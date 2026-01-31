@@ -1,70 +1,49 @@
 <!DOCTYPE html>
 <html>
     <head>
-        <script src="./onnxsim.js"></script>
         <script type="text/javascript">
-            // based on https://github.com/StanleyMasinde/wasm-image-processor
-            create_onnxsim({
-                preRun: [(runtime) => {
-                    console.log("preinit", runtime);
-                    runtime.ENV.LOG_THRESHOLD = "-1";
-                }],
-                print: (str) => {
-                    console.log("stdout:", str);
-                    document.getElementById("log-output").textContent += str + "\n";
-                },
-                printErr: (str) => {
-                    console.error("stderr:", str);
-                    document.getElementById("log-output").textContent += str + "\n";
-                },
-            }).then((runtime) => {
-                console.log(runtime);
-
+            window.onload = () => {
+                const worker = new Worker("worker.js");
+                const log_output = document.getElementById("log-output");
                 const input = document.getElementById("file-input");
                 const dl_btn = document.getElementById("download-button");
-
-                input.addEventListener("change", async (e) => {
-                    const file = e.target.files[0];
-                    if (!file) return;
-                    const result_name = (file.name.endsWith(".onnx") ? file.name.substring(0, file.name.length - 5) : file.name) + ".simplified.onnx"
-
-                    try {
-                        input.disabled = true;
-                        const buf = await file.arrayBuffer();
-                        const simplify_result = runtime.onnxsimplify_export(
-                            buf,
-                            [], // skip optimizers
-                            true, // constant folding
-                            true, // shape inference
-                            1024 * 1024 * 1024 * 1, // tensor size threshold
-                        );
-                        if (!simplify_result) {
-                            console.error("simplify failed!");
-                            return;
-                        }
-                        console.log("to blob start");
-                        const blob = new Blob(simplify_result, { type: "application/octet-stream" });
-                        console.log("to blob done")
-                        const reader = new FileReader();
-                        reader.addEventListener("load", () => {
+                let result_name = "";
+                worker.onmessage = (e) => {
+                    switch (e.data[0]) {
+                        case "stdout":
+                            log_output.textContent += e.data[1] + "\n";
+                            break;
+                        case "stderr":
+                            log_output.textContent += e.data[1] + "\n";
+                            break;
+                        case "convert-done":
+                            console.log("to data url start")
+                            const data_url = "data:application/octet-stream;base64," + e.data[1].toBase64();
                             console.log("to data url end")
                             input.disabled = false;
                             dl_btn.disabled = false;
                             dl_btn.onclick = () => {
                                 const a = document.createElement("a");
-                                a.href = reader.result;
+                                a.href = data_url;
                                 a.download = result_name;
                                 a.click();
-                                URL.revokeObjectURL(reader.result);
                             };
-                        });
-                        console.log("to data url start")
-                        reader.readAsDataURL(blob);
-                    } catch (error) {
-                        console.error("error: ", error);
+                            break;
                     }
+                };
+
+                input.addEventListener("change", async (e) => {
+                    const file = e.target.files[0];
+                    if (!file) return;
+                    result_name = (file.name.endsWith(".onnx") ? file.name.substring(0, file.name.length - 5) : file.name) + ".simplified.onnx"
+
+                    input.disabled = true;
+                    dl_btn.disabled = true;
+                    const buf = await file.arrayBuffer();
+                    console.log("sending: ", file.name);
+                    worker.postMessage(["input", buf], [buf]);
                 });
-            });
+            };
         </script>
     </head>
     <body>

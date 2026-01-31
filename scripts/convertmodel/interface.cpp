@@ -49,7 +49,7 @@ em::val onnxsimplify_export(const std::string& data, em::val skip_optimizers, bo
         return em::val::null();
     }
     std::cerr << "model simplify ended" << std::endl;
-    return em::val(em::typed_memory_view(result.size(), result.data()));
+    return em::val(em::typed_memory_view(result.size(), reinterpret_cast<uint8_t*>(result.data())));
 }
 
 EMSCRIPTEN_BINDINGS(module) {
