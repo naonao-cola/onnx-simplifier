@@ -52,6 +52,68 @@ em::val onnxsimplify_export(const std::string& data, em::val skip_optimizers, bo
     return em::val(em::typed_memory_view(result.size(), reinterpret_cast<uint8_t*>(result.data())));
 }
 
+em::val onnxoptimizer_optimize(const std::string& data, em::val passes_ary) {
+    std::vector<std::string> passes = em::vecFromJSArray<std::string>(passes_ary);
+    onnx::ModelProto xmodel;
+    std::cerr << "parsing message" << std::endl;
+    if (!xmodel.ParseFromArray(data.data(), data.size())) {
+        std::cerr << "Parse failed" << std::endl;
+        return em::val::null();
+    }
+    onnx::ModelProto optimized;
+    try {
+        optimized = onnx::optimization::Optimize(xmodel, passes);
+    } catch (const std::exception& e) {
+        std::cerr << "optimize error: " << e.what() << std::endl;
+        return em::val::null();
+    }
+    std::cerr << "serializing model" << std::endl;
+    static std::string result;
+    if (!optimized.SerializeToString(&result)) {
+        std::cerr << "Serialize failed" << std::endl;
+        return em::val::null();
+    }
+    return em::val(em::typed_memory_view(result.size(), reinterpret_cast<uint8_t*>(result.data())));
+}
+
+em::val onnxoptimizer_optimize_fixed(const std::string& data, em::val passes_ary) {
+    std::vector<std::string> passes = em::vecFromJSArray<std::string>(passes_ary);
+    onnx::ModelProto xmodel;
+    std::cerr << "parsing message" << std::endl;
+    if (!xmodel.ParseFromArray(data.data(), data.size())) {
+        std::cerr << "Parse failed" << std::endl;
+        return em::val::null();
+    }
+    onnx::ModelProto optimized;
+    try {
+        optimized = onnx::optimization::OptimizeFixed(xmodel, passes);
+    } catch (const std::exception& e) {
+        std::cerr << "optimize error: " << e.what() << std::endl;
+        return em::val::null();
+    }
+    std::cerr << "serializing model" << std::endl;
+    static std::string result;
+    if (!optimized.SerializeToString(&result)) {
+        std::cerr << "Serialize failed" << std::endl;
+        return em::val::null();
+    }
+    return em::val(em::typed_memory_view(result.size(), reinterpret_cast<uint8_t*>(result.data())));
+}
+
+std::vector<std::string> onnxoptimizer_passes() {
+    return onnx::optimization::GetAvailablePasses();
+}
+
+std::vector<std::string> onnxoptimizer_fuse_elimination_passes() {
+    return onnx::optimization::GetFuseAndEliminationPass();
+}
+
 EMSCRIPTEN_BINDINGS(module) {
     function("onnxsimplify_export", &onnxsimplify_export);
+    function("onnxoptimizer_optimize", &onnxoptimizer_optimize);
+    function("onnxoptimizer_optimize_fixed", &onnxoptimizer_optimize_fixed);
+    em::function("onnxoptimizer_passes", &onnxoptimizer_passes);
+    em::function("onnxoptimizer_fuse_elimination_passes", &onnxoptimizer_fuse_elimination_passes);
+
+    em::register_vector<std::string>("string_list");
 }

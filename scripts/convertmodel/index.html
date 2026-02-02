@@ -1,7 +1,29 @@
 <!DOCTYPE html>
 <html>
     <head>
+        <script type="text/javascript" src="./onnxsim.js"></script>
         <script type="text/javascript">
+            create_onnxsim().then((runtime) => {
+                to_ary = (vec) => {
+                    return new Array(vec.size()).fill(0).map((_, id) => vec.get(id))
+                };
+                const passes = document.getElementById("passes");
+                for (const p of to_ary(runtime.onnxoptimizer_passes()).sort()) {
+                    const c = document.createElement("input");
+                    c.type = "checkbox";
+                    c.setAttribute("class", "pass");
+                    c.name = p;
+                    c.checked = true;
+                    c.id = "id_" + p;
+                    passes.appendChild(c);
+                    const l = document.createElement("label");
+                    l.textContent = p;
+                    l.setAttribute("for", c.id);
+                    passes.appendChild(l);
+                    passes.appendChild(document.createElement("br"));
+                }
+            });
+
             window.onload = () => {
                 const worker = new Worker("worker.js");
                 const log_output = document.getElementById("log-output");
@@ -39,7 +61,9 @@
                     dl_btn.disabled = true;
                     const buf = await file.arrayBuffer();
                     console.log("sending: ", file.name);
-                    worker.postMessage(["input", buf], [buf]);
+                    const passes = Array.from(document.querySelectorAll('input[class="pass"]:checked')).map((v) => v.name);
+                    const optimizer = document.querySelector('input[name="optimizer"]:checked').value;
+                    worker.postMessage([optimizer, buf, passes], [buf]);
                 });
             };
         </script>
@@ -48,6 +72,21 @@
         <h1>Model converter</h1>
         <input type="file" id="file-input" />
         <button id="download-button" disabled>Download</button>
+        <div>
+            <input type="radio" name="optimizer" value="simplifiy" id="optimizer_simplify" checked>
+            <label for="optimizer_simplify">
+                <a href="https://github.com/daquexian/onnx-simplifier" target="_blank">Simplify</a>
+            </label>
+            <input type="radio" name="optimizer" value="optimize" id="optimizer_optimize">
+            <label for="optimizer_optimize">
+                <a href="https://github.com/onnx/optimizer" target="_blank">Optimize</a>
+            </label>
+            <input type="radio" name="optimizer" value="optimize_fixed" id="optimizer_optimize_fixed">
+            <label for="optimizer_optimize_fixed">
+                Fixed <a href="https://github.com/onnx/optimizer" target="_blank">Optimize</a>
+            </label>
+        </div>
+        <div id="passes"></div>
         <h2>Console outputs:</h2>
         <pre id="log-output"></pre>
     </body>
