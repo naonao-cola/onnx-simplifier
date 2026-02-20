@@ -44,7 +44,7 @@ and then replaces the redundant operators with their constant outputs (a.k.a. co
 
 ### Web version
 
-We have published ONNX Simplifier on [convertmodel.com](https://www.convertmodel.com/#input=onnx&output=onnx). It works out of the box and **doesn't need any installation**. Note that it runs in the browser locally and your model is completely safe.
+We have published ONNX Simplifier on [GitHub pages](https://onnxsim.github.io/onnxsim/). It works out of the box and **doesn't need any installation**. Note that it runs in the browser locally and your model is completely safe.
 
 ### Python version
 
