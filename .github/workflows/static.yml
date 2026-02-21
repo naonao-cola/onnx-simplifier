@@ -29,8 +29,6 @@ jobs:
       url: ${{ steps.deployment.outputs.page_url }}
     runs-on: ubuntu-latest
     env:
-      SCCACHE_GHA_ENABLED: on
-      ACTIONS_CACHE_SERVICE_V2: on
       CMAKE_GENERATOR: Ninja
       EMSCRIPTEN_VERSION: "5.0.0"
     steps:
@@ -56,6 +54,7 @@ jobs:
           restore-keys: |
               ${{ matrix.config.name }}-ccache-
       - run: |
+          sudo apt install -y ccache
           which ccache
           ccache -z
           echo "CCACHE_DIR=${PWD}/.ccache" >> ${GITHUB_ENV}
