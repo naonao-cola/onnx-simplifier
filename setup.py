@@ -55,13 +55,20 @@ try:
 except (OSError, subprocess.CalledProcessError):
     git_version = None
 
-if os.getenv('ONNXSIM_SDIST') is not None:
+try:
+    dev_count = subprocess.check_output(['git', 'rev-list', '--count', f"v{version}..HEAD"]).decode('ascii').strip()
+except (OSError, subprocess.CalledProcessError):
+    dev_count = None
+
+if os.getenv('ONNXSIM_RELEASE') is not None:
     version = '0.0.0'
     git_version = None
+    dev_count = None
 
-VersionInfo = namedtuple('VersionInfo', ['version', 'git_version'])(
+VersionInfo = namedtuple('VersionInfo', ['version', 'git_version', 'dev_count'])(
     version=version,
-    git_version=git_version
+    git_version=git_version,
+    dev_count=dev_count,
 )
 
 assert CMAKE, 'Could not find "cmake" executable!'
@@ -96,6 +103,7 @@ class create_version(ONNXCommand):
 
             version = '{version}'
             git_version = '{git_version}'
+            dev_count = {dev_count}
             '''.format(**dict(VersionInfo._asdict()))))
 
 
@@ -274,9 +282,17 @@ from pathlib import Path
 this_directory = Path(__file__).parent
 long_description = (this_directory / "README.md").read_text()
 
+version_str = VersionInfo.version
+
+if VersionInfo.dev_count is not None:
+    version_str += f".dev{VersionInfo.dev_count}"
+
+if VersionInfo.git_version is not None:
+    version_str += f"+{VersionInfo.git_version}"
+
 setuptools.setup(
     name="onnxsim",
-    version=VersionInfo.version,
+    version=version_str,
     description='Simplify your ONNX model',
     ext_modules=ext_modules,
     cmdclass=cmdclass,

@@ -1,7 +1,9 @@
 recursive-include onnxsim *.h *.hpp *.cc *.cpp
 recursive-include cmake *
-recursive-include third_party *
-recursive-exclude third_party/onnx-optimizer/build *
+recursive-include third_party/onnx-optimizer *
+recursive-exclude third_party/onnx-optimizer/*build* *
 include CMakeLists.txt
 include VERSION
-recursive-exclude third_party *.onnx *.pb *.cs *.rs
+recursive-exclude third_party *.onnx *.pb
+recursive-exclude third_party *.zip
+recursive-exclude third_party *.so
