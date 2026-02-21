@@ -57,6 +57,7 @@ jobs:
           ccache -z
           echo "CCACHE_DIR=${PWD}/.ccache" >> ${GITHUB_ENV}
           echo "CCACHE_MAXSIZE=500M" >> ${GITHUB_ENV}
+          echo "_EMCC_CCACHE=1" >> ${GITHUB_ENV}
       - run: |
           git clone --depth 1 https://github.com/emscripten-core/emsdk.git
           ./emsdk/emsdk install ${EMSCRIPTEN_VERSION}
