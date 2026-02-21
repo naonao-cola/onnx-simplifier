@@ -287,8 +287,9 @@ version_str = VersionInfo.version
 if VersionInfo.dev_count is not None:
     version_str += f".dev{VersionInfo.dev_count}"
 
-if VersionInfo.git_version is not None:
-    version_str += f"+{VersionInfo.git_version}"
+# Disabling local version for public release
+# if VersionInfo.git_version is not None:
+#     version_str += f"+{VersionInfo.git_version}"
 
 setuptools.setup(
     name="onnxsim",
