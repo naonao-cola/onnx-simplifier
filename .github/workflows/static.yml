@@ -19,7 +19,7 @@ permissions:
 # However, do NOT cancel in-progress runs as we want to allow these production deployments to complete.
 concurrency:
   group: "pages"
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 jobs:
   # Single deploy job since we're just deploying
@@ -29,9 +29,6 @@ jobs:
       url: ${{ steps.deployment.outputs.page_url }}
     runs-on: ubuntu-latest
     env:
-      SCCACHE_GHA_ENABLED: on
-      ACTIONS_CACHE_SERVICE_V2: on
-      CMAKE_CXX_COMPILER_LAUNCHER: sccache
       CMAKE_GENERATOR: Ninja
       EMSCRIPTEN_VERSION: "5.0.0"
     steps:
@@ -41,9 +38,26 @@ jobs:
           submodules: recursive
       - name: Setup Pages
         uses: actions/configure-pages@v5
-      - uses: mozilla-actions/sccache-action@v0.0.9
       - run: pip install cmake ninja
       - run: sudo apt install protobuf-compiler
+      - name: Prepare ccache timestamp
+        id: ccache_cache_timestamp
+        run: |
+          echo "timestamp=$(date -Iseconds)" >> ${GITHUB_OUTPUT}
+      - name: ccache cache files
+        uses: actions/cache@v5
+        with:
+          path: .ccache
+          key: ${{ matrix.config.name }}-ccache-${{ steps.ccache_cache_timestamp.outputs.timestamp }}
+          restore-keys: |
+              ${{ matrix.config.name }}-ccache-
+      - run: |
+          sudo apt install -y ccache
+          which ccache
+          ccache -z
+          echo "CCACHE_DIR=${PWD}/.ccache" >> ${GITHUB_ENV}
+          echo "CCACHE_MAXSIZE=500M" >> ${GITHUB_ENV}
+          echo "_EMCC_CCACHE=1" >> ${GITHUB_ENV}
       - run: |
           git clone --depth 1 https://github.com/emscripten-core/emsdk.git
           ./emsdk/emsdk install ${EMSCRIPTEN_VERSION}
@@ -52,6 +66,8 @@ jobs:
           EMPROFILE=1 ./build_wasm.sh
           rm scripts/convertmodel/onnxsim.*
           cp build-wasm-node-OFF/onnxsim.* scripts/convertmodel
+      - run: |
+          ccache -s
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v3
         with:
@@ -60,3 +76,4 @@ jobs:
       - name: Deploy to GitHub Pages
         id: deployment
         uses: actions/deploy-pages@v4
+        if: ${{ github.event_name == 'push' }}
