@@ -105,7 +105,7 @@ jobs:
         path: dist/*.tar.gz
 
   upload_pypi:
-    if: github.event_name == 'push' || github.event_name == 'release'
+    if: (github.repository == 'onnxsim/onnxsim') && (github.event_name == 'push' || github.event_name == 'release')
     name: Upload to PyPI
     needs: [build_wheels, build_sdist]
     runs-on: ubuntu-latest
