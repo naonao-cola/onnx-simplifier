@@ -116,3 +116,24 @@ def test_concat_squeese():
 
     export_simplify_and_check_by_python_api(Model(), (torch.rand(20, 20),), export_kwargs={"opset_version": 9})
 
+
+def test_trilinear():
+    class Model(torch.nn.Module):
+        def __init__(self):
+            super(Model, self).__init__()
+
+        def forward(self, input_tensor):
+            return torch.nn.functional.interpolate(input_tensor, scale_factor=[4, 4, 4], mode='trilinear')
+
+    x = torch.rand(1, 8, 20, 120, 120)
+    opt = export_simplify_and_check_by_python_api(
+        Model(),
+        (x,),
+        export_kwargs={
+            "opset_version": 11,
+            "export_params": True,
+        })
+    sess = onnxruntime.InferenceSession(opt.SerializeToString(), providers=["CPUExecutionProvider"])
+    out_names = [i.name for i in sess.get_outputs()]
+    outs = sess.run(out_names, { opt.graph.input[0].name: x.numpy() })
+    assert outs[0].shape == (1, 8, 80, 480, 480)
