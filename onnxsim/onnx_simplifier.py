@@ -377,6 +377,14 @@ def main():
         )
     parser.add_argument('-v', '--version', action='version', version='onnxsim ' + version.version)
 
+    class ListOptimizers(argparse.Action):
+        def __call__(self, parser, ns, v, option_string=None):
+            for p in C._list_optimizers():
+                print(p)
+            parser.exit()
+
+    parser.add_argument("--list-default-optimizers", help="List default optimizer pass names", nargs=0, action=ListOptimizers)
+
     args = parser.parse_args()
 
     if args.enable_fuse_bn:

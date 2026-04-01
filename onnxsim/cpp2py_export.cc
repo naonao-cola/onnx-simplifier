@@ -10,6 +10,7 @@
 #include <nanobind/stl/vector.h>
 
 #include "onnx/proto_utils.h"
+#include "onnxoptimizer/optimize.h"
 #include "onnxsim.h"
 
 namespace py = nanobind;
@@ -100,7 +101,16 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
       .def("_set_model_executor",
            [](std::shared_ptr<PyModelExecutor> executor) {
              ModelExecutor::set_instance(std::move(executor));
-           }, "executor"_a.none());
+           }, "executor"_a.none())
+      .def("_list_optimizers",
+           []() {
+            py::list ret;
+            for (const auto& p : onnx::optimization::GetFuseAndEliminationPass()) {
+              ret.append(p);
+            }
+            return ret;
+           })
+      ;
 
   py::class_<PyModelExecutor, PyModelExecutorTrampoline>(m, "ModelExecutor")
       .def(py::init<>())

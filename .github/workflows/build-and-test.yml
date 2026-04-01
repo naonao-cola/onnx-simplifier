@@ -19,7 +19,7 @@ jobs:
       CIBW_BEFORE_BUILD: "python3 -m pip install --break-system-packages cmake ninja setuptools sccache"
       CIBW_TEST_REQUIRES: pytest flake8 onnxruntime onnxscript==0.6.2 timm==1.0.26
       CIBW_BEFORE_TEST: pip install torch==2.10.0 torchvision==0.25.0 --index-url https://download.pytorch.org/whl/cpu/
-      CIBW_TEST_COMMAND: pytest -v {project}/tests && onnxsim -h
+      CIBW_TEST_COMMAND: pytest -v {project}/tests && onnxsim -h && onnxsim --list-default-optimizers
       # Only build on Python 3 and skip 32-bit or musl builds
       CIBW_SKIP: "*-win32 *-manylinux_i686 *-musllinux_*"
       CIBW_ENVIRONMENT: CMAKE_ARGS="-DONNX_USE_PROTOBUF_SHARED_LIBS=OFF" CMAKE_GENERATOR=Ninja CMAKE_CXX_COMPILER_LAUNCHER=sccache
