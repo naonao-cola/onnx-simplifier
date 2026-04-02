@@ -3,6 +3,7 @@ import onnx
 import onnxruntime
 import onnxsim
 
+from typing import Optional
 from onnxsim.test_utils import export_simplify_and_check_by_python_api
 
 
@@ -137,3 +138,18 @@ def test_trilinear():
     out_names = [i.name for i in sess.get_outputs()]
     outs = sess.run(out_names, { opt.graph.input[0].name: x.numpy() })
     assert outs[0].shape == (1, 8, 80, 480, 480)
+
+
+def test_optional_type():
+    class MyModule(torch.nn.Module):
+        def forward(self, x: Optional[torch.Tensor]):
+            return x is not None
+
+    module = MyModule()
+    inputs = (torch.tensor(1),)
+    module = torch.jit.script(module, example_inputs=[inputs, (None,)])
+    export_simplify_and_check_by_python_api(
+        module,
+        inputs,
+        simplify_kwargs={"input_data": {"i": inputs[0].numpy()}},
+        export_kwargs={"opset_version": 15, "input_names": ["i"]})
