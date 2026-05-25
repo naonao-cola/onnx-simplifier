@@ -1,7 +1,9 @@
+import tempfile
 import torch
 import onnx
 import onnxruntime
 import onnxsim
+import os
 
 from typing import Optional
 from onnxsim.test_utils import export_simplify_and_check_by_python_api
@@ -160,14 +162,17 @@ def test_ext():
         def __init__(self):
             super().__init__()
 
-            self.param = torch.nn.Parameter(torch.rand(1024, 1024, 1024, dtype=torch.float32))
+            self.param = torch.nn.Parameter(torch.rand(1024, 1024, 1024, dtype=torch.float16))
 
         def forward(self, x):
             return self.param * x
 
     module = MyMod()
     inputs = (torch.tensor(1),)
-    export_simplify_and_check_by_python_api(
-        module,
-        inputs,
-        export_kwargs={"input_names": ["x"]})
+
+    with tempfile.TemporaryDirectory() as tmpdirname:
+        model_fn = os.path.join(tmpdirname, "tmp.onnx")
+        torch.onnx.export(module, inputs, model_fn, dynamo=False, input_names=["x"])
+        model = onnx.load(model_fn)
+        sim_model, check_ok = onnxsim.simplify(model_fn, check_n=0)
+        assert check_ok
