@@ -175,4 +175,5 @@ def test_ext():
         torch.onnx.export(module, inputs, model_fn, dynamo=False, input_names=["x"])
         model = onnx.load(model_fn)
         sim_model, check_ok = onnxsim.simplify(model_fn, check_n=0)
+        module = None
         assert check_ok
