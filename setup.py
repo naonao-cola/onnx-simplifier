@@ -242,7 +242,8 @@ cmdclass = {
     'develop': develop,
 }
 
-py_limited_api = sys.version_info[0] >= 3 and sys.version_info[1] >= 12
+py_limited_api = sys.version_info[0] >= 3 and sys.version_info[1] >= 12 and \
+    not sysconfig.get_config_var("Py_GIL_DISABLED")
 if py_limited_api:
     setup_opts = {
         'bdist_wheel': {
