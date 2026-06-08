@@ -51,7 +51,7 @@ jobs:
         arch: amd64
       if: ${{ matrix.os == 'windows-2025' }}
     - name: Build onnxsim wheels
-      uses: pypa/cibuildwheel@v3.4.1
+      uses: pypa/cibuildwheel@v4.0.0
       env:
         CIBW_BUILD: "${{ matrix.py_ver }}-*"
     - name: Check ABI3
