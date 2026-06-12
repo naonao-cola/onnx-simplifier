@@ -25,6 +25,8 @@ jobs:
         submodules: recursive
     - uses: mozilla-actions/sccache-action@v0.0.10
 
+    - run: pip install sccache
+
     - name: Build
       run: pip install --no-build-isolation -ve .
     
