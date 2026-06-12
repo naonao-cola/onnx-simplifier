@@ -15,6 +15,7 @@ jobs:
     env:
       CMAKE_GENERATOR: Ninja
       CMAKE_CXX_COMPILER_LAUNCHER: sccache
+      CMAKE_LINKER_TYPE: MOLD
       CXXFLAGS: -fsanitize=address
       LDFLAGS: -fsanitize=address
       ASAN_OPTIONS: verify_asan_link_order=0
