@@ -139,6 +139,8 @@ class cmake_build(setuptools.Command):
 
         with cd(CMAKE_BUILD_DIR):
             build_type = 'RelWithDebInfo'
+            if WINDOWS:
+                build_type = 'Release'
             # configure
             cmake_args = [
                 CMAKE,
