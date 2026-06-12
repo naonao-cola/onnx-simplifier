@@ -145,6 +145,7 @@ class cmake_build(setuptools.Command):
                 '-DPython_INCLUDE_DIR={}'.format(sysconfig.get_path('include')),
                 '-DPython_EXECUTABLE={}'.format(sys.executable),
                 '-DONNX_BUILD_PYTHON=ON',
+                "-DONNX_INSTALL=OFF",
                 '-DONNXSIM_PYTHON=ON',
                 '-DONNXSIM_BUILTIN_ORT=OFF',
                 '-DONNX_USE_LITE_PROTO=OFF',
