@@ -6,3 +6,6 @@ leak:onnx_cpp2py_export
 leak:PyThread_allocate_lock
 leak:nanobind::detail::malloc_check
 leak:nanobind::detail::strdup_check
+leak:hf_xet
+leak:_safetensors_rust
+leak:PyObject_Realloc
