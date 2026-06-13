@@ -19,6 +19,8 @@ jobs:
       CXXFLAGS: -fsanitize=address
       LDFLAGS: -fsanitize=address
       ASAN_OPTIONS: verify_asan_link_order=0
+      SCCACHE_GHA_ENABLED: on
+      ACTIONS_CACHE_SERVICE_V2: on
     steps:
     - uses: actions/checkout@v6
       with:
