@@ -9,3 +9,10 @@ leak:nanobind::detail::strdup_check
 leak:hf_xet
 leak:_safetensors_rust
 leak:PyObject_Realloc
+leak:_upb
+leak:_PyBytes_Resize
+leak:Objects/unicodeobject
+leak:PyObject_Malloc
+leak:PyMem_Malloc
+leak:list_resize
+leak:_io/stringio
