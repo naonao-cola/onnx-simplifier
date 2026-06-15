@@ -9,7 +9,7 @@ from onnxsim.test_utils import export_simplify_and_check_by_python_api
 
 # From https://github.com/onnxsim/onnxsim/issues/307
 def test_swin():
-    model = timm.create_model("swin_tiny_patch4_window7_224", pretrained=True, num_classes=1000).eval()
+    model = timm.create_model("swin_tiny_patch4_window7_224", pretrained=False, num_classes=1000).eval()
     dummy_input = torch.randn(*(1, 3, 224, 224), device='cpu')
 
     opt = export_simplify_and_check_by_python_api(
