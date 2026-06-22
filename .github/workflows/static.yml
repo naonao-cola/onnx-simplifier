@@ -35,7 +35,7 @@ jobs:
       EMSCRIPTEN_VERSION: "5.0.0"
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           submodules: recursive
       - name: Setup Pages
