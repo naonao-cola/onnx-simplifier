@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <fstream>
 #include <numeric>
+#include <unordered_map>
 
 #ifndef NO_BUILTIN_ORT
 #include "onnxruntime/core/framework/endian.h"
@@ -14,6 +15,7 @@
 #endif
 #include "onnx/common/file_utils.h"
 #include "onnx/defs/printer.h"
+#include "onnx/defs/schema.h"
 #include "onnx/shape_inference/implementation.h"
 #include "onnxoptimizer/model_util.h"
 #include "onnxoptimizer/optimize.h"
@@ -49,18 +51,26 @@ bool IsOfficialOp(const std::string& domain, const std::string& op) {
   return experimental_ops.find(op) == experimental_ops.end();
 }
 
-bool IsDeterministic(const std::string& domain, const std::string& op) {
-  // Copy from onnxruntime/core/optimizer/utils.cc
-  constexpr std::array kOnnxDomainNonDeterministicOps{
-      "RandomUniform", "RandomNormal", "RandomUniformLike", "RandomNormalLike",
-      "Multinomial"};
-  if (domain == "ai.onnx" || domain == "ai.onnx.ml" || domain.empty()) {
-    auto iter = std::find(kOnnxDomainNonDeterministicOps.begin(),
-                          kOnnxDomainNonDeterministicOps.end(), op);
-    return iter == kOnnxDomainNonDeterministicOps.end();
+bool IsDeterministic(const std::string& domain, const std::string& op,
+                     int opset_version) {
+  // Query the determinism attribute of the operator schema instead of
+  // maintaining a hardcoded list of non-deterministic ops. See
+  // https://github.com/onnx/onnx/pull/7176.
+  //
+  // The ONNX operator schema registry stores the default ONNX domain as an
+  // empty string.
+  const std::string& lookup_domain = domain == "ai.onnx" ? "" : domain;
+  const auto* schema =
+      onnx::OpSchemaRegistry::Schema(op, opset_version, lookup_domain);
+  if (schema == nullptr) {
+    // Unknown op. Assume it is not deterministic.
+    return false;
   }
-  // Unknown domain. Assume the op is not deterministic.
-  return false;
+  // Only fold ops that are known to be deterministic. Ops whose determinism
+  // cannot be statically determined (e.g. context-dependent functions) are
+  // treated as non-deterministic to be safe.
+  return schema->GetNodeDeterminism() ==
+         onnx::OpSchema::NodeDeterminism::Deterministic;
 }
 
 bool IsQDQ(const std::string& domain, const std::string& op) {
@@ -384,11 +394,26 @@ GetConstantNodes(const onnx::ModelProto& model) {
   std::transform(
       model.graph().initializer().begin(), model.graph().initializer().end(),
       std::back_inserter(const_names), [](const auto& x) { return x.name(); });
+  // Map each domain to its imported opset version so the correct operator
+  // schema can be looked up. The default ONNX domain is normalized to an empty
+  // string, which is how the schema registry stores it.
+  std::unordered_map<std::string, int> domain_to_version;
+  for (const auto& opset : model.opset_import()) {
+    const std::string& domain =
+        opset.domain() == "ai.onnx" ? "" : opset.domain();
+    domain_to_version[domain] = opset.version();
+  }
+  auto opset_version_of = [&domain_to_version](const std::string& domain) {
+    const std::string& key = domain == "ai.onnx" ? "" : domain;
+    auto iter = domain_to_version.find(key);
+    return iter == domain_to_version.end() ? 0 : iter->second;
+  };
   // node is already topo sorted
   for (const auto& node : model.graph().node()) {
     // clang-format off
     if (IsOfficialOp(node.domain(), node.op_type()) &&
-        IsDeterministic(node.domain(), node.op_type()) &&
+        IsDeterministic(node.domain(), node.op_type(),
+                        opset_version_of(node.domain())) &&
         !IsQDQ(node.domain(), node.op_type()) &&
         !HasSubgraph(node) &&
         !ProduceLargeTensor(model, node, config.tensor_size_threshold) &&

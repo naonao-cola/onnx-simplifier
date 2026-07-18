@@ -281,6 +281,66 @@ def test_unset_optional_input():
     assert len(sim_model.graph.initializer) == 1
 
 
+def test_fold_deterministic_op():
+    # An op that the operator schema marks as deterministic and whose inputs are
+    # all constants should be constant-folded away.
+    a = np.random.rand(2, 3).astype(np.float32)
+    b = np.random.rand(2, 3).astype(np.float32)
+    initializers = [
+        onnx.helper.make_tensor('a', onnx.TensorProto.FLOAT, a.shape, a.tobytes(), raw=True),
+        onnx.helper.make_tensor('b', onnx.TensorProto.FLOAT, b.shape, b.tobytes(), raw=True),
+    ]
+    node = onnx.helper.make_node('Add', inputs=['a', 'b'], outputs=['y'])
+    out = onnx.helper.make_tensor_value_info('y', onnx.TensorProto.FLOAT, (2, 3))
+    graph_def = onnx.helper.make_graph(
+        [node], 'test_fold_deterministic_op', [], [out], initializer=initializers)
+    model = onnx.helper.make_model(
+        graph_def, opset_imports=[onnx.helper.make_opsetid("", 14)], ir_version=10)
+
+    sim_model, check_ok = onnxsim.simplify(model, check_n=3)
+    assert check_ok
+    # The Add node is folded into a single constant initializer.
+    assert len(sim_model.graph.node) == 0
+    assert len(sim_model.graph.initializer) == 1
+
+
+def test_do_not_fold_random_op():
+    # RandomUniform is non-deterministic according to the operator schema
+    # determinism attribute, so it must not be constant-folded even though it
+    # has no non-constant inputs.
+    node = onnx.helper.make_node(
+        'RandomUniform', inputs=[], outputs=['y'],
+        shape=[2, 3], dtype=onnx.TensorProto.FLOAT)
+    out = onnx.helper.make_tensor_value_info('y', onnx.TensorProto.FLOAT, (2, 3))
+    graph_def = onnx.helper.make_graph(
+        [node], 'test_do_not_fold_random_op', [], [out])
+    model = onnx.helper.make_model(
+        graph_def, opset_imports=[onnx.helper.make_opsetid("", 14)], ir_version=10)
+
+    sim_model, _ = onnxsim.simplify(model, check_n=0)
+    assert len(sim_model.graph.node) == 1
+    assert sim_model.graph.node[0].op_type == 'RandomUniform'
+    assert len(sim_model.graph.initializer) == 0
+
+
+def test_do_not_fold_random_like_op():
+    # RandomNormalLike is non-deterministic; it must not be folded even when its
+    # input is a constant.
+    x = np.zeros((2, 3), dtype=np.float32)
+    initializers = [
+        onnx.helper.make_tensor('x', onnx.TensorProto.FLOAT, x.shape, x.tobytes(), raw=True),
+    ]
+    node = onnx.helper.make_node('RandomNormalLike', inputs=['x'], outputs=['y'])
+    out = onnx.helper.make_tensor_value_info('y', onnx.TensorProto.FLOAT, (2, 3))
+    graph_def = onnx.helper.make_graph(
+        [node], 'test_do_not_fold_random_like_op', [], [out], initializer=initializers)
+    model = onnx.helper.make_model(
+        graph_def, opset_imports=[onnx.helper.make_opsetid("", 14)], ir_version=10)
+
+    sim_model, _ = onnxsim.simplify(model, check_n=0)
+    assert any(n.op_type == 'RandomNormalLike' for n in sim_model.graph.node)
+
+
 def test_perform_optimization_false():
     def _create_dummy_model():
         class MockModel(torch.nn.Module):
