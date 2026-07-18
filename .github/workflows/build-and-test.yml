@@ -83,6 +83,8 @@ jobs:
       if: startsWith(github.ref, 'refs/tags/v')
       run: echo "ONNXSIM_RELEASE=${{ github.ref_name }}" >> ${GITHUB_ENV}
 
+    - run: sudo apt install python3-dev
+
     - name: Build sdist
       run: |
         pushd scripts/onnx-simplifier
