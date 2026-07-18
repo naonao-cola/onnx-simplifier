@@ -26,7 +26,7 @@ def _make_foldable_model() -> onnx.ModelProto:
         [helper.make_tensor_value_info("y", TensorProto.FLOAT, [2, 2])],
         [a, b],
     )
-    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 18)])
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 18)], ir_version=10)
     onnx.checker.check_model(model)
     return model
 
