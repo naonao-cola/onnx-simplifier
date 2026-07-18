@@ -146,6 +146,14 @@ class cmake_build(setuptools.Command):
                 CMAKE,
                 '-DPython_INCLUDE_DIR={}'.format(sysconfig.get_path('include')),
                 '-DPython_EXECUTABLE={}'.format(sys.executable),
+                # onnx's CMake calls find_package(Python3 ...) first, which does
+                # not see the Python_ prefixed hints. Without these, CMake >= 4.4
+                # defaults Python3_FIND_ABI to "ANY;ANY;ANY;OFF" and rejects a
+                # free-threaded (Py_GIL_DISABLED) interpreter, then wanders off to
+                # a non-venv python. Mirror the hints under the Python3_ prefix.
+                # '-DPython3_EXECUTABLE={}'.format(sys.executable),
+                '-DPython3_ROOT_DIR={}'.format(sys.prefix),
+                '-DPython3_FIND_ABI=ANY;ANY;ANY;ANY',
                 '-DONNX_BUILD_PYTHON=ON',
                 "-DONNX_INSTALL=OFF",
                 '-DONNXSIM_PYTHON=ON',
