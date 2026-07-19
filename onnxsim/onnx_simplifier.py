@@ -97,6 +97,34 @@ def check_and_update_input_shapes(model: onnx.ModelProto, input_shapes: Optional
 DEFAULT_TENSOR_SIZE_THRESHOLDHOLD = '1.5GB'
 
 
+def _snapshot_doc_strings(model: onnx.ModelProto) -> dict:
+    """Capture the ``doc_string`` fields that the C++ optimizer discards."""
+    return {
+        "model": model.doc_string,
+        "graph": model.graph.doc_string,
+        "inputs": {i.name: i.doc_string for i in model.graph.input},
+        "outputs": {o.name: o.doc_string for o in model.graph.output},
+    }
+
+
+def _restore_doc_strings(model: onnx.ModelProto, snapshot: dict) -> None:
+    """Restore doc strings captured by :func:`_snapshot_doc_strings`.
+
+    Only fields that the optimizer left empty are restored, so any doc string
+    produced by the optimizer itself takes precedence.
+    """
+    if not model.doc_string and snapshot["model"]:
+        model.doc_string = snapshot["model"]
+    if not model.graph.doc_string and snapshot["graph"]:
+        model.graph.doc_string = snapshot["graph"]
+    for ipt in model.graph.input:
+        if not ipt.doc_string and snapshot["inputs"].get(ipt.name):
+            ipt.doc_string = snapshot["inputs"][ipt.name]
+    for opt in model.graph.output:
+        if not opt.doc_string and snapshot["outputs"].get(opt.name):
+            opt.doc_string = snapshot["outputs"][opt.name]
+
+
 def simplify(
     model: Union[str, onnx.ModelProto],
     check_n: int = 0,
@@ -175,11 +203,21 @@ def simplify(
         for ipt in model.graph.input:
             if ipt.name == name:
                 for i, dim in enumerate(ipt.type.tensor_type.shape.dim):
-                    dim.dim_value = input_shape[i]
+                    # A non-positive value means "keep the original (possibly
+                    # dynamic) dimension" rather than hardcoding an invalid size
+                    # such as 0, which would make the model impossible to run
+                    # (see GitHub issue #237).
+                    if input_shape[i] > 0:
+                        dim.dim_value = input_shape[i]
     if unused_output is not None:
         model = remove_unused_output(model, unused_output)
     if not mutable_initializer and model.ir_version >= 4:
         model = remove_initializer_from_input(model)
+
+    # The C++ optimizer re-serializes the graph and drops the `doc_string`
+    # fields on the model, graph and input/output value infos. Snapshot them
+    # here so they can be restored on the simplified model (GitHub issue #428).
+    doc_strings = _snapshot_doc_strings(model)
 
     def parse_size(size: str) -> int:
         m = re.fullmatch(r"([\d.]+)\s*([KMGT]?B)", size.strip(), re.I)
@@ -236,6 +274,7 @@ def simplify(
                 check_n, test_input_shapes, input_data, custom_lib
             )
             model_opt = onnx.load(os.path.join(tmpdirname, 'opt.onnx'))
+    _restore_doc_strings(model_opt, doc_strings)
     return model_opt, check_ok
 
 

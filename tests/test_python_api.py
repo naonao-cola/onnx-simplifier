@@ -341,6 +341,53 @@ def test_do_not_fold_random_like_op():
     assert any(n.op_type == 'RandomNormalLike' for n in sim_model.graph.node)
 
 
+def test_overwrite_input_shape_ignores_non_positive():
+    # A non-positive value in overwrite_input_shapes must not be written to the
+    # graph as a literal (e.g. 0) dimension; the original dimension should be
+    # kept instead so the simplified model stays runnable (GitHub issue #237).
+    x = onnx.helper.make_tensor_value_info(
+        'input', onnx.TensorProto.FLOAT, ['N', 3, 'H', 'W'])
+    y = onnx.helper.make_tensor_value_info(
+        'output', onnx.TensorProto.FLOAT, ['N', 3, 'H', 'W'])
+    node = onnx.helper.make_node('Relu', ['input'], ['output'])
+    graph_def = onnx.helper.make_graph(
+        [node], 'test_overwrite_input_shape_ignores_non_positive', [x], [y])
+    model = onnx.helper.make_model(
+        graph_def, opset_imports=[onnx.helper.make_opsetid("", 13)])
+
+    sim_model, _ = onnxsim.simplify(
+        model, overwrite_input_shapes={'input': [1, 3, 0, 0]})
+    dims = sim_model.graph.input[0].type.tensor_type.shape.dim
+    # The positive value is applied, the non-positive ones are left untouched
+    # (the original dynamic dim params are kept, never set to 0).
+    assert dims[0].dim_value == 1
+    assert dims[2].dim_param == 'H'
+    assert dims[3].dim_param == 'W'
+
+
+def test_preserve_doc_strings():
+    # onnxsim must not drop the doc_string fields of the model / graph / inputs
+    # / outputs while simplifying (GitHub issue #428).
+    x = onnx.helper.make_tensor_value_info('X', onnx.TensorProto.FLOAT, [1, 4])
+    x.doc_string = "input documentation"
+    y = onnx.helper.make_tensor_value_info('Y', onnx.TensorProto.FLOAT, [1, 4])
+    y.doc_string = "output documentation"
+    node = onnx.helper.make_node('Relu', ['X'], ['Y'])
+    graph_def = onnx.helper.make_graph(
+        [node], 'test_preserve_doc_strings', [x], [y])
+    graph_def.doc_string = "graph documentation"
+    model = onnx.helper.make_model(
+        graph_def, opset_imports=[onnx.helper.make_opsetid("", 13)])
+    model.doc_string = "model documentation"
+
+    sim_model, check_ok = onnxsim.simplify(model)
+    assert check_ok
+    assert sim_model.doc_string == "model documentation"
+    assert sim_model.graph.doc_string == "graph documentation"
+    assert sim_model.graph.input[0].doc_string == "input documentation"
+    assert sim_model.graph.output[0].doc_string == "output documentation"
+
+
 def test_perform_optimization_false():
     def _create_dummy_model():
         class MockModel(torch.nn.Module):
