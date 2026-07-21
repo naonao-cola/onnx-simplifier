@@ -161,12 +161,11 @@ fi
 WINPY_INC="${WINPY}/python/include"
 WINPY_LIBDIR="${WINPY}/python/libs"
 PYVER_NODOT="${PYVER//./}"
-if [[ "${ABI3}" == "1" ]]; then
-  WINPY_LIB="${WINPY_LIBDIR}/python3.lib"          # limited API import library
-else
-  WINPY_LIB="${WINPY_LIBDIR}/python${PYVER_NODOT}.lib"
-fi
-[[ -f "${WINPY_LIB}" ]] || { echo "missing ${WINPY_LIB}"; ls -la "${WINPY_LIBDIR}"; exit 1; }
+WINPY_MODULE_LIB="${WINPY_LIBDIR}/python${PYVER_NODOT}.lib"  # Development.Module
+WINPY_SABI_LIB="${WINPY_LIBDIR}/python3.lib"                 # Development.SABIModule
+for f in "${WINPY_MODULE_LIB}" "${WINPY_SABI_LIB}"; do
+  [[ -f "${f}" ]] || { echo "missing ${f}"; ls -la "${WINPY_LIBDIR}"; exit 1; }
+done
 
 # ---------------------------------------------------------------------------
 # 3. Host protoc (Linux) -- ONNX runs this during code generation.
@@ -246,11 +245,23 @@ NANOBIND_CMAKE_DIR="$(python3 -m nanobind --cmake_dir)"
 BUILD_DIR="${WORK}/onnxsim-build-${PYVER}$([[ "${ABI3}" == "1" ]] && echo -abi3)"
 rm -rf "${BUILD_DIR}"
 
-sabi_args=()
-if [[ "${ABI3}" == "1" ]]; then
-  # nanobind STABLE_ABI needs the SABI import library (python3.lib).
-  sabi_args+=( -DPython_SABI_LIBRARY="${WINPY_LIBDIR}/python3.lib" )
-fi
+HOSTPY="$(command -v python3)"
+# onnx splits the Python roles when cross-compiling: the Python3 package supplies
+# the target dev libraries (Development.Module + Development.SABIModule) while the
+# Python package supplies the host interpreter. onnxsim/onnx-optimizer also use
+# the Python package for target dev libs. Provide hints for both namespaces:
+# host interpreter + target include + target module lib (pythonXY.lib) + target
+# SABI lib (python3.lib).
+python_args=(
+  -DPython_EXECUTABLE="${HOSTPY}"
+  -DPython_INCLUDE_DIR="${WINPY_INC}"
+  -DPython_LIBRARY="${WINPY_MODULE_LIB}"
+  -DPython_SABI_LIBRARY="${WINPY_SABI_LIB}"
+  -DPython3_EXECUTABLE="${HOSTPY}"
+  -DPython3_INCLUDE_DIR="${WINPY_INC}"
+  -DPython3_LIBRARY="${WINPY_MODULE_LIB}"
+  -DPython3_SABI_LIBRARY="${WINPY_SABI_LIB}"
+)
 
 cmake -S "${REPO_ROOT}" -B "${BUILD_DIR}" -G Ninja \
   "${TOOLCHAIN_ARGS[@]}" \
@@ -265,10 +276,7 @@ cmake -S "${REPO_ROOT}" -B "${BUILD_DIR}" -G Ninja \
   -DProtobuf_PROTOC_EXECUTABLE="${HOST_PROTOC}" \
   -DCMAKE_PREFIX_PATH="${DEPS_TARGET};${NANOBIND_CMAKE_DIR}" \
   -Dnanobind_DIR="${NANOBIND_CMAKE_DIR}" \
-  -DPython_EXECUTABLE="$(command -v python3)" \
-  -DPython_INCLUDE_DIR="${WINPY_INC}" \
-  -DPython_LIBRARY="${WINPY_LIB}" \
-  "${sabi_args[@]}"
+  "${python_args[@]}"
 
 cmake --build "${BUILD_DIR}" --target onnxsim_cpp2py_export -j "${JOBS}"
 
