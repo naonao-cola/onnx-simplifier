@@ -100,6 +100,58 @@ def test_dynamic_batch_size():
     assert len(sim_model.graph.node) == 1
 
 
+def test_dynamic_axes_preserve_dynamic_dimension():
+    # Regression test for GitHub issue #299. When a dimension of the input is
+    # dynamic, the shape computation that reads that dimension at runtime must
+    # NOT be constant-folded away, otherwise the simplified model bakes in the
+    # dummy batch size and breaks for every other input size.
+    #
+    # onnxsim only folds a node when *all* of its inputs are constants
+    # (initializers or the outputs of already-folded nodes). A graph input is
+    # not a constant, so a "Shape" op reading a dynamic input is never folded.
+    # This test locks that in behaviourally: the simplified model must still
+    # run correctly at a batch size different from the one used at export time.
+    class DynamicReshape(torch.nn.Module):
+        def __init__(self):
+            super(DynamicReshape, self).__init__()
+
+        def forward(self, x):
+            # Keep the dynamic batch dim, merge the two static trailing dims.
+            return x.reshape(x.shape[0], x.shape[1], x.shape[2] * x.shape[3])
+
+    net = DynamicReshape()
+    dummy_input = torch.randn(2, 3, 4, 5)
+    sim_model = export_simplify_and_check_by_python_api(
+        net,
+        dummy_input,
+        export_kwargs={
+            "input_names": ["input"],
+            "output_names": ["output"],
+            "dynamic_axes": {"input": {0: "batch"}, "output": {0: "batch"}},
+        },
+        simplify_kwargs={"test_input_shapes": {"input": [2, 3, 4, 5]}},
+    )
+
+    # The simplified model must still expose the batch dimension as dynamic
+    # rather than hardcoding the dummy value of 2.
+    in_dim0 = sim_model.graph.input[0].type.tensor_type.shape.dim[0]
+    out_dim0 = sim_model.graph.output[0].type.tensor_type.shape.dim[0]
+    assert in_dim0.dim_value == 0 and in_dim0.dim_param == "batch"
+    assert out_dim0.dim_value == 0 and out_dim0.dim_param == "batch"
+
+    # And it must actually run for a batch size other than the export dummy of
+    # 2. If the shape computation had been folded to a constant, this would
+    # raise or produce the wrong output shape.
+    for batch_size in (1, 2, 7):
+        x = np.random.rand(batch_size, 3, 4, 5).astype(np.float32)
+        outputs = onnxsim.backend.run_model(sim_model, {"input": x})
+        (result,) = outputs.values()
+        assert result.shape == (batch_size, 3, 20)
+        np.testing.assert_allclose(
+            result, x.reshape(batch_size, 3, 20), rtol=1e-5, atol=1e-6
+        )
+
+
 # NOTE: `include_subgraph` makes this test fail
 @skip_in_ci()
 def test_torchvision_fasterrcnn_fpn():
