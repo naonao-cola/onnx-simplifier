@@ -97,6 +97,71 @@ def check_and_update_input_shapes(model: onnx.ModelProto, input_shapes: Optional
 DEFAULT_TENSOR_SIZE_THRESHOLDHOLD = '1.5GB'
 
 
+# ONNX ``TensorProto`` element types that onnxoptimizer's tensor-value hashing
+# (``cse_util.h``) knows how to hash. Any other type makes those passes raise
+# ``RuntimeError: no supported data type: <N>``. We enumerate the *supported*
+# types (rather than the unsupported ones) so that element types added to ONNX
+# in the future are treated as unhashable by default instead of silently
+# crashing the optimizer.
+_CSE_HASHABLE_ELEM_TYPES = frozenset({
+    onnx.TensorProto.UNDEFINED,
+    onnx.TensorProto.BOOL,
+    onnx.TensorProto.INT8,
+    onnx.TensorProto.INT16,
+    onnx.TensorProto.INT32,
+    onnx.TensorProto.INT64,
+    onnx.TensorProto.UINT8,
+    onnx.TensorProto.UINT16,
+    onnx.TensorProto.UINT32,
+    onnx.TensorProto.UINT64,
+    onnx.TensorProto.FLOAT,
+    onnx.TensorProto.DOUBLE,
+    onnx.TensorProto.FLOAT16,
+    onnx.TensorProto.BFLOAT16,
+    onnx.TensorProto.COMPLEX64,
+    onnx.TensorProto.COMPLEX128,
+    onnx.TensorProto.STRING,
+})
+
+# onnxoptimizer passes that hash tensor *values* via ``cse_util.h``. They crash
+# on tensors whose element type they cannot hash -- for example the
+# ``float8_e4m3fn`` zero points in NVIDIA ModelOpt fp8 QDQ models (see GitHub
+# issue #348), or int4/uint4/float8 tensors in general.
+_TENSOR_VALUE_HASHING_OPTIMIZERS = (
+    "eliminate_common_subexpression",
+    "eliminate_duplicate_initializer",
+)
+
+
+def _iter_tensor_data_types(graph: onnx.GraphProto):
+    """Yield the ``data_type`` of every tensor stored inside ``graph``.
+
+    Covers initializers, ``Constant`` (and other) tensor/tensors attributes and
+    recurses into subgraphs, i.e. all the places onnxoptimizer might hash a
+    tensor value.
+    """
+    for initializer in graph.initializer:
+        yield initializer.data_type
+    for node in graph.node:
+        for attr in node.attribute:
+            if attr.HasField("t"):
+                yield attr.t.data_type
+            for tensor in attr.tensors:
+                yield tensor.data_type
+            if attr.HasField("g"):
+                yield from _iter_tensor_data_types(attr.g)
+            for subgraph in attr.graphs:
+                yield from _iter_tensor_data_types(subgraph)
+
+
+def _has_cse_unhashable_tensor(model: onnx.ModelProto) -> bool:
+    """Whether ``model`` contains a tensor onnxoptimizer's CSE cannot hash."""
+    return any(
+        data_type not in _CSE_HASHABLE_ELEM_TYPES
+        for data_type in _iter_tensor_data_types(model.graph)
+    )
+
+
 def _snapshot_doc_strings(model: onnx.ModelProto) -> dict:
     """Capture the ``doc_string`` fields that the C++ optimizer discards."""
     return {
@@ -219,6 +284,31 @@ def simplify(
         model = remove_unused_output(model, unused_output)
     if not mutable_initializer and model.ir_version >= 4:
         model = remove_initializer_from_input(model)
+
+    # onnxoptimizer's common-subexpression / duplicate-initializer passes hash
+    # tensor values and crash with "no supported data type: <N>" on element
+    # types they cannot hash, such as the float8 zero points produced by NVIDIA
+    # ModelOpt fp8 QDQ models (GitHub issue #348). When such a tensor is present
+    # we transparently skip those two passes so the rest of the simplification
+    # still runs, instead of failing outright. ``skipped_optimizers is None``
+    # means "skip every optimizer", so there is nothing to add in that case.
+    if skipped_optimizers is not None and _has_cse_unhashable_tensor(model):
+        added = [
+            opt for opt in _TENSOR_VALUE_HASHING_OPTIMIZERS
+            if opt not in skipped_optimizers
+        ]
+        if added:
+            skipped_optimizers.extend(added)
+            print(
+                Text(
+                    "The model contains tensors with element types that "
+                    "onnxoptimizer cannot hash (e.g. float8/int4 in NVIDIA "
+                    "ModelOpt fp8 QDQ models). Skipping the optimizers "
+                    f"{added} to avoid a crash; all other simplifications "
+                    "still run.",
+                    style="bold magenta",
+                )
+            )
 
     # The C++ optimizer re-serializes the graph and drops the `doc_string`
     # fields on the model, graph and input/output value infos. Snapshot them

@@ -204,3 +204,61 @@ def test_unfoldable_const_node_keeps_topological_order():
     onnx.checker.check_model(sim_model)
     op_types = [n.op_type for n in sim_model.graph.node]
     assert op_types.index("SequenceEmpty") < op_types.index("SequenceInsert")
+
+
+def test_fp8_qdq_model():
+    # Regression test for GitHub issue #348. NVIDIA ModelOpt emits fp8 QDQ
+    # models whose QuantizeLinear/DequantizeLinear zero points use the
+    # ``float8_e4m3fn`` element type (17). onnxoptimizer's tensor-value hashing
+    # passes (eliminate_common_subexpression / eliminate_duplicate_initializer)
+    # cannot hash such tensors and used to abort the whole simplification with
+    # "RuntimeError: no supported data type: 17". onnxsim now detects these
+    # tensors and transparently skips the offending passes instead of crashing.
+    def fp8_zero_point(name: str) -> onnx.TensorProto:
+        # A single float8_e4m3fn zero, expressed as its raw byte so the test
+        # does not depend on ml_dtypes.
+        return helper.make_tensor(name, TensorProto.FLOAT8E4M3FN, [], b"\x00", raw=True)
+
+    weight = helper.make_tensor(
+        "W", TensorProto.FLOAT, [4, 3], [0.1 * i for i in range(12)]
+    )
+    w_scale = helper.make_tensor("w_scale", TensorProto.FLOAT, [], [0.05])
+    a_scale = helper.make_tensor("a_scale", TensorProto.FLOAT, [], [0.1])
+
+    nodes = [
+        # activation QDQ (dynamic input, must be preserved)
+        helper.make_node("QuantizeLinear", ["X", "a_scale", "a_zp"], ["X_q"]),
+        helper.make_node("DequantizeLinear", ["X_q", "a_scale", "a_zp"], ["X_dq"]),
+        # weight QDQ (constant inputs) plus a duplicated weight zero point to
+        # exercise eliminate_duplicate_initializer as well.
+        helper.make_node("QuantizeLinear", ["W", "w_scale", "w_zp"], ["W_q"]),
+        helper.make_node("DequantizeLinear", ["W_q", "w_scale", "w_zp2"], ["W_dq"]),
+        helper.make_node("MatMul", ["X_dq", "W_dq"], ["Y"]),
+    ]
+    graph = helper.make_graph(
+        nodes,
+        "fp8_qdq",
+        [helper.make_tensor_value_info("X", TensorProto.FLOAT, [2, 4])],
+        [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [2, 3])],
+        [
+            weight,
+            w_scale,
+            a_scale,
+            fp8_zero_point("a_zp"),
+            fp8_zero_point("w_zp"),
+            fp8_zero_point("w_zp2"),
+        ],
+    )
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 21)])
+    model.ir_version = 10
+    onnx.checker.check_model(model)
+
+    # Must not raise "no supported data type: 17".
+    sim_model, check_ok = onnxsim.simplify(model)
+    assert check_ok
+    onnx.checker.check_model(sim_model)
+    # The fp8 QDQ structure must survive simplification.
+    op_types = [n.op_type for n in sim_model.graph.node]
+    assert op_types.count("QuantizeLinear") == 2
+    assert op_types.count("DequantizeLinear") == 2
+    assert "MatMul" in op_types
