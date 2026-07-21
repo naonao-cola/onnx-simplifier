@@ -15,3 +15,9 @@
 # loads only on the exact build-time CPython. Forcing the target to exist makes
 # nanobind emit a genuine abi3 module depending only on python3.dll.
 find_package(Python REQUIRED COMPONENTS Interpreter Development.Module Development.SABIModule)
+
+if(TARGET Python::SABIModule)
+  message(STATUS "XDIAG@early SABIModule=YES Python_VERSION=${Python_VERSION} INTERPRETER_ID=${Python_INTERPRETER_ID}")
+else()
+  message(STATUS "XDIAG@early SABIModule=NO Python_VERSION=${Python_VERSION} INTERPRETER_ID=${Python_INTERPRETER_ID}")
+endif()

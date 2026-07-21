@@ -84,6 +84,11 @@ if (ONNXSIM_PYTHON)
     Python 3.10
     COMPONENTS Interpreter Development.Module REQUIRED
     OPTIONAL_COMPONENTS Development.SABIModule)
+  if(TARGET Python::SABIModule)
+    message(STATUS "XDIAG@onnxsim SABIModule=YES Python_VERSION=${Python_VERSION} INTERPRETER_ID=${Python_INTERPRETER_ID}")
+  else()
+    message(STATUS "XDIAG@onnxsim SABIModule=NO Python_VERSION=${Python_VERSION} INTERPRETER_ID=${Python_INTERPRETER_ID}")
+  endif()
   nanobind_add_module(onnxsim_cpp2py_export onnxsim/cpp2py_export.cc STABLE_ABI)
   target_link_libraries(onnxsim_cpp2py_export PRIVATE onnxsim)
 endif()
