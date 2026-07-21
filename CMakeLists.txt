@@ -37,6 +37,13 @@ endif()
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 if (ONNXSIM_BUILTIN_ORT)
+  # The top-level project only enables CXX, but ONNX Runtime (added below as a
+  # subdirectory) compiles C and assembly sources. Enable the languages it needs
+  # before configuring it. Emscripten's toolchain handles this on its own.
+  if (NOT EMSCRIPTEN)
+    enable_language(C)
+    enable_language(ASM)
+  endif()
   include(cmake/build_ort.cmake)
   if (EMSCRIPTEN)
     set(ORT_NAME onnxruntime_webassembly)
