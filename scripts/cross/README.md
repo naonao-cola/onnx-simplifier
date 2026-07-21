@@ -49,7 +49,13 @@ Select with `BACKEND=llvm-mingw` / `BACKEND=clang-cl`. Each has a matching
 4. **Target abseil + protobuf** cross-built so ONNX has something to link.
    Versions come from ONNX's SBOM so the host `protoc` and target `libprotobuf`
    always match.
-5. **onnxsim's nanobind extension** cross-built against all of the above.
+5. **onnxsim's nanobind extension** cross-built against all of the above. A
+   small portability patch (`onnx-msvc-portability.patch`) is applied to the
+   vendored onnx first: onnx's Windows code uses a reinterpret-cast pointer as a
+   non-type template argument and a case-sensitive `<Windows.h>`, both of which
+   only MSVC's `cl.exe` accepts — Clang (clang-cl and mingw alike) rejects them.
+   The patch is applied idempotently at build time and reverts cleanly; it is a
+   candidate for upstreaming to onnx.
 6. **`assemble_wheel.py`** packs the `.pyd` into a correctly tagged wheel
    (setup.py cannot drive packaging when cross-compiling, as it assumes the
    host's extension suffix and build layout).

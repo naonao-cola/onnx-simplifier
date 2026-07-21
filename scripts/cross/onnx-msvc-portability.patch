@@ -1,0 +1,50 @@
+diff --git a/onnx/checker.cc b/onnx/checker.cc
+index e5c7c595c..c9744212b 100644
+--- a/onnx/checker.cc
++++ b/onnx/checker.cc
+@@ -22,7 +22,7 @@
+ #include "onnx/shape_inference/implementation.h"
+ 
+ #ifdef _WIN32
+-#include <Windows.h>
++#include <windows.h>
+ #include <fcntl.h>
+ #include <io.h>
+ #else
+diff --git a/onnx/common/scoped_resource.h b/onnx/common/scoped_resource.h
+index 525e4d6d8..477d8ebc8 100644
+--- a/onnx/common/scoped_resource.h
++++ b/onnx/common/scoped_resource.h
+@@ -56,7 +56,31 @@ class ScopedResource {
+ inline void close_handle(HANDLE h) {
+   CloseHandle(h);
+ }
+-using ScopedHandle = ScopedResource<INVALID_HANDLE_VALUE, close_handle>;
++// INVALID_HANDLE_VALUE is ((HANDLE)-1). MSVC accepts it as a non-type template
++// argument, but standard C++ forbids a reinterpret-cast pointer there, so Clang
++// (clang-cl and mingw alike) rejects ScopedResource<INVALID_HANDLE_VALUE, ...>.
++// Use a dedicated RAII class that only references the sentinel at runtime.
++class ScopedHandle {
++  HANDLE val_;
++
++ public:
++  explicit ScopedHandle(HANDLE v) : val_(v) {}
++  ~ScopedHandle() {
++    if (val_ != INVALID_HANDLE_VALUE) {
++      close_handle(val_);
++    }
++  }
++  HANDLE get() const {
++    return val_;
++  }
++  HANDLE release() {
++    HANDLE tmp = val_;
++    val_ = INVALID_HANDLE_VALUE;
++    return tmp;
++  }
++  ScopedHandle(const ScopedHandle&) = delete;
++  ScopedHandle& operator=(const ScopedHandle&) = delete;
++};
+ #endif
+ 
+ inline void close_fd(int fd) {

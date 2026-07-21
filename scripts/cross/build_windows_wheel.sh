@@ -240,6 +240,21 @@ fi
 # 5. Cross-build the onnxsim extension
 # ---------------------------------------------------------------------------
 echo "== [5/6] cross-building onnxsim extension =="
+
+# Apply the onnx MSVC-portability patch: onnx's Windows code uses constructs only
+# cl.exe accepts (a reinterpret-cast pointer as a non-type template argument, and
+# a case-sensitive <Windows.h>), which Clang -- clang-cl and mingw alike --
+# rejects when cross-compiling. Applied idempotently so local re-runs are safe.
+ONNX_PATCH="${REPO_ROOT}/scripts/cross/onnx-msvc-portability.patch"
+if git -C "${ONNX_DIR}" apply --reverse --check "${ONNX_PATCH}" 2>/dev/null; then
+  echo "onnx portability patch already applied"
+elif git -C "${ONNX_DIR}" apply --check "${ONNX_PATCH}" 2>/dev/null; then
+  git -C "${ONNX_DIR}" apply "${ONNX_PATCH}"
+  echo "applied onnx portability patch"
+else
+  echo "ERROR: ${ONNX_PATCH} does not apply cleanly (onnx version drift?)"; exit 1
+fi
+
 NANOBIND_CMAKE_DIR="$(python3 -m nanobind --cmake_dir)"
 
 BUILD_DIR="${WORK}/onnxsim-build-${PYVER}$([[ "${ABI3}" == "1" ]] && echo -abi3)"
