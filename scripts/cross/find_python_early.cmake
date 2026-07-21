@@ -9,15 +9,9 @@
 # using the target dev-lib hints passed on the CMake command line
 # (Python_EXECUTABLE / Python_INCLUDE_DIR / Python_LIBRARY / Python_SABI_LIBRARY).
 #
-# Development.SABIModule is REQUIRED (not optional): nanobind silently disables
-# the stable ABI and links the version-specific Python::Module (-> pythonXY.dll)
-# whenever the Python::SABIModule target is absent, which produces a wheel that
-# loads only on the exact build-time CPython. Forcing the target to exist makes
-# nanobind emit a genuine abi3 module depending only on python3.dll.
+# Development.SABIModule is included because onnx's cross branch requires it
+# (via the Python3 package) and onnxsim uses nanobind's STABLE_ABI. Note the
+# produced wheels are still version-specific: python-build-standalone's
+# python3.lib imports the versioned pythonXY.dll rather than the stable-ABI
+# python3.dll, so each wheel is built and tagged per CPython version.
 find_package(Python REQUIRED COMPONENTS Interpreter Development.Module Development.SABIModule)
-
-if(TARGET Python::SABIModule)
-  message(STATUS "XDIAG@early SABIModule=YES Python_VERSION=${Python_VERSION} INTERPRETER_ID=${Python_INTERPRETER_ID}")
-else()
-  message(STATUS "XDIAG@early SABIModule=NO Python_VERSION=${Python_VERSION} INTERPRETER_ID=${Python_INTERPRETER_ID}")
-endif()

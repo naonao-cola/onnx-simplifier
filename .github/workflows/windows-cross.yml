@@ -1,13 +1,14 @@
 name: Windows wheel (Linux cross-build)
 
-# Proof-of-concept: build the Windows wheel on a cheap Ubuntu runner by
+# Proof-of-concept: build the Windows wheels on a cheap Ubuntu runner by
 # cross-compiling with llvm-mingw (clang + lld + a self-contained UCRT sysroot),
-# then run the test suite on a Windows runner against the pre-built wheel.  This
+# then run the test suite on a Windows runner against each pre-built wheel. This
 # runs alongside the native Windows build in build-and-test.yml; it does not
-# replace it yet.
+# replace it.
 #
-# Currently limited to CPython 3.12 (limited-API / abi3), whose wheel also
-# covers 3.13+.
+# Wheels are version-specific (one per CPython): python-build-standalone's
+# python3.lib imports the versioned pythonXY.dll rather than the stable-ABI
+# python3.dll, so a single abi3 wheel cannot span versions here.
 
 on:
   workflow_dispatch:
@@ -18,8 +19,12 @@ on:
 
 jobs:
   build-on-linux:
-    name: Cross-build Windows wheel on Ubuntu (cp312 abi3, llvm-mingw)
+    name: Cross-build Windows wheel on Ubuntu (py ${{ matrix.py_ver }}, llvm-mingw)
     runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        py_ver: ['3.12', '3.13']
     steps:
       - uses: actions/checkout@v7
         with:
@@ -34,7 +39,7 @@ jobs:
 
       - uses: actions/setup-python@v7
         with:
-          python-version: '3.12'
+          python-version: ${{ matrix.py_ver }}
 
       - name: Install Python build dependencies
         run: |
@@ -44,13 +49,13 @@ jobs:
       - name: Cross-build wheel (llvm-mingw)
         env:
           BACKEND: llvm-mingw
-          PYVER: '3.12'
-          ABI3: '1'
+          PYVER: ${{ matrix.py_ver }}
+          ABI3: '0'
         run: bash scripts/cross/build_windows_wheel.sh
 
       - uses: actions/upload-artifact@v7
         with:
-          name: windows-cross-wheel-cp312
+          name: windows-cross-wheel-${{ matrix.py_ver }}
           path: ./wheelhouse/*.whl
 
   test-on-windows:
@@ -72,7 +77,7 @@ jobs:
 
       - uses: actions/download-artifact@v8
         with:
-          name: windows-cross-wheel-cp312
+          name: windows-cross-wheel-${{ matrix.py_ver }}
           path: wheelhouse
 
       - name: Install cross-built wheel + test deps

@@ -62,11 +62,14 @@ Select with `BACKEND=llvm-mingw` / `BACKEND=clang-cl`. Each has a matching
 
 ## Scope / status
 
-* Currently a **proof of concept** limited to CPython **3.12 (abi3)**; that
-  wheel also serves 3.13+. `build-and-test.yml` still builds the release
-  Windows wheels natively — this path runs alongside it.
-* To extend to 3.10 / 3.11, run the script with `PYVER=3.10 ABI3=0` etc. and
-  add matching test-matrix entries.
+* **Proof of concept** covering CPython **3.12 and 3.13**, one version-specific
+  wheel each (matrixed in the workflow). `build-and-test.yml` still builds the
+  release Windows wheels natively — this path runs alongside it.
+* Wheels are **version-specific, not abi3**: python-build-standalone's
+  `python3.lib` imports the versioned `pythonXY.dll` rather than the stable-ABI
+  `python3.dll`, so a single abi3 wheel cannot span versions with these import
+  libraries. To add 3.10 / 3.11, add matrix entries (the script already accepts
+  any `PYVER`).
 * onnxruntime is **not** compiled in (`-DONNXSIM_BUILTIN_ORT=OFF`, matching the
   pip build), keeping the cross-compile surface to onnx + protobuf + nanobind.
 

@@ -305,11 +305,12 @@ PYD="$(find "${BUILD_DIR}" -name 'onnxsim_cpp2py_export*.pyd' -print -quit)"
 [[ -n "${PYD}" ]] || { echo "no .pyd produced"; find "${BUILD_DIR}" -name 'onnxsim_cpp2py_export*'; exit 1; }
 echo "built: ${PYD}"
 
-# Diagnostic: which Python DLL does the module import? A true abi3 module depends
-# on python3.dll; a version-locked one depends on pythonXY.dll.
-echo "XDIAG .pyd basename: $(basename "${PYD}")"
-echo "XDIAG .pyd DLL imports:"
-"${LLVM_MINGW_DIR}/bin/llvm-readobj" --coff-imports "${PYD}" 2>/dev/null | grep -iE "Name:.*\.dll" || true
+# Report which DLLs the module imports (expects pythonXY.dll for the target
+# version, the UCRT api-ms-win-crt-* set, and system DLLs -- no libstdc++/libgcc).
+if [[ "${BACKEND}" == "llvm-mingw" ]]; then
+  echo "== ${PYD##*/} DLL imports =="
+  "${LLVM_MINGW_DIR}/bin/llvm-readobj" --coff-imports "${PYD}" 2>/dev/null | grep -iE "Name:.*\.dll" || true
+fi
 
 # ---------------------------------------------------------------------------
 # 6. Pack the wheel
