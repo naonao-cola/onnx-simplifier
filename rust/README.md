@@ -65,13 +65,18 @@ for name in onnxsim::list_optimizers() {
 three modes:
 
 1. **From source (default).** Runs CMake to build the full onnxsim stack
-   (ONNX Runtime, onnx-optimizer, protobuf). This is heavy the first time and
-   requires the git submodules to be checked out:
+   (ONNX Runtime, onnx-optimizer, protobuf). This is heavy the first time. Check
+   out the git submodules first (for onnx-optimizer); the ONNX Runtime source is
+   not a submodule and is downloaded automatically on the first build:
 
    ```sh
    git submodule update --init --recursive
    cargo build
    ```
+
+   Set `ONNXSIM_SKIP_ORT_DOWNLOAD=1` to forbid the automatic download (the build
+   then requires the ONNX Runtime source to already be present at
+   `third_party/onnxruntime-1.27.1`).
 
 2. **Pre-built library.** If you already have `onnxsim_c` (and its dependencies)
    built, point the build script at the directory (or directories, `:`-separated)
@@ -96,9 +101,10 @@ three modes:
 
 | Variable             | Effect                                                        |
 | -------------------- | ------------------------------------------------------------- |
-| `ONNXSIM_NO_BUILD`   | Skip the native build entirely (type-check only).             |
-| `ONNXSIM_LIB_DIR`    | `:`-separated dirs holding a pre-built `onnxsim_c`.           |
-| `ONNXSIM_SOURCE_DIR` | Override the path to the onnxsim C++ source (default `../..`). |
+| `ONNXSIM_NO_BUILD`        | Skip the native build entirely (type-check only).        |
+| `ONNXSIM_LIB_DIR`         | `:`-separated dirs holding a pre-built `onnxsim_c`.      |
+| `ONNXSIM_SOURCE_DIR`      | Override the onnxsim C++ source path (default `../..`).  |
+| `ONNXSIM_SKIP_ORT_DOWNLOAD` | Forbid the automatic ONNX Runtime source download.    |
 
 ## Examples & tests
 

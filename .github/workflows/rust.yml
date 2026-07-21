@@ -18,6 +18,7 @@ jobs:
   lint:
     name: fmt / clippy (no native build)
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     env:
       ONNXSIM_NO_BUILD: "1"
     steps:
@@ -34,6 +35,9 @@ jobs:
   build:
     name: build + smoke test (native)
     runs-on: ubuntu-latest
+    # The first build compiles ONNX Runtime, onnx, and protobuf from source
+    # (sccache warms subsequent runs), so allow generous headroom.
+    timeout-minutes: 120
     env:
       CMAKE_GENERATOR: Ninja
       CMAKE_CXX_COMPILER_LAUNCHER: sccache
@@ -48,6 +52,13 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: Install build tools
         run: sudo apt-get update && sudo apt-get install -y ninja-build
+      # ONNX Runtime source is not a git submodule; onnxsim-sys downloads it on
+      # demand. Cache it so it is fetched at most once per version.
+      - name: Cache ONNX Runtime source
+        uses: actions/cache@v4
+        with:
+          path: third_party/onnxruntime-1.27.1
+          key: onnxruntime-src-1.27.1
       - name: Build the workspace (compiles and links the native library)
         run: cargo build --release --workspace
       - name: Run tests (unit + linked integration tests)

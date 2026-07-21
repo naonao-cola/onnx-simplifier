@@ -137,3 +137,7 @@ onnxsim/version.py
 # Rust
 /rust/target/
 rust/Cargo.lock
+
+# ONNX Runtime source fetched on demand by the Rust build (see build_wasm.sh)
+/third_party/onnxruntime-*/
+/third_party/v*.zip
