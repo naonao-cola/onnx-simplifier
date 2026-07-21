@@ -180,6 +180,20 @@ def test_ext():
         assert check_ok
 
 
+def _constant_value(model, name):
+    # Return the constant value produced for `name`, whether it is delivered as
+    # a graph initializer or as a Constant node's value attribute, else None.
+    for initializer in model.graph.initializer:
+        if initializer.name == name:
+            return numpy_helper.to_array(initializer)
+    for node in model.graph.node:
+        if node.op_type == "Constant" and name in node.output:
+            for attr in node.attribute:
+                if attr.name == "value":
+                    return numpy_helper.to_array(attr.t)
+    return None
+
+
 def test_partial_shape_evaluation_gather():
     # Partial shape evaluation for https://github.com/onnxsim/onnxsim/issues/139
     # The input's leading dimension is dynamic, but a Gather that reads only the
@@ -203,9 +217,9 @@ def test_partial_shape_evaluation_gather():
     # batch dimension is dynamic.
     assert "Shape" not in op_types
     assert "Gather" not in op_types
-    initializers = {i.name: i for i in sim_model.graph.initializer}
-    assert "g" in initializers
-    assert list(numpy_helper.to_array(initializers["g"])) == [3, 4, 5]
+    value = _constant_value(sim_model, "g")
+    assert value is not None
+    assert list(value) == [3, 4, 5]
 
 
 def test_partial_shape_evaluation_keeps_dynamic_gather():
@@ -226,8 +240,10 @@ def test_partial_shape_evaluation_keeps_dynamic_gather():
     assert check_ok
     onnx.checker.check_model(sim_model)
     op_types = [n.op_type for n in sim_model.graph.node]
-    # The dynamic dimension cannot be pre-computed, so the ops stay.
+    # The dynamic dimension cannot be pre-computed, so the ops stay and "g" is
+    # not turned into a constant.
     assert "Gather" in op_types
+    assert _constant_value(sim_model, "g") is None
 
 
 def test_unfoldable_const_node_keeps_topological_order():
