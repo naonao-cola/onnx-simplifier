@@ -13,6 +13,7 @@
 #include "onnxruntime/core/common/endian.h"
 #include "onnxruntime/core/session/onnxruntime_cxx_api.h"
 #endif
+#include "contrib_schemas.h"
 #include "onnx/common/file_utils.h"
 #include "onnx/defs/printer.h"
 #include "onnx/defs/schema.h"
@@ -518,6 +519,10 @@ onnx::ModelProto Simplify(
     const ModelExecutor& executor, const onnx::ModelProto& model,
     std::optional<std::vector<std::string>> skip_optimizers,
     bool constant_folding, bool shape_inference, size_t tensor_size_threshold) {
+  // Make shape inference aware of ONNX Runtime's quantized contrib operators
+  // (QLinearAdd and friends) so shape deduction does not stop at them.
+  onnxsim::RegisterContribOpSchemas();
+
   Check(model);
 
   config.tensor_size_threshold = tensor_size_threshold;

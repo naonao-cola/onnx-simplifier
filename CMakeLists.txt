@@ -47,7 +47,7 @@ endif()
 # configure onnx-optimizer after onnxruntime, because they both depend on onnx and onnxruntime has its own flags for onnx
 add_subdirectory(third_party/onnx-optimizer EXCLUDE_FROM_ALL)
 
-add_library(onnxsim onnxsim/onnxsim.cpp)
+add_library(onnxsim onnxsim/onnxsim.cpp onnxsim/contrib_schemas.cpp)
 if (ONNXSIM_BUILTIN_ORT)
   target_include_directories(onnxsim PRIVATE ${ONNXRUNTIME_INCLUDE_DIR})
 endif()

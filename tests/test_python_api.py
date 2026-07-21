@@ -388,6 +388,125 @@ def test_preserve_doc_strings():
     assert sim_model.graph.output[0].doc_string == "output documentation"
 
 
+def _make_scalar_initializer(name: str, value, dtype) -> onnx.TensorProto:
+    return onnx.numpy_helper.from_array(np.array(value, dtype=dtype), name)
+
+
+def _quant_params():
+    return [
+        _make_scalar_initializer("s", 0.01, np.float32),
+        _make_scalar_initializer("zp", 128, np.uint8),
+    ]
+
+
+def _build_contrib_model(nodes, inputs, outputs, initializer):
+    graph = onnx.helper.make_graph(nodes, "g", inputs, outputs, initializer=initializer)
+    model = onnx.helper.make_model(
+        graph,
+        opset_imports=[
+            onnx.helper.make_opsetid("", 13),
+            onnx.helper.make_opsetid("com.microsoft", 1),
+        ],
+    )
+    model.ir_version = 9
+    return model
+
+
+def _value_info_shape(model: onnx.ModelProto, name: str):
+    for vi in model.graph.value_info:
+        if vi.name == name:
+            tensor_type = vi.type.tensor_type
+            if not tensor_type.HasField("shape"):
+                return None
+            return [d.dim_value for d in tensor_type.shape.dim]
+    return None
+
+
+def test_qlinear_add_shape_inference():
+    # QLinearAdd is an ONNX Runtime "com.microsoft" contrib op. Without a schema
+    # registered for it, ONNX shape inference stops and the intermediate tensor
+    # never gets a shape (GitHub issue #245).
+    nodes = [
+        onnx.helper.make_node(
+            "QLinearAdd",
+            ["A", "s", "zp", "B", "s", "zp", "s", "zp"],
+            ["C"],
+            domain="com.microsoft",
+        ),
+        onnx.helper.make_node("DequantizeLinear", ["C", "s", "zp"], ["out"]),
+    ]
+    inputs = [
+        onnx.helper.make_tensor_value_info("A", onnx.TensorProto.UINT8, [1, 3, 16, 16]),
+        onnx.helper.make_tensor_value_info("B", onnx.TensorProto.UINT8, [1, 3, 16, 16]),
+    ]
+    outputs = [
+        onnx.helper.make_tensor_value_info(
+            "out", onnx.TensorProto.FLOAT, [1, 3, 16, 16]
+        )
+    ]
+    model = _build_contrib_model(nodes, inputs, outputs, _quant_params())
+    sim_model, check_ok = onnxsim.simplify(model)
+    assert check_ok
+    assert _value_info_shape(sim_model, "C") == [1, 3, 16, 16]
+
+
+def test_qlinear_concat_shape_inference():
+    nodes = [
+        onnx.helper.make_node(
+            "QLinearConcat",
+            ["s", "zp", "A", "s", "zp", "B", "s", "zp"],
+            ["C"],
+            domain="com.microsoft",
+            axis=1,
+        ),
+        onnx.helper.make_node("DequantizeLinear", ["C", "s", "zp"], ["out"]),
+    ]
+    inputs = [
+        onnx.helper.make_tensor_value_info("A", onnx.TensorProto.UINT8, [1, 3, 16, 16]),
+        onnx.helper.make_tensor_value_info("B", onnx.TensorProto.UINT8, [1, 5, 16, 16]),
+    ]
+    outputs = [
+        onnx.helper.make_tensor_value_info(
+            "out", onnx.TensorProto.FLOAT, [1, 8, 16, 16]
+        )
+    ]
+    model = _build_contrib_model(nodes, inputs, outputs, _quant_params())
+    sim_model, check_ok = onnxsim.simplify(model)
+    assert check_ok
+    assert _value_info_shape(sim_model, "C") == [1, 8, 16, 16]
+
+
+def test_unknown_contrib_op_is_tolerated():
+    # Registering schemas for the supported quantized ops must not make the
+    # checker reject other, unregistered "com.microsoft" contrib operators.
+    nodes = [
+        onnx.helper.make_node(
+            "QLinearAdd",
+            ["A", "s", "zp", "B", "s", "zp", "s", "zp"],
+            ["C"],
+            domain="com.microsoft",
+        ),
+        onnx.helper.make_node(
+            "SomeUnknownContribOp", ["C"], ["D"], domain="com.microsoft"
+        ),
+        onnx.helper.make_node("DequantizeLinear", ["C", "s", "zp"], ["out"]),
+    ]
+    inputs = [
+        onnx.helper.make_tensor_value_info("A", onnx.TensorProto.UINT8, [1, 3, 16, 16]),
+        onnx.helper.make_tensor_value_info("B", onnx.TensorProto.UINT8, [1, 3, 16, 16]),
+    ]
+    outputs = [
+        onnx.helper.make_tensor_value_info(
+            "out", onnx.TensorProto.FLOAT, [1, 3, 16, 16]
+        ),
+        onnx.helper.make_tensor_value_info("D", onnx.TensorProto.UINT8, [1, 3, 16, 16]),
+    ]
+    model = _build_contrib_model(nodes, inputs, outputs, _quant_params())
+    sim_model, check_ok = onnxsim.simplify(model, skip_constant_folding=True)
+    assert check_ok
+    assert _value_info_shape(sim_model, "C") == [1, 3, 16, 16]
+
+
 def test_perform_optimization_false():
     def _create_dummy_model():
         class MockModel(torch.nn.Module):
