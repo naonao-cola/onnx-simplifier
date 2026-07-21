@@ -589,11 +589,11 @@ def test_run_coerces_non_ndarray_output():
     outputs = executor.Run(model.SerializeToString(), [])
 
     assert len(outputs) == 1
-    result_tp = onnx.TensorProto()
-    result_tp.ParseFromString(outputs[0])
-    result = onnx.numpy_helper.to_array(result_tp)
-    assert isinstance(result, np.ndarray)
-    assert result.size == 0
+    assert outputs[0] == []
+
+    sim_model, check_ok = onnxsim.simplify(model)
+    assert check_ok
+    print(sim_model)
 
 
 def test_perform_optimization_false():

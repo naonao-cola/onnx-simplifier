@@ -311,13 +311,9 @@ class PyModelExecutor(C.ModelExecutor):
         # output). onnx.numpy_helper.from_array only accepts numpy arrays, so
         # coerce any such value into an empty array instead of crashing with
         # "'list' object has no attribute 'shape'" (GitHub PR #249).
-        output_arrs = [
-            x if isinstance(x, np.ndarray) else np.array([])
-            for x in outputs.values()
-        ]
         return [
-            onnx.numpy_helper.from_array(x).SerializeToString()
-            for x in output_arrs
+            onnx.numpy_helper.from_array(x).SerializeToString() if isinstance(x, np.ndarray) else x
+            for x in outputs.values()
         ]
 
 

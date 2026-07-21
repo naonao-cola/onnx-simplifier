@@ -460,7 +460,7 @@ onnx::ModelProto _FoldConstant(const ModelExecutor& executor,
         }
       } catch (const std::exception& e) {
         std::cerr << "WARNING: failed to run \"" << x.op_type() <<
-          "\" op (name is \"" << x.name() << "\"), skip..." << std::endl;
+          "\" op (name is \"" << x.name() << "\"), skip... " << e.what() << std::endl;
       }
     }
     // Rebuild the node list in its original topological order, dropping only
