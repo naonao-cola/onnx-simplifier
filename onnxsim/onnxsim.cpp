@@ -931,6 +931,65 @@ void RegisterCustomDefaultDomainOpSchemas(const onnx::ModelProto& model) {
   }
 }
 
+// Collect the names of every node in `graph`, descending into subgraphs held in
+// node attributes (If/Loop/Scan bodies). Used to de-duplicate the names later
+// assigned to nameless nodes.
+void CollectNodeNames(const onnx::GraphProto& graph,
+                      std::set<std::string>& names) {
+  for (const auto& node : graph.node()) {
+    if (!node.name().empty()) {
+      names.insert(node.name());
+    }
+    for (const auto& attr : node.attribute()) {
+      if (attr.has_g()) {
+        CollectNodeNames(attr.g(), names);
+      }
+      for (const auto& subgraph : attr.graphs()) {
+        CollectNodeNames(subgraph, names);
+      }
+    }
+  }
+}
+
+// Give a unique, deterministic name to every node that has none. Nodes without
+// a name survive simplification unnamed -- either because they were nameless in
+// the input model or because an onnx-optimizer pass created a replacement node
+// without setting a name -- which trips up downstream tooling that keys on node
+// names (issue #269). Each generated name is derived from the op type plus a
+// running counter and de-duplicated against every name already present in the
+// graph (including names generated earlier in this pass). Subgraphs are handled
+// recursively so nodes inside If/Loop/Scan bodies are named too.
+void AssignMissingNodeNames(onnx::GraphProto& graph,
+                            std::set<std::string>& used_names,
+                            size_t& counter) {
+  for (auto& node : *graph.mutable_node()) {
+    if (node.name().empty()) {
+      std::string name;
+      do {
+        name = node.op_type() + "_" + std::to_string(counter++);
+      } while (used_names.count(name) > 0);
+      used_names.insert(name);
+      node.set_name(name);
+    }
+    for (auto& attr : *node.mutable_attribute()) {
+      if (attr.has_g()) {
+        AssignMissingNodeNames(*attr.mutable_g(), used_names, counter);
+      }
+      for (auto& subgraph : *attr.mutable_graphs()) {
+        AssignMissingNodeNames(subgraph, used_names, counter);
+      }
+    }
+  }
+}
+
+// Assign names to any nodes left nameless after simplification (issue #269).
+void AssignMissingNodeNames(onnx::ModelProto& model) {
+  std::set<std::string> used_names;
+  CollectNodeNames(model.graph(), used_names);
+  size_t counter = 0;
+  AssignMissingNodeNames(*model.mutable_graph(), used_names, counter);
+}
+
 void Check(const onnx::ModelProto& model) { onnx::checker::check_model(model); }
 
 onnx::ModelProto Simplify(
@@ -997,6 +1056,10 @@ onnx::ModelProto Simplify(
   // input model and simplify it in place.
   onnx::ModelProto sim_model = model;
   OptAndShapeAndFold(sim_model);
+  // Simplification (and some onnx-optimizer passes) can leave nodes without a
+  // name; assign unique names to them so downstream tools that key on node
+  // names keep working (issue #269).
+  AssignMissingNodeNames(sim_model);
   Check(sim_model);
   if (!converged) {
     std::cout << "WARNING: the simplification stopped because of timeout. "
