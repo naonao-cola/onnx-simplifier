@@ -60,6 +60,12 @@ Select with `BACKEND=llvm-mingw` / `BACKEND=clang-cl`. Each has a matching
    (setup.py cannot drive packaging when cross-compiling, as it assumes the
    host's extension suffix and build layout).
 
+When `sccache` is on `PATH`, it is used as the CMake compiler launcher for every
+stage, so object files (host protoc, target abseil/protobuf, onnx/onnxsim) are
+cached across runs. The workflow provides it via `mozilla-actions/sccache-action`
+with the GitHub Actions cache backend, matching `build-and-test.yml`; the first
+run is a cold cache, later runs reuse it.
+
 ## Scope / status
 
 * **Proof of concept** covering CPython **3.12 and 3.13**, one version-specific

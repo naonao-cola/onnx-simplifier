@@ -107,6 +107,17 @@ fetch() {  # fetch <url> <dest>
   fi
 }
 
+# Use sccache as the compiler launcher for every stage when available, so the
+# host protoc, target abseil/protobuf, and onnx/onnxsim object files are cached
+# across runs (matching build-and-test.yml). The workflow provides sccache via
+# mozilla-actions/sccache-action with the GitHub Actions cache backend.
+SCCACHE_ARGS=()
+if command -v sccache >/dev/null; then
+  SCCACHE_ARGS=( -DCMAKE_C_COMPILER_LAUNCHER=sccache -DCMAKE_CXX_COMPILER_LAUNCHER=sccache )
+  sccache --start-server >/dev/null 2>&1 || true
+  echo "sccache enabled: $(command -v sccache)"
+fi
+
 # ---------------------------------------------------------------------------
 # 1. Target toolchain
 #
@@ -188,12 +199,14 @@ if [[ ! -x "${HOST_PROTOC}" ]]; then
   tar -C "${WORK}/protobuf-host-src" --strip-components=1 -xf "${DL}/protobuf.tar.gz"
 
   cmake -S "${WORK}/absl-host-src" -B "${WORK}/absl-host-build" -G Ninja \
+    "${SCCACHE_ARGS[@]}" \
     -DCMAKE_BUILD_TYPE=Release -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
     -DABSL_PROPAGATE_CXX_STD=ON -DABSL_ENABLE_INSTALL=ON \
     -DCMAKE_INSTALL_PREFIX="${DEPS_HOST}"
   cmake --build "${WORK}/absl-host-build" --target install -j "${JOBS}"
 
   cmake -S "${WORK}/protobuf-host-src" -B "${WORK}/protobuf-host-build" -G Ninja \
+    "${SCCACHE_ARGS[@]}" \
     -DCMAKE_BUILD_TYPE=Release -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
     -Dprotobuf_BUILD_TESTS=OFF -Dprotobuf_ABSL_PROVIDER=package \
     -DCMAKE_PREFIX_PATH="${DEPS_HOST}" -DCMAKE_INSTALL_PREFIX="${DEPS_HOST}"
@@ -223,6 +236,7 @@ if [[ ! -f "${DEPS_TARGET}/.done" ]]; then
   common_target_args=(
     -G Ninja
     "${TOOLCHAIN_ARGS[@]}"
+    "${SCCACHE_ARGS[@]}"
     -DCMAKE_BUILD_TYPE=Release
     # ONNX links protobuf statically (onnxsim CI: ONNX_USE_PROTOBUF_SHARED_LIBS=OFF).
     -DBUILD_SHARED_LIBS=OFF
@@ -286,6 +300,7 @@ python_args=(
 
 cmake -S "${REPO_ROOT}" -B "${BUILD_DIR}" -G Ninja \
   "${TOOLCHAIN_ARGS[@]}" \
+  "${SCCACHE_ARGS[@]}" \
   -DCMAKE_PROJECT_TOP_LEVEL_INCLUDES="${REPO_ROOT}/scripts/cross/find_python_early.cmake" \
   -DCMAKE_BUILD_TYPE=Release \
   -DONNX_BUILD_PYTHON=ON \
@@ -323,6 +338,11 @@ python3 "${REPO_ROOT}/scripts/cross/assemble_wheel.py" \
   --pyver "${PYVER}" \
   --abi3 "${ABI3}" \
   --outdir "${REPO_ROOT}/wheelhouse"
+
+if command -v sccache >/dev/null; then
+  echo "== sccache stats =="
+  sccache --show-stats || true
+fi
 
 echo "== done =="
 ls -la "${REPO_ROOT}/wheelhouse"

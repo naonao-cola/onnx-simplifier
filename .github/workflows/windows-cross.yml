@@ -21,6 +21,12 @@ jobs:
   build-on-linux:
     name: Cross-build Windows wheel on Ubuntu (py ${{ matrix.py_ver }}, llvm-mingw)
     runs-on: ubuntu-24.04
+    env:
+      # Cache C++ compilation across runs (host protoc, target abseil/protobuf,
+      # onnx/onnxsim), matching build-and-test.yml. The build script sets sccache
+      # as the CMake compiler launcher when sccache is on PATH.
+      SCCACHE_GHA_ENABLED: 'on'
+      ACTIONS_CACHE_SERVICE_V2: 'on'
     strategy:
       fail-fast: false
       matrix:
@@ -30,6 +36,8 @@ jobs:
         with:
           submodules: recursive
           fetch-depth: 0
+
+      - uses: mozilla-actions/sccache-action@v0.0.10
 
       - name: Install build tools
         run: |
