@@ -1,0 +1,8 @@
+# Test dependencies for the cross-built Windows wheel (see windows-cross.yml).
+# Kept in a file so actions/setup-python can key its pip download cache on it.
+# torch/torchvision are installed separately from the PyTorch CPU index.
+pytest
+flake8
+onnxruntime
+onnxscript==0.6.2
+timm==1.0.26

@@ -88,6 +88,8 @@ jobs:
       - uses: actions/setup-python@v7
         with:
           python-version: ${{ matrix.py_ver }}
+          cache: 'pip'   # cache pip's download cache (torch et al.) across runs
+          cache-dependency-path: scripts/cross/windows-test-requirements.txt
 
       - uses: actions/download-artifact@v8
         with:
@@ -97,9 +99,8 @@ jobs:
       - name: Install cross-built wheel + test deps
         shell: bash
         run: |
-          python -m pip install --upgrade pip
           python -m pip install torch==2.10.0 torchvision==0.25.0 --index-url https://download.pytorch.org/whl/cpu/
-          python -m pip install pytest flake8 onnxruntime onnxscript==0.6.2 timm==1.0.26
+          python -m pip install -r scripts/cross/windows-test-requirements.txt
           # Install the cross-built wheel by path (forces our wheel, not PyPI's);
           # its deps (onnx, rich) resolve from PyPI.
           whl=$(ls wheelhouse/onnxsim-*.whl)
