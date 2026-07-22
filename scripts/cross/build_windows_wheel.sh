@@ -316,8 +316,13 @@ cmake -S "${REPO_ROOT}" -B "${BUILD_DIR}" -G Ninja \
 
 cmake --build "${BUILD_DIR}" --target onnxsim_cpp2py_export -j "${JOBS}"
 
-PYD="$(find "${BUILD_DIR}" -name 'onnxsim_cpp2py_export*.pyd' -print -quit)"
-[[ -n "${PYD}" ]] || { echo "no .pyd produced"; find "${BUILD_DIR}" -name 'onnxsim_cpp2py_export*'; exit 1; }
+# Locate the built extension. abi3 modules are named .pyd, but for a
+# version-specific (non-abi3) cross build nanobind derives the suffix from the
+# HOST interpreter (e.g. .cpython-310-x86_64-linux-gnu.so) even though the file
+# is a Windows PE built by the mingw toolchain. Accept either; assemble_wheel
+# renames it to onnxsim_cpp2py_export.pyd.
+PYD="$(find "${BUILD_DIR}" \( -name 'onnxsim_cpp2py_export*.pyd' -o -name 'onnxsim_cpp2py_export*.so' \) -print -quit)"
+[[ -n "${PYD}" ]] || { echo "no extension module produced"; find "${BUILD_DIR}" -name 'onnxsim_cpp2py_export*'; exit 1; }
 echo "built: ${PYD}"
 
 # Report which DLLs the module imports (expects pythonXY.dll for the target
