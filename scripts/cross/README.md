@@ -39,9 +39,11 @@ Select with `BACKEND=llvm-mingw` / `BACKEND=clang-cl`. Each has a matching
 ## How the cross-build works (`build_windows_wheel.sh`)
 
 1. **Toolchain** — download llvm-mingw (or the MSVC SDK via xwin).
-2. **Target CPython** headers + import libraries from
-   [python-build-standalone](https://github.com/astral-sh/python-build-standalone);
-   abi3 wheels link `python3.lib`, version-specific wheels link `pythonXY.lib`.
+2. **Target CPython** headers + import libraries from the official CPython
+   [NuGet package](https://www.nuget.org/packages/python). Its `python3.lib`
+   imports the stable-ABI `python3.dll` (python-build-standalone's imports the
+   versioned `pythonXY.dll` instead), so the abi3 build links `python3.lib` and
+   produces a wheel that loads on any CPython >= 3.12.
 3. **Host `protoc`** (a Linux protobuf build) runs ONNX's code generation via
    `ONNX_CUSTOM_PROTOC_EXECUTABLE`; a cross-built `protoc.exe` could not run on
    the Linux host. Built with the host compiler — the target toolchain is kept
@@ -68,14 +70,13 @@ run is a cold cache, later runs reuse it.
 
 ## Scope / status
 
-* **Proof of concept** covering CPython **3.12 and 3.13**, one version-specific
-  wheel each (matrixed in the workflow). `build-and-test.yml` still builds the
-  release Windows wheels natively — this path runs alongside it.
-* Wheels are **version-specific, not abi3**: python-build-standalone's
-  `python3.lib` imports the versioned `pythonXY.dll` rather than the stable-ABI
-  `python3.dll`, so a single abi3 wheel cannot span versions with these import
-  libraries. To add 3.10 / 3.11, add matrix entries (the script already accepts
-  any `PYVER`).
+* **Proof of concept** building a single **cp312-abi3** wheel and testing it on
+  CPython **3.12 and 3.13** (one wheel, matrixed test). `build-and-test.yml`
+  still builds the release Windows wheels natively — this path runs alongside it.
+* The wheel is a genuine **abi3** (limited-API) module: nanobind sets
+  `Py_LIMITED_API` and links nuget's `python3.lib`, so the `.pyd` imports
+  `python3.dll` and loads on any CPython >= 3.12. Build a version-specific wheel
+  instead with `ABI3=0` (links `pythonXY.dll`, tag `cp3XX-cp3XX`).
 * onnxruntime is **not** compiled in (`-DONNXSIM_BUILTIN_ORT=OFF`, matching the
   pip build), keeping the cross-compile surface to onnx + protobuf + nanobind.
 

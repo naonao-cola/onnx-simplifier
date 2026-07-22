@@ -1,14 +1,13 @@
 name: Windows wheel (Linux cross-build)
 
-# Proof-of-concept: build the Windows wheels on a cheap Ubuntu runner by
+# Proof-of-concept: build a Windows abi3 wheel on a cheap Ubuntu runner by
 # cross-compiling with llvm-mingw (clang + lld + a self-contained UCRT sysroot),
-# then run the test suite on a Windows runner against each pre-built wheel. This
-# runs alongside the native Windows build in build-and-test.yml; it does not
-# replace it.
+# then run the test suite on a Windows runner against that one wheel for multiple
+# CPython versions. Runs alongside the native Windows build in build-and-test.yml.
 #
-# Wheels are version-specific (one per CPython): python-build-standalone's
-# python3.lib imports the versioned pythonXY.dll rather than the stable-ABI
-# python3.dll, so a single abi3 wheel cannot span versions here.
+# A single cp312-abi3 wheel covers CPython 3.12+: nanobind builds a limited-API
+# module and the target python3.lib (from the official CPython NuGet package)
+# imports the stable-ABI python3.dll, so the wheel loads on 3.12, 3.13, ...
 
 on:
   workflow_dispatch:
@@ -19,18 +18,13 @@ on:
 
 jobs:
   build-on-linux:
-    name: Cross-build Windows wheel on Ubuntu (py ${{ matrix.py_ver }}, llvm-mingw)
+    name: Cross-build Windows abi3 wheel on Ubuntu (cp312, llvm-mingw)
     runs-on: ubuntu-24.04
     env:
       # Cache C++ compilation across runs (host protoc, target abseil/protobuf,
-      # onnx/onnxsim), matching build-and-test.yml. The build script sets sccache
-      # as the CMake compiler launcher when sccache is on PATH.
+      # onnx/onnxsim), matching build-and-test.yml.
       SCCACHE_GHA_ENABLED: 'on'
       ACTIONS_CACHE_SERVICE_V2: 'on'
-    strategy:
-      fail-fast: false
-      matrix:
-        py_ver: ['3.12', '3.13']
     steps:
       - uses: actions/checkout@v7
         with:
@@ -42,32 +36,32 @@ jobs:
       - name: Install build tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y cmake ninja-build xz-utils build-essential
+          sudo apt-get install -y cmake ninja-build xz-utils unzip build-essential
           # build-essential provides the host gcc/g++ used for the host protoc build
 
       - uses: actions/setup-python@v7
         with:
-          python-version: ${{ matrix.py_ver }}
+          python-version: '3.12'   # abi3 floor
 
       - name: Install Python build dependencies
         run: |
           python -m pip install --upgrade pip
           python -m pip install nanobind==2.12.0 wheel setuptools
 
-      - name: Cross-build wheel (llvm-mingw)
+      - name: Cross-build abi3 wheel (llvm-mingw)
         env:
           BACKEND: llvm-mingw
-          PYVER: ${{ matrix.py_ver }}
-          ABI3: '0'
+          PYVER: '3.12'
+          ABI3: '1'
         run: bash scripts/cross/build_windows_wheel.sh
 
       - uses: actions/upload-artifact@v7
         with:
-          name: windows-cross-wheel-${{ matrix.py_ver }}
+          name: windows-cross-abi3-wheel
           path: ./wheelhouse/*.whl
 
   test-on-windows:
-    name: Test cross-built wheel on Windows (py ${{ matrix.py_ver }})
+    name: Test abi3 wheel on Windows (py ${{ matrix.py_ver }})
     needs: build-on-linux
     runs-on: windows-2025
     strategy:
@@ -85,7 +79,7 @@ jobs:
 
       - uses: actions/download-artifact@v8
         with:
-          name: windows-cross-wheel-${{ matrix.py_ver }}
+          name: windows-cross-abi3-wheel
           path: wheelhouse
 
       - name: Install cross-built wheel + test deps
@@ -94,8 +88,9 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install torch==2.10.0 torchvision==0.25.0 --index-url https://download.pytorch.org/whl/cpu/
           python -m pip install pytest flake8 onnxruntime onnxscript==0.6.2 timm==1.0.26
-          # Install the cross-built wheel by path (forces our wheel, not PyPI's),
-          # letting its dependencies (onnx, rich) resolve from PyPI.
+          # Install the single cross-built abi3 wheel by path (forces our wheel,
+          # not PyPI's); its deps (onnx, rich) resolve from PyPI. The same wheel
+          # is installed on every Python version in the matrix.
           whl=$(ls wheelhouse/onnxsim-*.whl)
           echo "installing ${whl}"
           python -m pip install "${whl}"

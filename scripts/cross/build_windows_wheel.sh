@@ -67,24 +67,24 @@ PROTOBUF_VER="${PROTOBUF_VER:-$(sbom_ver protobuf)}"
 ABSL_VER="${ABSL_VER:-$(sbom_ver abseil-cpp)}"
 NANOBIND_VER="${NANOBIND_VER:-$(sbom_ver nanobind)}"
 
-# python-build-standalone release providing the target Windows interpreter.
-# Only the headers and import libraries are used; the version tag is pinned so
-# the build is reproducible.  Override PBS_RELEASE / PBS_PYFULL to bump.
-PBS_RELEASE="${PBS_RELEASE:-20250723}"
-declare -A PBS_PYFULL_MAP=(
-  ["3.10"]="3.10.18"
-  ["3.11"]="3.11.13"
-  ["3.12"]="3.12.11"
-  ["3.13"]="3.13.5"
+# Target Windows CPython headers + import libraries come from the official
+# CPython NuGet package. Crucially its python3.lib imports the stable-ABI
+# python3.dll (unlike python-build-standalone, whose python3.lib imports the
+# versioned pythonXY.dll) -- required for a genuine abi3 wheel. Pin per version.
+declare -A NUGET_PYFULL_MAP=(
+  ["3.10"]="3.10.11"
+  ["3.11"]="3.11.9"
+  ["3.12"]="3.12.10"
+  ["3.13"]="3.13.14"
 )
-PBS_PYFULL="${PBS_PYFULL:-${PBS_PYFULL_MAP[$PYVER]:?no python-build-standalone pin for $PYVER}}"
+NUGET_PYFULL="${NUGET_PYFULL:-${NUGET_PYFULL_MAP[$PYVER]:?no nuget pin for $PYVER}}"
 
 # llvm-mingw release (used when BACKEND=llvm-mingw).
 LLVM_MINGW_REL="${LLVM_MINGW_REL:-20250709}"
 
 echo "== onnxsim Windows cross-build =="
 echo "   backend       : ${BACKEND}"
-echo "   target python : ${PYVER} (${PBS_PYFULL}), abi3=${ABI3}"
+echo "   target python : ${PYVER} (nuget ${NUGET_PYFULL}), abi3=${ABI3}"
 echo "   protobuf      : ${PROTOBUF_VER}"
 echo "   abseil-cpp    : ${ABSL_VER}"
 echo "   nanobind      : ${NANOBIND_VER}"
@@ -162,21 +162,20 @@ esac
 # ---------------------------------------------------------------------------
 # 2. Target Windows CPython (headers + python3.lib / pythonXY.lib)
 # ---------------------------------------------------------------------------
-if [[ ! -d "${WINPY}/python" ]]; then
-  echo "== [2/6] fetching target Windows CPython ${PBS_PYFULL} =="
-  pbs_url="https://github.com/astral-sh/python-build-standalone/releases/download/${PBS_RELEASE}/cpython-${PBS_PYFULL}+${PBS_RELEASE}-${ARCH}-pc-windows-msvc-install_only.tar.gz"
-  fetch "${pbs_url}" "${DL}/winpy.tar.gz"
+if [[ ! -d "${WINPY}/tools" ]]; then
+  echo "== [2/6] fetching target Windows CPython ${NUGET_PYFULL} (nuget) =="
+  fetch "https://api.nuget.org/v3-flatcontainer/python/${NUGET_PYFULL}/python.${NUGET_PYFULL}.nupkg" "${DL}/winpy.nupkg"
   mkdir -p "${WINPY}"
-  tar -C "${WINPY}" -xf "${DL}/winpy.tar.gz"   # extracts a top-level "python/" dir
+  ( cd "${WINPY}" && unzip -oq "${DL}/winpy.nupkg" 'tools/include/*' 'tools/libs/*' )
 fi
-WINPY_INC="${WINPY}/python/include"
-WINPY_LIBDIR="${WINPY}/python/libs"
+WINPY_INC="${WINPY}/tools/include"
+WINPY_LIBDIR="${WINPY}/tools/libs"
 PYVER_NODOT="${PYVER//./}"
 # Development.Module needs the versioned import lib (FindPython validates the
-# library version against the interpreter; the stable-ABI python3.lib has no
-# version and fails that check). Development.SABIModule uses python3.lib. When a
-# true abi3 module is built, nanobind links only the SABI lib (see below), so
-# the .pyd depends on python3.dll, not pythonXY.dll.
+# library version against the interpreter). Development.SABIModule uses
+# python3.lib. For an abi3 build nanobind links only the SABI lib, and nuget's
+# python3.lib imports python3.dll -- so the .pyd is a genuine abi3 module that
+# loads on any CPython >= 3.12 (the nanobind Py_LIMITED_API floor).
 WINPY_MODULE_LIB="${WINPY_LIBDIR}/python${PYVER_NODOT}.lib"  # Development.Module
 WINPY_SABI_LIB="${WINPY_LIBDIR}/python3.lib"                 # Development.SABIModule
 for f in "${WINPY_MODULE_LIB}" "${WINPY_SABI_LIB}"; do
