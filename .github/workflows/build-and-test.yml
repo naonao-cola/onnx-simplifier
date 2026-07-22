@@ -19,7 +19,7 @@ jobs:
       CIBW_BEFORE_BUILD: "python3 -m pip install --break-system-packages cmake ninja setuptools sccache"
       CIBW_TEST_REQUIRES: pytest flake8 onnxruntime onnxscript==0.6.2 timm==1.0.26
       CIBW_BEFORE_TEST: pip install torch==2.10.0 torchvision==0.25.0 --index-url https://download.pytorch.org/whl/cpu/
-      CIBW_TEST_COMMAND: pytest -v {project}/tests && onnxsim -h && onnxsim --list-default-optimizers
+      CIBW_TEST_COMMAND: pytest -v --durations=10 {project}/tests && onnxsim -h && onnxsim --list-default-optimizers
       # Only build on Python 3 and skip 32-bit or musl builds
       CIBW_SKIP: "*-win32 *-manylinux_i686 *-musllinux_*"
       CIBW_ENVIRONMENT: CMAKE_ARGS="-DONNX_USE_PROTOBUF_SHARED_LIBS=OFF" CMAKE_GENERATOR=Ninja CMAKE_CXX_COMPILER_LAUNCHER=sccache CMAKE_LINKER_TYPE=LLD
@@ -29,7 +29,10 @@ jobs:
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
-        os: [ubuntu-24.04, ubuntu-24.04-arm, windows-2025, macos-15]
+        # Windows wheels are built by cross-compiling on Ubuntu (see the
+        # build_wheels_windows_cross / test_wheels_windows_cross jobs below),
+        # not natively here.
+        os: [ubuntu-24.04, ubuntu-24.04-arm, macos-15]
         py_ver: [cp310, cp311, cp312, cp313]
         include:
           - os: ubuntu-24.04
@@ -43,13 +46,6 @@ jobs:
     - name: Update version
       if: startsWith(github.ref, 'refs/tags/v')
       run: echo "ONNXSIM_RELEASE=${{ github.ref_name }}" >> ${GITHUB_ENV}
-    - name: Update version
-      if: startsWith(github.ref, 'refs/tags/v') && matrix.os == 'windows-2025'
-      run: echo "ONNXSIM_RELEASE=${{ github.ref_name }}" >> $env:GITHUB_ENV
-    - uses: ilammy/msvc-dev-cmd@v1
-      with:
-        arch: amd64
-      if: ${{ matrix.os == 'windows-2025' }}
     - name: Build onnxsim wheels
       uses: pypa/cibuildwheel@v4.1.0
       env:
@@ -64,6 +60,123 @@ jobs:
         name: python-dist-${{ matrix.os }}-${{ matrix.py_ver }}
         path: ./wheelhouse/*.whl
       if: ${{ !contains(fromJSON('["cp313"]'), matrix.py_ver) }}
+
+  # Windows wheels are cross-compiled on a cheap Ubuntu runner with llvm-mingw
+  # (clang + lld + a self-contained UCRT sysroot) instead of built natively on a
+  # Windows runner. 3.12 and 3.13 share a single cp312-abi3 wheel (nanobind
+  # limited-API module + the stable-ABI python3.lib from the CPython NuGet
+  # package); 3.10 and 3.11 are below the abi3 floor and get version-specific
+  # wheels. See scripts/cross/README.md.
+  build_wheels_windows_cross:
+    name: Cross-build Windows wheel on Ubuntu (${{ matrix.artifact }}, llvm-mingw)
+    env:
+      # Cache C++ compilation across runs (host protoc, target abseil/protobuf,
+      # onnx/onnxsim), matching the native build_wheels job.
+      SCCACHE_GHA_ENABLED: 'on'
+      ACTIONS_CACHE_SERVICE_V2: 'on'
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { py_ver: '3.10', abi3: '0', artifact: cp310 }   # version-specific (below abi3 floor)
+          - { py_ver: '3.11', abi3: '0', artifact: cp311 }   # version-specific (below abi3 floor)
+          - { py_ver: '3.12', abi3: '1', artifact: abi3 }    # abi3: also serves 3.13+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+          fetch-depth: 0
+      - uses: mozilla-actions/sccache-action@v0.0.10
+      - name: Update version
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: echo "ONNXSIM_RELEASE=${{ github.ref_name }}" >> ${GITHUB_ENV}
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build xz-utils unzip build-essential
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.py_ver }}
+      - name: Install Python build dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install nanobind==2.12.0 wheel setuptools
+      - name: Cross-build wheel (llvm-mingw)
+        env:
+          BACKEND: llvm-mingw
+          PYVER: ${{ matrix.py_ver }}
+          ABI3: ${{ matrix.abi3 }}
+        run: bash scripts/cross/build_windows_wheel.sh
+      - name: Check ABI3
+        if: ${{ matrix.abi3 == '1' }}
+        run: |
+          python -m pip install abi3audit
+          abi3audit --strict -v --report ./wheelhouse/*.whl
+      - uses: actions/upload-artifact@v7
+        with:
+          # python-dist-* so the upload_pypi job's download pattern picks it up.
+          name: python-dist-windows-cross-${{ matrix.artifact }}
+          path: ./wheelhouse/*.whl
+
+  test_wheels_windows_cross:
+    name: Test cross-built wheel on Windows (py ${{ matrix.py_ver }})
+    needs: build_wheels_windows_cross
+    runs-on: windows-2025
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { py_ver: '3.10', artifact: cp310 }
+          - { py_ver: '3.11', artifact: cp311 }
+          - { py_ver: '3.12', artifact: abi3 }   # same cp312-abi3 wheel ...
+          - { py_ver: '3.13', artifact: abi3 }   # ... on 3.13 too
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.py_ver }}
+      # uv installs (and links) much faster than pip; its global cache (keyed on
+      # the requirements + this workflow) caches the packages, torch included.
+      - uses: astral-sh/setup-uv@v9.0.0
+        with:
+          enable-cache: true
+          # Per-Python cache: setup-uv's key omits the interpreter version, so
+          # without a suffix all matrix jobs would share one blob.
+          cache-suffix: py${{ matrix.py_ver }}
+          cache-dependency-glob: |
+            scripts/cross/windows-test-requirements.txt
+            .github/workflows/build-and-test.yml
+      - uses: actions/download-artifact@v8
+        with:
+          name: python-dist-windows-cross-${{ matrix.artifact }}
+          path: wheelhouse
+      - name: Install cross-built wheel + test deps
+        shell: bash
+        run: |
+          uv pip install --system torch==2.10.0 torchvision==0.25.0 --index-url https://download.pytorch.org/whl/cpu/
+          uv pip install --system -r scripts/cross/windows-test-requirements.txt
+          # Install the cross-built wheel by path (forces our wheel, not PyPI's).
+          whl=$(ls wheelhouse/onnxsim-*.whl)
+          echo "installing ${whl}"
+          uv pip install --system "${whl}"
+      # Run from a neutral directory: the repo root's ./onnxsim source package
+      # (without the compiled .pyd) would otherwise shadow the installed wheel.
+      - name: Verify the wheel is really the cross-built one
+        shell: bash
+        working-directory: ${{ runner.temp }}
+        run: |
+          python -c "import onnxsim, onnxsim.onnxsim_cpp2py_export as m; print('onnxsim', onnxsim.__version__); print(m.__file__)"
+      - name: Run tests
+        shell: bash
+        working-directory: ${{ runner.temp }}
+        run: |
+          # test_ext allocates a ~2 GiB fp16 tensor; skip it on the Windows runner.
+          pytest -v --durations=10 -k "not test_ext" "${GITHUB_WORKSPACE}/tests"
+          onnxsim -h
+          onnxsim --list-default-optimizers
 
   build_sdist:
     name: Build source distribution
@@ -114,7 +227,7 @@ jobs:
   upload_pypi:
     if: (github.repository == 'onnxsim/onnxsim') && (github.event_name == 'push' || github.event_name == 'release')
     name: Upload to PyPI
-    needs: [build_wheels, build_sdist]
+    needs: [build_wheels, build_wheels_windows_cross, test_wheels_windows_cross, build_sdist]
     runs-on: ubuntu-latest
     environment:
       name: pypi
