@@ -109,6 +109,6 @@ jobs:
         shell: bash
         working-directory: ${{ runner.temp }}
         run: |
-          pytest -v "${GITHUB_WORKSPACE}/tests"
+          pytest -v --durations=10 "${GITHUB_WORKSPACE}/tests"
           onnxsim -h
           onnxsim --list-default-optimizers
