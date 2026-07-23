@@ -702,6 +702,36 @@ def test_custom_trt_op_does_not_block_surrounding_simplification():
     assert op_types.count("BatchedNMS_TRT") == 1
 
 
+def test_nameless_nodes_get_names():
+    # Regression test for GitHub issue #269. Nodes that have no name in the input
+    # model (and nodes left nameless by onnx-optimizer passes) must be assigned
+    # unique names during simplification, otherwise downstream tools that key on
+    # node names break.
+    x = onnx.helper.make_tensor_value_info("X", onnx.TensorProto.FLOAT, [1, 4])
+    y = onnx.helper.make_tensor_value_info("Y", onnx.TensorProto.FLOAT, [1, 4])
+    # Both nodes are created without a name (the `name` argument is omitted) and
+    # operate on the non-constant graph input, so they survive simplification.
+    nodes = [
+        onnx.helper.make_node("Abs", ["X"], ["t"]),
+        onnx.helper.make_node("Relu", ["t"], ["Y"]),
+    ]
+    graph_def = onnx.helper.make_graph(nodes, "test_nameless_nodes", [x], [y])
+    model = onnx.helper.make_model(
+        graph_def, opset_imports=[onnx.helper.make_opsetid("", 13)]
+    )
+    # Sanity check: the input model really has nameless nodes.
+    assert all(node.name == "" for node in model.graph.node)
+
+    sim_model, check_ok = onnxsim.simplify(model)
+    assert check_ok
+    assert len(sim_model.graph.node) == 2
+
+    names = [node.name for node in sim_model.graph.node]
+    # Every surviving node has a non-empty, unique name.
+    assert all(name != "" for name in names)
+    assert len(set(names)) == len(names)
+
+
 def test_perform_optimization_false():
     def _create_dummy_model():
         class MockModel(torch.nn.Module):
