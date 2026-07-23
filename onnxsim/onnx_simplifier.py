@@ -181,12 +181,12 @@ def _register_schema_in_onnxsim(schema) -> None:
 
     attributes = []
     for attr in schema.attributes.values():
-        default_value = b""
-        # ``default_value`` is an ``AttributeProto``; an UNDEFINED type means the
+        # ``default_value`` is an ``onnx.AttributeProto`` that nanobind
+        # serializes across the library boundary; an UNDEFINED type means the
         # attribute has no default (it is either required or plainly optional).
-        proto = attr.default_value
-        if proto is not None and proto.type != onnx.AttributeProto.UNDEFINED:
-            default_value = proto.SerializeToString()
+        default_value = attr.default_value
+        if default_value is None:
+            default_value = onnx.AttributeProto()
         attributes.append(
             (attr.name, attr.description, int(attr.type), bool(attr.required), default_value)
         )

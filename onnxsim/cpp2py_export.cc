@@ -23,6 +23,48 @@
 namespace py = nanobind;
 using namespace nanobind::literals;
 
+// nanobind type caster converting a Python ``onnx`` protobuf message (any object
+// exposing ``SerializeToString``) to/from a C++ ``onnx::AttributeProto`` via the
+// protobuf wire format. This mirrors ONNX's own ``ONNX_DEFINE_TYPE_CASTER`` so
+// ``_register_schema`` can accept an attribute's default value as a real
+// ``onnx.AttributeProto`` object instead of pre-serialized bytes.
+namespace nanobind {
+namespace detail {
+template <>
+struct type_caster<onnx::AttributeProto> {
+  NB_TYPE_CASTER(onnx::AttributeProto, const_name("onnx.AttributeProto"))
+
+  bool from_python(handle src, uint8_t, cleanup_list*) noexcept {
+    try {
+      if (!nanobind::hasattr(src, "SerializeToString")) {
+        return false;
+      }
+      auto serialized =
+          nanobind::cast<nanobind::bytes>(src.attr("SerializeToString")());
+      return onnx::ParseProtoFromBytes(&value, serialized.c_str(),
+                                       serialized.size());
+    } catch (const nanobind::python_error&) {
+      return false;
+    }
+  }
+
+  static handle from_cpp(const onnx::AttributeProto& proto, rv_policy,
+                         cleanup_list*) noexcept {
+    try {
+      const std::string serialized = proto.SerializeAsString();
+      auto py_proto =
+          nanobind::module_::import_("onnx").attr("AttributeProto")();
+      py_proto.attr("ParseFromString")(
+          nanobind::bytes(serialized.c_str(), serialized.size()));
+      return py_proto.release();
+    } catch (...) {
+      return handle();
+    }
+  }
+};
+}  // namespace detail
+}  // namespace nanobind
+
 namespace {
 
 using onnx::OpSchema;
@@ -35,9 +77,10 @@ using PyFormalParameter =
     std::tuple<std::string, std::string, std::string, int, bool, int>;
 // An attribute: (name, description, type, required, default_value). ``type`` is
 // the integer value of onnx's AttributeProto::AttributeType enum. When
-// ``default_value`` is a non-empty serialized AttributeProto the attribute is
-// optional with that default; when empty, ``required`` decides.
-using PyAttribute = std::tuple<std::string, std::string, int, bool, py::bytes>;
+// ``default_value`` has a defined type the attribute is optional with that
+// default; when its type is UNDEFINED, ``required`` decides.
+using PyAttribute =
+    std::tuple<std::string, std::string, int, bool, onnx::AttributeProto>;
 // A type constraint: (type_param_str, allowed_type_strs, description).
 using PyTypeConstraint =
     std::tuple<std::string, std::vector<std::string>, std::string>;
@@ -217,13 +260,10 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
                    std::get<4>(p), std::get<5>(p));
              }
              for (const auto& a : attributes) {
-               const py::bytes& default_value = std::get<4>(a);
-               if (default_value.size() > 0) {
-                 onnx::AttributeProto proto;
-                 proto.ParseFromArray(default_value.c_str(),
-                                      static_cast<int>(default_value.size()));
+               const onnx::AttributeProto& default_value = std::get<4>(a);
+               if (default_value.type() != onnx::AttributeProto::UNDEFINED) {
                  schema.Attr(OpSchema::Attribute(std::get<0>(a), std::get<1>(a),
-                                                 std::move(proto)));
+                                                 default_value));
                } else {
                  schema.Attr(OpSchema::Attribute(
                      std::get<0>(a), std::get<1>(a),
