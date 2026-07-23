@@ -26,8 +26,11 @@ def _simplify(model):
 
 def _model(nodes, inputs, outputs, initializer, opset=13):
     graph = onnx.helper.make_graph(nodes, "g", inputs, outputs, initializer)
+    # Pin a low IR version so the model loads under the older onnxruntime
+    # bundled with some CI wheels (which cap at IR version 11); onnxsim's
+    # check_n runs the model through onnxruntime.
     return onnx.helper.make_model(
-        graph, opset_imports=[onnx.helper.make_opsetid("", opset)])
+        graph, opset_imports=[onnx.helper.make_opsetid("", opset)], ir_version=10)
 
 
 def _vi(name, shape):
