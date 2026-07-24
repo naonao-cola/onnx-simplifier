@@ -373,3 +373,78 @@ def test_fp8_qdq_model():
     assert op_types.count("QuantizeLinear") == 2
     assert op_types.count("DequantizeLinear") == 2
     assert "MatMul" in op_types
+
+
+def test_fp8_qdq_modelopt_integration():
+    # NVIDIA ModelOpt used to simplify ONNX models inside its quantization
+    # preprocessing with exactly ``model_simp, check = onnxsim.simplify(model)``
+    # (wrapped in a try/except that fell back to the unsimplified model on
+    # error). It dropped onnxsim for onnxslim, in part because onnxsim aborted
+    # on ModelOpt's fp8 QDQ output with "no supported data type: 17" (issue
+    # #348). This exercises that exact call shape on a richer, more
+    # ModelOpt-like graph -- Conv + Gemm with both activation and weight QDQ and
+    # duplicated float8 zero points -- to guard that onnxsim simplifies it
+    # without crashing and preserves the QDQ structure TensorRT relies on.
+    def fp8_zero_point(name: str) -> onnx.TensorProto:
+        # A single float8_e4m3fn zero as its raw byte (no ml_dtypes dependency).
+        return helper.make_tensor(name, TensorProto.FLOAT8E4M3FN, [], b"\x00", raw=True)
+
+    conv_w = helper.make_tensor(
+        "conv_w", TensorProto.FLOAT, [8, 3, 3, 3],
+        [0.01 * (i % 7 - 3) for i in range(8 * 3 * 3 * 3)],
+    )
+    gemm_w = helper.make_tensor(
+        "gemm_w", TensorProto.FLOAT, [8, 8], [0.02 * (i % 5 - 2) for i in range(64)]
+    )
+    conv_ws = helper.make_tensor("conv_w_scale", TensorProto.FLOAT, [], [0.02])
+    gemm_ws = helper.make_tensor("gemm_w_scale", TensorProto.FLOAT, [], [0.03])
+    act_s = helper.make_tensor("act_scale", TensorProto.FLOAT, [], [0.1])
+    act_s2 = helper.make_tensor("act_scale2", TensorProto.FLOAT, [], [0.1])
+
+    nodes = [
+        # activation QDQ on the dynamic input -- must survive simplification.
+        helper.make_node("QuantizeLinear", ["X", "act_scale", "a_zp"], ["Xq"]),
+        helper.make_node("DequantizeLinear", ["Xq", "act_scale", "a_zp"], ["Xdq"]),
+        # weight QDQ (constant). ModelOpt duplicates fp8 zero points across
+        # weights, which is what tripped eliminate_duplicate_initializer.
+        helper.make_node("QuantizeLinear", ["conv_w", "conv_w_scale", "cw_zp"], ["cwq"]),
+        helper.make_node("DequantizeLinear", ["cwq", "conv_w_scale", "cw_zp2"], ["cwdq"]),
+        helper.make_node("Conv", ["Xdq", "cwdq"], ["conv_out"], kernel_shape=[3, 3]),
+        helper.make_node("GlobalAveragePool", ["conv_out"], ["pooled"]),
+        helper.make_node("Flatten", ["pooled"], ["flat"], axis=1),
+        # second activation QDQ + weight QDQ feeding a Gemm.
+        helper.make_node("QuantizeLinear", ["flat", "act_scale2", "a_zp2"], ["flatq"]),
+        helper.make_node("DequantizeLinear", ["flatq", "act_scale2", "a_zp2"], ["flatdq"]),
+        helper.make_node("QuantizeLinear", ["gemm_w", "gemm_w_scale", "gw_zp"], ["gwq"]),
+        helper.make_node("DequantizeLinear", ["gwq", "gemm_w_scale", "gw_zp2"], ["gwdq"]),
+        helper.make_node("Gemm", ["flatdq", "gwdq"], ["Y"], transB=1),
+    ]
+    graph = helper.make_graph(
+        nodes,
+        "modelopt_fp8_qdq",
+        [helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, 3, 6, 6])],
+        [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, 8])],
+        [
+            conv_w, gemm_w, conv_ws, gemm_ws, act_s, act_s2,
+            fp8_zero_point("a_zp"), fp8_zero_point("a_zp2"),
+            fp8_zero_point("cw_zp"), fp8_zero_point("cw_zp2"),
+            fp8_zero_point("gw_zp"), fp8_zero_point("gw_zp2"),
+        ],
+    )
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 21)])
+    model.ir_version = 10
+    onnx.checker.check_model(model)
+
+    # ModelOpt's exact former call shape. Must not raise "no supported data
+    # type: 17"; check must be True so ModelOpt would keep the simplified model.
+    sim_model, check_ok = onnxsim.simplify(model)
+    assert check_ok
+    onnx.checker.check_model(sim_model)
+
+    # Every QDQ pair must be preserved -- TensorRT needs the QDQ structure, and
+    # onnxsim must not fold or dedupe it away.
+    op_types = [n.op_type for n in sim_model.graph.node]
+    assert op_types.count("QuantizeLinear") == 4
+    assert op_types.count("DequantizeLinear") == 4
+    assert "Conv" in op_types
+    assert "Gemm" in op_types
