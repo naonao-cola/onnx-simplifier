@@ -481,9 +481,33 @@ def test_if_with_const_cond_is_folded():
     assert check_ok
     onnx.checker.check_model(sim_model)
     # The constant-condition `If` (condition is True) must be folded away, and
-    # the model output must be the "then" branch constant [1.0, 2.0].
+    # the model output must be the "then" branch constant [1.0, 2.0]. Read the
+    # folded value straight out of the graph rather than running the model,
+    # since helper.make_model stamps the latest ONNX IR version, which the
+    # bundled onnxruntime may not load.
     assert all(n.op_type != "If" for n in sim_model.graph.node)
-    sess = onnxruntime.InferenceSession(
-        sim_model.SerializeToString(), providers=["CPUExecutionProvider"])
-    (out,) = sess.run(None, {})
+
+    def _resolve_const(model, name):
+        # Follow the output through initializers, Constant nodes, and Identity
+        # aliases until a constant tensor is found.
+        seen = set()
+        while name and name not in seen:
+            seen.add(name)
+            for init in model.graph.initializer:
+                if init.name == name:
+                    return numpy_helper.to_array(init)
+            alias = None
+            for node in model.graph.node:
+                if name not in node.output:
+                    continue
+                if node.op_type == "Constant":
+                    (attr,) = [a for a in node.attribute if a.name == "value"]
+                    return numpy_helper.to_array(attr.t)
+                if node.op_type == "Identity":
+                    alias = node.input[0]
+                break
+            name = alias
+        raise AssertionError(f"output {name!r} is not a resolvable constant")
+
+    out = _resolve_const(sim_model, sim_model.graph.output[0].name)
     assert out.tolist() == [1.0, 2.0]
