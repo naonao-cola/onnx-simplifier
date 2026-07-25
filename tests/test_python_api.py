@@ -910,6 +910,51 @@ def test_nameless_nodes_get_names():
     assert len(set(names)) == len(names)
 
 
+def test_simplify_path_with_external_data():
+    # When ``simplify`` is given a *file path* to a model whose weights live in a
+    # separate external-data file, it defers loading that (potentially huge)
+    # external data until right before the model is serialized for the C++
+    # simplifier -- every graph-metadata phase in between runs without the
+    # weights resident. This regression test makes sure that deferral still
+    # produces a correct result: the external tensor data must be materialized so
+    # the constant fold below can happen and the values are preserved.
+    a = np.random.rand(64, 64).astype(np.float32)
+    b = np.random.rand(64, 64).astype(np.float32)
+    initializers = [
+        onnx.numpy_helper.from_array(a, "a"),
+        onnx.numpy_helper.from_array(b, "b"),
+    ]
+    node = onnx.helper.make_node("Add", ["a", "b"], ["y"])
+    out = onnx.helper.make_tensor_value_info("y", onnx.TensorProto.FLOAT, (64, 64))
+    graph_def = onnx.helper.make_graph(
+        [node], "test_simplify_path_with_external_data", [], [out],
+        initializer=initializers)
+    model = onnx.helper.make_model(
+        graph_def, opset_imports=[onnx.helper.make_opsetid("", 14)], ir_version=10)
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        model_path = os.path.join(tmpdir, "model.onnx")
+        onnx.save(
+            model,
+            model_path,
+            save_as_external_data=True,
+            all_tensors_to_one_file=True,
+            location="model.data",
+        )
+        # The .onnx file itself carries no raw tensor data -- it is all in the
+        # external .data file, so this really exercises the deferred-load path.
+        assert os.path.exists(os.path.join(tmpdir, "model.data"))
+
+        sim_model, check_ok = onnxsim.simplify(model_path, check_n=1)
+
+    assert check_ok
+    # Add of two constants is folded into a single initializer holding a + b.
+    assert len(sim_model.graph.node) == 0
+    assert len(sim_model.graph.initializer) == 1
+    folded = onnx.numpy_helper.to_array(sim_model.graph.initializer[0])
+    np.testing.assert_allclose(folded, a + b, rtol=1e-5, atol=1e-6)
+
+
 def test_perform_optimization_false():
     def _create_dummy_model():
         class MockModel(torch.nn.Module):

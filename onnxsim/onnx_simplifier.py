@@ -376,8 +376,19 @@ def simplify(
     # defensive copy). When the caller passes their own ``ModelProto`` we must
     # not mutate it.
     model_owned = isinstance(model, str)
+    # When the caller passes a file path, defer loading the (potentially
+    # multi-GB) external tensor data until it is actually needed -- right before
+    # the model is serialized for the C++ simplifier. Every graph transformation
+    # in between (input-shape overwrite, unused-output/initializer pruning,
+    # unhashable-tensor detection, doc-string snapshotting) reads only tensor
+    # *metadata* -- names, shapes, element types -- never the raw bytes, so
+    # keeping the weights on disk through these phases lowers active memory use
+    # and avoids loading them at all when an earlier phase raises. The directory
+    # is remembered so the external data can be resolved later.
+    external_data_dir: Optional[str] = None
     if model_owned:
-        model = onnx.load(model)
+        external_data_dir = os.path.dirname(os.path.abspath(model))
+        model = onnx.load(model, load_external_data=False)
     if overwrite_input_shapes is None:
         overwrite_input_shapes = {}
     overwrite_input_shapes = check_and_update_input_shapes(
@@ -441,6 +452,13 @@ def simplify(
     tensor_size_threshold = parse_size(tensor_size_threshold)
     if tensor_size_threshold > 2**31 - 9999:
         raise ValueError("tensor_size_threshold should be less than 2GB")
+
+    # Materialize the external tensor data now that the metadata-only phases are
+    # over and the full model is about to be serialized for the C++ simplifier.
+    # This is a no-op unless we loaded from a path above (and therefore deferred
+    # it); a caller-provided ``ModelProto`` already carries its data inline.
+    if external_data_dir is not None:
+        onnx.load_external_data_for_model(model, external_data_dir)
 
     try:
         model_bytes = model.SerializeToString()
