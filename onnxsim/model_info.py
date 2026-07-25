@@ -119,7 +119,7 @@ def _known(shape: Optional[List[Optional[int]]]) -> bool:
 # required tensor shapes are unknown. FLOPs are reported as 2 * MACs.
 # Coverage is intentionally limited to the compute-dominant operators; these
 # account for the vast majority of a typical model's arithmetic.
-_MAC_COUNTERS: Dict[str, Callable[[onnx.NodeProto, ShapeMap], int]] = {}
+_MAC_COUNTERS: Dict[str, Callable[[onnx.NodeProto, ShapeMap], Macs]] = {}
 
 
 def _register(*op_types: str) -> Callable[[Callable], Callable]:
@@ -130,11 +130,24 @@ def _register(*op_types: str) -> Callable[[Callable], Callable]:
     return deco
 
 
-@_register("Conv")
+# QLinearConv reorders inputs: x, x_scale, x_zp, w, w_scale, w_zp, ... so the
+# weight is input[3] rather than input[1]. Everything else about the MAC count
+# (a quantized conv does the same multiply-accumulates as its float twin) is
+# identical, so the counters below just point at the right operand indices.
+@_register("Conv", "ConvInteger")
 def _conv_macs(node: onnx.NodeProto, shapes: ShapeMap) -> int:
+    return _conv_macs_impl(node, shapes, weight_idx=1)
+
+
+@_register("QLinearConv")
+def _qlinearconv_macs(node: onnx.NodeProto, shapes: ShapeMap) -> int:
+    return _conv_macs_impl(node, shapes, weight_idx=3)
+
+
+def _conv_macs_impl(node: onnx.NodeProto, shapes: ShapeMap, weight_idx: int) -> Macs:
     # weight: [out_channels, in_channels / group, *kernel_shape]
     # output: [batch, out_channels, *spatial_out]
-    weight = shapes.get(node.input[1])
+    weight = shapes.get(node.input[weight_idx])
     output = shapes.get(node.output[0])
     if not _known(weight) or not _known(output):
         return 0
@@ -169,8 +182,11 @@ def _gemm_macs(node: onnx.NodeProto, shapes: ShapeMap) -> int:
     return m * n * k
 
 
-@_register("MatMul")
-def _matmul_macs(node: onnx.NodeProto, shapes: ShapeMap) -> int:
+# MatMul, MatMulInteger and QLinearMatMul all take A as input[0] and produce Y
+# as output[0]; the quantized variants only add scale/zero-point operands, which
+# don't affect the multiply-accumulate count.
+@_register("MatMul", "MatMulInteger", "QLinearMatMul")
+def _matmul_macs(node: onnx.NodeProto, shapes: ShapeMap) -> Macs:
     # output: [*batch, M, N]; contraction dim K is the last dim of input A.
     a = shapes.get(node.input[0])
     output = shapes.get(node.output[0])
@@ -180,17 +196,63 @@ def _matmul_macs(node: onnx.NodeProto, shapes: ShapeMap) -> int:
     return _prod(output) * k
 
 
+@_register("Attention")
+def _attention_macs(node: onnx.NodeProto, shapes: ShapeMap) -> Macs:
+    """Scaled dot-product attention (ai.onnx opset 23+).
+
+    Cost is dominated by the two batched matmuls, QK^T and (softmax)V; the
+    softmax/scale/mask are elementwise and negligible by comparison. For heads
+    ``h``, query/key sequence lengths ``sq``/``skv`` and per-head sizes ``d``
+    (QK) and ``dv`` (V):
+
+        QK^T : batch * h * sq * skv * d
+        P V  : batch * h * sq * skv * dv
+
+    Q/K/V are either 4D ``(batch, num_heads, seq, head_size)`` or 3D
+    ``(batch, seq, num_heads * head_size)``; in the 3D form the head count comes
+    from the ``q_num_heads`` / ``kv_num_heads`` attributes. Grouped-query
+    attention (kv heads < q heads) still evaluates all ``q_num_heads`` query
+    heads, so the query head count drives both matmuls.
+    """
+    q = shapes.get(node.input[0])
+    k = shapes.get(node.input[1])
+    v = shapes.get(node.input[2])
+    if not _known(q) or not _known(k) or not _known(v):
+        return 0
+
+    if len(q) == 4 and len(k) == 4 and len(v) == 4:
+        batch, q_heads, sq, d = q
+        skv = k[2]
+        dv = v[3]
+    elif len(q) == 3 and len(k) == 3 and len(v) == 3:
+        q_heads = _attr_int(node, "q_num_heads", 0)
+        kv_heads = _attr_int(node, "kv_num_heads", 0)
+        if q_heads <= 0 or kv_heads <= 0:
+            return 0  # head split is unknowable without the attributes
+        batch, sq, _ = q
+        skv = k[1]
+        d = k[2] // kv_heads   # per-head size (K packs kv_heads * head_size)
+        dv = v[2] // kv_heads
+    else:
+        return 0
+
+    qk = _prod([batch, q_heads, sq, skv, d])
+    pv = _prod([batch, q_heads, sq, skv, dv])
+    return qk + pv
+
+
 class ModelInfo:
     """
     Model info contains:
     1. Num of every op
     2. Model size
-    3. MACs / FLOPs of the compute-dominant operators (Conv, ConvTranspose,
-       Gemm, MatMul). Shapes come from ONNX shape inference; nodes whose shapes
-       cannot be inferred contribute 0. Dynamic dimensions (``dim_param``, e.g.
-       "batch") become sympy symbols when sympy is installed, so ``macs`` /
-       ``flops`` may be a symbolic formula; without sympy they are assumed 1
-       (per-sample MACs).
+    3. MACs / FLOPs of the compute-dominant operators: Conv, ConvTranspose,
+       Gemm, MatMul, Attention, and the quantized twins (ConvInteger,
+       QLinearConv, MatMulInteger, QLinearMatMul). Shapes come from ONNX shape
+       inference; nodes whose shapes cannot be inferred contribute 0. Dynamic
+       dimensions (``dim_param``, e.g. "batch") become sympy symbols when sympy
+       is installed, so ``macs`` / ``flops`` may be a symbolic formula; without
+       sympy they are assumed 1 (per-sample MACs).
     TODO:
     Based on onnx runtime, get
     1、forward memory footprint
@@ -281,6 +343,7 @@ def print_simplifying_info(model_ori: onnx.ModelProto, model_opt: onnx.ModelProt
                 opt_info.op_nums[key], lambda opt, ori: opt < ori)
     add_row(
         table, 'Model Size', ori_info.model_size, opt_info.model_size, lambda opt, ori: opt < ori, postprocess=human_readable_size)
+
     # MACs/FLOPs may be symbolic, for which "<" yields an undecidable sympy
     # relational; compare representative magnitudes (all free dims -> 1) so the
     # highlighting still works without raising.
