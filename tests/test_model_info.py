@@ -6,6 +6,7 @@ exercised when sympy is installed and skipped otherwise, mirroring the optional
 ``onnxsim[symbolic]`` extra.
 """
 import numpy as np
+import onnx
 from onnx import TensorProto, helper
 import pytest
 
@@ -296,3 +297,74 @@ def test_warns_when_counter_raises(monkeypatch):
     node = helper.make_node("Relu", ["x"], ["y"], name="r")
     with pytest.warns(UserWarning, match="Failed to count MACs"):
         ModelInfo(_model([node], [x], [y]))
+
+
+# --------------------------------------------------------------------------- #
+# Model-local function operators are counted via their bodies
+# --------------------------------------------------------------------------- #
+def _linear_function():
+    # A local function "MyLinear(x, w) -> MatMul(x, w)".
+    return helper.make_function(
+        "custom", "MyLinear", ["x", "w"], ["y"],
+        [helper.make_node("MatMul", ["x", "w"], ["y"])],
+        [helper.make_opsetid("", 18)],
+    )
+
+
+def _function_model(nodes, inputs, outputs, initializers, functions):
+    model = helper.make_model(
+        helper.make_graph(nodes, "g", inputs, outputs, initializers),
+        opset_imports=[helper.make_opsetid("", 18), helper.make_opsetid("custom", 1)],
+        functions=functions,
+    )
+    onnx.checker.check_model(model)
+    return model
+
+
+def test_function_body_counted_and_op_kept():
+    # MyLinear used twice: op counts show the function op, MACs sum the bodies.
+    x = _vi("X", [4, 8])
+    y = _vi("Y", [4, 32])
+    inits = [_weight("W1", [8, 16]), _weight("W2", [16, 32])]
+    nodes = [
+        helper.make_node("MyLinear", ["X", "W1"], ["H"], domain="custom"),
+        helper.make_node("MyLinear", ["H", "W2"], ["Y"], domain="custom"),
+    ]
+    info = ModelInfo(_function_model(nodes, [x], [y], inits, [_linear_function()]))
+    assert info.op_nums["MyLinear"] == 2          # op count keeps the function op
+    assert info.macs == 4 * 16 * 8 + 4 * 32 * 16  # MACs come from the bodies
+
+
+def test_nested_function_body_counted():
+    # Block(x, w) -> MyLinear(x, w) -> Relu; nested functions are inlined too.
+    inner = _linear_function()
+    outer = helper.make_function(
+        "custom", "Block", ["x", "w"], ["y"],
+        [
+            helper.make_node("MyLinear", ["x", "w"], ["t"], domain="custom"),
+            helper.make_node("Relu", ["t"], ["y"]),
+        ],
+        [helper.make_opsetid("", 18), helper.make_opsetid("custom", 1)],
+    )
+    x = _vi("X", [4, 8])
+    y = _vi("Y", [4, 16])
+    nodes = [helper.make_node("Block", ["X", "W1"], ["Y"], domain="custom")]
+    info = ModelInfo(_function_model(nodes, [x], [y], [_weight("W1", [8, 16])], [inner, outer]))
+    assert info.op_nums["Block"] == 1
+    assert info.macs == 4 * 16 * 8
+
+
+def test_warns_when_inlining_fails(monkeypatch):
+    import onnx.inliner
+
+    def boom(_model):
+        raise RuntimeError("inliner boom")
+
+    monkeypatch.setattr(onnx.inliner, "inline_local_functions", boom)
+    x = _vi("X", [4, 8])
+    y = _vi("Y", [4, 16])
+    nodes = [helper.make_node("MyLinear", ["X", "W1"], ["Y"], domain="custom")]
+    model = _function_model(nodes, [x], [y], [_weight("W1", [8, 16])], [_linear_function()])
+    with pytest.warns(UserWarning, match="Failed to inline local functions"):
+        info = ModelInfo(model)
+    assert info.macs == 0  # body compute uncounted, but no crash

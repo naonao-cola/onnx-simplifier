@@ -13,6 +13,11 @@ try:
 except ImportError:  # sympy is an optional dependency; see _tensor_shape below.
     sympy = None
 
+try:
+    from onnx import inliner as onnx_inliner
+except ImportError:  # onnx.inliner was added in onnx 1.14; see ModelInfo.__init__.
+    onnx_inliner = None
+
 
 __all__ = ['ModelInfo', 'print_simplifying_info']
 
@@ -252,7 +257,10 @@ class ModelInfo:
        inference; nodes whose shapes cannot be inferred contribute 0. Dynamic
        dimensions (``dim_param``, e.g. "batch") become sympy symbols when sympy
        is installed, so ``macs`` / ``flops`` may be a symbolic formula; without
-       sympy they are assumed 1 (per-sample MACs).
+       sympy they are assumed 1 (per-sample MACs). Model-local function ops are
+       inlined before counting, so the compute inside their bodies (and nested
+       functions) is included in the MAC total while op counts still list the
+       function op itself.
     TODO:
     Based on onnx runtime, get
     1、forward memory footprint
@@ -295,8 +303,29 @@ class ModelInfo:
         return op_nums, model_size, macs
 
     def __init__(self, model: onnx.ModelProto):
+        inferred = self._infer_shapes(model)
+        # Op counts and model size describe the model as authored, so a function
+        # op (e.g. a fused block) is reported as a single op.
+        self.op_nums, self.model_size, macs = self.get_info(inferred.graph)
+        # But its compute lives in its body, so for MACs we inline the local
+        # functions and recount -- the primitive counters then see the MatMuls,
+        # Convs, etc. inside every function instance.
+        if model.functions and onnx_inliner is not None:
+            try:
+                inlined = onnx_inliner.inline_local_functions(model)
+                _, _, macs = self.get_info(self._infer_shapes(inlined).graph)
+            except Exception as e:
+                warnings.warn(
+                    f"Failed to inline local functions ({e}); MACs inside "
+                    "function bodies are not counted.",
+                    stacklevel=2,
+                )
+        self.macs = macs
+
+    @staticmethod
+    def _infer_shapes(model: onnx.ModelProto) -> onnx.ModelProto:
         try:
-            model = shape_inference.infer_shapes(model)
+            return shape_inference.infer_shapes(model)
         except Exception as e:
             # Shape inference can fail (e.g. models > 2GB); MACs then fall back
             # to 0 for nodes without pre-existing value_info.
@@ -305,7 +334,7 @@ class ModelInfo:
                 "for nodes without existing shape info.",
                 stacklevel=2,
             )
-        self.op_nums, self.model_size, self.macs = self.get_info(model.graph)
+            return model
 
     @property
     def flops(self) -> int:
