@@ -298,7 +298,15 @@ python_args=(
   -DPython3_SABI_LIBRARY="${WINPY_SABI_LIB}"
 )
 
-cmake -S "${REPO_ROOT}" -B "${BUILD_DIR}" -G Ninja \
+# -Wno-dev quiets CMake's own developer/author warning from FindPython, which
+# creates the Python SABI import library with ADD_LIBRARY(... SHARED) and then
+# warns it fell back to STATIC because this cross toolchain reports no dynamic
+# linking. That fallback is correct here (an import lib is what we want) and the
+# warning comes from CMake modules, not onnxsim, so there is nothing else to fix.
+# -Wno-dev also disables deprecation warnings by default; pair it with
+# -Wdeprecated so those stay visible (e.g. a future deprecation in onnxsim's own
+# CMakeLists), keeping the suppression scoped to just the author/dev warning.
+cmake -S "${REPO_ROOT}" -B "${BUILD_DIR}" -G Ninja -Wno-dev -Wdeprecated \
   "${TOOLCHAIN_ARGS[@]}" \
   "${SCCACHE_ARGS[@]}" \
   -DCMAKE_PROJECT_TOP_LEVEL_INCLUDES="${REPO_ROOT}/scripts/cross/find_python_early.cmake" \
@@ -310,7 +318,6 @@ cmake -S "${REPO_ROOT}" -B "${BUILD_DIR}" -G Ninja \
   -DONNX_USE_LITE_PROTO=OFF \
   -DONNX_USE_PROTOBUF_SHARED_LIBS=OFF \
   -DONNX_CUSTOM_PROTOC_EXECUTABLE="${HOST_PROTOC}" \
-  -DProtobuf_PROTOC_EXECUTABLE="${HOST_PROTOC}" \
   -DCMAKE_PREFIX_PATH="${DEPS_TARGET};${NANOBIND_CMAKE_DIR}" \
   -Dnanobind_DIR="${NANOBIND_CMAKE_DIR}" \
   "${python_args[@]}"
