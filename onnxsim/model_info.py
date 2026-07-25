@@ -1,13 +1,49 @@
 from collections import defaultdict
-from typing import Callable, Any, Optional, Tuple, Dict
+from typing import Callable, Any, Iterable, Optional, Dict
 
 import onnx
+from onnx.external_data_helper import ExternalDataInfo, uses_external_data
 from rich.table import Table
 from rich.text import Text
 from rich import print
 
 
 __all__ = ['ModelInfo', 'print_simplifying_info']
+
+
+def _iter_graph_tensors(graph: onnx.GraphProto) -> Iterable[onnx.TensorProto]:
+    """Yield every ``TensorProto`` stored in ``graph``, recursing into subgraphs.
+
+    Covers initializers as well as tensors carried in node attributes (e.g. the
+    ``value`` of a ``Constant``), matching every place a model may hold tensor
+    data.
+    """
+    for initializer in graph.initializer:
+        yield initializer
+    for node in graph.node:
+        for attr in node.attribute:
+            if attr.HasField("t"):
+                yield attr.t
+            for tensor in attr.tensors:
+                yield tensor
+            if attr.HasField("g"):
+                yield from _iter_graph_tensors(attr.g)
+            for subgraph in attr.graphs:
+                yield from _iter_graph_tensors(subgraph)
+
+
+def _external_data_size(graph: onnx.GraphProto) -> int:
+    """Total bytes of tensor data held in external files, from metadata alone.
+
+    ``ExternalDataInfo(tensor).length`` reads the ``length`` entry of a tensor's
+    ``external_data`` record, so this never loads the data itself: the size of a
+    model whose weights live on disk can be reported without materializing them.
+    """
+    total = 0
+    for tensor in _iter_graph_tensors(graph):
+        if uses_external_data(tensor):
+            total += ExternalDataInfo(tensor).length or 0
+    return total
 
 
 def human_readable_size(num, suffix="B"):
@@ -31,27 +67,32 @@ class ModelInfo:
     4、compute density
     """
 
-    def get_info(self, graph: onnx.GraphProto) -> Tuple[Dict[str, int], int]:
+    def get_info(self, graph: onnx.GraphProto) -> Dict[str, int]:
         op_nums = defaultdict(int)
-        model_size = 0
         for node in graph.node:
             op_nums[node.op_type] += 1
             for attr in node.attribute:
                 sub_graphs = []
-                if attr.g is not None:
+                if attr.HasField("g"):
                     sub_graphs.append(attr.g)
-                if attr.graphs is not None:
-                    sub_graphs.extend(attr.graphs)
+                sub_graphs.extend(attr.graphs)
                 for sub_graph in sub_graphs:
-                    sub_op_nums, sub_model_size = self.get_info(sub_graph)
+                    sub_op_nums = self.get_info(sub_graph)
                     op_nums = defaultdict(int, {k: op_nums[k] + sub_op_nums[k] for k in set(op_nums) | set(sub_op_nums)})
-                    model_size += sub_model_size
         op_nums["Constant"] += len(graph.initializer)
-        model_size += graph.ByteSize()
-        return op_nums, model_size
+        return op_nums
 
     def __init__(self, model: onnx.ModelProto):
-        self.op_nums, self.model_size = self.get_info(model.graph)
+        self.op_nums = self.get_info(model.graph)
+        # ``graph.ByteSize()`` is the serialized size of the whole graph -- nested
+        # subgraphs and inline tensor data included -- so it is taken once at the
+        # top rather than summed per subgraph (which double-counted nested
+        # graphs). Tensors kept as external data contribute nothing to ByteSize
+        # (their ``raw_data`` is empty), so their on-disk lengths are added from
+        # metadata. The size is therefore correct whether or not the external
+        # data has been loaded, so callers need not materialize multi-GB weights
+        # just to measure the model.
+        self.model_size = model.graph.ByteSize() + _external_data_size(model.graph)
 
 
 def print_simplifying_info(model_ori: onnx.ModelProto, model_opt: onnx.ModelProto) -> None:

@@ -794,9 +794,20 @@ def main():
         sess_options.optimized_model_filepath = tmp_file.name
         _ = rt.InferenceSession(args.input_model, sess_options, providers=["CPUExecutionProvider"])
 
-        model = onnx.load(tmp_file.name)
+        # ``tmp_file`` stays referenced (and thus on disk) until ``main`` returns,
+        # so ``simplify`` can load it below.
+        model_path = tmp_file.name
     else:
-        model = onnx.load(args.input_model)
+        model_path = args.input_model
+
+    # Load only the graph structure here, deferring the (potentially multi-GB)
+    # external tensor data. The CLI needs this model just for the pre-flight
+    # warnings below and the size/op diff printed at the end -- none of which read
+    # raw tensor bytes: op counts come from graph structure and the reported size
+    # is computed from external-data metadata (see ``model_info``). ``simplify``
+    # is handed the *path* (not this ModelProto) so it owns its copy and performs
+    # its own deferred load, keeping the weights out of memory here entirely.
+    model = onnx.load(model_path, load_external_data=False)
 
     if args.tensor_size_threshold == DEFAULT_TENSOR_SIZE_THRESHOLDHOLD:
         for node in model.graph.node:
@@ -831,7 +842,7 @@ def main():
     print("Simplifying...")
 
     model_opt, check_ok = simplify(
-        model,
+        model_path,
         args.check_n,
         perform_optimization,
         False,
