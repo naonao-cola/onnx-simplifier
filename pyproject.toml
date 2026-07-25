@@ -33,6 +33,9 @@ classifiers = [
 # onnxruntime is preferred for constant folding and correctness checking.
 # When it is not installed, onnxsim falls back to onnx's reference evaluator.
 onnxruntime = ["onnxruntime >= 1.6.0"]
+# sympy lets the MACs/FLOPs report keep dynamic dimensions (dim_param, e.g.
+# "batch") as symbols and produce a formula instead of assuming them to be 1.
+symbolic = ["sympy"]
 
 [project.urls]
 Homepage = "https://github.com/onnxsim/onnxsim"

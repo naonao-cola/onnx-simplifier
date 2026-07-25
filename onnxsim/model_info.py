@@ -1,12 +1,17 @@
 import warnings
 from collections import defaultdict
-from typing import Callable, Any, List, Optional, Tuple, Dict
+from typing import Callable, Any, List, Optional, Tuple, Dict, Union
 
 import onnx
 from onnx import shape_inference
 from rich.table import Table
 from rich.text import Text
 from rich import print
+
+try:
+    import sympy
+except ImportError:  # sympy is an optional dependency; see _tensor_shape below.
+    sympy = None
 
 
 __all__ = ['ModelInfo', 'print_simplifying_info']
@@ -21,6 +26,10 @@ def human_readable_size(num, suffix="B"):
 
 
 def human_readable_num(num, suffix=""):
+    # A symbolic MAC count (dynamic shapes + sympy) is printed as the formula
+    # itself, e.g. "512*batch*seq**2 + 5419008*batch".
+    if _is_symbolic(num):
+        return str(sympy.factor(num))
     for unit in ["", "K", "M", "G", "T", "P", "E"]:
         if abs(num) < 1000.0:
             return f"{num:3.1f}{unit}{suffix}"
@@ -28,24 +37,59 @@ def human_readable_num(num, suffix=""):
     return f"{num:.1f}Z{suffix}"
 
 
-ShapeMap = Dict[str, List[Optional[int]]]
+# A dimension is a concrete int, a symbolic size (a sympy Symbol standing in for
+# a ``dim_param`` such as "batch"), or None when the size is entirely unknown.
+Dim = Union[int, "sympy.Expr", None]
+# A MAC count is an int, or a sympy expression once any symbolic dim is involved.
+Macs = Union[int, "sympy.Expr"]
+ShapeMap = Dict[str, List[Dim]]
 
 
-def _prod(vals: List[int]) -> int:
+def _dim_symbol(name: str) -> "sympy.Expr":
+    # Same dim_param name -> same symbol, so a dynamic dim shared across tensors
+    # (e.g. "batch") combines correctly in the accumulated formula. Sizes are
+    # positive integers, which lets sympy simplify/factor the result.
+    return sympy.Symbol(name, positive=True, integer=True)
+
+
+def _prod(vals: List[Dim]) -> Macs:
     result = 1
     for v in vals:
         result *= v
     return result
 
 
-def _tensor_shape(type_proto: onnx.TypeProto) -> Optional[List[Optional[int]]]:
+def _tensor_shape(type_proto: onnx.TypeProto) -> Optional[List[Dim]]:
     tensor_type = type_proto.tensor_type
     if not tensor_type.HasField("shape"):
         return None
-    shape: List[Optional[int]] = []
+    shape: List[Dim] = []
     for dim in tensor_type.shape.dim:
-        shape.append(dim.dim_value if dim.HasField("dim_value") else None)
+        if dim.HasField("dim_value"):
+            shape.append(dim.dim_value)
+        elif dim.dim_param:
+            # Dynamic (symbolic) dimension. With sympy we keep it as a symbol so
+            # the MAC total becomes a formula in terms of it; without sympy we
+            # assume 1 and report per-sample MACs (as onnx-tool does).
+            shape.append(_dim_symbol(dim.dim_param) if sympy is not None else 1)
+        else:
+            # Rank is known but this dimension is entirely unknown (no value and
+            # no name); it stays None and disables MAC counting for the node.
+            shape.append(None)
     return shape
+
+
+def _is_symbolic(value: Macs) -> bool:
+    return sympy is not None and isinstance(value, sympy.Expr) and bool(value.free_symbols)
+
+
+def _representative_number(value: Macs) -> int:
+    # Collapse a (possibly symbolic) MAC count to a single number by setting
+    # every free dimension to 1. Used only for ordering and the summary table's
+    # highlighting -- never for the reported value, which stays symbolic.
+    if sympy is not None and isinstance(value, sympy.Expr):
+        value = value.subs({s: 1 for s in value.free_symbols})
+    return int(value)
 
 
 def _collect_shapes(graph: onnx.GraphProto, inherited: ShapeMap) -> ShapeMap:
@@ -143,7 +187,10 @@ class ModelInfo:
     2. Model size
     3. MACs / FLOPs of the compute-dominant operators (Conv, ConvTranspose,
        Gemm, MatMul). Shapes come from ONNX shape inference; nodes whose shapes
-       cannot be inferred contribute 0.
+       cannot be inferred contribute 0. Dynamic dimensions (``dim_param``, e.g.
+       "batch") become sympy symbols when sympy is installed, so ``macs`` /
+       ``flops`` may be a symbolic formula; without sympy they are assumed 1
+       (per-sample MACs).
     TODO:
     Based on onnx runtime, get
     1、forward memory footprint
@@ -234,8 +281,14 @@ def print_simplifying_info(model_ori: onnx.ModelProto, model_opt: onnx.ModelProt
                 opt_info.op_nums[key], lambda opt, ori: opt < ori)
     add_row(
         table, 'Model Size', ori_info.model_size, opt_info.model_size, lambda opt, ori: opt < ori, postprocess=human_readable_size)
+    # MACs/FLOPs may be symbolic, for which "<" yields an undecidable sympy
+    # relational; compare representative magnitudes (all free dims -> 1) so the
+    # highlighting still works without raising.
+    def macs_improved(opt: Macs, ori: Macs) -> bool:
+        return _representative_number(opt) < _representative_number(ori)
+
     add_row(
-        table, 'MACs', ori_info.macs, opt_info.macs, lambda opt, ori: opt < ori, postprocess=human_readable_num)
+        table, 'MACs', ori_info.macs, opt_info.macs, macs_improved, postprocess=human_readable_num)
     add_row(
-        table, 'FLOPs', ori_info.flops, opt_info.flops, lambda opt, ori: opt < ori, postprocess=human_readable_num)
+        table, 'FLOPs', ori_info.flops, opt_info.flops, macs_improved, postprocess=human_readable_num)
     print(table)
