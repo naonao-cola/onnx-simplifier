@@ -164,8 +164,12 @@ class ModelInfo:
             if counter is not None:
                 try:
                     macs += counter(node, shapes)
-                except Exception:
-                    pass
+                except Exception as e:
+                    warnings.warn(
+                        f"Failed to count MACs for {node.op_type} node "
+                        f"'{node.name}' ({e}); it is excluded from the total.",
+                        stacklevel=2,
+                    )
             for attr in node.attribute:
                 sub_graphs = []
                 if attr.g is not None:
