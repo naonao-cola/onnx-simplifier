@@ -1,3 +1,4 @@
+import warnings
 from collections import defaultdict
 from typing import Callable, Any, List, Optional, Tuple, Dict
 
@@ -183,10 +184,14 @@ class ModelInfo:
     def __init__(self, model: onnx.ModelProto):
         try:
             model = shape_inference.infer_shapes(model)
-        except Exception:
+        except Exception as e:
             # Shape inference can fail (e.g. models > 2GB); MACs then fall back
             # to 0 for nodes without pre-existing value_info.
-            pass
+            warnings.warn(
+                f"Shape inference failed ({e}); MACs/FLOPs may be underestimated "
+                "for nodes without existing shape info.",
+                stacklevel=2,
+            )
         self.op_nums, self.model_size, self.macs = self.get_info(model.graph)
 
     @property
