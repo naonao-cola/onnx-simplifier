@@ -708,6 +708,217 @@ void _EvalPartialShape(onnx::ModelProto& model) {
   }
 }
 
+// Whether every element of `tensor` is zero. Only the storage forms that can be
+// inspected locally are accepted: a tensor whose data lives in an external file
+// is reported as "not provably zero" rather than loaded.
+bool IsAllZeroTensor(const onnx::TensorProto& tensor) {
+  if (tensor.data_location() == onnx::TensorProto::EXTERNAL) {
+    return false;
+  }
+  // A zero string is not a thing, and STRING tensors keep their payload in
+  // `string_data`, which the numeric checks below would happily skip over.
+  if (tensor.data_type() == onnx::TensorProto::STRING ||
+      tensor.data_type() == onnx::TensorProto::UNDEFINED) {
+    return false;
+  }
+  if (tensor.has_raw_data()) {
+    // Every numeric ONNX dtype (including float16/bfloat16 and the float8
+    // variants) encodes +0 as all-zero bytes, so a byte-wise test is both dtype
+    // agnostic and conservative: -0.0 has its sign bit set and is reported as
+    // non-zero even though it compares equal to 0.
+    const std::string& raw = tensor.raw_data();
+    return std::all_of(raw.begin(), raw.end(), [](char c) { return c == 0; });
+  }
+  auto all_zero = [](const auto& field) {
+    return std::all_of(field.begin(), field.end(),
+                       [](auto value) { return value == 0; });
+  };
+  // Guard against a tensor that carries no data at all (nothing to prove).
+  const int element_count =
+      tensor.float_data_size() + tensor.int32_data_size() +
+      tensor.int64_data_size() + tensor.double_data_size() +
+      tensor.uint64_data_size();
+  if (element_count == 0) {
+    return false;
+  }
+  return all_zero(tensor.float_data()) && all_zero(tensor.int32_data()) &&
+         all_zero(tensor.int64_data()) && all_zero(tensor.double_data()) &&
+         all_zero(tensor.uint64_data());
+}
+
+// Whether `name` is provably an all-zero tensor, following the chain of ops
+// that produced it. Only shape-manipulating ops are traversed: they move
+// elements around without changing their values, so an all-zero input implies
+// an all-zero output. Ops whose output could be empty (Slice, Split, Gather)
+// stay sound too, since an empty tensor is vacuously all zeros.
+bool IsAllZeroValue(
+    const std::string& name,
+    const std::unordered_map<std::string, const onnx::TensorProto*>&
+        initializers,
+    const std::unordered_map<std::string, const onnx::NodeProto*>& producers,
+    std::unordered_map<std::string, bool>& memo) {
+  if (name.empty()) {
+    return false;
+  }
+  auto memo_iter = memo.find(name);
+  if (memo_iter != memo.end()) {
+    return memo_iter->second;
+  }
+  // Insert a pessimistic answer up front: it both memoizes the miss and breaks
+  // any cycle a malformed graph might contain.
+  memo.emplace(name, false);
+
+  auto init_iter = initializers.find(name);
+  if (init_iter != initializers.end()) {
+    const bool result = IsAllZeroTensor(*init_iter->second);
+    memo[name] = result;
+    return result;
+  }
+
+  auto producer_iter = producers.find(name);
+  if (producer_iter == producers.end()) {
+    return false;
+  }
+  const onnx::NodeProto& node = *producer_iter->second;
+  if (!node.domain().empty() && node.domain() != "ai.onnx") {
+    return false;
+  }
+
+  const auto attribute = [&node](const char* attr_name) {
+    for (const auto& attr : node.attribute()) {
+      if (attr.name() == attr_name) {
+        return &attr;
+      }
+    }
+    return static_cast<const onnx::AttributeProto*>(nullptr);
+  };
+
+  bool result = false;
+  const std::string& op = node.op_type();
+  if (op == "Constant") {
+    if (const auto* value = attribute("value")) {
+      result = IsAllZeroTensor(value->t());
+    } else if (const auto* value = attribute("value_float")) {
+      result = value->f() == 0;
+    } else if (const auto* value = attribute("value_int")) {
+      result = value->i() == 0;
+    } else if (const auto* value = attribute("value_floats")) {
+      result = value->floats_size() > 0 &&
+               std::all_of(value->floats().begin(), value->floats().end(),
+                           [](float f) { return f == 0; });
+    } else if (const auto* value = attribute("value_ints")) {
+      result = value->ints_size() > 0 &&
+               std::all_of(value->ints().begin(), value->ints().end(),
+                           [](int64_t i) { return i == 0; });
+    }
+  } else if (op == "ConstantOfShape") {
+    // The `value` attribute defaults to a single zero float.
+    const auto* value = attribute("value");
+    result = value == nullptr || IsAllZeroTensor(value->t());
+  } else if (op == "Cast" || op == "CastLike") {
+    // Zero casts to zero for every numeric target type, but casting to STRING
+    // yields "0", which is not a zero tensor.
+    const auto* to = attribute("to");
+    const bool to_string =
+        to != nullptr && to->i() == onnx::TensorProto::STRING;
+    result = !to_string &&
+             IsAllZeroValue(node.input(0), initializers, producers, memo);
+  } else if (op == "Identity" || op == "Reshape" || op == "Transpose" ||
+             op == "Squeeze" || op == "Unsqueeze" || op == "Flatten" ||
+             op == "Tile" || op == "Expand" || op == "Slice" || op == "Split" ||
+             op == "Gather" || op == "GatherElements" || op == "GatherND") {
+    result = IsAllZeroValue(node.input(0), initializers, producers, memo);
+  } else if (op == "Concat") {
+    result = node.input_size() > 0 &&
+             std::all_of(node.input().begin(), node.input().end(),
+                         [&](const std::string& input) {
+                           return IsAllZeroValue(input, initializers, producers,
+                                                 memo);
+                         });
+  }
+
+  memo[name] = result;
+  return result;
+}
+
+// Unset the recurrent initial states of RNN/GRU/LSTM nodes that are provably
+// all zeros (issue #314).
+//
+// paddle2onnx (like several other converters) materializes the zero initial
+// hidden/cell state of an LSTM as a *batch-dependent* subgraph, because the
+// state's shape is [num_directions, batch_size, hidden_size]:
+//   Shape(x) -> Slice -> Concat([batch,1,1]) -> Tile(zeros) -> Transpose
+//            -> Slice -> LSTM(initial_h, initial_c)
+// When the model has a dynamic batch dimension none of that can be constant
+// folded, so the simplified model keeps a Shape/Slice/Concat/Tile chain that
+// downstream converters (onnx2ncnn in the issue) reject outright.
+//
+// The ONNX spec says initial_h/initial_c default to zero when omitted, so an
+// input that is provably all zeros can simply be unset. The subgraph feeding it
+// then becomes dead and is removed by the ordinary dead-end elimination pass.
+// Only the initial states are unset; the equally zero-defaulting B and P inputs
+// are left alone because they are plain initializers, so dropping them removes
+// no operator while risking a needless behaviour change in consumers that read
+// them.
+void EliminateZeroRnnInitialState(onnx::GraphProto& graph) {
+  std::unordered_map<std::string, const onnx::TensorProto*> initializers;
+  for (const auto& initializer : graph.initializer()) {
+    initializers.emplace(initializer.name(), &initializer);
+  }
+  std::unordered_map<std::string, const onnx::NodeProto*> producers;
+  for (const auto& node : graph.node()) {
+    for (const auto& output : node.output()) {
+      producers.emplace(output, &node);
+    }
+  }
+  // Shared across nodes: the same zero subgraph usually feeds both initial_h
+  // and initial_c, and often several recurrent layers.
+  std::unordered_map<std::string, bool> memo;
+
+  for (auto& node : *graph.mutable_node()) {
+    // Recurse first, so recurrent ops inside If/Loop/Scan bodies are handled
+    // too. The nested graph is analysed on its own: a value coming from the
+    // enclosing scope has no producer there and is simply not proven zero.
+    for (auto& attr : *node.mutable_attribute()) {
+      if (attr.has_g()) {
+        EliminateZeroRnnInitialState(*attr.mutable_g());
+      }
+      for (auto& subgraph : *attr.mutable_graphs()) {
+        EliminateZeroRnnInitialState(subgraph);
+      }
+    }
+
+    if (!node.domain().empty() && node.domain() != "ai.onnx") {
+      continue;
+    }
+    // Input layout: X, W, R, B, sequence_lens, initial_h[, initial_c, P]
+    const std::string& op = node.op_type();
+    int last_state_index;
+    if (op == "LSTM") {
+      last_state_index = 6;  // initial_h and initial_c
+    } else if (op == "RNN" || op == "GRU") {
+      last_state_index = 5;  // initial_h only
+    } else {
+      continue;
+    }
+
+    for (int i = 5; i <= last_state_index && i < node.input_size(); i++) {
+      if (IsAllZeroValue(node.input(i), initializers, producers, memo)) {
+        node.set_input(i, "");
+      }
+    }
+    // Trailing empty inputs carry no information; drop them so the node ends up
+    // in the same shape a converter would have emitted without the state.
+    while (node.input_size() > 0 && node.input(node.input_size() - 1).empty()) {
+      node.mutable_input()->RemoveLast();
+    }
+  }
+}
+
+void EliminateZeroRnnInitialState(onnx::ModelProto& model) {
+  EliminateZeroRnnInitialState(*model.mutable_graph());
+}
+
 onnx::ModelProto _FoldConstant(const ModelExecutor& executor,
                                const onnx::ModelProto& model) {
   const auto& tmp = model;
@@ -1038,7 +1249,17 @@ onnx::ModelProto Simplify(
   ModelFn InferShapes = shape_inference ? _InferShapes : Identity;
   // ``Optimize`` builds a fresh model (``OptimizeFixed`` returns a new proto),
   // so wrap it as an in-place transform that move-assigns the result back.
-  ModelFn OptimizeInPlace = [](onnx::ModelProto& model) {
+  // ``perform_optimization=False`` (skip_optimizers == nullopt) means the
+  // caller wants the graph structure left alone, so the state elimination --
+  // which relies on dead-end elimination to clean up behind it -- runs with the
+  // optimizer or not at all.
+  const bool optimize = skip_optimizers.has_value();
+  ModelFn OptimizeInPlace = [optimize](onnx::ModelProto& model) {
+    if (optimize) {
+      // Unset all-zero recurrent initial states (issue #314) so the subgraph
+      // computing them becomes dead and the passes below can remove it.
+      EliminateZeroRnnInitialState(model);
+    }
     model = Optimize(model);
   };
 
