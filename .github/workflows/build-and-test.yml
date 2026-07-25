@@ -19,7 +19,7 @@ jobs:
       CIBW_BEFORE_BUILD: "python3 -m pip install --break-system-packages cmake ninja setuptools sccache"
       CIBW_TEST_REQUIRES: pytest flake8 onnxruntime onnxscript==0.6.2 timm==1.0.26 sympy
       CIBW_BEFORE_TEST: pip install torch==2.10.0 torchvision==0.25.0 --index-url https://download.pytorch.org/whl/cpu/
-      CIBW_TEST_COMMAND: pytest -v --durations=10 {project}/tests && onnxsim -h && onnxsim --list-default-optimizers
+      CIBW_TEST_COMMAND: pytest -v --durations=10 ${{ matrix.pytest_args }} {project}/tests && onnxsim -h && onnxsim --list-default-optimizers
       # Only build on Python 3 and skip 32-bit or musl builds
       CIBW_SKIP: "*-win32 *-manylinux_i686 *-musllinux_*"
       # The extension is built RelWithDebInfo (see setup.py) so the sanitizer
@@ -43,6 +43,11 @@ jobs:
         include:
           - os: ubuntu-24.04
             py_ver: cp314t
+            # test_ext allocates a ~2 GiB fp16 tensor and OOM-kills the
+            # free-threaded runner (SIGKILL / exit 137), just as it does on the
+            # Windows runner (see test_wheels_windows_cross). Skip it here; the
+            # same test still runs on the cp310-cp313 jobs.
+            pytest_args: '-k "not test_ext"'
     steps:
     - uses: actions/checkout@v7
       with:
