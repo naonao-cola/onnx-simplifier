@@ -55,7 +55,7 @@ jobs:
       # ONNX Runtime source is not a git submodule; onnxsim-sys downloads it on
       # demand. Cache it so it is fetched at most once per version.
       - name: Cache ONNX Runtime source
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: third_party/onnxruntime-1.27.1
           key: onnxruntime-src-1.27.1
