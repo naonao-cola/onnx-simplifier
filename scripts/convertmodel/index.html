@@ -75,7 +75,9 @@
                     const constant_fold = document.getElementById("id_simplify_constant_fold").checked;
                     const shape_inference = document.getElementById("id_simplify_shape_inference").checked;
                     const tensor_size_threshold = parseInt(document.getElementById("id_simplify_tensor_size_threshold").value);
-                    worker.postMessage([optimizer, buf, passes, constant_fold, shape_inference, tensor_size_threshold], [buf]);
+                    // An empty / non-positive value means "keep the current opset version".
+                    const target_opset_version = parseInt(document.getElementById("id_simplify_target_opset").value) || 0;
+                    worker.postMessage([optimizer, buf, passes, constant_fold, shape_inference, tensor_size_threshold, target_opset_version], [buf]);
                 });
             };
         </script>
@@ -107,6 +109,9 @@
             <br/>
             <label>tensor size threshold (simplify only)</label>
             <input type="number" name="simplify_tensor_size_threshold" id="id_simplify_tensor_size_threshold" value="1000000000">
+            <br/>
+            <label>target opset version (simplify only, 0 = keep)</label>
+            <input type="number" name="simplify_target_opset" id="id_simplify_target_opset" value="0">
             <br/>
         </div>
         <h2>Console outputs:</h2>

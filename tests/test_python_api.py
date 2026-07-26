@@ -1171,6 +1171,45 @@ def test_keep_nonzero_lstm_initial_state():
     assert "Tile" in [node.op_type for node in sim_model.graph.node]
 
 
+def test_target_opset_version_upgrades_model():
+    # ``target_opset_version`` must upgrade the model's default-domain opset
+    # during simplification, using onnx's version converter.
+    x = onnx.helper.make_tensor_value_info("X", onnx.TensorProto.FLOAT, [1, 4])
+    y = onnx.helper.make_tensor_value_info("Y", onnx.TensorProto.FLOAT, [1, 4])
+    node = onnx.helper.make_node("Relu", ["X"], ["Y"])
+    graph_def = onnx.helper.make_graph([node], "g", [x], [y])
+    model = onnx.helper.make_model(
+        graph_def, opset_imports=[onnx.helper.make_opsetid("", 11)]
+    )
+
+    def _default_opset(m):
+        return next(o.version for o in m.opset_import if o.domain in ("", "ai.onnx"))
+
+    assert _default_opset(model) == 11
+
+    sim_model, check_ok = onnxsim.simplify(model, target_opset_version=18)
+    assert check_ok
+    assert _default_opset(sim_model) == 18
+
+
+def test_target_opset_version_none_keeps_opset():
+    # The default (None) must leave the model's opset version untouched.
+    x = onnx.helper.make_tensor_value_info("X", onnx.TensorProto.FLOAT, [1, 4])
+    y = onnx.helper.make_tensor_value_info("Y", onnx.TensorProto.FLOAT, [1, 4])
+    node = onnx.helper.make_node("Relu", ["X"], ["Y"])
+    graph_def = onnx.helper.make_graph([node], "g", [x], [y])
+    model = onnx.helper.make_model(
+        graph_def, opset_imports=[onnx.helper.make_opsetid("", 11)]
+    )
+
+    sim_model, check_ok = onnxsim.simplify(model)
+    assert check_ok
+    default_opset = next(
+        o.version for o in sim_model.opset_import if o.domain in ("", "ai.onnx")
+    )
+    assert default_opset == 11
+
+
 def test_perform_optimization_false():
     def _create_dummy_model():
         class MockModel(torch.nn.Module):

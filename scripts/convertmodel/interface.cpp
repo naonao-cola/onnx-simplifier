@@ -7,7 +7,7 @@
 
 namespace em = emscripten;
 
-em::val onnxsimplify_export(const std::string& data, em::val skip_optimizers, bool constant_folding, bool shape_inference, size_t tensor_size_threshold) {
+em::val onnxsimplify_export(const std::string& data, em::val skip_optimizers, bool constant_folding, bool shape_inference, size_t tensor_size_threshold, int target_opset_version) {
     InitEnv();
 
     std::cerr << "LOG_THRESHOLD: " << std::getenv("LOG_THRESHOLD") << std::endl;
@@ -27,7 +27,11 @@ em::val onnxsimplify_export(const std::string& data, em::val skip_optimizers, bo
             em::vecFromJSArray<std::string>(skip_optimizers),
             constant_folding,
             shape_inference,
-            tensor_size_threshold
+            tensor_size_threshold,
+            // A target opset version of <= 0 means "leave the opset unchanged".
+            target_opset_version > 0
+                ? std::make_optional(target_opset_version)
+                : std::nullopt
         );
     } catch (const std::exception& e) {
         std::cerr << "simplify error: " << e.what() << std::endl;

@@ -295,6 +295,7 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
            std::optional<std::vector<std::string>> skip_optimizers,
            bool constant_folding, bool shape_inference,
            size_t tensor_size_threshold,
+           std::optional<int> target_opset_version,
            std::shared_ptr<PyGraphRewriter> rewriter) -> py::bytes {
           // force env initialization to register opset
           InitEnv();
@@ -302,30 +303,35 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
           ParseProtoFromBytes(&model, model_proto_bytes.c_str(), model_proto_bytes.size());
           auto const result = Simplify(*executor, model, skip_optimizers,
                                        constant_folding, shape_inference,
-                                       tensor_size_threshold, rewriter.get());
+                                       tensor_size_threshold,
+                                       target_opset_version, rewriter.get());
           std::string out;
           result.SerializeToString(&out);
           return py::bytes(out.data(), out.size());
         }, "executor"_a, "model_bytes"_a, "skip_optimizers"_a.none(),
         "constant_folding"_a = true, "shape_inference"_a = true,
-        "tensor_size_threshold"_a, "rewriter"_a.none())
+        "tensor_size_threshold"_a, "target_opset_version"_a.none(),
+        "rewriter"_a.none())
       .def("simplify_path",
            [](std::shared_ptr<PyModelExecutor> executor,
               const std::string& in_path, const std::string& out_path,
               std::optional<std::vector<std::string>> skip_optimizers,
               bool constant_folding, bool shape_inference,
               size_t tensor_size_threshold,
+              std::optional<int> target_opset_version,
               std::shared_ptr<PyGraphRewriter> rewriter) -> bool {
              // force env initialization to register opset
              InitEnv();
              SimplifyPath(*executor, in_path, out_path, skip_optimizers,
                           constant_folding, shape_inference,
-                          tensor_size_threshold, rewriter.get());
+                          tensor_size_threshold, target_opset_version,
+                          rewriter.get());
              return true;
            }, "executor"_a, "in_path"_a, "out_path"_a,
            "skip_optimizers"_a.none(),
            "constant_folding"_a = true, "shape_inference"_a = true,
-           "tensor_size_threshold"_a, "rewriter"_a.none())
+           "tensor_size_threshold"_a, "target_opset_version"_a.none(),
+           "rewriter"_a.none())
       .def("_list_optimizers",
            []() {
             py::list ret;

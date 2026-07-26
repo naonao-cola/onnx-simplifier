@@ -41,6 +41,7 @@ extern "C" {
         constant_folding: c_int,
         shape_inference: c_int,
         tensor_size_threshold: usize,
+        target_opset_version: c_int,
         out_data: *mut *mut c_void,
         out_size: *mut usize,
         out_error: *mut *mut c_char,
@@ -60,6 +61,7 @@ extern "C" {
         constant_folding: c_int,
         shape_inference: c_int,
         tensor_size_threshold: usize,
+        target_opset_version: c_int,
         out_error: *mut *mut c_char,
     ) -> c_int;
 

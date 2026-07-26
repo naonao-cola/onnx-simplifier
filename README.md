@@ -135,6 +135,39 @@ during simplification, so the custom operator's output shapes are inferred too.
 Custom operators without an inference function are still imported; shape
 inference simply flows past them.
 
+## Changing the opset version
+
+You can upgrade (or downgrade) the model's opset version while simplifying. Pass
+`target_opset_version` to `simplify` (CLI: `--target-opset`) and onnxsim converts
+the default ONNX domain to that opset — using onnx's own version converter —
+before running the simplification, so any redundant nodes the conversion
+introduces get cleaned up too.
+
+```python
+import onnx
+import onnxsim
+
+model = onnx.load(filename)
+
+# Convert the model to opset 18 and simplify it.
+model_simp, check = onnxsim.simplify(model, target_opset_version=18)
+```
+
+On the command line:
+
+```
+onnxsim input_onnx_model output_onnx_model --target-opset 18
+```
+
+When `target_opset_version` is left unset (the default), the model's opset
+version is preserved.
+
+The conversion runs inside onnxsim's C++ core, so every binding shares it —
+the Python package, the C API and its Rust wrapper (`Options::target_opset_version`),
+the standalone `onnxsim` binary (`--target-opset`), and the
+[web version](https://onnxsim.github.io/onnxsim/) (the "target opset version"
+field).
+
 ## Custom rewriters
 
 Beyond the built-in optimizer passes, you can plug your own graph rewriting
