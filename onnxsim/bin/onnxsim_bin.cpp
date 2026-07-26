@@ -11,6 +11,7 @@ int main(int argc, char** argv) {
   bool no_opt = option.Get<bool>("no-opt");
   bool no_sim = option.Get<bool>("no-sim");
   bool no_shape_inference = option.Get<bool>("no-shape-inference");
+  int target_opset = option.Get<int>("target-opset");
   auto input_model_filename = option.Get<std::string>("input-model");
   auto output_model_filename = option.Get<std::string>("output-model");
 
@@ -20,7 +21,9 @@ int main(int argc, char** argv) {
   model = Simplify(
       *GetBuiltinModelExecutor(), model,
       no_opt ? std::nullopt : std::make_optional<std::vector<std::string>>({}),
-      !no_sim, !no_shape_inference, SIZE_MAX);
+      !no_sim, !no_shape_inference, SIZE_MAX,
+      // A target opset of <= 0 means "leave the opset version unchanged".
+      target_opset > 0 ? std::make_optional(target_opset) : std::nullopt);
 
   std::ofstream ofs(output_model_filename,
                     std::ios::out | std::ios::trunc | std::ios::binary);

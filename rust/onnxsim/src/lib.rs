@@ -93,6 +93,9 @@ pub struct Options {
     constant_folding: bool,
     shape_inference: bool,
     tensor_size_threshold: usize,
+    /// Target opset version (of the default ONNX domain) to convert the model
+    /// to before simplifying. `None` leaves the opset version unchanged.
+    target_opset_version: Option<i32>,
 }
 
 impl Default for Options {
@@ -102,6 +105,7 @@ impl Default for Options {
             constant_folding: true,
             shape_inference: true,
             tensor_size_threshold: DEFAULT_TENSOR_SIZE_THRESHOLD,
+            target_opset_version: None,
         }
     }
 }
@@ -131,6 +135,15 @@ impl Options {
     /// as an initializer (default: [`DEFAULT_TENSOR_SIZE_THRESHOLD`]).
     pub fn tensor_size_threshold(mut self, bytes: usize) -> Self {
         self.tensor_size_threshold = bytes;
+        self
+    }
+
+    /// Convert the model to `version` (the opset version of the default ONNX
+    /// domain) before simplifying, using onnx's version converter. Can be used
+    /// to upgrade or downgrade the model's opset during simplification (default:
+    /// leave the opset version unchanged).
+    pub fn target_opset_version(mut self, version: i32) -> Self {
+        self.target_opset_version = Some(version);
         self
     }
 
@@ -192,6 +205,7 @@ pub fn simplify_with(model_bytes: &[u8], options: &Options) -> Result<Vec<u8>, E
             bool_to_c(options.constant_folding),
             bool_to_c(options.shape_inference),
             options.tensor_size_threshold,
+            target_opset_to_c(options.target_opset_version),
             &mut out_data,
             &mut out_size,
             &mut out_error,
@@ -240,6 +254,7 @@ pub fn simplify_path_with<P: AsRef<Path>, Q: AsRef<Path>>(
             bool_to_c(options.constant_folding),
             bool_to_c(options.shape_inference),
             options.tensor_size_threshold,
+            target_opset_to_c(options.target_opset_version),
             &mut out_error,
         )
     };
@@ -332,6 +347,12 @@ fn bool_to_c(value: bool) -> c_int {
     }
 }
 
+/// Encode the optional target opset version for the C ABI: `None` (leave the
+/// opset unchanged) maps to 0, which the C API treats as "no change".
+fn target_opset_to_c(version: Option<i32>) -> c_int {
+    version.unwrap_or(0) as c_int
+}
+
 /// Consume a C-owned error string, returning a Rust `Error` and freeing the
 /// original allocation.
 fn take_error(out_error: *mut c_char) -> Error {
@@ -377,6 +398,16 @@ mod tests {
         assert!(opts.shape_inference);
         assert_eq!(opts.skip_optimizers, Some(Vec::new()));
         assert_eq!(opts.tensor_size_threshold, DEFAULT_TENSOR_SIZE_THRESHOLD);
+        assert_eq!(opts.target_opset_version, None);
+    }
+
+    #[test]
+    fn target_opset_version_setter() {
+        let opts = Options::new().target_opset_version(18);
+        assert_eq!(opts.target_opset_version, Some(18));
+        // None encodes to 0 (the C API's "no change" sentinel); Some passes through.
+        assert_eq!(target_opset_to_c(None), 0);
+        assert_eq!(target_opset_to_c(Some(18)), 18);
     }
 
     #[test]

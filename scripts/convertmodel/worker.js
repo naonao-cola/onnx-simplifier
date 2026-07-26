@@ -25,6 +25,7 @@ create_onnxsim({
                     e.data[3], // constant folding
                     e.data[4], // shape inference
                     e.data[5], // tensor size threshold
+                    e.data[6], // target opset version (<= 0 means keep)
                 );
                 break;
             case "optimize":

@@ -312,6 +312,7 @@ def simplify(
     *,
     import_custom_schemas: bool = True,
     input_shapes=None,
+    target_opset_version: Optional[int] = None,
 ) -> Tuple[onnx.ModelProto, bool]:
     """
     :param model: onnx ModelProto object or file path
@@ -335,6 +336,10 @@ def simplify(
             custom operators pass validation. Set to False to disable this and leave onnxsim's
             registry untouched.
     :param input_shapes: Deprecated. Please use `overwrite_input_shapes` and/or `test_input_shapes` instead.
+    :param target_opset_version: Convert the model to this opset version (of the default ONNX domain)
+            before simplifying, using onnx's version converter (run inside the C++ core so every
+            binding shares the behavior). This can be used to upgrade (or downgrade) the model's
+            opset during simplification. When None (the default), the opset version is left unchanged.
     :return: A tuple (simplified model, success(True) or failed(False))
     """
     if dynamic_input_shape:
@@ -472,6 +477,7 @@ def simplify(
             not skip_constant_folding,
             not skip_shape_inference,
             tensor_size_threshold,
+            target_opset_version,
         )
         # The serialized original (~1x model) is not needed once the C++
         # simplifier has consumed it -- the large-model fallback below
@@ -528,6 +534,7 @@ def simplify(
                 not skip_constant_folding,
                 not skip_shape_inference,
                 tensor_size_threshold,
+                target_opset_version,
             )
             check_ok = model_checking.compare(
                 os.path.join(tmpdirname, 'opt.onnx'),
@@ -698,6 +705,12 @@ def main():
         help="By default onnxsim imports operator schemas registered in the Python 'onnx' module (e.g. via onnx.defs.register_schema) into its own registry so models with custom operators pass validation. Specify this flag to disable that import.",
         action="store_true",
         )
+    parser.add_argument(
+        "--target-opset",
+        help="Convert the model to this opset version (of the default ONNX domain) before simplifying, for example '--target-opset 18'. Can be used to upgrade (or downgrade) the model's opset during simplification.",
+        type=int,
+        default=None,
+        )
     parser.add_argument('-v', '--version', action='version', version='onnxsim ' + version.version)
 
     class ListOptimizers(argparse.Action):
@@ -859,6 +872,7 @@ def main():
         args.tensor_size_threshold,
         args.mutable_initializer,
         import_custom_schemas=not args.skip_schema_import,
+        target_opset_version=args.target_opset,
     )
 
     try:

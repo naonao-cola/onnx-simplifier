@@ -23,13 +23,19 @@ void InitEnv();
 std::shared_ptr<const ModelExecutor> GetBuiltinModelExecutor();
 #endif
 
+// ``target_opset_version``, when set, converts the model to that opset version
+// of the default ONNX domain (using onnx's version converter) before
+// simplifying, so the simplifier can clean up any redundant nodes the
+// conversion introduces. std::nullopt leaves the opset version unchanged.
 onnx::ModelProto Simplify(
     const ModelExecutor& executor, const onnx::ModelProto& model,
     std::optional<std::vector<std::string>> skip_optimizers,
-    bool constant_folding, bool shape_inference, size_t tensor_size_threshold);
+    bool constant_folding, bool shape_inference, size_t tensor_size_threshold,
+    std::optional<int> target_opset_version = std::nullopt);
 
 void SimplifyPath(const ModelExecutor& executor, const std::string& in_path,
                   const std::string& out_path,
                   std::optional<std::vector<std::string>> skip_optimizers,
                   bool constant_folding, bool shape_inference,
-                  size_t tensor_size_threshold);
+                  size_t tensor_size_threshold,
+                  std::optional<int> target_opset_version = std::nullopt);

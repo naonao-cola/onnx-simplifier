@@ -56,6 +56,14 @@ std::optional<std::vector<std::string>> BuildSkipOptimizers(
   return passes;
 }
 
+// A target opset version of <= 0 means "leave the opset version unchanged".
+std::optional<int> BuildTargetOpsetVersion(int target_opset_version) {
+  if (target_opset_version <= 0) {
+    return std::nullopt;
+  }
+  return target_opset_version;
+}
+
 }  // namespace
 
 extern "C" {
@@ -65,8 +73,8 @@ OnnxsimStatus onnxsim_simplify(const void* model_data, size_t model_size,
                                size_t num_skip_optimizers,
                                int skip_optimizers_is_null, int constant_folding,
                                int shape_inference, size_t tensor_size_threshold,
-                               void** out_data, size_t* out_size,
-                               char** out_error) {
+                               int target_opset_version, void** out_data,
+                               size_t* out_size, char** out_error) {
   if (out_data != nullptr) {
     *out_data = nullptr;
   }
@@ -93,7 +101,8 @@ OnnxsimStatus onnxsim_simplify(const void* model_data, size_t model_size,
         *GetBuiltinModelExecutor(), model,
         BuildSkipOptimizers(skip_optimizers, num_skip_optimizers,
                             skip_optimizers_is_null),
-        constant_folding != 0, shape_inference != 0, tensor_size_threshold);
+        constant_folding != 0, shape_inference != 0, tensor_size_threshold,
+        BuildTargetOpsetVersion(target_opset_version));
 
     std::string out;
     if (!result.SerializeToString(&out)) {
@@ -126,6 +135,7 @@ OnnxsimStatus onnxsim_simplify_path(const char* in_path, const char* out_path,
                                     int skip_optimizers_is_null,
                                     int constant_folding, int shape_inference,
                                     size_t tensor_size_threshold,
+                                    int target_opset_version,
                                     char** out_error) {
   if (out_error != nullptr) {
     *out_error = nullptr;
@@ -140,7 +150,8 @@ OnnxsimStatus onnxsim_simplify_path(const char* in_path, const char* out_path,
                  BuildSkipOptimizers(skip_optimizers, num_skip_optimizers,
                                     skip_optimizers_is_null),
                  constant_folding != 0, shape_inference != 0,
-                 tensor_size_threshold);
+                 tensor_size_threshold,
+                 BuildTargetOpsetVersion(target_opset_version));
     return ONNXSIM_OK;
   } catch (const std::exception& e) {
     SetError(out_error, e.what());
