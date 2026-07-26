@@ -12,7 +12,9 @@ import pytest
 
 from onnxsim import model_info
 from onnxsim.model_info import (
+    METADATA_PREFIX,
     ModelInfo,
+    annotate_metadata,
     human_readable_density,
     human_readable_num,
     human_readable_size,
@@ -408,6 +410,118 @@ def test_memory_metrics_reported_in_summary(capsys):
     assert "Memory Access" in out
     assert "Memory Footprint" in out
     assert "Compute Density" in out
+
+
+# --------------------------------------------------------------------------- #
+# Storing metrics into metadata_props
+# --------------------------------------------------------------------------- #
+def _meta(proto):
+    return {e.key: e.value for e in proto.metadata_props}
+
+
+def _gemm_model():
+    a = _vi("a", [5, 7])
+    b = _vi("b", [7, 3])
+    y = _vi("y", [5, 3])
+    return _model([helper.make_node("Gemm", ["a", "b"], ["y"], name="gemm0")], [a, b], [y])
+
+
+def test_annotate_metadata_model_level():
+    model = _gemm_model()
+    info = ModelInfo(model)
+    out = annotate_metadata(model)
+    meta = _meta(out)
+    p = METADATA_PREFIX
+    assert meta[p + "macs"] == str(info.macs)
+    assert meta[p + "flops"] == str(info.flops)
+    assert meta[p + "mem_access"] == str(info.mem_access)
+    assert meta[p + "memory_footprint"] == str(info.memory_footprint)
+    assert meta[p + "model_size"] == str(info.model_size)
+    assert p + "compute_density" in meta
+
+
+def test_annotate_metadata_node_level():
+    out = annotate_metadata(_gemm_model())
+    (node,) = out.graph.node
+    meta = _meta(node)
+    p = METADATA_PREFIX
+    assert meta[p + "macs"] == str(5 * 3 * 7)
+    assert meta[p + "flops"] == str(2 * 5 * 3 * 7)
+    assert meta[p + "mem_access"] == str((5 * 7 + 7 * 3 + 5 * 3) * 4)
+
+
+def test_annotate_metadata_value_level():
+    out = annotate_metadata(_gemm_model())
+    by_name = {vi.name: _meta(vi) for vi in list(out.graph.input) + list(out.graph.output)}
+    p = METADATA_PREFIX
+    assert by_name["a"][p + "bytes"] == str(5 * 7 * 4)
+    assert by_name["b"][p + "bytes"] == str(7 * 3 * 4)
+    assert by_name["y"][p + "bytes"] == str(5 * 3 * 4)
+
+
+def test_annotate_metadata_annotates_initializers():
+    a = _vi("a", [4, 8])
+    b = _weight("b", [8, 16])
+    y = _vi("y", [4, 16])
+    model = _model([helper.make_node("MatMul", ["a", "b"], ["y"])], [a], [y], [b])
+    out = annotate_metadata(model)
+    (init,) = out.graph.initializer
+    assert _meta(init)[METADATA_PREFIX + "bytes"] == str(8 * 16 * 4)
+
+
+def test_annotate_metadata_does_not_mutate_input():
+    model = _gemm_model()
+    annotate_metadata(model)
+    assert len(model.metadata_props) == 0
+    assert all(len(n.metadata_props) == 0 for n in model.graph.node)
+    assert all(len(vi.metadata_props) == 0 for vi in model.graph.input)
+
+
+def test_annotate_metadata_output_passes_checker():
+    onnx.checker.check_model(annotate_metadata(_gemm_model()))
+
+
+def test_annotate_metadata_custom_prefix():
+    out = annotate_metadata(_gemm_model(), prefix="myprefix.")
+    assert "myprefix.macs" in _meta(out)
+    assert "myprefix.macs" in _meta(out.graph.node[0])
+
+
+def test_annotate_metadata_symbolic_stores_formula():
+    pytest.importorskip("sympy")
+    a = _vi("a", ["batch", 7])
+    b = _weight("b", [7, 3])
+    y = _vi("y", ["batch", 3])
+    model = _model([helper.make_node("MatMul", ["a", "b"], ["y"], name="mm")], [a], [y], [b])
+    out = annotate_metadata(model)
+    assert _meta(out.graph.node[0])[METADATA_PREFIX + "macs"] == "21*batch"
+    a_vi = next(vi for vi in out.graph.input if vi.name == "a")
+    assert _meta(a_vi)[METADATA_PREFIX + "bytes"] == "28*batch"
+
+
+def test_annotate_metadata_recurses_subgraphs():
+    # An If whose branches each hold a Gemm: the node inside a branch must be
+    # annotated, and the model total must include that branch's MACs.
+    cond = helper.make_tensor_value_info("cond", TensorProto.BOOL, [])
+    y = _vi("y", [5, 3])
+
+    def branch(name):
+        a = _weight("a_" + name, [5, 7])
+        b = _weight("b_" + name, [7, 3])
+        node = helper.make_node("Gemm", ["a_" + name, "b_" + name], ["y"], name="gemm_" + name)
+        return helper.make_graph([node], name, [], [_vi("y", [5, 3])], [a, b])
+
+    if_node = helper.make_node(
+        "If", ["cond"], ["y"], then_branch=branch("t"), else_branch=branch("e")
+    )
+    model = _model([if_node], [cond], [y])
+    out = annotate_metadata(model)
+    # Locate the Gemm inside the then-branch and check it carries metrics.
+    then_g = next(a.g for a in out.graph.node[0].attribute if a.name == "then_branch")
+    gemm = next(n for n in then_g.node if n.op_type == "Gemm")
+    assert _meta(gemm)[METADATA_PREFIX + "macs"] == str(5 * 3 * 7)
+    # Model total counts both branches' Gemms.
+    assert _meta(out)[METADATA_PREFIX + "macs"] == str(2 * 5 * 3 * 7)
 
 
 # --------------------------------------------------------------------------- #

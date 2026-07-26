@@ -21,7 +21,11 @@ except ImportError:  # onnx.inliner was added in onnx 1.14; see ModelInfo.__init
     onnx_inliner = None
 
 
-__all__ = ['ModelInfo', 'print_simplifying_info']
+__all__ = ['ModelInfo', 'print_simplifying_info', 'annotate_metadata', 'METADATA_PREFIX']
+
+# metadata_props keys written by ``annotate_metadata`` are namespaced with this
+# prefix (e.g. "onnxsim.macs") so they never collide with other producers.
+METADATA_PREFIX = "onnxsim."
 
 
 def _iter_graph_tensors(graph: onnx.GraphProto) -> Iterable[onnx.TensorProto]:
@@ -707,3 +711,135 @@ def print_simplifying_info(model_ori: onnx.ModelProto, model_opt: onnx.ModelProt
     add_row(
         table, 'Compute Density', ori_info.compute_density, opt_info.compute_density, lambda opt, ori: False, postprocess=human_readable_density)
     print(table)
+
+
+def _metric_str(value: Macs) -> str:
+    # A metadata value is always a string. A symbolic metric is stored as its
+    # factored formula (e.g. "512*batch"); a concrete one as its plain number.
+    if _is_symbolic(value):
+        return str(sympy.factor(value))
+    return str(value)
+
+
+def _supports_metadata(proto) -> bool:
+    # metadata_props on Node/Graph/ValueInfo/Tensor was added in newer onnx
+    # releases; skip the level cleanly on older ones instead of crashing.
+    return any(f.name == "metadata_props" for f in proto.DESCRIPTOR.fields)
+
+
+def _set_metadata(proto, key: str, value: str) -> None:
+    """Set ``key`` -> ``value`` in ``proto.metadata_props``, overwriting any
+    existing entry with that key. No-op if the proto has no metadata_props.
+    """
+    if not _supports_metadata(proto):
+        return
+    for entry in proto.metadata_props:
+        if entry.key == key:
+            entry.value = value
+            return
+    entry = proto.metadata_props.add()
+    entry.key = key
+    entry.value = value
+
+
+def _annotate_graph(
+    graph: onnx.GraphProto,
+    prefix: str,
+    inherited_shapes: ShapeMap,
+    inherited_dtypes: DTypeMap,
+) -> Tuple[Macs, Macs]:
+    """Write per-node and per-value metrics onto ``graph`` in place and return
+    the graph's ``(macs, mem_access)`` subtotal.
+
+    Per-value tensors (inputs, outputs, value_info and initializers) get a
+    ``<prefix>bytes`` entry; each node gets ``macs`` / ``flops`` / ``mem_access``;
+    the graph itself gets its own aggregate of those three. Values come from the
+    graph as authored, so a function-op node counts only what a bespoke counter
+    knows (0 otherwise) -- the model-level totals additionally include function
+    bodies (see ``annotate_metadata``).
+    """
+    shapes = _collect_shapes(graph, inherited_shapes)
+    dtypes = _collect_dtypes(graph, inherited_dtypes)
+
+    for value_info in list(graph.input) + list(graph.output) + list(graph.value_info):
+        nbytes = _tensor_bytes(value_info.name, shapes, dtypes)
+        if nbytes is not None:
+            _set_metadata(value_info, prefix + "bytes", _metric_str(nbytes))
+    for initializer in graph.initializer:
+        nbytes = _tensor_bytes(initializer.name, shapes, dtypes)
+        if nbytes is not None:
+            _set_metadata(initializer, prefix + "bytes", _metric_str(nbytes))
+
+    macs: Macs = 0
+    mem_access: Macs = 0
+    for node in graph.node:
+        counter = _MAC_COUNTERS.get(node.op_type)
+        node_macs: Macs = 0
+        if counter is not None:
+            try:
+                node_macs = counter(node, shapes)
+            except Exception:
+                node_macs = 0
+        node_mem = _node_memory_access(node, shapes, dtypes)
+        _set_metadata(node, prefix + "macs", _metric_str(node_macs))
+        _set_metadata(node, prefix + "flops", _metric_str(node_macs * 2))
+        _set_metadata(node, prefix + "mem_access", _metric_str(node_mem))
+        macs += node_macs
+        mem_access += node_mem
+        for attr in node.attribute:
+            sub_graphs = []
+            if attr.HasField("g"):
+                sub_graphs.append(attr.g)
+            sub_graphs.extend(attr.graphs)
+            for sub_graph in sub_graphs:
+                sub_macs, sub_mem = _annotate_graph(sub_graph, prefix, shapes, dtypes)
+                macs += sub_macs
+                mem_access += sub_mem
+
+    _set_metadata(graph, prefix + "macs", _metric_str(macs))
+    _set_metadata(graph, prefix + "flops", _metric_str(macs * 2))
+    _set_metadata(graph, prefix + "mem_access", _metric_str(mem_access))
+    return macs, mem_access
+
+
+def annotate_metadata(model: onnx.ModelProto, prefix: str = METADATA_PREFIX) -> onnx.ModelProto:
+    """Return a shape-inferred copy of ``model`` with the computed metrics stored
+    in ``metadata_props`` at three levels, so downstream tools can read them back:
+
+    - **Model** (and every graph): ``<prefix>macs``, ``flops``, ``mem_access``.
+      The model additionally carries ``memory_footprint``, ``compute_density``
+      and ``model_size``. Model-level totals come from :class:`ModelInfo`, so
+      they include the compute inside inlined function bodies; a graph's own
+      entries are the sum over the nodes it literally contains.
+    - **Node**: ``<prefix>macs`` / ``flops`` / ``mem_access`` for that node.
+    - **Value** (inputs, outputs, value_info, initializers): ``<prefix>bytes``.
+
+    Values are strings (a symbolic metric is its formula, e.g. ``"512*batch"``).
+    Tensors of unknown shape/dtype are simply left unannotated. The input model
+    is never mutated; the returned copy is shape-inferred so intermediate values
+    carry the shapes the per-value/per-node metrics are derived from.
+    """
+    info = ModelInfo(model)
+    # Work on an inferred copy: infer_shapes returns a fresh model on success,
+    # but the original object on failure -- deep-copy first so the caller's model
+    # is never touched and the annotations land on populated value_info.
+    work = ModelInfo._infer_shapes(copy.deepcopy(model))
+
+    _annotate_graph(work.graph, prefix, {}, {})
+
+    totals = {
+        "macs": info.macs,
+        "flops": info.flops,
+        "mem_access": info.mem_access,
+        "memory_footprint": info.memory_footprint,
+        "compute_density": info.compute_density,
+        "model_size": info.model_size,
+    }
+    for key, value in totals.items():
+        _set_metadata(work, prefix + key, _metric_str(value))
+    # Overwrite the top graph's authored-node aggregates with the model totals so
+    # graph- and model-level macs/flops/mem_access agree (they differ only when
+    # function bodies contribute compute the authored nodes don't show).
+    for key in ("macs", "flops", "mem_access"):
+        _set_metadata(work.graph, prefix + key, _metric_str(totals[key]))
+    return work
