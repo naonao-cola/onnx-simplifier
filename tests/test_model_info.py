@@ -11,7 +11,14 @@ from onnx import TensorProto, helper
 import pytest
 
 from onnxsim import model_info
-from onnxsim.model_info import ModelInfo, human_readable_num, human_readable_size
+from onnxsim.model_info import (
+    METADATA_PREFIX,
+    ModelInfo,
+    annotate_metadata,
+    human_readable_density,
+    human_readable_num,
+    human_readable_size,
+)
 
 
 def _model(nodes, inputs, outputs, initializers=None, opset=23):
@@ -270,6 +277,251 @@ def test_human_readable_num_units():
 def test_human_readable_size_units():
     assert human_readable_size(512) == "512.0B"
     assert human_readable_size(1024) == "1.0KiB"
+
+
+def test_human_readable_density_units():
+    assert human_readable_density(0) == "0.00 FLOP/Byte"
+    assert human_readable_density(2.5) == "2.50 FLOP/Byte"
+
+
+def test_human_readable_size_symbolic():
+    sympy = pytest.importorskip("sympy")
+    batch = sympy.Symbol("batch", positive=True, integer=True)
+    assert human_readable_size(512 * batch) == "512*batch"
+
+
+# --------------------------------------------------------------------------- #
+# Memory metrics: access traffic, peak footprint, compute density
+# --------------------------------------------------------------------------- #
+def _info(nodes, inputs, outputs, initializers=None, opset=23):
+    return ModelInfo(_model(nodes, inputs, outputs, initializers, opset))
+
+
+def test_memory_access_gemm():
+    # float32 tensors: reads a (5*7) + b (7*3), writes y (5*3), 4 bytes each.
+    a = _vi("a", [5, 7])
+    b = _vi("b", [7, 3])
+    y = _vi("y", [5, 3])
+    node = helper.make_node("Gemm", ["a", "b"], ["y"])
+    expected = (5 * 7 + 7 * 3 + 5 * 3) * 4
+    assert _info([node], [a, b], [y]).mem_access == expected
+
+
+def test_memory_access_counts_weights():
+    # A weight fed as an initializer is read from memory, so its bytes count.
+    a = _vi("a", [4, 8])
+    b = _weight("b", [8, 16])
+    y = _vi("y", [4, 16])
+    node = helper.make_node("MatMul", ["a", "b"], ["y"])
+    expected = (4 * 8 + 8 * 16 + 4 * 16) * 4
+    assert _info([node], [a], [y], [b]).mem_access == expected
+
+
+def test_memory_access_respects_dtype_size():
+    # float16 halves the bytes of the float32 case.
+    a = _vi("a", [5, 7], TensorProto.FLOAT16)
+    b = _vi("b", [7, 3], TensorProto.FLOAT16)
+    y = _vi("y", [5, 3], TensorProto.FLOAT16)
+    node = helper.make_node("Gemm", ["a", "b"], ["y"])
+    expected = (5 * 7 + 7 * 3 + 5 * 3) * 2
+    assert _info([node], [a, b], [y]).mem_access == expected
+
+
+def test_memory_access_unknown_shape_contributes_zero():
+    # An intermediate with no inferred shape simply drops out of the total; the
+    # known operands are still counted.
+    a = _vi("a", [5, 7])
+    b = _vi("b", [7, 3])
+    y = _vi("y", [5, 3])
+    node = helper.make_node("Gemm", ["a", "b"], ["y"])
+    assert model_info._node_memory_access(node, {}, {}) == 0
+
+
+def test_compute_density_is_flops_over_bytes():
+    a = _vi("a", [5, 7])
+    b = _vi("b", [7, 3])
+    y = _vi("y", [5, 3])
+    info = _info([helper.make_node("Gemm", ["a", "b"], ["y"])], [a, b], [y])
+    assert info.compute_density == info.flops / info.mem_access
+
+
+def test_compute_density_zero_when_no_traffic():
+    # A shapeless model has no measurable traffic, so density is 0 (not a crash).
+    x = helper.make_tensor_value_info("x", TensorProto.FLOAT, None)
+    y = helper.make_tensor_value_info("y", TensorProto.FLOAT, None)
+    info = _info([helper.make_node("Relu", ["x"], ["y"])], [x], [y])
+    assert info.mem_access == 0
+    assert info.compute_density == 0
+
+
+def test_memory_footprint_single_node():
+    # Gemm: inputs a, b live through the node and output y is produced -> peak is
+    # every tensor resident at once.
+    a = _vi("a", [5, 7])
+    b = _vi("b", [7, 3])
+    y = _vi("y", [5, 3])
+    info = _info([helper.make_node("Gemm", ["a", "b"], ["y"])], [a, b], [y])
+    assert info.memory_footprint == (5 * 7 + 7 * 3 + 5 * 3) * 4
+
+
+def test_memory_footprint_reuses_freed_activations():
+    # x -> Conv -> h -> Relu -> y. x is dead after Conv, so it is not resident
+    # during Relu; the peak is the larger of the two per-node working sets, not
+    # the sum of every tensor.
+    x = _vi("x", [1, 3, 8, 8])
+    w = _weight("w", [4, 3, 3, 3])
+    h = _vi("h", [1, 4, 8, 8])
+    y = _vi("y", [1, 4, 8, 8])
+    nodes = [
+        helper.make_node("Conv", ["x", "w"], ["h"], kernel_shape=[3, 3], pads=[1, 1, 1, 1]),
+        helper.make_node("Relu", ["h"], ["y"]),
+    ]
+    info = _info(nodes, [x], [y], [w])
+    b = 4  # float32
+    weight_bytes = 4 * 3 * 3 * 3 * b
+    x_bytes = 1 * 3 * 8 * 8 * b
+    h_bytes = 1 * 4 * 8 * 8 * b
+    y_bytes = 1 * 4 * 8 * 8 * b
+    conv_peak = weight_bytes + x_bytes + h_bytes  # x still live, h produced
+    relu_peak = weight_bytes + h_bytes + y_bytes  # x freed, y produced
+    assert info.memory_footprint == max(conv_peak, relu_peak)
+    # ... and strictly less than holding every tensor at once.
+    assert info.memory_footprint < weight_bytes + x_bytes + h_bytes + y_bytes
+
+
+def test_memory_metrics_symbolic_dynamic_batch():
+    sympy = pytest.importorskip("sympy")
+    a = _vi("a", ["batch", 7])
+    b = _weight("b", [7, 3])
+    y = _vi("y", ["batch", 3])
+    info = _info([helper.make_node("MatMul", ["a", "b"], ["y"])], [a], [y], [b])
+    batch = sympy.Symbol("batch", positive=True, integer=True)
+    expected = (7 * batch + 3 * batch) * 4 + (7 * 3) * 4  # a + y scale with batch; b fixed
+    assert sympy.simplify(info.mem_access - expected) == 0
+
+
+def test_memory_metrics_reported_in_summary(capsys):
+    a = _vi("a", [5, 7])
+    b = _vi("b", [7, 3])
+    y = _vi("y", [5, 3])
+    model = _model([helper.make_node("Gemm", ["a", "b"], ["y"])], [a, b], [y])
+    model_info.print_simplifying_info(model, model)
+    out = capsys.readouterr().out
+    assert "Memory Access" in out
+    assert "Memory Footprint" in out
+    assert "Compute Density" in out
+
+
+# --------------------------------------------------------------------------- #
+# Storing metrics into metadata_props
+# --------------------------------------------------------------------------- #
+def _meta(proto):
+    return {e.key: e.value for e in proto.metadata_props}
+
+
+def _gemm_model():
+    a = _vi("a", [5, 7])
+    b = _vi("b", [7, 3])
+    y = _vi("y", [5, 3])
+    return _model([helper.make_node("Gemm", ["a", "b"], ["y"], name="gemm0")], [a, b], [y])
+
+
+def test_annotate_metadata_model_level():
+    model = _gemm_model()
+    info = ModelInfo(model)
+    out = annotate_metadata(model)
+    meta = _meta(out)
+    p = METADATA_PREFIX
+    assert meta[p + "macs"] == str(info.macs)
+    assert meta[p + "flops"] == str(info.flops)
+    assert meta[p + "mem_access"] == str(info.mem_access)
+    assert meta[p + "memory_footprint"] == str(info.memory_footprint)
+    assert meta[p + "model_size"] == str(info.model_size)
+    assert p + "compute_density" in meta
+
+
+def test_annotate_metadata_node_level():
+    out = annotate_metadata(_gemm_model())
+    (node,) = out.graph.node
+    meta = _meta(node)
+    p = METADATA_PREFIX
+    assert meta[p + "macs"] == str(5 * 3 * 7)
+    assert meta[p + "flops"] == str(2 * 5 * 3 * 7)
+    assert meta[p + "mem_access"] == str((5 * 7 + 7 * 3 + 5 * 3) * 4)
+
+
+def test_annotate_metadata_value_level():
+    out = annotate_metadata(_gemm_model())
+    by_name = {vi.name: _meta(vi) for vi in list(out.graph.input) + list(out.graph.output)}
+    p = METADATA_PREFIX
+    assert by_name["a"][p + "bytes"] == str(5 * 7 * 4)
+    assert by_name["b"][p + "bytes"] == str(7 * 3 * 4)
+    assert by_name["y"][p + "bytes"] == str(5 * 3 * 4)
+
+
+def test_annotate_metadata_annotates_initializers():
+    a = _vi("a", [4, 8])
+    b = _weight("b", [8, 16])
+    y = _vi("y", [4, 16])
+    model = _model([helper.make_node("MatMul", ["a", "b"], ["y"])], [a], [y], [b])
+    out = annotate_metadata(model)
+    (init,) = out.graph.initializer
+    assert _meta(init)[METADATA_PREFIX + "bytes"] == str(8 * 16 * 4)
+
+
+def test_annotate_metadata_does_not_mutate_input():
+    model = _gemm_model()
+    annotate_metadata(model)
+    assert len(model.metadata_props) == 0
+    assert all(len(n.metadata_props) == 0 for n in model.graph.node)
+    assert all(len(vi.metadata_props) == 0 for vi in model.graph.input)
+
+
+def test_annotate_metadata_output_passes_checker():
+    onnx.checker.check_model(annotate_metadata(_gemm_model()))
+
+
+def test_annotate_metadata_custom_prefix():
+    out = annotate_metadata(_gemm_model(), prefix="myprefix.")
+    assert "myprefix.macs" in _meta(out)
+    assert "myprefix.macs" in _meta(out.graph.node[0])
+
+
+def test_annotate_metadata_symbolic_stores_formula():
+    pytest.importorskip("sympy")
+    a = _vi("a", ["batch", 7])
+    b = _weight("b", [7, 3])
+    y = _vi("y", ["batch", 3])
+    model = _model([helper.make_node("MatMul", ["a", "b"], ["y"], name="mm")], [a], [y], [b])
+    out = annotate_metadata(model)
+    assert _meta(out.graph.node[0])[METADATA_PREFIX + "macs"] == "21*batch"
+    a_vi = next(vi for vi in out.graph.input if vi.name == "a")
+    assert _meta(a_vi)[METADATA_PREFIX + "bytes"] == "28*batch"
+
+
+def test_annotate_metadata_recurses_subgraphs():
+    # An If whose branches each hold a Gemm: the node inside a branch must be
+    # annotated, and the model total must include that branch's MACs.
+    cond = helper.make_tensor_value_info("cond", TensorProto.BOOL, [])
+    y = _vi("y", [5, 3])
+
+    def branch(name):
+        a = _weight("a_" + name, [5, 7])
+        b = _weight("b_" + name, [7, 3])
+        node = helper.make_node("Gemm", ["a_" + name, "b_" + name], ["y"], name="gemm_" + name)
+        return helper.make_graph([node], name, [], [_vi("y", [5, 3])], [a, b])
+
+    if_node = helper.make_node(
+        "If", ["cond"], ["y"], then_branch=branch("t"), else_branch=branch("e")
+    )
+    model = _model([if_node], [cond], [y])
+    out = annotate_metadata(model)
+    # Locate the Gemm inside the then-branch and check it carries metrics.
+    then_g = next(a.g for a in out.graph.node[0].attribute if a.name == "then_branch")
+    gemm = next(n for n in then_g.node if n.op_type == "Gemm")
+    assert _meta(gemm)[METADATA_PREFIX + "macs"] == str(5 * 3 * 7)
+    # Model total counts both branches' Gemms.
+    assert _meta(out)[METADATA_PREFIX + "macs"] == str(2 * 5 * 3 * 7)
 
 
 # --------------------------------------------------------------------------- #
