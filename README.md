@@ -237,25 +237,27 @@ callable as protobuf bytes and parses whatever comes back into a fresh
 that copy even when it changed nothing.
 
 Return `False` to tell onnxsim that this round rewrote nothing; onnxsim then
-keeps the model it already has and skips the round-trip. `onnxscript.rewriter`
-knows this from its applied-rewrite **count**, which
-`RewriteRuleSet.apply_to_model` returns (an IR round-trip can reorder the bytes
-even when no rule fires, so the count — not a byte comparison — is the reliable
-signal). Drive the rewrite through the IR so you can read that count:
+keeps the model it already has and skips the round-trip. Run the rules through
+onnx-ir's `PassManager` — `onnxscript.rewriter.RewritePass` wraps a rule set as
+an IR pass — and read the `modified` flag of the `PassResult` it returns. That
+flag is the reliable signal: an IR round-trip can reorder the serialized bytes
+even when no rule fires, so a byte comparison would falsely report a change.
 
 ```python
 from onnxscript import ir
-from onnxscript.rewriter import pattern
+from onnxscript.rewriter import RewritePass, pattern
 
 rules = pattern.RewriteRuleSet(
     [pattern.RewriteRule(matmul_add_pattern, gemm_replacement)]
 )
+rewrite_pass = ir.passes.PassManager([RewritePass(rules)])
 
 def apply_rules(model: onnx.ModelProto):
     model_ir = ir.serde.deserialize_model(model)
-    if rules.apply_to_model(model_ir) == 0:
-        return False  # nothing matched this round: skip the copy
-    return ir.serde.serialize_model(model_ir)
+    result = rewrite_pass(model_ir)  # ir.passes.PassResult
+    if not result.modified:
+        return False  # no rule fired this round: skip the copy
+    return ir.serde.serialize_model(result.model)
 
 model_simp, check = onnxsim.simplify(model, custom_rewriter=apply_rules)
 ```

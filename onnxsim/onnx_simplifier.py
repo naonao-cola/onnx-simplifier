@@ -354,8 +354,8 @@ def simplify(
             ``custom_rewriter=lambda m: onnxscript.rewriter.rewrite(m, pattern_rewrite_rules=my_rules)``.
             The callable may return a new ``ModelProto``, mutate and return ``None``, or return ``False``
             to report that it rewrote nothing. Returning ``False`` when no rewrite happened (for example
-            when an ``onnxscript.rewriter`` rule set's applied-rewrite count is zero) lets onnxsim skip
-            copying an unchanged model back through the C++ core on that fixed-point round.
+            when an ``onnxscript.rewriter`` pass reports ``PassResult.modified`` is ``False``) lets onnxsim
+            skip copying an unchanged model back through the C++ core on that fixed-point round.
     :return: A tuple (simplified model, success(True) or failed(False))
     """
     if dynamic_input_shape:
@@ -606,13 +606,13 @@ class _GraphRewriterAdapter(C.GraphRewriter):
     passed-in model.
 
     A function may instead return ``False`` to report that it rewrote nothing
-    -- e.g. an ``onnxscript.rewriter`` rule set whose patterns matched zero
-    times, which is known from its applied-rewrite count. In that case this
-    adapter returns empty bytes, the "model unchanged" sentinel, so the C++ core
-    keeps the model it already has instead of re-serializing here and parsing an
-    identical copy back. Because an onnxscript IR round-trip can reorder bytes
-    even when no rule fires, the rewrite count -- not a byte comparison -- is the
-    reliable signal that nothing changed.
+    -- e.g. an ``onnxscript.rewriter`` pass whose ``PassResult.modified`` is
+    ``False`` because no pattern matched. In that case this adapter returns
+    empty bytes, the "model unchanged" sentinel, so the C++ core keeps the model
+    it already has instead of re-serializing here and parsing an identical copy
+    back. Because an onnxscript IR round-trip can reorder bytes even when no rule
+    fires, the ``modified`` flag -- not a byte comparison -- is the reliable
+    signal that nothing changed.
     """
 
     def __init__(self, fn: ModelRewriter):

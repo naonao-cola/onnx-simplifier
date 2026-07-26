@@ -193,13 +193,14 @@ def test_custom_rewriter_with_onnxscript():
     assert check_ok
 
 
-def test_custom_rewriter_onnxscript_count_skips_copy():
-    """The documented count-aware onnxscript pattern: return ``False`` when the
-    rule set's applied-rewrite count is zero so onnxsim skips the copy, and still
-    apply the fusion when it fires."""
+def test_custom_rewriter_onnxscript_passresult_skips_copy():
+    """The documented onnxscript pattern: run the rules through onnx-ir's
+    ``PassManager`` and return ``False`` when the resulting ``PassResult`` reports
+    the model was not modified, so onnxsim skips the copy -- while still applying
+    the fusion when a rule fires."""
     pytest.importorskip("onnxscript.rewriter")
     from onnxscript import ir
-    from onnxscript.rewriter import pattern
+    from onnxscript.rewriter import RewritePass, pattern
 
     def _pat(op, x, w, b):
         return op.Add(op.MatMul(x, w), b)
@@ -208,17 +209,18 @@ def test_custom_rewriter_onnxscript_count_skips_copy():
         return op.Gemm(x, w, b)
 
     rules = pattern.RewriteRuleSet([pattern.RewriteRule(_pat, _rep)])
+    rewrite_pass = ir.passes.PassManager([RewritePass(rules)])
 
     model = _matmul_add_model()
-    counts_seen = []
+    modified_seen = []
 
     def rewrite(m: onnx.ModelProto):
         model_ir = ir.serde.deserialize_model(m)
-        count = rules.apply_to_model(model_ir)
-        counts_seen.append(count)
-        if count == 0:
-            return False  # nothing matched: skip the copy
-        return ir.serde.serialize_model(model_ir)
+        result = rewrite_pass(model_ir)
+        modified_seen.append(result.modified)
+        if not result.modified:
+            return False  # no rule fired: skip the copy
+        return ir.serde.serialize_model(result.model)
 
     sim_model, check_ok = onnxsim.simplify(
         model, check_n=3, custom_rewriter=rewrite)
@@ -226,8 +228,9 @@ def test_custom_rewriter_onnxscript_count_skips_copy():
     assert counts["Gemm"] == 1, counts
     assert counts["MatMul"] == 0 and counts["Add"] == 0, counts
     assert check_ok
-    # The rewriter ran, and the final round reported zero rewrites and returned
-    # ``False`` -- exercising the no-copy path that converges the fixed point.
-    # (The fusion itself may come from this rule or from the built-in optimizer,
-    # whichever fires first; either way the last round rewrites nothing.)
-    assert counts_seen and counts_seen[-1] == 0
+    # The rewriter ran, and the final round reported the model was not modified
+    # and returned ``False`` -- exercising the no-copy path that converges the
+    # fixed point. (The fusion itself may come from this rule or from the
+    # built-in optimizer, whichever fires first; either way the last round
+    # rewrites nothing.)
+    assert modified_seen and not modified_seen[-1]
