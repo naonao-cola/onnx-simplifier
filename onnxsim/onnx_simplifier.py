@@ -5,7 +5,7 @@ import os
 import sys
 import re
 import tempfile
-from typing import List, Literal, Dict, Union, Optional, Tuple, Sequence
+from typing import Callable, List, Literal, Dict, Union, Optional, Tuple, Sequence
 from rich.text import Text
 from rich import print
 import numpy as np
@@ -26,6 +26,10 @@ from . import version
 TensorShape = List[int]
 TensorShapes = Dict[str, TensorShape]
 TensorShapesWithOptionalKey = Dict[Optional[str], TensorShape]
+# A user-supplied graph rewriter: takes a model and returns a rewritten model,
+# or mutates it in place and returns ``None``. Passed to ``simplify`` via
+# ``custom_rewriter`` and run inside the simplification fixed point.
+ModelRewriter = Callable[[onnx.ModelProto], Optional[onnx.ModelProto]]
 Unit = Literal["B", "KB", "MB", "GB", "TB"]
 
 UNIT_MAP: dict[Unit, int] = {
@@ -312,6 +316,7 @@ def simplify(
     *,
     import_custom_schemas: bool = True,
     input_shapes=None,
+    custom_rewriter: Optional[ModelRewriter] = None,
 ) -> Tuple[onnx.ModelProto, bool]:
     """
     :param model: onnx ModelProto object or file path
@@ -335,6 +340,12 @@ def simplify(
             custom operators pass validation. Set to False to disable this and leave onnxsim's
             registry untouched.
     :param input_shapes: Deprecated. Please use `overwrite_input_shapes` and/or `test_input_shapes` instead.
+    :param custom_rewriter: An optional callable ``ModelProto -> Optional[ModelProto]`` run as an extra
+            stage inside onnxsim's simplification fixed point, interleaved with the built-in optimizer,
+            shape inference and constant folding so a rewrite can unlock further simplification and vice
+            versa. Use it to plug in a custom graph rewriter, e.g. an ``onnxscript.rewriter`` rule set:
+            ``custom_rewriter=lambda m: onnxscript.rewriter.rewrite(m, pattern_rewrite_rules=my_rules)``.
+            The callable may return a new ``ModelProto`` or mutate and return ``None``.
     :return: A tuple (simplified model, success(True) or failed(False))
     """
     if dynamic_input_shape:
@@ -361,6 +372,11 @@ def simplify(
     # Can be turned off via ``import_custom_schemas=False``.
     if import_custom_schemas:
         import_onnx_schemas()
+
+    # Wrap the user-supplied rewriter (if any) so the C++ simplifier can call it
+    # between optimization rounds. ``None`` leaves the pipeline unchanged.
+    rewriter = _GraphRewriterAdapter(
+        custom_rewriter) if custom_rewriter is not None else None
 
     if not perform_optimization:
         # None means skip all optimizers
@@ -472,6 +488,7 @@ def simplify(
             not skip_constant_folding,
             not skip_shape_inference,
             tensor_size_threshold,
+            rewriter,
         )
         # The serialized original (~1x model) is not needed once the C++
         # simplifier has consumed it -- the large-model fallback below
@@ -528,6 +545,7 @@ def simplify(
                 not skip_constant_folding,
                 not skip_shape_inference,
                 tensor_size_threshold,
+                rewriter,
             )
             check_ok = model_checking.compare(
                 os.path.join(tmpdirname, 'opt.onnx'),
@@ -563,6 +581,30 @@ class PyModelExecutor(C.ModelExecutor):
             onnx.numpy_helper.from_array(x).SerializeToString() if isinstance(x, np.ndarray) else x
             for x in outputs.values()
         ]
+
+
+class _GraphRewriterAdapter(C.GraphRewriter):
+    """Adapts a Python ``ModelProto -> ModelProto`` callable to the C++
+    ``GraphRewriter`` interface.
+
+    The C++ simplifier hands the model to ``Run`` as serialized protobuf bytes
+    and expects the rewritten model back as bytes; this adapter deserializes,
+    calls the user function, and re-serializes. A function that returns ``None``
+    (i.e. mutates the model in place) is supported by falling back to the
+    passed-in model.
+    """
+
+    def __init__(self, fn: ModelRewriter):
+        super().__init__()
+        self._fn = fn
+
+    def Run(self, model_str: bytes) -> bytes:
+        model = onnx.ModelProto()
+        model.ParseFromString(model_str)
+        rewritten = self._fn(model)
+        if rewritten is None:
+            rewritten = model
+        return rewritten.SerializeToString()
 
 
 _model_executor: Optional[PyModelExecutor] = None

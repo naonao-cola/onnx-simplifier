@@ -1,0 +1,136 @@
+"""Tests for the ``custom_rewriter`` hook of ``onnxsim.simplify``.
+
+``custom_rewriter`` lets a Python callable rewrite the model from inside
+onnxsim's simplification fixed point, interleaved with the built-in optimizer,
+shape inference and constant folding. These tests exercise the hook with a
+plain-Python rewriter (no extra dependency) and, when available, with an
+``onnxscript.rewriter`` rule set -- the intended real-world use case.
+"""
+import collections
+
+import numpy as np
+import onnx
+import onnxsim
+import pytest
+
+
+def _model(nodes, inputs, outputs, initializer, opset=13):
+    graph = onnx.helper.make_graph(nodes, "g", inputs, outputs, initializer)
+    return onnx.helper.make_model(
+        graph, opset_imports=[onnx.helper.make_opsetid("", opset)], ir_version=10)
+
+
+def _vi(name, shape):
+    return onnx.helper.make_tensor_value_info(name, onnx.TensorProto.FLOAT, shape)
+
+
+def _f32(array, name):
+    return onnx.numpy_helper.from_array(array.astype(np.float32), name)
+
+
+def _matmul_add_model():
+    """x @ W + B, i.e. a MatMul feeding an Add -- the classic Gemm fusion."""
+    nodes = [
+        onnx.helper.make_node("MatMul", ["x", "W"], ["mm"], name="mm"),
+        onnx.helper.make_node("Add", ["mm", "B"], ["y"], name="add"),
+    ]
+    inits = [
+        _f32(np.random.randn(4, 5), "W"),
+        _f32(np.random.randn(5), "B"),
+    ]
+    return _model(
+        nodes,
+        [_vi("x", [3, 4])],
+        [_vi("y", [3, 5])],
+        inits,
+    )
+
+
+def _op_types(model):
+    return collections.Counter(n.op_type for n in model.graph.node)
+
+
+def test_custom_rewriter_runs_and_rewrites():
+    """A plain-Python rewriter that renames every Relu to a Gelu is applied."""
+    model = _model(
+        [onnx.helper.make_node("Relu", ["x"], ["y"], name="r")],
+        [_vi("x", [2, 2])],
+        [_vi("y", [2, 2])],
+        [],
+    )
+
+    def rewrite(m: onnx.ModelProto) -> onnx.ModelProto:
+        for node in m.graph.node:
+            if node.op_type == "Relu":
+                node.op_type = "Gelu"
+        return m
+
+    sim_model, _ = onnxsim.simplify(model, check_n=0, custom_rewriter=rewrite)
+    assert _op_types(sim_model)["Gelu"] == 1
+    assert _op_types(sim_model)["Relu"] == 0
+
+
+def test_custom_rewriter_in_place_none_return():
+    """A rewriter that mutates in place and returns ``None`` is supported."""
+    model = _model(
+        [onnx.helper.make_node("Relu", ["x"], ["y"], name="r")],
+        [_vi("x", [2, 2])],
+        [_vi("y", [2, 2])],
+        [],
+    )
+
+    def rewrite(m: onnx.ModelProto) -> None:
+        for node in m.graph.node:
+            if node.op_type == "Relu":
+                node.op_type = "Gelu"
+        # no return
+
+    sim_model, _ = onnxsim.simplify(model, check_n=0, custom_rewriter=rewrite)
+    assert _op_types(sim_model)["Gelu"] == 1
+
+
+def test_custom_rewriter_none_is_noop():
+    """Passing no rewriter leaves behaviour identical to a plain simplify."""
+    model = _matmul_add_model()
+    a, _ = onnxsim.simplify(model, check_n=3)
+    b, _ = onnxsim.simplify(model, check_n=3, custom_rewriter=None)
+    assert _op_types(a) == _op_types(b)
+
+
+def test_custom_rewriter_called():
+    """The hook is actually invoked at least once."""
+    model = _matmul_add_model()
+    calls = {"n": 0}
+
+    def rewrite(m: onnx.ModelProto) -> onnx.ModelProto:
+        calls["n"] += 1
+        return m
+
+    onnxsim.simplify(model, check_n=0, custom_rewriter=rewrite)
+    assert calls["n"] >= 1
+
+
+def test_custom_rewriter_with_onnxscript():
+    """Real-world case: register an onnxscript.rewriter rule set as the pass."""
+    rewriter = pytest.importorskip("onnxscript.rewriter")
+    from onnxscript.rewriter import pattern
+
+    def _pat(op, x, w, b):
+        return op.Add(op.MatMul(x, w), b)
+
+    def _rep(op, x, w, b):
+        return op.Gemm(x, w, b)
+
+    rules = pattern.RewriteRuleSet([pattern.RewriteRule(_pat, _rep)])
+
+    model = _matmul_add_model()
+
+    def rewrite(m: onnx.ModelProto) -> onnx.ModelProto:
+        return rewriter.rewrite(m, pattern_rewrite_rules=rules)
+
+    sim_model, check_ok = onnxsim.simplify(
+        model, check_n=3, custom_rewriter=rewrite)
+    counts = _op_types(sim_model)
+    assert counts["Gemm"] == 1, counts
+    assert counts["MatMul"] == 0 and counts["Add"] == 0, counts
+    assert check_ok
