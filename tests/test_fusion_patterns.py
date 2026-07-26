@@ -216,6 +216,76 @@ def test_eliminate_common_subexpression():
 
 
 # --------------------------------------------------------------------------- #
+# Deferred folding of large-tensor ops (ConstantOfShape / Constant -> Expand)
+#
+# With --no-large-tensor these ops are not folded into a (large) initializer,
+# but they are still treated as constant so a downstream node whose output is
+# small keeps folding: the producing op is inlined into the sub-model the
+# operator executor runs, so the large intermediate is computed transiently and
+# never stored. The result is that the whole constant chain collapses to the
+# small final initializer.
+# --------------------------------------------------------------------------- #
+def _simplify_no_large_tensor(model):
+    sim_model, check_ok = onnxsim.simplify(
+        model, check_n=3, tensor_size_threshold="1KB")
+    assert check_ok, "simplified model failed onnxsim's equivalence check"
+    return sim_model, collections.Counter(n.op_type for n in sim_model.graph.node)
+
+
+def test_defer_constantofshape_folds_small_consumer():
+    # ConstantOfShape produces a large (256*256 f32 = 256KB > 1KB) tensor, so it
+    # is not materialized under --no-large-tensor. ReduceSum over it yields a
+    # scalar, which the executor still folds by running ConstantOfShape+ReduceSum
+    # together; the scalar feeds a runtime Add. The large tensor is never stored
+    # and the ConstantOfShape/ReduceSum chain disappears.
+    inits = [_i64([256, 256], "shape")]
+    value = onnx.helper.make_tensor(
+        "value", onnx.TensorProto.FLOAT, [1], [2.0])
+    nodes = [
+        onnx.helper.make_node(
+            "ConstantOfShape", ["shape"], ["big"], value=value),
+        onnx.helper.make_node("ReduceSum", ["big"], ["s"], keepdims=0),
+        onnx.helper.make_node("Add", ["X", "s"], ["Y"]),
+    ]
+    model = _model(nodes, [_vi("X", [4, 8])], [_vi("Y", [4, 8])], inits, opset=11)
+    sim_model, ops = _simplify_no_large_tensor(model)
+    assert ops["ConstantOfShape"] == 0
+    assert ops["ReduceSum"] == 0
+    assert ops["Add"] == 1
+    # No large intermediate tensor was materialized as an initializer.
+    assert all(
+        onnx.numpy_helper.to_array(init).size < 256 * 256
+        for init in sim_model.graph.initializer)
+
+
+def test_defer_constant_expand_folds_small_consumer():
+    # Constant -> Expand blows a scalar up to a large (512*512) tensor. Under
+    # --no-large-tensor the Expand is not materialized, but ReduceSum over it is
+    # a small (scalar) foldable output whose value depends on the data (so it is
+    # not handled by shape propagation). The executor still folds it by running
+    # Expand+ReduceSum together, and the scalar feeds a runtime Add, so the whole
+    # constant chain collapses without ever storing the expanded tensor.
+    inits = [_i64([512, 512], "eshape")]
+    scalar = onnx.helper.make_tensor(
+        "c", onnx.TensorProto.FLOAT, [1, 1], [3.0])
+    nodes = [
+        onnx.helper.make_node("Constant", [], ["small"], value=scalar),
+        onnx.helper.make_node("Expand", ["small", "eshape"], ["big"]),
+        onnx.helper.make_node("ReduceSum", ["big"], ["s"], keepdims=0),
+        onnx.helper.make_node("Add", ["X", "s"], ["Y"]),
+    ]
+    model = _model(nodes, [_vi("X", [4, 8])], [_vi("Y", [4, 8])], inits, opset=11)
+    sim_model, ops = _simplify_no_large_tensor(model)
+    assert ops["Expand"] == 0
+    assert ops["ReduceSum"] == 0
+    assert ops["Constant"] == 0
+    assert ops["Add"] == 1
+    assert all(
+        onnx.numpy_helper.to_array(init).size < 512 * 512
+        for init in sim_model.graph.initializer)
+
+
+# --------------------------------------------------------------------------- #
 # Passes OnnxSlim performs but onnxsim (onnxoptimizer + constant folding) does
 # not. These document the coverage gap: each asserts the *desired* optimization,
 # marked xfail because onnxsim currently leaves the graph unchanged. If a future
