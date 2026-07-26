@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <fstream>
+#include <functional>
 #include <numeric>
 #include <set>
 #include <string>
@@ -254,9 +255,23 @@ void InitEnv() {
 }
 #endif
 
-std::vector<onnx::TensorProto> RunOp(const ModelExecutor& executor,
-                                     onnx::ModelProto& model,
-                                     const onnx::NodeProto& op) {
+// Fold `op` by building a small model that produces just its outputs and
+// running it through `executor`.
+//
+// `deferred_producers` maps the output name of every "deferred" node (a
+// ConstantOfShape or Constant->Expand that is logically constant but was not
+// materialized because it would produce a large tensor, see GetConstantNodes)
+// to the node itself. When an input of `op` is such a deferred output, the
+// producing node is inlined into the sub-model instead of being looked up as an
+// already-materialized initializer. This is applied transitively, so a whole
+// chain (e.g. ConstantOfShape -> Expand -> Reshape) runs together inside the
+// executor: the large intermediate tensors are computed transiently and only
+// `op`'s (smaller) output is returned to be stored as an initializer.
+std::vector<onnx::TensorProto> RunOp(
+    const ModelExecutor& executor, onnx::ModelProto& model,
+    const onnx::NodeProto& op,
+    const std::unordered_map<std::string, const onnx::NodeProto*>&
+        deferred_producers) {
   std::vector<std::string> input_names;
   std::vector<onnx::TensorProto> input_tps;
   std::set<std::string> initializer_names;
@@ -266,29 +281,47 @@ std::vector<onnx::TensorProto> RunOp(const ModelExecutor& executor,
   for (const auto& x : model.opset_import()) {
     *op_model.add_opset_import() = x;
   }
-  *op_model.mutable_graph()->add_node() = op;
 
-  for (const auto& input : op.input()) {
-    if (std::find(input_names.begin(), input_names.end(), input) !=
-        input_names.end()) {
-      continue;
-    }
-    // skip "" which represents the unset optional input
-    if (input.empty()) {
-      continue;
-    }
-    if (initializer_names.find(input) != initializer_names.end()) {
-      continue;
-    }
-    auto in_tp = FindInitializerByName(model, input);
-    if (in_tp.dims().size() == 1 && in_tp.dims()[0] == 0) {
-      initializer_names.insert(input);
-      *op_model.mutable_graph()->add_initializer() = in_tp;
-      continue;
-    }
-    input_names.push_back(input);
-    input_tps.push_back(in_tp);
-  }
+  // Post-order traversal: emit every deferred producer before its consumer so
+  // the sub-model stays topologically sorted (`op` is emitted last). Each node
+  // is included at most once even when several consumers share it.
+  std::set<const onnx::NodeProto*> included;
+  std::function<void(const onnx::NodeProto&)> include_node =
+      [&](const onnx::NodeProto& node) {
+        if (!included.insert(&node).second) {
+          return;
+        }
+        for (const auto& input : node.input()) {
+          // skip "" which represents the unset optional input
+          if (input.empty()) {
+            continue;
+          }
+          auto deferred_iter = deferred_producers.find(input);
+          if (deferred_iter != deferred_producers.end()) {
+            // Produced by a deferred node: inline it rather than treating the
+            // (unmaterialized) output as an external constant input.
+            include_node(*deferred_iter->second);
+            continue;
+          }
+          if (std::find(input_names.begin(), input_names.end(), input) !=
+              input_names.end()) {
+            continue;
+          }
+          if (initializer_names.find(input) != initializer_names.end()) {
+            continue;
+          }
+          auto in_tp = FindInitializerByName(model, input);
+          if (in_tp.dims().size() == 1 && in_tp.dims()[0] == 0) {
+            initializer_names.insert(input);
+            *op_model.mutable_graph()->add_initializer() = in_tp;
+            continue;
+          }
+          input_names.push_back(input);
+          input_tps.push_back(in_tp);
+        }
+        *op_model.mutable_graph()->add_node() = node;
+      };
+  include_node(op);
 
   for (const auto& x : input_names) {
     // skip "" which represents the unset optional input
@@ -313,10 +346,12 @@ std::vector<onnx::TensorProto> RunOp(const ModelExecutor& executor,
   return output_tps;
 }
 
-void RunOpAndAddInitializer(const ModelExecutor& executor,
-                            onnx::ModelProto& model,
-                            const onnx::NodeProto& op) {
-  const auto output_tps = RunOp(executor, model, op);
+void RunOpAndAddInitializer(
+    const ModelExecutor& executor, onnx::ModelProto& model,
+    const onnx::NodeProto& op,
+    const std::unordered_map<std::string, const onnx::NodeProto*>&
+        deferred_producers) {
+  const auto output_tps = RunOp(executor, model, op, deferred_producers);
   for (const auto& output_tp : output_tps) {
     *model.mutable_graph()->add_initializer() = output_tp;
   }
@@ -389,13 +424,29 @@ bool ProduceLargeTensor(const onnx::ModelProto& model,
   return true;
 }
 
-std::pair<std::vector<onnx::NodeProto>, std::vector<onnx::NodeProto>>
-GetConstantNodes(const onnx::ModelProto& model) {
+// The result of partitioning a graph's nodes for constant folding.
+struct ConstantNodePartition {
+  // Nodes whose output is materialized into an initializer by folding.
+  std::vector<onnx::NodeProto> const_nodes;
+  // Nodes kept in the graph (folded consumers reference their outputs via
+  // initializers, or they are genuinely non-constant runtime nodes).
+  std::vector<onnx::NodeProto> non_const_nodes;
+  // Outputs of "deferred" nodes: ConstantOfShape/Expand nodes whose inputs are
+  // all constant but that were not folded into an initializer because they
+  // would produce a large tensor. They stay in the graph (in non_const_nodes),
+  // yet their outputs are treated as constant so downstream constant nodes stay
+  // foldable; RunOp inlines the producing node into the sub-model it executes,
+  // so the large intermediate tensor is computed transiently and never stored.
+  std::set<std::string> deferred_outputs;
+};
+
+ConstantNodePartition GetConstantNodes(const onnx::ModelProto& model) {
   // tensor with empty name("") represents the empty value of an optional input
   // so "" should be treated as a name of a constant tensor.
   std::vector<std::string> const_names{""};
-  std::vector<onnx::NodeProto> const_nodes;
-  std::vector<onnx::NodeProto> non_const_nodes;
+  ConstantNodePartition partition;
+  auto& const_nodes = partition.const_nodes;
+  auto& non_const_nodes = partition.non_const_nodes;
   std::transform(
       model.graph().initializer().begin(), model.graph().initializer().end(),
       std::back_inserter(const_names), [](const auto& x) { return x.name(); });
@@ -415,27 +466,43 @@ GetConstantNodes(const onnx::ModelProto& model) {
   };
   // node is already topo sorted
   for (const auto& node : model.graph().node()) {
-    // clang-format off
-    if (IsOfficialOp(node.domain(), node.op_type()) &&
+    const bool foldable =
+        IsOfficialOp(node.domain(), node.op_type()) &&
         IsDeterministic(node.domain(), node.op_type(),
                         opset_version_of(node.domain())) &&
-        !IsQDQ(node.domain(), node.op_type()) &&
-        !HasSubgraph(node) &&
-        !ProduceLargeTensor(model, node, config.tensor_size_threshold) &&
-        // clang-format on
+        !IsQDQ(node.domain(), node.op_type()) && !HasSubgraph(node) &&
         std::all_of(node.input().begin(), node.input().end(),
                     [&const_names](const auto& x) {
                       return std::find(const_names.begin(), const_names.end(),
                                        x) != const_names.end();
-                    })) {
+                    });
+    if (!foldable) {
+      non_const_nodes.push_back(node);
+      continue;
+    }
+    if (!ProduceLargeTensor(model, node, config.tensor_size_threshold)) {
+      // Ordinary constant folding: the output is materialized as an
+      // initializer and the node is dropped.
       const_names.insert(const_names.end(), node.output().begin(),
                          node.output().end());
       const_nodes.push_back(node);
-    } else {
-      non_const_nodes.push_back(node);
+      continue;
     }
+    // Large-tensor op. ConstantOfShape and the foldable Expand (the
+    // "Constant -> Expand" pattern) are folded lazily: the node is kept in the
+    // graph but its output is still treated as constant so consumers keep
+    // folding, and RunOp inlines it into the executor's sub-model at fold time
+    // rather than materializing the large tensor as an initializer. Other
+    // large-tensor ops (e.g. Tile) remain fully excluded from folding.
+    if (node.op_type() == "ConstantOfShape" || node.op_type() == "Expand") {
+      const_names.insert(const_names.end(), node.output().begin(),
+                         node.output().end());
+      partition.deferred_outputs.insert(node.output().begin(),
+                                        node.output().end());
+    }
+    non_const_nodes.push_back(node);
   }
-  return {const_nodes, non_const_nodes};
+  return partition;
 }
 
 // Recursively collect the names of every tensor consumed as a node input,
@@ -926,13 +993,27 @@ onnx::ModelProto _FoldConstant(const ModelExecutor& executor,
   {
     onnx::ModelProto model;
     model.CopyFrom(tmp);
-    auto [const_nodes, non_const_nodes] = GetConstantNodes(model);
-    (void)non_const_nodes;
+    auto partition = GetConstantNodes(model);
+    const auto& const_nodes = partition.const_nodes;
+    // Map each deferred node's output to the producing node so RunOp can inline
+    // it into the sub-model executed when folding a downstream consumer. The
+    // pointers stay valid for the loop below: folding only appends initializers
+    // to the graph and never touches its node list.
+    std::unordered_map<std::string, const onnx::NodeProto*> deferred_producers;
+    if (!partition.deferred_outputs.empty()) {
+      for (const auto& node : model.graph().node()) {
+        for (const auto& output : node.output()) {
+          if (partition.deferred_outputs.count(output) > 0) {
+            deferred_producers.emplace(output, &node);
+          }
+        }
+      }
+    }
     // Outputs of const nodes that were successfully folded into initializers.
     std::set<std::string> folded_outputs;
     for (const auto& x : const_nodes) {
       try {
-        RunOpAndAddInitializer(executor, model, x);
+        RunOpAndAddInitializer(executor, model, x, deferred_producers);
         for (const auto& output : x.output()) {
           folded_outputs.insert(output);
         }
