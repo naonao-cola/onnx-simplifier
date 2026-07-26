@@ -115,6 +115,58 @@ def test_custom_rewriter_called():
     assert calls["n"] >= 1
 
 
+def test_custom_rewriter_false_signals_no_change():
+    """Returning ``False`` reports "nothing rewritten" and leaves the model as-is.
+
+    A rewriter that changes the model on its first round and then reports no
+    further change with ``False`` must still keep that change: the ``False``
+    sentinel only skips copying an *unchanged* model back, it never discards a
+    rewrite. It also must not loop forever -- ``False`` lets the fixed point
+    converge.
+    """
+    model = _model(
+        [onnx.helper.make_node("Relu", ["x"], ["y"], name="r")],
+        [_vi("x", [2, 2])],
+        [_vi("y", [2, 2])],
+        [],
+    )
+    calls = {"n": 0}
+
+    def rewrite(m: onnx.ModelProto):
+        calls["n"] += 1
+        relus = [n for n in m.graph.node if n.op_type == "Relu"]
+        if not relus:
+            # Already rewritten: report no change so onnxsim skips the copy.
+            return False
+        for node in relus:
+            node.op_type = "Sigmoid"
+        return m
+
+    sim_model, _ = onnxsim.simplify(model, check_n=0, custom_rewriter=rewrite)
+    counts = _op_types(sim_model)
+    # The rewrite is kept: returning ``False`` on a later round never discards
+    # the earlier Relu -> Sigmoid change.
+    assert counts["Sigmoid"] == 1 and counts["Relu"] == 0, counts
+    # The rewriter ran. (Once the optimizer settles on the rewritten model the
+    # fixed point can converge without another rewrite call, so the exact count
+    # is not asserted -- the no-change ``False`` path itself is covered by
+    # test_custom_rewriter_false_from_the_start_is_noop and
+    # test_custom_rewriter_onnxscript_count_skips_copy.)
+    assert calls["n"] >= 1
+
+
+def test_custom_rewriter_false_from_the_start_is_noop():
+    """A rewriter that only ever returns ``False`` never changes the model."""
+    model = _matmul_add_model()
+    baseline, _ = onnxsim.simplify(model, check_n=0)
+
+    def rewrite(m: onnx.ModelProto) -> bool:
+        return False
+
+    sim_model, _ = onnxsim.simplify(model, check_n=0, custom_rewriter=rewrite)
+    assert _op_types(sim_model) == _op_types(baseline)
+
+
 def test_custom_rewriter_with_onnxscript():
     """Real-world case: register an onnxscript.rewriter rule set as the pass."""
     rewriter = pytest.importorskip("onnxscript.rewriter")
@@ -139,3 +191,46 @@ def test_custom_rewriter_with_onnxscript():
     assert counts["Gemm"] == 1, counts
     assert counts["MatMul"] == 0 and counts["Add"] == 0, counts
     assert check_ok
+
+
+def test_custom_rewriter_onnxscript_passresult_skips_copy():
+    """The documented onnxscript pattern: run the rules through onnx-ir's
+    ``PassManager`` and return ``False`` when the resulting ``PassResult`` reports
+    the model was not modified, so onnxsim skips the copy -- while still applying
+    the fusion when a rule fires."""
+    pytest.importorskip("onnxscript.rewriter")
+    from onnxscript import ir
+    from onnxscript.rewriter import RewritePass, pattern
+
+    def _pat(op, x, w, b):
+        return op.Add(op.MatMul(x, w), b)
+
+    def _rep(op, x, w, b):
+        return op.Gemm(x, w, b)
+
+    rules = pattern.RewriteRuleSet([pattern.RewriteRule(_pat, _rep)])
+    rewrite_pass = ir.passes.PassManager([RewritePass(rules)])
+
+    model = _matmul_add_model()
+    modified_seen = []
+
+    def rewrite(m: onnx.ModelProto):
+        model_ir = ir.serde.deserialize_model(m)
+        result = rewrite_pass(model_ir)
+        modified_seen.append(result.modified)
+        if not result.modified:
+            return False  # no rule fired: skip the copy
+        return ir.serde.serialize_model(result.model)
+
+    sim_model, check_ok = onnxsim.simplify(
+        model, check_n=3, custom_rewriter=rewrite)
+    counts = _op_types(sim_model)
+    assert counts["Gemm"] == 1, counts
+    assert counts["MatMul"] == 0 and counts["Add"] == 0, counts
+    assert check_ok
+    # The rewriter ran, and the final round reported the model was not modified
+    # and returned ``False`` -- exercising the no-copy path that converges the
+    # fixed point. (The fusion itself may come from this rule or from the
+    # built-in optimizer, whichever fires first; either way the last round
+    # rewrites nothing.)
+    assert modified_seen and not modified_seen[-1]

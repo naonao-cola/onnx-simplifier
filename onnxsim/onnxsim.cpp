@@ -1393,7 +1393,11 @@ onnx::ModelProto Simplify(
     ModelFn OptAndShapeAndFold =
         FixedPointFn(OptAndShape, FoldConstant, fixed_point_iters);
     ModelFn RewriteInPlace = [rewriter](onnx::ModelProto& model) {
-      model = rewriter->_Run(model);
+      // ``_Run`` rewrites in place and returns whether it changed anything; when
+      // it reports no change it leaves ``model`` untouched, so no copy is made.
+      // The fixed point's fingerprint comparison then sees the unchanged model
+      // and converges without an extra ModelProto round-trip.
+      rewriter->_Run(model);
     };
     Pipeline =
         FixedPointFn(OptAndShapeAndFold, RewriteInPlace, fixed_point_iters,
