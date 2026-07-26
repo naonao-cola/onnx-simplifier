@@ -16,7 +16,8 @@
 #include "onnxsim.h"
 
 #ifdef NO_BUILTIN_ORT
-#error "The onnxsim C API requires the built-in ONNX Runtime (ONNXSIM_BUILTIN_ORT=ON)."
+#error \
+    "The onnxsim C API requires the built-in ONNX Runtime (ONNXSIM_BUILTIN_ORT=ON)."
 #endif
 
 namespace {
@@ -50,7 +51,8 @@ std::optional<std::vector<std::string>> BuildSkipOptimizers(
   std::vector<std::string> passes;
   passes.reserve(num_skip_optimizers);
   for (size_t i = 0; i < num_skip_optimizers; ++i) {
-    const char* name = skip_optimizers != nullptr ? skip_optimizers[i] : nullptr;
+    const char* name =
+        skip_optimizers != nullptr ? skip_optimizers[i] : nullptr;
     passes.emplace_back(name != nullptr ? name : "");
   }
   return passes;
@@ -71,8 +73,9 @@ extern "C" {
 OnnxsimStatus onnxsim_simplify(const void* model_data, size_t model_size,
                                const char* const* skip_optimizers,
                                size_t num_skip_optimizers,
-                               int skip_optimizers_is_null, int constant_folding,
-                               int shape_inference, size_t tensor_size_threshold,
+                               int skip_optimizers_is_null,
+                               int constant_folding, int shape_inference,
+                               size_t tensor_size_threshold,
                                int target_opset_version, void** out_data,
                                size_t* out_size, char** out_error) {
   if (out_data != nullptr) {
@@ -109,8 +112,9 @@ OnnxsimStatus onnxsim_simplify(const void* model_data, size_t model_size,
       SetError(out_error, "failed to serialize the simplified ModelProto");
       return ONNXSIM_ERROR;
     }
-    // malloc(0) may return nullptr; hand back a distinct non-null pointer so the
-    // caller can always free it and can rely on out_data != NULL on success.
+    // malloc(0) may return nullptr; hand back a distinct non-null pointer so
+    // the caller can always free it and can rely on out_data != NULL on
+    // success.
     void* buffer = std::malloc(out.size() != 0 ? out.size() : 1);
     if (buffer == nullptr) {
       SetError(out_error, "out of memory while copying the simplified model");
@@ -129,14 +133,11 @@ OnnxsimStatus onnxsim_simplify(const void* model_data, size_t model_size,
   }
 }
 
-OnnxsimStatus onnxsim_simplify_path(const char* in_path, const char* out_path,
-                                    const char* const* skip_optimizers,
-                                    size_t num_skip_optimizers,
-                                    int skip_optimizers_is_null,
-                                    int constant_folding, int shape_inference,
-                                    size_t tensor_size_threshold,
-                                    int target_opset_version,
-                                    char** out_error) {
+OnnxsimStatus onnxsim_simplify_path(
+    const char* in_path, const char* out_path,
+    const char* const* skip_optimizers, size_t num_skip_optimizers,
+    int skip_optimizers_is_null, int constant_folding, int shape_inference,
+    size_t tensor_size_threshold, int target_opset_version, char** out_error) {
   if (out_error != nullptr) {
     *out_error = nullptr;
   }
@@ -148,7 +149,7 @@ OnnxsimStatus onnxsim_simplify_path(const char* in_path, const char* out_path,
     InitEnv();
     SimplifyPath(*GetBuiltinModelExecutor(), in_path, out_path,
                  BuildSkipOptimizers(skip_optimizers, num_skip_optimizers,
-                                    skip_optimizers_is_null),
+                                     skip_optimizers_is_null),
                  constant_folding != 0, shape_inference != 0,
                  tensor_size_threshold,
                  BuildTargetOpsetVersion(target_opset_version));

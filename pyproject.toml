@@ -42,3 +42,20 @@ Homepage = "https://github.com/onnxsim/onnxsim"
 
 [project.scripts]
 onnxsim = "onnxsim:main"
+
+[tool.ruff]
+# The vendored single-header option parser is not our code to reformat.
+extend-exclude = ["onnxsim/cxxopts.hpp"]
+
+[tool.ruff.lint]
+# pycodestyle errors (E), Pyflakes (F), and isort (I). Import sorting is applied
+# by `ruff check --fix`; `ruff format` handles the rest of the layout.
+select = ["E4", "E7", "E9", "F", "I"]
+
+[tool.mypy]
+# Type-check the Python package (not the tests, which lean on dynamic fixtures).
+files = ["onnxsim"]
+python_version = "3.10"
+# onnx/numpy/onnxruntime/torch expose partial or no type information, and the
+# compiled `onnxsim_cpp2py_export` extension has no stubs; don't fail on them.
+ignore_missing_imports = true

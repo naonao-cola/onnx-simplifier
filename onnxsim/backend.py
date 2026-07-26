@@ -63,9 +63,7 @@ def _run_with_reference(
     custom_lib: Optional[str],
 ) -> "OrderedDict[str, np.ndarray]":
     if custom_lib is not None:
-        raise ValueError(
-            "custom_lib is only supported when onnxruntime is installed"
-        )
+        raise ValueError("custom_lib is only supported when onnxruntime is installed")
     from onnx.reference import ReferenceEvaluator
 
     if isinstance(model, str):

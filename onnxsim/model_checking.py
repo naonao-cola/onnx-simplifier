@@ -1,9 +1,9 @@
-from typing import Iterable, List, Dict, Optional, Set, Union
+from typing import Dict, Iterable, List, Optional, Set, Union
 
+import numpy as np
 import onnx
 import onnx.checker
 import onnx.defs
-import numpy as np
 
 from . import backend
 
@@ -93,13 +93,13 @@ def compare(
             return get_shape_from_value_info_proto(v)
         raise RuntimeError('Cannot get shape of "{}"'.format(name))
 
-    def get_elem_type(m: onnx.ModelProto, name: str) -> Optional[int]:
+    def get_elem_type(m: onnx.ModelProto, name: str) -> int:
         v = get_value_info_all(m, name)
         if v is not None:
             return v.type.tensor_type.elem_type
-        return None
+        raise RuntimeError('Cannot get element type of "{}"'.format(name))
 
-    def get_np_type_from_elem_type(elem_type: int) -> int:
+    def get_np_type_from_elem_type(elem_type: int) -> type:
         sizes = (
             None,
             np.float32,
@@ -132,8 +132,7 @@ def compare(
         return input_names
 
     def generate_rand_input(
-        model: Union[str, onnx.ModelProto],
-        input_shapes: Optional[TensorShapes] = None
+        model: Union[str, onnx.ModelProto], input_shapes: Optional[TensorShapes] = None
     ):
         if input_shapes is None:
             input_shapes = {}
@@ -147,10 +146,14 @@ def compare(
             if any([dim <= 0 for dim in shape[1:]]):
                 raise RuntimeError(
                     'The shape of input "{}" has dynamic size, '
-                    "please set an input shape manually with --test-input-shape".format(name)
+                    "please set an input shape manually with --test-input-shape".format(
+                        name
+                    )
                 )
             if len(shape) > 0 and shape[0] <= 0:
-                print(f'shape[0] of input "{name}" is dynamic, we assume it presents batch size and set it as 1 when testing. If it is not wanted, please set the it manually by --test-input-shape (see `onnxsim -h` for the details).')
+                print(
+                    f'shape[0] of input "{name}" is dynamic, we assume it presents batch size and set it as 1 when testing. If it is not wanted, please set the it manually by --test-input-shape (see `onnxsim -h` for the details).'
+                )
                 shape[0] = 1
 
         inputs = {
@@ -163,9 +166,9 @@ def compare(
         return inputs
 
     def forward(
-            model: Union[str, onnx.ModelProto],
-            inputs: Tensors,
-            custom_lib: Optional[str] = None
+        model: Union[str, onnx.ModelProto],
+        inputs: Tensors,
+        custom_lib: Optional[str] = None,
     ) -> Dict[str, np.ndarray]:
         return backend.run_model(model, inputs, custom_lib=custom_lib)
 
@@ -190,7 +193,7 @@ def compare(
         else:
             raise
     for i in range(n_times):
-        print(f'Checking {i}/{n_times}...')
+        print(f"Checking {i}/{n_times}...")
         if input_data is None:
             inputs = generate_rand_input(model_opt, input_shapes=input_shapes)
         else:

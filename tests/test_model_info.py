@@ -5,10 +5,11 @@ counts are asserted against hand-computed values. The symbolic (sympy) path is
 exercised when sympy is installed and skipped otherwise, mirroring the optional
 ``onnxsim[symbolic]`` extra.
 """
+
 import numpy as np
 import onnx
-from onnx import TensorProto, helper
 import pytest
+from onnx import TensorProto, helper
 
 from onnxsim import model_info
 from onnxsim.model_info import (
@@ -49,7 +50,9 @@ def test_conv_macs():
     x = _vi("x", [1, 3, 8, 8])
     w = _weight("w", [4, 3, 3, 3])
     y = _vi("y", [1, 4, 8, 8])
-    node = helper.make_node("Conv", ["x", "w"], ["y"], kernel_shape=[3, 3], pads=[1, 1, 1, 1])
+    node = helper.make_node(
+        "Conv", ["x", "w"], ["y"], kernel_shape=[3, 3], pads=[1, 1, 1, 1]
+    )
     assert _macs([node], [x], [y], [w]) == 1 * 4 * 8 * 8 * 3 * (3 * 3)
 
 
@@ -166,9 +169,12 @@ def test_qlinearconv_weight_at_input3():
     w = _vi("w", [4, 3, 3, 3], TensorProto.UINT8)
     y = _vi("y", [1, 4, 8, 8], TensorProto.UINT8)
     scalars = [
-        _vi("x_s", []), _vi("x_z", [], TensorProto.UINT8),
-        _vi("w_s", [4]), _vi("w_z", [4], TensorProto.UINT8),
-        _vi("y_s", []), _vi("y_z", [], TensorProto.UINT8),
+        _vi("x_s", []),
+        _vi("x_z", [], TensorProto.UINT8),
+        _vi("w_s", [4]),
+        _vi("w_z", [4], TensorProto.UINT8),
+        _vi("y_s", []),
+        _vi("y_z", [], TensorProto.UINT8),
     ]
     node = helper.make_node(
         "QLinearConv",
@@ -190,7 +196,9 @@ def test_unnamed_dynamic_dim_counts_per_sample():
     x = _vi("x", [None, 3, 8, 8])
     w = _weight("w", [4, 3, 3, 3])
     y = _vi("y", [None, 4, 8, 8])
-    node = helper.make_node("Conv", ["x", "w"], ["y"], kernel_shape=[3, 3], pads=[1, 1, 1, 1])
+    node = helper.make_node(
+        "Conv", ["x", "w"], ["y"], kernel_shape=[3, 3], pads=[1, 1, 1, 1]
+    )
     macs = _macs([node], [x], [y], [w])
     assert model_info._representative_number(macs) == 1 * 4 * 8 * 8 * 3 * 9
 
@@ -218,7 +226,9 @@ def test_dynamic_dim_symbolic():
     x = _vi("x", ["batch", 3, 8, 8])
     w = _weight("w", [4, 3, 3, 3])
     y = _vi("y", ["batch", 4, 8, 8])
-    node = helper.make_node("Conv", ["x", "w"], ["y"], kernel_shape=[3, 3], pads=[1, 1, 1, 1])
+    node = helper.make_node(
+        "Conv", ["x", "w"], ["y"], kernel_shape=[3, 3], pads=[1, 1, 1, 1]
+    )
     macs = ModelInfo(_model([node], [x], [y], [w])).macs
     batch = sympy.Symbol("batch", positive=True, integer=True)
     assert sympy.simplify(macs - 1 * 4 * 8 * 8 * 3 * 9 * batch) == 0
@@ -236,7 +246,7 @@ def test_symbolic_dims_unify_across_tensors():
     node = helper.make_node("Attention", ["q", "k", "v"], ["y"])
     macs = ModelInfo(_model([node], [q, k, v], [y])).macs
     seq = sympy.Symbol("seq", positive=True, integer=True)
-    assert sympy.simplify(macs - 2 * b * hq * d * seq ** 2) == 0
+    assert sympy.simplify(macs - 2 * b * hq * d * seq**2) == 0
 
 
 def test_symbolic_human_readable_num():
@@ -250,7 +260,9 @@ def test_print_simplifying_info_symbolic_does_not_raise():
     x = _vi("x", ["batch", 3, 8, 8])
     w = _weight("w", [4, 3, 3, 3])
     y = _vi("y", ["batch", 4, 8, 8])
-    node = helper.make_node("Conv", ["x", "w"], ["y"], kernel_shape=[3, 3], pads=[1, 1, 1, 1])
+    node = helper.make_node(
+        "Conv", ["x", "w"], ["y"], kernel_shape=[3, 3], pads=[1, 1, 1, 1]
+    )
     model = _model([node], [x], [y], [w])
     model_info.print_simplifying_info(model, model)  # must not raise on symbolic "<"
 
@@ -261,7 +273,9 @@ def test_dynamic_dim_without_sympy_assumes_one(monkeypatch):
     x = _vi("x", ["batch", 3, 8, 8])
     w = _weight("w", [4, 3, 3, 3])
     y = _vi("y", ["batch", 4, 8, 8])
-    node = helper.make_node("Conv", ["x", "w"], ["y"], kernel_shape=[3, 3], pads=[1, 1, 1, 1])
+    node = helper.make_node(
+        "Conv", ["x", "w"], ["y"], kernel_shape=[3, 3], pads=[1, 1, 1, 1]
+    )
     assert ModelInfo(_model([node], [x], [y], [w])).macs == 1 * 4 * 8 * 8 * 3 * 9
 
 
@@ -329,10 +343,8 @@ def test_memory_access_respects_dtype_size():
 
 def test_memory_access_unknown_shape_contributes_zero():
     # An intermediate with no inferred shape simply drops out of the total; the
-    # known operands are still counted.
-    a = _vi("a", [5, 7])
-    b = _vi("b", [7, 3])
-    y = _vi("y", [5, 3])
+    # known operands are still counted. No shapes are supplied (empty maps), so
+    # the node's traffic is entirely unknown and totals zero.
     node = helper.make_node("Gemm", ["a", "b"], ["y"])
     assert model_info._node_memory_access(node, {}, {}) == 0
 
@@ -370,10 +382,11 @@ def test_memory_footprint_reuses_freed_activations():
     # the sum of every tensor.
     x = _vi("x", [1, 3, 8, 8])
     w = _weight("w", [4, 3, 3, 3])
-    h = _vi("h", [1, 4, 8, 8])
     y = _vi("y", [1, 4, 8, 8])
     nodes = [
-        helper.make_node("Conv", ["x", "w"], ["h"], kernel_shape=[3, 3], pads=[1, 1, 1, 1]),
+        helper.make_node(
+            "Conv", ["x", "w"], ["h"], kernel_shape=[3, 3], pads=[1, 1, 1, 1]
+        ),
         helper.make_node("Relu", ["h"], ["y"]),
     ]
     info = _info(nodes, [x], [y], [w])
@@ -396,7 +409,9 @@ def test_memory_metrics_symbolic_dynamic_batch():
     y = _vi("y", ["batch", 3])
     info = _info([helper.make_node("MatMul", ["a", "b"], ["y"])], [a], [y], [b])
     batch = sympy.Symbol("batch", positive=True, integer=True)
-    expected = (7 * batch + 3 * batch) * 4 + (7 * 3) * 4  # a + y scale with batch; b fixed
+    expected = (7 * batch + 3 * batch) * 4 + (
+        7 * 3
+    ) * 4  # a + y scale with batch; b fixed
     assert sympy.simplify(info.mem_access - expected) == 0
 
 
@@ -423,7 +438,9 @@ def _gemm_model():
     a = _vi("a", [5, 7])
     b = _vi("b", [7, 3])
     y = _vi("y", [5, 3])
-    return _model([helper.make_node("Gemm", ["a", "b"], ["y"], name="gemm0")], [a, b], [y])
+    return _model(
+        [helper.make_node("Gemm", ["a", "b"], ["y"], name="gemm0")], [a, b], [y]
+    )
 
 
 def test_annotate_metadata_model_level():
@@ -452,7 +469,9 @@ def test_annotate_metadata_node_level():
 
 def test_annotate_metadata_value_level():
     out = annotate_metadata(_gemm_model())
-    by_name = {vi.name: _meta(vi) for vi in list(out.graph.input) + list(out.graph.output)}
+    by_name = {
+        vi.name: _meta(vi) for vi in list(out.graph.input) + list(out.graph.output)
+    }
     p = METADATA_PREFIX
     assert by_name["a"][p + "bytes"] == str(5 * 7 * 4)
     assert by_name["b"][p + "bytes"] == str(7 * 3 * 4)
@@ -492,7 +511,9 @@ def test_annotate_metadata_symbolic_stores_formula():
     a = _vi("a", ["batch", 7])
     b = _weight("b", [7, 3])
     y = _vi("y", ["batch", 3])
-    model = _model([helper.make_node("MatMul", ["a", "b"], ["y"], name="mm")], [a], [y], [b])
+    model = _model(
+        [helper.make_node("MatMul", ["a", "b"], ["y"], name="mm")], [a], [y], [b]
+    )
     out = annotate_metadata(model)
     assert _meta(out.graph.node[0])[METADATA_PREFIX + "macs"] == "21*batch"
     a_vi = next(vi for vi in out.graph.input if vi.name == "a")
@@ -508,7 +529,9 @@ def test_annotate_metadata_recurses_subgraphs():
     def branch(name):
         a = _weight("a_" + name, [5, 7])
         b = _weight("b_" + name, [7, 3])
-        node = helper.make_node("Gemm", ["a_" + name, "b_" + name], ["y"], name="gemm_" + name)
+        node = helper.make_node(
+            "Gemm", ["a_" + name, "b_" + name], ["y"], name="gemm_" + name
+        )
         return helper.make_graph([node], name, [], [_vi("y", [5, 3])], [a, b])
 
     if_node = helper.make_node(
@@ -557,7 +580,10 @@ def test_warns_when_counter_raises(monkeypatch):
 def _linear_function():
     # A local function "MyLinear(x, w) -> MatMul(x, w)".
     return helper.make_function(
-        "custom", "MyLinear", ["x", "w"], ["y"],
+        "custom",
+        "MyLinear",
+        ["x", "w"],
+        ["y"],
         [helper.make_node("MatMul", ["x", "w"], ["y"])],
         [helper.make_opsetid("", 18)],
     )
@@ -583,7 +609,7 @@ def test_function_body_counted_and_op_kept():
         helper.make_node("MyLinear", ["H", "W2"], ["Y"], domain="custom"),
     ]
     info = ModelInfo(_function_model(nodes, [x], [y], inits, [_linear_function()]))
-    assert info.op_nums["MyLinear"] == 2          # op count keeps the function op
+    assert info.op_nums["MyLinear"] == 2  # op count keeps the function op
     assert info.macs == 4 * 16 * 8 + 4 * 32 * 16  # MACs come from the bodies
 
 
@@ -591,7 +617,10 @@ def test_nested_function_body_counted():
     # Block(x, w) -> MyLinear(x, w) -> Relu; nested functions are inlined too.
     inner = _linear_function()
     outer = helper.make_function(
-        "custom", "Block", ["x", "w"], ["y"],
+        "custom",
+        "Block",
+        ["x", "w"],
+        ["y"],
         [
             helper.make_node("MyLinear", ["x", "w"], ["t"], domain="custom"),
             helper.make_node("Relu", ["t"], ["y"]),
@@ -601,7 +630,9 @@ def test_nested_function_body_counted():
     x = _vi("X", [4, 8])
     y = _vi("Y", [4, 16])
     nodes = [helper.make_node("Block", ["X", "W1"], ["Y"], domain="custom")]
-    info = ModelInfo(_function_model(nodes, [x], [y], [_weight("W1", [8, 16])], [inner, outer]))
+    info = ModelInfo(
+        _function_model(nodes, [x], [y], [_weight("W1", [8, 16])], [inner, outer])
+    )
     assert info.op_nums["Block"] == 1
     assert info.macs == 4 * 16 * 8
 
@@ -616,7 +647,9 @@ def test_warns_when_inlining_fails(monkeypatch):
     x = _vi("X", [4, 8])
     y = _vi("Y", [4, 16])
     nodes = [helper.make_node("MyLinear", ["X", "W1"], ["Y"], domain="custom")]
-    model = _function_model(nodes, [x], [y], [_weight("W1", [8, 16])], [_linear_function()])
+    model = _function_model(
+        nodes, [x], [y], [_weight("W1", [8, 16])], [_linear_function()]
+    )
     with pytest.warns(UserWarning, match="Failed to expand function bodies"):
         info = ModelInfo(model)
     assert info.macs == 0  # body compute uncounted, but no crash
@@ -637,8 +670,8 @@ def test_schema_function_fallback_counts_attention(monkeypatch):
         opset_imports=[helper.make_opsetid("", 24)],
     )
     info = ModelInfo(model)
-    assert info.op_nums["Attention"] == 1          # op count still shows the op
-    assert info.macs == b * h * sq * sq * d * 2     # exact, via the expanded body
+    assert info.op_nums["Attention"] == 1  # op count still shows the op
+    assert info.macs == b * h * sq * sq * d * 2  # exact, via the expanded body
 
 
 def test_schema_function_fallback_layernorm_is_zero():
@@ -647,7 +680,9 @@ def test_schema_function_fallback_layernorm_is_zero():
     node = helper.make_node("LayerNormalization", ["X", "scale", "bias"], ["Y"])
     model = helper.make_model(
         helper.make_graph(
-            [node], "g", [x],
+            [node],
+            "g",
+            [x],
             [_vi("Y", [4, 16])],
             [_weight("scale", [16]), _weight("bias", [16])],
         ),

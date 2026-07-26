@@ -3,6 +3,7 @@
 These only do something on a free-threaded CPython build (the ``cp*t`` wheels,
 e.g. cp314t). On a regular GIL build they are skipped.
 """
+
 import subprocess
 import sys
 import sysconfig

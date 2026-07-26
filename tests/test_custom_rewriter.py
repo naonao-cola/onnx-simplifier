@@ -6,18 +6,21 @@ shape inference and constant folding. These tests exercise the hook with a
 plain-Python rewriter (no extra dependency) and, when available, with an
 ``onnxscript.rewriter`` rule set -- the intended real-world use case.
 """
+
 import collections
 
 import numpy as np
 import onnx
-import onnxsim
 import pytest
+
+import onnxsim
 
 
 def _model(nodes, inputs, outputs, initializer, opset=13):
     graph = onnx.helper.make_graph(nodes, "g", inputs, outputs, initializer)
     return onnx.helper.make_model(
-        graph, opset_imports=[onnx.helper.make_opsetid("", opset)], ir_version=10)
+        graph, opset_imports=[onnx.helper.make_opsetid("", opset)], ir_version=10
+    )
 
 
 def _vi(name, shape):
@@ -185,8 +188,7 @@ def test_custom_rewriter_with_onnxscript():
     def rewrite(m: onnx.ModelProto) -> onnx.ModelProto:
         return rewriter.rewrite(m, pattern_rewrite_rules=rules)
 
-    sim_model, check_ok = onnxsim.simplify(
-        model, check_n=3, custom_rewriter=rewrite)
+    sim_model, check_ok = onnxsim.simplify(model, check_n=3, custom_rewriter=rewrite)
     counts = _op_types(sim_model)
     assert counts["Gemm"] == 1, counts
     assert counts["MatMul"] == 0 and counts["Add"] == 0, counts
@@ -222,8 +224,7 @@ def test_custom_rewriter_onnxscript_passresult_skips_copy():
             return False  # no rule fired: skip the copy
         return ir.serde.serialize_model(result.model)
 
-    sim_model, check_ok = onnxsim.simplify(
-        model, check_n=3, custom_rewriter=rewrite)
+    sim_model, check_ok = onnxsim.simplify(model, check_n=3, custom_rewriter=rewrite)
     counts = _op_types(sim_model)
     assert counts["Gemm"] == 1, counts
     assert counts["MatMul"] == 0 and counts["Add"] == 0, counts

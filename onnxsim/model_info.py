@@ -1,14 +1,24 @@
 import copy
 import warnings
 from collections import defaultdict
-from typing import Callable, Any, Iterable, List, Optional, Tuple, Dict, Union
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    Iterable,
+    List,
+    Optional,
+    Tuple,
+    TypeGuard,
+    Union,
+)
 
 import onnx
 from onnx import defs, helper, shape_inference
 from onnx.external_data_helper import ExternalDataInfo, uses_external_data
+from rich import print
 from rich.table import Table
 from rich.text import Text
-from rich import print
 
 try:
     import sympy
@@ -21,7 +31,12 @@ except ImportError:  # onnx.inliner was added in onnx 1.14; see ModelInfo.__init
     onnx_inliner = None
 
 
-__all__ = ['ModelInfo', 'print_simplifying_info', 'annotate_metadata', 'METADATA_PREFIX']
+__all__ = [
+    "ModelInfo",
+    "print_simplifying_info",
+    "annotate_metadata",
+    "METADATA_PREFIX",
+]
 
 # metadata_props keys written by ``annotate_metadata`` are namespaced with this
 # prefix (e.g. "onnxsim.macs") so they never collide with other producers.
@@ -113,10 +128,10 @@ def _dim_symbol(name: str) -> "sympy.Expr":
     return sympy.Symbol(name, positive=True, integer=True)
 
 
-def _prod(vals: List[Dim]) -> Macs:
-    result = 1
+def _prod(vals: Iterable[Macs]) -> Macs:
+    result: Macs = 1
     for v in vals:
-        result *= v
+        result = result * v
     return result
 
 
@@ -141,7 +156,9 @@ def _tensor_shape(type_proto: onnx.TypeProto) -> Optional[List[Dim]]:
 
 
 def _is_symbolic(value: Macs) -> bool:
-    return sympy is not None and isinstance(value, sympy.Expr) and bool(value.free_symbols)
+    return (
+        sympy is not None and isinstance(value, sympy.Expr) and bool(value.free_symbols)
+    )
 
 
 def _representative_number(value: Macs) -> int:
@@ -209,7 +226,9 @@ def _tensor_bytes(name: str, shapes: ShapeMap, dtypes: DTypeMap) -> Optional[Mac
     return _prod(shape) * esize
 
 
-def _node_memory_access(node: onnx.NodeProto, shapes: ShapeMap, dtypes: DTypeMap) -> Macs:
+def _node_memory_access(
+    node: onnx.NodeProto, shapes: ShapeMap, dtypes: DTypeMap
+) -> Macs:
     """Bytes a node moves in a forward pass: every input read plus every output
     written. Weights read from memory count as reads. Tensors with unknown size
     contribute 0 (best-effort, matching the MAC counters).
@@ -231,8 +250,8 @@ def _attr_int(node: onnx.NodeProto, name: str, default: int) -> int:
     return default
 
 
-def _known(shape: Optional[List[Optional[int]]]) -> bool:
-    return bool(shape) and all(d is not None for d in shape)
+def _known(shape: Optional[List[Dim]]) -> TypeGuard[List[Macs]]:
+    return shape is not None and len(shape) > 0 and all(d is not None for d in shape)
 
 
 # --- Per-op MAC (multiply-accumulate) counters --------------------------------
@@ -248,6 +267,7 @@ def _register(*op_types: str) -> Callable[[Callable], Callable]:
         for op_type in op_types:
             _MAC_COUNTERS[op_type] = fn
         return fn
+
     return deco
 
 
@@ -352,7 +372,7 @@ def _attention_macs(node: onnx.NodeProto, shapes: ShapeMap) -> Macs:
             return 0  # head split is unknowable without the attributes
         batch, sq, _ = q
         skv = k[1]
-        d = k[2] // kv_heads   # per-head size (K packs kv_heads * head_size)
+        d = k[2] // kv_heads  # per-head size (K packs kv_heads * head_size)
         dv = v[2] // kv_heads
     else:
         return 0
@@ -369,7 +389,8 @@ def _type_map(graph: onnx.GraphProto) -> Dict[str, onnx.TypeProto]:
             types[value_info.name] = value_info.type
     for initializer in graph.initializer:
         types[initializer.name] = helper.make_tensor_type_proto(
-            initializer.data_type, list(initializer.dims))
+            initializer.data_type, list(initializer.dims)
+        )
     return types
 
 
@@ -393,12 +414,15 @@ def _schema_function_body(
     if any(name and types.get(name) is None for name in node.input):
         return None
     input_types = [
-        types[name].SerializeToString() if name else onnx.TypeProto().SerializeToString()
+        types[name].SerializeToString()
+        if name
+        else onnx.TypeProto().SerializeToString()
         for name in node.input
     ]
     try:
         body_bytes = schema.get_context_dependent_function(
-            node.SerializeToString(), input_types)
+            node.SerializeToString(), input_types
+        )
     except Exception:
         return None
     body = onnx.FunctionProto()
@@ -478,7 +502,7 @@ class ModelInfo:
             inherited_dtypes = {}
         shapes = _collect_shapes(graph, inherited_shapes)
         dtypes = _collect_dtypes(graph, inherited_dtypes)
-        op_nums = defaultdict(int)
+        op_nums: Dict[str, int] = defaultdict(int)
         macs = 0
         mem_access = 0
         for node in graph.node:
@@ -500,8 +524,16 @@ class ModelInfo:
                     sub_graphs.append(attr.g)
                 sub_graphs.extend(attr.graphs)
                 for sub_graph in sub_graphs:
-                    sub_op_nums, sub_macs, sub_mem = self.get_info(sub_graph, shapes, dtypes)
-                    op_nums = defaultdict(int, {k: op_nums[k] + sub_op_nums[k] for k in set(op_nums) | set(sub_op_nums)})
+                    sub_op_nums, sub_macs, sub_mem = self.get_info(
+                        sub_graph, shapes, dtypes
+                    )
+                    op_nums = defaultdict(
+                        int,
+                        {
+                            k: op_nums[k] + sub_op_nums[k]
+                            for k in set(op_nums) | set(sub_op_nums)
+                        },
+                    )
                     macs += sub_macs
                     mem_access += sub_mem
         op_nums["Constant"] += len(graph.initializer)
@@ -563,7 +595,9 @@ class ModelInfo:
             return None
 
     @staticmethod
-    def _infer_shapes(model: onnx.ModelProto, data_prop: bool = False) -> onnx.ModelProto:
+    def _infer_shapes(
+        model: onnx.ModelProto, data_prop: bool = False
+    ) -> onnx.ModelProto:
         try:
             return shape_inference.infer_shapes(model, data_prop=data_prop)
         except Exception as e:
@@ -660,7 +694,9 @@ class ModelInfo:
         return self.flops / self.mem_access
 
 
-def print_simplifying_info(model_ori: onnx.ModelProto, model_opt: onnx.ModelProto) -> None:
+def print_simplifying_info(
+    model_ori: onnx.ModelProto, model_opt: onnx.ModelProto
+) -> None:
     """
     --------------------------------------------------------
     |             | original model | simplified model |
@@ -673,24 +709,47 @@ def print_simplifying_info(model_ori: onnx.ModelProto, model_opt: onnx.ModelProt
     ori_info = ModelInfo(model_ori)
     opt_info = ModelInfo(model_opt)
     table = Table()
-    table.add_column('')
-    table.add_column('Original Model')
-    table.add_column('Simplified Model')
+    table.add_column("")
+    table.add_column("Original Model")
+    table.add_column("Simplified Model")
 
-    def add_row(table: Table, key, ori_data, opt_data, is_better: Callable[[Any, Any], Any], postprocess: Optional[Callable[[Any], Any]] = None) -> None:
+    def add_row(
+        table: Table,
+        key,
+        ori_data,
+        opt_data,
+        is_better: Callable[[Any, Any], Any],
+        postprocess: Optional[Callable[[Any], Any]] = None,
+    ) -> None:
         if postprocess is None:
             postprocess = str
         if is_better(opt_data, ori_data):
-            table.add_row(key, postprocess(ori_data), Text(
-                postprocess(opt_data), style='bold green1'))
+            table.add_row(
+                key,
+                postprocess(ori_data),
+                Text(postprocess(opt_data), style="bold green1"),
+            )
         else:
             table.add_row(key, postprocess(ori_data), postprocess(opt_data))
 
-    for key in sorted(list(set(ori_info.op_nums.keys()) | set(opt_info.op_nums.keys()))):
-        add_row(table, key, ori_info.op_nums[key],
-                opt_info.op_nums[key], lambda opt, ori: opt < ori)
+    for key in sorted(
+        list(set(ori_info.op_nums.keys()) | set(opt_info.op_nums.keys()))
+    ):
+        add_row(
+            table,
+            key,
+            ori_info.op_nums[key],
+            opt_info.op_nums[key],
+            lambda opt, ori: opt < ori,
+        )
     add_row(
-        table, 'Model Size', ori_info.model_size, opt_info.model_size, lambda opt, ori: opt < ori, postprocess=human_readable_size)
+        table,
+        "Model Size",
+        ori_info.model_size,
+        opt_info.model_size,
+        lambda opt, ori: opt < ori,
+        postprocess=human_readable_size,
+    )
 
     # MACs/FLOPs may be symbolic, for which "<" yields an undecidable sympy
     # relational; compare representative magnitudes (all free dims -> 1) so the
@@ -699,17 +758,47 @@ def print_simplifying_info(model_ori: onnx.ModelProto, model_opt: onnx.ModelProt
         return _representative_number(opt) < _representative_number(ori)
 
     add_row(
-        table, 'MACs', ori_info.macs, opt_info.macs, macs_improved, postprocess=human_readable_num)
+        table,
+        "MACs",
+        ori_info.macs,
+        opt_info.macs,
+        macs_improved,
+        postprocess=human_readable_num,
+    )
     add_row(
-        table, 'FLOPs', ori_info.flops, opt_info.flops, macs_improved, postprocess=human_readable_num)
+        table,
+        "FLOPs",
+        ori_info.flops,
+        opt_info.flops,
+        macs_improved,
+        postprocess=human_readable_num,
+    )
     add_row(
-        table, 'Memory Access', ori_info.mem_access, opt_info.mem_access, macs_improved, postprocess=human_readable_size)
+        table,
+        "Memory Access",
+        ori_info.mem_access,
+        opt_info.mem_access,
+        macs_improved,
+        postprocess=human_readable_size,
+    )
     add_row(
-        table, 'Memory Footprint', ori_info.memory_footprint, opt_info.memory_footprint, macs_improved, postprocess=human_readable_size)
+        table,
+        "Memory Footprint",
+        ori_info.memory_footprint,
+        opt_info.memory_footprint,
+        macs_improved,
+        postprocess=human_readable_size,
+    )
     # Compute density (FLOP/Byte): a change here isn't strictly "better or
     # worse", so it is reported without highlighting.
     add_row(
-        table, 'Compute Density', ori_info.compute_density, opt_info.compute_density, lambda opt, ori: False, postprocess=human_readable_density)
+        table,
+        "Compute Density",
+        ori_info.compute_density,
+        opt_info.compute_density,
+        lambda opt, ori: False,
+        postprocess=human_readable_density,
+    )
     print(table)
 
 
@@ -802,7 +891,9 @@ def _annotate_graph(
     return macs, mem_access
 
 
-def annotate_metadata(model: onnx.ModelProto, prefix: str = METADATA_PREFIX) -> onnx.ModelProto:
+def annotate_metadata(
+    model: onnx.ModelProto, prefix: str = METADATA_PREFIX
+) -> onnx.ModelProto:
     """Return a shape-inferred copy of ``model`` with the computed metrics stored
     in ``metadata_props`` at three levels, so downstream tools can read them back:
 
