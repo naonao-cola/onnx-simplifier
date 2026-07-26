@@ -56,6 +56,9 @@ select = ["E4", "E7", "E9", "F", "I"]
 # Type-check the Python package (not the tests, which lean on dynamic fixtures).
 files = ["onnxsim"]
 python_version = "3.10"
-# onnx/numpy/onnxruntime/torch expose partial or no type information, and the
-# compiled `onnxsim_cpp2py_export` extension has no stubs; don't fail on them.
+# onnx/numpy/onnxruntime/torch expose partial or no type information, the
+# compiled `onnxsim_cpp2py_export` extension has no stubs, and upstream stubs
+# are incomplete (e.g. onnx OpSchema methods). Treat every third-party import as
+# Any so the check covers our own code and stays stable across dependency bumps.
+# The Lint workflow deliberately runs mypy without these packages installed.
 ignore_missing_imports = true

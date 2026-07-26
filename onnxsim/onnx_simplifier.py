@@ -570,7 +570,7 @@ def simplify(
                 skipped_optimizers,
                 not skip_constant_folding,
                 not skip_shape_inference,
-                tensor_size_threshold,
+                tensor_size_threshold_bytes,
                 target_opset_version,
                 rewriter,
             )
