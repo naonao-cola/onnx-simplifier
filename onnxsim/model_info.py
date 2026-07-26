@@ -60,6 +60,10 @@ def _external_data_size(graph: onnx.GraphProto) -> int:
 
 
 def human_readable_size(num, suffix="B"):
+    # A symbolic byte count (dynamic shapes + sympy) is printed as the formula
+    # itself, matching human_readable_num.
+    if _is_symbolic(num):
+        return str(sympy.factor(num))
     for unit in ["", "Ki", "Mi", "Gi", "Ti", "Pi", "Ei", "Zi"]:
         if abs(num) < 1024.0:
             return f"{num:3.1f}{unit}{suffix}"
@@ -79,12 +83,23 @@ def human_readable_num(num, suffix=""):
     return f"{num:.1f}Z{suffix}"
 
 
+def human_readable_density(num, suffix=" FLOP/Byte"):
+    # Arithmetic intensity is a small ratio; print it plainly. When symbolic
+    # (dynamic shapes cancel unevenly) fall back to the factored formula.
+    if _is_symbolic(num):
+        return f"{sympy.factor(num)}{suffix}"
+    return f"{float(num):.2f}{suffix}"
+
+
 # A dimension is a concrete int, a symbolic size (a sympy Symbol standing in for
 # a ``dim_param`` such as "batch"), or None when the size is entirely unknown.
 Dim = Union[int, "sympy.Expr", None]
 # A MAC count is an int, or a sympy expression once any symbolic dim is involved.
 Macs = Union[int, "sympy.Expr"]
 ShapeMap = Dict[str, List[Dim]]
+# Bytes-per-element for each tensor, keyed like ShapeMap. Drives the memory
+# metrics (access traffic, peak footprint) alongside the shapes.
+DTypeMap = Dict[str, int]
 
 
 def _dim_symbol(name: str) -> "sympy.Expr":
@@ -134,6 +149,13 @@ def _representative_number(value: Macs) -> int:
     return int(value)
 
 
+def _max_macs(a: Macs, b: Macs) -> Macs:
+    # Larger of two possibly-symbolic values, chosen by representative magnitude
+    # (all free dims -> 1). The winner is returned intact, so a symbolic peak is
+    # reported as its formula while the comparison itself stays decidable.
+    return a if _representative_number(a) >= _representative_number(b) else b
+
+
 def _collect_shapes(graph: onnx.GraphProto, inherited: ShapeMap) -> ShapeMap:
     shapes: ShapeMap = dict(inherited)
     for value_info in list(graph.input) + list(graph.output) + list(graph.value_info):
@@ -143,6 +165,59 @@ def _collect_shapes(graph: onnx.GraphProto, inherited: ShapeMap) -> ShapeMap:
     for initializer in graph.initializer:
         shapes[initializer.name] = list(initializer.dims)
     return shapes
+
+
+def _elem_size(elem_type: int) -> Optional[int]:
+    """Bytes per element of an ONNX tensor element type, or None if it has no
+    fixed width (e.g. STRING) or is unmapped. Unknown widths disable the memory
+    metrics for the tensor rather than guessing.
+    """
+    try:
+        dtype = helper.tensor_dtype_to_np_dtype(elem_type)
+    except Exception:
+        return None
+    if dtype.kind in ("O", "U", "S", "V"):  # object / string / void: no fixed size
+        return None
+    return int(dtype.itemsize)
+
+
+def _collect_dtypes(graph: onnx.GraphProto, inherited: DTypeMap) -> DTypeMap:
+    dtypes: DTypeMap = dict(inherited)
+    for value_info in list(graph.input) + list(graph.output) + list(graph.value_info):
+        esize = _elem_size(value_info.type.tensor_type.elem_type)
+        if esize is not None:
+            dtypes[value_info.name] = esize
+    for initializer in graph.initializer:
+        esize = _elem_size(initializer.data_type)
+        if esize is not None:
+            dtypes[initializer.name] = esize
+    return dtypes
+
+
+def _tensor_bytes(name: str, shapes: ShapeMap, dtypes: DTypeMap) -> Optional[Macs]:
+    """Size in bytes of a named tensor, or None when its shape or element size is
+    unknown. May be symbolic when a dimension is a ``dim_param``.
+    """
+    shape = shapes.get(name)
+    esize = dtypes.get(name)
+    if not _known(shape) or esize is None:
+        return None
+    return _prod(shape) * esize
+
+
+def _node_memory_access(node: onnx.NodeProto, shapes: ShapeMap, dtypes: DTypeMap) -> Macs:
+    """Bytes a node moves in a forward pass: every input read plus every output
+    written. Weights read from memory count as reads. Tensors with unknown size
+    contribute 0 (best-effort, matching the MAC counters).
+    """
+    total: Macs = 0
+    for name in list(node.input) + list(node.output):
+        if not name:  # optional/omitted operand
+            continue
+        nbytes = _tensor_bytes(name, shapes, dtypes)
+        if nbytes is not None:
+            total += nbytes
+    return total
 
 
 def _attr_int(node: onnx.NodeProto, name: str, default: int) -> int:
@@ -374,19 +449,34 @@ class ModelInfo:
        functions (and nested ones) are inlined, and schema-registered function
        ops without a bespoke counter fall back to their context-dependent body
        (best-effort).
-    TODO:
-    Based on onnx runtime, get
-    1、forward memory footprint
-    2、memory access
-    3、compute density
+    4. Memory metrics, derived statically from the same inferred shapes (no
+       runtime execution needed):
+       - ``mem_access``: total bytes read and written across a forward pass --
+         every node's inputs (weights included) plus its outputs.
+       - ``memory_footprint``: peak bytes resident at once, from a liveness pass
+         over the topologically-ordered nodes -- weights stay resident while each
+         activation lives only from where it is produced to its last use.
+       - ``compute_density``: arithmetic intensity, ``flops / mem_access``
+         (FLOP per byte), the roofline ratio.
+       Tensors whose shape or element size is unknown contribute 0, so these are
+       best-effort lower bounds; with dynamic dims they may be symbolic too.
     """
 
-    def get_info(self, graph: onnx.GraphProto, inherited_shapes: Optional[ShapeMap] = None) -> Tuple[Dict[str, int], Macs]:
+    def get_info(
+        self,
+        graph: onnx.GraphProto,
+        inherited_shapes: Optional[ShapeMap] = None,
+        inherited_dtypes: Optional[DTypeMap] = None,
+    ) -> Tuple[Dict[str, int], Macs, Macs]:
         if inherited_shapes is None:
             inherited_shapes = {}
+        if inherited_dtypes is None:
+            inherited_dtypes = {}
         shapes = _collect_shapes(graph, inherited_shapes)
+        dtypes = _collect_dtypes(graph, inherited_dtypes)
         op_nums = defaultdict(int)
         macs = 0
+        mem_access = 0
         for node in graph.node:
             op_nums[node.op_type] += 1
             counter = _MAC_COUNTERS.get(node.op_type)
@@ -399,23 +489,25 @@ class ModelInfo:
                         f"'{node.name}' ({e}); it is excluded from the total.",
                         stacklevel=2,
                     )
+            mem_access += _node_memory_access(node, shapes, dtypes)
             for attr in node.attribute:
                 sub_graphs = []
                 if attr.HasField("g"):
                     sub_graphs.append(attr.g)
                 sub_graphs.extend(attr.graphs)
                 for sub_graph in sub_graphs:
-                    sub_op_nums, sub_macs = self.get_info(sub_graph, shapes)
+                    sub_op_nums, sub_macs, sub_mem = self.get_info(sub_graph, shapes, dtypes)
                     op_nums = defaultdict(int, {k: op_nums[k] + sub_op_nums[k] for k in set(op_nums) | set(sub_op_nums)})
                     macs += sub_macs
+                    mem_access += sub_mem
         op_nums["Constant"] += len(graph.initializer)
-        return op_nums, macs
+        return op_nums, macs, mem_access
 
     def __init__(self, model: onnx.ModelProto):
         inferred = self._infer_shapes(model)
         # Op counts describe the model as authored, so a function op (e.g. a
         # fused block) is reported as a single op.
-        self.op_nums, macs = self.get_info(inferred.graph)
+        self.op_nums, macs, mem_access = self.get_info(inferred.graph)
         # ``graph.ByteSize()`` is the serialized size of the whole graph -- nested
         # subgraphs and inline tensor data included -- so it is taken once at the
         # top rather than summed per subgraph (which double-counted nested
@@ -425,13 +517,18 @@ class ModelInfo:
         # data has been loaded, so callers need not materialize multi-GB weights
         # just to measure the model.
         self.model_size = model.graph.ByteSize() + _external_data_size(model.graph)
-        # A function op's compute lives in its body, so for MACs we expose
-        # function bodies and recount -- the primitive counters then see the
+        # A function op's compute lives in its body, so for MACs (and the memory
+        # metrics, which must pair with those FLOPs) we expose function bodies and
+        # recount on the expanded graph -- the primitive counters then see the
         # MatMuls, Convs, etc. inside every function instance.
-        macs_graph = self._expanded_macs_graph(model)
-        if macs_graph is not None:
-            _, macs = self.get_info(macs_graph)
+        compute_graph = self._expanded_macs_graph(model)
+        if compute_graph is not None:
+            _, macs, mem_access = self.get_info(compute_graph)
+        else:
+            compute_graph = inferred.graph
         self.macs = macs
+        self.mem_access = mem_access
+        self.memory_footprint = self._peak_memory_footprint(compute_graph)
 
     @staticmethod
     def _expanded_macs_graph(model: onnx.ModelProto) -> Optional[onnx.GraphProto]:
@@ -475,9 +572,88 @@ class ModelInfo:
             )
             return model
 
+    def _peak_memory_footprint(
+        self,
+        graph: onnx.GraphProto,
+        inherited_shapes: Optional[ShapeMap] = None,
+        inherited_dtypes: Optional[DTypeMap] = None,
+    ) -> Macs:
+        """Peak bytes resident during a forward pass of ``graph``.
+
+        A simple liveness pass over the topologically-ordered nodes (ONNX
+        requires that order): weights (initializers) stay resident throughout,
+        while every other tensor lives from where it is produced until its last
+        consumer -- graph outputs live to the end. The peak is the largest total
+        of resident-weights + live-activations at any node. Control-flow
+        subgraphs add their own recursive peak on top of the live set at the
+        owning node (a conservative bound, since captured tensors are counted in
+        both). Unknown-size tensors contribute 0.
+        """
+        shapes = _collect_shapes(graph, inherited_shapes or {})
+        dtypes = _collect_dtypes(graph, inherited_dtypes or {})
+
+        def nbytes(name: str) -> Macs:
+            size = _tensor_bytes(name, shapes, dtypes)
+            return size if size is not None else 0
+
+        weight_names = {init.name for init in graph.initializer}
+        resident: Macs = 0
+        for name in weight_names:
+            resident += nbytes(name)
+
+        # Last node index that consumes each tensor; graph outputs are "consumed"
+        # at the end so they stay live for the whole pass.
+        last_use: Dict[str, int] = {}
+        for i, node in enumerate(graph.node):
+            for name in node.input:
+                if name:
+                    last_use[name] = i
+        end = len(graph.node)
+        for out in graph.output:
+            last_use[out.name] = end
+
+        def live_bytes(live: set) -> Macs:
+            total: Macs = resident
+            for name in live:
+                total += nbytes(name)
+            return total
+
+        # Graph inputs (non-weight) are available from the start.
+        live = {inp.name for inp in graph.input if inp.name not in weight_names}
+        peak = live_bytes(live)
+        for i, node in enumerate(graph.node):
+            for name in node.output:
+                if name and name not in weight_names:
+                    live.add(name)
+            current = live_bytes(live)
+            # Nested subgraphs run while this node's live set is held.
+            for attr in node.attribute:
+                sub_graphs = []
+                if attr.HasField("g"):
+                    sub_graphs.append(attr.g)
+                sub_graphs.extend(attr.graphs)
+                for sub_graph in sub_graphs:
+                    sub_peak = self._peak_memory_footprint(sub_graph, shapes, dtypes)
+                    current = current + sub_peak
+            peak = _max_macs(peak, current)
+            for name in [n for n in live if last_use.get(n) == i]:
+                live.discard(name)
+        return peak
+
     @property
     def flops(self) -> int:
         return self.macs * 2
+
+    @property
+    def compute_density(self) -> Macs:
+        """Arithmetic intensity: FLOPs per byte of memory traffic (roofline).
+
+        0 when no traffic is known. Symbolic when the dynamic dimensions do not
+        cancel between FLOPs and bytes.
+        """
+        if _representative_number(self.mem_access) == 0:
+            return 0
+        return self.flops / self.mem_access
 
 
 def print_simplifying_info(model_ori: onnx.ModelProto, model_opt: onnx.ModelProto) -> None:
@@ -522,4 +698,12 @@ def print_simplifying_info(model_ori: onnx.ModelProto, model_opt: onnx.ModelProt
         table, 'MACs', ori_info.macs, opt_info.macs, macs_improved, postprocess=human_readable_num)
     add_row(
         table, 'FLOPs', ori_info.flops, opt_info.flops, macs_improved, postprocess=human_readable_num)
+    add_row(
+        table, 'Memory Access', ori_info.mem_access, opt_info.mem_access, macs_improved, postprocess=human_readable_size)
+    add_row(
+        table, 'Memory Footprint', ori_info.memory_footprint, opt_info.memory_footprint, macs_improved, postprocess=human_readable_size)
+    # Compute density (FLOP/Byte): a change here isn't strictly "better or
+    # worse", so it is reported without highlighting.
+    add_row(
+        table, 'Compute Density', ori_info.compute_density, opt_info.compute_density, lambda opt, ori: False, postprocess=human_readable_density)
     print(table)

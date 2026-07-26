@@ -11,7 +11,12 @@ from onnx import TensorProto, helper
 import pytest
 
 from onnxsim import model_info
-from onnxsim.model_info import ModelInfo, human_readable_num, human_readable_size
+from onnxsim.model_info import (
+    ModelInfo,
+    human_readable_density,
+    human_readable_num,
+    human_readable_size,
+)
 
 
 def _model(nodes, inputs, outputs, initializers=None, opset=23):
@@ -270,6 +275,139 @@ def test_human_readable_num_units():
 def test_human_readable_size_units():
     assert human_readable_size(512) == "512.0B"
     assert human_readable_size(1024) == "1.0KiB"
+
+
+def test_human_readable_density_units():
+    assert human_readable_density(0) == "0.00 FLOP/Byte"
+    assert human_readable_density(2.5) == "2.50 FLOP/Byte"
+
+
+def test_human_readable_size_symbolic():
+    sympy = pytest.importorskip("sympy")
+    batch = sympy.Symbol("batch", positive=True, integer=True)
+    assert human_readable_size(512 * batch) == "512*batch"
+
+
+# --------------------------------------------------------------------------- #
+# Memory metrics: access traffic, peak footprint, compute density
+# --------------------------------------------------------------------------- #
+def _info(nodes, inputs, outputs, initializers=None, opset=23):
+    return ModelInfo(_model(nodes, inputs, outputs, initializers, opset))
+
+
+def test_memory_access_gemm():
+    # float32 tensors: reads a (5*7) + b (7*3), writes y (5*3), 4 bytes each.
+    a = _vi("a", [5, 7])
+    b = _vi("b", [7, 3])
+    y = _vi("y", [5, 3])
+    node = helper.make_node("Gemm", ["a", "b"], ["y"])
+    expected = (5 * 7 + 7 * 3 + 5 * 3) * 4
+    assert _info([node], [a, b], [y]).mem_access == expected
+
+
+def test_memory_access_counts_weights():
+    # A weight fed as an initializer is read from memory, so its bytes count.
+    a = _vi("a", [4, 8])
+    b = _weight("b", [8, 16])
+    y = _vi("y", [4, 16])
+    node = helper.make_node("MatMul", ["a", "b"], ["y"])
+    expected = (4 * 8 + 8 * 16 + 4 * 16) * 4
+    assert _info([node], [a], [y], [b]).mem_access == expected
+
+
+def test_memory_access_respects_dtype_size():
+    # float16 halves the bytes of the float32 case.
+    a = _vi("a", [5, 7], TensorProto.FLOAT16)
+    b = _vi("b", [7, 3], TensorProto.FLOAT16)
+    y = _vi("y", [5, 3], TensorProto.FLOAT16)
+    node = helper.make_node("Gemm", ["a", "b"], ["y"])
+    expected = (5 * 7 + 7 * 3 + 5 * 3) * 2
+    assert _info([node], [a, b], [y]).mem_access == expected
+
+
+def test_memory_access_unknown_shape_contributes_zero():
+    # An intermediate with no inferred shape simply drops out of the total; the
+    # known operands are still counted.
+    a = _vi("a", [5, 7])
+    b = _vi("b", [7, 3])
+    y = _vi("y", [5, 3])
+    node = helper.make_node("Gemm", ["a", "b"], ["y"])
+    assert model_info._node_memory_access(node, {}, {}) == 0
+
+
+def test_compute_density_is_flops_over_bytes():
+    a = _vi("a", [5, 7])
+    b = _vi("b", [7, 3])
+    y = _vi("y", [5, 3])
+    info = _info([helper.make_node("Gemm", ["a", "b"], ["y"])], [a, b], [y])
+    assert info.compute_density == info.flops / info.mem_access
+
+
+def test_compute_density_zero_when_no_traffic():
+    # A shapeless model has no measurable traffic, so density is 0 (not a crash).
+    x = helper.make_tensor_value_info("x", TensorProto.FLOAT, None)
+    y = helper.make_tensor_value_info("y", TensorProto.FLOAT, None)
+    info = _info([helper.make_node("Relu", ["x"], ["y"])], [x], [y])
+    assert info.mem_access == 0
+    assert info.compute_density == 0
+
+
+def test_memory_footprint_single_node():
+    # Gemm: inputs a, b live through the node and output y is produced -> peak is
+    # every tensor resident at once.
+    a = _vi("a", [5, 7])
+    b = _vi("b", [7, 3])
+    y = _vi("y", [5, 3])
+    info = _info([helper.make_node("Gemm", ["a", "b"], ["y"])], [a, b], [y])
+    assert info.memory_footprint == (5 * 7 + 7 * 3 + 5 * 3) * 4
+
+
+def test_memory_footprint_reuses_freed_activations():
+    # x -> Conv -> h -> Relu -> y. x is dead after Conv, so it is not resident
+    # during Relu; the peak is the larger of the two per-node working sets, not
+    # the sum of every tensor.
+    x = _vi("x", [1, 3, 8, 8])
+    w = _weight("w", [4, 3, 3, 3])
+    h = _vi("h", [1, 4, 8, 8])
+    y = _vi("y", [1, 4, 8, 8])
+    nodes = [
+        helper.make_node("Conv", ["x", "w"], ["h"], kernel_shape=[3, 3], pads=[1, 1, 1, 1]),
+        helper.make_node("Relu", ["h"], ["y"]),
+    ]
+    info = _info(nodes, [x], [y], [w])
+    b = 4  # float32
+    weight_bytes = 4 * 3 * 3 * 3 * b
+    x_bytes = 1 * 3 * 8 * 8 * b
+    h_bytes = 1 * 4 * 8 * 8 * b
+    y_bytes = 1 * 4 * 8 * 8 * b
+    conv_peak = weight_bytes + x_bytes + h_bytes  # x still live, h produced
+    relu_peak = weight_bytes + h_bytes + y_bytes  # x freed, y produced
+    assert info.memory_footprint == max(conv_peak, relu_peak)
+    # ... and strictly less than holding every tensor at once.
+    assert info.memory_footprint < weight_bytes + x_bytes + h_bytes + y_bytes
+
+
+def test_memory_metrics_symbolic_dynamic_batch():
+    sympy = pytest.importorskip("sympy")
+    a = _vi("a", ["batch", 7])
+    b = _weight("b", [7, 3])
+    y = _vi("y", ["batch", 3])
+    info = _info([helper.make_node("MatMul", ["a", "b"], ["y"])], [a], [y], [b])
+    batch = sympy.Symbol("batch", positive=True, integer=True)
+    expected = (7 * batch + 3 * batch) * 4 + (7 * 3) * 4  # a + y scale with batch; b fixed
+    assert sympy.simplify(info.mem_access - expected) == 0
+
+
+def test_memory_metrics_reported_in_summary(capsys):
+    a = _vi("a", [5, 7])
+    b = _vi("b", [7, 3])
+    y = _vi("y", [5, 3])
+    model = _model([helper.make_node("Gemm", ["a", "b"], ["y"])], [a, b], [y])
+    model_info.print_simplifying_info(model, model)
+    out = capsys.readouterr().out
+    assert "Memory Access" in out
+    assert "Memory Footprint" in out
+    assert "Compute Density" in out
 
 
 # --------------------------------------------------------------------------- #
