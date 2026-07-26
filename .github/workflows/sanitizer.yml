@@ -38,7 +38,7 @@ jobs:
     - name: Install test dependencies
       run: |
         pip install torch==2.10.0 torchvision==0.25.0 --index-url https://download.pytorch.org/whl/cpu/
-        pip install pytest flake8 onnxruntime onnxscript==0.6.2 timm==1.0.26
+        pip install pytest flake8 onnxruntime onnxscript==0.6.2 timm==1.0.26 sympy
     - name: Test
       run: |
         LD_PRELOAD="/lib/x86_64-linux-gnu/libasan.so.8 /usr/lib/x86_64-linux-gnu/libstdc++.so.6" \
