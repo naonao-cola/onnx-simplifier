@@ -1,9 +1,10 @@
+import copy
 import warnings
 from collections import defaultdict
 from typing import Callable, Any, List, Optional, Tuple, Dict, Union
 
 import onnx
-from onnx import shape_inference
+from onnx import defs, helper, shape_inference
 from rich.table import Table
 from rich.text import Text
 from rich import print
@@ -246,6 +247,80 @@ def _attention_macs(node: onnx.NodeProto, shapes: ShapeMap) -> Macs:
     return qk + pv
 
 
+def _type_map(graph: onnx.GraphProto) -> Dict[str, onnx.TypeProto]:
+    types: Dict[str, onnx.TypeProto] = {}
+    for value_info in list(graph.input) + list(graph.output) + list(graph.value_info):
+        if value_info.type.ByteSize():
+            types[value_info.name] = value_info.type
+    for initializer in graph.initializer:
+        types[initializer.name] = helper.make_tensor_type_proto(
+            initializer.data_type, list(initializer.dims))
+    return types
+
+
+def _schema_function_body(
+    node: onnx.NodeProto, types: Dict[str, onnx.TypeProto], opsets: Dict[str, int]
+) -> Optional[onnx.FunctionProto]:
+    """The expanded body of a context-dependent schema function, or None.
+
+    Only context-dependent functions (e.g. Attention, LayerNormalization) are
+    handled: their body is generated from the node's attributes and input types,
+    so it needs no attribute plumbing when turned into a local function.
+    """
+    version = opsets.get(node.domain, opsets.get("", 1))
+    try:
+        schema = defs.get_schema(node.op_type, version, node.domain)
+    except Exception:
+        return None
+    if not schema.has_context_dependent_function:
+        return None
+    # Every non-optional input must have a known type to generate the body.
+    if any(name and types.get(name) is None for name in node.input):
+        return None
+    input_types = [
+        types[name].SerializeToString() if name else onnx.TypeProto().SerializeToString()
+        for name in node.input
+    ]
+    try:
+        body_bytes = schema.get_context_dependent_function(
+            node.SerializeToString(), input_types)
+    except Exception:
+        return None
+    body = onnx.FunctionProto()
+    body.ParseFromString(body_bytes)
+    return body
+
+
+def _expand_schema_functions(model: onnx.ModelProto) -> None:
+    """In place: turn schema-registered function ops that have no bespoke MAC
+    counter into uniquely-named model-local functions, so a later inlining pass
+    exposes the compute (MatMuls, Convs, ...) inside their bodies.
+
+    Best-effort and top-level only: a node whose body cannot be generated is
+    left untouched (and thus counts as 0, as before). Ops with a bespoke counter
+    are skipped so their exact counters keep winning.
+    """
+    opsets = {imp.domain: imp.version for imp in model.opset_import}
+    types = _type_map(ModelInfo._infer_shapes(model).graph)
+    existing = {(f.domain, f.name) for f in model.functions}
+    new_functions = []
+    for i, node in enumerate(model.graph.node):
+        if node.op_type in _MAC_COUNTERS or (node.domain, node.op_type) in existing:
+            continue
+        body = _schema_function_body(node, types, opsets)
+        if body is None:
+            continue
+        domain = f"__macs_expand_{i}"
+        body.name = f"{node.op_type}__expanded"
+        body.domain = domain
+        new_functions.append(body)
+        node.op_type = body.name
+        node.domain = domain
+        del node.attribute[:]  # the body is already specialized for these attrs
+        model.opset_import.append(helper.make_opsetid(domain, 1))
+    model.functions.extend(new_functions)
+
+
 class ModelInfo:
     """
     Model info contains:
@@ -257,10 +332,12 @@ class ModelInfo:
        inference; nodes whose shapes cannot be inferred contribute 0. Dynamic
        dimensions (``dim_param``, e.g. "batch") become sympy symbols when sympy
        is installed, so ``macs`` / ``flops`` may be a symbolic formula; without
-       sympy they are assumed 1 (per-sample MACs). Model-local function ops are
-       inlined before counting, so the compute inside their bodies (and nested
-       functions) is included in the MAC total while op counts still list the
-       function op itself.
+       sympy they are assumed 1 (per-sample MACs). Function ops are expanded
+       before counting, so the compute inside their bodies is included in the
+       MAC total while op counts still list the function op itself: model-local
+       functions (and nested ones) are inlined, and schema-registered function
+       ops without a bespoke counter fall back to their context-dependent body
+       (best-effort).
     TODO:
     Based on onnx runtime, get
     1、forward memory footprint
@@ -307,25 +384,46 @@ class ModelInfo:
         # Op counts and model size describe the model as authored, so a function
         # op (e.g. a fused block) is reported as a single op.
         self.op_nums, self.model_size, macs = self.get_info(inferred.graph)
-        # But its compute lives in its body, so for MACs we inline the local
-        # functions and recount -- the primitive counters then see the MatMuls,
+        # But its compute lives in its body, so for MACs we expose function
+        # bodies and recount -- the primitive counters then see the MatMuls,
         # Convs, etc. inside every function instance.
-        if model.functions and onnx_inliner is not None:
-            try:
-                inlined = onnx_inliner.inline_local_functions(model)
-                _, _, macs = self.get_info(self._infer_shapes(inlined).graph)
-            except Exception as e:
-                warnings.warn(
-                    f"Failed to inline local functions ({e}); MACs inside "
-                    "function bodies are not counted.",
-                    stacklevel=2,
-                )
+        macs_graph = self._expanded_macs_graph(model)
+        if macs_graph is not None:
+            _, _, macs = self.get_info(macs_graph)
         self.macs = macs
 
     @staticmethod
-    def _infer_shapes(model: onnx.ModelProto) -> onnx.ModelProto:
+    def _expanded_macs_graph(model: onnx.ModelProto) -> Optional[onnx.GraphProto]:
+        """A shape-inferred graph with function bodies exposed for MAC counting,
+        or None when there is nothing to expand.
+
+        Model-local functions are inlined, and schema-registered function ops
+        without a bespoke counter are first converted to local functions (see
+        ``_expand_schema_functions``). Shapes are inferred with data propagation
+        so the dynamic reshapes inside generated bodies (e.g. Attention) resolve
+        and the internal MatMuls get concrete shapes.
+        """
+        if onnx_inliner is None:
+            return None
         try:
-            return shape_inference.infer_shapes(model)
+            work = copy.deepcopy(model)
+            _expand_schema_functions(work)
+            if not work.functions:
+                return None
+            inlined = onnx_inliner.inline_local_functions(work)
+            return ModelInfo._infer_shapes(inlined, data_prop=True).graph
+        except Exception as e:
+            warnings.warn(
+                f"Failed to expand function bodies ({e}); MACs inside function "
+                "bodies are not counted.",
+                stacklevel=2,
+            )
+            return None
+
+    @staticmethod
+    def _infer_shapes(model: onnx.ModelProto, data_prop: bool = False) -> onnx.ModelProto:
+        try:
+            return shape_inference.infer_shapes(model, data_prop=data_prop)
         except Exception as e:
             # Shape inference can fail (e.g. models > 2GB); MACs then fall back
             # to 0 for nodes without pre-existing value_info.

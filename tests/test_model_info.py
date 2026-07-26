@@ -365,6 +365,40 @@ def test_warns_when_inlining_fails(monkeypatch):
     y = _vi("Y", [4, 16])
     nodes = [helper.make_node("MyLinear", ["X", "W1"], ["Y"], domain="custom")]
     model = _function_model(nodes, [x], [y], [_weight("W1", [8, 16])], [_linear_function()])
-    with pytest.warns(UserWarning, match="Failed to inline local functions"):
+    with pytest.warns(UserWarning, match="Failed to expand function bodies"):
         info = ModelInfo(model)
     assert info.macs == 0  # body compute uncounted, but no crash
+
+
+def test_schema_function_fallback_counts_attention(monkeypatch):
+    # Drop Attention's bespoke counter so the generic schema-function fallback
+    # must expand its context-dependent body and count the two internal MatMuls.
+    monkeypatch.delitem(model_info._MAC_COUNTERS, "Attention")
+    b, h, sq, d = 2, 8, 16, 64
+    q = _vi("Q", [b, h, sq, d])
+    k = _vi("K", [b, h, sq, d])
+    v = _vi("V", [b, h, sq, d])
+    y = _vi("Y", [b, h, sq, d])
+    node = helper.make_node("Attention", ["Q", "K", "V"], ["Y"])
+    model = helper.make_model(
+        helper.make_graph([node], "g", [q, k, v], [y]),
+        opset_imports=[helper.make_opsetid("", 24)],
+    )
+    info = ModelInfo(model)
+    assert info.op_nums["Attention"] == 1          # op count still shows the op
+    assert info.macs == b * h * sq * sq * d * 2     # exact, via the expanded body
+
+
+def test_schema_function_fallback_layernorm_is_zero():
+    # A context-dependent function with no matmuls must expand cleanly to 0 MACs.
+    x = _vi("X", [4, 16])
+    node = helper.make_node("LayerNormalization", ["X", "scale", "bias"], ["Y"])
+    model = helper.make_model(
+        helper.make_graph(
+            [node], "g", [x],
+            [_vi("Y", [4, 16])],
+            [_weight("scale", [16]), _weight("bias", [16])],
+        ),
+        opset_imports=[helper.make_opsetid("", 17)],
+    )
+    assert ModelInfo(model).macs == 0
