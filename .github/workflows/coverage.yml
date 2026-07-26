@@ -44,13 +44,22 @@ jobs:
         pip install cmake ninja "setuptools>=77" sccache
         pip install pytest pytest-cov gcovr
 
-    - name: Build instrumented extension (editable)
-      run: pip install --no-build-isolation -ve .
-
+    # Kick the network-heavy, build-independent test-dependency install off in
+    # the background so torch/torchvision (and the rest, all prebuilt wheels)
+    # download while the C++ extension below compiles, instead of waiting for the
+    # build to finish first. The `wait` before the test step guarantees they are
+    # installed before tests run.
     - name: Install test dependencies
+      id: test_deps
+      background: true
       run: |
         pip install torch==2.10.0 torchvision==0.25.0 --index-url https://download.pytorch.org/whl/cpu/
         pip install flake8 onnxruntime onnxscript==0.6.2 timm==1.0.26
+
+    - name: Build instrumented extension (editable)
+      run: pip install --no-build-isolation -ve .
+
+    - wait: test_deps
 
     - name: Run tests with combined coverage
       # COV_SKIP_BUILD=1: the extension was already built above.
