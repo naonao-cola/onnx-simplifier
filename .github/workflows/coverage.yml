@@ -1,0 +1,100 @@
+name: Coverage (C++ and Python)
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  coverage:
+    name: Combined C++/Python coverage
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # Lets the sticky-comment step post/update the coverage summary comment.
+      pull-requests: write
+    env:
+      CMAKE_GENERATOR: Ninja
+      CMAKE_CXX_COMPILER_LAUNCHER: sccache
+      CMAKE_LINKER_TYPE: MOLD
+      # COVERAGE=1 makes setup.py configure -DONNXSIM_COVERAGE=ON (instrument
+      # onnxsim's own C++ with --coverage) and force a Debug/-O0 build.
+      COVERAGE: '1'
+      SCCACHE_GHA_ENABLED: on
+      ACTIONS_CACHE_SERVICE_V2: on
+    steps:
+    - uses: actions/checkout@v7
+      with:
+        submodules: recursive
+        fetch-depth: 0
+        # Measure the PR's head commit rather than the synthetic merge commit,
+        # so the coverage summary reflects the branch as-is. Falls back to the
+        # pushed commit for push events.
+        ref: ${{ github.event.pull_request.head.sha || github.sha }}
+    - uses: actions/setup-python@v7
+      with:
+        python-version: '3.12'
+    - uses: mozilla-actions/sccache-action@v0.0.10
+
+    - name: Install build + coverage tooling
+      run: |
+        pip install cmake ninja "setuptools>=77" sccache
+        pip install pytest pytest-cov gcovr
+
+    - name: Build instrumented extension (editable)
+      run: pip install --no-build-isolation -ve .
+
+    - name: Install test dependencies
+      run: |
+        pip install torch==2.10.0 torchvision==0.25.0 --index-url https://download.pytorch.org/whl/cpu/
+        pip install flake8 onnxruntime onnxscript==0.6.2 timm==1.0.26
+
+    - name: Run tests with combined coverage
+      # COV_SKIP_BUILD=1: the extension was already built above.
+      env:
+        COV_SKIP_BUILD: '1'
+      run: bash scripts/coverage/run_coverage.sh
+
+    - name: Upload coverage reports artifact
+      if: always()
+      uses: actions/upload-artifact@v7
+      with:
+        name: coverage-report
+        path: coverage-report/
+
+    # Render a combined coverage table from both Cobertura reports. irongut
+    # accepts a comma-separated file list, so C++ and Python land in one summary.
+    # No external service or secret -- output goes to the job summary and a PR
+    # comment. fail_below_min stays false so coverage never blocks CI; set it
+    # true (with `thresholds`) to enforce a floor.
+    - name: Coverage summary (C++ + Python)
+      if: ${{ !cancelled() }}
+      uses: irongut/CodeCoverageSummary@v1.3.0
+      with:
+        filename: coverage-report/cpp.xml,coverage-report/python.xml
+        badge: true
+        format: markdown
+        output: both
+        hide_complexity: true
+        indicators: true
+        fail_below_min: false
+        thresholds: '50 75'
+
+    # Surface the table in the Actions run's job summary.
+    - name: Publish coverage to job summary
+      if: ${{ !cancelled() }}
+      run: cat code-coverage-results.md >> "$GITHUB_STEP_SUMMARY"
+
+    # Post/update a sticky coverage comment on the PR. continue-on-error keeps CI
+    # green on fork PRs, where the token is read-only and the comment can't post.
+    - name: Post coverage comment on PR
+      if: ${{ !cancelled() && github.event_name == 'pull_request' }}
+      continue-on-error: true
+      uses: marocchino/sticky-pull-request-comment@v3.0.5
+      with:
+        header: coverage
+        recreate: true
+        path: code-coverage-results.md

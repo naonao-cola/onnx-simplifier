@@ -161,6 +161,11 @@ class cmake_build(setuptools.Command):
                 cmake_args.append('-DPython3_FIND_ABI=ANY;ANY;ANY;ANY')
             if COVERAGE:
                 cmake_args.append('-DONNX_COVERAGE=ON')
+                # Instrument onnxsim's own C++ (onnxsim.cpp, cpp2py_export.cc,
+                # ...) too, so a pytest run reports coverage for the code that
+                # actually runs behind the Python extension, not just vendored
+                # ONNX. gcovr collects the resulting .gcda from the build dir.
+                cmake_args.append('-DONNXSIM_COVERAGE=ON')
             if COVERAGE or DEBUG:
                 # in order to get accurate coverage information, the
                 # build needs to turn off optimizations
