@@ -116,6 +116,11 @@ if (ONNXSIM_PYTHON)
     Python 3.10
     COMPONENTS Interpreter Development.Module REQUIRED
     OPTIONAL_COMPONENTS Development.SABIModule)
-  nanobind_add_module(onnxsim_cpp2py_export onnxsim/cpp2py_export.cc STABLE_ABI)
+  # FREE_THREADED marks the module Py_MOD_GIL_NOT_USED so free-threaded
+  # interpreters (e.g. the cp314t wheel) keep the GIL disabled instead of
+  # re-enabling it at import. nanobind ignores STABLE_ABI on free-threaded
+  # builds (the limited API is unavailable there), so the two keywords coexist:
+  # STABLE_ABI applies on regular interpreters, FREE_THREADED on cp314t.
+  nanobind_add_module(onnxsim_cpp2py_export onnxsim/cpp2py_export.cc STABLE_ABI FREE_THREADED)
   target_link_libraries(onnxsim_cpp2py_export PRIVATE onnxsim)
 endif()

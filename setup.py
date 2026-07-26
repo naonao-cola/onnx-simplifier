@@ -267,6 +267,15 @@ ext_modules = [
 ]
 
 packages = setuptools.find_packages()
+# onnxsim/bin and onnxsim/capi hold C++ build inputs, not importable Python.
+# MANIFEST.in's `recursive-include onnxsim ...` sweeps their sources into the
+# sdist, and because they are identifier-named subdirectories of the onnxsim
+# package, setuptools both warns ("Package 'onnxsim.bin' is absent from the
+# `packages` configuration") and ships the raw .cpp/.h inside every wheel.
+# Declare them as packages to silence the warning, then exclude their contents
+# (below) so the built wheel carries no stray C++ sources -- they stay in the
+# sdist for source builds.
+packages += ['onnxsim.bin', 'onnxsim.capi']
 
 version_str = VersionInfo.version
 
@@ -283,5 +292,6 @@ setuptools.setup(
     cmdclass=cmdclass,
     packages=packages,
     include_package_data=True,
+    exclude_package_data={'onnxsim.bin': ['*'], 'onnxsim.capi': ['*']},
     options=setup_opts,
 )

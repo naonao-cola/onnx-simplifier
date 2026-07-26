@@ -1016,6 +1016,161 @@ def test_model_info_size_does_not_double_count_subgraphs():
     assert model_info.ModelInfo(model).model_size == model.graph.ByteSize()
 
 
+def _make_lstm_model_with_dynamic_zero_state(
+    initial_state_value: float = 0.0, hidden_size: int = 4, input_size: int = 3
+):
+    """Build the LSTM graph paddle2onnx emits for a zero initial state.
+
+    The state's shape is [num_directions, batch_size, hidden_size], so a
+    converter that cannot assume a static batch size materializes it as
+    ``Shape -> Slice -> Concat -> Tile -> Transpose -> Slice``, reading the
+    batch size off the input at runtime. ``X`` here is the ONNX LSTM layout
+    [seq_length, batch_size, input_size] with a dynamic batch.
+    """
+    x = onnx.helper.make_tensor_value_info(
+        "X", onnx.TensorProto.FLOAT, ["seq", "batch", input_size]
+    )
+    y = onnx.helper.make_tensor_value_info(
+        "Y", onnx.TensorProto.FLOAT, ["seq", 1, "batch", hidden_size]
+    )
+
+    w = np.random.rand(1, 4 * hidden_size, input_size).astype(np.float32)
+    r = np.random.rand(1, 4 * hidden_size, hidden_size).astype(np.float32)
+    # The tiled state seed: [1, 2, hidden_size], holding initial_h and
+    # initial_c stacked along axis 1.
+    state = np.full((1, 2, hidden_size), initial_state_value, dtype=np.float32)
+    initializers = [
+        onnx.numpy_helper.from_array(w, "W"),
+        onnx.numpy_helper.from_array(r, "R"),
+        onnx.numpy_helper.from_array(state, "state"),
+        onnx.numpy_helper.from_array(np.array([1], dtype=np.int64), "one"),
+        onnx.numpy_helper.from_array(np.array([2], dtype=np.int64), "two"),
+        onnx.numpy_helper.from_array(np.array([0], dtype=np.int64), "zero"),
+        onnx.numpy_helper.from_array(np.array([1, 1], dtype=np.int64), "ones2"),
+    ]
+    nodes = [
+        onnx.helper.make_node("Shape", ["X"], ["shape"]),
+        # shape[1:2] == [batch]
+        onnx.helper.make_node("Slice", ["shape", "one", "two", "zero"], ["batch"]),
+        onnx.helper.make_node("Concat", ["batch", "ones2"], ["repeats"], axis=0),
+        # [1, 2, hidden] -> [batch, 2, hidden] -> [2, batch, hidden]
+        onnx.helper.make_node("Tile", ["state", "repeats"], ["tiled"]),
+        onnx.helper.make_node(
+            "Transpose", ["tiled"], ["states"], perm=[1, 0, 2]
+        ),
+        onnx.helper.make_node("Slice", ["states", "zero", "one", "zero"], ["h0"]),
+        onnx.helper.make_node("Slice", ["states", "one", "two", "zero"], ["c0"]),
+        onnx.helper.make_node(
+            "LSTM",
+            ["X", "W", "R", "", "", "h0", "c0"],
+            ["Y"],
+            hidden_size=hidden_size,
+        ),
+    ]
+    graph_def = onnx.helper.make_graph(
+        nodes, "lstm_zero_state", [x], [y], initializer=initializers
+    )
+    return onnx.helper.make_model(
+        graph_def, opset_imports=[onnx.helper.make_opsetid("", 13)], ir_version=10
+    )
+
+
+def test_eliminate_zero_lstm_initial_state():
+    # Regression test for GitHub issue #314. An LSTM whose initial_h/initial_c
+    # are provably all zeros must have those inputs unset (the ONNX spec
+    # defaults them to zero), which makes the batch-dependent subgraph that
+    # computed them dead. Without this the model keeps Shape/Slice/Concat/Tile
+    # ops that downstream converters such as onnx2ncnn cannot handle.
+    model = _make_lstm_model_with_dynamic_zero_state()
+    sim_model, check_ok = onnxsim.simplify(
+        model, test_input_shapes={"X": [5, 2, 3]}, check_n=3
+    )
+    assert check_ok
+
+    op_types = [node.op_type for node in sim_model.graph.node]
+    assert op_types == ["LSTM"]
+    lstm = sim_model.graph.node[0]
+    # initial_h/initial_c (indices 5 and 6) are gone, and the trailing empty
+    # inputs are trimmed away rather than left dangling.
+    assert all(name == "" for name in lstm.input[5:])
+
+    # The simplified model still computes the same thing, for a batch size
+    # other than the one used to probe shapes.
+    for batch_size in (1, 2, 7):
+        x = np.random.rand(5, batch_size, 3).astype(np.float32)
+        (before,) = onnxsim.backend.run_model(model, {"X": x}).values()
+        (after,) = onnxsim.backend.run_model(sim_model, {"X": x}).values()
+        np.testing.assert_allclose(before, after, rtol=1e-5, atol=1e-6)
+
+
+def test_eliminate_zero_gru_initial_state_from_constant_of_shape():
+    # The same elimination for GRU (which has initial_h but no initial_c), with
+    # the zero state produced by a bare ConstantOfShape whose `value` attribute
+    # is omitted and therefore defaults to zero.
+    hidden_size, input_size = 4, 3
+    x = onnx.helper.make_tensor_value_info(
+        "X", onnx.TensorProto.FLOAT, ["seq", "batch", input_size]
+    )
+    y = onnx.helper.make_tensor_value_info(
+        "Y", onnx.TensorProto.FLOAT, ["seq", 1, "batch", hidden_size]
+    )
+    initializers = [
+        onnx.numpy_helper.from_array(
+            np.random.rand(1, 3 * hidden_size, input_size).astype(np.float32), "W"
+        ),
+        onnx.numpy_helper.from_array(
+            np.random.rand(1, 3 * hidden_size, hidden_size).astype(np.float32), "R"
+        ),
+        onnx.numpy_helper.from_array(np.array([0], dtype=np.int64), "zero"),
+        onnx.numpy_helper.from_array(np.array([1], dtype=np.int64), "one"),
+        onnx.numpy_helper.from_array(np.array([2], dtype=np.int64), "two"),
+        onnx.numpy_helper.from_array(
+            np.array([hidden_size], dtype=np.int64), "hidden"
+        ),
+    ]
+    nodes = [
+        onnx.helper.make_node("Shape", ["X"], ["shape"]),
+        onnx.helper.make_node("Slice", ["shape", "one", "two", "zero"], ["batch"]),
+        # [1, batch, hidden_size]
+        onnx.helper.make_node(
+            "Concat", ["one", "batch", "hidden"], ["state_shape"], axis=0
+        ),
+        onnx.helper.make_node("ConstantOfShape", ["state_shape"], ["h0"]),
+        onnx.helper.make_node(
+            "GRU", ["X", "W", "R", "", "", "h0"], ["Y"], hidden_size=hidden_size
+        ),
+    ]
+    graph_def = onnx.helper.make_graph(
+        nodes, "gru_zero_state", [x], [y], initializer=initializers
+    )
+    model = onnx.helper.make_model(
+        graph_def, opset_imports=[onnx.helper.make_opsetid("", 13)], ir_version=10
+    )
+
+    sim_model, check_ok = onnxsim.simplify(
+        model, test_input_shapes={"X": [5, 2, 3]}, check_n=3
+    )
+    assert check_ok
+    assert [node.op_type for node in sim_model.graph.node] == ["GRU"]
+    assert all(name == "" for name in sim_model.graph.node[0].input[5:])
+
+
+def test_keep_nonzero_lstm_initial_state():
+    # The counterpart of the test above: an initial state that is *not* zero
+    # carries real information and must be preserved verbatim.
+    model = _make_lstm_model_with_dynamic_zero_state(initial_state_value=0.5)
+    sim_model, check_ok = onnxsim.simplify(
+        model, test_input_shapes={"X": [5, 2, 3]}, check_n=3
+    )
+    assert check_ok
+
+    (lstm,) = [node for node in sim_model.graph.node if node.op_type == "LSTM"]
+    assert len(lstm.input) == 7
+    assert lstm.input[5] != "" and lstm.input[6] != ""
+    # The state is still computed from the input's dynamic batch size.
+    assert "Tile" in [node.op_type for node in sim_model.graph.node]
+
+
 def test_perform_optimization_false():
     def _create_dummy_model():
         class MockModel(torch.nn.Module):

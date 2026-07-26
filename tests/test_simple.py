@@ -448,3 +448,66 @@ def test_fp8_qdq_modelopt_integration():
     assert op_types.count("DequantizeLinear") == 4
     assert "Conv" in op_types
     assert "Gemm" in op_types
+
+
+def test_if_with_const_cond_is_folded():
+    # An `If` whose condition is a constant, with branches that each just
+    # produce a constant, used to crash simplify() with a segfault (exit 139):
+    # onnxsim's constant folding turns the branch `Constant` nodes into subgraph
+    # initializers, and the onnxoptimizer "eliminate_if_with_const_cond" pass
+    # then dereferenced a null value while inlining the taken branch (the branch
+    # output was now an initializer with no producing node). With the fixed pass
+    # the `If` is folded away and its output becomes the taken branch's constant
+    # (GitHub issue #452).
+    tv = helper.make_tensor("tv", TensorProto.FLOAT, [2], [1.0, 2.0])
+    fv = helper.make_tensor("fv", TensorProto.FLOAT, [2], [3.0, 4.0])
+    then_b = helper.make_graph(
+        [helper.make_node("Constant", [], ["to"], value=tv)], "tb", [],
+        [helper.make_tensor_value_info("to", TensorProto.FLOAT, [2])])
+    else_b = helper.make_graph(
+        [helper.make_node("Constant", [], ["fo"], value=fv)], "fb", [],
+        [helper.make_tensor_value_info("fo", TensorProto.FLOAT, [2])])
+    if_node = helper.make_node(
+        "If", ["c"], ["Y"], then_branch=then_b, else_branch=else_b)
+    graph = helper.make_graph(
+        [if_node], "g", [],
+        [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [2])],
+        [helper.make_tensor("c", TensorProto.BOOL, [], [True])])
+    model = helper.make_model(
+        graph, opset_imports=[helper.make_opsetid("", 13)])
+    onnx.checker.check_model(model)
+
+    sim_model, check_ok = onnxsim.simplify(model)
+    assert check_ok
+    onnx.checker.check_model(sim_model)
+    # The constant-condition `If` (condition is True) must be folded away, and
+    # the model output must be the "then" branch constant [1.0, 2.0]. Read the
+    # folded value straight out of the graph rather than running the model,
+    # since helper.make_model stamps the latest ONNX IR version, which the
+    # bundled onnxruntime may not load.
+    assert all(n.op_type != "If" for n in sim_model.graph.node)
+
+    def _resolve_const(model, name):
+        # Follow the output through initializers, Constant nodes, and Identity
+        # aliases until a constant tensor is found.
+        seen = set()
+        while name and name not in seen:
+            seen.add(name)
+            for init in model.graph.initializer:
+                if init.name == name:
+                    return numpy_helper.to_array(init)
+            alias = None
+            for node in model.graph.node:
+                if name not in node.output:
+                    continue
+                if node.op_type == "Constant":
+                    (attr,) = [a for a in node.attribute if a.name == "value"]
+                    return numpy_helper.to_array(attr.t)
+                if node.op_type == "Identity":
+                    alias = node.input[0]
+                break
+            name = alias
+        raise AssertionError(f"output {name!r} is not a resolvable constant")
+
+    out = _resolve_const(sim_model, sim_model.graph.output[0].name)
+    assert out.tolist() == [1.0, 2.0]
