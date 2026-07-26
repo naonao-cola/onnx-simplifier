@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools", "wheel"]
+requires = ["setuptools>=77", "wheel"]
 build-backend = "setuptools.build_meta:__legacy__"
 
 [project]
@@ -7,7 +7,7 @@ name = "onnxsim"
 dynamic = ["version"]
 description = "Simplify your ONNX model"
 readme = "README.md"
-license = {text = "MIT AND (Apache-2.0 OR BSD-2-Clause)"}
+license = "MIT AND (Apache-2.0 OR BSD-2-Clause)"
 requires-python = ">=3.10"
 dependencies = [
     "onnx",
