@@ -1,5 +1,6 @@
 #include "onnxsim.h"
 
+#include <google/protobuf/arena.h>
 #include <google/protobuf/text_format.h>
 #include <google/protobuf/util/message_differencer.h>
 #include <onnx/onnx_pb.h>
@@ -276,7 +277,23 @@ std::vector<onnx::TensorProto> RunOp(
   std::vector<onnx::TensorProto> input_tps;
   std::set<std::string> initializer_names;
 
-  onnx::ModelProto op_model;
+  // Build the throwaway sub-model on an arena. RunOp is called once per foldable
+  // node -- often thousands of times across a fixed-point run -- and each call
+  // copies initializers and nodes into `op_model`, so the message is a deep tree
+  // of nested sub-messages (NodeProto, TensorProto, ValueInfoProto, dims, ...).
+  // Without an arena, destroying it walks that whole tree freeing each
+  // sub-message individually; on an arena the entire tree is released in one
+  // bulk free when `arena` goes out of scope. `CreateMessage` (rather than
+  // `Create`) is used so the arena pointer propagates to every `add_*`/
+  // `mutable_*` sub-message -- that propagation is what makes the teardown cheap,
+  // and it is the form that works down to the protobuf 3.7 floor in
+  // requirements.txt. The sub-model is strictly local: it is never Swap'd or
+  // moved into `model`, and the executor returns its outputs in a separate
+  // std::vector that does not live on this arena, so the arena can be torn down
+  // on return without dangling anything the caller keeps.
+  google::protobuf::Arena arena;
+  onnx::ModelProto& op_model =
+      *google::protobuf::Arena::CreateMessage<onnx::ModelProto>(&arena);
   op_model.set_ir_version(model.ir_version());
   for (const auto& x : model.opset_import()) {
     *op_model.add_opset_import() = x;
