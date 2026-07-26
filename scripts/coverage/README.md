@@ -74,9 +74,15 @@ python3 -m pytest --cov=onnxsim --cov-report=term-missing tests
 
 # 3. collect the C++ side
 gcovr --root . --filter onnxsim/ --exclude '.*third_party.*' \
+      --gcov-ignore-parse-errors=suspicious_hits.warn \
       --print-summary --html-details coverage-report/cpp.html \
       .setuptools-cmake-build
 ```
+
+> `--gcov-ignore-parse-errors=suspicious_hits.warn` keeps gcovr from aborting
+> when a hot loop's hit count grows large enough (billions) that gcov emits a
+> value gcovr 8.x flags as "suspicious". Those counts are real; the flag
+> downgrades them from a fatal error to a warning.
 
 ## Requirements
 

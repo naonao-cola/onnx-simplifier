@@ -90,11 +90,18 @@ python3 -m pytest \
 # 4. Turn the accumulated .gcda profiles into C++ coverage reports. --root keeps
 #    paths repo-relative; the filters restrict the report to onnxsim's own C++
 #    (dropping vendored ONNX / onnxruntime and system headers).
+#
+#    --gcov-ignore-parse-errors=suspicious_hits.warn: a hot loop exercised
+#    across the whole suite can accumulate a hit count so large (billions) that
+#    gcov emits a value gcovr 8.x flags as "suspicious" and, by default, aborts
+#    the whole run over (exit 64). Those counts are legitimate, so downgrade the
+#    suspicious-hit error to a warning and keep going.
 echo "==> Collecting C++ coverage with gcovr"
 gcovr \
   --root "${REPO_ROOT}" \
   --filter "${REPO_ROOT}/onnxsim/" \
   --exclude '.*third_party.*' \
+  --gcov-ignore-parse-errors=suspicious_hits.warn \
   --print-summary \
   --xml-pretty --output "${OUTPUT_DIR}/cpp.xml" \
   --html-details "${OUTPUT_DIR}/cpp.html" \
