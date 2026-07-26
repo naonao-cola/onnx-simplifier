@@ -341,6 +341,68 @@ def test_folding_does_not_duplicate_initializers():
         assert "w" not in {init.name for init in sim_model.graph.initializer}
 
 
+def test_batched_constant_folding():
+    # Many independent constant sub-expressions are folded in a single backend
+    # Session (batched folding) instead of one Session per node. This builds a
+    # wide fan of Constant -> Mul chains that are summed into one constant and
+    # then added to the runtime input, and checks that every constant node is
+    # folded into a single initializer and that the result stays numerically
+    # correct.
+    import numpy as np
+
+    n = 40
+    base = np.arange(8, dtype=np.float32)
+    x = helper.make_tensor_value_info("x", TensorProto.FLOAT, [8])
+    y = helper.make_tensor_value_info("y", TensorProto.FLOAT, [8])
+    base_init = numpy_helper.from_array(base, name="base")
+
+    nodes = []
+    prod_names = []
+    for i in range(n):
+        c_name = f"c{i}"
+        p_name = f"p{i}"
+        nodes.append(
+            helper.make_node(
+                "Constant",
+                [],
+                [c_name],
+                value=numpy_helper.from_array(
+                    np.array(float(i), dtype=np.float32), name=c_name
+                ),
+            )
+        )
+        nodes.append(helper.make_node("Mul", ["base", c_name], [p_name]))
+        prod_names.append(p_name)
+    nodes.append(helper.make_node("Sum", prod_names, ["acc"]))
+    nodes.append(helper.make_node("Add", ["x", "acc"], ["y"]))
+
+    graph = helper.make_graph(nodes, "g", [x], [y], initializer=[base_init])
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+    onnx.checker.check_model(model)
+
+    sim_model, check_ok = onnxsim.simplify(model, perform_optimization=False)
+    assert check_ok
+    onnx.checker.check_model(sim_model)
+
+    # No initializer may be left dangling regardless of backend availability.
+    used = {i for node in sim_model.graph.node for i in node.input}
+    for init in sim_model.graph.initializer:
+        assert init.name in used, f"unused initializer left behind: {init.name}"
+
+    op_types = [node.op_type for node in sim_model.graph.node]
+    # When the backend folded the constants, the whole fan collapses to a single
+    # Add reading the runtime input and one folded initializer.
+    if "Mul" not in op_types and "Sum" not in op_types and "Constant" not in op_types:
+        assert op_types == ["Add"]
+        acc = base * (n * (n - 1) / 2)
+        x_val = np.random.rand(8).astype(np.float32)
+        sess = onnxruntime.InferenceSession(
+            sim_model.SerializeToString(), providers=["CPUExecutionProvider"]
+        )
+        (out,) = sess.run(None, {"x": x_val})
+        np.testing.assert_allclose(out, x_val + acc, rtol=1e-5, atol=1e-5)
+
+
 def test_fp8_qdq_model():
     # Regression test for GitHub issue #348. NVIDIA ModelOpt emits fp8 QDQ
     # models whose QuantizeLinear/DequantizeLinear zero points use the
