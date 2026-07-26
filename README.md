@@ -135,6 +135,78 @@ during simplification, so the custom operator's output shapes are inferred too.
 Custom operators without an inference function are still imported; shape
 inference simply flows past them.
 
+## Custom rewriters
+
+Beyond the built-in optimizer passes, you can plug your own graph rewriting
+logic into simplification with the `custom_rewriter` parameter of `simplify()`.
+It accepts a callable
+
+```python
+Callable[[onnx.ModelProto], Optional[onnx.ModelProto]]
+```
+
+that either returns a rewritten model or mutates the model in place and returns
+`None`. The callable runs **inside** onnxsim's simplification fixed point,
+interleaved with shape inference, the built-in optimizer and constant folding —
+so a rewrite can expose new optimization/folding opportunities and vice versa,
+and the whole pipeline iterates until it converges. onnxsim itself takes no
+dependency on any particular rewriting library; you bring your own.
+
+### Using onnx-rewriter (`onnxscript.rewriter`)
+
+[onnx-rewriter](https://github.com/microsoft/onnxscript) lets you express a
+subgraph pattern and its replacement as plain Python and have it matched and
+rewritten anywhere in the model. Install it alongside onnxsim:
+
+```
+pip3 install onnxscript
+```
+
+Then define a rule set and hand it to `simplify` via `custom_rewriter`. This
+example fuses `MatMul` + `Add` into a single `Gemm`:
+
+```python
+import onnx
+import onnxsim
+from onnxscript.rewriter import pattern, rewrite
+
+# The subgraph to match: y = MatMul(x, w) + b
+def matmul_add_pattern(op, x, w, b):
+    return op.Add(op.MatMul(x, w), b)
+
+# What to replace it with: y = Gemm(x, w, b)
+def gemm_replacement(op, x, w, b):
+    return op.Gemm(x, w, b)
+
+rules = pattern.RewriteRuleSet(
+    [pattern.RewriteRule(matmul_add_pattern, gemm_replacement)]
+)
+
+model = onnx.load("model.onnx")
+model_simp, check = onnxsim.simplify(
+    model,
+    custom_rewriter=lambda m: rewrite(m, pattern_rewrite_rules=rules),
+)
+assert check, "Simplified ONNX model could not be validated"
+```
+
+Because the rewriter runs every round of the fixed point, the fused `Gemm`
+above (and anything it unlocks) is folded and re-optimized together with the
+rest of the graph.
+
+A few things to keep in mind:
+
+- **Keep the model schema-valid.** After each rewrite onnxsim validates the
+  model, so any op you introduce must be registered at the model's opset (for
+  example `Gelu` only exists from opset 20). Custom-domain ops are fine — see
+  [Custom operators](#custom-operators) for registering their schemas.
+- **Match the opset your rules target.** Convert the model to the opset your
+  patterns expect (e.g. with `onnx.version_converter`) before simplifying if
+  needed.
+- **You are not limited to onnx-rewriter.** Any callable works — a hand-written
+  pass over `model.graph`, an [onnx-graphsurgeon](https://github.com/NVIDIA/TensorRT/tree/main/tools/onnx-graphsurgeon)
+  edit, etc. — as long as it takes and returns a `ModelProto`.
+
 ## Projects Using ONNX Simplifier
 
 * [MXNet](https://mxnet.apache.org/versions/1.9.1/api/python/docs/tutorials/deploy/export/onnx.html#Simplify-the-exported-ONNX-model)
