@@ -14,11 +14,8 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      # Required by actions/upload-code-coverage to push reports to GitHub's
-      # native code-coverage (Code Quality) API.
-      code-quality: write
-      # Lets the action resolve the open PR number on push events (gh pr list).
-      pull-requests: read
+      # Lets the sticky-comment step post/update the coverage summary comment.
+      pull-requests: write
     env:
       CMAKE_GENERATOR: Ninja
       CMAKE_CXX_COMPILER_LAUNCHER: sccache
@@ -33,9 +30,9 @@ jobs:
       with:
         submodules: recursive
         fetch-depth: 0
-        # Measure the PR's head commit (not the merge commit) so coverage lines
-        # up with the SHA GitHub Code Quality annotates. Falls back to the pushed
-        # commit for push events.
+        # Measure the PR's head commit rather than the synthetic merge commit,
+        # so the coverage summary reflects the branch as-is. Falls back to the
+        # pushed commit for push events.
         ref: ${{ github.event.pull_request.head.sha || github.sha }}
     - uses: actions/setup-python@v7
       with:
@@ -68,31 +65,36 @@ jobs:
         name: coverage-report
         path: coverage-report/
 
-    # Publish to GitHub's native code coverage (Code Quality) so coverage shows
-    # directly on the PR via github-code-quality[bot] -- no external service or
-    # secret needed (uses the built-in GITHUB_TOKEN + code-quality:write above).
-    # The action takes one Cobertura file and one language per call, which suits
-    # this hybrid repo: upload each report under its language so the PR reports
-    # C++ and Python coverage separately.
-    #
-    # fail-on-error: false keeps CI green while GitHub Code Quality coverage is a
-    # public preview and may not be enabled on the org yet; upload problems still
-    # surface as workflow annotations. Drop it (defaults to true) once the repo
-    # is enrolled and coverage upload should be a hard requirement.
-    - name: Upload Python coverage to GitHub Code Quality
+    # Render a combined coverage table from both Cobertura reports. irongut
+    # accepts a comma-separated file list, so C++ and Python land in one summary.
+    # No external service or secret -- output goes to the job summary and a PR
+    # comment. fail_below_min stays false so coverage never blocks CI; set it
+    # true (with `thresholds`) to enforce a floor.
+    - name: Coverage summary (C++ + Python)
       if: ${{ !cancelled() }}
-      uses: actions/upload-code-coverage@v1
+      uses: irongut/CodeCoverageSummary@v1.3.0
       with:
-        file: coverage-report/python.xml
-        language: Python
-        label: code-coverage/python
-        fail-on-error: false
+        filename: coverage-report/cpp.xml,coverage-report/python.xml
+        badge: true
+        format: markdown
+        output: both
+        hide_complexity: true
+        indicators: true
+        fail_below_min: false
+        thresholds: '50 75'
 
-    - name: Upload C++ coverage to GitHub Code Quality
+    # Surface the table in the Actions run's job summary.
+    - name: Publish coverage to job summary
       if: ${{ !cancelled() }}
-      uses: actions/upload-code-coverage@v1
+      run: cat code-coverage-results.md >> "$GITHUB_STEP_SUMMARY"
+
+    # Post/update a sticky coverage comment on the PR. continue-on-error keeps CI
+    # green on fork PRs, where the token is read-only and the comment can't post.
+    - name: Post coverage comment on PR
+      if: ${{ !cancelled() && github.event_name == 'pull_request' }}
+      continue-on-error: true
+      uses: marocchino/sticky-pull-request-comment@v3.0.5
       with:
-        file: coverage-report/cpp.xml
-        language: C++
-        label: code-coverage/cpp
-        fail-on-error: false
+        header: coverage
+        recreate: true
+        path: code-coverage-results.md

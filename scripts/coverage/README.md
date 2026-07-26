@@ -28,11 +28,13 @@ coverage-report/cpp.html         HTML           (C++)
 ```
 
 Both XML files are Cobertura, which most coverage viewers accept. In CI
-(`.github/workflows/coverage.yml`) they are published to GitHub's native code
-coverage (Code Quality) via `actions/upload-code-coverage`, one upload per
-language, so the C++ and Python numbers show directly on the pull request with
-no external service or secret. The same Cobertura files can just as easily feed
-Codecov, Coveralls, or SonarQube if you prefer a hosted dashboard with history.
+(`.github/workflows/coverage.yml`) they are fed to `irongut/CodeCoverageSummary`
+(a comma-separated list, so C++ and Python appear in one combined table), which
+writes the summary to the Actions job summary and posts it as a sticky pull
+request comment via `marocchino/sticky-pull-request-comment` -- no external
+service or secret required. The same Cobertura files can just as easily feed
+Codecov, Coveralls, SonarQube, or GitHub's native Code Quality coverage if you
+prefer a hosted dashboard or inline PR annotations.
 
 Pass extra arguments straight through to pytest:
 
