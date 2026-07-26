@@ -162,6 +162,12 @@ onnxsim input_onnx_model output_onnx_model --target-opset 18
 When `target_opset_version` is left unset (the default), the model's opset
 version is preserved.
 
+The conversion runs inside onnxsim's C++ core, so every binding shares it —
+the Python package, the C API and its Rust wrapper (`Options::target_opset_version`),
+the standalone `onnxsim` binary (`--target-opset`), and the
+[web version](https://onnxsim.github.io/onnxsim/) (the "target opset version"
+field).
+
 ## Projects Using ONNX Simplifier
 
 * [MXNet](https://mxnet.apache.org/versions/1.9.1/api/python/docs/tutorials/deploy/export/onnx.html#Simplify-the-exported-ONNX-model)

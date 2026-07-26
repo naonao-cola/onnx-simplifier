@@ -47,6 +47,10 @@ typedef enum OnnxsimStatus {
  * tensor_size_threshold bounds the byte size of tensors produced by constant
  * folding that are kept as initializers.
  *
+ * target_opset_version, when > 0, converts the model to that opset version of
+ * the default ONNX domain (using onnx's version converter) before simplifying;
+ * a value <= 0 leaves the opset version unchanged.
+ *
  * On ONNXSIM_OK, *out_data / *out_size receive a newly allocated buffer holding
  * the serialized simplified ModelProto; release it with onnxsim_free_buffer.
  * On ONNXSIM_ERROR, *out_error receives a newly allocated, NUL-terminated
@@ -57,8 +61,8 @@ ONNXSIM_C_API OnnxsimStatus onnxsim_simplify(
     const void* model_data, size_t model_size,
     const char* const* skip_optimizers, size_t num_skip_optimizers,
     int skip_optimizers_is_null, int constant_folding, int shape_inference,
-    size_t tensor_size_threshold, void** out_data, size_t* out_size,
-    char** out_error);
+    size_t tensor_size_threshold, int target_opset_version, void** out_data,
+    size_t* out_size, char** out_error);
 
 /*
  * Same as onnxsim_simplify, but reads the input model from `in_path` and writes
@@ -69,7 +73,7 @@ ONNXSIM_C_API OnnxsimStatus onnxsim_simplify_path(
     const char* in_path, const char* out_path,
     const char* const* skip_optimizers, size_t num_skip_optimizers,
     int skip_optimizers_is_null, int constant_folding, int shape_inference,
-    size_t tensor_size_threshold, char** out_error);
+    size_t tensor_size_threshold, int target_opset_version, char** out_error);
 
 /*
  * Return the names of all available fuse/elimination optimizer passes as a

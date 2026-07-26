@@ -16,7 +16,6 @@ import onnx.checker  # type: ignore
 import onnx.helper  # type: ignore
 import onnx.shape_inference  # type: ignore
 import onnx.numpy_helper  # type: ignore
-import onnx.version_converter  # type: ignore
 import onnxsim.onnxsim_cpp2py_export as C
 from . import backend
 from . import model_info
@@ -293,35 +292,6 @@ def _restore_doc_strings(model: onnx.ModelProto, snapshot: dict) -> None:
             opt.doc_string = snapshot["outputs"][opt.name]
 
 
-def _get_default_opset_version(model: onnx.ModelProto) -> Optional[int]:
-    """Return the opset version the model imports for the default ONNX domain.
-
-    The default domain is represented as either the empty string ``""`` or the
-    equivalent ``"ai.onnx"``. Returns ``None`` when the model does not import the
-    default domain at all (a model made purely of custom-domain operators).
-    """
-    for opset in model.opset_import:
-        if opset.domain in ("", "ai.onnx"):
-            return opset.version
-    return None
-
-
-def _convert_opset_version(
-    model: onnx.ModelProto, target_opset_version: int
-) -> onnx.ModelProto:
-    """Convert ``model`` to ``target_opset_version`` for the default ONNX domain.
-
-    Uses onnx's own version converter. Only the default ONNX domain opset is
-    changed; custom/other-domain opset imports are left untouched. If the model
-    is already at the requested version (or does not import the default domain)
-    the model is returned unchanged.
-    """
-    current = _get_default_opset_version(model)
-    if current is None or current == target_opset_version:
-        return model
-    return onnx.version_converter.convert_version(model, target_opset_version)
-
-
 def simplify(
     model: Union[str, onnx.ModelProto],
     check_n: int = 0,
@@ -367,9 +337,9 @@ def simplify(
             registry untouched.
     :param input_shapes: Deprecated. Please use `overwrite_input_shapes` and/or `test_input_shapes` instead.
     :param target_opset_version: Convert the model to this opset version (of the default ONNX domain)
-            before simplifying, using onnx's version converter. This can be used to upgrade (or
-            downgrade) the model's opset during simplification. When None (the default), the opset
-            version is left unchanged.
+            before simplifying, using onnx's version converter (run inside the C++ core so every
+            binding shares the behavior). This can be used to upgrade (or downgrade) the model's
+            opset during simplification. When None (the default), the opset version is left unchanged.
     :return: A tuple (simplified model, success(True) or failed(False))
     """
     if dynamic_input_shape:
@@ -495,12 +465,6 @@ def simplify(
     if external_data_dir is not None:
         onnx.load_external_data_for_model(model, external_data_dir)
 
-    # Optionally convert the model to a different opset version (of the default
-    # ONNX domain) before simplifying. Running the conversion first lets the
-    # simplifier clean up any redundant nodes the version converter introduces.
-    if target_opset_version is not None:
-        model = _convert_opset_version(model, target_opset_version)
-
     try:
         model_bytes = model.SerializeToString()
         if len(model_bytes) >= 2 * 1024 * 1024 * 1024:
@@ -513,6 +477,7 @@ def simplify(
             not skip_constant_folding,
             not skip_shape_inference,
             tensor_size_threshold,
+            target_opset_version,
         )
         # The serialized original (~1x model) is not needed once the C++
         # simplifier has consumed it -- the large-model fallback below
@@ -569,6 +534,7 @@ def simplify(
                 not skip_constant_folding,
                 not skip_shape_inference,
                 tensor_size_threshold,
+                target_opset_version,
             )
             check_ok = model_checking.compare(
                 os.path.join(tmpdirname, 'opt.onnx'),

@@ -20,6 +20,7 @@
 #include "onnx/defs/printer.h"
 #include "onnx/defs/schema.h"
 #include "onnx/shape_inference/implementation.h"
+#include "onnx/version_converter/convert.h"
 #include "onnxoptimizer/model_util.h"
 #include "onnxoptimizer/optimize.h"
 #include "onnxoptimizer/passes/logging.h"
@@ -1203,10 +1204,38 @@ void AssignMissingNodeNames(onnx::ModelProto& model) {
 
 void Check(const onnx::ModelProto& model) { onnx::checker::check_model(model); }
 
+// Return the opset version the model imports for the default ONNX domain
+// (represented as either the empty string or "ai.onnx"), or std::nullopt when
+// the model does not import the default domain at all (a model made purely of
+// custom-domain operators).
+std::optional<int> DefaultOpsetVersion(const onnx::ModelProto& model) {
+  for (const auto& opset : model.opset_import()) {
+    if (opset.domain().empty() || opset.domain() == "ai.onnx") {
+      return static_cast<int>(opset.version());
+    }
+  }
+  return std::nullopt;
+}
+
+// Convert the default ONNX domain of the model to target_version using onnx's
+// own version converter. Only the default ONNX domain opset is changed;
+// custom/other-domain opset imports are left untouched. Returns the model
+// unchanged when it is already at the requested version or does not import the
+// default domain.
+onnx::ModelProto ConvertOpsetVersion(const onnx::ModelProto& model,
+                                     int target_version) {
+  const auto current = DefaultOpsetVersion(model);
+  if (!current || *current == target_version) {
+    return model;
+  }
+  return onnx::version_conversion::ConvertVersion(model, target_version);
+}
+
 onnx::ModelProto Simplify(
     const ModelExecutor& executor, const onnx::ModelProto& model,
     std::optional<std::vector<std::string>> skip_optimizers,
-    bool constant_folding, bool shape_inference, size_t tensor_size_threshold) {
+    bool constant_folding, bool shape_inference, size_t tensor_size_threshold,
+    std::optional<int> target_opset_version) {
   // Make shape inference aware of ONNX Runtime's quantized contrib operators
   // (QLinearAdd and friends) so shape deduction does not stop at them.
   onnxsim::RegisterContribOpSchemas();
@@ -1276,6 +1305,12 @@ onnx::ModelProto Simplify(
   // The fixed points mutate in place, so make one working copy of the (const)
   // input model and simplify it in place.
   onnx::ModelProto sim_model = model;
+  // Optionally convert the model to a different opset version (of the default
+  // ONNX domain) first, so the simplification below can clean up any redundant
+  // nodes the version converter introduces.
+  if (target_opset_version) {
+    sim_model = ConvertOpsetVersion(sim_model, *target_opset_version);
+  }
   OptAndShapeAndFold(sim_model);
   // Simplification (and some onnx-optimizer passes) can leave nodes without a
   // name; assign unique names to them so downstream tools that key on node
@@ -1296,12 +1331,14 @@ void SimplifyPath(const ModelExecutor& executor, const std::string& in_path,
                   const std::string& out_path,
                   std::optional<std::vector<std::string>> skip_optimizers,
                   bool constant_folding, bool shape_inference,
-                  size_t tensor_size_threshold) {
+                  size_t tensor_size_threshold,
+                  std::optional<int> target_opset_version) {
   onnx::ModelProto model;
   onnx::optimization::loadModel(&model, in_path, true);
 
   model = Simplify(executor, model, skip_optimizers, constant_folding,
-                   shape_inference, tensor_size_threshold);
+                   shape_inference, tensor_size_threshold,
+                   target_opset_version);
 
   onnx::optimization::saveModel(&model, out_path, true, "");
 }
