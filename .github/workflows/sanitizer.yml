@@ -32,13 +32,21 @@ jobs:
 
     - run: pip install cmake ninja setuptools sccache
 
-    - name: Build
-      run: pip install --no-build-isolation -ve .
-    
+    # Download/install the build-independent test dependencies (all prebuilt
+    # wheels) in the background so they fetch while the ASan build below compiles.
+    # The `wait` before the test step ensures they are ready first.
     - name: Install test dependencies
+      id: test_deps
+      background: true
       run: |
         pip install torch==2.10.0 torchvision==0.25.0 --index-url https://download.pytorch.org/whl/cpu/
         pip install pytest flake8 onnxruntime onnxscript==0.6.2 timm==1.0.26 sympy
+
+    - name: Build
+      run: pip install --no-build-isolation -ve .
+
+    - wait: test_deps
+
     - name: Test
       run: |
         LD_PRELOAD="/lib/x86_64-linux-gnu/libasan.so.8 /usr/lib/x86_64-linux-gnu/libstdc++.so.6" \
