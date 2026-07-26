@@ -1316,7 +1316,7 @@ onnx::ModelProto Simplify(
     const ModelExecutor& executor, const onnx::ModelProto& model,
     std::optional<std::vector<std::string>> skip_optimizers,
     bool constant_folding, bool shape_inference, size_t tensor_size_threshold,
-    std::optional<int> target_opset_version) {
+    std::optional<int> target_opset_version, const GraphRewriter* rewriter) {
   // Make shape inference aware of ONNX Runtime's quantized contrib operators
   // (QLinearAdd and friends) so shape deduction does not stop at them.
   onnxsim::RegisterContribOpSchemas();
@@ -1381,8 +1381,27 @@ onnx::ModelProto Simplify(
   ModelFn OptAndShape =
       FixedPointFn(InferShapes, OptimizeInPlace, fixed_point_iters);
   bool converged = false;
-  ModelFn OptAndShapeAndFold =
-      FixedPointFn(OptAndShape, FoldConstant, fixed_point_iters, &converged);
+  ModelFn Pipeline;
+  if (rewriter) {
+    // Run the user-supplied rewriter (e.g. an onnxscript.rewriter rule set) as
+    // the outermost stage of the fixed point: each round drives shape
+    // inference, onnxoptimizer and constant folding to a fixed point, then
+    // rewrites, then repeats until the whole thing stops changing. This lets a
+    // rewrite expose new optimizer/folding opportunities and vice versa. The
+    // rewriter runs on the ``ModelProto`` directly, so no internal-graph
+    // conversion is involved.
+    ModelFn OptAndShapeAndFold =
+        FixedPointFn(OptAndShape, FoldConstant, fixed_point_iters);
+    ModelFn RewriteInPlace = [rewriter](onnx::ModelProto& model) {
+      model = rewriter->_Run(model);
+    };
+    Pipeline =
+        FixedPointFn(OptAndShapeAndFold, RewriteInPlace, fixed_point_iters,
+                     &converged);
+  } else {
+    Pipeline =
+        FixedPointFn(OptAndShape, FoldConstant, fixed_point_iters, &converged);
+  }
   // The fixed points mutate in place, so make one working copy of the (const)
   // input model and simplify it in place.
   onnx::ModelProto sim_model = model;
@@ -1392,7 +1411,7 @@ onnx::ModelProto Simplify(
   if (target_opset_version) {
     sim_model = ConvertOpsetVersion(sim_model, *target_opset_version);
   }
-  OptAndShapeAndFold(sim_model);
+  Pipeline(sim_model);
   // Simplification (and some onnx-optimizer passes) can leave nodes without a
   // name; assign unique names to them so downstream tools that key on node
   // names keep working (issue #269).
@@ -1413,13 +1432,14 @@ void SimplifyPath(const ModelExecutor& executor, const std::string& in_path,
                   std::optional<std::vector<std::string>> skip_optimizers,
                   bool constant_folding, bool shape_inference,
                   size_t tensor_size_threshold,
-                  std::optional<int> target_opset_version) {
+                  std::optional<int> target_opset_version,
+                  const GraphRewriter* rewriter) {
   onnx::ModelProto model;
   onnx::optimization::loadModel(&model, in_path, true);
 
   model = Simplify(executor, model, skip_optimizers, constant_folding,
-                   shape_inference, tensor_size_threshold,
-                   target_opset_version);
+                   shape_inference, tensor_size_threshold, target_opset_version,
+                   rewriter);
 
   onnx::optimization::saveModel(&model, out_path, true, "");
 }

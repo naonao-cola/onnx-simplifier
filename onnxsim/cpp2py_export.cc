@@ -252,6 +252,38 @@ struct PyModelExecutorTrampoline : public PyModelExecutor {
   }
 };
 
+// Bridges the C++ ``GraphRewriter`` interface to a Python implementation, in the
+// same shape as ``PyModelExecutor``: the model is serialized to the protobuf
+// wire format, handed to Python as ``bytes``, and the rewritten model is parsed
+// back from the returned ``bytes``. This keeps onnxsim itself free of any
+// dependency on the Python rewriting library (onnxscript etc.); the caller
+// supplies the Python ``Run`` implementation.
+struct PyGraphRewriter : public GraphRewriter {
+  using GraphRewriter::GraphRewriter;
+
+  onnx::ModelProto _Run(const onnx::ModelProto& model) const override {
+    std::string model_str = model.SerializeAsString();
+    auto output_bytes =
+        _PyRun(py::bytes(model_str.data(), model_str.size()));
+    onnx::ModelProto out;
+    out.ParseFromString(std::string(output_bytes.c_str(), output_bytes.size()));
+    return out;
+  }
+
+  virtual py::bytes _PyRun(const py::bytes& model_bytes) const = 0;
+};
+
+struct PyGraphRewriterTrampoline : public PyGraphRewriter {
+  NB_TRAMPOLINE(PyGraphRewriter, 1);
+
+  py::bytes _PyRun(const py::bytes& model_bytes) const override {
+    NB_OVERRIDE_PURE_NAME(
+        "Run", _PyRun, /* Name of function in C++ (must match Python name) */
+        model_bytes /* Argument(s) */
+    );
+  }
+};
+
 NB_MODULE(onnxsim_cpp2py_export, m) {
   m.doc() = "ONNX Simplifier";
 
@@ -263,7 +295,8 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
            std::optional<std::vector<std::string>> skip_optimizers,
            bool constant_folding, bool shape_inference,
            size_t tensor_size_threshold,
-           std::optional<int> target_opset_version) -> py::bytes {
+           std::optional<int> target_opset_version,
+           std::shared_ptr<PyGraphRewriter> rewriter) -> py::bytes {
           // force env initialization to register opset
           InitEnv();
           ONNX_NAMESPACE::ModelProto model;
@@ -271,31 +304,34 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
           auto const result = Simplify(*executor, model, skip_optimizers,
                                        constant_folding, shape_inference,
                                        tensor_size_threshold,
-                                       target_opset_version);
+                                       target_opset_version, rewriter.get());
           std::string out;
           result.SerializeToString(&out);
           return py::bytes(out.data(), out.size());
         }, "executor"_a, "model_bytes"_a, "skip_optimizers"_a.none(),
-        "constant_folding"_a = true, "shape_inference"_a = true, "tensor_size_threshold"_a,
-        "target_opset_version"_a.none())
+        "constant_folding"_a = true, "shape_inference"_a = true,
+        "tensor_size_threshold"_a, "target_opset_version"_a.none(),
+        "rewriter"_a.none())
       .def("simplify_path",
            [](std::shared_ptr<PyModelExecutor> executor,
               const std::string& in_path, const std::string& out_path,
               std::optional<std::vector<std::string>> skip_optimizers,
               bool constant_folding, bool shape_inference,
               size_t tensor_size_threshold,
-              std::optional<int> target_opset_version) -> bool {
+              std::optional<int> target_opset_version,
+              std::shared_ptr<PyGraphRewriter> rewriter) -> bool {
              // force env initialization to register opset
              InitEnv();
              SimplifyPath(*executor, in_path, out_path, skip_optimizers,
                           constant_folding, shape_inference,
-                          tensor_size_threshold, target_opset_version);
+                          tensor_size_threshold, target_opset_version,
+                          rewriter.get());
              return true;
            }, "executor"_a, "in_path"_a, "out_path"_a,
            "skip_optimizers"_a.none(),
            "constant_folding"_a = true, "shape_inference"_a = true,
-           "tensor_size_threshold"_a,
-           "target_opset_version"_a.none())
+           "tensor_size_threshold"_a, "target_opset_version"_a.none(),
+           "rewriter"_a.none())
       .def("_list_optimizers",
            []() {
             py::list ret;
@@ -405,4 +441,8 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
   py::class_<PyModelExecutor, PyModelExecutorTrampoline>(m, "ModelExecutor")
       .def(py::init<>())
       .def("Run", &PyModelExecutor::_PyRun);
+
+  py::class_<PyGraphRewriter, PyGraphRewriterTrampoline>(m, "GraphRewriter")
+      .def(py::init<>())
+      .def("Run", &PyGraphRewriter::_PyRun);
 }
