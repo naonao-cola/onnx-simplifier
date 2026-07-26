@@ -910,6 +910,112 @@ def test_nameless_nodes_get_names():
     assert len(set(names)) == len(names)
 
 
+def test_simplify_path_with_external_data():
+    # When ``simplify`` is given a *file path* to a model whose weights live in a
+    # separate external-data file, it defers loading that (potentially huge)
+    # external data until right before the model is serialized for the C++
+    # simplifier -- every graph-metadata phase in between runs without the
+    # weights resident. This regression test makes sure that deferral still
+    # produces a correct result: the external tensor data must be materialized so
+    # the constant fold below can happen and the values are preserved.
+    a = np.random.rand(64, 64).astype(np.float32)
+    b = np.random.rand(64, 64).astype(np.float32)
+    initializers = [
+        onnx.numpy_helper.from_array(a, "a"),
+        onnx.numpy_helper.from_array(b, "b"),
+    ]
+    node = onnx.helper.make_node("Add", ["a", "b"], ["y"])
+    out = onnx.helper.make_tensor_value_info("y", onnx.TensorProto.FLOAT, (64, 64))
+    graph_def = onnx.helper.make_graph(
+        [node], "test_simplify_path_with_external_data", [], [out],
+        initializer=initializers)
+    model = onnx.helper.make_model(
+        graph_def, opset_imports=[onnx.helper.make_opsetid("", 14)], ir_version=10)
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        model_path = os.path.join(tmpdir, "model.onnx")
+        onnx.save(
+            model,
+            model_path,
+            save_as_external_data=True,
+            all_tensors_to_one_file=True,
+            location="model.data",
+        )
+        # The .onnx file itself carries no raw tensor data -- it is all in the
+        # external .data file, so this really exercises the deferred-load path.
+        assert os.path.exists(os.path.join(tmpdir, "model.data"))
+
+        sim_model, check_ok = onnxsim.simplify(model_path, check_n=1)
+
+    assert check_ok
+    # Add of two constants is folded into a single initializer holding a + b.
+    assert len(sim_model.graph.node) == 0
+    assert len(sim_model.graph.initializer) == 1
+    folded = onnx.numpy_helper.to_array(sim_model.graph.initializer[0])
+    np.testing.assert_allclose(folded, a + b, rtol=1e-5, atol=1e-6)
+
+
+def test_model_info_size_counts_external_data_without_loading():
+    # ModelInfo must report a model's size from external-data metadata, so a
+    # model whose weights live on disk can be measured without loading them --
+    # and the number must match what a fully-loaded model reports.
+    from onnxsim import model_info
+
+    w = np.random.rand(256, 256).astype(np.float32)  # 256 KiB of weights
+    initializer = onnx.numpy_helper.from_array(w, "w")
+    node = onnx.helper.make_node("Identity", ["w"], ["y"])
+    out = onnx.helper.make_tensor_value_info("y", onnx.TensorProto.FLOAT, (256, 256))
+    graph_def = onnx.helper.make_graph([node], "g", [], [out], initializer=[initializer])
+    model = onnx.helper.make_model(
+        graph_def, opset_imports=[onnx.helper.make_opsetid("", 14)], ir_version=10)
+
+    full_size = model_info.ModelInfo(model).model_size
+    # The weights dominate the reported size.
+    assert full_size >= w.nbytes
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        model_path = os.path.join(tmpdir, "model.onnx")
+        onnx.save(
+            model, model_path, save_as_external_data=True,
+            all_tensors_to_one_file=True, location="model.data")
+        meta_only = onnx.load(model_path, load_external_data=False)
+
+    # The metadata-only model carries no raw tensor bytes...
+    assert len(meta_only.graph.initializer[0].raw_data) == 0
+    meta_size = model_info.ModelInfo(meta_only).model_size
+    # ...yet its reported size still counts the external weights and matches the
+    # fully-loaded size (to within the few bytes of external-data bookkeeping).
+    assert meta_size >= w.nbytes
+    assert abs(meta_size - full_size) < 1024
+
+
+def test_model_info_size_does_not_double_count_subgraphs():
+    # graph.ByteSize() already includes nested subgraphs, so the size must be
+    # taken once at the top -- not summed per subgraph (which double-counted).
+    from onnxsim import model_info
+
+    def _branch(name, out_name):
+        c = onnx.numpy_helper.from_array(np.zeros(1024, dtype=np.float32), name + "_c")
+        n = onnx.helper.make_node("Identity", [name + "_c"], [out_name])
+        return onnx.helper.make_graph(
+            [n], name, [], [onnx.helper.make_tensor_value_info(
+                out_name, onnx.TensorProto.FLOAT, (1024,))], initializer=[c])
+
+    if_node = onnx.helper.make_node(
+        "If", ["cond"], ["y"],
+        then_branch=_branch("then", "ty"), else_branch=_branch("else", "ey"))
+    graph_def = onnx.helper.make_graph(
+        [if_node], "g",
+        [onnx.helper.make_tensor_value_info("cond", onnx.TensorProto.BOOL, [])],
+        [onnx.helper.make_tensor_value_info("y", onnx.TensorProto.FLOAT, (1024,))])
+    model = onnx.helper.make_model(
+        graph_def, opset_imports=[onnx.helper.make_opsetid("", 14)], ir_version=10)
+
+    # With no external data, the reported size is exactly the graph's serialized
+    # size -- the subgraph bytes are counted once, not twice.
+    assert model_info.ModelInfo(model).model_size == model.graph.ByteSize()
+
+
 def _make_lstm_model_with_dynamic_zero_state(
     initial_state_value: float = 0.0, hidden_size: int = 4, input_size: int = 3
 ):

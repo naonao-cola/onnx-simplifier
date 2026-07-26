@@ -376,8 +376,19 @@ def simplify(
     # defensive copy). When the caller passes their own ``ModelProto`` we must
     # not mutate it.
     model_owned = isinstance(model, str)
+    # When the caller passes a file path, defer loading the (potentially
+    # multi-GB) external tensor data until it is actually needed -- right before
+    # the model is serialized for the C++ simplifier. Every graph transformation
+    # in between (input-shape overwrite, unused-output/initializer pruning,
+    # unhashable-tensor detection, doc-string snapshotting) reads only tensor
+    # *metadata* -- names, shapes, element types -- never the raw bytes, so
+    # keeping the weights on disk through these phases lowers active memory use
+    # and avoids loading them at all when an earlier phase raises. The directory
+    # is remembered so the external data can be resolved later.
+    external_data_dir: Optional[str] = None
     if model_owned:
-        model = onnx.load(model)
+        external_data_dir = os.path.dirname(os.path.abspath(model))
+        model = onnx.load(model, load_external_data=False)
     if overwrite_input_shapes is None:
         overwrite_input_shapes = {}
     overwrite_input_shapes = check_and_update_input_shapes(
@@ -441,6 +452,13 @@ def simplify(
     tensor_size_threshold = parse_size(tensor_size_threshold)
     if tensor_size_threshold > 2**31 - 9999:
         raise ValueError("tensor_size_threshold should be less than 2GB")
+
+    # Materialize the external tensor data now that the metadata-only phases are
+    # over and the full model is about to be serialized for the C++ simplifier.
+    # This is a no-op unless we loaded from a path above (and therefore deferred
+    # it); a caller-provided ``ModelProto`` already carries its data inline.
+    if external_data_dir is not None:
+        onnx.load_external_data_for_model(model, external_data_dir)
 
     try:
         model_bytes = model.SerializeToString()
@@ -776,9 +794,20 @@ def main():
         sess_options.optimized_model_filepath = tmp_file.name
         _ = rt.InferenceSession(args.input_model, sess_options, providers=["CPUExecutionProvider"])
 
-        model = onnx.load(tmp_file.name)
+        # ``tmp_file`` stays referenced (and thus on disk) until ``main`` returns,
+        # so ``simplify`` can load it below.
+        model_path = tmp_file.name
     else:
-        model = onnx.load(args.input_model)
+        model_path = args.input_model
+
+    # Load only the graph structure here, deferring the (potentially multi-GB)
+    # external tensor data. The CLI needs this model just for the pre-flight
+    # warnings below and the size/op diff printed at the end -- none of which read
+    # raw tensor bytes: op counts come from graph structure and the reported size
+    # is computed from external-data metadata (see ``model_info``). ``simplify``
+    # is handed the *path* (not this ModelProto) so it owns its copy and performs
+    # its own deferred load, keeping the weights out of memory here entirely.
+    model = onnx.load(model_path, load_external_data=False)
 
     if args.tensor_size_threshold == DEFAULT_TENSOR_SIZE_THRESHOLDHOLD:
         for node in model.graph.node:
@@ -813,7 +842,7 @@ def main():
     print("Simplifying...")
 
     model_opt, check_ok = simplify(
-        model,
+        model_path,
         args.check_n,
         perform_optimization,
         False,
