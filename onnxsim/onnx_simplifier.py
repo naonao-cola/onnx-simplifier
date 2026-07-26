@@ -28,8 +28,10 @@ TensorShapes = Dict[str, TensorShape]
 TensorShapesWithOptionalKey = Dict[Optional[str], TensorShape]
 # A user-supplied graph rewriter: takes a model and returns a rewritten model,
 # or mutates it in place and returns ``None``. Passed to ``simplify`` via
-# ``custom_rewriter`` and run inside the simplification fixed point.
-ModelRewriter = Callable[[onnx.ModelProto], Optional[onnx.ModelProto]]
+# ``custom_rewriter`` and run inside the simplification fixed point. Returning
+# ``False`` reports that nothing was rewritten, which lets onnxsim skip copying
+# an unchanged model back through the C++ core (see ``_GraphRewriterAdapter``).
+ModelRewriter = Callable[[onnx.ModelProto], Union[onnx.ModelProto, bool, None]]
 Unit = Literal["B", "KB", "MB", "GB", "TB"]
 
 UNIT_MAP: dict[Unit, int] = {
@@ -350,7 +352,10 @@ def simplify(
             shape inference and constant folding so a rewrite can unlock further simplification and vice
             versa. Use it to plug in a custom graph rewriter, e.g. an ``onnxscript.rewriter`` rule set:
             ``custom_rewriter=lambda m: onnxscript.rewriter.rewrite(m, pattern_rewrite_rules=my_rules)``.
-            The callable may return a new ``ModelProto`` or mutate and return ``None``.
+            The callable may return a new ``ModelProto``, mutate and return ``None``, or return ``False``
+            to report that it rewrote nothing. Returning ``False`` when no rewrite happened (for example
+            when an ``onnxscript.rewriter`` rule set's applied-rewrite count is zero) lets onnxsim skip
+            copying an unchanged model back through the C++ core on that fixed-point round.
     :return: A tuple (simplified model, success(True) or failed(False))
     """
     if dynamic_input_shape:
@@ -599,6 +604,15 @@ class _GraphRewriterAdapter(C.GraphRewriter):
     calls the user function, and re-serializes. A function that returns ``None``
     (i.e. mutates the model in place) is supported by falling back to the
     passed-in model.
+
+    A function may instead return ``False`` to report that it rewrote nothing
+    -- e.g. an ``onnxscript.rewriter`` rule set whose patterns matched zero
+    times, which is known from its applied-rewrite count. In that case this
+    adapter returns empty bytes, the "model unchanged" sentinel, so the C++ core
+    keeps the model it already has instead of re-serializing here and parsing an
+    identical copy back. Because an onnxscript IR round-trip can reorder bytes
+    even when no rule fires, the rewrite count -- not a byte comparison -- is the
+    reliable signal that nothing changed.
     """
 
     def __init__(self, fn: ModelRewriter):
@@ -609,6 +623,10 @@ class _GraphRewriterAdapter(C.GraphRewriter):
         model = onnx.ModelProto()
         model.ParseFromString(model_str)
         rewritten = self._fn(model)
+        if rewritten is False:
+            # Nothing was rewritten: return the empty "unchanged" sentinel and
+            # skip re-serializing an identical model.
+            return b""
         if rewritten is None:
             rewritten = model
         return rewritten.SerializeToString()

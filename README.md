@@ -227,6 +227,42 @@ Because the rewriter runs every round of the fixed point, the fused `Gemm`
 above (and anything it unlocks) is folded and re-optimized together with the
 rest of the graph.
 
+### Skipping the copy when nothing is rewritten
+
+The rewriter runs on every fixed-point round, including the final one where it
+has nothing left to do — and the fixed point always ends with at least one
+such no-op round to detect convergence. onnxsim hands the model to your
+callable as protobuf bytes and parses whatever comes back into a fresh
+`ModelProto`, so a rewriter that reports a rewritten model each round pays for
+that copy even when it changed nothing.
+
+Return `False` to tell onnxsim that this round rewrote nothing; onnxsim then
+keeps the model it already has and skips the round-trip. `onnxscript.rewriter`
+knows this from its applied-rewrite **count**, which
+`RewriteRuleSet.apply_to_model` returns (an IR round-trip can reorder the bytes
+even when no rule fires, so the count — not a byte comparison — is the reliable
+signal). Drive the rewrite through the IR so you can read that count:
+
+```python
+from onnxscript import ir
+from onnxscript.rewriter import pattern
+
+rules = pattern.RewriteRuleSet(
+    [pattern.RewriteRule(matmul_add_pattern, gemm_replacement)]
+)
+
+def apply_rules(model: onnx.ModelProto):
+    model_ir = ir.serde.deserialize_model(model)
+    if rules.apply_to_model(model_ir) == 0:
+        return False  # nothing matched this round: skip the copy
+    return ir.serde.serialize_model(model_ir)
+
+model_simp, check = onnxsim.simplify(model, custom_rewriter=apply_rules)
+```
+
+The plain `lambda m: rewrite(m, pattern_rewrite_rules=rules)` form still works —
+it just always returns a model, so onnxsim copies it back every round.
+
 A few things to keep in mind:
 
 - **Keep the model schema-valid.** After each rewrite onnxsim validates the
