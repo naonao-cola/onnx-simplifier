@@ -24,8 +24,14 @@ struct ModelExecutor {
 struct GraphRewriter {
   virtual ~GraphRewriter() = default;
 
+  // Rewrite ``model`` in place. Returns ``true`` if the model was changed and
+  // ``false`` if the rewriter left it untouched -- in the latter case ``model``
+  // is not modified, so callers can skip re-copying it. Being able to report
+  // "nothing changed" lets a rewriter that matched no rule (for example an
+  // ``onnxscript.rewriter`` rule set whose patterns did not fire) avoid parsing
+  // and copying a fresh, identical ModelProto back on every fixed-point round.
   // public it for pybind11
-  virtual onnx::ModelProto _Run(const onnx::ModelProto& model) const = 0;
+  virtual bool _Run(onnx::ModelProto& model) const = 0;
 };
 
 void InitEnv();

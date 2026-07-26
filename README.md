@@ -227,6 +227,44 @@ Because the rewriter runs every round of the fixed point, the fused `Gemm`
 above (and anything it unlocks) is folded and re-optimized together with the
 rest of the graph.
 
+### Skipping the copy when nothing is rewritten
+
+The rewriter runs on every fixed-point round, including the final one where it
+has nothing left to do — and the fixed point always ends with at least one
+such no-op round to detect convergence. onnxsim hands the model to your
+callable as protobuf bytes and parses whatever comes back into a fresh
+`ModelProto`, so a rewriter that reports a rewritten model each round pays for
+that copy even when it changed nothing.
+
+Return `False` to tell onnxsim that this round rewrote nothing; onnxsim then
+keeps the model it already has and skips the round-trip. Run the rules through
+onnx-ir's `PassManager` — `onnxscript.rewriter.RewritePass` wraps a rule set as
+an IR pass — and read the `modified` flag of the `PassResult` it returns. That
+flag is the reliable signal: an IR round-trip can reorder the serialized bytes
+even when no rule fires, so a byte comparison would falsely report a change.
+
+```python
+from onnxscript import ir
+from onnxscript.rewriter import RewritePass, pattern
+
+rules = pattern.RewriteRuleSet(
+    [pattern.RewriteRule(matmul_add_pattern, gemm_replacement)]
+)
+rewrite_pass = ir.passes.PassManager([RewritePass(rules)])
+
+def apply_rules(model: onnx.ModelProto):
+    model_ir = ir.serde.deserialize_model(model)
+    result = rewrite_pass(model_ir)  # ir.passes.PassResult
+    if not result.modified:
+        return False  # no rule fired this round: skip the copy
+    return ir.serde.serialize_model(result.model)
+
+model_simp, check = onnxsim.simplify(model, custom_rewriter=apply_rules)
+```
+
+The plain `lambda m: rewrite(m, pattern_rewrite_rules=rules)` form still works —
+it just always returns a model, so onnxsim copies it back every round.
+
 A few things to keep in mind:
 
 - **Keep the model schema-valid.** After each rewrite onnxsim validates the

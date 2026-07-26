@@ -261,13 +261,18 @@ struct PyModelExecutorTrampoline : public PyModelExecutor {
 struct PyGraphRewriter : public GraphRewriter {
   using GraphRewriter::GraphRewriter;
 
-  onnx::ModelProto _Run(const onnx::ModelProto& model) const override {
+  bool _Run(onnx::ModelProto& model) const override {
     std::string model_str = model.SerializeAsString();
     auto output_bytes =
         _PyRun(py::bytes(model_str.data(), model_str.size()));
-    onnx::ModelProto out;
-    out.ParseFromString(std::string(output_bytes.c_str(), output_bytes.size()));
-    return out;
+    // An empty ``bytes`` is the "model unchanged" sentinel: the Python rewriter
+    // reported that it rewrote nothing, so leave ``model`` alone instead of
+    // parsing an identical ModelProto back out of the returned bytes.
+    if (output_bytes.size() == 0) {
+      return false;
+    }
+    model.ParseFromString(std::string(output_bytes.c_str(), output_bytes.size()));
+    return true;
   }
 
   virtual py::bytes _PyRun(const py::bytes& model_bytes) const = 0;

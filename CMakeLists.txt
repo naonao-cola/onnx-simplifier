@@ -18,6 +18,7 @@ option(ONNXSIM_PYTHON "" OFF)
 option(ONNXSIM_BUILTIN_ORT "" ON)
 option(ONNXSIM_WASM_NODE "For node (enable NODERAWFS etc.)" OFF)
 option(ONNXSIM_C_API "Build the C ABI shared library used by the Rust wrapper and other FFI consumers" OFF)
+option(ONNXSIM_COVERAGE "Instrument onnxsim's own C++ targets for gcov/llvm-cov coverage" OFF)
 
 if (ONNXSIM_PYTHON AND EMSCRIPTEN)
   message(STATUS "python and emscripten cannot be built at the same time")
@@ -123,4 +124,41 @@ if (ONNXSIM_PYTHON)
   # STABLE_ABI applies on regular interpreters, FREE_THREADED on cp314t.
   nanobind_add_module(onnxsim_cpp2py_export onnxsim/cpp2py_export.cc STABLE_ABI FREE_THREADED)
   target_link_libraries(onnxsim_cpp2py_export PRIVATE onnxsim)
+endif()
+
+if (ONNXSIM_COVERAGE)
+  # Instrument onnxsim's own C++ sources (onnxsim.cpp, contrib_schemas.cpp,
+  # cpp2py_export.cc) with gcov/llvm-cov counters. When the Python extension is
+  # imported and called from pytest, the exercised C++ writes .gcda profiles
+  # next to the .gcno files in the build directory, which gcovr then turns into
+  # a C++ coverage report to sit alongside coverage.py's Python report.
+  #
+  # STABLE_ABI is irrelevant here: coverage builds are Debug/-O0 dev builds, not
+  # distributable wheels. Only GCC and Clang support --coverage; MSVC does not.
+  if (NOT (CMAKE_CXX_COMPILER_ID STREQUAL "GNU" OR
+           CMAKE_CXX_COMPILER_ID STREQUAL "Clang" OR
+           CMAKE_CXX_COMPILER_ID STREQUAL "AppleClang"))
+    message(FATAL_ERROR
+      "ONNXSIM_COVERAGE requires a GCC- or Clang-compatible compiler that "
+      "understands --coverage (got '${CMAKE_CXX_COMPILER_ID}').")
+  endif()
+
+  # --coverage expands to -fprofile-arcs -ftest-coverage at compile time and
+  # links the coverage runtime (libgcov / clang's profile runtime) at link time.
+  # Instrument the static library and every consumer that links it so the
+  # runtime is pulled into the final Python module / executable.
+  set(_onnxsim_cov_targets onnxsim)
+  if (TARGET onnxsim_cpp2py_export)
+    list(APPEND _onnxsim_cov_targets onnxsim_cpp2py_export)
+  endif()
+  if (TARGET onnxsim_bin)
+    list(APPEND _onnxsim_cov_targets onnxsim_bin)
+  endif()
+  if (TARGET onnxsim_c)
+    list(APPEND _onnxsim_cov_targets onnxsim_c)
+  endif()
+  foreach(_t IN LISTS _onnxsim_cov_targets)
+    target_compile_options(${_t} PRIVATE --coverage -O0 -g)
+    target_link_options(${_t} PRIVATE --coverage)
+  endforeach()
 endif()
