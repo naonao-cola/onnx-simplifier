@@ -1,27 +1,24 @@
 import argparse
-
 import copy
 import os
-import sys
 import re
+import sys
 import tempfile
-from typing import Callable, List, Literal, Dict, Union, Optional, Tuple, Sequence
-from rich.text import Text
-from rich import print
-import numpy as np
-from google.protobuf.message import EncodeError
+from typing import Callable, Dict, List, Literal, Optional, Sequence, Tuple, Union
 
+import numpy as np
 import onnx  # type: ignore
 import onnx.checker  # type: ignore
 import onnx.helper  # type: ignore
-import onnx.shape_inference  # type: ignore
 import onnx.numpy_helper  # type: ignore
-import onnxsim.onnxsim_cpp2py_export as C
-from . import backend
-from . import model_info
-from . import model_checking
-from . import version
+import onnx.shape_inference  # type: ignore
+from google.protobuf.message import EncodeError
+from rich import print
+from rich.text import Text
 
+import onnxsim.onnxsim_cpp2py_export as C
+
+from . import backend, model_checking, model_info, version
 
 TensorShape = List[int]
 TensorShapes = Dict[str, TensorShape]
@@ -41,6 +38,7 @@ UNIT_MAP: dict[Unit, int] = {
     "GB": 1 << 30,
     "TB": 1 << 40,
 }
+
 
 def get_output_names(model: onnx.ModelProto) -> List[str]:
     output_names = [opt.name for opt in model.graph.output]
@@ -71,7 +69,9 @@ def remove_initializer_from_input(model: onnx.ModelProto) -> onnx.ModelProto:
     return model
 
 
-def check_and_update_input_shapes(model: onnx.ModelProto, input_shapes: Optional[TensorShapesWithOptionalKey]) -> Optional[TensorShapes]:
+def check_and_update_input_shapes(
+    model: onnx.ModelProto, input_shapes: Optional[TensorShapesWithOptionalKey]
+) -> Optional[TensorShapes]:
     if input_shapes is None:
         return None
 
@@ -90,17 +90,17 @@ def check_and_update_input_shapes(model: onnx.ModelProto, input_shapes: Optional
             del input_shapes[None]
         else:
             raise RuntimeError(
-                'The model has more than 1 inputs, please use the format "input_name:dim0,dim1,...,dimN" in --input-shape')
+                'The model has more than 1 inputs, please use the format "input_name:dim0,dim1,...,dimN" in --input-shape'
+            )
     for x in input_shapes:
         if x not in input_names:
-            raise RuntimeError(
-                'The model doesn\'t have input named "{}"'.format(x))
+            raise RuntimeError('The model doesn\'t have input named "{}"'.format(x))
 
     return input_shapes  # type: ignore
 
 
 # A very very large threshold
-DEFAULT_TENSOR_SIZE_THRESHOLDHOLD = '1.5GB'
+DEFAULT_TENSOR_SIZE_THRESHOLDHOLD = "1.5GB"
 
 
 # ONNX ``TensorProto`` element types that onnxoptimizer's tensor-value hashing
@@ -109,25 +109,27 @@ DEFAULT_TENSOR_SIZE_THRESHOLDHOLD = '1.5GB'
 # types (rather than the unsupported ones) so that element types added to ONNX
 # in the future are treated as unhashable by default instead of silently
 # crashing the optimizer.
-_CSE_HASHABLE_ELEM_TYPES = frozenset({
-    onnx.TensorProto.UNDEFINED,
-    onnx.TensorProto.BOOL,
-    onnx.TensorProto.INT8,
-    onnx.TensorProto.INT16,
-    onnx.TensorProto.INT32,
-    onnx.TensorProto.INT64,
-    onnx.TensorProto.UINT8,
-    onnx.TensorProto.UINT16,
-    onnx.TensorProto.UINT32,
-    onnx.TensorProto.UINT64,
-    onnx.TensorProto.FLOAT,
-    onnx.TensorProto.DOUBLE,
-    onnx.TensorProto.FLOAT16,
-    onnx.TensorProto.BFLOAT16,
-    onnx.TensorProto.COMPLEX64,
-    onnx.TensorProto.COMPLEX128,
-    onnx.TensorProto.STRING,
-})
+_CSE_HASHABLE_ELEM_TYPES = frozenset(
+    {
+        onnx.TensorProto.UNDEFINED,
+        onnx.TensorProto.BOOL,
+        onnx.TensorProto.INT8,
+        onnx.TensorProto.INT16,
+        onnx.TensorProto.INT32,
+        onnx.TensorProto.INT64,
+        onnx.TensorProto.UINT8,
+        onnx.TensorProto.UINT16,
+        onnx.TensorProto.UINT32,
+        onnx.TensorProto.UINT64,
+        onnx.TensorProto.FLOAT,
+        onnx.TensorProto.DOUBLE,
+        onnx.TensorProto.FLOAT16,
+        onnx.TensorProto.BFLOAT16,
+        onnx.TensorProto.COMPLEX64,
+        onnx.TensorProto.COMPLEX128,
+        onnx.TensorProto.STRING,
+    }
+)
 
 # onnxoptimizer passes that hash tensor *values* via ``cse_util.h``. They crash
 # on tensors whose element type they cannot hash -- for example the
@@ -194,7 +196,13 @@ def _register_schema_in_onnxsim(schema) -> None:
         if default_value is None:
             default_value = onnx.AttributeProto()
         attributes.append(
-            (attr.name, attr.description, int(attr.type), bool(attr.required), default_value)
+            (
+                attr.name,
+                attr.description,
+                int(attr.type),
+                bool(attr.required),
+                default_value,
+            )
         )
 
     type_constraints = [
@@ -385,8 +393,9 @@ def simplify(
 
     # Wrap the user-supplied rewriter (if any) so the C++ simplifier can call it
     # between optimization rounds. ``None`` leaves the pipeline unchanged.
-    rewriter = _GraphRewriterAdapter(
-        custom_rewriter) if custom_rewriter is not None else None
+    rewriter = (
+        _GraphRewriterAdapter(custom_rewriter) if custom_rewriter is not None else None
+    )
 
     if not perform_optimization:
         # None means skip all optimizers
@@ -401,7 +410,7 @@ def simplify(
     # function and may be mutated freely (e.g. saved as external data without a
     # defensive copy). When the caller passes their own ``ModelProto`` we must
     # not mutate it.
-    model_owned = isinstance(model, str)
+    #
     # When the caller passes a file path, defer loading the (potentially
     # multi-GB) external tensor data until it is actually needed -- right before
     # the model is serialized for the C++ simplifier. Every graph transformation
@@ -412,15 +421,18 @@ def simplify(
     # and avoids loading them at all when an earlier phase raises. The directory
     # is remembered so the external data can be resolved later.
     external_data_dir: Optional[str] = None
-    if model_owned:
+    if isinstance(model, str):
+        model_owned = True
         external_data_dir = os.path.dirname(os.path.abspath(model))
         model = onnx.load(model, load_external_data=False)
+    else:
+        model_owned = False
     if overwrite_input_shapes is None:
         overwrite_input_shapes = {}
     overwrite_input_shapes = check_and_update_input_shapes(
-        model, overwrite_input_shapes)
-    test_input_shapes = check_and_update_input_shapes(
-        model, test_input_shapes)
+        model, overwrite_input_shapes
+    )
+    test_input_shapes = check_and_update_input_shapes(model, test_input_shapes)
 
     for name, input_shape in overwrite_input_shapes.items():
         for ipt in model.graph.input:
@@ -446,7 +458,8 @@ def simplify(
     # means "skip every optimizer", so there is nothing to add in that case.
     if skipped_optimizers is not None and _has_cse_unhashable_tensor(model):
         added = [
-            opt for opt in _TENSOR_VALUE_HASHING_OPTIMIZERS
+            opt
+            for opt in _TENSOR_VALUE_HASHING_OPTIMIZERS
             if opt not in skipped_optimizers
         ]
         if added:
@@ -475,8 +488,8 @@ def simplify(
         unit: Unit = m.group(2).upper()  # type: ignore
         return int(number * UNIT_MAP[unit])
 
-    tensor_size_threshold = parse_size(tensor_size_threshold)
-    if tensor_size_threshold > 2**31 - 9999:
+    tensor_size_threshold_bytes = parse_size(tensor_size_threshold)
+    if tensor_size_threshold_bytes > 2**31 - 9999:
         raise ValueError("tensor_size_threshold should be less than 2GB")
 
     # Materialize the external tensor data now that the metadata-only phases are
@@ -497,7 +510,7 @@ def simplify(
             skipped_optimizers,
             not skip_constant_folding,
             not skip_shape_inference,
-            tensor_size_threshold,
+            tensor_size_threshold_bytes,
             target_opset_version,
             rewriter,
         )
@@ -533,7 +546,9 @@ def simplify(
             # is freed), so surface the exception directly instead of crashing
             # on a ``None`` model.
             raise
-        print("[bold magenta]Simplified model larger than 2GB. Trying to save as external data...[/bold magenta]")
+        print(
+            "[bold magenta]Simplified model larger than 2GB. Trying to save as external data...[/bold magenta]"
+        )
         # large models try to convert through a temporary file
         with tempfile.TemporaryDirectory() as tmpdirname:
             # ``save_as_external_data=True`` mutates the model in place, moving
@@ -545,26 +560,29 @@ def simplify(
             model_to_save = model if model_owned else copy.deepcopy(model)
             onnx.save(
                 model_to_save,
-                os.path.join(tmpdirname, 'model.onnx'),
+                os.path.join(tmpdirname, "model.onnx"),
                 save_as_external_data=True,
             )
             check_ok = C.simplify_path(
                 _get_model_executor(),
-                os.path.join(tmpdirname, 'model.onnx'),
-                os.path.join(tmpdirname, 'opt.onnx'),
+                os.path.join(tmpdirname, "model.onnx"),
+                os.path.join(tmpdirname, "opt.onnx"),
                 skipped_optimizers,
                 not skip_constant_folding,
                 not skip_shape_inference,
-                tensor_size_threshold,
+                tensor_size_threshold_bytes,
                 target_opset_version,
                 rewriter,
             )
             check_ok = model_checking.compare(
-                os.path.join(tmpdirname, 'opt.onnx'),
-                os.path.join(tmpdirname, 'model.onnx'),
-                check_n, test_input_shapes, input_data, custom_lib
+                os.path.join(tmpdirname, "opt.onnx"),
+                os.path.join(tmpdirname, "model.onnx"),
+                check_n,
+                test_input_shapes,
+                input_data,
+                custom_lib,
             )
-            model_opt = onnx.load(os.path.join(tmpdirname, 'opt.onnx'))
+            model_opt = onnx.load(os.path.join(tmpdirname, "opt.onnx"))
     _restore_doc_strings(model_opt, doc_strings)
     return model_opt, check_ok
 
@@ -590,7 +608,9 @@ class PyModelExecutor(C.ModelExecutor):
         # coerce any such value into an empty array instead of crashing with
         # "'list' object has no attribute 'shape'" (GitHub PR #249).
         return [
-            onnx.numpy_helper.from_array(x).SerializeToString() if isinstance(x, np.ndarray) else x
+            onnx.numpy_helper.from_array(x).SerializeToString()
+            if isinstance(x, np.ndarray)
+            else x
             for x in outputs.values()
         ]
 
@@ -629,6 +649,10 @@ class _GraphRewriterAdapter(C.GraphRewriter):
             return b""
         if rewritten is None:
             rewritten = model
+        # ``rewritten`` is now a ModelProto: the ``False`` (unchanged) and
+        # ``None`` (mutated in place) sentinels were handled above, and the
+        # rewriter contract permits no other non-model return.
+        assert not isinstance(rewritten, bool)
         return rewritten.SerializeToString()
 
 
@@ -683,7 +707,9 @@ def main():
         type=str,
         nargs="*",
     )
-    parser.add_argument("--skip-constant-folding", help="Skip constant folding", action="store_true")
+    parser.add_argument(
+        "--skip-constant-folding", help="Skip constant folding", action="store_true"
+    )
     parser.add_argument(
         "--input-shape",
         help="This argument has been renamed to --overwrite-input-shape, please refer to it",
@@ -745,7 +771,7 @@ def main():
         "--no-large-tensor",
         help="Some ops like Tile and ConstantOfShape can produce large tensor and make the model size much larger. Specifying this flag to skip folding these ops, with loss of some optimization chances. It can be followed with a threshold, for example, --no-large-tensor 1M or --no-large-tensor 100KB. A simple '--no-large-tensor' means '--no-large-tensor 1KB'.",
         type=str,
-        const='1KB',
+        const="1KB",
         default=DEFAULT_TENSOR_SIZE_THRESHOLDHOLD,
         nargs="?",
         dest="tensor_size_threshold",
@@ -754,24 +780,26 @@ def main():
         "--mutable-initializer",
         help="By ONNX specification, initializers can also serve as inputs. This allows users to overwrite their values during runtime, but some useful optimizations like fuse-conv-and-bn will not be applicable anymore. In almost all cases, having an initializer that is also an input is unintended (usually caused by a out-dated PyTorch). So onnxsim treats all initializers immutable to enabling all optimizations. If it is not wanted, you can specify '--mutable-initializer' to disable this behavior.",
         action="store_true",
-        )
+    )
     parser.add_argument(
         "--save-as-external-data",
         help="Save parameters as external data. This will make the .onnx file much smaller, but the .onnx file will depend on the external data file (.data).",
         action="store_true",
-        )
+    )
     parser.add_argument(
         "--skip-schema-import",
         help="By default onnxsim imports operator schemas registered in the Python 'onnx' module (e.g. via onnx.defs.register_schema) into its own registry so models with custom operators pass validation. Specify this flag to disable that import.",
         action="store_true",
-        )
+    )
     parser.add_argument(
         "--target-opset",
         help="Convert the model to this opset version (of the default ONNX domain) before simplifying, for example '--target-opset 18'. Can be used to upgrade (or downgrade) the model's opset during simplification.",
         type=int,
         default=None,
-        )
-    parser.add_argument('-v', '--version', action='version', version='onnxsim ' + version.version)
+    )
+    parser.add_argument(
+        "-v", "--version", action="version", version="onnxsim " + version.version
+    )
 
     class ListOptimizers(argparse.Action):
         def __call__(self, parser, ns, v, option_string=None):
@@ -779,7 +807,12 @@ def main():
                 print(p)
             parser.exit()
 
-    parser.add_argument("--list-default-optimizers", help="List default optimizer pass names", nargs=0, action=ListOptimizers)
+    parser.add_argument(
+        "--list-default-optimizers",
+        help="List default optimizer pass names",
+        nargs=0,
+        action=ListOptimizers,
+    )
 
     args = parser.parse_args()
 
@@ -838,13 +871,15 @@ def main():
         shapes = {}
         if shapes_arg is not None:
             for x in shapes_arg:
-                if ':' not in x:
-                    shapes[None] = list(map(int, x.split(',')))
+                if ":" not in x:
+                    shapes[None] = list(map(int, x.split(",")))
                 else:
-                    pieces = x.split(':')
+                    pieces = x.split(":")
                     # for the input name like input:0
-                    name, shape = ':'.join(
-                        pieces[:-1]), list(map(int, pieces[-1].split(',')))
+                    name, shape = (
+                        ":".join(pieces[:-1]),
+                        list(map(int, pieces[-1].split(","))),
+                    )
                     shapes.update({name: shape})
         return shapes
 
@@ -862,10 +897,14 @@ def main():
         tmp_file = tempfile.NamedTemporaryFile()
         sess_options = rt.SessionOptions()
         # Set graph optimization level
-        sess_options.graph_optimization_level = rt.GraphOptimizationLevel.ORT_ENABLE_BASIC
+        sess_options.graph_optimization_level = (
+            rt.GraphOptimizationLevel.ORT_ENABLE_BASIC
+        )
         # To enable model serialization after graph optimization
         sess_options.optimized_model_filepath = tmp_file.name
-        _ = rt.InferenceSession(args.input_model, sess_options, providers=["CPUExecutionProvider"])
+        _ = rt.InferenceSession(
+            args.input_model, sess_options, providers=["CPUExecutionProvider"]
+        )
 
         # ``tmp_file`` stays referenced (and thus on disk) until ``main`` returns,
         # so ``simplify`` can load it below.
@@ -908,8 +947,8 @@ def main():
     if args.input_data_path is not None:
         input_tensors = {}
         for x in args.input_data_path:
-            pieces = x.split(':')
-            name, data = ':'.join(pieces[:-1]), pieces[-1]
+            pieces = x.split(":")
+            name, data = ":".join(pieces[:-1]), pieces[-1]
             input_tensors.update({name: np.load(data)})
 
     print("Simplifying...")
@@ -943,7 +982,7 @@ def main():
     except ValueError:
         # large models (>2GB) which onnx.save doesn't support,
         # or explicitly specified --save-as-external-data
-        external_data_path = os.path.basename(args.output_model) + '.data'
+        external_data_path = os.path.basename(args.output_model) + ".data"
         if os.path.exists(external_data_path):
             os.remove(external_data_path)
         onnx.save(

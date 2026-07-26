@@ -277,16 +277,16 @@ std::vector<onnx::TensorProto> RunOp(
   std::vector<onnx::TensorProto> input_tps;
   std::set<std::string> initializer_names;
 
-  // Build the throwaway sub-model on an arena. RunOp is called once per foldable
-  // node -- often thousands of times across a fixed-point run -- and each call
-  // copies initializers and nodes into `op_model`, so the message is a deep tree
-  // of nested sub-messages (NodeProto, TensorProto, ValueInfoProto, dims, ...).
-  // Without an arena, destroying it walks that whole tree freeing each
-  // sub-message individually; on an arena the entire tree is released in one
-  // bulk free when `arena` goes out of scope. `CreateMessage` (rather than
+  // Build the throwaway sub-model on an arena. RunOp is called once per
+  // foldable node -- often thousands of times across a fixed-point run -- and
+  // each call copies initializers and nodes into `op_model`, so the message is
+  // a deep tree of nested sub-messages (NodeProto, TensorProto, ValueInfoProto,
+  // dims, ...). Without an arena, destroying it walks that whole tree freeing
+  // each sub-message individually; on an arena the entire tree is released in
+  // one bulk free when `arena` goes out of scope. `CreateMessage` (rather than
   // `Create`) is used so the arena pointer propagates to every `add_*`/
-  // `mutable_*` sub-message -- that propagation is what makes the teardown cheap,
-  // and it is the form that works down to the protobuf 3.7 floor in
+  // `mutable_*` sub-message -- that propagation is what makes the teardown
+  // cheap, and it is the form that works down to the protobuf 3.7 floor in
   // requirements.txt. The sub-model is strictly local: it is never Swap'd or
   // moved into `model`, and the executor returns its outputs in a separate
   // std::vector that does not live on this arena, so the arena can be torn down
@@ -666,10 +666,11 @@ void _EvalPartialShape(onnx::ModelProto& model) {
   // snapshot those annotations and restore them on the paths that fold nothing,
   // leaving the model byte-for-byte unchanged (the old code returned the
   // untouched input there). The snapshot is metadata only -- no tensor weights
-  // -- so it is cheap, unlike the full-model ``CopyFrom`` it replaces. Restoring
-  // also keeps this pass's data-propagation value_info out of the model, which
-  // matters: it differs from the regular shape-inference pass's value_info, and
-  // leaving it behind could make the outer fixed point oscillate.
+  // -- so it is cheap, unlike the full-model ``CopyFrom`` it replaces.
+  // Restoring also keeps this pass's data-propagation value_info out of the
+  // model, which matters: it differs from the regular shape-inference pass's
+  // value_info, and leaving it behind could make the outer fixed point
+  // oscillate.
   auto saved_value_info = model.graph().value_info();
   auto saved_output = model.graph().output();
   auto restore = [&]() {
@@ -682,8 +683,8 @@ void _EvalPartialShape(onnx::ModelProto& model) {
     const onnx::ShapeInferenceOptions options(/*check_type=*/false,
                                               /*error_mode=*/0,
                                               /*enable_data_propagation=*/true);
-    onnx::shape_inference::InferShapes(model, onnx::OpSchemaRegistry::Instance(),
-                                       options, &data_map);
+    onnx::shape_inference::InferShapes(
+        model, onnx::OpSchemaRegistry::Instance(), options, &data_map);
   } catch (const std::exception&) {
     // If shape inference fails we simply have no propagated values to exploit.
     restore();
@@ -1035,8 +1036,9 @@ onnx::ModelProto _FoldConstant(const ModelExecutor& executor,
           folded_outputs.insert(output);
         }
       } catch (const std::exception& e) {
-        std::cerr << "WARNING: failed to run \"" << x.op_type() <<
-          "\" op (name is \"" << x.name() << "\"), skip... " << e.what() << std::endl;
+        std::cerr << "WARNING: failed to run \"" << x.op_type()
+                  << "\" op (name is \"" << x.name() << "\"), skip... "
+                  << e.what() << std::endl;
       }
     }
     // Rebuild the node list in its original topological order, dropping only
@@ -1048,8 +1050,8 @@ onnx::ModelProto _FoldConstant(const ModelExecutor& executor,
     google::protobuf::RepeatedPtrField<onnx::NodeProto> original_nodes;
     original_nodes.Swap(model.mutable_graph()->mutable_node());
     for (auto& node : original_nodes) {
-      const bool folded = node.output_size() > 0 &&
-                          folded_outputs.count(node.output(0)) > 0;
+      const bool folded =
+          node.output_size() > 0 && folded_outputs.count(node.output(0)) > 0;
       if (!folded) {
         *model.mutable_graph()->add_node() = std::move(node);
       }
@@ -1096,8 +1098,8 @@ ModelFingerprint Fingerprint(const onnx::ModelProto& model) {
 }
 
 // Alternately apply ``f1`` and ``f2`` until the model stops changing (a joint
-// fixed point) or ``max_iters`` alternations elapse. Each application produces a
-// fresh model, so ``model`` is move-assigned in place and only a single
+// fixed point) or ``max_iters`` alternations elapse. Each application produces
+// a fresh model, so ``model`` is move-assigned in place and only a single
 // ModelProto is held live across the loop; convergence is detected by comparing
 // the fingerprints of consecutive states rather than keeping the previous
 // ModelProto for a ``MessageDifferencer::Equals`` call. This mirrors the
@@ -1183,10 +1185,12 @@ void CollectCustomDefaultDomainOps(const onnx::GraphProto& graph,
     // Recurse into subgraphs held in node attributes (If/Loop/Scan bodies).
     for (const auto& attr : node.attribute()) {
       if (attr.has_g()) {
-        CollectCustomDefaultDomainOps(attr.g(), default_opset_version, custom_ops);
+        CollectCustomDefaultDomainOps(attr.g(), default_opset_version,
+                                      custom_ops);
       }
       for (const auto& subgraph : attr.graphs()) {
-        CollectCustomDefaultDomainOps(subgraph, default_opset_version, custom_ops);
+        CollectCustomDefaultDomainOps(subgraph, default_opset_version,
+                                      custom_ops);
       }
     }
   }
@@ -1210,7 +1214,8 @@ void RegisterCustomDefaultDomainOpSchemas(const onnx::ModelProto& model) {
   }
 
   std::set<std::string> custom_ops;
-  CollectCustomDefaultDomainOps(model.graph(), default_opset_version, custom_ops);
+  CollectCustomDefaultDomainOps(model.graph(), default_opset_version,
+                                custom_ops);
 
   for (const auto& op_type : custom_ops) {
     onnx::OpSchema schema;
@@ -1219,7 +1224,8 @@ void RegisterCustomDefaultDomainOpSchemas(const onnx::ModelProto& model) {
         .SinceVersion(1)
         .SetDoc(
             "Placeholder schema registered by onnxsim for a custom operator "
-            "(e.g. a TensorRT plugin) exported into the default ONNX domain, so "
+            "(e.g. a TensorRT plugin) exported into the default ONNX domain, "
+            "so "
             "that the model passes validation and is simplified with the "
             "operator preserved unchanged.")
         .Input(0, "inputs", "Variadic inputs of the custom operator.", "T",
@@ -1233,8 +1239,8 @@ void RegisterCustomDefaultDomainOpSchemas(const onnx::ModelProto& model) {
         // Custom ops carry arbitrary, plugin-specific attributes; accept them
         // all rather than trying to enumerate them.
         .AllowUncheckedAttributes();
-    // Never fail or throw: a duplicate registration (e.g. simplifying two models
-    // that use the same custom op in one process) is a harmless no-op.
+    // Never fail or throw: a duplicate registration (e.g. simplifying two
+    // models that use the same custom op in one process) is a harmless no-op.
     onnx::RegisterSchema(std::move(schema), /*opset_version_to_load=*/1,
                          /*fail_duplicate_schema=*/false,
                          /*fail_with_exception=*/false);
@@ -1410,15 +1416,14 @@ onnx::ModelProto Simplify(
     ModelFn OptAndShapeAndFold =
         FixedPointFn(OptAndShape, FoldConstant, fixed_point_iters);
     ModelFn RewriteInPlace = [rewriter](onnx::ModelProto& model) {
-      // ``_Run`` rewrites in place and returns whether it changed anything; when
-      // it reports no change it leaves ``model`` untouched, so no copy is made.
-      // The fixed point's fingerprint comparison then sees the unchanged model
-      // and converges without an extra ModelProto round-trip.
+      // ``_Run`` rewrites in place and returns whether it changed anything;
+      // when it reports no change it leaves ``model`` untouched, so no copy is
+      // made. The fixed point's fingerprint comparison then sees the unchanged
+      // model and converges without an extra ModelProto round-trip.
       rewriter->_Run(model);
     };
-    Pipeline =
-        FixedPointFn(OptAndShapeAndFold, RewriteInPlace, fixed_point_iters,
-                     &converged);
+    Pipeline = FixedPointFn(OptAndShapeAndFold, RewriteInPlace,
+                            fixed_point_iters, &converged);
   } else {
     Pipeline =
         FixedPointFn(OptAndShape, FoldConstant, fixed_point_iters, &converged);

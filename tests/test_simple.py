@@ -1,12 +1,13 @@
+import os
 import tempfile
-import torch
+from typing import Optional
+
 import onnx
 import onnxruntime
-import onnxsim
-import os
+import torch
+from onnx import TensorProto, helper, numpy_helper
 
-from onnx import helper, numpy_helper, TensorProto
-from typing import Optional
+import onnxsim
 from onnxsim.test_utils import export_simplify_and_check_by_python_api
 
 
@@ -24,7 +25,6 @@ def test_onnx_simplifier():
 
 def test_mg():
     class MG(torch.nn.Module):
-
         def __init__(self):
             super().__init__()
 
@@ -41,10 +41,17 @@ def test_mg():
 
     x = torch.randn([1, 256, 160, 184])
     b = torch.randn([100, 256, 1, 1])
-    opt = export_simplify_and_check_by_python_api(MG(), (x, b), export_kwargs={"dynamo": True})
-    sess = onnxruntime.InferenceSession(opt.SerializeToString(), providers=["CPUExecutionProvider"])
+    opt = export_simplify_and_check_by_python_api(
+        MG(), (x, b), export_kwargs={"dynamo": True}
+    )
+    sess = onnxruntime.InferenceSession(
+        opt.SerializeToString(), providers=["CPUExecutionProvider"]
+    )
     out_names = [i.name for i in sess.get_outputs()]
-    outs = sess.run(out_names, { opt.graph.input[0].name: x.numpy(), opt.graph.input[1].name: b.numpy() })
+    outs = sess.run(
+        out_names,
+        {opt.graph.input[0].name: x.numpy(), opt.graph.input[1].name: b.numpy()},
+    )
     assert outs[0].shape == MG()(x, b).shape
 
 
@@ -55,15 +62,18 @@ def test_transformer():
         num_encoder_layers=3,
         num_decoder_layers=3,
         dim_feedforward=1024,
-        dropout=0.1)
-    model.to('cpu').to(torch.float32)
+        dropout=0.1,
+    )
+    model.to("cpu").to(torch.float32)
     model.eval()
 
     inputs = (
         torch.rand((100, 2, 256), dtype=torch.float32),
         torch.rand((15, 2, 256), dtype=torch.float32),
     )
-    export_simplify_and_check_by_python_api(model, inputs, export_kwargs={"dynamo": True})
+    export_simplify_and_check_by_python_api(
+        model, inputs, export_kwargs={"dynamo": True}
+    )
 
 
 def test_upsample():
@@ -87,16 +97,19 @@ def test_upsample():
         def forward(self, x):
             x1 = F.relu(self.bn1(self.conv1_2(F.relu(self.conv1_1(x)))))
             x2 = self.maxpool(x1)
-            xup = F.interpolate(x2, scale_factor=2, mode='bilinear', align_corners=False)
+            xup = F.interpolate(
+                x2, scale_factor=2, mode="bilinear", align_corners=False
+            )
             x3 = self.bn2(self.conv2_2(F.relu(self.conv2_1(xup))))
             x4 = F.relu(self.conv3_3(self.conv3_2(F.relu(self.conv3_1(x3)))))
             x5 = self.bn3(x4)
             return F.softsign(x5)
 
-
     inp = torch.rand(1, 3, 96, 96)
     net = Net()
-    opt = export_simplify_and_check_by_python_api(net, (inp,), export_kwargs={"opset_version": 9})
+    opt = export_simplify_and_check_by_python_api(
+        net, (inp,), export_kwargs={"opset_version": 9}
+    )
 
     u_out = None
     for n in opt.graph.node:
@@ -116,9 +129,13 @@ def test_concat_squeese():
     class Model(torch.nn.Module):
         def forward(self, x):
             # return torch.cat((torch.mean(x, 1, keepdim=True), torch.mean(x, 1, keepdim=True)), dim=1)
-            return torch.cat((torch.mean(x, 1).unsqueeze(1), torch.mean(x, 1).unsqueeze(1)), dim=1)
+            return torch.cat(
+                (torch.mean(x, 1).unsqueeze(1), torch.mean(x, 1).unsqueeze(1)), dim=1
+            )
 
-    export_simplify_and_check_by_python_api(Model(), (torch.rand(20, 20),), export_kwargs={"opset_version": 9})
+    export_simplify_and_check_by_python_api(
+        Model(), (torch.rand(20, 20),), export_kwargs={"opset_version": 9}
+    )
 
 
 def test_trilinear():
@@ -127,7 +144,9 @@ def test_trilinear():
             super(Model, self).__init__()
 
         def forward(self, input_tensor):
-            return torch.nn.functional.interpolate(input_tensor, scale_factor=[4, 4, 4], mode='trilinear')
+            return torch.nn.functional.interpolate(
+                input_tensor, scale_factor=[4, 4, 4], mode="trilinear"
+            )
 
     x = torch.rand(1, 8, 20, 120, 120)
     opt = export_simplify_and_check_by_python_api(
@@ -136,10 +155,13 @@ def test_trilinear():
         export_kwargs={
             "opset_version": 11,
             "export_params": True,
-        })
-    sess = onnxruntime.InferenceSession(opt.SerializeToString(), providers=["CPUExecutionProvider"])
+        },
+    )
+    sess = onnxruntime.InferenceSession(
+        opt.SerializeToString(), providers=["CPUExecutionProvider"]
+    )
     out_names = [i.name for i in sess.get_outputs()]
-    outs = sess.run(out_names, { opt.graph.input[0].name: x.numpy() })
+    outs = sess.run(out_names, {opt.graph.input[0].name: x.numpy()})
     assert outs[0].shape == (1, 8, 80, 480, 480)
 
 
@@ -155,7 +177,8 @@ def test_optional_type():
         module,
         inputs,
         simplify_kwargs={"input_data": {"i": inputs[0].numpy()}},
-        export_kwargs={"opset_version": 15, "input_names": ["i"]})
+        export_kwargs={"opset_version": 15, "input_names": ["i"]},
+    )
 
 
 def test_ext():
@@ -163,7 +186,9 @@ def test_ext():
         def __init__(self):
             super().__init__()
 
-            self.param = torch.nn.Parameter(torch.rand(1024, 1024, 1024, dtype=torch.float16))
+            self.param = torch.nn.Parameter(
+                torch.rand(1024, 1024, 1024, dtype=torch.float16)
+            )
 
         def forward(self, x):
             return self.param * x
@@ -174,7 +199,6 @@ def test_ext():
     with tempfile.TemporaryDirectory() as tmpdirname:
         model_fn = os.path.join(tmpdirname, "tmp.onnx")
         torch.onnx.export(module, inputs, model_fn, dynamo=False, input_names=["x"])
-        model = onnx.load(model_fn)
         sim_model, check_ok = onnxsim.simplify(model_fn, check_n=0)
         module = None
         assert check_ok
@@ -390,7 +414,9 @@ def test_fp8_qdq_modelopt_integration():
         return helper.make_tensor(name, TensorProto.FLOAT8E4M3FN, [], b"\x00", raw=True)
 
     conv_w = helper.make_tensor(
-        "conv_w", TensorProto.FLOAT, [8, 3, 3, 3],
+        "conv_w",
+        TensorProto.FLOAT,
+        [8, 3, 3, 3],
         [0.01 * (i % 7 - 3) for i in range(8 * 3 * 3 * 3)],
     )
     gemm_w = helper.make_tensor(
@@ -407,16 +433,26 @@ def test_fp8_qdq_modelopt_integration():
         helper.make_node("DequantizeLinear", ["Xq", "act_scale", "a_zp"], ["Xdq"]),
         # weight QDQ (constant). ModelOpt duplicates fp8 zero points across
         # weights, which is what tripped eliminate_duplicate_initializer.
-        helper.make_node("QuantizeLinear", ["conv_w", "conv_w_scale", "cw_zp"], ["cwq"]),
-        helper.make_node("DequantizeLinear", ["cwq", "conv_w_scale", "cw_zp2"], ["cwdq"]),
+        helper.make_node(
+            "QuantizeLinear", ["conv_w", "conv_w_scale", "cw_zp"], ["cwq"]
+        ),
+        helper.make_node(
+            "DequantizeLinear", ["cwq", "conv_w_scale", "cw_zp2"], ["cwdq"]
+        ),
         helper.make_node("Conv", ["Xdq", "cwdq"], ["conv_out"], kernel_shape=[3, 3]),
         helper.make_node("GlobalAveragePool", ["conv_out"], ["pooled"]),
         helper.make_node("Flatten", ["pooled"], ["flat"], axis=1),
         # second activation QDQ + weight QDQ feeding a Gemm.
         helper.make_node("QuantizeLinear", ["flat", "act_scale2", "a_zp2"], ["flatq"]),
-        helper.make_node("DequantizeLinear", ["flatq", "act_scale2", "a_zp2"], ["flatdq"]),
-        helper.make_node("QuantizeLinear", ["gemm_w", "gemm_w_scale", "gw_zp"], ["gwq"]),
-        helper.make_node("DequantizeLinear", ["gwq", "gemm_w_scale", "gw_zp2"], ["gwdq"]),
+        helper.make_node(
+            "DequantizeLinear", ["flatq", "act_scale2", "a_zp2"], ["flatdq"]
+        ),
+        helper.make_node(
+            "QuantizeLinear", ["gemm_w", "gemm_w_scale", "gw_zp"], ["gwq"]
+        ),
+        helper.make_node(
+            "DequantizeLinear", ["gwq", "gemm_w_scale", "gw_zp2"], ["gwdq"]
+        ),
         helper.make_node("Gemm", ["flatdq", "gwdq"], ["Y"], transB=1),
     ]
     graph = helper.make_graph(
@@ -425,10 +461,18 @@ def test_fp8_qdq_modelopt_integration():
         [helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, 3, 6, 6])],
         [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, 8])],
         [
-            conv_w, gemm_w, conv_ws, gemm_ws, act_s, act_s2,
-            fp8_zero_point("a_zp"), fp8_zero_point("a_zp2"),
-            fp8_zero_point("cw_zp"), fp8_zero_point("cw_zp2"),
-            fp8_zero_point("gw_zp"), fp8_zero_point("gw_zp2"),
+            conv_w,
+            gemm_w,
+            conv_ws,
+            gemm_ws,
+            act_s,
+            act_s2,
+            fp8_zero_point("a_zp"),
+            fp8_zero_point("a_zp2"),
+            fp8_zero_point("cw_zp"),
+            fp8_zero_point("cw_zp2"),
+            fp8_zero_point("gw_zp"),
+            fp8_zero_point("gw_zp2"),
         ],
     )
     model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 21)])
@@ -462,19 +506,28 @@ def test_if_with_const_cond_is_folded():
     tv = helper.make_tensor("tv", TensorProto.FLOAT, [2], [1.0, 2.0])
     fv = helper.make_tensor("fv", TensorProto.FLOAT, [2], [3.0, 4.0])
     then_b = helper.make_graph(
-        [helper.make_node("Constant", [], ["to"], value=tv)], "tb", [],
-        [helper.make_tensor_value_info("to", TensorProto.FLOAT, [2])])
+        [helper.make_node("Constant", [], ["to"], value=tv)],
+        "tb",
+        [],
+        [helper.make_tensor_value_info("to", TensorProto.FLOAT, [2])],
+    )
     else_b = helper.make_graph(
-        [helper.make_node("Constant", [], ["fo"], value=fv)], "fb", [],
-        [helper.make_tensor_value_info("fo", TensorProto.FLOAT, [2])])
+        [helper.make_node("Constant", [], ["fo"], value=fv)],
+        "fb",
+        [],
+        [helper.make_tensor_value_info("fo", TensorProto.FLOAT, [2])],
+    )
     if_node = helper.make_node(
-        "If", ["c"], ["Y"], then_branch=then_b, else_branch=else_b)
+        "If", ["c"], ["Y"], then_branch=then_b, else_branch=else_b
+    )
     graph = helper.make_graph(
-        [if_node], "g", [],
+        [if_node],
+        "g",
+        [],
         [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [2])],
-        [helper.make_tensor("c", TensorProto.BOOL, [], [True])])
-    model = helper.make_model(
-        graph, opset_imports=[helper.make_opsetid("", 13)])
+        [helper.make_tensor("c", TensorProto.BOOL, [], [True])],
+    )
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
     onnx.checker.check_model(model)
 
     sim_model, check_ok = onnxsim.simplify(model)

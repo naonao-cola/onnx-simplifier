@@ -1,10 +1,10 @@
 #pragma once
 
+#include <onnx/onnx_pb.h>
+
 #include <memory>
 #include <optional>
 #include <vector>
-
-#include <onnx/onnx_pb.h>
 
 struct ModelExecutor {
   virtual ~ModelExecutor() = default;
@@ -15,8 +15,9 @@ struct ModelExecutor {
       const std::vector<onnx::TensorProto>& inputs) const = 0;
 };
 
-// A user-supplied whole-graph rewriter. When one is passed to ``Simplify`` it is
-// run inside the simplification fixed point, letting Python code (for example an
+// A user-supplied whole-graph rewriter. When one is passed to ``Simplify`` it
+// is run inside the simplification fixed point, letting Python code (for
+// example an
 // ``onnxscript.rewriter`` rule set) rewrite the model between the optimizer and
 // constant-folding rounds so a rewrite can unlock further simplification and
 // vice versa. Passing ``nullptr`` (the default) leaves simplification behaviour

@@ -1,0 +1,57 @@
+name: Lint
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  # Format + lint + type-check the Python sources. Tools are pinned so a local
+  # run reports exactly what CI does; bump the pins here to upgrade everywhere.
+  python:
+    name: ruff + mypy (Python)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.10"
+      - name: Install tools
+        run: |
+          python -m pip install --upgrade pip
+          pip install ruff==0.14.0 mypy==1.18.2
+          # Third-party deps (onnx, numpy, rich, sympy) and the compiled
+          # extension are intentionally not installed: mypy treats them as Any
+          # via ignore_missing_imports, so this checks our own code's internal
+          # consistency and stays stable across dependency upgrades rather than
+          # breaking on incomplete upstream stubs.
+      - name: ruff format --check
+        run: ruff format --check onnxsim tests
+      - name: ruff check (lint)
+        run: ruff check onnxsim tests
+      - name: mypy (type check)
+        run: mypy
+
+  # Check C/C++ formatting. clang-format is installed from the PyPI wheel so its
+  # version is pinned and identical across machines (apt/system clang-format
+  # versions differ and would disagree on the output).
+  clang-format:
+    name: clang-format (C/C++)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.x"
+      - name: Install clang-format
+        run: pip install clang-format==18.1.8
+      - name: clang-format --dry-run --Werror
+        run: |
+          # Every tracked C/C++ source except the vendored cxxopts single header.
+          files=$(git ls-files 'onnxsim/**.cpp' 'onnxsim/**.cc' 'onnxsim/**.h' 'onnxsim/**.hpp' ':!:onnxsim/cxxopts.hpp')
+          echo "Checking:"
+          echo "${files}"
+          clang-format --style=file:onnxsim/.clang-format --dry-run --Werror ${files}

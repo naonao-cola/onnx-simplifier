@@ -15,12 +15,14 @@ The final section holds ``xfail`` tests for optimizations OnnxSlim performs but
 onnxsim currently does not (e.g. ConvTranspose fusion, GELU fusion, no-op Dropout
 removal). They document the gap and will XPASS if onnxsim ever gains the pass.
 """
+
 import collections
 
 import numpy as np
 import onnx
-import onnxsim
 import pytest
+
+import onnxsim
 
 
 def _simplify(model):
@@ -35,7 +37,8 @@ def _model(nodes, inputs, outputs, initializer, opset=13):
     # bundled with some CI wheels (which cap at IR version 11); onnxsim's
     # check_n runs the model through onnxruntime.
     return onnx.helper.make_model(
-        graph, opset_imports=[onnx.helper.make_opsetid("", opset)], ir_version=10)
+        graph, opset_imports=[onnx.helper.make_opsetid("", opset)], ir_version=10
+    )
 
 
 def _vi(name, shape):
@@ -65,9 +68,11 @@ def test_fuse_conv_bn_into_conv():
     ]
     nodes = [
         onnx.helper.make_node(
-            "Conv", ["X", "W"], ["c"], kernel_shape=[3, 3], pads=[1, 1, 1, 1]),
+            "Conv", ["X", "W"], ["c"], kernel_shape=[3, 3], pads=[1, 1, 1, 1]
+        ),
         onnx.helper.make_node(
-            "BatchNormalization", ["c", "scale", "bias", "mean", "var"], ["Y"]),
+            "BatchNormalization", ["c", "scale", "bias", "mean", "var"], ["Y"]
+        ),
     ]
     model = _model(nodes, [_vi("X", [1, 3, 16, 16])], [_vi("Y", [1, 8, 16, 16])], inits)
     _, ops = _simplify(model)
@@ -227,7 +232,8 @@ def test_eliminate_common_subexpression():
 # --------------------------------------------------------------------------- #
 def _simplify_no_large_tensor(model):
     sim_model, check_ok = onnxsim.simplify(
-        model, check_n=3, tensor_size_threshold="1KB")
+        model, check_n=3, tensor_size_threshold="1KB"
+    )
     assert check_ok, "simplified model failed onnxsim's equivalence check"
     return sim_model, collections.Counter(n.op_type for n in sim_model.graph.node)
 
@@ -239,11 +245,9 @@ def test_defer_constantofshape_folds_small_consumer():
     # together; the scalar feeds a runtime Add. The large tensor is never stored
     # and the ConstantOfShape/ReduceSum chain disappears.
     inits = [_i64([256, 256], "shape")]
-    value = onnx.helper.make_tensor(
-        "value", onnx.TensorProto.FLOAT, [1], [2.0])
+    value = onnx.helper.make_tensor("value", onnx.TensorProto.FLOAT, [1], [2.0])
     nodes = [
-        onnx.helper.make_node(
-            "ConstantOfShape", ["shape"], ["big"], value=value),
+        onnx.helper.make_node("ConstantOfShape", ["shape"], ["big"], value=value),
         onnx.helper.make_node("ReduceSum", ["big"], ["s"], keepdims=0),
         onnx.helper.make_node("Add", ["X", "s"], ["Y"]),
     ]
@@ -255,7 +259,8 @@ def test_defer_constantofshape_folds_small_consumer():
     # No large intermediate tensor was materialized as an initializer.
     assert all(
         onnx.numpy_helper.to_array(init).size < 256 * 256
-        for init in sim_model.graph.initializer)
+        for init in sim_model.graph.initializer
+    )
 
 
 def test_defer_constant_expand_folds_small_consumer():
@@ -266,8 +271,7 @@ def test_defer_constant_expand_folds_small_consumer():
     # Expand+ReduceSum together, and the scalar feeds a runtime Add, so the whole
     # constant chain collapses without ever storing the expanded tensor.
     inits = [_i64([512, 512], "eshape")]
-    scalar = onnx.helper.make_tensor(
-        "c", onnx.TensorProto.FLOAT, [1, 1], [3.0])
+    scalar = onnx.helper.make_tensor("c", onnx.TensorProto.FLOAT, [1, 1], [3.0])
     nodes = [
         onnx.helper.make_node("Constant", [], ["small"], value=scalar),
         onnx.helper.make_node("Expand", ["small", "eshape"], ["big"]),
@@ -282,7 +286,8 @@ def test_defer_constant_expand_folds_small_consumer():
     assert ops["Add"] == 1
     assert all(
         onnx.numpy_helper.to_array(init).size < 512 * 512
-        for init in sim_model.graph.initializer)
+        for init in sim_model.graph.initializer
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -294,7 +299,8 @@ def test_defer_constant_expand_folds_small_consumer():
 # --------------------------------------------------------------------------- #
 @pytest.mark.xfail(
     reason="onnxsim does not eliminate a no-op Dropout (ratio=0); OnnxSlim does",
-    strict=False)
+    strict=False,
+)
 def test_eliminate_nop_dropout():
     inits = [onnx.numpy_helper.from_array(np.array(0.0, dtype=np.float32), "ratio")]
     nodes = [
@@ -309,8 +315,9 @@ def test_eliminate_nop_dropout():
 
 @pytest.mark.xfail(
     reason="onnxoptimizer only folds BatchNorm into Conv, not ConvTranspose; "
-           "OnnxSlim fuses ConvTranspose+BN",
-    strict=False)
+    "OnnxSlim fuses ConvTranspose+BN",
+    strict=False,
+)
 def test_fuse_convtranspose_bn():
     inits = [
         _f32(np.random.randn(3, 8, 3, 3), "W"),  # ConvTranspose: [Cin, Cout, kH, kW]
@@ -322,7 +329,8 @@ def test_fuse_convtranspose_bn():
     nodes = [
         onnx.helper.make_node("ConvTranspose", ["X", "W"], ["c"], kernel_shape=[3, 3]),
         onnx.helper.make_node(
-            "BatchNormalization", ["c", "scale", "bias", "mean", "var"], ["Y"]),
+            "BatchNormalization", ["c", "scale", "bias", "mean", "var"], ["Y"]
+        ),
     ]
     model = _model(nodes, [_vi("X", [1, 3, 8, 8])], [_vi("Y", [1, 8, 10, 10])], inits)
     _, ops = _simplify(model)
@@ -332,7 +340,8 @@ def test_fuse_convtranspose_bn():
 
 @pytest.mark.xfail(
     reason="onnxsim has no ConvTranspose+Add bias fusion; OnnxSlim fuses it",
-    strict=False)
+    strict=False,
+)
 def test_fuse_convtranspose_add():
     inits = [
         _f32(np.random.randn(3, 8, 3, 3), "W"),
@@ -350,8 +359,9 @@ def test_fuse_convtranspose_add():
 
 @pytest.mark.xfail(
     reason="onnxsim has no GELU subgraph fusion; OnnxSlim ships a (currently "
-           "disabled) FusionGelu matcher for this exact pattern",
-    strict=False)
+    "disabled) FusionGelu matcher for this exact pattern",
+    strict=False,
+)
 def test_fuse_gelu():
     # 0.5 * x * (1 + erf(x / sqrt(2))) is the exact-erf GELU formulation.
     inits = [

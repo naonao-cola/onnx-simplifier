@@ -208,8 +208,10 @@ void RegisterAll() {
 
   RegisterIfAbsent(MakeQLinearBinarySchema("QLinearAdd"));
   RegisterIfAbsent(MakeQLinearBinarySchema("QLinearMul"));
-  RegisterIfAbsent(MakeQLinearUnarySchema("QLinearSigmoid", /*has_alpha=*/false));
-  RegisterIfAbsent(MakeQLinearUnarySchema("QLinearLeakyRelu", /*has_alpha=*/true));
+  RegisterIfAbsent(
+      MakeQLinearUnarySchema("QLinearSigmoid", /*has_alpha=*/false));
+  RegisterIfAbsent(
+      MakeQLinearUnarySchema("QLinearLeakyRelu", /*has_alpha=*/true));
   RegisterIfAbsent(MakeQLinearConcatSchema());
 }
 

@@ -1,10 +1,15 @@
+import os
+import tempfile
 from typing import Any, Callable, Dict, Optional
 
 import onnx
-import onnxsim
-import os
 import torch
-import tempfile
+
+import onnxsim
+
+
+def _always_valid(_: Any) -> bool:
+    return True
 
 
 def export_simplify_and_check_by_python_api(
@@ -16,15 +21,15 @@ def export_simplify_and_check_by_python_api(
     simplify_kwargs: Optional[Dict[str, Any]] = None,
 ) -> onnx.ModelProto:
     if is_model_valid is None:
-        is_model_valid = lambda _: True
+        is_model_valid = _always_valid
     if export_kwargs is None:
         export_kwargs = {}
     if simplify_kwargs is None:
         simplify_kwargs = {}
     # Use legacy TorchScript-based exporter (dynamo=False) for ScriptModule support
     # PyTorch 2.9+ defaults to dynamo=True which doesn't support ScriptModule
-    if 'dynamo' not in export_kwargs:
-        export_kwargs['dynamo'] = False
+    if "dynamo" not in export_kwargs:
+        export_kwargs["dynamo"] = False
     with tempfile.TemporaryDirectory() as tmpdirname:
         model_fn = os.path.join(tmpdirname, "tmp.onnx")
         torch.onnx.export(m, input, model_fn, **export_kwargs)
