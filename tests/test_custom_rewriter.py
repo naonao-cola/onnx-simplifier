@@ -51,7 +51,12 @@ def _op_types(model):
 
 
 def test_custom_rewriter_runs_and_rewrites():
-    """A plain-Python rewriter that renames every Relu to a Gelu is applied."""
+    """A plain-Python rewriter that renames every Relu to a Sigmoid is applied.
+
+    Sigmoid is chosen because, like Relu, it is a single-input/single-output
+    elementwise op valid in opset 13, so the rewritten model stays schema-valid
+    (unlike, say, Gelu, which is only registered from opset 20).
+    """
     model = _model(
         [onnx.helper.make_node("Relu", ["x"], ["y"], name="r")],
         [_vi("x", [2, 2])],
@@ -62,11 +67,11 @@ def test_custom_rewriter_runs_and_rewrites():
     def rewrite(m: onnx.ModelProto) -> onnx.ModelProto:
         for node in m.graph.node:
             if node.op_type == "Relu":
-                node.op_type = "Gelu"
+                node.op_type = "Sigmoid"
         return m
 
     sim_model, _ = onnxsim.simplify(model, check_n=0, custom_rewriter=rewrite)
-    assert _op_types(sim_model)["Gelu"] == 1
+    assert _op_types(sim_model)["Sigmoid"] == 1
     assert _op_types(sim_model)["Relu"] == 0
 
 
@@ -82,11 +87,11 @@ def test_custom_rewriter_in_place_none_return():
     def rewrite(m: onnx.ModelProto) -> None:
         for node in m.graph.node:
             if node.op_type == "Relu":
-                node.op_type = "Gelu"
+                node.op_type = "Sigmoid"
         # no return
 
     sim_model, _ = onnxsim.simplify(model, check_n=0, custom_rewriter=rewrite)
-    assert _op_types(sim_model)["Gelu"] == 1
+    assert _op_types(sim_model)["Sigmoid"] == 1
 
 
 def test_custom_rewriter_none_is_noop():
