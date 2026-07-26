@@ -27,8 +27,12 @@ coverage-report/cpp.xml          Cobertura XML  (C++)
 coverage-report/cpp.html         HTML           (C++)
 ```
 
-Both XML files are Cobertura, so a single Codecov/Coveralls/Sonar upload can
-ingest them together for one unified C++/Python view.
+Both XML files are Cobertura, which most coverage viewers accept. In CI
+(`.github/workflows/coverage.yml`) they are published to GitHub's native code
+coverage (Code Quality) via `actions/upload-code-coverage`, one upload per
+language, so the C++ and Python numbers show directly on the pull request with
+no external service or secret. The same Cobertura files can just as easily feed
+Codecov, Coveralls, or SonarQube if you prefer a hosted dashboard with history.
 
 Pass extra arguments straight through to pytest:
 

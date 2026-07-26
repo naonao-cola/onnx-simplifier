@@ -12,6 +12,13 @@ jobs:
   coverage:
     name: Combined C++/Python coverage
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # Required by actions/upload-code-coverage to push reports to GitHub's
+      # native code-coverage (Code Quality) API.
+      code-quality: write
+      # Lets the action resolve the open PR number on push events (gh pr list).
+      pull-requests: read
     env:
       CMAKE_GENERATOR: Ninja
       CMAKE_CXX_COMPILER_LAUNCHER: sccache
@@ -26,6 +33,10 @@ jobs:
       with:
         submodules: recursive
         fetch-depth: 0
+        # Measure the PR's head commit (not the merge commit) so coverage lines
+        # up with the SHA GitHub Code Quality annotates. Falls back to the pushed
+        # commit for push events.
+        ref: ${{ github.event.pull_request.head.sha || github.sha }}
     - uses: actions/setup-python@v7
       with:
         python-version: '3.12'
@@ -57,15 +68,31 @@ jobs:
         name: coverage-report
         path: coverage-report/
 
-    # Optional: publish to Codecov. Both files are Cobertura XML, so a single
-    # step ingests C++ and Python together. Requires CODECOV_TOKEN for private
-    # repos; remove this step if Codecov is not used.
-    - name: Upload to Codecov
+    # Publish to GitHub's native code coverage (Code Quality) so coverage shows
+    # directly on the PR via github-code-quality[bot] -- no external service or
+    # secret needed (uses the built-in GITHUB_TOKEN + code-quality:write above).
+    # The action takes one Cobertura file and one language per call, which suits
+    # this hybrid repo: upload each report under its language so the PR reports
+    # C++ and Python coverage separately.
+    #
+    # fail-on-error: false keeps CI green while GitHub Code Quality coverage is a
+    # public preview and may not be enabled on the org yet; upload problems still
+    # surface as workflow annotations. Drop it (defaults to true) once the repo
+    # is enrolled and coverage upload should be a hard requirement.
+    - name: Upload Python coverage to GitHub Code Quality
       if: ${{ !cancelled() }}
-      uses: codecov/codecov-action@v5
-      continue-on-error: true
+      uses: actions/upload-code-coverage@v1
       with:
-        files: coverage-report/python.xml,coverage-report/cpp.xml
-        disable_search: true
-      env:
-        CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+        file: coverage-report/python.xml
+        language: Python
+        label: code-coverage/python
+        fail-on-error: false
+
+    - name: Upload C++ coverage to GitHub Code Quality
+      if: ${{ !cancelled() }}
+      uses: actions/upload-code-coverage@v1
+      with:
+        file: coverage-report/cpp.xml
+        language: C++
+        label: code-coverage/cpp
+        fail-on-error: false
