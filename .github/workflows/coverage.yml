@@ -1,0 +1,71 @@
+name: Coverage (C++ and Python)
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  coverage:
+    name: Combined C++/Python coverage
+    runs-on: ubuntu-latest
+    env:
+      CMAKE_GENERATOR: Ninja
+      CMAKE_CXX_COMPILER_LAUNCHER: sccache
+      CMAKE_LINKER_TYPE: MOLD
+      # COVERAGE=1 makes setup.py configure -DONNXSIM_COVERAGE=ON (instrument
+      # onnxsim's own C++ with --coverage) and force a Debug/-O0 build.
+      COVERAGE: '1'
+      SCCACHE_GHA_ENABLED: on
+      ACTIONS_CACHE_SERVICE_V2: on
+    steps:
+    - uses: actions/checkout@v7
+      with:
+        submodules: recursive
+        fetch-depth: 0
+    - uses: actions/setup-python@v7
+      with:
+        python-version: '3.12'
+    - uses: mozilla-actions/sccache-action@v0.0.10
+
+    - name: Install build + coverage tooling
+      run: |
+        pip install cmake ninja "setuptools>=77" sccache
+        pip install pytest pytest-cov gcovr
+
+    - name: Build instrumented extension (editable)
+      run: pip install --no-build-isolation -ve .
+
+    - name: Install test dependencies
+      run: |
+        pip install torch==2.10.0 torchvision==0.25.0 --index-url https://download.pytorch.org/whl/cpu/
+        pip install flake8 onnxruntime onnxscript==0.6.2 timm==1.0.26
+
+    - name: Run tests with combined coverage
+      # COV_SKIP_BUILD=1: the extension was already built above.
+      env:
+        COV_SKIP_BUILD: '1'
+      run: bash scripts/coverage/run_coverage.sh
+
+    - name: Upload coverage reports artifact
+      if: always()
+      uses: actions/upload-artifact@v7
+      with:
+        name: coverage-report
+        path: coverage-report/
+
+    # Optional: publish to Codecov. Both files are Cobertura XML, so a single
+    # step ingests C++ and Python together. Requires CODECOV_TOKEN for private
+    # repos; remove this step if Codecov is not used.
+    - name: Upload to Codecov
+      if: ${{ !cancelled() }}
+      uses: codecov/codecov-action@v5
+      continue-on-error: true
+      with:
+        files: coverage-report/python.xml,coverage-report/cpp.xml
+        disable_search: true
+      env:
+        CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}

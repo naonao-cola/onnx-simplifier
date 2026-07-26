@@ -50,6 +50,12 @@ coverage.xml
 *.cover
 .hypothesis/
 .pytest_cache/
+# Combined C++/Python coverage output (scripts/coverage/run_coverage.sh)
+coverage-report/
+# gcov data emitted by ONNXSIM_COVERAGE builds
+*.gcda
+*.gcno
+*.gcov
 
 # Translations
 *.mo
