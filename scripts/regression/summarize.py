@@ -107,12 +107,25 @@ def main(argv):
     lines.append("")
 
     text = "\n".join(lines)
-    out = os.environ.get("GITHUB_STEP_SUMMARY")
-    if out:
-        with open(out, "a") as f:
-            f.write(text)
-    print(text)
 
+    # The run summary page.
+    step_summary = os.environ.get("GITHUB_STEP_SUMMARY")
+    if step_summary:
+        with open(step_summary, "a") as f:
+            f.write(text)
+
+    # A standalone copy the issue-reporting step reads as the issue body.
+    with open("regression-summary.md", "w") as f:
+        f.write(text)
+
+    # Machine-readable outcome for the workflow (drives the failure issue).
+    job_output = os.environ.get("GITHUB_OUTPUT")
+    if job_output:
+        with open(job_output, "a") as f:
+            f.write(f"status={'fail' if bad else 'pass'}\n")
+            f.write(f"blocking_failures={len(bad)}\n")
+
+    print(text)
     return 1 if bad else 0
 
 

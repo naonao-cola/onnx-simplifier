@@ -168,6 +168,9 @@ jobs:
     needs: [regression, known-slow]
     if: always()
     runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      issues: write # open/update/close the failure-tracking issue
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
@@ -178,11 +181,70 @@ jobs:
           pattern: regression-csv-*
           path: csvs
           merge-multiple: true
+      # Writes regression-report.csv + regression-summary.md, appends the run
+      # summary, and sets outputs.status=pass|fail. Kept from failing the step
+      # here (continue-on-error) so the issue-reporting step always runs; the
+      # final step re-raises the failure to keep the workflow red.
       - name: Build summary
+        id: sum
+        continue-on-error: true
         run: python "$GITHUB_WORKSPACE/scripts/regression/summarize.py" "csvs/*.csv"
       - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: regression-report
-          path: regression-report.csv
+          path: |
+            regression-report.csv
+            regression-summary.md
           if-no-files-found: ignore
+      # On a scheduled/manual run, file (or update) a tracking issue when the
+      # regression fails, and close it when it goes green again. Skipped on
+      # pull_request runs, which only validate the harness.
+      - name: Report result to tracking issue
+        if: ${{ always() && github.event_name != 'pull_request' }}
+        uses: actions/github-script@v7
+        env:
+          STATUS: ${{ steps.sum.outputs.status }}
+        with:
+          script: |
+            const fs = require('fs');
+            const { owner, repo } = context.repo;
+            const status = process.env.STATUS || 'fail';
+            const runUrl = `${process.env.GITHUB_SERVER_URL}/${owner}/${repo}/actions/runs/${context.runId}`;
+            const TITLE = 'Weekly model regression failing';
+            let report = '';
+            try { report = fs.readFileSync('regression-summary.md', 'utf8'); } catch (e) {}
+            const footer = `\n\n[Full run, logs & CSV artifacts](${runUrl})\n\n_Filed automatically by the Model Regression workflow._`;
+
+            const issues = await github.paginate(github.rest.issues.listForRepo, {
+              owner, repo, state: 'open', per_page: 100,
+            });
+            const existing = issues.find(i => i.title === TITLE && !i.pull_request);
+
+            if (status === 'fail') {
+              const body = report + footer;
+              if (existing) {
+                await github.rest.issues.update({ owner, repo, issue_number: existing.number, body });
+                await github.rest.issues.createComment({
+                  owner, repo, issue_number: existing.number,
+                  body: `Still failing as of ${runUrl}` + footer,
+                });
+                core.notice(`Updated regression issue #${existing.number}`);
+              } else {
+                const created = await github.rest.issues.create({ owner, repo, title: TITLE, body });
+                core.notice(`Opened regression issue #${created.data.number}`);
+              }
+            } else if (existing) {
+              await github.rest.issues.createComment({
+                owner, repo, issue_number: existing.number,
+                body: `✅ Regression green again as of ${runUrl}. Closing.` + footer,
+              });
+              await github.rest.issues.update({ owner, repo, issue_number: existing.number, state: 'closed' });
+              core.notice(`Closed regression issue #${existing.number}`);
+            }
+      # Re-raise the failure the summary step swallowed, so the workflow is red.
+      - name: Fail if regression failed
+        if: ${{ steps.sum.outputs.status == 'fail' }}
+        run: |
+          echo "::error::Model regression had blocking failures"
+          exit 1
