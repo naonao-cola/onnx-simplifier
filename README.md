@@ -392,7 +392,12 @@ model_simp, check = onnxsim.simplify(
 ```
 
 See `tests/test_function_rewriter_onnxscript_script.py` for the `@script`
-approach, including the attribute-wildcard case.
+approach, including the attribute-wildcard case. To reuse an *existing*
+`onnxscript` rule, its structural `pattern` method can be compiled to a
+FunctionProto through the same `@script` converter —
+`tests/test_function_rewriter_compile_rule.py` shows a small helper that does
+this (paired with a simple replacement), noting the boundary where a rewrite
+that derives attributes from the match can't be compiled that way.
 
 From C, call `onnxsim_simplify_with_rules` with the serialized FunctionProto
 pairs (see `onnxsim/capi/onnxsim_c_api.h`); from Rust, use
