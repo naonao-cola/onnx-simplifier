@@ -328,6 +328,8 @@ def simplify(
     input_shapes=None,
     target_opset_version: Optional[int] = None,
     custom_rewriter: Optional[ModelRewriter] = None,
+    check_rtol: float = 1e-4,
+    check_atol: float = 1e-5,
 ) -> Tuple[onnx.ModelProto, bool]:
     """
     :param model: onnx ModelProto object or file path
@@ -364,6 +366,12 @@ def simplify(
             to report that it rewrote nothing. Returning ``False`` when no rewrite happened (for example
             when an ``onnxscript.rewriter`` pass reports ``PassResult.modified`` is ``False``) lets onnxsim
             skip copying an unchanged model back through the C++ core on that fixed-point round.
+    :param check_rtol: Relative tolerance used by the ``check_n`` verification when comparing the
+            original and simplified outputs (``numpy.allclose``). The default (1e-4) is strict; raise
+            it for very deep models where correct constant-folding/fusion reorders floating-point ops
+            enough to accumulate a larger-but-benign difference (e.g. RF-DETR's XLarge segmentation
+            variants -- see ``scripts/rfdetr/FAILURE_ANALYSIS.md``). Ignored when ``check_n == 0``.
+    :param check_atol: Absolute tolerance counterpart of ``check_rtol``.
     :return: A tuple (simplified model, success(True) or failed(False))
     """
     if dynamic_input_shape:
@@ -535,7 +543,14 @@ def simplify(
             model = None
         model_opt = onnx.load_from_string(model_opt_bytes)
         check_ok = model_checking.compare(
-            model_opt, model, check_n, test_input_shapes, input_data, custom_lib
+            model_opt,
+            model,
+            check_n,
+            test_input_shapes,
+            input_data,
+            custom_lib,
+            rtol=check_rtol,
+            atol=check_atol,
         )
     except (EncodeError, ValueError, onnx.onnx_cpp2py_export.checker.ValidationError):
         if model is None:
@@ -581,6 +596,8 @@ def simplify(
                 test_input_shapes,
                 input_data,
                 custom_lib,
+                rtol=check_rtol,
+                atol=check_atol,
             )
             model_opt = onnx.load(os.path.join(tmpdirname, "opt.onnx"))
     _restore_doc_strings(model_opt, doc_strings)
@@ -709,6 +726,20 @@ def main():
     )
     parser.add_argument(
         "--skip-constant-folding", help="Skip constant folding", action="store_true"
+    )
+    parser.add_argument(
+        "--check-rtol",
+        help="Relative tolerance for the check_n output comparison (default 1e-4). "
+        "Raise it for very deep models whose correct op reordering accumulates a larger "
+        "floating-point difference (e.g. RF-DETR XLarge).",
+        type=float,
+        default=1e-4,
+    )
+    parser.add_argument(
+        "--check-atol",
+        help="Absolute tolerance for the check_n output comparison (default 1e-5).",
+        type=float,
+        default=1e-5,
     )
     parser.add_argument(
         "--input-shape",
@@ -972,6 +1003,8 @@ def main():
         args.mutable_initializer,
         import_custom_schemas=not args.skip_schema_import,
         target_opset_version=args.target_opset,
+        check_rtol=args.check_rtol,
+        check_atol=args.check_atol,
     )
 
     try:
