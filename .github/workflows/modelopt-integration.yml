@@ -10,11 +10,11 @@ name: ModelOpt Integration
 # test requirements, so this runs in its own workflow instead of the
 # build-and-test matrix. Calibration is pinned to the CPU EP, so an ordinary
 # CPU runner is enough. Runs on PRs that touch the QDQ path or this harness, on
-# a weekly schedule to catch new ModelOpt releases, and on demand.
+# a daily schedule to catch new ModelOpt releases, and on demand.
 
 on:
   schedule:
-    - cron: "0 7 * * 1" # Mondays 07:00 UTC (weekly)
+    - cron: "0 7 * * *" # Daily 07:00 UTC
   workflow_dispatch:
   pull_request:
     paths:
