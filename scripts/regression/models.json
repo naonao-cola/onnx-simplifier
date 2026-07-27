@@ -1,0 +1,565 @@
+{
+  "_comment": "Regression model set \u2014 the models exercised in the onnxsim large-model sweep. See scripts/regression/README.md. baseline_* fields come from the initial characterization run and are advisory (shard balancing + summary deltas).",
+  "models": [
+    {
+      "id": "onnxmodelzoo/FasterRCNN-10",
+      "baseline_seconds": 61.8,
+      "baseline_orig_nodes": 6370,
+      "baseline_simp_nodes": 2824,
+      "known_slow": false
+    },
+    {
+      "id": "onnxmodelzoo/age_googlenet",
+      "baseline_seconds": 8.2,
+      "baseline_orig_nodes": 143,
+      "baseline_simp_nodes": 143,
+      "known_slow": false
+    },
+    {
+      "id": "onnxmodelzoo/bert_Opset18",
+      "baseline_seconds": 126.1,
+      "baseline_orig_nodes": 533,
+      "baseline_simp_nodes": 418,
+      "known_slow": false
+    },
+    {
+      "id": "onnxmodelzoo/botnet26t_256_Opset18",
+      "baseline_seconds": 8.3,
+      "baseline_orig_nodes": 502,
+      "baseline_simp_nodes": 185,
+      "known_slow": false
+    },
+    {
+      "id": "onnxmodelzoo/caffenet-3",
+      "baseline_seconds": 103.2,
+      "baseline_orig_nodes": 23,
+      "baseline_simp_nodes": 23,
+      "known_slow": false
+    },
+    {
+      "id": "onnxmodelzoo/cait_xxs36_224_Opset18",
+      "baseline_seconds": 18.1,
+      "baseline_orig_nodes": 1758,
+      "baseline_simp_nodes": 1488,
+      "known_slow": false
+    },
+    {
+      "id": "onnxmodelzoo/convit_base_Opset18",
+      "baseline_seconds": 219.9,
+      "baseline_orig_nodes": 695,
+      "baseline_simp_nodes": 406,
+      "known_slow": false
+    },
+    {
+      "id": "onnxmodelzoo/convnext_large_in22ft1k_Opset18",
+      "baseline_seconds": 91.7,
+      "baseline_orig_nodes": 670,
+      "baseline_simp_nodes": 562,
+      "known_slow": false
+    },
+    {
+      "id": "onnxmodelzoo/convnext_tiny_in22k_Opset18",
+      "baseline_seconds": 21.5,
+      "baseline_orig_nodes": 346,
+      "baseline_simp_nodes": 292,
+      "known_slow": false
+    },
+    {
+      "id": "onnxmodelzoo/crossvit_base_240_Opset17",
+      "baseline_seconds": 234.8,
+      "baseline_orig_nodes": 1267,
+      "baseline_simp_nodes": 756,
+      "known_slow": false
+    },
+    {
+      "id": "onnxmodelzoo/cspresnet50_Opset18",
+      "baseline_seconds": 10.3,
+      "baseline_orig_nodes": 135,
+      "baseline_simp_nodes": 131,
+      "known_slow": false
+    },
+    {
+      "id": "onnxmodelzoo/deit3_large_patch16_384_in21ft1k_Opset18",
+      "baseline_seconds": 272.1,
+      "baseline_orig_nodes": 1272,
+      "baseline_simp_nodes": 800,
+      "known_slow": false
+    },
+    {
+      "id": "onnxmodelzoo/deit_tiny_patch16_224_Opset18",
+      "baseline_seconds": 5.4,
+      "baseline_orig_nodes": 624,
+      "baseline_simp_nodes": 380,
+      "known_slow": false
+    },
+    {
+      "id": "onnxmodelzoo/densenetblur121d_Opset18",
+      "baseline_seconds": 6.6,
+      "baseline_orig_nodes": 394,
+      "baseline_simp_nodes": 374,
+      "known_slow": false
+    },
+    {
+      "id": "onnxmodelzoo/dla60x_Opset18",
+      "baseline_seconds": 11.3,
+      "baseline_orig_nodes": 155,
+      "baseline_simp_nodes": 153,
+      "known_slow": false
+    },
+    {
+      "id": "onnxmodelzoo/eca_botnext26ts_256_Opset17",
+      "baseline_seconds": 10.7,
+      "baseline_orig_nodes": 579,
+      "baseline_simp_nodes": 247,
+      "known_slow": false
+    },
+    {
+      "id": "onnxmodelzoo/edgenext_small_Opset18",
+      "baseline_seconds": 5.2,
+      "baseline_orig_nodes": 659,
+      "baseline_simp_nodes": 419,
+      "known_slow": false
+    },
+    {
+      "id": "onnxmodelzoo/efficientnet_b3a_Opset17",
+      "baseline_seconds": 6.0,
+      "baseline_orig_nodes": 386,
+      "baseline_simp_nodes": 386,
+      "known_slow": false
+    },
+    {
+      "id": "onnxmodelzoo/efficientnetv2_rw_m_Opset17",
+      "baseline_seconds": 24.4,
+      "baseline_orig_nodes": 774,
+      "baseline_simp_nodes": 774,
+      "known_slow": false
+    },
+    {
+      "id": "onnxmodelzoo/ese_vovnet19b_dw_Opset17",
+      "baseline_seconds": 4.5,
+      "baseline_orig_nodes": 86,
+      "baseline_simp_nodes": 86,
+      "known_slow": false
+    },
+    {
+      "id": "onnxmodelzoo/fcn-resnet50-12-int8",
+      "baseline_seconds": 4.6,
+      "baseline_orig_nodes": 91,
+      "baseline_simp_nodes": 91,
+      "known_slow": false
+    },
+    {
+      "id": "onnxmodelzoo/gcresnext50ts_Opset18",
+      "baseline_seconds": 9.8,
+      "baseline_orig_nodes": 497,
+      "baseline_simp_nodes": 417,
+      "known_slow": false
+    },
+    {
+      "id": "onnxmodelzoo/gluon_resnet152_v1b_Opset18",
+      "baseline_seconds": 25.0,
+      "baseline_orig_nodes": 360,
+      "baseline_simp_nodes": 360,
+      "known_slow": false
+    },
+    {
+      "id": "onnxmodelzoo/gluon_resnext50_32x4d_Opset18",
+      "baseline_seconds": 11.2,
+      "baseline_orig_nodes": 122,
+      "baseline_simp_nodes": 122,
+      "known_slow": false
+    },
+    {
+      "id": "onnxmodelzoo/googlenet-6",
+      "baseline_seconds": 4.1,
+      "baseline_orig_nodes": 143,
+      "baseline_simp_nodes": 143,
+      "known_slow": false
+    },
+    {
+      "id": "onnxmodelzoo/hardcorenas_b_Opset17",
+      "baseline_seconds": 4.3,
+      "baseline_orig_nodes": 133,
+      "baseline_simp_nodes": 133,
+      "known_slow": false
+    },
+    {
+      "id": "onnxmodelzoo/hrnet_w48_Opset18",
+      "baseline_seconds": 34.3,
+      "baseline_orig_nodes": 851,
+      "baseline_simp_nodes": 820,
+      "known_slow": false
+    },
+    {
+      "id": "onnxmodelzoo/inception-v1-7",
+      "baseline_seconds": 4.6,
+      "baseline_orig_nodes": 144,
+      "baseline_simp_nodes": 143,
+      "known_slow": false
+    },
+    {
+      "id": "onnxmodelzoo/jx_nest_small_Opset18",
+      "baseline_seconds": 85.5,
+      "baseline_orig_nodes": 2282,
+      "baseline_simp_nodes": 786,
+      "known_slow": false
+    },
+    {
+      "id": "onnxmodelzoo/legacy_seresnet152_Opset17",
+      "baseline_seconds": 28.5,
+      "baseline_orig_nodes": 660,
+      "baseline_simp_nodes": 660,
+      "known_slow": false
+    },
+    {
+      "id": "onnxmodelzoo/longt5_Opset17",
+      "baseline_seconds": 900.0,
+      "baseline_orig_nodes": null,
+      "baseline_simp_nodes": null,
+      "known_slow": true
+    },
+    {
+      "id": "onnxmodelzoo/mixer_l16_224_in21k_Opset17",
+      "baseline_seconds": 481.5,
+      "baseline_orig_nodes": 733,
+      "baseline_simp_nodes": 582,
+      "known_slow": false
+    },
+    {
+      "id": "onnxmodelzoo/mnasnet_small_Opset17",
+      "baseline_seconds": 5.8,
+      "baseline_orig_nodes": 150,
+      "baseline_simp_nodes": 150,
+      "known_slow": false
+    },
+    {
+      "id": "onnxmodelzoo/mobilenetv2-12-int8",
+      "baseline_seconds": 2.5,
+      "baseline_orig_nodes": 73,
+      "baseline_simp_nodes": 73,
+      "known_slow": false
+    },
+    {
+      "id": "onnxmodelzoo/mobilenetv3_small_050_Opset17",
+      "baseline_seconds": 2.5,
+      "baseline_orig_nodes": 123,
+      "baseline_simp_nodes": 123,
+      "known_slow": false
+    },
+    {
+      "id": "onnxmodelzoo/mobilevitv2_175_Opset18",
+      "baseline_seconds": 27.2,
+      "baseline_orig_nodes": 431,
+      "baseline_simp_nodes": 322,
+      "known_slow": false
+    },
+    {
+      "id": "onnxmodelzoo/mvp_Opset18",
+      "baseline_seconds": 610.1,
+      "baseline_orig_nodes": 1967,
+      "baseline_simp_nodes": 1361,
+      "known_slow": false
+    },
+    {
+      "id": "onnxmodelzoo/pit_b_distilled_224_Opset18",
+      "baseline_seconds": 46.4,
+      "baseline_orig_nodes": 735,
+      "baseline_simp_nodes": 435,
+      "known_slow": false
+    },
+    {
+      "id": "onnxmodelzoo/poolformer_m48_Opset18",
+      "baseline_seconds": 280.7,
+      "baseline_orig_nodes": 1642,
+      "baseline_simp_nodes": 1114,
+      "known_slow": false
+    },
+    {
+      "id": "onnxmodelzoo/regnet_x_16gf_Opset18",
+      "baseline_seconds": 27.3,
+      "baseline_orig_nodes": 163,
+      "baseline_simp_nodes": 163,
+      "known_slow": false
+    },
+    {
+      "id": "onnxmodelzoo/regnet_y_8gf_Opset18",
+      "baseline_seconds": 27.1,
+      "baseline_orig_nodes": 230,
+      "baseline_simp_nodes": 230,
+      "known_slow": false
+    },
+    {
+      "id": "onnxmodelzoo/regnetx_120_Opset18",
+      "baseline_seconds": 24.5,
+      "baseline_orig_nodes": 142,
+      "baseline_simp_nodes": 142,
+      "known_slow": false
+    },
+    {
+      "id": "onnxmodelzoo/regnety_120_Opset17",
+      "baseline_seconds": 27.7,
+      "baseline_orig_nodes": 256,
+      "baseline_simp_nodes": 256,
+      "known_slow": false
+    },
+    {
+      "id": "onnxmodelzoo/repvgg_a2_Opset18",
+      "baseline_seconds": 13.1,
+      "baseline_orig_nodes": 125,
+      "baseline_simp_nodes": 125,
+      "known_slow": false
+    },
+    {
+      "id": "onnxmodelzoo/res2net50_26w_8s_Opset18",
+      "baseline_seconds": 96.1,
+      "baseline_orig_nodes": 438,
+      "baseline_simp_nodes": 422,
+      "known_slow": false
+    },
+    {
+      "id": "onnxmodelzoo/resmlp_big_24_224_in22ft1k_Opset17",
+      "baseline_seconds": 52.5,
+      "baseline_orig_nodes": 688,
+      "baseline_simp_nodes": 511,
+      "known_slow": false
+    },
+    {
+      "id": "onnxmodelzoo/resnet101-v1-7",
+      "baseline_seconds": 22.3,
+      "baseline_orig_nodes": 345,
+      "baseline_simp_nodes": 345,
+      "known_slow": false
+    },
+    {
+      "id": "onnxmodelzoo/resnet18d_Opset18",
+      "baseline_seconds": 5.2,
+      "baseline_orig_nodes": 56,
+      "baseline_simp_nodes": 56,
+      "known_slow": false
+    },
+    {
+      "id": "onnxmodelzoo/resnet50-caffe2-v1-3",
+      "baseline_seconds": 38.1,
+      "baseline_orig_nodes": 175,
+      "baseline_simp_nodes": 175,
+      "known_slow": false
+    },
+    {
+      "id": "onnxmodelzoo/resnet51q_Opset18",
+      "baseline_seconds": 16.8,
+      "baseline_orig_nodes": 178,
+      "baseline_simp_nodes": 178,
+      "known_slow": false
+    },
+    {
+      "id": "onnxmodelzoo/resnetv2_101_Opset18",
+      "baseline_seconds": 18.2,
+      "baseline_orig_nodes": 275,
+      "baseline_simp_nodes": 275,
+      "known_slow": false
+    },
+    {
+      "id": "onnxmodelzoo/resnetv2_50x3_bitm_Opset17",
+      "baseline_seconds": 900.0,
+      "baseline_orig_nodes": null,
+      "baseline_simp_nodes": null,
+      "known_slow": true
+    },
+    {
+      "id": "onnxmodelzoo/rexnet_200_Opset17",
+      "baseline_seconds": 10.8,
+      "baseline_orig_nodes": 344,
+      "baseline_simp_nodes": 224,
+      "known_slow": false
+    },
+    {
+      "id": "onnxmodelzoo/selecsls60b_Opset18",
+      "baseline_seconds": 13.7,
+      "baseline_orig_nodes": 130,
+      "baseline_simp_nodes": 130,
+      "known_slow": false
+    },
+    {
+      "id": "onnxmodelzoo/seresnext101d_32x8d_Opset17",
+      "baseline_seconds": 223.0,
+      "baseline_orig_nodes": 446,
+      "baseline_simp_nodes": 446,
+      "known_slow": false
+    },
+    {
+      "id": "onnxmodelzoo/shufflenet-v2-12",
+      "baseline_seconds": 3.4,
+      "baseline_orig_nodes": 261,
+      "baseline_simp_nodes": 173,
+      "known_slow": false
+    },
+    {
+      "id": "onnxmodelzoo/squeezebert_Opset18",
+      "baseline_seconds": 75.1,
+      "baseline_orig_nodes": 494,
+      "baseline_simp_nodes": 382,
+      "known_slow": false
+    },
+    {
+      "id": "onnxmodelzoo/ssd-10",
+      "baseline_seconds": 16.7,
+      "baseline_orig_nodes": 515,
+      "baseline_simp_nodes": 175,
+      "known_slow": false
+    },
+    {
+      "id": "onnxmodelzoo/ssl_resnext101_32x8d_Opset18",
+      "baseline_seconds": 173.3,
+      "baseline_orig_nodes": 241,
+      "baseline_simp_nodes": 241,
+      "known_slow": false
+    },
+    {
+      "id": "onnxmodelzoo/swin_s_Opset18",
+      "baseline_seconds": 341.7,
+      "baseline_orig_nodes": 12830,
+      "baseline_simp_nodes": 1295,
+      "known_slow": false
+    },
+    {
+      "id": "onnxmodelzoo/swinv2_cr_small_ns_224_Opset18",
+      "baseline_seconds": 121.9,
+      "baseline_orig_nodes": 2768,
+      "baseline_simp_nodes": 1460,
+      "known_slow": false
+    },
+    {
+      "id": "onnxmodelzoo/swsl_resnext101_32x16d_Opset18",
+      "baseline_seconds": 363.0,
+      "baseline_orig_nodes": 241,
+      "baseline_simp_nodes": 241,
+      "known_slow": false
+    },
+    {
+      "id": "onnxmodelzoo/tf_efficientnet_b1_Opset17",
+      "baseline_seconds": 16.5,
+      "baseline_orig_nodes": 766,
+      "baseline_simp_nodes": 341,
+      "known_slow": false
+    },
+    {
+      "id": "onnxmodelzoo/tf_efficientnet_b5_Opset17",
+      "baseline_seconds": 115.8,
+      "baseline_orig_nodes": 1003,
+      "baseline_simp_nodes": 578,
+      "known_slow": false
+    },
+    {
+      "id": "onnxmodelzoo/tf_efficientnet_em_Opset18",
+      "baseline_seconds": 12.0,
+      "baseline_orig_nodes": 549,
+      "baseline_simp_nodes": 124,
+      "known_slow": false
+    },
+    {
+      "id": "onnxmodelzoo/tf_efficientnetv2_l_Opset17",
+      "baseline_seconds": 547.3,
+      "baseline_orig_nodes": 1429,
+      "baseline_simp_nodes": 1004,
+      "known_slow": false
+    },
+    {
+      "id": "onnxmodelzoo/tf_mixnet_l_Opset17",
+      "baseline_seconds": 17.0,
+      "baseline_orig_nodes": 1759,
+      "baseline_simp_nodes": 446,
+      "known_slow": false
+    },
+    {
+      "id": "onnxmodelzoo/tinynet_c_Opset17",
+      "baseline_seconds": 4.4,
+      "baseline_orig_nodes": 224,
+      "baseline_simp_nodes": 224,
+      "known_slow": false
+    },
+    {
+      "id": "onnxmodelzoo/tv_resnext50_32x4d_Opset18",
+      "baseline_seconds": 49.3,
+      "baseline_orig_nodes": 122,
+      "baseline_simp_nodes": 122,
+      "known_slow": false
+    },
+    {
+      "id": "onnxmodelzoo/version-RFB-320-int8",
+      "baseline_seconds": 3.0,
+      "baseline_orig_nodes": 91,
+      "baseline_simp_nodes": 91,
+      "known_slow": false
+    },
+    {
+      "id": "onnxmodelzoo/vgg19_Opset18_timm",
+      "baseline_seconds": 72.6,
+      "baseline_orig_nodes": 44,
+      "baseline_simp_nodes": 44,
+      "known_slow": false
+    },
+    {
+      "id": "onnxmodelzoo/visformer_small_Opset18",
+      "baseline_seconds": 69.2,
+      "baseline_orig_nodes": 447,
+      "baseline_simp_nodes": 325,
+      "known_slow": false
+    },
+    {
+      "id": "onnxmodelzoo/vit_base_patch32_224_in21k_Opset18",
+      "baseline_seconds": 219.4,
+      "baseline_orig_nodes": 624,
+      "baseline_simp_nodes": 380,
+      "known_slow": false
+    },
+    {
+      "id": "onnxmodelzoo/vit_relpos_base_patch16_clsgap_224_Opset17",
+      "baseline_seconds": 221.1,
+      "baseline_orig_nodes": 1012,
+      "baseline_simp_nodes": 404,
+      "known_slow": false
+    },
+    {
+      "id": "onnxmodelzoo/vit_small_patch32_384_Opset18",
+      "baseline_seconds": 41.7,
+      "baseline_orig_nodes": 624,
+      "baseline_simp_nodes": 380,
+      "known_slow": false
+    },
+    {
+      "id": "onnxmodelzoo/xception65p_Opset18",
+      "baseline_seconds": 66.7,
+      "baseline_orig_nodes": 240,
+      "baseline_simp_nodes": 240,
+      "known_slow": false
+    },
+    {
+      "id": "onnxmodelzoo/xcit_medium_24_p8_224_dist_Opset18",
+      "baseline_seconds": 356.3,
+      "baseline_orig_nodes": 2330,
+      "baseline_simp_nodes": 1564,
+      "known_slow": false
+    },
+    {
+      "id": "onnxmodelzoo/xcit_small_12_p8_224_dist_Opset18",
+      "baseline_seconds": 79.9,
+      "baseline_orig_nodes": 1310,
+      "baseline_simp_nodes": 832,
+      "known_slow": false
+    },
+    {
+      "id": "onnxmodelzoo/xcit_tiny_12_p8_384_dist_Opset18",
+      "baseline_seconds": 10.5,
+      "baseline_orig_nodes": 1310,
+      "baseline_simp_nodes": 832,
+      "known_slow": false
+    },
+    {
+      "id": "onnxmodelzoo/yolov3-10",
+      "baseline_seconds": 35.1,
+      "baseline_orig_nodes": 469,
+      "baseline_simp_nodes": 379,
+      "known_slow": false
+    }
+  ]
+}
