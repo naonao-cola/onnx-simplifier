@@ -39,10 +39,15 @@ correctly set-up RF-DETR environment never hits this.
   so that upper bound could be relaxed.
 - XLarge / 2XLarge segmentation variants additionally require
   `pip install rfdetr[plus]`. They simplify correctly but report
-  `check_ok=False`: their large mask head accumulates a sub-`1e-4`
-  floating-point difference from op reordering that exceeds onnxsim's strict
-  `np.allclose(rtol=1e-4, atol=1e-5)` check. The graphs are functionally
-  equivalent (no NaNs, detection heads match to ~`1e-4`); pass `check_n=0`
-  to skip the strict check for these.
+  `check_ok=False`: onnxsim's constant folding perturbs the graph at the
+  ~`1e-5` level, which accumulates through the deep DINOv2 ViT backbone and
+  mask head and exceeds onnxsim's strict `np.allclose(rtol=1e-4, atol=1e-5)`
+  check. The graphs are functionally equivalent — predictions are unchanged
+  (100% class agreement, ~0.0001% mask-pixel flips). Pass `check_n=0` to
+  skip the strict check for these.
 
-See `RESULTS.md` for a captured run and the full analysis.
+Run `inspect_failures.py` to reproduce the onnxruntime-based investigation
+of the two XL variants.
+
+See `RESULTS.md` for a captured run and `FAILURE_ANALYSIS.md` for the full
+analysis.

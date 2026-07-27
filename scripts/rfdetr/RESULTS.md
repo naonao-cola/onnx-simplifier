@@ -46,13 +46,17 @@ box.** Every variant simplifies structurally (~48–63% fewer nodes).
 
 `RFDETRSegXLarge` / `RFDETRSeg2XLarge` simplify correctly but report
 `check_ok=False`. This is a strict-tolerance artifact, not a wrong graph.
+See **[`FAILURE_ANALYSIS.md`](FAILURE_ANALYSIS.md)** for the full
+onnxruntime-based investigation; the short version:
 
 onnxsim's `check_n` compares original vs. simplified outputs with
-`np.allclose(rtol=1e-4, atol=1e-5)` (`onnxsim/model_checking.py`). On these
-two large graphs, constant folding and BatchNorm fusion legitimately reorder
-floating-point ops, and the reordering accumulates a sub-`1e-4` difference
-that trips that strict relative bound. Comparing the two graphs directly
-with onnxruntime over several random inputs:
+`np.allclose(rtol=1e-4, atol=1e-5)` (`onnxsim/model_checking.py`). onnxsim's
+**constant folding** (`Mul` 150→140, `Add` 244→236, mostly in the deformable
+cross-attention decoder — there are **no** BatchNorm nodes to fuse; the ViT
+backbone uses LayerNorm) bakes precomputed constants in at slightly
+different fp rounding. That sub-`1e-5` perturbation enters the DINOv2 ViT
+backbone encoder and **accumulates through 12+ residual transformer layers**
+into the mask head. onnxruntime comparison:
 
 ```
 dets    maxdiff ~1e-4    (values in [0,1])
@@ -61,14 +65,14 @@ masks   maxdiff ~1e-2..1.6e-1  (raw mask logits, 300×156×156)
 no NaNs in either graph
 ```
 
-The detection heads match to ~`1e-4`; only the large segmentation **mask
-logits** accumulate enough fp drift to exceed the check. `dets` alone is
-already off by ~`9e-5` on small-magnitude entries, which fails the relative
-bound. `skip_fuse_bn=True` and `skip_constant_folding=True` each still leave
-enough folding to trip it. The simplification is correct — the outputs are
-equal within floating-point noise — the default check is simply strict on
-graphs this size. Consumers who want the simplified XL models can pass
-`check_n=0` (skip the check) or verify with a task-level tolerance.
+The first tensor to break tolerance is a LayerNorm output at maxdiff
+`1.5e-5` — LayerNorm emits near-zero values, so `allclose` there collapses
+to the `atol=1e-5` floor. **Predictions are unaffected**: 100% class-argmax
+agreement, identical top-10 detections, sub-pixel boxes, and ~0.0001% of
+mask pixels flip at the 0.5 threshold. The failure is a scale effect of the
+strict check on a deep transformer, not a wrong simplification. Consumers
+who want the simplified XL models can pass `check_n=0` (skip the check) or
+verify with a task-level tolerance.
 
 ## Notes
 
