@@ -1510,14 +1510,27 @@ onnx::ModelProto Simplify(
 
   config.tensor_size_threshold = tensor_size_threshold;
   config.optimizer_passes.clear();
+  // onnxsim already folds ``Gather`` on a ``Shape`` into constants on its own:
+  // ``_EvalPartialShape`` (above) plus data-propagating shape inference resolve
+  // the statically-known dimensions and leave the genuinely dynamic ones
+  // untouched. The onnx-optimizer ``eliminate_shape_gather`` pass is therefore
+  // redundant here, and it aborts the whole process on graphs where a Gather
+  // index cannot be statically resolved to an axis (common in dynamic-shape
+  // detection models such as FasterRCNN). Always drop it from the pass list.
+  static const std::vector<std::string> kAlwaysDisabledPasses = {
+      "eliminate_shape_gather"};
+  auto is_disabled = [](const std::vector<std::string>& list,
+                        const std::string& pass) {
+    return std::find(list.begin(), list.end(), pass) != list.end();
+  };
   // skip_optimizers == nullopt means skiping all optimizers, so
   // config.optimizer_passes is empty
   if (skip_optimizers) {
     std::vector<std::string> passes;
     const auto all_passes = onnx::optimization::GetFuseAndEliminationPass();
     for (const auto& pass : all_passes) {
-      if (std::find(skip_optimizers->begin(), skip_optimizers->end(), pass) ==
-          skip_optimizers->end()) {
+      if (!is_disabled(*skip_optimizers, pass) &&
+          !is_disabled(kAlwaysDisabledPasses, pass)) {
         passes.push_back(pass);
       }
     }
