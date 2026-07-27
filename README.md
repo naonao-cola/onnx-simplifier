@@ -369,6 +369,31 @@ pattern→replacement rules that translate directly into a FunctionProto pair li
 the one above; see `tests/test_function_rewriter_common_rules.py` for worked
 examples that check parity against the onnxscript rule itself.
 
+Instead of writing the ONNX text by hand you can author each side as an
+`onnxscript.script` function and call `.to_function_proto()` — a Python-typed
+attribute parameter (`alpha: float`) even compiles to the `@name` wildcard form:
+
+```python
+from onnxscript import script
+from onnxscript import opset18 as op
+
+@script()
+def matmul_add(a, b, c):
+    return op.Add(op.MatMul(a, b), c)
+
+@script()
+def gemm(a, b, c):
+    return op.Gemm(a, b, c)
+
+model_simp, check = onnxsim.simplify(
+    model,
+    function_rewrite_rules=[(matmul_add.to_function_proto(), gemm.to_function_proto())],
+)
+```
+
+See `tests/test_function_rewriter_onnxscript_script.py` for the `@script`
+approach, including the attribute-wildcard case.
+
 From C, call `onnxsim_simplify_with_rules` with the serialized FunctionProto
 pairs (see `onnxsim/capi/onnxsim_c_api.h`); from Rust, use
 `Options::function_rewrite_rule(pattern_bytes, replacement_bytes)`.
