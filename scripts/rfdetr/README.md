@@ -59,8 +59,10 @@ correctly set-up RF-DETR environment never hits this.
   ~`1e-5` level, which accumulates through the deep DINOv2 ViT backbone and
   mask head and exceeds onnxsim's strict `np.allclose(rtol=1e-4, atol=1e-5)`
   check. The graphs are functionally equivalent — predictions are unchanged
-  (100% class agreement, ~0.0001% mask-pixel flips). Pass `check_n=0` to
-  skip the strict check for these.
+  (100% class agreement, ~0.0001% mask-pixel flips). Pass a looser
+  `onnxsim.simplify(..., check_rtol=1e-2, check_atol=1e-3)` (or
+  `--check-rtol/--check-atol` on the CLI) so the check passes on these deep
+  models, or `check_n=0` to skip it.
 
 Run `inspect_failures.py` to reproduce the onnxruntime-based investigation
 of the two XL variants.
