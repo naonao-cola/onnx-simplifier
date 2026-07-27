@@ -419,7 +419,7 @@ def simplify(
             "pass only one."
         )
     if function_rewrite_rules:
-        rewriter = C.FunctionProtoRewriter(
+        rewriter = C.make_function_proto_rewriter(
             [(pattern, replacement) for pattern, replacement in function_rewrite_rules]
         )
     elif custom_rewriter is not None:

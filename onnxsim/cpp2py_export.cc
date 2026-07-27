@@ -470,21 +470,20 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
       .def("Run", &PyGraphRewriter::_PyRun);
 
   // The data-driven rewriter: a list of (pattern, replacement) FunctionProto
-  // pairs. Being pure data, it works from every binding, not just Python.
-  py::class_<onnxsim::FunctionProtoRewriter, GraphRewriter>(
-      m, "FunctionProtoRewriter")
-      .def(
-          "__init__",
-          [](onnxsim::FunctionProtoRewriter* self,
-             std::vector<std::pair<onnx::FunctionProto, onnx::FunctionProto>>
-                 rules) {
-            std::vector<onnxsim::FunctionRewriteRule> converted;
-            converted.reserve(rules.size());
-            for (auto& pair : rules) {
-              converted.push_back(onnxsim::FunctionRewriteRule{
-                  std::move(pair.first), std::move(pair.second)});
-            }
-            new (self) onnxsim::FunctionProtoRewriter(std::move(converted));
-          },
-          "rules"_a);
+  // pairs. Being pure data, the same rules work from every binding, not just
+  // Python. Returned as the base ``GraphRewriter`` -- the concrete type stays
+  // private to the onnxsim core so this extension never references its vtable.
+  m.def(
+      "make_function_proto_rewriter",
+      [](std::vector<std::pair<onnx::FunctionProto, onnx::FunctionProto>> rules)
+          -> std::shared_ptr<GraphRewriter> {
+        std::vector<onnxsim::FunctionRewriteRule> converted;
+        converted.reserve(rules.size());
+        for (auto& pair : rules) {
+          converted.push_back(onnxsim::FunctionRewriteRule{
+              std::move(pair.first), std::move(pair.second)});
+        }
+        return onnxsim::MakeFunctionProtoRewriter(std::move(converted));
+      },
+      "rules"_a);
 }

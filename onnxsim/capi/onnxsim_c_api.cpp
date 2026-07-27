@@ -7,6 +7,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <exception>
+#include <memory>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -213,14 +214,15 @@ OnnxsimStatus onnxsim_simplify_with_rules(
     return ONNXSIM_ERROR;
   }
   try {
-    onnxsim::FunctionProtoRewriter rewriter(
-        BuildRewriteRules(pattern_data, pattern_sizes, replacement_data,
-                          replacement_sizes, num_rules));
+    std::shared_ptr<GraphRewriter> rewriter =
+        onnxsim::MakeFunctionProtoRewriter(
+            BuildRewriteRules(pattern_data, pattern_sizes, replacement_data,
+                              replacement_sizes, num_rules));
     return SimplifyToBuffer(model_data, model_size, skip_optimizers,
                             num_skip_optimizers, skip_optimizers_is_null,
                             constant_folding, shape_inference,
                             tensor_size_threshold, target_opset_version,
-                            &rewriter, out_data, out_size, out_error);
+                            rewriter.get(), out_data, out_size, out_error);
   } catch (const std::exception& e) {
     SetError(out_error, e.what());
     return ONNXSIM_ERROR;

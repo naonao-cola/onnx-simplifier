@@ -33,6 +33,7 @@
 
 #include <algorithm>
 #include <map>
+#include <memory>
 #include <set>
 #include <string>
 #include <unordered_map>
@@ -611,40 +612,54 @@ bool ApplyRuleOnce(onnx::ModelProto& model, onnx::GraphProto& graph,
   return false;
 }
 
-}  // namespace
+// A GraphRewriter that applies a fixed set of FunctionRewriteRules. Kept
+// private to this translation unit: callers obtain it only via
+// MakeFunctionProtoRewriter, as a base GraphRewriter pointer, so no other
+// shared object references this concrete type's vtable.
+class FunctionProtoRewriterImpl final : public GraphRewriter {
+ public:
+  explicit FunctionProtoRewriterImpl(std::vector<FunctionRewriteRule> rules)
+      : rules_(std::move(rules)) {}
 
-FunctionProtoRewriter::FunctionProtoRewriter(
-    std::vector<FunctionRewriteRule> rules)
-    : rules_(std::move(rules)) {}
-
-bool FunctionProtoRewriter::_Run(onnx::ModelProto& model) const {
-  if (rules_.empty() || !model.has_graph()) {
-    return false;
-  }
-  onnx::GraphProto& graph = *model.mutable_graph();
-  bool changed = false;
-  // Keep applying rules until a full pass over every rule changes nothing. Each
-  // successful rewrite invalidates the node indices, so rebuild the index and
-  // restart the scan. A generous iteration cap guards against a pathological
-  // rule whose replacement re-creates its own pattern (which would otherwise
-  // loop forever); normal rule sets converge far below it.
-  const long long kMaxRewrites =
-      static_cast<long long>(graph.node_size()) * 100 + 100000;
-  long long applied = 0;
-  bool progress = true;
-  while (progress && applied < kMaxRewrites) {
-    progress = false;
-    HostIndex host(graph);
-    for (const auto& rule : rules_) {
-      if (ApplyRuleOnce(model, graph, host, rule)) {
-        changed = true;
-        progress = true;
-        ++applied;
-        break;  // indices changed -- rebuild the index and rescan.
+  bool _Run(onnx::ModelProto& model) const override {
+    if (rules_.empty() || !model.has_graph()) {
+      return false;
+    }
+    onnx::GraphProto& graph = *model.mutable_graph();
+    bool changed = false;
+    // Keep applying rules until a full pass over every rule changes nothing.
+    // Each successful rewrite invalidates the node indices, so rebuild the
+    // index and restart the scan. A generous iteration cap guards against a
+    // pathological rule whose replacement re-creates its own pattern (which
+    // would otherwise loop forever); normal rule sets converge far below it.
+    const long long kMaxRewrites =
+        static_cast<long long>(graph.node_size()) * 100 + 100000;
+    long long applied = 0;
+    bool progress = true;
+    while (progress && applied < kMaxRewrites) {
+      progress = false;
+      HostIndex host(graph);
+      for (const auto& rule : rules_) {
+        if (ApplyRuleOnce(model, graph, host, rule)) {
+          changed = true;
+          progress = true;
+          ++applied;
+          break;  // indices changed -- rebuild the index and rescan.
+        }
       }
     }
+    return changed;
   }
-  return changed;
+
+ private:
+  std::vector<FunctionRewriteRule> rules_;
+};
+
+}  // namespace
+
+std::shared_ptr<GraphRewriter> MakeFunctionProtoRewriter(
+    std::vector<FunctionRewriteRule> rules) {
+  return std::make_shared<FunctionProtoRewriterImpl>(std::move(rules));
 }
 
 }  // namespace onnxsim

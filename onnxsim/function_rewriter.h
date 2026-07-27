@@ -6,6 +6,7 @@
 
 #include <onnx/onnx_pb.h>
 
+#include <memory>
 #include <vector>
 
 #include "onnxsim.h"
@@ -32,23 +33,22 @@ struct FunctionRewriteRule {
   onnx::FunctionProto replacement;
 };
 
-// A ``GraphRewriter`` that applies a fixed set of ``FunctionRewriteRule``s. It
-// plugs into ``Simplify`` exactly like any other rewriter and therefore runs
-// inside onnxsim's simplification fixed point, so a fusion it performs can
-// unlock further optimizer/folding passes and vice versa.
-class FunctionProtoRewriter final : public GraphRewriter {
- public:
-  explicit FunctionProtoRewriter(std::vector<FunctionRewriteRule> rules);
-
-  // Repeatedly applies the rules to ``model``'s main graph until no rule fires.
-  // Returns true if the model was changed and false if it was left untouched;
-  // the "unchanged" answer lets onnxsim skip re-copying the model, matching the
-  // rest of the ``GraphRewriter`` contract.
-  bool _Run(onnx::ModelProto& model) const override;
-
- private:
-  std::vector<FunctionRewriteRule> rules_;
-};
+// Build a ``GraphRewriter`` that applies ``rules``. It plugs into ``Simplify``
+// like any other rewriter and runs inside onnxsim's simplification fixed point,
+// so a fusion it performs can unlock further optimizer/folding passes and vice
+// versa.
+//
+// The concrete rewriter type is kept private to function_rewriter.cpp and only
+// a base ``GraphRewriter`` pointer is returned. onnxsim is built as a shared
+// library under a hidden default-visibility preset, and its callers (the C ABI
+// and the Python extension) live in *other* shared objects; returning the base
+// keeps them from referencing the concrete subclass's vtable across the
+// library boundary (which the linker cannot resolve). The returned
+// ``shared_ptr`` type-erases its deleter, so destruction still dispatches to
+// the concrete type. This is a plain free function, exported exactly like the
+// rest of onnxsim's public API (e.g. ``Simplify``).
+std::shared_ptr<GraphRewriter> MakeFunctionProtoRewriter(
+    std::vector<FunctionRewriteRule> rules);
 
 }  // namespace onnxsim
 
