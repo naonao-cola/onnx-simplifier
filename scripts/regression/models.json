@@ -2,17 +2,24 @@
   "_comment": "Regression model set \u2014 the models exercised in the onnxsim large-model sweep. See scripts/regression/README.md. baseline_* fields come from the initial characterization run and are advisory (shard balancing + summary deltas).",
   "models": [
     {
-      "id": "onnxmodelzoo/FasterRCNN-10",
-      "baseline_seconds": 61.8,
-      "baseline_orig_nodes": 6370,
-      "baseline_simp_nodes": 2824,
-      "known_slow": false
-    },
-    {
       "id": "onnxmodelzoo/age_googlenet",
       "baseline_seconds": 8.2,
       "baseline_orig_nodes": 143,
       "baseline_simp_nodes": 143,
+      "known_slow": false
+    },
+    {
+      "id": "onnxmodelzoo/albert_Opset18",
+      "baseline_seconds": 8.8,
+      "baseline_orig_nodes": 733,
+      "baseline_simp_nodes": 456,
+      "known_slow": false
+    },
+    {
+      "id": "onnxmodelzoo/bart_Opset18",
+      "baseline_seconds": 67.1,
+      "baseline_orig_nodes": 1061,
+      "baseline_simp_nodes": 689,
       "known_slow": false
     },
     {
@@ -79,6 +86,13 @@
       "known_slow": false
     },
     {
+      "id": "onnxmodelzoo/deberta_Opset17",
+      "baseline_seconds": 57.5,
+      "baseline_orig_nodes": 1642,
+      "baseline_simp_nodes": 678,
+      "known_slow": false
+    },
+    {
       "id": "onnxmodelzoo/deit3_large_patch16_384_in21ft1k_Opset18",
       "baseline_seconds": 272.1,
       "baseline_orig_nodes": 1272,
@@ -97,6 +111,13 @@
       "baseline_seconds": 6.6,
       "baseline_orig_nodes": 394,
       "baseline_simp_nodes": 374,
+      "known_slow": false
+    },
+    {
+      "id": "onnxmodelzoo/distilbert_Opset18",
+      "baseline_seconds": 32.9,
+      "baseline_orig_nodes": 295,
+      "baseline_simp_nodes": 210,
       "known_slow": false
     },
     {
@@ -135,10 +156,24 @@
       "known_slow": false
     },
     {
+      "id": "onnxmodelzoo/electra_Opset18",
+      "baseline_seconds": 9.5,
+      "baseline_orig_nodes": 531,
+      "baseline_simp_nodes": 417,
+      "known_slow": false
+    },
+    {
       "id": "onnxmodelzoo/ese_vovnet19b_dw_Opset17",
       "baseline_seconds": 4.5,
       "baseline_orig_nodes": 86,
       "baseline_simp_nodes": 86,
+      "known_slow": false
+    },
+    {
+      "id": "onnxmodelzoo/FasterRCNN-10",
+      "baseline_seconds": 61.8,
+      "baseline_orig_nodes": 6370,
+      "baseline_simp_nodes": 2824,
       "known_slow": false
     },
     {
@@ -174,6 +209,13 @@
       "baseline_seconds": 4.1,
       "baseline_orig_nodes": 143,
       "baseline_simp_nodes": 143,
+      "known_slow": false
+    },
+    {
+      "id": "onnxmodelzoo/gpt2_Opset18",
+      "baseline_seconds": 49.1,
+      "baseline_orig_nodes": 825,
+      "baseline_simp_nodes": 474,
       "known_slow": false
     },
     {
@@ -230,6 +272,13 @@
       "baseline_seconds": 5.8,
       "baseline_orig_nodes": 150,
       "baseline_simp_nodes": 150,
+      "known_slow": false
+    },
+    {
+      "id": "onnxmodelzoo/mobilebert_Opset18",
+      "baseline_seconds": 13.6,
+      "baseline_orig_nodes": 1867,
+      "baseline_simp_nodes": 1672,
       "known_slow": false
     },
     {
@@ -373,6 +422,13 @@
       "known_slow": false
     },
     {
+      "id": "onnxmodelzoo/roberta_Opset18",
+      "baseline_seconds": 50.6,
+      "baseline_orig_nodes": 542,
+      "baseline_simp_nodes": 425,
+      "known_slow": false
+    },
+    {
       "id": "onnxmodelzoo/selecsls60b_Opset18",
       "baseline_seconds": 13.7,
       "baseline_orig_nodes": 130,
@@ -433,6 +489,13 @@
       "baseline_seconds": 363.0,
       "baseline_orig_nodes": 241,
       "baseline_simp_nodes": 241,
+      "known_slow": false
+    },
+    {
+      "id": "onnxmodelzoo/t5_Opset17",
+      "baseline_seconds": 27.1,
+      "baseline_orig_nodes": 889,
+      "baseline_simp_nodes": 574,
       "known_slow": false
     },
     {
@@ -552,6 +615,13 @@
       "baseline_seconds": 10.5,
       "baseline_orig_nodes": 1310,
       "baseline_simp_nodes": 832,
+      "known_slow": false
+    },
+    {
+      "id": "onnxmodelzoo/xlmroberta_Opset18",
+      "baseline_seconds": 103.2,
+      "baseline_orig_nodes": 542,
+      "baseline_simp_nodes": 425,
       "known_slow": false
     },
     {
