@@ -16,6 +16,22 @@ result with the **current** onnxsim, reproducing RF-DETR's own call. It
 reports node counts before/after and whether onnxsim's numerical
 equivalence check (`check_n`) passed.
 
+## Regression test
+
+`tests/test_rfdetr.py` is the automated counterpart of this harness. It builds
+a tiny, randomly-initialised RF-DETR model offline (no checkpoint download)
+in two configurations — detection and segmentation — exports each with
+`torch.onnx` and runs it through onnxsim's `check_n=3` verification, so an
+onnxsim regression on RF-DETR-style graphs fails the suite. The two configs
+share their graph structure with 12 of the 13 shipped variants.
+
+`rfdetr` pins `onnxsim<0.6.0`, so it is not a normal test dependency: the test
+`importorskip`s `rfdetr` and skips unless it is already installed. To run it::
+
+    pip install torch rfdetr onnxruntime
+    pip install --force-reinstall --no-deps .   # the onnxsim under test
+    pytest tests/test_rfdetr.py -v
+
 ## Running
 
 ```bash
