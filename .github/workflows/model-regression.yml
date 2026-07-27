@@ -1,0 +1,250 @@
+name: Model Regression
+
+# Runs onnxsim over the large real-world model set characterized in the
+# onnxmodelzoo sweep (see scripts/regression/models.json) to catch crashes,
+# hangs, and correctness regressions that the unit tests don't exercise — e.g.
+# an optimizer pass that aborts on a dynamic-shape detection model.
+#
+# Heavy job (~17 GB of downloads, ~110 min of sequential simplify work), so it
+# runs on a schedule and on demand rather than on every push. The work is
+# split across balanced shards to keep wall-clock down. To switch cadence,
+# change the cron below (weekly `0 6 * * 1` vs daily `0 6 * * *`).
+
+on:
+  schedule:
+    - cron: "0 6 * * 1" # Mondays 06:00 UTC (weekly). Use "0 6 * * *" for daily.
+  workflow_dispatch:
+    inputs:
+      num_shards:
+        description: "Number of parallel shards for the blocking model set"
+        default: "6"
+        type: string
+      include_slow:
+        description: "Also run the known-slow models (non-blocking)"
+        default: true
+        type: boolean
+  pull_request:
+    # Validate the harness itself whenever it changes.
+    paths:
+      - ".github/workflows/model-regression.yml"
+      - "scripts/regression/**"
+
+concurrency:
+  group: model-regression-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  # Build onnxsim once from the current tree and share the wheel with every
+  # shard, instead of rebuilding the C++ extension in each shard job.
+  build:
+    name: Build onnxsim wheel
+    runs-on: ubuntu-24.04
+    env:
+      SCCACHE_GHA_ENABLED: "on"
+      ACTIONS_CACHE_SERVICE_V2: "on"
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+          fetch-depth: 0
+      - uses: mozilla-actions/sccache-action@v0.0.10
+      - name: Build cp312 wheel
+        uses: pypa/cibuildwheel@v4.1.0
+        env:
+          CIBW_BUILD: "cp312-manylinux_x86_64"
+          CIBW_ARCHS: native
+          CIBW_BUILD_FRONTEND: "pip; args: --no-build-isolation"
+          CIBW_MANYLINUX_X86_64_IMAGE: manylinux_2_28
+          CIBW_ENVIRONMENT_PASS_LINUX: CI SCCACHE_GHA_ENABLED ACTIONS_RESULTS_URL ACTIONS_RUNTIME_TOKEN ACTIONS_CACHE_SERVICE_V2
+          CIBW_BEFORE_BUILD: "python3 -m pip install --break-system-packages cmake ninja setuptools sccache"
+          CIBW_ENVIRONMENT: CMAKE_ARGS="-DONNX_USE_PROTOBUF_SHARED_LIBS=OFF" CMAKE_GENERATOR=Ninja CMAKE_CXX_COMPILER_LAUNCHER=sccache CMAKE_LINKER_TYPE=LLD
+          CIBW_REPAIR_WHEEL_COMMAND_LINUX: "auditwheel repair -w {dest_dir} {wheel} --strip"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: onnxsim-wheel
+          path: ./wheelhouse/*.whl
+
+  # Emit the shard index list so the shard count is configurable from
+  # workflow_dispatch while defaulting to 6.
+  setup:
+    name: Plan shards
+    runs-on: ubuntu-24.04
+    outputs:
+      shards: ${{ steps.plan.outputs.shards }}
+      num_shards: ${{ steps.plan.outputs.num_shards }}
+    steps:
+      - id: plan
+        run: |
+          n="${{ github.event.inputs.num_shards || '6' }}"
+          shards=$(python3 -c "import json,sys; print(json.dumps(list(range(int(sys.argv[1])))))" "$n")
+          echo "num_shards=$n" >> "$GITHUB_OUTPUT"
+          echo "shards=$shards" >> "$GITHUB_OUTPUT"
+          echo "planning $n shards: $shards"
+
+  regression:
+    name: Shard ${{ matrix.shard }}
+    needs: [build, setup]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      NUM_SHARDS: ${{ needs.setup.outputs.num_shards }}
+      HF_HUB_ENABLE_HF_TRANSFER: "0"
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ${{ fromJSON(needs.setup.outputs.shards) }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - uses: actions/download-artifact@v8
+        with:
+          name: onnxsim-wheel
+          path: wheelhouse
+      - name: Install onnxsim wheel + deps
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install onnxruntime huggingface_hub
+          python -m pip install wheelhouse/*.whl
+      - name: Verify the installed wheel is used (not the source tree)
+        working-directory: ${{ runner.temp }}
+        run: python -c "import onnxsim, onnxsim.onnxsim_cpp2py_export as m; print(onnxsim.__version__, m.__file__)"
+      - name: Run regression shard
+        working-directory: ${{ runner.temp }}
+        run: |
+          python "$GITHUB_WORKSPACE/scripts/regression/run_regression.py" \
+            --shard "${{ matrix.shard }}" \
+            --num-shards "$NUM_SHARDS" \
+            --timeout 900 \
+            --output "shard-${{ matrix.shard }}.csv"
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: regression-csv-shard-${{ matrix.shard }}
+          path: ${{ runner.temp }}/shard-${{ matrix.shard }}.csv
+          if-no-files-found: ignore
+
+  known-slow:
+    name: Known-slow models (non-blocking)
+    needs: [build]
+    if: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.include_slow == 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - uses: actions/download-artifact@v8
+        with:
+          name: onnxsim-wheel
+          path: wheelhouse
+      - name: Install onnxsim wheel + deps
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install onnxruntime huggingface_hub
+          python -m pip install wheelhouse/*.whl
+      - name: Run known-slow models
+        working-directory: ${{ runner.temp }}
+        run: |
+          python "$GITHUB_WORKSPACE/scripts/regression/run_regression.py" \
+            --slow-only \
+            --timeout 2400 \
+            --output "slow.csv"
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: regression-csv-slow
+          path: ${{ runner.temp }}/slow.csv
+          if-no-files-found: ignore
+
+  summary:
+    name: Summary
+    needs: [regression, known-slow]
+    if: always()
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      issues: write # open/update/close the failure-tracking issue
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: regression-csv-*
+          path: csvs
+          merge-multiple: true
+      # Writes regression-report.csv + regression-summary.md, appends the run
+      # summary, and sets outputs.status=pass|fail. Kept from failing the step
+      # here (continue-on-error) so the issue-reporting step always runs; the
+      # final step re-raises the failure to keep the workflow red.
+      - name: Build summary
+        id: sum
+        continue-on-error: true
+        run: python "$GITHUB_WORKSPACE/scripts/regression/summarize.py" "csvs/*.csv"
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: regression-report
+          path: |
+            regression-report.csv
+            regression-summary.md
+          if-no-files-found: ignore
+      # On a scheduled/manual run, file (or update) a tracking issue when the
+      # regression fails, and close it when it goes green again. Skipped on
+      # pull_request runs, which only validate the harness.
+      - name: Report result to tracking issue
+        if: ${{ always() && github.event_name != 'pull_request' }}
+        uses: actions/github-script@v7
+        env:
+          STATUS: ${{ steps.sum.outputs.status }}
+        with:
+          script: |
+            const fs = require('fs');
+            const { owner, repo } = context.repo;
+            const status = process.env.STATUS || 'fail';
+            const runUrl = `${process.env.GITHUB_SERVER_URL}/${owner}/${repo}/actions/runs/${context.runId}`;
+            const TITLE = 'Weekly model regression failing';
+            let report = '';
+            try { report = fs.readFileSync('regression-summary.md', 'utf8'); } catch (e) {}
+            const footer = `\n\n[Full run, logs & CSV artifacts](${runUrl})\n\n_Filed automatically by the Model Regression workflow._`;
+
+            const issues = await github.paginate(github.rest.issues.listForRepo, {
+              owner, repo, state: 'open', per_page: 100,
+            });
+            const existing = issues.find(i => i.title === TITLE && !i.pull_request);
+
+            if (status === 'fail') {
+              const body = report + footer;
+              if (existing) {
+                await github.rest.issues.update({ owner, repo, issue_number: existing.number, body });
+                await github.rest.issues.createComment({
+                  owner, repo, issue_number: existing.number,
+                  body: `Still failing as of ${runUrl}` + footer,
+                });
+                core.notice(`Updated regression issue #${existing.number}`);
+              } else {
+                const created = await github.rest.issues.create({ owner, repo, title: TITLE, body });
+                core.notice(`Opened regression issue #${created.data.number}`);
+              }
+            } else if (existing) {
+              await github.rest.issues.createComment({
+                owner, repo, issue_number: existing.number,
+                body: `✅ Regression green again as of ${runUrl}. Closing.` + footer,
+              });
+              await github.rest.issues.update({ owner, repo, issue_number: existing.number, state: 'closed' });
+              core.notice(`Closed regression issue #${existing.number}`);
+            }
+      # Re-raise the failure the summary step swallowed, so the workflow is red.
+      - name: Fail if regression failed
+        if: ${{ steps.sum.outputs.status == 'fail' }}
+        run: |
+          echo "::error::Model regression had blocking failures"
+          exit 1
