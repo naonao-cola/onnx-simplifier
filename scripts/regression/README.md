@@ -47,6 +47,30 @@ python scripts/regression/summarize.py "shard-*.csv" slow.csv
 
 ## Updating the model set
 
-Edit `models.json`. `baseline_seconds` only affects how models are distributed
-across shards; a rough value is fine. Set `known_slow: true` for anything that
-regularly exceeds ~15 min so it stays out of the blocking shards.
+`models.json` is a curated spread across architecture families, not every
+export in the org. Edit it by hand for one-off tweaks, or use
+`select_models.py` to regenerate/extend it from the Hugging Face
+[`onnxmodelzoo`](https://huggingface.co/onnxmodelzoo) org:
+
+```bash
+# family coverage: what the org has vs what the set represents (no changes)
+python scripts/regression/select_models.py
+
+# bump every entry to the newest Opset export of the same model
+python scripts/regression/select_models.py --refresh --write
+
+# add widely-used NLP transformers (one newest-opset representative each)
+python scripts/regression/select_models.py \
+  --add '^(distilbert|roberta|albert|electra|deberta|bart|xlnet|mobilebert|mpnet|longformer|gpt2|opt)_Opset' --write
+```
+
+It preserves existing `baseline_*` and `known_slow` across a regenerate and
+gives new entries null baselines. Offline, pass `--ids-file <cached.json>` (a
+JSON list of `onnxmodelzoo/<name>`) instead of hitting the API.
+
+Field notes: `baseline_seconds` only affects how models are distributed across
+shards; a rough value is fine (new entries default to 0 and land in the
+lightest shard until a run fills them in). Set `known_slow: true` for anything
+that regularly exceeds ~15 min so it stays out of the blocking shards. After
+adding models, run `run_regression.py` once to populate baselines and confirm
+they pass before relying on them.
