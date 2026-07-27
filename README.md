@@ -168,6 +168,57 @@ the standalone `onnxsim` binary (`--target-opset`), and the
 [web version](https://onnxsim.github.io/onnxsim/) (the "target opset version"
 field).
 
+## Constant folding on the GPU (CUDA execution provider)
+
+onnxsim constant-folds by running the foldable sub-graphs through ONNX Runtime.
+By default it uses the CPU execution provider, which is always available and
+gives deterministic results. For large models it can be much faster to fold on
+an NVIDIA GPU. Pass `providers` to `simplify` to choose the ONNX Runtime
+[execution providers](https://onnxruntime.ai/docs/execution-providers/), in
+priority order:
+
+```python
+import onnx
+import onnxsim
+
+model = onnx.load(filename)
+
+# Fold on the GPU, falling back to CPU for ops CUDA cannot run.
+model_simp, check = onnxsim.simplify(
+    model, providers=["CUDAExecutionProvider", "CPUExecutionProvider"]
+)
+```
+
+On the command line:
+
+```
+# Explicit provider list (priority order):
+onnxsim input_onnx_model output_onnx_model \
+    --providers CUDAExecutionProvider CPUExecutionProvider
+
+# Or the shortcut, equivalent to the line above:
+onnxsim input_onnx_model output_onnx_model --cuda
+```
+
+Keeping `CPUExecutionProvider` last is recommended: ONNX Runtime falls back to
+it for any operator the GPU provider cannot run. Each provider entry may also be
+a `(name, options)` tuple, exactly as
+[`onnxruntime.InferenceSession`](https://onnxruntime.ai/docs/api/python/api_summary.html)
+accepts it, for example to pin a specific `device_id`:
+
+```python
+model_simp, check = onnxsim.simplify(
+    model,
+    providers=[("CUDAExecutionProvider", {"device_id": 1}), "CPUExecutionProvider"],
+)
+```
+
+The CUDA execution provider requires the GPU build of ONNX Runtime
+(`pip install onnxruntime-gpu`). If you request a provider the installed ONNX
+Runtime does not offer, onnxsim raises a `ValueError` listing the available
+providers instead of silently folding on the CPU. When `providers` is left
+unset (the default), folding runs on the CPU.
+
 ## Custom rewriters
 
 Beyond the built-in optimizer passes, you can plug your own graph rewriting
