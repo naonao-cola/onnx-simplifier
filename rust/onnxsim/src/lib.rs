@@ -241,11 +241,15 @@ pub fn simplify_with(model_bytes: &[u8], options: &Options) -> Result<Vec<u8>, E
         // Borrow the rule byte buffers into the pointer/size arrays the C API
         // expects; these locals stay alive across the call below.
         let rules = &options.function_rewrite_rules;
-        let pattern_ptrs: Vec<*const c_void> =
-            rules.iter().map(|(p, _)| p.as_ptr() as *const c_void).collect();
+        let pattern_ptrs: Vec<*const c_void> = rules
+            .iter()
+            .map(|(p, _)| p.as_ptr() as *const c_void)
+            .collect();
         let pattern_sizes: Vec<usize> = rules.iter().map(|(p, _)| p.len()).collect();
-        let replacement_ptrs: Vec<*const c_void> =
-            rules.iter().map(|(_, r)| r.as_ptr() as *const c_void).collect();
+        let replacement_ptrs: Vec<*const c_void> = rules
+            .iter()
+            .map(|(_, r)| r.as_ptr() as *const c_void)
+            .collect();
         let replacement_sizes: Vec<usize> = rules.iter().map(|(_, r)| r.len()).collect();
         unsafe {
             onnxsim_sys::onnxsim_simplify_with_rules(

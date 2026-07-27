@@ -63,7 +63,10 @@ fn simplify_with_function_rules() {
     let opts = onnxsim::Options::new().function_rewrite_rule(pattern_bytes, replacement_bytes);
     let simplified =
         onnxsim::simplify_with(&model_bytes, &opts).expect("simplify_with should succeed");
-    assert!(!simplified.is_empty(), "simplified model should not be empty");
+    assert!(
+        !simplified.is_empty(),
+        "simplified model should not be empty"
+    );
     assert_ne!(
         simplified, model_bytes,
         "the rule should have rewritten the model"
