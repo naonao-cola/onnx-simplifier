@@ -87,7 +87,8 @@ class CApiGraphRewriter : public GraphRewriter {
     size_t out_size = 0;
     const int rc = fn_(user_data_, in.data(), in.size(), &out_data, &out_size);
     if (rc < 0) {
-      throw std::runtime_error("the custom rewriter callback reported an error");
+      throw std::runtime_error(
+          "the custom rewriter callback reported an error");
     }
     if (rc == 0) {
       // Nothing was rewritten this round: keep the model unchanged.
@@ -123,17 +124,14 @@ class CApiGraphRewriter : public GraphRewriter {
 
 extern "C" {
 
-OnnxsimStatus onnxsim_simplify(const void* model_data, size_t model_size,
-                               const char* const* skip_optimizers,
-                               size_t num_skip_optimizers,
-                               int skip_optimizers_is_null,
-                               int constant_folding, int shape_inference,
-                               size_t tensor_size_threshold,
-                               int target_opset_version,
-                               OnnxsimRewriteFn rewrite_fn,
-                               OnnxsimRewriteFreeFn rewrite_free_fn,
-                               void* rewrite_user_data, void** out_data,
-                               size_t* out_size, char** out_error) {
+OnnxsimStatus onnxsim_simplify(
+    const void* model_data, size_t model_size,
+    const char* const* skip_optimizers, size_t num_skip_optimizers,
+    int skip_optimizers_is_null, int constant_folding, int shape_inference,
+    size_t tensor_size_threshold, int target_opset_version,
+    OnnxsimRewriteFn rewrite_fn, OnnxsimRewriteFreeFn rewrite_free_fn,
+    void* rewrite_user_data, void** out_data, size_t* out_size,
+    char** out_error) {
   if (out_data != nullptr) {
     *out_data = nullptr;
   }
