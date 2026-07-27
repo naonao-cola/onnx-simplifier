@@ -8,9 +8,12 @@
 #include <cstring>
 #include <exception>
 #include <optional>
+#include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
+#include "function_rewriter.h"
 #include "onnx/proto_utils.h"
 #include "onnxoptimizer/optimize.h"
 #include "onnxsim.h"
@@ -66,17 +69,18 @@ std::optional<int> BuildTargetOpsetVersion(int target_opset_version) {
   return target_opset_version;
 }
 
-}  // namespace
-
-extern "C" {
-
-OnnxsimStatus onnxsim_simplify(const void* model_data, size_t model_size,
+// Shared body of onnxsim_simplify / onnxsim_simplify_with_rules: parse the
+// model, simplify it (optionally with `rewriter`), and hand back a freshly
+// malloc'd buffer of serialized bytes. All out-parameters follow the C API
+// contract documented in the header.
+OnnxsimStatus SimplifyToBuffer(const void* model_data, size_t model_size,
                                const char* const* skip_optimizers,
                                size_t num_skip_optimizers,
                                int skip_optimizers_is_null,
                                int constant_folding, int shape_inference,
                                size_t tensor_size_threshold,
-                               int target_opset_version, void** out_data,
+                               int target_opset_version,
+                               const GraphRewriter* rewriter, void** out_data,
                                size_t* out_size, char** out_error) {
   if (out_data != nullptr) {
     *out_data = nullptr;
@@ -105,7 +109,7 @@ OnnxsimStatus onnxsim_simplify(const void* model_data, size_t model_size,
         BuildSkipOptimizers(skip_optimizers, num_skip_optimizers,
                             skip_optimizers_is_null),
         constant_folding != 0, shape_inference != 0, tensor_size_threshold,
-        BuildTargetOpsetVersion(target_opset_version));
+        BuildTargetOpsetVersion(target_opset_version), rewriter);
 
     std::string out;
     if (!result.SerializeToString(&out)) {
@@ -129,6 +133,99 @@ OnnxsimStatus onnxsim_simplify(const void* model_data, size_t model_size,
     return ONNXSIM_ERROR;
   } catch (...) {
     SetError(out_error, "unknown error while simplifying the model");
+    return ONNXSIM_ERROR;
+  }
+}
+
+// Parse `num_rules` (pattern, replacement) FunctionProto pairs from the given
+// byte buffers into rewrite rules. Throws std::runtime_error on a parse
+// failure.
+std::vector<onnxsim::FunctionRewriteRule> BuildRewriteRules(
+    const void* const* pattern_data, const size_t* pattern_sizes,
+    const void* const* replacement_data, const size_t* replacement_sizes,
+    size_t num_rules) {
+  std::vector<onnxsim::FunctionRewriteRule> rules;
+  rules.reserve(num_rules);
+  for (size_t i = 0; i < num_rules; ++i) {
+    onnxsim::FunctionRewriteRule rule;
+    if (!ParseProtoFromBytes(&rule.pattern,
+                             static_cast<const char*>(pattern_data[i]),
+                             pattern_sizes[i])) {
+      throw std::runtime_error("failed to parse pattern FunctionProto");
+    }
+    if (!ParseProtoFromBytes(&rule.replacement,
+                             static_cast<const char*>(replacement_data[i]),
+                             replacement_sizes[i])) {
+      throw std::runtime_error("failed to parse replacement FunctionProto");
+    }
+    rules.push_back(std::move(rule));
+  }
+  return rules;
+}
+
+}  // namespace
+
+extern "C" {
+
+OnnxsimStatus onnxsim_simplify(const void* model_data, size_t model_size,
+                               const char* const* skip_optimizers,
+                               size_t num_skip_optimizers,
+                               int skip_optimizers_is_null,
+                               int constant_folding, int shape_inference,
+                               size_t tensor_size_threshold,
+                               int target_opset_version, void** out_data,
+                               size_t* out_size, char** out_error) {
+  return SimplifyToBuffer(model_data, model_size, skip_optimizers,
+                          num_skip_optimizers, skip_optimizers_is_null,
+                          constant_folding, shape_inference,
+                          tensor_size_threshold, target_opset_version,
+                          /*rewriter=*/nullptr, out_data, out_size, out_error);
+}
+
+OnnxsimStatus onnxsim_simplify_with_rules(
+    const void* model_data, size_t model_size,
+    const char* const* skip_optimizers, size_t num_skip_optimizers,
+    int skip_optimizers_is_null, int constant_folding, int shape_inference,
+    size_t tensor_size_threshold, int target_opset_version,
+    const void* const* pattern_data, const size_t* pattern_sizes,
+    const void* const* replacement_data, const size_t* replacement_sizes,
+    size_t num_rules, void** out_data, size_t* out_size, char** out_error) {
+  // With no rules this is just onnxsim_simplify.
+  if (num_rules == 0) {
+    return onnxsim_simplify(model_data, model_size, skip_optimizers,
+                            num_skip_optimizers, skip_optimizers_is_null,
+                            constant_folding, shape_inference,
+                            tensor_size_threshold, target_opset_version,
+                            out_data, out_size, out_error);
+  }
+  if (out_data != nullptr) {
+    *out_data = nullptr;
+  }
+  if (out_size != nullptr) {
+    *out_size = 0;
+  }
+  if (out_error != nullptr) {
+    *out_error = nullptr;
+  }
+  if (pattern_data == nullptr || pattern_sizes == nullptr ||
+      replacement_data == nullptr || replacement_sizes == nullptr) {
+    SetError(out_error, "onnxsim_simplify_with_rules: rule array is NULL");
+    return ONNXSIM_ERROR;
+  }
+  try {
+    onnxsim::FunctionProtoRewriter rewriter(
+        BuildRewriteRules(pattern_data, pattern_sizes, replacement_data,
+                          replacement_sizes, num_rules));
+    return SimplifyToBuffer(model_data, model_size, skip_optimizers,
+                            num_skip_optimizers, skip_optimizers_is_null,
+                            constant_folding, shape_inference,
+                            tensor_size_threshold, target_opset_version,
+                            &rewriter, out_data, out_size, out_error);
+  } catch (const std::exception& e) {
+    SetError(out_error, e.what());
+    return ONNXSIM_ERROR;
+  } catch (...) {
+    SetError(out_error, "unknown error while building rewrite rules");
     return ONNXSIM_ERROR;
   }
 }

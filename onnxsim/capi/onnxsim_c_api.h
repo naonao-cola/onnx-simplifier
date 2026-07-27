@@ -65,6 +65,30 @@ ONNXSIM_C_API OnnxsimStatus onnxsim_simplify(
     size_t* out_size, char** out_error);
 
 /*
+ * Same as onnxsim_simplify, but also applies a set of data-driven rewrite rules
+ * inside the simplification fixed point. Each rule is a (pattern, replacement)
+ * pair of serialized ONNX FunctionProto: the pattern's inputs are wildcards
+ * binding to graph values, its body is the subgraph to match, and its outputs
+ * are rewired to the replacement's outputs. This is the same
+ * FunctionProto-based rewriter the Python and Rust bindings expose, so a rule
+ * set authored once (e.g. via onnx.parser.parse_function) works from any
+ * binding without depending on onnxscript.
+ *
+ * `pattern_data[i]`/`pattern_sizes[i]` and `replacement_data[i]`/
+ * `replacement_sizes[i]` describe rule `i`, for `i` in [0, num_rules). Passing
+ * num_rules == 0 behaves exactly like onnxsim_simplify. All other parameters
+ * match onnxsim_simplify.
+ */
+ONNXSIM_C_API OnnxsimStatus onnxsim_simplify_with_rules(
+    const void* model_data, size_t model_size,
+    const char* const* skip_optimizers, size_t num_skip_optimizers,
+    int skip_optimizers_is_null, int constant_folding, int shape_inference,
+    size_t tensor_size_threshold, int target_opset_version,
+    const void* const* pattern_data, const size_t* pattern_sizes,
+    const void* const* replacement_data, const size_t* replacement_sizes,
+    size_t num_rules, void** out_data, size_t* out_size, char** out_error);
+
+/*
  * Same as onnxsim_simplify, but reads the input model from `in_path` and writes
  * the simplified model to `out_path`. On failure, *out_error receives a message
  * (free with onnxsim_free_string).

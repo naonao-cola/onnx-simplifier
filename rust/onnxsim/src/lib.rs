@@ -96,6 +96,10 @@ pub struct Options {
     /// Target opset version (of the default ONNX domain) to convert the model
     /// to before simplifying. `None` leaves the opset version unchanged.
     target_opset_version: Option<i32>,
+    /// FunctionProto-based rewrite rules applied inside the fixed point. Each
+    /// entry is a `(pattern, replacement)` pair of serialized `FunctionProto`
+    /// bytes. Empty (the default) means no rule-based rewriting.
+    function_rewrite_rules: Vec<(Vec<u8>, Vec<u8>)>,
 }
 
 impl Default for Options {
@@ -106,6 +110,7 @@ impl Default for Options {
             shape_inference: true,
             tensor_size_threshold: DEFAULT_TENSOR_SIZE_THRESHOLD,
             target_opset_version: None,
+            function_rewrite_rules: Vec::new(),
         }
     }
 }
@@ -176,6 +181,26 @@ impl Options {
             .push(name.into());
         self
     }
+
+    /// Add a FunctionProto-based rewrite rule, matched and applied by onnxsim's
+    /// C++ core inside the simplification fixed point.
+    ///
+    /// `pattern` and `replacement` are serialized `onnx.FunctionProto` bytes:
+    /// the pattern's inputs are wildcards binding to graph values, its body is
+    /// the subgraph to match, and its outputs are rewired to the replacement's
+    /// outputs. The same rules work from the Python and C bindings; this is the
+    /// language-agnostic counterpart to onnxscript's Python rewriter. Only
+    /// [`simplify`]/[`simplify_with`] apply the rules; the path-based variants
+    /// reject a non-empty rule set.
+    pub fn function_rewrite_rule(
+        mut self,
+        pattern: impl Into<Vec<u8>>,
+        replacement: impl Into<Vec<u8>>,
+    ) -> Self {
+        self.function_rewrite_rules
+            .push((pattern.into(), replacement.into()));
+        self
+    }
 }
 
 /// Simplify a serialized ONNX `ModelProto` with default options.
@@ -195,21 +220,54 @@ pub fn simplify_with(model_bytes: &[u8], options: &Options) -> Result<Vec<u8>, E
     let mut out_size: usize = 0;
     let mut out_error: *mut c_char = ptr::null_mut();
 
-    let status = unsafe {
-        onnxsim_sys::onnxsim_simplify(
-            model_bytes.as_ptr() as *const c_void,
-            model_bytes.len(),
-            ffi.ptr(),
-            ffi.len(),
-            ffi.is_null_flag(),
-            bool_to_c(options.constant_folding),
-            bool_to_c(options.shape_inference),
-            options.tensor_size_threshold,
-            target_opset_to_c(options.target_opset_version),
-            &mut out_data,
-            &mut out_size,
-            &mut out_error,
-        )
+    let status = if options.function_rewrite_rules.is_empty() {
+        unsafe {
+            onnxsim_sys::onnxsim_simplify(
+                model_bytes.as_ptr() as *const c_void,
+                model_bytes.len(),
+                ffi.ptr(),
+                ffi.len(),
+                ffi.is_null_flag(),
+                bool_to_c(options.constant_folding),
+                bool_to_c(options.shape_inference),
+                options.tensor_size_threshold,
+                target_opset_to_c(options.target_opset_version),
+                &mut out_data,
+                &mut out_size,
+                &mut out_error,
+            )
+        }
+    } else {
+        // Borrow the rule byte buffers into the pointer/size arrays the C API
+        // expects; these locals stay alive across the call below.
+        let rules = &options.function_rewrite_rules;
+        let pattern_ptrs: Vec<*const c_void> =
+            rules.iter().map(|(p, _)| p.as_ptr() as *const c_void).collect();
+        let pattern_sizes: Vec<usize> = rules.iter().map(|(p, _)| p.len()).collect();
+        let replacement_ptrs: Vec<*const c_void> =
+            rules.iter().map(|(_, r)| r.as_ptr() as *const c_void).collect();
+        let replacement_sizes: Vec<usize> = rules.iter().map(|(_, r)| r.len()).collect();
+        unsafe {
+            onnxsim_sys::onnxsim_simplify_with_rules(
+                model_bytes.as_ptr() as *const c_void,
+                model_bytes.len(),
+                ffi.ptr(),
+                ffi.len(),
+                ffi.is_null_flag(),
+                bool_to_c(options.constant_folding),
+                bool_to_c(options.shape_inference),
+                options.tensor_size_threshold,
+                target_opset_to_c(options.target_opset_version),
+                pattern_ptrs.as_ptr(),
+                pattern_sizes.as_ptr(),
+                replacement_ptrs.as_ptr(),
+                replacement_sizes.as_ptr(),
+                rules.len(),
+                &mut out_data,
+                &mut out_size,
+                &mut out_error,
+            )
+        }
     };
 
     if status == onnxsim_sys::ONNXSIM_OK {
@@ -239,6 +297,13 @@ pub fn simplify_path_with<P: AsRef<Path>, Q: AsRef<Path>>(
     output_path: Q,
     options: &Options,
 ) -> Result<(), Error> {
+    if !options.function_rewrite_rules.is_empty() {
+        return Err(Error::InvalidArgument(
+            "function_rewrite_rules are only supported by simplify/simplify_with, \
+             not the path-based variants"
+                .to_string(),
+        ));
+    }
     let in_c = path_to_cstring(input_path.as_ref())?;
     let out_c = path_to_cstring(output_path.as_ref())?;
     let ffi = FfiSkipOptimizers::new(options)?;

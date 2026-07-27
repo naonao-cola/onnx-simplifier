@@ -278,6 +278,76 @@ A few things to keep in mind:
   pass over `model.graph`, an [onnx-graphsurgeon](https://github.com/NVIDIA/TensorRT/tree/main/tools/onnx-graphsurgeon)
   edit, etc. — as long as it takes and returns a `ModelProto`.
 
+### FunctionProto rules (works in every binding)
+
+`custom_rewriter` takes a Python **callable**, so it only works from the Python
+binding. If instead you express a rule as **pure data** — a `(pattern,
+replacement)` pair of `onnx.FunctionProto` — onnxsim matches and applies it in
+its C++ core, so the *same* rule set also works from the C and Rust bindings
+with no dependency on onnxscript. The pattern's inputs are wildcards that bind
+to graph values, its body is the subgraph to match, and its outputs are rewired
+to the replacement's outputs. Build the FunctionProtos with
+`onnx.parser.parse_function`:
+
+```python
+import onnx
+import onnxsim
+from onnx import parser
+
+pattern = parser.parse_function("""
+<domain: "com.example", opset_import: ["" : 18]>
+matmul_add_pattern (x, w, b) => (y)
+{
+    t = MatMul(x, w)
+    y = Add(t, b)
+}
+""")
+replacement = parser.parse_function("""
+<domain: "com.example", opset_import: ["" : 18]>
+gemm_replacement (x, w, b) => (y)
+{
+    y = Gemm(x, w, b)
+}
+""")
+
+model = onnx.load("model.onnx")
+model_simp, check = onnxsim.simplify(
+    model, function_rewrite_rules=[(pattern, replacement)]
+)
+```
+
+This is enough to stand in for a hand-written onnxoptimizer pass: the rule above
+reproduces the built-in `fuse_matmul_add_bias_into_gemm` fusion. Skip the
+built-in pass and let the rule do it:
+
+```python
+model_simp, check = onnxsim.simplify(
+    model,
+    skipped_optimizers=["fuse_matmul_add_bias_into_gemm"],
+    function_rewrite_rules=[(pattern, replacement)],
+)
+```
+
+A node attribute written `@name` (an ONNX-text *ref attribute*) is an attribute
+wildcard: it binds the matched node's attribute and is substituted into the
+replacement. `function_rewrite_rules` is mutually exclusive with
+`custom_rewriter`.
+
+From C, call `onnxsim_simplify_with_rules` with the serialized FunctionProto
+pairs (see `onnxsim/capi/onnxsim_c_api.h`); from Rust, use
+`Options::function_rewrite_rule(pattern_bytes, replacement_bytes)`.
+
+**Capabilities and limits of the built-in matcher.** It matches arbitrary
+connected DAG patterns with one or more outputs, tries both operand orders for
+the commutative binary ops (`Add`, `Mul`, …), matches attributes exactly or as
+`@name` wildcards, matches a pattern `Constant` against a byte-equal
+initializer, and refuses a rewrite that would break a value consumed outside the
+match. It does **not** (in this version) traverse `If`/`Loop`/`Scan` subgraph
+bodies, handle variadic/optional-input arity mismatches, match >2-operand
+commutative permutations, or evaluate attribute *predicates* — for those, the
+Python-only `onnxscript.rewriter` via `custom_rewriter` remains the richer
+option.
+
 ## Projects Using ONNX Simplifier
 
 * [MXNet](https://mxnet.apache.org/versions/1.9.1/api/python/docs/tutorials/deploy/export/onnx.html#Simplify-the-exported-ONNX-model)

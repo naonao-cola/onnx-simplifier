@@ -4,6 +4,7 @@
 
 #include <nanobind/nanobind.h>
 #include <nanobind/stl/optional.h>
+#include <nanobind/stl/pair.h>
 #include <nanobind/stl/shared_ptr.h>
 #include <nanobind/stl/string.h>
 #include <nanobind/stl/tuple.h>
@@ -15,6 +16,7 @@
 #include <tuple>
 #include <vector>
 
+#include "function_rewriter.h"
 #include "onnx/defs/schema.h"
 #include "onnx/defs/shape_inference.h"
 #include "onnx/proto_utils.h"
@@ -69,6 +71,7 @@ ONNXSIM_PROTO_CASTER(AttributeProto, "onnx.AttributeProto")
 ONNXSIM_PROTO_CASTER(TypeProto, "onnx.TypeProto")
 ONNXSIM_PROTO_CASTER(NodeProto, "onnx.NodeProto")
 ONNXSIM_PROTO_CASTER(TensorProto, "onnx.TensorProto")
+ONNXSIM_PROTO_CASTER(FunctionProto, "onnx.FunctionProto")
 
 #undef ONNXSIM_PROTO_CASTER
 }  // namespace detail
@@ -303,7 +306,7 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
           std::optional<std::vector<std::string>> skip_optimizers,
           bool constant_folding, bool shape_inference,
           size_t tensor_size_threshold, std::optional<int> target_opset_version,
-          std::shared_ptr<PyGraphRewriter> rewriter) -> py::bytes {
+          std::shared_ptr<GraphRewriter> rewriter) -> py::bytes {
          // force env initialization to register opset
          InitEnv();
          ONNX_NAMESPACE::ModelProto model;
@@ -329,7 +332,7 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
              bool constant_folding, bool shape_inference,
              size_t tensor_size_threshold,
              std::optional<int> target_opset_version,
-             std::shared_ptr<PyGraphRewriter> rewriter) -> bool {
+             std::shared_ptr<GraphRewriter> rewriter) -> bool {
             // force env initialization to register opset
             InitEnv();
             SimplifyPath(*executor, in_path, out_path, skip_optimizers,
@@ -456,7 +459,32 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
       .def(py::init<>())
       .def("Run", &PyModelExecutor::_PyRun);
 
-  py::class_<PyGraphRewriter, PyGraphRewriterTrampoline>(m, "GraphRewriter")
+  // The abstract C++ base shared by every rewriter kind. It carries no Python
+  // constructor; ``simplify``/``simplify_path`` accept any subclass.
+  py::class_<GraphRewriter>(m, "_GraphRewriterBase");
+
+  // The Python-callable rewriter (an ``onnxscript.rewriter`` rule set, etc.).
+  py::class_<PyGraphRewriter, GraphRewriter, PyGraphRewriterTrampoline>(
+      m, "GraphRewriter")
       .def(py::init<>())
       .def("Run", &PyGraphRewriter::_PyRun);
+
+  // The data-driven rewriter: a list of (pattern, replacement) FunctionProto
+  // pairs. Being pure data, it works from every binding, not just Python.
+  py::class_<onnxsim::FunctionProtoRewriter, GraphRewriter>(
+      m, "FunctionProtoRewriter")
+      .def(
+          "__init__",
+          [](onnxsim::FunctionProtoRewriter* self,
+             std::vector<std::pair<onnx::FunctionProto, onnx::FunctionProto>>
+                 rules) {
+            std::vector<onnxsim::FunctionRewriteRule> converted;
+            converted.reserve(rules.size());
+            for (auto& pair : rules) {
+              converted.push_back(onnxsim::FunctionRewriteRule{
+                  std::move(pair.first), std::move(pair.second)});
+            }
+            new (self) onnxsim::FunctionProtoRewriter(std::move(converted));
+          },
+          "rules"_a);
 }
