@@ -20,8 +20,10 @@ op.Gemm(..., **attrs)`` or ``ReshapeReshape.rewrite``'s
 ``op.initializer(ir.Tensor(self._new_shape, ...))`` -- is *not* compilable this
 way and raises. In practice the ``pattern`` side of a rule is usually structural
 (so it compiles), while the ``rewrite`` side often is not, so you pair a
-compiled pattern with a simple replacement function. This matches onnxsim's own
-matcher limits.
+compiled pattern with a simple replacement function. Some rules do have a
+structural rewrite too -- e.g. ``FuseSuccessiveRelu`` (``Relu(Relu(x)) ->
+Relu(x)``), whose rewrite is a plain ``op.Relu(x)`` -- and compile end to end
+from their own methods. This matches onnxsim's own matcher limits.
 """
 
 import ast
@@ -45,6 +47,22 @@ common = pytest.importorskip("onnxscript.rewriter.rules.common")
 _rewriter = pytest.importorskip("onnxscript.rewriter")
 
 
+class _StripAnnotations(ast.NodeTransformer):
+    """Drop parameter/return annotations. Rewrite-rule methods annotate their
+    tensor parameters ``x: ir.Value`` (onnxscript's rewriter typing), which the
+    ``@script`` converter rejects; the annotations carry no meaning for a
+    structural op graph, so remove them."""
+
+    def visit_arg(self, node):
+        node.annotation = None
+        return node
+
+    def visit_FunctionDef(self, node):
+        node.returns = None
+        self.generic_visit(node)
+        return node
+
+
 def _compile_fn_to_function_proto(fn, *, opset_version=18, name=None):
     """Compile ``fn(op, *inputs)`` / ``fn(self, op, *inputs)`` to a FunctionProto.
 
@@ -59,6 +77,8 @@ def _compile_fn_to_function_proto(fn, *, opset_version=18, name=None):
     fdef = ast.parse(src).body[0]
     fdef.decorator_list = []
     fdef.args.args = [a for a in fdef.args.args if a.arg not in ("self", "op")]
+    _StripAnnotations().visit(fdef)
+    ast.fix_missing_locations(fdef)
     if name is not None:
         fdef.name = name
     env = {**getattr(inspect.getmodule(fn), "__dict__", {}), "op": op_builder}
@@ -179,6 +199,42 @@ def test_compiled_reshape_reshape_pattern_from_real_rule():
 
     theirs = _apply_onnxscript_rule(build(), common.reshape_reshape_rule)
     assert _op_types(theirs)["Reshape"] == 1, _op_types(theirs)
+
+
+def test_compiled_successive_relu_both_from_real_rule():
+    """Some rules have *both* a structural pattern and a structural rewrite --
+    ``FuseSuccessiveRelu`` (``Relu(Relu(x)) -> Relu(x)``), whose rewrite is a
+    plain ``op.Relu(x)`` with no match-derived attributes -- so the whole rule
+    compiles straight from its own methods."""
+    from onnxscript.rewriter.rules.common._fuse_relus_clips import FuseSuccessiveRelu
+
+    pattern_fp = _compile_fn_to_function_proto(FuseSuccessiveRelu.pattern, name="pat")
+    replacement_fp = _compile_fn_to_function_proto(
+        FuseSuccessiveRelu.rewrite, name="rep"
+    )
+    assert [n.op_type for n in pattern_fp.node] == ["Relu", "Relu"]
+    assert [n.op_type for n in replacement_fp.node] == ["Relu"]
+
+    def build():
+        nodes = [
+            helper.make_node("Relu", ["x"], ["t"]),
+            helper.make_node("Relu", ["t"], ["y"]),
+        ]
+        graph = helper.make_graph(
+            nodes, "g", [_vi("x", [2, 2])], [_vi("y", [2, 2])], []
+        )
+        return helper.make_model(
+            graph, opset_imports=[helper.make_opsetid("", 18)], ir_version=10
+        )
+
+    ours, check_ok = onnxsim.simplify(
+        build(), check_n=2, function_rewrite_rules=[(pattern_fp, replacement_fp)]
+    )
+    assert _op_types(ours)["Relu"] == 1, _op_types(ours)
+    assert check_ok
+
+    theirs = _apply_onnxscript_rule(build(), common.successive_relu_rule)
+    assert _op_types(theirs)["Relu"] == 1, _op_types(theirs)
 
 
 def test_nonstructural_rewrite_method_is_rejected():
