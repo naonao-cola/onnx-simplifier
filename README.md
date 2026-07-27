@@ -307,6 +307,113 @@ callback) to `onnxsim_simplify` / `onnxsim_simplify_path`; see
 The only binding without it is the standalone CLI, which has no way to carry a
 user callback.
 
+### FunctionProto rules (works in every binding)
+
+`custom_rewriter` takes a Python **callable**, so it only works from the Python
+binding. If instead you express a rule as **pure data** — a `(pattern,
+replacement)` pair of `onnx.FunctionProto` — onnxsim matches and applies it in
+its C++ core, so the *same* rule set also works from the C and Rust bindings
+with no dependency on onnxscript. The pattern's inputs are wildcards that bind
+to graph values, its body is the subgraph to match, and its outputs are rewired
+to the replacement's outputs. Build the FunctionProtos with
+`onnx.parser.parse_function`:
+
+```python
+import onnx
+import onnxsim
+from onnx import parser
+
+pattern = parser.parse_function("""
+<domain: "com.example", opset_import: ["" : 18]>
+matmul_add_pattern (x, w, b) => (y)
+{
+    t = MatMul(x, w)
+    y = Add(t, b)
+}
+""")
+replacement = parser.parse_function("""
+<domain: "com.example", opset_import: ["" : 18]>
+gemm_replacement (x, w, b) => (y)
+{
+    y = Gemm(x, w, b)
+}
+""")
+
+model = onnx.load("model.onnx")
+model_simp, check = onnxsim.simplify(
+    model, function_rewrite_rules=[(pattern, replacement)]
+)
+```
+
+This is enough to stand in for a hand-written onnxoptimizer pass: the rule above
+reproduces the built-in `fuse_matmul_add_bias_into_gemm` fusion. Skip the
+built-in pass and let the rule do it:
+
+```python
+model_simp, check = onnxsim.simplify(
+    model,
+    skipped_optimizers=["fuse_matmul_add_bias_into_gemm"],
+    function_rewrite_rules=[(pattern, replacement)],
+)
+```
+
+A node attribute written `@name` (an ONNX-text *ref attribute*) is an attribute
+wildcard: it binds the matched node's attribute and is substituted into the
+replacement. `function_rewrite_rules` is mutually exclusive with
+`custom_rewriter`.
+
+Many of onnxscript's ready-made
+[common rewrite rules](https://github.com/microsoft/onnxscript/tree/main/onnxscript/rewriter/rules/common)
+(e.g. `matmul_add_to_gemm_rule`, `reshape_reshape_rule`) are simple structural
+pattern→replacement rules that translate directly into a FunctionProto pair like
+the one above; see `tests/test_function_rewriter_common_rules.py` for worked
+examples that check parity against the onnxscript rule itself.
+
+Instead of writing the ONNX text by hand you can author each side as an
+`onnxscript.script` function and call `.to_function_proto()` — a Python-typed
+attribute parameter (`alpha: float`) even compiles to the `@name` wildcard form:
+
+```python
+from onnxscript import script
+from onnxscript import opset18 as op
+
+@script()
+def matmul_add(a, b, c):
+    return op.Add(op.MatMul(a, b), c)
+
+@script()
+def gemm(a, b, c):
+    return op.Gemm(a, b, c)
+
+model_simp, check = onnxsim.simplify(
+    model,
+    function_rewrite_rules=[(matmul_add.to_function_proto(), gemm.to_function_proto())],
+)
+```
+
+See `tests/test_function_rewriter_onnxscript_script.py` for the `@script`
+approach, including the attribute-wildcard case. To reuse an *existing*
+`onnxscript` rule, its structural `pattern` method can be compiled to a
+FunctionProto through the same `@script` converter —
+`tests/test_function_rewriter_compile_rule.py` shows a small helper that does
+this (paired with a simple replacement), noting the boundary where a rewrite
+that derives attributes from the match can't be compiled that way.
+
+From C, call `onnxsim_simplify_with_rules` with the serialized FunctionProto
+pairs (see `onnxsim/capi/onnxsim_c_api.h`); from Rust, use
+`Options::function_rewrite_rule(pattern_bytes, replacement_bytes)`.
+
+**Capabilities and limits of the built-in matcher.** It matches arbitrary
+connected DAG patterns with one or more outputs, tries both operand orders for
+the commutative binary ops (`Add`, `Mul`, …), matches attributes exactly or as
+`@name` wildcards, matches a pattern `Constant` against a byte-equal
+initializer, and refuses a rewrite that would break a value consumed outside the
+match. It does **not** (in this version) traverse `If`/`Loop`/`Scan` subgraph
+bodies, handle variadic/optional-input arity mismatches, match >2-operand
+commutative permutations, or evaluate attribute *predicates* — for those, the
+Python-only `onnxscript.rewriter` via `custom_rewriter` remains the richer
+option.
+
 ## Projects Using ONNX Simplifier
 
 * [MXNet](https://mxnet.apache.org/versions/1.9.1/api/python/docs/tutorials/deploy/export/onnx.html#Simplify-the-exported-ONNX-model)

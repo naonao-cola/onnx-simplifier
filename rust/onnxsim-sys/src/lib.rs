@@ -72,6 +72,39 @@ extern "C" {
         out_error: *mut *mut c_char,
     ) -> c_int;
 
+    /// Simplify a serialized ONNX `ModelProto`, additionally applying a set of
+    /// FunctionProto-based rewrite rules inside the simplification fixed point.
+    ///
+    /// See `onnxsim_c_api.h` for the full contract. Rule `i` is the
+    /// (pattern, replacement) pair of serialized `FunctionProto` bytes at
+    /// `pattern_data[i]`/`pattern_sizes[i]` and
+    /// `replacement_data[i]`/`replacement_sizes[i]`. `num_rules == 0` behaves
+    /// exactly like [`onnxsim_simplify`].
+    ///
+    /// # Safety
+    /// All non-null pointers must be valid; the rule arrays must each hold
+    /// `num_rules` entries, and every `*_data[i]` must point to at least the
+    /// matching `*_sizes[i]` bytes. Otherwise as [`onnxsim_simplify`].
+    pub fn onnxsim_simplify_with_rules(
+        model_data: *const c_void,
+        model_size: usize,
+        skip_optimizers: *const *const c_char,
+        num_skip_optimizers: usize,
+        skip_optimizers_is_null: c_int,
+        constant_folding: c_int,
+        shape_inference: c_int,
+        tensor_size_threshold: usize,
+        target_opset_version: c_int,
+        pattern_data: *const *const c_void,
+        pattern_sizes: *const usize,
+        replacement_data: *const *const c_void,
+        replacement_sizes: *const usize,
+        num_rules: usize,
+        out_data: *mut *mut c_void,
+        out_size: *mut usize,
+        out_error: *mut *mut c_char,
+    ) -> c_int;
+
     /// Simplify a model read from `in_path`, writing the result to `out_path`.
     ///
     /// # Safety

@@ -29,6 +29,13 @@ TensorShapesWithOptionalKey = Dict[Optional[str], TensorShape]
 # ``False`` reports that nothing was rewritten, which lets onnxsim skip copying
 # an unchanged model back through the C++ core (see ``_GraphRewriterAdapter``).
 ModelRewriter = Callable[[onnx.ModelProto], Union[onnx.ModelProto, bool, None]]
+# A data-driven rewrite rule: a ``(pattern, replacement)`` pair of
+# ``onnx.FunctionProto``. The pattern's inputs are wildcards binding to graph
+# values, its body is the subgraph to match, and its outputs are the values
+# rewired to the replacement's outputs. Unlike ``ModelRewriter`` (a Python
+# callable), a rule is pure data, so the same rules work from the C and Rust
+# bindings too. Build one with ``onnx.parser.parse_function`` (see the README).
+FunctionRewriteRule = Tuple[onnx.FunctionProto, onnx.FunctionProto]
 Unit = Literal["B", "KB", "MB", "GB", "TB"]
 
 UNIT_MAP: dict[Unit, int] = {
@@ -328,6 +335,7 @@ def simplify(
     input_shapes=None,
     target_opset_version: Optional[int] = None,
     custom_rewriter: Optional[ModelRewriter] = None,
+    function_rewrite_rules: Optional[Sequence[FunctionRewriteRule]] = None,
     check_rtol: float = 1e-4,
     check_atol: float = 1e-5,
 ) -> Tuple[onnx.ModelProto, bool]:
@@ -366,6 +374,15 @@ def simplify(
             to report that it rewrote nothing. Returning ``False`` when no rewrite happened (for example
             when an ``onnxscript.rewriter`` pass reports ``PassResult.modified`` is ``False``) lets onnxsim
             skip copying an unchanged model back through the C++ core on that fixed-point round.
+    :param function_rewrite_rules: An optional sequence of ``(pattern, replacement)`` pairs of
+            ``onnx.FunctionProto`` describing data-driven rewrite rules matched and applied natively by
+            onnxsim's C++ core (no onnxscript dependency), so the *same* rules also work from the C and
+            Rust bindings. The pattern's inputs are wildcards binding to graph values, its body is the
+            subgraph to match, and its outputs are rewired to the replacement's outputs; a node attribute
+            written ``@name`` (a ``ref_attr_name``) is an attribute wildcard bound and substituted into the
+            replacement. Build the FunctionProtos with ``onnx.parser.parse_function``. Runs inside the same
+            fixed point as ``custom_rewriter`` and is mutually exclusive with it (passing both raises
+            ``ValueError``).
     :param check_rtol: Relative tolerance used by the ``check_n`` verification when comparing the
             original and simplified outputs (``numpy.allclose``). The default (1e-4) is strict; raise
             it for very deep models where correct constant-folding/fusion reorders floating-point ops
@@ -401,9 +418,22 @@ def simplify(
 
     # Wrap the user-supplied rewriter (if any) so the C++ simplifier can call it
     # between optimization rounds. ``None`` leaves the pipeline unchanged.
-    rewriter = (
-        _GraphRewriterAdapter(custom_rewriter) if custom_rewriter is not None else None
-    )
+    # ``custom_rewriter`` (a Python callable) and ``function_rewrite_rules`` (data
+    # matched natively in C++) both drive the single rewriter slot, so at most one
+    # may be given.
+    if custom_rewriter is not None and function_rewrite_rules:
+        raise ValueError(
+            "custom_rewriter and function_rewrite_rules are mutually exclusive; "
+            "pass only one."
+        )
+    if function_rewrite_rules:
+        rewriter = C.make_function_proto_rewriter(
+            [(pattern, replacement) for pattern, replacement in function_rewrite_rules]
+        )
+    elif custom_rewriter is not None:
+        rewriter = _GraphRewriterAdapter(custom_rewriter)
+    else:
+        rewriter = None
 
     if not perform_optimization:
         # None means skip all optimizers
