@@ -362,6 +362,13 @@ wildcard: it binds the matched node's attribute and is substituted into the
 replacement. `function_rewrite_rules` is mutually exclusive with
 `custom_rewriter`.
 
+Many of onnxscript's ready-made
+[common rewrite rules](https://github.com/microsoft/onnxscript/tree/main/onnxscript/rewriter/rules/common)
+(e.g. `matmul_add_to_gemm_rule`, `reshape_reshape_rule`) are simple structural
+pattern→replacement rules that translate directly into a FunctionProto pair like
+the one above; see `tests/test_function_rewriter_common_rules.py` for worked
+examples that check parity against the onnxscript rule itself.
+
 From C, call `onnxsim_simplify_with_rules` with the serialized FunctionProto
 pairs (see `onnxsim/capi/onnxsim_c_api.h`); from Rust, use
 `Options::function_rewrite_rule(pattern_bytes, replacement_bytes)`.
