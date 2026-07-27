@@ -1291,3 +1291,62 @@ def test_perform_optimization_false():
         onnx_model, perform_optimization=False, skip_shape_inference=True
     )
     assert simple_model is not None
+
+
+def _add_const_model(delta: float) -> onnx.ModelProto:
+    """A minimal model computing ``y = x + delta`` (delta baked as initializer)."""
+    x = onnx.helper.make_tensor_value_info("x", onnx.TensorProto.FLOAT, [1, 4])
+    y = onnx.helper.make_tensor_value_info("y", onnx.TensorProto.FLOAT, [1, 4])
+    const = onnx.helper.make_tensor("c", onnx.TensorProto.FLOAT, [1], [delta])
+    node = onnx.helper.make_node("Add", inputs=["x", "c"], outputs=["y"])
+    graph = onnx.helper.make_graph([node], "g", [x], [y], initializer=[const])
+    return onnx.helper.make_model(
+        graph, opset_imports=[onnx.helper.make_opsetid("", 14)], ir_version=10
+    )
+
+
+def test_compare_respects_check_tolerance():
+    # Two models whose outputs differ by a known 5e-4 offset -- above the
+    # default check tolerance (rtol=1e-4, atol=1e-5 -> ~1.1e-4 at |y|~1) but
+    # well within a looser tolerance. This is the RF-DETR XLarge situation in
+    # miniature: a correct-but-not-bit-identical simplified graph.
+    from onnxsim import model_checking
+
+    ori = _add_const_model(0.0)
+    opt = _add_const_model(5e-4)
+    data = {"x": np.ones((1, 4), dtype=np.float32)}
+
+    # Strict default: flagged as changed.
+    assert (
+        model_checking.compare(opt, ori, n_times=1, input_data=data, verbose=False)
+        is False
+    )
+    # Looser tolerance: accepted.
+    assert (
+        model_checking.compare(
+            opt, ori, n_times=1, input_data=data, verbose=False, rtol=1e-2, atol=1e-2
+        )
+        is True
+    )
+
+
+def test_simplify_threads_check_tolerance(monkeypatch):
+    # simplify() must forward check_rtol/check_atol into model_checking.compare.
+    from onnxsim import model_checking
+
+    captured = {}
+
+    def fake_compare(model_opt, model_ori, n_times, *args, **kwargs):
+        captured["rtol"] = kwargs.get("rtol")
+        captured["atol"] = kwargs.get("atol")
+        return True
+
+    monkeypatch.setattr(model_checking, "compare", fake_compare)
+
+    onnxsim.simplify(
+        _add_const_model(0.0),
+        check_n=1,
+        check_rtol=0.123,
+        check_atol=0.456,
+    )
+    assert captured == {"rtol": 0.123, "atol": 0.456}

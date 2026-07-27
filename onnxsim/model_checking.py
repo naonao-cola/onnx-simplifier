@@ -54,6 +54,8 @@ def compare(
     input_data: Optional[Tensors] = None,
     custom_lib: Optional[str] = None,
     verbose=True,
+    rtol: float = 1e-4,
+    atol: float = 1e-5,
 ) -> bool:
     """
     :param model_opt: The simplified ONNX model
@@ -62,6 +64,11 @@ def compare(
     :param input_shapes: Shapes of generated random inputs
     :param input_data: User-given data instead of random generated data
     :param custom_lib: ONNX Runtime custom lib for custom ops
+    :param rtol: Relative tolerance for ``numpy.allclose`` when comparing the
+        original and simplified outputs. Increase it for very deep models whose
+        (correct) op reordering accumulates floating-point error beyond the
+        default -- see the RF-DETR XLarge case in ``scripts/rfdetr``.
+    :param atol: Absolute tolerance for ``numpy.allclose`` (see ``rtol``).
     """
 
     def get_shape_from_value_info_proto(v: onnx.ValueInfoProto) -> List[int]:
@@ -202,7 +209,7 @@ def compare(
         res_opt = forward(model_opt, inputs, custom_lib)
 
         for name in res_opt.keys():
-            if not np.allclose(res_opt[name], res_ori[name], rtol=1e-4, atol=1e-5):
+            if not np.allclose(res_opt[name], res_ori[name], rtol=rtol, atol=atol):
                 if verbose:
                     print(
                         "Tensor {} changes after optimization. The max diff is {}.".format(

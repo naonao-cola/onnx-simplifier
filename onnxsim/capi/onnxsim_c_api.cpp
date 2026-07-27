@@ -70,6 +70,60 @@ std::optional<int> BuildTargetOpsetVersion(int target_opset_version) {
   return target_opset_version;
 }
 
+// Adapts the C rewrite callback to the C++ GraphRewriter interface, exchanging
+// models as serialized ModelProto bytes. Mirrors the Python
+// `_GraphRewriterAdapter`: a return of 0 means "nothing rewritten" (keep the
+// model as-is and skip a copy), > 0 means the callback produced a rewritten
+// model, and < 0 is an error.
+class CApiGraphRewriter : public GraphRewriter {
+ public:
+  CApiGraphRewriter(OnnxsimRewriteFn fn, OnnxsimRewriteFreeFn free_fn,
+                    void* user_data)
+      : fn_(fn), free_fn_(free_fn), user_data_(user_data) {}
+
+  bool _Run(onnx::ModelProto& model) const override {
+    std::string in;
+    if (!model.SerializeToString(&in)) {
+      throw std::runtime_error(
+          "failed to serialize the model for the custom rewriter");
+    }
+    void* out_data = nullptr;
+    size_t out_size = 0;
+    const int rc = fn_(user_data_, in.data(), in.size(), &out_data, &out_size);
+    if (rc < 0) {
+      throw std::runtime_error(
+          "the custom rewriter callback reported an error");
+    }
+    if (rc == 0) {
+      // Nothing was rewritten this round: keep the model unchanged.
+      return false;
+    }
+    if (out_data == nullptr) {
+      throw std::runtime_error(
+          "the custom rewriter reported a rewrite but returned no model");
+    }
+    onnx::ModelProto rewritten;
+    const bool parsed = ParseProtoFromBytes(
+        &rewritten, static_cast<const char*>(out_data), out_size);
+    // Release the callback-owned buffer regardless of whether it parsed.
+    if (free_fn_ != nullptr) {
+      free_fn_(user_data_, out_data, out_size);
+    }
+    if (!parsed) {
+      throw std::runtime_error(
+          "the custom rewriter returned bytes that are not a valid ONNX "
+          "ModelProto");
+    }
+    model.Swap(&rewritten);
+    return true;
+  }
+
+ private:
+  OnnxsimRewriteFn fn_;
+  OnnxsimRewriteFreeFn free_fn_;
+  void* user_data_;
+};
+
 // Shared body of onnxsim_simplify / onnxsim_simplify_with_rules: parse the
 // model, simplify it (optionally with `rewriter`), and hand back a freshly
 // malloc'd buffer of serialized bytes. All out-parameters follow the C API
@@ -168,19 +222,24 @@ std::vector<onnxsim::FunctionRewriteRule> BuildRewriteRules(
 
 extern "C" {
 
-OnnxsimStatus onnxsim_simplify(const void* model_data, size_t model_size,
-                               const char* const* skip_optimizers,
-                               size_t num_skip_optimizers,
-                               int skip_optimizers_is_null,
-                               int constant_folding, int shape_inference,
-                               size_t tensor_size_threshold,
-                               int target_opset_version, void** out_data,
-                               size_t* out_size, char** out_error) {
+OnnxsimStatus onnxsim_simplify(
+    const void* model_data, size_t model_size,
+    const char* const* skip_optimizers, size_t num_skip_optimizers,
+    int skip_optimizers_is_null, int constant_folding, int shape_inference,
+    size_t tensor_size_threshold, int target_opset_version,
+    OnnxsimRewriteFn rewrite_fn, OnnxsimRewriteFreeFn rewrite_free_fn,
+    void* rewrite_user_data, void** out_data, size_t* out_size,
+    char** out_error) {
+  std::optional<CApiGraphRewriter> rewriter;
+  if (rewrite_fn != nullptr) {
+    rewriter.emplace(rewrite_fn, rewrite_free_fn, rewrite_user_data);
+  }
   return SimplifyToBuffer(model_data, model_size, skip_optimizers,
                           num_skip_optimizers, skip_optimizers_is_null,
                           constant_folding, shape_inference,
                           tensor_size_threshold, target_opset_version,
-                          /*rewriter=*/nullptr, out_data, out_size, out_error);
+                          rewriter.has_value() ? &rewriter.value() : nullptr,
+                          out_data, out_size, out_error);
 }
 
 OnnxsimStatus onnxsim_simplify_with_rules(
@@ -191,13 +250,14 @@ OnnxsimStatus onnxsim_simplify_with_rules(
     const void* const* pattern_data, const size_t* pattern_sizes,
     const void* const* replacement_data, const size_t* replacement_sizes,
     size_t num_rules, void** out_data, size_t* out_size, char** out_error) {
-  // With no rules this is just onnxsim_simplify.
+  // With no rules this is just onnxsim_simplify (no callback rewriter).
   if (num_rules == 0) {
-    return onnxsim_simplify(model_data, model_size, skip_optimizers,
-                            num_skip_optimizers, skip_optimizers_is_null,
-                            constant_folding, shape_inference,
-                            tensor_size_threshold, target_opset_version,
-                            out_data, out_size, out_error);
+    return onnxsim_simplify(
+        model_data, model_size, skip_optimizers, num_skip_optimizers,
+        skip_optimizers_is_null, constant_folding, shape_inference,
+        tensor_size_threshold, target_opset_version, /*rewrite_fn=*/nullptr,
+        /*rewrite_free_fn=*/nullptr, /*rewrite_user_data=*/nullptr, out_data,
+        out_size, out_error);
   }
   if (out_data != nullptr) {
     *out_data = nullptr;
@@ -236,7 +296,9 @@ OnnxsimStatus onnxsim_simplify_path(
     const char* in_path, const char* out_path,
     const char* const* skip_optimizers, size_t num_skip_optimizers,
     int skip_optimizers_is_null, int constant_folding, int shape_inference,
-    size_t tensor_size_threshold, int target_opset_version, char** out_error) {
+    size_t tensor_size_threshold, int target_opset_version,
+    OnnxsimRewriteFn rewrite_fn, OnnxsimRewriteFreeFn rewrite_free_fn,
+    void* rewrite_user_data, char** out_error) {
   if (out_error != nullptr) {
     *out_error = nullptr;
   }
@@ -246,12 +308,19 @@ OnnxsimStatus onnxsim_simplify_path(
   }
   try {
     InitEnv();
+    std::optional<CApiGraphRewriter> rewriter;
+    if (rewrite_fn != nullptr) {
+      rewriter.emplace(rewrite_fn, rewrite_free_fn, rewrite_user_data);
+    }
+    const GraphRewriter* rewriter_ptr =
+        rewriter.has_value() ? &rewriter.value() : nullptr;
+
     SimplifyPath(*GetBuiltinModelExecutor(), in_path, out_path,
                  BuildSkipOptimizers(skip_optimizers, num_skip_optimizers,
                                      skip_optimizers_is_null),
                  constant_folding != 0, shape_inference != 0,
                  tensor_size_threshold,
-                 BuildTargetOpsetVersion(target_opset_version));
+                 BuildTargetOpsetVersion(target_opset_version), rewriter_ptr);
     return ONNXSIM_OK;
   } catch (const std::exception& e) {
     SetError(out_error, e.what());

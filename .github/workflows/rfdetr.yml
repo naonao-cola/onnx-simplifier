@@ -1,0 +1,64 @@
+name: RF-DETR export test
+
+# Builds onnxsim from source and runs tests/test_rfdetr.py, which exports a
+# small RF-DETR model with torch.onnx and simplifies it with onnxsim. This
+# guards against onnxsim regressions on RF-DETR-style graphs.
+#
+# rfdetr is kept out of the main test job because its `[onnx]` extra pins
+# onnxsim<0.6.0. Base `rfdetr` (installed here) has no onnxsim dependency, so
+# building the onnxsim under test from source in the same environment does not
+# trigger a downgrade.
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  rfdetr:
+    name: RF-DETR export -> onnxsim
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      CMAKE_GENERATOR: Ninja
+      CMAKE_CXX_COMPILER_LAUNCHER: sccache
+      SCCACHE_GHA_ENABLED: 'on'
+      ACTIONS_CACHE_SERVICE_V2: 'on'
+      # The RFDETRNano config used by the test has patch_size=16, which builds
+      # the DINOv2 backbone with random weights; these keep transformers/HF Hub
+      # from reaching the network even so.
+      HF_HUB_OFFLINE: '1'
+      TRANSFORMERS_OFFLINE: '1'
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.11'
+      - uses: mozilla-actions/sccache-action@v0.0.10
+
+      - name: Install build tooling
+        run: pip install cmake ninja "setuptools>=77" sccache
+
+      # Base rfdetr pulls torch/transformers but NOT onnxsim (that lives in its
+      # [onnx] extra). Install CPU torch explicitly first so rfdetr reuses it.
+      - name: Install test dependencies
+        run: |
+          pip install torch==2.10.0 torchvision==0.25.0 --index-url https://download.pytorch.org/whl/cpu/
+          pip install pytest onnxruntime rfdetr
+
+      # Build the onnxsim under test last so it wins over anything a dependency
+      # might have pulled. --no-build-isolation reuses the tooling installed above.
+      - name: Build onnxsim (editable)
+        run: pip install --no-build-isolation -ve .
+
+      - name: Verify onnxsim under test is the source build
+        run: python -c "import onnxsim, onnxsim.onnxsim_cpp2py_export; print('onnxsim', onnxsim.__version__, onnxsim.__file__)"
+
+      - name: Run RF-DETR export test
+        run: pytest -v --durations=10 tests/test_rfdetr.py

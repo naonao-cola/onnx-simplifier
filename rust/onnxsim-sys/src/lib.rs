@@ -18,6 +18,26 @@ pub const ONNXSIM_OK: c_int = 0;
 /// Failure return code; an error message is written to the `out_error` slot.
 pub const ONNXSIM_ERROR: c_int = 1;
 
+/// Custom graph-rewriter callback (mirrors `OnnxsimRewriteFn` in the C header).
+///
+/// Invoked once per fixed-point round with the current model as serialized
+/// ModelProto bytes (`in_model_data`/`in_model_size`). Returns `> 0` after
+/// setting `*out_model_data`/`*out_model_size` to a newly allocated buffer with
+/// the rewritten model, `0` to report that nothing changed, or `< 0` on error.
+pub type OnnxsimRewriteFn = unsafe extern "C" fn(
+    user_data: *mut c_void,
+    in_model_data: *const c_void,
+    in_model_size: usize,
+    out_model_data: *mut *mut c_void,
+    out_model_size: *mut usize,
+) -> c_int;
+
+/// Frees a buffer produced by an [`OnnxsimRewriteFn`] (mirrors
+/// `OnnxsimRewriteFreeFn`). Called with the same `user_data` and the pointer and
+/// size the rewrite callback returned, once onnxsim has parsed it.
+pub type OnnxsimRewriteFreeFn =
+    unsafe extern "C" fn(user_data: *mut c_void, model_data: *mut c_void, model_size: usize);
+
 extern "C" {
     /// Simplify a serialized ONNX `ModelProto`.
     ///
@@ -31,7 +51,9 @@ extern "C" {
     /// # Safety
     /// All non-null pointers must be valid; `model_data` must point to at least
     /// `model_size` bytes and `skip_optimizers` to `num_skip_optimizers`
-    /// NUL-terminated strings when `skip_optimizers_is_null == 0`.
+    /// NUL-terminated strings when `skip_optimizers_is_null == 0`. When
+    /// `rewrite_fn` is `Some`, it (and the matching `rewrite_free_fn`) must obey
+    /// the callback contract in `onnxsim_c_api.h`.
     pub fn onnxsim_simplify(
         model_data: *const c_void,
         model_size: usize,
@@ -42,6 +64,9 @@ extern "C" {
         shape_inference: c_int,
         tensor_size_threshold: usize,
         target_opset_version: c_int,
+        rewrite_fn: Option<OnnxsimRewriteFn>,
+        rewrite_free_fn: Option<OnnxsimRewriteFreeFn>,
+        rewrite_user_data: *mut c_void,
         out_data: *mut *mut c_void,
         out_size: *mut usize,
         out_error: *mut *mut c_char,
@@ -84,7 +109,8 @@ extern "C" {
     ///
     /// # Safety
     /// `in_path`/`out_path` must be valid NUL-terminated paths; the
-    /// `skip_optimizers` rules match [`onnxsim_simplify`].
+    /// `skip_optimizers` and `rewrite_fn`/`rewrite_free_fn` rules match
+    /// [`onnxsim_simplify`].
     pub fn onnxsim_simplify_path(
         in_path: *const c_char,
         out_path: *const c_char,
@@ -95,6 +121,9 @@ extern "C" {
         shape_inference: c_int,
         tensor_size_threshold: usize,
         target_opset_version: c_int,
+        rewrite_fn: Option<OnnxsimRewriteFn>,
+        rewrite_free_fn: Option<OnnxsimRewriteFreeFn>,
+        rewrite_user_data: *mut c_void,
         out_error: *mut *mut c_char,
     ) -> c_int;
 

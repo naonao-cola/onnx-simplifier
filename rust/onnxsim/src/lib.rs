@@ -46,6 +46,35 @@
 //!     Ok(())
 //! }
 //! ```
+//!
+//! # Custom rewriter
+//!
+//! [`simplify_with_rewriter`] (and [`simplify_path_with_rewriter`]) run a
+//! closure of yours inside the simplification fixed point — the Rust equivalent
+//! of the Python `custom_rewriter` parameter. The closure receives the current
+//! model as serialized `ModelProto` bytes each round and returns `Ok(None)`
+//! (nothing changed), `Ok(Some(bytes))` (rewritten model), or `Err(..)` to
+//! abort. Because it is interleaved with the built-in optimizer, shape inference
+//! and constant folding, a rewrite can unlock further simplification and vice
+//! versa.
+//!
+//! ```no_run
+//! fn main() -> Result<(), Box<dyn std::error::Error + 'static>> {
+//!     let model = std::fs::read("model.onnx")?;
+//!     let simplified = onnxsim::simplify_with_rewriter(
+//!         &model,
+//!         &onnxsim::Options::new(),
+//!         |bytes: &[u8]| {
+//!             // Decode `bytes`, rewrite the graph with your library of choice,
+//!             // and return the new bytes — or `Ok(None)` to change nothing.
+//!             let _ = bytes;
+//!             Ok::<_, onnxsim::Error>(None)
+//!         },
+//!     )?;
+//!     let _ = simplified;
+//!     Ok(())
+//! }
+//! ```
 
 use std::ffi::{CStr, CString};
 use std::fmt;
@@ -232,6 +261,9 @@ pub fn simplify_with(model_bytes: &[u8], options: &Options) -> Result<Vec<u8>, E
                 bool_to_c(options.shape_inference),
                 options.tensor_size_threshold,
                 target_opset_to_c(options.target_opset_version),
+                None,
+                None,
+                ptr::null_mut(),
                 &mut out_data,
                 &mut out_size,
                 &mut out_error,
@@ -324,6 +356,9 @@ pub fn simplify_path_with<P: AsRef<Path>, Q: AsRef<Path>>(
             bool_to_c(options.shape_inference),
             options.tensor_size_threshold,
             target_opset_to_c(options.target_opset_version),
+            None,
+            None,
+            ptr::null_mut(),
             &mut out_error,
         )
     };
@@ -332,6 +367,233 @@ pub fn simplify_path_with<P: AsRef<Path>, Q: AsRef<Path>>(
         Ok(())
     } else {
         Err(take_error(out_error))
+    }
+}
+
+/// Error a custom rewriter closure may return. Any type convertible into a
+/// boxed [`std::error::Error`] works, including this crate's [`Error`].
+pub type RewriterError = Box<dyn std::error::Error + Send + Sync + 'static>;
+
+/// Type-erased rewriter closure: `Ok(None)` => nothing rewritten this round,
+/// `Ok(Some(bytes))` => rewritten model, `Err` => abort simplification.
+type RewriteCallback<'a> = dyn FnMut(&[u8]) -> Result<Option<Vec<u8>>, RewriterError> + 'a;
+
+/// Holds the (type-erased) user closure and captures failures that cannot cross
+/// the FFI boundary as a return value. A single, non-generic pair of trampolines
+/// therefore serves every closure.
+struct RewriterState<'a> {
+    callback: &'a mut RewriteCallback<'a>,
+    error: Option<RewriterError>,
+    panicked: bool,
+}
+
+/// `extern "C"` shim matching [`onnxsim_sys::OnnxsimRewriteFn`]. Recovers the
+/// `RewriterState` from `user_data`, runs the closure under `catch_unwind` (an
+/// unwind across the C frames would be undefined behaviour), and translates its
+/// outcome into the C return convention.
+unsafe extern "C" fn rewrite_trampoline(
+    user_data: *mut c_void,
+    in_model_data: *const c_void,
+    in_model_size: usize,
+    out_model_data: *mut *mut c_void,
+    out_model_size: *mut usize,
+) -> c_int {
+    let state = &mut *(user_data as *mut RewriterState);
+    let input: &[u8] = if in_model_size == 0 {
+        &[]
+    } else {
+        std::slice::from_raw_parts(in_model_data as *const u8, in_model_size)
+    };
+    let outcome =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (state.callback)(input)));
+    match outcome {
+        Ok(Ok(None)) => 0,
+        Ok(Ok(Some(bytes))) => {
+            // Hand ownership of the buffer to the C core; it is returned to
+            // `rewrite_free_trampoline` (with this exact length) after parsing.
+            let boxed = bytes.into_boxed_slice();
+            *out_model_size = boxed.len();
+            *out_model_data = Box::into_raw(boxed) as *mut c_void;
+            1
+        }
+        Ok(Err(e)) => {
+            state.error = Some(e);
+            -1
+        }
+        Err(_) => {
+            state.panicked = true;
+            -1
+        }
+    }
+}
+
+/// `extern "C"` shim matching [`onnxsim_sys::OnnxsimRewriteFreeFn`]. Reclaims a
+/// buffer handed out by [`rewrite_trampoline`] using the length the C core
+/// passes back.
+unsafe extern "C" fn rewrite_free_trampoline(
+    _user_data: *mut c_void,
+    model_data: *mut c_void,
+    model_size: usize,
+) {
+    if !model_data.is_null() {
+        drop(Box::from_raw(std::ptr::slice_from_raw_parts_mut(
+            model_data as *mut u8,
+            model_size,
+        )));
+    }
+}
+
+// Map an FFI error, preferring a failure captured from the rewriter closure (it
+// is more specific than the generic C-side message). `out_error`, if set, is
+// always consumed so it cannot leak.
+fn rewriter_error(state: &mut RewriterState, out_error: *mut c_char) -> Error {
+    let c_message = if out_error.is_null() {
+        None
+    } else {
+        match take_error(out_error) {
+            Error::Simplify(msg) => Some(msg),
+            other => Some(other.to_string()),
+        }
+    };
+    if state.panicked {
+        return Error::Simplify("the custom rewriter panicked".to_string());
+    }
+    if let Some(e) = state.error.take() {
+        return Error::Simplify(format!("custom rewriter failed: {e}"));
+    }
+    Error::Simplify(c_message.unwrap_or_else(|| "unknown error (no message provided)".to_string()))
+}
+
+/// Simplify a serialized ONNX `ModelProto`, running a custom graph rewriter
+/// inside the simplification fixed point.
+///
+/// This is the Rust counterpart of the Python `custom_rewriter` parameter and
+/// the C API's rewrite callback. `rewriter` is called on each fixed-point round
+/// with the current model as serialized `ModelProto` bytes and must return:
+///
+/// * `Ok(None)` — nothing was rewritten this round (onnxsim keeps the model it
+///   already has and skips a copy);
+/// * `Ok(Some(bytes))` — the rewritten model as serialized `ModelProto` bytes;
+/// * `Err(e)` — abort simplification with this error.
+///
+/// Because the rewriter runs interleaved with the built-in optimizer, shape
+/// inference and constant folding, a rewrite can unlock further simplification
+/// and vice versa; the pipeline iterates until it converges.
+///
+/// ```no_run
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// let model = std::fs::read("model.onnx")?;
+/// // A no-op rewriter that reports it changed nothing every round.
+/// let simplified = onnxsim::simplify_with_rewriter(
+///     &model,
+///     &onnxsim::Options::new(),
+///     |_bytes: &[u8]| Ok::<_, onnxsim::Error>(None),
+/// )?;
+/// # let _ = simplified;
+/// # Ok(())
+/// # }
+/// ```
+pub fn simplify_with_rewriter<F, E>(
+    model_bytes: &[u8],
+    options: &Options,
+    mut rewriter: F,
+) -> Result<Vec<u8>, Error>
+where
+    F: FnMut(&[u8]) -> Result<Option<Vec<u8>>, E>,
+    E: Into<RewriterError>,
+{
+    let mut wrapped = move |bytes: &[u8]| rewriter(bytes).map_err(Into::into);
+    let mut state = RewriterState {
+        callback: &mut wrapped,
+        error: None,
+        panicked: false,
+    };
+    let ffi = FfiSkipOptimizers::new(options)?;
+
+    let mut out_data: *mut c_void = ptr::null_mut();
+    let mut out_size: usize = 0;
+    let mut out_error: *mut c_char = ptr::null_mut();
+
+    let status = unsafe {
+        onnxsim_sys::onnxsim_simplify(
+            model_bytes.as_ptr() as *const c_void,
+            model_bytes.len(),
+            ffi.ptr(),
+            ffi.len(),
+            ffi.is_null_flag(),
+            bool_to_c(options.constant_folding),
+            bool_to_c(options.shape_inference),
+            options.tensor_size_threshold,
+            target_opset_to_c(options.target_opset_version),
+            Some(rewrite_trampoline),
+            Some(rewrite_free_trampoline),
+            &mut state as *mut RewriterState as *mut c_void,
+            &mut out_data,
+            &mut out_size,
+            &mut out_error,
+        )
+    };
+
+    if status == onnxsim_sys::ONNXSIM_OK {
+        let result =
+            unsafe { std::slice::from_raw_parts(out_data as *const u8, out_size) }.to_vec();
+        unsafe { onnxsim_sys::onnxsim_free_buffer(out_data) };
+        Ok(result)
+    } else {
+        Err(rewriter_error(&mut state, out_error))
+    }
+}
+
+/// Simplify the model at `input_path`, writing the result to `output_path`,
+/// running a custom graph rewriter inside the simplification fixed point.
+///
+/// See [`simplify_with_rewriter`] for the `rewriter` contract.
+pub fn simplify_path_with_rewriter<P, Q, F, E>(
+    input_path: P,
+    output_path: Q,
+    options: &Options,
+    mut rewriter: F,
+) -> Result<(), Error>
+where
+    P: AsRef<Path>,
+    Q: AsRef<Path>,
+    F: FnMut(&[u8]) -> Result<Option<Vec<u8>>, E>,
+    E: Into<RewriterError>,
+{
+    let in_c = path_to_cstring(input_path.as_ref())?;
+    let out_c = path_to_cstring(output_path.as_ref())?;
+
+    let mut wrapped = move |bytes: &[u8]| rewriter(bytes).map_err(Into::into);
+    let mut state = RewriterState {
+        callback: &mut wrapped,
+        error: None,
+        panicked: false,
+    };
+    let ffi = FfiSkipOptimizers::new(options)?;
+
+    let mut out_error: *mut c_char = ptr::null_mut();
+    let status = unsafe {
+        onnxsim_sys::onnxsim_simplify_path(
+            in_c.as_ptr(),
+            out_c.as_ptr(),
+            ffi.ptr(),
+            ffi.len(),
+            ffi.is_null_flag(),
+            bool_to_c(options.constant_folding),
+            bool_to_c(options.shape_inference),
+            options.tensor_size_threshold,
+            target_opset_to_c(options.target_opset_version),
+            Some(rewrite_trampoline),
+            Some(rewrite_free_trampoline),
+            &mut state as *mut RewriterState as *mut c_void,
+            &mut out_error,
+        )
+    };
+
+    if status == onnxsim_sys::ONNXSIM_OK {
+        Ok(())
+    } else {
+        Err(rewriter_error(&mut state, out_error))
     }
 }
 
@@ -515,5 +777,98 @@ mod tests {
             FfiSkipOptimizers::new(&opts),
             Err(Error::InvalidArgument(_))
         ));
+    }
+
+    // The rewriter trampolines are pure Rust (no FFI into the native library),
+    // so their translation of a closure's outcome to the C return convention —
+    // and the buffer hand-off/reclaim — can be exercised directly.
+
+    unsafe fn call_rewrite(
+        state: &mut RewriterState,
+        input: &[u8],
+        out_data: &mut *mut c_void,
+        out_size: &mut usize,
+    ) -> c_int {
+        rewrite_trampoline(
+            state as *mut RewriterState as *mut c_void,
+            input.as_ptr() as *const c_void,
+            input.len(),
+            out_data,
+            out_size,
+        )
+    }
+
+    #[test]
+    fn rewrite_trampoline_reports_unchanged() {
+        let mut cb = |_: &[u8]| Ok::<_, RewriterError>(None);
+        let mut state = RewriterState {
+            callback: &mut cb,
+            error: None,
+            panicked: false,
+        };
+        let mut out_data: *mut c_void = ptr::null_mut();
+        let mut out_size = 0usize;
+        let rc = unsafe { call_rewrite(&mut state, &[1, 2, 3], &mut out_data, &mut out_size) };
+        assert_eq!(rc, 0);
+        assert!(out_data.is_null());
+    }
+
+    #[test]
+    fn rewrite_trampoline_roundtrips_rewritten_buffer() {
+        let payload = vec![9u8, 8, 7, 6];
+        let expected = payload.clone();
+        let mut cb = move |_: &[u8]| Ok::<_, RewriterError>(Some(payload.clone()));
+        let mut state = RewriterState {
+            callback: &mut cb,
+            error: None,
+            panicked: false,
+        };
+        let mut out_data: *mut c_void = ptr::null_mut();
+        let mut out_size = 0usize;
+        let rc = unsafe { call_rewrite(&mut state, &[0], &mut out_data, &mut out_size) };
+        assert_eq!(rc, 1);
+        assert_eq!(out_size, expected.len());
+        let returned =
+            unsafe { std::slice::from_raw_parts(out_data as *const u8, out_size) }.to_vec();
+        assert_eq!(returned, expected);
+        // Reclaim through the free trampoline exactly as the C core would.
+        unsafe { rewrite_free_trampoline(ptr::null_mut(), out_data, out_size) };
+    }
+
+    #[test]
+    fn rewrite_trampoline_captures_error() {
+        let mut cb = |_: &[u8]| Err::<Option<Vec<u8>>, RewriterError>("boom".into());
+        let mut state = RewriterState {
+            callback: &mut cb,
+            error: None,
+            panicked: false,
+        };
+        let mut out_data: *mut c_void = ptr::null_mut();
+        let mut out_size = 0usize;
+        let rc = unsafe { call_rewrite(&mut state, &[0], &mut out_data, &mut out_size) };
+        assert_eq!(rc, -1);
+        let err = rewriter_error(&mut state, ptr::null_mut());
+        assert!(matches!(&err, Error::Simplify(m) if m.contains("boom")));
+    }
+
+    #[test]
+    fn rewrite_trampoline_captures_panic() {
+        let mut cb = |_: &[u8]| -> Result<Option<Vec<u8>>, RewriterError> { panic!("kaboom") };
+        let mut state = RewriterState {
+            callback: &mut cb,
+            error: None,
+            panicked: false,
+        };
+        let mut out_data: *mut c_void = ptr::null_mut();
+        let mut out_size = 0usize;
+        // Silence the default panic hook's backtrace print during the test.
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let rc = unsafe { call_rewrite(&mut state, &[0], &mut out_data, &mut out_size) };
+        std::panic::set_hook(prev);
+        assert_eq!(rc, -1);
+        assert!(state.panicked);
+        let err = rewriter_error(&mut state, ptr::null_mut());
+        assert!(matches!(&err, Error::Simplify(m) if m.contains("panicked")));
     }
 }
