@@ -278,6 +278,35 @@ A few things to keep in mind:
   pass over `model.graph`, an [onnx-graphsurgeon](https://github.com/NVIDIA/TensorRT/tree/main/tools/onnx-graphsurgeon)
   edit, etc. — as long as it takes and returns a `ModelProto`.
 
+### From the C API and Rust
+
+The custom rewriter lives in onnxsim's C++ core, so the C API and its Rust
+wrapper expose it too — the model is exchanged as serialized `ModelProto` bytes
+across the boundary instead of as an `onnx.ModelProto` object. In Rust, use
+[`simplify_with_rewriter`](rust/onnxsim) (or `simplify_path_with_rewriter`) and
+pass a closure `FnMut(&[u8]) -> Result<Option<Vec<u8>>, E>`: return `Ok(None)`
+when a round rewrote nothing (onnxsim skips the copy, matching the Python
+`False` sentinel), `Ok(Some(bytes))` for the rewritten model, or `Err(..)` to
+abort.
+
+```rust
+let simplified = onnxsim::simplify_with_rewriter(
+    &model_bytes,
+    &onnxsim::Options::new(),
+    |bytes: &[u8]| {
+        // Decode `bytes`, rewrite, and return the new bytes — or Ok(None).
+        let _ = bytes;
+        Ok::<_, onnxsim::Error>(None)
+    },
+)?;
+```
+
+In C, pass an `OnnxsimRewriteFn` callback (and an optional matching free
+callback) to `onnxsim_simplify` / `onnxsim_simplify_path`; see
+[`onnxsim/capi/onnxsim_c_api.h`](onnxsim/capi/onnxsim_c_api.h) for the contract.
+The only binding without it is the standalone CLI, which has no way to carry a
+user callback.
+
 ## Projects Using ONNX Simplifier
 
 * [MXNet](https://mxnet.apache.org/versions/1.9.1/api/python/docs/tutorials/deploy/export/onnx.html#Simplify-the-exported-ONNX-model)

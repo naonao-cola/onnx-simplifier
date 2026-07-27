@@ -69,6 +69,34 @@ for name in onnxsim::list_optimizers() {
 }
 ```
 
+## Custom rewriter
+
+Run your own graph-rewriting logic inside the simplification fixed point — the
+Rust equivalent of the Python `custom_rewriter` parameter. The closure is called
+each round with the current model as serialized `ModelProto` bytes and returns
+`Ok(None)` (nothing changed this round), `Ok(Some(bytes))` (the rewritten
+model), or `Err(..)` to abort. Because it is interleaved with the built-in
+optimizer, shape inference and constant folding, a rewrite can unlock further
+simplification and vice versa.
+
+```rust
+fn main() -> Result<(), Box<dyn std::error::Error + 'static>> {
+    let model = std::fs::read("model.onnx")?;
+    let simplified = onnxsim::simplify_with_rewriter(
+        &model,
+        &onnxsim::Options::new(),
+        |bytes: &[u8]| {
+            // Decode `bytes`, rewrite the graph, and return the new bytes,
+            // or `Ok(None)` to report that nothing changed this round.
+            let _ = bytes;
+            Ok::<_, onnxsim::Error>(None)
+        },
+    )?;
+    std::fs::write("model.opt.onnx", &simplified)?;
+    Ok(())
+}
+```
+
 ## Building the native library
 
 `onnxsim-sys` needs the `onnxsim_c` shared library. Its build script supports

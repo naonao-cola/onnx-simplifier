@@ -33,6 +33,44 @@ typedef enum OnnxsimStatus {
 } OnnxsimStatus;
 
 /*
+ * Optional custom graph-rewriter callback.
+ *
+ * When supplied to onnxsim_simplify / onnxsim_simplify_path it is run inside
+ * onnxsim's simplification fixed point, interleaved with the built-in optimizer,
+ * shape inference and constant folding, so a rewrite can unlock further
+ * simplification and vice versa. It mirrors the C++ `GraphRewriter` and the
+ * Python `custom_rewriter` parameter, exchanging models as serialized ONNX
+ * ModelProto bytes across the C boundary.
+ *
+ * On each round it is called with the current model in `in_model_data`
+ * (`in_model_size` bytes) and must return:
+ *   - a value > 0 : the model was rewritten. `*out_model_data`/`*out_model_size`
+ *     must be set to a newly allocated buffer holding the rewritten serialized
+ *     ModelProto. onnxsim parses it and then, if a free callback was supplied,
+ *     calls it with exactly that pointer and size to release the buffer.
+ *   - 0           : nothing was rewritten this round. The out-parameters are
+ *     ignored and onnxsim keeps the model it already has (skipping a copy).
+ *   - a value < 0 : the callback failed; simplification aborts with
+ *     ONNXSIM_ERROR.
+ *
+ * `user_data` is passed through untouched on every call (both the rewrite and
+ * the free callback). Passing a NULL rewrite callback disables the feature and
+ * reproduces the previous behaviour exactly.
+ */
+typedef int (*OnnxsimRewriteFn)(void* user_data, const void* in_model_data,
+                                size_t in_model_size, void** out_model_data,
+                                size_t* out_model_size);
+
+/*
+ * Releases a buffer produced by an OnnxsimRewriteFn. Called with the same
+ * `user_data` and with the `out_model_data`/`out_model_size` the rewrite
+ * callback returned, once onnxsim has finished parsing it. May be NULL, in
+ * which case onnxsim never frees the rewriter's output (the callback owns it).
+ */
+typedef void (*OnnxsimRewriteFreeFn)(void* user_data, void* model_data,
+                                     size_t model_size);
+
+/*
  * Simplify a model given as a serialized ONNX ModelProto.
  *
  * skip_optimizers semantics mirror the C++/Python API:
@@ -51,6 +89,11 @@ typedef enum OnnxsimStatus {
  * the default ONNX domain (using onnx's version converter) before simplifying;
  * a value <= 0 leaves the opset version unchanged.
  *
+ * rewrite_fn, when non-NULL, is a custom graph rewriter run inside the
+ * simplification fixed point (see OnnxsimRewriteFn). rewrite_free_fn releases
+ * the buffers it produces (may be NULL). rewrite_user_data is passed through to
+ * both callbacks untouched. Pass a NULL rewrite_fn to disable the feature.
+ *
  * On ONNXSIM_OK, *out_data / *out_size receive a newly allocated buffer holding
  * the serialized simplified ModelProto; release it with onnxsim_free_buffer.
  * On ONNXSIM_ERROR, *out_error receives a newly allocated, NUL-terminated
@@ -61,8 +104,10 @@ ONNXSIM_C_API OnnxsimStatus onnxsim_simplify(
     const void* model_data, size_t model_size,
     const char* const* skip_optimizers, size_t num_skip_optimizers,
     int skip_optimizers_is_null, int constant_folding, int shape_inference,
-    size_t tensor_size_threshold, int target_opset_version, void** out_data,
-    size_t* out_size, char** out_error);
+    size_t tensor_size_threshold, int target_opset_version,
+    OnnxsimRewriteFn rewrite_fn, OnnxsimRewriteFreeFn rewrite_free_fn,
+    void* rewrite_user_data, void** out_data, size_t* out_size,
+    char** out_error);
 
 /*
  * Same as onnxsim_simplify, but reads the input model from `in_path` and writes
@@ -73,7 +118,9 @@ ONNXSIM_C_API OnnxsimStatus onnxsim_simplify_path(
     const char* in_path, const char* out_path,
     const char* const* skip_optimizers, size_t num_skip_optimizers,
     int skip_optimizers_is_null, int constant_folding, int shape_inference,
-    size_t tensor_size_threshold, int target_opset_version, char** out_error);
+    size_t tensor_size_threshold, int target_opset_version,
+    OnnxsimRewriteFn rewrite_fn, OnnxsimRewriteFreeFn rewrite_free_fn,
+    void* rewrite_user_data, char** out_error);
 
 /*
  * Return the names of all available fuse/elimination optimizer passes as a
