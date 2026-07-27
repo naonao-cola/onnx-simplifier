@@ -38,6 +38,11 @@ correctly set-up RF-DETR environment never hits this.
   confirms the exported graphs also simplify cleanly with onnxsim 0.7.x,
   so that upper bound could be relaxed.
 - XLarge / 2XLarge segmentation variants additionally require
-  `pip install rfdetr[plus]`.
+  `pip install rfdetr[plus]`. They simplify correctly but report
+  `check_ok=False`: their large mask head accumulates a sub-`1e-4`
+  floating-point difference from op reordering that exceeds onnxsim's strict
+  `np.allclose(rtol=1e-4, atol=1e-5)` check. The graphs are functionally
+  equivalent (no NaNs, detection heads match to ~`1e-4`); pass `check_n=0`
+  to skip the strict check for these.
 
-See `RESULTS.md` for a captured run.
+See `RESULTS.md` for a captured run and the full analysis.
