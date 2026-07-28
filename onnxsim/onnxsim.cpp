@@ -31,6 +31,12 @@ struct Config {
   std::vector<std::string> optimizer_passes;
   // default value is max
   size_t tensor_size_threshold = -1;
+  // Whether graph initializers are treated as constant tensors. When false,
+  // constant folding does not seed its constant set with initializer names, so
+  // nodes rooted only at initializers are left unfolded (see GetConstantNodes),
+  // and the onnx optimizer is told to leave initializer-backed weights alone
+  // too (see Optimize). Constant nodes are always constant.
+  bool initializers_as_constants = true;
 };
 
 Config config;
@@ -494,9 +500,17 @@ ConstantNodePartition GetConstantNodes(const onnx::ModelProto& model) {
   ConstantNodePartition partition;
   auto& const_nodes = partition.const_nodes;
   auto& non_const_nodes = partition.non_const_nodes;
-  std::transform(
-      model.graph().initializer().begin(), model.graph().initializer().end(),
-      std::back_inserter(const_names), [](const auto& x) { return x.name(); });
+  // Seed the constant set with the initializer names, unless the caller asked
+  // for initializers to be treated as non-constant. In that case a node whose
+  // inputs are (only) initializers is not foldable, so its weights are left in
+  // the graph untouched; a node fed by a Constant node still folds because ""
+  // and Constant outputs remain in the constant set.
+  if (config.initializers_as_constants) {
+    std::transform(
+        model.graph().initializer().begin(), model.graph().initializer().end(),
+        std::back_inserter(const_names),
+        [](const auto& x) { return x.name(); });
+  }
   // Map each domain to its imported opset version so the correct operator
   // schema can be looked up. The default ONNX domain is normalized to an empty
   // string, which is how the schema registry stores it.
@@ -1221,7 +1235,14 @@ onnx::ModelProto _FoldConstant(const ModelExecutor& executor,
 }
 
 onnx::ModelProto Optimize(const onnx::ModelProto& model) {
-  return onnx::optimization::OptimizeFixed(model, config.optimizer_passes);
+  // Mirror the initializer treatment into the onnx optimizer so its
+  // value-baking passes (fuse_bn_into_conv, ...) respect it too. The setting is
+  // thread-local in the optimizer; restore it afterwards so we do not leak it.
+  const bool prev = onnx::optimization::InitializersAsConstants();
+  onnx::optimization::SetInitializersAsConstants(config.initializers_as_constants);
+  auto result = onnx::optimization::OptimizeFixed(model, config.optimizer_passes);
+  onnx::optimization::SetInitializersAsConstants(prev);
+  return result;
 }
 
 // A 128-bit fingerprint of a model, used by FixedPointFn to detect when an
@@ -1497,7 +1518,8 @@ onnx::ModelProto Simplify(
     const ModelExecutor& executor, const onnx::ModelProto& model,
     std::optional<std::vector<std::string>> skip_optimizers,
     bool constant_folding, bool shape_inference, size_t tensor_size_threshold,
-    std::optional<int> target_opset_version, const GraphRewriter* rewriter) {
+    std::optional<int> target_opset_version, const GraphRewriter* rewriter,
+    bool initializers_as_constants) {
   // Make shape inference aware of ONNX Runtime's quantized contrib operators
   // (QLinearAdd and friends) so shape deduction does not stop at them.
   onnxsim::RegisterContribOpSchemas();
@@ -1509,6 +1531,7 @@ onnx::ModelProto Simplify(
   Check(model);
 
   config.tensor_size_threshold = tensor_size_threshold;
+  config.initializers_as_constants = initializers_as_constants;
   config.optimizer_passes.clear();
   // onnxsim already folds ``Gather`` on a ``Shape`` into constants on its own:
   // ``_EvalPartialShape`` (above) plus data-propagating shape inference resolve
@@ -1517,8 +1540,17 @@ onnx::ModelProto Simplify(
   // redundant here, and it aborts the whole process on graphs where a Gather
   // index cannot be statically resolved to an axis (common in dynamic-shape
   // detection models such as FasterRCNN). Always drop it from the pass list.
-  static const std::vector<std::string> kAlwaysDisabledPasses = {
-      "eliminate_shape_gather"};
+  std::vector<std::string> always_disabled_passes = {"eliminate_shape_gather"};
+  // When initializers are treated as non-constant, keep ``Constant`` nodes in
+  // producer form: ``extract_constant_to_initializer`` would rewrite every
+  // Constant into an initializer, which -- being non-constant now -- would then
+  // block onnxsim's own constant folding of genuinely-constant subgraphs. The
+  // value-baking passes themselves already leave initializer weights alone via
+  // ``IsConstantTensor`` (see the onnx-optimizer changes), so only this
+  // representation-changing pass needs dropping.
+  if (!initializers_as_constants) {
+    always_disabled_passes.push_back("extract_constant_to_initializer");
+  }
   auto is_disabled = [](const std::vector<std::string>& list,
                         const std::string& pass) {
     return std::find(list.begin(), list.end(), pass) != list.end();
@@ -1530,7 +1562,7 @@ onnx::ModelProto Simplify(
     const auto all_passes = onnx::optimization::GetFuseAndEliminationPass();
     for (const auto& pass : all_passes) {
       if (!is_disabled(*skip_optimizers, pass) &&
-          !is_disabled(kAlwaysDisabledPasses, pass)) {
+          !is_disabled(always_disabled_passes, pass)) {
         passes.push_back(pass);
       }
     }
@@ -1630,13 +1662,14 @@ void SimplifyPath(const ModelExecutor& executor, const std::string& in_path,
                   bool constant_folding, bool shape_inference,
                   size_t tensor_size_threshold,
                   std::optional<int> target_opset_version,
-                  const GraphRewriter* rewriter) {
+                  const GraphRewriter* rewriter,
+                  bool initializers_as_constants) {
   onnx::ModelProto model;
   onnx::optimization::loadModel(&model, in_path, true);
 
   model = Simplify(executor, model, skip_optimizers, constant_folding,
                    shape_inference, tensor_size_threshold, target_opset_version,
-                   rewriter);
+                   rewriter, initializers_as_constants);
 
   onnx::optimization::saveModel(&model, out_path, true, "");
 }

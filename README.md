@@ -49,7 +49,11 @@ At its core onnxsim runs a fixed point of shape inference, graph optimization an
 constant folding until the model stops changing. Around that it offers:
 
 - **Constant folding.** Evaluates the constant parts of the graph and replaces
-  redundant operators with their computed outputs.
+  redundant operators with their computed outputs. By default initializers count
+  as constants; pass `--initializers-as-non-constants` (Python:
+  `initializers_as_constants=False`) to keep weights as tunable tensors so nodes
+  rooted only at initializers — and value-baking fusions such as fuse BatchNorm
+  into Conv — are left untouched.
 - **Graph optimization passes.** Runs onnx-optimizer's fusions and eliminations
   (e.g. fuse BatchNorm into Conv). List them with
   `onnxsim --list-default-optimizers`; skip all or some with

@@ -331,6 +331,7 @@ def simplify(
     tensor_size_threshold: str = DEFAULT_TENSOR_SIZE_THRESHOLDHOLD,
     mutable_initializer: bool = False,
     *,
+    initializers_as_constants: bool = True,
     import_custom_schemas: bool = True,
     input_shapes=None,
     target_opset_version: Optional[int] = None,
@@ -357,6 +358,14 @@ def simplify(
     :param custom_lib: onnxruntime custom ops's shared library
     :param include_subgraph: Simplify subgraph (e.g. true graph and false graph of "If" operator) instead of only the main graph
     :param unused_output: name of unused outputs that will be eliminated from the model
+    :param initializers_as_constants: Whether initializers are treated as constant tensors
+            (the default, ``True``). When set to ``False``, initializers are treated as
+            non-constant: constant folding leaves nodes that depend only on initializers in the
+            graph, and the onnx optimizer's value-baking passes (e.g. ``fuse_bn_into_conv``) are
+            told to leave initializer-backed weights alone, so the weights survive simplification
+            as tunable tensors. ``Constant`` nodes are still folded either way. This is orthogonal
+            to ``mutable_initializer`` (which controls whether initializers also remain graph
+            inputs).
     :param import_custom_schemas: Import operator schemas registered in the Python `onnx` module
             (e.g. via `onnx.defs.register_schema`) into onnxsim's own registry so models using
             custom operators pass validation. Set to False to disable this and leave onnxsim's
@@ -569,6 +578,7 @@ def simplify(
             tensor_size_threshold_bytes,
             target_opset_version,
             rewriter,
+            initializers_as_constants,
         )
         # The serialized original (~1x model) is not needed once the C++
         # simplifier has consumed it -- the large-model fallback below
@@ -636,6 +646,7 @@ def simplify(
                 tensor_size_threshold_bytes,
                 target_opset_version,
                 rewriter,
+                initializers_as_constants,
             )
             check_ok = model_checking.compare(
                 os.path.join(tmpdirname, "opt.onnx"),
@@ -872,6 +883,15 @@ def main():
         action="store_true",
     )
     parser.add_argument(
+        "--initializers-as-non-constants",
+        help="Treat initializers as non-constant tensors. By default onnxsim treats "
+        "initializers as constants, so it constant-folds nodes that depend only on them "
+        "and lets value-baking optimizers (e.g. fuse_bn_into_conv) fold their weights. "
+        "Specify this flag to keep such weights untouched as tunable tensors; Constant "
+        "nodes are still folded. This is independent of --mutable-initializer.",
+        action="store_true",
+    )
+    parser.add_argument(
         "--save-as-external-data",
         help="Save parameters as external data. This will make the .onnx file much smaller, but the .onnx file will depend on the external data file (.data).",
         action="store_true",
@@ -1090,6 +1110,7 @@ def main():
         args.unused_output,
         args.tensor_size_threshold,
         args.mutable_initializer,
+        initializers_as_constants=not args.initializers_as_non_constants,
         import_custom_schemas=not args.skip_schema_import,
         target_opset_version=args.target_opset,
         check_rtol=args.check_rtol,
