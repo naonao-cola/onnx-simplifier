@@ -43,6 +43,44 @@ However, I got the following complicated model instead:
 ONNX Simplifier is presented to simplify the ONNX model. It infers the whole computation graph
 and then replaces the redundant operators with their constant outputs (a.k.a. constant folding).
 
+## Features
+
+At its core onnxsim runs a fixed point of shape inference, graph optimization and
+constant folding until the model stops changing. Around that it offers:
+
+- **Constant folding.** Evaluates the constant parts of the graph and replaces
+  redundant operators with their computed outputs.
+- **Graph optimization passes.** Runs onnx-optimizer's fusions and eliminations
+  (e.g. fuse BatchNorm into Conv). List them with
+  `onnxsim --list-default-optimizers`; skip all or some with
+  `--skip-optimization [pass ...]`.
+- **Shape inference.** Propagates tensor shapes through the graph — including
+  partial shape evaluation via ONNX data propagation — to unlock more folding.
+- **Correctness checking.** Optionally validates the simplified model against the
+  original on `N` random inputs (the positional `check_n` argument, with
+  configurable `--check-rtol`/`--check-atol`).
+- **Fixed and dynamic input shapes.** Pin a dynamic model's shapes for
+  simplification/checking with `--overwrite-input-shape` and `--test-input-shape`.
+- **[Custom operators](#custom-operators).** Keeps custom ops (TensorRT plugins,
+  vendor domains, or custom ops in the default ONNX domain) unchanged and picks
+  up schemas registered via `onnx.defs.register_schema` automatically.
+- **[Opset conversion](#changing-the-opset-version).** Upgrade or downgrade the
+  model's opset while simplifying with `--target-opset`.
+- **[Custom rewriters](#custom-rewriters).** Plug your own rewriting logic into
+  the fixed point with `custom_rewriter`, or express data-only `FunctionProto`
+  rules that also run from the C and Rust bindings.
+- **Subgraph simplification.** Simplify `If`/`Loop`/`Scan` subgraph bodies too
+  with `--include-subgraph`.
+- **Large-model handling.** Guard against blow-up from ops like `Tile`/
+  `ConstantOfShape` (`--no-large-tensor`), read and write external-data models,
+  and eliminate unused outputs (`--unused-output`).
+- **Many ways to run it.** A zero-install [web version](#web-version), a Python
+  package and `onnxsim` CLI, a C API, and a Rust wrapper — all sharing the same
+  C++ core. onnxruntime is optional; onnxsim falls back to the onnx reference
+  evaluator when it isn't installed.
+
+## Getting started
+
 ### Web version
 
 We have published ONNX Simplifier on [GitHub pages](https://onnxsim.github.io/onnxsim/). It works out of the box and **doesn't need any installation**. Note that it runs in the browser locally and your model is completely safe.
