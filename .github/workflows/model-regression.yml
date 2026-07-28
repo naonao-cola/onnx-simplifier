@@ -5,8 +5,13 @@ name: Model Regression
 # hangs, and correctness regressions that the unit tests don't exercise — e.g.
 # an optimizer pass that aborts on a dynamic-shape detection model.
 #
-# Heavy job (~17 GB of downloads, ~110 min of sequential simplify work), so it
-# runs on a schedule and on demand rather than on every push. The work is
+# Each model is also run through onnxslim on the same graph, purely for
+# comparison: summarize.py reports where the two simplifiers diverge on
+# robustness, node reduction, and speed / peak memory. onnxsim remains the only
+# arm that gates the run — an onnxslim failure never turns the workflow red.
+#
+# Heavy job (~17 GB of downloads, plus sequential simplify work for two tools),
+# so it runs on a schedule and on demand rather than on every push. The work is
 # split across balanced shards to keep wall-clock down. To switch cadence,
 # change the cron below (weekly `0 6 * * 1` vs daily `0 6 * * *`).
 
@@ -108,7 +113,7 @@ jobs:
       - name: Install onnxsim wheel + deps
         run: |
           python -m pip install --upgrade pip
-          python -m pip install onnxruntime huggingface_hub
+          python -m pip install onnxruntime huggingface_hub onnxslim
           python -m pip install wheelhouse/*.whl
       - name: Verify the installed wheel is used (not the source tree)
         working-directory: ${{ runner.temp }}
@@ -147,7 +152,7 @@ jobs:
       - name: Install onnxsim wheel + deps
         run: |
           python -m pip install --upgrade pip
-          python -m pip install onnxruntime huggingface_hub
+          python -m pip install onnxruntime huggingface_hub onnxslim
           python -m pip install wheelhouse/*.whl
       - name: Run known-slow models
         working-directory: ${{ runner.temp }}

@@ -109,9 +109,7 @@ def test_explicit_cpu_provider_produces_correct_result():
     # the default (which is CPU).
     model = _make_foldable_model()
     x = np.arange(4, dtype=np.float32).reshape(2, 2)
-    outputs = backend.run_model(
-        model, {"x": x}, providers=["CPUExecutionProvider"]
-    )
+    outputs = backend.run_model(model, {"x": x}, providers=["CPUExecutionProvider"])
     np.testing.assert_allclose(outputs["y"], x + 3.0)
 
 
@@ -161,7 +159,5 @@ def test_reference_evaluator_rejects_non_cpu_provider(monkeypatch):
         )
     # The reference evaluator still accepts an explicit CPU provider.
     x = np.arange(4, dtype=np.float32).reshape(2, 2)
-    outputs = backend.run_model(
-        model, {"x": x}, providers=["CPUExecutionProvider"]
-    )
+    outputs = backend.run_model(model, {"x": x}, providers=["CPUExecutionProvider"])
     np.testing.assert_allclose(outputs["y"], x + 3.0)
