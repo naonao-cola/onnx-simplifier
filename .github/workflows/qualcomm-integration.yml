@@ -1,0 +1,100 @@
+name: Qualcomm Integration
+
+# Compiles and runs onnxsim's output through the Qualcomm AI Runtime (QNN)
+# execution provider to catch simplifications that break the Qualcomm toolchain
+# (SNPE / QAIRT) — a graph the QNN converter can no longer compile, or whose
+# on-device result changed.
+#
+# Runs entirely on a stock x86-64 CPU runner: the pip `onnxruntime-qnn` wheel's
+# HTP backend does the full offline graph compile (libHtpPrepare.so) and executes
+# in the x86 emulator, so no Snapdragon device is needed. See
+# scripts/qualcomm/README.md for the fidelity tiers this covers (and the SDK /
+# AI Hub paths for real-hardware numerics).
+#
+# Scheduled + on demand (like the model regression), plus on PRs that touch the
+# harness so it stays valid.
+
+on:
+  schedule:
+    - cron: "0 7 * * 1" # Mondays 07:00 UTC (weekly)
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - ".github/workflows/qualcomm-integration.yml"
+      - "scripts/qualcomm/**"
+      - "tests/test_qnn_compat.py"
+
+concurrency:
+  group: qualcomm-integration-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  # Build onnxsim once from the current tree, so the QNN check runs against the
+  # actual simplifier in this branch rather than a released wheel.
+  build:
+    name: Build onnxsim wheel
+    runs-on: ubuntu-24.04
+    env:
+      SCCACHE_GHA_ENABLED: "on"
+      ACTIONS_CACHE_SERVICE_V2: "on"
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+          fetch-depth: 0
+      - uses: mozilla-actions/sccache-action@v0.0.10
+      - name: Build cp312 wheel
+        uses: pypa/cibuildwheel@v4.1.1
+        env:
+          CIBW_BUILD: "cp312-manylinux_x86_64"
+          CIBW_ARCHS: native
+          CIBW_BUILD_FRONTEND: "pip; args: --no-build-isolation"
+          CIBW_MANYLINUX_X86_64_IMAGE: manylinux_2_28
+          CIBW_ENVIRONMENT_PASS_LINUX: CI SCCACHE_GHA_ENABLED ACTIONS_RESULTS_URL ACTIONS_RUNTIME_TOKEN ACTIONS_CACHE_SERVICE_V2
+          CIBW_BEFORE_BUILD: "python3 -m pip install --break-system-packages cmake ninja setuptools sccache"
+          CIBW_ENVIRONMENT: CMAKE_ARGS="-DONNX_USE_PROTOBUF_SHARED_LIBS=OFF" CMAKE_GENERATOR=Ninja CMAKE_CXX_COMPILER_LAUNCHER=sccache CMAKE_LINKER_TYPE=LLD
+          CIBW_REPAIR_WHEEL_COMMAND_LINUX: "auditwheel repair -w {dest_dir} {wheel} --strip"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: onnxsim-wheel-qnn
+          path: ./wheelhouse/*.whl
+
+  qnn-compat:
+    name: QNN compatibility check
+    needs: [build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          # onnxruntime-qnn ships cp311/cp312/cp313 x86-64 Linux wheels.
+          python-version: "3.12"
+      - uses: actions/download-artifact@v8
+        with:
+          name: onnxsim-wheel-qnn
+          path: wheelhouse
+      - name: Install onnxsim wheel + onnxruntime-qnn
+        run: |
+          python -m pip install --upgrade pip
+          # onnxruntime-qnn brings its own onnxruntime (the QNN plugin EP).
+          python -m pip install onnxruntime-qnn
+          python -m pip install wheelhouse/*.whl
+      - name: Show environment
+        run: |
+          python -c "import onnxsim, onnxruntime_qnn as q; print('onnxsim', onnxsim.__version__); print('onnxruntime-qnn', q.__version__)"
+          python -c "import sys; sys.path.insert(0, 'scripts/qualcomm'); import qnn_backend as q; print('QNN available:', q.QNN_AVAILABLE, '| backend:', q.backend_path() if q.QNN_AVAILABLE else q.unavailable_reason())"
+      - name: Run QNN compatibility check
+        run: |
+          python scripts/qualcomm/run_qnn_compat.py \
+            --require-qnn \
+            --output qnn-compat.csv
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: qnn-compat-report
+          path: qnn-compat.csv
+          if-no-files-found: ignore
