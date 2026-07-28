@@ -1,17 +1,20 @@
 #!/usr/bin/env python3
-"""Run onnxsim over a shard of the large-model regression set.
+"""Run onnxsim (and onnxslim, for comparison) over a shard of the large-model set.
 
-Each model is downloaded from the Hugging Face ``onnxmodelzoo`` org, simplified,
-correctness-checked, and then deleted before the next one, so peak disk stays at
-roughly one model. Every model runs in its own subprocess with a hard timeout,
-so an OOM, segfault, or hang on one model is contained and reported rather than
-taking the whole job down.
+Each model is downloaded from the Hugging Face ``onnxmodelzoo`` org, run through
+both simplifiers, correctness-checked, and then deleted before the next one, so
+peak disk stays at roughly one model. Every model runs in its own subprocess and
+each tool inside it runs in its own child with a hard timeout, so an OOM,
+segfault, or hang on one model (or one tool) is contained and reported rather
+than taking the whole job down.
 
-The regression is intentionally about *robustness*: a model fails only when it
-crashes, times out, or produces a graph onnxsim itself cannot validate. Node
-counts are recorded and compared against the committed baseline for the run
-summary, but drift there does not fail the job (legitimate optimizer changes
-move those numbers).
+onnxsim is the *authoritative* arm: the regression is about onnxsim's
+*robustness*, and a model fails only when onnxsim crashes, times out, or produces
+a graph onnxsim itself cannot validate. onnxslim is measured on the same graphs
+purely for comparison -- its node counts, timing, peak memory and validity are
+recorded (and summarized by ``summarize.py``) but never fail the job. Node counts
+are also compared against the committed baseline for the summary, but drift there
+does not fail the job (legitimate optimizer changes move those numbers).
 
 Usage:
     run_regression.py --shard 0 --num-shards 6 --output shard-0.csv
@@ -52,14 +55,21 @@ def assign_shard(models, shard, num_shards):
     return buckets[shard]
 
 
-def run_one(model_id, timeout):
-    """Simplify one model in an isolated worker subprocess."""
+def run_one(model_id, per_tool_timeout):
+    """Run onnxsim + onnxslim on one model in an isolated worker subprocess.
+
+    ``per_tool_timeout`` caps each tool individually inside the worker (each tool
+    runs in its own child). The outer cap here is a generous backstop covering
+    the download plus both tools, so a single-tool hang is reported by the worker
+    rather than taking the whole model down."""
     t0 = time.time()
+    backstop = None if per_tool_timeout <= 0 else per_tool_timeout * 2 + 600
     proc = subprocess.run(
-        [sys.executable, os.path.join(HERE, "worker.py"), model_id, DL_DIR],
+        [sys.executable, os.path.join(HERE, "worker.py"), model_id, DL_DIR,
+         str(per_tool_timeout)],
         capture_output=True,
         text=True,
-        timeout=None if timeout <= 0 else timeout,
+        timeout=backstop,
     )
     result = None
     for line in proc.stdout.splitlines():
@@ -89,7 +99,8 @@ def main():
         "--timeout",
         type=int,
         default=900,
-        help="per-model wall-clock cap in seconds; <=0 disables",
+        help="per-tool wall-clock cap in seconds (each of onnxsim/onnxslim gets "
+        "this budget); <=0 disables",
     )
     ap.add_argument("--output", default="regression.csv")
     args = ap.parse_args()
@@ -135,12 +146,22 @@ def main():
         rows.append(r)
 
         status = r.get("status")
+        on = r.get("orig_nodes")
         if status in ("ok", "unvalidated"):
-            on, sn = r.get("orig_nodes"), r.get("simp_nodes")
-            red = (100 * (on - sn) / on) if on else 0
-            print(f"{status}: {on}->{sn} ({red:+.0f}%) {r.get('seconds')}s", flush=True)
+            sn = r.get("simp_nodes")
+            red = (100 * (on - sn) / on) if on and sn is not None else 0
+            print(f"onnxsim {status}: {on}->{sn} ({red:+.0f}%) {r.get('seconds')}s", flush=True)
         else:
-            print(f"{status}: {str(r.get('error'))[:80]} {r.get('seconds')}s", flush=True)
+            print(f"onnxsim {status}: {str(r.get('error'))[:80]} {r.get('seconds')}s", flush=True)
+        # onnxslim is comparison-only and never gates the run.
+        sstatus, ssn = r.get("slim_status"), r.get("slim_simp_nodes")
+        if sstatus in ("ok", "unvalidated") and ssn is not None:
+            sred = (100 * (on - ssn) / on) if on else 0
+            print(f"    onnxslim {sstatus}: {on}->{ssn} ({sred:+.0f}%) {r.get('slim_seconds')}s",
+                  flush=True)
+        elif sstatus:
+            print(f"    onnxslim {sstatus}: {str(r.get('slim_error'))[:80]} {r.get('slim_seconds')}s",
+                  flush=True)
 
         # A model fails the regression when it crashes, times out, or the
         # simplified graph does not pass onnxsim's own correctness check.
@@ -157,14 +178,26 @@ def main():
         "seconds",
         "skipped_optimizers",
         "valid",
+        "peak_rss_mb",
         "error",
+        # onnxslim comparison arm
+        "slim_status",
+        "slim_simp_nodes",
+        "slim_reduction_pct",
+        "slim_seconds",
+        "slim_valid",
+        "slim_peak_rss_mb",
+        "slim_error",
     ]
     with open(args.output, "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
         w.writeheader()
         for r in rows:
-            on, sn = r.get("orig_nodes"), r.get("simp_nodes")
+            on = r.get("orig_nodes")
+            sn = r.get("simp_nodes")
             r["reduction_pct"] = round(100 * (on - sn) / on, 1) if on and sn is not None else ""
+            ssn = r.get("slim_simp_nodes")
+            r["slim_reduction_pct"] = round(100 * (on - ssn) / on, 1) if on and ssn is not None else ""
             so = r.get("skipped_optimizers")
             r["skipped_optimizers"] = ",".join(so) if isinstance(so, list) else (so or "")
             w.writerow(r)
