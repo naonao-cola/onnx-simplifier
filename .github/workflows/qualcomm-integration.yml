@@ -83,18 +83,24 @@ jobs:
           # onnxruntime-qnn brings its own onnxruntime (the QNN plugin EP).
           python -m pip install onnxruntime-qnn
           python -m pip install wheelhouse/*.whl
+      # Run from runner.temp, not the checkout: the repo root contains the
+      # `onnxsim/` source dir (no compiled extension), which would shadow the
+      # installed wheel on `import onnxsim`. Reference the harness by absolute
+      # $GITHUB_WORKSPACE path. Same guard the model-regression workflow uses.
       - name: Show environment
+        working-directory: ${{ runner.temp }}
         run: |
           python -c "import onnxsim, onnxruntime_qnn as q; print('onnxsim', onnxsim.__version__); print('onnxruntime-qnn', q.__version__)"
-          python -c "import sys; sys.path.insert(0, 'scripts/qualcomm'); import qnn_backend as q; print('QNN available:', q.QNN_AVAILABLE, '| backend:', q.backend_path() if q.QNN_AVAILABLE else q.unavailable_reason())"
+          python -c "import sys, os; sys.path.insert(0, os.path.join(os.environ['GITHUB_WORKSPACE'], 'scripts', 'qualcomm')); import qnn_backend as q; print('QNN available:', q.QNN_AVAILABLE, '| backend:', q.backend_path() if q.QNN_AVAILABLE else q.unavailable_reason())"
       - name: Run QNN compatibility check
+        working-directory: ${{ runner.temp }}
         run: |
-          python scripts/qualcomm/run_qnn_compat.py \
+          python "$GITHUB_WORKSPACE/scripts/qualcomm/run_qnn_compat.py" \
             --require-qnn \
             --output qnn-compat.csv
       - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: qnn-compat-report
-          path: qnn-compat.csv
+          path: ${{ runner.temp }}/qnn-compat.csv
           if-no-files-found: ignore
