@@ -1,0 +1,71 @@
+name: MNN onnxslim replacement
+
+# Builds onnxsim from source and runs tests/test_mnn_llm_export.py, which stands
+# in onnxsim for the onnxslim call in Alibaba MNN's LLM export pipeline
+# (transformers/llm/export/llmexport.py `slim_onnx`, gated by --onnx_slim). The
+# test exports a small LLaMA-style decoder the way MNN does and simplifies it
+# with onnxsim, then -- because onnxslim is installed here -- also compares
+# against onnxslim to prove onnxsim is a faithful drop-in replacement.
+#
+# onnxslim is installed alongside the onnxsim under test (it is a light,
+# pure-Python + onnx dependency with no onnxsim pin), so both simplifiers run in
+# the same environment. torch is needed only to trace the model and is installed
+# CPU-only.
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  pull_request:
+    paths:
+      - "tests/test_mnn_llm_export.py"
+      - ".github/workflows/mnn-onnxslim.yml"
+      - "onnxsim/onnx_simplifier.py"
+      - "onnxsim/onnxsim.cpp"
+  workflow_dispatch:
+
+concurrency:
+  group: mnn-onnxslim-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  mnn-onnxslim:
+    name: MNN LLM export -> onnxsim (vs onnxslim)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      CMAKE_GENERATOR: Ninja
+      CMAKE_CXX_COMPILER_LAUNCHER: sccache
+      SCCACHE_GHA_ENABLED: 'on'
+      ACTIONS_CACHE_SERVICE_V2: 'on'
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.11'
+      - uses: mozilla-actions/sccache-action@v0.0.10
+
+      - name: Install build tooling
+        run: pip install cmake ninja "setuptools>=77" sccache
+
+      # torch is only needed to trace the tiny decoder; CPU wheels are enough.
+      # onnxslim is MNN's current simplifier and drives the comparison leg.
+      - name: Install test dependencies
+        run: |
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install pytest onnxruntime onnxslim
+
+      # Build the onnxsim under test last so it wins over anything a dependency
+      # might have pulled. --no-build-isolation reuses the tooling installed above.
+      - name: Build onnxsim (editable)
+        run: pip install --no-build-isolation -ve .
+
+      - name: Verify onnxsim under test is the source build
+        run: python -c "import onnxsim, onnxsim.onnxsim_cpp2py_export; print('onnxsim', onnxsim.__version__, onnxsim.__file__)"
+
+      - name: Run MNN onnxslim-replacement test
+        run: pytest -v --durations=10 tests/test_mnn_llm_export.py
