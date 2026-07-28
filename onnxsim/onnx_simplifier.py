@@ -402,6 +402,13 @@ def simplify(
             raises ``ValueError`` instead of silently falling back.
     :return: A tuple (simplified model, success(True) or failed(False))
     """
+    # Validate the requested execution providers up front. onnxsim's constant
+    # folding catches per-op executor failures and leaves the op unfolded, so an
+    # unavailable provider raised mid-fold would be swallowed and silently
+    # degrade to no folding. Checking here turns a misconfigured provider (e.g.
+    # CUDA requested without the onnxruntime-gpu build) into an immediate error.
+    backend.validate_providers(providers)
+
     if dynamic_input_shape:
         print(
             Text(

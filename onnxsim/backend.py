@@ -68,6 +68,39 @@ def _check_providers_available(providers: Sequence[Provider]) -> None:
         )
 
 
+def validate_providers(providers: Optional[Sequence[Provider]]) -> None:
+    """Validate a requested execution-provider list, raising if it cannot be
+    honoured by the current backend.
+
+    Callers use this to fail fast *before* constant folding starts. onnxsim's
+    folding loop catches per-op executor errors and simply leaves the op
+    unfolded, so an unavailable provider raised deep inside a fold would be
+    swallowed and silently degrade to no folding rather than surfacing to the
+    user. Checking here instead turns a misconfigured provider into an
+    immediate, actionable error.
+
+    ``None`` (fold on CPU) is always valid.
+    """
+    if providers is None:
+        return
+    if _HAS_ONNXRUNTIME:
+        _check_providers_available(providers)
+        return
+    # Without onnxruntime only the pure-Python reference evaluator is available,
+    # which runs on the CPU and cannot honour any other provider.
+    non_cpu = [
+        _provider_name(p)
+        for p in providers
+        if _provider_name(p) != "CPUExecutionProvider"
+    ]
+    if non_cpu:
+        raise ValueError(
+            "Execution providers other than CPUExecutionProvider require "
+            "onnxruntime. Please install it (e.g. `pip install onnxruntime-gpu` "
+            f"for CUDA). Requested providers: {non_cpu}."
+        )
+
+
 def _run_with_onnxruntime(
     model: Union[str, bytes, onnx.ModelProto],
     inputs: Dict[str, np.ndarray],
@@ -77,7 +110,7 @@ def _run_with_onnxruntime(
 ) -> "OrderedDict[str, np.ndarray]":
     if providers is None:
         providers = DEFAULT_PROVIDERS
-    _check_providers_available(providers)
+    validate_providers(providers)
     sess_options = rt.SessionOptions()
     if custom_lib is not None:
         if os.path.exists(custom_lib):
@@ -114,14 +147,7 @@ def _run_with_reference(
     # execution providers. Asking for a non-CPU provider (e.g. CUDA) without
     # onnxruntime installed cannot be honoured, so surface that instead of
     # silently ignoring the request.
-    if providers is not None and any(
-        _provider_name(p) != "CPUExecutionProvider" for p in providers
-    ):
-        raise ValueError(
-            "Execution providers other than CPUExecutionProvider require "
-            "onnxruntime. Please install it (e.g. `pip install onnxruntime-gpu` "
-            f"for CUDA). Requested providers: {[_provider_name(p) for p in providers]}."
-        )
+    validate_providers(providers)
     from onnx.reference import ReferenceEvaluator
 
     if isinstance(model, str):
