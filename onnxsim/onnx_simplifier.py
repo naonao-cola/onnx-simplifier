@@ -338,6 +338,7 @@ def simplify(
     function_rewrite_rules: Optional[Sequence[FunctionRewriteRule]] = None,
     check_rtol: float = 1e-4,
     check_atol: float = 1e-5,
+    providers: Optional[Sequence[backend.Provider]] = None,
 ) -> Tuple[onnx.ModelProto, bool]:
     """
     :param model: onnx ModelProto object or file path
@@ -389,8 +390,25 @@ def simplify(
             enough to accumulate a larger-but-benign difference (e.g. RF-DETR's XLarge segmentation
             variants -- see ``scripts/rfdetr/FAILURE_ANALYSIS.md``). Ignored when ``check_n == 0``.
     :param check_atol: Absolute tolerance counterpart of ``check_rtol``.
+    :param providers: onnxruntime execution providers used to run the model
+            during constant folding, in priority order, for example
+            ``["CUDAExecutionProvider", "CPUExecutionProvider"]`` to fold on an
+            NVIDIA GPU (falling back to CPU for ops CUDA cannot run). An entry may
+            also be a ``(name, options)`` tuple as accepted by
+            ``onnxruntime.InferenceSession``. ``None`` (the default) folds on the
+            CPU. Non-CPU providers require onnxruntime to be installed (the CUDA
+            provider specifically needs the ``onnxruntime-gpu`` build); a
+            requested provider that the installed onnxruntime does not offer
+            raises ``ValueError`` instead of silently falling back.
     :return: A tuple (simplified model, success(True) or failed(False))
     """
+    # Validate the requested execution providers up front. onnxsim's constant
+    # folding catches per-op executor failures and leaves the op unfolded, so an
+    # unavailable provider raised mid-fold would be swallowed and silently
+    # degrade to no folding. Checking here turns a misconfigured provider (e.g.
+    # CUDA requested without the onnxruntime-gpu build) into an immediate error.
+    backend.validate_providers(providers)
+
     if dynamic_input_shape:
         print(
             Text(
@@ -543,7 +561,7 @@ def simplify(
             model_bytes = None
             raise EncodeError("Message larger than 2GiB")
         model_opt_bytes = C.simplify(
-            _get_model_executor(),
+            _get_model_executor(providers),
             model_bytes,
             skipped_optimizers,
             not skip_constant_folding,
@@ -609,7 +627,7 @@ def simplify(
                 save_as_external_data=True,
             )
             check_ok = C.simplify_path(
-                _get_model_executor(),
+                _get_model_executor(providers),
                 os.path.join(tmpdirname, "model.onnx"),
                 os.path.join(tmpdirname, "opt.onnx"),
                 skipped_optimizers,
@@ -635,6 +653,12 @@ def simplify(
 
 
 class PyModelExecutor(C.ModelExecutor):
+    def __init__(self, providers: Optional[Sequence[backend.Provider]] = None):
+        super().__init__()
+        # onnxruntime execution providers used to run the throwaway sub-models
+        # the C++ core builds during constant folding. ``None`` means CPU only.
+        self.providers = providers
+
     def Run(self, model_str: str, inputs_str: List[str]):
         model = onnx.ModelProto()
         model.ParseFromString(model_str)
@@ -648,7 +672,7 @@ class PyModelExecutor(C.ModelExecutor):
         input_arrs = map(onnx.numpy_helper.to_array, input_tps)
         input_names = [x.name for x in model.graph.input]
         inputs = dict(zip(input_names, input_arrs))
-        outputs = backend.run_model(model, inputs)
+        outputs = backend.run_model(model, inputs, providers=self.providers)
         # The inference backend may return a non-ndarray for an output (for
         # example onnxruntime yields an empty Python list for an empty sequence
         # output). onnx.numpy_helper.from_array only accepts numpy arrays, so
@@ -706,15 +730,20 @@ class _GraphRewriterAdapter(C.GraphRewriter):
 _model_executor: Optional[PyModelExecutor] = None
 
 
-def _get_model_executor() -> PyModelExecutor:
+def _get_model_executor(
+    providers: Optional[Sequence[backend.Provider]] = None,
+) -> PyModelExecutor:
     """Return the process-wide Python model executor, creating it on demand.
 
     The executor is passed explicitly to the C++ ``simplify``/``simplify_path``
-    entry points instead of being registered as a global instance.
+    entry points instead of being registered as a global instance. The cached
+    executor is reused only when it was built for the same ``providers`` request,
+    so a later call asking for a different provider set gets a fresh executor
+    rather than silently keeping the previous one.
     """
     global _model_executor
-    if _model_executor is None:
-        _model_executor = PyModelExecutor()
+    if _model_executor is None or _model_executor.providers != providers:
+        _model_executor = PyModelExecutor(providers)
     return _model_executor
 
 
@@ -859,6 +888,23 @@ def main():
         default=None,
     )
     parser.add_argument(
+        "--providers",
+        help="onnxruntime execution providers used to run the model during "
+        "constant folding, in priority order, for example '--providers "
+        "CUDAExecutionProvider CPUExecutionProvider' to fold on an NVIDIA GPU "
+        "(falling back to CPU for ops CUDA cannot run). Defaults to CPU only. "
+        "The CUDA provider requires the 'onnxruntime-gpu' build.",
+        type=str,
+        nargs="+",
+        default=None,
+    )
+    parser.add_argument(
+        "--cuda",
+        help="Shortcut for '--providers CUDAExecutionProvider "
+        "CPUExecutionProvider'. Requires the 'onnxruntime-gpu' build.",
+        action="store_true",
+    )
+    parser.add_argument(
         "-v", "--version", action="version", version="onnxsim " + version.version
     )
 
@@ -927,6 +973,19 @@ def main():
         args.skip_optimization.append("fuse_bn_into_conv")
 
     perform_optimization = False if args.skip_optimization is None else True
+
+    # Resolve the execution providers for constant folding. ``--cuda`` is a
+    # shortcut for the common GPU-then-CPU order; it and an explicit
+    # ``--providers`` cannot both be given.
+    if args.cuda and args.providers is not None:
+        raise RuntimeError(
+            "--cuda and --providers are mutually exclusive; --cuda is a shortcut "
+            "for '--providers CUDAExecutionProvider CPUExecutionProvider'."
+        )
+    if args.cuda:
+        providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+    else:
+        providers = args.providers
 
     def parse_shapes(shapes_arg):
         shapes = {}
@@ -1035,6 +1094,7 @@ def main():
         target_opset_version=args.target_opset,
         check_rtol=args.check_rtol,
         check_atol=args.check_atol,
+        providers=providers,
     )
 
     try:

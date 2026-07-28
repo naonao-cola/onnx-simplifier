@@ -64,6 +64,34 @@ def test_simplify_without_onnxruntime(monkeypatch):
     assert len(opt.graph.node) == 1
 
 
+@pytest.mark.skipif(
+    not backend.has_onnxruntime(), reason="requires onnxruntime for provider selection"
+)
+def test_simplify_with_explicit_provider():
+    # ``simplify`` threads ``providers`` down to the constant-folding executor.
+    # An explicit CPU provider must fold identically to the default.
+    model = _make_foldable_model()
+    opt, check_ok = onnxsim.simplify(
+        model, check_n=3, providers=["CPUExecutionProvider"]
+    )
+    assert check_ok
+    assert len(opt.graph.node) == 1
+
+
+def test_simplify_with_unavailable_provider_raises():
+    # Requesting a provider the installed onnxruntime does not offer surfaces a
+    # clear error rather than silently folding on the CPU.
+    import onnxruntime as rt
+
+    if not backend.has_onnxruntime():
+        pytest.skip("requires onnxruntime")
+    if "CUDAExecutionProvider" in rt.get_available_providers():
+        pytest.skip("CUDA provider is available; cannot test the unavailable path")
+    model = _make_foldable_model()
+    with pytest.raises(ValueError, match="not available"):
+        onnxsim.simplify(model, providers=["CUDAExecutionProvider"])
+
+
 def test_reference_evaluator_rejects_custom_lib(monkeypatch):
     monkeypatch.setattr(backend, "_HAS_ONNXRUNTIME", False)
     model = _make_foldable_model()
@@ -71,3 +99,69 @@ def test_reference_evaluator_rejects_custom_lib(monkeypatch):
         backend.run_model(
             model, {"x": np.zeros((2, 2), np.float32)}, custom_lib="does_not_exist.so"
         )
+
+
+@pytest.mark.skipif(
+    not backend.has_onnxruntime(), reason="requires onnxruntime for provider selection"
+)
+def test_explicit_cpu_provider_produces_correct_result():
+    # Passing an explicit provider list is honoured and gives the same result as
+    # the default (which is CPU).
+    model = _make_foldable_model()
+    x = np.arange(4, dtype=np.float32).reshape(2, 2)
+    outputs = backend.run_model(
+        model, {"x": x}, providers=["CPUExecutionProvider"]
+    )
+    np.testing.assert_allclose(outputs["y"], x + 3.0)
+
+
+@pytest.mark.skipif(
+    not backend.has_onnxruntime(), reason="requires onnxruntime for provider selection"
+)
+def test_provider_options_tuple_form():
+    # onnxruntime also accepts ``(name, options)`` tuples; onnxsim passes them
+    # through unchanged.
+    model = _make_foldable_model()
+    x = np.arange(4, dtype=np.float32).reshape(2, 2)
+    outputs = backend.run_model(
+        model, {"x": x}, providers=[("CPUExecutionProvider", {})]
+    )
+    np.testing.assert_allclose(outputs["y"], x + 3.0)
+
+
+@pytest.mark.skipif(
+    not backend.has_onnxruntime(), reason="requires onnxruntime for provider selection"
+)
+def test_unavailable_provider_raises():
+    # A requested provider the installed onnxruntime does not offer (e.g. CUDA on
+    # a CPU-only wheel) fails loudly instead of silently falling back to CPU.
+    import onnxruntime as rt
+
+    if "CUDAExecutionProvider" in rt.get_available_providers():
+        pytest.skip("CUDA provider is available; cannot test the unavailable path")
+    model = _make_foldable_model()
+    with pytest.raises(ValueError, match="not available"):
+        backend.run_model(
+            model,
+            {"x": np.zeros((2, 2), np.float32)},
+            providers=["CUDAExecutionProvider"],
+        )
+
+
+def test_reference_evaluator_rejects_non_cpu_provider(monkeypatch):
+    # Without onnxruntime the pure-Python reference evaluator cannot honour a
+    # non-CPU provider, so asking for one is an error rather than a silent no-op.
+    monkeypatch.setattr(backend, "_HAS_ONNXRUNTIME", False)
+    model = _make_foldable_model()
+    with pytest.raises(ValueError, match="require onnxruntime"):
+        backend.run_model(
+            model,
+            {"x": np.zeros((2, 2), np.float32)},
+            providers=["CUDAExecutionProvider"],
+        )
+    # The reference evaluator still accepts an explicit CPU provider.
+    x = np.arange(4, dtype=np.float32).reshape(2, 2)
+    outputs = backend.run_model(
+        model, {"x": x}, providers=["CPUExecutionProvider"]
+    )
+    np.testing.assert_allclose(outputs["y"], x + 3.0)
