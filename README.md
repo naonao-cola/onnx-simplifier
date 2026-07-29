@@ -271,6 +271,13 @@ JSON. Open that file in `chrome://tracing` or at
 nested fixed points appear as parent spans and the individual transforms as their
 children, one box per invocation, annotated with peak RSS and CPU time.
 
+Constant folding's actual work is running the model through ONNX Runtime, so
+those session runs are profiled too. Each fold group appears under `FoldConstant`
+as an `OrtExecutor` span, split into `OrtSessionInit` (building the ONNX Runtime
+session, which is often the dominant cost) and `OrtSessionRun` (the inference).
+This makes it easy to see how much of simplification time is spent inside ONNX
+Runtime versus in shape inference and the optimizer passes.
+
 ```python
 import onnx
 import onnxsim
@@ -301,6 +308,9 @@ Simplify                    1       260.59       270.93       260.59       112.9
     FoldConstant            3       100.36       103.78        47.69       112.93
       Optimize              3       112.56       116.99        37.77       101.42
       InferShapes           3        45.46        47.10        15.22        78.68
+      OrtExecutor          12        71.44        74.02        18.31       112.93
+        OrtSessionInit     12        58.02        60.11        15.90       112.93
+        OrtSessionRun      12         9.85        10.42         2.71       109.10
 -------------------------------------------------------------------------------------
 ```
 

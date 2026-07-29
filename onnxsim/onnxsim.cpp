@@ -212,6 +212,14 @@ struct CppModelExecutor : public ModelExecutor {
   std::vector<onnx::TensorProto> _Run(
       const onnx::ModelProto& model,
       const std::vector<onnx::TensorProto>& inputs) const override {
+    // Constant folding's actual work is running these ONNX Runtime sessions
+    // (one per fold group). Wrap the executor so each run shows up as a span in
+    // the profiling trace, nested under the FoldConstant fixed-point function.
+    // ``OrtSessionInit`` (building the session, where ONNX Runtime does its own
+    // graph loading) and ``OrtSessionRun`` (the inference) are broken out
+    // separately because init is often the dominant cost. All ProfiledScopes
+    // are no-ops unless ONNXSIM_PROFILE is set, so this adds nothing otherwise.
+    onnxsim::ProfiledScope executor_scope("OrtExecutor");
     std::vector<const char*> input_name_ptrs;
     std::vector<const char*> output_name_ptrs;
     std::transform(
@@ -226,16 +234,25 @@ struct CppModelExecutor : public ModelExecutor {
     sess_opts.SetLogSeverityLevel(3);
     sess_opts.SetGraphOptimizationLevel(ORT_DISABLE_ALL);
     std::string model_str = model.SerializeAsString();
-    Ort::Session session(*GetEnv(), model_str.data(), model_str.size(),
-                         sess_opts);
+    Ort::Session session{nullptr};
+    {
+      onnxsim::ProfiledScope init_scope("OrtSessionInit");
+      session = Ort::Session(*GetEnv(), model_str.data(), model_str.size(),
+                             sess_opts);
+    }
     Ort::RunOptions run_opts;
     run_opts.SetRunLogSeverityLevel(3);
     std::vector<Ort::Value> input_tensors;
     std::transform(inputs.begin(), inputs.end(),
                    std::back_inserter(input_tensors), TensorProtoToTensor);
-    auto output_tensors = session.Run(
-        run_opts, input_name_ptrs.data(), input_tensors.data(),
-        input_tensors.size(), output_name_ptrs.data(), output_name_ptrs.size());
+    std::vector<Ort::Value> output_tensors;
+    {
+      onnxsim::ProfiledScope run_scope("OrtSessionRun");
+      output_tensors =
+          session.Run(run_opts, input_name_ptrs.data(), input_tensors.data(),
+                      input_tensors.size(), output_name_ptrs.data(),
+                      output_name_ptrs.size());
+    }
 
     std::vector<onnx::TensorProto> output_tps;
     std::transform(output_tensors.begin(), output_tensors.end(),
