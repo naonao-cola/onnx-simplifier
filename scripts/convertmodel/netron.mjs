@@ -17,10 +17,19 @@
 
 export const NETRON_BASE = "https://netron.app/";
 
-// Above this data-URL length we skip the inline <iframe> and only offer an
-// "open in a new tab" link: browsers refuse to navigate to extremely long URLs,
-// and embedding a multi-megabyte frame src is a poor experience anyway.
-export const NETRON_INLINE_MAX = 6 * 1024 * 1024;
+// Chromium refuses to *navigate* to a URL longer than url::kMaxURLChars
+// (2 MiB) and shows `about:blank#blocked` instead. Because we hand the whole
+// model to Netron as a base64 `data:` URL packed into the URL hash, that cap is
+// the real ceiling on both the inline <iframe> src and the "open in a new tab"
+// link. Base64 inflates the model by ~4/3, so anything past ~1.5 MiB overflows
+// it. Other engines have their own limits (Firefox is far higher, older Safari
+// lower); 2 MiB is the safe common denominator that matches the block we see.
+export const BROWSER_URL_MAX = 2 * 1024 * 1024;
+
+// Keep headroom below the hard cap for the `?identifier=<name>#` prefix and for
+// engines with a slightly lower limit, so we never hand out a URL right at the
+// edge that the browser then blocks.
+export const NETRON_URL_MAX = BROWSER_URL_MAX - 8 * 1024;
 
 // Build the Netron URL that opens `dataUrl` (a `data:...;base64,...` string) and
 // labels it `name` so Netron picks the right parser from the extension.
@@ -32,7 +41,13 @@ export function buildNetronUrl(dataUrl, name) {
   return `${NETRON_BASE}?identifier=${identifier}#${dataUrl}`;
 }
 
-// Whether a data URL is small enough to embed inline in an <iframe>.
-export function canEmbedInline(dataUrl) {
-  return typeof dataUrl === "string" && dataUrl.length <= NETRON_INLINE_MAX;
+// Whether the Netron URL for this model fits under the browser's navigation
+// limit. When it does, both the inline <iframe> and the "open in a new tab"
+// link work; when it doesn't, the browser blocks the navigation
+// (`about:blank#blocked`), so the caller must fall back to a local download.
+// The check is on the *whole* built URL, not just the data URL, since the
+// `identifier` prefix counts against the same cap.
+export function netronUrlFits(dataUrl, name) {
+  if (typeof dataUrl !== "string" || !dataUrl.startsWith("data:")) return false;
+  return buildNetronUrl(dataUrl, name).length <= NETRON_URL_MAX;
 }

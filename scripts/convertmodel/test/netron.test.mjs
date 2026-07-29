@@ -7,9 +7,10 @@
 import assert from "node:assert/strict";
 import {
   NETRON_BASE,
-  NETRON_INLINE_MAX,
+  NETRON_URL_MAX,
+  BROWSER_URL_MAX,
   buildNetronUrl,
-  canEmbedInline,
+  netronUrlFits,
 } from "../netron.mjs";
 
 let passed = 0;
@@ -49,11 +50,28 @@ check("rejects non-data URLs", () => {
   assert.throws(() => buildNetronUrl(undefined, "x"));
 });
 
-check("canEmbedInline respects the size threshold", () => {
-  assert.equal(canEmbedInline(DATA_URL), true);
-  const big = "data:application/octet-stream;base64," + "A".repeat(NETRON_INLINE_MAX);
-  assert.equal(canEmbedInline(big), false);
-  assert.equal(canEmbedInline(undefined), false);
+check("netronUrlFits gates on the browser URL cap", () => {
+  // The safe threshold must stay under the browser's hard navigation limit,
+  // otherwise the URLs we hand out get blocked as `about:blank#blocked`.
+  assert.ok(NETRON_URL_MAX < BROWSER_URL_MAX);
+
+  assert.equal(netronUrlFits(DATA_URL, "model.onnx"), true);
+
+  // A data URL whose *whole* built URL lands just under the cap fits; one just
+  // over it does not. The `identifier` prefix counts against the same budget,
+  // so the check is on buildNetronUrl(...).length, not the data URL alone.
+  const prefix = "data:application/octet-stream;base64,";
+  const fill = (total) => prefix + "A".repeat(total - prefix.length);
+  const overhead = buildNetronUrl(prefix, "model.onnx").length - prefix.length;
+
+  const justFits = fill(NETRON_URL_MAX - overhead);
+  const justOver = fill(NETRON_URL_MAX - overhead + 1);
+  assert.equal(buildNetronUrl(justFits, "model.onnx").length, NETRON_URL_MAX);
+  assert.equal(netronUrlFits(justFits, "model.onnx"), true);
+  assert.equal(netronUrlFits(justOver, "model.onnx"), false);
+
+  assert.equal(netronUrlFits(undefined, "model.onnx"), false);
+  assert.equal(netronUrlFits("https://example.com/m.onnx", "m"), false);
 });
 
 console.log(`PASS: ${passed} checks`);
