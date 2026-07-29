@@ -110,6 +110,23 @@
                                 a.download = result_name;
                                 a.click();
                             };
+                            // Keep the converted model bytes around so the
+                            // "Run inference" panel can run them (not just the
+                            // original upload). Decode the base64 data URL back
+                            // into a Uint8Array and publish it for the panel.
+                            try {
+                                const b64 = data_url.slice(data_url.indexOf(",") + 1);
+                                const bin = atob(b64);
+                                const bytes = new Uint8Array(bin.length);
+                                for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+                                window.__onnxsimConverted = { bytes, name: result_name };
+                                window.dispatchEvent(new CustomEvent("onnxsim:converted", {
+                                    detail: { name: result_name },
+                                }));
+                            } catch (err) {
+                                log_output.value += "failed to keep converted model for inference: " + err + "\n";
+                                log_output.scrollTop = log_output.scrollHeight;
+                            }
                             // Render the onnxsim simplification profile, if one
                             // came back, as an inline flame graph.
                             if (trace_container) trace_container.innerHTML = "";
@@ -224,11 +241,18 @@
         <div id="simplify-trace"></div>
         <h2>Run inference (onnxruntime-web)</h2>
         <p>
-            Runs the selected model for a few iterations to check it executes,
-            using dummy inputs generated from the model's input shapes. WebGPU
-            falls back to WebAssembly when unavailable.
+            Runs a model for a few iterations to check it executes, using dummy
+            inputs generated from the model's input shapes. Pick whether to run
+            the <b>converted</b> result (the simplify/optimize output) or the
+            <b>original</b> upload, so you can compare the two. WebGPU falls back
+            to WebAssembly when unavailable.
         </p>
         <div>
+            <label for="inference-source">model</label>
+            <select id="inference-source">
+                <option value="converted">converted (simplify/optimize output)</option>
+                <option value="original">original (uploaded)</option>
+            </select>
             <label for="inference-ep">execution provider</label>
             <select id="inference-ep">
                 <option value="webgpu">WebGPU (fallback to WASM)</option>
