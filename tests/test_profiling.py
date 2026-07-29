@@ -45,16 +45,16 @@ _EXPECTED_SPANS = {
     "FoldConstant",
 }
 
-# Spans emitted only when constant folding actually runs an ONNX Runtime session
-# (i.e. an op was folded). The executor wraps each session, breaking out session
-# construction (``OrtSessionInit``) from inference (``OrtSessionRun``). onnxsim
-# skips folding when it cannot run the op in the current build/environment, so
-# these are asserted separately from the always-present spans above.
-_ORT_SESSION_SPANS = {
-    "OrtExecutor",
-    "OrtSessionInit",
-    "OrtSessionRun",
-}
+# Span emitted for each fold group's ONNX Runtime session run, i.e. only when
+# constant folding actually runs the op through the executor. It is profiled at
+# the executor call site, so it appears for every executor (the built-in ONNX
+# Runtime one and the Python trampoline that ``simplify()`` injects). The
+# built-in executor additionally nests ``OrtSessionInit``/``OrtSessionRun`` under
+# it, but the Python path used here runs the session opaquely inside the
+# trampoline, so only the ``OrtSession`` span is asserted. onnxsim skips folding
+# when it cannot run the op in the current build/environment, so this is checked
+# separately from the always-present spans above.
+_ORT_SESSION_SPAN = "OrtSession"
 
 
 def _load_trace(path):
@@ -114,8 +114,8 @@ def _contained_in(inner, outer):
 
 def test_profile_captures_ort_session_runs(tmp_path):
     """Constant folding's real work is running ONNX Runtime sessions; those runs
-    are profiled too. When a fold actually executes, the executor span and its
-    init/run sub-spans appear in the trace, nested under FoldConstant."""
+    are profiled too. When a fold actually executes, an ``OrtSession`` span
+    appears in the trace for each fold group, nested under FoldConstant."""
     model = _foldable_model()
     out = str(tmp_path / "trace.json")
     model_opt, ok = onnxsim.simplify(model, profile=out)
@@ -125,30 +125,24 @@ def test_profile_captures_ort_session_runs(tmp_path):
     names = {e["name"] for e in complete}
 
     # The Add of two initializers collapses to a single initializer, leaving one
-    # Add node, iff constant folding ran the op through the ONNX Runtime
-    # executor. onnxsim skips folding when it cannot run the op in the current
-    # build/environment, so there would be nothing to profile then.
+    # Add node, iff constant folding ran the op through the executor. onnxsim
+    # skips folding when it cannot run the op in the current build/environment,
+    # so there would be nothing to profile then.
     add_nodes = [n for n in model_opt.graph.node if n.op_type == "Add"]
     if len(add_nodes) != 1:
         pytest.skip("constant folding did not run the ONNX Runtime executor here")
 
-    assert _ORT_SESSION_SPANS <= names, (
-        f"missing ORT session spans: {_ORT_SESSION_SPANS - names}"
+    assert _ORT_SESSION_SPAN in names, (
+        f"missing {_ORT_SESSION_SPAN!r} span; got {sorted(names)}"
     )
 
-    # Each session run nests correctly: OrtSessionInit and OrtSessionRun inside
-    # an OrtExecutor, which itself sits inside a FoldConstant span.
-    executors = [e for e in complete if e["name"] == "OrtExecutor"]
+    # Each session run nests inside a FoldConstant span.
+    sessions = [e for e in complete if e["name"] == _ORT_SESSION_SPAN]
     folds = [e for e in complete if e["name"] == "FoldConstant"]
-    for exc in executors:
-        assert any(_contained_in(exc, f) for f in folds), (
-            "OrtExecutor span not nested under any FoldConstant span"
+    for sess in sessions:
+        assert any(_contained_in(sess, f) for f in folds), (
+            f"{_ORT_SESSION_SPAN} span not nested under any FoldConstant span"
         )
-    for name in ("OrtSessionInit", "OrtSessionRun"):
-        for span in (e for e in complete if e["name"] == name):
-            assert any(_contained_in(span, exc) for exc in executors), (
-                f"{name} span not nested under any OrtExecutor span"
-            )
 
 
 def test_profile_defaults_to_named_file(tmp_path, monkeypatch):

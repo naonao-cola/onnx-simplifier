@@ -212,14 +212,12 @@ struct CppModelExecutor : public ModelExecutor {
   std::vector<onnx::TensorProto> _Run(
       const onnx::ModelProto& model,
       const std::vector<onnx::TensorProto>& inputs) const override {
-    // Constant folding's actual work is running these ONNX Runtime sessions
-    // (one per fold group). Wrap the executor so each run shows up as a span in
-    // the profiling trace, nested under the FoldConstant fixed-point function.
-    // ``OrtSessionInit`` (building the session, where ONNX Runtime does its own
-    // graph loading) and ``OrtSessionRun`` (the inference) are broken out
-    // separately because init is often the dominant cost. All ProfiledScopes
-    // are no-ops unless ONNXSIM_PROFILE is set, so this adds nothing otherwise.
-    onnxsim::ProfiledScope executor_scope("OrtExecutor");
+    // The RunOps call site already profiles each fold group's session run as a
+    // single ``OrtSession`` span (see RunOps); for the built-in executor break
+    // that down further into ``OrtSessionInit`` (building the session, where
+    // ONNX Runtime loads the graph and usually the dominant cost) and
+    // ``OrtSessionRun`` (the inference). All ProfiledScopes are no-ops unless
+    // ONNXSIM_PROFILE is set, so this adds nothing otherwise.
     std::vector<const char*> input_name_ptrs;
     std::vector<const char*> output_name_ptrs;
     std::transform(
@@ -404,7 +402,18 @@ std::vector<onnx::TensorProto> RunOps(
 
   using namespace ONNX_NAMESPACE::optimization;
   VLOG(1) << "Running " << ops.size() << " node(s) as one batch";
-  auto output_tps = executor._Run(op_model, input_tps);
+  // Constant folding's actual work is running each fold group's sub-model
+  // through the model executor -- an ONNX Runtime session. Profile that run so
+  // it shows up in the trace nested under FoldConstant. This is the one spot
+  // common to every executor (the built-in ONNX Runtime one and the Python
+  // trampoline that Python's simplify() injects), so the session run is
+  // profiled regardless of binding. The ProfiledScope is a no-op unless
+  // ONNXSIM_PROFILE is set.
+  std::vector<onnx::TensorProto> output_tps;
+  {
+    onnxsim::ProfiledScope session_scope("OrtSession");
+    output_tps = executor._Run(op_model, input_tps);
+  }
   for (size_t i = 0; i < output_names.size() && i < output_tps.size(); i++) {
     output_tps[i].set_name(output_names[i]);
   }
