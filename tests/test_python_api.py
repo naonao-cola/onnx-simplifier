@@ -1350,3 +1350,53 @@ def test_simplify_threads_check_tolerance(monkeypatch):
         check_atol=0.456,
     )
     assert captured == {"rtol": 0.123, "atol": 0.456}
+
+
+def _mul_init_by_const_model() -> onnx.ModelProto:
+    """A model ``y = (W * K) + x`` where ``W`` is an initializer and ``K`` is a
+    ``Constant`` node. ``W * K`` is foldable only when initializers count as
+    constants; ``x`` is a genuine graph input so the ``Add`` never folds."""
+    x = onnx.helper.make_tensor_value_info("x", onnx.TensorProto.FLOAT, [1, 3])
+    y = onnx.helper.make_tensor_value_info("y", onnx.TensorProto.FLOAT, [1, 3])
+    w = onnx.helper.make_tensor("W", onnx.TensorProto.FLOAT, [1, 3], [1.0, 2.0, 3.0])
+    const_node = onnx.helper.make_node(
+        "Constant",
+        inputs=[],
+        outputs=["K"],
+        value=onnx.helper.make_tensor(
+            "value", onnx.TensorProto.FLOAT, [1, 3], [2.0, 2.0, 2.0]
+        ),
+    )
+    mul = onnx.helper.make_node("Mul", inputs=["W", "K"], outputs=["M"])
+    add = onnx.helper.make_node("Add", inputs=["x", "M"], outputs=["y"])
+    graph = onnx.helper.make_graph(
+        [const_node, mul, add], "g", [x], [y], initializer=[w]
+    )
+    return onnx.helper.make_model(
+        graph, opset_imports=[onnx.helper.make_opsetid("", 14)], ir_version=10
+    )
+
+
+def test_initializers_as_constants_default_folds_initializer():
+    # By default the initializer W is constant, so W * K is constant-folded away
+    # and only the Add on the real input survives.
+    model = _mul_init_by_const_model()
+    sim_model, ok = onnxsim.simplify(model)
+    assert ok
+    op_types = [n.op_type for n in sim_model.graph.node]
+    assert "Mul" not in op_types
+    assert op_types.count("Add") == 1
+
+
+def test_initializers_as_non_constants_keeps_initializer_node():
+    # Treating initializers as non-constant leaves the Mul on the initializer in
+    # the graph; only the Constant node (K) is still folded.
+    model = _mul_init_by_const_model()
+    sim_model, ok = onnxsim.simplify(model, initializers_as_constants=False)
+    assert ok
+    op_types = [n.op_type for n in sim_model.graph.node]
+    assert "Mul" in op_types
+    assert "Add" in op_types
+    # W stays an initializer, and K has been folded into one too.
+    init_names = {i.name for i in sim_model.graph.initializer}
+    assert "W" in init_names
