@@ -368,6 +368,25 @@ environment variable (`ONNXSIM_ORT_PROFILE`), so it works from every binding:
 ONNXSIM_ORT_PROFILE=ort_profile onnxsim input_onnx_model output_onnx_model
 ```
 
+#### Merging it into onnxsim's trace
+
+Rather than juggling separate files, `merge_ort_profile` (or `--merge-ort-profile`)
+splices ONNX Runtime's per-operator events straight into onnxsim's `profile`
+trace, so each `OrtSession` span gets ONNX Runtime's operator-level detail lined
+up beneath it on its own **onnxruntime** track -- one unified flame graph. It
+implies `profile` (defaulting to `onnxsim_profile.json`), and ONNX Runtime's
+intermediate traces are captured to a temporary directory and removed after
+merging, so nothing is left behind. This works for every executor, including the
+Python one `simplify()` uses:
+
+```python
+model_simp, check = onnxsim.simplify(model, profile="profile.json", merge_ort_profile=True)
+```
+
+```
+onnxsim input_onnx_model output_onnx_model --profile profile.json --merge-ort-profile
+```
+
 ## Custom rewriters
 
 Beyond the built-in optimizer passes, you can plug your own graph rewriting

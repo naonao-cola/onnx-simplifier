@@ -195,6 +195,49 @@ def test_no_ort_profile_by_default(tmp_path, monkeypatch):
     assert "ONNXSIM_ORT_PROFILE" not in os.environ
 
 
+def test_merge_ort_profile_unifies_trace(tmp_path, monkeypatch):
+    """``merge_ort_profile`` folds onnxruntime's own per-operator session traces
+    into onnxsim's ``profile`` trace, so onnxruntime operator events appear in the
+    single unified trace (and no stray onnxruntime files are left behind)."""
+    if not backend.has_onnxruntime():
+        pytest.skip("onnxruntime not installed; native session profiling unavailable")
+    if not hasattr(backend.rt.SessionOptions(), "profile_file_prefix"):
+        pytest.skip("onnxruntime too old to redirect its profile output for merging")
+
+    monkeypatch.chdir(tmp_path)
+    out = str(tmp_path / "trace.json")
+    model_opt, ok = onnxsim.simplify(
+        _foldable_model(), profile=out, merge_ort_profile=True
+    )
+    assert ok
+
+    add_nodes = [n for n in model_opt.graph.node if n.op_type == "Add"]
+    if len(add_nodes) != 1:
+        pytest.skip("constant folding did not run the ONNX Runtime executor here")
+
+    complete, _ = _load_trace(out)
+    # onnxsim's own spans are still there...
+    assert _EXPECTED_SPANS <= {e["name"] for e in complete}
+    # ...and onnxruntime's per-operator events were merged in on their own track.
+    ort_ops = [e for e in complete if e.get("cat") == "onnxruntime"]
+    assert ort_ops, "expected merged onnxruntime operator events in the trace"
+
+    # The temporary onnxruntime traces were cleaned up: the only JSON here is our
+    # unified trace.
+    assert list(tmp_path.glob("*.json")) == [tmp_path / "trace.json"]
+
+
+def test_merge_ort_profile_implies_profile(tmp_path, monkeypatch):
+    # merge_ort_profile without an explicit ``profile`` still writes the default
+    # onnxsim trace (it needs one to merge into).
+    if not backend.has_onnxruntime():
+        pytest.skip("onnxruntime not installed; native session profiling unavailable")
+    monkeypatch.chdir(tmp_path)
+    _, ok = onnxsim.simplify(_foldable_model(), merge_ort_profile=True)
+    assert ok
+    assert os.path.exists(tmp_path / "onnxsim_profile.json")
+
+
 def test_profile_defaults_to_named_file(tmp_path, monkeypatch):
     # An empty string selects the default trace filename in the cwd.
     monkeypatch.chdir(tmp_path)
