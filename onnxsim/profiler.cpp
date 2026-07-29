@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -177,9 +178,11 @@ struct Profiler::Impl {
   std::chrono::steady_clock::time_point t0;
   unsigned sample_interval_ms = 5;
 
-  std::mutex mu;  // guards events and samples
+  std::mutex mu;  // guards events, samples and ort_trace_paths
   std::vector<Event> events;
   std::vector<Sample> samples;
+  // Paths of ONNX Runtime's own per-session traces to merge at Finish().
+  std::vector<std::string> ort_trace_paths;
 
   std::thread sampler;
   std::atomic<bool> stop_sampler{false};
@@ -203,6 +206,14 @@ void Profiler::set_sample_interval_ms(unsigned ms) {
   if (impl_ != nullptr && ms > 0) {
     impl_->sample_interval_ms = ms;
   }
+}
+
+void Profiler::AddOrtTracePath(const std::string& path) {
+  if (!enabled_ || impl_ == nullptr || !merge_ort_traces_ || path.empty()) {
+    return;
+  }
+  std::lock_guard<std::mutex> lk(impl_->mu);
+  impl_->ort_trace_paths.push_back(path);
 }
 
 void Profiler::Enable(const std::string& out_path) {
@@ -303,6 +314,267 @@ void Profiler::End() {
 }
 
 namespace {
+
+// One event read back out of an ONNX Runtime trace file. Only the fields the
+// merge needs are captured; everything else in the JSON is skipped.
+struct OrtEvent {
+  std::string name;
+  std::string ph;
+  double ts = 0;
+  double dur = 0;
+  int64_t tid = 0;
+  bool has_ts = false;
+  bool has_dur = false;
+};
+
+// A tolerant scanner over an ONNX Runtime Chrome-trace JSON. onnxsim's profiler
+// only *writes* JSON, so to fold ONNX Runtime's own traces back in we need to
+// read them; rather than take on a JSON-library dependency this extracts just
+// the handful of fields the merge uses (name/ph/ts/dur/tid) and skips the rest,
+// correctly stepping over nested objects/arrays and string escapes.
+class OrtJsonScanner {
+ public:
+  explicit OrtJsonScanner(const std::string& s) : s_(s) {}
+
+  bool eof() const { return i_ >= s_.size(); }
+  char peek() const { return i_ < s_.size() ? s_[i_] : '\0'; }
+  void advance() { ++i_; }
+  void skip_ws() {
+    while (i_ < s_.size() && (s_[i_] == ' ' || s_[i_] == '\t' ||
+                              s_[i_] == '\n' || s_[i_] == '\r')) {
+      ++i_;
+    }
+  }
+
+  // Parse a JSON string starting at the opening quote; returns its contents.
+  std::string parse_string() {
+    std::string out;
+    ++i_;  // opening quote
+    while (i_ < s_.size()) {
+      char c = s_[i_++];
+      if (c == '"') break;
+      if (c == '\\' && i_ < s_.size()) {
+        char e = s_[i_++];
+        switch (e) {
+          case 'n':
+            out += '\n';
+            break;
+          case 't':
+            out += '\t';
+            break;
+          case 'r':
+            out += '\r';
+            break;
+          case 'b':
+            out += '\b';
+            break;
+          case 'f':
+            out += '\f';
+            break;
+          case 'u':
+            if (i_ + 4 <= s_.size()) i_ += 4;  // non-ASCII names are not needed
+            out += '?';
+            break;
+          default:
+            out += e;  // \\  \/  \"  and anything else -> literal
+        }
+      } else {
+        out += c;
+      }
+    }
+    return out;
+  }
+
+  double parse_number() {
+    skip_ws();
+    size_t start = i_;
+    while (i_ < s_.size() &&
+           (std::isdigit(static_cast<unsigned char>(s_[i_])) || s_[i_] == '-' ||
+            s_[i_] == '+' || s_[i_] == '.' || s_[i_] == 'e' || s_[i_] == 'E')) {
+      ++i_;
+    }
+    return std::strtod(s_.substr(start, i_ - start).c_str(), nullptr);
+  }
+
+  // Skip one value (string / number / object / array / literal).
+  void skip_value() {
+    skip_ws();
+    char c = peek();
+    if (c == '"') {
+      parse_string();
+    } else if (c == '{' || c == '[') {
+      skip_container();
+    } else {
+      while (i_ < s_.size() && s_[i_] != ',' && s_[i_] != '}' &&
+             s_[i_] != ']') {
+        ++i_;
+      }
+    }
+  }
+
+ private:
+  void skip_container() {
+    char open = s_[i_];
+    char close = open == '{' ? '}' : ']';
+    ++i_;
+    int depth = 1;
+    while (i_ < s_.size() && depth > 0) {
+      char c = s_[i_];
+      if (c == '"') {
+        parse_string();  // strings may contain braces/brackets
+        continue;
+      }
+      if (c == open) {
+        ++depth;
+      } else if (c == close) {
+        --depth;
+      }
+      ++i_;
+    }
+  }
+
+  const std::string& s_;
+  size_t i_ = 0;
+};
+
+// Parse an ONNX Runtime trace (a bare JSON array, or an object with a
+// ``traceEvents`` array) into the events the merge needs.
+std::vector<OrtEvent> ParseOrtTraceJson(const std::string& text) {
+  std::vector<OrtEvent> out;
+  OrtJsonScanner sc(text);
+  sc.skip_ws();
+  if (sc.peek() == '{') {
+    // Tolerate the {"traceEvents":[...]} wrapper: advance to the array.
+    while (!sc.eof() && sc.peek() != '[') {
+      if (sc.peek() == '"') {
+        sc.parse_string();
+      } else {
+        sc.advance();
+      }
+    }
+  }
+  sc.skip_ws();
+  if (sc.peek() != '[') return out;
+  sc.advance();  // '['
+  sc.skip_ws();
+  while (!sc.eof() && sc.peek() != ']') {
+    sc.skip_ws();
+    if (sc.peek() != '{') {
+      if (sc.peek() == ',') {
+        sc.advance();
+        continue;
+      }
+      sc.skip_value();
+      sc.skip_ws();
+      if (sc.peek() == ',') sc.advance();
+      continue;
+    }
+    sc.advance();  // '{'
+    OrtEvent ev;
+    sc.skip_ws();
+    while (!sc.eof() && sc.peek() != '}') {
+      sc.skip_ws();
+      if (sc.peek() != '"') break;
+      std::string key = sc.parse_string();
+      sc.skip_ws();
+      if (sc.peek() == ':') sc.advance();
+      sc.skip_ws();
+      if (key == "name" && sc.peek() == '"') {
+        ev.name = sc.parse_string();
+      } else if (key == "ph" && sc.peek() == '"') {
+        ev.ph = sc.parse_string();
+      } else if (key == "ts") {
+        ev.ts = sc.parse_number();
+        ev.has_ts = true;
+      } else if (key == "dur") {
+        ev.dur = sc.parse_number();
+        ev.has_dur = true;
+      } else if (key == "tid") {
+        ev.tid = static_cast<int64_t>(sc.parse_number());
+      } else {
+        sc.skip_value();
+      }
+      sc.skip_ws();
+      if (sc.peek() == ',') {
+        sc.advance();
+        sc.skip_ws();
+      }
+    }
+    if (sc.peek() == '}') sc.advance();
+    out.push_back(std::move(ev));
+    sc.skip_ws();
+    if (sc.peek() == ',') {
+      sc.advance();
+      sc.skip_ws();
+    }
+  }
+  return out;
+}
+
+// Build Chrome-trace event JSON that splices each ONNX Runtime trace named in
+// ``ort_paths`` (in session order) under the matching ``OrtSession`` span in
+// ``events``. onnxruntime's timestamps are relative to that session's start, so
+// each trace is offset onto its span's start and given its own track(s). Traces
+// beyond the number of spans (e.g. correctness-check runs) are ignored.
+std::vector<std::string> BuildMergedOrtEvents(
+    const std::vector<Event>& events,
+    const std::vector<std::string>& ort_paths) {
+  std::vector<std::string> out;
+  std::vector<const Event*> spans;
+  for (const auto& ev : events) {
+    if (ev.name == "OrtSession") spans.push_back(&ev);
+  }
+  std::sort(spans.begin(), spans.end(),
+            [](const Event* a, const Event* b) { return a->ts_us < b->ts_us; });
+  if (spans.empty()) return out;
+
+  // A dedicated tid range so ONNX Runtime events render on their own tracks,
+  // clear of onnxsim's own span threads (hashed to the low 24 bits).
+  uint64_t next_tid = 100000000ull;
+  std::vector<std::pair<size_t, uint64_t>> track_names;  // (session index, tid)
+  for (size_t i = 0; i < ort_paths.size() && i < spans.size(); ++i) {
+    std::ifstream ifs(ort_paths[i], std::ios::binary);
+    if (!ifs) continue;
+    std::stringstream buf;
+    buf << ifs.rdbuf();
+    std::vector<OrtEvent> ort = ParseOrtTraceJson(buf.str());
+    std::vector<const OrtEvent*> complete;
+    for (const auto& e : ort) {
+      if (e.ph == "X" && e.has_ts && e.has_dur) complete.push_back(&e);
+    }
+    if (complete.empty()) continue;
+    double min_ts = complete.front()->ts;
+    for (const auto* e : complete) min_ts = std::min(min_ts, e->ts);
+    const double offset = static_cast<double>(spans[i]->ts_us) - min_ts;
+    std::unordered_map<int64_t, uint64_t> remap;
+    for (const auto* e : complete) {
+      auto it = remap.find(e->tid);
+      uint64_t tid;
+      if (it == remap.end()) {
+        tid = next_tid++;
+        remap[e->tid] = tid;
+        track_names.emplace_back(i, tid);
+      } else {
+        tid = it->second;
+      }
+      std::ostringstream os;
+      os << "{\"name\":\"" << JsonEscape(e->name)
+         << "\",\"cat\":\"onnxruntime\",\"ph\":\"X\",\"ts\":"
+         << static_cast<int64_t>(e->ts + offset)
+         << ",\"dur\":" << static_cast<int64_t>(e->dur)
+         << ",\"pid\":1,\"tid\":" << tid << "}";
+      out.push_back(os.str());
+    }
+  }
+  for (const auto& tn : track_names) {
+    std::ostringstream os;
+    os << "{\"name\":\"thread_name\",\"ph\":\"M\",\"pid\":1,\"tid\":"
+       << tn.second << ",\"args\":{\"name\":\"onnxruntime session " << tn.first
+       << "\"}}";
+    out.push_back(os.str());
+  }
+  return out;
+}
 
 // Append one Chrome "complete" (ph:X) event for a finished span.
 void WriteCompleteEvent(std::ostream& os, const Event& ev) {
@@ -440,6 +712,24 @@ void Profiler::Finish() {
     WriteCompleteEvent(json, ev);
   }
 
+  // ONNX Runtime's own per-operator events, spliced under their OrtSession
+  // spans (empty unless ONNXSIM_MERGE_ORT_PROFILE turned merging on). The trace
+  // files were intermediate, so drop them once folded in.
+  if (merge_ort_traces_) {
+    std::vector<std::string> ort_paths;
+    {
+      std::lock_guard<std::mutex> lk(impl_->mu);
+      ort_paths = impl_->ort_trace_paths;
+    }
+    for (const auto& merged : BuildMergedOrtEvents(impl_->events, ort_paths)) {
+      comma();
+      json << merged;
+    }
+    for (const auto& p : ort_paths) {
+      std::remove(p.c_str());
+    }
+  }
+
   // The RSS-over-time curve as counter events (a track in the timeline).
   for (const auto& s : impl_->samples) {
     comma();
@@ -471,6 +761,7 @@ void Profiler::Finish() {
   }
   std::cout.flush();
 
+  merge_ort_traces_ = false;
   delete impl_;
   impl_ = nullptr;
 }

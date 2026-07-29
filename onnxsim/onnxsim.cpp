@@ -208,10 +208,51 @@ std::shared_ptr<Ort::Env> GetEnv() {
   return env;
 }
 
+// Turn on ONNX Runtime's own per-operator session profiler when
+// ONNXSIM_ORT_PROFILE is set, and return whether it was enabled. This is
+// separate from onnxsim's span profiler (ONNXSIM_PROFILE): it makes each
+// constant-folding session dump ONNX Runtime's detailed per-kernel Chrome
+// trace. The variable names a file prefix (ONNX Runtime writes one
+// ``<prefix>_<timestamp>.json`` per session); the truthy shorthands select a
+// default prefix, mirroring ONNXSIM_PROFILE.
+bool EnableOrtProfilingFromEnv(Ort::SessionOptions& sess_opts) {
+  // Merging (ONNXSIM_MERGE_ORT_PROFILE) also needs the per-session traces, and
+  // writes them to an intermediate prefix that Finish() folds in and deletes.
+  const bool merging = onnxsim::Profiler::Instance().merge_ort_traces();
+  const char* env = std::getenv("ONNXSIM_ORT_PROFILE");
+  if (env == nullptr && !merging) {
+    return false;
+  }
+  std::string prefix;
+  if (merging) {
+    prefix = "onnxsim_ort_merge_tmp";
+  } else {
+    prefix = env;
+    if (prefix.empty() || prefix == "1" || prefix == "true" || prefix == "on" ||
+        prefix == "yes") {
+      prefix = "onnxsim_ort_profile";
+    }
+  }
+#ifdef _WIN32
+  // ORTCHAR_T is wchar_t on Windows; widen the (ASCII) prefix for the API.
+  std::wstring wprefix(prefix.begin(), prefix.end());
+  sess_opts.EnableProfiling(wprefix.c_str());
+#else
+  sess_opts.EnableProfiling(prefix.c_str());
+#endif
+  return true;
+}
+
 struct CppModelExecutor : public ModelExecutor {
   std::vector<onnx::TensorProto> _Run(
       const onnx::ModelProto& model,
       const std::vector<onnx::TensorProto>& inputs) const override {
+    // The RunOps call site already profiles each fold group's session run as a
+    // single ``OrtSession`` span (see RunOps); for the built-in executor break
+    // that down further into ``OrtSessionInit`` (building the session, where
+    // ONNX Runtime loads the graph and usually the dominant cost) and
+    // ``OrtSessionRun`` (the inference). All ProfiledScopes are no-ops unless
+    // ONNXSIM_PROFILE is set, so this adds nothing otherwise.
     std::vector<const char*> input_name_ptrs;
     std::vector<const char*> output_name_ptrs;
     std::transform(
@@ -225,17 +266,39 @@ struct CppModelExecutor : public ModelExecutor {
     Ort::SessionOptions sess_opts;
     sess_opts.SetLogSeverityLevel(3);
     sess_opts.SetGraphOptimizationLevel(ORT_DISABLE_ALL);
+    const bool ort_profiling = EnableOrtProfilingFromEnv(sess_opts);
     std::string model_str = model.SerializeAsString();
-    Ort::Session session(*GetEnv(), model_str.data(), model_str.size(),
-                         sess_opts);
+    Ort::Session session{nullptr};
+    {
+      onnxsim::ProfiledScope init_scope("OrtSessionInit");
+      session = Ort::Session(*GetEnv(), model_str.data(), model_str.size(),
+                             sess_opts);
+    }
     Ort::RunOptions run_opts;
     run_opts.SetRunLogSeverityLevel(3);
     std::vector<Ort::Value> input_tensors;
     std::transform(inputs.begin(), inputs.end(),
                    std::back_inserter(input_tensors), TensorProtoToTensor);
-    auto output_tensors = session.Run(
-        run_opts, input_name_ptrs.data(), input_tensors.data(),
-        input_tensors.size(), output_name_ptrs.data(), output_name_ptrs.size());
+    std::vector<Ort::Value> output_tensors;
+    {
+      onnxsim::ProfiledScope run_scope("OrtSessionRun");
+      output_tensors =
+          session.Run(run_opts, input_name_ptrs.data(), input_tensors.data(),
+                      input_tensors.size(), output_name_ptrs.data(),
+                      output_name_ptrs.size());
+    }
+    if (ort_profiling) {
+      // Flush ONNX Runtime's profiling trace for this session to disk. When
+      // merging, hand its path to the profiler so Finish() folds it into the
+      // onnxsim trace (and deletes the intermediate file).
+      Ort::AllocatorWithDefaultOptions allocator;
+      Ort::AllocatedStringPtr profile_file =
+          session.EndProfilingAllocated(allocator);
+      if (onnxsim::Profiler::Instance().merge_ort_traces() &&
+          profile_file != nullptr) {
+        onnxsim::Profiler::Instance().AddOrtTracePath(profile_file.get());
+      }
+    }
 
     std::vector<onnx::TensorProto> output_tps;
     std::transform(output_tensors.begin(), output_tensors.end(),
@@ -387,7 +450,18 @@ std::vector<onnx::TensorProto> RunOps(
 
   using namespace ONNX_NAMESPACE::optimization;
   VLOG(1) << "Running " << ops.size() << " node(s) as one batch";
-  auto output_tps = executor._Run(op_model, input_tps);
+  // Constant folding's actual work is running each fold group's sub-model
+  // through the model executor -- an ONNX Runtime session. Profile that run so
+  // it shows up in the trace nested under FoldConstant. This is the one spot
+  // common to every executor (the built-in ONNX Runtime one and the Python
+  // trampoline that Python's simplify() injects), so the session run is
+  // profiled regardless of binding. The ProfiledScope is a no-op unless
+  // ONNXSIM_PROFILE is set.
+  std::vector<onnx::TensorProto> output_tps;
+  {
+    onnxsim::ProfiledScope session_scope("OrtSession");
+    output_tps = executor._Run(op_model, input_tps);
+  }
   for (size_t i = 0; i < output_names.size() && i < output_tps.size(); i++) {
     output_tps[i].set_name(output_names[i]);
   }
@@ -1590,6 +1664,21 @@ onnx::ModelProto Simplify(
     }
     if (!profile_path.empty()) {
       onnxsim::Profiler::Instance().Enable(profile_path);
+    }
+  }
+  // Optionally merge ONNX Runtime's own per-session profiles into the onnxsim
+  // trace -- the binding-agnostic counterpart of Python's
+  // ``merge_ort_profile``, so the C ABI, Rust and WASM bindings can produce one
+  // unified trace too. Enable the profiler if it is not already (there must be
+  // a trace to merge into), then have it collect and splice ONNX Runtime's
+  // traces at Finish().
+  if (const char* merge_env = std::getenv("ONNXSIM_MERGE_ORT_PROFILE")) {
+    std::string v = merge_env;
+    if (!v.empty() && v != "0" && v != "false" && v != "off" && v != "no") {
+      if (!onnxsim::Profiler::Instance().enabled()) {
+        onnxsim::Profiler::Instance().Enable("onnxsim_profile.json");
+      }
+      onnxsim::Profiler::Instance().SetMergeOrtTraces(true);
     }
   }
   // Ensure the trace is flushed and the sampler thread is stopped even if a

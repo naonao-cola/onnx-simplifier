@@ -271,6 +271,17 @@ JSON. Open that file in `chrome://tracing` or at
 nested fixed points appear as parent spans and the individual transforms as their
 children, one box per invocation, annotated with peak RSS and CPU time.
 
+Constant folding's actual work is running the model through ONNX Runtime, so
+those session runs are profiled too. Each fold group appears under `FoldConstant`
+as an `OrtSession` span, which times running that group's sub-model through the
+inference executor. This works for every binding, since it wraps the one call
+site common to both the built-in ONNX Runtime executor and the Python executor
+that `simplify()` uses. When the built-in executor runs, the `OrtSession` span is
+split further into `OrtSessionInit` (building the session, where ONNX Runtime
+loads the graph and usually the dominant cost) and `OrtSessionRun` (the
+inference). This makes it easy to see how much of simplification time is spent
+inside ONNX Runtime versus in shape inference and the optimizer passes.
+
 ```python
 import onnx
 import onnxsim
@@ -301,8 +312,14 @@ Simplify                    1       260.59       270.93       260.59       112.9
     FoldConstant            3       100.36       103.78        47.69       112.93
       Optimize              3       112.56       116.99        37.77       101.42
       InferShapes           3        45.46        47.10        15.22        78.68
+      OrtSession           12        71.44        74.02        18.31       112.93
+        OrtSessionInit     12        58.02        60.11        15.90       112.93
+        OrtSessionRun      12         9.85        10.42         2.71       109.10
 -------------------------------------------------------------------------------------
 ```
+
+(`OrtSessionInit`/`OrtSessionRun` show only when the built-in ONNX Runtime
+executor runs the fold; the Python `simplify()` path shows just `OrtSession`.)
 
 `calls` is how many times a function ran across all fixed-point rounds, `cpu(ms)`
 is process CPU time (it can exceed wall time when constant folding runs multiple
@@ -317,6 +334,66 @@ wrapper without any code change:
 
 ```
 ONNXSIM_PROFILE=profile.json onnxsim input_onnx_model output_onnx_model
+```
+
+### ONNX Runtime's own session profiler
+
+The `OrtSession` span above times each folding session as a whole. For a
+finer, per-operator breakdown *inside* those sessions, turn on ONNX Runtime's
+own [session profiler](https://onnxruntime.ai/docs/performance/tune-performance/profiling-tools.html)
+with `ort_profile` (or `--ort-profile`). This flips on
+`SessionOptions.enable_profiling` for the ONNX Runtime sessions onnxsim runs
+while simplifying (the constant-folding sessions, plus the correctness-check
+runs when `check_n > 0`), so each one writes ONNX Runtime's detailed per-kernel
+Chrome trace:
+
+```python
+# Write onnxruntime session traces with the given file prefix.
+model_simp, check = onnxsim.simplify(model, ort_profile="ort_profile")
+```
+
+```
+onnxsim input_onnx_model output_onnx_model --ort-profile ort_profile
+```
+
+The value is a file **prefix**: ONNX Runtime writes one
+`<prefix>_<timestamp>.json` per session, so a run that folds in several batches
+produces several files (open each in `chrome://tracing` or
+[ui.perfetto.dev](https://ui.perfetto.dev)). It is independent of `profile` --
+use either, or both together (`profile` for onnxsim's pipeline, `ort_profile`
+for what ONNX Runtime does inside each fold). Like `profile`, it is driven by an
+environment variable (`ONNXSIM_ORT_PROFILE`), so it works from every binding:
+
+```
+ONNXSIM_ORT_PROFILE=ort_profile onnxsim input_onnx_model output_onnx_model
+```
+
+#### Merging it into onnxsim's trace
+
+Rather than juggling separate files, `merge_ort_profile` (or `--merge-ort-profile`)
+splices ONNX Runtime's per-operator events straight into onnxsim's `profile`
+trace, so each `OrtSession` span gets ONNX Runtime's operator-level detail lined
+up beneath it on its own **onnxruntime** track -- one unified flame graph. It
+implies `profile` (defaulting to `onnxsim_profile.json`), and ONNX Runtime's
+intermediate traces are captured to a temporary directory and removed after
+merging, so nothing is left behind. This works for every executor, including the
+Python one `simplify()` uses:
+
+```python
+model_simp, check = onnxsim.simplify(model, profile="profile.json", merge_ort_profile=True)
+```
+
+```
+onnxsim input_onnx_model output_onnx_model --profile profile.json --merge-ort-profile
+```
+
+The merge is also available from the **C ABI, Rust and WASM bindings** (which
+fold through the built-in ONNX Runtime executor): set the `ONNXSIM_MERGE_ORT_PROFILE`
+environment variable and it is done entirely in onnxsim's C++ core -- no Python
+needed. It implies `ONNXSIM_PROFILE` (defaulting to `onnxsim_profile.json`):
+
+```
+ONNXSIM_MERGE_ORT_PROFILE=1 onnxsim input_onnx_model output_onnx_model
 ```
 
 ## Custom rewriters

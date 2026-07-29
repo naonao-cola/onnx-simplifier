@@ -40,6 +40,27 @@ def has_onnxruntime() -> bool:
     return _HAS_ONNXRUNTIME
 
 
+def _ort_profile_prefix() -> Optional[str]:
+    """The file prefix for onnxruntime's built-in session profiler, or ``None``
+    when it is disabled.
+
+    Constant folding runs each fold group through an ``onnxruntime`` session;
+    setting ``ONNXSIM_ORT_PROFILE`` turns on onnxruntime's own per-operator
+    profiler (``SessionOptions.enable_profiling``) for those sessions, which is
+    finer-grained than onnxsim's ``OrtSession`` span. The variable names a file
+    *prefix* -- onnxruntime writes one ``<prefix>_<timestamp>.json`` Chrome trace
+    per session -- and mirrors ``ONNXSIM_PROFILE``: the truthy shorthands
+    ``1``/``true``/``on``/``yes`` (and the empty string, as set by the
+    ``ort_profile=""`` API default) select the default prefix.
+    """
+    value = os.environ.get("ONNXSIM_ORT_PROFILE")
+    if value is None:
+        return None
+    if value.lower() in ("", "1", "true", "on", "yes"):
+        return "onnxsim_ort_profile"
+    return value
+
+
 def _provider_name(provider: Provider) -> str:
     """The provider name whether ``provider`` is a bare string or a
     ``(name, options)`` tuple."""
@@ -119,6 +140,18 @@ def _run_with_onnxruntime(
             raise ValueError("No such file '{}'".format(custom_lib))
     sess_options.graph_optimization_level = rt.GraphOptimizationLevel(0)
     sess_options.log_severity_level = 3
+    # Optionally turn on onnxruntime's own per-operator session profiler for this
+    # folding session (separate from onnxsim's span profiler; see
+    # ``_ort_profile_prefix``). onnxruntime writes one Chrome trace JSON per
+    # session when the session ends.
+    ort_profile_prefix = _ort_profile_prefix()
+    if ort_profile_prefix is not None:
+        sess_options.enable_profiling = True
+        # onnxruntime appends "_<timestamp>.json" to the prefix. Guard the
+        # attribute: it was added in newer onnxruntime, and without it the
+        # default prefix ("onnxruntime_profile_") is used instead.
+        if hasattr(sess_options, "profile_file_prefix"):
+            sess_options.profile_file_prefix = ort_profile_prefix
     if isinstance(model, onnx.ModelProto):
         model = model.SerializeToString()
     sess = rt.InferenceSession(
@@ -131,6 +164,11 @@ def _run_with_onnxruntime(
     run_options = rt.RunOptions()
     run_options.log_severity_level = 3
     outputs = sess.run(list(output_names), inputs, run_options=run_options)
+    if ort_profile_prefix is not None:
+        # Flush the per-operator trace to disk and stop profiling for this
+        # session (otherwise the file is only written when the session is later
+        # garbage-collected).
+        sess.end_profiling()
     return OrderedDict(zip(output_names, outputs))
 
 

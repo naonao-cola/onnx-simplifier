@@ -58,6 +58,22 @@ class Profiler {
   // profiling was never enabled. After it returns profiling is off again.
   void Finish();
 
+  // Merge ONNX Runtime's own per-session profiling traces into this trace.
+  //
+  // When enabled, Finish() reads each trace path handed to AddOrtTracePath()
+  // and splices its per-operator events under the matching ``OrtSession`` span
+  // (offsetting ONNX Runtime's session-relative timestamps into this profiler's
+  // timeline, one ONNX Runtime thread per track), then deletes the file. This
+  // is the C++ (binding-agnostic) counterpart of onnxsim's Python
+  // ``merge_ort_profile`` and is what lets the C ABI, Rust and WASM bindings
+  // produce a single unified trace. Driven by ``ONNXSIM_MERGE_ORT_PROFILE``.
+  void SetMergeOrtTraces(bool on) { merge_ort_traces_ = on; }
+  bool merge_ort_traces() const { return merge_ort_traces_; }
+
+  // Record the path of an ONNX Runtime trace to merge at Finish(). A no-op
+  // unless profiling and merging are both on.
+  void AddOrtTracePath(const std::string& path);
+
   // RSS sampling interval, milliseconds. Read from ONNXSIM_PROFILE_INTERVAL_MS
   // by Enable() (default 5ms); exposed for tests.
   void set_sample_interval_ms(unsigned ms);
@@ -72,6 +88,7 @@ class Profiler {
   // Heap-allocated so this header stays free of <thread>/<mutex>/<vector>.
   Impl* impl_ = nullptr;
   bool enabled_ = false;
+  bool merge_ort_traces_ = false;
 };
 
 // RAII wrapper that profiles the enclosing scope. Captures whether profiling is

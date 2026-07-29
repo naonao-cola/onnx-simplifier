@@ -2,6 +2,7 @@ import argparse
 import copy
 import os
 import re
+import shutil
 import sys
 import tempfile
 from typing import Callable, Dict, List, Literal, Optional, Sequence, Tuple, Union
@@ -18,7 +19,7 @@ from rich.text import Text
 
 import onnxsim.onnxsim_cpp2py_export as C
 
-from . import backend, model_checking, model_info, version
+from . import backend, model_checking, model_info, profile_merge, version
 
 TensorShape = List[int]
 TensorShapes = Dict[str, TensorShape]
@@ -340,6 +341,8 @@ def simplify(
     check_atol: float = 1e-5,
     providers: Optional[Sequence[backend.Provider]] = None,
     profile: Optional[str] = None,
+    ort_profile: Optional[str] = None,
+    merge_ort_profile: bool = False,
 ) -> Tuple[onnx.ModelProto, bool]:
     """
     :param model: onnx ModelProto object or file path
@@ -411,6 +414,28 @@ def simplify(
             is also printed to stdout. Implemented in the C++ core via the
             ``ONNXSIM_PROFILE`` environment variable, so it works from every
             binding; setting this argument simply sets that variable for the call.
+    :param ort_profile: When set, turn on onnxruntime's own built-in session
+            profiler for the onnxruntime sessions onnxsim runs while simplifying
+            (the constant-folding sessions, plus the correctness-check runs when
+            ``check_n`` > 0). This is separate from and complementary to
+            ``profile``: where ``profile`` times onnxsim's fixed-point functions,
+            ``ort_profile`` records onnxruntime's detailed per-operator execution
+            within each session. The value is a file *prefix* (an empty string uses
+            ``onnxsim_ort_profile``); onnxruntime writes one
+            ``<prefix>_<timestamp>.json`` Chrome trace per session, so a run that
+            folds in several batches produces several files. Implemented via the
+            ``ONNXSIM_ORT_PROFILE`` environment variable, so it works from every
+            binding; setting this argument simply sets that variable for the call.
+    :param merge_ort_profile: Merge onnxruntime's own per-operator session
+            profiles *into* onnxsim's ``profile`` trace, so the operator-level
+            events show up directly under each ``OrtSession`` span in one unified
+            flame graph -- rather than as the separate files ``ort_profile``
+            writes. Implies profiling: if ``profile`` is not set it defaults to
+            ``onnxsim_profile.json``. onnxruntime's traces are captured to a
+            temporary directory and removed after merging, so no stray files are
+            left behind. Takes precedence over ``ort_profile`` (which requests
+            standalone files). Works for every executor, including the Python
+            ``PyModelExecutor`` used by ``simplify()``.
     :return: A tuple (simplified model, success(True) or failed(False))
     """
     # Validate the requested execution providers up front. onnxsim's constant
@@ -566,15 +591,41 @@ def simplify(
     if external_data_dir is not None:
         onnx.load_external_data_for_model(model, external_data_dir)
 
+    # Merging onnxruntime's profile into onnxsim's trace requires an onnxsim
+    # trace to merge into, so it implies profiling.
+    if merge_ort_profile and profile is None:
+        profile = "onnxsim_profile.json"
+
     # Enable the C++ core's fixed-point profiler for the duration of this call by
     # setting ``ONNXSIM_PROFILE`` (read inside ``Simplify``), restoring any prior
     # value afterwards so profiling does not leak into later calls in the same
     # process. An empty string falls back to the default trace filename.
     _prev_profile_env = None
     _profile_active = profile is not None
+    _profile_path = profile or "onnxsim_profile.json"
     if _profile_active:
         _prev_profile_env = os.environ.get("ONNXSIM_PROFILE")
-        os.environ["ONNXSIM_PROFILE"] = profile or "onnxsim_profile.json"
+        os.environ["ONNXSIM_PROFILE"] = _profile_path
+
+    # Turn on onnxruntime's own session profiler by setting ``ONNXSIM_ORT_PROFILE``
+    # (read by the executor). It has two modes: ``ort_profile`` writes standalone
+    # trace files at the given prefix, while ``merge_ort_profile`` captures them to
+    # a temporary directory to be merged into the onnxsim trace below (and takes
+    # precedence). Either way, restore any prior value afterwards.
+    _ort_merge_dir = (
+        tempfile.mkdtemp(prefix="onnxsim_ort_ops_") if merge_ort_profile else None
+    )
+    if _ort_merge_dir is not None:
+        _ort_env_prefix: Optional[str] = os.path.join(_ort_merge_dir, "session")
+    elif ort_profile is not None:
+        _ort_env_prefix = ort_profile or "onnxsim_ort_profile"
+    else:
+        _ort_env_prefix = None
+    _prev_ort_profile_env = None
+    _ort_profile_active = _ort_env_prefix is not None
+    if _ort_env_prefix is not None:
+        _prev_ort_profile_env = os.environ.get("ONNXSIM_ORT_PROFILE")
+        os.environ["ONNXSIM_ORT_PROFILE"] = _ort_env_prefix
 
     try:
         model_bytes = model.SerializeToString()
@@ -675,6 +726,23 @@ def simplify(
                 os.environ.pop("ONNXSIM_PROFILE", None)
             else:
                 os.environ["ONNXSIM_PROFILE"] = _prev_profile_env
+        if _ort_profile_active:
+            if _prev_ort_profile_env is None:
+                os.environ.pop("ONNXSIM_ORT_PROFILE", None)
+            else:
+                os.environ["ONNXSIM_ORT_PROFILE"] = _prev_ort_profile_env
+        # Fold onnxruntime's captured per-operator traces into the onnxsim trace,
+        # then drop the temporary files. Best-effort: a merge failure must not
+        # sink an otherwise-successful simplification.
+        if _ort_merge_dir is not None:
+            try:
+                profile_merge.merge_ort_traces_into_profile(
+                    _profile_path, _ort_merge_dir
+                )
+            except Exception:  # noqa: BLE001 - profiling is best-effort
+                pass
+            finally:
+                shutil.rmtree(_ort_merge_dir, ignore_errors=True)
     _restore_doc_strings(model_opt, doc_strings)
     return model_opt, check_ok
 
@@ -945,6 +1013,26 @@ def main():
         default=None,
     )
     parser.add_argument(
+        "--ort-profile",
+        help="Turn on onnxruntime's own per-operator session profiler for the "
+        "onnxruntime sessions onnxsim runs while simplifying (complementary to "
+        "--profile). The value is a file prefix (defaults to "
+        "'onnxsim_ort_profile'); onnxruntime writes one '<prefix>_<timestamp>.json' "
+        "Chrome trace per session.",
+        type=str,
+        nargs="?",
+        const="onnxsim_ort_profile",
+        default=None,
+    )
+    parser.add_argument(
+        "--merge-ort-profile",
+        help="Merge onnxruntime's per-operator session profiles into onnxsim's "
+        "--profile trace, so the operator-level events appear under each OrtSession "
+        "span in one unified flame graph. Implies --profile (defaults to "
+        "'onnxsim_profile.json').",
+        action="store_true",
+    )
+    parser.add_argument(
         "-v", "--version", action="version", version="onnxsim " + version.version
     )
 
@@ -1136,6 +1224,8 @@ def main():
         check_atol=args.check_atol,
         providers=providers,
         profile=args.profile,
+        ort_profile=args.ort_profile,
+        merge_ort_profile=args.merge_ort_profile,
     )
 
     try:
