@@ -8,16 +8,18 @@
 // Perfetto UI (https://ui.perfetto.dev) right in the page for deeper analysis.
 //
 // renderTrace(container, trace, opts) clears `container` and mounts:
-//   * a small toolbar (download JSON + embed-in-Perfetto),
+//   * a small toolbar (download JSON, embed-in-Perfetto, open-in-a-new-tab),
 //   * the flame-graph canvas (wheel to zoom at the cursor, drag to pan,
 //     double-click to reset),
 //   * a hover tooltip with each span's name, duration and args,
 //   * a slot below into which the Perfetto UI is embedded on demand.
 //
-// Perfetto is embedded following its official protocol
-// (https://perfetto.dev/docs/visualization/embedding-the-ui): an iframe at
-// ui.perfetto.dev/#!/?mode=embedded, a PING/PONG readiness handshake, then a
-// { perfetto: { buffer, title, ... } } postMessage carrying the trace bytes.
+// Perfetto is driven following its official protocol
+// (https://perfetto.dev/docs/visualization/embedding-the-ui): a PING/PONG
+// readiness handshake, then a { perfetto: { buffer, title, ... } } postMessage
+// carrying the trace bytes. The same handshake works against an embedded iframe
+// (ui.perfetto.dev/#!/?mode=embedded) and against the full UI opened in a new
+// tab (window.open on ui.perfetto.dev).
 
 const PERFETTO_ORIGIN = "https://ui.perfetto.dev";
 // `mode=embedded` hides Perfetto's sidebar for a clean in-page view.
@@ -107,29 +109,69 @@ function makeButton(label) {
   return b;
 }
 
-// Embed the Perfetto UI in `slot` (an iframe) and load `trace` into it. Follows
-// the official embedding protocol: create the iframe, PING its contentWindow
-// until it answers PONG (its message listener is then registered), then post
-// the trace bytes. `keepApiOpen` lets us swap in a new trace later without
-// reloading the iframe. Reuses an already-ready iframe on repeat calls.
-function embedInPerfetto(slot, trace, title) {
-  const buffer = new TextEncoder().encode(JSON.stringify(trace)).buffer;
-  const post = (win) =>
-    win.postMessage(
-      {
-        perfetto: {
-          buffer,
-          title,
-          fileName: `${title}.json`,
-          keepApiOpen: true,
-        },
-      },
-      PERFETTO_ORIGIN,
-    );
+// Serialize `trace` (a Chrome Trace Event object) to the ArrayBuffer Perfetto
+// wants. Re-encoded per post so a buffer is never reused across windows.
+function traceBuffer(trace) {
+  return new TextEncoder().encode(JSON.stringify(trace)).buffer;
+}
 
+// Hand `trace` to a ready Perfetto window (iframe contentWindow or popup).
+// `keepApiOpen` keeps Perfetto's postMessage API open so we can swap in a new
+// trace later without reloading (used for the reusable inline iframe).
+function postTrace(win, trace, title, keepApiOpen) {
+  win.postMessage(
+    {
+      perfetto: {
+        buffer: traceBuffer(trace),
+        title,
+        fileName: `${title}.json`,
+        keepApiOpen,
+      },
+    },
+    PERFETTO_ORIGIN,
+  );
+}
+
+// PING `win` until it answers PONG (its message listener is then registered),
+// then call `ready()`. Returns a teardown that stops pinging. Gives up after
+// ~20s, and stops early if the window goes away (e.g. a closed popup).
+function whenPerfettoReady(win, ready) {
+  let done = false;
+  const onMessage = (evt) => {
+    // Only this window's PONG counts (other embeds post PONGs too).
+    if (evt.source !== win || evt.data !== "PONG") return;
+    teardown();
+    ready();
+  };
+  const timer = setInterval(() => {
+    try {
+      if (win && !win.closed) {
+        win.postMessage("PING", PERFETTO_ORIGIN);
+      } else {
+        teardown();
+      }
+    } catch {
+      teardown();
+    }
+  }, 250);
+  const giveUp = setTimeout(teardown, 20000);
+  function teardown() {
+    if (done) return;
+    done = true;
+    clearInterval(timer);
+    clearTimeout(giveUp);
+    window.removeEventListener("message", onMessage);
+  }
+  window.addEventListener("message", onMessage);
+  return teardown;
+}
+
+// Embed the Perfetto UI in `slot` (an iframe) and load `trace` into it. Reuses
+// an already-ready iframe on repeat calls.
+function embedInPerfetto(slot, trace, title) {
   let iframe = slot.querySelector("iframe.perfetto");
   if (iframe && iframe.__ready) {
-    post(iframe.contentWindow);
+    postTrace(iframe.contentWindow, trace, title, true);
     return;
   }
   if (!iframe) {
@@ -145,24 +187,22 @@ function embedInPerfetto(slot, trace, title) {
     slot.innerHTML = "";
     slot.appendChild(iframe);
   }
-
-  // Only the target iframe's PONG counts (other embeds post PONGs too).
-  const onMessage = (evt) => {
-    if (evt.source !== iframe.contentWindow || evt.data !== "PONG") return;
-    clearInterval(timer);
-    window.removeEventListener("message", onMessage);
+  whenPerfettoReady(iframe.contentWindow, () => {
     iframe.__ready = true;
-    post(iframe.contentWindow);
-  };
-  window.addEventListener("message", onMessage);
-  const timer = setInterval(() => {
-    if (iframe.contentWindow) iframe.contentWindow.postMessage("PING", PERFETTO_ORIGIN);
-  }, 250);
-  // Give up pinging after ~20s so we do not leak the interval.
-  setTimeout(() => {
-    clearInterval(timer);
-    window.removeEventListener("message", onMessage);
-  }, 20000);
+    postTrace(iframe.contentWindow, trace, title, true);
+  });
+}
+
+// Open the full Perfetto UI in a new tab and load `trace` into it. Must run
+// from a user gesture (a click) so the popup is not blocked. Returns the opened
+// window, or null if the browser blocked it.
+function openInPerfettoTab(trace, title) {
+  const win = window.open(`${PERFETTO_ORIGIN}/`, "_blank");
+  if (!win) {
+    return null;
+  }
+  whenPerfettoReady(win, () => postTrace(win, trace, title, false));
+  return win;
 }
 
 function download(trace, filename) {
@@ -194,15 +234,25 @@ export function renderTrace(container, trace, opts = {}) {
   bar.style.margin = "6px 0";
   const dlBtn = makeButton("Download JSON");
   const pfBtn = makeButton("Embed in Perfetto");
+  const pfTabBtn = makeButton("open in a new tab ↗");
   dlBtn.addEventListener("click", () => download(trace, filename));
   bar.appendChild(dlBtn);
   bar.appendChild(pfBtn);
+  bar.appendChild(pfTabBtn);
   const hint = document.createElement("span");
   hint.style.color = "#666";
   hint.style.fontSize = "12px";
   hint.textContent = "wheel = zoom · drag = pan · double-click = reset";
   bar.appendChild(hint);
   container.appendChild(bar);
+
+  // Open the trace in the full Perfetto UI in a new tab.
+  pfTabBtn.addEventListener("click", () => {
+    if (!openInPerfettoTab(trace, title)) {
+      hint.style.color = "#a00";
+      hint.textContent = "Pop-up blocked — allow pop-ups to open Perfetto in a new tab.";
+    }
+  });
 
   // Slot the Perfetto UI is embedded into on demand; the button toggles it.
   const perfettoSlot = document.createElement("div");
