@@ -18,7 +18,6 @@
 #include "onnxruntime/core/session/onnxruntime_cxx_api.h"
 #endif
 #include "contrib_schemas.h"
-#include "profiler.h"
 #include "onnx/common/file_utils.h"
 #include "onnx/defs/printer.h"
 #include "onnx/defs/schema.h"
@@ -27,6 +26,7 @@
 #include "onnxoptimizer/model_util.h"
 #include "onnxoptimizer/optimize.h"
 #include "onnxoptimizer/passes/logging.h"
+#include "profiler.h"
 
 struct Config {
   std::vector<std::string> optimizer_passes;
@@ -1579,12 +1579,13 @@ onnx::ModelProto Simplify(
   // every binding without a signature change. ``Profiled`` wraps a transform so
   // each invocation records its wall/CPU duration and peak RSS; the wrappers
   // nest, so the fixed points show up as parent spans of the transforms they
-  // drive. When profiling is off ``Profiled`` returns the function unchanged and
+  // drive. When profiling is off ``Profiled`` returns the function unchanged
+  // and
   // ``ProfiledScope`` is a no-op, so there is zero overhead.
   if (const char* profile_env = std::getenv("ONNXSIM_PROFILE")) {
     std::string profile_path = profile_env;
-    if (profile_path == "1" || profile_path == "true" ||
-        profile_path == "on" || profile_path == "yes") {
+    if (profile_path == "1" || profile_path == "true" || profile_path == "on" ||
+        profile_path == "yes") {
       profile_path = "onnxsim_profile.json";
     }
     if (!profile_path.empty()) {
@@ -1608,9 +1609,9 @@ onnx::ModelProto Simplify(
   };
 
   ModelFn OptAndShape = Profiled(
-      "OptAndShape", FixedPointFn(Profiled("InferShapes", InferShapes),
-                                  Profiled("Optimize", OptimizeInPlace),
-                                  fixed_point_iters));
+      "OptAndShape",
+      FixedPointFn(Profiled("InferShapes", InferShapes),
+                   Profiled("Optimize", OptimizeInPlace), fixed_point_iters));
   bool converged = false;
   ModelFn Pipeline;
   if (rewriter) {
@@ -1625,20 +1626,23 @@ onnx::ModelProto Simplify(
         "OptAndShapeAndFold",
         FixedPointFn(OptAndShape, Profiled("FoldConstant", FoldConstant),
                      fixed_point_iters));
-    ModelFn RewriteInPlace = Profiled("Rewrite", [rewriter](onnx::ModelProto& model) {
-      // ``_Run`` rewrites in place and returns whether it changed anything;
-      // when it reports no change it leaves ``model`` untouched, so no copy is
-      // made. The fixed point's fingerprint comparison then sees the unchanged
-      // model and converges without an extra ModelProto round-trip.
-      rewriter->_Run(model);
-    });
-    Pipeline = Profiled("Pipeline",
-                        FixedPointFn(OptAndShapeAndFold, RewriteInPlace,
-                                     fixed_point_iters, &converged));
+    ModelFn RewriteInPlace =
+        Profiled("Rewrite", [rewriter](onnx::ModelProto& model) {
+          // ``_Run`` rewrites in place and returns whether it changed anything;
+          // when it reports no change it leaves ``model`` untouched, so no copy
+          // is made. The fixed point's fingerprint comparison then sees the
+          // unchanged model and converges without an extra ModelProto
+          // round-trip.
+          rewriter->_Run(model);
+        });
+    Pipeline =
+        Profiled("Pipeline", FixedPointFn(OptAndShapeAndFold, RewriteInPlace,
+                                          fixed_point_iters, &converged));
   } else {
     Pipeline = Profiled(
-        "Pipeline", FixedPointFn(OptAndShape, Profiled("FoldConstant", FoldConstant),
-                                 fixed_point_iters, &converged));
+        "Pipeline",
+        FixedPointFn(OptAndShape, Profiled("FoldConstant", FoldConstant),
+                     fixed_point_iters, &converged));
   }
   // The fixed points mutate in place, so make one working copy of the (const)
   // input model and simplify it in place.

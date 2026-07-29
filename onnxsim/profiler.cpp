@@ -74,8 +74,8 @@ size_t ReadCurrentRssBytes() {
   struct rusage ru;
   if (getrusage(RUSAGE_SELF, &ru) == 0) {
     // ru_maxrss is kilobytes on Linux/BSD; this branch is only the fallback for
-    // platforms without a live-RSS source, so a peak high-water mark is the best
-    // available approximation.
+    // platforms without a live-RSS source, so a peak high-water mark is the
+    // best available approximation.
     return static_cast<size_t>(ru.ru_maxrss) * 1024;
   }
   return 0;
@@ -177,7 +177,7 @@ struct Profiler::Impl {
   std::chrono::steady_clock::time_point t0;
   unsigned sample_interval_ms = 5;
 
-  std::mutex mu;                 // guards events and samples
+  std::mutex mu;  // guards events and samples
   std::vector<Event> events;
   std::vector<Sample> samples;
 
@@ -226,8 +226,9 @@ void Profiler::Enable(const std::string& out_path) {
 
   enabled_ = true;
 
-  // The sampler only reads process memory and appends to a mutex-guarded buffer;
-  // it never touches Python, so it is safe to run while the GIL is held.
+  // The sampler only reads process memory and appends to a mutex-guarded
+  // buffer; it never touches Python, so it is safe to run while the GIL is
+  // held.
   //
   // Skipped under Emscripten, whose default build has no pthread runtime: there
   // peak memory falls back to the synchronous reads Begin()/End() take at each
@@ -306,9 +307,9 @@ namespace {
 // Append one Chrome "complete" (ph:X) event for a finished span.
 void WriteCompleteEvent(std::ostream& os, const Event& ev) {
   const double cpu_ms = static_cast<double>(ev.cpu_us) / 1000.0;
-  const double util =
-      ev.dur_us > 0 ? static_cast<double>(ev.cpu_us) / static_cast<double>(ev.dur_us)
-                    : 0.0;
+  const double util = ev.dur_us > 0 ? static_cast<double>(ev.cpu_us) /
+                                          static_cast<double>(ev.dur_us)
+                                    : 0.0;
   os << "{\"name\":\"" << JsonEscape(ev.name) << "\",\"cat\":\"fixed_point\","
      << "\"ph\":\"X\",\"ts\":" << ev.ts_us << ",\"dur\":" << ev.dur_us
      << ",\"pid\":1,\"tid\":" << ev.tid << ",\"args\":{"

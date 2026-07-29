@@ -43,8 +43,8 @@ class Profiler {
 
   // Turn profiling on, writing the trace to ``out_path`` when Finish() runs.
   // Resets any state from a previous run and starts the RSS sampler. Calling
-  // Enable() again (e.g. onnxsim's large-model fallback simplifies twice) starts
-  // a fresh run whose trace overwrites the previous one.
+  // Enable() again (e.g. onnxsim's large-model fallback simplifies twice)
+  // starts a fresh run whose trace overwrites the previous one.
   void Enable(const std::string& out_path);
 
   bool enabled() const { return enabled_; }
@@ -79,7 +79,8 @@ class Profiler {
 // that actually happened.
 class ProfiledScope {
  public:
-  explicit ProfiledScope(const char* name) : active_(Profiler::Instance().enabled()) {
+  explicit ProfiledScope(const char* name)
+      : active_(Profiler::Instance().enabled()) {
     if (active_) {
       Profiler::Instance().Begin(name);
     }
