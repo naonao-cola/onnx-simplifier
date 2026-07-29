@@ -1,0 +1,28 @@
+name: convertmodel inference test
+
+on:
+  push:
+    branches: ["master"]
+    paths:
+      - "scripts/convertmodel/**"
+      - ".github/workflows/convertmodel-inference.yml"
+  pull_request:
+    paths:
+      - "scripts/convertmodel/**"
+      - ".github/workflows/convertmodel-inference.yml"
+  workflow_dispatch:
+
+jobs:
+  inference:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Install onnxruntime-web
+        working-directory: scripts/convertmodel
+        run: npm ci
+      - name: Run inference smoke test (wasm EP)
+        working-directory: scripts/convertmodel
+        run: npm run test:inference

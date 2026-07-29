@@ -149,3 +149,15 @@ rust/Cargo.lock
 # ONNX Runtime source fetched on demand by the Rust build (see build_wasm.sh)
 /third_party/onnxruntime-*/
 /third_party/v*.zip
+
+# emscripten SDK cloned by build_wasm.sh helpers
+/emsdk/
+
+# protobuf built on demand by build_wasm.sh when protoc is missing
+/protobuf/
+
+# Node deps for the convertmodel inference test / browser page
+node_modules/
+
+# ...but the convertmodel inference test's fixture model IS tracked.
+!/scripts/convertmodel/test/model.onnx

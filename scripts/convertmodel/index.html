@@ -116,5 +116,23 @@
         </div>
         <h2>Console outputs:</h2>
         <pre id="log-output"></pre>
+        <h2>Run inference (onnxruntime-web)</h2>
+        <p>
+            Runs the selected model for a few iterations to check it executes,
+            using dummy inputs generated from the model's input shapes. WebGPU
+            falls back to WebAssembly when unavailable.
+        </p>
+        <div>
+            <label for="inference-ep">execution provider</label>
+            <select id="inference-ep">
+                <option value="webgpu">WebGPU (fallback to WASM)</option>
+                <option value="wasm">WASM</option>
+            </select>
+            <label for="inference-iters">iterations</label>
+            <input type="number" id="inference-iters" value="5" min="1" style="width: 4em;">
+            <button id="run-inference">Run inference</button>
+        </div>
+        <pre id="inference-output"></pre>
+        <script type="module" src="./inference_browser.mjs"></script>
     </body>
 </html>
