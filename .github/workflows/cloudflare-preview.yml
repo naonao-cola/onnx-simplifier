@@ -1,0 +1,106 @@
+# Deploy per-PR preview builds of the WASM demo to Cloudflare Pages.
+# Production stays on GitHub Pages (see static.yml); this workflow only
+# publishes preview deployments so every pull request gets its own URL.
+name: Cloudflare Pages preview
+
+on:
+  pull_request:
+
+  # Allows you to run this workflow manually from the Actions tab
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: write
+
+# One preview per PR; cancel superseded runs.
+concurrency:
+  group: "cf-pages-${{ github.ref }}"
+  cancel-in-progress: true
+
+jobs:
+  preview:
+    runs-on: ubuntu-latest
+    # Secrets are not available to pull requests from forks, so skip the
+    # deploy there instead of failing. Same-repo branches get previews.
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository }}
+    env:
+      CMAKE_GENERATOR: Ninja
+      EMSCRIPTEN_VERSION: "5.0.0"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          submodules: recursive
+      - run: pip install cmake ninja
+      - run: |
+          sudo apt update
+          sudo apt install protobuf-compiler
+      - name: Prepare ccache timestamp
+        id: ccache_cache_timestamp
+        run: |
+          echo "timestamp=$(date -Iseconds)" >> ${GITHUB_OUTPUT}
+      - name: ccache cache files
+        uses: actions/cache@v6
+        with:
+          path: .ccache
+          key: cf-pages-ccache-${{ steps.ccache_cache_timestamp.outputs.timestamp }}
+          restore-keys: |
+              cf-pages-ccache-
+      - run: |
+          sudo apt install -y ccache
+          which ccache
+          ccache -z
+          echo "CCACHE_DIR=${PWD}/.ccache" >> ${GITHUB_ENV}
+          echo "CCACHE_MAXSIZE=500M" >> ${GITHUB_ENV}
+          echo "_EMCC_CCACHE=1" >> ${GITHUB_ENV}
+      - name: Build WASM demo
+        run: |
+          git clone --depth 1 https://github.com/emscripten-core/emsdk.git
+          ./emsdk/emsdk install ${EMSCRIPTEN_VERSION}
+          ./emsdk/emsdk activate ${EMSCRIPTEN_VERSION}
+          . ./emsdk/emsdk_env.sh
+          EMPROFILE=1 ./build_wasm.sh
+          rm scripts/convertmodel/onnxsim.*
+          cp build-wasm-node-OFF/onnxsim.* scripts/convertmodel
+      - run: ccache -s
+      - name: Deploy preview to Cloudflare Pages
+        id: deploy
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          # A branch that is NOT the project's production branch produces a
+          # preview deployment with a stable <branch>.<project>.pages.dev alias.
+          command: >-
+            pages deploy scripts/convertmodel
+            --project-name=onnxsim
+            --branch=${{ github.head_ref || github.ref_name }}
+      - name: Comment preview URL on the PR
+        if: ${{ github.event_name == 'pull_request' }}
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const url = ${{ toJSON(steps.deploy.outputs.deployment-url) }};
+            const alias = ${{ toJSON(steps.deploy.outputs.pages-deployment-alias-url) }};
+            const marker = '<!-- cloudflare-pages-preview -->';
+            const body = [
+              marker,
+              '### ⚡ Cloudflare Pages preview',
+              '',
+              `| | URL |`,
+              `| --- | --- |`,
+              `| **This build** | ${url} |`,
+              alias ? `| **Branch alias** | ${alias} |` : '',
+              '',
+              `_Preview of ${context.sha.slice(0, 7)} — updates on every push to this PR._`,
+            ].filter(Boolean).join('\n');
+            const { owner, repo } = context.repo;
+            const issue_number = context.issue.number;
+            const { data: comments } = await github.rest.issues.listComments({ owner, repo, issue_number });
+            const existing = comments.find((c) => c.body && c.body.includes(marker));
+            if (existing) {
+              await github.rest.issues.updateComment({ owner, repo, comment_id: existing.id, body });
+            } else {
+              await github.rest.issues.createComment({ owner, repo, issue_number, body });
+            }
