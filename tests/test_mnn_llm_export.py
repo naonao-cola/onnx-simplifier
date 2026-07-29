@@ -36,9 +36,9 @@
 # offline and fast, but the op set and graph topology are the ones a real MNN
 # LLM export produces, so it exercises the same simplification paths.
 #
-# torch is required to trace the model. It is already in the build-and-test
-# matrix, so this runs there; the dedicated ``mnn-onnxslim`` workflow also
-# installs onnxslim so the comparison leg runs. To run locally::
+# This runs in the regular build-and-test matrix: torch (to trace the model) and
+# onnxslim (for the comparison leg) are both in that job's test requirements, so
+# both test cases execute there with no dedicated workflow. To run locally::
 #
 #     pip install torch onnxruntime onnxslim
 #     pip install --force-reinstall --no-deps .   # the onnxsim under test
@@ -275,8 +275,9 @@ def test_onnxsim_slims_mnn_llm_export(tmp_path):
 def test_onnxsim_matches_onnxslim_on_mnn_llm_export(tmp_path):
     # Proves the replacement is faithful: onnxsim and the onnxslim it replaces
     # both turn the same MNN export into a valid graph that reproduces the
-    # reference outputs. Skipped unless onnxslim (MNN's current dependency) is
-    # installed; the dedicated CI workflow installs it.
+    # reference outputs. onnxslim (MNN's current dependency) is installed in the
+    # build-and-test matrix; the importorskip only guards ad-hoc environments
+    # that lack it.
     onnxslim = pytest.importorskip("onnxslim")
 
     onnx_path, feed, reference = _export_llm(tmp_path)
