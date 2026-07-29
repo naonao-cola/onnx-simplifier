@@ -7,7 +7,7 @@
                 to_ary = (vec) => {
                     return new Array(vec.size()).fill(0).map((_, id) => vec.get(id))
                 };
-                const passes = document.getElementById("passes");
+                const passes = document.getElementById("pass-list");
                 const checkboxes = {};
                 for (const p of to_ary(runtime.onnxoptimizer_passes()).sort()) {
                     const c = document.createElement("input");
@@ -38,10 +38,12 @@
                 worker.onmessage = (e) => {
                     switch (e.data[0]) {
                         case "stdout":
-                            log_output.textContent += e.data[1] + "\n";
+                            log_output.value += e.data[1] + "\n";
+                            log_output.scrollTop = log_output.scrollHeight;
                             break;
                         case "stderr":
-                            log_output.textContent += e.data[1] + "\n";
+                            log_output.value += e.data[1] + "\n";
+                            log_output.scrollTop = log_output.scrollHeight;
                             break;
                         case "convert-done":
                             input.disabled = false;
@@ -67,7 +69,8 @@
                                         });
                                     });
                                 } catch (err) {
-                                    log_output.textContent += "failed to parse profiling trace: " + err + "\n";
+                                    log_output.value += "failed to parse profiling trace: " + err + "\n";
+                                    log_output.scrollTop = log_output.scrollHeight;
                                 }
                             }
                             break;
@@ -137,9 +140,10 @@
             <input type="checkbox" name="simplify_profile" id="id_simplify_profile" checked>
             <label for="id_simplify_profile">profile simplification (simplify only) — emit a Chrome trace</label>
             <br/>
+            <div id="pass-list" style="height: 300px; overflow-y: auto; border: 1px solid #ccc; padding: 4px; margin-top: 4px;"></div>
         </div>
         <h2>Console outputs:</h2>
-        <pre id="log-output"></pre>
+        <textarea id="log-output" readonly rows="20" style="width: 100%; box-sizing: border-box;"></textarea>
         <h2>onnxsim profiling</h2>
         <p>
             Profiling is on by default (“profile simplification” above): convert

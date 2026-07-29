@@ -47,12 +47,21 @@ std::shared_ptr<const ModelExecutor> GetBuiltinModelExecutor();
 // of the default ONNX domain (using onnx's version converter) before
 // simplifying, so the simplifier can clean up any redundant nodes the
 // conversion introduces. std::nullopt leaves the opset version unchanged.
+// ``initializers_as_constants`` (default true) controls whether graph
+// initializers are treated as constant tensors during simplification. With the
+// default, initializers are constants: constant folding materializes nodes that
+// depend only on them, and the onnx optimizer's value-baking passes (e.g.
+// fuse_bn_into_conv) may fold them. When set to false, initializers are treated
+// as non-constant, so nodes rooted only at initializers are left in the graph
+// and their weights survive simplification as tunable tensors; ``Constant``
+// nodes are still treated as constants either way.
 onnx::ModelProto Simplify(
     const ModelExecutor& executor, const onnx::ModelProto& model,
     std::optional<std::vector<std::string>> skip_optimizers,
     bool constant_folding, bool shape_inference, size_t tensor_size_threshold,
     std::optional<int> target_opset_version = std::nullopt,
-    const GraphRewriter* rewriter = nullptr);
+    const GraphRewriter* rewriter = nullptr,
+    bool initializers_as_constants = true);
 
 void SimplifyPath(const ModelExecutor& executor, const std::string& in_path,
                   const std::string& out_path,
@@ -60,4 +69,5 @@ void SimplifyPath(const ModelExecutor& executor, const std::string& in_path,
                   bool constant_folding, bool shape_inference,
                   size_t tensor_size_threshold,
                   std::optional<int> target_opset_version = std::nullopt,
-                  const GraphRewriter* rewriter = nullptr);
+                  const GraphRewriter* rewriter = nullptr,
+                  bool initializers_as_constants = true);
