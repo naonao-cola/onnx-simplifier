@@ -18,6 +18,16 @@ ORT_ITERS=20 npm run test:inference
 ORT_EP=webgpu npm run test:inference   # only where a WebGPU runtime exists
 ```
 
+## Netron URL builder test
+
+`npm run test:netron` unit-tests `netron.mjs`, the pure helper that builds the
+[Netron](https://netron.app) URL for the converter page's "Visualize with
+Netron (before / after)" panel. It needs no dependencies or network:
+
+```bash
+npm run test:netron
+```
+
 ## Execution providers
 
 onnxruntime-web exposes the `wasm` execution provider everywhere and the

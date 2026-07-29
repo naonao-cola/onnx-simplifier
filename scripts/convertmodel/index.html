@@ -1,6 +1,12 @@
 <!DOCTYPE html>
 <html>
     <head>
+        <style>
+            .netron-pane { flex: 1 1 380px; min-width: 300px; }
+            .netron-head { margin-bottom: 0.35em; }
+            .netron-note { color: #a00; font-size: 0.9em; margin-top: 0.35em; }
+            .netron-frame { width: 100%; height: 480px; border: 1px solid #ccc; }
+        </style>
         <script type="text/javascript" src="./onnxsim.js"></script>
         <script type="text/javascript">
             create_onnxsim().then((runtime) => {
@@ -52,6 +58,10 @@
                                 a.download = result_name;
                                 a.click();
                             };
+                            // Visualize the simplified/optimized model with Netron.
+                            if (window.netronShowAfter) {
+                                window.netronShowAfter(data_url, result_name);
+                            }
                             break;
                     }
                 };
@@ -114,6 +124,33 @@
             <input type="number" name="simplify_target_opset" id="id_simplify_target_opset" value="0">
             <br/>
         </div>
+        <h2>Visualize with Netron (before / after)</h2>
+        <p>
+            Renders the model graph with
+            <a href="https://netron.app" target="_blank" rel="noopener">Netron</a>:
+            the original model on the left and the simplified/optimized result on
+            the right, so you can compare them side by side. Nothing is uploaded —
+            the model is handed to Netron as an in-browser data URL.
+        </p>
+        <div id="netron-panes" style="display: flex; gap: 1em; flex-wrap: wrap;">
+            <div class="netron-pane">
+                <div class="netron-head">
+                    <strong>Before</strong> —
+                    <a id="netron-before-link" target="_blank" rel="noopener" style="display: none;"></a>
+                </div>
+                <iframe id="netron-before-frame" class="netron-frame" title="Netron — original model" style="display: none;"></iframe>
+                <div id="netron-before-note" class="netron-note"></div>
+            </div>
+            <div class="netron-pane">
+                <div class="netron-head">
+                    <strong>After</strong> —
+                    <a id="netron-after-link" target="_blank" rel="noopener" style="display: none;"></a>
+                </div>
+                <iframe id="netron-after-frame" class="netron-frame" title="Netron — simplified model" style="display: none;"></iframe>
+                <div id="netron-after-note" class="netron-note"></div>
+            </div>
+        </div>
+        <script type="module" src="./netron_view.mjs"></script>
         <h2>Console outputs:</h2>
         <pre id="log-output"></pre>
         <h2>Run inference (onnxruntime-web)</h2>
