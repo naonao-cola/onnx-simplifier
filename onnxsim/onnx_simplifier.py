@@ -339,6 +339,7 @@ def simplify(
     check_rtol: float = 1e-4,
     check_atol: float = 1e-5,
     providers: Optional[Sequence[backend.Provider]] = None,
+    profile: Optional[str] = None,
 ) -> Tuple[onnx.ModelProto, bool]:
     """
     :param model: onnx ModelProto object or file path
@@ -400,6 +401,16 @@ def simplify(
             provider specifically needs the ``onnxruntime-gpu`` build); a
             requested provider that the installed onnxruntime does not offer
             raises ``ValueError`` instead of silently falling back.
+    :param profile: When set, profile every simplification fixed-point function
+            (shape inference, the onnx-optimizer passes, constant folding and any
+            custom rewriter) -- recording each one's wall-clock and CPU duration
+            and the peak resident memory reached while it runs -- and write a
+            Chrome Trace Event Format JSON to this path (an empty string uses
+            ``onnxsim_profile.json``). Open the file in ``chrome://tracing`` or
+            https://ui.perfetto.dev to see the flame graph; a per-function summary
+            is also printed to stdout. Implemented in the C++ core via the
+            ``ONNXSIM_PROFILE`` environment variable, so it works from every
+            binding; setting this argument simply sets that variable for the call.
     :return: A tuple (simplified model, success(True) or failed(False))
     """
     # Validate the requested execution providers up front. onnxsim's constant
@@ -555,6 +566,16 @@ def simplify(
     if external_data_dir is not None:
         onnx.load_external_data_for_model(model, external_data_dir)
 
+    # Enable the C++ core's fixed-point profiler for the duration of this call by
+    # setting ``ONNXSIM_PROFILE`` (read inside ``Simplify``), restoring any prior
+    # value afterwards so profiling does not leak into later calls in the same
+    # process. An empty string falls back to the default trace filename.
+    _prev_profile_env = None
+    _profile_active = profile is not None
+    if _profile_active:
+        _prev_profile_env = os.environ.get("ONNXSIM_PROFILE")
+        os.environ["ONNXSIM_PROFILE"] = profile or "onnxsim_profile.json"
+
     try:
         model_bytes = model.SerializeToString()
         if len(model_bytes) >= 2 * 1024 * 1024 * 1024:
@@ -648,6 +669,12 @@ def simplify(
                 atol=check_atol,
             )
             model_opt = onnx.load(os.path.join(tmpdirname, "opt.onnx"))
+    finally:
+        if _profile_active:
+            if _prev_profile_env is None:
+                os.environ.pop("ONNXSIM_PROFILE", None)
+            else:
+                os.environ["ONNXSIM_PROFILE"] = _prev_profile_env
     _restore_doc_strings(model_opt, doc_strings)
     return model_opt, check_ok
 
@@ -905,6 +932,19 @@ def main():
         action="store_true",
     )
     parser.add_argument(
+        "--profile",
+        help="Profile each simplification fixed-point function (shape inference, "
+        "the onnx-optimizer passes, constant folding and any rewriter): record its "
+        "wall-clock and CPU duration and the peak resident memory reached while it "
+        "runs, print a per-function summary, and write a Chrome trace to the given "
+        "path (defaults to 'onnxsim_profile.json'). Open the trace in "
+        "chrome://tracing or https://ui.perfetto.dev to view the flame graph.",
+        type=str,
+        nargs="?",
+        const="onnxsim_profile.json",
+        default=None,
+    )
+    parser.add_argument(
         "-v", "--version", action="version", version="onnxsim " + version.version
     )
 
@@ -1095,6 +1135,7 @@ def main():
         check_rtol=args.check_rtol,
         check_atol=args.check_atol,
         providers=providers,
+        profile=args.profile,
     )
 
     try:

@@ -257,6 +257,68 @@ Runtime does not offer, onnxsim raises a `ValueError` listing the available
 providers instead of silently folding on the CPU. When `providers` is left
 unset (the default), folding runs on the CPU.
 
+## Profiling the optimization
+
+Simplification alternates a handful of transforms -- shape inference, the
+onnx-optimizer passes, constant folding and any custom rewriter -- to a joint
+fixed point. To see where the time and memory go, pass `profile` to `simplify`
+(or `--profile` on the command line). onnxsim then measures each fixed-point
+function's wall-clock and CPU duration and the peak resident memory reached while
+it runs, prints a per-function summary, and writes a
+[Chrome Trace Event Format](https://docs.google.com/document/d/1CvAClvFfyA5R-PhYUmn5OOQtYMH4h6I0nSsKchNAySU/preview)
+JSON. Open that file in `chrome://tracing` or at
+[ui.perfetto.dev](https://ui.perfetto.dev) to view it as a **flame graph**: the
+nested fixed points appear as parent spans and the individual transforms as their
+children, one box per invocation, annotated with peak RSS and CPU time.
+
+```python
+import onnx
+import onnxsim
+
+model = onnx.load(filename)
+
+# Write the trace to profile.json (open it in chrome://tracing or ui.perfetto.dev).
+model_simp, check = onnxsim.simplify(model, profile="profile.json")
+```
+
+On the command line:
+
+```
+# Give a path, or omit it to use onnxsim_profile.json in the current directory.
+onnxsim input_onnx_model output_onnx_model --profile profile.json
+```
+
+The printed summary looks like:
+
+```
+onnxsim profiling summary (per fixed-point function)
+-------------------------------------------------------------------------------------
+function                calls     wall(ms)      cpu(ms) max wall(ms)    peak(MiB)
+-------------------------------------------------------------------------------------
+Simplify                    1       260.59       270.93       260.59       112.95
+  Pipeline                  3       259.75       269.67       100.76       112.94
+    OptAndShape             3       158.63       165.13        53.20       101.43
+    FoldConstant            3       100.36       103.78        47.69       112.93
+      Optimize              3       112.56       116.99        37.77       101.42
+      InferShapes           3        45.46        47.10        15.22        78.68
+-------------------------------------------------------------------------------------
+```
+
+`calls` is how many times a function ran across all fixed-point rounds, `cpu(ms)`
+is process CPU time (it can exceed wall time when constant folding runs multiple
+ONNX Runtime threads), and `peak(MiB)` is the highest process RSS observed while
+that function was on the stack (sampled by a lightweight background thread; tune
+the interval with `ONNXSIM_PROFILE_INTERVAL_MS`, default 5ms).
+
+Profiling is implemented in onnxsim's C++ core and is driven by the
+`ONNXSIM_PROFILE` environment variable (the Python `profile` argument and the
+`--profile` flag just set it), so it also works from the C ABI and the Rust
+wrapper without any code change:
+
+```
+ONNXSIM_PROFILE=profile.json onnxsim input_onnx_model output_onnx_model
+```
+
 ## Custom rewriters
 
 Beyond the built-in optimizer passes, you can plug your own graph rewriting

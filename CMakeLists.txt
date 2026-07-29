@@ -56,7 +56,7 @@ endif()
 # configure onnx-optimizer after onnxruntime, because they both depend on onnx and onnxruntime has its own flags for onnx
 add_subdirectory(third_party/onnx-optimizer EXCLUDE_FROM_ALL)
 
-add_library(onnxsim onnxsim/onnxsim.cpp onnxsim/contrib_schemas.cpp onnxsim/function_rewriter.cpp)
+add_library(onnxsim onnxsim/onnxsim.cpp onnxsim/contrib_schemas.cpp onnxsim/function_rewriter.cpp onnxsim/profiler.cpp)
 if (ONNXSIM_BUILTIN_ORT)
   target_include_directories(onnxsim PRIVATE ${ONNXRUNTIME_INCLUDE_DIR})
 endif()
@@ -67,7 +67,12 @@ endif()
 if (EMSCRIPTEN)
   target_link_libraries(onnxsim ${ORT_NAME} onnx_optimizer)
 else()
-  target_link_libraries(onnxsim ${ORT_NAME} onnx_optimizer onnx)
+  # The profiler samples RSS on a background std::thread, so link the platform
+  # threading library explicitly rather than relying on it arriving transitively
+  # through ONNX Runtime. Emscripten provides threading through its own toolchain
+  # flags, so skip it there.
+  find_package(Threads REQUIRED)
+  target_link_libraries(onnxsim ${ORT_NAME} onnx_optimizer onnx Threads::Threads)
 endif()
 
 if(EMSCRIPTEN)

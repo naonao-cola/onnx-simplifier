@@ -26,6 +26,7 @@
 #include "onnxoptimizer/model_util.h"
 #include "onnxoptimizer/optimize.h"
 #include "onnxoptimizer/passes/logging.h"
+#include "profiler.h"
 
 struct Config {
   std::vector<std::string> optimizer_passes;
@@ -1572,8 +1573,45 @@ onnx::ModelProto Simplify(
           ? std::atoi(std::getenv("ONNXSIM_FIXED_POINT_ITERS"))
           : 50;
 
-  ModelFn OptAndShape =
-      FixedPointFn(InferShapes, OptimizeInPlace, fixed_point_iters);
+  // Optionally profile every fixed-point function. Turned on by pointing
+  // ``ONNXSIM_PROFILE`` at an output file (``ONNXSIM_PROFILE=1`` uses the
+  // default name), mirroring ``ONNXSIM_FIXED_POINT_ITERS`` so it works from
+  // every binding without a signature change. ``Profiled`` wraps a transform so
+  // each invocation records its wall/CPU duration and peak RSS; the wrappers
+  // nest, so the fixed points show up as parent spans of the transforms they
+  // drive. When profiling is off ``Profiled`` returns the function unchanged
+  // and
+  // ``ProfiledScope`` is a no-op, so there is zero overhead.
+  if (const char* profile_env = std::getenv("ONNXSIM_PROFILE")) {
+    std::string profile_path = profile_env;
+    if (profile_path == "1" || profile_path == "true" || profile_path == "on" ||
+        profile_path == "yes") {
+      profile_path = "onnxsim_profile.json";
+    }
+    if (!profile_path.empty()) {
+      onnxsim::Profiler::Instance().Enable(profile_path);
+    }
+  }
+  // Ensure the trace is flushed and the sampler thread is stopped even if a
+  // transform throws mid-pipeline. Finish() is idempotent, so the explicit call
+  // on the success path below is a harmless no-op the second time.
+  struct ProfilerFinishGuard {
+    ~ProfilerFinishGuard() { onnxsim::Profiler::Instance().Finish(); }
+  } profiler_finish_guard;
+  auto Profiled = [](const char* name, ModelFn fn) -> ModelFn {
+    if (!onnxsim::Profiler::Instance().enabled()) {
+      return fn;
+    }
+    return [name, fn = std::move(fn)](onnx::ModelProto& model) {
+      onnxsim::ProfiledScope scope(name);
+      fn(model);
+    };
+  };
+
+  ModelFn OptAndShape = Profiled(
+      "OptAndShape",
+      FixedPointFn(Profiled("InferShapes", InferShapes),
+                   Profiled("Optimize", OptimizeInPlace), fixed_point_iters));
   bool converged = false;
   ModelFn Pipeline;
   if (rewriter) {
@@ -1584,20 +1622,27 @@ onnx::ModelProto Simplify(
     // rewrite expose new optimizer/folding opportunities and vice versa. The
     // rewriter runs on the ``ModelProto`` directly, so no internal-graph
     // conversion is involved.
-    ModelFn OptAndShapeAndFold =
-        FixedPointFn(OptAndShape, FoldConstant, fixed_point_iters);
-    ModelFn RewriteInPlace = [rewriter](onnx::ModelProto& model) {
-      // ``_Run`` rewrites in place and returns whether it changed anything;
-      // when it reports no change it leaves ``model`` untouched, so no copy is
-      // made. The fixed point's fingerprint comparison then sees the unchanged
-      // model and converges without an extra ModelProto round-trip.
-      rewriter->_Run(model);
-    };
-    Pipeline = FixedPointFn(OptAndShapeAndFold, RewriteInPlace,
-                            fixed_point_iters, &converged);
-  } else {
+    ModelFn OptAndShapeAndFold = Profiled(
+        "OptAndShapeAndFold",
+        FixedPointFn(OptAndShape, Profiled("FoldConstant", FoldConstant),
+                     fixed_point_iters));
+    ModelFn RewriteInPlace =
+        Profiled("Rewrite", [rewriter](onnx::ModelProto& model) {
+          // ``_Run`` rewrites in place and returns whether it changed anything;
+          // when it reports no change it leaves ``model`` untouched, so no copy
+          // is made. The fixed point's fingerprint comparison then sees the
+          // unchanged model and converges without an extra ModelProto
+          // round-trip.
+          rewriter->_Run(model);
+        });
     Pipeline =
-        FixedPointFn(OptAndShape, FoldConstant, fixed_point_iters, &converged);
+        Profiled("Pipeline", FixedPointFn(OptAndShapeAndFold, RewriteInPlace,
+                                          fixed_point_iters, &converged));
+  } else {
+    Pipeline = Profiled(
+        "Pipeline",
+        FixedPointFn(OptAndShape, Profiled("FoldConstant", FoldConstant),
+                     fixed_point_iters, &converged));
   }
   // The fixed points mutate in place, so make one working copy of the (const)
   // input model and simplify it in place.
@@ -1608,7 +1653,15 @@ onnx::ModelProto Simplify(
   if (target_opset_version) {
     sim_model = ConvertOpsetVersion(sim_model, *target_opset_version);
   }
-  Pipeline(sim_model);
+  {
+    // A single root span so the profiled fixed points nest under one box in the
+    // flame graph (a no-op when profiling is disabled).
+    onnxsim::ProfiledScope root("Simplify");
+    Pipeline(sim_model);
+  }
+  // Flush the profiling trace and print the per-function summary. Safe to call
+  // unconditionally: Finish() is a no-op unless profiling was enabled above.
+  onnxsim::Profiler::Instance().Finish();
   // Simplification (and some onnx-optimizer passes) can leave nodes without a
   // name; assign unique names to them so downstream tools that key on node
   // names keep working (issue #269).
