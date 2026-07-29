@@ -12,9 +12,9 @@
 namespace {
 
 // Recursively tally op types, descending into every subgraph carried by a node
-// attribute (the ``g`` of e.g. an ``If`` branch, or the ``graphs`` of ``Loop``).
-// Every initializer of each graph is counted as a ``Constant``, matching the
-// Python ``ModelInfo.get_info``.
+// attribute (the ``g`` of e.g. an ``If`` branch, or the ``graphs`` of
+// ``Loop``). Every initializer of each graph is counted as a ``Constant``,
+// matching the Python ``ModelInfo.get_info``.
 void CountGraphOps(const onnx::GraphProto& graph,
                    std::map<std::string, int64_t>& op_nums) {
   for (const auto& node : graph.node()) {
@@ -50,9 +50,10 @@ int64_t TensorExternalSize(const onnx::TensorProto& tensor) {
   return 0;
 }
 
-// Total external-data bytes across every tensor a graph holds -- initializers as
-// well as tensors carried in node attributes -- recursing into subgraphs. This
-// mirrors Python's ``_external_data_size`` and never loads the data itself.
+// Total external-data bytes across every tensor a graph holds -- initializers
+// as well as tensors carried in node attributes -- recursing into subgraphs.
+// This mirrors Python's ``_external_data_size`` and never loads the data
+// itself.
 int64_t ExternalDataSize(const onnx::GraphProto& graph) {
   int64_t total = 0;
   for (const auto& initializer : graph.initializer()) {
@@ -82,7 +83,7 @@ int64_t ExternalDataSize(const onnx::GraphProto& graph) {
 std::string HumanReadableSize(int64_t num) {
   double value = static_cast<double>(num);
   static const char* const kUnits[] = {"",   "Ki", "Mi", "Gi",
-                                        "Ti", "Pi", "Ei", "Zi"};
+                                       "Ti", "Pi", "Ei", "Zi"};
   char buf[64];
   for (const char* unit : kUnits) {
     if (std::fabs(value) < 1024.0) {
@@ -136,8 +137,7 @@ std::string FormatSimplifyingInfo(const onnx::ModelProto& model_ori,
 
   std::string size_cell = HumanReadableSize(opt.model_size);
   if (opt.model_size < ori.model_size) size_cell += " *";
-  rows.push_back(
-      {"Model Size", HumanReadableSize(ori.model_size), size_cell});
+  rows.push_back({"Model Size", HumanReadableSize(ori.model_size), size_cell});
 
   std::array<size_t, 3> width = {0, 0, 0};
   for (const auto& row : rows) {

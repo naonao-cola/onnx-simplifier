@@ -6,12 +6,13 @@
 #include <map>
 #include <string>
 
-// A lightweight, dependency-free counterpart to the Python ``ModelInfo`` for the
-// non-Python bindings (the CLI binary, the C ABI / Rust wrapper, and the WASM
-// converter). It reports the two metrics that can be derived from a
+// A lightweight, dependency-free counterpart to the Python ``ModelInfo`` for
+// the non-Python bindings (the CLI binary, the C ABI / Rust wrapper, and the
+// WASM converter). It reports the two metrics that can be derived from a
 // ``ModelProto`` alone, without ONNX shape inference:
 //
-//   * ``op_nums`` -- how many of each op type the model contains, recursing into
+//   * ``op_nums`` -- how many of each op type the model contains, recursing
+//   into
 //     control-flow subgraphs. Initializers are folded into the ``Constant``
 //     count, exactly as the Python ``ModelInfo`` does, so a weight tensor reads
 //     as a constant.

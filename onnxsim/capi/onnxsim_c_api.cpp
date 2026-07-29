@@ -364,8 +364,7 @@ OnnxsimStatus onnxsim_model_info_diff(const void* original_data,
   }
   try {
     onnx::ModelProto original;
-    if (!ParseProtoFromBytes(&original,
-                             static_cast<const char*>(original_data),
+    if (!ParseProtoFromBytes(&original, static_cast<const char*>(original_data),
                              original_size)) {
       SetError(out_error, "failed to parse the original ONNX ModelProto");
       return ONNXSIM_ERROR;
