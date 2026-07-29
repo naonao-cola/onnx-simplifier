@@ -506,10 +506,10 @@ ConstantNodePartition GetConstantNodes(const onnx::ModelProto& model) {
   // the graph untouched; a node fed by a Constant node still folds because ""
   // and Constant outputs remain in the constant set.
   if (config.initializers_as_constants) {
-    std::transform(
-        model.graph().initializer().begin(), model.graph().initializer().end(),
-        std::back_inserter(const_names),
-        [](const auto& x) { return x.name(); });
+    std::transform(model.graph().initializer().begin(),
+                   model.graph().initializer().end(),
+                   std::back_inserter(const_names),
+                   [](const auto& x) { return x.name(); });
   }
   // Map each domain to its imported opset version so the correct operator
   // schema can be looked up. The default ONNX domain is normalized to an empty
@@ -1239,8 +1239,10 @@ onnx::ModelProto Optimize(const onnx::ModelProto& model) {
   // value-baking passes (fuse_bn_into_conv, ...) respect it too. The setting is
   // thread-local in the optimizer; restore it afterwards so we do not leak it.
   const bool prev = onnx::optimization::InitializersAsConstants();
-  onnx::optimization::SetInitializersAsConstants(config.initializers_as_constants);
-  auto result = onnx::optimization::OptimizeFixed(model, config.optimizer_passes);
+  onnx::optimization::SetInitializersAsConstants(
+      config.initializers_as_constants);
+  auto result =
+      onnx::optimization::OptimizeFixed(model, config.optimizer_passes);
   onnx::optimization::SetInitializersAsConstants(prev);
   return result;
 }

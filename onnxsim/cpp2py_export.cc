@@ -313,11 +313,10 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
          ONNX_NAMESPACE::ModelProto model;
          ParseProtoFromBytes(&model, model_proto_bytes.c_str(),
                              model_proto_bytes.size());
-         auto const result =
-             Simplify(*executor, model, skip_optimizers, constant_folding,
-                      shape_inference, tensor_size_threshold,
-                      target_opset_version, rewriter.get(),
-                      initializers_as_constants);
+         auto const result = Simplify(
+             *executor, model, skip_optimizers, constant_folding,
+             shape_inference, tensor_size_threshold, target_opset_version,
+             rewriter.get(), initializers_as_constants);
          std::string out;
          result.SerializeToString(&out);
          return py::bytes(out.data(), out.size());
