@@ -16,26 +16,38 @@ create_onnxsim({
     addEventListener("message", (e) => {
         console.log(e.data);
         const buf = e.data[1];
-        let result = null;
+        // `model` is the converted model bytes (a Uint8Array view); `trace` is
+        // the onnxsim profiling trace JSON for "simplify" when profiling was
+        // requested, otherwise an empty string.
+        let model = null;
+        let trace = "";
         switch (e.data[0]) {
-            case "simplify":
-                result = runtime.onnxsimplify_export(
+            case "simplify": {
+                // Simplify returns { model, trace } so the profiling trace can
+                // ride back alongside the converted model.
+                const result = runtime.onnxsimplify_export(
                     buf,
                     e.data[2], // skip optimizers
                     e.data[3], // constant folding
                     e.data[4], // shape inference
                     e.data[5], // tensor size threshold
                     e.data[6], // target opset version (<= 0 means keep)
+                    e.data[7], // profile (emit a Chrome trace)
                 );
+                if (result) {
+                    model = result.model;
+                    trace = result.trace || "";
+                }
                 break;
+            }
             case "optimize":
-                result = runtime.onnxoptimizer_optimize(
+                model = runtime.onnxoptimizer_optimize(
                     buf,
                     e.data[2], // target optimizers
                 );
                 break;
             case "optimize_fixed":
-                result = runtime.onnxoptimizer_optimize_fixed(
+                model = runtime.onnxoptimizer_optimize_fixed(
                     buf,
                     e.data[2], // target optimizers
                 );
@@ -44,13 +56,13 @@ create_onnxsim({
                 postMessage(["stderr", "unknown conversion type: " + e.data[0]]);
                 return;
         }
-        if (!result) {
+        if (!model) {
             postMessage(["stderr", e.data[0] + " failed!"]);
             return;
         }
         console.log("to data url start")
-        const data_url = "data:application/octet-stream;base64," + result.toBase64();
+        const data_url = "data:application/octet-stream;base64," + model.toBase64();
         console.log("to data url end")
-        postMessage(["convert-done", data_url]);
+        postMessage(["convert-done", data_url, trace]);
     });
 });

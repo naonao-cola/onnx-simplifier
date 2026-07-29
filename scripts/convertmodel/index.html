@@ -83,6 +83,7 @@
                 const log_output = document.getElementById("log-output");
                 const input = document.getElementById("file-input");
                 const dl_btn = document.getElementById("download-button");
+                const trace_container = document.getElementById("simplify-trace");
                 const report_btn = document.getElementById("report-issue-button");
                 report_btn.onclick = () => {
                     window.open(build_issue_url(), "_blank", "noopener");
@@ -102,12 +103,30 @@
                             input.disabled = false;
                             dl_btn.disabled = false;
                             const data_url = e.data[1];
+                            const trace_json = e.data[2];
                             dl_btn.onclick = () => {
                                 const a = document.createElement("a");
                                 a.href = data_url;
                                 a.download = result_name;
                                 a.click();
                             };
+                            // Render the onnxsim simplification profile, if one
+                            // came back, as an inline flame graph.
+                            if (trace_container) trace_container.innerHTML = "";
+                            if (trace_json && trace_container) {
+                                try {
+                                    const trace = JSON.parse(trace_json);
+                                    import("./trace_viewer.mjs").then(({ renderTrace }) => {
+                                        renderTrace(trace_container, trace, {
+                                            title: "onnxsim simplify",
+                                            filename: "onnxsim.simplify.trace.json",
+                                        });
+                                    });
+                                } catch (err) {
+                                    log_output.value += "failed to parse profiling trace: " + err + "\n";
+                                    log_output.scrollTop = log_output.scrollHeight;
+                                }
+                            }
                             break;
                     }
                 };
@@ -138,7 +157,10 @@
                         tensor_size_threshold, target_opset_version,
                         file_name: file.name,
                     };
-                    worker.postMessage([optimizer, buf, passes, constant_fold, shape_inference, tensor_size_threshold, target_opset_version], [buf]);
+                    // Profiling only applies to "simplify"; the onnx-optimizer
+                    // paths do not run the fixed-point profiler.
+                    const profile = optimizer == "simplify" && document.getElementById("id_simplify_profile").checked;
+                    worker.postMessage([optimizer, buf, passes, constant_fold, shape_inference, tensor_size_threshold, target_opset_version, profile], [buf]);
                 });
             };
         </script>
@@ -174,6 +196,9 @@
             <label>target opset version (simplify only, 0 = keep)</label>
             <input type="number" name="simplify_target_opset" id="id_simplify_target_opset" value="0">
             <br/>
+            <input type="checkbox" name="simplify_profile" id="id_simplify_profile" checked>
+            <label for="id_simplify_profile">profile simplification (simplify only) — emit a Chrome trace</label>
+            <br/>
             <div id="pass-list" style="height: 300px; overflow-y: auto; border: 1px solid #ccc; padding: 4px; margin-top: 4px;"></div>
         </div>
         <h2>Console outputs:</h2>
@@ -187,6 +212,16 @@
                 Please also attach your model so the problem can be reproduced.
             </span>
         </div>
+        <h2>onnxsim profiling</h2>
+        <p>
+            Profiling is on by default (“profile simplification” above): convert
+            a model with <b>Simplify</b> and the fixed-point transforms (shape
+            inference, onnx-optimizer, constant folding) — with ONNX Runtime's
+            own per-operator constant-folding spans merged in — render below as a
+            flame graph. Download the JSON, or click <b>Embed in Perfetto</b> to
+            open the full Perfetto timeline inline on this page.
+        </p>
+        <div id="simplify-trace"></div>
         <h2>Run inference (onnxruntime-web)</h2>
         <p>
             Runs the selected model for a few iterations to check it executes,
@@ -201,9 +236,19 @@
             </select>
             <label for="inference-iters">iterations</label>
             <input type="number" id="inference-iters" value="5" min="1" style="width: 4em;">
+            <input type="checkbox" id="inference-profile" checked>
+            <label for="inference-profile">profile (Chrome trace)</label>
             <button id="run-inference">Run inference</button>
         </div>
         <pre id="inference-output"></pre>
+        <p>
+            With profiling on (default), the run captures an onnxruntime-web
+            trace: on WebGPU, one span per GPU kernel invocation; on WASM (or as
+            a fallback), one span per <code>session.run</code> iteration. It
+            renders below in the same viewer, with an <b>Embed in Perfetto</b>
+            button to open the full timeline inline.
+        </p>
+        <div id="inference-trace"></div>
         <script type="module" src="./inference_browser.mjs"></script>
     </body>
 </html>

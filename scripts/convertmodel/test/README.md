@@ -16,7 +16,25 @@ npm ci
 npm run test:inference          # wasm EP, 5 iterations
 ORT_ITERS=20 npm run test:inference
 ORT_EP=webgpu npm run test:inference   # only where a WebGPU runtime exists
+npm run test:trace              # trace-assembler unit test (no GPU/ORT needed)
 ```
+
+## Profiling traces
+
+Both the browser panels can emit a [Chrome Trace Event][cte] JSON that the page
+renders inline as a flame graph (and offers for download / hand-off to
+[Perfetto](https://ui.perfetto.dev)):
+
+- **onnxsim** — ticking “profile simplification” makes the WASM core run its
+  fixed-point profiler (`ONNXSIM_PROFILE`) with ONNX Runtime's constant-folding
+  spans merged in (`ONNXSIM_MERGE_ORT_PROFILE`), and returns the trace with the
+  converted model.
+- **onnxruntime-web** — the inference panel captures per-`session.run` wall
+  spans and, on WebGPU, one span per GPU kernel via
+  `ort.env.webgpu.profiling.ondata`. `trace.test.mjs` covers the assembler
+  (`trace_build.mjs`) that turns those records into a Chrome trace.
+
+[cte]: https://docs.google.com/document/d/1CvAClvFfyA5R-PhYUmn5OOQtYMH4h6I0nSsKchNAySU/preview
 
 ## Execution providers
 
