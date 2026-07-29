@@ -1,4 +1,6 @@
-# Simple workflow for deploying static content to GitHub Pages
+# Builds the WASM convertmodel demo once, then:
+#   - on push to master/pages: deploys it to GitHub Pages (production)
+#   - on pull_request:          deploys a per-PR preview to Cloudflare Pages
 name: Deploy static content to Pages
 
 on:
@@ -12,10 +14,12 @@ on:
   workflow_dispatch:
 
 # Sets permissions of the GITHUB_TOKEN to allow deployment to GitHub Pages
+# and to post the Cloudflare preview URL as a PR comment.
 permissions:
   contents: read
   pages: write
   id-token: write
+  pull-requests: write
 
 # Allow only one concurrent deployment, skipping runs queued between the run in-progress and latest queued.
 # However, do NOT cancel in-progress runs as we want to allow these production deployments to complete.
@@ -39,6 +43,7 @@ jobs:
         with:
           submodules: recursive
       - name: Setup Pages
+        if: ${{ github.event_name == 'push' }}
         uses: actions/configure-pages@v6
       - run: pip install cmake ninja
       - run: |
@@ -72,7 +77,10 @@ jobs:
           cp build-wasm-node-OFF/onnxsim.* scripts/convertmodel
       - run: |
           ccache -s
+
+      # --- Production: GitHub Pages (push to master/pages only) ---
       - name: Upload artifact
+        if: ${{ github.event_name == 'push' }}
         uses: actions/upload-pages-artifact@v5
         with:
           # Upload entire repository
@@ -81,3 +89,48 @@ jobs:
         id: deployment
         uses: actions/deploy-pages@v5
         if: ${{ github.event_name == 'push' }}
+
+      # --- Preview: Cloudflare Pages (pull requests only) ---
+      # Secrets are not available to pull requests from forks, so skip the
+      # deploy there instead of failing. Same-repo branches get previews.
+      - name: Deploy preview to Cloudflare Pages
+        id: cf_deploy
+        if: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository }}
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          # A branch that is NOT the project's production branch produces a
+          # preview deployment with a stable <branch>.<project>.pages.dev alias.
+          command: >-
+            pages deploy scripts/convertmodel
+            --project-name=onnxsim
+            --branch=${{ github.head_ref }}
+      - name: Comment preview URL on the PR
+        if: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository }}
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const url = ${{ toJSON(steps.cf_deploy.outputs.deployment-url) }};
+            const alias = ${{ toJSON(steps.cf_deploy.outputs.pages-deployment-alias-url) }};
+            const marker = '<!-- cloudflare-pages-preview -->';
+            const body = [
+              marker,
+              '### ⚡ Cloudflare Pages preview',
+              '',
+              `| | URL |`,
+              `| --- | --- |`,
+              `| **This build** | ${url} |`,
+              alias ? `| **Branch alias** | ${alias} |` : '',
+              '',
+              `_Preview of ${context.payload.pull_request.head.sha.slice(0, 7)} — updates on every push to this PR._`,
+            ].filter(Boolean).join('\n');
+            const { owner, repo } = context.repo;
+            const issue_number = context.issue.number;
+            const { data: comments } = await github.rest.issues.listComments({ owner, repo, issue_number });
+            const existing = comments.find((c) => c.body && c.body.includes(marker));
+            if (existing) {
+              await github.rest.issues.updateComment({ owner, repo, comment_id: existing.id, body });
+            } else {
+              await github.rest.issues.createComment({ owner, repo, issue_number, body });
+            }
