@@ -3,18 +3,25 @@
 // Both traces this page shows -- onnxsim's C++ simplification profiler and the
 // onnxruntime-web inference profiler -- are Chrome Trace Event Format JSON
 // ({ traceEvents: [ ... ] } with "X" complete events and "M" thread_name
-// metadata). Rather than pull in a bundler or ship Perfetto, this renders that
-// format inline as a zoomable flame graph on a <canvas>, and offers the raw
-// JSON for download or a one-click hand-off to https://ui.perfetto.dev for the
-// full-featured view.
+// metadata). This renders that format inline as a zoomable flame graph on a
+// <canvas> for a fast, offline-friendly first look, and can embed the full
+// Perfetto UI (https://ui.perfetto.dev) right in the page for deeper analysis.
 //
 // renderTrace(container, trace, opts) clears `container` and mounts:
-//   * a small toolbar (download + open-in-Perfetto),
+//   * a small toolbar (download JSON + embed-in-Perfetto),
 //   * the flame-graph canvas (wheel to zoom at the cursor, drag to pan,
 //     double-click to reset),
-//   * a hover tooltip with each span's name, duration and args.
+//   * a hover tooltip with each span's name, duration and args,
+//   * a slot below into which the Perfetto UI is embedded on demand.
+//
+// Perfetto is embedded following its official protocol
+// (https://perfetto.dev/docs/visualization/embedding-the-ui): an iframe at
+// ui.perfetto.dev/#!/?mode=embedded, a PING/PONG readiness handshake, then a
+// { perfetto: { buffer, title, ... } } postMessage carrying the trace bytes.
 
 const PERFETTO_ORIGIN = "https://ui.perfetto.dev";
+// `mode=embedded` hides Perfetto's sidebar for a clean in-page view.
+const PERFETTO_EMBED_SRC = "https://ui.perfetto.dev/#!/?mode=embedded";
 const ROW_H = 18; // px per stacked span row
 const TRACK_PAD = 6; // px above each track label
 const LABEL_H = 16; // px for a track's name row
@@ -100,27 +107,57 @@ function makeButton(label) {
   return b;
 }
 
-// Hand the trace to the Perfetto UI via its postMessage open protocol: open the
-// site, ping until it answers PONG, then post the JSON buffer.
-function openInPerfetto(trace, title) {
-  const json = JSON.stringify(trace);
-  const win = window.open(PERFETTO_ORIGIN);
-  if (!win) {
-    alert("Pop-up blocked -- allow pop-ups to open the trace in Perfetto.");
+// Embed the Perfetto UI in `slot` (an iframe) and load `trace` into it. Follows
+// the official embedding protocol: create the iframe, PING its contentWindow
+// until it answers PONG (its message listener is then registered), then post
+// the trace bytes. `keepApiOpen` lets us swap in a new trace later without
+// reloading the iframe. Reuses an already-ready iframe on repeat calls.
+function embedInPerfetto(slot, trace, title) {
+  const buffer = new TextEncoder().encode(JSON.stringify(trace)).buffer;
+  const post = (win) =>
+    win.postMessage(
+      {
+        perfetto: {
+          buffer,
+          title,
+          fileName: `${title}.json`,
+          keepApiOpen: true,
+        },
+      },
+      PERFETTO_ORIGIN,
+    );
+
+  let iframe = slot.querySelector("iframe.perfetto");
+  if (iframe && iframe.__ready) {
+    post(iframe.contentWindow);
     return;
   }
-  const buffer = new TextEncoder().encode(json).buffer;
+  if (!iframe) {
+    iframe = document.createElement("iframe");
+    iframe.className = "perfetto";
+    iframe.src = PERFETTO_EMBED_SRC;
+    Object.assign(iframe.style, {
+      width: "100%",
+      height: "600px",
+      border: "1px solid #ccc",
+      marginTop: "6px",
+    });
+    slot.innerHTML = "";
+    slot.appendChild(iframe);
+  }
+
+  // Only the target iframe's PONG counts (other embeds post PONGs too).
   const onMessage = (evt) => {
-    if (evt.data !== "PONG") return;
+    if (evt.source !== iframe.contentWindow || evt.data !== "PONG") return;
     clearInterval(timer);
     window.removeEventListener("message", onMessage);
-    win.postMessage({ perfetto: { buffer, title } }, PERFETTO_ORIGIN);
+    iframe.__ready = true;
+    post(iframe.contentWindow);
   };
   window.addEventListener("message", onMessage);
-  const timer = setInterval(
-    () => win.postMessage("PING", PERFETTO_ORIGIN),
-    250,
-  );
+  const timer = setInterval(() => {
+    if (iframe.contentWindow) iframe.contentWindow.postMessage("PING", PERFETTO_ORIGIN);
+  }, 250);
   // Give up pinging after ~20s so we do not leak the interval.
   setTimeout(() => {
     clearInterval(timer);
@@ -156,9 +193,8 @@ export function renderTrace(container, trace, opts = {}) {
   const bar = document.createElement("div");
   bar.style.margin = "6px 0";
   const dlBtn = makeButton("Download JSON");
-  const pfBtn = makeButton("Open in Perfetto");
+  const pfBtn = makeButton("Embed in Perfetto");
   dlBtn.addEventListener("click", () => download(trace, filename));
-  pfBtn.addEventListener("click", () => openInPerfetto(trace, title));
   bar.appendChild(dlBtn);
   bar.appendChild(pfBtn);
   const hint = document.createElement("span");
@@ -167,6 +203,18 @@ export function renderTrace(container, trace, opts = {}) {
   hint.textContent = "wheel = zoom · drag = pan · double-click = reset";
   bar.appendChild(hint);
   container.appendChild(bar);
+
+  // Slot the Perfetto UI is embedded into on demand; the button toggles it.
+  const perfettoSlot = document.createElement("div");
+  pfBtn.addEventListener("click", () => {
+    if (perfettoSlot.querySelector("iframe.perfetto")) {
+      perfettoSlot.innerHTML = "";
+      pfBtn.textContent = "Embed in Perfetto";
+    } else {
+      embedInPerfetto(perfettoSlot, trace, title);
+      pfBtn.textContent = "Hide Perfetto";
+    }
+  });
 
   // Canvas sized to fit every track's lanes.
   const totalH = tracks.reduce(
@@ -197,6 +245,7 @@ export function renderTrace(container, trace, opts = {}) {
   });
   wrap.appendChild(tip);
   container.appendChild(wrap);
+  container.appendChild(perfettoSlot);
 
   // View state: [viewMin, viewMax] in trace time (µs).
   let viewMin = tMin;

@@ -134,7 +134,7 @@
             <label>target opset version (simplify only, 0 = keep)</label>
             <input type="number" name="simplify_target_opset" id="id_simplify_target_opset" value="0">
             <br/>
-            <input type="checkbox" name="simplify_profile" id="id_simplify_profile">
+            <input type="checkbox" name="simplify_profile" id="id_simplify_profile" checked>
             <label for="id_simplify_profile">profile simplification (simplify only) — emit a Chrome trace</label>
             <br/>
         </div>
@@ -142,12 +142,12 @@
         <pre id="log-output"></pre>
         <h2>onnxsim profiling</h2>
         <p>
-            Enable “profile simplification” above, then convert a model with
-            <b>Simplify</b>. The fixed-point transforms (shape inference,
-            onnx-optimizer, constant folding) — with ONNX Runtime's own
-            per-operator constant-folding spans merged in — render below as a
-            flame graph. Download the JSON or open it in Perfetto for the full
-            timeline.
+            Profiling is on by default (“profile simplification” above): convert
+            a model with <b>Simplify</b> and the fixed-point transforms (shape
+            inference, onnx-optimizer, constant folding) — with ONNX Runtime's
+            own per-operator constant-folding spans merged in — render below as a
+            flame graph. Download the JSON, or click <b>Embed in Perfetto</b> to
+            open the full Perfetto timeline inline on this page.
         </p>
         <div id="simplify-trace"></div>
         <h2>Run inference (onnxruntime-web)</h2>
@@ -170,10 +170,11 @@
         </div>
         <pre id="inference-output"></pre>
         <p>
-            With profiling on, the run captures an onnxruntime-web trace: on
-            WebGPU, one span per GPU kernel invocation; on WASM (or as a
-            fallback), one span per <code>session.run</code> iteration. It
-            renders below in the same viewer.
+            With profiling on (default), the run captures an onnxruntime-web
+            trace: on WebGPU, one span per GPU kernel invocation; on WASM (or as
+            a fallback), one span per <code>session.run</code> iteration. It
+            renders below in the same viewer, with an <b>Embed in Perfetto</b>
+            button to open the full timeline inline.
         </p>
         <div id="inference-trace"></div>
         <script type="module" src="./inference_browser.mjs"></script>
