@@ -230,17 +230,18 @@
         </div>
         <h2>Visualize with Netron (before / after)</h2>
         <p>
-            Renders the model graph with
-            <a href="https://netron.app" target="_blank" rel="noopener">Netron</a>:
+            Renders the model graph with a self-hosted
+            <a href="https://github.com/onnxsim/netron" target="_blank" rel="noopener">Netron</a>:
             the original model on the left and the simplified/optimized result on
             the right, so you can compare them side by side. Nothing is uploaded —
-            the model is handed to Netron as an in-browser data URL.
+            the model bytes are posted straight into the embedded Netron in your
+            browser, so there is no model-size limit.
         </p>
         <div id="netron-panes" style="display: flex; gap: 1em; flex-wrap: wrap;">
             <div class="netron-pane">
                 <div class="netron-head">
                     <strong>Before</strong> —
-                    <a id="netron-before-link" target="_blank" rel="noopener" style="display: none;"></a>
+                    <button id="netron-before-open" type="button" style="display: none;">open in a new tab ↗</button>
                 </div>
                 <iframe id="netron-before-frame" class="netron-frame" title="Netron — original model" style="display: none;"></iframe>
                 <div id="netron-before-note" class="netron-note"></div>
@@ -248,7 +249,7 @@
             <div class="netron-pane">
                 <div class="netron-head">
                     <strong>After</strong> —
-                    <a id="netron-after-link" target="_blank" rel="noopener" style="display: none;"></a>
+                    <button id="netron-after-open" type="button" style="display: none;">open in a new tab ↗</button>
                 </div>
                 <iframe id="netron-after-frame" class="netron-frame" title="Netron — simplified model" style="display: none;"></iframe>
                 <div id="netron-after-note" class="netron-note"></div>

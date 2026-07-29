@@ -1,16 +1,18 @@
-// Unit test for the Netron URL builder used by the converter page's
-// "Visualize with Netron" panel. Pure logic, no network or browser needed.
+// Unit test for the pure helpers behind the converter page's "Visualize with
+// Netron" panel. No network or browser needed.
 //
 // Usage:
 //   node test/netron.test.mjs
 
 import assert from "node:assert/strict";
 import {
-  NETRON_BASE,
-  NETRON_URL_MAX,
-  BROWSER_URL_MAX,
-  buildNetronUrl,
-  netronUrlFits,
+  NETRON_EMBED_URL,
+  NETRON_PATH,
+  NETRON_PING,
+  NETRON_PONG,
+  toArrayBuffer,
+  dataUrlToArrayBuffer,
+  buildModelMessage,
 } from "../netron.mjs";
 
 let passed = 0;
@@ -20,58 +22,69 @@ function check(name, fn) {
   console.log("  ok -", name);
 }
 
-const DATA_URL = "data:application/octet-stream;base64,QUJD"; // "ABC"
-
-check("builds a netron URL with the data URL in the hash", () => {
-  const url = buildNetronUrl(DATA_URL, "model.onnx");
-  assert.ok(url.startsWith(NETRON_BASE), "starts with the Netron base URL");
-  const [head, hash] = url.split("#");
-  // The (possibly large) data URL must live in the hash, untouched, so its
-  // base64 padding and +/ characters survive.
-  assert.equal(hash, DATA_URL);
-  // The file name rides along as the `identifier` query param for format
-  // detection.
-  assert.ok(head.includes("identifier=model.onnx"));
+check("embed URL points at the self-hosted Netron in embedded mode", () => {
+  assert.ok(NETRON_EMBED_URL.startsWith(NETRON_PATH));
+  assert.ok(NETRON_EMBED_URL.includes("embed"));
+  // Handshake strings must match the Netron host.
+  assert.equal(NETRON_PING, "PING");
+  assert.equal(NETRON_PONG, "PONG");
 });
 
-check("percent-encodes the identifier file name", () => {
-  const url = buildNetronUrl(DATA_URL, "my model.onnx");
-  assert.ok(url.includes("identifier=my%20model.onnx"));
-  assert.ok(url.endsWith(`#${DATA_URL}`), "data URL still intact in the hash");
+check("toArrayBuffer copies a typed array to an exact standalone buffer", () => {
+  const src = new Uint8Array([1, 2, 3, 4]);
+  const buf = toArrayBuffer(src);
+  assert.ok(buf instanceof ArrayBuffer);
+  assert.deepEqual(Array.from(new Uint8Array(buf)), [1, 2, 3, 4]);
+  // A copy, not a view: mutating the source must not affect the result.
+  src[0] = 99;
+  assert.equal(new Uint8Array(buf)[0], 1);
 });
 
-check("falls back to a default identifier", () => {
-  const url = buildNetronUrl(DATA_URL, "");
-  assert.ok(url.includes("identifier=model.onnx"));
+check("toArrayBuffer copies only a view's slice of a larger buffer", () => {
+  const backing = new Uint8Array([10, 11, 12, 13, 14, 15]);
+  const view = new Uint8Array(backing.buffer, 2, 3); // [12, 13, 14]
+  const buf = toArrayBuffer(view);
+  assert.equal(buf.byteLength, 3);
+  assert.deepEqual(Array.from(new Uint8Array(buf)), [12, 13, 14]);
 });
 
-check("rejects non-data URLs", () => {
-  assert.throws(() => buildNetronUrl("https://example.com/model.onnx", "x"));
-  assert.throws(() => buildNetronUrl(undefined, "x"));
+check("toArrayBuffer clones an ArrayBuffer", () => {
+  const src = new Uint8Array([5, 6, 7]).buffer;
+  const buf = toArrayBuffer(src);
+  assert.notEqual(buf, src);
+  assert.deepEqual(Array.from(new Uint8Array(buf)), [5, 6, 7]);
 });
 
-check("netronUrlFits gates on the browser URL cap", () => {
-  // The safe threshold must stay under the browser's hard navigation limit,
-  // otherwise the URLs we hand out get blocked as `about:blank#blocked`.
-  assert.ok(NETRON_URL_MAX < BROWSER_URL_MAX);
+check("toArrayBuffer rejects non-buffer input", () => {
+  assert.throws(() => toArrayBuffer("nope"));
+  assert.throws(() => toArrayBuffer(undefined));
+});
 
-  assert.equal(netronUrlFits(DATA_URL, "model.onnx"), true);
+check("dataUrlToArrayBuffer decodes base64 model bytes", () => {
+  const buf = dataUrlToArrayBuffer("data:application/octet-stream;base64,QUJD"); // "ABC"
+  assert.deepEqual(Array.from(new Uint8Array(buf)), [65, 66, 67]);
+});
 
-  // A data URL whose *whole* built URL lands just under the cap fits; one just
-  // over it does not. The `identifier` prefix counts against the same budget,
-  // so the check is on buildNetronUrl(...).length, not the data URL alone.
-  const prefix = "data:application/octet-stream;base64,";
-  const fill = (total) => prefix + "A".repeat(total - prefix.length);
-  const overhead = buildNetronUrl(prefix, "model.onnx").length - prefix.length;
+check("dataUrlToArrayBuffer rejects non-data URLs", () => {
+  assert.throws(() => dataUrlToArrayBuffer("https://example.com/model.onnx"));
+  assert.throws(() => dataUrlToArrayBuffer(undefined));
+});
 
-  const justFits = fill(NETRON_URL_MAX - overhead);
-  const justOver = fill(NETRON_URL_MAX - overhead + 1);
-  assert.equal(buildNetronUrl(justFits, "model.onnx").length, NETRON_URL_MAX);
-  assert.equal(netronUrlFits(justFits, "model.onnx"), true);
-  assert.equal(netronUrlFits(justOver, "model.onnx"), false);
+check("buildModelMessage wraps the buffer with an identifier", () => {
+  const buffer = new Uint8Array([1, 2, 3]).buffer;
+  const message = buildModelMessage(buffer, "my model.onnx");
+  assert.equal(message.netron.buffer, buffer);
+  assert.equal(message.netron.name, "my model.onnx");
+  assert.equal(message.netron.identifier, "my model.onnx");
+});
 
-  assert.equal(netronUrlFits(undefined, "model.onnx"), false);
-  assert.equal(netronUrlFits("https://example.com/m.onnx", "m"), false);
+check("buildModelMessage falls back to a default identifier", () => {
+  const message = buildModelMessage(new ArrayBuffer(0), "");
+  assert.equal(message.netron.identifier, "model.onnx");
+});
+
+check("buildModelMessage requires an ArrayBuffer", () => {
+  assert.throws(() => buildModelMessage(new Uint8Array([1]), "x"));
 });
 
 console.log(`PASS: ${passed} checks`);

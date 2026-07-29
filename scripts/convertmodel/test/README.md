@@ -16,15 +16,20 @@ npm ci
 npm run test:inference          # wasm EP, 5 iterations
 ORT_ITERS=20 npm run test:inference
 ORT_EP=webgpu npm run test:inference   # only where a WebGPU runtime exists
-npm run test:netron             # Netron URL builder unit test (no GPU/ORT needed)
+npm run test:netron             # Netron embedding helpers unit test (no GPU/ORT needed)
 npm run test:trace              # trace-assembler unit test (no GPU/ORT needed)
 ```
 
-## Netron URL builder test
+## Netron embedding test
 
-`npm run test:netron` unit-tests `netron.mjs`, the pure helper that builds the
-[Netron](https://netron.app) URL for the converter page's "Visualize with
-Netron (before / after)" panel. It needs no dependencies or network:
+`npm run test:netron` unit-tests `netron.mjs`, the pure helpers behind the
+converter page's "Visualize with Netron (before / after)" panel. The panel
+renders each model with a **self-hosted** [Netron](https://github.com/onnxsim/netron)
+(built into the site at `./netron/` by the deploy workflow) and hands it the
+model bytes over a postMessage embedding protocol — so nothing is uploaded and
+there is no model-size limit (the old URL-based path was capped at ~2 MB by the
+browser). The test covers buffer normalization, data-URL decoding, and the
+message shape; it needs no dependencies or network:
 
 ```bash
 npm run test:netron
