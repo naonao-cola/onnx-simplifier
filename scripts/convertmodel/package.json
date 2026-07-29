@@ -5,7 +5,8 @@
   "description": "Browser model converter (onnxsim/onnx-optimizer) plus an onnxruntime-web inference smoke test.",
   "type": "module",
   "scripts": {
-    "test:inference": "node test/inference.test.mjs"
+    "test:inference": "node test/inference.test.mjs",
+    "test:trace": "node test/trace.test.mjs"
   },
   "dependencies": {
     "onnxruntime-web": "^1.27.0"
