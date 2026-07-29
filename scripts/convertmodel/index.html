@@ -37,10 +37,12 @@
                 worker.onmessage = (e) => {
                     switch (e.data[0]) {
                         case "stdout":
-                            log_output.textContent += e.data[1] + "\n";
+                            log_output.value += e.data[1] + "\n";
+                            log_output.scrollTop = log_output.scrollHeight;
                             break;
                         case "stderr":
-                            log_output.textContent += e.data[1] + "\n";
+                            log_output.value += e.data[1] + "\n";
+                            log_output.scrollTop = log_output.scrollHeight;
                             break;
                         case "convert-done":
                             input.disabled = false;
@@ -115,7 +117,7 @@
             <br/>
         </div>
         <h2>Console outputs:</h2>
-        <pre id="log-output"></pre>
+        <textarea id="log-output" readonly rows="20" style="width: 100%; box-sizing: border-box;"></textarea>
         <h2>Run inference (onnxruntime-web)</h2>
         <p>
             Runs the selected model for a few iterations to check it executes,
