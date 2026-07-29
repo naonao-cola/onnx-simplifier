@@ -7,7 +7,7 @@
                 to_ary = (vec) => {
                     return new Array(vec.size()).fill(0).map((_, id) => vec.get(id))
                 };
-                const passes = document.getElementById("passes");
+                const passes = document.getElementById("pass-list");
                 const checkboxes = {};
                 for (const p of to_ary(runtime.onnxoptimizer_passes()).sort()) {
                     const c = document.createElement("input");
@@ -62,7 +62,7 @@
                 lines.push("");
                 lines.push("**Console output**");
                 const log_el = document.getElementById("log-output");
-                let log = ((log_el && log_el.textContent) || "").trim();
+                let log = ((log_el && log_el.value) || "").trim();
                 // Keep the URL within browser length limits; include the tail,
                 // which usually holds the error, and note when it was trimmed.
                 const MAX_LOG = 4000;
@@ -91,10 +91,12 @@
                 worker.onmessage = (e) => {
                     switch (e.data[0]) {
                         case "stdout":
-                            log_output.textContent += e.data[1] + "\n";
+                            log_output.value += e.data[1] + "\n";
+                            log_output.scrollTop = log_output.scrollHeight;
                             break;
                         case "stderr":
-                            log_output.textContent += e.data[1] + "\n";
+                            log_output.value += e.data[1] + "\n";
+                            log_output.scrollTop = log_output.scrollHeight;
                             break;
                         case "convert-done":
                             input.disabled = false;
@@ -172,9 +174,10 @@
             <label>target opset version (simplify only, 0 = keep)</label>
             <input type="number" name="simplify_target_opset" id="id_simplify_target_opset" value="0">
             <br/>
+            <div id="pass-list" style="height: 300px; overflow-y: auto; border: 1px solid #ccc; padding: 4px; margin-top: 4px;"></div>
         </div>
         <h2>Console outputs:</h2>
-        <pre id="log-output"></pre>
+        <textarea id="log-output" readonly rows="20" style="width: 100%; box-sizing: border-box;"></textarea>
         <div>
             <button id="report-issue-button" type="button">Report an issue</button>
             <span>
