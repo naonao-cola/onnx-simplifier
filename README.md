@@ -387,6 +387,15 @@ model_simp, check = onnxsim.simplify(model, profile="profile.json", merge_ort_pr
 onnxsim input_onnx_model output_onnx_model --profile profile.json --merge-ort-profile
 ```
 
+The merge is also available from the **C ABI, Rust and WASM bindings** (which
+fold through the built-in ONNX Runtime executor): set the `ONNXSIM_MERGE_ORT_PROFILE`
+environment variable and it is done entirely in onnxsim's C++ core -- no Python
+needed. It implies `ONNXSIM_PROFILE` (defaulting to `onnxsim_profile.json`):
+
+```
+ONNXSIM_MERGE_ORT_PROFILE=1 onnxsim input_onnx_model output_onnx_model
+```
+
 ## Custom rewriters
 
 Beyond the built-in optimizer passes, you can plug your own graph rewriting
