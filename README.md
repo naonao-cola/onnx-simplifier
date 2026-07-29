@@ -336,6 +336,38 @@ wrapper without any code change:
 ONNXSIM_PROFILE=profile.json onnxsim input_onnx_model output_onnx_model
 ```
 
+### ONNX Runtime's own session profiler
+
+The `OrtSession` span above times each folding session as a whole. For a
+finer, per-operator breakdown *inside* those sessions, turn on ONNX Runtime's
+own [session profiler](https://onnxruntime.ai/docs/performance/tune-performance/profiling-tools.html)
+with `ort_profile` (or `--ort-profile`). This flips on
+`SessionOptions.enable_profiling` for the ONNX Runtime sessions onnxsim runs
+while simplifying (the constant-folding sessions, plus the correctness-check
+runs when `check_n > 0`), so each one writes ONNX Runtime's detailed per-kernel
+Chrome trace:
+
+```python
+# Write onnxruntime session traces with the given file prefix.
+model_simp, check = onnxsim.simplify(model, ort_profile="ort_profile")
+```
+
+```
+onnxsim input_onnx_model output_onnx_model --ort-profile ort_profile
+```
+
+The value is a file **prefix**: ONNX Runtime writes one
+`<prefix>_<timestamp>.json` per session, so a run that folds in several batches
+produces several files (open each in `chrome://tracing` or
+[ui.perfetto.dev](https://ui.perfetto.dev)). It is independent of `profile` --
+use either, or both together (`profile` for onnxsim's pipeline, `ort_profile`
+for what ONNX Runtime does inside each fold). Like `profile`, it is driven by an
+environment variable (`ONNXSIM_ORT_PROFILE`), so it works from every binding:
+
+```
+ONNXSIM_ORT_PROFILE=ort_profile onnxsim input_onnx_model output_onnx_model
+```
+
 ## Custom rewriters
 
 Beyond the built-in optimizer passes, you can plug your own graph rewriting

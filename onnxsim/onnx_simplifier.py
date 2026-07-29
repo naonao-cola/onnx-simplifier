@@ -340,6 +340,7 @@ def simplify(
     check_atol: float = 1e-5,
     providers: Optional[Sequence[backend.Provider]] = None,
     profile: Optional[str] = None,
+    ort_profile: Optional[str] = None,
 ) -> Tuple[onnx.ModelProto, bool]:
     """
     :param model: onnx ModelProto object or file path
@@ -410,6 +411,18 @@ def simplify(
             https://ui.perfetto.dev to see the flame graph; a per-function summary
             is also printed to stdout. Implemented in the C++ core via the
             ``ONNXSIM_PROFILE`` environment variable, so it works from every
+            binding; setting this argument simply sets that variable for the call.
+    :param ort_profile: When set, turn on onnxruntime's own built-in session
+            profiler for the onnxruntime sessions onnxsim runs while simplifying
+            (the constant-folding sessions, plus the correctness-check runs when
+            ``check_n`` > 0). This is separate from and complementary to
+            ``profile``: where ``profile`` times onnxsim's fixed-point functions,
+            ``ort_profile`` records onnxruntime's detailed per-operator execution
+            within each session. The value is a file *prefix* (an empty string uses
+            ``onnxsim_ort_profile``); onnxruntime writes one
+            ``<prefix>_<timestamp>.json`` Chrome trace per session, so a run that
+            folds in several batches produces several files. Implemented via the
+            ``ONNXSIM_ORT_PROFILE`` environment variable, so it works from every
             binding; setting this argument simply sets that variable for the call.
     :return: A tuple (simplified model, success(True) or failed(False))
     """
@@ -576,6 +589,16 @@ def simplify(
         _prev_profile_env = os.environ.get("ONNXSIM_PROFILE")
         os.environ["ONNXSIM_PROFILE"] = profile or "onnxsim_profile.json"
 
+    # Likewise turn on onnxruntime's own session profiler for the folding
+    # sessions by setting ``ONNXSIM_ORT_PROFILE`` (read by the executor), and
+    # restore any prior value afterwards. An empty string selects the default
+    # file prefix.
+    _prev_ort_profile_env = None
+    _ort_profile_active = ort_profile is not None
+    if _ort_profile_active:
+        _prev_ort_profile_env = os.environ.get("ONNXSIM_ORT_PROFILE")
+        os.environ["ONNXSIM_ORT_PROFILE"] = ort_profile or "onnxsim_ort_profile"
+
     try:
         model_bytes = model.SerializeToString()
         if len(model_bytes) >= 2 * 1024 * 1024 * 1024:
@@ -675,6 +698,11 @@ def simplify(
                 os.environ.pop("ONNXSIM_PROFILE", None)
             else:
                 os.environ["ONNXSIM_PROFILE"] = _prev_profile_env
+        if _ort_profile_active:
+            if _prev_ort_profile_env is None:
+                os.environ.pop("ONNXSIM_ORT_PROFILE", None)
+            else:
+                os.environ["ONNXSIM_ORT_PROFILE"] = _prev_ort_profile_env
     _restore_doc_strings(model_opt, doc_strings)
     return model_opt, check_ok
 
@@ -945,6 +973,18 @@ def main():
         default=None,
     )
     parser.add_argument(
+        "--ort-profile",
+        help="Turn on onnxruntime's own per-operator session profiler for the "
+        "onnxruntime sessions onnxsim runs while simplifying (complementary to "
+        "--profile). The value is a file prefix (defaults to "
+        "'onnxsim_ort_profile'); onnxruntime writes one '<prefix>_<timestamp>.json' "
+        "Chrome trace per session.",
+        type=str,
+        nargs="?",
+        const="onnxsim_ort_profile",
+        default=None,
+    )
+    parser.add_argument(
         "-v", "--version", action="version", version="onnxsim " + version.version
     )
 
@@ -1136,6 +1176,7 @@ def main():
         check_atol=args.check_atol,
         providers=providers,
         profile=args.profile,
+        ort_profile=args.ort_profile,
     )
 
     try:

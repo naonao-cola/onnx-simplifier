@@ -16,6 +16,7 @@ import pytest
 from onnx import TensorProto, helper, numpy_helper
 
 import onnxsim
+from onnxsim import backend
 
 
 def _foldable_model() -> onnx.ModelProto:
@@ -143,6 +144,55 @@ def test_profile_captures_ort_session_runs(tmp_path):
         assert any(_contained_in(sess, f) for f in folds), (
             f"{_ORT_SESSION_SPAN} span not nested under any FoldConstant span"
         )
+
+
+def test_ort_profile_writes_session_traces(tmp_path, monkeypatch):
+    """``ort_profile`` turns on onnxruntime's own per-operator session profiler
+    for the folding sessions, writing a Chrome trace per session (separate from
+    onnxsim's own ``profile`` trace)."""
+    if not backend.has_onnxruntime():
+        pytest.skip("onnxruntime not installed; native session profiling unavailable")
+
+    # onnxruntime writes the trace(s) relative to the cwd, so run in tmp_path.
+    monkeypatch.chdir(tmp_path)
+    model_opt, ok = onnxsim.simplify(_foldable_model(), ort_profile="ortprof")
+    assert ok
+
+    # The trace only exists if folding actually ran a session (see the fold-count
+    # reasoning in test_profile_captures_ort_session_runs).
+    add_nodes = [n for n in model_opt.graph.node if n.op_type == "Add"]
+    if len(add_nodes) != 1:
+        pytest.skip("constant folding did not run the ONNX Runtime executor here")
+
+    # We did not pass ``profile``, so any JSON here is an onnxruntime session
+    # trace. (Its exact name depends on the onnxruntime version's support for a
+    # custom prefix, so match on directory rather than prefix.)
+    traces = list(tmp_path.glob("*.json"))
+    assert traces, "expected an onnxruntime session profiling trace to be written"
+
+    # Each trace is a valid onnxruntime profile: a JSON array of event objects.
+    with open(traces[0]) as f:
+        events = json.load(f)
+    assert isinstance(events, list) and events
+
+
+def test_ort_profile_restores_env(tmp_path, monkeypatch):
+    # A pre-existing ONNXSIM_ORT_PROFILE value is restored after the call.
+    monkeypatch.chdir(tmp_path)
+    sentinel = "outer_ort_prefix"
+    monkeypatch.setenv("ONNXSIM_ORT_PROFILE", sentinel)
+    onnxsim.simplify(_foldable_model(), ort_profile="inner")
+    assert os.environ["ONNXSIM_ORT_PROFILE"] == sentinel
+
+
+def test_no_ort_profile_by_default(tmp_path, monkeypatch):
+    # Without ``ort_profile`` no session trace is written and the env is untouched.
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("ONNXSIM_ORT_PROFILE", raising=False)
+    _, ok = onnxsim.simplify(_foldable_model())
+    assert ok
+    assert not list(tmp_path.glob("*.json"))
+    assert "ONNXSIM_ORT_PROFILE" not in os.environ
 
 
 def test_profile_defaults_to_named_file(tmp_path, monkeypatch):

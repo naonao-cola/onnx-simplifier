@@ -208,6 +208,33 @@ std::shared_ptr<Ort::Env> GetEnv() {
   return env;
 }
 
+// Turn on ONNX Runtime's own per-operator session profiler when
+// ONNXSIM_ORT_PROFILE is set, and return whether it was enabled. This is
+// separate from onnxsim's span profiler (ONNXSIM_PROFILE): it makes each
+// constant-folding session dump ONNX Runtime's detailed per-kernel Chrome
+// trace. The variable names a file prefix (ONNX Runtime writes one
+// ``<prefix>_<timestamp>.json`` per session); the truthy shorthands select a
+// default prefix, mirroring ONNXSIM_PROFILE.
+bool EnableOrtProfilingFromEnv(Ort::SessionOptions& sess_opts) {
+  const char* env = std::getenv("ONNXSIM_ORT_PROFILE");
+  if (env == nullptr) {
+    return false;
+  }
+  std::string prefix = env;
+  if (prefix.empty() || prefix == "1" || prefix == "true" || prefix == "on" ||
+      prefix == "yes") {
+    prefix = "onnxsim_ort_profile";
+  }
+#ifdef _WIN32
+  // ORTCHAR_T is wchar_t on Windows; widen the (ASCII) prefix for the API.
+  std::wstring wprefix(prefix.begin(), prefix.end());
+  sess_opts.EnableProfiling(wprefix.c_str());
+#else
+  sess_opts.EnableProfiling(prefix.c_str());
+#endif
+  return true;
+}
+
 struct CppModelExecutor : public ModelExecutor {
   std::vector<onnx::TensorProto> _Run(
       const onnx::ModelProto& model,
@@ -231,6 +258,7 @@ struct CppModelExecutor : public ModelExecutor {
     Ort::SessionOptions sess_opts;
     sess_opts.SetLogSeverityLevel(3);
     sess_opts.SetGraphOptimizationLevel(ORT_DISABLE_ALL);
+    const bool ort_profiling = EnableOrtProfilingFromEnv(sess_opts);
     std::string model_str = model.SerializeAsString();
     Ort::Session session{nullptr};
     {
@@ -250,6 +278,11 @@ struct CppModelExecutor : public ModelExecutor {
           session.Run(run_opts, input_name_ptrs.data(), input_tensors.data(),
                       input_tensors.size(), output_name_ptrs.data(),
                       output_name_ptrs.size());
+    }
+    if (ort_profiling) {
+      // Flush ONNX Runtime's profiling trace for this session to disk.
+      Ort::AllocatorWithDefaultOptions allocator;
+      session.EndProfilingAllocated(allocator);
     }
 
     std::vector<onnx::TensorProto> output_tps;
