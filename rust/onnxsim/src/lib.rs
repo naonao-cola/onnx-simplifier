@@ -616,6 +616,51 @@ pub fn list_optimizers() -> Vec<String> {
         .collect()
 }
 
+/// Render a human-readable diff between an `original` and a `simplified` model,
+/// both serialized ONNX `ModelProto` bytes.
+///
+/// The report is an ASCII table comparing op counts and model size — the same
+/// "here is the difference" summary the Python CLI prints after simplifying — so
+/// a Rust caller can show a before/after view without decoding the models
+/// itself. A metric that improved is flagged with a trailing `*`.
+///
+/// ```no_run
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// let model = std::fs::read("model.onnx")?;
+/// let simplified = onnxsim::simplify(&model)?;
+/// print!("{}", onnxsim::model_info_diff(&model, &simplified)?);
+/// # Ok(())
+/// # }
+/// ```
+pub fn model_info_diff(original: &[u8], simplified: &[u8]) -> Result<String, Error> {
+    let mut out_text: *mut c_char = ptr::null_mut();
+    let mut out_error: *mut c_char = ptr::null_mut();
+
+    let status = unsafe {
+        onnxsim_sys::onnxsim_model_info_diff(
+            original.as_ptr() as *const c_void,
+            original.len(),
+            simplified.as_ptr() as *const c_void,
+            simplified.len(),
+            &mut out_text,
+            &mut out_error,
+        )
+    };
+
+    if status == onnxsim_sys::ONNXSIM_OK {
+        if out_text.is_null() {
+            return Ok(String::new());
+        }
+        let text = unsafe { CStr::from_ptr(out_text) }
+            .to_string_lossy()
+            .into_owned();
+        unsafe { onnxsim_sys::onnxsim_free_string(out_text) };
+        Ok(text)
+    } else {
+        Err(take_error(out_error))
+    }
+}
+
 /// Owns the `CString`s and pointer array backing the `skip_optimizers` FFI
 /// arguments, keeping them alive for the duration of a call.
 struct FfiSkipOptimizers {

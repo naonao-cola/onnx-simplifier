@@ -1,5 +1,7 @@
 #include <fstream>
+#include <iostream>
 
+#include "model_info.h"
 #include "onnx/common/file_utils.h"
 #include "onnxsim.h"
 #include "onnxsim_option.h"
@@ -18,7 +20,7 @@ int main(int argc, char** argv) {
   onnx::ModelProto model;
   onnx::LoadProtoFromPath(input_model_filename, model);
 
-  model = Simplify(
+  onnx::ModelProto simplified = Simplify(
       *GetBuiltinModelExecutor(), model,
       no_opt ? std::nullopt : std::make_optional<std::vector<std::string>>({}),
       !no_sim, !no_shape_inference, SIZE_MAX,
@@ -27,8 +29,13 @@ int main(int argc, char** argv) {
 
   std::ofstream ofs(output_model_filename,
                     std::ios::out | std::ios::trunc | std::ios::binary);
-  if (!model.SerializeToOstream(&ofs)) {
+  if (!simplified.SerializeToOstream(&ofs)) {
     throw std::invalid_argument("save model error");
   }
+
+  // Report the difference between the original and simplified models, matching
+  // the Python CLI's "Finish! Here is the difference:" output.
+  std::cout << "Finish! Here is the difference:\n";
+  std::cout << FormatSimplifyingInfo(model, simplified);
   return 0;
 }
