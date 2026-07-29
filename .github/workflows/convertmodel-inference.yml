@@ -26,6 +26,9 @@ jobs:
       - name: Run Netron URL builder test
         working-directory: scripts/convertmodel
         run: npm run test:netron
+      - name: Run trace-assembler unit test
+        working-directory: scripts/convertmodel
+        run: npm run test:trace
       - name: Run inference smoke test (wasm EP)
         working-directory: scripts/convertmodel
         run: npm run test:inference

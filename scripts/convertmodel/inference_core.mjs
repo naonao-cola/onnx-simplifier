@@ -7,6 +7,13 @@
 // session on the first provider that works (so a page can ask for WebGPU and
 // transparently fall back to wasm), then run several iterations and report
 // timings plus whether the output stayed identical across iterations.
+//
+// When `profile` is set the run also captures an onnxruntime-web profiling
+// trace (see trace_build.mjs): per-iteration wall timings for every provider,
+// plus per-kernel GPU timings on WebGPU via the profiling callback. The trace
+// is returned as a ready-to-render Chrome Trace Event object.
+
+import { buildOrtTrace } from "./trace_build.mjs";
 
 function maxAbsDiff(a, b) {
   let m = 0;
@@ -35,9 +42,37 @@ export async function createSessionWithFallback(ort, model, providers, onLog = (
   throw new Error(`no usable execution provider (${errors.join(" | ")})`);
 }
 
+// Turn on onnxruntime-web's WebGPU per-kernel profiling and collect the records
+// the callback delivers. Returns { kernels, restore } where restore() puts
+// env.webgpu.profiling back the way it was. A no-op-friendly wrapper: on builds
+// without WebGPU profiling the array simply stays empty.
+function startWebGpuProfiling(ort) {
+  const kernels = [];
+  const prev = ort?.env?.webgpu?.profiling;
+  try {
+    ort.env.webgpu.profiling = {
+      mode: "default",
+      ondata: (d) => kernels.push(d),
+    };
+  } catch {
+    // env.webgpu may be absent (older builds); wall timings still get captured.
+  }
+  const restore = () => {
+    try {
+      ort.env.webgpu.profiling = prev ?? { mode: "off" };
+    } catch {
+      /* ignore */
+    }
+  };
+  return { kernels, restore };
+}
+
 // Run `iterations` inference passes and verify determinism (every pass must
 // equal the first) and, if `reference` is given, correctness within `tolerance`.
-// Returns { ep, iterations, timings, avgMs, output, dims }.
+// Returns { ep, iterations, timings, avgMs, output, dims, trace? }.
+//
+// With `profile: true`, `trace` is a Chrome Trace Event object built from the
+// per-iteration wall timings and (on WebGPU) the per-kernel GPU records.
 export async function runInference(ort, {
   model,
   inputName,
@@ -47,39 +82,69 @@ export async function runInference(ort, {
   iterations = 5,
   reference = null,
   tolerance = 1e-4,
+  profile = false,
   onLog = () => {},
 }) {
-  const { session, ep } = await createSessionWithFallback(ort, model, providers, onLog);
+  // Arm WebGPU kernel profiling before the session is created so its programs
+  // are built with timestamp queries enabled.
+  const gpu = profile ? startWebGpuProfiling(ort) : null;
+
+  let session;
+  let ep;
+  try {
+    ({ session, ep } = await createSessionWithFallback(
+      ort,
+      model,
+      providers,
+      onLog,
+    ));
+  } catch (e) {
+    gpu?.restore();
+    throw e;
+  }
   const resolvedInputName = inputName || session.inputNames[0];
   const resolvedOutputName = outputName || session.outputNames[0];
 
   let first = null;
   let lastDims = null;
   const timings = [];
-  for (let i = 0; i < iterations; i++) {
-    const t0 = performance.now();
-    const results = await session.run({ [resolvedInputName]: input });
-    timings.push(performance.now() - t0);
+  const runs = [];
+  try {
+    for (let i = 0; i < iterations; i++) {
+      const t0 = performance.now();
+      const results = await session.run({ [resolvedInputName]: input });
+      const durMs = performance.now() - t0;
+      timings.push(durMs);
+      runs.push({ index: i, startMs: t0, durMs });
 
-    const out = results[resolvedOutputName];
-    if (!out) throw new Error(`iteration ${i}: missing output '${resolvedOutputName}'`);
-    const data = out.data;
-    lastDims = out.dims;
+      const out = results[resolvedOutputName];
+      if (!out) throw new Error(`iteration ${i}: missing output '${resolvedOutputName}'`);
+      const data = out.data;
+      lastDims = out.dims;
 
-    if (reference) {
-      const refDiff = maxAbsDiff(data, reference);
-      if (refDiff > tolerance) {
-        throw new Error(`iteration ${i}: output differs from reference by ${refDiff} (> ${tolerance})`);
+      if (reference) {
+        const refDiff = maxAbsDiff(data, reference);
+        if (refDiff > tolerance) {
+          throw new Error(`iteration ${i}: output differs from reference by ${refDiff} (> ${tolerance})`);
+        }
       }
+      if (first === null) {
+        first = data;
+      } else if (maxAbsDiff(data, first) !== 0) {
+        throw new Error(`iteration ${i}: non-deterministic across runs on '${ep}'`);
+      }
+      onLog(`iter ${i}: ${timings[i].toFixed(2)} ms`);
     }
-    if (first === null) {
-      first = data;
-    } else if (maxAbsDiff(data, first) !== 0) {
-      throw new Error(`iteration ${i}: non-deterministic across runs on '${ep}'`);
-    }
-    onLog(`iter ${i}: ${timings[i].toFixed(2)} ms`);
+  } finally {
+    gpu?.restore();
   }
 
   const avgMs = timings.reduce((a, b) => a + b, 0) / timings.length;
-  return { ep, iterations, timings, avgMs, output: first, dims: lastDims };
+  const result = { ep, iterations, timings, avgMs, output: first, dims: lastDims };
+  if (profile) {
+    const version = ort?.env?.versions?.web;
+    result.kernels = gpu ? gpu.kernels : [];
+    result.trace = buildOrtTrace({ version, ep, runs, kernels: result.kernels });
+  }
+  return result;
 }

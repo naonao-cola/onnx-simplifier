@@ -7,6 +7,8 @@
 // unavailable, so it works on any browser.
 
 import { runInference } from "./inference_core.mjs";
+import { summarizeOrtTrace } from "./trace_build.mjs";
+import { renderTrace } from "./trace_viewer.mjs";
 
 const ORT_VERSION = "1.27.0";
 const ORT_BASE = `https://cdn.jsdelivr.net/npm/onnxruntime-web@${ORT_VERSION}/dist/`;
@@ -59,7 +61,7 @@ function makeDummyInputs(ort, session) {
   return feeds;
 }
 
-async function runOnModel(modelBytes, { iterations, preferWebGPU }, log) {
+async function runOnModel(modelBytes, { iterations, preferWebGPU, profile }, log) {
   const ort = await loadOrt();
   const providers = preferWebGPU ? ["webgpu", "wasm"] : ["wasm"];
 
@@ -77,6 +79,7 @@ async function runOnModel(modelBytes, { iterations, preferWebGPU }, log) {
     input: feeds[inputName],
     providers,
     iterations,
+    profile,
     onLog: log,
   });
   return res;
@@ -88,6 +91,8 @@ export function initInferencePanel() {
   const fileInput = document.getElementById("file-input");
   const itersInput = document.getElementById("inference-iters");
   const epSelect = document.getElementById("inference-ep");
+  const profileChk = document.getElementById("inference-profile");
+  const traceContainer = document.getElementById("inference-trace");
   if (!btn) return;
 
   const log = (msg) => {
@@ -102,16 +107,38 @@ export function initInferencePanel() {
     }
     btn.disabled = true;
     out.textContent = "";
+    if (traceContainer) traceContainer.innerHTML = "";
     try {
       const iterations = Math.max(1, parseInt(itersInput.value, 10) || 5);
       const preferWebGPU = epSelect.value === "webgpu";
+      const profile = !profileChk || profileChk.checked;
       const bytes = new Uint8Array(await file.arrayBuffer());
       log(`loading onnxruntime-web ${ORT_VERSION}…`);
-      const res = await runOnModel(bytes, { iterations, preferWebGPU }, log);
+      const res = await runOnModel(
+        bytes,
+        { iterations, preferWebGPU, profile },
+        log,
+      );
       log(
         `PASS: ${res.iterations} iterations on '${res.ep}', deterministic ` +
           `(avg ${res.avgMs.toFixed(2)} ms/iter)`,
       );
+      if (profile && res.trace && traceContainer) {
+        const runs = res.timings.map((durMs, index) => ({ index, startMs: 0, durMs }));
+        const s = summarizeOrtTrace({ runs, kernels: res.kernels || [] });
+        if (s.kernels > 0) {
+          log(`captured ${s.kernels} GPU kernel spans (${s.gpuMs.toFixed(2)} ms on device)`);
+        } else {
+          log(
+            "no per-kernel GPU profiling for this provider; showing " +
+              "per-iteration wall spans. Run on WebGPU for op-level detail.",
+          );
+        }
+        renderTrace(traceContainer, res.trace, {
+          title: `onnxruntime-web ${res.ep} inference`,
+          filename: `onnxruntime-web.${res.ep}.trace.json`,
+        });
+      }
     } catch (e) {
       log("FAIL: " + (e && e.message ? e.message : String(e)));
     } finally {
