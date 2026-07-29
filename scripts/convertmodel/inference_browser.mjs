@@ -5,6 +5,11 @@
 // shared inference_core.mjs (the same code the Node smoke test drives). The
 // execution provider defaults to WebGPU and falls back to wasm when WebGPU is
 // unavailable, so it works on any browser.
+//
+// The panel can run either the original uploaded model or the converted
+// (simplify/optimize) result. The converter page publishes the converted bytes
+// on `window.__onnxsimConverted` (set in index.html when a conversion
+// finishes); "original" reads the file input directly.
 
 import { runInference } from "./inference_core.mjs";
 import { summarizeOrtTrace } from "./trace_build.mjs";
@@ -85,12 +90,35 @@ async function runOnModel(modelBytes, { iterations, preferWebGPU, profile }, log
   return res;
 }
 
+// Resolve the model bytes for the chosen source. "converted" uses the bytes the
+// converter page published on window.__onnxsimConverted; "original" reads the
+// file input. Returns { bytes, label } or throws with a user-facing message.
+async function resolveModelBytes(source, fileInput) {
+  if (source === "converted") {
+    const converted = window.__onnxsimConverted;
+    if (!converted || !converted.bytes) {
+      throw new Error(
+        "no converted model yet — pick a file above to run a conversion " +
+          "first, or switch the model dropdown to 'original'.",
+      );
+    }
+    return { bytes: converted.bytes, label: `converted (${converted.name})` };
+  }
+  const file = fileInput.files && fileInput.files[0];
+  if (!file) throw new Error("Pick an .onnx file first.");
+  return {
+    bytes: new Uint8Array(await file.arrayBuffer()),
+    label: `original (${file.name})`,
+  };
+}
+
 export function initInferencePanel() {
   const btn = document.getElementById("run-inference");
   const out = document.getElementById("inference-output");
   const fileInput = document.getElementById("file-input");
   const itersInput = document.getElementById("inference-iters");
   const epSelect = document.getElementById("inference-ep");
+  const sourceSelect = document.getElementById("inference-source");
   const profileChk = document.getElementById("inference-profile");
   const traceContainer = document.getElementById("inference-trace");
   if (!btn) return;
@@ -100,19 +128,16 @@ export function initInferencePanel() {
   };
 
   btn.addEventListener("click", async () => {
-    const file = fileInput.files && fileInput.files[0];
-    if (!file) {
-      out.textContent = "Pick an .onnx file first.\n";
-      return;
-    }
     btn.disabled = true;
     out.textContent = "";
     if (traceContainer) traceContainer.innerHTML = "";
     try {
+      const source = sourceSelect ? sourceSelect.value : "original";
+      const { bytes, label } = await resolveModelBytes(source, fileInput);
       const iterations = Math.max(1, parseInt(itersInput.value, 10) || 5);
       const preferWebGPU = epSelect.value === "webgpu";
       const profile = !profileChk || profileChk.checked;
-      const bytes = new Uint8Array(await file.arrayBuffer());
+      log(`running ${label}`);
       log(`loading onnxruntime-web ${ORT_VERSION}…`);
       const res = await runOnModel(
         bytes,
