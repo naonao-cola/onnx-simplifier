@@ -71,3 +71,37 @@ simplify cleanly:
   redundant nodes and sees the largest reduction (~31–36%).
 - The simplified graphs load and run in onnxruntime with unchanged I/O
   signatures (verified by `tests/test_yolo.py`).
+
+## onnxsim vs onnxslim
+
+Ultralytics' own `simplify=True` export path now uses
+[onnxslim](https://github.com/inisis/OnnxSlim) rather than onnxsim, so it is
+worth checking how the two compare on the same exports. Running both
+simplifiers on the raw ONNX (reproduce with
+`python bench/onnxslim_comparison.py <exported .onnx> ...`; onnxslim `0.1.94`):
+
+| Spec | orig | onnxsim | onnxslim | same op histogram |
+|---|---:|---:|---:|:---:|
+| yolo26n | 550 | 384 | 384 | ✅ |
+| yolo26n-seg | 625 | 434 | 434 | ✅ |
+| yolo26n-pose | 613 | 419 | 419 | ✅ |
+| yolo26n-obb | 595 | 421 | 421 | ✅ |
+| yolo26n-cls | 185 | 144 | 144 | ✅ |
+| yolo12n | 744 | 496 | 496 | ✅ |
+| yolo12n-seg | 791 | 531 | 531 | ✅ |
+| yolo11n | 429 | 318 | 318 | ✅ |
+| yolo11n-seg | 476 | 353 | 353 | ✅ |
+| yolo11n-pose | 484 | 352 | 352 | ✅ |
+
+**The two simplifiers converge to the same graph on every YOLO spec** — not
+just the same total node count but the same per-op-type histogram. The
+`onnxsim`- and `onnxslim`-simplified models are also numerically identical to
+each other (`max|onnxsim − onnxslim| = 0.0` over random inputs on
+`yolo26n` / `yolo12n-seg` / `yolo11n-pose`). This is expected: both tools run
+shape inference + constant folding + the standard fusions (Conv+BN, etc.) to a
+fixed point, and YOLO's CNN detection graphs leave no folding gap between them.
+
+Runtimes are also a wash — summed over the 10 specs above, ~4.4 s (onnxsim)
+vs ~4.5 s (onnxslim), with per-model noise in both directions. On the latest
+YOLO family the choice between onnxsim and onnxslim is a functional no-op; both
+produce the same simplified model.
