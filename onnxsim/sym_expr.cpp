@@ -139,6 +139,43 @@ std::string wrap(const SymExpr& e) {
 
 }  // namespace
 
+std::optional<SymExpr> TryExactDivide(const SymExpr& num, const SymExpr& den) {
+  // Only single-term divisors (a product of dimensions times a constant); a
+  // genuine polynomial sum is never a shape-arithmetic divisor.
+  if (den.terms().size() != 1) return std::nullopt;
+  const auto& [den_mono, den_coeff] = *den.terms().begin();
+  if (den_coeff == 0) return std::nullopt;  // division by zero
+  const auto den_powers = powers_of(den_mono);
+
+  SymExpr quotient;  // starts at 0, so num == 0 divides to 0
+  for (const auto& [mono, coeff] : num.terms()) {
+    if (coeff % den_coeff != 0)
+      return std::nullopt;  // coefficient not divisible
+    auto powers = powers_of(mono);
+    for (const auto& [name, power] : den_powers) {
+      const auto it = powers.find(name);
+      if (it == powers.end() || it->second < power) {
+        return std::nullopt;  // this term is not divisible by den's monomial
+      }
+      it->second -= power;
+    }
+    // Rebuild the quotient term coeff/den_coeff * (remaining symbols), using
+    // the public API only (mirrors divide_by above).
+    SymExpr term(coeff / den_coeff);
+    for (const auto& [name, power] : powers)
+      for (std::size_t k = 0; k < power; ++k) term *= SymExpr::Symbol(name);
+    quotient += term;
+  }
+  return quotient;
+}
+
+std::optional<bool> TryEqual(const SymExpr& a, const SymExpr& b) {
+  const SymExpr diff = a - b;
+  if (diff.is_zero()) return true;        // a and b are structurally identical
+  if (!diff.is_symbolic()) return false;  // concrete, non-zero difference
+  return std::nullopt;                    // symbolic difference: undecidable
+}
+
 std::string SymExpr::str() const { return join_terms(terms_); }
 
 std::string SymExpr::str_factored() const {
