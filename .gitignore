@@ -161,3 +161,9 @@ node_modules/
 
 # ...but the convertmodel inference test's fixture model IS tracked.
 !/scripts/convertmodel/test/model.onnx
+
+# Self-hosted Netron: built into the converter site by the deploy workflow
+# (scripts/convertmodel/netron) from a clone of the fork (netron-src). Neither
+# is committed — they are produced at deploy time.
+/scripts/convertmodel/netron/
+/netron-src/

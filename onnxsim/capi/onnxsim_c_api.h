@@ -154,6 +154,25 @@ ONNXSIM_C_API OnnxsimStatus onnxsim_simplify_path(
  */
 ONNXSIM_C_API char* onnxsim_list_optimizers(void);
 
+/*
+ * Render a human-readable diff between an original and a simplified model, both
+ * given as serialized ONNX ModelProto bytes. The report is an ASCII table
+ * comparing op counts and model size, the same information the Python CLI
+ * prints as "the difference" after simplifying. It lets the non-Python bindings
+ * show a before/after summary without re-implementing the analysis.
+ *
+ * On ONNXSIM_OK, *out_text receives a newly allocated, NUL-terminated string
+ * holding the table; release it with onnxsim_free_string. On ONNXSIM_ERROR,
+ * *out_error receives a newly allocated message; release it the same way.
+ * Either out_* pointer may be NULL if the caller does not want that value.
+ */
+ONNXSIM_C_API OnnxsimStatus onnxsim_model_info_diff(const void* original_data,
+                                                    size_t original_size,
+                                                    const void* simplified_data,
+                                                    size_t simplified_size,
+                                                    char** out_text,
+                                                    char** out_error);
+
 /* Free a buffer returned via an out_data parameter. NULL is ignored. */
 ONNXSIM_C_API void onnxsim_free_buffer(void* data);
 

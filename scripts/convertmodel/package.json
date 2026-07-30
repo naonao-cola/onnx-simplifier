@@ -6,6 +6,7 @@
   "type": "module",
   "scripts": {
     "test:inference": "node test/inference.test.mjs",
+    "test:netron": "node test/netron.test.mjs",
     "test:trace": "node test/trace.test.mjs"
   },
   "dependencies": {

@@ -17,9 +17,28 @@ fn main() -> ExitCode {
     let input = &args[1];
     let output = &args[2];
 
-    match onnxsim::simplify_path(input, output) {
-        Ok(()) => {
+    // Simplify in memory (rather than with `simplify_path`) so we still hold the
+    // original bytes and can print the before/after diff, mirroring the Python
+    // CLI's "here is the difference" output.
+    let model_bytes = match std::fs::read(input) {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            eprintln!("error: cannot read {input}: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    match onnxsim::simplify(&model_bytes) {
+        Ok(simplified) => {
+            if let Err(err) = std::fs::write(output, &simplified) {
+                eprintln!("error: cannot write {output}: {err}");
+                return ExitCode::FAILURE;
+            }
             println!("simplified {input} -> {output}");
+            match onnxsim::model_info_diff(&model_bytes, &simplified) {
+                Ok(diff) => print!("{diff}"),
+                Err(err) => eprintln!("warning: could not compute model diff: {err}"),
+            }
             ExitCode::SUCCESS
         }
         Err(err) => {

@@ -69,6 +69,18 @@ for name in onnxsim::list_optimizers() {
 }
 ```
 
+Print the before/after difference, the same op-count and model-size summary the
+Python CLI shows after simplifying:
+
+```rust
+fn main() -> Result<(), Box<dyn std::error::Error + 'static>> {
+    let model = std::fs::read("model.onnx")?;
+    let simplified = onnxsim::simplify(&model)?;
+    print!("{}", onnxsim::model_info_diff(&model, &simplified)?);
+    Ok(())
+}
+```
+
 ## Custom rewriter
 
 Run your own graph-rewriting logic inside the simplification fixed point — the
