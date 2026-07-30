@@ -460,6 +460,48 @@ def _expand_schema_functions(model: onnx.ModelProto) -> None:
     model.functions.extend(new_functions)
 
 
+def _poly_to_metric(poly: List[Tuple[int, List[str]]]) -> Macs:
+    """Rebuild a metric from the C++ polynomial form -- a list of
+    ``(coeff, [dim_name, ...])`` terms -- into the value the pure-Python counters
+    produced: a plain int when concrete, or the same sympy expression (dim_params
+    as positive-integer symbols) when a dynamic dimension is involved. Without
+    sympy every symbol collapses to 1, matching the old per-sample fallback.
+    """
+    if sympy is None:
+        return sum((coeff for coeff, _ in poly), 0)
+    total: Macs = 0
+    for coeff, monomial in poly:
+        term: Macs = coeff
+        for name in monomial:
+            term = term * _dim_symbol(name)
+        total = total + term
+    return total
+
+
+def _cpp_metrics(
+    model: onnx.ModelProto, run_shape_inference: bool = True
+) -> Tuple[Dict[str, int], int, Macs, Macs, Macs]:
+    """Delegate the metric counting to the C++ implementation and rebuild the
+    symbolic metrics as sympy expressions. Returns
+    ``(op_nums, model_size, macs, mem_access, memory_footprint)``.
+    """
+    # Imported lazily so importing ``onnxsim.model_info`` never forces the
+    # compiled extension at module load, and cannot form an import cycle with the
+    # package __init__.
+    from onnxsim import onnxsim_cpp2py_export as _C
+
+    op_nums, model_size, macs, mem_access, footprint = _C._model_metrics(
+        model.SerializeToString(), run_shape_inference
+    )
+    return (
+        dict(op_nums),
+        model_size,
+        _poly_to_metric(macs),
+        _poly_to_metric(mem_access),
+        _poly_to_metric(footprint),
+    )
+
+
 class ModelInfo:
     """
     Model info contains:
@@ -540,35 +582,32 @@ class ModelInfo:
         return op_nums, macs, mem_access
 
     def __init__(self, model: onnx.ModelProto):
-        inferred = self._infer_shapes(model)
-        # Op counts describe the model as authored, so a function op (e.g. a
-        # fused block) is reported as a single op.
-        self.op_nums, macs, mem_access = self.get_info(inferred.graph)
-        # ``graph.ByteSize()`` is the serialized size of the whole graph -- nested
-        # subgraphs and inline tensor data included -- so it is taken once at the
-        # top rather than summed per subgraph (which double-counted nested
-        # graphs). Tensors kept as external data contribute nothing to ByteSize
-        # (their ``raw_data`` is empty), so their on-disk lengths are added from
-        # metadata. The size is therefore correct whether or not the external
-        # data has been loaded, so callers need not materialize multi-GB weights
-        # just to measure the model.
-        self.model_size = model.graph.ByteSize() + _external_data_size(model.graph)
-        # A function op's compute lives in its body, so for MACs (and the memory
-        # metrics, which must pair with those FLOPs) we expose function bodies and
-        # recount on the expanded graph -- the primitive counters then see the
-        # MatMuls, Convs, etc. inside every function instance.
-        compute_graph = self._expanded_macs_graph(model)
-        if compute_graph is not None:
-            _, macs, mem_access = self.get_info(compute_graph)
-        else:
-            compute_graph = inferred.graph
+        # Delegate the counting to the single C++ implementation, which returns
+        # op counts, model size, and the compute/memory metrics as polynomials;
+        # _cpp_metrics rebuilds the symbolic ones into the same sympy expressions
+        # the pure-Python counters used to produce. Op counts and size describe
+        # the model as authored, so a function op is reported as a single op and
+        # the size is the serialized graph plus external-data lengths (correct
+        # whether or not the weights on disk have been loaded).
+        op_nums, self.model_size, macs, mem_access, footprint = _cpp_metrics(model)
+        self.op_nums = defaultdict(int, op_nums)
+        # A function op's compute lives in its body, so recount MACs and the
+        # memory metrics on the function-expanded (inlined) graph -- the counters
+        # then see the MatMuls, Convs, etc. inside every function instance. The
+        # expanded model already carries shapes (inferred with data propagation),
+        # so C++ need not infer them again.
+        expanded = self._expanded_macs_model(model)
+        if expanded is not None:
+            _, _, macs, mem_access, footprint = _cpp_metrics(
+                expanded, run_shape_inference=False
+            )
         self.macs = macs
         self.mem_access = mem_access
-        self.memory_footprint = self._peak_memory_footprint(compute_graph)
+        self.memory_footprint = footprint
 
     @staticmethod
-    def _expanded_macs_graph(model: onnx.ModelProto) -> Optional[onnx.GraphProto]:
-        """A shape-inferred graph with function bodies exposed for MAC counting,
+    def _expanded_macs_model(model: onnx.ModelProto) -> Optional[onnx.ModelProto]:
+        """A shape-inferred model with function bodies exposed for MAC counting,
         or None when there is nothing to expand.
 
         Model-local functions are inlined, and schema-registered function ops
@@ -585,7 +624,7 @@ class ModelInfo:
             if not work.functions:
                 return None
             inlined = onnx_inliner.inline_local_functions(work)
-            return ModelInfo._infer_shapes(inlined, data_prop=True).graph
+            return ModelInfo._infer_shapes(inlined, data_prop=True)
         except Exception as e:
             warnings.warn(
                 f"Failed to expand function bodies ({e}); MACs inside function "
