@@ -18,6 +18,25 @@
         </style>
         <script type="text/javascript" src="./onnxsim.js"></script>
         <script type="text/javascript">
+            // The "Choose file" picker must stay disabled until BOTH WASM
+            // runtimes are initialized: the one on this page (used to populate
+            // the pass list) and the one inside the conversion worker (which
+            // actually receives the model). Enabling it earlier lets a user
+            // pick a file before the worker is listening, so the conversion
+            // message is dropped and the runtime raises uninitialized errors.
+            let runtimeReady = false; // this page's WASM (pass list)
+            let workerReady = false;  // the worker's WASM (conversion)
+            const maybeEnableInput = () => {
+                if (!runtimeReady || !workerReady) return;
+                const input = document.getElementById("file-input");
+                if (input) {
+                    input.disabled = false;
+                    input.removeAttribute("title");
+                }
+                const status = document.getElementById("loading-status");
+                if (status) status.style.display = "none";
+            };
+
             create_onnxsim().then((runtime) => {
                 to_ary = (vec) => {
                     return new Array(vec.size()).fill(0).map((_, id) => vec.get(id))
@@ -41,6 +60,8 @@
                 for (const p of to_ary(runtime.onnxoptimizer_fuse_elimination_passes()).sort()) {
                     checkboxes[p].checked = true;
                 }
+                runtimeReady = true;
+                maybeEnableInput();
             });
 
             // The most recent conversion parameters, captured so that the
@@ -106,6 +127,12 @@
                 let result_name = "";
                 worker.onmessage = (e) => {
                     switch (e.data[0]) {
+                        case "ready":
+                            // The worker's WASM runtime has finished loading and
+                            // is now listening for conversion requests.
+                            workerReady = true;
+                            maybeEnableInput();
+                            break;
                         case "stdout":
                             log_output.value += e.data[1] + "\n";
                             log_output.scrollTop = log_output.scrollHeight;
@@ -207,7 +234,8 @@
     </head>
     <body>
         <h1>Model converter</h1>
-        <input type="file" id="file-input" />
+        <input type="file" id="file-input" disabled title="Loading WebAssembly runtime…" />
+        <span id="loading-status">⏳ Loading WebAssembly runtime… the file picker is disabled until it is ready.</span>
         <button id="download-button" disabled>Download</button>
         <div>
             <input type="radio" name="optimizer" value="simplify" id="optimizer_simplify" checked>
