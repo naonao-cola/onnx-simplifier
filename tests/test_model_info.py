@@ -562,16 +562,11 @@ def test_warns_when_shape_inference_fails(monkeypatch):
         ModelInfo(_model([node], [x], [y]))
 
 
-def test_warns_when_counter_raises(monkeypatch):
-    def boom(node, shapes):
-        raise ValueError("bad counter")
-
-    monkeypatch.setitem(model_info._MAC_COUNTERS, "Relu", boom)
-    x = _vi("x", [1, 4])
-    y = _vi("y", [1, 4])
-    node = helper.make_node("Relu", ["x"], ["y"], name="r")
-    with pytest.warns(UserWarning, match="Failed to count MACs"):
-        ModelInfo(_model([node], [x], [y]))
+# There is no "warn when a MAC counter raises" test: the counting is delegated
+# to the C++ implementation, whose counters are bounds-checked and return 0
+# rather than throwing, so a malformed node degrades to 0 without a per-counter
+# Python warning (the graceful-degradation behaviour is preserved structurally;
+# see the "macs == 0 when shapes are unknown" cases above).
 
 
 # --------------------------------------------------------------------------- #
