@@ -43,9 +43,13 @@ struct ModelInfo {
   onnxsim::SymExpr Flops() const { return macs * onnxsim::SymExpr(2); }
 };
 
-// Compute the metrics of ``model``. The model is not modified; shape inference
-// (needed for the compute/memory metrics) runs on an internal copy.
-ModelInfo GetModelInfo(const onnx::ModelProto& model);
+// Compute the metrics of ``model``. The model is not modified. When
+// ``run_shape_inference`` is true (the default) shape inference runs on an
+// internal copy to populate the shapes the compute/memory metrics need; pass
+// false when ``model`` already carries the value_info (e.g. a caller that
+// inferred shapes itself, with data propagation) to avoid the extra pass.
+ModelInfo GetModelInfo(const onnx::ModelProto& model,
+                       bool run_shape_inference = true);
 
 // Render an ASCII table comparing an original and a simplified model, mirroring
 // the layout of the Python ``print_simplifying_info``: one row per op type (the

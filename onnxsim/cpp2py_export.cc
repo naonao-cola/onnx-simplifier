@@ -3,6 +3,7 @@
  */
 
 #include <nanobind/nanobind.h>
+#include <nanobind/stl/map.h>
 #include <nanobind/stl/optional.h>
 #include <nanobind/stl/pair.h>
 #include <nanobind/stl/shared_ptr.h>
@@ -17,6 +18,7 @@
 #include <vector>
 
 #include "function_rewriter.h"
+#include "model_info.h"
 #include "onnx/defs/schema.h"
 #include "onnx/defs/shape_inference.h"
 #include "onnx/proto_utils.h"
@@ -298,6 +300,34 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
   m.doc() = "ONNX Simplifier";
 
   using namespace py::literals;
+
+  // Compute the model metrics (op counts, size, MACs, memory access, peak
+  // footprint) in C++ so the Python ``model_info`` can delegate the counting to
+  // a single implementation. The symbolic metrics are returned as
+  // coefficient/monomial polynomials -- each is a list of (coeff, [dim_name,
+  // ...]) terms -- which the Python side rebuilds into sympy expressions,
+  // keeping the public API (and its exact symbolic output) unchanged. Pass
+  // ``run_shape_inference=False`` when the caller already inferred shapes (e.g.
+  // the function-expanded graph, inferred with data propagation).
+  m.def(
+      "_model_metrics",
+      [](const py::bytes& model_bytes, bool run_shape_inference) {
+        onnx::ModelProto model;
+        onnx::ParseProtoFromBytes(&model, model_bytes.c_str(),
+                                  model_bytes.size());
+        const ModelInfo info = GetModelInfo(model, run_shape_inference);
+        auto to_poly = [](const onnxsim::SymExpr& expr) {
+          std::vector<std::pair<int64_t, std::vector<std::string>>> poly;
+          for (const auto& [monomial, coeff] : expr.terms()) {
+            poly.emplace_back(coeff, monomial);
+          }
+          return poly;
+        };
+        return std::make_tuple(info.op_nums, info.model_size,
+                               to_poly(info.macs), to_poly(info.mem_access),
+                               to_poly(info.memory_footprint));
+      },
+      "model_bytes"_a, "run_shape_inference"_a = true);
 
   m.def(
        "simplify",

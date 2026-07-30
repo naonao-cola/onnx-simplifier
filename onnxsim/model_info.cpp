@@ -227,7 +227,8 @@ GraphView BuildGraphView(const onnx::GraphProto& graph, ShapeMap shapes,
 
 }  // namespace
 
-ModelInfo GetModelInfo(const onnx::ModelProto& model) {
+ModelInfo GetModelInfo(const onnx::ModelProto& model,
+                       bool run_shape_inference) {
   ModelInfo info;
   CountGraphOps(model.graph(), info.op_nums);
   // ByteSizeLong() (not the 32-bit ByteSize()) so models above 2GB do not
@@ -237,17 +238,23 @@ ModelInfo GetModelInfo(const onnx::ModelProto& model) {
   info.model_size = static_cast<int64_t>(model.graph().ByteSizeLong()) +
                     ExternalDataSize(model.graph());
 
-  // The compute/memory metrics need tensor shapes, so run shape inference on a
-  // copy (it mutates in place). Best-effort: if it throws (e.g. models > 2GB),
-  // fall back to whatever value_info the model already carries -- unshaped
-  // nodes then contribute 0, mirroring the Python warning path.
-  onnx::ModelProto inferred = model;
-  try {
-    onnx::shape_inference::InferShapes(inferred);
-  } catch (...) {
+  // The compute/memory metrics need tensor shapes. By default run shape
+  // inference on a copy (it mutates in place). Best-effort: if it throws (e.g.
+  // models > 2GB), fall back to whatever value_info the model already carries
+  // -- unshaped nodes then contribute 0, mirroring the Python warning path.
+  // When the caller already inferred shapes (e.g. with data propagation), skip
+  // the pass and read the model's existing value_info directly.
+  onnx::ModelProto inferred;
+  const onnx::GraphProto* graph = &model.graph();
+  if (run_shape_inference) {
+    inferred = model;
+    try {
+      onnx::shape_inference::InferShapes(inferred);
+    } catch (...) {
+    }
+    graph = &inferred.graph();
   }
-  const GraphView view =
-      BuildGraphView(inferred.graph(), ShapeMap{}, DTypeMap{});
+  const GraphView view = BuildGraphView(*graph, ShapeMap{}, DTypeMap{});
   const Metrics metrics = onnxsim::ComputeMetrics(view);
   info.macs = metrics.macs;
   info.mem_access = metrics.mem_access;
