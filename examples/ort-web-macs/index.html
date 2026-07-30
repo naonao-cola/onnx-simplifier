@@ -1,0 +1,275 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>ONNX MACs &middot; onnxruntime-web (WASM)</title>
+    <!-- onnxruntime-web WASM runtime (exposes the global `ort`). -->
+    <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.27.0/dist/ort.min.js"></script>
+    <style>
+      :root {
+        color-scheme: light dark;
+        --bg: #f7f8fa; --panel: #ffffff; --border: #e3e6ea; --fg: #1c2024;
+        --muted: #667085; --accent: #3757ff; --accent-fg: #fff;
+        --bar: #cdd7ff; --bar-strong: #3757ff; --ok: #12805c; --warn: #b64512;
+        --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      }
+      @media (prefers-color-scheme: dark) {
+        :root {
+          --bg: #14161a; --panel: #1c1f24; --border: #2b2f36; --fg: #e6e8eb;
+          --muted: #9aa3ad; --accent: #6a86ff; --bar: #2c3763; --bar-strong: #6a86ff;
+          --ok: #3ddc97; --warn: #ff9d6b;
+        }
+      }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0; background: var(--bg); color: var(--fg);
+        font: 15px/1.5 system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+      }
+      .wrap { max-width: 960px; margin: 0 auto; padding: 28px 20px 64px; }
+      h1 { font-size: 1.5rem; margin: 0 0 4px; }
+      h2 { font-size: 1rem; margin: 28px 0 12px; }
+      .sub { color: var(--muted); margin: 0 0 20px; }
+      .sub a { color: var(--accent); }
+      .panel {
+        background: var(--panel); border: 1px solid var(--border);
+        border-radius: 12px; padding: 18px; margin-bottom: 16px;
+      }
+      .controls { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
+      button, .filebtn {
+        font: inherit; border: 1px solid var(--border); background: var(--panel);
+        color: var(--fg); padding: 8px 14px; border-radius: 8px; cursor: pointer;
+      }
+      button.primary { background: var(--accent); color: var(--accent-fg); border-color: transparent; }
+      button:disabled { opacity: .5; cursor: not-allowed; }
+      .filebtn input { display: none; }
+      label.runs { color: var(--muted); display: inline-flex; gap: 6px; align-items: center; }
+      label.runs input { width: 68px; font: inherit; padding: 6px 8px; border-radius: 6px;
+        border: 1px solid var(--border); background: var(--bg); color: var(--fg); }
+      #status { margin-top: 12px; color: var(--muted); font-size: .9rem; min-height: 1.2em; }
+      #status.err { color: var(--warn); }
+      .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; }
+      .card { background: var(--bg); border: 1px solid var(--border); border-radius: 10px; padding: 14px; }
+      .card .k { color: var(--muted); font-size: .78rem; text-transform: uppercase; letter-spacing: .04em; }
+      .card .v { font-size: 1.35rem; font-weight: 650; margin-top: 4px; font-variant-numeric: tabular-nums; }
+      .card .v small { font-size: .8rem; color: var(--muted); font-weight: 500; }
+      .hl { border-color: var(--accent); }
+      .tablewrap { overflow-x: auto; }
+      table { border-collapse: collapse; width: 100%; font-size: .92rem; }
+      th, td { text-align: right; padding: 8px 10px; border-bottom: 1px solid var(--border); white-space: nowrap; }
+      th:first-child, td:first-child { text-align: left; }
+      th { color: var(--muted); font-weight: 600; font-size: .8rem; text-transform: uppercase; letter-spacing: .03em; }
+      td.mono, .mono { font-family: var(--mono); font-variant-numeric: tabular-nums; }
+      .barcell { position: relative; }
+      .bar { position: absolute; inset: 2px auto 2px 0; background: var(--bar); border-radius: 4px; z-index: 0; }
+      .barcell span { position: relative; z-index: 1; }
+      .hidden { display: none; }
+      details summary { cursor: pointer; color: var(--accent); margin: 8px 0; }
+      code { font-family: var(--mono); background: var(--bg); padding: 1px 5px; border-radius: 5px; }
+      .note { font-size: .85rem; color: var(--muted); }
+    </style>
+  </head>
+  <body>
+    <div class="wrap">
+      <h1>ONNX MACs &times; onnxruntime-web (WASM)</h1>
+      <p class="sub">
+        Calculate the MACs / FLOPs of an ONNX model from the metrics
+        <a href="https://github.com/onnxsim/onnxsim/pull/527" target="_blank" rel="noopener">onnxsim
+        bakes into <code>metadata_props</code></a>, then run the model with
+        <strong>onnxruntime-web</strong>'s WebAssembly backend right here in the browser to see the
+        achieved throughput. Annotate any model first with
+        <code>python prepare_model.py your.onnx -o your.annotated.onnx</code>.
+      </p>
+
+      <div class="panel">
+        <div class="controls">
+          <button id="loadSample" class="primary">Load bundled sample model</button>
+          <label class="filebtn">Choose annotated .onnx&hellip;
+            <input id="file" type="file" accept=".onnx" />
+          </label>
+          <label class="runs">inference runs
+            <input id="runs" type="number" min="1" max="500" value="30" />
+          </label>
+          <button id="run" disabled>Run inference</button>
+        </div>
+        <div id="status">No model loaded.</div>
+      </div>
+
+      <div id="results" class="hidden">
+        <h2>onnxsim metrics (from <code>metadata_props</code>, PR&nbsp;#527)</h2>
+        <div class="panel"><div id="cards" class="cards"></div></div>
+
+        <h2>onnxruntime-web inference (WASM)</h2>
+        <div class="panel"><div id="perfcards" class="cards"></div>
+          <p id="perfnote" class="note"></p>
+        </div>
+
+        <h2>MACs by operator</h2>
+        <div class="panel tablewrap">
+          <table id="opTable">
+            <thead><tr><th>Operator</th><th>Nodes</th><th>MACs</th><th>FLOPs</th><th>% of MACs</th></tr></thead>
+            <tbody></tbody>
+          </table>
+          <details>
+            <summary>Per-node breakdown</summary>
+            <div class="tablewrap">
+              <table id="nodeTable">
+                <thead><tr><th>Node</th><th>Op</th><th>MACs</th><th>FLOPs</th><th>Mem access</th></tr></thead>
+                <tbody></tbody>
+              </table>
+            </div>
+          </details>
+        </div>
+      </div>
+    </div>
+
+    <script type="module">
+      import { readAnnotations, perOpSummary, buildRandomFeeds } from "./onnx-macs.js";
+
+      // Single-threaded WASM avoids the cross-origin-isolation (SharedArrayBuffer)
+      // requirement, so the demo works from a plain static file server. Point the
+      // loader at the same CDN the runtime came from.
+      ort.env.wasm.wasmPaths = "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.27.0/dist/";
+      ort.env.wasm.numThreads = 1;
+
+      const $ = (id) => document.getElementById(id);
+      const status = $("status");
+      let modelBytes = null;
+      let ann = null;
+
+      function setStatus(msg, isErr = false) {
+        status.textContent = msg;
+        status.classList.toggle("err", isErr);
+      }
+
+      // --- number formatting (1000-based for counts, 1024-based for bytes) ---
+      function human(n, base, units, suffix = "") {
+        if (n == null || !Number.isFinite(+n)) return String(n); // symbolic formula
+        n = +n;
+        for (const u of units) {
+          if (Math.abs(n) < base) return `${n.toFixed(n < 10 && u ? 1 : 0)}${u}${suffix}`;
+          n /= base;
+        }
+        return `${n.toFixed(1)}${units[units.length - 1]}${suffix}`;
+      }
+      const humanNum = (n) => human(n, 1000, ["", "K", "M", "G", "T", "P"]);
+      const humanBytes = (n) => human(n, 1024, ["", "Ki", "Mi", "Gi", "Ti"], "B");
+
+      function card(k, v, sub, hl = false) {
+        return `<div class="card${hl ? " hl" : ""}"><div class="k">${k}</div>
+          <div class="v">${v}${sub ? ` <small>${sub}</small>` : ""}</div></div>`;
+      }
+
+      function renderMetrics() {
+        const m = ann.model;
+        const macs = m.macs, flops = m.flops;
+        $("cards").innerHTML = [
+          card("MACs", humanNum(macs), Number.isFinite(+macs) ? `${(+macs).toLocaleString()}` : "", true),
+          card("FLOPs", humanNum(flops), Number.isFinite(+flops) ? `= 2 &times; MACs` : ""),
+          card("Memory access", humanBytes(m.mem_access), "read + written"),
+          card("Peak footprint", humanBytes(m.memory_footprint), "resident"),
+          card("Compute density", Number.isFinite(+m.compute_density)
+            ? (+m.compute_density).toFixed(2) : m.compute_density, "FLOP/Byte"),
+          card("Model size", humanBytes(m.model_size), ""),
+        ].join("");
+
+        const { rows, totalMacs } = perOpSummary(ann.nodes);
+        const maxMacs = Math.max(1, ...rows.map((r) => r.macs));
+        $("opTable").querySelector("tbody").innerHTML = rows.map((r) => {
+          const pct = totalMacs ? (100 * r.macs / totalMacs) : 0;
+          const w = (100 * r.macs / maxMacs).toFixed(1);
+          return `<tr>
+            <td>${r.opType}</td>
+            <td class="mono">${r.count}</td>
+            <td class="mono barcell"><div class="bar" style="width:${w}%"></div><span>${humanNum(r.macs)}</span></td>
+            <td class="mono">${humanNum(r.macs * 2)}</td>
+            <td class="mono">${pct.toFixed(1)}%</td>
+          </tr>`;
+        }).join("");
+
+        $("nodeTable").querySelector("tbody").innerHTML = ann.nodes.map((n) => `<tr>
+            <td>${n.name || "<em>(unnamed)</em>"}</td>
+            <td>${n.opType}</td>
+            <td class="mono">${n.macs != null ? humanNum(n.macs) : (n.raw.macs ?? "-")}</td>
+            <td class="mono">${n.flops != null ? humanNum(n.flops) : (n.raw.flops ?? "-")}</td>
+            <td class="mono">${n.memAccess != null ? humanBytes(n.memAccess) : (n.raw.mem_access ?? "-")}</td>
+          </tr>`).join("");
+
+        $("perfcards").innerHTML = "";
+        $("perfnote").textContent = "";
+        $("results").classList.remove("hidden");
+      }
+
+      async function loadBytes(bytes, label) {
+        modelBytes = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+        ann = readAnnotations(modelBytes);
+        if (!ann.annotated) {
+          setStatus(`${label}: no onnxsim.* metrics found. Run prepare_model.py to annotate it first.`, true);
+          $("run").disabled = true;
+          $("results").classList.add("hidden");
+          return;
+        }
+        renderMetrics();
+        $("run").disabled = false;
+        const inShapes = ann.feedInputs.map((i) => `${i.name}[${(i.dims || []).join(",")}]`).join(", ");
+        setStatus(`Loaded ${label} — ${ann.nodes.length} nodes, inputs: ${inShapes || "(none)"}. Ready to run inference.`);
+      }
+
+      async function runInference() {
+        if (!modelBytes) return;
+        const runs = Math.max(1, Math.min(500, +$("runs").value || 30));
+        $("run").disabled = true;
+        try {
+          setStatus("Creating onnxruntime-web session (WASM)…");
+          const session = await ort.InferenceSession.create(modelBytes, {
+            executionProviders: ["wasm"], graphOptimizationLevel: "all",
+          });
+          const feeds = buildRandomFeeds(ann.feedInputs, ort);
+          setStatus("Warming up…");
+          await session.run(feeds);
+          setStatus(`Running ${runs} iterations…`);
+          const t0 = performance.now();
+          for (let i = 0; i < runs; i++) await session.run(feeds);
+          const avgMs = (performance.now() - t0) / runs;
+
+          const macs = +ann.model.macs;
+          const hasMacs = Number.isFinite(macs);
+          const gflops = hasMacs ? (2 * macs) / (avgMs / 1000) / 1e9 : null;
+          const gmacs = hasMacs ? macs / (avgMs / 1000) / 1e9 : null;
+          $("perfcards").innerHTML = [
+            card("Avg latency", avgMs.toFixed(3), "ms / run", true),
+            card("Throughput", gflops != null ? gflops.toFixed(2) : "—", "GFLOP/s"),
+            card("MAC rate", gmacs != null ? gmacs.toFixed(2) : "—", "GMAC/s"),
+            card("Runs", String(runs), "iterations"),
+          ].join("");
+          $("perfnote").innerHTML = hasMacs
+            ? `Throughput = model FLOPs (<span class="mono">${(2 * macs).toLocaleString()}</span>, from PR&nbsp;#527) ÷ average latency. Backend: <code>wasm</code>, single-threaded${ort.env.wasm.simd ? " + SIMD" : ""}.`
+            : "MACs are symbolic (dynamic dimensions) — throughput needs a concrete shape.";
+          setStatus(`Done. ${avgMs.toFixed(3)} ms/run over ${runs} runs.`);
+        } catch (e) {
+          console.error(e);
+          setStatus(`Inference failed: ${e.message}`, true);
+        } finally {
+          $("run").disabled = false;
+        }
+      }
+
+      $("loadSample").addEventListener("click", async () => {
+        try {
+          setStatus("Fetching sample_model.annotated.onnx…");
+          const resp = await fetch("./sample_model.annotated.onnx");
+          if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+          await loadBytes(await resp.arrayBuffer(), "sample_model.annotated.onnx");
+        } catch (e) {
+          setStatus(`Could not fetch the sample (serve this folder over HTTP, or use "Choose file"). ${e.message}`, true);
+        }
+      });
+      $("file").addEventListener("change", async (ev) => {
+        const f = ev.target.files[0];
+        if (!f) return;
+        await loadBytes(await f.arrayBuffer(), f.name);
+      });
+      $("run").addEventListener("click", runInference);
+    </script>
+  </body>
+</html>
