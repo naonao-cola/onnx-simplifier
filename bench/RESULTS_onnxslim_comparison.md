@@ -99,19 +99,28 @@ to onnxslim is a **different, fusion-level** gap, not a folding one:
 | Gather/Slice/… | — | — | +20 | dynamic-shape plumbing |
 
 * **~106 nodes — decomposed BatchNorm (`Conv → Mul → Add`).** onnxsim's output
-  contains **53** `Conv → Mul(scale) → Add(bias)` chains where `scale`/`bias` are
+  contained **53** `Conv → Mul(scale) → Add(bias)` chains where `scale`/`bias` are
   per-channel `(1, C, 1, 1)` constants (a BatchNorm exported as an affine pair);
   onnxslim has **0** — it folds the scale into the Conv weights and the bias into
   the Conv bias. onnxoptimizer has `fuse_bn_into_conv` (for an actual
-  `BatchNormalization` node) and `fuse_add_bias_into_conv`, but no pass that
+  `BatchNormalization` node) and `fuse_add_bias_into_conv`, but had no pass that
   folds a per-channel `Mul` sitting between a `Conv` and its bias `Add`, so
-  neither the `Mul` nor the now-not-adjacent `Add` fuses. Closing this would be
-  an **onnxoptimizer** change (a `fuse_mul_into_conv`-style pass), not an onnxsim
-  one.
-* **~90 nodes — dynamic-shape plumbing.** The rest is `Gather`-from-`Shape` →
-  `Unsqueeze` → `Concat` shape arithmetic for the dynamic `height`/`width`
-  input. These depend on the runtime shape and so cannot be constant-folded;
-  onnxslim collapses more of them with dedicated shape-graph simplifications.
+  neither the `Mul` nor the now-not-adjacent `Add` fused.
+
+  This is now fixed by a **`fuse_mul_into_conv`** pass added to onnx-optimizer
+  (the `onnxsim/optimizer` companion repo). Once the `fuse_mul_into_conv` folds
+  the scale into the weights, the existing `fuse_add_bias_into_conv` absorbs the
+  bias, collapsing the whole affine tail. With that pass, FasterRCNN-10 drops
+  from **2824 → 2718** nodes (all 53 chains fused: `Mul` 119 → 66, `Add` 127 →
+  74), numerically identical to the original. It takes effect in onnxsim once the
+  bundled `third_party/onnx-optimizer` submodule is updated to include the pass.
+* **~90 nodes — dynamic-shape plumbing (kept on purpose).** The rest is
+  `Gather`-from-`Shape` → `Unsqueeze` → `Concat` shape arithmetic that carries
+  the input's `dim_param`s (`height`, `width`, and the data-dependent `nbox`).
+  These depend on the runtime shape and so **must not** be constant-folded —
+  folding them would hard-code one resolution. onnxsim correctly keeps them;
+  onnxslim collapses a few more with dedicated symbolic shape-graph rewrites, but
+  the remaining difference here is dynamic-shape bookkeeping, not dead weight.
 
 ## Verification
 
