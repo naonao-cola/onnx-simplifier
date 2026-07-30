@@ -57,7 +57,7 @@ endif()
 # configure onnx-optimizer after onnxruntime, because they both depend on onnx and onnxruntime has its own flags for onnx
 add_subdirectory(third_party/onnx-optimizer EXCLUDE_FROM_ALL)
 
-add_library(onnxsim onnxsim/onnxsim.cpp onnxsim/contrib_schemas.cpp onnxsim/function_rewriter.cpp onnxsim/profiler.cpp onnxsim/model_info.cpp onnxsim/sym_expr.cpp)
+add_library(onnxsim onnxsim/onnxsim.cpp onnxsim/contrib_schemas.cpp onnxsim/function_rewriter.cpp onnxsim/profiler.cpp onnxsim/model_info.cpp onnxsim/sym_expr.cpp onnxsim/model_metrics.cpp)
 if (ONNXSIM_BUILTIN_ORT)
   target_include_directories(onnxsim PRIVATE ${ONNXRUNTIME_INCLUDE_DIR})
 endif()
@@ -177,4 +177,9 @@ if (ONNXSIM_TESTS)
   add_executable(sym_expr_test onnxsim/sym_expr_test.cpp onnxsim/sym_expr.cpp)
   target_include_directories(sym_expr_test PRIVATE onnxsim)
   add_test(NAME sym_expr_test COMMAND sym_expr_test)
+
+  add_executable(model_metrics_test onnxsim/model_metrics_test.cpp
+                                    onnxsim/model_metrics.cpp onnxsim/sym_expr.cpp)
+  target_include_directories(model_metrics_test PRIVATE onnxsim)
+  add_test(NAME model_metrics_test COMMAND model_metrics_test)
 endif()

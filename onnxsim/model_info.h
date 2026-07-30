@@ -6,37 +6,56 @@
 #include <map>
 #include <string>
 
-// A lightweight, dependency-free counterpart to the Python ``ModelInfo`` for
-// the non-Python bindings (the CLI binary, the C ABI / Rust wrapper, and the
-// WASM converter). It reports the two metrics that can be derived from a
-// ``ModelProto`` alone, without ONNX shape inference:
+#include "model_metrics.h"
+
+// A dependency-free counterpart to the Python ``ModelInfo`` for the non-Python
+// bindings (the CLI binary, the C ABI / Rust wrapper, and the WASM converter).
+// It reports:
 //
 //   * ``op_nums`` -- how many of each op type the model contains, recursing
-//   into
-//     control-flow subgraphs. Initializers are folded into the ``Constant``
-//     count, exactly as the Python ``ModelInfo`` does, so a weight tensor reads
-//     as a constant.
+//     into control-flow subgraphs. Initializers are folded into the
+//     ``Constant`` count, exactly as the Python ``ModelInfo`` does, so a weight
+//     tensor reads as a constant.
 //   * ``model_size`` -- the serialized byte size of the graph plus any tensor
 //     data kept in external files (read from the external-data metadata, so
 //     weights on disk are counted without being materialized).
+//   * ``macs`` / FLOPs -- multiply-accumulates of the compute-dominant
+//     operators (Conv, ConvTranspose, Gemm, MatMul, Attention, and the
+//     quantized twins), from ONNX shape inference. A dynamic dimension
+//     (dim_param, e.g. "batch") stays symbolic via ``SymExpr``, so these may be
+//     a formula rather than a number. Nodes whose shapes cannot be inferred
+//     contribute 0. FLOPs are 2 * MACs.
+//   * ``mem_access`` / ``memory_footprint`` -- forward-pass memory traffic
+//     (every input and output touched) and the peak bytes resident at once
+//     (weights plus live activations), from the same inferred shapes.
 //
-// The heavier metrics the Python table also shows (MACs / FLOPs and the memory
-// figures) require full shape inference and a symbolic-math dependency, so they
-// are intentionally out of scope for these bindings.
+// Unlike the Python ``ModelInfo`` this does not expand/inline function bodies,
+// so compute inside a function op is not yet counted (a follow-up); the op
+// count still lists the function op itself.
 struct ModelInfo {
   std::map<std::string, int64_t> op_nums;
   int64_t model_size = 0;
+  onnxsim::SymExpr macs;
+  onnxsim::SymExpr mem_access;
+  onnxsim::SymExpr memory_footprint;
+
+  // FLOPs are two per MAC (one multiply, one add).
+  onnxsim::SymExpr Flops() const { return macs * onnxsim::SymExpr(2); }
 };
 
-// Compute the op counts and model size of ``model``.
+// Compute the metrics of ``model``. The model is not modified; shape inference
+// (needed for the compute/memory metrics) runs on an internal copy.
 ModelInfo GetModelInfo(const onnx::ModelProto& model);
 
 // Render an ASCII table comparing an original and a simplified model, mirroring
 // the layout of the Python ``print_simplifying_info``: one row per op type (the
-// sorted union of both models' ops) followed by a ``Model Size`` row, with
-// columns for the original and simplified values. A metric that improved (a
-// dropped op count or a smaller model) is flagged with a trailing ``*``, since
-// these bindings print to plain terminals where the Python rich-text colouring
-// is unavailable. The returned string ends with a newline.
+// sorted union of both models' ops), then ``Model Size``, ``MACs``, ``FLOPs``,
+// ``Memory Access``, ``Memory Footprint`` and ``Compute Density``, with columns
+// for the original and simplified values. A metric that improved (a dropped op
+// count, or a smaller size / MACs / memory figure) is flagged with a trailing
+// ``*``, since these bindings print to plain terminals where the Python
+// rich-text colouring is unavailable. Compute density is reported without a
+// flag (a change there is not strictly better or worse). The returned string
+// ends with a newline.
 std::string FormatSimplifyingInfo(const onnx::ModelProto& model_ori,
                                   const onnx::ModelProto& model_opt);
