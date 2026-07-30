@@ -6,8 +6,10 @@
 
 #include <mutex>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
+#include "onnx/defs/data_propagators.h"
 #include "onnx/defs/schema.h"
 #include "onnx/defs/shape_inference.h"
 
@@ -17,8 +19,43 @@ namespace {
 
 constexpr const char* kMSDomain = "com.microsoft";
 
+using onnx::DataPropagationContext;
 using onnx::InferenceContext;
 using onnx::OpSchema;
+
+// Attach a data-propagation function to `Reshape`. ONNX ships data-propagation
+// functions for the shape family (Shape, Gather, Concat, Slice, Squeeze,
+// Unsqueeze, Add/Sub/Mul, ...) but not for Reshape, so a shape tensor threaded
+// through a Reshape -- e.g. `Shape(x) -> Reshape(., [-1]) -> Gather(...)` --
+// loses its propagated value there and downstream shape arithmetic stops
+// folding.
+//
+// A Reshape only rearranges a tensor's dims; it never changes the number of
+// elements or their row-major order. Data propagation tracks a shape tensor's
+// *value* as a flat, ordered list of its elements, so that list is invariant
+// under a Reshape and can be copied straight through -- the same reasoning, and
+// the same helper (PropagateShapeDataFromInputToOutput), that ONNX uses for
+// Squeeze/Unsqueeze, which likewise only add or remove size-1 axes.
+//
+// The schema objects are owned by the registry and Schema() returns a pointer
+// into that storage, so we const_cast to augment them in place. Data
+// propagation only runs when explicitly enabled (onnxsim's partial-shape pass),
+// so this never affects ordinary shape inference.
+void RegisterReshapeDataPropagation() {
+  std::unordered_set<const OpSchema*> augmented;
+  for (int ver = 1; ver <= 64; ++ver) {
+    const OpSchema* schema =
+        onnx::OpSchemaRegistry::Schema("Reshape", ver, onnx::ONNX_DOMAIN);
+    if (schema == nullptr || augmented.count(schema)) {
+      continue;
+    }
+    augmented.insert(schema);
+    const_cast<OpSchema*>(schema)->PartialDataPropagationFunction(
+        [](DataPropagationContext& ctx) {
+          onnx::PropagateShapeDataFromInputToOutput(ctx, 0);
+        });
+  }
+}
 
 // Shape/type inference for the element-wise binary quantized ops (QLinearAdd,
 // QLinearMul). Inputs are laid out as
@@ -213,6 +250,10 @@ void RegisterAll() {
   RegisterIfAbsent(
       MakeQLinearUnarySchema("QLinearLeakyRelu", /*has_alpha=*/true));
   RegisterIfAbsent(MakeQLinearConcatSchema());
+
+  // Augment the standard Reshape schema with a data-propagation function so
+  // shape tensors can flow through a Reshape during partial shape evaluation.
+  RegisterReshapeDataPropagation();
 }
 
 }  // namespace
