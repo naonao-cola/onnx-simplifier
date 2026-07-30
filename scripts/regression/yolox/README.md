@@ -11,6 +11,13 @@ node-count reduction, validity, wall-clock, and peak RSS — the same
 "what counts as a failure" definition as the onnxmodelzoo harness one level up
 in [`scripts/regression/`](../README.md).
 
+Each graph is **also** run through
+[`onnxslim`](https://github.com/inisis/OnnxSlim) on the same export, purely for
+comparison (node reduction, timing, and a best-effort `model_check=True`
+equivalence check). As in the onnxmodelzoo harness, onnxsim is the only arm that
+gates the run — onnxslim outcomes are recorded but never fail it. Set
+`SLIM_CHECK=0` to skip onnxslim's equivalence check.
+
 Unlike that harness (which downloads ready-made ONNX from Hugging Face), YOLOX
 ships as PyTorch, so this one needs torch + the YOLOX source to produce the
 graph before handing it to onnxsim.
@@ -18,8 +25,8 @@ graph before handing it to onnxsim.
 ## Running
 
 ```bash
-# onnxsim under test + its runtime deps
-pip install onnx onnxruntime .          # or an onnxsim wheel
+# onnxsim under test + its runtime deps, plus the onnxslim comparison arm
+pip install onnx onnxruntime onnxslim .   # or an onnxsim wheel
 
 # export toolchain (not onnxsim deps)
 pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu

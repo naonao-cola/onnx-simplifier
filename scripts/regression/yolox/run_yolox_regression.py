@@ -8,17 +8,22 @@ exports the torch model to a *raw* ONNX graph, then runs ``onnxsim.simplify``
 with its built-in correctness check (``check_n``) and records the node-count
 reduction, validity, wall-clock and peak RSS.
 
-A variant *fails* when onnxsim crashes/aborts, hangs, or the simplified graph
+Each graph is **also** run through `onnxslim <https://github.com/inisis/OnnxSlim>`_
+on the same export, purely for comparison -- exactly as the onnxmodelzoo harness
+does. onnxslim's numbers (node reduction, timing, best-effort equivalence check)
+are recorded but **never** gate the run.
+
+A variant *fails* when **onnxsim** crashes/aborts, hangs, or the simplified graph
 does not pass onnxsim's own check -- the same failure definition as the
-onnxmodelzoo harness in ``scripts/regression/``. Node-count drift is reported
-but never fails the run.
+onnxmodelzoo harness in ``scripts/regression/``. Node-count drift and any
+onnxslim outcome are reported but never fail the run.
 
 Requirements (not onnxsim deps -- install separately):
 
     pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
     pip install loguru thop tabulate tqdm psutil opencv-python-headless
     git clone --depth 1 https://github.com/Megvii-BaseDetection/YOLOX.git
-    pip install onnx onnxruntime .   # onnxsim under test
+    pip install onnx onnxruntime onnxslim .   # onnxsim under test + comparison arm
 
 Then, with the YOLOX checkout on PYTHONPATH:
 
@@ -70,6 +75,40 @@ def maybe_download(weights_dir):
 
 def op_hist(model):
     return Counter(n.op_type for n in model.graph.node)
+
+
+def run_onnxslim(raw_path, raw_nodes):
+    """Comparison arm: optimize with onnxslim + a best-effort equivalence check.
+
+    Mirrors scripts/regression/worker.py -- slim() mutates its input so each call
+    gets a pristine reload, and model_check=True returns None when the slimmed
+    graph fails onnxslim's own onnxruntime check. A check that *errors* (e.g. the
+    model needs explicit input shapes) leaves validity unknown rather than
+    counting as an onnxslim failure. Never affects the run's exit code.
+    """
+    import onnxslim
+    out = {}
+    try:
+        t0 = time.perf_counter()
+        model_simp = onnxslim.slim(onnx.load(raw_path))
+        out["slim_seconds"] = round(time.perf_counter() - t0, 2)
+        out["slim_simp_nodes"] = len(model_simp.graph.node)
+        out["slim_reduction_pct"] = round(
+            100.0 * (raw_nodes - out["slim_simp_nodes"]) / raw_nodes, 1
+        )
+        out["slim_status"] = "ok"
+    except Exception as e:
+        out["slim_status"] = "error"
+        out["slim_error"] = f"{type(e).__name__}: {e}"
+        return out
+    if os.environ.get("SLIM_CHECK", "1") != "0":
+        try:
+            checked = onnxslim.slim(onnx.load(raw_path), model_check=True)
+            out["slim_valid"] = checked is not None
+        except Exception as e:
+            out["slim_valid"] = None  # unknown, not a failure
+            out["slim_check_error"] = f"{type(e).__name__}: {e}"
+    return out
 
 
 def export_raw(exp_name, ckpt_path, out_path, opset):
@@ -124,6 +163,14 @@ def run_one(exp_name, ckpt_path, workdir, opset):
     rec["peak_rss_mb"] = round(
         resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024, 1
     )
+
+    # Comparison arm -- only if onnxsim got a raw graph to work from.
+    if "raw_nodes" in rec:
+        try:
+            rec.update(run_onnxslim(raw_path, rec["raw_nodes"]))
+        except Exception as e:  # onnxslim not installed, ...
+            rec["slim_status"] = "error"
+            rec["slim_error"] = f"{type(e).__name__}: {e}"
     return rec
 
 
@@ -149,9 +196,11 @@ def main():
         print(json.dumps(rec, indent=2), flush=True)
         rows.append(rec)
 
-    fields = ["variant", "opset", "input_hw", "raw_nodes", "simp_nodes",
-              "reduction_pct", "valid", "seconds", "peak_rss_mb", "status",
-              "top_ops_removed", "error"]
+    fields = ["variant", "opset", "input_hw", "raw_nodes",
+              "simp_nodes", "reduction_pct", "valid", "seconds",
+              "slim_simp_nodes", "slim_reduction_pct", "slim_valid",
+              "slim_seconds", "slim_status",
+              "peak_rss_mb", "status", "top_ops_removed", "error", "slim_error"]
     with open(args.output, "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=fields)
         w.writeheader()
