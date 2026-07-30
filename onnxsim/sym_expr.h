@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <iterator>
 #include <map>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -91,6 +92,13 @@ class SymExpr {
     return a;
   }
 
+  // a - b, needed by shape arithmetic (Slice's end - start, Sub) and by
+  // TryEqual below. Defined as a + (-1)*b to reuse the existing operators.
+  friend SymExpr operator-(SymExpr a, const SymExpr& b) {
+    a += SymExpr(-1) * b;
+    return a;
+  }
+
   friend SymExpr operator*(const SymExpr& a, const SymExpr& b) {
     SymExpr r;
     for (const auto& [m1, c1] : a.terms_) {
@@ -127,6 +135,29 @@ class SymExpr {
   // Invariant: no entry has a zero coefficient; every Monomial key is sorted.
   std::map<Monomial, std::int64_t> terms_;
 };
+
+// Exact division num / den, for the symbolic *shape* evaluation that a
+// data-propagation pass needs (distinct from model_info's MAC formulas). The
+// canonical case is Reshape's -1 sentinel, resolved as
+//   total // non_deferred_size   e.g.  (batch*1024*128) // (1024*128) -> batch
+// and strided/pooled dims. Divisors there are always a single term (a product
+// of dimensions times a constant), so only single-term `den` is supported.
+//
+// Returns the quotient q with q*den == num when den divides num exactly (every
+// term's coefficient divisible by den's, and den's monomial a sub-multiset of
+// each term's); std::nullopt when it does not divide evenly or den is a genuine
+// polynomial sum. Never guesses -- an undecidable division stays unresolved so
+// the caller leaves that shape symbolic rather than folding something wrong.
+std::optional<SymExpr> TryExactDivide(const SymExpr& num, const SymExpr& den);
+
+// Decidable equality for Equal/Where in shape evaluation. a == b iff a - b ==
+// 0:
+//   - structurally equal (a - b is 0)             -> true
+//   - concrete, non-zero difference (e.g. 512,1024) -> false
+//   - symbolic difference (e.g. batch vs 512)       -> std::nullopt (unknown)
+// The unknown case is deliberate: a Where whose condition can't be decided
+// leaves its output unresolved rather than picking a branch that may be wrong.
+std::optional<bool> TryEqual(const SymExpr& a, const SymExpr& b);
 
 // compute_density = flops / mem_access is the one metric that is a *ratio* of
 // two polynomials rather than a polynomial, so it gets its own small type. When

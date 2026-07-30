@@ -53,6 +53,49 @@ int main() {
   const SymRatio dens_partial(batch * seq, batch + seq);
   assert(dens_partial.str() == "batch*seq/(batch + seq)");
 
+  // --- subtraction (shape arithmetic: Slice end-start, Sub) ---------------
+  assert((SymExpr(5) - SymExpr(3)).to_int() == 2);
+  assert((SymExpr(2) * batch - batch).str() == "batch");
+
+  // --- exact division: Reshape's -1, (batch*1024*128) // (1024*128) -> batch
+  {
+    const SymExpr total = batch * SymExpr(1024) * SymExpr(128);
+    const SymExpr non_deferred = SymExpr(1024) * SymExpr(128);
+    const auto q = onnxsim::TryExactDivide(total, non_deferred);
+    assert(q.has_value() && q->str() == "batch");
+  }
+  // divide a polynomial by a shared symbol: (512*batch*seq + 8*batch)/batch
+  {
+    const SymExpr n = SymExpr(512) * batch * seq + SymExpr(8) * batch;
+    const auto q = onnxsim::TryExactDivide(n, batch);
+    assert(q.has_value() && q->str() == "512*seq + 8");
+  }
+  // not evenly divisible -> nullopt: (batch + seq) / seq (batch term has no
+  // seq)
+  assert(!onnxsim::TryExactDivide(batch + seq, seq).has_value());
+  // coefficient not divisible -> nullopt: (3*batch) / 2
+  assert(!onnxsim::TryExactDivide(SymExpr(3) * batch, SymExpr(2)).has_value());
+  // a genuine polynomial (multi-term) divisor is unsupported -> nullopt
+  assert(!onnxsim::TryExactDivide(batch * seq, batch + seq).has_value());
+  // 0 / anything -> 0
+  assert(onnxsim::TryExactDivide(SymExpr(0), batch)->is_zero());
+
+  // --- decidable equality for Equal/Where ---------------------------------
+  {
+    auto e = onnxsim::TryEqual(SymExpr(512), SymExpr(512));
+    assert(e.has_value() && *e);  // equal concretes -> true
+  }
+  {
+    auto e = onnxsim::TryEqual(SymExpr(512), SymExpr(1024));
+    assert(e.has_value() && !*e);  // unequal concretes -> false
+  }
+  {
+    auto e = onnxsim::TryEqual(batch, batch);
+    assert(e.has_value() && *e);  // structurally identical -> true
+  }
+  // symbolic vs constant is undecidable -> nullopt (Where leaves it unresolved)
+  assert(!onnxsim::TryEqual(batch, SymExpr(512)).has_value());
+
   std::cout << "all SymExpr tests passed\n";
   std::cout << "  macs           = " << macs.str() << "\n";
   std::cout << "  macs (factored)= " << macs.str_factored() << "\n";
