@@ -75,8 +75,9 @@ The script is a thin wrapper; the manual flow is:
 COVERAGE=1 python3 -m pip install -e . --no-build-isolation
 
 # 2. clear stale C++ profiles, then run the suite under coverage.py
+#    (--cov-branch so the Python side reports branch coverage, not just lines)
 find .setuptools-cmake-build -name '*.gcda' -delete
-python3 -m pytest --cov=onnxsim --cov-report=term-missing tests
+python3 -m pytest --cov=onnxsim --cov-branch --cov-report=term-missing tests
 
 # 3. collect the C++ side
 gcovr --root . --filter onnxsim/ --exclude '.*third_party.*' \
