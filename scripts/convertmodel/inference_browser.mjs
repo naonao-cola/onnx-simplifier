@@ -14,6 +14,14 @@
 import { runInference } from "./inference_core.mjs";
 import { summarizeOrtTrace } from "./trace_build.mjs";
 import { renderTrace } from "./trace_viewer.mjs";
+import {
+  readAnnotations,
+  perOpSummary,
+  humanNum,
+  humanBytes,
+  humanDensity,
+  throughput,
+} from "./macs.mjs";
 
 const ORT_VERSION = "1.27.0";
 const ORT_BASE = `https://cdn.jsdelivr.net/npm/onnxruntime-web@${ORT_VERSION}/dist/`;
@@ -112,6 +120,79 @@ async function resolveModelBytes(source, fileInput) {
   };
 }
 
+// Render the onnxsim MAC/FLOP metrics (onnxsim PR #527) that travel inside the
+// model's `metadata_props`, plus the throughput implied by the measured average
+// latency. `res` may be null (metrics shown before/without a run). When the
+// model carries no onnxsim.* metrics the container is cleared and a hint is
+// logged instead.
+function renderMacs(container, log, bytes, res) {
+  if (!container) return;
+  let ann;
+  try {
+    ann = readAnnotations(bytes);
+  } catch (e) {
+    container.innerHTML = "";
+    log(`could not read onnxsim metrics: ${e && e.message ? e.message : e}`);
+    return;
+  }
+  if (!ann.annotated) {
+    container.innerHTML = "";
+    log(
+      "no onnxsim MAC metrics in this model — annotate it first with " +
+        "onnxsim.model_info.annotate_metadata (see onnxsim PR #527).",
+    );
+    return;
+  }
+
+  const m = ann.model;
+  const tp = res ? throughput(m, res.avgMs) : null;
+  const cards = [
+    ["MACs", humanNum(m.macs), Number.isFinite(+m.macs) ? (+m.macs).toLocaleString() : ""],
+    ["FLOPs", humanNum(m.flops), "= 2 × MACs"],
+    ["Memory access", humanBytes(m.mem_access), "read + written"],
+    ["Peak footprint", humanBytes(m.memory_footprint), "resident"],
+    ["Compute density", m.compute_density != null ? humanDensity(m.compute_density) : "—", ""],
+    ["Model size", humanBytes(m.model_size), ""],
+  ];
+  if (tp) {
+    cards.push(["Throughput", `${tp.gflops.toFixed(2)} GFLOP/s`, `avg ${res.avgMs.toFixed(2)} ms on '${res.ep}'`]);
+    cards.push(["MAC rate", `${tp.gmacs.toFixed(2)} GMAC/s`, ""]);
+  }
+
+  const { rows, totalMacs } = perOpSummary(ann.nodes);
+  const cardHtml = cards
+    .map(
+      ([k, v, sub]) =>
+        `<div class="macs-card"><div class="macs-k">${k}</div>` +
+        `<div class="macs-v">${v}${sub ? ` <small>${sub}</small>` : ""}</div></div>`,
+    )
+    .join("");
+  const opRows = rows
+    .map((r) => {
+      const pct = totalMacs ? (100 * r.macs) / totalMacs : 0;
+      return (
+        `<tr><td>${r.opType}</td><td>${r.count}</td>` +
+        `<td>${humanNum(r.macs)}</td><td>${humanNum(r.macs * 2)}</td>` +
+        `<td>${pct.toFixed(1)}%</td></tr>`
+      );
+    })
+    .join("");
+  container.innerHTML =
+    `<div class="macs-cards">${cardHtml}</div>` +
+    `<table class="macs-table"><thead><tr><th>Operator</th><th>Nodes</th>` +
+    `<th>MACs</th><th>FLOPs</th><th>% of MACs</th></tr></thead><tbody>${opRows}</tbody></table>` +
+    `<p class="macs-note">Metrics read from the model's <code>metadata_props</code> ` +
+    `(onnxsim <a href="https://github.com/onnxsim/onnxsim/pull/527" target="_blank" rel="noopener">PR #527</a>). ` +
+    `Throughput = model FLOPs ÷ average onnxruntime-web latency.</p>`;
+
+  const macsStr = Number.isFinite(+m.macs) ? (+m.macs).toLocaleString() : m.macs;
+  if (tp) {
+    log(`MACs: ${macsStr} → ${tp.gflops.toFixed(2)} GFLOP/s at ${res.avgMs.toFixed(2)} ms/iter (from PR #527 metadata)`);
+  } else {
+    log(`MACs: ${macsStr} (from onnxsim metadata_props, PR #527)`);
+  }
+}
+
 export function initInferencePanel() {
   const btn = document.getElementById("run-inference");
   const out = document.getElementById("inference-output");
@@ -121,6 +202,7 @@ export function initInferencePanel() {
   const sourceSelect = document.getElementById("inference-source");
   const profileChk = document.getElementById("inference-profile");
   const traceContainer = document.getElementById("inference-trace");
+  const macsContainer = document.getElementById("inference-macs");
   if (!btn) return;
 
   const log = (msg) => {
@@ -131,6 +213,7 @@ export function initInferencePanel() {
     btn.disabled = true;
     out.textContent = "";
     if (traceContainer) traceContainer.innerHTML = "";
+    if (macsContainer) macsContainer.innerHTML = "";
     try {
       const source = sourceSelect ? sourceSelect.value : "original";
       const { bytes, label } = await resolveModelBytes(source, fileInput);
@@ -138,6 +221,9 @@ export function initInferencePanel() {
       const preferWebGPU = epSelect.value === "webgpu";
       const profile = !profileChk || profileChk.checked;
       log(`running ${label}`);
+      // Static MACs/FLOPs from the model's onnxsim metadata_props (PR #527),
+      // shown before the run so they appear even if inference fails.
+      renderMacs(macsContainer, log, bytes, null);
       log(`loading onnxruntime-web ${ORT_VERSION}…`);
       const res = await runOnModel(
         bytes,
@@ -148,6 +234,8 @@ export function initInferencePanel() {
         `PASS: ${res.iterations} iterations on '${res.ep}', deterministic ` +
           `(avg ${res.avgMs.toFixed(2)} ms/iter)`,
       );
+      // Re-render with the measured latency to add achieved throughput.
+      renderMacs(macsContainer, () => {}, bytes, res);
       if (profile && res.trace && traceContainer) {
         const runs = res.timings.map((durMs, index) => ({ index, startMs: 0, durMs }));
         const s = summarizeOrtTrace({ runs, kernels: res.kernels || [] });
