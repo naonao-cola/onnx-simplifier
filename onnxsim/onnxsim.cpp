@@ -884,7 +884,75 @@ void _EvalPartialShape(onnx::ModelProto& model) {
     folded_values.emplace(output, std::move(tp));
   }
 
-  if (folded_values.empty()) {
+  // Data propagation for `Reshape` (single dynamic dim). The fully-known folder
+  // above only rewrites a node whose propagated value is entirely concrete, so
+  // a shape tensor that keeps one symbolic entry -- e.g. `[batch, 1024, 128]`
+  // on a graph with a dynamic batch, or `[?, 768]` with a dynamic sequence
+  // length -- is left alone, and with it the whole `Shape -> Gather -> Concat`
+  // subgraph that computes it at runtime. Those single-dynamic-dim reshapes
+  // dominate transformer and speech graphs.
+  //
+  // When a Reshape's shape input propagates to a value with exactly one unknown
+  // entry and all other entries positive constants, materialize the shape as a
+  // constant with the unknown slot set to -1. ONNX Reshape infers the -1 dim
+  // from the total element count, so for every input the result is identical to
+  // the runtime-computed shape, while the shape-producing subgraph becomes dead
+  // and is removed by the optimizer. (Correctness is still gated by onnxsim's
+  // own equivalence check.)
+  struct ReshapeShapeFix {
+    std::string shape_name;
+    onnx::TensorProto shape_tensor;
+  };
+  std::unordered_map<std::string, ReshapeShapeFix> reshape_fixes;
+  for (const auto& node : model.graph().node()) {
+    if (node.op_type() != "Reshape" || node.input_size() < 2 ||
+        node.output_size() != 1) {
+      continue;
+    }
+    auto data_iter = data_map.find(node.input(1));
+    if (data_iter == data_map.end()) {
+      continue;
+    }
+    const onnx::TensorShapeProto& shape_value = data_iter->second;
+    if (shape_value.dim_size() == 0) {
+      continue;
+    }
+    int unknown = 0;
+    bool usable = true;
+    std::vector<int64_t> shape;
+    shape.reserve(shape_value.dim_size());
+    for (const auto& dim : shape_value.dim()) {
+      if (dim.has_dim_value()) {
+        // A non-positive entry is a literal 0 (copy-dim) or an already
+        // materialized -1; leave those for the ordinary folder.
+        if (dim.dim_value() <= 0) {
+          usable = false;
+          break;
+        }
+        shape.push_back(dim.dim_value());
+      } else {
+        ++unknown;
+        shape.push_back(-1);
+      }
+    }
+    // Exactly one unknown dim maps to Reshape's single -1 sentinel. Zero
+    // unknowns is handled by the fully-known folder above; two or more cannot
+    // be expressed with a single -1.
+    if (!usable || unknown != 1) {
+      continue;
+    }
+    onnx::TensorProto tp;
+    tp.set_data_type(onnx::TensorProto::INT64);
+    tp.add_dims(static_cast<int64_t>(shape.size()));
+    for (int64_t v : shape) {
+      tp.add_int64_data(v);
+    }
+    reshape_fixes.emplace(
+        node.output(0),
+        ReshapeShapeFix{node.output(0) + "_dp_shape", std::move(tp)});
+  }
+
+  if (folded_values.empty() && reshape_fixes.empty()) {
     restore();
     return;
   }
@@ -898,18 +966,38 @@ void _EvalPartialShape(onnx::ModelProto& model) {
   for (auto& node : original_nodes) {
     auto iter = node.output_size() == 1 ? folded_values.find(node.output(0))
                                         : folded_values.end();
-    if (iter == folded_values.end()) {
-      *model.mutable_graph()->add_node() = std::move(node);
+    if (iter != folded_values.end()) {
+      onnx::NodeProto* constant = model.mutable_graph()->add_node();
+      constant->set_name(node.name());
+      constant->set_op_type("Constant");
+      constant->add_output(iter->first);
+      onnx::AttributeProto* attr = constant->add_attribute();
+      attr->set_name("value");
+      attr->set_type(onnx::AttributeProto::TENSOR);
+      *attr->mutable_t() = std::move(iter->second);
       continue;
     }
-    onnx::NodeProto* constant = model.mutable_graph()->add_node();
-    constant->set_name(node.name());
-    constant->set_op_type("Constant");
-    constant->add_output(iter->first);
-    onnx::AttributeProto* attr = constant->add_attribute();
-    attr->set_name("value");
-    attr->set_type(onnx::AttributeProto::TENSOR);
-    *attr->mutable_t() = std::move(iter->second);
+    auto fix_iter = node.output_size() == 1 ? reshape_fixes.find(node.output(0))
+                                            : reshape_fixes.end();
+    if (fix_iter != reshape_fixes.end()) {
+      // Emit the materialized shape as a Constant just before the Reshape
+      // (preserving topological order), then repoint the Reshape's shape input
+      // at it. The original shape-producing subgraph is now unused and is
+      // cleaned up by the optimizer's dead-node elimination.
+      onnx::NodeProto* shape_const = model.mutable_graph()->add_node();
+      shape_const->set_op_type("Constant");
+      shape_const->add_output(fix_iter->second.shape_name);
+      onnx::AttributeProto* attr = shape_const->add_attribute();
+      attr->set_name("value");
+      attr->set_type(onnx::AttributeProto::TENSOR);
+      *attr->mutable_t() = std::move(fix_iter->second.shape_tensor);
+
+      onnx::NodeProto* reshape = model.mutable_graph()->add_node();
+      *reshape = std::move(node);
+      reshape->set_input(1, fix_iter->second.shape_name);
+      continue;
+    }
+    *model.mutable_graph()->add_node() = std::move(node);
   }
 }
 

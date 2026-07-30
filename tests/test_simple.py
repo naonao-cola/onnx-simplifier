@@ -270,6 +270,44 @@ def test_partial_shape_evaluation_keeps_dynamic_gather():
     assert _constant_value(sim_model, "g") is None
 
 
+def test_partial_shape_evaluation_reshape_single_dynamic_dim():
+    # Data propagation for Reshape: the target shape is computed at runtime from
+    # the input's shape (Shape -> Gather -> Concat), and it has a single dynamic
+    # entry (the batch) plus otherwise-static dimensions. Partial shape
+    # evaluation propagates that shape to [batch, 60], and the Reshape pass
+    # materializes it as the constant [-1, 60] -- the single -1 lets ONNX infer
+    # the dynamic dim from the total element count, which is provably equivalent
+    # -- so the whole Shape -> Gather -> Concat scaffolding collapses away.
+    x = helper.make_tensor_value_info("x", TensorProto.FLOAT, ["batch", 3, 4, 5])
+    y = helper.make_tensor_value_info("y", TensorProto.FLOAT, ["batch", 60])
+    idx0 = helper.make_tensor("idx0", TensorProto.INT64, [1], [0])
+    sixty = helper.make_tensor("sixty", TensorProto.INT64, [1], [60])  # 3*4*5
+    nodes = [
+        helper.make_node("Shape", ["x"], ["s"]),
+        helper.make_node("Gather", ["s", "idx0"], ["b"], axis=0),
+        helper.make_node("Concat", ["b", "sixty"], ["newshape"], axis=0),
+        helper.make_node("Reshape", ["x", "newshape"], ["y"]),
+    ]
+    graph = helper.make_graph(nodes, "g", [x], [y], initializer=[idx0, sixty])
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+    onnx.checker.check_model(model)
+
+    sim_model, check_ok = onnxsim.simplify(model)
+    assert check_ok
+    onnx.checker.check_model(sim_model)
+    op_types = [n.op_type for n in sim_model.graph.node]
+    # The runtime shape computation is gone; only the Reshape (fed by a constant
+    # shape) survives.
+    assert "Shape" not in op_types
+    assert "Gather" not in op_types
+    assert "Concat" not in op_types
+    reshape = [n for n in sim_model.graph.node if n.op_type == "Reshape"]
+    assert len(reshape) == 1
+    shape_value = _constant_value(sim_model, reshape[0].input[1])
+    assert shape_value is not None
+    assert list(shape_value) == [-1, 60]
+
+
 def test_unfoldable_const_node_keeps_topological_order():
     # A const node (all-constant inputs) that fails to fold must keep its
     # original position. Here SequenceEmpty is treated as a const node; its
