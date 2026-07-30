@@ -89,9 +89,9 @@ class Evaluator {
   // The int list carried by attribute `attr_name`, else by input `input_index`
   // (opset >= 13 moved several of these axis/starts/ends operands to inputs).
   // Requires every element to be concrete.
-  std::optional<std::vector<int64_t>> IntListOperand(const SymNode& node,
-                                                     const std::string& attr_name,
-                                                     std::size_t input_index) const {
+  std::optional<std::vector<int64_t>> IntListOperand(
+      const SymNode& node, const std::string& attr_name,
+      std::size_t input_index) const {
     if (const SymAttr* a = node.attr(attr_name)) return a->ints;
     if (input_index < node.input.size()) {
       if (const SymTensor* t = Value(node.input[input_index])) {
@@ -132,14 +132,16 @@ class Evaluator {
     if (op == "Range") return EvalRange(node);
     if (op == "ReduceProd") return EvalReduceProd(node);
     if (op == "Tile") return EvalTile(node);
-    if (op == "Transpose") return EvalUnary(node, [](const SymExpr& e) {
-      return e;  // rank <= 1 transpose is the identity
-    });
+    if (op == "Transpose")
+      return EvalUnary(node, [](const SymExpr& e) {
+        return e;  // rank <= 1 transpose is the identity
+      });
     if (op == "Expand") return EvalExpand(node);
     if (op == "Neg")
       return EvalUnary(node, [](const SymExpr& e) { return SymExpr(0) - e; });
     if (op == "Floor")
-      return EvalUnary(node, [](const SymExpr& e) { return e; });  // integer data
+      return EvalUnary(node,
+                       [](const SymExpr& e) { return e; });  // integer data
     if (op == "Add" || op == "Sub" || op == "Mul" || op == "Div")
       return EvalArithmetic(node);
     if (op == "Equal") return EvalEqual(node);
@@ -171,7 +173,8 @@ class Evaluator {
     if (it == graph_.shape.end()) return std::nullopt;
     const std::vector<SymExpr>& dims = it->second;
     const int64_t rank = static_cast<int64_t>(dims.size());
-    // Optional start/end slice of the shape (opset 15+). Defaults span the rank.
+    // Optional start/end slice of the shape (opset 15+). Defaults span the
+    // rank.
     int64_t start = IntAttr(node, "start", 0).value();
     int64_t end = IntAttr(node, "end", rank).value();
     if (start < 0) start += rank;
@@ -247,8 +250,9 @@ class Evaluator {
     if (node.input.empty()) return std::nullopt;
     const SymTensor* data = Value(node.input[0]);
     if (!data) return std::nullopt;
-    if (data->scalar) return *data;                       // already rank 0
-    if (data->size() == 1) return SymTensor::Scalar(data->data[0]);  // [1] -> ()
+    if (data->scalar) return *data;  // already rank 0
+    if (data->size() == 1)
+      return SymTensor::Scalar(data->data[0]);  // [1] -> ()
     return std::nullopt;
   }
 
@@ -291,15 +295,15 @@ class Evaluator {
     if (node.input.empty()) return std::nullopt;
     const SymTensor* data = Value(node.input[0]);
     if (!data) return std::nullopt;
-    // Casting between integer / bool representations preserves the exact integer
-    // value the shape scaffolding carries, so the symbolic value is unchanged.
-    // A float target is not modelled (later float arithmetic would be lost), so
-    // leave it unresolved.
+    // Casting between integer / bool representations preserves the exact
+    // integer value the shape scaffolding carries, so the symbolic value is
+    // unchanged. A float target is not modelled (later float arithmetic would
+    // be lost), so leave it unresolved.
     const int64_t to = IntAttr(node, "to", 0).value();
     // onnx::TensorProto data types: FLOAT=1, INT8=3, INT16=5, INT32=6, INT64=7,
     // BOOL=9, UINT8=2, UINT16=4, UINT32=12, UINT64=13, INT4=22, UINT4=21.
-    static const std::vector<int64_t> kIntegerTypes = {2, 3,  4,  5,  6,
-                                                       7, 9, 12, 13, 21, 22};
+    static const std::vector<int64_t> kIntegerTypes = {2, 3,  4,  5,  6, 7,
+                                                       9, 12, 13, 21, 22};
     if (std::find(kIntegerTypes.begin(), kIntegerTypes.end(), to) ==
         kIntegerTypes.end())
       return std::nullopt;
@@ -313,8 +317,8 @@ class Evaluator {
     if (!data || !shape) return std::nullopt;
     const int64_t count = data->size();
     // Only rank <= 1 targets are representable here: a 1-D value flattened /
-    // kept 1-D (the `Shape -> Reshape([-1]) -> Gather` pattern), or collapsed to
-    // a scalar. Higher-rank targets are left alone.
+    // kept 1-D (the `Shape -> Reshape([-1]) -> Gather` pattern), or collapsed
+    // to a scalar. Higher-rank targets are left alone.
     if (shape->empty()) {  // reshape to scalar
       if (count != 1) return std::nullopt;
       return SymTensor::Scalar(data->data[0]);
@@ -330,9 +334,10 @@ class Evaluator {
   std::optional<SymTensor> EvalConstantOfShape(const SymNode& node) {
     if (node.input.empty()) return std::nullopt;
     const SymTensor* shape = Value(node.input[0]);
-    // The shape input lists the output dims. A single-entry shape gives a rank-1
-    // output; multi-entry shapes exceed the rank<=1 model.
-    if (!shape || !shape->is_vector() || shape->size() != 1) return std::nullopt;
+    // The shape input lists the output dims. A single-entry shape gives a
+    // rank-1 output; multi-entry shapes exceed the rank<=1 model.
+    if (!shape || !shape->is_vector() || shape->size() != 1)
+      return std::nullopt;
     auto len = ConcreteInt(shape->data[0]);
     if (!len || *len < 0) return std::nullopt;
     SymExpr fill(0);  // ONNX default is a single 0
@@ -342,8 +347,8 @@ class Evaluator {
       else
         return std::nullopt;
     }
-    return SymTensor::Vector(std::vector<SymExpr>(static_cast<std::size_t>(*len),
-                                                  fill));
+    return SymTensor::Vector(
+        std::vector<SymExpr>(static_cast<std::size_t>(*len), fill));
   }
 
   std::optional<SymTensor> EvalRange(const SymNode& node) {
@@ -396,7 +401,8 @@ class Evaluator {
     const SymTensor* shape = Value(node.input[1]);
     if (!data || !shape || !shape->is_vector()) return std::nullopt;
     // Only rank <= 1 targets are representable. An empty target shape keeps the
-    // (necessarily length-1) input; a single-entry target gives a rank-1 result.
+    // (necessarily length-1) input; a single-entry target gives a rank-1
+    // result.
     if (shape->size() == 0) {
       if (data->size() != 1) return std::nullopt;
       return data->scalar ? *data : SymTensor::Scalar(data->data[0]);
@@ -435,13 +441,12 @@ class Evaluator {
     const std::string& op = node.op_type;
     return BinaryElementwise(
         *a, *b,
-        [&op](const SymExpr& x,
-              const SymExpr& y) -> std::optional<SymExpr> {
+        [&op](const SymExpr& x, const SymExpr& y) -> std::optional<SymExpr> {
           if (op == "Add") return x + y;
           if (op == "Sub") return x - y;
           if (op == "Mul") return x * y;
-          // Div: exact integer division only; a symbolic remainder is undecidable
-          // and leaves the value unresolved (never rounds/guesses).
+          // Div: exact integer division only; a symbolic remainder is
+          // undecidable and leaves the value unresolved (never rounds/guesses).
           return TryExactDivide(x, y);
         });
   }
@@ -452,7 +457,8 @@ class Evaluator {
     const SymTensor* b = Value(node.input[1]);
     if (!a || !b) return std::nullopt;
     return BinaryElementwise(
-        *a, *b, [](const SymExpr& x, const SymExpr& y) -> std::optional<SymExpr> {
+        *a, *b,
+        [](const SymExpr& x, const SymExpr& y) -> std::optional<SymExpr> {
           auto eq = TryEqual(x, y);
           if (!eq) return std::nullopt;  // undecidable comparison
           return SymExpr(*eq ? 1 : 0);

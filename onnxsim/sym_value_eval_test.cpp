@@ -106,8 +106,8 @@ int main() {
   }
 
   // === Shape -> Gather(batch) -> Concat -> [batch, 60] ======================
-  // The single-symbolic-entry shape the #526 Reshape rewrite turns into [-1,60].
-  // Also exercises the scalar-index -> Unsqueeze -> Concat variant.
+  // The single-symbolic-entry shape the #526 Reshape rewrite turns into
+  // [-1,60]. Also exercises the scalar-index -> Unsqueeze -> Concat variant.
   {
     SymGraph g;
     g.shape["x"] = {batch, SymExpr(3), SymExpr(4), SymExpr(5)};
@@ -208,8 +208,9 @@ int main() {
   {
     SymGraph g;
     g.initializer["shape"] = Vec({4});
-    g.node = {N("ConstantOfShape", {"shape"}, {"z"}),  // default fill 0
-              N("ConstantOfShape", {"shape"}, {"ones"}, {ATensor("value", Scal(1))})};
+    g.node = {
+        N("ConstantOfShape", {"shape"}, {"z"}),  // default fill 0
+        N("ConstantOfShape", {"shape"}, {"ones"}, {ATensor("value", Scal(1))})};
     const auto v = onnxsim::EvaluateSymbolicValues(g);
     assert(Is(v, "z", {"0", "0", "0", "0"}, false));
     assert(Is(v, "ones", {"1", "1", "1", "1"}, false));
@@ -225,12 +226,12 @@ int main() {
     g.initializer["reps"] = Vec({2});
     g.initializer["data"] = Vec({10, 11, 12, 13});
     g.node = {
-        N("Range", {"start", "limit", "delta"}, {"r"}),      // [0,1,2,3]
-        N("Tile", {"r", "reps"}, {"tiled"}),                 // [0,1,2,3,0,1,2,3]
-        N("Slice", {"data"}, {"sl"},                         // data[1:3] -> [11,12]
+        N("Range", {"start", "limit", "delta"}, {"r"}),  // [0,1,2,3]
+        N("Tile", {"r", "reps"}, {"tiled"}),             // [0,1,2,3,0,1,2,3]
+        N("Slice", {"data"}, {"sl"},                     // data[1:3] -> [11,12]
           {AInts("starts", {1}), AInts("ends", {3}), AInts("axes", {0})}),
-        N("Size", {"x"}, {"sz"}),                            // batch*6
-        N("Cast", {"data"}, {"casted"}, {AInt("to", 6)}),    // INT32 -> unchanged
+        N("Size", {"x"}, {"sz"}),                          // batch*6
+        N("Cast", {"data"}, {"casted"}, {AInt("to", 6)}),  // INT32 -> unchanged
     };
     const auto v = onnxsim::EvaluateSymbolicValues(g);
     assert(Is(v, "r", {"0", "1", "2", "3"}, false));
