@@ -1,0 +1,63 @@
+name: YOLO export test
+
+# Builds onnxsim from source and runs tests/test_yolo.py, which exports the
+# latest Ultralytics YOLO models (YOLO26 / YOLO12 / YOLO11, multiple task
+# heads) with Ultralytics' ONNX exporter and simplifies each with onnxsim.
+# This guards against onnxsim regressions on YOLO-style graphs.
+#
+# ultralytics is kept out of the main test job (it is a large install that
+# pulls torch/torchvision). It has no onnxsim dependency of its own -- its
+# own export "simplify" path uses onnxslim -- so building the onnxsim under
+# test from source in the same environment does not trigger a downgrade.
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  yolo:
+    name: YOLO export -> onnxsim
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      CMAKE_GENERATOR: Ninja
+      CMAKE_CXX_COMPILER_LAUNCHER: sccache
+      SCCACHE_GHA_ENABLED: 'on'
+      ACTIONS_CACHE_SERVICE_V2: 'on'
+      # Keep Ultralytics from reaching the network during export (asset/font
+      # fetches). The test also sets this itself; this is belt-and-suspenders.
+      YOLO_OFFLINE: 'True'
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.11'
+      - uses: mozilla-actions/sccache-action@v0.0.10
+
+      - name: Install build tooling
+        run: pip install cmake ninja "setuptools>=77" sccache
+
+      # Install CPU torch explicitly first so ultralytics reuses it instead of
+      # pulling a CUDA build.
+      - name: Install test dependencies
+        run: |
+          pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu/
+          pip install pytest onnxruntime ultralytics
+
+      # Build the onnxsim under test last so it wins over anything a dependency
+      # might have pulled. --no-build-isolation reuses the tooling installed above.
+      - name: Build onnxsim (editable)
+        run: pip install --no-build-isolation -ve .
+
+      - name: Verify onnxsim under test is the source build
+        run: python -c "import onnxsim, onnxsim.onnxsim_cpp2py_export; print('onnxsim', onnxsim.__version__, onnxsim.__file__)"
+
+      - name: Run YOLO export test
+        run: pytest -v --durations=10 tests/test_yolo.py
