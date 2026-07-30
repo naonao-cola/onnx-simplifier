@@ -326,7 +326,9 @@
             Runs a model for a few iterations to check it executes, using dummy
             inputs generated from the model's input shapes. Pick whether to run
             the <b>converted</b> result (the simplify/optimize output) or the
-            <b>original</b> upload, so you can compare the two. WebGPU falls back
+            <b>original</b> upload, so you can compare the two. The <b>batch</b>
+            control sizes the model's dynamic batch (first) axis; it has no
+            effect on inputs whose first dimension is fixed. WebGPU falls back
             to WebAssembly when unavailable.
         </p>
         <p>
@@ -350,6 +352,9 @@
             </select>
             <label for="inference-iters">iterations</label>
             <input type="number" id="inference-iters" value="5" min="1" style="width: 4em;">
+            <label for="inference-batch">batch</label>
+            <input type="number" id="inference-batch" value="1" min="1" style="width: 4em;"
+                   title="Size for the model's dynamic batch (first) axis; ignored on fixed-shape inputs.">
             <input type="checkbox" id="inference-profile" checked>
             <label for="inference-profile">profile (Chrome trace)</label>
             <button id="run-inference">Run inference</button>
