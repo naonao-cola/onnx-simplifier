@@ -53,15 +53,15 @@ chain. onnxslim folds it; onnxsim did not.
 
 ## The fix
 
-`IsDeterministic` now folds every default-domain op **except** an explicit
-denylist of the genuinely non-deterministic (random/stateful) generators —
-`RandomNormal`, `RandomNormalLike`, `RandomUniform`, `RandomUniformLike`,
-`Multinomial`, `Bernoulli`, `Dropout`, `SequenceMap`. This mirrors the set ONNX
-annotates with `SetNodeDeterminism(NonDeterministic)` on the operator's *own*
-schema (as opposed to the value it *infers* for function bodies), and matches
-the behaviour onnxsim had before it switched to the schema attribute. Subgraph
-carriers (`If`/`Loop`/`Scan`) remain excluded by the existing `!HasSubgraph`
-guard at the call site.
+Rather than second-guess the determinism query in `IsDeterministic` (which stays
+the ordinary `GetNodeDeterminism() == Deterministic` check), onnxsim corrects the
+mis-annotated source data. `FixupSchemaDeterminism()` marks the affected ops —
+currently `Range` — as `Deterministic` on their registered schemas (every
+version in the registry's history), and `Simplify()` calls it once before
+folding. The ONNX registry hands back pointers into its own storage, so the
+metadata is corrected in place and the normal folding check then picks `Range`
+up. Genuinely non-deterministic generators keep their explicit
+`SetNodeDeterminism(NonDeterministic)` and are still never folded.
 
 ## Swin-S: where the 213 nodes went
 
@@ -84,6 +84,34 @@ The remaining ~24-node difference vs onnxslim is mostly onnxslim rewriting the
 3-D transformer linears `MatMul(x, W) + b` into `Reshape → Gemm → Reshape`
 (1 → 97 `Gemm`), a representation change that trades node count for a fused-bias
 GEMM kernel; it is orthogonal to the folding fix here.
+
+## FasterRCNN-10: cause of the remaining gap (onnxsim 2824 vs onnxslim 2622)
+
+The determinism fix does not change FasterRCNN-10 (it is opset 10, and `Range`
+did not exist until opset 11, so there is nothing to unblock). The 202-node gap
+to onnxslim is a **different, fusion-level** gap, not a folding one:
+
+| op | onnxsim | onnxslim | Δ | cause |
+|---|---:|---:|---:|---|
+| Mul | 119 | 59 | +60 | Conv scale not fused |
+| Add | 127 | 74 | +53 | Conv bias not fused |
+| Unsqueeze | 379 | 310 | +69 | dynamic-shape plumbing |
+| Gather/Slice/… | — | — | +20 | dynamic-shape plumbing |
+
+* **~106 nodes — decomposed BatchNorm (`Conv → Mul → Add`).** onnxsim's output
+  contains **53** `Conv → Mul(scale) → Add(bias)` chains where `scale`/`bias` are
+  per-channel `(1, C, 1, 1)` constants (a BatchNorm exported as an affine pair);
+  onnxslim has **0** — it folds the scale into the Conv weights and the bias into
+  the Conv bias. onnxoptimizer has `fuse_bn_into_conv` (for an actual
+  `BatchNormalization` node) and `fuse_add_bias_into_conv`, but no pass that
+  folds a per-channel `Mul` sitting between a `Conv` and its bias `Add`, so
+  neither the `Mul` nor the now-not-adjacent `Add` fuses. Closing this would be
+  an **onnxoptimizer** change (a `fuse_mul_into_conv`-style pass), not an onnxsim
+  one.
+* **~90 nodes — dynamic-shape plumbing.** The rest is `Gather`-from-`Shape` →
+  `Unsqueeze` → `Concat` shape arithmetic for the dynamic `height`/`width`
+  input. These depend on the runtime shape and so cannot be constant-folded;
+  onnxslim collapses more of them with dedicated shape-graph simplifications.
 
 ## Verification
 

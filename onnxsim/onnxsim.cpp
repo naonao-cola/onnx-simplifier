@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <fstream>
 #include <functional>
+#include <mutex>
 #include <numeric>
 #include <set>
 #include <string>
@@ -62,10 +63,59 @@ bool IsOfficialOp(const std::string& domain, const std::string& op) {
   return experimental_ops.find(op) == experimental_ops.end();
 }
 
+// Correct the determinism metadata of operators ONNX mis-annotates, so the
+// ordinary ``IsDeterministic`` check below can fold them.
+//
+// ``OpSchema::GetNodeDeterminism`` infers a *function* op's determinism from
+// the ops in its function body, and reports ``NonDeterministic`` for a body
+// that contains a subgraph-carrying op (``Loop``/``If``/``Scan``) and
+// ``Unknown`` for a context-dependent function -- neither of which means the op
+// is actually random. ``Range`` is the canonical victim: its body is a ``Loop``
+// (opset < 27) or a context-dependent function (opset >= 27), so it is reported
+// non-deterministic even though its output is a pure function of its inputs. It
+// is then never constant-folded, which in turn strands whole static subgraphs
+// built on top of it -- e.g. the ``Range -> Slice -> Reshape -> Expand ->
+// Unsqueeze -> Concat`` attention-mask construction (and the neighbouring
+// ``ScatterND`` chains) in Swin-style models, leaving hundreds of constant
+// nodes that other simplifiers fold away.
+//
+// Rather than second-guess the determinism query in ``IsDeterministic``, fix
+// the source data: mark these genuinely-deterministic ops ``Deterministic`` on
+// their registered schemas (every version in the registry's history). The
+// registry returns pointers into its own storage, so this updates the metadata
+// in place.
+void FixupSchemaDeterminism() {
+  static std::once_flag once;
+  std::call_once(once, [] {
+    // Deterministic default-domain ops whose schema determinism ONNX infers
+    // (incorrectly, for folding purposes) from a function body.
+    static const std::set<std::string> deterministic_ops = {"Range"};
+    for (const auto& schema :
+         onnx::OpSchemaRegistry::get_all_schemas_with_history()) {
+      if (!schema.domain().empty() || !deterministic_ops.count(schema.Name())) {
+        continue;
+      }
+      const onnx::OpSchema* registered = onnx::OpSchemaRegistry::Schema(
+          schema.Name(), schema.since_version(), schema.domain());
+      if (registered != nullptr) {
+        const_cast<onnx::OpSchema*>(registered)
+            ->SetNodeDeterminism(
+                onnx::OpSchema::NodeDeterminism::Deterministic);
+      }
+    }
+  });
+}
+
 bool IsDeterministic(const std::string& domain, const std::string& op,
                      int opset_version) {
-  // Whether a node may be constant-folded (given constant inputs). The ONNX
-  // operator schema registry stores the default ONNX domain as an empty string.
+  // Query the determinism attribute of the operator schema instead of
+  // maintaining a hardcoded list of non-deterministic ops. See
+  // https://github.com/onnx/onnx/pull/7176. Operators ONNX mis-annotates for
+  // constant-folding purposes (e.g. ``Range``) have their metadata corrected by
+  // FixupSchemaDeterminism(), which Simplify() runs before folding.
+  //
+  // The ONNX operator schema registry stores the default ONNX domain as an
+  // empty string.
   const std::string& lookup_domain = domain == "ai.onnx" ? "" : domain;
   const auto* schema =
       onnx::OpSchemaRegistry::Schema(op, opset_version, lookup_domain);
@@ -73,45 +123,11 @@ bool IsDeterministic(const std::string& domain, const std::string& op,
     // Unknown op. Assume it is not deterministic.
     return false;
   }
-  // Fold every default-domain op except those that are genuinely
-  // non-deterministic (the random/stateful generators below).
-  //
-  // We deliberately do NOT trust ``schema->GetNodeDeterminism()`` here. That
-  // attribute has three states (``Deterministic``/``NonDeterministic``/
-  // ``Unknown``) and, for the purpose of constant folding, mislabels many
-  // perfectly foldable ops:
-  //
-  //   * Ops ONNX defines through a *function body* inherit their determinism
-  //     from the constituent ops of that body, and any constituent that carries
-  //     a subgraph (``Loop``/``If``/``Scan``) is reported ``NonDeterministic``
-  //     purely because it has a subgraph -- not because it is random.
-  //     ``Range``, for instance, is a function whose body contains a ``Loop``
-  //     (opset < 27) or a context-dependent function (opset >= 27), so it
-  //     resolves to ``NonDeterministic`` / ``Unknown`` even though its output
-  //     is a pure function of its constant inputs.
-  //   * A single such op left unfolded poisons an entire otherwise-constant
-  //     subgraph: in Swin-style models the static attention-mask construction
-  //     ``Range -> Slice -> Reshape -> Expand -> Unsqueeze -> Concat`` (and the
-  //     ``ScatterND`` chains beside it) all depend on ``Range``, so hundreds of
-  //     constant nodes survive that onnxslim and other simplifiers fold away.
-  //
-  // Instead we keep an explicit denylist of the ops that actually produce
-  // different values on different runs. It mirrors the set ONNX itself
-  // annotates with ``SetNodeDeterminism(NonDeterministic)`` on the operator's
-  // own schema (as opposed to the value it *infers* for function bodies), so it
-  // stays in step with the standard while side-stepping the function-body
-  // inference. The subgraph carriers (``If``/``Loop``/``Scan``/``SequenceMap``)
-  // are already excluded by the ``!HasSubgraph`` guard at the call site.
-  if (lookup_domain.empty()) {
-    static const std::set<std::string> non_deterministic_ops = {
-        "RandomNormal",      "RandomNormalLike", "RandomUniform",
-        "RandomUniformLike", "Multinomial",      "Bernoulli",
-        "Dropout",           "SequenceMap"};
-    return non_deterministic_ops.find(op) == non_deterministic_ops.end();
-  }
-  // For non-default domains (e.g. onnx-ml) there is no random-op concern for
-  // the ops onnxsim folds, so treat schema-backed ops as deterministic.
-  return true;
+  // Only fold ops that are known to be deterministic. Ops whose determinism
+  // cannot be statically determined (e.g. context-dependent functions) are
+  // treated as non-deterministic to be safe.
+  return schema->GetNodeDeterminism() ==
+         onnx::OpSchema::NodeDeterminism::Deterministic;
 }
 
 bool IsQDQ(const std::string& domain, const std::string& op) {
@@ -1630,6 +1646,9 @@ onnx::ModelProto Simplify(
   // Make shape inference aware of ONNX Runtime's quantized contrib operators
   // (QLinearAdd and friends) so shape deduction does not stop at them.
   onnxsim::RegisterContribOpSchemas();
+  // Correct the determinism metadata of ops ONNX mis-annotates (e.g. Range) so
+  // constant folding does not skip them.
+  FixupSchemaDeterminism();
   // Register permissive placeholder schemas for custom ops exported into the
   // default ONNX domain (e.g. TensorRT plugins such as BatchedNMS_TRT) so the
   // checker below does not reject the model (GitHub issues #107, #220).
