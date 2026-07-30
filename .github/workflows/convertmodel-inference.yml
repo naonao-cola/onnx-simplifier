@@ -29,6 +29,9 @@ jobs:
       - name: Run trace-assembler unit test
         working-directory: scripts/convertmodel
         run: npm run test:trace
+      - name: Run MAC-metrics reader unit test
+        working-directory: scripts/convertmodel
+        run: npm run test:macs
       - name: Run inference smoke test (wasm EP)
         working-directory: scripts/convertmodel
         run: npm run test:inference

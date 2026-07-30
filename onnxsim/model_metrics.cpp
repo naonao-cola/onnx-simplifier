@@ -154,6 +154,14 @@ const std::map<std::string, Counter>& Counters() {
   return kCounters;
 }
 
+// Larger of two possibly-symbolic values by representative magnitude (all free
+// dims -> 1); the winner is returned intact so a symbolic peak stays a formula.
+SymExpr Max(const SymExpr& a, const SymExpr& b) {
+  return a.representative() >= b.representative() ? a : b;
+}
+
+}  // namespace
+
 SymExpr NodeMacs(const NodeView& node, const ShapeMap& shapes) {
   const auto& counters = Counters();
   auto it = counters.find(node.op_type);
@@ -173,14 +181,6 @@ SymExpr NodeMemAccess(const NodeView& node, const ShapeMap& shapes,
   }
   return total;
 }
-
-// Larger of two possibly-symbolic values by representative magnitude (all free
-// dims -> 1); the winner is returned intact so a symbolic peak stays a formula.
-SymExpr Max(const SymExpr& a, const SymExpr& b) {
-  return a.representative() >= b.representative() ? a : b;
-}
-
-}  // namespace
 
 int64_t NodeView::AttrInt(const std::string& name, int64_t dflt) const {
   auto it = attr_ints.find(name);
