@@ -1,0 +1,19 @@
+{
+  "_comment": "ONNX models (opset <= 15, X2Paddle 1.6.0's supported range) pulled from the Hugging Face onnxmodelzoo org and converted to PaddlePaddle with X2Paddle, both from the original graph and after onnxsim.simplify. A spread across classic vision families (LeNet, SqueezeNet, ResNet, MobileNet, ShuffleNet, GoogLeNet/Inception, ZFNet, AlexNet, DenseNet), plus one int8/QDQ model X2Paddle can't convert to exercise the non-gating baseline_unsupported verdict. baseline_seconds only balances shards; baseline_verdict records the last observed outcome so a change in convertibility stands out in review. See README.md.",
+  "models": [
+    {"id": "onnxmodelzoo/mnist-12", "baseline_seconds": 4.0, "baseline_verdict": "pass"},
+    {"id": "onnxmodelzoo/emotion-ferplus-8", "baseline_seconds": 4.0, "baseline_verdict": "pass"},
+    {"id": "onnxmodelzoo/squeezenet1.0-12", "baseline_seconds": 5.0, "baseline_verdict": "pass"},
+    {"id": "onnxmodelzoo/resnet18-v1-7", "baseline_seconds": 6.0, "baseline_verdict": "pass"},
+    {"id": "onnxmodelzoo/mobilenetv2-12", "baseline_seconds": 6.0, "baseline_verdict": "pass"},
+    {"id": "onnxmodelzoo/shufflenet-v2-12", "baseline_seconds": 6.0, "baseline_verdict": "pass"},
+    {"id": "onnxmodelzoo/googlenet-12", "baseline_seconds": 7.0, "baseline_verdict": "pass"},
+    {"id": "onnxmodelzoo/inception-v1-12", "baseline_seconds": 7.0, "baseline_verdict": "pass"},
+    {"id": "onnxmodelzoo/bvlcalexnet-12", "baseline_seconds": 8.0, "baseline_verdict": "pass"},
+    {"id": "onnxmodelzoo/zfnet512-12", "baseline_seconds": 8.0, "baseline_verdict": "pass"},
+    {"id": "onnxmodelzoo/resnet50-v1-12", "baseline_seconds": 10.0, "baseline_verdict": "pass"},
+    {"id": "onnxmodelzoo/resnet101-v1-7", "baseline_seconds": 14.0, "baseline_verdict": "pass"},
+    {"id": "onnxmodelzoo/densenet-12", "baseline_seconds": 16.0, "baseline_verdict": "pass"},
+    {"id": "onnxmodelzoo/mobilenetv2-12-int8", "baseline_seconds": 6.0, "baseline_verdict": "baseline_unsupported"}
+  ]
+}

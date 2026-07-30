@@ -1,0 +1,154 @@
+name: X2Paddle Regression
+
+# Downstream-consumer regression: onnxsim is X2Paddle's built-in ONNX optimize
+# step (x2paddle.convert.onnx2paddle runs onnxsim.simplify before its op-mapper),
+# so this converts a set of real ONNX models to PaddlePaddle twice — from the
+# original graph and after onnxsim — and fails if onnxsim broke a conversion
+# X2Paddle could do before. See scripts/regression/x2paddle/README.md.
+#
+# X2Paddle 1.6.0 pins onnx<1.16 (uses onnx.mapping) and opset <= 15, so this job
+# installs a separate dependency set from the onnxmodelzoo sweep. It's a heavier
+# job (paddlepaddle + model downloads), so it runs on a schedule and on demand.
+
+on:
+  schedule:
+    - cron: "0 7 * * 1" # Mondays 07:00 UTC (weekly)
+  workflow_dispatch:
+    inputs:
+      num_shards:
+        description: "Number of parallel shards"
+        default: "2"
+        type: string
+  pull_request:
+    # Validate the harness itself whenever it changes.
+    paths:
+      - ".github/workflows/x2paddle-regression.yml"
+      - "scripts/regression/x2paddle/**"
+
+concurrency:
+  group: x2paddle-regression-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  # Build onnxsim once from the current tree and share the wheel with every
+  # shard, so the regression tests the code under review — not a released wheel.
+  build:
+    name: Build onnxsim wheel
+    runs-on: ubuntu-24.04
+    env:
+      SCCACHE_GHA_ENABLED: "on"
+      ACTIONS_CACHE_SERVICE_V2: "on"
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+          fetch-depth: 0
+      - uses: mozilla-actions/sccache-action@v0.0.10
+      # X2Paddle 1.6.0 needs onnx<1.16, which has no cp312 wheels on some
+      # platforms; build the onnxsim wheel for cp311 to match the shard runtime.
+      - name: Build cp311 wheel
+        uses: pypa/cibuildwheel@v4.1.1
+        env:
+          CIBW_BUILD: "cp311-manylinux_x86_64"
+          CIBW_ARCHS: native
+          CIBW_BUILD_FRONTEND: "pip; args: --no-build-isolation"
+          CIBW_MANYLINUX_X86_64_IMAGE: manylinux_2_28
+          CIBW_ENVIRONMENT_PASS_LINUX: CI SCCACHE_GHA_ENABLED ACTIONS_RESULTS_URL ACTIONS_RUNTIME_TOKEN ACTIONS_CACHE_SERVICE_V2
+          CIBW_BEFORE_BUILD: "python3 -m pip install --break-system-packages cmake ninja setuptools sccache"
+          CIBW_ENVIRONMENT: CMAKE_ARGS="-DONNX_USE_PROTOBUF_SHARED_LIBS=OFF" CMAKE_GENERATOR=Ninja CMAKE_CXX_COMPILER_LAUNCHER=sccache CMAKE_LINKER_TYPE=LLD
+          CIBW_REPAIR_WHEEL_COMMAND_LINUX: "auditwheel repair -w {dest_dir} {wheel} --strip"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: onnxsim-wheel-cp311
+          path: ./wheelhouse/*.whl
+
+  setup:
+    name: Plan shards
+    runs-on: ubuntu-24.04
+    outputs:
+      shards: ${{ steps.plan.outputs.shards }}
+      num_shards: ${{ steps.plan.outputs.num_shards }}
+    steps:
+      - id: plan
+        run: |
+          n="${{ github.event.inputs.num_shards || '2' }}"
+          shards=$(python3 -c "import json,sys; print(json.dumps(list(range(int(sys.argv[1])))))" "$n")
+          echo "num_shards=$n" >> "$GITHUB_OUTPUT"
+          echo "shards=$shards" >> "$GITHUB_OUTPUT"
+          echo "planning $n shards: $shards"
+
+  regression:
+    name: Shard ${{ matrix.shard }}
+    needs: [build, setup]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      NUM_SHARDS: ${{ needs.setup.outputs.num_shards }}
+      HF_HUB_ENABLE_HF_TRANSFER: "0"
+      HF_HUB_DISABLE_PROGRESS_BARS: "1"
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ${{ fromJSON(needs.setup.outputs.shards) }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+      - uses: actions/download-artifact@v8
+        with:
+          name: onnxsim-wheel-cp311
+          path: wheelhouse
+      - name: Install X2Paddle stack + onnxsim wheel
+        run: |
+          python -m pip install --upgrade pip
+          # X2Paddle 1.6.0 targets onnx<1.16 (onnx.mapping) and opset <= 15.
+          python -m pip install "paddlepaddle>=2.5" "x2paddle==1.6.0" "onnx<1.16" \
+            onnxruntime huggingface_hub
+          python -m pip install --no-deps wheelhouse/*.whl
+      - name: Verify the built wheel is used (not the source tree)
+        working-directory: ${{ runner.temp }}
+        run: python -c "import onnxsim, onnxsim.onnxsim_cpp2py_export as m; print(onnxsim.__version__, m.__file__)"
+      - name: Run X2Paddle regression shard
+        working-directory: ${{ runner.temp }}
+        run: |
+          python "$GITHUB_WORKSPACE/scripts/regression/x2paddle/run_x2paddle_regression.py" \
+            --shard "${{ matrix.shard }}" \
+            --num-shards "$NUM_SHARDS" \
+            --timeout 600 \
+            --output "x2paddle-shard-${{ matrix.shard }}.csv"
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: x2paddle-csv-shard-${{ matrix.shard }}
+          path: ${{ runner.temp }}/x2paddle-shard-${{ matrix.shard }}.csv
+          if-no-files-found: ignore
+
+  summary:
+    name: Summary
+    needs: [regression]
+    if: always()
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: x2paddle-csv-*
+          path: csvs
+          merge-multiple: true
+      - name: Build summary
+        run: python "$GITHUB_WORKSPACE/scripts/regression/x2paddle/summarize.py" "csvs/*.csv"
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: x2paddle-regression-report
+          path: |
+            x2paddle-regression-report.csv
+            x2paddle-regression-summary.md
+          if-no-files-found: ignore
