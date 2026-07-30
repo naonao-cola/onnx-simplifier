@@ -95,7 +95,9 @@ def test_yolo_export_simplify(tmp_path, spec, task, imgsz, expected_op):
     assert nodes_after < nodes_before, f"{spec}: {nodes_before} -> {nodes_after}"
 
     op_types = {node.op_type for node in sim_model.graph.node}
-    assert expected_op in op_types, f"{spec}: expected {expected_op} in simplified graph"
+    assert expected_op in op_types, (
+        f"{spec}: expected {expected_op} in simplified graph"
+    )
 
     # The simplified model must load and run in onnxruntime and preserve the
     # export's input/output signature.

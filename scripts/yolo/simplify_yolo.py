@@ -56,6 +56,7 @@ TASK_SUFFIXES = ["", "-seg", "-pose", "-obb", "-cls"]
 DEFAULT_SPECS = ["yolo26n", "yolo26n-seg", "yolo26n-pose"]
 ALL_SPECS = [f"{gen}n{suffix}" for gen in GENERATIONS for suffix in TASK_SUFFIXES]
 
+
 # Classification heads take 224x224; everything else uses the canonical 640.
 def _imgsz_for(spec: str) -> int:
     return 224 if spec.endswith("-cls") else 640
@@ -120,9 +121,13 @@ def run_spec(spec: str, output_dir: str, opset: int) -> dict:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("specs", nargs="*", help="YOLO spec names, e.g. yolo26n-seg")
-    parser.add_argument("--all", action="store_true", help="newest gens x every task head")
+    parser.add_argument(
+        "--all", action="store_true", help="newest gens x every task head"
+    )
     parser.add_argument("--opset", type=int, default=17, help="ONNX opset for export")
-    parser.add_argument("--output-dir", default="yolo_onnx", help="ONNX output directory")
+    parser.add_argument(
+        "--output-dir", default="yolo_onnx", help="ONNX output directory"
+    )
     args = parser.parse_args()
 
     if args.all:
@@ -145,9 +150,13 @@ def main() -> None:
         status = r.get("status")
         ok += status == "OK"
         b, a = r.get("nodes_before", "?"), r.get("nodes_after", "?")
-        red = f"{100*(b-a)//b}%" if isinstance(b, int) and isinstance(a, int) and b else "?"
+        red = (
+            f"{100 * (b - a) // b}%"
+            if isinstance(b, int) and isinstance(a, int) and b
+            else "?"
+        )
         print(
-            f"{r['spec']:16s} {str(r.get('task','?')):8s} {status:22s} "
+            f"{r['spec']:16s} {str(r.get('task', '?')):8s} {status:22s} "
             f"nodes {b}->{a} ({red}) check_ok={r.get('check_ok', '?')} {r.get('error', '')}"
         )
     print(f"\n{ok}/{len(results)} specs simplified with onnxsim {onnxsim.__version__}")
