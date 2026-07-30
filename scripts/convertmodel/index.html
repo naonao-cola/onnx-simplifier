@@ -6,6 +6,15 @@
             .netron-head { margin-bottom: 0.35em; }
             .netron-note { color: #a00; font-size: 0.9em; margin-top: 0.35em; }
             .netron-frame { width: 100%; height: 480px; border: 1px solid #ccc; }
+            .macs-cards { display: flex; flex-wrap: wrap; gap: 0.6em; margin: 0.6em 0; }
+            .macs-card { border: 1px solid #ccc; border-radius: 6px; padding: 0.5em 0.7em; min-width: 8em; }
+            .macs-k { color: #666; font-size: 0.75em; text-transform: uppercase; letter-spacing: 0.03em; }
+            .macs-v { font-size: 1.2em; font-weight: 600; font-variant-numeric: tabular-nums; }
+            .macs-v small { font-size: 0.65em; color: #666; font-weight: 400; }
+            .macs-table { border-collapse: collapse; margin-top: 0.4em; font-variant-numeric: tabular-nums; }
+            .macs-table th, .macs-table td { border-bottom: 1px solid #eee; padding: 3px 10px; text-align: right; }
+            .macs-table th:first-child, .macs-table td:first-child { text-align: left; }
+            .macs-note { color: #666; font-size: 0.85em; margin-top: 0.4em; }
         </style>
         <script type="text/javascript" src="./onnxsim.js"></script>
         <script type="text/javascript">
@@ -187,7 +196,11 @@
                     // Profiling only applies to "simplify"; the onnx-optimizer
                     // paths do not run the fixed-point profiler.
                     const profile = optimizer == "simplify" && document.getElementById("id_simplify_profile").checked;
-                    worker.postMessage([optimizer, buf, passes, constant_fold, shape_inference, tensor_size_threshold, target_opset_version, profile], [buf]);
+                    // Annotate the converted model with MACs/FLOPs (metadata_props)
+                    // by default; applies to every optimizer mode.
+                    const annotate_model_info = document.getElementById("id_annotate_model_info").checked;
+                    last_run_info.annotate_model_info = annotate_model_info;
+                    worker.postMessage([optimizer, buf, passes, constant_fold, shape_inference, tensor_size_threshold, target_opset_version, profile, annotate_model_info], [buf]);
                 });
             };
         </script>
@@ -225,6 +238,9 @@
             <br/>
             <input type="checkbox" name="simplify_profile" id="id_simplify_profile" checked>
             <label for="id_simplify_profile">profile simplification (simplify only) — emit a Chrome trace</label>
+            <br/>
+            <input type="checkbox" name="annotate_model_info" id="id_annotate_model_info" checked>
+            <label for="id_annotate_model_info">annotate model info — bake MACs/FLOPs into <code>metadata_props</code> (shown in "Run inference" below)</label>
             <br/>
             <div id="pass-list" style="height: 300px; overflow-y: auto; border: 1px solid #ccc; padding: 4px; margin-top: 4px;"></div>
         </div>
@@ -285,6 +301,14 @@
             <b>original</b> upload, so you can compare the two. WebGPU falls back
             to WebAssembly when unavailable.
         </p>
+        <p>
+            If the model carries onnxsim's MAC/FLOP metrics in its
+            <code>metadata_props</code> (onnxsim
+            <a href="https://github.com/onnxsim/onnxsim/pull/527" target="_blank" rel="noopener">PR #527</a>,
+            e.g. annotated via <code>onnxsim.model_info.annotate_metadata</code>),
+            they are shown below with the achieved throughput (GFLOP/s = model
+            FLOPs ÷ average latency).
+        </p>
         <div>
             <label for="inference-source">model</label>
             <select id="inference-source">
@@ -303,6 +327,7 @@
             <button id="run-inference">Run inference</button>
         </div>
         <pre id="inference-output"></pre>
+        <div id="inference-macs"></div>
         <p>
             With profiling on (default), the run captures an onnxruntime-web
             trace: on WebGPU, one span per GPU kernel invocation; on WASM (or as

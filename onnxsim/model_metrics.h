@@ -71,6 +71,13 @@ struct Metrics {
 // Total MACs and forward-pass memory traffic of a graph (recursing subgraphs).
 Metrics ComputeMetrics(const GraphView& graph);
 
+// MACs of a single node (0 for ops without a counter or with unknown shapes),
+// and the bytes it reads+writes in a forward pass. Exposed so a caller can
+// annotate per-node metrics; ComputeMetrics is these summed over the graph.
+SymExpr NodeMacs(const NodeView& node, const ShapeMap& shapes);
+SymExpr NodeMemAccess(const NodeView& node, const ShapeMap& shapes,
+                      const DTypeMap& dtypes);
+
 // Peak bytes resident during a forward pass: initializers stay resident, each
 // activation lives from where it is produced to its last use, and a node's
 // control-flow subgraphs add their own peak on top of the live set at that node

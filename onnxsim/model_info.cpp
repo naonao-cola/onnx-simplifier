@@ -225,7 +225,82 @@ GraphView BuildGraphView(const onnx::GraphProto& graph, ShapeMap shapes,
   return view;
 }
 
+// The string form of a metric for metadata_props, mirroring Python's
+// ``_metric_str``: a concrete value as its plain integer, a symbolic one as its
+// factored formula (e.g. "512*batch").
+std::string MetricStr(const SymExpr& value) {
+  return value.is_symbolic() ? value.str_factored()
+                             : std::to_string(value.to_int());
+}
+
+// The string form of compute density (FLOP/Byte) for metadata_props. 0 when no
+// traffic is known; a decimal when concrete; the simplified formula when the
+// dynamic dims do not cancel.
+std::string DensityStr(const ModelInfo& info) {
+  if (info.mem_access.representative() == 0) return "0";
+  const SymRatio ratio(info.Flops(), info.mem_access);
+  if (ratio.is_symbolic()) return ratio.str();
+  char buf[64];
+  std::snprintf(buf, sizeof(buf), "%.17g", ratio.representative());
+  return buf;
+}
+
+// Set ``key`` -> ``value`` in a proto's metadata_props, overwriting any
+// existing entry with that key. Works for any message that has a repeated
+// StringStringEntryProto metadata_props (ModelProto and NodeProto here).
+template <typename Proto>
+void SetMetadata(Proto& proto, const std::string& key,
+                 const std::string& value) {
+  for (auto& entry : *proto.mutable_metadata_props()) {
+    if (entry.key() == key) {
+      entry.set_value(value);
+      return;
+    }
+  }
+  auto* entry = proto.add_metadata_props();
+  entry->set_key(key);
+  entry->set_value(value);
+}
+
 }  // namespace
+
+void AnnotateModelInfo(onnx::ModelProto& model) {
+  // Model-level totals (and model_size) come from the model as given, before we
+  // add any metadata_props, so the reported size matches the Python annotator.
+  const ModelInfo info = GetModelInfo(model);
+
+  SetMetadata(model, "onnxsim.macs", MetricStr(info.macs));
+  SetMetadata(model, "onnxsim.flops", MetricStr(info.Flops()));
+  SetMetadata(model, "onnxsim.mem_access", MetricStr(info.mem_access));
+  SetMetadata(model, "onnxsim.memory_footprint",
+              MetricStr(info.memory_footprint));
+  SetMetadata(model, "onnxsim.compute_density", DensityStr(info));
+  SetMetadata(model, "onnxsim.model_size", std::to_string(info.model_size));
+
+  // Per-node metrics need tensor shapes; infer them on a copy (best-effort) and
+  // reduce to a GraphView. Shape inference only adds value_info -- it never
+  // reorders or changes the node list -- so view.nodes[i] lines up with the
+  // model's node i, and we write the per-node metadata onto the original nodes.
+  onnx::ModelProto inferred = model;
+  try {
+    onnx::shape_inference::InferShapes(inferred);
+  } catch (...) {
+  }
+  const GraphView view =
+      BuildGraphView(inferred.graph(), ShapeMap{}, DTypeMap{});
+  auto* graph = model.mutable_graph();
+  if (view.nodes.size() == static_cast<std::size_t>(graph->node_size())) {
+    for (int i = 0; i < graph->node_size(); ++i) {
+      const SymExpr macs = onnxsim::NodeMacs(view.nodes[i], view.shapes);
+      const SymExpr mem =
+          onnxsim::NodeMemAccess(view.nodes[i], view.shapes, view.dtypes);
+      onnx::NodeProto* node = graph->mutable_node(i);
+      SetMetadata(*node, "onnxsim.macs", MetricStr(macs));
+      SetMetadata(*node, "onnxsim.flops", MetricStr(macs * SymExpr(2)));
+      SetMetadata(*node, "onnxsim.mem_access", MetricStr(mem));
+    }
+  }
+}
 
 ModelInfo GetModelInfo(const onnx::ModelProto& model,
                        bool run_shape_inference) {

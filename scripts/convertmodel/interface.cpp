@@ -57,7 +57,7 @@ std::string ReadAndClearProfileTrace() {
 // profiler's Chrome trace JSON when `profile` is true, otherwise "". Returning
 // an object (rather than the bare model view) lets the worker hand the trace to
 // the in-page flame-graph viewer without a second round-trip.
-em::val onnxsimplify_export(const std::string& data, em::val skip_optimizers, bool constant_folding, bool shape_inference, size_t tensor_size_threshold, int target_opset_version, bool profile) {
+em::val onnxsimplify_export(const std::string& data, em::val skip_optimizers, bool constant_folding, bool shape_inference, size_t tensor_size_threshold, int target_opset_version, bool profile, bool annotate) {
     InitEnv();
 
     std::cerr << "LOG_THRESHOLD: " << std::getenv("LOG_THRESHOLD") << std::endl;
@@ -112,6 +112,17 @@ em::val onnxsimplify_export(const std::string& data, em::val skip_optimizers, bo
         trace = ReadAndClearProfileTrace();
     }
 
+    // Bake onnxsim's MAC/FLOP model-info metrics into the model's
+    // metadata_props (mirrors Python model_info.annotate_metadata) so the page's
+    // "Run inference" panel can read and display them. On by default.
+    if (annotate) {
+        try {
+            AnnotateModelInfo(optimized);
+        } catch (const std::exception& e) {
+            std::cerr << "annotate model info failed: " << e.what() << std::endl;
+        }
+    }
+
     try {
         std::cerr << "checking model" << std::endl;
         onnx::checker::check_model(optimized);
@@ -133,7 +144,7 @@ em::val onnxsimplify_export(const std::string& data, em::val skip_optimizers, bo
     return out;
 }
 
-em::val onnxoptimizer_optimize(const std::string& data, em::val passes_ary) {
+em::val onnxoptimizer_optimize(const std::string& data, em::val passes_ary, bool annotate) {
     std::vector<std::string> passes = em::vecFromJSArray<std::string>(passes_ary);
     onnx::ModelProto xmodel;
     std::cerr << "parsing message" << std::endl;
@@ -148,6 +159,13 @@ em::val onnxoptimizer_optimize(const std::string& data, em::val passes_ary) {
         std::cerr << "optimize error: " << e.what() << std::endl;
         return em::val::null();
     }
+    if (annotate) {
+        try {
+            AnnotateModelInfo(optimized);
+        } catch (const std::exception& e) {
+            std::cerr << "annotate model info failed: " << e.what() << std::endl;
+        }
+    }
     std::cerr << "serializing model" << std::endl;
     static std::string result;
     if (!optimized.SerializeToString(&result)) {
@@ -157,7 +175,7 @@ em::val onnxoptimizer_optimize(const std::string& data, em::val passes_ary) {
     return em::val(em::typed_memory_view(result.size(), reinterpret_cast<uint8_t*>(result.data())));
 }
 
-em::val onnxoptimizer_optimize_fixed(const std::string& data, em::val passes_ary) {
+em::val onnxoptimizer_optimize_fixed(const std::string& data, em::val passes_ary, bool annotate) {
     std::vector<std::string> passes = em::vecFromJSArray<std::string>(passes_ary);
     onnx::ModelProto xmodel;
     std::cerr << "parsing message" << std::endl;
@@ -171,6 +189,13 @@ em::val onnxoptimizer_optimize_fixed(const std::string& data, em::val passes_ary
     } catch (const std::exception& e) {
         std::cerr << "optimize error: " << e.what() << std::endl;
         return em::val::null();
+    }
+    if (annotate) {
+        try {
+            AnnotateModelInfo(optimized);
+        } catch (const std::exception& e) {
+            std::cerr << "annotate model info failed: " << e.what() << std::endl;
+        }
     }
     std::cerr << "serializing model" << std::endl;
     static std::string result;

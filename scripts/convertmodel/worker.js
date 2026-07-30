@@ -33,6 +33,7 @@ create_onnxsim({
                     e.data[5], // tensor size threshold
                     e.data[6], // target opset version (<= 0 means keep)
                     e.data[7], // profile (emit a Chrome trace)
+                    e.data[8], // annotate model info (MACs/FLOPs) into metadata_props
                 );
                 if (result) {
                     model = result.model;
@@ -44,12 +45,14 @@ create_onnxsim({
                 model = runtime.onnxoptimizer_optimize(
                     buf,
                     e.data[2], // target optimizers
+                    e.data[8], // annotate model info (MACs/FLOPs) into metadata_props
                 );
                 break;
             case "optimize_fixed":
                 model = runtime.onnxoptimizer_optimize_fixed(
                     buf,
                     e.data[2], // target optimizers
+                    e.data[8], // annotate model info (MACs/FLOPs) into metadata_props
                 );
                 break;
             default:

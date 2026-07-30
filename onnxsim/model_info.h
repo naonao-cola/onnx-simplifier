@@ -51,6 +51,22 @@ struct ModelInfo {
 ModelInfo GetModelInfo(const onnx::ModelProto& model,
                        bool run_shape_inference = true);
 
+// Write onnxsim's model-info metrics into ``model``'s ``metadata_props`` in
+// place, mirroring the Python ``model_info.annotate_metadata`` so downstream
+// tools (e.g. the browser inference panel) can read them back:
+//
+//   * model level: ``onnxsim.macs``, ``onnxsim.flops``, ``onnxsim.mem_access``,
+//     ``onnxsim.memory_footprint``, ``onnxsim.compute_density`` and
+//     ``onnxsim.model_size``.
+//   * node level: ``onnxsim.macs`` / ``onnxsim.flops`` / ``onnxsim.mem_access``
+//     for each node of the top-level graph.
+//
+// Values are strings: a concrete metric as its plain number, a symbolic one
+// (dynamic dims) as its factored formula (e.g. "512*batch"). Shapes are taken
+// from a shape-inferred copy, so ``model`` keeps its graph structure and only
+// gains ``metadata_props``. An existing entry with the same key is overwritten.
+void AnnotateModelInfo(onnx::ModelProto& model);
+
 // Render an ASCII table comparing an original and a simplified model, mirroring
 // the layout of the Python ``print_simplifying_info``: one row per op type (the
 // sorted union of both models' ops), then ``Model Size``, ``MACs``, ``FLOPs``,
