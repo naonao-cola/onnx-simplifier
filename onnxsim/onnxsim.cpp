@@ -28,6 +28,8 @@
 #include "onnxoptimizer/optimize.h"
 #include "onnxoptimizer/passes/logging.h"
 #include "profiler.h"
+#include "sym_shape_infer.h"
+#include "sym_value_eval.h"
 
 struct Config {
   std::vector<std::string> optimizer_passes;
@@ -804,6 +806,146 @@ bool GetStaticIntTensorInfo(
   return true;
 }
 
+// --- Native symbolic shape evaluation (issue #532, milestones M1/M2/M3) ------
+//
+// The ONNX data-propagation path below stalls at any arithmetic over a dynamic
+// dim symbol: it carries a value as a TensorShapeProto whose entries are a
+// concrete int or an *opaque* dim_param string, so a Reshape target like
+// `[batch, 1024, 128]`, or a `Div`/`Where`/`Equal` over the symbol, cannot be
+// evaluated. The dependency-free evaluator in sym_value_eval / sym_shape_infer
+// keeps each dynamic dim as a `SymExpr` and computes the shape algebra. These
+// helpers adapt an `onnx::ModelProto` into the evaluator's plain structs and
+// run M2 (symbolic activation shapes) then M1 (symbolic value evaluation) over
+// it.
+
+// Convert an integer TensorProto (rank 0 or 1, INT64/INT32, inline data) to a
+// SymTensor of concrete values. Returns nullopt for other dtypes/ranks or data
+// kept in an external file. Raw data is read little-endian, matching how this
+// file already memcpys raw_data into onnxruntime tensors.
+std::optional<onnxsim::SymTensor> IntTensorToSymTensor(
+    const onnx::TensorProto& tp) {
+  if (tp.data_location() == onnx::TensorProto::EXTERNAL) return std::nullopt;
+  const auto dt = tp.data_type();
+  if (dt != onnx::TensorProto::INT64 && dt != onnx::TensorProto::INT32)
+    return std::nullopt;
+  if (tp.dims_size() > 1) return std::nullopt;  // rank 0 (scalar) or 1 only
+  const bool scalar = tp.dims_size() == 0;
+  std::vector<int64_t> vals;
+  if (tp.has_raw_data()) {
+    const std::string& raw = tp.raw_data();
+    if (dt == onnx::TensorProto::INT64) {
+      const size_t n = raw.size() / sizeof(int64_t);
+      vals.resize(n);
+      if (n) std::memcpy(vals.data(), raw.data(), n * sizeof(int64_t));
+    } else {
+      const size_t n = raw.size() / sizeof(int32_t);
+      std::vector<int32_t> tmp(n);
+      if (n) std::memcpy(tmp.data(), raw.data(), n * sizeof(int32_t));
+      vals.assign(tmp.begin(), tmp.end());
+    }
+  } else if (dt == onnx::TensorProto::INT64) {
+    vals.assign(tp.int64_data().begin(), tp.int64_data().end());
+  } else {
+    vals.assign(tp.int32_data().begin(), tp.int32_data().end());
+  }
+  const int64_t expect = scalar ? 1 : tp.dims(0);
+  if (static_cast<int64_t>(vals.size()) != expect) return std::nullopt;
+  onnxsim::SymTensor t;
+  t.scalar = scalar;
+  for (int64_t v : vals) t.data.emplace_back(v);
+  return t;
+}
+
+// A TypeProto's shape as a SymShape: dim_value -> SymExpr(v), a non-empty
+// dim_param -> its Symbol, an otherwise-unknown dim -> a fresh distinct symbol
+// (so the rank is preserved). Returns nullopt when the rank itself is unknown.
+std::optional<onnxsim::SymShape> TypeProtoToSymShape(
+    const onnx::TypeProto& type, int64_t& fresh) {
+  if (!type.has_tensor_type() || !type.tensor_type().has_shape())
+    return std::nullopt;
+  onnxsim::SymShape shape;
+  for (const auto& dim : type.tensor_type().shape().dim()) {
+    if (dim.has_dim_value())
+      shape.push_back(onnxsim::SymExpr(dim.dim_value()));
+    else if (!dim.dim_param().empty())
+      shape.push_back(onnxsim::SymExpr::Symbol(dim.dim_param()));
+    else
+      shape.push_back(
+          onnxsim::SymExpr::Symbol("seedunk_" + std::to_string(fresh++)));
+  }
+  return shape;
+}
+
+// One node in the evaluator's plain form. A node from a non-default domain gets
+// an empty op_type so no handler matches it (its outputs stay unevaluated).
+onnxsim::SymNode ToSymNode(const onnx::NodeProto& node) {
+  onnxsim::SymNode n;
+  const std::string& domain = node.domain();
+  n.op_type = (domain.empty() || domain == "ai.onnx") ? node.op_type() : "";
+  n.input.assign(node.input().begin(), node.input().end());
+  n.output.assign(node.output().begin(), node.output().end());
+  for (const auto& attr : node.attribute()) {
+    onnxsim::SymAttr a;
+    a.name = attr.name();
+    switch (attr.type()) {
+      case onnx::AttributeProto::INT:
+        a.i = attr.i();
+        break;
+      case onnx::AttributeProto::INTS:
+        a.ints.assign(attr.ints().begin(), attr.ints().end());
+        break;
+      case onnx::AttributeProto::TENSOR:
+        if (auto t = IntTensorToSymTensor(attr.t())) a.t = std::move(*t);
+        break;
+      default:
+        break;
+    }
+    n.attribute.push_back(std::move(a));
+  }
+  return n;
+}
+
+// Run M2 (symbolic activation-shape inference) then M1 (symbolic value
+// evaluation) over `model`, returning every shape-data tensor the evaluator
+// could resolve as a SymTensor (its entries possibly still symbolic).
+std::map<std::string, onnxsim::SymTensor> EvaluateModelSymbolicValues(
+    const onnx::ModelProto& model) {
+  int64_t fresh = 0;
+  std::vector<onnxsim::SymNode> nodes;
+  nodes.reserve(model.graph().node_size());
+  for (const auto& node : model.graph().node())
+    nodes.push_back(ToSymNode(node));
+
+  std::map<std::string, onnxsim::SymTensor> initializers;
+  std::map<std::string, onnxsim::SymShape> shapes_seed;
+  for (const auto& init : model.graph().initializer()) {
+    if (auto t = IntTensorToSymTensor(init)) initializers[init.name()] = *t;
+    onnxsim::SymShape s;  // an initializer's own shape is fully static
+    for (int64_t d : init.dims()) s.emplace_back(d);
+    shapes_seed[init.name()] = std::move(s);
+  }
+  auto seed = [&](const onnx::ValueInfoProto& vi) {
+    if (shapes_seed.count(vi.name()))
+      return;  // keep the concrete initializer shape
+    if (auto s = TypeProtoToSymShape(vi.type(), fresh))
+      shapes_seed[vi.name()] = std::move(*s);
+  };
+  for (const auto& vi : model.graph().input()) seed(vi);
+  for (const auto& vi : model.graph().value_info()) seed(vi);
+  for (const auto& vi : model.graph().output()) seed(vi);
+
+  onnxsim::ShapeGraph sg;
+  sg.node = nodes;
+  sg.value_info = shapes_seed;
+  sg.initializer = initializers;
+
+  onnxsim::SymGraph vg;
+  vg.node = std::move(nodes);
+  vg.initializer = std::move(initializers);
+  vg.shape = onnxsim::InferSymbolicShapes(sg);
+  return onnxsim::EvaluateSymbolicValues(vg);
+}
+
 // Partial shape evaluation (issue #139) via ONNX data propagation.
 //
 // The plain constant folder only folds a node when *all* of its inputs are
@@ -856,10 +998,11 @@ void _EvalPartialShape(onnx::ModelProto& model) {
     return;
   }
 
-  if (data_map.empty()) {
-    restore();
-    return;
-  }
+  // An empty data_map is not a dead end anymore: the native symbolic evaluator
+  // (issue #532) runs further below and can resolve chains ONNX data
+  // propagation could not, so fall through instead of returning. The loops over
+  // data_map simply add nothing, and the final `folded_values && reshape_fixes`
+  // empty check restores the model if the symbolic pass also finds nothing.
 
   const auto type_map = BuildTypeMap(model);
 
@@ -996,6 +1139,89 @@ void _EvalPartialShape(onnx::ModelProto& model) {
     reshape_fixes.emplace(
         node.output(0),
         ReshapeShapeFix{node.output(0) + "_dp_shape", std::move(tp)});
+  }
+
+  // Native symbolic evaluation (issue #532). ONNX data propagation above stops
+  // wherever the shape algebra crosses a dynamic-dim symbol; the SymExpr
+  // evaluator resolves those chains. Merge whatever it finds that the ONNX path
+  // did not already cover into the same two rewrite maps, so the shared rewrite
+  // loop below handles both uniformly. Correctness stays gated by check_n.
+  {
+    const auto sym_values = EvaluateModelSymbolicValues(model);
+    // Fully concrete symbolic values fold to a `Constant`, exactly like the
+    // ONNX fully-known folder above (same dtype/shape/element-count checks).
+    for (const auto& node : model.graph().node()) {
+      if (node.output_size() != 1) continue;
+      const std::string& output = node.output(0);
+      if (folded_values.count(output) || reshape_fixes.count(output)) continue;
+      auto sym_iter = sym_values.find(output);
+      if (sym_iter == sym_values.end()) continue;
+      std::vector<int64_t> flat;
+      bool all_concrete = true;
+      for (const auto& e : sym_iter->second.data) {
+        if (e.is_symbolic()) {
+          all_concrete = false;
+          break;
+        }
+        flat.push_back(e.to_int());
+      }
+      if (!all_concrete) continue;
+      onnx::TensorProto::DataType elem_type;
+      std::vector<int64_t> dims;
+      if (!GetStaticIntTensorInfo(type_map, output, elem_type, dims)) continue;
+      int64_t element_count = 1;
+      for (int64_t d : dims) element_count *= d;
+      if (element_count != static_cast<int64_t>(flat.size())) continue;
+      onnx::TensorProto tp;
+      tp.set_data_type(elem_type);
+      for (int64_t d : dims) tp.add_dims(d);
+      if (elem_type == onnx::TensorProto::INT64) {
+        for (int64_t v : flat) tp.add_int64_data(v);
+      } else {
+        for (int64_t v : flat) tp.add_int32_data(static_cast<int32_t>(v));
+      }
+      folded_values.emplace(output, std::move(tp));
+    }
+    // A Reshape whose target has exactly one symbolic entry (plus positive
+    // constants) becomes `[-1, ...]` -- the same rewrite as the ONNX data-prop
+    // Reshape path above, but reached through SymExpr arithmetic.
+    for (const auto& node : model.graph().node()) {
+      if (node.op_type() != "Reshape" || node.input_size() < 2 ||
+          node.output_size() != 1) {
+        continue;
+      }
+      if (reshape_fixes.count(node.output(0))) continue;
+      auto sym_iter = sym_values.find(node.input(1));
+      if (sym_iter == sym_values.end()) continue;
+      const onnxsim::SymTensor& shape_value = sym_iter->second;
+      if (shape_value.scalar || shape_value.data.empty()) continue;
+      int unknown = 0;
+      bool usable = true;
+      std::vector<int64_t> shape;
+      shape.reserve(shape_value.data.size());
+      for (const auto& e : shape_value.data) {
+        if (e.is_symbolic()) {
+          ++unknown;
+          shape.push_back(-1);
+        } else {
+          const int64_t v = e.to_int();
+          if (v <=
+              0) {  // a literal 0 (copy) or -1 is left for the ordinary folder
+            usable = false;
+            break;
+          }
+          shape.push_back(v);
+        }
+      }
+      if (!usable || unknown != 1) continue;
+      onnx::TensorProto tp;
+      tp.set_data_type(onnx::TensorProto::INT64);
+      tp.add_dims(static_cast<int64_t>(shape.size()));
+      for (int64_t v : shape) tp.add_int64_data(v);
+      reshape_fixes.emplace(
+          node.output(0),
+          ReshapeShapeFix{node.output(0) + "_sym_shape", std::move(tp)});
+    }
   }
 
   if (folded_values.empty() && reshape_fixes.empty()) {

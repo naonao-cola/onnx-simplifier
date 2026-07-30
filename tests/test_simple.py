@@ -340,6 +340,49 @@ def test_data_propagation_through_reshape():
     assert list(value) == [3, 4]
 
 
+def test_partial_shape_evaluation_symbolic_arithmetic_reshape():
+    # Native symbolic shape evaluation (issue #532). The Reshape target is
+    # computed at runtime with *arithmetic over the dynamic batch dim*:
+    #   half = ReduceProd(Shape(x)) / 2 = (batch * 768) / 2 = batch * 384
+    #   newshape = Concat(half, [2]) = [batch * 384, 2]
+    # ONNX data propagation cannot carry a symbol through ReduceProd/Div, so the
+    # #526 rewrite alone leaves the whole Shape -> ReduceProd -> Div -> Concat
+    # scaffolding standing. The SymExpr evaluator keeps the dim as `384*batch`,
+    # sees a single symbolic entry, and materializes the shape as the constant
+    # [-1, 2] -- provably equivalent since batch*384*2 == numel(x) for every
+    # batch -- so the scaffolding collapses.
+    x = helper.make_tensor_value_info("x", TensorProto.FLOAT, ["batch", 768])
+    y = helper.make_tensor_value_info("y", TensorProto.FLOAT, [None, 2])
+    two = helper.make_tensor("two", TensorProto.INT64, [1], [2])
+    two2 = helper.make_tensor("two2", TensorProto.INT64, [1], [2])
+    nodes = [
+        helper.make_node("Shape", ["x"], ["s"]),
+        helper.make_node("ReduceProd", ["s"], ["total"], keepdims=1),
+        helper.make_node("Div", ["total", "two"], ["half"]),
+        helper.make_node("Concat", ["half", "two2"], ["newshape"], axis=0),
+        helper.make_node("Reshape", ["x", "newshape"], ["y"]),
+    ]
+    graph = helper.make_graph(nodes, "g", [x], [y], initializer=[two, two2])
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+    onnx.checker.check_model(model)
+
+    sim_model, check_ok = onnxsim.simplify(model)
+    assert check_ok
+    onnx.checker.check_model(sim_model)
+    op_types = [n.op_type for n in sim_model.graph.node]
+    # The runtime shape arithmetic is gone; only the Reshape (fed by a constant
+    # shape) survives.
+    assert "Shape" not in op_types
+    assert "ReduceProd" not in op_types
+    assert "Div" not in op_types
+    assert "Concat" not in op_types
+    reshape = [n for n in sim_model.graph.node if n.op_type == "Reshape"]
+    assert len(reshape) == 1
+    shape_value = _constant_value(sim_model, reshape[0].input[1])
+    assert shape_value is not None
+    assert list(shape_value) == [-1, 2]
+
+
 def test_unfoldable_const_node_keeps_topological_order():
     # A const node (all-constant inputs) that fails to fold must keep its
     # original position. Here SequenceEmpty is treated as a const node; its
