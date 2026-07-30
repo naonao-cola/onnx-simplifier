@@ -57,7 +57,7 @@ endif()
 # configure onnx-optimizer after onnxruntime, because they both depend on onnx and onnxruntime has its own flags for onnx
 add_subdirectory(third_party/onnx-optimizer EXCLUDE_FROM_ALL)
 
-add_library(onnxsim onnxsim/onnxsim.cpp onnxsim/contrib_schemas.cpp onnxsim/function_rewriter.cpp onnxsim/profiler.cpp onnxsim/model_info.cpp onnxsim/sym_expr.cpp onnxsim/model_metrics.cpp)
+add_library(onnxsim onnxsim/onnxsim.cpp onnxsim/contrib_schemas.cpp onnxsim/function_rewriter.cpp onnxsim/profiler.cpp onnxsim/model_info.cpp onnxsim/sym_expr.cpp onnxsim/sym_value_eval.cpp onnxsim/model_metrics.cpp)
 if (ONNXSIM_BUILTIN_ORT)
   target_include_directories(onnxsim PRIVATE ${ONNXRUNTIME_INCLUDE_DIR})
 endif()
@@ -182,4 +182,12 @@ if (ONNXSIM_TESTS)
                                     onnxsim/model_metrics.cpp onnxsim/sym_expr.cpp)
   target_include_directories(model_metrics_test PRIVATE onnxsim)
   add_test(NAME model_metrics_test COMMAND model_metrics_test)
+
+  # The M1 symbolic value evaluator (issue #532) is likewise dependency-free
+  # (only SymExpr), so it builds and runs standalone -- including under
+  # Emscripten -- without configuring ONNX / onnxruntime.
+  add_executable(sym_value_eval_test onnxsim/sym_value_eval_test.cpp
+                                     onnxsim/sym_value_eval.cpp onnxsim/sym_expr.cpp)
+  target_include_directories(sym_value_eval_test PRIVATE onnxsim)
+  add_test(NAME sym_value_eval_test COMMAND sym_value_eval_test)
 endif()
