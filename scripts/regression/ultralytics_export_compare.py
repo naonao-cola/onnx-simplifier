@@ -35,11 +35,11 @@ import numpy as np
 import onnx
 
 DEFAULT_MODELS = [
-    "yolo11n.pt",       # detect
-    "yolo11n-seg.pt",   # segment
-    "yolo11n-cls.pt",   # classify
+    "yolo11n.pt",  # detect
+    "yolo11n-seg.pt",  # segment
+    "yolo11n-cls.pt",  # classify
     "yolo11n-pose.pt",  # pose
-    "yolo11n-obb.pt",   # oriented bounding boxes
+    "yolo11n-obb.pt",  # oriented bounding boxes
 ]
 
 # numeric parity tolerance for raw-vs-simplified outputs
@@ -200,20 +200,23 @@ def main() -> int:
             print(f"{r['model']:<18} EXPORT ERROR: {r['error']}")
             regressions.append(r["model"])
             continue
-        sim_ok = r.get("sim_valid") and r.get("sim_parity", float("inf")) <= (ATOL + RTOL)
-        slim_ok = r.get("slim_valid") and r.get("slim_parity", float("inf")) <= (ATOL + RTOL)
+        sim_ok = r.get("sim_valid") and r.get("sim_parity", float("inf")) <= (
+            ATOL + RTOL
+        )
         sim_cell = (
-            f"{r.get('sim_nodes','-'):>5} "
+            f"{r.get('sim_nodes', '-'):>5} "
             f"{'Y' if r.get('sim_valid') else 'N'} "
             f"{_fmt_parity(r.get('sim_parity')):>9} "
             f"{'ok' if r.get('sim_check_ok') else 'no':>3}"
         )
         slim_cell = (
-            f"{r.get('slim_nodes','-'):>5} "
+            f"{r.get('slim_nodes', '-'):>5} "
             f"{'Y' if r.get('slim_valid') else 'N'} "
             f"{_fmt_parity(r.get('slim_parity')):>9}"
         )
-        print(f"{r['model']:<18} {r.get('raw_nodes','-'):>5} | {sim_cell:<34} | {slim_cell:<26}")
+        print(
+            f"{r['model']:<18} {r.get('raw_nodes', '-'):>5} | {sim_cell:<34} | {slim_cell:<26}"
+        )
         if not sim_ok:
             regressions.append(r["model"])
 
@@ -224,7 +227,9 @@ def main() -> int:
     if regressions:
         print(f"RESULT: onnxsim NOT a clean drop-in for: {', '.join(regressions)}")
         return 1
-    print("RESULT: onnxsim is a valid drop-in replacement for onnxslim on all tested models.")
+    print(
+        "RESULT: onnxsim is a valid drop-in replacement for onnxslim on all tested models."
+    )
     return 0
 
 
