@@ -9,6 +9,7 @@
 #include <unordered_set>
 #include <vector>
 
+#include "onnx/defs/data_propagators.h"
 #include "onnx/defs/schema.h"
 #include "onnx/defs/shape_inference.h"
 
@@ -21,60 +22,25 @@ constexpr const char* kMSDomain = "com.microsoft";
 using onnx::DataPropagationContext;
 using onnx::InferenceContext;
 using onnx::OpSchema;
-using onnx::TensorShapeProto;
 
-// Data propagation for `Reshape`. ONNX ships data-propagation functions for the
-// shape family (Shape, Gather, Concat, Slice, Squeeze, Unsqueeze, Add/Sub/Mul,
-// ...) but not for Reshape, so a shape tensor that flows through a Reshape --
-// e.g. `Shape(x) -> Reshape(., [-1]) -> Gather(...)` -- loses its propagated
-// value there and the chain stops. That leaves downstream shape arithmetic
-// unfoldable even though the shape is fully derivable.
+// Attach a data-propagation function to `Reshape`. ONNX ships data-propagation
+// functions for the shape family (Shape, Gather, Concat, Slice, Squeeze,
+// Unsqueeze, Add/Sub/Mul, ...) but not for Reshape, so a shape tensor threaded
+// through a Reshape -- e.g. `Shape(x) -> Reshape(., [-1]) -> Gather(...)` --
+// loses its propagated value there and downstream shape arithmetic stops
+// folding.
 //
-// A Reshape preserves the flat element sequence, and data propagation tracks
-// the value of a 1-D integer (shape) tensor as a TensorShapeProto whose entries
-// are its elements. So when the target shape keeps the tensor 1-D with the same
-// number of elements -- an identity on the flat list, which is the shape-tensor
-// case that matters -- the output carries exactly the input's propagated value.
-// Only that provably value-preserving case is propagated; anything else is left
-// unset rather than guessed.
-void ReshapeDataPropagation(DataPropagationContext& ctx) {
-  if (ctx.getNumInputs() < 2) {
-    return;  // Reshape-1 kept the shape as an attribute; nothing to read.
-  }
-  const TensorShapeProto* input_data = ctx.getInputData(0);
-  if (input_data == nullptr) {
-    return;  // The reshaped tensor's value has not been propagated.
-  }
-  const TensorShapeProto* shape_data = ctx.getInputData(1);
-  if (shape_data == nullptr) {
-    return;  // The target shape's value is unknown.
-  }
-  // The target must be rank 1 (a single entry in the shape tensor) so the
-  // output stays a 1-D value list.
-  if (shape_data->dim_size() != 1) {
-    return;
-  }
-  const auto& target = shape_data->dim(0);
-  if (!target.has_dim_value()) {
-    return;  // Symbolic target length: cannot confirm the count is preserved.
-  }
-  const int64_t target_len = target.dim_value();
-  const int64_t input_len = input_data->dim_size();
-  // -1 infers the (only) dim, so it always preserves the count; otherwise the
-  // explicit length must match the input element count.
-  if (target_len != -1 && target_len != input_len) {
-    return;
-  }
-  ctx.addOutputData(0, TensorShapeProto(*input_data));
-}
-
-// Attach ReshapeDataPropagation to every registered Reshape version. The schema
-// objects are owned by the registry and Schema() returns a pointer into that
-// storage, so we const_cast to augment them in place (the stored object is not
-// truly const). Data propagation only runs when explicitly enabled (onnxsim's
-// partial-shape pass), so this never affects ordinary shape inference.
-// Reshape-1 resolves to a one-input schema, which the function's arity check
-// ignores.
+// A Reshape only rearranges a tensor's dims; it never changes the number of
+// elements or their row-major order. Data propagation tracks a shape tensor's
+// *value* as a flat, ordered list of its elements, so that list is invariant
+// under a Reshape and can be copied straight through -- the same reasoning, and
+// the same helper (PropagateShapeDataFromInputToOutput), that ONNX uses for
+// Squeeze/Unsqueeze, which likewise only add or remove size-1 axes.
+//
+// The schema objects are owned by the registry and Schema() returns a pointer
+// into that storage, so we const_cast to augment them in place. Data
+// propagation only runs when explicitly enabled (onnxsim's partial-shape pass),
+// so this never affects ordinary shape inference.
 void RegisterReshapeDataPropagation() {
   std::unordered_set<const OpSchema*> augmented;
   for (int ver = 1; ver <= 64; ++ver) {
@@ -85,7 +51,9 @@ void RegisterReshapeDataPropagation() {
     }
     augmented.insert(schema);
     const_cast<OpSchema*>(schema)->PartialDataPropagationFunction(
-        ReshapeDataPropagation);
+        [](DataPropagationContext& ctx) {
+          onnx::PropagateShapeDataFromInputToOutput(ctx, 0);
+        });
   }
 }
 
