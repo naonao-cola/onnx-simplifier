@@ -19,6 +19,7 @@ option(ONNXSIM_BUILTIN_ORT "" ON)
 option(ONNXSIM_WASM_NODE "For node (enable NODERAWFS etc.)" OFF)
 option(ONNXSIM_C_API "Build the C ABI shared library used by the Rust wrapper and other FFI consumers" OFF)
 option(ONNXSIM_COVERAGE "Instrument onnxsim's own C++ targets for gcov/llvm-cov coverage" OFF)
+option(ONNXSIM_TESTS "Build the dependency-free C++ unit tests (e.g. sym_expr)" OFF)
 
 if (ONNXSIM_PYTHON AND EMSCRIPTEN)
   message(STATUS "python and emscripten cannot be built at the same time")
@@ -56,7 +57,7 @@ endif()
 # configure onnx-optimizer after onnxruntime, because they both depend on onnx and onnxruntime has its own flags for onnx
 add_subdirectory(third_party/onnx-optimizer EXCLUDE_FROM_ALL)
 
-add_library(onnxsim onnxsim/onnxsim.cpp onnxsim/contrib_schemas.cpp onnxsim/function_rewriter.cpp onnxsim/profiler.cpp onnxsim/model_info.cpp)
+add_library(onnxsim onnxsim/onnxsim.cpp onnxsim/contrib_schemas.cpp onnxsim/function_rewriter.cpp onnxsim/profiler.cpp onnxsim/model_info.cpp onnxsim/sym_expr.cpp onnxsim/model_metrics.cpp)
 if (ONNXSIM_BUILTIN_ORT)
   target_include_directories(onnxsim PRIVATE ${ONNXRUNTIME_INCLUDE_DIR})
 endif()
@@ -166,4 +167,19 @@ if (ONNXSIM_COVERAGE)
     target_compile_options(${_t} PRIVATE --coverage -O0 -g)
     target_link_options(${_t} PRIVATE --coverage)
   endforeach()
+endif()
+
+if (ONNXSIM_TESTS)
+  # sym_expr is a self-contained, dependency-free unit (no ONNX / ORT), so its
+  # test compiles and runs on its own -- including under Emscripten -- without
+  # configuring the rest of the project.
+  enable_testing()
+  add_executable(sym_expr_test onnxsim/sym_expr_test.cpp onnxsim/sym_expr.cpp)
+  target_include_directories(sym_expr_test PRIVATE onnxsim)
+  add_test(NAME sym_expr_test COMMAND sym_expr_test)
+
+  add_executable(model_metrics_test onnxsim/model_metrics_test.cpp
+                                    onnxsim/model_metrics.cpp onnxsim/sym_expr.cpp)
+  target_include_directories(model_metrics_test PRIVATE onnxsim)
+  add_test(NAME model_metrics_test COMMAND model_metrics_test)
 endif()

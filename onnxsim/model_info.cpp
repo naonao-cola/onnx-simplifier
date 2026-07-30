@@ -5,11 +5,25 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <optional>
 #include <set>
 #include <string>
+#include <utility>
 #include <vector>
 
+#include "model_metrics.h"
+#include "onnx/shape_inference/implementation.h"
+
 namespace {
+
+using onnxsim::DTypeMap;
+using onnxsim::GraphView;
+using onnxsim::Metrics;
+using onnxsim::NodeView;
+using onnxsim::Shape;
+using onnxsim::ShapeMap;
+using onnxsim::SymExpr;
+using onnxsim::SymRatio;
 
 // Recursively tally op types, descending into every subgraph carried by a node
 // attribute (the ``g`` of e.g. an ``If`` branch, or the ``graphs`` of
@@ -102,15 +116,149 @@ int64_t OpCount(const std::map<std::string, int64_t>& op_nums,
   return it != op_nums.end() ? it->second : 0;
 }
 
+// --- ONNX glue for the metric core -------------------------------------------
+// The heavy lifting (MAC counters, memory liveness) lives in model_metrics.*,
+// which is free of ONNX types. These helpers reduce a shape-inferred
+// ``GraphProto`` to the ``GraphView`` that core operates on.
+
+// A tensor's shape as a list of SymExpr dims, or nullopt when it is not fully
+// usable: no tensor type, no shape (unknown rank), any dimension that is
+// neither a fixed value nor a dim_param, or rank 0 (a scalar -- matching the
+// Python ``_known`` rule that a metric-bearing shape has rank >= 1).
+std::optional<Shape> ExtractShape(const onnx::TypeProto& type) {
+  if (!type.has_tensor_type()) return std::nullopt;
+  const auto& tensor_type = type.tensor_type();
+  if (!tensor_type.has_shape()) return std::nullopt;
+  Shape shape;
+  for (const auto& dim : tensor_type.shape().dim()) {
+    if (dim.has_dim_value()) {
+      shape.push_back(SymExpr(dim.dim_value()));
+    } else if (!dim.dim_param().empty()) {
+      shape.push_back(SymExpr::Symbol(dim.dim_param()));
+    } else {
+      return std::nullopt;  // dimension is entirely unknown
+    }
+  }
+  if (shape.empty()) return std::nullopt;
+  return shape;
+}
+
+// Record a value_info's shape (if fully known) and element size (if fixed) into
+// the maps the core reads.
+void AddValueInfo(const onnx::ValueInfoProto& value_info, ShapeMap& shapes,
+                  DTypeMap& dtypes) {
+  if (auto shape = ExtractShape(value_info.type())) {
+    shapes[value_info.name()] = std::move(*shape);
+  }
+  if (value_info.type().has_tensor_type()) {
+    if (auto esize = onnxsim::ElemSize(
+            static_cast<int>(value_info.type().tensor_type().elem_type()))) {
+      dtypes[value_info.name()] = *esize;
+    }
+  }
+}
+
+// Reduce a graph (and its control-flow subgraphs) to a GraphView. Shapes and
+// dtypes are inherited by value so a subgraph sees the tensors captured from
+// its enclosing scope, exactly as the Python metrics thread them down.
+GraphView BuildGraphView(const onnx::GraphProto& graph, ShapeMap shapes,
+                         DTypeMap dtypes) {
+  GraphView view;
+  view.shapes = std::move(shapes);
+  view.dtypes = std::move(dtypes);
+
+  for (const auto& value_info : graph.input()) {
+    AddValueInfo(value_info, view.shapes, view.dtypes);
+  }
+  for (const auto& value_info : graph.output()) {
+    AddValueInfo(value_info, view.shapes, view.dtypes);
+  }
+  for (const auto& value_info : graph.value_info()) {
+    AddValueInfo(value_info, view.shapes, view.dtypes);
+  }
+  for (const auto& initializer : graph.initializer()) {
+    if (initializer.dims_size() > 0) {  // rank-0 scalars carry no metric shape
+      Shape shape;
+      for (int i = 0; i < initializer.dims_size(); ++i) {
+        shape.push_back(SymExpr(initializer.dims(i)));
+      }
+      view.shapes[initializer.name()] = std::move(shape);
+    }
+    if (auto esize =
+            onnxsim::ElemSize(static_cast<int>(initializer.data_type()))) {
+      view.dtypes[initializer.name()] = *esize;
+    }
+  }
+
+  for (const auto& value_info : graph.input()) {
+    view.inputs.push_back(value_info.name());
+  }
+  for (const auto& value_info : graph.output()) {
+    view.outputs.push_back(value_info.name());
+  }
+  for (const auto& initializer : graph.initializer()) {
+    view.initializers.push_back(initializer.name());
+  }
+
+  for (const auto& node : graph.node()) {
+    NodeView node_view;
+    node_view.op_type = node.op_type();
+    for (const auto& name : node.input()) node_view.inputs.push_back(name);
+    for (const auto& name : node.output()) node_view.outputs.push_back(name);
+    for (const auto& attr : node.attribute()) {
+      if (attr.type() == onnx::AttributeProto::INT) {
+        node_view.attr_ints[attr.name()] = attr.i();
+      }
+    }
+    for (const auto& attr : node.attribute()) {
+      if (attr.has_g()) {
+        node_view.subgraphs.push_back(
+            BuildGraphView(attr.g(), view.shapes, view.dtypes));
+      }
+      for (const auto& subgraph : attr.graphs()) {
+        node_view.subgraphs.push_back(
+            BuildGraphView(subgraph, view.shapes, view.dtypes));
+      }
+    }
+    view.nodes.push_back(std::move(node_view));
+  }
+  return view;
+}
+
 }  // namespace
 
-ModelInfo GetModelInfo(const onnx::ModelProto& model) {
+ModelInfo GetModelInfo(const onnx::ModelProto& model,
+                       bool run_shape_inference) {
   ModelInfo info;
   CountGraphOps(model.graph(), info.op_nums);
   // ByteSizeLong() (not the 32-bit ByteSize()) so models above 2GB do not
-  // overflow; external tensor data is then added from metadata.
+  // overflow; external tensor data is then added from metadata. Op counts and
+  // size come from the model as given -- not the shape-inferred copy below,
+  // whose extra value_info would inflate the serialized size.
   info.model_size = static_cast<int64_t>(model.graph().ByteSizeLong()) +
                     ExternalDataSize(model.graph());
+
+  // The compute/memory metrics need tensor shapes. By default run shape
+  // inference on a copy (it mutates in place). Best-effort: if it throws (e.g.
+  // models > 2GB), fall back to whatever value_info the model already carries
+  // -- unshaped nodes then contribute 0, mirroring the Python warning path.
+  // When the caller already inferred shapes (e.g. with data propagation), skip
+  // the pass and read the model's existing value_info directly.
+  onnx::ModelProto inferred;
+  const onnx::GraphProto* graph = &model.graph();
+  if (run_shape_inference) {
+    inferred = model;
+    try {
+      onnx::shape_inference::InferShapes(inferred);
+    } catch (...) {
+    }
+    graph = &inferred.graph();
+  }
+  const GraphView view = BuildGraphView(*graph, ShapeMap{}, DTypeMap{});
+  const Metrics metrics = onnxsim::ComputeMetrics(view);
+  info.macs = metrics.macs;
+  info.mem_access = metrics.mem_access;
+  info.memory_footprint = onnxsim::PeakMemoryFootprint(view);
   return info;
 }
 
@@ -138,6 +286,32 @@ std::string FormatSimplifyingInfo(const onnx::ModelProto& model_ori,
   std::string size_cell = HumanReadableSize(opt.model_size);
   if (opt.model_size < ori.model_size) size_cell += " *";
   rows.push_back({"Model Size", HumanReadableSize(ori.model_size), size_cell});
+
+  // Symbolic metric rows: a smaller representative magnitude (every dynamic dim
+  // -> 1) counts as the improvement, since "<" on a genuine formula is not
+  // decidable.
+  auto add_metric = [&](const std::string& name, const SymExpr& o,
+                        const SymExpr& s, std::string (*fmt)(const SymExpr&)) {
+    std::string cell = fmt(s);
+    if (s.representative() < o.representative()) cell += " *";
+    rows.push_back({name, fmt(o), cell});
+  };
+  add_metric("MACs", ori.macs, opt.macs, onnxsim::HumanReadableNum);
+  add_metric("FLOPs", ori.Flops(), opt.Flops(), onnxsim::HumanReadableNum);
+  add_metric("Memory Access", ori.mem_access, opt.mem_access,
+             onnxsim::HumanReadableSize);
+  add_metric("Memory Footprint", ori.memory_footprint, opt.memory_footprint,
+             onnxsim::HumanReadableSize);
+
+  // Compute density (FLOP/Byte) is a ratio and not strictly better-or-worse, so
+  // it is shown without a flag. Zero traffic -> 0 to avoid dividing by zero.
+  auto density_cell = [](const ModelInfo& mi) -> std::string {
+    if (mi.mem_access.representative() == 0) {
+      return onnxsim::HumanReadableDensity(SymRatio(SymExpr(0), SymExpr(1)));
+    }
+    return onnxsim::HumanReadableDensity(SymRatio(mi.Flops(), mi.mem_access));
+  };
+  rows.push_back({"Compute Density", density_cell(ori), density_cell(opt)});
 
   std::array<size_t, 3> width = {0, 0, 0};
   for (const auto& row : rows) {
