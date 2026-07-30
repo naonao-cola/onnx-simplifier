@@ -13,6 +13,10 @@ create_onnxsim({
         postMessage(["stderr", str]);
     },
 }).then((runtime) => {
+    // Tell the page the WASM runtime is initialized so it can enable the
+    // "Choose file" picker. Registering the message listener below only
+    // happens now, so any file posted earlier would be dropped.
+    postMessage(["ready"]);
     addEventListener("message", (e) => {
         console.log(e.data);
         const buf = e.data[1];
