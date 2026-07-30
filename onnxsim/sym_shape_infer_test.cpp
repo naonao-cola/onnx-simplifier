@@ -266,6 +266,26 @@ int main() {
            it->second[2].str() == "768");
   }
 
+  // === ScatterND / ScatterElements keep the data (input 0) shape ===========
+  // The causal-mask subgraph in BART reaches a Reshape through
+  // Shape(ScatterND(...)); the scatter must carry `data`'s shape so that Shape
+  // resolves instead of stalling.
+  {
+    ShapeGraph g;
+    g.value_info["data"] = {seq, seq};
+    g.value_info["indices"] = {seq, SymExpr(2)};
+    g.value_info["updates"] = {seq};
+    g.node = {
+        N("ScatterND", {"data", "indices", "updates"}, {"sn"}),
+        N("ScatterElements", {"data", "indices", "updates"}, {"se"},
+          {AInt("axis", 0)}),
+    };
+    const auto r = onnxsim::InferSymbolicShapes(g);
+    g_result = &r;
+    assert(ShapeIs("sn", {"seq", "seq"}));
+    assert(ShapeIs("se", {"seq", "seq"}));
+  }
+
   std::cout << "sym_shape_infer_test: all assertions passed\n";
   return 0;
 }

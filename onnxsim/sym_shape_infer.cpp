@@ -12,9 +12,12 @@ std::optional<int64_t> ConcreteInt(const SymExpr& e) {
   return e.to_int();
 }
 
-// Elementwise ops whose output(0) shape equals input(0) shape. (Ops with extra
-// data inputs -- Clip's min/max, PRelu's slope, LayerNormalization's scale/bias
-// -- still take their shape from input(0).)
+// Ops whose output(0) shape equals input(0) shape. Elementwise ops with extra
+// data inputs (Clip's min/max, PRelu's slope, LayerNormalization's scale/bias)
+// still take their shape from input(0); so do the in-place scatters
+// (ScatterND/ScatterElements), whose output has the shape of `data` (input 0)
+// -- this is what lets M2 shape the causal-mask subgraph in encoder/decoder
+// models like BART instead of stalling at Shape(ScatterND(...)).
 bool IsUnaryShapePreserving(const std::string& op) {
   static const std::set<std::string> kUnary = {
       "Relu",
@@ -62,6 +65,8 @@ bool IsUnaryShapePreserving(const std::string& op) {
       "LpNormalization",
       "QuantizeLinear",
       "DequantizeLinear",
+      "ScatterND",
+      "ScatterElements",
   };
   return kUnary.count(op) != 0;
 }
