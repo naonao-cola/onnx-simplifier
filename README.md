@@ -650,23 +650,14 @@ option.
 
 ONNX Simplifier is most often used as a post-export cleanup step, run on a
 freshly exported ONNX graph before it is handed to a mobile / edge / accelerator
-runtime converter. A non-exhaustive list of projects that use or recommend it:
+runtime converter. Projects that actively use it in their current export or
+conversion tooling include:
 
-*Model export*
-
-* [MXNet](https://mxnet.apache.org/versions/1.9.1/api/python/docs/tutorials/deploy/export/onnx.html#Simplify-the-exported-ONNX-model)
-* [YOLOv5](https://github.com/ultralytics/yolov5) / [Ultralytics YOLO](https://github.com/ultralytics/ultralytics) — the `export` step exposes a `simplify` option that runs onnxsim
-* [YOLOX](https://github.com/Megvii-BaseDetection/YOLOX)
-
-*Deployment toolchains & runtime converters*
-
-* [MMDetection](https://github.com/open-mmlab/mmdetection) / [MMDeploy](https://github.com/open-mmlab/mmdeploy) (OpenMMLab)
-* [ncnn](https://github.com/Tencent/ncnn) (Tencent) — recommended before `onnx2ncnn`
-* [MNN](https://github.com/alibaba/MNN) (Alibaba)
-* [X2Paddle](https://github.com/PaddlePaddle/X2Paddle) / [Paddle2ONNX](https://github.com/PaddlePaddle/Paddle2ONNX) (PaddlePaddle)
-* [RKNN-Toolkit2](https://github.com/airockchip/rknn-toolkit2) (Rockchip) — simplify before NPU conversion
-* NVIDIA [TensorRT](https://github.com/NVIDIA/TensorRT) ecosystem — a common pre-TensorRT cleanup step
-* ...
+* [YOLOX](https://github.com/Megvii-BaseDetection/YOLOX) (Megvii) — the ONNX export runs onnxsim by default (`--no-onnxsim` to disable)
+* [PaddleDetection](https://github.com/PaddlePaddle/PaddleDetection) (PaddlePaddle) — simplifies exported detectors (PP-YOLOE, PicoDet, RT-DETR, …) with onnxsim before deployment
+* [X2Paddle](https://github.com/PaddlePaddle/X2Paddle) (PaddlePaddle) — runs `onnxsim.simplify` in its ONNX → Paddle conversion optimizer
+* [ncnn](https://github.com/Tencent/ncnn) (Tencent) — recommends simplifying with onnxsim before `onnx2ncnn`
+* [RKNN Model Zoo](https://github.com/airockchip/rknn_model_zoo) (Rockchip) — runs onnxsim in its ONNX export scripts before RKNN conversion
 
 ## Chat
 
