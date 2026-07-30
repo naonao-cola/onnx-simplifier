@@ -1,10 +1,12 @@
 #include "onnxsim.h"
+#include "model_info.h"
 #include "onnxoptimizer/optimize.h"
 #include "onnx/checker.h"
 
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
+#include <iostream>
 #include <sstream>
 #include <string>
 
@@ -94,6 +96,12 @@ em::val onnxsimplify_export(const std::string& data, em::val skip_optimizers, bo
         return em::val::null();
     }
     std::cerr << "simplify end" << std::endl;
+
+    // Print the before/after diff (op counts + model size) to stdout so the page
+    // surfaces it in the log, mirroring the Python CLI's "here is the difference"
+    // output. std::cout is routed to the worker's `print` handler.
+    std::cout << "Finish! Here is the difference:\n"
+              << FormatSimplifyingInfo(xmodel, optimized) << std::flush;
 
     // Collect the trace right after Simplify() (the profiler has flushed it by
     // now) and turn profiling back off, so a later check/serialize failure

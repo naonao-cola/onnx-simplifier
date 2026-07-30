@@ -135,6 +135,24 @@ extern "C" {
     /// Always safe to call; the returned pointer must be freed exactly once.
     pub fn onnxsim_list_optimizers() -> *mut c_char;
 
+    /// Render a human-readable diff (op counts + model size) between an original
+    /// and a simplified model, both serialized `ModelProto` bytes. On
+    /// `ONNXSIM_OK`, `out_text` owns a NUL-terminated string to free with
+    /// [`onnxsim_free_string`]; on `ONNXSIM_ERROR`, `out_error` owns a message.
+    ///
+    /// # Safety
+    /// `original_data`/`simplified_data` must each point to at least the matching
+    /// size in bytes; `out_text`/`out_error`, if non-null, receive owned strings
+    /// that must be freed exactly once.
+    pub fn onnxsim_model_info_diff(
+        original_data: *const c_void,
+        original_size: usize,
+        simplified_data: *const c_void,
+        simplified_size: usize,
+        out_text: *mut *mut c_char,
+        out_error: *mut *mut c_char,
+    ) -> c_int;
+
     /// Free a buffer produced by an `out_data` parameter. Null is ignored.
     ///
     /// # Safety
