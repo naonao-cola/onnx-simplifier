@@ -23,6 +23,7 @@ workflow on a weekly schedule and on demand.
 | `worker.py` | downloads one model, then runs **both** onnxsim and onnxslim over it, **each in its own child subprocess** with its own timeout (so a hang/abort in one tool is contained and can't corrupt the other's result), records both outcomes + per-tool peak RSS, and deletes the download. |
 | `run_regression.py` | assigns a balanced shard of the model set (or the known-slow set) and runs each model through `worker.py` with a per-tool timeout. Exits non-zero if any model in the shard **crashed, timed out, or failed onnxsim's correctness check** — onnxslim outcomes are recorded but never affect the exit code. |
 | `summarize.py` | merges the per-shard CSVs into `regression-report.csv` and a Markdown run summary, including the onnxsim-vs-onnxslim comparison tables. |
+| `yolov5_regression.py` | standalone check that `onnxsim` can replace the `onnxslim.slim` call in [ultralytics/yolov5](https://github.com/ultralytics/yolov5)'s `export.py`: exports the raw graph, runs both simplifiers, and gates on onnxsim producing a valid graph numerically equivalent to the original. Latest run: [`RESULTS_yolov5.md`](./RESULTS_yolov5.md). |
 
 ## What counts as a failure
 
