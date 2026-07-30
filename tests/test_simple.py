@@ -308,6 +308,38 @@ def test_partial_shape_evaluation_reshape_single_dynamic_dim():
     assert list(shape_value) == [-1, 60]
 
 
+def test_data_propagation_through_reshape():
+    # ONNX has no data-propagation function for Reshape, so onnxsim registers one
+    # (contrib_schemas): a shape tensor threaded through an element-preserving
+    # Reshape must keep its propagated value so downstream shape arithmetic still
+    # folds. Here Shape(x) -> Reshape(., [-1]) -> Gather([1, 2]) reads only the
+    # static dims, so it must pre-compute to [3, 4] even though the batch is
+    # dynamic -- which requires the value to survive the Reshape.
+    x = helper.make_tensor_value_info("x", TensorProto.FLOAT, ["batch", 3, 4])
+    g = helper.make_tensor_value_info("g", TensorProto.INT64, [2])
+    flat = helper.make_tensor("flat", TensorProto.INT64, [1], [-1])
+    indices = helper.make_tensor("indices", TensorProto.INT64, [2], [1, 2])
+    nodes = [
+        helper.make_node("Shape", ["x"], ["s"]),
+        helper.make_node("Reshape", ["s", "flat"], ["s2"]),
+        helper.make_node("Gather", ["s2", "indices"], ["g"], axis=0),
+    ]
+    graph = helper.make_graph(nodes, "g", [x], [g], initializer=[flat, indices])
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+    onnx.checker.check_model(model)
+
+    sim_model, check_ok = onnxsim.simplify(model)
+    assert check_ok
+    onnx.checker.check_model(sim_model)
+    op_types = [n.op_type for n in sim_model.graph.node]
+    # The value propagated through the Reshape, so the whole chain pre-computes.
+    assert "Gather" not in op_types
+    assert "Reshape" not in op_types
+    value = _constant_value(sim_model, "g")
+    assert value is not None
+    assert list(value) == [3, 4]
+
+
 def test_unfoldable_const_node_keeps_topological_order():
     # A const node (all-constant inputs) that fails to fold must keep its
     # original position. Here SequenceEmpty is treated as a const node; its
