@@ -1,0 +1,5 @@
+# Per-run model download cache (one model at a time; cleaned as the run goes).
+dl/
+# Local run outputs.
+*.csv
+x2paddle-regression-summary.md
