@@ -57,7 +57,7 @@ endif()
 # configure onnx-optimizer after onnxruntime, because they both depend on onnx and onnxruntime has its own flags for onnx
 add_subdirectory(third_party/onnx-optimizer EXCLUDE_FROM_ALL)
 
-add_library(onnxsim onnxsim/onnxsim.cpp onnxsim/contrib_schemas.cpp onnxsim/function_rewriter.cpp onnxsim/profiler.cpp onnxsim/model_info.cpp onnxsim/sym_expr.cpp onnxsim/sym_value_eval.cpp onnxsim/model_metrics.cpp)
+add_library(onnxsim onnxsim/onnxsim.cpp onnxsim/contrib_schemas.cpp onnxsim/function_rewriter.cpp onnxsim/profiler.cpp onnxsim/model_info.cpp onnxsim/sym_expr.cpp onnxsim/sym_value_eval.cpp onnxsim/sym_shape_infer.cpp onnxsim/model_metrics.cpp)
 if (ONNXSIM_BUILTIN_ORT)
   target_include_directories(onnxsim PRIVATE ${ONNXRUNTIME_INCLUDE_DIR})
 endif()
@@ -190,4 +190,12 @@ if (ONNXSIM_TESTS)
                                      onnxsim/sym_value_eval.cpp onnxsim/sym_expr.cpp)
   target_include_directories(sym_value_eval_test PRIVATE onnxsim)
   add_test(NAME sym_value_eval_test COMMAND sym_value_eval_test)
+
+  # M2 symbolic activation-shape inference (issue #532): dependency-free (only
+  # SymExpr + the SymNode/SymTensor structs), so it builds and runs standalone.
+  add_executable(sym_shape_infer_test onnxsim/sym_shape_infer_test.cpp
+                                      onnxsim/sym_shape_infer.cpp
+                                      onnxsim/sym_value_eval.cpp onnxsim/sym_expr.cpp)
+  target_include_directories(sym_shape_infer_test PRIVATE onnxsim)
+  add_test(NAME sym_shape_infer_test COMMAND sym_shape_infer_test)
 endif()
