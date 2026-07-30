@@ -98,7 +98,18 @@ async function runOnModel(modelBytes, { iterations, batch, preferWebGPU, profile
   });
   const feeds = makeDummyInputs(ort, metaSession, batch);
   const inputName = metaSession.inputNames[0];
+  const leadMeta = metaSession.inputMetadata.find((mm) => mm.name === inputName);
+  const leadingDynamic = isDynamicDim(leadMeta?.shape?.[0]);
   log(`input '${inputName}' dims [${feeds[inputName].dims.join(", ")}]`);
+  // Explain a dropped batch request: onnxruntime enforces a model's declared
+  // static shapes, so a fixed leading dimension can't be resized here.
+  if (batch > 1 && !leadingDynamic) {
+    log(
+      `note: batch ${batch} ignored — '${inputName}' has a fixed first ` +
+        `dimension (${leadMeta?.shape?.[0]}); re-export the model with a ` +
+        `dynamic batch axis to change it.`,
+    );
+  }
 
   const res = await runInference(ort, {
     model: modelBytes,
@@ -112,8 +123,7 @@ async function runOnModel(modelBytes, { iterations, batch, preferWebGPU, profile
   // How much the annotated (per-sample, dynamic-dims=1) work was scaled up by:
   // only a dynamic leading axis is driven by `batch`, so a fixed-shape input
   // leaves the metrics untouched (batch is a no-op there).
-  const leadMeta = metaSession.inputMetadata.find((mm) => mm.name === inputName);
-  res.batchScale = isDynamicDim(leadMeta?.shape?.[0]) ? batch : 1;
+  res.batchScale = leadingDynamic ? batch : 1;
   return res;
 }
 
