@@ -84,11 +84,11 @@ bool IsDeterministic(const std::string& domain, const std::string& op,
   //   * Ops ONNX defines through a *function body* inherit their determinism
   //     from the constituent ops of that body, and any constituent that carries
   //     a subgraph (``Loop``/``If``/``Scan``) is reported ``NonDeterministic``
-  //     purely because it has a subgraph -- not because it is random. ``Range``,
-  //     for instance, is a function whose body contains a ``Loop`` (opset < 27)
-  //     or a context-dependent function (opset >= 27), so it resolves to
-  //     ``NonDeterministic`` / ``Unknown`` even though its output is a pure
-  //     function of its constant inputs.
+  //     purely because it has a subgraph -- not because it is random.
+  //     ``Range``, for instance, is a function whose body contains a ``Loop``
+  //     (opset < 27) or a context-dependent function (opset >= 27), so it
+  //     resolves to ``NonDeterministic`` / ``Unknown`` even though its output
+  //     is a pure function of its constant inputs.
   //   * A single such op left unfolded poisons an entire otherwise-constant
   //     subgraph: in Swin-style models the static attention-mask construction
   //     ``Range -> Slice -> Reshape -> Expand -> Unsqueeze -> Concat`` (and the
@@ -96,21 +96,21 @@ bool IsDeterministic(const std::string& domain, const std::string& op,
   //     constant nodes survive that onnxslim and other simplifiers fold away.
   //
   // Instead we keep an explicit denylist of the ops that actually produce
-  // different values on different runs. It mirrors the set ONNX itself annotates
-  // with ``SetNodeDeterminism(NonDeterministic)`` on the operator's own schema
-  // (as opposed to the value it *infers* for function bodies), so it stays in
-  // step with the standard while side-stepping the function-body inference. The
-  // subgraph carriers (``If``/``Loop``/``Scan``/``SequenceMap``) are already
-  // excluded by the ``!HasSubgraph`` guard at the call site.
+  // different values on different runs. It mirrors the set ONNX itself
+  // annotates with ``SetNodeDeterminism(NonDeterministic)`` on the operator's
+  // own schema (as opposed to the value it *infers* for function bodies), so it
+  // stays in step with the standard while side-stepping the function-body
+  // inference. The subgraph carriers (``If``/``Loop``/``Scan``/``SequenceMap``)
+  // are already excluded by the ``!HasSubgraph`` guard at the call site.
   if (lookup_domain.empty()) {
     static const std::set<std::string> non_deterministic_ops = {
-        "RandomNormal",     "RandomNormalLike", "RandomUniform",
-        "RandomUniformLike", "Multinomial",     "Bernoulli",
-        "Dropout",          "SequenceMap"};
+        "RandomNormal",      "RandomNormalLike", "RandomUniform",
+        "RandomUniformLike", "Multinomial",      "Bernoulli",
+        "Dropout",           "SequenceMap"};
     return non_deterministic_ops.find(op) == non_deterministic_ops.end();
   }
-  // For non-default domains (e.g. onnx-ml) there is no random-op concern for the
-  // ops onnxsim folds, so treat schema-backed ops as deterministic.
+  // For non-default domains (e.g. onnx-ml) there is no random-op concern for
+  // the ops onnxsim folds, so treat schema-backed ops as deterministic.
   return true;
 }
 

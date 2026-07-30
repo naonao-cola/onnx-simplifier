@@ -73,9 +73,7 @@ def test_range_rooted_subgraph_is_fully_folded():
     assert ok
     assert len(sim.graph.node) == 0, _op_types(sim)
     # The baked value is correct.
-    (folded,) = [
-        t for t in sim.graph.initializer if t.name == "out"
-    ]
+    (folded,) = [t for t in sim.graph.initializer if t.name == "out"]
     np.testing.assert_array_equal(
         onnx.numpy_helper.to_array(folded),
         np.arange(0, 6) + np.array([10, 20, 30, 40, 50, 60]),
