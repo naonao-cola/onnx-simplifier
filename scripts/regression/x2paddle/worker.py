@@ -239,14 +239,28 @@ def run_step(args, timeout):
     }
 
 
+def _is_env_error(step):
+    """True if a step failed because a Python dependency is missing, i.e. a
+    broken environment rather than anything about the model. x2paddle has
+    undeclared runtime deps (six, requests) that its conversion path imports, so
+    a clean install can hit ImportError here. We must NOT let that masquerade as
+    baseline_unsupported (which is non-gating) -- a missing dep makes *every*
+    model's baseline crash and would turn the whole run silently green."""
+    err = step.get("error") or ""
+    return "ModuleNotFoundError" in err or "ImportError" in err
+
+
 def verdict(onnxsim, baseline, simp):
-    """Classify one model from its three step results.
+    """Classify one model from its step results.
 
     Gating verdicts (fail the regression):
       onnxsim_fail -- onnxsim crashed, timed out, or failed its own check.
       regression   -- X2Paddle converted the original but NOT the
                       onnxsim-simplified graph: onnxsim broke a working
                       downstream conversion.
+      env_error    -- a conversion failed on a missing Python dependency; the
+                      environment is broken, so results are meaningless. Gated
+                      loudly rather than passed off as baseline_unsupported.
     Non-gating verdicts:
       pass                  -- onnxsim ok and the simplified graph converts.
       baseline_unsupported  -- X2Paddle can't convert the original either;
@@ -256,6 +270,8 @@ def verdict(onnxsim, baseline, simp):
     """
     if onnxsim.get("status") not in ("ok",):
         return "onnxsim_fail"
+    if _is_env_error(baseline) or _is_env_error(simp or {}):
+        return "env_error"
     base_ok = baseline.get("status") == "ok"
     simp_ok = (simp or {}).get("status") == "ok"
     if base_ok and simp_ok:

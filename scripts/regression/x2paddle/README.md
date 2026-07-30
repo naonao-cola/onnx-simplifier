@@ -40,12 +40,16 @@ with its own timeout, for two reasons:
 | `pass` | — | onnxsim ok and X2Paddle converted the simplified graph |
 | `regression` | **✗ fails** | X2Paddle converted the original but **not** the simplified graph — onnxsim broke a working conversion |
 | `onnxsim_fail` | **✗ fails** | onnxsim crashed, timed out, or failed its own correctness check |
+| `env_error` | **✗ fails** | a conversion failed to import a Python dependency — the environment is broken (e.g. an undeclared x2paddle dep is missing), so results are meaningless |
 | `baseline_unsupported` | — | X2Paddle can't convert the original either (an unsupported op, etc.) — onnxsim is not implicated |
 | `improved` | — | the original failed but the simplified graph converted — onnxsim *unblocked* X2Paddle |
 
-Only `regression` and `onnxsim_fail` (and a harness `error`) turn the run red.
-`baseline_unsupported` is expected for models that use ops X2Paddle's ONNX
-front-end doesn't implement; those are recorded for coverage, never gated.
+Only `regression`, `onnxsim_fail`, and `env_error` (and a harness `error`) turn
+the run red. `baseline_unsupported` is expected for models that use ops
+X2Paddle's ONNX front-end doesn't implement; those are recorded for coverage,
+never gated. `env_error` exists so a missing dependency fails loudly instead of
+making *every* model's baseline crash and silently pass as
+`baseline_unsupported`.
 
 If an onnxsim optimizer pass raises a C++ assertion, the worker detects the
 pass, adds it to `skipped_optimizers`, and retries — so a newly-fragile pass
@@ -75,11 +79,12 @@ model is not a regression and is not actionable on its own.
 
 ```bash
 # X2Paddle 1.6.0 needs onnx<1.16 (it uses onnx.mapping and mis-detects newer
-# onnx as "not installed"), and targets opset <= 15. `six` is an undeclared
-# x2paddle runtime dep (x2paddle/core/program.py imports it), so install it
-# explicitly. onnxslim is the comparison arm.
+# onnx as "not installed"), and targets opset <= 15. `six` and `requests` are
+# undeclared x2paddle runtime deps its conversion path pulls in
+# (x2paddle/core/program.py imports six and, via x2paddle.utils, requests), so
+# install them explicitly. onnxslim is the comparison arm.
 pip install "paddlepaddle>=2.5" "x2paddle==1.6.0" "onnx<1.16" \
-    onnxruntime huggingface_hub onnxslim six
+    onnxruntime huggingface_hub onnxslim six requests
 pip install .            # or install an onnxsim wheel
 
 # one shard

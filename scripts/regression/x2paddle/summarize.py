@@ -4,8 +4,8 @@
 Writes a merged ``x2paddle-regression-report.csv`` and a Markdown summary to
 ``$GITHUB_STEP_SUMMARY`` (or stdout when run locally), plus a standalone
 ``x2paddle-regression-summary.md``. Exits non-zero if any model has a gating
-verdict (``onnxsim_fail`` or ``regression``), so the summary job reflects the
-overall result even though each shard already gates itself.
+verdict (``onnxsim_fail``, ``regression``, or ``env_error``), so the summary job
+reflects the overall result even though each shard already gates itself.
 
 Verdicts
 --------
@@ -13,6 +13,8 @@ pass                  onnxsim ok and X2Paddle converted the simplified graph.
 regression   (gates)  X2Paddle converted the original but not the simplified
                       graph -- onnxsim broke a working downstream conversion.
 onnxsim_fail (gates)  onnxsim crashed / timed out / failed its own check.
+env_error    (gates)  a conversion failed to import a Python dependency; the
+                      environment is broken, so results are meaningless.
 baseline_unsupported  X2Paddle can't convert the original either (its own
                       limitation on that model); not onnxsim's fault.
 improved              original failed, simplified converted (onnxsim unblocked
@@ -27,7 +29,7 @@ import os
 import statistics
 import sys
 
-GATING = ("onnxsim_fail", "regression")
+GATING = ("onnxsim_fail", "regression", "env_error")
 
 
 def _num(v):
@@ -210,6 +212,7 @@ def main(argv):
     passed = with_verdict("pass")
     regressions = with_verdict("regression")
     onnxsim_fails = with_verdict("onnxsim_fail")
+    env_errors = with_verdict("env_error")
     unsupported = with_verdict("baseline_unsupported")
     improved = with_verdict("improved")
     errored = [r for r in rows if r.get("verdict") in ("error", None, "")]
@@ -227,9 +230,28 @@ def main(argv):
     lines.append(
         f"**{len(passed)}/{len(rows)} models pass.** "
         f"{len(regressions)} regression(s), {len(onnxsim_fails)} onnxsim failure(s), "
+        f"{len(env_errors)} environment error(s), "
         f"{len(unsupported)} X2Paddle-unsupported (non-gating), "
         f"{len(improved)} improved, {len(errored)} harness error(s).\n"
     )
+
+    if env_errors:
+        lines.append(
+            "## ❌ Environment errors (missing dependency — results invalid)\n"
+        )
+        lines.append(
+            "A X2Paddle conversion failed to import a Python dependency, so the "
+            "environment is broken and these results mean nothing. Fix the install "
+            "(x2paddle has undeclared deps: six, requests) and re-run.\n"
+        )
+        lines.append("| model | error |")
+        lines.append("| --- | --- |")
+        for r in env_errors:
+            err = (r.get("baseline_error") or r.get("simp_error") or "").replace(
+                "|", "\\|"
+            )[:160]
+            lines.append(f"| {r['model']} | {err} |")
+        lines.append("")
 
     if regressions:
         lines.append(
@@ -331,6 +353,7 @@ def main(argv):
         "baseline_unsupported": "➖",
         "regression": "❌",
         "onnxsim_fail": "❌",
+        "env_error": "❌",
     }
     for r in rows:
         m = mark.get(r.get("verdict"), "❓")

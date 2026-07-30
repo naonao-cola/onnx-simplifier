@@ -38,7 +38,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 MODELS_JSON = os.path.join(HERE, "models.json")
 DL_DIR = os.path.join(HERE, "dl")
 
-GATING_VERDICTS = ("onnxsim_fail", "regression")
+GATING_VERDICTS = ("onnxsim_fail", "regression", "env_error")
 
 
 def load_models():
