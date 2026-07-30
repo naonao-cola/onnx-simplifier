@@ -135,9 +135,10 @@ def main():
         red = (100 * (on - sn) / on) if on and sn is not None else 0
         bconv = r.get("baseline_conv_status")
         sconv = r.get("simp_conv_status")
+        slconv = r.get("slim_conv_status")
         print(
             f"{v} | onnxsim {r.get('onnxsim_status')} {on}->{sn} ({red:+.0f}%) | "
-            f"x2paddle base={bconv} simp={sconv}",
+            f"x2paddle base={bconv} simp={sconv} | onnxslim conv={slconv}",
             flush=True,
         )
         if v not in ("pass",):
@@ -171,6 +172,17 @@ def main():
         "simp_conv_seconds",
         "simp_peak_rss_mb",
         "simp_error",
+        "onnxslim_status",
+        "slim_nodes",
+        "slim_reduction_pct",
+        "onnxslim_seconds",
+        "onnxslim_peak_rss_mb",
+        "onnxslim_error",
+        "slim_conv_status",
+        "slim_conv_ops",
+        "slim_conv_seconds",
+        "slim_conv_peak_rss_mb",
+        "slim_conv_error",
         "orig_bytes",
         "error",
     ]
@@ -181,6 +193,10 @@ def main():
             on, sn = r.get("orig_nodes"), r.get("simp_nodes")
             r["reduction_pct"] = (
                 round(100 * (on - sn) / on, 1) if on and sn is not None else ""
+            )
+            sln = r.get("slim_nodes")
+            r["slim_reduction_pct"] = (
+                round(100 * (on - sln) / on, 1) if on and sln is not None else ""
             )
             so = r.get("skipped_optimizers")
             r["skipped_optimizers"] = (

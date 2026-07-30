@@ -106,10 +106,12 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           # X2Paddle 1.6.0 targets onnx<1.16 (onnx.mapping) and opset <= 15.
-          # rich is an onnxsim runtime dep, installed explicitly because the
-          # wheel below goes in with --no-deps.
+          # six is an undeclared x2paddle runtime dep (x2paddle/core/program.py
+          # imports it); rich is an onnxsim runtime dep. Both are installed
+          # explicitly because the onnxsim wheel below goes in with --no-deps.
+          # onnxslim is the comparison arm.
           python -m pip install "paddlepaddle>=2.5" "x2paddle==1.6.0" "onnx<1.16" \
-            onnxruntime huggingface_hub rich
+            onnxruntime huggingface_hub onnxslim rich six
           # --no-deps so the wheel can't drag in onnx>=1.16 over the pin above.
           python -m pip install --no-deps wheelhouse/*.whl
       - name: Verify the built wheel is used (not the source tree)

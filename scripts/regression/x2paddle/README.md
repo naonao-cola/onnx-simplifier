@@ -52,12 +52,34 @@ pass, adds it to `skipped_optimizers`, and retries — so a newly-fragile pass
 shows up in the summary's "passes skipped" table (same behaviour as the
 onnxmodelzoo sweep).
 
+## onnxslim comparison (non-gating)
+
+Each model is **also** run through [`onnxslim`](https://github.com/inisis/OnnxSlim)
+and that slimmed graph is fed to X2Paddle too, in its own isolated arm — purely
+for comparison, mirroring the onnxmodelzoo sweep. onnxsim is the only arm that
+gates the run; the onnxslim numbers never turn it red. The summary reports two
+axes:
+
+- **X2Paddle-convertibility.** Over the models X2Paddle converted from the
+  original, how often each simplifier's output still converts, and the models
+  where the two diverge. This is the axis that matters for this downstream: a
+  simplifier that reduces more nodes but produces a graph X2Paddle can't convert
+  is *worse* here, not better.
+- **Node reduction.** Median reduction for each tool and the largest node-count
+  divergences.
+
+The comparison is descriptive, not a target — onnxslim reducing more nodes on a
+model is not a regression and is not actionable on its own.
+
 ## Running locally
 
 ```bash
 # X2Paddle 1.6.0 needs onnx<1.16 (it uses onnx.mapping and mis-detects newer
-# onnx as "not installed"), and targets opset <= 15.
-pip install "paddlepaddle>=2.5" "x2paddle==1.6.0" "onnx<1.16" onnxruntime huggingface_hub
+# onnx as "not installed"), and targets opset <= 15. `six` is an undeclared
+# x2paddle runtime dep (x2paddle/core/program.py imports it), so install it
+# explicitly. onnxslim is the comparison arm.
+pip install "paddlepaddle>=2.5" "x2paddle==1.6.0" "onnx<1.16" \
+    onnxruntime huggingface_hub onnxslim six
 pip install .            # or install an onnxsim wheel
 
 # one shard

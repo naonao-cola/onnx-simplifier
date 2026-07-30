@@ -129,6 +129,44 @@ def child_onnxsim(in_path, out_path):
 
 
 # --------------------------------------------------------------------------- #
+# Child: onnxslim step (comparison arm). Slim <in> -> <out>, print
+# __STEPRESULT__<json>. onnxslim is measured on the same graphs purely for
+# comparison and never gates the run, matching the onnxmodelzoo sweep.
+# --------------------------------------------------------------------------- #
+def child_onnxslim(in_path, out_path):
+    res = {
+        "step": "onnxslim",
+        "status": "error",
+        "error": None,
+        "simp_nodes": None,
+        "seconds": None,
+        "peak_rss_mb": None,
+    }
+    t0 = time.time()
+    try:
+        import onnx
+        import onnxslim
+
+        # Optimize pass only (robustness + node reduction). slim() mutates its
+        # input in place, so it gets a freshly loaded model. We don't run
+        # onnxslim's own equivalence check here: the comparison axis is whether
+        # X2Paddle can convert the slimmed graph, plus node reduction.
+        model_simp = onnxslim.slim(onnx.load(in_path))
+        onnx.save(model_simp, out_path)
+        res["simp_nodes"] = len(model_simp.graph.node)
+        res["status"] = "ok"
+    except Exception as e:
+        res["status"] = "crash"
+        res["error"] = f"{type(e).__name__}: {e}"
+        res["trace"] = traceback.format_exc()[-600:]
+    finally:
+        res["seconds"] = round(time.time() - t0, 1)
+        res["peak_rss_mb"] = peak_rss_mb()
+    print("__STEPRESULT__" + json.dumps(res))
+    return 0
+
+
+# --------------------------------------------------------------------------- #
 # Child: X2Paddle conversion of one graph. Drives the same stages that
 # x2paddle.convert.onnx2paddle runs after its (broken-on-new-onnx) version gate.
 # --------------------------------------------------------------------------- #
@@ -259,6 +297,17 @@ def orchestrate(model_id, dl_dir, per_step_timeout):
         "simp_conv_seconds": None,
         "simp_peak_rss_mb": None,
         "simp_error": None,
+        # onnxslim comparison arm (never gates): slim the graph, then convert it
+        "onnxslim_status": None,
+        "slim_nodes": None,
+        "onnxslim_seconds": None,
+        "onnxslim_peak_rss_mb": None,
+        "onnxslim_error": None,
+        "slim_conv_status": None,
+        "slim_conv_ops": None,
+        "slim_conv_seconds": None,
+        "slim_conv_peak_rss_mb": None,
+        "slim_conv_error": None,
     }
     local = os.path.join(dl_dir, model_id.replace("/", "__"))
     save_root = local + "__pd"
@@ -324,6 +373,26 @@ def orchestrate(model_id, dl_dir, per_step_timeout):
             res["simp_peak_rss_mb"] = simp.get("peak_rss_mb")
             res["simp_error"] = simp.get("error")
 
+        # onnxslim comparison arm: slim the same graph and convert it. Measured
+        # side by side with onnxsim (robustness + node reduction) but never gates.
+        slim_path = onnx_path[:-5] + ".onnxslim.onnx"
+        onnxslim = run_step(["--onnxslim", onnx_path, slim_path], per_step_timeout)
+        res["onnxslim_status"] = onnxslim.get("status")
+        res["slim_nodes"] = onnxslim.get("simp_nodes")
+        res["onnxslim_seconds"] = onnxslim.get("seconds")
+        res["onnxslim_peak_rss_mb"] = onnxslim.get("peak_rss_mb")
+        res["onnxslim_error"] = onnxslim.get("error")
+        if onnxslim.get("status") == "ok" and os.path.exists(slim_path):
+            slim_conv = run_step(
+                ["--convert", "onnxslim", slim_path, save_root + "_slim"],
+                per_step_timeout,
+            )
+            res["slim_conv_status"] = slim_conv.get("status")
+            res["slim_conv_ops"] = slim_conv.get("paddle_ops")
+            res["slim_conv_seconds"] = slim_conv.get("seconds")
+            res["slim_conv_peak_rss_mb"] = slim_conv.get("peak_rss_mb")
+            res["slim_conv_error"] = slim_conv.get("error")
+
         res["verdict"] = verdict(onnxsim, baseline, simp)
         res["status"] = (
             "ok"
@@ -339,12 +408,15 @@ def orchestrate(model_id, dl_dir, per_step_timeout):
         shutil.rmtree(local, ignore_errors=True)
         shutil.rmtree(save_root + "_base", ignore_errors=True)
         shutil.rmtree(save_root + "_simp", ignore_errors=True)
+        shutil.rmtree(save_root + "_slim", ignore_errors=True)
     return res
 
 
 if __name__ == "__main__":
     if len(sys.argv) >= 4 and sys.argv[1] == "--onnxsim":
         sys.exit(child_onnxsim(sys.argv[2], sys.argv[3]))
+    if len(sys.argv) >= 4 and sys.argv[1] == "--onnxslim":
+        sys.exit(child_onnxslim(sys.argv[2], sys.argv[3]))
     if len(sys.argv) >= 5 and sys.argv[1] == "--convert":
         sys.exit(child_convert(sys.argv[2], sys.argv[3], sys.argv[4]))
 

@@ -48,6 +48,116 @@ def _median(xs):
     return statistics.median(xs) if xs else None
 
 
+def comparison_section(rows):
+    """onnxsim vs onnxslim, both as downstream inputs to X2Paddle.
+
+    Two axes, both comparison-only (onnxslim never gates this harness):
+      - X2Paddle-convertibility: over the models X2Paddle converted from the
+        original graph, how often each simplifier's output still converts. This
+        is the axis that matters here — a simplifier that reduces more nodes but
+        breaks X2Paddle is worse for this downstream, not better.
+      - Node reduction: median reduction each simplifier achieved, and where the
+        two diverge most.
+    Returns [] when no onnxslim data is present (older CSVs).
+    """
+    if not any(r.get("onnxslim_status") for r in rows):
+        return []
+
+    lines = ["## onnxsim vs onnxslim (comparison, non-gating)\n"]
+
+    # --- Robustness: does the simplified graph still convert? ---------------- #
+    order = ["ok", "unvalidated", "crash", "timeout", "error"]
+
+    def counts(key):
+        c = {k: 0 for k in order}
+        for r in rows:
+            s = (r.get(key) or "").strip()
+            if s in c:
+                c[s] += 1
+        return c
+
+    sim = counts("simp_conv_status")
+    slim = counts("slim_conv_status")
+    lines.append("### X2Paddle conversion of the simplified graph\n")
+    lines.append("| X2Paddle status | after onnxsim | after onnxslim |")
+    lines.append("| --- | --- | --- |")
+    for k in order:
+        if sim[k] or slim[k]:
+            lines.append(f"| {k} | {sim[k]} | {slim[k]} |")
+    lines.append("")
+
+    # Where the two simplifiers diverge on whether X2Paddle can convert the
+    # result, among models X2Paddle converted from the original.
+    ran = {"ok"}
+    divergent = []
+    for r in rows:
+        if (r.get("baseline_conv_status") or "") not in ran:
+            continue
+        s = (r.get("simp_conv_status") or "") in ran
+        sl = (r.get("slim_conv_status") or "") in ran
+        if s != sl:
+            divergent.append(r)
+    if divergent:
+        lines.append(
+            "Models where only one simplifier's graph still converts (baseline "
+            "converted):\n"
+        )
+        lines.append("| model | after onnxsim | after onnxslim |")
+        lines.append("| --- | --- | --- |")
+        for r in sorted(divergent, key=lambda r: r["model"]):
+            lines.append(
+                f"| {r['model']} | {r.get('simp_conv_status')} | "
+                f"{r.get('slim_conv_status')} |"
+            )
+        lines.append("")
+
+    # --- Optimization strength ---------------------------------------------- #
+    both = []
+    for r in rows:
+        on = _int(r.get("orig_nodes"))
+        sn = _int(r.get("simp_nodes"))
+        sln = _int(r.get("slim_nodes"))
+        if on and sn is not None and sln is not None:
+            both.append((r, on, sn, sln))
+    lines.append("### Node reduction\n")
+    if both:
+        sim_reds = [100 * (on - sn) / on for _, on, sn, _ in both]
+        slim_reds = [100 * (on - sln) / on for _, on, _, sln in both]
+        slim_fewer = sum(1 for _, _, sn, sln in both if sln < sn)
+        sim_fewer = sum(1 for _, _, sn, sln in both if sn < sln)
+        equal = sum(1 for _, _, sn, sln in both if sn == sln)
+        lines.append(f"Over the {len(both)} models both simplifiers processed:\n")
+        lines.append("| metric | onnxsim | onnxslim |")
+        lines.append("| --- | --- | --- |")
+        lines.append(
+            f"| median node reduction | {_median(sim_reds):.1f}% | "
+            f"{_median(slim_reds):.1f}% |"
+        )
+        lines.append("")
+        lines.append(
+            f"- onnxslim produced **fewer** nodes on {slim_fewer}, onnxsim fewer "
+            f"on {sim_fewer}, equal on {equal}."
+        )
+        lines.append("")
+        div = [
+            t for t in sorted(both, key=lambda t: -abs(t[2] - t[3])) if t[2] != t[3]
+        ][:15]
+        if div:
+            lines.append(
+                "Largest node-count divergences (orig → onnxsim / onnxslim):\n"
+            )
+            lines.append("| model | orig | onnxsim | onnxslim | fewer |")
+            lines.append("| --- | --- | --- | --- | --- |")
+            for r, on, sn, sln in div:
+                fewer = "onnxslim" if sln < sn else "onnxsim"
+                lines.append(f"| {r['model']} | {on} | {sn} | {sln} | {fewer} |")
+            lines.append("")
+    else:
+        lines.append("_No model was processed by both simplifiers._\n")
+
+    return lines
+
+
 def main(argv):
     csv_paths = []
     for pat in argv[1:] or ["*.csv"]:
@@ -79,6 +189,14 @@ def main(argv):
         "simp_ops",
         "simp_conv_seconds",
         "simp_error",
+        "onnxslim_status",
+        "slim_nodes",
+        "slim_reduction_pct",
+        "onnxslim_seconds",
+        "slim_conv_status",
+        "slim_conv_ops",
+        "slim_conv_seconds",
+        "slim_conv_error",
         "error",
     ]
     with open("x2paddle-regression-report.csv", "w", newline="") as f:
@@ -199,11 +317,14 @@ def main(argv):
             lines.append(f"- median onnxsim time: {_median(secs):.1f}s.")
         lines.append("")
 
+    lines.extend(comparison_section(rows))
+
     lines.append("## All models\n")
     lines.append(
-        "| model | verdict | onnxsim (orig→simp) | X2Paddle base | X2Paddle simp |"
+        "| model | verdict | onnxsim (orig→simp) | X2Paddle base | X2Paddle simp | "
+        "onnxslim (orig→slim) | X2Paddle slim |"
     )
-    lines.append("| --- | --- | --- | --- | --- |")
+    lines.append("| --- | --- | --- | --- | --- | --- | --- |")
     mark = {
         "pass": "✅",
         "improved": "✅",
@@ -217,7 +338,9 @@ def main(argv):
             f"| {r['model']} | {m} {r.get('verdict')} | "
             f"{r.get('orig_nodes')}→{r.get('simp_nodes')} ({r.get('onnxsim_status')}) | "
             f"{r.get('baseline_conv_status')} ({r.get('baseline_ops')}) | "
-            f"{r.get('simp_conv_status')} ({r.get('simp_ops')}) |"
+            f"{r.get('simp_conv_status')} ({r.get('simp_ops')}) | "
+            f"{r.get('orig_nodes')}→{r.get('slim_nodes')} ({r.get('onnxslim_status')}) | "
+            f"{r.get('slim_conv_status')} ({r.get('slim_conv_ops')}) |"
         )
     lines.append("")
 
