@@ -79,9 +79,14 @@ find "${BUILD_DIR}" -name '*.gcda' -delete 2>/dev/null || true
 
 # 3. Run pytest under coverage.py. `--cov=onnxsim` measures the Python package;
 #    the C++ profiles accumulate as a side effect of the extension running.
+#    `--cov-branch` records branch (decision) coverage too. Without it coverage.py
+#    collects lines only and writes branches-valid="0" into python.xml, which the
+#    combined summary renders as a misleading 0% branch rate for the Python side
+#    (gcov measures C++ branches by default, so only the Python half was blank).
 echo "==> Running pytest with Python coverage"
 python3 -m pytest \
   --cov=onnxsim \
+  --cov-branch \
   --cov-report="xml:${OUTPUT_DIR}/python.xml" \
   --cov-report="html:${OUTPUT_DIR}/python-html" \
   --cov-report=term-missing \
