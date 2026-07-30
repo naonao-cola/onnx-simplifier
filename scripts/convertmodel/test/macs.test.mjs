@@ -12,7 +12,14 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import assert from "node:assert/strict";
-import { readAnnotations, perOpSummary, throughput, humanNum } from "../macs.mjs";
+import {
+  readAnnotations,
+  perOpSummary,
+  throughput,
+  humanNum,
+  evalMetric,
+  isSymbolicStr,
+} from "../macs.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const model = new Uint8Array(readFileSync(join(HERE, "model.onnx")));
@@ -39,10 +46,28 @@ assert.equal(summary.rows[0].opType, "MatMul", "MatMul dominates the MAC total")
 const tp = throughput(ann.model, 2.0);
 assert.ok(tp, "throughput computed for a concrete FLOP count");
 assert.ok(Math.abs(tp.gflops - 24 / 0.002 / 1e9) < 1e-12, "GFLOP/s");
-assert.equal(throughput({ macs: "512*batch" }, 2.0), null, "symbolic FLOPs -> no throughput");
+
+// evalMetric: substitute every symbolic dim with 1 (the per-sample value).
+assert.equal(evalMetric("512"), 512, "plain int");
+assert.equal(evalMetric("7.5"), 7.5, "decimal (compute_density form)");
+assert.equal(evalMetric("512*batch"), 512, "single symbol -> 1");
+assert.equal(evalMetric("512*batch*seq**2 + 5419008*batch"), 5419520, "polynomial");
+assert.equal(evalMetric("512*batch*(seq**2 + 10584)"), 5419520, "factored form");
+assert.equal(evalMetric("24/batch"), 24, "rational form");
+assert.equal(evalMetric(null), null, "missing -> null");
+assert.equal(evalMetric("rm -rf /"), null, "non-formula string -> null (never eval'd)");
+assert.equal(isSymbolicStr("512"), false, "plain number is not symbolic");
+assert.equal(isSymbolicStr("512*batch"), true, "formula is symbolic");
+
+// A symbolic model now yields a per-sample throughput (dims substituted with 1),
+// rather than being reported as unknown.
+const sym = throughput({ macs: "512*batch" }, 2.0);
+assert.ok(sym, "symbolic FLOPs -> per-sample throughput");
+assert.equal(sym.macs, 512, "symbolic macs substituted to 512");
+assert.ok(Math.abs(sym.gflops - (2 * 512) / 0.002 / 1e9) < 1e-12, "symbolic GFLOP/s");
 
 // Formatter sanity.
 assert.equal(humanNum(1622336), "1.6M");
 
-console.log(`\nMACs ${ann.model.macs} (${humanNum(+ann.model.macs)}), MatMul dominates; throughput helper OK`);
-console.log("PASS: macs.mjs reads onnxsim metadata_props and computes throughput");
+console.log(`\nMACs ${ann.model.macs} (${humanNum(+ann.model.macs)}), MatMul dominates; substitution OK`);
+console.log("PASS: macs.mjs reads onnxsim metadata_props, substitutes dims, computes throughput");

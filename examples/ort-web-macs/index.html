@@ -97,7 +97,14 @@
 
       <div id="results" class="hidden">
         <h2>onnxsim metrics (from <code>metadata_props</code>, PR&nbsp;#527)</h2>
-        <div class="panel"><div id="cards" class="cards"></div></div>
+        <div class="panel">
+          <div id="cards" class="cards"></div>
+          <p id="subst-note" class="note" style="display:none">
+            This model has dynamic dimensions, so the stored metrics are formulas
+            (e.g. <code>512*batch</code>). Values shown substitute every dynamic
+            dimension with 1 — the per-sample metrics.
+          </p>
+        </div>
 
         <h2>onnxruntime-web inference (WASM)</h2>
         <div class="panel"><div id="perfcards" class="cards"></div>
@@ -124,7 +131,7 @@
     </div>
 
     <script type="module">
-      import { readAnnotations, perOpSummary, buildRandomFeeds } from "./onnx-macs.js";
+      import { readAnnotations, perOpSummary, buildRandomFeeds, evalMetric, isSymbolicStr } from "./onnx-macs.js";
 
       // Single-threaded WASM avoids the cross-origin-isolation (SharedArrayBuffer)
       // requirement, so the demo works from a plain static file server. Point the
@@ -144,7 +151,8 @@
 
       // --- number formatting (1000-based for counts, 1024-based for bytes) ---
       function human(n, base, units, suffix = "") {
-        if (n == null || !Number.isFinite(+n)) return String(n); // symbolic formula
+        if (n == null) return "—";
+        if (!Number.isFinite(+n)) return String(n);
         n = +n;
         for (const u of units) {
           if (Math.abs(n) < base) return `${n.toFixed(n < 10 && u ? 1 : 0)}${u}${suffix}`;
@@ -162,16 +170,19 @@
 
       function renderMetrics() {
         const m = ann.model;
-        const macs = m.macs, flops = m.flops;
+        // Any dynamic dim makes the stored metrics symbolic formulas; show them
+        // with every symbol substituted by 1 (per-sample values).
+        const symbolic = [m.macs, m.flops, m.mem_access, m.memory_footprint].some(isSymbolicStr);
+        const macs = evalMetric(m.macs), density = evalMetric(m.compute_density);
         $("cards").innerHTML = [
-          card("MACs", humanNum(macs), Number.isFinite(+macs) ? `${(+macs).toLocaleString()}` : "", true),
-          card("FLOPs", humanNum(flops), Number.isFinite(+flops) ? `= 2 &times; MACs` : ""),
-          card("Memory access", humanBytes(m.mem_access), "read + written"),
-          card("Peak footprint", humanBytes(m.memory_footprint), "resident"),
-          card("Compute density", Number.isFinite(+m.compute_density)
-            ? (+m.compute_density).toFixed(2) : m.compute_density, "FLOP/Byte"),
-          card("Model size", humanBytes(m.model_size), ""),
+          card("MACs", humanNum(macs), macs != null ? `${macs.toLocaleString()}` : "", true),
+          card("FLOPs", humanNum(evalMetric(m.flops)), `= 2 &times; MACs`),
+          card("Memory access", humanBytes(evalMetric(m.mem_access)), "read + written"),
+          card("Peak footprint", humanBytes(evalMetric(m.memory_footprint)), "resident"),
+          card("Compute density", density != null ? density.toFixed(2) : "—", "FLOP/Byte"),
+          card("Model size", humanBytes(evalMetric(m.model_size)), ""),
         ].join("");
+        $("subst-note").style.display = symbolic ? "" : "none";
 
         const { rows, totalMacs } = perOpSummary(ann.nodes);
         const maxMacs = Math.max(1, ...rows.map((r) => r.macs));
@@ -232,8 +243,11 @@
           for (let i = 0; i < runs; i++) await session.run(feeds);
           const avgMs = (performance.now() - t0) / runs;
 
-          const macs = +ann.model.macs;
-          const hasMacs = Number.isFinite(macs);
+          // Symbolic metrics (dynamic dims) are substituted with 1, so a
+          // dynamic-shape model reports its per-sample throughput.
+          const macs = evalMetric(ann.model.macs);
+          const symbolic = isSymbolicStr(ann.model.macs);
+          const hasMacs = macs != null;
           const gflops = hasMacs ? (2 * macs) / (avgMs / 1000) / 1e9 : null;
           const gmacs = hasMacs ? macs / (avgMs / 1000) / 1e9 : null;
           $("perfcards").innerHTML = [
@@ -243,8 +257,8 @@
             card("Runs", String(runs), "iterations"),
           ].join("");
           $("perfnote").innerHTML = hasMacs
-            ? `Throughput = model FLOPs (<span class="mono">${(2 * macs).toLocaleString()}</span>, from PR&nbsp;#527) ÷ average latency. Backend: <code>wasm</code>, single-threaded${ort.env.wasm.simd ? " + SIMD" : ""}.`
-            : "MACs are symbolic (dynamic dimensions) — throughput needs a concrete shape.";
+            ? `Throughput = model FLOPs (<span class="mono">${(2 * macs).toLocaleString()}</span>, from PR&nbsp;#527) ÷ average latency. Backend: <code>wasm</code>, single-threaded${ort.env.wasm.simd ? " + SIMD" : ""}.${symbolic ? " Dynamic dimensions substituted with 1 (per-sample)." : ""}`
+            : "MACs could not be read from this model.";
           setStatus(`Done. ${avgMs.toFixed(3)} ms/run over ${runs} runs.`);
         } catch (e) {
           console.error(e);

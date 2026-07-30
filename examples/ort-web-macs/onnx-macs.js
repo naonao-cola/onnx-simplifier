@@ -14,6 +14,110 @@
 
 export const METADATA_PREFIX = "onnxsim.";
 
+// True when a metric string is a symbolic formula (carries a dim name such as
+// "batch") rather than a plain number.
+export function isSymbolicStr(str) {
+  return str != null && /[A-Za-z_]/.test(String(str));
+}
+
+// Evaluate a metric string to a concrete number, substituting every symbolic
+// dimension (any identifier, e.g. "batch") with 1 -- the representative,
+// per-sample value, matching onnxsim's own SymExpr.representative(). Handles the
+// integer-polynomial forms onnxsim emits (coefficients with * + - ** and
+// parentheses) and the decimal / rational form of compute_density. Returns null
+// if the string is missing or cannot be parsed.
+//
+// A hand-written recursive-descent evaluator, never eval(): the metric strings
+// come from a user-supplied model, so they must not be executed as code.
+export function evalMetric(str) {
+  if (str == null) return null;
+  const s = String(str).trim();
+  if (s === "") return null;
+  if (/^[+-]?\d+(\.\d+)?$/.test(s)) return Number(s); // fast path: plain number
+
+  const re = /\s*(\d+\.\d+|\d+|[A-Za-z_]\w*|\*\*|[+\-*/()])/y;
+  const tokens = [];
+  let m;
+  let end = 0; // a sticky regex resets lastIndex to 0 when exec finally fails,
+  while ((m = re.exec(s)) !== null) {
+    tokens.push(m[1]);
+    end = re.lastIndex; // so remember how far we actually consumed.
+  }
+  if (s.slice(end).trim() !== "") return null; // stray character
+
+  let i = 0;
+  const peek = () => tokens[i];
+  const parseExpr = () => {
+    let v = parseTerm();
+    if (v === null) return null;
+    while (peek() === "+" || peek() === "-") {
+      const op = tokens[i++];
+      const r = parseTerm();
+      if (r === null) return null;
+      v = op === "+" ? v + r : v - r;
+    }
+    return v;
+  };
+  const parseTerm = () => {
+    let v = parsePow();
+    if (v === null) return null;
+    while (peek() === "*" || peek() === "/") {
+      const op = tokens[i++];
+      const r = parsePow();
+      if (r === null) return null;
+      v = op === "*" ? v * r : v / r;
+    }
+    return v;
+  };
+  const parsePow = () => {
+    const base = parseUnary();
+    if (base === null) return null;
+    if (peek() === "**") {
+      i++;
+      const exp = parsePow();
+      return exp === null ? null : Math.pow(base, exp);
+    }
+    return base;
+  };
+  const parseUnary = () => {
+    if (peek() === "-") {
+      i++;
+      const v = parseUnary();
+      return v === null ? null : -v;
+    }
+    if (peek() === "+") {
+      i++;
+      return parseUnary();
+    }
+    return parseAtom();
+  };
+  const parseAtom = () => {
+    const t = peek();
+    if (t === undefined) return null;
+    if (t === "(") {
+      i++;
+      const v = parseExpr();
+      if (v === null || tokens[i++] !== ")") return null;
+      return v;
+    }
+    if (/^\d/.test(t)) {
+      i++;
+      return Number(t);
+    }
+    if (/^[A-Za-z_]/.test(t)) {
+      i++;
+      return 1; // symbolic dim -> 1
+    }
+    return null;
+  };
+
+  const result = parseExpr();
+  if (result === null || i !== tokens.length || !Number.isFinite(result)) {
+    return null;
+  }
+  return result;
+}
+
 // --- minimal protobuf wire reader ------------------------------------------
 // We only ever read length-delimited (wire 2) and varint (wire 0) fields, plus
 // skip the rest. Varints are accumulated with multiplication (not <<) so values
@@ -102,10 +206,10 @@ function parseNode(buf) {
   return {
     name,
     opType,
-    macs: numOrNull(meta.macs),
-    flops: numOrNull(meta.flops),
-    memAccess: numOrNull(meta.mem_access),
-    // Raw strings too, so symbolic values (e.g. "512*batch") survive display.
+    // Substituted (dims -> 1) numbers; raw formulas kept in `raw`.
+    macs: evalMetric(meta.macs),
+    flops: evalMetric(meta.flops),
+    memAccess: evalMetric(meta.mem_access),
     raw: meta,
   };
 }
@@ -199,12 +303,6 @@ export function readAnnotations(modelBytes) {
     feedInputs, // [{ name, elemType, dims }]
     annotated: Object.keys(model).length > 0 || graph.nodes.some((n) => n.macs != null),
   };
-}
-
-function numOrNull(s) {
-  if (s == null) return null;
-  const n = Number(s);
-  return Number.isFinite(n) ? n : null; // symbolic strings (e.g. "512*batch") -> null
 }
 
 // Aggregate per-node MACs/FLOPs by op type, with a count and the running total.

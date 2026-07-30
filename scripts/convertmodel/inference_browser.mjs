@@ -21,6 +21,8 @@ import {
   humanBytes,
   humanDensity,
   throughput,
+  evalMetric,
+  isSymbolicStr,
 } from "./macs.mjs";
 
 const ORT_VERSION = "1.27.0";
@@ -146,13 +148,20 @@ function renderMacs(container, log, bytes, res) {
 
   const m = ann.model;
   const tp = res ? throughput(m, res.avgMs) : null;
+  // Any dynamic dimension makes the stored metrics symbolic formulas; we show
+  // them with every symbol substituted by 1 (the per-sample value).
+  const symbolic = [m.macs, m.flops, m.mem_access, m.memory_footprint].some(
+    isSymbolicStr,
+  );
+  const macs = evalMetric(m.macs);
   const cards = [
-    ["MACs", humanNum(m.macs), Number.isFinite(+m.macs) ? (+m.macs).toLocaleString() : ""],
-    ["FLOPs", humanNum(m.flops), "= 2 × MACs"],
-    ["Memory access", humanBytes(m.mem_access), "read + written"],
-    ["Peak footprint", humanBytes(m.memory_footprint), "resident"],
-    ["Compute density", m.compute_density != null ? humanDensity(m.compute_density) : "—", ""],
-    ["Model size", humanBytes(m.model_size), ""],
+    ["MACs", humanNum(macs), macs != null ? macs.toLocaleString() : ""],
+    ["FLOPs", humanNum(evalMetric(m.flops)), "= 2 × MACs"],
+    ["Memory access", humanBytes(evalMetric(m.mem_access)), "read + written"],
+    ["Peak footprint", humanBytes(evalMetric(m.memory_footprint)), "resident"],
+    ["Compute density",
+      m.compute_density != null ? humanDensity(evalMetric(m.compute_density)) : "—", ""],
+    ["Model size", humanBytes(evalMetric(m.model_size)), ""],
   ];
   if (tp) {
     cards.push(["Throughput", `${tp.gflops.toFixed(2)} GFLOP/s`, `avg ${res.avgMs.toFixed(2)} ms on '${res.ep}'`]);
@@ -177,19 +186,23 @@ function renderMacs(container, log, bytes, res) {
       );
     })
     .join("");
+  const substNote = symbolic
+    ? " Dynamic dimensions substituted with 1 (per-sample values)."
+    : "";
   container.innerHTML =
     `<div class="macs-cards">${cardHtml}</div>` +
     `<table class="macs-table"><thead><tr><th>Operator</th><th>Nodes</th>` +
     `<th>MACs</th><th>FLOPs</th><th>% of MACs</th></tr></thead><tbody>${opRows}</tbody></table>` +
     `<p class="macs-note">Metrics read from the model's <code>metadata_props</code> ` +
     `(onnxsim <a href="https://github.com/onnxsim/onnxsim/pull/527" target="_blank" rel="noopener">PR #527</a>). ` +
-    `Throughput = model FLOPs ÷ average onnxruntime-web latency.</p>`;
+    `Throughput = model FLOPs ÷ average onnxruntime-web latency.${substNote}</p>`;
 
-  const macsStr = Number.isFinite(+m.macs) ? (+m.macs).toLocaleString() : m.macs;
+  const macsStr = macs != null ? macs.toLocaleString() : (m.macs ?? "?");
+  const suffix = symbolic ? " (per-sample, dims=1)" : "";
   if (tp) {
-    log(`MACs: ${macsStr} → ${tp.gflops.toFixed(2)} GFLOP/s at ${res.avgMs.toFixed(2)} ms/iter (from PR #527 metadata)`);
+    log(`MACs: ${macsStr}${suffix} → ${tp.gflops.toFixed(2)} GFLOP/s at ${res.avgMs.toFixed(2)} ms/iter (from PR #527 metadata)`);
   } else {
-    log(`MACs: ${macsStr} (from onnxsim metadata_props, PR #527)`);
+    log(`MACs: ${macsStr}${suffix} (from onnxsim metadata_props, PR #527)`);
   }
 }
 
