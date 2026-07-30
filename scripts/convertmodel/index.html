@@ -196,7 +196,11 @@
                     // Profiling only applies to "simplify"; the onnx-optimizer
                     // paths do not run the fixed-point profiler.
                     const profile = optimizer == "simplify" && document.getElementById("id_simplify_profile").checked;
-                    worker.postMessage([optimizer, buf, passes, constant_fold, shape_inference, tensor_size_threshold, target_opset_version, profile], [buf]);
+                    // Annotate the converted model with MACs/FLOPs (metadata_props)
+                    // by default; applies to every optimizer mode.
+                    const annotate_model_info = document.getElementById("id_annotate_model_info").checked;
+                    last_run_info.annotate_model_info = annotate_model_info;
+                    worker.postMessage([optimizer, buf, passes, constant_fold, shape_inference, tensor_size_threshold, target_opset_version, profile, annotate_model_info], [buf]);
                 });
             };
         </script>
@@ -234,6 +238,9 @@
             <br/>
             <input type="checkbox" name="simplify_profile" id="id_simplify_profile" checked>
             <label for="id_simplify_profile">profile simplification (simplify only) — emit a Chrome trace</label>
+            <br/>
+            <input type="checkbox" name="annotate_model_info" id="id_annotate_model_info" checked>
+            <label for="id_annotate_model_info">annotate model info — bake MACs/FLOPs into <code>metadata_props</code> (shown in "Run inference" below)</label>
             <br/>
             <div id="pass-list" style="height: 300px; overflow-y: auto; border: 1px solid #ccc; padding: 4px; margin-top: 4px;"></div>
         </div>
