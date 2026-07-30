@@ -13,12 +13,18 @@ It drives the same `inference_core.mjs` the browser converter page uses via
 ```bash
 cd scripts/convertmodel
 npm ci
-npm run test:inference          # wasm EP, 5 iterations
+npm run test:inference          # wasm EP, 5 iterations, batch 1
 ORT_ITERS=20 npm run test:inference
+ORT_BATCH=64 npm run test:inference    # feed 64 input rows
 ORT_EP=webgpu npm run test:inference   # only where a WebGPU runtime exists
 npm run test:netron             # Netron embedding helpers unit test (no GPU/ORT needed)
 npm run test:trace              # trace-assembler unit test (no GPU/ORT needed)
 ```
+
+The fixture model's batch (first) input dimension is symbolic, so `ORT_BATCH`
+controls how many input rows to feed (default `1`). Each row runs independently,
+so the test replicates the single reference row in `io.json` `ORT_BATCH` times
+and checks that every output row still matches it.
 
 ## Netron embedding test
 

@@ -9,6 +9,11 @@ the metadata_props reader used by the "Run inference" panel and macs.test.mjs.
 Re-run this to regenerate ``model.onnx`` and ``io.json`` after changing the
 graph.
 
+The batch (first) dimension is left symbolic so the inference test can feed any
+number of rows (see ``ORT_BATCH`` in ``inference.test.mjs``). Every row is
+independent through MatMul/Add/Relu, so the single reference row baked into
+``io.json`` is what each output row must equal at any batch size.
+
     python3 make_fixture.py
 
 The MatMul MACs are hand-checkable: output [1, 3] with contraction dim K = 4 ->
@@ -46,8 +51,9 @@ REF = np.maximum(X @ W + B, 0.0)
 
 
 def build_model() -> onnx.ModelProto:
-    x = helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, 4])
-    y = helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, 3])
+    # A symbolic batch dim ("batch") lets the test run any number of rows.
+    x = helper.make_tensor_value_info("X", TensorProto.FLOAT, ["batch", 4])
+    y = helper.make_tensor_value_info("Y", TensorProto.FLOAT, ["batch", 3])
     nodes = [
         helper.make_node("MatMul", ["X", "W"], ["xw"]),
         helper.make_node("Add", ["xw", "B"], ["xwb"]),

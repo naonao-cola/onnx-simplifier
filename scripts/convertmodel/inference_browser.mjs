@@ -55,19 +55,30 @@ const TYPED_ARRAY = {
   uint64: typeof BigUint64Array !== "undefined" ? BigUint64Array : null,
 };
 
-// A symbolic or non-positive dimension (dynamic axis) is materialized as 1 so we
-// can construct a concrete tensor to run.
-function concreteShape(shape) {
-  return (shape || []).map((d) => (typeof d === "number" && d > 0 ? d : 1));
+// True for a symbolic (string) or non-positive dimension — i.e. a dynamic axis
+// with no fixed size baked into the model.
+function isDynamicDim(d) {
+  return !(typeof d === "number" && d > 0);
 }
 
-function makeDummyInputs(ort, session) {
+// Materialize a model input shape into concrete integers. Fixed dims are kept;
+// a dynamic leading (batch) axis becomes `batch`, and any other dynamic axis
+// becomes 1, so we can construct a runnable tensor. With batch === 1 this
+// matches the model's own default sizing.
+function concreteShape(shape, batch = 1) {
+  return (shape || []).map((d, i) => {
+    if (!isDynamicDim(d)) return d;
+    return i === 0 ? batch : 1;
+  });
+}
+
+function makeDummyInputs(ort, session, batch = 1) {
   const feeds = {};
   for (const meta of session.inputMetadata) {
     if (!meta.isTensor) {
       throw new Error(`input '${meta.name}' is not a tensor; cannot auto-generate`);
     }
-    const dims = concreteShape(meta.shape);
+    const dims = concreteShape(meta.shape, batch);
     const count = dims.reduce((a, b) => a * b, 1);
     const Ctor = TYPED_ARRAY[meta.type];
     if (!Ctor) throw new Error(`unsupported input type '${meta.type}'`);
@@ -76,7 +87,7 @@ function makeDummyInputs(ort, session) {
   return feeds;
 }
 
-async function runOnModel(modelBytes, { iterations, preferWebGPU, profile }, log) {
+async function runOnModel(modelBytes, { iterations, batch, preferWebGPU, profile }, log) {
   const ort = await loadOrt();
   const providers = preferWebGPU ? ["webgpu", "wasm"] : ["wasm"];
 
@@ -85,8 +96,20 @@ async function runOnModel(modelBytes, { iterations, preferWebGPU, profile }, log
   const metaSession = await ort.InferenceSession.create(modelBytes, {
     executionProviders: ["wasm"],
   });
-  const feeds = makeDummyInputs(ort, metaSession);
+  const feeds = makeDummyInputs(ort, metaSession, batch);
   const inputName = metaSession.inputNames[0];
+  const leadMeta = metaSession.inputMetadata.find((mm) => mm.name === inputName);
+  const leadingDynamic = isDynamicDim(leadMeta?.shape?.[0]);
+  log(`input '${inputName}' dims [${feeds[inputName].dims.join(", ")}]`);
+  // Explain a dropped batch request: onnxruntime enforces a model's declared
+  // static shapes, so a fixed leading dimension can't be resized here.
+  if (batch > 1 && !leadingDynamic) {
+    log(
+      `note: batch ${batch} ignored — '${inputName}' has a fixed first ` +
+        `dimension (${leadMeta?.shape?.[0]}); re-export the model with a ` +
+        `dynamic batch axis to change it.`,
+    );
+  }
 
   const res = await runInference(ort, {
     model: modelBytes,
@@ -97,6 +120,10 @@ async function runOnModel(modelBytes, { iterations, preferWebGPU, profile }, log
     profile,
     onLog: log,
   });
+  // How much the annotated (per-sample, dynamic-dims=1) work was scaled up by:
+  // only a dynamic leading axis is driven by `batch`, so a fixed-shape input
+  // leaves the metrics untouched (batch is a no-op there).
+  res.batchScale = leadingDynamic ? batch : 1;
   return res;
 }
 
@@ -147,7 +174,15 @@ function renderMacs(container, log, bytes, res) {
   }
 
   const m = ann.model;
+  // The metrics are per-sample (dynamic dims -> 1); when the run fed a larger
+  // batch on a dynamic leading axis, scale FLOPs/MACs up so the throughput
+  // reflects the aggregate work done in that latency.
+  const batchScale = res && res.batchScale > 0 ? res.batchScale : 1;
   const tp = res ? throughput(m, res.avgMs) : null;
+  if (tp && batchScale !== 1) {
+    tp.gflops *= batchScale;
+    tp.gmacs *= batchScale;
+  }
   // Any dynamic dimension makes the stored metrics symbolic formulas; we show
   // them with every symbol substituted by 1 (the per-sample value).
   const symbolic = [m.macs, m.flops, m.mem_access, m.memory_footprint].some(
@@ -164,7 +199,8 @@ function renderMacs(container, log, bytes, res) {
     ["Model size", humanBytes(evalMetric(m.model_size)), ""],
   ];
   if (tp) {
-    cards.push(["Throughput", `${tp.gflops.toFixed(2)} GFLOP/s`, `avg ${res.avgMs.toFixed(2)} ms on '${res.ep}'`]);
+    const batchNote = batchScale !== 1 ? ` × batch ${batchScale}` : "";
+    cards.push(["Throughput", `${tp.gflops.toFixed(2)} GFLOP/s`, `avg ${res.avgMs.toFixed(2)} ms on '${res.ep}'${batchNote}`]);
     cards.push(["MAC rate", `${tp.gmacs.toFixed(2)} GMAC/s`, ""]);
   }
 
@@ -211,6 +247,7 @@ export function initInferencePanel() {
   const out = document.getElementById("inference-output");
   const fileInput = document.getElementById("file-input");
   const itersInput = document.getElementById("inference-iters");
+  const batchInput = document.getElementById("inference-batch");
   const epSelect = document.getElementById("inference-ep");
   const sourceSelect = document.getElementById("inference-source");
   const profileChk = document.getElementById("inference-profile");
@@ -231,6 +268,7 @@ export function initInferencePanel() {
       const source = sourceSelect ? sourceSelect.value : "original";
       const { bytes, label } = await resolveModelBytes(source, fileInput);
       const iterations = Math.max(1, parseInt(itersInput.value, 10) || 5);
+      const batch = Math.max(1, parseInt(batchInput ? batchInput.value : "1", 10) || 1);
       const preferWebGPU = epSelect.value === "webgpu";
       const profile = !profileChk || profileChk.checked;
       log(`running ${label}`);
@@ -240,7 +278,7 @@ export function initInferencePanel() {
       log(`loading onnxruntime-web ${ORT_VERSION}…`);
       const res = await runOnModel(
         bytes,
-        { iterations, preferWebGPU, profile },
+        { iterations, batch, preferWebGPU, profile },
         log,
       );
       log(
