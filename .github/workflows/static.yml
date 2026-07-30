@@ -7,8 +7,27 @@ on:
   # Runs on pushes targeting the default branch
   push:
     branches: ["master", "pages"]
+    # Only rebuild/deploy the WASM convertmodel demo when files that actually
+    # affect it change (the C++ sources, the build scripts, the demo assets,
+    # or this workflow itself).
+    paths:
+      - ".github/workflows/static.yml"
+      - "build_wasm.sh"
+      - "CMakeLists.txt"
+      - "cmake/**"
+      - "onnxsim/**"
+      - "scripts/convertmodel/**"
+      - ".gitmodules"
 
   pull_request:
+    paths:
+      - ".github/workflows/static.yml"
+      - "build_wasm.sh"
+      - "CMakeLists.txt"
+      - "cmake/**"
+      - "onnxsim/**"
+      - "scripts/convertmodel/**"
+      - ".gitmodules"
 
   # Allows you to run this workflow manually from the Actions tab
   workflow_dispatch:
