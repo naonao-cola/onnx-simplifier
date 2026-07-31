@@ -190,9 +190,23 @@ Consequences for the design:
 - `onnxsim/capi/onnxsim_c_api.{h,cpp}` — `OnnxsimExecuteFn` +
   `onnxsim_simplify_with_executor`.
 
+## Rust binding
+
+The Rust crates expose the seam:
+
+- `onnxsim-sys`: the DLPack structs (`DLManagedTensor` et al.), `OnnxsimExecuteFn`
+  / `OnnxsimExecuteFreeFn`, and `onnxsim_simplify_with_executor`, mirroring the C
+  header one-to-one.
+- `onnxsim` (safe): `simplify_with_executor(model, options, |submodel, inputs|
+  -> Result<Vec<Tensor>, E>)`. Inputs arrive as borrowed `TensorRef`s (dtype +
+  shape + little-endian bytes); outputs are owned `Tensor`s. Trampolines convert
+  to/from `DLManagedTensor` with an RAII deleter, guard the FFI boundary with
+  `catch_unwind`, and validate output byte lengths. The DLManagedTensor
+  construction/teardown round trip is unit-tested and verified leak/UAF-free
+  under AddressSanitizer.
+
 ## Follow-ups
 
-- Expose `onnxsim_simplify_with_executor` from the Rust `-sys`/safe crates.
 - Implement `JsModelExecutor` (embind adapter: `DLManagedTensor` ⇆ `ort.Tensor`,
   batched per fold group).
 - Optional dlpack-native Python executor via `__dlpack__` to drop the Python
