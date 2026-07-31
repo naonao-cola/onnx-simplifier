@@ -11,6 +11,9 @@ import {
   fetchModelBytes,
   fetchModelBytesXet,
   probeModelSize,
+  listOnnxFiles,
+  parseRef,
+  fileUrl,
   humanBytes,
 } from "./hf_models.mjs";
 import { openXetCache, makeCachingFetch } from "./xet_cache.mjs";
@@ -25,6 +28,24 @@ const xetToggle = document.getElementById("hf-use-xet");
 const xetConcurrencyInput = document.getElementById("hf-xet-concurrency");
 const clearCacheBtn = document.getElementById("hf-clear-cache");
 const cacheSizeEl = document.getElementById("hf-cache-size");
+const fileRow = document.getElementById("hf-file-row");
+const fileSelect = document.getElementById("hf-file-select");
+const fileNote = document.getElementById("hf-file-note");
+
+// parseRef throws on empty/garbage; this never does, for use in event handlers.
+function safeParse(ref) {
+  try {
+    return parseRef((ref || "").trim());
+  } catch {
+    return null;
+  }
+}
+
+// True for a plain Hugging Face repo reference (no explicit file, not a direct
+// URL) — the only case where a file picker makes sense.
+function isPlainRepo(parsed) {
+  return !!(parsed && parsed.repo && !parsed.file && !parsed.url);
+}
 
 // How many parallel byte-range shards to read a Xet download in. XetBlob fetches
 // serially, so >1 shard is what actually parallelizes the transfer. Clamped to a
@@ -132,26 +153,124 @@ async function showSizeFor(ref, knownSize) {
   }
 }
 
+// --- File selection within a repo -----------------------------------------
+// When the reference is a plain repo, list its .onnx files so the user can pick
+// which one to convert (the largest is auto-detected and pre-selected). A
+// separate token guards against a slow listing landing after the ref changed.
+let fileListToken = 0;
+
+function hideFileRow() {
+  if (fileRow) fileRow.style.display = "none";
+  if (fileSelect) fileSelect.innerHTML = "";
+  if (fileNote) fileNote.textContent = "";
+}
+
+// Reflect the currently-selected file's size in the status line.
+function renderSizeForSelectedFile() {
+  if (loading || !fileSelect) return;
+  const opt = fileSelect.options[fileSelect.selectedIndex];
+  if (!opt) return;
+  const size = Number(opt.dataset.size) || 0;
+  renderSize(size || null, opt.value.split("/").pop());
+}
+
+// List a repo's .onnx files and populate the picker (largest first / selected).
+// `knownSize` (from models.json for a curated pick) is shown immediately for
+// snappiness while the listing loads.
+async function refreshFileList(repo, knownSize) {
+  const token = ++fileListToken;
+  if (knownSize) renderSize(knownSize, repo.replace(/^onnxmodelzoo\//, ""));
+  else if (statusEl) statusEl.textContent = "checking size…";
+  if (fileNote) fileNote.textContent = "listing files…";
+  if (fileRow) fileRow.style.display = "";
+  try {
+    const files = await listOnnxFiles(repo);
+    if (token !== fileListToken || loading) return;
+    if (!files.length) {
+      hideFileRow();
+      if (statusEl) statusEl.textContent = "no .onnx file found in repo";
+      return;
+    }
+    fileSelect.innerHTML = "";
+    files.forEach((f, i) => {
+      const opt = document.createElement("option");
+      opt.value = f.file;
+      opt.dataset.size = f.size || "";
+      const sz = f.size ? ` (${humanBytes(f.size)})` : "";
+      opt.textContent = `${f.file}${sz}${i === 0 ? " — auto (largest)" : ""}`;
+      fileSelect.appendChild(opt);
+    });
+    fileSelect.selectedIndex = 0; // largest, i.e. the auto-detected file
+    if (fileNote) {
+      fileNote.textContent =
+        files.length > 1
+          ? `${files.length} .onnx files; largest auto-detected`
+          : "1 .onnx file (auto-detected)";
+    }
+    if (fileRow) fileRow.style.display = "";
+    renderSizeForSelectedFile();
+  } catch (e) {
+    if (token !== fileListToken) return;
+    // Listing failed (CORS, offline, …) — hide the picker and fall back to a
+    // plain size probe so the user still sees something.
+    hideFileRow();
+    showSizeFor(repo);
+  }
+}
+
+// Handle a committed reference: repos get a file picker + size; a specific file
+// or direct URL just gets a size probe (no picker, the file is fixed).
+function onRefCommitted(ref, knownSize) {
+  const parsed = safeParse(ref);
+  if (isPlainRepo(parsed)) {
+    refreshFileList(parsed.repo, knownSize);
+  } else {
+    hideFileRow();
+    showSizeFor(ref);
+  }
+}
+
+// The effective reference to load: when a specific file is chosen for a plain
+// repo, resolve it to that file's URL so the download uses the picked file
+// instead of the auto-detected largest.
+function effectiveRef() {
+  const raw = ((refInput && refInput.value) || (select && select.value) || "").trim();
+  if (fileRow && fileRow.style.display !== "none" && fileSelect && fileSelect.value) {
+    const parsed = safeParse(raw);
+    if (isPlainRepo(parsed)) {
+      return fileUrl(parsed.repo, fileSelect.value);
+    }
+  }
+  return raw;
+}
+
 // Picking from the dropdown mirrors into the text box so the two never disagree
 // about what "Load" will fetch, and the user can tweak the id before loading.
-// Both a dropdown pick and a committed edit of the text box preview the size.
+// Both a dropdown pick and a committed edit of the text box preview the size and
+// (for a repo) the file picker.
 if (select && refInput) {
   select.addEventListener("change", () => {
     if (select.value) {
       refInput.value = select.value;
-      showSizeFor(select.value, curatedSizes.get(select.value));
+      onRefCommitted(select.value, curatedSizes.get(select.value));
     }
   });
 }
 // `change` fires on commit (blur / Enter), so partial keystrokes don't each
-// trigger a network probe; the text box is mirrored from the dropdown
-// programmatically, which does not fire `change`, so there's no double probe.
+// trigger a network call; the text box is mirrored from the dropdown
+// programmatically, which does not fire `change`, so there's no double request.
 if (refInput) {
-  refInput.addEventListener("change", () => showSizeFor(refInput.value));
+  refInput.addEventListener("change", () => onRefCommitted(refInput.value));
+}
+// Choosing a different file updates the previewed size; effectiveRef() picks it
+// up at load time.
+if (fileSelect) {
+  fileSelect.addEventListener("change", renderSizeForSelectedFile);
 }
 
 async function doLoad() {
-  const ref = ((refInput && refInput.value) || (select && select.value) || "").trim();
+  // Resolve to the picked file when one is chosen, else the raw repo id / URL.
+  const ref = effectiveRef();
   if (!ref) {
     log("enter a Hugging Face repo id or .onnx URL, or pick one from the list");
     return;
@@ -224,6 +343,7 @@ async function doLoad() {
     let usedXet = false;
     let netBytes = 0; // bytes actually pulled over the network (Xet path)
     let hitBytes = 0; // bytes served from the chunk cache (Xet path)
+    let settleWrites = null; // await the Xet cache's background writes before reading its size
     if (xetToggle && xetToggle.checked) {
       usedXet = true;
       // Experimental Xet path, with the persistent chunk cache. Any failure
@@ -252,6 +372,7 @@ async function doLoad() {
         getXetCache(),
         { onHit: (_k, n) => { hits += 1; hitBytes += n; }, onNetwork },
       );
+      settleWrites = cachingFetch.settled;
       try {
         ({ bytes, name } = await fetchModelBytesXet(ref, {
           onLog: log,
@@ -284,6 +405,15 @@ async function doLoad() {
       } else if (elapsed > 0) {
         log(`reconstructed entirely from the chunk cache (${humanBytes(hitBytes)}) ` +
             `in ${elapsed.toFixed(1)}s — no network transfer`);
+      }
+      // The cache writes are backgrounded during download; wait for them so the
+      // readout reflects the chunks this download just added.
+      if (settleWrites) {
+        try {
+          await settleWrites();
+        } catch {
+          // ignore — refresh anyway with whatever landed
+        }
       }
       refreshCacheSize();
     } else if (elapsed > 0 && bytes && bytes.length) {

@@ -107,6 +107,21 @@ function pickOnnxSibling(siblings, repo) {
   return { sibling: onnx[0], count: onnx.length };
 }
 
+// List a repo's .onnx files as [{ file, size }], largest first — so the UI can
+// let the user pick which file to convert instead of always taking the auto-
+// detected (largest) one. `size` is a byte count or null when undisclosed.
+// Returns [] when the repo has no .onnx file (the caller decides what to do).
+export async function listOnnxFiles(repo) {
+  const siblings = await repoSiblings(repo);
+  return siblings
+    .filter((s) => s.rfilename && s.rfilename.endsWith(".onnx"))
+    .map((s) => ({
+      file: s.rfilename,
+      size: Number.isFinite(s.size) && s.size > 0 ? s.size : null,
+    }))
+    .sort((a, b) => (b.size || 0) - (a.size || 0));
+}
+
 // Pick the main .onnx file in a repo (largest, matching the regression workers)
 // and warn when the graph relies on external-data blobs the in-browser,
 // single-file converter can't load.

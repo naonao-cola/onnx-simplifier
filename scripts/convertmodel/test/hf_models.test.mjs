@@ -11,6 +11,7 @@ import {
   loadModelList,
   fetchModelBytes,
   probeModelSize,
+  listOnnxFiles,
   readBlobSharded,
   humanBytes,
 } from "../hf_models.mjs";
@@ -293,6 +294,42 @@ await acheck("probeModelSize returns a null size when Content-Length is absent",
     assert.equal(info.size, null);
     assert.equal(info.name, "net.onnx");
   });
+});
+
+await acheck("listOnnxFiles returns .onnx files largest-first with sizes", async () => {
+  const api = "https://huggingface.co/api/models/onnxmodelzoo/foo?blobs=true";
+  await withFetch(
+    {
+      [api]: {
+        json: {
+          siblings: [
+            { rfilename: "small.onnx", size: 10 },
+            { rfilename: "big.onnx", size: 999 },
+            { rfilename: "readme.md", size: 1 },
+            { rfilename: "nosize.onnx" },
+          ],
+        },
+      },
+    },
+    async () => {
+      const files = await listOnnxFiles("onnxmodelzoo/foo");
+      assert.deepEqual(files, [
+        { file: "big.onnx", size: 999 },
+        { file: "small.onnx", size: 10 },
+        { file: "nosize.onnx", size: null },
+      ]);
+    },
+  );
+});
+
+await acheck("listOnnxFiles returns [] for a repo with no .onnx", async () => {
+  const api = "https://huggingface.co/api/models/onnxmodelzoo/empty?blobs=true";
+  await withFetch(
+    { [api]: { json: { siblings: [{ rfilename: "readme.md", size: 1 }] } } },
+    async () => {
+      assert.deepEqual(await listOnnxFiles("onnxmodelzoo/empty"), []);
+    },
+  );
 });
 
 await acheck("probeModelSize surfaces a repo with no .onnx", async () => {

@@ -133,6 +133,28 @@ await acheck("does not block the response on a slow cache write", async () => {
   assert.deepEqual(Array.from(new Uint8Array(await r.arrayBuffer())), [1, 2, 3]);
 });
 
+await acheck("settled() waits for the background cache write to finish", async () => {
+  // The write is off the download path, but settled() lets a caller (e.g. the
+  // cache-size readout) wait until it lands.
+  let resolvePut;
+  const cache = {
+    get: async () => null,
+    put: () => new Promise((res) => (resolvePut = res)),
+  };
+  const realFetch = async () =>
+    new Response(new Uint8Array([1, 2]).buffer, { status: 206 });
+  const f = makeCachingFetch(realFetch, cache);
+  await f("https://cas.example/blk/s", { headers: { Range: "bytes=0-1" } });
+
+  const order = [];
+  const settled = f.settled().then(() => order.push("settled"));
+  await new Promise((r) => setTimeout(r, 5));
+  order.push("tick");
+  resolvePut();
+  await settled;
+  assert.deepEqual(order, ["tick", "settled"]); // settled resolved only after put
+});
+
 await acheck("a cache read error falls back to the network", async () => {
   const cache = {
     get: async () => {

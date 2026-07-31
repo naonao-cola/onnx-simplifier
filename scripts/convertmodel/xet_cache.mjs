@@ -90,7 +90,12 @@ export function isCacheable(url, method, rangeHeader) {
 // chunks never cross the network). A cache failure never breaks the request — it
 // just falls back to the network.
 export function makeCachingFetch(realFetch, cache, hooks = {}) {
-  return async (input, init) => {
+  // Background cache writes in flight. `fetchImpl.settled()` resolves once they
+  // all finish, so a caller can read an accurate cache size right after a
+  // download (the writes are deliberately not awaited on the download path).
+  const pendingWrites = new Set();
+
+  const fetchImpl = async (input, init) => {
     const { url, method, headers } = reqInfo(input, init);
     const range = headerGet(headers, "range");
     if (!isCacheable(url, method, range)) {
@@ -119,17 +124,24 @@ export function makeCachingFetch(realFetch, cache, hooks = {}) {
         // writes per object store and structured-cloning multi-MB blocks is
         // slow, so awaiting the write here would funnel even parallel range
         // fetches through IDB's write throughput and throttle the download.
-        // Serving `resp` doesn't depend on the block being stored.
+        // Serving `resp` doesn't depend on the block being stored. Tracked in
+        // `pendingWrites` so settled() can report when the cache is consistent.
         const entry = { status: resp.status, headers: pickHeaders(resp.headers), body };
-        Promise.resolve(cache.put(key, entry)).catch(() => {
+        const write = Promise.resolve(cache.put(key, entry)).catch(() => {
           // Non-fatal: the block just won't be cached for next time.
         });
+        pendingWrites.add(write);
+        write.then(() => pendingWrites.delete(write));
       } catch {
         // Non-fatal: serve the live response even if reading the body failed.
       }
     }
     return resp;
   };
+
+  // Resolve once every background cache write started so far has completed.
+  fetchImpl.settled = () => Promise.all([...pendingWrites]);
+  return fetchImpl;
 }
 
 // An IndexedDB-backed cache. Falls back to an in-memory Map when IndexedDB is
