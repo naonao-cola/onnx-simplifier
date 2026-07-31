@@ -33,6 +33,15 @@
                     input.disabled = false;
                     input.removeAttribute("title");
                 }
+                // The "Load from Hugging Face" controls share the same runtimes
+                // as the file picker, so enable them together.
+                for (const id of ["hf-model-select", "hf-model-input", "hf-load-button"]) {
+                    const el = document.getElementById(id);
+                    if (el) {
+                        el.disabled = false;
+                        el.removeAttribute("title");
+                    }
+                }
                 const status = document.getElementById("loading-status");
                 if (status) status.style.display = "none";
             };
@@ -194,16 +203,18 @@
                     }
                 };
 
-                input.addEventListener("change", async (e) => {
-                    const file = e.target.files[0];
-                    if (!file) return;
+                // Run one conversion. `modelName` names the source (for the
+                // download filename and issue report); `buf` is an ArrayBuffer
+                // that is *transferred* to the worker. Shared by the file picker
+                // and the Hugging Face loader (which calls it via the window
+                // handle published below).
+                const startConversion = (modelName, buf) => {
                     const optimizer = document.querySelector('input[name="optimizer"]:checked').value;
-                    result_name = (file.name.endsWith(".onnx") ? file.name.substring(0, file.name.length - 5) : file.name) + "." + optimizer + ".onnx"
+                    result_name = (modelName.endsWith(".onnx") ? modelName.substring(0, modelName.length - 5) : modelName) + "." + optimizer + ".onnx"
 
                     input.disabled = true;
                     dl_btn.disabled = true;
-                    const buf = await file.arrayBuffer();
-                    console.log("sending: ", file.name);
+                    console.log("sending: ", modelName);
                     let passes = null;
                     if (optimizer == "simplify") {
                         passes = Array.from(document.querySelectorAll('input[class="pass"]:not(:checked)')).map((v) => v.name);
@@ -218,7 +229,7 @@
                     last_run_info = {
                         optimizer, passes, constant_fold, shape_inference,
                         tensor_size_threshold, target_opset_version,
-                        file_name: file.name,
+                        file_name: modelName,
                     };
                     // Profiling only applies to "simplify"; the onnx-optimizer
                     // paths do not run the fixed-point profiler.
@@ -228,6 +239,21 @@
                     const annotate_model_info = document.getElementById("id_annotate_model_info").checked;
                     last_run_info.annotate_model_info = annotate_model_info;
                     worker.postMessage([optimizer, buf, passes, constant_fold, shape_inference, tensor_size_threshold, target_opset_version, profile, annotate_model_info], [buf]);
+                };
+                // Expose the conversion entry point for the Hugging Face loader
+                // module (hf_load.mjs), which downloads model bytes and drives
+                // the same path as an uploaded file.
+                window.__onnxsimStartConversion = startConversion;
+
+                input.addEventListener("change", async (e) => {
+                    const file = e.target.files[0];
+                    if (!file) return;
+                    // An uploaded file is readable as "original" from the file
+                    // input itself, so clear any model left over from a previous
+                    // Hugging Face load to avoid running stale bytes.
+                    window.__onnxsimOriginal = null;
+                    const buf = await file.arrayBuffer();
+                    startConversion(file.name, buf);
                 });
             };
         </script>
@@ -237,6 +263,24 @@
         <input type="file" id="file-input" disabled title="Loading WebAssembly runtime…" />
         <span id="loading-status">⏳ Loading WebAssembly runtime… the file picker is disabled until it is ready.</span>
         <button id="download-button" disabled>Download</button>
+        <div id="hf-loader" style="margin-top: 0.6em;">
+            <label for="hf-model-select">…or load from <a href="https://huggingface.co/onnxmodelzoo" target="_blank" rel="noopener">Hugging Face</a>:</label>
+            <select id="hf-model-select" disabled title="Loading WebAssembly runtime…">
+                <option value="">— pick a model from onnxmodelzoo —</option>
+            </select>
+            <input type="text" id="hf-model-input" size="42"
+                   placeholder="repo id (e.g. onnxmodelzoo/resnet18d_Opset18) or an .onnx URL"
+                   disabled title="Loading WebAssembly runtime…" />
+            <button id="hf-load-button" type="button" disabled title="Loading WebAssembly runtime…">Load</button>
+            <span id="hf-status"></span>
+            <div style="color: #666; font-size: 0.85em; margin-top: 0.25em;">
+                Fetches the model straight from the Hugging Face Hub in your
+                browser (nothing is uploaded), then runs it through the same
+                Simplify / Optimize path as an uploaded file. Bare names default
+                to the <code>onnxmodelzoo</code> org; any <code>owner/repo</code>
+                or direct <code>.onnx</code> URL works too.
+            </div>
+        </div>
         <div>
             <input type="radio" name="optimizer" value="simplify" id="optimizer_simplify" checked>
             <label for="optimizer_simplify">
@@ -300,6 +344,7 @@
             </div>
         </div>
         <script type="module" src="./netron_view.mjs"></script>
+        <script type="module" src="./hf_load.mjs"></script>
         <h2>Console outputs:</h2>
         <textarea id="log-output" readonly rows="20" style="width: 100%; box-sizing: border-box;"></textarea>
         <div>

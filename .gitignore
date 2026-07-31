@@ -167,3 +167,8 @@ node_modules/
 # is committed — they are produced at deploy time.
 /scripts/convertmodel/netron/
 /netron-src/
+
+# The curated model list is copied next to the page by the deploy workflow so
+# the "Load from Hugging Face" dropdown can read it same-origin. The source of
+# truth is scripts/regression/models.json; the copy is a build artifact.
+/scripts/convertmodel/models.json
