@@ -17,7 +17,7 @@ fi
 
 set -u -o pipefail
 
-ORT_VER=1.27.1
+ORT_VER=1.28.0
 if [ ! -d "third_party/onnxruntime-${ORT_VER}" ] ; then
     pushd third_party
     wget -q "https://github.com/microsoft/onnxruntime/archive/refs/tags/v${ORT_VER}.zip"
