@@ -6,13 +6,44 @@
 #include <optional>
 #include <vector>
 
+#include "dlpack/dlpack.h"
+
+// RAII owner for a DLManagedTensor: releasing it invokes the tensor's own
+// DLPack deleter exactly once (per the DLPack contract), which frees whatever
+// the producer attached -- a borrowed-buffer no-op, an Ort::Value, a host
+// allocation, etc. Move-only.
+struct DLManagedTensorDeleter {
+  void operator()(DLManagedTensor* t) const {
+    if (t != nullptr && t->deleter != nullptr) {
+      t->deleter(t);
+    }
+  }
+};
+using DLManagedTensorPtr =
+    std::unique_ptr<DLManagedTensor, DLManagedTensorDeleter>;
+
+// The constant-folding executor boundary. onnxsim runs each fold group by
+// building a throwaway sub-model and asking an executor to evaluate it. Tensors
+// cross this boundary as DLPack DLManagedTensors rather than onnx::TensorProto,
+// so an executor can borrow onnxsim's buffers (and hand its results back)
+// without a protobuf serialize/parse round trip. This is also the seam an
+// embedder implements to plug in its own ONNX runtime (see the C ABI executor
+// callback in capi/onnxsim_c_api.h, and docs/dlpack-executor.md).
 struct ModelExecutor {
   virtual ~ModelExecutor() = default;
 
-  // public it for pybind11
-  virtual std::vector<onnx::TensorProto> _Run(
+  // Evaluate `model`, whose graph inputs are fed by `inputs` (positional, i.e.
+  // inputs[i] feeds model.graph().input(i)), and return one tensor per graph
+  // output (positional, matching model.graph().output()).
+  //
+  // Ownership: `inputs` are BORROWED for the duration of the call -- the
+  // executor must not retain them past return. Each returned DLManagedTensorPtr
+  // is freshly owned by the caller. Tensors are CPU, contiguous, little-endian.
+  //
+  // public for pybind11 / nanobind trampolines
+  virtual std::vector<DLManagedTensorPtr> Run(
       const onnx::ModelProto& model,
-      const std::vector<onnx::TensorProto>& inputs) const = 0;
+      const std::vector<const DLManagedTensor*>& inputs) const = 0;
 };
 
 // A user-supplied whole-graph rewriter. When one is passed to ``Simplify`` it

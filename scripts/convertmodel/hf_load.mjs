@@ -10,6 +10,7 @@ import {
   loadModelList,
   fetchModelBytes,
   fetchModelBytesXet,
+  probeModelSize,
   humanBytes,
 } from "./hf_models.mjs";
 import { openXetCache, makeCachingFetch } from "./xet_cache.mjs";
@@ -55,12 +56,54 @@ loadModelList().then((ids) => {
   }
 });
 
+// Show the download size for the currently-referenced model *before* fetching,
+// so a user can see how big it is before committing to the download. The size
+// comes from the Hub API listing (for a repo id) or a HEAD request (for an exact
+// file / direct URL). A monotonic token guards against a slow probe overwriting
+// the status line for a reference the user has since changed.
+let probeToken = 0;
+let loading = false; // a download is in flight; don't let a probe touch the status
+async function showSizeFor(ref) {
+  if (loading) return;
+  ref = (ref || "").trim();
+  const token = ++probeToken;
+  if (!ref) {
+    if (statusEl) statusEl.textContent = "";
+    return;
+  }
+  if (statusEl) statusEl.textContent = "checking size…";
+  try {
+    const { size, name } = await probeModelSize(ref);
+    if (token !== probeToken) return; // a newer reference superseded this probe
+    if (statusEl) {
+      const label = name ? `${name} — ` : "";
+      statusEl.textContent = size
+        ? `${label}≈ ${humanBytes(size)} to download`
+        : `${label}size unavailable`;
+    }
+  } catch (e) {
+    if (token !== probeToken) return;
+    if (statusEl) statusEl.textContent = "size unavailable — see console output";
+    log(`could not determine model size for "${ref}": ${e && e.message ? e.message : e}`);
+  }
+}
+
 // Picking from the dropdown mirrors into the text box so the two never disagree
 // about what "Load" will fetch, and the user can tweak the id before loading.
+// Both a dropdown pick and a committed edit of the text box preview the size.
 if (select && refInput) {
   select.addEventListener("change", () => {
-    if (select.value) refInput.value = select.value;
+    if (select.value) {
+      refInput.value = select.value;
+      showSizeFor(select.value);
+    }
   });
+}
+// `change` fires on commit (blur / Enter), so partial keystrokes don't each
+// trigger a network probe; the text box is mirrored from the dropdown
+// programmatically, which does not fire `change`, so there's no double probe.
+if (refInput) {
+  refInput.addEventListener("change", () => showSizeFor(refInput.value));
 }
 
 async function doLoad() {
@@ -74,6 +117,11 @@ async function doLoad() {
     return;
   }
 
+  // Take over the status line from any size preview: mark a load in flight and
+  // invalidate outstanding probes so a late size result can't overwrite the
+  // download progress below.
+  loading = true;
+  probeToken += 1;
   loadBtn.disabled = true;
   if (fileInput) fileInput.disabled = true;
   if (statusEl) statusEl.textContent = "loading…";
@@ -177,6 +225,7 @@ async function doLoad() {
     // the worker's convert-done message does that).
     if (fileInput) fileInput.disabled = false;
   } finally {
+    loading = false;
     loadBtn.disabled = false;
   }
 }

@@ -12,6 +12,8 @@
 
 #include <stddef.h>
 
+#include "dlpack/dlpack.h"
+
 #if defined(_WIN32)
 #if defined(ONNXSIM_C_API_BUILD)
 #define ONNXSIM_C_API __declspec(dllexport)
@@ -72,6 +74,53 @@ typedef void (*OnnxsimRewriteFreeFn)(void* user_data, void* model_data,
                                      size_t model_size);
 
 /*
+ * Optional custom constant-folding executor callback (the embeddability seam).
+ *
+ * When supplied to onnxsim_simplify_with_executor it REPLACES the built-in
+ * ONNX Runtime constant folder: onnxsim hands each fold group's throwaway
+ * sub-model plus its input tensors to this callback, which evaluates it in the
+ * host's own ONNX runtime and returns the resulting tensors. This lets onnxsim
+ * be embedded in another compiler/runtime stack (a different ORT build, IREE,
+ * TVM, a hardware vendor's runtime) without depending on the vendored ORT, and
+ * without serializing tensors to TensorProto: tensors cross as DLPack
+ * DLManagedTensors (see third_party/dlpack/dlpack.h, docs/dlpack-executor.md).
+ *
+ * Call contract, per fold group:
+ *   - `model_data`/`model_size`: the sub-model as a serialized ONNX ModelProto.
+ *     Its graph.input() are fed positionally by `inputs`; produce one output
+ *     per graph.output(), in that order.
+ *   - `inputs`/`num_inputs`: input tensors, BORROWED for the duration of the
+ *     call. The callback must NOT free them or retain them past return.
+ *   - On success return 0 and set `*out_outputs` to an array of `num` owned
+ *     DLManagedTensor* (set `*out_num_outputs = num`). onnxsim takes ownership
+ *     of each tensor and releases it via that tensor's own DLPack `deleter`; it
+ *     then calls the paired OnnxsimExecuteFreeFn (if any) to release the array
+ *     container itself. All tensors must be CPU (kDLCPU), contiguous, and of a
+ *     dtype onnxsim supports (float16/float/double/bfloat16, 8/16/32/64-bit
+ *     ints, bool).
+ *   - Return non-zero to signal failure; simplification aborts with
+ *     ONNXSIM_ERROR.
+ *
+ * `user_data` is passed through untouched on every call.
+ */
+typedef int (*OnnxsimExecuteFn)(void* user_data, const void* model_data,
+                                size_t model_size,
+                                const DLManagedTensor* const* inputs,
+                                size_t num_inputs,
+                                DLManagedTensor*** out_outputs,
+                                size_t* out_num_outputs);
+
+/*
+ * Releases the output array a OnnxsimExecuteFn returned (the container, not the
+ * tensors -- each DLManagedTensor is released through its own deleter). Called
+ * with the same `user_data` and the exact `outputs`/`num_outputs` the execute
+ * callback produced. May be NULL, in which case onnxsim does not free the array
+ * (e.g. when the callback returns a reused/static buffer).
+ */
+typedef void (*OnnxsimExecuteFreeFn)(void* user_data, DLManagedTensor** outputs,
+                                     size_t num_outputs);
+
+/*
  * Simplify a model given as a serialized ONNX ModelProto.
  *
  * skip_optimizers semantics mirror the C++/Python API:
@@ -109,6 +158,26 @@ onnxsim_simplify(const void* model_data, size_t model_size,
                  int target_opset_version, OnnxsimRewriteFn rewrite_fn,
                  OnnxsimRewriteFreeFn rewrite_free_fn, void* rewrite_user_data,
                  void** out_data, size_t* out_size, char** out_error);
+
+/*
+ * Same as onnxsim_simplify, but drives constant folding through a host-provided
+ * executor callback instead of the built-in ONNX Runtime (see
+ * OnnxsimExecuteFn). This is the seam for embedding onnxsim in another
+ * ONNX-based stack. Passing a NULL execute_fn falls back to the built-in
+ * executor, making this a drop-in superset of onnxsim_simplify. execute_free_fn
+ * (may be NULL) releases each output array; execute_user_data is passed through
+ * to both callbacks. All other parameters and the out_* contract match
+ * onnxsim_simplify.
+ */
+ONNXSIM_C_API OnnxsimStatus onnxsim_simplify_with_executor(
+    const void* model_data, size_t model_size,
+    const char* const* skip_optimizers, size_t num_skip_optimizers,
+    int skip_optimizers_is_null, int constant_folding, int shape_inference,
+    size_t tensor_size_threshold, int target_opset_version,
+    OnnxsimRewriteFn rewrite_fn, OnnxsimRewriteFreeFn rewrite_free_fn,
+    void* rewrite_user_data, OnnxsimExecuteFn execute_fn,
+    OnnxsimExecuteFreeFn execute_free_fn, void* execute_user_data,
+    void** out_data, size_t* out_size, char** out_error);
 
 /*
  * Same as onnxsim_simplify, but also applies a set of data-driven rewrite rules

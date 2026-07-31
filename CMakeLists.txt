@@ -24,12 +24,28 @@ option(ONNXSIM_WASM_NODE "For node (enable NODERAWFS etc.)" OFF)
 option(ONNXSIM_C_API "Build the C ABI shared library used by the Rust wrapper and other FFI consumers" OFF)
 option(ONNXSIM_COVERAGE "Instrument onnxsim's own C++ targets for gcov/llvm-cov coverage" OFF)
 option(ONNXSIM_TESTS "Build the dependency-free C++ unit tests (e.g. sym_expr)" OFF)
+option(ONNXSIM_WASM_ORT_WEB "For the Emscripten build: delegate constant folding to the page's onnxruntime-web instead of compiling and linking ONNX Runtime into the module" OFF)
+
+if (ONNXSIM_WASM_ORT_WEB)
+  # The whole point of this mode is to NOT bundle ONNX Runtime -- constant
+  # folding is delegated to the page's onnxruntime-web at runtime -- so force the
+  # built-in ORT off. onnxsim then compiles with NO_BUILTIN_ORT (all Ort:: code
+  # #ifdef'd out) and no ORT source is fetched or compiled.
+  set(ONNXSIM_BUILTIN_ORT OFF)
+  # In the default WASM build, ONNX Runtime builds protobuf for the wasm target
+  # and hands it to onnx (build_ort.cmake sets onnxruntime_USE_FULL_PROTOBUF and
+  # ONNX_TARGET_NAME). With ORT gone, onnx has no wasm protobuf and its generated
+  # .pb.* code fails to compile. Have onnx build its own bundled protobuf for the
+  # target instead; the host protoc is still used for codegen via
+  # ONNX_CUSTOM_PROTOC_EXECUTABLE (passed by build_wasm.sh).
+  set(ONNX_BUILD_CUSTOM_PROTOBUF ON CACHE BOOL "" FORCE)
+endif()
 
 if (ONNXSIM_PYTHON AND EMSCRIPTEN)
   message(STATUS "python and emscripten cannot be built at the same time")
 endif()
 
-if (NOT ONNXSIM_BUILTIN_ORT AND EMSCRIPTEN)
+if (NOT ONNXSIM_BUILTIN_ORT AND EMSCRIPTEN AND NOT ONNXSIM_WASM_ORT_WEB)
   message(STATUS "emscripten needs builtin ort")
 endif()
 
@@ -48,6 +64,10 @@ endif()
 if (ONNXSIM_PREBUILT_ORT AND EMSCRIPTEN)
   message(FATAL_ERROR "ONNXSIM_PREBUILT_ORT is not supported for Emscripten; the "
                       "WebAssembly build must compile ONNX Runtime from source")
+endif()
+if (ONNXSIM_WASM_ORT_WEB AND NOT EMSCRIPTEN)
+  message(FATAL_ERROR "ONNXSIM_WASM_ORT_WEB only applies to the Emscripten/"
+                      "WebAssembly build (it routes folding through onnxruntime-web)")
 endif()
 
 if (ONNXSIM_BUILTIN_ORT)
@@ -88,11 +108,22 @@ if (ONNXSIM_BUILTIN_ORT)
   endif()
 endif()
 target_include_directories(onnxsim PUBLIC onnxsim)
+# dlpack.h (at third_party/dlpack/dlpack.h) is the tensor-exchange type at the
+# ModelExecutor / C-ABI executor boundary (see docs/dlpack-executor.md). The
+# include root is third_party/ so `#include "dlpack/dlpack.h"` resolves. PUBLIC
+# so the C API and any target that includes onnxsim.h / dlpack_bridge.h finds it.
+target_include_directories(onnxsim PUBLIC third_party)
 if (NOT ONNXSIM_BUILTIN_ORT)
   target_compile_definitions(onnxsim PUBLIC NO_BUILTIN_ORT)
 endif()
 if (EMSCRIPTEN)
-  target_link_libraries(onnxsim ${ORT_NAME} onnx_optimizer)
+  if (ONNXSIM_BUILTIN_ORT)
+    target_link_libraries(onnxsim ${ORT_NAME} onnx_optimizer)
+  else()
+    # ORT-web build: no ONNX Runtime is linked in, so onnx is no longer provided
+    # transitively by it. Link onnx (and onnx_optimizer) directly instead.
+    target_link_libraries(onnxsim onnx_optimizer onnx)
+  endif()
 else()
   # The profiler samples RSS on a background std::thread, so link the platform
   # threading library explicitly rather than relying on it arriving transitively
@@ -104,6 +135,10 @@ endif()
 
 if(EMSCRIPTEN)
   list(APPEND ONNXSIM_WASM_INTERFACE scripts/convertmodel/interface.cpp)
+  if (ONNXSIM_WASM_ORT_WEB)
+    # The onnxruntime-web-backed executor (compiled only in this mode).
+    list(APPEND ONNXSIM_WASM_INTERFACE scripts/convertmodel/js_model_executor.cpp)
+  endif()
 endif()
 
 add_executable(
@@ -118,6 +153,20 @@ if (EMSCRIPTEN)
   target_link_libraries(onnxsim_bin embind "-Wl,--whole-archive" onnxsim "-Wl,--no-whole-archive")
 else()
   target_link_libraries(onnxsim_bin onnxsim)
+endif()
+
+if (ONNXSIM_WASM_ORT_WEB)
+  # interface.cpp / onnxsim_bin.cpp select GetJsModelExecutor() under this define
+  # and js_model_executor.cpp implements it. onnxsim_bin.cpp lives in onnxsim/bin,
+  # so add scripts/convertmodel to its include path to find js_model_executor.h.
+  target_compile_definitions(onnxsim_bin PRIVATE ONNXSIM_WASM_ORT_WEB)
+  target_include_directories(onnxsim_bin PRIVATE scripts/convertmodel)
+  # JsModelExecutor::_Run blocks on an onnxruntime-web Promise via
+  # emscripten::val::await(), which requires Asyncify. Asyncify also makes the
+  # exported onnxsimplify_export return a Promise (the worker awaits it). The
+  # larger Asyncify stack covers the deep Simplify -> RunOps -> _Run call chain
+  # that is unwound and rewound across each fold group's await.
+  target_link_options(onnxsim_bin PRIVATE "-sASYNCIFY" "-sASYNCIFY_STACK_SIZE=131072")
 endif()
 
 if (ONNXSIM_C_API)
@@ -230,4 +279,11 @@ if (ONNXSIM_TESTS)
                                       onnxsim/sym_value_eval.cpp onnxsim/sym_expr.cpp)
   target_include_directories(sym_shape_infer_test PRIVATE onnxsim)
   add_test(NAME sym_shape_infer_test COMMAND sym_shape_infer_test)
+
+  # The ONNX<->DLPack dtype mapping (dlpack_dtype.h) is pure: it operates on the
+  # integer ONNX dtype codes and depends only on dlpack.h, so its test builds
+  # and runs standalone -- including under Emscripten -- without ONNX / ORT.
+  add_executable(dlpack_dtype_test onnxsim/dlpack_dtype_test.cpp)
+  target_include_directories(dlpack_dtype_test PRIVATE onnxsim third_party)
+  add_test(NAME dlpack_dtype_test COMMAND dlpack_dtype_test)
 endif()

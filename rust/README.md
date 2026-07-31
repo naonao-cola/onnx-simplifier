@@ -126,7 +126,7 @@ three modes:
 
    Set `ONNXSIM_SKIP_ORT_DOWNLOAD=1` to forbid the automatic download (the build
    then requires the ONNX Runtime source to already be present at
-   `third_party/onnxruntime-1.27.1`).
+   `third_party/onnxruntime-1.28.0`).
 
    **Fast path — prebuilt ONNX Runtime.** To skip compiling ONNX Runtime from
    source, set `ONNXSIM_PREBUILT_ORT=1`. The build then links an official

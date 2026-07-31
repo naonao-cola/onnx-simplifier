@@ -1,5 +1,30 @@
 importScripts("./onnxsim.js");
 
+// onnxruntime-web CDN location, kept in sync with inference_browser.mjs. Only
+// used by the ORT-web build of the module (see below).
+const ORT_VERSION = "1.27.0";
+const ORT_BASE = `https://cdn.jsdelivr.net/npm/onnxruntime-web@${ORT_VERSION}/dist/`;
+
+// For the ORT-web build (onnxsim compiled with ONNXSIM_WASM_ORT_WEB): load
+// onnxruntime-web and register the runner JsModelExecutor calls. In the default
+// built-in-ORT build onnxsim_needs_ort_web() is false and this is a no-op, so
+// the worker keeps behaving exactly as before.
+async function setupOrtWebIfNeeded(runtime) {
+    if (!(typeof runtime.onnxsim_needs_ort_web === "function" &&
+          runtime.onnxsim_needs_ort_web())) {
+        return;
+    }
+    const [ortMod, { makeOrtRunner }] = await Promise.all([
+        import(/* @vite-ignore */ `${ORT_BASE}ort.min.mjs`),
+        import("./ort_executor.mjs"),
+    ]);
+    const ort = ortMod.default ?? ortMod;
+    // Pull the matching wasm binaries from the same CDN directory.
+    ort.env.wasm.wasmPaths = ORT_BASE;
+    // JsModelExecutor::Run reaches this via val::module_property("onnxsimOrtWebRun").
+    runtime.onnxsimOrtWebRun = makeOrtRunner(ort);
+}
+
 create_onnxsim({
     preRun: [(runtime) => {
         runtime.ENV.LOG_THRESHOLD = "-1";
@@ -12,12 +37,21 @@ create_onnxsim({
         console.error("stderr:", [str]);
         postMessage(["stderr", str]);
     },
-}).then((runtime) => {
+}).then(async (runtime) => {
+    // Wire up onnxruntime-web before announcing readiness, so the first
+    // conversion already has a runner registered (only matters in the ORT-web
+    // build; a no-op otherwise).
+    try {
+        await setupOrtWebIfNeeded(runtime);
+    } catch (err) {
+        postMessage(["stderr", "failed to load onnxruntime-web: " + err]);
+        return;
+    }
     // Tell the page the WASM runtime is initialized so it can enable the
     // "Choose file" picker. Registering the message listener below only
     // happens now, so any file posted earlier would be dropped.
     postMessage(["ready"]);
-    addEventListener("message", (e) => {
+    addEventListener("message", async (e) => {
         console.log(e.data);
         const buf = e.data[1];
         // `model` is the converted model bytes (a Uint8Array view); `trace` is
@@ -28,8 +62,11 @@ create_onnxsim({
         switch (e.data[0]) {
             case "simplify": {
                 // Simplify returns { model, trace } so the profiling trace can
-                // ride back alongside the converted model.
-                const result = runtime.onnxsimplify_export(
+                // ride back alongside the converted model. In the ORT-web build
+                // onnxsimplify_export is Asyncified and returns a Promise, so
+                // await when needed; in the built-in-ORT build it returns the
+                // object synchronously and the await is a harmless pass-through.
+                let result = runtime.onnxsimplify_export(
                     buf,
                     e.data[2], // skip optimizers
                     e.data[3], // constant folding
@@ -39,6 +76,9 @@ create_onnxsim({
                     e.data[7], // profile (emit a Chrome trace)
                     e.data[8], // annotate model info (MACs/FLOPs) into metadata_props
                 );
+                if (result && typeof result.then === "function") {
+                    result = await result;
+                }
                 if (result) {
                     model = result.model;
                     trace = result.trace || "";

@@ -5,7 +5,7 @@
 Don't get confused by `ONNXSIM_BUILTIN_ORT` when working on the wheel build.
 
 - `CMakeLists.txt` defaults `ONNXSIM_BUILTIN_ORT` to **ON**, which would compile the
-  vendored ONNX Runtime C++ source under `third_party/onnxruntime-1.27.1` (via
+  vendored ONNX Runtime C++ source under `third_party/onnxruntime-1.28.0` (via
   `cmake/build_ort.cmake`). That default is for the standalone C++/WASM builds, **not**
   the Python wheel.
 - `setup.py` explicitly passes **`-DONNXSIM_BUILTIN_ORT=OFF`** when building the wheel, so

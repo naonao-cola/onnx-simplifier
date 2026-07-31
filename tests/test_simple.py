@@ -790,3 +790,54 @@ def test_ir3_conv_bn_fuses():
     # The BatchNormalization is folded into the Conv weights and disappears.
     assert all(n.op_type != "BatchNormalization" for n in sim_model.graph.node)
     assert any(n.op_type == "Conv" for n in sim_model.graph.node)
+
+
+def _ir3_matmul_model(opset: int) -> onnx.ModelProto:
+    # A minimal IR-3 model whose weight ``W`` is *also* listed as a graph input,
+    # as IR<4 required. ``opset`` selects the ai.onnx version under test.
+    import numpy as np
+
+    W = numpy_helper.from_array(np.ones((2, 2), dtype=np.float32), "W")
+    graph = helper.make_graph(
+        [helper.make_node("MatMul", ["X", "W"], ["Y"])],
+        "g",
+        [
+            helper.make_tensor_value_info("X", TensorProto.FLOAT, [2, 2]),
+            helper.make_tensor_value_info("W", TensorProto.FLOAT, [2, 2]),
+        ],
+        [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [2, 2])],
+        [W],
+    )
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", opset)])
+    model.ir_version = 3
+    return model
+
+
+def test_remove_initializer_from_input_skips_ancient_opset():
+    # The opset-3 onnx-caffe2 ``resnet50-caffe2-v1-3`` regressed once IR<4
+    # folding was enabled: bumping such a model to IR 4 lets onnxoptimizer's
+    # value-baking fusions fire, and ``fuse_bn_into_conv`` emits ``Cast`` nodes
+    # using the modern INT ``to`` attribute -- illegal under opset 3, where
+    # ``to`` is a STRING -- so onnx/onnxruntime abort with "Mismatched attribute
+    # type in 'Cast_0 : to'. Expected: 'STRING', actual: 'INT'". Opsets below
+    # ``_MIN_OPSET_FOR_INITIALIZER_FOLD`` must therefore be left untouched: the
+    # initializer stays a graph input (so the fusions stay disabled) and the IR
+    # version is not bumped.
+    from onnxsim.onnx_simplifier import remove_initializer_from_input
+
+    model = _ir3_matmul_model(opset=3)
+    out = remove_initializer_from_input(model)
+    assert out.ir_version == 3
+    assert "W" in [i.name for i in out.graph.input]
+
+
+def test_remove_initializer_from_input_folds_modern_opset():
+    # An opset >= 6 IR-3 model (e.g. the opset-8 ``resnet101-v1-7``) is safe to
+    # fold: the initializer-input is dropped and the model bumped to IR 4 so the
+    # freed constant becomes foldable and value-baking fusions can fire.
+    from onnxsim.onnx_simplifier import remove_initializer_from_input
+
+    model = _ir3_matmul_model(opset=8)
+    out = remove_initializer_from_input(model)
+    assert out.ir_version == 4
+    assert "W" not in [i.name for i in out.graph.input]
