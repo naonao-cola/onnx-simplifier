@@ -130,7 +130,8 @@ inline DLManagedTensor* BuildFromProto(const onnx::TensorProto& src,
                                        TensorProtoManagerCtx* ctx) {
   if constexpr (std::endian::native != std::endian::little) {
     delete ctx;
-    throw std::invalid_argument("dlpack bridge: only little endian is supported");
+    throw std::invalid_argument(
+        "dlpack bridge: only little endian is supported");
   }
   if (src.data_location() == onnx::TensorProto::EXTERNAL) {
     delete ctx;
@@ -201,9 +202,9 @@ inline onnx::TensorProto ToTensorProto(const DLTensor& t,
   }
   int32_t onnx_dtype;
   if (!TryDLToOnnx(t.dtype, &onnx_dtype)) {
-    throw std::invalid_argument(
-        "dlpack bridge: unsupported DLDataType code=" +
-        std::to_string(t.dtype.code) + " bits=" + std::to_string(t.dtype.bits));
+    throw std::invalid_argument("dlpack bridge: unsupported DLDataType code=" +
+                                std::to_string(t.dtype.code) +
+                                " bits=" + std::to_string(t.dtype.bits));
   }
   onnx::TensorProto tp;
   if (!name.empty()) tp.set_name(name);
@@ -211,8 +212,7 @@ inline onnx::TensorProto ToTensorProto(const DLTensor& t,
   for (int32_t i = 0; i < t.ndim; ++i) tp.add_dims(t.shape[i]);
 
   const size_t nbytes = NumElements(t.shape, t.ndim) * SizeOf(t.dtype);
-  const auto* base =
-      static_cast<const uint8_t*>(t.data) + t.byte_offset;
+  const auto* base = static_cast<const uint8_t*>(t.data) + t.byte_offset;
   tp.set_raw_data(base, nbytes);  // single copy into the persisted model
   return tp;
 }
@@ -237,7 +237,8 @@ inline Ort::Value BorrowAsOrtValue(const DLTensor& t) {
   }
   int32_t onnx_dtype;
   if (!TryDLToOnnx(t.dtype, &onnx_dtype)) {
-    throw std::invalid_argument("dlpack bridge: unsupported DLDataType for ORT");
+    throw std::invalid_argument(
+        "dlpack bridge: unsupported DLDataType for ORT");
   }
   const size_t nbytes = NumElements(t.shape, t.ndim) * SizeOf(t.dtype);
   auto* base = static_cast<uint8_t*>(t.data) + t.byte_offset;

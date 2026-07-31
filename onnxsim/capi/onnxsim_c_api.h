@@ -161,12 +161,13 @@ onnxsim_simplify(const void* model_data, size_t model_size,
 
 /*
  * Same as onnxsim_simplify, but drives constant folding through a host-provided
- * executor callback instead of the built-in ONNX Runtime (see OnnxsimExecuteFn).
- * This is the seam for embedding onnxsim in another ONNX-based stack. Passing a
- * NULL execute_fn falls back to the built-in executor, making this a drop-in
- * superset of onnxsim_simplify. execute_free_fn (may be NULL) releases each
- * output array; execute_user_data is passed through to both callbacks. All
- * other parameters and the out_* contract match onnxsim_simplify.
+ * executor callback instead of the built-in ONNX Runtime (see
+ * OnnxsimExecuteFn). This is the seam for embedding onnxsim in another
+ * ONNX-based stack. Passing a NULL execute_fn falls back to the built-in
+ * executor, making this a drop-in superset of onnxsim_simplify. execute_free_fn
+ * (may be NULL) releases each output array; execute_user_data is passed through
+ * to both callbacks. All other parameters and the out_* contract match
+ * onnxsim_simplify.
  */
 ONNXSIM_C_API OnnxsimStatus onnxsim_simplify_with_executor(
     const void* model_data, size_t model_size,

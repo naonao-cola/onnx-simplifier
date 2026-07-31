@@ -461,11 +461,12 @@ std::vector<onnx::TensorProto> RunOps(
   // profiled regardless of binding. The ProfiledScope is a no-op unless
   // ONNXSIM_PROFILE is set.
   // Bridge to the DLPack executor boundary. Each feed borrows its initializer's
-  // buffer (no copy); `input_tps` is fully built above and not mutated again, so
-  // the borrowed pointers stay valid. `input_dls` owns the managed tensors and
-  // must outlive the executor call (the executor borrows them). Outputs come
-  // back as DLManagedTensors and are baked into TensorProto raw_data here -- the
-  // single, unavoidable copy, since folded results become model initializers.
+  // buffer (no copy); `input_tps` is fully built above and not mutated again,
+  // so the borrowed pointers stay valid. `input_dls` owns the managed tensors
+  // and must outlive the executor call (the executor borrows them). Outputs
+  // come back as DLManagedTensors and are baked into TensorProto raw_data here
+  // -- the single, unavoidable copy, since folded results become model
+  // initializers.
   std::vector<DLManagedTensorPtr> input_dls;
   input_dls.reserve(input_tps.size());
   for (const auto& tp : input_tps) {

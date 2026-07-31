@@ -70,13 +70,12 @@ int main() {
 
   // Unsupported ONNX dtypes must be rejected, not silently mismapped.
   const std::vector<int32_t> unsupported = {
-      ONNX_UNDEFINED, ONNX_STRING, ONNX_COMPLEX64, ONNX_COMPLEX128,
-      17 /*FLOAT8E4M3FN*/, 21 /*UINT4*/, 22 /*INT4*/, 999 /*garbage*/,
+      ONNX_UNDEFINED,      ONNX_STRING,  ONNX_COMPLEX64, ONNX_COMPLEX128,
+      17 /*FLOAT8E4M3FN*/, 21 /*UINT4*/, 22 /*INT4*/,    999 /*garbage*/,
   };
   for (int32_t code : unsupported) {
     DLDataType dt;
-    Check(!TryOnnxToDL(code, &dt),
-          "reject onnx dtype " + std::to_string(code));
+    Check(!TryOnnxToDL(code, &dt), "reject onnx dtype " + std::to_string(code));
   }
 
   // Vector (lanes != 1) and unknown DLDataTypes must be rejected by the

@@ -179,16 +179,13 @@ class CApiModelExecutor : public ModelExecutor {
 // non-NULL -- otherwise the built-in ORT executor), and hand back a freshly
 // malloc'd buffer of serialized bytes. All out-parameters follow the C API
 // contract documented in the header.
-OnnxsimStatus SimplifyToBuffer(const void* model_data, size_t model_size,
-                               const char* const* skip_optimizers,
-                               size_t num_skip_optimizers,
-                               int skip_optimizers_is_null,
-                               int constant_folding, int shape_inference,
-                               size_t tensor_size_threshold,
-                               int target_opset_version,
-                               const GraphRewriter* rewriter,
-                               const ModelExecutor* executor, void** out_data,
-                               size_t* out_size, char** out_error) {
+OnnxsimStatus SimplifyToBuffer(
+    const void* model_data, size_t model_size,
+    const char* const* skip_optimizers, size_t num_skip_optimizers,
+    int skip_optimizers_is_null, int constant_folding, int shape_inference,
+    size_t tensor_size_threshold, int target_opset_version,
+    const GraphRewriter* rewriter, const ModelExecutor* executor,
+    void** out_data, size_t* out_size, char** out_error) {
   if (out_data != nullptr) {
     *out_data = nullptr;
   }
@@ -311,13 +308,13 @@ OnnxsimStatus onnxsim_simplify_with_executor(
   if (execute_fn != nullptr) {
     executor.emplace(execute_fn, execute_free_fn, execute_user_data);
   }
-  return SimplifyToBuffer(
-      model_data, model_size, skip_optimizers, num_skip_optimizers,
-      skip_optimizers_is_null, constant_folding, shape_inference,
-      tensor_size_threshold, target_opset_version,
-      rewriter.has_value() ? &rewriter.value() : nullptr,
-      executor.has_value() ? &executor.value() : nullptr, out_data, out_size,
-      out_error);
+  return SimplifyToBuffer(model_data, model_size, skip_optimizers,
+                          num_skip_optimizers, skip_optimizers_is_null,
+                          constant_folding, shape_inference,
+                          tensor_size_threshold, target_opset_version,
+                          rewriter.has_value() ? &rewriter.value() : nullptr,
+                          executor.has_value() ? &executor.value() : nullptr,
+                          out_data, out_size, out_error);
 }
 
 OnnxsimStatus onnxsim_simplify_with_rules(
@@ -356,12 +353,11 @@ OnnxsimStatus onnxsim_simplify_with_rules(
         onnxsim::MakeFunctionProtoRewriter(
             BuildRewriteRules(pattern_data, pattern_sizes, replacement_data,
                               replacement_sizes, num_rules));
-    return SimplifyToBuffer(model_data, model_size, skip_optimizers,
-                            num_skip_optimizers, skip_optimizers_is_null,
-                            constant_folding, shape_inference,
-                            tensor_size_threshold, target_opset_version,
-                            rewriter.get(), /*executor=*/nullptr, out_data,
-                            out_size, out_error);
+    return SimplifyToBuffer(
+        model_data, model_size, skip_optimizers, num_skip_optimizers,
+        skip_optimizers_is_null, constant_folding, shape_inference,
+        tensor_size_threshold, target_opset_version, rewriter.get(),
+        /*executor=*/nullptr, out_data, out_size, out_error);
   } catch (const std::exception& e) {
     SetError(out_error, e.what());
     return ONNXSIM_ERROR;

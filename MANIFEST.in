@@ -1,6 +1,9 @@
 recursive-include onnxsim *.h *.hpp *.cc *.cpp
 recursive-include cmake *
 recursive-include third_party/onnx-optimizer *
+# Vendored DLPack header. onnxsim.h / dlpack_bridge.h include <dlpack/dlpack.h>,
+# so the wheel build compiles onnxsim.cpp against it; it must ship in the sdist.
+recursive-include third_party/dlpack *.h
 recursive-exclude third_party/onnx-optimizer/*build* *
 include CMakeLists.txt
 include VERSION

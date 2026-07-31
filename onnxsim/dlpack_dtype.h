@@ -69,20 +69,47 @@ inline bool TryOnnxToDL(int32_t onnx_dtype, DLDataType* out) {
     out->lanes = 1;
   };
   switch (onnx_dtype) {
-    case ONNX_FLOAT: set(kDLFloat, 32); return true;
-    case ONNX_DOUBLE: set(kDLFloat, 64); return true;
-    case ONNX_FLOAT16: set(kDLFloat, 16); return true;
-    case ONNX_BFLOAT16: set(kDLBfloat, 16); return true;
-    case ONNX_INT8: set(kDLInt, 8); return true;
-    case ONNX_INT16: set(kDLInt, 16); return true;
-    case ONNX_INT32: set(kDLInt, 32); return true;
-    case ONNX_INT64: set(kDLInt, 64); return true;
-    case ONNX_UINT8: set(kDLUInt, 8); return true;
-    case ONNX_UINT16: set(kDLUInt, 16); return true;
-    case ONNX_UINT32: set(kDLUInt, 32); return true;
-    case ONNX_UINT64: set(kDLUInt, 64); return true;
-    case ONNX_BOOL: set(kDLBool, 8); return true;
-    default: return false;
+    case ONNX_FLOAT:
+      set(kDLFloat, 32);
+      return true;
+    case ONNX_DOUBLE:
+      set(kDLFloat, 64);
+      return true;
+    case ONNX_FLOAT16:
+      set(kDLFloat, 16);
+      return true;
+    case ONNX_BFLOAT16:
+      set(kDLBfloat, 16);
+      return true;
+    case ONNX_INT8:
+      set(kDLInt, 8);
+      return true;
+    case ONNX_INT16:
+      set(kDLInt, 16);
+      return true;
+    case ONNX_INT32:
+      set(kDLInt, 32);
+      return true;
+    case ONNX_INT64:
+      set(kDLInt, 64);
+      return true;
+    case ONNX_UINT8:
+      set(kDLUInt, 8);
+      return true;
+    case ONNX_UINT16:
+      set(kDLUInt, 16);
+      return true;
+    case ONNX_UINT32:
+      set(kDLUInt, 32);
+      return true;
+    case ONNX_UINT64:
+      set(kDLUInt, 64);
+      return true;
+    case ONNX_BOOL:
+      set(kDLBool, 8);
+      return true;
+    default:
+      return false;
   }
 }
 
