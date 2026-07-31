@@ -1,14 +1,17 @@
-# Combined C++ + Python coverage
+# Combined C++ + Python + JS coverage
 
 onnxsim is a hybrid project. The C++ in `onnxsim/*.cpp` / `*.cc` is compiled
 into the `onnxsim_cpp2py_export` extension, and the Python in `onnxsim/*.py`
 drives it. A single `pytest` run exercises both halves in the same process, so
-both can be measured at once:
+both can be measured at once. The browser converter under
+`scripts/convertmodel/` adds a third layer of JavaScript, covered separately by
+its own Node test suite:
 
 | Layer  | Tool                    | How                                                                 |
 | ------ | ----------------------- | ------------------------------------------------------------------- |
 | Python | `coverage.py` (`pytest-cov`) | instruments the `.py` modules directly                         |
 | C++    | `gcov` + `gcovr`        | the extension is built with `--coverage`; running it emits `.gcda` profiles that `gcovr` reports on |
+| JS     | `c8` (V8 coverage)      | runs the convertmodel Node unit tests and reports on the `.mjs` modules they exercise |
 
 ## Quick start
 
@@ -29,12 +32,44 @@ coverage-report/cpp.html         HTML           (C++)
 
 Both XML files are Cobertura, which most coverage viewers accept. In CI
 (`.github/workflows/coverage.yml`) they are fed to `irongut/CodeCoverageSummary`
-(a comma-separated list, so C++ and Python appear in one combined table), which
-writes the summary to the Actions job summary and posts it as a sticky pull
-request comment via `marocchino/sticky-pull-request-comment` -- no external
+(a comma-separated list, so C++, Python and JS appear in one combined table),
+which writes the summary to the Actions job summary and posts it as a sticky
+pull request comment via `marocchino/sticky-pull-request-comment` -- no external
 service or secret required. The same Cobertura files can just as easily feed
 Codecov, Coveralls, SonarQube, or GitHub's native Code Quality coverage if you
 prefer a hosted dashboard or inline PR annotations.
+
+## JavaScript (convertmodel)
+
+`run_coverage.sh` covers only the C++/Python halves. The JS coverage is a
+separate, self-contained step because it needs a Node toolchain rather than the
+C++/Python build:
+
+```bash
+cd scripts/convertmodel
+npm ci
+npm run coverage            # c8 wraps `npm run test:all`
+```
+
+This runs every Node unit test (`test/*.test.mjs`) under
+[`c8`](https://github.com/bcoe/c8) and writes `text`, `html`, and `cobertura`
+reports to `scripts/convertmodel/coverage/`:
+
+```
+scripts/convertmodel/coverage/cobertura-coverage.xml   Cobertura XML  (JS)
+scripts/convertmodel/coverage/index.html               HTML           (JS)
+```
+
+Scope and reporters live in `scripts/convertmodel/.c8rc.json`. `all: true` plus
+the `include` list report every node-testable module even when a given run does
+not import it, so the number reflects the whole unit-tested surface rather than
+just the files loaded this run. The browser-only glue (`hf_load.mjs`,
+`*_view.mjs`, `inference_browser.mjs`, `worker.js`) drives the DOM and has no
+unit test, so it is intentionally left out.
+
+The coverage CI job copies `cobertura-coverage.xml` to `coverage-report/js.xml`
+and adds it to the same `irongut/CodeCoverageSummary` list, so JS lands in the
+one combined table alongside C++ and Python.
 
 Pass extra arguments straight through to pytest:
 
