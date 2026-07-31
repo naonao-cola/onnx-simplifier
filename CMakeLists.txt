@@ -85,6 +85,11 @@ if (ONNXSIM_BUILTIN_ORT)
   endif()
 endif()
 target_include_directories(onnxsim PUBLIC onnxsim)
+# dlpack.h (at third_party/dlpack/dlpack.h) is the tensor-exchange type at the
+# ModelExecutor / C-ABI executor boundary (see docs/dlpack-executor.md). The
+# include root is third_party/ so `#include "dlpack/dlpack.h"` resolves. PUBLIC
+# so the C API and any target that includes onnxsim.h / dlpack_bridge.h finds it.
+target_include_directories(onnxsim PUBLIC third_party)
 if (NOT ONNXSIM_BUILTIN_ORT)
   target_compile_definitions(onnxsim PUBLIC NO_BUILTIN_ORT)
 endif()
@@ -221,4 +226,11 @@ if (ONNXSIM_TESTS)
                                       onnxsim/sym_value_eval.cpp onnxsim/sym_expr.cpp)
   target_include_directories(sym_shape_infer_test PRIVATE onnxsim)
   add_test(NAME sym_shape_infer_test COMMAND sym_shape_infer_test)
+
+  # The ONNX<->DLPack dtype mapping (dlpack_dtype.h) is pure: it operates on the
+  # integer ONNX dtype codes and depends only on dlpack.h, so its test builds
+  # and runs standalone -- including under Emscripten -- without ONNX / ORT.
+  add_executable(dlpack_dtype_test onnxsim/dlpack_dtype_test.cpp)
+  target_include_directories(dlpack_dtype_test PRIVATE onnxsim third_party)
+  add_test(NAME dlpack_dtype_test COMMAND dlpack_dtype_test)
 endif()

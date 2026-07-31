@@ -30,6 +30,7 @@
 #endif
 #endif
 #include "contrib_schemas.h"
+#include "dlpack_bridge.h"
 #include "onnx/common/file_utils.h"
 #include "onnx/defs/printer.h"
 #include "onnx/defs/schema.h"
@@ -187,86 +188,12 @@ auto FindValueInfoProtoByName(const onnx::ModelProto& model,
 }
 
 #ifndef NO_BUILTIN_ORT
-onnx::TensorProto TensorToTensorProto(const Ort::Value& tensor) {
-  onnx::TensorProto tensor_proto;
-  for (const auto& dim : tensor.GetTensorTypeAndShapeInfo().GetShape()) {
-    tensor_proto.add_dims(dim);
-  }
-  onnx::TensorProto::DataType onnx_dtype =
-      (onnx::TensorProto::DataType)tensor.GetTensorTypeAndShapeInfo()
-          .GetElementType();
-  tensor_proto.set_data_type(onnx_dtype);
-
-  switch (onnx_dtype) {
-#define CASE_DTYPE(onnx_dtype, storage_dtype, cpp_type)                   \
-  case onnx::TensorProto::onnx_dtype: {                                   \
-    const auto* dptr = tensor.GetTensorData<cpp_type>();                  \
-    for (size_t i = 0;                                                    \
-         i < tensor.GetTensorTypeAndShapeInfo().GetElementCount(); i++) { \
-      tensor_proto.add_##storage_dtype##_data(dptr[i]);                   \
-    }                                                                     \
-    break;                                                                \
-  }
-
-    CASE_DTYPE(FLOAT, float, float)
-    CASE_DTYPE(DOUBLE, double, double)
-    CASE_DTYPE(INT64, int64, int64_t)
-    CASE_DTYPE(UINT64, uint64, uint64_t)
-    CASE_DTYPE(INT32, int32, int32_t)
-    CASE_DTYPE(UINT8, int32, uint8_t)
-    CASE_DTYPE(INT8, int32, int8_t)
-    CASE_DTYPE(UINT16, int32, uint16_t)
-    CASE_DTYPE(INT16, int32, int16_t)
-    CASE_DTYPE(BOOL, int32, int8_t)
-#undef CASE_DTYPE
-    default:
-      throw std::invalid_argument("Unknown dtype " +
-                                  std::to_string(tensor_proto.data_type()));
-  }
-  return tensor_proto;
-}
-
-Ort::Value TensorProtoToTensor(const onnx::TensorProto& tensor_proto) {
-  Ort::AllocatorWithDefaultOptions allocator;
-  auto tensor = Ort::Value::CreateTensor(
-      allocator, tensor_proto.dims().data(), tensor_proto.dims_size(),
-      (ONNXTensorElementDataType)tensor_proto.data_type());
-  if (tensor_proto.has_raw_data()) {
-    if constexpr (std::endian::native == std::endian::big) {
-      throw std::invalid_argument("only little endian is supported");
-    }
-    memcpy(tensor.GetTensorMutableData<void>(), tensor_proto.raw_data().data(),
-           tensor_proto.raw_data().size());
-  } else {
-    switch (tensor_proto.data_type()) {
-#define CASE_DTYPE(onnx_dtype, storage_dtype, cpp_type)         \
-  case onnx::TensorProto::onnx_dtype: {                         \
-    std::vector<cpp_type> vec;                                  \
-    for (const auto& x : tensor_proto.storage_dtype##_data()) { \
-      vec.push_back(x);                                         \
-    }                                                           \
-    memcpy(tensor.GetTensorMutableData<void>(), vec.data(),     \
-           vec.size() * sizeof(cpp_type));                      \
-    break;                                                      \
-  }
-      CASE_DTYPE(FLOAT, float, float)
-      CASE_DTYPE(DOUBLE, double, double)
-      CASE_DTYPE(INT64, int64, int64_t)
-      CASE_DTYPE(UINT64, uint64, uint64_t)
-      CASE_DTYPE(INT32, int32, int32_t)
-      CASE_DTYPE(UINT8, int32, uint8_t)
-      CASE_DTYPE(INT8, int32, int8_t)
-      CASE_DTYPE(UINT16, int32, uint16_t)
-      CASE_DTYPE(INT16, int32, int16_t)
-      CASE_DTYPE(BOOL, int32, int8_t)
-#undef CASE_DTYPE
-      default:
-        throw std::invalid_argument("Unknown dtype " +
-                                    std::to_string(tensor_proto.data_type()));
-    }
-  }
-  return tensor;
-}
+// The TensorProto<->Ort::Value converters that used to live here have moved to
+// dlpack_bridge.h and now exchange data through DLManagedTensor:
+//   * inputs: onnxsim::dlpack::BorrowAsOrtValue wraps the feed buffer with the
+//     borrowing CreateTensor overload -- no copy in;
+//   * outputs: onnxsim::dlpack::FromOrtValue moves ORT's own output allocation
+//     into the returned tensor -- no copy out (and no per-element add_*_data).
 
 std::shared_ptr<Ort::Env> GetEnv() {
   static std::shared_ptr<Ort::Env> env = std::make_shared<Ort::Env>();
@@ -309,9 +236,9 @@ bool EnableOrtProfilingFromEnv(Ort::SessionOptions& sess_opts) {
 }
 
 struct CppModelExecutor : public ModelExecutor {
-  std::vector<onnx::TensorProto> _Run(
+  std::vector<DLManagedTensorPtr> Run(
       const onnx::ModelProto& model,
-      const std::vector<onnx::TensorProto>& inputs) const override {
+      const std::vector<const DLManagedTensor*>& inputs) const override {
     // The RunOps call site already profiles each fold group's session run as a
     // single ``OrtSession`` span (see RunOps); for the built-in executor break
     // that down further into ``OrtSessionInit`` (building the session, where
@@ -341,9 +268,14 @@ struct CppModelExecutor : public ModelExecutor {
     }
     Ort::RunOptions run_opts;
     run_opts.SetRunLogSeverityLevel(3);
+    // Borrow each feed's buffer directly into an Ort::Value -- no copy. The
+    // DLManagedTensors are owned by the caller (RunOps) and outlive this call,
+    // so the borrowed pointers stay valid through session.Run.
     std::vector<Ort::Value> input_tensors;
-    std::transform(inputs.begin(), inputs.end(),
-                   std::back_inserter(input_tensors), TensorProtoToTensor);
+    input_tensors.reserve(inputs.size());
+    for (const DLManagedTensor* in : inputs) {
+      input_tensors.push_back(onnxsim::dlpack::BorrowAsOrtValue(in->dl_tensor));
+    }
     std::vector<Ort::Value> output_tensors;
     {
       onnxsim::ProfiledScope run_scope("OrtSessionRun");
@@ -365,10 +297,16 @@ struct CppModelExecutor : public ModelExecutor {
       }
     }
 
-    std::vector<onnx::TensorProto> output_tps;
-    std::transform(output_tensors.begin(), output_tensors.end(),
-                   std::back_inserter(output_tps), TensorToTensorProto);
-    return output_tps;
+    // Hand ORT's own output buffers out as DLManagedTensors: FromOrtValue moves
+    // each Ort::Value into the managed tensor, so nothing is copied here (the
+    // one unavoidable copy happens when RunOps bakes the result into the
+    // model's initializers as raw_data).
+    std::vector<DLManagedTensorPtr> outputs;
+    outputs.reserve(output_tensors.size());
+    for (auto& v : output_tensors) {
+      outputs.emplace_back(onnxsim::dlpack::FromOrtValue(std::move(v)));
+    }
+    return outputs;
   }
 };
 
@@ -522,13 +460,32 @@ std::vector<onnx::TensorProto> RunOps(
   // trampoline that Python's simplify() injects), so the session run is
   // profiled regardless of binding. The ProfiledScope is a no-op unless
   // ONNXSIM_PROFILE is set.
-  std::vector<onnx::TensorProto> output_tps;
+  // Bridge to the DLPack executor boundary. Each feed borrows its initializer's
+  // buffer (no copy); `input_tps` is fully built above and not mutated again, so
+  // the borrowed pointers stay valid. `input_dls` owns the managed tensors and
+  // must outlive the executor call (the executor borrows them). Outputs come
+  // back as DLManagedTensors and are baked into TensorProto raw_data here -- the
+  // single, unavoidable copy, since folded results become model initializers.
+  std::vector<DLManagedTensorPtr> input_dls;
+  input_dls.reserve(input_tps.size());
+  for (const auto& tp : input_tps) {
+    input_dls.emplace_back(onnxsim::dlpack::FromTensorProtoBorrowing(tp));
+  }
+  std::vector<const DLManagedTensor*> input_ptrs;
+  input_ptrs.reserve(input_dls.size());
+  for (const auto& p : input_dls) input_ptrs.push_back(p.get());
+
+  std::vector<DLManagedTensorPtr> output_dls;
   {
     onnxsim::ProfiledScope session_scope("OrtSession");
-    output_tps = executor._Run(op_model, input_tps);
+    output_dls = executor.Run(op_model, input_ptrs);
   }
-  for (size_t i = 0; i < output_names.size() && i < output_tps.size(); i++) {
-    output_tps[i].set_name(output_names[i]);
+  std::vector<onnx::TensorProto> output_tps;
+  output_tps.reserve(output_dls.size());
+  for (size_t i = 0; i < output_dls.size(); i++) {
+    output_tps.push_back(onnxsim::dlpack::ToTensorProto(
+        output_dls[i]->dl_tensor,
+        i < output_names.size() ? output_names[i] : std::string()));
   }
   return output_tps;
 }

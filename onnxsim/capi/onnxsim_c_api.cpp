@@ -125,8 +125,58 @@ class CApiGraphRewriter : public GraphRewriter {
   void* user_data_;
 };
 
+// Adapts the C OnnxsimExecuteFn callback to the C++ ModelExecutor interface,
+// exchanging tensors as DLPack DLManagedTensor with no TensorProto round trip.
+// Mirrors CApiGraphRewriter: a (fn, free_fn, user_data) triple. The whole C API
+// requires the built-in ORT (see the #error at the top), but this adapter needs
+// no ORT itself -- it just marshals to the host callback.
+class CApiModelExecutor : public ModelExecutor {
+ public:
+  CApiModelExecutor(OnnxsimExecuteFn fn, OnnxsimExecuteFreeFn free_fn,
+                    void* user_data)
+      : fn_(fn), free_fn_(free_fn), user_data_(user_data) {}
+
+  std::vector<DLManagedTensorPtr> Run(
+      const onnx::ModelProto& model,
+      const std::vector<const DLManagedTensor*>& inputs) const override {
+    const std::string model_str = model.SerializeAsString();
+    DLManagedTensor** out_outputs = nullptr;
+    size_t num_outputs = 0;
+    const int rc =
+        fn_(user_data_, model_str.data(), model_str.size(), inputs.data(),
+            inputs.size(), &out_outputs, &num_outputs);
+    if (rc != 0) {
+      throw std::runtime_error(
+          "the custom constant-folding executor callback failed (returned " +
+          std::to_string(rc) + ")");
+    }
+    if (num_outputs != 0 && out_outputs == nullptr) {
+      throw std::runtime_error(
+          "the custom executor reported outputs but returned a NULL array");
+    }
+    // Adopt each returned tensor into an owning handle first (so the DLPack
+    // deleters run even if a later step throws), then let the host release the
+    // array container.
+    std::vector<DLManagedTensorPtr> outputs;
+    outputs.reserve(num_outputs);
+    for (size_t i = 0; i < num_outputs; ++i) {
+      outputs.emplace_back(out_outputs[i]);
+    }
+    if (free_fn_ != nullptr) {
+      free_fn_(user_data_, out_outputs, num_outputs);
+    }
+    return outputs;
+  }
+
+ private:
+  OnnxsimExecuteFn fn_;
+  OnnxsimExecuteFreeFn free_fn_;
+  void* user_data_;
+};
+
 // Shared body of onnxsim_simplify / onnxsim_simplify_with_rules: parse the
-// model, simplify it (optionally with `rewriter`), and hand back a freshly
+// model, simplify it (optionally with `rewriter`, and through `executor` when
+// non-NULL -- otherwise the built-in ORT executor), and hand back a freshly
 // malloc'd buffer of serialized bytes. All out-parameters follow the C API
 // contract documented in the header.
 OnnxsimStatus SimplifyToBuffer(const void* model_data, size_t model_size,
@@ -136,7 +186,8 @@ OnnxsimStatus SimplifyToBuffer(const void* model_data, size_t model_size,
                                int constant_folding, int shape_inference,
                                size_t tensor_size_threshold,
                                int target_opset_version,
-                               const GraphRewriter* rewriter, void** out_data,
+                               const GraphRewriter* rewriter,
+                               const ModelExecutor* executor, void** out_data,
                                size_t* out_size, char** out_error) {
   if (out_data != nullptr) {
     *out_data = nullptr;
@@ -161,7 +212,7 @@ OnnxsimStatus SimplifyToBuffer(const void* model_data, size_t model_size,
       return ONNXSIM_ERROR;
     }
     onnx::ModelProto result = Simplify(
-        *GetBuiltinModelExecutor(), model,
+        executor != nullptr ? *executor : *GetBuiltinModelExecutor(), model,
         BuildSkipOptimizers(skip_optimizers, num_skip_optimizers,
                             skip_optimizers_is_null),
         constant_folding != 0, shape_inference != 0, tensor_size_threshold,
@@ -240,7 +291,33 @@ OnnxsimStatus onnxsim_simplify(
                           constant_folding, shape_inference,
                           tensor_size_threshold, target_opset_version,
                           rewriter.has_value() ? &rewriter.value() : nullptr,
-                          out_data, out_size, out_error);
+                          /*executor=*/nullptr, out_data, out_size, out_error);
+}
+
+OnnxsimStatus onnxsim_simplify_with_executor(
+    const void* model_data, size_t model_size,
+    const char* const* skip_optimizers, size_t num_skip_optimizers,
+    int skip_optimizers_is_null, int constant_folding, int shape_inference,
+    size_t tensor_size_threshold, int target_opset_version,
+    OnnxsimRewriteFn rewrite_fn, OnnxsimRewriteFreeFn rewrite_free_fn,
+    void* rewrite_user_data, OnnxsimExecuteFn execute_fn,
+    OnnxsimExecuteFreeFn execute_free_fn, void* execute_user_data,
+    void** out_data, size_t* out_size, char** out_error) {
+  std::optional<CApiGraphRewriter> rewriter;
+  if (rewrite_fn != nullptr) {
+    rewriter.emplace(rewrite_fn, rewrite_free_fn, rewrite_user_data);
+  }
+  std::optional<CApiModelExecutor> executor;
+  if (execute_fn != nullptr) {
+    executor.emplace(execute_fn, execute_free_fn, execute_user_data);
+  }
+  return SimplifyToBuffer(
+      model_data, model_size, skip_optimizers, num_skip_optimizers,
+      skip_optimizers_is_null, constant_folding, shape_inference,
+      tensor_size_threshold, target_opset_version,
+      rewriter.has_value() ? &rewriter.value() : nullptr,
+      executor.has_value() ? &executor.value() : nullptr, out_data, out_size,
+      out_error);
 }
 
 OnnxsimStatus onnxsim_simplify_with_rules(
@@ -283,7 +360,8 @@ OnnxsimStatus onnxsim_simplify_with_rules(
                             num_skip_optimizers, skip_optimizers_is_null,
                             constant_folding, shape_inference,
                             tensor_size_threshold, target_opset_version,
-                            rewriter.get(), out_data, out_size, out_error);
+                            rewriter.get(), /*executor=*/nullptr, out_data,
+                            out_size, out_error);
   } catch (const std::exception& e) {
     SetError(out_error, e.what());
     return ONNXSIM_ERROR;
