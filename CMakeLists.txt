@@ -195,12 +195,18 @@ if (ONNXSIM_C_API)
   # inference functions through static initializers -- objects nothing references
   # directly. With the stack now built static (option 1), the linker would prune
   # those archive members and leave dangling symbols such as
-  # `onnx::RNNShapeInference`. Force every object of the onnx stack and onnxsim
-  # into onnxsim_c with --whole-archive so all schemas/inference fns are present.
-  # ONNX Runtime arrives transitively through onnxsim's public link interface and
-  # is linked normally (it is referenced via the Ort:: C++ API).
+  # `onnx::RNNShapeInference`. Force every object of libonnx and onnxsim into
+  # onnxsim_c with --whole-archive so all schemas/inference fns are present.
+  #
+  # Whole-archive libonnx *only* (not onnx_proto): the generated *.pb.cc objects
+  # -- carrying protobuf's descriptor registration -- are compiled into libonnx.a
+  # as well as libonnx_proto.a, so whole-archiving both double-defines symbols
+  # like Arena::CreateMaybeMessage<onnx::OperatorProto>. Pulling libonnx whole
+  # already brings those descriptors in; onnx_proto and onnx_optimizer are
+  # referenced directly and link normally, as does ONNX Runtime (via the Ort::
+  # C++ API through onnxsim's public link interface).
   target_link_libraries(onnxsim_c PRIVATE
-    "-Wl,--whole-archive" onnxsim onnx_optimizer onnx onnx_proto "-Wl,--no-whole-archive")
+    "-Wl,--whole-archive" onnxsim onnx "-Wl,--no-whole-archive")
   target_include_directories(onnxsim_c PUBLIC onnxsim/capi)
   # The exported symbols opt back into default visibility via ONNXSIM_C_API in
   # the header, so the project-wide "hidden" preset keeps everything else local.
