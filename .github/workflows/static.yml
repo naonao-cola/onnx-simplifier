@@ -67,9 +67,14 @@ jobs:
         if: ${{ github.event_name == 'push' }}
         uses: actions/configure-pages@v6
       - run: pip install cmake ninja
-      - run: |
-          sudo apt update
-          sudo apt install protobuf-compiler
+      # onnx 1.23+ bundles protobuf 6.31.1, so the host protoc used for codegen
+      # must match; the distro's protobuf-compiler (3.x) generates *.pb.h that
+      # are incompatible with the bundled runtime headers. Install protoc 31.1.
+      - name: Install protoc 31.1 (matches onnx's bundled protobuf 6.31.1)
+        run: |
+          curl -sSL https://github.com/protocolbuffers/protobuf/releases/download/v31.1/protoc-31.1-linux-x86_64.zip -o /tmp/protoc.zip
+          sudo unzip -o /tmp/protoc.zip -d /usr/local bin/protoc 'include/*'
+          protoc --version
       - name: Prepare ccache timestamp
         id: ccache_cache_timestamp
         run: |

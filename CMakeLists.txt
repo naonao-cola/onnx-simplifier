@@ -129,11 +129,12 @@ if (ONNXSIM_C_API)
   # project-wide "hidden" visibility preset, so they export none of their
   # symbols. onnxsim/onnxsim_c call into onnx_optimizer across the
   # shared-library boundary (e.g. OptimizeFixed, GetFuseAndEliminationPass), and
-  # reference onnx message RTTI across it (e.g. typeinfo for onnx::ModelProto);
-  # both then fail to resolve at runtime with "undefined symbol". Restore
-  # default visibility so those symbols are exported. (The Python build avoids
-  # this by linking them statically.)
-  foreach(_onnxsim_shared_dep onnx_optimizer onnx)
+  # reference onnx message RTTI across it (e.g. typeinfo for onnx::ModelProto,
+  # whose vtable/typeinfo live in the onnx_proto target that compiles the
+  # generated *.pb.cc); both then fail to resolve at runtime with "undefined
+  # symbol". Restore default visibility so those symbols are exported. (The
+  # Python build avoids this by linking them statically.)
+  foreach(_onnxsim_shared_dep onnx_optimizer onnx onnx_proto)
     if (TARGET ${_onnxsim_shared_dep})
       set_target_properties(${_onnxsim_shared_dep} PROPERTIES
         CXX_VISIBILITY_PRESET default
