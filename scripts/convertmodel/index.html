@@ -325,6 +325,15 @@
                     IndexedDB so repeated / overlapping loads reuse them. Falls
                     back to the direct download automatically if the Xet path
                     isn't available (e.g. a non-Xet repo or a CORS block).
+                    <br>
+                    <b>For a one-off download, leave this off</b> — the plain
+                    download (the default) streams over a single connection and
+                    is usually faster. The in-browser Xet client fetches chunks
+                    <i>serially</i>
+                    (<a href="https://github.com/huggingface/huggingface.js/blob/main/packages/hub/src/utils/XetBlob.ts" target="_blank" rel="noopener"><code>XetBlob</code></a>
+                    has no parallel-download option), so its payoff is cache
+                    reuse across repeated / overlapping loads, not raw
+                    cold-download speed.
                 </div>
             </div>
         </div>
