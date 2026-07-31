@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// ONNX Runtime version onnxsim builds against; must match `cmake/build_ort.cmake`.
-const ONNXRUNTIME_VERSION: &str = "1.27.1";
+const ONNXRUNTIME_VERSION: &str = "1.28.0";
 
 fn main() {
     println!("cargo:rerun-if-env-changed=ONNXSIM_NO_BUILD");
