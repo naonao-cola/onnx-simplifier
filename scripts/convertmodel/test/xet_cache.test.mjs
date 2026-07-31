@@ -117,6 +117,22 @@ await acheck("fires onHit / onMiss / onNetwork hooks", async () => {
   assert.deepEqual(events, [["miss"], ["network", 3], ["hit", 3]]);
 });
 
+await acheck("does not block the response on a slow cache write", async () => {
+  // A put that never resolves must not stall the download: the block is cached
+  // in the background, off the critical path, so serving the response can't wait
+  // on IndexedDB's write throughput. If the write were awaited, this would hang.
+  const cache = {
+    get: async () => null,
+    put: () => new Promise(() => {}), // never settles
+  };
+  const realFetch = async () =>
+    new Response(new Uint8Array([1, 2, 3]).buffer, { status: 206 });
+  const f = makeCachingFetch(realFetch, cache);
+  const r = await f("https://cas.example/blk/slow", { headers: { Range: "bytes=0-2" } });
+  assert.equal(r.status, 206);
+  assert.deepEqual(Array.from(new Uint8Array(await r.arrayBuffer())), [1, 2, 3]);
+});
+
 await acheck("a cache read error falls back to the network", async () => {
   const cache = {
     get: async () => {

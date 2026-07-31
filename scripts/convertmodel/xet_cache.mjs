@@ -115,13 +115,17 @@ export function makeCachingFetch(realFetch, cache, hooks = {}) {
       try {
         const body = await resp.clone().arrayBuffer();
         if (hooks.onNetwork) hooks.onNetwork(body.byteLength);
-        await cache.put(key, {
-          status: resp.status,
-          headers: pickHeaders(resp.headers),
-          body,
+        // Persist in the background — do NOT await it. IndexedDB serializes
+        // writes per object store and structured-cloning multi-MB blocks is
+        // slow, so awaiting the write here would funnel even parallel range
+        // fetches through IDB's write throughput and throttle the download.
+        // Serving `resp` doesn't depend on the block being stored.
+        const entry = { status: resp.status, headers: pickHeaders(resp.headers), body };
+        Promise.resolve(cache.put(key, entry)).catch(() => {
+          // Non-fatal: the block just won't be cached for next time.
         });
       } catch {
-        // Non-fatal: serve the live response even if caching failed.
+        // Non-fatal: serve the live response even if reading the body failed.
       }
     }
     return resp;
