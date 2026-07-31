@@ -127,5 +127,6 @@ protobuf on `PATH` before running `ORT_WEB=ON ./build_wasm.sh`.
 - Only the dtypes above are bridged (same as the built-in executor); others throw
   a clear error.
 - Not wired for the `ONNXSIM_WASM_NODE` (NODERAWFS) build or a Node smoke test yet.
-- The `JsModelExecutor` C++ / `ort_executor.mjs` bridge has not been exercised
-  yet because the build fails earlier at the protobuf step above.
+- The `JsModelExecutor` C++ / `ort_executor.mjs` bridge compiles but has not been
+  exercised at runtime yet; it needs a browser/Node folding test with
+  onnxruntime-web loaded (the JS runner registered on the Module).

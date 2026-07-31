@@ -6,6 +6,14 @@
 #include "onnxsim.h"
 #include "onnxsim_option.h"
 
+// In the ORT-web WASM build (ONNXSIM_WASM_ORT_WEB) onnxsim links no ONNX Runtime
+// (NO_BUILTIN_ORT), so GetBuiltinModelExecutor() does not exist; folding is
+// delegated to onnxruntime-web via GetJsModelExecutor() instead. main() is not
+// auto-run under Emscripten (INVOKE_RUN=0) but still has to compile.
+#ifdef ONNXSIM_WASM_ORT_WEB
+#include "js_model_executor.h"
+#endif
+
 int main(int argc, char** argv) {
   // force env initialization to register opset
   InitEnv();
@@ -21,7 +29,11 @@ int main(int argc, char** argv) {
   onnx::LoadProtoFromPath(input_model_filename, model);
 
   onnx::ModelProto simplified = Simplify(
+#ifdef ONNXSIM_WASM_ORT_WEB
+      *GetJsModelExecutor(), model,
+#else
       *GetBuiltinModelExecutor(), model,
+#endif
       no_opt ? std::nullopt : std::make_optional<std::vector<std::string>>({}),
       !no_sim, !no_shape_inference, SIZE_MAX,
       // A target opset of <= 0 means "leave the opset version unchanged".

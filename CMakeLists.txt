@@ -148,9 +148,11 @@ else()
 endif()
 
 if (ONNXSIM_WASM_ORT_WEB)
-  # interface.cpp selects GetJsModelExecutor() under this define and
-  # js_model_executor.cpp implements it.
+  # interface.cpp / onnxsim_bin.cpp select GetJsModelExecutor() under this define
+  # and js_model_executor.cpp implements it. onnxsim_bin.cpp lives in onnxsim/bin,
+  # so add scripts/convertmodel to its include path to find js_model_executor.h.
   target_compile_definitions(onnxsim_bin PRIVATE ONNXSIM_WASM_ORT_WEB)
+  target_include_directories(onnxsim_bin PRIVATE scripts/convertmodel)
   # JsModelExecutor::_Run blocks on an onnxruntime-web Promise via
   # emscripten::val::await(), which requires Asyncify. Asyncify also makes the
   # exported onnxsimplify_export return a Promise (the worker awaits it). The
