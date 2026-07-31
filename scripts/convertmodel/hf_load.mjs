@@ -22,8 +22,19 @@ const statusEl = document.getElementById("hf-status");
 const fileInput = document.getElementById("file-input");
 const logOutput = document.getElementById("log-output");
 const xetToggle = document.getElementById("hf-use-xet");
+const xetConcurrencyInput = document.getElementById("hf-xet-concurrency");
 const clearCacheBtn = document.getElementById("hf-clear-cache");
 const cacheSizeEl = document.getElementById("hf-cache-size");
+
+// How many parallel byte-range shards to read a Xet download in. XetBlob fetches
+// serially, so >1 shard is what actually parallelizes the transfer. Clamped to a
+// sane range; past ~10 the returns fade and the Hub may throttle.
+const XET_CONCURRENCY_MAX = 16;
+function xetConcurrency() {
+  const n = parseInt(xetConcurrencyInput && xetConcurrencyInput.value, 10);
+  if (!Number.isFinite(n) || n < 1) return 1;
+  return Math.min(n, XET_CONCURRENCY_MAX);
+}
 
 // The persistent chunk cache is created lazily on first Xet use.
 let xetCache = null;
@@ -246,6 +257,7 @@ async function doLoad() {
           onLog: log,
           onProgress,
           fetchImpl: cachingFetch,
+          concurrency: xetConcurrency(),
         }));
         if (hits > 0) log(`reused ${hits} cached chunk(s) (${humanBytes(hitBytes)})`);
       } catch (e) {

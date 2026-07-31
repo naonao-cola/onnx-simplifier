@@ -287,15 +287,73 @@ async function readBlobWithProgress(blob, onProgress) {
   return bytes;
 }
 
+// Read a Blob in `concurrency` parallel shards, into one preallocated buffer.
+//
+// The in-browser Xet client (@huggingface/hub's XetBlob) fetches a file's
+// reconstruction terms strictly serially, so a single read never uses more than
+// one connection. But `blob.slice(a, b)` re-fetches reconstruction scoped to
+// `bytes=a-(b-1)`, so a sliced blob downloads only its sub-range — reading N
+// non-overlapping, contiguous slices concurrently gives N-way parallelism while
+// reusing all of XetBlob's reconstruction + decompression. Each shard streams
+// its range in order, so writing at a running offset from the shard's start
+// reassembles the file with no ordering logic; shards write disjoint regions of
+// `out`. Blocks straddling a shard boundary may be fetched by both neighbors —
+// a little redundant transfer, deduplicated by the chunk cache when keys line up.
+// Exported for unit testing (browser-only in practice).
+export async function readBlobSharded(blob, concurrency, onProgress = () => {}) {
+  const total = blob.size || 0;
+  const out = new Uint8Array(total);
+  const shardCount = Math.min(concurrency, total);
+  const step = Math.ceil(total / shardCount);
+  const loadedPerShard = [];
+  const report = () => {
+    let loaded = 0;
+    for (const n of loadedPerShard) loaded += n;
+    onProgress({ loaded, total });
+  };
+  const tasks = [];
+  for (let start = 0; start < total; start += step) {
+    const end = Math.min(start + step, total);
+    const idx = loadedPerShard.length;
+    loadedPerShard.push(0);
+    tasks.push(
+      (async () => {
+        const part = blob.slice(start, end);
+        if (typeof part.stream !== "function") {
+          const buf = new Uint8Array(await part.arrayBuffer());
+          out.set(buf, start);
+          loadedPerShard[idx] = buf.length;
+          report();
+          return;
+        }
+        const reader = part.stream().getReader();
+        let offset = start;
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          out.set(value, offset);
+          offset += value.length;
+          loadedPerShard[idx] = offset - start;
+          report();
+        }
+      })(),
+    );
+  }
+  await Promise.all(tasks);
+  return out;
+}
+
 // EXPERIMENTAL: download a model over the Hugging Face Xet protocol via
 // @huggingface/hub's downloadFile, which reconstructs the file from
 // content-addressed blocks. Pass `fetchImpl` (e.g. the caching fetch from
-// xet_cache.mjs) to persist those blocks across loads. Only Hub repos are
+// xet_cache.mjs) to persist those blocks across loads. `concurrency` > 1 reads
+// the reconstructed file in that many parallel byte-range shards (see
+// readBlobSharded) to work around XetBlob's serial fetching. Only Hub repos are
 // supported (not arbitrary URLs). Returns { bytes, name, repo }; the caller is
 // expected to fall back to fetchModelBytes() on any failure (CORS, unsupported).
 export async function fetchModelBytesXet(
   ref,
-  { onLog = () => {}, onProgress = () => {}, fetchImpl } = {},
+  { onLog = () => {}, onProgress = () => {}, fetchImpl, concurrency = 1 } = {},
 ) {
   const parsed = parseRef(ref);
   if (!parsed.repo) {
@@ -319,7 +377,14 @@ export async function fetchModelBytesXet(
   if (!blob) throw new Error(`file not found: ${parsed.repo}/${file}`);
 
   const name = file.split("/").pop();
-  const bytes = await readBlobWithProgress(blob, onProgress);
+  // Shard only when it can help: more than one shard requested, a known size to
+  // split on, and a sliceable blob. Otherwise fall back to a single stream.
+  const shards = Math.max(1, Math.floor(concurrency) || 1);
+  const canShard = shards > 1 && blob.size > 0 && typeof blob.slice === "function";
+  if (canShard) onLog(`reading via Xet in ${Math.min(shards, blob.size)} parallel shards…`);
+  const bytes = canShard
+    ? await readBlobSharded(blob, shards, onProgress)
+    : await readBlobWithProgress(blob, onProgress);
   onLog(`downloaded ${name} (${bytes.length.toLocaleString()} bytes via Xet)`);
   return { bytes, name, repo: parsed.repo };
 }

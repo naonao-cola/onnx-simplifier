@@ -317,6 +317,10 @@
                     Use <a href="https://huggingface.co/docs/xet/en/index" target="_blank" rel="noopener">Xet</a>
                     protocol (experimental)
                 </label>
+                <label for="hf-xet-concurrency" style="margin-left: 0.6em;">parallel shards</label>
+                <input type="number" id="hf-xet-concurrency" value="8" min="1" max="16" step="1"
+                       style="width: 3.5em;"
+                       title="How many parallel byte-range shards to read a Xet download in. XetBlob fetches serially, so this is what parallelizes the transfer; ~10 or fewer is usually best.">
                 <button id="hf-clear-cache" type="button">clear chunk cache</button>
                 <span id="hf-cache-size" style="color: #666; font-size: 0.85em; margin-left: 0.4em;"></span>
                 <div style="color: #666; font-size: 0.85em; margin-top: 0.2em;">
@@ -326,14 +330,14 @@
                     back to the direct download automatically if the Xet path
                     isn't available (e.g. a non-Xet repo or a CORS block).
                     <br>
-                    <b>For a one-off download, leave this off</b> — the plain
-                    download (the default) streams over a single connection and
-                    is usually faster. The in-browser Xet client fetches chunks
-                    <i>serially</i>
-                    (<a href="https://github.com/huggingface/huggingface.js/blob/main/packages/hub/src/utils/XetBlob.ts" target="_blank" rel="noopener"><code>XetBlob</code></a>
-                    has no parallel-download option), so its payoff is cache
-                    reuse across repeated / overlapping loads, not raw
-                    cold-download speed.
+                    The in-browser Xet client
+                    (<a href="https://github.com/huggingface/huggingface.js/blob/main/packages/hub/src/utils/XetBlob.ts" target="_blank" rel="noopener"><code>XetBlob</code></a>)
+                    fetches a file <i>serially</i>, so a single read uses one
+                    connection. <b>parallel shards</b> works around that by
+                    reading the file in that many concurrent byte-range slices —
+                    set it to saturate your link (~10 or fewer is usually best;
+                    <code>1</code> disables sharding). Xet's extra payoff is chunk
+                    dedup / cache reuse across repeated or overlapping loads.
                 </div>
             </div>
         </div>
