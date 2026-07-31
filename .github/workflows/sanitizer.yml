@@ -1,4 +1,4 @@
-name: Build and Test with address sanitizer
+name: Build and Test with sanitizers
 
 on:
   push:
@@ -52,3 +52,95 @@ jobs:
         LD_PRELOAD="/lib/x86_64-linux-gnu/libasan.so.8 /usr/lib/x86_64-linux-gnu/libstdc++.so.6" \
         LSAN_OPTIONS=suppressions=./scripts/leak.txt \
         pytest -sv tests
+
+  # UndefinedBehaviorSanitizer: alignment. Catches misaligned typed loads/stores
+  # -- undefined behaviour that x86_64 silently tolerates but that faults with
+  # SIGBUS on arm64 (and Darwin/arm64 in particular does not fix up). The whole
+  # dependency tree (onnxsim, onnx-optimizer, onnx, and its bundled protobuf) is
+  # instrumented via CXXFLAGS, and -fno-sanitize-recover makes any violation
+  # abort so the job fails instead of printing and passing. Unlike ASan the
+  # UBSan runtime is pulled in as a NEEDED library of the extension, so the test
+  # step needs no LD_PRELOAD. Note: this Linux/libstdc++ job cannot see
+  # alignment faults that only exist under macOS/libc++'s different type layout
+  # -- for those, run the workflow_dispatch macOS job below.
+  build_ubsan:
+    name: Build and test with alignment sanitizer
+    runs-on: ubuntu-latest
+    env:
+      CMAKE_GENERATOR: Ninja
+      CMAKE_CXX_COMPILER_LAUNCHER: sccache
+      CMAKE_LINKER_TYPE: MOLD
+      CXXFLAGS: -fsanitize=alignment -fno-sanitize-recover=alignment
+      LDFLAGS: -fsanitize=alignment
+      UBSAN_OPTIONS: print_stacktrace=1
+      SCCACHE_GHA_ENABLED: on
+      ACTIONS_CACHE_SERVICE_V2: on
+    steps:
+    - uses: actions/checkout@v7
+      with:
+        submodules: recursive
+    - uses: actions/setup-python@v7
+      with:
+        python-version: '3.14'
+    - uses: mozilla-actions/sccache-action@v0.0.10
+
+    - run: pip install cmake ninja setuptools sccache
+
+    - name: Install test dependencies
+      id: test_deps
+      background: true
+      run: |
+        pip install torch==2.10.0 torchvision==0.25.0 --index-url https://download.pytorch.org/whl/cpu/
+        pip install pytest flake8 onnxruntime onnxscript==0.6.2 timm==1.0.26 sympy
+
+    - name: Build
+      run: pip install --no-build-isolation -ve .
+
+    - wait: test_deps
+
+    - name: Test
+      run: pytest -sv tests
+
+  # Alignment sanitizer on macOS arm64, where the ONNX 1.23 function-rewrite
+  # SIGBUS actually reproduces (see #557 / #561). It is gated to manual
+  # workflow_dispatch rather than push/pull_request because, until the upstream
+  # ONNX fix lands, it is expected to trip -- its job is to turn the bare SIGBUS
+  # into a precise UBSan report (offending type + source file:line) on the
+  # platform where the fault occurs. Running it does not gate normal CI.
+  build_ubsan_macos:
+    name: Alignment sanitizer on macOS arm64 (manual)
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: macos-15
+    env:
+      CMAKE_GENERATOR: Ninja
+      CMAKE_CXX_COMPILER_LAUNCHER: sccache
+      # Match the deployment target the wheels use; the crash correlates with
+      # the libc++ that this target pulls in.
+      MACOSX_DEPLOYMENT_TARGET: '13.3'
+      CXXFLAGS: -fsanitize=alignment -g
+      LDFLAGS: -fsanitize=alignment
+      UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+      SCCACHE_GHA_ENABLED: on
+      ACTIONS_CACHE_SERVICE_V2: on
+    steps:
+    - uses: actions/checkout@v7
+      with:
+        submodules: recursive
+    - uses: actions/setup-python@v7
+      with:
+        python-version: '3.12'
+    - uses: mozilla-actions/sccache-action@v0.0.10
+
+    - run: pip install cmake ninja setuptools sccache
+
+    - name: Install test dependencies
+      run: pip install pytest onnxruntime onnxscript==0.6.2 sympy
+
+    - name: Build
+      run: pip install --no-build-isolation -ve .
+
+    # The function-rewrite suite is where the fault reproduces; run just it so
+    # the UBSan report is easy to find. halt_on_error=1 stops at the first
+    # misaligned access with its type and source location.
+    - name: Test (function rewriter)
+      run: pytest -sv tests/test_function_rewriter.py tests/test_function_rewriter_compile_rule.py
