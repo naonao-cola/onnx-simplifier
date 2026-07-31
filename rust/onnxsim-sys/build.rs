@@ -25,6 +25,10 @@ fn main() {
     println!("cargo:rerun-if-env-changed=ONNXSIM_LIB_DIR");
     println!("cargo:rerun-if-env-changed=ONNXSIM_SOURCE_DIR");
     println!("cargo:rerun-if-env-changed=ONNXSIM_SKIP_ORT_DOWNLOAD");
+    println!("cargo:rerun-if-env-changed=ONNXSIM_PREBUILT_ORT");
+    println!("cargo:rerun-if-env-changed=ONNXSIM_ORT_HOME");
+    println!("cargo:rerun-if-env-changed=ONNXSIM_ORT_VERSION");
+    println!("cargo:rerun-if-env-changed=ONNXSIM_ORT_URL");
 
     // Mode 1: skip building entirely (docs.rs / `cargo check`).
     if env::var_os("DOCS_RS").is_some() || env::var_os("ONNXSIM_NO_BUILD").is_some() {
@@ -51,12 +55,23 @@ fn main() {
         source_dir.join("onnxsim/capi/onnxsim_c_api.cpp").display()
     );
 
-    // onnxsim vendors ONNX Runtime by downloading a source tarball (see
-    // build_wasm.sh) rather than as a git submodule, so `submodules: recursive`
-    // does not provide it. Fetch it here if the builtin-ORT build needs it.
-    ensure_onnxruntime_source(&source_dir);
+    // ONNXSIM_PREBUILT_ORT swaps the from-source ONNX Runtime build for an
+    // official prebuilt release (see cmake/prebuilt_ort.cmake), which is much
+    // faster the first time. In that mode ORT is not compiled here, so the
+    // vendored source tarball is not needed.
+    let prebuilt_ort = env::var_os("ONNXSIM_PREBUILT_ORT")
+        .map(|v| is_truthy(&v))
+        .unwrap_or(false);
 
-    let dst = cmake::Config::new(&source_dir)
+    if !prebuilt_ort {
+        // onnxsim vendors ONNX Runtime by downloading a source tarball (see
+        // build_wasm.sh) rather than as a git submodule, so `submodules: recursive`
+        // does not provide it. Fetch it here if the builtin-ORT build needs it.
+        ensure_onnxruntime_source(&source_dir);
+    }
+
+    let mut config = cmake::Config::new(&source_dir);
+    config
         .define("ONNXSIM_C_API", "ON")
         .define("ONNXSIM_BUILTIN_ORT", "ON")
         .define("ONNXSIM_PYTHON", "OFF")
@@ -64,8 +79,20 @@ fn main() {
         // No install() rules exist for onnxsim_c, so build the target in place
         // and locate the artifacts under the CMake build tree ourselves.
         .build_target("onnxsim_c")
-        .very_verbose(false)
-        .build();
+        .very_verbose(false);
+
+    if prebuilt_ort {
+        config.define("ONNXSIM_PREBUILT_ORT", "ON");
+        // Forward the optional knobs so callers can pin a version, point at an
+        // already-extracted release, or override the download URL.
+        for var in ["ONNXSIM_ORT_HOME", "ONNXSIM_ORT_VERSION", "ONNXSIM_ORT_URL"] {
+            if let Some(val) = env::var_os(var) {
+                config.define(var, val);
+            }
+        }
+    }
+
+    let dst = config.build();
 
     let build_dir = dst.join("build");
     for dir in find_lib_dirs(&build_dir) {
@@ -167,6 +194,20 @@ fn extract_zip(zip_path: &Path, dest_dir: &Path) {
 /// Run a command, returning true on a successful exit status.
 fn run(cmd: &mut Command) -> bool {
     matches!(cmd.status(), Ok(status) if status.success())
+}
+
+/// Interpret an environment variable as a boolean flag. Anything other than the
+/// usual "off" spellings (unset is handled by the caller) counts as enabled, so
+/// `ONNXSIM_PREBUILT_ORT=1`, `=ON`, and `=true` all turn the feature on.
+fn is_truthy(val: &std::ffi::OsStr) -> bool {
+    match val.to_str() {
+        Some(s) => !matches!(
+            s.trim().to_ascii_lowercase().as_str(),
+            "" | "0" | "off" | "false" | "no"
+        ),
+        // Non-UTF-8 but present: treat as set/enabled.
+        None => true,
+    }
 }
 
 /// Root of the onnxsim C++ project (the directory holding the top-level

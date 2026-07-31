@@ -6,6 +6,7 @@
 #include <onnx/onnx_pb.h>
 
 #include <algorithm>
+#include <bit>
 #include <fstream>
 #include <functional>
 #include <mutex>
@@ -15,8 +16,18 @@
 #include <unordered_map>
 
 #ifndef NO_BUILTIN_ORT
-#include "onnxruntime/core/common/endian.h"
+// Prebuilt ONNX Runtime releases (github.com/microsoft/onnxruntime/releases)
+// ship the public headers flat under include/ (e.g. onnxruntime_cxx_api.h),
+// whereas the vendored source tree nests them under
+// include/onnxruntime/core/session/. ONNXSIM_ORT_FLAT_HEADERS, defined by CMake
+// when ONNXSIM_PREBUILT_ORT is enabled, selects the flat layout. Endianness is
+// checked via C++20 std::endian so neither path depends on ORT's internal
+// core/common/endian.h (which the prebuilt release does not ship).
+#ifdef ONNXSIM_ORT_FLAT_HEADERS
+#include "onnxruntime_cxx_api.h"
+#else
 #include "onnxruntime/core/session/onnxruntime_cxx_api.h"
+#endif
 #endif
 #include "contrib_schemas.h"
 #include "onnx/common/file_utils.h"
@@ -221,7 +232,7 @@ Ort::Value TensorProtoToTensor(const onnx::TensorProto& tensor_proto) {
       allocator, tensor_proto.dims().data(), tensor_proto.dims_size(),
       (ONNXTensorElementDataType)tensor_proto.data_type());
   if (tensor_proto.has_raw_data()) {
-    if (onnxruntime::endian::native == onnxruntime::endian::big) {
+    if constexpr (std::endian::native == std::endian::big) {
       throw std::invalid_argument("only little endian is supported");
     }
     memcpy(tensor.GetTensorMutableData<void>(), tensor_proto.raw_data().data(),
