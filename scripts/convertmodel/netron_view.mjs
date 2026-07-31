@@ -5,8 +5,10 @@
 // posted into Netron as raw bytes over the embedding protocol (see netron.mjs),
 // so nothing leaves the page and there is no model-size limit.
 //
-// The "before" pane is driven here by watching the file input directly. The
-// "after" pane is driven by the converter worker code, which calls the
+// The "before" pane is driven by watching the file input directly, and — for
+// models pulled from Hugging Face, which never touch the file input — by the
+// `window.netronShowBefore(bytes, name)` hook this module installs. The "after"
+// pane is driven by the converter worker code, which calls the
 // `window.netronShowAfter(dataUrl, name)` hook this module installs once a
 // conversion finishes.
 
@@ -169,6 +171,17 @@ function initNetronPanel() {
         .catch((err) => console.error("netron (before):", err));
     });
   }
+
+  // Called by the Hugging Face loader (hf_load.mjs) with the downloaded model
+  // bytes, since those never pass through the file input above. `data` may be a
+  // Uint8Array or ArrayBuffer; toArrayBuffer copies it to a standalone buffer.
+  window.netronShowBefore = (data, name) => {
+    try {
+      renderPane("before", toArrayBuffer(data), name);
+    } catch (err) {
+      console.error("netron (before):", err);
+    }
+  };
 
   // Called by the converter worker glue in index.html when a result is ready.
   window.netronShowAfter = (dataUrl, name) => {

@@ -158,6 +158,12 @@ async function doLoad() {
     // Publish as the "original" model so the Run inference panel can run it —
     // there is no file-input entry for a Hugging Face download.
     window.__onnxsimOriginal = { bytes, name };
+    // Render the "before" Netron pane too: it normally watches the file input,
+    // which a Hugging Face download bypasses, so drive it explicitly here.
+    // (toArrayBuffer copies the bytes, leaving our Uint8Array intact.)
+    if (typeof window.netronShowBefore === "function") {
+      window.netronShowBefore(bytes, name);
+    }
     // Hand a *copy* to the worker: the buffer is transferred (detached) on
     // postMessage, so copying keeps `bytes` intact for the inference panel.
     const copy = bytes.slice();
