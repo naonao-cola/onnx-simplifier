@@ -9,12 +9,17 @@ name: RF-DETR export test
 # building the onnxsim under test from source in the same environment does not
 # trigger a downgrade.
 
+# The RF-DETR export test pulls a large torch/transformers stack and exports a
+# model, so it is too heavy to run on every PR. Instead it runs on push to the
+# default branch and once a day; use workflow_dispatch to trigger it manually
+# against a branch when needed.
 on:
   push:
     branches:
       - main
       - master
-  pull_request:
+  schedule:
+    - cron: '0 7 * * *'  # daily at 07:00 UTC
   workflow_dispatch:
 
 jobs:

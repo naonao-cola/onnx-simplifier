@@ -10,12 +10,17 @@ name: YOLO export test
 # own export "simplify" path uses onnxslim -- so building the onnxsim under
 # test from source in the same environment does not trigger a downgrade.
 
+# The YOLO export test pulls a large torch/torchvision + ultralytics stack and
+# exports several models, so it is too heavy to run on every PR. Instead it runs
+# on push to the default branch and once a day; use workflow_dispatch to trigger
+# it manually against a branch when needed.
 on:
   push:
     branches:
       - main
       - master
-  pull_request:
+  schedule:
+    - cron: '0 6 * * *'  # daily at 06:00 UTC
   workflow_dispatch:
 
 jobs:
