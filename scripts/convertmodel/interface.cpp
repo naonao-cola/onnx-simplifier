@@ -84,7 +84,7 @@ em::val onnxsimplify_export(const std::string& data, em::val skip_optimizers, bo
     try {
         optimized = Simplify(
 #ifdef ONNXSIM_WASM_ORT_WEB
-            // Runs each fold group through the page's onnxruntime-web. _Run
+            // Runs each fold group through the page's onnxruntime-web. Its Run
             // blocks on a JS Promise, so this whole function is Asyncified and
             // returns a Promise to JS (the worker awaits it).
             *GetJsModelExecutor(),

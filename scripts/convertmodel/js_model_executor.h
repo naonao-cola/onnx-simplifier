@@ -4,9 +4,11 @@
 //
 // This is the WebAssembly analogue of the Python "trampoline" executor
 // (PyModelExecutor in onnxsim/cpp2py_export.cc): the C++ constant folder keeps
-// calling ModelExecutor::_Run, but the actual op execution is delegated across
+// calling ModelExecutor::Run, but the actual op execution is delegated across
 // the language boundary -- to the pip `onnxruntime` package in Python, and to
-// the page's `onnxruntime-web` module here.
+// the page's `onnxruntime-web` module here. Tensors cross the executor boundary
+// as DLPack DLManagedTensors (see onnxsim.h); this executor converts them
+// to/from onnxruntime-web's dtype+dims+raw-bytes contract.
 //
 // Why: the default WASM build compiles ONNX Runtime from source and links it
 // into onnxsim's own .wasm (ONNXSIM_BUILTIN_ORT=ON). That from-source ORT
@@ -31,7 +33,7 @@
 
 #include "onnxsim.h"  // ModelExecutor
 
-// Returns the singleton onnxruntime-web-backed executor. Its _Run reaches into
+// Returns the singleton onnxruntime-web-backed executor. Its Run reaches into
 // JavaScript for the actual session run, so it must be called from a context
 // linked with Asyncify (as onnxsimplify_export is in the ORT-web build).
 std::shared_ptr<const ModelExecutor> GetJsModelExecutor();

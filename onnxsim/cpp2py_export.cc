@@ -17,6 +17,7 @@
 #include <tuple>
 #include <vector>
 
+#include "dlpack_bridge.h"
 #include "function_rewriter.h"
 #include "model_info.h"
 #include "onnx/defs/schema.h"
@@ -214,27 +215,36 @@ void RunPythonNodeInference(onnx::InferenceContext& ctx,
 struct PyModelExecutor : public ModelExecutor {
   using ModelExecutor::ModelExecutor;
 
-  std::vector<onnx::TensorProto> _Run(
+  // Adapts the DLPack executor boundary to the Python protocol, which still
+  // exchanges tensors as serialized TensorProto bytes (the Python side --
+  // onnxruntime's Python API, onnx's reference evaluator -- speaks TensorProto,
+  // not DLPack). So this adapter pays a protobuf round trip that the C++/C-ABI
+  // executors avoid; Python is not the zero-copy target. A future
+  // dlpack-native Python executor could bypass it via __dlpack__.
+  std::vector<DLManagedTensorPtr> Run(
       const onnx::ModelProto& model,
-      const std::vector<onnx::TensorProto>& inputs) const override {
+      const std::vector<const DLManagedTensor*>& inputs) const override {
     std::vector<py::bytes> inputs_bytes;
-    std::transform(inputs.begin(), inputs.end(),
-                   std::back_inserter(inputs_bytes),
-                   [](const onnx::TensorProto& x) {
-                     const std::string str = x.SerializeAsString();
-                     return py::bytes(str.data(), str.size());
-                   });
+    inputs_bytes.reserve(inputs.size());
+    for (const DLManagedTensor* in : inputs) {
+      const std::string str =
+          onnxsim::dlpack::ToTensorProto(in->dl_tensor).SerializeAsString();
+      inputs_bytes.emplace_back(str.data(), str.size());
+    }
     std::string model_str = model.SerializeAsString();
     auto output_bytes =
         _PyRun(py::bytes(model_str.data(), model_str.size()), inputs_bytes);
-    std::vector<onnx::TensorProto> output_tps;
-    std::transform(output_bytes.begin(), output_bytes.end(),
-                   std::back_inserter(output_tps), [](const py::bytes& x) {
-                     onnx::TensorProto tp;
-                     tp.ParseFromString(std::string(x.c_str(), x.size()));
-                     return tp;
-                   });
-    return output_tps;
+    std::vector<DLManagedTensorPtr> outputs;
+    outputs.reserve(output_bytes.size());
+    for (const py::bytes& x : output_bytes) {
+      onnx::TensorProto tp;
+      tp.ParseFromString(std::string(x.c_str(), x.size()));
+      // Owning conversion: the parsed proto is a temporary, so the managed
+      // tensor must keep it alive itself.
+      outputs.emplace_back(
+          onnxsim::dlpack::FromTensorProtoOwning(std::move(tp)));
+    }
+    return outputs;
   }
 
   virtual std::vector<py::bytes> _PyRun(

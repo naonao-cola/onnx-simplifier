@@ -75,6 +75,34 @@
 //!     Ok(())
 //! }
 //! ```
+//!
+//! # Custom executor
+//!
+//! [`simplify_with_executor`] drives constant folding through a closure of yours
+//! instead of the built-in ONNX Runtime — the seam for embedding onnxsim on top
+//! of another ONNX runtime. Each fold group calls the closure with the sub-model
+//! as serialized `ModelProto` bytes and its input tensors as borrowed
+//! [`TensorRef`]s; the closure evaluates it and returns one owned [`Tensor`] per
+//! graph output. Tensors cross as DLPack under the hood, so nothing is
+//! serialized to `TensorProto` on the way in or out.
+//!
+//! ```no_run
+//! fn main() -> Result<(), Box<dyn std::error::Error + 'static>> {
+//!     let model = std::fs::read("model.onnx")?;
+//!     let simplified = onnxsim::simplify_with_executor(
+//!         &model,
+//!         &onnxsim::Options::new(),
+//!         |submodel: &[u8], inputs: &[onnxsim::TensorRef]| {
+//!             // Evaluate `submodel` with `inputs` in your runtime of choice and
+//!             // return the outputs as `onnxsim::Tensor`s (in graph-output order).
+//!             let _ = (submodel, inputs);
+//!             Ok::<_, onnxsim::Error>(Vec::<onnxsim::Tensor>::new())
+//!         },
+//!     )?;
+//!     let _ = simplified;
+//!     Ok(())
+//! }
+//! ```
 
 use std::ffi::{CStr, CString};
 use std::fmt;
@@ -715,6 +743,484 @@ impl FfiSkipOptimizers {
     }
 }
 
+// --- Custom executor -------------------------------------------------------
+//
+// The executor boundary lets you drive constant folding through your own ONNX
+// runtime instead of the built-in ONNX Runtime. Tensors cross as DLPack
+// DLManagedTensors; this module wraps that in a safe API where inputs arrive as
+// borrowed [`TensorRef`]s and outputs are returned as owned [`Tensor`]s.
+
+/// Element type of a tensor at the executor boundary.
+///
+/// This is the set onnxsim's constant folder exchanges (it matches the C++
+/// dtype table); other ONNX dtypes (string, complex, float8, 4-bit) never cross
+/// this boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DataType {
+    /// IEEE half precision (float16).
+    Float16,
+    /// IEEE single precision (float32).
+    Float32,
+    /// IEEE double precision (float64).
+    Float64,
+    /// bfloat16.
+    Bfloat16,
+    /// 8-bit signed integer.
+    Int8,
+    /// 16-bit signed integer.
+    Int16,
+    /// 32-bit signed integer.
+    Int32,
+    /// 64-bit signed integer.
+    Int64,
+    /// 8-bit unsigned integer.
+    Uint8,
+    /// 16-bit unsigned integer.
+    Uint16,
+    /// 32-bit unsigned integer.
+    Uint32,
+    /// 64-bit unsigned integer.
+    Uint64,
+    /// Boolean (1 byte per element).
+    Bool,
+}
+
+impl DataType {
+    /// Size in bytes of a single element of this type.
+    pub fn byte_size(self) -> usize {
+        use DataType::*;
+        match self {
+            Bool | Int8 | Uint8 => 1,
+            Float16 | Bfloat16 | Int16 | Uint16 => 2,
+            Float32 | Int32 | Uint32 => 4,
+            Float64 | Int64 | Uint64 => 8,
+        }
+    }
+
+    /// The DLPack `(code, bits)` pair for this type (`lanes` is always 1).
+    fn to_dl(self) -> (u8, u8) {
+        use onnxsim_sys::DLDataTypeCode::*;
+        use DataType::*;
+        let (code, bits) = match self {
+            Float16 => (kDLFloat, 16),
+            Float32 => (kDLFloat, 32),
+            Float64 => (kDLFloat, 64),
+            Bfloat16 => (kDLBfloat, 16),
+            Int8 => (kDLInt, 8),
+            Int16 => (kDLInt, 16),
+            Int32 => (kDLInt, 32),
+            Int64 => (kDLInt, 64),
+            Uint8 => (kDLUInt, 8),
+            Uint16 => (kDLUInt, 16),
+            Uint32 => (kDLUInt, 32),
+            Uint64 => (kDLUInt, 64),
+            Bool => (kDLBool, 8),
+        };
+        (code as u8, bits)
+    }
+
+    /// Recover a [`DataType`] from a DLPack `DLDataType`, or `None` if it is not
+    /// one onnxsim's boundary supports (vectors, unknown code/width, etc.).
+    fn from_dl(dt: onnxsim_sys::DLDataType) -> Option<DataType> {
+        use onnxsim_sys::DLDataTypeCode;
+        use DataType::*;
+        if dt.lanes != 1 {
+            return None;
+        }
+        // `dt.code` is a raw u8 from C; compare against the enum's discriminants.
+        let code = dt.code;
+        let float = DLDataTypeCode::kDLFloat as u8;
+        let bfloat = DLDataTypeCode::kDLBfloat as u8;
+        let int = DLDataTypeCode::kDLInt as u8;
+        let uint = DLDataTypeCode::kDLUInt as u8;
+        let boolean = DLDataTypeCode::kDLBool as u8;
+        match (code, dt.bits) {
+            (c, 16) if c == float => Some(Float16),
+            (c, 32) if c == float => Some(Float32),
+            (c, 64) if c == float => Some(Float64),
+            (c, 16) if c == bfloat => Some(Bfloat16),
+            (c, 8) if c == int => Some(Int8),
+            (c, 16) if c == int => Some(Int16),
+            (c, 32) if c == int => Some(Int32),
+            (c, 64) if c == int => Some(Int64),
+            (c, 8) if c == uint => Some(Uint8),
+            (c, 16) if c == uint => Some(Uint16),
+            (c, 32) if c == uint => Some(Uint32),
+            (c, 64) if c == uint => Some(Uint64),
+            (c, 8) if c == boolean => Some(Bool),
+            _ => None,
+        }
+    }
+}
+
+/// An owned CPU tensor your executor returns for a graph output: raw
+/// little-endian element bytes plus dtype and shape.
+///
+/// `data.len()` must equal `shape.iter().product::<i64>() as usize *
+/// dtype.byte_size()`; [`simplify_with_executor`] aborts the run with an error
+/// if it does not.
+#[derive(Debug, Clone)]
+pub struct Tensor {
+    dtype: DataType,
+    shape: Vec<i64>,
+    data: Vec<u8>,
+}
+
+impl Tensor {
+    /// Build an output tensor from its dtype, shape, and raw little-endian bytes.
+    pub fn new(dtype: DataType, shape: Vec<i64>, data: Vec<u8>) -> Self {
+        Tensor { dtype, shape, data }
+    }
+
+    /// Element type.
+    pub fn dtype(&self) -> DataType {
+        self.dtype
+    }
+
+    /// Shape (dimension sizes).
+    pub fn shape(&self) -> &[i64] {
+        &self.shape
+    }
+
+    /// Raw little-endian element bytes.
+    pub fn data(&self) -> &[u8] {
+        &self.data
+    }
+
+    /// Number of elements (product of the shape; 1 for a scalar).
+    fn num_elements(&self) -> i64 {
+        self.shape.iter().product()
+    }
+
+    /// Move into a heap-allocated DLManagedTensor owned by the C side. The
+    /// returned pointer is released by [`output_deleter`] (invoked by onnxsim
+    /// through the tensor's DLPack `deleter`).
+    fn into_managed(self) -> *mut onnxsim_sys::DLManagedTensor {
+        use onnxsim_sys::{DLDataType, DLDevice, DLDeviceType, DLManagedTensor, DLTensor};
+        let (code, bits) = self.dtype.to_dl();
+        // Keep shape and data alive in a context box; the DLTensor points into
+        // the Vecs' heap buffers, which stay put when the box is leaked.
+        let mut ctx = Box::new(OutputCtx {
+            shape: self.shape,
+            data: self.data,
+        });
+        let ndim = ctx.shape.len() as c_int;
+        let shape_ptr = ctx.shape.as_mut_ptr();
+        let data_ptr = ctx.data.as_mut_ptr() as *mut c_void;
+        let managed = Box::new(DLManagedTensor {
+            dl_tensor: DLTensor {
+                data: data_ptr,
+                device: DLDevice {
+                    device_type: DLDeviceType::kDLCPU,
+                    device_id: 0,
+                },
+                ndim,
+                dtype: DLDataType {
+                    code,
+                    bits,
+                    lanes: 1,
+                },
+                shape: shape_ptr,
+                strides: ptr::null_mut(),
+                byte_offset: 0,
+            },
+            manager_ctx: Box::into_raw(ctx) as *mut c_void,
+            deleter: Some(output_deleter),
+        });
+        Box::into_raw(managed)
+    }
+}
+
+/// Backing store for a [`Tensor`] handed to the C side as a DLManagedTensor.
+struct OutputCtx {
+    shape: Vec<i64>,
+    data: Vec<u8>,
+}
+
+/// DLPack `deleter` for tensors produced by [`Tensor::into_managed`]. Reclaims
+/// both the context box (shape + data) and the DLManagedTensor box.
+unsafe extern "C" fn output_deleter(this: *mut onnxsim_sys::DLManagedTensor) {
+    if this.is_null() {
+        return;
+    }
+    let managed = Box::from_raw(this);
+    if !managed.manager_ctx.is_null() {
+        drop(Box::from_raw(managed.manager_ctx as *mut OutputCtx));
+    }
+    // `managed` (the DLManagedTensor box) is dropped here.
+}
+
+/// A borrowed view of an input tensor onnxsim feeds to the executor. Valid only
+/// for the duration of the executor call; copy out anything you need to keep.
+pub struct TensorRef<'a> {
+    dtype: DataType,
+    shape: &'a [i64],
+    data: &'a [u8],
+}
+
+impl<'a> TensorRef<'a> {
+    /// Element type.
+    pub fn dtype(&self) -> DataType {
+        self.dtype
+    }
+
+    /// Shape (dimension sizes).
+    pub fn shape(&self) -> &'a [i64] {
+        self.shape
+    }
+
+    /// Raw little-endian element bytes.
+    pub fn data(&self) -> &'a [u8] {
+        self.data
+    }
+
+    /// Borrow the fields of a DLManagedTensor onnxsim passed in. Rejects tensors
+    /// that are not CPU, not contiguous, or of an unsupported dtype.
+    ///
+    /// # Safety
+    /// `mt` must be a valid DLManagedTensor whose buffers outlive `'a`.
+    unsafe fn from_managed(mt: &'a onnxsim_sys::DLManagedTensor) -> Result<TensorRef<'a>, Error> {
+        use onnxsim_sys::DLDeviceType;
+        let t = &mt.dl_tensor;
+        if t.device.device_type != DLDeviceType::kDLCPU {
+            return Err(Error::Simplify(
+                "executor input tensor is not on the CPU device".to_string(),
+            ));
+        }
+        if !t.strides.is_null() {
+            return Err(Error::Simplify(
+                "executor input tensor is not contiguous (non-null strides)".to_string(),
+            ));
+        }
+        let dtype = DataType::from_dl(t.dtype).ok_or_else(|| {
+            Error::Simplify(format!(
+                "executor input tensor has an unsupported dtype (code={}, bits={})",
+                t.dtype.code, t.dtype.bits
+            ))
+        })?;
+        let ndim = t.ndim.max(0) as usize;
+        let shape = std::slice::from_raw_parts(t.shape, ndim);
+        let count: i64 = shape.iter().product();
+        let nbytes = count.max(0) as usize * dtype.byte_size();
+        let base = (t.data as *const u8).add(t.byte_offset as usize);
+        let data = std::slice::from_raw_parts(base, nbytes);
+        Ok(TensorRef { dtype, shape, data })
+    }
+}
+
+/// Type-erased executor closure: `(sub-model bytes, input tensors) -> outputs`.
+type ExecuteCallback<'a> =
+    dyn for<'b> FnMut(&'b [u8], &'b [TensorRef<'b>]) -> Result<Vec<Tensor>, RewriterError> + 'a;
+
+/// Holds the user closure and captures failures that cannot cross the FFI as a
+/// return value (a closure error, a panic, or an invalid input tensor).
+struct ExecutorState<'a> {
+    callback: &'a mut ExecuteCallback<'a>,
+    error: Option<RewriterError>,
+    panicked: bool,
+}
+
+/// `extern "C"` shim matching [`onnxsim_sys::OnnxsimExecuteFn`]. Recovers the
+/// `ExecutorState`, borrows the input tensors, runs the closure under
+/// `catch_unwind`, and hands the outputs back as an owned DLManagedTensor array.
+unsafe extern "C" fn execute_trampoline(
+    user_data: *mut c_void,
+    model_data: *const c_void,
+    model_size: usize,
+    inputs: *const *const onnxsim_sys::DLManagedTensor,
+    num_inputs: usize,
+    out_outputs: *mut *mut *mut onnxsim_sys::DLManagedTensor,
+    out_num_outputs: *mut usize,
+) -> c_int {
+    let state = &mut *(user_data as *mut ExecutorState);
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let model: &[u8] = if model_size == 0 {
+            &[]
+        } else {
+            std::slice::from_raw_parts(model_data as *const u8, model_size)
+        };
+        let mut refs: Vec<TensorRef> = Vec::with_capacity(num_inputs);
+        for i in 0..num_inputs {
+            let mt = *inputs.add(i);
+            if mt.is_null() {
+                return Err(RewriterError::from(Box::new(Error::Simplify(
+                    "executor received a null input tensor".to_string(),
+                ))));
+            }
+            refs.push(TensorRef::from_managed(&*mt)?);
+        }
+        (state.callback)(model, &refs)
+    }));
+    match outcome {
+        Ok(Ok(outputs)) => {
+            // Validate each output's byte length before building DLManagedTensors,
+            // so a malformed tensor is a clean error rather than an out-of-bounds
+            // read on the C side.
+            for (i, t) in outputs.iter().enumerate() {
+                let expected = t.num_elements().max(0) as usize * t.dtype.byte_size();
+                if t.data.len() != expected {
+                    state.error = Some(RewriterError::from(Box::new(Error::Simplify(format!(
+                        "executor output {i} has {} bytes but dtype {:?} and shape {:?} \
+                         imply {expected}",
+                        t.data.len(),
+                        t.dtype,
+                        t.shape
+                    )))));
+                    return -1;
+                }
+            }
+            let mut boxed: Box<[*mut onnxsim_sys::DLManagedTensor]> = outputs
+                .into_iter()
+                .map(Tensor::into_managed)
+                .collect::<Vec<_>>()
+                .into_boxed_slice();
+            let len = boxed.len();
+            let ptr = boxed.as_mut_ptr();
+            std::mem::forget(boxed); // ownership passes to execute_free_trampoline
+            *out_outputs = ptr;
+            *out_num_outputs = len;
+            0
+        }
+        Ok(Err(e)) => {
+            state.error = Some(e);
+            -1
+        }
+        Err(_) => {
+            state.panicked = true;
+            -1
+        }
+    }
+}
+
+/// `extern "C"` shim matching [`onnxsim_sys::OnnxsimExecuteFreeFn`]. Reclaims the
+/// output-array container allocated in [`execute_trampoline`]. The tensors
+/// themselves are released by onnxsim through their own deleters, so this must
+/// not touch them.
+unsafe extern "C" fn execute_free_trampoline(
+    _user_data: *mut c_void,
+    outputs: *mut *mut onnxsim_sys::DLManagedTensor,
+    num_outputs: usize,
+) {
+    if outputs.is_null() {
+        return;
+    }
+    drop(Box::from_raw(std::ptr::slice_from_raw_parts_mut(
+        outputs,
+        num_outputs,
+    )));
+}
+
+/// Map an FFI failure, preferring an error captured from the executor closure.
+fn executor_error(state: &mut ExecutorState, out_error: *mut c_char) -> Error {
+    let c_message = if out_error.is_null() {
+        None
+    } else {
+        match take_error(out_error) {
+            Error::Simplify(msg) => Some(msg),
+            other => Some(other.to_string()),
+        }
+    };
+    if state.panicked {
+        return Error::Simplify("the custom executor panicked".to_string());
+    }
+    if let Some(e) = state.error.take() {
+        return Error::Simplify(format!("custom executor failed: {e}"));
+    }
+    Error::Simplify(c_message.unwrap_or_else(|| "unknown error (no message provided)".to_string()))
+}
+
+/// Simplify a serialized ONNX `ModelProto`, driving constant folding through a
+/// custom executor instead of the built-in ONNX Runtime.
+///
+/// This is the Rust counterpart of the C API's executor callback — the seam for
+/// running onnxsim on top of another ONNX runtime. `executor` is called once per
+/// fold group with the sub-model as serialized `ModelProto` bytes and its input
+/// tensors (borrowed [`TensorRef`]s, positional to `graph.input`); it must
+/// evaluate the sub-model and return one owned [`Tensor`] per graph output, in
+/// order.
+///
+/// `function_rewrite_rules` on the options are not supported here (this entry
+/// point takes an executor, not a rule set) and cause an error if set.
+///
+/// ```no_run
+/// # fn main() -> Result<(), Box<dyn std::error::Error + 'static>> {
+/// let model = std::fs::read("model.onnx")?;
+/// let simplified = onnxsim::simplify_with_executor(
+///     &model,
+///     &onnxsim::Options::new(),
+///     |_submodel: &[u8], _inputs: &[onnxsim::TensorRef]| {
+///         // Run `_submodel` in your runtime with `_inputs`, then return the
+///         // output tensors. (A real executor must actually evaluate it.)
+///         Ok::<_, onnxsim::Error>(Vec::<onnxsim::Tensor>::new())
+///     },
+/// )?;
+/// # let _ = simplified;
+/// # Ok(())
+/// # }
+/// ```
+pub fn simplify_with_executor<F, E>(
+    model_bytes: &[u8],
+    options: &Options,
+    mut executor: F,
+) -> Result<Vec<u8>, Error>
+where
+    F: for<'b> FnMut(&'b [u8], &'b [TensorRef<'b>]) -> Result<Vec<Tensor>, E>,
+    E: Into<RewriterError>,
+{
+    if !options.function_rewrite_rules.is_empty() {
+        return Err(Error::InvalidArgument(
+            "function_rewrite_rules are only supported by simplify/simplify_with, \
+             not simplify_with_executor"
+                .to_string(),
+        ));
+    }
+
+    let mut wrapped =
+        move |model: &[u8], inputs: &[TensorRef]| executor(model, inputs).map_err(Into::into);
+    let mut state = ExecutorState {
+        callback: &mut wrapped,
+        error: None,
+        panicked: false,
+    };
+    let ffi = FfiSkipOptimizers::new(options)?;
+
+    let mut out_data: *mut c_void = ptr::null_mut();
+    let mut out_size: usize = 0;
+    let mut out_error: *mut c_char = ptr::null_mut();
+
+    let status = unsafe {
+        onnxsim_sys::onnxsim_simplify_with_executor(
+            model_bytes.as_ptr() as *const c_void,
+            model_bytes.len(),
+            ffi.ptr(),
+            ffi.len(),
+            ffi.is_null_flag(),
+            bool_to_c(options.constant_folding),
+            bool_to_c(options.shape_inference),
+            options.tensor_size_threshold,
+            target_opset_to_c(options.target_opset_version),
+            None,
+            None,
+            ptr::null_mut(),
+            Some(execute_trampoline),
+            Some(execute_free_trampoline),
+            &mut state as *mut ExecutorState as *mut c_void,
+            &mut out_data,
+            &mut out_size,
+            &mut out_error,
+        )
+    };
+
+    if status == onnxsim_sys::ONNXSIM_OK {
+        let result =
+            unsafe { std::slice::from_raw_parts(out_data as *const u8, out_size) }.to_vec();
+        unsafe { onnxsim_sys::onnxsim_free_buffer(out_data) };
+        Ok(result)
+    } else {
+        Err(executor_error(&mut state, out_error))
+    }
+}
+
 fn bool_to_c(value: bool) -> c_int {
     if value {
         1
@@ -914,6 +1420,193 @@ mod tests {
         assert_eq!(rc, -1);
         assert!(state.panicked);
         let err = rewriter_error(&mut state, ptr::null_mut());
+        assert!(matches!(&err, Error::Simplify(m) if m.contains("panicked")));
+    }
+
+    // --- Executor boundary -------------------------------------------------
+    //
+    // Like the rewriter trampolines, the executor trampolines and the
+    // DLManagedTensor conversions are pure Rust, so the whole input-view ->
+    // closure -> output-tensor -> free round trip can be driven directly without
+    // the native library.
+
+    #[test]
+    fn datatype_byte_size_and_dl_roundtrip() {
+        use DataType::*;
+        let all = [
+            Float16, Float32, Float64, Bfloat16, Int8, Int16, Int32, Int64, Uint8, Uint16, Uint32,
+            Uint64, Bool,
+        ];
+        for dt in all {
+            let (code, bits) = dt.to_dl();
+            assert_eq!(bits as usize, dt.byte_size() * 8);
+            let recovered = DataType::from_dl(onnxsim_sys::DLDataType {
+                code,
+                bits,
+                lanes: 1,
+            });
+            assert_eq!(recovered, Some(dt));
+        }
+        // Vectors and unknown widths are rejected.
+        assert_eq!(
+            DataType::from_dl(onnxsim_sys::DLDataType {
+                code: onnxsim_sys::DLDataTypeCode::kDLFloat as u8,
+                bits: 32,
+                lanes: 4,
+            }),
+            None
+        );
+    }
+
+    /// Build a borrowed input DLManagedTensor (as onnxsim would) over caller-owned
+    /// shape/data buffers, feed it through the executor trampoline, and return the
+    /// closure's outcome plus the reconstructed outputs.
+    #[test]
+    fn execute_trampoline_roundtrips_tensors() {
+        // Input: int32 tensor shape [2] = [1, 2]; the closure echoes it back as
+        // an output, exercising both TensorRef::from_managed and into_managed.
+        let mut in_shape: [i64; 1] = [2];
+        let mut in_data: Vec<u8> = vec![1, 0, 0, 0, 2, 0, 0, 0];
+        let mut in_tensor = onnxsim_sys::DLManagedTensor {
+            dl_tensor: onnxsim_sys::DLTensor {
+                data: in_data.as_mut_ptr() as *mut c_void,
+                device: onnxsim_sys::DLDevice {
+                    device_type: onnxsim_sys::DLDeviceType::kDLCPU,
+                    device_id: 0,
+                },
+                ndim: 1,
+                dtype: onnxsim_sys::DLDataType {
+                    code: onnxsim_sys::DLDataTypeCode::kDLInt as u8,
+                    bits: 32,
+                    lanes: 1,
+                },
+                shape: in_shape.as_mut_ptr(),
+                strides: ptr::null_mut(),
+                byte_offset: 0,
+            },
+            manager_ctx: ptr::null_mut(),
+            deleter: None,
+        };
+        let input_ptrs: [*const onnxsim_sys::DLManagedTensor; 1] = [&in_tensor];
+
+        let mut seen_shape: Vec<i64> = Vec::new();
+        let mut seen_bytes: Vec<u8> = Vec::new();
+        let mut cb = |model: &[u8], inputs: &[TensorRef]| {
+            assert_eq!(model, b"model-bytes");
+            assert_eq!(inputs.len(), 1);
+            seen_shape = inputs[0].shape().to_vec();
+            seen_bytes = inputs[0].data().to_vec();
+            assert_eq!(inputs[0].dtype(), DataType::Int32);
+            Ok::<_, RewriterError>(vec![Tensor::new(
+                DataType::Int32,
+                inputs[0].shape().to_vec(),
+                inputs[0].data().to_vec(),
+            )])
+        };
+        let mut state = ExecutorState {
+            callback: &mut cb,
+            error: None,
+            panicked: false,
+        };
+
+        let model = b"model-bytes";
+        let mut out_outputs: *mut *mut onnxsim_sys::DLManagedTensor = ptr::null_mut();
+        let mut out_num: usize = 0;
+        let rc = unsafe {
+            execute_trampoline(
+                &mut state as *mut ExecutorState as *mut c_void,
+                model.as_ptr() as *const c_void,
+                model.len(),
+                input_ptrs.as_ptr(),
+                input_ptrs.len(),
+                &mut out_outputs,
+                &mut out_num,
+            )
+        };
+        assert_eq!(rc, 0);
+        assert_eq!(seen_shape, vec![2]);
+        assert_eq!(seen_bytes, vec![1, 0, 0, 0, 2, 0, 0, 0]);
+        assert_eq!(out_num, 1);
+
+        // Inspect the produced output tensor, then release it exactly as onnxsim
+        // would: each element via its deleter, then the array via the free shim.
+        unsafe {
+            let out0 = *out_outputs;
+            assert!(!out0.is_null());
+            let t = &(*out0).dl_tensor;
+            assert_eq!(t.ndim, 1);
+            assert_eq!(std::slice::from_raw_parts(t.shape, 1), &[2]);
+            let bytes = std::slice::from_raw_parts(t.data as *const u8, 8);
+            assert_eq!(bytes, &[1, 0, 0, 0, 2, 0, 0, 0]);
+            let deleter = (*out0).deleter.expect("output tensor must carry a deleter");
+            deleter(out0);
+            execute_free_trampoline(ptr::null_mut(), out_outputs, out_num);
+        }
+        // Keep the borrowed input buffers alive until here.
+        let _ = (&in_shape, &in_data, &mut in_tensor);
+    }
+
+    #[test]
+    fn execute_trampoline_rejects_wrong_output_length() {
+        let mut cb = |_: &[u8], _: &[TensorRef]| {
+            // Claims shape [4] int32 (16 bytes) but supplies only 4 bytes.
+            Ok::<_, RewriterError>(vec![Tensor::new(
+                DataType::Int32,
+                vec![4],
+                vec![0, 0, 0, 0],
+            )])
+        };
+        let mut state = ExecutorState {
+            callback: &mut cb,
+            error: None,
+            panicked: false,
+        };
+        let mut out_outputs: *mut *mut onnxsim_sys::DLManagedTensor = ptr::null_mut();
+        let mut out_num: usize = 0;
+        let rc = unsafe {
+            execute_trampoline(
+                &mut state as *mut ExecutorState as *mut c_void,
+                ptr::null(),
+                0,
+                ptr::null(),
+                0,
+                &mut out_outputs,
+                &mut out_num,
+            )
+        };
+        assert_eq!(rc, -1);
+        let err = executor_error(&mut state, ptr::null_mut());
+        assert!(matches!(&err, Error::Simplify(m) if m.contains("bytes")));
+    }
+
+    #[test]
+    fn execute_trampoline_captures_panic() {
+        let mut cb =
+            |_: &[u8], _: &[TensorRef]| -> Result<Vec<Tensor>, RewriterError> { panic!("kaboom") };
+        let mut state = ExecutorState {
+            callback: &mut cb,
+            error: None,
+            panicked: false,
+        };
+        let mut out_outputs: *mut *mut onnxsim_sys::DLManagedTensor = ptr::null_mut();
+        let mut out_num: usize = 0;
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let rc = unsafe {
+            execute_trampoline(
+                &mut state as *mut ExecutorState as *mut c_void,
+                ptr::null(),
+                0,
+                ptr::null(),
+                0,
+                &mut out_outputs,
+                &mut out_num,
+            )
+        };
+        std::panic::set_hook(prev);
+        assert_eq!(rc, -1);
+        assert!(state.panicked);
+        let err = executor_error(&mut state, ptr::null_mut());
         assert!(matches!(&err, Error::Simplify(m) if m.contains("panicked")));
     }
 }

@@ -10,6 +10,8 @@
 #include <string>
 #include <vector>
 
+#include "dlpack_bridge.h"
+
 // wasm is always little-endian; the (de)serialization below memcpy's typed data
 // to/from raw little-endian bytes, so bail loudly if that ever stops holding.
 static_assert(std::endian::native == std::endian::little,
@@ -20,23 +22,29 @@ namespace {
 using emscripten::val;
 
 // The page registers its onnxruntime-web runner on the Emscripten Module under
-// this name (see ort_executor.mjs / worker.js). Signature, in JS:
-//   async (modelBytes: Uint8Array, inputs: InTensor[]) => { [name]: OutTensor }
-// where InTensor  = { name, dataType, dims: number[], data: Uint8Array }
-//   and OutTensor = { dataType, dims: number[], data: Uint8Array }.
-// `dataType` is the ONNX TensorProto.DataType enum value; `data` is the tensor
-// content as raw little-endian bytes of the element type.
+// this name (see ort_executor.mjs / worker.js). The crossing is batched: all of
+// a fold group's tensors travel in one concatenated byte blob plus one flat
+// [dtype, ndim, dims...] metadata array, in both directions. Signature, in JS:
+//   async (modelBytes: Uint8Array,
+//          inputsData: Uint8Array,      // all feed bytes concatenated
+//          inputsMeta: Float64Array)    // [dtype, ndim, dims...] per feed
+//     => Promise<{ data: Uint8Array, meta: Float64Array }>  // same layout
+// `dtype` is the ONNX TensorProto.DataType enum value; tensor bytes are raw
+// little-endian element data. Tensors are positional (no names cross).
 constexpr const char* kRunnerProp = "onnxsimOrtWebRun";
 
-// Copy `s` into a fresh JS-owned Uint8Array. Constructing `new Uint8Array(view)`
-// from a view over the wasm heap copies the bytes into a new ArrayBuffer, so
-// the result stays valid across the Asyncify suspend in _Run -- while suspended
-// the wasm heap can grow (ALLOW_MEMORY_GROWTH=1) and any view still pointing at
-// the old heap would be detached.
-val StringToJsU8Copy(const std::string& s) {
-  val view = val(emscripten::typed_memory_view(
-      s.size(), reinterpret_cast<const uint8_t*>(s.data())));
+// Copy `len` bytes at `data` into a fresh JS-owned Uint8Array. Constructing
+// `new Uint8Array(view)` from a view over the wasm heap copies the bytes into a
+// new ArrayBuffer, so the result stays valid across the Asyncify suspend in
+// Run() -- while suspended the wasm heap can grow (ALLOW_MEMORY_GROWTH=1) and
+// any view still pointing at the old heap would be detached.
+val RawToJsU8Copy(const uint8_t* data, size_t len) {
+  val view = val(emscripten::typed_memory_view(len, data));
   return val::global("Uint8Array").new_(view);
+}
+
+val StringToJsU8Copy(const std::string& s) {
+  return RawToJsU8Copy(reinterpret_cast<const uint8_t*>(s.data()), s.size());
 }
 
 // Copy a JS Uint8Array back into a std::string. Called after the await, so the
@@ -51,50 +59,38 @@ std::string JsU8ToString(const val& u8) {
   return out;
 }
 
-// Serialize a TensorProto's element data to raw little-endian bytes. Mirrors the
-// dtype coverage of the built-in CppModelExecutor's TensorProtoToTensor so the
-// two executors accept the same models. onnx packs the sub-32-bit integer and
-// bool types into int32_data, so narrow each element to its true width.
-std::string TensorProtoRawBytes(const onnx::TensorProto& t) {
-  if (t.has_raw_data()) {
-    return t.raw_data();
-  }
-  std::string raw;
-#define CASE_DTYPE(onnx_dtype, storage_dtype, cpp_type)                  \
-  case onnx::TensorProto::onnx_dtype: {                                  \
-    std::vector<cpp_type> vec;                                           \
-    vec.reserve(t.storage_dtype##_data_size());                         \
-    for (const auto& x : t.storage_dtype##_data()) {                    \
-      vec.push_back(static_cast<cpp_type>(x));                           \
-    }                                                                    \
-    raw.assign(reinterpret_cast<const char*>(vec.data()),               \
-               vec.size() * sizeof(cpp_type));                          \
-    break;                                                              \
-  }
-  switch (t.data_type()) {
-    CASE_DTYPE(FLOAT, float, float)
-    CASE_DTYPE(DOUBLE, double, double)
-    CASE_DTYPE(INT64, int64, int64_t)
-    CASE_DTYPE(UINT64, uint64, uint64_t)
-    CASE_DTYPE(INT32, int32, int32_t)
-    CASE_DTYPE(UINT8, int32, uint8_t)
-    CASE_DTYPE(INT8, int32, int8_t)
-    CASE_DTYPE(UINT16, int32, uint16_t)
-    CASE_DTYPE(INT16, int32, int16_t)
-    CASE_DTYPE(BOOL, int32, int8_t)
-    default:
-      throw std::invalid_argument("onnxruntime-web executor: unsupported input "
-                                  "dtype " +
-                                  std::to_string(t.data_type()));
-  }
-#undef CASE_DTYPE
-  return raw;
+// Copy a std::vector<double> into a fresh JS-owned Float64Array (the batched
+// input metadata). Like the byte copies, this survives the Asyncify suspend.
+val DoublesToJsF64Copy(const std::vector<double>& v) {
+  val view = val(emscripten::typed_memory_view(v.size(), v.data()));
+  return val::global("Float64Array").new_(view);
 }
 
+// Copy a JS Float64Array (the batched output metadata) into a vector. Called
+// after the await, against the current heap.
+std::vector<double> JsF64ToVector(const val& arr) {
+  const size_t len = arr["length"].as<size_t>();
+  std::vector<double> out(len);
+  if (len != 0) {
+    val dest = val(emscripten::typed_memory_view(len, out.data()));
+    dest.call<void>("set", arr);
+  }
+  return out;
+}
+
+// A ModelExecutor that evaluates each constant-folding sub-model with
+// onnxruntime-web. Tensors cross the executor boundary as DLPack
+// DLManagedTensors (see onnxsim.h / dlpack_bridge.h): inputs are borrowed for
+// the call, and outputs are returned as freshly owned managed tensors. Across
+// the wasm<->JS boundary the payload still has to be copied into JS-owned
+// buffers (onnxsim's wasm heap and onnxruntime-web's are separate memories),
+// but nothing is serialized to TensorProto -- the contract is ONNX dtype enums
+// plus raw little-endian bytes, matching the built-in CppModelExecutor's dtype
+// set.
 struct JsModelExecutor : public ModelExecutor {
-  std::vector<onnx::TensorProto> _Run(
+  std::vector<DLManagedTensorPtr> Run(
       const onnx::ModelProto& model,
-      const std::vector<onnx::TensorProto>& inputs) const override {
+      const std::vector<const DLManagedTensor*>& inputs) const override {
     // Reach the runner the page registered on the Module.
     val runner = val::module_property(kRunnerProp);
     if (runner.isUndefined() || runner.isNull()) {
@@ -109,47 +105,82 @@ struct JsModelExecutor : public ModelExecutor {
     const std::string model_str = model.SerializeAsString();
     val js_model = StringToJsU8Copy(model_str);
 
-    val js_inputs = val::array();
-    for (const auto& inp : inputs) {
-      const std::string raw = TensorProtoRawBytes(inp);
-      val obj = val::object();
-      obj.set("name", inp.name());
-      obj.set("dataType", static_cast<int>(inp.data_type()));
-      val dims = val::array();
-      for (int i = 0; i < inp.dims_size(); i++) {
-        dims.call<void>("push", static_cast<double>(inp.dims(i)));
+    // Batch the feeds into two buffers that cross the boundary once each: all
+    // input bytes concatenated, plus a flat [dtype, ndim, dims...] metadata
+    // array (mirrored by ort_executor.mjs). This avoids the per-tensor,
+    // per-field embind round trips of building a JS object array. Inputs are
+    // positional w.r.t. model.graph().input(); the JS side rebinds them to the
+    // session's input names in the same order (DLPack tensors carry no name).
+    std::string in_blob;
+    std::vector<double> in_meta;
+    for (const DLManagedTensor* in : inputs) {
+      const DLTensor& t = in->dl_tensor;
+      int32_t onnx_dtype;
+      if (!onnxsim::dlpack::TryDLToOnnx(t.dtype, &onnx_dtype)) {
+        throw std::invalid_argument(
+            "onnxruntime-web executor: unsupported input dtype (DLPack code=" +
+            std::to_string(t.dtype.code) +
+            ", bits=" + std::to_string(t.dtype.bits) + ")");
       }
-      obj.set("dims", dims);
-      obj.set("data", StringToJsU8Copy(raw));
-      js_inputs.call<void>("push", obj);
+      in_meta.push_back(onnx_dtype);
+      in_meta.push_back(t.ndim);
+      for (int32_t d = 0; d < t.ndim; d++) {
+        in_meta.push_back(static_cast<double>(t.shape[d]));
+      }
+      const size_t nbytes =
+          static_cast<size_t>(onnxsim::dlpack::NumElements(t.shape, t.ndim)) *
+          onnxsim::dlpack::SizeOf(t.dtype);
+      const char* base = static_cast<const char*>(t.data) + t.byte_offset;
+      in_blob.append(base, nbytes);
     }
+    val js_data = StringToJsU8Copy(in_blob);
+    val js_meta = DoublesToJsF64Copy(in_meta);
 
     // Run onnxruntime-web and block on its Promise. val::await() unwinds the
     // wasm stack via Asyncify and resumes here once the Promise settles; a
     // rejected Promise surfaces as a C++ exception.
-    val result = runner(js_model, js_inputs).await();
+    val result = runner(js_model, js_data, js_meta).await();
 
-    // RunOps names the returned tensors positionally, in graph-output order, so
-    // return them in exactly that order (their own names are overwritten).
-    std::vector<onnx::TensorProto> outputs;
+    // The runner returns { data, meta } in the same batched layout, with
+    // outputs in graph-output order (which is how RunOps names them
+    // positionally). Walk the metadata, slicing each output's bytes out of the
+    // blob and rebuilding it as a TensorProto handed to the DLPack boundary as
+    // an owning tensor.
+    const std::string out_blob = JsU8ToString(result["data"]);
+    const std::vector<double> out_meta = JsF64ToVector(result["meta"]);
+
+    std::vector<DLManagedTensorPtr> outputs;
     outputs.reserve(model.graph().output_size());
-    for (const auto& out_vi : model.graph().output()) {
-      val t = result[out_vi.name()];
-      if (t.isUndefined() || t.isNull()) {
-        throw std::runtime_error(
-            "onnxruntime-web executor: runner did not return output '" +
-            out_vi.name() + "'");
-      }
+    size_t m = 0;    // index into out_meta
+    size_t off = 0;  // byte offset into out_blob
+    while (m < out_meta.size()) {
+      const int32_t onnx_dtype = static_cast<int32_t>(out_meta[m++]);
+      const int32_t ndim = static_cast<int32_t>(out_meta[m++]);
       onnx::TensorProto tp;
-      tp.set_data_type(
-          static_cast<onnx::TensorProto::DataType>(t["dataType"].as<int>()));
-      val dims = t["dims"];
-      const size_t ndim = dims["length"].as<size_t>();
-      for (size_t i = 0; i < ndim; i++) {
-        tp.add_dims(static_cast<int64_t>(dims[i].as<double>()));
+      tp.set_data_type(static_cast<onnx::TensorProto::DataType>(onnx_dtype));
+      int64_t numel = 1;
+      for (int32_t d = 0; d < ndim; d++) {
+        const int64_t dim = static_cast<int64_t>(out_meta[m++]);
+        tp.add_dims(dim);
+        numel *= dim;
       }
-      tp.set_raw_data(JsU8ToString(t["data"]));
-      outputs.push_back(std::move(tp));
+      DLDataType dl;
+      if (!onnxsim::dlpack::TryOnnxToDL(onnx_dtype, &dl)) {
+        throw std::invalid_argument(
+            "onnxruntime-web executor: unsupported output dtype " +
+            std::to_string(onnx_dtype));
+      }
+      const size_t nbytes =
+          static_cast<size_t>(numel) * onnxsim::dlpack::SizeOf(dl);
+      if (off + nbytes > out_blob.size()) {
+        throw std::runtime_error(
+            "onnxruntime-web executor: output blob shorter than its metadata "
+            "implies");
+      }
+      tp.set_raw_data(out_blob.data() + off, nbytes);
+      off += nbytes;
+      outputs.emplace_back(
+          onnxsim::dlpack::FromTensorProtoOwning(std::move(tp)));
     }
     return outputs;
   }

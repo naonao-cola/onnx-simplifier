@@ -12,12 +12,16 @@ onnxsim's constant folding runs sub-models through a `ModelExecutor` abstraction
 - `CppModelExecutor` — calls a statically linked ONNX Runtime C++ library. This
   is what the default WASM build uses (`ONNXSIM_BUILTIN_ORT=ON`), which compiles
   ONNX Runtime from source into onnxsim's own `.wasm`.
-- `PyModelExecutor` — the Python "trampoline": `_Run` calls back into the pip
+- `PyModelExecutor` — the Python "trampoline": `Run` calls back into the pip
   `onnxruntime` package, so the wheel links no ONNX Runtime C++
   (`NO_BUILTIN_ORT`).
 
+The `ModelExecutor` boundary exchanges tensors as DLPack `DLManagedTensor`
+(`onnxsim.h` / `onnxsim/dlpack_bridge.h`, see `docs/dlpack-executor.md`), so no
+tensor is serialized to `TensorProto` across it.
+
 This variant adds the WebAssembly analogue of the Python trampoline: a
-`JsModelExecutor` whose `_Run` delegates each fold group to the page's
+`JsModelExecutor` whose `Run` delegates each fold group to the page's
 **onnxruntime-web** module. Built this way, the onnxsim WASM module links **no**
 ONNX Runtime:
 
@@ -28,11 +32,11 @@ ONNX Runtime:
 ## How it works
 
 ```
-Simplify → RunOps → executor._Run(subModel, inputs)      (C++, onnxsim.cpp)
+Simplify → RunOps → executor.Run(subModel, DLManagedTensor feeds)  (C++, onnxsim.cpp)
                         │
                         │  JsModelExecutor (js_model_executor.cpp)
-                        │   - serialize subModel + inputs to JS-owned buffers
-                        │   - Module.onnxsimOrtWebRun(modelBytes, inputs)
+                        │   - concat all feed bytes + a flat meta array (one copy each)
+                        │   - Module.onnxsimOrtWebRun(modelBytes, inputsData, inputsMeta)
                         │   - .await() the returned Promise  ← needs Asyncify
                         ▼
         onnxsimOrtWebRun (ort_executor.mjs, makeOrtRunner)  (JS)
@@ -42,14 +46,20 @@ Simplify → RunOps → executor._Run(subModel, inputs)      (C++, onnxsim.cpp)
                  onnxruntime-web (wasm/WebGPU EP)
 ```
 
-The C++↔JS contract (see `js_model_executor.cpp` and `ort_executor.mjs`):
+The C++↔JS contract (see `js_model_executor.cpp` and `ort_executor.mjs`) is
+**batched**: all of a fold group's tensors cross in a single concatenated byte
+blob plus one flat metadata array, in both directions, so the number of embind
+round trips is O(1) rather than O(tensors × fields):
 
-- **Input** `{ name, dataType, dims: number[], data: Uint8Array }` per feed,
-  where `dataType` is the ONNX `TensorProto.DataType` enum value and `data` is
-  raw little-endian element bytes.
-- **Output** is a map `{ [name]: { dataType, dims, data } }`. `JsModelExecutor`
-  reads it back in `graph().output()` order, because `RunOps` names the returned
-  tensors positionally in that order.
+- **Input**: `onnxsimOrtWebRun(modelBytes, inputsData, inputsMeta)`, where
+  `inputsData` is every feed's raw little-endian bytes concatenated and
+  `inputsMeta` is a `Float64Array` of `[dtype, ndim, dims...]` per feed
+  (`dtype` = ONNX `TensorProto.DataType`).
+- **Output**: `{ data: Uint8Array, meta: Float64Array }` in the same layout.
+- Tensors are **positional** — no names cross. Input i binds to
+  `session.inputNames[i]`; outputs are emitted in `session.outputNames` order.
+  Both equal the sub-model's graph input/output order, which is how the built-in
+  executor maps feeds and how `RunOps` names returned tensors.
 
 Supported dtypes match `CppModelExecutor`: FLOAT, DOUBLE, INT64, UINT64, INT32,
 UINT8, INT8, UINT16, INT16, BOOL.
@@ -58,15 +68,16 @@ UINT8, INT8, UINT16, INT16, BOOL.
 
 The Python trampoline is straightforward because `onnxruntime`'s `run()` is
 synchronous. `onnxruntime-web` is asynchronous (`await create`, `await run`),
-but `ModelExecutor::_Run` is a synchronous call deep inside `Simplify`. The
+but `ModelExecutor::Run` is a synchronous call deep inside `Simplify`. The
 bridge is **Asyncify** (`-sASYNCIFY`): `emscripten::val::await()` unwinds the
-wasm stack at the `_Run` call, lets the JS Promise settle, then rewinds. A
+wasm stack at the `Run` call, lets the JS Promise settle, then rewinds. A
 consequence is that the exported `onnxsimplify_export` becomes async (returns a
 Promise); `worker.js` awaits it when `onnxsim_needs_ort_web()` is true.
 
 Because the wasm heap can move/grow while suspended (`ALLOW_MEMORY_GROWTH=1`),
-`_Run` copies the model bytes and every input into JS-owned `Uint8Array`s
-*before* the await, so nothing points into the wasm heap across the suspend.
+`Run` copies the model bytes and the batched input blob + metadata into JS-owned
+buffers *before* the await, so nothing points into the wasm heap across the
+suspend.
 
 ## Building
 
