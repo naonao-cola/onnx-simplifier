@@ -6,7 +6,7 @@
 // that entry point as `window.__onnxsimStartConversion` and enables the controls
 // below (via `maybeEnableInput`) only once both WASM runtimes are ready.
 
-import { loadModelList, fetchModelBytes } from "./hf_models.mjs";
+import { loadModelList, fetchModelBytes, humanBytes } from "./hf_models.mjs";
 
 const select = document.getElementById("hf-model-select");
 const refInput = document.getElementById("hf-model-input");
@@ -64,7 +64,27 @@ async function doLoad() {
   if (statusEl) statusEl.textContent = "loading…";
   try {
     log(`loading model from Hugging Face: ${ref}`);
-    const { bytes, name } = await fetchModelBytes(ref, log);
+    // Live download progress in the status line. Update only when the whole-
+    // percent (or, without a Content-Length, the rounded MB) changes, so the
+    // DOM isn't rewritten on every chunk.
+    let lastShown = -1;
+    const onProgress = ({ loaded, total }) => {
+      if (!statusEl) return;
+      if (total > 0) {
+        const pct = Math.floor((loaded / total) * 100);
+        if (pct === lastShown) return;
+        lastShown = pct;
+        statusEl.textContent =
+          `downloading… ${pct}% (${humanBytes(loaded)} / ${humanBytes(total)})`;
+      } else {
+        const mb = Math.floor(loaded / (1024 * 1024));
+        if (mb === lastShown) return;
+        lastShown = mb;
+        statusEl.textContent = `downloading… ${humanBytes(loaded)}`;
+      }
+    };
+    const { bytes, name } = await fetchModelBytes(ref, log, onProgress);
+    if (statusEl) statusEl.textContent = "converting…";
     // Publish as the "original" model so the Run inference panel can run it —
     // there is no file-input entry for a Hugging Face download.
     window.__onnxsimOriginal = { bytes, name };
@@ -72,7 +92,8 @@ async function doLoad() {
     // postMessage, so copying keeps `bytes` intact for the inference panel.
     const copy = bytes.slice();
     window.__onnxsimStartConversion(name, copy.buffer);
-    if (statusEl) statusEl.textContent = "";
+    // Leave "converting…" showing; it is cleared when the worker signals the
+    // conversion is done (the onnxsim:converted listener below).
   } catch (e) {
     log("Hugging Face load failed: " + (e && e.message ? e.message : String(e)));
     if (statusEl) statusEl.textContent = "failed — see console output";
@@ -93,3 +114,10 @@ if (refInput) {
     }
   });
 }
+
+// index.html fires this once a conversion finishes; clear the "converting…"
+// status so the panel returns to idle (harmless for file-upload conversions,
+// where the status line is already empty).
+window.addEventListener("onnxsim:converted", () => {
+  if (statusEl) statusEl.textContent = "";
+});

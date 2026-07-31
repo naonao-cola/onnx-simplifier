@@ -10,6 +10,7 @@ import {
   fileUrl,
   loadModelList,
   fetchModelBytes,
+  humanBytes,
 } from "../hf_models.mjs";
 
 let passed = 0;
@@ -25,23 +26,50 @@ async function acheck(name, fn) {
   console.log("  ok -", name);
 }
 
-// Install a fetch stub that maps URL -> { ok, status, json?, arrayBuffer? }.
+// Install a fetch stub that maps URL -> a route descriptor:
+//   { ok?, status?, statusText?, json?, arrayBuffer?, chunks?, contentLength? }
+// A `chunks` array (of Uint8Array) yields a streaming ReadableStream-style body
+// so the progress path can be exercised; otherwise only arrayBuffer() is served.
 function withFetch(routes, fn) {
   const saved = globalThis.fetch;
   globalThis.fetch = async (url) => {
     const r = routes[url];
-    if (!r) return { ok: false, status: 404, statusText: "Not Found" };
-    return {
+    if (!r) {
+      return { ok: false, status: 404, statusText: "Not Found", headers: headersOf() };
+    }
+    const resp = {
       ok: r.ok !== false,
       status: r.status ?? 200,
       statusText: r.statusText ?? "OK",
+      headers: headersOf(r.contentLength),
       json: async () => r.json,
       arrayBuffer: async () => r.arrayBuffer ?? new ArrayBuffer(0),
     };
+    if (r.chunks) resp.body = streamOf(r.chunks);
+    return resp;
   };
   return Promise.resolve(fn()).finally(() => {
     globalThis.fetch = saved;
   });
+}
+
+function headersOf(contentLength) {
+  const map = {};
+  if (contentLength != null) map["content-length"] = String(contentLength);
+  return { get: (k) => map[k.toLowerCase()] ?? null };
+}
+
+// Minimal getReader()-style body over a fixed list of chunks.
+function streamOf(chunks) {
+  let i = 0;
+  return {
+    getReader: () => ({
+      read: async () =>
+        i < chunks.length
+          ? { done: false, value: chunks[i++] }
+          : { done: true, value: undefined },
+    }),
+  };
 }
 
 check("bare name defaults to the onnxmodelzoo org", () => {
@@ -167,6 +195,51 @@ await acheck("fetchModelBytes surfaces a failed download", async () => {
     { [url]: { ok: false, status: 403, statusText: "Forbidden" } },
     async () => {
       await assert.rejects(fetchModelBytes(url), /HTTP 403/);
+    },
+  );
+});
+
+check("humanBytes formats sizes", () => {
+  assert.equal(humanBytes(0), "0 B");
+  assert.equal(humanBytes(512), "512 B");
+  assert.equal(humanBytes(1536), "1.5 KB");
+  assert.equal(humanBytes(5 * 1024 * 1024), "5.0 MB");
+  assert.equal(humanBytes(-1), "?");
+});
+
+await acheck("fetchModelBytes streams chunks and reports progress", async () => {
+  const url = "https://huggingface.co/o/r/resolve/main/m.onnx";
+  await withFetch(
+    {
+      [url]: {
+        contentLength: 6,
+        chunks: [new Uint8Array([1, 2, 3]), new Uint8Array([4, 5, 6])],
+      },
+    },
+    async () => {
+      const progress = [];
+      const { bytes } = await fetchModelBytes(url, () => {}, (p) => progress.push(p));
+      // Bytes are reassembled in order across chunks.
+      assert.deepEqual(Array.from(bytes), [1, 2, 3, 4, 5, 6]);
+      // Progress is reported per chunk, with the total from Content-Length.
+      assert.deepEqual(progress, [
+        { loaded: 3, total: 6 },
+        { loaded: 6, total: 6 },
+      ]);
+    },
+  );
+});
+
+await acheck("fetchModelBytes falls back to arrayBuffer without a body", async () => {
+  const url = "https://huggingface.co/o/r/resolve/main/m.onnx";
+  await withFetch(
+    { [url]: { arrayBuffer: new Uint8Array([7, 8]).buffer } },
+    async () => {
+      const progress = [];
+      const { bytes } = await fetchModelBytes(url, () => {}, (p) => progress.push(p));
+      assert.deepEqual(Array.from(bytes), [7, 8]);
+      // One final progress tick; total defaults to the byte count.
+      assert.deepEqual(progress, [{ loaded: 2, total: 2 }]);
     },
   );
 });

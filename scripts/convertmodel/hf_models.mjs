@@ -114,9 +114,54 @@ async function findOnnxFile(repo, onLog) {
   return chosen;
 }
 
+// Human-readable byte size, e.g. 4.7 MB. Used in progress messages.
+export function humanBytes(n) {
+  if (!Number.isFinite(n) || n < 0) return "?";
+  const units = ["B", "KB", "MB", "GB"];
+  let i = 0;
+  let v = n;
+  while (v >= 1024 && i < units.length - 1) {
+    v /= 1024;
+    i += 1;
+  }
+  return `${i === 0 ? v : v.toFixed(1)} ${units[i]}`;
+}
+
+// Read a fetch Response body to a Uint8Array, reporting progress as it streams.
+// `onProgress({ loaded, total })` is called per chunk (`total` is 0 when the
+// server sends no Content-Length). Falls back to a single arrayBuffer() read
+// when the environment has no streaming body.
+async function readWithProgress(resp, onProgress) {
+  const total = Number(resp.headers && resp.headers.get("content-length")) || 0;
+  if (!resp.body || typeof resp.body.getReader !== "function") {
+    const bytes = new Uint8Array(await resp.arrayBuffer());
+    onProgress({ loaded: bytes.length, total: total || bytes.length });
+    return bytes;
+  }
+  const reader = resp.body.getReader();
+  const chunks = [];
+  let loaded = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    chunks.push(value);
+    loaded += value.length;
+    onProgress({ loaded, total });
+  }
+  const bytes = new Uint8Array(loaded);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.length;
+  }
+  return bytes;
+}
+
 // Resolve a reference and download the model. Returns { bytes, name, repo }.
-// `onLog` receives progress lines for the page's console output.
-export async function fetchModelBytes(ref, onLog = () => {}) {
+// `onLog` receives progress lines for the page's console output; `onProgress`
+// receives { loaded, total } byte counts as the download streams, for a live
+// progress indicator.
+export async function fetchModelBytes(ref, onLog = () => {}, onProgress = () => {}) {
   const parsed = parseRef(ref);
 
   let url;
@@ -140,7 +185,7 @@ export async function fetchModelBytes(ref, onLog = () => {}) {
   if (!resp.ok) {
     throw new Error(`download failed: HTTP ${resp.status} ${resp.statusText}`);
   }
-  const bytes = new Uint8Array(await resp.arrayBuffer());
+  const bytes = await readWithProgress(resp, onProgress);
   onLog(`downloaded ${name} (${bytes.length.toLocaleString()} bytes)`);
   return { bytes, name, repo: parsed.repo };
 }
