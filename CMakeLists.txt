@@ -16,6 +16,7 @@ set(CMAKE_CXX_STANDARD 20)
 
 option(ONNXSIM_PYTHON "" OFF)
 option(ONNXSIM_BUILTIN_ORT "" ON)
+option(ONNXSIM_PREBUILT_ORT "Link a prebuilt ONNX Runtime release instead of building it from source" OFF)
 option(ONNXSIM_WASM_NODE "For node (enable NODERAWFS etc.)" OFF)
 option(ONNXSIM_C_API "Build the C ABI shared library used by the Rust wrapper and other FFI consumers" OFF)
 option(ONNXSIM_COVERAGE "Instrument onnxsim's own C++ targets for gcov/llvm-cov coverage" OFF)
@@ -38,19 +39,36 @@ if (WIN32)
 endif()
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
+if (ONNXSIM_PREBUILT_ORT AND NOT ONNXSIM_BUILTIN_ORT)
+  message(FATAL_ERROR "ONNXSIM_PREBUILT_ORT requires ONNXSIM_BUILTIN_ORT=ON")
+endif()
+if (ONNXSIM_PREBUILT_ORT AND EMSCRIPTEN)
+  message(FATAL_ERROR "ONNXSIM_PREBUILT_ORT is not supported for Emscripten; the "
+                      "WebAssembly build must compile ONNX Runtime from source")
+endif()
+
 if (ONNXSIM_BUILTIN_ORT)
-  # The top-level project only enables CXX, but ONNX Runtime (added below as a
-  # subdirectory) compiles C and assembly sources. Enable the languages it needs
-  # before configuring it. Emscripten's toolchain handles this on its own.
-  if (NOT EMSCRIPTEN)
-    enable_language(C)
-    enable_language(ASM)
-  endif()
-  include(cmake/build_ort.cmake)
-  if (EMSCRIPTEN)
-    set(ORT_NAME onnxruntime_webassembly)
-  else()
+  if (ONNXSIM_PREBUILT_ORT)
+    # Link an official ONNX Runtime release (headers + libonnxruntime) and skip
+    # the from-source ORT build entirely. This defines an imported `onnxruntime`
+    # target and sets ONNXRUNTIME_INCLUDE_DIR, mirroring build_ort.cmake's
+    # outputs so the rest of this file is unchanged.
+    include(cmake/prebuilt_ort.cmake)
     set(ORT_NAME onnxruntime)
+  else()
+    # The top-level project only enables CXX, but ONNX Runtime (added below as a
+    # subdirectory) compiles C and assembly sources. Enable the languages it needs
+    # before configuring it. Emscripten's toolchain handles this on its own.
+    if (NOT EMSCRIPTEN)
+      enable_language(C)
+      enable_language(ASM)
+    endif()
+    include(cmake/build_ort.cmake)
+    if (EMSCRIPTEN)
+      set(ORT_NAME onnxruntime_webassembly)
+    else()
+      set(ORT_NAME onnxruntime)
+    endif()
   endif()
 endif()
 
@@ -60,6 +78,11 @@ add_subdirectory(third_party/onnx-optimizer EXCLUDE_FROM_ALL)
 add_library(onnxsim onnxsim/onnxsim.cpp onnxsim/contrib_schemas.cpp onnxsim/function_rewriter.cpp onnxsim/profiler.cpp onnxsim/model_info.cpp onnxsim/sym_expr.cpp onnxsim/sym_value_eval.cpp onnxsim/sym_shape_infer.cpp onnxsim/model_metrics.cpp)
 if (ONNXSIM_BUILTIN_ORT)
   target_include_directories(onnxsim PRIVATE ${ONNXRUNTIME_INCLUDE_DIR})
+  if (ONNXSIM_PREBUILT_ORT)
+    # Prebuilt releases ship the public headers flat under include/, so onnxsim.cpp
+    # includes onnxruntime_cxx_api.h directly instead of the nested source path.
+    target_compile_definitions(onnxsim PRIVATE ONNXSIM_ORT_FLAT_HEADERS)
+  endif()
 endif()
 target_include_directories(onnxsim PUBLIC onnxsim)
 if (NOT ONNXSIM_BUILTIN_ORT)
