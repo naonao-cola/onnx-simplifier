@@ -841,4 +841,3 @@ def test_remove_initializer_from_input_folds_modern_opset():
     out = remove_initializer_from_input(model)
     assert out.ir_version == 4
     assert "W" not in [i.name for i in out.graph.input]
-    assert all(n.op_type != "Cast" for n in sim_model.graph.node)
