@@ -1,0 +1,24 @@
+{
+  "//": "c8 coverage config for the convertmodel JS unit tests. `all` reports every",
+  "//src": "included module even when a test happens not to import one, so the number",
+  "//include": "reflects the whole unit-tested surface, not just files loaded this run.",
+  "//scope": "Only node-testable modules are listed; the browser-only glue (hf_load.mjs,",
+  "//scope2": "*_view.mjs, inference_browser.mjs, worker.js) drives the DOM and has no unit test.",
+  "all": true,
+  "src": ["."],
+  "include": [
+    "hf_models.mjs",
+    "inference_core.mjs",
+    "macs.mjs",
+    "netron.mjs",
+    "trace_build.mjs",
+    "xet_cache.mjs"
+  ],
+  "exclude": [
+    "test/**",
+    "node_modules/**"
+  ],
+  "reporter": ["text", "html", "cobertura"],
+  "report-dir": "coverage",
+  "clean": true
+}

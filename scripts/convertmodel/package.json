@@ -10,9 +10,14 @@
     "test:trace": "node test/trace.test.mjs",
     "test:macs": "node test/macs.test.mjs",
     "test:hf": "node test/hf_models.test.mjs",
-    "test:xet": "node test/xet_cache.test.mjs"
+    "test:xet": "node test/xet_cache.test.mjs",
+    "test:all": "npm run test:netron && npm run test:trace && npm run test:macs && npm run test:hf && npm run test:xet && npm run test:inference",
+    "coverage": "c8 npm run test:all"
   },
   "dependencies": {
     "onnxruntime-web": "^1.27.0"
+  },
+  "devDependencies": {
+    "c8": "^10.1.3"
   }
 }

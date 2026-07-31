@@ -1,4 +1,4 @@
-name: Coverage (C++ and Python)
+name: Coverage (C++, Python and JS)
 
 on:
   push:
@@ -10,7 +10,7 @@ on:
 
 jobs:
   coverage:
-    name: Combined C++/Python coverage
+    name: Combined C++/Python/JS coverage
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -37,6 +37,9 @@ jobs:
     - uses: actions/setup-python@v7
       with:
         python-version: '3.12'
+    - uses: actions/setup-node@v4
+      with:
+        node-version: '22'
     - uses: mozilla-actions/sccache-action@v0.0.10
 
     - name: Install build + coverage tooling
@@ -67,6 +70,20 @@ jobs:
         COV_SKIP_BUILD: '1'
       run: bash scripts/coverage/run_coverage.sh
 
+    # JS coverage is independent of the C++/Python build: it runs the
+    # convertmodel Node unit tests under c8 (V8 coverage) and emits a Cobertura
+    # report, which we drop next to python.xml/cpp.xml as js.xml so the summary
+    # below folds all three languages into one table.
+    - name: Run JS tests with coverage
+      working-directory: scripts/convertmodel
+      run: |
+        npm ci
+        npm run coverage
+    - name: Collect JS coverage report
+      run: |
+        cp scripts/convertmodel/coverage/cobertura-coverage.xml coverage-report/js.xml
+        cp -r scripts/convertmodel/coverage coverage-report/js-html
+
     - name: Upload coverage reports artifact
       if: always()
       uses: actions/upload-artifact@v7
@@ -74,16 +91,16 @@ jobs:
         name: coverage-report
         path: coverage-report/
 
-    # Render a combined coverage table from both Cobertura reports. irongut
-    # accepts a comma-separated file list, so C++ and Python land in one summary.
-    # No external service or secret -- output goes to the job summary and a PR
-    # comment. fail_below_min stays false so coverage never blocks CI; set it
-    # true (with `thresholds`) to enforce a floor.
-    - name: Coverage summary (C++ + Python)
+    # Render a combined coverage table from every Cobertura report. irongut
+    # accepts a comma-separated file list, so C++, Python and JS land in one
+    # summary. No external service or secret -- output goes to the job summary
+    # and a PR comment. fail_below_min stays false so coverage never blocks CI;
+    # set it true (with `thresholds`) to enforce a floor.
+    - name: Coverage summary (C++ + Python + JS)
       if: ${{ !cancelled() }}
       uses: irongut/CodeCoverageSummary@v1.3.0
       with:
-        filename: coverage-report/cpp.xml,coverage-report/python.xml
+        filename: coverage-report/cpp.xml,coverage-report/python.xml,coverage-report/js.xml
         badge: true
         format: markdown
         output: both
