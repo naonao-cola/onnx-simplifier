@@ -32,6 +32,12 @@ jobs:
       - name: Run MAC-metrics reader unit test
         working-directory: scripts/convertmodel
         run: npm run test:macs
+      - name: Run Hugging Face loader unit test
+        working-directory: scripts/convertmodel
+        run: npm run test:hf
+      - name: Run Xet chunk-cache unit test
+        working-directory: scripts/convertmodel
+        run: npm run test:xet
       - name: Run inference smoke test (wasm EP)
         working-directory: scripts/convertmodel
         run: npm run test:inference

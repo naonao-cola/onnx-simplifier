@@ -129,38 +129,55 @@ async function runOnModel(modelBytes, { iterations, batch, preferWebGPU, profile
 
 // Resolve the model bytes for the chosen source. "converted" uses the bytes the
 // converter page published on window.__onnxsimConverted; "original" reads the
-// file input. Returns { bytes, label } or throws with a user-facing message.
+// file input, falling back to a model loaded from Hugging Face (published on
+// window.__onnxsimOriginal, which has no file-input entry). Returns
+// { bytes, label } or throws with a user-facing message.
 async function resolveModelBytes(source, fileInput) {
   if (source === "converted") {
     const converted = window.__onnxsimConverted;
     if (!converted || !converted.bytes) {
       throw new Error(
-        "no converted model yet — pick a file above to run a conversion " +
-          "first, or switch the model dropdown to 'original'.",
+        "no converted model yet — pick a file (or load one from Hugging " +
+          "Face) above to run a conversion first, or switch the model " +
+          "dropdown to 'original'.",
       );
     }
     return { bytes: converted.bytes, label: `converted (${converted.name})` };
   }
   const file = fileInput.files && fileInput.files[0];
-  if (!file) throw new Error("Pick an .onnx file first.");
-  // Prefer the MAC-annotated copy of the original that the converter produced
-  // for this upload (window.__onnxsimOriginalAnnotated, published in index.html
-  // when a conversion finishes with "annotate model info" on). It is the same
-  // model plus onnxsim.* metadata_props, so it runs identically but lets the
-  // panel report MACs/throughput — enabling an original-vs-converted speed
+  // Resolve the "original" bytes + a display name from either a local file
+  // upload or a Hugging Face download (which has no file-input entry, and
+  // publishes itself on window.__onnxsimOriginal).
+  let name = null;
+  let readBytes = null;
+  if (file) {
+    name = file.name;
+    readBytes = async () => new Uint8Array(await file.arrayBuffer());
+  } else {
+    const original = window.__onnxsimOriginal;
+    if (original && original.bytes) {
+      name = original.name;
+      readBytes = async () => original.bytes;
+    }
+  }
+  if (!readBytes) {
+    throw new Error("Pick an .onnx file or load one from Hugging Face first.");
+  }
+  // Prefer the MAC-annotated copy of this original that the converter produced
+  // (window.__onnxsimOriginalAnnotated, published in index.html when a
+  // conversion finishes with "annotate model info" on). It is the same model
+  // plus onnxsim.* metadata_props, so it runs identically but lets the panel
+  // report MACs/throughput — enabling an original-vs-converted speed
   // comparison. The name guard avoids serving a stale annotation for a model
   // that has since been swapped out.
   const annotated = window.__onnxsimOriginalAnnotated;
-  if (annotated && annotated.bytes && annotated.name === file.name) {
+  if (annotated && annotated.bytes && annotated.name === name) {
     return {
       bytes: annotated.bytes,
-      label: `original (${file.name}, MAC-annotated)`,
+      label: `original (${name}, MAC-annotated)`,
     };
   }
-  return {
-    bytes: new Uint8Array(await file.arrayBuffer()),
-    label: `original (${file.name})`,
-  };
+  return { bytes: await readBytes(), label: `original (${name})` };
 }
 
 // Render the onnxsim MAC/FLOP metrics (onnxsim PR #527) that travel inside the

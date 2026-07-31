@@ -24,6 +24,7 @@ workflow on a weekly schedule and on demand.
 | `run_regression.py` | assigns a balanced shard of the model set (or the known-slow set) and runs each model through `worker.py` with a per-tool timeout. Exits non-zero if any model in the shard **crashed, timed out, or failed onnxsim's correctness check** — onnxslim outcomes are recorded but never affect the exit code. |
 | `summarize.py` | merges the per-shard CSVs into `regression-report.csv` and a Markdown run summary, including the onnxsim-vs-onnxslim comparison tables. |
 | `yolov5_regression.py` | standalone check that `onnxsim` can replace the `onnxslim.slim` call in [ultralytics/yolov5](https://github.com/ultralytics/yolov5)'s `export.py`: exports the raw graph, runs both simplifiers, and gates on onnxsim producing a valid graph numerically equivalent to the original. Latest run: [`RESULTS_yolov5.md`](./RESULTS_yolov5.md). |
+| `model_zoo.py` | reference a regression model by short name from Python or the CLI, downloading it from the [`onnxmodelzoo`](https://huggingface.co/onnxmodelzoo) org (cached) and returning the path to its main `.onnx`. See [Referencing a model by name](#referencing-a-model-by-name). |
 
 ## What counts as a failure
 
@@ -93,6 +94,34 @@ python scripts/regression/summarize.py "shard-*.csv" slow.csv
 
 Set `SLIM_CHECK=0` to skip onnxslim's (optional) equivalence check, which halves
 onnxslim's per-model work when you only care about its robustness and node counts.
+
+## Referencing a model by name
+
+`model_zoo.py` turns a short model name into a local `.onnx` path, so a script or
+test can pull one of the regression models without repeating the
+`snapshot_download` boilerplate:
+
+```python
+from model_zoo import fetch_model, list_models, resolve
+
+fetch_model("resnet18d_Opset18")   # -> /path/to/…/resnet18d.onnx (cached)
+resolve("resnet18d_Opset18")       # -> "onnxmodelzoo/resnet18d_Opset18"
+list_models()                      # -> the curated set's full repo ids
+```
+
+The name is resolved leniently: a short name is looked up in `models.json`, a
+bare name not listed there is assumed to live under `onnxmodelzoo/`, and an
+explicit `owner/repo` is used verbatim (so any Hugging Face repo works). The same
+is available from the command line:
+
+```bash
+python scripts/regression/model_zoo.py list            # curated repo ids
+python scripts/regression/model_zoo.py resolve resnet18d_Opset18
+python scripts/regression/model_zoo.py fetch resnet18d_Opset18   # prints .onnx path
+```
+
+Downloads require `huggingface_hub` (`pip install huggingface_hub`) and land in
+its cache, so repeated fetches of the same model are effectively free.
 
 ## Updating the model set
 

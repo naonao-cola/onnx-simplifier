@@ -17,6 +17,7 @@ on:
       - "cmake/**"
       - "onnxsim/**"
       - "scripts/convertmodel/**"
+      - "scripts/regression/models.json"
       - ".gitmodules"
 
   pull_request:
@@ -27,6 +28,7 @@ on:
       - "cmake/**"
       - "onnxsim/**"
       - "scripts/convertmodel/**"
+      - "scripts/regression/models.json"
       - ".gitmodules"
 
   # Allows you to run this workflow manually from the Actions tab
@@ -108,6 +110,11 @@ jobs:
             echo '```'
           } >> "${GITHUB_STEP_SUMMARY}"
           ccache -s
+
+      # Ship the curated regression model set next to the page so the
+      # "Load from Hugging Face" dropdown can fetch it same-origin (it falls
+      # back to the raw GitHub copy when this file is absent, e.g. local dev).
+      - run: cp scripts/regression/models.json scripts/convertmodel/models.json
 
       # Build the patched Netron (embedding protocol + embedded mode) and serve
       # it from the converter's own origin at ./netron/, so the page can post
