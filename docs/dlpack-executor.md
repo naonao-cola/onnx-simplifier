@@ -137,7 +137,8 @@ container. The Rust `-sys` crate can add a matching declaration to expose this
 
 ## JsModelExecutor / onnxruntime-web: the separate-heap caveat
 
-A planned `JsModelExecutor` would run constant folding in onnxruntime-web. This
+`JsModelExecutor` (added in #555, `scripts/convertmodel/js_model_executor.cpp`,
+and ported to this boundary here) runs constant folding in onnxruntime-web. This
 is the case DLPack helps most — **but with a hard constraint**: onnxsim-wasm and
 onnxruntime-web are *separate WASM modules with separate linear memories*. A
 `DLManagedTensor.data` pointer minted in onnxsim's heap is meaningless inside
@@ -205,9 +206,16 @@ The Rust crates expose the seam:
   construction/teardown round trip is unit-tested and verified leak/UAF-free
   under AddressSanitizer.
 
+The `JsModelExecutor`'s `Run` now takes borrowed `DLManagedTensor*` feeds
+(reading dtype/shape/bytes directly, names recovered positionally from
+`graph().input()`) and returns owning managed tensors built from the runner's
+output bytes via `FromTensorProtoOwning`. See `docs/wasm_ort_web.md` for the
+onnxruntime-web build variant and its Asyncify sync-C++/async-JS bridge.
+
 ## Follow-ups
 
-- Implement `JsModelExecutor` (embind adapter: `DLManagedTensor` ⇆ `ort.Tensor`,
-  batched per fold group).
+- Batch a whole fold group's tensors into one embind crossing in
+  `JsModelExecutor` (currently one JS array built per call; the per-tensor
+  `Uint8Array` copies are unavoidable across the separate heaps).
 - Optional dlpack-native Python executor via `__dlpack__` to drop the Python
   adapter's protobuf round trip.
