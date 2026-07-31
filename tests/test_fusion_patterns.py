@@ -95,6 +95,22 @@ def test_fuse_matmul_add_into_gemm():
     assert ops["MatMul"] == 0 and ops["Add"] == 0
 
 
+def test_batched_matmul_add_into_gemm():
+    # A transformer linear layer applies a 2-D weight to a rank-3 activation and
+    # adds a bias (exported bias-first, as HuggingFace does). onnxsim converts
+    # the batched MatMul+Add into a Gemm (fuse_matmul_add_bias_into_gemm_batched,
+    # opted in by onnxsim) so runtimes can dispatch tuned GEMM kernels.
+    inits = [_f32(np.random.randn(8, 16), "W"), _f32(np.random.randn(16), "b")]
+    nodes = [
+        onnx.helper.make_node("MatMul", ["X", "W"], ["mm"]),
+        onnx.helper.make_node("Add", ["b", "mm"], ["Y"]),
+    ]
+    model = _model(nodes, [_vi("X", [2, 4, 8])], [_vi("Y", [2, 4, 16])], inits)
+    _, ops = _simplify(model)
+    assert ops["Gemm"] == 1
+    assert ops["MatMul"] == 0
+
+
 def test_fuse_pad_into_conv():
     # A constant zero-value Pad on the spatial dims is folded into the Conv pads
     # attribute (fuse_pad_into_conv), removing the Pad node.

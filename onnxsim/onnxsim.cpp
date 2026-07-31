@@ -2006,6 +2006,19 @@ onnx::ModelProto Simplify(
         passes.push_back(pass);
       }
     }
+    // Opt into the batched MatMul+bias -> Gemm rewrite. onnx-optimizer registers
+    // it as PassType::Other (so it is absent from GetFuseAndEliminationPass),
+    // because it is a graph-shape rewrite rather than a pure node reduction.
+    // Transformer linear layers apply a 2-D weight to rank-3 activations, which
+    // the 2-D-only ``fuse_matmul_add_bias_into_gemm`` cannot fuse; converting
+    // them to ``Gemm`` lets runtimes dispatch their tuned GEMM kernels (the
+    // reshape scaffolding it introduces is folded/deduplicated by the rest of
+    // the fixed point). Still honour an explicit ``--skip-optimization`` for it.
+    const std::string batched_gemm = "fuse_matmul_add_bias_into_gemm_batched";
+    if (!is_disabled(*skip_optimizers, batched_gemm) &&
+        !is_disabled(always_disabled_passes, batched_gemm)) {
+      passes.push_back(batched_gemm);
+    }
     config.optimizer_passes = passes;
   }
 
