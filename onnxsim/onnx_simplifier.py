@@ -69,13 +69,29 @@ def remove_unused_output(
     return model
 
 
+def _default_domain_opset(model: onnx.ModelProto) -> int:
+    """Opset version imported for the default (ai.onnx) domain, or 0 if none."""
+    for imp in model.opset_import:
+        if imp.domain in ("", "ai.onnx"):
+            return imp.version
+    return 0
+
+
+# Value-baking fusions such as ``fuse_bn_into_conv`` materialise helper nodes --
+# notably ``Cast`` -- using the modern operator encoding, where ``Cast``'s ``to``
+# attribute is an INT (a ``TensorProto`` data-type enum). That encoding only
+# became valid in opset 6; before that ``to`` was a STRING type name. Enabling
+# those fusions on an older-opset graph therefore emits nodes the graph's own
+# opset rejects, and onnx / onnxruntime abort with e.g. "Mismatched attribute
+# type in 'Cast_0 : to'. Expected: 'STRING', actual: 'INT'" (the onnx-caffe2
+# opset-3 ``resnet50-caffe2-v1-3`` hit exactly this). Below this opset we leave
+# IR<4 models untouched so onnxoptimizer keeps treating their initializers as
+# runtime inputs and skips the value-baking fusions -- the graph passes through
+# unchanged rather than crashing.
+_MIN_OPSET_FOR_INITIALIZER_FOLD = 6
+
+
 def remove_initializer_from_input(model: onnx.ModelProto) -> onnx.ModelProto:
-    initializer_names = [x.name for x in model.graph.initializer]
-    removed_any = False
-    for graph_input in copy.deepcopy(model.graph.input):
-        if graph_input.name in initializer_names:
-            model.graph.input.remove(graph_input)
-            removed_any = True
     # IR version 4 (ONNX 1.4) is the first that allows an initializer to *not*
     # also be a graph input. Older IR (v3 and below) required every initializer
     # to appear in ``graph.input``, and leaving it there makes onnxoptimizer
@@ -83,8 +99,21 @@ def remove_initializer_from_input(model: onnx.ModelProto) -> onnx.ModelProto:
     # (``is_constant_initializer`` returns false), which silently blocks
     # value-baking fusions such as ``fuse_bn_into_conv`` -- e.g. the plain
     # Conv+BN chains of the opset-8 ``resnet101-v1-7`` were left completely
-    # unsimplified. Bump such models to IR 4 so the removal above is legal and
-    # the freed initializers fold like any other constant.
+    # unsimplified. Bump such models to IR 4 so the removal below is legal and
+    # the freed initializers fold like any other constant -- but only when the
+    # opset is new enough for the ops those fusions insert; on an ancient-opset
+    # graph the bump would let a fusion emit a node the opset rejects (see
+    # ``_MIN_OPSET_FOR_INITIALIZER_FOLD``), so leave such models alone.
+    if model.ir_version < 4 and (
+        _default_domain_opset(model) < _MIN_OPSET_FOR_INITIALIZER_FOLD
+    ):
+        return model
+    initializer_names = [x.name for x in model.graph.initializer]
+    removed_any = False
+    for graph_input in copy.deepcopy(model.graph.input):
+        if graph_input.name in initializer_names:
+            model.graph.input.remove(graph_input)
+            removed_any = True
     if removed_any and model.ir_version < 4:
         model.ir_version = 4
     return model
@@ -564,7 +593,8 @@ def simplify(
         # ``remove_initializer_from_input`` bumps IR<4 models to IR 4 so the
         # freed initializers become foldable constants (previously gated on
         # ``ir_version >= 4``, which left opset-8 graphs such as resnet101-v1-7
-        # completely unsimplified).
+        # completely unsimplified) -- except for opsets too old to encode the
+        # nodes those fusions insert, which it leaves untouched.
         model = remove_initializer_from_input(model)
 
     # onnxoptimizer's common-subexpression / duplicate-initializer passes hash
