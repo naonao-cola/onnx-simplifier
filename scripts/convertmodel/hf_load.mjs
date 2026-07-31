@@ -79,23 +79,46 @@ async function doLoad() {
   if (statusEl) statusEl.textContent = "loading…";
   try {
     log(`loading model from Hugging Face: ${ref}`);
-    // Live download progress in the status line. Update only when the whole-
-    // percent (or, without a Content-Length, the rounded MB) changes, so the
-    // DOM isn't rewritten on every chunk.
+    // Live download progress + speed in the status line. Speed is smoothed with
+    // an exponential moving average so it doesn't jitter per chunk. The DOM is
+    // only rewritten when the whole-percent (or, without a Content-Length, the
+    // rounded MB) changes, but timing is sampled on every chunk for accuracy.
     let lastShown = -1;
+    let startedAt = 0;
+    let lastAt = 0;
+    let lastLoaded = 0;
+    let emaRate = 0; // bytes/sec
+    const resetProgress = () => {
+      lastShown = -1;
+      startedAt = lastAt = performance.now();
+      lastLoaded = 0;
+      emaRate = 0;
+    };
+    resetProgress();
     const onProgress = ({ loaded, total }) => {
       if (!statusEl) return;
+      // Update the smoothed rate every call, before the display throttle.
+      const now = performance.now();
+      const dt = (now - lastAt) / 1000;
+      if (dt > 0 && loaded > lastLoaded) {
+        const inst = (loaded - lastLoaded) / dt;
+        emaRate = emaRate === 0 ? inst : emaRate * 0.7 + inst * 0.3;
+        lastAt = now;
+        lastLoaded = loaded;
+      }
+      const speed = emaRate > 0 ? ` — ${humanBytes(emaRate)}/s` : "";
+
       if (total > 0) {
         const pct = Math.floor((loaded / total) * 100);
         if (pct === lastShown) return;
         lastShown = pct;
         statusEl.textContent =
-          `downloading… ${pct}% (${humanBytes(loaded)} / ${humanBytes(total)})`;
+          `downloading… ${pct}% (${humanBytes(loaded)} / ${humanBytes(total)})${speed}`;
       } else {
         const mb = Math.floor(loaded / (1024 * 1024));
         if (mb === lastShown) return;
         lastShown = mb;
-        statusEl.textContent = `downloading… ${humanBytes(loaded)}`;
+        statusEl.textContent = `downloading… ${humanBytes(loaded)}${speed}`;
       }
     };
     let bytes;
@@ -120,11 +143,16 @@ async function doLoad() {
         if (hits > 0) log(`reused ${hits} cached chunk(s) (${humanBytes(hitBytes)})`);
       } catch (e) {
         log(`Xet path unavailable (${e && e.message ? e.message : e}); falling back to direct download`);
-        lastShown = -1;
+        resetProgress();
         ({ bytes, name } = await fetchModelBytes(ref, log, onProgress));
       }
     } else {
       ({ bytes, name } = await fetchModelBytes(ref, log, onProgress));
+    }
+    // Report the average download speed over the whole transfer.
+    const elapsed = (performance.now() - startedAt) / 1000;
+    if (elapsed > 0 && bytes && bytes.length) {
+      log(`download average ${humanBytes(bytes.length / elapsed)}/s over ${elapsed.toFixed(1)}s`);
     }
     if (statusEl) statusEl.textContent = "converting…";
     // Publish as the "original" model so the Run inference panel can run it —
