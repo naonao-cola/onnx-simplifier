@@ -5,7 +5,7 @@
 # The demo is built as the ORT-web variant (ONNXSIM_WASM_ORT_WEB=ON): onnxsim's
 # WebAssembly module links no ONNX Runtime and delegates constant folding to the
 # page's onnxruntime-web (worker.js loads it and registers the runner; see
-# docs/wasm_ort_web.md). onnx builds its bundled protobuf 6.31.1 for the wasm
+# docs/wasm_ort_web.md). onnx builds its bundled protobuf 25.1 for the wasm
 # target, so the host protoc must match that version for codegen.
 name: Deploy static content to Pages
 
@@ -74,14 +74,14 @@ jobs:
         uses: actions/configure-pages@v6
       - run: pip install cmake ninja
       # The ORT-web build forces ONNX_BUILD_CUSTOM_PROTOBUF=ON (CMakeLists.txt),
-      # so onnx fetches and builds protobuf 6.31.1 for the wasm target (see its
+      # so onnx fetches and builds protobuf 25.1 for the wasm target (see its
       # sbom.cdx.json). build_wasm.sh passes `which protoc` as
       # ONNX_CUSTOM_PROTOC_EXECUTABLE for codegen, so the host protoc MUST match
       # that version or the generated .pb.* code is incompatible with the runtime
-      # headers. Ubuntu's apt protobuf-compiler is too old, so install protoc 31.1.
-      - name: Install protoc 31.1 (matches onnx's bundled protobuf 6.31.1)
+      # headers. Ubuntu's apt protobuf-compiler is too old, so install protoc 25.1.
+      - name: Install protoc 25.1 (matches onnx's bundled protobuf)
         run: |
-          PROTOC_VERSION=31.1
+          PROTOC_VERSION=25.1
           curl -sSL -o /tmp/protoc.zip \
             "https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/protoc-${PROTOC_VERSION}-linux-x86_64.zip"
           sudo unzip -o /tmp/protoc.zip -d /usr/local bin/protoc 'include/*'
