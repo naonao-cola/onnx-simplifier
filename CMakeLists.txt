@@ -1,10 +1,13 @@
 cmake_minimum_required(VERSION 3.22)
 
-# For std::filesystem in onnx optimizer
+# For std::filesystem in onnx optimizer, and std::to_chars (used by onnx's
+# text printer) which libc++ only marks available from macOS 13.3 onwards.
+# ONNX itself raised its wheel deployment target to 13.3 for the same reason,
+# so onnxsim follows to keep building the bundled onnx on macOS.
 # Must be a cache variable and be set before project()
 # Reference: https://cmake.org/cmake/help/latest/variable/CMAKE_OSX_DEPLOYMENT_TARGET.html
 # It can be a normal variable if policy CMP0126 is set to NEW.
-set(CMAKE_OSX_DEPLOYMENT_TARGET 10.15 CACHE STRING "Minimum OS X deployment version")
+set(CMAKE_OSX_DEPLOYMENT_TARGET 13.3 CACHE STRING "Minimum OS X deployment version")
 
 project(onnxsim CXX)
 
@@ -170,17 +173,23 @@ if (ONNXSIM_C_API)
   if (NOT ONNXSIM_BUILTIN_ORT)
     message(FATAL_ERROR "ONNXSIM_C_API requires ONNXSIM_BUILTIN_ORT=ON")
   endif()
-  # In the builtin-ORT path onnx_optimizer is built as a shared library
-  # (build_ort.cmake sets BUILD_SHARED_LIBS ON), but it inherits the
-  # project-wide "hidden" visibility preset, so it exports none of its symbols.
-  # onnxsim/onnxsim_c call into it across the shared-library boundary (e.g.
-  # OptimizeFixed, GetFuseAndEliminationPass), which then fail to resolve at
-  # runtime with "undefined symbol". Restore default visibility so those symbols
-  # are exported. (The Python build avoids this by linking it statically.)
-  if (TARGET onnx_optimizer)
-    set_target_properties(onnx_optimizer PROPERTIES CXX_VISIBILITY_PRESET default
-                                                    VISIBILITY_INLINES_HIDDEN FALSE)
-  endif()
+  # In the builtin-ORT path onnx_optimizer and onnx are built as shared
+  # libraries (build_ort.cmake sets BUILD_SHARED_LIBS ON), but they inherit the
+  # project-wide "hidden" visibility preset, so they export none of their
+  # symbols. onnxsim/onnxsim_c call into onnx_optimizer across the
+  # shared-library boundary (e.g. OptimizeFixed, GetFuseAndEliminationPass), and
+  # reference onnx message RTTI across it (e.g. typeinfo for onnx::ModelProto,
+  # whose vtable/typeinfo live in the onnx_proto target that compiles the
+  # generated *.pb.cc); both then fail to resolve at runtime with "undefined
+  # symbol". Restore default visibility so those symbols are exported. (The
+  # Python build avoids this by linking them statically.)
+  foreach(_onnxsim_shared_dep onnx_optimizer onnx onnx_proto)
+    if (TARGET ${_onnxsim_shared_dep})
+      set_target_properties(${_onnxsim_shared_dep} PROPERTIES
+        CXX_VISIBILITY_PRESET default
+        VISIBILITY_INLINES_HIDDEN FALSE)
+    endif()
+  endforeach()
   add_library(onnxsim_c SHARED onnxsim/capi/onnxsim_c_api.cpp)
   target_link_libraries(onnxsim_c PRIVATE onnxsim onnx_optimizer onnx)
   target_include_directories(onnxsim_c PUBLIC onnxsim/capi)
