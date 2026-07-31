@@ -29,6 +29,13 @@ if (ONNXSIM_WASM_ORT_WEB)
   # built-in ORT off. onnxsim then compiles with NO_BUILTIN_ORT (all Ort:: code
   # #ifdef'd out) and no ORT source is fetched or compiled.
   set(ONNXSIM_BUILTIN_ORT OFF)
+  # In the default WASM build, ONNX Runtime builds protobuf for the wasm target
+  # and hands it to onnx (build_ort.cmake sets onnxruntime_USE_FULL_PROTOBUF and
+  # ONNX_TARGET_NAME). With ORT gone, onnx has no wasm protobuf and its generated
+  # .pb.* code fails to compile. Have onnx build its own bundled protobuf for the
+  # target instead; the host protoc is still used for codegen via
+  # ONNX_CUSTOM_PROTOC_EXECUTABLE (passed by build_wasm.sh).
+  set(ONNX_BUILD_CUSTOM_PROTOBUF ON CACHE BOOL "" FORCE)
 endif()
 
 if (ONNXSIM_PYTHON AND EMSCRIPTEN)

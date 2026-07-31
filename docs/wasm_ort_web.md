@@ -98,12 +98,29 @@ byte-for-byte the old behavior.
   model with constant folding enabled, and confirm the output matches the
   built-in-ORT build for the same model.
 
+## protobuf for wasm (resolved via ONNX_BUILD_CUSTOM_PROTOBUF)
+
+The first `ORT_WEB=ON` build failed while compiling onnx's *own* libraries
+(`onnx_proto`, `onnx`) with `onnx-ml.pb.h: unknown type name
+'PROTOBUF_NAMESPACE_OPEN'`. The default WASM build relies on **ONNX Runtime to
+build protobuf for the wasm target and hand it to onnx** (`build_ort.cmake` sets
+`onnxruntime_USE_FULL_PROTOBUF` and `ONNX_TARGET_NAME onnxruntime_webassembly`).
+Removing ORT (`ONNXSIM_BUILTIN_ORT=OFF`) also removes that wasm protobuf, so
+onnx's generated `.pb.*` code fails to compile; `build_wasm.sh` only builds a
+**host** protoc (for codegen), not a wasm protobuf runtime.
+
+Fix: the `ONNXSIM_WASM_ORT_WEB` path sets `ONNX_BUILD_CUSTOM_PROTOBUF=ON`, so
+onnx builds its own bundled protobuf cross-compiled for the wasm target. The
+host protoc is still used for codegen via `ONNX_CUSTOM_PROTOC_EXECUTABLE` (passed
+by `build_wasm.sh`), so the generated code and the runtime protobuf come from the
+matching version.
+
 ## Not done yet / follow-ups
 
-- No CI job builds the ORT-web variant yet (needs an Emscripten + onnxruntime-web
-  end-to-end runner). Until then it is validated manually.
 - Per-fold-group `InferenceSession.create` may dominate runtime; session reuse or
   coarser batching is a likely optimization.
 - Only the dtypes above are bridged (same as the built-in executor); others throw
   a clear error.
 - Not wired for the `ONNXSIM_WASM_NODE` (NODERAWFS) build or a Node smoke test yet.
+- The `JsModelExecutor` C++ / `ort_executor.mjs` bridge has not been exercised
+  yet because the build fails earlier at the protobuf step above.
