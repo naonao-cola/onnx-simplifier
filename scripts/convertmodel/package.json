@@ -9,7 +9,8 @@
     "test:netron": "node test/netron.test.mjs",
     "test:trace": "node test/trace.test.mjs",
     "test:macs": "node test/macs.test.mjs",
-    "test:hf": "node test/hf_models.test.mjs"
+    "test:hf": "node test/hf_models.test.mjs",
+    "test:xet": "node test/xet_cache.test.mjs"
   },
   "dependencies": {
     "onnxruntime-web": "^1.27.0"

@@ -189,3 +189,73 @@ export async function fetchModelBytes(ref, onLog = () => {}, onProgress = () => 
   onLog(`downloaded ${name} (${bytes.length.toLocaleString()} bytes)`);
   return { bytes, name, repo: parsed.repo };
 }
+
+// Pinned @huggingface/hub build for the experimental Xet download path. Loaded
+// lazily (only when the Xet toggle is used) from a CDN, mirroring how the
+// inference panel lazy-loads onnxruntime-web.
+const HF_HUB_ESM = "https://esm.sh/@huggingface/hub@2.14.4";
+
+// Read a Blob (e.g. the XetBlob returned by downloadFile) to a Uint8Array,
+// reporting streaming progress against its known size.
+async function readBlobWithProgress(blob, onProgress) {
+  const total = blob.size || 0;
+  if (typeof blob.stream !== "function") {
+    const bytes = new Uint8Array(await blob.arrayBuffer());
+    onProgress({ loaded: bytes.length, total: total || bytes.length });
+    return bytes;
+  }
+  const reader = blob.stream().getReader();
+  const chunks = [];
+  let loaded = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    chunks.push(value);
+    loaded += value.length;
+    onProgress({ loaded, total });
+  }
+  const bytes = new Uint8Array(loaded);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.length;
+  }
+  return bytes;
+}
+
+// EXPERIMENTAL: download a model over the Hugging Face Xet protocol via
+// @huggingface/hub's downloadFile, which reconstructs the file from
+// content-addressed blocks. Pass `fetchImpl` (e.g. the caching fetch from
+// xet_cache.mjs) to persist those blocks across loads. Only Hub repos are
+// supported (not arbitrary URLs). Returns { bytes, name, repo }; the caller is
+// expected to fall back to fetchModelBytes() on any failure (CORS, unsupported).
+export async function fetchModelBytesXet(
+  ref,
+  { onLog = () => {}, onProgress = () => {}, fetchImpl } = {},
+) {
+  const parsed = parseRef(ref);
+  if (!parsed.repo) {
+    throw new Error("Xet download needs a Hugging Face repo, not a direct URL");
+  }
+  const revision = parsed.revision || "main";
+  let file = parsed.file;
+  if (!file) {
+    onLog(`querying Hugging Face for the .onnx file in ${parsed.repo}…`);
+    file = await findOnnxFile(parsed.repo, onLog);
+  }
+
+  onLog(`downloading ${file} from ${parsed.repo} via Xet…`);
+  const { downloadFile } = await import(/* @vite-ignore */ HF_HUB_ESM);
+  const blob = await downloadFile({
+    repo: parsed.repo,
+    path: file,
+    revision,
+    fetch: fetchImpl,
+  });
+  if (!blob) throw new Error(`file not found: ${parsed.repo}/${file}`);
+
+  const name = file.split("/").pop();
+  const bytes = await readBlobWithProgress(blob, onProgress);
+  onLog(`downloaded ${name} (${bytes.length.toLocaleString()} bytes via Xet)`);
+  return { bytes, name, repo: parsed.repo };
+}

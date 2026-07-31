@@ -280,6 +280,21 @@
                 to the <code>onnxmodelzoo</code> org; any <code>owner/repo</code>
                 or direct <code>.onnx</code> URL works too.
             </div>
+            <div style="margin-top: 0.25em;">
+                <input type="checkbox" id="hf-use-xet">
+                <label for="hf-use-xet">
+                    Use <a href="https://huggingface.co/docs/xet/en/index" target="_blank" rel="noopener">Xet</a>
+                    protocol (experimental)
+                </label>
+                <button id="hf-clear-cache" type="button">clear chunk cache</button>
+                <div style="color: #666; font-size: 0.85em; margin-top: 0.2em;">
+                    Downloads via <code>@huggingface/hub</code>, reconstructing the
+                    file from content-addressed chunks and caching them in
+                    IndexedDB so repeated / overlapping loads reuse them. Falls
+                    back to the direct download automatically if the Xet path
+                    isn't available (e.g. a non-Xet repo or a CORS block).
+                </div>
+            </div>
         </div>
         <div>
             <input type="radio" name="optimizer" value="simplify" id="optimizer_simplify" checked>

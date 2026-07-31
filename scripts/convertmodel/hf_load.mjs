@@ -6,7 +6,13 @@
 // that entry point as `window.__onnxsimStartConversion` and enables the controls
 // below (via `maybeEnableInput`) only once both WASM runtimes are ready.
 
-import { loadModelList, fetchModelBytes, humanBytes } from "./hf_models.mjs";
+import {
+  loadModelList,
+  fetchModelBytes,
+  fetchModelBytesXet,
+  humanBytes,
+} from "./hf_models.mjs";
+import { openXetCache, makeCachingFetch } from "./xet_cache.mjs";
 
 const select = document.getElementById("hf-model-select");
 const refInput = document.getElementById("hf-model-input");
@@ -14,6 +20,15 @@ const loadBtn = document.getElementById("hf-load-button");
 const statusEl = document.getElementById("hf-status");
 const fileInput = document.getElementById("file-input");
 const logOutput = document.getElementById("log-output");
+const xetToggle = document.getElementById("hf-use-xet");
+const clearCacheBtn = document.getElementById("hf-clear-cache");
+
+// The persistent chunk cache is created lazily on first Xet use.
+let xetCache = null;
+function getXetCache() {
+  if (!xetCache) xetCache = openXetCache();
+  return xetCache;
+}
 
 const log = (msg) => {
   if (!logOutput) return;
@@ -83,7 +98,34 @@ async function doLoad() {
         statusEl.textContent = `downloading… ${humanBytes(loaded)}`;
       }
     };
-    const { bytes, name } = await fetchModelBytes(ref, log, onProgress);
+    let bytes;
+    let name;
+    if (xetToggle && xetToggle.checked) {
+      // Experimental Xet path, with the persistent chunk cache. Any failure
+      // (non-Xet repo, CORS on the CAS endpoints, …) falls back to the direct
+      // download so the toggle can never break loading.
+      let hits = 0;
+      let hitBytes = 0;
+      const cachingFetch = makeCachingFetch(
+        globalThis.fetch.bind(globalThis),
+        getXetCache(),
+        { onHit: (_k, n) => { hits += 1; hitBytes += n; } },
+      );
+      try {
+        ({ bytes, name } = await fetchModelBytesXet(ref, {
+          onLog: log,
+          onProgress,
+          fetchImpl: cachingFetch,
+        }));
+        if (hits > 0) log(`reused ${hits} cached chunk(s) (${humanBytes(hitBytes)})`);
+      } catch (e) {
+        log(`Xet path unavailable (${e && e.message ? e.message : e}); falling back to direct download`);
+        lastShown = -1;
+        ({ bytes, name } = await fetchModelBytes(ref, log, onProgress));
+      }
+    } else {
+      ({ bytes, name } = await fetchModelBytes(ref, log, onProgress));
+    }
     if (statusEl) statusEl.textContent = "converting…";
     // Publish as the "original" model so the Run inference panel can run it —
     // there is no file-input entry for a Hugging Face download.
@@ -111,6 +153,17 @@ if (refInput) {
     if (e.key === "Enter") {
       e.preventDefault();
       doLoad();
+    }
+  });
+}
+
+if (clearCacheBtn) {
+  clearCacheBtn.addEventListener("click", async () => {
+    try {
+      await getXetCache().clear();
+      log("Xet chunk cache cleared");
+    } catch (e) {
+      log("could not clear Xet cache: " + (e && e.message ? e.message : e));
     }
   });
 }
