@@ -10,6 +10,7 @@ import {
   fileUrl,
   loadModelList,
   fetchModelBytes,
+  probeModelSize,
   humanBytes,
 } from "../hf_models.mjs";
 
@@ -240,6 +241,57 @@ await acheck("fetchModelBytes falls back to arrayBuffer without a body", async (
       assert.deepEqual(Array.from(bytes), [7, 8]);
       // One final progress tick; total defaults to the byte count.
       assert.deepEqual(progress, [{ loaded: 2, total: 2 }]);
+    },
+  );
+});
+
+await acheck("probeModelSize reports the largest .onnx size from the Hub API", async () => {
+  const api = "https://huggingface.co/api/models/onnxmodelzoo/foo?blobs=true";
+  await withFetch(
+    {
+      [api]: {
+        json: {
+          siblings: [
+            { rfilename: "small.onnx", size: 10 },
+            { rfilename: "big.onnx", size: 999 },
+            { rfilename: "readme.md", size: 1 },
+          ],
+        },
+      },
+    },
+    async () => {
+      const info = await probeModelSize("foo");
+      assert.equal(info.size, 999);
+      assert.equal(info.name, "big.onnx");
+      assert.equal(info.repo, "onnxmodelzoo/foo");
+    },
+  );
+});
+
+await acheck("probeModelSize HEADs an exact resolve URL for its size", async () => {
+  const url = "https://huggingface.co/o/r/resolve/main/m.onnx";
+  await withFetch({ [url]: { contentLength: 4096 } }, async () => {
+    const info = await probeModelSize(url);
+    assert.equal(info.size, 4096);
+    assert.equal(info.name, "m.onnx");
+  });
+});
+
+await acheck("probeModelSize returns a null size when Content-Length is absent", async () => {
+  const url = "https://example.com/models/net.onnx";
+  await withFetch({ [url]: {} }, async () => {
+    const info = await probeModelSize(url);
+    assert.equal(info.size, null);
+    assert.equal(info.name, "net.onnx");
+  });
+});
+
+await acheck("probeModelSize surfaces a repo with no .onnx", async () => {
+  const api = "https://huggingface.co/api/models/onnxmodelzoo/empty?blobs=true";
+  await withFetch(
+    { [api]: { json: { siblings: [{ rfilename: "readme.md", size: 1 }] } } },
+    async () => {
+      await assert.rejects(probeModelSize("empty"), /no \.onnx file found/);
     },
   );
 });

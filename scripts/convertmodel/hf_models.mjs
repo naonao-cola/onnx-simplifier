@@ -89,17 +89,25 @@ async function repoSiblings(repo) {
   return info.siblings || [];
 }
 
+// From a repo's sibling listing, pick the main .onnx file (largest, matching the
+// regression workers). Returns { sibling, count } where `sibling` carries both
+// `rfilename` and `size`; throws when the repo has no .onnx file.
+function pickOnnxSibling(siblings, repo) {
+  const onnx = siblings.filter((s) => s.rfilename && s.rfilename.endsWith(".onnx"));
+  if (!onnx.length) throw new Error(`no .onnx file found in ${repo}`);
+  onnx.sort((a, b) => (b.size || 0) - (a.size || 0));
+  return { sibling: onnx[0], count: onnx.length };
+}
+
 // Pick the main .onnx file in a repo (largest, matching the regression workers)
 // and warn when the graph relies on external-data blobs the in-browser,
 // single-file converter can't load.
 async function findOnnxFile(repo, onLog) {
   const siblings = await repoSiblings(repo);
-  const onnx = siblings.filter((s) => s.rfilename && s.rfilename.endsWith(".onnx"));
-  if (!onnx.length) throw new Error(`no .onnx file found in ${repo}`);
-  onnx.sort((a, b) => (b.size || 0) - (a.size || 0));
-  const chosen = onnx[0].rfilename;
-  if (onnx.length > 1) {
-    onLog(`repo has ${onnx.length} .onnx files; using the largest: ${chosen}`);
+  const { sibling, count } = pickOnnxSibling(siblings, repo);
+  const chosen = sibling.rfilename;
+  if (count > 1) {
+    onLog(`repo has ${count} .onnx files; using the largest: ${chosen}`);
   }
   const external = siblings.some(
     (s) => s.rfilename && /\.(onnx_data|onnx\.data|data|weight|weights)$/.test(s.rfilename),
@@ -112,6 +120,54 @@ async function findOnnxFile(repo, onLog) {
     );
   }
   return chosen;
+}
+
+// Read a URL's byte size from its Content-Length via a HEAD request, without
+// downloading the body. Returns a positive integer, or null when the size can't
+// be determined (request failed, header absent, or CORS hid it).
+async function headContentLength(url) {
+  try {
+    const r = await fetch(url, { method: "HEAD" });
+    if (!r.ok) return null;
+    const n = Number(r.headers && r.headers.get("content-length"));
+    return Number.isFinite(n) && n > 0 ? n : null;
+  } catch {
+    return null;
+  }
+}
+
+// Resolve a reference to the size of the model that would be downloaded, WITHOUT
+// fetching the model bytes — so the page can show how big a model is before
+// committing to the download. For a Hub repo id this reuses the Hub API listing
+// (which carries per-file sizes); for an exact file or a direct URL it issues a
+// HEAD request and reads Content-Length. Returns { size, name, repo?, file?,
+// url? }, where `size` is a byte count or null when it can't be determined.
+// Throws only when the reference itself can't be resolved (empty ref, or a repo
+// with no .onnx file).
+export async function probeModelSize(ref) {
+  const parsed = parseRef(ref);
+  if (parsed.url) {
+    return { size: await headContentLength(parsed.url), name: parsed.name, url: parsed.url };
+  }
+  const revision = parsed.revision || "main";
+  if (parsed.file) {
+    const url = fileUrl(parsed.repo, parsed.file, revision);
+    return {
+      size: await headContentLength(url),
+      name: parsed.file.split("/").pop(),
+      repo: parsed.repo,
+      file: parsed.file,
+    };
+  }
+  const siblings = await repoSiblings(parsed.repo);
+  const { sibling } = pickOnnxSibling(siblings, parsed.repo);
+  const size = Number.isFinite(sibling.size) && sibling.size > 0 ? sibling.size : null;
+  return {
+    size,
+    name: sibling.rfilename.split("/").pop(),
+    repo: parsed.repo,
+    file: sibling.rfilename,
+  };
 }
 
 // Human-readable byte size, e.g. 4.7 MB. Used in progress messages.
