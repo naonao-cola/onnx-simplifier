@@ -206,6 +206,35 @@ em::val onnxoptimizer_optimize_fixed(const std::string& data, em::val passes_ary
     return em::val(em::typed_memory_view(result.size(), reinterpret_cast<uint8_t*>(result.data())));
 }
 
+// Annotate a model's MAC/FLOP model-info metrics into its metadata_props
+// without simplifying/optimizing it, and return the annotated bytes. The page
+// uses this to give the *original* uploaded model the same onnxsim.* metrics
+// the converted model gets, so the "Run inference" panel can report throughput
+// (GFLOP/s) for both and compare their inference speed. Execution is unaffected
+// — only metadata_props are added — so the annotated bytes run identically.
+// Returns null on a parse/serialize failure (annotation itself is best-effort:
+// a model whose shapes cannot be inferred simply gains no metrics).
+em::val onnxsim_annotate_model_info(const std::string& data) {
+    onnx::ModelProto xmodel;
+    std::cerr << "parsing message" << std::endl;
+    if (!xmodel.ParseFromArray(data.data(), data.size())) {
+        std::cerr << "Parse failed" << std::endl;
+        return em::val::null();
+    }
+    try {
+        AnnotateModelInfo(xmodel);
+    } catch (const std::exception& e) {
+        std::cerr << "annotate model info failed: " << e.what() << std::endl;
+    }
+    std::cerr << "serializing model" << std::endl;
+    static std::string result;
+    if (!xmodel.SerializeToString(&result)) {
+        std::cerr << "Serialize failed" << std::endl;
+        return em::val::null();
+    }
+    return em::val(em::typed_memory_view(result.size(), reinterpret_cast<uint8_t*>(result.data())));
+}
+
 std::vector<std::string> onnxoptimizer_passes() {
     return onnx::optimization::GetAvailablePasses();
 }
@@ -216,6 +245,7 @@ std::vector<std::string> onnxoptimizer_fuse_elimination_passes() {
 
 EMSCRIPTEN_BINDINGS(module) {
     function("onnxsimplify_export", &onnxsimplify_export);
+    function("onnxsim_annotate_model_info", &onnxsim_annotate_model_info);
     function("onnxoptimizer_optimize", &onnxoptimizer_optimize);
     function("onnxoptimizer_optimize_fixed", &onnxoptimizer_optimize_fixed);
     em::function("onnxoptimizer_passes", &onnxoptimizer_passes);

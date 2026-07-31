@@ -143,6 +143,20 @@ async function resolveModelBytes(source, fileInput) {
   }
   const file = fileInput.files && fileInput.files[0];
   if (!file) throw new Error("Pick an .onnx file first.");
+  // Prefer the MAC-annotated copy of the original that the converter produced
+  // for this upload (window.__onnxsimOriginalAnnotated, published in index.html
+  // when a conversion finishes with "annotate model info" on). It is the same
+  // model plus onnxsim.* metadata_props, so it runs identically but lets the
+  // panel report MACs/throughput — enabling an original-vs-converted speed
+  // comparison. The name guard avoids serving a stale annotation for a model
+  // that has since been swapped out.
+  const annotated = window.__onnxsimOriginalAnnotated;
+  if (annotated && annotated.bytes && annotated.name === file.name) {
+    return {
+      bytes: annotated.bytes,
+      label: `original (${file.name}, MAC-annotated)`,
+    };
+  }
   return {
     bytes: new Uint8Array(await file.arrayBuffer()),
     label: `original (${file.name})`,
