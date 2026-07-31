@@ -145,7 +145,13 @@ add_executable(
   ${ONNXSIM_WASM_INTERFACE})
 set_target_properties(onnxsim_bin PROPERTIES OUTPUT_NAME onnxsim)
 if (EMSCRIPTEN)
-  set_target_properties(onnxsim_bin PROPERTIES LINK_FLAGS "-s ALLOW_MEMORY_GROWTH=1 -s EXIT_RUNTIME=0 -s FORCE_FILESYSTEM=1 -s MODULARIZE=1 -s 'EXPORT_NAME=\"create_onnxsim\"' -s 
+  # ALLOW_MEMORY_GROWTH=1 lets the heap grow on demand, but without
+  # MAXIMUM_MEMORY Emscripten caps that growth at 2 GiB and aborts with
+  # "Cannot enlarge memory, requested N bytes, but the limit is 2147483648
+  # bytes!" the moment a model needs more. Raise the cap to 4 GiB, the hard
+  # addressing limit of a wasm32 module (2^32 bytes), so larger models can be
+  # converted in the browser. Going beyond 4 GiB would require MEMORY64/wasm64.
+  set_target_properties(onnxsim_bin PROPERTIES LINK_FLAGS "-s ALLOW_MEMORY_GROWTH=1 -s MAXIMUM_MEMORY=4294967296 -s EXIT_RUNTIME=0 -s FORCE_FILESYSTEM=1 -s MODULARIZE=1 -s 'EXPORT_NAME=\"create_onnxsim\"' -s
   'EXPORTED_RUNTIME_METHODS=[ENV]' -Wl,--threads=8 -Wl,--lto-partitions=8 -Wl,--lto-O0 -Wl,--lto-CGO0 -s ERROR_ON_UNDEFINED_SYMBOLS=0 -sASSERTIONS=2 -sINVOKE_RUN=0")
   target_link_libraries(onnxsim_bin embind "-Wl,--whole-archive" onnxsim "-Wl,--no-whole-archive")
 else()
