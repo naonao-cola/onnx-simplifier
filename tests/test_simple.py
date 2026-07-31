@@ -739,3 +739,54 @@ def test_if_with_const_cond_is_folded():
 
     out = _resolve_const(sim_model, sim_model.graph.output[0].name)
     assert out.tolist() == [1.0, 2.0]
+
+
+def test_ir3_conv_bn_fuses():
+    # IR version 3 models (e.g. the opset-8 ``resnet101-v1-7``) list every
+    # initializer as a graph input too, which is required before IR 4. onnxsim
+    # used to skip ``remove_initializer_from_input`` for such models, so the
+    # weights stayed "runtime inputs" and onnxoptimizer refused to fold them --
+    # ``fuse_bn_into_conv`` never fired and the graph came out unchanged
+    # (GitHub issue #543). onnxsim now bumps these to IR 4 and drops the
+    # initializer inputs, so the Conv+BN pair fuses away.
+    import numpy as np
+
+    out_ch, in_ch = 4, 3
+    W = np.random.randn(out_ch, in_ch, 3, 3).astype(np.float32)
+    scale = np.abs(np.random.randn(out_ch).astype(np.float32)) + 1
+    bias = np.random.randn(out_ch).astype(np.float32)
+    mean = np.random.randn(out_ch).astype(np.float32)
+    var = np.abs(np.random.randn(out_ch).astype(np.float32)) + 1
+    inits = [
+        numpy_helper.from_array(W, "W"),
+        numpy_helper.from_array(scale, "scale"),
+        numpy_helper.from_array(bias, "bias"),
+        numpy_helper.from_array(mean, "mean"),
+        numpy_helper.from_array(var, "var"),
+    ]
+    conv = helper.make_node("Conv", ["X", "W"], ["conv_out"])
+    bn = helper.make_node(
+        "BatchNormalization", ["conv_out", "scale", "bias", "mean", "var"], ["Y"]
+    )
+    graph = helper.make_graph(
+        [conv, bn],
+        "g",
+        # Initializers are *also* listed as graph inputs, as IR<4 requires.
+        [helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, in_ch, 8, 8])]
+        + [
+            helper.make_tensor_value_info(t.name, TensorProto.FLOAT, t.dims)
+            for t in inits
+        ],
+        [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, out_ch, 6, 6])],
+        inits,
+    )
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 8)])
+    model.ir_version = 3
+    onnx.checker.check_model(model)
+
+    sim_model, check_ok = onnxsim.simplify(model)
+    assert check_ok
+    onnx.checker.check_model(sim_model)
+    # The BatchNormalization is folded into the Conv weights and disappears.
+    assert all(n.op_type != "BatchNormalization" for n in sim_model.graph.node)
+    assert any(n.op_type == "Conv" for n in sim_model.graph.node)

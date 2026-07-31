@@ -96,7 +96,19 @@ jobs:
           EMPROFILE=1 ./build_wasm.sh
           rm scripts/convertmodel/onnxsim.*
           cp build-wasm-node-OFF/onnxsim.* scripts/convertmodel
-      - run: |
+      # Surface ccache statistics on the run's summary page, the same way
+      # mozilla-actions/sccache-action does for sccache. `ccache -s` still
+      # goes to the step log too, so the numbers are available in both places.
+      - name: ccache statistics
+        if: always()
+        run: |
+          {
+            echo "### ccache statistics"
+            echo ""
+            echo '```'
+            ccache -s
+            echo '```'
+          } >> "${GITHUB_STEP_SUMMARY}"
           ccache -s
 
       # Ship the curated regression model set next to the page so the

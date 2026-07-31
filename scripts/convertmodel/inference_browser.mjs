@@ -145,18 +145,39 @@ async function resolveModelBytes(source, fileInput) {
     return { bytes: converted.bytes, label: `converted (${converted.name})` };
   }
   const file = fileInput.files && fileInput.files[0];
+  // Resolve the "original" bytes + a display name from either a local file
+  // upload or a Hugging Face download (which has no file-input entry, and
+  // publishes itself on window.__onnxsimOriginal).
+  let name = null;
+  let readBytes = null;
   if (file) {
+    name = file.name;
+    readBytes = async () => new Uint8Array(await file.arrayBuffer());
+  } else {
+    const original = window.__onnxsimOriginal;
+    if (original && original.bytes) {
+      name = original.name;
+      readBytes = async () => original.bytes;
+    }
+  }
+  if (!readBytes) {
+    throw new Error("Pick an .onnx file or load one from Hugging Face first.");
+  }
+  // Prefer the MAC-annotated copy of this original that the converter produced
+  // (window.__onnxsimOriginalAnnotated, published in index.html when a
+  // conversion finishes with "annotate model info" on). It is the same model
+  // plus onnxsim.* metadata_props, so it runs identically but lets the panel
+  // report MACs/throughput — enabling an original-vs-converted speed
+  // comparison. The name guard avoids serving a stale annotation for a model
+  // that has since been swapped out.
+  const annotated = window.__onnxsimOriginalAnnotated;
+  if (annotated && annotated.bytes && annotated.name === name) {
     return {
-      bytes: new Uint8Array(await file.arrayBuffer()),
-      label: `original (${file.name})`,
+      bytes: annotated.bytes,
+      label: `original (${name}, MAC-annotated)`,
     };
   }
-  // No local file picked — use a Hugging Face download if one is loaded.
-  const original = window.__onnxsimOriginal;
-  if (original && original.bytes) {
-    return { bytes: original.bytes, label: `original (${original.name})` };
-  }
-  throw new Error("Pick an .onnx file or load one from Hugging Face first.");
+  return { bytes: await readBytes(), label: `original (${name})` };
 }
 
 // Render the onnxsim MAC/FLOP metrics (onnxsim PR #527) that travel inside the

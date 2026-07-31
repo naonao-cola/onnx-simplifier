@@ -134,6 +134,15 @@
                     window.open(build_issue_url(), "_blank", "noopener");
                 };
                 let result_name = "";
+                let original_name = "";
+                // Decode a "data:...;base64,<b64>" URL back into a Uint8Array.
+                const dataUrlToBytes = (data_url) => {
+                    const b64 = data_url.slice(data_url.indexOf(",") + 1);
+                    const bin = atob(b64);
+                    const bytes = new Uint8Array(bin.length);
+                    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+                    return bytes;
+                };
                 worker.onmessage = (e) => {
                     switch (e.data[0]) {
                         case "ready":
@@ -155,6 +164,7 @@
                             dl_btn.disabled = false;
                             const data_url = e.data[1];
                             const trace_json = e.data[2];
+                            const original_data_url = e.data[3];
                             dl_btn.onclick = () => {
                                 const a = document.createElement("a");
                                 a.href = data_url;
@@ -170,10 +180,7 @@
                             // original upload). Decode the base64 data URL back
                             // into a Uint8Array and publish it for the panel.
                             try {
-                                const b64 = data_url.slice(data_url.indexOf(",") + 1);
-                                const bin = atob(b64);
-                                const bytes = new Uint8Array(bin.length);
-                                for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+                                const bytes = dataUrlToBytes(data_url);
                                 window.__onnxsimConverted = { bytes, name: result_name };
                                 window.dispatchEvent(new CustomEvent("onnxsim:converted", {
                                     detail: { name: result_name },
@@ -181,6 +188,22 @@
                             } catch (err) {
                                 log_output.value += "failed to keep converted model for inference: " + err + "\n";
                                 log_output.scrollTop = log_output.scrollHeight;
+                            }
+                            // Keep the MAC-annotated *original* bytes (when the
+                            // worker produced them) so the "Run inference" panel's
+                            // "original" source can report MACs/throughput and be
+                            // compared against the converted result.
+                            if (original_data_url) {
+                                try {
+                                    const bytes = dataUrlToBytes(original_data_url);
+                                    window.__onnxsimOriginalAnnotated = { bytes, name: original_name };
+                                    window.dispatchEvent(new CustomEvent("onnxsim:original-annotated", {
+                                        detail: { name: original_name },
+                                    }));
+                                } catch (err) {
+                                    log_output.value += "failed to keep annotated original for inference: " + err + "\n";
+                                    log_output.scrollTop = log_output.scrollHeight;
+                                }
                             }
                             // Render the onnxsim simplification profile, if one
                             // came back, as an inline flame graph.
@@ -211,6 +234,12 @@
                 const startConversion = (modelName, buf) => {
                     const optimizer = document.querySelector('input[name="optimizer"]:checked').value;
                     result_name = (modelName.endsWith(".onnx") ? modelName.substring(0, modelName.length - 5) : modelName) + "." + optimizer + ".onnx"
+                    original_name = modelName;
+                    // Drop any previous run's cached models so the inference panel
+                    // never serves a stale converted/annotated result for the new
+                    // model while this conversion is still in flight.
+                    window.__onnxsimConverted = null;
+                    window.__onnxsimOriginalAnnotated = null;
 
                     input.disabled = true;
                     dl_btn.disabled = true;
@@ -397,7 +426,10 @@
             <a href="https://github.com/onnxsim/onnxsim/pull/527" target="_blank" rel="noopener">PR #527</a>,
             e.g. annotated via <code>onnxsim.model_info.annotate_metadata</code>),
             they are shown below with the achieved throughput (GFLOP/s = model
-            FLOPs ÷ average latency).
+            FLOPs ÷ average latency). With <b>annotate model info</b> on (the
+            default), the converter bakes these metrics into <i>both</i> the
+            converted result <i>and</i> the original upload, so you can run each
+            and compare their MACs alongside the measured inference speed.
         </p>
         <div>
             <label for="inference-source">model</label>

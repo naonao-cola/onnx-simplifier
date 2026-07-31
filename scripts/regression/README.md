@@ -57,13 +57,16 @@ divergence:
   `tests/test_simple.py::test_fp8_qdq_modelopt_integration`).
 
 - **Optimization strength.** Median node reduction for each tool and the models
-  with the largest node-count gaps. onnxslim ships pattern fusions onnxsim
-  (onnxoptimizer + constant folding) does not — e.g. ConvTranspose+BatchNorm and
-  ConvTranspose+Add-bias fusion, and no-op `Dropout(ratio=0)` elimination — so it
-  often lands fewer nodes on conv/transformer graphs. Those specific gaps are
-  pinned as `xfail` tests in `tests/test_fusion_patterns.py`; they'll XPASS if
-  onnxsim ever gains the pass. (onnxslim also has a GELU-subgraph matcher, but it
-  ships disabled, so both tools currently leave the erf-GELU pattern intact.)
+  with the largest node-count gaps. Several fusions that onnxslim shipped and
+  onnxsim did not — ConvTranspose+BatchNorm and ConvTranspose+Add-bias fusion,
+  and no-op `Dropout` elimination in the opset-12+ input form — are now covered
+  by onnxsim's optimizer (issue #543) and have regular tests in
+  `tests/test_fusion_patterns.py`. A separate onnxsim fix also lets value-baking
+  fusions run on IR<4 (e.g. opset-8) exports whose initializers double as graph
+  inputs, so plain Conv+BN CNNs like `resnet101-v1-7` now fold. The one fusion
+  onnxslim still has that onnxsim lacks is the GELU-subgraph matcher — and
+  onnxslim ships it disabled, so both tools currently leave the erf-GELU pattern
+  intact (pinned as the remaining `xfail` in `tests/test_fusion_patterns.py`).
 
 - **Speed / memory.** Median wall-clock and peak RSS over the models both tools
   completed. onnxsim runs onnxruntime-based constant folding and its `check_n`

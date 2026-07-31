@@ -39,14 +39,19 @@ jobs:
         # build_wheels_windows_cross / test_wheels_windows_cross jobs below),
         # not natively here.
         os: [ubuntu-24.04, ubuntu-24.04-arm, macos-15]
-        py_ver: [cp310, cp311, cp312, cp313]
+        # Full Python coverage on push/release; a reduced set on pull_request to
+        # cut CI jobs. cp310 exercises a version-specific (below-abi3-floor)
+        # wheel and cp312 the abi3 wheel that also serves 3.13/3.14, so cp311 and
+        # cp313 add no distinct build coverage on PRs. The free-threaded cp314t
+        # job (via include below) still runs on every event.
+        py_ver: ${{ github.event_name == 'pull_request' && fromJSON('["cp310", "cp312"]') || fromJSON('["cp310", "cp311", "cp312", "cp313"]') }}
         include:
           - os: ubuntu-24.04
             py_ver: cp314t
             # test_ext allocates a ~2 GiB fp16 tensor and OOM-kills the
             # free-threaded runner (SIGKILL / exit 137), just as it does on the
             # Windows runner (see test_wheels_windows_cross). Skip it here; the
-            # same test still runs on the cp310-cp313 jobs.
+            # same test still runs on the cp310-cp313 jobs (cp310/cp312 on PRs).
             pytest_args: '-k "not test_ext"'
     steps:
     - uses: actions/checkout@v7
@@ -137,11 +142,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - { py_ver: '3.10', artifact: cp310 }
-          - { py_ver: '3.11', artifact: cp311 }
-          - { py_ver: '3.12', artifact: abi3 }   # same cp312-abi3 wheel ...
-          - { py_ver: '3.13', artifact: abi3 }   # ... on 3.13 too
+        # The 3.13 job re-tests the exact cp312-abi3 wheel the 3.12 job already
+        # covers, so drop it on pull_request to cut a CI job; push/release still
+        # test both.
+        include: ${{ github.event_name == 'pull_request' && fromJSON('[{"py_ver":"3.10","artifact":"cp310"},{"py_ver":"3.11","artifact":"cp311"},{"py_ver":"3.12","artifact":"abi3"}]') || fromJSON('[{"py_ver":"3.10","artifact":"cp310"},{"py_ver":"3.11","artifact":"cp311"},{"py_ver":"3.12","artifact":"abi3"},{"py_ver":"3.13","artifact":"abi3"}]') }}
     steps:
       - uses: actions/checkout@v7
         with:

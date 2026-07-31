@@ -128,6 +128,19 @@ three modes:
    then requires the ONNX Runtime source to already be present at
    `third_party/onnxruntime-1.27.1`).
 
+   **Fast path — prebuilt ONNX Runtime.** To skip compiling ONNX Runtime from
+   source, set `ONNXSIM_PREBUILT_ORT=1`. The build then links an official
+   [ONNX Runtime release](https://github.com/microsoft/onnxruntime/releases)
+   (downloaded and cached automatically) instead. onnx-optimizer, onnx and
+   protobuf are still built from source, but the slowest dependency is skipped:
+
+   ```sh
+   ONNXSIM_PREBUILT_ORT=1 cargo build
+   # optionally pin a version or reuse an already-extracted release:
+   ONNXSIM_PREBUILT_ORT=1 ONNXSIM_ORT_VERSION=1.28.0 cargo build
+   ONNXSIM_PREBUILT_ORT=1 ONNXSIM_ORT_HOME=/path/to/onnxruntime-linux-x64-1.28.0 cargo build
+   ```
+
 2. **Pre-built library.** If you already have `onnxsim_c` (and its dependencies)
    built, point the build script at the directory (or directories, `:`-separated)
    holding the shared libraries:
@@ -143,6 +156,11 @@ three modes:
    cmake --build build --target onnxsim_c
    ```
 
+   Add `-DONNXSIM_PREBUILT_ORT=ON` to link an official ONNX Runtime release
+   (downloaded and cached under the build tree) instead of compiling it from
+   source. `-DONNXSIM_ORT_VERSION=<ver>` pins the release and
+   `-DONNXSIM_ORT_HOME=<dir>` reuses an already-extracted one.
+
 3. **Skip building** (for `cargo check` / docs.rs). Set `ONNXSIM_NO_BUILD=1`
    (docs.rs sets `DOCS_RS` automatically). The crate type-checks but cannot be
    linked into a runnable binary.
@@ -155,6 +173,10 @@ three modes:
 | `ONNXSIM_LIB_DIR`         | `:`-separated dirs holding a pre-built `onnxsim_c`.      |
 | `ONNXSIM_SOURCE_DIR`      | Override the onnxsim C++ source path (default `../..`).  |
 | `ONNXSIM_SKIP_ORT_DOWNLOAD` | Forbid the automatic ONNX Runtime source download.    |
+| `ONNXSIM_PREBUILT_ORT`    | Link a prebuilt ONNX Runtime release instead of building it. |
+| `ONNXSIM_ORT_VERSION`     | Prebuilt release version to fetch (default `1.28.0`).    |
+| `ONNXSIM_ORT_HOME`        | Use an already-extracted prebuilt release (no download). |
+| `ONNXSIM_ORT_URL`         | Override the prebuilt release download URL.              |
 
 ## Examples & tests
 

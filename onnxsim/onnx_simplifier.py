@@ -71,9 +71,22 @@ def remove_unused_output(
 
 def remove_initializer_from_input(model: onnx.ModelProto) -> onnx.ModelProto:
     initializer_names = [x.name for x in model.graph.initializer]
+    removed_any = False
     for graph_input in copy.deepcopy(model.graph.input):
         if graph_input.name in initializer_names:
             model.graph.input.remove(graph_input)
+            removed_any = True
+    # IR version 4 (ONNX 1.4) is the first that allows an initializer to *not*
+    # also be a graph input. Older IR (v3 and below) required every initializer
+    # to appear in ``graph.input``, and leaving it there makes onnxoptimizer
+    # treat it as a runtime input rather than a constant
+    # (``is_constant_initializer`` returns false), which silently blocks
+    # value-baking fusions such as ``fuse_bn_into_conv`` -- e.g. the plain
+    # Conv+BN chains of the opset-8 ``resnet101-v1-7`` were left completely
+    # unsimplified. Bump such models to IR 4 so the removal above is legal and
+    # the freed initializers fold like any other constant.
+    if removed_any and model.ir_version < 4:
+        model.ir_version = 4
     return model
 
 
@@ -547,7 +560,11 @@ def simplify(
                         dim.dim_value = input_shape[i]
     if unused_output is not None:
         model = remove_unused_output(model, unused_output)
-    if not mutable_initializer and model.ir_version >= 4:
+    if not mutable_initializer:
+        # ``remove_initializer_from_input`` bumps IR<4 models to IR 4 so the
+        # freed initializers become foldable constants (previously gated on
+        # ``ir_version >= 4``, which left opset-8 graphs such as resnet101-v1-7
+        # completely unsimplified).
         model = remove_initializer_from_input(model)
 
     # onnxoptimizer's common-subexpression / duplicate-initializer passes hash

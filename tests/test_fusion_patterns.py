@@ -11,9 +11,11 @@ Every model is built directly with ``onnx.helper`` (no torch dependency) and run
 through ``onnxsim.simplify`` with ``check_n=3`` so onnxsim's own random-input
 equivalence check guards correctness of each rewrite.
 
-The final section holds ``xfail`` tests for optimizations OnnxSlim performs but
-onnxsim currently does not (e.g. ConvTranspose fusion, GELU fusion, no-op Dropout
-removal). They document the gap and will XPASS if onnxsim ever gains the pass.
+ConvTranspose+BN, ConvTranspose+Add-bias and no-op ``Dropout`` fusions -- once
+gaps versus OnnxSlim -- are now covered by onnxsim's optimizer (issue #543) and
+are regular tests below. The final section holds the remaining ``xfail`` cases
+(GELU-subgraph fusion) that OnnxSlim performs but onnxsim does not; they document
+the gap and will XPASS if onnxsim ever gains the pass.
 """
 
 import collections
@@ -291,16 +293,10 @@ def test_defer_constant_expand_folds_small_consumer():
 
 
 # --------------------------------------------------------------------------- #
-# Passes OnnxSlim performs but onnxsim (onnxoptimizer + constant folding) does
-# not. These document the coverage gap: each asserts the *desired* optimization,
-# marked xfail because onnxsim currently leaves the graph unchanged. If a future
-# onnxsim/onnxoptimizer version starts performing one, the test XPASSes and can
-# be promoted to a regular test. strict=False keeps CI green either way.
+# ConvTranspose / no-op Dropout fusions (issue #543). Formerly xfail gaps versus
+# OnnxSlim, now handled by onnxsim's optimizer: no-op Dropout removal and the
+# fuse_bn_into_conv / fuse_add_bias_into_conv passes extended to ConvTranspose.
 # --------------------------------------------------------------------------- #
-@pytest.mark.xfail(
-    reason="onnxsim does not eliminate a no-op Dropout (ratio=0); OnnxSlim does",
-    strict=False,
-)
 def test_eliminate_nop_dropout():
     inits = [onnx.numpy_helper.from_array(np.array(0.0, dtype=np.float32), "ratio")]
     nodes = [
@@ -313,11 +309,6 @@ def test_eliminate_nop_dropout():
     assert ops["Relu"] == 1
 
 
-@pytest.mark.xfail(
-    reason="onnxoptimizer only folds BatchNorm into Conv, not ConvTranspose; "
-    "OnnxSlim fuses ConvTranspose+BN",
-    strict=False,
-)
 def test_fuse_convtranspose_bn():
     inits = [
         _f32(np.random.randn(3, 8, 3, 3), "W"),  # ConvTranspose: [Cin, Cout, kH, kW]
@@ -338,10 +329,6 @@ def test_fuse_convtranspose_bn():
     assert ops["ConvTranspose"] == 1
 
 
-@pytest.mark.xfail(
-    reason="onnxsim has no ConvTranspose+Add bias fusion; OnnxSlim fuses it",
-    strict=False,
-)
 def test_fuse_convtranspose_add():
     inits = [
         _f32(np.random.randn(3, 8, 3, 3), "W"),
@@ -357,6 +344,11 @@ def test_fuse_convtranspose_add():
     assert ops["ConvTranspose"] == 1
 
 
+# --------------------------------------------------------------------------- #
+# Remaining gap: passes OnnxSlim performs but onnxsim does not. Marked xfail
+# (strict=False) so CI stays green; each XPASSes and can be promoted if onnxsim
+# gains the pass.
+# --------------------------------------------------------------------------- #
 @pytest.mark.xfail(
     reason="onnxsim has no GELU subgraph fusion; OnnxSlim ships a (currently "
     "disabled) FusionGelu matcher for this exact pattern",
