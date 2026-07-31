@@ -71,6 +71,28 @@ The coverage CI job copies `cobertura-coverage.xml` to `coverage-report/js.xml`
 and adds it to the same `irongut/CodeCoverageSummary` list, so JS lands in the
 one combined table alongside C++ and Python.
 
+## Rust (bindings)
+
+The Rust wrapper crates under `rust/` are covered separately, in their own CI
+job, because they need a linked native `onnxsim_c` library rather than the
+C++/Python/Node toolchains above. Coverage there uses
+[`cargo-llvm-cov`](https://github.com/taiki-e/cargo-llvm-cov):
+
+```bash
+cargo install cargo-llvm-cov
+rustup component add llvm-tools-preview
+cd rust
+# Prebuilt ONNX Runtime keeps the required native build fast.
+ONNXSIM_PREBUILT_ORT=1 cargo llvm-cov --workspace --cobertura \
+  --output-path ../coverage-report/rust.xml
+```
+
+`cargo-llvm-cov` instruments only the wrapper crates (`onnxsim`, `onnxsim-sys`);
+the C++ core they call into is already covered by the C++ report above. Like the
+other reports, the Rust output is Cobertura XML, so it feeds the same
+`irongut/CodeCoverageSummary`. This runs as the `coverage` job in
+`.github/workflows/rust.yml` (see `rust/README.md` for details).
+
 Pass extra arguments straight through to pytest:
 
 ```bash

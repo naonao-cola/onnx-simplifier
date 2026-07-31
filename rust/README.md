@@ -182,8 +182,44 @@ three modes:
 
 ```sh
 cargo run --example simplify -- input.onnx output.onnx
-cargo test          # pure-Rust unit tests run without the native lib
+cargo test          # builds/links the native lib, then runs the tests
 ```
+
+Most of the unit tests exercise pure-Rust logic (the options builder, the
+rewriter/executor trampolines, the DLPack conversions) and never call into the
+native library. They still link against it, though — the crate's other code
+references the C ABI — so `cargo test` builds `onnxsim_c` like any other build.
+Use the prebuilt-ORT fast path (`ONNXSIM_PREBUILT_ORT=1`) to avoid compiling
+ONNX Runtime from source.
+
+### Coverage
+
+Rust line/region coverage uses
+[`cargo-llvm-cov`](https://github.com/taiki-e/cargo-llvm-cov). Because the tests
+link the native library, measuring coverage builds it too; the prebuilt-ORT fast
+path keeps that quick:
+
+```sh
+cargo install cargo-llvm-cov          # once
+rustup component add llvm-tools-preview
+
+# Terminal summary of the workspace's Rust coverage.
+ONNXSIM_PREBUILT_ORT=1 cargo llvm-cov --workspace
+
+# Accumulate the default run and the native-only integration test, then render
+# an HTML report and a Cobertura XML (the format the project's other coverage
+# reports use).
+ONNXSIM_PREBUILT_ORT=1 cargo llvm-cov --workspace --no-report
+ONNXSIM_PREBUILT_ORT=1 cargo llvm-cov --no-report -- --ignored list_optimizers_is_non_empty
+cargo llvm-cov report --html          # target/llvm-cov/html/index.html
+cargo llvm-cov report --cobertura --output-path rust-coverage.xml
+```
+
+`cargo-llvm-cov` instruments only the wrapper crates (`onnxsim`,
+`onnxsim-sys`); the C++ core is measured separately by the C++ coverage job.
+In CI this runs as the `coverage` job in
+[`.github/workflows/rust.yml`](../.github/workflows/rust.yml), which uploads the
+HTML/XML reports and posts a summary on pull requests.
 
 The integration test in `onnxsim/tests/` is ignored by default because it needs
 the linked native library and an ONNX model; see the file header to enable it.

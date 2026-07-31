@@ -65,3 +65,112 @@ jobs:
         run: |
           cargo test --release --workspace
           cargo test --release -- --ignored list_optimizers_is_non_empty
+
+  # Rust line/region coverage for the wrapper crates. Like the build job it must
+  # link the native library (the safe API's tests call into the C ABI), so it
+  # takes the documented prebuilt-ONNX-Runtime fast path instead of compiling ORT
+  # from source. cargo-llvm-cov instruments only the workspace's own Rust
+  # (onnxsim, onnxsim-sys) -- the C++ core is measured separately by the C++
+  # coverage job -- and emits a Cobertura report, matching the project's other
+  # coverage jobs so the same tooling can render it.
+  coverage:
+    name: llvm-cov (native, prebuilt ORT)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      # Lets the sticky-comment step post/update the Rust coverage summary.
+      pull-requests: write
+    env:
+      CMAKE_GENERATOR: Ninja
+      CMAKE_CXX_COMPILER_LAUNCHER: sccache
+      SCCACHE_GHA_ENABLED: "on"
+      ACTIONS_CACHE_SERVICE_V2: "on"
+      # Skip compiling ONNX Runtime from source; link a prebuilt release instead.
+      # ONNXSIM_ORT_HOME points at the cached, pre-extracted release below so the
+      # native build never re-downloads it.
+      ONNXSIM_PREBUILT_ORT: "1"
+      ONNXSIM_ORT_HOME: ${{ github.workspace }}/rust/prebuilt-ort/onnxruntime-linux-x64-1.28.0
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+          fetch-depth: 0
+          # Measure the PR's head commit rather than the synthetic merge commit,
+          # so the summary reflects the branch as-is. Falls back to the pushed
+          # commit for push events.
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - uses: mozilla-actions/sccache-action@v0.0.10
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
+      - name: Install build tools
+        run: sudo apt-get update && sudo apt-get install -y ninja-build
+      # The prebuilt ONNX Runtime release is a single tarball; cache the extracted
+      # tree (keyed by version) so it is downloaded at most once.
+      - name: Cache prebuilt ONNX Runtime
+        id: ort-cache
+        uses: actions/cache@v6
+        with:
+          path: rust/prebuilt-ort
+          key: prebuilt-ort-linux-x64-1.28.0
+      - name: Download prebuilt ONNX Runtime
+        if: steps.ort-cache.outputs.cache-hit != 'true'
+        # Runs in ./rust (the workflow's default working-directory), so
+        # prebuilt-ort here is the rust/prebuilt-ort the cache tracks.
+        run: |
+          mkdir -p prebuilt-ort
+          curl -L --fail --silent --show-error \
+            -o /tmp/onnxruntime.tgz \
+            https://github.com/microsoft/onnxruntime/releases/download/v1.28.0/onnxruntime-linux-x64-1.28.0.tgz
+          tar -xzf /tmp/onnxruntime.tgz -C prebuilt-ort
+      # Build + run the tests under instrumentation, accumulating profiles across
+      # both the default run and the native-only integration test the build job
+      # also runs, then render one combined report. --no-report defers rendering
+      # until every test run's profiles are collected.
+      - name: Run tests with coverage
+        working-directory: rust
+        run: |
+          mkdir -p "${GITHUB_WORKSPACE}/coverage-report"
+          cargo llvm-cov --release --workspace --no-report
+          cargo llvm-cov --release --no-report -- --ignored list_optimizers_is_non_empty
+          cargo llvm-cov report --release \
+            --cobertura --output-path "${GITHUB_WORKSPACE}/coverage-report/rust.xml"
+          cargo llvm-cov report --release \
+            --html --output-dir "${GITHUB_WORKSPACE}/coverage-report/rust-html"
+          cargo llvm-cov report --release --summary-only
+      - name: Upload coverage report artifact
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: rust-coverage-report
+          path: coverage-report/
+      # Render the Cobertura report as a markdown table (same tool the combined
+      # C++/Python/JS coverage job uses) for the job summary and a sticky PR
+      # comment. fail_below_min stays false so coverage never blocks CI.
+      - name: Coverage summary (Rust)
+        if: ${{ !cancelled() }}
+        uses: irongut/CodeCoverageSummary@v1.3.0
+        with:
+          filename: coverage-report/rust.xml
+          badge: true
+          format: markdown
+          output: both
+          hide_complexity: true
+          indicators: true
+          fail_below_min: false
+          thresholds: '50 75'
+      - name: Publish coverage to job summary
+        if: ${{ !cancelled() }}
+        run: cat code-coverage-results.md >> "$GITHUB_STEP_SUMMARY"
+      - name: Post coverage comment on PR
+        if: ${{ !cancelled() && github.event_name == 'pull_request' }}
+        continue-on-error: true
+        uses: marocchino/sticky-pull-request-comment@v3.0.5
+        with:
+          header: rust-coverage
+          recreate: true
+          path: code-coverage-results.md
