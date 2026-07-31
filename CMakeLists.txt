@@ -191,7 +191,16 @@ if (ONNXSIM_C_API)
     endif()
   endforeach()
   add_library(onnxsim_c SHARED onnxsim/capi/onnxsim_c_api.cpp)
-  target_link_libraries(onnxsim_c PRIVATE onnxsim onnx_optimizer onnx)
+  # onnx (and onnxsim's own contrib_schemas) register operator schemas and shape
+  # inference functions through static initializers -- objects nothing references
+  # directly. With the stack now built static (option 1), the linker would prune
+  # those archive members and leave dangling symbols such as
+  # `onnx::RNNShapeInference`. Force every object of the onnx stack and onnxsim
+  # into onnxsim_c with --whole-archive so all schemas/inference fns are present.
+  # ONNX Runtime arrives transitively through onnxsim's public link interface and
+  # is linked normally (it is referenced via the Ort:: C++ API).
+  target_link_libraries(onnxsim_c PRIVATE
+    "-Wl,--whole-archive" onnxsim onnx_optimizer onnx onnx_proto "-Wl,--no-whole-archive")
   target_include_directories(onnxsim_c PUBLIC onnxsim/capi)
   # The exported symbols opt back into default visibility via ONNXSIM_C_API in
   # the header, so the project-wide "hidden" preset keeps everything else local.
