@@ -22,16 +22,24 @@ const MODEL_LIST_SOURCES = [
   "https://raw.githubusercontent.com/onnxsim/onnxsim/master/scripts/regression/models.json",
 ];
 
-// Fetch the curated regression model ids for the dropdown. Returns [] (rather
-// than throwing) when no source is reachable, so the free-text box still works.
+// Fetch the curated regression model set for the dropdown, as
+// [{ id, size }] where `size` is the byte size of the repo's largest .onnx
+// (baked into models.json by select_models.py --refresh-sizes) or null when the
+// list predates that field. Returns [] (rather than throwing) when no source is
+// reachable, so the free-text box still works.
 export async function loadModelList() {
   for (const src of MODEL_LIST_SOURCES) {
     try {
       const r = await fetch(src);
       if (!r.ok) continue;
       const data = await r.json();
-      const ids = (data.models || []).map((m) => m.id).filter(Boolean);
-      if (ids.length) return ids;
+      const models = (data.models || [])
+        .filter((m) => m && m.id)
+        .map((m) => ({
+          id: m.id,
+          size: Number.isFinite(m.size) && m.size > 0 ? m.size : null,
+        }));
+      if (models.length) return models;
     } catch {
       // try the next source
     }

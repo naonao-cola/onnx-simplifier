@@ -83,9 +83,12 @@ export function isCacheable(url, method, rangeHeader) {
 }
 
 // Wrap a fetch so cacheable requests are served from / stored into `cache`
-// (any { get(key), put(key, entry) }). `hooks.onHit(key, bytes)` and
-// `hooks.onMiss(key)` are optional progress callbacks. A cache failure never
-// breaks the request — it just falls back to the network.
+// (any { get(key), put(key, entry) }). Optional progress callbacks:
+// `hooks.onHit(key, bytes)` (served from cache), `hooks.onMiss(key)` (about to
+// fetch), and `hooks.onNetwork(bytes)` (bytes actually pulled over the network
+// on a miss — the honest denominator for a download-speed estimate, since cached
+// chunks never cross the network). A cache failure never breaks the request — it
+// just falls back to the network.
 export function makeCachingFetch(realFetch, cache, hooks = {}) {
   return async (input, init) => {
     const { url, method, headers } = reqInfo(input, init);
@@ -111,6 +114,7 @@ export function makeCachingFetch(realFetch, cache, hooks = {}) {
     if (resp.ok || resp.status === 206) {
       try {
         const body = await resp.clone().arrayBuffer();
+        if (hooks.onNetwork) hooks.onNetwork(body.byteLength);
         await cache.put(key, {
           status: resp.status,
           headers: pickHeaders(resp.headers),
@@ -153,10 +157,33 @@ export function openXetCache(dbName = "onnxsim-xet-cache", storeName = "blocks")
         }),
     );
 
+  // Total stored bytes + entry count, by scanning every cached block with a
+  // cursor (there's no running aggregate). Used only for the UI's cache-size
+  // readout, so a full scan is acceptable for this experimental feature.
+  const size = () =>
+    db().then(
+      (d) =>
+        new Promise((resolve, reject) => {
+          const req = d.transaction(storeName, "readonly").objectStore(storeName).openCursor();
+          let bytes = 0;
+          let count = 0;
+          req.onsuccess = () => {
+            const cursor = req.result;
+            if (!cursor) return resolve({ bytes, count });
+            const v = cursor.value;
+            if (v && v.body) bytes += v.body.byteLength;
+            count += 1;
+            cursor.continue();
+          };
+          req.onerror = () => reject(req.error);
+        }),
+    );
+
   return {
     get: (key) => run("readonly", (s) => s.get(key)),
     put: (key, value) => run("readwrite", (s) => s.put(value, key)),
     clear: () => run("readwrite", (s) => s.clear()),
+    size,
   };
 }
 
@@ -166,5 +193,10 @@ function memoryCache() {
     get: async (key) => map.get(key) || null,
     put: async (key, value) => void map.set(key, value),
     clear: async () => void map.clear(),
+    size: async () => {
+      let bytes = 0;
+      for (const v of map.values()) if (v && v.body) bytes += v.body.byteLength;
+      return { bytes, count: map.size };
+    },
   };
 }

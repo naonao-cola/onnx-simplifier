@@ -98,19 +98,23 @@ await acheck("passes through non-cacheable requests untouched", async () => {
   assert.equal(cache._map.size, 0);
 });
 
-await acheck("fires onHit / onMiss hooks", async () => {
+await acheck("fires onHit / onMiss / onNetwork hooks", async () => {
   const cache = mapCache();
   const realFetch = async () =>
-    new Response(new Uint8Array([9]).buffer, { status: 206 });
+    new Response(new Uint8Array([9, 9, 9]).buffer, { status: 206 });
   const events = [];
   const f = makeCachingFetch(realFetch, cache, {
     onHit: (_k, n) => events.push(["hit", n]),
     onMiss: () => events.push(["miss"]),
+    onNetwork: (n) => events.push(["network", n]),
   });
   const url = "https://cas.example/blk/z";
-  await f(url, { headers: { Range: "bytes=0-0" } });
-  await f(url, { headers: { Range: "bytes=0-0" } });
-  assert.deepEqual(events, [["miss"], ["hit", 1]]);
+  await f(url, { headers: { Range: "bytes=0-2" } });
+  await f(url, { headers: { Range: "bytes=0-2" } });
+  // A miss reports the bytes fetched over the network; the subsequent hit does
+  // not fire onNetwork (nothing crossed the wire) — the basis for the honest
+  // Xet download-speed figure.
+  assert.deepEqual(events, [["miss"], ["network", 3], ["hit", 3]]);
 });
 
 await acheck("a cache read error falls back to the network", async () => {

@@ -124,16 +124,24 @@ check("fileUrl percent-encodes each path segment", () => {
   );
 });
 
-await acheck("loadModelList reads ./models.json first", async () => {
+await acheck("loadModelList reads ./models.json first, carrying sizes", async () => {
   await withFetch(
     {
       "./models.json": {
-        json: { models: [{ id: "onnxmodelzoo/a" }, { id: "onnxmodelzoo/b" }] },
+        json: {
+          models: [
+            { id: "onnxmodelzoo/a", size: 1234 },
+            { id: "onnxmodelzoo/b" },
+          ],
+        },
       },
     },
     async () => {
-      const ids = await loadModelList();
-      assert.deepEqual(ids, ["onnxmodelzoo/a", "onnxmodelzoo/b"]);
+      const models = await loadModelList();
+      assert.deepEqual(models, [
+        { id: "onnxmodelzoo/a", size: 1234 },
+        { id: "onnxmodelzoo/b", size: null },
+      ]);
     },
   );
 });
