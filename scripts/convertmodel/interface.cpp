@@ -3,6 +3,13 @@
 #include "onnxoptimizer/optimize.h"
 #include "onnx/checker.h"
 
+// In the ORT-web build (ONNXSIM_WASM_ORT_WEB) onnxsim is compiled with
+// NO_BUILTIN_ORT -- no ONNX Runtime is linked in -- and constant folding is
+// delegated to the page's onnxruntime-web via this executor instead.
+#ifdef ONNXSIM_WASM_ORT_WEB
+#include "js_model_executor.h"
+#endif
+
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
@@ -76,7 +83,14 @@ em::val onnxsimplify_export(const std::string& data, em::val skip_optimizers, bo
     onnx::ModelProto optimized;
     try {
         optimized = Simplify(
+#ifdef ONNXSIM_WASM_ORT_WEB
+            // Runs each fold group through the page's onnxruntime-web. _Run
+            // blocks on a JS Promise, so this whole function is Asyncified and
+            // returns a Promise to JS (the worker awaits it).
+            *GetJsModelExecutor(),
+#else
             *GetBuiltinModelExecutor(),
+#endif
             xmodel,
             em::vecFromJSArray<std::string>(skip_optimizers),
             constant_folding,
@@ -235,6 +249,20 @@ em::val onnxsim_annotate_model_info(const std::string& data) {
     return em::val(em::typed_memory_view(result.size(), reinterpret_cast<uint8_t*>(result.data())));
 }
 
+// True when this module was built to delegate constant folding to
+// onnxruntime-web (ONNXSIM_WASM_ORT_WEB). The worker uses this to decide whether
+// it must load onnxruntime-web and register a runner on the Module before
+// simplifying, and whether onnxsimplify_export returns a Promise (Asyncify) it
+// needs to await. In the default built-in-ORT build this is false and the
+// worker's behaviour is unchanged.
+bool onnxsim_needs_ort_web() {
+#ifdef ONNXSIM_WASM_ORT_WEB
+    return true;
+#else
+    return false;
+#endif
+}
+
 std::vector<std::string> onnxoptimizer_passes() {
     return onnx::optimization::GetAvailablePasses();
 }
@@ -250,6 +278,7 @@ EMSCRIPTEN_BINDINGS(module) {
     function("onnxoptimizer_optimize_fixed", &onnxoptimizer_optimize_fixed);
     em::function("onnxoptimizer_passes", &onnxoptimizer_passes);
     em::function("onnxoptimizer_fuse_elimination_passes", &onnxoptimizer_fuse_elimination_passes);
+    em::function("onnxsim_needs_ort_web", &onnxsim_needs_ort_web);
 
     em::register_vector<std::string>("string_list");
 }
