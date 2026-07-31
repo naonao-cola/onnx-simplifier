@@ -41,6 +41,23 @@ message shape; it needs no dependencies or network:
 npm run test:netron
 ```
 
+## MAC / FLOP metrics
+
+`npm run test:macs` unit-tests `macs.mjs`, the dependency-free protobuf reader
+behind the inference panel's MAC/FLOP display. It reads onnxsim's per-model and
+per-node metrics out of a model's `metadata_props` (onnxsim
+[PR #527](https://github.com/onnxsim/onnxsim/pull/527)), substitutes dynamic
+dimensions with 1, and turns a model's FLOPs plus a measured latency into
+GFLOP/s.
+
+With **annotate model info** on (the default), the converter bakes these metrics
+into *both* outputs of a conversion: the converted result and — via the WASM
+`onnxsim_annotate_model_info` binding — the original upload
+(`window.__onnxsimOriginalAnnotated`). The inference panel then reports MACs and
+throughput for either **model** source, so the original and converted models can
+be compared on inference speed. Annotation only adds `metadata_props`, so the
+annotated bytes execute identically to the upload.
+
 ## Profiling traces
 
 Both the browser panels can emit a [Chrome Trace Event][cte] JSON that the page

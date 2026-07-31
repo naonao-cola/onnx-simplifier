@@ -70,6 +70,24 @@ create_onnxsim({
         console.log("to data url start")
         const data_url = "data:application/octet-stream;base64," + model.toBase64();
         console.log("to data url end")
-        postMessage(["convert-done", data_url, trace]);
+        // When "annotate model info" is on, also bake the MAC/FLOP metrics into
+        // the *original* uploaded model so the "Run inference" panel can report
+        // its throughput too — letting the user compare original vs converted
+        // inference speed. Annotation only adds metadata_props, so the bytes run
+        // identically. Best-effort: a failure here just leaves the original
+        // un-annotated (the panel falls back to the raw upload).
+        let original_data_url = "";
+        if (e.data[8]) {
+            try {
+                const annotated = runtime.onnxsim_annotate_model_info(buf);
+                if (annotated) {
+                    original_data_url =
+                        "data:application/octet-stream;base64," + annotated.toBase64();
+                }
+            } catch (err) {
+                postMessage(["stderr", "annotate original model failed: " + err]);
+            }
+        }
+        postMessage(["convert-done", data_url, trace, original_data_url]);
     });
 });
