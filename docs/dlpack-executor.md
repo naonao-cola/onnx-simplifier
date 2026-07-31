@@ -212,10 +212,14 @@ The `JsModelExecutor`'s `Run` now takes borrowed `DLManagedTensor*` feeds
 output bytes via `FromTensorProtoOwning`. See `docs/wasm_ort_web.md` for the
 onnxruntime-web build variant and its Asyncify sync-C++/async-JS bridge.
 
+`JsModelExecutor` batches a whole fold group's tensors into a single embind
+crossing per direction — one concatenated byte blob plus one flat
+`[dtype, ndim, dims...]` metadata array — instead of building a JS object per
+tensor. The per-fold-group data copies across the two separate heaps remain
+(they are unavoidable), but the number of embind round trips is now O(1) rather
+than O(tensors × fields). See `docs/wasm_ort_web.md`.
+
 ## Follow-ups
 
-- Batch a whole fold group's tensors into one embind crossing in
-  `JsModelExecutor` (currently one JS array built per call; the per-tensor
-  `Uint8Array` copies are unavoidable across the separate heaps).
 - Optional dlpack-native Python executor via `__dlpack__` to drop the Python
   adapter's protobuf round trip.
