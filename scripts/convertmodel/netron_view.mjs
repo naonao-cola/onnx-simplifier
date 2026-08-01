@@ -20,6 +20,7 @@ import {
   dataUrlToArrayBuffer,
   buildModelMessage,
 } from "./netron.mjs";
+import { downloadBytes } from "./download.mjs";
 
 // Read a File as an ArrayBuffer.
 function fileToArrayBuffer(file) {
@@ -91,6 +92,7 @@ const panes = {
 function renderPane(which, buffer, name) {
   const frame = document.getElementById(`netron-${which}-frame`);
   const open = document.getElementById(`netron-${which}-open`);
+  const download = document.getElementById(`netron-${which}-download`);
   const note = document.getElementById(`netron-${which}-note`);
   if (!frame) {
     return;
@@ -136,6 +138,17 @@ function renderPane(which, buffer, name) {
   if (open) {
     open.style.display = "";
     open.onclick = () => openInNewTab(which);
+  }
+
+  // Arm the "download model" button with the pane's current bytes. Netron
+  // renders the graph but offers no way to save the model it was handed; this
+  // lets the user grab the exact before/after bytes shown here (e.g. the
+  // converted result, or a model pulled from Hugging Face).
+  if (download) {
+    download.style.display = "";
+    download.onclick = () => {
+      if (pane.buffer) downloadBytes(pane.buffer, pane.name || `${which}.onnx`);
+    };
   }
 }
 

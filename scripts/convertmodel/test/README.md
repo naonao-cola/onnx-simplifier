@@ -58,6 +58,21 @@ throughput for either **model** source, so the original and converted models can
 be compared on inference speed. Annotation only adds `metadata_props`, so the
 annotated bytes execute identically to the upload.
 
+## Report-an-issue URL
+
+`npm run test:issue` unit-tests `issue_report.mjs`, the pure builder behind the
+converter page's **Report an issue** button. It assembles the pre-filled GitHub
+issue body (page URL, user agent, the last conversion's parameters, and the tail
+of the console log) and — crucially — trims the log from the front until the
+whole URL fits under a conservative length cap, so GitHub never rejects it with
+*"Whoa there! Your request URL is too long."*. The test covers the field
+contents, the untrimmed short-log case, and that a huge log is trimmed (keeping
+its error-bearing tail) so the URL stays under the cap. No DOM or network:
+
+```bash
+npm run test:issue
+```
+
 ## Profiling traces
 
 Both the browser panels can emit a [Chrome Trace Event][cte] JSON that the page

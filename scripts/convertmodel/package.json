@@ -11,7 +11,8 @@
     "test:macs": "node test/macs.test.mjs",
     "test:hf": "node test/hf_models.test.mjs",
     "test:xet": "node test/xet_cache.test.mjs",
-    "test:all": "npm run test:netron && npm run test:trace && npm run test:macs && npm run test:hf && npm run test:xet && npm run test:inference",
+    "test:issue": "node test/issue_report.test.mjs",
+    "test:all": "npm run test:netron && npm run test:trace && npm run test:macs && npm run test:hf && npm run test:xet && npm run test:issue && npm run test:inference",
     "coverage": "c8 npm run test:all"
   },
   "dependencies": {
