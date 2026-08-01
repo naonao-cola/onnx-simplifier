@@ -2,6 +2,18 @@
 #include "model_info.h"
 #include "onnxoptimizer/optimize.h"
 #include "onnx/checker.h"
+#include "onnx/defs/parser.h"
+#include "onnx/defs/schema.h"
+
+// Version strings baked in by CMake (read from VERSION and
+// third_party/onnx-optimizer/VERSION_NUMBER). Fall back to "unknown" so the
+// file still compiles outside the CMake build (e.g. an IDE/static check).
+#ifndef ONNXSIM_VERSION_STRING
+#define ONNXSIM_VERSION_STRING "unknown"
+#endif
+#ifndef ONNX_OPTIMIZER_VERSION_STRING
+#define ONNX_OPTIMIZER_VERSION_STRING "unknown"
+#endif
 
 // In the ORT-web build (ONNXSIM_WASM_ORT_WEB) onnxsim is compiled with
 // NO_BUILTIN_ORT -- no ONNX Runtime is linked in -- and constant folding is
@@ -56,6 +68,84 @@ std::string ReadAndClearProfileTrace() {
     }
     std::remove(kProfileTracePath);
     return trace;
+}
+
+// Serialize `model` into the shared static buffer and hand JS a typed-memory
+// view over it (null on failure). The buffer is `static` so the view stays
+// valid after this function returns; the worker copies it out immediately
+// (toBase64 / a fresh Uint8Array), and calls are sequential, so a single shared
+// buffer is safe -- matching how the other bindings here return model bytes.
+em::val SerializeModel(const onnx::ModelProto& model) {
+    static std::string result;
+    if (!model.SerializeToString(&result)) {
+        std::cerr << "Serialize failed" << std::endl;
+        return em::val::null();
+    }
+    return em::val(em::typed_memory_view(result.size(),
+                                         reinterpret_cast<uint8_t*>(result.data())));
+}
+
+// Materialize the raw little-endian bytes of `tensor` into `out`, reading either
+// its `raw_data` or the typed repeated fields (float_data/int64_data/...). The
+// wasm target is little-endian, so writing native bytes yields the
+// little-endian layout onnxruntime-web's typed arrays expect. Returns false for
+// a dtype we do not pack (STRING / COMPLEX / the narrow float variants stored
+// out of band); the caller reports it. The bridged dtypes match
+// CppModelExecutor / the ONNX backend node tests.
+bool TensorProtoToRawBytes(const onnx::TensorProto& tensor, std::string& out) {
+    using TP = onnx::TensorProto;
+    out.clear();
+    if (tensor.has_raw_data()) {
+        out = tensor.raw_data();
+        return true;
+    }
+    auto append = [&out](const void* p, size_t n) {
+        out.append(reinterpret_cast<const char*>(p), n);
+    };
+    switch (tensor.data_type()) {
+        case TP::FLOAT:
+            for (float v : tensor.float_data()) append(&v, sizeof(v));
+            return true;
+        case TP::DOUBLE:
+            for (double v : tensor.double_data()) append(&v, sizeof(v));
+            return true;
+        case TP::INT64:
+            for (int64_t v : tensor.int64_data()) append(&v, sizeof(v));
+            return true;
+        case TP::UINT64:
+            for (uint64_t v : tensor.uint64_data()) append(&v, sizeof(v));
+            return true;
+        case TP::INT32:
+            for (int32_t v : tensor.int32_data()) append(&v, sizeof(v));
+            return true;
+        case TP::UINT32:
+            // uint32 values live in uint64_data per the TensorProto encoding.
+            for (uint64_t v : tensor.uint64_data()) {
+                uint32_t w = static_cast<uint32_t>(v);
+                append(&w, sizeof(w));
+            }
+            return true;
+        case TP::INT16:
+        case TP::UINT16:
+        case TP::FLOAT16:
+        case TP::BFLOAT16:
+            // Stored widened in int32_data; pack the low 16 bits.
+            for (int32_t v : tensor.int32_data()) {
+                uint16_t w = static_cast<uint16_t>(v);
+                append(&w, sizeof(w));
+            }
+            return true;
+        case TP::INT8:
+        case TP::UINT8:
+        case TP::BOOL:
+            for (int32_t v : tensor.int32_data()) {
+                uint8_t b = static_cast<uint8_t>(v);
+                append(&b, sizeof(b));
+            }
+            return true;
+        default:
+            return false;
+    }
 }
 
 }  // namespace
@@ -249,6 +339,181 @@ em::val onnxsim_annotate_model_info(const std::string& data) {
     return em::val(em::typed_memory_view(result.size(), reinterpret_cast<uint8_t*>(result.data())));
 }
 
+// Report the versions of the libraries baked into this module, for detailed
+// bug reports. onnxsim and onnx-optimizer come from CMake (their VERSION files);
+// onnx is reported as its max IR version + the highest opset it supports for the
+// default (ai.onnx) domain, both read from the linked onnx at runtime; protobuf
+// is decoded from GOOGLE_PROTOBUF_VERSION. Returns a plain JS object of strings.
+em::val onnxsim_versions() {
+    em::val out = em::val::object();
+    out.set("onnxsim", std::string(ONNXSIM_VERSION_STRING));
+    out.set("onnx_optimizer", std::string(ONNX_OPTIMIZER_VERSION_STRING));
+
+    // onnx: IR version + highest supported opset for the default ONNX domain.
+    {
+        int max_opset = 0;
+        const auto& ranges =
+            onnx::OpSchemaRegistry::DomainToVersionRange::Instance().Map();
+        auto it = ranges.find("");  // "" is the default ONNX domain (ai.onnx)
+        if (it != ranges.end()) {
+            max_opset = it->second.second;
+        }
+        std::ostringstream os;
+        os << "IR v" << static_cast<int>(onnx::IR_VERSION) << ", opset "
+           << max_opset;
+        out.set("onnx", os.str());
+    }
+
+    // protobuf: GOOGLE_PROTOBUF_VERSION is major*1000000 + minor*1000 + patch.
+#ifdef GOOGLE_PROTOBUF_VERSION
+    {
+        int pv = GOOGLE_PROTOBUF_VERSION;
+        std::ostringstream os;
+        os << (pv / 1000000) << "." << (pv / 1000 % 1000) << "." << (pv % 1000);
+        out.set("protobuf", os.str());
+    }
+#else
+    out.set("protobuf", std::string("unknown"));
+#endif
+    return out;
+}
+
+// Parse an ONNX *text* representation into a model and return its bytes. Accepts
+// either a whole-model text (with an `<ir_version: ..., opset_import: [...]>`
+// prolog) or a bare graph body -- the textual form onnx.parser.parse_graph
+// accepts. A bare graph is wrapped in a minimal ModelProto with a default-domain
+// opset import at the highest opset this build supports, so the parsed graph can
+// then be simplified / visualized / run like an uploaded model. Returns
+// { model: Uint8Array } on success or { error: string } describing the parse
+// failure(s).
+em::val onnxsim_parse_graph(const std::string& text) {
+    em::val out = em::val::object();
+    // Try whole-model text first.
+    onnx::ModelProto model;
+    onnx::Common::Status model_st = onnx::OnnxParser::Parse(model, text);
+    if (!model_st.IsOK()) {
+        // Fall back to graph-only text and wrap it into a model.
+        onnx::GraphProto graph;
+        onnx::Common::Status graph_st = onnx::OnnxParser::Parse(graph, text);
+        if (!graph_st.IsOK()) {
+            out.set("error", std::string("failed to parse as a model (") +
+                                 model_st.ErrorMessage() +
+                                 ") and as a graph (" + graph_st.ErrorMessage() +
+                                 ")");
+            return out;
+        }
+        model.Clear();
+        model.set_ir_version(onnx::IR_VERSION);
+        *model.mutable_graph() = graph;
+        int max_opset = 0;
+        const auto& ranges =
+            onnx::OpSchemaRegistry::DomainToVersionRange::Instance().Map();
+        auto it = ranges.find("");  // default ONNX domain (ai.onnx)
+        if (it != ranges.end()) {
+            max_opset = it->second.second;
+        }
+        auto* opset = model.add_opset_import();
+        opset->set_domain("");  // default ONNX domain
+        opset->set_version(max_opset > 0 ? max_opset : 1);
+    }
+    em::val bytes = SerializeModel(model);
+    if (bytes.isNull()) {
+        out.set("error", std::string("failed to serialize the parsed model"));
+        return out;
+    }
+    out.set("model", bytes);
+    return out;
+}
+
+// Parse a serialized onnx.TensorProto (e.g. an input_N.pb / output_N.pb from an
+// ONNX backend test case) into a form onnxruntime-web can consume in JS.
+// Returns { dtype: int (TensorProto.DataType), name: string, dims: [int...],
+// data: Uint8Array (raw little-endian) } or { error: string }.
+em::val onnxsim_parse_tensor(const std::string& data) {
+    em::val out = em::val::object();
+    onnx::TensorProto tensor;
+    if (!tensor.ParseFromArray(data.data(), data.size())) {
+        out.set("error", std::string("failed to parse TensorProto"));
+        return out;
+    }
+    static std::string raw;
+    if (!TensorProtoToRawBytes(tensor, raw)) {
+        std::ostringstream os;
+        os << "unsupported tensor data type " << tensor.data_type()
+           << " (STRING / COMPLEX and similar are not bridged)";
+        out.set("error", os.str());
+        return out;
+    }
+    out.set("dtype", static_cast<int>(tensor.data_type()));
+    out.set("name", tensor.name());
+    em::val dims = em::val::array();
+    for (int i = 0; i < tensor.dims_size(); ++i) {
+        dims.set(i, static_cast<double>(tensor.dims(i)));
+    }
+    out.set("dims", dims);
+    out.set("data", em::val(em::typed_memory_view(
+                        raw.size(), reinterpret_cast<uint8_t*>(raw.data()))));
+    return out;
+}
+
+// Run a single simplification building block once (not in the fixed point) for
+// debugging, returning the transformed model bytes (null on failure). Shape
+// inference and data propagation need no model executor. Constant folding runs
+// through the same executor Simplify uses -- in the ORT-web build that awaits
+// onnxruntime-web, so (like onnxsimplify_export) onnxsim_fold_constant is
+// Asyncified and returns a Promise the worker awaits.
+em::val onnxsim_infer_shapes(const std::string& data) {
+    InitEnv();
+    onnx::ModelProto xmodel;
+    if (!xmodel.ParseFromArray(data.data(), data.size())) {
+        std::cerr << "Parse failed" << std::endl;
+        return em::val::null();
+    }
+    try {
+        return SerializeModel(InferShapesOnce(xmodel));
+    } catch (const std::exception& e) {
+        std::cerr << "shape inference error: " << e.what() << std::endl;
+        return em::val::null();
+    }
+}
+
+em::val onnxsim_data_propagation(const std::string& data) {
+    InitEnv();
+    onnx::ModelProto xmodel;
+    if (!xmodel.ParseFromArray(data.data(), data.size())) {
+        std::cerr << "Parse failed" << std::endl;
+        return em::val::null();
+    }
+    try {
+        return SerializeModel(PropagateDataOnce(xmodel));
+    } catch (const std::exception& e) {
+        std::cerr << "data propagation error: " << e.what() << std::endl;
+        return em::val::null();
+    }
+}
+
+em::val onnxsim_fold_constant(const std::string& data, size_t tensor_size_threshold) {
+    InitEnv();
+    onnx::ModelProto xmodel;
+    if (!xmodel.ParseFromArray(data.data(), data.size())) {
+        std::cerr << "Parse failed" << std::endl;
+        return em::val::null();
+    }
+    try {
+        onnx::ModelProto folded = FoldConstantOnce(
+#ifdef ONNXSIM_WASM_ORT_WEB
+            *GetJsModelExecutor(),
+#else
+            *GetBuiltinModelExecutor(),
+#endif
+            xmodel, tensor_size_threshold);
+        return SerializeModel(folded);
+    } catch (const std::exception& e) {
+        std::cerr << "constant folding error: " << e.what() << std::endl;
+        return em::val::null();
+    }
+}
+
 // True when this module was built to delegate constant folding to
 // onnxruntime-web (ONNXSIM_WASM_ORT_WEB). The worker uses this to decide whether
 // it must load onnxruntime-web and register a runner on the Module before
@@ -279,6 +544,14 @@ EMSCRIPTEN_BINDINGS(module) {
     em::function("onnxoptimizer_passes", &onnxoptimizer_passes);
     em::function("onnxoptimizer_fuse_elimination_passes", &onnxoptimizer_fuse_elimination_passes);
     em::function("onnxsim_needs_ort_web", &onnxsim_needs_ort_web);
+    // Version reporting, text-graph parsing, TensorProto parsing, and the
+    // single-pass debugging entry points (see the definitions above).
+    em::function("onnxsim_versions", &onnxsim_versions);
+    em::function("onnxsim_parse_graph", &onnxsim_parse_graph);
+    em::function("onnxsim_parse_tensor", &onnxsim_parse_tensor);
+    em::function("onnxsim_infer_shapes", &onnxsim_infer_shapes);
+    em::function("onnxsim_data_propagation", &onnxsim_data_propagation);
+    em::function("onnxsim_fold_constant", &onnxsim_fold_constant);
 
     em::register_vector<std::string>("string_list");
 }

@@ -73,6 +73,62 @@ its error-bearing tail) so the URL stays under the cap. No DOM or network:
 npm run test:issue
 ```
 
+## Library versions
+
+The page shows the **versions** of the libraries built into the WebAssembly
+module — onnxsim, onnx-optimizer, onnx (its IR version + highest supported
+opset), and protobuf — as a row of badges under the title, and includes them in
+the **Report an issue** body. onnxsim and onnx-optimizer come from their
+`VERSION` files (baked in by CMake); onnx and protobuf are read from the linked
+libraries at runtime by the `onnxsim_versions` binding. `npm run test:versions`
+unit-tests the pure `versions.mjs` helpers (normalization + badge rendering
+against a tiny fake DOM); no DOM or network:
+
+```bash
+npm run test:versions
+```
+
+## Parse a text graph
+
+The **Parse a text graph** panel takes an ONNX
+[textual representation](https://onnx.ai/onnx/repo-docs/Syntax.html) — the form
+`onnx.parser.parse_graph` / `parse_model` accept — and parses it into a model
+with the `onnxsim_parse_graph` binding (whole-model text is used as-is; a bare
+graph is wrapped into a model with a default-domain opset import). The parsed
+model is shown in the **Before** Netron pane, becomes the source for the
+single-feature passes, and — with *convert after parsing* on — is run straight
+through the Simplify path.
+
+## Run a single feature (debugging)
+
+The **Run a single feature** panel runs exactly one of the transforms that
+`Simplify` otherwise drives to a fixed point — **shape inference**, ONNX **data
+propagation**, or **constant folding** — once, on a chosen model, so its
+isolated effect can be inspected. These map to onnxsim's
+`InferShapesOnce` / `PropagateDataOnce` / `FoldConstantOnce` core helpers, exposed
+to the page as the `onnxsim_infer_shapes` / `onnxsim_data_propagation` /
+`onnxsim_fold_constant` bindings. Constant folding runs through the same model
+executor `Simplify` uses (onnxruntime-web in the ORT-web build), so that pass
+goes through the conversion worker. Each result is shown in the **After** Netron
+pane, offered as a download, and becomes the new source so passes can be chained.
+
+## Run an ONNX backend test case
+
+The **Run an ONNX backend test case** panel takes a URL to an
+[ONNX backend test case](https://github.com/onnx/onnx/tree/main/onnx/backend/test/data)
+directory (a `model.onnx` plus one or more `test_data_set_N/` of `input_*.pb` /
+`output_*.pb` TensorProtos), fetches the model and test data from GitHub, runs
+the model through onnxruntime-web with the given inputs, and compares each output
+against the expected tensor within tolerance. TensorProtos are decoded by the
+`onnxsim_parse_tensor` binding. `npm run test:backend` unit-tests the pure
+`backend_test.mjs` helpers — GitHub URL parsing (tree / blob /
+`raw.githubusercontent.com` / contents-API forms), numeric ordering of
+`input_N.pb` files, and float/int/shape tensor comparison; no DOM or network:
+
+```bash
+npm run test:backend
+```
+
 ## Profiling traces
 
 Both the browser panels can emit a [Chrome Trace Event][cte] JSON that the page

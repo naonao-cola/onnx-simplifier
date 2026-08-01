@@ -90,8 +90,50 @@ create_onnxsim({
     // "Choose file" picker. Registering the message listener below only
     // happens now, so any file posted earlier would be dropped.
     postMessage(["ready"]);
+
+    // The single-feature debugging passes (the "Run a single feature" panel):
+    // each takes a model and returns a transformed model, without the full
+    // fixed-point Simplify. They post back ["debug-done", type, dataUrl, error]
+    // so the debug module can tell its responses apart from a conversion.
+    const DEBUG_TYPES = new Set(["infer_shapes", "data_propagation", "fold_constant"]);
+    async function handleDebug(e) {
+        const type = e.data[0];
+        const buf = e.data[1];
+        try {
+            let model = null;
+            if (type === "infer_shapes") {
+                model = runtime.onnxsim_infer_shapes(buf);
+            } else if (type === "data_propagation") {
+                model = runtime.onnxsim_data_propagation(buf);
+            } else if (type === "fold_constant") {
+                // Constant folding runs through the executor; in the ORT-web
+                // build it is Asyncified and returns a Promise to await.
+                let r = runtime.onnxsim_fold_constant(buf, e.data[2]);
+                if (r && typeof r.then === "function") r = await r;
+                model = r;
+            }
+            if (!model) {
+                postMessage(["debug-done", type, null,
+                    type + " produced no model (see the log above)"]);
+                return;
+            }
+            const data_url = "data:application/octet-stream;base64," + model.toBase64();
+            postMessage(["debug-done", type, data_url, null]);
+        } catch (err) {
+            const detail = String((err && err.message) || err);
+            if (isOutOfMemory(detail)) {
+                postMessage(["stderr", memoryLimitMessage(detail)]);
+            }
+            postMessage(["debug-done", type, null, detail]);
+        }
+    }
+
     addEventListener("message", async (e) => {
         console.log(e.data);
+        if (DEBUG_TYPES.has(e.data[0])) {
+            await handleDebug(e);
+            return;
+        }
         const buf = e.data[1];
         // `model` is the converted model bytes (a Uint8Array view); `trace` is
         // the onnxsim profiling trace JSON for "simplify" when profiling was

@@ -1920,6 +1920,52 @@ onnx::ModelProto ConvertOpsetVersion(const onnx::ModelProto& model,
   return onnx::version_conversion::ConvertVersion(model, target_version);
 }
 
+// Shared schema setup for the single-pass debug helpers below, mirroring the
+// head of ``Simplify``: teach shape inference about ONNX Runtime's quantized
+// contrib ops and register permissive placeholders for custom ops exported into
+// the default ONNX domain, so neither shape inference nor a later checker
+// rejects the model. Unlike ``Simplify`` these helpers do not ``Check`` the
+// model up front -- the point of running a step in isolation is to debug a model
+// that may not yet be fully valid.
+void PrepareSchemasForDebug(const onnx::ModelProto& model) {
+  onnxsim::RegisterContribOpSchemas();
+  FixupSchemaDeterminism();
+  RegisterCustomDefaultDomainOpSchemas(model);
+}
+
+onnx::ModelProto InferShapesOnce(const onnx::ModelProto& model) {
+  PrepareSchemasForDebug(model);
+  onnx::ModelProto out = model;
+  _InferShapes(out);
+  return out;
+}
+
+onnx::ModelProto PropagateDataOnce(const onnx::ModelProto& model) {
+  PrepareSchemasForDebug(model);
+  onnx::ModelProto out = model;
+  _EvalPartialShape(out);
+  return out;
+}
+
+onnx::ModelProto FoldConstantOnce(const ModelExecutor& executor,
+                                  const onnx::ModelProto& model,
+                                  size_t tensor_size_threshold,
+                                  bool initializers_as_constants) {
+  PrepareSchemasForDebug(model);
+  // ``_FoldConstant`` reads these globals (tensor-size cap and the
+  // initializers-as-constants policy), just as ``Simplify`` sets them.
+  config.tensor_size_threshold = tensor_size_threshold;
+  config.initializers_as_constants = initializers_as_constants;
+  config.optimizer_passes.clear();
+  onnx::ModelProto out = model;
+  // Mirror ``Simplify``'s FoldConstant step: partial shape evaluation first
+  // turns Shape/Gather-on-shape into constants that the ordinary constant
+  // folder can then propagate.
+  _EvalPartialShape(out);
+  out = _FoldConstant(executor, out);
+  return out;
+}
+
 onnx::ModelProto Simplify(
     const ModelExecutor& executor, const onnx::ModelProto& model,
     std::optional<std::vector<std::string>> skip_optimizers,
