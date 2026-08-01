@@ -198,25 +198,25 @@ if (ONNXSIM_C_API)
   # `onnx::RNNShapeInference`. Force every object of libonnx and onnxsim into
   # onnxsim_c with --whole-archive so all schemas/inference fns are present.
   #
-  # Whole-archive libonnx *only* (not onnx_proto): the generated onnx-operators
-  # *.pb.cc object is archived into both libonnx.a and libonnx_proto.a, so
-  # whole-archiving both double-defines symbols like
-  # Arena::CreateMaybeMessage<onnx::OperatorProto> (and double-runs its protobuf
-  # descriptor registration). Pulling libonnx whole brings the schemas plus its
-  # copy of the operators/data protos.
-  #
-  # onnx::ModelProto's vtable/typeinfo live in onnx.pb.cc, which is only in
-  # libonnx_proto.a. onnxsim references that typeinfo through a *weak* COMDAT
-  # reference (MessageDifferencer on ModelProto), which the linker will not use
-  # to pull an archive member -- so onnx_proto linked normally leaves it
-  # undefined. Force onnx.pb.cc in with a strong -u reference to the ModelProto
-  # typeinfo symbol; that one object carries every onnx.proto message type.
-  # onnx_proto/onnx_optimizer otherwise link normally, as does ONNX Runtime (via
-  # the Ort:: C++ API through onnxsim's public link interface).
+  # Static option 1: pull the whole onnx stack + onnxsim into onnxsim_c so every
+  # statically-registered object survives.
+  #  * libonnx carries the operator schemas and shape-inference fns (e.g.
+  #    onnx::RNNShapeInference) that self-register via static initializers, so it
+  #    must be whole-archived or the linker prunes them.
+  #  * onnx::ModelProto's vtable/typeinfo live in onnx.pb.cc (libonnx_proto only)
+  #    and are referenced only through a weak COMDAT reference that the linker
+  #    won't use to pull an archive member; whole-archiving onnx_proto forces
+  #    that object in.
+  # The generated onnx-operators *.pb.cc object is archived into BOTH libonnx and
+  # libonnx_proto, so whole-archiving both duplicates its symbols. --allow-
+  # multiple-definition tolerates that: protobuf's per-file descriptor_table
+  # symbols merge to a single copy, whose once-guarded registration then runs
+  # exactly once (no double registration). onnx_optimizer and ONNX Runtime are
+  # referenced directly and link normally.
   target_link_libraries(onnxsim_c PRIVATE
-    "-Wl,-u,_ZTIN4onnx10ModelProtoE"
-    "-Wl,--whole-archive" onnxsim onnx "-Wl,--no-whole-archive"
-    onnx_proto onnx_optimizer)
+    "-Wl,--allow-multiple-definition"
+    "-Wl,--whole-archive" onnxsim onnx onnx_proto "-Wl,--no-whole-archive"
+    onnx_optimizer)
   target_include_directories(onnxsim_c PUBLIC onnxsim/capi)
   # The exported symbols opt back into default visibility via ONNXSIM_C_API in
   # the header, so the project-wide "hidden" preset keeps everything else local.
