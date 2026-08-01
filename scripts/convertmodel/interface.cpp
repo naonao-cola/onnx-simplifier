@@ -388,13 +388,17 @@ em::val onnxsim_versions() {
 // failure(s).
 em::val onnxsim_parse_graph(const std::string& text) {
     em::val out = em::val::object();
-    // Try whole-model text first.
+    // Try whole-model text first. Each OnnxParser consumes its input, so a fresh
+    // parser is constructed per attempt (the member Parse API is stable across
+    // onnx versions).
     onnx::ModelProto model;
-    onnx::Common::Status model_st = onnx::OnnxParser::Parse(model, text);
+    onnx::OnnxParser model_parser(text.c_str());
+    onnx::Common::Status model_st = model_parser.Parse(model);
     if (!model_st.IsOK()) {
         // Fall back to graph-only text and wrap it into a model.
         onnx::GraphProto graph;
-        onnx::Common::Status graph_st = onnx::OnnxParser::Parse(graph, text);
+        onnx::OnnxParser graph_parser(text.c_str());
+        onnx::Common::Status graph_st = graph_parser.Parse(graph);
         if (!graph_st.IsOK()) {
             out.set("error", std::string("failed to parse as a model (") +
                                  model_st.ErrorMessage() +
