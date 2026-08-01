@@ -13,6 +13,7 @@ import {
   toArrayBuffer,
   dataUrlToArrayBuffer,
   buildModelMessage,
+  buildExportMessage,
 } from "../netron.mjs";
 
 let passed = 0;
@@ -85,6 +86,21 @@ check("buildModelMessage falls back to a default identifier", () => {
 
 check("buildModelMessage requires an ArrayBuffer", () => {
   assert.throws(() => buildModelMessage(new Uint8Array([1]), "x"));
+});
+
+check("buildExportMessage defaults to an svg export command", () => {
+  const message = buildExportMessage(undefined, "my model.onnx");
+  assert.equal(message.netron.command, "export");
+  assert.equal(message.netron.format, "svg");
+  assert.equal(message.netron.name, "my model.onnx");
+});
+
+check("buildExportMessage accepts png and defaults the name", () => {
+  const png = buildExportMessage("png");
+  assert.equal(png.netron.format, "png");
+  assert.equal(png.netron.name, "model");
+  // An unknown format falls back to svg.
+  assert.equal(buildExportMessage("gif").netron.format, "svg");
 });
 
 console.log(`PASS: ${passed} checks`);

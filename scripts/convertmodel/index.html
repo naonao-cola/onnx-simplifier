@@ -376,7 +376,14 @@
             the original model on the left and the simplified/optimized result on
             the right, so you can compare them side by side. Nothing is uploaded —
             the model bytes are posted straight into the embedded Netron in your
-            browser, so there is no model-size limit.
+            browser, so there is no model-size limit. Use <b>export SVG</b> to save
+            the rendered graph as an SVG image.
+        </p>
+        <p class="macs-note">
+            Netron is driven here purely as an embeddable model-preview component
+            over a <code>postMessage</code> protocol; that idea and protocol are
+            being discussed upstream in
+            <a href="https://github.com/lutzroeder/netron/pull/1591#issuecomment-5148706256" target="_blank" rel="noopener">lutzroeder/netron#1591</a>.
         </p>
         <div id="netron-panes" style="display: flex; gap: 1em; flex-wrap: wrap;">
             <div class="netron-pane">
@@ -384,6 +391,7 @@
                     <strong>Before</strong> —
                     <button id="netron-before-open" type="button" style="display: none;">open in a new tab ↗</button>
                     <button id="netron-before-download" type="button" style="display: none;">download model ↓</button>
+                    <button id="netron-before-svg" type="button" style="display: none;">export SVG ↓</button>
                 </div>
                 <iframe id="netron-before-frame" class="netron-frame" title="Netron — original model" style="display: none;"></iframe>
                 <div id="netron-before-note" class="netron-note"></div>
@@ -393,6 +401,7 @@
                     <strong>After</strong> —
                     <button id="netron-after-open" type="button" style="display: none;">open in a new tab ↗</button>
                     <button id="netron-after-download" type="button" style="display: none;">download model ↓</button>
+                    <button id="netron-after-svg" type="button" style="display: none;">export SVG ↓</button>
                 </div>
                 <iframe id="netron-after-frame" class="netron-frame" title="Netron — simplified model" style="display: none;"></iframe>
                 <div id="netron-after-note" class="netron-note"></div>

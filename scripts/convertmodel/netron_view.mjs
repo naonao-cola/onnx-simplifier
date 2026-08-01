@@ -19,6 +19,7 @@ import {
   toArrayBuffer,
   dataUrlToArrayBuffer,
   buildModelMessage,
+  buildExportMessage,
 } from "./netron.mjs";
 import { downloadBytes } from "./download.mjs";
 
@@ -150,6 +151,37 @@ function renderPane(which, buffer, name) {
       if (pane.buffer) downloadBytes(pane.buffer, pane.name || `${which}.onnx`);
     };
   }
+
+  // Arm the "export SVG" button: ask the pane's Netron to render the current
+  // graph to SVG and download the returned bytes. The base name drops the
+  // model's extension so the file is e.g. "model.svg".
+  const svg = document.getElementById(`netron-${which}-svg`);
+  if (svg) {
+    svg.style.display = "";
+    svg.onclick = () => {
+      const base = (pane.name || which).replace(/\.[^./\\]*$/, "");
+      const prev = svg.textContent;
+      svg.disabled = true;
+      svg.textContent = "exporting…";
+      const finish = () => {
+        svg.disabled = false;
+        svg.textContent = prev;
+      };
+      exportFromNetron(
+        frame.contentWindow,
+        "svg",
+        base,
+        (bytes, fname) => {
+          downloadBytes(bytes, fname || `${base}.svg`);
+          finish();
+        },
+        (msg) => {
+          if (note) note.textContent = `SVG export failed: ${msg}`;
+          finish();
+        },
+      );
+    };
+  }
 }
 
 // Open the pane's current model in a new Netron tab. Must run from a user
@@ -169,6 +201,43 @@ function openInNewTab(which) {
     return;
   }
   driveNetron(win, pane.buffer, pane.name);
+}
+
+// Ask the Netron already showing a model in `target` to render the current
+// graph and hand back the image bytes, then deliver them to `onDone(bytes,
+// name)`. The pane has already completed the load handshake, so the window is
+// ready; we post the export command and wait for the matching reply. `onError`
+// is called with a message on failure or timeout.
+function exportFromNetron(target, format, name, onDone, onError) {
+  let settled = false;
+  const onMessage = (e) => {
+    if (e.source !== target) {
+      return;
+    }
+    const d = e.data;
+    if (d && typeof d === "object" && d.netron && d.netron.command === "export") {
+      teardown();
+      if (d.netron.status === "success" && d.netron.buffer) {
+        onDone(new Uint8Array(d.netron.buffer), d.netron.name || `${name}.${format}`);
+      } else if (onError) {
+        onError(d.netron.message || "Netron could not export the graph.");
+      }
+    }
+  };
+  const timeout = setTimeout(() => {
+    teardown();
+    if (onError) onError("Netron did not respond to the export request.");
+  }, 20000);
+  function teardown() {
+    if (settled) {
+      return;
+    }
+    settled = true;
+    clearTimeout(timeout);
+    window.removeEventListener("message", onMessage);
+  }
+  window.addEventListener("message", onMessage);
+  target.postMessage(buildExportMessage(format, name), NETRON_ORIGIN);
 }
 
 function initNetronPanel() {

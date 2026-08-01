@@ -34,8 +34,15 @@ renders each model with a **self-hosted** [Netron](https://github.com/onnxsim/ne
 (built into the site at `./netron/` by the deploy workflow) and hands it the
 model bytes over a postMessage embedding protocol — so nothing is uploaded and
 there is no model-size limit (the old URL-based path was capped at ~2 MB by the
-browser). The test covers buffer normalization, data-URL decoding, and the
-message shape; it needs no dependencies or network:
+browser). Each pane also has an **export SVG** button that asks Netron (over the
+same protocol's `export` command) to render the shown graph and hand the SVG
+bytes back for download. The test covers buffer normalization, data-URL
+decoding, and the model/export message shapes; it needs no dependencies or
+network:
+
+Netron is used here as an embeddable **model-preview component** driven entirely
+over `postMessage`; that idea and protocol are being discussed upstream in
+[lutzroeder/netron#1591](https://github.com/lutzroeder/netron/pull/1591#issuecomment-5148706256).
 
 ```bash
 npm run test:netron
