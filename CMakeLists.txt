@@ -198,15 +198,25 @@ if (ONNXSIM_C_API)
   # `onnx::RNNShapeInference`. Force every object of libonnx and onnxsim into
   # onnxsim_c with --whole-archive so all schemas/inference fns are present.
   #
-  # Whole-archive libonnx *only* (not onnx_proto): the generated *.pb.cc objects
-  # -- carrying protobuf's descriptor registration -- are compiled into libonnx.a
-  # as well as libonnx_proto.a, so whole-archiving both double-defines symbols
-  # like Arena::CreateMaybeMessage<onnx::OperatorProto>. Pulling libonnx whole
-  # already brings those descriptors in; onnx_proto and onnx_optimizer are
-  # referenced directly and link normally, as does ONNX Runtime (via the Ort::
-  # C++ API through onnxsim's public link interface).
+  # Whole-archive libonnx *only* (not onnx_proto): the generated onnx-operators
+  # *.pb.cc object is archived into both libonnx.a and libonnx_proto.a, so
+  # whole-archiving both double-defines symbols like
+  # Arena::CreateMaybeMessage<onnx::OperatorProto> (and double-runs its protobuf
+  # descriptor registration). Pulling libonnx whole brings the schemas plus its
+  # copy of the operators/data protos.
+  #
+  # onnx::ModelProto's vtable/typeinfo live in onnx.pb.cc, which is only in
+  # libonnx_proto.a. onnxsim references that typeinfo through a *weak* COMDAT
+  # reference (MessageDifferencer on ModelProto), which the linker will not use
+  # to pull an archive member -- so onnx_proto linked normally leaves it
+  # undefined. Force onnx.pb.cc in with a strong -u reference to the ModelProto
+  # typeinfo symbol; that one object carries every onnx.proto message type.
+  # onnx_proto/onnx_optimizer otherwise link normally, as does ONNX Runtime (via
+  # the Ort:: C++ API through onnxsim's public link interface).
   target_link_libraries(onnxsim_c PRIVATE
-    "-Wl,--whole-archive" onnxsim onnx "-Wl,--no-whole-archive")
+    "-Wl,-u,_ZTIN4onnx10ModelProtoE"
+    "-Wl,--whole-archive" onnxsim onnx "-Wl,--no-whole-archive"
+    onnx_proto onnx_optimizer)
   target_include_directories(onnxsim_c PUBLIC onnxsim/capi)
   # The exported symbols opt back into default visibility via ONNXSIM_C_API in
   # the header, so the project-wide "hidden" preset keeps everything else local.
