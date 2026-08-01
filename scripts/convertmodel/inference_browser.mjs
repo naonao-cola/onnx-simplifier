@@ -14,6 +14,7 @@
 import { runInference } from "./inference_core.mjs";
 import { summarizeOrtTrace } from "./trace_build.mjs";
 import { renderTrace } from "./trace_viewer.mjs";
+import { downloadText } from "./download.mjs";
 import {
   readAnnotations,
   perOpSummary,
@@ -284,15 +285,25 @@ export function initInferencePanel() {
   const profileChk = document.getElementById("inference-profile");
   const traceContainer = document.getElementById("inference-trace");
   const macsContainer = document.getElementById("inference-macs");
+  const dlLogBtn = document.getElementById("download-inference-log-button");
   if (!btn) return;
 
+  // The inference output is a readonly textarea (mirroring the simplify console
+  // log above), so append to `.value` and keep it scrolled to the newest line.
   const log = (msg) => {
-    out.textContent += msg + "\n";
+    out.value += msg + "\n";
+    out.scrollTop = out.scrollHeight;
   };
+
+  if (dlLogBtn) {
+    dlLogBtn.addEventListener("click", () => {
+      downloadText((out && out.value) || "", "onnxsim-inference.log");
+    });
+  }
 
   btn.addEventListener("click", async () => {
     btn.disabled = true;
-    out.textContent = "";
+    out.value = "";
     if (traceContainer) traceContainer.innerHTML = "";
     if (macsContainer) macsContainer.innerHTML = "";
     try {
