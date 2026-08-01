@@ -215,12 +215,24 @@ cargo llvm-cov report --html          # target/llvm-cov/html/index.html
 cargo llvm-cov report --cobertura --output-path rust-coverage.xml
 ```
 
+Branch coverage needs the **nightly** toolchain — `--branch` sets
+`-Zcoverage-options=branch`, which stable rejects. Add it to both the runs and
+the report to populate the branch-rate column:
+
+```sh
+ONNXSIM_PREBUILT_ORT=1 cargo +nightly llvm-cov --branch --workspace
+```
+
+On stable, `cargo-llvm-cov` still reports region/line/function coverage; only the
+branch column is blank.
+
 `cargo-llvm-cov` instruments only the wrapper crates (`onnxsim`,
 `onnxsim-sys`); the C++ core is measured separately by the C++ coverage job.
 In CI this runs as the `rust` job in
-[`.github/workflows/coverage.yml`](../.github/workflows/coverage.yml), whose
-Cobertura report is folded together with the C++, Python and JS reports into a
-single combined coverage summary and pull-request comment.
+[`.github/workflows/coverage.yml`](../.github/workflows/coverage.yml), which uses
+the nightly toolchain to collect branch coverage; its Cobertura report is folded
+together with the C++, Python and JS reports into a single combined coverage
+summary and pull-request comment.
 
 The integration test in `onnxsim/tests/` is ignored by default because it needs
 the linked native library and an ONNX model; see the file header to enable it.

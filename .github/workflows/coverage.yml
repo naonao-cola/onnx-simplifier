@@ -92,14 +92,19 @@ jobs:
         name: coverage-cpp-python-js
         path: coverage-report/
 
-  # Rust line/region coverage for the wrapper crates. It must link the native
-  # library (the safe API's tests call into the C ABI), so it takes the
+  # Rust line/region/branch coverage for the wrapper crates. It must link the
+  # native library (the safe API's tests call into the C ABI), so it takes the
   # documented prebuilt-ONNX-Runtime fast path instead of compiling ORT from
   # source. cargo-llvm-cov instruments only the workspace's own Rust (onnxsim,
   # onnxsim-sys); the C++ core is measured by the job above. It emits a Cobertura
   # report that the `report` job folds into the same combined summary.
+  #
+  # Runs on the nightly toolchain: branch coverage (`--branch`, which sets
+  # -Zcoverage-options=branch) is nightly-only, so the branch-rate column stays
+  # empty on stable. Nightly is confined to this job -- rust.yml's lint/build
+  # jobs stay on stable.
   rust:
-    name: Rust coverage (llvm-cov, prebuilt ORT)
+    name: Rust coverage (llvm-cov, prebuilt ORT, nightly)
     runs-on: ubuntu-latest
     timeout-minutes: 90
     defaults:
@@ -122,7 +127,7 @@ jobs:
           fetch-depth: 0
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
       - uses: mozilla-actions/sccache-action@v0.0.10
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@nightly
         with:
           components: llvm-tools-preview
       - uses: taiki-e/install-action@v2
@@ -152,16 +157,21 @@ jobs:
       # both the default run and the native-only integration test, then render
       # one combined report. --no-report defers rendering until every test run's
       # profiles are collected.
+      # --branch enables branch coverage (nightly-only); it must be set on both
+      # the instrumented test runs and the report commands. --ignore-filename-regex
+      # drops onnxsim-sys/build.rs: nightly instruments the build script, but its
+      # "coverage" only reflects which build path ran (prebuilt ORT), not the
+      # tests, so it would be misleading noise in the report.
       - name: Run tests with coverage
         run: |
           mkdir -p "${GITHUB_WORKSPACE}/coverage-report"
-          cargo llvm-cov --release --workspace --no-report
-          cargo llvm-cov --release --no-report -- --ignored list_optimizers_is_non_empty
-          cargo llvm-cov report --release \
+          cargo llvm-cov --branch --release --workspace --no-report
+          cargo llvm-cov --branch --release --no-report -- --ignored list_optimizers_is_non_empty
+          cargo llvm-cov report --branch --release --ignore-filename-regex '(^|/)build\.rs$' \
             --cobertura --output-path "${GITHUB_WORKSPACE}/coverage-report/rust.xml"
-          cargo llvm-cov report --release \
+          cargo llvm-cov report --branch --release --ignore-filename-regex '(^|/)build\.rs$' \
             --html --output-dir "${GITHUB_WORKSPACE}/coverage-report/rust-html"
-          cargo llvm-cov report --release --summary-only
+          cargo llvm-cov report --branch --release --ignore-filename-regex '(^|/)build\.rs$' --summary-only
       - name: Upload Rust coverage
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@v7

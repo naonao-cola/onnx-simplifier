@@ -87,6 +87,12 @@ ONNXSIM_PREBUILT_ORT=1 cargo llvm-cov --workspace --cobertura \
 the C++ core they call into is already covered by the C++ report above. Like the
 other reports, the Rust output is Cobertura XML.
 
+Branch coverage needs the nightly toolchain (`cargo +nightly llvm-cov --branch`,
+which sets `-Zcoverage-options=branch`); on stable only region/line/function
+coverage is reported. CI runs this job on nightly to fill the branch column and
+excludes `onnxsim-sys/build.rs` (nightly instruments the build script, whose
+"coverage" reflects the build path taken, not the tests). See `rust/README.md`.
+
 ## CI structure (one combined comment)
 
 In CI (`.github/workflows/coverage.yml`) each language is measured in its own
