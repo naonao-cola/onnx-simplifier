@@ -1925,8 +1925,8 @@ onnx::ModelProto ConvertOpsetVersion(const onnx::ModelProto& model,
 // contrib ops and register permissive placeholders for custom ops exported into
 // the default ONNX domain, so neither shape inference nor a later checker
 // rejects the model. Unlike ``Simplify`` these helpers do not ``Check`` the
-// model up front -- the point of running a step in isolation is to debug a model
-// that may not yet be fully valid.
+// model up front -- the point of running a step in isolation is to debug a
+// model that may not yet be fully valid.
 void PrepareSchemasForDebug(const onnx::ModelProto& model) {
   onnxsim::RegisterContribOpSchemas();
   FixupSchemaDeterminism();
