@@ -302,6 +302,11 @@
                    disabled title="Loading WebAssembly runtime…" />
             <button id="hf-load-button" type="button" disabled title="Loading WebAssembly runtime…">Load</button>
             <span id="hf-status"></span>
+            <div id="hf-file-row" style="margin-top: 0.25em; display: none;">
+                <label for="hf-file-select">file</label>
+                <select id="hf-file-select"></select>
+                <span id="hf-file-note" style="color: #666; font-size: 0.85em; margin-left: 0.25em;"></span>
+            </div>
             <div style="color: #666; font-size: 0.85em; margin-top: 0.25em;">
                 Fetches the model straight from the Hugging Face Hub in your
                 browser (nothing is uploaded), then runs it through the same
@@ -309,21 +314,37 @@
                 to the <code>onnxmodelzoo</code> org; any <code>owner/repo</code>
                 or direct <code>.onnx</code> URL works too. Picking a model (or
                 entering a repo id / URL) shows its download size first, so you
-                can see how big it is before fetching.
+                can see how big it is before fetching. When a repo holds more than
+                one <code>.onnx</code>, the largest is auto-detected; use the
+                <b>file</b> selector to convert a different one.
             </div>
             <div style="margin-top: 0.25em;">
-                <input type="checkbox" id="hf-use-xet">
+                <input type="checkbox" id="hf-use-xet" checked>
                 <label for="hf-use-xet">
                     Use <a href="https://huggingface.co/docs/xet/en/index" target="_blank" rel="noopener">Xet</a>
-                    protocol (experimental)
+                    protocol (default; falls back to a direct download)
                 </label>
+                <label for="hf-xet-concurrency" style="margin-left: 0.6em;">parallel shards</label>
+                <input type="number" id="hf-xet-concurrency" value="8" min="1" max="16" step="1"
+                       style="width: 3.5em;"
+                       title="How many parallel byte-range shards to read a Xet download in. XetBlob fetches serially, so this is what parallelizes the transfer; ~10 or fewer is usually best.">
                 <button id="hf-clear-cache" type="button">clear chunk cache</button>
+                <span id="hf-cache-size" style="color: #666; font-size: 0.85em; margin-left: 0.4em;"></span>
                 <div style="color: #666; font-size: 0.85em; margin-top: 0.2em;">
                     Downloads via <code>@huggingface/hub</code>, reconstructing the
                     file from content-addressed chunks and caching them in
-                    IndexedDB so repeated / overlapping loads reuse them. Falls
-                    back to the direct download automatically if the Xet path
-                    isn't available (e.g. a non-Xet repo or a CORS block).
+                    IndexedDB so repeated / overlapping loads reuse them. On by
+                    default; falls back to a direct download automatically if the
+                    Xet path isn't available (e.g. a non-Xet repo or a CORS block).
+                    <br>
+                    The in-browser Xet client
+                    (<a href="https://github.com/huggingface/huggingface.js/blob/main/packages/hub/src/utils/XetBlob.ts" target="_blank" rel="noopener"><code>XetBlob</code></a>)
+                    fetches a file <i>serially</i>, so <b>parallel shards</b> reads
+                    it in that many concurrent byte-range slices to saturate your
+                    link — this is what makes Xet fast enough to be the default
+                    (~10 or fewer is usually best; <code>1</code> disables
+                    sharding). Xet also gives chunk dedup / cache reuse across
+                    repeated or overlapping loads.
                 </div>
             </div>
         </div>

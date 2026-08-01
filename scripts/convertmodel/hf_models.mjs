@@ -22,16 +22,24 @@ const MODEL_LIST_SOURCES = [
   "https://raw.githubusercontent.com/onnxsim/onnxsim/master/scripts/regression/models.json",
 ];
 
-// Fetch the curated regression model ids for the dropdown. Returns [] (rather
-// than throwing) when no source is reachable, so the free-text box still works.
+// Fetch the curated regression model set for the dropdown, as
+// [{ id, size }] where `size` is the byte size of the repo's largest .onnx
+// (baked into models.json by select_models.py --refresh-sizes) or null when the
+// list predates that field. Returns [] (rather than throwing) when no source is
+// reachable, so the free-text box still works.
 export async function loadModelList() {
   for (const src of MODEL_LIST_SOURCES) {
     try {
       const r = await fetch(src);
       if (!r.ok) continue;
       const data = await r.json();
-      const ids = (data.models || []).map((m) => m.id).filter(Boolean);
-      if (ids.length) return ids;
+      const models = (data.models || [])
+        .filter((m) => m && m.id)
+        .map((m) => ({
+          id: m.id,
+          size: Number.isFinite(m.size) && m.size > 0 ? m.size : null,
+        }));
+      if (models.length) return models;
     } catch {
       // try the next source
     }
@@ -97,6 +105,21 @@ function pickOnnxSibling(siblings, repo) {
   if (!onnx.length) throw new Error(`no .onnx file found in ${repo}`);
   onnx.sort((a, b) => (b.size || 0) - (a.size || 0));
   return { sibling: onnx[0], count: onnx.length };
+}
+
+// List a repo's .onnx files as [{ file, size }], largest first — so the UI can
+// let the user pick which file to convert instead of always taking the auto-
+// detected (largest) one. `size` is a byte count or null when undisclosed.
+// Returns [] when the repo has no .onnx file (the caller decides what to do).
+export async function listOnnxFiles(repo) {
+  const siblings = await repoSiblings(repo);
+  return siblings
+    .filter((s) => s.rfilename && s.rfilename.endsWith(".onnx"))
+    .map((s) => ({
+      file: s.rfilename,
+      size: Number.isFinite(s.size) && s.size > 0 ? s.size : null,
+    }))
+    .sort((a, b) => (b.size || 0) - (a.size || 0));
 }
 
 // Pick the main .onnx file in a repo (largest, matching the regression workers)
@@ -279,15 +302,73 @@ async function readBlobWithProgress(blob, onProgress) {
   return bytes;
 }
 
+// Read a Blob in `concurrency` parallel shards, into one preallocated buffer.
+//
+// The in-browser Xet client (@huggingface/hub's XetBlob) fetches a file's
+// reconstruction terms strictly serially, so a single read never uses more than
+// one connection. But `blob.slice(a, b)` re-fetches reconstruction scoped to
+// `bytes=a-(b-1)`, so a sliced blob downloads only its sub-range — reading N
+// non-overlapping, contiguous slices concurrently gives N-way parallelism while
+// reusing all of XetBlob's reconstruction + decompression. Each shard streams
+// its range in order, so writing at a running offset from the shard's start
+// reassembles the file with no ordering logic; shards write disjoint regions of
+// `out`. Blocks straddling a shard boundary may be fetched by both neighbors —
+// a little redundant transfer, deduplicated by the chunk cache when keys line up.
+// Exported for unit testing (browser-only in practice).
+export async function readBlobSharded(blob, concurrency, onProgress = () => {}) {
+  const total = blob.size || 0;
+  const out = new Uint8Array(total);
+  const shardCount = Math.min(concurrency, total);
+  const step = Math.ceil(total / shardCount);
+  const loadedPerShard = [];
+  const report = () => {
+    let loaded = 0;
+    for (const n of loadedPerShard) loaded += n;
+    onProgress({ loaded, total });
+  };
+  const tasks = [];
+  for (let start = 0; start < total; start += step) {
+    const end = Math.min(start + step, total);
+    const idx = loadedPerShard.length;
+    loadedPerShard.push(0);
+    tasks.push(
+      (async () => {
+        const part = blob.slice(start, end);
+        if (typeof part.stream !== "function") {
+          const buf = new Uint8Array(await part.arrayBuffer());
+          out.set(buf, start);
+          loadedPerShard[idx] = buf.length;
+          report();
+          return;
+        }
+        const reader = part.stream().getReader();
+        let offset = start;
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          out.set(value, offset);
+          offset += value.length;
+          loadedPerShard[idx] = offset - start;
+          report();
+        }
+      })(),
+    );
+  }
+  await Promise.all(tasks);
+  return out;
+}
+
 // EXPERIMENTAL: download a model over the Hugging Face Xet protocol via
 // @huggingface/hub's downloadFile, which reconstructs the file from
 // content-addressed blocks. Pass `fetchImpl` (e.g. the caching fetch from
-// xet_cache.mjs) to persist those blocks across loads. Only Hub repos are
+// xet_cache.mjs) to persist those blocks across loads. `concurrency` > 1 reads
+// the reconstructed file in that many parallel byte-range shards (see
+// readBlobSharded) to work around XetBlob's serial fetching. Only Hub repos are
 // supported (not arbitrary URLs). Returns { bytes, name, repo }; the caller is
 // expected to fall back to fetchModelBytes() on any failure (CORS, unsupported).
 export async function fetchModelBytesXet(
   ref,
-  { onLog = () => {}, onProgress = () => {}, fetchImpl } = {},
+  { onLog = () => {}, onProgress = () => {}, fetchImpl, concurrency = 1 } = {},
 ) {
   const parsed = parseRef(ref);
   if (!parsed.repo) {
@@ -311,7 +392,14 @@ export async function fetchModelBytesXet(
   if (!blob) throw new Error(`file not found: ${parsed.repo}/${file}`);
 
   const name = file.split("/").pop();
-  const bytes = await readBlobWithProgress(blob, onProgress);
+  // Shard only when it can help: more than one shard requested, a known size to
+  // split on, and a sliceable blob. Otherwise fall back to a single stream.
+  const shards = Math.max(1, Math.floor(concurrency) || 1);
+  const canShard = shards > 1 && blob.size > 0 && typeof blob.slice === "function";
+  if (canShard) onLog(`reading via Xet in ${Math.min(shards, blob.size)} parallel shards…`);
+  const bytes = canShard
+    ? await readBlobSharded(blob, shards, onProgress)
+    : await readBlobWithProgress(blob, onProgress);
   onLog(`downloaded ${name} (${bytes.length.toLocaleString()} bytes via Xet)`);
   return { bytes, name, repo: parsed.repo };
 }

@@ -83,11 +83,19 @@ export function isCacheable(url, method, rangeHeader) {
 }
 
 // Wrap a fetch so cacheable requests are served from / stored into `cache`
-// (any { get(key), put(key, entry) }). `hooks.onHit(key, bytes)` and
-// `hooks.onMiss(key)` are optional progress callbacks. A cache failure never
-// breaks the request — it just falls back to the network.
+// (any { get(key), put(key, entry) }). Optional progress callbacks:
+// `hooks.onHit(key, bytes)` (served from cache), `hooks.onMiss(key)` (about to
+// fetch), and `hooks.onNetwork(bytes)` (bytes actually pulled over the network
+// on a miss — the honest denominator for a download-speed estimate, since cached
+// chunks never cross the network). A cache failure never breaks the request — it
+// just falls back to the network.
 export function makeCachingFetch(realFetch, cache, hooks = {}) {
-  return async (input, init) => {
+  // Background cache writes in flight. `fetchImpl.settled()` resolves once they
+  // all finish, so a caller can read an accurate cache size right after a
+  // download (the writes are deliberately not awaited on the download path).
+  const pendingWrites = new Set();
+
+  const fetchImpl = async (input, init) => {
     const { url, method, headers } = reqInfo(input, init);
     const range = headerGet(headers, "range");
     if (!isCacheable(url, method, range)) {
@@ -111,17 +119,29 @@ export function makeCachingFetch(realFetch, cache, hooks = {}) {
     if (resp.ok || resp.status === 206) {
       try {
         const body = await resp.clone().arrayBuffer();
-        await cache.put(key, {
-          status: resp.status,
-          headers: pickHeaders(resp.headers),
-          body,
+        if (hooks.onNetwork) hooks.onNetwork(body.byteLength);
+        // Persist in the background — do NOT await it. IndexedDB serializes
+        // writes per object store and structured-cloning multi-MB blocks is
+        // slow, so awaiting the write here would funnel even parallel range
+        // fetches through IDB's write throughput and throttle the download.
+        // Serving `resp` doesn't depend on the block being stored. Tracked in
+        // `pendingWrites` so settled() can report when the cache is consistent.
+        const entry = { status: resp.status, headers: pickHeaders(resp.headers), body };
+        const write = Promise.resolve(cache.put(key, entry)).catch(() => {
+          // Non-fatal: the block just won't be cached for next time.
         });
+        pendingWrites.add(write);
+        write.then(() => pendingWrites.delete(write));
       } catch {
-        // Non-fatal: serve the live response even if caching failed.
+        // Non-fatal: serve the live response even if reading the body failed.
       }
     }
     return resp;
   };
+
+  // Resolve once every background cache write started so far has completed.
+  fetchImpl.settled = () => Promise.all([...pendingWrites]);
+  return fetchImpl;
 }
 
 // An IndexedDB-backed cache. Falls back to an in-memory Map when IndexedDB is
@@ -153,10 +173,33 @@ export function openXetCache(dbName = "onnxsim-xet-cache", storeName = "blocks")
         }),
     );
 
+  // Total stored bytes + entry count, by scanning every cached block with a
+  // cursor (there's no running aggregate). Used only for the UI's cache-size
+  // readout, so a full scan is acceptable for this experimental feature.
+  const size = () =>
+    db().then(
+      (d) =>
+        new Promise((resolve, reject) => {
+          const req = d.transaction(storeName, "readonly").objectStore(storeName).openCursor();
+          let bytes = 0;
+          let count = 0;
+          req.onsuccess = () => {
+            const cursor = req.result;
+            if (!cursor) return resolve({ bytes, count });
+            const v = cursor.value;
+            if (v && v.body) bytes += v.body.byteLength;
+            count += 1;
+            cursor.continue();
+          };
+          req.onerror = () => reject(req.error);
+        }),
+    );
+
   return {
     get: (key) => run("readonly", (s) => s.get(key)),
     put: (key, value) => run("readwrite", (s) => s.put(value, key)),
     clear: () => run("readwrite", (s) => s.clear()),
+    size,
   };
 }
 
@@ -166,5 +209,10 @@ function memoryCache() {
     get: async (key) => map.get(key) || null,
     put: async (key, value) => void map.set(key, value),
     clear: async () => void map.clear(),
+    size: async () => {
+      let bytes = 0;
+      for (const v of map.values()) if (v && v.body) bytes += v.body.byteLength;
+      return { bytes, count: map.size };
+    },
   };
 }

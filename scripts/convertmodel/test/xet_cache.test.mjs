@@ -98,19 +98,61 @@ await acheck("passes through non-cacheable requests untouched", async () => {
   assert.equal(cache._map.size, 0);
 });
 
-await acheck("fires onHit / onMiss hooks", async () => {
+await acheck("fires onHit / onMiss / onNetwork hooks", async () => {
   const cache = mapCache();
   const realFetch = async () =>
-    new Response(new Uint8Array([9]).buffer, { status: 206 });
+    new Response(new Uint8Array([9, 9, 9]).buffer, { status: 206 });
   const events = [];
   const f = makeCachingFetch(realFetch, cache, {
     onHit: (_k, n) => events.push(["hit", n]),
     onMiss: () => events.push(["miss"]),
+    onNetwork: (n) => events.push(["network", n]),
   });
   const url = "https://cas.example/blk/z";
-  await f(url, { headers: { Range: "bytes=0-0" } });
-  await f(url, { headers: { Range: "bytes=0-0" } });
-  assert.deepEqual(events, [["miss"], ["hit", 1]]);
+  await f(url, { headers: { Range: "bytes=0-2" } });
+  await f(url, { headers: { Range: "bytes=0-2" } });
+  // A miss reports the bytes fetched over the network; the subsequent hit does
+  // not fire onNetwork (nothing crossed the wire) — the basis for the honest
+  // Xet download-speed figure.
+  assert.deepEqual(events, [["miss"], ["network", 3], ["hit", 3]]);
+});
+
+await acheck("does not block the response on a slow cache write", async () => {
+  // A put that never resolves must not stall the download: the block is cached
+  // in the background, off the critical path, so serving the response can't wait
+  // on IndexedDB's write throughput. If the write were awaited, this would hang.
+  const cache = {
+    get: async () => null,
+    put: () => new Promise(() => {}), // never settles
+  };
+  const realFetch = async () =>
+    new Response(new Uint8Array([1, 2, 3]).buffer, { status: 206 });
+  const f = makeCachingFetch(realFetch, cache);
+  const r = await f("https://cas.example/blk/slow", { headers: { Range: "bytes=0-2" } });
+  assert.equal(r.status, 206);
+  assert.deepEqual(Array.from(new Uint8Array(await r.arrayBuffer())), [1, 2, 3]);
+});
+
+await acheck("settled() waits for the background cache write to finish", async () => {
+  // The write is off the download path, but settled() lets a caller (e.g. the
+  // cache-size readout) wait until it lands.
+  let resolvePut;
+  const cache = {
+    get: async () => null,
+    put: () => new Promise((res) => (resolvePut = res)),
+  };
+  const realFetch = async () =>
+    new Response(new Uint8Array([1, 2]).buffer, { status: 206 });
+  const f = makeCachingFetch(realFetch, cache);
+  await f("https://cas.example/blk/s", { headers: { Range: "bytes=0-1" } });
+
+  const order = [];
+  const settled = f.settled().then(() => order.push("settled"));
+  await new Promise((r) => setTimeout(r, 5));
+  order.push("tick");
+  resolvePut();
+  await settled;
+  assert.deepEqual(order, ["tick", "settled"]); // settled resolved only after put
 });
 
 await acheck("a cache read error falls back to the network", async () => {
