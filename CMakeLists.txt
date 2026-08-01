@@ -191,31 +191,25 @@ if (ONNXSIM_C_API)
     endif()
   endforeach()
   add_library(onnxsim_c SHARED onnxsim/capi/onnxsim_c_api.cpp)
-  # onnx (and onnxsim's own contrib_schemas) register operator schemas and shape
-  # inference functions through static initializers -- objects nothing references
-  # directly. With the stack now built static (option 1), the linker would prune
-  # those archive members and leave dangling symbols such as
-  # `onnx::RNNShapeInference`. Force every object of libonnx and onnxsim into
-  # onnxsim_c with --whole-archive so all schemas/inference fns are present.
+  # With the onnx stack built static (option 1) the linker prunes archive members
+  # nothing references directly: onnx's operator schemas and shape-inference fns
+  # (e.g. onnx::RNNShapeInference, self-registered via static initializers) and
+  # onnx.pb.cc (onnx::ModelProto's vtable/typeinfo, referenced only through a
+  # weak COMDAT reference). Whole-archive onnxsim + onnx + onnx_proto so every
+  # such object is retained.
   #
-  # Static option 1: pull the whole onnx stack + onnxsim into onnxsim_c so every
-  # statically-registered object survives.
-  #  * libonnx carries the operator schemas and shape-inference fns (e.g.
-  #    onnx::RNNShapeInference) that self-register via static initializers, so it
-  #    must be whole-archived or the linker prunes them.
-  #  * onnx::ModelProto's vtable/typeinfo live in onnx.pb.cc (libonnx_proto only)
-  #    and are referenced only through a weak COMDAT reference that the linker
-  #    won't use to pull an archive member; whole-archiving onnx_proto forces
-  #    that object in.
-  # The generated onnx-operators *.pb.cc object is archived into BOTH libonnx and
-  # libonnx_proto, so whole-archiving both duplicates its symbols. --allow-
-  # multiple-definition tolerates that: protobuf's per-file descriptor_table
-  # symbols merge to a single copy, whose once-guarded registration then runs
-  # exactly once (no double registration). onnx_optimizer and ONNX Runtime are
-  # referenced directly and link normally.
+  # Use the LINK_LIBRARY genex rather than a raw "-Wl,--whole-archive ... " group
+  # so CMake does not de-duplicate onnx/onnx_proto -- which also arrive
+  # transitively -- back out of the whole-archive group (that de-dup is why a raw
+  # group whole-archived onnx's schemas but dropped onnx_proto's ModelProto
+  # typeinfo). The onnx-operators *.pb.cc object lives in both libonnx and
+  # libonnx_proto, so --allow-multiple-definition tolerates the duplicate:
+  # protobuf's per-file descriptor_table merges to one copy whose once-guarded
+  # registration runs exactly once. onnx_optimizer and ONNX Runtime link normally
+  # (referenced directly / via the Ort:: C++ API through onnxsim's interface).
+  target_link_options(onnxsim_c PRIVATE "LINKER:--allow-multiple-definition")
   target_link_libraries(onnxsim_c PRIVATE
-    "-Wl,--allow-multiple-definition"
-    "-Wl,--whole-archive" onnxsim onnx onnx_proto "-Wl,--no-whole-archive"
+    "$<LINK_LIBRARY:WHOLE_ARCHIVE,onnxsim,onnx,onnx_proto>"
     onnx_optimizer)
   target_include_directories(onnxsim_c PUBLIC onnxsim/capi)
   # The exported symbols opt back into default visibility via ONNXSIM_C_API in
