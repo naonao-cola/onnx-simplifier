@@ -165,7 +165,9 @@ jobs:
           thresholds: '50 75'
       - name: Publish coverage to job summary
         if: ${{ !cancelled() }}
-        run: cat code-coverage-results.md >> "$GITHUB_STEP_SUMMARY"
+        # irongut writes code-coverage-results.md to the repo root, but this job's
+        # default working-directory is ./rust, so reference it by absolute path.
+        run: cat "${GITHUB_WORKSPACE}/code-coverage-results.md" >> "$GITHUB_STEP_SUMMARY"
       - name: Post coverage comment on PR
         if: ${{ !cancelled() && github.event_name == 'pull_request' }}
         continue-on-error: true
