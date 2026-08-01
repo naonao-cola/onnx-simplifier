@@ -217,9 +217,10 @@ cargo llvm-cov report --cobertura --output-path rust-coverage.xml
 
 `cargo-llvm-cov` instruments only the wrapper crates (`onnxsim`,
 `onnxsim-sys`); the C++ core is measured separately by the C++ coverage job.
-In CI this runs as the `coverage` job in
-[`.github/workflows/rust.yml`](../.github/workflows/rust.yml), which uploads the
-HTML/XML reports and posts a summary on pull requests.
+In CI this runs as the `rust` job in
+[`.github/workflows/coverage.yml`](../.github/workflows/coverage.yml), whose
+Cobertura report is folded together with the C++, Python and JS reports into a
+single combined coverage summary and pull-request comment.
 
 The integration test in `onnxsim/tests/` is ignored by default because it needs
 the linked native library and an ONNX model; see the file header to enable it.

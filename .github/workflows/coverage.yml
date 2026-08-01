@@ -1,4 +1,4 @@
-name: Coverage (C++, Python and JS)
+name: Coverage (C++, Python, JS and Rust)
 
 on:
   push:
@@ -9,13 +9,12 @@ on:
   workflow_dispatch:
 
 jobs:
-  coverage:
-    name: Combined C++/Python/JS coverage
+  # C++ + Python + JS coverage from a single pytest run plus the Node suite.
+  # Emits Cobertura reports and hands them to the `report` job below rather than
+  # posting its own comment, so all languages fold into one summary.
+  cpp-python-js:
+    name: C++/Python/JS coverage
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      # Lets the sticky-comment step post/update the coverage summary comment.
-      pull-requests: write
     env:
       CMAKE_GENERATOR: Ninja
       CMAKE_CXX_COMPILER_LAUNCHER: sccache
@@ -72,8 +71,8 @@ jobs:
 
     # JS coverage is independent of the C++/Python build: it runs the
     # convertmodel Node unit tests under c8 (V8 coverage) and emits a Cobertura
-    # report, which we drop next to python.xml/cpp.xml as js.xml so the summary
-    # below folds all three languages into one table.
+    # report, which we drop next to python.xml/cpp.xml as js.xml so the report
+    # job below folds all languages into one table.
     - name: Run JS tests with coverage
       working-directory: scripts/convertmodel
       run: |
@@ -84,7 +83,117 @@ jobs:
         cp scripts/convertmodel/coverage/cobertura-coverage.xml coverage-report/js.xml
         cp -r scripts/convertmodel/coverage coverage-report/js-html
 
-    - name: Upload coverage reports artifact
+    # Hand the reports to the `report` job. Uploading on !cancelled() means a
+    # partial run still contributes whatever XML it produced.
+    - name: Upload C++/Python/JS coverage
+      if: ${{ !cancelled() }}
+      uses: actions/upload-artifact@v7
+      with:
+        name: coverage-cpp-python-js
+        path: coverage-report/
+
+  # Rust line/region coverage for the wrapper crates. It must link the native
+  # library (the safe API's tests call into the C ABI), so it takes the
+  # documented prebuilt-ONNX-Runtime fast path instead of compiling ORT from
+  # source. cargo-llvm-cov instruments only the workspace's own Rust (onnxsim,
+  # onnxsim-sys); the C++ core is measured by the job above. It emits a Cobertura
+  # report that the `report` job folds into the same combined summary.
+  rust:
+    name: Rust coverage (llvm-cov, prebuilt ORT)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    defaults:
+      run:
+        working-directory: rust
+    env:
+      CMAKE_GENERATOR: Ninja
+      CMAKE_CXX_COMPILER_LAUNCHER: sccache
+      SCCACHE_GHA_ENABLED: "on"
+      ACTIONS_CACHE_SERVICE_V2: "on"
+      # Skip compiling ONNX Runtime from source; link a prebuilt release instead.
+      # ONNXSIM_ORT_HOME points at the cached, pre-extracted release below so the
+      # native build never re-downloads it.
+      ONNXSIM_PREBUILT_ORT: "1"
+      ONNXSIM_ORT_HOME: ${{ github.workspace }}/rust/prebuilt-ort/onnxruntime-linux-x64-1.28.0
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - uses: mozilla-actions/sccache-action@v0.0.10
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
+      - name: Install build tools
+        run: sudo apt-get update && sudo apt-get install -y ninja-build
+      # The prebuilt ONNX Runtime release is a single tarball; cache the extracted
+      # tree (keyed by version) so it is downloaded at most once.
+      - name: Cache prebuilt ONNX Runtime
+        id: ort-cache
+        uses: actions/cache@v6
+        with:
+          path: rust/prebuilt-ort
+          key: prebuilt-ort-linux-x64-1.28.0
+      - name: Download prebuilt ONNX Runtime
+        if: steps.ort-cache.outputs.cache-hit != 'true'
+        # Runs in ./rust (this job's default working-directory), so prebuilt-ort
+        # here is the rust/prebuilt-ort the cache tracks.
+        run: |
+          mkdir -p prebuilt-ort
+          curl -L --fail --silent --show-error \
+            -o /tmp/onnxruntime.tgz \
+            https://github.com/microsoft/onnxruntime/releases/download/v1.28.0/onnxruntime-linux-x64-1.28.0.tgz
+          tar -xzf /tmp/onnxruntime.tgz -C prebuilt-ort
+      # Build + run the tests under instrumentation, accumulating profiles across
+      # both the default run and the native-only integration test, then render
+      # one combined report. --no-report defers rendering until every test run's
+      # profiles are collected.
+      - name: Run tests with coverage
+        run: |
+          mkdir -p "${GITHUB_WORKSPACE}/coverage-report"
+          cargo llvm-cov --release --workspace --no-report
+          cargo llvm-cov --release --no-report -- --ignored list_optimizers_is_non_empty
+          cargo llvm-cov report --release \
+            --cobertura --output-path "${GITHUB_WORKSPACE}/coverage-report/rust.xml"
+          cargo llvm-cov report --release \
+            --html --output-dir "${GITHUB_WORKSPACE}/coverage-report/rust-html"
+          cargo llvm-cov report --release --summary-only
+      - name: Upload Rust coverage
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: coverage-rust
+          path: coverage-report/
+
+  # Fold every language's Cobertura report into one summary and one sticky PR
+  # comment. Downloading same-workflow artifacts (rather than reaching across
+  # workflows) keeps the single-comment render reliable.
+  report:
+    name: Combined coverage report
+    needs: [cpp-python-js, rust]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # Lets the sticky-comment step post/update the combined coverage comment.
+      pull-requests: write
+    steps:
+    # Each language's report has disjoint filenames, so extracting both artifacts
+    # into the same directory merges them into one coverage-report/ tree.
+    - name: Download C++/Python/JS coverage
+      uses: actions/download-artifact@v8
+      with:
+        name: coverage-cpp-python-js
+        path: coverage-report
+    - name: Download Rust coverage
+      uses: actions/download-artifact@v8
+      with:
+        name: coverage-rust
+        path: coverage-report
+    - name: Upload combined coverage report artifact
       if: always()
       uses: actions/upload-artifact@v7
       with:
@@ -92,15 +201,15 @@ jobs:
         path: coverage-report/
 
     # Render a combined coverage table from every Cobertura report. irongut
-    # accepts a comma-separated file list, so C++, Python and JS land in one
-    # summary. No external service or secret -- output goes to the job summary
-    # and a PR comment. fail_below_min stays false so coverage never blocks CI;
-    # set it true (with `thresholds`) to enforce a floor.
-    - name: Coverage summary (C++ + Python + JS)
+    # accepts a comma-separated file list, so C++, Python, JS and Rust land in
+    # one summary. No external service or secret -- output goes to the job
+    # summary and a PR comment. fail_below_min stays false so coverage never
+    # blocks CI; set it true (with `thresholds`) to enforce a floor.
+    - name: Coverage summary (C++ + Python + JS + Rust)
       if: ${{ !cancelled() }}
       uses: irongut/CodeCoverageSummary@v1.3.0
       with:
-        filename: coverage-report/cpp.xml,coverage-report/python.xml,coverage-report/js.xml
+        filename: coverage-report/cpp.xml,coverage-report/python.xml,coverage-report/js.xml,coverage-report/rust.xml
         badge: true
         format: markdown
         output: both
@@ -114,8 +223,9 @@ jobs:
       if: ${{ !cancelled() }}
       run: cat code-coverage-results.md >> "$GITHUB_STEP_SUMMARY"
 
-    # Post/update a sticky coverage comment on the PR. continue-on-error keeps CI
-    # green on fork PRs, where the token is read-only and the comment can't post.
+    # Post/update a single sticky coverage comment on the PR. continue-on-error
+    # keeps CI green on fork PRs, where the token is read-only and the comment
+    # can't post.
     - name: Post coverage comment on PR
       if: ${{ !cancelled() && github.event_name == 'pull_request' }}
       continue-on-error: true
