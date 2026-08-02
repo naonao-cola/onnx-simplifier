@@ -34,6 +34,7 @@
 #include "onnx/common/file_utils.h"
 #include "onnx/defs/printer.h"
 #include "onnx/defs/schema.h"
+#include "onnx/inliner/inliner.h"
 #include "onnx/shape_inference/implementation.h"
 #include "onnx/version_converter/convert.h"
 #include "onnxoptimizer/model_util.h"
@@ -1922,12 +1923,58 @@ onnx::ModelProto ConvertOpsetVersion(const onnx::ModelProto& model,
   return onnx::version_conversion::ConvertVersion(model, target_version);
 }
 
+// Shared schema setup for the single-pass debug helpers below, mirroring the
+// head of ``Simplify``: teach shape inference about ONNX Runtime's quantized
+// contrib ops and register permissive placeholders for custom ops exported into
+// the default ONNX domain, so neither shape inference nor a later checker
+// rejects the model. Unlike ``Simplify`` these helpers do not ``Check`` the
+// model up front -- the point of running a step in isolation is to debug a
+// model that may not yet be fully valid.
+void PrepareSchemasForDebug(const onnx::ModelProto& model) {
+  onnxsim::RegisterContribOpSchemas();
+  FixupSchemaDeterminism();
+  RegisterCustomDefaultDomainOpSchemas(model);
+}
+
+onnx::ModelProto InferShapesOnce(const onnx::ModelProto& model) {
+  PrepareSchemasForDebug(model);
+  onnx::ModelProto out = model;
+  _InferShapes(out);
+  return out;
+}
+
+onnx::ModelProto PropagateDataOnce(const onnx::ModelProto& model) {
+  PrepareSchemasForDebug(model);
+  onnx::ModelProto out = model;
+  _EvalPartialShape(out);
+  return out;
+}
+
+onnx::ModelProto FoldConstantOnce(const ModelExecutor& executor,
+                                  const onnx::ModelProto& model,
+                                  size_t tensor_size_threshold,
+                                  bool initializers_as_constants) {
+  PrepareSchemasForDebug(model);
+  // ``_FoldConstant`` reads these globals (tensor-size cap and the
+  // initializers-as-constants policy), just as ``Simplify`` sets them.
+  config.tensor_size_threshold = tensor_size_threshold;
+  config.initializers_as_constants = initializers_as_constants;
+  config.optimizer_passes.clear();
+  onnx::ModelProto out = model;
+  // Mirror ``Simplify``'s FoldConstant step: partial shape evaluation first
+  // turns Shape/Gather-on-shape into constants that the ordinary constant
+  // folder can then propagate.
+  _EvalPartialShape(out);
+  out = _FoldConstant(executor, out);
+  return out;
+}
+
 onnx::ModelProto Simplify(
     const ModelExecutor& executor, const onnx::ModelProto& model,
     std::optional<std::vector<std::string>> skip_optimizers,
     bool constant_folding, bool shape_inference, size_t tensor_size_threshold,
     std::optional<int> target_opset_version, const GraphRewriter* rewriter,
-    bool initializers_as_constants) {
+    bool initializers_as_constants, bool include_inline_functions) {
   // Make shape inference aware of ONNX Runtime's quantized contrib operators
   // (QLinearAdd and friends) so shape deduction does not stop at them.
   onnxsim::RegisterContribOpSchemas();
@@ -2118,6 +2165,15 @@ onnx::ModelProto Simplify(
   // The fixed points mutate in place, so make one working copy of the (const)
   // input model and simplify it in place.
   onnx::ModelProto sim_model = model;
+  // Optionally inline the model's local (model-defined) functions into the main
+  // graph up front, so the optimizer, shape inference and constant folding
+  // below see through them into a flat op graph. Done before the opset
+  // conversion and fixed point so everything downstream operates on the inlined
+  // graph; schema-defined functions are left untouched. Off by default, so a
+  // model with functions is otherwise simplified exactly as before.
+  if (include_inline_functions) {
+    onnx::inliner::InlineLocalFunctions(sim_model);
+  }
   // Optionally convert the model to a different opset version (of the default
   // ONNX domain) first, so the simplification below can clean up any redundant
   // nodes the version converter introduces.
@@ -2154,14 +2210,15 @@ void SimplifyPath(const ModelExecutor& executor, const std::string& in_path,
                   bool constant_folding, bool shape_inference,
                   size_t tensor_size_threshold,
                   std::optional<int> target_opset_version,
-                  const GraphRewriter* rewriter,
-                  bool initializers_as_constants) {
+                  const GraphRewriter* rewriter, bool initializers_as_constants,
+                  bool include_inline_functions) {
   onnx::ModelProto model;
   onnx::optimization::loadModel(&model, in_path, true);
 
-  model = Simplify(executor, model, skip_optimizers, constant_folding,
-                   shape_inference, tensor_size_threshold, target_opset_version,
-                   rewriter, initializers_as_constants);
+  model =
+      Simplify(executor, model, skip_optimizers, constant_folding,
+               shape_inference, tensor_size_threshold, target_opset_version,
+               rewriter, initializers_as_constants, include_inline_functions);
 
   onnx::optimization::saveModel(&model, out_path, true, "");
 }

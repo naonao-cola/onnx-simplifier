@@ -143,7 +143,10 @@ jobs:
       - name: Build and embed Netron
         env:
           NETRON_REPO: https://github.com/onnxsim/netron
-          NETRON_REF: claude/wasm-netron-visualization-c4ppnv
+          # Netron 9.1.9 + the embedding protocol, now also exposing an
+          # `export` command so the page's "export SVG" buttons can save the
+          # rendered graph (see the onnxsim/netron branch / docs/embedding.md).
+          NETRON_REF: claude/wasm-netron-svg-export
         run: |
           git clone --depth 1 --branch "$NETRON_REF" "$NETRON_REPO" netron-src
           (cd netron-src && node package.js build web)

@@ -24,7 +24,7 @@ const TRUNCATED_PREFIX =
 
 // The fixed (non-log) lines of the issue body, built from the page context and
 // the most recent conversion parameters (`runInfo`, may be null).
-function headerLines({ pageUrl, userAgent, runInfo }) {
+function headerLines({ pageUrl, userAgent, runInfo, versions }) {
   const lines = [];
   lines.push("**Describe the bug**");
   lines.push("<!-- A clear and concise description of what went wrong. -->");
@@ -36,11 +36,20 @@ function headerLines({ pageUrl, userAgent, runInfo }) {
   lines.push("**Environment (WASM converter)**");
   lines.push("- Page: " + (pageUrl || "(unknown)"));
   lines.push("- User agent: " + (userAgent || "(unknown)"));
+  // Library versions baked into the module (from onnxsim_versions), so the
+  // report says exactly which onnxsim / onnx-optimizer / onnx / protobuf ran.
+  if (versions) {
+    lines.push("- onnxsim: " + (versions.onnxsim || "unknown"));
+    lines.push("- onnx-optimizer: " + (versions.onnx_optimizer || "unknown"));
+    lines.push("- onnx: " + (versions.onnx || "unknown"));
+    lines.push("- protobuf: " + (versions.protobuf || "unknown"));
+  }
   if (runInfo) {
     lines.push("- Optimizer: " + runInfo.optimizer);
     lines.push("- File: " + runInfo.file_name);
     lines.push("- constant fold: " + runInfo.constant_fold);
     lines.push("- shape inference: " + runInfo.shape_inference);
+    lines.push("- inline functions: " + runInfo.inline_functions);
     lines.push("- tensor size threshold: " + runInfo.tensor_size_threshold);
     lines.push("- target opset version: " + runInfo.target_opset_version + " (0 = keep)");
     if (runInfo.passes && runInfo.passes.length) {

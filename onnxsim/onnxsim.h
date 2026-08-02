@@ -86,13 +86,40 @@ std::shared_ptr<const ModelExecutor> GetBuiltinModelExecutor();
 // as non-constant, so nodes rooted only at initializers are left in the graph
 // and their weights survive simplification as tunable tensors; ``Constant``
 // nodes are still treated as constants either way.
+// ``include_inline_functions`` (default false) inlines the model's local
+// (model-defined) functions into the main graph before simplifying, via onnx's
+// inliner. This flattens function calls into plain ops so the optimizer, shape
+// inference and constant folding can see through them; schema-defined
+// (built-in) functions are left alone. With the default the model's functions
+// are left untouched.
 onnx::ModelProto Simplify(
     const ModelExecutor& executor, const onnx::ModelProto& model,
     std::optional<std::vector<std::string>> skip_optimizers,
     bool constant_folding, bool shape_inference, size_t tensor_size_threshold,
     std::optional<int> target_opset_version = std::nullopt,
     const GraphRewriter* rewriter = nullptr,
-    bool initializers_as_constants = true);
+    bool initializers_as_constants = true,
+    bool include_inline_functions = false);
+
+// Debugging helpers: run a *single* one of the transforms that ``Simplify``
+// otherwise drives to a fixed point, once, on a copy of ``model``, and return
+// the result. They let a caller inspect the isolated effect of a step (e.g. the
+// WASM converter's "run a single feature" panel) instead of the whole
+// fixed-point simplification. The input model is never mutated.
+//
+// ``InferShapesOnce`` runs ONNX shape inference (populates value_info / output
+// types). ``PropagateDataOnce`` runs onnxsim's partial-shape / data-propagation
+// pass, which rewrites nodes whose output value became statically known into
+// ``Constant`` nodes. ``FoldConstantOnce`` runs the same partial-shape pass and
+// then one constant-folding round through ``executor`` (so it needs a model
+// executor, exactly like ``Simplify``); ``tensor_size_threshold`` caps the size
+// of tensors that folding may materialize, matching ``Simplify``'s parameter.
+onnx::ModelProto InferShapesOnce(const onnx::ModelProto& model);
+onnx::ModelProto PropagateDataOnce(const onnx::ModelProto& model);
+onnx::ModelProto FoldConstantOnce(const ModelExecutor& executor,
+                                  const onnx::ModelProto& model,
+                                  size_t tensor_size_threshold,
+                                  bool initializers_as_constants = true);
 
 void SimplifyPath(const ModelExecutor& executor, const std::string& in_path,
                   const std::string& out_path,
@@ -101,4 +128,5 @@ void SimplifyPath(const ModelExecutor& executor, const std::string& in_path,
                   size_t tensor_size_threshold,
                   std::optional<int> target_opset_version = std::nullopt,
                   const GraphRewriter* rewriter = nullptr,
-                  bool initializers_as_constants = true);
+                  bool initializers_as_constants = true,
+                  bool include_inline_functions = false);

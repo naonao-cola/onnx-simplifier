@@ -11,10 +11,11 @@
 // on `window.__onnxsimConverted` (set in index.html when a conversion
 // finishes); "original" reads the file input directly.
 
-import { runInference } from "./inference_core.mjs";
+import { runInference, compareInference } from "./inference_core.mjs";
 import { summarizeOrtTrace } from "./trace_build.mjs";
 import { renderTrace } from "./trace_viewer.mjs";
 import { downloadText } from "./download.mjs";
+import { providersForEp, isWebnnEp, detectWebnn, formatWebnnStatus } from "./webnn.mjs";
 import {
   readAnnotations,
   perOpSummary,
@@ -29,17 +30,24 @@ import {
 const ORT_VERSION = "1.27.0";
 const ORT_BASE = `https://cdn.jsdelivr.net/npm/onnxruntime-web@${ORT_VERSION}/dist/`;
 
-let ortPromise = null;
-function loadOrt() {
-  if (!ortPromise) {
-    ortPromise = import(/* @vite-ignore */ `${ORT_BASE}ort.min.mjs`).then((m) => {
+// onnxruntime-web ships several EP bundles. The default (`ort.min.mjs`) carries
+// WASM + WebGPU; WebNN lives only in the "all" bundle (`ort.all.min.mjs`). Both
+// use the same JSEP wasm artifacts from ORT_BASE, so switching bundles keeps
+// wasmPaths valid. We load the WebNN bundle on demand (only when a WebNN EP is
+// picked) so the common WebGPU/WASM path keeps its smaller download.
+const ORT_BUNDLE = { default: "ort.min.mjs", all: "ort.all.min.mjs" };
+const ortPromises = {};
+function loadOrt(variant = "default") {
+  if (!ortPromises[variant]) {
+    const file = ORT_BUNDLE[variant] || ORT_BUNDLE.default;
+    ortPromises[variant] = import(/* @vite-ignore */ `${ORT_BASE}${file}`).then((m) => {
       const ort = m.default ?? m;
       // Pull the matching wasm binaries from the same CDN directory.
       ort.env.wasm.wasmPaths = ORT_BASE;
       return ort;
     });
   }
-  return ortPromise;
+  return ortPromises[variant];
 }
 
 const TYPED_ARRAY = {
@@ -73,7 +81,31 @@ function concreteShape(shape, batch = 1) {
   });
 }
 
-function makeDummyInputs(ort, session, batch = 1) {
+// Fill a float typed-array in place with small deterministic pseudo-random
+// values in [-1, 1) (a seeded xorshift32, so every call produces the same
+// sequence). Used by the before/after comparison: all-zero inputs can mask a
+// divergence introduced by a graph change (many ops map 0 -> 0), whereas varied
+// inputs actually exercise the graph. Integer/bool inputs are left at zero,
+// which is the safe default for index-like tensors (Gather, etc.) where an
+// arbitrary value could go out of bounds. Determinism matters because
+// runInference() re-feeds the same tensor every iteration and asserts the output
+// never changes.
+function fillPseudoRandom(arr, type) {
+  if (type !== "float32" && type !== "float64") return; // zeros for ints/bool
+  let s = 0x2545f491; // fixed non-zero seed
+  for (let i = 0; i < arr.length; i++) {
+    // xorshift32 (bitwise ops keep `s` a 32-bit signed int throughout).
+    s ^= s << 13;
+    s ^= s >>> 17;
+    s ^= s << 5;
+    arr[i] = s / 0x80000000; // 32-bit signed / 2^31 -> [-1, 1)
+  }
+}
+
+// Build a feeds object for every model input. `fill` is "zero" (the default,
+// matching a plain single-model run) or "random" (deterministic non-zero float
+// values, used by the compare path so the before/after diff is meaningful).
+function makeDummyInputs(ort, session, batch = 1, fill = "zero") {
   const feeds = {};
   for (const meta of session.inputMetadata) {
     if (!meta.isTensor) {
@@ -83,25 +115,26 @@ function makeDummyInputs(ort, session, batch = 1) {
     const count = dims.reduce((a, b) => a * b, 1);
     const Ctor = TYPED_ARRAY[meta.type];
     if (!Ctor) throw new Error(`unsupported input type '${meta.type}'`);
-    feeds[meta.name] = new ort.Tensor(meta.type, new Ctor(count), dims);
+    const buf = new Ctor(count);
+    if (fill === "random") fillPseudoRandom(buf, meta.type);
+    feeds[meta.name] = new ort.Tensor(meta.type, buf, dims);
   }
   return feeds;
 }
 
-async function runOnModel(modelBytes, { iterations, batch, preferWebGPU, profile }, log) {
-  const ort = await loadOrt();
-  const providers = preferWebGPU ? ["webgpu", "wasm"] : ["wasm"];
-
-  // Build inputs from a throwaway wasm session's metadata (cheap and always
-  // available), then run the real iterations through the chosen provider.
+// Build the dummy inputs for a model from a throwaway wasm session's metadata
+// (cheap and always available) and report the leading (batch) input. Shared by
+// the single-model and compare paths so the compare path can build ONE set of
+// inputs and feed the SAME tensor to both models. Returns
+// { feeds, inputName, leadMeta, leadingDynamic }.
+async function prepareInputs(ort, modelBytes, batch, fill, log) {
   const metaSession = await ort.InferenceSession.create(modelBytes, {
     executionProviders: ["wasm"],
   });
-  const feeds = makeDummyInputs(ort, metaSession, batch);
+  const feeds = makeDummyInputs(ort, metaSession, batch, fill);
   const inputName = metaSession.inputNames[0];
   const leadMeta = metaSession.inputMetadata.find((mm) => mm.name === inputName);
   const leadingDynamic = isDynamicDim(leadMeta?.shape?.[0]);
-  log(`input '${inputName}' dims [${feeds[inputName].dims.join(", ")}]`);
   // Explain a dropped batch request: onnxruntime enforces a model's declared
   // static shapes, so a fixed leading dimension can't be resized here.
   if (batch > 1 && !leadingDynamic) {
@@ -111,11 +144,29 @@ async function runOnModel(modelBytes, { iterations, batch, preferWebGPU, profile
         `dynamic batch axis to change it.`,
     );
   }
+  return { feeds, inputName, leadMeta, leadingDynamic };
+}
+
+async function runOnModel(modelBytes, { iterations, batch, providers, needWebnn, profile }, log) {
+  const ort = await loadOrt(needWebnn ? "all" : "default");
+
+  const { feeds, inputName, leadingDynamic } = await prepareInputs(
+    ort,
+    modelBytes,
+    batch,
+    "zero",
+    log,
+  );
+  log(`input '${inputName}' dims [${feeds[inputName].dims.join(", ")}]`);
 
   const res = await runInference(ort, {
     model: modelBytes,
     inputName,
     input: feeds[inputName],
+    // Feed *all* the model's inputs, not just the first — a multi-input model
+    // (e.g. a MatMul with a separate weight input) otherwise fails with
+    // "input '<name>' is missing in 'feeds'".
+    feeds,
     providers,
     iterations,
     profile,
@@ -126,6 +177,49 @@ async function runOnModel(modelBytes, { iterations, batch, preferWebGPU, profile
   // leaves the metrics untouched (batch is a no-op there).
   res.batchScale = leadingDynamic ? batch : 1;
   return res;
+}
+
+// Run the "compare (before vs after)" path: feed ONE shared, deterministic
+// input to both the original and converted models and report how far their
+// outputs diverge plus the speed difference. Building the input from the
+// original model (whose I/O the conversion preserves) and reusing the exact same
+// tensor for both isolates the effect of the graph change.
+async function runCompare(
+  originalBytes,
+  convertedBytes,
+  { iterations, batch, providers, needWebnn, profile },
+  log,
+) {
+  const ort = await loadOrt(needWebnn ? "all" : "default");
+
+  const { feeds, inputName, leadingDynamic } = await prepareInputs(
+    ort,
+    originalBytes,
+    batch,
+    "random",
+    log,
+  );
+  const input = feeds[inputName];
+  log(`shared input '${inputName}' dims [${input.dims.join(", ")}] (deterministic)`);
+
+  const cmp = await compareInference(ort, {
+    before: { model: originalBytes, label: "original" },
+    after: { model: convertedBytes, label: "converted" },
+    inputName,
+    input,
+    // Feed *all* the model's inputs to both models (multi-input models otherwise
+    // fail with "input '<name>' is missing in 'feeds'"); the conversion
+    // preserves the model's I/O, so the original's feeds fit the converted model.
+    feeds,
+    providers,
+    iterations,
+    profile,
+    onLog: log,
+  });
+  const batchScale = leadingDynamic ? batch : 1;
+  cmp.before.batchScale = batchScale;
+  cmp.after.batchScale = batchScale;
+  return cmp;
 }
 
 // Resolve the model bytes for the chosen source. "converted" uses the bytes the
@@ -274,6 +368,93 @@ function renderMacs(container, log, bytes, res) {
   }
 }
 
+// Read a model's annotated per-sample MACs (onnxsim PR #527 metadata_props),
+// or null when the model carries none / can't be parsed.
+function modelMacs(bytes) {
+  try {
+    const ann = readAnnotations(bytes);
+    return ann.annotated ? evalMetric(ann.model.macs) : null;
+  } catch {
+    return null;
+  }
+}
+
+// Render the before/after comparison summary into `container`: a verdict on
+// whether the conversion preserved the numerics (max |Δ| vs tolerance), the
+// per-iteration latency of each model with the resulting speedup, and — when
+// both models are MAC-annotated — the MAC reduction. `cmp` is the object from
+// runCompare()/compareInference(). Also logs a compact text summary.
+function renderCompare(container, log, originalBytes, convertedBytes, cmp, tolerance) {
+  const { before, after, maxAbsDiff, dimsMatch, comparable, equivalent, speedup } = cmp;
+
+  const diffStr = comparable ? maxAbsDiff.toExponential(3) : "n/a";
+  let verdictText;
+  let verdictClass;
+  if (!comparable) {
+    verdictText = "outputs not comparable (shape/length differ)";
+    verdictClass = "cmp-warn";
+  } else if (equivalent) {
+    verdictText = `equivalent — max |Δ| = ${diffStr} ≤ ${tolerance}`;
+    verdictClass = "cmp-ok";
+  } else {
+    verdictText = `differs — max |Δ| = ${diffStr} > ${tolerance}`;
+    verdictClass = "cmp-bad";
+  }
+
+  const speedStr =
+    speedup != null
+      ? `${speedup.toFixed(2)}× ${speedup >= 1 ? "faster" : "slower"}`
+      : "—";
+  const dimsStr = `[${(before.dims || []).join(", ")}]${
+    dimsMatch ? "" : ` vs [${(after.dims || []).join(", ")}]`
+  }`;
+
+  const macsBefore = modelMacs(originalBytes);
+  const macsAfter = modelMacs(convertedBytes);
+  const macsCell =
+    macsBefore != null && macsAfter != null
+      ? `${humanNum(macsBefore)} → ${humanNum(macsAfter)}` +
+        (macsBefore > 0
+          ? ` (${(((macsBefore - macsAfter) / macsBefore) * 100).toFixed(1)}% fewer)`
+          : "")
+      : "annotate model info to compare";
+
+  const rows = [
+    ["Outputs", verdictText, verdictClass],
+    ["Output dims", `${dimsStr}${dimsMatch ? " (match)" : " (differ)"}`, ""],
+    [
+      "Latency",
+      `before ${before.avgMs.toFixed(2)} ms, after ${after.avgMs.toFixed(2)} ms → ${speedStr}`,
+      "",
+    ],
+    ["MACs", macsCell, ""],
+  ];
+  container.innerHTML =
+    `<table class="macs-table cmp-table"><tbody>` +
+    rows
+      .map(
+        ([k, v, cls]) =>
+          `<tr><th>${k}</th><td class="${cls}">${v}</td></tr>`,
+      )
+      .join("") +
+    `</tbody></table>` +
+    `<p class="macs-note">Both models run on the <b>same</b> deterministic input ` +
+    `(dynamic axes sized from the batch control); a small max |Δ| means the ` +
+    `conversion preserved the model's numerics. Speedup = before ÷ after average ` +
+    `<code>session.run</code> latency on '${after.ep}'.</p>`;
+
+  log("── comparison (before vs after conversion) ──");
+  log(`outputs: ${verdictText}`);
+  log(`output dims: ${dimsStr}${dimsMatch ? " (match)" : " (differ)"}`);
+  log(
+    `speed: before ${before.avgMs.toFixed(2)} ms/iter, after ` +
+      `${after.avgMs.toFixed(2)} ms/iter → ${speedStr}`,
+  );
+  if (macsBefore != null && macsAfter != null) {
+    log(`MACs: ${macsCell}`);
+  }
+}
+
 export function initInferencePanel() {
   const btn = document.getElementById("run-inference");
   const out = document.getElementById("inference-output");
@@ -286,6 +467,7 @@ export function initInferencePanel() {
   const traceContainer = document.getElementById("inference-trace");
   const macsContainer = document.getElementById("inference-macs");
   const dlLogBtn = document.getElementById("download-inference-log-button");
+  const webnnStatusEl = document.getElementById("webnn-status");
   if (!btn) return;
 
   // The inference output is a readonly textarea (mirroring the simplify console
@@ -294,6 +476,26 @@ export function initInferencePanel() {
     out.value += msg + "\n";
     out.scrollTop = out.scrollHeight;
   };
+
+  // Probe the WebNN API once at load and show a live status next to the EP
+  // picker, so a user can see whether the WebNN options will actually run
+  // before selecting one. detectWebnn never throws.
+  if (webnnStatusEl) {
+    webnnStatusEl.textContent = "WebNN status: probing…";
+    detectWebnn()
+      .then((report) => {
+        webnnStatusEl.textContent = formatWebnnStatus(report);
+        webnnStatusEl.title = report.apiPresent
+          ? `device availability — ${["gpu", "npu", "cpu"]
+              .map((d) => `${d}: ${report.devices[d] ? "yes" : "no"}`)
+              .join(", ")}`
+          : "";
+      })
+      .catch(() => {
+        webnnStatusEl.textContent =
+          "WebNN status: ❌ could not probe navigator.ml.";
+      });
+  }
 
   if (dlLogBtn) {
     dlLogBtn.addEventListener("click", () => {
@@ -308,11 +510,52 @@ export function initInferencePanel() {
     if (macsContainer) macsContainer.innerHTML = "";
     try {
       const source = sourceSelect ? sourceSelect.value : "original";
-      const { bytes, label } = await resolveModelBytes(source, fileInput);
       const iterations = Math.max(1, parseInt(itersInput.value, 10) || 5);
       const batch = Math.max(1, parseInt(batchInput ? batchInput.value : "1", 10) || 1);
-      const preferWebGPU = epSelect.value === "webgpu";
+      const epValue = epSelect.value;
+      const { providers, needWebnn } = providersForEp(epValue);
       const profile = !profileChk || profileChk.checked;
+
+      if (isWebnnEp(epValue)) {
+        log(
+          "WebNN is experimental; falling back to WASM if the WebNN device " +
+            "or an operator is unsupported.",
+        );
+      }
+
+      // "compare (before vs after)" runs both the original and converted models
+      // on one shared input and reports how far their outputs diverge plus the
+      // speed difference — the verification the rest of the panel can't give
+      // from a single model.
+      if (source === "compare") {
+        const original = await resolveModelBytes("original", fileInput);
+        const converted = await resolveModelBytes("converted", fileInput);
+        const tolerance = 1e-3;
+        log(`comparing ${original.label} vs ${converted.label}`);
+        log(`loading onnxruntime-web ${ORT_VERSION}…`);
+        const cmp = await runCompare(
+          original.bytes,
+          converted.bytes,
+          { iterations, batch, providers, needWebnn, profile },
+          log,
+        );
+        log(
+          `PASS: ran both models ${cmp.after.iterations} iterations on ` +
+            `'${cmp.after.ep}'`,
+        );
+        if (macsContainer) {
+          renderCompare(macsContainer, log, original.bytes, converted.bytes, cmp, tolerance);
+        }
+        if (profile && cmp.after.trace && traceContainer) {
+          renderTrace(traceContainer, cmp.after.trace, {
+            title: `onnxruntime-web ${cmp.after.ep} inference (converted)`,
+            filename: `onnxruntime-web.${cmp.after.ep}.converted.trace.json`,
+          });
+        }
+        return;
+      }
+
+      const { bytes, label } = await resolveModelBytes(source, fileInput);
       log(`running ${label}`);
       // Static MACs/FLOPs from the model's onnxsim metadata_props (PR #527),
       // shown before the run so they appear even if inference fails.
@@ -320,7 +563,7 @@ export function initInferencePanel() {
       log(`loading onnxruntime-web ${ORT_VERSION}…`);
       const res = await runOnModel(
         bytes,
-        { iterations, batch, preferWebGPU, profile },
+        { iterations, batch, providers, needWebnn, profile },
         log,
       );
       log(

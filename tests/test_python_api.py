@@ -1400,3 +1400,58 @@ def test_initializers_as_non_constants_keeps_initializer_node():
     # W stays an initializer, and K has been folded into one too.
     init_names = {i.name for i in sim_model.graph.initializer}
     assert "W" in init_names
+
+
+def _model_with_local_function() -> onnx.ModelProto:
+    # A model whose main graph calls a single model-defined (local) function
+    # ``custom.AddRelu`` -- authored via the ONNX text form so the FunctionProto
+    # rides along in ``model.functions``.
+    from onnx import parser
+
+    return parser.parse_model(
+        """
+        <
+          ir_version: 10,
+          opset_import: ["": 18, "custom": 1]
+        >
+        agraph (float[N] X) => (float[N] Y) {
+          Y = custom.AddRelu(X)
+        }
+        <
+          domain: "custom",
+          opset_import: ["": 18]
+        >
+        AddRelu (x) => (y) {
+          one = Constant<value = float {1.0}>()
+          shifted = Add(x, one)
+          y = Relu(shifted)
+        }
+        """
+    )
+
+
+def test_inline_functions_disabled_by_default_keeps_function():
+    # Without inline_functions the local function is preserved: the graph still
+    # calls custom.AddRelu and the FunctionProto stays in model.functions.
+    model = _model_with_local_function()
+    sim_model, ok = onnxsim.simplify(model, check_n=0)
+    assert ok
+    op_types = [n.op_type for n in sim_model.graph.node]
+    assert op_types == ["AddRelu"]
+    assert sim_model.graph.node[0].domain == "custom"
+    assert [f.name for f in sim_model.functions] == ["AddRelu"]
+
+
+def test_inline_functions_flattens_local_function():
+    # With inline_functions the call site is replaced by the function body (Add +
+    # Relu, with the folded constant), and the function is removed from the model
+    # so the optimizer and constant folding can act on the flattened graph.
+    model = _model_with_local_function()
+    sim_model, ok = onnxsim.simplify(model, inline_functions=True, check_n=0)
+    assert ok
+    op_types = [n.op_type for n in sim_model.graph.node]
+    assert "AddRelu" not in op_types
+    # The inlined body survives as plain ops (the +1 bias folds into an Add
+    # initializer/Constant, followed by Relu).
+    assert "Relu" in op_types
+    assert len(sim_model.functions) == 0

@@ -1,8 +1,29 @@
+import os
+
 import onnxruntime
+import pytest
 import timm
 import torch
 
 from onnxsim.test_utils import export_simplify_and_check_by_python_api
+
+# These two timm exports are slow, so they only run on master-branch pushes
+# (post-merge validation) -- they are skipped on pull-request CI. They also run
+# locally, where GITHUB_EVENT_NAME is unset, so developers can exercise them on
+# demand.
+#
+# GitHub Actions sets GITHUB_EVENT_NAME/GITHUB_REF. Inside the Linux cibuildwheel
+# container these are only visible because build-and-test.yml lists them in
+# CIBW_ENVIRONMENT_PASS_LINUX.
+_event = os.environ.get("GITHUB_EVENT_NAME")
+_is_mainline_push = _event == "push" and os.environ.get("GITHUB_REF") in (
+    "refs/heads/master",
+    "refs/heads/main",
+)
+skip_on_pr_ci = pytest.mark.skipif(
+    _event is not None and not _is_mainline_push,
+    reason="Skipped on PR CI; runs on master-branch pushes and locally.",
+)
 
 
 # From https://github.com/onnxsim/onnxsim/issues/307
@@ -10,6 +31,7 @@ from onnxsim.test_utils import export_simplify_and_check_by_python_api
 # swin_tiny_patch4_window7_224 is also one of the two models named in NVIDIA
 # Model Optimizer's onnx_ptq example (download_example_onnx.py); see
 # test_vit_base_patch16_224 below for the other one.
+@skip_on_pr_ci
 def test_swin():
     model = timm.create_model(
         "swin_tiny_patch4_window7_224", pretrained=False, num_classes=1000
@@ -46,6 +68,7 @@ def test_swin():
 # This test reproduces that export (with pretrained=False so no weights need to
 # be downloaded -- the weight values don't affect the graph onnxsim simplifies)
 # and confirms onnxsim can simplify the result.
+@skip_on_pr_ci
 def test_vit_base_patch16_224():
     model = timm.create_model(
         "vit_base_patch16_224", pretrained=False, num_classes=1000
