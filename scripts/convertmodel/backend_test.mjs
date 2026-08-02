@@ -21,6 +21,35 @@ import { syncInputUrl } from "./query_params.mjs";
 const ORT_VERSION = "1.27.0";
 const ORT_BASE = `https://cdn.jsdelivr.net/npm/onnxruntime-web@${ORT_VERSION}/dist/`;
 
+// A curated set of common ONNX backend *node* test cases for the picker, like
+// the Hugging Face model dropdown. Each entry's value is the GitHub tree URL of
+// the test-case directory; the free-text box accepts any other URL. The base is
+// onnx/onnx@main's node-test data directory.
+const BACKEND_NODE_BASE =
+  "https://github.com/onnx/onnx/tree/main/onnx/backend/test/data/node/";
+export const BACKEND_PRESETS = [
+  "test_relu",
+  "test_sigmoid",
+  "test_tanh",
+  "test_abs",
+  "test_exp",
+  "test_log",
+  "test_softmax_example",
+  "test_add",
+  "test_sub",
+  "test_mul",
+  "test_div",
+  "test_matmul_2d",
+  "test_gemm_default_zero_bias",
+  "test_transpose_default",
+  "test_concat_1d_axis_0",
+  "test_conv_with_strides_no_padding",
+  "test_basic_conv_with_padding",
+  "test_maxpool_2d_default",
+  "test_averagepool_2d_default",
+  "test_reduce_mean_default_axes_keepdims_example",
+].map((name) => ({ name, url: BACKEND_NODE_BASE + name }));
+
 // ONNX TensorProto.DataType -> onnxruntime-web tensor type + the typed-array
 // constructor over the raw little-endian bytes. STRING/COMPLEX are unbridged
 // (the module's parser rejects them before we get here).
@@ -349,6 +378,7 @@ async function runBackendTest(url, tol, epPref, convert, log) {
 
 function initBackendPanel() {
   const btn = document.getElementById("backend-run");
+  const select = document.getElementById("backend-select");
   const urlInput = document.getElementById("backend-url");
   const epSelect = document.getElementById("backend-ep");
   const atolInput = document.getElementById("backend-atol");
@@ -356,7 +386,23 @@ function initBackendPanel() {
   const out = document.getElementById("backend-output");
   const dlBtn = document.getElementById("backend-download-log");
   const convertChk = document.getElementById("backend-convert");
+  const statusEl = document.getElementById("backend-status");
   if (!btn) return;
+
+  // Populate the preset picker and mirror a pick into the free-text box, so the
+  // two never disagree about what "Run test case" will fetch (like the Hugging
+  // Face model dropdown / text box pair).
+  if (select) {
+    for (const { name, url } of BACKEND_PRESETS) {
+      const opt = document.createElement("option");
+      opt.value = url;
+      opt.textContent = name.replace(/^test_/, "");
+      select.appendChild(opt);
+    }
+    select.addEventListener("change", () => {
+      if (select.value && urlInput) urlInput.value = select.value;
+    });
+  }
 
   const log = (msg) => {
     if (!out) return;
@@ -370,6 +416,7 @@ function initBackendPanel() {
   btn.addEventListener("click", async () => {
     btn.disabled = true;
     if (out) out.value = "";
+    if (statusEl) statusEl.textContent = "running…";
     try {
       const tol = {
         atol: parseFloat(atolInput ? atolInput.value : "") || 1e-4,
@@ -377,9 +424,11 @@ function initBackendPanel() {
       };
       const epPref = epSelect ? epSelect.value : "wasm";
       const convert = convertChk ? convertChk.checked : false;
-      await runBackendTest(urlInput ? urlInput.value : "", tol, epPref, convert, log);
+      const passed = await runBackendTest(urlInput ? urlInput.value : "", tol, epPref, convert, log);
+      if (statusEl) statusEl.textContent = passed ? "PASS ✅" : "FAIL ❌";
     } catch (e) {
       log("ERROR: " + (e && e.message ? e.message : String(e)));
+      if (statusEl) statusEl.textContent = "error — see output";
     } finally {
       btn.disabled = false;
     }

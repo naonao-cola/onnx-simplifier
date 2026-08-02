@@ -379,6 +379,44 @@ agraph (float[N] X) =&gt; (float[N] Y) {
                 </div>
             </div>
         </div>
+        <div id="backend-loader" style="margin-top: 0.6em;">
+            <label for="backend-select">…or run an
+                <a href="https://github.com/onnx/onnx/tree/main/onnx/backend/test/data" target="_blank" rel="noopener">ONNX backend test case</a>:</label>
+            <select id="backend-select">
+                <option value="">— pick a backend node test —</option>
+            </select>
+            <input type="text" id="backend-url" size="52"
+                placeholder="…or a GitHub tree / raw URL to a test-case directory">
+            <button id="backend-run" type="button">Run test case</button>
+            <span id="backend-status"></span>
+            <div style="color: #666; font-size: 0.85em; margin-top: 0.25em;">
+                Fetches <code>model.onnx</code> and the test data
+                (<code>test_data_set_N/</code> of <code>input_*.pb</code> /
+                <code>output_*.pb</code>) from GitHub, runs the model through
+                onnxruntime-web <b>with the test inputs</b>, and checks each output
+                against the expected tensor within tolerance. Pick a preset above or
+                paste a GitHub <code>tree</code> / <code>raw.githubusercontent.com</code>
+                URL; listing uses GitHub's public (rate-limited) API. With
+                <b>convert the model</b> on, the fetched model is also run through the
+                selected convert mode below (and shown in the Netron panes).
+            </div>
+            <div style="margin-top: 0.25em;">
+                <input type="checkbox" id="backend-convert" checked>
+                <label for="backend-convert">convert the model too</label>
+                <label for="backend-ep" style="margin-left: 0.6em;">execution provider</label>
+                <select id="backend-ep">
+                    <option value="wasm">WASM</option>
+                    <option value="webgpu">WebGPU (fallback to WASM)</option>
+                </select>
+                <label for="backend-atol" style="margin-left: 0.4em;">atol</label>
+                <input type="number" id="backend-atol" value="0.0001" step="any" style="width: 6em;">
+                <label for="backend-rtol">rtol</label>
+                <input type="number" id="backend-rtol" value="0.001" step="any" style="width: 6em;">
+                <button id="backend-download-log" type="button">Download log</button>
+            </div>
+            <textarea id="backend-output" readonly rows="8" style="width: 100%; box-sizing: border-box; margin-top: 0.25em;"></textarea>
+        </div>
+        <script type="module" src="./backend_test.mjs"></script>
         <div>
             <input type="radio" name="optimizer" value="simplify" id="optimizer_simplify" checked>
             <label for="optimizer_simplify">
@@ -573,47 +611,5 @@ agraph (float[N] X) =&gt; (float[N] Y) {
         <div id="inference-trace"></div>
         <script type="module" src="./inference_browser.mjs"></script>
 
-        <h2>Run an ONNX backend test case</h2>
-        <div class="tool-panel">
-            <p class="tool-note">
-                Paste a URL to an
-                <a href="https://github.com/onnx/onnx/tree/main/onnx/backend/test/data" target="_blank" rel="noopener">ONNX backend test case</a>
-                directory (a folder holding <code>model.onnx</code> and one or more
-                <code>test_data_set_N/</code> of <code>input_*.pb</code> /
-                <code>output_*.pb</code>). The model and its test data are fetched from
-                GitHub, the model is run through onnxruntime-web with the given inputs,
-                and each output is compared with the expected tensor within tolerance.
-                GitHub <code>tree</code> URLs and <code>raw.githubusercontent.com</code>
-                URLs both work; listing uses GitHub's public (rate-limited) API.
-                With <b>convert the model</b> on, the fetched <code>model.onnx</code>
-                is also sent straight through the Simplify / Optimize path above (and
-                shown in the Netron panes), so a backend test case doubles as a
-                converter input.
-            </p>
-            <div class="debug-actions">
-                <input type="text" id="backend-url" size="70"
-                    placeholder="https://github.com/onnx/onnx/tree/main/onnx/backend/test/data/node/test_relu"
-                    style="flex: 1 1 30em;">
-            </div>
-            <div class="debug-actions">
-                <input type="checkbox" id="backend-convert" checked>
-                <label for="backend-convert">convert the model (Simplify/Optimize) too</label>
-            </div>
-            <div class="debug-actions">
-                <label for="backend-ep">execution provider</label>
-                <select id="backend-ep">
-                    <option value="wasm">WASM</option>
-                    <option value="webgpu">WebGPU (fallback to WASM)</option>
-                </select>
-                <label for="backend-atol">atol</label>
-                <input type="number" id="backend-atol" value="0.0001" step="any" style="width: 7em;">
-                <label for="backend-rtol">rtol</label>
-                <input type="number" id="backend-rtol" value="0.001" step="any" style="width: 7em;">
-                <button id="backend-run" type="button">Run test case</button>
-                <button id="backend-download-log" type="button">Download log</button>
-            </div>
-            <textarea id="backend-output" readonly rows="12" style="width: 100%; box-sizing: border-box;"></textarea>
-        </div>
-        <script type="module" src="./backend_test.mjs"></script>
     </body>
 </html>

@@ -150,16 +150,21 @@ the **After** Netron pane, downloadable, and runnable in the inference panel.
 
 ## Run an ONNX backend test case
 
-The **Run an ONNX backend test case** panel takes a URL to an
-[ONNX backend test case](https://github.com/onnx/onnx/tree/main/onnx/backend/test/data)
-directory (a `model.onnx` plus one or more `test_data_set_N/` of `input_*.pb` /
-`output_*.pb` TensorProtos), fetches the model and test data from GitHub, runs
-the model through onnxruntime-web with the given inputs, and compares each output
-against the expected tensor within tolerance. TensorProtos are decoded by the
-`onnxsim_parse_tensor` binding. `npm run test:backend` unit-tests the pure
-`backend_test.mjs` helpers — GitHub URL parsing (tree / blob /
-`raw.githubusercontent.com` / contents-API forms), numeric ordering of
-`input_N.pb` files, and float/int/shape tensor comparison; no DOM or network:
+The **ONNX backend test case** picker (next to the Hugging Face model selector)
+takes an [ONNX backend test case](https://github.com/onnx/onnx/tree/main/onnx/backend/test/data)
+directory — a `model.onnx` plus one or more `test_data_set_N/` of `input_*.pb` /
+`output_*.pb` TensorProtos. A dropdown offers a curated set of common node tests
+(`test_relu`, `test_matmul_2d`, …); the free-text box accepts any GitHub `tree` /
+`raw.githubusercontent.com` URL. It fetches the model and test data from GitHub,
+**runs the model through onnxruntime-web with the test inputs** (the `input_*.pb`
+tensors, not dummy data), and compares each output against the expected
+`output_*.pb` tensor within tolerance. With **convert the model** on, the fetched
+model also runs through the selected convert mode (Netron panes + download).
+TensorProtos are decoded by the `onnxsim_parse_tensor` binding. `npm run
+test:backend` unit-tests the pure `backend_test.mjs` helpers — GitHub URL parsing
+(tree / blob / `raw.githubusercontent.com` / contents-API forms), numeric
+ordering of `input_N.pb` files, float/int/shape tensor comparison, and that every
+curated preset is a parseable node-test URL; no DOM or network:
 
 ```bash
 npm run test:backend

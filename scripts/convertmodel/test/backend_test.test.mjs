@@ -11,6 +11,7 @@ import {
   tensorIndex,
   compareTensors,
   ONNX_DTYPE,
+  BACKEND_PRESETS,
 } from "../backend_test.mjs";
 
 let passed = 0;
@@ -109,6 +110,18 @@ check("int64 (bigint) outputs compare exactly", () => {
   const bad = new BigInt64Array([1n, 2n, 4n]);
   assert.ok(compareTensors(good, [3], expected, {}).ok);
   assert.equal(compareTensors(bad, [3], expected, {}).ok, false);
+});
+
+check("backend presets are node-test dirs parseable by the URL parser", () => {
+  assert.ok(BACKEND_PRESETS.length >= 10);
+  for (const { name, url } of BACKEND_PRESETS) {
+    assert.ok(name.startsWith("test_"), `preset name ${name} should start with test_`);
+    const loc = parseGithubDirUrl(url);
+    assert.ok(loc, `preset URL ${url} should parse`);
+    assert.equal(loc.owner, "onnx");
+    assert.equal(loc.repo, "onnx");
+    assert.ok(loc.path.endsWith(`/node/${name}`), `path ${loc.path} should end with the test name`);
+  }
 });
 
 check("dtype table maps the common ONNX types", () => {
