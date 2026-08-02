@@ -11,6 +11,7 @@
     "inference_core.mjs",
     "issue_report.mjs",
     "macs.mjs",
+    "shapes.mjs",
     "netron.mjs",
     "trace_build.mjs",
     "webnn.mjs",
