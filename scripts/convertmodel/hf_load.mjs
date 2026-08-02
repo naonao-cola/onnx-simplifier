@@ -17,6 +17,7 @@ import {
   humanBytes,
 } from "./hf_models.mjs";
 import { openXetCache, makeCachingFetch } from "./xet_cache.mjs";
+import { parseInputParams, applyOptionParams } from "./query_params.mjs";
 
 const select = document.getElementById("hf-model-select");
 const refInput = document.getElementById("hf-model-input");
@@ -485,3 +486,51 @@ if (xetToggle) {
 window.addEventListener("onnxsim:converted", () => {
   if (statusEl) statusEl.textContent = "";
 });
+
+// --- Query-parameter input -------------------------------------------------
+// Let a shareable link drive the input model and conversion options, e.g.
+//   ?model=onnxmodelzoo/resnet18d_Opset18
+//   ?model=https://…/foo.onnx&optimizer=optimize&cf=0
+//   ?model=…&autoload=0        (prefill the box + options but don't auto-run)
+// The model reference reuses the Hugging Face loader's repo-id / .onnx-URL path,
+// so nothing is uploaded and the conversion is the same one an upload drives.
+(function initFromQueryParams() {
+  let params;
+  try {
+    params = parseInputParams(window.location.search);
+  } catch {
+    return;
+  }
+  // Prefill the conversion option controls so both an auto-run and a later
+  // manual run honor the link's options.
+  try {
+    const changed = applyOptionParams(params, document);
+    if (changed.length) log(`applied options from URL: ${changed.join(", ")}`);
+  } catch {
+    // Best-effort: a missing control just leaves that option at its default.
+  }
+  // Prefill the backend-test panel's URL (it reads the input when Run is clicked).
+  if (params.backend) {
+    const el = document.getElementById("backend-url");
+    if (el) el.value = params.backend;
+  }
+  if (!params.model) return;
+  if (refInput) refInput.value = params.model;
+  // Wait until both WASM runtimes are ready (index.html dispatches
+  // "onnxsim:ready" from maybeEnableInput) before loading, so the conversion
+  // entry point exists; if it already fired, go now.
+  const start = () => {
+    if (params.autoload) {
+      log(`loading input model from URL parameter: ${params.model}`);
+      doLoad();
+    } else {
+      // Just preview size / list files so the user can review before loading.
+      onRefCommitted(params.model);
+    }
+  };
+  if (window.__onnxsimReady) {
+    start();
+  } else {
+    window.addEventListener("onnxsim:ready", start, { once: true });
+  }
+})();

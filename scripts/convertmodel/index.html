@@ -304,6 +304,20 @@
                 one <code>.onnx</code>, the largest is auto-detected; use the
                 <b>file</b> selector to convert a different one.
             </div>
+            <div style="color: #666; font-size: 0.85em; margin-top: 0.25em;">
+                <b>Shareable link:</b> the input model and options can be set from
+                the URL — e.g.
+                <code>?model=onnxmodelzoo/resnet18d_Opset18</code> or
+                <code>?model=https://…/foo.onnx&amp;optimizer=optimize&amp;cf=0</code>.
+                It loads and converts automatically (add <code>&amp;autoload=0</code>
+                to only prefill). Keys: <code>model</code>
+                (<code>hf</code>/<code>url</code>), <code>optimizer</code>,
+                <code>constant_fold</code>/<code>cf</code>,
+                <code>shape_inference</code>/<code>si</code>,
+                <code>tensor_size_threshold</code>/<code>tst</code>,
+                <code>target_opset</code>/<code>opset</code>,
+                <code>backend</code> (prefills the backend-test URL below).
+            </div>
             <div style="margin-top: 0.25em;">
                 <input type="checkbox" id="hf-use-xet" checked>
                 <label for="hf-use-xet">

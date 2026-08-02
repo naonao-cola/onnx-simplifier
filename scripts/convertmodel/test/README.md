@@ -95,6 +95,30 @@ against a tiny fake DOM); no DOM or network:
 npm run test:versions
 ```
 
+## URL-driven input (query parameters)
+
+The input model and conversion options can be set straight from the page URL, so
+a link converts a specific model on open. The model reference reuses the Hugging
+Face loader's repo-id / `.onnx`-URL path (nothing is uploaded):
+
+```
+?model=onnxmodelzoo/resnet18d_Opset18
+?model=https://…/foo.onnx&optimizer=optimize&cf=0
+?model=…&autoload=0          # prefill the box + options but don't auto-run
+?backend=https://github.com/onnx/onnx/tree/main/onnx/backend/test/data/node/test_relu
+```
+
+Keys (aliases in parentheses): `model` (`hf`/`url`/`input`), `optimizer`,
+`constant_fold` (`cf`), `shape_inference` (`si`), `tensor_size_threshold`
+(`tst`), `target_opset` (`opset`), `autoload` (`run`/`convert`), and `backend`
+(prefills the backend-test panel). `npm run test:query` unit-tests the pure
+`query_params.mjs` parser + option-prefiller (against a fake DOM); no
+DOM/network:
+
+```bash
+npm run test:query
+```
+
 ## Parse a text graph
 
 The **Parse a text graph** panel takes an ONNX

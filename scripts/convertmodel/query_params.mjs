@@ -1,0 +1,100 @@
+// Parse the converter page's input configuration from URL query parameters, so a
+// model (and the conversion options) can be driven straight from a shareable
+// link — e.g. `?model=https://…/foo.onnx` or `?model=onnxmodelzoo/resnet18d_Opset18`.
+//
+// Kept pure (no DOM/network) so the parsing is unit-tested; hf_load.mjs imports
+// these and does the browser wiring (prefilling controls and driving the load).
+//
+// Recognized parameters (aliases in parentheses):
+//   model (hf, url, input) — a Hugging Face repo id or a direct .onnx URL; the
+//     same reference the "Load from Hugging Face" box accepts.
+//   backend (testcase, test) — an ONNX backend test-case URL to prefill the
+//     "Run an ONNX backend test case" panel.
+//   autoload (run, convert) — whether to start the conversion automatically once
+//     a model is given (default: true).
+//   optimizer (opt) — "simplify" | "optimize" | "optimize_fixed".
+//   constant_fold (cf), shape_inference (si) — booleans.
+//   tensor_size_threshold (tst), target_opset (opset) — integers.
+
+// Parse a boolean-ish value: an empty value (a bare `?cf`) means "on"; returns
+// null for absent or unrecognized so callers can tell "not set" from false.
+function toBool(v) {
+  if (v === null || v === undefined) return null;
+  const s = String(v).trim().toLowerCase();
+  if (s === "" || s === "1" || s === "true" || s === "yes" || s === "on") return true;
+  if (s === "0" || s === "false" || s === "no" || s === "off") return false;
+  return null;
+}
+
+function toInt(v) {
+  const n = parseInt(v, 10);
+  return Number.isFinite(n) ? n : null;
+}
+
+const OPTIMIZERS = ["simplify", "optimize", "optimize_fixed"];
+
+// Parse a `location.search` (or any query string) into a normalized config.
+// Fields are null when the parameter is absent, except `autoload` which
+// defaults to true (only meaningful when a model is given).
+export function parseInputParams(search) {
+  const p = new URLSearchParams(search || "");
+  const first = (...keys) => {
+    for (const k of keys) {
+      const v = p.get(k);
+      if (v !== null) return v;
+    }
+    return null;
+  };
+  const trimmed = (v) => (v === null ? null : v.trim() || null);
+
+  const optimizerRaw = trimmed(first("optimizer", "opt"));
+  const optimizer = optimizerRaw && OPTIMIZERS.includes(optimizerRaw) ? optimizerRaw : null;
+  const autoloadRaw = toBool(first("autoload", "run", "convert"));
+
+  return {
+    model: trimmed(first("model", "hf", "url", "input")),
+    backend: trimmed(first("backend", "testcase", "test")),
+    autoload: autoloadRaw === null ? true : autoloadRaw,
+    optimizer,
+    constantFold: toBool(first("constant_fold", "cf")),
+    shapeInference: toBool(first("shape_inference", "si")),
+    tensorSizeThreshold: toInt(first("tensor_size_threshold", "tst")),
+    targetOpset: toInt(first("target_opset", "opset")),
+  };
+}
+
+// Prefill the converter's option controls from a parsed config, so both an
+// auto-run and a later manual run honor the link's options. `doc` is the
+// document (injected for testability); only set fields are touched. Returns the
+// list of control ids it changed (handy for tests / logging).
+export function applyOptionParams(params, doc) {
+  const changed = [];
+  const setChecked = (id, val) => {
+    if (val === null || val === undefined) return;
+    const el = doc.getElementById(id);
+    if (el) {
+      el.checked = val;
+      changed.push(id);
+    }
+  };
+  const setValue = (id, val) => {
+    if (val === null || val === undefined) return;
+    const el = doc.getElementById(id);
+    if (el) {
+      el.value = String(val);
+      changed.push(id);
+    }
+  };
+  if (params.optimizer) {
+    const radio = doc.getElementById(`optimizer_${params.optimizer}`);
+    if (radio) {
+      radio.checked = true;
+      changed.push(`optimizer_${params.optimizer}`);
+    }
+  }
+  setChecked("id_simplify_constant_fold", params.constantFold);
+  setChecked("id_simplify_shape_inference", params.shapeInference);
+  setValue("id_simplify_tensor_size_threshold", params.tensorSizeThreshold);
+  setValue("id_simplify_target_opset", params.targetOpset);
+  return changed;
+}

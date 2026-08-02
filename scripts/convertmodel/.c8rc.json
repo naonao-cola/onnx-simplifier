@@ -13,6 +13,7 @@
     "issue_report.mjs",
     "macs.mjs",
     "netron.mjs",
+    "query_params.mjs",
     "trace_build.mjs",
     "versions.mjs",
     "xet_cache.mjs"
