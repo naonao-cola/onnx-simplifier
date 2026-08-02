@@ -90,6 +90,7 @@ create_onnxsim({
     // "Choose file" picker. Registering the message listener below only
     // happens now, so any file posted earlier would be dropped.
     postMessage(["ready"]);
+
     addEventListener("message", async (e) => {
         console.log(e.data);
         const buf = e.data[1];
@@ -143,6 +144,23 @@ create_onnxsim({
                     e.data[8], // annotate model info (MACs/FLOPs) into metadata_props
                 );
                 break;
+            // Single-pass debugging modes: run exactly one of Simplify's
+            // fixed-point building blocks once. Shape inference and data
+            // propagation need no executor; constant folding does (Asyncified in
+            // the ORT-web build, so await when it returns a Promise). They all
+            // return the model bytes through the same convert-done path below.
+            case "infer_shapes":
+                model = runtime.onnxsim_infer_shapes(buf);
+                break;
+            case "data_propagation":
+                model = runtime.onnxsim_data_propagation(buf);
+                break;
+            case "fold_constant": {
+                let r = runtime.onnxsim_fold_constant(buf, e.data[5]); // tensor size threshold
+                if (r && typeof r.then === "function") r = await r;
+                model = r;
+                break;
+            }
             default:
                 postMessage(["stderr", "unknown conversion type: " + e.data[0]]);
                 return;

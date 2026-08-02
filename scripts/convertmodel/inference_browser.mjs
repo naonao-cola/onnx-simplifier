@@ -163,6 +163,10 @@ async function runOnModel(modelBytes, { iterations, batch, providers, needWebnn,
     model: modelBytes,
     inputName,
     input: feeds[inputName],
+    // Feed *all* the model's inputs, not just the first — a multi-input model
+    // (e.g. a MatMul with a separate weight input) otherwise fails with
+    // "input '<name>' is missing in 'feeds'".
+    feeds,
     providers,
     iterations,
     profile,
@@ -203,6 +207,10 @@ async function runCompare(
     after: { model: convertedBytes, label: "converted" },
     inputName,
     input,
+    // Feed *all* the model's inputs to both models (multi-input models otherwise
+    // fail with "input '<name>' is missing in 'feeds'"); the conversion
+    // preserves the model's I/O, so the original's feeds fit the converted model.
+    feeds,
     providers,
     iterations,
     profile,
