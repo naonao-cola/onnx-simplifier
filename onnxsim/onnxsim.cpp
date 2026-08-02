@@ -360,17 +360,19 @@ std::vector<onnx::TensorProto> RunOps(
   // a deep tree of nested sub-messages (NodeProto, TensorProto, ValueInfoProto,
   // dims, ...). Without an arena, destroying it walks that whole tree freeing
   // each sub-message individually; on an arena the entire tree is released in
-  // one bulk free when `arena` goes out of scope. `CreateMessage` (rather than
-  // `Create`) is used so the arena pointer propagates to every `add_*`/
-  // `mutable_*` sub-message -- that propagation is what makes the teardown
-  // cheap, and it is the form that works down to the protobuf 3.7 floor in
-  // requirements.txt. The sub-model is strictly local: it is never Swap'd or
-  // moved into `model`, and the executor returns its outputs in a separate
-  // std::vector that does not live on this arena, so the arena can be torn down
-  // on return without dangling anything the caller keeps.
+  // one bulk free when `arena` goes out of scope. `Create` propagates the arena
+  // pointer to every `add_*`/`mutable_*` sub-message -- that propagation is
+  // what makes the teardown cheap. (Older protobuf spelled this
+  // arena-propagating form `Arena::CreateMessage`, but that alias was
+  // deprecated in protobuf 5.x and removed in 6.x -- the floor the bundled ONNX
+  // now requires -- so `Create` is the modern equivalent for message types.)
+  // The sub-model is strictly local: it is never Swap'd or moved into `model`,
+  // and the executor returns its outputs in a separate std::vector that does
+  // not live on this arena, so the arena can be torn down on return without
+  // dangling anything the caller keeps.
   google::protobuf::Arena arena;
   onnx::ModelProto& op_model =
-      *google::protobuf::Arena::CreateMessage<onnx::ModelProto>(&arena);
+      *google::protobuf::Arena::Create<onnx::ModelProto>(&arena);
   op_model.set_ir_version(model.ir_version());
   for (const auto& x : model.opset_import()) {
     *op_model.add_opset_import() = x;
