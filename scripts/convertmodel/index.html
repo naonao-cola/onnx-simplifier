@@ -526,6 +526,17 @@ agraph (float[N] X) =&gt; (float[N] Y) {
             browser (nothing is uploaded); symbolic axes are shown
             <span class="dp-param">highlighted</span>.
         </p>
+        <p style="color: #666; font-size: 0.9em;">
+            <b>Try it:</b>
+            <a href="?model=https://huggingface.co/Xenova/all-MiniLM-L6-v2/resolve/main/onnx/model_quantized.onnx&amp;optimizer=simplify">load
+            <code>Xenova/all-MiniLM-L6-v2</code></a>
+            (a ~21&nbsp;MB quantized MiniLM sentence-transformer) — its inputs
+            and output carry the named dynamic axes <code>batch_size</code> and
+            <code>sequence_length</code>, so they show up here on both the
+            <b>before</b> and <b>after</b> sides. Most image models (e.g. the
+            <code>onnxmodelzoo</code> ResNets in the dropdown) are fully static
+            and list no <code>dim_param</code>s.
+        </p>
         <div id="dim-params-content"></div>
         <script type="module" src="./shapes_view.mjs"></script>
         <script type="module" src="./hf_load.mjs"></script>
