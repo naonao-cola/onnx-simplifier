@@ -16,6 +16,7 @@
 // onnxruntime-web, so decoding works even if inference can't run.
 
 import { downloadText } from "./download.mjs";
+import { syncInputUrl } from "./query_params.mjs";
 
 const ORT_VERSION = "1.27.0";
 const ORT_BASE = `https://cdn.jsdelivr.net/npm/onnxruntime-web@${ORT_VERSION}/dist/`;
@@ -276,6 +277,8 @@ async function runBackendTest(url, tol, epPref, convert, log) {
     );
   }
   log(`case: ${loc.owner}/${loc.repo}@${loc.ref} :: ${loc.path}`);
+  // Reflect the test-case URL in the address bar so the link is shareable.
+  syncInputUrl("backend", url);
   const runtime = await window.__onnxsimRuntimePromise;
 
   log("listing the test-case directory…");

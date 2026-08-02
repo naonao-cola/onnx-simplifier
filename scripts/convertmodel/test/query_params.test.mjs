@@ -6,7 +6,7 @@
 //   node test/query_params.test.mjs
 
 import assert from "node:assert/strict";
-import { parseInputParams, applyOptionParams } from "../query_params.mjs";
+import { parseInputParams, applyOptionParams, setInputParam } from "../query_params.mjs";
 
 let passed = 0;
 function check(name, fn) {
@@ -98,6 +98,27 @@ check("applyOptionParams leaves untouched controls alone", () => {
   // No option params present, so nothing is changed.
   assert.equal(changed.length, 0);
   assert.equal(doc.els.id_simplify_constant_fold.checked, true);
+});
+
+check("setInputParam sets model and drops other input keys", () => {
+  const s = setInputParam("?hf=old/repo&optimizer=optimize", "model", "owner/new");
+  const p = new URLSearchParams(s);
+  assert.equal(p.get("model"), "owner/new");
+  assert.equal(p.get("hf"), null); // old input key dropped
+  assert.equal(p.get("optimizer"), "optimize"); // option param preserved
+});
+
+check("setInputParam sets backend and clears model", () => {
+  const s = setInputParam("?model=owner/repo", "backend", "https://github.com/onnx/onnx/tree/main/x");
+  const p = new URLSearchParams(s);
+  assert.equal(p.get("backend"), "https://github.com/onnx/onnx/tree/main/x");
+  assert.equal(p.get("model"), null);
+});
+
+check("setInputParam round-trips through parseInputParams", () => {
+  const s = setInputParam("", "model", "https://x/y.onnx");
+  assert.ok(s.startsWith("?"));
+  assert.equal(parseInputParams(s).model, "https://x/y.onnx");
 });
 
 console.log(`PASS: ${passed} checks`);

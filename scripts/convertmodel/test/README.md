@@ -111,8 +111,13 @@ Face loader's repo-id / `.onnx`-URL path (nothing is uploaded):
 Keys (aliases in parentheses): `model` (`hf`/`url`/`input`), `optimizer`,
 `constant_fold` (`cf`), `shape_inference` (`si`), `tensor_size_threshold`
 (`tst`), `target_opset` (`opset`), `autoload` (`run`/`convert`), and `backend`
-(prefills the backend-test panel). `npm run test:query` unit-tests the pure
-`query_params.mjs` parser + option-prefiller (against a fake DOM); no
+(prefills the backend-test panel).
+
+Conversely, **setting** an input model updates the address bar (via
+`history.replaceState`) to the matching `?model=` / `?backend=` link, so the
+current input is always shareable — except an uploaded local file, which has no
+URL. `npm run test:query` unit-tests the pure `query_params.mjs` parser, the
+option-prefiller (against a fake DOM), and the `setInputParam` URL builder; no
 DOM/network:
 
 ```bash
@@ -130,18 +135,18 @@ model is shown in the **Before** Netron pane, becomes the source for the
 single-feature passes, and — with *convert after parsing* on — is run straight
 through the Simplify path.
 
-## Run a single feature (debugging)
+## Single-pass debug modes
 
-The **Run a single feature** panel runs exactly one of the transforms that
-`Simplify` otherwise drives to a fixed point — **shape inference**, ONNX **data
-propagation**, or **constant folding** — once, on a chosen model, so its
-isolated effect can be inspected. These map to onnxsim's
-`InferShapesOnce` / `PropagateDataOnce` / `FoldConstantOnce` core helpers, exposed
-to the page as the `onnxsim_infer_shapes` / `onnxsim_data_propagation` /
-`onnxsim_fold_constant` bindings. Constant folding runs through the same model
-executor `Simplify` uses (onnxruntime-web in the ORT-web build), so that pass
-goes through the conversion worker. Each result is shown in the **After** Netron
-pane, offered as a download, and becomes the new source so passes can be chained.
+Alongside **Simplify** / **Optimize** / **Fixed Optimize**, the converter's mode
+radios include **Shape inference**, **Data propagation**, and **Constant
+folding** — each runs exactly one of the transforms `Simplify` otherwise drives
+to a fixed point, once, so its isolated effect can be inspected. They map to
+onnxsim's `InferShapesOnce` / `PropagateDataOnce` / `FoldConstantOnce` core
+helpers, exposed as the `onnxsim_infer_shapes` / `onnxsim_data_propagation` /
+`onnxsim_fold_constant` bindings, and run through the same conversion worker (so
+constant folding uses the same model executor `Simplify` does — onnxruntime-web
+in the ORT-web build). The result flows through the normal convert path: shown in
+the **After** Netron pane, downloadable, and runnable in the inference panel.
 
 ## Run an ONNX backend test case
 

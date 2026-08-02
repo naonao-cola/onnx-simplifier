@@ -17,7 +17,7 @@ import {
   humanBytes,
 } from "./hf_models.mjs";
 import { openXetCache, makeCachingFetch } from "./xet_cache.mjs";
-import { parseInputParams, applyOptionParams } from "./query_params.mjs";
+import { parseInputParams, applyOptionParams, syncInputUrl } from "./query_params.mjs";
 
 const select = document.getElementById("hf-model-select");
 const refInput = document.getElementById("hf-model-input");
@@ -289,6 +289,10 @@ async function doLoad() {
   loadBtn.disabled = true;
   if (fileInput) fileInput.disabled = true;
   if (statusEl) statusEl.textContent = "loading…";
+  // Reflect this input in the address bar so the link is shareable/reproducible
+  // (a Hugging Face repo id or a direct .onnx URL). Uploaded local files have no
+  // URL and are handled by the file-input path, which does not call this.
+  syncInputUrl("model", ref);
   try {
     log(`loading model from Hugging Face: ${ref}`);
     // Live download progress + speed in the status line. Speed is smoothed with

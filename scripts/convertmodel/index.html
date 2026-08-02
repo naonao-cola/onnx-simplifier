@@ -105,11 +105,6 @@
 
             window.onload = () => {
                 const worker = new Worker("worker.js");
-                // Publish the worker so the single-feature debug panel can send
-                // it its passes (which need the same executor Simplify uses) and
-                // listen for their "debug-done" replies.
-                window.__onnxsimWorker = worker;
-                window.dispatchEvent(new Event("onnxsim:worker-ready"));
                 const log_output = document.getElementById("log-output");
                 const input = document.getElementById("file-input");
                 const dl_btn = document.getElementById("download-button");
@@ -284,10 +279,10 @@
                 <a href="https://onnx.ai/onnx/repo-docs/Syntax.html" target="_blank" rel="noopener">textual representation</a>
                 — the form <code>onnx.parser.parse_graph</code> / <code>parse_model</code> accept.
                 It is parsed into a model by the WebAssembly module (a bare graph is
-                wrapped into a model with a default-domain opset import), then shown in
-                the <b>Before</b> Netron pane and made the input for the
-                <b>single-feature</b> debugging passes. With <b>convert after parsing</b>
-                on, it is also run straight through the Simplify / Optimize path.
+                wrapped into a model with a default-domain opset import) and shown in
+                the <b>Before</b> Netron pane. With <b>convert after parsing</b> on, it
+                is also run straight through the currently selected convert mode below
+                (Simplify / Optimize, or a single debug pass).
             </p>
             <textarea id="parse-graph-text" rows="8" style="width: 100%; box-sizing: border-box; font-family: monospace;"
                 placeholder="&lt;
@@ -394,6 +389,13 @@ agraph (float[N] X) =&gt; (float[N] Y) {
             <label for="optimizer_optimize_fixed">
                 Fixed <a href="https://github.com/onnx/optimizer" target="_blank">Optimize</a>
             </label>
+            <span style="margin-left: 0.6em; color: #666;">| single pass (debug):</span>
+            <input type="radio" name="optimizer" value="infer_shapes" id="optimizer_infer_shapes">
+            <label for="optimizer_infer_shapes" title="Run ONNX shape inference once (not in the fixed point)">Shape inference</label>
+            <input type="radio" name="optimizer" value="data_propagation" id="optimizer_data_propagation">
+            <label for="optimizer_data_propagation" title="Run ONNX data propagation once (not in the fixed point)">Data propagation</label>
+            <input type="radio" name="optimizer" value="fold_constant" id="optimizer_fold_constant">
+            <label for="optimizer_fold_constant" title="Run one constant-folding round (not in the fixed point); uses the tensor size threshold below">Constant folding</label>
         </div>
         <div id="passes">
             <input type="checkbox" name="simplify_constant_fold" id="id_simplify_constant_fold" checked>
@@ -402,7 +404,7 @@ agraph (float[N] X) =&gt; (float[N] Y) {
             <input type="checkbox" name="simplify_shape_inference" id="id_simplify_shape_inference" checked>
             <label for="id_simplify_shape_inference">shape inference (simplify only)</label>
             <br/>
-            <label>tensor size threshold (simplify only)</label>
+            <label>tensor size threshold (simplify / constant folding)</label>
             <input type="number" name="simplify_tensor_size_threshold" id="id_simplify_tensor_size_threshold" value="1000000000">
             <br/>
             <label>target opset version (simplify only, 0 = keep)</label>
@@ -458,33 +460,6 @@ agraph (float[N] X) =&gt; (float[N] Y) {
         </div>
         <script type="module" src="./netron_view.mjs"></script>
         <script type="module" src="./hf_load.mjs"></script>
-
-        <h2>Run a single feature (debugging)</h2>
-        <div class="tool-panel">
-            <p class="tool-note">
-                Run exactly one of the transforms that <b>Simplify</b> otherwise drives
-                to a fixed point — <b>shape inference</b>, ONNX <b>data propagation</b>,
-                or <b>constant folding</b> — once, so its isolated effect can be
-                inspected. Pick the model with the file input below, or reuse the
-                converted result / a parsed graph above. The result is shown in the
-                <b>After</b> Netron pane, offered as a download, and becomes the new
-                source so passes can be chained (e.g. shape inference, then folding).
-            </p>
-            <div class="debug-actions">
-                <input type="file" id="debug-file-input" />
-                <button id="debug-use-converted" type="button">use last converted result</button>
-                <span id="debug-source-name" class="tool-note">no model loaded yet</span>
-            </div>
-            <div class="debug-actions">
-                <button id="debug-infer-shapes" type="button">Shape inference</button>
-                <button id="debug-data-propagation" type="button">Data propagation</button>
-                <button id="debug-fold-constant" type="button">Constant folding</button>
-                <label for="debug-tensor-size-threshold">fold tensor size threshold</label>
-                <input type="number" id="debug-tensor-size-threshold" value="1000000000" style="width: 10em;">
-                <button id="debug-download" type="button" style="display: none;">download result ↓</button>
-            </div>
-            <textarea id="debug-output" readonly rows="8" style="width: 100%; box-sizing: border-box;"></textarea>
-        </div>
 
         <h2>Console outputs:</h2>
         <textarea id="log-output" readonly rows="20" style="width: 100%; box-sizing: border-box;"></textarea>

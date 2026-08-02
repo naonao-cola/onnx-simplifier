@@ -63,6 +63,39 @@ export function parseInputParams(search) {
   };
 }
 
+// Every query key that names an input source; setting one canonical input
+// clears all of these so the URL always reflects a single current input.
+const INPUT_KEYS = ["model", "hf", "url", "input", "backend", "testcase", "test"];
+
+// Return a new query string (leading "?" or "") that names `value` as the input,
+// under the canonical key for `kind` ("backend" -> `backend`, anything else ->
+// `model`), dropping every other input key while preserving option params
+// (optimizer, cf, …). Pure, for unit testing.
+export function setInputParam(search, kind, value) {
+  const p = new URLSearchParams(search || "");
+  for (const k of INPUT_KEYS) p.delete(k);
+  const key = kind === "backend" ? "backend" : "model";
+  p.set(key, value);
+  const s = p.toString();
+  return s ? `?${s}` : "";
+}
+
+// Reflect a just-set input model in the address bar (history.replaceState, so no
+// navigation / history entry), so the link is shareable and reproducible. Used
+// for the Hugging Face / URL loader ("model") and the backend-test panel
+// ("backend"); uploaded local files have no URL representation and are skipped
+// by their callers. Best-effort: never throws into the caller.
+export function syncInputUrl(kind, value) {
+  try {
+    if (typeof window === "undefined" || !window.history || !value) return;
+    const search = setInputParam(window.location.search, kind, value);
+    const url = window.location.pathname + search + window.location.hash;
+    window.history.replaceState(null, "", url);
+  } catch {
+    // ignore — a failed URL update must not break loading.
+  }
+}
+
 // Prefill the converter's option controls from a parsed config, so both an
 // auto-run and a later manual run honor the link's options. `doc` is the
 // document (injected for testability); only set fields are touched. Returns the
