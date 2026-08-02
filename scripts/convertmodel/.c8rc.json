@@ -13,6 +13,7 @@
     "macs.mjs",
     "netron.mjs",
     "trace_build.mjs",
+    "webnn.mjs",
     "xet_cache.mjs"
   ],
   "exclude": [

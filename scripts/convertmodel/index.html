@@ -436,6 +436,17 @@
             to WebAssembly when unavailable.
         </p>
         <p>
+            The execution-provider picker also offers
+            <a href="https://www.w3.org/TR/webnn/" target="_blank" rel="noopener">WebNN</a>
+            (GPU / NPU / CPU), which runs the model through the browser's own
+            ML stack. WebNN is <b>experimental</b> and ships behind a flag
+            (Chrome/Edge: <code>chrome://flags/#web-machine-learning-neural-network</code>),
+            with the broadest support on Windows — the <b>WebNN status</b> line
+            below the controls reports whether it is usable in your browser, and
+            any WebNN run falls back to WebAssembly when the chosen device or an
+            operator is unsupported.
+        </p>
+        <p>
             If the model carries onnxsim's MAC/FLOP metrics in its
             <code>metadata_props</code> (onnxsim
             <a href="https://github.com/onnxsim/onnxsim/pull/527" target="_blank" rel="noopener">PR #527</a>,
@@ -455,6 +466,9 @@
             <label for="inference-ep">execution provider</label>
             <select id="inference-ep">
                 <option value="webgpu">WebGPU (fallback to WASM)</option>
+                <option value="webnn-gpu">WebNN · GPU (fallback to WASM)</option>
+                <option value="webnn-npu">WebNN · NPU (fallback to WASM)</option>
+                <option value="webnn-cpu">WebNN · CPU (fallback to WASM)</option>
                 <option value="wasm">WASM</option>
             </select>
             <label for="inference-iters">iterations</label>
@@ -467,6 +481,7 @@
             <button id="run-inference">Run inference</button>
             <button id="download-inference-log-button" type="button">Download log</button>
         </div>
+        <div id="webnn-status" style="color: #666; font-size: 0.85em; margin-top: 0.3em;" title="">WebNN status: probing…</div>
         <textarea id="inference-output" readonly rows="12" style="width: 100%; box-sizing: border-box;"></textarea>
         <div id="inference-macs"></div>
         <p>

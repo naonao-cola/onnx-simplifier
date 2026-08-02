@@ -73,6 +73,22 @@ its error-bearing tail) so the URL stays under the cap. No DOM or network:
 npm run test:issue
 ```
 
+## WebNN helpers
+
+`npm run test:webnn` unit-tests `webnn.mjs`, the browser-free helpers behind the
+inference panel's [WebNN](https://www.w3.org/TR/webnn/) execution-provider
+options (see [`docs/webnn.md`](../../../docs/webnn.md)). It covers building the
+onnxruntime-web WebNN provider objects (`gpu`/`npu`/`cpu`, with a
+`powerPreference` only on the accelerator devices), the readable provider labels,
+the dropdown-value → provider-list mapping (each ending in a `wasm` fallback),
+and `detectWebnn()` — the `navigator.ml` probe — driven with an injected
+navigator so the absent-API, some-devices-usable, and no-device-usable cases are
+all exercised without a real browser. No DOM or network:
+
+```bash
+npm run test:webnn
+```
+
 ## Profiling traces
 
 Both the browser panels can emit a [Chrome Trace Event][cte] JSON that the page
@@ -96,6 +112,12 @@ onnxruntime-web exposes the `wasm` execution provider everywhere and the
 `webgpu` provider where the host has a WebGPU runtime (a browser, or Node built
 with one). A plain CI/Node container has no GPU, so CI runs the `wasm` provider;
 the browser page defaults to `webgpu` and falls back to `wasm`.
+
+The panel also offers the experimental `webnn` provider (GPU / NPU / CPU device
+types), which needs a browser with the WebNN API enabled — see
+[`docs/webnn.md`](../../../docs/webnn.md). Its pure helpers are covered by
+`test:webnn`; the live `navigator.ml` path only exists in a browser, so CI does
+not exercise it end to end.
 
 ## Regenerate the fixture
 
