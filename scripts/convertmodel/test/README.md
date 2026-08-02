@@ -138,9 +138,13 @@ Keys (aliases in parentheses): `model` (`hf`/`url`/`input`), `optimizer`,
 Conversely, **setting** an input model updates the address bar (via
 `history.replaceState`) to the matching `?model=` / `?backend=` link, so the
 current input is always shareable — except an uploaded local file, which has no
-URL. `npm run test:query` unit-tests the pure `query_params.mjs` parser, the
-option-prefiller (against a fake DOM), and the `setInputParam` URL builder; no
-DOM/network:
+URL. The **Copy shareable link** button (wired in `share_url.mjs`) goes further:
+it calls `buildShareSearch` to overlay *every* conversion option's current value
+onto that link — the processor plus `cf` / `si` / `tst` / `opset`, dropping any
+left at its default to keep the URL short — and copies the result to the
+clipboard (updating the address bar to match). `npm run test:query` unit-tests
+the pure `query_params.mjs` parser, the option-prefiller (against a fake DOM),
+the `setInputParam` URL builder, and `buildShareSearch`; no DOM/network:
 
 ```bash
 npm run test:query
