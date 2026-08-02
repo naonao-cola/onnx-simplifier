@@ -152,31 +152,32 @@ function renderPane(which, buffer, name) {
     };
   }
 
-  // Arm the "export SVG" button: ask the pane's Netron to render the current
-  // graph to SVG and download the returned bytes. The base name drops the
-  // model's extension so the file is e.g. "model.svg".
-  const svg = document.getElementById(`netron-${which}-svg`);
-  if (svg) {
-    svg.style.display = "";
-    svg.onclick = () => {
+  // Arm the "export SVG"/"export PNG" buttons: ask the pane's Netron to render
+  // the current graph to that format and download the returned bytes. The base
+  // name drops the model's extension so the file is e.g. "model.svg".
+  for (const format of ["svg", "png"]) {
+    const button = document.getElementById(`netron-${which}-${format}`);
+    if (!button) continue;
+    button.style.display = "";
+    button.onclick = () => {
       const base = (pane.name || which).replace(/\.[^./\\]*$/, "");
-      const prev = svg.textContent;
-      svg.disabled = true;
-      svg.textContent = "exporting…";
+      const prev = button.textContent;
+      button.disabled = true;
+      button.textContent = "exporting…";
       const finish = () => {
-        svg.disabled = false;
-        svg.textContent = prev;
+        button.disabled = false;
+        button.textContent = prev;
       };
       exportFromNetron(
         frame.contentWindow,
-        "svg",
+        format,
         base,
         (bytes, fname) => {
-          downloadBytes(bytes, fname || `${base}.svg`);
+          downloadBytes(bytes, fname || `${base}.${format}`);
           finish();
         },
         (msg) => {
-          if (note) note.textContent = `SVG export failed: ${msg}`;
+          if (note) note.textContent = `${format.toUpperCase()} export failed: ${msg}`;
           finish();
         },
       );
