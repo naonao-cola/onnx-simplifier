@@ -369,6 +369,18 @@ agraph (float[N] X) =&gt; (float[N] Y) {
                 <code>target_opset</code>/<code>opset</code>,
                 <code>backend</code> (prefills the backend-test URL). Setting an
                 input updates this URL so it stays shareable (uploads excepted).
+                <div style="margin-top: 0.35em;">
+                    <button id="share-link-button" type="button">Copy shareable link</button>
+                    <span id="share-link-status" style="color: #0a7d24; font-size: 0.85em; margin-left: 0.4em;"></span>
+                    <div style="margin-top: 0.2em;">
+                        Builds a link that reproduces the <b>current</b> input and
+                        <i>all</i> the conversion options below (processor, constant
+                        fold, shape inference, tensor size threshold, target opset)
+                        and copies it to your clipboard. Uploaded local files have no
+                        URL, so share a Hugging Face model / URL, a backend test case,
+                        or a pasted text graph.
+                    </div>
+                </div>
             </div>
             <div style="margin-top: 0.25em;">
                 <input type="checkbox" id="hf-use-xet" checked>
@@ -546,6 +558,7 @@ agraph (float[N] X) =&gt; (float[N] Y) {
         <div id="dim-params-content"></div>
         <script type="module" src="./shapes_view.mjs"></script>
         <script type="module" src="./hf_load.mjs"></script>
+        <script type="module" src="./share_url.mjs"></script>
 
         <h2>Console outputs:</h2>
         <textarea id="log-output" readonly rows="20" style="width: 100%; box-sizing: border-box;"></textarea>

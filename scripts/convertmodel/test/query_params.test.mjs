@@ -11,6 +11,7 @@ import {
   applyOptionParams,
   setInputParam,
   setUrlParam,
+  buildShareSearch,
 } from "../query_params.mjs";
 
 let passed = 0;
@@ -157,6 +158,74 @@ check("setUrlParam sets/deletes one param, preserving inputs", () => {
   assert.equal(new URLSearchParams(setUrlParam("?model=x", "optimizer", "optimize")).get("model"), "x");
   // Empty value deletes the key.
   assert.equal(new URLSearchParams(setUrlParam("?model=x&optimizer=optimize", "optimizer", "")).get("optimizer"), null);
+});
+
+// A document stand-in for buildShareSearch: the option controls addressed by id
+// plus a querySelector that resolves the single supported selector, the checked
+// optimizer radio. `opts` overrides the defaults (all at their index.html state).
+function shareDoc(opts = {}) {
+  const optimizer = opts.optimizer || "simplify";
+  const els = {
+    id_simplify_constant_fold: { checked: opts.constantFold ?? true },
+    id_simplify_shape_inference: { checked: opts.shapeInference ?? true },
+    id_simplify_tensor_size_threshold: { value: String(opts.tst ?? 1000000000) },
+    id_simplify_target_opset: { value: String(opts.opset ?? 0) },
+  };
+  return {
+    getElementById: (id) => els[id] || null,
+    querySelector: (sel) =>
+      sel === 'input[name="optimizer"]:checked' ? { value: optimizer } : null,
+  };
+}
+
+check("buildShareSearch keeps a compact URL when all options are default", () => {
+  const s = buildShareSearch("?model=owner/repo", shareDoc());
+  const p = new URLSearchParams(s);
+  assert.equal(p.get("model"), "owner/repo"); // input preserved
+  assert.equal(p.get("optimizer"), "simplify"); // processor always spelled out
+  // Defaults are dropped to keep the link short.
+  assert.equal(p.get("cf"), null);
+  assert.equal(p.get("si"), null);
+  assert.equal(p.get("tst"), null);
+  assert.equal(p.get("opset"), null);
+});
+
+check("buildShareSearch encodes every changed option", () => {
+  const doc = shareDoc({
+    optimizer: "optimize",
+    constantFold: false,
+    shapeInference: false,
+    tst: 500000,
+    opset: 18,
+  });
+  const s = buildShareSearch("?model=owner/repo", doc);
+  const p = new URLSearchParams(s);
+  assert.equal(p.get("model"), "owner/repo");
+  assert.equal(p.get("optimizer"), "optimize");
+  assert.equal(p.get("cf"), "0");
+  assert.equal(p.get("si"), "0");
+  assert.equal(p.get("tst"), "500000");
+  assert.equal(p.get("opset"), "18");
+});
+
+check("buildShareSearch round-trips through parseInputParams", () => {
+  const doc = shareDoc({ optimizer: "optimize", constantFold: false, opset: 17 });
+  const s = buildShareSearch("?backend=https://x/tree/y", doc);
+  const c = parseInputParams(s);
+  assert.equal(c.backend, "https://x/tree/y");
+  assert.equal(c.optimizer, "optimize");
+  assert.equal(c.constantFold, false);
+  assert.equal(c.shapeInference, null); // left at default → absent → default on load
+  assert.equal(c.targetOpset, 17);
+});
+
+check("buildShareSearch overwrites a stale option already in the query", () => {
+  // A previously shared cf=0 must be cleared once the control is back to default.
+  const s = buildShareSearch("?model=x&cf=0&opset=18", shareDoc({ opset: 0 }));
+  const p = new URLSearchParams(s);
+  assert.equal(p.get("cf"), null); // re-checked → default → dropped
+  assert.equal(p.get("opset"), null); // back to 0 (keep) → dropped
+  assert.equal(p.get("model"), "x");
 });
 
 console.log(`PASS: ${passed} checks`);

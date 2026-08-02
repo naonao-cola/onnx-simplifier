@@ -142,6 +142,51 @@ export function syncInputUrl(kind, value) {
   }
 }
 
+// The converter option controls' default state, matching index.html. An option
+// left at its default is omitted from a shared link (parseInputParams falls back
+// to the same defaults), so a typical "Share link" URL stays compact — it only
+// spells out what the user actually changed.
+const OPTION_DEFAULTS = {
+  constantFold: true, // #id_simplify_constant_fold checked
+  shapeInference: true, // #id_simplify_shape_inference checked
+  tensorSizeThreshold: 1000000000, // #id_simplify_tensor_size_threshold
+  targetOpset: 0, // #id_simplify_target_opset (0 = keep current opset)
+};
+
+// Build a complete shareable query string from the current converter state.
+// `search` is the live query string (already carrying the input key, kept in
+// sync by syncInputUrl); this overlays every conversion option at its current
+// control value so the link reproduces the *whole* configuration — not just the
+// input and processor that get synced live. `doc` is the document, injected for
+// testability. Options at their default are dropped to keep the URL short. Pure.
+export function buildShareSearch(search, doc) {
+  let s = search || "";
+  // Processor / mode radio (canonical key `optimizer`).
+  const checked = doc.querySelector && doc.querySelector('input[name="optimizer"]:checked');
+  if (checked && checked.value) s = setUrlParam(s, "optimizer", checked.value);
+  // Boolean toggles: emit "1"/"0" only when flipped away from the default.
+  const setBool = (id, key, dflt) => {
+    const el = doc.getElementById(id);
+    if (!el) return;
+    s = setUrlParam(s, key, el.checked === dflt ? "" : el.checked ? "1" : "0");
+  };
+  setBool("id_simplify_constant_fold", "cf", OPTION_DEFAULTS.constantFold);
+  setBool("id_simplify_shape_inference", "si", OPTION_DEFAULTS.shapeInference);
+  // Numeric options: emit only when meaningful (present and non-default).
+  const tst = doc.getElementById("id_simplify_tensor_size_threshold");
+  if (tst) {
+    const v = String(tst.value).trim();
+    const drop = v === "" || Number(v) === OPTION_DEFAULTS.tensorSizeThreshold;
+    s = setUrlParam(s, "tst", drop ? "" : v);
+  }
+  const opset = doc.getElementById("id_simplify_target_opset");
+  if (opset) {
+    const v = parseInt(opset.value, 10);
+    s = setUrlParam(s, "opset", Number.isFinite(v) && v > 0 ? String(v) : "");
+  }
+  return s;
+}
+
 // Prefill the converter's option controls from a parsed config, so both an
 // auto-run and a later manual run honor the link's options. `doc` is the
 // document (injected for testability); only set fields are touched. Returns the
