@@ -17,6 +17,12 @@
             .macs-table th, .macs-table td { border-bottom: 1px solid #eee; padding: 3px 10px; text-align: right; }
             .macs-table th:first-child, .macs-table td:first-child { text-align: left; }
             .macs-note { color: #666; font-size: 0.85em; margin-top: 0.4em; }
+            /* before/after comparison summary (Run inference "compare" mode) */
+            .cmp-table th { text-align: left; color: #666; font-weight: 600; white-space: nowrap; }
+            .cmp-table td { text-align: left; }
+            .cmp-ok { color: #0a7d24; font-weight: 600; }
+            .cmp-bad { color: #a00; font-weight: 600; }
+            .cmp-warn { color: #a06000; font-weight: 600; }
         </style>
         <script type="text/javascript" src="./onnxsim.js"></script>
         <script type="text/javascript">
@@ -428,12 +434,17 @@
         <h2>Run inference (onnxruntime-web)</h2>
         <p>
             Runs a model for a few iterations to check it executes, using dummy
-            inputs generated from the model's input shapes. Pick whether to run
-            the <b>converted</b> result (the simplify/optimize output) or the
-            <b>original</b> upload, so you can compare the two. The <b>batch</b>
-            control sizes the model's dynamic batch (first) axis; it has no
-            effect on inputs whose first dimension is fixed. WebGPU falls back
-            to WebAssembly when unavailable.
+            inputs generated from the model's input shapes. The <b>model</b>
+            picker chooses what to run: <b>compare (before vs after
+            conversion)</b> — the default — runs <i>both</i> the original upload
+            and the converted result on the <b>same</b> deterministic input and
+            reports how far their outputs diverge (max |Δ|) plus the speed
+            difference, so you can confirm the simplify/optimize step preserved
+            the model's numerics and see how much faster it got. You can also run
+            just the <b>converted</b> result or the <b>original</b> upload on
+            their own. The <b>batch</b> control sizes the model's dynamic batch
+            (first) axis; it has no effect on inputs whose first dimension is
+            fixed. WebGPU falls back to WebAssembly when unavailable.
         </p>
         <p>
             The execution-provider picker also offers
@@ -460,6 +471,7 @@
         <div>
             <label for="inference-source">model</label>
             <select id="inference-source">
+                <option value="compare">compare (before vs after conversion)</option>
                 <option value="converted">converted (simplify/optimize output)</option>
                 <option value="original">original (uploaded)</option>
             </select>
