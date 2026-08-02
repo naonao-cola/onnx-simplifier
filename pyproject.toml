@@ -43,6 +43,12 @@ Homepage = "https://github.com/onnxsim/onnxsim"
 [project.scripts]
 onnxsim = "onnxsim:main"
 
+[tool.pytest.ini_options]
+# Always report the 10 slowest tests. tests/conftest.py additionally mirrors
+# this list into the GitHub Actions job summary when running in CI, so the
+# timings are visible without opening the raw logs.
+addopts = "--durations=10"
+
 [tool.ruff]
 # The vendored single-header option parser is not our code to reformat.
 extend-exclude = ["onnxsim/cxxopts.hpp"]
