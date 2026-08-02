@@ -12,6 +12,7 @@
     "inference_core.mjs",
     "issue_report.mjs",
     "macs.mjs",
+    "shapes.mjs",
     "netron.mjs",
     "query_params.mjs",
     "trace_build.mjs",

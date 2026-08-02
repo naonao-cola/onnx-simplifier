@@ -32,6 +32,9 @@ jobs:
       - name: Run MAC-metrics reader unit test
         working-directory: scripts/convertmodel
         run: npm run test:macs
+      - name: Run dim_param shape-reader unit test
+        working-directory: scripts/convertmodel
+        run: npm run test:shapes
       - name: Run Hugging Face loader unit test
         working-directory: scripts/convertmodel
         run: npm run test:hf

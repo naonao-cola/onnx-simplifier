@@ -17,6 +17,16 @@
             .macs-table th, .macs-table td { border-bottom: 1px solid #eee; padding: 3px 10px; text-align: right; }
             .macs-table th:first-child, .macs-table td:first-child { text-align: left; }
             .macs-note { color: #666; font-size: 0.85em; margin-top: 0.4em; }
+            /* "Dynamic dimensions (dim_param)" panel */
+            .dp-panes { display: flex; gap: 1em; flex-wrap: wrap; }
+            .dp-pane { flex: 1 1 320px; min-width: 280px; border: 1px solid #ccc; border-radius: 6px; padding: 0.5em 0.7em; }
+            .dp-head { font-weight: 600; margin-bottom: 0.35em; }
+            .dp-names { margin-bottom: 0.4em; }
+            .dp-diff { margin: 0 0 0.5em; padding: 0.35em 0.6em; background: #f4f7ff; border-left: 3px solid #4a6cf7; border-radius: 3px; }
+            .dp-table { border-collapse: collapse; width: 100%; font-variant-numeric: tabular-nums; }
+            .dp-table th, .dp-table td { border-bottom: 1px solid #eee; padding: 3px 8px; text-align: left; }
+            .dp-param { color: #b5006b; font-weight: 600; }
+            .dp-dim { color: #333; }
             /* before/after comparison summary (Run inference "compare" mode) */
             .cmp-table th { text-align: left; color: #666; font-weight: 600; white-space: nowrap; }
             .cmp-table td { text-align: left; }
@@ -156,6 +166,10 @@
                             // Visualize the simplified/optimized model with Netron.
                             if (window.netronShowAfter) {
                                 window.netronShowAfter(data_url, result_name);
+                            }
+                            // List the converted model's dim_params ("after").
+                            if (window.dimParamsShowAfter) {
+                                window.dimParamsShowAfter(data_url, result_name);
                             }
                             // Keep the converted model bytes around so the
                             // "Run inference" panel can run them (not just the
@@ -507,6 +521,30 @@ agraph (float[N] X) =&gt; (float[N] Y) {
             </div>
         </div>
         <script type="module" src="./netron_view.mjs"></script>
+        <h2>Dynamic dimensions (dim_param)</h2>
+        <p>
+            Lists the model's symbolic axis names (ONNX
+            <code>dim_param</code>s) on its graph inputs and outputs —
+            <b>before</b> and <b>after</b> simplify/optimize — so you can see how
+            the conversion changed the dynamic axes: a <code>batch</code> /
+            <code>sequence</code> axis kept symbolic, or a symbolic dimension
+            folded to a fixed size. Read straight from the model bytes in your
+            browser (nothing is uploaded); symbolic axes are shown
+            <span class="dp-param">highlighted</span>.
+        </p>
+        <p style="color: #666; font-size: 0.9em;">
+            <b>Try it:</b>
+            <a href="?model=https://huggingface.co/Xenova/all-MiniLM-L6-v2/resolve/main/onnx/model_quantized.onnx&amp;optimizer=simplify">load
+            <code>Xenova/all-MiniLM-L6-v2</code></a>
+            (a ~21&nbsp;MB quantized MiniLM sentence-transformer) — its inputs
+            and output carry the named dynamic axes <code>batch_size</code> and
+            <code>sequence_length</code>, so they show up here on both the
+            <b>before</b> and <b>after</b> sides. Most image models (e.g. the
+            <code>onnxmodelzoo</code> ResNets in the dropdown) are fully static
+            and list no <code>dim_param</code>s.
+        </p>
+        <div id="dim-params-content"></div>
+        <script type="module" src="./shapes_view.mjs"></script>
         <script type="module" src="./hf_load.mjs"></script>
 
         <h2>Console outputs:</h2>

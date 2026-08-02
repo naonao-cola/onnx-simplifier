@@ -434,6 +434,11 @@ async function doLoad() {
     if (typeof window.netronShowBefore === "function") {
       window.netronShowBefore(bytes, name);
     }
+    // Likewise list the "before" model's dim_params, which also normally come
+    // from the file input a Hugging Face download bypasses.
+    if (typeof window.dimParamsShowBefore === "function") {
+      window.dimParamsShowBefore(bytes, name);
+    }
     // Hand a *copy* to the worker: the buffer is transferred (detached) on
     // postMessage, so copying keeps `bytes` intact for the inference panel.
     const copy = bytes.slice();

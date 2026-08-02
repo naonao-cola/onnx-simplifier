@@ -66,6 +66,22 @@ throughput for either **model** source, so the original and converted models can
 be compared on inference speed. Annotation only adds `metadata_props`, so the
 annotated bytes execute identically to the upload.
 
+## Dynamic dimensions (dim_param)
+
+`npm run test:shapes` unit-tests `shapes.mjs`, which reads a model's graph
+input/output shapes — and in particular the symbolic `dim_param` axis names —
+straight out of the ONNX bytes, reusing the same dependency-free protobuf reader
+as `macs.mjs`. It backs the converter page's **Dynamic dimensions (dim_param)**
+panel, which lists a model's symbolic axes before vs after simplify/optimize.
+The fixture `model.onnx` has a symbolic batch axis (input `X` is `[batch, 4]`,
+output `Y` is `[batch, 3]`), so the test checks that the parser recovers the
+`batch` name on both I/O tensors, formats shapes readably, skips unknown-rank /
+non-tensor values, and diffs two models' dim_param sets. No DOM or network:
+
+```bash
+npm run test:shapes
+```
+
 ## Before/after comparison
 
 `npm run test:compare` drives `compareInference()` / `compareOutputs()` in

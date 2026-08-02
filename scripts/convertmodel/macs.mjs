@@ -138,8 +138,10 @@ function readVarint(buf, pos) {
 }
 
 // Iterate the fields of a protobuf message buffer, yielding
-// { field, wire, value?, bytes? }.
-function* fields(buf) {
+// { field, wire, value?, bytes? }. Exported so sibling modules (e.g.
+// shapes.mjs, which reads the graph's input/output dim_params) can reuse this
+// one dependency-free wire reader instead of duplicating it.
+export function* fields(buf) {
   let pos = 0;
   const len = buf.length;
   while (pos < len) {
@@ -168,7 +170,9 @@ function* fields(buf) {
 }
 
 const utf8 = new TextDecoder("utf-8");
-const decode = (bytes) => utf8.decode(bytes);
+// Decode a length-delimited protobuf field's bytes as UTF-8. Exported for
+// reuse by shapes.mjs (dim_param names are protobuf strings).
+export const decode = (bytes) => utf8.decode(bytes);
 
 // StringStringEntryProto { string key = 1; string value = 2; }
 function parseStringStringEntry(buf) {
