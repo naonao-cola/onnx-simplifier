@@ -27,6 +27,12 @@
             .dp-table th, .dp-table td { border-bottom: 1px solid #eee; padding: 3px 8px; text-align: left; }
             .dp-param { color: #b5006b; font-weight: 600; }
             .dp-dim { color: #333; }
+            /* before/after comparison summary (Run inference "compare" mode) */
+            .cmp-table th { text-align: left; color: #666; font-weight: 600; white-space: nowrap; }
+            .cmp-table td { text-align: left; }
+            .cmp-ok { color: #0a7d24; font-weight: 600; }
+            .cmp-bad { color: #a00; font-weight: 600; }
+            .cmp-warn { color: #a06000; font-weight: 600; }
             #versions-panel { display: flex; flex-wrap: wrap; gap: 0.5em; margin: 0.4em 0 0.8em; }
             .version-badge { border: 1px solid #ccc; border-radius: 999px; padding: 0.15em 0.7em; font-size: 0.85em; display: inline-flex; gap: 0.4em; align-items: baseline; }
             .version-k { color: #666; }
@@ -599,12 +605,17 @@ agraph (float[N] X) =&gt; (float[N] Y) {
         <h2>Run inference (onnxruntime-web)</h2>
         <p>
             Runs a model for a few iterations to check it executes, using dummy
-            inputs generated from the model's input shapes. Pick whether to run
-            the <b>converted</b> result (the simplify/optimize output) or the
-            <b>original</b> upload, so you can compare the two. The <b>batch</b>
-            control sizes the model's dynamic batch (first) axis; it has no
-            effect on inputs whose first dimension is fixed. WebGPU falls back
-            to WebAssembly when unavailable.
+            inputs generated from the model's input shapes. The <b>model</b>
+            picker chooses what to run: <b>compare (before vs after
+            conversion)</b> — the default — runs <i>both</i> the original upload
+            and the converted result on the <b>same</b> deterministic input and
+            reports how far their outputs diverge (max |Δ|) plus the speed
+            difference, so you can confirm the simplify/optimize step preserved
+            the model's numerics and see how much faster it got. You can also run
+            just the <b>converted</b> result or the <b>original</b> upload on
+            their own. The <b>batch</b> control sizes the model's dynamic batch
+            (first) axis; it has no effect on inputs whose first dimension is
+            fixed. WebGPU falls back to WebAssembly when unavailable.
         </p>
         <p>
             The execution-provider picker also offers
@@ -631,6 +642,7 @@ agraph (float[N] X) =&gt; (float[N] Y) {
         <div>
             <label for="inference-source">model</label>
             <select id="inference-source">
+                <option value="compare">compare (before vs after conversion)</option>
                 <option value="converted">converted (simplify/optimize output)</option>
                 <option value="original">original (uploaded)</option>
             </select>
