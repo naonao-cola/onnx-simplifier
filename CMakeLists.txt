@@ -179,21 +179,39 @@ if (ONNXSIM_C_API)
   if (NOT ONNXSIM_BUILTIN_ORT)
     message(FATAL_ERROR "ONNXSIM_C_API requires ONNXSIM_BUILTIN_ORT=ON")
   endif()
-  # In the builtin-ORT path onnx_optimizer and onnx are built as shared
-  # libraries (build_ort.cmake sets BUILD_SHARED_LIBS ON), but they inherit the
-  # project-wide "hidden" visibility preset, so they export none of their
-  # symbols. onnxsim/onnxsim_c call into onnx_optimizer across the
-  # shared-library boundary (e.g. OptimizeFixed, GetFuseAndEliminationPass), and
-  # reference onnx message RTTI across it (e.g. typeinfo for onnx::ModelProto,
-  # whose vtable/typeinfo live in the onnx_proto target that compiles the
-  # generated *.pb.cc); both then fail to resolve at runtime with "undefined
-  # symbol". Restore default visibility so those symbols are exported. (The
-  # Python build avoids this by linking them statically.)
+  # onnx_optimizer, onnx and onnx_proto are built as part of the builtin-ORT
+  # subtree and absorbed statically into onnxsim_c (option 1; see
+  # build_ort.cmake). Two settings they inherit from that subtree must be undone
+  # for onnxsim_c to link:
+  #
+  #  * Visibility -- they inherit the project-wide "hidden" preset. onnxsim_c
+  #    calls onnx_optimizer entry points (OptimizeFixed, GetFuseAndElimination
+  #    Pass, ...) and, historically when these were separate shared libraries,
+  #    needed them exported, so restore default visibility (harmless now that
+  #    they link in statically).
+  #  * RTTI -- ONNX Runtime configures its subtree with onnxruntime_DISABLE_RTTI
+  #    =ON (-fno-rtti), so onnx, the generated *.pb.cc and the bundled protobuf
+  #    omit their typeinfo (onnx-ml.pb.cc emits onnx::ModelProto's vtable but not
+  #    its typeinfo; libprotobuf omits google::protobuf::Message/MessageLite
+  #    typeinfo). onnxsim is compiled RTTI-on -- it has to be, because
+  #    onnx-optimizer's cse_util.h uses typeid(T) -- and references
+  #    onnx::ModelProto's typeinfo, so the link fails with "undefined symbol:
+  #    typeinfo for onnx::ModelProto" (and, once that resolves, its
+  #    google::protobuf::Message base). Compiling onnxsim -fno-rtti to match the
+  #    stack is therefore not possible; instead force -frtti back on for the onnx
+  #    and protobuf targets so the whole typeinfo chain is emitted (-frtti wins
+  #    as the last -f(no-)rtti on the command line).
   foreach(_onnxsim_shared_dep onnx_optimizer onnx onnx_proto)
     if (TARGET ${_onnxsim_shared_dep})
       set_target_properties(${_onnxsim_shared_dep} PROPERTIES
         CXX_VISIBILITY_PRESET default
         VISIBILITY_INLINES_HIDDEN FALSE)
+    endif()
+  endforeach()
+  foreach(_onnxsim_rtti_dep onnx onnx_proto libprotobuf libprotobuf-lite)
+    if (TARGET ${_onnxsim_rtti_dep})
+      target_compile_options(${_onnxsim_rtti_dep} PRIVATE
+        $<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:-frtti>)
     endif()
   endforeach()
   add_library(onnxsim_c SHARED onnxsim/capi/onnxsim_c_api.cpp)
@@ -204,19 +222,36 @@ if (ONNXSIM_C_API)
   # weak COMDAT reference). Whole-archive onnxsim + onnx + onnx_proto so every
   # such object is retained.
   #
-  # Use the LINK_LIBRARY genex rather than a raw "-Wl,--whole-archive ... " group
-  # so CMake does not de-duplicate onnx/onnx_proto -- which also arrive
-  # transitively -- back out of the whole-archive group (that de-dup is why a raw
-  # group whole-archived onnx's schemas but dropped onnx_proto's ModelProto
-  # typeinfo). The onnx-operators *.pb.cc object lives in both libonnx and
+  # Whole-archive by ARCHIVE FILE ($<TARGET_FILE:...>) rather than by target
+  # name. onnx and onnx_proto also reach onnxsim_c transitively (as ordinary
+  # link items through onnxsim/onnx_optimizer), and CMake refuses to link the
+  # same *target* both with the WHOLE_ARCHIVE feature and plain -- the
+  # "$<LINK_LIBRARY:WHOLE_ARCHIVE,...>" genex fails to configure with "link item
+  # 'onnx' ... has already occurred with the feature 'WHOLE_ARCHIVE', which is
+  # not allowed". Passing the archive paths as raw linker inputs sidesteps both
+  # that per-target feature check and CMake's de-duplication (which otherwise
+  # drops onnx_proto's onnx.pb.cc -- ModelProto's vtable/typeinfo -- back out of
+  # a raw --whole-archive group). The transitive plain occurrences still link
+  # normally for their referenced members; the whole-archive pass additionally
+  # retains the members nothing references directly: onnx's self-registered
+  # operator schemas / shape-inference fns (e.g. onnx::RNNShapeInference) and
+  # onnx.pb.cc's ModelProto RTTI (reached only through a weak COMDAT reference).
+  # The onnx-operators *.pb.cc object is archived into both libonnx and
   # libonnx_proto, so --allow-multiple-definition tolerates the duplicate:
   # protobuf's per-file descriptor_table merges to one copy whose once-guarded
   # registration runs exactly once. onnx_optimizer and ONNX Runtime link normally
   # (referenced directly / via the Ort:: C++ API through onnxsim's interface).
-  target_link_options(onnxsim_c PRIVATE "LINKER:--allow-multiple-definition")
-  target_link_libraries(onnxsim_c PRIVATE
-    "$<LINK_LIBRARY:WHOLE_ARCHIVE,onnxsim,onnx,onnx_proto>"
-    onnx_optimizer)
+  target_link_libraries(onnxsim_c PRIVATE onnxsim onnx_optimizer)
+  target_link_options(onnxsim_c PRIVATE
+    "LINKER:--allow-multiple-definition"
+    "LINKER:--whole-archive"
+    "$<TARGET_FILE:onnxsim>"
+    "$<TARGET_FILE:onnx>"
+    "$<TARGET_FILE:onnx_proto>"
+    "LINKER:--no-whole-archive")
+  # $<TARGET_FILE:...> in link options does not itself create a build-order
+  # edge, so require the archives explicitly (onnxsim already is a link dep).
+  add_dependencies(onnxsim_c onnx onnx_proto)
   target_include_directories(onnxsim_c PUBLIC onnxsim/capi)
   # The exported symbols opt back into default visibility via ONNXSIM_C_API in
   # the header, so the project-wide "hidden" preset keeps everything else local.
