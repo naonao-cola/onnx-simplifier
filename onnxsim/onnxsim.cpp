@@ -2164,11 +2164,11 @@ onnx::ModelProto Simplify(
   // input model and simplify it in place.
   onnx::ModelProto sim_model = model;
   // Optionally inline the model's local (model-defined) functions into the main
-  // graph up front, so the optimizer, shape inference and constant folding below
-  // see through them into a flat op graph. Done before the opset conversion and
-  // fixed point so everything downstream operates on the inlined graph;
-  // schema-defined functions are left untouched. Off by default, so a model with
-  // functions is otherwise simplified exactly as before.
+  // graph up front, so the optimizer, shape inference and constant folding
+  // below see through them into a flat op graph. Done before the opset
+  // conversion and fixed point so everything downstream operates on the inlined
+  // graph; schema-defined functions are left untouched. Off by default, so a
+  // model with functions is otherwise simplified exactly as before.
   if (include_inline_functions) {
     onnx::inliner::InlineLocalFunctions(sim_model);
   }
@@ -2208,16 +2208,15 @@ void SimplifyPath(const ModelExecutor& executor, const std::string& in_path,
                   bool constant_folding, bool shape_inference,
                   size_t tensor_size_threshold,
                   std::optional<int> target_opset_version,
-                  const GraphRewriter* rewriter,
-                  bool initializers_as_constants,
+                  const GraphRewriter* rewriter, bool initializers_as_constants,
                   bool include_inline_functions) {
   onnx::ModelProto model;
   onnx::optimization::loadModel(&model, in_path, true);
 
-  model = Simplify(executor, model, skip_optimizers, constant_folding,
-                   shape_inference, tensor_size_threshold, target_opset_version,
-                   rewriter, initializers_as_constants,
-                   include_inline_functions);
+  model =
+      Simplify(executor, model, skip_optimizers, constant_folding,
+               shape_inference, tensor_size_threshold, target_opset_version,
+               rewriter, initializers_as_constants, include_inline_functions);
 
   onnx::optimization::saveModel(&model, out_path, true, "");
 }

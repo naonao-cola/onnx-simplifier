@@ -89,9 +89,9 @@ std::shared_ptr<const ModelExecutor> GetBuiltinModelExecutor();
 // ``include_inline_functions`` (default false) inlines the model's local
 // (model-defined) functions into the main graph before simplifying, via onnx's
 // inliner. This flattens function calls into plain ops so the optimizer, shape
-// inference and constant folding can see through them; schema-defined (built-in)
-// functions are left alone. With the default the model's functions are left
-// untouched.
+// inference and constant folding can see through them; schema-defined
+// (built-in) functions are left alone. With the default the model's functions
+// are left untouched.
 onnx::ModelProto Simplify(
     const ModelExecutor& executor, const onnx::ModelProto& model,
     std::optional<std::vector<std::string>> skip_optimizers,
