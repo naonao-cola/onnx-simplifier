@@ -25,6 +25,24 @@ export const NETRON_EMBED_URL = `${NETRON_PATH}?embed`;
 export const NETRON_PING = "PING";
 export const NETRON_PONG = "PONG";
 
+// The self-hosted Netron is driven purely over this postMessage protocol, i.e.
+// it is used here as an embeddable model-preview component. That idea and this
+// protocol are being discussed upstream in
+// https://github.com/lutzroeder/netron/pull/1591 — follow that thread for the
+// canonical protocol as it converges.
+export const NETRON_PR_1591 =
+  "https://github.com/lutzroeder/netron/pull/1591#issuecomment-5148706256";
+
+// Build the message that asks the embedded Netron to render the currently shown
+// graph and post the image bytes back (rather than downloading them inside the
+// frame). `format` is "svg" (default) or "png"; `name` sets the suggested file
+// name. Netron replies with
+// `{ netron: { command: "export", status, format, name, buffer } }`.
+export function buildExportMessage(format = "svg", name) {
+  const fmt = format === "png" ? "png" : "svg";
+  return { netron: { command: "export", format: fmt, name: name || "model" } };
+}
+
 // Normalize model bytes to a standalone ArrayBuffer holding exactly those
 // bytes. Accepts an ArrayBuffer or any typed-array / DataView view, and always
 // returns a fresh copy so the source is never detached when the buffer is

@@ -34,8 +34,15 @@ renders each model with a **self-hosted** [Netron](https://github.com/onnxsim/ne
 (built into the site at `./netron/` by the deploy workflow) and hands it the
 model bytes over a postMessage embedding protocol — so nothing is uploaded and
 there is no model-size limit (the old URL-based path was capped at ~2 MB by the
-browser). The test covers buffer normalization, data-URL decoding, and the
-message shape; it needs no dependencies or network:
+browser). Each pane also has an **export SVG** button that asks Netron (over the
+same protocol's `export` command) to render the shown graph and hand the SVG
+bytes back for download. The test covers buffer normalization, data-URL
+decoding, and the model/export message shapes; it needs no dependencies or
+network:
+
+Netron is used here as an embeddable **model-preview component** driven entirely
+over `postMessage`; that idea and protocol are being discussed upstream in
+[lutzroeder/netron#1591](https://github.com/lutzroeder/netron/pull/1591#issuecomment-5148706256).
 
 ```bash
 npm run test:netron
@@ -71,6 +78,96 @@ its error-bearing tail) so the URL stays under the cap. No DOM or network:
 
 ```bash
 npm run test:issue
+```
+
+## Library versions
+
+The page shows the **versions** of the libraries built into the WebAssembly
+module — onnxsim, onnx-optimizer, onnx (its IR version + highest supported
+opset), and protobuf — as a row of badges under the title, and includes them in
+the **Report an issue** body. onnxsim and onnx-optimizer come from their
+`VERSION` files (baked in by CMake); onnx and protobuf are read from the linked
+libraries at runtime by the `onnxsim_versions` binding. `npm run test:versions`
+unit-tests the pure `versions.mjs` helpers (normalization + badge rendering
+against a tiny fake DOM); no DOM or network:
+
+```bash
+npm run test:versions
+```
+
+## URL-driven input (query parameters)
+
+The input model and conversion options can be set straight from the page URL, so
+a link converts a specific model on open. The model reference reuses the Hugging
+Face loader's repo-id / `.onnx`-URL path (nothing is uploaded):
+
+```
+?model=onnxmodelzoo/resnet18d_Opset18
+?model=https://…/foo.onnx&optimizer=optimize&cf=0
+?model=…&autoload=0          # prefill the box + options but don't auto-run
+?backend=https://github.com/onnx/onnx/tree/main/onnx/backend/test/data/node/test_relu
+```
+
+Keys (aliases in parentheses): `model` (`hf`/`url`/`input`), `optimizer`,
+`constant_fold` (`cf`), `shape_inference` (`si`), `tensor_size_threshold`
+(`tst`), `target_opset` (`opset`), `autoload` (`run`/`convert`), and `backend`
+(prefills the backend-test panel).
+
+Conversely, **setting** an input model updates the address bar (via
+`history.replaceState`) to the matching `?model=` / `?backend=` link, so the
+current input is always shareable — except an uploaded local file, which has no
+URL. `npm run test:query` unit-tests the pure `query_params.mjs` parser, the
+option-prefiller (against a fake DOM), and the `setInputParam` URL builder; no
+DOM/network:
+
+```bash
+npm run test:query
+```
+
+## Parse a text graph
+
+The **Parse a text graph** panel takes an ONNX
+[textual representation](https://onnx.ai/onnx/repo-docs/Syntax.html) — the form
+`onnx.parser.parse_graph` / `parse_model` accept — and parses it into a model
+with the `onnxsim_parse_graph` binding (whole-model text is used as-is; a bare
+graph is wrapped into a model with a default-domain opset import). The parsed
+model is shown in the **Before** Netron pane, becomes the source for the
+single-feature passes, and — with *convert after parsing* on — is run straight
+through the Simplify path.
+
+## Single-pass debug modes
+
+Alongside **Simplify** / **Optimize** / **Fixed Optimize**, the converter's mode
+radios include **Shape inference**, **Data propagation**, and **Constant
+folding** — each runs exactly one of the transforms `Simplify` otherwise drives
+to a fixed point, once, so its isolated effect can be inspected. They map to
+onnxsim's `InferShapesOnce` / `PropagateDataOnce` / `FoldConstantOnce` core
+helpers, exposed as the `onnxsim_infer_shapes` / `onnxsim_data_propagation` /
+`onnxsim_fold_constant` bindings, and run through the same conversion worker (so
+constant folding uses the same model executor `Simplify` does — onnxruntime-web
+in the ORT-web build). The result flows through the normal convert path: shown in
+the **After** Netron pane, downloadable, and runnable in the inference panel.
+
+## Run an ONNX backend test case
+
+The **ONNX backend test case** picker (next to the Hugging Face model selector)
+takes an [ONNX backend test case](https://github.com/onnx/onnx/tree/main/onnx/backend/test/data)
+directory — a `model.onnx` plus one or more `test_data_set_N/` of `input_*.pb` /
+`output_*.pb` TensorProtos. A dropdown offers a curated set of common node tests
+(`test_relu`, `test_matmul_2d`, …); the free-text box accepts any GitHub `tree` /
+`raw.githubusercontent.com` URL. It fetches the model and test data from GitHub,
+**runs the model through onnxruntime-web with the test inputs** (the `input_*.pb`
+tensors, not dummy data), and compares each output against the expected
+`output_*.pb` tensor within tolerance. With **convert the model** on, the fetched
+model also runs through the selected convert mode (Netron panes + download).
+TensorProtos are decoded by the `onnxsim_parse_tensor` binding. `npm run
+test:backend` unit-tests the pure `backend_test.mjs` helpers — GitHub URL parsing
+(tree / blob / `raw.githubusercontent.com` / contents-API forms), numeric
+ordering of `input_N.pb` files, float/int/shape tensor comparison, and that every
+curated preset is a parseable node-test URL; no DOM or network:
+
+```bash
+npm run test:backend
 ```
 
 ## WebNN helpers

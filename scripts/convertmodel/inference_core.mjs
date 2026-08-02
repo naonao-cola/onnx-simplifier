@@ -81,6 +81,7 @@ export async function runInference(ort, {
   model,
   inputName,
   input,
+  feeds = null,
   outputName,
   providers,
   iterations = 5,
@@ -108,6 +109,12 @@ export async function runInference(ort, {
   }
   const resolvedInputName = inputName || session.inputNames[0];
   const resolvedOutputName = outputName || session.outputNames[0];
+  // Feed every model input. A caller with a multi-input model passes the whole
+  // `feeds` map ({ name: tensor }); the single-input callers (and the Node smoke
+  // test) pass just `input`, which we bind to the first/only input name. Without
+  // this, a model like MatMul(X, W) + Add(_, B) fails with
+  // "input 'W' is missing in 'feeds'".
+  const runFeeds = feeds || { [resolvedInputName]: input };
 
   let first = null;
   let lastDims = null;
@@ -116,7 +123,7 @@ export async function runInference(ort, {
   try {
     for (let i = 0; i < iterations; i++) {
       const t0 = performance.now();
-      const results = await session.run({ [resolvedInputName]: input });
+      const results = await session.run(runFeeds);
       const durMs = performance.now() - t0;
       timings.push(durMs);
       runs.push({ index: i, startMs: t0, durMs });

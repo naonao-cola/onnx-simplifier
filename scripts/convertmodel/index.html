@@ -17,6 +17,14 @@
             .macs-table th, .macs-table td { border-bottom: 1px solid #eee; padding: 3px 10px; text-align: right; }
             .macs-table th:first-child, .macs-table td:first-child { text-align: left; }
             .macs-note { color: #666; font-size: 0.85em; margin-top: 0.4em; }
+            #versions-panel { display: flex; flex-wrap: wrap; gap: 0.5em; margin: 0.4em 0 0.8em; }
+            .version-badge { border: 1px solid #ccc; border-radius: 999px; padding: 0.15em 0.7em; font-size: 0.85em; display: inline-flex; gap: 0.4em; align-items: baseline; }
+            .version-k { color: #666; }
+            .version-v { font-weight: 600; font-variant-numeric: tabular-nums; }
+            .tool-panel { border: 1px solid #ddd; border-radius: 6px; padding: 0.6em 0.8em; margin: 0.8em 0; }
+            .tool-panel h3 { margin: 0 0 0.4em; }
+            .tool-note { color: #666; font-size: 0.85em; margin: 0.3em 0; }
+            .debug-actions { display: flex; flex-wrap: wrap; gap: 0.5em; align-items: center; margin: 0.4em 0; }
         </style>
         <script type="text/javascript" src="./onnxsim.js"></script>
         <script type="text/javascript">
@@ -46,9 +54,21 @@
                 }
                 const status = document.getElementById("loading-status");
                 if (status) status.style.display = "none";
+                // Signal the module panels (the single-feature debug passes)
+                // that BOTH runtimes are up, so a pass posted to the worker is
+                // no longer at risk of being dropped before it starts listening.
+                if (!window.__onnxsimReady) {
+                    window.__onnxsimReady = true;
+                    window.dispatchEvent(new Event("onnxsim:ready"));
+                }
             };
 
-            create_onnxsim().then((runtime) => {
+            // Publish the runtime (and a promise for it) so the ES-module panels
+            // — versions, "parse a text graph", and the single-feature debug
+            // passes — can call the module directly. None of them need
+            // onnxruntime-web, so this page's runtime is enough for them.
+            window.__onnxsimRuntimePromise = create_onnxsim().then((runtime) => {
+                window.__onnxsimRuntime = runtime;
                 to_ary = (vec) => {
                     return new Array(vec.size()).fill(0).map((_, id) => vec.get(id))
                 };
@@ -73,6 +93,7 @@
                 }
                 runtimeReady = true;
                 maybeEnableInput();
+                return runtime;
             });
 
             // The most recent conversion parameters, captured so that the
@@ -246,6 +267,42 @@
     </head>
     <body>
         <h1>Model converter</h1>
+        <div id="versions-panel" title="Library versions built into this WebAssembly module (also included in a bug report).">
+            <span class="version-badge"><span class="version-k">versions</span><span class="version-v">loading…</span></span>
+        </div>
+        <script type="module" src="./versions.mjs"></script>
+
+        <h2>Parse a text graph</h2>
+        <div class="tool-panel">
+            <p class="tool-note">
+                Paste an ONNX model or graph in the
+                <a href="https://onnx.ai/onnx/repo-docs/Syntax.html" target="_blank" rel="noopener">textual representation</a>
+                — the form <code>onnx.parser.parse_graph</code> / <code>parse_model</code> accept.
+                It is parsed into a model by the WebAssembly module (a bare graph is
+                wrapped into a model with a default-domain opset import) and shown in
+                the <b>Before</b> Netron pane. With <b>convert after parsing</b> on, it
+                is also run straight through the currently selected convert mode below
+                (Simplify / Optimize, or a single debug pass).
+            </p>
+            <textarea id="parse-graph-text" rows="8" style="width: 100%; box-sizing: border-box; font-family: monospace;"
+                placeholder="&lt;
+   ir_version: 7,
+   opset_import: [&quot;&quot; : 13]
+&gt;
+agraph (float[N] X) =&gt; (float[N] Y) {
+   Y = Relu(X)
+}"></textarea>
+            <div class="debug-actions">
+                <button id="parse-graph-button" type="button">Parse graph</button>
+                <input type="checkbox" id="parse-graph-convert" checked>
+                <label for="parse-graph-convert">convert after parsing</label>
+                <button id="parse-graph-download" type="button" style="display: none;">download model ↓</button>
+                <span id="parse-graph-status" class="tool-note"></span>
+            </div>
+        </div>
+        <script type="module" src="./debug_tools.mjs"></script>
+
+        <h2>Convert a model</h2>
         <input type="file" id="file-input" disabled title="Loading WebAssembly runtime…" />
         <span id="loading-status">⏳ Loading WebAssembly runtime… the file picker is disabled until it is ready.</span>
         <button id="download-button" disabled>Download</button>
@@ -274,6 +331,24 @@
                 can see how big it is before fetching. When a repo holds more than
                 one <code>.onnx</code>, the largest is auto-detected; use the
                 <b>file</b> selector to convert a different one.
+            </div>
+            <div style="color: #666; font-size: 0.85em; margin-top: 0.25em;">
+                <b>Shareable link:</b> the input model and options can be set from
+                the URL — e.g.
+                <code>?model=onnxmodelzoo/resnet18d_Opset18</code> or
+                <code>?model=https://…/foo.onnx&amp;optimizer=optimize&amp;cf=0</code>.
+                It loads and converts automatically (add <code>&amp;autoload=0</code>
+                to only prefill). Keys: <code>model</code>
+                (<code>hf</code>/<code>url</code>), <code>graph</code> (an ONNX text
+                graph to parse), <code>optimizer</code> (a.k.a. <code>mode</code>/<code>processor</code>; the
+                convert mode —
+                <code>simplify</code>/<code>optimize</code>/<code>optimize_fixed</code>/<code>infer_shapes</code>/<code>data_propagation</code>/<code>fold_constant</code>),
+                <code>constant_fold</code>/<code>cf</code>,
+                <code>shape_inference</code>/<code>si</code>,
+                <code>tensor_size_threshold</code>/<code>tst</code>,
+                <code>target_opset</code>/<code>opset</code>,
+                <code>backend</code> (prefills the backend-test URL). Setting an
+                input updates this URL so it stays shareable (uploads excepted).
             </div>
             <div style="margin-top: 0.25em;">
                 <input type="checkbox" id="hf-use-xet" checked>
@@ -305,6 +380,44 @@
                 </div>
             </div>
         </div>
+        <div id="backend-loader" style="margin-top: 0.6em;">
+            <label for="backend-select">…or run an
+                <a href="https://github.com/onnx/onnx/tree/main/onnx/backend/test/data" target="_blank" rel="noopener">ONNX backend test case</a>:</label>
+            <select id="backend-select">
+                <option value="">— pick a backend node test —</option>
+            </select>
+            <input type="text" id="backend-url" size="52"
+                placeholder="…or a GitHub tree / raw URL to a test-case directory">
+            <button id="backend-run" type="button">Run test case</button>
+            <span id="backend-status"></span>
+            <div style="color: #666; font-size: 0.85em; margin-top: 0.25em;">
+                Fetches <code>model.onnx</code> and the test data
+                (<code>test_data_set_N/</code> of <code>input_*.pb</code> /
+                <code>output_*.pb</code>) from GitHub, runs the model through
+                onnxruntime-web <b>with the test inputs</b>, and checks each output
+                against the expected tensor within tolerance. Pick a preset above or
+                paste a GitHub <code>tree</code> / <code>raw.githubusercontent.com</code>
+                URL; listing uses GitHub's public (rate-limited) API. With
+                <b>convert the model</b> on, the fetched model is also run through the
+                selected convert mode below (and shown in the Netron panes).
+            </div>
+            <div style="margin-top: 0.25em;">
+                <input type="checkbox" id="backend-convert" checked>
+                <label for="backend-convert">convert the model too</label>
+                <label for="backend-ep" style="margin-left: 0.6em;">execution provider</label>
+                <select id="backend-ep">
+                    <option value="wasm">WASM</option>
+                    <option value="webgpu">WebGPU (fallback to WASM)</option>
+                </select>
+                <label for="backend-atol" style="margin-left: 0.4em;">atol</label>
+                <input type="number" id="backend-atol" value="0.0001" step="any" style="width: 6em;">
+                <label for="backend-rtol">rtol</label>
+                <input type="number" id="backend-rtol" value="0.001" step="any" style="width: 6em;">
+                <button id="backend-download-log" type="button">Download log</button>
+            </div>
+            <textarea id="backend-output" readonly rows="8" style="width: 100%; box-sizing: border-box; margin-top: 0.25em;"></textarea>
+        </div>
+        <script type="module" src="./backend_test.mjs"></script>
         <div>
             <input type="radio" name="optimizer" value="simplify" id="optimizer_simplify" checked>
             <label for="optimizer_simplify">
@@ -318,6 +431,13 @@
             <label for="optimizer_optimize_fixed">
                 Fixed <a href="https://github.com/onnx/optimizer" target="_blank">Optimize</a>
             </label>
+            <span style="margin-left: 0.6em; color: #666;">| single pass (debug):</span>
+            <input type="radio" name="optimizer" value="infer_shapes" id="optimizer_infer_shapes">
+            <label for="optimizer_infer_shapes" title="Run ONNX shape inference once (not in the fixed point)">Shape inference</label>
+            <input type="radio" name="optimizer" value="data_propagation" id="optimizer_data_propagation">
+            <label for="optimizer_data_propagation" title="Run ONNX data propagation once (not in the fixed point)">Data propagation</label>
+            <input type="radio" name="optimizer" value="fold_constant" id="optimizer_fold_constant">
+            <label for="optimizer_fold_constant" title="Run one constant-folding round (not in the fixed point); uses the tensor size threshold below">Constant folding</label>
         </div>
         <div id="passes">
             <input type="checkbox" name="simplify_constant_fold" id="id_simplify_constant_fold" checked>
@@ -326,7 +446,7 @@
             <input type="checkbox" name="simplify_shape_inference" id="id_simplify_shape_inference" checked>
             <label for="id_simplify_shape_inference">shape inference (simplify only)</label>
             <br/>
-            <label>tensor size threshold (simplify only)</label>
+            <label>tensor size threshold (simplify / constant folding)</label>
             <input type="number" name="simplify_tensor_size_threshold" id="id_simplify_tensor_size_threshold" value="1000000000">
             <br/>
             <label>target opset version (simplify only, 0 = keep)</label>
@@ -347,7 +467,14 @@
             the original model on the left and the simplified/optimized result on
             the right, so you can compare them side by side. Nothing is uploaded —
             the model bytes are posted straight into the embedded Netron in your
-            browser, so there is no model-size limit.
+            browser, so there is no model-size limit. Use <b>export SVG</b> to save
+            the rendered graph as an SVG image.
+        </p>
+        <p class="macs-note">
+            Netron is driven here purely as an embeddable model-preview component
+            over a <code>postMessage</code> protocol; that idea and protocol are
+            being discussed upstream in
+            <a href="https://github.com/lutzroeder/netron/pull/1591#issuecomment-5148706256" target="_blank" rel="noopener">lutzroeder/netron#1591</a>.
         </p>
         <div id="netron-panes" style="display: flex; gap: 1em; flex-wrap: wrap;">
             <div class="netron-pane">
@@ -355,6 +482,8 @@
                     <strong>Before</strong> —
                     <button id="netron-before-open" type="button" style="display: none;">open in a new tab ↗</button>
                     <button id="netron-before-download" type="button" style="display: none;">download model ↓</button>
+                    <button id="netron-before-svg" type="button" style="display: none;">export SVG ↓</button>
+                    <button id="netron-before-png" type="button" style="display: none;">export PNG ↓</button>
                 </div>
                 <iframe id="netron-before-frame" class="netron-frame" title="Netron — original model" style="display: none;"></iframe>
                 <div id="netron-before-note" class="netron-note"></div>
@@ -364,6 +493,8 @@
                     <strong>After</strong> —
                     <button id="netron-after-open" type="button" style="display: none;">open in a new tab ↗</button>
                     <button id="netron-after-download" type="button" style="display: none;">download model ↓</button>
+                    <button id="netron-after-svg" type="button" style="display: none;">export SVG ↓</button>
+                    <button id="netron-after-png" type="button" style="display: none;">export PNG ↓</button>
                 </div>
                 <iframe id="netron-after-frame" class="netron-frame" title="Netron — simplified model" style="display: none;"></iframe>
                 <div id="netron-after-note" class="netron-note"></div>
@@ -371,6 +502,7 @@
         </div>
         <script type="module" src="./netron_view.mjs"></script>
         <script type="module" src="./hf_load.mjs"></script>
+
         <h2>Console outputs:</h2>
         <textarea id="log-output" readonly rows="20" style="width: 100%; box-sizing: border-box;"></textarea>
         <div>
@@ -409,6 +541,7 @@
                         pageUrl: location.href,
                         userAgent: navigator.userAgent,
                         runInfo: window.__onnxsimLastRunInfo || null,
+                        versions: window.__onnxsimVersions || null,
                         log: (logEl && logEl.value) || "",
                     });
                     window.open(url, "_blank", "noopener");
@@ -493,5 +626,6 @@
         </p>
         <div id="inference-trace"></div>
         <script type="module" src="./inference_browser.mjs"></script>
+
     </body>
 </html>
