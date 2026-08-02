@@ -62,12 +62,22 @@ check("parses integer options and ignores garbage", () => {
   assert.equal(parseInputParams("?opset=notanumber").targetOpset, null);
 });
 
-check("only accepts known optimizer values, incl. single-pass modes", () => {
+check("only accepts known optimizer values, incl. inline and single-pass modes", () => {
   assert.equal(parseInputParams("?optimizer=optimize_fixed").optimizer, "optimize_fixed");
+  assert.equal(parseInputParams("?optimizer=inline").optimizer, "inline");
   assert.equal(parseInputParams("?optimizer=fold_constant").optimizer, "fold_constant");
   assert.equal(parseInputParams("?optimizer=infer_shapes").optimizer, "infer_shapes");
   assert.equal(parseInputParams("?optimizer=data_propagation").optimizer, "data_propagation");
   assert.equal(parseInputParams("?optimizer=bogus").optimizer, null);
+});
+
+check("parses the inline_functions flag and its alias", () => {
+  // Absent → null so callers can tell "not set" from off.
+  assert.equal(parseInputParams("?model=x").inlineFunctions, null);
+  assert.equal(parseInputParams("?inline_functions=1").inlineFunctions, true);
+  assert.equal(parseInputParams("?inline_functions=0").inlineFunctions, false);
+  assert.equal(parseInputParams("?inline").inlineFunctions, true); // bare alias = on
+  assert.equal(parseInputParams("?inline=off").inlineFunctions, false);
 });
 
 check("optimizer accepts mode/processor/opt aliases", () => {
@@ -101,17 +111,20 @@ check("applyOptionParams prefills only the given controls", () => {
     "optimizer_optimize",
     "id_simplify_constant_fold",
     "id_simplify_shape_inference",
+    "id_inline_functions",
     "id_simplify_tensor_size_threshold",
     "id_simplify_target_opset",
   ]);
-  const params = parseInputParams("?optimizer=optimize&cf=0&si=1&tst=1000&opset=18");
+  const params = parseInputParams("?optimizer=optimize&cf=0&si=1&inline=1&tst=1000&opset=18");
   const changed = applyOptionParams(params, doc);
   assert.equal(doc.els.optimizer_optimize.checked, true);
   assert.equal(doc.els.id_simplify_constant_fold.checked, false);
   assert.equal(doc.els.id_simplify_shape_inference.checked, true);
+  assert.equal(doc.els.id_inline_functions.checked, true);
   assert.equal(doc.els.id_simplify_tensor_size_threshold.value, "1000");
   assert.equal(doc.els.id_simplify_target_opset.value, "18");
   assert.ok(changed.includes("optimizer_optimize"));
+  assert.ok(changed.includes("id_inline_functions"));
 });
 
 check("applyOptionParams leaves untouched controls alone", () => {

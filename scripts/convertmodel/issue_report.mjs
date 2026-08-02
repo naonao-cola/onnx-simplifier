@@ -49,6 +49,7 @@ function headerLines({ pageUrl, userAgent, runInfo, versions }) {
     lines.push("- File: " + runInfo.file_name);
     lines.push("- constant fold: " + runInfo.constant_fold);
     lines.push("- shape inference: " + runInfo.shape_inference);
+    lines.push("- inline functions: " + runInfo.inline_functions);
     lines.push("- tensor size threshold: " + runInfo.tensor_size_threshold);
     lines.push("- target opset version: " + runInfo.target_opset_version + " (0 = keep)");
     if (runInfo.passes && runInfo.passes.length) {

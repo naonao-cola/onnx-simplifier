@@ -4,6 +4,7 @@
 #include "onnx/checker.h"
 #include "onnx/defs/parser.h"
 #include "onnx/defs/schema.h"
+#include "onnx/inliner/inliner.h"
 
 // Version strings baked in by CMake (read from VERSION and
 // third_party/onnx-optimizer/VERSION_NUMBER). Fall back to "unknown" so the
@@ -26,6 +27,7 @@
 #include <cstdlib>
 #include <fstream>
 #include <iostream>
+#include <set>
 #include <sstream>
 #include <string>
 
@@ -145,6 +147,53 @@ bool TensorProtoToRawBytes(const onnx::TensorProto& tensor, std::string& out) {
             return true;
         default:
             return false;
+    }
+}
+
+// Highest opset version this build supports for the default ONNX domain
+// (ai.onnx), read from the linked onnx at runtime. Returns 1 if the registry
+// somehow lacks the default domain. Used to give parsed graphs a sensible
+// default opset import.
+int HighestDefaultOpset() {
+    const auto& ranges =
+        onnx::OpSchemaRegistry::DomainToVersionRange::Instance().Map();
+    auto it = ranges.find("");  // "" is the default ONNX domain (ai.onnx)
+    int max_opset = (it != ranges.end()) ? it->second.second : 0;
+    return max_opset > 0 ? max_opset : 1;
+}
+
+// Make sure `model` carries an opset import for the default ONNX domain and for
+// every domain its local functions live in, so a model assembled from parsed
+// text (which may omit the prolog, or reference local functions) still validates
+// and can be simplified / visualized. Existing opset imports are left untouched;
+// only missing domains are added. A local function's own domain is imported at
+// the version the function declares for that domain, defaulting to 1 for a
+// custom domain that declares none.
+void EnsureOpsetImports(onnx::ModelProto& model) {
+    std::set<std::string> present;
+    for (const auto& op : model.opset_import()) {
+        present.insert(op.domain());
+    }
+    if (!present.count("")) {
+        auto* op = model.add_opset_import();
+        op->set_domain("");  // default ONNX domain (ai.onnx)
+        op->set_version(HighestDefaultOpset());
+        present.insert("");
+    }
+    for (const auto& fn : model.functions()) {
+        const std::string& dom = fn.domain();
+        if (present.count(dom)) continue;
+        int64_t ver = 1;
+        for (const auto& op : fn.opset_import()) {
+            if (op.domain() == dom) {
+                ver = op.version();
+                break;
+            }
+        }
+        auto* op = model.add_opset_import();
+        op->set_domain(dom);
+        op->set_version(ver);
+        present.insert(dom);
     }
 }
 
@@ -380,22 +429,29 @@ em::val onnxsim_versions() {
 
 // Parse an ONNX *text* representation into a model and return its bytes. Accepts
 // either a whole-model text (with an `<ir_version: ..., opset_import: [...]>`
-// prolog) or a bare graph body -- the textual form onnx.parser.parse_graph
-// accepts. A bare graph is wrapped in a minimal ModelProto with a default-domain
-// opset import at the highest opset this build supports, so the parsed graph can
-// then be simplified / visualized / run like an uploaded model. Returns
-// { model: Uint8Array } on success or { error: string } describing the parse
-// failure(s).
+// prolog) or a bare graph body -- the textual form onnx.parser.parse_graph /
+// parse_model accept. Local function definitions (one or more `<domain: ...>
+// name (...) => (...) {...}` blocks after the graph) are parsed too: the model
+// path captures them natively, and either path is normalized so the model
+// carries an opset import for the default ONNX domain and for every domain its
+// functions use, plus a valid ir_version -- so a graph that calls local
+// functions still validates and can be simplified / visualized / run like an
+// uploaded model. Returns { model: Uint8Array } on success or { error: string }
+// describing the parse failure(s).
 em::val onnxsim_parse_graph(const std::string& text) {
     em::val out = em::val::object();
-    // Try whole-model text first. Each OnnxParser consumes its input, so a fresh
-    // parser is constructed per attempt (the member Parse API is stable across
-    // onnx versions).
+    // Try whole-model text first: this is the only path that captures trailing
+    // FunctionProto definitions (GraphProto has no functions field), and it also
+    // accepts a bare graph because the `<...>` prolog is optional. Each
+    // OnnxParser consumes its input, so a fresh parser is constructed per attempt
+    // (the member Parse API is stable across onnx versions).
     onnx::ModelProto model;
     onnx::OnnxParser model_parser(text.c_str());
     onnx::Common::Status model_st = model_parser.Parse(model);
-    if (!model_st.IsOK()) {
-        // Fall back to graph-only text and wrap it into a model.
+    if (!model_st.IsOK() || !model.has_graph()) {
+        // Fall back to graph-only text and wrap it into a model. This path has no
+        // functions (the graph syntax cannot carry them), so a model that needs
+        // local functions must go through the model path above.
         onnx::GraphProto graph;
         onnx::OnnxParser graph_parser(text.c_str());
         onnx::Common::Status graph_st = graph_parser.Parse(graph);
@@ -407,19 +463,16 @@ em::val onnxsim_parse_graph(const std::string& text) {
             return out;
         }
         model.Clear();
-        model.set_ir_version(onnx::IR_VERSION);
         *model.mutable_graph() = graph;
-        int max_opset = 0;
-        const auto& ranges =
-            onnx::OpSchemaRegistry::DomainToVersionRange::Instance().Map();
-        auto it = ranges.find("");  // default ONNX domain (ai.onnx)
-        if (it != ranges.end()) {
-            max_opset = it->second.second;
-        }
-        auto* opset = model.add_opset_import();
-        opset->set_domain("");  // default ONNX domain
-        opset->set_version(max_opset > 0 ? max_opset : 1);
     }
+    // A bare graph (or a graph with local functions but no explicit prolog) parses
+    // without an ir_version or opset imports; fill in sensible defaults so the
+    // result validates. Local functions require IR v8+, and EnsureOpsetImports
+    // adds an opset import for each function's domain.
+    if (model.ir_version() == 0) {
+        model.set_ir_version(onnx::IR_VERSION);
+    }
+    EnsureOpsetImports(model);
     em::val bytes = SerializeModel(model);
     if (bytes.isNull()) {
         out.set("error", std::string("failed to serialize the parsed model"));
@@ -427,6 +480,37 @@ em::val onnxsim_parse_graph(const std::string& text) {
     }
     out.set("model", bytes);
     return out;
+}
+
+// Inline the model's local (model-defined) functions into its main graph: every
+// call-site of a FunctionProto listed in `model.functions` is replaced by the
+// function body, and the functions are removed from the model. This flattens a
+// model that uses local functions into a plain op graph, which onnx-optimizer /
+// Simplify and constant folding can then see through. Schema-defined (built-in)
+// functions are left alone. Returns the inlined model bytes (null on failure);
+// `annotate` optionally bakes MAC/FLOP model info into metadata_props, matching
+// the other convert entry points.
+em::val onnxsim_inline_functions(const std::string& data, bool annotate) {
+    onnx::ModelProto xmodel;
+    std::cerr << "parsing message" << std::endl;
+    if (!xmodel.ParseFromArray(data.data(), data.size())) {
+        std::cerr << "Parse failed" << std::endl;
+        return em::val::null();
+    }
+    try {
+        onnx::inliner::InlineLocalFunctions(xmodel);
+    } catch (const std::exception& e) {
+        std::cerr << "inline functions error: " << e.what() << std::endl;
+        return em::val::null();
+    }
+    if (annotate) {
+        try {
+            AnnotateModelInfo(xmodel);
+        } catch (const std::exception& e) {
+            std::cerr << "annotate model info failed: " << e.what() << std::endl;
+        }
+    }
+    return SerializeModel(xmodel);
 }
 
 // Parse a serialized onnx.TensorProto (e.g. an input_N.pb / output_N.pb from an
@@ -552,6 +636,7 @@ EMSCRIPTEN_BINDINGS(module) {
     // single-pass debugging entry points (see the definitions above).
     em::function("onnxsim_versions", &onnxsim_versions);
     em::function("onnxsim_parse_graph", &onnxsim_parse_graph);
+    em::function("onnxsim_inline_functions", &onnxsim_inline_functions);
     em::function("onnxsim_parse_tensor", &onnxsim_parse_tensor);
     em::function("onnxsim_infer_shapes", &onnxsim_infer_shapes);
     em::function("onnxsim_data_propagation", &onnxsim_data_propagation);

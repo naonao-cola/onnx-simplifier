@@ -1,5 +1,6 @@
 leak:libcrypt
 leak:libtorch
+leak:libc10
 leak:numpy/_core
 leak:onnxruntime_pybind11_state
 leak:onnx_cpp2py_export
@@ -14,5 +15,6 @@ leak:_PyBytes_Resize
 leak:Objects/unicodeobject
 leak:PyObject_Malloc
 leak:PyMem_Malloc
+leak:PyMem_Calloc
 leak:list_resize
 leak:_io/stringio

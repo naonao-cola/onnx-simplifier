@@ -70,6 +70,11 @@ constant folding until the model stops changing. Around that it offers:
   up schemas registered via `onnx.defs.register_schema` automatically.
 - **[Opset conversion](#changing-the-opset-version).** Upgrade or downgrade the
   model's opset while simplifying with `--target-opset`.
+- **Function inlining.** Flatten the model's local (model-defined) functions into
+  the main graph before simplifying with `--inline-functions` (Python:
+  `inline_functions=True`), so the optimizer, shape inference and constant folding
+  can see through function calls. Schema-defined (built-in) functions are left
+  alone.
 - **[Custom rewriters](#custom-rewriters).** Plug your own rewriting logic into
   the fixed point with `custom_rewriter`, or express data-only `FunctionProto`
   rules that also run from the C and Rust bindings.
