@@ -267,7 +267,7 @@ async function runDataSet(ort, runtime, session, loc, setEntry, tol, log) {
   return { name: setEntry.name, passed, lines };
 }
 
-async function runBackendTest(url, tol, epPref, log) {
+async function runBackendTest(url, tol, epPref, convert, log) {
   const loc = parseGithubDirUrl(url);
   if (!loc) {
     throw new Error(
@@ -287,15 +287,28 @@ async function runBackendTest(url, tol, epPref, log) {
 
   log(`fetching model.onnx…`);
   const modelBytes = await fetchBytes(modelUrl);
+  const caseName = (loc.path.split("/").filter(Boolean).pop() || "model") + ".onnx";
 
-  // Preview the fetched model in the "Before" Netron pane (like the text-graph
-  // parser does), naming it after the test case so the pane is labelled.
+  // Make the fetched model a first-class converter input, like the text-graph
+  // parser: preview it in the "Before" Netron pane and publish it as the
+  // inference panel's "original" source.
   if (typeof window.netronShowBefore === "function") {
-    const caseName = (loc.path.split("/").filter(Boolean).pop() || "model") + ".onnx";
     try {
       window.netronShowBefore(modelBytes, caseName);
     } catch {
       // Best-effort preview: a Netron hiccup must not fail the test run.
+    }
+  }
+  window.__onnxsimOriginal = { bytes: modelBytes, name: caseName };
+  // Optionally run it straight through the Simplify / Optimize path (a copy,
+  // since startConversion transfers and detaches the buffer it is given, and we
+  // still need modelBytes for the inference session below).
+  if (convert && typeof window.__onnxsimStartConversion === "function") {
+    log(`sending ${caseName} through the converter…`);
+    try {
+      window.__onnxsimStartConversion(caseName, modelBytes.slice().buffer);
+    } catch (e) {
+      log(`could not start conversion: ${e && e.message ? e.message : e}`);
     }
   }
 
@@ -339,6 +352,7 @@ function initBackendPanel() {
   const rtolInput = document.getElementById("backend-rtol");
   const out = document.getElementById("backend-output");
   const dlBtn = document.getElementById("backend-download-log");
+  const convertChk = document.getElementById("backend-convert");
   if (!btn) return;
 
   const log = (msg) => {
@@ -359,7 +373,8 @@ function initBackendPanel() {
         rtol: parseFloat(rtolInput ? rtolInput.value : "") || 1e-3,
       };
       const epPref = epSelect ? epSelect.value : "wasm";
-      await runBackendTest(urlInput ? urlInput.value : "", tol, epPref, log);
+      const convert = convertChk ? convertChk.checked : false;
+      await runBackendTest(urlInput ? urlInput.value : "", tol, epPref, convert, log);
     } catch (e) {
       log("ERROR: " + (e && e.message ? e.message : String(e)));
     } finally {

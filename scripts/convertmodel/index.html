@@ -605,11 +605,19 @@ agraph (float[N] X) =&gt; (float[N] Y) {
                 and each output is compared with the expected tensor within tolerance.
                 GitHub <code>tree</code> URLs and <code>raw.githubusercontent.com</code>
                 URLs both work; listing uses GitHub's public (rate-limited) API.
+                With <b>convert the model</b> on, the fetched <code>model.onnx</code>
+                is also sent straight through the Simplify / Optimize path above (and
+                shown in the Netron panes), so a backend test case doubles as a
+                converter input.
             </p>
             <div class="debug-actions">
                 <input type="text" id="backend-url" size="70"
                     placeholder="https://github.com/onnx/onnx/tree/main/onnx/backend/test/data/node/test_relu"
                     style="flex: 1 1 30em;">
+            </div>
+            <div class="debug-actions">
+                <input type="checkbox" id="backend-convert" checked>
+                <label for="backend-convert">convert the model (Simplify/Optimize) too</label>
             </div>
             <div class="debug-actions">
                 <label for="backend-ep">execution provider</label>
