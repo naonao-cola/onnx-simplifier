@@ -31,7 +31,16 @@ function toInt(v) {
   return Number.isFinite(n) ? n : null;
 }
 
-const OPTIMIZERS = ["simplify", "optimize", "optimize_fixed"];
+// The converter's mode radio values: the three optimizers plus the single-pass
+// debug modes (each runs one of Simplify's fixed-point steps once).
+const OPTIMIZERS = [
+  "simplify",
+  "optimize",
+  "optimize_fixed",
+  "infer_shapes",
+  "data_propagation",
+  "fold_constant",
+];
 
 // Parse a `location.search` (or any query string) into a normalized config.
 // Fields are null when the parameter is absent, except `autoload` which
@@ -54,6 +63,10 @@ export function parseInputParams(search) {
   return {
     model: trimmed(first("model", "hf", "url", "input")),
     backend: trimmed(first("backend", "testcase", "test")),
+    // The ONNX text graph to parse (onnx.parser syntax). Not trimmed of interior
+    // whitespace — only null when the key is absent or empty — since the graph
+    // body's own formatting matters.
+    graph: first("graph", "text"),
     autoload: autoloadRaw === null ? true : autoloadRaw,
     optimizer,
     constantFold: toBool(first("constant_fold", "cf")),
@@ -65,19 +78,50 @@ export function parseInputParams(search) {
 
 // Every query key that names an input source; setting one canonical input
 // clears all of these so the URL always reflects a single current input.
-const INPUT_KEYS = ["model", "hf", "url", "input", "backend", "testcase", "test"];
+const INPUT_KEYS = [
+  "model", "hf", "url", "input",
+  "backend", "testcase", "test",
+  "graph", "text",
+];
+
+// The canonical query key for each input kind.
+const INPUT_KEY = { backend: "backend", graph: "graph", model: "model" };
 
 // Return a new query string (leading "?" or "") that names `value` as the input,
-// under the canonical key for `kind` ("backend" -> `backend`, anything else ->
-// `model`), dropping every other input key while preserving option params
-// (optimizer, cf, …). Pure, for unit testing.
+// under the canonical key for `kind` ("backend"/"graph", else "model"), dropping
+// every other input key while preserving option params (optimizer, cf, …).
+// Pure, for unit testing.
 export function setInputParam(search, kind, value) {
   const p = new URLSearchParams(search || "");
   for (const k of INPUT_KEYS) p.delete(k);
-  const key = kind === "backend" ? "backend" : "model";
-  p.set(key, value);
+  p.set(INPUT_KEY[kind] || "model", value);
   const s = p.toString();
   return s ? `?${s}` : "";
+}
+
+// Set (or, for an empty value, delete) a single non-input param, preserving
+// everything else — used to reflect the conversion processor (?optimizer=).
+// Pure, for unit testing.
+export function setUrlParam(search, key, value) {
+  const p = new URLSearchParams(search || "");
+  if (value === null || value === undefined || value === "") {
+    p.delete(key);
+  } else {
+    p.set(key, value);
+  }
+  const s = p.toString();
+  return s ? `?${s}` : "";
+}
+
+// Reflect a single param in the address bar (history.replaceState). Best-effort.
+export function syncUrlParam(key, value) {
+  try {
+    if (typeof window === "undefined" || !window.history) return;
+    const search = setUrlParam(window.location.search, key, value);
+    window.history.replaceState(null, "", window.location.pathname + search + window.location.hash);
+  } catch {
+    // ignore — a failed URL update must not break anything.
+  }
 }
 
 // Reflect a just-set input model in the address bar (history.replaceState, so no

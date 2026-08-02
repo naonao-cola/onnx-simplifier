@@ -6,7 +6,12 @@
 //   node test/query_params.test.mjs
 
 import assert from "node:assert/strict";
-import { parseInputParams, applyOptionParams, setInputParam } from "../query_params.mjs";
+import {
+  parseInputParams,
+  applyOptionParams,
+  setInputParam,
+  setUrlParam,
+} from "../query_params.mjs";
 
 let passed = 0;
 function check(name, fn) {
@@ -56,9 +61,20 @@ check("parses integer options and ignores garbage", () => {
   assert.equal(parseInputParams("?opset=notanumber").targetOpset, null);
 });
 
-check("only accepts known optimizer values", () => {
+check("only accepts known optimizer values, incl. single-pass modes", () => {
   assert.equal(parseInputParams("?optimizer=optimize_fixed").optimizer, "optimize_fixed");
+  assert.equal(parseInputParams("?optimizer=fold_constant").optimizer, "fold_constant");
+  assert.equal(parseInputParams("?optimizer=infer_shapes").optimizer, "infer_shapes");
+  assert.equal(parseInputParams("?optimizer=data_propagation").optimizer, "data_propagation");
   assert.equal(parseInputParams("?optimizer=bogus").optimizer, null);
+});
+
+check("parses a text graph param (graph/text), preserving interior whitespace", () => {
+  const graph = "agraph (float[N] X) => (float[N] Y) {\n  Y = Relu(X)\n}";
+  const c = parseInputParams("?graph=" + encodeURIComponent(graph));
+  assert.equal(c.graph, graph);
+  assert.equal(parseInputParams("?text=" + encodeURIComponent(graph)).graph, graph);
+  assert.equal(parseInputParams("?model=x").graph, null);
 });
 
 check("parses a backend test-case URL", () => {
@@ -119,6 +135,22 @@ check("setInputParam round-trips through parseInputParams", () => {
   const s = setInputParam("", "model", "https://x/y.onnx");
   assert.ok(s.startsWith("?"));
   assert.equal(parseInputParams(s).model, "https://x/y.onnx");
+});
+
+check("setInputParam sets graph and clears other inputs", () => {
+  const s = setInputParam("?model=owner/repo&optimizer=fold_constant", "graph", "agraph () => () {}");
+  const p = new URLSearchParams(s);
+  assert.equal(p.get("graph"), "agraph () => () {}");
+  assert.equal(p.get("model"), null);
+  assert.equal(p.get("optimizer"), "fold_constant"); // option preserved
+});
+
+check("setUrlParam sets/deletes one param, preserving inputs", () => {
+  assert.equal(new URLSearchParams(setUrlParam("?model=x", "optimizer", "optimize")).get("optimizer"), "optimize");
+  // Existing input param is preserved.
+  assert.equal(new URLSearchParams(setUrlParam("?model=x", "optimizer", "optimize")).get("model"), "x");
+  // Empty value deletes the key.
+  assert.equal(new URLSearchParams(setUrlParam("?model=x&optimizer=optimize", "optimizer", "")).get("optimizer"), null);
 });
 
 console.log(`PASS: ${passed} checks`);

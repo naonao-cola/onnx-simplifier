@@ -339,12 +339,15 @@ agraph (float[N] X) =&gt; (float[N] Y) {
                 <code>?model=https://…/foo.onnx&amp;optimizer=optimize&amp;cf=0</code>.
                 It loads and converts automatically (add <code>&amp;autoload=0</code>
                 to only prefill). Keys: <code>model</code>
-                (<code>hf</code>/<code>url</code>), <code>optimizer</code>,
+                (<code>hf</code>/<code>url</code>), <code>graph</code> (an ONNX text
+                graph to parse), <code>optimizer</code> (the convert mode —
+                <code>simplify</code>/<code>optimize</code>/<code>optimize_fixed</code>/<code>infer_shapes</code>/<code>data_propagation</code>/<code>fold_constant</code>),
                 <code>constant_fold</code>/<code>cf</code>,
                 <code>shape_inference</code>/<code>si</code>,
                 <code>tensor_size_threshold</code>/<code>tst</code>,
                 <code>target_opset</code>/<code>opset</code>,
-                <code>backend</code> (prefills the backend-test URL below).
+                <code>backend</code> (prefills the backend-test URL). Setting an
+                input updates this URL so it stays shareable (uploads excepted).
             </div>
             <div style="margin-top: 0.25em;">
                 <input type="checkbox" id="hf-use-xet" checked>

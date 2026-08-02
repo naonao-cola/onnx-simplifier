@@ -9,6 +9,7 @@
 // Parsing needs no model executor, so it runs on this page's runtime directly.
 
 import { downloadBytes } from "./download.mjs";
+import { syncInputUrl } from "./query_params.mjs";
 
 // Resolve this page's WASM runtime (published by index.html's inline loader).
 function getRuntime() {
@@ -56,6 +57,8 @@ async function initParsePanel() {
       // inference panel's "original" source.
       if (window.netronShowBefore) window.netronShowBefore(bytes, name);
       window.__onnxsimOriginal = { bytes, name };
+      // Reflect the graph text in the address bar so the link is shareable.
+      syncInputUrl("graph", text);
       // Optionally run it straight through the converter using the currently
       // selected mode (a fresh copy, since startConversion transfers and
       // detaches the buffer it is given).
