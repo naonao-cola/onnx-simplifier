@@ -288,6 +288,17 @@ async function runBackendTest(url, tol, epPref, log) {
   log(`fetching model.onnx…`);
   const modelBytes = await fetchBytes(modelUrl);
 
+  // Preview the fetched model in the "Before" Netron pane (like the text-graph
+  // parser does), naming it after the test case so the pane is labelled.
+  if (typeof window.netronShowBefore === "function") {
+    const caseName = (loc.path.split("/").filter(Boolean).pop() || "model") + ".onnx";
+    try {
+      window.netronShowBefore(modelBytes, caseName);
+    } catch {
+      // Best-effort preview: a Netron hiccup must not fail the test run.
+    }
+  }
+
   log(`loading onnxruntime-web ${ORT_VERSION}…`);
   const ort = await loadOrt();
   const providers = epPref === "webgpu" ? ["webgpu", "wasm"] : ["wasm"];

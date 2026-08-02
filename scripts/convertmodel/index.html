@@ -275,6 +275,39 @@
         <div id="versions-panel" title="Library versions built into this WebAssembly module (also included in a bug report).">
             <span class="version-badge"><span class="version-k">versions</span><span class="version-v">loading…</span></span>
         </div>
+        <script type="module" src="./versions.mjs"></script>
+
+        <h2>Parse a text graph</h2>
+        <div class="tool-panel">
+            <p class="tool-note">
+                Paste an ONNX model or graph in the
+                <a href="https://onnx.ai/onnx/repo-docs/Syntax.html" target="_blank" rel="noopener">textual representation</a>
+                — the form <code>onnx.parser.parse_graph</code> / <code>parse_model</code> accept.
+                It is parsed into a model by the WebAssembly module (a bare graph is
+                wrapped into a model with a default-domain opset import), then shown in
+                the <b>Before</b> Netron pane and made the input for the
+                <b>single-feature</b> debugging passes. With <b>convert after parsing</b>
+                on, it is also run straight through the Simplify / Optimize path.
+            </p>
+            <textarea id="parse-graph-text" rows="8" style="width: 100%; box-sizing: border-box; font-family: monospace;"
+                placeholder="&lt;
+   ir_version: 7,
+   opset_import: [&quot;&quot; : 13]
+&gt;
+agraph (float[N] X) =&gt; (float[N] Y) {
+   Y = Relu(X)
+}"></textarea>
+            <div class="debug-actions">
+                <button id="parse-graph-button" type="button">Parse graph</button>
+                <input type="checkbox" id="parse-graph-convert" checked>
+                <label for="parse-graph-convert">convert after parsing</label>
+                <button id="parse-graph-download" type="button" style="display: none;">download model ↓</button>
+                <span id="parse-graph-status" class="tool-note"></span>
+            </div>
+        </div>
+        <script type="module" src="./debug_tools.mjs"></script>
+
+        <h2>Convert a model</h2>
         <input type="file" id="file-input" disabled title="Loading WebAssembly runtime…" />
         <span id="loading-status">⏳ Loading WebAssembly runtime… the file picker is disabled until it is ready.</span>
         <button id="download-button" disabled>Download</button>
@@ -424,35 +457,6 @@
         <script type="module" src="./netron_view.mjs"></script>
         <script type="module" src="./hf_load.mjs"></script>
 
-        <h2>Parse a text graph</h2>
-        <div class="tool-panel">
-            <p class="tool-note">
-                Paste an ONNX model or graph in the
-                <a href="https://onnx.ai/onnx/repo-docs/Syntax.html" target="_blank" rel="noopener">textual representation</a>
-                — the form <code>onnx.parser.parse_graph</code> / <code>parse_model</code> accept.
-                It is parsed into a model by the WebAssembly module (a bare graph is
-                wrapped into a model with a default-domain opset import), then shown in
-                the <b>Before</b> Netron pane and made the input for the
-                <b>single-feature</b> passes below. With <b>convert after parsing</b> on,
-                it is also run straight through the Simplify path above.
-            </p>
-            <textarea id="parse-graph-text" rows="8" style="width: 100%; box-sizing: border-box; font-family: monospace;"
-                placeholder="&lt;
-   ir_version: 7,
-   opset_import: [&quot;&quot; : 13]
-&gt;
-agraph (float[N] X) =&gt; (float[N] Y) {
-   Y = Relu(X)
-}"></textarea>
-            <div class="debug-actions">
-                <button id="parse-graph-button" type="button">Parse graph</button>
-                <input type="checkbox" id="parse-graph-convert" checked>
-                <label for="parse-graph-convert">convert after parsing</label>
-                <button id="parse-graph-download" type="button" style="display: none;">download model ↓</button>
-                <span id="parse-graph-status" class="tool-note"></span>
-            </div>
-        </div>
-
         <h2>Run a single feature (debugging)</h2>
         <div class="tool-panel">
             <p class="tool-note">
@@ -479,7 +483,6 @@ agraph (float[N] X) =&gt; (float[N] Y) {
             </div>
             <textarea id="debug-output" readonly rows="8" style="width: 100%; box-sizing: border-box;"></textarea>
         </div>
-        <script type="module" src="./debug_tools.mjs"></script>
 
         <h2>Console outputs:</h2>
         <textarea id="log-output" readonly rows="20" style="width: 100%; box-sizing: border-box;"></textarea>
