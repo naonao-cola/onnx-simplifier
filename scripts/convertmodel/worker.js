@@ -93,7 +93,12 @@ create_onnxsim({
 
     addEventListener("message", async (e) => {
         console.log(e.data);
-        const buf = e.data[1];
+        let buf = e.data[1];
+        // The true uploaded bytes, kept aside so the "annotate the original for
+        // the inference-compare panel" step below always sees the model the user
+        // gave us, even when the inline pre-step replaces `buf` with the inlined
+        // model before the main transform runs.
+        const originalBuf = e.data[1];
         // `model` is the converted model bytes (a Uint8Array view); `trace` is
         // the onnxsim profiling trace JSON for "simplify" when profiling was
         // requested, otherwise an empty string.
@@ -104,6 +109,24 @@ create_onnxsim({
         // user gets an explanation (see memoryLimitMessage) instead of the worker
         // dying with an opaque, unhandled error.
         try {
+        // Optional pre-step: inline the model's local functions before the main
+        // transform, so onnx-optimizer / Simplify / constant folding see through
+        // them into a plain op graph. Controlled by a checkbox (e.data[9]) and
+        // only meaningful for the whole-model transforms; the single-pass debug
+        // modes and the standalone "inline" mode below never run it. Inlining
+        // needs no model executor, so it is synchronous in both module variants.
+        if (e.data[9] &&
+            (e.data[0] === "simplify" || e.data[0] === "optimize" ||
+             e.data[0] === "optimize_fixed")) {
+            const inlined = runtime.onnxsim_inline_functions(buf, false);
+            if (!inlined) {
+                postMessage(["stderr", "inline functions failed!"]);
+                return;
+            }
+            // Copy out of the wasm heap (the view is invalidated by later wasm
+            // calls) and feed the inlined bytes to the selected transform.
+            buf = new Uint8Array(inlined).buffer;
+        }
         switch (e.data[0]) {
             case "simplify": {
                 // Simplify returns { model, trace } so the profiling trace can
@@ -141,6 +164,16 @@ create_onnxsim({
                 model = runtime.onnxoptimizer_optimize_fixed(
                     buf,
                     e.data[2], // target optimizers
+                    e.data[8], // annotate model info (MACs/FLOPs) into metadata_props
+                );
+                break;
+            // Standalone transform: inline the model's local functions into its
+            // main graph and return the flattened model. Unlike the pre-step
+            // above (which feeds a following simplify/optimize), this is the
+            // whole conversion, so it honors the "annotate model info" toggle.
+            case "inline":
+                model = runtime.onnxsim_inline_functions(
+                    buf,
                     e.data[8], // annotate model info (MACs/FLOPs) into metadata_props
                 );
                 break;
@@ -192,7 +225,7 @@ create_onnxsim({
         let original_data_url = "";
         if (e.data[8]) {
             try {
-                const annotated = runtime.onnxsim_annotate_model_info(buf);
+                const annotated = runtime.onnxsim_annotate_model_info(originalBuf);
                 if (annotated) {
                     original_data_url =
                         "data:application/octet-stream;base64," + annotated.toBase64();

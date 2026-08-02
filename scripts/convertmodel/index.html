@@ -263,9 +263,15 @@
                     // by default; applies to every optimizer mode.
                     const annotate_model_info = document.getElementById("id_annotate_model_info").checked;
                     last_run_info.annotate_model_info = annotate_model_info;
+                    // Inline the model's local functions before simplify / optimize /
+                    // fixed optimize (a no-op for the single-pass debug modes and the
+                    // standalone "inline" mode). Off by default so behaviour is
+                    // unchanged unless the user opts in.
+                    const inline_functions = document.getElementById("id_inline_functions").checked;
+                    last_run_info.inline_functions = inline_functions;
                     // Expose the latest run parameters to the report-issue module.
                     window.__onnxsimLastRunInfo = last_run_info;
-                    worker.postMessage([optimizer, buf, passes, constant_fold, shape_inference, tensor_size_threshold, target_opset_version, profile, annotate_model_info], [buf]);
+                    worker.postMessage([optimizer, buf, passes, constant_fold, shape_inference, tensor_size_threshold, target_opset_version, profile, annotate_model_info, inline_functions], [buf]);
                 };
                 // Expose the conversion entry point for the Hugging Face loader
                 // module (hf_load.mjs), which downloads model bytes and drives
@@ -300,9 +306,13 @@
                 — the form <code>onnx.parser.parse_graph</code> / <code>parse_model</code> accept.
                 It is parsed into a model by the WebAssembly module (a bare graph is
                 wrapped into a model with a default-domain opset import) and shown in
-                the <b>Before</b> Netron pane. With <b>convert after parsing</b> on, it
-                is also run straight through the currently selected convert mode below
-                (Simplify / Optimize, or a single debug pass).
+                the <b>Before</b> Netron pane. Local <b>function</b> definitions
+                (<code>&lt;domain: "..."&gt; name (...) =&gt; (...) {...}</code> blocks after
+                the graph) are parsed too, and the wrapped model gains an opset import
+                for each function's domain so it validates. With <b>convert after
+                parsing</b> on, it is also run straight through the currently selected
+                convert mode below (Simplify / Optimize / Inline functions, or a single
+                debug pass).
             </p>
             <textarea id="parse-graph-text" rows="8" style="width: 100%; box-sizing: border-box; font-family: monospace;"
                 placeholder="&lt;
@@ -362,9 +372,10 @@ agraph (float[N] X) =&gt; (float[N] Y) {
                 (<code>hf</code>/<code>url</code>), <code>graph</code> (an ONNX text
                 graph to parse), <code>optimizer</code> (a.k.a. <code>mode</code>/<code>processor</code>; the
                 convert mode —
-                <code>simplify</code>/<code>optimize</code>/<code>optimize_fixed</code>/<code>infer_shapes</code>/<code>data_propagation</code>/<code>fold_constant</code>),
+                <code>simplify</code>/<code>optimize</code>/<code>optimize_fixed</code>/<code>inline</code>/<code>infer_shapes</code>/<code>data_propagation</code>/<code>fold_constant</code>),
                 <code>constant_fold</code>/<code>cf</code>,
                 <code>shape_inference</code>/<code>si</code>,
+                <code>inline_functions</code>/<code>inline</code>,
                 <code>tensor_size_threshold</code>/<code>tst</code>,
                 <code>target_opset</code>/<code>opset</code>,
                 <code>backend</code> (prefills the backend-test URL). Setting an
@@ -451,6 +462,8 @@ agraph (float[N] X) =&gt; (float[N] Y) {
             <label for="optimizer_optimize_fixed">
                 Fixed <a href="https://github.com/onnx/optimizer" target="_blank">Optimize</a>
             </label>
+            <input type="radio" name="optimizer" value="inline" id="optimizer_inline">
+            <label for="optimizer_inline" title="Inline the model's local (model-defined) functions into the main graph; schema-defined functions are left alone">Inline functions</label>
             <span style="margin-left: 0.6em; color: #666;">| single pass (debug):</span>
             <input type="radio" name="optimizer" value="infer_shapes" id="optimizer_infer_shapes">
             <label for="optimizer_infer_shapes" title="Run ONNX shape inference once (not in the fixed point)">Shape inference</label>
@@ -465,6 +478,9 @@ agraph (float[N] X) =&gt; (float[N] Y) {
             <br/>
             <input type="checkbox" name="simplify_shape_inference" id="id_simplify_shape_inference" checked>
             <label for="id_simplify_shape_inference">shape inference (simplify only)</label>
+            <br/>
+            <input type="checkbox" name="inline_functions" id="id_inline_functions">
+            <label for="id_inline_functions">inline local functions first (simplify / optimize / fixed optimize) — flatten model-defined functions into the graph before converting</label>
             <br/>
             <label>tensor size threshold (simplify / constant folding)</label>
             <input type="number" name="simplify_tensor_size_threshold" id="id_simplify_tensor_size_threshold" value="1000000000">

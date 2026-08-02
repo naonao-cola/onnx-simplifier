@@ -12,8 +12,11 @@
 //     "Run an ONNX backend test case" panel.
 //   autoload (run, convert) — whether to start the conversion automatically once
 //     a model is given (default: true).
-//   optimizer (opt) — "simplify" | "optimize" | "optimize_fixed".
+//   optimizer (opt) — "simplify" | "optimize" | "optimize_fixed" | "inline" |
+//     the single-pass debug modes.
 //   constant_fold (cf), shape_inference (si) — booleans.
+//   inline_functions (inline) — boolean: inline local functions before the
+//     simplify / optimize / fixed-optimize transform.
 //   tensor_size_threshold (tst), target_opset (opset) — integers.
 
 // Parse a boolean-ish value: an empty value (a bare `?cf`) means "on"; returns
@@ -37,6 +40,7 @@ const OPTIMIZERS = [
   "simplify",
   "optimize",
   "optimize_fixed",
+  "inline",
   "infer_shapes",
   "data_propagation",
   "fold_constant",
@@ -73,6 +77,9 @@ export function parseInputParams(search) {
     optimizer,
     constantFold: toBool(first("constant_fold", "cf")),
     shapeInference: toBool(first("shape_inference", "si")),
+    // Whether to inline local functions before simplify / optimize / fixed
+    // optimize (the "inline local functions first" checkbox).
+    inlineFunctions: toBool(first("inline_functions", "inline")),
     tensorSizeThreshold: toInt(first("tensor_size_threshold", "tst")),
     targetOpset: toInt(first("target_opset", "opset")),
   };
@@ -173,6 +180,7 @@ export function applyOptionParams(params, doc) {
   }
   setChecked("id_simplify_constant_fold", params.constantFold);
   setChecked("id_simplify_shape_inference", params.shapeInference);
+  setChecked("id_inline_functions", params.inlineFunctions);
   setValue("id_simplify_tensor_size_threshold", params.tensorSizeThreshold);
   setValue("id_simplify_target_opset", params.targetOpset);
   return changed;
