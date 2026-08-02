@@ -30,7 +30,10 @@ jobs:
       # the debug symbols when repairing the released wheels; the sanitizer
       # workflow builds separately and keeps its symbols.
       CIBW_REPAIR_WHEEL_COMMAND_LINUX: "auditwheel repair -w {dest_dir} {wheel} --strip"
-      CIBW_ENVIRONMENT: CMAKE_ARGS="-DONNX_USE_PROTOBUF_SHARED_LIBS=OFF" CMAKE_GENERATOR=Ninja CMAKE_CXX_COMPILER_LAUNCHER=sccache CMAKE_LINKER_TYPE=LLD
+      # onnx 1.23+ uses std::to_chars in its text printer, which libc++ only
+      # exposes from macOS 13.3; match the deployment target onnx itself ships
+      # its wheels with so both the compile and the delocate/tag step agree.
+      CIBW_ENVIRONMENT: MACOSX_DEPLOYMENT_TARGET=13.3 CMAKE_ARGS="-DONNX_USE_PROTOBUF_SHARED_LIBS=OFF" CMAKE_GENERATOR=Ninja CMAKE_CXX_COMPILER_LAUNCHER=sccache CMAKE_LINKER_TYPE=LLD
       SCCACHE_GHA_ENABLED: on
       ACTIONS_CACHE_SERVICE_V2: on
     name: Build wheel ${{ matrix.py_ver }} on ${{ matrix.os }}

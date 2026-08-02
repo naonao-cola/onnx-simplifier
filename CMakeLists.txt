@@ -1,10 +1,13 @@
 cmake_minimum_required(VERSION 3.22)
 
-# For std::filesystem in onnx optimizer
+# For std::filesystem in onnx optimizer, and std::to_chars (used by onnx's
+# text printer) which libc++ only marks available from macOS 13.3 onwards.
+# ONNX itself raised its wheel deployment target to 13.3 for the same reason,
+# so onnxsim follows to keep building the bundled onnx on macOS.
 # Must be a cache variable and be set before project()
 # Reference: https://cmake.org/cmake/help/latest/variable/CMAKE_OSX_DEPLOYMENT_TARGET.html
 # It can be a normal variable if policy CMP0126 is set to NEW.
-set(CMAKE_OSX_DEPLOYMENT_TARGET 10.15 CACHE STRING "Minimum OS X deployment version")
+set(CMAKE_OSX_DEPLOYMENT_TARGET 13.3 CACHE STRING "Minimum OS X deployment version")
 
 project(onnxsim CXX)
 
@@ -197,19 +200,79 @@ if (ONNXSIM_C_API)
   if (NOT ONNXSIM_BUILTIN_ORT)
     message(FATAL_ERROR "ONNXSIM_C_API requires ONNXSIM_BUILTIN_ORT=ON")
   endif()
-  # In the builtin-ORT path onnx_optimizer is built as a shared library
-  # (build_ort.cmake sets BUILD_SHARED_LIBS ON), but it inherits the
-  # project-wide "hidden" visibility preset, so it exports none of its symbols.
-  # onnxsim/onnxsim_c call into it across the shared-library boundary (e.g.
-  # OptimizeFixed, GetFuseAndEliminationPass), which then fail to resolve at
-  # runtime with "undefined symbol". Restore default visibility so those symbols
-  # are exported. (The Python build avoids this by linking it statically.)
-  if (TARGET onnx_optimizer)
-    set_target_properties(onnx_optimizer PROPERTIES CXX_VISIBILITY_PRESET default
-                                                    VISIBILITY_INLINES_HIDDEN FALSE)
-  endif()
+  # onnx_optimizer, onnx and onnx_proto are built as part of the builtin-ORT
+  # subtree and absorbed statically into onnxsim_c (option 1; see
+  # build_ort.cmake). Two settings they inherit from that subtree must be undone
+  # for onnxsim_c to link:
+  #
+  #  * Visibility -- they inherit the project-wide "hidden" preset. onnxsim_c
+  #    calls onnx_optimizer entry points (OptimizeFixed, GetFuseAndElimination
+  #    Pass, ...) and, historically when these were separate shared libraries,
+  #    needed them exported, so restore default visibility (harmless now that
+  #    they link in statically).
+  #  * RTTI -- ONNX Runtime configures its subtree with onnxruntime_DISABLE_RTTI
+  #    =ON (-fno-rtti), so onnx, the generated *.pb.cc and the bundled protobuf
+  #    omit their typeinfo (onnx-ml.pb.cc emits onnx::ModelProto's vtable but not
+  #    its typeinfo; libprotobuf omits google::protobuf::Message/MessageLite
+  #    typeinfo). onnxsim is compiled RTTI-on -- it has to be, because
+  #    onnx-optimizer's cse_util.h uses typeid(T) -- and references
+  #    onnx::ModelProto's typeinfo, so the link fails with "undefined symbol:
+  #    typeinfo for onnx::ModelProto" (and, once that resolves, its
+  #    google::protobuf::Message base). Compiling onnxsim -fno-rtti to match the
+  #    stack is therefore not possible; instead force -frtti back on for the onnx
+  #    and protobuf targets so the whole typeinfo chain is emitted (-frtti wins
+  #    as the last -f(no-)rtti on the command line).
+  foreach(_onnxsim_shared_dep onnx_optimizer onnx onnx_proto)
+    if (TARGET ${_onnxsim_shared_dep})
+      set_target_properties(${_onnxsim_shared_dep} PROPERTIES
+        CXX_VISIBILITY_PRESET default
+        VISIBILITY_INLINES_HIDDEN FALSE)
+    endif()
+  endforeach()
+  foreach(_onnxsim_rtti_dep onnx onnx_proto libprotobuf libprotobuf-lite)
+    if (TARGET ${_onnxsim_rtti_dep})
+      target_compile_options(${_onnxsim_rtti_dep} PRIVATE
+        $<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:-frtti>)
+    endif()
+  endforeach()
   add_library(onnxsim_c SHARED onnxsim/capi/onnxsim_c_api.cpp)
-  target_link_libraries(onnxsim_c PRIVATE onnxsim onnx_optimizer onnx)
+  # With the onnx stack built static (option 1) the linker prunes archive members
+  # nothing references directly: onnx's operator schemas and shape-inference fns
+  # (e.g. onnx::RNNShapeInference, self-registered via static initializers) and
+  # onnx.pb.cc (onnx::ModelProto's vtable/typeinfo, referenced only through a
+  # weak COMDAT reference). Whole-archive onnxsim + onnx + onnx_proto so every
+  # such object is retained.
+  #
+  # Whole-archive by ARCHIVE FILE ($<TARGET_FILE:...>) rather than by target
+  # name. onnx and onnx_proto also reach onnxsim_c transitively (as ordinary
+  # link items through onnxsim/onnx_optimizer), and CMake refuses to link the
+  # same *target* both with the WHOLE_ARCHIVE feature and plain -- the
+  # "$<LINK_LIBRARY:WHOLE_ARCHIVE,...>" genex fails to configure with "link item
+  # 'onnx' ... has already occurred with the feature 'WHOLE_ARCHIVE', which is
+  # not allowed". Passing the archive paths as raw linker inputs sidesteps both
+  # that per-target feature check and CMake's de-duplication (which otherwise
+  # drops onnx_proto's onnx.pb.cc -- ModelProto's vtable/typeinfo -- back out of
+  # a raw --whole-archive group). The transitive plain occurrences still link
+  # normally for their referenced members; the whole-archive pass additionally
+  # retains the members nothing references directly: onnx's self-registered
+  # operator schemas / shape-inference fns (e.g. onnx::RNNShapeInference) and
+  # onnx.pb.cc's ModelProto RTTI (reached only through a weak COMDAT reference).
+  # The onnx-operators *.pb.cc object is archived into both libonnx and
+  # libonnx_proto, so --allow-multiple-definition tolerates the duplicate:
+  # protobuf's per-file descriptor_table merges to one copy whose once-guarded
+  # registration runs exactly once. onnx_optimizer and ONNX Runtime link normally
+  # (referenced directly / via the Ort:: C++ API through onnxsim's interface).
+  target_link_libraries(onnxsim_c PRIVATE onnxsim onnx_optimizer)
+  target_link_options(onnxsim_c PRIVATE
+    "LINKER:--allow-multiple-definition"
+    "LINKER:--whole-archive"
+    "$<TARGET_FILE:onnxsim>"
+    "$<TARGET_FILE:onnx>"
+    "$<TARGET_FILE:onnx_proto>"
+    "LINKER:--no-whole-archive")
+  # $<TARGET_FILE:...> in link options does not itself create a build-order
+  # edge, so require the archives explicitly (onnxsim already is a link dep).
+  add_dependencies(onnxsim_c onnx onnx_proto)
   target_include_directories(onnxsim_c PUBLIC onnxsim/capi)
   # The exported symbols opt back into default visibility via ONNXSIM_C_API in
   # the header, so the project-wide "hidden" preset keeps everything else local.
@@ -229,6 +292,27 @@ if (ONNXSIM_PYTHON)
   # STABLE_ABI applies on regular interpreters, FREE_THREADED on cp314t.
   nanobind_add_module(onnxsim_cpp2py_export onnxsim/cpp2py_export.cc STABLE_ABI FREE_THREADED)
   target_link_libraries(onnxsim_cpp2py_export PRIVATE onnxsim)
+
+  # onnxsim links the ONNX and protobuf C++ libraries statically into this
+  # extension, but the running Python process ALSO loads the separate pip
+  # `onnx` package (onnx_cpp2py_export), which carries its own copy of the same
+  # onnx::/google::protobuf:: symbols built against a possibly different
+  # protobuf major (onnx <= 1.22 -> protobuf 5.x; our bundled onnx 1.23 ->
+  # protobuf 6.x). ONNX and protobuf annotate their public classes with
+  # default-visibility export macros (ONNX_API / PROTOBUF_EXPORT), so those
+  # symbols leak out of this module even under the project-wide hidden preset.
+  # On macOS, dyld coalesces such weak definitions (vtables, typeinfo, inline
+  # methods) across every loaded image regardless of the two-level namespace,
+  # so onnxsim's protobuf-6 message objects can end up dispatching through pip
+  # onnx's protobuf-5 ClassData -- an ABI mismatch that corrupts the message
+  # vtable/merge function pointer and crashes with SIGBUS inside TypeProto
+  # merges during shape inference. Linux escapes it because CPython dlopens
+  # extension modules with RTLD_LOCAL. Export ONLY the module init symbol so
+  # none of the bundled onnx/protobuf symbols are visible to coalesce.
+  if (APPLE)
+    target_link_options(onnxsim_cpp2py_export PRIVATE
+      "-Wl,-exported_symbol,_PyInit_onnxsim_cpp2py_export")
+  endif()
 endif()
 
 if (ONNXSIM_COVERAGE)
