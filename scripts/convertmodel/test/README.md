@@ -17,6 +17,7 @@ npm run test:inference          # wasm EP, 5 iterations, batch 1
 ORT_ITERS=20 npm run test:inference
 ORT_BATCH=64 npm run test:inference    # feed 64 input rows
 ORT_EP=webgpu npm run test:inference   # only where a WebGPU runtime exists
+npm run test:compare            # before/after comparison path (wasm EP)
 npm run test:netron             # Netron embedding helpers unit test (no GPU/ORT needed)
 npm run test:trace              # trace-assembler unit test (no GPU/ORT needed)
 ```
@@ -64,6 +65,27 @@ into *both* outputs of a conversion: the converted result and — via the WASM
 throughput for either **model** source, so the original and converted models can
 be compared on inference speed. Annotation only adds `metadata_props`, so the
 annotated bytes execute identically to the upload.
+
+## Before/after comparison
+
+`npm run test:compare` drives `compareInference()` / `compareOutputs()` in
+`inference_core.mjs`, the code behind the inference panel's **compare (before vs
+after conversion)** mode. That mode feeds one shared, deterministic input to
+*both* the original upload and the simplify/optimize result and reports how far
+their outputs diverge (max |Δ|) plus the speed difference, so a conversion that
+was meant to be numerics-preserving can be verified as such right in the browser.
+
+The test runs the fixture model against itself (a conversion is free to be a
+no-op) and asserts the outputs are byte-for-byte identical (max |Δ| == 0), the
+dims match, and the verdict is *equivalent* within tolerance. It also unit-tests
+`compareOutputs()` directly — no onnxruntime — across the divergent,
+within-tolerance, and not-comparable (mismatched output length) branches the
+panel renders:
+
+```bash
+npm run test:compare
+ORT_EP=webgpu npm run test:compare   # only where a WebGPU runtime exists
+```
 
 ## Report-an-issue URL
 
