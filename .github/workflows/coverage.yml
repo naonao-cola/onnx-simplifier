@@ -203,6 +203,35 @@ jobs:
       with:
         name: coverage-rust
         path: coverage-report
+
+    # Each report's <package name> is auto-derived and cryptic (gcovr -> onnxsim,
+    # coverage.py -> main, c8 -> ., cargo-llvm-cov -> onnxsim.src). Relabel them
+    # per language so the combined table reads clearly.
+    - name: Label coverage packages by language
+      run: |
+        python3 - <<'PY'
+        import os, xml.etree.ElementTree as ET
+        labels = {
+            "coverage-report/cpp.xml": "C++ (onnxsim core)",
+            "coverage-report/python.xml": "Python (onnxsim)",
+            "coverage-report/js.xml": "JavaScript (convertmodel)",
+            "coverage-report/rust.xml": "Rust (bindings)",
+        }
+        for path, label in labels.items():
+            if not os.path.exists(path):
+                continue
+            tree = ET.parse(path)
+            pkgs = tree.getroot().findall(".//package")
+            if len(pkgs) == 1:
+                pkgs[0].set("name", label)
+            else:
+                # Keep multiple packages distinct if a report ever has more.
+                for p in pkgs:
+                    orig = p.get("name", "")
+                    p.set("name", f"{label}: {orig}" if orig and orig != "." else label)
+            tree.write(path, xml_declaration=True, encoding="utf-8")
+        PY
+
     - name: Upload combined coverage report artifact
       if: always()
       uses: actions/upload-artifact@v7
