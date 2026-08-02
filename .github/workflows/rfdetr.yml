@@ -66,4 +66,4 @@ jobs:
         run: python -c "import onnxsim, onnxsim.onnxsim_cpp2py_export; print('onnxsim', onnxsim.__version__, onnxsim.__file__)"
 
       - name: Run RF-DETR export test
-        run: pytest -v --durations=10 tests/test_rfdetr.py
+        run: pytest -v tests/test_rfdetr.py

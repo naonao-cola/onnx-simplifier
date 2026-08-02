@@ -65,4 +65,4 @@ jobs:
         run: python -c "import onnxsim, onnxsim.onnxsim_cpp2py_export; print('onnxsim', onnxsim.__version__, onnxsim.__file__)"
 
       - name: Run YOLO export test
-        run: pytest -v --durations=10 tests/test_yolo.py
+        run: pytest -v tests/test_yolo.py
