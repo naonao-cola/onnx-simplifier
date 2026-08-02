@@ -15,9 +15,15 @@ and maintainable:
     org are represented and which are not, so gaps are a decision, not an
     accident.
 
-Existing `baseline_seconds` / `baseline_*_nodes` / `known_slow` are always
-preserved across a regenerate — only ids and membership change. New entries get
-null baselines (fill them with a run of run_regression.py) and known_slow=false.
+Existing `baseline_seconds` / `baseline_*_nodes` / `known_slow` / `size` are
+always preserved across a regenerate — only ids and membership change. New
+entries get null baselines (fill them with a run of run_regression.py), a null
+`size`, and known_slow=false.
+
+`size` is the byte size of the repo's largest `.onnx` file — the one the
+converters (WASM UI / regression workers) download. It powers the size preview
+in the browser converter. Fill or refresh it with `--refresh-sizes`, which
+queries the HF API for each entry (online only).
 
 Model ids come from the live HF API (`huggingface_hub`) or, offline, from a
 cached JSON list via `--ids-file` (a plain list of "onnxmodelzoo/<name>").
@@ -107,11 +113,24 @@ def load_models_json(path):
 def new_entry(model_id):
     return {
         "id": model_id,
+        "size": None,
         "baseline_seconds": 0.0,
         "baseline_orig_nodes": None,
         "baseline_simp_nodes": None,
         "known_slow": False,
     }
+
+
+def largest_onnx_size(api, repo):
+    """Byte size of the repo's largest `.onnx` file (the one the converters
+    download), or None when the repo has no `.onnx`. Mirrors the "largest wins"
+    selection in scripts/convertmodel/hf_models.mjs and the regression workers."""
+    info = api.model_info(repo, files_metadata=True)
+    onnx = [s for s in (info.siblings or []) if s.rfilename.endswith(".onnx")]
+    if not onnx:
+        return None
+    onnx.sort(key=lambda s: s.size or 0, reverse=True)
+    return onnx[0].size
 
 
 def representative(ids_for_stem):
@@ -129,6 +148,9 @@ def main():
     ap.add_argument("--add", action="append", default=[], metavar="REGEX",
                     help="add newest-opset representative for every model whose id "
                          "matches REGEX (repeatable), e.g. --add '(distilbert|roberta|albert)'")
+    ap.add_argument("--refresh-sizes", action="store_true",
+                    help="fill/refresh each entry's `size` (largest .onnx bytes) "
+                         "from the live HF API; online only")
     ap.add_argument("--report", action="store_true",
                     help="print family coverage report (default action)")
     ap.add_argument("--write", action="store_true", help="write the updated models.json")
@@ -186,10 +208,27 @@ def main():
     if added:
         changed += [f"ADD {a}" for a in added]
 
+    # 4. Refresh sizes (largest .onnx bytes) from the live HF API.
+    if args.refresh_sizes:
+        try:
+            from huggingface_hub import HfApi
+        except ImportError:
+            sys.exit("huggingface_hub not installed; --refresh-sizes needs the live API")
+        api = HfApi()
+        for m in models:
+            try:
+                size = largest_onnx_size(api, m["id"])
+            except Exception as e:  # noqa: BLE001 — report and continue
+                changed.append(f"SIZE-FAIL {m['id']}: {e}")
+                continue
+            if m.get("size") != size:
+                changed.append(f"SIZE {m['id']} -> {size}")
+                m["size"] = size
+
     models.sort(key=lambda m: m["id"].lower())
 
-    # 4. Coverage report.
-    if args.report or not (args.refresh or args.add):
+    # 5. Coverage report.
+    if args.report or not (args.refresh or args.add or args.refresh_sizes):
         covered = {arch_family(m["id"]) for m in models}
         org_fams = {}
         for i in org_ids:

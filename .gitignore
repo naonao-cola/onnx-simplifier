@@ -52,6 +52,9 @@ coverage.xml
 .pytest_cache/
 # Combined C++/Python coverage output (scripts/coverage/run_coverage.sh)
 coverage-report/
+# JS coverage output (scripts/convertmodel `npm run coverage`, c8)
+/scripts/convertmodel/coverage/
+.nyc_output/
 # gcov data emitted by ONNXSIM_COVERAGE builds
 *.gcda
 *.gcno

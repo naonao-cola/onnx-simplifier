@@ -5,7 +5,9 @@
             .netron-pane { flex: 1 1 380px; min-width: 300px; }
             .netron-head { margin-bottom: 0.35em; }
             .netron-note { color: #a00; font-size: 0.9em; margin-top: 0.35em; }
-            .netron-frame { width: 100%; height: 480px; border: 1px solid #ccc; }
+            /* `resize: vertical` needs a non-visible overflow to expose the
+               drag handle; the min/max keep the pane usable. */
+            .netron-frame { width: 100%; height: 480px; min-height: 200px; max-height: 90vh; border: 1px solid #ccc; resize: vertical; overflow: auto; }
             .macs-cards { display: flex; flex-wrap: wrap; gap: 0.6em; margin: 0.6em 0; }
             .macs-card { border: 1px solid #ccc; border-radius: 6px; padding: 0.5em 0.7em; min-width: 8em; }
             .macs-k { color: #666; font-size: 0.75em; text-transform: uppercase; letter-spacing: 0.03em; }
@@ -75,53 +77,10 @@
 
             // The most recent conversion parameters, captured so that the
             // "Report an issue" button can include them in the pre-filled report.
+            // Published on `window` so the report-issue module (a separate inline
+            // module script) can read it — modules don't share this classic
+            // script's scope.
             let last_run_info = null;
-
-            const build_issue_url = () => {
-                const repo = "https://github.com/onnxsim/onnxsim";
-                const lines = [];
-                lines.push("**Describe the bug**");
-                lines.push("<!-- A clear and concise description of what went wrong. -->");
-                lines.push("");
-                lines.push("**Model**");
-                lines.push("<!-- Please attach the model or a download link so the problem can be reproduced,");
-                lines.push("or send it to daquexian566@gmail.com -->");
-                lines.push("");
-                lines.push("**Environment (WASM converter)**");
-                lines.push("- Page: " + location.href);
-                lines.push("- User agent: " + navigator.userAgent);
-                if (last_run_info) {
-                    lines.push("- Optimizer: " + last_run_info.optimizer);
-                    lines.push("- File: " + last_run_info.file_name);
-                    lines.push("- constant fold: " + last_run_info.constant_fold);
-                    lines.push("- shape inference: " + last_run_info.shape_inference);
-                    lines.push("- tensor size threshold: " + last_run_info.tensor_size_threshold);
-                    lines.push("- target opset version: " + last_run_info.target_opset_version + " (0 = keep)");
-                    if (last_run_info.passes && last_run_info.passes.length) {
-                        const label = last_run_info.optimizer === "simplify" ? "Skipped passes" : "Target passes";
-                        lines.push("- " + label + ": " + last_run_info.passes.join(", "));
-                    }
-                } else {
-                    lines.push("- (no conversion has been run yet in this session)");
-                }
-                lines.push("");
-                lines.push("**Console output**");
-                const log_el = document.getElementById("log-output");
-                let log = ((log_el && log_el.value) || "").trim();
-                // Keep the URL within browser length limits; include the tail,
-                // which usually holds the error, and note when it was trimmed.
-                const MAX_LOG = 4000;
-                if (log.length > MAX_LOG) {
-                    log = "...(truncated, please paste the full log)...\n" + log.slice(log.length - MAX_LOG);
-                }
-                lines.push("```");
-                lines.push(log || "(no console output)");
-                lines.push("```");
-
-                const title = "[BUG] WASM converter: ";
-                return repo + "/issues/new?title=" + encodeURIComponent(title) +
-                    "&body=" + encodeURIComponent(lines.join("\n"));
-            };
 
             window.onload = () => {
                 const worker = new Worker("worker.js");
@@ -129,10 +88,6 @@
                 const input = document.getElementById("file-input");
                 const dl_btn = document.getElementById("download-button");
                 const trace_container = document.getElementById("simplify-trace");
-                const report_btn = document.getElementById("report-issue-button");
-                report_btn.onclick = () => {
-                    window.open(build_issue_url(), "_blank", "noopener");
-                };
                 let result_name = "";
                 let original_name = "";
                 // Decode a "data:...;base64,<b64>" URL back into a Uint8Array.
@@ -267,6 +222,8 @@
                     // by default; applies to every optimizer mode.
                     const annotate_model_info = document.getElementById("id_annotate_model_info").checked;
                     last_run_info.annotate_model_info = annotate_model_info;
+                    // Expose the latest run parameters to the report-issue module.
+                    window.__onnxsimLastRunInfo = last_run_info;
                     worker.postMessage([optimizer, buf, passes, constant_fold, shape_inference, tensor_size_threshold, target_opset_version, profile, annotate_model_info], [buf]);
                 };
                 // Expose the conversion entry point for the Hugging Face loader
@@ -302,6 +259,11 @@
                    disabled title="Loading WebAssembly runtime…" />
             <button id="hf-load-button" type="button" disabled title="Loading WebAssembly runtime…">Load</button>
             <span id="hf-status"></span>
+            <div id="hf-file-row" style="margin-top: 0.25em; display: none;">
+                <label for="hf-file-select">file</label>
+                <select id="hf-file-select"></select>
+                <span id="hf-file-note" style="color: #666; font-size: 0.85em; margin-left: 0.25em;"></span>
+            </div>
             <div style="color: #666; font-size: 0.85em; margin-top: 0.25em;">
                 Fetches the model straight from the Hugging Face Hub in your
                 browser (nothing is uploaded), then runs it through the same
@@ -309,21 +271,37 @@
                 to the <code>onnxmodelzoo</code> org; any <code>owner/repo</code>
                 or direct <code>.onnx</code> URL works too. Picking a model (or
                 entering a repo id / URL) shows its download size first, so you
-                can see how big it is before fetching.
+                can see how big it is before fetching. When a repo holds more than
+                one <code>.onnx</code>, the largest is auto-detected; use the
+                <b>file</b> selector to convert a different one.
             </div>
             <div style="margin-top: 0.25em;">
-                <input type="checkbox" id="hf-use-xet">
+                <input type="checkbox" id="hf-use-xet" checked>
                 <label for="hf-use-xet">
                     Use <a href="https://huggingface.co/docs/xet/en/index" target="_blank" rel="noopener">Xet</a>
-                    protocol (experimental)
+                    protocol (default; falls back to a direct download)
                 </label>
+                <label for="hf-xet-concurrency" style="margin-left: 0.6em;">parallel shards</label>
+                <input type="number" id="hf-xet-concurrency" value="8" min="1" max="16" step="1"
+                       style="width: 3.5em;"
+                       title="How many parallel byte-range shards to read a Xet download in. XetBlob fetches serially, so this is what parallelizes the transfer; ~10 or fewer is usually best.">
                 <button id="hf-clear-cache" type="button">clear chunk cache</button>
+                <span id="hf-cache-size" style="color: #666; font-size: 0.85em; margin-left: 0.4em;"></span>
                 <div style="color: #666; font-size: 0.85em; margin-top: 0.2em;">
                     Downloads via <code>@huggingface/hub</code>, reconstructing the
                     file from content-addressed chunks and caching them in
-                    IndexedDB so repeated / overlapping loads reuse them. Falls
-                    back to the direct download automatically if the Xet path
-                    isn't available (e.g. a non-Xet repo or a CORS block).
+                    IndexedDB so repeated / overlapping loads reuse them. On by
+                    default; falls back to a direct download automatically if the
+                    Xet path isn't available (e.g. a non-Xet repo or a CORS block).
+                    <br>
+                    The in-browser Xet client
+                    (<a href="https://github.com/huggingface/huggingface.js/blob/main/packages/hub/src/utils/XetBlob.ts" target="_blank" rel="noopener"><code>XetBlob</code></a>)
+                    fetches a file <i>serially</i>, so <b>parallel shards</b> reads
+                    it in that many concurrent byte-range slices to saturate your
+                    link — this is what makes Xet fast enough to be the default
+                    (~10 or fewer is usually best; <code>1</code> disables
+                    sharding). Xet also gives chunk dedup / cache reuse across
+                    repeated or overlapping loads.
                 </div>
             </div>
         </div>
@@ -376,6 +354,7 @@
                 <div class="netron-head">
                     <strong>Before</strong> —
                     <button id="netron-before-open" type="button" style="display: none;">open in a new tab ↗</button>
+                    <button id="netron-before-download" type="button" style="display: none;">download model ↓</button>
                 </div>
                 <iframe id="netron-before-frame" class="netron-frame" title="Netron — original model" style="display: none;"></iframe>
                 <div id="netron-before-note" class="netron-note"></div>
@@ -384,6 +363,7 @@
                 <div class="netron-head">
                     <strong>After</strong> —
                     <button id="netron-after-open" type="button" style="display: none;">open in a new tab ↗</button>
+                    <button id="netron-after-download" type="button" style="display: none;">download model ↓</button>
                 </div>
                 <iframe id="netron-after-frame" class="netron-frame" title="Netron — simplified model" style="display: none;"></iframe>
                 <div id="netron-after-note" class="netron-note"></div>
@@ -394,14 +374,47 @@
         <h2>Console outputs:</h2>
         <textarea id="log-output" readonly rows="20" style="width: 100%; box-sizing: border-box;"></textarea>
         <div>
+            <button id="download-log-button" type="button">Download log</button>
             <button id="report-issue-button" type="button">Report an issue</button>
             <span>
-                Opens a pre-filled
+                <b>Download log</b> saves the console output above as a
+                <code>.log</code> file. <b>Report an issue</b> opens a pre-filled
                 <a href="https://github.com/onnxsim/onnxsim/issues" target="_blank">GitHub issue</a>
-                with the selected options, browser info, and console output above.
-                Please also attach your model so the problem can be reproduced.
+                with the selected options, browser info, and the tail of the
+                console output. Please also attach your model (and the downloaded
+                log) so the problem can be reproduced.
             </span>
         </div>
+        <script type="module">
+            // Wire the "Download log" and "Report an issue" buttons. Kept in a
+            // module so it can pull the length-capped URL builder from
+            // issue_report.mjs (which the Node test also exercises).
+            import { buildIssueUrl } from "./issue_report.mjs";
+            import { downloadText } from "./download.mjs";
+
+            const logEl = document.getElementById("log-output");
+            const dlLogBtn = document.getElementById("download-log-button");
+            if (dlLogBtn) {
+                dlLogBtn.addEventListener("click", () => {
+                    downloadText((logEl && logEl.value) || "", "onnxsim-converter.log");
+                });
+            }
+
+            const reportBtn = document.getElementById("report-issue-button");
+            if (reportBtn) {
+                reportBtn.addEventListener("click", () => {
+                    const url = buildIssueUrl({
+                        repo: "https://github.com/onnxsim/onnxsim",
+                        title: "[BUG] WASM converter: ",
+                        pageUrl: location.href,
+                        userAgent: navigator.userAgent,
+                        runInfo: window.__onnxsimLastRunInfo || null,
+                        log: (logEl && logEl.value) || "",
+                    });
+                    window.open(url, "_blank", "noopener");
+                });
+            }
+        </script>
         <h2>onnxsim profiling</h2>
         <p>
             Profiling is on by default (“profile simplification” above): convert
@@ -452,8 +465,9 @@
             <input type="checkbox" id="inference-profile" checked>
             <label for="inference-profile">profile (Chrome trace)</label>
             <button id="run-inference">Run inference</button>
+            <button id="download-inference-log-button" type="button">Download log</button>
         </div>
-        <pre id="inference-output"></pre>
+        <textarea id="inference-output" readonly rows="12" style="width: 100%; box-sizing: border-box;"></textarea>
         <div id="inference-macs"></div>
         <p>
             With profiling on (default), the run captures an onnxruntime-web

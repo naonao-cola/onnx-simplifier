@@ -11,6 +11,8 @@ import {
   loadModelList,
   fetchModelBytes,
   probeModelSize,
+  listOnnxFiles,
+  readBlobSharded,
   humanBytes,
 } from "../hf_models.mjs";
 
@@ -124,16 +126,24 @@ check("fileUrl percent-encodes each path segment", () => {
   );
 });
 
-await acheck("loadModelList reads ./models.json first", async () => {
+await acheck("loadModelList reads ./models.json first, carrying sizes", async () => {
   await withFetch(
     {
       "./models.json": {
-        json: { models: [{ id: "onnxmodelzoo/a" }, { id: "onnxmodelzoo/b" }] },
+        json: {
+          models: [
+            { id: "onnxmodelzoo/a", size: 1234 },
+            { id: "onnxmodelzoo/b" },
+          ],
+        },
       },
     },
     async () => {
-      const ids = await loadModelList();
-      assert.deepEqual(ids, ["onnxmodelzoo/a", "onnxmodelzoo/b"]);
+      const models = await loadModelList();
+      assert.deepEqual(models, [
+        { id: "onnxmodelzoo/a", size: 1234 },
+        { id: "onnxmodelzoo/b", size: null },
+      ]);
     },
   );
 });
@@ -286,6 +296,42 @@ await acheck("probeModelSize returns a null size when Content-Length is absent",
   });
 });
 
+await acheck("listOnnxFiles returns .onnx files largest-first with sizes", async () => {
+  const api = "https://huggingface.co/api/models/onnxmodelzoo/foo?blobs=true";
+  await withFetch(
+    {
+      [api]: {
+        json: {
+          siblings: [
+            { rfilename: "small.onnx", size: 10 },
+            { rfilename: "big.onnx", size: 999 },
+            { rfilename: "readme.md", size: 1 },
+            { rfilename: "nosize.onnx" },
+          ],
+        },
+      },
+    },
+    async () => {
+      const files = await listOnnxFiles("onnxmodelzoo/foo");
+      assert.deepEqual(files, [
+        { file: "big.onnx", size: 999 },
+        { file: "small.onnx", size: 10 },
+        { file: "nosize.onnx", size: null },
+      ]);
+    },
+  );
+});
+
+await acheck("listOnnxFiles returns [] for a repo with no .onnx", async () => {
+  const api = "https://huggingface.co/api/models/onnxmodelzoo/empty?blobs=true";
+  await withFetch(
+    { [api]: { json: { siblings: [{ rfilename: "readme.md", size: 1 }] } } },
+    async () => {
+      assert.deepEqual(await listOnnxFiles("onnxmodelzoo/empty"), []);
+    },
+  );
+});
+
 await acheck("probeModelSize surfaces a repo with no .onnx", async () => {
   const api = "https://huggingface.co/api/models/onnxmodelzoo/empty?blobs=true";
   await withFetch(
@@ -294,6 +340,59 @@ await acheck("probeModelSize surfaces a repo with no .onnx", async () => {
       await assert.rejects(probeModelSize("empty"), /no \.onnx file found/);
     },
   );
+});
+
+// A minimal Blob-like whose slice(a,b) streams that sub-range in small chunks,
+// mirroring how XetBlob.slice() yields only its byte range.
+function fakeBlob(bytes, chunk = 3) {
+  const make = (buf) => ({
+    size: buf.length,
+    stream() {
+      let i = 0;
+      return {
+        getReader: () => ({
+          read: async () => {
+            if (i >= buf.length) return { done: true, value: undefined };
+            const value = buf.slice(i, i + chunk);
+            i += value.length;
+            return { done: false, value };
+          },
+        }),
+      };
+    },
+  });
+  return {
+    size: bytes.length,
+    slice: (start, end) => make(bytes.slice(start, end)),
+  };
+}
+
+await acheck("readBlobSharded reassembles shards in order", async () => {
+  const data = new Uint8Array(20);
+  for (let i = 0; i < data.length; i++) data[i] = i;
+  for (const k of [1, 3, 4, 7, 100]) {
+    const progress = [];
+    const out = await readBlobSharded(fakeBlob(data), k, (p) => progress.push(p));
+    assert.equal(out.length, data.length);
+    assert.deepEqual(Array.from(out), Array.from(data), `k=${k}`);
+    // Progress ends at the full size, never exceeding it.
+    const last = progress[progress.length - 1];
+    assert.deepEqual(last, { loaded: data.length, total: data.length }, `k=${k} progress`);
+    assert.ok(progress.every((p) => p.loaded <= p.total));
+  }
+});
+
+await acheck("readBlobSharded falls back to arrayBuffer without a stream", async () => {
+  const data = new Uint8Array([5, 6, 7, 8, 9]);
+  const blob = {
+    size: data.length,
+    slice: (start, end) => ({
+      size: end - start,
+      arrayBuffer: async () => data.slice(start, end).buffer,
+    }),
+  };
+  const out = await readBlobSharded(blob, 2);
+  assert.deepEqual(Array.from(out), Array.from(data));
 });
 
 console.log(`\n${passed} checks passed`);

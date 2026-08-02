@@ -5,6 +5,41 @@ importScripts("./onnxsim.js");
 const ORT_VERSION = "1.27.0";
 const ORT_BASE = `https://cdn.jsdelivr.net/npm/onnxruntime-web@${ORT_VERSION}/dist/`;
 
+// Turn a low-level WASM out-of-memory abort into an actionable explanation.
+// When a model needs more heap than the module can address, Emscripten aborts
+// with "Cannot enlarge memory, requested N bytes, but the limit is M bytes!"
+// (surfaced via printErr) and throws a RuntimeError from the conversion call.
+// Both are accurate but say nothing about *why* or *what to do*, so translate
+// them into a message the user can act on. The module caps its heap at 4 GiB,
+// the hard addressing limit of a wasm32 build (see MAXIMUM_MEMORY in
+// CMakeLists.txt); simplification needs several times the model's size on top
+// of the model itself, so large models can exhaust it.
+function isOutOfMemory(text) {
+    return /Cannot enlarge memory|out of memory|Aborted|enlarge|allocat/i.test(
+        String(text || ""));
+}
+
+function memoryLimitMessage(text) {
+    const gib = (n) => (n / (1024 ** 3)).toFixed(2) + " GiB";
+    const m = /requested (\d+) bytes, but the limit is (\d+) bytes/.exec(
+        String(text || ""));
+    const limit = m ? gib(Number(m[2])) : "4 GiB";
+    const needed = m ? ` (it needed about ${gib(Number(m[1]))})` : "";
+    return [
+        `This model is too large to convert in the browser${needed}.`,
+        `The WebAssembly build can address at most ${limit} of memory, and`,
+        `simplification (shape inference + constant folding) needs several times`,
+        `the model's size on top of the model itself.`,
+        ``,
+        `Things to try:`,
+        `  - run onnxsim locally, where it is not limited to ${limit}:`,
+        `      pip install onnxsim && onnxsim input.onnx output.onnx`,
+        `  - turn off "constant folding" (or lower the tensor-size threshold),`,
+        `    then convert again`,
+        `  - reduce the model size first (e.g. split it or externalize weights)`,
+    ].join("\n");
+}
+
 // For the ORT-web build (onnxsim compiled with ONNXSIM_WASM_ORT_WEB): load
 // onnxruntime-web and register the runner JsModelExecutor calls. In the default
 // built-in-ORT build onnxsim_needs_ort_web() is false and this is a no-op, so
@@ -36,6 +71,10 @@ create_onnxsim({
     printErr: (str) => {
         console.error("stderr:", [str]);
         postMessage(["stderr", str]);
+        // Augment the raw Emscripten OOM abort line with a human-readable hint.
+        if (typeof str === "string" && str.includes("Cannot enlarge memory")) {
+            postMessage(["stderr", memoryLimitMessage(str)]);
+        }
     },
 }).then(async (runtime) => {
     // Wire up onnxruntime-web before announcing readiness, so the first
@@ -59,6 +98,11 @@ create_onnxsim({
         // requested, otherwise an empty string.
         let model = null;
         let trace = "";
+        // A model that outgrows the wasm heap makes Emscripten abort mid-run and
+        // throw a RuntimeError out of the conversion call. Catch it here so the
+        // user gets an explanation (see memoryLimitMessage) instead of the worker
+        // dying with an opaque, unhandled error.
+        try {
         switch (e.data[0]) {
             case "simplify": {
                 // Simplify returns { model, trace } so the profiling trace can
@@ -102,6 +146,17 @@ create_onnxsim({
             default:
                 postMessage(["stderr", "unknown conversion type: " + e.data[0]]);
                 return;
+        }
+        } catch (err) {
+            const detail = String((err && err.message) || err);
+            if (isOutOfMemory(detail)) {
+                // The raw "Cannot enlarge memory" line (if any) already went out
+                // via printErr; this adds the actionable explanation.
+                postMessage(["stderr", memoryLimitMessage(detail)]);
+            } else {
+                postMessage(["stderr", e.data[0] + " failed: " + detail]);
+            }
+            return;
         }
         if (!model) {
             postMessage(["stderr", e.data[0] + " failed!"]);
