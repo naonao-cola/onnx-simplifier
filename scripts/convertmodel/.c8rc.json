@@ -7,13 +7,16 @@
   "all": true,
   "src": ["."],
   "include": [
+    "backend_test.mjs",
     "hf_models.mjs",
     "inference_core.mjs",
     "issue_report.mjs",
     "macs.mjs",
     "shapes.mjs",
     "netron.mjs",
+    "query_params.mjs",
     "trace_build.mjs",
+    "versions.mjs",
     "webnn.mjs",
     "xet_cache.mjs"
   ],

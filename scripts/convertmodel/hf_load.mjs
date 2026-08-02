@@ -17,6 +17,7 @@ import {
   humanBytes,
 } from "./hf_models.mjs";
 import { openXetCache, makeCachingFetch } from "./xet_cache.mjs";
+import { parseInputParams, applyOptionParams, syncInputUrl, syncUrlParam } from "./query_params.mjs";
 
 const select = document.getElementById("hf-model-select");
 const refInput = document.getElementById("hf-model-input");
@@ -288,6 +289,10 @@ async function doLoad() {
   loadBtn.disabled = true;
   if (fileInput) fileInput.disabled = true;
   if (statusEl) statusEl.textContent = "loading…";
+  // Reflect this input in the address bar so the link is shareable/reproducible
+  // (a Hugging Face repo id or a direct .onnx URL). Uploaded local files have no
+  // URL and are handled by the file-input path, which does not call this.
+  syncInputUrl("model", ref);
   try {
     log(`loading model from Hugging Face: ${ref}`);
     // Live download progress + speed in the status line. Speed is smoothed with
@@ -490,3 +495,74 @@ if (xetToggle) {
 window.addEventListener("onnxsim:converted", () => {
   if (statusEl) statusEl.textContent = "";
 });
+
+// --- Query-parameter input -------------------------------------------------
+// Let a shareable link drive the input and conversion options, e.g.
+//   ?model=onnxmodelzoo/resnet18d_Opset18
+//   ?model=https://…/foo.onnx&optimizer=optimize&cf=0
+//   ?graph=<onnx text>&optimizer=fold_constant   (parse a text graph, then run)
+//   ?backend=<onnx backend test-case URL>        (prefill the backend panel)
+//   ?…&autoload=0                                 (prefill but don't auto-run)
+// The model reference reuses the Hugging Face loader's repo-id / .onnx-URL path,
+// so nothing is uploaded and the conversion is the same one an upload drives.
+(function initFromQueryParams() {
+  let params;
+  try {
+    params = parseInputParams(window.location.search);
+  } catch {
+    return;
+  }
+  // Prefill the conversion option controls (including the processor / mode radio
+  // from ?optimizer=) so both an auto-run and a later manual run honor the link.
+  try {
+    const changed = applyOptionParams(params, document);
+    if (changed.length) log(`applied options from URL: ${changed.join(", ")}`);
+  } catch {
+    // Best-effort: a missing control just leaves that option at its default.
+  }
+  // Reflect the conversion processor in the URL whenever the mode radio changes,
+  // so the current processor is always part of the shareable link.
+  for (const radio of document.querySelectorAll('input[name="optimizer"]')) {
+    radio.addEventListener("change", () => {
+      if (radio.checked) syncUrlParam("optimizer", radio.value);
+    });
+  }
+  // Prefill the backend-test panel's URL (it reads the input when Run is clicked).
+  if (params.backend) {
+    const el = document.getElementById("backend-url");
+    if (el) el.value = params.backend;
+  }
+  // Run one of the input sources once both WASM runtimes are ready (index.html
+  // dispatches "onnxsim:ready" from maybeEnableInput), so the conversion entry
+  // point and the page runtime both exist; if it already fired, go now.
+  const whenReady = (fn) => {
+    if (window.__onnxsimReady) fn();
+    else window.addEventListener("onnxsim:ready", fn, { once: true });
+  };
+
+  // A text graph: prefill the parse box and, on autoload, click Parse (which
+  // parses and — with "convert after parsing" on — runs the selected mode).
+  if (params.graph) {
+    const ta = document.getElementById("parse-graph-text");
+    if (ta) ta.value = params.graph;
+    if (params.autoload) {
+      whenReady(() => {
+        const b = document.getElementById("parse-graph-button");
+        if (b) b.click();
+      });
+    }
+    return;
+  }
+
+  if (!params.model) return;
+  if (refInput) refInput.value = params.model;
+  whenReady(() => {
+    if (params.autoload) {
+      log(`loading input model from URL parameter: ${params.model}`);
+      doLoad();
+    } else {
+      // Just preview size / list files so the user can review before loading.
+      onRefCommitted(params.model);
+    }
+  });
+})();

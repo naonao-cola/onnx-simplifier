@@ -144,6 +144,27 @@ add_executable(
   onnxsim/bin/onnxsim_option.cpp
   ${ONNXSIM_WASM_INTERFACE})
 set_target_properties(onnxsim_bin PROPERTIES OUTPUT_NAME onnxsim)
+
+# Bake the onnxsim and onnx-optimizer version strings into the module so the
+# WASM converter's interface.cpp can report them (the "versions" panel / issue
+# report). Read from the VERSION files that ship in the tree; the onnx and
+# protobuf versions are read at runtime from the linked libraries instead.
+if (EMSCRIPTEN)
+  set(_onnxsim_ver "unknown")
+  if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/VERSION")
+    file(STRINGS "${CMAKE_CURRENT_SOURCE_DIR}/VERSION" _onnxsim_ver LIMIT_COUNT 1)
+    string(STRIP "${_onnxsim_ver}" _onnxsim_ver)
+  endif()
+  set(_onnxopt_ver "unknown")
+  if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/onnx-optimizer/VERSION_NUMBER")
+    file(STRINGS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/onnx-optimizer/VERSION_NUMBER" _onnxopt_ver LIMIT_COUNT 1)
+    string(STRIP "${_onnxopt_ver}" _onnxopt_ver)
+  endif()
+  target_compile_definitions(onnxsim_bin PRIVATE
+    "ONNXSIM_VERSION_STRING=\"${_onnxsim_ver}\""
+    "ONNX_OPTIMIZER_VERSION_STRING=\"${_onnxopt_ver}\"")
+endif()
+
 if (EMSCRIPTEN)
   # ALLOW_MEMORY_GROWTH=1 lets the heap grow on demand, but without
   # MAXIMUM_MEMORY Emscripten caps that growth at 2 GiB and aborts with

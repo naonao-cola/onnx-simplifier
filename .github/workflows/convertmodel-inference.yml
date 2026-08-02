@@ -44,6 +44,15 @@ jobs:
       - name: Run WebNN helper unit test
         working-directory: scripts/convertmodel
         run: npm run test:webnn
+      - name: Run library-versions unit test
+        working-directory: scripts/convertmodel
+        run: npm run test:versions
+      - name: Run backend-test-runner unit test
+        working-directory: scripts/convertmodel
+        run: npm run test:backend
+      - name: Run query-parameter unit test
+        working-directory: scripts/convertmodel
+        run: npm run test:query
       - name: Run inference smoke test (wasm EP)
         working-directory: scripts/convertmodel
         run: npm run test:inference

@@ -123,6 +123,10 @@ async function runOnModel(modelBytes, { iterations, batch, providers, needWebnn,
     model: modelBytes,
     inputName,
     input: feeds[inputName],
+    // Feed *all* the model's inputs, not just the first — a multi-input model
+    // (e.g. a MatMul with a separate weight input) otherwise fails with
+    // "input '<name>' is missing in 'feeds'".
+    feeds,
     providers,
     iterations,
     profile,
