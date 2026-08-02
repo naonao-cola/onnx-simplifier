@@ -44,7 +44,7 @@ Homepage = "https://github.com/onnxsim/onnxsim"
 onnxsim = "onnxsim:main"
 
 [tool.pytest.ini_options]
-# Always report the 10 slowest tests. The root conftest.py additionally mirrors
+# Always report the 10 slowest tests. tests/conftest.py additionally mirrors
 # this list into the GitHub Actions job summary when running in CI, so the
 # timings are visible without opening the raw logs.
 addopts = "--durations=10"
