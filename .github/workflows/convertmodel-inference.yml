@@ -38,6 +38,9 @@ jobs:
       - name: Run Xet chunk-cache unit test
         working-directory: scripts/convertmodel
         run: npm run test:xet
+      - name: Run WebNN helper unit test
+        working-directory: scripts/convertmodel
+        run: npm run test:webnn
       - name: Run inference smoke test (wasm EP)
         working-directory: scripts/convertmodel
         run: npm run test:inference

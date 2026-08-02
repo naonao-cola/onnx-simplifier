@@ -15,6 +15,7 @@ import { runInference } from "./inference_core.mjs";
 import { summarizeOrtTrace } from "./trace_build.mjs";
 import { renderTrace } from "./trace_viewer.mjs";
 import { downloadText } from "./download.mjs";
+import { providersForEp, isWebnnEp, detectWebnn, formatWebnnStatus } from "./webnn.mjs";
 import {
   readAnnotations,
   perOpSummary,
@@ -29,17 +30,24 @@ import {
 const ORT_VERSION = "1.27.0";
 const ORT_BASE = `https://cdn.jsdelivr.net/npm/onnxruntime-web@${ORT_VERSION}/dist/`;
 
-let ortPromise = null;
-function loadOrt() {
-  if (!ortPromise) {
-    ortPromise = import(/* @vite-ignore */ `${ORT_BASE}ort.min.mjs`).then((m) => {
+// onnxruntime-web ships several EP bundles. The default (`ort.min.mjs`) carries
+// WASM + WebGPU; WebNN lives only in the "all" bundle (`ort.all.min.mjs`). Both
+// use the same JSEP wasm artifacts from ORT_BASE, so switching bundles keeps
+// wasmPaths valid. We load the WebNN bundle on demand (only when a WebNN EP is
+// picked) so the common WebGPU/WASM path keeps its smaller download.
+const ORT_BUNDLE = { default: "ort.min.mjs", all: "ort.all.min.mjs" };
+const ortPromises = {};
+function loadOrt(variant = "default") {
+  if (!ortPromises[variant]) {
+    const file = ORT_BUNDLE[variant] || ORT_BUNDLE.default;
+    ortPromises[variant] = import(/* @vite-ignore */ `${ORT_BASE}${file}`).then((m) => {
       const ort = m.default ?? m;
       // Pull the matching wasm binaries from the same CDN directory.
       ort.env.wasm.wasmPaths = ORT_BASE;
       return ort;
     });
   }
-  return ortPromise;
+  return ortPromises[variant];
 }
 
 const TYPED_ARRAY = {
@@ -88,9 +96,8 @@ function makeDummyInputs(ort, session, batch = 1) {
   return feeds;
 }
 
-async function runOnModel(modelBytes, { iterations, batch, preferWebGPU, profile }, log) {
-  const ort = await loadOrt();
-  const providers = preferWebGPU ? ["webgpu", "wasm"] : ["wasm"];
+async function runOnModel(modelBytes, { iterations, batch, providers, needWebnn, profile }, log) {
+  const ort = await loadOrt(needWebnn ? "all" : "default");
 
   // Build inputs from a throwaway wasm session's metadata (cheap and always
   // available), then run the real iterations through the chosen provider.
@@ -286,6 +293,7 @@ export function initInferencePanel() {
   const traceContainer = document.getElementById("inference-trace");
   const macsContainer = document.getElementById("inference-macs");
   const dlLogBtn = document.getElementById("download-inference-log-button");
+  const webnnStatusEl = document.getElementById("webnn-status");
   if (!btn) return;
 
   // The inference output is a readonly textarea (mirroring the simplify console
@@ -294,6 +302,26 @@ export function initInferencePanel() {
     out.value += msg + "\n";
     out.scrollTop = out.scrollHeight;
   };
+
+  // Probe the WebNN API once at load and show a live status next to the EP
+  // picker, so a user can see whether the WebNN options will actually run
+  // before selecting one. detectWebnn never throws.
+  if (webnnStatusEl) {
+    webnnStatusEl.textContent = "WebNN status: probing…";
+    detectWebnn()
+      .then((report) => {
+        webnnStatusEl.textContent = formatWebnnStatus(report);
+        webnnStatusEl.title = report.apiPresent
+          ? `device availability — ${["gpu", "npu", "cpu"]
+              .map((d) => `${d}: ${report.devices[d] ? "yes" : "no"}`)
+              .join(", ")}`
+          : "";
+      })
+      .catch(() => {
+        webnnStatusEl.textContent =
+          "WebNN status: ❌ could not probe navigator.ml.";
+      });
+  }
 
   if (dlLogBtn) {
     dlLogBtn.addEventListener("click", () => {
@@ -311,16 +339,23 @@ export function initInferencePanel() {
       const { bytes, label } = await resolveModelBytes(source, fileInput);
       const iterations = Math.max(1, parseInt(itersInput.value, 10) || 5);
       const batch = Math.max(1, parseInt(batchInput ? batchInput.value : "1", 10) || 1);
-      const preferWebGPU = epSelect.value === "webgpu";
+      const epValue = epSelect.value;
+      const { providers, needWebnn } = providersForEp(epValue);
       const profile = !profileChk || profileChk.checked;
       log(`running ${label}`);
       // Static MACs/FLOPs from the model's onnxsim metadata_props (PR #527),
       // shown before the run so they appear even if inference fails.
       renderMacs(macsContainer, log, bytes, null);
+      if (isWebnnEp(epValue)) {
+        log(
+          "WebNN is experimental; falling back to WASM if the WebNN device " +
+            "or an operator is unsupported.",
+        );
+      }
       log(`loading onnxruntime-web ${ORT_VERSION}…`);
       const res = await runOnModel(
         bytes,
-        { iterations, batch, preferWebGPU, profile },
+        { iterations, batch, providers, needWebnn, profile },
         log,
       );
       log(
