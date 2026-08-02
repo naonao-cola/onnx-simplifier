@@ -230,6 +230,27 @@ if (ONNXSIM_PYTHON)
   # STABLE_ABI applies on regular interpreters, FREE_THREADED on cp314t.
   nanobind_add_module(onnxsim_cpp2py_export onnxsim/cpp2py_export.cc STABLE_ABI FREE_THREADED)
   target_link_libraries(onnxsim_cpp2py_export PRIVATE onnxsim)
+
+  # onnxsim links the ONNX and protobuf C++ libraries statically into this
+  # extension, but the running Python process ALSO loads the separate pip
+  # `onnx` package (onnx_cpp2py_export), which carries its own copy of the same
+  # onnx::/google::protobuf:: symbols built against a possibly different
+  # protobuf major (onnx <= 1.22 -> protobuf 5.x; our bundled onnx 1.23 ->
+  # protobuf 6.x). ONNX and protobuf annotate their public classes with
+  # default-visibility export macros (ONNX_API / PROTOBUF_EXPORT), so those
+  # symbols leak out of this module even under the project-wide hidden preset.
+  # On macOS, dyld coalesces such weak definitions (vtables, typeinfo, inline
+  # methods) across every loaded image regardless of the two-level namespace,
+  # so onnxsim's protobuf-6 message objects can end up dispatching through pip
+  # onnx's protobuf-5 ClassData -- an ABI mismatch that corrupts the message
+  # vtable/merge function pointer and crashes with SIGBUS inside TypeProto
+  # merges during shape inference. Linux escapes it because CPython dlopens
+  # extension modules with RTLD_LOCAL. Export ONLY the module init symbol so
+  # none of the bundled onnx/protobuf symbols are visible to coalesce.
+  if (APPLE)
+    target_link_options(onnxsim_cpp2py_export PRIVATE
+      "-Wl,-exported_symbol,_PyInit_onnxsim_cpp2py_export")
+  endif()
 endif()
 
 if (ONNXSIM_COVERAGE)

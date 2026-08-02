@@ -9,8 +9,6 @@ and Rust bindings. These tests build the FunctionProtos with
 """
 
 import collections
-import platform
-import sys
 
 import numpy as np
 import onnx
@@ -18,15 +16,6 @@ import pytest
 from onnx import parser
 
 import onnxsim
-
-# The bundled ONNX 1.23.0-dev has an arm64-specific misaligned-access fault
-# (SIGBUS) in its native code that this rewrite triggers; it surfaces only on
-# macOS, because Darwin/arm64 delivers SIGBUS on the unaligned load while
-# Linux/arm64 transparently fixes it up. A SIGBUS crashes the interpreter, so
-# the test cannot be xfail'd -- it has to be skipped so it never runs there.
-# onnxsim's own code on this path is alignment-clean (the fault is upstream);
-# remove this skip once ONNX 1.23 releases with the fix.
-_MACOS_ARM64 = sys.platform == "darwin" and platform.machine() == "arm64"
 
 
 def _model(nodes, inputs, outputs, initializer, opset=18):
@@ -103,11 +92,6 @@ def test_function_rewriter_commutative_add():
     assert _op_types(sim_model)["Gemm"] == 1
 
 
-@pytest.mark.skipif(
-    _MACOS_ARM64,
-    reason="SIGBUS in bundled ONNX 1.23.0-dev native code on macOS arm64 "
-    "(upstream, alignment); re-enable when ONNX 1.23 releases",
-)
 def test_function_rewriter_attribute_wildcard():
     """A ``@name`` ref-attribute is an attribute wildcard: it binds the matched
     node's attribute and substitutes it into the replacement. Here ``Relu``
