@@ -148,6 +148,8 @@ onnxsim/version.py
 # Rust
 /rust/target/
 rust/Cargo.lock
+# Prebuilt ONNX Runtime extracted for the Rust coverage job (ONNXSIM_ORT_HOME)
+/rust/prebuilt-ort/
 
 # ONNX Runtime source fetched on demand by the Rust build (see build_wasm.sh)
 /third_party/onnxruntime-*/

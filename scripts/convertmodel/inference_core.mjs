@@ -14,6 +14,7 @@
 // is returned as a ready-to-render Chrome Trace Event object.
 
 import { buildOrtTrace } from "./trace_build.mjs";
+import { providerLabel } from "./webnn.mjs";
 
 function maxAbsDiff(a, b) {
   let m = 0;
@@ -22,21 +23,24 @@ function maxAbsDiff(a, b) {
 }
 
 // Try each execution provider in order; return the session created on the first
-// one that succeeds, along with the provider name that won. Throws only if every
-// provider fails.
+// one that succeeds, along with the provider name that won. Providers may be
+// bare name strings ("wasm", "webgpu") or onnxruntime-web options objects (e.g.
+// { name: "webnn", deviceType: "gpu" }); the returned/logged `ep` is always the
+// readable label from providerLabel(). Throws only if every provider fails.
 export async function createSessionWithFallback(ort, model, providers, onLog = () => {}) {
   const errors = [];
   for (const ep of providers) {
+    const label = providerLabel(ep);
     try {
       const session = await ort.InferenceSession.create(model, {
         executionProviders: [ep],
         graphOptimizationLevel: "all",
       });
-      return { session, ep };
+      return { session, ep: label };
     } catch (e) {
       const msg = e && e.message ? e.message : String(e);
-      onLog(`execution provider '${ep}' unavailable: ${msg}`);
-      errors.push(`${ep}: ${msg}`);
+      onLog(`execution provider '${label}' unavailable: ${msg}`);
+      errors.push(`${label}: ${msg}`);
     }
   }
   throw new Error(`no usable execution provider (${errors.join(" | ")})`);

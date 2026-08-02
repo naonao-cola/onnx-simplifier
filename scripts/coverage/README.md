@@ -1,11 +1,12 @@
-# Combined C++ + Python + JS coverage
+# Combined C++ + Python + JS + Rust coverage
 
 onnxsim is a hybrid project. The C++ in `onnxsim/*.cpp` / `*.cc` is compiled
 into the `onnxsim_cpp2py_export` extension, and the Python in `onnxsim/*.py`
 drives it. A single `pytest` run exercises both halves in the same process, so
 both can be measured at once. The browser converter under
 `scripts/convertmodel/` adds a third layer of JavaScript, covered separately by
-its own Node test suite:
+its own Node test suite, and the Rust wrapper crates under `rust/` add a fourth
+(see the Rust section below):
 
 | Layer  | Tool                    | How                                                                 |
 | ------ | ----------------------- | ------------------------------------------------------------------- |
@@ -30,14 +31,9 @@ coverage-report/cpp.xml          Cobertura XML  (C++)
 coverage-report/cpp.html         HTML           (C++)
 ```
 
-Both XML files are Cobertura, which most coverage viewers accept. In CI
-(`.github/workflows/coverage.yml`) they are fed to `irongut/CodeCoverageSummary`
-(a comma-separated list, so C++, Python and JS appear in one combined table),
-which writes the summary to the Actions job summary and posts it as a sticky
-pull request comment via `marocchino/sticky-pull-request-comment` -- no external
-service or secret required. The same Cobertura files can just as easily feed
-Codecov, Coveralls, SonarQube, or GitHub's native Code Quality coverage if you
-prefer a hosted dashboard or inline PR annotations.
+Both XML files are Cobertura, which most coverage viewers accept. In CI these
+are combined with the JS and Rust reports into a single summary and pull-request
+comment; see "CI structure" below for how that is wired up.
 
 ## JavaScript (convertmodel)
 
@@ -67,9 +63,51 @@ just the files loaded this run. The browser-only glue (`hf_load.mjs`,
 `*_view.mjs`, `inference_browser.mjs`, `worker.js`) drives the DOM and has no
 unit test, so it is intentionally left out.
 
-The coverage CI job copies `cobertura-coverage.xml` to `coverage-report/js.xml`
-and adds it to the same `irongut/CodeCoverageSummary` list, so JS lands in the
-one combined table alongside C++ and Python.
+The CI `cpp-python-js` job copies `cobertura-coverage.xml` to
+`coverage-report/js.xml`, so JS lands in the one combined table alongside C++,
+Python and Rust.
+
+## Rust (bindings)
+
+The Rust wrapper crates under `rust/` are covered in a separate CI job because
+they need a linked native `onnxsim_c` library rather than the C++/Python/Node
+toolchains above. Coverage there uses
+[`cargo-llvm-cov`](https://github.com/taiki-e/cargo-llvm-cov):
+
+```bash
+cargo install cargo-llvm-cov
+rustup component add llvm-tools-preview
+cd rust
+# Prebuilt ONNX Runtime keeps the required native build fast.
+ONNXSIM_PREBUILT_ORT=1 cargo llvm-cov --workspace --cobertura \
+  --output-path ../coverage-report/rust.xml
+```
+
+`cargo-llvm-cov` instruments only the wrapper crates (`onnxsim`, `onnxsim-sys`);
+the C++ core they call into is already covered by the C++ report above. Like the
+other reports, the Rust output is Cobertura XML.
+
+Branch coverage needs the nightly toolchain (`cargo +nightly llvm-cov --branch`,
+which sets `-Zcoverage-options=branch`); on stable only region/line/function
+coverage is reported. CI runs this job on nightly to fill the branch column and
+excludes `onnxsim-sys/build.rs` (nightly instruments the build script, whose
+"coverage" reflects the build path taken, not the tests). See `rust/README.md`.
+
+## CI structure (one combined comment)
+
+In CI (`.github/workflows/coverage.yml`) each language is measured in its own
+job — `cpp-python-js` (this script + the Node suite) and `rust`
+(`cargo-llvm-cov`) — and each uploads its Cobertura XML as an artifact. A final
+`report` job downloads them all and feeds the comma-separated list
+(`cpp.xml,python.xml,js.xml,rust.xml`) to a single
+[`irongut/CodeCoverageSummary`](https://github.com/irongut/CodeCoverageSummary)
+run, which writes the combined table to the Actions job summary and posts it as
+one sticky pull-request comment via
+[`marocchino/sticky-pull-request-comment`](https://github.com/marocchino/sticky-pull-request-comment)
+— no external service or secret required. Splitting measurement across jobs but
+downloading the artifacts into one `report` job keeps every language in a single
+comment. The same Cobertura files can just as easily feed Codecov, Coveralls,
+SonarQube, or GitHub's native Code Quality coverage.
 
 Pass extra arguments straight through to pytest:
 

@@ -16,6 +16,7 @@
     "query_params.mjs",
     "trace_build.mjs",
     "versions.mjs",
+    "webnn.mjs",
     "xet_cache.mjs"
   ],
   "exclude": [
