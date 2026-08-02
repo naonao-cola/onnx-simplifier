@@ -347,7 +347,8 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
           bool constant_folding, bool shape_inference,
           size_t tensor_size_threshold, std::optional<int> target_opset_version,
           std::shared_ptr<GraphRewriter> rewriter,
-          bool initializers_as_constants) -> py::bytes {
+          bool initializers_as_constants,
+          bool include_inline_functions) -> py::bytes {
          // force env initialization to register opset
          InitEnv();
          ONNX_NAMESPACE::ModelProto model;
@@ -356,7 +357,8 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
          auto const result = Simplify(
              *executor, model, skip_optimizers, constant_folding,
              shape_inference, tensor_size_threshold, target_opset_version,
-             rewriter.get(), initializers_as_constants);
+             rewriter.get(), initializers_as_constants,
+             include_inline_functions);
          std::string out;
          result.SerializeToString(&out);
          return py::bytes(out.data(), out.size());
@@ -364,7 +366,8 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
        "executor"_a, "model_bytes"_a, "skip_optimizers"_a.none(),
        "constant_folding"_a = true, "shape_inference"_a = true,
        "tensor_size_threshold"_a, "target_opset_version"_a.none(),
-       "rewriter"_a.none(), "initializers_as_constants"_a = true)
+       "rewriter"_a.none(), "initializers_as_constants"_a = true,
+       "include_inline_functions"_a = false)
       .def(
           "simplify_path",
           [](std::shared_ptr<PyModelExecutor> executor,
@@ -374,19 +377,22 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
              size_t tensor_size_threshold,
              std::optional<int> target_opset_version,
              std::shared_ptr<GraphRewriter> rewriter,
-             bool initializers_as_constants) -> bool {
+             bool initializers_as_constants,
+             bool include_inline_functions) -> bool {
             // force env initialization to register opset
             InitEnv();
             SimplifyPath(*executor, in_path, out_path, skip_optimizers,
                          constant_folding, shape_inference,
                          tensor_size_threshold, target_opset_version,
-                         rewriter.get(), initializers_as_constants);
+                         rewriter.get(), initializers_as_constants,
+                         include_inline_functions);
             return true;
           },
           "executor"_a, "in_path"_a, "out_path"_a, "skip_optimizers"_a.none(),
           "constant_folding"_a = true, "shape_inference"_a = true,
           "tensor_size_threshold"_a, "target_opset_version"_a.none(),
-          "rewriter"_a.none(), "initializers_as_constants"_a = true)
+          "rewriter"_a.none(), "initializers_as_constants"_a = true,
+          "include_inline_functions"_a = false)
       .def("_list_optimizers",
            []() {
              py::list ret;

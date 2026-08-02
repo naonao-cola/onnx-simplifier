@@ -375,6 +375,7 @@ def simplify(
     mutable_initializer: bool = False,
     *,
     initializers_as_constants: bool = True,
+    inline_functions: bool = False,
     import_custom_schemas: bool = True,
     input_shapes=None,
     target_opset_version: Optional[int] = None,
@@ -412,6 +413,11 @@ def simplify(
             as tunable tensors. ``Constant`` nodes are still folded either way. This is orthogonal
             to ``mutable_initializer`` (which controls whether initializers also remain graph
             inputs).
+    :param inline_functions: When True, inline the model's local (model-defined) functions into
+            the main graph before simplifying (using onnx's inliner), flattening function calls
+            into plain ops so the optimizer, shape inference and constant folding can see through
+            them. Schema-defined (built-in) functions are left alone. Defaults to False, which
+            leaves the model's functions untouched.
     :param import_custom_schemas: Import operator schemas registered in the Python `onnx` module
             (e.g. via `onnx.defs.register_schema`) into onnxsim's own registry so models using
             custom operators pass validation. Set to False to disable this and leave onnxsim's
@@ -698,6 +704,7 @@ def simplify(
             target_opset_version,
             rewriter,
             initializers_as_constants,
+            inline_functions,
         )
         # The serialized original (~1x model) is not needed once the C++
         # simplifier has consumed it -- the large-model fallback below
@@ -766,6 +773,7 @@ def simplify(
                 target_opset_version,
                 rewriter,
                 initializers_as_constants,
+                inline_functions,
             )
             check_ok = model_checking.compare(
                 os.path.join(tmpdirname, "opt.onnx"),
@@ -1050,6 +1058,13 @@ def main():
         default=None,
     )
     parser.add_argument(
+        "--inline-functions",
+        help="Inline the model's local (model-defined) functions into the main graph before "
+        "simplifying, so the optimizer, shape inference and constant folding can see through "
+        "function calls into a flat op graph. Schema-defined (built-in) functions are left alone.",
+        action="store_true",
+    )
+    parser.add_argument(
         "--providers",
         help="onnxruntime execution providers used to run the model during "
         "constant folding, in priority order, for example '--providers "
@@ -1286,6 +1301,7 @@ def main():
         args.tensor_size_threshold,
         args.mutable_initializer,
         initializers_as_constants=not args.initializers_as_non_constants,
+        inline_functions=args.inline_functions,
         import_custom_schemas=not args.skip_schema_import,
         target_opset_version=args.target_opset,
         check_rtol=args.check_rtol,
