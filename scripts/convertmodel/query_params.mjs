@@ -56,7 +56,9 @@ export function parseInputParams(search) {
   };
   const trimmed = (v) => (v === null ? null : v.trim() || null);
 
-  const optimizerRaw = trimmed(first("optimizer", "opt"));
+  // The conversion processor / mode: optimizer (opt) is the canonical key;
+  // mode / processor are friendlier aliases.
+  const optimizerRaw = trimmed(first("optimizer", "opt", "mode", "processor"));
   const optimizer = optimizerRaw && OPTIMIZERS.includes(optimizerRaw) ? optimizerRaw : null;
   const autoloadRaw = toBool(first("autoload", "run", "convert"));
 

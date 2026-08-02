@@ -69,6 +69,12 @@ check("only accepts known optimizer values, incl. single-pass modes", () => {
   assert.equal(parseInputParams("?optimizer=bogus").optimizer, null);
 });
 
+check("optimizer accepts mode/processor/opt aliases", () => {
+  assert.equal(parseInputParams("?mode=simplify").optimizer, "simplify");
+  assert.equal(parseInputParams("?processor=fold_constant").optimizer, "fold_constant");
+  assert.equal(parseInputParams("?opt=optimize").optimizer, "optimize");
+});
+
 check("parses a text graph param (graph/text), preserving interior whitespace", () => {
   const graph = "agraph (float[N] X) => (float[N] Y) {\n  Y = Relu(X)\n}";
   const c = parseInputParams("?graph=" + encodeURIComponent(graph));

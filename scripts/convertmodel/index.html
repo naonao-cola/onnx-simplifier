@@ -340,7 +340,8 @@ agraph (float[N] X) =&gt; (float[N] Y) {
                 It loads and converts automatically (add <code>&amp;autoload=0</code>
                 to only prefill). Keys: <code>model</code>
                 (<code>hf</code>/<code>url</code>), <code>graph</code> (an ONNX text
-                graph to parse), <code>optimizer</code> (the convert mode —
+                graph to parse), <code>optimizer</code> (a.k.a. <code>mode</code>/<code>processor</code>; the
+                convert mode —
                 <code>simplify</code>/<code>optimize</code>/<code>optimize_fixed</code>/<code>infer_shapes</code>/<code>data_propagation</code>/<code>fold_constant</code>),
                 <code>constant_fold</code>/<code>cf</code>,
                 <code>shape_inference</code>/<code>si</code>,
