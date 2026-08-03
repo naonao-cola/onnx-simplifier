@@ -486,9 +486,17 @@ export function initInferencePanel() {
     detectWebnn()
       .then((report) => {
         webnnStatusEl.textContent = formatWebnnStatus(report);
+        // Show per-device availability in the tooltip, appending the failure
+        // reason (captured by detectWebnn) for any device that couldn't be
+        // created — the full errors are also logged to the browser console.
         webnnStatusEl.title = report.apiPresent
           ? `device availability — ${["gpu", "npu", "cpu"]
-              .map((d) => `${d}: ${report.devices[d] ? "yes" : "no"}`)
+              .map((d) => {
+                const err = report.errors && report.errors[d];
+                return `${d}: ${report.devices[d] ? "yes" : "no"}${
+                  err ? ` (${err})` : ""
+                }`;
+              })
               .join(", ")}`
           : "";
       })

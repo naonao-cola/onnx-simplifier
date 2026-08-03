@@ -38,7 +38,11 @@ in `test/webnn.test.mjs`):
 - **`detectWebnn(navigator)`** probes `navigator.ml` at page load, attempting to
   create an `MLContext` for each device type (`gpu`, `npu`, `cpu`). The panel
   renders the result as a live **WebNN status** line under the inference
-  controls, so a visitor can see whether WebNN will run before selecting it.
+  controls, so a visitor can see whether WebNN will run before selecting it. When
+  a device type can't be created, the underlying WebNN error is **logged to the
+  browser console** (and captured in the report so the status line's tooltip
+  shows the reason), so a failure the one-line status can only summarize is
+  debuggable in DevTools.
 - **`providersForEp(value)`** maps each EP dropdown choice to an ordered
   onnxruntime-web provider list. The WebNN choices are:
 

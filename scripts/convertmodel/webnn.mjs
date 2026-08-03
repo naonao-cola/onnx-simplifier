@@ -78,13 +78,21 @@ export function isWebnnEp(epValue) {
 }
 
 // Probe the WebNN API on an injected navigator (defaults to the page's).
-// Returns { apiPresent, supported, devices: {gpu,npu,cpu}, message }: apiPresent
-// reflects navigator.ml being exposed at all; `devices[type]` is true when an
-// MLContext for that device type could actually be created; `supported` is true
-// when at least one device type worked. Never throws — any failure is reported
-// as unsupported so a caller can render it directly.
+// Returns { apiPresent, supported, devices: {gpu,npu,cpu}, errors: {…}, message }:
+// apiPresent reflects navigator.ml being exposed at all; `devices[type]` is true
+// when an MLContext for that device type could actually be created; `errors[type]`
+// carries the failure message for a device type that couldn't be created; and
+// `supported` is true when at least one device type worked. Never throws — any
+// failure is reported as unsupported so a caller can render it directly.
+//
+// The per-device MLContext failures are also logged to `con` (defaults to the
+// page's console) so the actual WebNN error — which the one-line panel status
+// can only summarize — is visible in the browser console for debugging. `con` is
+// injectable so the probe stays unit-testable under Node without touching the
+// global console.
 export async function detectWebnn(
   nav = typeof navigator !== "undefined" ? navigator : undefined,
+  con = typeof console !== "undefined" ? console : undefined,
 ) {
   const ml = nav && nav.ml;
   if (!ml || typeof ml.createContext !== "function") {
@@ -92,6 +100,7 @@ export async function detectWebnn(
       apiPresent: false,
       supported: false,
       devices: {},
+      errors: {},
       message:
         "WebNN API (navigator.ml) is not available in this browser. Try a " +
         "recent Chrome/Edge with the WebNN flag enabled " +
@@ -100,6 +109,7 @@ export async function detectWebnn(
   }
 
   const devices = {};
+  const errors = {};
   for (const deviceType of WEBNN_DEVICE_TYPES) {
     try {
       const ctx = await ml.createContext({ deviceType });
@@ -112,8 +122,17 @@ export async function detectWebnn(
           /* ignore */
         }
       }
-    } catch {
+    } catch (err) {
       devices[deviceType] = false;
+      errors[deviceType] = err && err.message ? err.message : String(err);
+      // Surface the real WebNN failure to the console — the panel status only
+      // reports that a device couldn't be created, not why.
+      if (con && typeof con.error === "function") {
+        con.error(
+          `WebNN: could not create an MLContext for deviceType '${deviceType}':`,
+          err,
+        );
+      }
     }
   }
 
@@ -122,6 +141,7 @@ export async function detectWebnn(
     apiPresent: true,
     supported: usable.length > 0,
     devices,
+    errors,
     message: usable.length
       ? `WebNN available — device types: ${usable.join(", ")}.`
       : "navigator.ml exists, but no WebNN device (gpu/npu/cpu) could be " +
