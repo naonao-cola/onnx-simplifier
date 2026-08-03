@@ -145,6 +145,29 @@ input[type="file"] {
   max-width: 100%;
 }
 
+/* Read-only console / output panes read better as monospace, a touch smaller
+   and tighter than prose. (The "parse a text graph" textarea already opts into
+   monospace inline.) */
+#log-output,
+#inference-output,
+#backend-output {
+  font-family: var(--mono);
+  font-size: 0.85em;
+  line-height: 1.4;
+}
+
+/* The "loading runtime…" hint next to the disabled file picker. */
+#loading-status {
+  color: var(--muted);
+  font-size: 0.9em;
+}
+
+/* Theme the checkbox/radio ticks to the brand accent in both schemes. */
+input[type="checkbox"],
+input[type="radio"] {
+  accent-color: var(--accent);
+}
+
 button {
   background: var(--panel-bg);
   color: var(--fg);
@@ -159,6 +182,29 @@ button:hover:not(:disabled) {
 button:disabled {
   opacity: 0.55;
   cursor: not-allowed;
+}
+
+/* Primary calls-to-action — the buttons that actually kick off work — get a
+   filled accent so they stand out from the secondary/utility buttons around
+   them (download log, export, clear cache, …), which keep the neutral style
+   above. Targeted by id so no markup changes are needed. */
+#parse-graph-button,
+#hf-load-button,
+#backend-run,
+#run-inference,
+#download-button {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+  font-weight: 600;
+}
+#parse-graph-button:hover:not(:disabled),
+#hf-load-button:hover:not(:disabled),
+#backend-run:hover:not(:disabled),
+#run-inference:hover:not(:disabled),
+#download-button:hover:not(:disabled) {
+  filter: brightness(1.08);
+  border-color: var(--accent);
 }
 
 /* A clear keyboard focus ring on every interactive control. */
