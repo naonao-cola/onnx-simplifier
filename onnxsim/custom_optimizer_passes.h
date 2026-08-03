@@ -13,7 +13,8 @@ namespace onnxsim {
 //
 // These four passes are onnxsim-specific graph rewrites that used to live in
 // onnxsim's onnxoptimizer fork. They are defined under onnxsim/passes/ and
-// injected here via onnxoptimizer's RegisterExternalPass hook:
+// injected directly into onnxoptimizer's existing global pass registry
+// (onnx::optimization::Optimizer::passes), so onnxoptimizer needs no change:
 //
 //   - fuse_mul_into_conv
 //   - fuse_consecutive_mul

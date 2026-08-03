@@ -4,7 +4,6 @@
 
 #include "custom_optimizer_passes.h"
 
-#include <memory>
 #include <mutex>
 
 #include "onnxoptimizer/optimize.h"
@@ -19,12 +18,15 @@ void RegisterCustomOptimizerPasses() {
   static std::once_flag flag;
   std::call_once(flag, [] {
     namespace opt = ONNX_NAMESPACE::optimization;
-    opt::RegisterExternalPass(
-        std::make_shared<opt::EliminateReshapeAroundElementwise>());
-    opt::RegisterExternalPass(std::make_shared<opt::FuseConsecutiveMul>());
-    opt::RegisterExternalPass(
-        std::make_shared<opt::FuseMatMulAddBiasIntoGemmBatched>());
-    opt::RegisterExternalPass(std::make_shared<opt::FuseMulIntoConv>());
+    // Add onnxsim's passes into onnxoptimizer's existing global registry
+    // directly (registerPass<T> constructs and registers one instance), so no
+    // change to onnxoptimizer itself is required. call_once keeps this a
+    // one-time write, matching the registry's static, read-only-after-init use.
+    auto& registry = opt::Optimizer::passes;
+    registry.registerPass<opt::EliminateReshapeAroundElementwise>();
+    registry.registerPass<opt::FuseConsecutiveMul>();
+    registry.registerPass<opt::FuseMatMulAddBiasIntoGemmBatched>();
+    registry.registerPass<opt::FuseMulIntoConv>();
   });
 }
 
