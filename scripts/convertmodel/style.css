@@ -93,6 +93,48 @@ h2 {
   margin: 2.2rem 0 0.6rem;
   padding-bottom: 0.3rem;
   border-bottom: 1px solid var(--border);
+  /* Keep an anchored section clear of the sticky nav when jumped to. */
+  scroll-margin-top: 3.4rem;
+}
+
+/* --- sticky section nav --------------------------------------------------- */
+.section-nav {
+  position: sticky;
+  top: 0;
+  z-index: 10;
+  display: flex;
+  flex-wrap: nowrap;
+  gap: 0.35em;
+  overflow-x: auto;
+  margin: 0.2rem 0 1rem;
+  padding: 0.5em 0;
+  background: var(--bg);
+  border-bottom: 1px solid var(--border);
+  scrollbar-width: thin;
+}
+.section-nav a {
+  flex: 0 0 auto;
+  padding: 0.25em 0.75em;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  color: var(--fg);
+  font-size: 0.85em;
+  white-space: nowrap;
+}
+.section-nav a:hover,
+.section-nav a:focus-visible {
+  border-color: var(--accent);
+  color: var(--accent);
+  text-decoration: none;
+}
+html {
+  /* Smooth-scroll for the in-page nav jumps. */
+  scroll-behavior: smooth;
+}
+@media (prefers-reduced-motion: reduce) {
+  html {
+    scroll-behavior: auto;
+  }
 }
 
 h3 {

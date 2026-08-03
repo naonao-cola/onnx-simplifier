@@ -28,12 +28,21 @@
             compiled to WebAssembly. Everything runs locally in your browser —
             models are never uploaded.
         </p>
+        <nav class="section-nav" aria-label="Jump to section">
+            <a href="#sec-parse">Parse graph</a>
+            <a href="#sec-convert">Convert</a>
+            <a href="#sec-visualize">Netron</a>
+            <a href="#sec-dims">Dynamic dims</a>
+            <a href="#sec-console">Console</a>
+            <a href="#sec-profiling">Profiling</a>
+            <a href="#sec-inference">Run inference</a>
+        </nav>
         <div id="versions-panel" title="Library versions built into this WebAssembly module (also included in a bug report).">
             <span class="version-badge"><span class="version-k">versions</span><span class="version-v">loading…</span></span>
         </div>
         <script type="module" src="./versions.mjs"></script>
 
-        <h2>Parse a text graph</h2>
+        <h2 id="sec-parse">Parse a text graph</h2>
         <div class="tool-panel">
             <p class="tool-note">
                 Paste an ONNX model or graph in the
@@ -67,7 +76,7 @@ agraph (float[N] X) =&gt; (float[N] Y) {
         </div>
         <script type="module" src="./debug_tools.mjs"></script>
 
-        <h2>Convert a model</h2>
+        <h2 id="sec-convert">Convert a model</h2>
         <input type="file" id="file-input" disabled title="Loading WebAssembly runtime…" />
         <span id="loading-status" role="status" aria-live="polite">⏳ Loading WebAssembly runtime… the file picker is disabled until it is ready.</span>
         <button id="download-button" disabled>Download</button>
@@ -246,7 +255,7 @@ agraph (float[N] X) =&gt; (float[N] Y) {
             <div id="pass-list" style="height: 300px; overflow-y: auto; border: 1px solid var(--border); border-radius: var(--radius); padding: 4px; margin-top: 4px;"></div>
         </div>
         </section>
-        <h2>Visualize with Netron (before / after)</h2>
+        <h2 id="sec-visualize">Visualize with Netron (before / after)</h2>
         <p>
             Renders the model graph with a self-hosted
             <a href="https://github.com/onnxsim/netron" target="_blank" rel="noopener">Netron</a>:
@@ -287,7 +296,7 @@ agraph (float[N] X) =&gt; (float[N] Y) {
             </div>
         </div>
         <script type="module" src="./netron_view.mjs"></script>
-        <h2>Dynamic dimensions (dim_param)</h2>
+        <h2 id="sec-dims">Dynamic dimensions (dim_param)</h2>
         <p>
             Lists the model's symbolic axis names (ONNX
             <code>dim_param</code>s) on its graph inputs and outputs —
@@ -314,7 +323,7 @@ agraph (float[N] X) =&gt; (float[N] Y) {
         <script type="module" src="./hf_load.mjs"></script>
         <script type="module" src="./share_url.mjs"></script>
 
-        <h2>Console outputs:</h2>
+        <h2 id="sec-console">Console outputs:</h2>
         <textarea id="log-output" readonly rows="20" style="width: 100%; box-sizing: border-box;"></textarea>
         <div>
             <button id="download-log-button" type="button">Download log</button>
@@ -359,7 +368,7 @@ agraph (float[N] X) =&gt; (float[N] Y) {
                 });
             }
         </script>
-        <h2>onnxsim profiling</h2>
+        <h2 id="sec-profiling">onnxsim profiling</h2>
         <p>
             Profiling is on by default (“profile simplification” above): convert
             a model with <b>Simplify</b> and the fixed-point transforms (shape
@@ -369,7 +378,7 @@ agraph (float[N] X) =&gt; (float[N] Y) {
             open the full Perfetto timeline inline on this page.
         </p>
         <div id="simplify-trace"></div>
-        <h2>Run inference (onnxruntime-web)</h2>
+        <h2 id="sec-inference">Run inference (onnxruntime-web)</h2>
         <p>
             Runs a model for a few iterations to check it executes, using dummy
             inputs generated from the model's input shapes. The <b>model</b>
