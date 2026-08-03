@@ -41,9 +41,7 @@ struct FuseMulIntoConv final : public PredicateBasedPass {
   explicit FuseMulIntoConv()
       : PredicateBasedPass(PassType::Fuse, PassEfficiency::Complete,
                            PassOptimizationType::Compute) {}
-  std::string getPassName() const override {
-    return "fuse_mul_into_conv";
-  }
+  std::string getPassName() const override { return "fuse_mul_into_conv"; }
 
   // Index (0 or 1) of the Mul operand that is a foldable Conv output -- a Conv
   // used only by this Mul and whose weight is constant -- or -1 if neither is.

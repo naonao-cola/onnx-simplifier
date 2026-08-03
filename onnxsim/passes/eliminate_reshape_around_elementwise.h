@@ -7,19 +7,22 @@
 
 #pragma once
 
-// Cancel the reshape scaffolding that ``fuse_matmul_add_bias_into_gemm_batched``
-// leaves around a chain of element-wise ops.
+// Cancel the reshape scaffolding that
+// ``fuse_matmul_add_bias_into_gemm_batched`` leaves around a chain of
+// element-wise ops.
 //
 // That pass rewrites a rank-3 ``MatMul(X,W)+b`` into
-//   X2 = Reshape(X, [-1, K])   ;   G = Gemm(X2, W, b)   ;   A = Reshape(G, [.., N])
+//   X2 = Reshape(X, [-1, K])   ;   G = Gemm(X2, W, b)   ;   A = Reshape(G, [..,
+//   N])
 // so a transformer's linear layers become 2-D Gemms. Consecutive linears are
-// separated only by element-wise ops (a GELU/act block, a bias add, ...), so the
-// graph ends up as
-//   Gemm -> Reshape(to N-D) -> <element-wise chain, all N-D> -> Reshape(to 2-D) -> Gemm
-// where the two reshapes are exact inverses (they only merge / split the leading
-// dims and keep the last dim). Element-wise ops commute with a leading-dim
-// flatten, so the chain can run on the already-2-D Gemm output and both reshapes
-// disappear -- the Gemms (and their tuned-kernel dispatch) stay.
+// separated only by element-wise ops (a GELU/act block, a bias add, ...), so
+// the graph ends up as
+//   Gemm -> Reshape(to N-D) -> <element-wise chain, all N-D> -> Reshape(to 2-D)
+//   -> Gemm
+// where the two reshapes are exact inverses (they only merge / split the
+// leading dims and keep the last dim). Element-wise ops commute with a
+// leading-dim flatten, so the chain can run on the already-2-D Gemm output and
+// both reshapes disappear -- the Gemms (and their tuned-kernel dispatch) stay.
 //
 // Before (K = feature dims collapsed, last dim preserved):
 //   g0 = Gemm(...)                      // [P, H]   (P = merged leading dims)
@@ -35,8 +38,9 @@
 // This matches on the flattening ``Reshape`` (``f`` above) and only fires when
 // the whole element-wise region between it and the inverse reshapes is *closed*
 // -- every value it would flatten is consumed only inside the region -- so no
-// out-of-region consumer ever sees a reshaped tensor. Registered ``Nop`` so it is
-// part of the default fuse/eliminate set and honours ``--skip-optimization``.
+// out-of-region consumer ever sees a reshaped tensor. Registered ``Nop`` so it
+// is part of the default fuse/eliminate set and honours
+// ``--skip-optimization``.
 
 #include <functional>
 #include <unordered_map>
@@ -65,11 +69,12 @@ struct EliminateReshapeAroundElementwise final : public PredicateBasedPass {
   // last axis) are intentionally excluded.
   static bool IsElementwise(const Node* n) {
     static const std::vector<Symbol> kinds = {
-        Symbol("Add"),   Symbol("Sub"),  Symbol("Mul"),        Symbol("Div"),
-        Symbol("Pow"),   Symbol("Erf"),  Symbol("Relu"),       Symbol("Sigmoid"),
-        Symbol("Tanh"),  Symbol("Sqrt"), Symbol("Exp"),        Symbol("Log"),
-        Symbol("Neg"),   Symbol("Abs"),  Symbol("Softplus"),   Symbol("Reciprocal"),
-        Symbol("Gelu"),  Symbol("Cast"),
+        Symbol("Add"),        Symbol("Sub"),     Symbol("Mul"),
+        Symbol("Div"),        Symbol("Pow"),     Symbol("Erf"),
+        Symbol("Relu"),       Symbol("Sigmoid"), Symbol("Tanh"),
+        Symbol("Sqrt"),       Symbol("Exp"),     Symbol("Log"),
+        Symbol("Neg"),        Symbol("Abs"),     Symbol("Softplus"),
+        Symbol("Reciprocal"), Symbol("Gelu"),    Symbol("Cast"),
     };
     for (const auto& k : kinds) {
       if (n->kind() == k) {
@@ -162,7 +167,8 @@ struct EliminateReshapeAroundElementwise final : public PredicateBasedPass {
 
     // Walk the element-wise region backwards from ``root``. Every internal
     // value must be consumed only inside the region; every leaf must be a
-    // trailing-broadcast constant (left as-is) or an inverse reshape (bypassed).
+    // trailing-broadcast constant (left as-is) or an inverse reshape
+    // (bypassed).
     std::unordered_set<Node*> region;
     std::vector<Node*> worklist;
     // Rewires to apply on success: (node, input index) -> the 2-D value.
@@ -221,8 +227,8 @@ struct EliminateReshapeAroundElementwise final : public PredicateBasedPass {
     // The region now computes on the flattened (2-D) tensors, so the cached N-D
     // shapes on its outputs are stale. Wipe them so the next shape-inference
     // pass recomputes the 2-D shapes; a leftover 3-D value_info would otherwise
-    // trip strict consumers (e.g. onnxruntime's Gemm rank check) even though the
-    // graph is numerically correct.
+    // trip strict consumers (e.g. onnxruntime's Gemm rank check) even though
+    // the graph is numerically correct.
     for (Node* n : region) {
       for (Value* out : n->outputs()) {
         out->wipeSizes();

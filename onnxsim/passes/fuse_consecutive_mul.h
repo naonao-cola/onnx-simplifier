@@ -38,9 +38,7 @@ struct FuseConsecutiveMul final : public PredicateBasedPass {
   explicit FuseConsecutiveMul()
       : PredicateBasedPass(PassType::Fuse, PassEfficiency::Complete,
                            PassOptimizationType::Compute) {}
-  std::string getPassName() const override {
-    return "fuse_consecutive_mul";
-  }
+  std::string getPassName() const override { return "fuse_consecutive_mul"; }
 
   // Returns the index (0 or 1) of the single constant operand of a 2-input
   // node, or -1 when the node does not have exactly one constant operand.
