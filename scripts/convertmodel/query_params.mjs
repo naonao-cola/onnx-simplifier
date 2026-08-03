@@ -18,6 +18,8 @@
 //   inline_functions (inline) — boolean: inline local functions before the
 //     simplify / optimize / fixed-optimize transform.
 //   tensor_size_threshold (tst), target_opset (opset) — integers.
+//   autorun (autoinfer, autorun_inference) — boolean: auto-run the "Run
+//     inference" panel each time a conversion finishes.
 
 // Parse a boolean-ish value: an empty value (a bare `?cf`) means "on"; returns
 // null for absent or unrecognized so callers can tell "not set" from false.
@@ -82,6 +84,9 @@ export function parseInputParams(search) {
     inlineFunctions: toBool(first("inline_functions", "inline")),
     tensorSizeThreshold: toInt(first("tensor_size_threshold", "tst")),
     targetOpset: toInt(first("target_opset", "opset")),
+    // Whether to auto-run the "Run inference" panel after each conversion
+    // (the "auto-run after each conversion" checkbox).
+    autoRunInference: toBool(first("autorun", "autoinfer", "autorun_inference")),
   };
 }
 
@@ -158,6 +163,7 @@ const OPTION_DEFAULTS = {
   shapeInference: true, // #id_simplify_shape_inference checked
   tensorSizeThreshold: 1000000000, // #id_simplify_tensor_size_threshold
   targetOpset: 0, // #id_simplify_target_opset (0 = keep current opset)
+  autoRunInference: false, // #inference-autorun unchecked
 };
 
 // Build a complete shareable query string from the current converter state.
@@ -179,6 +185,7 @@ export function buildShareSearch(search, doc) {
   };
   setBool("id_simplify_constant_fold", "cf", OPTION_DEFAULTS.constantFold);
   setBool("id_simplify_shape_inference", "si", OPTION_DEFAULTS.shapeInference);
+  setBool("inference-autorun", "autorun", OPTION_DEFAULTS.autoRunInference);
   // Numeric options: emit only when meaningful (present and non-default).
   const tst = doc.getElementById("id_simplify_tensor_size_threshold");
   if (tst) {
@@ -226,6 +233,7 @@ export function applyOptionParams(params, doc) {
   setChecked("id_simplify_constant_fold", params.constantFold);
   setChecked("id_simplify_shape_inference", params.shapeInference);
   setChecked("id_inline_functions", params.inlineFunctions);
+  setChecked("inference-autorun", params.autoRunInference);
   setValue("id_simplify_tensor_size_threshold", params.tensorSizeThreshold);
   setValue("id_simplify_target_opset", params.targetOpset);
   return changed;
