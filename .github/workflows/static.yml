@@ -64,6 +64,11 @@ jobs:
     env:
       CMAKE_GENERATOR: Ninja
       EMSCRIPTEN_VERSION: "5.0.0"
+      # Surfaced so the Cloudflare preview steps can gate on the secret being
+      # present. It is empty for fork PRs and for Dependabot PRs (GitHub does
+      # not share repo secrets with either), so the steps below skip instead of
+      # failing wrangler with "CLOUDFLARE_API_TOKEN is necessary".
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -166,11 +171,13 @@ jobs:
         if: ${{ github.event_name == 'push' }}
 
       # --- Preview: Cloudflare Pages (pull requests only) ---
-      # Secrets are not available to pull requests from forks, so skip the
-      # deploy there instead of failing. Same-repo branches get previews.
+      # Repo secrets are not shared with fork PRs or Dependabot PRs, so
+      # CLOUDFLARE_API_TOKEN is empty there. Gate on it being set so those runs
+      # skip the deploy instead of failing wrangler. Same-repo branches (which
+      # do get the secret) still produce previews.
       - name: Deploy preview to Cloudflare Pages
         id: cf_deploy
-        if: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository }}
+        if: ${{ github.event_name == 'pull_request' && env.CLOUDFLARE_API_TOKEN != '' }}
         uses: cloudflare/wrangler-action@v3
         with:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
@@ -182,7 +189,7 @@ jobs:
             --project-name=onnxsim
             --branch=${{ github.head_ref }}
       - name: Comment preview URL on the PR
-        if: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository }}
+        if: ${{ github.event_name == 'pull_request' && env.CLOUDFLARE_API_TOKEN != '' }}
         uses: actions/github-script@v7
         with:
           script: |
