@@ -46,7 +46,7 @@ jobs:
         with:
           submodules: recursive
           fetch-depth: 0
-      - uses: mozilla-actions/sccache-action@v0.0.10
+      - uses: mozilla-actions/sccache-action@v0.0.11
       # X2Paddle 1.6.0 needs onnx<1.16, which has no cp312 wheels on some
       # platforms; build the onnxsim wheel for cp311 to match the shard runtime.
       - name: Build cp311 wheel
