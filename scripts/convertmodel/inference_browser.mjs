@@ -145,7 +145,7 @@ async function prepareInputs(ort, modelBytes, batch, fill, log) {
   return { feeds, inputName, leadMeta, leadingDynamic };
 }
 
-async function runOnModel(modelBytes, { iterations, batch, providers, needWebnn, profile }, log) {
+async function runOnModel(modelBytes, { iterations, warmup, batch, providers, needWebnn, profile }, log) {
   const ort = await loadOrt(needWebnn ? "all" : "default");
 
   const { feeds, inputName, leadingDynamic } = await prepareInputs(
@@ -167,6 +167,7 @@ async function runOnModel(modelBytes, { iterations, batch, providers, needWebnn,
     feeds,
     providers,
     iterations,
+    warmup,
     profile,
     onLog: log,
   });
@@ -185,7 +186,7 @@ async function runOnModel(modelBytes, { iterations, batch, providers, needWebnn,
 async function runCompare(
   originalBytes,
   convertedBytes,
-  { iterations, batch, providers, needWebnn, profile },
+  { iterations, warmup, batch, providers, needWebnn, profile },
   log,
 ) {
   const ort = await loadOrt(needWebnn ? "all" : "default");
@@ -211,6 +212,7 @@ async function runCompare(
     feeds,
     providers,
     iterations,
+    warmup,
     profile,
     onLog: log,
   });
@@ -458,6 +460,7 @@ export function initInferencePanel() {
   const out = document.getElementById("inference-output");
   const fileInput = document.getElementById("file-input");
   const itersInput = document.getElementById("inference-iters");
+  const warmupInput = document.getElementById("inference-warmup");
   const batchInput = document.getElementById("inference-batch");
   const epSelect = document.getElementById("inference-ep");
   const sourceSelect = document.getElementById("inference-source");
@@ -515,6 +518,10 @@ export function initInferencePanel() {
     try {
       const source = sourceSelect ? sourceSelect.value : "original";
       const iterations = Math.max(1, parseInt(itersInput.value, 10) || 5);
+      // Warm-up passes run before the timed loop and are excluded from the
+      // measured latency, so the reported speed isn't skewed by one-time
+      // compilation/allocation costs. 0 keeps every iteration timed.
+      const warmup = Math.max(0, parseInt(warmupInput ? warmupInput.value : "1", 10) || 0);
       const batch = Math.max(1, parseInt(batchInput ? batchInput.value : "1", 10) || 1);
       const epValue = epSelect.value;
       const { providers, needWebnn } = providersForEp(epValue);
@@ -540,7 +547,7 @@ export function initInferencePanel() {
         const cmp = await runCompare(
           original.bytes,
           converted.bytes,
-          { iterations, batch, providers, needWebnn, profile },
+          { iterations, warmup, batch, providers, needWebnn, profile },
           log,
         );
         log(
@@ -567,7 +574,7 @@ export function initInferencePanel() {
       log(`loading onnxruntime-web ${ORT_VERSION}…`);
       const res = await runOnModel(
         bytes,
-        { iterations, batch, providers, needWebnn, profile },
+        { iterations, warmup, batch, providers, needWebnn, profile },
         log,
       );
       log(

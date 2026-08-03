@@ -75,6 +75,13 @@ function startWebGpuProfiling(ort) {
 // equal the first) and, if `reference` is given, correctness within `tolerance`.
 // Returns { ep, iterations, timings, avgMs, output, dims, trace? }.
 //
+// `warmup` untimed passes run first (default 1) and are excluded from the
+// reported timings, average, and profiling trace. The first `session.run` pays
+// one-time costs — kernel/program compilation, buffer allocation, JIT warm-up —
+// that don't recur, so counting it would inflate the measured latency; a warm-up
+// pass absorbs that cost and leaves the timed loop measuring steady state. Pass
+// `warmup: 0` to time every iteration (the old behaviour).
+//
 // With `profile: true`, `trace` is a Chrome Trace Event object built from the
 // per-iteration wall timings and (on WebGPU) the per-kernel GPU records.
 export async function runInference(ort, {
@@ -85,6 +92,7 @@ export async function runInference(ort, {
   outputName,
   providers,
   iterations = 5,
+  warmup = 1,
   reference = null,
   tolerance = 1e-4,
   profile = false,
@@ -120,7 +128,17 @@ export async function runInference(ort, {
   let lastDims = null;
   const timings = [];
   const runs = [];
+  const warmupRuns = Math.max(0, warmup | 0);
   try {
+    // Warm-up passes: run but don't time. These absorb the one-time
+    // compilation/allocation costs so they don't skew the measured latency.
+    for (let w = 0; w < warmupRuns; w++) {
+      await session.run(runFeeds);
+      onLog(`warmup ${w}: discarded (not timed)`);
+    }
+    // Drop any kernel spans the warm-up passes emitted so the profiling trace
+    // reflects only the timed iterations.
+    if (gpu) gpu.kernels.length = 0;
     for (let i = 0; i < iterations; i++) {
       const t0 = performance.now();
       const results = await session.run(runFeeds);
@@ -216,6 +234,7 @@ export async function compareInference(ort, {
   outputName,
   providers,
   iterations = 5,
+  warmup = 1,
   tolerance = 1e-3,
   profile = false,
   onLog = () => {},
@@ -231,6 +250,7 @@ export async function compareInference(ort, {
     outputName,
     providers,
     iterations,
+    warmup,
     profile,
     onLog,
   });
@@ -243,6 +263,7 @@ export async function compareInference(ort, {
     outputName,
     providers,
     iterations,
+    warmup,
     profile,
     onLog,
   });

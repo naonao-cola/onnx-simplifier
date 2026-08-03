@@ -1,0 +1,252 @@
+// Main converter glue for index.html: gates the file picker on both
+// WASM runtimes being ready, wires the worker, and drives conversion.
+// Extracted verbatim from the page's inline <script> so it can be
+// version-controlled and diffed on its own; it stays a classic script
+// (loaded right after onnxsim.js, before the module panels) so its load
+// order and behavior are unchanged.
+
+            // The "Choose file" picker must stay disabled until BOTH WASM
+            // runtimes are initialized: the one on this page (used to populate
+            // the pass list) and the one inside the conversion worker (which
+            // actually receives the model). Enabling it earlier lets a user
+            // pick a file before the worker is listening, so the conversion
+            // message is dropped and the runtime raises uninitialized errors.
+            let runtimeReady = false; // this page's WASM (pass list)
+            let workerReady = false;  // the worker's WASM (conversion)
+            const maybeEnableInput = () => {
+                if (!runtimeReady || !workerReady) return;
+                const input = document.getElementById("file-input");
+                if (input) {
+                    input.disabled = false;
+                    input.removeAttribute("title");
+                }
+                // The "Load from Hugging Face" controls share the same runtimes
+                // as the file picker, so enable them together.
+                for (const id of ["hf-model-select", "hf-model-input", "hf-load-button"]) {
+                    const el = document.getElementById(id);
+                    if (el) {
+                        el.disabled = false;
+                        el.removeAttribute("title");
+                    }
+                }
+                const status = document.getElementById("loading-status");
+                if (status) status.style.display = "none";
+                // Signal the module panels (the single-feature debug passes)
+                // that BOTH runtimes are up, so a pass posted to the worker is
+                // no longer at risk of being dropped before it starts listening.
+                if (!window.__onnxsimReady) {
+                    window.__onnxsimReady = true;
+                    window.dispatchEvent(new Event("onnxsim:ready"));
+                }
+            };
+
+            // Publish the runtime (and a promise for it) so the ES-module panels
+            // — versions, "parse a text graph", and the single-feature debug
+            // passes — can call the module directly. None of them need
+            // onnxruntime-web, so this page's runtime is enough for them.
+            window.__onnxsimRuntimePromise = create_onnxsim().then((runtime) => {
+                window.__onnxsimRuntime = runtime;
+                to_ary = (vec) => {
+                    return new Array(vec.size()).fill(0).map((_, id) => vec.get(id))
+                };
+                const passes = document.getElementById("pass-list");
+                const checkboxes = {};
+                for (const p of to_ary(runtime.onnxoptimizer_passes()).sort()) {
+                    const c = document.createElement("input");
+                    c.type = "checkbox";
+                    c.setAttribute("class", "pass");
+                    c.name = p;
+                    c.id = "id_" + p;
+                    checkboxes[p] = c;
+                    passes.appendChild(c);
+                    const l = document.createElement("label");
+                    l.textContent = p;
+                    l.setAttribute("for", c.id);
+                    passes.appendChild(l);
+                    passes.appendChild(document.createElement("br"));
+                }
+                for (const p of to_ary(runtime.onnxoptimizer_fuse_elimination_passes()).sort()) {
+                    checkboxes[p].checked = true;
+                }
+                runtimeReady = true;
+                maybeEnableInput();
+                return runtime;
+            });
+
+            // The most recent conversion parameters, captured so that the
+            // "Report an issue" button can include them in the pre-filled report.
+            // Published on `window` so the report-issue module (a separate inline
+            // module script) can read it — modules don't share this classic
+            // script's scope.
+            let last_run_info = null;
+
+            window.onload = () => {
+                const worker = new Worker(window.__onnxsimWorkerUrl || "worker.js");
+                const log_output = document.getElementById("log-output");
+                const input = document.getElementById("file-input");
+                const dl_btn = document.getElementById("download-button");
+                const trace_container = document.getElementById("simplify-trace");
+                let result_name = "";
+                let original_name = "";
+                // Decode a "data:...;base64,<b64>" URL back into a Uint8Array.
+                const dataUrlToBytes = (data_url) => {
+                    const b64 = data_url.slice(data_url.indexOf(",") + 1);
+                    const bin = atob(b64);
+                    const bytes = new Uint8Array(bin.length);
+                    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+                    return bytes;
+                };
+                worker.onmessage = (e) => {
+                    switch (e.data[0]) {
+                        case "ready":
+                            // The worker's WASM runtime has finished loading and
+                            // is now listening for conversion requests.
+                            workerReady = true;
+                            maybeEnableInput();
+                            break;
+                        case "stdout":
+                            log_output.value += e.data[1] + "\n";
+                            log_output.scrollTop = log_output.scrollHeight;
+                            break;
+                        case "stderr":
+                            log_output.value += e.data[1] + "\n";
+                            log_output.scrollTop = log_output.scrollHeight;
+                            break;
+                        case "convert-done":
+                            input.disabled = false;
+                            dl_btn.disabled = false;
+                            const data_url = e.data[1];
+                            const trace_json = e.data[2];
+                            const original_data_url = e.data[3];
+                            dl_btn.onclick = () => {
+                                const a = document.createElement("a");
+                                a.href = data_url;
+                                a.download = result_name;
+                                a.click();
+                            };
+                            // Visualize the simplified/optimized model with Netron.
+                            if (window.netronShowAfter) {
+                                window.netronShowAfter(data_url, result_name);
+                            }
+                            // List the converted model's dim_params ("after").
+                            if (window.dimParamsShowAfter) {
+                                window.dimParamsShowAfter(data_url, result_name);
+                            }
+                            // Keep the converted model bytes around so the
+                            // "Run inference" panel can run them (not just the
+                            // original upload). Decode the base64 data URL back
+                            // into a Uint8Array and publish it for the panel.
+                            try {
+                                const bytes = dataUrlToBytes(data_url);
+                                window.__onnxsimConverted = { bytes, name: result_name };
+                                window.dispatchEvent(new CustomEvent("onnxsim:converted", {
+                                    detail: { name: result_name },
+                                }));
+                            } catch (err) {
+                                log_output.value += "failed to keep converted model for inference: " + err + "\n";
+                                log_output.scrollTop = log_output.scrollHeight;
+                            }
+                            // Keep the MAC-annotated *original* bytes (when the
+                            // worker produced them) so the "Run inference" panel's
+                            // "original" source can report MACs/throughput and be
+                            // compared against the converted result.
+                            if (original_data_url) {
+                                try {
+                                    const bytes = dataUrlToBytes(original_data_url);
+                                    window.__onnxsimOriginalAnnotated = { bytes, name: original_name };
+                                    window.dispatchEvent(new CustomEvent("onnxsim:original-annotated", {
+                                        detail: { name: original_name },
+                                    }));
+                                } catch (err) {
+                                    log_output.value += "failed to keep annotated original for inference: " + err + "\n";
+                                    log_output.scrollTop = log_output.scrollHeight;
+                                }
+                            }
+                            // Render the onnxsim simplification profile, if one
+                            // came back, as an inline flame graph.
+                            if (trace_container) trace_container.innerHTML = "";
+                            if (trace_json && trace_container) {
+                                try {
+                                    const trace = JSON.parse(trace_json);
+                                    import("./trace_viewer.mjs").then(({ renderTrace }) => {
+                                        renderTrace(trace_container, trace, {
+                                            title: "onnxsim simplify",
+                                            filename: "onnxsim.simplify.trace.json",
+                                        });
+                                    });
+                                } catch (err) {
+                                    log_output.value += "failed to parse profiling trace: " + err + "\n";
+                                    log_output.scrollTop = log_output.scrollHeight;
+                                }
+                            }
+                            break;
+                    }
+                };
+
+                // Run one conversion. `modelName` names the source (for the
+                // download filename and issue report); `buf` is an ArrayBuffer
+                // that is *transferred* to the worker. Shared by the file picker
+                // and the Hugging Face loader (which calls it via the window
+                // handle published below).
+                const startConversion = (modelName, buf) => {
+                    const optimizer = document.querySelector('input[name="optimizer"]:checked').value;
+                    result_name = (modelName.endsWith(".onnx") ? modelName.substring(0, modelName.length - 5) : modelName) + "." + optimizer + ".onnx"
+                    original_name = modelName;
+                    // Drop any previous run's cached models so the inference panel
+                    // never serves a stale converted/annotated result for the new
+                    // model while this conversion is still in flight.
+                    window.__onnxsimConverted = null;
+                    window.__onnxsimOriginalAnnotated = null;
+
+                    input.disabled = true;
+                    dl_btn.disabled = true;
+                    console.log("sending: ", modelName);
+                    let passes = null;
+                    if (optimizer == "simplify") {
+                        passes = Array.from(document.querySelectorAll('input[class="pass"]:not(:checked)')).map((v) => v.name);
+                    } else {
+                        passes = Array.from(document.querySelectorAll('input[class="pass"]:checked')).map((v) => v.name);
+                    }
+                    const constant_fold = document.getElementById("id_simplify_constant_fold").checked;
+                    const shape_inference = document.getElementById("id_simplify_shape_inference").checked;
+                    const tensor_size_threshold = parseInt(document.getElementById("id_simplify_tensor_size_threshold").value);
+                    // An empty / non-positive value means "keep the current opset version".
+                    const target_opset_version = parseInt(document.getElementById("id_simplify_target_opset").value) || 0;
+                    last_run_info = {
+                        optimizer, passes, constant_fold, shape_inference,
+                        tensor_size_threshold, target_opset_version,
+                        file_name: modelName,
+                    };
+                    // Profiling only applies to "simplify"; the onnx-optimizer
+                    // paths do not run the fixed-point profiler.
+                    const profile = optimizer == "simplify" && document.getElementById("id_simplify_profile").checked;
+                    // Annotate the converted model with MACs/FLOPs (metadata_props)
+                    // by default; applies to every optimizer mode.
+                    const annotate_model_info = document.getElementById("id_annotate_model_info").checked;
+                    last_run_info.annotate_model_info = annotate_model_info;
+                    // Inline the model's local functions before simplify / optimize /
+                    // fixed optimize (a no-op for the single-pass debug modes and the
+                    // standalone "inline" mode). Off by default so behaviour is
+                    // unchanged unless the user opts in.
+                    const inline_functions = document.getElementById("id_inline_functions").checked;
+                    last_run_info.inline_functions = inline_functions;
+                    // Expose the latest run parameters to the report-issue module.
+                    window.__onnxsimLastRunInfo = last_run_info;
+                    worker.postMessage([optimizer, buf, passes, constant_fold, shape_inference, tensor_size_threshold, target_opset_version, profile, annotate_model_info, inline_functions], [buf]);
+                };
+                // Expose the conversion entry point for the Hugging Face loader
+                // module (hf_load.mjs), which downloads model bytes and drives
+                // the same path as an uploaded file.
+                window.__onnxsimStartConversion = startConversion;
+
+                input.addEventListener("change", async (e) => {
+                    const file = e.target.files[0];
+                    if (!file) return;
+                    // An uploaded file is readable as "original" from the file
+                    // input itself, so clear any model left over from a previous
+                    // Hugging Face load to avoid running stale bytes.
+                    window.__onnxsimOriginal = null;
+                    const buf = await file.arrayBuffer();
+                    startConversion(file.name, buf);
+                });
+            };

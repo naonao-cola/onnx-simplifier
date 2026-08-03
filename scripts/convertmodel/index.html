@@ -1,295 +1,12 @@
 <!DOCTYPE html>
 <html>
     <head>
-        <style>
-            .netron-pane { flex: 1 1 380px; min-width: 300px; }
-            .netron-head { margin-bottom: 0.35em; }
-            .netron-note { color: #a00; font-size: 0.9em; margin-top: 0.35em; }
-            /* `resize: vertical` needs a non-visible overflow to expose the
-               drag handle; the min/max keep the pane usable. */
-            .netron-frame { width: 100%; height: 480px; min-height: 200px; max-height: 90vh; border: 1px solid #ccc; resize: vertical; overflow: auto; }
-            .macs-cards { display: flex; flex-wrap: wrap; gap: 0.6em; margin: 0.6em 0; }
-            .macs-card { border: 1px solid #ccc; border-radius: 6px; padding: 0.5em 0.7em; min-width: 8em; }
-            .macs-k { color: #666; font-size: 0.75em; text-transform: uppercase; letter-spacing: 0.03em; }
-            .macs-v { font-size: 1.2em; font-weight: 600; font-variant-numeric: tabular-nums; }
-            .macs-v small { font-size: 0.65em; color: #666; font-weight: 400; }
-            .macs-table { border-collapse: collapse; margin-top: 0.4em; font-variant-numeric: tabular-nums; }
-            .macs-table th, .macs-table td { border-bottom: 1px solid #eee; padding: 3px 10px; text-align: right; }
-            .macs-table th:first-child, .macs-table td:first-child { text-align: left; }
-            .macs-note { color: #666; font-size: 0.85em; margin-top: 0.4em; }
-            /* "Dynamic dimensions (dim_param)" panel */
-            .dp-panes { display: flex; gap: 1em; flex-wrap: wrap; }
-            .dp-pane { flex: 1 1 320px; min-width: 280px; border: 1px solid #ccc; border-radius: 6px; padding: 0.5em 0.7em; }
-            .dp-head { font-weight: 600; margin-bottom: 0.35em; }
-            .dp-names { margin-bottom: 0.4em; }
-            .dp-diff { margin: 0 0 0.5em; padding: 0.35em 0.6em; background: #f4f7ff; border-left: 3px solid #4a6cf7; border-radius: 3px; }
-            .dp-table { border-collapse: collapse; width: 100%; font-variant-numeric: tabular-nums; }
-            .dp-table th, .dp-table td { border-bottom: 1px solid #eee; padding: 3px 8px; text-align: left; }
-            .dp-param { color: #b5006b; font-weight: 600; }
-            .dp-dim { color: #333; }
-            /* before/after comparison summary (Run inference "compare" mode) */
-            .cmp-table th { text-align: left; color: #666; font-weight: 600; white-space: nowrap; }
-            .cmp-table td { text-align: left; }
-            .cmp-ok { color: #0a7d24; font-weight: 600; }
-            .cmp-bad { color: #a00; font-weight: 600; }
-            .cmp-warn { color: #a06000; font-weight: 600; }
-            #versions-panel { display: flex; flex-wrap: wrap; gap: 0.5em; margin: 0.4em 0 0.8em; }
-            .version-badge { border: 1px solid #ccc; border-radius: 999px; padding: 0.15em 0.7em; font-size: 0.85em; display: inline-flex; gap: 0.4em; align-items: baseline; }
-            .version-k { color: #666; }
-            .version-v { font-weight: 600; font-variant-numeric: tabular-nums; }
-            .tool-panel { border: 1px solid #ddd; border-radius: 6px; padding: 0.6em 0.8em; margin: 0.8em 0; }
-            .tool-panel h3 { margin: 0 0 0.4em; }
-            .tool-note { color: #666; font-size: 0.85em; margin: 0.3em 0; }
-            .debug-actions { display: flex; flex-wrap: wrap; gap: 0.5em; align-items: center; margin: 0.4em 0; }
-        </style>
+        <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <title>onnxsim model converter</title>
+        <link rel="stylesheet" href="./style.css">
         <script type="text/javascript" src="./onnxsim.js"></script>
-        <script type="text/javascript">
-            // The "Choose file" picker must stay disabled until BOTH WASM
-            // runtimes are initialized: the one on this page (used to populate
-            // the pass list) and the one inside the conversion worker (which
-            // actually receives the model). Enabling it earlier lets a user
-            // pick a file before the worker is listening, so the conversion
-            // message is dropped and the runtime raises uninitialized errors.
-            let runtimeReady = false; // this page's WASM (pass list)
-            let workerReady = false;  // the worker's WASM (conversion)
-            const maybeEnableInput = () => {
-                if (!runtimeReady || !workerReady) return;
-                const input = document.getElementById("file-input");
-                if (input) {
-                    input.disabled = false;
-                    input.removeAttribute("title");
-                }
-                // The "Load from Hugging Face" controls share the same runtimes
-                // as the file picker, so enable them together.
-                for (const id of ["hf-model-select", "hf-model-input", "hf-load-button"]) {
-                    const el = document.getElementById(id);
-                    if (el) {
-                        el.disabled = false;
-                        el.removeAttribute("title");
-                    }
-                }
-                const status = document.getElementById("loading-status");
-                if (status) status.style.display = "none";
-                // Signal the module panels (the single-feature debug passes)
-                // that BOTH runtimes are up, so a pass posted to the worker is
-                // no longer at risk of being dropped before it starts listening.
-                if (!window.__onnxsimReady) {
-                    window.__onnxsimReady = true;
-                    window.dispatchEvent(new Event("onnxsim:ready"));
-                }
-            };
-
-            // Publish the runtime (and a promise for it) so the ES-module panels
-            // — versions, "parse a text graph", and the single-feature debug
-            // passes — can call the module directly. None of them need
-            // onnxruntime-web, so this page's runtime is enough for them.
-            window.__onnxsimRuntimePromise = create_onnxsim().then((runtime) => {
-                window.__onnxsimRuntime = runtime;
-                to_ary = (vec) => {
-                    return new Array(vec.size()).fill(0).map((_, id) => vec.get(id))
-                };
-                const passes = document.getElementById("pass-list");
-                const checkboxes = {};
-                for (const p of to_ary(runtime.onnxoptimizer_passes()).sort()) {
-                    const c = document.createElement("input");
-                    c.type = "checkbox";
-                    c.setAttribute("class", "pass");
-                    c.name = p;
-                    c.id = "id_" + p;
-                    checkboxes[p] = c;
-                    passes.appendChild(c);
-                    const l = document.createElement("label");
-                    l.textContent = p;
-                    l.setAttribute("for", c.id);
-                    passes.appendChild(l);
-                    passes.appendChild(document.createElement("br"));
-                }
-                for (const p of to_ary(runtime.onnxoptimizer_fuse_elimination_passes()).sort()) {
-                    checkboxes[p].checked = true;
-                }
-                runtimeReady = true;
-                maybeEnableInput();
-                return runtime;
-            });
-
-            // The most recent conversion parameters, captured so that the
-            // "Report an issue" button can include them in the pre-filled report.
-            // Published on `window` so the report-issue module (a separate inline
-            // module script) can read it — modules don't share this classic
-            // script's scope.
-            let last_run_info = null;
-
-            window.onload = () => {
-                const worker = new Worker(window.__onnxsimWorkerUrl || "worker.js");
-                const log_output = document.getElementById("log-output");
-                const input = document.getElementById("file-input");
-                const dl_btn = document.getElementById("download-button");
-                const trace_container = document.getElementById("simplify-trace");
-                let result_name = "";
-                let original_name = "";
-                // Decode a "data:...;base64,<b64>" URL back into a Uint8Array.
-                const dataUrlToBytes = (data_url) => {
-                    const b64 = data_url.slice(data_url.indexOf(",") + 1);
-                    const bin = atob(b64);
-                    const bytes = new Uint8Array(bin.length);
-                    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
-                    return bytes;
-                };
-                worker.onmessage = (e) => {
-                    switch (e.data[0]) {
-                        case "ready":
-                            // The worker's WASM runtime has finished loading and
-                            // is now listening for conversion requests.
-                            workerReady = true;
-                            maybeEnableInput();
-                            break;
-                        case "stdout":
-                            log_output.value += e.data[1] + "\n";
-                            log_output.scrollTop = log_output.scrollHeight;
-                            break;
-                        case "stderr":
-                            log_output.value += e.data[1] + "\n";
-                            log_output.scrollTop = log_output.scrollHeight;
-                            break;
-                        case "convert-done":
-                            input.disabled = false;
-                            dl_btn.disabled = false;
-                            const data_url = e.data[1];
-                            const trace_json = e.data[2];
-                            const original_data_url = e.data[3];
-                            dl_btn.onclick = () => {
-                                const a = document.createElement("a");
-                                a.href = data_url;
-                                a.download = result_name;
-                                a.click();
-                            };
-                            // Visualize the simplified/optimized model with Netron.
-                            if (window.netronShowAfter) {
-                                window.netronShowAfter(data_url, result_name);
-                            }
-                            // List the converted model's dim_params ("after").
-                            if (window.dimParamsShowAfter) {
-                                window.dimParamsShowAfter(data_url, result_name);
-                            }
-                            // Keep the converted model bytes around so the
-                            // "Run inference" panel can run them (not just the
-                            // original upload). Decode the base64 data URL back
-                            // into a Uint8Array and publish it for the panel.
-                            try {
-                                const bytes = dataUrlToBytes(data_url);
-                                window.__onnxsimConverted = { bytes, name: result_name };
-                                window.dispatchEvent(new CustomEvent("onnxsim:converted", {
-                                    detail: { name: result_name },
-                                }));
-                            } catch (err) {
-                                log_output.value += "failed to keep converted model for inference: " + err + "\n";
-                                log_output.scrollTop = log_output.scrollHeight;
-                            }
-                            // Keep the MAC-annotated *original* bytes (when the
-                            // worker produced them) so the "Run inference" panel's
-                            // "original" source can report MACs/throughput and be
-                            // compared against the converted result.
-                            if (original_data_url) {
-                                try {
-                                    const bytes = dataUrlToBytes(original_data_url);
-                                    window.__onnxsimOriginalAnnotated = { bytes, name: original_name };
-                                    window.dispatchEvent(new CustomEvent("onnxsim:original-annotated", {
-                                        detail: { name: original_name },
-                                    }));
-                                } catch (err) {
-                                    log_output.value += "failed to keep annotated original for inference: " + err + "\n";
-                                    log_output.scrollTop = log_output.scrollHeight;
-                                }
-                            }
-                            // Render the onnxsim simplification profile, if one
-                            // came back, as an inline flame graph.
-                            if (trace_container) trace_container.innerHTML = "";
-                            if (trace_json && trace_container) {
-                                try {
-                                    const trace = JSON.parse(trace_json);
-                                    import("./trace_viewer.mjs").then(({ renderTrace }) => {
-                                        renderTrace(trace_container, trace, {
-                                            title: "onnxsim simplify",
-                                            filename: "onnxsim.simplify.trace.json",
-                                        });
-                                    });
-                                } catch (err) {
-                                    log_output.value += "failed to parse profiling trace: " + err + "\n";
-                                    log_output.scrollTop = log_output.scrollHeight;
-                                }
-                            }
-                            break;
-                    }
-                };
-
-                // Run one conversion. `modelName` names the source (for the
-                // download filename and issue report); `buf` is an ArrayBuffer
-                // that is *transferred* to the worker. Shared by the file picker
-                // and the Hugging Face loader (which calls it via the window
-                // handle published below).
-                const startConversion = (modelName, buf) => {
-                    const optimizer = document.querySelector('input[name="optimizer"]:checked').value;
-                    result_name = (modelName.endsWith(".onnx") ? modelName.substring(0, modelName.length - 5) : modelName) + "." + optimizer + ".onnx"
-                    original_name = modelName;
-                    // Drop any previous run's cached models so the inference panel
-                    // never serves a stale converted/annotated result for the new
-                    // model while this conversion is still in flight.
-                    window.__onnxsimConverted = null;
-                    window.__onnxsimOriginalAnnotated = null;
-
-                    input.disabled = true;
-                    dl_btn.disabled = true;
-                    console.log("sending: ", modelName);
-                    let passes = null;
-                    if (optimizer == "simplify") {
-                        passes = Array.from(document.querySelectorAll('input[class="pass"]:not(:checked)')).map((v) => v.name);
-                    } else {
-                        passes = Array.from(document.querySelectorAll('input[class="pass"]:checked')).map((v) => v.name);
-                    }
-                    const constant_fold = document.getElementById("id_simplify_constant_fold").checked;
-                    const shape_inference = document.getElementById("id_simplify_shape_inference").checked;
-                    const tensor_size_threshold = parseInt(document.getElementById("id_simplify_tensor_size_threshold").value);
-                    // An empty / non-positive value means "keep the current opset version".
-                    const target_opset_version = parseInt(document.getElementById("id_simplify_target_opset").value) || 0;
-                    last_run_info = {
-                        optimizer, passes, constant_fold, shape_inference,
-                        tensor_size_threshold, target_opset_version,
-                        file_name: modelName,
-                    };
-                    // Profiling only applies to "simplify"; the onnx-optimizer
-                    // paths do not run the fixed-point profiler.
-                    const profile = optimizer == "simplify" && document.getElementById("id_simplify_profile").checked;
-                    // Annotate the converted model with MACs/FLOPs (metadata_props)
-                    // by default; applies to every optimizer mode.
-                    const annotate_model_info = document.getElementById("id_annotate_model_info").checked;
-                    last_run_info.annotate_model_info = annotate_model_info;
-                    // Inline the model's local functions before simplify / optimize /
-                    // fixed optimize (a no-op for the single-pass debug modes and the
-                    // standalone "inline" mode). Off by default so behaviour is
-                    // unchanged unless the user opts in.
-                    const inline_functions = document.getElementById("id_inline_functions").checked;
-                    last_run_info.inline_functions = inline_functions;
-                    // Expose the latest run parameters to the report-issue module.
-                    window.__onnxsimLastRunInfo = last_run_info;
-                    worker.postMessage([optimizer, buf, passes, constant_fold, shape_inference, tensor_size_threshold, target_opset_version, profile, annotate_model_info, inline_functions], [buf]);
-                };
-                // Expose the conversion entry point for the Hugging Face loader
-                // module (hf_load.mjs), which downloads model bytes and drives
-                // the same path as an uploaded file.
-                window.__onnxsimStartConversion = startConversion;
-
-                input.addEventListener("change", async (e) => {
-                    const file = e.target.files[0];
-                    if (!file) return;
-                    // An uploaded file is readable as "original" from the file
-                    // input itself, so clear any model left over from a previous
-                    // Hugging Face load to avoid running stale bytes.
-                    window.__onnxsimOriginal = null;
-                    const buf = await file.arrayBuffer();
-                    startConversion(file.name, buf);
-                });
-            };
-        </script>
+        <script type="text/javascript" src="./converter_main.js"></script>
         <!-- Build the conversion worker's URL from the single CDN source of
              truth (cdn.mjs). worker.js is a classic worker and can't import the
              ES module, so the onnxruntime-web base — which only the module's
@@ -303,12 +20,29 @@
     </head>
     <body>
         <h1>Model converter</h1>
+        <p class="subtitle">
+            Simplify, optimize, and inspect ONNX models with
+            <a href="https://github.com/onnxsim/onnxsim" target="_blank" rel="noopener">onnxsim</a>
+            and
+            <a href="https://github.com/onnx/optimizer" target="_blank" rel="noopener">onnx-optimizer</a>,
+            compiled to WebAssembly. Everything runs locally in your browser —
+            models are never uploaded.
+        </p>
+        <nav class="section-nav" aria-label="Jump to section">
+            <a href="#sec-parse">Parse graph</a>
+            <a href="#sec-convert">Convert</a>
+            <a href="#sec-visualize">Netron</a>
+            <a href="#sec-dims">Dynamic dims</a>
+            <a href="#sec-console">Console</a>
+            <a href="#sec-profiling">Profiling</a>
+            <a href="#sec-inference">Run inference</a>
+        </nav>
         <div id="versions-panel" title="Library versions built into this WebAssembly module (also included in a bug report).">
             <span class="version-badge"><span class="version-k">versions</span><span class="version-v">loading…</span></span>
         </div>
         <script type="module" src="./versions.mjs"></script>
 
-        <h2>Parse a text graph</h2>
+        <h2 id="sec-parse">Parse a text graph</h2>
         <div class="tool-panel">
             <p class="tool-note">
                 Paste an ONNX model or graph in the
@@ -342,10 +76,10 @@ agraph (float[N] X) =&gt; (float[N] Y) {
         </div>
         <script type="module" src="./debug_tools.mjs"></script>
 
-        <h2>Convert a model</h2>
+        <h2 id="sec-convert">Convert a model</h2>
         <input type="file" id="file-input" disabled title="Loading WebAssembly runtime…" />
-        <span id="loading-status">⏳ Loading WebAssembly runtime… the file picker is disabled until it is ready.</span>
-        <button id="download-button" disabled>Download</button>
+        <span id="loading-status" role="status" aria-live="polite">⏳ Loading WebAssembly runtime… the file picker is disabled until it is ready.</span>
+        <button id="download-button" disabled>Download ↓</button>
         <div id="hf-loader" style="margin-top: 0.6em;">
             <label for="hf-model-select">…or load from <a href="https://huggingface.co/onnxmodelzoo" target="_blank" rel="noopener">Hugging Face</a>:</label>
             <select id="hf-model-select" disabled title="Loading WebAssembly runtime…">
@@ -355,13 +89,13 @@ agraph (float[N] X) =&gt; (float[N] Y) {
                    placeholder="repo id (e.g. onnxmodelzoo/resnet18d_Opset18) or an .onnx URL"
                    disabled title="Loading WebAssembly runtime…" />
             <button id="hf-load-button" type="button" disabled title="Loading WebAssembly runtime…">Load</button>
-            <span id="hf-status"></span>
+            <span id="hf-status" role="status" aria-live="polite"></span>
             <div id="hf-file-row" style="margin-top: 0.25em; display: none;">
                 <label for="hf-file-select">file</label>
                 <select id="hf-file-select"></select>
-                <span id="hf-file-note" style="color: #666; font-size: 0.85em; margin-left: 0.25em;"></span>
+                <span id="hf-file-note" class="note" style="margin-left: 0.25em;"></span>
             </div>
-            <div style="color: #666; font-size: 0.85em; margin-top: 0.25em;">
+            <div class="note" style="margin-top: 0.25em;">
                 Fetches the model straight from the Hugging Face Hub in your
                 browser (nothing is uploaded), then runs it through the same
                 Simplify / Optimize path as an uploaded file. Bare names default
@@ -372,7 +106,7 @@ agraph (float[N] X) =&gt; (float[N] Y) {
                 one <code>.onnx</code>, the largest is auto-detected; use the
                 <b>file</b> selector to convert a different one.
             </div>
-            <div style="color: #666; font-size: 0.85em; margin-top: 0.25em;">
+            <div class="note" style="margin-top: 0.25em;">
                 <b>Shareable link:</b> the input model and options can be set from
                 the URL — e.g.
                 <code>?model=onnxmodelzoo/resnet18d_Opset18</code> or
@@ -394,7 +128,7 @@ agraph (float[N] X) =&gt; (float[N] Y) {
                 input updates this URL so it stays shareable (uploads excepted).
                 <div style="margin-top: 0.35em;">
                     <button id="share-link-button" type="button">Copy shareable link</button>
-                    <span id="share-link-status" style="color: #0a7d24; font-size: 0.85em; margin-left: 0.4em;"></span>
+                    <span id="share-link-status" class="ok" style="font-size: 0.85em; margin-left: 0.4em;"></span>
                     <div style="margin-top: 0.2em;">
                         Builds a link that reproduces the <b>current</b> input and
                         <i>all</i> the conversion options below (processor, constant
@@ -416,8 +150,8 @@ agraph (float[N] X) =&gt; (float[N] Y) {
                        style="width: 3.5em;"
                        title="How many parallel byte-range shards to read a Xet download in. XetBlob fetches serially, so this is what parallelizes the transfer; ~10 or fewer is usually best.">
                 <button id="hf-clear-cache" type="button">clear chunk cache</button>
-                <span id="hf-cache-size" style="color: #666; font-size: 0.85em; margin-left: 0.4em;"></span>
-                <div style="color: #666; font-size: 0.85em; margin-top: 0.2em;">
+                <span id="hf-cache-size" class="note" style="margin-left: 0.4em;"></span>
+                <div class="note" style="margin-top: 0.2em;">
                     Downloads via <code>@huggingface/hub</code>, reconstructing the
                     file from content-addressed chunks and caching them in
                     IndexedDB so repeated / overlapping loads reuse them. On by
@@ -444,8 +178,8 @@ agraph (float[N] X) =&gt; (float[N] Y) {
             <input type="text" id="backend-url" size="52"
                 placeholder="…or a GitHub tree / raw URL to a test-case directory">
             <button id="backend-run" type="button">Run test case</button>
-            <span id="backend-status"></span>
-            <div style="color: #666; font-size: 0.85em; margin-top: 0.25em;">
+            <span id="backend-status" role="status" aria-live="polite"></span>
+            <div class="note" style="margin-top: 0.25em;">
                 Fetches <code>model.onnx</code> and the test data
                 (<code>test_data_set_N/</code> of <code>input_*.pb</code> /
                 <code>output_*.pb</code>) from GitHub, runs the model through
@@ -468,12 +202,14 @@ agraph (float[N] X) =&gt; (float[N] Y) {
                 <input type="number" id="backend-atol" value="0.0001" step="any" style="width: 6em;">
                 <label for="backend-rtol">rtol</label>
                 <input type="number" id="backend-rtol" value="0.001" step="any" style="width: 6em;">
-                <button id="backend-download-log" type="button">Download log</button>
+                <button id="backend-download-log" type="button">Download log ↓</button>
             </div>
             <textarea id="backend-output" readonly rows="8" style="width: 100%; box-sizing: border-box; margin-top: 0.25em;"></textarea>
         </div>
         <script type="module" src="./backend_test.mjs"></script>
-        <div>
+        <section class="options-panel">
+        <h3>Convert mode &amp; options</h3>
+        <div class="convert-modes">
             <input type="radio" name="optimizer" value="simplify" id="optimizer_simplify" checked>
             <label for="optimizer_simplify">
                 <a href="https://github.com/onnxsim/onnxsim" target="_blank">Simplify</a>
@@ -488,7 +224,8 @@ agraph (float[N] X) =&gt; (float[N] Y) {
             </label>
             <input type="radio" name="optimizer" value="inline" id="optimizer_inline">
             <label for="optimizer_inline" title="Inline the model's local (model-defined) functions into the main graph; schema-defined functions are left alone">Inline functions</label>
-            <span style="margin-left: 0.6em; color: #666;">| single pass (debug):</span>
+            <br>
+            <span class="note">single pass (debug):</span>
             <input type="radio" name="optimizer" value="infer_shapes" id="optimizer_infer_shapes">
             <label for="optimizer_infer_shapes" title="Run ONNX shape inference once (not in the fixed point)">Shape inference</label>
             <input type="radio" name="optimizer" value="data_propagation" id="optimizer_data_propagation">
@@ -518,9 +255,10 @@ agraph (float[N] X) =&gt; (float[N] Y) {
             <input type="checkbox" name="annotate_model_info" id="id_annotate_model_info" checked>
             <label for="id_annotate_model_info">annotate model info — bake MACs/FLOPs into <code>metadata_props</code> (shown in "Run inference" below)</label>
             <br/>
-            <div id="pass-list" style="height: 300px; overflow-y: auto; border: 1px solid #ccc; padding: 4px; margin-top: 4px;"></div>
+            <div id="pass-list" style="height: 300px; overflow-y: auto; border: 1px solid var(--border); border-radius: var(--radius); padding: 4px; margin-top: 4px;"></div>
         </div>
-        <h2>Visualize with Netron (before / after)</h2>
+        </section>
+        <h2 id="sec-visualize">Visualize with Netron (before / after)</h2>
         <p>
             Renders the model graph with a self-hosted
             <a href="https://github.com/onnxsim/netron" target="_blank" rel="noopener">Netron</a>:
@@ -536,7 +274,7 @@ agraph (float[N] X) =&gt; (float[N] Y) {
             being discussed upstream in
             <a href="https://github.com/lutzroeder/netron/pull/1591#issuecomment-5148706256" target="_blank" rel="noopener">lutzroeder/netron#1591</a>.
         </p>
-        <div id="netron-panes" style="display: flex; gap: 1em; flex-wrap: wrap;">
+        <div id="netron-panes" class="wide" style="display: flex; gap: 1em; flex-wrap: wrap;">
             <div class="netron-pane">
                 <div class="netron-head">
                     <strong>Before</strong> —
@@ -561,7 +299,7 @@ agraph (float[N] X) =&gt; (float[N] Y) {
             </div>
         </div>
         <script type="module" src="./netron_view.mjs"></script>
-        <h2>Dynamic dimensions (dim_param)</h2>
+        <h2 id="sec-dims">Dynamic dimensions (dim_param)</h2>
         <p>
             Lists the model's symbolic axis names (ONNX
             <code>dim_param</code>s) on its graph inputs and outputs —
@@ -572,7 +310,7 @@ agraph (float[N] X) =&gt; (float[N] Y) {
             browser (nothing is uploaded); symbolic axes are shown
             <span class="dp-param">highlighted</span>.
         </p>
-        <p style="color: #666; font-size: 0.9em;">
+        <p class="note">
             <b>Try it:</b>
             <a href="?model=https://huggingface.co/Xenova/all-MiniLM-L6-v2/resolve/main/onnx/model_quantized.onnx&amp;optimizer=simplify">load
             <code>Xenova/all-MiniLM-L6-v2</code></a>
@@ -588,11 +326,11 @@ agraph (float[N] X) =&gt; (float[N] Y) {
         <script type="module" src="./hf_load.mjs"></script>
         <script type="module" src="./share_url.mjs"></script>
 
-        <h2>Console outputs:</h2>
-        <textarea id="log-output" readonly rows="20" style="width: 100%; box-sizing: border-box;"></textarea>
+        <h2 id="sec-console">Console outputs:</h2>
+        <textarea id="log-output" class="wide" readonly rows="20" style="box-sizing: border-box;"></textarea>
         <div>
-            <button id="download-log-button" type="button">Download log</button>
-            <button id="report-issue-button" type="button">Report an issue</button>
+            <button id="download-log-button" type="button">Download log ↓</button>
+            <button id="report-issue-button" type="button">Report an issue ↗</button>
             <span>
                 <b>Download log</b> saves the console output above as a
                 <code>.log</code> file. <b>Report an issue</b> opens a pre-filled
@@ -633,7 +371,7 @@ agraph (float[N] X) =&gt; (float[N] Y) {
                 });
             }
         </script>
-        <h2>onnxsim profiling</h2>
+        <h2 id="sec-profiling">onnxsim profiling</h2>
         <p>
             Profiling is on by default (“profile simplification” above): convert
             a model with <b>Simplify</b> and the fixed-point transforms (shape
@@ -642,8 +380,8 @@ agraph (float[N] X) =&gt; (float[N] Y) {
             flame graph. Download the JSON, or click <b>Embed in Perfetto</b> to
             open the full Perfetto timeline inline on this page.
         </p>
-        <div id="simplify-trace"></div>
-        <h2>Run inference (onnxruntime-web)</h2>
+        <div id="simplify-trace" class="wide"></div>
+        <h2 id="sec-inference">Run inference (onnxruntime-web)</h2>
         <p>
             Runs a model for a few iterations to check it executes, using dummy
             inputs generated from the model's input shapes. The <b>model</b>
@@ -656,10 +394,13 @@ agraph (float[N] X) =&gt; (float[N] Y) {
             just the <b>converted</b> result or the <b>original</b> upload on
             their own. The <b>batch</b> control sizes the model's dynamic batch
             (first) axis; it has no effect on inputs whose first dimension is
-            fixed. WebGPU falls back to WebAssembly when unavailable. Tick
-            <b>auto-run after each conversion</b> to run this panel automatically
-            whenever a conversion finishes (with the options selected here),
-            instead of clicking <b>Run inference</b> each time.
+            fixed. The <b>warmup</b> control runs that many untimed passes before
+            the timed iterations, so one-time costs (kernel/program compilation,
+            buffer allocation) don't add noise to the reported latency; set it to
+            0 to time every run. WebGPU falls back to WebAssembly when
+            unavailable. Tick <b>auto-run after each conversion</b> to run this
+            panel automatically whenever a conversion finishes (with the options
+            selected here), instead of clicking <b>Run inference</b> each time.
         </p>
         <p>
             The execution-provider picker also offers
@@ -700,6 +441,9 @@ agraph (float[N] X) =&gt; (float[N] Y) {
             </select>
             <label for="inference-iters">iterations</label>
             <input type="number" id="inference-iters" value="5" min="1" style="width: 4em;">
+            <label for="inference-warmup">warmup</label>
+            <input type="number" id="inference-warmup" value="1" min="0" style="width: 4em;"
+                   title="Untimed warm-up runs done before the timed iterations, so one-time costs (kernel/program compilation, buffer allocation) don't skew the measured latency. 0 times every iteration.">
             <label for="inference-batch">batch</label>
             <input type="number" id="inference-batch" value="1" min="1" style="width: 4em;"
                    title="Size for the model's dynamic batch (first) axis; ignored on fixed-shape inputs.">
@@ -708,9 +452,9 @@ agraph (float[N] X) =&gt; (float[N] Y) {
             <input type="checkbox" id="inference-autorun">
             <label for="inference-autorun" title="Run this inference panel automatically each time a conversion finishes, using the model / execution provider / iterations / batch selected here. Off by default; a run downloads onnxruntime-web and executes the model.">auto-run after each conversion</label>
             <button id="run-inference">Run inference</button>
-            <button id="download-inference-log-button" type="button">Download log</button>
+            <button id="download-inference-log-button" type="button">Download log ↓</button>
         </div>
-        <div id="webnn-status" style="color: #666; font-size: 0.85em; margin-top: 0.3em;" title="">WebNN status: probing…</div>
+        <div id="webnn-status" class="note" style="margin-top: 0.3em;" title="">WebNN status: probing…</div>
         <textarea id="inference-output" readonly rows="12" style="width: 100%; box-sizing: border-box;"></textarea>
         <div id="inference-macs"></div>
         <p>
@@ -720,7 +464,7 @@ agraph (float[N] X) =&gt; (float[N] Y) {
             renders below in the same viewer, with an <b>Embed in Perfetto</b>
             button to open the full timeline inline.
         </p>
-        <div id="inference-trace"></div>
+        <div id="inference-trace" class="wide"></div>
         <script type="module" src="./inference_browser.mjs"></script>
 
     </body>
