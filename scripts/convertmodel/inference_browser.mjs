@@ -465,6 +465,7 @@ export function initInferencePanel() {
   const epSelect = document.getElementById("inference-ep");
   const sourceSelect = document.getElementById("inference-source");
   const profileChk = document.getElementById("inference-profile");
+  const autoRunChk = document.getElementById("inference-autorun");
   const traceContainer = document.getElementById("inference-trace");
   const macsContainer = document.getElementById("inference-macs");
   const dlLogBtn = document.getElementById("download-inference-log-button");
@@ -504,7 +505,12 @@ export function initInferencePanel() {
     });
   }
 
-  btn.addEventListener("click", async () => {
+  // Run the inference panel once, honoring the currently-selected controls.
+  // Shared by the "Run inference" button and the "auto-run after each
+  // conversion" option below; the button's disabled state doubles as a simple
+  // re-entrancy guard so overlapping runs can't interleave.
+  const runOnce = async () => {
+    if (btn.disabled) return;
     btn.disabled = true;
     out.value = "";
     if (traceContainer) traceContainer.innerHTML = "";
@@ -598,7 +604,25 @@ export function initInferencePanel() {
     } finally {
       btn.disabled = false;
     }
-  });
+  };
+
+  btn.addEventListener("click", runOnce);
+
+  // "auto-run after each conversion": when enabled, run this panel
+  // automatically every time a conversion finishes, using the options selected
+  // here. index.html dispatches `onnxsim:converted` on window once the worker
+  // returns — and, right after (synchronously), `onnxsim:original-annotated`.
+  // Defer to a macrotask so the whole convert-done handler finishes first,
+  // ensuring both the converted and MAC-annotated-original bytes are published
+  // before a "compare (before vs after)" run reads them.
+  if (autoRunChk) {
+    window.addEventListener("onnxsim:converted", () => {
+      if (!autoRunChk.checked || btn.disabled) return;
+      setTimeout(() => {
+        if (autoRunChk.checked && !btn.disabled) runOnce();
+      }, 0);
+    });
+  }
 }
 
 initInferencePanel();

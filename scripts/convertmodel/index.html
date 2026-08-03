@@ -122,6 +122,8 @@ agraph (float[N] X) =&gt; (float[N] Y) {
                 <code>inline_functions</code>/<code>inline</code>,
                 <code>tensor_size_threshold</code>/<code>tst</code>,
                 <code>target_opset</code>/<code>opset</code>,
+                <code>autorun</code>/<code>autoinfer</code> (auto-run inference
+                after each conversion),
                 <code>backend</code> (prefills the backend-test URL). Setting an
                 input updates this URL so it stays shareable (uploads excepted).
                 <div style="margin-top: 0.35em;">
@@ -396,7 +398,9 @@ agraph (float[N] X) =&gt; (float[N] Y) {
             the timed iterations, so one-time costs (kernel/program compilation,
             buffer allocation) don't add noise to the reported latency; set it to
             0 to time every run. WebGPU falls back to WebAssembly when
-            unavailable.
+            unavailable. Tick <b>auto-run after each conversion</b> to run this
+            panel automatically whenever a conversion finishes (with the options
+            selected here), instead of clicking <b>Run inference</b> each time.
         </p>
         <p>
             The execution-provider picker also offers
@@ -445,6 +449,8 @@ agraph (float[N] X) =&gt; (float[N] Y) {
                    title="Size for the model's dynamic batch (first) axis; ignored on fixed-shape inputs.">
             <input type="checkbox" id="inference-profile" checked>
             <label for="inference-profile">profile (Chrome trace)</label>
+            <input type="checkbox" id="inference-autorun">
+            <label for="inference-autorun" title="Run this inference panel automatically each time a conversion finishes, using the model / execution provider / iterations / batch selected here. Off by default; a run downloads onnxruntime-web and executes the model.">auto-run after each conversion</label>
             <button id="run-inference">Run inference</button>
             <button id="download-inference-log-button" type="button">Download log ↓</button>
         </div>
