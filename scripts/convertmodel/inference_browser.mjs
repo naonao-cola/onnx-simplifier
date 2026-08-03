@@ -16,6 +16,7 @@ import { summarizeOrtTrace } from "./trace_build.mjs";
 import { renderTrace } from "./trace_viewer.mjs";
 import { downloadText } from "./download.mjs";
 import { providersForEp, isWebnnEp, detectWebnn, formatWebnnStatus } from "./webnn.mjs";
+import { captureOrtDiagnostics } from "./ort_log_capture.mjs";
 import { ORT_VERSION, ORT_BASE } from "./cdn.mjs";
 import {
   readAnnotations,
@@ -517,6 +518,12 @@ export function initInferencePanel() {
     out.value = "";
     if (traceContainer) traceContainer.innerHTML = "";
     if (macsContainer) macsContainer.innerHTML = "";
+    // Mirror onnxruntime-web's own console diagnostics and unhandled WebNN/ORT
+    // promise rejections into this panel's log for the duration of the run —
+    // e.g. "WebNN backend does not support data type: int64", which ORT throws
+    // on an internal promise that bypasses the try/catch below and otherwise
+    // only shows in devtools. restoreOrtLogs() is called in finally.
+    const restoreOrtLogs = captureOrtDiagnostics({ log });
     try {
       const source = sourceSelect ? sourceSelect.value : "original";
       const iterations = Math.max(1, parseInt(itersInput.value, 10) || 5);
@@ -604,6 +611,11 @@ export function initInferencePanel() {
     } catch (e) {
       log("FAIL: " + (e && e.message ? e.message : String(e)));
     } finally {
+      // Give any WebNN/ORT rejection queued during the run a microtask to fire
+      // (unhandledrejection is dispatched asynchronously) so it's still mirrored
+      // before the console/handler hooks are removed.
+      await Promise.resolve();
+      restoreOrtLogs();
       btn.disabled = false;
     }
   });

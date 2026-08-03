@@ -57,6 +57,21 @@ in `test/webnn.test.mjs`):
   particular operator — is unsupported. `inference_core.mjs` reports which
   provider actually won (e.g. `webnn:gpu` or the `wasm` fallback).
 
+- **`captureOrtDiagnostics(...)`** (in `ort_log_capture.mjs`, unit-tested in
+  `test/ort_log_capture.test.mjs`) mirrors onnxruntime-web's *own* diagnostics
+  into the panel's on-page log while a run is active. Some ORT messages never
+  reach the panel's `try/catch`, so before this they were visible only in the
+  browser devtools console: EP-assignment notes
+  (`VerifyEachNodeIsAssignedToAnEp …`) are printed straight to
+  `console.warn`/`console.error` from the wasm module, and WebNN backend
+  failures (e.g. `WebNN backend does not support data type: int64`) are thrown
+  on an internal ORT promise that isn't chained to the awaited `session.run()`,
+  so they surface as an *uncaught* promise rejection. The helper wraps
+  `console.warn`/`console.error` and listens for `unhandledrejection` for the
+  duration of the run, forwarding the `onnxruntime`/`webnn` ones to the log
+  (devtools output is preserved). This is why WebNN falls back to `wasm` silently
+  yet the reason now shows up in the panel too.
+
 - The WebNN provider lives only in the "all" onnxruntime-web bundle, so the
   panel loads `ort.all.min.mjs` on demand the first time a WebNN EP is selected,
   and keeps the smaller default bundle for the common WebGPU/WASM path. Both

@@ -14,6 +14,7 @@
     "macs.mjs",
     "shapes.mjs",
     "netron.mjs",
+    "ort_log_capture.mjs",
     "query_params.mjs",
     "trace_build.mjs",
     "versions.mjs",
