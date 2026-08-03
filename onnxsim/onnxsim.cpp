@@ -30,6 +30,7 @@
 #endif
 #endif
 #include "contrib_schemas.h"
+#include "custom_optimizer_passes.h"
 #include "dlpack_bridge.h"
 #include "onnx/common/file_utils.h"
 #include "onnx/defs/printer.h"
@@ -1642,6 +1643,9 @@ onnx::ModelProto _FoldConstant(const ModelExecutor& executor,
 }
 
 onnx::ModelProto Optimize(const onnx::ModelProto& model) {
+  // Make onnxsim's own optimizer passes available to onnxoptimizer's registry
+  // (idempotent) so config.optimizer_passes may name them.
+  onnxsim::RegisterCustomOptimizerPasses();
   // Mirror the initializer treatment into the onnx optimizer so its
   // value-baking passes (fuse_bn_into_conv, ...) respect it too. The setting is
   // thread-local in the optimizer; restore it afterwards so we do not leak it.
@@ -1975,6 +1979,12 @@ onnx::ModelProto Simplify(
     bool constant_folding, bool shape_inference, size_t tensor_size_threshold,
     std::optional<int> target_opset_version, const GraphRewriter* rewriter,
     bool initializers_as_constants, bool include_inline_functions) {
+  // Register onnxsim's own optimizer passes into onnxoptimizer's registry
+  // before the pass list is built below: fuse_consecutive_mul, fuse_mul_into_conv
+  // and eliminate_reshape_around_elementwise are auto-selected via
+  // GetFuseAndEliminationPass, and fuse_matmul_add_bias_into_gemm_batched is
+  // named explicitly. The call is idempotent.
+  onnxsim::RegisterCustomOptimizerPasses();
   // Make shape inference aware of ONNX Runtime's quantized contrib operators
   // (QLinearAdd and friends) so shape deduction does not stop at them.
   onnxsim::RegisterContribOpSchemas();
