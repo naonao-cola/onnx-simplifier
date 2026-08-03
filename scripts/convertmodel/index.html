@@ -442,7 +442,9 @@ agraph (float[N] X) =&gt; (float[N] Y) {
             <textarea id="backend-output" readonly rows="8" style="width: 100%; box-sizing: border-box; margin-top: 0.25em;"></textarea>
         </div>
         <script type="module" src="./backend_test.mjs"></script>
-        <div>
+        <section class="options-panel">
+        <h3>Convert mode &amp; options</h3>
+        <div class="convert-modes">
             <input type="radio" name="optimizer" value="simplify" id="optimizer_simplify" checked>
             <label for="optimizer_simplify">
                 <a href="https://github.com/onnxsim/onnxsim" target="_blank">Simplify</a>
@@ -489,6 +491,7 @@ agraph (float[N] X) =&gt; (float[N] Y) {
             <br/>
             <div id="pass-list" style="height: 300px; overflow-y: auto; border: 1px solid var(--border); border-radius: var(--radius); padding: 4px; margin-top: 4px;"></div>
         </div>
+        </section>
         <h2>Visualize with Netron (before / after)</h2>
         <p>
             Renders the model graph with a self-hosted

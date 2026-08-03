@@ -298,6 +298,37 @@ button:focus-visible {
   margin: 0.4em 0;
 }
 
+/* --- convert mode & options card ----------------------------------------- */
+.options-panel {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 0.6em 0.9em 0.8em;
+  margin: 0.9em 0;
+  background: var(--panel-bg);
+}
+.options-panel h3 {
+  margin: 0 0 0.5em;
+}
+/* The convert-mode radios sit on one wrapping row with a divider below,
+   separating "what to run" from the "how" options underneath. Extra space
+   after each label (and roomier line-height) keeps the choices from cramming
+   when they wrap. */
+.convert-modes {
+  padding-bottom: 0.6em;
+  margin-bottom: 0.6em;
+  border-bottom: 1px solid var(--border);
+  line-height: 2;
+}
+.convert-modes label {
+  margin-right: 0.7em;
+}
+.options-panel #passes {
+  line-height: 1.9;
+}
+.options-panel #passes input[type="number"] {
+  margin: 0.1em 0;
+}
+
 /* --- Netron before/after panes ------------------------------------------- */
 .netron-pane {
   flex: 1 1 380px;
