@@ -10,6 +10,8 @@
 // This module is pure data/networking: it returns model bytes, and index.html
 // feeds them into the same conversion path an uploaded file takes.
 
+import { HF_HUB_ESM } from "./cdn.mjs";
+
 const HF = "https://huggingface.co";
 // Default org for bare names, matching scripts/regression/model_zoo.py.
 const ORG = "onnxmodelzoo";
@@ -269,10 +271,10 @@ export async function fetchModelBytes(ref, onLog = () => {}, onProgress = () => 
   return { bytes, name, repo: parsed.repo };
 }
 
-// Pinned @huggingface/hub build for the experimental Xet download path. Loaded
-// lazily (only when the Xet toggle is used) from a CDN, mirroring how the
-// inference panel lazy-loads onnxruntime-web.
-const HF_HUB_ESM = "https://esm.sh/@huggingface/hub@2.14.4";
+// The pinned @huggingface/hub build for the experimental Xet download path
+// (HF_HUB_ESM) is declared in cdn.mjs. It is loaded lazily (only when the Xet
+// toggle is used) from a CDN, mirroring how the inference panel lazy-loads
+// onnxruntime-web.
 
 // Read a Blob (e.g. the XetBlob returned by downloadFile) to a Uint8Array,
 // reporting streaming progress against its known size.

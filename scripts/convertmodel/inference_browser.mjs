@@ -16,6 +16,7 @@ import { summarizeOrtTrace } from "./trace_build.mjs";
 import { renderTrace } from "./trace_viewer.mjs";
 import { downloadText } from "./download.mjs";
 import { providersForEp, isWebnnEp, detectWebnn, formatWebnnStatus } from "./webnn.mjs";
+import { ORT_VERSION, ORT_BASE } from "./cdn.mjs";
 import {
   readAnnotations,
   perOpSummary,
@@ -26,9 +27,6 @@ import {
   evalMetric,
   isSymbolicStr,
 } from "./macs.mjs";
-
-const ORT_VERSION = "1.27.0";
-const ORT_BASE = `https://cdn.jsdelivr.net/npm/onnxruntime-web@${ORT_VERSION}/dist/`;
 
 // onnxruntime-web ships several EP bundles. The default (`ort.min.mjs`) carries
 // WASM + WebGPU; WebNN lives only in the "all" bundle (`ort.all.min.mjs`). Both

@@ -1,9 +1,15 @@
 importScripts("./onnxsim.js");
 
-// onnxruntime-web CDN location, kept in sync with inference_browser.mjs. Only
-// used by the ORT-web build of the module (see below).
-const ORT_VERSION = "1.27.0";
-const ORT_BASE = `https://cdn.jsdelivr.net/npm/onnxruntime-web@${ORT_VERSION}/dist/`;
+// onnxruntime-web CDN location. Only used by the ORT-web build of the module
+// (see setupOrtWebIfNeeded below); the default built-in-ORT build never reads
+// it. This classic worker can't import the ES-module single source of truth
+// (cdn.mjs), so index.html — which does import it — passes the base in via the
+// worker URL's `?ortBase=` query param (new Worker("worker.js?ortBase=…")). The
+// literal below is only a defensive fallback for a worker started without it;
+// the live value always comes from cdn.mjs through the page.
+const ORT_BASE =
+    new URLSearchParams(self.location.search).get("ortBase") ||
+    "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.27.0/dist/";
 
 // Turn a low-level WASM out-of-memory abort into an actionable explanation.
 // When a model needs more heap than the module can address, Emscripten aborts

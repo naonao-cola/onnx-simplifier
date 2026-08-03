@@ -120,7 +120,7 @@
             let last_run_info = null;
 
             window.onload = () => {
-                const worker = new Worker("worker.js");
+                const worker = new Worker(window.__onnxsimWorkerUrl || "worker.js");
                 const log_output = document.getElementById("log-output");
                 const input = document.getElementById("file-input");
                 const dl_btn = document.getElementById("download-button");
@@ -289,6 +289,16 @@
                     startConversion(file.name, buf);
                 });
             };
+        </script>
+        <!-- Build the conversion worker's URL from the single CDN source of
+             truth (cdn.mjs). worker.js is a classic worker and can't import the
+             ES module, so the onnxruntime-web base — which only the module's
+             ORT-web build needs — rides in on the worker URL's query string.
+             The window.onload handler above reads __onnxsimWorkerUrl; module
+             scripts run before the load event, so it is set in time. -->
+        <script type="module">
+            import { ORT_BASE } from "./cdn.mjs";
+            window.__onnxsimWorkerUrl = "worker.js?ortBase=" + encodeURIComponent(ORT_BASE);
         </script>
     </head>
     <body>

@@ -17,9 +17,7 @@
 
 import { downloadText } from "./download.mjs";
 import { syncInputUrl } from "./query_params.mjs";
-
-const ORT_VERSION = "1.27.0";
-const ORT_BASE = `https://cdn.jsdelivr.net/npm/onnxruntime-web@${ORT_VERSION}/dist/`;
+import { ORT_VERSION, ORT_BASE } from "./cdn.mjs";
 
 // A curated set of common ONNX backend *node* test cases for the picker, like
 // the Hugging Face model dropdown. Each entry's value is the GitHub tree URL of
