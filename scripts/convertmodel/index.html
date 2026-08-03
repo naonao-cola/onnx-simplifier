@@ -222,7 +222,8 @@ agraph (float[N] X) =&gt; (float[N] Y) {
             </label>
             <input type="radio" name="optimizer" value="inline" id="optimizer_inline">
             <label for="optimizer_inline" title="Inline the model's local (model-defined) functions into the main graph; schema-defined functions are left alone">Inline functions</label>
-            <span class="note" style="margin-left: 0.6em;">| single pass (debug):</span>
+            <br>
+            <span class="note">single pass (debug):</span>
             <input type="radio" name="optimizer" value="infer_shapes" id="optimizer_infer_shapes">
             <label for="optimizer_infer_shapes" title="Run ONNX shape inference once (not in the fixed point)">Shape inference</label>
             <input type="radio" name="optimizer" value="data_propagation" id="optimizer_data_propagation">
