@@ -39,7 +39,7 @@ jobs:
     - uses: actions/setup-node@v4
       with:
         node-version: '22'
-    - uses: mozilla-actions/sccache-action@v0.0.10
+    - uses: mozilla-actions/sccache-action@v0.0.11
 
     - name: Install build + coverage tooling
       run: |
@@ -126,7 +126,7 @@ jobs:
           submodules: recursive
           fetch-depth: 0
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
-      - uses: mozilla-actions/sccache-action@v0.0.10
+      - uses: mozilla-actions/sccache-action@v0.0.11
       - uses: dtolnay/rust-toolchain@nightly
         with:
           components: llvm-tools-preview
