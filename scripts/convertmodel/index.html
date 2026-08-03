@@ -447,6 +447,14 @@ agraph (float[N] X) =&gt; (float[N] Y) {
             <label for="inference-batch">batch</label>
             <input type="number" id="inference-batch" value="1" min="1" style="width: 4em;"
                    title="Size for the model's dynamic batch (first) axis; ignored on fixed-shape inputs.">
+            <label for="inference-fill">input fill</label>
+            <select id="inference-fill"
+                    title="How the auto-generated float inputs are valued (integer/bool inputs stay zero). 'random' varies the input so the before/after compare actually exercises the graph; 'zeros' can mask a divergence. Mirrors the CLI's --input-fill.">
+                <option value="random">random (deterministic)</option>
+                <option value="ones">ones</option>
+                <option value="zeros">zeros</option>
+                <option value="arange">arange (0, 1, 2, …)</option>
+            </select>
             <input type="checkbox" id="inference-profile" checked>
             <label for="inference-profile">profile (Chrome trace)</label>
             <input type="checkbox" id="inference-autorun">

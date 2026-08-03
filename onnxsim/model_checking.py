@@ -11,6 +11,35 @@ Tensors = Dict[str, np.ndarray]
 TensorShape = List[int]
 TensorShapes = Dict[Optional[str], TensorShape]
 
+# How the values of the random test inputs are generated when the user does not
+# supply their own ``input_data``. See ``compare``'s ``input_fill`` parameter.
+INPUT_FILL_CHOICES = ("random", "ones", "zeros", "arange")
+
+
+def _fill_array(shape: TensorShape, np_type: type, input_fill: str) -> np.ndarray:
+    """Create an array of ``shape`` / ``np_type`` filled according to ``input_fill``.
+
+    ``random`` draws from a uniform ``[0, 1)`` distribution (the historical
+    default), ``ones``/``zeros`` fill with the constant, and ``arange`` fills with
+    ``0, 1, 2, ...`` in row-major order, which is handy for reproducible,
+    easy-to-eyeball checks.
+    """
+    if input_fill == "random":
+        values = np.random.rand(*shape)
+    elif input_fill == "ones":
+        values = np.ones(shape)
+    elif input_fill == "zeros":
+        values = np.zeros(shape)
+    elif input_fill == "arange":
+        values = np.arange(int(np.prod(shape, dtype=np.int64))).reshape(shape)
+    else:
+        raise ValueError(
+            'Unknown input_fill "{}", expected one of {}.'.format(
+                input_fill, ", ".join(INPUT_FILL_CHOICES)
+            )
+        )
+    return np.array(values, dtype=np_type)
+
 
 def _iter_graph_nodes(graph: onnx.GraphProto) -> Iterable[onnx.NodeProto]:
     """Yield every node in ``graph``, recursing into subgraph attributes."""
@@ -56,6 +85,7 @@ def compare(
     verbose=True,
     rtol: float = 1e-4,
     atol: float = 1e-5,
+    input_fill: str = "random",
 ) -> bool:
     """
     :param model_opt: The simplified ONNX model
@@ -69,7 +99,17 @@ def compare(
         (correct) op reordering accumulates floating-point error beyond the
         default -- see the RF-DETR XLarge case in ``scripts/rfdetr``.
     :param atol: Absolute tolerance for ``numpy.allclose`` (see ``rtol``).
+    :param input_fill: How to fill the generated test inputs when ``input_data``
+        is not given. One of ``"random"`` (uniform ``[0, 1)``, the default),
+        ``"ones"``, ``"zeros"`` or ``"arange"`` (``0, 1, 2, ...`` in row-major
+        order).
     """
+    if input_fill not in INPUT_FILL_CHOICES:
+        raise ValueError(
+            'Unknown input_fill "{}", expected one of {}.'.format(
+                input_fill, ", ".join(INPUT_FILL_CHOICES)
+            )
+        )
 
     def get_shape_from_value_info_proto(v: onnx.ValueInfoProto) -> List[int]:
         return [dim.dim_value for dim in v.type.tensor_type.shape.dim]
@@ -164,9 +204,10 @@ def compare(
                 shape[0] = 1
 
         inputs = {
-            ipt: np.array(
-                np.random.rand(*full_input_shapes[ipt]),
-                dtype=get_np_type_from_elem_type(get_elem_type(model, ipt)),
+            ipt: _fill_array(
+                full_input_shapes[ipt],
+                get_np_type_from_elem_type(get_elem_type(model, ipt)),
+                input_fill,
             )
             for ipt in input_names
         }
