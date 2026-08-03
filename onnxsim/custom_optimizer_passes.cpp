@@ -9,10 +9,15 @@
 #include <string>
 
 #include "onnxoptimizer/optimize.h"
+#include "passes/eliminate_nop_dropout.h"
 #include "passes/eliminate_reshape_around_elementwise.h"
+#include "passes/fuse_add_bias_into_conv.h"
+#include "passes/fuse_bn_into_conv.h"
 #include "passes/fuse_consecutive_mul.h"
+#include "passes/fuse_consecutive_unsqueezes.h"
 #include "passes/fuse_matmul_add_bias_into_gemm_batched.h"
 #include "passes/fuse_mul_into_conv.h"
+#include "passes/fuse_pad_into_pool.h"
 
 namespace onnxsim {
 
@@ -40,15 +45,28 @@ void RegisterOrReplace(ONNX_NAMESPACE::optimization::GlobalPassRegistry& reg) {
 void RegisterCustomOptimizerPasses() {
   static std::once_flag flag;
   std::call_once(flag, [] {
-    namespace opt = ONNX_NAMESPACE::optimization;
+    namespace p = ONNX_NAMESPACE::optimization::onnxsim_passes;
     // Inject onnxsim's passes into onnxoptimizer's existing global registry,
     // overwriting any built-in of the same name. call_once keeps this a
     // one-time write, matching the registry's static, read-only-after-init use.
-    auto& registry = opt::Optimizer::passes;
-    RegisterOrReplace<opt::EliminateReshapeAroundElementwise>(registry);
-    RegisterOrReplace<opt::FuseConsecutiveMul>(registry);
-    RegisterOrReplace<opt::FuseMatMulAddBiasIntoGemmBatched>(registry);
-    RegisterOrReplace<opt::FuseMulIntoConv>(registry);
+    auto& registry = ONNX_NAMESPACE::optimization::Optimizer::passes;
+
+    // onnxsim-only rewrites (no built-in of the same name today).
+    RegisterOrReplace<p::EliminateReshapeAroundElementwise>(registry);
+    RegisterOrReplace<p::FuseConsecutiveMul>(registry);
+    RegisterOrReplace<p::FuseMatMulAddBiasIntoGemmBatched>(registry);
+    RegisterOrReplace<p::FuseMulIntoConv>(registry);
+
+    // onnxsim's patched versions of built-in onnxoptimizer passes. These
+    // overwrite the registry entries the submodule registers under the same
+    // names, so onnxsim's fixes/extensions (ConvTranspose fusions, no-op
+    // opset-12 Dropout, zero-padding MaxPool, ...) apply while the fork itself
+    // tracks upstream onnxoptimizer.
+    RegisterOrReplace<p::EliminateNopDropout>(registry);
+    RegisterOrReplace<p::FuseAddBiasIntoConv>(registry);
+    RegisterOrReplace<p::FuseBNIntoConv>(registry);
+    RegisterOrReplace<p::FuseConsecutiveUnsqueezes>(registry);
+    RegisterOrReplace<p::FusePadIntoPool>(registry);
   });
 }
 

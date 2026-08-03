@@ -36,6 +36,10 @@
 
 namespace ONNX_NAMESPACE {
 namespace optimization {
+// onnxsim's own passes live in this nested namespace so their class
+// names never collide (ODR) with the same-named passes compiled into
+// onnxoptimizer; RegisterOrReplace still keys them by getPassName().
+namespace onnxsim_passes {
 
 struct FuseMulIntoConv final : public PredicateBasedPass {
   explicit FuseMulIntoConv()
@@ -218,5 +222,6 @@ struct FuseMulIntoConv final : public PredicateBasedPass {
   }
 };
 
+}  // namespace onnxsim_passes
 }  // namespace optimization
 }  // namespace ONNX_NAMESPACE
