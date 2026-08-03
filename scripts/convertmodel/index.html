@@ -392,7 +392,11 @@ agraph (float[N] X) =&gt; (float[N] Y) {
             just the <b>converted</b> result or the <b>original</b> upload on
             their own. The <b>batch</b> control sizes the model's dynamic batch
             (first) axis; it has no effect on inputs whose first dimension is
-            fixed. WebGPU falls back to WebAssembly when unavailable.
+            fixed. The <b>warmup</b> control runs that many untimed passes before
+            the timed iterations, so one-time costs (kernel/program compilation,
+            buffer allocation) don't add noise to the reported latency; set it to
+            0 to time every run. WebGPU falls back to WebAssembly when
+            unavailable.
         </p>
         <p>
             The execution-provider picker also offers
@@ -433,6 +437,9 @@ agraph (float[N] X) =&gt; (float[N] Y) {
             </select>
             <label for="inference-iters">iterations</label>
             <input type="number" id="inference-iters" value="5" min="1" style="width: 4em;">
+            <label for="inference-warmup">warmup</label>
+            <input type="number" id="inference-warmup" value="1" min="0" style="width: 4em;"
+                   title="Untimed warm-up runs done before the timed iterations, so one-time costs (kernel/program compilation, buffer allocation) don't skew the measured latency. 0 times every iteration.">
             <label for="inference-batch">batch</label>
             <input type="number" id="inference-batch" value="1" min="1" style="width: 4em;"
                    title="Size for the model's dynamic batch (first) axis; ignored on fixed-shape inputs.">
