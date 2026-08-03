@@ -2030,9 +2030,12 @@ onnx::ModelProto Simplify(
     // than a pure node reduction. Transformer linear layers apply a 2-D weight
     // to rank-3 activations, which the 2-D-only
     // ``fuse_matmul_add_bias_into_gemm`` cannot fuse; converting them to
-    // ``Gemm`` lets runtimes dispatch their tuned GEMM kernels (the reshape
-    // scaffolding it introduces is folded/deduplicated by the rest of the fixed
-    // point). Still honour an explicit ``--skip-optimization`` for it.
+    // ``Gemm`` lets runtimes dispatch their tuned GEMM kernels. The reshape
+    // scaffolding it introduces around chains of element-wise ops is then
+    // cancelled by ``eliminate_reshape_around_elementwise`` (a Nop pass in the
+    // default set), which keeps the Gemms but drops the now-inverse reshape
+    // pairs so the node count does not regress. Still honour an explicit
+    // ``--skip-optimization`` for it.
     const std::string batched_gemm = "fuse_matmul_add_bias_into_gemm_batched";
     if (!is_disabled(*skip_optimizers, batched_gemm) &&
         !is_disabled(always_disabled_passes, batched_gemm)) {

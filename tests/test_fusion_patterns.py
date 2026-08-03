@@ -361,6 +361,50 @@ def test_fuse_convtranspose_add():
 
 
 # --------------------------------------------------------------------------- #
+# Reshape cancellation around a batched-Gemm element-wise chain. onnxsim's
+# batched MatMul+bias -> Gemm rewrite brackets each rank-3 linear layer in a
+# Reshape(-> 2-D) / Gemm / Reshape(-> N-D) sandwich so runtimes can dispatch a
+# tuned GEMM kernel. When two such linears surround an element-wise chain, the
+# inverse reshapes between them cancel (eliminate_reshape_around_elementwise):
+# the chain runs on the 2-D Gemm output and both Gemms are kept. This is the
+# node-count half of the batched-Gemm rewrite (issue: model-regression node
+# reduction).
+# --------------------------------------------------------------------------- #
+def test_eliminate_reshape_around_elementwise():
+    # The post-batched-fusion shape, built explicitly: Gemm -> Reshape(N-D) ->
+    # Relu -> Reshape(2-D) -> Gemm. The two middle reshapes are exact inverses
+    # (they only split / merge the leading dims), so they collapse and the Relu
+    # ends up directly between the two Gemms.
+    inits = [
+        _i64([-1, 8], "s1"),
+        _f32(np.random.randn(8, 16), "W1"),
+        _f32(np.random.randn(16), "b1"),
+        _i64([2, 4, 16], "s2"),
+        _i64([-1, 16], "s3"),
+        _f32(np.random.randn(16, 8), "W2"),
+        _f32(np.random.randn(8), "b2"),
+        _i64([2, 4, 8], "s4"),
+    ]
+    nodes = [
+        onnx.helper.make_node("Reshape", ["X", "s1"], ["rx1"]),
+        onnx.helper.make_node("Gemm", ["rx1", "W1", "b1"], ["g1"]),
+        onnx.helper.make_node("Reshape", ["g1", "s2"], ["u1"]),
+        onnx.helper.make_node("Relu", ["u1"], ["r"]),
+        onnx.helper.make_node("Reshape", ["r", "s3"], ["f2"]),
+        onnx.helper.make_node("Gemm", ["f2", "W2", "b2"], ["g2"]),
+        onnx.helper.make_node("Reshape", ["g2", "s4"], ["Y"]),
+    ]
+    model = _model(nodes, [_vi("X", [2, 4, 8])], [_vi("Y", [2, 4, 8])], inits)
+    _, ops = _simplify(model)
+    # Both Gemms are kept (tuned-kernel dispatch preserved)...
+    assert ops["Gemm"] == 2
+    assert ops["Relu"] == 1
+    # ...and the two inverse reshapes bracketing the Relu are gone: only the
+    # entry (X -> 2-D) and the final (2-D -> N-D output) reshapes remain.
+    assert ops["Reshape"] == 2
+
+
+# --------------------------------------------------------------------------- #
 # Remaining gap: passes OnnxSlim performs but onnxsim does not. Marked xfail
 # (strict=False) so CI stays green; each XPASSes and can be promoted if onnxsim
 # gains the pass.
