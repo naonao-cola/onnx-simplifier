@@ -383,6 +383,7 @@ def simplify(
     function_rewrite_rules: Optional[Sequence[FunctionRewriteRule]] = None,
     check_rtol: float = 1e-4,
     check_atol: float = 1e-5,
+    input_fill: str = "random",
     providers: Optional[Sequence[backend.Provider]] = None,
     profile: Optional[str] = None,
     ort_profile: Optional[str] = None,
@@ -451,6 +452,11 @@ def simplify(
             enough to accumulate a larger-but-benign difference (e.g. RF-DETR's XLarge segmentation
             variants -- see ``scripts/rfdetr/FAILURE_ANALYSIS.md``). Ignored when ``check_n == 0``.
     :param check_atol: Absolute tolerance counterpart of ``check_rtol``.
+    :param input_fill: How to fill the random inputs generated for the ``check_n``
+            verification when ``input_data`` is not supplied. One of ``"random"``
+            (uniform ``[0, 1)``, the default), ``"ones"``, ``"zeros"`` or ``"arange"``
+            (``0, 1, 2, ...`` in row-major order). Ignored when ``check_n == 0`` or
+            when ``input_data`` is given.
     :param providers: onnxruntime execution providers used to run the model
             during constant folding, in priority order, for example
             ``["CUDAExecutionProvider", "CPUExecutionProvider"]`` to fold on an
@@ -735,6 +741,7 @@ def simplify(
             custom_lib,
             rtol=check_rtol,
             atol=check_atol,
+            input_fill=input_fill,
         )
     except (EncodeError, ValueError, onnx.onnx_cpp2py_export.checker.ValidationError):
         if model is None:
@@ -784,6 +791,7 @@ def simplify(
                 custom_lib,
                 rtol=check_rtol,
                 atol=check_atol,
+                input_fill=input_fill,
             )
             model_opt = onnx.load(os.path.join(tmpdirname, "opt.onnx"))
     finally:
@@ -1003,6 +1011,15 @@ def main():
         help='input data, The value should be "input_name1:xxx1.bin"  "input_name2:xxx2.bin ...", input data should be a binary data file.',
         type=str,
         nargs="+",
+    )
+    parser.add_argument(
+        "--input-fill",
+        help="How to fill the random inputs generated for checking (check_n). "
+        "'random' (uniform [0, 1), the default), 'ones', 'zeros' or 'arange' "
+        "(0, 1, 2, ... in row-major order). Ignored when --input-data-path is given.",
+        type=str,
+        choices=model_checking.INPUT_FILL_CHOICES,
+        default="random",
     )
     parser.add_argument(
         "--custom-lib", help="Deprecated. Not needed any more.", type=str
@@ -1306,6 +1323,7 @@ def main():
         target_opset_version=args.target_opset,
         check_rtol=args.check_rtol,
         check_atol=args.check_atol,
+        input_fill=args.input_fill,
         providers=providers,
         profile=args.profile,
         ort_profile=args.ort_profile,

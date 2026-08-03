@@ -62,7 +62,9 @@ constant folding until the model stops changing. Around that it offers:
   partial shape evaluation via ONNX data propagation — to unlock more folding.
 - **Correctness checking.** Optionally validates the simplified model against the
   original on `N` random inputs (the positional `check_n` argument, with
-  configurable `--check-rtol`/`--check-atol`).
+  configurable `--check-rtol`/`--check-atol`). Choose how the generated inputs are
+  filled with `--input-fill` (Python: `input_fill=`): `random` (uniform `[0, 1)`,
+  the default), `ones`, `zeros` or `arange`.
 - **Fixed and dynamic input shapes.** Pin a dynamic model's shapes for
   simplification/checking with `--overwrite-input-shape` and `--test-input-shape`.
 - **[Custom operators](#custom-operators).** Keeps custom ops (TensorRT plugins,

@@ -80,6 +80,16 @@ check("parses the inline_functions flag and its alias", () => {
   assert.equal(parseInputParams("?inline=off").inlineFunctions, false);
 });
 
+check("parses the autorun (auto-run inference) flag and its aliases", () => {
+  // Absent → null so callers can tell "not set" from off.
+  assert.equal(parseInputParams("?model=x").autoRunInference, null);
+  assert.equal(parseInputParams("?autorun=1").autoRunInference, true);
+  assert.equal(parseInputParams("?autorun").autoRunInference, true); // bare flag = on
+  assert.equal(parseInputParams("?autorun=0").autoRunInference, false);
+  assert.equal(parseInputParams("?autoinfer=on").autoRunInference, true);
+  assert.equal(parseInputParams("?autorun_inference=false").autoRunInference, false);
+});
+
 check("optimizer accepts mode/processor/opt aliases", () => {
   assert.equal(parseInputParams("?mode=simplify").optimizer, "simplify");
   assert.equal(parseInputParams("?processor=fold_constant").optimizer, "fold_constant");
@@ -114,8 +124,9 @@ check("applyOptionParams prefills only the given controls", () => {
     "id_inline_functions",
     "id_simplify_tensor_size_threshold",
     "id_simplify_target_opset",
+    "inference-autorun",
   ]);
-  const params = parseInputParams("?optimizer=optimize&cf=0&si=1&inline=1&tst=1000&opset=18");
+  const params = parseInputParams("?optimizer=optimize&cf=0&si=1&inline=1&tst=1000&opset=18&autorun=1");
   const changed = applyOptionParams(params, doc);
   assert.equal(doc.els.optimizer_optimize.checked, true);
   assert.equal(doc.els.id_simplify_constant_fold.checked, false);
@@ -123,8 +134,10 @@ check("applyOptionParams prefills only the given controls", () => {
   assert.equal(doc.els.id_inline_functions.checked, true);
   assert.equal(doc.els.id_simplify_tensor_size_threshold.value, "1000");
   assert.equal(doc.els.id_simplify_target_opset.value, "18");
+  assert.equal(doc.els["inference-autorun"].checked, true);
   assert.ok(changed.includes("optimizer_optimize"));
   assert.ok(changed.includes("id_inline_functions"));
+  assert.ok(changed.includes("inference-autorun"));
 });
 
 check("applyOptionParams leaves untouched controls alone", () => {
@@ -183,6 +196,7 @@ function shareDoc(opts = {}) {
     id_simplify_shape_inference: { checked: opts.shapeInference ?? true },
     id_simplify_tensor_size_threshold: { value: String(opts.tst ?? 1000000000) },
     id_simplify_target_opset: { value: String(opts.opset ?? 0) },
+    "inference-autorun": { checked: opts.autoRunInference ?? false },
   };
   return {
     getElementById: (id) => els[id] || null,
@@ -201,6 +215,7 @@ check("buildShareSearch keeps a compact URL when all options are default", () =>
   assert.equal(p.get("si"), null);
   assert.equal(p.get("tst"), null);
   assert.equal(p.get("opset"), null);
+  assert.equal(p.get("autorun"), null); // unchecked (default) → dropped
 });
 
 check("buildShareSearch encodes every changed option", () => {
@@ -210,6 +225,7 @@ check("buildShareSearch encodes every changed option", () => {
     shapeInference: false,
     tst: 500000,
     opset: 18,
+    autoRunInference: true,
   });
   const s = buildShareSearch("?model=owner/repo", doc);
   const p = new URLSearchParams(s);
@@ -219,6 +235,7 @@ check("buildShareSearch encodes every changed option", () => {
   assert.equal(p.get("si"), "0");
   assert.equal(p.get("tst"), "500000");
   assert.equal(p.get("opset"), "18");
+  assert.equal(p.get("autorun"), "1"); // checked → emitted
 });
 
 check("buildShareSearch round-trips through parseInputParams", () => {

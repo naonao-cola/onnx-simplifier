@@ -12,6 +12,7 @@
 // finishes); "original" reads the file input directly.
 
 import { runInference, compareInference } from "./inference_core.mjs";
+import { fillInput, INPUT_FILL_MODES } from "./input_fill.mjs";
 import { summarizeOrtTrace } from "./trace_build.mjs";
 import { renderTrace } from "./trace_viewer.mjs";
 import { downloadText } from "./download.mjs";
@@ -80,30 +81,10 @@ function concreteShape(shape, batch = 1) {
   });
 }
 
-// Fill a float typed-array in place with small deterministic pseudo-random
-// values in [-1, 1) (a seeded xorshift32, so every call produces the same
-// sequence). Used by the before/after comparison: all-zero inputs can mask a
-// divergence introduced by a graph change (many ops map 0 -> 0), whereas varied
-// inputs actually exercise the graph. Integer/bool inputs are left at zero,
-// which is the safe default for index-like tensors (Gather, etc.) where an
-// arbitrary value could go out of bounds. Determinism matters because
-// runInference() re-feeds the same tensor every iteration and asserts the output
-// never changes.
-function fillPseudoRandom(arr, type) {
-  if (type !== "float32" && type !== "float64") return; // zeros for ints/bool
-  let s = 0x2545f491; // fixed non-zero seed
-  for (let i = 0; i < arr.length; i++) {
-    // xorshift32 (bitwise ops keep `s` a 32-bit signed int throughout).
-    s ^= s << 13;
-    s ^= s >>> 17;
-    s ^= s << 5;
-    arr[i] = s / 0x80000000; // 32-bit signed / 2^31 -> [-1, 1)
-  }
-}
-
-// Build a feeds object for every model input. `fill` is "zero" (the default,
-// matching a plain single-model run) or "random" (deterministic non-zero float
-// values, used by the compare path so the before/after diff is meaningful).
+// Build a feeds object for every model input. `fill` selects how the float
+// inputs are valued (see input_fill.mjs): "zero" (a plain single-model run),
+// "random" (deterministic non-zero values, the compare path's default so the
+// before/after diff is meaningful), or the user-chosen "ones"/"zeros"/"arange".
 function makeDummyInputs(ort, session, batch = 1, fill = "zero") {
   const feeds = {};
   for (const meta of session.inputMetadata) {
@@ -114,8 +95,7 @@ function makeDummyInputs(ort, session, batch = 1, fill = "zero") {
     const count = dims.reduce((a, b) => a * b, 1);
     const Ctor = TYPED_ARRAY[meta.type];
     if (!Ctor) throw new Error(`unsupported input type '${meta.type}'`);
-    const buf = new Ctor(count);
-    if (fill === "random") fillPseudoRandom(buf, meta.type);
+    const buf = fillInput(new Ctor(count), meta.type, fill);
     feeds[meta.name] = new ort.Tensor(meta.type, buf, dims);
   }
   return feeds;
@@ -146,17 +126,21 @@ async function prepareInputs(ort, modelBytes, batch, fill, log) {
   return { feeds, inputName, leadMeta, leadingDynamic };
 }
 
-async function runOnModel(modelBytes, { iterations, warmup, batch, providers, needWebnn, profile }, log) {
+async function runOnModel(
+  modelBytes,
+  { iterations, warmup, batch, providers, needWebnn, profile, fill = "zero" },
+  log,
+) {
   const ort = await loadOrt(needWebnn ? "all" : "default");
 
   const { feeds, inputName, leadingDynamic } = await prepareInputs(
     ort,
     modelBytes,
     batch,
-    "zero",
+    fill,
     log,
   );
-  log(`input '${inputName}' dims [${feeds[inputName].dims.join(", ")}]`);
+  log(`input '${inputName}' dims [${feeds[inputName].dims.join(", ")}] (fill=${fill})`);
 
   const res = await runInference(ort, {
     model: modelBytes,
@@ -187,7 +171,7 @@ async function runOnModel(modelBytes, { iterations, warmup, batch, providers, ne
 async function runCompare(
   originalBytes,
   convertedBytes,
-  { iterations, warmup, batch, providers, needWebnn, profile },
+  { iterations, warmup, batch, providers, needWebnn, profile, fill = "random" },
   log,
 ) {
   const ort = await loadOrt(needWebnn ? "all" : "default");
@@ -196,11 +180,14 @@ async function runCompare(
     ort,
     originalBytes,
     batch,
-    "random",
+    fill,
     log,
   );
   const input = feeds[inputName];
-  log(`shared input '${inputName}' dims [${input.dims.join(", ")}] (deterministic)`);
+  log(
+    `shared input '${inputName}' dims [${input.dims.join(", ")}] ` +
+      `(deterministic, fill=${fill})`,
+  );
 
   const cmp = await compareInference(ort, {
     before: { model: originalBytes, label: "original" },
@@ -465,7 +452,9 @@ export function initInferencePanel() {
   const batchInput = document.getElementById("inference-batch");
   const epSelect = document.getElementById("inference-ep");
   const sourceSelect = document.getElementById("inference-source");
+  const fillSelect = document.getElementById("inference-fill");
   const profileChk = document.getElementById("inference-profile");
+  const autoRunChk = document.getElementById("inference-autorun");
   const traceContainer = document.getElementById("inference-trace");
   const macsContainer = document.getElementById("inference-macs");
   const dlLogBtn = document.getElementById("download-inference-log-button");
@@ -513,7 +502,12 @@ export function initInferencePanel() {
     });
   }
 
-  btn.addEventListener("click", async () => {
+  // Run the inference panel once, honoring the currently-selected controls.
+  // Shared by the "Run inference" button and the "auto-run after each
+  // conversion" option below; the button's disabled state doubles as a simple
+  // re-entrancy guard so overlapping runs can't interleave.
+  const runOnce = async () => {
+    if (btn.disabled) return;
     btn.disabled = true;
     out.value = "";
     if (traceContainer) traceContainer.innerHTML = "";
@@ -535,6 +529,11 @@ export function initInferencePanel() {
       const epValue = epSelect.value;
       const { providers, needWebnn } = providersForEp(epValue);
       const profile = !profileChk || profileChk.checked;
+      // How the auto-generated float inputs are valued (input_fill.mjs). Guard
+      // against an unexpected value so a stale/edited DOM can't feed a bad mode
+      // into the fill routine.
+      const fillValue = fillSelect ? fillSelect.value : "random";
+      const fill = INPUT_FILL_MODES.includes(fillValue) ? fillValue : "random";
 
       if (isWebnnEp(epValue)) {
         log(
@@ -556,7 +555,7 @@ export function initInferencePanel() {
         const cmp = await runCompare(
           original.bytes,
           converted.bytes,
-          { iterations, warmup, batch, providers, needWebnn, profile },
+          { iterations, warmup, batch, providers, needWebnn, profile, fill },
           log,
         );
         log(
@@ -583,7 +582,7 @@ export function initInferencePanel() {
       log(`loading onnxruntime-web ${ORT_VERSION}…`);
       const res = await runOnModel(
         bytes,
-        { iterations, warmup, batch, providers, needWebnn, profile },
+        { iterations, warmup, batch, providers, needWebnn, profile, fill },
         log,
       );
       log(
@@ -618,7 +617,25 @@ export function initInferencePanel() {
       restoreOrtLogs();
       btn.disabled = false;
     }
-  });
+  };
+
+  btn.addEventListener("click", runOnce);
+
+  // "auto-run after each conversion": when enabled, run this panel
+  // automatically every time a conversion finishes, using the options selected
+  // here. index.html dispatches `onnxsim:converted` on window once the worker
+  // returns — and, right after (synchronously), `onnxsim:original-annotated`.
+  // Defer to a macrotask so the whole convert-done handler finishes first,
+  // ensuring both the converted and MAC-annotated-original bytes are published
+  // before a "compare (before vs after)" run reads them.
+  if (autoRunChk) {
+    window.addEventListener("onnxsim:converted", () => {
+      if (!autoRunChk.checked || btn.disabled) return;
+      setTimeout(() => {
+        if (autoRunChk.checked && !btn.disabled) runOnce();
+      }, 0);
+    });
+  }
 }
 
 initInferencePanel();

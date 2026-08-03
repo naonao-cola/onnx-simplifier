@@ -20,7 +20,8 @@
     "test:webnn": "node test/webnn.test.mjs",
     "test:ortlog": "node test/ort_log_capture.test.mjs",
     "test:cdn": "node test/cdn.test.mjs",
-    "test:all": "npm run test:netron && npm run test:trace && npm run test:macs && npm run test:shapes && npm run test:hf && npm run test:xet && npm run test:issue && npm run test:versions && npm run test:backend && npm run test:query && npm run test:webnn && npm run test:ortlog && npm run test:cdn && npm run test:inference && npm run test:compare",
+    "test:fill": "node test/input_fill.test.mjs",
+    "test:all": "npm run test:netron && npm run test:trace && npm run test:macs && npm run test:shapes && npm run test:hf && npm run test:xet && npm run test:issue && npm run test:versions && npm run test:backend && npm run test:query && npm run test:webnn && npm run test:ortlog && npm run test:cdn && npm run test:fill && npm run test:inference && npm run test:compare",
     "coverage": "c8 npm run test:all"
   },
   "dependencies": {

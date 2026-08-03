@@ -1330,6 +1330,57 @@ def test_compare_respects_check_tolerance():
     )
 
 
+def test_compare_input_fill_modes():
+    # The random test inputs can be filled several ways. Capture what compare()
+    # actually feeds the model by intercepting the backend run.
+    from onnxsim import backend, model_checking
+
+    model = _add_const_model(0.0)
+    captured = {}
+
+    def fake_run_model(m, inputs, custom_lib=None):
+        captured["inputs"] = inputs
+        return {"y": inputs["x"]}
+
+    for fill, expected in (
+        ("ones", np.ones((1, 4), dtype=np.float32)),
+        ("zeros", np.zeros((1, 4), dtype=np.float32)),
+        ("arange", np.arange(4, dtype=np.float32).reshape(1, 4)),
+    ):
+        import unittest.mock
+
+        with unittest.mock.patch.object(backend, "run_model", fake_run_model):
+            assert model_checking.compare(
+                model, model, n_times=1, verbose=False, input_fill=fill
+            )
+        np.testing.assert_array_equal(captured["inputs"]["x"], expected)
+
+
+def test_compare_rejects_unknown_input_fill():
+    from onnxsim import model_checking
+
+    with pytest.raises(ValueError):
+        model_checking.compare(
+            _add_const_model(0.0), _add_const_model(0.0), n_times=1, input_fill="bogus"
+        )
+
+
+def test_simplify_threads_input_fill(monkeypatch):
+    # simplify() must forward input_fill into model_checking.compare.
+    from onnxsim import model_checking
+
+    captured = {}
+
+    def fake_compare(model_opt, model_ori, n_times, *args, **kwargs):
+        captured["input_fill"] = kwargs.get("input_fill")
+        return True
+
+    monkeypatch.setattr(model_checking, "compare", fake_compare)
+
+    onnxsim.simplify(_add_const_model(0.0), check_n=1, input_fill="arange")
+    assert captured == {"input_fill": "arange"}
+
+
 def test_simplify_threads_check_tolerance(monkeypatch):
     # simplify() must forward check_rtol/check_atol into model_checking.compare.
     from onnxsim import model_checking
