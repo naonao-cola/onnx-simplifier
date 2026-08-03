@@ -266,6 +266,14 @@
     </head>
     <body>
         <h1>Model converter</h1>
+        <p class="subtitle">
+            Simplify, optimize, and inspect ONNX models with
+            <a href="https://github.com/onnxsim/onnxsim" target="_blank" rel="noopener">onnxsim</a>
+            and
+            <a href="https://github.com/onnx/optimizer" target="_blank" rel="noopener">onnx-optimizer</a>,
+            compiled to WebAssembly. Everything runs locally in your browser —
+            models are never uploaded.
+        </p>
         <div id="versions-panel" title="Library versions built into this WebAssembly module (also included in a bug report).">
             <span class="version-badge"><span class="version-k">versions</span><span class="version-v">loading…</span></span>
         </div>
@@ -307,7 +315,7 @@ agraph (float[N] X) =&gt; (float[N] Y) {
 
         <h2>Convert a model</h2>
         <input type="file" id="file-input" disabled title="Loading WebAssembly runtime…" />
-        <span id="loading-status">⏳ Loading WebAssembly runtime… the file picker is disabled until it is ready.</span>
+        <span id="loading-status" role="status" aria-live="polite">⏳ Loading WebAssembly runtime… the file picker is disabled until it is ready.</span>
         <button id="download-button" disabled>Download</button>
         <div id="hf-loader" style="margin-top: 0.6em;">
             <label for="hf-model-select">…or load from <a href="https://huggingface.co/onnxmodelzoo" target="_blank" rel="noopener">Hugging Face</a>:</label>
@@ -318,7 +326,7 @@ agraph (float[N] X) =&gt; (float[N] Y) {
                    placeholder="repo id (e.g. onnxmodelzoo/resnet18d_Opset18) or an .onnx URL"
                    disabled title="Loading WebAssembly runtime…" />
             <button id="hf-load-button" type="button" disabled title="Loading WebAssembly runtime…">Load</button>
-            <span id="hf-status"></span>
+            <span id="hf-status" role="status" aria-live="polite"></span>
             <div id="hf-file-row" style="margin-top: 0.25em; display: none;">
                 <label for="hf-file-select">file</label>
                 <select id="hf-file-select"></select>
@@ -405,7 +413,7 @@ agraph (float[N] X) =&gt; (float[N] Y) {
             <input type="text" id="backend-url" size="52"
                 placeholder="…or a GitHub tree / raw URL to a test-case directory">
             <button id="backend-run" type="button">Run test case</button>
-            <span id="backend-status"></span>
+            <span id="backend-status" role="status" aria-live="polite"></span>
             <div class="note" style="margin-top: 0.25em;">
                 Fetches <code>model.onnx</code> and the test data
                 (<code>test_data_set_N/</code> of <code>input_*.pb</code> /

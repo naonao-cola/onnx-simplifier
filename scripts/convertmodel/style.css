@@ -57,6 +57,12 @@
 }
 
 /* --- base ----------------------------------------------------------------- */
+html {
+  /* Never allow the page itself to scroll sideways; wide content (tables,
+     Netron/Perfetto iframes) scrolls within its own container instead. */
+  overflow-x: hidden;
+}
+
 body {
   max-width: 62rem;
   margin: 0 auto;
@@ -67,11 +73,19 @@ body {
   line-height: 1.55;
   color: var(--fg);
   background: var(--bg);
+  overflow-wrap: break-word;
 }
 
 h1 {
   font-size: 1.7rem;
+  margin: 0 0 0.3rem;
+}
+
+/* One-line intro under the title. */
+.subtitle {
   margin: 0 0 0.6rem;
+  max-width: 60ch;
+  color: var(--muted);
 }
 
 h2 {
@@ -104,6 +118,9 @@ code {
   border-radius: 4px;
   font-family: var(--mono);
   font-size: 0.9em;
+  /* Long inline code / URLs (e.g. the shareable-link examples) must wrap
+     instead of forcing the page wider than a narrow viewport. */
+  overflow-wrap: anywhere;
 }
 
 /* Muted helper text — the many inline `color:#666; font-size:.85em` notes now
@@ -127,6 +144,18 @@ button {
   color: var(--fg);
 }
 
+/* The control rows lay labels, inputs, selects and buttons out inline; aligning
+   them to the middle (rather than the baseline default) keeps rows of
+   different-height controls visually level. */
+input,
+select,
+button {
+  vertical-align: middle;
+}
+label {
+  vertical-align: middle;
+}
+
 input[type="text"],
 input[type="number"],
 select,
@@ -135,6 +164,10 @@ textarea {
   border: 1px solid var(--border);
   border-radius: var(--radius);
   padding: 0.3em 0.5em;
+  /* Several text inputs set a wide `size=` (repo id, backend URL); cap them at
+     the viewport so they shrink on small screens instead of overflowing. */
+  max-width: 100%;
+  box-sizing: border-box;
 }
 
 textarea {
@@ -326,6 +359,10 @@ button:focus-visible {
   border-collapse: collapse;
   margin-top: 0.4em;
   font-variant-numeric: tabular-nums;
+  /* Scroll a wide per-op table within itself rather than widening the page. */
+  display: block;
+  max-width: 100%;
+  overflow-x: auto;
 }
 .macs-table th,
 .macs-table td {
