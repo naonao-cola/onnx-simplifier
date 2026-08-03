@@ -231,7 +231,7 @@ export function renderTrace(container, trace, opts = {}) {
   // Toolbar.
   const bar = document.createElement("div");
   bar.style.margin = "6px 0";
-  const dlBtn = makeButton("Download JSON");
+  const dlBtn = makeButton("Download JSON ↓");
   const pfBtn = makeButton("Embed in Perfetto");
   const pfTabBtn = makeButton("open in a new tab ↗");
   dlBtn.addEventListener("click", () => download(trace, filename));
@@ -239,7 +239,7 @@ export function renderTrace(container, trace, opts = {}) {
   bar.appendChild(pfBtn);
   bar.appendChild(pfTabBtn);
   const hint = document.createElement("span");
-  hint.style.color = "#666";
+  hint.style.color = "var(--muted, #666)";
   hint.style.fontSize = "12px";
   hint.textContent = "wheel = zoom · drag = pan · double-click = reset";
   bar.appendChild(hint);
@@ -248,7 +248,7 @@ export function renderTrace(container, trace, opts = {}) {
   // Open the trace in the full Perfetto UI in a new tab.
   pfTabBtn.addEventListener("click", () => {
     if (!openInPerfettoTab(trace, title)) {
-      hint.style.color = "#a00";
+      hint.style.color = "var(--bad, #a00)";
       hint.textContent = "Pop-up blocked — allow pop-ups to open Perfetto in a new tab.";
     }
   });
@@ -318,10 +318,17 @@ export function renderTrace(container, trace, opts = {}) {
   function draw() {
     ctx.clearRect(0, 0, cssW, totalH);
     ctx.textBaseline = "middle";
+    // Track labels are drawn on the (transparent) canvas over the page
+    // background, so pull the foreground color from the theme token — resolved
+    // per draw so it tracks a light/dark switch. Span labels below sit on the
+    // colored bars and stay dark regardless.
+    const labelColor =
+      getComputedStyle(document.documentElement).getPropertyValue("--fg").trim() ||
+      "#333";
     let y = 0;
     for (const track of tracks) {
       // Track label.
-      ctx.fillStyle = "#333";
+      ctx.fillStyle = labelColor;
       ctx.font = "bold 12px sans-serif";
       ctx.fillText(track.label, 4, y + LABEL_H / 2);
       y += LABEL_H + TRACK_PAD;
