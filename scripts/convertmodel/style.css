@@ -1,0 +1,559 @@
+/* Styles for the onnxsim WebAssembly model-converter page (index.html).
+ *
+ * Previously the page had only a small inline <style> block for a few
+ * components and relied on the browser defaults for everything else (full-width
+ * body, hardcoded #666 / #ccc / #a00 colors scattered inline). This file gives
+ * the page a single, cohesive look: a readable centered column, consistent
+ * typography and spacing, uniformly styled form controls with visible focus
+ * rings, and — via CSS custom properties — a light and dark theme that follows
+ * the OS setting. Every color is a token so the two themes stay in sync.
+ *
+ * Only presentation lives here; the page's element ids/classes and all its
+ * JavaScript behavior are unchanged.
+ */
+
+/* --- design tokens -------------------------------------------------------- */
+:root {
+  color-scheme: light dark;
+
+  --bg: #ffffff;
+  --fg: #1f2328;
+  --muted: #656d76;
+  --border: #d0d7de;
+  --panel-bg: #f6f8fa;
+  --field-bg: #ffffff;
+  --code-bg: rgba(175, 184, 193, 0.2);
+  --link: #0969da;
+  --accent: #4a6cf7;
+  --accent-soft: #f4f7ff;
+  --ok: #0a7d24;
+  --bad: #a00000;
+  --warn: #a06000;
+  --param: #b5006b;
+
+  --radius: 6px;
+  --gap: 0.6em;
+  --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas,
+    "Liberation Mono", monospace;
+  /* Width for content that breaks out of the reading column (see .wide). */
+  --wide: min(96vw, 1600px);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #0d1117;
+    --fg: #e6edf3;
+    --muted: #9198a1;
+    --border: #30363d;
+    --panel-bg: #161b22;
+    --field-bg: #0d1117;
+    --code-bg: rgba(110, 118, 129, 0.4);
+    --link: #4493f8;
+    --accent: #6b8afd;
+    --accent-soft: #12203f;
+    --ok: #3fb950;
+    --bad: #ff7b72;
+    --warn: #d29922;
+    --param: #f778ba;
+  }
+}
+
+/* --- base ----------------------------------------------------------------- */
+html {
+  /* Never allow the page itself to scroll sideways; wide content (tables,
+     Netron/Perfetto iframes) scrolls within its own container instead. */
+  overflow-x: hidden;
+}
+
+body {
+  max-width: 62rem;
+  margin: 0 auto;
+  padding: 1.5rem 1.25rem 4rem;
+  font-family: system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial,
+    sans-serif;
+  font-size: 15px;
+  line-height: 1.55;
+  color: var(--fg);
+  background: var(--bg);
+  overflow-wrap: break-word;
+}
+
+/* Break out of the centered reading column to use more of the viewport, for
+   wide content the 62rem column makes needlessly small (the Netron graph
+   panes and the console log). The negative side margins are symmetric, so the
+   block stays centered; on narrow viewports --wide is < the column width and
+   this is a no-op. max-width:none defeats the 100% cap the form-control rules
+   put on the <textarea>. */
+.wide {
+  width: var(--wide);
+  max-width: none;
+  margin-inline: calc(50% - var(--wide) / 2);
+}
+
+h1 {
+  font-size: 1.7rem;
+  margin: 0 0 0.3rem;
+}
+
+/* One-line intro under the title. */
+.subtitle {
+  margin: 0 0 0.6rem;
+  max-width: 60ch;
+  color: var(--muted);
+}
+
+h2 {
+  font-size: 1.25rem;
+  margin: 2.2rem 0 0.6rem;
+  padding-bottom: 0.3rem;
+  border-bottom: 1px solid var(--border);
+  /* Keep an anchored section clear of the sticky nav when jumped to. */
+  scroll-margin-top: 3.4rem;
+}
+
+/* --- sticky section nav --------------------------------------------------- */
+.section-nav {
+  position: sticky;
+  top: 0;
+  z-index: 10;
+  display: flex;
+  flex-wrap: nowrap;
+  gap: 0.35em;
+  overflow-x: auto;
+  margin: 0.2rem 0 1rem;
+  padding: 0.5em 0;
+  background: var(--bg);
+  border-bottom: 1px solid var(--border);
+  scrollbar-width: thin;
+}
+.section-nav a {
+  flex: 0 0 auto;
+  padding: 0.25em 0.75em;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  color: var(--fg);
+  font-size: 0.85em;
+  white-space: nowrap;
+}
+.section-nav a:hover,
+.section-nav a:focus-visible {
+  border-color: var(--accent);
+  color: var(--accent);
+  text-decoration: none;
+}
+html {
+  /* Smooth-scroll for the in-page nav jumps. */
+  scroll-behavior: smooth;
+}
+@media (prefers-reduced-motion: reduce) {
+  html {
+    scroll-behavior: auto;
+  }
+}
+
+h3 {
+  font-size: 1.05rem;
+  margin: 0 0 0.4em;
+}
+
+p {
+  margin: 0.5rem 0;
+}
+
+a {
+  color: var(--link);
+  text-decoration: none;
+}
+a:hover {
+  text-decoration: underline;
+}
+/* Links that open a new tab (external sites) get a trailing outward arrow.
+   The NBSP keeps the arrow from wrapping onto a line by itself. The in-page
+   section-nav links (same-document #hashes, no target) are unaffected. */
+a[target="_blank"]::after {
+  content: "\00A0↗";
+  font-size: 0.85em;
+}
+
+code {
+  background: var(--code-bg);
+  padding: 0.12em 0.35em;
+  border-radius: 4px;
+  font-family: var(--mono);
+  font-size: 0.9em;
+  /* Long inline code / URLs (e.g. the shareable-link examples) must wrap
+     instead of forcing the page wider than a narrow viewport. */
+  overflow-wrap: anywhere;
+}
+
+/* Muted helper text — the many inline `color:#666; font-size:.85em` notes now
+   use this class so they follow the theme. */
+.note {
+  color: var(--muted);
+  font-size: 0.85em;
+}
+
+/* Success text (e.g. the "copied!" share-link confirmation). */
+.ok {
+  color: var(--ok);
+}
+
+/* --- form controls -------------------------------------------------------- */
+input,
+select,
+textarea,
+button {
+  font: inherit;
+  color: var(--fg);
+}
+
+/* The control rows lay labels, inputs, selects and buttons out inline; aligning
+   them to the middle (rather than the baseline default) keeps rows of
+   different-height controls visually level. */
+input,
+select,
+button {
+  vertical-align: middle;
+}
+label {
+  vertical-align: middle;
+}
+
+input[type="text"],
+input[type="number"],
+select,
+textarea {
+  background: var(--field-bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 0.3em 0.5em;
+  /* Several text inputs set a wide `size=` (repo id, backend URL); cap them at
+     the viewport so they shrink on small screens instead of overflowing. */
+  max-width: 100%;
+  box-sizing: border-box;
+}
+
+textarea {
+  color: var(--fg);
+}
+
+input[type="file"] {
+  max-width: 100%;
+}
+/* Give the native "Choose File" button the same look as the other buttons. */
+input[type="file"]::file-selector-button {
+  font: inherit;
+  margin-right: 0.6em;
+  background: var(--panel-bg);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 0.35em 0.85em;
+  cursor: pointer;
+}
+input[type="file"]:not(:disabled)::file-selector-button:hover {
+  border-color: var(--accent);
+}
+
+/* Read-only console / output panes read better as monospace, a touch smaller
+   and tighter than prose. (The "parse a text graph" textarea already opts into
+   monospace inline.) */
+#log-output,
+#inference-output,
+#backend-output {
+  font-family: var(--mono);
+  font-size: 0.85em;
+  line-height: 1.4;
+}
+
+/* The "loading runtime…" hint next to the disabled file picker. */
+#loading-status {
+  color: var(--muted);
+  font-size: 0.9em;
+}
+
+/* Theme the checkbox/radio ticks to the brand accent in both schemes. */
+input[type="checkbox"],
+input[type="radio"] {
+  accent-color: var(--accent);
+}
+
+button {
+  background: var(--panel-bg);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 0.35em 0.85em;
+  cursor: pointer;
+}
+button:hover:not(:disabled) {
+  border-color: var(--accent);
+}
+button:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+/* Primary calls-to-action — the buttons that actually kick off work — get a
+   filled accent so they stand out from the secondary/utility buttons around
+   them (download log, export, clear cache, …), which keep the neutral style
+   above. Targeted by id so no markup changes are needed. */
+#parse-graph-button,
+#hf-load-button,
+#backend-run,
+#run-inference,
+#download-button {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+  font-weight: 600;
+}
+#parse-graph-button:hover:not(:disabled),
+#hf-load-button:hover:not(:disabled),
+#backend-run:hover:not(:disabled),
+#run-inference:hover:not(:disabled),
+#download-button:hover:not(:disabled) {
+  filter: brightness(1.08);
+  border-color: var(--accent);
+}
+
+/* A clear keyboard focus ring on every interactive control. */
+a:focus-visible,
+input:focus-visible,
+select:focus-visible,
+textarea:focus-visible,
+button:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+/* --- versions panel ------------------------------------------------------- */
+#versions-panel {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5em;
+  margin: 0.4em 0 0.8em;
+}
+.version-badge {
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 0.15em 0.7em;
+  font-size: 0.85em;
+  display: inline-flex;
+  gap: 0.4em;
+  align-items: baseline;
+}
+.version-k {
+  color: var(--muted);
+}
+.version-v {
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+
+/* --- "parse a text graph" / debug tool panel ------------------------------ */
+.tool-panel {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 0.6em 0.8em;
+  margin: 0.8em 0;
+  background: var(--panel-bg);
+}
+.tool-panel h3 {
+  margin: 0 0 0.4em;
+}
+.tool-note {
+  color: var(--muted);
+  font-size: 0.85em;
+  margin: 0.3em 0;
+}
+.debug-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5em;
+  align-items: center;
+  margin: 0.4em 0;
+}
+
+/* --- convert mode & options card ----------------------------------------- */
+.options-panel {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 0.6em 0.9em 0.8em;
+  margin: 0.9em 0;
+  background: var(--panel-bg);
+}
+.options-panel h3 {
+  margin: 0 0 0.5em;
+}
+/* The convert-mode radios sit on one wrapping row with a divider below,
+   separating "what to run" from the "how" options underneath. Extra space
+   after each label (and roomier line-height) keeps the choices from cramming
+   when they wrap. */
+.convert-modes {
+  padding-bottom: 0.6em;
+  margin-bottom: 0.6em;
+  border-bottom: 1px solid var(--border);
+  line-height: 2;
+}
+.convert-modes label {
+  margin-right: 0.7em;
+}
+.options-panel #passes {
+  line-height: 1.9;
+}
+.options-panel #passes input[type="number"] {
+  margin: 0.1em 0;
+}
+
+/* --- Netron before/after panes ------------------------------------------- */
+.netron-pane {
+  flex: 1 1 380px;
+  min-width: 300px;
+}
+.netron-head {
+  margin-bottom: 0.35em;
+}
+.netron-note {
+  color: var(--bad);
+  font-size: 0.9em;
+  margin-top: 0.35em;
+}
+/* `resize: vertical` needs a non-visible overflow to expose the drag handle;
+   the min/max keep the pane usable. */
+.netron-frame {
+  width: 100%;
+  height: 480px;
+  min-height: 200px;
+  max-height: 90vh;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  resize: vertical;
+  overflow: auto;
+  background: var(--field-bg);
+}
+
+/* --- MACs / FLOPs cards and table ---------------------------------------- */
+.macs-cards {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.6em;
+  margin: 0.6em 0;
+}
+.macs-card {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 0.5em 0.7em;
+  min-width: 8em;
+  background: var(--panel-bg);
+}
+.macs-k {
+  color: var(--muted);
+  font-size: 0.75em;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+.macs-v {
+  font-size: 1.2em;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+.macs-v small {
+  font-size: 0.65em;
+  color: var(--muted);
+  font-weight: 400;
+}
+.macs-table {
+  border-collapse: collapse;
+  margin-top: 0.4em;
+  font-variant-numeric: tabular-nums;
+  /* Scroll a wide per-op table within itself rather than widening the page. */
+  display: block;
+  max-width: 100%;
+  overflow-x: auto;
+}
+.macs-table th,
+.macs-table td {
+  border-bottom: 1px solid var(--border);
+  padding: 3px 10px;
+  text-align: right;
+}
+.macs-table th:first-child,
+.macs-table td:first-child {
+  text-align: left;
+}
+.macs-note {
+  color: var(--muted);
+  font-size: 0.85em;
+  margin-top: 0.4em;
+}
+
+/* --- dynamic dimensions (dim_param) panel -------------------------------- */
+.dp-panes {
+  display: flex;
+  gap: 1em;
+  flex-wrap: wrap;
+}
+.dp-pane {
+  flex: 1 1 320px;
+  min-width: 280px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 0.5em 0.7em;
+  background: var(--panel-bg);
+}
+.dp-head {
+  font-weight: 600;
+  margin-bottom: 0.35em;
+}
+.dp-names {
+  margin-bottom: 0.4em;
+}
+.dp-diff {
+  margin: 0 0 0.5em;
+  padding: 0.35em 0.6em;
+  background: var(--accent-soft);
+  border-left: 3px solid var(--accent);
+  border-radius: 3px;
+}
+.dp-table {
+  border-collapse: collapse;
+  width: 100%;
+  font-variant-numeric: tabular-nums;
+}
+.dp-table th,
+.dp-table td {
+  border-bottom: 1px solid var(--border);
+  padding: 3px 8px;
+  text-align: left;
+}
+.dp-param {
+  color: var(--param);
+  font-weight: 600;
+}
+.dp-dim {
+  color: var(--fg);
+}
+
+/* --- before/after inference comparison summary --------------------------- */
+.cmp-table th {
+  text-align: left;
+  color: var(--muted);
+  font-weight: 600;
+  white-space: nowrap;
+}
+.cmp-table td {
+  text-align: left;
+}
+.cmp-ok {
+  color: var(--ok);
+  font-weight: 600;
+}
+.cmp-bad {
+  color: var(--bad);
+  font-weight: 600;
+}
+.cmp-warn {
+  color: var(--warn);
+  font-weight: 600;
+}
