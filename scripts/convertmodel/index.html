@@ -1,47 +1,10 @@
 <!DOCTYPE html>
 <html>
     <head>
-        <style>
-            .netron-pane { flex: 1 1 380px; min-width: 300px; }
-            .netron-head { margin-bottom: 0.35em; }
-            .netron-note { color: #a00; font-size: 0.9em; margin-top: 0.35em; }
-            /* `resize: vertical` needs a non-visible overflow to expose the
-               drag handle; the min/max keep the pane usable. */
-            .netron-frame { width: 100%; height: 480px; min-height: 200px; max-height: 90vh; border: 1px solid #ccc; resize: vertical; overflow: auto; }
-            .macs-cards { display: flex; flex-wrap: wrap; gap: 0.6em; margin: 0.6em 0; }
-            .macs-card { border: 1px solid #ccc; border-radius: 6px; padding: 0.5em 0.7em; min-width: 8em; }
-            .macs-k { color: #666; font-size: 0.75em; text-transform: uppercase; letter-spacing: 0.03em; }
-            .macs-v { font-size: 1.2em; font-weight: 600; font-variant-numeric: tabular-nums; }
-            .macs-v small { font-size: 0.65em; color: #666; font-weight: 400; }
-            .macs-table { border-collapse: collapse; margin-top: 0.4em; font-variant-numeric: tabular-nums; }
-            .macs-table th, .macs-table td { border-bottom: 1px solid #eee; padding: 3px 10px; text-align: right; }
-            .macs-table th:first-child, .macs-table td:first-child { text-align: left; }
-            .macs-note { color: #666; font-size: 0.85em; margin-top: 0.4em; }
-            /* "Dynamic dimensions (dim_param)" panel */
-            .dp-panes { display: flex; gap: 1em; flex-wrap: wrap; }
-            .dp-pane { flex: 1 1 320px; min-width: 280px; border: 1px solid #ccc; border-radius: 6px; padding: 0.5em 0.7em; }
-            .dp-head { font-weight: 600; margin-bottom: 0.35em; }
-            .dp-names { margin-bottom: 0.4em; }
-            .dp-diff { margin: 0 0 0.5em; padding: 0.35em 0.6em; background: #f4f7ff; border-left: 3px solid #4a6cf7; border-radius: 3px; }
-            .dp-table { border-collapse: collapse; width: 100%; font-variant-numeric: tabular-nums; }
-            .dp-table th, .dp-table td { border-bottom: 1px solid #eee; padding: 3px 8px; text-align: left; }
-            .dp-param { color: #b5006b; font-weight: 600; }
-            .dp-dim { color: #333; }
-            /* before/after comparison summary (Run inference "compare" mode) */
-            .cmp-table th { text-align: left; color: #666; font-weight: 600; white-space: nowrap; }
-            .cmp-table td { text-align: left; }
-            .cmp-ok { color: #0a7d24; font-weight: 600; }
-            .cmp-bad { color: #a00; font-weight: 600; }
-            .cmp-warn { color: #a06000; font-weight: 600; }
-            #versions-panel { display: flex; flex-wrap: wrap; gap: 0.5em; margin: 0.4em 0 0.8em; }
-            .version-badge { border: 1px solid #ccc; border-radius: 999px; padding: 0.15em 0.7em; font-size: 0.85em; display: inline-flex; gap: 0.4em; align-items: baseline; }
-            .version-k { color: #666; }
-            .version-v { font-weight: 600; font-variant-numeric: tabular-nums; }
-            .tool-panel { border: 1px solid #ddd; border-radius: 6px; padding: 0.6em 0.8em; margin: 0.8em 0; }
-            .tool-panel h3 { margin: 0 0 0.4em; }
-            .tool-note { color: #666; font-size: 0.85em; margin: 0.3em 0; }
-            .debug-actions { display: flex; flex-wrap: wrap; gap: 0.5em; align-items: center; margin: 0.4em 0; }
-        </style>
+        <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <title>onnxsim model converter</title>
+        <link rel="stylesheet" href="./style.css">
         <script type="text/javascript" src="./onnxsim.js"></script>
         <script type="text/javascript">
             // The "Choose file" picker must stay disabled until BOTH WASM
@@ -359,9 +322,9 @@ agraph (float[N] X) =&gt; (float[N] Y) {
             <div id="hf-file-row" style="margin-top: 0.25em; display: none;">
                 <label for="hf-file-select">file</label>
                 <select id="hf-file-select"></select>
-                <span id="hf-file-note" style="color: #666; font-size: 0.85em; margin-left: 0.25em;"></span>
+                <span id="hf-file-note" class="note" style="margin-left: 0.25em;"></span>
             </div>
-            <div style="color: #666; font-size: 0.85em; margin-top: 0.25em;">
+            <div class="note" style="margin-top: 0.25em;">
                 Fetches the model straight from the Hugging Face Hub in your
                 browser (nothing is uploaded), then runs it through the same
                 Simplify / Optimize path as an uploaded file. Bare names default
@@ -372,7 +335,7 @@ agraph (float[N] X) =&gt; (float[N] Y) {
                 one <code>.onnx</code>, the largest is auto-detected; use the
                 <b>file</b> selector to convert a different one.
             </div>
-            <div style="color: #666; font-size: 0.85em; margin-top: 0.25em;">
+            <div class="note" style="margin-top: 0.25em;">
                 <b>Shareable link:</b> the input model and options can be set from
                 the URL — e.g.
                 <code>?model=onnxmodelzoo/resnet18d_Opset18</code> or
@@ -392,7 +355,7 @@ agraph (float[N] X) =&gt; (float[N] Y) {
                 input updates this URL so it stays shareable (uploads excepted).
                 <div style="margin-top: 0.35em;">
                     <button id="share-link-button" type="button">Copy shareable link</button>
-                    <span id="share-link-status" style="color: #0a7d24; font-size: 0.85em; margin-left: 0.4em;"></span>
+                    <span id="share-link-status" class="ok" style="font-size: 0.85em; margin-left: 0.4em;"></span>
                     <div style="margin-top: 0.2em;">
                         Builds a link that reproduces the <b>current</b> input and
                         <i>all</i> the conversion options below (processor, constant
@@ -414,8 +377,8 @@ agraph (float[N] X) =&gt; (float[N] Y) {
                        style="width: 3.5em;"
                        title="How many parallel byte-range shards to read a Xet download in. XetBlob fetches serially, so this is what parallelizes the transfer; ~10 or fewer is usually best.">
                 <button id="hf-clear-cache" type="button">clear chunk cache</button>
-                <span id="hf-cache-size" style="color: #666; font-size: 0.85em; margin-left: 0.4em;"></span>
-                <div style="color: #666; font-size: 0.85em; margin-top: 0.2em;">
+                <span id="hf-cache-size" class="note" style="margin-left: 0.4em;"></span>
+                <div class="note" style="margin-top: 0.2em;">
                     Downloads via <code>@huggingface/hub</code>, reconstructing the
                     file from content-addressed chunks and caching them in
                     IndexedDB so repeated / overlapping loads reuse them. On by
@@ -443,7 +406,7 @@ agraph (float[N] X) =&gt; (float[N] Y) {
                 placeholder="…or a GitHub tree / raw URL to a test-case directory">
             <button id="backend-run" type="button">Run test case</button>
             <span id="backend-status"></span>
-            <div style="color: #666; font-size: 0.85em; margin-top: 0.25em;">
+            <div class="note" style="margin-top: 0.25em;">
                 Fetches <code>model.onnx</code> and the test data
                 (<code>test_data_set_N/</code> of <code>input_*.pb</code> /
                 <code>output_*.pb</code>) from GitHub, runs the model through
@@ -486,7 +449,7 @@ agraph (float[N] X) =&gt; (float[N] Y) {
             </label>
             <input type="radio" name="optimizer" value="inline" id="optimizer_inline">
             <label for="optimizer_inline" title="Inline the model's local (model-defined) functions into the main graph; schema-defined functions are left alone">Inline functions</label>
-            <span style="margin-left: 0.6em; color: #666;">| single pass (debug):</span>
+            <span class="note" style="margin-left: 0.6em;">| single pass (debug):</span>
             <input type="radio" name="optimizer" value="infer_shapes" id="optimizer_infer_shapes">
             <label for="optimizer_infer_shapes" title="Run ONNX shape inference once (not in the fixed point)">Shape inference</label>
             <input type="radio" name="optimizer" value="data_propagation" id="optimizer_data_propagation">
@@ -516,7 +479,7 @@ agraph (float[N] X) =&gt; (float[N] Y) {
             <input type="checkbox" name="annotate_model_info" id="id_annotate_model_info" checked>
             <label for="id_annotate_model_info">annotate model info — bake MACs/FLOPs into <code>metadata_props</code> (shown in "Run inference" below)</label>
             <br/>
-            <div id="pass-list" style="height: 300px; overflow-y: auto; border: 1px solid #ccc; padding: 4px; margin-top: 4px;"></div>
+            <div id="pass-list" style="height: 300px; overflow-y: auto; border: 1px solid var(--border); border-radius: var(--radius); padding: 4px; margin-top: 4px;"></div>
         </div>
         <h2>Visualize with Netron (before / after)</h2>
         <p>
@@ -570,7 +533,7 @@ agraph (float[N] X) =&gt; (float[N] Y) {
             browser (nothing is uploaded); symbolic axes are shown
             <span class="dp-param">highlighted</span>.
         </p>
-        <p style="color: #666; font-size: 0.9em;">
+        <p class="note">
             <b>Try it:</b>
             <a href="?model=https://huggingface.co/Xenova/all-MiniLM-L6-v2/resolve/main/onnx/model_quantized.onnx&amp;optimizer=simplify">load
             <code>Xenova/all-MiniLM-L6-v2</code></a>
@@ -703,7 +666,7 @@ agraph (float[N] X) =&gt; (float[N] Y) {
             <button id="run-inference">Run inference</button>
             <button id="download-inference-log-button" type="button">Download log</button>
         </div>
-        <div id="webnn-status" style="color: #666; font-size: 0.85em; margin-top: 0.3em;" title="">WebNN status: probing…</div>
+        <div id="webnn-status" class="note" style="margin-top: 0.3em;" title="">WebNN status: probing…</div>
         <textarea id="inference-output" readonly rows="12" style="width: 100%; box-sizing: border-box;"></textarea>
         <div id="inference-macs"></div>
         <p>

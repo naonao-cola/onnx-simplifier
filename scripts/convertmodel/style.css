@@ -1,0 +1,368 @@
+/* Styles for the onnxsim WebAssembly model-converter page (index.html).
+ *
+ * Previously the page had only a small inline <style> block for a few
+ * components and relied on the browser defaults for everything else (full-width
+ * body, hardcoded #666 / #ccc / #a00 colors scattered inline). This file gives
+ * the page a single, cohesive look: a readable centered column, consistent
+ * typography and spacing, uniformly styled form controls with visible focus
+ * rings, and — via CSS custom properties — a light and dark theme that follows
+ * the OS setting. Every color is a token so the two themes stay in sync.
+ *
+ * Only presentation lives here; the page's element ids/classes and all its
+ * JavaScript behavior are unchanged.
+ */
+
+/* --- design tokens -------------------------------------------------------- */
+:root {
+  color-scheme: light dark;
+
+  --bg: #ffffff;
+  --fg: #1f2328;
+  --muted: #656d76;
+  --border: #d0d7de;
+  --panel-bg: #f6f8fa;
+  --field-bg: #ffffff;
+  --code-bg: rgba(175, 184, 193, 0.2);
+  --link: #0969da;
+  --accent: #4a6cf7;
+  --accent-soft: #f4f7ff;
+  --ok: #0a7d24;
+  --bad: #a00000;
+  --warn: #a06000;
+  --param: #b5006b;
+
+  --radius: 6px;
+  --gap: 0.6em;
+  --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas,
+    "Liberation Mono", monospace;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #0d1117;
+    --fg: #e6edf3;
+    --muted: #9198a1;
+    --border: #30363d;
+    --panel-bg: #161b22;
+    --field-bg: #0d1117;
+    --code-bg: rgba(110, 118, 129, 0.4);
+    --link: #4493f8;
+    --accent: #6b8afd;
+    --accent-soft: #12203f;
+    --ok: #3fb950;
+    --bad: #ff7b72;
+    --warn: #d29922;
+    --param: #f778ba;
+  }
+}
+
+/* --- base ----------------------------------------------------------------- */
+body {
+  max-width: 62rem;
+  margin: 0 auto;
+  padding: 1.5rem 1.25rem 4rem;
+  font-family: system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial,
+    sans-serif;
+  font-size: 15px;
+  line-height: 1.55;
+  color: var(--fg);
+  background: var(--bg);
+}
+
+h1 {
+  font-size: 1.7rem;
+  margin: 0 0 0.6rem;
+}
+
+h2 {
+  font-size: 1.25rem;
+  margin: 2.2rem 0 0.6rem;
+  padding-bottom: 0.3rem;
+  border-bottom: 1px solid var(--border);
+}
+
+h3 {
+  font-size: 1.05rem;
+  margin: 0 0 0.4em;
+}
+
+p {
+  margin: 0.5rem 0;
+}
+
+a {
+  color: var(--link);
+  text-decoration: none;
+}
+a:hover {
+  text-decoration: underline;
+}
+
+code {
+  background: var(--code-bg);
+  padding: 0.12em 0.35em;
+  border-radius: 4px;
+  font-family: var(--mono);
+  font-size: 0.9em;
+}
+
+/* Muted helper text — the many inline `color:#666; font-size:.85em` notes now
+   use this class so they follow the theme. */
+.note {
+  color: var(--muted);
+  font-size: 0.85em;
+}
+
+/* Success text (e.g. the "copied!" share-link confirmation). */
+.ok {
+  color: var(--ok);
+}
+
+/* --- form controls -------------------------------------------------------- */
+input,
+select,
+textarea,
+button {
+  font: inherit;
+  color: var(--fg);
+}
+
+input[type="text"],
+input[type="number"],
+select,
+textarea {
+  background: var(--field-bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 0.3em 0.5em;
+}
+
+textarea {
+  color: var(--fg);
+}
+
+input[type="file"] {
+  max-width: 100%;
+}
+
+button {
+  background: var(--panel-bg);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 0.35em 0.85em;
+  cursor: pointer;
+}
+button:hover:not(:disabled) {
+  border-color: var(--accent);
+}
+button:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+/* A clear keyboard focus ring on every interactive control. */
+a:focus-visible,
+input:focus-visible,
+select:focus-visible,
+textarea:focus-visible,
+button:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+/* --- versions panel ------------------------------------------------------- */
+#versions-panel {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5em;
+  margin: 0.4em 0 0.8em;
+}
+.version-badge {
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 0.15em 0.7em;
+  font-size: 0.85em;
+  display: inline-flex;
+  gap: 0.4em;
+  align-items: baseline;
+}
+.version-k {
+  color: var(--muted);
+}
+.version-v {
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+
+/* --- "parse a text graph" / debug tool panel ------------------------------ */
+.tool-panel {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 0.6em 0.8em;
+  margin: 0.8em 0;
+  background: var(--panel-bg);
+}
+.tool-panel h3 {
+  margin: 0 0 0.4em;
+}
+.tool-note {
+  color: var(--muted);
+  font-size: 0.85em;
+  margin: 0.3em 0;
+}
+.debug-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5em;
+  align-items: center;
+  margin: 0.4em 0;
+}
+
+/* --- Netron before/after panes ------------------------------------------- */
+.netron-pane {
+  flex: 1 1 380px;
+  min-width: 300px;
+}
+.netron-head {
+  margin-bottom: 0.35em;
+}
+.netron-note {
+  color: var(--bad);
+  font-size: 0.9em;
+  margin-top: 0.35em;
+}
+/* `resize: vertical` needs a non-visible overflow to expose the drag handle;
+   the min/max keep the pane usable. */
+.netron-frame {
+  width: 100%;
+  height: 480px;
+  min-height: 200px;
+  max-height: 90vh;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  resize: vertical;
+  overflow: auto;
+  background: var(--field-bg);
+}
+
+/* --- MACs / FLOPs cards and table ---------------------------------------- */
+.macs-cards {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.6em;
+  margin: 0.6em 0;
+}
+.macs-card {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 0.5em 0.7em;
+  min-width: 8em;
+  background: var(--panel-bg);
+}
+.macs-k {
+  color: var(--muted);
+  font-size: 0.75em;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+.macs-v {
+  font-size: 1.2em;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+.macs-v small {
+  font-size: 0.65em;
+  color: var(--muted);
+  font-weight: 400;
+}
+.macs-table {
+  border-collapse: collapse;
+  margin-top: 0.4em;
+  font-variant-numeric: tabular-nums;
+}
+.macs-table th,
+.macs-table td {
+  border-bottom: 1px solid var(--border);
+  padding: 3px 10px;
+  text-align: right;
+}
+.macs-table th:first-child,
+.macs-table td:first-child {
+  text-align: left;
+}
+.macs-note {
+  color: var(--muted);
+  font-size: 0.85em;
+  margin-top: 0.4em;
+}
+
+/* --- dynamic dimensions (dim_param) panel -------------------------------- */
+.dp-panes {
+  display: flex;
+  gap: 1em;
+  flex-wrap: wrap;
+}
+.dp-pane {
+  flex: 1 1 320px;
+  min-width: 280px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 0.5em 0.7em;
+  background: var(--panel-bg);
+}
+.dp-head {
+  font-weight: 600;
+  margin-bottom: 0.35em;
+}
+.dp-names {
+  margin-bottom: 0.4em;
+}
+.dp-diff {
+  margin: 0 0 0.5em;
+  padding: 0.35em 0.6em;
+  background: var(--accent-soft);
+  border-left: 3px solid var(--accent);
+  border-radius: 3px;
+}
+.dp-table {
+  border-collapse: collapse;
+  width: 100%;
+  font-variant-numeric: tabular-nums;
+}
+.dp-table th,
+.dp-table td {
+  border-bottom: 1px solid var(--border);
+  padding: 3px 8px;
+  text-align: left;
+}
+.dp-param {
+  color: var(--param);
+  font-weight: 600;
+}
+.dp-dim {
+  color: var(--fg);
+}
+
+/* --- before/after inference comparison summary --------------------------- */
+.cmp-table th {
+  text-align: left;
+  color: var(--muted);
+  font-weight: 600;
+  white-space: nowrap;
+}
+.cmp-table td {
+  text-align: left;
+}
+.cmp-ok {
+  color: var(--ok);
+  font-weight: 600;
+}
+.cmp-bad {
+  color: var(--bad);
+  font-weight: 600;
+}
+.cmp-warn {
+  color: var(--warn);
+  font-weight: 600;
+}
