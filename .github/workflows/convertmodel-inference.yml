@@ -56,6 +56,9 @@ jobs:
       - name: Run CDN source-of-truth unit test
         working-directory: scripts/convertmodel
         run: npm run test:cdn
+      - name: Run input-fill helper unit test
+        working-directory: scripts/convertmodel
+        run: npm run test:fill
       - name: Run inference smoke test (wasm EP)
         working-directory: scripts/convertmodel
         run: npm run test:inference
