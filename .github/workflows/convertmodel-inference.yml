@@ -53,6 +53,9 @@ jobs:
       - name: Run query-parameter unit test
         working-directory: scripts/convertmodel
         run: npm run test:query
+      - name: Run CDN source-of-truth unit test
+        working-directory: scripts/convertmodel
+        run: npm run test:cdn
       - name: Run inference smoke test (wasm EP)
         working-directory: scripts/convertmodel
         run: npm run test:inference

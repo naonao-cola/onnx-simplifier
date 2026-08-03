@@ -21,9 +21,8 @@
 // (ui.perfetto.dev/#!/?mode=embedded) and against the full UI opened in a new
 // tab (window.open on ui.perfetto.dev).
 
-const PERFETTO_ORIGIN = "https://ui.perfetto.dev";
-// `mode=embedded` hides Perfetto's sidebar for a clean in-page view.
-const PERFETTO_EMBED_SRC = "https://ui.perfetto.dev/#!/?mode=embedded";
+import { PERFETTO_ORIGIN, PERFETTO_EMBED_SRC } from "./cdn.mjs";
+
 const ROW_H = 18; // px per stacked span row
 const TRACK_PAD = 6; // px above each track label
 const LABEL_H = 16; // px for a track's name row
