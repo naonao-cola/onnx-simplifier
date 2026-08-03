@@ -167,6 +167,13 @@ a {
 a:hover {
   text-decoration: underline;
 }
+/* Links that open a new tab (external sites) get a trailing outward arrow.
+   The NBSP keeps the arrow from wrapping onto a line by itself. The in-page
+   section-nav links (same-document #hashes, no target) are unaffected. */
+a[target="_blank"]::after {
+  content: "\00A0↗";
+  font-size: 0.85em;
+}
 
 code {
   background: var(--code-bg);
@@ -232,6 +239,20 @@ textarea {
 
 input[type="file"] {
   max-width: 100%;
+}
+/* Give the native "Choose File" button the same look as the other buttons. */
+input[type="file"]::file-selector-button {
+  font: inherit;
+  margin-right: 0.6em;
+  background: var(--panel-bg);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 0.35em 0.85em;
+  cursor: pointer;
+}
+input[type="file"]:not(:disabled)::file-selector-button:hover {
+  border-color: var(--accent);
 }
 
 /* Read-only console / output panes read better as monospace, a touch smaller

@@ -231,7 +231,7 @@ export function renderTrace(container, trace, opts = {}) {
   // Toolbar.
   const bar = document.createElement("div");
   bar.style.margin = "6px 0";
-  const dlBtn = makeButton("Download JSON");
+  const dlBtn = makeButton("Download JSON ↓");
   const pfBtn = makeButton("Embed in Perfetto");
   const pfTabBtn = makeButton("open in a new tab ↗");
   dlBtn.addEventListener("click", () => download(trace, filename));
