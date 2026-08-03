@@ -38,7 +38,11 @@ in `test/webnn.test.mjs`):
 - **`detectWebnn(navigator)`** probes `navigator.ml` at page load, attempting to
   create an `MLContext` for each device type (`gpu`, `npu`, `cpu`). The panel
   renders the result as a live **WebNN status** line under the inference
-  controls, so a visitor can see whether WebNN will run before selecting it.
+  controls, so a visitor can see whether WebNN will run before selecting it. When
+  a device type can't be created, the underlying WebNN error is **logged to the
+  browser console** (and captured in the report so the status line's tooltip
+  shows the reason), so a failure the one-line status can only summarize is
+  debuggable in DevTools.
 - **`providersForEp(value)`** maps each EP dropdown choice to an ordered
   onnxruntime-web provider list. The WebNN choices are:
 
@@ -52,6 +56,21 @@ in `test/webnn.test.mjs`):
   transparently falls back to WebAssembly when the WebNN context — or a
   particular operator — is unsupported. `inference_core.mjs` reports which
   provider actually won (e.g. `webnn:gpu` or the `wasm` fallback).
+
+- **`captureOrtDiagnostics(...)`** (in `ort_log_capture.mjs`, unit-tested in
+  `test/ort_log_capture.test.mjs`) mirrors onnxruntime-web's *own* diagnostics
+  into the panel's on-page log while a run is active. Some ORT messages never
+  reach the panel's `try/catch`, so before this they were visible only in the
+  browser devtools console: EP-assignment notes
+  (`VerifyEachNodeIsAssignedToAnEp …`) are printed straight to
+  `console.warn`/`console.error` from the wasm module, and WebNN backend
+  failures (e.g. `WebNN backend does not support data type: int64`) are thrown
+  on an internal ORT promise that isn't chained to the awaited `session.run()`,
+  so they surface as an *uncaught* promise rejection. The helper wraps
+  `console.warn`/`console.error` and listens for `unhandledrejection` for the
+  duration of the run, forwarding the `onnxruntime`/`webnn` ones to the log
+  (devtools output is preserved). This is why WebNN falls back to `wasm` silently
+  yet the reason now shows up in the panel too.
 
 - The WebNN provider lives only in the "all" onnxruntime-web bundle, so the
   panel loads `ort.all.min.mjs` on demand the first time a WebNN EP is selected,

@@ -228,6 +228,24 @@ all exercised without a real browser. No DOM or network:
 npm run test:webnn
 ```
 
+## ORT diagnostic mirroring
+
+`npm run test:ortlog` unit-tests `ort_log_capture.mjs`, which mirrors
+onnxruntime-web's own diagnostics into the inference panel's on-page log while a
+run is active. Some ORT messages bypass the panel's `try/catch` and so used to
+show up only in the browser devtools console — EP-assignment notes
+(`VerifyEachNodeIsAssignedToAnEp …`, printed to `console.warn`/`console.error`
+from the wasm module) and WebNN backend failures (e.g. `WebNN backend does not
+support data type: int64`, thrown as an *uncaught* promise rejection on an
+internal ORT promise). The helper wraps `console.warn`/`console.error` and
+listens for `unhandledrejection`, forwarding the `onnxruntime`/`webnn` ones to
+the log while preserving the devtools output. Its console/event-target are
+injected, so the test drives the whole thing under Node with no browser:
+
+```bash
+npm run test:ortlog
+```
+
 ## Profiling traces
 
 Both the browser panels can emit a [Chrome Trace Event][cte] JSON that the page
