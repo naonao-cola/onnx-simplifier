@@ -35,6 +35,8 @@
   --gap: 0.6em;
   --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas,
     "Liberation Mono", monospace;
+  /* Width for content that breaks out of the reading column (see .wide). */
+  --wide: min(96vw, 1600px);
 }
 
 @media (prefers-color-scheme: dark) {
@@ -74,6 +76,18 @@ body {
   color: var(--fg);
   background: var(--bg);
   overflow-wrap: break-word;
+}
+
+/* Break out of the centered reading column to use more of the viewport, for
+   wide content the 62rem column makes needlessly small (the Netron graph
+   panes and the console log). The negative side margins are symmetric, so the
+   block stays centered; on narrow viewports --wide is < the column width and
+   this is a no-op. max-width:none defeats the 100% cap the form-control rules
+   put on the <textarea>. */
+.wide {
+  width: var(--wide);
+  max-width: none;
+  margin-inline: calc(50% - var(--wide) / 2);
 }
 
 h1 {
