@@ -1132,6 +1132,17 @@ def main():
         action="store_true",
     )
     parser.add_argument(
+        "--emit-mlir",
+        nargs="?",
+        const="",
+        default=None,
+        metavar="PATH",
+        help="Also emit the simplified model as Torch-dialect MLIR using torch-mlir "
+        "(pip install torch-mlir). Optionally give an output path; when the flag is "
+        "passed without one, the MLIR is written next to the output model with a "
+        "'.mlir' extension.",
+    )
+    parser.add_argument(
         "-v", "--version", action="version", version="onnxsim " + version.version
     )
 
@@ -1348,6 +1359,21 @@ def main():
             all_tensors_to_one_file=True,
             location=external_data_path,
         )
+
+    if args.emit_mlir is not None:
+        from onnxsim import mlir_export
+
+        if args.emit_mlir:
+            mlir_path = args.emit_mlir
+        else:
+            mlir_path = os.path.splitext(args.output_model)[0] + ".mlir"
+        print(f"Emitting Torch-dialect MLIR to {mlir_path} ...")
+        try:
+            mlir_export.export_mlir(model_opt, mlir_path)
+        except RuntimeError as e:
+            print(Text(str(e), style="bold red"))
+            sys.exit(1)
+        print(f"MLIR written to {mlir_path}")
 
     if check_ok:
         print("Finish! Here is the difference:")

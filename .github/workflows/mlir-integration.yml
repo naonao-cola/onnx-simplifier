@@ -1,0 +1,95 @@
+name: MLIR Integration
+
+# End-to-end tests that emit Torch-dialect MLIR from onnxsim's output using
+# torch-mlir's pure-Python ONNX importer (tests/test_mlir_export.py, exercising
+# onnxsim/mlir_export.py and the --emit-mlir CLI flag).
+#
+# torch-mlir ships large prebuilt wheels tied to specific LLVM/PyTorch versions
+# and is not part of onnxsim's test requirements, so this runs in its own
+# workflow instead of the build-and-test matrix -- the same arrangement as the
+# ModelOpt integration. Runs on PRs that touch the MLIR export path or this
+# harness, on a weekly schedule to catch new torch-mlir releases, and on demand.
+
+on:
+  schedule:
+    - cron: "0 8 * * 1" # Weekly, Monday 08:00 UTC
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "onnxsim/mlir_export.py"
+      - "tests/test_mlir_export.py"
+      - ".github/workflows/mlir-integration.yml"
+      - "onnxsim/__init__.py"
+      - "onnxsim/onnx_simplifier.py"
+
+concurrency:
+  group: mlir-integration-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  # Build onnxsim once from the current tree, exactly like the model-regression
+  # and modelopt-integration workflows, and hand the wheel to the test job so it
+  # exercises this branch's code rather than a PyPI release.
+  build:
+    name: Build onnxsim wheel
+    runs-on: ubuntu-24.04
+    env:
+      SCCACHE_GHA_ENABLED: "on"
+      ACTIONS_CACHE_SERVICE_V2: "on"
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+          fetch-depth: 0
+      - uses: mozilla-actions/sccache-action@v0.0.11
+      - name: Build cp311 wheel
+        uses: pypa/cibuildwheel@v4.1.1
+        env:
+          CIBW_BUILD: "cp311-manylinux_x86_64"
+          CIBW_ARCHS: native
+          CIBW_BUILD_FRONTEND: "pip; args: --no-build-isolation"
+          CIBW_MANYLINUX_X86_64_IMAGE: manylinux_2_28
+          CIBW_ENVIRONMENT_PASS_LINUX: CI SCCACHE_GHA_ENABLED ACTIONS_RESULTS_URL ACTIONS_RUNTIME_TOKEN ACTIONS_CACHE_SERVICE_V2
+          CIBW_BEFORE_BUILD: "python3 -m pip install --break-system-packages cmake ninja setuptools sccache"
+          CIBW_ENVIRONMENT: CMAKE_ARGS="-DONNX_USE_PROTOBUF_SHARED_LIBS=OFF" CMAKE_GENERATOR=Ninja CMAKE_CXX_COMPILER_LAUNCHER=sccache CMAKE_LINKER_TYPE=LLD
+          CIBW_REPAIR_WHEEL_COMMAND_LINUX: "auditwheel repair -w {dest_dir} {wheel} --strip"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: onnxsim-wheel
+          path: ./wheelhouse/*.whl
+
+  test:
+    name: Emit MLIR with torch-mlir
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+      - uses: actions/download-artifact@v8
+        with:
+          name: onnxsim-wheel
+          path: wheelhouse
+      - name: Install onnxsim wheel + torch-mlir
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pytest
+          # torch-mlir's nightly wheels live on its own release index; pin the
+          # CPU PyTorch build it depends on from the PyTorch nightly index.
+          python -m pip install --pre torch-mlir \
+            --extra-index-url https://download.pytorch.org/whl/nightly/cpu \
+            -f https://github.com/llvm/torch-mlir-release/releases/expanded_assets/dev-wheels
+          python -m pip install wheelhouse/*.whl
+      - name: Verify the installed wheel is used (not the source tree)
+        working-directory: ${{ runner.temp }}
+        run: python -c "import onnxsim, onnxsim.onnxsim_cpp2py_export as m; print(onnxsim.__version__, m.__file__)"
+      # Run from a neutral directory so the repo root's ./onnxsim source package
+      # (without the compiled extension) does not shadow the installed wheel.
+      - name: Run MLIR integration tests
+        working-directory: ${{ runner.temp }}
+        run: pytest -v "$GITHUB_WORKSPACE/tests/test_mlir_export.py"
