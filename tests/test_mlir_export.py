@@ -102,5 +102,6 @@ def test_convert_matches_export():
 
 
 def test_unsupported_target_rejected():
+    # "torch" and "onnx" are supported; anything else is rejected up front.
     with pytest.raises(ValueError, match="Unsupported MLIR target"):
-        onnxsim.export_mlir(_relu_model(), target="onnx")
+        onnxsim.export_mlir(_relu_model(), target="stablehlo")

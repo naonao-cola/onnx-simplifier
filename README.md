@@ -82,10 +82,11 @@ constant folding until the model stops changing. Around that it offers:
   rules that also run from the C and Rust bindings.
 - **Subgraph simplification.** Simplify `If`/`Loop`/`Scan` subgraph bodies too
   with `--include-subgraph`.
-- **[MLIR export](#exporting-to-mlir-torch-mlir).** Hand the simplified model to
-  [torch-mlir](https://github.com/llvm/torch-mlir) and emit Torch-dialect MLIR
-  with `--emit-mlir` (Python: `onnxsim.export_mlir`) — a bridge into MLIR-based
-  compiler stacks (torch-mlir, IREE). torch-mlir is an optional dependency.
+- **[MLIR export](#exporting-to-mlir-torch-mlir--onnx-mlir).** Hand the simplified
+  model to [torch-mlir](https://github.com/llvm/torch-mlir) (Torch dialect) or
+  [onnx-mlir](https://github.com/onnx/onnx-mlir) (ONNX dialect) with `--emit-mlir`
+  (Python: `onnxsim.export_mlir`) — a bridge into MLIR-based compiler stacks
+  (torch-mlir, IREE, onnx-mlir). Both backends are optional.
 - **Large-model handling.** Guard against blow-up from ops like `Tile`/
   `ConstantOfShape` (`--no-large-tensor`), read and write external-data models,
   and eliminate unused outputs (`--unused-output`).
@@ -221,20 +222,30 @@ the standalone `onnxsim` binary (`--target-opset`), and the
 [web version](https://onnxsim.github.io/onnxsim/) (the "target opset version"
 field).
 
-## Exporting to MLIR (torch-mlir)
+## Exporting to MLIR (torch-mlir / onnx-mlir)
 
 Downstream compiler stacks built on [MLIR](https://mlir.llvm.org/) —
-[torch-mlir](https://github.com/llvm/torch-mlir) and, on top of it,
-[IREE](https://iree.dev/) — consume models as MLIR rather than as an ONNX
-`ModelProto`. onnxsim can bridge the gap: after simplifying, it hands the model
-to torch-mlir's pure-Python ONNX importer and emits **Torch-dialect** MLIR.
+[torch-mlir](https://github.com/llvm/torch-mlir),
+[IREE](https://iree.dev/) on top of it, and
+[onnx-mlir](https://github.com/onnx/onnx-mlir) — consume models as MLIR rather
+than as an ONNX `ModelProto`. onnxsim can bridge the gap: after simplifying, it
+emits the model as MLIR in one of two dialects, chosen with `--mlir-target`
+(Python: the `target` argument):
+
+- **`torch`** (default) — **Torch-dialect** MLIR via torch-mlir's pure-Python
+  ONNX importer.
+- **`onnx`** — **ONNX-dialect** MLIR via the onnx-mlir compiler binary.
 
 Simplifying first is the point — constant folding and the optimizer passes
 collapse the shape-manipulation subgraphs the importer would otherwise translate
 op by op, so the emitted MLIR is smaller and closer to what the compiler needs.
 
-torch-mlir is an **optional** dependency (just like onnxruntime for constant
-folding). Install it to use this feature:
+Both backends are **optional** (just like onnxruntime for constant folding):
+neither is imported/located unless you actually emit MLIR.
+
+### torch-mlir (Torch dialect)
+
+Install torch-mlir:
 
 ```
 pip install torch-mlir
@@ -270,11 +281,36 @@ mlir_text = onnxsim.export_mlir(model_simp)
 onnxsim.export_mlir(model_simp, "model.mlir")
 ```
 
-`export_mlir` accepts a few keyword arguments — `opset_version` to run ONNX's
-version converter before importing (torch-mlir targets recent opsets),
-`verify=False` to skip MLIR verification when inspecting malformed output, and a
-forward-looking `target` argument (only `"torch"` is supported today). See
-`onnxsim/mlir_export.py` for the full signature.
+### onnx-mlir (ONNX dialect)
+
+onnx-mlir has no pip-installable importer, so this backend shells out to the
+`onnx-mlir` compiler binary (`--EmitONNXIR`). Build or install it from
+<https://github.com/onnx/onnx-mlir>, then make it discoverable — put `onnx-mlir`
+on your `PATH`, set `ONNX_MLIR_HOME` to its install prefix (the binary is
+expected at `$ONNX_MLIR_HOME/bin/onnx-mlir`), set `ONNX_MLIR` to the binary
+path, or pass the path explicitly.
+
+```
+# locate onnx-mlir via PATH / ONNX_MLIR_HOME / ONNX_MLIR
+onnxsim input.onnx simplified.onnx --emit-mlir --mlir-target onnx
+
+# or point at the binary directly
+onnxsim input.onnx simplified.onnx --emit-mlir model.mlir \
+  --mlir-target onnx --onnx-mlir /path/to/onnx-mlir
+```
+
+```python
+mlir_text = onnxsim.export_mlir(model_simp, target="onnx")
+# with an explicit binary path:
+onnxsim.export_mlir(model_simp, "model.mlir", target="onnx",
+                    onnx_mlir="/path/to/onnx-mlir")
+```
+
+`export_mlir` accepts a few keyword arguments, forwarded to the selected backend
+— e.g. `opset_version` to run ONNX's version converter first (both targets
+prefer recent opsets), `verify=False` (torch) to skip MLIR verification, and
+`emit` / `extra_args` (onnx) to change the onnx-mlir emit flag or pass extra
+compiler options. See `onnxsim/mlir_export.py` for the full signatures.
 
 ## Constant folding on the GPU (CUDA execution provider)
 

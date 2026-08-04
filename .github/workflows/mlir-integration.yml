@@ -9,6 +9,11 @@ name: MLIR Integration
 # workflow instead of the build-and-test matrix -- the same arrangement as the
 # ModelOpt integration. Runs on PRs that touch the MLIR export path or this
 # harness, on a weekly schedule to catch new torch-mlir releases, and on demand.
+#
+# The onnx-mlir backend (--mlir-target onnx) has no pip-installable importer, so
+# its shell-out plumbing is covered in the ordinary build-and-test matrix using a
+# fake onnx-mlir binary (tests/test_onnx_mlir_export.py); the real end-to-end
+# path there is skipped unless an onnx-mlir binary is on PATH.
 
 on:
   schedule:
@@ -18,6 +23,7 @@ on:
     paths:
       - "onnxsim/mlir_export.py"
       - "tests/test_mlir_export.py"
+      - "tests/test_onnx_mlir_export.py"
       - ".github/workflows/mlir-integration.yml"
       - "onnxsim/__init__.py"
       - "onnxsim/onnx_simplifier.py"
