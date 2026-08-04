@@ -74,9 +74,11 @@ jobs:
 
   # Emit the shard index list so the shard count is configurable from
   # workflow_dispatch while defaulting to 6.
+  # One `python3 -c` line emitting the shard list -- no checkout, nothing built.
+  # ubuntu-slim's preinstalled Python is all this needs.
   setup:
     name: Plan shards
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-slim
     outputs:
       shards: ${{ steps.plan.outputs.shards }}
       num_shards: ${{ steps.plan.outputs.num_shards }}
