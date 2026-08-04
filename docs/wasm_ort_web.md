@@ -105,9 +105,10 @@ byte-for-byte the old behavior.
 
 - The deployed convertmodel demo IS the ORT-web variant:
   `.github/workflows/static.yml` builds with `ORT_WEB=ON` and ships the module to
-  GitHub Pages (production) and to the per-PR Cloudflare preview. Open that page,
-  convert a model with constant folding enabled, and the folding runs through the
-  page's onnxruntime-web.
+  GitHub Pages (production). Open that page, convert a model with constant folding
+  enabled, and the folding runs through the page's onnxruntime-web. To get the same
+  page built from a pull request, comment `/preview` on it — the workflow then
+  deploys that PR's head to Cloudflare Pages and replies with the URL.
 - Manual/local: build with `ORT_WEB=ON`, serve `scripts/convertmodel/`, convert a
   model with constant folding enabled, and confirm the output matches the
   built-in-ORT build for the same model.
