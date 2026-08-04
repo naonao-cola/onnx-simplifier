@@ -65,9 +65,11 @@ jobs:
           name: onnxsim-wheel-cp311
           path: ./wheelhouse/*.whl
 
+  # One `python3 -c` line emitting the shard list -- no checkout, nothing built.
+  # ubuntu-slim's preinstalled Python is all this needs.
   setup:
     name: Plan shards
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-slim
     outputs:
       shards: ${{ steps.plan.outputs.shards }}
       num_shards: ${{ steps.plan.outputs.num_shards }}
