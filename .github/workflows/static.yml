@@ -142,7 +142,7 @@ jobs:
       # it from the converter's own origin at ./netron/, so the page can post
       # models straight into it — no upload, no URL-length limit.
       - name: Setup Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: "22"
       - name: Build and embed Netron
