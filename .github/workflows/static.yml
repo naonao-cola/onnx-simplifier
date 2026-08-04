@@ -1,6 +1,11 @@
 # Builds the WASM convertmodel demo once, then:
 #   - on push to master/pages: deploys it to GitHub Pages (production)
-#   - on pull_request:          deploys a per-PR preview to Cloudflare Pages
+#   - on a `/preview` PR comment: deploys a per-PR preview to Cloudflare Pages
+#
+# The preview is on demand rather than automatic: the build (emscripten + a full
+# Netron web build) is expensive, and most PRs never need a hosted demo. Comment
+# `/preview` on a pull request and this workflow builds that PR's head and
+# deploys it, replying with the URL.
 #
 # The demo is built as the ORT-web variant (ONNXSIM_WASM_ORT_WEB=ON): onnxsim's
 # WebAssembly module links no ONNX Runtime and delegates constant folding to the
@@ -26,37 +31,47 @@ on:
       - "scripts/regression/models.json"
       - ".gitmodules"
 
-  pull_request:
-    paths:
-      - ".github/workflows/static.yml"
-      - "build_wasm.sh"
-      - "CMakeLists.txt"
-      - "cmake/**"
-      - "onnxsim/**"
-      - "scripts/convertmodel/**"
-      - "scripts/regression/models.json"
-      - ".gitmodules"
+  # Per-PR Cloudflare previews are opt-in: comment `/preview` on the pull
+  # request. `issue_comment` has no path filter, which is fine — the whole point
+  # is that a human asked for this build.
+  issue_comment:
+    types: [created]
 
   # Allows you to run this workflow manually from the Actions tab
   workflow_dispatch:
 
-# Sets permissions of the GITHUB_TOKEN to allow deployment to GitHub Pages
-# and to post the Cloudflare preview URL as a PR comment.
+# Sets permissions of the GITHUB_TOKEN to allow deployment to GitHub Pages, and
+# to react to the `/preview` comment and post the Cloudflare preview URL back on
+# the PR (PR conversation comments go through the issues API).
 permissions:
   contents: read
   pages: write
   id-token: write
   pull-requests: write
+  issues: write
 
 # Allow only one concurrent deployment, skipping runs queued between the run in-progress and latest queued.
 # However, do NOT cancel in-progress runs as we want to allow these production deployments to complete.
+# `/preview` runs are keyed by PR number: an `issue_comment` run reports
+# github.ref as the default branch, so without this a preview would share a
+# group with — and cancel — the production Pages deployment.
 concurrency:
-  group: "pages-${{ github.ref }}"
+  group: "pages-${{ github.event.issue.number || github.ref }}"
   cancel-in-progress: true
 
 jobs:
   # Single deploy job since we're just deploying
   deploy:
+    # For comments: only `/preview` on a pull request, and only from someone
+    # with write access. That last check matters — an `issue_comment` run
+    # executes with the repo's secrets, and the preview builds the PR head
+    # (possibly from a fork), so a maintainer has to ask for it.
+    if: >-
+      github.event_name != 'issue_comment' || (
+        github.event.issue.pull_request != null &&
+        startsWith(github.event.comment.body, '/preview') &&
+        contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association)
+      )
     environment:
       name: ${{ case(github.event_name == 'push', 'github-pages', '') }}
       url: ${{ steps.deployment.outputs.page_url }}
@@ -65,14 +80,38 @@ jobs:
       CMAKE_GENERATOR: Ninja
       EMSCRIPTEN_VERSION: "5.0.0"
       # Surfaced so the Cloudflare preview steps can gate on the secret being
-      # present. It is empty for fork PRs and for Dependabot PRs (GitHub does
-      # not share repo secrets with either), so the steps below skip instead of
-      # failing wrangler with "CLOUDFLARE_API_TOKEN is necessary".
+      # present. `issue_comment` runs always get the repo's secrets (they run in
+      # the base repo's context, not the PR's), so this is only empty in a fork
+      # of this repo that has not configured its own Cloudflare credentials.
       CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
     steps:
+      # An `issue_comment` payload carries no head ref, so ask the API which
+      # commit the PR currently points at and build exactly that. The 👀
+      # reaction is the "your build started" ack, since the run itself is not
+      # attached to the PR's checks.
+      - name: Resolve the PR the comment is on
+        id: pr
+        if: ${{ github.event_name == 'issue_comment' }}
+        uses: actions/github-script@v9
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const { data: pr } = await github.rest.pulls.get({
+              owner, repo, pull_number: context.issue.number,
+            });
+            core.setOutput('head_repo', pr.head.repo.full_name);
+            core.setOutput('head_ref', pr.head.ref);
+            core.setOutput('head_sha', pr.head.sha);
+            await github.rest.reactions.createForIssueComment({
+              owner, repo, comment_id: context.payload.comment.id, content: 'eyes',
+            });
       - name: Checkout
         uses: actions/checkout@v7
         with:
+          # Empty for push/workflow_dispatch, which keeps checkout's default
+          # (the ref that triggered the run).
+          repository: ${{ steps.pr.outputs.head_repo }}
+          ref: ${{ steps.pr.outputs.head_sha }}
           submodules: recursive
       - name: Setup Pages
         if: ${{ github.event_name == 'push' }}
@@ -170,14 +209,13 @@ jobs:
         uses: actions/deploy-pages@v5
         if: ${{ github.event_name == 'push' }}
 
-      # --- Preview: Cloudflare Pages (pull requests only) ---
-      # Repo secrets are not shared with fork PRs or Dependabot PRs, so
-      # CLOUDFLARE_API_TOKEN is empty there. Gate on it being set so those runs
-      # skip the deploy instead of failing wrangler. Same-repo branches (which
-      # do get the secret) still produce previews.
+      # --- Preview: Cloudflare Pages (`/preview` comment only) ---
+      # A fork of this repo will not have CLOUDFLARE_API_TOKEN configured, so
+      # gate on it being set: those runs skip the deploy instead of failing
+      # wrangler with "CLOUDFLARE_API_TOKEN is necessary".
       - name: Deploy preview to Cloudflare Pages
         id: cf_deploy
-        if: ${{ github.event_name == 'pull_request' && env.CLOUDFLARE_API_TOKEN != '' }}
+        if: ${{ github.event_name == 'issue_comment' && env.CLOUDFLARE_API_TOKEN != '' }}
         uses: cloudflare/wrangler-action@v4
         with:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
@@ -187,14 +225,15 @@ jobs:
           command: >-
             pages deploy scripts/convertmodel
             --project-name=onnxsim
-            --branch=${{ github.head_ref }}
+            --branch=${{ steps.pr.outputs.head_ref }}
       - name: Comment preview URL on the PR
-        if: ${{ github.event_name == 'pull_request' && env.CLOUDFLARE_API_TOKEN != '' }}
+        if: ${{ github.event_name == 'issue_comment' && env.CLOUDFLARE_API_TOKEN != '' }}
         uses: actions/github-script@v9
         with:
           script: |
             const url = ${{ toJSON(steps.cf_deploy.outputs.deployment-url) }};
             const alias = ${{ toJSON(steps.cf_deploy.outputs.pages-deployment-alias-url) }};
+            const sha = ${{ toJSON(steps.pr.outputs.head_sha) }};
             const marker = '<!-- cloudflare-pages-preview -->';
             const body = [
               marker,
@@ -205,7 +244,7 @@ jobs:
               `| **This build** | ${url} |`,
               alias ? `| **Branch alias** | ${alias} |` : '',
               '',
-              `_Preview of ${context.payload.pull_request.head.sha.slice(0, 7)} — updates on every push to this PR._`,
+              `_Preview of ${sha.slice(0, 7)} — comment \`/preview\` again to rebuild._`,
             ].filter(Boolean).join('\n');
             const { owner, repo } = context.repo;
             const issue_number = context.issue.number;
