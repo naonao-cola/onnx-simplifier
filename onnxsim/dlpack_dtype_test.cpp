@@ -99,7 +99,8 @@ int main() {
     // 1-byte elements are never touched.
     std::vector<uint8_t> one = {1, 2, 3};
     SwapElementBytes(one.data(), one.size(), 1);
-    Check(one == std::vector<uint8_t>({1, 2, 3}), "swap elem_size=1 is a no-op");
+    Check(one == std::vector<uint8_t>({1, 2, 3}),
+          "swap elem_size=1 is a no-op");
 
     std::vector<uint8_t> two = {0x01, 0x02, 0x03, 0x04};
     SwapElementBytes(two.data(), two.size(), 2);
@@ -136,8 +137,7 @@ int main() {
 
     // The flag the bridge branches on must agree with the running host.
     const uint32_t probe = 1;
-    const bool host_is_little =
-        *reinterpret_cast<const uint8_t*>(&probe) == 1;
+    const bool host_is_little = *reinterpret_cast<const uint8_t*>(&probe) == 1;
     Check(kRawDataIsHostOrder == host_is_little,
           "kRawDataIsHostOrder matches this host's byte order");
   }
