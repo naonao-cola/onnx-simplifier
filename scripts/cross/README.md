@@ -94,3 +94,72 @@ additionally need `xwin` on `PATH`, which downloads the MSVC SDK from Microsoft.
 BACKEND=llvm-mingw PYVER=3.12 ABI3=1 bash scripts/cross/build_windows_wheel.sh
 # -> wheelhouse/onnxsim-<ver>-cp312-abi3-win_amd64.whl
 ```
+
+---
+
+# Cross-building for s390x (big endian)
+
+The second cross-build in this directory targets **s390x Linux**, for a
+different reason than the Windows one: not to ship wheels, but to run onnxsim's
+test suite on a **big-endian** CPU. ONNX defines `TensorProto.raw_data` as
+little-endian on every host, so any code that reinterprets those bytes in host
+order is a latent bug that only x86/ARM's byte order hides. s390x is the only
+mainstream big-endian Linux target a major distro still supports, and Ubuntu
+ships `python3-onnx` / `python3-numpy` / `python3-pytest` for it — which is what
+makes this practical, since PyPI has no s390x wheels.
+
+Everything is compiled by the **host** toolchain (`s390x-linux-gnu-g++`), so the
+build runs at native speed; only the resulting binaries execute under
+`qemu-s390x-static`. An emulated build of the onnx + protobuf stack would take
+hours.
+
+## Procedure
+
+```sh
+# 1. Ubuntu s390x rootfs + binfmt_misc -> qemu-s390x-static  (root; once)
+sudo bash scripts/cross/bootstrap_s390x_rootfs.sh
+
+# 2. Cross-build the extension (host protoc, target abseil/protobuf, onnxsim)
+bash scripts/cross/build_s390x_extension.sh
+
+# 3. Install it into the rootfs and run pytest there, big endian
+sudo bash scripts/cross/run_s390x_tests.sh
+```
+
+## The little-endian control
+
+A big-endian test run on its own is hard to read: a failure may be an
+endianness bug, or just an artifact of this unusual environment (no
+onnxruntime, no torch, an older distro onnx). So build the **same commit** for
+x86_64 and run the **same suite** in an amd64 rootfs with the **same package
+versions**. Then byte order is the only variable and the two failure sets can be
+diffed directly:
+
+```sh
+sudo ARCH=amd64 bash scripts/cross/bootstrap_s390x_rootfs.sh
+bash scripts/cross/build_native_control.sh
+sudo SYSROOT=/rootfs-amd64 BUILD=$PWD/.native-build-control/onnxsim-build \
+     bash scripts/cross/run_s390x_tests.sh
+```
+
+## Notes / gotchas
+
+* **binfmt magic must mask `EI_OSABI`.** glibc's own binaries (notably
+  `ldconfig.real`) are tagged `ELFOSABI_GNU`, so a handler that pins byte 7 to
+  SYSV makes exactly those fail with `Exec format error` part-way through
+  `debootstrap`, corrupting the dpkg status file. The mask also has to accept
+  `ET_DYN` for static-pie binaries.
+* **The host interpreter must match the target CPython's X.Y.** CMake's
+  `FindPython` validates the interpreter against the target headers and refuses
+  a mismatch, even though the interpreter only runs ONNX's codegen.
+* **The distro's `python3-onnx` is too old** for onnxsim's vendored onnx and
+  fails a large part of the suite for reasons unrelated to byte order.
+  `run_s390x_tests.sh` therefore installs the vendored onnx (assembled from the
+  same cross-build) ahead of it on `PYTHONPATH`. protobuf has a pure-Python
+  wheel, so it needs no s390x build; `ml_dtypes` does not, and is compiled once
+  inside the rootfs under emulation by the bootstrap script.
+* onnxruntime, torch and timm have no s390x builds, so the test modules that
+  import them at module scope cannot be collected. onnxsim falls back to onnx's
+  reference evaluator, which is the supported no-onnxruntime path.
+
+See `docs/big-endian.md` for what these runs actually found.
