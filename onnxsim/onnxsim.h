@@ -38,7 +38,9 @@ struct ModelExecutor {
   //
   // Ownership: `inputs` are BORROWED for the duration of the call -- the
   // executor must not retain them past return. Each returned DLManagedTensorPtr
-  // is freshly owned by the caller. Tensors are CPU, contiguous, little-endian.
+  // is freshly owned by the caller. Tensors are CPU, contiguous, and in host
+  // byte order (raw_data's little-endian layout is converted at the DLPack
+  // boundary -- see dlpack_bridge.h).
   //
   // public for pybind11 / nanobind trampolines
   virtual std::vector<DLManagedTensorPtr> Run(
