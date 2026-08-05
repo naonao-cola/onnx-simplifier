@@ -192,6 +192,11 @@ cmake -S "${REPO_ROOT}" -B "${BUILD_DIR}" -G Ninja -Wno-dev -Wdeprecated \
   "${python_args[@]}"
 
 cmake --build "${BUILD_DIR}" --target onnxsim_cpp2py_export -j "${JOBS}"
+# onnx's own extension. Not a dependency of onnxsim's -- onnxsim links the onnx
+# C++ library, not its Python bindings -- so it has to be asked for by name.
+# run_s390x_tests.sh installs it into the rootfs as part of the vendored onnx,
+# which the distro's much older python3-onnx is shadowed by.
+cmake --build "${BUILD_DIR}" --target onnx_cpp2py_export -j "${JOBS}"
 # The dependency-free unit tests (ONNXSIM_TESTS=ON above). dlpack_dtype_test is
 # the one that covers the byte-order conversion directly; the rest come along
 # because they are cheap and exercise the same cross-built toolchain.
