@@ -189,5 +189,37 @@ It would be the obvious next thing to cache, and it is deliberately not:
 Caching the one emulated compile instead gets the same wall-clock win for
 0.7% of the storage.
 
+### Why the bootstrap is ~280s and not much less
+
+Measured on a 4-core runner, building the rootfs from scratch:
+
+| package set | time | rootfs |
+| --- | ---: | ---: |
+| the original 14 packages | 289s | 888 MB |
+| current set (dead ones dropped) | 281s | 694 MB |
+| also dropping `build-essential` | 216s | 384 MB |
+| prebuilt `ubuntu-base` tarball + apt | 144s | 509 MB |
+
+Stage 1 — download and native unpack — is only ~40s. The rest is dpkg
+*configuring* every package under emulation, and that is what sets the floor.
+Things that turned out not to help: caching the `.deb` files saves 19s for a
+57 MB cache entry, and dpkg's `force-unsafe-io` saves nothing measurable.
+
+Two faster options were rejected on purpose:
+
+* **Dropping `build-essential`** (216s) shifts the ml_dtypes build's
+  dependencies to an `apt-get` *inside* the chroot on a cache miss, where
+  unpack and configure both run emulated — an order of magnitude slower than
+  debootstrap's native stage-1 unpack. With a weekly schedule and a 7-day cache
+  eviction window, misses are near the norm, so this trades 65s a run against
+  ten minutes on the runs that miss.
+* **The prebuilt `ubuntu-base` tarball** (144s) is genuinely faster, but that
+  image ships no `gpgv`, so apt cannot verify repository signatures — the
+  measurement above only reached 144s with verification disabled. Trading
+  package authenticity for ~140s on a ~20 min job is not a good deal.
+
+The build, not the bootstrap, is where the time is; sccache is the lever that
+matters there.
+
 See `docs/big-endian.md` for what these runs found, and for the one known
 failure the job deselects by name.

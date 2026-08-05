@@ -54,8 +54,32 @@ fi
 # installs the vendored version over it.
 # ---------------------------------------------------------------------------
 if [[ ! -e "${SYSROOT}/etc/os-release" ]]; then
+  # debootstrap's second stage configures every package under emulation, and
+  # that dominates this script: stage 1 (download + native unpack) is ~40s of a
+  # ~280s run. So the list is worth keeping tight -- but only where a package is
+  # genuinely unused.
+  #
+  # Dropped, measured at 289s/888 MB -> 281s/694 MB:
+  #   python3-onnx, python3-protobuf -- run_s390x_tests.sh installs the vendored
+  #     onnx and a pure-Python protobuf ahead of them on PYTHONPATH, so the
+  #     distro copies were only ever shadowed (verified: the suite passes in
+  #     full with both removed).
+  #   libprotobuf-dev, protobuf-compiler -- the cross-build builds its own
+  #     protobuf at the version onnx's SBOM pins and points CMAKE_PREFIX_PATH at
+  #     it; the rootfs copy was unused, and a different version sitting in the
+  #     sysroot is a hazard rather than a help.
+  #   cmake, git -- nothing in the rootfs builds with them.
+  #
+  # build-essential and python3-pip stay, even though only the ml_dtypes build
+  # below needs them and that is normally served from cache. Dropping them does
+  # cut the bootstrap to ~215s/384 MB, but then a cache miss has to apt-get them
+  # *inside* the chroot, where both unpack and configure run emulated -- far
+  # slower than debootstrap's native stage-1 unpack, and enough to swamp the 65s
+  # saved. This job runs weekly and GitHub evicts caches after 7 days idle, so
+  # misses sit near the norm rather than the exception; paying 65s every run
+  # beats paying ten minutes on the ones that miss.
   debootstrap --arch="${ARCH}" --variant=minbase --components=main,universe \
-    --include=python3,python3-dev,python3-numpy,python3-onnx,python3-pytest,python3-protobuf,python3-pip,libpython3-dev,libprotobuf-dev,protobuf-compiler,ca-certificates,build-essential,cmake,git \
+    --include=python3,python3-dev,libpython3-dev,python3-numpy,python3-pytest,ca-certificates,python3-pip,build-essential \
     "${SUITE}" "${SYSROOT}" "${MIRROR}"
 fi
 

@@ -80,11 +80,20 @@ jobs:
       # ml_dtypes has no s390x wheel and must be compiled inside the rootfs
       # under emulation. It is the one slow step the host toolchain cannot
       # take over, so cache the wheel rather than rebuild it every run.
+      #
+      # restore-keys matters more than usual here: the exact key changes
+      # whenever the bootstrap script does (even for a comment), and this job
+      # runs weekly against a 7-day cache eviction window, so exact hits are not
+      # something to rely on. Any previously built wheel satisfies the
+      # >=0.5.4 constraint, so falling back to the newest prefix match is both
+      # correct and much cheaper than recompiling under qemu.
       - name: Cache the emulated ml_dtypes build
         uses: actions/cache@v6
         with:
           path: ${{ env.WHEELHOUSE }}
           key: s390x-wheelhouse-noble-${{ hashFiles('scripts/cross/bootstrap_s390x_rootfs.sh') }}
+          restore-keys: |
+            s390x-wheelhouse-noble-
 
       - name: Bootstrap the s390x rootfs
         run: sudo -E env "PATH=$PATH" bash scripts/cross/bootstrap_s390x_rootfs.sh
