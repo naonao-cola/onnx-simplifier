@@ -145,6 +145,11 @@ test*.py
 .setuptools-cmake-build/
 onnxsim/version.py
 
+# scripts/cross/ build trees (Windows wheel, s390x big-endian, native control)
+.cross-build/
+.cross-build-s390x/
+.native-build-control/
+
 # Rust
 /rust/target/
 rust/Cargo.lock
