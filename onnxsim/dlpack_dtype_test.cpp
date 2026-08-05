@@ -89,6 +89,59 @@ int main() {
           "reject opaque");
   }
 
+  // ------------------------------------------------------------------
+  // SwapElementBytes: the raw_data <-> host-order conversion the DLPack
+  // bridge applies on big-endian hosts. These checks are byte-order
+  // independent -- they assert on the bytes, not on decoded scalars -- so
+  // they mean the same thing whether this binary runs on x86_64 or s390x.
+  // ------------------------------------------------------------------
+  {
+    // 1-byte elements are never touched.
+    std::vector<uint8_t> one = {1, 2, 3};
+    SwapElementBytes(one.data(), one.size(), 1);
+    Check(one == std::vector<uint8_t>({1, 2, 3}),
+          "swap elem_size=1 is a no-op");
+
+    std::vector<uint8_t> two = {0x01, 0x02, 0x03, 0x04};
+    SwapElementBytes(two.data(), two.size(), 2);
+    Check(two == std::vector<uint8_t>({0x02, 0x01, 0x04, 0x03}),
+          "swap elem_size=2 reverses each pair");
+
+    std::vector<uint8_t> four = {1, 2, 3, 4, 5, 6, 7, 8};
+    SwapElementBytes(four.data(), four.size(), 4);
+    Check(four == std::vector<uint8_t>({4, 3, 2, 1, 8, 7, 6, 5}),
+          "swap elem_size=4 reverses each quad");
+
+    std::vector<uint8_t> eight = {1, 2, 3, 4, 5, 6, 7, 8};
+    SwapElementBytes(eight.data(), eight.size(), 8);
+    Check(eight == std::vector<uint8_t>({8, 7, 6, 5, 4, 3, 2, 1}),
+          "swap elem_size=8 reverses the element");
+
+    // Swapping twice restores the original, which is what makes one function
+    // serve both the read and write direction.
+    std::vector<uint8_t> rt = {9, 8, 7, 6, 5, 4, 3, 2};
+    const std::vector<uint8_t> before = rt;
+    SwapElementBytes(rt.data(), rt.size(), 4);
+    SwapElementBytes(rt.data(), rt.size(), 4);
+    Check(rt == before, "swap is its own inverse");
+
+    // A trailing partial element is left alone rather than read out of bounds.
+    std::vector<uint8_t> partial = {1, 2, 3, 4, 5, 6};
+    SwapElementBytes(partial.data(), partial.size(), 4);
+    Check(partial == std::vector<uint8_t>({4, 3, 2, 1, 5, 6}),
+          "swap leaves a trailing partial element untouched");
+
+    // Empty input must not walk off the (possibly null) pointer.
+    SwapElementBytes(nullptr, 0, 8);
+    Check(true, "swap tolerates an empty buffer");
+
+    // The flag the bridge branches on must agree with the running host.
+    const uint32_t probe = 1;
+    const bool host_is_little = *reinterpret_cast<const uint8_t*>(&probe) == 1;
+    Check(kRawDataIsHostOrder == host_is_little,
+          "kRawDataIsHostOrder matches this host's byte order");
+  }
+
   if (g_failures == 0) {
     std::printf("dlpack_dtype_test: all checks passed\n");
     return 0;

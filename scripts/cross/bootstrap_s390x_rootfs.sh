@@ -54,8 +54,32 @@ fi
 # installs the vendored version over it.
 # ---------------------------------------------------------------------------
 if [[ ! -e "${SYSROOT}/etc/os-release" ]]; then
+  # debootstrap's second stage configures every package under emulation, and
+  # that dominates this script: stage 1 (download + native unpack) is ~40s of a
+  # ~280s run. So the list is worth keeping tight -- but only where a package is
+  # genuinely unused.
+  #
+  # Dropped, measured at 289s/888 MB -> 281s/694 MB:
+  #   python3-onnx, python3-protobuf -- run_s390x_tests.sh installs the vendored
+  #     onnx and a pure-Python protobuf ahead of them on PYTHONPATH, so the
+  #     distro copies were only ever shadowed (verified: the suite passes in
+  #     full with both removed).
+  #   libprotobuf-dev, protobuf-compiler -- the cross-build builds its own
+  #     protobuf at the version onnx's SBOM pins and points CMAKE_PREFIX_PATH at
+  #     it; the rootfs copy was unused, and a different version sitting in the
+  #     sysroot is a hazard rather than a help.
+  #   cmake, git -- nothing in the rootfs builds with them.
+  #
+  # build-essential and python3-pip stay, even though only the ml_dtypes build
+  # below needs them and that is normally served from cache. Dropping them does
+  # cut the bootstrap to ~215s/384 MB, but then a cache miss has to apt-get them
+  # *inside* the chroot, where both unpack and configure run emulated -- far
+  # slower than debootstrap's native stage-1 unpack, and enough to swamp the 65s
+  # saved. This job runs weekly and GitHub evicts caches after 7 days idle, so
+  # misses sit near the norm rather than the exception; paying 65s every run
+  # beats paying ten minutes on the ones that miss.
   debootstrap --arch="${ARCH}" --variant=minbase --components=main,universe \
-    --include=python3,python3-dev,python3-numpy,python3-onnx,python3-pytest,python3-protobuf,python3-pip,libpython3-dev,libprotobuf-dev,protobuf-compiler,ca-certificates,build-essential,cmake,git \
+    --include=python3,python3-dev,libpython3-dev,python3-numpy,python3-pytest,ca-certificates,python3-pip,build-essential \
     "${SUITE}" "${SYSROOT}" "${MIRROR}"
 fi
 
@@ -72,15 +96,34 @@ if [[ -f /root/.ccr/ca-bundle.crt ]]; then
 fi
 
 # rich is a runtime dependency of onnxsim and pure Python, so the host's pip can
-# drop it straight in. ml_dtypes is a C extension the vendored onnx needs and
-# has no s390x wheel, so it is compiled in-place under emulation (slow, once).
+# drop it straight in.
 python3 -m pip install --quiet --target="${SYSROOT}/usr/lib/python3/dist-packages" rich
-chroot "${SYSROOT}" /bin/sh -c '
-  export PIP_BREAK_SYSTEM_PACKAGES=1
-  python3 -c "import ml_dtypes" 2>/dev/null && exit 0
-  pip3 install -U --ignore-installed setuptools wheel pybind11
-  pip3 install --no-build-isolation --no-deps "ml_dtypes>=0.5.4"
-'
+
+# ml_dtypes is a C extension the vendored onnx needs and has no s390x wheel, so
+# it has to be compiled inside the rootfs under emulation. That is by far the
+# slowest step here, so when WHEELHOUSE points at a directory the built wheel is
+# kept there and reused on the next run (CI caches it).
+if ! chroot "${SYSROOT}" /usr/bin/python3 -c "import ml_dtypes" 2>/dev/null; then
+  mkdir -p "${SYSROOT}/wheelhouse"
+  if [[ -n "${WHEELHOUSE:-}" ]]; then
+    mkdir -p "${WHEELHOUSE}"
+    cp "${WHEELHOUSE}"/*.whl "${SYSROOT}/wheelhouse/" 2>/dev/null || true
+  fi
+  chroot "${SYSROOT}" /bin/sh -c '
+    set -e
+    export PIP_BREAK_SYSTEM_PACKAGES=1
+    if ! ls /wheelhouse/ml_dtypes-*.whl >/dev/null 2>&1; then
+      # noble ships setuptools 68, which rejects ml_dtypes 0.5.x'"'"'s SPDX
+      # `project.license`; --no-build-isolation then needs pybind11 present.
+      pip3 install -U --ignore-installed setuptools wheel pybind11
+      pip3 wheel --no-build-isolation --no-deps -w /wheelhouse "ml_dtypes>=0.5.4"
+    fi
+    pip3 install --no-deps /wheelhouse/ml_dtypes-*.whl
+  '
+  if [[ -n "${WHEELHOUSE:-}" ]]; then
+    cp "${SYSROOT}/wheelhouse"/*.whl "${WHEELHOUSE}/" 2>/dev/null || true
+  fi
+fi
 
 chroot "${SYSROOT}" /usr/bin/python3 -c "
 import sys, numpy

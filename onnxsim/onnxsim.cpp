@@ -6,13 +6,13 @@
 #include <onnx/onnx_pb.h>
 
 #include <algorithm>
-#include <bit>
 #include <fstream>
 #include <functional>
 #include <mutex>
 #include <numeric>
 #include <set>
 #include <string>
+#include <type_traits>
 #include <unordered_map>
 
 #ifndef NO_BUILTIN_ORT
@@ -20,9 +20,10 @@
 // ship the public headers flat under include/ (e.g. onnxruntime_cxx_api.h),
 // whereas the vendored source tree nests them under
 // include/onnxruntime/core/session/. ONNXSIM_ORT_FLAT_HEADERS, defined by CMake
-// when ONNXSIM_PREBUILT_ORT is enabled, selects the flat layout. Endianness is
-// checked via C++20 std::endian so neither path depends on ORT's internal
-// core/common/endian.h (which the prebuilt release does not ship).
+// when ONNXSIM_PREBUILT_ORT is enabled, selects the flat layout. Byte order is
+// handled with C++20 std::endian in dlpack_dtype.h, so neither path depends on
+// ORT's internal core/common/endian.h (which the prebuilt release does not
+// ship).
 #ifdef ONNXSIM_ORT_FLAT_HEADERS
 #include "onnxruntime_cxx_api.h"
 #else
@@ -791,10 +792,23 @@ bool GetStaticIntTensorInfo(
 // run M2 (symbolic activation shapes) then M1 (symbolic value evaluation) over
 // it.
 
+// Read one little-endian `T` out of `p`. ONNX defines TensorProto::raw_data as
+// little-endian on every host, so this is a plain byte-wise decode rather than
+// a memcpy into a host integer (which would be correct only on a little-endian
+// machine -- see docs/big-endian.md).
+template <typename T>
+T ReadLittleEndian(const char* p) {
+  std::make_unsigned_t<T> v = 0;
+  for (size_t i = 0; i < sizeof(T); ++i) {
+    v |= static_cast<std::make_unsigned_t<T>>(static_cast<unsigned char>(p[i]))
+         << (8 * i);
+  }
+  return static_cast<T>(v);
+}
+
 // Convert an integer TensorProto (rank 0 or 1, INT64/INT32, inline data) to a
 // SymTensor of concrete values. Returns nullopt for other dtypes/ranks or data
-// kept in an external file. Raw data is read little-endian, matching how this
-// file already memcpys raw_data into onnxruntime tensors.
+// kept in an external file.
 std::optional<onnxsim::SymTensor> IntTensorToSymTensor(
     const onnx::TensorProto& tp) {
   if (tp.data_location() == onnx::TensorProto::EXTERNAL) return std::nullopt;
@@ -809,12 +823,13 @@ std::optional<onnxsim::SymTensor> IntTensorToSymTensor(
     if (dt == onnx::TensorProto::INT64) {
       const size_t n = raw.size() / sizeof(int64_t);
       vals.resize(n);
-      if (n) std::memcpy(vals.data(), raw.data(), n * sizeof(int64_t));
+      for (size_t i = 0; i < n; ++i)
+        vals[i] = ReadLittleEndian<int64_t>(raw.data() + i * sizeof(int64_t));
     } else {
       const size_t n = raw.size() / sizeof(int32_t);
-      std::vector<int32_t> tmp(n);
-      if (n) std::memcpy(tmp.data(), raw.data(), n * sizeof(int32_t));
-      vals.assign(tmp.begin(), tmp.end());
+      vals.resize(n);
+      for (size_t i = 0; i < n; ++i)
+        vals[i] = ReadLittleEndian<int32_t>(raw.data() + i * sizeof(int32_t));
     }
   } else if (dt == onnx::TensorProto::INT64) {
     vals.assign(tp.int64_data().begin(), tp.int64_data().end());

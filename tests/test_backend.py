@@ -81,10 +81,11 @@ def test_simplify_with_explicit_provider():
 def test_simplify_with_unavailable_provider_raises():
     # Requesting a provider the installed onnxruntime does not offer surfaces a
     # clear error rather than silently folding on the CPU.
-    import onnxruntime as rt
-
     if not backend.has_onnxruntime():
         pytest.skip("requires onnxruntime")
+
+    import onnxruntime as rt
+
     if "CUDAExecutionProvider" in rt.get_available_providers():
         pytest.skip("CUDA provider is available; cannot test the unavailable path")
     model = _make_foldable_model()

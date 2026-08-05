@@ -162,4 +162,64 @@ sudo SYSROOT=/rootfs-amd64 BUILD=$PWD/.native-build-control/onnxsim-build \
   import them at module scope cannot be collected. onnxsim falls back to onnx's
   reference evaluator, which is the supported no-onnxruntime path.
 
-See `docs/big-endian.md` for what these runs actually found.
+## In CI
+
+`.github/workflows/big-endian.yml` runs all three steps plus `ctest`. It is
+weekly, on demand, and on pull requests touching the harness or the files that
+read and write `raw_data` — a cold run is ~40 minutes, too much for every PR.
+sccache carries every compile across runs — host protoc, target
+abseil/protobuf, **and** onnx/onnx-optimizer/onnxsim itself, which is the bulk
+of the work. The one step the host toolchain cannot take over (compiling
+`ml_dtypes` inside the rootfs under emulation) has its wheel cached separately
+via `WHEELHOUSE`, at ~4 MB.
+
+### Why the rootfs is not cached
+
+It would be the obvious next thing to cache, and it is deliberately not:
+
+* It is **1.1 GB across ~28k files, ~500 MB gzipped** — around 5% of the
+  repository's 10 GB Actions cache budget, which it would be competing for with
+  sccache, whose entries are worth far more per byte.
+* It only saves the `debootstrap` step (~3 min). Restoring and unpacking half a
+  gigabyte is not obviously faster than just rebuilding it.
+* `actions/cache` tars as the runner user, which cannot preserve the root
+  ownership, setuid bits and device nodes a chroot needs, so a restored rootfs
+  would likely be subtly broken anyway.
+
+Caching the one emulated compile instead gets the same wall-clock win for
+0.7% of the storage.
+
+### Why the bootstrap is ~280s and not much less
+
+Measured on a 4-core runner, building the rootfs from scratch:
+
+| package set | time | rootfs |
+| --- | ---: | ---: |
+| the original 14 packages | 289s | 888 MB |
+| current set (dead ones dropped) | 281s | 694 MB |
+| also dropping `build-essential` | 216s | 384 MB |
+| prebuilt `ubuntu-base` tarball + apt | 144s | 509 MB |
+
+Stage 1 — download and native unpack — is only ~40s. The rest is dpkg
+*configuring* every package under emulation, and that is what sets the floor.
+Things that turned out not to help: caching the `.deb` files saves 19s for a
+57 MB cache entry, and dpkg's `force-unsafe-io` saves nothing measurable.
+
+Two faster options were rejected on purpose:
+
+* **Dropping `build-essential`** (216s) shifts the ml_dtypes build's
+  dependencies to an `apt-get` *inside* the chroot on a cache miss, where
+  unpack and configure both run emulated — an order of magnitude slower than
+  debootstrap's native stage-1 unpack. With a weekly schedule and a 7-day cache
+  eviction window, misses are near the norm, so this trades 65s a run against
+  ten minutes on the runs that miss.
+* **The prebuilt `ubuntu-base` tarball** (144s) is genuinely faster, but that
+  image ships no `gpgv`, so apt cannot verify repository signatures — the
+  measurement above only reached 144s with verification disabled. Trading
+  package authenticity for ~140s on a ~20 min job is not a good deal.
+
+The build, not the bootstrap, is where the time is; sccache is the lever that
+matters there.
+
+See `docs/big-endian.md` for what these runs found, and for the one known
+failure the job deselects by name.
