@@ -167,10 +167,27 @@ sudo SYSROOT=/rootfs-amd64 BUILD=$PWD/.native-build-control/onnxsim-build \
 `.github/workflows/big-endian.yml` runs all three steps plus `ctest`. It is
 weekly, on demand, and on pull requests touching the harness or the files that
 read and write `raw_data` — a cold run is ~40 minutes, too much for every PR.
-sccache carries the host protoc and target abseil/protobuf object files across
-runs, and the one step the host toolchain cannot take over (compiling
+sccache carries every compile across runs — host protoc, target
+abseil/protobuf, **and** onnx/onnx-optimizer/onnxsim itself, which is the bulk
+of the work. The one step the host toolchain cannot take over (compiling
 `ml_dtypes` inside the rootfs under emulation) has its wheel cached separately
-via `WHEELHOUSE`.
+via `WHEELHOUSE`, at ~4 MB.
+
+### Why the rootfs is not cached
+
+It would be the obvious next thing to cache, and it is deliberately not:
+
+* It is **1.1 GB across ~28k files, ~500 MB gzipped** — around 5% of the
+  repository's 10 GB Actions cache budget, which it would be competing for with
+  sccache, whose entries are worth far more per byte.
+* It only saves the `debootstrap` step (~3 min). Restoring and unpacking half a
+  gigabyte is not obviously faster than just rebuilding it.
+* `actions/cache` tars as the runner user, which cannot preserve the root
+  ownership, setuid bits and device nodes a chroot needs, so a restored rootfs
+  would likely be subtly broken anyway.
+
+Caching the one emulated compile instead gets the same wall-clock win for
+0.7% of the storage.
 
 See `docs/big-endian.md` for what these runs found, and for the one known
 failure the job deselects by name.

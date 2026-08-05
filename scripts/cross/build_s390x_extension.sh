@@ -176,6 +176,7 @@ fi
 
 cmake -S "${REPO_ROOT}" -B "${BUILD_DIR}" -G Ninja -Wno-dev -Wdeprecated \
   "${TOOLCHAIN_ARGS[@]}" \
+  "${SCCACHE_ARGS[@]}" \
   "${emulator_args[@]}" \
   -DCMAKE_PROJECT_TOP_LEVEL_INCLUDES="${REPO_ROOT}/scripts/cross/find_python_early.cmake" \
   -DCMAKE_BUILD_TYPE=Release \
