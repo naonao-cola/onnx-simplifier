@@ -162,4 +162,15 @@ sudo SYSROOT=/rootfs-amd64 BUILD=$PWD/.native-build-control/onnxsim-build \
   import them at module scope cannot be collected. onnxsim falls back to onnx's
   reference evaluator, which is the supported no-onnxruntime path.
 
-See `docs/big-endian.md` for what these runs actually found.
+## In CI
+
+`.github/workflows/big-endian.yml` runs all three steps plus `ctest`. It is
+weekly, on demand, and on pull requests touching the harness or the files that
+read and write `raw_data` — a cold run is ~40 minutes, too much for every PR.
+sccache carries the host protoc and target abseil/protobuf object files across
+runs, and the one step the host toolchain cannot take over (compiling
+`ml_dtypes` inside the rootfs under emulation) has its wheel cached separately
+via `WHEELHOUSE`.
+
+See `docs/big-endian.md` for what these runs found, and for the one known
+failure the job deselects by name.

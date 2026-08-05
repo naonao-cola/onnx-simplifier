@@ -53,6 +53,18 @@ TOOLCHAIN_ARGS=(
   -DONNXSIM_S390X_SYSROOT="${SYSROOT}"
 )
 
+# When sccache is on PATH it launches every compile (host protoc, target
+# abseil/protobuf, onnx/onnxsim), so object files survive across runs -- the
+# same arrangement build_windows_wheel.sh uses. The workflow provides it via
+# mozilla-actions/sccache-action with the GitHub Actions cache backend.
+SCCACHE_ARGS=()
+if command -v sccache >/dev/null; then
+  SCCACHE_ARGS=( -DCMAKE_C_COMPILER_LAUNCHER=sccache
+                 -DCMAKE_CXX_COMPILER_LAUNCHER=sccache )
+  sccache --start-server >/dev/null 2>&1 || true
+  echo "sccache enabled: $(command -v sccache)"
+fi
+
 # ---------------------------------------------------------------------------
 # 1. Host protoc -- ONNX runs this during code generation. A cross-built
 #    s390x protoc could not execute on this host.
@@ -69,12 +81,14 @@ if [[ ! -x "${HOST_PROTOC}" ]]; then
   tar -C "${WORK}/protobuf-host-src" --strip-components=1 -xf "${DL}/protobuf.tar.gz"
 
   cmake -S "${WORK}/absl-host-src" -B "${WORK}/absl-host-build" -G Ninja \
+    "${SCCACHE_ARGS[@]}" \
     -DCMAKE_BUILD_TYPE=Release -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
     -DABSL_PROPAGATE_CXX_STD=ON -DABSL_ENABLE_INSTALL=ON \
     -DCMAKE_INSTALL_PREFIX="${DEPS_HOST}"
   cmake --build "${WORK}/absl-host-build" --target install -j "${JOBS}"
 
   cmake -S "${WORK}/protobuf-host-src" -B "${WORK}/protobuf-host-build" -G Ninja \
+    "${SCCACHE_ARGS[@]}" \
     -DCMAKE_BUILD_TYPE=Release -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
     -Dprotobuf_BUILD_TESTS=OFF -Dprotobuf_ABSL_PROVIDER=package \
     -DCMAKE_PREFIX_PATH="${DEPS_HOST}" -DCMAKE_INSTALL_PREFIX="${DEPS_HOST}"
@@ -98,6 +112,7 @@ if [[ ! -f "${DEPS_TARGET}/.done" ]]; then
   common_target_args=(
     -G Ninja
     "${TOOLCHAIN_ARGS[@]}"
+    "${SCCACHE_ARGS[@]}"
     -DCMAKE_BUILD_TYPE=Release
     -DCMAKE_POSITION_INDEPENDENT_CODE=ON
     -DBUILD_SHARED_LIBS=OFF
@@ -148,8 +163,20 @@ python_args=(
   -DPython3_SABI_LIBRARY="${TGT_PY_SABI}"
 )
 
+# Let CTest run the cross-built unit tests under qemu. Set here rather than in
+# the toolchain file so it applies only to onnxsim: with an emulator configured,
+# CMake also starts *running* try_run checks, which the abseil/protobuf
+# configures above have no need to do.
+emulator_args=()
+if command -v qemu-s390x-static >/dev/null; then
+  emulator_args=(
+    -DCMAKE_CROSSCOMPILING_EMULATOR="$(command -v qemu-s390x-static);-L;${SYSROOT}"
+  )
+fi
+
 cmake -S "${REPO_ROOT}" -B "${BUILD_DIR}" -G Ninja -Wno-dev -Wdeprecated \
   "${TOOLCHAIN_ARGS[@]}" \
+  "${emulator_args[@]}" \
   -DCMAKE_PROJECT_TOP_LEVEL_INCLUDES="${REPO_ROOT}/scripts/cross/find_python_early.cmake" \
   -DCMAKE_BUILD_TYPE=Release \
   -DONNX_BUILD_PYTHON=ON \
@@ -165,6 +192,11 @@ cmake -S "${REPO_ROOT}" -B "${BUILD_DIR}" -G Ninja -Wno-dev -Wdeprecated \
   "${python_args[@]}"
 
 cmake --build "${BUILD_DIR}" --target onnxsim_cpp2py_export -j "${JOBS}"
+# The dependency-free unit tests (ONNXSIM_TESTS=ON above). dlpack_dtype_test is
+# the one that covers the byte-order conversion directly; the rest come along
+# because they are cheap and exercise the same cross-built toolchain.
+cmake --build "${BUILD_DIR}" --target sym_expr_test model_metrics_test \
+  sym_value_eval_test sym_shape_infer_test dlpack_dtype_test -j "${JOBS}"
 
 SO="$(find "${BUILD_DIR}" -name 'onnxsim_cpp2py_export*.so' -print -quit)"
 [[ -n "${SO}" ]] || { echo "no extension module produced"; exit 1; }

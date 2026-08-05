@@ -1,0 +1,108 @@
+name: Big Endian
+
+# Builds onnxsim for s390x and runs its tests there under qemu-user, i.e. on a
+# big-endian CPU. ONNX defines TensorProto.raw_data as little-endian on every
+# host, so code that reinterprets those bytes in host order is a bug that
+# x86/ARM's byte order hides -- and every other job in CI runs little-endian.
+# See docs/big-endian.md for the class of bug this exists to catch.
+#
+# Everything is compiled by the host toolchain (s390x-linux-gnu-g++), so only
+# the resulting binaries execute under emulation; an emulated build of the
+# onnx + protobuf stack would take hours rather than ~40 minutes.
+#
+# Cost is why this is not on every push. It runs weekly, on demand, and on pull
+# requests that touch either the harness or the code that actually reads and
+# writes raw_data. A new byte-order assumption somewhere else in the tree is
+# caught by the weekly run rather than at review time -- the trade that keeps
+# this off the critical path of ordinary PRs. To make it stricter, widen the
+# paths filter below to "onnxsim/**".
+
+on:
+  schedule:
+    - cron: "0 5 * * 1" # Mondays 05:00 UTC (weekly)
+  workflow_dispatch:
+  pull_request:
+    paths:
+      # The byte-order boundary itself.
+      - "onnxsim/dlpack_bridge.h"
+      - "onnxsim/dlpack_dtype.h"
+      - "onnxsim/dlpack_dtype_test.cpp"
+      # The other file that reads raw_data (IntTensorToSymTensor, IsAllZeroTensor).
+      - "onnxsim/onnxsim.cpp"
+      - "onnxsim/onnxsim.h"
+      # The harness, so changes to it are validated before they are relied on.
+      - "scripts/cross/bootstrap_s390x_rootfs.sh"
+      - "scripts/cross/build_s390x_extension.sh"
+      - "scripts/cross/run_s390x_tests.sh"
+      - "scripts/cross/linux-s390x.toolchain.cmake"
+      - "CMakeLists.txt"
+      - ".github/workflows/big-endian.yml"
+
+concurrency:
+  group: big-endian-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  s390x:
+    name: s390x (big endian)
+    runs-on: ubuntu-24.04
+    # A cold run is ~40-50 min (host protoc dominates); a warm sccache is much
+    # less. The ceiling is generous so a slow runner reports real results
+    # instead of a timeout.
+    timeout-minutes: 120
+    env:
+      SCCACHE_GHA_ENABLED: "on"
+      ACTIONS_CACHE_SERVICE_V2: "on"
+      SYSROOT: /rootfs-s390x
+      WHEELHOUSE: ${{ github.workspace }}/.s390x-wheelhouse
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+
+      # The host interpreter must be the same X.Y as the target CPython in the
+      # rootfs (Ubuntu noble ships 3.12): CMake's FindPython validates the
+      # interpreter against the target headers and refuses a mismatch, even
+      # though the interpreter only runs ONNX's codegen scripts.
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - uses: mozilla-actions/sccache-action@v0.0.11
+
+      - name: Install cross toolchain and emulation
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q \
+            debootstrap qemu-user-static g++-s390x-linux-gnu ninja-build
+          python3 -m pip install --upgrade nanobind
+
+      # ml_dtypes has no s390x wheel and must be compiled inside the rootfs
+      # under emulation. It is the one slow step the host toolchain cannot
+      # take over, so cache the wheel rather than rebuild it every run.
+      - name: Cache the emulated ml_dtypes build
+        uses: actions/cache@v6
+        with:
+          path: ${{ env.WHEELHOUSE }}
+          key: s390x-wheelhouse-noble-${{ hashFiles('scripts/cross/bootstrap_s390x_rootfs.sh') }}
+
+      - name: Bootstrap the s390x rootfs
+        run: sudo -E env "PATH=$PATH" bash scripts/cross/bootstrap_s390x_rootfs.sh
+
+      - name: Cross-build onnxsim for s390x
+        run: bash scripts/cross/build_s390x_extension.sh
+
+      # The dependency-free C++ tests, run through CTest with qemu configured as
+      # CMAKE_CROSSCOMPILING_EMULATOR. dlpack_dtype_test covers the byte-order
+      # conversion directly and asserts kRawDataIsHostOrder matches the CPU it
+      # is running on, so it fails loudly if the emulation is not actually big
+      # endian.
+      - name: C++ unit tests (big endian)
+        run: ctest --test-dir .cross-build-s390x/onnxsim-build --output-on-failure
+
+      - name: Python test suite (big endian)
+        run: sudo -E env "PATH=$PATH" bash scripts/cross/run_s390x_tests.sh
+
+      - name: Report sccache stats
+        if: always()
+        run: sccache --show-stats || true

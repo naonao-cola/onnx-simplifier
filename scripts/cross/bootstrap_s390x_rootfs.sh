@@ -72,15 +72,34 @@ if [[ -f /root/.ccr/ca-bundle.crt ]]; then
 fi
 
 # rich is a runtime dependency of onnxsim and pure Python, so the host's pip can
-# drop it straight in. ml_dtypes is a C extension the vendored onnx needs and
-# has no s390x wheel, so it is compiled in-place under emulation (slow, once).
+# drop it straight in.
 python3 -m pip install --quiet --target="${SYSROOT}/usr/lib/python3/dist-packages" rich
-chroot "${SYSROOT}" /bin/sh -c '
-  export PIP_BREAK_SYSTEM_PACKAGES=1
-  python3 -c "import ml_dtypes" 2>/dev/null && exit 0
-  pip3 install -U --ignore-installed setuptools wheel pybind11
-  pip3 install --no-build-isolation --no-deps "ml_dtypes>=0.5.4"
-'
+
+# ml_dtypes is a C extension the vendored onnx needs and has no s390x wheel, so
+# it has to be compiled inside the rootfs under emulation. That is by far the
+# slowest step here, so when WHEELHOUSE points at a directory the built wheel is
+# kept there and reused on the next run (CI caches it).
+if ! chroot "${SYSROOT}" /usr/bin/python3 -c "import ml_dtypes" 2>/dev/null; then
+  mkdir -p "${SYSROOT}/wheelhouse"
+  if [[ -n "${WHEELHOUSE:-}" ]]; then
+    mkdir -p "${WHEELHOUSE}"
+    cp "${WHEELHOUSE}"/*.whl "${SYSROOT}/wheelhouse/" 2>/dev/null || true
+  fi
+  chroot "${SYSROOT}" /bin/sh -c '
+    set -e
+    export PIP_BREAK_SYSTEM_PACKAGES=1
+    if ! ls /wheelhouse/ml_dtypes-*.whl >/dev/null 2>&1; then
+      # noble ships setuptools 68, which rejects ml_dtypes 0.5.x'"'"'s SPDX
+      # `project.license`; --no-build-isolation then needs pybind11 present.
+      pip3 install -U --ignore-installed setuptools wheel pybind11
+      pip3 wheel --no-build-isolation --no-deps -w /wheelhouse "ml_dtypes>=0.5.4"
+    fi
+    pip3 install --no-deps /wheelhouse/ml_dtypes-*.whl
+  '
+  if [[ -n "${WHEELHOUSE:-}" ]]; then
+    cp "${SYSROOT}/wheelhouse"/*.whl "${WHEELHOUSE}/" 2>/dev/null || true
+  fi
+fi
 
 chroot "${SYSROOT}" /usr/bin/python3 -c "
 import sys, numpy

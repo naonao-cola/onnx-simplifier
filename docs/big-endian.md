@@ -132,6 +132,25 @@ The checks assert on bytes rather than decoded scalars, so they mean the same
 thing on either architecture. `sym_expr_test`, `model_metrics_test`,
 `sym_value_eval_test` and `sym_shape_infer_test` also pass on s390x.
 
-CI does not run any of this — there is no big-endian runner, and the s390x
-build is driven by hand from `scripts/cross/`. Re-run it when touching the
-DLPack bridge or anything else that reads `raw_data`.
+`.github/workflows/big-endian.yml` runs the whole thing: it bootstraps the
+rootfs, cross-builds, runs the C++ tests through CTest (with qemu as
+`CMAKE_CROSSCOMPILING_EMULATOR`) and then the Python suite. It is weekly, on
+demand, and on pull requests touching the harness or the files that read and
+write `raw_data` — a full run is ~40 minutes cold, which is too much for every
+PR. Widen the `paths` filter to `onnxsim/**` to make it stricter.
+
+## Known unrelated failure in the no-onnxruntime configuration
+
+`test_fuse_conv_bn_into_conv` and `test_fuse_convtranspose_bn` fail onnxsim's
+own `check_n` equivalence check (max diff ~2.4, far past float noise) whenever
+onnxruntime is absent and the reference evaluator runs instead. This is **not**
+byte-order related — they fail identically on x86_64 under the same conditions,
+and they failed before the byte-order fixes landed. onnxruntime has no s390x
+build, so the big-endian job cannot avoid that configuration; it deselects
+those two by name in `run_s390x_tests.sh` rather than tolerating failures
+generally, so a real big-endian regression still turns the job red.
+
+Worth chasing separately: either BN fusion is subtly wrong and ORT's tolerance
+hides it, or the reference evaluator disagrees with ORT on
+`BatchNormalization`. Whichever it is, it affects everyone running onnxsim
+without onnxruntime, which `pyproject.toml` lists as an optional dependency.
