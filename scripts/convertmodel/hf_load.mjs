@@ -48,9 +48,9 @@ function isPlainRepo(parsed) {
   return !!(parsed && parsed.repo && !parsed.file && !parsed.url);
 }
 
-// How many parallel byte-range shards to read a Xet download in. XetBlob fetches
-// serially, so >1 shard is what actually parallelizes the transfer. Clamped to a
-// sane range; past ~10 the returns fade and the Hub may throttle.
+// Ceiling on parallel connections XetBlob may open for a Xet download (it tunes
+// the actual count adaptively from measured throughput). Clamped to a sane
+// range; past ~10 the returns fade and the Hub may throttle.
 const XET_CONCURRENCY_MAX = 16;
 function xetConcurrency() {
   const n = parseInt(xetConcurrencyInput && xetConcurrencyInput.value, 10);

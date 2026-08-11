@@ -145,10 +145,10 @@ agraph (float[N] X) =&gt; (float[N] Y) {
                     Use <a href="https://huggingface.co/docs/xet/en/index" target="_blank" rel="noopener">Xet</a>
                     protocol (default; falls back to a direct download)
                 </label>
-                <label for="hf-xet-concurrency" style="margin-left: 0.6em;">parallel shards</label>
+                <label for="hf-xet-concurrency" style="margin-left: 0.6em;">max connections</label>
                 <input type="number" id="hf-xet-concurrency" value="8" min="1" max="16" step="1"
                        style="width: 3.5em;"
-                       title="How many parallel byte-range shards to read a Xet download in. XetBlob fetches serially, so this is what parallelizes the transfer; ~10 or fewer is usually best.">
+                       title="Ceiling on parallel connections for a Xet download. XetBlob tunes the actual count adaptively from measured throughput, up to this limit; ~10 or fewer is usually best.">
                 <button id="hf-clear-cache" type="button">clear chunk cache</button>
                 <span id="hf-cache-size" class="note" style="margin-left: 0.4em;"></span>
                 <div class="note" style="margin-top: 0.2em;">
@@ -160,11 +160,12 @@ agraph (float[N] X) =&gt; (float[N] Y) {
                     <br>
                     The in-browser Xet client
                     (<a href="https://github.com/huggingface/huggingface.js/blob/main/packages/hub/src/utils/XetBlob.ts" target="_blank" rel="noopener"><code>XetBlob</code></a>)
-                    fetches a file <i>serially</i>, so <b>parallel shards</b> reads
-                    it in that many concurrent byte-range slices to saturate your
-                    link — this is what makes Xet fast enough to be the default
-                    (~10 or fewer is usually best; <code>1</code> disables
-                    sharding). Xet also gives chunk dedup / cache reuse across
+                    fetches multiple content-addressed blocks at once and adapts
+                    the connection count to measured throughput, up to
+                    <b>max connections</b>, to saturate your link — this is what
+                    makes Xet fast enough to be the default (~10 or fewer is
+                    usually best; <code>1</code> forces a single serial
+                    connection). Xet also gives chunk dedup / cache reuse across
                     repeated or overlapping loads.
                 </div>
             </div>
