@@ -1,0 +1,134 @@
+# Publishes the `onnxsim` npm package (npm/onnxsim/): onnxsim compiled to
+# WebAssembly with constant folding delegated to onnxruntime-web instead of a
+# compiled-in ONNX Runtime (see docs/wasm_ort_web.md and
+# npm/onnxsim/README.md). Mirrors the PyPI release job in build-and-test.yml:
+# build the artifact, then publish only on a `v*` tag release, using OIDC
+# trusted publishing (no long-lived npm token stored as a secret).
+name: Publish npm package
+
+on:
+  release:
+    types: [published]
+  # Lets a maintainer re-run publishing for an existing release (e.g. after
+  # fixing a packaging bug) without cutting a new tag.
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - ".github/workflows/npm-publish.yml"
+      - "npm/onnxsim/**"
+      - "scripts/build_npm_package.sh"
+      - "scripts/convertmodel/ort_executor.mjs"
+      - "build_wasm.sh"
+      - "CMakeLists.txt"
+      - "cmake/**"
+      - "onnxsim/**"
+
+jobs:
+  # Runs on every PR touching the package so packaging breakage is caught
+  # before a release, without needing publish credentials.
+  build_and_pack:
+    name: Build wasm module and npm pack (no publish)
+    runs-on: ubuntu-latest
+    env:
+      CMAKE_GENERATOR: Ninja
+      EMSCRIPTEN_VERSION: "5.0.0"
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+      - run: pip install cmake ninja
+      # Matches static.yml: the ORT-web build forces ONNX_BUILD_CUSTOM_PROTOBUF=ON,
+      # so onnx fetches and builds protobuf 6.31.1 for the wasm target, and the
+      # host protoc used for codegen must match that version.
+      - name: Install protoc 31.1 (matches onnx's bundled protobuf 6.31.1)
+        run: |
+          PROTOC_VERSION=31.1
+          curl -sSL -o /tmp/protoc.zip \
+            "https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/protoc-${PROTOC_VERSION}-linux-x86_64.zip"
+          sudo unzip -o /tmp/protoc.zip -d /usr/local bin/protoc 'include/*'
+          sudo chmod +x /usr/local/bin/protoc
+          protoc --version
+      - name: Prepare ccache timestamp
+        id: ccache_cache_timestamp
+        run: echo "timestamp=$(date -Iseconds)" >> "${GITHUB_OUTPUT}"
+      - name: ccache cache files
+        uses: actions/cache@v6
+        with:
+          path: .ccache
+          key: npm-publish-ccache-${{ steps.ccache_cache_timestamp.outputs.timestamp }}
+          restore-keys: |
+            npm-publish-ccache-
+      - run: |
+          sudo apt install -y ccache
+          echo "CCACHE_DIR=${PWD}/.ccache" >> "${GITHUB_ENV}"
+          echo "CCACHE_MAXSIZE=500M" >> "${GITHUB_ENV}"
+          echo "_EMCC_CCACHE=1" >> "${GITHUB_ENV}"
+      - run: |
+          git clone --depth 1 https://github.com/emscripten-core/emsdk.git
+          ./emsdk/emsdk install "${EMSCRIPTEN_VERSION}"
+          ./emsdk/emsdk activate "${EMSCRIPTEN_VERSION}"
+          . ./emsdk/emsdk_env.sh
+          ./scripts/build_npm_package.sh
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+      - name: npm pack (packaging smoke test)
+        working-directory: npm/onnxsim
+        run: npm pack
+      - uses: actions/upload-artifact@v7
+        with:
+          name: npm-package
+          path: npm/onnxsim/onnxsim-*.tgz
+          retention-days: 7
+
+  publish:
+    # Only a maintainer publishing a GitHub release (tagged v*) or an explicit
+    # manual re-run actually pushes to the npm registry.
+    if: >-
+      github.repository == 'onnxsim/onnxsim' && (
+        github.event_name == 'workflow_dispatch' ||
+        (github.event_name == 'release' && startsWith(github.ref, 'refs/tags/v'))
+      )
+    name: Publish to npm
+    runs-on: ubuntu-latest
+    environment:
+      name: npm
+      url: https://www.npmjs.com/package/onnxsim
+    permissions:
+      contents: read
+      # Required for npm's OIDC trusted publishing (npm CLI >= 11.5.1) --
+      # exchanges this workflow's identity for a short-lived publish token, so
+      # no NPM_TOKEN secret is stored in the repository.
+      id-token: write
+    env:
+      CMAKE_GENERATOR: Ninja
+      EMSCRIPTEN_VERSION: "5.0.0"
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+      - run: pip install cmake ninja
+      - name: Install protoc 31.1 (matches onnx's bundled protobuf 6.31.1)
+        run: |
+          PROTOC_VERSION=31.1
+          curl -sSL -o /tmp/protoc.zip \
+            "https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/protoc-${PROTOC_VERSION}-linux-x86_64.zip"
+          sudo unzip -o /tmp/protoc.zip -d /usr/local bin/protoc 'include/*'
+          sudo chmod +x /usr/local/bin/protoc
+          protoc --version
+      - run: |
+          git clone --depth 1 https://github.com/emscripten-core/emsdk.git
+          ./emsdk/emsdk install "${EMSCRIPTEN_VERSION}"
+          ./emsdk/emsdk activate "${EMSCRIPTEN_VERSION}"
+          . ./emsdk/emsdk_env.sh
+          ./scripts/build_npm_package.sh
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+          registry-url: "https://registry.npmjs.org"
+      # Trusted publishing needs a recent npm CLI; setup-node's bundled
+      # version can lag behind the OIDC support landing in npm.
+      - run: npm install -g npm@latest
+      - name: npm publish
+        working-directory: npm/onnxsim
+        run: npm publish --provenance

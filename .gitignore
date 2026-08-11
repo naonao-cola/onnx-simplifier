@@ -182,3 +182,10 @@ node_modules/
 # the "Load from Hugging Face" dropdown can read it same-origin. The source of
 # truth is scripts/regression/models.json; the copy is a build artifact.
 /scripts/convertmodel/models.json
+
+# npm/onnxsim's wasm module + JS executor are build artifacts staged by
+# scripts/build_npm_package.sh (from the ORT-web build and
+# scripts/convertmodel/ort_executor.mjs respectively), not checked into git.
+/npm/onnxsim/onnxsim.cjs
+/npm/onnxsim/onnxsim.wasm
+/npm/onnxsim/ort_executor.mjs

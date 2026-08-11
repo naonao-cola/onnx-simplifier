@@ -135,6 +135,16 @@ version, or the generated `.pb.*` code is incompatible with the runtime headers
 `protobuf-compiler`. When building locally, put a protoc matching onnx's pinned
 protobuf on `PATH` before running `ORT_WEB=ON ./build_wasm.sh`.
 
+## npm package
+
+This variant is also what ships as the [`onnxsim` npm
+package](https://www.npmjs.com/package/onnxsim) (`npm/onnxsim/`) — a
+Node.js-friendly wrapper around the same `onnxsim.js` / `onnxsim.wasm` built
+here, with `onnxruntime-web` as an ordinary npm dependency instead of a CDN
+load. See `npm/onnxsim/README.md` for usage and
+`scripts/build_npm_package.sh` / `.github/workflows/npm-publish.yml` for how
+it's built and published.
+
 ## Not done yet / follow-ups
 
 - Per-fold-group `InferenceSession.create` may dominate runtime; session reuse or
