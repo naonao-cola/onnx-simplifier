@@ -258,7 +258,29 @@ tree that lives outside the crate directory (`../..` from
 `rust/onnxsim-sys`), compiling ONNX Runtime, onnx, onnx-optimizer and
 protobuf from source. `cargo publish`'s default verification step packages
 the crate into an isolated directory with no monorepo around it, so that
-build can't succeed there — pass `--no-verify` to skip it:
+build can't succeed there — every publish (automated or manual) has to pass
+`--no-verify` to skip it. This does mean the crate isn't buildable from
+crates.io metadata alone: consumers need `ONNXSIM_SOURCE_DIR` pointed at a
+checkout of this monorepo (with submodules), or a pre-built library via
+`ONNXSIM_LIB_DIR` — see "Building the native library" above.
+
+### Automated (GitHub Actions)
+
+The `publish` job in
+[`.github/workflows/rust.yml`](../.github/workflows/rust.yml) runs whenever a
+GitHub release is published (tag `vX.Y.Z`), after the `lint` and `build` jobs
+pass. It bumps every binding manifest to the release tag
+(`scripts/bump_binding_versions.sh`, the same script the `lint`/`build` jobs
+run to validate against), then publishes `onnxsim-sys`, polls
+`https://crates.io/api/v1/crates/onnxsim-sys/<version>` until it lands on the
+index, and publishes `onnxsim`.
+
+It needs a `CARGO_REGISTRY_TOKEN` repository secret — a crates.io API token
+(Account Settings → API Tokens, scoped to `publish-new`/`publish-update` for
+both crates) — which isn't set by this change and must be added by a
+maintainer with crates.io publish rights before the job can run.
+
+### Manual
 
 ```sh
 cd rust
@@ -268,11 +290,7 @@ cargo publish -p onnxsim --no-verify
 ```
 
 `onnxsim-sys` must publish first and be visible on the index before
-`onnxsim` (which depends on it by version) can publish. This does mean the
-crate isn't buildable from crates.io metadata alone: consumers need
-`ONNXSIM_SOURCE_DIR` pointed at a checkout of this monorepo (with
-submodules), or a pre-built library via `ONNXSIM_LIB_DIR` — see "Building the
-native library" above.
+`onnxsim` (which depends on it by version) can publish.
 
 ## License
 
