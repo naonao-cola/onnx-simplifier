@@ -162,6 +162,17 @@ jobs:
       - name: Setup Pages
         if: ${{ github.event_name == 'push' }}
         uses: actions/configure-pages@v6
+      # CMakeLists.txt bakes this file's contents into the WASM module as
+      # ONNXSIM_VERSION_STRING (the demo's "versions" panel / issue report),
+      # and this same module ships inside the npm package below. Like the npm
+      # package.json version further down, the committed VERSION file isn't
+      # guaranteed to reflect the release tag yet -- the automated bump PR
+      # (version-sync.yml) only updates it after the release, once a
+      # maintainer merges it -- so force it here, before build_wasm.sh runs,
+      # rather than let the WASM module report a stale version.
+      - name: Set VERSION to the release tag
+        if: ${{ github.event_name == 'release' && startsWith(github.ref, 'refs/tags/v') }}
+        run: echo "${GITHUB_REF#refs/tags/v}" > VERSION
       - run: pip install cmake ninja
       # The ORT-web build forces ONNX_BUILD_CUSTOM_PROTOBUF=ON (CMakeLists.txt),
       # so onnx fetches and builds protobuf 6.31.1 for the wasm target (see its
