@@ -41,6 +41,7 @@ const { model, trace } = await simplify(input, {
   targetOpsetVersion: -1,    // <= 0 keeps the model's opset
   profile: false,            // also return a Chrome trace JSON
   annotateModelInfo: false,  // bake MAC/FLOP counts into metadata_props
+  graphDiff: false,          // console.log a node/value-level before/after diff
 });
 ```
 

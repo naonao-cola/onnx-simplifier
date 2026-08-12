@@ -71,6 +71,9 @@ function toBytes(model) {
  * @param {boolean} [options.profile=false] - also return a Chrome trace JSON.
  * @param {boolean} [options.annotateModelInfo=false] - bake MAC/FLOP counts
  *   into the model's metadata_props.
+ * @param {boolean} [options.graphDiff=false] - print a detailed node/value-level
+ *   before/after diff (which nodes/values were removed, added, or changed) via
+ *   console.log, in addition to the op-count summary always printed.
  * @returns {Promise<{model: Uint8Array, trace: string}>}
  */
 export async function simplify(model, options = {}) {
@@ -84,6 +87,7 @@ export async function simplify(model, options = {}) {
     targetOpsetVersion = -1,
     profile = false,
     annotateModelInfo = false,
+    graphDiff = false,
   } = options;
 
   let result = runtime.onnxsimplify_export(
@@ -95,6 +99,7 @@ export async function simplify(model, options = {}) {
     targetOpsetVersion,
     profile,
     annotateModelInfo,
+    graphDiff,
   );
   if (result && typeof result.then === "function") {
     result = await result;

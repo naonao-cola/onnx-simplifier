@@ -16,6 +16,12 @@ export interface SimplifyOptions {
   profile?: boolean;
   /** Bake MAC/FLOP counts into the model's metadata_props. */
   annotateModelInfo?: boolean;
+  /**
+   * Print a detailed node/value-level before/after diff (which nodes/values
+   * were removed, added, or changed) via console.log, in addition to the
+   * op-count summary always printed. Default false.
+   */
+  graphDiff?: boolean;
 }
 
 export interface SimplifyResult {
