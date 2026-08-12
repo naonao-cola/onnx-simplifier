@@ -547,26 +547,25 @@ std::string FormatGraphDiff(const onnx::ModelProto& model_ori,
                             const onnx::ModelProto& model_opt, size_t limit) {
   const GraphDiff diff = DiffGraphs(model_ori, model_opt);
 
-  std::string out =
-      "Graph diff (matched by node output / value name):\n";
+  std::string out = "Graph diff (matched by node output / value name):\n";
 
-  out += "Nodes removed (" + std::to_string(diff.removed_nodes.size()) +
-        "):\n";
+  out += "Nodes removed (" + std::to_string(diff.removed_nodes.size()) + "):\n";
   {
     std::vector<std::string> lines;
-    for (const auto& n : diff.removed_nodes) lines.push_back("  - " + NodeLabel(n));
+    for (const auto& n : diff.removed_nodes)
+      lines.push_back("  - " + NodeLabel(n));
     AppendCapped(out, lines, limit);
   }
 
   out += "Nodes added (" + std::to_string(diff.added_nodes.size()) + "):\n";
   {
     std::vector<std::string> lines;
-    for (const auto& n : diff.added_nodes) lines.push_back("  + " + NodeLabel(n));
+    for (const auto& n : diff.added_nodes)
+      lines.push_back("  + " + NodeLabel(n));
     AppendCapped(out, lines, limit);
   }
 
-  out += "Nodes changed (" + std::to_string(diff.changed_nodes.size()) +
-        "):\n";
+  out += "Nodes changed (" + std::to_string(diff.changed_nodes.size()) + "):\n";
   {
     std::vector<std::string> lines;
     for (const auto& [before, after] : diff.changed_nodes) {
@@ -582,8 +581,8 @@ std::string FormatGraphDiff(const onnx::ModelProto& model_ori,
     AppendCapped(out, lines, limit);
   }
 
-  out += "Values removed (" + std::to_string(diff.removed_values.size()) +
-        "):\n";
+  out +=
+      "Values removed (" + std::to_string(diff.removed_values.size()) + "):\n";
   {
     std::vector<std::string> lines;
     for (const auto& v : diff.removed_values) lines.push_back("  - " + v);
