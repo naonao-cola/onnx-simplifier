@@ -105,6 +105,11 @@ jobs:
     permissions:
       id-token: write
       contents: read
+    env:
+      # crates.io's API rejects requests with no descriptive User-Agent
+      # (https://crates.io/data-access), which used to make every curl check
+      # below fail regardless of whether the crate was actually published.
+      CRATES_IO_USER_AGENT: "onnxsim-release-workflow (https://github.com/onnxsim/onnxsim)"
     steps:
       - uses: actions/checkout@v7
       - name: Bump binding versions to the release tag
@@ -117,12 +122,18 @@ jobs:
       - name: Publish onnxsim-sys
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
-        run: cargo publish -p onnxsim-sys --no-verify
+        run: |
+          version="${GITHUB_REF#refs/tags/v}"
+          if curl -sf -H "User-Agent: ${CRATES_IO_USER_AGENT}" "https://crates.io/api/v1/crates/onnxsim-sys/${version}" > /dev/null; then
+            echo "onnxsim-sys ${version} is already published, skipping"
+          else
+            cargo publish -p onnxsim-sys --no-verify
+          fi
       - name: Wait for onnxsim-sys to land on the crates.io index
         run: |
           version="${GITHUB_REF#refs/tags/v}"
           for i in $(seq 1 30); do
-            if curl -sf -H "User-Agent: onnxsim-release-workflow (https://github.com/onnxsim/onnxsim)" "https://crates.io/api/v1/crates/onnxsim-sys/${version}" > /dev/null; then
+            if curl -sf -H "User-Agent: ${CRATES_IO_USER_AGENT}" "https://crates.io/api/v1/crates/onnxsim-sys/${version}" > /dev/null; then
               echo "onnxsim-sys ${version} is live"
               exit 0
             fi
@@ -134,4 +145,10 @@ jobs:
       - name: Publish onnxsim
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
-        run: cargo publish -p onnxsim --no-verify
+        run: |
+          version="${GITHUB_REF#refs/tags/v}"
+          if curl -sf -H "User-Agent: ${CRATES_IO_USER_AGENT}" "https://crates.io/api/v1/crates/onnxsim/${version}" > /dev/null; then
+            echo "onnxsim ${version} is already published, skipping"
+          else
+            cargo publish -p onnxsim --no-verify
+          fi
