@@ -80,6 +80,60 @@ def test_fuse_mul_into_conv_scalar():
 
 
 # --------------------------------------------------------------------------- #
+# fuse_preceding_mul_into_conv
+# --------------------------------------------------------------------------- #
+def _mul_feeds_conv_in(model):
+    conv_first_inputs = {n.input[0] for n in model.graph.node if n.op_type == "Conv"}
+    return any(
+        n.op_type == "Mul" and n.output[0] in conv_first_inputs
+        for n in model.graph.node
+    )
+
+
+def test_fuse_preceding_mul_into_conv_per_channel():
+    # Mul(X, per-input-channel [1, C, 1, 1] scale) -> Conv: the scale folds
+    # into the Conv weights, so nothing multiplies the Conv input beforehand.
+    w = _f32(np.random.rand(4, 3, 3, 3), "W")
+    b = _f32(np.random.rand(4), "B")
+    s = _f32(np.random.rand(1, 3, 1, 1), "S")
+    nodes = [
+        onnx.helper.make_node("Mul", ["X", "S"], ["X2"]),
+        onnx.helper.make_node("Conv", ["X2", "W", "B"], ["Y"], pads=[1, 1, 1, 1]),
+    ]
+    model = _model(nodes, [_vi("X", (1, 3, 8, 8))], [_vi("Y", (1, 4, 8, 8))], [w, b, s])
+    sim, ops = _simplify(model)
+    assert ops["Conv"] == 1
+    assert not _mul_feeds_conv_in(sim)
+
+
+def test_fuse_preceding_mul_into_conv_scalar():
+    w = _f32(np.random.rand(4, 3, 3, 3), "W")
+    s = _f32(np.array(2.0), "S")  # scalar scale
+    nodes = [
+        onnx.helper.make_node("Mul", ["X", "S"], ["X2"]),
+        onnx.helper.make_node("Conv", ["X2", "W"], ["Y"], pads=[1, 1, 1, 1]),
+    ]
+    model = _model(nodes, [_vi("X", (1, 3, 8, 8))], [_vi("Y", (1, 4, 8, 8))], [w, s])
+    sim, _ = _simplify(model)
+    assert not _mul_feeds_conv_in(sim)
+
+
+def test_fuse_preceding_mul_into_conv_grouped_per_channel_not_fused():
+    # A per-channel scale on a grouped Conv is left alone: it would need
+    # re-slicing per group to line up with the weight layout, which this pass
+    # does not attempt. The model must still simplify correctly.
+    w = _f32(np.random.rand(4, 1, 3, 3), "W")
+    s = _f32(np.random.rand(1, 4, 1, 1), "S")
+    nodes = [
+        onnx.helper.make_node("Mul", ["X", "S"], ["X2"]),
+        onnx.helper.make_node("Conv", ["X2", "W"], ["Y"], pads=[1, 1, 1, 1], group=4),
+    ]
+    model = _model(nodes, [_vi("X", (1, 4, 8, 8))], [_vi("Y", (1, 4, 8, 8))], [w, s])
+    sim, ops = _simplify(model)
+    assert ops["Conv"] == 1
+
+
+# --------------------------------------------------------------------------- #
 # fuse_consecutive_mul
 # --------------------------------------------------------------------------- #
 def test_fuse_consecutive_mul_scalar():
