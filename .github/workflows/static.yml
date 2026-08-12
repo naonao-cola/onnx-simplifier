@@ -4,11 +4,11 @@
 #   - on a `v*` GitHub release: stages the `onnxsim` npm package for release
 #     (npm/onnxsim/; see docs/wasm_ort_web.md "npm package" section)
 #   - on a pull request touching wasm/npm paths: builds the wasm module and
-#     validates the npm package (tests + `npm publish --dry-run`), but skips
-#     the (unrelated, expensive) Netron build and never deploys anywhere
+#     validates the npm package (tests + `npm pack`), but skips the
+#     (unrelated, expensive) Netron build and never deploys anywhere
 #
 # The npm package ships the exact same ORT-web wasm module as the demo, so its
-# packaging (npm publish --dry-run, and on a release npm stage publish) rides
+# packaging (npm test && npm pack, and on a release npm stage publish) rides
 # along with whichever build this workflow is already doing, rather than a
 # separate workflow rebuilding the module a second time.
 #
@@ -162,17 +162,27 @@ jobs:
       - name: Setup Pages
         if: ${{ github.event_name == 'push' }}
         uses: actions/configure-pages@v6
-      # CMakeLists.txt bakes this file's contents into the WASM module as
-      # ONNXSIM_VERSION_STRING (the demo's "versions" panel / issue report),
-      # and this same module ships inside the npm package below. Like the npm
-      # package.json version further down, the committed VERSION file isn't
-      # guaranteed to reflect the release tag yet -- the automated bump PR
-      # (version-sync.yml) only updates it after the release, once a
-      # maintainer merges it -- so force it here, before build_wasm.sh runs,
-      # rather than let the WASM module report a stale version.
-      - name: Set VERSION to the release tag
+      # Needed early (rather than right before the npm packaging steps
+      # further down, where it used to live) because the release-only bump
+      # step right below calls npm.
+      - name: Setup Node
+        uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+          registry-url: "https://registry.npmjs.org"
+      # Forces every binding manifest (npm/onnxsim/package.json,
+      # rust/Cargo.toml + rust/onnxsim/Cargo.toml, and the root VERSION file
+      # -- which CMakeLists.txt bakes into the WASM module below as
+      # ONNXSIM_VERSION_STRING, the demo's "versions" panel / issue report)
+      # to the release tag before anything downstream reads them. This is the
+      # same script the automated bump PR (version-sync.yml) runs, but that
+      # one only updates the repo's committed files *after* the release, once
+      # a maintainer merges it -- so relying on what's currently committed
+      # here would let the WASM module and the published npm package report a
+      # stale version.
+      - name: Bump binding versions to the release tag
         if: ${{ github.event_name == 'release' && startsWith(github.ref, 'refs/tags/v') }}
-        run: echo "${GITHUB_REF#refs/tags/v}" > VERSION
+        run: ./scripts/bump_binding_versions.sh "${GITHUB_REF#refs/tags/}"
       - run: pip install cmake ninja
       # The ORT-web build forces ONNX_BUILD_CUSTOM_PROTOBUF=ON (CMakeLists.txt),
       # so onnx fetches and builds protobuf 6.31.1 for the wasm target (see its
@@ -229,14 +239,6 @@ jobs:
           } >> "${GITHUB_STEP_SUMMARY}"
           ccache -s
 
-      # Moved ahead of the Netron build (which also needs it) so the npm
-      # packaging steps below can use it too.
-      - name: Setup Node
-        uses: actions/setup-node@v7
-        with:
-          node-version: "22"
-          registry-url: "https://registry.npmjs.org"
-
       # --- npm package (npm/onnxsim/): stage onnxsim.{js->cjs,wasm} + the
       # shared JS executor from the module just built above; see
       # docs/wasm_ort_web.md "npm package".
@@ -251,29 +253,17 @@ jobs:
       - name: Install npm/onnxsim's dependencies
         working-directory: npm/onnxsim
         run: npm install
-      # The version actually published to npm must match the release tag
-      # exactly, regardless of whatever version happens to be committed in
-      # package.json right now -- the automated bump PR
-      # (.github/workflows/version-sync.yml) only updates that file after the
-      # release, and a maintainer still has to merge it, so it can't be
-      # trusted to have landed before this step runs.
-      - name: Set npm package version to the release tag
-        if: >-
-          github.repository == 'onnxsim/onnxsim' &&
-          github.event_name == 'release' &&
-          startsWith(github.ref, 'refs/tags/v')
+      # Unit tests, then pack the tarball locally as a packaging smoke test --
+      # no separate CI step duplicates either. Runs on every trigger of this
+      # workflow (push, pull_request, /preview, workflow_dispatch, release).
+      # `npm publish --dry-run` used to cover this, but it queries the
+      # registry and fails outright once package.json's version is already
+      # live on npm -- the normal state between releases, not an error -- so
+      # it isn't safe to run unconditionally; `npm pack` never contacts the
+      # registry.
+      - name: npm test && npm pack (unit tests + packaging smoke test, no publish/registry check)
         working-directory: npm/onnxsim
-        run: npm version "${GITHUB_REF#refs/tags/v}" --no-git-tag-version --allow-same-version
-      # `npm publish`'s prepublishOnly hook (package.json) runs
-      # test/index.test.mjs against the module just built above, so this one
-      # step is both the packaging smoke test AND the unit test run -- no
-      # separate CI step duplicates it. Runs on every trigger of this workflow
-      # (push, pull_request, /preview, workflow_dispatch, release) --
-      # exercises the same registry-shaped checks a real publish would,
-      # without uploading or needing auth.
-      - name: npm publish --dry-run (runs the unit tests, packaging smoke test, no publish)
-        working-directory: npm/onnxsim
-        run: npm publish --dry-run
+        run: npm test && npm pack
       # This only *stages* the release -- it does not go live on its own.
       # `npm stage publish` uploads the tarball to a review queue instead of
       # the registry; a maintainer with 2FA still has to run
