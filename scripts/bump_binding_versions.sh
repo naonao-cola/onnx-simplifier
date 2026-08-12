@@ -13,6 +13,12 @@
 #                                 [workspace.package]; member crates use
 #                                 version.workspace = true and pick it up
 #                                 automatically
+#   - rust/onnxsim/Cargo.toml    onnxsim's `onnxsim-sys = { path = ...,
+#                                 version = "..." }` dependency line -- this
+#                                 one is NOT covered by workspace.version, so
+#                                 it has to be bumped explicitly or cargo
+#                                 fails to resolve the workspace once the two
+#                                 versions diverge
 #   - VERSION                    root file; Python sdist/wheel fallback and
 #                                 the WASM build's baked-in version string
 #                                 (see CMakeLists.txt)
@@ -38,6 +44,8 @@ echo "Bumping binding manifests to $VERSION"
 )
 
 sed -i "s/^version = \".*\"/version = \"$VERSION\"/" "$ROOT_DIR/rust/Cargo.toml"
+sed -i -E "s/(onnxsim-sys = \{ path = \"\.\.\/onnxsim-sys\", version = \")[^\"]*(\" \})/\1$VERSION\2/" \
+  "$ROOT_DIR/rust/onnxsim/Cargo.toml"
 
 echo "$VERSION" > "$ROOT_DIR/VERSION"
 
