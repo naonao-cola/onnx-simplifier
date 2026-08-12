@@ -1,9 +1,12 @@
 # Publishes the `onnxsim` npm package (npm/onnxsim/): onnxsim compiled to
 # WebAssembly with constant folding delegated to onnxruntime-web instead of a
 # compiled-in ONNX Runtime (see docs/wasm_ort_web.md and
-# npm/onnxsim/README.md). Mirrors the PyPI release job in build-and-test.yml:
-# build the artifact, then publish only on a `v*` tag release, using OIDC
-# trusted publishing (no long-lived npm token stored as a secret).
+# npm/onnxsim/README.md). Loosely mirrors the PyPI release job in
+# build-and-test.yml (build the artifact, act only on a `v*` tag release,
+# OIDC trusted publishing so no long-lived npm token is stored as a secret),
+# but the `publish` job below only *stages* the release --
+# https://docs.npmjs.com/staged-publishing -- so a maintainer's 2FA approval
+# is still required before it goes live; see that job's comments.
 name: Publish npm package
 
 on:
@@ -203,9 +206,22 @@ jobs:
         with:
           node-version: "22"
           registry-url: "https://registry.npmjs.org"
-      # Trusted publishing needs a recent npm CLI; setup-node's bundled
-      # version can lag behind the OIDC support landing in npm.
+      # `npm stage` (staged publishing, https://docs.npmjs.com/staged-publishing)
+      # needs npm CLI >= 11.15.0; setup-node's bundled version can lag behind it.
       - run: npm install -g npm@latest
-      - name: npm publish
+      # This CI job only *stages* the release -- it does not go live on its
+      # own. `npm stage publish` uploads the tarball to a review queue instead
+      # of the registry; a maintainer with 2FA still has to run
+      # `npm stage approve <stage-id>` (or approve on npmjs.com) before it's
+      # installable. That keeps a compromised workflow (or a compromised
+      # transitive build dependency) from being able to push a live release by
+      # itself -- OIDC trusted publishing here can only propose one.
+      #
+      # The `onnxsim` package's trusted publisher entry on npmjs.com must list
+      # this workflow (npm-publish.yml) with "npm stage publish" among its
+      # allowed actions (ideally stage-only, rejecting direct `npm publish`)
+      # for this to succeed -- that's a one-time setting on the package's
+      # npmjs.com settings page, not something this workflow can configure.
+      - name: npm stage publish
         working-directory: npm/onnxsim
-        run: npm publish --provenance
+        run: npm stage publish --provenance

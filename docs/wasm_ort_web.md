@@ -145,6 +145,27 @@ load. See `npm/onnxsim/README.md` for usage and
 `scripts/build_npm_package.sh` / `.github/workflows/npm-publish.yml` for how
 it's built and published.
 
+### Releasing (staged publishing)
+
+`npm-publish.yml`'s `publish` job runs `npm stage publish`, not
+`npm publish` — [staged publishing](https://docs.npmjs.com/staged-publishing)
+uploads the release to a review queue rather than the registry directly, so a
+maintainer still has to approve it with 2FA before it's installable (a
+compromised workflow run can propose a release but not ship one on its own).
+After a `v*` GitHub release runs the workflow:
+
+1. Check the queued release: `npm stage list --package onnxsim` (or the
+   "Staged" tab on the package's npmjs.com page).
+2. Inspect it if you want to double check contents: `npm stage view <stage-id>`.
+3. Approve (prompts for 2FA) to publish it: `npm stage approve <stage-id>`, or
+   reject with `npm stage reject <stage-id>`.
+
+One-time setup: the `onnxsim` package's trusted publisher entry on
+npmjs.com must list this repo's `npm-publish.yml` workflow with
+"npm stage publish" among its allowed actions (ideally stage-only, so a
+direct `npm publish` from CI is rejected) — that's configured on the
+package's npmjs.com settings page, not in this repo.
+
 ## Not done yet / follow-ups
 
 - Per-fold-group `InferenceSession.create` may dominate runtime; session reuse or
