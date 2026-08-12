@@ -56,12 +56,22 @@ jobs:
           git checkout -b "$BRANCH"
           git commit -am "chore: bump binding versions to $VERSION"
           git push -u origin "$BRANCH" --force
+
+          # Distinguish "a PR for this branch already exists" (fine, the
+          # push above just updated it) from a genuine failure to create one
+          # (e.g. this repo not allowing Actions to open PRs) -- the latter
+          # must fail the job instead of being silently swallowed, or a
+          # maintainer has no way to know the bump never got a PR.
+          if gh pr view "$BRANCH" --json url -q .url > /dev/null 2>&1; then
+            echo "A PR for $BRANCH already exists; the branch was updated in place."
+            exit 0
+          fi
+
           gh pr create \
             --title "chore: bump binding versions to $VERSION" \
             --body "Auto-generated after the \`$TAG\` release: syncs npm/onnxsim, rust/Cargo.toml, and VERSION with the release tag (scripts/bump_binding_versions.sh). Verify with \`scripts/check_version_sync.sh $VERSION\`." \
             --base master \
-            --head "$BRANCH" \
-            || echo "A PR for $BRANCH already exists; the branch was updated in place instead."
+            --head "$BRANCH"
 
   check:
     if: github.event_name == 'workflow_dispatch'
