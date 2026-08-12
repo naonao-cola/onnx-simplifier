@@ -1,0 +1,78 @@
+name: Version sync
+
+# Guards against a binding's manifest silently drifting from the release tag
+# (this already happened once: npm/onnxsim/package.json sat at 0.7.1 while a
+# v0.7.0 GitHub release was cut, see commit "Bump npm/onnxsim to 0.7.1 --
+# 0.7.0 is already published").
+#
+# - "bump" runs on every published release: it writes the release version
+#   into npm/onnxsim/package.json, rust/Cargo.toml, and VERSION (see
+#   scripts/bump_binding_versions.sh) and, if that changes anything, opens a
+#   PR for a maintainer to review and merge -- it never pushes to master
+#   directly.
+# - "check" is a manual, read-only verification (scripts/check_version_sync.sh)
+#   for spot-checking the tree between releases; it never edits anything.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to check against, e.g. 0.8.0 (no leading v). Defaults to the latest tag reachable from HEAD."
+        required: false
+
+jobs:
+  bump:
+    if: github.event_name == 'release'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+      - name: Bump binding manifests to the release version
+        run: |
+          TAG="${GITHUB_REF#refs/tags/}"
+          echo "TAG=$TAG" >> "$GITHUB_ENV"
+          echo "VERSION=${TAG#v}" >> "$GITHUB_ENV"
+          ./scripts/bump_binding_versions.sh "$TAG"
+      - name: Open a PR with the bump, if anything changed
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if git diff --quiet; then
+            echo "Bindings already match $VERSION; nothing to do."
+            exit 0
+          fi
+          BRANCH="version-sync/$VERSION"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$BRANCH"
+          git commit -am "chore: bump binding versions to $VERSION"
+          git push -u origin "$BRANCH" --force
+          gh pr create \
+            --title "chore: bump binding versions to $VERSION" \
+            --body "Auto-generated after the \`$TAG\` release: syncs npm/onnxsim, rust/Cargo.toml, and VERSION with the release tag (scripts/bump_binding_versions.sh). Verify with \`scripts/check_version_sync.sh $VERSION\`." \
+            --base master \
+            --head "$BRANCH" \
+            || echo "A PR for $BRANCH already exists; the branch was updated in place instead."
+
+  check:
+    if: github.event_name == 'workflow_dispatch'
+    # Nothing is compiled and no third-party deps are installed (just
+    # python3, sed, and git), matching lint.yml's ubuntu-slim jobs.
+    runs-on: ubuntu-slim
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # scripts/check_version_sync.sh falls back to `git describe --tags`
+          # when no version is passed explicitly, which needs full history.
+          fetch-depth: 0
+      - name: Check bindings' versions match
+        run: ./scripts/check_version_sync.sh "${{ github.event.inputs.version }}"
