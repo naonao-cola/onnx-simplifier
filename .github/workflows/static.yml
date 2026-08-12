@@ -240,6 +240,19 @@ jobs:
       - name: Install npm/onnxsim's dependencies
         working-directory: npm/onnxsim
         run: npm install
+      # The version actually published to npm must match the release tag
+      # exactly, regardless of whatever version happens to be committed in
+      # package.json right now -- the automated bump PR
+      # (.github/workflows/version-sync.yml) only updates that file after the
+      # release, and a maintainer still has to merge it, so it can't be
+      # trusted to have landed before this step runs.
+      - name: Set npm package version to the release tag
+        if: >-
+          github.repository == 'onnxsim/onnxsim' &&
+          github.event_name == 'release' &&
+          startsWith(github.ref, 'refs/tags/v')
+        working-directory: npm/onnxsim
+        run: npm version "${GITHUB_REF#refs/tags/v}" --no-git-tag-version --allow-same-version
       # `npm publish`'s prepublishOnly hook (package.json) runs
       # test/index.test.mjs against the module just built above, so this one
       # step is both the packaging smoke test AND the unit test run -- no
