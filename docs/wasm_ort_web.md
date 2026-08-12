@@ -169,6 +169,13 @@ constant-folding path is covered by the convertmodel demo's own
 
 ### Releasing (staged publishing)
 
+`npm/onnxsim/package.json`'s `version` is independent of the root `VERSION`
+file (like the Rust crate's own versioning) — bump it before tagging a release
+that should also publish npm. The registry rejects publishing (even
+`--dry-run`) over a version that's already there, so leaving it unbumped fails
+every subsequent PR/push build's packaging smoke test too, not just the
+release itself.
+
 The `npm stage publish` step in static.yml — not `npm publish` — only runs on
 a `v*` GitHub release. [Staged publishing](https://docs.npmjs.com/staged-publishing)
 uploads the release to a review queue rather than the registry directly, so a
