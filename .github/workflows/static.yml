@@ -213,12 +213,23 @@ jobs:
       # `npm stage` (staged publishing, https://docs.npmjs.com/staged-publishing)
       # needs npm CLI >= 11.15.0; setup-node's bundled version can lag behind it.
       - run: npm install -g npm@latest
-      # Packaging smoke test on every build this workflow does (push, /preview,
-      # workflow_dispatch, release) -- exercises prepublishOnly and the same
-      # registry-shaped checks a real publish would, without uploading or
-      # needing auth. This is the only per-PR coverage npm packaging gets (see
-      # the header comment) since it only runs via /preview, not every PR.
-      - name: npm publish --dry-run (packaging smoke test, no publish)
+      # Installs onnxruntime-web, the package's one runtime dependency -- needed
+      # both to actually run test/index.test.mjs below and because
+      # index.mjs always imports it (the npm build always reports
+      # onnxsim_needs_ort_web() true; see docs/wasm_ort_web.md).
+      - name: Install npm/onnxsim's dependencies
+        working-directory: npm/onnxsim
+        run: npm install
+      # `npm publish`'s prepublishOnly hook (package.json) runs
+      # test/index.test.mjs against the module just built above, so this one
+      # step is both the packaging smoke test AND the unit test run -- no
+      # separate CI step duplicates it. Packaging smoke test on every build
+      # this workflow does (push, /preview, workflow_dispatch, release) --
+      # exercises the same registry-shaped checks a real publish would,
+      # without uploading or needing auth. This is the only per-PR coverage
+      # npm packaging gets (see the header comment) since it only runs via
+      # /preview, not every PR.
+      - name: npm publish --dry-run (runs the unit tests, packaging smoke test, no publish)
         working-directory: npm/onnxsim
         run: npm publish --dry-run
       # This only *stages* the release -- it does not go live on its own.

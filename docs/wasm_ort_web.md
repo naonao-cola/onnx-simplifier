@@ -153,6 +153,17 @@ release (see below). `scripts/build_npm_package.sh` is the local-dev
 equivalent (build from source + stage in one command) for testing
 `npm/onnxsim` without pushing.
 
+`npm/onnxsim/test/index.test.mjs` unit-tests the public API (`simplify()` /
+`versions()`) against the actual built module — run it directly with
+`cd npm/onnxsim && npm install && npm test`, or it runs automatically as part
+of `npm publish --dry-run` / `npm stage publish` (wired in as the
+`prepublishOnly` script in `npm/onnxsim/package.json`), so it's covered by the
+same CI step as the packaging smoke test rather than a separate one. It runs
+`simplify()` with constant folding disabled so it never needs
+onnxruntime-web's wasm assets located on disk; the end-to-end
+constant-folding path is covered by the convertmodel demo's own
+`scripts/convertmodel/test/inference.test.mjs`.
+
 ### Releasing (staged publishing)
 
 The `npm stage publish` step in static.yml — not `npm publish` — only runs on

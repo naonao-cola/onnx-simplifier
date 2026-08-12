@@ -4,9 +4,9 @@
 // onnxsim repository): the wasm module links no ONNX Runtime and instead
 // delegates constant folding to onnxruntime-web, which is an ordinary npm
 // dependency here rather than a second copy of ONNX Runtime compiled into
-// the module. onnxsim.js / onnxsim.wasm / ort_executor.mjs are build
-// artifacts copied in by scripts/build_npm_package.sh (see that script and
-// the npm-publish workflow) — they are not checked into git.
+// the module. onnxsim.cjs / onnxsim.wasm / ort_executor.mjs are build
+// artifacts staged in by scripts/stage_npm_package.sh (see that script and
+// .github/workflows/static.yml) — they are not checked into git.
 
 import createOnnxsim from "./onnxsim.cjs";
 import { makeOrtRunner } from "./ort_executor.mjs";
@@ -64,6 +64,7 @@ function toBytes(model) {
  * @returns {Promise<{model: Uint8Array, trace: string}>}
  */
 export async function simplify(model, options = {}) {
+  const bytes = toBytes(model);
   const runtime = await getRuntime();
   const {
     skipOptimizers = [],
@@ -76,7 +77,7 @@ export async function simplify(model, options = {}) {
   } = options;
 
   let result = runtime.onnxsimplify_export(
-    toBytes(model),
+    bytes,
     skipOptimizers,
     constantFolding,
     shapeInference,
