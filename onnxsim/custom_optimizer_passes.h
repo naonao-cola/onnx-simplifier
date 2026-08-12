@@ -11,12 +11,14 @@ namespace onnxsim {
 // appear in GetAvailablePasses / GetFuseAndEliminationPass, exactly like the
 // passes that ship with onnxoptimizer.
 //
-// These four passes are onnxsim-specific graph rewrites that used to live in
-// onnxsim's onnxoptimizer fork. They are defined under onnxsim/passes/ and
-// injected directly into onnxoptimizer's existing global pass registry
+// These passes are onnxsim-specific graph rewrites that used to live in
+// onnxsim's onnxoptimizer fork (plus fuse_preceding_mul_into_conv, added
+// directly in onnxsim). They are defined under onnxsim/passes/ and injected
+// directly into onnxoptimizer's existing global pass registry
 // (onnx::optimization::Optimizer::passes), so onnxoptimizer needs no change:
 //
 //   - fuse_mul_into_conv
+//   - fuse_preceding_mul_into_conv
 //   - fuse_consecutive_mul
 //   - fuse_matmul_add_bias_into_gemm_batched
 //   - eliminate_reshape_around_elementwise

@@ -1996,10 +1996,10 @@ onnx::ModelProto Simplify(
     bool initializers_as_constants, bool include_inline_functions) {
   // Register onnxsim's own optimizer passes into onnxoptimizer's registry
   // before the pass list is built below: fuse_consecutive_mul,
-  // fuse_mul_into_conv and eliminate_reshape_around_elementwise are
-  // auto-selected via GetFuseAndEliminationPass, and
-  // fuse_matmul_add_bias_into_gemm_batched is named explicitly. The call is
-  // idempotent.
+  // fuse_mul_into_conv, fuse_preceding_mul_into_conv and
+  // eliminate_reshape_around_elementwise are auto-selected via
+  // GetFuseAndEliminationPass, and fuse_matmul_add_bias_into_gemm_batched is
+  // named explicitly. The call is idempotent.
   onnxsim::RegisterCustomOptimizerPasses();
   // Make shape inference aware of ONNX Runtime's quantized contrib operators
   // (QLinearAdd and friends) so shape deduction does not stop at them.
