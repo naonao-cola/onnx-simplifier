@@ -97,6 +97,7 @@ jobs:
     needs: [lint, build]
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    environment: cargo
     steps:
       - uses: actions/checkout@v7
       - name: Bump binding versions to the release tag

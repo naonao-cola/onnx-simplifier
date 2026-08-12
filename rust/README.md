@@ -275,10 +275,9 @@ run to validate against), then publishes `onnxsim-sys`, polls
 `https://crates.io/api/v1/crates/onnxsim-sys/<version>` until it lands on the
 index, and publishes `onnxsim`.
 
-It needs a `CARGO_REGISTRY_TOKEN` repository secret — a crates.io API token
-(Account Settings → API Tokens, scoped to `publish-new`/`publish-update` for
-both crates) — which isn't set by this change and must be added by a
-maintainer with crates.io publish rights before the job can run.
+It runs under the `cargo` GitHub Environment and needs a `CARGO_REGISTRY_TOKEN`
+secret there — a crates.io API token (Account Settings → API Tokens, scoped to
+`publish-new`/`publish-update` for both crates).
 
 ### Manual
 
