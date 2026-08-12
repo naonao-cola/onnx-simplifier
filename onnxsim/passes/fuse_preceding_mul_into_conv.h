@@ -74,11 +74,13 @@ struct FusePrecedingMulIntoConv final : public PredicateBasedPass {
     }
     // The Mul must feed exactly one consumer -- a Conv, as that Conv's data
     // input (offset 0) -- so rewiring the Conv away from the Mul leaves the
-    // Mul dead and safe to erase.
+    // Mul dead and safe to erase. `uses()` returns by value, so bind the
+    // element by value rather than taking a reference into the temporary
+    // vector.
     if (n->output()->uses().size() != 1) {
       return false;
     }
-    const Use& use = n->output()->uses()[0];
+    const Use use = n->output()->uses()[0];
     if (use.user->kind() != kConv || use.offset != 0 ||
         !IsConstantTensor(use.user, 1)) {
       return false;
