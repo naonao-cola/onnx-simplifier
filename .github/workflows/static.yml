@@ -157,6 +157,18 @@ jobs:
           EMPROFILE=1 ORT_WEB=ON ./build_wasm.sh
           rm scripts/convertmodel/onnxsim.*
           cp build-wasm-node-OFF-ortweb/onnxsim.* scripts/convertmodel
+      # Reused by .github/workflows/npm-publish.yml (matched by head SHA) so
+      # it can skip rebuilding the exact same ORT-web module for the `onnxsim`
+      # npm package. Kept as a plain artifact (not the Pages-specific upload
+      # below) so a normal actions/download-artifact works from another workflow.
+      - name: Upload wasm module artifact (reused by npm-publish.yml)
+        uses: actions/upload-artifact@v7
+        with:
+          name: onnxsim-wasm-ortweb
+          path: |
+            build-wasm-node-OFF-ortweb/onnxsim.js
+            build-wasm-node-OFF-ortweb/onnxsim.wasm
+          retention-days: 30
       # Surface ccache statistics on the run's summary page, the same way
       # mozilla-actions/sccache-action does for sccache. `ccache -s` still
       # goes to the step log too, so the numbers are available in both places.
