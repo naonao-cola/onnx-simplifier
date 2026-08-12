@@ -122,7 +122,7 @@ jobs:
         run: |
           version="${GITHUB_REF#refs/tags/v}"
           for i in $(seq 1 30); do
-            if curl -sf "https://crates.io/api/v1/crates/onnxsim-sys/${version}" > /dev/null; then
+            if curl -sf -H "User-Agent: onnxsim-release-workflow (https://github.com/onnxsim/onnxsim)" "https://crates.io/api/v1/crates/onnxsim-sys/${version}" > /dev/null; then
               echo "onnxsim-sys ${version} is live"
               exit 0
             fi
