@@ -36,7 +36,14 @@ export const ORT_BASE = `https://cdn.jsdelivr.net/npm/onnxruntime-web@${ORT_VERS
 // --- @huggingface/hub ------------------------------------------------------
 // Pinned build for the experimental Xet download path, loaded lazily (only when
 // the Xet toggle is used) via dynamic import.
-export const HF_HUB_VERSION = "2.14.4";
+//
+// >=2.15.0 adds adaptive parallel downloads to XetBlob/downloadFile itself
+// (huggingface/huggingface.js#2350): it fetches multiple xorb entries at once
+// and tunes the connection count from measured throughput, instead of the
+// single serial connection earlier versions were limited to. hf_models.mjs
+// passes `parallelDownloads` through to `downloadFile` rather than working
+// around the old serial-only behavior with manual byte-range sharding.
+export const HF_HUB_VERSION = "2.15.0";
 export const HF_HUB_ESM = `https://esm.sh/@huggingface/hub@${HF_HUB_VERSION}`;
 
 // --- Perfetto UI -----------------------------------------------------------
