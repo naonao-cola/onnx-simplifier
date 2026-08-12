@@ -140,7 +140,8 @@ struct FusePrecedingMulIntoConv final : public PredicateBasedPass {
     } else if (s_numel == Cg) {
       // A per-channel scale only lines up with weight axis 1 when there is a
       // single group; see the file comment above.
-      const int64_t group = GetValueFromAttrWithDefault(conv, kgroup, int64_t{1});
+      const int64_t group =
+          GetValueFromAttrWithDefault(conv, kgroup, int64_t{1});
       if (group != 1) {
         return false;
       }

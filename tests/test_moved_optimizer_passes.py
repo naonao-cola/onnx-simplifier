@@ -126,9 +126,7 @@ def test_fuse_preceding_mul_into_conv_grouped_per_channel_not_fused():
     s = _f32(np.random.rand(1, 4, 1, 1), "S")
     nodes = [
         onnx.helper.make_node("Mul", ["X", "S"], ["X2"]),
-        onnx.helper.make_node(
-            "Conv", ["X2", "W"], ["Y"], pads=[1, 1, 1, 1], group=4
-        ),
+        onnx.helper.make_node("Conv", ["X2", "W"], ["Y"], pads=[1, 1, 1, 1], group=4),
     ]
     model = _model(nodes, [_vi("X", (1, 4, 8, 8))], [_vi("Y", (1, 4, 8, 8))], [w, s])
     sim, ops = _simplify(model)
