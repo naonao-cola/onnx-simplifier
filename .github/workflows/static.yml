@@ -3,20 +3,22 @@
 #   - on a `/preview` PR comment: deploys a per-PR preview to Cloudflare Pages
 #   - on a `v*` GitHub release: stages the `onnxsim` npm package for release
 #     (npm/onnxsim/; see docs/wasm_ort_web.md "npm package" section)
+#   - on a pull request touching wasm/npm paths: builds the wasm module and
+#     validates the npm package (tests + `npm publish --dry-run`), but skips
+#     the (unrelated, expensive) Netron build and never deploys anywhere
 #
 # The npm package ships the exact same ORT-web wasm module as the demo, so its
 # packaging (npm publish --dry-run, and on a release npm stage publish) rides
 # along with whichever build this workflow is already doing, rather than a
-# separate workflow rebuilding the module a second time. The tradeoff: a PR
-# only gets npm-packaging coverage via `/preview` or once it lands on
-# master/pages, not on every PR touching npm/onnxsim/ -- this workflow's build
-# (emscripten + a full Netron web build) is too expensive to run unconditionally
-# on every PR (see the paths filter below).
+# separate workflow rebuilding the module a second time.
 #
-# The preview is on demand rather than automatic: the build (emscripten + a full
-# Netron web build) is expensive, and most PRs never need a hosted demo. Comment
-# `/preview` on a pull request and this workflow builds that PR's head and
-# deploys it, replying with the URL.
+# The hosted demo preview is on-demand rather than automatic: the full build
+# (emscripten + a full Netron web build) is expensive, and most PRs don't touch
+# the demo or don't need a hosted preview of it. Comment `/preview` on a pull
+# request and this workflow builds that PR's head and deploys it, replying with
+# the URL. The npm build+validate above is a separate, cheaper path (no Netron)
+# that runs unconditionally on a relevant PR, since it's the only per-PR
+# coverage npm packaging gets.
 #
 # The demo is built as the ORT-web variant (ONNXSIM_WASM_ORT_WEB=ON): onnxsim's
 # WebAssembly module links no ONNX Runtime and delegates constant folding to the
@@ -32,6 +34,24 @@ on:
     # Only rebuild/deploy the WASM convertmodel demo when files that actually
     # affect it change (the C++ sources, the build scripts, the demo assets,
     # or this workflow itself).
+    paths:
+      - ".github/workflows/static.yml"
+      - "build_wasm.sh"
+      - "CMakeLists.txt"
+      - "cmake/**"
+      - "onnxsim/**"
+      - "scripts/convertmodel/**"
+      - "scripts/regression/models.json"
+      - "npm/onnxsim/**"
+      - "scripts/build_npm_package.sh"
+      - "scripts/stage_npm_package.sh"
+      - ".gitmodules"
+
+  # Validates the wasm build + npm package on every PR that touches it (same
+  # paths as the push trigger above) -- see the "Demo-only" step gates below
+  # for what this skips (Netron, Pages/Cloudflare deploy) to keep it cheaper
+  # than a full demo build.
+  pull_request:
     paths:
       - ".github/workflows/static.yml"
       - "build_wasm.sh"
@@ -223,12 +243,10 @@ jobs:
       # `npm publish`'s prepublishOnly hook (package.json) runs
       # test/index.test.mjs against the module just built above, so this one
       # step is both the packaging smoke test AND the unit test run -- no
-      # separate CI step duplicates it. Packaging smoke test on every build
-      # this workflow does (push, /preview, workflow_dispatch, release) --
+      # separate CI step duplicates it. Runs on every trigger of this workflow
+      # (push, pull_request, /preview, workflow_dispatch, release) --
       # exercises the same registry-shaped checks a real publish would,
-      # without uploading or needing auth. This is the only per-PR coverage
-      # npm packaging gets (see the header comment) since it only runs via
-      # /preview, not every PR.
+      # without uploading or needing auth.
       - name: npm publish --dry-run (runs the unit tests, packaging smoke test, no publish)
         working-directory: npm/onnxsim
         run: npm publish --dry-run
@@ -256,17 +274,18 @@ jobs:
       # Ship the curated regression model set next to the page so the
       # "Load from Hugging Face" dropdown can fetch it same-origin (it falls
       # back to the raw GitHub copy when this file is absent, e.g. local dev).
-      # Demo-only, so skipped on a release run (which only wants the npm steps
-      # above, not a rebuild of the hosted page).
-      - if: ${{ github.event_name != 'release' }}
+      # Demo-only: only push (production) and issue_comment (/preview) actually
+      # deploy the demo, so a release or plain pull_request run skips this.
+      - if: ${{ github.event_name == 'push' || github.event_name == 'issue_comment' }}
         run: cp scripts/regression/models.json scripts/convertmodel/models.json
 
       # Build the patched Netron (embedding protocol + embedded mode) and serve
       # it from the converter's own origin at ./netron/, so the page can post
-      # models straight into it — no upload, no URL-length limit. Demo-only,
-      # so skipped on a release run (see above).
+      # models straight into it — no upload, no URL-length limit. Demo-only
+      # (see above) -- skipping it is what keeps the pull_request validation
+      # path cheaper than a full demo build.
       - name: Build and embed Netron
-        if: ${{ github.event_name != 'release' }}
+        if: ${{ github.event_name == 'push' || github.event_name == 'issue_comment' }}
         env:
           NETRON_REPO: https://github.com/onnxsim/netron
           # Netron 9.1.9 + the embedding protocol, now also exposing an

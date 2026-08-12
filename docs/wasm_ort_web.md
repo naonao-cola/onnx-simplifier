@@ -146,12 +146,15 @@ load. See `npm/onnxsim/README.md` for usage.
 It's built and published from `.github/workflows/static.yml` itself, right
 after that workflow's own wasm build (`scripts/stage_npm_package.sh` stages
 the module into `npm/onnxsim/`) — not a separate workflow, so the module is
-never built twice. Every run of that workflow (push, `/preview`,
+never built twice. Every run of that workflow (push, pull request, `/preview`,
 `workflow_dispatch`, or a release) also does a `npm publish --dry-run`
 packaging smoke test; only a `v*` GitHub release goes on to actually stage a
-release (see below). `scripts/build_npm_package.sh` is the local-dev
-equivalent (build from source + stage in one command) for testing
-`npm/onnxsim` without pushing.
+release (see below). A pull request touching wasm/npm paths runs this same
+build+validate path but skips the Netron build and never deploys anywhere, so
+it's cheaper than a full demo build while still giving every such PR real npm
+packaging coverage. `scripts/build_npm_package.sh` is the local-dev equivalent
+(build from source + stage in one command) for testing `npm/onnxsim` without
+pushing.
 
 `npm/onnxsim/test/index.test.mjs` unit-tests the public API (`simplify()` /
 `versions()`) against the actual built module — run it directly with
