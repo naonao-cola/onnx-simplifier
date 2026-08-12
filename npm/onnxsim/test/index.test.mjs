@@ -31,38 +31,48 @@ async function check(name, fn) {
   console.log("  ok -", name);
 }
 
-await check("simplify() returns a non-empty model and no trace by default", async () => {
-  const input = new Uint8Array(readFileSync(FIXTURE));
-  const { model, trace } = await simplify(input, { constantFolding: false });
-  assert.ok(model instanceof Uint8Array);
-  assert.ok(model.length > 0);
-  assert.equal(trace, "");
-});
+// onnxsim.cjs is Emscripten's minified, single-physical-line output; an
+// uncaught throw/rejection reaching Node's default handler makes it dump the
+// *entire* file as "source context" instead of a useful message (it treats
+// the whole file as one "line"). Catch everything here and print just the
+// error's message/stack so a real failure stays readable.
+try {
+  await check("simplify() returns a non-empty model and no trace by default", async () => {
+    const input = new Uint8Array(readFileSync(FIXTURE));
+    const { model, trace } = await simplify(input, { constantFolding: false });
+    assert.ok(model instanceof Uint8Array);
+    assert.ok(model.length > 0);
+    assert.equal(trace, "");
+  });
 
-await check("simplify() accepts an ArrayBuffer too", async () => {
-  const input = readFileSync(FIXTURE);
-  const { model } = await simplify(
-    input.buffer.slice(input.byteOffset, input.byteOffset + input.byteLength),
-    { constantFolding: false },
-  );
-  assert.ok(model instanceof Uint8Array);
-  assert.ok(model.length > 0);
-});
+  await check("simplify() accepts an ArrayBuffer too", async () => {
+    const input = readFileSync(FIXTURE);
+    const { model } = await simplify(
+      input.buffer.slice(input.byteOffset, input.byteOffset + input.byteLength),
+      { constantFolding: false },
+    );
+    assert.ok(model instanceof Uint8Array);
+    assert.ok(model.length > 0);
+  });
 
-await check("simplify() rejects a non-bytes input", async () => {
-  await assert.rejects(() => simplify("not bytes"), TypeError);
-});
+  await check("simplify() rejects a non-bytes input", async () => {
+    await assert.rejects(() => simplify("not bytes"), TypeError);
+  });
 
-await check("simplify() rejects bytes that aren't a valid model", async () => {
-  await assert.rejects(() => simplify(new Uint8Array([1, 2, 3])));
-});
+  await check("simplify() rejects bytes that aren't a valid model", async () => {
+    await assert.rejects(() => simplify(new Uint8Array([1, 2, 3])));
+  });
 
-await check("versions() reports onnxsim and onnx-optimizer version strings", async () => {
-  const v = await versions();
-  assert.equal(typeof v.onnxsim, "string");
-  assert.ok(v.onnxsim.length > 0);
-  assert.equal(typeof v.onnx_optimizer, "string");
-  assert.ok(v.onnx_optimizer.length > 0);
-});
+  await check("versions() reports onnxsim and onnx-optimizer version strings", async () => {
+    const v = await versions();
+    assert.equal(typeof v.onnxsim, "string");
+    assert.ok(v.onnxsim.length > 0);
+    assert.equal(typeof v.onnx_optimizer, "string");
+    assert.ok(v.onnx_optimizer.length > 0);
+  });
 
-console.log(`PASS: ${passed} checks`);
+  console.log(`PASS: ${passed} checks`);
+} catch (err) {
+  console.error(`FAIL after ${passed} checks:`, (err && err.stack) || err);
+  process.exitCode = 1;
+}

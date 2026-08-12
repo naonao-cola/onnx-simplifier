@@ -22,10 +22,20 @@ let runtimePromise;
 function getRuntime() {
   if (!runtimePromise) {
     runtimePromise = (async () => {
-      const runtime = await createOnnxsim({
-        print: (str) => console.log(str),
-        printErr: (str) => console.error(str),
-      });
+      let runtime;
+      try {
+        runtime = await createOnnxsim({
+          print: (str) => console.log(str),
+          printErr: (str) => console.error(str),
+        });
+      } catch (err) {
+        // onnxsim.cjs is Emscripten's minified, single-physical-line output;
+        // an uncaught throw from inside it makes Node's default formatter
+        // dump the *entire* file as "source context" instead of a useful
+        // message. Catch and rethrow a short, readable error instead.
+        const detail = (err && err.message) || err;
+        throw new Error(`onnxsim: failed to initialize the wasm module: ${detail}`, { cause: err });
+      }
       if (
         typeof runtime.onnxsim_needs_ort_web === "function" &&
         runtime.onnxsim_needs_ort_web()
