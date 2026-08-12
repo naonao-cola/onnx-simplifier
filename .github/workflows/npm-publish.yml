@@ -27,7 +27,7 @@ jobs:
   # Runs on every PR touching the package so packaging breakage is caught
   # before a release, without needing publish credentials.
   build_and_pack:
-    name: Build wasm module and npm pack (no publish)
+    name: Build wasm module and dry-run npm publish (no publish)
     runs-on: ubuntu-latest
     env:
       CMAKE_GENERATOR: Ninja
@@ -72,14 +72,12 @@ jobs:
       - uses: actions/setup-node@v7
         with:
           node-version: "22"
-      - name: npm pack (packaging smoke test)
+      # --dry-run runs everything `npm publish` would (prepublishOnly, pack,
+      # registry checks) without uploading, and needs no auth token -- a
+      # closer packaging smoke test than `npm pack` for no extra cost.
+      - name: npm publish --dry-run (packaging smoke test, no publish)
         working-directory: npm/onnxsim
-        run: npm pack
-      - uses: actions/upload-artifact@v7
-        with:
-          name: npm-package
-          path: npm/onnxsim/onnxsim-*.tgz
-          retention-days: 7
+        run: npm publish --dry-run
 
   publish:
     # Only a maintainer publishing a GitHub release (tagged v*) or an explicit
