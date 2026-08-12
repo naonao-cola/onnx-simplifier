@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # Build the ORT-web WASM variant from source, then stage it into npm/onnxsim/
-# (see stage_npm_package.sh). For local testing (`npm/onnxsim && npm pack`)
-# and as the CI fallback when no matching static.yml artifact is available to
-# reuse (see .github/workflows/npm-publish.yml).
+# (see stage_npm_package.sh). This is the local-dev equivalent of what
+# .github/workflows/static.yml does in CI (build_wasm.sh + stage_npm_package.sh
+# as part of its existing wasm build, rather than a separate workflow
+# rebuilding the module again); use it for local testing (`npm/onnxsim && npm
+# pack`).
 set -euxo pipefail
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &> /dev/null && pwd)

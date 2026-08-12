@@ -3,9 +3,9 @@
 # JS executor into npm/onnxsim/, so `npm pack` / `npm publish` run from that
 # directory produce a self-contained package.
 #
-# Split out from build_npm_package.sh so CI can reuse a module already built
-# by static.yml (downloaded as the `onnxsim-wasm-ortweb` artifact) instead of
-# rebuilding it from source; see .github/workflows/npm-publish.yml.
+# Split out from build_npm_package.sh so .github/workflows/static.yml can call
+# it directly right after its own wasm build (build_wasm.sh) without
+# rebuilding the module a second time in a separate workflow.
 #
 # Usage: stage_npm_package.sh [dir containing onnxsim.js and onnxsim.wasm]
 # Defaults to build-wasm-node-OFF-ortweb/ (build_wasm.sh's ORT_WEB=ON output).
