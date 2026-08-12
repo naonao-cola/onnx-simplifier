@@ -13,6 +13,7 @@
 
 import { runInference, compareInference } from "./inference_core.mjs";
 import { fillInput, INPUT_FILL_MODES } from "./input_fill.mjs";
+import { buildSampleInput, createSampleContext } from "./sample_inputs.mjs";
 import { summarizeOrtTrace } from "./trace_build.mjs";
 import { renderTrace } from "./trace_viewer.mjs";
 import { downloadText } from "./download.mjs";
@@ -35,6 +36,10 @@ import {
 // use the same JSEP wasm artifacts from ORT_BASE, so switching bundles keeps
 // wasmPaths valid. We load the WebNN bundle on demand (only when a WebNN EP is
 // picked) so the common WebGPU/WASM path keeps its smaller download.
+// input_fill.mjs's synthetic modes plus "sample" (real data, sample_inputs.mjs)
+// — the full set of values #inference-fill may legitimately hold.
+const ALL_FILL_MODES = [...INPUT_FILL_MODES, "sample"];
+
 const ORT_BUNDLE = { default: "ort.min.mjs", all: "ort.all.min.mjs" };
 const ortPromises = {};
 function loadOrt(variant = "default") {
@@ -84,9 +89,13 @@ function concreteShape(shape, batch = 1) {
 // Build a feeds object for every model input. `fill` selects how the float
 // inputs are valued (see input_fill.mjs): "zero" (a plain single-model run),
 // "random" (deterministic non-zero values, the compare path's default so the
-// before/after diff is meaningful), or the user-chosen "ones"/"zeros"/"arange".
-function makeDummyInputs(ort, session, batch = 1, fill = "zero") {
+// before/after diff is meaningful), the user-chosen "ones"/"zeros"/"arange",
+// or "sample" — a real image/tokenized-text input fetched from Hugging Face
+// (sample_inputs.mjs), falling back to "random" per-input when an input isn't
+// image- or recognized-text-shaped, or the sample fetch fails.
+async function makeDummyInputs(ort, session, batch = 1, fill = "zero", modelName = null, log = () => {}) {
   const feeds = {};
+  const sampleCtx = fill === "sample" ? createSampleContext() : null;
   for (const meta of session.inputMetadata) {
     if (!meta.isTensor) {
       throw new Error(`input '${meta.name}' is not a tensor; cannot auto-generate`);
@@ -95,7 +104,13 @@ function makeDummyInputs(ort, session, batch = 1, fill = "zero") {
     const count = dims.reduce((a, b) => a * b, 1);
     const Ctor = TYPED_ARRAY[meta.type];
     if (!Ctor) throw new Error(`unsupported input type '${meta.type}'`);
-    const buf = fillInput(new Ctor(count), meta.type, fill);
+    let buf = null;
+    if (fill === "sample") {
+      buf = await buildSampleInput(meta, dims, modelName, Ctor, sampleCtx, log);
+    }
+    if (!buf) {
+      buf = fillInput(new Ctor(count), meta.type, fill === "sample" ? "random" : fill);
+    }
     feeds[meta.name] = new ort.Tensor(meta.type, buf, dims);
   }
   return feeds;
@@ -106,11 +121,11 @@ function makeDummyInputs(ort, session, batch = 1, fill = "zero") {
 // the single-model and compare paths so the compare path can build ONE set of
 // inputs and feed the SAME tensor to both models. Returns
 // { feeds, inputName, leadMeta, leadingDynamic }.
-async function prepareInputs(ort, modelBytes, batch, fill, log) {
+async function prepareInputs(ort, modelBytes, batch, fill, modelName, log) {
   const metaSession = await ort.InferenceSession.create(modelBytes, {
     executionProviders: ["wasm"],
   });
-  const feeds = makeDummyInputs(ort, metaSession, batch, fill);
+  const feeds = await makeDummyInputs(ort, metaSession, batch, fill, modelName, log);
   const inputName = metaSession.inputNames[0];
   const leadMeta = metaSession.inputMetadata.find((mm) => mm.name === inputName);
   const leadingDynamic = isDynamicDim(leadMeta?.shape?.[0]);
@@ -128,7 +143,7 @@ async function prepareInputs(ort, modelBytes, batch, fill, log) {
 
 async function runOnModel(
   modelBytes,
-  { iterations, warmup, batch, providers, needWebnn, profile, fill = "zero" },
+  { iterations, warmup, batch, providers, needWebnn, profile, fill = "zero", modelName = null },
   log,
 ) {
   const ort = await loadOrt(needWebnn ? "all" : "default");
@@ -138,6 +153,7 @@ async function runOnModel(
     modelBytes,
     batch,
     fill,
+    modelName,
     log,
   );
   log(`input '${inputName}' dims [${feeds[inputName].dims.join(", ")}] (fill=${fill})`);
@@ -171,7 +187,7 @@ async function runOnModel(
 async function runCompare(
   originalBytes,
   convertedBytes,
-  { iterations, warmup, batch, providers, needWebnn, profile, fill = "random" },
+  { iterations, warmup, batch, providers, needWebnn, profile, fill = "random", modelName = null },
   log,
 ) {
   const ort = await loadOrt(needWebnn ? "all" : "default");
@@ -181,6 +197,7 @@ async function runCompare(
     originalBytes,
     batch,
     fill,
+    modelName,
     log,
   );
   const input = feeds[inputName];
@@ -214,7 +231,9 @@ async function runCompare(
 // converter page published on window.__onnxsimConverted; "original" reads the
 // file input, falling back to a model loaded from Hugging Face (published on
 // window.__onnxsimOriginal, which has no file-input entry). Returns
-// { bytes, label } or throws with a user-facing message.
+// { bytes, label, name } or throws with a user-facing message. `name` is the
+// plain filename (no "converted (...)"/"original (...)" wrapping), used to
+// look up a tokenizer family for the sample-data fill mode.
 async function resolveModelBytes(source, fileInput) {
   if (source === "converted") {
     const converted = window.__onnxsimConverted;
@@ -225,7 +244,7 @@ async function resolveModelBytes(source, fileInput) {
           "dropdown to 'original'.",
       );
     }
-    return { bytes: converted.bytes, label: `converted (${converted.name})` };
+    return { bytes: converted.bytes, label: `converted (${converted.name})`, name: converted.name };
   }
   const file = fileInput.files && fileInput.files[0];
   // Resolve the "original" bytes + a display name from either a local file
@@ -258,9 +277,10 @@ async function resolveModelBytes(source, fileInput) {
     return {
       bytes: annotated.bytes,
       label: `original (${name}, MAC-annotated)`,
+      name,
     };
   }
-  return { bytes: await readBytes(), label: `original (${name})` };
+  return { bytes: await readBytes(), label: `original (${name})`, name };
 }
 
 // Render the onnxsim MAC/FLOP metrics (onnxsim PR #527) that travel inside the
@@ -529,11 +549,12 @@ export function initInferencePanel() {
       const epValue = epSelect.value;
       const { providers, needWebnn } = providersForEp(epValue);
       const profile = !profileChk || profileChk.checked;
-      // How the auto-generated float inputs are valued (input_fill.mjs). Guard
-      // against an unexpected value so a stale/edited DOM can't feed a bad mode
-      // into the fill routine.
+      // How the auto-generated inputs are valued: one of input_fill.mjs's
+      // synthetic modes, or "sample" (real image/tokenized-text data — see
+      // sample_inputs.mjs). Guard against an unexpected value so a
+      // stale/edited DOM can't feed a bad mode into the fill routine.
       const fillValue = fillSelect ? fillSelect.value : "random";
-      const fill = INPUT_FILL_MODES.includes(fillValue) ? fillValue : "random";
+      const fill = ALL_FILL_MODES.includes(fillValue) ? fillValue : "random";
 
       if (isWebnnEp(epValue)) {
         log(
@@ -555,7 +576,7 @@ export function initInferencePanel() {
         const cmp = await runCompare(
           original.bytes,
           converted.bytes,
-          { iterations, warmup, batch, providers, needWebnn, profile, fill },
+          { iterations, warmup, batch, providers, needWebnn, profile, fill, modelName: original.name },
           log,
         );
         log(
@@ -574,7 +595,7 @@ export function initInferencePanel() {
         return;
       }
 
-      const { bytes, label } = await resolveModelBytes(source, fileInput);
+      const { bytes, label, name } = await resolveModelBytes(source, fileInput);
       log(`running ${label}`);
       // Static MACs/FLOPs from the model's onnxsim metadata_props (PR #527),
       // shown before the run so they appear even if inference fails.
@@ -582,7 +603,7 @@ export function initInferencePanel() {
       log(`loading onnxruntime-web ${ORT_VERSION}…`);
       const res = await runOnModel(
         bytes,
-        { iterations, warmup, batch, providers, needWebnn, profile, fill },
+        { iterations, warmup, batch, providers, needWebnn, profile, fill, modelName: name },
         log,
       );
       log(

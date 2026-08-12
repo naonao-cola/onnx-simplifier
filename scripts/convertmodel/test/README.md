@@ -103,6 +103,55 @@ npm run test:compare
 ORT_EP=webgpu npm run test:compare   # only where a WebGPU runtime exists
 ```
 
+## Sample data (real image / text) fill mode
+
+The inference panel's **input fill** picker normally feeds a model synthetic
+numbers (`random`/`ones`/`zeros`/`arange`, `input_fill.mjs`). The `sample data`
+option instead feeds *real* data fetched live from Hugging Face:
+
+- **Images** (`hf_datasets.mjs`'s `fetchSampleImageBytes()`): a random row from
+  [`frgfm/imagenette`](https://huggingface.co/datasets/frgfm/imagenette)
+  (Apache-2.0, 10 easy ImageNet classes) via the public, CORS-enabled
+  `datasets-server.huggingface.co/rows` API — the same endpoint behind HF's own
+  embeddable dataset-viewer widget. `sample_inputs.mjs` decodes it
+  (`createImageBitmap`), resizes to the model's declared `[H, W]`, and
+  normalizes with ImageNet mean/std — a reasonable default, not an exact match
+  for every architecture (a few, e.g. Inception-style, expect `[0.5]*3`
+  instead).
+- **Text** (`fetchSampleSentence()`): a random row from
+  [`stanfordnlp/sst2`](https://huggingface.co/datasets/stanfordnlp/sst2), same
+  API. `tokenize.mjs` resolves the model's family from its filename (e.g.
+  `bert_Opset18.onnx` -> `bert`) against `FAMILY_TOKENIZER` — a table of the
+  *exact* checkpoint each onnxmodelzoo NLP export came from (verified against
+  each family's [turnkeyml](https://github.com/onnx/turnkeyml/tree/main/models/transformers)
+  export script) — then tokenizes with
+  [`@huggingface/tokenizers`](https://github.com/huggingface/tokenizers.js)
+  loaded lazily from the CDN (`cdn.mjs`'s `TOKENIZERS_ESM`). An unrecognized
+  family throws rather than guessing a tokenizer, since reusing the wrong
+  vocab risks an out-of-bounds `Gather` on that model's embedding table.
+
+Any input that isn't image- or recognized-text-shaped (or whose sample fetch
+fails) falls back to `random` fill, logged. This means, unlike the rest of
+`input_fill.mjs`, it needs network access to run for real — so only the pure
+pieces are unit-tested at the Node level, matching how `inference_browser.mjs`
+itself has no DOM-level Node test:
+
+```bash
+npm run test:tokenize   # familyFromFilename() + FAMILY_TOKENIZER, all pure
+npm run test:hfdata     # hf_datasets.mjs row-fetch logic, fetch stubbed
+npm run test:sample     # sample_inputs.mjs's shape classifiers + pixel math
+```
+
+Not covered by these (needs a real browser + network — see the manual
+smoke-test note in "Before/after comparison" above for the same caveat on
+`inference_browser.mjs`): the actual `createImageBitmap`/canvas decode, the
+`Tokenizer` CDN load, and end-to-end wiring through `makeDummyInputs()`. Manual
+check: serve `scripts/convertmodel/`, load an image model (e.g.
+`onnxmodelzoo/resnet18d_Opset18`) and an NLP model (e.g.
+`onnxmodelzoo/bert_Opset18`) from the Hugging Face panel, set **input fill ->
+sample data**, and confirm the log shows a real fetched image/sentence and the
+run completes.
+
 ## Report-an-issue URL
 
 `npm run test:issue` unit-tests `issue_report.mjs`, the pure builder behind the
