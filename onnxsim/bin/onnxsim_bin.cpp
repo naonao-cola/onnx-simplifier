@@ -23,6 +23,7 @@ int main(int argc, char** argv) {
   bool no_sim = option.Get<bool>("no-sim");
   bool no_shape_inference = option.Get<bool>("no-shape-inference");
   int target_opset = option.Get<int>("target-opset");
+  bool graph_diff = option.Get<bool>("graph-diff");
   auto input_model_filename = option.Get<std::string>("input-model");
   auto output_model_filename = option.Get<std::string>("output-model");
 
@@ -50,5 +51,8 @@ int main(int argc, char** argv) {
   // the Python CLI's "Finish! Here is the difference:" output.
   std::cout << "Finish! Here is the difference:\n";
   std::cout << FormatSimplifyingInfo(model, simplified);
+  if (graph_diff) {
+    std::cout << FormatGraphDiff(model, simplified);
+  }
   return 0;
 }

@@ -468,6 +468,53 @@ OnnxsimStatus onnxsim_model_info_diff(const void* original_data,
   }
 }
 
+OnnxsimStatus onnxsim_graph_diff(const void* original_data,
+                                 size_t original_size,
+                                 const void* simplified_data,
+                                 size_t simplified_size, char** out_text,
+                                 char** out_error) {
+  if (out_text != nullptr) {
+    *out_text = nullptr;
+  }
+  if (out_error != nullptr) {
+    *out_error = nullptr;
+  }
+  if (original_data == nullptr || simplified_data == nullptr) {
+    SetError(out_error, "onnxsim_graph_diff: required argument is NULL");
+    return ONNXSIM_ERROR;
+  }
+  try {
+    onnx::ModelProto original;
+    if (!ParseProtoFromBytes(&original, static_cast<const char*>(original_data),
+                             original_size)) {
+      SetError(out_error, "failed to parse the original ONNX ModelProto");
+      return ONNXSIM_ERROR;
+    }
+    onnx::ModelProto simplified;
+    if (!ParseProtoFromBytes(&simplified,
+                             static_cast<const char*>(simplified_data),
+                             simplified_size)) {
+      SetError(out_error, "failed to parse the simplified ONNX ModelProto");
+      return ONNXSIM_ERROR;
+    }
+    if (out_text != nullptr) {
+      char* text = DupCString(FormatGraphDiff(original, simplified));
+      if (text == nullptr) {
+        SetError(out_error, "out of memory while formatting the graph diff");
+        return ONNXSIM_ERROR;
+      }
+      *out_text = text;
+    }
+    return ONNXSIM_OK;
+  } catch (const std::exception& e) {
+    SetError(out_error, e.what());
+    return ONNXSIM_ERROR;
+  } catch (...) {
+    SetError(out_error, "unknown error while computing the graph diff");
+    return ONNXSIM_ERROR;
+  }
+}
+
 void onnxsim_free_buffer(void* data) { std::free(data); }
 
 void onnxsim_free_string(char* data) { std::free(data); }

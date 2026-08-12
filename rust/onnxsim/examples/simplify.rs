@@ -39,6 +39,10 @@ fn main() -> ExitCode {
                 Ok(diff) => print!("{diff}"),
                 Err(err) => eprintln!("warning: could not compute model diff: {err}"),
             }
+            match onnxsim::graph_diff(&model_bytes, &simplified) {
+                Ok(diff) => print!("{diff}"),
+                Err(err) => eprintln!("warning: could not compute graph diff: {err}"),
+            }
             ExitCode::SUCCESS
         }
         Err(err) => {

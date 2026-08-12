@@ -149,6 +149,7 @@ create_onnxsim({
                     e.data[6], // target opset version (<= 0 means keep)
                     e.data[7], // profile (emit a Chrome trace)
                     e.data[8], // annotate model info (MACs/FLOPs) into metadata_props
+                    e.data[10], // graph diff (node/value-level before/after report)
                 );
                 if (result && typeof result.then === "function") {
                     result = await result;

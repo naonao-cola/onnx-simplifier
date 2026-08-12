@@ -14,6 +14,7 @@ void OnnxsimOption::Parse(int argc, char** argv) {
   ("no-sim",              "No simplification",           cxxopts::value<bool>()->default_value("false"))
   ("no-shape-inference",  "No shape inference",          cxxopts::value<bool>()->default_value("false"))
   ("target-opset",        "Convert the model to this opset version (of the default ONNX domain) before simplifying. 0 keeps the current version.", cxxopts::value<int>()->default_value("0"))
+  ("graph-diff",          "Also print a node- and value-level diff between the original and simplified graphs, matched by output tensor name.", cxxopts::value<bool>()->default_value("false"))
   ;
   // clang-format on
 

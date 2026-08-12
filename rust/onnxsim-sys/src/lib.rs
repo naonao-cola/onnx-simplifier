@@ -345,6 +345,28 @@ extern "C" {
         out_error: *mut *mut c_char,
     ) -> c_int;
 
+    /// Render a node- and value-level diff (matched by output tensor name)
+    /// between an original and a simplified model, both serialized
+    /// `ModelProto` bytes: which nodes/values were removed, added, or changed.
+    /// Complementary to [`onnxsim_model_info_diff`], which reports
+    /// op-count/size/MACs aggregates rather than the specific nodes and values
+    /// involved. On `ONNXSIM_OK`, `out_text` owns a NUL-terminated string to
+    /// free with [`onnxsim_free_string`]; on `ONNXSIM_ERROR`, `out_error` owns
+    /// a message.
+    ///
+    /// # Safety
+    /// `original_data`/`simplified_data` must each point to at least the matching
+    /// size in bytes; `out_text`/`out_error`, if non-null, receive owned strings
+    /// that must be freed exactly once.
+    pub fn onnxsim_graph_diff(
+        original_data: *const c_void,
+        original_size: usize,
+        simplified_data: *const c_void,
+        simplified_size: usize,
+        out_text: *mut *mut c_char,
+        out_error: *mut *mut c_char,
+    ) -> c_int;
+
     /// Free a buffer produced by an `out_data` parameter. Null is ignored.
     ///
     /// # Safety

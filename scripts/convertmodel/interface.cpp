@@ -203,7 +203,7 @@ void EnsureOpsetImports(onnx::ModelProto& model) {
 // profiler's Chrome trace JSON when `profile` is true, otherwise "". Returning
 // an object (rather than the bare model view) lets the worker hand the trace to
 // the in-page flame-graph viewer without a second round-trip.
-em::val onnxsimplify_export(const std::string& data, em::val skip_optimizers, bool constant_folding, bool shape_inference, size_t tensor_size_threshold, int target_opset_version, bool profile, bool annotate) {
+em::val onnxsimplify_export(const std::string& data, em::val skip_optimizers, bool constant_folding, bool shape_inference, size_t tensor_size_threshold, int target_opset_version, bool profile, bool annotate, bool graph_diff) {
     InitEnv();
 
     std::cerr << "LOG_THRESHOLD: " << std::getenv("LOG_THRESHOLD") << std::endl;
@@ -255,6 +255,14 @@ em::val onnxsimplify_export(const std::string& data, em::val skip_optimizers, bo
     // output. std::cout is routed to the worker's `print` handler.
     std::cout << "Finish! Here is the difference:\n"
               << FormatSimplifyingInfo(xmodel, optimized) << std::flush;
+
+    // Optional, more detailed node/value-level diff -- which nodes/values were
+    // removed, added, or changed (matched by output tensor name). Off by
+    // default (it can be long for a big model), controlled by the page's
+    // "graph diff" toggle.
+    if (graph_diff) {
+        std::cout << FormatGraphDiff(xmodel, optimized) << std::flush;
+    }
 
     // Collect the trace right after Simplify() (the profiler has flushed it by
     // now) and turn profiling back off, so a later check/serialize failure
