@@ -18,7 +18,9 @@ on:
 
 jobs:
   check:
-    runs-on: ubuntu-latest
+    # Nothing is compiled and no third-party deps are installed (just node -p,
+    # sed, and git), matching lint.yml's ubuntu-slim jobs.
+    runs-on: ubuntu-slim
     steps:
       - uses: actions/checkout@v7
         with:

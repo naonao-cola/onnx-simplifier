@@ -33,7 +33,7 @@ EXPECTED="${EXPECTED#v}"
 
 echo "Expected version: $EXPECTED"
 
-NPM_VERSION=$(node -p "require('$ROOT_DIR/npm/onnxsim/package.json').version")
+NPM_VERSION=$(python3 -c "import json; print(json.load(open('$ROOT_DIR/npm/onnxsim/package.json'))['version'])")
 RUST_VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' "$ROOT_DIR/rust/Cargo.toml" | head -n1)
 FILE_VERSION=$(tr -d '[:space:]' < "$ROOT_DIR/VERSION")
 
