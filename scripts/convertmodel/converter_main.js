@@ -230,9 +230,15 @@
                     // unchanged unless the user opts in.
                     const inline_functions = document.getElementById("id_inline_functions").checked;
                     last_run_info.inline_functions = inline_functions;
+                    // Print a node/value-level diff (which nodes/values were removed,
+                    // added, or changed) to the log alongside the op-count summary.
+                    // Only meaningful for "simplify", where onnxsim actually changes
+                    // the graph. Off by default: it can be long for a big model.
+                    const graph_diff = optimizer == "simplify" && document.getElementById("id_graph_diff").checked;
+                    last_run_info.graph_diff = graph_diff;
                     // Expose the latest run parameters to the report-issue module.
                     window.__onnxsimLastRunInfo = last_run_info;
-                    worker.postMessage([optimizer, buf, passes, constant_fold, shape_inference, tensor_size_threshold, target_opset_version, profile, annotate_model_info, inline_functions], [buf]);
+                    worker.postMessage([optimizer, buf, passes, constant_fold, shape_inference, tensor_size_threshold, target_opset_version, profile, annotate_model_info, inline_functions, graph_diff], [buf]);
                 };
                 // Expose the conversion entry point for the Hugging Face loader
                 // module (hf_load.mjs), which downloads model bytes and drives

@@ -689,6 +689,51 @@ pub fn model_info_diff(original: &[u8], simplified: &[u8]) -> Result<String, Err
     }
 }
 
+/// Render a node- and value-level diff between an `original` and a
+/// `simplified` model, both serialized ONNX `ModelProto` bytes: which
+/// nodes/values were removed, added, or changed (matched by output tensor
+/// name), e.g. a Conv whose bias input got folded into its weight.
+///
+/// Complementary to [`model_info_diff`], which reports op-count/size/MACs
+/// aggregates rather than the specific nodes and values involved.
+///
+/// ```no_run
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// let model = std::fs::read("model.onnx")?;
+/// let simplified = onnxsim::simplify(&model)?;
+/// print!("{}", onnxsim::graph_diff(&model, &simplified)?);
+/// # Ok(())
+/// # }
+/// ```
+pub fn graph_diff(original: &[u8], simplified: &[u8]) -> Result<String, Error> {
+    let mut out_text: *mut c_char = ptr::null_mut();
+    let mut out_error: *mut c_char = ptr::null_mut();
+
+    let status = unsafe {
+        onnxsim_sys::onnxsim_graph_diff(
+            original.as_ptr() as *const c_void,
+            original.len(),
+            simplified.as_ptr() as *const c_void,
+            simplified.len(),
+            &mut out_text,
+            &mut out_error,
+        )
+    };
+
+    if status == onnxsim_sys::ONNXSIM_OK {
+        if out_text.is_null() {
+            return Ok(String::new());
+        }
+        let text = unsafe { CStr::from_ptr(out_text) }
+            .to_string_lossy()
+            .into_owned();
+        unsafe { onnxsim_sys::onnxsim_free_string(out_text) };
+        Ok(text)
+    } else {
+        Err(take_error(out_error))
+    }
+}
+
 /// Owns the `CString`s and pointer array backing the `skip_optimizers` FFI
 /// arguments, keeping them alive for the duration of a call.
 struct FfiSkipOptimizers {

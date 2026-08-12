@@ -81,6 +81,20 @@ fn main() -> Result<(), Box<dyn std::error::Error + 'static>> {
 }
 ```
 
+For the specific nodes and values that changed rather than just the aggregate
+counts, use `graph_diff` instead: which nodes/values were removed, added, or
+changed (matched by output tensor name), e.g. a Conv whose bias input got
+folded into its weight.
+
+```rust
+fn main() -> Result<(), Box<dyn std::error::Error + 'static>> {
+    let model = std::fs::read("model.onnx")?;
+    let simplified = onnxsim::simplify(&model)?;
+    print!("{}", onnxsim::graph_diff(&model, &simplified)?);
+    Ok(())
+}
+```
+
 ## Custom rewriter
 
 Run your own graph-rewriting logic inside the simplification fixed point — the

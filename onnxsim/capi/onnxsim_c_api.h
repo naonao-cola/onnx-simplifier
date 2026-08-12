@@ -242,6 +242,26 @@ ONNXSIM_C_API OnnxsimStatus onnxsim_model_info_diff(const void* original_data,
                                                     char** out_text,
                                                     char** out_error);
 
+/*
+ * Render a node- and value-level diff between an original and a simplified
+ * model, both given as serialized ONNX ModelProto bytes: which nodes/values
+ * were removed, added, or changed (matched by output tensor name), e.g. a
+ * Conv whose bias input got folded away. Complementary to
+ * onnxsim_model_info_diff, which reports op-count/size/MACs aggregates rather
+ * than the specific nodes and values involved.
+ *
+ * On ONNXSIM_OK, *out_text receives a newly allocated, NUL-terminated string
+ * holding the report; release it with onnxsim_free_string. On ONNXSIM_ERROR,
+ * *out_error receives a newly allocated message; release it the same way.
+ * Either out_* pointer may be NULL if the caller does not want that value.
+ */
+ONNXSIM_C_API OnnxsimStatus onnxsim_graph_diff(const void* original_data,
+                                               size_t original_size,
+                                               const void* simplified_data,
+                                               size_t simplified_size,
+                                               char** out_text,
+                                               char** out_error);
+
 /* Free a buffer returned via an out_data parameter. NULL is ignored. */
 ONNXSIM_C_API void onnxsim_free_buffer(void* data);
 
