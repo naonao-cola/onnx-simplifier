@@ -1,6 +1,6 @@
 {
   "name": "onnxsim",
-  "version": "0.7.2",
+  "version": "0.7.3",
   "description": "Simplify ONNX models — WebAssembly build, with constant folding delegated to onnxruntime-web",
   "type": "module",
   "main": "index.mjs",
