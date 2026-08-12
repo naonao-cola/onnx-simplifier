@@ -115,6 +115,17 @@ For more advanced features, try the following command for help message
 onnxsim -h
 ```
 
+### Node.js version
+
+The same WebAssembly build backing the web version above is also published as
+an npm package, for JavaScript tooling that wants ONNX simplification without
+a native build step or a Python runtime. See
+[`npm/onnxsim/README.md`](npm/onnxsim/README.md) for usage.
+
+```
+npm install onnxsim
+```
+
 ## Demonstration
 
 An overall comparison between
