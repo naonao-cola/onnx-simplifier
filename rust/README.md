@@ -275,9 +275,14 @@ run to validate against), then publishes `onnxsim-sys`, polls
 `https://crates.io/api/v1/crates/onnxsim-sys/<version>` until it lands on the
 index, and publishes `onnxsim`.
 
-It runs under the `cargo` GitHub Environment and needs a `CARGO_REGISTRY_TOKEN`
-secret there — a crates.io API token (Account Settings → API Tokens, scoped to
-`publish-new`/`publish-update` for both crates).
+It authenticates via crates.io [Trusted Publishing](https://crates.io/docs/trusted-publishing)
+(OIDC) rather than a long-lived API token: the job requests an `id-token`,
+[`rust-lang/crates-io-auth-action`](https://github.com/rust-lang/crates-io-auth-action)
+exchanges it for a short-lived (30-minute) crates.io token that's revoked when
+the job ends. This requires a trusted-publishing config on crates.io for both
+`onnxsim-sys` and `onnxsim` naming this repository, the `rust.yml` workflow,
+and the `cargo` environment (which the job runs under, matching that config)
+— no repository secret needed.
 
 ### Manual
 
