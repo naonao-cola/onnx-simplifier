@@ -251,6 +251,29 @@ summary and pull-request comment.
 The integration test in `onnxsim/tests/` is ignored by default because it needs
 the linked native library and an ONNX model; see the file header to enable it.
 
+## Publishing
+
+`onnxsim-sys` builds by shelling out to CMake against the onnxsim C++ source
+tree that lives outside the crate directory (`../..` from
+`rust/onnxsim-sys`), compiling ONNX Runtime, onnx, onnx-optimizer and
+protobuf from source. `cargo publish`'s default verification step packages
+the crate into an isolated directory with no monorepo around it, so that
+build can't succeed there — pass `--no-verify` to skip it:
+
+```sh
+cd rust
+cargo publish -p onnxsim-sys --no-verify
+# wait for crates.io's index to pick up onnxsim-sys, then:
+cargo publish -p onnxsim --no-verify
+```
+
+`onnxsim-sys` must publish first and be visible on the index before
+`onnxsim` (which depends on it by version) can publish. This does mean the
+crate isn't buildable from crates.io metadata alone: consumers need
+`ONNXSIM_SOURCE_DIR` pointed at a checkout of this monorepo (with
+submodules), or a pre-built library via `ONNXSIM_LIB_DIR` — see "Building the
+native library" above.
+
 ## License
 
 Apache-2.0, matching the parent project.
