@@ -251,6 +251,51 @@ summary and pull-request comment.
 The integration test in `onnxsim/tests/` is ignored by default because it needs
 the linked native library and an ONNX model; see the file header to enable it.
 
+## Publishing
+
+`onnxsim-sys` builds by shelling out to CMake against the onnxsim C++ source
+tree that lives outside the crate directory (`../..` from
+`rust/onnxsim-sys`), compiling ONNX Runtime, onnx, onnx-optimizer and
+protobuf from source. `cargo publish`'s default verification step packages
+the crate into an isolated directory with no monorepo around it, so that
+build can't succeed there — every publish (automated or manual) has to pass
+`--no-verify` to skip it. This does mean the crate isn't buildable from
+crates.io metadata alone: consumers need `ONNXSIM_SOURCE_DIR` pointed at a
+checkout of this monorepo (with submodules), or a pre-built library via
+`ONNXSIM_LIB_DIR` — see "Building the native library" above.
+
+### Automated (GitHub Actions)
+
+The `publish` job in
+[`.github/workflows/rust.yml`](../.github/workflows/rust.yml) runs whenever a
+GitHub release is published (tag `vX.Y.Z`), after the `lint` and `build` jobs
+pass. It bumps every binding manifest to the release tag
+(`scripts/bump_binding_versions.sh`, the same script the `lint`/`build` jobs
+run to validate against), then publishes `onnxsim-sys`, polls
+`https://crates.io/api/v1/crates/onnxsim-sys/<version>` until it lands on the
+index, and publishes `onnxsim`.
+
+It authenticates via crates.io [Trusted Publishing](https://crates.io/docs/trusted-publishing)
+(OIDC) rather than a long-lived API token: the job requests an `id-token`,
+[`rust-lang/crates-io-auth-action`](https://github.com/rust-lang/crates-io-auth-action)
+exchanges it for a short-lived (30-minute) crates.io token that's revoked when
+the job ends. This requires a trusted-publishing config on crates.io for both
+`onnxsim-sys` and `onnxsim` naming this repository, the `rust.yml` workflow,
+and the `cargo` environment (which the job runs under, matching that config)
+— no repository secret needed.
+
+### Manual
+
+```sh
+cd rust
+cargo publish -p onnxsim-sys --no-verify
+# wait for crates.io's index to pick up onnxsim-sys, then:
+cargo publish -p onnxsim --no-verify
+```
+
+`onnxsim-sys` must publish first and be visible on the index before
+`onnxsim` (which depends on it by version) can publish.
+
 ## License
 
 Apache-2.0, matching the parent project.

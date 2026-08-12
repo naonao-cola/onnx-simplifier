@@ -25,17 +25,15 @@ jobs:
       ONNXSIM_NO_BUILD: "1"
     steps:
       - uses: actions/checkout@v7
-      # No crates.io publish exists yet for this crate, but a release build
-      # should still validate against the tagged version: bump every binding
-      # manifest to the release tag (scripts/bump_binding_versions.sh -- the
-      # same script version-sync.yml's bump job and static.yml's npm build
+      # A release build should validate against the tagged version: bump every
+      # binding manifest to the release tag (scripts/bump_binding_versions.sh --
+      # the same script version-sync.yml's bump job and static.yml's npm build
       # already run) before clippy resolves the workspace, so this actually
       # exercises the tagged version's onnxsim-sys constraint instead of
       # whatever happened to be committed (this is exactly what broke #606:
       # the workspace version moved but rust/onnxsim/Cargo.toml's pinned
-      # onnxsim-sys dependency didn't, and cargo failed to resolve). Once
-      # crates.io publishing is added here, this is also where the version
-      # would need to be set before `cargo publish`.
+      # onnxsim-sys dependency didn't, and cargo failed to resolve). The publish
+      # job below does the same bump before `cargo publish`.
       - name: Bump binding versions to the release tag
         if: ${{ github.event_name == 'release' && startsWith(github.ref, 'refs/tags/v') }}
         working-directory: ${{ github.workspace }}
@@ -65,8 +63,7 @@ jobs:
         with:
           submodules: recursive
           fetch-depth: 0
-      # See the matching step in the lint job above for why this runs even
-      # though nothing publishes the crate yet.
+      # See the matching step in the lint job above for why this runs.
       - name: Bump binding versions to the release tag
         if: ${{ github.event_name == 'release' && startsWith(github.ref, 'refs/tags/v') }}
         working-directory: ${{ github.workspace }}
@@ -88,3 +85,53 @@ jobs:
         run: |
           cargo test --release --workspace
           cargo test --release -- --ignored list_optimizers_is_non_empty
+
+  # Publish onnxsim-sys and onnxsim to crates.io once a GitHub release is
+  # published, gated on lint and build passing first. See "Publishing" in
+  # rust/README.md for why --no-verify is required and why onnxsim-sys has to
+  # land on the index before onnxsim (which depends on it by version) can
+  # publish. Authenticates via crates.io Trusted Publishing (OIDC) instead of
+  # a long-lived CARGO_REGISTRY_TOKEN secret -- id-token: write lets
+  # crates-io-auth-action exchange this job's OIDC identity (repo + workflow +
+  # the `cargo` environment below, matching the trusted-publishing config on
+  # crates.io) for a short-lived token that's revoked when the job ends.
+  publish:
+    name: publish to crates.io
+    if: ${{ github.event_name == 'release' && startsWith(github.ref, 'refs/tags/v') }}
+    needs: [lint, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment: cargo
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+      - name: Bump binding versions to the release tag
+        working-directory: ${{ github.workspace }}
+        run: ./scripts/bump_binding_versions.sh "${GITHUB_REF#refs/tags/}"
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Authenticate with crates.io
+        id: auth
+        uses: rust-lang/crates-io-auth-action@v1
+      - name: Publish onnxsim-sys
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+        run: cargo publish -p onnxsim-sys --no-verify
+      - name: Wait for onnxsim-sys to land on the crates.io index
+        run: |
+          version="${GITHUB_REF#refs/tags/v}"
+          for i in $(seq 1 30); do
+            if curl -sf "https://crates.io/api/v1/crates/onnxsim-sys/${version}" > /dev/null; then
+              echo "onnxsim-sys ${version} is live"
+              exit 0
+            fi
+            echo "waiting for onnxsim-sys ${version} to appear on crates.io ($i/30)..."
+            sleep 10
+          done
+          echo "::error::onnxsim-sys ${version} did not appear on crates.io in time"
+          exit 1
+      - name: Publish onnxsim
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+        run: cargo publish -p onnxsim --no-verify
