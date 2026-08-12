@@ -669,6 +669,134 @@ def test_schema_function_fallback_counts_attention(monkeypatch):
     assert info.macs == b * h * sq * sq * d * 2  # exact, via the expanded body
 
 
+# --------------------------------------------------------------------------- #
+# Graph diff: node/value level diff between original and simplified graphs
+# --------------------------------------------------------------------------- #
+def test_diff_graphs_unchanged_model_is_empty():
+    x = _vi("x", [1, 4])
+    y = _vi("y", [1, 4])
+    model = _model([helper.make_node("Relu", ["x"], ["y"])], [x], [y])
+    diff = model_info.diff_graphs(model, model)
+    assert diff.removed_nodes == []
+    assert diff.added_nodes == []
+    assert diff.changed_nodes == []
+    assert diff.removed_values == []
+    assert diff.added_values == []
+
+
+def test_diff_graphs_detects_removed_and_added_nodes():
+    # x -> Identity -> Relu -> y  becomes  x -> Relu -> y (Identity eliminated).
+    x = _vi("x", [1, 4])
+    y = _vi("y", [1, 4])
+    ori = _model(
+        [
+            helper.make_node("Identity", ["x"], ["mid"], name="id0"),
+            helper.make_node("Relu", ["mid"], ["y"], name="relu0"),
+        ],
+        [x],
+        [y],
+    )
+    opt = _model([helper.make_node("Relu", ["x"], ["y"], name="relu0")], [x], [y])
+
+    diff = model_info.diff_graphs(ori, opt)
+    assert [n.name for n in diff.removed_nodes] == ["id0"]
+    assert diff.added_nodes == []
+    # relu0 kept its output name "y" but its inputs changed (mid -> x).
+    assert len(diff.changed_nodes) == 1
+    before, after = diff.changed_nodes[0]
+    assert before.inputs == ("mid",)
+    assert after.inputs == ("x",)
+    assert diff.removed_values == ["mid"]
+    assert diff.added_values == []
+
+
+def test_diff_graphs_added_node_from_constant_folding():
+    # A Shape node folded away and replaced by a Constant under a new name.
+    x = _vi("x", [1, 4])
+    y = _vi("y", [1])
+    ori = _model([helper.make_node("Shape", ["x"], ["y"], name="shape0")], [x], [y])
+    opt = _model(
+        [
+            helper.make_node(
+                "Constant",
+                [],
+                ["y_folded"],
+                name="const0",
+                value=helper.make_tensor("v", TensorProto.INT64, [1], [4]),
+            )
+        ],
+        [x],
+        [_vi("y_folded", [1])],
+    )
+    diff = model_info.diff_graphs(ori, opt)
+    assert [n.name for n in diff.removed_nodes] == ["shape0"]
+    assert [n.name for n in diff.added_nodes] == ["const0"]
+    assert diff.changed_nodes == []
+    assert diff.removed_values == ["y"]
+    assert diff.added_values == ["y_folded"]
+
+
+def test_diff_graphs_detects_op_type_change():
+    # Same output name "y", but the producing op_type changed.
+    x = _vi("x", [1, 4])
+    y = _vi("y", [1, 4])
+    ori = _model([helper.make_node("Relu", ["x"], ["y"], name="n")], [x], [y])
+    opt = _model([helper.make_node("Sigmoid", ["x"], ["y"], name="n")], [x], [y])
+    diff = model_info.diff_graphs(ori, opt)
+    assert diff.removed_nodes == []
+    assert diff.added_nodes == []
+    (before, after) = diff.changed_nodes[0]
+    assert before.op_type == "Relu"
+    assert after.op_type == "Sigmoid"
+
+
+def test_diff_graphs_removed_and_added_initializers():
+    x = _vi("x", [4, 8])
+    y = _vi("y", [4, 16])
+    b_ori = _weight("b", [8, 16])
+    ori = _model([helper.make_node("MatMul", ["x", "b"], ["y"])], [x], [y], [b_ori])
+    b_opt = _weight("b_folded", [8, 16])
+    opt = _model(
+        [helper.make_node("MatMul", ["x", "b_folded"], ["y"])], [x], [y], [b_opt]
+    )
+    diff = model_info.diff_graphs(ori, opt)
+    assert diff.removed_values == ["b"]
+    assert diff.added_values == ["b_folded"]
+
+
+def test_print_graph_diff_does_not_raise(capsys):
+    x = _vi("x", [1, 4])
+    y = _vi("y", [1, 4])
+    ori = _model(
+        [
+            helper.make_node("Identity", ["x"], ["mid"], name="id0"),
+            helper.make_node("Relu", ["mid"], ["y"], name="relu0"),
+        ],
+        [x],
+        [y],
+    )
+    opt = _model([helper.make_node("Relu", ["x"], ["y"], name="relu0")], [x], [y])
+    model_info.print_graph_diff(ori, opt)
+    out = capsys.readouterr().out
+    assert "Nodes removed" in out
+    assert "id0" in out
+    assert "Values removed" in out
+    assert "mid" in out
+
+
+def test_print_graph_diff_caps_output(capsys):
+    x = _vi("x", [1, 4])
+    ori_nodes = [
+        helper.make_node("Identity", ["x"], [f"mid{i}"], name=f"id{i}")
+        for i in range(5)
+    ]
+    ori = _model(ori_nodes, [x], [_vi("mid0", [1, 4])])
+    opt = _model([], [x], [_vi("x", [1, 4])])
+    model_info.print_graph_diff(ori, opt, limit=2)
+    out = capsys.readouterr().out
+    assert "... and" in out
+
+
 def test_schema_function_fallback_layernorm_is_zero():
     # A context-dependent function with no matmuls must expand cleanly to 0 MACs.
     x = _vi("X", [4, 16])

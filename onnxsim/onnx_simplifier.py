@@ -1132,6 +1132,14 @@ def main():
         action="store_true",
     )
     parser.add_argument(
+        "--graph-diff",
+        help="Print a node- and value-level diff between the original and "
+        "simplified graphs after simplification, matched by output tensor "
+        "name: which nodes/values were removed, added, or changed (e.g. a "
+        "Conv whose bias input got folded away).",
+        action="store_true",
+    )
+    parser.add_argument(
         "-v", "--version", action="version", version="onnxsim " + version.version
     )
 
@@ -1352,10 +1360,14 @@ def main():
     if check_ok:
         print("Finish! Here is the difference:")
         model_info.print_simplifying_info(model, model_opt)
+        if args.graph_diff:
+            model_info.print_graph_diff(model, model_opt)
     else:
         print(
             'Check failed. Please be careful to use the simplified model, or try specifying "--skip-fuse-bn" or "--skip-optimization" (run "onnxsim -h" for details).'
         )
         print("Here is the difference after simplification:")
         model_info.print_simplifying_info(model, model_opt)
+        if args.graph_diff:
+            model_info.print_graph_diff(model, model_opt)
         sys.exit(1)

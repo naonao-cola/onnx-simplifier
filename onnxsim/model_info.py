@@ -1,4 +1,5 @@
 import copy
+import dataclasses
 import warnings
 from collections import defaultdict
 from typing import (
@@ -8,6 +9,7 @@ from typing import (
     Iterable,
     List,
     Optional,
+    Set,
     Tuple,
     TypeGuard,
     Union,
@@ -36,6 +38,10 @@ __all__ = [
     "print_simplifying_info",
     "annotate_metadata",
     "METADATA_PREFIX",
+    "GraphDiff",
+    "NodeDiffEntry",
+    "diff_graphs",
+    "print_graph_diff",
 ]
 
 # metadata_props keys written by ``annotate_metadata`` are namespaced with this
@@ -839,6 +845,176 @@ def print_simplifying_info(
         postprocess=human_readable_density,
     )
     print(table)
+
+
+# --------------------------------------------------------------------------- #
+# Node/value level diff between the original and simplified graph
+# --------------------------------------------------------------------------- #
+@dataclasses.dataclass(frozen=True)
+class NodeDiffEntry:
+    """One node's identity for diffing: enough to describe it on a diff line,
+    not the full ``NodeProto`` (attributes are omitted; a node whose attributes
+    changed but whose op_type/inputs/outputs did not is not detected as
+    "changed" -- see ``diff_graphs``).
+    """
+
+    op_type: str
+    name: str
+    inputs: Tuple[str, ...]
+    outputs: Tuple[str, ...]
+
+
+def _node_diff_entry(node: onnx.NodeProto) -> NodeDiffEntry:
+    return NodeDiffEntry(
+        op_type=node.op_type,
+        name=node.name,
+        inputs=tuple(node.input),
+        outputs=tuple(node.output),
+    )
+
+
+@dataclasses.dataclass(frozen=True)
+class GraphDiff:
+    """Node- and value-level diff between an original and simplified graph,
+    matched by name -- see ``diff_graphs``.
+    """
+
+    removed_nodes: List[NodeDiffEntry]
+    added_nodes: List[NodeDiffEntry]
+    # (before, after) pairs that produce the same output(s) but whose op_type
+    # or inputs changed, e.g. a Conv whose bias input was folded away.
+    changed_nodes: List[Tuple[NodeDiffEntry, NodeDiffEntry]]
+    removed_values: List[str]
+    added_values: List[str]
+
+
+def _graph_value_names(graph: onnx.GraphProto) -> Set[str]:
+    # Every named tensor the (top-level) graph produces or consumes: node
+    # outputs, initializers and graph inputs. Node *inputs* that are neither an
+    # initializer nor another node's output are graph inputs already, so this
+    # set covers every value a diff could plausibly care about.
+    names: Set[str] = set()
+    for node in graph.node:
+        names.update(n for n in node.output if n)
+    names.update(init.name for init in graph.initializer)
+    names.update(inp.name for inp in graph.input)
+    return names
+
+
+def diff_graphs(model_ori: onnx.ModelProto, model_opt: onnx.ModelProto) -> GraphDiff:
+    """Diff ``model_ori``'s top-level graph against ``model_opt``'s, matched by
+    name rather than position, so the result reflects what simplification
+    actually did to named values instead of a meaningless positional diff.
+
+    Nodes are matched by their output tensor name(s) -- unique within a graph
+    by the ONNX spec, and the identity a downstream consumer actually depends
+    on -- so a node is reported as "changed" (rather than removed + added) only
+    when simplification kept the same output name(s) but altered the op_type or
+    inputs (e.g. folding a Conv's bias into its weight). This is precisely why
+    onnxsim tries to preserve value names across simplification passes where
+    possible: it is what keeps this diff (and any other name-keyed tooling)
+    meaningful instead of turning every fused/folded node into an unrelated
+    remove+add pair.
+
+    Only the top-level graph is compared -- nodes inside control-flow
+    subgraphs (If/Loop/Scan bodies) are not matched across models, since names
+    are only required to be unique within their own graph scope.
+    """
+    ori_by_output = {
+        _node_diff_entry(n).outputs: _node_diff_entry(n) for n in model_ori.graph.node
+    }
+    opt_by_output = {
+        _node_diff_entry(n).outputs: _node_diff_entry(n) for n in model_opt.graph.node
+    }
+
+    removed_nodes = []
+    changed_nodes = []
+    for outputs, before in ori_by_output.items():
+        after = opt_by_output.get(outputs)
+        if after is None:
+            removed_nodes.append(before)
+        elif (after.op_type, after.inputs) != (before.op_type, before.inputs):
+            changed_nodes.append((before, after))
+    added_nodes = [
+        after
+        for outputs, after in opt_by_output.items()
+        if outputs not in ori_by_output
+    ]
+
+    ori_values = _graph_value_names(model_ori.graph)
+    opt_values = _graph_value_names(model_opt.graph)
+
+    return GraphDiff(
+        removed_nodes=removed_nodes,
+        added_nodes=added_nodes,
+        changed_nodes=changed_nodes,
+        removed_values=sorted(ori_values - opt_values),
+        added_values=sorted(opt_values - ori_values),
+    )
+
+
+def _node_label(entry: NodeDiffEntry) -> str:
+    name = entry.name or "/".join(entry.outputs)
+    return f"{entry.op_type} ({name})"
+
+
+def print_graph_diff(
+    model_ori: onnx.ModelProto, model_opt: onnx.ModelProto, limit: int = 50
+) -> None:
+    """Print the node- and value-level diff between ``model_ori`` and
+    ``model_opt`` (see ``diff_graphs``), in a unified-diff style: ``-`` for
+    what simplification removed, ``+`` for what it added, ``~`` for a node kept
+    under the same output name(s) but changed. Each section is capped at
+    ``limit`` entries (with a "... and N more" line) so a large model's diff
+    stays readable.
+    """
+    diff = diff_graphs(model_ori, model_opt)
+
+    def print_section(title: str, count: int) -> None:
+        print(f"[bold]{title} ({count}):[/bold]")
+
+    def print_capped(lines: List[Text]) -> None:
+        for line in lines[:limit]:
+            print(line)
+        if len(lines) > limit:
+            print(Text(f"  ... and {len(lines) - limit} more", style="dim"))
+
+    print(Text("Graph diff (matched by node output / value name):", style="bold"))
+
+    print_section("Nodes removed", len(diff.removed_nodes))
+    print_capped(
+        [Text(f"  - {_node_label(n)}", style="red") for n in diff.removed_nodes]
+    )
+
+    print_section("Nodes added", len(diff.added_nodes))
+    print_capped(
+        [Text(f"  + {_node_label(n)}", style="green") for n in diff.added_nodes]
+    )
+
+    print_section("Nodes changed", len(diff.changed_nodes))
+    changed_lines = []
+    for before, after in diff.changed_nodes:
+        label = _node_label(after)
+        if before.op_type != after.op_type:
+            changed_lines.append(
+                Text(
+                    f"  ~ {label}: {before.op_type} -> {after.op_type}", style="yellow"
+                )
+            )
+        else:
+            changed_lines.append(
+                Text(
+                    f"  ~ {label}: inputs {list(before.inputs)} -> {list(after.inputs)}",
+                    style="yellow",
+                )
+            )
+    print_capped(changed_lines)
+
+    print_section("Values removed", len(diff.removed_values))
+    print_capped([Text(f"  - {v}", style="red") for v in diff.removed_values])
+
+    print_section("Values added", len(diff.added_values))
+    print_capped([Text(f"  + {v}", style="green") for v in diff.added_values])
 
 
 def _metric_str(value: Macs) -> str:
