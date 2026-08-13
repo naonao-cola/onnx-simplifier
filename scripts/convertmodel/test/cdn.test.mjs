@@ -13,6 +13,8 @@ import {
   ORT_BASE,
   HF_HUB_VERSION,
   HF_HUB_ESM,
+  TOKENIZERS_VERSION,
+  TOKENIZERS_ESM,
   PERFETTO_ORIGIN,
   PERFETTO_EMBED_SRC,
 } from "../cdn.mjs";
@@ -40,6 +42,11 @@ check("HF_HUB_ESM points at the pinned @huggingface/hub version", () => {
   assert.ok(HF_HUB_ESM.includes(HF_HUB_VERSION));
 });
 
+check("TOKENIZERS_ESM points at the pinned @huggingface/tokenizers version", () => {
+  assert.equal(TOKENIZERS_ESM, `https://esm.sh/@huggingface/tokenizers@${TOKENIZERS_VERSION}`);
+  assert.ok(TOKENIZERS_ESM.includes(TOKENIZERS_VERSION));
+});
+
 check("PERFETTO_EMBED_SRC is the embedded-mode URL on PERFETTO_ORIGIN", () => {
   assert.ok(PERFETTO_EMBED_SRC.startsWith(PERFETTO_ORIGIN + "/"));
   assert.ok(PERFETTO_EMBED_SRC.includes("mode=embedded"));
@@ -49,6 +56,7 @@ check("every declared endpoint is an https URL on its expected origin", () => {
   const expect = [
     [ORT_BASE, "cdn.jsdelivr.net"],
     [HF_HUB_ESM, "esm.sh"],
+    [TOKENIZERS_ESM, "esm.sh"],
     [PERFETTO_ORIGIN, "ui.perfetto.dev"],
     [PERFETTO_EMBED_SRC, "ui.perfetto.dev"],
   ];

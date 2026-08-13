@@ -13,10 +13,15 @@
 // fetches over the network is *data* (models, backend test cases, model lists)
 // pulled from Hugging Face / GitHub per feature; that stays with its feature.
 //
-//   * onnxruntime-web  (cdn.jsdelivr.net)  — inference + the ORT-web build's
-//                                            constant folding
-//   * @huggingface/hub (esm.sh)            — experimental Xet download (lazy)
-//   * Perfetto UI      (ui.perfetto.dev)   — optional embedded trace viewer
+//   * onnxruntime-web        (cdn.jsdelivr.net) — inference + the ORT-web
+//                                                  build's constant folding
+//   * @huggingface/hub       (esm.sh)           — experimental Xet download
+//                                                  (lazy)
+//   * @huggingface/tokenizers(esm.sh)           — sample-data text tokenizing
+//                                                  for the inference panel
+//                                                  (lazy)
+//   * Perfetto UI            (ui.perfetto.dev)  — optional embedded trace
+//                                                  viewer
 //
 // Pure constants only (no window/document access) so the Node tests can import
 // and assert on them.
@@ -45,6 +50,15 @@ export const ORT_BASE = `https://cdn.jsdelivr.net/npm/onnxruntime-web@${ORT_VERS
 // around the old serial-only behavior with manual byte-range sharding.
 export const HF_HUB_VERSION = "2.15.0";
 export const HF_HUB_ESM = `https://esm.sh/@huggingface/hub@${HF_HUB_VERSION}`;
+
+// --- @huggingface/tokenizers ------------------------------------------------
+// Pure-JS/TS tokenizer implementation (no native/WASM bindings, no
+// onnxruntime-web of its own — unlike @huggingface/transformers, which bundles
+// a second, possibly mismatched ORT build). Loaded lazily by tokenize.mjs, only
+// when the "Run inference" panel's sample-data fill mode needs to tokenize text
+// for an NLP model.
+export const TOKENIZERS_VERSION = "0.1.3";
+export const TOKENIZERS_ESM = `https://esm.sh/@huggingface/tokenizers@${TOKENIZERS_VERSION}`;
 
 // --- Perfetto UI -----------------------------------------------------------
 // The trace viewer can embed the full Perfetto UI (or open it in a new tab) for

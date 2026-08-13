@@ -405,6 +405,21 @@ agraph (float[N] X) =&gt; (float[N] Y) {
             unavailable. Tick <b>auto-run after each conversion</b> to run this
             panel automatically whenever a conversion finishes (with the options
             selected here), instead of clicking <b>Run inference</b> each time.
+            The <b>input fill</b> picker's <b>sample data</b> option feeds real
+            data instead of synthetic numbers: a photo from
+            <a href="https://huggingface.co/datasets/frgfm/imagenette" target="_blank" rel="noopener">frgfm/imagenette</a>
+            for an image-shaped input, or a tokenized sentence from
+            <a href="https://huggingface.co/datasets/stanfordnlp/sst2" target="_blank" rel="noopener">stanfordnlp/sst2</a>
+            for a recognized NLP model's <code>input_ids</code>/
+            <code>attention_mask</code>/<code>token_type_ids</code> — both
+            fetched live from Hugging Face for each run. Any input that doesn't
+            match one of those shapes, or an NLP model whose tokenizer family
+            isn't recognized, falls back to random fill (logged in the output
+            below). With <b>sample data</b> selected, a run also shows what it
+            actually fed the model and got back — the fetched image/sentence
+            next to the model's raw output, decoded as top-5 ImageNet-1k
+            predictions when the output looks like a standard 1000-way
+            classifier (a best-effort guess, not verified per model).
         </p>
         <p>
             The execution-provider picker also offers
@@ -453,11 +468,12 @@ agraph (float[N] X) =&gt; (float[N] Y) {
                    title="Size for the model's dynamic batch (first) axis; ignored on fixed-shape inputs.">
             <label for="inference-fill">input fill</label>
             <select id="inference-fill"
-                    title="How the auto-generated float inputs are valued (integer/bool inputs stay zero). 'random' varies the input so the before/after compare actually exercises the graph; 'zeros' can mask a divergence. Mirrors the CLI's --input-fill.">
+                    title="How the auto-generated inputs are valued. 'random'/'ones'/'zeros'/'arange' are synthetic (integer/bool inputs stay zero; mirrors the CLI's --input-fill). 'sample data' fetches a real image (frgfm/imagenette) or tokenized sentence (stanfordnlp/sst2) from Hugging Face for inputs shaped like one; any other input, or a model whose tokenizer isn't recognized, falls back to random fill (logged).">
                 <option value="random">random (deterministic)</option>
                 <option value="ones">ones</option>
                 <option value="zeros">zeros</option>
                 <option value="arange">arange (0, 1, 2, …)</option>
+                <option value="sample">sample data (real image/text from Hugging Face)</option>
             </select>
             <input type="checkbox" id="inference-profile" checked>
             <label for="inference-profile">profile (Chrome trace)</label>
@@ -469,6 +485,7 @@ agraph (float[N] X) =&gt; (float[N] Y) {
         <div id="webnn-status" class="note" style="margin-top: 0.3em;" title="">WebNN status: probing…</div>
         <textarea id="inference-output" readonly rows="12" style="width: 100%; box-sizing: border-box;"></textarea>
         <div id="inference-macs"></div>
+        <div id="inference-sample-io" class="wide"></div>
         <p>
             With profiling on (default), the run captures an onnxruntime-web
             trace: on WebGPU, one span per GPU kernel invocation; on WASM (or as
