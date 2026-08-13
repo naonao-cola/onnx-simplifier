@@ -14,6 +14,7 @@
 import { runInference, compareInference } from "./inference_core.mjs";
 import { fillInput, INPUT_FILL_MODES } from "./input_fill.mjs";
 import { buildSampleInput, createSampleContext } from "./sample_inputs.mjs";
+import { summarizeOutput } from "./classify_output.mjs";
 import { summarizeOrtTrace } from "./trace_build.mjs";
 import { renderTrace } from "./trace_viewer.mjs";
 import { downloadText } from "./download.mjs";
@@ -92,10 +93,14 @@ function concreteShape(shape, batch = 1) {
 // before/after diff is meaningful), the user-chosen "ones"/"zeros"/"arange",
 // or "sample" — a real image/tokenized-text input fetched from Hugging Face
 // (sample_inputs.mjs), falling back to "random" per-input when an input isn't
-// image- or recognized-text-shaped, or the sample fetch fails.
-async function makeDummyInputs(ort, session, batch = 1, fill = "zero", modelName = null, log = () => {}) {
+// image- or recognized-text-shaped, or the sample fetch fails. `sampleCtx`
+// (from sample_inputs.mjs's createSampleContext()) is created by the caller
+// (initInferencePanel's runOnce()) rather than here, so it can render the
+// fetched image/sentence in the "sample data" input/output preview once the
+// run finishes — the same context reference is reused across every input a
+// model has, so a multi-input model shares one fetched sample.
+async function makeDummyInputs(ort, session, batch = 1, fill = "zero", modelName = null, sampleCtx = null, log = () => {}) {
   const feeds = {};
-  const sampleCtx = fill === "sample" ? createSampleContext() : null;
   for (const meta of session.inputMetadata) {
     if (!meta.isTensor) {
       throw new Error(`input '${meta.name}' is not a tensor; cannot auto-generate`);
@@ -121,11 +126,11 @@ async function makeDummyInputs(ort, session, batch = 1, fill = "zero", modelName
 // the single-model and compare paths so the compare path can build ONE set of
 // inputs and feed the SAME tensor to both models. Returns
 // { feeds, inputName, leadMeta, leadingDynamic }.
-async function prepareInputs(ort, modelBytes, batch, fill, modelName, log) {
+async function prepareInputs(ort, modelBytes, batch, fill, modelName, sampleCtx, log) {
   const metaSession = await ort.InferenceSession.create(modelBytes, {
     executionProviders: ["wasm"],
   });
-  const feeds = await makeDummyInputs(ort, metaSession, batch, fill, modelName, log);
+  const feeds = await makeDummyInputs(ort, metaSession, batch, fill, modelName, sampleCtx, log);
   const inputName = metaSession.inputNames[0];
   const leadMeta = metaSession.inputMetadata.find((mm) => mm.name === inputName);
   const leadingDynamic = isDynamicDim(leadMeta?.shape?.[0]);
@@ -143,7 +148,7 @@ async function prepareInputs(ort, modelBytes, batch, fill, modelName, log) {
 
 async function runOnModel(
   modelBytes,
-  { iterations, warmup, batch, providers, needWebnn, profile, fill = "zero", modelName = null },
+  { iterations, warmup, batch, providers, needWebnn, profile, fill = "zero", modelName = null, sampleCtx = null },
   log,
 ) {
   const ort = await loadOrt(needWebnn ? "all" : "default");
@@ -154,6 +159,7 @@ async function runOnModel(
     batch,
     fill,
     modelName,
+    sampleCtx,
     log,
   );
   log(`input '${inputName}' dims [${feeds[inputName].dims.join(", ")}] (fill=${fill})`);
@@ -187,7 +193,7 @@ async function runOnModel(
 async function runCompare(
   originalBytes,
   convertedBytes,
-  { iterations, warmup, batch, providers, needWebnn, profile, fill = "random", modelName = null },
+  { iterations, warmup, batch, providers, needWebnn, profile, fill = "random", modelName = null, sampleCtx = null },
   log,
 ) {
   const ort = await loadOrt(needWebnn ? "all" : "default");
@@ -198,6 +204,7 @@ async function runCompare(
     batch,
     fill,
     modelName,
+    sampleCtx,
     log,
   );
   const input = feeds[inputName];
@@ -463,6 +470,92 @@ function renderCompare(container, log, originalBytes, convertedBytes, cmp, toler
   }
 }
 
+const HTML_ESCAPES = { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" };
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, (c) => HTML_ESCAPES[c]);
+}
+
+// Revoked before creating the next one, so switching between sample-data runs
+// doesn't leak a blob URL per run.
+let lastSampleImageUrl = null;
+
+// Render the "sample data" input/output preview: the real image/sentence the
+// run fed the model (from `sampleCtx`, sample_inputs.mjs's per-run cache —
+// already resolved by the time a run completes, since makeDummyInputs awaited
+// it while building feeds), and a best-effort read of the model's raw output
+// (classify_output.mjs — decoded ImageNet-1k labels when the output looks like
+// a standard 1000-way classifier, otherwise a plain numeric preview). No-ops
+// (clearing the panel) when `sampleCtx` is null, i.e. the run didn't use the
+// "sample data" fill mode.
+async function renderSampleIO(container, sampleCtx, output, dims, outputLabel) {
+  if (!container) return;
+  if (!sampleCtx) {
+    container.innerHTML = "";
+    return;
+  }
+
+  let inputHtml =
+    '<p class="sample-io-note">no image- or recognized-text-shaped input on ' +
+    "this model — sample data wasn't used (see the log for the fallback " +
+    "reason).</p>";
+  if (sampleCtx.imagePromise) {
+    try {
+      const { bytes, label } = await sampleCtx.imagePromise;
+      const url = URL.createObjectURL(new Blob([bytes]));
+      if (lastSampleImageUrl) URL.revokeObjectURL(lastSampleImageUrl);
+      lastSampleImageUrl = url;
+      inputHtml =
+        `<img class="sample-io-image" src="${url}" alt="sample input image">` +
+        `<p class="sample-io-caption">"${escapeHtml(label)}" — ` +
+        '<a href="https://huggingface.co/datasets/frgfm/imagenette" target="_blank" rel="noopener">frgfm/imagenette</a></p>';
+    } catch (e) {
+      inputHtml = `<p class="sample-io-note">sample image unavailable (${escapeHtml(e && e.message ? e.message : e)})</p>`;
+    }
+  } else if (sampleCtx.textPromise) {
+    try {
+      const { text, label } = await sampleCtx.textPromise;
+      inputHtml =
+        `<blockquote class="sample-io-text">${escapeHtml(text)}</blockquote>` +
+        `<p class="sample-io-caption">${escapeHtml(label)} — ` +
+        '<a href="https://huggingface.co/datasets/stanfordnlp/sst2" target="_blank" rel="noopener">stanfordnlp/sst2</a></p>';
+    } catch (e) {
+      inputHtml = `<p class="sample-io-note">sample text unavailable (${escapeHtml(e && e.message ? e.message : e)})</p>`;
+    }
+  }
+
+  let outputHtml = '<p class="sample-io-note">no output captured.</p>';
+  if (output && dims) {
+    const summary = summarizeOutput(output, dims);
+    if (summary.kind === "imagenet") {
+      outputHtml =
+        '<ol class="sample-io-preds">' +
+        summary.top
+          .map(
+            ({ label, prob }) =>
+              `<li><span class="sample-io-pred-label">${escapeHtml(label)}</span>` +
+              `<span class="sample-io-pred-prob">${(prob * 100).toFixed(1)}%</span></li>`,
+          )
+          .join("") +
+        "</ol>" +
+        `<p class="sample-io-caption">top-${summary.top.length} of a 1000-way output, decoded as ` +
+        "standard ImageNet-1k classes — a best-effort guess (see classify_output.mjs), not " +
+        "verified against this specific model's training labels.</p>";
+    } else {
+      const more = summary.total > summary.preview.length ? ", …" : "";
+      outputHtml =
+        `<p class="sample-io-note">output shape [${dims.join(", ")}] (${summary.total} values) — ` +
+        "no recognized label mapping, showing raw values:</p>" +
+        `<code class="sample-io-raw">${escapeHtml(summary.preview.map((v) => v.toFixed(4)).join(", "))}${more}</code>`;
+    }
+  }
+
+  container.innerHTML =
+    '<div class="sample-io-panes">' +
+    `<div class="dp-pane"><div class="dp-head">Input</div>${inputHtml}</div>` +
+    `<div class="dp-pane"><div class="dp-head">Output${outputLabel ? ` (${escapeHtml(outputLabel)})` : ""}</div>${outputHtml}</div>` +
+    "</div>";
+}
+
 export function initInferencePanel() {
   const btn = document.getElementById("run-inference");
   const out = document.getElementById("inference-output");
@@ -477,6 +570,7 @@ export function initInferencePanel() {
   const autoRunChk = document.getElementById("inference-autorun");
   const traceContainer = document.getElementById("inference-trace");
   const macsContainer = document.getElementById("inference-macs");
+  const sampleIoContainer = document.getElementById("inference-sample-io");
   const dlLogBtn = document.getElementById("download-inference-log-button");
   const webnnStatusEl = document.getElementById("webnn-status");
   if (!btn) return;
@@ -532,6 +626,7 @@ export function initInferencePanel() {
     out.value = "";
     if (traceContainer) traceContainer.innerHTML = "";
     if (macsContainer) macsContainer.innerHTML = "";
+    if (sampleIoContainer) sampleIoContainer.innerHTML = "";
     // Mirror onnxruntime-web's own console diagnostics and unhandled WebNN/ORT
     // promise rejections into this panel's log for the duration of the run —
     // e.g. "WebNN backend does not support data type: int64", which ORT throws
@@ -555,6 +650,10 @@ export function initInferencePanel() {
       // stale/edited DOM can't feed a bad mode into the fill routine.
       const fillValue = fillSelect ? fillSelect.value : "random";
       const fill = ALL_FILL_MODES.includes(fillValue) ? fillValue : "random";
+      // Shared across every input a model has (see makeDummyInputs/
+      // buildSampleInput) so a multi-input model reuses ONE fetched sample,
+      // and so renderSampleIO can show what was actually fed after the run.
+      const sampleCtx = fill === "sample" ? createSampleContext() : null;
 
       if (isWebnnEp(epValue)) {
         log(
@@ -576,7 +675,7 @@ export function initInferencePanel() {
         const cmp = await runCompare(
           original.bytes,
           converted.bytes,
-          { iterations, warmup, batch, providers, needWebnn, profile, fill, modelName: original.name },
+          { iterations, warmup, batch, providers, needWebnn, profile, fill, modelName: original.name, sampleCtx },
           log,
         );
         log(
@@ -585,6 +684,9 @@ export function initInferencePanel() {
         );
         if (macsContainer) {
           renderCompare(macsContainer, log, original.bytes, converted.bytes, cmp, tolerance);
+        }
+        if (sampleIoContainer) {
+          await renderSampleIO(sampleIoContainer, sampleCtx, cmp.after.output, cmp.after.dims, "converted");
         }
         if (profile && cmp.after.trace && traceContainer) {
           renderTrace(traceContainer, cmp.after.trace, {
@@ -603,7 +705,7 @@ export function initInferencePanel() {
       log(`loading onnxruntime-web ${ORT_VERSION}…`);
       const res = await runOnModel(
         bytes,
-        { iterations, warmup, batch, providers, needWebnn, profile, fill, modelName: name },
+        { iterations, warmup, batch, providers, needWebnn, profile, fill, modelName: name, sampleCtx },
         log,
       );
       log(
@@ -612,6 +714,9 @@ export function initInferencePanel() {
       );
       // Re-render with the measured latency to add achieved throughput.
       renderMacs(macsContainer, () => {}, bytes, res);
+      if (sampleIoContainer) {
+        await renderSampleIO(sampleIoContainer, sampleCtx, res.output, res.dims, null);
+      }
       if (profile && res.trace && traceContainer) {
         const runs = res.timings.map((durMs, index) => ({ index, startMs: 0, durMs }));
         const s = summarizeOrtTrace({ runs, kernels: res.kernels || [] });

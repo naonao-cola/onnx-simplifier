@@ -415,7 +415,11 @@ agraph (float[N] X) =&gt; (float[N] Y) {
             fetched live from Hugging Face for each run. Any input that doesn't
             match one of those shapes, or an NLP model whose tokenizer family
             isn't recognized, falls back to random fill (logged in the output
-            below).
+            below). With <b>sample data</b> selected, a run also shows what it
+            actually fed the model and got back — the fetched image/sentence
+            next to the model's raw output, decoded as top-5 ImageNet-1k
+            predictions when the output looks like a standard 1000-way
+            classifier (a best-effort guess, not verified per model).
         </p>
         <p>
             The execution-provider picker also offers
@@ -481,6 +485,7 @@ agraph (float[N] X) =&gt; (float[N] Y) {
         <div id="webnn-status" class="note" style="margin-top: 0.3em;" title="">WebNN status: probing…</div>
         <textarea id="inference-output" readonly rows="12" style="width: 100%; box-sizing: border-box;"></textarea>
         <div id="inference-macs"></div>
+        <div id="inference-sample-io" class="wide"></div>
         <p>
             With profiling on (default), the run captures an onnxruntime-web
             trace: on WebGPU, one span per GPU kernel invocation; on WASM (or as

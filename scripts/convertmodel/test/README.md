@@ -140,6 +140,7 @@ itself has no DOM-level Node test:
 npm run test:tokenize   # familyFromFilename() + FAMILY_TOKENIZER, all pure
 npm run test:hfdata     # hf_datasets.mjs row-fetch logic, fetch stubbed
 npm run test:sample     # sample_inputs.mjs's shape classifiers + pixel math
+npm run test:classify   # classify_output.mjs's softmax/top-K/ImageNet decode
 ```
 
 Not covered by these (needs a real browser + network — see the manual
@@ -151,6 +152,30 @@ check: serve `scripts/convertmodel/`, load an image model (e.g.
 `onnxmodelzoo/bert_Opset18`) from the Hugging Face panel, set **input fill ->
 sample data**, and confirm the log shows a real fetched image/sentence and the
 run completes.
+
+### Input/output preview
+
+`inference_browser.mjs`'s `renderSampleIO()` renders what a `sample data` run
+actually fed the model and got back, in a panel below the MACs cards
+(`#inference-sample-io` in `index.html`, styled by the `.sample-io-*` rules in
+`style.css`):
+
+- **Input**: the fetched image (an `<img>` from an object URL built off the raw
+  bytes `sample_inputs.mjs` already cached on the run's `sampleCtx`) or the
+  fetched sentence, with its source dataset linked.
+- **Output**: `classify_output.mjs`'s `summarizeOutput(output, dims)` — when
+  the output looks like a standard 1000-way ImageNet classifier (`dims`' last
+  axis is 1000, every other axis is 1 — `isImagenetLogits()`), a softmax +
+  top-5 decoded through `imagenet_classes.mjs` (sourced from pytorch/hub's
+  canonical `imagenet_classes.txt`, the same order timm/torchvision-trained
+  models use); otherwise the shape plus the first few raw values. This is a
+  labeled best guess, not a verified mapping — a non-ImageNet model that
+  happens to emit exactly 1000 outputs would be mislabeled, which is why the
+  panel always states it's a best-effort decode.
+
+`test:classify` covers `isImagenetLogits`/`softmax`/`topK`/`summarizeOutput`
+directly; the actual DOM rendering (object URL creation/revocation, the
+generated HTML) is manual-only, same caveat as the rest of this section.
 
 ## Report-an-issue URL
 
