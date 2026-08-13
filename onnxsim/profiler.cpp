@@ -22,7 +22,11 @@
 // Platform-specific resident-set-size readers. Everything degrades to 0 (peak
 // memory simply unreported) on platforms none of these branches cover, so the
 // timing side of the profiler keeps working regardless.
-#if defined(__linux__)
+#if defined(__EMSCRIPTEN__)
+// No branch needed: wasm has no RSS API, and calling getrusage() (the
+// fallback below) hits Emscripten's unimplemented __syscall_getrusage, which
+// logs "unsupported syscall" to the console on every profiler span.
+#elif defined(__linux__)
 #include <unistd.h>
 #elif defined(__APPLE__)
 #include <mach/mach.h>
@@ -42,7 +46,9 @@ namespace {
 // Current resident set size of this process, in bytes. Returns 0 when it cannot
 // be determined.
 size_t ReadCurrentRssBytes() {
-#if defined(__linux__)
+#if defined(__EMSCRIPTEN__)
+  return 0;
+#elif defined(__linux__)
   // /proc/self/statm reports memory in pages: "size resident shared ...".
   std::FILE* f = std::fopen("/proc/self/statm", "r");
   if (f == nullptr) {
