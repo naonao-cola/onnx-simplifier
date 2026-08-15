@@ -179,6 +179,13 @@ three modes:
    (docs.rs sets `DOCS_RS` automatically). The crate type-checks but cannot be
    linked into a runnable binary.
 
+Mode 1 is the default only *inside* this repository, where the C++ sources sit
+two directories above the crate. The published crate ships without them, so a
+build from crates.io stops immediately with a message pointing at the three
+modes rather than attempting a source build that cannot work; pick mode 2 or 3
+there. [The standalone package build test](#standalone-package-build-test)
+covers exactly that situation.
+
 ### Environment variables
 
 | Variable             | Effect                                                        |
@@ -250,6 +257,50 @@ summary and pull-request comment.
 
 The integration test in `onnxsim/tests/` is ignored by default because it needs
 the linked native library and an ONNX model; see the file header to enable it.
+
+## Standalone package build test
+
+`cargo publish --no-verify` (see [Publishing](#publishing)) means the archive
+that actually ships is never compiled by the in-tree build: `cargo build` in
+`rust/` always has the C++ sources, the submodules and the sibling crate next
+to it, and the published crate has none of that. Anything that only breaks
+there — a file missing from the package, a path dependency that stops resolving
+once cargo rewrites it to a registry dependency, a build script that assumes the
+onnxsim source tree is two directories up — would otherwise surface as a broken
+release on crates.io.
+
+[`scripts/test_rust_package_standalone.sh`](../scripts/test_rust_package_standalone.sh)
+closes that gap. It runs `cargo package`, unpacks both `.crate` archives into a
+directory **outside** this repository, patches `onnxsim`'s registry dependency
+on `onnxsim-sys` back to the freshly unpacked sibling, and builds the unpacked
+crates plus a throwaway downstream crate against them:
+
+```sh
+# Check-only (no native build, ~a minute): type-checks the unpacked crates and
+# a consumer of them, and asserts that a build with no mode selected fails fast
+# with an actionable message.
+scripts/test_rust_package_standalone.sh
+
+# Link and run the packaged crates against a native library. `--lib-dir auto`
+# reuses whatever a previous `cargo build` in rust/ already produced; pass an
+# explicit `dir[:dir...]` for a library built elsewhere.
+scripts/test_rust_package_standalone.sh --lib-dir auto --model model.onnx
+
+# Or build the native library from source against a checkout (slow):
+ONNXSIM_PREBUILT_ORT=1 scripts/test_rust_package_standalone.sh --source-dir "$PWD"
+```
+
+Useful options: `--workdir DIR` to unpack somewhere specific (it must be outside
+the repository, or the build script would find the C++ sources after all),
+`--keep` to leave the unpacked tree and the generated consumer crate around for
+inspection, and `--model PATH` to have the consumer actually simplify a model
+once the native library is linked.
+
+In CI this runs as the `package` job in
+[`.github/workflows/rust.yml`](../.github/workflows/rust.yml) (check-only, on
+every PR) and again at the end of the `build` job with `--lib-dir auto`, which
+links the packaged crates against the native library that job just built and
+runs them.
 
 ## Publishing
 

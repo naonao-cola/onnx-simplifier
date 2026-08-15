@@ -20,6 +20,11 @@ use std::process::Command;
 /// ONNX Runtime version onnxsim builds against; must match `cmake/build_ort.cmake`.
 const ONNXRUNTIME_VERSION: &str = "1.28.0";
 
+/// C API implementation file, relative to the onnxsim source root. Used both as
+/// a rebuild trigger and as the marker that a directory really is an onnxsim
+/// checkout.
+const CAPI_SOURCE: &str = "onnxsim/capi/onnxsim_c_api.cpp";
+
 fn main() {
     println!("cargo:rerun-if-env-changed=ONNXSIM_NO_BUILD");
     println!("cargo:rerun-if-env-changed=ONNXSIM_LIB_DIR");
@@ -46,13 +51,14 @@ fn main() {
 
     // Mode 3: build from source with CMake.
     let source_dir = source_dir();
+    verify_source_dir(&source_dir);
     println!(
         "cargo:rerun-if-changed={}",
         source_dir.join("CMakeLists.txt").display()
     );
     println!(
         "cargo:rerun-if-changed={}",
-        source_dir.join("onnxsim/capi/onnxsim_c_api.cpp").display()
+        source_dir.join(CAPI_SOURCE).display()
     );
 
     // ONNXSIM_PREBUILT_ORT swaps the from-source ONNX Runtime build for an
@@ -103,6 +109,37 @@ fn main() {
     // Expose where the shared libraries live so downstream crates / test
     // harnesses can set LD_LIBRARY_PATH if needed.
     println!("cargo:root={}", build_dir.display());
+}
+
+/// Fail fast, with an actionable message, when the onnxsim C++ sources are not
+/// where the from-source build expects them.
+///
+/// This is what a consumer of the *published* crate hits: `cargo package` ships
+/// only the crate directory, so a build outside this repository has no C++
+/// source tree two levels up and must pick one of the other modes. Without this
+/// check the build would download the ONNX Runtime tarball into an unrelated
+/// directory and then hand CMake a path with no `CMakeLists.txt`, failing much
+/// later with a far less obvious error.
+fn verify_source_dir(dir: &Path) {
+    if dir.join("CMakeLists.txt").is_file() && dir.join(CAPI_SOURCE).is_file() {
+        return;
+    }
+    let hint = if env::var_os("ONNXSIM_SOURCE_DIR").is_some() {
+        "ONNXSIM_SOURCE_DIR is set but does not point at an onnxsim checkout"
+    } else {
+        "onnxsim-sys was not built from inside the onnxsim repository, so the \
+         C++ sources it compiles by default are not available"
+    };
+    panic!(
+        "cannot build the native onnxsim_c library from source: {hint} \
+         (looked for CMakeLists.txt and {CAPI_SOURCE} under {}).\n\
+         Pick one of:\n  \
+         * ONNXSIM_LIB_DIR=<dir>    link a pre-built onnxsim_c (and its dependencies)\n  \
+         * ONNXSIM_SOURCE_DIR=<dir> point at an onnxsim checkout with submodules initialized\n  \
+         * ONNXSIM_NO_BUILD=1       skip the native build entirely (type-check only)\n\
+         See https://github.com/onnxsim/onnxsim/blob/master/rust/README.md#building-the-native-library",
+        dir.display()
+    );
 }
 
 /// Ensure the ONNX Runtime source tree exists at
