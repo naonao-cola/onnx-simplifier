@@ -245,3 +245,98 @@ def test_function_rewriter_replaces_builtin_pass():
     counts = _op_types(with_rule)
     assert counts["Gemm"] == 1 and counts["MatMul"] == 0 and counts["Add"] == 0, counts
     assert check_ok
+
+
+def test_function_rewriter_batches_independent_matches():
+    """Several independent (non-overlapping) MatMul+Add blocks all fuse in one
+    ``simplify`` call. Each block is matched and rewritten in the same batch
+    (see ``ApplyMatchesBatch`` in function_rewriter.cpp) rather than one at a
+    time, so this also exercises that every block gets a distinct fresh
+    interior-name prefix instead of colliding."""
+    n = 5
+    nodes = []
+    inputs = []
+    inits = []
+    outputs = []
+    for i in range(n):
+        x, w, b, y = f"x{i}", f"w{i}", f"b{i}", f"y{i}"
+        nodes.append(onnx.helper.make_node("MatMul", [x, w], [f"mm{i}"], name=f"mm{i}"))
+        nodes.append(onnx.helper.make_node("Add", [f"mm{i}", b], [y], name=f"add{i}"))
+        inputs.append(_vi(x, [3, 4]))
+        inits += [_f32(np.random.randn(4, 5), w), _f32(np.random.randn(5), b)]
+        outputs.append(_vi(y, [3, 5]))
+    model = _model(nodes, inputs, outputs, inits)
+
+    sim_model, check_ok = onnxsim.simplify(
+        model,
+        check_n=1,
+        skipped_optimizers=["fuse_matmul_add_bias_into_gemm"],
+        function_rewrite_rules=[(_GEMM_PATTERN, _GEMM_REPLACEMENT)],
+    )
+    counts = _op_types(sim_model)
+    assert counts["Gemm"] == n and counts["MatMul"] == 0 and counts["Add"] == 0, counts
+    assert check_ok
+
+
+# A pattern that chains the same custom op twice -- used to force *overlapping*
+# match candidates (see the conflict test below): on a chain of 3 MyOp nodes,
+# the candidate rooted at node 2 and the candidate rooted at node 3 both claim
+# node 2, which no builtin-op pattern in this file's other tests can do (their
+# root and interior node kinds always differ).
+_CHAIN_PATTERN = parser.parse_function(
+    """
+<domain: "com.onnxsim.test", opset_import: ["com.onnxsim.test" : 1]>
+chain_pattern (x) => (y)
+{
+    t = com.onnxsim.test.MyOp(x)
+    y = com.onnxsim.test.MyOp(t)
+}
+"""
+)
+_CHAIN_REPLACEMENT = parser.parse_function(
+    """
+<domain: "com.onnxsim.test", opset_import: ["com.onnxsim.test" : 1]>
+chain_replacement (x) => (y)
+{
+    y = com.onnxsim.test.MyOpFused(x)
+}
+"""
+)
+
+
+def test_function_rewriter_overlapping_candidates_resolved_across_rounds():
+    """A chain of 3 ``MyOp`` nodes offers two candidate matches for the
+    2-node ``MyOp(MyOp(x))`` pattern -- rooted at node 2 (claims nodes 1-2) and
+    rooted at node 3 (claims nodes 2-3) -- that share node 2. Collecting both
+    into the same batch would double-claim it and corrupt the graph (or, before
+    the fresh-name accumulator, collide their interior names); the rewriter
+    must keep only one non-conflicting candidate per round and pick up the
+    rest -- if any is still possible -- on the next round against the
+    rewritten graph.
+
+    Here the second candidate becomes permanently unmatchable once the first
+    is applied (its predecessor becomes ``MyOpFused``, a different op), so the
+    correct fixed point is exactly one fusion, not two and not zero."""
+    domain = "com.onnxsim.test"
+    n1 = onnx.helper.make_node("MyOp", ["x"], ["v1"], name="n1", domain=domain)
+    n2 = onnx.helper.make_node("MyOp", ["v1"], ["v2"], name="n2", domain=domain)
+    n3 = onnx.helper.make_node("MyOp", ["v2"], ["v3"], name="n3", domain=domain)
+    graph = onnx.helper.make_graph(
+        [n1, n2, n3], "g", [_vi("x", [4])], [_vi("v3", [4])], []
+    )
+    model = onnx.helper.make_model(
+        graph,
+        opset_imports=[
+            onnx.helper.make_opsetid("", 18),
+            onnx.helper.make_opsetid(domain, 1),
+        ],
+        ir_version=10,
+    )
+    onnx.checker.check_model(model)
+
+    sim_model, _ = onnxsim.simplify(
+        model, check_n=0, function_rewrite_rules=[(_CHAIN_PATTERN, _CHAIN_REPLACEMENT)]
+    )
+    onnx.checker.check_model(sim_model)
+    counts = _op_types(sim_model)
+    assert counts["MyOpFused"] == 1 and counts["MyOp"] == 1, counts

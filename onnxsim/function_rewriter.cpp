@@ -104,10 +104,17 @@ struct HostIndex {
   std::unordered_map<std::string, const onnx::TensorProto*> initializer;
   std::unordered_set<std::string> graph_outputs;
   std::unordered_set<std::string> value_names;  // every name in use anywhere.
+  // Node *names* -- a separate namespace from value names, but onnxruntime
+  // still rejects two nodes sharing one, so freshly-minted replacement node
+  // names need to avoid these too (see FreshPrefix).
+  std::unordered_set<std::string> node_names;
 
   explicit HostIndex(const onnx::GraphProto& graph) {
     for (int i = 0; i < graph.node_size(); ++i) {
       const auto& node = graph.node(i);
+      if (!node.name().empty()) {
+        node_names.insert(node.name());
+      }
       for (int s = 0; s < node.output_size(); ++s) {
         const std::string& out = node.output(s);
         if (!out.empty()) {
@@ -310,15 +317,25 @@ class Matcher {
   const PatternIndex& pat_;
 };
 
-// Choose a value-name prefix that collides with nothing already in the graph,
-// so replacement interior values are guaranteed fresh.
+// Choose a prefix that collides with nothing already in the graph (as either
+// a value name or a node name -- two separate ONNX namespaces, but checked
+// together here since that's only ever more conservative) nor in ``reserved``
+// -- names already claimed by other matches instantiated earlier in the same
+// batch (see ApplyMatchesBatch) -- so a replacement's interior values *and*
+// its nodes' own names are guaranteed fresh even when several matches of the
+// same rule (which typically share the same interior/node names, e.g. always
+// "t", or "node0" for an unnamed single-node replacement) are instantiated
+// together against one frozen HostIndex.
 std::string FreshPrefix(const HostIndex& host,
-                        const std::vector<std::string>& interior_names) {
+                        const std::unordered_set<std::string>& reserved,
+                        const std::vector<std::string>& names) {
   for (int k = 0;; ++k) {
     std::string prefix = "onnxsim_fnrw" + std::to_string(k) + "_";
     bool ok = true;
-    for (const auto& name : interior_names) {
-      if (host.value_names.count(prefix + name)) {
+    for (const auto& name : names) {
+      const std::string full = prefix + name;
+      if (host.value_names.count(full) || host.node_names.count(full) ||
+          reserved.count(full)) {
         ok = false;
         break;
       }
@@ -358,14 +375,25 @@ void EnsureOpsetImports(onnx::ModelProto& model,
   }
 }
 
-// Apply ``rule``'s replacement for a validated match: delete the matched nodes
-// and splice in the instantiated replacement at the last matched position.
-// Returns false (no change) if the replacement cannot be instantiated cleanly.
-bool ApplyReplacement(onnx::ModelProto& model, onnx::GraphProto& graph,
-                      const HostIndex& host, const FunctionRewriteRule& rule,
-                      const MatchState& state,
-                      const std::vector<std::string>& out_host,
-                      const std::set<int>& matched) {
+// A single validated, not-yet-applied match of a rule's pattern.
+struct MatchResult {
+  MatchState state;
+  std::vector<std::string> out_host;
+  std::set<int> matched;
+};
+
+// Instantiate ``rule``'s replacement for one validated match: build the
+// renamed, attribute-filled replacement nodes. Does not touch the graph's
+// node list -- ApplyMatchesBatch does that once for a whole batch of matches,
+// rather than once per match. ``reserved_names`` accumulates every fresh
+// interior name minted so far this batch (see FreshPrefix). Returns false (no
+// change) if the replacement cannot be instantiated cleanly.
+bool InstantiateReplacement(const HostIndex& host,
+                            const FunctionRewriteRule& rule,
+                            const MatchState& state,
+                            const std::vector<std::string>& out_host,
+                            std::unordered_set<std::string>& reserved_names,
+                            std::vector<onnx::NodeProto>& new_nodes) {
   const onnx::FunctionProto& rep = rule.replacement;
   if (rep.output_size() != static_cast<int>(out_host.size())) {
     return false;
@@ -393,7 +421,25 @@ bool ApplyReplacement(onnx::ModelProto& model, onnx::GraphProto& graph,
     for (const auto& v : node.output()) note_interior(v);
     for (const auto& v : node.input()) note_interior(v);
   }
-  const std::string prefix = FreshPrefix(host, interior);
+
+  // Node *names* need the same freshness as interior values (see FreshPrefix)
+  // -- computed here, ahead of the node-building loop below, so both use the
+  // exact same fallback name per replacement node.
+  std::vector<std::string> node_name_suffixes;
+  node_name_suffixes.reserve(rep.node_size());
+  for (int i = 0; i < rep.node_size(); ++i) {
+    const auto& rnode = rep.node(i);
+    node_name_suffixes.push_back(
+        rnode.name().empty() ? "node" + std::to_string(i) : rnode.name());
+  }
+
+  std::vector<std::string> fresh_names = interior;
+  fresh_names.insert(fresh_names.end(), node_name_suffixes.begin(),
+                     node_name_suffixes.end());
+  const std::string prefix = FreshPrefix(host, reserved_names, fresh_names);
+  for (const auto& name : fresh_names) {
+    reserved_names.insert(prefix + name);
+  }
 
   auto rename = [&](const std::string& name) -> std::string {
     if (name.empty()) {
@@ -413,19 +459,16 @@ bool ApplyReplacement(onnx::ModelProto& model, onnx::GraphProto& graph,
   };
 
   // Build the replacement nodes with renamed edges and bound attributes.
-  std::vector<onnx::NodeProto> new_nodes;
+  new_nodes.clear();
   new_nodes.reserve(rep.node_size());
-  int node_counter = 0;
-  for (const auto& rnode : rep.node()) {
+  for (int node_counter = 0; node_counter < rep.node_size(); ++node_counter) {
+    const auto& rnode = rep.node(node_counter);
     onnx::NodeProto n;
     n.set_op_type(rnode.op_type());
     if (!rnode.domain().empty()) {
       n.set_domain(rnode.domain());
     }
-    n.set_name(prefix + (rnode.name().empty()
-                             ? "node" + std::to_string(node_counter)
-                             : rnode.name()));
-    ++node_counter;
+    n.set_name(prefix + node_name_suffixes[node_counter]);
     for (const auto& in : rnode.input()) {
       const std::string mapped = rename(in);
       if (!in.empty() && mapped.empty()) {
@@ -452,18 +495,61 @@ bool ApplyReplacement(onnx::ModelProto& model, onnx::GraphProto& graph,
     }
     new_nodes.push_back(std::move(n));
   }
+  return true;
+}
 
-  EnsureOpsetImports(model, rep);
+// Instantiates and splices in every match's replacement in ONE combined
+// node-list rebuild, rather than rebuilding the whole node list once per
+// match: with many independent, non-conflicting matches per round (the
+// common case -- e.g. the same fusion applying to N structurally-identical
+// blocks), this turns O(node count x matches) copying into O(node count) for
+// the whole round.
+bool ApplyMatchesBatch(onnx::ModelProto& model, onnx::GraphProto& graph,
+                       const HostIndex& host, const FunctionRewriteRule& rule,
+                       std::vector<MatchResult>& matches) {
+  struct Pending {
+    std::set<int> matched;
+    std::vector<onnx::NodeProto> new_nodes;
+  };
+  std::unordered_set<std::string> reserved_names;
+  std::vector<Pending> pending;
+  pending.reserve(matches.size());
+  for (auto& m : matches) {
+    Pending p;
+    p.matched = std::move(m.matched);
+    if (InstantiateReplacement(host, rule, m.state, m.out_host, reserved_names,
+                               p.new_nodes)) {
+      pending.push_back(std::move(p));
+    }
+    // Instantiation failure (e.g. an unbound replacement input/attribute) is a
+    // rule-authoring issue, not specific to this host location; skip just this
+    // match, matching the pre-batching behavior of moving on to the next
+    // candidate.
+  }
+  if (pending.empty()) {
+    return false;
+  }
 
-  // Rebuild the node list: drop matched nodes, and emit the replacement where
-  // the last matched node was (keeping topological order).
-  const int max_idx = *matched.rbegin();
+  EnsureOpsetImports(model, rule.replacement);
+
+  // Map each match's splice point (its last matched node index) to its
+  // instantiated replacement, and union every matched index across the batch.
+  std::unordered_map<int, size_t> splice_at;
+  std::set<int> all_matched;
+  size_t new_node_total = 0;
+  for (size_t i = 0; i < pending.size(); ++i) {
+    splice_at[*pending[i].matched.rbegin()] = i;
+    all_matched.insert(pending[i].matched.begin(), pending[i].matched.end());
+    new_node_total += pending[i].new_nodes.size();
+  }
+
   std::vector<onnx::NodeProto> rebuilt;
-  rebuilt.reserve(graph.node_size() - matched.size() + new_nodes.size());
+  rebuilt.reserve(graph.node_size() - all_matched.size() + new_node_total);
   for (int i = 0; i < graph.node_size(); ++i) {
-    if (matched.count(i)) {
-      if (i == max_idx) {
-        for (auto& n : new_nodes) {
+    if (all_matched.count(i)) {
+      auto it = splice_at.find(i);
+      if (it != splice_at.end()) {
+        for (auto& n : pending[it->second].new_nodes) {
           rebuilt.push_back(std::move(n));
         }
       }
@@ -478,26 +564,35 @@ bool ApplyReplacement(onnx::ModelProto& model, onnx::GraphProto& graph,
   return true;
 }
 
-// Try to match and rewrite ``rule`` at one location in ``graph``. Returns true
-// (and mutates ``model``/``graph``) on the first successful rewrite.
-bool ApplyRuleOnce(onnx::ModelProto& model, onnx::GraphProto& graph,
-                   const HostIndex& host, const FunctionRewriteRule& rule) {
+// Scan every host node for ``rule``, collecting every valid match that
+// doesn't conflict with one already collected -- no two collected matches
+// share a graph node, and no wildcard in one match binds to a value produced
+// by a node another collected match is about to delete. ApplyMatchesBatch
+// then rewrites every collected match in one combined pass. A match that
+// conflicts with an earlier one this round is simply skipped -- it'll be
+// found again (against the then-current graph) on the next round, once
+// HostIndex is rebuilt.
+std::vector<MatchResult> CollectNonConflictingMatches(
+    const onnx::GraphProto& graph, const HostIndex& host,
+    const FunctionRewriteRule& rule) {
+  std::vector<MatchResult> results;
   const onnx::FunctionProto& pattern = rule.pattern;
   if (pattern.output_size() == 0 || pattern.node_size() == 0) {
-    return false;
+    return results;
   }
   PatternIndex pat(pattern);
 
   // Anchor on the node producing the pattern's first output.
   auto root_it = pat.producer.find(pattern.output(0));
   if (root_it == pat.producer.end()) {
-    return false;  // output(0) is a pass-through input -- nothing to match.
+    return results;  // output(0) is a pass-through input -- nothing to match.
   }
   const int root_pat_node = root_it->second.first;
   const onnx::NodeProto& root = pattern.node(root_pat_node);
 
+  std::set<int> claimed;  // union of matched-node-sets already collected.
   for (int h = 0; h < graph.node_size(); ++h) {
-    if (!SameOp(root, graph.node(h))) {
+    if (!SameOp(root, graph.node(h)) || claimed.count(h)) {
       continue;
     }
 
@@ -508,7 +603,7 @@ bool ApplyRuleOnce(onnx::ModelProto& model, onnx::GraphProto& graph,
     {
       // "Match" covers the DAG search (Matcher::MatchNode) plus the
       // bookkeeping that decides whether a found match is safe to apply --
-      // everything up to (but not including) the actual graph mutation below.
+      // everything up to (but not including) instantiating the replacement.
       ProfiledScope match_scope("RuleMatch");
       Matcher matcher(graph, host, pat);
       if (!matcher.MatchNode(root_pat_node, h, state)) {
@@ -552,6 +647,21 @@ bool ApplyRuleOnce(onnx::ModelProto& model, onnx::GraphProto& graph,
       if (matched.empty()) {
         continue;
       }
+
+      // Reject if this match shares a node with an already-collected match --
+      // handled below via `claimed`, not `matched` -- so it doesn't corrupt
+      // the batch; it'll be re-examined next round.
+      bool conflicts = false;
+      for (int idx : matched) {
+        if (claimed.count(idx)) {
+          conflicts = true;
+          break;
+        }
+      }
+      if (conflicts) {
+        continue;
+      }
+
       const int max_idx = *matched.rbegin();
 
       std::unordered_set<std::string> out_set(out_host.begin(), out_host.end());
@@ -589,7 +699,8 @@ bool ApplyRuleOnce(onnx::ModelProto& model, onnx::GraphProto& graph,
 
       // Placement safety: every consumer of a (reproduced) pattern-output
       // value must come after the splice point, and no replacement input may
-      // be produced by a matched (about-to-be-deleted) node.
+      // be produced by a node about to be deleted -- by this match or another
+      // one already claimed this round.
       for (const std::string& v : out_host) {
         auto cit = host.consumers.find(v);
         if (cit != host.consumers.end()) {
@@ -605,7 +716,9 @@ bool ApplyRuleOnce(onnx::ModelProto& model, onnx::GraphProto& graph,
       if (safe) {
         for (const auto& kv : state.vbind) {
           auto pit = host.producer.find(kv.second);
-          if (pit != host.producer.end() && matched.count(pit->second.first)) {
+          if (pit != host.producer.end() &&
+              (matched.count(pit->second.first) ||
+               claimed.count(pit->second.first))) {
             safe = false;  // a wildcard bound to a value about to be deleted.
             break;
           }
@@ -616,15 +729,11 @@ bool ApplyRuleOnce(onnx::ModelProto& model, onnx::GraphProto& graph,
       }
     }
 
-    {
-      ProfiledScope rewrite_scope("RuleApply");
-      if (ApplyReplacement(model, graph, host, rule, state, out_host,
-                           matched)) {
-        return true;
-      }
-    }
+    claimed.insert(matched.begin(), matched.end());
+    results.push_back(
+        {std::move(state), std::move(out_host), std::move(matched)});
   }
-  return false;
+  return results;
 }
 
 // A GraphRewriter that applies a fixed set of FunctionRewriteRules. Kept
@@ -643,9 +752,10 @@ class FunctionProtoRewriterImpl final : public GraphRewriter {
     onnx::GraphProto& graph = *model.mutable_graph();
     bool changed = false;
     // Keep applying rules until a full pass over every rule changes nothing.
-    // Each successful rewrite invalidates the node indices, so rebuild the
-    // index and restart the scan. A generous iteration cap guards against a
-    // pathological rule whose replacement re-creates its own pattern (which
+    // Every successful round -- possibly many non-conflicting matches of one
+    // rule, rewritten together -- invalidates the node indices, so rebuild
+    // the index and restart the scan. A generous iteration cap guards against
+    // a pathological rule whose replacement re-creates its own pattern (which
     // would otherwise loop forever); normal rule sets converge far below it.
     const long long kMaxRewrites =
         static_cast<long long>(graph.node_size()) * 100 + 100000;
@@ -655,10 +765,16 @@ class FunctionProtoRewriterImpl final : public GraphRewriter {
       progress = false;
       HostIndex host(graph);
       for (const auto& rule : rules_) {
-        if (ApplyRuleOnce(model, graph, host, rule)) {
+        std::vector<MatchResult> matches =
+            CollectNonConflictingMatches(graph, host, rule);
+        if (matches.empty()) {
+          continue;
+        }
+        ProfiledScope rewrite_scope("RuleApply");
+        if (ApplyMatchesBatch(model, graph, host, rule, matches)) {
           changed = true;
           progress = true;
-          ++applied;
+          applied += static_cast<long long>(matches.size());
           break;  // indices changed -- rebuild the index and rescan.
         }
       }
