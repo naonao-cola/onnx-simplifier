@@ -16,7 +16,13 @@ def _random_normal_like_model(with_seed: bool = False) -> onnx.ModelProto:
     attrs = {"seed": 1.0} if with_seed else {}
     node = helper.make_node("RandomNormalLike", ["x"], ["y"], **attrs)
     graph = helper.make_graph([node], "g", [x], [y])
-    return helper.make_model(graph, opset_imports=[helper.make_opsetid("", 17)])
+    # Pin ir_version: helper.make_model() otherwise defaults to the installed
+    # onnx package's current IR version, which can be newer than the
+    # onnxruntime build available in some CI jobs supports (matches
+    # test_backend.py's _make_foldable_model).
+    return helper.make_model(
+        graph, opset_imports=[helper.make_opsetid("", 17)], ir_version=10
+    )
 
 
 def _plain_model() -> onnx.ModelProto:
@@ -24,7 +30,9 @@ def _plain_model() -> onnx.ModelProto:
     y = helper.make_tensor_value_info("y", TensorProto.FLOAT, [1])
     node = helper.make_node("Identity", ["x"], ["y"])
     graph = helper.make_graph([node], "g", [x], [y])
-    return helper.make_model(graph, opset_imports=[helper.make_opsetid("", 17)])
+    return helper.make_model(
+        graph, opset_imports=[helper.make_opsetid("", 17)], ir_version=10
+    )
 
 
 # --------------------------------------------------------------------------- #
