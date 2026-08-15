@@ -52,6 +52,37 @@ _OPSET = 17
 _IR_VERSION = 8
 
 
+def _safe_jit_target():
+    """The host target, minus AVX-512/AVX-VNNI.
+
+    Halide's default JIT target is ``get_host_target()``, detected from
+    ``cpuid`` at process start. On some virtualized cloud CI runners cpuid
+    advertises AVX-512/AVX-VNNI support the actual (possibly heterogeneous)
+    fleet hardware or hypervisor does not reliably provide, and code Halide
+    generates using those instructions then ``SIGILL``s at ``realize()``
+    time. AVX-512 is not needed for these tiny test models, so this drops it
+    (and the newer AVX-VNNI) unconditionally rather than trusting cpuid.
+    """
+    target = hl.get_host_target()
+    for feature_name in (
+        "AVX512",
+        "AVX512_Cannonlake",
+        "AVX512_SapphireRapids",
+        "AVX512_Skylake",
+        "AVX512_Zen4",
+        "AVX512_Zen5",
+        "AVX512_KNL",
+        "AVXVNNI",
+    ):
+        feature = getattr(hl.TargetFeature, feature_name, None)
+        if feature is not None and target.has_feature(feature):
+            target = target.without_feature(feature)
+    return target
+
+
+_JIT_TARGET = _safe_jit_target()
+
+
 def _model(nodes, inputs, outputs, initializers, name) -> onnx.ModelProto:
     graph = helper.make_graph(nodes, name, inputs, outputs, initializers)
     model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", _OPSET)])
@@ -298,7 +329,7 @@ def _array_to_func(arr: np.ndarray):
 
 
 def _realize_to_numpy(f, shape):
-    return np.asanyarray(f.realize(list(reversed(shape))))
+    return np.asanyarray(f.realize(list(reversed(shape)), _JIT_TARGET))
 
 
 def _compile_and_run_with_halide(model: onnx.ModelProto, feeds):
