@@ -46,10 +46,14 @@ import urllib.error
 import urllib.request
 
 import onnx
-import onnxruntime
 import pytest
 
 import onnxsim
+
+# A bare ``import onnxruntime`` would fail collection (not skip the test) on
+# platforms onnxruntime doesn't ship wheels for (e.g. s390x), before the
+# ONNXSIM_RUN_VOICEVOX_TESTS skipif below even gets a chance to apply.
+onnxruntime = pytest.importorskip("onnxruntime")
 
 pytestmark = pytest.mark.skipif(
     os.environ.get("ONNXSIM_RUN_VOICEVOX_TESTS") != "1",

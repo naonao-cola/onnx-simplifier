@@ -95,45 +95,6 @@ if (ONNXSIM_BUILTIN_ORT)
   endif()
 endif()
 
-# Apply a correctness/perf patch to onnx's vendored Graph IR (onnx-optimizer's
-# fuse passes run on this), before configuring onnx-optimizer below.
-# Graph::isNameUnique() used to do an O(n) linear scan -- string comparisons
-# against every node's inputs/outputs, plus a separate initializer-name vector
-# scan -- on every single call, and fuse passes such as fuse_bn_into_conv mint
-# several fresh unique names per fusion via getNextUniqueName(). On a graph
-# with many independent fusable blocks this makes optimization scale far worse
-# than it needs to (roughly 2x total onnxsim runtime on a 900-node
-# Conv+BatchNorm+Relu benchmark). The patch adds a maintained name set so the
-# common case answers in O(1); see cmake/patches/onnx-ir-name-uniqueness.patch
-# for the full rationale. Applied idempotently so re-configuring (and CI, which
-# starts from a clean submodule checkout) is safe; if the vendored onnx source
-# has drifted and the patch no longer applies, this warns and continues
-# unpatched rather than failing the build.
-set(_onnx_ir_patch "${CMAKE_CURRENT_SOURCE_DIR}/cmake/patches/onnx-ir-name-uniqueness.patch")
-set(_onnx_dir "${CMAKE_CURRENT_SOURCE_DIR}/third_party/onnx-optimizer/third_party/onnx")
-if (EXISTS "${_onnx_dir}/onnx/common/ir.h")
-  execute_process(
-    COMMAND git apply --reverse --check "${_onnx_ir_patch}"
-    WORKING_DIRECTORY "${_onnx_dir}"
-    RESULT_VARIABLE _onnx_ir_patch_already_applied
-    OUTPUT_QUIET ERROR_QUIET)
-  if (NOT _onnx_ir_patch_already_applied EQUAL 0)
-    execute_process(
-      COMMAND git apply --check "${_onnx_ir_patch}"
-      WORKING_DIRECTORY "${_onnx_dir}"
-      RESULT_VARIABLE _onnx_ir_patch_applies_cleanly
-      OUTPUT_QUIET ERROR_QUIET)
-    if (_onnx_ir_patch_applies_cleanly EQUAL 0)
-      execute_process(COMMAND git apply "${_onnx_ir_patch}" WORKING_DIRECTORY "${_onnx_dir}")
-      message(STATUS "Applied onnx IR name-uniqueness patch")
-    else()
-      message(WARNING "onnx-ir-name-uniqueness.patch does not apply cleanly against "
-                       "third_party/onnx-optimizer/third_party/onnx (vendored onnx version drift?) "
-                       "-- continuing unpatched")
-    endif()
-  endif()
-endif()
-
 # configure onnx-optimizer after onnxruntime, because they both depend on onnx and onnxruntime has its own flags for onnx
 add_subdirectory(third_party/onnx-optimizer EXCLUDE_FROM_ALL)
 

@@ -554,8 +554,7 @@ bool ApplyRuleOnce(onnx::ModelProto& model, onnx::GraphProto& graph,
       }
       const int max_idx = *matched.rbegin();
 
-      std::unordered_set<std::string> out_set(out_host.begin(),
-                                               out_host.end());
+      std::unordered_set<std::string> out_set(out_host.begin(), out_host.end());
 
       // Safety: an interior value (produced inside the match, not a pattern
       // output) must be consumed only within the match and must not be a
@@ -606,8 +605,7 @@ bool ApplyRuleOnce(onnx::ModelProto& model, onnx::GraphProto& graph,
       if (safe) {
         for (const auto& kv : state.vbind) {
           auto pit = host.producer.find(kv.second);
-          if (pit != host.producer.end() &&
-              matched.count(pit->second.first)) {
+          if (pit != host.producer.end() && matched.count(pit->second.first)) {
             safe = false;  // a wildcard bound to a value about to be deleted.
             break;
           }
@@ -621,7 +619,7 @@ bool ApplyRuleOnce(onnx::ModelProto& model, onnx::GraphProto& graph,
     {
       ProfiledScope rewrite_scope("RuleApply");
       if (ApplyReplacement(model, graph, host, rule, state, out_host,
-                            matched)) {
+                           matched)) {
         return true;
       }
     }
