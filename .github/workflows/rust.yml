@@ -46,6 +46,30 @@ jobs:
       - name: clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+  # Builds the crates as a downstream consumer gets them: `cargo package`, then
+  # unpack the archives outside the repository and compile against the unpacked
+  # copies. Because `cargo publish` has to run with --no-verify (see
+  # "Publishing" in rust/README.md), nothing else in CI ever compiles what
+  # actually ships -- a file missing from the package, or a build script that
+  # assumes the onnxsim C++ tree sits two directories up, only breaks there.
+  # No native build, so this stays as quick as the lint job.
+  package:
+    name: standalone package build (no native build)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      # See the matching step in the lint job above for why this runs.
+      - name: Bump binding versions to the release tag
+        if: ${{ github.event_name == 'release' && startsWith(github.ref, 'refs/tags/v') }}
+        working-directory: ${{ github.workspace }}
+        run: ./scripts/bump_binding_versions.sh "${GITHUB_REF#refs/tags/}"
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Package and build the crates outside the source tree
+        working-directory: ${{ github.workspace }}
+        # RUNNER_TEMP is outside the checkout, which is what the test needs.
+        run: ./scripts/test_rust_package_standalone.sh --workdir "${RUNNER_TEMP}/rust-standalone"
+
   # Full build that compiles the C API and links it against onnxsim.
   build:
     name: build + smoke test (native)
@@ -85,6 +109,18 @@ jobs:
         run: |
           cargo test --release --workspace
           cargo test --release -- --ignored list_optimizers_is_non_empty
+      # Same standalone package test as the `package` job, but linking the
+      # native library this job just built (--lib-dir auto finds it under
+      # rust/target), so the packaged crates are linked and executed outside
+      # the source tree rather than only type-checked. Reusing the existing
+      # build tree keeps this to seconds instead of another native build.
+      - name: Standalone package build against the native library
+        working-directory: ${{ github.workspace }}
+        run: |
+          ./scripts/test_rust_package_standalone.sh \
+            --workdir "${RUNNER_TEMP}/rust-standalone-native" \
+            --lib-dir auto \
+            --model scripts/convertmodel/test/model.onnx
 
   # Publish onnxsim-sys and onnxsim to crates.io once a GitHub release is
   # published, gated on lint and build passing first. See "Publishing" in
@@ -98,7 +134,7 @@ jobs:
   publish:
     name: publish to crates.io
     if: ${{ github.event_name == 'release' && startsWith(github.ref, 'refs/tags/v') }}
-    needs: [lint, build]
+    needs: [lint, package, build]
     runs-on: ubuntu-latest
     timeout-minutes: 20
     environment: cargo
