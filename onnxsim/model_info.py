@@ -88,7 +88,7 @@ def human_readable_size(num, suffix="B"):
     # A symbolic byte count (dynamic shapes + sympy) is printed as the formula
     # itself, matching human_readable_num.
     if _is_symbolic(num):
-        return str(sympy.factor(num))
+        return _factor_or_str(num)
     for unit in ["", "Ki", "Mi", "Gi", "Ti", "Pi", "Ei", "Zi"]:
         if abs(num) < 1024.0:
             return f"{num:3.1f}{unit}{suffix}"
@@ -100,7 +100,7 @@ def human_readable_num(num, suffix=""):
     # A symbolic MAC count (dynamic shapes + sympy) is printed as the formula
     # itself, e.g. "512*batch*seq**2 + 5419008*batch".
     if _is_symbolic(num):
-        return str(sympy.factor(num))
+        return _factor_or_str(num)
     for unit in ["", "K", "M", "G", "T", "P", "E"]:
         if abs(num) < 1000.0:
             return f"{num:3.1f}{unit}{suffix}"
@@ -112,7 +112,7 @@ def human_readable_density(num, suffix=" FLOP/Byte"):
     # Arithmetic intensity is a small ratio; print it plainly. When symbolic
     # (dynamic shapes cancel unevenly) fall back to the factored formula.
     if _is_symbolic(num):
-        return f"{sympy.factor(num)}{suffix}"
+        return f"{_factor_or_str(num)}{suffix}"
     return f"{float(num):.2f}{suffix}"
 
 
@@ -165,6 +165,19 @@ def _is_symbolic(value: Macs) -> bool:
     return (
         sympy is not None and isinstance(value, sympy.Expr) and bool(value.free_symbols)
     )
+
+
+def _factor_or_str(value: "sympy.Expr") -> str:
+    # sympy.factor() is purely cosmetic here (a nicer-looking formula for the
+    # report), but on models with many unresolved symbolic dims its polynomial
+    # arithmetic can recurse deep enough to blow Python's recursion limit (seen
+    # in practice on real-world models with 1000+ nodes, e.g. VOICEVOX's
+    # predict_sing_f0.onnx). Fall back to the unfactored expression rather than
+    # crashing the whole report over a formatting nicety.
+    try:
+        return str(sympy.factor(value))
+    except RecursionError:
+        return str(value)
 
 
 def _representative_number(value: Macs) -> int:
@@ -1021,7 +1034,7 @@ def _metric_str(value: Macs) -> str:
     # A metadata value is always a string. A symbolic metric is stored as its
     # factored formula (e.g. "512*batch"); a concrete one as its plain number.
     if _is_symbolic(value):
-        return str(sympy.factor(value))
+        return _factor_or_str(value)
     return str(value)
 
 
