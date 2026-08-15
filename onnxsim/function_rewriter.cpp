@@ -41,6 +41,8 @@
 #include <utility>
 #include <vector>
 
+#include "profiler.h"
+
 namespace onnxsim {
 namespace {
 
@@ -498,72 +500,102 @@ bool ApplyRuleOnce(onnx::ModelProto& model, onnx::GraphProto& graph,
     if (!SameOp(root, graph.node(h))) {
       continue;
     }
-    Matcher matcher(graph, host, pat);
-    MatchState state;
-    if (!matcher.MatchNode(root_pat_node, h, state)) {
-      continue;
-    }
 
-    // Resolve every pattern output to a concrete host value.
+    MatchState state;
     std::vector<std::string> out_host;
-    out_host.reserve(pattern.output_size());
-    bool resolved = true;
-    for (const auto& pout : pattern.output()) {
-      if (pat.inputs.count(pout)) {
-        auto b = state.vbind.find(pout);
-        if (b == state.vbind.end()) {
+    std::set<int> matched;
+    bool safe = false;
+    {
+      // "Match" covers the DAG search (Matcher::MatchNode) plus the
+      // bookkeeping that decides whether a found match is safe to apply --
+      // everything up to (but not including) the actual graph mutation below.
+      ProfiledScope match_scope("RuleMatch");
+      Matcher matcher(graph, host, pat);
+      if (!matcher.MatchNode(root_pat_node, h, state)) {
+        continue;
+      }
+
+      // Resolve every pattern output to a concrete host value.
+      out_host.reserve(pattern.output_size());
+      bool resolved = true;
+      for (const auto& pout : pattern.output()) {
+        if (pat.inputs.count(pout)) {
+          auto b = state.vbind.find(pout);
+          if (b == state.vbind.end()) {
+            resolved = false;
+            break;
+          }
+          out_host.push_back(b->second);
+          continue;
+        }
+        auto pit = pat.producer.find(pout);
+        if (pit == pat.producer.end() ||
+            !state.node_map.count(pit->second.first)) {
           resolved = false;
           break;
         }
-        out_host.push_back(b->second);
-        continue;
-      }
-      auto pit = pat.producer.find(pout);
-      if (pit == pat.producer.end() ||
-          !state.node_map.count(pit->second.first)) {
-        resolved = false;
-        break;
-      }
-      const onnx::NodeProto& hn =
-          graph.node(state.node_map.at(pit->second.first));
-      if (pit->second.second >= hn.output_size()) {
-        resolved = false;
-        break;
-      }
-      out_host.push_back(hn.output(pit->second.second));
-    }
-    if (!resolved) {
-      continue;
-    }
-
-    std::set<int> matched;
-    for (const auto& kv : state.node_map) {
-      matched.insert(kv.second);
-    }
-    if (matched.empty()) {
-      continue;
-    }
-    const int max_idx = *matched.rbegin();
-
-    std::unordered_set<std::string> out_set(out_host.begin(), out_host.end());
-
-    // Safety: an interior value (produced inside the match, not a pattern
-    // output) must be consumed only within the match and must not be a graph
-    // output -- otherwise the rewrite would break an outside consumer.
-    bool safe = true;
-    for (int idx : matched) {
-      for (const auto& v : graph.node(idx).output()) {
-        if (v.empty() || out_set.count(v)) {
-          continue;
-        }
-        if (host.graph_outputs.count(v)) {
-          safe = false;
+        const onnx::NodeProto& hn =
+            graph.node(state.node_map.at(pit->second.first));
+        if (pit->second.second >= hn.output_size()) {
+          resolved = false;
           break;
         }
+        out_host.push_back(hn.output(pit->second.second));
+      }
+      if (!resolved) {
+        continue;
+      }
+
+      for (const auto& kv : state.node_map) {
+        matched.insert(kv.second);
+      }
+      if (matched.empty()) {
+        continue;
+      }
+      const int max_idx = *matched.rbegin();
+
+      std::unordered_set<std::string> out_set(out_host.begin(),
+                                               out_host.end());
+
+      // Safety: an interior value (produced inside the match, not a pattern
+      // output) must be consumed only within the match and must not be a
+      // graph output -- otherwise the rewrite would break an outside
+      // consumer.
+      safe = true;
+      for (int idx : matched) {
+        for (const auto& v : graph.node(idx).output()) {
+          if (v.empty() || out_set.count(v)) {
+            continue;
+          }
+          if (host.graph_outputs.count(v)) {
+            safe = false;
+            break;
+          }
+          auto cit = host.consumers.find(v);
+          if (cit != host.consumers.end()) {
+            for (int c : cit->second) {
+              if (!matched.count(c)) {
+                safe = false;
+                break;
+              }
+            }
+          }
+          if (!safe) break;
+        }
+        if (!safe) break;
+      }
+      if (!safe) {
+        continue;
+      }
+
+      // Placement safety: every consumer of a (reproduced) pattern-output
+      // value must come after the splice point, and no replacement input may
+      // be produced by a matched (about-to-be-deleted) node.
+      for (const std::string& v : out_host) {
         auto cit = host.consumers.find(v);
         if (cit != host.consumers.end()) {
           for (int c : cit->second) {
-            if (!matched.count(c)) {
+            if (!matched.count(c) && c < max_idx) {
               safe = false;
               break;
             }
@@ -571,42 +603,27 @@ bool ApplyRuleOnce(onnx::ModelProto& model, onnx::GraphProto& graph,
         }
         if (!safe) break;
       }
-      if (!safe) break;
-    }
-    if (!safe) {
-      continue;
-    }
-
-    // Placement safety: every consumer of a (reproduced) pattern-output value
-    // must come after the splice point, and no replacement input may be
-    // produced by a matched (about-to-be-deleted) node.
-    for (const std::string& v : out_host) {
-      auto cit = host.consumers.find(v);
-      if (cit != host.consumers.end()) {
-        for (int c : cit->second) {
-          if (!matched.count(c) && c < max_idx) {
-            safe = false;
+      if (safe) {
+        for (const auto& kv : state.vbind) {
+          auto pit = host.producer.find(kv.second);
+          if (pit != host.producer.end() &&
+              matched.count(pit->second.first)) {
+            safe = false;  // a wildcard bound to a value about to be deleted.
             break;
           }
         }
       }
-      if (!safe) break;
-    }
-    if (safe) {
-      for (const auto& kv : state.vbind) {
-        auto pit = host.producer.find(kv.second);
-        if (pit != host.producer.end() && matched.count(pit->second.first)) {
-          safe = false;  // a wildcard bound to a value we are about to delete.
-          break;
-        }
+      if (!safe) {
+        continue;
       }
     }
-    if (!safe) {
-      continue;
-    }
 
-    if (ApplyReplacement(model, graph, host, rule, state, out_host, matched)) {
-      return true;
+    {
+      ProfiledScope rewrite_scope("RuleApply");
+      if (ApplyReplacement(model, graph, host, rule, state, out_host,
+                            matched)) {
+        return true;
+      }
     }
   }
   return false;
