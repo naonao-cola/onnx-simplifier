@@ -1,10 +1,17 @@
 recursive-include onnxsim *.h *.hpp *.cc *.cpp
 recursive-include cmake *
 recursive-include third_party/onnx-optimizer *
+# onnx is a top-level submodule (not nested under onnx-optimizer) so its
+# pinned commit shows up as its own submodule entry in onnxsim's history;
+# onnx-optimizer's own nested third_party/onnx (included above, unused when
+# built as part of onnxsim -- see CMakeLists.txt) is what's actually shipped
+# in the wheel for onnx-optimizer's standalone build.
+recursive-include third_party/onnx *
 # Vendored DLPack header. onnxsim.h / dlpack_bridge.h include <dlpack/dlpack.h>,
 # so the wheel build compiles onnxsim.cpp against it; it must ship in the sdist.
 recursive-include third_party/dlpack *.h
 recursive-exclude third_party/onnx-optimizer/*build* *
+recursive-exclude third_party/onnx/*build* *
 include CMakeLists.txt
 include VERSION
 recursive-exclude third_party *.onnx *.pb
