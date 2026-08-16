@@ -1,5 +1,7 @@
 #pragma once
 
+#include <onnx/common/interned_strings.h>
+
 #include <algorithm>
 #include <cstdint>
 #include <iterator>
@@ -7,8 +9,6 @@
 #include <optional>
 #include <string>
 #include <vector>
-
-#include <onnx/common/interned_strings.h>
 
 namespace onnxsim {
 
