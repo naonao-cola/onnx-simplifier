@@ -260,10 +260,13 @@ fi
 # ---------------------------------------------------------------------------
 echo "== [5/6] cross-building onnxsim extension =="
 
-# Apply the onnx MSVC-portability patch: onnx's Windows code uses constructs only
-# cl.exe accepts (a reinterpret-cast pointer as a non-type template argument, and
-# a case-sensitive <Windows.h>), which Clang -- clang-cl and mingw alike --
-# rejects when cross-compiling. Applied idempotently so local re-runs are safe.
+# Apply the onnx MSVC-portability patch: onnx/checker.cc includes the
+# case-sensitive spelling <Windows.h>, which cl.exe accepts but Clang --
+# clang-cl and mingw alike -- rejects when cross-compiling. (onnx used to
+# also need a workaround for a reinterpret-cast pointer as a non-type
+# template argument in scoped_resource.h; that's fixed upstream now, so the
+# patch is down to just this one include.) Applied idempotently so local
+# re-runs are safe.
 ONNX_PATCH="${REPO_ROOT}/scripts/cross/onnx-msvc-portability.patch"
 if git -C "${ONNX_DIR}" apply --reverse --check "${ONNX_PATCH}" 2>/dev/null; then
   echo "onnx portability patch already applied"
