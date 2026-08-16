@@ -1,3 +1,6 @@
 [submodule "onnxsim/third_party/onnx-optimizer"]
 	path = third_party/onnx-optimizer
 	url = https://github.com/onnxsim/optimizer.git
+[submodule "third_party/onnx"]
+	path = third_party/onnx
+	url = https://github.com/onnxsim/onnx.git

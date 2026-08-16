@@ -18,7 +18,7 @@ SYSROOT="${SYSROOT:-/rootfs-s390x}"
 JOBS="${JOBS:-$(nproc)}"
 PYVER="${PYVER:-3.12}"
 
-ONNX_DIR="${REPO_ROOT}/third_party/onnx-optimizer/third_party/onnx"
+ONNX_DIR="${REPO_ROOT}/third_party/onnx"
 SBOM="${ONNX_DIR}/sbom.cdx.json"
 
 sbom_ver() {  # sbom_ver <component-name>

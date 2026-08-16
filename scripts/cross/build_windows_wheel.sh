@@ -22,8 +22,8 @@
 #   6. Pack the resulting .pyd into a correctly tagged wheel.
 #
 # Dependency versions are pinned to whatever the vendored ONNX pins (see the
-# SBOM in third_party/onnx-optimizer/third_party/onnx/sbom.cdx.json); a mismatch
-# between the host protoc and the target libprotobuf would break the build.
+# SBOM in third_party/onnx/sbom.cdx.json); a mismatch between the host protoc
+# and the target libprotobuf would break the build.
 #
 # Required environment:
 #   PYVER          Target CPython version, e.g. "3.12".
@@ -48,7 +48,7 @@ WORK="${WORK:-${REPO_ROOT}/.cross-build}"
 JOBS="${JOBS:-$(nproc)}"
 ARCH="x86_64"
 
-ONNX_DIR="${REPO_ROOT}/third_party/onnx-optimizer/third_party/onnx"
+ONNX_DIR="${REPO_ROOT}/third_party/onnx"
 SBOM="${ONNX_DIR}/sbom.cdx.json"
 
 sbom_ver() {  # sbom_ver <component-name>
@@ -260,10 +260,13 @@ fi
 # ---------------------------------------------------------------------------
 echo "== [5/6] cross-building onnxsim extension =="
 
-# Apply the onnx MSVC-portability patch: onnx's Windows code uses constructs only
-# cl.exe accepts (a reinterpret-cast pointer as a non-type template argument, and
-# a case-sensitive <Windows.h>), which Clang -- clang-cl and mingw alike --
-# rejects when cross-compiling. Applied idempotently so local re-runs are safe.
+# Apply the onnx MSVC-portability patch: onnx/checker.cc includes the
+# case-sensitive spelling <Windows.h>, which cl.exe accepts but Clang --
+# clang-cl and mingw alike -- rejects when cross-compiling. (onnx used to
+# also need a workaround for a reinterpret-cast pointer as a non-type
+# template argument in scoped_resource.h; that's fixed upstream now, so the
+# patch is down to just this one include.) Applied idempotently so local
+# re-runs are safe.
 ONNX_PATCH="${REPO_ROOT}/scripts/cross/onnx-msvc-portability.patch"
 if git -C "${ONNX_DIR}" apply --reverse --check "${ONNX_PATCH}" 2>/dev/null; then
   echo "onnx portability patch already applied"

@@ -95,6 +95,33 @@ if (ONNXSIM_BUILTIN_ORT)
   endif()
 endif()
 
+# Provide the `onnx` target from onnxsim's own top-level submodule instead of
+# letting onnx-optimizer's nested third_party/onnx submodule provide it (its
+# cmake/utils.cmake add_subdirectory_if_no_target() skips its own copy once a
+# target named `onnx` already exists -- must run before
+# add_subdirectory(third_party/onnx-optimizer) below). This keeps onnx's
+# pinned commit its own top-level submodule entry in onnxsim's history,
+# rather than folded invisibly into an onnx-optimizer submodule bump.
+# Mirrors the protobuf-related CMake variables onnx-optimizer's own
+# CMakeLists.txt otherwise sets before its (now-skipped) call, so onnx's
+# build configuration is unchanged.
+#
+# Left to ONNXSIM_BUILTIN_ORT's own path when that's ON: onnxruntime (added
+# above) already provides its own `onnx` target first there, and onnx-
+# optimizer's add_subdirectory_if_no_target() links against that instead, "because
+# they both depend on onnx and onnxruntime has its own flags for onnx" --
+# unrelated to and unaffected by this change.
+if (NOT ONNXSIM_BUILTIN_ORT)
+  option(ONNX_OPT_USE_SYSTEM_PROTOBUF "" OFF)
+  if (NOT ONNX_OPT_USE_SYSTEM_PROTOBUF)
+    option(protobuf_BUILD_TESTS "" OFF)
+    option(protobuf_MSVC_STATIC_RUNTIME "" ${ONNX_USE_MSVC_STATIC_RUNTIME})
+    set(protobuf_FORCE_FETCH_DEPENDENCIES ON)
+    set(ONNX_BUILD_CUSTOM_PROTOBUF ON)
+  endif()
+  add_subdirectory(third_party/onnx EXCLUDE_FROM_ALL)
+endif()
+
 # configure onnx-optimizer after onnxruntime, because they both depend on onnx and onnxruntime has its own flags for onnx
 add_subdirectory(third_party/onnx-optimizer EXCLUDE_FROM_ALL)
 
