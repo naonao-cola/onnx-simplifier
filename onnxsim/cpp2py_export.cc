@@ -327,9 +327,12 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
                                   model_bytes.size());
         const ModelInfo info = GetModelInfo(model, run_shape_inference);
         auto to_poly = [](const onnxsim::SymExpr& expr) {
-          std::vector<std::pair<int64_t, std::vector<onnx::Symbol>>> poly;
+          std::vector<std::pair<int64_t, std::vector<std::string>>> poly;
           for (const auto& [monomial, coeff] : expr.terms()) {
-            poly.emplace_back(coeff, monomial);
+            std::vector<std::string> names;
+            names.reserve(monomial.size());
+            for (const onnx::Symbol& s : monomial) names.emplace_back(s.toString());
+            poly.emplace_back(coeff, std::move(names));
           }
           return poly;
         };
