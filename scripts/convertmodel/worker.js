@@ -71,11 +71,9 @@ create_onnxsim({
         runtime.ENV.LOG_THRESHOLD = "-1";
     }],
     print: (str) => {
-        console.log("stdout:", str);
         postMessage(["stdout", str]);
     },
     printErr: (str) => {
-        console.error("stderr:", [str]);
         postMessage(["stderr", str]);
         // Augment the raw Emscripten OOM abort line with a human-readable hint.
         if (typeof str === "string" && str.includes("Cannot enlarge memory")) {
@@ -98,7 +96,6 @@ create_onnxsim({
     postMessage(["ready"]);
 
     addEventListener("message", async (e) => {
-        console.log(e.data);
         let buf = e.data[1];
         // The true uploaded bytes, kept aside so the "annotate the original for
         // the inference-compare panel" step below always sees the model the user
@@ -220,9 +217,7 @@ create_onnxsim({
             postMessage(["stderr", e.data[0] + " failed!"]);
             return;
         }
-        console.log("to data url start")
         const data_url = "data:application/octet-stream;base64," + model.toBase64();
-        console.log("to data url end")
         // When "annotate model info" is on, also bake the MAC/FLOP metrics into
         // the *original* uploaded model so the "Run inference" panel can report
         // its throughput too — letting the user compare original vs converted
