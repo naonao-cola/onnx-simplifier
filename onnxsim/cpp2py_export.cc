@@ -331,7 +331,8 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
           for (const auto& [monomial, coeff] : expr.terms()) {
             std::vector<std::string> names;
             names.reserve(monomial.size());
-            for (const onnx::Symbol& s : monomial) names.emplace_back(s.toString());
+            for (const onnx::Symbol& s : monomial)
+              names.emplace_back(s.toString());
             poly.emplace_back(coeff, std::move(names));
           }
           return poly;
