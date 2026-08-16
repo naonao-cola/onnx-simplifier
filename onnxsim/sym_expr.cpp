@@ -19,14 +19,14 @@ std::int64_t gcd_i(std::int64_t a, std::int64_t b) {
   return a;
 }
 
-// Per-symbol powers of a monomial: {"batch","seq","seq"} -> {batch:1, seq:2}.
-std::map<std::string, std::size_t> powers_of(const Monomial& mono) {
-  std::map<std::string, std::size_t> c;
-  for (const std::string& s : mono) ++c[s];
+// Per-symbol powers of a monomial: {batch,seq,seq} -> {batch:1, seq:2}.
+std::map<onnx::Symbol, std::size_t> powers_of(const Monomial& mono) {
+  std::map<onnx::Symbol, std::size_t> c;
+  for (const onnx::Symbol& s : mono) ++c[s];
   return c;
 }
 
-// "batch*seq**2" for {"batch","seq","seq"}; "" for the empty (constant) mono.
+// "batch*seq**2" for {batch,seq,seq}; "" for the empty (constant) mono.
 std::string monomial_str(const Monomial& mono) {
   std::string out;
   for (std::size_t i = 0; i < mono.size();) {
@@ -34,7 +34,7 @@ std::string monomial_str(const Monomial& mono) {
     while (j < mono.size() && mono[j] == mono[i]) ++j;
     const std::size_t power = j - i;
     if (!out.empty()) out += "*";
-    out += mono[i];
+    out += mono[i].toString();
     if (power > 1) out += "**" + std::to_string(power);
     i = j;
   }
@@ -78,7 +78,7 @@ std::string join_terms(const std::map<Monomial, std::int64_t>& terms) {
 // and the minimum power of each symbol present in *every* term.
 struct CommonFactor {
   std::int64_t content = 0;  // gcd of |coeff|; 0 only if there are no terms
-  std::map<std::string, std::size_t> monomial;
+  std::map<onnx::Symbol, std::size_t> monomial;
 };
 
 CommonFactor common_factor(std::initializer_list<const SymExpr*> exprs) {
