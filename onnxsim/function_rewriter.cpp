@@ -34,8 +34,10 @@
 #include <algorithm>
 #include <map>
 #include <memory>
+#include <optional>
 #include <set>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -45,6 +47,49 @@
 
 namespace onnxsim {
 namespace {
+
+// Splits [0, n) into contiguous chunks run across a small thread pool spawned
+// fresh for this call, or serially in the calling thread when there is no
+// benefit (n too small, or only one hardware thread) or no pthread runtime
+// (Emscripten's default build -- see profiler.cpp's sampler thread for the
+// same guard). ``f`` must be safe to call concurrently for distinct indices;
+// it is never called concurrently for the *same* index.
+template <typename Fn>
+void ParallelFor(int n, const Fn& f) {
+#if !defined(__EMSCRIPTEN__)
+  constexpr int kMinPerThread =
+      64;  // below this, threading overhead isn't worth it.
+  constexpr int kMaxThreads = 8;
+  const unsigned hw = std::thread::hardware_concurrency();
+  const int max_threads = hw > 1 ? static_cast<int>(hw) : 1;
+  const int num_threads =
+      std::min({max_threads, n / kMinPerThread, kMaxThreads});
+  if (num_threads > 1) {
+    std::vector<std::thread> workers;
+    workers.reserve(static_cast<size_t>(num_threads));
+    const int chunk = (n + num_threads - 1) / num_threads;
+    for (int t = 0; t < num_threads; ++t) {
+      const int begin = t * chunk;
+      const int end = std::min(n, begin + chunk);
+      if (begin >= end) {
+        break;
+      }
+      workers.emplace_back([&f, begin, end]() {
+        for (int i = begin; i < end; ++i) {
+          f(i);
+        }
+      });
+    }
+    for (auto& w : workers) {
+      w.join();
+    }
+    return;
+  }
+#endif
+  for (int i = 0; i < n; ++i) {
+    f(i);
+  }
+}
 
 // The default ONNX domain is spelled either "" or "ai.onnx"; treat them as one.
 std::string NormDomain(const std::string& domain) {
@@ -590,148 +635,148 @@ std::vector<MatchResult> CollectNonConflictingMatches(
   const int root_pat_node = root_it->second.first;
   const onnx::NodeProto& root = pattern.node(root_pat_node);
 
-  std::set<int> claimed;  // union of matched-node-sets already collected.
-  for (int h = 0; h < graph.node_size(); ++h) {
-    if (!SameOp(root, graph.node(h)) || claimed.count(h)) {
-      continue;
+  // Phase 1 (parallel, read-only): independently try to match the pattern
+  // rooted at each host node and run every safety check that does NOT depend
+  // on which other matches this round end up accepted -- that part
+  // (`claimed`, built incrementally in phase 2) is inherently sequential
+  // since acceptance order matters, but the DAG search (Matcher::MatchNode)
+  // and the rest of the checks only read `graph`/`host`/`pat`, all const and
+  // already shared read-only across every host node in the original
+  // single-threaded scan. Splitting the work this way changes only the
+  // scheduling, not the result: phase 2 below resolves candidates in the same
+  // node order, and with the same conflict rules, the fully-sequential
+  // version used.
+  std::vector<std::optional<MatchResult>> candidates(
+      static_cast<size_t>(graph.node_size()));
+  ParallelFor(graph.node_size(), [&](int h) {
+    if (!SameOp(root, graph.node(h))) {
+      return;
+    }
+    // "Match" covers the DAG search (Matcher::MatchNode) plus the bookkeeping
+    // that decides whether a found match is safe to apply -- everything up to
+    // (but not including) instantiating the replacement.
+    ProfiledScope match_scope("RuleMatch");
+    MatchState state;
+    Matcher matcher(graph, host, pat);
+    if (!matcher.MatchNode(root_pat_node, h, state)) {
+      return;
     }
 
-    MatchState state;
+    // Resolve every pattern output to a concrete host value.
     std::vector<std::string> out_host;
-    std::set<int> matched;
-    bool safe = false;
-    {
-      // "Match" covers the DAG search (Matcher::MatchNode) plus the
-      // bookkeeping that decides whether a found match is safe to apply --
-      // everything up to (but not including) instantiating the replacement.
-      ProfiledScope match_scope("RuleMatch");
-      Matcher matcher(graph, host, pat);
-      if (!matcher.MatchNode(root_pat_node, h, state)) {
+    out_host.reserve(pattern.output_size());
+    for (const auto& pout : pattern.output()) {
+      if (pat.inputs.count(pout)) {
+        auto b = state.vbind.find(pout);
+        if (b == state.vbind.end()) {
+          return;
+        }
+        out_host.push_back(b->second);
         continue;
       }
+      auto pit = pat.producer.find(pout);
+      if (pit == pat.producer.end() ||
+          !state.node_map.count(pit->second.first)) {
+        return;
+      }
+      const onnx::NodeProto& hn =
+          graph.node(state.node_map.at(pit->second.first));
+      if (pit->second.second >= hn.output_size()) {
+        return;
+      }
+      out_host.push_back(hn.output(pit->second.second));
+    }
 
-      // Resolve every pattern output to a concrete host value.
-      out_host.reserve(pattern.output_size());
-      bool resolved = true;
-      for (const auto& pout : pattern.output()) {
-        if (pat.inputs.count(pout)) {
-          auto b = state.vbind.find(pout);
-          if (b == state.vbind.end()) {
-            resolved = false;
-            break;
-          }
-          out_host.push_back(b->second);
+    std::set<int> matched;
+    for (const auto& kv : state.node_map) {
+      matched.insert(kv.second);
+    }
+    if (matched.empty()) {
+      return;
+    }
+
+    const int max_idx = *matched.rbegin();
+    std::unordered_set<std::string> out_set(out_host.begin(), out_host.end());
+
+    // Safety: an interior value (produced inside the match, not a pattern
+    // output) must be consumed only within the match and must not be a
+    // graph output -- otherwise the rewrite would break an outside consumer.
+    for (int idx : matched) {
+      for (const auto& v : graph.node(idx).output()) {
+        if (v.empty() || out_set.count(v)) {
           continue;
         }
-        auto pit = pat.producer.find(pout);
-        if (pit == pat.producer.end() ||
-            !state.node_map.count(pit->second.first)) {
-          resolved = false;
-          break;
+        if (host.graph_outputs.count(v)) {
+          return;
         }
-        const onnx::NodeProto& hn =
-            graph.node(state.node_map.at(pit->second.first));
-        if (pit->second.second >= hn.output_size()) {
-          resolved = false;
-          break;
-        }
-        out_host.push_back(hn.output(pit->second.second));
-      }
-      if (!resolved) {
-        continue;
-      }
-
-      for (const auto& kv : state.node_map) {
-        matched.insert(kv.second);
-      }
-      if (matched.empty()) {
-        continue;
-      }
-
-      // Reject if this match shares a node with an already-collected match --
-      // handled below via `claimed`, not `matched` -- so it doesn't corrupt
-      // the batch; it'll be re-examined next round.
-      bool conflicts = false;
-      for (int idx : matched) {
-        if (claimed.count(idx)) {
-          conflicts = true;
-          break;
-        }
-      }
-      if (conflicts) {
-        continue;
-      }
-
-      const int max_idx = *matched.rbegin();
-
-      std::unordered_set<std::string> out_set(out_host.begin(), out_host.end());
-
-      // Safety: an interior value (produced inside the match, not a pattern
-      // output) must be consumed only within the match and must not be a
-      // graph output -- otherwise the rewrite would break an outside
-      // consumer.
-      safe = true;
-      for (int idx : matched) {
-        for (const auto& v : graph.node(idx).output()) {
-          if (v.empty() || out_set.count(v)) {
-            continue;
-          }
-          if (host.graph_outputs.count(v)) {
-            safe = false;
-            break;
-          }
-          auto cit = host.consumers.find(v);
-          if (cit != host.consumers.end()) {
-            for (int c : cit->second) {
-              if (!matched.count(c)) {
-                safe = false;
-                break;
-              }
-            }
-          }
-          if (!safe) break;
-        }
-        if (!safe) break;
-      }
-      if (!safe) {
-        continue;
-      }
-
-      // Placement safety: every consumer of a (reproduced) pattern-output
-      // value must come after the splice point, and no replacement input may
-      // be produced by a node about to be deleted -- by this match or another
-      // one already claimed this round.
-      for (const std::string& v : out_host) {
         auto cit = host.consumers.find(v);
         if (cit != host.consumers.end()) {
           for (int c : cit->second) {
-            if (!matched.count(c) && c < max_idx) {
-              safe = false;
-              break;
+            if (!matched.count(c)) {
+              return;
             }
           }
         }
-        if (!safe) break;
-      }
-      if (safe) {
-        for (const auto& kv : state.vbind) {
-          auto pit = host.producer.find(kv.second);
-          if (pit != host.producer.end() &&
-              (matched.count(pit->second.first) ||
-               claimed.count(pit->second.first))) {
-            safe = false;  // a wildcard bound to a value about to be deleted.
-            break;
-          }
-        }
-      }
-      if (!safe) {
-        continue;
       }
     }
 
-    claimed.insert(matched.begin(), matched.end());
-    results.push_back(
-        {std::move(state), std::move(out_host), std::move(matched)});
+    // Placement safety: every consumer of a (reproduced) pattern-output value
+    // must come after the splice point.
+    for (const std::string& v : out_host) {
+      auto cit = host.consumers.find(v);
+      if (cit != host.consumers.end()) {
+        for (int c : cit->second) {
+          if (!matched.count(c) && c < max_idx) {
+            return;
+          }
+        }
+      }
+    }
+
+    candidates[static_cast<size_t>(h)] =
+        MatchResult{std::move(state), std::move(out_host), std::move(matched)};
+  });
+
+  // Phase 2 (serial): resolve conflicts against `claimed` in host-node order,
+  // exactly as the fully-sequential version did.
+  std::set<int> claimed;  // union of matched-node-sets already collected.
+  for (int h = 0; h < graph.node_size(); ++h) {
+    std::optional<MatchResult>& cand = candidates[static_cast<size_t>(h)];
+    if (!cand || claimed.count(h)) {
+      continue;
+    }
+
+    // Reject if this match shares a node with an already-collected match --
+    // it'll be re-examined next round.
+    bool conflicts = false;
+    for (int idx : cand->matched) {
+      if (claimed.count(idx)) {
+        conflicts = true;
+        break;
+      }
+    }
+    if (conflicts) {
+      continue;
+    }
+
+    // No replacement input may be produced by a node about to be deleted --
+    // by this match or another one already claimed this round.
+    bool safe = true;
+    for (const auto& kv : cand->state.vbind) {
+      auto pit = host.producer.find(kv.second);
+      if (pit != host.producer.end() &&
+          (cand->matched.count(pit->second.first) ||
+           claimed.count(pit->second.first))) {
+        safe = false;  // a wildcard bound to a value about to be deleted.
+        break;
+      }
+    }
+    if (!safe) {
+      continue;
+    }
+
+    claimed.insert(cand->matched.begin(), cand->matched.end());
+    results.push_back(std::move(*cand));
   }
   return results;
 }
