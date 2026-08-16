@@ -200,7 +200,6 @@
 
                     input.disabled = true;
                     dl_btn.disabled = true;
-                    console.log("sending: ", modelName);
                     let passes = null;
                     if (optimizer == "simplify") {
                         passes = Array.from(document.querySelectorAll('input[class="pass"]:not(:checked)')).map((v) => v.name);
