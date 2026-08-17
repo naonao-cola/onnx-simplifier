@@ -1,6 +1,7 @@
 #include "onnxsim.h"
 
 #include <google/protobuf/arena.h>
+#include <google/protobuf/io/zero_copy_stream.h>
 #include <google/protobuf/text_format.h>
 #include <google/protobuf/util/message_differencer.h>
 #include <onnx/onnx_pb.h>
@@ -1704,50 +1705,106 @@ struct ModelFingerprint {
   }
 };
 
-ModelFingerprint Fingerprint(const onnx::ModelProto& model) {
-  // ModelProto contains no protobuf ``map<>`` fields, so serialization order is
-  // stable and equal models serialize to identical bytes.
-  const std::string bytes = model.SerializeAsString();
-  // Two independent rolling hashes (FNV-1a and a splitmix-style mix) combined
-  // into a 128-bit value, mixed 8 bytes (one machine word) at a time rather
-  // than one byte at a time.
-  //
-  // Fingerprint() runs at every step of every (possibly nested) fixed point,
-  // so on a model with hundreds of MB of initializer weight data -- which
-  // dominates the serialized size but is untouched by most rounds (shape
-  // inference, the onnx-optimizer passes) -- it still has to read all of that
-  // data, every round, just to prove nothing changed. Profiling a 265 MB
-  // model showed this loop was a multi-second fraction of total
-  // simplification time. Folding 8 bytes into each multiply-mix step instead
-  // of 1 keeps exactly the same byte coverage in the same order -- so the
-  // same false-match guarantees in the struct comment above still hold --
-  // while cutting the number of loop iterations, and with them most of the
-  // loop/branch overhead, by roughly 8x.
-  uint64_t h1 = 1469598103934665603ULL;  // FNV-1a offset basis
-  uint64_t h2 = 0;
-  const size_t n = bytes.size();
+// Mixes ``n`` bytes at ``data`` into the two rolling hash accumulators (FNV-1a
+// and a splitmix-style mix), 8 bytes (one machine word) at a time rather than
+// one byte at a time -- cutting the number of loop iterations, and with them
+// most of the loop/branch overhead, by roughly 8x versus a byte-at-a-time
+// mix, for identical byte coverage and order.
+void MixBytes(const char* data, size_t n, uint64_t& h1, uint64_t& h2) {
   const size_t n_words = n / sizeof(uint64_t);
-  const char* data = bytes.data();
   for (size_t i = 0; i < n_words; ++i) {
     // memcpy, not a reinterpret_cast dereference: ``data`` is not guaranteed
-    // 8-byte aligned (it is std::string's internal buffer), and an unaligned
-    // uint64_t load is undefined behavior in C++. Any decent compiler lowers
-    // this fixed-size memcpy to a single unaligned load.
+    // 8-byte aligned (it may be a chunk of a streaming buffer, or a
+    // std::string's internal buffer), and an unaligned uint64_t load is
+    // undefined behavior in C++. Any decent compiler lowers this fixed-size
+    // memcpy to a single unaligned load.
     uint64_t word;
     std::memcpy(&word, data + i * sizeof(uint64_t), sizeof(uint64_t));
     h1 = (h1 ^ word) * 1099511628211ULL;
     h2 = (h2 + word) * 0x9E3779B97F4A7C15ULL;
     h2 ^= h2 >> 29;
   }
-  // Fewer than 8 trailing bytes: fall back to the original byte-at-a-time
-  // mix so every byte still participates in the hash.
+  // Fewer than 8 trailing bytes: fall back to a byte-at-a-time mix so every
+  // byte still participates in the hash.
   for (size_t i = n_words * sizeof(uint64_t); i < n; ++i) {
     const unsigned char c = static_cast<unsigned char>(data[i]);
     h1 = (h1 ^ c) * 1099511628211ULL;
     h2 = (h2 + c) * 0x9E3779B97F4A7C15ULL;
     h2 ^= h2 >> 29;
   }
-  h2 ^= n;
+}
+
+// A protobuf output stream that hashes bytes as they are handed out by the
+// serializer instead of collecting them into a buffer. Fingerprint() used to
+// call ``model.SerializeAsString()`` -- which allocates a buffer the size of
+// the whole serialized model (hundreds of MB of initializer weight data on a
+// large model) and serializes into it -- and then made a second, separate
+// pass over that buffer to hash it. Handing the serializer a small
+// stack-resident scratch buffer instead avoids that large allocation (and the
+// deallocation moments later): each time the serializer fills it, this stream
+// mixes it into the running hash and hands the same buffer back out, so the
+// whole model is hashed in bounded extra memory regardless of its size.
+class HashingOutputStream final : public google::protobuf::io::ZeroCopyOutputStream {
+ public:
+  bool Next(void** data, int* size) override {
+    FlushPending();
+    *data = buf_;
+    *size = static_cast<int>(sizeof(buf_));
+    pending_ = static_cast<int>(sizeof(buf_));
+    return true;
+  }
+  void BackUp(int count) override { pending_ -= count; }
+  int64_t ByteCount() const override { return byte_count_; }
+
+  // Call after serialization completes to mix in the final partial buffer.
+  void Finish() { FlushPending(); }
+
+  uint64_t h1() const { return h1_; }
+  uint64_t h2() const { return h2_; }
+  size_t total_bytes() const { return static_cast<size_t>(byte_count_); }
+
+ private:
+  void FlushPending() {
+    if (pending_ <= 0) {
+      return;
+    }
+    MixBytes(buf_, static_cast<size_t>(pending_), h1_, h2_);
+    byte_count_ += pending_;
+    pending_ = 0;
+  }
+
+  // 64 KiB: large enough that the per-Next() call overhead is negligible next
+  // to the memory-bandwidth-bound hashing work, small enough to stay resident
+  // in L1/L2 cache across the mix.
+  char buf_[1 << 16];
+  int pending_ = 0;
+  int64_t byte_count_ = 0;
+  uint64_t h1_ = 1469598103934665603ULL;  // FNV-1a offset basis
+  uint64_t h2_ = 0;
+};
+
+ModelFingerprint Fingerprint(const onnx::ModelProto& model) {
+  // ModelProto contains no protobuf ``map<>`` fields, so serialization order is
+  // stable and equal models serialize to identical bytes.
+  //
+  // Fingerprint() runs at every step of every (possibly nested) fixed point,
+  // so on a model with hundreds of MB of initializer weight data -- which
+  // dominates the serialized size but is untouched by most rounds (shape
+  // inference, the onnx-optimizer passes) -- it still has to read all of that
+  // data, every round, just to prove nothing changed. Profiling a 265 MB
+  // model showed this was a multi-second fraction (over half of total wall
+  // time on that model) of total simplification time, so it is worth
+  // streaming through a small buffer (see HashingOutputStream) rather than
+  // materializing the whole serialized model first.
+  HashingOutputStream stream;
+  // SerializeToZeroCopyStream only returns false if a Next() call on the
+  // stream fails (out of disk space, a broken pipe, ...); HashingOutputStream
+  // writes to memory and its Next() always succeeds, so this cannot fail.
+  model.SerializeToZeroCopyStream(&stream);
+  stream.Finish();
+  uint64_t h1 = stream.h1();
+  uint64_t h2 = stream.h2();
+  h2 ^= stream.total_bytes();
   return {h1, h2};
 }
 
@@ -1772,11 +1829,20 @@ std::function<void(T&)> FixedPointFn(const std::function<void(T&)>& f1,
                                      const std::function<void(T&)>& f2,
                                      size_t max_iters, bool* converged) {
   return [f1, f2, max_iters, converged](T& model) -> void {
+    // Profiled separately from the transforms it gates: on large models this
+    // convergence check is not free (see Fingerprint()'s comment), so its cost
+    // should be visible in its own right rather than silently inflating
+    // whichever of f1/f2's spans happens to run next. A no-op unless
+    // ONNXSIM_PROFILE is set.
+    auto fingerprint = [](const onnx::ModelProto& m) {
+      onnxsim::ProfiledScope scope("Fingerprint");
+      return Fingerprint(m);
+    };
     size_t _max_iters = max_iters;
     f1(model);
-    ModelFingerprint fp_prev = Fingerprint(model);
+    ModelFingerprint fp_prev = fingerprint(model);
     f2(model);
-    ModelFingerprint fp_cur = Fingerprint(model);
+    ModelFingerprint fp_cur = fingerprint(model);
     while (_max_iters-- > 0) {
       if (fp_cur == fp_prev) {
         if (converged) {
@@ -1786,7 +1852,7 @@ std::function<void(T&)> FixedPointFn(const std::function<void(T&)>& f1,
       }
       f1(model);
       fp_prev = fp_cur;
-      fp_cur = Fingerprint(model);
+      fp_cur = fingerprint(model);
       if (fp_cur == fp_prev) {
         if (converged) {
           *converged = true;
@@ -1795,7 +1861,7 @@ std::function<void(T&)> FixedPointFn(const std::function<void(T&)>& f1,
       }
       f2(model);
       fp_prev = fp_cur;
-      fp_cur = Fingerprint(model);
+      fp_cur = fingerprint(model);
     }
 
     if (converged) {
