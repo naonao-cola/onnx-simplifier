@@ -261,6 +261,21 @@ struct CppModelExecutor : public ModelExecutor {
     Ort::SessionOptions sess_opts;
     sess_opts.SetLogSeverityLevel(3);
     sess_opts.SetGraphOptimizationLevel(ORT_DISABLE_ALL);
+    // This executor exists only to run constant-folding's throwaway
+    // fold-group sub-models (see RunOps above) -- never a full-size
+    // correctness check -- and each session here runs exactly once. So:
+    //  - Memory-pattern planning, which pays off across *repeated* Run()
+    //    calls, buys nothing for a session used once; skip planning it.
+    //  - A fresh intra-op thread pool sized to the machine's CPU count is
+    //    spun up (and joined) on every session construction, which happens
+    //    once per fold group per fixed-point round -- often hundreds of times
+    //    per large model. For the shape/index ops typical of a fold group
+    //    that spin-up/join is pure overhead, and it is where most of a fold
+    //    session's time goes (see the ``OrtSessionInit`` span above).
+    //    Running single-threaded skips it.
+    sess_opts.DisableMemPattern();
+    sess_opts.SetIntraOpNumThreads(1);
+    sess_opts.SetInterOpNumThreads(1);
     const bool ort_profiling = EnableOrtProfilingFromEnv(sess_opts);
     std::string model_str = model.SerializeAsString();
     Ort::Session session{nullptr};
