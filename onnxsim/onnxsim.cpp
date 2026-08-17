@@ -1744,7 +1744,8 @@ void MixBytes(const char* data, size_t n, uint64_t& h1, uint64_t& h2) {
 // deallocation moments later): each time the serializer fills it, this stream
 // mixes it into the running hash and hands the same buffer back out, so the
 // whole model is hashed in bounded extra memory regardless of its size.
-class HashingOutputStream final : public google::protobuf::io::ZeroCopyOutputStream {
+class HashingOutputStream final
+    : public google::protobuf::io::ZeroCopyOutputStream {
  public:
   bool Next(void** data, int* size) override {
     FlushPending();
