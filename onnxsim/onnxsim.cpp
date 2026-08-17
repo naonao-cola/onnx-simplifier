@@ -17,6 +17,7 @@
 #include <string>
 #include <type_traits>
 #include <unordered_map>
+#include <vector>
 
 #ifndef NO_BUILTIN_ORT
 // Prebuilt ONNX Runtime releases (github.com/microsoft/onnxruntime/releases)
@@ -1739,9 +1740,9 @@ void MixBytes(const char* data, size_t n, uint64_t& h1, uint64_t& h2) {
 // call ``model.SerializeAsString()`` -- which allocates a buffer the size of
 // the whole serialized model (hundreds of MB of initializer weight data on a
 // large model) and serializes into it -- and then made a second, separate
-// pass over that buffer to hash it. Handing the serializer a small
-// stack-resident scratch buffer instead avoids that large allocation (and the
-// deallocation moments later): each time the serializer fills it, this stream
+// pass over that buffer to hash it. Handing the serializer a small, reused
+// scratch buffer instead avoids that large allocation (and the deallocation
+// moments later): each time the serializer fills it, this stream
 // mixes it into the running hash and hands the same buffer back out, so the
 // whole model is hashed in bounded extra memory regardless of its size.
 class HashingOutputStream final
@@ -1749,9 +1750,9 @@ class HashingOutputStream final
  public:
   bool Next(void** data, int* size) override {
     FlushPending();
-    *data = buf_;
-    *size = static_cast<int>(sizeof(buf_));
-    pending_ = static_cast<int>(sizeof(buf_));
+    *data = buf_.data();
+    *size = static_cast<int>(buf_.size());
+    pending_ = static_cast<int>(buf_.size());
     return true;
   }
   void BackUp(int count) override { pending_ -= count; }
@@ -1769,15 +1770,22 @@ class HashingOutputStream final
     if (pending_ <= 0) {
       return;
     }
-    MixBytes(buf_, static_cast<size_t>(pending_), h1_, h2_);
+    MixBytes(buf_.data(), static_cast<size_t>(pending_), h1_, h2_);
     byte_count_ += pending_;
     pending_ = 0;
   }
 
   // 64 KiB: large enough that the per-Next() call overhead is negligible next
   // to the memory-bandwidth-bound hashing work, small enough to stay resident
-  // in L1/L2 cache across the mix.
-  char buf_[1 << 16];
+  // in L1/L2 cache across the mix. Heap-allocated, not a fixed-size array
+  // member: this object lives on the call stack of Fingerprint(), which is
+  // itself invoked from deep inside the (possibly nested) fixed-point
+  // machinery, and the WASM build's stack is only tens of KiB total -- a
+  // 64 KiB stack-resident array here reliably overflowed it (issue caught by
+  // the WASM build's own smoke test, "Aborted(stack overflow ...)" on the
+  // very first Simplify() call). std::vector's control block is a few
+  // pointer-sized words on the stack; the buffer itself is heap-backed.
+  std::vector<char> buf_ = std::vector<char>(1 << 16);
   int pending_ = 0;
   int64_t byte_count_ = 0;
   uint64_t h1_ = 1469598103934665603ULL;  // FNV-1a offset basis
