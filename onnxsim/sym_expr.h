@@ -1,7 +1,5 @@
 #pragma once
 
-#include <onnx/common/interned_strings.h>
-
 #include <algorithm>
 #include <cstdint>
 #include <iterator>
@@ -18,12 +16,9 @@ namespace onnxsim {
 // dimensions, so they are exactly integer-coefficient polynomials in the
 // dim_param names.
 //
-// Symbol names are stored as onnx::Symbol: an interned string from ONNX's C++
-// API (already a build dependency). Interning makes symbol equality and
-// ordering a cheap uint32 comparison, and there is no separate heap-allocated
-// std::string per occurrence. The type builds unchanged under Emscripten/WASM
-// -- where SymEngine (which needs GMP, or an experimental boost-multiprecision
-// build) is not practically available.
+// Pure standard C++ with no external dependency, so it builds unchanged under
+// Emscripten/WASM -- where SymEngine (which needs GMP, or an experimental
+// boost-multiprecision build) is not practically available.
 //
 // Maps onto the sympy calls in onnxsim/model_info.py:
 //   sympy.Symbol(name, positive=True, integer=True) -> SymExpr::Symbol(name)
@@ -37,9 +32,9 @@ class SymExpr {
  public:
   // A monomial is the sorted multiset of symbol names in one product term:
   //   {}                    -> 1                (the constant term)
-  //   {batch}               -> batch
-  //   {batch,seq,seq}       -> batch*seq**2
-  using Monomial = std::vector<onnx::Symbol>;
+  //   {"batch"}             -> batch
+  //   {"batch","seq","seq"} -> batch*seq**2
+  using Monomial = std::vector<std::string>;
 
   SymExpr() = default;
   // Implicit so `SymExpr(512) * batch` and `expr * 2` read naturally, mirroring
@@ -49,10 +44,6 @@ class SymExpr {
   }
 
   static SymExpr Symbol(const std::string& name) {
-    return Symbol(onnx::Symbol(name));
-  }
-
-  static SymExpr Symbol(onnx::Symbol name) {
     SymExpr e;
     e.terms_[Monomial{name}] = 1;
     return e;
