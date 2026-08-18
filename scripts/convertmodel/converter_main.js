@@ -85,6 +85,8 @@
                 const log_output = document.getElementById("log-output");
                 const input = document.getElementById("file-input");
                 const dl_btn = document.getElementById("download-button");
+                const format_select = document.getElementById("download-format");
+                const format_status = document.getElementById("download-format-status");
                 const trace_container = document.getElementById("simplify-trace");
                 let result_name = "";
                 let original_name = "";
@@ -112,17 +114,59 @@
                             log_output.value += e.data[1] + "\n";
                             log_output.scrollTop = log_output.scrollHeight;
                             break;
+                        // The download-format selector asked for the already-
+                        // converted model re-exported as a standalone
+                        // safetensors/gguf archive (see dl_btn.onclick below);
+                        // this is that export's result, so trigger the download
+                        // now and re-enable the controls it disabled meanwhile.
+                        case "export-format-done": {
+                            dl_btn.disabled = false;
+                            format_select.disabled = false;
+                            format_status.textContent = "";
+                            const a = document.createElement("a");
+                            a.href = e.data[2];
+                            a.download = e.data[3];
+                            a.click();
+                            break;
+                        }
+                        case "export-format-error":
+                            dl_btn.disabled = false;
+                            format_select.disabled = false;
+                            format_status.textContent = `${e.data[1]} export failed: ${e.data[2]}`;
+                            break;
                         case "convert-done":
                             input.disabled = false;
                             dl_btn.disabled = false;
+                            format_status.textContent = "";
                             const data_url = e.data[1];
                             const trace_json = e.data[2];
                             const original_data_url = e.data[3];
                             dl_btn.onclick = () => {
-                                const a = document.createElement("a");
-                                a.href = data_url;
-                                a.download = result_name;
-                                a.click();
+                                const format = format_select.value;
+                                if (format === "onnx") {
+                                    const a = document.createElement("a");
+                                    a.href = data_url;
+                                    a.download = result_name;
+                                    a.click();
+                                    return;
+                                }
+                                // Safetensors / GGUF: ask the worker to re-export
+                                // the already-converted bytes into that standalone
+                                // archive format (it owns the WASM runtime that
+                                // does the export). Async, so disable the controls
+                                // until "export-format-done"/"-error" above fires.
+                                const converted = window.__onnxsimConverted;
+                                if (!converted || !converted.bytes) return;
+                                const ext = format === "gguf" ? ".gguf" : ".safetensors";
+                                const bytes = converted.bytes;
+                                const export_buf = bytes.buffer.slice(
+                                    bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
+                                dl_btn.disabled = true;
+                                format_select.disabled = true;
+                                format_status.textContent = `exporting ${format}…`;
+                                worker.postMessage(
+                                    ["export_" + format, export_buf, result_name + ext],
+                                    [export_buf]);
                             };
                             // Visualize the simplified/optimized model with Netron.
                             if (window.netronShowAfter) {
@@ -200,6 +244,7 @@
 
                     input.disabled = true;
                     dl_btn.disabled = true;
+                    format_status.textContent = "";
                     let passes = null;
                     if (optimizer == "simplify") {
                         passes = Array.from(document.querySelectorAll('input[class="pass"]:not(:checked)')).map((v) => v.name);

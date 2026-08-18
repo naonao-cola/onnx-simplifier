@@ -96,6 +96,30 @@ create_onnxsim({
     postMessage(["ready"]);
 
     addEventListener("message", async (e) => {
+        // Re-export already-converted model bytes into a standalone archive
+        // format for the page's download-format selector (safetensors / gguf).
+        // Kept separate from the convert switch below: this takes the already-
+        // converted bytes (not a raw upload) and needs none of the inline-
+        // functions / annotate-original pre-steps a fresh conversion runs.
+        if (e.data[0] === "export_safetensors" || e.data[0] === "export_gguf") {
+            const format = e.data[0] === "export_gguf" ? "gguf" : "safetensors";
+            const exportBuf = e.data[1];
+            const filename = e.data[2];
+            try {
+                const fn = format === "gguf" ?
+                    runtime.onnxsim_export_gguf : runtime.onnxsim_export_safetensors;
+                const bytes = fn(exportBuf);
+                if (!bytes) {
+                    postMessage(["export-format-error", format, format + " export failed!"]);
+                    return;
+                }
+                const data_url = "data:application/octet-stream;base64," + bytes.toBase64();
+                postMessage(["export-format-done", format, data_url, filename]);
+            } catch (err) {
+                postMessage(["export-format-error", format, String((err && err.message) || err)]);
+            }
+            return;
+        }
         let buf = e.data[1];
         // The true uploaded bytes, kept aside so the "annotate the original for
         // the inference-compare panel" step below always sees the model the user

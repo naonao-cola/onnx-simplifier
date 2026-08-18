@@ -5,6 +5,9 @@
 #include "onnx/defs/parser.h"
 #include "onnx/defs/schema.h"
 #include "onnx/inliner/inliner.h"
+#include "tensor_pool.h"
+#include "tensor_pool_bridge.h"
+#include "tensor_pool_gguf_bridge.h"
 
 // Version strings baked in by CMake (read from VERSION and
 // third_party/onnx-optimizer/VERSION_NUMBER). Fall back to "unknown" so the
@@ -70,6 +73,32 @@ std::string ReadAndClearProfileTrace() {
     }
     std::remove(kProfileTracePath);
     return trace;
+}
+
+// Where the standalone safetensors/gguf exports below write their result
+// inside Emscripten's in-memory filesystem, mirroring kProfileTracePath. The
+// TensorPool bridge bakes this path into the archive as the embedded model's
+// external_data "location" (see SaveModelAsSafetensorsStandalone /
+// SaveModelAsGGUFStandalone), so it is a fixed internal name rather than the
+// user-facing download filename -- onnxsim's own loaders resolve the
+// embedded model by pool name, not by this path, so the mismatch with
+// whatever name the browser saves the download under is harmless.
+constexpr const char* kSafetensorsExportPath = "onnxsim_export.safetensors";
+constexpr const char* kGGUFExportPath = "onnxsim_export.gguf";
+
+// Read `path` back into a string and delete it, same pattern as
+// ReadAndClearProfileTrace above. Returns an empty string if the file could
+// not be opened.
+std::string ReadAndDeleteFile(const std::string& path) {
+    std::string data;
+    std::ifstream ifs(path, std::ios::binary);
+    if (ifs) {
+        std::ostringstream ss;
+        ss << ifs.rdbuf();
+        data = ss.str();
+    }
+    std::remove(path.c_str());
+    return data;
 }
 
 // Serialize `model` into the shared static buffer and hand JS a typed-memory
@@ -396,6 +425,65 @@ em::val onnxsim_annotate_model_info(const std::string& data) {
     return em::val(em::typed_memory_view(result.size(), reinterpret_cast<uint8_t*>(result.data())));
 }
 
+// Export `data` (a serialized onnx::ModelProto) as a single standalone
+// safetensors archive: every initializer's bytes move into the archive with
+// real, byte-accurate offsets -- openable by the `safetensors` Python package
+// / HF tooling with no onnxsim involved -- and the graph itself is embedded
+// alongside them (tensor_pool_bridge.h's SaveModelAsSafetensorsStandalone), so
+// the one file this returns is both the model's weights and its graph. Used
+// by the page's download-format selector for the ".onnx.safetensors" option.
+// Returns null on a parse/export failure.
+em::val onnxsim_export_safetensors(const std::string& data) {
+    onnx::ModelProto xmodel;
+    if (!xmodel.ParseFromArray(data.data(), data.size())) {
+        std::cerr << "Parse failed" << std::endl;
+        return em::val::null();
+    }
+    onnxsim::tensor_pool::TensorPool pool;
+    try {
+        onnxsim::tensor_pool::SaveModelAsSafetensorsStandalone(
+            xmodel, kSafetensorsExportPath, pool);
+    } catch (const std::exception& e) {
+        std::cerr << "safetensors export failed: " << e.what() << std::endl;
+        std::remove(kSafetensorsExportPath);
+        return em::val::null();
+    }
+    static std::string result;
+    result = ReadAndDeleteFile(kSafetensorsExportPath);
+    if (result.empty()) {
+        std::cerr << "failed to read back the exported safetensors file" << std::endl;
+        return em::val::null();
+    }
+    return em::val(em::typed_memory_view(result.size(), reinterpret_cast<uint8_t*>(result.data())));
+}
+
+// GGUF counterpart of onnxsim_export_safetensors above; see
+// tensor_pool_gguf_bridge.h's SaveModelAsGGUFStandalone. Used by the page's
+// download-format selector for the ".onnx.gguf" option.
+em::val onnxsim_export_gguf(const std::string& data) {
+    onnx::ModelProto xmodel;
+    if (!xmodel.ParseFromArray(data.data(), data.size())) {
+        std::cerr << "Parse failed" << std::endl;
+        return em::val::null();
+    }
+    onnxsim::tensor_pool::TensorPool pool;
+    try {
+        onnxsim::tensor_pool::SaveModelAsGGUFStandalone(xmodel, kGGUFExportPath,
+                                                         pool);
+    } catch (const std::exception& e) {
+        std::cerr << "gguf export failed: " << e.what() << std::endl;
+        std::remove(kGGUFExportPath);
+        return em::val::null();
+    }
+    static std::string result;
+    result = ReadAndDeleteFile(kGGUFExportPath);
+    if (result.empty()) {
+        std::cerr << "failed to read back the exported gguf file" << std::endl;
+        return em::val::null();
+    }
+    return em::val(em::typed_memory_view(result.size(), reinterpret_cast<uint8_t*>(result.data())));
+}
+
 // Report the versions of the libraries baked into this module, for detailed
 // bug reports. onnxsim and onnx-optimizer come from CMake (their VERSION files);
 // onnx is reported as its max IR version + the highest opset it supports for the
@@ -635,6 +723,8 @@ std::vector<std::string> onnxoptimizer_fuse_elimination_passes() {
 EMSCRIPTEN_BINDINGS(module) {
     function("onnxsimplify_export", &onnxsimplify_export);
     function("onnxsim_annotate_model_info", &onnxsim_annotate_model_info);
+    function("onnxsim_export_safetensors", &onnxsim_export_safetensors);
+    function("onnxsim_export_gguf", &onnxsim_export_gguf);
     function("onnxoptimizer_optimize", &onnxoptimizer_optimize);
     function("onnxoptimizer_optimize_fixed", &onnxoptimizer_optimize_fixed);
     em::function("onnxoptimizer_passes", &onnxoptimizer_passes);
