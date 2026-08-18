@@ -755,6 +755,16 @@ void _InferShapes(onnx::ModelProto& model) {
 // InferShapes optionally counts this itself, so no extra pass over the model
 // is needed). Used by OptAndShape's fast-path fixed point below to tell
 // whether this round changed anything without hashing the whole model.
+//
+// Only available under NO_BUILTIN_ORT (the Python wheel build, where
+// third_party/onnx is guaranteed to be onnxsim's own patched onnx fork that
+// added the trailing ``num_inferred_values`` out-param). When
+// ONNXSIM_BUILTIN_ORT is ON instead (standalone C++/WASM/Rust builds), the
+// ``onnx`` CMake target comes from onnxruntime's own vendored, unpatched
+// onnx copy (see CMakeLists.txt), which does not have this parameter -- the
+// fast path below falls back to the original Fingerprint-based fixed point
+// there.
+#ifdef NO_BUILTIN_ORT
 void _InferShapes(onnx::ModelProto& model, bool* changed) {
   size_t num_inferred_values = 0;
   onnx::shape_inference::InferShapes(
@@ -764,6 +774,7 @@ void _InferShapes(onnx::ModelProto& model, bool* changed) {
     *changed = num_inferred_values > 0;
   }
 }
+#endif  // NO_BUILTIN_ORT
 
 // Build a lookup from tensor name to its type, gathering shapes from every
 // place a shape can be declared: value_info (populated by shape inference),
@@ -2296,11 +2307,18 @@ onnx::ModelProto Simplify(
   } else {
     FoldConstant = Identity;
   }
+  // ``perform_optimization=False`` (skip_optimizers == nullopt) means the
+  // caller wants the graph structure left alone, so the state elimination --
+  // which relies on dead-end elimination to clean up behind it -- runs with the
+  // optimizer or not at all.
+  const bool optimize = skip_optimizers.has_value();
+#ifdef NO_BUILTIN_ORT
   // Bool-returning counterparts of InferShapes/Optimize, used to build
   // OptAndShape's fast-path fixed point below (see the
   // ``std::function<bool(T&)>`` overload of ``FixedPointFn``): each reports
   // whether it actually changed the model, so that inner loop can skip
-  // Fingerprint hashing entirely.
+  // Fingerprint hashing entirely. Only available under NO_BUILTIN_ORT; see
+  // ``_InferShapes(model, bool*)``'s comment for why.
   using ModelFnChanged = std::function<bool(onnx::ModelProto&)>;
   ModelFnChanged InferShapesReportingChange =
       shape_inference ? ModelFnChanged([](onnx::ModelProto& model) {
@@ -2311,11 +2329,6 @@ onnx::ModelProto Simplify(
                       : ModelFnChanged([](onnx::ModelProto&) { return false; });
   // ``Optimize`` builds a fresh model (``OptimizeFixed`` returns a new proto),
   // so wrap it as an in-place transform that move-assigns the result back.
-  // ``perform_optimization=False`` (skip_optimizers == nullopt) means the
-  // caller wants the graph structure left alone, so the state elimination --
-  // which relies on dead-end elimination to clean up behind it -- runs with the
-  // optimizer or not at all.
-  const bool optimize = skip_optimizers.has_value();
   ModelFnChanged OptimizeInPlaceReportingChange =
       [optimize](onnx::ModelProto& model) {
         if (optimize) {
@@ -2329,6 +2342,20 @@ onnx::ModelProto Simplify(
         model = Optimize(model, &changed);
         return changed;
       };
+#else
+  // ONNXSIM_BUILTIN_ORT builds (standalone C++/WASM/Rust) link onnxruntime's
+  // own vendored, unpatched onnx copy rather than onnxsim's fork (see
+  // CMakeLists.txt), so the InferShapes change-count out-param used above is
+  // not available here. Fall back to the original Fingerprint-based fixed
+  // point for OptAndShape -- correct, just without the fast-path skip.
+  ModelFn InferShapes = shape_inference ? _InferShapes : Identity;
+  ModelFn OptimizeInPlace = [optimize](onnx::ModelProto& model) {
+    if (optimize) {
+      EliminateZeroRnnInitialState(model);
+    }
+    model = Optimize(model);
+  };
+#endif
 
   int fixed_point_iters =
       std::getenv("ONNXSIM_FIXED_POINT_ITERS")
@@ -2384,6 +2411,7 @@ onnx::ModelProto Simplify(
       fn(model);
     };
   };
+#ifdef NO_BUILTIN_ORT
   auto ProfiledChanged = [](const char* name,
                             ModelFnChanged fn) -> ModelFnChanged {
     if (!onnxsim::Profiler::Instance().enabled()) {
@@ -2400,6 +2428,12 @@ onnx::ModelProto Simplify(
       FixedPointFn(ProfiledChanged("InferShapes", InferShapesReportingChange),
                    ProfiledChanged("Optimize", OptimizeInPlaceReportingChange),
                    fixed_point_iters));
+#else
+  ModelFn OptAndShape = Profiled(
+      "OptAndShape",
+      FixedPointFn(Profiled("InferShapes", InferShapes),
+                   Profiled("Optimize", OptimizeInPlace), fixed_point_iters));
+#endif
   bool converged = false;
   ModelFn Pipeline;
   if (rewriter) {
