@@ -99,6 +99,10 @@ jobs:
     env:
       NUM_SHARDS: ${{ needs.setup.outputs.num_shards }}
       HF_HUB_ENABLE_HF_TRANSFER: "0"
+      # Authenticated downloads get their own rate-limit bucket, which helps
+      # with the intermittent connection resets anonymous access to the Hub
+      # sometimes hits under load. huggingface_hub picks this up automatically.
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
     strategy:
       fail-fast: false
       matrix:
@@ -142,6 +146,8 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     continue-on-error: true
+    env:
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
