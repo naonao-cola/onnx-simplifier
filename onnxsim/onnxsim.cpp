@@ -1701,7 +1701,8 @@ onnx::ModelProto _FoldConstant(const ModelExecutor& executor,
 // reporting) is count-based, so this sum is an accurate "did anything
 // change" signal, not just a hint -- used by OptAndShape's fast-path fixed
 // point below to skip hashing the whole model when it is false.
-onnx::ModelProto Optimize(const onnx::ModelProto& model, bool* changed = nullptr) {
+onnx::ModelProto Optimize(const onnx::ModelProto& model,
+                          bool* changed = nullptr) {
   // Make onnxsim's own optimizer passes available to onnxoptimizer's registry
   // (idempotent) so config.optimizer_passes may name them.
   onnxsim::RegisterCustomOptimizerPasses();
@@ -2296,18 +2297,18 @@ onnx::ModelProto Simplify(
     FoldConstant = Identity;
   }
   // Bool-returning counterparts of InferShapes/Optimize, used to build
-  // OptAndShape's fast-path fixed point below (see the ``std::function<bool(T&)>``
-  // overload of ``FixedPointFn``): each reports whether it actually changed
-  // the model, so that inner loop can skip Fingerprint hashing entirely.
+  // OptAndShape's fast-path fixed point below (see the
+  // ``std::function<bool(T&)>`` overload of ``FixedPointFn``): each reports
+  // whether it actually changed the model, so that inner loop can skip
+  // Fingerprint hashing entirely.
   using ModelFnChanged = std::function<bool(onnx::ModelProto&)>;
   ModelFnChanged InferShapesReportingChange =
-      shape_inference
-          ? ModelFnChanged([](onnx::ModelProto& model) {
-              bool changed = false;
-              _InferShapes(model, &changed);
-              return changed;
-            })
-          : ModelFnChanged([](onnx::ModelProto&) { return false; });
+      shape_inference ? ModelFnChanged([](onnx::ModelProto& model) {
+        bool changed = false;
+        _InferShapes(model, &changed);
+        return changed;
+      })
+                      : ModelFnChanged([](onnx::ModelProto&) { return false; });
   // ``Optimize`` builds a fresh model (``OptimizeFixed`` returns a new proto),
   // so wrap it as an in-place transform that move-assigns the result back.
   // ``perform_optimization=False`` (skip_optimizers == nullopt) means the
