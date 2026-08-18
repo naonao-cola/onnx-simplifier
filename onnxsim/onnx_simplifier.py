@@ -841,7 +841,15 @@ class PyModelExecutor(C.ModelExecutor):
         input_arrs = map(onnx.numpy_helper.to_array, input_tps)
         input_names = [x.name for x in model.graph.input]
         inputs = dict(zip(input_names, input_arrs))
-        outputs = backend.run_model(model, inputs, providers=self.providers)
+        # This executor is only ever invoked by the C++ core's constant-folding
+        # ``RunOps`` (see onnxsim.cpp) to run one throwaway fold-group
+        # sub-model, never for the full-size correctness check -- so it is
+        # always safe (and, given how many of these run per model, usually a
+        # meaningful speedup) to skip onnxruntime's per-session thread-pool
+        # spin-up.
+        outputs = backend.run_model(
+            model, inputs, providers=self.providers, single_threaded=True
+        )
         # The inference backend may return a non-ndarray for an output (for
         # example onnxruntime yields an empty Python list for an empty sequence
         # output). onnx.numpy_helper.from_array only accepts numpy arrays, so

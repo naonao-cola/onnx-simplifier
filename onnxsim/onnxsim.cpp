@@ -1,19 +1,25 @@
 #include "onnxsim.h"
 
 #include <google/protobuf/arena.h>
+#include <google/protobuf/io/zero_copy_stream.h>
 #include <google/protobuf/text_format.h>
 #include <google/protobuf/util/message_differencer.h>
 #include <onnx/onnx_pb.h>
 
 #include <algorithm>
+#include <cstdint>
+#include <cstring>
 #include <fstream>
 #include <functional>
+#include <map>
 #include <mutex>
 #include <numeric>
 #include <set>
 #include <string>
 #include <type_traits>
 #include <unordered_map>
+#include <unordered_set>
+#include <vector>
 
 #ifndef NO_BUILTIN_ORT
 // Prebuilt ONNX Runtime releases (github.com/microsoft/onnxruntime/releases)
@@ -261,6 +267,21 @@ struct CppModelExecutor : public ModelExecutor {
     Ort::SessionOptions sess_opts;
     sess_opts.SetLogSeverityLevel(3);
     sess_opts.SetGraphOptimizationLevel(ORT_DISABLE_ALL);
+    // This executor exists only to run constant-folding's throwaway
+    // fold-group sub-models (see RunOps above) -- never a full-size
+    // correctness check -- and each session here runs exactly once. So:
+    //  - Memory-pattern planning, which pays off across *repeated* Run()
+    //    calls, buys nothing for a session used once; skip planning it.
+    //  - A fresh intra-op thread pool sized to the machine's CPU count is
+    //    spun up (and joined) on every session construction, which happens
+    //    once per fold group per fixed-point round -- often hundreds of times
+    //    per large model. For the shape/index ops typical of a fold group
+    //    that spin-up/join is pure overhead, and it is where most of a fold
+    //    session's time goes (see the ``OrtSessionInit`` span above).
+    //    Running single-threaded skips it.
+    sess_opts.DisableMemPattern();
+    sess_opts.SetIntraOpNumThreads(1);
+    sess_opts.SetInterOpNumThreads(1);
     const bool ort_profiling = EnableOrtProfilingFromEnv(sess_opts);
     std::string model_str = model.SerializeAsString();
     Ort::Session session{nullptr};
@@ -593,7 +614,14 @@ struct ConstantNodePartition {
 ConstantNodePartition GetConstantNodes(const onnx::ModelProto& model) {
   // tensor with empty name("") represents the empty value of an optional input
   // so "" should be treated as a name of a constant tensor.
-  std::vector<std::string> const_names{""};
+  //
+  // A hash set, not a vector: every node's every input is looked up against
+  // this set below (``std::all_of`` over ``const_names``), and the set grows
+  // by every initializer up front plus every folded node's outputs as the
+  // scan proceeds. A vector + linear ``std::find`` makes that lookup
+  // O(constants seen so far) per input, i.e. O(nodes * initializers) overall
+  // on a model with many weights; a hash set makes each lookup O(1) average.
+  std::unordered_set<std::string> const_names{""};
   ConstantNodePartition partition;
   auto& const_nodes = partition.const_nodes;
   auto& non_const_nodes = partition.non_const_nodes;
@@ -603,10 +631,9 @@ ConstantNodePartition GetConstantNodes(const onnx::ModelProto& model) {
   // the graph untouched; a node fed by a Constant node still folds because ""
   // and Constant outputs remain in the constant set.
   if (config.initializers_as_constants) {
-    std::transform(model.graph().initializer().begin(),
-                   model.graph().initializer().end(),
-                   std::back_inserter(const_names),
-                   [](const auto& x) { return x.name(); });
+    for (const auto& x : model.graph().initializer()) {
+      const_names.insert(x.name());
+    }
   }
   // Map each domain to its imported opset version so the correct operator
   // schema can be looked up. The default ONNX domain is normalized to an empty
@@ -629,11 +656,9 @@ ConstantNodePartition GetConstantNodes(const onnx::ModelProto& model) {
         IsDeterministic(node.domain(), node.op_type(),
                         opset_version_of(node.domain())) &&
         !IsQDQ(node.domain(), node.op_type()) && !HasSubgraph(node) &&
-        std::all_of(node.input().begin(), node.input().end(),
-                    [&const_names](const auto& x) {
-                      return std::find(const_names.begin(), const_names.end(),
-                                       x) != const_names.end();
-                    });
+        std::all_of(
+            node.input().begin(), node.input().end(),
+            [&const_names](const auto& x) { return const_names.count(x) > 0; });
     if (!foldable) {
       non_const_nodes.push_back(node);
       continue;
@@ -641,8 +666,7 @@ ConstantNodePartition GetConstantNodes(const onnx::ModelProto& model) {
     if (!ProduceLargeTensor(model, node, config.tensor_size_threshold)) {
       // Ordinary constant folding: the output is materialized as an
       // initializer and the node is dropped.
-      const_names.insert(const_names.end(), node.output().begin(),
-                         node.output().end());
+      const_names.insert(node.output().begin(), node.output().end());
       const_nodes.push_back(node);
       continue;
     }
@@ -653,8 +677,7 @@ ConstantNodePartition GetConstantNodes(const onnx::ModelProto& model) {
     // rather than materializing the large tensor as an initializer. Other
     // large-tensor ops (e.g. Tile) remain fully excluded from folding.
     if (node.op_type() == "ConstantOfShape" || node.op_type() == "Expand") {
-      const_names.insert(const_names.end(), node.output().begin(),
-                         node.output().end());
+      const_names.insert(node.output().begin(), node.output().end());
       partition.deferred_outputs.insert(node.output().begin(),
                                         node.output().end());
     }
@@ -729,6 +752,32 @@ onnx::ModelProto EliminateUnusedInitializer(const onnx::ModelProto& model) {
 void _InferShapes(onnx::ModelProto& model) {
   onnx::shape_inference::InferShapes(model);
 }
+
+// Same as ``_InferShapes``, but also reports whether shape inference actually
+// inferred or updated any value's type/shape this call (``onnx::onnx``'s
+// InferShapes optionally counts this itself, so no extra pass over the model
+// is needed). Used by OptAndShape's fast-path fixed point below to tell
+// whether this round changed anything without hashing the whole model.
+//
+// Only available under NO_BUILTIN_ORT (the Python wheel build, where
+// third_party/onnx is guaranteed to be onnxsim's own patched onnx fork that
+// added the trailing ``num_inferred_values`` out-param). When
+// ONNXSIM_BUILTIN_ORT is ON instead (standalone C++/WASM/Rust builds), the
+// ``onnx`` CMake target comes from onnxruntime's own vendored, unpatched
+// onnx copy (see CMakeLists.txt), which does not have this parameter -- the
+// fast path below falls back to the original Fingerprint-based fixed point
+// there.
+#ifdef NO_BUILTIN_ORT
+void _InferShapes(onnx::ModelProto& model, bool* changed) {
+  size_t num_inferred_values = 0;
+  onnx::shape_inference::InferShapes(
+      model, onnx::OpSchemaRegistry::Instance(), onnx::ShapeInferenceOptions(),
+      /*generated_shape_data_by_name=*/nullptr, &num_inferred_values);
+  if (changed) {
+    *changed = num_inferred_values > 0;
+  }
+}
+#endif  // NO_BUILTIN_ORT
 
 // Build a lookup from tensor name to its type, gathering shapes from every
 // place a shape can be declared: value_info (populated by shape inference),
@@ -1657,7 +1706,17 @@ onnx::ModelProto _FoldConstant(const ModelExecutor& executor,
   }
 }
 
-onnx::ModelProto Optimize(const onnx::ModelProto& model) {
+// ``changed``, if non-null, is set to whether onnx-optimizer's own internal
+// fixed point (``OptimizeFixed`` already runs every pass to convergence
+// itself) modified the graph at all this call: it sums the per-pass
+// transform counts from the optional report onnx-optimizer can produce. Every
+// pass reachable through onnxsim's default pass list (built from
+// ``GetFuseAndEliminationPass()``, see onnxsim/optimizer's transform_counts
+// reporting) is count-based, so this sum is an accurate "did anything
+// change" signal, not just a hint -- used by OptAndShape's fast-path fixed
+// point below to skip hashing the whole model when it is false.
+onnx::ModelProto Optimize(const onnx::ModelProto& model,
+                          bool* changed = nullptr) {
   // Make onnxsim's own optimizer passes available to onnxoptimizer's registry
   // (idempotent) so config.optimizer_passes may name them.
   onnxsim::RegisterCustomOptimizerPasses();
@@ -1667,9 +1726,19 @@ onnx::ModelProto Optimize(const onnx::ModelProto& model) {
   const bool prev = onnx::optimization::InitializersAsConstants();
   onnx::optimization::SetInitializersAsConstants(
       config.initializers_as_constants);
-  auto result =
-      onnx::optimization::OptimizeFixed(model, config.optimizer_passes);
+  std::map<std::string, unsigned int> report;
+  auto result = onnx::optimization::OptimizeFixed(
+      model, config.optimizer_passes, changed ? &report : nullptr);
   onnx::optimization::SetInitializersAsConstants(prev);
+  if (changed) {
+    *changed = false;
+    for (const auto& pass_count : report) {
+      if (pass_count.second != 0) {
+        *changed = true;
+        break;
+      }
+    }
+  }
   return result;
 }
 
@@ -1687,20 +1756,114 @@ struct ModelFingerprint {
   }
 };
 
-ModelFingerprint Fingerprint(const onnx::ModelProto& model) {
-  // ModelProto contains no protobuf ``map<>`` fields, so serialization order is
-  // stable and equal models serialize to identical bytes.
-  const std::string bytes = model.SerializeAsString();
-  // Two independent rolling hashes (FNV-1a and a splitmix-style mix) combined
-  // into a 128-bit value.
-  uint64_t h1 = 1469598103934665603ULL;  // FNV-1a offset basis
-  uint64_t h2 = 0;
-  for (unsigned char c : bytes) {
-    h1 = (h1 ^ c) * 1099511628211ULL;  // FNV-1a prime
+// Mixes ``n`` bytes at ``data`` into the two rolling hash accumulators (FNV-1a
+// and a splitmix-style mix), 8 bytes (one machine word) at a time rather than
+// one byte at a time -- cutting the number of loop iterations, and with them
+// most of the loop/branch overhead, by roughly 8x versus a byte-at-a-time
+// mix, for identical byte coverage and order.
+void MixBytes(const char* data, size_t n, uint64_t& h1, uint64_t& h2) {
+  const size_t n_words = n / sizeof(uint64_t);
+  for (size_t i = 0; i < n_words; ++i) {
+    // memcpy, not a reinterpret_cast dereference: ``data`` is not guaranteed
+    // 8-byte aligned (it may be a chunk of a streaming buffer, or a
+    // std::string's internal buffer), and an unaligned uint64_t load is
+    // undefined behavior in C++. Any decent compiler lowers this fixed-size
+    // memcpy to a single unaligned load.
+    uint64_t word;
+    std::memcpy(&word, data + i * sizeof(uint64_t), sizeof(uint64_t));
+    h1 = (h1 ^ word) * 1099511628211ULL;
+    h2 = (h2 + word) * 0x9E3779B97F4A7C15ULL;
+    h2 ^= h2 >> 29;
+  }
+  // Fewer than 8 trailing bytes: fall back to a byte-at-a-time mix so every
+  // byte still participates in the hash.
+  for (size_t i = n_words * sizeof(uint64_t); i < n; ++i) {
+    const unsigned char c = static_cast<unsigned char>(data[i]);
+    h1 = (h1 ^ c) * 1099511628211ULL;
     h2 = (h2 + c) * 0x9E3779B97F4A7C15ULL;
     h2 ^= h2 >> 29;
   }
-  h2 ^= bytes.size();
+}
+
+// A protobuf output stream that hashes bytes as they are handed out by the
+// serializer instead of collecting them into a buffer. Fingerprint() used to
+// call ``model.SerializeAsString()`` -- which allocates a buffer the size of
+// the whole serialized model (hundreds of MB of initializer weight data on a
+// large model) and serializes into it -- and then made a second, separate
+// pass over that buffer to hash it. Handing the serializer a small, reused
+// scratch buffer instead avoids that large allocation (and the deallocation
+// moments later): each time the serializer fills it, this stream
+// mixes it into the running hash and hands the same buffer back out, so the
+// whole model is hashed in bounded extra memory regardless of its size.
+class HashingOutputStream final
+    : public google::protobuf::io::ZeroCopyOutputStream {
+ public:
+  bool Next(void** data, int* size) override {
+    FlushPending();
+    *data = buf_.data();
+    *size = static_cast<int>(buf_.size());
+    pending_ = static_cast<int>(buf_.size());
+    return true;
+  }
+  void BackUp(int count) override { pending_ -= count; }
+  int64_t ByteCount() const override { return byte_count_; }
+
+  // Call after serialization completes to mix in the final partial buffer.
+  void Finish() { FlushPending(); }
+
+  uint64_t h1() const { return h1_; }
+  uint64_t h2() const { return h2_; }
+  size_t total_bytes() const { return static_cast<size_t>(byte_count_); }
+
+ private:
+  void FlushPending() {
+    if (pending_ <= 0) {
+      return;
+    }
+    MixBytes(buf_.data(), static_cast<size_t>(pending_), h1_, h2_);
+    byte_count_ += pending_;
+    pending_ = 0;
+  }
+
+  // 64 KiB: large enough that the per-Next() call overhead is negligible next
+  // to the memory-bandwidth-bound hashing work, small enough to stay resident
+  // in L1/L2 cache across the mix. Heap-allocated, not a fixed-size array
+  // member: this object lives on the call stack of Fingerprint(), which is
+  // itself invoked from deep inside the (possibly nested) fixed-point
+  // machinery, and the WASM build's stack is only tens of KiB total -- a
+  // 64 KiB stack-resident array here reliably overflowed it (issue caught by
+  // the WASM build's own smoke test, "Aborted(stack overflow ...)" on the
+  // very first Simplify() call). std::vector's control block is a few
+  // pointer-sized words on the stack; the buffer itself is heap-backed.
+  std::vector<char> buf_ = std::vector<char>(1 << 16);
+  int pending_ = 0;
+  int64_t byte_count_ = 0;
+  uint64_t h1_ = 1469598103934665603ULL;  // FNV-1a offset basis
+  uint64_t h2_ = 0;
+};
+
+ModelFingerprint Fingerprint(const onnx::ModelProto& model) {
+  // ModelProto contains no protobuf ``map<>`` fields, so serialization order is
+  // stable and equal models serialize to identical bytes.
+  //
+  // Fingerprint() runs at every step of every (possibly nested) fixed point,
+  // so on a model with hundreds of MB of initializer weight data -- which
+  // dominates the serialized size but is untouched by most rounds (shape
+  // inference, the onnx-optimizer passes) -- it still has to read all of that
+  // data, every round, just to prove nothing changed. Profiling a 265 MB
+  // model showed this was a multi-second fraction (over half of total wall
+  // time on that model) of total simplification time, so it is worth
+  // streaming through a small buffer (see HashingOutputStream) rather than
+  // materializing the whole serialized model first.
+  HashingOutputStream stream;
+  // SerializeToZeroCopyStream only returns false if a Next() call on the
+  // stream fails (out of disk space, a broken pipe, ...); HashingOutputStream
+  // writes to memory and its Next() always succeeds, so this cannot fail.
+  model.SerializeToZeroCopyStream(&stream);
+  stream.Finish();
+  uint64_t h1 = stream.h1();
+  uint64_t h2 = stream.h2();
+  h2 ^= stream.total_bytes();
   return {h1, h2};
 }
 
@@ -1725,11 +1888,20 @@ std::function<void(T&)> FixedPointFn(const std::function<void(T&)>& f1,
                                      const std::function<void(T&)>& f2,
                                      size_t max_iters, bool* converged) {
   return [f1, f2, max_iters, converged](T& model) -> void {
+    // Profiled separately from the transforms it gates: on large models this
+    // convergence check is not free (see Fingerprint()'s comment), so its cost
+    // should be visible in its own right rather than silently inflating
+    // whichever of f1/f2's spans happens to run next. A no-op unless
+    // ONNXSIM_PROFILE is set.
+    auto fingerprint = [](const onnx::ModelProto& m) {
+      onnxsim::ProfiledScope scope("Fingerprint");
+      return Fingerprint(m);
+    };
     size_t _max_iters = max_iters;
     f1(model);
-    ModelFingerprint fp_prev = Fingerprint(model);
+    ModelFingerprint fp_prev = fingerprint(model);
     f2(model);
-    ModelFingerprint fp_cur = Fingerprint(model);
+    ModelFingerprint fp_cur = fingerprint(model);
     while (_max_iters-- > 0) {
       if (fp_cur == fp_prev) {
         if (converged) {
@@ -1739,7 +1911,7 @@ std::function<void(T&)> FixedPointFn(const std::function<void(T&)>& f1,
       }
       f1(model);
       fp_prev = fp_cur;
-      fp_cur = Fingerprint(model);
+      fp_cur = fingerprint(model);
       if (fp_cur == fp_prev) {
         if (converged) {
           *converged = true;
@@ -1748,7 +1920,7 @@ std::function<void(T&)> FixedPointFn(const std::function<void(T&)>& f1,
       }
       f2(model);
       fp_prev = fp_cur;
-      fp_cur = Fingerprint(model);
+      fp_cur = fingerprint(model);
     }
 
     if (converged) {
@@ -1760,6 +1932,61 @@ std::function<void(T&)> FixedPointFn(const std::function<void(T&)>& f1,
 template <typename T>
 std::function<void(T&)> FixedPointFn(const std::function<void(T&)>& f1,
                                      const std::function<void(T&)>& f2,
+                                     size_t max_iters) {
+  return FixedPointFn(f1, f2, max_iters, nullptr);
+}
+
+// Same convergence algorithm as the ``Fingerprint``-based ``FixedPointFn``
+// above, specialized for transforms that can cheaply report whether they
+// changed the model themselves (``f1``/``f2`` return true iff they did),
+// instead of hashing the whole serialized model after every call. This skips
+// ``Fingerprint()`` entirely, which matters most here because this is the
+// innermost, most-frequently-run fixed point (``OptAndShape`` below runs
+// every simplification round). It is only as safe as ``f1``/``f2``'s own
+// signal: both onnx-optimizer's per-pass transform counts and onnx's
+// InferShapes value-change count are exact for onnxsim's pass list (no
+// pass with an ``Empty``/uncounted analysis type is used), so a ``false``
+// return means that call provably made no change -- not just "probably".
+// A false negative here (missing a real change) would still not produce an
+// incorrect model: it only makes this inner loop stop one round early, and
+// the fingerprint-based fixed point one level up (which wraps every call
+// to ``OptAndShape`` as a whole) re-drives it from the top if that whole
+// call's net effect changed anything, same as a ``Fingerprint`` hash
+// collision would.
+template <typename T>
+std::function<void(T&)> FixedPointFn(const std::function<bool(T&)>& f1,
+                                     const std::function<bool(T&)>& f2,
+                                     size_t max_iters, bool* converged) {
+  return [f1, f2, max_iters, converged](T& model) -> void {
+    size_t _max_iters = max_iters;
+    f1(model);
+    bool last_changed = f2(model);
+    while (_max_iters-- > 0) {
+      if (!last_changed) {
+        if (converged) {
+          *converged = true;
+        }
+        return;
+      }
+      last_changed = f1(model);
+      if (!last_changed) {
+        if (converged) {
+          *converged = true;
+        }
+        return;
+      }
+      last_changed = f2(model);
+    }
+
+    if (converged) {
+      *converged = false;
+    }
+  };
+}
+
+template <typename T>
+std::function<void(T&)> FixedPointFn(const std::function<bool(T&)>& f1,
+                                     const std::function<bool(T&)>& f2,
                                      size_t max_iters) {
   return FixedPointFn(f1, f2, max_iters, nullptr);
 }
@@ -2083,22 +2310,55 @@ onnx::ModelProto Simplify(
   } else {
     FoldConstant = Identity;
   }
-  ModelFn InferShapes = shape_inference ? _InferShapes : Identity;
-  // ``Optimize`` builds a fresh model (``OptimizeFixed`` returns a new proto),
-  // so wrap it as an in-place transform that move-assigns the result back.
   // ``perform_optimization=False`` (skip_optimizers == nullopt) means the
   // caller wants the graph structure left alone, so the state elimination --
   // which relies on dead-end elimination to clean up behind it -- runs with the
   // optimizer or not at all.
   const bool optimize = skip_optimizers.has_value();
+#ifdef NO_BUILTIN_ORT
+  // Bool-returning counterparts of InferShapes/Optimize, used to build
+  // OptAndShape's fast-path fixed point below (see the
+  // ``std::function<bool(T&)>`` overload of ``FixedPointFn``): each reports
+  // whether it actually changed the model, so that inner loop can skip
+  // Fingerprint hashing entirely. Only available under NO_BUILTIN_ORT; see
+  // ``_InferShapes(model, bool*)``'s comment for why.
+  using ModelFnChanged = std::function<bool(onnx::ModelProto&)>;
+  ModelFnChanged InferShapesReportingChange =
+      shape_inference ? ModelFnChanged([](onnx::ModelProto& model) {
+        bool changed = false;
+        _InferShapes(model, &changed);
+        return changed;
+      })
+                      : ModelFnChanged([](onnx::ModelProto&) { return false; });
+  // ``Optimize`` builds a fresh model (``OptimizeFixed`` returns a new proto),
+  // so wrap it as an in-place transform that move-assigns the result back.
+  ModelFnChanged OptimizeInPlaceReportingChange =
+      [optimize](onnx::ModelProto& model) {
+        if (optimize) {
+          // Unset all-zero recurrent initial states (issue #314) so the
+          // subgraph computing them becomes dead and the passes below can
+          // remove it. Not reflected in Optimize()'s own change signal, but
+          // that is safe: see FixedPointFn's bool-returning overload comment.
+          EliminateZeroRnnInitialState(model);
+        }
+        bool changed = false;
+        model = Optimize(model, &changed);
+        return changed;
+      };
+#else
+  // ONNXSIM_BUILTIN_ORT builds (standalone C++/WASM/Rust) link onnxruntime's
+  // own vendored, unpatched onnx copy rather than onnxsim's fork (see
+  // CMakeLists.txt), so the InferShapes change-count out-param used above is
+  // not available here. Fall back to the original Fingerprint-based fixed
+  // point for OptAndShape -- correct, just without the fast-path skip.
+  ModelFn InferShapes = shape_inference ? _InferShapes : Identity;
   ModelFn OptimizeInPlace = [optimize](onnx::ModelProto& model) {
     if (optimize) {
-      // Unset all-zero recurrent initial states (issue #314) so the subgraph
-      // computing them becomes dead and the passes below can remove it.
       EliminateZeroRnnInitialState(model);
     }
     model = Optimize(model);
   };
+#endif
 
   int fixed_point_iters =
       std::getenv("ONNXSIM_FIXED_POINT_ITERS")
@@ -2154,11 +2414,29 @@ onnx::ModelProto Simplify(
       fn(model);
     };
   };
+#ifdef NO_BUILTIN_ORT
+  auto ProfiledChanged = [](const char* name,
+                            ModelFnChanged fn) -> ModelFnChanged {
+    if (!onnxsim::Profiler::Instance().enabled()) {
+      return fn;
+    }
+    return [name, fn = std::move(fn)](onnx::ModelProto& model) {
+      onnxsim::ProfiledScope scope(name);
+      return fn(model);
+    };
+  };
 
+  ModelFn OptAndShape = Profiled(
+      "OptAndShape",
+      FixedPointFn(ProfiledChanged("InferShapes", InferShapesReportingChange),
+                   ProfiledChanged("Optimize", OptimizeInPlaceReportingChange),
+                   fixed_point_iters));
+#else
   ModelFn OptAndShape = Profiled(
       "OptAndShape",
       FixedPointFn(Profiled("InferShapes", InferShapes),
                    Profiled("Optimize", OptimizeInPlace), fixed_point_iters));
+#endif
   bool converged = false;
   ModelFn Pipeline;
   if (rewriter) {
