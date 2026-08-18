@@ -80,6 +80,9 @@ constant folding until the model stops changing. Around that it offers:
 - **[Custom rewriters](#custom-rewriters).** Plug your own rewriting logic into
   the fixed point with `custom_rewriter`, or express data-only `FunctionProto`
   rules that also run from the C and Rust bindings.
+- **[Safetensors / GGUF archives](#safetensors--gguf-archives).** Export a model
+  to a standalone `.safetensors` or `.gguf` file (graph + weights in one
+  ecosystem-standard archive) and import it back, from every binding.
 - **Subgraph simplification.** Simplify `If`/`Loop`/`Scan` subgraph bodies too
   with `--include-subgraph`.
 - **Large-model handling.** Guard against blow-up from ops like `Tile`/
@@ -663,6 +666,61 @@ bodies, handle variadic/optional-input arity mismatches, match >2-operand
 commutative permutations, or evaluate attribute *predicates* — for those, the
 Python-only `onnxscript.rewriter` via `custom_rewriter` remains the richer
 option.
+
+## Safetensors / GGUF archives
+
+Besides plain `.onnx`, a model can be exported to (and imported back from) a
+**standalone safetensors or GGUF archive**: every initializer's bytes move into
+the archive with real, byte-accurate offsets — openable by the `safetensors`
+Python package / HF tooling, or any GGUF reader, with no onnxsim involved — and
+the graph itself is embedded alongside them, so the one archive file is both
+the model's weights and its graph. This is useful for interop with the
+safetensors/GGUF ecosystems, or simply as a one-file way to move a model
+around; it does not itself simplify anything, so pair it with `simplify()` if
+you want both.
+
+From Python:
+
+```python
+import onnx
+import onnxsim
+
+model = onnx.load("model.onnx")
+onnxsim.export_safetensors(model, "model.onnx.safetensors")
+onnxsim.export_gguf(model, "model.onnx.gguf")
+
+# ... later, or in another process:
+model = onnxsim.import_safetensors("model.onnx.safetensors")
+model = onnxsim.import_gguf("model.onnx.gguf")
+```
+
+From Rust:
+
+```rust
+let model_bytes = std::fs::read("model.onnx")?;
+onnxsim::export_safetensors(&model_bytes, "model.onnx.safetensors")?;
+onnxsim::export_gguf(&model_bytes, "model.onnx.gguf")?;
+
+let model_bytes = onnxsim::import_safetensors("model.onnx.safetensors")?;
+let model_bytes = onnxsim::import_gguf("model.onnx.gguf")?;
+```
+
+From C, `onnxsim_export_safetensors`/`onnxsim_import_safetensors` and their
+`_gguf` counterparts follow the same `out_data`/`out_size`/`out_error`
+convention as `onnxsim_simplify` (see
+[`onnxsim/capi/onnxsim_c_api.h`](onnxsim/capi/onnxsim_c_api.h)); the export
+side takes the model as bytes and writes straight to a path, the import side
+reads a path and hands back a freshly allocated buffer of model bytes.
+
+The [web version](#web-version) exposes the same thing as UI: a format
+dropdown (`.onnx` / `.onnx.safetensors` / `.onnx.gguf`) next to the converter's
+**Download** button, and the file picker accepts either archive format as an
+upload, decoding it back to ONNX before simplifying.
+
+Importing an archive with no embedded model — e.g. a plain, weights-only
+safetensors/GGUF file from somewhere else, with no onnxsim-authored graph
+alongside the tensors — fails with a clear error rather than silently
+returning nothing: there is no graph in it to import.
 
 ## Projects Using ONNX Simplifier
 
