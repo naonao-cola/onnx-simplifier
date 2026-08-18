@@ -70,7 +70,7 @@ struct GraphRewriter {
 
 void InitEnv();
 
-#ifndef NO_BUILTIN_ORT
+#ifdef ONNXSIM_HAS_ORT
 // Returns the built-in model executor backed by ONNX Runtime. Only available
 // when onnxsim is built with the built-in ONNX Runtime.
 std::shared_ptr<const ModelExecutor> GetBuiltinModelExecutor();

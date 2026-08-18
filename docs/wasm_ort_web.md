@@ -14,7 +14,7 @@ onnxsim's constant folding runs sub-models through a `ModelExecutor` abstraction
   ONNX Runtime from source into onnxsim's own `.wasm`.
 - `PyModelExecutor` — the Python "trampoline": `Run` calls back into the pip
   `onnxruntime` package, so the wheel links no ONNX Runtime C++
-  (`NO_BUILTIN_ORT`).
+  (no `ONNXSIM_HAS_ORT`).
 
 The `ModelExecutor` boundary exchanges tensors as DLPack `DLManagedTensor`
 (`onnxsim.h` / `onnxsim/dlpack_bridge.h`, see `docs/dlpack-executor.md`), so no
@@ -91,9 +91,9 @@ ORT_WEB=ON ./build_wasm.sh
 
 `ORT_WEB=ON` skips the ONNX Runtime source download, configures with
 `-DONNXSIM_WASM_ORT_WEB=ON`, and builds into `build-wasm-node-OFF-ortweb/`. The
-CMake option forces `ONNXSIM_BUILTIN_ORT=OFF`, links `onnx` directly (ORT no
-longer provides it transitively), compiles `js_model_executor.cpp`, and adds
-the Asyncify link flags.
+CMake option forces `ONNXSIM_BUILTIN_ORT=OFF` (onnxsim's own onnx/onnx-optimizer
+fork is linked directly either way -- see CMakeLists.txt), compiles
+`js_model_executor.cpp`, and adds the Asyncify link flags.
 
 Deploy the resulting `onnxsim.js` / `onnxsim.wasm` next to the page as usual.
 `worker.js` detects the variant at runtime via `onnxsim_needs_ort_web()`, loads
@@ -124,8 +124,11 @@ Removing ORT (`ONNXSIM_BUILTIN_ORT=OFF`) also removes that wasm protobuf, so
 onnx's generated `.pb.*` code fails to compile; `build_wasm.sh` only builds a
 **host** protoc (for codegen), not a wasm protobuf runtime.
 
-Fix: the `ONNXSIM_WASM_ORT_WEB` path sets `ONNX_BUILD_CUSTOM_PROTOBUF=ON`, so
-onnx builds its own bundled protobuf cross-compiled for the wasm target. onnx
+Fix: `ONNX_BUILD_CUSTOM_PROTOBUF=ON` is now set unconditionally for every build
+(not just `ONNXSIM_WASM_ORT_WEB` -- onnxsim's own onnx fork is always linked
+directly rather than sometimes provided transitively through ORT, see
+CMakeLists.txt), so onnx builds its own bundled protobuf cross-compiled for the
+wasm target. onnx
 fetches a **pinned protobuf version** (25.1, per onnx's `sbom.cdx.json`) and
 still uses a **host** protoc for codegen via `ONNX_CUSTOM_PROTOC_EXECUTABLE`
 (passed by `build_wasm.sh` as `which protoc`). The host protoc must match that

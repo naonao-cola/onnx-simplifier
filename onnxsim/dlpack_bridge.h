@@ -41,12 +41,8 @@
 #include "dlpack/dlpack.h"
 #include "dlpack_dtype.h"
 
-#ifndef NO_BUILTIN_ORT
-#ifdef ONNXSIM_ORT_FLAT_HEADERS
+#ifdef ONNXSIM_HAS_ORT
 #include "onnxruntime_cxx_api.h"
-#else
-#include "onnxruntime/core/session/onnxruntime_cxx_api.h"
-#endif
 #endif
 
 namespace onnxsim {
@@ -242,7 +238,7 @@ inline onnx::TensorProto ToTensorProto(const DLTensor& t,
   return tp;
 }
 
-#ifndef NO_BUILTIN_ORT
+#ifdef ONNXSIM_HAS_ORT
 // A process-wide CPU OrtMemoryInfo for wrapping/borrowing host buffers.
 inline Ort::MemoryInfo& CpuMemoryInfo() {
   static Ort::MemoryInfo info =
@@ -308,7 +304,7 @@ inline DLManagedTensor* FromOrtValue(Ort::Value&& value) {
   };
   return managed;
 }
-#endif  // NO_BUILTIN_ORT
+#endif  // ONNXSIM_HAS_ORT
 
 }  // namespace dlpack
 }  // namespace onnxsim

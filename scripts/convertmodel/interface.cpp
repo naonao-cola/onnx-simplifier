@@ -16,8 +16,8 @@
 #define ONNX_OPTIMIZER_VERSION_STRING "unknown"
 #endif
 
-// In the ORT-web build (ONNXSIM_WASM_ORT_WEB) onnxsim is compiled with
-// NO_BUILTIN_ORT -- no ONNX Runtime is linked in -- and constant folding is
+// In the ORT-web build (ONNXSIM_WASM_ORT_WEB) onnxsim is compiled without
+// ONNXSIM_HAS_ORT -- no ONNX Runtime is linked in -- and constant folding is
 // delegated to the page's onnxruntime-web via this executor instead.
 #ifdef ONNXSIM_WASM_ORT_WEB
 #include "js_model_executor.h"

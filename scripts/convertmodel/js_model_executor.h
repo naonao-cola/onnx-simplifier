@@ -16,7 +16,7 @@
 // with a second copy of ORT. When the hosting page already loads
 // onnxruntime-web (the converter page does, for its inference panel), routing
 // constant folding through it lets the onnxsim WASM build drop ORT entirely
-// (built with NO_BUILTIN_ORT), shrinking the module and removing the ORT
+// (built without ONNXSIM_HAS_ORT), shrinking the module and removing the ORT
 // compile from the build.
 //
 // This path is only compiled for Emscripten and only when the build opts into
