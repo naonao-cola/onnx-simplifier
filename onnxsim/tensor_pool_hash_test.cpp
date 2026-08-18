@@ -4,8 +4,9 @@
  * Standalone: g++ -std=c++17 -DBLAKE3_NO_SSE2 -DBLAKE3_NO_SSE41
  *   -DBLAKE3_NO_AVX2 -DBLAKE3_NO_AVX512 -DBLAKE3_USE_NEON=0 -I.. \
  *   tensor_pool_hash_test.cpp tensor_pool_hash.cpp \
- *   ../third_party/blake3/blake3.c ../third_party/blake3/blake3_dispatch.c \
- *   ../third_party/blake3/blake3_portable.c -o t && ./t
+ *   ../third_party/blake3/c/blake3.c \
+ *   ../third_party/blake3/c/blake3_dispatch.c \
+ *   ../third_party/blake3/c/blake3_portable.c -o t && ./t
  *
  * Checks both HashAlgorithm backends against their own published test
  * vectors (SHA-256's FIPS 180-4 examples; BLAKE3's official

@@ -11,8 +11,8 @@ set(CMAKE_OSX_DEPLOYMENT_TARGET 13.3 CACHE STRING "Minimum OS X deployment versi
 
 project(onnxsim CXX)
 
-# The vendored BLAKE3 sources backing TensorPool's content hashing
-# (onnxsim/tensor_pool_hash.cpp, third_party/blake3/*.c) are plain C, unlike
+# The BLAKE3 sources backing TensorPool's content hashing (onnxsim/
+# tensor_pool_hash.cpp, third_party/blake3/c/*.c) are plain C, unlike
 # the rest of this project, and are compiled into the `onnxsim` target in
 # EVERY configuration (see ONNXSIM_BLAKE3_SOURCES below) -- unlike the
 # ONNXSIM_BUILTIN_ORT path's own enable_language(C) call below, which only
@@ -132,23 +132,25 @@ add_subdirectory(third_party/onnx EXCLUDE_FROM_ALL)
 
 add_subdirectory(third_party/onnx-optimizer EXCLUDE_FROM_ALL)
 
-# Vendored BLAKE3 (third_party/blake3, see that directory's blake3.h for the
-# pinned version/license) backing TensorPool::ContentHash's default
-# HashAlgorithm -- see tensor_pool_hash.h's file comment. Only the portable
-# C source is vendored (no per-architecture SIMD), so it's compiled with
-# every SIMD backend disabled: that makes blake3_dispatch.c's runtime
-# CPU-feature dispatch fall through to blake3_portable.c unconditionally,
-# which is what makes omitting the SIMD source files (and their assembly)
-# correct rather than merely omitted. Applied via target_sources /
-# target_compile_definitions below to each target that (transitively, via
-# tensor_pool.cpp) needs TensorPool's hashing -- mirroring how
-# tensor_pool.cpp itself is listed per-target rather than built once into a
-# shared object library, matching this file's existing tensor_pool_test /
-# tensor_pool_gguf_test pattern below.
+# BLAKE3 (third_party/blake3, a git submodule pinned to a specific upstream
+# commit -- see .gitmodules / `git submodule status`, and LICENSE_A2 /
+# LICENSE_CC0 in that directory) backing TensorPool::ContentHash's default
+# HashAlgorithm -- see tensor_pool_hash.h's file comment. Its C sources live
+# under the submodule's own c/ subdirectory (upstream's layout, alongside
+# Rust/other-language bindings this repo doesn't use). Only the portable
+# files are compiled (no per-architecture SIMD), with every SIMD backend
+# disabled: that makes blake3_dispatch.c's runtime CPU-feature dispatch fall
+# through to blake3_portable.c unconditionally, which is what makes omitting
+# the SIMD source files (and their assembly) correct rather than merely
+# omitted. Applied via target_sources / target_compile_definitions below to
+# each target that (transitively, via tensor_pool.cpp) needs TensorPool's
+# hashing -- mirroring how tensor_pool.cpp itself is listed per-target
+# rather than built once into a shared object library, matching this file's
+# existing tensor_pool_test / tensor_pool_gguf_test pattern below.
 set(ONNXSIM_BLAKE3_SOURCES
-    third_party/blake3/blake3.c
-    third_party/blake3/blake3_dispatch.c
-    third_party/blake3/blake3_portable.c)
+    third_party/blake3/c/blake3.c
+    third_party/blake3/c/blake3_dispatch.c
+    third_party/blake3/c/blake3_portable.c)
 set(ONNXSIM_BLAKE3_COMPILE_DEFS
     BLAKE3_NO_SSE2 BLAKE3_NO_SSE41 BLAKE3_NO_AVX2 BLAKE3_NO_AVX512
     BLAKE3_USE_NEON=0)

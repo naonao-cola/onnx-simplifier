@@ -5,7 +5,7 @@
 #include <cstring>
 #include <stdexcept>
 
-#include "blake3/blake3.h"
+#include "blake3/c/blake3.h"
 
 namespace onnxsim {
 namespace tensor_pool {
