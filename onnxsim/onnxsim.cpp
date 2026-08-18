@@ -40,8 +40,12 @@
 #include "custom_optimizer_passes.h"
 #include "dlpack_bridge.h"
 #include "onnx/common/file_utils.h"
-#include "onnx/common/graph_shape_inference.h"
 #include "onnx/common/ir_pb_converter.h"
+#ifdef NO_BUILTIN_ORT
+// Only present in onnxsim's own onnx fork, not ONNX Runtime's bundled,
+// unpatched onnx copy -- see the NO_BUILTIN_ORT block below that uses it.
+#include "onnx/common/graph_shape_inference.h"
+#endif
 #include "onnx/defs/printer.h"
 #include "onnx/defs/schema.h"
 #include "onnx/inliner/inliner.h"
