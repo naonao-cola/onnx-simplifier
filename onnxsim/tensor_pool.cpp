@@ -323,18 +323,17 @@ class HeaderParser {
       }
     } else if (c == 't' || c == 'f' || c == 'n') {
       // true / false / null
-      while (pos_ < s_.size() && std::isalpha(static_cast<unsigned char>(
-                                     s_[pos_]))) {
+      while (pos_ < s_.size() &&
+             std::isalpha(static_cast<unsigned char>(s_[pos_]))) {
         ++pos_;
       }
     } else {
       // number
       size_t start = pos_;
-      while (pos_ < s_.size() && (std::isdigit(static_cast<unsigned char>(
-                                      s_[pos_])) ||
-                                  s_[pos_] == '-' || s_[pos_] == '+' ||
-                                  s_[pos_] == '.' || s_[pos_] == 'e' ||
-                                  s_[pos_] == 'E')) {
+      while (pos_ < s_.size() &&
+             (std::isdigit(static_cast<unsigned char>(s_[pos_])) ||
+              s_[pos_] == '-' || s_[pos_] == '+' || s_[pos_] == '.' ||
+              s_[pos_] == 'e' || s_[pos_] == 'E')) {
         ++pos_;
       }
       if (pos_ == start) Fail("unexpected character while skipping value");
@@ -354,8 +353,7 @@ void TensorPool::Add(const std::string& name, int32_t dtype,
   // its storage originated from a std::string (here) or a plain read buffer
   // (LoadSafetensors below).
   std::shared_ptr<const char[]> aliased(owner, view.data());
-  entries_[name] =
-      Entry{dtype, std::move(shape), std::move(aliased), view};
+  entries_[name] = Entry{dtype, std::move(shape), std::move(aliased), view};
 }
 
 void TensorPool::Add(const std::string& name, int32_t dtype,
@@ -385,10 +383,10 @@ void TensorPool::SaveSafetensors(
   for (const auto& [name, entry] : entries_) {
     std::string_view dt = ToSafetensors(entry.dtype);
     if (dt.empty()) {
-      throw std::runtime_error(
-          "TensorPool::SaveSafetensors: tensor '" + name +
-          "' has an ONNX dtype (" + std::to_string(entry.dtype) +
-          ") with no safetensors representation");
+      throw std::runtime_error("TensorPool::SaveSafetensors: tensor '" + name +
+                               "' has an ONNX dtype (" +
+                               std::to_string(entry.dtype) +
+                               ") with no safetensors representation");
     }
     if (!first) header += ',';
     first = false;
@@ -454,9 +452,8 @@ void TensorPool::LoadSafetensors(const std::string& path) {
   in.seekg(0, std::ios::beg);
   uint64_t header_len = ReadU64LE(in);
   if (!in || header_len > static_cast<uint64_t>(file_size) - 8) {
-    throw std::runtime_error(
-        "TensorPool::LoadSafetensors: '" + path +
-        "' has an invalid header length");
+    throw std::runtime_error("TensorPool::LoadSafetensors: '" + path +
+                             "' has an invalid header length");
   }
 
   std::string header(header_len, '\0');

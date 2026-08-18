@@ -9,11 +9,11 @@
 #include "tensor_pool_bridge.h"
 
 #include <onnx/onnx_pb.h>
+#include <unistd.h>
 
 #include <cstdio>
 #include <fstream>
 #include <string>
-#include <unistd.h>
 
 using namespace onnxsim::tensor_pool;
 
@@ -29,8 +29,8 @@ void Check(bool cond, const std::string& what) {
 }
 
 std::string TempPath(const std::string& suffix) {
-  return "/tmp/onnxsim_tensor_pool_bridge_test_" +
-        std::to_string(::getpid()) + suffix;
+  return "/tmp/onnxsim_tensor_pool_bridge_test_" + std::to_string(::getpid()) +
+         suffix;
 }
 
 std::string ReadFileRange(const std::string& path, uint64_t offset,
@@ -61,24 +61,24 @@ void TestAdoptAndHydrateSingleTensor() {
   bool adopted = AdoptFromTensorProto("w", t, pool);
   Check(adopted, "AdoptFromTensorProto succeeds for an inline-raw_data tensor");
   Check(!t.has_raw_data(),
-       "raw_data is gone from the TensorProto after adopting (moved, not "
-       "copied)");
+        "raw_data is gone from the TensorProto after adopting (moved, not "
+        "copied)");
   const Entry* e = pool.Find("w");
   Check(e != nullptr && e->nbytes() == 8, "pool holds the adopted bytes");
 
   // Adopting an already-adopted (raw_data-less) tensor is a no-op.
   Check(!AdoptFromTensorProto("w", t, pool),
-       "re-adopting a tensor with no raw_data returns false");
+        "re-adopting a tensor with no raw_data returns false");
 
   bool hydrated = HydrateTensorProto("w", t, pool);
   Check(hydrated, "HydrateTensorProto succeeds");
   Check(t.has_raw_data() && t.raw_data() == std::string(8, 'x'),
-       "hydrated raw_data matches the original bytes exactly");
+        "hydrated raw_data matches the original bytes exactly");
   Check(t.data_location() == onnx::TensorProto::DEFAULT,
-       "hydrated tensor is DEFAULT-located, not EXTERNAL");
+        "hydrated tensor is DEFAULT-located, not EXTERNAL");
 
   Check(!HydrateTensorProto("missing", t, pool),
-       "hydrating an unpooled name returns false");
+        "hydrating an unpooled name returns false");
 }
 
 void TestStringTensorIsNotAdopted() {
@@ -88,7 +88,7 @@ void TestStringTensorIsNotAdopted() {
   t.add_string_data("hello");
   TensorPool pool;
   Check(!AdoptFromTensorProto("s", t, pool),
-       "STRING tensors are never adopted (no raw byte layout)");
+        "STRING tensors are never adopted (no raw byte layout)");
   Check(pool.empty(), "pool stays empty");
 }
 
@@ -97,8 +97,8 @@ void TestExportModelWithSafetensors() {
   auto* graph = model.mutable_graph();
   *graph->add_initializer() = MakeInitializer(
       "weight", onnx::TensorProto::FLOAT, {2, 2}, std::string(16, '\x11'));
-  *graph->add_initializer() =
-      MakeInitializer("bias", onnx::TensorProto::INT64, {2}, std::string(16, '\x22'));
+  *graph->add_initializer() = MakeInitializer("bias", onnx::TensorProto::INT64,
+                                              {2}, std::string(16, '\x22'));
 
   // A node-attribute tensor (e.g. as Constant's `value` attribute uses) --
   // exercises the recursion into node attributes, not just top-level
@@ -107,9 +107,8 @@ void TestExportModelWithSafetensors() {
   node->set_name("const_node");
   auto* attr = node->add_attribute();
   attr->set_name("value");
-  *attr->mutable_t() =
-      MakeInitializer("const_tensor", onnx::TensorProto::UINT8, {4},
-                      std::string(4, '\x33'));
+  *attr->mutable_t() = MakeInitializer("const_tensor", onnx::TensorProto::UINT8,
+                                       {4}, std::string(4, '\x33'));
 
   std::string path = TempPath("_export.safetensors");
   TensorPool pool;
@@ -127,9 +126,9 @@ void TestExportModelWithSafetensors() {
     Check(t != nullptr, std::string(name) + ": found in model");
     if (t == nullptr) continue;
     Check(t->data_location() == onnx::TensorProto::EXTERNAL,
-         std::string(name) + ": is EXTERNAL after export");
+          std::string(name) + ": is EXTERNAL after export");
     Check(!t->has_raw_data(),
-         std::string(name) + ": no inline raw_data left after export");
+          std::string(name) + ": no inline raw_data left after export");
 
     std::string location, offset_str, length_str;
     for (const auto& e : t->external_data()) {
@@ -137,18 +136,19 @@ void TestExportModelWithSafetensors() {
       if (e.key() == "offset") offset_str = e.value();
       if (e.key() == "length") length_str = e.value();
     }
-    Check(location == path, std::string(name) + ": location == safetensors path");
+    Check(location == path,
+          std::string(name) + ": location == safetensors path");
     Check(!offset_str.empty() && !length_str.empty(),
-         std::string(name) + ": offset/length are set");
+          std::string(name) + ": offset/length are set");
 
     uint64_t offset = std::stoull(offset_str);
     uint64_t length = std::stoull(length_str);
     std::string on_disk = ReadFileRange(path, offset, length);
     const Entry* pooled = pool.Find(name);
     Check(pooled != nullptr && on_disk == pooled->data,
-         std::string(name) +
-             ": bytes at the recorded external_data offset match the pool "
-             "(and so the original tensor)");
+          std::string(name) +
+              ": bytes at the recorded external_data offset match the pool "
+              "(and so the original tensor)");
   }
 
   // The file this wrote is a valid, standalone safetensors file too -- a
@@ -156,7 +156,7 @@ void TestExportModelWithSafetensors() {
   TensorPool reloaded;
   reloaded.LoadSafetensors(path);
   Check(reloaded.size() == 3,
-       "the exported file is independently loadable as safetensors");
+        "the exported file is independently loadable as safetensors");
 
   std::remove(path.c_str());
 }
@@ -186,7 +186,7 @@ void TestUnnamedAttributeTensor() {
 
   const auto& exported_t = model.graph().node(0).attribute(0).t();
   Check(exported_t.data_location() == onnx::TensorProto::EXTERNAL,
-       "unnamed attribute tensor is EXTERNAL after export");
+        "unnamed attribute tensor is EXTERNAL after export");
   std::string location, offset_str, length_str;
   for (const auto& e : exported_t.external_data()) {
     if (e.key() == "location") location = e.value();
@@ -194,13 +194,13 @@ void TestUnnamedAttributeTensor() {
     if (e.key() == "length") length_str = e.value();
   }
   Check(!location.empty() && !offset_str.empty() && !length_str.empty(),
-       "unnamed attribute tensor got real location/offset/length, not left "
-       "half-adopted");
+        "unnamed attribute tensor got real location/offset/length, not left "
+        "half-adopted");
   if (!offset_str.empty() && !length_str.empty()) {
-    std::string on_disk = ReadFileRange(path, std::stoull(offset_str),
-                                        std::stoull(length_str));
+    std::string on_disk =
+        ReadFileRange(path, std::stoull(offset_str), std::stoull(length_str));
     Check(on_disk == std::string(4, '\x77'),
-         "bytes at the recorded offset match the original tensor");
+          "bytes at the recorded offset match the original tensor");
   }
   std::remove(path.c_str());
 }
@@ -210,10 +210,10 @@ void TestImportModelWithSafetensorsHydrateAll() {
   // but round-tripping all the way back through import.
   onnx::ModelProto original;
   auto* g = original.mutable_graph();
-  *g->add_initializer() = MakeInitializer(
-      "w1", onnx::TensorProto::FLOAT, {3}, std::string(12, '\x44'));
-  *g->add_initializer() = MakeInitializer(
-      "w2", onnx::TensorProto::INT32, {2}, std::string(8, '\x55'));
+  *g->add_initializer() = MakeInitializer("w1", onnx::TensorProto::FLOAT, {3},
+                                          std::string(12, '\x44'));
+  *g->add_initializer() = MakeInitializer("w2", onnx::TensorProto::INT32, {2},
+                                          std::string(8, '\x55'));
 
   std::string path = TempPath("_import.safetensors");
   TensorPool export_pool;
@@ -238,13 +238,13 @@ void TestImportModelWithSafetensorsHydrateAll() {
   Check(matched == 2, "both initializers matched on import");
 
   Check(fg->initializer(0).has_raw_data() &&
-           fg->initializer(0).raw_data() == std::string(12, '\x44'),
-       "w1 hydrated to the original bytes");
+            fg->initializer(0).raw_data() == std::string(12, '\x44'),
+        "w1 hydrated to the original bytes");
   Check(fg->initializer(0).data_location() == onnx::TensorProto::DEFAULT,
-       "w1 is DEFAULT-located after hydration");
+        "w1 is DEFAULT-located after hydration");
   Check(fg->initializer(1).has_raw_data() &&
-           fg->initializer(1).raw_data() == std::string(8, '\x55'),
-       "w2 hydrated to the original bytes");
+            fg->initializer(1).raw_data() == std::string(8, '\x55'),
+        "w2 hydrated to the original bytes");
 
   std::remove(path.c_str());
 }
@@ -264,22 +264,22 @@ void TestImportModelWithSafetensorsLazy() {
   init->add_dims(1);
 
   TensorPool import_pool;
-  size_t matched =
-      ImportModelWithSafetensors(fresh, path, import_pool, /*hydrate_all=*/false);
+  size_t matched = ImportModelWithSafetensors(fresh, path, import_pool,
+                                              /*hydrate_all=*/false);
   Check(matched == 1, "lazy import still reports the match");
   Check(!fresh.graph().initializer(0).has_raw_data(),
-       "lazy import leaves raw_data unset");
+        "lazy import leaves raw_data unset");
   Check(fresh.graph().initializer(0).data_location() ==
-           onnx::TensorProto::EXTERNAL,
-       "lazy import marks the tensor EXTERNAL for on-demand hydration");
+            onnx::TensorProto::EXTERNAL,
+        "lazy import marks the tensor EXTERNAL for on-demand hydration");
 
   // The caller can still hydrate it explicitly, on demand, straight from the
   // already-loaded pool -- no second file read.
   bool hydrated = HydrateTensorProto(
       "lazy", *fresh.mutable_graph()->mutable_initializer(0), import_pool);
-  Check(hydrated && fresh.graph().initializer(0).raw_data() ==
-                       std::string(4, '\x66'),
-       "on-demand HydrateTensorProto recovers the bytes");
+  Check(hydrated &&
+            fresh.graph().initializer(0).raw_data() == std::string(4, '\x66'),
+        "on-demand HydrateTensorProto recovers the bytes");
 
   std::remove(path.c_str());
 }
@@ -298,7 +298,6 @@ int main() {
     std::printf("tensor_pool_bridge_test: all checks passed\n");
     return 0;
   }
-  std::fprintf(stderr, "tensor_pool_bridge_test: %d failure(s)\n",
-              g_failures);
+  std::fprintf(stderr, "tensor_pool_bridge_test: %d failure(s)\n", g_failures);
   return 1;
 }

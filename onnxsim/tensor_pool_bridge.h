@@ -99,8 +99,7 @@ template <typename Fn>
 void ForEachTensor(onnx::GraphProto& graph, Fn&& fn) {
   for (int i = 0; i < graph.initializer_size(); ++i) {
     auto* init = graph.mutable_initializer(i);
-    fn(init->name().empty() ? "initializer" + std::to_string(i)
-                            : init->name(),
+    fn(init->name().empty() ? "initializer" + std::to_string(i) : init->name(),
        *init);
   }
   for (int ni = 0; ni < graph.node_size(); ++ni) {

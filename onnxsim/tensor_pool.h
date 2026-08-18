@@ -129,10 +129,9 @@ class TensorPool {
   // need the tensor's *absolute* file offset (e.g. to fill in a
   // TensorProto's external_data, as tensor_pool_bridge.h's
   // ExportModelWithSafetensors does) add HeaderPrefixSize(path)'s result.
-  void SaveSafetensors(
-      const std::string& path,
-      std::map<std::string, std::pair<uint64_t, uint64_t>>* data_offsets_out =
-          nullptr) const;
+  void SaveSafetensors(const std::string& path,
+                       std::map<std::string, std::pair<uint64_t, uint64_t>>*
+                           data_offsets_out = nullptr) const;
 
   // Replace this pool's contents with every tensor described by the
   // .safetensors file at `path`. Reads the whole file into one owned buffer

@@ -33,18 +33,17 @@ void Check(bool cond, const std::string& what) {
 }
 
 std::string TempPath(const std::string& suffix) {
-  return "/tmp/onnxsim_tensor_pool_test_" + std::to_string(::getpid()) +
-        suffix;
+  return "/tmp/onnxsim_tensor_pool_test_" + std::to_string(::getpid()) + suffix;
 }
 
 void TestRoundTrip() {
   TensorPool pool;
   pool.Add("weight.0", ONNX_FLOAT, {2, 3},
-          std::string("\x00\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b"
+           std::string("\x00\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b"
                        "\x0c\x0d\x0d\x0d\x0e\x0e\x0e\x0e\x0f\x0f\x0f\x0f",
                        24));
   pool.Add("bias", ONNX_INT64, {3},
-          std::string(24, '\x2a'));  // 3 int64 elements, arbitrary bytes
+           std::string(24, '\x2a'));  // 3 int64 elements, arbitrary bytes
   pool.Add("scalar", ONNX_BOOL, {}, std::string(1, '\x01'));
   pool.Add("empty", ONNX_FLOAT, {0}, std::string());
 
@@ -62,24 +61,23 @@ void TestRoundTrip() {
   if (w != nullptr) {
     Check(w->dtype == ONNX_FLOAT, "weight.0 dtype round-trips");
     Check(w->shape == std::vector<int64_t>({2, 3}),
-         "weight.0 shape round-trips");
+          "weight.0 shape round-trips");
     Check(w->nbytes() == 24, "weight.0 byte length round-trips");
-    Check(w->data ==
-             std::string_view(
-                 "\x00\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b"
-                 "\x0c\x0d\x0d\x0d\x0e\x0e\x0e\x0e\x0f\x0f\x0f\x0f",
-                 24),
-         "weight.0 bytes round-trip exactly");
+    Check(w->data == std::string_view(
+                         "\x00\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b"
+                         "\x0c\x0d\x0d\x0d\x0e\x0e\x0e\x0e\x0f\x0f\x0f\x0f",
+                         24),
+          "weight.0 bytes round-trip exactly");
   }
 
   const Entry* b = loaded.Find("bias");
   Check(b != nullptr && b->dtype == ONNX_INT64 &&
-           b->shape == std::vector<int64_t>({3}) && b->nbytes() == 24,
-       "bias round-trips");
+            b->shape == std::vector<int64_t>({3}) && b->nbytes() == 24,
+        "bias round-trips");
 
   const Entry* s = loaded.Find("scalar");
   Check(s != nullptr && s->shape.empty() && s->nbytes() == 1,
-       "scalar (rank-0) tensor round-trips");
+        "scalar (rank-0) tensor round-trips");
 
   const Entry* e = loaded.Find("empty");
   Check(e != nullptr && e->nbytes() == 0, "zero-size tensor round-trips");
@@ -111,16 +109,16 @@ void TestAliasingIsZeroCopyPerTensor() {
     // own base address for each entry, and both entries' owning control
     // block use_count should reflect a shared buffer.
     Check(static_cast<const void*>(ea->owner.get()) == ea->data.data(),
-         "a: owner aliases its own data pointer");
+          "a: owner aliases its own data pointer");
     Check(static_cast<const void*>(eb->owner.get()) == eb->data.data(),
-         "b: owner aliases its own data pointer");
+          "b: owner aliases its own data pointer");
     // The gap between the two views should exactly equal 'a's length,
     // confirming they were carved out of one contiguous buffer at the
     // offsets the header describes (rather than, say, two heap allocations
     // that happen to be adjacent by luck).
     Check(eb->data.data() - ea->data.data() ==
-             static_cast<ptrdiff_t>(ea->nbytes()),
-         "a and b are adjacent views into one contiguous buffer");
+              static_cast<ptrdiff_t>(ea->nbytes()),
+          "a and b are adjacent views into one contiguous buffer");
   }
   std::remove(path.c_str());
 }
@@ -137,7 +135,7 @@ void TestHeaderPrefixSize() {
   in.seekg(0, std::ios::end);
   uint64_t file_size = static_cast<uint64_t>(in.tellg());
   Check(prefix + offsets.at("x").second == file_size,
-       "HeaderPrefixSize + last tensor's end offset == file size");
+        "HeaderPrefixSize + last tensor's end offset == file size");
   std::remove(path.c_str());
 }
 
@@ -192,7 +190,7 @@ void TestSkipsMetadata() {
   Check(pool.size() == 1, "__metadata__ is skipped, not loaded as a tensor");
   Check(pool.Find("t") != nullptr, "the real tensor is still loaded");
   Check(pool.Find("__metadata__") == nullptr,
-       "__metadata__ itself is not exposed as an entry");
+        "__metadata__ itself is not exposed as an entry");
   std::remove(path.c_str());
 }
 
