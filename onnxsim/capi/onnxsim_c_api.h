@@ -262,6 +262,67 @@ ONNXSIM_C_API OnnxsimStatus onnxsim_graph_diff(const void* original_data,
                                                char** out_text,
                                                char** out_error);
 
+/*
+ * Export a model (given as a serialized ONNX ModelProto) to a standalone
+ * safetensors archive at `out_path`: every initializer's bytes move into the
+ * archive with real, byte-accurate offsets -- openable by the `safetensors`
+ * Python package / HF tooling with no onnxsim involved -- and the graph
+ * itself is embedded alongside them, so `out_path` alone is both the
+ * model's weights and its graph (see onnxsim/tensor_pool_bridge.h's
+ * SaveModelAsSafetensorsStandalone). Reload it with
+ * onnxsim_import_safetensors.
+ *
+ * On ONNXSIM_ERROR, *out_error receives a newly allocated message; release it
+ * with onnxsim_free_string. out_error may be NULL.
+ */
+ONNXSIM_C_API OnnxsimStatus onnxsim_export_safetensors(const void* model_data,
+                                                       size_t model_size,
+                                                       const char* out_path,
+                                                       char** out_error);
+
+/*
+ * Import a standalone safetensors archive at `in_path` (as produced by
+ * onnxsim_export_safetensors, or any other tool following the same
+ * self-describing-archive convention -- an embedded "model.onnx" entry
+ * alongside the tensors) back into an ordinary, fully in-memory ONNX
+ * ModelProto.
+ *
+ * On ONNXSIM_OK, *out_data/*out_size receive a newly allocated buffer holding
+ * the serialized ModelProto; release it with onnxsim_free_buffer. Fails with
+ * ONNXSIM_ERROR (and a message in *out_error, release with
+ * onnxsim_free_string) if the archive has no embedded onnxsim model -- e.g. a
+ * plain weights-only safetensors file with no graph to import -- or on any
+ * other read/parse failure. Either out_* pointer may be NULL if the caller
+ * does not want that value.
+ */
+ONNXSIM_C_API OnnxsimStatus onnxsim_import_safetensors(const char* in_path,
+                                                       void** out_data,
+                                                       size_t* out_size,
+                                                       char** out_error);
+
+/*
+ * GGUF counterpart of onnxsim_export_safetensors; see onnxsim/
+ * tensor_pool_gguf_bridge.h's SaveModelAsGGUFStandalone. Same contract.
+ */
+ONNXSIM_C_API OnnxsimStatus onnxsim_export_gguf(const void* model_data,
+                                                size_t model_size,
+                                                const char* out_path,
+                                                char** out_error);
+
+/*
+ * GGUF counterpart of onnxsim_import_safetensors; see onnxsim/
+ * tensor_pool_gguf_bridge.h's LoadModelFromGGUF. Same contract -- including
+ * failing with ONNXSIM_ERROR when the archive has no embedded model. Any
+ * OTHER pooled tensor LoadModelFromGGUF could not hydrate (e.g. a quantized
+ * weight) is silently left un-hydrated in the returned model rather than
+ * surfaced through this narrow C ABI; use the C++/Python/Rust bindings
+ * directly for that detail if it matters to the caller.
+ */
+ONNXSIM_C_API OnnxsimStatus onnxsim_import_gguf(const char* in_path,
+                                                void** out_data,
+                                                size_t* out_size,
+                                                char** out_error);
+
 /* Free a buffer returned via an out_data parameter. NULL is ignored. */
 ONNXSIM_C_API void onnxsim_free_buffer(void* data);
 

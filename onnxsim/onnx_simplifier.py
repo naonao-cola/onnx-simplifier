@@ -328,6 +328,44 @@ def import_onnx_schemas() -> int:
     return imported
 
 
+def export_safetensors(model: onnx.ModelProto, out_path: str) -> None:
+    """Export ``model`` to a standalone safetensors archive at ``out_path``.
+
+    Every initializer's bytes move into the archive with real, byte-accurate
+    offsets -- openable by the ``safetensors`` Python package / HF tooling with
+    no onnxsim involved -- and the graph itself is embedded alongside them, so
+    ``out_path`` alone is both the model's weights and its graph. Reload it
+    with :func:`import_safetensors`.
+    """
+    C.export_safetensors(model.SerializeToString(), out_path)
+
+
+def import_safetensors(in_path: str) -> onnx.ModelProto:
+    """Import a standalone safetensors archive back into an ``onnx.ModelProto``.
+
+    ``in_path`` must be an archive produced by :func:`export_safetensors` (or
+    any other tool following the same self-describing-archive convention: an
+    embedded ``model.onnx`` entry alongside the tensors). Raises
+    ``RuntimeError`` if the archive has no embedded onnxsim model, e.g. a
+    plain weights-only safetensors file with no graph to import.
+    """
+    model = onnx.ModelProto()
+    model.ParseFromString(C.import_safetensors(in_path))
+    return model
+
+
+def export_gguf(model: onnx.ModelProto, out_path: str) -> None:
+    """GGUF counterpart of :func:`export_safetensors`."""
+    C.export_gguf(model.SerializeToString(), out_path)
+
+
+def import_gguf(in_path: str) -> onnx.ModelProto:
+    """GGUF counterpart of :func:`import_safetensors`."""
+    model = onnx.ModelProto()
+    model.ParseFromString(C.import_gguf(in_path))
+    return model
+
+
 def _snapshot_doc_strings(model: onnx.ModelProto) -> dict:
     """Capture the ``doc_string`` fields that the C++ optimizer discards."""
     return {

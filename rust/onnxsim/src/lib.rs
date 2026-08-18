@@ -734,6 +734,138 @@ pub fn graph_diff(original: &[u8], simplified: &[u8]) -> Result<String, Error> {
     }
 }
 
+/// Export a serialized ONNX `ModelProto` to a standalone safetensors archive
+/// at `out_path`.
+///
+/// Every initializer's bytes move into the archive with real, byte-accurate
+/// offsets — openable by the `safetensors` Python package / HF tooling with
+/// no onnxsim involved — and the graph itself is embedded alongside them, so
+/// `out_path` alone is both the model's weights and its graph. Reload it with
+/// [`import_safetensors`].
+///
+/// ```no_run
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// let model = std::fs::read("model.onnx")?;
+/// onnxsim::export_safetensors(&model, "model.onnx.safetensors")?;
+/// # Ok(())
+/// # }
+/// ```
+pub fn export_safetensors<P: AsRef<Path>>(model_bytes: &[u8], out_path: P) -> Result<(), Error> {
+    let out_c = path_to_cstring(out_path.as_ref())?;
+    let mut out_error: *mut c_char = ptr::null_mut();
+    let status = unsafe {
+        onnxsim_sys::onnxsim_export_safetensors(
+            model_bytes.as_ptr() as *const c_void,
+            model_bytes.len(),
+            out_c.as_ptr(),
+            &mut out_error,
+        )
+    };
+    if status == onnxsim_sys::ONNXSIM_OK {
+        Ok(())
+    } else {
+        Err(take_error(out_error))
+    }
+}
+
+/// Import a standalone safetensors archive at `in_path` back into a
+/// serialized ONNX `ModelProto`.
+///
+/// `in_path` must be an archive produced by [`export_safetensors`] (or any
+/// other tool following the same self-describing-archive convention: an
+/// embedded `model.onnx` entry alongside the tensors). Fails if the archive
+/// has no embedded onnxsim model, e.g. a plain weights-only safetensors file
+/// with no graph to import.
+///
+/// ```no_run
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// let model_bytes = onnxsim::import_safetensors("model.onnx.safetensors")?;
+/// std::fs::write("model.onnx", &model_bytes)?;
+/// # Ok(())
+/// # }
+/// ```
+pub fn import_safetensors<P: AsRef<Path>>(in_path: P) -> Result<Vec<u8>, Error> {
+    let in_c = path_to_cstring(in_path.as_ref())?;
+    let mut out_data: *mut c_void = ptr::null_mut();
+    let mut out_size: usize = 0;
+    let mut out_error: *mut c_char = ptr::null_mut();
+    let status = unsafe {
+        onnxsim_sys::onnxsim_import_safetensors(
+            in_c.as_ptr(),
+            &mut out_data,
+            &mut out_size,
+            &mut out_error,
+        )
+    };
+    if status == onnxsim_sys::ONNXSIM_OK {
+        let result =
+            unsafe { std::slice::from_raw_parts(out_data as *const u8, out_size) }.to_vec();
+        unsafe { onnxsim_sys::onnxsim_free_buffer(out_data) };
+        Ok(result)
+    } else {
+        Err(take_error(out_error))
+    }
+}
+
+/// GGUF counterpart of [`export_safetensors`].
+///
+/// ```no_run
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// let model = std::fs::read("model.onnx")?;
+/// onnxsim::export_gguf(&model, "model.onnx.gguf")?;
+/// # Ok(())
+/// # }
+/// ```
+pub fn export_gguf<P: AsRef<Path>>(model_bytes: &[u8], out_path: P) -> Result<(), Error> {
+    let out_c = path_to_cstring(out_path.as_ref())?;
+    let mut out_error: *mut c_char = ptr::null_mut();
+    let status = unsafe {
+        onnxsim_sys::onnxsim_export_gguf(
+            model_bytes.as_ptr() as *const c_void,
+            model_bytes.len(),
+            out_c.as_ptr(),
+            &mut out_error,
+        )
+    };
+    if status == onnxsim_sys::ONNXSIM_OK {
+        Ok(())
+    } else {
+        Err(take_error(out_error))
+    }
+}
+
+/// GGUF counterpart of [`import_safetensors`].
+///
+/// ```no_run
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// let model_bytes = onnxsim::import_gguf("model.onnx.gguf")?;
+/// std::fs::write("model.onnx", &model_bytes)?;
+/// # Ok(())
+/// # }
+/// ```
+pub fn import_gguf<P: AsRef<Path>>(in_path: P) -> Result<Vec<u8>, Error> {
+    let in_c = path_to_cstring(in_path.as_ref())?;
+    let mut out_data: *mut c_void = ptr::null_mut();
+    let mut out_size: usize = 0;
+    let mut out_error: *mut c_char = ptr::null_mut();
+    let status = unsafe {
+        onnxsim_sys::onnxsim_import_gguf(
+            in_c.as_ptr(),
+            &mut out_data,
+            &mut out_size,
+            &mut out_error,
+        )
+    };
+    if status == onnxsim_sys::ONNXSIM_OK {
+        let result =
+            unsafe { std::slice::from_raw_parts(out_data as *const u8, out_size) }.to_vec();
+        unsafe { onnxsim_sys::onnxsim_free_buffer(out_data) };
+        Ok(result)
+    } else {
+        Err(take_error(out_error))
+    }
+}
+
 /// Owns the `CString`s and pointer array backing the `skip_optimizers` FFI
 /// arguments, keeping them alive for the duration of a call.
 struct FfiSkipOptimizers {

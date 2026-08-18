@@ -95,6 +95,22 @@ fn main() -> Result<(), Box<dyn std::error::Error + 'static>> {
 }
 ```
 
+Export a model to a standalone safetensors or GGUF archive (graph + weights in
+one ecosystem-standard file) and import it back:
+
+```rust
+fn main() -> Result<(), Box<dyn std::error::Error + 'static>> {
+    let model = std::fs::read("model.onnx")?;
+    onnxsim::export_safetensors(&model, "model.onnx.safetensors")?;
+    onnxsim::export_gguf(&model, "model.onnx.gguf")?;
+
+    let model = onnxsim::import_safetensors("model.onnx.safetensors")?;
+    let model = onnxsim::import_gguf("model.onnx.gguf")?;
+    let _ = model;
+    Ok(())
+}
+```
+
 ## Custom rewriter
 
 Run your own graph-rewriting logic inside the simplification fixed point — the

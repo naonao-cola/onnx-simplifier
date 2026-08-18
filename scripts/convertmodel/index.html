@@ -77,9 +77,20 @@ agraph (float[N] X) =&gt; (float[N] Y) {
         <script type="module" src="./debug_tools.mjs"></script>
 
         <h2 id="sec-convert">Convert a model</h2>
-        <input type="file" id="file-input" disabled title="Loading WebAssembly runtime…" />
+        <input type="file" id="file-input" accept=".onnx,.onnx.safetensors,.onnx.gguf,.safetensors,.gguf" disabled title="Loading WebAssembly runtime…" />
         <span id="loading-status" role="status" aria-live="polite">⏳ Loading WebAssembly runtime… the file picker is disabled until it is ready.</span>
+        <div class="note">
+            Also accepts a standalone <code>.onnx.safetensors</code> or <code>.onnx.gguf</code> archive
+            (e.g. one downloaded from the format selector below) -- it is decoded back to ONNX before converting.
+        </div>
         <button id="download-button" disabled>Download ↓</button>
+        <label for="download-format" style="margin-left: 0.5em;">as</label>
+        <select id="download-format" title="Choose the downloaded file's format. Safetensors and GGUF each produce one self-contained file: the model graph plus its weights, in that ecosystem's standard tensor format.">
+            <option value="onnx" selected>.onnx</option>
+            <option value="safetensors">.onnx.safetensors</option>
+            <option value="gguf">.onnx.gguf</option>
+        </select>
+        <span id="download-format-status" class="tool-note"></span>
         <div id="hf-loader" style="margin-top: 0.6em;">
             <label for="hf-model-select">…or load from <a href="https://huggingface.co/onnxmodelzoo" target="_blank" rel="noopener">Hugging Face</a>:</label>
             <select id="hf-model-select" disabled title="Loading WebAssembly runtime…">
