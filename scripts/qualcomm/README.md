@@ -15,6 +15,12 @@ preparation a Qualcomm converter runs) and then executes the compiled graph in
 the **x86 host emulator**. So the whole check runs on a free GitHub-hosted runner
 with nothing but `pip install onnxruntime-qnn`.
 
+Sibling checks for other vendor execution providers follow the same
+pattern: [`scripts/apple`](../apple) (Core ML) and
+[`scripts/intel`](../intel) (OpenVINO). NVIDIA (CUDA/TensorRT) and AMD
+(MIGraphX/ROCm) need real GPU hardware and aren't covered by a CI-runner
+harness yet.
+
 ## What it checks
 
 For each model the harness runs **original vs. simplified through the same QNN
@@ -42,8 +48,8 @@ bug.
 
 | file | purpose |
 | --- | --- |
-| `qnn_backend.py` | wraps the QNN EP: registers the plugin, builds/runs a model on QNN (offline HTP compile + x86 emulation) and on the ORT CPU reference, measures coverage, synthesizes inputs, compares outputs. Degrades gracefully (`QNN_AVAILABLE`) when the EP is absent. |
-| `models.py` | a small, network-free suite of synthetic graphs covering common layer patterns (conv/BN/relu, foldable shape→reshape, MLP, cancelling transposes, swish), each carrying the redundancy onnxsim is meant to remove. |
+| `qnn_backend.py` | wraps the QNN EP: registers the plugin, builds/runs a model on QNN (offline HTP compile + x86 emulation) and on the ORT CPU reference, measures coverage. Input synthesis/comparison come from `scripts/common/ep_numerics.py`. Degrades gracefully (`QNN_AVAILABLE`) when the EP is absent. |
+| `models.py` | alias for `scripts/common/synthetic_models.py`, a small, network-free suite of synthetic graphs covering common layer patterns (conv/BN/relu, foldable shape→reshape, MLP, cancelling transposes, swish), each carrying the redundancy onnxsim is meant to remove. Shared with the Apple Core ML (`scripts/apple`) and Intel OpenVINO (`scripts/intel`) harnesses so the suite isn't duplicated per vendor. |
 | `worker.py` | runs the check for one model in an isolated subprocess (the HTP compiler can abort at the C++ level), printing one `__RESULT__<json>` line. |
 | `run_qnn_compat.py` | drives the suite, writes a CSV, and exits non-zero on any regression. Entry point for CI. |
 

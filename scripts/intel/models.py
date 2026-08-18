@@ -1,12 +1,5 @@
 #!/usr/bin/env python3
-"""Qualcomm-side alias for the shared synthetic model suite.
-
-The suite itself moved to ``scripts/common/synthetic_models.py`` so the Apple
-CoreML and Intel OpenVINO harnesses can reuse it without duplicating ~180
-lines of graph builders. This module re-exports the same public API so
-``worker.py``'s ``import models`` and ``tests/test_qnn_compat.py``'s
-``models.names()`` / ``models.conv_bn_relu()`` keep working unchanged.
-"""
+"""Intel-side alias for the shared synthetic model suite. See scripts/common/."""
 
 from __future__ import annotations
 
