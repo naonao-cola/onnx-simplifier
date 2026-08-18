@@ -60,8 +60,8 @@ def check(model_name: str, onnx_path: str | None) -> dict:
     }
     t0 = time.time()
     try:
-        import onnx
         import coreml_backend as coreml
+        import onnx
 
         if not coreml.COREML_AVAILABLE:
             res["status"] = "skipped"
