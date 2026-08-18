@@ -2492,10 +2492,12 @@ onnx::ModelProto Simplify(
           GraphFnChanged InferShapesOnGraphChanged =
               shape_inference
                   ? GraphFnChanged([](onnx::Graph& graph) {
+                      onnxsim::ProfiledScope scope("InferShapes");
                       return onnx::InferShapesOnGraph(graph);
                     })
                   : GraphFnChanged([](onnx::Graph&) { return false; });
           GraphFnChanged OptimizeGraphChanged = [](onnx::Graph& graph) {
+            onnxsim::ProfiledScope scope("Optimize");
             onnxsim::RegisterCustomOptimizerPasses();
             const bool prev = onnx::optimization::InitializersAsConstants();
             onnx::optimization::SetInitializersAsConstants(
