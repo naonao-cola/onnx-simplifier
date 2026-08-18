@@ -1521,15 +1521,15 @@ bool IsAllZeroTensor(const onnx::Tensor& tensor) {
     return std::all_of(field.begin(), field.end(),
                        [](auto value) { return value == 0; });
   };
-  const size_t element_count = tensor.floats().size() + tensor.int32s().size() +
-                               tensor.int64s().size() + tensor.doubles().size() +
-                               tensor.uint64s().size();
+  const size_t element_count =
+      tensor.floats().size() + tensor.int32s().size() + tensor.int64s().size() +
+      tensor.doubles().size() + tensor.uint64s().size();
   if (element_count == 0) {
     return false;
   }
   return all_zero(tensor.floats()) && all_zero(tensor.int32s()) &&
-        all_zero(tensor.int64s()) && all_zero(tensor.doubles()) &&
-        all_zero(tensor.uint64s());
+         all_zero(tensor.int64s()) && all_zero(tensor.doubles()) &&
+         all_zero(tensor.uint64s());
 }
 
 // Graph-native port of IsAllZeroValue above, walking onnx::Value/Node instead
@@ -1610,28 +1610,26 @@ bool IsAllZeroGraphValue(
                                             [](int64_t i) { return i == 0; });
     }
   } else if (kind == kConstantOfShape) {
-    result = !producer->hasAttribute(kValue) ||
-             IsAllZeroTensor(producer->t(kValue));
+    result =
+        !producer->hasAttribute(kValue) || IsAllZeroTensor(producer->t(kValue));
   } else if (kind == kCast || kind == kCastLike) {
     const bool to_string = producer->hasAttribute(kTo) &&
                            producer->i(kTo) == onnx::TensorProto::STRING;
     result = !to_string && IsAllZeroGraphValue(producer->inputs()[0],
                                                initializer_by_name, memo);
   } else if (kind == kIdentity || kind == kReshape || kind == kTranspose ||
-            kind == kSqueeze || kind == kUnsqueeze || kind == kFlatten ||
-            kind == kTile || kind == kExpand || kind == kSlice ||
-            kind == kSplit || kind == kGather || kind == kGatherElements ||
-            kind == kGatherND) {
-    result = IsAllZeroGraphValue(producer->inputs()[0], initializer_by_name,
-                                 memo);
+             kind == kSqueeze || kind == kUnsqueeze || kind == kFlatten ||
+             kind == kTile || kind == kExpand || kind == kSlice ||
+             kind == kSplit || kind == kGather || kind == kGatherElements ||
+             kind == kGatherND) {
+    result =
+        IsAllZeroGraphValue(producer->inputs()[0], initializer_by_name, memo);
   } else if (kind == kConcat) {
     const auto& inputs = producer->inputs();
     result = !inputs.empty() &&
-             std::all_of(inputs.begin(), inputs.end(),
-                        [&](onnx::Value* input) {
-                          return IsAllZeroGraphValue(input,
-                                                     initializer_by_name, memo);
-                        });
+             std::all_of(inputs.begin(), inputs.end(), [&](onnx::Value* input) {
+               return IsAllZeroGraphValue(input, initializer_by_name, memo);
+             });
   }
 
   memo[value] = result;
@@ -1697,8 +1695,8 @@ void EliminateZeroRnnInitialState(onnx::Graph& graph) {
     }
 
     const auto& inputs = node->inputs();
-    for (int i = 5; i <= last_state_index && i < static_cast<int>(inputs.size());
-        i++) {
+    for (int i = 5;
+         i <= last_state_index && i < static_cast<int>(inputs.size()); i++) {
       if (IsAllZeroGraphValue(inputs[i], initializer_by_name, memo)) {
         if (undefined == nullptr) {
           undefined = FindUndefinedGraphValue(graph);
@@ -1709,7 +1707,7 @@ void EliminateZeroRnnInitialState(onnx::Graph& graph) {
     // Trailing empty inputs carry no information; drop them so the node ends
     // up in the same shape a converter would have emitted without the state.
     while (!node->inputs().empty() &&
-          node->inputs().back()->node()->kind() == onnx::kUndefined) {
+           node->inputs().back()->node()->kind() == onnx::kUndefined) {
       node->removeInput(node->inputs().size() - 1);
     }
   }
@@ -2597,9 +2595,9 @@ onnx::ModelProto Simplify(
   // function's doc comment), which can converge to less complete shape info
   // than a from-scratch protobuf InferShapes call for models using those
   // ops.
-  ModelFn OptAndShape =
-      Profiled("OptAndShape", [optimize, shape_inference,
-                               fixed_point_iters](onnx::ModelProto& model) {
+  ModelFn OptAndShape = Profiled(
+      "OptAndShape",
+      [optimize, shape_inference, fixed_point_iters](onnx::ModelProto& model) {
         std::shared_ptr<onnx::Graph> g(onnx::ImportModelProto(model));
         if (g.get() == nullptr) {
           // Same fallback as Optimizer::optimize(): if we can't parse the
@@ -2630,8 +2628,8 @@ onnx::ModelProto Simplify(
           onnx::optimization::SetInitializersAsConstants(
               config.initializers_as_constants);
           std::map<std::string, unsigned int> report;
-          onnx::optimization::OptimizeGraphFixed(
-              graph, config.optimizer_passes, &report);
+          onnx::optimization::OptimizeGraphFixed(graph, config.optimizer_passes,
+                                                 &report);
           onnx::optimization::SetInitializersAsConstants(prev);
           for (const auto& pass_count : report) {
             if (pass_count.second != 0) {
