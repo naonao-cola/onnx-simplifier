@@ -95,6 +95,19 @@ create_onnxsim({
     // happens now, so any file posted earlier would be dropped.
     postMessage(["ready"]);
 
+    // Decode a standalone safetensors/gguf archive into plain ONNX model
+    // bytes via the matching TensorPool import binding. Shared by the
+    // conversion pre-step below (which feeds the result into simplify/
+    // optimize) and the standalone "import_*" message (which just wants the
+    // decoded bytes to show in Netron -- see the "before" pane). Returns the
+    // decoded Uint8Array, or null if the archive has no embedded onnxsim
+    // model (e.g. a plain weights-only archive with no graph to import).
+    function importArchive(format, buf) {
+        const fn = format === "gguf" ?
+            runtime.onnxsim_import_gguf : runtime.onnxsim_import_safetensors;
+        return fn(buf);
+    }
+
     addEventListener("message", async (e) => {
         // Re-export already-converted model bytes into a standalone archive
         // format for the page's download-format selector (safetensors / gguf).
@@ -113,10 +126,42 @@ create_onnxsim({
                     postMessage(["export-format-error", format, format + " export failed!"]);
                     return;
                 }
-                const data_url = "data:application/octet-stream;base64," + bytes.toBase64();
-                postMessage(["export-format-done", format, data_url, filename]);
+                // Copy out of the wasm heap into a standalone ArrayBuffer (the
+                // view `bytes` aliases the module's own memory and cannot be
+                // transferred) and hand it to the main thread by transfer, not
+                // structured-clone. A safetensors/gguf archive embeds the whole
+                // model, easily tens of MB for a real model; a base64 data URL
+                // would encode it into an even bigger string, clone that whole
+                // string across the worker boundary, and then have the browser
+                // parse it back out of the anchor's href on click -- all of
+                // which a plain ArrayBuffer transfer + Blob URL skips.
+                const copy = bytes.slice();
+                postMessage(["export-format-done", format, copy.buffer, filename], [copy.buffer]);
             } catch (err) {
                 postMessage(["export-format-error", format, String((err && err.message) || err)]);
+            }
+            return;
+        }
+        // Decode a safetensors/gguf upload into plain ONNX bytes without
+        // running it through simplify/optimize -- used by the "before" Netron
+        // pane (netron_view.mjs, via window.__onnxsimImportArchive) so it
+        // renders the actual model graph instead of the raw archive bytes.
+        if (e.data[0] === "import_safetensors" || e.data[0] === "import_gguf") {
+            const format = e.data[0] === "import_gguf" ? "gguf" : "safetensors";
+            const importBuf = e.data[1];
+            try {
+                const bytes = importArchive(format, importBuf);
+                if (!bytes) {
+                    postMessage(["import-format-error", format,
+                        `no embedded onnxsim model found in this ${format} file`]);
+                    return;
+                }
+                // Transfer, not base64 -- same reasoning as the export path
+                // above; the decoded model can be tens of MB.
+                const copy = bytes.slice();
+                postMessage(["import-format-done", format, copy.buffer], [copy.buffer]);
+            } catch (err) {
+                postMessage(["import-format-error", format, String((err && err.message) || err)]);
             }
             return;
         }
@@ -147,9 +192,7 @@ create_onnxsim({
         // synchronous in both module variants.
         const source_format = e.data[11] || "onnx";
         if (source_format === "safetensors" || source_format === "gguf") {
-            const importFn = source_format === "gguf" ?
-                runtime.onnxsim_import_gguf : runtime.onnxsim_import_safetensors;
-            const imported = importFn(buf);
+            const imported = importArchive(source_format, buf);
             if (!imported) {
                 postMessage(["stderr",
                     `failed to import ${source_format}: no embedded onnxsim model ` +

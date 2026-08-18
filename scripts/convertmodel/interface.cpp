@@ -92,11 +92,20 @@ constexpr const char* kGGUFArchivePath = "onnxsim_export.gguf";
 // not be opened.
 std::string ReadAndDeleteFile(const std::string& path) {
     std::string data;
-    std::ifstream ifs(path, std::ios::binary);
+    // Seek to measure the size and read directly into a pre-sized string,
+    // rather than streaming through an ostringstream (which grows its own
+    // internal buffer geometrically and copies out of it into the returned
+    // string on .str()) -- one read into the final buffer instead of several
+    // reallocate-and-copy passes. Matters here because a safetensors/gguf
+    // archive embeds the whole model and can be tens of MB.
+    std::ifstream ifs(path, std::ios::binary | std::ios::ate);
     if (ifs) {
-        std::ostringstream ss;
-        ss << ifs.rdbuf();
-        data = ss.str();
+        const std::streamoff size = ifs.tellg();
+        if (size > 0) {
+            data.resize(static_cast<size_t>(size));
+            ifs.seekg(0);
+            ifs.read(&data[0], size);
+        }
     }
     std::remove(path.c_str());
     return data;

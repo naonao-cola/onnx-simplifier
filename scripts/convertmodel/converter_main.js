@@ -98,8 +98,30 @@
                     for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
                     return bytes;
                 };
+                // The in-flight window.__onnxsimImportArchive() request (see
+                // below), resolved/rejected by the "import-format-done"/
+                // "import-format-error" cases below. Only one archive decode
+                // is ever in flight at a time -- a later request implicitly
+                // supersedes an earlier one, which matches the file picker it
+                // serves (picking a new file makes any previous one moot).
+                let pendingImport = null;
+
                 worker.onmessage = (e) => {
                     switch (e.data[0]) {
+                        case "import-format-done":
+                            // e.data[2] is the decoded model's raw bytes (an
+                            // ArrayBuffer, transferred -- see worker.js).
+                            if (pendingImport) {
+                                pendingImport.resolve(new Uint8Array(e.data[2]));
+                                pendingImport = null;
+                            }
+                            break;
+                        case "import-format-error":
+                            if (pendingImport) {
+                                pendingImport.reject(new Error(e.data[2]));
+                                pendingImport = null;
+                            }
+                            break;
                         case "ready":
                             // The worker's WASM runtime has finished loading and
                             // is now listening for conversion requests.
@@ -123,10 +145,15 @@
                             dl_btn.disabled = false;
                             format_select.disabled = false;
                             format_status.textContent = "";
-                            const a = document.createElement("a");
-                            a.href = e.data[2];
-                            a.download = e.data[3];
-                            a.click();
+                            // e.data[2] is the raw archive bytes (an
+                            // ArrayBuffer, transferred rather than a base64
+                            // data URL -- see worker.js). downloadBytes wraps
+                            // it in a Blob URL, which is O(1) to create/click
+                            // regardless of size, unlike a multi-ten-MB data:
+                            // URL.
+                            import("./download.mjs").then(({ downloadBytes }) => {
+                                downloadBytes(e.data[2], e.data[3]);
+                            });
                             break;
                         }
                         case "export-format-error":
@@ -306,6 +333,20 @@
                 // module (hf_load.mjs), which downloads model bytes and drives
                 // the same path as an uploaded file.
                 window.__onnxsimStartConversion = startConversion;
+
+                // Decode a standalone safetensors/gguf archive (ArrayBuffer) into
+                // plain ONNX model bytes, without running a conversion. Used by
+                // netron_view.mjs's "before" pane so a safetensors/gguf upload
+                // renders the actual model graph instead of the raw archive
+                // bytes (which Netron can only show as an opaque weights list).
+                // `format` is "safetensors" or "gguf"; `buf` is transferred to
+                // the worker, so the caller must not reuse it afterwards.
+                window.__onnxsimImportArchive = (buf, format) => {
+                    return new Promise((resolve, reject) => {
+                        pendingImport = { resolve, reject };
+                        worker.postMessage(["import_" + format, buf], [buf]);
+                    });
+                };
 
                 input.addEventListener("change", async (e) => {
                     const file = e.target.files[0];
