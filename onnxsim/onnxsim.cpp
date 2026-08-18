@@ -40,6 +40,12 @@
 #include "custom_optimizer_passes.h"
 #include "dlpack_bridge.h"
 #include "onnx/common/file_utils.h"
+#include "onnx/common/ir_pb_converter.h"
+#ifdef NO_BUILTIN_ORT
+// Only present in onnxsim's own onnx fork, not ONNX Runtime's bundled,
+// unpatched onnx copy -- see the NO_BUILTIN_ORT block below that uses it.
+#include "onnx/common/graph_shape_inference.h"
+#endif
 #include "onnx/defs/printer.h"
 #include "onnx/defs/schema.h"
 #include "onnx/inliner/inliner.h"
@@ -752,32 +758,6 @@ onnx::ModelProto EliminateUnusedInitializer(const onnx::ModelProto& model) {
 void _InferShapes(onnx::ModelProto& model) {
   onnx::shape_inference::InferShapes(model);
 }
-
-// Same as ``_InferShapes``, but also reports whether shape inference actually
-// inferred or updated any value's type/shape this call (``onnx::onnx``'s
-// InferShapes optionally counts this itself, so no extra pass over the model
-// is needed). Used by OptAndShape's fast-path fixed point below to tell
-// whether this round changed anything without hashing the whole model.
-//
-// Only available under NO_BUILTIN_ORT (the Python wheel build, where
-// third_party/onnx is guaranteed to be onnxsim's own patched onnx fork that
-// added the trailing ``num_inferred_values`` out-param). When
-// ONNXSIM_BUILTIN_ORT is ON instead (standalone C++/WASM/Rust builds), the
-// ``onnx`` CMake target comes from onnxruntime's own vendored, unpatched
-// onnx copy (see CMakeLists.txt), which does not have this parameter -- the
-// fast path below falls back to the original Fingerprint-based fixed point
-// there.
-#ifdef NO_BUILTIN_ORT
-void _InferShapes(onnx::ModelProto& model, bool* changed) {
-  size_t num_inferred_values = 0;
-  onnx::shape_inference::InferShapes(
-      model, onnx::OpSchemaRegistry::Instance(), onnx::ShapeInferenceOptions(),
-      /*generated_shape_data_by_name=*/nullptr, &num_inferred_values);
-  if (changed) {
-    *changed = num_inferred_values > 0;
-  }
-}
-#endif  // NO_BUILTIN_ORT
 
 // Build a lookup from tensor name to its type, gathering shapes from every
 // place a shape can be declared: value_info (populated by shape inference),
@@ -1521,6 +1501,219 @@ void EliminateZeroRnnInitialState(onnx::ModelProto& model) {
   EliminateZeroRnnInitialState(*model.mutable_graph());
 }
 
+#ifdef NO_BUILTIN_ORT
+// Graph-native port of IsAllZeroTensor above, for onnx::Tensor (the C++ IR's
+// tensor type) instead of onnx::TensorProto. See that function's comment for
+// the zero-detection logic itself; this only translates the storage API.
+bool IsAllZeroTensor(const onnx::Tensor& tensor) {
+  if (tensor.data_location() == onnx::TensorProto_DataLocation_EXTERNAL) {
+    return false;
+  }
+  if (tensor.elem_type() == onnx::TensorProto::STRING ||
+      tensor.elem_type() == onnx::TensorProto::UNDEFINED) {
+    return false;
+  }
+  if (tensor.is_raw_data()) {
+    const std::string& raw = tensor.raw();
+    return std::all_of(raw.begin(), raw.end(), [](char c) { return c == 0; });
+  }
+  auto all_zero = [](const auto& field) {
+    return std::all_of(field.begin(), field.end(),
+                       [](auto value) { return value == 0; });
+  };
+  const size_t element_count =
+      tensor.floats().size() + tensor.int32s().size() + tensor.int64s().size() +
+      tensor.doubles().size() + tensor.uint64s().size();
+  if (element_count == 0) {
+    return false;
+  }
+  return all_zero(tensor.floats()) && all_zero(tensor.int32s()) &&
+         all_zero(tensor.int64s()) && all_zero(tensor.doubles()) &&
+         all_zero(tensor.uint64s());
+}
+
+// Graph-native port of IsAllZeroValue above, walking onnx::Value/Node instead
+// of TensorProto/NodeProto names. ``value``'s producer being the graph's
+// single kUndefined placeholder node (see ir_pb_converter.cc) is the IR's
+// direct equivalent of the ModelProto version's "name.empty()" check: both
+// mean "this optional input was not provided".
+bool IsAllZeroGraphValue(
+    onnx::Value* value,
+    const std::unordered_map<std::string, const onnx::Tensor*>&
+        initializer_by_name,
+    std::unordered_map<const onnx::Value*, bool>& memo) {
+  if (value->node()->kind() == onnx::kUndefined) {
+    return false;
+  }
+  auto memo_iter = memo.find(value);
+  if (memo_iter != memo.end()) {
+    return memo_iter->second;
+  }
+  // Insert a pessimistic answer up front: it both memoizes the miss and
+  // breaks any cycle a malformed graph might contain.
+  memo.emplace(value, false);
+
+  auto init_iter = initializer_by_name.find(value->uniqueName());
+  if (init_iter != initializer_by_name.end()) {
+    const bool result = IsAllZeroTensor(*init_iter->second);
+    memo[value] = result;
+    return result;
+  }
+
+  onnx::Node* producer = value->node();
+  if (producer->has_domain() && !producer->domain().empty() &&
+      producer->domain() != "ai.onnx") {
+    return false;
+  }
+
+  static const onnx::Symbol kConstant("Constant");
+  static const onnx::Symbol kConstantOfShape("ConstantOfShape");
+  static const onnx::Symbol kCast("Cast");
+  static const onnx::Symbol kCastLike("CastLike");
+  static const onnx::Symbol kIdentity("Identity");
+  static const onnx::Symbol kReshape("Reshape");
+  static const onnx::Symbol kTranspose("Transpose");
+  static const onnx::Symbol kSqueeze("Squeeze");
+  static const onnx::Symbol kUnsqueeze("Unsqueeze");
+  static const onnx::Symbol kFlatten("Flatten");
+  static const onnx::Symbol kTile("Tile");
+  static const onnx::Symbol kExpand("Expand");
+  static const onnx::Symbol kSlice("Slice");
+  static const onnx::Symbol kSplit("Split");
+  static const onnx::Symbol kGather("Gather");
+  static const onnx::Symbol kGatherElements("GatherElements");
+  static const onnx::Symbol kGatherND("GatherND");
+  static const onnx::Symbol kConcat("Concat");
+  static const onnx::Symbol kValue("value");
+  static const onnx::Symbol kValueFloat("value_float");
+  static const onnx::Symbol kValueInt("value_int");
+  static const onnx::Symbol kValueFloats("value_floats");
+  static const onnx::Symbol kValueInts("value_ints");
+  static const onnx::Symbol kTo("to");
+
+  bool result = false;
+  const onnx::Symbol kind = producer->kind();
+  if (kind == kConstant) {
+    if (producer->hasAttribute(kValue)) {
+      result = IsAllZeroTensor(producer->t(kValue));
+    } else if (producer->hasAttribute(kValueFloat)) {
+      result = producer->f(kValueFloat) == 0;
+    } else if (producer->hasAttribute(kValueInt)) {
+      result = producer->i(kValueInt) == 0;
+    } else if (producer->hasAttribute(kValueFloats)) {
+      const auto& floats = producer->fs(kValueFloats);
+      result = !floats.empty() && std::all_of(floats.begin(), floats.end(),
+                                              [](double f) { return f == 0; });
+    } else if (producer->hasAttribute(kValueInts)) {
+      const auto& ints = producer->is(kValueInts);
+      result = !ints.empty() && std::all_of(ints.begin(), ints.end(),
+                                            [](int64_t i) { return i == 0; });
+    }
+  } else if (kind == kConstantOfShape) {
+    result =
+        !producer->hasAttribute(kValue) || IsAllZeroTensor(producer->t(kValue));
+  } else if (kind == kCast || kind == kCastLike) {
+    const bool to_string = producer->hasAttribute(kTo) &&
+                           producer->i(kTo) == onnx::TensorProto::STRING;
+    result = !to_string && IsAllZeroGraphValue(producer->inputs()[0],
+                                               initializer_by_name, memo);
+  } else if (kind == kIdentity || kind == kReshape || kind == kTranspose ||
+             kind == kSqueeze || kind == kUnsqueeze || kind == kFlatten ||
+             kind == kTile || kind == kExpand || kind == kSlice ||
+             kind == kSplit || kind == kGather || kind == kGatherElements ||
+             kind == kGatherND) {
+    result =
+        IsAllZeroGraphValue(producer->inputs()[0], initializer_by_name, memo);
+  } else if (kind == kConcat) {
+    const auto& inputs = producer->inputs();
+    result = !inputs.empty() &&
+             std::all_of(inputs.begin(), inputs.end(), [&](onnx::Value* input) {
+               return IsAllZeroGraphValue(input, initializer_by_name, memo);
+             });
+  }
+
+  memo[value] = result;
+  return result;
+}
+
+// The graph's single placeholder Value standing in for "this optional input
+// was not provided" (see ir_pb_converter.cc) -- every kUndefined-producer
+// input aliases this same Value. Only scanned when actually needed (an
+// all-zero RNN initial state was found), so the common case of a graph with
+// no LSTM/RNN/GRU nodes pays nothing for it.
+onnx::Value* FindUndefinedGraphValue(onnx::Graph& graph) {
+  for (onnx::Node* node : graph.nodes()) {
+    if (node->kind() == onnx::kUndefined) {
+      return node->outputs()[0];
+    }
+  }
+  return nullptr;
+}
+
+// Graph-native port of EliminateZeroRnnInitialState(GraphProto&) above; see
+// that function's comment for the full rationale (issue #314).
+void EliminateZeroRnnInitialState(onnx::Graph& graph) {
+  std::unordered_map<std::string, const onnx::Tensor*> initializer_by_name;
+  const auto& initializers = graph.initializers();
+  const auto& initializer_names = graph.initializer_names();
+  initializer_by_name.reserve(initializers.size());
+  for (size_t i = 0; i < initializers.size(); ++i) {
+    initializer_by_name[initializer_names[i]] = &initializers[i];
+  }
+  std::unordered_map<const onnx::Value*, bool> memo;
+  onnx::Value* undefined = nullptr;
+
+  static const onnx::Symbol kLSTM("LSTM");
+  static const onnx::Symbol kRNN("RNN");
+  static const onnx::Symbol kGRU("GRU");
+
+  for (onnx::Node* node : graph.nodes()) {
+    // Recurse first, so recurrent ops inside If/Loop/Scan bodies are handled
+    // too.
+    for (onnx::Symbol attr : node->attributeNames()) {
+      if (node->kindOf(attr) == onnx::AttributeKind::g) {
+        EliminateZeroRnnInitialState(*node->g(attr));
+      } else if (node->kindOf(attr) == onnx::AttributeKind::gs) {
+        for (const auto& subgraph : node->gs(attr)) {
+          EliminateZeroRnnInitialState(*subgraph);
+        }
+      }
+    }
+
+    if (node->has_domain() && !node->domain().empty() &&
+        node->domain() != "ai.onnx") {
+      continue;
+    }
+    const onnx::Symbol kind = node->kind();
+    int last_state_index;
+    if (kind == kLSTM) {
+      last_state_index = 6;
+    } else if (kind == kRNN || kind == kGRU) {
+      last_state_index = 5;
+    } else {
+      continue;
+    }
+
+    const auto& inputs = node->inputs();
+    for (int i = 5;
+         i <= last_state_index && i < static_cast<int>(inputs.size()); i++) {
+      if (IsAllZeroGraphValue(inputs[i], initializer_by_name, memo)) {
+        if (undefined == nullptr) {
+          undefined = FindUndefinedGraphValue(graph);
+        }
+        node->replaceInput(i, undefined);
+      }
+    }
+    // Trailing empty inputs carry no information; drop them so the node ends
+    // up in the same shape a converter would have emitted without the state.
+    while (!node->inputs().empty() &&
+           node->inputs().back()->node()->kind() == onnx::kUndefined) {
+      node->removeInput(node->inputs().size() - 1);
+    }
+  }
+}
+#endif  // NO_BUILTIN_ORT
+
 // Estimate the number of bytes the outputs of `node` occupy once materialized,
 // using shapes gathered by shape inference (`vi_map` maps a tensor name to its
 // value_info). Outputs whose dtype or shape is not fully known contribute
@@ -1706,31 +1899,21 @@ onnx::ModelProto _FoldConstant(const ModelExecutor& executor,
   }
 }
 
-// ``changed``, if non-null, is set to whether onnx-optimizer's own internal
-// fixed point (``OptimizeFixed`` already runs every pass to convergence
-// itself) modified the graph at all this call: it sums the per-pass
-// transform counts from the optional report onnx-optimizer can produce. Every
-// pass reachable through onnxsim's default pass list (built from
-// ``GetFuseAndEliminationPass()``, see onnxsim/optimizer's transform_counts
-// reporting) is count-based, so this sum is an accurate "did anything
-// change" signal, not just a hint -- used by OptAndShape's fast-path fixed
-// point below to skip hashing the whole model when it is false.
-// ``model`` is ``onnx::ModelProto&`` (not const) under NO_BUILTIN_ORT: both
-// call sites below pass a mutable lvalue that is about to be move-assigned
-// over (``model = Optimize(model, ...)``), so its pre-call contents are dead
-// once this returns. That lets OptimizeFixed move each initializer's raw
-// bytes through the ModelProto<->Graph round trip instead of copying them --
-// the dominant cost of this call for weight-heavy models (onnxsim issue
-// #633) -- via the moving ImportModelProto/ExportModelProto overloads added
-// to onnxsim's onnx fork. Those overloads only exist on onnxsim's own fork,
-// not onnxruntime's bundled, unpatched onnx copy, so the non-NO_BUILTIN_ORT
-// build (standalone C++/WASM/Rust, which links ORT's onnx -- see the
-// InferShapes split above) keeps the original const-ref/copying signature.
+// ``model`` is ``onnx::ModelProto&`` (not const) under NO_BUILTIN_ORT: the
+// call site below passes a mutable lvalue that is about to be move-assigned
+// over (``model = Optimize(model)``), so its pre-call contents are dead once
+// this returns. That lets OptimizeFixed move each initializer's raw bytes
+// through the ModelProto<->Graph round trip instead of copying them -- the
+// dominant cost of this call for weight-heavy models (onnxsim issue #633) --
+// via the moving ImportModelProto/ExportModelProto overloads added to
+// onnxsim's onnx fork. Those overloads only exist on onnxsim's own fork, not
+// onnxruntime's bundled, unpatched onnx copy, so the non-NO_BUILTIN_ORT build
+// (standalone C++/WASM/Rust, which links ORT's onnx -- see the InferShapes
+// split above) keeps the original const-ref/copying signature.
 #ifdef NO_BUILTIN_ORT
-onnx::ModelProto Optimize(onnx::ModelProto& model, bool* changed = nullptr) {
+onnx::ModelProto Optimize(onnx::ModelProto& model) {
 #else
-onnx::ModelProto Optimize(const onnx::ModelProto& model,
-                          bool* changed = nullptr) {
+onnx::ModelProto Optimize(const onnx::ModelProto& model) {
 #endif
   // Make onnxsim's own optimizer passes available to onnxoptimizer's registry
   // (idempotent) so config.optimizer_passes may name them.
@@ -1741,19 +1924,9 @@ onnx::ModelProto Optimize(const onnx::ModelProto& model,
   const bool prev = onnx::optimization::InitializersAsConstants();
   onnx::optimization::SetInitializersAsConstants(
       config.initializers_as_constants);
-  std::map<std::string, unsigned int> report;
-  auto result = onnx::optimization::OptimizeFixed(
-      model, config.optimizer_passes, changed ? &report : nullptr);
+  auto result =
+      onnx::optimization::OptimizeFixed(model, config.optimizer_passes);
   onnx::optimization::SetInitializersAsConstants(prev);
-  if (changed) {
-    *changed = false;
-    for (const auto& pass_count : report) {
-      if (pass_count.second != 0) {
-        *changed = true;
-        break;
-      }
-    }
-  }
   return result;
 }
 
@@ -2330,42 +2503,12 @@ onnx::ModelProto Simplify(
   // which relies on dead-end elimination to clean up behind it -- runs with the
   // optimizer or not at all.
   const bool optimize = skip_optimizers.has_value();
-#ifdef NO_BUILTIN_ORT
-  // Bool-returning counterparts of InferShapes/Optimize, used to build
-  // OptAndShape's fast-path fixed point below (see the
-  // ``std::function<bool(T&)>`` overload of ``FixedPointFn``): each reports
-  // whether it actually changed the model, so that inner loop can skip
-  // Fingerprint hashing entirely. Only available under NO_BUILTIN_ORT; see
-  // ``_InferShapes(model, bool*)``'s comment for why.
-  using ModelFnChanged = std::function<bool(onnx::ModelProto&)>;
-  ModelFnChanged InferShapesReportingChange =
-      shape_inference ? ModelFnChanged([](onnx::ModelProto& model) {
-        bool changed = false;
-        _InferShapes(model, &changed);
-        return changed;
-      })
-                      : ModelFnChanged([](onnx::ModelProto&) { return false; });
-  // ``Optimize`` builds a fresh model (``OptimizeFixed`` returns a new proto),
-  // so wrap it as an in-place transform that move-assigns the result back.
-  ModelFnChanged OptimizeInPlaceReportingChange =
-      [optimize](onnx::ModelProto& model) {
-        if (optimize) {
-          // Unset all-zero recurrent initial states (issue #314) so the
-          // subgraph computing them becomes dead and the passes below can
-          // remove it. Not reflected in Optimize()'s own change signal, but
-          // that is safe: see FixedPointFn's bool-returning overload comment.
-          EliminateZeroRnnInitialState(model);
-        }
-        bool changed = false;
-        model = Optimize(model, &changed);
-        return changed;
-      };
-#else
+#ifndef NO_BUILTIN_ORT
   // ONNXSIM_BUILTIN_ORT builds (standalone C++/WASM/Rust) link onnxruntime's
   // own vendored, unpatched onnx copy rather than onnxsim's fork (see
-  // CMakeLists.txt), so the InferShapes change-count out-param used above is
-  // not available here. Fall back to the original Fingerprint-based fixed
-  // point for OptAndShape -- correct, just without the fast-path skip.
+  // CMakeLists.txt), so the Graph-native fixed point below (which needs
+  // onnxsim's own onnx/onnx-optimizer forks) is not available here. Fall
+  // back to the original ModelProto-based fixed point for OptAndShape.
   ModelFn InferShapes = shape_inference ? _InferShapes : Identity;
   ModelFn OptimizeInPlace = [optimize](onnx::ModelProto& model) {
     if (optimize) {
@@ -2429,28 +2572,84 @@ onnx::ModelProto Simplify(
       fn(model);
     };
   };
-#ifdef NO_BUILTIN_ORT
-  auto ProfiledChanged = [](const char* name,
-                            ModelFnChanged fn) -> ModelFnChanged {
-    if (!onnxsim::Profiler::Instance().enabled()) {
-      return fn;
-    }
-    return [name, fn = std::move(fn)](onnx::ModelProto& model) {
-      onnxsim::ProfiledScope scope(name);
-      return fn(model);
-    };
-  };
-
-  ModelFn OptAndShape = Profiled(
-      "OptAndShape",
-      FixedPointFn(ProfiledChanged("InferShapes", InferShapesReportingChange),
-                   ProfiledChanged("Optimize", OptimizeInPlaceReportingChange),
-                   fixed_point_iters));
-#else
+#ifndef NO_BUILTIN_ORT
   ModelFn OptAndShape = Profiled(
       "OptAndShape",
       FixedPointFn(Profiled("InferShapes", InferShapes),
                    Profiled("Optimize", OptimizeInPlace), fixed_point_iters));
+#else
+  // Fully Graph-resident OptAndShape, built on onnx::InferShapesOnGraph
+  // (onnx/common/graph_shape_inference.h) and onnx-optimizer's
+  // OptimizeGraphFixed (onnxoptimizer/optimize.h): both run directly against
+  // one onnx::Graph held for the whole inner fixed point, so this does
+  // exactly one Import and one Export for the *entire* fixed point, however
+  // many rounds it takes to converge -- instead of one Import+Export per
+  // round. This is onnxsim issue #633's "remaining option 2" (eliminating
+  // the round trip itself, not just its per-round cost); see #637 and #638
+  // for the validation, profiling and follow-up fix that took this from
+  // opt-in to the default.
+  //
+  // Remaining known scope gap: InferShapesOnGraph's own v1 scope leaves
+  // control-flow ops (If/Loop/Scan) and function-body ops uninferred (safe:
+  // exactly as if they had no registered schema, never wrong -- see that
+  // function's doc comment), which can converge to less complete shape info
+  // than a from-scratch protobuf InferShapes call for models using those
+  // ops.
+  ModelFn OptAndShape = Profiled(
+      "OptAndShape",
+      [optimize, shape_inference, fixed_point_iters](onnx::ModelProto& model) {
+        std::shared_ptr<onnx::Graph> g(onnx::ImportModelProto(model));
+        if (g.get() == nullptr) {
+          // Same fallback as Optimizer::optimize(): if we can't parse the
+          // model, leave it untouched.
+          return;
+        }
+        using GraphFnChanged = std::function<bool(onnx::Graph&)>;
+        GraphFnChanged InferShapesOnGraphChanged =
+            shape_inference
+                ? GraphFnChanged([](onnx::Graph& graph) {
+                    onnxsim::ProfiledScope scope("InferShapes");
+                    return onnx::InferShapesOnGraph(graph);
+                  })
+                : GraphFnChanged([](onnx::Graph&) { return false; });
+        GraphFnChanged OptimizeGraphChanged = [optimize](onnx::Graph& graph) {
+          onnxsim::ProfiledScope scope("Optimize");
+          onnxsim::RegisterCustomOptimizerPasses();
+          if (optimize) {
+            // Unset all-zero recurrent initial states (issue #314) so the
+            // subgraph computing them becomes dead and the passes below can
+            // remove it. Not reflected in the "changed" signal below, but
+            // that is safe: see FixedPointFn's bool-returning overload
+            // comment -- any resulting dead-end elimination is itself
+            // reflected in the report.
+            EliminateZeroRnnInitialState(graph);
+          }
+          const bool prev = onnx::optimization::InitializersAsConstants();
+          onnx::optimization::SetInitializersAsConstants(
+              config.initializers_as_constants);
+          std::map<std::string, unsigned int> report;
+          onnx::optimization::OptimizeGraphFixed(graph, config.optimizer_passes,
+                                                 &report);
+          onnx::optimization::SetInitializersAsConstants(prev);
+          for (const auto& pass_count : report) {
+            if (pass_count.second != 0) {
+              return true;
+            }
+          }
+          return false;
+        };
+        FixedPointFn(InferShapesOnGraphChanged, OptimizeGraphChanged,
+                     fixed_point_iters)(*g);
+        onnx::ModelProto out = onnx::PrepareOutput(model);
+        onnx::ExportModelProto(&out, g, /*consume_tensor_data=*/true);
+        // OptimizeGraphFixed never sees model-local functions (they live
+        // on ModelProto, not Graph), so carry them over unchanged --
+        // mirroring Optimizer::optimize()'s own AddFunctionsToModel.
+        for (const auto& function_proto : model.functions()) {
+          *out.add_functions() = function_proto;
+        }
+        model = std::move(out);
+      });
 #endif
   bool converged = false;
   ModelFn Pipeline;
