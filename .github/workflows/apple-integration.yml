@@ -1,0 +1,70 @@
+name: Apple Integration
+
+# Compiles and runs onnxsim's output through Apple's Core ML execution
+# provider to catch simplifications that break the Core ML toolchain, or
+# whose on-device result changed.
+#
+# Runs on a stock macOS GitHub-hosted runner: the CoreMLExecutionProvider is
+# built into the standard `onnxruntime` PyPI wheel's macOS build, so no extra
+# package or device is needed beyond the Mac itself. See
+# scripts/apple/README.md for the fidelity tiers this covers.
+#
+# Scheduled + on demand (like the Qualcomm check), plus on PRs that touch the
+# harness so it stays valid.
+
+on:
+  schedule:
+    - cron: "0 7 * * 1" # Mondays 07:00 UTC (weekly)
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - ".github/workflows/apple-integration.yml"
+      - "scripts/apple/**"
+      - "scripts/common/**"
+      - "tests/test_coreml_compat.py"
+
+concurrency:
+  group: apple-integration-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  coreml-compat:
+    name: Core ML compatibility check
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Install onnxsim + onnxruntime
+        run: |
+          python3 -m pip install --upgrade pip
+          # The macOS onnxruntime wheel bundles the Core ML EP.
+          python3 -m pip install onnxruntime
+          python3 -m pip install .
+      # Run from runner.temp, not the checkout: the repo root contains the
+      # `onnxsim/` source dir (no compiled extension), which would shadow the
+      # installed wheel on `import onnxsim`. Reference the harness by absolute
+      # $GITHUB_WORKSPACE path. Same guard the QNN/OpenVINO workflows use.
+      - name: Show environment
+        working-directory: ${{ runner.temp }}
+        run: |
+          python3 -c "import onnxsim, onnxruntime as ort; print('onnxsim', onnxsim.__version__); print('onnxruntime', ort.__version__); print('providers', ort.get_available_providers())"
+      - name: Run Core ML compatibility check
+        working-directory: ${{ runner.temp }}
+        run: |
+          python3 "$GITHUB_WORKSPACE/scripts/apple/run_coreml_compat.py" \
+            --require-coreml \
+            --output coreml-compat.csv
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: coreml-compat-report
+          path: ${{ runner.temp }}/coreml-compat.csv
+          if-no-files-found: ignore

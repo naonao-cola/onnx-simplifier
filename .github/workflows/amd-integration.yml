@@ -1,0 +1,65 @@
+name: AMD Integration
+
+# Compiles and runs onnxsim's output through AMD's MIGraphX execution
+# provider to catch simplifications that break the MIGraphX toolchain, or
+# whose on-device result changed.
+#
+# Unlike apple-integration.yml / intel-integration.yml, this workflow is
+# workflow_dispatch-ONLY and targets a [self-hosted, rocm] runner label that
+# this repository does not currently provision. MIGraphX has no CPU fallback
+# or host emulator (see scripts/amd/README.md) -- there is no way to exercise
+# it on a stock GitHub-hosted runner, so wiring this into `schedule` or
+# `pull_request` like the Apple/Intel checks would just queue forever with no
+# matching runner. Point it at your own ROCm-equipped self-hosted runner and
+# trigger it manually; until then it's dormant.
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: amd-integration-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  migraphx-compat:
+    name: MIGraphX compatibility check
+    # Requires a self-hosted runner with a ROCm-capable AMD GPU and the ROCm
+    # stack installed, labeled "rocm". Not provided by this repository.
+    runs-on: [self-hosted, rocm]
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Install onnxsim + onnxruntime-migraphx
+        run: |
+          python3 -m pip install --upgrade pip
+          # onnxruntime-migraphx replaces plain onnxruntime (bundles its own EP).
+          python3 -m pip install onnxruntime-migraphx
+          python3 -m pip install .
+      # Run from runner.temp, not the checkout: the repo root contains the
+      # `onnxsim/` source dir (no compiled extension), which would shadow the
+      # installed wheel on `import onnxsim`. Reference the harness by absolute
+      # $GITHUB_WORKSPACE path. Same guard the QNN/Core ML/OpenVINO workflows use.
+      - name: Show environment
+        working-directory: ${{ runner.temp }}
+        run: |
+          python3 -c "import onnxsim, onnxruntime as ort; print('onnxsim', onnxsim.__version__); print('onnxruntime', ort.__version__); print('providers', ort.get_available_providers())"
+      - name: Run MIGraphX compatibility check
+        working-directory: ${{ runner.temp }}
+        run: |
+          python3 "$GITHUB_WORKSPACE/scripts/amd/run_migraphx_compat.py" \
+            --require-migraphx \
+            --output migraphx-compat.csv
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: migraphx-compat-report
+          path: ${{ runner.temp }}/migraphx-compat.csv
+          if-no-files-found: ignore
