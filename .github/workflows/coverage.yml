@@ -179,17 +179,15 @@ jobs:
           name: coverage-rust
           path: coverage-report/
 
-  # Fold every language's Cobertura report into one summary and one sticky PR
-  # comment. Downloading same-workflow artifacts (rather than reaching across
-  # workflows) keeps the single-comment render reliable.
+  # Fold every language's Cobertura report into one summary. Downloading
+  # same-workflow artifacts (rather than reaching across workflows) keeps the
+  # combined render reliable.
   report:
     name: Combined coverage report
     needs: [cpp-python-js, rust]
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      # Lets the sticky-comment step post/update the combined coverage comment.
-      pull-requests: write
     steps:
     # Each language's report has disjoint filenames, so extracting both artifacts
     # into the same directory merges them into one coverage-report/ tree.
@@ -241,9 +239,10 @@ jobs:
 
     # Render a combined coverage table from every Cobertura report. irongut
     # accepts a comma-separated file list, so C++, Python, JS and Rust land in
-    # one summary. No external service or secret -- output goes to the job
-    # summary and a PR comment. fail_below_min stays false so coverage never
-    # blocks CI; set it true (with `thresholds`) to enforce a floor.
+    # one summary. No external service or secret -- output goes only to the
+    # job summary (no PR comment, to avoid noisy notifications). fail_below_min
+    # stays false so coverage never blocks CI; set it true (with `thresholds`)
+    # to enforce a floor.
     - name: Coverage summary (C++ + Python + JS + Rust)
       if: ${{ !cancelled() }}
       uses: irongut/CodeCoverageSummary@v1.3.0
@@ -261,15 +260,3 @@ jobs:
     - name: Publish coverage to job summary
       if: ${{ !cancelled() }}
       run: cat code-coverage-results.md >> "$GITHUB_STEP_SUMMARY"
-
-    # Post/update a single sticky coverage comment on the PR. continue-on-error
-    # keeps CI green on fork PRs, where the token is read-only and the comment
-    # can't post.
-    - name: Post coverage comment on PR
-      if: ${{ !cancelled() && github.event_name == 'pull_request' }}
-      continue-on-error: true
-      uses: marocchino/sticky-pull-request-comment@v3.0.5
-      with:
-        header: coverage
-        recreate: true
-        path: code-coverage-results.md
