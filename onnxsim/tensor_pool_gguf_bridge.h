@@ -142,6 +142,52 @@ inline bool LoadModelFromGGUF(const std::string& path, onnx::ModelProto* model,
   return ExtractModel(pool, model, hydrate_all);
 }
 
+// GGUF counterpart of tensor_pool_bridge.h's SaveModelAsSafetensorsStandalone
+// -- see that function's comment (and the "standalone archives" section
+// above it) for the real-offset design and why every weight tensor is still
+// written to disk exactly once despite the model blob needing two passes.
+inline void SaveModelAsGGUFStandalone(
+    onnx::ModelProto& model, const std::string& path, TensorPool& pool,
+    const std::map<std::string, std::string>& string_metadata = {}) {
+  auto adopted = AdoptAllWithPlaceholderOffsets(model, path, pool);
+  CheckNoEmbeddedModelKeyCollision(pool);
+
+  std::string placeholder_bytes;
+  if (!model.SerializeToString(&placeholder_bytes)) {
+    throw std::runtime_error(
+        "TensorPool: SaveModelAsGGUFStandalone: failed to serialize the "
+        "model");
+  }
+  pool.Add(kEmbeddedModelKey, ONNX_INT8,
+           {static_cast<int64_t>(placeholder_bytes.size())},
+           std::string(placeholder_bytes));
+
+  std::map<std::string, std::pair<uint64_t, uint64_t>> offsets;
+  uint64_t data_section_start = 0;
+  pool.SaveGGUF(path, string_metadata, &offsets, &data_section_start);
+
+  PatchStandaloneOffsets(adopted, offsets, data_section_start);
+
+  std::string final_bytes;
+  if (!model.SerializeToString(&final_bytes)) {
+    throw std::runtime_error(
+        "TensorPool: SaveModelAsGGUFStandalone: failed to re-serialize the "
+        "model");
+  }
+  if (final_bytes.size() != placeholder_bytes.size()) {
+    throw std::runtime_error(
+        "TensorPool: SaveModelAsGGUFStandalone: internal error -- "
+        "re-serializing with real offsets changed the model's size (" +
+        std::to_string(placeholder_bytes.size()) + " -> " +
+        std::to_string(final_bytes.size()) + " bytes)");
+  }
+
+  const auto& model_range = offsets.at(kEmbeddedModelKey);
+  PatchFileBytes(path, data_section_start + model_range.first, final_bytes);
+  pool.Add(kEmbeddedModelKey, ONNX_INT8,
+           {static_cast<int64_t>(final_bytes.size())}, std::move(final_bytes));
+}
+
 }  // namespace tensor_pool
 }  // namespace onnxsim
 

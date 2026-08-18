@@ -73,6 +73,7 @@
 #include <onnx/onnx_pb.h>
 
 #include <cstdint>
+#include <fstream>
 #include <map>
 #include <memory>
 #include <stdexcept>
@@ -263,6 +264,22 @@ inline size_t ImportModelWithSafetensors(onnx::ModelProto& model,
 // Pool key under which a self-describing archive's own graph is stored.
 inline const std::string kEmbeddedModelKey = "model.onnx";  // NOLINT
 
+// TensorPool::Add silently overwrites an existing entry of the same name,
+// which would be actively dangerous here: a model with a real initializer
+// named "model.onnx" (unlikely, but not forbidden by the ONNX spec) would
+// have that weight silently clobbered by the embedded-model blob with no
+// error. Call this right before adding kEmbeddedModelKey and it throws
+// instead.
+inline void CheckNoEmbeddedModelKeyCollision(const TensorPool& pool) {
+  if (pool.Find(kEmbeddedModelKey) != nullptr) {
+    throw std::runtime_error(
+        "TensorPool: a tensor is already named '" + kEmbeddedModelKey +
+        "', which collides with the reserved key this archive format "
+        "embeds the graph itself under; rename that tensor before "
+        "embedding");
+  }
+}
+
 // Move every eligible tensor's bytes out of `model` into `pool` (as
 // AdoptFromTensorProto does), mark each as a symbolic EXTERNAL reference
 // into `archive_path`, then serialize the now-byte-free `model` and add
@@ -272,6 +289,11 @@ inline const std::string kEmbeddedModelKey = "model.onnx";  // NOLINT
 // AdoptFromTensorProto leaves individual tensors in -- reload it via
 // ExtractModel/LoadModelFromSafetensors/LoadModelFromGGUF rather than using
 // `model` directly afterwards.
+//
+// The embedded copy's EXTERNAL references are symbolic (see this header's
+// top comment) -- for real, byte-accurate offsets that make the extracted
+// model.onnx blob standalone-loadable elsewhere, use
+// SaveModelAsSafetensorsStandalone / SaveModelAsGGUFStandalone instead.
 inline void EmbedModel(onnx::ModelProto& model, const std::string& archive_path,
                        TensorPool& pool) {
   detail::ForEachTensor(*model.mutable_graph(),
@@ -283,6 +305,7 @@ inline void EmbedModel(onnx::ModelProto& model, const std::string& archive_path,
                           e->set_key("location");
                           e->set_value(archive_path);
                         });
+  CheckNoEmbeddedModelKeyCollision(pool);
 
   std::string bytes;
   if (!model.SerializeToString(&bytes)) {
@@ -335,6 +358,167 @@ inline bool LoadModelFromSafetensors(const std::string& path,
                                      bool hydrate_all = true) {
   pool.LoadSafetensors(path);
   return ExtractModel(pool, model, hydrate_all);
+}
+
+// --- standalone archives: real, byte-accurate self-referencing offsets ----
+//
+// EmbedModel's embedded copy is symbolic -- fine for onnxsim's own
+// round-trip (ExtractModel resolves by name, never touches offset/length),
+// but useless to a vanilla onnx/onnxruntime given just the extracted
+// model.onnx blob. Making the embedded copy's offsets byte-accurate has a
+// real chicken-and-egg problem: the model's serialized size depends on the
+// digit-string offset/length values patched into it, which depend on where
+// the model blob itself ends up in the archive, which depends on the
+// model's serialized size.
+//
+// Broken with a fixed-width field: every offset/length value is written as
+// exactly kOffsetFieldWidth decimal digits (zero-padded -- ordinary decimal
+// parsers, including onnx's own external-data reader, skip leading zeros
+// with no issue), so re-patching the *real* value in later never changes
+// the model's serialized byte length versus an all-zero placeholder. That
+// makes the whole thing a single clean pass: adopt tensors with placeholder
+// offsets -> serialize -> pool it -> ask TensorPool for the real layout ->
+// patch the *same-length* real values in -> re-serialize (guaranteed
+// identical length) -> overwrite just the already-written model blob's
+// bytes in place. Every weight tensor is still written to disk exactly
+// once; only the small model blob is touched twice.
+
+inline constexpr int kOffsetFieldWidth = 20;  // covers up to ~10**20 bytes
+
+inline std::string FixedWidthDecimal(uint64_t v) {
+  std::string s = std::to_string(v);
+  if (s.size() > static_cast<size_t>(kOffsetFieldWidth)) {
+    throw std::runtime_error("TensorPool: offset/length " + s +
+                             " exceeds the reserved field width (" +
+                             std::to_string(kOffsetFieldWidth) + " digits)");
+  }
+  return std::string(static_cast<size_t>(kOffsetFieldWidth) - s.size(), '0') +
+         s;
+}
+
+// First half of the standalone-embed algorithm: adopt every eligible
+// tensor's bytes into `pool` and mark each EXTERNAL with `archive_path` and
+// fixed-width placeholder (all-zero) offset/length, ready for
+// PatchStandaloneOffsets once the pool's real layout is known. Returns
+// each adopted tensor's pool key alongside its TensorProto*, exactly like
+// ExportModelWithSafetensors's internal bookkeeping, so the second half can
+// find and re-patch them without a second graph traversal.
+inline std::vector<std::pair<std::string, onnx::TensorProto*>>
+AdoptAllWithPlaceholderOffsets(onnx::ModelProto& model,
+                               const std::string& archive_path,
+                               TensorPool& pool) {
+  std::vector<std::pair<std::string, onnx::TensorProto*>> adopted;
+  detail::ForEachTensor(*model.mutable_graph(), [&](const std::string& name,
+                                                    onnx::TensorProto& t) {
+    if (!AdoptFromTensorProto(name, t, pool)) return;
+    t.set_data_location(onnx::TensorProto::EXTERNAL);
+    t.clear_external_data();
+    auto set_kv = [&](const std::string& k, const std::string& v) {
+      auto* e = t.add_external_data();
+      e->set_key(k);
+      e->set_value(v);
+    };
+    set_kv("location", archive_path);
+    set_kv("offset", FixedWidthDecimal(0));
+    set_kv("length", FixedWidthDecimal(0));
+    adopted.emplace_back(name, &t);
+  });
+  return adopted;
+}
+
+// Second half: overwrite each adopted tensor's placeholder offset/length
+// (in place, same field width) with its real value from `offsets`
+// (relative to the data section) and `data_section_start` (absolute) --
+// both exactly what TensorPool::SaveSafetensors's/SaveGGUF's own
+// data_offsets_out/data_section_start_out out-params provide.
+inline void PatchStandaloneOffsets(
+    std::vector<std::pair<std::string, onnx::TensorProto*>>& adopted,
+    const std::map<std::string, std::pair<uint64_t, uint64_t>>& offsets,
+    uint64_t data_section_start) {
+  for (auto& [name, t] : adopted) {
+    const auto& [begin, end] = offsets.at(name);
+    for (auto& e : *t->mutable_external_data()) {
+      if (e.key() == "offset") {
+        e.set_value(FixedWidthDecimal(data_section_start + begin));
+      } else if (e.key() == "length") {
+        e.set_value(FixedWidthDecimal(end - begin));
+      }
+    }
+  }
+}
+
+// Overwrite `bytes.size()` bytes of the already-written file at `path`,
+// starting at absolute byte `offset`, without touching anything else in the
+// file (no truncation, no resize) -- the final step of the standalone-embed
+// algorithm, patching the model blob's placeholder bytes with the real,
+// offset-patched serialization in place.
+inline void PatchFileBytes(const std::string& path, uint64_t offset,
+                           const std::string& bytes) {
+  std::fstream out(path, std::ios::in | std::ios::out | std::ios::binary);
+  if (!out) {
+    throw std::runtime_error("TensorPool: cannot reopen '" + path +
+                             "' to patch the embedded model's bytes");
+  }
+  out.seekp(static_cast<std::streamoff>(offset));
+  out.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+  if (!out) {
+    throw std::runtime_error(
+        "TensorPool: failed to patch the embedded model's bytes into '" + path +
+        "'");
+  }
+}
+
+// Standalone counterpart of SaveModelAsSafetensors: same one-file result,
+// but the embedded copy's initializers carry real, byte-accurate
+// external_data offset/length into `path` -- extracting the "model.onnx"
+// tensor's bytes and saving them separately produces an ordinary, fully
+// standalone .onnx file loadable by vanilla onnx/onnxruntime, no onnxsim
+// involved. Every weight tensor is written to disk exactly once; the model
+// blob itself is written, then patched in place (same algorithm as
+// SaveModelAsGGUFStandalone) -- see this section's top comment.
+inline void SaveModelAsSafetensorsStandalone(onnx::ModelProto& model,
+                                             const std::string& path,
+                                             TensorPool& pool) {
+  auto adopted = AdoptAllWithPlaceholderOffsets(model, path, pool);
+  CheckNoEmbeddedModelKeyCollision(pool);
+
+  std::string placeholder_bytes;
+  if (!model.SerializeToString(&placeholder_bytes)) {
+    throw std::runtime_error(
+        "TensorPool: SaveModelAsSafetensorsStandalone: failed to serialize "
+        "the model");
+  }
+  pool.Add(kEmbeddedModelKey, ONNX_INT8,
+           {static_cast<int64_t>(placeholder_bytes.size())},
+           std::string(placeholder_bytes));
+
+  std::map<std::string, std::pair<uint64_t, uint64_t>> offsets;
+  pool.SaveSafetensors(path, &offsets);
+  uint64_t data_section_start = HeaderPrefixSize(path);
+
+  PatchStandaloneOffsets(adopted, offsets, data_section_start);
+
+  std::string final_bytes;
+  if (!model.SerializeToString(&final_bytes)) {
+    throw std::runtime_error(
+        "TensorPool: SaveModelAsSafetensorsStandalone: failed to "
+        "re-serialize the model");
+  }
+  if (final_bytes.size() != placeholder_bytes.size()) {
+    // Should be unreachable given FixedWidthDecimal's fixed width; a hard
+    // check rather than a silently-corrupt file if the invariant ever
+    // breaks (e.g. a future edit to what EmbedModel-style code patches).
+    throw std::runtime_error(
+        "TensorPool: SaveModelAsSafetensorsStandalone: internal error -- "
+        "re-serializing with real offsets changed the model's size (" +
+        std::to_string(placeholder_bytes.size()) + " -> " +
+        std::to_string(final_bytes.size()) + " bytes)");
+  }
+
+  const auto& model_range = offsets.at(kEmbeddedModelKey);
+  PatchFileBytes(path, data_section_start + model_range.first, final_bytes);
+  pool.Add(kEmbeddedModelKey, ONNX_INT8,
+           {static_cast<int64_t>(final_bytes.size())}, std::move(final_bytes));
 }
 
 }  // namespace tensor_pool
