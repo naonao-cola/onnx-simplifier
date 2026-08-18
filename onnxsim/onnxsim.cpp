@@ -18,6 +18,7 @@
 #include <string>
 #include <type_traits>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #ifndef NO_BUILTIN_ORT
@@ -613,7 +614,14 @@ struct ConstantNodePartition {
 ConstantNodePartition GetConstantNodes(const onnx::ModelProto& model) {
   // tensor with empty name("") represents the empty value of an optional input
   // so "" should be treated as a name of a constant tensor.
-  std::vector<std::string> const_names{""};
+  //
+  // A hash set, not a vector: every node's every input is looked up against
+  // this set below (``std::all_of`` over ``const_names``), and the set grows
+  // by every initializer up front plus every folded node's outputs as the
+  // scan proceeds. A vector + linear ``std::find`` makes that lookup
+  // O(constants seen so far) per input, i.e. O(nodes * initializers) overall
+  // on a model with many weights; a hash set makes each lookup O(1) average.
+  std::unordered_set<std::string> const_names{""};
   ConstantNodePartition partition;
   auto& const_nodes = partition.const_nodes;
   auto& non_const_nodes = partition.non_const_nodes;
@@ -623,10 +631,9 @@ ConstantNodePartition GetConstantNodes(const onnx::ModelProto& model) {
   // the graph untouched; a node fed by a Constant node still folds because ""
   // and Constant outputs remain in the constant set.
   if (config.initializers_as_constants) {
-    std::transform(model.graph().initializer().begin(),
-                   model.graph().initializer().end(),
-                   std::back_inserter(const_names),
-                   [](const auto& x) { return x.name(); });
+    for (const auto& x : model.graph().initializer()) {
+      const_names.insert(x.name());
+    }
   }
   // Map each domain to its imported opset version so the correct operator
   // schema can be looked up. The default ONNX domain is normalized to an empty
@@ -649,11 +656,9 @@ ConstantNodePartition GetConstantNodes(const onnx::ModelProto& model) {
         IsDeterministic(node.domain(), node.op_type(),
                         opset_version_of(node.domain())) &&
         !IsQDQ(node.domain(), node.op_type()) && !HasSubgraph(node) &&
-        std::all_of(node.input().begin(), node.input().end(),
-                    [&const_names](const auto& x) {
-                      return std::find(const_names.begin(), const_names.end(),
-                                       x) != const_names.end();
-                    });
+        std::all_of(
+            node.input().begin(), node.input().end(),
+            [&const_names](const auto& x) { return const_names.count(x) > 0; });
     if (!foldable) {
       non_const_nodes.push_back(node);
       continue;
@@ -661,8 +666,7 @@ ConstantNodePartition GetConstantNodes(const onnx::ModelProto& model) {
     if (!ProduceLargeTensor(model, node, config.tensor_size_threshold)) {
       // Ordinary constant folding: the output is materialized as an
       // initializer and the node is dropped.
-      const_names.insert(const_names.end(), node.output().begin(),
-                         node.output().end());
+      const_names.insert(node.output().begin(), node.output().end());
       const_nodes.push_back(node);
       continue;
     }
@@ -673,8 +677,7 @@ ConstantNodePartition GetConstantNodes(const onnx::ModelProto& model) {
     // rather than materializing the large tensor as an initializer. Other
     // large-tensor ops (e.g. Tile) remain fully excluded from folding.
     if (node.op_type() == "ConstantOfShape" || node.op_type() == "Expand") {
-      const_names.insert(const_names.end(), node.output().begin(),
-                         node.output().end());
+      const_names.insert(node.output().begin(), node.output().end());
       partition.deferred_outputs.insert(node.output().begin(),
                                         node.output().end());
     }
