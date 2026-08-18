@@ -91,6 +91,13 @@ ExternalProject_Add(onnxruntime_external
 # same flat shape the official release tarballs ship -- so this path sets
 # ONNXSIM_ORT_FLAT_HEADERS too (see CMakeLists.txt).
 set(ONNXRUNTIME_INCLUDE_DIR "${_ort_ext_install_dir}/include/onnxruntime")
+# CMake validates that an IMPORTED target's INTERFACE_INCLUDE_DIRECTORIES
+# exist at generate time, even though this directory is only populated later
+# by onnxruntime_external's own build+install step. Pre-create it (empty) so
+# that check passes; the actual headers land here before anything that
+# #includes onnxruntime_cxx_api.h is compiled, since onnxsim depends on
+# onnxruntime_external (see add_dependencies below).
+file(MAKE_DIRECTORY "${ONNXRUNTIME_INCLUDE_DIR}")
 
 add_library(onnxruntime SHARED IMPORTED GLOBAL)
 add_dependencies(onnxruntime onnxruntime_external)

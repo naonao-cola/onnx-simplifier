@@ -177,11 +177,27 @@ if(EMSCRIPTEN)
   endif()
 endif()
 
-add_executable(
-  onnxsim_bin
-  onnxsim/bin/onnxsim_bin.cpp
-  onnxsim/bin/onnxsim_option.cpp
-  ${ONNXSIM_WASM_INTERFACE})
+# onnxsim_bin needs a constant-folding executor: GetBuiltinModelExecutor()
+# (ONNXSIM_HAS_ORT) natively, or GetJsModelExecutor() (ONNXSIM_WASM_ORT_WEB)
+# under Emscripten. With neither -- ONNXSIM_BUILTIN_ORT=OFF on a native,
+# non-Emscripten build, e.g. the Python wheel's own configure -- there is no
+# executor available at all, so exclude it from the default `all` target
+# rather than failing that build (setup.py already only ever targets
+# onnxsim_cpp2py_export explicitly; this just keeps a plain `cmake --build .`
+# from tripping over a target that cannot link in that configuration).
+if (ONNXSIM_HAS_ORT OR ONNXSIM_WASM_ORT_WEB)
+  add_executable(
+    onnxsim_bin
+    onnxsim/bin/onnxsim_bin.cpp
+    onnxsim/bin/onnxsim_option.cpp
+    ${ONNXSIM_WASM_INTERFACE})
+else()
+  add_executable(
+    onnxsim_bin EXCLUDE_FROM_ALL
+    onnxsim/bin/onnxsim_bin.cpp
+    onnxsim/bin/onnxsim_option.cpp
+    ${ONNXSIM_WASM_INTERFACE})
+endif()
 set_target_properties(onnxsim_bin PROPERTIES OUTPUT_NAME onnxsim)
 
 # Bake the onnxsim and onnx-optimizer version strings into the module so the
