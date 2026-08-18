@@ -125,7 +125,7 @@ endif()
 # configure onnx-optimizer after onnxruntime, because they both depend on onnx and onnxruntime has its own flags for onnx
 add_subdirectory(third_party/onnx-optimizer EXCLUDE_FROM_ALL)
 
-add_library(onnxsim onnxsim/onnxsim.cpp onnxsim/contrib_schemas.cpp onnxsim/custom_optimizer_passes.cpp onnxsim/function_rewriter.cpp onnxsim/profiler.cpp onnxsim/model_info.cpp onnxsim/sym_expr.cpp onnxsim/sym_value_eval.cpp onnxsim/sym_shape_infer.cpp onnxsim/model_metrics.cpp)
+add_library(onnxsim onnxsim/onnxsim.cpp onnxsim/contrib_schemas.cpp onnxsim/custom_optimizer_passes.cpp onnxsim/function_rewriter.cpp onnxsim/profiler.cpp onnxsim/model_info.cpp onnxsim/sym_expr.cpp onnxsim/sym_value_eval.cpp onnxsim/sym_shape_infer.cpp onnxsim/model_metrics.cpp onnxsim/tensor_pool.cpp)
 if (ONNXSIM_BUILTIN_ORT)
   target_include_directories(onnxsim PRIVATE ${ONNXRUNTIME_INCLUDE_DIR})
   if (ONNXSIM_PREBUILT_ORT)
@@ -415,4 +415,25 @@ if (ONNXSIM_TESTS)
   add_executable(dlpack_dtype_test onnxsim/dlpack_dtype_test.cpp)
   target_include_directories(dlpack_dtype_test PRIVATE onnxsim third_party)
   add_test(NAME dlpack_dtype_test COMMAND dlpack_dtype_test)
+
+  # The ONNX<->safetensors dtype mapping (tensor_pool_dtype.h) is likewise
+  # pure and dependency-free, mirroring dlpack_dtype_test.cpp above.
+  add_executable(tensor_pool_dtype_test onnxsim/tensor_pool_dtype_test.cpp)
+  target_include_directories(tensor_pool_dtype_test PRIVATE onnxsim)
+  add_test(NAME tensor_pool_dtype_test COMMAND tensor_pool_dtype_test)
+
+  # TensorPool's storage and safetensors read/write (tensor_pool.{h,cpp})
+  # depend only on tensor_pool_dtype.h, so this too builds and runs
+  # standalone without ONNX / ONNX Runtime configured.
+  add_executable(tensor_pool_test onnxsim/tensor_pool_test.cpp
+                                  onnxsim/tensor_pool.cpp)
+  target_include_directories(tensor_pool_test PRIVATE onnxsim)
+  add_test(NAME tensor_pool_test COMMAND tensor_pool_test)
+
+  # tensor_pool_bridge.h is the one piece that DOES need onnx (it converts
+  # onnx::TensorProto <-> TensorPool), so its test links the fully-configured
+  # `onnxsim` target rather than building standalone like the tests above.
+  add_executable(tensor_pool_bridge_test onnxsim/tensor_pool_bridge_test.cpp)
+  target_link_libraries(tensor_pool_bridge_test onnxsim)
+  add_test(NAME tensor_pool_bridge_test COMMAND tensor_pool_bridge_test)
 endif()
