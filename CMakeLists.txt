@@ -459,4 +459,13 @@ if (ONNXSIM_TESTS)
   target_link_libraries(tensor_pool_gguf_bridge_test onnxsim)
   add_test(NAME tensor_pool_gguf_bridge_test
           COMMAND tensor_pool_gguf_bridge_test)
+
+  # The self-describing single-file archive functions (EmbedModel/
+  # ExtractModel and their Save/LoadModelAs* wrappers) span both bridge
+  # headers, so this one test exercises both the safetensors and the GGUF
+  # archive path; needs onnx for the same reason as the two tests above.
+  add_executable(tensor_pool_archive_test
+                onnxsim/tensor_pool_archive_test.cpp)
+  target_link_libraries(tensor_pool_archive_test onnxsim)
+  add_test(NAME tensor_pool_archive_test COMMAND tensor_pool_archive_test)
 endif()

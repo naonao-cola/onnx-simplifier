@@ -113,6 +113,35 @@ inline size_t ImportModelWithGGUF(
   return matched;
 }
 
+// GGUF counterparts of tensor_pool_bridge.h's SaveModelAsSafetensors /
+// LoadModelFromSafetensors -- see that header's top comment for the
+// self-describing-archive design (EmbedModel/ExtractModel, which these
+// reuse unchanged; embedding a model doesn't care which codec eventually
+// serializes the pool).
+
+// Convenience wrapper: EmbedModel then pool.SaveGGUF(path, string_metadata).
+// `model` ends up mutated exactly as EmbedModel leaves it -- reload with
+// LoadModelFromGGUF rather than reusing `model`.
+inline void SaveModelAsGGUF(
+    onnx::ModelProto& model, const std::string& path, TensorPool& pool,
+    const std::map<std::string, std::string>& string_metadata = {}) {
+  EmbedModel(model, path, pool);
+  pool.SaveGGUF(path, string_metadata);
+}
+
+// Convenience wrapper: pool.LoadGGUF(path) then ExtractModel. Returns false
+// if `path`'s pool has no embedded model. `skipped_out`, when non-null,
+// receives the names of any OTHER pooled tensors skipped as quantized/
+// unsupported (kEmbeddedModelKey itself is always a raw I8 blob, so it is
+// never one of them) -- same meaning as ImportModelWithGGUF's.
+inline bool LoadModelFromGGUF(const std::string& path, onnx::ModelProto* model,
+                              TensorPool& pool, bool hydrate_all = true,
+                              std::vector<std::string>* skipped_out = nullptr) {
+  std::vector<std::string> skipped = pool.LoadGGUF(path);
+  if (skipped_out != nullptr) *skipped_out = std::move(skipped);
+  return ExtractModel(pool, model, hydrate_all);
+}
+
 }  // namespace tensor_pool
 }  // namespace onnxsim
 

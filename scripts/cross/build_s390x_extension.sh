@@ -210,14 +210,14 @@ cmake --build "${BUILD_DIR}" --target sym_expr_test model_metrics_test \
   sym_value_eval_test sym_shape_infer_test dlpack_dtype_test \
   tensor_pool_dtype_test tensor_pool_test \
   gguf_dtype_test tensor_pool_gguf_test -j "${JOBS}"
-# tensor_pool_bridge_test and tensor_pool_gguf_bridge_test are NOT
-# dependency-free (they exercise the onnx::TensorProto <-> TensorPool
-# bridges), but the onnx/onnx-optimizer static libraries they need are
-# already built as a side effect of the onnxsim_cpp2py_export target above,
-# so they cost only their own link step here rather than a second onnx
-# build.
+# tensor_pool_bridge_test, tensor_pool_gguf_bridge_test, and
+# tensor_pool_archive_test are NOT dependency-free (they exercise the
+# onnx::TensorProto <-> TensorPool bridges), but the onnx/onnx-optimizer
+# static libraries they need are already built as a side effect of the
+# onnxsim_cpp2py_export target above, so they cost only their own link step
+# here rather than a second onnx build.
 cmake --build "${BUILD_DIR}" --target tensor_pool_bridge_test \
-  tensor_pool_gguf_bridge_test -j "${JOBS}"
+  tensor_pool_gguf_bridge_test tensor_pool_archive_test -j "${JOBS}"
 
 SO="$(find "${BUILD_DIR}" -name 'onnxsim_cpp2py_export*.so' -print -quit)"
 [[ -n "${SO}" ]] || { echo "no extension module produced"; exit 1; }

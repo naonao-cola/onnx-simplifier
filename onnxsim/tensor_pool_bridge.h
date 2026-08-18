@@ -33,6 +33,26 @@
  *     references and hydrate individual ones on demand via
  *     HydrateTensorProto -- see that function's caveat first, though).
  *
+ * A third pair, EmbedModel/ExtractModel plus the format-specific
+ * SaveModelAsSafetensors/LoadModelFromSafetensors below, goes one step
+ * further: instead of a small .onnx file with EXTERNAL references pointing
+ * at a separate weights file, the graph ITSELF is embedded inside the
+ * weights file too, as one more pooled entry (name "model.onnx", a raw
+ * byte blob) alongside the tensors -- one self-describing archive, not two
+ * files. The embedded copy's own initializers use a SYMBOLIC EXTERNAL
+ * reference (location = the archive path, no offset/length -- the same
+ * convention hydrate_all=false above already uses), resolved by name
+ * lookup into the archive's own pool, not by byte offset. That sidesteps a
+ * real chicken-and-egg problem real offsets would have here (the model's
+ * serialized size depends on the offsets, which depend on where the model
+ * blob itself lands in the file, which depends on the model's serialized
+ * size) at the cost of the extracted blob not being standalone-loadable by
+ * a vanilla onnx tool on its own -- only onnxsim's own
+ * LoadModelFromSafetensors/LoadModelFromGGUF (via ExtractModel) know to
+ * resolve it. Giving the embedded copy real, byte-accurate offsets instead
+ * (so an extracted model.onnx is standalone-usable elsewhere too) is a
+ * tracked follow-up, not implemented here.
+ *
  * NOT covered here: keeping initializers EXTERNAL as onnxsim's *internal*
  * in-flight representation during Simplify()'s fixed point, to dodge
  * ModelProto copy costs mid-pipeline. That would collide with existing logic
@@ -52,14 +72,17 @@
 
 #include <onnx/onnx_pb.h>
 
+#include <cstdint>
 #include <map>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <utility>
 #include <vector>
 
 #include "tensor_pool.h"
+#include "tensor_pool_dtype.h"
 
 namespace onnxsim {
 namespace tensor_pool {
@@ -233,6 +256,85 @@ inline size_t ImportModelWithSafetensors(onnx::ModelProto& model,
     }
   }
   return matched;
+}
+
+// --- self-describing single-file archives (see this header's top comment) -
+
+// Pool key under which a self-describing archive's own graph is stored.
+inline const std::string kEmbeddedModelKey = "model.onnx";  // NOLINT
+
+// Move every eligible tensor's bytes out of `model` into `pool` (as
+// AdoptFromTensorProto does), mark each as a symbolic EXTERNAL reference
+// into `archive_path`, then serialize the now-byte-free `model` and add
+// those bytes to `pool` under kEmbeddedModelKey. After this, `pool` (once
+// saved to `archive_path`) is a complete, self-describing archive; `model`
+// itself is mutated into the same byte-free, symbolically-external state
+// AdoptFromTensorProto leaves individual tensors in -- reload it via
+// ExtractModel/LoadModelFromSafetensors/LoadModelFromGGUF rather than using
+// `model` directly afterwards.
+inline void EmbedModel(onnx::ModelProto& model, const std::string& archive_path,
+                       TensorPool& pool) {
+  detail::ForEachTensor(*model.mutable_graph(),
+                        [&](const std::string& name, onnx::TensorProto& t) {
+                          if (!AdoptFromTensorProto(name, t, pool)) return;
+                          t.set_data_location(onnx::TensorProto::EXTERNAL);
+                          t.clear_external_data();
+                          auto* e = t.add_external_data();
+                          e->set_key("location");
+                          e->set_value(archive_path);
+                        });
+
+  std::string bytes;
+  if (!model.SerializeToString(&bytes)) {
+    throw std::runtime_error(
+        "TensorPool: EmbedModel: failed to serialize the model");
+  }
+  int64_t nbytes = static_cast<int64_t>(bytes.size());
+  pool.Add(kEmbeddedModelKey, ONNX_INT8, {nbytes}, std::move(bytes));
+}
+
+// Reverse of EmbedModel: find kEmbeddedModelKey in `pool`, parse it into
+// `*model`, and hydrate its initializers from `pool` by name (or, with
+// hydrate_all=false, leave them as the symbolic EXTERNAL references
+// EmbedModel wrote, for on-demand HydrateTensorProto -- same caveat as
+// ImportModelWithSafetensors's hydrate_all=false). Returns false, leaving
+// `*model` untouched, if `pool` has no embedded model. Throws
+// std::runtime_error if the embedded bytes aren't a valid ModelProto.
+inline bool ExtractModel(const TensorPool& pool, onnx::ModelProto* model,
+                         bool hydrate_all = true) {
+  const Entry* blob = pool.Find(kEmbeddedModelKey);
+  if (blob == nullptr) return false;
+  if (!model->ParseFromArray(blob->data.data(),
+                             static_cast<int>(blob->data.size()))) {
+    throw std::runtime_error("TensorPool: ExtractModel: embedded '" +
+                             kEmbeddedModelKey +
+                             "' is not a valid serialized ModelProto");
+  }
+  if (hydrate_all) {
+    for (auto& init : *model->mutable_graph()->mutable_initializer()) {
+      HydrateTensorProto(init.name(), init, pool);
+    }
+  }
+  return true;
+}
+
+// Convenience wrapper: EmbedModel then pool.SaveSafetensors(path). `model`
+// ends up mutated exactly as EmbedModel leaves it (see that function's
+// note) -- reload with LoadModelFromSafetensors rather than reusing `model`.
+inline void SaveModelAsSafetensors(onnx::ModelProto& model,
+                                   const std::string& path, TensorPool& pool) {
+  EmbedModel(model, path, pool);
+  pool.SaveSafetensors(path);
+}
+
+// Convenience wrapper: pool.LoadSafetensors(path) then ExtractModel. Returns
+// false if `path`'s pool has no embedded model (e.g. it's a plain weights-
+// only safetensors file with no onnxsim-authored archive on top).
+inline bool LoadModelFromSafetensors(const std::string& path,
+                                     onnx::ModelProto* model, TensorPool& pool,
+                                     bool hydrate_all = true) {
+  pool.LoadSafetensors(path);
+  return ExtractModel(pool, model, hydrate_all);
 }
 
 }  // namespace tensor_pool
