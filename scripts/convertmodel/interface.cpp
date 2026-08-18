@@ -75,16 +75,17 @@ std::string ReadAndClearProfileTrace() {
     return trace;
 }
 
-// Where the standalone safetensors/gguf exports below write their result
-// inside Emscripten's in-memory filesystem, mirroring kProfileTracePath. The
-// TensorPool bridge bakes this path into the archive as the embedded model's
-// external_data "location" (see SaveModelAsSafetensorsStandalone /
-// SaveModelAsGGUFStandalone), so it is a fixed internal name rather than the
-// user-facing download filename -- onnxsim's own loaders resolve the
-// embedded model by pool name, not by this path, so the mismatch with
-// whatever name the browser saves the download under is harmless.
-constexpr const char* kSafetensorsExportPath = "onnxsim_export.safetensors";
-constexpr const char* kGGUFExportPath = "onnxsim_export.gguf";
+// Where the standalone safetensors/gguf export/import functions below stage
+// the archive inside Emscripten's in-memory filesystem, mirroring
+// kProfileTracePath. On export, the TensorPool bridge bakes this path into
+// the archive as the embedded model's external_data "location" (see
+// SaveModelAsSafetensorsStandalone / SaveModelAsGGUFStandalone), so it is a
+// fixed internal name rather than the user-facing download filename --
+// onnxsim's own loaders resolve the embedded model by pool name, not by this
+// path, so the mismatch with whatever name the browser saves the download
+// under (or the name of a file the user uploads for import) is harmless.
+constexpr const char* kSafetensorsArchivePath = "onnxsim_export.safetensors";
+constexpr const char* kGGUFArchivePath = "onnxsim_export.gguf";
 
 // Read `path` back into a string and delete it, same pattern as
 // ReadAndClearProfileTrace above. Returns an empty string if the file could
@@ -99,6 +100,16 @@ std::string ReadAndDeleteFile(const std::string& path) {
     }
     std::remove(path.c_str());
     return data;
+}
+
+// Stage `data` at `path` inside the MEMFS, for the import functions below to
+// hand to a TensorPool loader that only knows how to read from a path.
+// Returns false (and leaves nothing behind) on a write failure.
+bool WriteFile(const std::string& path, const std::string& data) {
+    std::ofstream ofs(path, std::ios::binary | std::ios::trunc);
+    if (!ofs) return false;
+    ofs.write(data.data(), static_cast<std::streamsize>(data.size()));
+    return static_cast<bool>(ofs);
 }
 
 // Serialize `model` into the shared static buffer and hand JS a typed-memory
@@ -442,14 +453,14 @@ em::val onnxsim_export_safetensors(const std::string& data) {
     onnxsim::tensor_pool::TensorPool pool;
     try {
         onnxsim::tensor_pool::SaveModelAsSafetensorsStandalone(
-            xmodel, kSafetensorsExportPath, pool);
+            xmodel, kSafetensorsArchivePath, pool);
     } catch (const std::exception& e) {
         std::cerr << "safetensors export failed: " << e.what() << std::endl;
-        std::remove(kSafetensorsExportPath);
+        std::remove(kSafetensorsArchivePath);
         return em::val::null();
     }
     static std::string result;
-    result = ReadAndDeleteFile(kSafetensorsExportPath);
+    result = ReadAndDeleteFile(kSafetensorsArchivePath);
     if (result.empty()) {
         std::cerr << "failed to read back the exported safetensors file" << std::endl;
         return em::val::null();
@@ -468,20 +479,96 @@ em::val onnxsim_export_gguf(const std::string& data) {
     }
     onnxsim::tensor_pool::TensorPool pool;
     try {
-        onnxsim::tensor_pool::SaveModelAsGGUFStandalone(xmodel, kGGUFExportPath,
+        onnxsim::tensor_pool::SaveModelAsGGUFStandalone(xmodel, kGGUFArchivePath,
                                                          pool);
     } catch (const std::exception& e) {
         std::cerr << "gguf export failed: " << e.what() << std::endl;
-        std::remove(kGGUFExportPath);
+        std::remove(kGGUFArchivePath);
         return em::val::null();
     }
     static std::string result;
-    result = ReadAndDeleteFile(kGGUFExportPath);
+    result = ReadAndDeleteFile(kGGUFArchivePath);
     if (result.empty()) {
         std::cerr << "failed to read back the exported gguf file" << std::endl;
         return em::val::null();
     }
     return em::val(em::typed_memory_view(result.size(), reinterpret_cast<uint8_t*>(result.data())));
+}
+
+// Import counterpart of onnxsim_export_safetensors: `data` is the whole raw
+// bytes of a standalone safetensors archive (as produced by that function,
+// or any other tool following the same self-describing-archive convention --
+// tensor_pool_bridge.h's EmbedModel/ExtractModel -- an embedded "model.onnx"
+// entry alongside the tensors). Stages it into the MEMFS, loads it back into
+// an ordinary, fully in-memory onnx::ModelProto via LoadModelFromSafetensors
+// (hydrate_all=true, so every initializer is hydrated -- no lingering
+// EXTERNAL references into the now-deleted staged file), and returns its
+// serialized bytes. Used by the page's file picker to accept a
+// ".onnx.safetensors" upload. Returns null if the archive has no embedded
+// model (e.g. a plain weights-only safetensors file with no onnxsim-authored
+// graph) or on any other stage/load/parse failure.
+em::val onnxsim_import_safetensors(const std::string& data) {
+    if (!WriteFile(kSafetensorsArchivePath, data)) {
+        std::cerr << "failed to stage the uploaded safetensors file" << std::endl;
+        return em::val::null();
+    }
+    onnx::ModelProto xmodel;
+    onnxsim::tensor_pool::TensorPool pool;
+    bool ok = false;
+    try {
+        ok = onnxsim::tensor_pool::LoadModelFromSafetensors(
+            kSafetensorsArchivePath, &xmodel, pool);
+    } catch (const std::exception& e) {
+        std::cerr << "safetensors import failed: " << e.what() << std::endl;
+        std::remove(kSafetensorsArchivePath);
+        return em::val::null();
+    }
+    std::remove(kSafetensorsArchivePath);
+    if (!ok) {
+        std::cerr << "safetensors file has no embedded onnxsim model (a plain "
+                     "weights-only archive is not importable as a graph)"
+                  << std::endl;
+        return em::val::null();
+    }
+    return SerializeModel(xmodel);
+}
+
+// GGUF counterpart of onnxsim_import_safetensors above; see
+// tensor_pool_gguf_bridge.h's LoadModelFromGGUF. Used by the page's file
+// picker to accept a ".onnx.gguf" upload. `skipped` (any other pooled
+// tensors LoadModelFromGGUF could not hydrate, e.g. a quantized weight) is
+// logged rather than surfaced structurally -- best-effort, matching how the
+// rest of this file reports non-fatal issues via std::cerr.
+em::val onnxsim_import_gguf(const std::string& data) {
+    if (!WriteFile(kGGUFArchivePath, data)) {
+        std::cerr << "failed to stage the uploaded gguf file" << std::endl;
+        return em::val::null();
+    }
+    onnx::ModelProto xmodel;
+    onnxsim::tensor_pool::TensorPool pool;
+    bool ok = false;
+    std::vector<std::string> skipped;
+    try {
+        ok = onnxsim::tensor_pool::LoadModelFromGGUF(kGGUFArchivePath, &xmodel,
+                                                      pool, true, &skipped);
+    } catch (const std::exception& e) {
+        std::cerr << "gguf import failed: " << e.what() << std::endl;
+        std::remove(kGGUFArchivePath);
+        return em::val::null();
+    }
+    std::remove(kGGUFArchivePath);
+    if (!ok) {
+        std::cerr << "gguf file has no embedded onnxsim model (a plain "
+                     "weights-only archive is not importable as a graph)"
+                  << std::endl;
+        return em::val::null();
+    }
+    if (!skipped.empty()) {
+        std::cerr << "gguf import: " << skipped.size()
+                  << " tensor(s) left un-hydrated (quantized/unsupported dtype)"
+                  << std::endl;
+    }
+    return SerializeModel(xmodel);
 }
 
 // Report the versions of the libraries baked into this module, for detailed
@@ -725,6 +812,8 @@ EMSCRIPTEN_BINDINGS(module) {
     function("onnxsim_annotate_model_info", &onnxsim_annotate_model_info);
     function("onnxsim_export_safetensors", &onnxsim_export_safetensors);
     function("onnxsim_export_gguf", &onnxsim_export_gguf);
+    function("onnxsim_import_safetensors", &onnxsim_import_safetensors);
+    function("onnxsim_import_gguf", &onnxsim_import_gguf);
     function("onnxoptimizer_optimize", &onnxoptimizer_optimize);
     function("onnxoptimizer_optimize_fixed", &onnxoptimizer_optimize_fixed);
     em::function("onnxoptimizer_passes", &onnxoptimizer_passes);

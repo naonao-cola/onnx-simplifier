@@ -124,8 +124,10 @@ create_onnxsim({
         // The true uploaded bytes, kept aside so the "annotate the original for
         // the inference-compare panel" step below always sees the model the user
         // gave us, even when the inline pre-step replaces `buf` with the inlined
-        // model before the main transform runs.
-        const originalBuf = e.data[1];
+        // model before the main transform runs. Reassigned below (to the
+        // decoded ONNX bytes) when the upload was a safetensors/gguf archive,
+        // since the raw archive bytes are not a valid ONNX model on their own.
+        let originalBuf = e.data[1];
         // `model` is the converted model bytes (a Uint8Array view); `trace` is
         // the onnxsim profiling trace JSON for "simplify" when profiling was
         // requested, otherwise an empty string.
@@ -136,6 +138,27 @@ create_onnxsim({
         // user gets an explanation (see memoryLimitMessage) instead of the worker
         // dying with an opaque, unhandled error.
         try {
+        // Optional pre-step: the upload was a standalone safetensors/gguf
+        // archive (see the page's file picker), not a raw .onnx file -- decode
+        // it into an ordinary ONNX model first via the matching TensorPool
+        // import binding, so every transform below (and the "original" used
+        // for annotate/inference-compare) sees a plain ModelProto exactly like
+        // an .onnx upload would produce. No model executor needed, so this is
+        // synchronous in both module variants.
+        const source_format = e.data[11] || "onnx";
+        if (source_format === "safetensors" || source_format === "gguf") {
+            const importFn = source_format === "gguf" ?
+                runtime.onnxsim_import_gguf : runtime.onnxsim_import_safetensors;
+            const imported = importFn(buf);
+            if (!imported) {
+                postMessage(["stderr",
+                    `failed to import ${source_format}: no embedded onnxsim model ` +
+                    "found (a plain weights-only archive has no graph to import)"]);
+                return;
+            }
+            buf = new Uint8Array(imported).buffer;
+            originalBuf = buf;
+        }
         // Optional pre-step: inline the model's local functions before the main
         // transform, so onnx-optimizer / Simplify / constant folding see through
         // them into a plain op graph. Controlled by a checkbox (e.data[9]) and

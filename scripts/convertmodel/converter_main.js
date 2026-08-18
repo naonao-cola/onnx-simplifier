@@ -234,7 +234,25 @@
                 // handle published below).
                 const startConversion = (modelName, buf) => {
                     const optimizer = document.querySelector('input[name="optimizer"]:checked').value;
-                    result_name = (modelName.endsWith(".onnx") ? modelName.substring(0, modelName.length - 5) : modelName) + "." + optimizer + ".onnx"
+                    // A ".onnx.safetensors"/".onnx.gguf" upload (the same standalone
+                    // archive format the download-format selector produces) needs
+                    // decoding back to ONNX before conversion -- see worker.js's
+                    // import pre-step. Strip whichever archive suffix is present
+                    // first, then the ".onnx" underneath it, so the result name
+                    // matches a plain ".onnx" upload's either way.
+                    let base = modelName;
+                    let source_format = "onnx";
+                    if (/\.safetensors$/i.test(base)) {
+                        source_format = "safetensors";
+                        base = base.slice(0, -".safetensors".length);
+                    } else if (/\.gguf$/i.test(base)) {
+                        source_format = "gguf";
+                        base = base.slice(0, -".gguf".length);
+                    }
+                    if (/\.onnx$/i.test(base)) {
+                        base = base.slice(0, -".onnx".length);
+                    }
+                    result_name = base + "." + optimizer + ".onnx";
                     original_name = modelName;
                     // Drop any previous run's cached models so the inference panel
                     // never serves a stale converted/annotated result for the new
@@ -282,7 +300,7 @@
                     last_run_info.graph_diff = graph_diff;
                     // Expose the latest run parameters to the report-issue module.
                     window.__onnxsimLastRunInfo = last_run_info;
-                    worker.postMessage([optimizer, buf, passes, constant_fold, shape_inference, tensor_size_threshold, target_opset_version, profile, annotate_model_info, inline_functions, graph_diff], [buf]);
+                    worker.postMessage([optimizer, buf, passes, constant_fold, shape_inference, tensor_size_threshold, target_opset_version, profile, annotate_model_info, inline_functions, graph_diff, source_format], [buf]);
                 };
                 // Expose the conversion entry point for the Hugging Face loader
                 // module (hf_load.mjs), which downloads model bytes and drives
