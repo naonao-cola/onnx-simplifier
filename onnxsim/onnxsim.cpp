@@ -1715,8 +1715,23 @@ onnx::ModelProto _FoldConstant(const ModelExecutor& executor,
 // reporting) is count-based, so this sum is an accurate "did anything
 // change" signal, not just a hint -- used by OptAndShape's fast-path fixed
 // point below to skip hashing the whole model when it is false.
+// ``model`` is ``onnx::ModelProto&`` (not const) under NO_BUILTIN_ORT: both
+// call sites below pass a mutable lvalue that is about to be move-assigned
+// over (``model = Optimize(model, ...)``), so its pre-call contents are dead
+// once this returns. That lets OptimizeFixed move each initializer's raw
+// bytes through the ModelProto<->Graph round trip instead of copying them --
+// the dominant cost of this call for weight-heavy models (onnxsim issue
+// #633) -- via the moving ImportModelProto/ExportModelProto overloads added
+// to onnxsim's onnx fork. Those overloads only exist on onnxsim's own fork,
+// not onnxruntime's bundled, unpatched onnx copy, so the non-NO_BUILTIN_ORT
+// build (standalone C++/WASM/Rust, which links ORT's onnx -- see the
+// InferShapes split above) keeps the original const-ref/copying signature.
+#ifdef NO_BUILTIN_ORT
+onnx::ModelProto Optimize(onnx::ModelProto& model, bool* changed = nullptr) {
+#else
 onnx::ModelProto Optimize(const onnx::ModelProto& model,
                           bool* changed = nullptr) {
+#endif
   // Make onnxsim's own optimizer passes available to onnxoptimizer's registry
   // (idempotent) so config.optimizer_passes may name them.
   onnxsim::RegisterCustomOptimizerPasses();
