@@ -13,17 +13,19 @@ project(onnxsim CXX)
 
 # The vendored BLAKE3 sources backing TensorPool's content hashing
 # (onnxsim/tensor_pool_hash.cpp, third_party/blake3/*.c) are plain C, unlike
-# the rest of this project. The ONNXSIM_BUILTIN_ORT path below also calls
-# enable_language(C) before configuring ONNX Runtime, but only on that path
-# (not e.g. the Python wheel build, which passes -DONNXSIM_BUILTIN_ORT=OFF) --
-# enable it unconditionally and up front so BLAKE3 always has a C compiler
-# regardless of that option. A second enable_language(C) call below is a
-# harmless no-op. Skipped under Emscripten, matching the existing
-# enable_language(C) call's own NOT EMSCRIPTEN guard -- its toolchain file
-# configures the languages it needs on its own.
-if (NOT EMSCRIPTEN)
-  enable_language(C)
-endif()
+# the rest of this project, and are compiled into the `onnxsim` target in
+# EVERY configuration (see ONNXSIM_BLAKE3_SOURCES below) -- unlike the
+# ONNXSIM_BUILTIN_ORT path's own enable_language(C) call below, which only
+# runs when that option is ON and is skipped under Emscripten (that path
+# only ever configures ONNX Runtime, whose own from-source CMake build
+# enables the C/ASM it needs on its own). BLAKE3 has no such transitive
+# helper, and Emscripten does NOT enable C on its own just because CXX was
+# requested in project() above -- confirmed by the WASM build failing with
+# "CMAKE_C_COMPILE_OBJECT ... not set" without this. So enable C
+# unconditionally, including under Emscripten (emcc compiles C same as
+# C++), before any target needs it. A second enable_language(C) call below
+# is a harmless no-op.
+enable_language(C)
 
 set(CMAKE_CXX_VISIBILITY_PRESET "hidden")
 set(CMAKE_VISIBILITY_INLINES_HIDDEN TRUE)

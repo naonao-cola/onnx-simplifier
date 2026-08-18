@@ -10,6 +10,11 @@ recursive-include third_party/onnx *
 # Vendored DLPack header. onnxsim.h / dlpack_bridge.h include <dlpack/dlpack.h>,
 # so the wheel build compiles onnxsim.cpp against it; it must ship in the sdist.
 recursive-include third_party/dlpack *.h
+# Vendored BLAKE3 (portable-only build). tensor_pool_hash.cpp includes
+# <blake3/blake3.h> and CMakeLists.txt compiles third_party/blake3/*.c
+# directly into the onnxsim target, so both the headers and the .c sources
+# (unlike dlpack's headers-only vendoring above) must ship in the sdist.
+recursive-include third_party/blake3 *
 recursive-exclude third_party/onnx-optimizer/*build* *
 recursive-exclude third_party/onnx/*build* *
 include CMakeLists.txt
