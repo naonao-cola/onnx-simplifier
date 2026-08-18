@@ -1,0 +1,119 @@
+/*
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * GGUF counterpart of tensor_pool_bridge.h's ExportModelWithSafetensors /
+ * ImportModelWithSafetensors -- same design, a different container format.
+ * See that header's top comment for the shared rationale (moving an
+ * initializer's raw_data into a pool with no copy, then patching in a real,
+ * spec-compliant onnx EXTERNAL reference once the file's offsets are known)
+ * and its NOT-covered-here note, which applies equally: this is meant for
+ * the load/save boundary, not as onnxsim's internal in-flight
+ * representation during Simplify().
+ *
+ * The GGUF-specific thing worth calling out here is gguf_dtype.h's scope
+ * limit: GGUF's block-quantized types (most of a real quantized-LLM
+ * checkpoint's tensors) have no ONNX raw-data equivalent, so
+ * ImportModelWithGGUF's `skipped_out` matters more here than
+ * ImportModelWithSafetensors's equivalent ever would in practice -- loading
+ * an actual quantized .gguf will leave most of a model's initializers
+ * un-hydrated, and a caller needs to know which, rather than silently
+ * getting a model that's missing most of its weights.
+ */
+#ifndef ONNXSIM_TENSOR_POOL_GGUF_BRIDGE_H_
+#define ONNXSIM_TENSOR_POOL_GGUF_BRIDGE_H_
+
+#include <onnx/onnx_pb.h>
+
+#include <map>
+#include <string>
+#include <utility>
+#include <vector>
+
+#include "tensor_pool.h"
+// Reuses AdoptFromTensorProto / HydrateTensorProto / detail::ForEachTensor --
+// none of that is safetensors-specific, so there is nothing GGUF-specific to
+// redefine here.
+#include "tensor_pool_bridge.h"
+
+namespace onnxsim {
+namespace tensor_pool {
+
+// Rewrite `model` so every eligible tensor becomes an EXTERNAL reference into
+// a freshly-written `gguf_path`, and write that file. Returns the number of
+// tensors externalized. `pool` ends up holding every externalized tensor.
+// `string_metadata` is forwarded to TensorPool::SaveGGUF verbatim (e.g.
+// {"general.architecture", "onnxsim"}).
+inline size_t ExportModelWithGGUF(
+    onnx::ModelProto& model, const std::string& gguf_path, TensorPool& pool,
+    const std::map<std::string, std::string>& string_metadata = {}) {
+  // See ExportModelWithSafetensors's identical comment: keyed by the pool
+  // key ForEachTensor assigned, not by t->name(), which may be empty for an
+  // unnamed attribute tensor.
+  std::vector<std::pair<std::string, onnx::TensorProto*>> exported;
+  detail::ForEachTensor(*model.mutable_graph(),
+                        [&](const std::string& name, onnx::TensorProto& t) {
+                          if (AdoptFromTensorProto(name, t, pool)) {
+                            exported.emplace_back(name, &t);
+                          }
+                        });
+
+  std::map<std::string, std::pair<uint64_t, uint64_t>> offsets;
+  uint64_t data_section_start = 0;
+  pool.SaveGGUF(gguf_path, string_metadata, &offsets, &data_section_start);
+
+  for (auto& [pool_key, t] : exported) {
+    const auto& [begin, end] = offsets.at(pool_key);
+    t->set_data_location(onnx::TensorProto::EXTERNAL);
+    t->clear_external_data();
+    auto set_kv = [&](const std::string& k, const std::string& v) {
+      auto* e = t->add_external_data();
+      e->set_key(k);
+      e->set_value(v);
+    };
+    set_kv("location", gguf_path);
+    set_kv("offset", std::to_string(data_section_start + begin));
+    set_kv("length", std::to_string(end - begin));
+  }
+  return exported.size();
+}
+
+// Load `gguf_path` into `pool` and, for every graph initializer whose name
+// matches a pooled (i.e. raw-dtype) tensor, either hydrate it in place
+// (hydrate_all, the default) or leave it as a lazy EXTERNAL reference
+// (hydrate_all=false; see tensor_pool_bridge.h's caveat on this mode).
+// Returns the number of initializers matched (hydrated or marked lazy).
+//
+// When `skipped_out` is non-null, it receives the names of GGUF tensors
+// that were present in the file but skipped because their ggml_type is
+// quantized/unrecognized (TensorPool::LoadGGUF's own return value, passed
+// through) -- check this against your model's initializer names to find out
+// which weights this import could NOT bring in, rather than discovering it
+// only when a later pass trips over an initializer that's still empty.
+inline size_t ImportModelWithGGUF(
+    onnx::ModelProto& model, const std::string& gguf_path, TensorPool& pool,
+    bool hydrate_all = true, std::vector<std::string>* skipped_out = nullptr) {
+  std::vector<std::string> skipped = pool.LoadGGUF(gguf_path);
+  if (skipped_out != nullptr) *skipped_out = std::move(skipped);
+
+  size_t matched = 0;
+  for (auto& init : *model.mutable_graph()->mutable_initializer()) {
+    const Entry* entry = pool.Find(init.name());
+    if (entry == nullptr) continue;
+    ++matched;
+    if (hydrate_all) {
+      HydrateTensorProto(init.name(), init, pool);
+    } else {
+      init.set_data_location(onnx::TensorProto::EXTERNAL);
+      init.clear_external_data();
+      auto* e = init.add_external_data();
+      e->set_key("location");
+      e->set_value(gguf_path);
+    }
+  }
+  return matched;
+}
+
+}  // namespace tensor_pool
+}  // namespace onnxsim
+
+#endif  // ONNXSIM_TENSOR_POOL_GGUF_BRIDGE_H_

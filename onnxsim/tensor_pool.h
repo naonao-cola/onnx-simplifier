@@ -141,6 +141,53 @@ class TensorPool {
   // malformed header, or a tensor whose data_offsets fall outside the file.
   void LoadSafetensors(const std::string& path);
 
+  // --- GGUF (https://github.com/ggml-org/ggml/blob/master/docs/gguf.md)
+  // format, version 3 -- implemented in tensor_pool_gguf.cpp, a separate
+  // translation unit from the safetensors codec above, since the two file
+  // formats share nothing but the TensorPool storage they read into/from.
+  // See gguf_dtype.h's file comment for an important scope note: GGUF's
+  // block-quantized types (most of what a real quantized-LLM .gguf's
+  // tensors actually are) have no ONNX raw-data equivalent and are never
+  // pooled -- LoadGGUF skips and reports them rather than writing garbage.
+
+  // Write every entry to a GGUF file at `path`. Every dtype TensorPool can
+  // hold has a raw ggml_type counterpart (see gguf_dtype.h), so -- unlike
+  // LoadGGUF -- this never has to skip an entry; it throws instead if some
+  // future dtype addition broke that invariant. `string_metadata` is
+  // written verbatim as top-level GGUF string metadata entries (e.g.
+  // {"general.architecture", "onnxsim"}); pass {} for none.
+  //
+  // When `data_offsets_out` is non-null, it is filled with each written
+  // tensor's [begin, end) byte range *relative to the start of the tensor-
+  // data section* (GGUF's own per-tensor "offset" field, plus nbytes).
+  // When `data_section_start_out` is non-null, it receives that section's
+  // absolute byte offset from the start of the file. Together they're
+  // enough for a caller (see tensor_pool_gguf_bridge.h) to point a
+  // TensorProto's external_data straight at the file, the same way
+  // SaveSafetensors's data_offsets_out plus HeaderPrefixSize does for
+  // safetensors. Throws std::runtime_error on I/O failure.
+  void SaveGGUF(const std::string& path,
+                const std::map<std::string, std::string>& string_metadata = {},
+                std::map<std::string, std::pair<uint64_t, uint64_t>>*
+                    data_offsets_out = nullptr,
+                uint64_t* data_section_start_out = nullptr) const;
+
+  // Replace this pool's contents with every tensor in the GGUF file at
+  // `path` whose ggml_type is a *raw*, unquantized type this pool can
+  // represent -- typically a small minority of tensors in a real quantized-
+  // LLM .gguf (embeddings/attention/FFN weights are usually quantized;
+  // norm scale/bias and similar small tensors are usually not). Unlike
+  // LoadSafetensors, this does NOT read the whole file into memory: only
+  // the (small) header/metadata/tensor-info section is read up front, and
+  // each *included* tensor's bytes are read with their own targeted seek +
+  // read -- loading a large quantized checkpoint this way costs only the
+  // bytes of the few tensors this pool can actually use, not the whole
+  // file. Returns the names of tensors that were present in the file but
+  // skipped because their ggml_type has no ONNX raw-data equivalent (empty
+  // if every tensor was loaded). Throws std::runtime_error on I/O failure,
+  // an unrecognized magic/version, or a malformed header.
+  std::vector<std::string> LoadGGUF(const std::string& path);
+
  private:
   std::map<std::string, Entry> entries_;
 };

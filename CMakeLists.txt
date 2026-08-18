@@ -125,7 +125,7 @@ endif()
 # configure onnx-optimizer after onnxruntime, because they both depend on onnx and onnxruntime has its own flags for onnx
 add_subdirectory(third_party/onnx-optimizer EXCLUDE_FROM_ALL)
 
-add_library(onnxsim onnxsim/onnxsim.cpp onnxsim/contrib_schemas.cpp onnxsim/custom_optimizer_passes.cpp onnxsim/function_rewriter.cpp onnxsim/profiler.cpp onnxsim/model_info.cpp onnxsim/sym_expr.cpp onnxsim/sym_value_eval.cpp onnxsim/sym_shape_infer.cpp onnxsim/model_metrics.cpp onnxsim/tensor_pool.cpp)
+add_library(onnxsim onnxsim/onnxsim.cpp onnxsim/contrib_schemas.cpp onnxsim/custom_optimizer_passes.cpp onnxsim/function_rewriter.cpp onnxsim/profiler.cpp onnxsim/model_info.cpp onnxsim/sym_expr.cpp onnxsim/sym_value_eval.cpp onnxsim/sym_shape_infer.cpp onnxsim/model_metrics.cpp onnxsim/tensor_pool.cpp onnxsim/tensor_pool_gguf.cpp)
 if (ONNXSIM_BUILTIN_ORT)
   target_include_directories(onnxsim PRIVATE ${ONNXRUNTIME_INCLUDE_DIR})
   if (ONNXSIM_PREBUILT_ORT)
@@ -436,4 +436,27 @@ if (ONNXSIM_TESTS)
   add_executable(tensor_pool_bridge_test onnxsim/tensor_pool_bridge_test.cpp)
   target_link_libraries(tensor_pool_bridge_test onnxsim)
   add_test(NAME tensor_pool_bridge_test COMMAND tensor_pool_bridge_test)
+
+  # The ONNX<->GGML dtype mapping (gguf_dtype.h), mirroring
+  # tensor_pool_dtype_test.cpp above for the same reason.
+  add_executable(gguf_dtype_test onnxsim/gguf_dtype_test.cpp)
+  target_include_directories(gguf_dtype_test PRIVATE onnxsim)
+  add_test(NAME gguf_dtype_test COMMAND gguf_dtype_test)
+
+  # TensorPool's GGUF read/write (tensor_pool_gguf.cpp) depends only on
+  # tensor_pool.{h,cpp} and gguf_dtype.h, so it too builds and runs
+  # standalone without ONNX / ONNX Runtime configured.
+  add_executable(tensor_pool_gguf_test onnxsim/tensor_pool_gguf_test.cpp
+                                       onnxsim/tensor_pool.cpp
+                                       onnxsim/tensor_pool_gguf.cpp)
+  target_include_directories(tensor_pool_gguf_test PRIVATE onnxsim)
+  add_test(NAME tensor_pool_gguf_test COMMAND tensor_pool_gguf_test)
+
+  # tensor_pool_gguf_bridge.h needs onnx, same reason as
+  # tensor_pool_bridge_test above.
+  add_executable(tensor_pool_gguf_bridge_test
+                onnxsim/tensor_pool_gguf_bridge_test.cpp)
+  target_link_libraries(tensor_pool_gguf_bridge_test onnxsim)
+  add_test(NAME tensor_pool_gguf_bridge_test
+          COMMAND tensor_pool_gguf_bridge_test)
 endif()
