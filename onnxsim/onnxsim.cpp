@@ -2479,9 +2479,9 @@ onnx::ModelProto Simplify(
   //    skipped for RNN models that would otherwise hit it -- a completeness
   //    gap, not a correctness one.
   if (std::getenv("ONNXSIM_GRAPH_NATIVE_SHAPE_INFERENCE")) {
-    OptAndShape = Profiled(
-        "OptAndShape",
-        [optimize, shape_inference, fixed_point_iters](onnx::ModelProto& model) {
+    OptAndShape =
+        Profiled("OptAndShape", [optimize, shape_inference,
+                                 fixed_point_iters](onnx::ModelProto& model) {
           std::shared_ptr<onnx::Graph> g(onnx::ImportModelProto(model));
           if (g.get() == nullptr) {
             // Same fallback as Optimizer::optimize(): if we can't parse the
