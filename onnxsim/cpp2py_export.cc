@@ -550,7 +550,7 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
         ParseProtoFromBytes(&model, model_bytes.c_str(), model_bytes.size());
         onnxsim::tensor_pool::TensorPool pool;
         onnxsim::tensor_pool::SaveModelAsSafetensorsStandalone(model, out_path,
-                                                                pool);
+                                                               pool);
       },
       "model_bytes"_a, "out_path"_a);
 
@@ -560,7 +560,7 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
         onnx::ModelProto model;
         onnxsim::tensor_pool::TensorPool pool;
         if (!onnxsim::tensor_pool::LoadModelFromSafetensors(in_path, &model,
-                                                             pool)) {
+                                                            pool)) {
           throw std::runtime_error(
               "safetensors file has no embedded onnxsim model (a plain "
               "weights-only archive is not importable as a graph)");
