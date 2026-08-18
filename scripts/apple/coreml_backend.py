@@ -33,10 +33,20 @@ import numpy as np
 import onnx
 
 _SCRIPTS_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-if _SCRIPTS_DIR not in sys.path:
+# Only keep scripts/ on sys.path for the duration of this import: scripts/
+# also holds directories like rfdetr/ with no __init__.py, which Python 3
+# treats as importable namespace packages. Leaving scripts/ on sys.path for
+# the rest of the process would make `import rfdetr` "succeed" as that empty
+# namespace package instead of skipping via pytest.importorskip, and shadow
+# the real one everywhere else it's checked for.
+_inserted = _SCRIPTS_DIR not in sys.path
+if _inserted:
     sys.path.insert(0, _SCRIPTS_DIR)
-
-from common.ep_numerics import compare, random_feeds  # noqa: E402,F401
+try:
+    from common.ep_numerics import compare, random_feeds  # noqa: E402,F401
+finally:
+    if _inserted:
+        sys.path.remove(_SCRIPTS_DIR)
 
 _EP_NAME = "CoreMLExecutionProvider"
 # ALL lets Core ML place ops on CPU/GPU/Neural Engine as it judges best, the
