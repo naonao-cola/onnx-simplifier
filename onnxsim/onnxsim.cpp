@@ -40,6 +40,8 @@
 #include "custom_optimizer_passes.h"
 #include "dlpack_bridge.h"
 #include "onnx/common/file_utils.h"
+#include "onnx/common/graph_shape_inference.h"
+#include "onnx/common/ir_pb_converter.h"
 #include "onnx/defs/printer.h"
 #include "onnx/defs/schema.h"
 #include "onnx/inliner/inliner.h"
@@ -2451,6 +2453,77 @@ onnx::ModelProto Simplify(
       "OptAndShape",
       FixedPointFn(Profiled("InferShapes", InferShapes),
                    Profiled("Optimize", OptimizeInPlace), fixed_point_iters));
+#endif
+#ifdef NO_BUILTIN_ORT
+  // Opt-in (env-gated; not yet the default) fully Graph-resident OptAndShape,
+  // built on onnx::InferShapesOnGraph (onnx/common/graph_shape_inference.h)
+  // and onnx-optimizer's OptimizeGraphFixed (onnxoptimizer/optimize.h): both
+  // now run directly against one onnx::Graph held for the whole inner fixed
+  // point, so -- unlike the ModelProto-based OptAndShape above, which still
+  // does one Import+Export per round even with #634's move-based fix -- this
+  // does exactly one Import and one Export for the *entire* fixed point,
+  // however many rounds it takes to converge. This is onnxsim issue #633's
+  // "remaining option 2" (eliminating the round trip itself, not just its
+  // per-round cost).
+  //
+  // Gated behind an env var rather than replacing the default while its
+  // coverage is still being validated against the existing test/regression
+  // suites:
+  //  - InferShapesOnGraph's own v1 scope leaves control-flow ops (If/Loop/
+  //    Scan) and function-body ops uninferred (safe: exactly as if they had
+  //    no registered schema, never wrong -- see that function's doc
+  //    comment), which can converge to less complete shape info than the
+  //    ModelProto path for models using those ops.
+  //  - EliminateZeroRnnInitialState (issue #314) is ModelProto-based and is
+  //    not run on this path, so that one dead-initial-state cleanup is
+  //    skipped for RNN models that would otherwise hit it -- a completeness
+  //    gap, not a correctness one.
+  if (std::getenv("ONNXSIM_GRAPH_NATIVE_SHAPE_INFERENCE")) {
+    OptAndShape = Profiled(
+        "OptAndShape",
+        [optimize, shape_inference, fixed_point_iters](onnx::ModelProto& model) {
+          std::shared_ptr<onnx::Graph> g(onnx::ImportModelProto(model));
+          if (g.get() == nullptr) {
+            // Same fallback as Optimizer::optimize(): if we can't parse the
+            // model, leave it untouched.
+            return;
+          }
+          using GraphFnChanged = std::function<bool(onnx::Graph&)>;
+          GraphFnChanged InferShapesOnGraphChanged =
+              shape_inference
+                  ? GraphFnChanged([](onnx::Graph& graph) {
+                      return onnx::InferShapesOnGraph(graph);
+                    })
+                  : GraphFnChanged([](onnx::Graph&) { return false; });
+          GraphFnChanged OptimizeGraphChanged = [](onnx::Graph& graph) {
+            onnxsim::RegisterCustomOptimizerPasses();
+            const bool prev = onnx::optimization::InitializersAsConstants();
+            onnx::optimization::SetInitializersAsConstants(
+                config.initializers_as_constants);
+            std::map<std::string, unsigned int> report;
+            onnx::optimization::OptimizeGraphFixed(
+                graph, config.optimizer_passes, &report);
+            onnx::optimization::SetInitializersAsConstants(prev);
+            for (const auto& pass_count : report) {
+              if (pass_count.second != 0) {
+                return true;
+              }
+            }
+            return false;
+          };
+          FixedPointFn(InferShapesOnGraphChanged, OptimizeGraphChanged,
+                       fixed_point_iters)(*g);
+          onnx::ModelProto out = onnx::PrepareOutput(model);
+          onnx::ExportModelProto(&out, g, /*consume_tensor_data=*/true);
+          // OptimizeGraphFixed never sees model-local functions (they live
+          // on ModelProto, not Graph), so carry them over unchanged --
+          // mirroring Optimizer::optimize()'s own AddFunctionsToModel.
+          for (const auto& function_proto : model.functions()) {
+            *out.add_functions() = function_proto;
+          }
+          model = std::move(out);
+        });
+  }
 #endif
   bool converged = false;
   ModelFn Pipeline;
