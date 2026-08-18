@@ -13,6 +13,7 @@
 
 #include <cstdio>
 #include <fstream>
+#include <map>
 #include <string>
 
 using namespace onnxsim::tensor_pool;
@@ -284,6 +285,64 @@ void TestImportModelWithSafetensorsLazy() {
   std::remove(path.c_str());
 }
 
+void TestAttachContentHashMetadata() {
+  onnx::ModelProto model;
+  auto* graph = model.mutable_graph();
+  *graph->add_initializer() = MakeInitializer(
+      "weight", onnx::TensorProto::FLOAT, {2, 2}, std::string(16, '\x11'));
+  *graph->add_initializer() = MakeInitializer("bias", onnx::TensorProto::INT64,
+                                              {2}, std::string(16, '\x22'));
+
+  std::string path = TempPath("_hash.safetensors");
+  TensorPool pool;
+  ExportModelWithSafetensors(model, path, pool);
+  AttachContentHashMetadata(pool, model);
+
+  std::map<std::string, std::string> props;
+  for (const auto& kv : graph->metadata_props()) {
+    props[kv.key()] = kv.value();
+  }
+  Check(props.size() == 3,
+        "one metadata_props entry per tensor plus one __all__ summary");
+  Check(props.count("blake3:weight") == 1 && props.count("blake3:bias") == 1,
+        "per-tensor entries are keyed \"<algorithm>:<name>\"");
+  Check(props.at("blake3:weight") == pool.ContentHash("weight"),
+        "exported digest matches TensorPool::ContentHash");
+  Check(props.at("blake3:weight").size() == 64,
+        "exported digest is a 32-byte hex string");
+  Check(props.count("blake3:__all__") == 1,
+        "a whole-pool summary digest is also exported");
+
+  // Recomputed independently of AttachContentHashMetadata's own bookkeeping,
+  // the way an external verifier would: sort by name, concatenate
+  // "<name>\0<hex>\n", hash under the same algorithm.
+  std::string concat;
+  concat += "bias";
+  concat.push_back('\0');
+  concat += props.at("blake3:bias");
+  concat.push_back('\n');
+  concat += "weight";
+  concat.push_back('\0');
+  concat += props.at("blake3:weight");
+  concat.push_back('\n');
+  Check(props.at("blake3:__all__") ==
+            ToHex(RawDigest(HashAlgorithm::kBlake3, concat)),
+        "__all__ is independently reproducible from the per-tensor digests");
+
+  // A different HashAlgorithm changes both the key prefix and the values.
+  onnx::ModelProto model2 = model;
+  model2.mutable_graph()->clear_metadata_props();
+  pool.SetHashAlgorithm(HashAlgorithm::kSha256);
+  AttachContentHashMetadata(pool, model2);
+  bool has_sha_key = false;
+  for (const auto& kv : model2.graph().metadata_props()) {
+    if (kv.key() == "sha256:weight") has_sha_key = true;
+  }
+  Check(has_sha_key, "switching HashAlgorithm changes the exported key prefix");
+
+  std::remove(path.c_str());
+}
+
 }  // namespace
 
 int main() {
@@ -293,6 +352,7 @@ int main() {
   TestUnnamedAttributeTensor();
   TestImportModelWithSafetensorsHydrateAll();
   TestImportModelWithSafetensorsLazy();
+  TestAttachContentHashMetadata();
 
   if (g_failures == 0) {
     std::printf("tensor_pool_bridge_test: all checks passed\n");

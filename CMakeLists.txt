@@ -11,6 +11,20 @@ set(CMAKE_OSX_DEPLOYMENT_TARGET 13.3 CACHE STRING "Minimum OS X deployment versi
 
 project(onnxsim CXX)
 
+# The vendored BLAKE3 sources backing TensorPool's content hashing
+# (onnxsim/tensor_pool_hash.cpp, third_party/blake3/*.c) are plain C, unlike
+# the rest of this project. The ONNXSIM_BUILTIN_ORT path below also calls
+# enable_language(C) before configuring ONNX Runtime, but only on that path
+# (not e.g. the Python wheel build, which passes -DONNXSIM_BUILTIN_ORT=OFF) --
+# enable it unconditionally and up front so BLAKE3 always has a C compiler
+# regardless of that option. A second enable_language(C) call below is a
+# harmless no-op. Skipped under Emscripten, matching the existing
+# enable_language(C) call's own NOT EMSCRIPTEN guard -- its toolchain file
+# configures the languages it needs on its own.
+if (NOT EMSCRIPTEN)
+  enable_language(C)
+endif()
+
 set(CMAKE_CXX_VISIBILITY_PRESET "hidden")
 set(CMAKE_VISIBILITY_INLINES_HIDDEN TRUE)
 
@@ -116,7 +130,29 @@ add_subdirectory(third_party/onnx EXCLUDE_FROM_ALL)
 
 add_subdirectory(third_party/onnx-optimizer EXCLUDE_FROM_ALL)
 
-add_library(onnxsim onnxsim/onnxsim.cpp onnxsim/contrib_schemas.cpp onnxsim/custom_optimizer_passes.cpp onnxsim/function_rewriter.cpp onnxsim/profiler.cpp onnxsim/model_info.cpp onnxsim/sym_expr.cpp onnxsim/sym_value_eval.cpp onnxsim/sym_shape_infer.cpp onnxsim/model_metrics.cpp onnxsim/tensor_pool.cpp onnxsim/tensor_pool_gguf.cpp)
+# Vendored BLAKE3 (third_party/blake3, see that directory's blake3.h for the
+# pinned version/license) backing TensorPool::ContentHash's default
+# HashAlgorithm -- see tensor_pool_hash.h's file comment. Only the portable
+# C source is vendored (no per-architecture SIMD), so it's compiled with
+# every SIMD backend disabled: that makes blake3_dispatch.c's runtime
+# CPU-feature dispatch fall through to blake3_portable.c unconditionally,
+# which is what makes omitting the SIMD source files (and their assembly)
+# correct rather than merely omitted. Applied via target_sources /
+# target_compile_definitions below to each target that (transitively, via
+# tensor_pool.cpp) needs TensorPool's hashing -- mirroring how
+# tensor_pool.cpp itself is listed per-target rather than built once into a
+# shared object library, matching this file's existing tensor_pool_test /
+# tensor_pool_gguf_test pattern below.
+set(ONNXSIM_BLAKE3_SOURCES
+    third_party/blake3/blake3.c
+    third_party/blake3/blake3_dispatch.c
+    third_party/blake3/blake3_portable.c)
+set(ONNXSIM_BLAKE3_COMPILE_DEFS
+    BLAKE3_NO_SSE2 BLAKE3_NO_SSE41 BLAKE3_NO_AVX2 BLAKE3_NO_AVX512
+    BLAKE3_USE_NEON=0)
+
+add_library(onnxsim onnxsim/onnxsim.cpp onnxsim/contrib_schemas.cpp onnxsim/custom_optimizer_passes.cpp onnxsim/function_rewriter.cpp onnxsim/profiler.cpp onnxsim/model_info.cpp onnxsim/sym_expr.cpp onnxsim/sym_value_eval.cpp onnxsim/sym_shape_infer.cpp onnxsim/model_metrics.cpp onnxsim/tensor_pool.cpp onnxsim/tensor_pool_gguf.cpp onnxsim/tensor_pool_hash.cpp ${ONNXSIM_BLAKE3_SOURCES})
+target_compile_definitions(onnxsim PRIVATE ${ONNXSIM_BLAKE3_COMPILE_DEFS})
 if (ONNXSIM_BUILTIN_ORT)
   # Both ways of obtaining ONNX Runtime ship/install headers flat under this
   # directory (an official release tarball, or cmake/build_ort.cmake's own
@@ -430,13 +466,28 @@ if (ONNXSIM_TESTS)
   target_include_directories(tensor_pool_dtype_test PRIVATE onnxsim)
   add_test(NAME tensor_pool_dtype_test COMMAND tensor_pool_dtype_test)
 
-  # TensorPool's storage and safetensors read/write (tensor_pool.{h,cpp})
-  # depend only on tensor_pool_dtype.h, so this too builds and runs
-  # standalone without ONNX / ONNX Runtime configured.
+  # TensorPool's storage, safetensors read/write, and content hashing
+  # (tensor_pool.{h,cpp}, tensor_pool_hash.{h,cpp}) depend only on
+  # tensor_pool_dtype.h and the vendored BLAKE3, so this too builds and
+  # runs standalone without ONNX / ONNX Runtime configured.
   add_executable(tensor_pool_test onnxsim/tensor_pool_test.cpp
-                                  onnxsim/tensor_pool.cpp)
-  target_include_directories(tensor_pool_test PRIVATE onnxsim)
+                                  onnxsim/tensor_pool.cpp
+                                  onnxsim/tensor_pool_hash.cpp
+                                  ${ONNXSIM_BLAKE3_SOURCES})
+  target_include_directories(tensor_pool_test PRIVATE onnxsim third_party)
+  target_compile_definitions(tensor_pool_test PRIVATE ${ONNXSIM_BLAKE3_COMPILE_DEFS})
   add_test(NAME tensor_pool_test COMMAND tensor_pool_test)
+
+  # tensor_pool_hash.{h,cpp}'s two backends (BLAKE3, this repo's own
+  # SHA-256) checked against each algorithm's published test vectors, plus
+  # ContentDigest's dtype/shape domain separation -- pure and
+  # dependency-free like tensor_pool_dtype_test.cpp above.
+  add_executable(tensor_pool_hash_test onnxsim/tensor_pool_hash_test.cpp
+                                       onnxsim/tensor_pool_hash.cpp
+                                       ${ONNXSIM_BLAKE3_SOURCES})
+  target_include_directories(tensor_pool_hash_test PRIVATE onnxsim third_party)
+  target_compile_definitions(tensor_pool_hash_test PRIVATE ${ONNXSIM_BLAKE3_COMPILE_DEFS})
+  add_test(NAME tensor_pool_hash_test COMMAND tensor_pool_hash_test)
 
   # tensor_pool_bridge.h is the one piece that DOES need onnx (it converts
   # onnx::TensorProto <-> TensorPool), so its test links the fully-configured
@@ -457,8 +508,11 @@ if (ONNXSIM_TESTS)
   # standalone without ONNX / ONNX Runtime configured.
   add_executable(tensor_pool_gguf_test onnxsim/tensor_pool_gguf_test.cpp
                                        onnxsim/tensor_pool.cpp
-                                       onnxsim/tensor_pool_gguf.cpp)
-  target_include_directories(tensor_pool_gguf_test PRIVATE onnxsim)
+                                       onnxsim/tensor_pool_hash.cpp
+                                       onnxsim/tensor_pool_gguf.cpp
+                                       ${ONNXSIM_BLAKE3_SOURCES})
+  target_include_directories(tensor_pool_gguf_test PRIVATE onnxsim third_party)
+  target_compile_definitions(tensor_pool_gguf_test PRIVATE ${ONNXSIM_BLAKE3_COMPILE_DEFS})
   add_test(NAME tensor_pool_gguf_test COMMAND tensor_pool_gguf_test)
 
   # tensor_pool_gguf_bridge.h needs onnx, same reason as

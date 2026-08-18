@@ -25,8 +25,10 @@
  *      in-memory blob first.
  *
  * TensorPool itself is dependency-free of onnx/protobuf (only the *integer*
- * ONNX dtype codes from tensor_pool_dtype.h), so it builds and unit-tests
- * standalone -- mirrors the dlpack_dtype.h / dlpack_bridge.h split. The
+ * ONNX dtype codes from tensor_pool_dtype.h, plus the vendored BLAKE3 and
+ * self-contained SHA-256 backing ContentHash/SetHashAlgorithm below -- see
+ * tensor_pool_hash.h), so it builds and unit-tests standalone -- mirrors
+ * the dlpack_dtype.h / dlpack_bridge.h split. The
  * onnx::TensorProto <-> TensorPool glue lives in tensor_pool_bridge.h; see
  * that header's comment for how (and where) it's safe to plug a pool into
  * onnxsim's existing passes -- notably, several of them (onnxsim.cpp's
@@ -76,6 +78,8 @@
 #include <utility>
 #include <vector>
 
+#include "tensor_pool_hash.h"
+
 namespace onnxsim {
 namespace tensor_pool {
 
@@ -114,6 +118,29 @@ class TensorPool {
 
   auto begin() const { return entries_.begin(); }
   auto end() const { return entries_.end(); }
+
+  // Content-hash algorithm used by ContentHash/AllContentHashes below.
+  // Defaults to BLAKE3 -- cryptographic and, per its own published
+  // benchmarks, faster than SHA-256, so it's a safe default for both an
+  // internal dedup/lookup key and (see tensor_pool_bridge.h's
+  // AttachContentHashMetadata) an externally-verifiable integrity value.
+  // Override to kSha256 to interoperate with a downstream verifier that
+  // only knows SHA-256; see tensor_pool_hash.h's file comment for the
+  // tradeoff. Affects only hashes computed after the call.
+  void SetHashAlgorithm(HashAlgorithm algo) { hash_algorithm_ = algo; }
+  HashAlgorithm GetHashAlgorithm() const { return hash_algorithm_; }
+
+  // Hex-encoded digest of `name`'s dtype + shape + bytes (see
+  // tensor_pool_hash.h's ContentDigest) under the pool's current
+  // HashAlgorithm. Two entries -- in this pool or, run through the same
+  // HashAlgorithm, anywhere else -- with equal ContentHash have identical
+  // dtype, shape, and raw bytes (modulo the underlying hash's own collision
+  // resistance). Throws std::out_of_range if `name` isn't in the pool.
+  std::string ContentHash(const std::string& name) const;
+
+  // ContentHash for every entry, in the pool's iteration (name-sorted)
+  // order -- e.g. for AttachContentHashMetadata to export deterministically.
+  std::map<std::string, std::string> AllContentHashes() const;
 
   // Write every entry to a .safetensors file at `path`, in the pool's
   // iteration (name-sorted) order. Each tensor is written straight from its
@@ -190,6 +217,7 @@ class TensorPool {
 
  private:
   std::map<std::string, Entry> entries_;
+  HashAlgorithm hash_algorithm_ = HashAlgorithm::kBlake3;
 };
 
 // Bytes of `path`'s safetensors preamble (the 8-byte length prefix plus the

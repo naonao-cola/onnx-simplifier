@@ -18,6 +18,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <stdexcept>
 #include <string>
 #include <type_traits>
 
@@ -216,6 +217,45 @@ void TestSkipsMetadata() {
   std::remove(path.c_str());
 }
 
+void TestContentHash() {
+  TensorPool pool;
+  std::string bytes(16, '\x2a');
+  pool.Add("w1", ONNX_FLOAT, {2, 2}, std::string(bytes));
+  pool.Add("w2", ONNX_FLOAT, {2, 2},
+           std::string(bytes));  // same content, different name
+  pool.Add("w3", ONNX_INT8, {16},
+           std::string(bytes));  // same bytes, different dtype/shape
+
+  Check(pool.GetHashAlgorithm() == HashAlgorithm::kBlake3,
+        "TensorPool defaults to BLAKE3");
+
+  std::string h1 = pool.ContentHash("w1");
+  Check(h1.size() == 64, "ContentHash is a 32-byte digest, hex-encoded");
+  Check(pool.ContentHash("w2") == h1,
+        "identical dtype/shape/bytes under different names hash the same");
+  Check(pool.ContentHash("w3") != h1,
+        "identical bytes but different dtype/shape hash differently");
+
+  auto all = pool.AllContentHashes();
+  Check(all.size() == 3, "AllContentHashes covers every entry");
+  Check(all.at("w1") == h1 && all.at("w2") == h1,
+        "AllContentHashes agrees with ContentHash per entry");
+
+  bool threw = false;
+  try {
+    pool.ContentHash("missing");
+  } catch (const std::out_of_range&) {
+    threw = true;
+  }
+  Check(threw, "ContentHash throws out_of_range for an unknown name");
+
+  pool.SetHashAlgorithm(HashAlgorithm::kSha256);
+  Check(pool.GetHashAlgorithm() == HashAlgorithm::kSha256,
+        "SetHashAlgorithm takes effect");
+  Check(pool.ContentHash("w1") != h1,
+        "switching algorithm changes the digest for the same tensor");
+}
+
 }  // namespace
 
 int main() {
@@ -225,6 +265,7 @@ int main() {
   TestRejectsUnrepresentableDtype();
   TestRejectsMalformedFile();
   TestSkipsMetadata();
+  TestContentHash();
 
   if (g_failures == 0) {
     std::printf("tensor_pool_test: all checks passed\n");
