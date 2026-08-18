@@ -172,6 +172,17 @@ def comparison_section(rows):
                 faster = "onnxslim" if b < a else "onnxsim"
                 lines.append(f"| {r['model']} | {a:.1f} | {b:.1f} | {faster} |")
             lines.append("")
+
+        # Every model where onnxsim lost, not just the ones large enough to
+        # make the top-15 gap table above.
+        slower = sorted((t for t in timed if t[2] < t[1]), key=lambda t: -(t[1] - t[2]))
+        if slower:
+            lines.append(f"onnxsim slower than onnxslim on all {len(slower)} models:\n")
+            lines.append("| model | onnxsim (s) | onnxslim (s) | onnxsim is |")
+            lines.append("| --- | ---: | ---: | ---: |")
+            for r, a, b in slower:
+                lines.append(f"| {r['model']} | {a:.1f} | {b:.1f} | {a / b:.1f}x slower |")
+            lines.append("")
     else:
         lines.append("_No model was completed by both tools._\n")
 
@@ -259,6 +270,19 @@ def main(argv):
         lines.append("")
 
     lines.extend(comparison_section(rows))
+
+    timed_ok = sorted(
+        ((r, _num(r.get("seconds"))) for r in rows if r["status"] == "ok"),
+        key=lambda t: -(t[1] or 0),
+    )
+    timed_ok = [(r, s) for r, s in timed_ok if s is not None][:15]
+    if timed_ok:
+        lines.append("## 🐢 Slowest model conversions (onnxsim)\n")
+        lines.append("| model | time (s) | nodes (orig→simp) |")
+        lines.append("| --- | ---: | --- |")
+        for r, s in timed_ok:
+            lines.append(f"| {r['model']} | {s:.1f} | {r.get('orig_nodes', '')}→{r.get('simp_nodes', '')} |")
+        lines.append("")
 
     lines.append("## All models (onnxsim)\n")
     lines.append("| model | status | nodes (orig→simp) | baseline simp | Δ | time (s) |")
