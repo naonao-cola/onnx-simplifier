@@ -1,7 +1,7 @@
 /*
  * SPDX-License-Identifier: Apache-2.0
  *
- * Standalone: g++ -std=c++17 tensor_pool_test.cpp tensor_pool.cpp -o t && ./t
+ * Standalone: g++ -std=c++20 tensor_pool_test.cpp tensor_pool.cpp -o t && ./t
  *
  * Dependency-free unit test for TensorPool and its safetensors read/write
  * (no ONNX / ONNX Runtime -- see tensor_pool.h's top comment). The
@@ -12,10 +12,14 @@
 
 #include <unistd.h>
 
+#include <algorithm>
+#include <bit>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <string>
+#include <type_traits>
 
 #include "tensor_pool_dtype.h"
 
@@ -169,6 +173,26 @@ void TestRejectsMalformedFile() {
   std::remove(path.c_str());
 }
 
+// Writes bytes explicitly little-endian, regardless of host byte order --
+// required here because this test hand-constructs a raw safetensors file
+// (rather than going through TensorPool::SaveSafetensors, which already
+// gets this right; see tensor_pool.h's "Byte order" note). A prior version
+// of this helper used reinterpret_cast<const char*> on a host uint64_t/
+// float directly, which happened to match the spec on a little-endian host
+// but produced a file with a garbage header length -- and, on the tensor
+// payload below, a garbage float -- on a big-endian one (caught by this
+// repo's s390x CI job).
+template <typename T>
+void WriteLE(std::ostream& out, T v) {
+  static_assert(std::is_trivially_copyable_v<T>);
+  unsigned char raw[sizeof(T)];
+  std::memcpy(raw, &v, sizeof(T));
+  if constexpr (std::endian::native == std::endian::big) {
+    std::reverse(std::begin(raw), std::end(raw));
+  }
+  out.write(reinterpret_cast<const char*>(raw), sizeof(T));
+}
+
 void TestSkipsMetadata() {
   // __metadata__ is a valid, common safetensors header entry (arbitrary
   // string->string map, e.g. {"format": "pt"}) that this reader must skip
@@ -179,11 +203,9 @@ void TestSkipsMetadata() {
       R"("t":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}})";
   {
     std::ofstream out(path, std::ios::binary);
-    uint64_t len = header.size();
-    out.write(reinterpret_cast<const char*>(&len), 8);
+    WriteLE<uint64_t>(out, header.size());
     out.write(header.data(), static_cast<std::streamsize>(header.size()));
-    float v = 1.5f;
-    out.write(reinterpret_cast<const char*>(&v), 4);
+    WriteLE<float>(out, 1.5f);
   }
   TensorPool pool;
   pool.LoadSafetensors(path);
