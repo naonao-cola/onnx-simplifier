@@ -16,10 +16,11 @@ the **x86 host emulator**. So the whole check runs on a free GitHub-hosted runne
 with nothing but `pip install onnxruntime-qnn`.
 
 Sibling checks for other vendor execution providers follow the same
-pattern: [`scripts/apple`](../apple) (Core ML) and
-[`scripts/intel`](../intel) (OpenVINO). NVIDIA (CUDA/TensorRT) and AMD
-(MIGraphX/ROCm) need real GPU hardware and aren't covered by a CI-runner
-harness yet.
+pattern: [`scripts/apple`](../apple) (Core ML), [`scripts/intel`](../intel)
+(OpenVINO), and [`scripts/amd`](../amd) (MIGraphX -- needs a self-hosted ROCm
+runner, since unlike the other three it has no CPU fallback or emulator, so
+its workflow is dormant until one is provisioned). NVIDIA (CUDA/TensorRT)
+needs real GPU hardware too and isn't covered by a harness yet.
 
 ## What it checks
 
