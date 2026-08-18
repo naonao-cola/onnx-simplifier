@@ -20,7 +20,7 @@
 #include "onnxoptimizer/optimize.h"
 #include "onnxsim.h"
 
-#ifdef NO_BUILTIN_ORT
+#ifndef ONNXSIM_HAS_ORT
 #error \
     "The onnxsim C API requires the built-in ONNX Runtime (ONNXSIM_BUILTIN_ORT=ON)."
 #endif
