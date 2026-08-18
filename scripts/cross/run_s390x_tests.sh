@@ -77,8 +77,12 @@ print(sys.byteorder, \"endian | python\", sys.version.split()[0],
 "'
 
 # torch, timm and onnxruntime have no s390x builds, so the test modules that
-# import them at module scope cannot be collected here. test_qnn_compat needs a
-# model fixture that is not vendored.
+# import them at module scope cannot be collected here. test_qnn_compat,
+# test_coreml_compat, test_migraphx_compat and test_openvino_compat each
+# import their vendor backend module (e.g. ``coreml_backend``) and a ``models``
+# fixture module from a sibling scripts/<vendor>/ directory at module scope --
+# above, only tests/ and pyproject.toml are copied into the chroot, so none of
+# those imports resolve there regardless of what's pip-installed.
 #
 # The two deselected BN-fusion tests fail onnxsim's own check_n equivalence
 # check whenever onnxruntime is absent and the reference evaluator is used
@@ -103,6 +107,8 @@ chroot "${SYSROOT}" /bin/sh -c "cd /work && GITHUB_STEP_SUMMARY=${CHROOT_SUMMARY
   --ignore=tests/test_mnn_llm_export.py --ignore=tests/test_python_api.py --ignore=tests/test_rfdetr.py \
   --ignore=tests/test_simple.py --ignore=tests/test_timm.py --ignore=tests/test_yolo.py \
   --ignore=tests/test_qnn_compat.py --ignore=tests/test_modelopt_integration.py \
+  --ignore=tests/test_coreml_compat.py --ignore=tests/test_migraphx_compat.py \
+  --ignore=tests/test_openvino_compat.py \
   --deselect tests/test_fusion_patterns.py::test_fuse_conv_bn_into_conv \
   --deselect tests/test_fusion_patterns.py::test_fuse_convtranspose_bn ${PYTEST_ARGS:-}"
 pytest_status=$?
