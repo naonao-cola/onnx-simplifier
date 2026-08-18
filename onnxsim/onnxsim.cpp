@@ -11,6 +11,7 @@
 #include <cstring>
 #include <fstream>
 #include <functional>
+#include <map>
 #include <mutex>
 #include <numeric>
 #include <set>
@@ -747,6 +748,21 @@ onnx::ModelProto EliminateUnusedInitializer(const onnx::ModelProto& model) {
 // mutated).
 void _InferShapes(onnx::ModelProto& model) {
   onnx::shape_inference::InferShapes(model);
+}
+
+// Same as ``_InferShapes``, but also reports whether shape inference actually
+// inferred or updated any value's type/shape this call (``onnx::onnx``'s
+// InferShapes optionally counts this itself, so no extra pass over the model
+// is needed). Used by OptAndShape's fast-path fixed point below to tell
+// whether this round changed anything without hashing the whole model.
+void _InferShapes(onnx::ModelProto& model, bool* changed) {
+  size_t num_inferred_values = 0;
+  onnx::shape_inference::InferShapes(
+      model, onnx::OpSchemaRegistry::Instance(), onnx::ShapeInferenceOptions(),
+      /*generated_shape_data_by_name=*/nullptr, &num_inferred_values);
+  if (changed) {
+    *changed = num_inferred_values > 0;
+  }
 }
 
 // Build a lookup from tensor name to its type, gathering shapes from every
@@ -1676,7 +1692,16 @@ onnx::ModelProto _FoldConstant(const ModelExecutor& executor,
   }
 }
 
-onnx::ModelProto Optimize(const onnx::ModelProto& model) {
+// ``changed``, if non-null, is set to whether onnx-optimizer's own internal
+// fixed point (``OptimizeFixed`` already runs every pass to convergence
+// itself) modified the graph at all this call: it sums the per-pass
+// transform counts from the optional report onnx-optimizer can produce. Every
+// pass reachable through onnxsim's default pass list (built from
+// ``GetFuseAndEliminationPass()``, see onnxsim/optimizer's transform_counts
+// reporting) is count-based, so this sum is an accurate "did anything
+// change" signal, not just a hint -- used by OptAndShape's fast-path fixed
+// point below to skip hashing the whole model when it is false.
+onnx::ModelProto Optimize(const onnx::ModelProto& model, bool* changed = nullptr) {
   // Make onnxsim's own optimizer passes available to onnxoptimizer's registry
   // (idempotent) so config.optimizer_passes may name them.
   onnxsim::RegisterCustomOptimizerPasses();
@@ -1686,9 +1711,19 @@ onnx::ModelProto Optimize(const onnx::ModelProto& model) {
   const bool prev = onnx::optimization::InitializersAsConstants();
   onnx::optimization::SetInitializersAsConstants(
       config.initializers_as_constants);
-  auto result =
-      onnx::optimization::OptimizeFixed(model, config.optimizer_passes);
+  std::map<std::string, unsigned int> report;
+  auto result = onnx::optimization::OptimizeFixed(
+      model, config.optimizer_passes, changed ? &report : nullptr);
   onnx::optimization::SetInitializersAsConstants(prev);
+  if (changed) {
+    *changed = false;
+    for (const auto& pass_count : report) {
+      if (pass_count.second != 0) {
+        *changed = true;
+        break;
+      }
+    }
+  }
   return result;
 }
 
@@ -1882,6 +1917,61 @@ std::function<void(T&)> FixedPointFn(const std::function<void(T&)>& f1,
 template <typename T>
 std::function<void(T&)> FixedPointFn(const std::function<void(T&)>& f1,
                                      const std::function<void(T&)>& f2,
+                                     size_t max_iters) {
+  return FixedPointFn(f1, f2, max_iters, nullptr);
+}
+
+// Same convergence algorithm as the ``Fingerprint``-based ``FixedPointFn``
+// above, specialized for transforms that can cheaply report whether they
+// changed the model themselves (``f1``/``f2`` return true iff they did),
+// instead of hashing the whole serialized model after every call. This skips
+// ``Fingerprint()`` entirely, which matters most here because this is the
+// innermost, most-frequently-run fixed point (``OptAndShape`` below runs
+// every simplification round). It is only as safe as ``f1``/``f2``'s own
+// signal: both onnx-optimizer's per-pass transform counts and onnx's
+// InferShapes value-change count are exact for onnxsim's pass list (no
+// pass with an ``Empty``/uncounted analysis type is used), so a ``false``
+// return means that call provably made no change -- not just "probably".
+// A false negative here (missing a real change) would still not produce an
+// incorrect model: it only makes this inner loop stop one round early, and
+// the fingerprint-based fixed point one level up (which wraps every call
+// to ``OptAndShape`` as a whole) re-drives it from the top if that whole
+// call's net effect changed anything, same as a ``Fingerprint`` hash
+// collision would.
+template <typename T>
+std::function<void(T&)> FixedPointFn(const std::function<bool(T&)>& f1,
+                                     const std::function<bool(T&)>& f2,
+                                     size_t max_iters, bool* converged) {
+  return [f1, f2, max_iters, converged](T& model) -> void {
+    size_t _max_iters = max_iters;
+    f1(model);
+    bool last_changed = f2(model);
+    while (_max_iters-- > 0) {
+      if (!last_changed) {
+        if (converged) {
+          *converged = true;
+        }
+        return;
+      }
+      last_changed = f1(model);
+      if (!last_changed) {
+        if (converged) {
+          *converged = true;
+        }
+        return;
+      }
+      last_changed = f2(model);
+    }
+
+    if (converged) {
+      *converged = false;
+    }
+  };
+}
+
+template <typename T>
+std::function<void(T&)> FixedPointFn(const std::function<bool(T&)>& f1,
+                                     const std::function<bool(T&)>& f2,
                                      size_t max_iters) {
   return FixedPointFn(f1, f2, max_iters, nullptr);
 }
@@ -2205,7 +2295,19 @@ onnx::ModelProto Simplify(
   } else {
     FoldConstant = Identity;
   }
-  ModelFn InferShapes = shape_inference ? _InferShapes : Identity;
+  // Bool-returning counterparts of InferShapes/Optimize, used to build
+  // OptAndShape's fast-path fixed point below (see the ``std::function<bool(T&)>``
+  // overload of ``FixedPointFn``): each reports whether it actually changed
+  // the model, so that inner loop can skip Fingerprint hashing entirely.
+  using ModelFnChanged = std::function<bool(onnx::ModelProto&)>;
+  ModelFnChanged InferShapesReportingChange =
+      shape_inference
+          ? ModelFnChanged([](onnx::ModelProto& model) {
+              bool changed = false;
+              _InferShapes(model, &changed);
+              return changed;
+            })
+          : ModelFnChanged([](onnx::ModelProto&) { return false; });
   // ``Optimize`` builds a fresh model (``OptimizeFixed`` returns a new proto),
   // so wrap it as an in-place transform that move-assigns the result back.
   // ``perform_optimization=False`` (skip_optimizers == nullopt) means the
@@ -2213,14 +2315,19 @@ onnx::ModelProto Simplify(
   // which relies on dead-end elimination to clean up behind it -- runs with the
   // optimizer or not at all.
   const bool optimize = skip_optimizers.has_value();
-  ModelFn OptimizeInPlace = [optimize](onnx::ModelProto& model) {
-    if (optimize) {
-      // Unset all-zero recurrent initial states (issue #314) so the subgraph
-      // computing them becomes dead and the passes below can remove it.
-      EliminateZeroRnnInitialState(model);
-    }
-    model = Optimize(model);
-  };
+  ModelFnChanged OptimizeInPlaceReportingChange =
+      [optimize](onnx::ModelProto& model) {
+        if (optimize) {
+          // Unset all-zero recurrent initial states (issue #314) so the
+          // subgraph computing them becomes dead and the passes below can
+          // remove it. Not reflected in Optimize()'s own change signal, but
+          // that is safe: see FixedPointFn's bool-returning overload comment.
+          EliminateZeroRnnInitialState(model);
+        }
+        bool changed = false;
+        model = Optimize(model, &changed);
+        return changed;
+      };
 
   int fixed_point_iters =
       std::getenv("ONNXSIM_FIXED_POINT_ITERS")
@@ -2276,11 +2383,22 @@ onnx::ModelProto Simplify(
       fn(model);
     };
   };
+  auto ProfiledChanged = [](const char* name,
+                            ModelFnChanged fn) -> ModelFnChanged {
+    if (!onnxsim::Profiler::Instance().enabled()) {
+      return fn;
+    }
+    return [name, fn = std::move(fn)](onnx::ModelProto& model) {
+      onnxsim::ProfiledScope scope(name);
+      return fn(model);
+    };
+  };
 
   ModelFn OptAndShape = Profiled(
       "OptAndShape",
-      FixedPointFn(Profiled("InferShapes", InferShapes),
-                   Profiled("Optimize", OptimizeInPlace), fixed_point_iters));
+      FixedPointFn(ProfiledChanged("InferShapes", InferShapesReportingChange),
+                   ProfiledChanged("Optimize", OptimizeInPlaceReportingChange),
+                   fixed_point_iters));
   bool converged = false;
   ModelFn Pipeline;
   if (rewriter) {
