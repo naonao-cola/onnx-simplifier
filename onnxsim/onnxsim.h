@@ -4,6 +4,8 @@
 
 #include <memory>
 #include <optional>
+#include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "dlpack/dlpack.h"
@@ -94,6 +96,15 @@ std::shared_ptr<const ModelExecutor> GetBuiltinModelExecutor();
 // inference and constant folding can see through them; schema-defined
 // (built-in) functions are left alone. With the default the model's functions
 // are left untouched.
+// ``mutable_initializer`` (default true, i.e. skip) additionally folds an
+// initializer that also appears as a graph input, like any other constant,
+// when set to false -- see RemoveInitializerFromInput's own comment.
+// ``overwrite_input_shapes``, when set, overwrites the named graph inputs'
+// shape dims with the given values (a non-positive entry keeps the original,
+// possibly dynamic, dimension). ``unused_output``, when set, drops the named
+// graph outputs before simplification so dead-end elimination cleans up
+// nodes that only fed them. Both throw std::runtime_error if a name does
+// not match an existing graph input/output.
 onnx::ModelProto Simplify(
     const ModelExecutor& executor, const onnx::ModelProto& model,
     std::optional<std::vector<std::string>> skip_optimizers,
@@ -101,7 +112,11 @@ onnx::ModelProto Simplify(
     std::optional<int> target_opset_version = std::nullopt,
     const GraphRewriter* rewriter = nullptr,
     bool initializers_as_constants = true,
-    bool include_inline_functions = false);
+    bool include_inline_functions = false, bool mutable_initializer = true,
+    const std::optional<std::unordered_map<std::string, std::vector<int64_t>>>&
+        overwrite_input_shapes = std::nullopt,
+    const std::optional<std::vector<std::string>>& unused_output =
+        std::nullopt);
 
 // Debugging helpers: run a *single* one of the transforms that ``Simplify``
 // otherwise drives to a fixed point, once, on a copy of ``model``, and return
@@ -123,13 +138,16 @@ onnx::ModelProto FoldConstantOnce(const ModelExecutor& executor,
                                   size_t tensor_size_threshold,
                                   bool initializers_as_constants = true);
 
-void SimplifyPath(const ModelExecutor& executor, const std::string& in_path,
-                  const std::string& out_path,
-                  std::optional<std::vector<std::string>> skip_optimizers,
-                  bool constant_folding, bool shape_inference,
-                  size_t tensor_size_threshold,
-                  std::optional<int> target_opset_version = std::nullopt,
-                  const GraphRewriter* rewriter = nullptr,
-                  bool initializers_as_constants = true,
-                  bool include_inline_functions = false,
-                  bool mutable_initializer = true);
+void SimplifyPath(
+    const ModelExecutor& executor, const std::string& in_path,
+    const std::string& out_path,
+    std::optional<std::vector<std::string>> skip_optimizers,
+    bool constant_folding, bool shape_inference, size_t tensor_size_threshold,
+    std::optional<int> target_opset_version = std::nullopt,
+    const GraphRewriter* rewriter = nullptr,
+    bool initializers_as_constants = true,
+    bool include_inline_functions = false, bool mutable_initializer = true,
+    const std::optional<std::unordered_map<std::string, std::vector<int64_t>>>&
+        overwrite_input_shapes = std::nullopt,
+    const std::optional<std::vector<std::string>>& unused_output =
+        std::nullopt);
