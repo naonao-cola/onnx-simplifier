@@ -7,6 +7,7 @@
 #include <onnx/onnx_pb.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <fstream>
@@ -2165,6 +2166,41 @@ std::optional<int> DefaultOpsetVersion(const onnx::ModelProto& model) {
   return std::nullopt;
 }
 
+// Mirrors onnx_simplifier.py's remove_initializer_from_input: an initializer
+// that also appears in graph.input is treated as a runtime input by
+// onnxoptimizer's is_constant_initializer, which blocks value-baking fusions
+// (fuse_bn_into_conv, ...) that only work on non-input initializers -- e.g.
+// the plain Conv+BN chains of the opset-8 resnet101-v1-7 were left completely
+// unsimplified without this. Removing it from the input list lets it fold
+// like any other constant. Kept in sync with the Python function; see that
+// one's own comment for the opset-6 floor (Cast's `to` attribute's INT
+// encoding wasn't valid before opset 6, so bumping an old-IR/old-opset model
+// to IR 4 here would let a later fusion emit a node the opset rejects).
+void RemoveInitializerFromInput(onnx::ModelProto& model) {
+  constexpr int kMinOpsetForInitializerFold = 6;
+  if (model.ir_version() < 4) {
+    const auto opset = DefaultOpsetVersion(model);
+    if (!opset || *opset < kMinOpsetForInitializerFold) {
+      return;
+    }
+  }
+  std::set<std::string> initializer_names;
+  for (const auto& init : model.graph().initializer()) {
+    initializer_names.insert(init.name());
+  }
+  auto* inputs = model.mutable_graph()->mutable_input();
+  bool removed_any = false;
+  for (int i = inputs->size() - 1; i >= 0; --i) {
+    if (initializer_names.count((*inputs)[i].name()) > 0) {
+      inputs->erase(inputs->begin() + i);
+      removed_any = true;
+    }
+  }
+  if (removed_any && model.ir_version() < 4) {
+    model.set_ir_version(4);
+  }
+}
+
 // Convert the default ONNX domain of the model to target_version using onnx's
 // own version converter. Only the default ONNX domain opset is changed;
 // custom/other-domain opset imports are left untouched. Returns the model
@@ -2728,14 +2764,69 @@ void SimplifyPath(const ModelExecutor& executor, const std::string& in_path,
                   size_t tensor_size_threshold,
                   std::optional<int> target_opset_version,
                   const GraphRewriter* rewriter, bool initializers_as_constants,
-                  bool include_inline_functions) {
+                  bool include_inline_functions, bool mutable_initializer) {
+  const bool debug_timing = std::getenv("ONNXSIM_DEBUG_PATH_TIMING") != nullptr;
+  auto now = []() { return std::chrono::steady_clock::now(); };
+  auto elapsed_ms = [](auto t0, auto t1) {
+    return std::chrono::duration<double, std::milli>(t1 - t0).count();
+  };
+
   onnx::ModelProto model;
-  onnx::optimization::loadModel(&model, in_path, true);
+  {
+    const auto t0 = now();
+    onnx::optimization::loadModel(&model, in_path, true);
+    if (debug_timing) {
+      std::cerr << "SimplifyPath: loadModel " << elapsed_ms(t0, now())
+                << "ms\n";
+    }
+  }
 
-  model =
-      Simplify(executor, model, skip_optimizers, constant_folding,
-               shape_inference, tensor_size_threshold, target_opset_version,
-               rewriter, initializers_as_constants, include_inline_functions);
+  // Matches onnx_simplifier.py's default (mutable_initializer=False): fold
+  // initializers that also appear as graph inputs like any other constant.
+  // Defaults to true (skip) so callers that predate this parameter (the C
+  // API, and Python's pre-existing >2GB fallback, which already applies the
+  // equivalent transform itself in Python before ever reaching this
+  // function) see no behavior change.
+  if (!mutable_initializer) {
+    RemoveInitializerFromInput(model);
+  }
 
-  onnx::optimization::saveModel(&model, out_path, true, "");
+  {
+    const auto t0 = now();
+    model =
+        Simplify(executor, model, skip_optimizers, constant_folding,
+                 shape_inference, tensor_size_threshold, target_opset_version,
+                 rewriter, initializers_as_constants, include_inline_functions);
+    if (debug_timing) {
+      std::cerr << "SimplifyPath: Simplify " << elapsed_ms(t0, now()) << "ms\n";
+    }
+  }
+
+  // Prefer a single self-contained inline file over external data: onnx's
+  // own checker (onnx.checker.check_model, called by every Python caller's
+  // correctness check) is drastically slower validating an external-data
+  // model than an equivalent inline one -- 18.6s vs ~4s measured on an
+  // 833MB model, apparently from re-reading/re-validating the sibling data
+  // file rather than working off the already-parsed in-memory tensors. Only
+  // fall back to external data when the model does not fit in a single
+  // protobuf message (the 2GB limit `saveModel`'s unconditional external-
+  // data write used to sidestep unconditionally).
+  constexpr size_t kProtobufSizeLimit = (size_t(2) << 30) - 9999;
+  bool needs_external_data;
+  {
+    const auto t0 = now();
+    needs_external_data = model.ByteSizeLong() >= kProtobufSizeLimit;
+    if (debug_timing) {
+      std::cerr << "SimplifyPath: ByteSizeLong " << elapsed_ms(t0, now())
+                << "ms\n";
+    }
+  }
+  {
+    const auto t0 = now();
+    onnx::optimization::saveModel(&model, out_path, needs_external_data, "");
+    if (debug_timing) {
+      std::cerr << "SimplifyPath: saveModel " << elapsed_ms(t0, now())
+                << "ms\n";
+    }
+  }
 }

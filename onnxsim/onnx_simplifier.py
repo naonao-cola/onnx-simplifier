@@ -48,6 +48,15 @@ UNIT_MAP: dict[Unit, int] = {
 }
 
 
+def parse_size(size: str) -> int:
+    m = re.fullmatch(r"([\d.]+)\s*([KMGT]?B)", size.strip(), re.I)
+    if not m:
+        raise ValueError(size)
+    number: float = float(m.group(1))
+    unit: Unit = m.group(2).upper()  # type: ignore
+    return int(number * UNIT_MAP[unit])
+
+
 def get_output_names(model: onnx.ModelProto) -> List[str]:
     output_names = [opt.name for opt in model.graph.output]
     return output_names
@@ -598,6 +607,81 @@ def simplify(
 
     if skip_fuse_bn and skipped_optimizers is not None:
         skipped_optimizers.append("fuse_bn_into_conv")
+
+    # Fast path: called with a file path and none of the Python-side-only
+    # transforms below requested (input-shape overwrite, unused-output
+    # removal), with no ``check_n`` verification (which needs the original
+    # model loaded anyway to compare against). Hands the file straight to
+    # the C++ core's native path-based entry point (``C.simplify_path``),
+    # skipping the Python-level parse-then-reserialize round trip a large
+    # model otherwise pays crossing into C++ -- every initializer's bytes
+    # get materialized into a Python ``ModelProto``, serialized back to a
+    # byte string, and reparsed on the C++ side, all before simplification
+    # even starts. On an 833MB model this dwarfs the actual simplification
+    # work (tens of seconds of marshalling for ~5 seconds of real work).
+    # Falls back to the standard path below on ANY exception -- e.g. a model
+    # whose tensors onnxoptimizer's CSE cannot hash (issue #348), which the
+    # standard path detects and works around in Python before ever calling
+    # into C++ -- so this is never less correct than before, only sometimes
+    # not faster. One accepted gap: ``doc_string`` fields (issue #428) are
+    # not preserved on this path, since preserving them requires the very
+    # Python-side parse this path exists to avoid; real exporters rarely
+    # populate ``doc_string`` in the first place.
+    if (
+        isinstance(model, str)
+        and check_n == 0
+        and not overwrite_input_shapes
+        and not test_input_shapes
+        and input_shapes is None
+        and unused_output is None
+    ):
+        _fast_threshold_bytes = parse_size(tensor_size_threshold)
+        if _fast_threshold_bytes <= 2**31 - 9999:
+            _fast_prev_profile_env = None
+            _fast_profile_active = profile is not None
+            _fast_profile_path = profile or "onnxsim_profile.json"
+            if _fast_profile_active:
+                _fast_prev_profile_env = os.environ.get("ONNXSIM_PROFILE")
+                os.environ["ONNXSIM_PROFILE"] = _fast_profile_path
+            try:
+                with tempfile.TemporaryDirectory() as tmpdirname:
+                    fast_out_path = os.path.join(tmpdirname, "opt.onnx")
+                    C.simplify_path(
+                        _get_model_executor(providers),
+                        model,
+                        fast_out_path,
+                        skipped_optimizers,
+                        not skip_constant_folding,
+                        not skip_shape_inference,
+                        _fast_threshold_bytes,
+                        target_opset_version,
+                        rewriter,
+                        initializers_as_constants,
+                        inline_functions,
+                        mutable_initializer,
+                    )
+                    model_opt = onnx.load(fast_out_path)
+                check_ok = model_checking.compare(
+                    model_opt,
+                    None,
+                    0,
+                    test_input_shapes,
+                    input_data,
+                    custom_lib,
+                    rtol=check_rtol,
+                    atol=check_atol,
+                    input_fill=input_fill,
+                )
+                return model_opt, check_ok
+            except Exception:
+                pass
+            finally:
+                if _fast_profile_active:
+                    if _fast_prev_profile_env is None:
+                        os.environ.pop("ONNXSIM_PROFILE", None)
+                    else:
+                        os.environ["ONNXSIM_PROFILE"] = _fast_prev_profile_env
+
     # Track whether we own the in-memory model. When the caller passes a file
     # path we load it here, so the resulting ``ModelProto`` is private to this
     # function and may be mutated freely (e.g. saved as external data without a
@@ -677,14 +761,6 @@ def simplify(
     # fields on the model, graph and input/output value infos. Snapshot them
     # here so they can be restored on the simplified model (GitHub issue #428).
     doc_strings = _snapshot_doc_strings(model)
-
-    def parse_size(size: str) -> int:
-        m = re.fullmatch(r"([\d.]+)\s*([KMGT]?B)", size.strip(), re.I)
-        if not m:
-            raise ValueError(size)
-        number: float = float(m.group(1))
-        unit: Unit = m.group(2).upper()  # type: ignore
-        return int(number * UNIT_MAP[unit])
 
     tensor_size_threshold_bytes = parse_size(tensor_size_threshold)
     if tensor_size_threshold_bytes > 2**31 - 9999:

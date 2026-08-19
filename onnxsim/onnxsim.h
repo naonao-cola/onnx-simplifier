@@ -131,4 +131,5 @@ void SimplifyPath(const ModelExecutor& executor, const std::string& in_path,
                   std::optional<int> target_opset_version = std::nullopt,
                   const GraphRewriter* rewriter = nullptr,
                   bool initializers_as_constants = true,
-                  bool include_inline_functions = false);
+                  bool include_inline_functions = false,
+                  bool mutable_initializer = true);
