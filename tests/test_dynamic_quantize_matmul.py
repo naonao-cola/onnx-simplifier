@@ -15,9 +15,13 @@ import numpy as np
 import onnx
 import onnx.helper
 import onnx.numpy_helper
-import onnxruntime as ort
+import pytest
 
 import onnxsim
+
+# A bare ``import onnxruntime`` would fail collection (not skip the test) on
+# platforms onnxruntime doesn't ship wheels for (e.g. s390x).
+ort = pytest.importorskip("onnxruntime")
 
 
 def _model(nodes, inputs, outputs, initializer, opset=13):
