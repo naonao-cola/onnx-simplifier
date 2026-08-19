@@ -159,8 +159,11 @@ bool IsQDQ(const std::string& domain, const std::string& op) {
   return false;
 }
 
-auto FindInitializerByName(const onnx::ModelProto& model,
-                           const std::string& name) {
+// Returns a reference into `model`'s own initializer list rather than a copy:
+// callers that only read the tensor (the common case) avoid deep-copying its
+// raw_data bytes just to look it up.
+const onnx::TensorProto& FindInitializerByName(const onnx::ModelProto& model,
+                                               const std::string& name) {
   for (const auto& initializer : model.graph().initializer()) {
     if (initializer.name() == name) {
       return initializer;
@@ -371,7 +374,11 @@ std::vector<onnx::TensorProto> RunOps(
     const std::unordered_map<std::string, const onnx::NodeProto*>&
         deferred_producers) {
   std::vector<std::string> input_names;
-  std::vector<onnx::TensorProto> input_tps;
+  // Pointers borrow directly from `model`'s own initializers -- `model` is
+  // const and not touched again until every pointer here has been consumed
+  // (by the DLPack bridge below, within this same call), so this avoids
+  // deep-copying each constant input's raw_data just to feed the executor.
+  std::vector<const onnx::TensorProto*> input_tps;
   // Names already emitted as a feed or an initializer of the sub-model, so a
   // constant shared by several grouped nodes is added exactly once.
   std::set<std::string> seen_inputs;
@@ -448,13 +455,13 @@ std::vector<onnx::TensorProto> RunOps(
           if (!seen_inputs.insert(input).second) {
             continue;
           }
-          auto in_tp = FindInitializerByName(model, input);
+          const auto& in_tp = FindInitializerByName(model, input);
           if (in_tp.dims().size() == 1 && in_tp.dims()[0] == 0) {
             *op_model.mutable_graph()->add_initializer() = in_tp;
             continue;
           }
           input_names.push_back(input);
-          input_tps.push_back(in_tp);
+          input_tps.push_back(&in_tp);
         }
         *op_model.mutable_graph()->add_node() = node;
       };
@@ -506,8 +513,8 @@ std::vector<onnx::TensorProto> RunOps(
   {
     onnxsim::ProfiledScope dlpack_input_scope("DLPackInputBridge");
     input_dls.reserve(input_tps.size());
-    for (const auto& tp : input_tps) {
-      input_dls.emplace_back(onnxsim::dlpack::FromTensorProtoBorrowing(tp));
+    for (const auto* tp : input_tps) {
+      input_dls.emplace_back(onnxsim::dlpack::FromTensorProtoBorrowing(*tp));
     }
     input_ptrs.reserve(input_dls.size());
     for (const auto& p : input_dls) input_ptrs.push_back(p.get());
@@ -734,27 +741,28 @@ void CollectUsedTensorNames(const onnx::GraphProto& graph,
 // dangling weights are duplicated in the graph, which can push the model past
 // the 2GB protobuf limit before the onnx optimizer gets a chance to remove
 // them (issue #174).
-onnx::ModelProto EliminateUnusedInitializer(const onnx::ModelProto& model) {
-  onnx::ModelProto result;
-  result.CopyFrom(model);
-
+// Takes `model` by value and mutates it in place rather than copying into a
+// separate `result`: every caller already owns a private, uniquely-held copy
+// by this point and passes it via std::move, so this is a cheap move-in, not
+// a deep copy of the (potentially huge) initializer bytes.
+onnx::ModelProto EliminateUnusedInitializer(onnx::ModelProto model) {
   std::set<std::string> used;
-  CollectUsedTensorNames(result.graph(), used);
+  CollectUsedTensorNames(model.graph(), used);
   // Keep initializers that double as graph inputs (their default value);
   // dropping them would silently turn them into required inputs.
-  for (const auto& input : result.graph().input()) {
+  for (const auto& input : model.graph().input()) {
     used.insert(input.name());
   }
 
   google::protobuf::RepeatedPtrField<onnx::TensorProto> kept;
-  for (auto& initializer : *result.mutable_graph()->mutable_initializer()) {
+  for (auto& initializer : *model.mutable_graph()->mutable_initializer()) {
     if (used.count(initializer.name()) > 0) {
       *kept.Add() = std::move(initializer);
     }
   }
-  result.mutable_graph()->mutable_initializer()->Swap(&kept);
+  model.mutable_graph()->mutable_initializer()->Swap(&kept);
 
-  return result;
+  return model;
 }
 
 // Mutates the model in place; ``onnx::shape_inference::InferShapes`` already
@@ -1616,111 +1624,108 @@ void FoldGroup(const ModelExecutor& executor, onnx::ModelProto& model,
   }
 }
 
+// Takes `model` by value rather than `const&`: both call sites pass an
+// rvalue (std::move of a local they immediately overwrite with the return
+// value), so this is a cheap move-construction -- a pointer/buffer swap --
+// not a deep copy of the model's initializer bytes. `model` is then this
+// function's own uniquely-owned working copy, mutated in place throughout.
 onnx::ModelProto _FoldConstant(const ModelExecutor& executor,
-                               const onnx::ModelProto& model) {
-  const auto& tmp = model;
+                               onnx::ModelProto model) {
+  ConstantNodePartition partition;
   {
-    onnx::ModelProto model;
-    {
-      onnxsim::ProfiledScope copy_scope("CopyModel");
-      model.CopyFrom(tmp);
-    }
-    ConstantNodePartition partition;
-    {
-      onnxsim::ProfiledScope analysis_scope("GetConstantNodes");
-      partition = GetConstantNodes(model);
-    }
-    const auto& const_nodes = partition.const_nodes;
-    // Map each deferred node's output to the producing node so RunOps can
-    // inline it into the sub-model executed when folding a downstream consumer.
-    // The pointers stay valid for the loop below: folding only appends
-    // initializers to the graph and never touches its node list.
-    std::unordered_map<std::string, const onnx::NodeProto*> deferred_producers;
-    if (!partition.deferred_outputs.empty()) {
-      for (const auto& node : model.graph().node()) {
-        for (const auto& output : node.output()) {
-          if (partition.deferred_outputs.count(output) > 0) {
-            deferred_producers.emplace(output, &node);
-          }
-        }
-      }
-    }
-    // Look up each tensor's inferred shape so batches can be capped by the
-    // bytes they would materialize (see below). Pointers reference `model`,
-    // which is not mutated (only appended to) while the map is in use.
-    std::unordered_map<std::string, const onnx::ValueInfoProto*> vi_map;
-    for (const auto& vi : model.graph().value_info()) {
-      vi_map[vi.name()] = &vi;
-    }
-    // Fold the const nodes in batches: one Session per batch instead of one per
-    // node. `const_nodes` is topologically sorted, so a batch is a contiguous
-    // slice and a later batch reads any earlier batch's outputs as ordinary
-    // initializers. Two budgets bound ORT's peak memory: a batch is closed once
-    // its outputs would exceed kBatchByteBudget or it reaches kBatchMaxNodes.
-    // Nodes that consume a deferred (large-tensor) output are folded on their
-    // own so the large intermediate is materialized transiently for just that
-    // node, exactly as in the per-node path.
-    constexpr size_t kBatchByteBudget = size_t(256) << 20;  // 256 MiB
-    constexpr size_t kBatchMaxNodes = 1024;
-    auto consumes_deferred = [&](const onnx::NodeProto& node) {
-      if (partition.deferred_outputs.empty()) {
-        return false;
-      }
-      for (const auto& input : node.input()) {
-        if (partition.deferred_outputs.count(input) > 0) {
-          return true;
-        }
-      }
-      return false;
-    };
-    // Outputs of const nodes that were successfully folded into initializers.
-    std::set<std::string> folded_outputs;
-    const size_t num_const_nodes = const_nodes.size();
-    for (size_t i = 0; i < num_const_nodes;) {
-      if (consumes_deferred(const_nodes[i])) {
-        FoldGroup(executor, model, const_nodes, i, i + 1, deferred_producers,
-                  folded_outputs);
-        i++;
-        continue;
-      }
-      size_t j = i;
-      size_t bytes = 0;
-      while (j < num_const_nodes && j - i < kBatchMaxNodes &&
-             !consumes_deferred(const_nodes[j])) {
-        const size_t node_bytes = EstimateOutputBytes(vi_map, const_nodes[j]);
-        if (j > i && bytes + node_bytes > kBatchByteBudget) {
-          break;
-        }
-        bytes += node_bytes;
-        j++;
-      }
-      FoldGroup(executor, model, const_nodes, i, j, deferred_producers,
-                folded_outputs);
-      i = j;
-    }
-    // Rebuild the node list in its original topological order, dropping only
-    // the const nodes that were successfully folded into initializers. A const
-    // node that failed to fold must keep its original position: appending it to
-    // the end can place it after a non-const consumer (e.g. a Loop reading a
-    // SequenceEmpty output), which breaks topological sorting and makes the
-    // resulting model fail onnx's checker (issues #238, #335, #352).
-    {
-      onnxsim::ProfiledScope rebuild_scope("RebuildNodeList");
-      google::protobuf::RepeatedPtrField<onnx::NodeProto> original_nodes;
-      original_nodes.Swap(model.mutable_graph()->mutable_node());
-      for (auto& node : original_nodes) {
-        const bool folded =
-            node.output_size() > 0 && folded_outputs.count(node.output(0)) > 0;
-        if (!folded) {
-          *model.mutable_graph()->add_node() = std::move(node);
-        }
-      }
-    }
-    // Drop initializers left dangling by folding so the intermediate model does
-    // not balloon in size (issue #174).
-    onnxsim::ProfiledScope eliminate_scope("EliminateUnusedInitializerScope");
-    return EliminateUnusedInitializer(model);
+    onnxsim::ProfiledScope analysis_scope("GetConstantNodes");
+    partition = GetConstantNodes(model);
   }
+  const auto& const_nodes = partition.const_nodes;
+  // Map each deferred node's output to the producing node so RunOps can
+  // inline it into the sub-model executed when folding a downstream consumer.
+  // The pointers stay valid for the loop below: folding only appends
+  // initializers to the graph and never touches its node list.
+  std::unordered_map<std::string, const onnx::NodeProto*> deferred_producers;
+  if (!partition.deferred_outputs.empty()) {
+    for (const auto& node : model.graph().node()) {
+      for (const auto& output : node.output()) {
+        if (partition.deferred_outputs.count(output) > 0) {
+          deferred_producers.emplace(output, &node);
+        }
+      }
+    }
+  }
+  // Look up each tensor's inferred shape so batches can be capped by the
+  // bytes they would materialize (see below). Pointers reference `model`,
+  // which is not mutated (only appended to) while the map is in use.
+  std::unordered_map<std::string, const onnx::ValueInfoProto*> vi_map;
+  for (const auto& vi : model.graph().value_info()) {
+    vi_map[vi.name()] = &vi;
+  }
+  // Fold the const nodes in batches: one Session per batch instead of one per
+  // node. `const_nodes` is topologically sorted, so a batch is a contiguous
+  // slice and a later batch reads any earlier batch's outputs as ordinary
+  // initializers. Two budgets bound ORT's peak memory: a batch is closed once
+  // its outputs would exceed kBatchByteBudget or it reaches kBatchMaxNodes.
+  // Nodes that consume a deferred (large-tensor) output are folded on their
+  // own so the large intermediate is materialized transiently for just that
+  // node, exactly as in the per-node path.
+  constexpr size_t kBatchByteBudget = size_t(256) << 20;  // 256 MiB
+  constexpr size_t kBatchMaxNodes = 1024;
+  auto consumes_deferred = [&](const onnx::NodeProto& node) {
+    if (partition.deferred_outputs.empty()) {
+      return false;
+    }
+    for (const auto& input : node.input()) {
+      if (partition.deferred_outputs.count(input) > 0) {
+        return true;
+      }
+    }
+    return false;
+  };
+  // Outputs of const nodes that were successfully folded into initializers.
+  std::set<std::string> folded_outputs;
+  const size_t num_const_nodes = const_nodes.size();
+  for (size_t i = 0; i < num_const_nodes;) {
+    if (consumes_deferred(const_nodes[i])) {
+      FoldGroup(executor, model, const_nodes, i, i + 1, deferred_producers,
+                folded_outputs);
+      i++;
+      continue;
+    }
+    size_t j = i;
+    size_t bytes = 0;
+    while (j < num_const_nodes && j - i < kBatchMaxNodes &&
+           !consumes_deferred(const_nodes[j])) {
+      const size_t node_bytes = EstimateOutputBytes(vi_map, const_nodes[j]);
+      if (j > i && bytes + node_bytes > kBatchByteBudget) {
+        break;
+      }
+      bytes += node_bytes;
+      j++;
+    }
+    FoldGroup(executor, model, const_nodes, i, j, deferred_producers,
+              folded_outputs);
+    i = j;
+  }
+  // Rebuild the node list in its original topological order, dropping only
+  // the const nodes that were successfully folded into initializers. A const
+  // node that failed to fold must keep its original position: appending it to
+  // the end can place it after a non-const consumer (e.g. a Loop reading a
+  // SequenceEmpty output), which breaks topological sorting and makes the
+  // resulting model fail onnx's checker (issues #238, #335, #352).
+  {
+    onnxsim::ProfiledScope rebuild_scope("RebuildNodeList");
+    google::protobuf::RepeatedPtrField<onnx::NodeProto> original_nodes;
+    original_nodes.Swap(model.mutable_graph()->mutable_node());
+    for (auto& node : original_nodes) {
+      const bool folded =
+          node.output_size() > 0 && folded_outputs.count(node.output(0)) > 0;
+      if (!folded) {
+        *model.mutable_graph()->add_node() = std::move(node);
+      }
+    }
+  }
+  // Drop initializers left dangling by folding so the intermediate model does
+  // not balloon in size (issue #174).
+  onnxsim::ProfiledScope eliminate_scope("EliminateUnusedInitializerScope");
+  return EliminateUnusedInitializer(std::move(model));
 }
 
 // ``model`` is ``onnx::ModelProto&`` (not const): the call site below passes a
@@ -2216,7 +2221,7 @@ onnx::ModelProto FoldConstantOnce(const ModelExecutor& executor,
   // turns Shape/Gather-on-shape into constants that the ordinary constant
   // folder can then propagate.
   _EvalPartialShape(out);
-  out = _FoldConstant(executor, out);
+  out = _FoldConstant(executor, std::move(out));
   return out;
 }
 
@@ -2310,7 +2315,7 @@ onnx::ModelProto Simplify(
       // Partial shape evaluation (issue #139) turns Shape/Gather-on-shape into
       // constants that the ordinary constant folder can then propagate.
       _EvalPartialShape(model);
-      model = _FoldConstant(executor, model);
+      model = _FoldConstant(executor, std::move(model));
     };
   } else {
     FoldConstant = Identity;
