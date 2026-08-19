@@ -71,11 +71,9 @@ create_onnxsim({
         runtime.ENV.LOG_THRESHOLD = "-1";
     }],
     print: (str) => {
-        console.log("stdout:", str);
         postMessage(["stdout", str]);
     },
     printErr: (str) => {
-        console.error("stderr:", [str]);
         postMessage(["stderr", str]);
         // Augment the raw Emscripten OOM abort line with a human-readable hint.
         if (typeof str === "string" && str.includes("Cannot enlarge memory")) {
@@ -97,14 +95,84 @@ create_onnxsim({
     // happens now, so any file posted earlier would be dropped.
     postMessage(["ready"]);
 
+    // Decode a standalone safetensors/gguf archive into plain ONNX model
+    // bytes via the matching TensorPool import binding. Shared by the
+    // conversion pre-step below (which feeds the result into simplify/
+    // optimize) and the standalone "import_*" message (which just wants the
+    // decoded bytes to show in Netron -- see the "before" pane). Returns the
+    // decoded Uint8Array, or null if the archive has no embedded onnxsim
+    // model (e.g. a plain weights-only archive with no graph to import).
+    function importArchive(format, buf) {
+        const fn = format === "gguf" ?
+            runtime.onnxsim_import_gguf : runtime.onnxsim_import_safetensors;
+        return fn(buf);
+    }
+
     addEventListener("message", async (e) => {
-        console.log(e.data);
+        // Re-export already-converted model bytes into a standalone archive
+        // format for the page's download-format selector (safetensors / gguf).
+        // Kept separate from the convert switch below: this takes the already-
+        // converted bytes (not a raw upload) and needs none of the inline-
+        // functions / annotate-original pre-steps a fresh conversion runs.
+        if (e.data[0] === "export_safetensors" || e.data[0] === "export_gguf") {
+            const format = e.data[0] === "export_gguf" ? "gguf" : "safetensors";
+            const exportBuf = e.data[1];
+            const filename = e.data[2];
+            try {
+                const fn = format === "gguf" ?
+                    runtime.onnxsim_export_gguf : runtime.onnxsim_export_safetensors;
+                const bytes = fn(exportBuf);
+                if (!bytes) {
+                    postMessage(["export-format-error", format, format + " export failed!"]);
+                    return;
+                }
+                // Copy out of the wasm heap into a standalone ArrayBuffer (the
+                // view `bytes` aliases the module's own memory and cannot be
+                // transferred) and hand it to the main thread by transfer, not
+                // structured-clone. A safetensors/gguf archive embeds the whole
+                // model, easily tens of MB for a real model; a base64 data URL
+                // would encode it into an even bigger string, clone that whole
+                // string across the worker boundary, and then have the browser
+                // parse it back out of the anchor's href on click -- all of
+                // which a plain ArrayBuffer transfer + Blob URL skips.
+                const copy = bytes.slice();
+                postMessage(["export-format-done", format, copy.buffer, filename], [copy.buffer]);
+            } catch (err) {
+                postMessage(["export-format-error", format, String((err && err.message) || err)]);
+            }
+            return;
+        }
+        // Decode a safetensors/gguf upload into plain ONNX bytes without
+        // running it through simplify/optimize -- used by the "before" Netron
+        // pane (netron_view.mjs, via window.__onnxsimImportArchive) so it
+        // renders the actual model graph instead of the raw archive bytes.
+        if (e.data[0] === "import_safetensors" || e.data[0] === "import_gguf") {
+            const format = e.data[0] === "import_gguf" ? "gguf" : "safetensors";
+            const importBuf = e.data[1];
+            try {
+                const bytes = importArchive(format, importBuf);
+                if (!bytes) {
+                    postMessage(["import-format-error", format,
+                        `no embedded onnxsim model found in this ${format} file`]);
+                    return;
+                }
+                // Transfer, not base64 -- same reasoning as the export path
+                // above; the decoded model can be tens of MB.
+                const copy = bytes.slice();
+                postMessage(["import-format-done", format, copy.buffer], [copy.buffer]);
+            } catch (err) {
+                postMessage(["import-format-error", format, String((err && err.message) || err)]);
+            }
+            return;
+        }
         let buf = e.data[1];
         // The true uploaded bytes, kept aside so the "annotate the original for
         // the inference-compare panel" step below always sees the model the user
         // gave us, even when the inline pre-step replaces `buf` with the inlined
-        // model before the main transform runs.
-        const originalBuf = e.data[1];
+        // model before the main transform runs. Reassigned below (to the
+        // decoded ONNX bytes) when the upload was a safetensors/gguf archive,
+        // since the raw archive bytes are not a valid ONNX model on their own.
+        let originalBuf = e.data[1];
         // `model` is the converted model bytes (a Uint8Array view); `trace` is
         // the onnxsim profiling trace JSON for "simplify" when profiling was
         // requested, otherwise an empty string.
@@ -115,6 +183,25 @@ create_onnxsim({
         // user gets an explanation (see memoryLimitMessage) instead of the worker
         // dying with an opaque, unhandled error.
         try {
+        // Optional pre-step: the upload was a standalone safetensors/gguf
+        // archive (see the page's file picker), not a raw .onnx file -- decode
+        // it into an ordinary ONNX model first via the matching TensorPool
+        // import binding, so every transform below (and the "original" used
+        // for annotate/inference-compare) sees a plain ModelProto exactly like
+        // an .onnx upload would produce. No model executor needed, so this is
+        // synchronous in both module variants.
+        const source_format = e.data[11] || "onnx";
+        if (source_format === "safetensors" || source_format === "gguf") {
+            const imported = importArchive(source_format, buf);
+            if (!imported) {
+                postMessage(["stderr",
+                    `failed to import ${source_format}: no embedded onnxsim model ` +
+                    "found (a plain weights-only archive has no graph to import)"]);
+                return;
+            }
+            buf = new Uint8Array(imported).buffer;
+            originalBuf = buf;
+        }
         // Optional pre-step: inline the model's local functions before the main
         // transform, so onnx-optimizer / Simplify / constant folding see through
         // them into a plain op graph. Controlled by a checkbox (e.data[9]) and
@@ -220,9 +307,7 @@ create_onnxsim({
             postMessage(["stderr", e.data[0] + " failed!"]);
             return;
         }
-        console.log("to data url start")
         const data_url = "data:application/octet-stream;base64," + model.toBase64();
-        console.log("to data url end")
         // When "annotate model info" is on, also bake the MAC/FLOP metrics into
         // the *original* uploaded model so the "Run inference" panel can report
         // its throughput too — letting the user compare original vs converted

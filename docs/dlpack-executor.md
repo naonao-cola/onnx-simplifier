@@ -190,6 +190,16 @@ Consequences for the design:
 - `onnxsim/cpp2py_export.cc` — `PyModelExecutor` adapts DLPack ↔ bytes.
 - `onnxsim/capi/onnxsim_c_api.{h,cpp}` — `OnnxsimExecuteFn` +
   `onnxsim_simplify_with_executor`.
+- `tests/test_tvm_integration.py` (+ `.github/workflows/tvm-integration.yml`) —
+  regression test for the TVM embeddability claim above: feeds onnxsim's
+  simplified output into Apache TVM's Relax ONNX importer and checks it still
+  compiles and computes the same result.
+- `tests/test_halide_integration.py` (+ `.github/workflows/halide-integration.yml`) —
+  the same embeddability claim exercised against
+  [Halide](https://halide-lang.org/). Halide has no ready-made ONNX frontend,
+  so the test ships a small ONNX-subset-to-Halide lowering and checks that
+  onnxsim's simplified output still lowers, compiles, and computes the same
+  result as onnx's reference evaluator.
 
 ## Rust binding
 

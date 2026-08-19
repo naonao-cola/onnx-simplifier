@@ -1,39 +1,43 @@
 #include "onnxsim.h"
 
 #include <google/protobuf/arena.h>
+#include <google/protobuf/io/zero_copy_stream.h>
 #include <google/protobuf/text_format.h>
 #include <google/protobuf/util/message_differencer.h>
 #include <onnx/onnx_pb.h>
 
 #include <algorithm>
+#include <cstdint>
+#include <cstring>
 #include <fstream>
 #include <functional>
+#include <iomanip>
+#include <map>
 #include <mutex>
 #include <numeric>
 #include <set>
 #include <string>
 #include <type_traits>
 #include <unordered_map>
+#include <unordered_set>
+#include <vector>
 
-#ifndef NO_BUILTIN_ORT
-// Prebuilt ONNX Runtime releases (github.com/microsoft/onnxruntime/releases)
-// ship the public headers flat under include/ (e.g. onnxruntime_cxx_api.h),
-// whereas the vendored source tree nests them under
-// include/onnxruntime/core/session/. ONNXSIM_ORT_FLAT_HEADERS, defined by CMake
-// when ONNXSIM_PREBUILT_ORT is enabled, selects the flat layout. Byte order is
-// handled with C++20 std::endian in dlpack_dtype.h, so neither path depends on
-// ORT's internal core/common/endian.h (which the prebuilt release does not
-// ship).
-#ifdef ONNXSIM_ORT_FLAT_HEADERS
+#ifdef ONNXSIM_HAS_ORT
+// Both ways CMake obtains ONNX Runtime (an official release, or
+// cmake/build_ort.cmake's own from-source ExternalProject build) now install
+// their public headers flat (e.g. onnxruntime_cxx_api.h directly under the
+// include root) -- see ONNXSIM_ORT_FLAT_HEADERS in CMakeLists.txt /
+// cmake/build_ort.cmake. Byte order is handled with C++20 std::endian in
+// dlpack_dtype.h, so this does not depend on ORT's internal
+// core/common/endian.h (which neither ships).
 #include "onnxruntime_cxx_api.h"
-#else
-#include "onnxruntime/core/session/onnxruntime_cxx_api.h"
-#endif
 #endif
 #include "contrib_schemas.h"
 #include "custom_optimizer_passes.h"
 #include "dlpack_bridge.h"
 #include "onnx/common/file_utils.h"
+#include "onnx/common/graph_shape_inference.h"
+#include "onnx/common/ir_pb_converter.h"
 #include "onnx/defs/printer.h"
 #include "onnx/defs/schema.h"
 #include "onnx/inliner/inliner.h"
@@ -41,6 +45,7 @@
 #include "onnx/version_converter/convert.h"
 #include "onnxoptimizer/model_util.h"
 #include "onnxoptimizer/optimize.h"
+#include "onnxoptimizer/passes/cse_util.h"
 #include "onnxoptimizer/passes/logging.h"
 #include "profiler.h"
 #include "sym_shape_infer.h"
@@ -190,7 +195,7 @@ auto FindValueInfoProtoByName(const onnx::ModelProto& model,
   throw std::invalid_argument("no value info " + name);
 }
 
-#ifndef NO_BUILTIN_ORT
+#ifdef ONNXSIM_HAS_ORT
 // The TensorProto<->Ort::Value converters that used to live here have moved to
 // dlpack_bridge.h and now exchange data through DLManagedTensor:
 //   * inputs: onnxsim::dlpack::BorrowAsOrtValue wraps the feed buffer with the
@@ -261,6 +266,21 @@ struct CppModelExecutor : public ModelExecutor {
     Ort::SessionOptions sess_opts;
     sess_opts.SetLogSeverityLevel(3);
     sess_opts.SetGraphOptimizationLevel(ORT_DISABLE_ALL);
+    // This executor exists only to run constant-folding's throwaway
+    // fold-group sub-models (see RunOps above) -- never a full-size
+    // correctness check -- and each session here runs exactly once. So:
+    //  - Memory-pattern planning, which pays off across *repeated* Run()
+    //    calls, buys nothing for a session used once; skip planning it.
+    //  - A fresh intra-op thread pool sized to the machine's CPU count is
+    //    spun up (and joined) on every session construction, which happens
+    //    once per fold group per fixed-point round -- often hundreds of times
+    //    per large model. For the shape/index ops typical of a fold group
+    //    that spin-up/join is pure overhead, and it is where most of a fold
+    //    session's time goes (see the ``OrtSessionInit`` span above).
+    //    Running single-threaded skips it.
+    sess_opts.DisableMemPattern();
+    sess_opts.SetIntraOpNumThreads(1);
+    sess_opts.SetInterOpNumThreads(1);
     const bool ort_profiling = EnableOrtProfilingFromEnv(sess_opts);
     std::string model_str = model.SerializeAsString();
     Ort::Session session{nullptr};
@@ -593,7 +613,14 @@ struct ConstantNodePartition {
 ConstantNodePartition GetConstantNodes(const onnx::ModelProto& model) {
   // tensor with empty name("") represents the empty value of an optional input
   // so "" should be treated as a name of a constant tensor.
-  std::vector<std::string> const_names{""};
+  //
+  // A hash set, not a vector: every node's every input is looked up against
+  // this set below (``std::all_of`` over ``const_names``), and the set grows
+  // by every initializer up front plus every folded node's outputs as the
+  // scan proceeds. A vector + linear ``std::find`` makes that lookup
+  // O(constants seen so far) per input, i.e. O(nodes * initializers) overall
+  // on a model with many weights; a hash set makes each lookup O(1) average.
+  std::unordered_set<std::string> const_names{""};
   ConstantNodePartition partition;
   auto& const_nodes = partition.const_nodes;
   auto& non_const_nodes = partition.non_const_nodes;
@@ -603,10 +630,9 @@ ConstantNodePartition GetConstantNodes(const onnx::ModelProto& model) {
   // the graph untouched; a node fed by a Constant node still folds because ""
   // and Constant outputs remain in the constant set.
   if (config.initializers_as_constants) {
-    std::transform(model.graph().initializer().begin(),
-                   model.graph().initializer().end(),
-                   std::back_inserter(const_names),
-                   [](const auto& x) { return x.name(); });
+    for (const auto& x : model.graph().initializer()) {
+      const_names.insert(x.name());
+    }
   }
   // Map each domain to its imported opset version so the correct operator
   // schema can be looked up. The default ONNX domain is normalized to an empty
@@ -629,11 +655,9 @@ ConstantNodePartition GetConstantNodes(const onnx::ModelProto& model) {
         IsDeterministic(node.domain(), node.op_type(),
                         opset_version_of(node.domain())) &&
         !IsQDQ(node.domain(), node.op_type()) && !HasSubgraph(node) &&
-        std::all_of(node.input().begin(), node.input().end(),
-                    [&const_names](const auto& x) {
-                      return std::find(const_names.begin(), const_names.end(),
-                                       x) != const_names.end();
-                    });
+        std::all_of(
+            node.input().begin(), node.input().end(),
+            [&const_names](const auto& x) { return const_names.count(x) > 0; });
     if (!foldable) {
       non_const_nodes.push_back(node);
       continue;
@@ -641,8 +665,7 @@ ConstantNodePartition GetConstantNodes(const onnx::ModelProto& model) {
     if (!ProduceLargeTensor(model, node, config.tensor_size_threshold)) {
       // Ordinary constant folding: the output is materialized as an
       // initializer and the node is dropped.
-      const_names.insert(const_names.end(), node.output().begin(),
-                         node.output().end());
+      const_names.insert(node.output().begin(), node.output().end());
       const_nodes.push_back(node);
       continue;
     }
@@ -653,8 +676,7 @@ ConstantNodePartition GetConstantNodes(const onnx::ModelProto& model) {
     // rather than materializing the large tensor as an initializer. Other
     // large-tensor ops (e.g. Tile) remain fully excluded from folding.
     if (node.op_type() == "ConstantOfShape" || node.op_type() == "Expand") {
-      const_names.insert(const_names.end(), node.output().begin(),
-                         node.output().end());
+      const_names.insert(node.output().begin(), node.output().end());
       partition.deferred_outputs.insert(node.output().begin(),
                                         node.output().end());
     }
@@ -1264,134 +1286,152 @@ void _EvalPartialShape(onnx::ModelProto& model) {
 // Whether every element of `tensor` is zero. Only the storage forms that can be
 // inspected locally are accepted: a tensor whose data lives in an external file
 // is reported as "not provably zero" rather than loaded.
-bool IsAllZeroTensor(const onnx::TensorProto& tensor) {
-  if (tensor.data_location() == onnx::TensorProto::EXTERNAL) {
+bool IsAllZeroTensor(const onnx::Tensor& tensor) {
+  if (tensor.data_location() == onnx::TensorProto_DataLocation_EXTERNAL) {
     return false;
   }
-  // A zero string is not a thing, and STRING tensors keep their payload in
-  // `string_data`, which the numeric checks below would happily skip over.
-  if (tensor.data_type() == onnx::TensorProto::STRING ||
-      tensor.data_type() == onnx::TensorProto::UNDEFINED) {
+  if (tensor.elem_type() == onnx::TensorProto::STRING ||
+      tensor.elem_type() == onnx::TensorProto::UNDEFINED) {
     return false;
   }
-  if (tensor.has_raw_data()) {
-    // Every numeric ONNX dtype (including float16/bfloat16 and the float8
-    // variants) encodes +0 as all-zero bytes, so a byte-wise test is both dtype
-    // agnostic and conservative: -0.0 has its sign bit set and is reported as
-    // non-zero even though it compares equal to 0.
-    const std::string& raw = tensor.raw_data();
+  if (tensor.is_raw_data()) {
+    const std::string& raw = tensor.raw();
     return std::all_of(raw.begin(), raw.end(), [](char c) { return c == 0; });
   }
   auto all_zero = [](const auto& field) {
     return std::all_of(field.begin(), field.end(),
                        [](auto value) { return value == 0; });
   };
-  // Guard against a tensor that carries no data at all (nothing to prove).
-  const int element_count =
-      tensor.float_data_size() + tensor.int32_data_size() +
-      tensor.int64_data_size() + tensor.double_data_size() +
-      tensor.uint64_data_size();
+  const size_t element_count =
+      tensor.floats().size() + tensor.int32s().size() + tensor.int64s().size() +
+      tensor.doubles().size() + tensor.uint64s().size();
   if (element_count == 0) {
     return false;
   }
-  return all_zero(tensor.float_data()) && all_zero(tensor.int32_data()) &&
-         all_zero(tensor.int64_data()) && all_zero(tensor.double_data()) &&
-         all_zero(tensor.uint64_data());
+  return all_zero(tensor.floats()) && all_zero(tensor.int32s()) &&
+         all_zero(tensor.int64s()) && all_zero(tensor.doubles()) &&
+         all_zero(tensor.uint64s());
 }
 
-// Whether `name` is provably an all-zero tensor, following the chain of ops
-// that produced it. Only shape-manipulating ops are traversed: they move
-// elements around without changing their values, so an all-zero input implies
-// an all-zero output. Ops whose output could be empty (Slice, Split, Gather)
-// stay sound too, since an empty tensor is vacuously all zeros.
-bool IsAllZeroValue(
-    const std::string& name,
-    const std::unordered_map<std::string, const onnx::TensorProto*>&
-        initializers,
-    const std::unordered_map<std::string, const onnx::NodeProto*>& producers,
-    std::unordered_map<std::string, bool>& memo) {
-  if (name.empty()) {
+// Whether `value` is provably an all-zero tensor, following the chain of ops
+// that produced it, walking onnx::Value/Node. Only shape-manipulating ops are
+// traversed: they move elements around without changing their values, so an
+// all-zero input implies an all-zero output. Ops whose output could be empty
+// (Slice, Split, Gather) stay sound too, since an empty tensor is vacuously
+// all zeros. ``value``'s producer being the graph's single kUndefined
+// placeholder node (see ir_pb_converter.cc) means "this optional input was
+// not provided".
+bool IsAllZeroGraphValue(
+    onnx::Value* value,
+    const std::unordered_map<std::string, const onnx::Tensor*>&
+        initializer_by_name,
+    std::unordered_map<const onnx::Value*, bool>& memo) {
+  if (value->node()->kind() == onnx::kUndefined) {
     return false;
   }
-  auto memo_iter = memo.find(name);
+  auto memo_iter = memo.find(value);
   if (memo_iter != memo.end()) {
     return memo_iter->second;
   }
-  // Insert a pessimistic answer up front: it both memoizes the miss and breaks
-  // any cycle a malformed graph might contain.
-  memo.emplace(name, false);
+  // Insert a pessimistic answer up front: it both memoizes the miss and
+  // breaks any cycle a malformed graph might contain.
+  memo.emplace(value, false);
 
-  auto init_iter = initializers.find(name);
-  if (init_iter != initializers.end()) {
+  auto init_iter = initializer_by_name.find(value->uniqueName());
+  if (init_iter != initializer_by_name.end()) {
     const bool result = IsAllZeroTensor(*init_iter->second);
-    memo[name] = result;
+    memo[value] = result;
     return result;
   }
 
-  auto producer_iter = producers.find(name);
-  if (producer_iter == producers.end()) {
-    return false;
-  }
-  const onnx::NodeProto& node = *producer_iter->second;
-  if (!node.domain().empty() && node.domain() != "ai.onnx") {
+  onnx::Node* producer = value->node();
+  if (producer->has_domain() && !producer->domain().empty() &&
+      producer->domain() != "ai.onnx") {
     return false;
   }
 
-  const auto attribute = [&node](const char* attr_name) {
-    for (const auto& attr : node.attribute()) {
-      if (attr.name() == attr_name) {
-        return &attr;
-      }
-    }
-    return static_cast<const onnx::AttributeProto*>(nullptr);
-  };
+  static const onnx::Symbol kConstant("Constant");
+  static const onnx::Symbol kConstantOfShape("ConstantOfShape");
+  static const onnx::Symbol kCast("Cast");
+  static const onnx::Symbol kCastLike("CastLike");
+  static const onnx::Symbol kIdentity("Identity");
+  static const onnx::Symbol kReshape("Reshape");
+  static const onnx::Symbol kTranspose("Transpose");
+  static const onnx::Symbol kSqueeze("Squeeze");
+  static const onnx::Symbol kUnsqueeze("Unsqueeze");
+  static const onnx::Symbol kFlatten("Flatten");
+  static const onnx::Symbol kTile("Tile");
+  static const onnx::Symbol kExpand("Expand");
+  static const onnx::Symbol kSlice("Slice");
+  static const onnx::Symbol kSplit("Split");
+  static const onnx::Symbol kGather("Gather");
+  static const onnx::Symbol kGatherElements("GatherElements");
+  static const onnx::Symbol kGatherND("GatherND");
+  static const onnx::Symbol kConcat("Concat");
+  static const onnx::Symbol kValue("value");
+  static const onnx::Symbol kValueFloat("value_float");
+  static const onnx::Symbol kValueInt("value_int");
+  static const onnx::Symbol kValueFloats("value_floats");
+  static const onnx::Symbol kValueInts("value_ints");
+  static const onnx::Symbol kTo("to");
 
   bool result = false;
-  const std::string& op = node.op_type();
-  if (op == "Constant") {
-    if (const auto* value = attribute("value")) {
-      result = IsAllZeroTensor(value->t());
-    } else if (const auto* value = attribute("value_float")) {
-      result = value->f() == 0;
-    } else if (const auto* value = attribute("value_int")) {
-      result = value->i() == 0;
-    } else if (const auto* value = attribute("value_floats")) {
-      result = value->floats_size() > 0 &&
-               std::all_of(value->floats().begin(), value->floats().end(),
-                           [](float f) { return f == 0; });
-    } else if (const auto* value = attribute("value_ints")) {
-      result = value->ints_size() > 0 &&
-               std::all_of(value->ints().begin(), value->ints().end(),
-                           [](int64_t i) { return i == 0; });
+  const onnx::Symbol kind = producer->kind();
+  if (kind == kConstant) {
+    if (producer->hasAttribute(kValue)) {
+      result = IsAllZeroTensor(producer->t(kValue));
+    } else if (producer->hasAttribute(kValueFloat)) {
+      result = producer->f(kValueFloat) == 0;
+    } else if (producer->hasAttribute(kValueInt)) {
+      result = producer->i(kValueInt) == 0;
+    } else if (producer->hasAttribute(kValueFloats)) {
+      const auto& floats = producer->fs(kValueFloats);
+      result = !floats.empty() && std::all_of(floats.begin(), floats.end(),
+                                              [](double f) { return f == 0; });
+    } else if (producer->hasAttribute(kValueInts)) {
+      const auto& ints = producer->is(kValueInts);
+      result = !ints.empty() && std::all_of(ints.begin(), ints.end(),
+                                            [](int64_t i) { return i == 0; });
     }
-  } else if (op == "ConstantOfShape") {
-    // The `value` attribute defaults to a single zero float.
-    const auto* value = attribute("value");
-    result = value == nullptr || IsAllZeroTensor(value->t());
-  } else if (op == "Cast" || op == "CastLike") {
-    // Zero casts to zero for every numeric target type, but casting to STRING
-    // yields "0", which is not a zero tensor.
-    const auto* to = attribute("to");
-    const bool to_string =
-        to != nullptr && to->i() == onnx::TensorProto::STRING;
-    result = !to_string &&
-             IsAllZeroValue(node.input(0), initializers, producers, memo);
-  } else if (op == "Identity" || op == "Reshape" || op == "Transpose" ||
-             op == "Squeeze" || op == "Unsqueeze" || op == "Flatten" ||
-             op == "Tile" || op == "Expand" || op == "Slice" || op == "Split" ||
-             op == "Gather" || op == "GatherElements" || op == "GatherND") {
-    result = IsAllZeroValue(node.input(0), initializers, producers, memo);
-  } else if (op == "Concat") {
-    result = node.input_size() > 0 &&
-             std::all_of(node.input().begin(), node.input().end(),
-                         [&](const std::string& input) {
-                           return IsAllZeroValue(input, initializers, producers,
-                                                 memo);
-                         });
+  } else if (kind == kConstantOfShape) {
+    result =
+        !producer->hasAttribute(kValue) || IsAllZeroTensor(producer->t(kValue));
+  } else if (kind == kCast || kind == kCastLike) {
+    const bool to_string = producer->hasAttribute(kTo) &&
+                           producer->i(kTo) == onnx::TensorProto::STRING;
+    result = !to_string && IsAllZeroGraphValue(producer->inputs()[0],
+                                               initializer_by_name, memo);
+  } else if (kind == kIdentity || kind == kReshape || kind == kTranspose ||
+             kind == kSqueeze || kind == kUnsqueeze || kind == kFlatten ||
+             kind == kTile || kind == kExpand || kind == kSlice ||
+             kind == kSplit || kind == kGather || kind == kGatherElements ||
+             kind == kGatherND) {
+    result =
+        IsAllZeroGraphValue(producer->inputs()[0], initializer_by_name, memo);
+  } else if (kind == kConcat) {
+    const auto& inputs = producer->inputs();
+    result = !inputs.empty() &&
+             std::all_of(inputs.begin(), inputs.end(), [&](onnx::Value* input) {
+               return IsAllZeroGraphValue(input, initializer_by_name, memo);
+             });
   }
 
-  memo[name] = result;
+  memo[value] = result;
   return result;
+}
+
+// The graph's single placeholder Value standing in for "this optional input
+// was not provided" (see ir_pb_converter.cc) -- every kUndefined-producer
+// input aliases this same Value. Only scanned when actually needed (an
+// all-zero RNN initial state was found), so the common case of a graph with
+// no LSTM/RNN/GRU nodes pays nothing for it.
+onnx::Value* FindUndefinedGraphValue(onnx::Graph& graph) {
+  for (onnx::Node* node : graph.nodes()) {
+    if (node->kind() == onnx::kUndefined) {
+      return node->outputs()[0];
+    }
+  }
+  return nullptr;
 }
 
 // Unset the recurrent initial states of RNN/GRU/LSTM nodes that are provably
@@ -1413,63 +1453,65 @@ bool IsAllZeroValue(
 // are left alone because they are plain initializers, so dropping them removes
 // no operator while risking a needless behaviour change in consumers that read
 // them.
-void EliminateZeroRnnInitialState(onnx::GraphProto& graph) {
-  std::unordered_map<std::string, const onnx::TensorProto*> initializers;
-  for (const auto& initializer : graph.initializer()) {
-    initializers.emplace(initializer.name(), &initializer);
+void EliminateZeroRnnInitialState(onnx::Graph& graph) {
+  std::unordered_map<std::string, const onnx::Tensor*> initializer_by_name;
+  const auto& initializers = graph.initializers();
+  const auto& initializer_names = graph.initializer_names();
+  initializer_by_name.reserve(initializers.size());
+  for (size_t i = 0; i < initializers.size(); ++i) {
+    initializer_by_name[initializer_names[i]] = initializers[i].get();
   }
-  std::unordered_map<std::string, const onnx::NodeProto*> producers;
-  for (const auto& node : graph.node()) {
-    for (const auto& output : node.output()) {
-      producers.emplace(output, &node);
-    }
-  }
-  // Shared across nodes: the same zero subgraph usually feeds both initial_h
-  // and initial_c, and often several recurrent layers.
-  std::unordered_map<std::string, bool> memo;
+  std::unordered_map<const onnx::Value*, bool> memo;
+  onnx::Value* undefined = nullptr;
 
-  for (auto& node : *graph.mutable_node()) {
+  static const onnx::Symbol kLSTM("LSTM");
+  static const onnx::Symbol kRNN("RNN");
+  static const onnx::Symbol kGRU("GRU");
+
+  for (onnx::Node* node : graph.nodes()) {
     // Recurse first, so recurrent ops inside If/Loop/Scan bodies are handled
-    // too. The nested graph is analysed on its own: a value coming from the
-    // enclosing scope has no producer there and is simply not proven zero.
-    for (auto& attr : *node.mutable_attribute()) {
-      if (attr.has_g()) {
-        EliminateZeroRnnInitialState(*attr.mutable_g());
-      }
-      for (auto& subgraph : *attr.mutable_graphs()) {
-        EliminateZeroRnnInitialState(subgraph);
+    // too.
+    for (onnx::Symbol attr : node->attributeNames()) {
+      if (node->kindOf(attr) == onnx::AttributeKind::g) {
+        EliminateZeroRnnInitialState(*node->g(attr));
+      } else if (node->kindOf(attr) == onnx::AttributeKind::gs) {
+        for (const auto& subgraph : node->gs(attr)) {
+          EliminateZeroRnnInitialState(*subgraph);
+        }
       }
     }
 
-    if (!node.domain().empty() && node.domain() != "ai.onnx") {
+    if (node->has_domain() && !node->domain().empty() &&
+        node->domain() != "ai.onnx") {
       continue;
     }
-    // Input layout: X, W, R, B, sequence_lens, initial_h[, initial_c, P]
-    const std::string& op = node.op_type();
+    const onnx::Symbol kind = node->kind();
     int last_state_index;
-    if (op == "LSTM") {
-      last_state_index = 6;  // initial_h and initial_c
-    } else if (op == "RNN" || op == "GRU") {
-      last_state_index = 5;  // initial_h only
+    if (kind == kLSTM) {
+      last_state_index = 6;
+    } else if (kind == kRNN || kind == kGRU) {
+      last_state_index = 5;
     } else {
       continue;
     }
 
-    for (int i = 5; i <= last_state_index && i < node.input_size(); i++) {
-      if (IsAllZeroValue(node.input(i), initializers, producers, memo)) {
-        node.set_input(i, "");
+    const auto& inputs = node->inputs();
+    for (int i = 5;
+         i <= last_state_index && i < static_cast<int>(inputs.size()); i++) {
+      if (IsAllZeroGraphValue(inputs[i], initializer_by_name, memo)) {
+        if (undefined == nullptr) {
+          undefined = FindUndefinedGraphValue(graph);
+        }
+        node->replaceInput(i, undefined);
       }
     }
-    // Trailing empty inputs carry no information; drop them so the node ends up
-    // in the same shape a converter would have emitted without the state.
-    while (node.input_size() > 0 && node.input(node.input_size() - 1).empty()) {
-      node.mutable_input()->RemoveLast();
+    // Trailing empty inputs carry no information; drop them so the node ends
+    // up in the same shape a converter would have emitted without the state.
+    while (!node->inputs().empty() &&
+           node->inputs().back()->node()->kind() == onnx::kUndefined) {
+      node->removeInput(node->inputs().size() - 1);
     }
   }
-}
-
-void EliminateZeroRnnInitialState(onnx::ModelProto& model) {
-  EliminateZeroRnnInitialState(*model.mutable_graph());
 }
 
 // Estimate the number of bytes the outputs of `node` occupy once materialized,
@@ -1657,7 +1699,15 @@ onnx::ModelProto _FoldConstant(const ModelExecutor& executor,
   }
 }
 
-onnx::ModelProto Optimize(const onnx::ModelProto& model) {
+// ``model`` is ``onnx::ModelProto&`` (not const): the call site below passes a
+// mutable lvalue that is about to be move-assigned over
+// (``model = Optimize(model)``), so its pre-call contents are dead once this
+// returns. That lets OptimizeFixed move each initializer's raw bytes through
+// the ModelProto<->Graph round trip instead of copying them -- the dominant
+// cost of this call for weight-heavy models (onnxsim issue #633) -- via the
+// moving ImportModelProto/ExportModelProto overloads added to onnxsim's own
+// onnx fork.
+onnx::ModelProto Optimize(onnx::ModelProto& model) {
   // Make onnxsim's own optimizer passes available to onnxoptimizer's registry
   // (idempotent) so config.optimizer_passes may name them.
   onnxsim::RegisterCustomOptimizerPasses();
@@ -1687,20 +1737,114 @@ struct ModelFingerprint {
   }
 };
 
-ModelFingerprint Fingerprint(const onnx::ModelProto& model) {
-  // ModelProto contains no protobuf ``map<>`` fields, so serialization order is
-  // stable and equal models serialize to identical bytes.
-  const std::string bytes = model.SerializeAsString();
-  // Two independent rolling hashes (FNV-1a and a splitmix-style mix) combined
-  // into a 128-bit value.
-  uint64_t h1 = 1469598103934665603ULL;  // FNV-1a offset basis
-  uint64_t h2 = 0;
-  for (unsigned char c : bytes) {
-    h1 = (h1 ^ c) * 1099511628211ULL;  // FNV-1a prime
+// Mixes ``n`` bytes at ``data`` into the two rolling hash accumulators (FNV-1a
+// and a splitmix-style mix), 8 bytes (one machine word) at a time rather than
+// one byte at a time -- cutting the number of loop iterations, and with them
+// most of the loop/branch overhead, by roughly 8x versus a byte-at-a-time
+// mix, for identical byte coverage and order.
+void MixBytes(const char* data, size_t n, uint64_t& h1, uint64_t& h2) {
+  const size_t n_words = n / sizeof(uint64_t);
+  for (size_t i = 0; i < n_words; ++i) {
+    // memcpy, not a reinterpret_cast dereference: ``data`` is not guaranteed
+    // 8-byte aligned (it may be a chunk of a streaming buffer, or a
+    // std::string's internal buffer), and an unaligned uint64_t load is
+    // undefined behavior in C++. Any decent compiler lowers this fixed-size
+    // memcpy to a single unaligned load.
+    uint64_t word;
+    std::memcpy(&word, data + i * sizeof(uint64_t), sizeof(uint64_t));
+    h1 = (h1 ^ word) * 1099511628211ULL;
+    h2 = (h2 + word) * 0x9E3779B97F4A7C15ULL;
+    h2 ^= h2 >> 29;
+  }
+  // Fewer than 8 trailing bytes: fall back to a byte-at-a-time mix so every
+  // byte still participates in the hash.
+  for (size_t i = n_words * sizeof(uint64_t); i < n; ++i) {
+    const unsigned char c = static_cast<unsigned char>(data[i]);
+    h1 = (h1 ^ c) * 1099511628211ULL;
     h2 = (h2 + c) * 0x9E3779B97F4A7C15ULL;
     h2 ^= h2 >> 29;
   }
-  h2 ^= bytes.size();
+}
+
+// A protobuf output stream that hashes bytes as they are handed out by the
+// serializer instead of collecting them into a buffer. Fingerprint() used to
+// call ``model.SerializeAsString()`` -- which allocates a buffer the size of
+// the whole serialized model (hundreds of MB of initializer weight data on a
+// large model) and serializes into it -- and then made a second, separate
+// pass over that buffer to hash it. Handing the serializer a small, reused
+// scratch buffer instead avoids that large allocation (and the deallocation
+// moments later): each time the serializer fills it, this stream
+// mixes it into the running hash and hands the same buffer back out, so the
+// whole model is hashed in bounded extra memory regardless of its size.
+class HashingOutputStream final
+    : public google::protobuf::io::ZeroCopyOutputStream {
+ public:
+  bool Next(void** data, int* size) override {
+    FlushPending();
+    *data = buf_.data();
+    *size = static_cast<int>(buf_.size());
+    pending_ = static_cast<int>(buf_.size());
+    return true;
+  }
+  void BackUp(int count) override { pending_ -= count; }
+  int64_t ByteCount() const override { return byte_count_; }
+
+  // Call after serialization completes to mix in the final partial buffer.
+  void Finish() { FlushPending(); }
+
+  uint64_t h1() const { return h1_; }
+  uint64_t h2() const { return h2_; }
+  size_t total_bytes() const { return static_cast<size_t>(byte_count_); }
+
+ private:
+  void FlushPending() {
+    if (pending_ <= 0) {
+      return;
+    }
+    MixBytes(buf_.data(), static_cast<size_t>(pending_), h1_, h2_);
+    byte_count_ += pending_;
+    pending_ = 0;
+  }
+
+  // 64 KiB: large enough that the per-Next() call overhead is negligible next
+  // to the memory-bandwidth-bound hashing work, small enough to stay resident
+  // in L1/L2 cache across the mix. Heap-allocated, not a fixed-size array
+  // member: this object lives on the call stack of Fingerprint(), which is
+  // itself invoked from deep inside the (possibly nested) fixed-point
+  // machinery, and the WASM build's stack is only tens of KiB total -- a
+  // 64 KiB stack-resident array here reliably overflowed it (issue caught by
+  // the WASM build's own smoke test, "Aborted(stack overflow ...)" on the
+  // very first Simplify() call). std::vector's control block is a few
+  // pointer-sized words on the stack; the buffer itself is heap-backed.
+  std::vector<char> buf_ = std::vector<char>(1 << 16);
+  int pending_ = 0;
+  int64_t byte_count_ = 0;
+  uint64_t h1_ = 1469598103934665603ULL;  // FNV-1a offset basis
+  uint64_t h2_ = 0;
+};
+
+ModelFingerprint Fingerprint(const onnx::ModelProto& model) {
+  // ModelProto contains no protobuf ``map<>`` fields, so serialization order is
+  // stable and equal models serialize to identical bytes.
+  //
+  // Fingerprint() runs at every step of every (possibly nested) fixed point,
+  // so on a model with hundreds of MB of initializer weight data -- which
+  // dominates the serialized size but is untouched by most rounds (shape
+  // inference, the onnx-optimizer passes) -- it still has to read all of that
+  // data, every round, just to prove nothing changed. Profiling a 265 MB
+  // model showed this was a multi-second fraction (over half of total wall
+  // time on that model) of total simplification time, so it is worth
+  // streaming through a small buffer (see HashingOutputStream) rather than
+  // materializing the whole serialized model first.
+  HashingOutputStream stream;
+  // SerializeToZeroCopyStream only returns false if a Next() call on the
+  // stream fails (out of disk space, a broken pipe, ...); HashingOutputStream
+  // writes to memory and its Next() always succeeds, so this cannot fail.
+  model.SerializeToZeroCopyStream(&stream);
+  stream.Finish();
+  uint64_t h1 = stream.h1();
+  uint64_t h2 = stream.h2();
+  h2 ^= stream.total_bytes();
   return {h1, h2};
 }
 
@@ -1725,11 +1869,20 @@ std::function<void(T&)> FixedPointFn(const std::function<void(T&)>& f1,
                                      const std::function<void(T&)>& f2,
                                      size_t max_iters, bool* converged) {
   return [f1, f2, max_iters, converged](T& model) -> void {
+    // Profiled separately from the transforms it gates: on large models this
+    // convergence check is not free (see Fingerprint()'s comment), so its cost
+    // should be visible in its own right rather than silently inflating
+    // whichever of f1/f2's spans happens to run next. A no-op unless
+    // ONNXSIM_PROFILE is set.
+    auto fingerprint = [](const onnx::ModelProto& m) {
+      onnxsim::ProfiledScope scope("Fingerprint");
+      return Fingerprint(m);
+    };
     size_t _max_iters = max_iters;
     f1(model);
-    ModelFingerprint fp_prev = Fingerprint(model);
+    ModelFingerprint fp_prev = fingerprint(model);
     f2(model);
-    ModelFingerprint fp_cur = Fingerprint(model);
+    ModelFingerprint fp_cur = fingerprint(model);
     while (_max_iters-- > 0) {
       if (fp_cur == fp_prev) {
         if (converged) {
@@ -1739,7 +1892,7 @@ std::function<void(T&)> FixedPointFn(const std::function<void(T&)>& f1,
       }
       f1(model);
       fp_prev = fp_cur;
-      fp_cur = Fingerprint(model);
+      fp_cur = fingerprint(model);
       if (fp_cur == fp_prev) {
         if (converged) {
           *converged = true;
@@ -1748,7 +1901,7 @@ std::function<void(T&)> FixedPointFn(const std::function<void(T&)>& f1,
       }
       f2(model);
       fp_prev = fp_cur;
-      fp_cur = Fingerprint(model);
+      fp_cur = fingerprint(model);
     }
 
     if (converged) {
@@ -1760,6 +1913,61 @@ std::function<void(T&)> FixedPointFn(const std::function<void(T&)>& f1,
 template <typename T>
 std::function<void(T&)> FixedPointFn(const std::function<void(T&)>& f1,
                                      const std::function<void(T&)>& f2,
+                                     size_t max_iters) {
+  return FixedPointFn(f1, f2, max_iters, nullptr);
+}
+
+// Same convergence algorithm as the ``Fingerprint``-based ``FixedPointFn``
+// above, specialized for transforms that can cheaply report whether they
+// changed the model themselves (``f1``/``f2`` return true iff they did),
+// instead of hashing the whole serialized model after every call. This skips
+// ``Fingerprint()`` entirely, which matters most here because this is the
+// innermost, most-frequently-run fixed point (``OptAndShape`` below runs
+// every simplification round). It is only as safe as ``f1``/``f2``'s own
+// signal: both onnx-optimizer's per-pass transform counts and onnx's
+// InferShapes value-change count are exact for onnxsim's pass list (no
+// pass with an ``Empty``/uncounted analysis type is used), so a ``false``
+// return means that call provably made no change -- not just "probably".
+// A false negative here (missing a real change) would still not produce an
+// incorrect model: it only makes this inner loop stop one round early, and
+// the fingerprint-based fixed point one level up (which wraps every call
+// to ``OptAndShape`` as a whole) re-drives it from the top if that whole
+// call's net effect changed anything, same as a ``Fingerprint`` hash
+// collision would.
+template <typename T>
+std::function<void(T&)> FixedPointFn(const std::function<bool(T&)>& f1,
+                                     const std::function<bool(T&)>& f2,
+                                     size_t max_iters, bool* converged) {
+  return [f1, f2, max_iters, converged](T& model) -> void {
+    size_t _max_iters = max_iters;
+    f1(model);
+    bool last_changed = f2(model);
+    while (_max_iters-- > 0) {
+      if (!last_changed) {
+        if (converged) {
+          *converged = true;
+        }
+        return;
+      }
+      last_changed = f1(model);
+      if (!last_changed) {
+        if (converged) {
+          *converged = true;
+        }
+        return;
+      }
+      last_changed = f2(model);
+    }
+
+    if (converged) {
+      *converged = false;
+    }
+  };
+}
+
+template <typename T>
+std::function<void(T&)> FixedPointFn(const std::function<bool(T&)>& f1,
+                                     const std::function<bool(T&)>& f2,
                                      size_t max_iters) {
   return FixedPointFn(f1, f2, max_iters, nullptr);
 }
@@ -2092,22 +2300,11 @@ onnx::ModelProto Simplify(
   } else {
     FoldConstant = Identity;
   }
-  ModelFn InferShapes = shape_inference ? _InferShapes : Identity;
-  // ``Optimize`` builds a fresh model (``OptimizeFixed`` returns a new proto),
-  // so wrap it as an in-place transform that move-assigns the result back.
   // ``perform_optimization=False`` (skip_optimizers == nullopt) means the
   // caller wants the graph structure left alone, so the state elimination --
   // which relies on dead-end elimination to clean up behind it -- runs with the
   // optimizer or not at all.
   const bool optimize = skip_optimizers.has_value();
-  ModelFn OptimizeInPlace = [optimize](onnx::ModelProto& model) {
-    if (optimize) {
-      // Unset all-zero recurrent initial states (issue #314) so the subgraph
-      // computing them becomes dead and the passes below can remove it.
-      EliminateZeroRnnInitialState(model);
-    }
-    model = Optimize(model);
-  };
 
   int fixed_point_iters =
       std::getenv("ONNXSIM_FIXED_POINT_ITERS")
@@ -2132,6 +2329,22 @@ onnx::ModelProto Simplify(
     if (!profile_path.empty()) {
       onnxsim::Profiler::Instance().Enable(profile_path);
     }
+  }
+  // Optionally break the per-round Optimize() cost down further, into each
+  // PredicateBasedPass's "matching" (patternMatchPredicate) vs "modifying"
+  // (runTransform) phase, per pass name -- see onnxoptimizer/pass.h's
+  // PassPhaseTiming for scope and overhead. Exploratory diagnostic for
+  // onnxsim issue #633; the summary prints to stderr after Pipeline runs.
+  const bool profile_pass_phases = [] {
+    const char* env = std::getenv("ONNXSIM_PROFILE_PASS_PHASES");
+    return env != nullptr && std::string(env) != "0" &&
+           std::string(env) != "false";
+  }();
+  if (profile_pass_phases) {
+    onnx::optimization::ResetPassPhaseTimings();
+    onnx::optimization::ResetPassTotalTimings();
+    onnx::optimization::ResetCSEHashCompareTiming();
+    onnx::optimization::SetPassPhaseProfilingEnabled(true);
   }
   // Optionally merge ONNX Runtime's own per-session profiles into the onnxsim
   // trace -- the binding-agnostic counterpart of Python's
@@ -2163,11 +2376,100 @@ onnx::ModelProto Simplify(
       fn(model);
     };
   };
-
+  // Fully Graph-resident OptAndShape, built on onnx::InferShapesOnGraph
+  // (onnx/common/graph_shape_inference.h) and onnx-optimizer's
+  // OptimizeGraphFixed (onnxoptimizer/optimize.h): both run directly against
+  // one onnx::Graph held for the whole inner fixed point, so this does
+  // exactly one Import and one Export for the *entire* fixed point, however
+  // many rounds it takes to converge -- instead of one Import+Export per
+  // round. This is onnxsim issue #633's "remaining option 2" (eliminating
+  // the round trip itself, not just its per-round cost); see #637 and #638
+  // for the validation, profiling and follow-up fix that took this from
+  // opt-in to the default.
+  //
+  // Remaining known scope gap: InferShapesOnGraph's own v1 scope leaves
+  // control-flow ops (If/Loop/Scan) and function-body ops uninferred (safe:
+  // exactly as if they had no registered schema, never wrong -- see that
+  // function's doc comment), which can converge to less complete shape info
+  // than a from-scratch protobuf InferShapes call for models using those
+  // ops.
   ModelFn OptAndShape = Profiled(
       "OptAndShape",
-      FixedPointFn(Profiled("InferShapes", InferShapes),
-                   Profiled("Optimize", OptimizeInPlace), fixed_point_iters));
+      [optimize, shape_inference, fixed_point_iters](onnx::ModelProto& model) {
+        std::shared_ptr<onnx::Graph> g(onnx::ImportModelProto(model));
+        if (g.get() == nullptr) {
+          // Same fallback as Optimizer::optimize(): if we can't parse the
+          // model, leave it untouched.
+          return;
+        }
+        // Scope onnx-optimizer's tensor-hash caches (TensorContentDigest,
+        // the typed-field path, and CSETensorHash's raw_data-branch cache
+        // -- see onnxoptimizer/passes/{tensor_content_hash,cse_util}.h) to
+        // this whole OptAndShape call, instead of the OptimizeGraphFixed
+        // call below clearing them every round (its own default): `g` is
+        // one resident Graph held across every round of the fixed point
+        // underneath, and no round mutates a retained tensor's content in
+        // place (only replaces it wholesale, which mints its own fresh
+        // tensor_id() and simply misses these caches) -- so a hash computed
+        // for a tensor that survives unchanged from one round to the next
+        // stays valid, and correct, letting eliminate_duplicate_initializer
+        // and eliminate_common_subexpression skip rehashing it on every one
+        // of the ~dozens of rounds a deep repeated-block model can take.
+        // Dominated in practice by the raw_data cache: real exported models
+        // are raw_data-heavy, and measured 98%+ of those hash calls were
+        // otherwise recomputing a value already seen earlier in the same
+        // run (see onnxsim issue #633). OptimizeGraphChanged below passes
+        // clear_tensor_digest_cache=false to keep both caches alive across
+        // its own repeated OptimizeGraphFixed calls.
+        onnx::optimization::ClearTensorContentDigestCache();
+        onnx::optimization::ClearRawHashCache();
+        using GraphFnChanged = std::function<bool(onnx::Graph&)>;
+        GraphFnChanged InferShapesOnGraphChanged =
+            shape_inference
+                ? GraphFnChanged([](onnx::Graph& graph) {
+                    onnxsim::ProfiledScope scope("InferShapes");
+                    return onnx::InferShapesOnGraph(graph);
+                  })
+                : GraphFnChanged([](onnx::Graph&) { return false; });
+        GraphFnChanged OptimizeGraphChanged = [optimize](onnx::Graph& graph) {
+          onnxsim::ProfiledScope scope("Optimize");
+          onnxsim::RegisterCustomOptimizerPasses();
+          if (optimize) {
+            // Unset all-zero recurrent initial states (issue #314) so the
+            // subgraph computing them becomes dead and the passes below can
+            // remove it. Not reflected in the "changed" signal below, but
+            // that is safe: see FixedPointFn's bool-returning overload
+            // comment -- any resulting dead-end elimination is itself
+            // reflected in the report.
+            EliminateZeroRnnInitialState(graph);
+          }
+          const bool prev = onnx::optimization::InitializersAsConstants();
+          onnx::optimization::SetInitializersAsConstants(
+              config.initializers_as_constants);
+          std::map<std::string, unsigned int> report;
+          onnx::optimization::OptimizeGraphFixed(
+              graph, config.optimizer_passes, &report,
+              /*clear_tensor_digest_cache=*/false);
+          onnx::optimization::SetInitializersAsConstants(prev);
+          for (const auto& pass_count : report) {
+            if (pass_count.second != 0) {
+              return true;
+            }
+          }
+          return false;
+        };
+        FixedPointFn(InferShapesOnGraphChanged, OptimizeGraphChanged,
+                     fixed_point_iters)(*g);
+        onnx::ModelProto out = onnx::PrepareOutput(model);
+        onnx::ExportModelProto(&out, g, /*consume_tensor_data=*/true);
+        // OptimizeGraphFixed never sees model-local functions (they live
+        // on ModelProto, not Graph), so carry them over unchanged --
+        // mirroring Optimizer::optimize()'s own AddFunctionsToModel.
+        for (const auto& function_proto : model.functions()) {
+          *out.add_functions() = function_proto;
+        }
+        model = std::move(out);
+      });
   bool converged = false;
   ModelFn Pipeline;
   if (rewriter) {
@@ -2227,6 +2529,115 @@ onnx::ModelProto Simplify(
   // Flush the profiling trace and print the per-function summary. Safe to call
   // unconditionally: Finish() is a no-op unless profiling was enabled above.
   onnxsim::Profiler::Instance().Finish();
+  if (profile_pass_phases) {
+    onnx::optimization::SetPassPhaseProfilingEnabled(false);
+    std::vector<std::pair<std::string, onnx::optimization::PassPhaseTiming>>
+        rows(onnx::optimization::GetPassPhaseTimings().begin(),
+             onnx::optimization::GetPassPhaseTimings().end());
+    std::sort(rows.begin(), rows.end(), [](const auto& a, const auto& b) {
+      return (a.second.match_ms + a.second.transform_ms) >
+             (b.second.match_ms + b.second.transform_ms);
+    });
+    std::cerr << "\nonnxsim pass-phase profiling (PredicateBasedPass "
+                 "matching vs modifying)\n"
+              << "-------------------------------------------------------"
+                 "------------------------------------\n"
+              << std::left << std::setw(38) << "pass" << std::right
+              << std::setw(12) << "match(ms)" << std::setw(10) << "calls"
+              << std::setw(14) << "modify(ms)" << std::setw(10) << "calls"
+              << std::setw(12) << "total(ms)" << "\n"
+              << "-------------------------------------------------------"
+                 "------------------------------------\n";
+    double total_match_ms = 0, total_transform_ms = 0;
+    for (const auto& [name, t] : rows) {
+      std::cerr << std::left << std::setw(38) << name << std::right
+                << std::setw(12) << std::fixed << std::setprecision(2)
+                << t.match_ms << std::setw(10) << t.match_calls << std::setw(14)
+                << t.transform_ms << std::setw(10) << t.transform_calls
+                << std::setw(12) << (t.match_ms + t.transform_ms) << "\n";
+      total_match_ms += t.match_ms;
+      total_transform_ms += t.transform_ms;
+    }
+    std::cerr << "-------------------------------------------------------"
+                 "------------------------------------\n"
+              << "TOTAL matching: " << total_match_ms
+              << "ms, TOTAL modifying: " << total_transform_ms << "ms\n";
+
+    // Coarser companion table: total wall time inside EVERY pass's
+    // runPass(Graph&) call (both kinds), which is what actually accounts
+    // for the full Optimize() cost -- see PassTotalTiming's comment.
+    std::vector<std::pair<std::string, onnx::optimization::PassTotalTiming>>
+        total_rows(onnx::optimization::GetPassTotalTimings().begin(),
+                   onnx::optimization::GetPassTotalTimings().end());
+    std::sort(total_rows.begin(), total_rows.end(),
+              [](const auto& a, const auto& b) {
+                return a.second.total_ms > b.second.total_ms;
+              });
+    std::cerr << "\nonnxsim pass-phase profiling (total runPass() time, all "
+                 "pass kinds)\n"
+              << "-------------------------------------------------------"
+                 "------------------------------------\n"
+              << std::left << std::setw(38) << "pass" << std::right
+              << std::setw(14) << "total(ms)" << std::setw(10) << "calls"
+              << "\n"
+              << "-------------------------------------------------------"
+                 "------------------------------------\n";
+    double grand_total_ms = 0;
+    for (const auto& [name, t] : total_rows) {
+      std::cerr << std::left << std::setw(38) << name << std::right
+                << std::setw(14) << std::fixed << std::setprecision(2)
+                << t.total_ms << std::setw(10) << t.calls << "\n";
+      grand_total_ms += t.total_ms;
+    }
+    std::cerr << "-------------------------------------------------------"
+                 "------------------------------------\n"
+              << "GRAND TOTAL (sum of all pass runPass() calls): "
+              << grand_total_ms << "ms\n";
+
+    // CSETensorHash/CSETensorCompare breakdown -- the actual hashing and
+    // equality-checking work inside eliminate_duplicate_initializer and
+    // eliminate_common_subexpression's hash-map lookups. Splits raw_data
+    // (real exported-model weights; a byte hash / a single memcmp) from
+    // typed-field (BLAKE3-digest-backed; rarer in practice) so it's clear
+    // which one, if either, actually accounts for those two passes' cost.
+    const auto& cse_t = onnx::optimization::GetCSEHashCompareTiming();
+    std::cerr << "\nonnxsim CSETensorHash / CSETensorCompare breakdown "
+                 "(inside eliminate_duplicate_initializer / "
+                 "eliminate_common_subexpression's hash-map lookups)\n"
+              << "-------------------------------------------------------"
+                 "------------------------------------\n"
+              << std::left << std::setw(24) << "" << std::right << std::setw(14)
+              << "total(ms)" << std::setw(10) << "calls" << "\n"
+              << std::left << std::setw(24) << "raw_data hash" << std::right
+              << std::setw(14) << std::fixed << std::setprecision(2)
+              << cse_t.raw_hash_ms << std::setw(10) << cse_t.raw_hash_calls
+              << "\n"
+              << std::left << std::setw(24) << "typed-field hash" << std::right
+              << std::setw(14) << cse_t.typed_hash_ms << std::setw(10)
+              << cse_t.typed_hash_calls << "\n"
+              << std::left << std::setw(24) << "raw_data compare" << std::right
+              << std::setw(14) << cse_t.raw_compare_ms << std::setw(10)
+              << cse_t.raw_compare_calls << "\n"
+              << std::left << std::setw(24) << "typed-field compare"
+              << std::right << std::setw(14) << cse_t.typed_compare_ms
+              << std::setw(10) << cse_t.typed_compare_calls << "\n"
+              << "-------------------------------------------------------"
+                 "------------------------------------\n"
+              << "TOTAL hash: " << (cse_t.raw_hash_ms + cse_t.typed_hash_ms)
+              << "ms, TOTAL compare: "
+              << (cse_t.raw_compare_ms + cse_t.typed_compare_ms) << "ms\n";
+
+    // Actual cache hit rate: see cse_util.h's g_raw_hash_cache, keyed by
+    // Tensor::tensor_id().
+    if (cse_t.raw_hash_calls > 0) {
+      std::cerr << "raw_data hash cache: " << cse_t.raw_hash_cache_hits << "/"
+                << cse_t.raw_hash_calls << " calls ("
+                << (100.0 * cse_t.raw_hash_cache_hits / cse_t.raw_hash_calls)
+                << "%) were hits (" << cse_t.raw_hash_cache_hit_ms << "ms) vs "
+                << cse_t.raw_hash_cache_misses << " misses ("
+                << cse_t.raw_hash_cache_miss_ms << "ms).\n";
+    }
+  }
   // Simplification (and some onnx-optimizer passes) can leave nodes without a
   // name; assign unique names to them so downstream tools that key on node
   // names keep working (issue #269).

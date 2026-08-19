@@ -557,3 +557,62 @@ button:focus-visible {
   color: var(--warn);
   font-weight: 600;
 }
+
+/* --- sample-data input/output preview ------------------------------------ */
+.sample-io-panes {
+  display: flex;
+  gap: 1em;
+  flex-wrap: wrap;
+  margin: 0.6em 0;
+}
+.sample-io-panes .dp-pane {
+  flex: 1 1 320px;
+}
+.sample-io-image {
+  display: block;
+  max-width: 100%;
+  max-height: 220px;
+  border-radius: var(--radius);
+  border: 1px solid var(--border);
+}
+.sample-io-text {
+  margin: 0;
+  padding: 0.5em 0.8em;
+  border-left: 3px solid var(--accent);
+  background: var(--accent-soft);
+  border-radius: 3px;
+  font-style: italic;
+}
+.sample-io-caption {
+  color: var(--muted);
+  font-size: 0.85em;
+  margin: 0.4em 0 0;
+}
+.sample-io-note {
+  color: var(--muted);
+  font-size: 0.9em;
+  margin: 0;
+}
+.sample-io-preds {
+  margin: 0;
+  padding-left: 1.4em;
+}
+.sample-io-preds li {
+  display: flex;
+  justify-content: space-between;
+  gap: 0.6em;
+  padding: 0.15em 0;
+  font-variant-numeric: tabular-nums;
+}
+.sample-io-pred-prob {
+  color: var(--muted);
+  white-space: nowrap;
+}
+.sample-io-raw {
+  display: block;
+  overflow-wrap: break-word;
+  background: var(--code-bg);
+  border-radius: 3px;
+  padding: 0.3em 0.5em;
+  font-size: 0.85em;
+}

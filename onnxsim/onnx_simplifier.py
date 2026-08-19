@@ -328,6 +328,44 @@ def import_onnx_schemas() -> int:
     return imported
 
 
+def export_safetensors(model: onnx.ModelProto, out_path: str) -> None:
+    """Export ``model`` to a standalone safetensors archive at ``out_path``.
+
+    Every initializer's bytes move into the archive with real, byte-accurate
+    offsets -- openable by the ``safetensors`` Python package / HF tooling with
+    no onnxsim involved -- and the graph itself is embedded alongside them, so
+    ``out_path`` alone is both the model's weights and its graph. Reload it
+    with :func:`import_safetensors`.
+    """
+    C.export_safetensors(model.SerializeToString(), out_path)
+
+
+def import_safetensors(in_path: str) -> onnx.ModelProto:
+    """Import a standalone safetensors archive back into an ``onnx.ModelProto``.
+
+    ``in_path`` must be an archive produced by :func:`export_safetensors` (or
+    any other tool following the same self-describing-archive convention: an
+    embedded ``model.onnx`` entry alongside the tensors). Raises
+    ``RuntimeError`` if the archive has no embedded onnxsim model, e.g. a
+    plain weights-only safetensors file with no graph to import.
+    """
+    model = onnx.ModelProto()
+    model.ParseFromString(C.import_safetensors(in_path))
+    return model
+
+
+def export_gguf(model: onnx.ModelProto, out_path: str) -> None:
+    """GGUF counterpart of :func:`export_safetensors`."""
+    C.export_gguf(model.SerializeToString(), out_path)
+
+
+def import_gguf(in_path: str) -> onnx.ModelProto:
+    """GGUF counterpart of :func:`import_safetensors`."""
+    model = onnx.ModelProto()
+    model.ParseFromString(C.import_gguf(in_path))
+    return model
+
+
 def _snapshot_doc_strings(model: onnx.ModelProto) -> dict:
     """Capture the ``doc_string`` fields that the C++ optimizer discards."""
     return {
@@ -868,7 +906,15 @@ class PyModelExecutor(C.ModelExecutor):
         input_arrs = map(onnx.numpy_helper.to_array, input_tps)
         input_names = [x.name for x in model.graph.input]
         inputs = dict(zip(input_names, input_arrs))
-        outputs = backend.run_model(model, inputs, providers=self.providers)
+        # This executor is only ever invoked by the C++ core's constant-folding
+        # ``RunOps`` (see onnxsim.cpp) to run one throwaway fold-group
+        # sub-model, never for the full-size correctness check -- so it is
+        # always safe (and, given how many of these run per model, usually a
+        # meaningful speedup) to skip onnxruntime's per-session thread-pool
+        # spin-up.
+        outputs = backend.run_model(
+            model, inputs, providers=self.providers, single_threaded=True
+        )
         # The inference backend may return a non-ndarray for an output (for
         # example onnxruntime yields an empty Python list for an empty sequence
         # output). onnx.numpy_helper.from_array only accepts numpy arrays, so

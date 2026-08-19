@@ -1,3 +1,4 @@
+import copy
 from typing import Dict, Iterable, List, Optional, Set, Union
 
 import numpy as np
@@ -50,6 +51,54 @@ def _iter_graph_nodes(graph: onnx.GraphProto) -> Iterable[onnx.NodeProto]:
                 yield from _iter_graph_nodes(attr.g)
             for subgraph in attr.graphs:
                 yield from _iter_graph_nodes(subgraph)
+
+
+# Ops whose output is intentionally non-deterministic per the ONNX spec, but
+# which all accept an optional FLOAT ``seed`` attribute to pin that output.
+_RANDOM_OP_TYPES = frozenset(
+    {
+        "RandomNormal",
+        "RandomNormalLike",
+        "RandomUniform",
+        "RandomUniformLike",
+        "Multinomial",
+    }
+)
+
+
+def _is_unseeded_random_node(node: onnx.NodeProto) -> bool:
+    return node.op_type in _RANDOM_OP_TYPES and not any(
+        attr.name == "seed" for attr in node.attribute
+    )
+
+
+def _has_unseeded_random_ops(model: Union[str, onnx.ModelProto]) -> bool:
+    # Structure-only load (no external data / initializers) is enough: op_type
+    # and attributes don't depend on tensor weights.
+    m = onnx.load(model, load_external_data=False) if isinstance(model, str) else model
+    return any(_is_unseeded_random_node(node) for node in _iter_graph_nodes(m.graph))
+
+
+def _with_fixed_random_seeds(
+    model: Union[str, onnx.ModelProto], seed: float
+) -> onnx.ModelProto:
+    """Return a copy of ``model`` with every unseeded Random* op pinned to ``seed``.
+
+    Random* ops (RandomNormal[Like], RandomUniform[Like], Multinomial) draw
+    fresh noise on every onnxruntime session. ``compare`` creates a brand-new
+    session per model per check_n trial, so comparing the original and
+    simplified outputs is otherwise meaningless regardless of whether
+    simplification changed anything -- confirmed in practice on VOICEVOX's
+    predict_sing_f0.onnx, a flow-matching pitch predictor whose unseeded
+    RandomNormalLike nodes made every check_n trial report a false failure.
+    This only ever mutates a throwaway copy used for one comparison trial; the
+    model returned to the caller is never touched.
+    """
+    model = onnx.load(model) if isinstance(model, str) else copy.deepcopy(model)
+    for node in _iter_graph_nodes(model.graph):
+        if _is_unseeded_random_node(node):
+            node.attribute.append(onnx.helper.make_attribute("seed", seed))
+    return model
 
 
 def _custom_default_domain_ops(model: onnx.ModelProto) -> Set[str]:
@@ -240,14 +289,28 @@ def compare(
             )
         else:
             raise
+    # Only models with Random* ops pay for the extra per-trial copy below; the
+    # overwhelming majority of models have none and this check is a cheap,
+    # structure-only scan. Skipped entirely when n_times == 0: the loop below
+    # never runs, and model_ori may already be None at that point (the caller
+    # frees it once check_n == 0 makes it unnecessary).
+    needs_seeding = n_times > 0 and (
+        _has_unseeded_random_ops(model_opt) or _has_unseeded_random_ops(model_ori)
+    )
     for i in range(n_times):
         print(f"Checking {i}/{n_times}...")
         if input_data is None:
             inputs = generate_rand_input(model_opt, input_shapes=input_shapes)
         else:
             inputs = input_data
-        res_ori = forward(model_ori, inputs, custom_lib)
-        res_opt = forward(model_opt, inputs, custom_lib)
+        if needs_seeding:
+            trial_ori = _with_fixed_random_seeds(model_ori, float(i))
+            trial_opt = _with_fixed_random_seeds(model_opt, float(i))
+        else:
+            trial_ori = model_ori
+            trial_opt = model_opt
+        res_ori = forward(trial_ori, inputs, custom_lib)
+        res_opt = forward(trial_opt, inputs, custom_lib)
 
         for name in res_opt.keys():
             if not np.allclose(res_opt[name], res_ori[name], rtol=rtol, atol=atol):

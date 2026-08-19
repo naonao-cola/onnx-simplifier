@@ -15,7 +15,7 @@ cd $SCRIPT_DIR
 if which protoc ; then
     PROTOC=$(which protoc)
 else
-    . ./third_party/onnx-optimizer/third_party/onnx/workflow_scripts/protobuf/build_protobuf_unix.sh $(nproc) $PWD/protobuf
+    . ./third_party/onnx/workflow_scripts/protobuf/build_protobuf_unix.sh $(nproc) $PWD/protobuf
     PROTOC=$(which protoc)
 fi
 

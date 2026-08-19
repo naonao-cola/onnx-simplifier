@@ -18,7 +18,7 @@ SYSROOT="${SYSROOT:-/rootfs-s390x}"
 JOBS="${JOBS:-$(nproc)}"
 PYVER="${PYVER:-3.12}"
 
-ONNX_DIR="${REPO_ROOT}/third_party/onnx-optimizer/third_party/onnx"
+ONNX_DIR="${REPO_ROOT}/third_party/onnx"
 SBOM="${ONNX_DIR}/sbom.cdx.json"
 
 sbom_ver() {  # sbom_ver <component-name>
@@ -201,8 +201,28 @@ cmake --build "${BUILD_DIR}" --target onnx_cpp2py_export -j "${JOBS}"
 # The dependency-free unit tests (ONNXSIM_TESTS=ON above). dlpack_dtype_test is
 # the one that covers the byte-order conversion directly; the rest come along
 # because they are cheap and exercise the same cross-built toolchain.
+# tensor_pool_dtype_test/tensor_pool_test (safetensors) and
+# gguf_dtype_test/tensor_pool_gguf_test (GGUF) are likewise dependency-free
+# (each format's own byte-order handling; see tensor_pool.h's "Byte order"
+# note and tensor_pool_gguf.cpp's mirror of it) and belong in this list for
+# the same reason. tensor_pool_hash_test (TensorPool::ContentHash's BLAKE3 /
+# SHA-256 backends) is dependency-free too and belongs here for the same
+# reason -- CMake still registers it as a ctest target even if it's left off
+# this list, so omitting it here doesn't skip the test, it makes ctest try to
+# exec a binary that was never built: an instant, silent "Failed 0.00 sec"
+# with no output, indistinguishable at a glance from a real crash.
 cmake --build "${BUILD_DIR}" --target sym_expr_test model_metrics_test \
-  sym_value_eval_test sym_shape_infer_test dlpack_dtype_test -j "${JOBS}"
+  sym_value_eval_test sym_shape_infer_test dlpack_dtype_test \
+  tensor_pool_dtype_test tensor_pool_test tensor_pool_hash_test \
+  gguf_dtype_test tensor_pool_gguf_test -j "${JOBS}"
+# tensor_pool_bridge_test, tensor_pool_gguf_bridge_test, and
+# tensor_pool_archive_test are NOT dependency-free (they exercise the
+# onnx::TensorProto <-> TensorPool bridges), but the onnx/onnx-optimizer
+# static libraries they need are already built as a side effect of the
+# onnxsim_cpp2py_export target above, so they cost only their own link step
+# here rather than a second onnx build.
+cmake --build "${BUILD_DIR}" --target tensor_pool_bridge_test \
+  tensor_pool_gguf_bridge_test tensor_pool_archive_test -j "${JOBS}"
 
 SO="$(find "${BUILD_DIR}" -name 'onnxsim_cpp2py_export*.so' -print -quit)"
 [[ -n "${SO}" ]] || { echo "no extension module produced"; exit 1; }

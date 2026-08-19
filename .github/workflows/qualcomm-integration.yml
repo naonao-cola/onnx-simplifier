@@ -22,6 +22,7 @@ on:
     paths:
       - ".github/workflows/qualcomm-integration.yml"
       - "scripts/qualcomm/**"
+      - "scripts/common/**"
       - "tests/test_qnn_compat.py"
 
 concurrency:

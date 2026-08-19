@@ -25,6 +25,9 @@
 #include "onnx/proto_utils.h"
 #include "onnxoptimizer/optimize.h"
 #include "onnxsim.h"
+#include "tensor_pool.h"
+#include "tensor_pool_bridge.h"
+#include "tensor_pool_gguf_bridge.h"
 
 namespace py = nanobind;
 using namespace nanobind::literals;
@@ -328,9 +331,8 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
         const ModelInfo info = GetModelInfo(model, run_shape_inference);
         auto to_poly = [](const onnxsim::SymExpr& expr) {
           std::vector<std::pair<int64_t, std::vector<std::string>>> poly;
-          for (const auto& [monomial, coeff] : expr.terms()) {
+          for (const auto& [monomial, coeff] : expr.terms())
             poly.emplace_back(coeff, monomial);
-          }
           return poly;
         };
         return std::make_tuple(info.op_nums, info.model_size,
@@ -552,4 +554,62 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
         return onnxsim::MakeFunctionProtoRewriter(std::move(converted));
       },
       "rules"_a);
+
+  // Standalone safetensors/GGUF archive export/import: a model's graph and
+  // weights packaged together in one ecosystem-standard file (see
+  // onnxsim/tensor_pool_bridge.h and tensor_pool_gguf_bridge.h's *Standalone
+  // functions for the real-offset design). Exchanged as bytes for the model
+  // (like ``simplify``) and a real path for the archive itself, since the
+  // archive is inherently file-based.
+  m.def(
+      "export_safetensors",
+      [](const py::bytes& model_bytes, const std::string& out_path) {
+        onnx::ModelProto model;
+        ParseProtoFromBytes(&model, model_bytes.c_str(), model_bytes.size());
+        onnxsim::tensor_pool::TensorPool pool;
+        onnxsim::tensor_pool::SaveModelAsSafetensorsStandalone(model, out_path,
+                                                               pool);
+      },
+      "model_bytes"_a, "out_path"_a);
+
+  m.def(
+      "import_safetensors",
+      [](const std::string& in_path) -> py::bytes {
+        onnx::ModelProto model;
+        onnxsim::tensor_pool::TensorPool pool;
+        if (!onnxsim::tensor_pool::LoadModelFromSafetensors(in_path, &model,
+                                                            pool)) {
+          throw std::runtime_error(
+              "safetensors file has no embedded onnxsim model (a plain "
+              "weights-only archive is not importable as a graph)");
+        }
+        const std::string out = model.SerializeAsString();
+        return py::bytes(out.data(), out.size());
+      },
+      "in_path"_a);
+
+  m.def(
+      "export_gguf",
+      [](const py::bytes& model_bytes, const std::string& out_path) {
+        onnx::ModelProto model;
+        ParseProtoFromBytes(&model, model_bytes.c_str(), model_bytes.size());
+        onnxsim::tensor_pool::TensorPool pool;
+        onnxsim::tensor_pool::SaveModelAsGGUFStandalone(model, out_path, pool);
+      },
+      "model_bytes"_a, "out_path"_a);
+
+  m.def(
+      "import_gguf",
+      [](const std::string& in_path) -> py::bytes {
+        onnx::ModelProto model;
+        onnxsim::tensor_pool::TensorPool pool;
+        if (!onnxsim::tensor_pool::LoadModelFromGGUF(in_path, &model, pool)) {
+          throw std::runtime_error(
+              "gguf file has no embedded onnxsim model (a plain weights-only "
+              "archive is not importable as a graph)");
+        }
+        const std::string out = model.SerializeAsString();
+        return py::bytes(out.data(), out.size());
+      },
+      "in_path"_a);
 }

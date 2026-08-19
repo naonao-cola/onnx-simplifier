@@ -267,6 +267,35 @@ def test_print_simplifying_info_symbolic_does_not_raise():
     model_info.print_simplifying_info(model, model)  # must not raise on symbolic "<"
 
 
+def test_print_simplifying_info_factor_recursion_error_falls_back(monkeypatch):
+    # On real-world models with many unresolved symbolic dims (e.g. 1000+ node
+    # graphs with data-dependent output shapes), sympy.factor()'s polynomial
+    # arithmetic can exceed Python's recursion limit -- reproduced against
+    # VOICEVOX's predict_sing_f0.onnx / sf_decode.onnx. That must degrade to
+    # the unfactored formula, not crash the whole report.
+    pytest.importorskip("sympy")
+    import sympy
+
+    def _raise_recursion_error(_expr):
+        raise RecursionError("maximum recursion depth exceeded")
+
+    monkeypatch.setattr(sympy, "factor", _raise_recursion_error)
+
+    x = _vi("x", ["batch", 3, 8, 8])
+    w = _weight("w", [4, 3, 3, 3])
+    y = _vi("y", ["batch", 4, 8, 8])
+    node = helper.make_node(
+        "Conv", ["x", "w"], ["y"], kernel_shape=[3, 3], pads=[1, 1, 1, 1]
+    )
+    model = _model([node], [x], [y], [w])
+    model_info.print_simplifying_info(model, model)  # must not raise
+
+    batch = sympy.Symbol("batch")
+    assert human_readable_num(9472 * batch) == str(9472 * batch)
+    assert human_readable_size(9472 * batch) == str(9472 * batch)
+    assert human_readable_density(9472 * batch) == f"{9472 * batch} FLOP/Byte"
+
+
 def test_dynamic_dim_without_sympy_assumes_one(monkeypatch):
     # With sympy unavailable, dynamic dims are assumed 1 (per-sample MACs).
     monkeypatch.setattr(model_info, "sympy", None)

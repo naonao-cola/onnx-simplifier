@@ -128,6 +128,7 @@ def _run_with_onnxruntime(
     output_names: Optional[Sequence[str]],
     custom_lib: Optional[str],
     providers: Optional[Sequence[Provider]] = None,
+    single_threaded: bool = False,
 ) -> "OrderedDict[str, np.ndarray]":
     if providers is None:
         providers = DEFAULT_PROVIDERS
@@ -140,6 +141,27 @@ def _run_with_onnxruntime(
             raise ValueError("No such file '{}'".format(custom_lib))
     sess_options.graph_optimization_level = rt.GraphOptimizationLevel(0)
     sess_options.log_severity_level = 3
+    # Every session created here runs exactly once (one Run() call), so
+    # onnxruntime's memory-pattern optimizer -- which spends time up front
+    # planning buffer reuse across *repeated* Run() calls -- pays for itself
+    # never. Disabling it removes that planning cost from every session.
+    sess_options.enable_mem_pattern = False
+    if single_threaded:
+        # Constant folding creates one throwaway session per fold-group, often
+        # hundreds of times per model (once per batch of foldable nodes, per
+        # fixed-point round -- see ``RunOps`` in onnxsim.cpp). Each session
+        # otherwise spins up a fresh intra-op thread pool sized to the machine's
+        # CPU count purely to run, and then discard, a handful of shape/index
+        # ops on tiny tensors; that thread-pool spin-up/join is pure overhead
+        # for graphs this small, and it is repeated at every one of those
+        # session creations. Comparable to onnxsim issue observations that
+        # ``OrtSessionInit`` (not the actual op execution) is usually the
+        # dominant cost of a fold session. Running single-threaded skips it.
+        # Not applied to the ``model_checking`` correctness-check path, which
+        # runs the full (potentially large) model and can benefit from real
+        # parallelism.
+        sess_options.intra_op_num_threads = 1
+        sess_options.inter_op_num_threads = 1
     # Optionally turn on onnxruntime's own per-operator session profiler for this
     # folding session (separate from onnxsim's span profiler; see
     # ``_ort_profile_prefix``). onnxruntime writes one Chrome trace JSON per
@@ -205,6 +227,7 @@ def run_model(
     output_names: Optional[Sequence[str]] = None,
     custom_lib: Optional[str] = None,
     providers: Optional[Sequence[Provider]] = None,
+    single_threaded: bool = False,
 ) -> "OrderedDict[str, np.ndarray]":
     """Run ``model`` on ``inputs`` and return an ordered ``{name: array}`` map.
 
@@ -215,7 +238,16 @@ def run_model(
     :param providers: onnxruntime execution providers to run with, in priority
             order (e.g. ``["CUDAExecutionProvider", "CPUExecutionProvider"]``).
             ``None`` means CPU only. Non-CPU providers require onnxruntime.
+    :param single_threaded: Run the onnxruntime session with a single intra-/
+            inter-op thread instead of onnxruntime's default (one per CPU core).
+            Used by constant folding, which creates many small throwaway
+            sessions where thread-pool spin-up dwarfs the tiny amount of actual
+            work; leave this ``False`` for a full-size model. Ignored by the
+            pure-Python reference-evaluator fallback (no onnxruntime installed),
+            which has no thread pool to configure.
     """
     if _HAS_ONNXRUNTIME:
-        return _run_with_onnxruntime(model, inputs, output_names, custom_lib, providers)
+        return _run_with_onnxruntime(
+            model, inputs, output_names, custom_lib, providers, single_threaded
+        )
     return _run_with_reference(model, inputs, output_names, custom_lib, providers)

@@ -1,3 +1,6 @@
+# Local profiling traces (ONNXSIM_PROFILE=1)
+onnxsim_profile.json
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
@@ -9,7 +12,7 @@ __pycache__/
 # Distribution / packaging
 .Python
 build/
-build-wasm-*/
+build-*/
 develop-eggs/
 dist/
 downloads/

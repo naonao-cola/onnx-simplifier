@@ -7,8 +7,9 @@
 #include "onnxsim_option.h"
 
 // In the ORT-web WASM build (ONNXSIM_WASM_ORT_WEB) onnxsim links no ONNX
-// Runtime (NO_BUILTIN_ORT), so GetBuiltinModelExecutor() does not exist;
-// folding is delegated to onnxruntime-web via GetJsModelExecutor() instead.
+// Runtime (ONNXSIM_HAS_ORT is not defined), so GetBuiltinModelExecutor() does
+// not exist; folding is delegated to onnxruntime-web via GetJsModelExecutor()
+// instead.
 // main() is not auto-run under Emscripten (INVOKE_RUN=0) but still has to
 // compile.
 #ifdef ONNXSIM_WASM_ORT_WEB

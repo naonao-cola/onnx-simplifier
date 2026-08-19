@@ -1,0 +1,71 @@
+name: VOICEVOX regression test
+
+# Builds onnxsim from source and runs tests/test_voicevox.py, which downloads
+# the real ONNX models from voicevox_core's model/sample.vvm dev fixture
+# (https://github.com/VOICEVOX/voicevox_core) and simplifies each with
+# onnxsim. This guards against onnxsim regressions on VOICEVOX-style graphs --
+# see tests/test_voicevox.py's module docstring for the two real onnxsim bugs
+# this surfaced (a false check_n failure on models with Random* ops, and a
+# sympy RecursionError crash on models with deep symbolic MACs/FLOPs
+# formulas).
+
+# Downloads real models over the network and, for the decoder/vocoder cases,
+# takes several minutes per model under check_n=3 -- too slow/network-
+# dependent to run on every PR unconditionally. It always runs weekly and on
+# push to the default branch, and additionally runs on a PR when the PR
+# itself touches the files this test exists to guard (the test itself, or the
+# onnxsim modules it exercises -- model_checking.py's Random*-op seed pinning
+# and model_info.py's symbolic-formula crash fix); use workflow_dispatch to
+# trigger it manually against a branch for any other change.
+on:
+  push:
+    branches:
+      - main
+      - master
+  pull_request:
+    paths:
+      - tests/test_voicevox.py
+      - onnxsim/model_checking.py
+      - onnxsim/model_info.py
+      - .github/workflows/voicevox.yml
+  schedule:
+    - cron: '0 8 * * 1'  # weekly, Monday 08:00 UTC
+  workflow_dispatch:
+
+jobs:
+  voicevox:
+    name: VOICEVOX sample.vvm -> onnxsim
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      CMAKE_GENERATOR: Ninja
+      CMAKE_CXX_COMPILER_LAUNCHER: sccache
+      SCCACHE_GHA_ENABLED: 'on'
+      ACTIONS_CACHE_SERVICE_V2: 'on'
+      ONNXSIM_RUN_VOICEVOX_TESTS: '1'
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.11'
+      - uses: mozilla-actions/sccache-action@v0.0.11
+
+      - name: Install build tooling
+        run: pip install cmake ninja "setuptools>=77" sccache
+
+      - name: Install test dependencies
+        run: pip install pytest onnxruntime
+
+      # Build the onnxsim under test last so it wins over anything a dependency
+      # might have pulled. --no-build-isolation reuses the tooling installed above.
+      - name: Build onnxsim (editable)
+        run: pip install --no-build-isolation -ve .
+
+      - name: Verify onnxsim under test is the source build
+        run: python -c "import onnxsim, onnxsim.onnxsim_cpp2py_export; print('onnxsim', onnxsim.__version__, onnxsim.__file__)"
+
+      - name: Run VOICEVOX regression test
+        run: pytest -v tests/test_voicevox.py

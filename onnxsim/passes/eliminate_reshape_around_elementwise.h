@@ -229,13 +229,23 @@ struct EliminateReshapeAroundElementwise final : public PredicateBasedPass {
       n->replaceInput(i, src);
     }
     // The region now computes on the flattened (2-D) tensors, so the cached N-D
-    // shapes on its outputs are stale. Wipe them so the next shape-inference
-    // pass recomputes the 2-D shapes; a leftover 3-D value_info would otherwise
-    // trip strict consumers (e.g. onnxruntime's Gemm rank check) even though
-    // the graph is numerically correct.
+    // shapes on its outputs are stale. Every region member is shape-preserving
+    // and was collected precisely because its output shape equals `top`'s (see
+    // the SameShape check above), so its new output shape is exactly
+    // `flat_shape` -- set it directly instead of wiping it and waiting for the
+    // next full-graph shape-inference pass to recompute it. On a deep network
+    // with many structurally-identical regions (e.g. one per transformer
+    // block), leaving shapes stale here means only one region can be matched
+    // per InferShapes/Optimize round (patternMatchPredicate above requires
+    // has_sizes() on both the flatten's input and output), which turns an
+    // O(1)-round rewrite into an O(depth)-round one -- and every extra round
+    // pays a full model copy in onnx-optimizer's ModelProto<->Graph
+    // conversion. Setting the shape here lets the pass manager's own internal
+    // fixed point (which re-scans without re-running shape inference) find
+    // and fix every region in a single call.
     for (Node* n : region) {
       for (Value* out : n->outputs()) {
-        out->wipeSizes();
+        out->setSizes(flat_shape);
       }
     }
     flat->output()->replaceAllUsesWith(top);

@@ -367,6 +367,69 @@ extern "C" {
         out_error: *mut *mut c_char,
     ) -> c_int;
 
+    /// Export a serialized ONNX `ModelProto` to a standalone safetensors
+    /// archive at `out_path`: every initializer's bytes move into the archive
+    /// with real, byte-accurate offsets (openable by the `safetensors` Python
+    /// package / HF tooling with no onnxsim involved), and the graph itself is
+    /// embedded alongside them, so `out_path` alone is both the model's
+    /// weights and its graph. Reload it with [`onnxsim_import_safetensors`].
+    /// On `ONNXSIM_ERROR`, `out_error` owns a message to free with
+    /// [`onnxsim_free_string`].
+    ///
+    /// # Safety
+    /// `model_data` must point to at least `model_size` bytes; `out_path` must
+    /// be a valid NUL-terminated path; `out_error`, if non-null, receives an
+    /// owned string that must be freed exactly once.
+    pub fn onnxsim_export_safetensors(
+        model_data: *const c_void,
+        model_size: usize,
+        out_path: *const c_char,
+        out_error: *mut *mut c_char,
+    ) -> c_int;
+
+    /// Import a standalone safetensors archive at `in_path` (as produced by
+    /// [`onnxsim_export_safetensors`], or any other tool following the same
+    /// self-describing-archive convention) back into an ordinary, fully
+    /// in-memory ONNX `ModelProto`. On `ONNXSIM_OK`, `out_data`/`out_size` own
+    /// a buffer to free with [`onnxsim_free_buffer`]. Fails with
+    /// `ONNXSIM_ERROR` if the archive has no embedded onnxsim model (e.g. a
+    /// plain weights-only safetensors file with no graph to import).
+    ///
+    /// # Safety
+    /// `in_path` must be a valid NUL-terminated path; `out_data`/`out_size`/
+    /// `out_error`, if non-null, receive owned values that must be freed
+    /// exactly once.
+    pub fn onnxsim_import_safetensors(
+        in_path: *const c_char,
+        out_data: *mut *mut c_void,
+        out_size: *mut usize,
+        out_error: *mut *mut c_char,
+    ) -> c_int;
+
+    /// GGUF counterpart of [`onnxsim_export_safetensors`]. Same contract.
+    ///
+    /// # Safety
+    /// Same as [`onnxsim_export_safetensors`].
+    pub fn onnxsim_export_gguf(
+        model_data: *const c_void,
+        model_size: usize,
+        out_path: *const c_char,
+        out_error: *mut *mut c_char,
+    ) -> c_int;
+
+    /// GGUF counterpart of [`onnxsim_import_safetensors`]. Same contract,
+    /// including failing with `ONNXSIM_ERROR` when the archive has no
+    /// embedded model.
+    ///
+    /// # Safety
+    /// Same as [`onnxsim_import_safetensors`].
+    pub fn onnxsim_import_gguf(
+        in_path: *const c_char,
+        out_data: *mut *mut c_void,
+        out_size: *mut usize,
+        out_error: *mut *mut c_char,
+    ) -> c_int;
+
     /// Free a buffer produced by an `out_data` parameter. Null is ignored.
     ///
     /// # Safety

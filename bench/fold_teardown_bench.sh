@@ -12,7 +12,7 @@
 #                 PROTOBUF_LIBS if pkg-config can't find it.
 #
 # Example against a CMake build tree at build/:
-#   ONNX_INCLUDE="third_party/onnx-optimizer/third_party/onnx:build" \
+#   ONNX_INCLUDE="third_party/onnx:build" \
 #   ONNX_LIB="build:build/lib" \
 #   bench/fold_teardown_bench.sh 20000 8 1 16
 #
