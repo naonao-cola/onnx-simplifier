@@ -1457,7 +1457,7 @@ void EliminateZeroRnnInitialState(onnx::Graph& graph) {
   const auto& initializer_names = graph.initializer_names();
   initializer_by_name.reserve(initializers.size());
   for (size_t i = 0; i < initializers.size(); ++i) {
-    initializer_by_name[initializer_names[i]] = &initializers[i];
+    initializer_by_name[initializer_names[i]] = initializers[i].get();
   }
   std::unordered_map<const onnx::Value*, bool> memo;
   onnx::Value* undefined = nullptr;
