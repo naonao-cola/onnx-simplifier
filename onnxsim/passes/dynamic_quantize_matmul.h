@@ -57,15 +57,13 @@ struct DynamicQuantizeMatMul final : public PredicateBasedPass {
   explicit DynamicQuantizeMatMul()
       : PredicateBasedPass(PassType::Other, PassEfficiency::Complete,
                            PassOptimizationType::Compute) {}
-  std::string getPassName() const override {
-    return "dynamic_quantize_matmul";
-  }
+  std::string getPassName() const override { return "dynamic_quantize_matmul"; }
 
   // The pieces of a MatMul/vanilla-Gemm node this pass cares about.
   struct MatMulLikeInfo {
-    Value* x = nullptr;      // activation (not required to be constant)
-    Value* w = nullptr;      // weight; must be a constant 2-D float32 tensor
-    Value* bias = nullptr;   // Gemm's optional C input; nullptr for MatMul
+    Value* x = nullptr;     // activation (not required to be constant)
+    Value* w = nullptr;     // weight; must be a constant 2-D float32 tensor
+    Value* bias = nullptr;  // Gemm's optional C input; nullptr for MatMul
     bool weight_transposed = false;  // Gemm transB == 1: W stored as [N, K]
   };
 
@@ -175,7 +173,7 @@ struct DynamicQuantizeMatMul final : public PredicateBasedPass {
     }
     const Tensor* w_t = FetchConstantTensor(info.w);
     return w_t != nullptr && w_t->elem_type() == TensorProto_DataType_FLOAT &&
-          w_t->sizes().size() == 2;
+           w_t->sizes().size() == 2;
   }
 
   bool runTransform(Node* n, Graph& graph,

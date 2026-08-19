@@ -102,9 +102,7 @@ def test_quantize_skips_non_constant_weight():
     # Both MatMul operands are graph inputs (neither is a constant), so there
     # is nothing to quantize ahead of time.
     nodes = [onnx.helper.make_node("MatMul", ["X", "W"], ["Y"])]
-    model = _model(
-        nodes, [_vi("X", [4, 8]), _vi("W", [8, 4])], [_vi("Y", [4, 4])], []
-    )
+    model = _model(nodes, [_vi("X", [4, 8]), _vi("W", [8, 4])], [_vi("Y", [4, 4])], [])
     quant = onnxsim.quantize_dynamic(model)
     assert _op_counts(quant)["MatMul"] == 1
 
