@@ -224,6 +224,136 @@ void TestSkipsUnsupportedDtype() {
   std::remove(path.c_str());
 }
 
+void TestLoadGGUFMmapRoundTrip() {
+  // Mirrors TestRoundTrip, but through the mmap-backed loader -- same
+  // dimension-order and byte-content checks, to confirm the mapped path
+  // parses identically to the seek+read path, not just that it doesn't
+  // crash.
+  TensorPool pool;
+  pool.Add("weight", ONNX_FLOAT, {2, 3}, std::string(24, '\x11'));
+  pool.Add("bias", ONNX_INT64, {4}, std::string(32, '\x22'));
+  pool.Add("scalar", ONNX_INT8, {}, std::string(1, '\x33'));
+
+  std::string path = TempPath("_mmap_roundtrip.gguf");
+  pool.SaveGGUF(path, {{"general.architecture", "onnxsim-test"}});
+
+  TensorPool loaded;
+  auto skipped = loaded.LoadGGUFMmap(path);
+  Check(skipped.empty(), "mmap: nothing skipped for an all-raw-dtype pool");
+  Check(loaded.size() == 3, "mmap: all three tensors loaded");
+
+  const Entry* w = loaded.Find("weight");
+  Check(w != nullptr, "mmap: weight present");
+  if (w != nullptr) {
+    Check(w->dtype == ONNX_FLOAT, "mmap: weight dtype round-trips");
+    Check(w->shape == std::vector<int64_t>({2, 3}),
+          "mmap: weight shape round-trips in the RIGHT order (not "
+          "transposed to {3, 2})");
+    Check(w->data == std::string(24, '\x11'), "mmap: weight bytes round-trip");
+  }
+
+  const Entry* b = loaded.Find("bias");
+  Check(b != nullptr && b->dtype == ONNX_INT64 &&
+            b->shape == std::vector<int64_t>({4}) &&
+            b->data == std::string(32, '\x22'),
+        "mmap: bias round-trips");
+
+  const Entry* s = loaded.Find("scalar");
+  Check(s != nullptr && s->shape.empty() && s->data == std::string(1, '\x33'),
+        "mmap: rank-0 (scalar) tensor round-trips");
+
+  std::remove(path.c_str());
+}
+
+void TestLoadGGUFMmapSkipsUnsupportedDtype() {
+  // Same hand-built file as TestSkipsUnsupportedDtype (one raw F32 tensor,
+  // one made-up quantized type this pool can't represent), loaded through
+  // LoadGGUFMmap -- confirms the mapped path skips-and-reports exactly like
+  // the seek+read path rather than e.g. faulting trying to decode it.
+  std::string path = TempPath("_mmap_quantized.gguf");
+  {
+    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    auto write_string = [&](const std::string& s) {
+      WriteLE<uint64_t>(out, s.size());
+      out.write(s.data(), static_cast<std::streamsize>(s.size()));
+    };
+
+    WriteLE<uint32_t>(out, kMagic);
+    WriteLE<uint32_t>(out, kSupportedVersion);
+    WriteLE<uint64_t>(out, 2);  // tensor_count
+    WriteLE<uint64_t>(out, 0);  // metadata_kv_count
+
+    write_string("raw");
+    WriteLE<uint32_t>(out, 1);
+    WriteLE<uint64_t>(out, 2);
+    WriteLE<uint32_t>(out, GGML_TYPE_F32);
+    WriteLE<uint64_t>(out, 0);
+
+    write_string("quant");
+    WriteLE<uint32_t>(out, 1);
+    WriteLE<uint64_t>(out, 32);
+    WriteLE<uint32_t>(out, 2);  // GGML_TYPE_Q4_0
+    WriteLE<uint64_t>(out, kDefaultAlignment);
+
+    uint64_t header_end = static_cast<uint64_t>(out.tellp());
+    uint64_t data_start = (header_end + kDefaultAlignment - 1) /
+                          kDefaultAlignment * kDefaultAlignment;
+    for (uint64_t i = header_end; i < data_start; ++i) out.put('\0');
+
+    WriteLE<float>(out, 1.5f);
+    WriteLE<float>(out, -2.5f);
+    uint64_t cur = static_cast<uint64_t>(out.tellp()) - data_start;
+    for (uint64_t i = cur; i < kDefaultAlignment; ++i) out.put('\0');
+    for (int i = 0; i < 18; ++i) out.put('\xAB');
+  }
+
+  TensorPool pool;
+  auto skipped = pool.LoadGGUFMmap(path);
+  Check(skipped.size() == 1 && skipped[0] == "quant",
+        "mmap: the quantized tensor is skipped and reported by name");
+  Check(pool.size() == 1, "mmap: only the raw tensor made it into the pool");
+  const Entry* raw = pool.Find("raw");
+  Check(raw != nullptr && raw->dtype == ONNX_FLOAT &&
+            raw->shape == std::vector<int64_t>({2}),
+        "mmap: the raw tensor itself loaded correctly despite its sibling "
+        "being skipped");
+  Check(pool.Find("quant") == nullptr,
+        "mmap: the skipped tensor is definitely not silently present with "
+        "garbage data");
+  std::remove(path.c_str());
+}
+
+void TestLoadGGUFMmapRejectsBadMagic() {
+  std::string path = TempPath("_mmap_bad_magic.gguf");
+  std::ofstream out(path, std::ios::binary);
+  WriteLE<uint32_t>(out, 0xDEADBEEF);
+  WriteLE<uint32_t>(out, kSupportedVersion);
+  out.close();
+  TensorPool pool;
+  bool threw = false;
+  try {
+    pool.LoadGGUFMmap(path);
+  } catch (const std::runtime_error&) {
+    threw = true;
+  }
+  Check(threw, "mmap: bad magic is rejected");
+  std::remove(path.c_str());
+}
+
+void TestLoadGGUFMmapMissingFileFallsBackAndThrows() {
+  // No such file: TryMmapFile fails, so this exercises the fallback to
+  // LoadGGUF, which should throw its own "cannot open" error rather than
+  // silently succeeding.
+  TensorPool pool;
+  bool threw = false;
+  try {
+    pool.LoadGGUFMmap(TempPath("_mmap_missing.gguf"));
+  } catch (const std::runtime_error&) {
+    threw = true;
+  }
+  Check(threw, "mmap: loading a missing file throws (via read fallback)");
+}
+
 void TestRejectsBadMagicAndVersion() {
   {
     std::string path = TempPath("_bad_magic.gguf");
@@ -284,6 +414,10 @@ int main() {
   TestSkipsUnsupportedDtype();
   TestRejectsBadMagicAndVersion();
   TestRejectsUnrepresentableDtype();
+  TestLoadGGUFMmapRoundTrip();
+  TestLoadGGUFMmapSkipsUnsupportedDtype();
+  TestLoadGGUFMmapRejectsBadMagic();
+  TestLoadGGUFMmapMissingFileFallsBackAndThrows();
 
   if (g_failures == 0) {
     std::printf("tensor_pool_gguf_test: all checks passed\n");
