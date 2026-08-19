@@ -83,9 +83,9 @@ struct FileMapping {
 // back to an ordinary read.
 std::pair<std::shared_ptr<const char[]>, uint64_t> TryMmapFile(
     const std::string& path) {
-  HANDLE file = ::CreateFileA(path.c_str(), GENERIC_READ, FILE_SHARE_READ,
-                              nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL,
-                              nullptr);
+  HANDLE file =
+      ::CreateFileA(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
+                    OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
   if (file == INVALID_HANDLE_VALUE) return {nullptr, 0};
   LARGE_INTEGER size;
   if (!::GetFileSizeEx(file, &size) || size.QuadPart <= 0) {
@@ -130,7 +130,7 @@ std::pair<std::shared_ptr<const char[]>, uint64_t> TryMmapFile(
     const std::string& path) {
   int fd = ::open(path.c_str(), O_RDONLY);
   if (fd < 0) return {nullptr, 0};
-  struct stat st{};
+  struct stat st {};
   if (::fstat(fd, &st) != 0 || st.st_size <= 0) {
     ::close(fd);
     return {nullptr, 0};
@@ -677,8 +677,8 @@ void TensorPool::LoadSafetensorsMmap(const std::string& path) {
   for (auto& th : tensor_headers) {
     if (th.end > data_size) {
       throw std::runtime_error(
-          "TensorPool::LoadSafetensorsMmap: '" + path + "' tensor '" +
-          th.name + "' data_offsets [" + std::to_string(th.begin) + ", " +
+          "TensorPool::LoadSafetensorsMmap: '" + path + "' tensor '" + th.name +
+          "' data_offsets [" + std::to_string(th.begin) + ", " +
           std::to_string(th.end) + ") exceed the file's data segment (" +
           std::to_string(data_size) + " bytes)");
     }
