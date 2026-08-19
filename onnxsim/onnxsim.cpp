@@ -2364,6 +2364,8 @@ onnx::ModelProto Simplify(
     onnx::optimization::ResetPassPhaseTimings();
     onnx::optimization::ResetPassTotalTimings();
     onnx::optimization::ResetCSEHashCompareTiming();
+    onnx::optimization::ResetCSEPassTiming();
+    onnx::optimization::ResetDeadendPassTiming();
     onnx::optimization::SetPassPhaseProfilingEnabled(true);
   }
   // Optionally merge ONNX Runtime's own per-session profiles into the onnxsim
@@ -2641,11 +2643,26 @@ onnx::ModelProto Simplify(
               << std::left << std::setw(24) << "typed-field compare"
               << std::right << std::setw(14) << cse_t.typed_compare_ms
               << std::setw(10) << cse_t.typed_compare_calls << "\n"
+              << std::left << std::setw(24) << "node hash (CSENodeHash)"
+              << std::right << std::setw(14) << cse_t.node_hash_ms
+              << std::setw(10) << cse_t.node_hash_calls << "\n"
+              << std::left << std::setw(24) << "  of which attrs+sort"
+              << std::right << std::setw(14) << cse_t.node_hash_attrsort_ms
+              << std::setw(10) << cse_t.node_hash_attrsort_calls << "\n"
+              << std::left << std::setw(24) << "node equal (CSEEqual)"
+              << std::right << std::setw(14) << cse_t.node_equal_ms
+              << std::setw(10) << cse_t.node_equal_calls << "\n"
+              << std::left << std::setw(24) << "  of which attrs+sort"
+              << std::right << std::setw(14) << cse_t.node_equal_attrsort_ms
+              << std::setw(10) << cse_t.node_equal_attrsort_calls << "\n"
               << "-------------------------------------------------------"
                  "------------------------------------\n"
-              << "TOTAL hash: " << (cse_t.raw_hash_ms + cse_t.typed_hash_ms)
+              << "TOTAL hash: "
+              << (cse_t.raw_hash_ms + cse_t.typed_hash_ms + cse_t.node_hash_ms)
               << "ms, TOTAL compare: "
-              << (cse_t.raw_compare_ms + cse_t.typed_compare_ms) << "ms\n";
+              << (cse_t.raw_compare_ms + cse_t.typed_compare_ms +
+                  cse_t.node_equal_ms)
+              << "ms\n";
 
     // Actual cache hit rate: see cse_util.h's g_raw_hash_cache, keyed by
     // Tensor::tensor_id().
@@ -2657,6 +2674,37 @@ onnx::ModelProto Simplify(
                 << cse_t.raw_hash_cache_misses << " misses ("
                 << cse_t.raw_hash_cache_miss_ms << "ms).\n";
     }
+
+    // eliminate_common_subexpression's own outer-loop breakdown: filtering
+    // (hasUses/IsSupportedByCSE), the hash_map.emplace() lookup itself
+    // (overlaps with node_hash_ms/node_equal_ms above -- same work, two
+    // views), and replacing a found duplicate's uses.
+    const auto& cse_pass_t = onnx::optimization::GetCSEPassTiming();
+    std::cerr << "\nonnxsim eliminate_common_subexpression outer-loop "
+                 "breakdown (across "
+              << cse_pass_t.calls << " calls, " << cse_pass_t.nodes_seen
+              << " nodes seen, " << cse_pass_t.nodes_filtered_out
+              << " filtered out, " << cse_pass_t.nodes_replaced
+              << " replaced)\n"
+              << "-------------------------------------------------------"
+                 "------------------------------------\n"
+              << "  filter (hasUses/IsSupportedByCSE): " << cse_pass_t.filter_ms
+              << "ms\n"
+              << "  lookup (hash_map.emplace):          "
+              << cse_pass_t.lookup_ms << "ms\n"
+              << "  replace (tryReplacingAllUsesWith):   "
+              << cse_pass_t.replace_ms << "ms\n";
+
+    // eliminate_deadend's own breakdown: the liveness check (hasUses) vs
+    // actually unlinking/freeing a dead node (destroyCurrent).
+    const auto& dead_t = onnx::optimization::GetDeadendPassTiming();
+    std::cerr << "\nonnxsim eliminate_deadend breakdown (across "
+              << dead_t.calls << " calls, " << dead_t.nodes_seen
+              << " nodes seen, " << dead_t.nodes_removed << " removed)\n"
+              << "-------------------------------------------------------"
+                 "------------------------------------\n"
+              << "  hasUses():      " << dead_t.has_uses_ms << "ms\n"
+              << "  destroyCurrent(): " << dead_t.destroy_ms << "ms\n";
   }
   // Simplification (and some onnx-optimizer passes) can leave nodes without a
   // name; assign unique names to them so downstream tools that key on node
