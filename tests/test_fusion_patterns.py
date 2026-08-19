@@ -142,6 +142,72 @@ def test_fuse_consecutive_reduce_unsqueeze():
     assert ops["ReduceSum"] == 1
 
 
+def test_fuse_rms_norm():
+    # x.pow(2).mean(-1, keepdim=True) -> x * rsqrt(variance + eps) -> weight *
+    # (...): the textbook RMSNorm forward used by LLaMA/Mistral/Qwen-family
+    # exports (see test_mnn_llm_export.py's ``_RMSNorm``). At opset >= 23
+    # (RMSNormalization's introducing version) the whole chain collapses to a
+    # single node (fuse_rms_norm). RMSNormalization needs ir_version 11
+    # (opset 23 shipped in onnx 1.18), so this model is built directly rather
+    # than through the shared ``_model`` helper, which pins ir_version 10.
+    inits = [
+        _f32(np.array(2.0), "two"),
+        _i64([-1], "axes"),
+        _f32(np.array(1e-6), "eps"),
+        _f32(np.random.randn(8) * 0.02 + 1.0, "weight"),
+    ]
+    nodes = [
+        onnx.helper.make_node("Pow", ["X", "two"], ["sq"]),
+        onnx.helper.make_node("ReduceMean", ["sq", "axes"], ["var"], keepdims=1),
+        onnx.helper.make_node("Add", ["var", "eps"], ["var_eps"]),
+        onnx.helper.make_node("Sqrt", ["var_eps"], ["rms"]),
+        onnx.helper.make_node("Reciprocal", ["rms"], ["inv_rms"]),
+        onnx.helper.make_node("Mul", ["X", "inv_rms"], ["normed"]),
+        onnx.helper.make_node("Mul", ["weight", "normed"], ["Y"]),
+    ]
+    graph = onnx.helper.make_graph(
+        nodes, "g", [_vi("X", [2, 4, 8])], [_vi("Y", [2, 4, 8])], inits
+    )
+    model = onnx.helper.make_model(
+        graph, opset_imports=[onnx.helper.make_opsetid("", 23)], ir_version=11
+    )
+    _, ops = _simplify(model)
+    assert ops["RMSNormalization"] == 1
+    assert ops["Mul"] == 0
+    assert ops["Pow"] == 0
+    assert ops["ReduceMean"] == 0
+    assert ops["Add"] == 0
+    assert ops["Sqrt"] == 0
+    assert ops["Reciprocal"] == 0
+
+
+def test_fuse_rms_norm_below_opset_23_untouched():
+    # Below opset 23, RMSNormalization does not exist yet: the pass must not
+    # fire, leaving the decomposition (and its behavior on older runtimes)
+    # intact. ReduceMean's axes is an attribute (not a second input) below
+    # opset 18, so this also exercises that spelling of the pattern.
+    inits = [
+        _f32(np.array(2.0), "two"),
+        _f32(np.array(1e-6), "eps"),
+        _f32(np.random.randn(8) * 0.02 + 1.0, "weight"),
+    ]
+    nodes = [
+        onnx.helper.make_node("Pow", ["X", "two"], ["sq"]),
+        onnx.helper.make_node(
+            "ReduceMean", ["sq"], ["var"], axes=[-1], keepdims=1
+        ),
+        onnx.helper.make_node("Add", ["var", "eps"], ["var_eps"]),
+        onnx.helper.make_node("Sqrt", ["var_eps"], ["rms"]),
+        onnx.helper.make_node("Reciprocal", ["rms"], ["inv_rms"]),
+        onnx.helper.make_node("Mul", ["X", "inv_rms"], ["normed"]),
+        onnx.helper.make_node("Mul", ["weight", "normed"], ["Y"]),
+    ]
+    model = _model(nodes, [_vi("X", [2, 4, 8])], [_vi("Y", [2, 4, 8])], inits, opset=17)
+    _, ops = _simplify(model)
+    assert ops["RMSNormalization"] == 0
+    assert ops["Mul"] == 2
+
+
 def test_fuse_concat_into_reshape():
     # A Concat of constant shape pieces feeding a Reshape is folded into a single
     # Reshape with a constant target shape (fuse_concat_into_reshape).
