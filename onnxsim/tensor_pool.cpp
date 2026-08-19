@@ -4,8 +4,27 @@
 #include <cstdio>
 #include <fstream>
 #include <stdexcept>
+#include <utility>
 
 #include "tensor_pool_dtype.h"
+
+// Platform-specific file-memory-mapping for LoadSafetensorsMmap. Everything
+// falls back to LoadSafetensors's ordinary read on a platform none of these
+// branches cover (mirrors profiler.cpp's ReadCurrentRssBytes pattern), so
+// LoadSafetensorsMmap keeps working -- just without the mmap benefit -- on
+// wasm/Emscripten, which has no real demand-paged file mapping.
+#if defined(__EMSCRIPTEN__)
+// No mapping support: TryMmapFile below always reports failure.
+#elif defined(_WIN32)
+// clang-format off
+#include <windows.h>
+// clang-format on
+#else
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
 
 namespace onnxsim {
 namespace tensor_pool {
@@ -32,6 +51,109 @@ uint64_t ReadU64LE(std::istream& in) {
   for (int i = 7; i >= 0; --i) v = (v << 8) | buf[i];
   return v;
 }
+
+// Same decode as ReadU64LE, for the mmap path, which has no istream to read
+// from -- just the mapped bytes themselves.
+uint64_t DecodeU64LE(const char* buf) {
+  uint64_t v = 0;
+  for (int i = 7; i >= 0; --i) {
+    v = (v << 8) | static_cast<unsigned char>(buf[i]);
+  }
+  return v;
+}
+
+#if defined(_WIN32)
+// Owns the Windows handles/view backing a mapping; unmapped/closed together
+// once the last Entry referencing it (via the aliasing shared_ptr below) is
+// dropped.
+struct FileMapping {
+  HANDLE file = INVALID_HANDLE_VALUE;
+  HANDLE mapping = nullptr;
+  void* view = nullptr;
+  ~FileMapping() {
+    if (view != nullptr) ::UnmapViewOfFile(view);
+    if (mapping != nullptr) ::CloseHandle(mapping);
+    if (file != INVALID_HANDLE_VALUE) ::CloseHandle(file);
+  }
+};
+
+// Memory-maps `path` read-only. Returns {nullptr, 0} on any failure --
+// missing file, zero-length file (CreateFileMapping/MapViewOfFile reject
+// those), or any other OS-level error -- so LoadSafetensorsMmap can fall
+// back to an ordinary read.
+std::pair<std::shared_ptr<const char[]>, uint64_t> TryMmapFile(
+    const std::string& path) {
+  HANDLE file = ::CreateFileA(path.c_str(), GENERIC_READ, FILE_SHARE_READ,
+                              nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL,
+                              nullptr);
+  if (file == INVALID_HANDLE_VALUE) return {nullptr, 0};
+  LARGE_INTEGER size;
+  if (!::GetFileSizeEx(file, &size) || size.QuadPart <= 0) {
+    ::CloseHandle(file);
+    return {nullptr, 0};
+  }
+  HANDLE mapping =
+      ::CreateFileMappingA(file, nullptr, PAGE_READONLY, 0, 0, nullptr);
+  if (mapping == nullptr) {
+    ::CloseHandle(file);
+    return {nullptr, 0};
+  }
+  void* view = ::MapViewOfFile(mapping, FILE_MAP_READ, 0, 0, 0);
+  if (view == nullptr) {
+    ::CloseHandle(mapping);
+    ::CloseHandle(file);
+    return {nullptr, 0};
+  }
+  auto state = std::make_shared<FileMapping>();
+  state->file = file;
+  state->mapping = mapping;
+  state->view = view;
+  std::shared_ptr<const char[]> owner(state, static_cast<const char*>(view));
+  return {owner, static_cast<uint64_t>(size.QuadPart)};
+}
+#elif !defined(__EMSCRIPTEN__)
+// Owns the POSIX mapping; munmap'd once the last Entry referencing it (via
+// the aliasing shared_ptr below) is dropped.
+struct FileMapping {
+  void* addr = MAP_FAILED;
+  size_t length = 0;
+  ~FileMapping() {
+    if (addr != MAP_FAILED && length > 0) ::munmap(addr, length);
+  }
+};
+
+// Memory-maps `path` read-only. Returns {nullptr, 0} on any failure --
+// missing file, zero-length file (mmap() rejects a zero length), or any
+// other OS-level error -- so LoadSafetensorsMmap can fall back to an
+// ordinary read.
+std::pair<std::shared_ptr<const char[]>, uint64_t> TryMmapFile(
+    const std::string& path) {
+  int fd = ::open(path.c_str(), O_RDONLY);
+  if (fd < 0) return {nullptr, 0};
+  struct stat st{};
+  if (::fstat(fd, &st) != 0 || st.st_size <= 0) {
+    ::close(fd);
+    return {nullptr, 0};
+  }
+  size_t length = static_cast<size_t>(st.st_size);
+  void* addr = ::mmap(nullptr, length, PROT_READ, MAP_PRIVATE, fd, 0);
+  // The mapping keeps the file's data reachable independent of the fd once
+  // established, so the fd itself needn't (and, on some platforms, shouldn't)
+  // outlive this call.
+  ::close(fd);
+  if (addr == MAP_FAILED) return {nullptr, 0};
+  auto state = std::make_shared<FileMapping>();
+  state->addr = addr;
+  state->length = length;
+  std::shared_ptr<const char[]> owner(state, static_cast<const char*>(addr));
+  return {owner, static_cast<uint64_t>(length)};
+}
+#else
+std::pair<std::shared_ptr<const char[]>, uint64_t> TryMmapFile(
+    const std::string&) {
+  return {nullptr, 0};
+}
+#endif
 
 void AppendJsonEscaped(std::string& out, std::string_view s) {
   for (unsigned char c : s) {
@@ -515,6 +637,60 @@ void TensorPool::LoadSafetensors(const std::string& path) {
     }
     std::shared_ptr<const char[]> owner(buffer, buffer->data() + th.begin);
     std::string_view data(buffer->data() + th.begin, th.end - th.begin);
+    entries_[th.name] =
+        Entry{dtype, std::move(th.shape), std::move(owner), data};
+  }
+}
+
+void TensorPool::LoadSafetensorsMmap(const std::string& path) {
+  auto [mapped, file_size] = TryMmapFile(path);
+  if (!mapped) {
+    // No mapping support on this platform, or the mmap()/MapViewOfFile()
+    // call itself failed -- fall back to the ordinary one-copy read rather
+    // than surfacing a spurious failure for what may be a perfectly valid
+    // file.
+    LoadSafetensors(path);
+    return;
+  }
+
+  if (file_size < 8) {
+    throw std::runtime_error("TensorPool::LoadSafetensorsMmap: '" + path +
+                             "' is too small to be a safetensors file");
+  }
+  uint64_t header_len = DecodeU64LE(mapped.get());
+  if (header_len > file_size - 8) {
+    throw std::runtime_error("TensorPool::LoadSafetensorsMmap: '" + path +
+                             "' has an invalid header length");
+  }
+
+  // Unlike LoadSafetensors, the header itself doesn't need copying into a
+  // std::string first -- HeaderParser only ever reads through a
+  // std::string_view, and the mapped bytes already outlive this call via
+  // `mapped`.
+  std::string_view header(mapped.get() + 8, header_len);
+  auto tensor_headers = HeaderParser(header).Parse();
+
+  uint64_t data_start = 8 + header_len;
+  uint64_t data_size = file_size - data_start;
+
+  entries_.clear();
+  for (auto& th : tensor_headers) {
+    if (th.end > data_size) {
+      throw std::runtime_error(
+          "TensorPool::LoadSafetensorsMmap: '" + path + "' tensor '" +
+          th.name + "' data_offsets [" + std::to_string(th.begin) + ", " +
+          std::to_string(th.end) + ") exceed the file's data segment (" +
+          std::to_string(data_size) + " bytes)");
+    }
+    int32_t dtype = FromSafetensors(th.dtype);
+    if (dtype == ONNX_UNDEFINED) {
+      throw std::runtime_error("TensorPool::LoadSafetensorsMmap: '" + path +
+                               "' tensor '" + th.name +
+                               "' has unsupported dtype '" + th.dtype + "'");
+    }
+    const char* base = mapped.get() + data_start + th.begin;
+    std::shared_ptr<const char[]> owner(mapped, base);
+    std::string_view data(base, th.end - th.begin);
     entries_[th.name] =
         Entry{dtype, std::move(th.shape), std::move(owner), data};
   }
