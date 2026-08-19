@@ -5,10 +5,13 @@
 #include <algorithm>
 #include <cstdint>
 #include <fstream>
+#include <istream>
 #include <optional>
 #include <stdexcept>
+#include <streambuf>
 
 #include "gguf_dtype.h"
+#include "mmap_file.h"
 #include "tensor_pool.h"
 
 namespace onnxsim {
@@ -197,6 +200,55 @@ constexpr uint64_t kMaxTensorCount = 10'000'000;
 constexpr uint64_t kMaxMetadataCount = 10'000'000;
 constexpr uint32_t kMaxDims =
     8;  // ggml's own GGML_MAX_DIMS is 4; generous slack
+
+// A read-only std::streambuf backed directly by mapped file bytes, so
+// LoadGGUFMmap can reuse every header/metadata/tensor-info parsing helper
+// above (ReadU32LE, ReadGGUFString, SkipMetadataValue, ...) unchanged --
+// they only need a std::istream, not specifically an ifstream. Unlike the
+// default std::streambuf, this overrides seekoff/seekpos: LoadGGUF's parsing
+// relies on in.tellg() (to find where the tensor-info section ends) working
+// correctly, which the base class does not support on its own.
+class MemStreamBuf : public std::streambuf {
+ public:
+  MemStreamBuf(const char* base, size_t size)
+      : begin_(base), end_(base + size) {
+    char* p = const_cast<char*>(begin_);
+    setg(p, p, const_cast<char*>(end_));
+  }
+
+ protected:
+  pos_type seekoff(off_type off, std::ios_base::seekdir dir,
+                   std::ios_base::openmode which) override {
+    if ((which & std::ios_base::in) == 0) return pos_type(off_type(-1));
+    const char* base;
+    switch (dir) {
+      case std::ios_base::beg:
+        base = begin_;
+        break;
+      case std::ios_base::cur:
+        base = gptr();
+        break;
+      case std::ios_base::end:
+        base = end_;
+        break;
+      default:
+        return pos_type(off_type(-1));
+    }
+    const char* new_pos = base + off;
+    if (new_pos < begin_ || new_pos > end_) return pos_type(off_type(-1));
+    setg(const_cast<char*>(begin_), const_cast<char*>(new_pos),
+         const_cast<char*>(end_));
+    return pos_type(new_pos - begin_);
+  }
+
+  pos_type seekpos(pos_type pos, std::ios_base::openmode which) override {
+    return seekoff(off_type(pos), std::ios_base::beg, which);
+  }
+
+ private:
+  const char* begin_;
+  const char* end_;
+};
 
 }  // namespace
 
@@ -394,6 +446,101 @@ std::vector<std::string> TensorPool::LoadGGUF(const std::string& path) {
     // first, onnx's shape is outermost-first, for the same contiguous bytes.
     std::vector<int64_t> shape(info.ne.rbegin(), info.ne.rend());
     Add(info.name, onnx_dtype, std::move(shape), std::move(bytes));
+  }
+  return skipped;
+}
+
+std::vector<std::string> TensorPool::LoadGGUFMmap(const std::string& path) {
+  auto [mapped, file_size] = TryMmapFile(path);
+  if (!mapped) {
+    // No mapping support on this platform, or the mmap()/MapViewOfFile()
+    // call itself failed -- fall back to the ordinary seek + read path
+    // rather than surfacing a spurious failure for what may be a perfectly
+    // valid file.
+    return LoadGGUF(path);
+  }
+
+  MemStreamBuf buf(mapped.get(), static_cast<size_t>(file_size));
+  std::istream in(&buf);
+
+  uint32_t magic = ReadU32LE(in, path);
+  if (magic != kMagic) {
+    FailRead(path, "not a GGUF file (bad magic)");
+  }
+  uint32_t version = ReadU32LE(in, path);
+  if (version != kSupportedVersion) {
+    FailRead(path, "GGUF version " + std::to_string(version) +
+                       " is not supported (only version " +
+                       std::to_string(kSupportedVersion) + " is)");
+  }
+  uint64_t tensor_count = ReadU64LE(in, path);
+  uint64_t metadata_kv_count = ReadU64LE(in, path);
+  if (tensor_count > kMaxTensorCount) {
+    FailRead(path, "implausible tensor_count (" + std::to_string(tensor_count) +
+                       "), likely corrupt");
+  }
+  if (metadata_kv_count > kMaxMetadataCount) {
+    FailRead(path, "implausible metadata_kv_count (" +
+                       std::to_string(metadata_kv_count) + "), likely corrupt");
+  }
+
+  uint64_t alignment = kDefaultAlignment;
+  for (uint64_t i = 0; i < metadata_kv_count; ++i) {
+    std::string key = ReadGGUFString(in, path);
+    uint32_t value_type = ReadU32LE(in, path);
+    std::optional<uint64_t> numeric = SkipMetadataValue(in, path, value_type);
+    if (key == "general.alignment" && numeric.has_value() && *numeric != 0) {
+      alignment = *numeric;
+    }
+  }
+
+  std::vector<TensorInfo> infos;
+  infos.reserve(tensor_count);
+  for (uint64_t i = 0; i < tensor_count; ++i) {
+    TensorInfo info;
+    info.name = ReadGGUFString(in, path);
+    uint32_t n_dims = ReadU32LE(in, path);
+    if (n_dims > kMaxDims) {
+      FailRead(path, "tensor '" + info.name +
+                         "' has an implausible dimension count (" +
+                         std::to_string(n_dims) + ")");
+    }
+    info.ne.resize(n_dims);
+    for (uint32_t d = 0; d < n_dims; ++d) info.ne[d] = ReadU64LE(in, path);
+    info.ggml_type = ReadU32LE(in, path);
+    info.offset = ReadU64LE(in, path);
+    infos.push_back(std::move(info));
+  }
+
+  uint64_t header_end = static_cast<uint64_t>(in.tellg());
+  uint64_t data_section_start = AlignUp(header_end, alignment);
+
+  entries_.clear();
+  std::vector<std::string> skipped;
+  for (const auto& info : infos) {
+    int32_t onnx_dtype;
+    if (!gguf::ToOnnx(info.ggml_type, &onnx_dtype)) {
+      skipped.push_back(info.name);
+      continue;
+    }
+    size_t elem_size = gguf::ElementSize(info.ggml_type);
+    uint64_t nelems = 1;
+    for (uint64_t d : info.ne) nelems *= d;
+    uint64_t nbytes = nelems * elem_size;
+    uint64_t abs_offset = data_section_start + info.offset;
+    if (abs_offset > file_size || nbytes > file_size - abs_offset) {
+      FailRead(path, "tensor '" + info.name +
+                         "' data range extends past the end of the file");
+    }
+
+    const char* base = mapped.get() + abs_offset;
+    std::shared_ptr<const char[]> owner(mapped, base);
+    std::string_view data(base, nbytes);
+
+    // Reverse of SaveGGUF's reversal: ggml's ne[] is innermost-dimension-
+    // first, onnx's shape is outermost-first, for the same contiguous bytes.
+    std::vector<int64_t> shape(info.ne.rbegin(), info.ne.rend());
+    Add(info.name, onnx_dtype, std::move(shape), std::move(owner), data);
   }
   return skipped;
 }

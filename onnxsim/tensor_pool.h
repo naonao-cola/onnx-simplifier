@@ -168,6 +168,34 @@ class TensorPool {
   // malformed header, or a tensor whose data_offsets fall outside the file.
   void LoadSafetensors(const std::string& path);
 
+  // Like LoadSafetensors, but memory-maps `path` (mmap() on POSIX,
+  // MapViewOfFile() on Windows) instead of reading it into a heap buffer:
+  // every Entry's data is a direct view into the OS page cache backing the
+  // file, so this makes *zero* tensor-data copies -- not even
+  // LoadSafetensors's one whole-file read -- and pages are faulted in
+  // lazily, on first touch, rather than the whole file being made resident
+  // up front. The mapping itself is kept alive by the same shared_ptr-
+  // aliasing scheme as LoadSafetensors (see Entry::owner): it lives for as
+  // long as any Entry (or view derived from one) this call produced is
+  // reachable, and is unmapped automatically once the last one is dropped.
+  //
+  // Falls back to an ordinary LoadSafetensors call -- silently, with no
+  // memory-mapping benefit but identical results -- when this platform has
+  // no memory-mapping support (e.g. Emscripten/wasm) or the underlying
+  // mmap()/MapViewOfFile() call fails (e.g. `path` is empty, or isn't a
+  // regular seekable file). Throws std::runtime_error on I/O failure, a
+  // malformed header, or a tensor whose data_offsets fall outside the file
+  // -- same as LoadSafetensors.
+  //
+  // Caveat inherent to memory-mapping, unlike LoadSafetensors's own private
+  // copy: the mapped bytes alias `path` on disk for as long as the mapping
+  // lives. Modifying or truncating the file out from under a live mapping is
+  // undefined behavior (a SIGBUS on POSIX if a mapped page is truncated
+  // away; stale or torn bytes if its content is rewritten in place) -- only
+  // use this for a file this process (or a well-behaved peer) won't mutate
+  // while the pool is alive.
+  void LoadSafetensorsMmap(const std::string& path);
+
   // --- GGUF (https://github.com/ggml-org/ggml/blob/master/docs/gguf.md)
   // format, version 3 -- implemented in tensor_pool_gguf.cpp, a separate
   // translation unit from the safetensors codec above, since the two file
@@ -214,6 +242,32 @@ class TensorPool {
   // if every tensor was loaded). Throws std::runtime_error on I/O failure,
   // an unrecognized magic/version, or a malformed header.
   std::vector<std::string> LoadGGUF(const std::string& path);
+
+  // Like LoadGGUF, but memory-maps `path` (mmap() on POSIX, MapViewOfFile()
+  // on Windows -- the same TryMmapFile helper LoadSafetensorsMmap uses, see
+  // mmap_file.h) instead of doing its own seek + read per included tensor.
+  // The header/metadata/tensor-info section is still parsed exactly as
+  // LoadGGUF parses it (just from the mapped bytes instead of an ifstream);
+  // only what happens per tensor differs: an *included* tensor's Entry
+  // becomes a direct view into the mapped file via the usual shared_ptr-
+  // aliasing scheme (see Entry::owner) rather than a copied std::string, and
+  // a *skipped* tensor's bytes are never even faulted into memory, since
+  // mapping the file only reserves address space -- pages are faulted in
+  // lazily, on first touch, so an untouched skipped tensor's pages are
+  // simply never read at all (better than LoadGGUF's own already-selective
+  // seek + read, which at least issues no I/O for skipped tensors but still
+  // pays a syscall per included one).
+  //
+  // Falls back to an ordinary LoadGGUF call -- silently, with no memory-
+  // mapping benefit but identical results -- when this platform has no
+  // memory-mapping support (e.g. Emscripten/wasm) or the underlying mmap()/
+  // MapViewOfFile() call fails. Returns the same skipped-tensor-names list,
+  // and throws under the same conditions, as LoadGGUF.
+  //
+  // Same caveat as LoadSafetensorsMmap: the mapped bytes alias `path` on
+  // disk for as long as the mapping lives, so modifying or truncating the
+  // file out from under a live mapping is undefined behavior.
+  std::vector<std::string> LoadGGUFMmap(const std::string& path);
 
  private:
   std::map<std::string, Entry> entries_;

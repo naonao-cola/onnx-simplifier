@@ -4,7 +4,9 @@
 #include <cstdio>
 #include <fstream>
 #include <stdexcept>
+#include <utility>
 
+#include "mmap_file.h"
 #include "tensor_pool_dtype.h"
 
 namespace onnxsim {
@@ -30,6 +32,16 @@ uint64_t ReadU64LE(std::istream& in) {
   in.read(reinterpret_cast<char*>(buf), 8);
   uint64_t v = 0;
   for (int i = 7; i >= 0; --i) v = (v << 8) | buf[i];
+  return v;
+}
+
+// Same decode as ReadU64LE, for the mmap path, which has no istream to read
+// from -- just the mapped bytes themselves.
+uint64_t DecodeU64LE(const char* buf) {
+  uint64_t v = 0;
+  for (int i = 7; i >= 0; --i) {
+    v = (v << 8) | static_cast<unsigned char>(buf[i]);
+  }
   return v;
 }
 
@@ -515,6 +527,60 @@ void TensorPool::LoadSafetensors(const std::string& path) {
     }
     std::shared_ptr<const char[]> owner(buffer, buffer->data() + th.begin);
     std::string_view data(buffer->data() + th.begin, th.end - th.begin);
+    entries_[th.name] =
+        Entry{dtype, std::move(th.shape), std::move(owner), data};
+  }
+}
+
+void TensorPool::LoadSafetensorsMmap(const std::string& path) {
+  auto [mapped, file_size] = TryMmapFile(path);
+  if (!mapped) {
+    // No mapping support on this platform, or the mmap()/MapViewOfFile()
+    // call itself failed -- fall back to the ordinary one-copy read rather
+    // than surfacing a spurious failure for what may be a perfectly valid
+    // file.
+    LoadSafetensors(path);
+    return;
+  }
+
+  if (file_size < 8) {
+    throw std::runtime_error("TensorPool::LoadSafetensorsMmap: '" + path +
+                             "' is too small to be a safetensors file");
+  }
+  uint64_t header_len = DecodeU64LE(mapped.get());
+  if (header_len > file_size - 8) {
+    throw std::runtime_error("TensorPool::LoadSafetensorsMmap: '" + path +
+                             "' has an invalid header length");
+  }
+
+  // Unlike LoadSafetensors, the header itself doesn't need copying into a
+  // std::string first -- HeaderParser only ever reads through a
+  // std::string_view, and the mapped bytes already outlive this call via
+  // `mapped`.
+  std::string_view header(mapped.get() + 8, header_len);
+  auto tensor_headers = HeaderParser(header).Parse();
+
+  uint64_t data_start = 8 + header_len;
+  uint64_t data_size = file_size - data_start;
+
+  entries_.clear();
+  for (auto& th : tensor_headers) {
+    if (th.end > data_size) {
+      throw std::runtime_error(
+          "TensorPool::LoadSafetensorsMmap: '" + path + "' tensor '" + th.name +
+          "' data_offsets [" + std::to_string(th.begin) + ", " +
+          std::to_string(th.end) + ") exceed the file's data segment (" +
+          std::to_string(data_size) + " bytes)");
+    }
+    int32_t dtype = FromSafetensors(th.dtype);
+    if (dtype == ONNX_UNDEFINED) {
+      throw std::runtime_error("TensorPool::LoadSafetensorsMmap: '" + path +
+                               "' tensor '" + th.name +
+                               "' has unsupported dtype '" + th.dtype + "'");
+    }
+    const char* base = mapped.get() + data_start + th.begin;
+    std::shared_ptr<const char[]> owner(mapped, base);
+    std::string_view data(base, th.end - th.begin);
     entries_[th.name] =
         Entry{dtype, std::move(th.shape), std::move(owner), data};
   }

@@ -128,6 +128,107 @@ void TestAliasingIsZeroCopyPerTensor() {
   std::remove(path.c_str());
 }
 
+void TestLoadSafetensorsMmapRoundTrip() {
+  // Same round trip as TestRoundTrip, but through the mmap-backed loader --
+  // confirms it parses the header and carves out entries identically to the
+  // read-based path, not just that it doesn't crash.
+  TensorPool pool;
+  pool.Add("weight.0", ONNX_FLOAT, {2, 3},
+           std::string("\x00\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b"
+                       "\x0c\x0d\x0d\x0d\x0e\x0e\x0e\x0e\x0f\x0f\x0f\x0f",
+                       24));
+  pool.Add("bias", ONNX_INT64, {3}, std::string(24, '\x2a'));
+  pool.Add("scalar", ONNX_BOOL, {}, std::string(1, '\x01'));
+  pool.Add("empty", ONNX_FLOAT, {0}, std::string());
+
+  std::string path = TempPath("_mmap_roundtrip.safetensors");
+  pool.SaveSafetensors(path);
+
+  TensorPool loaded;
+  loaded.LoadSafetensorsMmap(path);
+  Check(loaded.size() == 4, "mmap-loaded pool holds 4 entries");
+
+  const Entry* w = loaded.Find("weight.0");
+  Check(w != nullptr, "weight.0 present after mmap load");
+  if (w != nullptr) {
+    Check(w->dtype == ONNX_FLOAT, "weight.0 dtype round-trips via mmap");
+    Check(w->shape == std::vector<int64_t>({2, 3}),
+          "weight.0 shape round-trips via mmap");
+    Check(w->data == std::string_view(
+                         "\x00\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b"
+                         "\x0c\x0d\x0d\x0d\x0e\x0e\x0e\x0e\x0f\x0f\x0f\x0f",
+                         24),
+          "weight.0 bytes round-trip exactly via mmap");
+  }
+
+  const Entry* b = loaded.Find("bias");
+  Check(b != nullptr && b->dtype == ONNX_INT64 &&
+            b->shape == std::vector<int64_t>({3}) && b->nbytes() == 24,
+        "bias round-trips via mmap");
+
+  const Entry* e = loaded.Find("empty");
+  Check(e != nullptr && e->nbytes() == 0,
+        "zero-size tensor round-trips via mmap");
+
+  std::remove(path.c_str());
+}
+
+void TestLoadSafetensorsMmapAliasingIsSharedMapping() {
+  // Mirrors TestAliasingIsZeroCopyPerTensor: every Entry from one mmap load
+  // should be a view into the same mapping, at adjacent offsets, not
+  // independent allocations.
+  TensorPool pool;
+  pool.Add("a", ONNX_UINT8, {4}, std::string(4, 'a'));
+  pool.Add("b", ONNX_UINT8, {4}, std::string(4, 'b'));
+  std::string path = TempPath("_mmap_alias.safetensors");
+  pool.SaveSafetensors(path);
+
+  TensorPool loaded;
+  loaded.LoadSafetensorsMmap(path);
+  const Entry* ea = loaded.Find("a");
+  const Entry* eb = loaded.Find("b");
+  Check(ea != nullptr && eb != nullptr, "both tensors present via mmap");
+  if (ea != nullptr && eb != nullptr) {
+    Check(static_cast<const void*>(ea->owner.get()) == ea->data.data(),
+          "a: owner aliases its own data pointer (mmap)");
+    Check(eb->data.data() - ea->data.data() ==
+              static_cast<ptrdiff_t>(ea->nbytes()),
+          "a and b are adjacent views into one mmap'd region");
+  }
+  std::remove(path.c_str());
+}
+
+void TestLoadSafetensorsMmapRejectsMalformedFile() {
+  std::string path = TempPath("_mmap_malformed.safetensors");
+  {
+    std::ofstream out(path, std::ios::binary);
+    out << "not a safetensors file";
+  }
+  TensorPool pool;
+  bool threw = false;
+  try {
+    pool.LoadSafetensorsMmap(path);
+  } catch (const std::runtime_error&) {
+    threw = true;
+  }
+  Check(threw, "mmap-loading a non-safetensors file throws");
+  std::remove(path.c_str());
+}
+
+void TestLoadSafetensorsMmapMissingFileFallsBackAndThrows() {
+  // No such file: TryMmapFile fails, so this exercises the fallback to
+  // LoadSafetensors, which should throw its own "cannot open" error rather
+  // than silently succeeding.
+  TensorPool pool;
+  bool threw = false;
+  try {
+    pool.LoadSafetensorsMmap(TempPath("_mmap_missing.safetensors"));
+  } catch (const std::runtime_error&) {
+    threw = true;
+  }
+  Check(threw, "mmap-loading a missing file throws (via read fallback)");
+}
+
 void TestHeaderPrefixSize() {
   TensorPool pool;
   pool.Add("x", ONNX_FLOAT, {1}, std::string(4, '\0'));
@@ -261,6 +362,10 @@ void TestContentHash() {
 int main() {
   TestRoundTrip();
   TestAliasingIsZeroCopyPerTensor();
+  TestLoadSafetensorsMmapRoundTrip();
+  TestLoadSafetensorsMmapAliasingIsSharedMapping();
+  TestLoadSafetensorsMmapRejectsMalformedFile();
+  TestLoadSafetensorsMmapMissingFileFallsBackAndThrows();
   TestHeaderPrefixSize();
   TestRejectsUnrepresentableDtype();
   TestRejectsMalformedFile();
