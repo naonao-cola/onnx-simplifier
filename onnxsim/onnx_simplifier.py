@@ -1221,6 +1221,32 @@ def main():
         action="store_true",
     )
     parser.add_argument(
+        "--static-quantize",
+        help="After simplifying, statically (calibration-based) quantize "
+        "MatMul/Gemm weights and activations to INT8/uint8, inserting a "
+        "QuantizeLinear/DequantizeLinear pair (QDQ format) with a fixed "
+        "scale/zero-point calibrated from --calibration-dataset if given, "
+        "else from random data. See onnxsim.quantize_static.",
+        action="store_true",
+    )
+    parser.add_argument(
+        "--calibration-dataset",
+        help="Hugging Face Hub dataset id (e.g. 'mnist') to pull "
+        "--calibration-samples real examples from for --static-quantize's "
+        "calibration, instead of random data. See "
+        "onnxsim.load_huggingface_calibration_data (needs the optional "
+        "'datasets' package: pip install datasets).",
+        type=str,
+        default=None,
+    )
+    parser.add_argument(
+        "--calibration-samples",
+        help="Number of calibration batches/examples for --static-quantize "
+        "(default: 8).",
+        type=int,
+        default=8,
+    )
+    parser.add_argument(
         "-v", "--version", action="version", version="onnxsim " + version.version
     )
 
@@ -1422,6 +1448,28 @@ def main():
     if args.dynamic_quantize:
         print("Dynamically quantizing MatMul/Gemm weights to INT8...")
         model_opt = quantize_dynamic(model_opt)
+
+    if args.static_quantize:
+        from . import calibration
+
+        if args.calibration_dataset:
+            print(
+                f'Calibrating from Hugging Face dataset "{args.calibration_dataset}"...'
+            )
+            calibration_data = calibration.load_huggingface_calibration_data(
+                args.calibration_dataset,
+                model_opt,
+                num_samples=args.calibration_samples,
+            )
+        else:
+            print("Calibrating from random data...")
+            calibration_data = calibration.generate_random_calibration_data(
+                model_opt, num_samples=args.calibration_samples
+            )
+        print("Statically quantizing MatMul/Gemm weights and activations...")
+        model_opt = calibration.quantize_static(
+            model_opt, calibration_data=calibration_data
+        )
 
     try:
         if not args.save_as_external_data:
