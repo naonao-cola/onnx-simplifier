@@ -395,6 +395,14 @@ std::vector<onnx::TensorProto> RunOps(
   google::protobuf::Arena arena;
   onnx::ModelProto& op_model =
       *google::protobuf::Arena::Create<onnx::ModelProto>(&arena);
+  // Spans the sub-model-construction phase below (building op_model: copying
+  // each grouped node and its constant inputs into the throwaway sub-model)
+  // -- not lexically scoped via ProfiledScope's RAII since input_names/
+  // input_tps/output_names, populated in this phase, are also read by the
+  // DLPack-bridging and output-materialization phases after it ends. See
+  // ONNXSIM_PROFILE's own doc comment for what "the tensor copying inside
+  // constant folding" actually covers.
+  onnxsim::Profiler::Instance().Begin("BuildSubModel");
   op_model.set_ir_version(model.ir_version());
   for (const auto& x : model.opset_import()) {
     *op_model.add_opset_import() = x;
@@ -475,6 +483,7 @@ std::vector<onnx::TensorProto> RunOps(
       output_names.push_back(x);
     }
   }
+  onnxsim::Profiler::Instance().End();  // BuildSubModel
 
   using namespace ONNX_NAMESPACE::optimization;
   VLOG(1) << "Running " << ops.size() << " node(s) as one batch";
@@ -493,13 +502,16 @@ std::vector<onnx::TensorProto> RunOps(
   // -- the single, unavoidable copy, since folded results become model
   // initializers.
   std::vector<DLManagedTensorPtr> input_dls;
-  input_dls.reserve(input_tps.size());
-  for (const auto& tp : input_tps) {
-    input_dls.emplace_back(onnxsim::dlpack::FromTensorProtoBorrowing(tp));
-  }
   std::vector<const DLManagedTensor*> input_ptrs;
-  input_ptrs.reserve(input_dls.size());
-  for (const auto& p : input_dls) input_ptrs.push_back(p.get());
+  {
+    onnxsim::ProfiledScope dlpack_input_scope("DLPackInputBridge");
+    input_dls.reserve(input_tps.size());
+    for (const auto& tp : input_tps) {
+      input_dls.emplace_back(onnxsim::dlpack::FromTensorProtoBorrowing(tp));
+    }
+    input_ptrs.reserve(input_dls.size());
+    for (const auto& p : input_dls) input_ptrs.push_back(p.get());
+  }
 
   std::vector<DLManagedTensorPtr> output_dls;
   {
@@ -507,6 +519,7 @@ std::vector<onnx::TensorProto> RunOps(
     output_dls = executor.Run(op_model, input_ptrs);
   }
   std::vector<onnx::TensorProto> output_tps;
+  onnxsim::ProfiledScope dlpack_output_scope("DLPackOutputCopy");
   output_tps.reserve(output_dls.size());
   for (size_t i = 0; i < output_dls.size(); i++) {
     output_tps.push_back(onnxsim::dlpack::ToTensorProto(
@@ -1608,8 +1621,15 @@ onnx::ModelProto _FoldConstant(const ModelExecutor& executor,
   const auto& tmp = model;
   {
     onnx::ModelProto model;
-    model.CopyFrom(tmp);
-    auto partition = GetConstantNodes(model);
+    {
+      onnxsim::ProfiledScope copy_scope("CopyModel");
+      model.CopyFrom(tmp);
+    }
+    ConstantNodePartition partition;
+    {
+      onnxsim::ProfiledScope analysis_scope("GetConstantNodes");
+      partition = GetConstantNodes(model);
+    }
     const auto& const_nodes = partition.const_nodes;
     // Map each deferred node's output to the producing node so RunOps can
     // inline it into the sub-model executed when folding a downstream consumer.
@@ -1684,17 +1704,21 @@ onnx::ModelProto _FoldConstant(const ModelExecutor& executor,
     // the end can place it after a non-const consumer (e.g. a Loop reading a
     // SequenceEmpty output), which breaks topological sorting and makes the
     // resulting model fail onnx's checker (issues #238, #335, #352).
-    google::protobuf::RepeatedPtrField<onnx::NodeProto> original_nodes;
-    original_nodes.Swap(model.mutable_graph()->mutable_node());
-    for (auto& node : original_nodes) {
-      const bool folded =
-          node.output_size() > 0 && folded_outputs.count(node.output(0)) > 0;
-      if (!folded) {
-        *model.mutable_graph()->add_node() = std::move(node);
+    {
+      onnxsim::ProfiledScope rebuild_scope("RebuildNodeList");
+      google::protobuf::RepeatedPtrField<onnx::NodeProto> original_nodes;
+      original_nodes.Swap(model.mutable_graph()->mutable_node());
+      for (auto& node : original_nodes) {
+        const bool folded =
+            node.output_size() > 0 && folded_outputs.count(node.output(0)) > 0;
+        if (!folded) {
+          *model.mutable_graph()->add_node() = std::move(node);
+        }
       }
     }
     // Drop initializers left dangling by folding so the intermediate model does
     // not balloon in size (issue #174).
+    onnxsim::ProfiledScope eliminate_scope("EliminateUnusedInitializerScope");
     return EliminateUnusedInitializer(model);
   }
 }
