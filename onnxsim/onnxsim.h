@@ -123,6 +123,23 @@ onnx::ModelProto FoldConstantOnce(const ModelExecutor& executor,
                                   size_t tensor_size_threshold,
                                   bool initializers_as_constants = true);
 
+// Dynamically quantizes every MatMul, and every "vanilla" Gemm (transA=0,
+// alpha=1, beta=1), whose weight is a constant 2-D float32 tensor: the weight
+// is quantized to INT8 ahead of time (per output channel, symmetric, from its
+// static values -- no calibration data needed), while the activation is
+// quantized to uint8 in the graph itself via ``DynamicQuantizeLinear``, which
+// computes its own scale/zero-point from each run's actual input range. This
+// mirrors the "dynamic quantization" scheme ONNX Runtime's
+// ``quantize_dynamic`` applies to MatMul/Gemm. See
+// ``passes/dynamic_quantize_matmul.h`` for the rewrite itself.
+//
+// Unlike ``Simplify``, this does not run shape inference, constant folding or
+// any other simplification pass -- it applies exactly this one rewrite, once,
+// to a copy of ``model`` (which is left untouched) and returns the result.
+// Nodes that do not match (dynamic or non-2-D weights, non-default Gemm
+// attributes, non-float32 operands, an opset older than 11) are left as-is.
+onnx::ModelProto QuantizeDynamic(const onnx::ModelProto& model);
+
 void SimplifyPath(const ModelExecutor& executor, const std::string& in_path,
                   const std::string& out_path,
                   std::optional<std::vector<std::string>> skip_optimizers,

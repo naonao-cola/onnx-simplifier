@@ -356,6 +356,33 @@ def _restore_doc_strings(model: onnx.ModelProto, snapshot: dict) -> None:
             opt.doc_string = snapshot["outputs"][opt.name]
 
 
+def quantize_dynamic(model: Union[str, onnx.ModelProto]) -> onnx.ModelProto:
+    """
+    Dynamically quantize every MatMul, and every "vanilla" Gemm (transA=0,
+    alpha=1, beta=1), whose weight is a constant 2-D float32 tensor.
+
+    The weight is quantized to INT8 ahead of time (per output channel,
+    symmetric, from its static values -- no calibration data is needed),
+    while the activation is quantized to uint8 *in the graph* via
+    ``DynamicQuantizeLinear``, which computes its own scale/zero-point from
+    each run's actual input range. This mirrors the "dynamic quantization"
+    scheme ONNX Runtime's ``quantize_dynamic`` applies to MatMul/Gemm.
+
+    This is a single, self-contained graph rewrite: unlike :func:`simplify`,
+    it does not run shape inference, constant folding, or any other pass.
+    Nodes that do not match (dynamic or non-2-D weights, non-default Gemm
+    attributes, non-float32 operands, an opset older than 11 -- which
+    ``DynamicQuantizeLinear`` requires) are left untouched. Consider calling
+    :func:`simplify` before and/or after to clean up the graph.
+
+    :param model: onnx ModelProto object or file path
+    :returns: the quantized onnx ModelProto
+    """
+    if isinstance(model, str):
+        model = onnx.load(model, load_external_data=False)
+    return onnx.load_from_string(C.quantize_dynamic(model.SerializeToString()))
+
+
 def simplify(
     model: Union[str, onnx.ModelProto],
     check_n: int = 0,
@@ -1140,6 +1167,14 @@ def main():
         action="store_true",
     )
     parser.add_argument(
+        "--dynamic-quantize",
+        help="After simplifying, dynamically quantize MatMul/Gemm weights to "
+        "INT8 (per output channel, symmetric, from their static values) and "
+        "quantize activations to uint8 at runtime via DynamicQuantizeLinear. "
+        "No calibration data is needed. See onnxsim.quantize_dynamic.",
+        action="store_true",
+    )
+    parser.add_argument(
         "-v", "--version", action="version", version="onnxsim " + version.version
     )
 
@@ -1337,6 +1372,10 @@ def main():
         ort_profile=args.ort_profile,
         merge_ort_profile=args.merge_ort_profile,
     )
+
+    if args.dynamic_quantize:
+        print("Dynamically quantizing MatMul/Gemm weights to INT8...")
+        model_opt = quantize_dynamic(model_opt)
 
     try:
         if not args.save_as_external_data:

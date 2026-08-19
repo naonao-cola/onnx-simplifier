@@ -9,6 +9,7 @@
 #include <string>
 
 #include "onnxoptimizer/optimize.h"
+#include "passes/dynamic_quantize_matmul.h"
 #include "passes/eliminate_nop_dropout.h"
 #include "passes/eliminate_reshape_around_elementwise.h"
 #include "passes/fuse_add_bias_into_conv.h"
@@ -53,6 +54,7 @@ void RegisterCustomOptimizerPasses() {
     auto& registry = ONNX_NAMESPACE::optimization::Optimizer::passes;
 
     // onnxsim-only rewrites (no built-in of the same name today).
+    RegisterOrReplace<p::DynamicQuantizeMatMul>(registry);
     RegisterOrReplace<p::EliminateReshapeAroundElementwise>(registry);
     RegisterOrReplace<p::FuseConsecutiveMul>(registry);
     RegisterOrReplace<p::FuseMatMulAddBiasIntoGemmBatched>(registry);

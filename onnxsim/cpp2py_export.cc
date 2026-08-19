@@ -339,6 +339,24 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
       },
       "model_bytes"_a, "run_shape_inference"_a = true);
 
+  // Dynamically quantizes MatMul/Gemm weights to INT8 (per output channel,
+  // symmetric) and activations to uint8 at runtime via DynamicQuantizeLinear
+  // -- see QuantizeDynamic in onnxsim.h. Pure graph rewrite: no ModelExecutor
+  // or calibration data needed.
+  m.def(
+      "quantize_dynamic",
+      [](const py::bytes& model_proto_bytes) -> py::bytes {
+        InitEnv();
+        ONNX_NAMESPACE::ModelProto model;
+        ParseProtoFromBytes(&model, model_proto_bytes.c_str(),
+                            model_proto_bytes.size());
+        const auto result = QuantizeDynamic(model);
+        std::string out;
+        result.SerializeToString(&out);
+        return py::bytes(out.data(), out.size());
+      },
+      "model_bytes"_a);
+
   m.def(
        "simplify",
        [](std::shared_ptr<PyModelExecutor> executor,

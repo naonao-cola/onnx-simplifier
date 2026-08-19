@@ -1988,6 +1988,15 @@ onnx::ModelProto FoldConstantOnce(const ModelExecutor& executor,
   return out;
 }
 
+onnx::ModelProto QuantizeDynamic(const onnx::ModelProto& model) {
+  PrepareSchemasForDebug(model);
+  // Registers dynamic_quantize_matmul (idempotent) into onnxoptimizer's
+  // registry so OptimizeFixed can find it by name below.
+  onnxsim::RegisterCustomOptimizerPasses();
+  return onnx::optimization::OptimizeFixed(
+      model, std::vector<std::string>{"dynamic_quantize_matmul"});
+}
+
 onnx::ModelProto Simplify(
     const ModelExecutor& executor, const onnx::ModelProto& model,
     std::optional<std::vector<std::string>> skip_optimizers,
