@@ -372,6 +372,26 @@ bool TensorPool::Erase(const std::string& name) {
   return entries_.erase(name) != 0;
 }
 
+std::string TensorPool::ContentHash(const std::string& name) const {
+  auto it = entries_.find(name);
+  if (it == entries_.end()) {
+    throw std::out_of_range("TensorPool::ContentHash: no entry named '" + name +
+                            "'");
+  }
+  const Entry& entry = it->second;
+  return ToHex(
+      ContentDigest(hash_algorithm_, entry.dtype, entry.shape, entry.data));
+}
+
+std::map<std::string, std::string> TensorPool::AllContentHashes() const {
+  std::map<std::string, std::string> out;
+  for (const auto& [name, entry] : entries_) {
+    out[name] = ToHex(
+        ContentDigest(hash_algorithm_, entry.dtype, entry.shape, entry.data));
+  }
+  return out;
+}
+
 void TensorPool::SaveSafetensors(
     const std::string& path,
     std::map<std::string, std::pair<uint64_t, uint64_t>>* data_offsets_out)

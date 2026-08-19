@@ -84,6 +84,7 @@
 
 #include "tensor_pool.h"
 #include "tensor_pool_dtype.h"
+#include "tensor_pool_hash.h"
 
 namespace onnxsim {
 namespace tensor_pool {
@@ -257,6 +258,40 @@ inline size_t ImportModelWithSafetensors(onnx::ModelProto& model,
     }
   }
   return matched;
+}
+
+// Export `pool`'s per-tensor ContentHash (see tensor_pool.h) into
+// `model`'s graph-level metadata_props, one entry per pooled tensor keyed
+// "<algorithm>:<tensor name>" (e.g. "blake3:conv1.weight"), plus one
+// "<algorithm>:__all__" entry -- a digest, under the same HashAlgorithm, of
+// every "<name>\0<hex digest>\n" line concatenated in name-sorted order --
+// so a consumer can check the whole set with a single recomputation
+// instead of re-deriving and comparing every metadata_props entry itself.
+// A downstream verifier needs only tensor_pool_hash.h's ContentDigest (or
+// an equivalent reimplementation of its framing) and the tensor's own
+// dtype/shape/bytes -- not onnxsim or TensorPool -- to recompute and check
+// either value. Call this AFTER `pool` holds its final tensor bytes (e.g.
+// right after ExportModelWithSafetensors, which is also the point at which
+// `model`'s initializers already carry the file references this hash lets
+// a caller confirm weren't corrupted or substituted); calling it earlier
+// hashes whatever `pool` happens to contain at the time.
+inline void AttachContentHashMetadata(const TensorPool& pool,
+                                      onnx::ModelProto& model) {
+  const std::string algo_name(HashAlgorithmName(pool.GetHashAlgorithm()));
+  auto* graph = model.mutable_graph();
+  std::string concat;
+  for (const auto& [name, hex] : pool.AllContentHashes()) {
+    auto* kv = graph->add_metadata_props();
+    kv->set_key(algo_name + ":" + name);
+    kv->set_value(hex);
+    concat += name;
+    concat.push_back('\0');
+    concat += hex;
+    concat.push_back('\n');
+  }
+  auto* all_kv = graph->add_metadata_props();
+  all_kv->set_key(algo_name + ":__all__");
+  all_kv->set_value(ToHex(RawDigest(pool.GetHashAlgorithm(), concat)));
 }
 
 // --- self-describing single-file archives (see this header's top comment) -
