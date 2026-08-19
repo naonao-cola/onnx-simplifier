@@ -142,8 +142,8 @@ inline void QuantizeWeightPerChannelKN(const Tensor& w_t, bool transposed,
 // expects of its weight input) is left untouched, unlike the dynamic pass's
 // MatMulInteger replacement.
 inline void QuantizeWeightPerChannelInPlace(const Tensor& w_t,
-                                            int64_t channel_axis,
-                                            Tensor& q_out, Tensor& scale_out) {
+                                            int64_t channel_axis, Tensor& q_out,
+                                            Tensor& scale_out) {
   const auto& sizes = w_t.sizes();
   const int64_t dim0 = sizes[0];
   const int64_t dim1 = sizes[1];

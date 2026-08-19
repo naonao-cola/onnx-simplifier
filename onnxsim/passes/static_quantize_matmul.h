@@ -145,9 +145,8 @@ struct StaticQuantizeMatMul final : public PredicateBasedPass {
 
     float x_scale_f = 1.0f;
     int32_t x_zp_i = 0;
-    ComputeAsymmetricUint8QuantParams(range_it->second.first,
-                                      range_it->second.second, x_scale_f,
-                                      x_zp_i);
+    ComputeAsymmetricUint8QuantParams(
+        range_it->second.first, range_it->second.second, x_scale_f, x_zp_i);
 
     // W's output-channel axis in its own (untransposed) layout: axis 0 when
     // Gemm's transB made W [N, K], else axis 1 ([K, N], MatMul's own layout).
