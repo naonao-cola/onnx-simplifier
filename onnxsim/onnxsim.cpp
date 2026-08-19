@@ -11,6 +11,7 @@
 #include <cstring>
 #include <fstream>
 #include <functional>
+#include <iomanip>
 #include <map>
 #include <mutex>
 #include <numeric>
@@ -44,6 +45,7 @@
 #include "onnx/version_converter/convert.h"
 #include "onnxoptimizer/model_util.h"
 #include "onnxoptimizer/optimize.h"
+#include "onnxoptimizer/passes/cse_util.h"
 #include "onnxoptimizer/passes/logging.h"
 #include "profiler.h"
 #include "sym_shape_infer.h"
@@ -2319,6 +2321,22 @@ onnx::ModelProto Simplify(
       onnxsim::Profiler::Instance().Enable(profile_path);
     }
   }
+  // Optionally break the per-round Optimize() cost down further, into each
+  // PredicateBasedPass's "matching" (patternMatchPredicate) vs "modifying"
+  // (runTransform) phase, per pass name -- see onnxoptimizer/pass.h's
+  // PassPhaseTiming for scope and overhead. Exploratory diagnostic for
+  // onnxsim issue #633; the summary prints to stderr after Pipeline runs.
+  const bool profile_pass_phases = [] {
+    const char* env = std::getenv("ONNXSIM_PROFILE_PASS_PHASES");
+    return env != nullptr && std::string(env) != "0" &&
+           std::string(env) != "false";
+  }();
+  if (profile_pass_phases) {
+    onnx::optimization::ResetPassPhaseTimings();
+    onnx::optimization::ResetPassTotalTimings();
+    onnx::optimization::ResetCSEHashCompareTiming();
+    onnx::optimization::SetPassPhaseProfilingEnabled(true);
+  }
   // Optionally merge ONNX Runtime's own per-session profiles into the onnxsim
   // trace -- the binding-agnostic counterpart of Python's
   // ``merge_ort_profile``, so the C ABI, Rust and WASM bindings can produce one
@@ -2375,6 +2393,27 @@ onnx::ModelProto Simplify(
           // model, leave it untouched.
           return;
         }
+        // Scope onnx-optimizer's tensor-hash caches (TensorContentDigest,
+        // the typed-field path, and CSETensorHash's raw_data-branch cache
+        // -- see onnxoptimizer/passes/{tensor_content_hash,cse_util}.h) to
+        // this whole OptAndShape call, instead of the OptimizeGraphFixed
+        // call below clearing them every round (its own default): `g` is
+        // one resident Graph held across every round of the fixed point
+        // underneath, and no round mutates a retained tensor's content in
+        // place (only replaces it wholesale, which mints its own fresh
+        // tensor_id() and simply misses these caches) -- so a hash computed
+        // for a tensor that survives unchanged from one round to the next
+        // stays valid, and correct, letting eliminate_duplicate_initializer
+        // and eliminate_common_subexpression skip rehashing it on every one
+        // of the ~dozens of rounds a deep repeated-block model can take.
+        // Dominated in practice by the raw_data cache: real exported models
+        // are raw_data-heavy, and measured 98%+ of those hash calls were
+        // otherwise recomputing a value already seen earlier in the same
+        // run (see onnxsim issue #633). OptimizeGraphChanged below passes
+        // clear_tensor_digest_cache=false to keep both caches alive across
+        // its own repeated OptimizeGraphFixed calls.
+        onnx::optimization::ClearTensorContentDigestCache();
+        onnx::optimization::ClearRawHashCache();
         using GraphFnChanged = std::function<bool(onnx::Graph&)>;
         GraphFnChanged InferShapesOnGraphChanged =
             shape_inference
@@ -2399,8 +2438,9 @@ onnx::ModelProto Simplify(
           onnx::optimization::SetInitializersAsConstants(
               config.initializers_as_constants);
           std::map<std::string, unsigned int> report;
-          onnx::optimization::OptimizeGraphFixed(graph, config.optimizer_passes,
-                                                 &report);
+          onnx::optimization::OptimizeGraphFixed(
+              graph, config.optimizer_passes, &report,
+              /*clear_tensor_digest_cache=*/false);
           onnx::optimization::SetInitializersAsConstants(prev);
           for (const auto& pass_count : report) {
             if (pass_count.second != 0) {
@@ -2480,6 +2520,115 @@ onnx::ModelProto Simplify(
   // Flush the profiling trace and print the per-function summary. Safe to call
   // unconditionally: Finish() is a no-op unless profiling was enabled above.
   onnxsim::Profiler::Instance().Finish();
+  if (profile_pass_phases) {
+    onnx::optimization::SetPassPhaseProfilingEnabled(false);
+    std::vector<std::pair<std::string, onnx::optimization::PassPhaseTiming>>
+        rows(onnx::optimization::GetPassPhaseTimings().begin(),
+             onnx::optimization::GetPassPhaseTimings().end());
+    std::sort(rows.begin(), rows.end(), [](const auto& a, const auto& b) {
+      return (a.second.match_ms + a.second.transform_ms) >
+             (b.second.match_ms + b.second.transform_ms);
+    });
+    std::cerr << "\nonnxsim pass-phase profiling (PredicateBasedPass "
+                 "matching vs modifying)\n"
+              << "-------------------------------------------------------"
+                 "------------------------------------\n"
+              << std::left << std::setw(38) << "pass" << std::right
+              << std::setw(12) << "match(ms)" << std::setw(10) << "calls"
+              << std::setw(14) << "modify(ms)" << std::setw(10) << "calls"
+              << std::setw(12) << "total(ms)" << "\n"
+              << "-------------------------------------------------------"
+                 "------------------------------------\n";
+    double total_match_ms = 0, total_transform_ms = 0;
+    for (const auto& [name, t] : rows) {
+      std::cerr << std::left << std::setw(38) << name << std::right
+                << std::setw(12) << std::fixed << std::setprecision(2)
+                << t.match_ms << std::setw(10) << t.match_calls << std::setw(14)
+                << t.transform_ms << std::setw(10) << t.transform_calls
+                << std::setw(12) << (t.match_ms + t.transform_ms) << "\n";
+      total_match_ms += t.match_ms;
+      total_transform_ms += t.transform_ms;
+    }
+    std::cerr << "-------------------------------------------------------"
+                 "------------------------------------\n"
+              << "TOTAL matching: " << total_match_ms
+              << "ms, TOTAL modifying: " << total_transform_ms << "ms\n";
+
+    // Coarser companion table: total wall time inside EVERY pass's
+    // runPass(Graph&) call (both kinds), which is what actually accounts
+    // for the full Optimize() cost -- see PassTotalTiming's comment.
+    std::vector<std::pair<std::string, onnx::optimization::PassTotalTiming>>
+        total_rows(onnx::optimization::GetPassTotalTimings().begin(),
+                   onnx::optimization::GetPassTotalTimings().end());
+    std::sort(total_rows.begin(), total_rows.end(),
+              [](const auto& a, const auto& b) {
+                return a.second.total_ms > b.second.total_ms;
+              });
+    std::cerr << "\nonnxsim pass-phase profiling (total runPass() time, all "
+                 "pass kinds)\n"
+              << "-------------------------------------------------------"
+                 "------------------------------------\n"
+              << std::left << std::setw(38) << "pass" << std::right
+              << std::setw(14) << "total(ms)" << std::setw(10) << "calls"
+              << "\n"
+              << "-------------------------------------------------------"
+                 "------------------------------------\n";
+    double grand_total_ms = 0;
+    for (const auto& [name, t] : total_rows) {
+      std::cerr << std::left << std::setw(38) << name << std::right
+                << std::setw(14) << std::fixed << std::setprecision(2)
+                << t.total_ms << std::setw(10) << t.calls << "\n";
+      grand_total_ms += t.total_ms;
+    }
+    std::cerr << "-------------------------------------------------------"
+                 "------------------------------------\n"
+              << "GRAND TOTAL (sum of all pass runPass() calls): "
+              << grand_total_ms << "ms\n";
+
+    // CSETensorHash/CSETensorCompare breakdown -- the actual hashing and
+    // equality-checking work inside eliminate_duplicate_initializer and
+    // eliminate_common_subexpression's hash-map lookups. Splits raw_data
+    // (real exported-model weights; a byte hash / a single memcmp) from
+    // typed-field (BLAKE3-digest-backed; rarer in practice) so it's clear
+    // which one, if either, actually accounts for those two passes' cost.
+    const auto& cse_t = onnx::optimization::GetCSEHashCompareTiming();
+    std::cerr << "\nonnxsim CSETensorHash / CSETensorCompare breakdown "
+                 "(inside eliminate_duplicate_initializer / "
+                 "eliminate_common_subexpression's hash-map lookups)\n"
+              << "-------------------------------------------------------"
+                 "------------------------------------\n"
+              << std::left << std::setw(24) << "" << std::right << std::setw(14)
+              << "total(ms)" << std::setw(10) << "calls" << "\n"
+              << std::left << std::setw(24) << "raw_data hash" << std::right
+              << std::setw(14) << std::fixed << std::setprecision(2)
+              << cse_t.raw_hash_ms << std::setw(10) << cse_t.raw_hash_calls
+              << "\n"
+              << std::left << std::setw(24) << "typed-field hash" << std::right
+              << std::setw(14) << cse_t.typed_hash_ms << std::setw(10)
+              << cse_t.typed_hash_calls << "\n"
+              << std::left << std::setw(24) << "raw_data compare" << std::right
+              << std::setw(14) << cse_t.raw_compare_ms << std::setw(10)
+              << cse_t.raw_compare_calls << "\n"
+              << std::left << std::setw(24) << "typed-field compare"
+              << std::right << std::setw(14) << cse_t.typed_compare_ms
+              << std::setw(10) << cse_t.typed_compare_calls << "\n"
+              << "-------------------------------------------------------"
+                 "------------------------------------\n"
+              << "TOTAL hash: " << (cse_t.raw_hash_ms + cse_t.typed_hash_ms)
+              << "ms, TOTAL compare: "
+              << (cse_t.raw_compare_ms + cse_t.typed_compare_ms) << "ms\n";
+
+    // Actual cache hit rate: see cse_util.h's g_raw_hash_cache, keyed by
+    // Tensor::tensor_id().
+    if (cse_t.raw_hash_calls > 0) {
+      std::cerr << "raw_data hash cache: " << cse_t.raw_hash_cache_hits << "/"
+                << cse_t.raw_hash_calls << " calls ("
+                << (100.0 * cse_t.raw_hash_cache_hits / cse_t.raw_hash_calls)
+                << "%) were hits (" << cse_t.raw_hash_cache_hit_ms << "ms) vs "
+                << cse_t.raw_hash_cache_misses << " misses ("
+                << cse_t.raw_hash_cache_miss_ms << "ms).\n";
+    }
+  }
   // Simplification (and some onnx-optimizer passes) can leave nodes without a
   // name; assign unique names to them so downstream tools that key on node
   // names keep working (issue #269).
