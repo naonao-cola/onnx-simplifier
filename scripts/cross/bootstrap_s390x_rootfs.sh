@@ -115,7 +115,9 @@ if ! chroot "${SYSROOT}" /usr/bin/python3 -c "import ml_dtypes" 2>/dev/null; the
     if ! ls /wheelhouse/ml_dtypes-*.whl >/dev/null 2>&1; then
       # noble ships setuptools 68, which rejects ml_dtypes 0.5.x'"'"'s SPDX
       # `project.license`; --no-build-isolation then needs pybind11 present.
-      pip3 install -U --ignore-installed setuptools wheel pybind11
+      # ml_dtypes 0.6.0 switched its build backend to scikit-build-core, so
+      # --no-build-isolation needs that present too now.
+      pip3 install -U --ignore-installed setuptools wheel pybind11 scikit-build-core
       pip3 wheel --no-build-isolation --no-deps -w /wheelhouse "ml_dtypes>=0.5.4"
     fi
     pip3 install --no-deps /wheelhouse/ml_dtypes-*.whl
