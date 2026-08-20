@@ -20,6 +20,7 @@
 #include "passes/fuse_mul_into_conv.h"
 #include "passes/fuse_pad_into_pool.h"
 #include "passes/fuse_preceding_mul_into_conv.h"
+#include "passes/static_quantize_conv.h"
 #include "passes/static_quantize_matmul.h"
 
 namespace onnxsim {
@@ -61,6 +62,7 @@ void RegisterCustomOptimizerPasses() {
     RegisterOrReplace<p::FuseMatMulAddBiasIntoGemmBatched>(registry);
     RegisterOrReplace<p::FuseMulIntoConv>(registry);
     RegisterOrReplace<p::FusePrecedingMulIntoConv>(registry);
+    RegisterOrReplace<p::StaticQuantizeConv>(registry);
     RegisterOrReplace<p::StaticQuantizeMatMul>(registry);
 
     // onnxsim's patched versions of built-in onnxoptimizer passes. These

@@ -24,6 +24,7 @@ namespace onnxsim {
 //   - eliminate_reshape_around_elementwise
 //   - dynamic_quantize_matmul
 //   - static_quantize_matmul
+//   - static_quantize_conv
 //
 // The registration runs at most once per process and is safe to call from any
 // simplification entry point. It MUST run before the pass list is built (a

@@ -295,9 +295,10 @@ def quantize_static(
     providers: Optional[Sequence[str]] = None,
 ) -> onnx.ModelProto:
     """
-    Statically (calibration-based) quantize every MatMul, and every "vanilla"
-    Gemm (transA=0, alpha=1, beta=1), whose weight is a constant 2-D float32
-    tensor.
+    Statically (calibration-based) quantize every MatMul, every "vanilla"
+    Gemm (transA=0, alpha=1, beta=1), and every Conv, whose weight is a
+    constant float32 tensor (2-D for MatMul/Gemm, rank >= 3 -- [Cout,
+    Cin/groups, k...] -- for Conv).
 
     Unlike :func:`onnxsim.quantize_dynamic`, the activation's quantization
     range is *calibrated*: fixed ahead of time from ``calibration_data``

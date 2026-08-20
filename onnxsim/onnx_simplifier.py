@@ -1261,7 +1261,7 @@ def main():
     parser.add_argument(
         "--static-quantize",
         help="After simplifying, statically (calibration-based) quantize "
-        "MatMul/Gemm weights and activations to INT8/uint8, inserting a "
+        "MatMul/Gemm/Conv weights and activations to INT8/uint8, inserting a "
         "QuantizeLinear/DequantizeLinear pair (QDQ format) with a fixed "
         "scale/zero-point calibrated from --calibration-dataset if given, "
         "else from random data. See onnxsim.quantize_static.",
@@ -1504,7 +1504,7 @@ def main():
             calibration_data = calibration.generate_random_calibration_data(
                 model_opt, num_samples=args.calibration_samples
             )
-        print("Statically quantizing MatMul/Gemm weights and activations...")
+        print("Statically quantizing MatMul/Gemm/Conv weights and activations...")
         model_opt = calibration.quantize_static(
             model_opt, calibration_data=calibration_data
         )
