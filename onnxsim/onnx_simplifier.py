@@ -48,6 +48,15 @@ UNIT_MAP: dict[Unit, int] = {
 }
 
 
+def parse_size(size: str) -> int:
+    m = re.fullmatch(r"([\d.]+)\s*([KMGT]?B)", size.strip(), re.I)
+    if not m:
+        raise ValueError(size)
+    number: float = float(m.group(1))
+    unit: Unit = m.group(2).upper()  # type: ignore
+    return int(number * UNIT_MAP[unit])
+
+
 def get_output_names(model: onnx.ModelProto) -> List[str]:
     output_names = [opt.name for opt in model.graph.output]
     return output_names
@@ -366,34 +375,6 @@ def import_gguf(in_path: str) -> onnx.ModelProto:
     return model
 
 
-def _snapshot_doc_strings(model: onnx.ModelProto) -> dict:
-    """Capture the ``doc_string`` fields that the C++ optimizer discards."""
-    return {
-        "model": model.doc_string,
-        "graph": model.graph.doc_string,
-        "inputs": {i.name: i.doc_string for i in model.graph.input},
-        "outputs": {o.name: o.doc_string for o in model.graph.output},
-    }
-
-
-def _restore_doc_strings(model: onnx.ModelProto, snapshot: dict) -> None:
-    """Restore doc strings captured by :func:`_snapshot_doc_strings`.
-
-    Only fields that the optimizer left empty are restored, so any doc string
-    produced by the optimizer itself takes precedence.
-    """
-    if not model.doc_string and snapshot["model"]:
-        model.doc_string = snapshot["model"]
-    if not model.graph.doc_string and snapshot["graph"]:
-        model.graph.doc_string = snapshot["graph"]
-    for ipt in model.graph.input:
-        if not ipt.doc_string and snapshot["inputs"].get(ipt.name):
-            ipt.doc_string = snapshot["inputs"][ipt.name]
-    for opt in model.graph.output:
-        if not opt.doc_string and snapshot["outputs"].get(opt.name):
-            opt.doc_string = snapshot["outputs"][opt.name]
-
-
 def simplify(
     model: Union[str, onnx.ModelProto],
     check_n: int = 0,
@@ -598,21 +579,132 @@ def simplify(
 
     if skip_fuse_bn and skipped_optimizers is not None:
         skipped_optimizers.append("fuse_bn_into_conv")
+
+    # onnxsim's model transforms -- input-shape overwrite, unused-output
+    # removal, initializer-from-input folding, and the unhashable-tensor
+    # optimizer skip -- all run natively in C++ (Simplify()/SimplifyPath()),
+    # so this function never needs to parse the model into a Python object
+    # itself: it only marshals options through to the C++ core. The one
+    # exception is the deprecated "``None`` key means the model's single
+    # input" convenience on ``overwrite_input_shapes``/``test_input_shapes``
+    # (and the legacy ``input_shapes`` argument, which sets both) -- resolving
+    # it needs the model's own input names, so it is the one case that still
+    # requires loading the model up front.
+    _shapes_need_model = (input_shapes is not None) or any(
+        d and None in d for d in (overwrite_input_shapes, test_input_shapes)
+    )
+
+    # Fast path: no ``check_n`` verification (which needs the original model
+    # loaded anyway to compare against), no shape dict needing the model to
+    # resolve, and no onnxruntime-side session profiling requested (this
+    # function's ``ort_profile``/``merge_ort_profile`` handling below sets up
+    # ``ONNXSIM_ORT_PROFILE`` and merges the resulting traces into the onnxsim
+    # profile after simplification -- machinery the fast path does not
+    # replicate). A file path goes straight through the C++ core's native
+    # path-based entry point (``C.simplify_path``), skipping the Python-level
+    # parse-then-reserialize round trip a large model otherwise pays crossing
+    # into C++ -- every initializer's bytes get materialized into a Python
+    # ``ModelProto``, serialized back to a byte string, and reparsed on the
+    # C++ side, all before simplification even starts. On an 833MB model this
+    # dwarfs the actual simplification work (tens of seconds of marshalling
+    # for ~5 seconds of real work). An in-memory ``ModelProto`` has no file to
+    # hand to C++, so it pays one unavoidable ``SerializeToString``/
+    # ``C.simplify`` bytes round trip -- still far cheaper than the removed
+    # Python-side transforms, which needed the model fully materialized and
+    # walked repeatedly. Falls back to the standard path below on ANY
+    # exception -- e.g. a model whose tensors onnxoptimizer's CSE cannot hash
+    # (issue #348), which the C++ core already detects and works around
+    # itself -- so this is never less correct than before, only sometimes not
+    # faster.
+    if (
+        check_n == 0
+        and not _shapes_need_model
+        and ort_profile is None
+        and not merge_ort_profile
+    ):
+        _fast_threshold_bytes = parse_size(tensor_size_threshold)
+        if _fast_threshold_bytes <= 2**31 - 9999:
+            _fast_prev_profile_env = None
+            _fast_profile_active = profile is not None
+            _fast_profile_path = profile or "onnxsim_profile.json"
+            if _fast_profile_active:
+                _fast_prev_profile_env = os.environ.get("ONNXSIM_PROFILE")
+                os.environ["ONNXSIM_PROFILE"] = _fast_profile_path
+            try:
+                if isinstance(model, str):
+                    with tempfile.TemporaryDirectory() as tmpdirname:
+                        fast_out_path = os.path.join(tmpdirname, "opt.onnx")
+                        C.simplify_path(
+                            _get_model_executor(providers),
+                            model,
+                            fast_out_path,
+                            skipped_optimizers,
+                            not skip_constant_folding,
+                            not skip_shape_inference,
+                            _fast_threshold_bytes,
+                            target_opset_version,
+                            rewriter,
+                            initializers_as_constants,
+                            inline_functions,
+                            mutable_initializer,
+                            overwrite_input_shapes,
+                            unused_output,
+                        )
+                        model_opt = onnx.load(fast_out_path)
+                else:
+                    model_bytes = model.SerializeToString()
+                    if len(model_bytes) >= 2 * 1024 * 1024 * 1024:
+                        raise EncodeError("Message larger than 2GiB")
+                    model_opt_bytes = C.simplify(
+                        _get_model_executor(providers),
+                        model_bytes,
+                        skipped_optimizers,
+                        not skip_constant_folding,
+                        not skip_shape_inference,
+                        _fast_threshold_bytes,
+                        target_opset_version,
+                        rewriter,
+                        initializers_as_constants,
+                        inline_functions,
+                        mutable_initializer,
+                        overwrite_input_shapes,
+                        unused_output,
+                    )
+                    if len(model_opt_bytes) == 0:
+                        raise ValueError("Simplified model larger than 2GB")
+                    model_opt = onnx.load_from_string(model_opt_bytes)
+                check_ok = model_checking.compare(
+                    model_opt,
+                    None,
+                    0,
+                    test_input_shapes,
+                    input_data,
+                    custom_lib,
+                    rtol=check_rtol,
+                    atol=check_atol,
+                    input_fill=input_fill,
+                )
+                return model_opt, check_ok
+            except Exception:
+                pass
+            finally:
+                if _fast_profile_active:
+                    if _fast_prev_profile_env is None:
+                        os.environ.pop("ONNXSIM_PROFILE", None)
+                    else:
+                        os.environ["ONNXSIM_PROFILE"] = _fast_prev_profile_env
+
+    # Slow path: either check_n > 0 (needs the original model to compare
+    # against) or a shape dict uses the "None key" convenience (needs the
+    # model's own input names to resolve). The model transforms themselves
+    # still run natively in C++ (passed through as arguments below); this
+    # only loads the model for those two Python-side needs.
+    #
     # Track whether we own the in-memory model. When the caller passes a file
     # path we load it here, so the resulting ``ModelProto`` is private to this
     # function and may be mutated freely (e.g. saved as external data without a
     # defensive copy). When the caller passes their own ``ModelProto`` we must
     # not mutate it.
-    #
-    # When the caller passes a file path, defer loading the (potentially
-    # multi-GB) external tensor data until it is actually needed -- right before
-    # the model is serialized for the C++ simplifier. Every graph transformation
-    # in between (input-shape overwrite, unused-output/initializer pruning,
-    # unhashable-tensor detection, doc-string snapshotting) reads only tensor
-    # *metadata* -- names, shapes, element types -- never the raw bytes, so
-    # keeping the weights on disk through these phases lowers active memory use
-    # and avoids loading them at all when an earlier phase raises. The directory
-    # is remembered so the external data can be resolved later.
     external_data_dir: Optional[str] = None
     if isinstance(model, str):
         model_owned = True
@@ -626,65 +718,6 @@ def simplify(
         model, overwrite_input_shapes
     )
     test_input_shapes = check_and_update_input_shapes(model, test_input_shapes)
-
-    for name, input_shape in overwrite_input_shapes.items():
-        for ipt in model.graph.input:
-            if ipt.name == name:
-                for i, dim in enumerate(ipt.type.tensor_type.shape.dim):
-                    # A non-positive value means "keep the original (possibly
-                    # dynamic) dimension" rather than hardcoding an invalid size
-                    # such as 0, which would make the model impossible to run
-                    # (see GitHub issue #237).
-                    if input_shape[i] > 0:
-                        dim.dim_value = input_shape[i]
-    if unused_output is not None:
-        model = remove_unused_output(model, unused_output)
-    if not mutable_initializer:
-        # ``remove_initializer_from_input`` bumps IR<4 models to IR 4 so the
-        # freed initializers become foldable constants (previously gated on
-        # ``ir_version >= 4``, which left opset-8 graphs such as resnet101-v1-7
-        # completely unsimplified) -- except for opsets too old to encode the
-        # nodes those fusions insert, which it leaves untouched.
-        model = remove_initializer_from_input(model)
-
-    # onnxoptimizer's common-subexpression / duplicate-initializer passes hash
-    # tensor values and crash with "no supported data type: <N>" on element
-    # types they cannot hash, such as the float8 zero points produced by NVIDIA
-    # ModelOpt fp8 QDQ models (GitHub issue #348). When such a tensor is present
-    # we transparently skip those two passes so the rest of the simplification
-    # still runs, instead of failing outright. ``skipped_optimizers is None``
-    # means "skip every optimizer", so there is nothing to add in that case.
-    if skipped_optimizers is not None and _has_cse_unhashable_tensor(model):
-        added = [
-            opt
-            for opt in _TENSOR_VALUE_HASHING_OPTIMIZERS
-            if opt not in skipped_optimizers
-        ]
-        if added:
-            skipped_optimizers.extend(added)
-            print(
-                Text(
-                    "The model contains tensors with element types that "
-                    "onnxoptimizer cannot hash (e.g. float8/int4 in NVIDIA "
-                    "ModelOpt fp8 QDQ models). Skipping the optimizers "
-                    f"{added} to avoid a crash; all other simplifications "
-                    "still run.",
-                    style="bold magenta",
-                )
-            )
-
-    # The C++ optimizer re-serializes the graph and drops the `doc_string`
-    # fields on the model, graph and input/output value infos. Snapshot them
-    # here so they can be restored on the simplified model (GitHub issue #428).
-    doc_strings = _snapshot_doc_strings(model)
-
-    def parse_size(size: str) -> int:
-        m = re.fullmatch(r"([\d.]+)\s*([KMGT]?B)", size.strip(), re.I)
-        if not m:
-            raise ValueError(size)
-        number: float = float(m.group(1))
-        unit: Unit = m.group(2).upper()  # type: ignore
-        return int(number * UNIT_MAP[unit])
 
     tensor_size_threshold_bytes = parse_size(tensor_size_threshold)
     if tensor_size_threshold_bytes > 2**31 - 9999:
@@ -749,6 +782,9 @@ def simplify(
             rewriter,
             initializers_as_constants,
             inline_functions,
+            mutable_initializer,
+            overwrite_input_shapes,
+            unused_output,
         )
         # The serialized original (~1x model) is not needed once the C++
         # simplifier has consumed it -- the large-model fallback below
@@ -819,6 +855,9 @@ def simplify(
                 rewriter,
                 initializers_as_constants,
                 inline_functions,
+                mutable_initializer,
+                overwrite_input_shapes,
+                unused_output,
             )
             check_ok = model_checking.compare(
                 os.path.join(tmpdirname, "opt.onnx"),
@@ -855,7 +894,6 @@ def simplify(
                 pass
             finally:
                 shutil.rmtree(_ort_merge_dir, ignore_errors=True)
-    _restore_doc_strings(model_opt, doc_strings)
     return model_opt, check_ok
 
 

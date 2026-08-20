@@ -54,7 +54,7 @@ jobs:
       - uses: mozilla-actions/sccache-action@v0.0.11
 
       - name: Install build tooling
-        run: pip install cmake ninja "setuptools>=77" sccache
+        run: pip install cmake ninja "setuptools>=77" sccache nanobind
 
       - name: Install test dependencies
         run: pip install pytest onnxruntime

@@ -23,6 +23,8 @@ namespace onnxsim {
 //   - fuse_matmul_add_bias_into_gemm_batched
 //   - eliminate_reshape_around_elementwise
 //   - fuse_rms_norm
+//   - fuse_gelu
+//   - fuse_layer_norm
 //
 // The registration runs at most once per process and is safe to call from any
 // simplification entry point. It MUST run before the pass list is built (a

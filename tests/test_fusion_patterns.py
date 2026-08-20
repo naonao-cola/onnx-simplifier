@@ -13,9 +13,9 @@ equivalence check guards correctness of each rewrite.
 
 ConvTranspose+BN, ConvTranspose+Add-bias and no-op ``Dropout`` fusions -- once
 gaps versus OnnxSlim -- are now covered by onnxsim's optimizer (issue #543) and
-are regular tests below. The final section holds the remaining ``xfail`` cases
-(GELU-subgraph fusion) that OnnxSlim performs but onnxsim does not; they document
-the gap and will XPASS if onnxsim ever gains the pass.
+are regular tests below. GELU and LayerNorm subgraph fusion -- also once gaps
+versus OnnxSlim -- are covered the same way now that onnxsim has fuse_gelu and
+fuse_layer_norm.
 """
 
 import collections
@@ -469,15 +469,11 @@ def test_eliminate_reshape_around_elementwise():
 
 
 # --------------------------------------------------------------------------- #
-# Remaining gap: passes OnnxSlim performs but onnxsim does not. Marked xfail
-# (strict=False) so CI stays green; each XPASSes and can be promoted if onnxsim
-# gains the pass.
+# GELU subgraph fusion: onnxsim recognizes the exact-erf decomposition and
+# fuses it to a single ``Gelu`` node (fuse_gelu, opset >= 20). This used to be
+# a documented gap versus OnnxSlim; promoted from xfail once onnxsim gained
+# the pass.
 # --------------------------------------------------------------------------- #
-@pytest.mark.xfail(
-    reason="onnxsim has no GELU subgraph fusion; OnnxSlim ships a (currently "
-    "disabled) FusionGelu matcher for this exact pattern",
-    strict=False,
-)
 def test_fuse_gelu():
     # 0.5 * x * (1 + erf(x / sqrt(2))) is the exact-erf GELU formulation.
     inits = [
@@ -492,7 +488,126 @@ def test_fuse_gelu():
         onnx.helper.make_node("Mul", ["X", "t2"], ["t3"]),
         onnx.helper.make_node("Mul", ["t3", "half"], ["Y"]),
     ]
-    model = _model(nodes, [_vi("X", [4, 8])], [_vi("Y", [4, 8])], inits)
+    # Gelu is only in the default domain from opset 20.
+    model = _model(nodes, [_vi("X", [4, 8])], [_vi("Y", [4, 8])], inits, opset=20)
     _, ops = _simplify(model)
     assert ops["Gelu"] == 1
     assert ops["Erf"] == 0
+
+
+def test_fuse_gelu_commuted_operands():
+    # Same pattern, but with every commutative Mul/Add's operands swapped.
+    inits = [
+        _f32(np.array([0.5]), "half"),
+        _f32(np.array([1.0]), "one"),
+        _f32(np.array([1.4142135623730951]), "sqrt2"),
+    ]
+    nodes = [
+        onnx.helper.make_node("Div", ["X", "sqrt2"], ["t0"]),
+        onnx.helper.make_node("Erf", ["t0"], ["t1"]),
+        onnx.helper.make_node("Add", ["one", "t1"], ["t2"]),
+        onnx.helper.make_node("Mul", ["t2", "X"], ["t3"]),
+        onnx.helper.make_node("Mul", ["half", "t3"], ["Y"]),
+    ]
+    model = _model(nodes, [_vi("X", [4, 8])], [_vi("Y", [4, 8])], inits, opset=20)
+    _, ops = _simplify(model)
+    assert ops["Gelu"] == 1
+    assert ops["Erf"] == 0
+
+
+def test_fuse_gelu_skips_old_opset():
+    # Gelu is only in the default domain from opset 20; an older-opset graph
+    # keeps the decomposition rather than emitting an invalid node.
+    inits = [
+        _f32(np.array([0.5]), "half"),
+        _f32(np.array([1.0]), "one"),
+        _f32(np.array([1.4142135623730951]), "sqrt2"),
+    ]
+    nodes = [
+        onnx.helper.make_node("Div", ["X", "sqrt2"], ["t0"]),
+        onnx.helper.make_node("Erf", ["t0"], ["t1"]),
+        onnx.helper.make_node("Add", ["t1", "one"], ["t2"]),
+        onnx.helper.make_node("Mul", ["X", "t2"], ["t3"]),
+        onnx.helper.make_node("Mul", ["t3", "half"], ["Y"]),
+    ]
+    model = _model(nodes, [_vi("X", [4, 8])], [_vi("Y", [4, 8])], inits, opset=13)
+    _, ops = _simplify(model)
+    assert ops["Gelu"] == 0
+    assert ops["Erf"] == 1
+
+
+# --------------------------------------------------------------------------- #
+# LayerNorm subgraph fusion: onnxsim recognizes the textbook last-axis
+# decomposition (mean/var via ReduceMean, either Mul(diff,diff) or
+# Pow(diff,2) for the square) and fuses it to a single
+# ``LayerNormalization`` node (fuse_layer_norm, opset >= 17).
+# --------------------------------------------------------------------------- #
+def _layer_norm_nodes(square_op):
+    square = (
+        onnx.helper.make_node("Mul", ["diff", "diff"], ["sq"])
+        if square_op == "Mul"
+        else onnx.helper.make_node("Pow", ["diff", "two"], ["sq"])
+    )
+    return [
+        onnx.helper.make_node("ReduceMean", ["X"], ["mean"], axes=[-1], keepdims=1),
+        onnx.helper.make_node("Sub", ["X", "mean"], ["diff"]),
+        square,
+        onnx.helper.make_node("ReduceMean", ["sq"], ["var"], axes=[-1], keepdims=1),
+        onnx.helper.make_node("Add", ["var", "eps"], ["var_eps"]),
+        onnx.helper.make_node("Sqrt", ["var_eps"], ["std"]),
+        onnx.helper.make_node("Div", ["diff", "std"], ["norm"]),
+        onnx.helper.make_node("Mul", ["norm", "scale"], ["scaled"]),
+        onnx.helper.make_node("Add", ["scaled", "bias"], ["Y"]),
+    ]
+
+
+def _layer_norm_inits():
+    return [
+        _f32(np.array([1e-5]), "eps"),
+        _f32(np.array([2.0]), "two"),
+        _f32(np.random.RandomState(0).randn(8), "scale"),
+        _f32(np.random.RandomState(1).randn(8), "bias"),
+    ]
+
+
+@pytest.mark.parametrize("square_op", ["Mul", "Pow"])
+def test_fuse_layer_norm(square_op):
+    nodes = _layer_norm_nodes(square_op)
+    model = _model(
+        nodes,
+        [_vi("X", [2, 4, 8])],
+        [_vi("Y", [2, 4, 8])],
+        _layer_norm_inits(),
+        opset=17,
+    )
+    _, ops = _simplify(model)
+    assert ops["LayerNormalization"] == 1
+    assert ops["ReduceMean"] == 0
+
+
+def test_fuse_layer_norm_skips_old_opset():
+    # LayerNormalization is only in the default domain from opset 17.
+    nodes = _layer_norm_nodes("Mul")
+    model = _model(
+        nodes,
+        [_vi("X", [2, 4, 8])],
+        [_vi("Y", [2, 4, 8])],
+        _layer_norm_inits(),
+        opset=13,
+    )
+    _, ops = _simplify(model)
+    assert ops["LayerNormalization"] == 0
+    assert ops["ReduceMean"] == 2
+
+
+def test_fuse_layer_norm_skips_mismatched_scale_shape():
+    # scale/bias must exactly match X's last dimension for
+    # LayerNormalization's Scale/B inputs; a scalar scale (which still
+    # broadcasts fine in the plain decomposition, so the model stays valid)
+    # does not match and is left unfused.
+    nodes = _layer_norm_nodes("Mul")
+    inits = _layer_norm_inits()
+    inits[2] = _f32(np.array(1.5), "scale")
+    model = _model(nodes, [_vi("X", [2, 4, 8])], [_vi("Y", [2, 4, 8])], inits, opset=17)
+    _, ops = _simplify(model)
+    assert ops["LayerNormalization"] == 0

@@ -7,10 +7,12 @@
 #include <onnx/onnx_pb.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <fstream>
 #include <functional>
+#include <iomanip>
 #include <map>
 #include <mutex>
 #include <numeric>
@@ -44,6 +46,7 @@
 #include "onnx/version_converter/convert.h"
 #include "onnxoptimizer/model_util.h"
 #include "onnxoptimizer/optimize.h"
+#include "onnxoptimizer/passes/cse_util.h"
 #include "onnxoptimizer/passes/logging.h"
 #include "profiler.h"
 #include "sym_shape_infer.h"
@@ -157,8 +160,11 @@ bool IsQDQ(const std::string& domain, const std::string& op) {
   return false;
 }
 
-auto FindInitializerByName(const onnx::ModelProto& model,
-                           const std::string& name) {
+// Returns a reference into `model`'s own initializer list rather than a copy:
+// callers that only read the tensor (the common case) avoid deep-copying its
+// raw_data bytes just to look it up.
+const onnx::TensorProto& FindInitializerByName(const onnx::ModelProto& model,
+                                               const std::string& name) {
   for (const auto& initializer : model.graph().initializer()) {
     if (initializer.name() == name) {
       return initializer;
@@ -369,7 +375,11 @@ std::vector<onnx::TensorProto> RunOps(
     const std::unordered_map<std::string, const onnx::NodeProto*>&
         deferred_producers) {
   std::vector<std::string> input_names;
-  std::vector<onnx::TensorProto> input_tps;
+  // Pointers borrow directly from `model`'s own initializers -- `model` is
+  // const and not touched again until every pointer here has been consumed
+  // (by the DLPack bridge below, within this same call), so this avoids
+  // deep-copying each constant input's raw_data just to feed the executor.
+  std::vector<const onnx::TensorProto*> input_tps;
   // Names already emitted as a feed or an initializer of the sub-model, so a
   // constant shared by several grouped nodes is added exactly once.
   std::set<std::string> seen_inputs;
@@ -393,6 +403,14 @@ std::vector<onnx::TensorProto> RunOps(
   google::protobuf::Arena arena;
   onnx::ModelProto& op_model =
       *google::protobuf::Arena::Create<onnx::ModelProto>(&arena);
+  // Spans the sub-model-construction phase below (building op_model: copying
+  // each grouped node and its constant inputs into the throwaway sub-model)
+  // -- not lexically scoped via ProfiledScope's RAII since input_names/
+  // input_tps/output_names, populated in this phase, are also read by the
+  // DLPack-bridging and output-materialization phases after it ends. See
+  // ONNXSIM_PROFILE's own doc comment for what "the tensor copying inside
+  // constant folding" actually covers.
+  onnxsim::Profiler::Instance().Begin("BuildSubModel");
   op_model.set_ir_version(model.ir_version());
   for (const auto& x : model.opset_import()) {
     *op_model.add_opset_import() = x;
@@ -438,13 +456,13 @@ std::vector<onnx::TensorProto> RunOps(
           if (!seen_inputs.insert(input).second) {
             continue;
           }
-          auto in_tp = FindInitializerByName(model, input);
+          const auto& in_tp = FindInitializerByName(model, input);
           if (in_tp.dims().size() == 1 && in_tp.dims()[0] == 0) {
             *op_model.mutable_graph()->add_initializer() = in_tp;
             continue;
           }
           input_names.push_back(input);
-          input_tps.push_back(in_tp);
+          input_tps.push_back(&in_tp);
         }
         *op_model.mutable_graph()->add_node() = node;
       };
@@ -473,6 +491,7 @@ std::vector<onnx::TensorProto> RunOps(
       output_names.push_back(x);
     }
   }
+  onnxsim::Profiler::Instance().End();  // BuildSubModel
 
   using namespace ONNX_NAMESPACE::optimization;
   VLOG(1) << "Running " << ops.size() << " node(s) as one batch";
@@ -491,13 +510,16 @@ std::vector<onnx::TensorProto> RunOps(
   // -- the single, unavoidable copy, since folded results become model
   // initializers.
   std::vector<DLManagedTensorPtr> input_dls;
-  input_dls.reserve(input_tps.size());
-  for (const auto& tp : input_tps) {
-    input_dls.emplace_back(onnxsim::dlpack::FromTensorProtoBorrowing(tp));
-  }
   std::vector<const DLManagedTensor*> input_ptrs;
-  input_ptrs.reserve(input_dls.size());
-  for (const auto& p : input_dls) input_ptrs.push_back(p.get());
+  {
+    onnxsim::ProfiledScope dlpack_input_scope("DLPackInputBridge");
+    input_dls.reserve(input_tps.size());
+    for (const auto* tp : input_tps) {
+      input_dls.emplace_back(onnxsim::dlpack::FromTensorProtoBorrowing(*tp));
+    }
+    input_ptrs.reserve(input_dls.size());
+    for (const auto& p : input_dls) input_ptrs.push_back(p.get());
+  }
 
   std::vector<DLManagedTensorPtr> output_dls;
   {
@@ -505,6 +527,7 @@ std::vector<onnx::TensorProto> RunOps(
     output_dls = executor.Run(op_model, input_ptrs);
   }
   std::vector<onnx::TensorProto> output_tps;
+  onnxsim::ProfiledScope dlpack_output_scope("DLPackOutputCopy");
   output_tps.reserve(output_dls.size());
   for (size_t i = 0; i < output_dls.size(); i++) {
     output_tps.push_back(onnxsim::dlpack::ToTensorProto(
@@ -719,27 +742,28 @@ void CollectUsedTensorNames(const onnx::GraphProto& graph,
 // dangling weights are duplicated in the graph, which can push the model past
 // the 2GB protobuf limit before the onnx optimizer gets a chance to remove
 // them (issue #174).
-onnx::ModelProto EliminateUnusedInitializer(const onnx::ModelProto& model) {
-  onnx::ModelProto result;
-  result.CopyFrom(model);
-
+// Takes `model` by value and mutates it in place rather than copying into a
+// separate `result`: every caller already owns a private, uniquely-held copy
+// by this point and passes it via std::move, so this is a cheap move-in, not
+// a deep copy of the (potentially huge) initializer bytes.
+onnx::ModelProto EliminateUnusedInitializer(onnx::ModelProto model) {
   std::set<std::string> used;
-  CollectUsedTensorNames(result.graph(), used);
+  CollectUsedTensorNames(model.graph(), used);
   // Keep initializers that double as graph inputs (their default value);
   // dropping them would silently turn them into required inputs.
-  for (const auto& input : result.graph().input()) {
+  for (const auto& input : model.graph().input()) {
     used.insert(input.name());
   }
 
   google::protobuf::RepeatedPtrField<onnx::TensorProto> kept;
-  for (auto& initializer : *result.mutable_graph()->mutable_initializer()) {
+  for (auto& initializer : *model.mutable_graph()->mutable_initializer()) {
     if (used.count(initializer.name()) > 0) {
       *kept.Add() = std::move(initializer);
     }
   }
-  result.mutable_graph()->mutable_initializer()->Swap(&kept);
+  model.mutable_graph()->mutable_initializer()->Swap(&kept);
 
-  return result;
+  return model;
 }
 
 // Mutates the model in place; ``onnx::shape_inference::InferShapes`` already
@@ -1457,7 +1481,7 @@ void EliminateZeroRnnInitialState(onnx::Graph& graph) {
   const auto& initializer_names = graph.initializer_names();
   initializer_by_name.reserve(initializers.size());
   for (size_t i = 0; i < initializers.size(); ++i) {
-    initializer_by_name[initializer_names[i]] = &initializers[i];
+    initializer_by_name[initializer_names[i]] = initializers[i].get();
   }
   std::unordered_map<const onnx::Value*, bool> memo;
   onnx::Value* undefined = nullptr;
@@ -1601,87 +1625,94 @@ void FoldGroup(const ModelExecutor& executor, onnx::ModelProto& model,
   }
 }
 
+// Takes `model` by value rather than `const&`: both call sites pass an
+// rvalue (std::move of a local they immediately overwrite with the return
+// value), so this is a cheap move-construction -- a pointer/buffer swap --
+// not a deep copy of the model's initializer bytes. `model` is then this
+// function's own uniquely-owned working copy, mutated in place throughout.
 onnx::ModelProto _FoldConstant(const ModelExecutor& executor,
-                               const onnx::ModelProto& model) {
-  const auto& tmp = model;
+                               onnx::ModelProto model) {
+  ConstantNodePartition partition;
   {
-    onnx::ModelProto model;
-    model.CopyFrom(tmp);
-    auto partition = GetConstantNodes(model);
-    const auto& const_nodes = partition.const_nodes;
-    // Map each deferred node's output to the producing node so RunOps can
-    // inline it into the sub-model executed when folding a downstream consumer.
-    // The pointers stay valid for the loop below: folding only appends
-    // initializers to the graph and never touches its node list.
-    std::unordered_map<std::string, const onnx::NodeProto*> deferred_producers;
-    if (!partition.deferred_outputs.empty()) {
-      for (const auto& node : model.graph().node()) {
-        for (const auto& output : node.output()) {
-          if (partition.deferred_outputs.count(output) > 0) {
-            deferred_producers.emplace(output, &node);
-          }
+    onnxsim::ProfiledScope analysis_scope("GetConstantNodes");
+    partition = GetConstantNodes(model);
+  }
+  const auto& const_nodes = partition.const_nodes;
+  // Map each deferred node's output to the producing node so RunOps can
+  // inline it into the sub-model executed when folding a downstream consumer.
+  // The pointers stay valid for the loop below: folding only appends
+  // initializers to the graph and never touches its node list.
+  std::unordered_map<std::string, const onnx::NodeProto*> deferred_producers;
+  if (!partition.deferred_outputs.empty()) {
+    for (const auto& node : model.graph().node()) {
+      for (const auto& output : node.output()) {
+        if (partition.deferred_outputs.count(output) > 0) {
+          deferred_producers.emplace(output, &node);
         }
       }
     }
-    // Look up each tensor's inferred shape so batches can be capped by the
-    // bytes they would materialize (see below). Pointers reference `model`,
-    // which is not mutated (only appended to) while the map is in use.
-    std::unordered_map<std::string, const onnx::ValueInfoProto*> vi_map;
-    for (const auto& vi : model.graph().value_info()) {
-      vi_map[vi.name()] = &vi;
-    }
-    // Fold the const nodes in batches: one Session per batch instead of one per
-    // node. `const_nodes` is topologically sorted, so a batch is a contiguous
-    // slice and a later batch reads any earlier batch's outputs as ordinary
-    // initializers. Two budgets bound ORT's peak memory: a batch is closed once
-    // its outputs would exceed kBatchByteBudget or it reaches kBatchMaxNodes.
-    // Nodes that consume a deferred (large-tensor) output are folded on their
-    // own so the large intermediate is materialized transiently for just that
-    // node, exactly as in the per-node path.
-    constexpr size_t kBatchByteBudget = size_t(256) << 20;  // 256 MiB
-    constexpr size_t kBatchMaxNodes = 1024;
-    auto consumes_deferred = [&](const onnx::NodeProto& node) {
-      if (partition.deferred_outputs.empty()) {
-        return false;
-      }
-      for (const auto& input : node.input()) {
-        if (partition.deferred_outputs.count(input) > 0) {
-          return true;
-        }
-      }
+  }
+  // Look up each tensor's inferred shape so batches can be capped by the
+  // bytes they would materialize (see below). Pointers reference `model`,
+  // which is not mutated (only appended to) while the map is in use.
+  std::unordered_map<std::string, const onnx::ValueInfoProto*> vi_map;
+  for (const auto& vi : model.graph().value_info()) {
+    vi_map[vi.name()] = &vi;
+  }
+  // Fold the const nodes in batches: one Session per batch instead of one per
+  // node. `const_nodes` is topologically sorted, so a batch is a contiguous
+  // slice and a later batch reads any earlier batch's outputs as ordinary
+  // initializers. Two budgets bound ORT's peak memory: a batch is closed once
+  // its outputs would exceed kBatchByteBudget or it reaches kBatchMaxNodes.
+  // Nodes that consume a deferred (large-tensor) output are folded on their
+  // own so the large intermediate is materialized transiently for just that
+  // node, exactly as in the per-node path.
+  constexpr size_t kBatchByteBudget = size_t(256) << 20;  // 256 MiB
+  constexpr size_t kBatchMaxNodes = 1024;
+  auto consumes_deferred = [&](const onnx::NodeProto& node) {
+    if (partition.deferred_outputs.empty()) {
       return false;
-    };
-    // Outputs of const nodes that were successfully folded into initializers.
-    std::set<std::string> folded_outputs;
-    const size_t num_const_nodes = const_nodes.size();
-    for (size_t i = 0; i < num_const_nodes;) {
-      if (consumes_deferred(const_nodes[i])) {
-        FoldGroup(executor, model, const_nodes, i, i + 1, deferred_producers,
-                  folded_outputs);
-        i++;
-        continue;
-      }
-      size_t j = i;
-      size_t bytes = 0;
-      while (j < num_const_nodes && j - i < kBatchMaxNodes &&
-             !consumes_deferred(const_nodes[j])) {
-        const size_t node_bytes = EstimateOutputBytes(vi_map, const_nodes[j]);
-        if (j > i && bytes + node_bytes > kBatchByteBudget) {
-          break;
-        }
-        bytes += node_bytes;
-        j++;
-      }
-      FoldGroup(executor, model, const_nodes, i, j, deferred_producers,
-                folded_outputs);
-      i = j;
     }
-    // Rebuild the node list in its original topological order, dropping only
-    // the const nodes that were successfully folded into initializers. A const
-    // node that failed to fold must keep its original position: appending it to
-    // the end can place it after a non-const consumer (e.g. a Loop reading a
-    // SequenceEmpty output), which breaks topological sorting and makes the
-    // resulting model fail onnx's checker (issues #238, #335, #352).
+    for (const auto& input : node.input()) {
+      if (partition.deferred_outputs.count(input) > 0) {
+        return true;
+      }
+    }
+    return false;
+  };
+  // Outputs of const nodes that were successfully folded into initializers.
+  std::set<std::string> folded_outputs;
+  const size_t num_const_nodes = const_nodes.size();
+  for (size_t i = 0; i < num_const_nodes;) {
+    if (consumes_deferred(const_nodes[i])) {
+      FoldGroup(executor, model, const_nodes, i, i + 1, deferred_producers,
+                folded_outputs);
+      i++;
+      continue;
+    }
+    size_t j = i;
+    size_t bytes = 0;
+    while (j < num_const_nodes && j - i < kBatchMaxNodes &&
+           !consumes_deferred(const_nodes[j])) {
+      const size_t node_bytes = EstimateOutputBytes(vi_map, const_nodes[j]);
+      if (j > i && bytes + node_bytes > kBatchByteBudget) {
+        break;
+      }
+      bytes += node_bytes;
+      j++;
+    }
+    FoldGroup(executor, model, const_nodes, i, j, deferred_producers,
+              folded_outputs);
+    i = j;
+  }
+  // Rebuild the node list in its original topological order, dropping only
+  // the const nodes that were successfully folded into initializers. A const
+  // node that failed to fold must keep its original position: appending it to
+  // the end can place it after a non-const consumer (e.g. a Loop reading a
+  // SequenceEmpty output), which breaks topological sorting and makes the
+  // resulting model fail onnx's checker (issues #238, #335, #352).
+  {
+    onnxsim::ProfiledScope rebuild_scope("RebuildNodeList");
     google::protobuf::RepeatedPtrField<onnx::NodeProto> original_nodes;
     original_nodes.Swap(model.mutable_graph()->mutable_node());
     for (auto& node : original_nodes) {
@@ -1691,10 +1722,11 @@ onnx::ModelProto _FoldConstant(const ModelExecutor& executor,
         *model.mutable_graph()->add_node() = std::move(node);
       }
     }
-    // Drop initializers left dangling by folding so the intermediate model does
-    // not balloon in size (issue #174).
-    return EliminateUnusedInitializer(model);
   }
+  // Drop initializers left dangling by folding so the intermediate model does
+  // not balloon in size (issue #174).
+  onnxsim::ProfiledScope eliminate_scope("EliminateUnusedInitializerScope");
+  return EliminateUnusedInitializer(std::move(model));
 }
 
 // ``model`` is ``onnx::ModelProto&`` (not const): the call site below passes a
@@ -2119,6 +2151,45 @@ void AssignMissingNodeNames(onnx::ModelProto& model) {
   AssignMissingNodeNames(*model.mutable_graph(), used_names, counter);
 }
 
+// Shape inference can leave behind a value_info entry that records a shape
+// but never resolved an element type (e.g. observed on a real-world model's
+// Reshape outputs inside attention blocks: graph_shape_inference.h's
+// InferShapesOnGraph propagated the target shape but left elem_type at its
+// default UNDEFINED). value_info is purely optional annotation -- nothing
+// reads it as ground truth -- but an entry with elem_type == UNDEFINED is a
+// malformed TypeProto, and onnx::checker::check_model does not reject it,
+// while onnxruntime's own model loader is stricter and refuses to load the
+// model at all with "Invalid tensor data type 0". Drop such entries instead
+// of leaving broken metadata in the output model; the same op's actual
+// output tensor is unaffected either way.
+// Recurses into subgraphs (If/Loop/Scan bodies) for the same reason
+// AssignMissingNodeNames does.
+void DropIncompleteValueInfo(onnx::GraphProto& graph) {
+  auto& value_info = *graph.mutable_value_info();
+  value_info.erase(
+      std::remove_if(value_info.begin(), value_info.end(),
+                     [](const onnx::ValueInfoProto& vi) {
+                       return vi.type().has_tensor_type() &&
+                              vi.type().tensor_type().elem_type() ==
+                                  onnx::TensorProto::UNDEFINED;
+                     }),
+      value_info.end());
+  for (auto& node : *graph.mutable_node()) {
+    for (auto& attr : *node.mutable_attribute()) {
+      if (attr.has_g()) {
+        DropIncompleteValueInfo(*attr.mutable_g());
+      }
+      for (auto& subgraph : *attr.mutable_graphs()) {
+        DropIncompleteValueInfo(subgraph);
+      }
+    }
+  }
+}
+
+void DropIncompleteValueInfo(onnx::ModelProto& model) {
+  DropIncompleteValueInfo(*model.mutable_graph());
+}
+
 void Check(const onnx::ModelProto& model) { onnx::checker::check_model(model); }
 
 // Return the opset version the model imports for the default ONNX domain
@@ -2132,6 +2203,171 @@ std::optional<int> DefaultOpsetVersion(const onnx::ModelProto& model) {
     }
   }
   return std::nullopt;
+}
+
+// Mirrors onnx_simplifier.py's remove_initializer_from_input: an initializer
+// that also appears in graph.input is treated as a runtime input by
+// onnxoptimizer's is_constant_initializer, which blocks value-baking fusions
+// (fuse_bn_into_conv, ...) that only work on non-input initializers -- e.g.
+// the plain Conv+BN chains of the opset-8 resnet101-v1-7 were left completely
+// unsimplified without this. Removing it from the input list lets it fold
+// like any other constant. Kept in sync with the Python function; see that
+// one's own comment for the opset-6 floor (Cast's `to` attribute's INT
+// encoding wasn't valid before opset 6, so bumping an old-IR/old-opset model
+// to IR 4 here would let a later fusion emit a node the opset rejects).
+void RemoveInitializerFromInput(onnx::ModelProto& model) {
+  constexpr int kMinOpsetForInitializerFold = 6;
+  if (model.ir_version() < 4) {
+    const auto opset = DefaultOpsetVersion(model);
+    if (!opset || *opset < kMinOpsetForInitializerFold) {
+      return;
+    }
+  }
+  std::set<std::string> initializer_names;
+  for (const auto& init : model.graph().initializer()) {
+    initializer_names.insert(init.name());
+  }
+  auto* inputs = model.mutable_graph()->mutable_input();
+  bool removed_any = false;
+  for (int i = inputs->size() - 1; i >= 0; --i) {
+    if (initializer_names.count((*inputs)[i].name()) > 0) {
+      inputs->erase(inputs->begin() + i);
+      removed_any = true;
+    }
+  }
+  if (removed_any && model.ir_version() < 4) {
+    model.set_ir_version(4);
+  }
+}
+
+// ONNX TensorProto element types onnxoptimizer's tensor-value hashing
+// (cse_util.h) knows how to hash. Any other type makes
+// eliminate_common_subexpression/eliminate_duplicate_initializer raise
+// "no supported data type: <N>". Enumerates the *supported* types (rather
+// than the unsupported ones) so an element type added to ONNX in the future
+// is treated as unhashable by default instead of silently crashing. Mirrors
+// onnx_simplifier.py's _CSE_HASHABLE_ELEM_TYPES.
+bool IsCSEHashableElemType(int32_t elem_type) {
+  switch (elem_type) {
+    case onnx::TensorProto::UNDEFINED:
+    case onnx::TensorProto::BOOL:
+    case onnx::TensorProto::INT8:
+    case onnx::TensorProto::INT16:
+    case onnx::TensorProto::INT32:
+    case onnx::TensorProto::INT64:
+    case onnx::TensorProto::UINT8:
+    case onnx::TensorProto::UINT16:
+    case onnx::TensorProto::UINT32:
+    case onnx::TensorProto::UINT64:
+    case onnx::TensorProto::FLOAT:
+    case onnx::TensorProto::DOUBLE:
+    case onnx::TensorProto::FLOAT16:
+    case onnx::TensorProto::BFLOAT16:
+    case onnx::TensorProto::COMPLEX64:
+    case onnx::TensorProto::COMPLEX128:
+    case onnx::TensorProto::STRING:
+      return true;
+    default:
+      return false;
+  }
+}
+
+// Mirrors onnx_simplifier.py's _has_cse_unhashable_tensor /
+// _iter_tensor_data_types: walks every tensor CSE might hash -- initializers,
+// t/ts node attributes, recursing into subgraphs -- looking for an element
+// type IsCSEHashableElemType rejects.
+bool GraphHasCSEUnhashableTensor(const onnx::GraphProto& graph) {
+  for (const auto& init : graph.initializer()) {
+    if (!IsCSEHashableElemType(init.data_type())) {
+      return true;
+    }
+  }
+  for (const auto& node : graph.node()) {
+    for (const auto& attr : node.attribute()) {
+      if (attr.has_t() && !IsCSEHashableElemType(attr.t().data_type())) {
+        return true;
+      }
+      for (const auto& t : attr.tensors()) {
+        if (!IsCSEHashableElemType(t.data_type())) {
+          return true;
+        }
+      }
+      if (attr.has_g() && GraphHasCSEUnhashableTensor(attr.g())) {
+        return true;
+      }
+      for (const auto& g : attr.graphs()) {
+        if (GraphHasCSEUnhashableTensor(g)) {
+          return true;
+        }
+      }
+    }
+  }
+  return false;
+}
+
+// Mirrors onnx_simplifier.py's overwrite_input_shapes loop: for each named
+// graph input, overwrite its shape's dims with the given values, skipping
+// any non-positive entry (which means "keep the original, possibly dynamic,
+// dimension" rather than hardcoding an invalid size such as 0 -- GitHub
+// issue #237). Throws std::runtime_error if a name isn't a graph input
+// (matching onnx_simplifier.py's RuntimeError for the same case).
+void ApplyInputShapeOverwrite(
+    onnx::ModelProto& model,
+    const std::unordered_map<std::string, std::vector<int64_t>>&
+        overwrite_input_shapes) {
+  for (const auto& [name, shape] : overwrite_input_shapes) {
+    bool found = false;
+    for (auto& input : *model.mutable_graph()->mutable_input()) {
+      if (input.name() != name) {
+        continue;
+      }
+      found = true;
+      auto* dims = input.mutable_type()
+                       ->mutable_tensor_type()
+                       ->mutable_shape()
+                       ->mutable_dim();
+      for (int i = 0; i < dims->size() && i < static_cast<int>(shape.size());
+           ++i) {
+        if (shape[i] > 0) {
+          dims->Mutable(i)->set_dim_value(shape[i]);
+        }
+      }
+    }
+    if (!found) {
+      throw std::runtime_error("The model doesn't have input named \"" + name +
+                               "\"");
+    }
+  }
+}
+
+// Mirrors onnx_simplifier.py's remove_unused_output: drops the named graph
+// outputs. Downstream dead-end elimination cleans up nodes that only fed
+// them. Throws std::runtime_error if a name isn't a graph output (matching
+// onnx_simplifier.py's RuntimeError for the same case).
+void RemoveUnusedOutputs(onnx::ModelProto& model,
+                         const std::vector<std::string>& unused_output) {
+  for (const auto& name : unused_output) {
+    bool found = false;
+    for (const auto& output : model.graph().output()) {
+      if (output.name() == name) {
+        found = true;
+        break;
+      }
+    }
+    if (!found) {
+      throw std::runtime_error("The model doesn't have output named \"" + name +
+                               "\"");
+    }
+  }
+  auto* outputs = model.mutable_graph()->mutable_output();
+  google::protobuf::RepeatedPtrField<onnx::ValueInfoProto> kept;
+  for (auto& output : *outputs) {
+    if (std::find(unused_output.begin(), unused_output.end(), output.name()) ==
+        unused_output.end()) {
+      *kept.Add() = std::move(output);
+    }
+  }
+  outputs->Swap(&kept);
 }
 
 // Convert the default ONNX domain of the model to target_version using onnx's
@@ -2190,8 +2426,91 @@ onnx::ModelProto FoldConstantOnce(const ModelExecutor& executor,
   // turns Shape/Gather-on-shape into constants that the ordinary constant
   // folder can then propagate.
   _EvalPartialShape(out);
-  out = _FoldConstant(executor, out);
+  out = _FoldConstant(executor, std::move(out));
   return out;
+}
+
+// Records the options this Simplify() call actually used (skip_optimizers
+// reflects any auto-added unhashable-tensor protections) as string
+// key/value pairs in the model's metadata_props, namespaced under
+// "onnxsim:" so they cannot collide with the model's own metadata. Lets a
+// downstream consumer see how a model was simplified without having to have
+// kept the original call around. Replaces any pre-existing "onnxsim:*"
+// entries (e.g. left by a previous simplify() call) rather than
+// accumulating duplicates across repeated simplification.
+void RecordSimplifyOptionsMetadata(
+    onnx::ModelProto& model,
+    const std::optional<std::vector<std::string>>& skip_optimizers,
+    bool constant_folding, bool shape_inference, size_t tensor_size_threshold,
+    std::optional<int> target_opset_version, bool initializers_as_constants,
+    bool include_inline_functions, bool mutable_initializer,
+    const std::optional<std::unordered_map<std::string, std::vector<int64_t>>>&
+        overwrite_input_shapes,
+    const std::optional<std::vector<std::string>>& unused_output) {
+  auto join = [](const std::vector<std::string>& v) {
+    std::string out;
+    for (size_t i = 0; i < v.size(); ++i) {
+      if (i > 0) {
+        out += ",";
+      }
+      out += v[i];
+    }
+    return out;
+  };
+
+  std::vector<std::pair<std::string, std::string>> options;
+  options.emplace_back("onnxsim:skip_optimizers",
+                       skip_optimizers ? join(*skip_optimizers) : "<all>");
+  options.emplace_back("onnxsim:constant_folding",
+                       constant_folding ? "true" : "false");
+  options.emplace_back("onnxsim:shape_inference",
+                       shape_inference ? "true" : "false");
+  options.emplace_back("onnxsim:tensor_size_threshold",
+                       std::to_string(tensor_size_threshold));
+  options.emplace_back(
+      "onnxsim:target_opset_version",
+      target_opset_version ? std::to_string(*target_opset_version) : "");
+  options.emplace_back("onnxsim:initializers_as_constants",
+                       initializers_as_constants ? "true" : "false");
+  options.emplace_back("onnxsim:include_inline_functions",
+                       include_inline_functions ? "true" : "false");
+  options.emplace_back("onnxsim:mutable_initializer",
+                       mutable_initializer ? "true" : "false");
+  if (overwrite_input_shapes) {
+    std::string s;
+    bool first = true;
+    for (const auto& [name, shape] : *overwrite_input_shapes) {
+      if (!first) {
+        s += ";";
+      }
+      first = false;
+      s += name + ":";
+      for (size_t i = 0; i < shape.size(); ++i) {
+        if (i > 0) {
+          s += ",";
+        }
+        s += std::to_string(shape[i]);
+      }
+    }
+    options.emplace_back("onnxsim:overwrite_input_shapes", s);
+  }
+  if (unused_output) {
+    options.emplace_back("onnxsim:unused_output", join(*unused_output));
+  }
+
+  auto* props = model.mutable_metadata_props();
+  google::protobuf::RepeatedPtrField<onnx::StringStringEntryProto> kept;
+  for (auto& prop : *props) {
+    if (prop.key().rfind("onnxsim:", 0) != 0) {
+      *kept.Add() = std::move(prop);
+    }
+  }
+  props->Swap(&kept);
+  for (const auto& [key, value] : options) {
+    auto* entry = props->Add();
+    entry->set_key(key);
+    entry->set_value(value);
+  }
 }
 
 onnx::ModelProto Simplify(
@@ -2199,7 +2518,11 @@ onnx::ModelProto Simplify(
     std::optional<std::vector<std::string>> skip_optimizers,
     bool constant_folding, bool shape_inference, size_t tensor_size_threshold,
     std::optional<int> target_opset_version, const GraphRewriter* rewriter,
-    bool initializers_as_constants, bool include_inline_functions) {
+    bool initializers_as_constants, bool include_inline_functions,
+    bool mutable_initializer,
+    const std::optional<std::unordered_map<std::string, std::vector<int64_t>>>&
+        overwrite_input_shapes,
+    const std::optional<std::vector<std::string>>& unused_output) {
   // Register onnxsim's own optimizer passes into onnxoptimizer's registry
   // before the pass list is built below: fuse_consecutive_mul,
   // fuse_mul_into_conv, fuse_preceding_mul_into_conv, fuse_rms_norm and
@@ -2245,6 +2568,23 @@ onnx::ModelProto Simplify(
                         const std::string& pass) {
     return std::find(list.begin(), list.end(), pass) != list.end();
   };
+  // onnxoptimizer's common-subexpression / duplicate-initializer passes hash
+  // tensor values and crash with "no supported data type: <N>" on element
+  // types they cannot hash, such as the float8 zero points produced by
+  // NVIDIA ModelOpt fp8 QDQ models (GitHub issue #348). When such a tensor
+  // is present, transparently skip those two passes so the rest of
+  // simplification still runs, instead of crashing outright. Only relevant
+  // when some optimizer is actually going to run (skip_optimizers ==
+  // nullopt already disables all of them).
+  if (skip_optimizers && GraphHasCSEUnhashableTensor(model.graph())) {
+    static const std::vector<std::string> kTensorValueHashingOptimizers = {
+        "eliminate_common_subexpression", "eliminate_duplicate_initializer"};
+    for (const auto& opt : kTensorValueHashingOptimizers) {
+      if (!is_disabled(*skip_optimizers, opt)) {
+        skip_optimizers->push_back(opt);
+      }
+    }
+  }
   // skip_optimizers == nullopt means skiping all optimizers, so
   // config.optimizer_passes is empty
   if (skip_optimizers) {
@@ -2284,7 +2624,7 @@ onnx::ModelProto Simplify(
       // Partial shape evaluation (issue #139) turns Shape/Gather-on-shape into
       // constants that the ordinary constant folder can then propagate.
       _EvalPartialShape(model);
-      model = _FoldConstant(executor, model);
+      model = _FoldConstant(executor, std::move(model));
     };
   } else {
     FoldConstant = Identity;
@@ -2318,6 +2658,24 @@ onnx::ModelProto Simplify(
     if (!profile_path.empty()) {
       onnxsim::Profiler::Instance().Enable(profile_path);
     }
+  }
+  // Optionally break the per-round Optimize() cost down further, into each
+  // PredicateBasedPass's "matching" (patternMatchPredicate) vs "modifying"
+  // (runTransform) phase, per pass name -- see onnxoptimizer/pass.h's
+  // PassPhaseTiming for scope and overhead. Exploratory diagnostic for
+  // onnxsim issue #633; the summary prints to stderr after Pipeline runs.
+  const bool profile_pass_phases = [] {
+    const char* env = std::getenv("ONNXSIM_PROFILE_PASS_PHASES");
+    return env != nullptr && std::string(env) != "0" &&
+           std::string(env) != "false";
+  }();
+  if (profile_pass_phases) {
+    onnx::optimization::ResetPassPhaseTimings();
+    onnx::optimization::ResetPassTotalTimings();
+    onnx::optimization::ResetCSEHashCompareTiming();
+    onnx::optimization::ResetCSEPassTiming();
+    onnx::optimization::ResetDeadendPassTiming();
+    onnx::optimization::SetPassPhaseProfilingEnabled(true);
   }
   // Optionally merge ONNX Runtime's own per-session profiles into the onnxsim
   // trace -- the binding-agnostic counterpart of Python's
@@ -2375,6 +2733,27 @@ onnx::ModelProto Simplify(
           // model, leave it untouched.
           return;
         }
+        // Scope onnx-optimizer's tensor-hash caches (TensorContentDigest,
+        // the typed-field path, and CSETensorHash's raw_data-branch cache
+        // -- see onnxoptimizer/passes/{tensor_content_hash,cse_util}.h) to
+        // this whole OptAndShape call, instead of the OptimizeGraphFixed
+        // call below clearing them every round (its own default): `g` is
+        // one resident Graph held across every round of the fixed point
+        // underneath, and no round mutates a retained tensor's content in
+        // place (only replaces it wholesale, which mints its own fresh
+        // tensor_id() and simply misses these caches) -- so a hash computed
+        // for a tensor that survives unchanged from one round to the next
+        // stays valid, and correct, letting eliminate_duplicate_initializer
+        // and eliminate_common_subexpression skip rehashing it on every one
+        // of the ~dozens of rounds a deep repeated-block model can take.
+        // Dominated in practice by the raw_data cache: real exported models
+        // are raw_data-heavy, and measured 98%+ of those hash calls were
+        // otherwise recomputing a value already seen earlier in the same
+        // run (see onnxsim issue #633). OptimizeGraphChanged below passes
+        // clear_tensor_digest_cache=false to keep both caches alive across
+        // its own repeated OptimizeGraphFixed calls.
+        onnx::optimization::ClearTensorContentDigestCache();
+        onnx::optimization::ClearRawHashCache();
         using GraphFnChanged = std::function<bool(onnx::Graph&)>;
         GraphFnChanged InferShapesOnGraphChanged =
             shape_inference
@@ -2399,8 +2778,9 @@ onnx::ModelProto Simplify(
           onnx::optimization::SetInitializersAsConstants(
               config.initializers_as_constants);
           std::map<std::string, unsigned int> report;
-          onnx::optimization::OptimizeGraphFixed(graph, config.optimizer_passes,
-                                                 &report);
+          onnx::optimization::OptimizeGraphFixed(
+              graph, config.optimizer_passes, &report,
+              /*clear_tensor_digest_cache=*/false);
           onnx::optimization::SetInitializersAsConstants(prev);
           for (const auto& pass_count : report) {
             if (pass_count.second != 0) {
@@ -2456,6 +2836,22 @@ onnx::ModelProto Simplify(
   // The fixed points mutate in place, so make one working copy of the (const)
   // input model and simplify it in place.
   onnx::ModelProto sim_model = model;
+  // Matches onnx_simplifier.py's default (mutable_initializer=False): fold
+  // initializers that also appear as graph inputs like any other constant.
+  if (!mutable_initializer) {
+    RemoveInitializerFromInput(sim_model);
+  }
+  // Overwrite named input shapes, if requested, before shape inference or
+  // any transform runs -- mirrors onnx_simplifier.py's overwrite_input_shapes
+  // loop, applied here instead of by the Python wrapper.
+  if (overwrite_input_shapes) {
+    ApplyInputShapeOverwrite(sim_model, *overwrite_input_shapes);
+  }
+  // Drop the named graph outputs, if requested, before the fixed point so
+  // dead-end elimination cleans up nodes that only fed them.
+  if (unused_output) {
+    RemoveUnusedOutputs(sim_model, *unused_output);
+  }
   // Optionally inline the model's local (model-defined) functions into the main
   // graph up front, so the optimizer, shape inference and constant folding
   // below see through them into a flat op graph. Done before the opset
@@ -2480,10 +2876,171 @@ onnx::ModelProto Simplify(
   // Flush the profiling trace and print the per-function summary. Safe to call
   // unconditionally: Finish() is a no-op unless profiling was enabled above.
   onnxsim::Profiler::Instance().Finish();
+  if (profile_pass_phases) {
+    onnx::optimization::SetPassPhaseProfilingEnabled(false);
+    std::vector<std::pair<std::string, onnx::optimization::PassPhaseTiming>>
+        rows(onnx::optimization::GetPassPhaseTimings().begin(),
+             onnx::optimization::GetPassPhaseTimings().end());
+    std::sort(rows.begin(), rows.end(), [](const auto& a, const auto& b) {
+      return (a.second.match_ms + a.second.transform_ms) >
+             (b.second.match_ms + b.second.transform_ms);
+    });
+    std::cerr << "\nonnxsim pass-phase profiling (PredicateBasedPass "
+                 "matching vs modifying)\n"
+              << "-------------------------------------------------------"
+                 "------------------------------------\n"
+              << std::left << std::setw(38) << "pass" << std::right
+              << std::setw(12) << "match(ms)" << std::setw(10) << "calls"
+              << std::setw(14) << "modify(ms)" << std::setw(10) << "calls"
+              << std::setw(12) << "total(ms)" << "\n"
+              << "-------------------------------------------------------"
+                 "------------------------------------\n";
+    double total_match_ms = 0, total_transform_ms = 0;
+    for (const auto& [name, t] : rows) {
+      std::cerr << std::left << std::setw(38) << name << std::right
+                << std::setw(12) << std::fixed << std::setprecision(2)
+                << t.match_ms << std::setw(10) << t.match_calls << std::setw(14)
+                << t.transform_ms << std::setw(10) << t.transform_calls
+                << std::setw(12) << (t.match_ms + t.transform_ms) << "\n";
+      total_match_ms += t.match_ms;
+      total_transform_ms += t.transform_ms;
+    }
+    std::cerr << "-------------------------------------------------------"
+                 "------------------------------------\n"
+              << "TOTAL matching: " << total_match_ms
+              << "ms, TOTAL modifying: " << total_transform_ms << "ms\n";
+
+    // Coarser companion table: total wall time inside EVERY pass's
+    // runPass(Graph&) call (both kinds), which is what actually accounts
+    // for the full Optimize() cost -- see PassTotalTiming's comment.
+    std::vector<std::pair<std::string, onnx::optimization::PassTotalTiming>>
+        total_rows(onnx::optimization::GetPassTotalTimings().begin(),
+                   onnx::optimization::GetPassTotalTimings().end());
+    std::sort(total_rows.begin(), total_rows.end(),
+              [](const auto& a, const auto& b) {
+                return a.second.total_ms > b.second.total_ms;
+              });
+    std::cerr << "\nonnxsim pass-phase profiling (total runPass() time, all "
+                 "pass kinds)\n"
+              << "-------------------------------------------------------"
+                 "------------------------------------\n"
+              << std::left << std::setw(38) << "pass" << std::right
+              << std::setw(14) << "total(ms)" << std::setw(10) << "calls"
+              << "\n"
+              << "-------------------------------------------------------"
+                 "------------------------------------\n";
+    double grand_total_ms = 0;
+    for (const auto& [name, t] : total_rows) {
+      std::cerr << std::left << std::setw(38) << name << std::right
+                << std::setw(14) << std::fixed << std::setprecision(2)
+                << t.total_ms << std::setw(10) << t.calls << "\n";
+      grand_total_ms += t.total_ms;
+    }
+    std::cerr << "-------------------------------------------------------"
+                 "------------------------------------\n"
+              << "GRAND TOTAL (sum of all pass runPass() calls): "
+              << grand_total_ms << "ms\n";
+
+    // CSETensorHash/CSETensorCompare breakdown -- the actual hashing and
+    // equality-checking work inside eliminate_duplicate_initializer and
+    // eliminate_common_subexpression's hash-map lookups. Splits raw_data
+    // (real exported-model weights; a byte hash / a single memcmp) from
+    // typed-field (BLAKE3-digest-backed; rarer in practice) so it's clear
+    // which one, if either, actually accounts for those two passes' cost.
+    const auto& cse_t = onnx::optimization::GetCSEHashCompareTiming();
+    std::cerr << "\nonnxsim CSETensorHash / CSETensorCompare breakdown "
+                 "(inside eliminate_duplicate_initializer / "
+                 "eliminate_common_subexpression's hash-map lookups)\n"
+              << "-------------------------------------------------------"
+                 "------------------------------------\n"
+              << std::left << std::setw(24) << "" << std::right << std::setw(14)
+              << "total(ms)" << std::setw(10) << "calls" << "\n"
+              << std::left << std::setw(24) << "raw_data hash" << std::right
+              << std::setw(14) << std::fixed << std::setprecision(2)
+              << cse_t.raw_hash_ms << std::setw(10) << cse_t.raw_hash_calls
+              << "\n"
+              << std::left << std::setw(24) << "typed-field hash" << std::right
+              << std::setw(14) << cse_t.typed_hash_ms << std::setw(10)
+              << cse_t.typed_hash_calls << "\n"
+              << std::left << std::setw(24) << "raw_data compare" << std::right
+              << std::setw(14) << cse_t.raw_compare_ms << std::setw(10)
+              << cse_t.raw_compare_calls << "\n"
+              << std::left << std::setw(24) << "typed-field compare"
+              << std::right << std::setw(14) << cse_t.typed_compare_ms
+              << std::setw(10) << cse_t.typed_compare_calls << "\n"
+              << std::left << std::setw(24) << "node hash (CSENodeHash)"
+              << std::right << std::setw(14) << cse_t.node_hash_ms
+              << std::setw(10) << cse_t.node_hash_calls << "\n"
+              << std::left << std::setw(24) << "  of which attrs+sort"
+              << std::right << std::setw(14) << cse_t.node_hash_attrsort_ms
+              << std::setw(10) << cse_t.node_hash_attrsort_calls << "\n"
+              << std::left << std::setw(24) << "node equal (CSEEqual)"
+              << std::right << std::setw(14) << cse_t.node_equal_ms
+              << std::setw(10) << cse_t.node_equal_calls << "\n"
+              << std::left << std::setw(24) << "  of which attrs+sort"
+              << std::right << std::setw(14) << cse_t.node_equal_attrsort_ms
+              << std::setw(10) << cse_t.node_equal_attrsort_calls << "\n"
+              << "-------------------------------------------------------"
+                 "------------------------------------\n"
+              << "TOTAL hash: "
+              << (cse_t.raw_hash_ms + cse_t.typed_hash_ms + cse_t.node_hash_ms)
+              << "ms, TOTAL compare: "
+              << (cse_t.raw_compare_ms + cse_t.typed_compare_ms +
+                  cse_t.node_equal_ms)
+              << "ms\n";
+
+    // Actual cache hit rate: see cse_util.h's g_raw_hash_cache, keyed by
+    // Tensor::tensor_id().
+    if (cse_t.raw_hash_calls > 0) {
+      std::cerr << "raw_data hash cache: " << cse_t.raw_hash_cache_hits << "/"
+                << cse_t.raw_hash_calls << " calls ("
+                << (100.0 * cse_t.raw_hash_cache_hits / cse_t.raw_hash_calls)
+                << "%) were hits (" << cse_t.raw_hash_cache_hit_ms << "ms) vs "
+                << cse_t.raw_hash_cache_misses << " misses ("
+                << cse_t.raw_hash_cache_miss_ms << "ms).\n";
+    }
+
+    // eliminate_common_subexpression's own outer-loop breakdown: filtering
+    // (hasUses/IsSupportedByCSE), the hash_map.emplace() lookup itself
+    // (overlaps with node_hash_ms/node_equal_ms above -- same work, two
+    // views), and replacing a found duplicate's uses.
+    const auto& cse_pass_t = onnx::optimization::GetCSEPassTiming();
+    std::cerr << "\nonnxsim eliminate_common_subexpression outer-loop "
+                 "breakdown (across "
+              << cse_pass_t.calls << " calls, " << cse_pass_t.nodes_seen
+              << " nodes seen, " << cse_pass_t.nodes_filtered_out
+              << " filtered out, " << cse_pass_t.nodes_replaced
+              << " replaced)\n"
+              << "-------------------------------------------------------"
+                 "------------------------------------\n"
+              << "  filter (hasUses/IsSupportedByCSE): " << cse_pass_t.filter_ms
+              << "ms\n"
+              << "  lookup (hash_map.emplace):          "
+              << cse_pass_t.lookup_ms << "ms\n"
+              << "  replace (tryReplacingAllUsesWith):   "
+              << cse_pass_t.replace_ms << "ms\n";
+
+    // eliminate_deadend's own breakdown: the liveness check (hasUses) vs
+    // actually unlinking/freeing a dead node (destroyCurrent).
+    const auto& dead_t = onnx::optimization::GetDeadendPassTiming();
+    std::cerr << "\nonnxsim eliminate_deadend breakdown (across "
+              << dead_t.calls << " calls, " << dead_t.nodes_seen
+              << " nodes seen, " << dead_t.nodes_removed << " removed)\n"
+              << "-------------------------------------------------------"
+                 "------------------------------------\n"
+              << "  hasUses():      " << dead_t.has_uses_ms << "ms\n"
+              << "  destroyCurrent(): " << dead_t.destroy_ms << "ms\n";
+  }
   // Simplification (and some onnx-optimizer passes) can leave nodes without a
   // name; assign unique names to them so downstream tools that key on node
   // names keep working (issue #269).
   AssignMissingNodeNames(sim_model);
+  DropIncompleteValueInfo(sim_model);
+  RecordSimplifyOptionsMetadata(sim_model, skip_optimizers, constant_folding,
+                                shape_inference, tensor_size_threshold,
+                                target_opset_version, initializers_as_constants,
+                                include_inline_functions, mutable_initializer,
+                                overwrite_input_shapes, unused_output);
   Check(sim_model);
   if (!converged) {
     std::cout << "WARNING: the simplification stopped because of timeout. "
@@ -2495,21 +3052,70 @@ onnx::ModelProto Simplify(
   return sim_model;
 }
 
-void SimplifyPath(const ModelExecutor& executor, const std::string& in_path,
-                  const std::string& out_path,
-                  std::optional<std::vector<std::string>> skip_optimizers,
-                  bool constant_folding, bool shape_inference,
-                  size_t tensor_size_threshold,
-                  std::optional<int> target_opset_version,
-                  const GraphRewriter* rewriter, bool initializers_as_constants,
-                  bool include_inline_functions) {
+void SimplifyPath(
+    const ModelExecutor& executor, const std::string& in_path,
+    const std::string& out_path,
+    std::optional<std::vector<std::string>> skip_optimizers,
+    bool constant_folding, bool shape_inference, size_t tensor_size_threshold,
+    std::optional<int> target_opset_version, const GraphRewriter* rewriter,
+    bool initializers_as_constants, bool include_inline_functions,
+    bool mutable_initializer,
+    const std::optional<std::unordered_map<std::string, std::vector<int64_t>>>&
+        overwrite_input_shapes,
+    const std::optional<std::vector<std::string>>& unused_output) {
+  const bool debug_timing = std::getenv("ONNXSIM_DEBUG_PATH_TIMING") != nullptr;
+  auto now = []() { return std::chrono::steady_clock::now(); };
+  auto elapsed_ms = [](auto t0, auto t1) {
+    return std::chrono::duration<double, std::milli>(t1 - t0).count();
+  };
+
   onnx::ModelProto model;
-  onnx::optimization::loadModel(&model, in_path, true);
+  {
+    const auto t0 = now();
+    onnx::optimization::loadModel(&model, in_path, true);
+    if (debug_timing) {
+      std::cerr << "SimplifyPath: loadModel " << elapsed_ms(t0, now())
+                << "ms\n";
+    }
+  }
 
-  model =
-      Simplify(executor, model, skip_optimizers, constant_folding,
-               shape_inference, tensor_size_threshold, target_opset_version,
-               rewriter, initializers_as_constants, include_inline_functions);
+  {
+    const auto t0 = now();
+    model =
+        Simplify(executor, model, skip_optimizers, constant_folding,
+                 shape_inference, tensor_size_threshold, target_opset_version,
+                 rewriter, initializers_as_constants, include_inline_functions,
+                 mutable_initializer, overwrite_input_shapes, unused_output);
+    if (debug_timing) {
+      std::cerr << "SimplifyPath: Simplify " << elapsed_ms(t0, now()) << "ms\n";
+    }
+  }
 
-  onnx::optimization::saveModel(&model, out_path, true, "");
+  // Prefer a single self-contained inline file over external data: onnx's
+  // own checker (onnx.checker.check_model, called by every Python caller's
+  // correctness check) is drastically slower validating an external-data
+  // model than an equivalent inline one -- 18.6s vs ~4s measured on an
+  // 833MB model, apparently from re-reading/re-validating the sibling data
+  // file rather than working off the already-parsed in-memory tensors. Only
+  // fall back to external data when the model does not fit in a single
+  // protobuf message (the 2GB limit `saveModel`'s unconditional external-
+  // data write used to sidestep unconditionally).
+  constexpr size_t kProtobufSizeLimit = (size_t(2) << 30) - 9999;
+  bool needs_external_data;
+  {
+    const auto t0 = now();
+    needs_external_data = model.ByteSizeLong() >= kProtobufSizeLimit;
+    if (debug_timing) {
+      std::cerr << "SimplifyPath: ByteSizeLong " << elapsed_ms(t0, now())
+                << "ms\n";
+    }
+  }
+  {
+    const auto t0 = now();
+    onnx::optimization::saveModel(&model, out_path, needs_external_data, "");
+    if (debug_timing) {
+      std::cerr << "SimplifyPath: saveModel " << elapsed_ms(t0, now())
+                << "ms\n";
+    }
+  }
 }
