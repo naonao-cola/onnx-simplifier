@@ -193,9 +193,7 @@ def test_fuse_rms_norm_below_opset_23_untouched():
     ]
     nodes = [
         onnx.helper.make_node("Pow", ["X", "two"], ["sq"]),
-        onnx.helper.make_node(
-            "ReduceMean", ["sq"], ["var"], axes=[-1], keepdims=1
-        ),
+        onnx.helper.make_node("ReduceMean", ["sq"], ["var"], axes=[-1], keepdims=1),
         onnx.helper.make_node("Add", ["var", "eps"], ["var_eps"]),
         onnx.helper.make_node("Sqrt", ["var_eps"], ["rms"]),
         onnx.helper.make_node("Reciprocal", ["rms"], ["inv_rms"]),
