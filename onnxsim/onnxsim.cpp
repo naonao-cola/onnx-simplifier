@@ -2201,6 +2201,136 @@ void RemoveInitializerFromInput(onnx::ModelProto& model) {
   }
 }
 
+// ONNX TensorProto element types onnxoptimizer's tensor-value hashing
+// (cse_util.h) knows how to hash. Any other type makes
+// eliminate_common_subexpression/eliminate_duplicate_initializer raise
+// "no supported data type: <N>". Enumerates the *supported* types (rather
+// than the unsupported ones) so an element type added to ONNX in the future
+// is treated as unhashable by default instead of silently crashing. Mirrors
+// onnx_simplifier.py's _CSE_HASHABLE_ELEM_TYPES.
+bool IsCSEHashableElemType(int32_t elem_type) {
+  switch (elem_type) {
+    case onnx::TensorProto::UNDEFINED:
+    case onnx::TensorProto::BOOL:
+    case onnx::TensorProto::INT8:
+    case onnx::TensorProto::INT16:
+    case onnx::TensorProto::INT32:
+    case onnx::TensorProto::INT64:
+    case onnx::TensorProto::UINT8:
+    case onnx::TensorProto::UINT16:
+    case onnx::TensorProto::UINT32:
+    case onnx::TensorProto::UINT64:
+    case onnx::TensorProto::FLOAT:
+    case onnx::TensorProto::DOUBLE:
+    case onnx::TensorProto::FLOAT16:
+    case onnx::TensorProto::BFLOAT16:
+    case onnx::TensorProto::COMPLEX64:
+    case onnx::TensorProto::COMPLEX128:
+    case onnx::TensorProto::STRING:
+      return true;
+    default:
+      return false;
+  }
+}
+
+// Mirrors onnx_simplifier.py's _has_cse_unhashable_tensor /
+// _iter_tensor_data_types: walks every tensor CSE might hash -- initializers,
+// t/ts node attributes, recursing into subgraphs -- looking for an element
+// type IsCSEHashableElemType rejects.
+bool GraphHasCSEUnhashableTensor(const onnx::GraphProto& graph) {
+  for (const auto& init : graph.initializer()) {
+    if (!IsCSEHashableElemType(init.data_type())) {
+      return true;
+    }
+  }
+  for (const auto& node : graph.node()) {
+    for (const auto& attr : node.attribute()) {
+      if (attr.has_t() && !IsCSEHashableElemType(attr.t().data_type())) {
+        return true;
+      }
+      for (const auto& t : attr.tensors()) {
+        if (!IsCSEHashableElemType(t.data_type())) {
+          return true;
+        }
+      }
+      if (attr.has_g() && GraphHasCSEUnhashableTensor(attr.g())) {
+        return true;
+      }
+      for (const auto& g : attr.graphs()) {
+        if (GraphHasCSEUnhashableTensor(g)) {
+          return true;
+        }
+      }
+    }
+  }
+  return false;
+}
+
+// Mirrors onnx_simplifier.py's overwrite_input_shapes loop: for each named
+// graph input, overwrite its shape's dims with the given values, skipping
+// any non-positive entry (which means "keep the original, possibly dynamic,
+// dimension" rather than hardcoding an invalid size such as 0 -- GitHub
+// issue #237). Throws std::runtime_error if a name isn't a graph input
+// (matching onnx_simplifier.py's RuntimeError for the same case).
+void ApplyInputShapeOverwrite(
+    onnx::ModelProto& model,
+    const std::unordered_map<std::string, std::vector<int64_t>>&
+        overwrite_input_shapes) {
+  for (const auto& [name, shape] : overwrite_input_shapes) {
+    bool found = false;
+    for (auto& input : *model.mutable_graph()->mutable_input()) {
+      if (input.name() != name) {
+        continue;
+      }
+      found = true;
+      auto* dims = input.mutable_type()
+                       ->mutable_tensor_type()
+                       ->mutable_shape()
+                       ->mutable_dim();
+      for (int i = 0; i < dims->size() && i < static_cast<int>(shape.size());
+           ++i) {
+        if (shape[i] > 0) {
+          dims->Mutable(i)->set_dim_value(shape[i]);
+        }
+      }
+    }
+    if (!found) {
+      throw std::runtime_error("The model doesn't have input named \"" + name +
+                               "\"");
+    }
+  }
+}
+
+// Mirrors onnx_simplifier.py's remove_unused_output: drops the named graph
+// outputs. Downstream dead-end elimination cleans up nodes that only fed
+// them. Throws std::runtime_error if a name isn't a graph output (matching
+// onnx_simplifier.py's RuntimeError for the same case).
+void RemoveUnusedOutputs(onnx::ModelProto& model,
+                         const std::vector<std::string>& unused_output) {
+  for (const auto& name : unused_output) {
+    bool found = false;
+    for (const auto& output : model.graph().output()) {
+      if (output.name() == name) {
+        found = true;
+        break;
+      }
+    }
+    if (!found) {
+      throw std::runtime_error("The model doesn't have output named \"" + name +
+                               "\"");
+    }
+  }
+  auto* outputs = model.mutable_graph()->mutable_output();
+  google::protobuf::RepeatedPtrField<onnx::ValueInfoProto> kept;
+  for (auto& output : *outputs) {
+    if (std::find(unused_output.begin(), unused_output.end(), output.name()) ==
+        unused_output.end()) {
+      *kept.Add() = std::move(output);
+    }
+  }
+  outputs->Swap(&kept);
+}
+
 // Convert the default ONNX domain of the model to target_version using onnx's
 // own version converter. Only the default ONNX domain opset is changed;
 // custom/other-domain opset imports are left untouched. Returns the model
@@ -2261,12 +2391,99 @@ onnx::ModelProto FoldConstantOnce(const ModelExecutor& executor,
   return out;
 }
 
+// Records the options this Simplify() call actually used (skip_optimizers
+// reflects any auto-added unhashable-tensor protections) as string
+// key/value pairs in the model's metadata_props, namespaced under
+// "onnxsim:" so they cannot collide with the model's own metadata. Lets a
+// downstream consumer see how a model was simplified without having to have
+// kept the original call around. Replaces any pre-existing "onnxsim:*"
+// entries (e.g. left by a previous simplify() call) rather than
+// accumulating duplicates across repeated simplification.
+void RecordSimplifyOptionsMetadata(
+    onnx::ModelProto& model,
+    const std::optional<std::vector<std::string>>& skip_optimizers,
+    bool constant_folding, bool shape_inference, size_t tensor_size_threshold,
+    std::optional<int> target_opset_version, bool initializers_as_constants,
+    bool include_inline_functions, bool mutable_initializer,
+    const std::optional<std::unordered_map<std::string, std::vector<int64_t>>>&
+        overwrite_input_shapes,
+    const std::optional<std::vector<std::string>>& unused_output) {
+  auto join = [](const std::vector<std::string>& v) {
+    std::string out;
+    for (size_t i = 0; i < v.size(); ++i) {
+      if (i > 0) {
+        out += ",";
+      }
+      out += v[i];
+    }
+    return out;
+  };
+
+  std::vector<std::pair<std::string, std::string>> options;
+  options.emplace_back("onnxsim:skip_optimizers",
+                       skip_optimizers ? join(*skip_optimizers) : "<all>");
+  options.emplace_back("onnxsim:constant_folding",
+                       constant_folding ? "true" : "false");
+  options.emplace_back("onnxsim:shape_inference",
+                       shape_inference ? "true" : "false");
+  options.emplace_back("onnxsim:tensor_size_threshold",
+                       std::to_string(tensor_size_threshold));
+  options.emplace_back(
+      "onnxsim:target_opset_version",
+      target_opset_version ? std::to_string(*target_opset_version) : "");
+  options.emplace_back("onnxsim:initializers_as_constants",
+                       initializers_as_constants ? "true" : "false");
+  options.emplace_back("onnxsim:include_inline_functions",
+                       include_inline_functions ? "true" : "false");
+  options.emplace_back("onnxsim:mutable_initializer",
+                       mutable_initializer ? "true" : "false");
+  if (overwrite_input_shapes) {
+    std::string s;
+    bool first = true;
+    for (const auto& [name, shape] : *overwrite_input_shapes) {
+      if (!first) {
+        s += ";";
+      }
+      first = false;
+      s += name + ":";
+      for (size_t i = 0; i < shape.size(); ++i) {
+        if (i > 0) {
+          s += ",";
+        }
+        s += std::to_string(shape[i]);
+      }
+    }
+    options.emplace_back("onnxsim:overwrite_input_shapes", s);
+  }
+  if (unused_output) {
+    options.emplace_back("onnxsim:unused_output", join(*unused_output));
+  }
+
+  auto* props = model.mutable_metadata_props();
+  google::protobuf::RepeatedPtrField<onnx::StringStringEntryProto> kept;
+  for (auto& prop : *props) {
+    if (prop.key().rfind("onnxsim:", 0) != 0) {
+      *kept.Add() = std::move(prop);
+    }
+  }
+  props->Swap(&kept);
+  for (const auto& [key, value] : options) {
+    auto* entry = props->Add();
+    entry->set_key(key);
+    entry->set_value(value);
+  }
+}
+
 onnx::ModelProto Simplify(
     const ModelExecutor& executor, const onnx::ModelProto& model,
     std::optional<std::vector<std::string>> skip_optimizers,
     bool constant_folding, bool shape_inference, size_t tensor_size_threshold,
     std::optional<int> target_opset_version, const GraphRewriter* rewriter,
-    bool initializers_as_constants, bool include_inline_functions) {
+    bool initializers_as_constants, bool include_inline_functions,
+    bool mutable_initializer,
+    const std::optional<std::unordered_map<std::string, std::vector<int64_t>>>&
+        overwrite_input_shapes,
+    const std::optional<std::vector<std::string>>& unused_output) {
   // Register onnxsim's own optimizer passes into onnxoptimizer's registry
   // before the pass list is built below: fuse_consecutive_mul,
   // fuse_mul_into_conv, fuse_preceding_mul_into_conv and
@@ -2312,6 +2529,23 @@ onnx::ModelProto Simplify(
                         const std::string& pass) {
     return std::find(list.begin(), list.end(), pass) != list.end();
   };
+  // onnxoptimizer's common-subexpression / duplicate-initializer passes hash
+  // tensor values and crash with "no supported data type: <N>" on element
+  // types they cannot hash, such as the float8 zero points produced by
+  // NVIDIA ModelOpt fp8 QDQ models (GitHub issue #348). When such a tensor
+  // is present, transparently skip those two passes so the rest of
+  // simplification still runs, instead of crashing outright. Only relevant
+  // when some optimizer is actually going to run (skip_optimizers ==
+  // nullopt already disables all of them).
+  if (skip_optimizers && GraphHasCSEUnhashableTensor(model.graph())) {
+    static const std::vector<std::string> kTensorValueHashingOptimizers = {
+        "eliminate_common_subexpression", "eliminate_duplicate_initializer"};
+    for (const auto& opt : kTensorValueHashingOptimizers) {
+      if (!is_disabled(*skip_optimizers, opt)) {
+        skip_optimizers->push_back(opt);
+      }
+    }
+  }
   // skip_optimizers == nullopt means skiping all optimizers, so
   // config.optimizer_passes is empty
   if (skip_optimizers) {
@@ -2563,6 +2797,22 @@ onnx::ModelProto Simplify(
   // The fixed points mutate in place, so make one working copy of the (const)
   // input model and simplify it in place.
   onnx::ModelProto sim_model = model;
+  // Matches onnx_simplifier.py's default (mutable_initializer=False): fold
+  // initializers that also appear as graph inputs like any other constant.
+  if (!mutable_initializer) {
+    RemoveInitializerFromInput(sim_model);
+  }
+  // Overwrite named input shapes, if requested, before shape inference or
+  // any transform runs -- mirrors onnx_simplifier.py's overwrite_input_shapes
+  // loop, applied here instead of by the Python wrapper.
+  if (overwrite_input_shapes) {
+    ApplyInputShapeOverwrite(sim_model, *overwrite_input_shapes);
+  }
+  // Drop the named graph outputs, if requested, before the fixed point so
+  // dead-end elimination cleans up nodes that only fed them.
+  if (unused_output) {
+    RemoveUnusedOutputs(sim_model, *unused_output);
+  }
   // Optionally inline the model's local (model-defined) functions into the main
   // graph up front, so the optimizer, shape inference and constant folding
   // below see through them into a flat op graph. Done before the opset
@@ -2746,6 +2996,11 @@ onnx::ModelProto Simplify(
   // name; assign unique names to them so downstream tools that key on node
   // names keep working (issue #269).
   AssignMissingNodeNames(sim_model);
+  RecordSimplifyOptionsMetadata(sim_model, skip_optimizers, constant_folding,
+                                shape_inference, tensor_size_threshold,
+                                target_opset_version, initializers_as_constants,
+                                include_inline_functions, mutable_initializer,
+                                overwrite_input_shapes, unused_output);
   Check(sim_model);
   if (!converged) {
     std::cout << "WARNING: the simplification stopped because of timeout. "
@@ -2757,14 +3012,17 @@ onnx::ModelProto Simplify(
   return sim_model;
 }
 
-void SimplifyPath(const ModelExecutor& executor, const std::string& in_path,
-                  const std::string& out_path,
-                  std::optional<std::vector<std::string>> skip_optimizers,
-                  bool constant_folding, bool shape_inference,
-                  size_t tensor_size_threshold,
-                  std::optional<int> target_opset_version,
-                  const GraphRewriter* rewriter, bool initializers_as_constants,
-                  bool include_inline_functions, bool mutable_initializer) {
+void SimplifyPath(
+    const ModelExecutor& executor, const std::string& in_path,
+    const std::string& out_path,
+    std::optional<std::vector<std::string>> skip_optimizers,
+    bool constant_folding, bool shape_inference, size_t tensor_size_threshold,
+    std::optional<int> target_opset_version, const GraphRewriter* rewriter,
+    bool initializers_as_constants, bool include_inline_functions,
+    bool mutable_initializer,
+    const std::optional<std::unordered_map<std::string, std::vector<int64_t>>>&
+        overwrite_input_shapes,
+    const std::optional<std::vector<std::string>>& unused_output) {
   const bool debug_timing = std::getenv("ONNXSIM_DEBUG_PATH_TIMING") != nullptr;
   auto now = []() { return std::chrono::steady_clock::now(); };
   auto elapsed_ms = [](auto t0, auto t1) {
@@ -2781,22 +3039,13 @@ void SimplifyPath(const ModelExecutor& executor, const std::string& in_path,
     }
   }
 
-  // Matches onnx_simplifier.py's default (mutable_initializer=False): fold
-  // initializers that also appear as graph inputs like any other constant.
-  // Defaults to true (skip) so callers that predate this parameter (the C
-  // API, and Python's pre-existing >2GB fallback, which already applies the
-  // equivalent transform itself in Python before ever reaching this
-  // function) see no behavior change.
-  if (!mutable_initializer) {
-    RemoveInitializerFromInput(model);
-  }
-
   {
     const auto t0 = now();
     model =
         Simplify(executor, model, skip_optimizers, constant_folding,
                  shape_inference, tensor_size_threshold, target_opset_version,
-                 rewriter, initializers_as_constants, include_inline_functions);
+                 rewriter, initializers_as_constants, include_inline_functions,
+                 mutable_initializer, overwrite_input_shapes, unused_output);
     if (debug_timing) {
       std::cerr << "SimplifyPath: Simplify " << elapsed_ms(t0, now()) << "ms\n";
     }
