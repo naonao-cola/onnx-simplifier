@@ -22,6 +22,7 @@
 #include "onnx/common/assertions.h"
 #include "onnxoptimizer/pass.h"
 #include "onnxoptimizer/passes/pass_util.h"
+#include "passes/endian_read.h"
 
 namespace ONNX_NAMESPACE {
 namespace optimization {
@@ -54,16 +55,18 @@ inline bool MatchConv(Node* n, ConvInfo& info) {
   return true;
 }
 
-// Reads `t` (a float32 constant of any rank) into a flat row-major buffer,
-// regardless of whether it is stored as raw bytes or a typed float array.
+// Reads `t` (a float32 constant of any rank) into a flat row-major,
+// host-byte-order buffer, regardless of whether it is stored as raw bytes
+// (which are little-endian on the wire regardless of host -- see
+// endian_read.h) or a typed float array (already host-order, decoded by
+// protobuf itself).
 inline std::vector<float> ReadFloatTensorFlat(const Tensor& t) {
   int64_t numel = 1;
   for (const auto& s : t.sizes()) {
     numel *= s;
   }
   if (t.is_raw_data()) {
-    const float* raw = t.data<float>();
-    return std::vector<float>(raw, raw + static_cast<size_t>(numel));
+    return ReadRawDataHostOrder<float>(t.data<float>(), numel);
   }
   return t.floats();
 }
