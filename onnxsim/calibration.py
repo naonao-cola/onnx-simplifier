@@ -224,16 +224,158 @@ def load_huggingface_calibration_data(
     return batches
 
 
+def _smooth_distribution(p: np.ndarray, eps: float = 1e-4) -> Optional[np.ndarray]:
+    """
+    Replace zero entries in histogram ``p`` with a small ``eps``, taking the
+    total added back out of the non-zero entries proportionally, so a KL
+    divergence computed against the result stays finite (``p * log(p / 0)``
+    would otherwise be ``-inf``). Standard technique for entropy calibration
+    (e.g. MXNet's and TensorRT's own KL calibrators use the same smoothing).
+
+    Returns ``None`` -- rather than a negative-count histogram -- when a
+    non-zero bin is smaller than the epsilon it would need to give up (only
+    possible when zero bins vastly outnumber non-zero ones); the caller skips
+    that candidate threshold.
+    """
+    p = p.astype(np.float64)
+    is_zeros = p == 0
+    n_zeros = int(is_zeros.sum())
+    if n_zeros == 0:
+        return p
+    n_nonzeros = p.size - n_zeros
+    if n_nonzeros == 0:
+        return None
+    eps1 = eps * float(n_zeros) / float(n_nonzeros)
+    hist = p.copy()
+    hist[~is_zeros] -= eps1
+    hist[is_zeros] = eps
+    if (hist[~is_zeros] < 0).any():
+        return None
+    return hist
+
+
+def _kl_divergence(p: np.ndarray, q: np.ndarray) -> float:
+    """KL(P || Q) for two same-length, already-normalized-or-not histograms
+    (only their relative proportions matter -- see how each is built below).
+    Bins where P is zero contribute nothing (the usual ``0 * log(0/q) = 0``
+    convention)."""
+    mask = p > 0
+    return float(np.sum(p[mask] * np.log(p[mask] / q[mask])))
+
+
+def _entropy_threshold(
+    values: np.ndarray,
+    num_bins: int = 2048,
+    num_quantized_bins: int = 128,
+    min_coverage: float = 0.999,
+) -> float:
+    """
+    Find the symmetric clip threshold ``T`` minimizing the KL divergence
+    between ``values``' distribution and its simulated INT8-quantized one
+    after clipping to ``[-T, T]`` -- entropy ("KL-divergence") calibration,
+    as TensorRT popularized it (Migacz, "8-bit Inference with TensorRT",
+    2017). Works on ``|values|`` throughout, since a single shared threshold
+    only makes sense as a magnitude clip; :func:`calibrate` intersects
+    ``[-T, T]`` with the tensor's observed ``(min, max)`` afterwards to get
+    the final (possibly asymmetric) range.
+
+    The search: build a fine-grained (``num_bins``) histogram of
+    ``|values|``, then for every candidate cutoff ``i`` from the
+    ``min_coverage`` percentile's bin up to ``num_bins``, compare the
+    reference distribution (the histogram clipped at ``i``, with everything
+    beyond folded into the last bin) against a simulated quantization of that
+    same clipped range down to ``num_quantized_bins`` levels and back. The
+    cutoff with the lowest KL divergence is the threshold that loses the
+    least distributional information by quantizing -- often tighter than the
+    raw max for a heavy-tailed distribution, where a handful of outliers
+    would otherwise stretch the whole range and waste quantization levels on
+    rarely-hit values.
+
+    ``min_coverage`` bounds the search from below at that percentile of
+    ``|values|`` (default: the top 0.1% may be clipped, no more). Without it,
+    the search can pick a pathologically small threshold on data that is
+    already smooth (no long tail to reward clipping against, e.g. a raw
+    Gaussian): quantizing *any* narrow slice of a locally-flat distribution
+    reproduces its shape almost exactly, so KL divergence stays near zero for
+    every threshold and the search has nothing to distinguish them by,
+    including catastrophically aggressive ones. Real, mostly-heavy-tailed
+    activation distributions have plenty of room below this floor for the
+    search to still find a genuinely tighter-than-max threshold in.
+
+    Falls back to the observed max (i.e. no clipping) when there is too
+    little data, or too little dynamic range, to build a meaningful
+    histogram.
+    """
+    abs_values = np.abs(values.astype(np.float64)).ravel()
+    abs_values = abs_values[np.isfinite(abs_values)]
+    if abs_values.size == 0:
+        return 0.0
+    abs_max = float(abs_values.max())
+    if abs_max <= 0.0 or abs_values.size < num_quantized_bins:
+        return abs_max
+
+    hist, bin_edges = np.histogram(abs_values, bins=num_bins, range=(0.0, abs_max))
+    hist = hist.astype(np.float64)
+
+    coverage_floor = float(np.percentile(abs_values, min_coverage * 100.0))
+    # bin_edges[i] is the upper edge of the i-th bin (0-indexed), so the first
+    # cutoff whose upper edge reaches the floor is searchsorted's insertion
+    # point; clamped into [num_quantized_bins, num_bins] either end.
+    i_start = int(
+        np.clip(
+            np.searchsorted(bin_edges, coverage_floor), num_quantized_bins, num_bins
+        )
+    )
+
+    best_threshold = abs_max
+    best_divergence = float("inf")
+    for i in range(i_start, num_bins + 1):
+        ref_dist = hist[:i].copy()
+        # Clipped, not dropped: fold the tail's count into the last
+        # reference bin so `ref_dist` still sums to the full sample count.
+        ref_dist[-1] += hist[i:].sum()
+        if ref_dist.sum() == 0:
+            continue
+
+        # Simulate quantizing the clipped range to num_quantized_bins levels:
+        # merge ref_dist's `i` fine bins into num_quantized_bins groups, then
+        # spread each group's total back out evenly over its own non-empty
+        # fine bins, so the simulated distribution has the same length (`i`)
+        # as ref_dist and the two are directly comparable bin-for-bin.
+        groups = np.array_split(np.arange(i), num_quantized_bins)
+        candidate = np.zeros(i, dtype=np.float64)
+        for idxs in groups:
+            nonzero = ref_dist[idxs] > 0
+            count = int(nonzero.sum())
+            if count == 0:
+                continue
+            candidate[idxs[nonzero]] = ref_dist[idxs].sum() / count
+
+        p = _smooth_distribution(ref_dist)
+        q = _smooth_distribution(candidate)
+        if p is None or q is None:
+            continue
+        divergence = _kl_divergence(p, q)
+        if divergence < best_divergence:
+            best_divergence = divergence
+            best_threshold = float(bin_edges[i])
+
+    return best_threshold
+
+
 def calibrate(
     model: Union[str, onnx.ModelProto],
     calibration_data: Sequence[Tensors],
     providers: Optional[Sequence[str]] = None,
+    method: str = "minmax",
+    num_bins: int = 2048,
+    num_quantized_bins: int = 128,
 ) -> Dict[str, Tuple[float, float]]:
     """
     Run the float ``model`` over every batch in ``calibration_data`` through
-    ONNX Runtime, recording each quantizable activation's observed (min, max)
-    range across all batches -- the calibration ranges
-    :func:`onnxsim.quantize_static` needs.
+    ONNX Runtime, recording each quantizable activation's calibration range
+    across all batches -- the calibration ranges :func:`onnxsim.quantize_static`
+    needs.
 
     :param model: onnx ModelProto object or file path
     :param calibration_data: representative input batches, e.g. from
@@ -241,10 +383,35 @@ def calibrate(
             :func:`load_huggingface_calibration_data`
     :param providers: onnxruntime execution providers to run calibration on
             (defaults to onnxruntime's own default provider selection)
+    :param method: ``"minmax"`` (default) uses each tensor's observed
+            ``(min, max)`` directly -- simple, and enough calibration data to
+            cover the real range is all it needs. ``"entropy"`` instead finds,
+            per tensor, the symmetric clip threshold minimizing the KL
+            divergence between the observed distribution and its simulated
+            INT8-quantized one (see :func:`_entropy_threshold`), then
+            intersects that clip with the observed ``(min, max)``. This can
+            give a tighter, better-behaved range than min/max alone when a
+            handful of outlier activations would otherwise stretch the whole
+            range and starve the common values of quantization levels -- the
+            same trade TensorRT's entropy calibrator makes. It needs
+            noticeably more calibration data than ``"minmax"`` to build a
+            meaningful per-tensor histogram (a couple of batches suffices for
+            min/max; entropy search wants at least ``num_quantized_bins``
+            observed values per tensor, and is more reliable with hundreds).
+    :param num_bins: (``"entropy"`` only) histogram resolution the threshold
+            search scans over -- see :func:`_entropy_threshold`.
+    :param num_quantized_bins: (``"entropy"`` only) number of levels the
+            search simulates quantizing down to -- see
+            :func:`_entropy_threshold`. Left at INT8's 128 (one sign's worth)
+            regardless of onnxsim's own uint8 range, matching the standard
+            entropy-calibration convention this implements.
     :returns: ``{tensor_name: (min, max)}`` for every tensor
             ``onnxsim_cpp2py_export.list_quantizable_activations`` reports
     """
     import onnxruntime as ort
+
+    if method not in ("minmax", "entropy"):
+        raise ValueError(f"unknown calibration method: {method!r}")
 
     if isinstance(model, str):
         model = onnx.load(model, load_external_data=False)
@@ -269,6 +436,9 @@ def calibrate(
     output_names = [o.name for o in sess.get_outputs()]
 
     ranges: Dict[str, Tuple[float, float]] = {}
+    # Only "entropy" needs every observed value kept around (to build a
+    # histogram from); "minmax" only ever needs a running (min, max).
+    collected: Dict[str, List[np.ndarray]] = {}
     for batch in calibration_data:
         outputs = sess.run(output_names, batch)
         for name, value in zip(output_names, outputs):
@@ -284,6 +454,19 @@ def calibrate(
                 ranges[name] = (min(prev_min, batch_min), max(prev_max, batch_max))
             else:
                 ranges[name] = (batch_min, batch_max)
+            if method == "entropy":
+                collected.setdefault(name, []).append(arr.ravel())
+
+    if method == "entropy":
+        for name, chunks in collected.items():
+            threshold = _entropy_threshold(
+                np.concatenate(chunks),
+                num_bins=num_bins,
+                num_quantized_bins=num_quantized_bins,
+            )
+            obs_min, obs_max = ranges[name]
+            ranges[name] = (max(obs_min, -threshold), min(obs_max, threshold))
+
     return ranges
 
 
@@ -293,6 +476,7 @@ def quantize_static(
     num_calibration_samples: int = 8,
     seed: int = 0,
     providers: Optional[Sequence[str]] = None,
+    method: str = "minmax",
 ) -> onnx.ModelProto:
     """
     Statically (calibration-based) quantize every MatMul, every "vanilla"
@@ -321,6 +505,10 @@ def quantize_static(
     :param seed: seed for the random calibration data (ignored if
             ``calibration_data`` is supplied)
     :param providers: onnxruntime execution providers to run calibration on
+    :param method: calibration range method, passed through to
+            :func:`calibrate` -- ``"minmax"`` (default) or ``"entropy"``
+            (KL-divergence calibration; see that function for the tradeoff
+            and its extra data requirement).
     :returns: the quantized onnx ModelProto
     """
     if isinstance(model, str):
@@ -329,5 +517,5 @@ def quantize_static(
         calibration_data = generate_random_calibration_data(
             model, num_samples=num_calibration_samples, seed=seed
         )
-    ranges = calibrate(model, calibration_data, providers=providers)
+    ranges = calibrate(model, calibration_data, providers=providers, method=method)
     return onnx.load_from_string(C.quantize_static(model.SerializeToString(), ranges))

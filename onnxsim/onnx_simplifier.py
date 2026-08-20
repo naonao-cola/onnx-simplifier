@@ -1285,6 +1285,20 @@ def main():
         default=8,
     )
     parser.add_argument(
+        "--calibration-method",
+        help="Calibration range method for --static-quantize: 'minmax' "
+        "(default) uses each tensor's observed min/max directly; 'entropy' "
+        "instead searches for the clip threshold minimizing KL divergence "
+        "between the observed and simulated-quantized distributions "
+        "(TensorRT-style entropy calibration), which can give a tighter "
+        "range for heavy-tailed activations but wants more calibration data "
+        "than minmax to build a meaningful histogram. See "
+        "onnxsim.calibrate.",
+        type=str,
+        choices=["minmax", "entropy"],
+        default="minmax",
+    )
+    parser.add_argument(
         "-v", "--version", action="version", version="onnxsim " + version.version
     )
 
@@ -1506,7 +1520,7 @@ def main():
             )
         print("Statically quantizing MatMul/Gemm/Conv weights and activations...")
         model_opt = calibration.quantize_static(
-            model_opt, calibration_data=calibration_data
+            model_opt, calibration_data=calibration_data, method=args.calibration_method
         )
 
     try:
