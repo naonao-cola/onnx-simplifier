@@ -2168,11 +2168,11 @@ void DropIncompleteValueInfo(onnx::GraphProto& graph) {
   auto& value_info = *graph.mutable_value_info();
   value_info.erase(
       std::remove_if(value_info.begin(), value_info.end(),
-                      [](const onnx::ValueInfoProto& vi) {
-                        return vi.type().has_tensor_type() &&
-                               vi.type().tensor_type().elem_type() ==
-                                   onnx::TensorProto::UNDEFINED;
-                      }),
+                     [](const onnx::ValueInfoProto& vi) {
+                       return vi.type().has_tensor_type() &&
+                              vi.type().tensor_type().elem_type() ==
+                                  onnx::TensorProto::UNDEFINED;
+                     }),
       value_info.end());
   for (auto& node : *graph.mutable_node()) {
     for (auto& attr : *node.mutable_attribute()) {

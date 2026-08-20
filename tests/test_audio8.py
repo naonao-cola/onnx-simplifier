@@ -172,7 +172,9 @@ def _download_one(url: str, dest: str) -> None:
                 os.remove(tmp_dest)
             if attempt + 1 < _DOWNLOAD_ATTEMPTS:
                 time.sleep(3 * (attempt + 1))
-    pytest.skip(f"Could not download {url} after {_DOWNLOAD_ATTEMPTS} attempts: {last_error}")
+    pytest.skip(
+        f"Could not download {url} after {_DOWNLOAD_ATTEMPTS} attempts: {last_error}"
+    )
 
 
 def _download(filename: str, dest_dir) -> str:

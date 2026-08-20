@@ -48,7 +48,7 @@ jobs:
       - uses: mozilla-actions/sccache-action@v0.0.11
 
       - name: Install build tooling
-        run: pip install cmake ninja "setuptools>=77" sccache
+        run: pip install cmake ninja "setuptools>=77" sccache nanobind
 
       # Base rfdetr pulls torch/transformers but NOT onnxsim (that lives in its
       # [onnx] extra). Install CPU torch explicitly first so rfdetr reuses it.
