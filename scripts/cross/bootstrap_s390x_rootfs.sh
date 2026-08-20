@@ -68,7 +68,9 @@ if [[ ! -e "${SYSROOT}/etc/os-release" ]]; then
   #     protobuf at the version onnx's SBOM pins and points CMAKE_PREFIX_PATH at
   #     it; the rootfs copy was unused, and a different version sitting in the
   #     sysroot is a hazard rather than a help.
-  #   cmake, git -- nothing in the rootfs builds with them.
+  #   cmake, git -- nothing in the rootfs builds with them (see the ml_dtypes
+  #     version pin below for why that stays true despite ml_dtypes 0.6.0
+  #     switching its own build backend to a CMake-based one).
   #
   # build-essential and python3-pip stay, even though only the ml_dtypes build
   # below needs them and that is normally served from cache. Dropping them does
@@ -115,8 +117,19 @@ if ! chroot "${SYSROOT}" /usr/bin/python3 -c "import ml_dtypes" 2>/dev/null; the
     if ! ls /wheelhouse/ml_dtypes-*.whl >/dev/null 2>&1; then
       # noble ships setuptools 68, which rejects ml_dtypes 0.5.x'"'"'s SPDX
       # `project.license`; --no-build-isolation then needs pybind11 present.
+      #
+      # Pinned below 0.6.0 (onnx itself only requires >=0.5.4, so any 0.5.x
+      # satisfies it): 0.6.0 switched its build backend to scikit-build-core,
+      # which needs a real `cmake` binary (installable, but see below), *and*
+      # its C++ sources now use NumPy 2.x-only C-API symbols
+      # (`PyArray_DescrProto`, `PyDataType_GetArrFuncs`) that noble'"'"'s
+      # python3-numpy (still 1.x -- there is no s390x NumPy 2 wheel and
+      # building one from source here is far too heavy for this bootstrap) does
+      # not declare, so the extension fails to compile regardless of the build
+      # backend. 0.5.x builds with plain setuptools against the 1.x API and
+      # needs neither.
       pip3 install -U --ignore-installed setuptools wheel pybind11
-      pip3 wheel --no-build-isolation --no-deps -w /wheelhouse "ml_dtypes>=0.5.4"
+      pip3 wheel --no-build-isolation --no-deps -w /wheelhouse "ml_dtypes>=0.5.4,<0.6.0"
     fi
     pip3 install --no-deps /wheelhouse/ml_dtypes-*.whl
   '
