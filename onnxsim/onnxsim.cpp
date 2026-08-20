@@ -2442,6 +2442,16 @@ onnx::ModelProto QuantizeDynamic(const onnx::ModelProto& model) {
       model, std::vector<std::string>{"dynamic_quantize_matmul"});
 }
 
+onnx::ModelProto QuantizeWeightOnly(const onnx::ModelProto& model) {
+  PrepareSchemasForDebug(model);
+  // Registers weight_only_quantize_matmul/_conv (idempotent) into
+  // onnxoptimizer's registry so OptimizeFixed can find them by name below.
+  onnxsim::RegisterCustomOptimizerPasses();
+  return onnx::optimization::OptimizeFixed(
+      model, std::vector<std::string>{"weight_only_quantize_matmul",
+                                      "weight_only_quantize_conv"});
+}
+
 std::vector<std::string> ListQuantizableActivations(
     const onnx::ModelProto& model) {
   PrepareSchemasForDebug(model);

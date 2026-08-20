@@ -156,6 +156,30 @@ onnx::ModelProto FoldConstantOnce(const ModelExecutor& executor,
 // attributes, non-float32 operands, an opset older than 11) are left as-is.
 onnx::ModelProto QuantizeDynamic(const onnx::ModelProto& model);
 
+// Weight-only quantizes every MatMul, every "vanilla" Gemm (transA=0,
+// alpha=1, beta=1), and every Conv, whose weight is a constant float32
+// tensor (2-D for MatMul/Gemm, rank >= 3 for Conv): the weight is quantized
+// to INT8 ahead of time (per output channel, symmetric, from its static
+// values -- same as ``QuantizeDynamic``/``QuantizeStatic``), inserting a
+// single ``DequantizeLinear`` in its place. Unlike both of those, the
+// activation is never touched -- no ``DynamicQuantizeLinear``, no
+// QuantizeLinear/DequantizeLinear pair, no calibration data of any kind --
+// so this only shrinks the model's weight storage; it does not change
+// activation precision or add any runtime quantize/dequantize cost on the
+// activation path. This mirrors the "weight-only quantization" scheme most
+// real-world weight-heavy ONNX deployments (large linear/embedding layers in
+// transformer-style decoders, for example) actually ship, as opposed to full
+// activation quantization. See ``passes/weight_only_quantize_matmul.h`` and
+// ``passes/weight_only_quantize_conv.h`` for the rewrites themselves.
+//
+// Unlike ``Simplify``, this does not run shape inference, constant folding or
+// any other simplification pass -- it applies exactly these rewrites, once
+// each, to a copy of ``model`` (which is left untouched) and returns the
+// result. Nodes that do not match (dynamic or unsupported-rank weights,
+// non-default Gemm attributes, non-float32 operands, an opset older than 13)
+// are left as-is.
+onnx::ModelProto QuantizeWeightOnly(const onnx::ModelProto& model);
+
 // Lists the activation tensor names that ``QuantizeStatic`` could quantize in
 // ``model`` -- the first input of every MatMul, every "vanilla" Gemm
 // (transA=0, alpha=1, beta=1), and every Conv, whose weight is a constant

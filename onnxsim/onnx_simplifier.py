@@ -402,6 +402,41 @@ def quantize_dynamic(model: Union[str, onnx.ModelProto]) -> onnx.ModelProto:
     return onnx.load_from_string(C.quantize_dynamic(model.SerializeToString()))
 
 
+def quantize_weight_only(model: Union[str, onnx.ModelProto]) -> onnx.ModelProto:
+    """
+    Weight-only quantize every MatMul, every "vanilla" Gemm (transA=0,
+    alpha=1, beta=1), and every Conv, whose weight is a constant float32
+    tensor (2-D for MatMul/Gemm, rank >= 3 for Conv).
+
+    The weight is quantized to INT8 ahead of time (per output channel,
+    symmetric, from its static values -- the same scheme
+    :func:`quantize_dynamic`/:func:`quantize_static` use), inserting a single
+    ``DequantizeLinear`` in its place. Unlike both of those, the activation is
+    never touched: no ``DynamicQuantizeLinear``, no QuantizeLinear/
+    DequantizeLinear pair, no calibration data of any kind. This only shrinks
+    the model's weight storage (~4x for the quantized weights); it does not
+    change activation precision or add any runtime quantize/dequantize cost
+    to the activation path. This mirrors the "weight-only quantization"
+    scheme most real-world weight-heavy ONNX deployments -- large linear/
+    embedding layers in transformer-style decoders, for example -- actually
+    ship, as opposed to full activation quantization.
+
+    This is a single, self-contained graph rewrite: unlike :func:`simplify`,
+    it does not run shape inference, constant folding, or any other pass.
+    Nodes that do not match (dynamic or unsupported-rank weights, non-default
+    Gemm attributes, non-float32 operands, an opset older than 13 -- which
+    ``DequantizeLinear``'s per-channel ``axis`` requires) are left untouched.
+    Consider calling :func:`simplify` before and/or after to clean up the
+    graph.
+
+    :param model: onnx ModelProto object or file path
+    :returns: the quantized onnx ModelProto
+    """
+    if isinstance(model, str):
+        model = onnx.load(model, load_external_data=False)
+    return onnx.load_from_string(C.quantize_weight_only(model.SerializeToString()))
+
+
 def simplify(
     model: Union[str, onnx.ModelProto],
     check_n: int = 0,
@@ -1259,6 +1294,16 @@ def main():
         action="store_true",
     )
     parser.add_argument(
+        "--weight-only-quantize",
+        help="After simplifying, weight-only quantize MatMul/Gemm/Conv "
+        "weights to INT8 (per output channel, symmetric, from their static "
+        "values), inserting a single DequantizeLinear per weight. "
+        "Activations are never touched -- no calibration data is needed and "
+        "no quantize/dequantize node is added on the activation path. See "
+        "onnxsim.quantize_weight_only.",
+        action="store_true",
+    )
+    parser.add_argument(
         "--static-quantize",
         help="After simplifying, statically (calibration-based) quantize "
         "MatMul/Gemm/Conv weights and activations to INT8/uint8, inserting a "
@@ -1500,6 +1545,10 @@ def main():
     if args.dynamic_quantize:
         print("Dynamically quantizing MatMul/Gemm weights to INT8...")
         model_opt = quantize_dynamic(model_opt)
+
+    if args.weight_only_quantize:
+        print("Weight-only quantizing MatMul/Gemm/Conv weights to INT8...")
+        model_opt = quantize_weight_only(model_opt)
 
     if args.static_quantize:
         from . import calibration

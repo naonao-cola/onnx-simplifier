@@ -25,6 +25,8 @@
 #include "passes/fuse_rms_norm.h"
 #include "passes/static_quantize_conv.h"
 #include "passes/static_quantize_matmul.h"
+#include "passes/weight_only_quantize_conv.h"
+#include "passes/weight_only_quantize_matmul.h"
 
 namespace onnxsim {
 
@@ -70,6 +72,8 @@ void RegisterCustomOptimizerPasses() {
     RegisterOrReplace<p::FuseRMSNorm>(registry);
     RegisterOrReplace<p::StaticQuantizeConv>(registry);
     RegisterOrReplace<p::StaticQuantizeMatMul>(registry);
+    RegisterOrReplace<p::WeightOnlyQuantizeConv>(registry);
+    RegisterOrReplace<p::WeightOnlyQuantizeMatMul>(registry);
 
     // onnxsim's patched versions of built-in onnxoptimizer passes. These
     // overwrite the registry entries the submodule registers under the same
