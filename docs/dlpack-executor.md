@@ -200,6 +200,15 @@ Consequences for the design:
   so the test ships a small ONNX-subset-to-Halide lowering and checks that
   onnxsim's simplified output still lowers, compiles, and computes the same
   result as onnx's reference evaluator.
+- `tests/test_nncase_integration.py` (+ `.github/workflows/nncase-integration.yml`) —
+  the same embeddability claim exercised against
+  [nncase](https://github.com/kendryte/nncase), the model compiler for the
+  Kendryte K230 / K510 processors (and a generic `cpu` target). nncase imports
+  an ONNX `ModelProto` directly, compiles it, and can evaluate the compiled
+  module, so the test feeds onnxsim's simplified output into nncase and checks
+  it still imports, compiles, and computes the same result. Every op the test
+  models use is drawn from nncase's supported-ops list
+  (<https://github.com/kendryte/nncase/blob/master/docs/onnx_ops.md>).
 
 ## Rust binding
 
