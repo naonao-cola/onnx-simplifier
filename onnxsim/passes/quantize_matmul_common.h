@@ -22,6 +22,7 @@
 #include "onnx/common/assertions.h"
 #include "onnxoptimizer/pass.h"
 #include "onnxoptimizer/passes/pass_util.h"
+#include "passes/endian_read.h"
 
 namespace ONNX_NAMESPACE {
 namespace optimization {
@@ -73,14 +74,15 @@ inline bool MatchMatMulLike(Node* n, MatMulLikeInfo& info) {
   return false;
 }
 
-// Reads `w_t` (a 2-D float32 constant) into a flat row-major float buffer,
-// regardless of whether it is stored as raw bytes or a typed float array.
+// Reads `w_t` (a 2-D float32 constant) into a flat row-major, host-byte-order
+// float buffer, regardless of whether it is stored as raw bytes (which are
+// little-endian on the wire regardless of host -- see endian_read.h) or a
+// typed float array (already host-order, decoded by protobuf itself).
 inline std::vector<float> ReadFloatMatrix(const Tensor& w_t) {
   const auto& sizes = w_t.sizes();
   const int64_t numel = sizes[0] * sizes[1];
   if (w_t.is_raw_data()) {
-    const float* raw = w_t.data<float>();
-    return std::vector<float>(raw, raw + static_cast<size_t>(numel));
+    return ReadRawDataHostOrder<float>(w_t.data<float>(), numel);
   }
   return w_t.floats();
 }
