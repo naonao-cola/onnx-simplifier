@@ -362,13 +362,23 @@ if (ONNXSIM_PYTHON)
 
   # nanobind ships its CMake package config inside its own pip-installed
   # wheel (not on any default CMake search path), so it must be located via
-  # its Python API and added to CMAKE_PREFIX_PATH before find_package(nanobind)
-  # can locate it -- this is nanobind's documented CMake integration pattern.
+  # its Python API before find_package(nanobind) can locate it -- this is
+  # nanobind's documented CMake integration pattern. Set nanobind_DIR
+  # directly to the directory --cmake_dir prints (which already *is* the
+  # directory containing nanobind-config.cmake) rather than only appending
+  # it to CMAKE_PREFIX_PATH: find_package's CONFIG-mode search additionally
+  # probes a "cmake/" suffix under each CMAKE_PREFIX_PATH entry, which -- on
+  # at least macOS cibuildwheel builds -- has been observed to resolve to a
+  # spurious nested ".../nanobind/cmake/cmake/nanobind-config.cmake",
+  # producing a doubled-up NB_DIR inside nanobind's own config script and a
+  # linker failure looking for ".../nanobind/cmake/cmake/darwin-ld-*.sym".
+  # Setting nanobind_DIR directly matches scripts/cross/build_windows_wheel.sh's
+  # already-proven -Dnanobind_DIR usage and sidesteps that ambiguity entirely.
   execute_process(
     COMMAND "${Python_EXECUTABLE}" -m nanobind --cmake_dir
     OUTPUT_STRIP_TRAILING_WHITESPACE
     OUTPUT_VARIABLE NB_DIR)
-  list(APPEND CMAKE_PREFIX_PATH "${NB_DIR}")
+  set(nanobind_DIR "${NB_DIR}" CACHE PATH "" FORCE)
   find_package(nanobind CONFIG REQUIRED)
 
   # FREE_THREADED marks the module Py_MOD_GIL_NOT_USED so free-threaded
