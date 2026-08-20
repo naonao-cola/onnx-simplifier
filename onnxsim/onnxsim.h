@@ -6,6 +6,7 @@
 #include <optional>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "dlpack/dlpack.h"
@@ -154,6 +155,44 @@ onnx::ModelProto FoldConstantOnce(const ModelExecutor& executor,
 // Nodes that do not match (dynamic or non-2-D weights, non-default Gemm
 // attributes, non-float32 operands, an opset older than 11) are left as-is.
 onnx::ModelProto QuantizeDynamic(const onnx::ModelProto& model);
+
+// Lists the activation tensor names that ``QuantizeStatic`` could quantize in
+// ``model`` -- the first input of every MatMul, and every "vanilla" Gemm
+// (transA=0, alpha=1, beta=1), whose weight is a constant 2-D float32 tensor
+// and whose activation is float32 -- so a caller can calibrate exactly (and
+// only) the tensors that matter, by running the model over representative
+// data and recording each listed tensor's observed (min, max). Names are
+// deduplicated and given in no particular order; the opset-version check
+// ``QuantizeStatic``'s pass applies is not repeated here, since calibrating a
+// tensor that then turns out to be unusable (opset < 13) is harmless -- the
+// pass simply ignores its entry in ``activation_ranges``.
+std::vector<std::string> ListQuantizableActivations(
+    const onnx::ModelProto& model);
+
+// Statically (calibration-based) quantizes every MatMul, and every "vanilla"
+// Gemm (transA=0, alpha=1, beta=1), whose weight is a constant 2-D float32
+// tensor and whose activation's tensor name is a key of
+// ``activation_ranges``: the weight is quantized to INT8 ahead of time (per
+// output channel, symmetric, from its static values -- same as
+// ``QuantizeDynamic``), and the activation is quantized to uint8 using a
+// *fixed* (scale, zero_point) derived from its calibrated (min, max) range in
+// ``activation_ranges`` (see ``ListQuantizableActivations`` to discover which
+// tensors to calibrate). The rewrite inserts a QuantizeLinear/DequantizeLinear
+// pair around each quantized tensor (the "QDQ" format) rather than replacing
+// the MatMul/Gemm itself, so the graph still computes in float32 -- a
+// QDQ-aware runtime fuses the pattern into a true integer kernel at load
+// time. See ``passes/static_quantize_matmul.h`` for the rewrite itself, and
+// ``QuantizeDynamic`` for the no-calibration alternative.
+//
+// Unlike ``Simplify``, this does not run shape inference, constant folding or
+// any other simplification pass -- it applies exactly this one rewrite, once,
+// to a copy of ``model`` (which is left untouched) and returns the result.
+// Nodes that do not match, or whose activation has no entry in
+// ``activation_ranges``, are left as-is.
+onnx::ModelProto QuantizeStatic(
+    const onnx::ModelProto& model,
+    const std::unordered_map<std::string, std::pair<float, float>>&
+        activation_ranges);
 
 void SimplifyPath(
     const ModelExecutor& executor, const std::string& in_path,

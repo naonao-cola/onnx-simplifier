@@ -362,6 +362,41 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
       },
       "model_bytes"_a);
 
+  // Lists the activation tensor names quantize_static could quantize --
+  // see ListQuantizableActivations in onnxsim.h.
+  m.def(
+      "list_quantizable_activations",
+      [](const py::bytes& model_proto_bytes) -> std::vector<std::string> {
+        InitEnv();
+        ONNX_NAMESPACE::ModelProto model;
+        ParseProtoFromBytes(&model, model_proto_bytes.c_str(),
+                            model_proto_bytes.size());
+        return ListQuantizableActivations(model);
+      },
+      "model_bytes"_a);
+
+  // Statically (calibration-based) quantizes MatMul/Gemm: weights to INT8
+  // (per output channel, symmetric, ahead of time) and activations to uint8
+  // via a QuantizeLinear/DequantizeLinear pair with a *fixed* scale/zero-point
+  // derived from `activation_ranges` (tensor name -> (min, max), typically
+  // from list_quantizable_activations plus running the float model over
+  // calibration data) -- see QuantizeStatic in onnxsim.h.
+  m.def(
+      "quantize_static",
+      [](const py::bytes& model_proto_bytes,
+         const std::unordered_map<std::string, std::pair<float, float>>&
+             activation_ranges) -> py::bytes {
+        InitEnv();
+        ONNX_NAMESPACE::ModelProto model;
+        ParseProtoFromBytes(&model, model_proto_bytes.c_str(),
+                            model_proto_bytes.size());
+        const auto result = QuantizeStatic(model, activation_ranges);
+        std::string out;
+        result.SerializeToString(&out);
+        return py::bytes(out.data(), out.size());
+      },
+      "model_bytes"_a, "activation_ranges"_a);
+
   m.def(
        "simplify",
        [](std::shared_ptr<PyModelExecutor> executor,
