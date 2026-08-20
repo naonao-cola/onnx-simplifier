@@ -21,6 +21,7 @@
 #include "passes/fuse_mul_into_conv.h"
 #include "passes/fuse_pad_into_pool.h"
 #include "passes/fuse_preceding_mul_into_conv.h"
+#include "passes/fuse_rms_norm.h"
 
 namespace onnxsim {
 
@@ -62,6 +63,7 @@ void RegisterCustomOptimizerPasses() {
     RegisterOrReplace<p::FuseMatMulAddBiasIntoGemmBatched>(registry);
     RegisterOrReplace<p::FuseMulIntoConv>(registry);
     RegisterOrReplace<p::FusePrecedingMulIntoConv>(registry);
+    RegisterOrReplace<p::FuseRMSNorm>(registry);
 
     // onnxsim's patched versions of built-in onnxoptimizer passes. These
     // overwrite the registry entries the submodule registers under the same
