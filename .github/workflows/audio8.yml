@@ -1,0 +1,69 @@
+name: Audio8 regression test
+
+# Builds onnxsim from source and runs tests/test_audio8.py, which downloads
+# real ONNX exports from the Audio8 org on Hugging Face
+# (https://huggingface.co/Audio8 -- TTS/ASR models shipped with ONNX Runtime
+# deployment packages) and simplifies each with onnxsim. This guards against
+# onnxsim regressions on Audio8-style graphs -- see tests/test_audio8.py's
+# module docstring for the real onnxsim bug this surfaced (a malformed
+# value_info entry, shape known but elem_type left UNDEFINED, that made a
+# simplified model fail to load in onnxruntime).
+
+# Downloads real models over the network and, for the TTS cases, takes over a
+# minute per model under check_n=3 -- too slow/network-dependent to run on
+# every PR unconditionally. It always runs weekly and on push to the default
+# branch, and additionally runs on a PR when the PR itself touches the files
+# this test exists to guard (the test itself, or onnxsim.cpp, where
+# DropIncompleteValueInfo lives); use workflow_dispatch to trigger it
+# manually against a branch for any other change.
+on:
+  push:
+    branches:
+      - main
+      - master
+  pull_request:
+    paths:
+      - tests/test_audio8.py
+      - onnxsim/onnxsim.cpp
+      - .github/workflows/audio8.yml
+  schedule:
+    - cron: '0 9 * * 1'  # weekly, Monday 09:00 UTC
+  workflow_dispatch:
+
+jobs:
+  audio8:
+    name: Audio8 (Hugging Face) -> onnxsim
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      CMAKE_GENERATOR: Ninja
+      CMAKE_CXX_COMPILER_LAUNCHER: sccache
+      SCCACHE_GHA_ENABLED: 'on'
+      ACTIONS_CACHE_SERVICE_V2: 'on'
+      ONNXSIM_RUN_AUDIO8_TESTS: '1'
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.11'
+      - uses: mozilla-actions/sccache-action@v0.0.11
+
+      - name: Install build tooling
+        run: pip install cmake ninja "setuptools>=77" sccache nanobind
+
+      - name: Install test dependencies
+        run: pip install pytest onnxruntime
+
+      # Build the onnxsim under test last so it wins over anything a dependency
+      # might have pulled. --no-build-isolation reuses the tooling installed above.
+      - name: Build onnxsim (editable)
+        run: pip install --no-build-isolation -ve .
+
+      - name: Verify onnxsim under test is the source build
+        run: python -c "import onnxsim, onnxsim.onnxsim_cpp2py_export; print('onnxsim', onnxsim.__version__, onnxsim.__file__)"
+
+      - name: Run Audio8 regression test
+        run: pytest -v tests/test_audio8.py

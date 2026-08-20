@@ -43,7 +43,7 @@ jobs:
 
     - name: Install build + coverage tooling
       run: |
-        pip install cmake ninja "setuptools>=77" sccache
+        pip install cmake ninja "setuptools>=77" sccache nanobind
         pip install pytest pytest-cov gcovr
 
     # Kick the network-heavy, build-independent test-dependency install off in
