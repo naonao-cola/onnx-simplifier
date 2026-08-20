@@ -55,7 +55,7 @@ jobs:
         python-version: '3.14'
     - uses: mozilla-actions/sccache-action@v0.0.11
 
-    - run: pip install cmake ninja setuptools sccache
+    - run: pip install cmake ninja setuptools sccache nanobind
 
     # Download/install the build-independent test dependencies (all prebuilt
     # wheels) in the background so they fetch while the instrumented build below

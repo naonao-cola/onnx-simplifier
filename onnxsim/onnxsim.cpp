@@ -2151,6 +2151,45 @@ void AssignMissingNodeNames(onnx::ModelProto& model) {
   AssignMissingNodeNames(*model.mutable_graph(), used_names, counter);
 }
 
+// Shape inference can leave behind a value_info entry that records a shape
+// but never resolved an element type (e.g. observed on a real-world model's
+// Reshape outputs inside attention blocks: graph_shape_inference.h's
+// InferShapesOnGraph propagated the target shape but left elem_type at its
+// default UNDEFINED). value_info is purely optional annotation -- nothing
+// reads it as ground truth -- but an entry with elem_type == UNDEFINED is a
+// malformed TypeProto, and onnx::checker::check_model does not reject it,
+// while onnxruntime's own model loader is stricter and refuses to load the
+// model at all with "Invalid tensor data type 0". Drop such entries instead
+// of leaving broken metadata in the output model; the same op's actual
+// output tensor is unaffected either way.
+// Recurses into subgraphs (If/Loop/Scan bodies) for the same reason
+// AssignMissingNodeNames does.
+void DropIncompleteValueInfo(onnx::GraphProto& graph) {
+  auto& value_info = *graph.mutable_value_info();
+  value_info.erase(
+      std::remove_if(value_info.begin(), value_info.end(),
+                     [](const onnx::ValueInfoProto& vi) {
+                       return vi.type().has_tensor_type() &&
+                              vi.type().tensor_type().elem_type() ==
+                                  onnx::TensorProto::UNDEFINED;
+                     }),
+      value_info.end());
+  for (auto& node : *graph.mutable_node()) {
+    for (auto& attr : *node.mutable_attribute()) {
+      if (attr.has_g()) {
+        DropIncompleteValueInfo(*attr.mutable_g());
+      }
+      for (auto& subgraph : *attr.mutable_graphs()) {
+        DropIncompleteValueInfo(subgraph);
+      }
+    }
+  }
+}
+
+void DropIncompleteValueInfo(onnx::ModelProto& model) {
+  DropIncompleteValueInfo(*model.mutable_graph());
+}
+
 void Check(const onnx::ModelProto& model) { onnx::checker::check_model(model); }
 
 // Return the opset version the model imports for the default ONNX domain
@@ -2996,6 +3035,7 @@ onnx::ModelProto Simplify(
   // name; assign unique names to them so downstream tools that key on node
   // names keep working (issue #269).
   AssignMissingNodeNames(sim_model);
+  DropIncompleteValueInfo(sim_model);
   RecordSimplifyOptionsMetadata(sim_model, skip_optimizers, constant_folding,
                                 shape_inference, tensor_size_threshold,
                                 target_opset_version, initializers_as_constants,
