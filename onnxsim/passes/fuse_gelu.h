@@ -23,14 +23,13 @@
 #pragma once
 
 #include <cmath>
-#include <cstdio>
-#include <cstdlib>
 #include <utility>
 #include <vector>
 
 #include "onnx/common/assertions.h"
 #include "onnxoptimizer/pass.h"
 #include "onnxoptimizer/passes/pass_util.h"
+#include "passes/endian_read.h"
 
 namespace ONNX_NAMESPACE {
 namespace optimization {
@@ -55,23 +54,15 @@ struct FuseGelu final : public PredicateBasedPass {
       return false;
     }
     if (t->elem_type() == TensorProto_DataType_FLOAT) {
-      out = t->is_raw_data() ? *t->data<float>() : t->floats()[0];
-      if (t->is_raw_data()) {
-        const unsigned char* b =
-            reinterpret_cast<const unsigned char*>(t->data<float>());
-        std::fprintf(stderr,
-                     "[fuse_gelu DEBUG] raw=1 bytes=%02x %02x %02x %02x "
-                     "out=%.17g\n",
-                     b[0], b[1], b[2], b[3], out);
-      } else {
-        std::fprintf(stderr,
-                     "[fuse_gelu DEBUG] raw=0 floats_size=%zu out=%.17g\n",
-                     t->floats().size(), out);
-      }
+      out = t->is_raw_data()
+                ? ReadRawDataHostOrder<float>(t->data<float>(), 1)[0]
+                : t->floats()[0];
       return true;
     }
     if (t->elem_type() == TensorProto_DataType_DOUBLE) {
-      out = t->is_raw_data() ? *t->data<double>() : t->doubles()[0];
+      out = t->is_raw_data()
+                ? ReadRawDataHostOrder<double>(t->data<double>(), 1)[0]
+                : t->doubles()[0];
       return true;
     }
     return false;
