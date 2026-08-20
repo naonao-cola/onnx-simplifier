@@ -375,7 +375,8 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
       },
       "model_bytes"_a);
 
-  // Statically (calibration-based) quantizes MatMul/Gemm: weights to INT8
+  // Statically (calibration-based) quantizes MatMul/Gemm/Conv: weights to
+  // INT8
   // (per output channel, symmetric, ahead of time) and activations to uint8
   // via a QuantizeLinear/DequantizeLinear pair with a *fixed* scale/zero-point
   // derived from `activation_ranges` (tensor name -> (min, max), typically
