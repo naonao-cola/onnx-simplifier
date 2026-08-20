@@ -359,6 +359,18 @@ if (ONNXSIM_PYTHON)
     Python 3.10
     COMPONENTS Interpreter Development.Module REQUIRED
     OPTIONAL_COMPONENTS Development.SABIModule)
+
+  # nanobind ships its CMake package config inside its own pip-installed
+  # wheel (not on any default CMake search path), so it must be located via
+  # its Python API and added to CMAKE_PREFIX_PATH before find_package(nanobind)
+  # can locate it -- this is nanobind's documented CMake integration pattern.
+  execute_process(
+    COMMAND "${Python_EXECUTABLE}" -m nanobind --cmake_dir
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    OUTPUT_VARIABLE NB_DIR)
+  list(APPEND CMAKE_PREFIX_PATH "${NB_DIR}")
+  find_package(nanobind CONFIG REQUIRED)
+
   # FREE_THREADED marks the module Py_MOD_GIL_NOT_USED so free-threaded
   # interpreters (e.g. the cp314t wheel) keep the GIL disabled instead of
   # re-enabling it at import. nanobind ignores STABLE_ABI on free-threaded
