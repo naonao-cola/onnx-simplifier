@@ -375,7 +375,6 @@ def import_gguf(in_path: str) -> onnx.ModelProto:
     return model
 
 
-
 def simplify(
     model: Union[str, onnx.ModelProto],
     check_n: int = 0,
@@ -596,8 +595,12 @@ def simplify(
     )
 
     # Fast path: no ``check_n`` verification (which needs the original model
-    # loaded anyway to compare against) and no shape dict needing the model to
-    # resolve. A file path goes straight through the C++ core's native
+    # loaded anyway to compare against), no shape dict needing the model to
+    # resolve, and no onnxruntime-side session profiling requested (this
+    # function's ``ort_profile``/``merge_ort_profile`` handling below sets up
+    # ``ONNXSIM_ORT_PROFILE`` and merges the resulting traces into the onnxsim
+    # profile after simplification -- machinery the fast path does not
+    # replicate). A file path goes straight through the C++ core's native
     # path-based entry point (``C.simplify_path``), skipping the Python-level
     # parse-then-reserialize round trip a large model otherwise pays crossing
     # into C++ -- every initializer's bytes get materialized into a Python
@@ -613,7 +616,12 @@ def simplify(
     # (issue #348), which the C++ core already detects and works around
     # itself -- so this is never less correct than before, only sometimes not
     # faster.
-    if check_n == 0 and not _shapes_need_model:
+    if (
+        check_n == 0
+        and not _shapes_need_model
+        and ort_profile is None
+        and not merge_ort_profile
+    ):
         _fast_threshold_bytes = parse_size(tensor_size_threshold)
         if _fast_threshold_bytes <= 2**31 - 9999:
             _fast_prev_profile_env = None
