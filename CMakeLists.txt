@@ -365,21 +365,33 @@ if (ONNXSIM_PYTHON)
   # its Python API before find_package(nanobind) can locate it -- this is
   # nanobind's documented CMake integration pattern. Set nanobind_DIR
   # directly to the directory --cmake_dir prints (which already *is* the
-  # directory containing nanobind-config.cmake) rather than only appending
-  # it to CMAKE_PREFIX_PATH: find_package's CONFIG-mode search additionally
-  # probes a "cmake/" suffix under each CMAKE_PREFIX_PATH entry, which -- on
-  # at least macOS cibuildwheel builds -- has been observed to resolve to a
-  # spurious nested ".../nanobind/cmake/cmake/nanobind-config.cmake",
-  # producing a doubled-up NB_DIR inside nanobind's own config script and a
-  # linker failure looking for ".../nanobind/cmake/cmake/darwin-ld-*.sym".
-  # Setting nanobind_DIR directly matches scripts/cross/build_windows_wheel.sh's
-  # already-proven -Dnanobind_DIR usage and sidesteps that ambiguity entirely.
+  # directory containing nanobind-config.cmake).
+  #
+  # nanobind-config.cmake self-computes its OWN "NB_DIR" (nanobind's package
+  # root, used e.g. as "${NB_DIR}/cmake/darwin-ld-cpython.sym" for the macOS
+  # linker response file) via get_filename_component(... CMAKE_CURRENT_LIST_FILE
+  # ...) and caches it as NB_DIR CACHE INTERNAL. That collides by name with a
+  # local (non-cache) variable this block used to set for the very same
+  # --cmake_dir output -- on at least one macOS cibuildwheel build this left
+  # nanobind's own NB_DIR one directory level too deep (pointing at the
+  # cmake/ subdirectory instead of the package root), producing a doubled
+  # ".../nanobind/cmake/cmake/darwin-ld-cpython.sym" link failure. Use a
+  # differently-named local variable to avoid any chance of that collision,
+  # and force nanobind's own NB_DIR to the independently-known-correct value
+  # (one directory above --cmake_dir's output) as a defensive follow-up, in
+  # case a stale NB_DIR cache entry from an earlier configure attempt in the
+  # same build directory would otherwise have survived (plain `CACHE
+  # INTERNAL` sets, as nanobind's config script uses, only take effect the
+  # first time -- they do not overwrite an existing cache entry).
   execute_process(
     COMMAND "${Python_EXECUTABLE}" -m nanobind --cmake_dir
     OUTPUT_STRIP_TRAILING_WHITESPACE
-    OUTPUT_VARIABLE NB_DIR)
-  set(nanobind_DIR "${NB_DIR}" CACHE PATH "" FORCE)
+    OUTPUT_VARIABLE ONNXSIM_NANOBIND_CMAKE_DIR)
+  set(nanobind_DIR "${ONNXSIM_NANOBIND_CMAKE_DIR}" CACHE PATH "" FORCE)
   find_package(nanobind CONFIG REQUIRED)
+  get_filename_component(ONNXSIM_NANOBIND_PACKAGE_ROOT
+                          "${ONNXSIM_NANOBIND_CMAKE_DIR}" DIRECTORY)
+  set(NB_DIR "${ONNXSIM_NANOBIND_PACKAGE_ROOT}" CACHE INTERNAL "" FORCE)
 
   # FREE_THREADED marks the module Py_MOD_GIL_NOT_USED so free-threaded
   # interpreters (e.g. the cp314t wheel) keep the GIL disabled instead of
