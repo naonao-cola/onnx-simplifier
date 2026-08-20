@@ -2603,7 +2603,7 @@ onnx::ModelProto Simplify(
     const std::optional<std::vector<std::string>>& unused_output) {
   // Register onnxsim's own optimizer passes into onnxoptimizer's registry
   // before the pass list is built below: fuse_consecutive_mul,
-  // fuse_mul_into_conv, fuse_preceding_mul_into_conv and
+  // fuse_mul_into_conv, fuse_preceding_mul_into_conv, fuse_rms_norm and
   // eliminate_reshape_around_elementwise are auto-selected via
   // GetFuseAndEliminationPass, and fuse_matmul_add_bias_into_gemm_batched is
   // named explicitly. The call is idempotent.

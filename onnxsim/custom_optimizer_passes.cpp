@@ -22,6 +22,7 @@
 #include "passes/fuse_mul_into_conv.h"
 #include "passes/fuse_pad_into_pool.h"
 #include "passes/fuse_preceding_mul_into_conv.h"
+#include "passes/fuse_rms_norm.h"
 #include "passes/static_quantize_conv.h"
 #include "passes/static_quantize_matmul.h"
 
@@ -66,6 +67,7 @@ void RegisterCustomOptimizerPasses() {
     RegisterOrReplace<p::FuseMatMulAddBiasIntoGemmBatched>(registry);
     RegisterOrReplace<p::FuseMulIntoConv>(registry);
     RegisterOrReplace<p::FusePrecedingMulIntoConv>(registry);
+    RegisterOrReplace<p::FuseRMSNorm>(registry);
     RegisterOrReplace<p::StaticQuantizeConv>(registry);
     RegisterOrReplace<p::StaticQuantizeMatMul>(registry);
 
