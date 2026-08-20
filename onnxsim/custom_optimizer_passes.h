@@ -25,6 +25,9 @@ namespace onnxsim {
 //   - fuse_rms_norm
 //   - fuse_gelu
 //   - fuse_layer_norm
+//   - dynamic_quantize_matmul
+//   - static_quantize_matmul
+//   - static_quantize_conv
 //
 // The registration runs at most once per process and is safe to call from any
 // simplification entry point. It MUST run before the pass list is built (a
