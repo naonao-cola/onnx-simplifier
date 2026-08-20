@@ -9,12 +9,15 @@
 #include <nanobind/stl/shared_ptr.h>
 #include <nanobind/stl/string.h>
 #include <nanobind/stl/tuple.h>
+#include <nanobind/stl/unordered_map.h>
 #include <nanobind/stl/vector.h>
 #include <nanobind/trampoline.h>
 
 #include <algorithm>
+#include <cstdint>
 #include <string>
 #include <tuple>
+#include <unordered_map>
 #include <vector>
 
 #include "dlpack_bridge.h"
@@ -367,18 +370,22 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
           bool constant_folding, bool shape_inference,
           size_t tensor_size_threshold, std::optional<int> target_opset_version,
           std::shared_ptr<GraphRewriter> rewriter,
-          bool initializers_as_constants,
-          bool include_inline_functions) -> py::bytes {
+          bool initializers_as_constants, bool include_inline_functions,
+          bool mutable_initializer,
+          std::optional<std::unordered_map<std::string, std::vector<int64_t>>>
+              overwrite_input_shapes,
+          std::optional<std::vector<std::string>> unused_output) -> py::bytes {
          // force env initialization to register opset
          InitEnv();
          ONNX_NAMESPACE::ModelProto model;
          ParseProtoFromBytes(&model, model_proto_bytes.c_str(),
                              model_proto_bytes.size());
-         auto const result =
-             Simplify(*executor, model, skip_optimizers, constant_folding,
-                      shape_inference, tensor_size_threshold,
-                      target_opset_version, rewriter.get(),
-                      initializers_as_constants, include_inline_functions);
+         auto const result = Simplify(
+             *executor, model, skip_optimizers, constant_folding,
+             shape_inference, tensor_size_threshold, target_opset_version,
+             rewriter.get(), initializers_as_constants,
+             include_inline_functions, mutable_initializer,
+             overwrite_input_shapes, unused_output);
          std::string out;
          result.SerializeToString(&out);
          return py::bytes(out.data(), out.size());
@@ -387,7 +394,8 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
        "constant_folding"_a = true, "shape_inference"_a = true,
        "tensor_size_threshold"_a, "target_opset_version"_a.none(),
        "rewriter"_a.none(), "initializers_as_constants"_a = true,
-       "include_inline_functions"_a = false)
+       "include_inline_functions"_a = false, "mutable_initializer"_a = true,
+       "overwrite_input_shapes"_a.none(), "unused_output"_a.none())
       .def(
           "simplify_path",
           [](std::shared_ptr<PyModelExecutor> executor,
@@ -397,22 +405,28 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
              size_t tensor_size_threshold,
              std::optional<int> target_opset_version,
              std::shared_ptr<GraphRewriter> rewriter,
-             bool initializers_as_constants,
-             bool include_inline_functions) -> bool {
+             bool initializers_as_constants, bool include_inline_functions,
+             bool mutable_initializer,
+             std::optional<
+                 std::unordered_map<std::string, std::vector<int64_t>>>
+                 overwrite_input_shapes,
+             std::optional<std::vector<std::string>> unused_output) -> bool {
             // force env initialization to register opset
             InitEnv();
             SimplifyPath(*executor, in_path, out_path, skip_optimizers,
                          constant_folding, shape_inference,
                          tensor_size_threshold, target_opset_version,
                          rewriter.get(), initializers_as_constants,
-                         include_inline_functions);
+                         include_inline_functions, mutable_initializer,
+                         overwrite_input_shapes, unused_output);
             return true;
           },
           "executor"_a, "in_path"_a, "out_path"_a, "skip_optimizers"_a.none(),
           "constant_folding"_a = true, "shape_inference"_a = true,
           "tensor_size_threshold"_a, "target_opset_version"_a.none(),
           "rewriter"_a.none(), "initializers_as_constants"_a = true,
-          "include_inline_functions"_a = false)
+          "include_inline_functions"_a = false, "mutable_initializer"_a = true,
+          "overwrite_input_shapes"_a.none(), "unused_output"_a.none())
       .def("_list_optimizers",
            []() {
              py::list ret;
