@@ -25,7 +25,7 @@ for est in onnxsim.estimate_quantization_precision(model):
     print(est)
 ```
 
-## The three things it checks
+## The four things it checks
 
 1. **Accumulator overflow** (MatMul/Gemm/Conv). onnxsim's INT8 weight
    quantization is symmetric and per-channel, scaled so a channel's
@@ -62,6 +62,26 @@ for est in onnxsim.estimate_quantization_precision(model):
    any recommendation; it exists only so "int32-safe" is never read as "exact
    end-to-end".
 
+4. **Activation-range provenance** (MatMul/Gemm/Conv). These compute-dominant
+   ops are never run standalone — their activation input is almost always the
+   output of another op, and a few common ones have a range fixed by the op
+   itself, for *any* input, so it needs no calibration run to know:
+   `Sigmoid`/`HardSigmoid`/`Softmax` → `[0, 1]`, `Tanh` → `[-1, 1]`, `Clip` →
+   `[min, max]` when both bounds are constant (`Relu` is deliberately
+   excluded — it's only bounded on one side, not enough to pick a fixed
+   scale). This is a **distinct claim from (1)–(3), not a tightening of
+   them**: `DynamicQuantizeLinear` rescales to the observed run's actual
+   min/max regardless of the producing op's theoretical range, so a
+   near-uniform `Softmax` output still spreads across most of uint8's range —
+   the accumulator-overflow bound in (1) already accounts for that worst
+   case and is unaffected by knowing the source op. What it *does* mean: such
+   a tensor could be quantized with a single, fixed, analytically-derived
+   scale — no calibration dataset (unlike an arbitrary activation, which
+   `onnxsim.quantize_static` needs calibration data for) and no runtime
+   `DynamicQuantizeLinear` overhead (unlike `onnxsim.quantize_dynamic`'s
+   current scheme). Reported as `activation_producer_op`/`activation_range`
+   when recognized, `None`/`None` otherwise.
+
 **Attention** has no constant weight in the MatMul sense — Q/K/V are runtime
 activations, so none of the above applies. Instead it reports an
 advisory-only check: the pre-softmax `Q·Kᵀ` dot product's magnitude grows
@@ -78,7 +98,7 @@ One dataclass per recognized node, in graph order:
 
 | Op type | Estimate type | Key fields |
 | --- | --- | --- |
-| `MatMul`, `Gemm` | `MatMulGemmPrecisionEstimate` | `reduction_depth`, `num_channels`, `int32_accumulator_safe`, `float32_cast_exact`, `max_outlier_ratio`, `outlier_risk`, `recommendation` |
+| `MatMul`, `Gemm` | `MatMulGemmPrecisionEstimate` | `reduction_depth`, `num_channels`, `int32_accumulator_safe`, `float32_cast_exact`, `max_outlier_ratio`, `outlier_risk`, `activation_producer_op`, `activation_range`, `recommendation` |
 | `Conv` | `ConvPrecisionEstimate` | same shape as above |
 | `Attention` | `AttentionPrecisionEstimate` | `num_query_heads`, `num_kv_heads`, `head_dim`, `default_scale`, `actual_scale`, `scale_matches_default`, `recommendation` |
 

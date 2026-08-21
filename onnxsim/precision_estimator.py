@@ -5,7 +5,7 @@ the reduction depth K for MatMul/Gemm, Cin/groups * kernel-volume for Conv,
 num_heads/head_dim for Attention -- this estimates whether INT8 quantization
 (the scheme ``onnxsim.quantize_dynamic``/``quantize_static`` apply, see
 docs/dynamic-quantization.md) is numerically safe, without running the model
-or needing calibration data. Three independent questions, all answerable
+or needing calibration data. Four independent questions, all answerable
 from static graph info alone:
 
 1. Accumulator overflow (MatMul/Gemm/Conv). onnxsim's INT8 weight
@@ -42,6 +42,24 @@ from static graph info alone:
    INT8 quantization's own ~1/127 (~0.8%) relative error -- reported so
    "int32-safe" is never read as "exact end-to-end".
 
+4. Activation-range provenance (MatMul/Gemm/Conv). These compute-dominant
+   ops never run in isolation -- their activation input is almost always the
+   output of another op, and a few common ones (``Sigmoid``, ``Tanh``,
+   ``HardSigmoid``, ``Softmax``, and ``Clip`` with constant bounds) have an
+   output range that is fixed by the op itself, for *any* input -- not a
+   property of the data, so no calibration run is needed to know it. This is
+   a distinct claim from (1)-(3): it does NOT tighten the accumulator-overflow
+   bound (``DynamicQuantizeLinear`` rescales to the observed run's actual
+   min/max regardless of the op's theoretical range, so a near-uniform
+   Softmax output still spreads across most of uint8's range -- the
+   worst-case bound in (1) already accounts for that and is unaffected). What
+   it DOES mean: such a tensor could be quantized with a single, fixed,
+   analytically-derived scale -- no calibration dataset (unlike an arbitrary
+   activation, which onnxsim.quantize_static needs calibration data for) and
+   no runtime ``DynamicQuantizeLinear`` overhead (unlike
+   onnxsim.quantize_dynamic's current scheme) -- reported as
+   ``activation_range``/``activation_producer_op`` when recognized.
+
 Attention has no constant weight in the MatMul sense (Q/K/V are runtime
 activations), so it gets a different, advisory-only estimate: the pre-softmax
 QK^T dot product's magnitude grows with head_dim, which is exactly why
@@ -58,7 +76,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Union
+from typing import Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import onnx
@@ -88,6 +106,49 @@ OUTLIER_RATIO_THRESHOLD = 127.0
 # "int32-safe" is never conflated with "exact end-to-end".
 MAX_EXACT_FLOAT32_REDUCTION_DEPTH = (2**24) // (127 * 255)
 
+# Ops whose output range is fixed by the op itself, for any input -- not a
+# property of the data, so it needs no calibration run to know. See this
+# module's docstring, point 4. LogSoftmax/Softplus/etc. are left out: they're
+# only bounded on one side, which isn't enough to pick a fixed scale.
+FIXED_ACTIVATION_RANGES: Dict[str, Tuple[float, float]] = {
+    "Sigmoid": (0.0, 1.0),
+    "HardSigmoid": (0.0, 1.0),  # max(0, min(1, alpha*x+beta)) -- bounded by construction
+    "Tanh": (-1.0, 1.0),
+    "Softmax": (0.0, 1.0),
+}
+
+
+def _clip_range(
+    node: onnx.NodeProto, initializers: Dict[str, onnx.TensorProto]
+) -> Optional[Tuple[float, float]]:
+    """Clip's static (min, max), or None if either bound isn't a constant."""
+    lo, hi = -math.inf, math.inf
+    for attr in node.attribute:  # opset < 11: min/max are attributes
+        if attr.name == "min":
+            lo = float(attr.f)
+        elif attr.name == "max":
+            hi = float(attr.f)
+    if len(node.input) > 1 and node.input[1] in initializers:  # opset >= 11
+        lo = float(numpy_helper.to_array(initializers[node.input[1]]).reshape(-1)[0])
+    if len(node.input) > 2 and node.input[2] in initializers:
+        hi = float(numpy_helper.to_array(initializers[node.input[2]]).reshape(-1)[0])
+    if math.isinf(lo) or math.isinf(hi):
+        return None
+    return (lo, hi)
+
+
+def _activation_range(
+    producer: Optional[onnx.NodeProto], initializers: Dict[str, onnx.TensorProto]
+) -> Optional[Tuple[float, float]]:
+    """The analytically-known output range of `producer`, or None."""
+    if producer is None:
+        return None
+    if producer.op_type in FIXED_ACTIVATION_RANGES:
+        return FIXED_ACTIVATION_RANGES[producer.op_type]
+    if producer.op_type == "Clip":
+        return _clip_range(producer, initializers)
+    return None
+
 
 @dataclass
 class MatMulGemmPrecisionEstimate:
@@ -99,6 +160,8 @@ class MatMulGemmPrecisionEstimate:
     float32_cast_exact: bool  # False just means routine float rounding, not a bug
     max_outlier_ratio: float  # max over channels of max|w| / median(|w|); nan if unknown
     outlier_risk: bool
+    activation_producer_op: Optional[str]  # e.g. "Sigmoid"; None if not recognized
+    activation_range: Optional[Tuple[float, float]]  # analytically-known (lo, hi)
     recommendation: str
 
 
@@ -111,6 +174,8 @@ class ConvPrecisionEstimate:
     float32_cast_exact: bool
     max_outlier_ratio: float
     outlier_risk: bool
+    activation_producer_op: Optional[str]
+    activation_range: Optional[Tuple[float, float]]
     recommendation: str
 
 
@@ -164,7 +229,13 @@ def _channel_outlier_ratio(abs_weights_for_channel) -> float:
     return peak / med
 
 
-def _recommendation(safe: bool, float32_exact: bool, outlier_risk: bool) -> str:
+def _recommendation(
+    safe: bool,
+    float32_exact: bool,
+    outlier_risk: bool,
+    activation_producer_op: Optional[str],
+    activation_range: Optional[Tuple[float, float]],
+) -> str:
     if not safe:
         return (
             "reduction depth exceeds the int32-safe bound: onnxsim.quantize_dynamic "
@@ -185,13 +256,23 @@ def _recommendation(safe: bool, float32_exact: bool, outlier_risk: bool) -> str:
             "INT16 would preserve more resolution for this node's typical-magnitude "
             "weights"
         )
+    if activation_range is not None:
+        lo, hi = activation_range
+        notes.append(
+            f"the activation input comes from {activation_producer_op}, whose output "
+            f"is always in [{lo:g}, {hi:g}] regardless of input data: a fixed static "
+            "scale would quantize it exactly, without calibration data or "
+            "quantize_dynamic's runtime DynamicQuantizeLinear"
+        )
     if not notes:
         return "INT8 (onnxsim.quantize_dynamic's scheme) looks safe and well-resolved"
     return "int32-safe, but " + "; ".join(notes)
 
 
 def _estimate_matmul_gemm(
-    node: onnx.NodeProto, initializers: Dict[str, onnx.TensorProto]
+    node: onnx.NodeProto,
+    initializers: Dict[str, onnx.TensorProto],
+    producer: Dict[str, onnx.NodeProto],
 ) -> Optional[MatMulGemmPrecisionEstimate]:
     if node.op_type not in ("MatMul", "Gemm"):
         return None
@@ -220,6 +301,8 @@ def _estimate_matmul_gemm(
     safe = k <= MAX_SAFE_INT32_REDUCTION_DEPTH
     float32_exact = k <= MAX_EXACT_FLOAT32_REDUCTION_DEPTH
     outlier_risk = bool(finite_ratios) and max_ratio > OUTLIER_RATIO_THRESHOLD
+    act_producer = producer.get(node.input[0]) if node.input else None
+    act_range = _activation_range(act_producer, initializers)
 
     return MatMulGemmPrecisionEstimate(
         node_name=node.name or f"{node.op_type}({node.input[1]})",
@@ -230,12 +313,22 @@ def _estimate_matmul_gemm(
         float32_cast_exact=float32_exact,
         max_outlier_ratio=max_ratio,
         outlier_risk=outlier_risk,
-        recommendation=_recommendation(safe, float32_exact, outlier_risk),
+        activation_producer_op=act_producer.op_type if act_range is not None else None,
+        activation_range=act_range,
+        recommendation=_recommendation(
+            safe,
+            float32_exact,
+            outlier_risk,
+            act_producer.op_type if act_range is not None else None,
+            act_range,
+        ),
     )
 
 
 def _estimate_conv(
-    node: onnx.NodeProto, initializers: Dict[str, onnx.TensorProto]
+    node: onnx.NodeProto,
+    initializers: Dict[str, onnx.TensorProto],
+    producer: Dict[str, onnx.NodeProto],
 ) -> Optional[ConvPrecisionEstimate]:
     if node.op_type != "Conv":
         return None
@@ -255,6 +348,8 @@ def _estimate_conv(
     safe = k <= MAX_SAFE_INT32_REDUCTION_DEPTH
     float32_exact = k <= MAX_EXACT_FLOAT32_REDUCTION_DEPTH
     outlier_risk = bool(finite_ratios) and max_ratio > OUTLIER_RATIO_THRESHOLD
+    act_producer = producer.get(node.input[0]) if node.input else None
+    act_range = _activation_range(act_producer, initializers)
 
     return ConvPrecisionEstimate(
         node_name=node.name or f"Conv({node.input[1]})",
@@ -264,7 +359,15 @@ def _estimate_conv(
         float32_cast_exact=float32_exact,
         max_outlier_ratio=max_ratio,
         outlier_risk=outlier_risk,
-        recommendation=_recommendation(safe, float32_exact, outlier_risk),
+        activation_producer_op=act_producer.op_type if act_range is not None else None,
+        activation_range=act_range,
+        recommendation=_recommendation(
+            safe,
+            float32_exact,
+            outlier_risk,
+            act_producer.op_type if act_range is not None else None,
+            act_range,
+        ),
     )
 
 
@@ -371,13 +474,16 @@ def estimate_quantization_precision(model: onnx.ModelProto) -> List[PrecisionEst
     """
     initializers = {init.name: init for init in model.graph.initializer}
     shapes = _collect_static_shapes(model)
+    producer = {
+        out: node for node in model.graph.node for out in node.output if out
+    }
 
     estimates: List[PrecisionEstimate] = []
     for node in model.graph.node:
         if node.op_type in ("MatMul", "Gemm"):
-            est = _estimate_matmul_gemm(node, initializers)
+            est = _estimate_matmul_gemm(node, initializers, producer)
         elif node.op_type == "Conv":
-            est = _estimate_conv(node, initializers)
+            est = _estimate_conv(node, initializers, producer)
         elif node.op_type == "Attention":
             est = _estimate_attention(node, shapes)
         else:
