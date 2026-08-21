@@ -6,26 +6,45 @@ fine-tuning entirely client-side in a browser tab.
 
 ## Status
 
-**The C++/Embind code and the JS-facing API are complete and self-contained.**
-The build wiring (`CMakeLists.txt`) has **not been build-verified** -- see the
-comment at the top of that file for why: it's a structural port of onnxsim's
-own working wasm build (`../../CMakeLists.txt`'s `EMSCRIPTEN` branch,
-`../../build_wasm.sh`) with `onnxruntime_ENABLE_TRAINING_APIS=ON` added, but
-onnxsim's own wasm build has never turned that flag on, and upstream ONNX
-Runtime's *own* wasm+training JS bindings were removed from its source tree
-after v1.19.2. Whether `onnxruntime_webassembly` still comes out the other
-end with training symbols intact when that flag is set is the one open
-question -- it needs an actual build attempt to confirm, which is a
-substantial compile (same ballpark as building ORT for native, likely more
-given wasm's slower codegen).
+**Build-verified, including WebGPU (JSEP).** `emcmake cmake` + `cmake --build`
+against ORT v1.19.2 with `onnxruntime_ENABLE_TRAINING_APIS=ON` and
+`onnxruntime_USE_JSEP=ON` (this file's `ONNX_FINETUNE_WASM_WEBGPU` default)
+produces a working `onnx-finetune-wasm.js`/`.wasm` (932 build steps,
+~11.5 MB `.wasm`). One upstream bug needed a patch to get there --
+`patches/mlas-wasm-ort-enforce.patch` (applies to the ONNX Runtime source
+checkout, not this repo): `onnxruntime/core/mlas/lib/q4_dq.cpp` (int4
+block-quantization kernels, unrelated to anything this tool uses) calls
+`ORT_ENFORCE`/`ORT_THROW` unconditionally, but those aren't defined under
+`BUILD_MLAS_NO_ONNXRUNTIME`, which the wasm build always sets. Apply it to
+your `onnxruntime` checkout before configuring:
 
-Why still worth doing this way: the alternative -- reviving ORT's deleted
-`onnxruntime-web/training` JS/TS layer -- means resurrecting and maintaining
-someone else's abandoned code. This instead reuses only what's still alive
-and maintained: the C++ training API (used natively, working, verified
-elsewhere in this repo) and onnxsim's own proven Emscripten build recipe.
-If the training+wasm CMake combination turns out not to build cleanly, the
-fix is scoped to this one file, not a resurrection project.
+```sh
+cd /path/to/onnxruntime
+git apply /path/to/onnxsim/tools/onnx-finetune/wasm/patches/mlas-wasm-ort-enforce.patch
+```
+
+Traced (and confirmed by the successful build) that the training+wasm CMake
+wiring itself needed no changes: with `onnxruntime_BUILD_WEBASSEMBLY_STATIC_LIB=ON`,
+`bundle_static_library()` in `onnxruntime_webassembly.cmake` produces a real
+linkable `add_library(... STATIC IMPORTED)` target, and
+`orttraining/training_api/*.cc` is globbed straight into `onnxruntime_session`
+(already one of the bundled libraries) by `onnxruntime_session.cmake` -- so
+training symbols end up in the archive with no separate training library
+needed on the link line.
+
+Build time (4 cores, `-O3`, ORT + onnx + protobuf + abseil all from source):
+25m35s cold, 6m41s warm (95.8% ccache hit rate) *if the build directory name
+matches between runs* -- generated headers get included via
+`-I<build-dir>/onnxruntime-build`, so a differently-named build directory
+(e.g. a fresh temp dir per CI run) busts most of ccache's hash and only
+saves ~7%. Reuse the same directory name (wipe contents, keep the path) to
+get the real benefit; `CCACHE_BASEDIR` does not fix this specific case since
+the differing path segment is the directory name itself, not just its
+absolute prefix.
+
+Not yet exercised: whether `onnx-finetune-wasm.wasm` actually *runs*
+correctly in a browser (`example/`) -- the build compiles and links clean,
+but nothing has loaded it in a JS engine yet.
 
 ## Design
 

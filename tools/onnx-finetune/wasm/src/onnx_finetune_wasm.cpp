@@ -80,10 +80,19 @@ class FinetuneSession {
     // MEMFS is in-memory by default in a browser build (no IDBFS/NODEFS
     // persistence backing it), so this never touches a real disk.
     const char* tmp_path = "/onnx_finetune_export.onnx";
-    session_.ExportModelForInferencing(tmp_path, names);
+    try {
+      session_.ExportModelForInferencing(tmp_path, names);
+    } catch (const std::exception& e) {
+      fprintf(stderr, "ExportModelForInferencing threw: %s\n", e.what());
+      throw;
+    }
 
     std::ifstream f(tmp_path, std::ios::binary);
+    if (!f) {
+      fprintf(stderr, "failed to reopen %s from MEMFS after export\n", tmp_path);
+    }
     std::vector<uint8_t> bytes((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    fprintf(stderr, "read back %zu bytes from %s\n", bytes.size(), tmp_path);
 
     val Uint8Array = val::global("Uint8Array");
     val result = Uint8Array.new_(bytes.size());

@@ -75,5 +75,5 @@ target_link_libraries(onnx-finetune-wasm PRIVATE embind onnxruntime_webassembly)
 set_target_properties(onnx-finetune-wasm PROPERTIES
   LINK_FLAGS "-s ALLOW_MEMORY_GROWTH=1 -s MAXIMUM_MEMORY=4294967296 -s EXIT_RUNTIME=0 \
 -s FORCE_FILESYSTEM=1 -s MODULARIZE=1 -s 'EXPORT_NAME=\"createOnnxFinetune\"' \
--s ERROR_ON_UNDEFINED_SYMBOLS=0"
+-s ERROR_ON_UNDEFINED_SYMBOLS=0 -s DISABLE_EXCEPTION_CATCHING=0"
 )
