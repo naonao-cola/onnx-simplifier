@@ -15,7 +15,6 @@ import onnx
 import onnxruntime
 import torch
 
-import onnxsim
 from onnxsim.test_utils import export_simplify_and_check_by_python_api
 
 
