@@ -1,0 +1,21 @@
+diff --git a/onnxruntime/core/mlas/lib/mlasi.h b/onnxruntime/core/mlas/lib/mlasi.h
+index 4239e2e..d454305 100644
+--- a/onnxruntime/core/mlas/lib/mlasi.h
++++ b/onnxruntime/core/mlas/lib/mlasi.h
+@@ -165,6 +165,16 @@ using MLAS_CPUIDINFO = onnxruntime::CPUIDInfo;
+ 
+ #else  // BUILD_MLAS_NO_ONNXRUNTIME
+ 
++// q4_dq.cpp uses ORT_ENFORCE/ORT_THROW unconditionally (upstream oversight --
++// it's excluded from ORT_MINIMAL_BUILD but not from BUILD_MLAS_NO_ONNXRUNTIME,
++// which is unconditionally set for the wasm build and skips the
++// core/common/common.h include above that would normally define these).
++// Minimal standalone fallbacks so it compiles here.
++#include <stdexcept>
++#define ORT_ENFORCE(cond, ...) \
++  do { if (!(cond)) { throw std::runtime_error(#cond); } } while (0)
++#define ORT_THROW(msg) throw std::runtime_error(msg)
++
+ class MLASCPUIDInfo
+ {
+    public:
