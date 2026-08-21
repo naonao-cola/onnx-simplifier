@@ -38,12 +38,16 @@ class FinetuneSession {
   // JS side and pass the resulting ArrayBuffers straight in.
   FinetuneSession(const val& checkpoint_bytes, const val& training_model_bytes,
                    const val& eval_model_bytes, const val& optimizer_model_bytes)
-      : checkpoint_(Ort::CheckpointState::LoadCheckpointFromBuffer(
+  try : checkpoint_(Ort::CheckpointState::LoadCheckpointFromBuffer(
             emscripten::vecFromJSArray<uint8_t>(checkpoint_bytes))),
         session_(GlobalEnv(), Ort::SessionOptions{}, checkpoint_,
                  emscripten::vecFromJSArray<uint8_t>(training_model_bytes),
                  emscripten::vecFromJSArray<uint8_t>(eval_model_bytes),
-                 emscripten::vecFromJSArray<uint8_t>(optimizer_model_bytes)) {}
+                 emscripten::vecFromJSArray<uint8_t>(optimizer_model_bytes)) {
+  } catch (const std::exception& e) {
+    fprintf(stderr, "FinetuneSession construction threw: %s\n", e.what());
+    throw;
+  }
 
   void setLearningRate(float lr) { session_.SetLearningRate(lr); }
 
@@ -64,8 +68,13 @@ class FinetuneSession {
     inputs.push_back(Ort::Value::CreateTensor<float>(mem_info, target_vec.data(), target_vec.size(),
                                                        tgt_shape.data(), tgt_shape.size()));
 
-    auto outputs = session_.TrainStep(inputs);
-    return outputs.empty() ? 0.f : *outputs[0].GetTensorData<float>();
+    try {
+      auto outputs = session_.TrainStep(inputs);
+      return outputs.empty() ? 0.f : *outputs[0].GetTensorData<float>();
+    } catch (const std::exception& e) {
+      fprintf(stderr, "TrainStep threw: %s\n", e.what());
+      throw;
+    }
   }
 
   void optimizerStep() { session_.OptimizerStep(); }
