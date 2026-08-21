@@ -46,7 +46,20 @@ def test_dcgan_generator_convtranspose_bn_fuses():
         def forward(self, z):
             return self.main(z)
 
-    model = DCGANGenerator().eval()
+    torch.manual_seed(0)
+    model = DCGANGenerator()
+    # A freshly constructed BatchNorm2d has weight==running_var (both all-ones)
+    # and bias==running_mean (both all-zeros), so PyTorch's exporter
+    # deduplicates them into shared initializers wired up via Identity nodes.
+    # That Identity indirection hides the initializers from the fusion's
+    # constant check, so the fusion this test exists to cover never fires.
+    # Randomizing the buffers -- as real trained BatchNorm statistics always
+    # are -- avoids that export-time aliasing artifact.
+    for m in model.modules():
+        if isinstance(m, torch.nn.BatchNorm2d):
+            m.running_mean.normal_()
+            m.running_var.uniform_(0.5, 1.5)
+    model = model.eval()
     z = torch.randn(1, 16, 1, 1)
 
     opt = export_simplify_and_check_by_python_api(
@@ -228,6 +241,10 @@ def test_cyclegan_resnet_generator_dynamic_hw():
                 "output_image": {2: "h", 3: "w"},
             },
         },
+        # H/W are dynamic, so the numerical check needs a concrete shape to
+        # test against; this does not constrain the *exported* graph, which
+        # keeps its dynamic axes (asserted below).
+        simplify_kwargs={"test_input_shapes": {"input_image": [1, 3, 32, 32]}},
     )
 
     assert len(opt.graph.node) < original_nodes
