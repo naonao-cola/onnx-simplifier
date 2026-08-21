@@ -34,7 +34,11 @@
 // is a constant 2-D float32 tensor and whose activation (input 0) is float32.
 // Everything else -- non-constant or non-2-D weights, non-default Gemm
 // attributes, non-float32 operands, opsets older than 11 (DynamicQuantizeLinear
-// requires opset 11) -- is left alone.
+// requires opset 11) -- is left alone. So is a node whose reduction depth K
+// is large enough that MatMulInteger's int32 accumulator could overflow in
+// the worst case (see quantize_matmul_common.h's IsSafeInt32ReductionDepth) --
+// such a node is left in float rather than silently producing a
+// quantization that can wrap around and corrupt its output.
 
 #include <string>
 #include <vector>
@@ -70,8 +74,13 @@ struct DynamicQuantizeMatMul final : public PredicateBasedPass {
       return false;
     }
     const Tensor* w_t = FetchConstantTensor(info.w);
-    return w_t != nullptr && w_t->elem_type() == TensorProto_DataType_FLOAT &&
-           w_t->sizes().size() == 2;
+    if (w_t == nullptr || w_t->elem_type() != TensorProto_DataType_FLOAT ||
+        w_t->sizes().size() != 2) {
+      return false;
+    }
+    const int64_t k =
+        info.weight_transposed ? w_t->sizes()[1] : w_t->sizes()[0];
+    return IsSafeInt32ReductionDepth(k);
   }
 
   bool runTransform(Node* n, Graph& graph,
@@ -87,6 +96,11 @@ struct DynamicQuantizeMatMul final : public PredicateBasedPass {
     const Tensor* w_t = FetchConstantTensor(info.w);
     if (w_t == nullptr || w_t->elem_type() != TensorProto_DataType_FLOAT ||
         w_t->sizes().size() != 2) {
+      return false;
+    }
+    const int64_t k =
+        info.weight_transposed ? w_t->sizes()[1] : w_t->sizes()[0];
+    if (!IsSafeInt32ReductionDepth(k)) {
       return false;
     }
 

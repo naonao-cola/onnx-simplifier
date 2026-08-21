@@ -133,3 +133,41 @@ def test_quantize_skips_non_default_gemm_attrs():
     model = _model(nodes, [_vi("X", [4, 8])], [_vi("Y", [4, 4])], [weight])
     quant = onnxsim.quantize_dynamic(model)
     assert _op_counts(quant)["Gemm"] == 1
+
+
+def test_quantize_skips_reduction_depth_that_would_overflow_int32():
+    # A worst-case int32 accumulator (every term at its extreme quantized
+    # value, K * 127 * 255) can wrap around once K exceeds
+    # MAX_SAFE_INT32_REDUCTION_DEPTH -- see
+    # onnxsim/passes/quantize_matmul_common.h's IsSafeInt32ReductionDepth.
+    # This pass must leave such a node in float rather than silently
+    # producing a quantization that can overflow.
+    from onnxsim.precision_estimator import MAX_SAFE_INT32_REDUCTION_DEPTH
+
+    k = MAX_SAFE_INT32_REDUCTION_DEPTH + 1
+    weight = _f32(np.random.randn(k, 1) * 0.01, "W")
+    nodes = [onnx.helper.make_node("MatMul", ["X", "W"], ["Y"])]
+    model = _model(nodes, [_vi("X", [1, k])], [_vi("Y", [1, 1])], [weight])
+
+    quant = onnxsim.quantize_dynamic(model)
+    onnx.checker.check_model(quant)
+    ops = _op_counts(quant)
+    assert ops["MatMul"] == 1
+    assert ops["MatMulInteger"] == 0
+
+
+def test_quantize_still_applies_at_the_safe_reduction_depth_boundary():
+    # One less than the overflow test above: still safe, so the node is
+    # quantized as usual.
+    from onnxsim.precision_estimator import MAX_SAFE_INT32_REDUCTION_DEPTH
+
+    k = MAX_SAFE_INT32_REDUCTION_DEPTH
+    weight = _f32(np.random.randn(k, 1) * 0.01, "W")
+    nodes = [onnx.helper.make_node("MatMul", ["X", "W"], ["Y"])]
+    model = _model(nodes, [_vi("X", [1, k])], [_vi("Y", [1, 1])], [weight])
+
+    quant = onnxsim.quantize_dynamic(model)
+    onnx.checker.check_model(quant)
+    ops = _op_counts(quant)
+    assert ops["MatMul"] == 0
+    assert ops["MatMulInteger"] == 1

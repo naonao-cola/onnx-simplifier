@@ -60,6 +60,34 @@ Left untouched (safe no-op, node passes through as-is):
 - Non-default Gemm attributes (`alpha != 1`, `transA != 0`, or `beta != 1`
   when a bias is present).
 - Non-float32 activations, or an opset older than 11.
+- A reduction depth (`K`) large enough that `MatMulInteger`'s int32
+  accumulator could overflow in the worst case (see "Accumulator-overflow
+  guard" below).
+
+## Accumulator-overflow guard
+
+`Acc = MatMulInteger(Xq, Wq, Xzp)` accumulates in int32. Because onnxsim's
+weight quantization is symmetric and per-channel (see above), a channel's
+largest-magnitude element always quantizes to exactly ±127 regardless of the
+weight's actual values — so the worst-case *quantized* term is fixed by the
+scheme, not the data. Paired with `DynamicQuantizeLinear`'s uint8 output (max
+255), the worst-case accumulated value for a reduction depth `K` is bounded by
+`K * 127 * 255`. Once that exceeds `INT32_MAX`, the accumulator can wrap
+around and silently corrupt the output.
+
+This pass therefore checks `K` against that bound
+(`IsSafeInt32ReductionDepth` in `passes/quantize_matmul_common.h`, `K` ≈
+66,311 at the threshold) and leaves a node that would exceed it in float,
+exactly like any other node outside this pass's scope. In practice this is
+rarely hit — hidden dimensions in the thousands are far below the threshold —
+but it is an exact, data-independent correctness bound worth enforcing rather
+than assuming away.
+
+For a broader, read-only precision analysis — this same overflow check plus
+per-channel outlier-vs-quantization-resolution risk for MatMul/Gemm/Conv, and
+an advisory QK^T-scale check for Attention — see
+`onnxsim.estimate_quantization_precision()`, documented in
+[precision-estimation.md](precision-estimation.md).
 
 ## End-to-end: simplify -> quantize -> deploy
 
