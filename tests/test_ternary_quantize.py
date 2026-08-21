@@ -202,8 +202,6 @@ def test_quantize_ternary_skips_old_opset():
     rng = np.random.default_rng(6)
     weight = _f32(_ternary_weight(rng, (8, 4)), "W")
     nodes = [onnx.helper.make_node("MatMul", ["X", "W"], ["Y"])]
-    model = _model(
-        nodes, [_vi("X", [4, 8])], [_vi("Y", [4, 4])], [weight], opset=10
-    )
+    model = _model(nodes, [_vi("X", [4, 8])], [_vi("Y", [4, 4])], [weight], opset=10)
     quant = onnxsim.quantize_ternary(model)
     assert _op_counts(quant)["MatMul"] == 1

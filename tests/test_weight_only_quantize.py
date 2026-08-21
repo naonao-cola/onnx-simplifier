@@ -183,9 +183,7 @@ def test_quantize_skips_old_opset():
     # DequantizeLinear's per-channel `axis` attribute needs opset >= 13.
     weight = _f32(np.random.randn(8, 4).astype(np.float32), "W")
     nodes = [onnx.helper.make_node("MatMul", ["X", "W"], ["Y"])]
-    model = _model(
-        nodes, [_vi("X", [4, 8])], [_vi("Y", [4, 4])], [weight], opset=12
-    )
+    model = _model(nodes, [_vi("X", [4, 8])], [_vi("Y", [4, 4])], [weight], opset=12)
     quant = onnxsim.quantize_weight_only(model)
     assert _op_counts(quant)["MatMul"] == 1
     assert _op_counts(quant)["DequantizeLinear"] == 0
