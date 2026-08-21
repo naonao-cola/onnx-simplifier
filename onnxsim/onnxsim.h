@@ -156,6 +156,50 @@ onnx::ModelProto FoldConstantOnce(const ModelExecutor& executor,
 // attributes, non-float32 operands, an opset older than 11) are left as-is.
 onnx::ModelProto QuantizeDynamic(const onnx::ModelProto& model);
 
+// Dynamically quantizes every MatMul/"vanilla" Gemm whose constant weight is
+// *structurally ternary* -- every element of every output column is one of
+// {-s, 0, +s} for that column's own scale ``s``, the representation BitNet
+// b1.58 (https://github.com/microsoft/BitNet) and similar ternary-weight
+// models use internally, which a generic ONNX export still stores as a dense
+// float32 initializer. Detected nodes get exactly the ``QuantizeDynamic``
+// rewrite (``DynamicQuantizeLinear`` + ``MatMulInteger`` + dequantize), except
+// the weight's INT8 encoding is a lossless {-1, 0, 1} code instead of a
+// rounded approximation of its full range. Nodes whose weight is not
+// structurally ternary are left untouched by this call -- combine with
+// ``QuantizeDynamic`` (which fires on any constant float32 weight, ternary or
+// not) if a model mixes ternary and ordinary layers and both should be
+// quantized. See ``passes/dynamic_quantize_ternary_matmul.h`` for the rewrite
+// itself and the rewrite's relationship to ``QuantizeDynamic``.
+//
+// Unlike ``Simplify``, this does not run shape inference, constant folding or
+// any other simplification pass -- it applies exactly this one rewrite, once,
+// to a copy of ``model`` (which is left untouched) and returns the result.
+onnx::ModelProto QuantizeTernary(const onnx::ModelProto& model);
+
+// Weight-only quantizes every MatMul, every "vanilla" Gemm (transA=0,
+// alpha=1, beta=1), and every Conv, whose weight is a constant float32
+// tensor (2-D for MatMul/Gemm, rank >= 3 for Conv): the weight is quantized
+// to INT8 ahead of time (per output channel, symmetric, from its static
+// values -- same as ``QuantizeDynamic``/``QuantizeStatic``), inserting a
+// single ``DequantizeLinear`` in its place. Unlike both of those, the
+// activation is never touched -- no ``DynamicQuantizeLinear``, no
+// QuantizeLinear/DequantizeLinear pair, no calibration data of any kind --
+// so this only shrinks the model's weight storage; it does not change
+// activation precision or add any runtime quantize/dequantize cost on the
+// activation path. This mirrors the "weight-only quantization" scheme most
+// real-world weight-heavy ONNX deployments (large linear/embedding layers in
+// transformer-style decoders, for example) actually ship, as opposed to full
+// activation quantization. See ``passes/weight_only_quantize_matmul.h`` and
+// ``passes/weight_only_quantize_conv.h`` for the rewrites themselves.
+//
+// Unlike ``Simplify``, this does not run shape inference, constant folding or
+// any other simplification pass -- it applies exactly these rewrites, once
+// each, to a copy of ``model`` (which is left untouched) and returns the
+// result. Nodes that do not match (dynamic or unsupported-rank weights,
+// non-default Gemm attributes, non-float32 operands, an opset older than 13)
+// are left as-is.
+onnx::ModelProto QuantizeWeightOnly(const onnx::ModelProto& model);
+
 // Lists the activation tensor names that ``QuantizeStatic`` could quantize in
 // ``model`` -- the first input of every MatMul, every "vanilla" Gemm
 // (transA=0, alpha=1, beta=1), and every Conv, whose weight is a constant

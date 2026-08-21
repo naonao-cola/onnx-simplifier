@@ -402,6 +402,84 @@ def quantize_dynamic(model: Union[str, onnx.ModelProto]) -> onnx.ModelProto:
     return onnx.load_from_string(C.quantize_dynamic(model.SerializeToString()))
 
 
+def quantize_ternary(model: Union[str, onnx.ModelProto]) -> onnx.ModelProto:
+    """
+    Dynamically quantize every MatMul, and every "vanilla" Gemm (transA=0,
+    alpha=1, beta=1), whose constant weight is *structurally ternary*: every
+    element of every output column is one of ``{-s, 0, +s}`` for that
+    column's own scale ``s``. This is the weight representation `BitNet
+    b1.58 <https://github.com/microsoft/BitNet>`_ and similar ternary-weight
+    models use internally, which a generic ONNX export still stores as a
+    dense float32 initializer -- 16x larger than it needs to be, and running
+    on the generic float MatMul kernel.
+
+    A detected node gets exactly :func:`quantize_dynamic`'s rewrite
+    (``DynamicQuantizeLinear`` + ``MatMulInteger`` + dequantize) -- the only
+    difference is that the weight's INT8 encoding here is a **lossless**
+    ``{-1, 0, 1}`` code (derived structurally, not by rounding), rather than
+    a rounded approximation of the weight's full dynamic range. A node whose
+    weight is not structurally ternary is left untouched by this call --
+    combine with :func:`quantize_dynamic` (which fires on any constant
+    float32 weight) if a model mixes ternary and ordinary layers and both
+    should be quantized.
+
+    This only targets standard ONNX operators, like the rest of onnxsim's
+    quantization passes -- not a contrib op like
+    ``com.microsoft::MatMulNBits``, which would pack the ternary codes down
+    to 2 bits for a further ~4x weight-storage saving on top of what this
+    function gets, at the cost of only running on onnxruntime builds that
+    ship it. See docs/ternary-quantization.md.
+
+    This is a single, self-contained graph rewrite: unlike :func:`simplify`,
+    it does not run shape inference, constant folding, or any other pass.
+    Nodes that do not match (dynamic or non-2-D weights, non-default Gemm
+    attributes, non-float32 operands, a non-ternary weight, an opset older
+    than 11) are left untouched. Consider calling :func:`simplify` before
+    and/or after to clean up the graph.
+
+    :param model: onnx ModelProto object or file path
+    :returns: the quantized onnx ModelProto
+    """
+    if isinstance(model, str):
+        model = onnx.load(model, load_external_data=False)
+    return onnx.load_from_string(C.quantize_ternary(model.SerializeToString()))
+
+
+def quantize_weight_only(model: Union[str, onnx.ModelProto]) -> onnx.ModelProto:
+    """
+    Weight-only quantize every MatMul, every "vanilla" Gemm (transA=0,
+    alpha=1, beta=1), and every Conv, whose weight is a constant float32
+    tensor (2-D for MatMul/Gemm, rank >= 3 for Conv).
+
+    The weight is quantized to INT8 ahead of time (per output channel,
+    symmetric, from its static values -- the same scheme
+    :func:`quantize_dynamic`/:func:`quantize_static` use), inserting a single
+    ``DequantizeLinear`` in its place. Unlike both of those, the activation is
+    never touched: no ``DynamicQuantizeLinear``, no QuantizeLinear/
+    DequantizeLinear pair, no calibration data of any kind. This only shrinks
+    the model's weight storage (~4x for the quantized weights); it does not
+    change activation precision or add any runtime quantize/dequantize cost
+    to the activation path. This mirrors the "weight-only quantization"
+    scheme most real-world weight-heavy ONNX deployments -- large linear/
+    embedding layers in transformer-style decoders, for example -- actually
+    ship, as opposed to full activation quantization.
+
+    This is a single, self-contained graph rewrite: unlike :func:`simplify`,
+    it does not run shape inference, constant folding, or any other pass.
+    Nodes that do not match (dynamic or unsupported-rank weights, non-default
+    Gemm attributes, non-float32 operands, an opset older than 13 -- which
+    ``DequantizeLinear``'s per-channel ``axis`` requires) are left untouched.
+    Consider calling :func:`simplify` before and/or after to clean up the
+    graph.
+
+    :param model: onnx ModelProto object or file path
+    :returns: the quantized onnx ModelProto
+    """
+    if isinstance(model, str):
+        model = onnx.load(model, load_external_data=False)
+    return onnx.load_from_string(C.quantize_weight_only(model.SerializeToString()))
+
+
 def simplify(
     model: Union[str, onnx.ModelProto],
     check_n: int = 0,
@@ -1259,6 +1337,27 @@ def main():
         action="store_true",
     )
     parser.add_argument(
+        "--ternary-quantize",
+        help="After simplifying, dynamically quantize MatMul/Gemm nodes "
+        "whose constant weight is structurally ternary ({-s, 0, +s} per "
+        "output column, e.g. BitNet b1.58) using a lossless ternary weight "
+        "encoding, rather than quantize_dynamic's rounded full-range one. "
+        "Nodes whose weight is not ternary are left untouched -- combine "
+        "with --dynamic-quantize to also quantize those. See "
+        "onnxsim.quantize_ternary.",
+        action="store_true",
+    )
+    parser.add_argument(
+        "--weight-only-quantize",
+        help="After simplifying, weight-only quantize MatMul/Gemm/Conv "
+        "weights to INT8 (per output channel, symmetric, from their static "
+        "values), inserting a single DequantizeLinear per weight. "
+        "Activations are never touched -- no calibration data is needed and "
+        "no quantize/dequantize node is added on the activation path. See "
+        "onnxsim.quantize_weight_only.",
+        action="store_true",
+    )
+    parser.add_argument(
         "--static-quantize",
         help="After simplifying, statically (calibration-based) quantize "
         "MatMul/Gemm/Conv weights and activations to INT8/uint8, inserting a "
@@ -1500,6 +1599,14 @@ def main():
     if args.dynamic_quantize:
         print("Dynamically quantizing MatMul/Gemm weights to INT8...")
         model_opt = quantize_dynamic(model_opt)
+
+    if args.ternary_quantize:
+        print("Dynamically quantizing structurally-ternary MatMul/Gemm weights...")
+        model_opt = quantize_ternary(model_opt)
+
+    if args.weight_only_quantize:
+        print("Weight-only quantizing MatMul/Gemm/Conv weights to INT8...")
+        model_opt = quantize_weight_only(model_opt)
 
     if args.static_quantize:
         from . import calibration

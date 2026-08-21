@@ -12,6 +12,8 @@ from onnxsim.onnx_simplifier import (
     import_safetensors,
     main,
     quantize_dynamic,
+    quantize_ternary,
+    quantize_weight_only,
     simplify,
 )
 
@@ -20,6 +22,8 @@ from .version import version as __version__
 __all__ = [
     "simplify",
     "quantize_dynamic",
+    "quantize_ternary",
+    "quantize_weight_only",
     "quantize_static",
     "calibrate",
     "generate_random_calibration_data",

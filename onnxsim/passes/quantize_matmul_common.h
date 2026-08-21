@@ -185,6 +185,72 @@ inline void QuantizeWeightPerChannelInPlace(const Tensor& w_t,
   scale_out.floats() = std::move(scale);
 }
 
+// Attempts a *ternary* decomposition of `w_t` (a 2-D float32 constant, laid
+// out as [N, K] when `transposed` else [K, N]): each output column may use
+// only one of {-s, 0, +s} for a single per-column scale `s` -- the weight
+// representation BitNet b1.58 (https://github.com/microsoft/BitNet) and
+// similar ternary-weight models use, which a generic ONNX export still
+// stores as a dense float32 initializer. Returns false (leaving `q_out`/
+// `scale_out` unspecified) when any element of any column is not within
+// `rtol` of its column's {-s, 0, +s}, or when every column is entirely zero
+// (carries no ternary signal, so there is nothing to gain by rewriting it).
+// On success, `q_out` holds the weight in the non-transposed [K, N] layout
+// MatMulInteger's B operand needs (int8, values in {-1, 0, 1}), and
+// `scale_out`[j] is output channel j's scale (an all-zero column gets an
+// arbitrary scale of 1.0, matching its all-zero codes).
+inline bool TryQuantizeWeightTernaryKN(const Tensor& w_t, bool transposed,
+                                       Tensor& q_out, Tensor& scale_out,
+                                       float rtol = 1e-5f) {
+  const auto& sizes = w_t.sizes();
+  const int64_t dim0 = sizes[0];
+  const int64_t dim1 = sizes[1];
+  const int64_t K = transposed ? dim1 : dim0;
+  const int64_t N = transposed ? dim0 : dim1;
+
+  const std::vector<float> data = ReadFloatMatrix(w_t);
+  auto at = [&](int64_t k, int64_t n) {
+    return transposed ? data[n * K + k] : data[k * N + n];
+  };
+
+  std::vector<float> scale(static_cast<size_t>(N), 0.0f);
+  for (int64_t k = 0; k < K; ++k) {
+    for (int64_t n = 0; n < N; ++n) {
+      scale[n] = std::max(scale[n], std::fabs(at(k, n)));
+    }
+  }
+  bool any_nonzero = false;
+  for (const float s : scale) {
+    any_nonzero |= s > 0.0f;
+  }
+  if (!any_nonzero) {
+    return false;
+  }
+  for (float& s : scale) {
+    if (s == 0.0f) {
+      s = 1.0f;  // All-zero column: arbitrary scale, codes are all 0 anyway.
+    }
+  }
+
+  q_out.elem_type() = TensorProto_DataType_INT8;
+  q_out.sizes() = {K, N};
+  q_out.int32s().resize(static_cast<size_t>(K * N));
+  for (int64_t k = 0; k < K; ++k) {
+    for (int64_t n = 0; n < N; ++n) {
+      const float normalized = at(k, n) / scale[n];
+      const float code = std::round(normalized);
+      if (std::fabs(code) > 1.0f || std::fabs(normalized - code) > rtol) {
+        return false;  // Not ternary: bail before mutating the caller's q_out.
+      }
+      q_out.int32s()[k * N + n] = static_cast<int32_t>(code);
+    }
+  }
+
+  scale_out.elem_type() = TensorProto_DataType_FLOAT;
+  scale_out.sizes() = {N};
+  scale_out.floats() = std::move(scale);
+  return true;
+}
+
 }  // namespace onnxsim_passes
 }  // namespace optimization
 }  // namespace ONNX_NAMESPACE

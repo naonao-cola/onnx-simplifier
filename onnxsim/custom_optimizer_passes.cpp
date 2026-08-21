@@ -10,6 +10,7 @@
 
 #include "onnxoptimizer/optimize.h"
 #include "passes/dynamic_quantize_matmul.h"
+#include "passes/dynamic_quantize_ternary_matmul.h"
 #include "passes/eliminate_nop_dropout.h"
 #include "passes/eliminate_reshape_around_elementwise.h"
 #include "passes/fuse_add_bias_into_conv.h"
@@ -25,6 +26,8 @@
 #include "passes/fuse_rms_norm.h"
 #include "passes/static_quantize_conv.h"
 #include "passes/static_quantize_matmul.h"
+#include "passes/weight_only_quantize_conv.h"
+#include "passes/weight_only_quantize_matmul.h"
 
 namespace onnxsim {
 
@@ -60,6 +63,7 @@ void RegisterCustomOptimizerPasses() {
 
     // onnxsim-only rewrites (no built-in of the same name today).
     RegisterOrReplace<p::DynamicQuantizeMatMul>(registry);
+    RegisterOrReplace<p::DynamicQuantizeTernaryMatMul>(registry);
     RegisterOrReplace<p::EliminateReshapeAroundElementwise>(registry);
     RegisterOrReplace<p::FuseConsecutiveMul>(registry);
     RegisterOrReplace<p::FuseGelu>(registry);
@@ -70,6 +74,8 @@ void RegisterCustomOptimizerPasses() {
     RegisterOrReplace<p::FuseRMSNorm>(registry);
     RegisterOrReplace<p::StaticQuantizeConv>(registry);
     RegisterOrReplace<p::StaticQuantizeMatMul>(registry);
+    RegisterOrReplace<p::WeightOnlyQuantizeConv>(registry);
+    RegisterOrReplace<p::WeightOnlyQuantizeMatMul>(registry);
 
     // onnxsim's patched versions of built-in onnxoptimizer passes. These
     // overwrite the registry entries the submodule registers under the same
