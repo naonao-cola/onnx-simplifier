@@ -1,5 +1,6 @@
 import copy
 import dataclasses
+import math
 import warnings
 from collections import defaultdict
 from typing import (
@@ -15,8 +16,9 @@ from typing import (
     Union,
 )
 
+import numpy as np
 import onnx
-from onnx import defs, helper, shape_inference
+from onnx import defs, helper, numpy_helper, shape_inference
 from onnx.external_data_helper import ExternalDataInfo, uses_external_data
 from rich import print
 from rich.table import Table
@@ -42,6 +44,9 @@ __all__ = [
     "NodeDiffEntry",
     "diff_graphs",
     "print_graph_diff",
+    "WeightQuantizationError",
+    "weight_quantization_error",
+    "print_weight_quantization_error",
 ]
 
 # metadata_props keys written by ``annotate_metadata`` are namespaced with this
@@ -433,9 +438,11 @@ def _schema_function_body(
     if any(name and types.get(name) is None for name in node.input):
         return None
     input_types = [
-        types[name].SerializeToString()
-        if name
-        else onnx.TypeProto().SerializeToString()
+        (
+            types[name].SerializeToString()
+            if name
+            else onnx.TypeProto().SerializeToString()
+        )
         for name in node.input
     ]
     try:
@@ -1162,3 +1169,265 @@ def annotate_metadata(
     for key in ("macs", "flops", "mem_access"):
         _set_metadata(work.graph, prefix + key, _metric_str(totals[key]))
     return work
+
+
+# --------------------------------------------------------------------------- #
+# Weight quantization error: original float weight vs. its dequantized
+# (quantize -> dequantize round-trip) reconstruction
+# --------------------------------------------------------------------------- #
+@dataclasses.dataclass(frozen=True)
+class WeightQuantizationError:
+    """Accuracy metrics for one weight quantized by :func:`onnxsim.quantize_static`,
+    comparing the original float weight against ``(w_q - zero_point) * scale`` --
+    the inverse of the quantize step, i.e. rematerializing the weight through its
+    own quantization parameters -- computed by :func:`weight_quantization_error`.
+    """
+
+    node: str  # the quantized node's name, or its output name(s) if unnamed
+    weight_name: str  # the original float weight's initializer/tensor name
+    shape: Tuple[int, ...]
+    axis: int  # the per-channel quantization axis
+    mse: float
+    max_abs_error: float
+    relative_l2: float  # ||w - dequant||_2 / ||w||_2
+    cosine_similarity: float
+    sqnr_db: float  # 20*log10(||w||_2 / ||w - dequant||_2); +inf if exact
+    per_channel_relative_l2: List[float]  # one entry per channel along `axis`
+
+
+def _resolve_constant(graph: onnx.GraphProto, name: str) -> Optional[onnx.TensorProto]:
+    """The constant ``TensorProto`` backing value ``name`` -- an initializer, or a
+    ``Constant`` node's ``value`` attribute -- or ``None`` if ``name`` is not
+    constant (or not found).
+    """
+    for initializer in graph.initializer:
+        if initializer.name == name:
+            return initializer
+    for node in graph.node:
+        if node.op_type == "Constant" and node.output and node.output[0] == name:
+            for attr in node.attribute:
+                if attr.name == "value" and attr.HasField("t"):
+                    return attr.t
+    return None
+
+
+def _broadcast_along_axis(values: np.ndarray, ndim: int, axis: int) -> np.ndarray:
+    """Reshape a per-channel 1-D array (or a scalar) so it broadcasts against an
+    ``ndim``-D array along ``axis`` -- turns ``DequantizeLinear``'s ``scale`` /
+    ``zero_point`` (one value per channel, or a single scalar for per-tensor
+    quantization) into the shape numpy needs to apply it channel-wise.
+    """
+    values = np.asarray(values, dtype=np.float64)
+    if values.ndim == 0:
+        return values
+    shape = [1] * ndim
+    shape[axis] = values.shape[0]
+    return values.reshape(shape)
+
+
+def _tensor_error_metrics(
+    original: np.ndarray, dequantized: np.ndarray, axis: int
+) -> Tuple[float, float, float, float, float, List[float]]:
+    """``(mse, max_abs_error, relative_l2, cosine_similarity, sqnr_db,
+    per_channel_relative_l2)`` between ``original`` and ``dequantized`` (same
+    shape), the last computed per channel along ``axis``.
+    """
+    orig = original.astype(np.float64)
+    deq = dequantized.astype(np.float64)
+    diff = deq - orig
+
+    mse = float(np.mean(diff**2)) if diff.size else 0.0
+    max_abs_error = float(np.max(np.abs(diff))) if diff.size else 0.0
+
+    norm_orig = float(np.linalg.norm(orig))
+    norm_diff = float(np.linalg.norm(diff))
+    if norm_orig > 0:
+        relative_l2 = norm_diff / norm_orig
+        sqnr_db = (
+            math.inf if norm_diff == 0 else 20.0 * math.log10(norm_orig / norm_diff)
+        )
+    else:
+        # An all-zero original weight: any reconstruction error is undefined as a
+        # *relative* quantity, so report exact-zero as perfect and anything else
+        # as unbounded rather than dividing by zero.
+        relative_l2 = 0.0 if norm_diff == 0 else math.inf
+        sqnr_db = math.inf if norm_diff == 0 else -math.inf
+
+    norm_deq = float(np.linalg.norm(deq))
+    denom = norm_orig * norm_deq
+    cosine_similarity = (
+        float(np.dot(orig.ravel(), deq.ravel()) / denom) if denom > 0 else 1.0
+    )
+
+    moved_orig = np.moveaxis(orig, axis, 0)
+    moved_deq = np.moveaxis(deq, axis, 0)
+    per_channel_relative_l2 = []
+    for c in range(moved_orig.shape[0]):
+        c_norm_orig = float(np.linalg.norm(moved_orig[c]))
+        c_norm_diff = float(np.linalg.norm(moved_deq[c] - moved_orig[c]))
+        if c_norm_orig > 0:
+            per_channel_relative_l2.append(c_norm_diff / c_norm_orig)
+        else:
+            per_channel_relative_l2.append(0.0 if c_norm_diff == 0 else math.inf)
+
+    return (
+        mse,
+        max_abs_error,
+        relative_l2,
+        cosine_similarity,
+        sqnr_db,
+        per_channel_relative_l2,
+    )
+
+
+def weight_quantization_error(
+    model_before: onnx.ModelProto, model_after: onnx.ModelProto
+) -> List[WeightQuantizationError]:
+    """Measure how much each weight :func:`onnxsim.quantize_static` (the QDQ,
+    calibration-based pass) perturbed, by rematerializing every quantized weight
+    through its ``DequantizeLinear`` -- ``w_dequant = (w_q - zero_point) * scale``,
+    the inverse of the quantize step -- and diffing that reconstruction against
+    the original float weight from ``model_before``.
+
+    ``model_after`` must be the direct result of running
+    :func:`onnxsim.quantize_static` on ``model_before`` (or on a simplified copy
+    of it -- node *identity*, not exact byte content, is what matters here): a
+    ``Conv``/``MatMul``/``Gemm`` node is matched between the two models by its
+    output name, since ``quantize_static`` never renames or removes these nodes,
+    only rewires their ``X``/``W`` inputs (see
+    ``onnxsim/passes/static_quantize_matmul.h`` and ``static_quantize_conv.h``).
+    A match is only reported when the matched node's weight input traces back to
+    a ``DequantizeLinear`` whose inputs are a constant int8/uint8 tensor and a
+    constant float scale -- i.e. only where ``quantize_static`` actually
+    quantized that weight.
+
+    Not applicable to :func:`onnxsim.quantize_dynamic`: that pass replaces the
+    MatMul/Gemm node itself with ``MatMulInteger`` rather than dequantizing the
+    weight back to float in the graph, so there is no ``DequantizeLinear`` to
+    walk back through here. Its quantized weight and per-channel scale are still
+    plain initializers though (the ``B`` input of the ``MatMulInteger`` node, and
+    the constant operand of the ``Mul`` that combines it with the activation's
+    runtime-computed scale) -- extract them by name and feed
+    ``(w_q * w_scale)`` through the same reconstruction by hand if needed.
+
+    :param model_before: the float model, before quantization
+    :param model_after: ``onnxsim.quantize_static(model_before, ...)``'s result
+    :returns: one :class:`WeightQuantizationError` per matched weight, in the
+            order its node appears in ``model_after``
+    """
+    graph_before = model_before.graph
+    graph_after = model_after.graph
+    nodes_before = {tuple(n.output): n for n in graph_before.node if n.output}
+
+    results: List[WeightQuantizationError] = []
+    for node in graph_after.node:
+        if node.op_type not in ("Conv", "MatMul", "Gemm") or len(node.input) < 2:
+            continue
+        before_node = nodes_before.get(tuple(node.output))
+        if before_node is None or before_node.op_type != node.op_type:
+            continue
+
+        dq = next(
+            (
+                n
+                for n in graph_after.node
+                if n.op_type == "DequantizeLinear"
+                and n.output
+                and n.output[0] == node.input[1]
+            ),
+            None,
+        )
+        if dq is None or len(dq.input) < 2:
+            continue
+
+        wq_t = _resolve_constant(graph_after, dq.input[0])
+        ws_t = _resolve_constant(graph_after, dq.input[1])
+        w_orig_t = _resolve_constant(graph_before, before_node.input[1])
+        if wq_t is None or ws_t is None or w_orig_t is None:
+            continue
+        if wq_t.data_type not in (
+            onnx.TensorProto.INT8,
+            onnx.TensorProto.UINT8,
+        ):
+            continue
+
+        wq = numpy_helper.to_array(wq_t)
+        w_orig = numpy_helper.to_array(w_orig_t)
+        if wq.shape != w_orig.shape:
+            continue  # unexpected shape mismatch; skip rather than guess
+
+        axis = 1
+        for attr in dq.attribute:
+            if attr.name == "axis":
+                axis = attr.i
+        axis %= wq.ndim
+
+        zero_point = np.array(0.0)
+        if len(dq.input) >= 3 and dq.input[2]:
+            zp_t = _resolve_constant(graph_after, dq.input[2])
+            if zp_t is not None:
+                zero_point = numpy_helper.to_array(zp_t)
+
+        ws = numpy_helper.to_array(ws_t)
+        w_dequant = (
+            wq.astype(np.float64) - _broadcast_along_axis(zero_point, wq.ndim, axis)
+        ) * _broadcast_along_axis(ws, wq.ndim, axis)
+
+        (
+            mse,
+            max_abs_error,
+            relative_l2,
+            cosine_similarity,
+            sqnr_db,
+            per_channel_relative_l2,
+        ) = _tensor_error_metrics(w_orig, w_dequant, axis)
+
+        results.append(
+            WeightQuantizationError(
+                node=before_node.name or "/".join(before_node.output),
+                weight_name=before_node.input[1],
+                shape=tuple(w_orig.shape),
+                axis=axis,
+                mse=mse,
+                max_abs_error=max_abs_error,
+                relative_l2=relative_l2,
+                cosine_similarity=cosine_similarity,
+                sqnr_db=sqnr_db,
+                per_channel_relative_l2=per_channel_relative_l2,
+            )
+        )
+    return results
+
+
+def print_weight_quantization_error(
+    results: List[WeightQuantizationError], limit: int = 50
+) -> None:
+    """Pretty-print :func:`weight_quantization_error`'s results as a table,
+    worst (highest relative L2 error) weight first, capped at ``limit`` rows (with
+    a "... and N more" line) so a large model's report stays readable.
+    """
+    table = Table()
+    table.add_column("Node")
+    table.add_column("Weight")
+    table.add_column("Shape")
+    table.add_column("MSE")
+    table.add_column("Max |Δ|")
+    table.add_column("Relative L2")
+    table.add_column("Cosine Sim.")
+    table.add_column("SQNR (dB)")
+
+    ordered = sorted(results, key=lambda r: r.relative_l2, reverse=True)
+    for r in ordered[:limit]:
+        table.add_row(
+            r.node,
+            r.weight_name,
+            "x".join(str(d) for d in r.shape),
+            f"{r.mse:.3e}",
+            f"{r.max_abs_error:.3e}",
+            f"{r.relative_l2:.4f}",
+            f"{r.cosine_similarity:.6f}",
+            "inf" if math.isinf(r.sqnr_db) else f"{r.sqnr_db:.1f}",
+        )
+    print(table)
+    if len(ordered) > limit:
+        print(Text(f"... and {len(ordered) - limit} more", style="dim"))
