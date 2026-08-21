@@ -42,9 +42,30 @@ get the real benefit; `CCACHE_BASEDIR` does not fix this specific case since
 the differing path segment is the directory name itself, not just its
 absolute prefix.
 
-Not yet exercised: whether `onnx-finetune-wasm.wasm` actually *runs*
-correctly in a browser (`example/`) -- the build compiles and links clean,
-but nothing has loaded it in a JS engine yet.
+**Runtime: partially exercised, currently flaky.** Loaded the compiled
+module in Node (bundled with emsdk, not a browser) and ran a real training
+loop against the same toy artifacts the native CLI's example uses. First
+attempt: the full 20-epoch loop ran and the loss converged
+(5.06 -> ~0.00001, matching the native CLI almost exactly) -- genuine
+confirmation the training loop executes correctly in wasm -- but
+`exportModel()` then failed with an undecodable raw exception pointer
+instead of a catchable JS error. Adding `DISABLE_EXCEPTION_CATCHING=0` to
+`onnx-finetune-wasm`'s own link flags looked like the fix (that setting
+lives on `onnxruntime_webassembly`'s LINK_FLAGS in
+`onnxruntime_webassembly.cmake`, which is silently ignored once that target
+is a bundled `STATIC IMPORTED` library rather than the final linked module)
+-- but `build.ninja` shows the flag was already present globally via ORT's
+own wasm CXX flags both before and after that change, so it wasn't actually
+the fix. Two rebuilds since then (with the flag change, then again with
+constructor/TrainStep try/catch diagnostics added) both fail *immediately*,
+before any training step runs at all -- a regression from the first
+successful run, cause not yet identified. Leading hypothesis, unconfirmed:
+JSEP/WebGPU EP init probing `navigator.gpu` during session construction,
+which doesn't exist in Node (only real browsers) -- would need a JSEP-off
+comparison build to confirm (a ~25min rebuild, not a quick check, since
+`-DUSE_JSEP=1` is baked into many cached object files). Whether it runs
+correctly in an actual browser (`example/`, where `navigator.gpu` is real)
+is untested.
 
 ## Design
 
