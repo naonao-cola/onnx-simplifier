@@ -573,6 +573,127 @@ def quantize_fp16(
     )
 
 
+def quantize_bf16(
+    model: Union[str, onnx.ModelProto], keep_io_types: bool = True
+) -> onnx.ModelProto:
+    """
+    Convert every float32 weight -- and, by default, every internal
+    activation -- in ``model`` to bfloat16.
+
+    The same calibration-free, whole-graph conversion as
+    :func:`quantize_fp16`, just to a different narrow floating-point format:
+    bfloat16 keeps float32's full 8-bit exponent range and narrows only the
+    mantissa (7 bits instead of float32's 23), so every finite float32 value
+    maps to a finite bfloat16 value -- unlike float16, no clamping is ever
+    needed.
+
+    With ``keep_io_types`` (the default ``True``), the model's own external
+    input/output types stay float32 -- a ``Cast`` is inserted right after
+    each float32 graph input and right before each float32 graph output, so
+    the model's public interface is unchanged and only its internal weights
+    and compute switch to bfloat16. Pass ``False`` to redeclare graph
+    inputs/outputs bfloat16 directly instead (no casts; callers must then
+    feed/read bfloat16 tensors).
+
+    No node's op_type or attributes are touched, and there is no per-op
+    bfloat16-support check: an ordinary feedforward graph ends up computing
+    end-to-end in bfloat16 as a side effect of every value along the way now
+    being bfloat16-typed, since almost every ONNX op propagates its input
+    dtype to its output dtype. A model containing an op with no bfloat16
+    kernel in the runtime it is deployed on will fail at *execution* time,
+    not at conversion time here.
+
+    This is a single, self-contained graph rewrite: unlike :func:`simplify`,
+    it does not run shape inference, constant folding, or any other pass.
+    Only the top-level graph is converted -- nodes inside control-flow
+    subgraphs (If/Loop/Scan bodies) are left untouched -- and an initializer
+    whose name is also a graph input (the rarely-used ONNX "optional input
+    with a default value" convention) is left alone entirely. Consider
+    calling :func:`simplify` before and/or after to clean up the graph.
+
+    :param model: onnx ModelProto object or file path
+    :param keep_io_types: keep the graph's own external input/output types
+            at float32 (inserting boundary Cast nodes) instead of
+            redeclaring them bfloat16 directly
+    :returns: the converted onnx ModelProto
+    """
+    if isinstance(model, str):
+        model = onnx.load(model, load_external_data=False)
+    return onnx.load_from_string(
+        C.quantize_bf16(model.SerializeToString(), keep_io_types)
+    )
+
+
+def quantize_fp8(
+    model: Union[str, onnx.ModelProto],
+    format: str = "e4m3",
+    keep_io_types: bool = True,
+) -> onnx.ModelProto:
+    """
+    Convert every float32 weight -- and, by default, every internal
+    activation -- in ``model`` to an 8-bit floating-point format.
+
+    The same calibration-free, whole-graph conversion as
+    :func:`quantize_fp16`/:func:`quantize_bf16`, just to a much narrower
+    floating-point format. ``format`` selects which one:
+
+    - ``"e4m3"`` (the default): E4M3FN -- 4 exponent bits, 3 mantissa bits,
+      max finite magnitude 448. No infinities. Typically used for weights.
+    - ``"e5m2"``: 5 exponent bits, 2 mantissa bits, max finite magnitude
+      57344 -- a dynamic range similar to float16. Typically used for
+      gradients.
+
+    Both are converted with saturation: a value whose magnitude exceeds the
+    target format's max finite value (including +-Inf itself) is clamped to
+    it rather than mapped to an infinity/NaN, the same design choice
+    :func:`quantize_fp16` makes for its own out-of-range values. Rounding is
+    round-to-nearest, ties-to-even -- float8's mantissa is only 2-3 bits
+    wide, so exact ties are common enough on real data that the simpler
+    ties-away-from-zero rule :func:`quantize_fp16`/:func:`quantize_bf16` use
+    is not a good enough approximation here.
+
+    With ``keep_io_types`` (the default ``True``), the model's own external
+    input/output types stay float32 -- a ``Cast`` is inserted right after
+    each float32 graph input and right before each float32 graph output, so
+    the model's public interface is unchanged and only its internal weights
+    and compute switch to the target float8 format. Pass ``False`` to
+    redeclare graph inputs/outputs in that format directly instead (no
+    casts; callers must then feed/read float8 tensors).
+
+    No node's op_type or attributes are touched, and there is no per-op
+    float8-support check: an ordinary feedforward graph ends up computing
+    end-to-end in the target format as a side effect of every value along
+    the way now being that format, since almost every ONNX op propagates its
+    input dtype to its output dtype. A model containing an op with no float8
+    kernel in the runtime it is deployed on will fail at *execution* time,
+    not at conversion time here -- and as of most current runtimes, float8
+    compute kernel coverage is narrower than even bfloat16's, so expect this
+    to mostly be useful for storage-size reduction and for deployment
+    targets with real float8 kernel support today.
+
+    This is a single, self-contained graph rewrite: unlike :func:`simplify`,
+    it does not run shape inference, constant folding, or any other pass.
+    Only the top-level graph is converted -- nodes inside control-flow
+    subgraphs (If/Loop/Scan bodies) are left untouched -- and an initializer
+    whose name is also a graph input (the rarely-used ONNX "optional input
+    with a default value" convention) is left alone entirely. Consider
+    calling :func:`simplify` before and/or after to clean up the graph.
+    Casting to/from these types needs opset >= 19.
+
+    :param model: onnx ModelProto object or file path
+    :param format: target float8 format, ``"e4m3"`` (default) or ``"e5m2"``
+    :param keep_io_types: keep the graph's own external input/output types
+            at float32 (inserting boundary Cast nodes) instead of
+            redeclaring them in the target format directly
+    :returns: the converted onnx ModelProto
+    """
+    if isinstance(model, str):
+        model = onnx.load(model, load_external_data=False)
+    return onnx.load_from_string(
+        C.quantize_fp8(model.SerializeToString(), format, keep_io_types)
+    )
+
+
 def simplify(
     model: Union[str, onnx.ModelProto],
     check_n: int = 0,
@@ -1471,6 +1592,38 @@ def main():
         action="store_true",
     )
     parser.add_argument(
+        "--bf16-quantize",
+        help="After simplifying, convert every float32 weight (and, by "
+        "default, every internal activation) to bfloat16 -- no calibration "
+        "data needed, since bfloat16 is still a floating-point format, not "
+        "an integer scheme. Keeps float32's exponent range, so no clamping "
+        "is needed. The model's own external input/output types stay "
+        "float32 (a Cast is inserted at each boundary). See "
+        "onnxsim.quantize_bf16.",
+        action="store_true",
+    )
+    parser.add_argument(
+        "--fp8-quantize",
+        help="After simplifying, convert every float32 weight (and, by "
+        "default, every internal activation) to an 8-bit floating-point "
+        "format -- no calibration data needed, since float8 is still a "
+        "floating-point format, not an integer scheme. Out-of-range values "
+        "are saturated (clamped) rather than mapped to an infinity/NaN. The "
+        "model's own external input/output types stay float32 (a Cast is "
+        "inserted at each boundary). Needs opset >= 19. See "
+        "onnxsim.quantize_fp8.",
+        action="store_true",
+    )
+    parser.add_argument(
+        "--fp8-format",
+        help="Target float8 format for --fp8-quantize: 'e4m3' (E4M3FN, the "
+        "default -- max finite magnitude 448, typically used for weights) "
+        "or 'e5m2' (max finite magnitude 57344, a dynamic range similar to "
+        "float16, typically used for gradients).",
+        choices=["e4m3", "e5m2"],
+        default="e4m3",
+    )
+    parser.add_argument(
         "--static-quantize",
         help="After simplifying, statically (calibration-based) quantize "
         "MatMul/Gemm/Conv weights and activations to INT8/uint8, inserting a "
@@ -1739,6 +1892,16 @@ def main():
     if args.fp16_quantize:
         print("Converting float32 weights/activations to float16...")
         model_opt = quantize_fp16(model_opt)
+
+    if args.bf16_quantize:
+        print("Converting float32 weights/activations to bfloat16...")
+        model_opt = quantize_bf16(model_opt)
+
+    if args.fp8_quantize:
+        print(
+            f"Converting float32 weights/activations to float8 ({args.fp8_format})..."
+        )
+        model_opt = quantize_fp8(model_opt, format=args.fp8_format)
 
     if args.static_quantize:
         from . import calibration
