@@ -94,7 +94,9 @@ def test_optimum_export_produces_split_files(exported_dir):
     # graphs, not one, for exactly the encoder-once /
     # decode-step-run-in-a-host-loop reasons discussed for autoregressive
     # models generally.
-    names = {os.path.basename(f) for f in glob.glob(os.path.join(exported_dir, "*.onnx"))}
+    names = {
+        os.path.basename(f) for f in glob.glob(os.path.join(exported_dir, "*.onnx"))
+    }
     assert names == {
         "encoder_model.onnx",
         "decoder_model.onnx",
