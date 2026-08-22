@@ -21,8 +21,8 @@ between a graph TVM can ingest and one it can't.
 
 ``apache-tvm`` is heavy (~100MB wheel) and not part of onnxsim's test
 requirements, so the whole module is skipped when it is not installed. The
-dedicated ``tvm-integration`` CI workflow installs it and runs these tests;
-the regular build-and-test matrix skips them.
+dedicated ``backend-integration`` CI workflow installs it and runs these
+tests; the regular build-and-test matrix skips them.
 """
 
 import numpy as np

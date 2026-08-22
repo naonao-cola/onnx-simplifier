@@ -1,18 +1,22 @@
-name: Qualcomm Integration
+name: Execution Provider Integration
 
-# Compiles and runs onnxsim's output through the Qualcomm AI Runtime (QNN)
-# execution provider to catch simplifications that break the Qualcomm toolchain
-# (SNPE / QAIRT) — a graph the QNN converter can no longer compile, or whose
-# on-device result changed.
+# Compiles and runs onnxsim's output through onnxruntime execution providers
+# (Intel's OpenVINO EP, the Qualcomm AI Runtime / QNN EP) to catch
+# simplifications that break those toolchains, or whose on-device result
+# changed. Both run entirely on a stock x86-64 CPU runner via their pip EP
+# wheels (onnxruntime-openvino, onnxruntime-qnn) -- no discrete Intel/Qualcomm
+# hardware needed. See scripts/intel/README.md and scripts/qualcomm/README.md
+# for the fidelity tiers each covers.
 #
-# Runs entirely on a stock x86-64 CPU runner: the pip `onnxruntime-qnn` wheel's
-# HTP backend does the full offline graph compile (libHtpPrepare.so) and executes
-# in the x86 emulator, so no Snapdragon device is needed. See
-# scripts/qualcomm/README.md for the fidelity tiers this covers (and the SDK /
-# AI Hub paths for real-hardware numerics).
+# These two checks used to live in their own workflow files
+# (intel-integration.yml, qualcomm-integration.yml), each independently
+# building an identical cp312 manylinux wheel from the same commit via
+# cibuildwheel. Merged here into one workflow: the wheel is built once and
+# shared with both EP checks, exactly like model-regression.yml already does
+# for its shards.
 #
-# Scheduled + on demand (like the model regression), plus on PRs that touch the
-# harness so it stays valid.
+# Scheduled + on demand, plus on PRs that touch either harness so they stay
+# valid.
 
 on:
   schedule:
@@ -20,21 +24,23 @@ on:
   workflow_dispatch:
   pull_request:
     paths:
-      - ".github/workflows/qualcomm-integration.yml"
+      - ".github/workflows/ep-integration.yml"
+      - "scripts/intel/**"
       - "scripts/qualcomm/**"
       - "scripts/common/**"
+      - "tests/test_openvino_compat.py"
       - "tests/test_qnn_compat.py"
 
 concurrency:
-  group: qualcomm-integration-${{ github.ref }}
+  group: ep-integration-${{ github.ref }}
   cancel-in-progress: true
 
 permissions:
   contents: read
 
 jobs:
-  # Build onnxsim once from the current tree, so the QNN check runs against the
-  # actual simplifier in this branch rather than a released wheel.
+  # Build onnxsim once from the current tree, so both EP checks run against
+  # the actual simplifier in this branch rather than a released wheel.
   build:
     name: Build onnxsim wheel
     runs-on: ubuntu-24.04
@@ -60,12 +66,53 @@ jobs:
           CIBW_REPAIR_WHEEL_COMMAND_LINUX: "auditwheel repair -w {dest_dir} {wheel} --strip"
       - uses: actions/upload-artifact@v7
         with:
-          name: onnxsim-wheel-qnn
+          name: onnxsim-wheel-ep
           path: ./wheelhouse/*.whl
 
-  qnn-compat:
+  openvino:
+    name: OpenVINO compatibility check
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - uses: actions/download-artifact@v8
+        with:
+          name: onnxsim-wheel-ep
+          path: wheelhouse
+      - name: Install onnxsim wheel + onnxruntime-openvino
+        run: |
+          python -m pip install --upgrade pip
+          # onnxruntime-openvino replaces plain onnxruntime (bundles its own EP).
+          python -m pip install onnxruntime-openvino
+          python -m pip install wheelhouse/*.whl
+      # Run from runner.temp, not the checkout: the repo root contains the
+      # `onnxsim/` source dir (no compiled extension), which would shadow the
+      # installed wheel on `import onnxsim`. Reference the harness by absolute
+      # $GITHUB_WORKSPACE path. Same guard the QNN/model-regression workflows use.
+      - name: Show environment
+        working-directory: ${{ runner.temp }}
+        run: |
+          python -c "import onnxsim, onnxruntime as ort; print('onnxsim', onnxsim.__version__); print('onnxruntime', ort.__version__); print('providers', ort.get_available_providers())"
+      - name: Run OpenVINO compatibility check
+        working-directory: ${{ runner.temp }}
+        run: |
+          python "$GITHUB_WORKSPACE/scripts/intel/run_openvino_compat.py" \
+            --require-openvino \
+            --output openvino-compat.csv
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: openvino-compat-report
+          path: ${{ runner.temp }}/openvino-compat.csv
+          if-no-files-found: ignore
+
+  qnn:
     name: QNN compatibility check
-    needs: [build]
+    needs: build
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
@@ -76,7 +123,7 @@ jobs:
           python-version: "3.12"
       - uses: actions/download-artifact@v8
         with:
-          name: onnxsim-wheel-qnn
+          name: onnxsim-wheel-ep
           path: wheelhouse
       - name: Install onnxsim wheel + onnxruntime-qnn
         run: |

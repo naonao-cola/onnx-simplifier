@@ -4,7 +4,7 @@ name: AMD Integration
 # provider to catch simplifications that break the MIGraphX toolchain, or
 # whose on-device result changed.
 #
-# Unlike apple-integration.yml / intel-integration.yml, this workflow is
+# Unlike apple-integration.yml / ep-integration.yml, this workflow is
 # workflow_dispatch-ONLY and targets a [self-hosted, rocm] runner label that
 # this repository does not currently provision. MIGraphX has no CPU fallback
 # or host emulator (see scripts/amd/README.md) -- there is no way to exercise

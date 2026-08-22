@@ -15,7 +15,7 @@ ones would keep passing.
 
 ModelOpt (and its torch / onnxruntime dependencies) is heavy and not part of
 onnxsim's test requirements, so the whole module is skipped when it is not
-installed. The dedicated ``modelopt-integration`` CI workflow installs it and
+installed. The dedicated ``backend-integration`` CI workflow installs it and
 runs these tests; the regular build-and-test matrix skips them.
 """
 

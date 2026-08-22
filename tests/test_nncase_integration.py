@@ -28,8 +28,8 @@ a runtime-computed shape that a fixed-shape compiler would rather not see.
 nncase is a .NET application (it bundles ``Nncase.Compiler.dll`` and needs the
 .NET runtime) and is not part of onnxsim's test requirements, so the whole
 module is skipped when it is not installed. The dedicated
-``nncase-integration`` CI workflow installs it and runs these tests; the regular
-build-and-test matrix skips them.
+``backend-integration`` CI workflow installs it and runs these tests; the
+regular build-and-test matrix skips them.
 """
 
 import numpy as np
