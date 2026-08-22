@@ -31,6 +31,7 @@
         <nav class="section-nav" aria-label="Jump to section">
             <a href="#sec-parse">Parse graph</a>
             <a href="#sec-convert">Convert</a>
+            <a href="#sec-quantize">Quantize</a>
             <a href="#sec-visualize">Netron</a>
             <a href="#sec-dims">Dynamic dims</a>
             <a href="#sec-console">Console</a>
@@ -273,6 +274,72 @@ agraph (float[N] X) =&gt; (float[N] Y) {
             <div id="pass-list" style="height: 300px; overflow-y: auto; border: 1px solid var(--border); border-radius: var(--radius); padding: 4px; margin-top: 4px;"></div>
         </div>
         </section>
+        <h2 id="sec-quantize">Quantize a model</h2>
+        <div class="tool-panel">
+            <p class="tool-note">
+                Quantizes the currently loaded model (the uploaded file, or one
+                loaded from Hugging Face / a backend test case / a parsed text
+                graph above) with onnxsim's WebAssembly module, entirely in your
+                browser -- nothing is uploaded. Pick a method:
+            </p>
+            <ul class="tool-note">
+                <li><b>Dynamic</b> -- MatMul/Gemm weights are quantized to INT8
+                    ahead of time; the activation is quantized at inference time
+                    via <code>DynamicQuantizeLinear</code>. No calibration
+                    needed.</li>
+                <li><b>Ternary</b> -- like Dynamic, but for weights whose values
+                    are already (approximately) ternary
+                    (<code>{-1, 0, 1} × scale</code>), e.g. BitNet-style models.
+                    No calibration needed.</li>
+                <li><b>Weight-only</b> / <b>Weight-only INT4</b> -- only the
+                    weight is quantized (INT8 / block-wise INT4); the activation
+                    is never touched. No calibration needed, smallest download,
+                    but needs a runtime that supports on-the-fly dequantization.</li>
+                <li><b>Static (QDQ)</b> -- MatMul/Gemm/Conv are wrapped in
+                    <code>QuantizeLinear</code>/<code>DequantizeLinear</code>
+                    pairs using a <i>calibrated</i> activation range; the graph
+                    still computes in float32, and a QDQ-aware runtime fuses the
+                    pattern into an integer kernel. Needs calibration (below).</li>
+                <li><b>QOperator</b> -- MatMul/Gemm are replaced outright with
+                    <code>QLinearMatMul</code>, computing directly in int8; also
+                    needs a calibrated <i>output</i> range, not just the
+                    activation. Needs calibration (below).</li>
+            </ul>
+            <p class="tool-note">
+                <b>Calibration</b> (Static/QOperator only) runs the model over a
+                few batches of synthetic random input through
+                <a href="https://github.com/microsoft/onnxruntime" target="_blank" rel="noopener">onnxruntime-web</a>
+                (downloaded on demand, same as the "Run inference" panel below)
+                to observe each quantizable tensor's actual value range -- the
+                same approach <code>onnxsim.calibrate()</code> uses in Python,
+                just run here in the browser instead. Random data is a
+                reasonable stand-in when representative data isn't at hand, but
+                real calibration data (e.g. via the Python API) usually gives
+                tighter, more accurate ranges.
+            </p>
+            <div class="convert-modes quantize-modes">
+                <input type="radio" name="quantize-method" value="dynamic" id="quantize_dynamic" checked>
+                <label for="quantize_dynamic">Dynamic</label>
+                <input type="radio" name="quantize-method" value="ternary" id="quantize_ternary">
+                <label for="quantize_ternary">Ternary</label>
+                <input type="radio" name="quantize-method" value="weight_only" id="quantize_weight_only">
+                <label for="quantize_weight_only">Weight-only</label>
+                <input type="radio" name="quantize-method" value="weight_only_int4" id="quantize_weight_only_int4">
+                <label for="quantize_weight_only_int4">Weight-only INT4</label>
+                <input type="radio" name="quantize-method" value="static" id="quantize_static">
+                <label for="quantize_static">Static (QDQ)</label>
+                <input type="radio" name="quantize-method" value="qoperator" id="quantize_qoperator">
+                <label for="quantize_qoperator">QOperator (QLinearMatMul)</label>
+            </div>
+            <label for="quantize-samples">calibration samples (Static / QOperator only)</label>
+            <input type="number" id="quantize-samples" value="8" min="1" max="64" step="1" style="width: 4em;">
+            <div class="debug-actions">
+                <button id="quantize-button" type="button">Quantize</button>
+                <button id="quantize-download" type="button" style="display: none;">download model ↓</button>
+                <span id="quantize-status" class="tool-note"></span>
+            </div>
+        </div>
+        <script type="module" src="./quantize_ui.mjs"></script>
         <h2 id="sec-visualize">Visualize with Netron (before / after)</h2>
         <p>
             Renders the model graph with a self-hosted

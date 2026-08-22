@@ -816,6 +816,160 @@ std::vector<std::string> onnxoptimizer_fuse_elimination_passes() {
     return onnx::optimization::GetFuseAndEliminationPass();
 }
 
+// Converts parallel JS arrays -- ``names_ary`` (tensor names) and
+// ``ranges_flat_ary`` (a flat [min0, max0, min1, max1, ...] array, twice the
+// length of ``names_ary``) -- into the calibration-ranges map
+// QuantizeStatic/QuantizeQOperator take. Flat parallel arrays (rather than a
+// JS object/Map bound through embind) match the batched, positional
+// convention already used at this C++/JS boundary elsewhere (see
+// js_model_executor.cpp / docs/wasm_ort_web.md).
+std::unordered_map<std::string, std::pair<float, float>>
+ParseCalibrationRanges(em::val names_ary, em::val ranges_flat_ary) {
+    std::vector<std::string> names = em::vecFromJSArray<std::string>(names_ary);
+    std::vector<float> flat = em::vecFromJSArray<float>(ranges_flat_ary);
+    std::unordered_map<std::string, std::pair<float, float>> ranges;
+    ranges.reserve(names.size());
+    for (size_t i = 0; i < names.size() && 2 * i + 1 < flat.size(); ++i) {
+        ranges.emplace(names[i], std::make_pair(flat[2 * i], flat[2 * i + 1]));
+    }
+    return ranges;
+}
+
+em::val onnxsim_quantize_dynamic(const std::string& data) {
+    onnx::ModelProto xmodel;
+    if (!xmodel.ParseFromArray(data.data(), data.size())) {
+        std::cerr << "Parse failed" << std::endl;
+        return em::val::null();
+    }
+    try {
+        return SerializeModel(QuantizeDynamic(xmodel));
+    } catch (const std::exception& e) {
+        std::cerr << "quantize_dynamic error: " << e.what() << std::endl;
+        return em::val::null();
+    }
+}
+
+em::val onnxsim_quantize_ternary(const std::string& data) {
+    onnx::ModelProto xmodel;
+    if (!xmodel.ParseFromArray(data.data(), data.size())) {
+        std::cerr << "Parse failed" << std::endl;
+        return em::val::null();
+    }
+    try {
+        return SerializeModel(QuantizeTernary(xmodel));
+    } catch (const std::exception& e) {
+        std::cerr << "quantize_ternary error: " << e.what() << std::endl;
+        return em::val::null();
+    }
+}
+
+em::val onnxsim_quantize_weight_only(const std::string& data) {
+    onnx::ModelProto xmodel;
+    if (!xmodel.ParseFromArray(data.data(), data.size())) {
+        std::cerr << "Parse failed" << std::endl;
+        return em::val::null();
+    }
+    try {
+        return SerializeModel(QuantizeWeightOnly(xmodel));
+    } catch (const std::exception& e) {
+        std::cerr << "quantize_weight_only error: " << e.what() << std::endl;
+        return em::val::null();
+    }
+}
+
+em::val onnxsim_quantize_weight_only_int4(const std::string& data) {
+    onnx::ModelProto xmodel;
+    if (!xmodel.ParseFromArray(data.data(), data.size())) {
+        std::cerr << "Parse failed" << std::endl;
+        return em::val::null();
+    }
+    try {
+        return SerializeModel(QuantizeWeightOnlyInt4(xmodel));
+    } catch (const std::exception& e) {
+        std::cerr << "quantize_weight_only_int4 error: " << e.what() << std::endl;
+        return em::val::null();
+    }
+}
+
+// Both list_* functions below are used by the page to discover which tensor
+// names to calibrate (run the model over sample inputs and record each
+// tensor's observed min/max) before calling quantize_static/quantize_qoperator.
+std::vector<std::string> onnxsim_list_quantizable_activations(const std::string& data) {
+    onnx::ModelProto xmodel;
+    if (!xmodel.ParseFromArray(data.data(), data.size())) {
+        std::cerr << "Parse failed" << std::endl;
+        return {};
+    }
+    return ListQuantizableActivations(xmodel);
+}
+
+std::vector<std::string> onnxsim_list_qoperator_quantizable_outputs(const std::string& data) {
+    onnx::ModelProto xmodel;
+    if (!xmodel.ParseFromArray(data.data(), data.size())) {
+        std::cerr << "Parse failed" << std::endl;
+        return {};
+    }
+    return ListQOperatorQuantizableOutputs(xmodel);
+}
+
+// Appends a bare ValueInfoProto(name=name) graph output for every name in
+// ``names_ary`` not already an output, mirroring calibration.py's calibrate()
+// -- the page's browser-side calibration step needs onnxruntime-web to
+// compute and return each candidate tensor's value without changing the
+// graph otherwise, so it can observe the per-tensor (min, max) over the
+// sample inputs it feeds through. A bare ValueInfoProto with no type/shape is
+// a valid ONNX output (onnxruntime infers it from the run); this matches
+// calibrate()'s own onnx.ValueInfoProto(name=name) exactly.
+em::val onnxsim_add_graph_outputs(const std::string& data, em::val names_ary) {
+    onnx::ModelProto xmodel;
+    if (!xmodel.ParseFromArray(data.data(), data.size())) {
+        std::cerr << "Parse failed" << std::endl;
+        return em::val::null();
+    }
+    std::vector<std::string> names = em::vecFromJSArray<std::string>(names_ary);
+    onnx::GraphProto* graph = xmodel.mutable_graph();
+    std::set<std::string> existing_outputs;
+    for (const auto& vi : graph->output()) {
+        existing_outputs.insert(vi.name());
+    }
+    for (const auto& name : names) {
+        if (existing_outputs.insert(name).second) {
+            graph->add_output()->set_name(name);
+        }
+    }
+    return SerializeModel(xmodel);
+}
+
+em::val onnxsim_quantize_static(const std::string& data, em::val names_ary, em::val ranges_flat_ary) {
+    onnx::ModelProto xmodel;
+    if (!xmodel.ParseFromArray(data.data(), data.size())) {
+        std::cerr << "Parse failed" << std::endl;
+        return em::val::null();
+    }
+    try {
+        return SerializeModel(QuantizeStatic(
+            xmodel, ParseCalibrationRanges(names_ary, ranges_flat_ary)));
+    } catch (const std::exception& e) {
+        std::cerr << "quantize_static error: " << e.what() << std::endl;
+        return em::val::null();
+    }
+}
+
+em::val onnxsim_quantize_qoperator(const std::string& data, em::val names_ary, em::val ranges_flat_ary) {
+    onnx::ModelProto xmodel;
+    if (!xmodel.ParseFromArray(data.data(), data.size())) {
+        std::cerr << "Parse failed" << std::endl;
+        return em::val::null();
+    }
+    try {
+        return SerializeModel(QuantizeQOperator(
+            xmodel, ParseCalibrationRanges(names_ary, ranges_flat_ary)));
+    } catch (const std::exception& e) {
+        std::cerr << "quantize_qoperator error: " << e.what() << std::endl;
+        return em::val::null();
+    }
+}
+
 EMSCRIPTEN_BINDINGS(module) {
     function("onnxsimplify_export", &onnxsimplify_export);
     function("onnxsim_annotate_model_info", &onnxsim_annotate_model_info);
@@ -837,6 +991,20 @@ EMSCRIPTEN_BINDINGS(module) {
     em::function("onnxsim_infer_shapes", &onnxsim_infer_shapes);
     em::function("onnxsim_data_propagation", &onnxsim_data_propagation);
     em::function("onnxsim_fold_constant", &onnxsim_fold_constant);
+
+    // Calibration-free quantization methods (no activation ranges needed).
+    function("onnxsim_quantize_dynamic", &onnxsim_quantize_dynamic);
+    function("onnxsim_quantize_ternary", &onnxsim_quantize_ternary);
+    function("onnxsim_quantize_weight_only", &onnxsim_quantize_weight_only);
+    function("onnxsim_quantize_weight_only_int4", &onnxsim_quantize_weight_only_int4);
+    // Calibration-based quantization: list_* discovers which tensors to
+    // calibrate, quantize_static/quantize_qoperator take the calibrated
+    // ranges back as parallel [name] / [min0, max0, min1, max1, ...] arrays.
+    em::function("onnxsim_list_quantizable_activations", &onnxsim_list_quantizable_activations);
+    em::function("onnxsim_list_qoperator_quantizable_outputs", &onnxsim_list_qoperator_quantizable_outputs);
+    function("onnxsim_add_graph_outputs", &onnxsim_add_graph_outputs);
+    function("onnxsim_quantize_static", &onnxsim_quantize_static);
+    function("onnxsim_quantize_qoperator", &onnxsim_quantize_qoperator);
 
     em::register_vector<std::string>("string_list");
 }

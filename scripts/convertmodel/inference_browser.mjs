@@ -43,7 +43,9 @@ const ALL_FILL_MODES = [...INPUT_FILL_MODES, "sample"];
 
 const ORT_BUNDLE = { default: "ort.min.mjs", all: "ort.all.min.mjs" };
 const ortPromises = {};
-function loadOrt(variant = "default") {
+// Exported for quantize_calibration.mjs -- calibrating Static/QOperator
+// quantization needs the same on-demand onnxruntime-web load this panel uses.
+export function loadOrt(variant = "default") {
   if (!ortPromises[variant]) {
     const file = ORT_BUNDLE[variant] || ORT_BUNDLE.default;
     ortPromises[variant] = import(/* @vite-ignore */ `${ORT_BASE}${file}`).then((m) => {
@@ -99,7 +101,9 @@ function concreteShape(shape, batch = 1) {
 // fetched image/sentence in the "sample data" input/output preview once the
 // run finishes — the same context reference is reused across every input a
 // model has, so a multi-input model shares one fetched sample.
-async function makeDummyInputs(ort, session, batch = 1, fill = "zero", modelName = null, sampleCtx = null, log = () => {}) {
+// Exported for quantize_calibration.mjs, which reuses this to build the
+// synthetic random calibration batches Static/QOperator quantization needs.
+export async function makeDummyInputs(ort, session, batch = 1, fill = "zero", modelName = null, sampleCtx = null, log = () => {}) {
   const feeds = {};
   for (const meta of session.inputMetadata) {
     if (!meta.isTensor) {
@@ -234,29 +238,17 @@ async function runCompare(
   return cmp;
 }
 
-// Resolve the model bytes for the chosen source. "converted" uses the bytes the
-// converter page published on window.__onnxsimConverted; "original" reads the
-// file input, falling back to a model loaded from Hugging Face (published on
-// window.__onnxsimOriginal, which has no file-input entry). Returns
-// { bytes, label, name } or throws with a user-facing message. `name` is the
-// plain filename (no "converted (...)"/"original (...)" wrapping), used to
-// look up a tokenizer family for the sample-data fill mode.
-async function resolveModelBytes(source, fileInput) {
-  if (source === "converted") {
-    const converted = window.__onnxsimConverted;
-    if (!converted || !converted.bytes) {
-      throw new Error(
-        "no converted model yet — pick a file (or load one from Hugging " +
-          "Face) above to run a conversion first, or switch the model " +
-          "dropdown to 'original'.",
-      );
-    }
-    return { bytes: converted.bytes, label: `converted (${converted.name})`, name: converted.name };
-  }
+// Resolve the "original" model bytes + a display name from either a local
+// file upload or a model loaded from elsewhere on the page (Hugging Face,
+// "parse a text graph", a backend test case -- none of which have a
+// file-input entry, and all publish themselves on window.__onnxsimOriginal).
+// Returns { bytes, label, name } or throws with a user-facing message. `name`
+// is the plain filename (no "original (...)" wrapping), used to look up a
+// tokenizer family for the sample-data fill mode. Exported for
+// quantize_ui.mjs, which quantizes whatever model is currently loaded the
+// same way this panel runs inference on it.
+export async function resolveOriginalModelBytes(fileInput) {
   const file = fileInput.files && fileInput.files[0];
-  // Resolve the "original" bytes + a display name from either a local file
-  // upload or a Hugging Face download (which has no file-input entry, and
-  // publishes itself on window.__onnxsimOriginal).
   let name = null;
   let readBytes = null;
   if (file) {
@@ -288,6 +280,25 @@ async function resolveModelBytes(source, fileInput) {
     };
   }
   return { bytes: await readBytes(), label: `original (${name})`, name };
+}
+
+// Resolve the model bytes for the chosen source. "converted" uses the bytes
+// the converter page published on window.__onnxsimConverted; "original"
+// delegates to resolveOriginalModelBytes. Returns { bytes, label, name } or
+// throws with a user-facing message.
+async function resolveModelBytes(source, fileInput) {
+  if (source === "converted") {
+    const converted = window.__onnxsimConverted;
+    if (!converted || !converted.bytes) {
+      throw new Error(
+        "no converted model yet — pick a file (or load one from Hugging " +
+          "Face) above to run a conversion first, or switch the model " +
+          "dropdown to 'original'.",
+      );
+    }
+    return { bytes: converted.bytes, label: `converted (${converted.name})`, name: converted.name };
+  }
+  return resolveOriginalModelBytes(fileInput);
 }
 
 // Render the onnxsim MAC/FLOP metrics (onnxsim PR #527) that travel inside the
