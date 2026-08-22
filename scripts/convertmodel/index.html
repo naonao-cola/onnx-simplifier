@@ -356,21 +356,32 @@ agraph (float[N] X) =&gt; (float[N] Y) {
                 <span id="quantize-status" class="tool-note"></span>
             </div>
             <div id="quantize-metrics" style="display: none; margin-top: 0.4em;"></div>
+            <div class="netron-pane" style="margin-top: 0.6em; max-width: 480px;">
+                <div class="netron-head">
+                    <strong>Quantized preview</strong> —
+                    <button id="netron-quantized-open" type="button" style="display: none;">open in a new tab ↗</button>
+                    <button id="netron-quantized-download" type="button" style="display: none;">download model ↓</button>
+                    <button id="netron-quantized-svg" type="button" style="display: none;">export SVG ↓</button>
+                    <button id="netron-quantized-png" type="button" style="display: none;">export PNG ↓</button>
+                </div>
+                <iframe id="netron-quantized-frame" class="netron-frame" title="Netron — quantized model" style="display: none;"></iframe>
+                <div id="netron-quantized-note" class="netron-note"></div>
+            </div>
         </div>
         <script type="module" src="./quantize_ui.mjs"></script>
-        <h2 id="sec-visualize">Visualize with Netron (original / onnxsim / quantized)</h2>
+        <h2 id="sec-visualize">Visualize with Netron (before / after)</h2>
         <p>
             Renders the model graph with a self-hosted
-            <a href="https://github.com/onnxsim/netron" target="_blank" rel="noopener">Netron</a>,
-            one pane per pipeline stage, so you can compare them side by side:
-            the original upload, the Convert section's simplify/optimize
-            result, and the Quantize panel's result (independent of the
-            middle pane -- quantizing never overwrites it, see the Quantize
-            panel above). A pane stays empty until that stage has actually
-            run. Nothing is uploaded — the model bytes are posted straight
-            into the embedded Netron in your browser, so there is no
-            model-size limit. Use <b>export SVG</b> to save the rendered
-            graph as an SVG image.
+            <a href="https://github.com/onnxsim/netron" target="_blank" rel="noopener">Netron</a>:
+            the original model on the left and the simplified/optimized result on
+            the right, so you can compare them side by side. Nothing is uploaded —
+            the model bytes are posted straight into the embedded Netron in your
+            browser, so there is no model-size limit. Use <b>export SVG</b> to save
+            the rendered graph as an SVG image.
+            <br>
+            The quantized result has its own Netron preview inside the
+            <a href="#sec-quantize">Quantize panel</a> above instead of a third
+            pane here, so it never crowds this before/after comparison.
         </p>
         <p class="macs-note">
             Netron is driven here purely as an embeddable model-preview component
@@ -400,17 +411,6 @@ agraph (float[N] X) =&gt; (float[N] Y) {
                 </div>
                 <iframe id="netron-after-frame" class="netron-frame" title="Netron — simplified model" style="display: none;"></iframe>
                 <div id="netron-after-note" class="netron-note"></div>
-            </div>
-            <div class="netron-pane">
-                <div class="netron-head">
-                    <strong>Quantized</strong> —
-                    <button id="netron-quantized-open" type="button" style="display: none;">open in a new tab ↗</button>
-                    <button id="netron-quantized-download" type="button" style="display: none;">download model ↓</button>
-                    <button id="netron-quantized-svg" type="button" style="display: none;">export SVG ↓</button>
-                    <button id="netron-quantized-png" type="button" style="display: none;">export PNG ↓</button>
-                </div>
-                <iframe id="netron-quantized-frame" class="netron-frame" title="Netron — quantized model" style="display: none;"></iframe>
-                <div id="netron-quantized-note" class="netron-note"></div>
             </div>
         </div>
         <script type="module" src="./netron_view.mjs"></script>
