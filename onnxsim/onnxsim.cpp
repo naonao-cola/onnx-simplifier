@@ -39,6 +39,7 @@
 #include "onnx/common/file_utils.h"
 #include "onnx/common/graph_shape_inference.h"
 #include "onnx/common/ir_pb_converter.h"
+#include "onnx/common/ir_pb_converter_internal.h"
 #include "onnx/defs/printer.h"
 #include "onnx/defs/schema.h"
 #include "onnx/inliner/inliner.h"
@@ -978,6 +979,144 @@ std::map<std::string, onnxsim::SymTensor> EvaluateModelSymbolicValues(
   return onnxsim::EvaluateSymbolicValues(vg);
 }
 
+// --- Graph-native counterparts of the two passes above ----------------------
+//
+// Both InferSymbolicShapes/EvaluateSymbolicValues already operate on the
+// plain, representation-agnostic SymNode/SymTensor/ShapeGraph/SymGraph
+// structs, so only the *builders* need a Graph-native counterpart -- the
+// evaluator logic itself is untouched.
+
+// Graph-native counterpart of IntTensorToSymTensor: identical rank-0/1,
+// INT32/INT64-only rules, reading directly from ir.h's Tensor instead of
+// TensorProto.
+std::optional<onnxsim::SymTensor> IntTensorToSymTensor(const onnx::Tensor& t) {
+  if (t.data_location() == onnx::TensorProto::EXTERNAL) return std::nullopt;
+  const auto dt = t.elem_type();
+  if (dt != onnx::TensorProto::INT64 && dt != onnx::TensorProto::INT32)
+    return std::nullopt;
+  if (t.sizes().size() > 1) return std::nullopt;
+  const bool scalar = t.sizes().empty();
+  std::vector<int64_t> vals;
+  if (t.is_raw_data()) {
+    const std::string& raw = t.raw();
+    if (dt == onnx::TensorProto::INT64) {
+      const size_t n = raw.size() / sizeof(int64_t);
+      vals.resize(n);
+      for (size_t i = 0; i < n; ++i)
+        vals[i] = ReadLittleEndian<int64_t>(raw.data() + i * sizeof(int64_t));
+    } else {
+      const size_t n = raw.size() / sizeof(int32_t);
+      vals.resize(n);
+      for (size_t i = 0; i < n; ++i)
+        vals[i] = ReadLittleEndian<int32_t>(raw.data() + i * sizeof(int32_t));
+    }
+  } else if (dt == onnx::TensorProto::INT64) {
+    vals.assign(t.int64s().begin(), t.int64s().end());
+  } else {
+    vals.assign(t.int32s().begin(), t.int32s().end());
+  }
+  const int64_t expect = scalar ? 1 : t.sizes()[0];
+  if (static_cast<int64_t>(vals.size()) != expect) return std::nullopt;
+  onnxsim::SymTensor r;
+  r.scalar = scalar;
+  for (int64_t v : vals) r.data.emplace_back(v);
+  return r;
+}
+
+// Graph-native counterpart of TypeProtoToSymShape, reading a Value's own
+// elemType()/sizes() -- no ModelProto value_info map needed, since a Value
+// already carries its own current shape/type in the IR.
+std::optional<onnxsim::SymShape> ValueToSymShape(onnx::Value* v, int64_t& fresh) {
+  if (!v->has_sizes()) return std::nullopt;
+  onnxsim::SymShape shape;
+  for (const auto& d : v->sizes()) {
+    if (d.is_int) {
+      shape.push_back(onnxsim::SymExpr(d.dim));
+    } else if (!d.is_unknown) {
+      shape.push_back(onnxsim::SymExpr::Symbol(d.param));
+    } else {
+      shape.push_back(
+          onnxsim::SymExpr::Symbol("seedunk_" + std::to_string(fresh++)));
+    }
+  }
+  return shape;
+}
+
+// Graph-native counterpart of ToSymNode.
+onnxsim::SymNode ToSymNode(onnx::Node* node) {
+  onnxsim::SymNode n;
+  const std::string domain = node->has_domain() ? node->domain() : std::string();
+  n.op_type = (domain.empty() || domain == "ai.onnx") ? node->kind().toString() : "";
+  for (onnx::Value* v : node->inputs()) {
+    n.input.push_back(v->node()->kind() == onnx::kUndefined ? "" : v->uniqueName());
+  }
+  for (onnx::Value* v : node->outputs()) {
+    n.output.push_back(v->uniqueName());
+  }
+  for (onnx::Symbol attr_name : node->attributeNames()) {
+    onnxsim::SymAttr a;
+    a.name = attr_name.toString();
+    switch (node->kindOf(attr_name)) {
+      case onnx::AttributeKind::i:
+        a.i = node->i(attr_name);
+        break;
+      case onnx::AttributeKind::is:
+        a.ints = node->is(attr_name);
+        break;
+      case onnx::AttributeKind::t:
+        if (auto t = IntTensorToSymTensor(node->t(attr_name))) a.t = std::move(*t);
+        break;
+      default:
+        break;
+    }
+    n.attribute.push_back(std::move(a));
+  }
+  return n;
+}
+
+// Graph-native counterpart of EvaluateModelSymbolicValues.
+std::map<std::string, onnxsim::SymTensor> EvaluateGraphSymbolicValues(
+    onnx::Graph& g, const std::vector<onnx::Node*>& node_ptrs) {
+  int64_t fresh = 0;
+  std::vector<onnxsim::SymNode> nodes;
+  nodes.reserve(node_ptrs.size());
+  for (onnx::Node* node : node_ptrs) {
+    if (node->kind() == onnx::kUndefined || node->kind() == onnx::kCaptured) continue;
+    nodes.push_back(ToSymNode(node));
+  }
+
+  std::map<std::string, onnxsim::SymTensor> initializers;
+  std::map<std::string, onnxsim::SymShape> shapes_seed;
+  const auto& inits = g.initializers();
+  const auto& init_names = g.initializer_names();
+  for (size_t i = 0; i < inits.size(); ++i) {
+    if (auto t = IntTensorToSymTensor(*inits[i])) initializers[init_names[i]] = *t;
+    onnxsim::SymShape s;
+    for (int64_t d : inits[i]->sizes()) s.emplace_back(d);
+    shapes_seed[init_names[i]] = std::move(s);
+  }
+  auto seed = [&](onnx::Value* v) {
+    if (shapes_seed.count(v->uniqueName())) return;  // keep the concrete initializer shape
+    if (auto s = ValueToSymShape(v, fresh)) shapes_seed[v->uniqueName()] = std::move(*s);
+  };
+  for (onnx::Value* v : g.inputs()) seed(v);
+  for (onnx::Node* node : node_ptrs) {
+    for (onnx::Value* v : node->outputs()) seed(v);
+  }
+  for (onnx::Value* v : g.outputs()) seed(v);
+
+  onnxsim::ShapeGraph sg;
+  sg.node = nodes;
+  sg.value_info = shapes_seed;
+  sg.initializer = initializers;
+
+  onnxsim::SymGraph vg;
+  vg.node = std::move(nodes);
+  vg.initializer = std::move(initializers);
+  vg.shape = onnxsim::InferSymbolicShapes(sg);
+  return onnxsim::EvaluateSymbolicValues(vg);
+}
+
 // Partial shape evaluation (issue #139) via ONNX data propagation.
 //
 // The plain constant folder only folds a node when *all* of its inputs are
@@ -1303,6 +1442,288 @@ void _EvalPartialShape(onnx::ModelProto& model) {
     }
     *model.mutable_graph()->add_node() = std::move(node);
   }
+}
+
+// Graph-native counterpart of _EvalPartialShape: same two rewrites (fold a
+// fully-known shape-family output to a Constant; materialize a Reshape's
+// shape input as a Constant with a single -1 slot when everything else is
+// concrete), reached without any ModelProto <-> Graph round trip. Built on
+// the extended InferShapesOnGraph (generated_shape_data out-param, see
+// onnx/common/graph_shape_inference.h) instead of onnx's protobuf-based
+// InferShapes. Returns whether anything changed, so the fully Graph-native
+// outer pipeline can use it as a GraphFnChanged step.
+bool _EvalPartialShapeOnGraph(onnx::Graph& g) {
+  // Mirrors _EvalPartialShape's own snapshot/restore of value_info/output:
+  // this pass's own data-propagation inference call must not leave its
+  // (lenient, check_type=false) shape/type conclusions on the graph --
+  // only the two rewrites below should persist. Restore before the rewrite
+  // loop, from a snapshot taken before the inference call.
+  struct ValueTypeSnapshot {
+    int32_t elem_type;
+    bool has_sizes;
+    std::vector<onnx::Dimension> sizes;
+  };
+  std::vector<onnx::Node*> node_ptrs(g.nodes().begin(), g.nodes().end());
+  std::unordered_map<onnx::Value*, ValueTypeSnapshot> snapshot;
+  auto save = [&](onnx::Value* v) {
+    snapshot[v] = {v->elemType(), v->has_sizes(),
+                   v->has_sizes() ? v->sizes() : std::vector<onnx::Dimension>{}};
+  };
+  for (onnx::Value* v : g.inputs()) save(v);
+  for (onnx::Node* node : node_ptrs) {
+    for (onnx::Value* v : node->outputs()) save(v);
+  }
+  auto restore = [&]() {
+    for (const auto& [v, s] : snapshot) {
+      v->setElemType(s.elem_type);
+      if (s.has_sizes) {
+        v->setSizes(s.sizes);
+      } else {
+        v->wipeSizes();
+      }
+    }
+  };
+
+  onnx::shape_inference::DataValueMap data_map;
+  {
+    const onnx::ShapeInferenceOptions options(/*check_type=*/false,
+                                              /*error_mode=*/0,
+                                              /*enable_data_propagation=*/true);
+    try {
+      onnx::InferShapesOnGraph(g, options, &data_map);
+    } catch (const std::exception&) {
+      restore();
+      return false;
+    }
+  }
+
+  // Maps the output of a foldable node to the constant tensor it produces.
+  std::unordered_map<std::string, onnx::Tensor> folded_values;
+  for (onnx::Node* node : node_ptrs) {
+    if (node->outputs().size() != 1) continue;
+    onnx::Value* out = node->outputs()[0];
+    auto data_iter = data_map.find(out->uniqueName());
+    if (data_iter == data_map.end()) continue;
+
+    const onnx::TensorShapeProto& value = data_iter->second;
+    bool fully_known = true;
+    std::vector<int64_t> values;
+    for (const auto& dim : value.dim()) {
+      if (!dim.has_dim_value()) {
+        fully_known = false;
+        break;
+      }
+      values.push_back(dim.dim_value());
+    }
+    if (!fully_known) continue;
+
+    const auto elem_type =
+        static_cast<onnx::TensorProto::DataType>(out->elemType());
+    if (elem_type != onnx::TensorProto::INT64 &&
+        elem_type != onnx::TensorProto::INT32) {
+      continue;
+    }
+    if (!out->has_sizes()) continue;
+    std::vector<int64_t> dims;
+    bool dims_known = true;
+    for (const auto& d : out->sizes()) {
+      if (!d.is_int) {
+        dims_known = false;
+        break;
+      }
+      dims.push_back(d.dim);
+    }
+    if (!dims_known) continue;
+    int64_t element_count = 1;
+    for (int64_t d : dims) element_count *= d;
+    if (element_count != static_cast<int64_t>(values.size())) continue;
+
+    onnx::Tensor t;
+    t.elem_type() = elem_type;
+    t.sizes() = dims;
+    if (elem_type == onnx::TensorProto::INT64) {
+      for (int64_t v : values) t.int64s().push_back(v);
+    } else {
+      for (int64_t v : values) t.int32s().push_back(static_cast<int32_t>(v));
+    }
+    folded_values.emplace(out->uniqueName(), std::move(t));
+  }
+
+  // Data propagation for `Reshape` (single dynamic dim) -- see
+  // _EvalPartialShape's own comment for why this matters.
+  struct ReshapeShapeFix {
+    onnx::Tensor shape_tensor;
+  };
+  std::unordered_map<std::string, ReshapeShapeFix> reshape_fixes;
+  for (onnx::Node* node : node_ptrs) {
+    if (node->kind() != onnx::kReshape || node->inputs().size() < 2 ||
+        node->outputs().size() != 1) {
+      continue;
+    }
+    if (folded_values.count(node->outputs()[0]->uniqueName())) continue;
+    auto data_iter = data_map.find(node->inputs()[1]->uniqueName());
+    if (data_iter == data_map.end()) continue;
+    const onnx::TensorShapeProto& shape_value = data_iter->second;
+    if (shape_value.dim_size() == 0) continue;
+    int unknown = 0;
+    bool usable = true;
+    std::vector<int64_t> shape;
+    shape.reserve(shape_value.dim_size());
+    for (const auto& dim : shape_value.dim()) {
+      if (dim.has_dim_value()) {
+        if (dim.dim_value() <= 0) {
+          usable = false;
+          break;
+        }
+        shape.push_back(dim.dim_value());
+      } else {
+        ++unknown;
+        shape.push_back(-1);
+      }
+    }
+    if (!usable || unknown != 1) continue;
+    onnx::Tensor t;
+    t.elem_type() = onnx::TensorProto::INT64;
+    t.sizes() = {static_cast<int64_t>(shape.size())};
+    for (int64_t v : shape) t.int64s().push_back(v);
+    reshape_fixes.emplace(node->outputs()[0]->uniqueName(),
+                          ReshapeShapeFix{std::move(t)});
+  }
+
+  // Native symbolic evaluation (issue #532), merged into the same two
+  // rewrite maps exactly as _EvalPartialShape does.
+  {
+    const auto sym_values = EvaluateGraphSymbolicValues(g, node_ptrs);
+    for (onnx::Node* node : node_ptrs) {
+      if (node->outputs().size() != 1) continue;
+      onnx::Value* out = node->outputs()[0];
+      const std::string& output = out->uniqueName();
+      if (folded_values.count(output) || reshape_fixes.count(output)) continue;
+      auto sym_iter = sym_values.find(output);
+      if (sym_iter == sym_values.end()) continue;
+      std::vector<int64_t> flat;
+      bool all_concrete = true;
+      for (const auto& e : sym_iter->second.data) {
+        if (e.is_symbolic()) {
+          all_concrete = false;
+          break;
+        }
+        flat.push_back(e.to_int());
+      }
+      if (!all_concrete) continue;
+      const auto elem_type =
+          static_cast<onnx::TensorProto::DataType>(out->elemType());
+      if (elem_type != onnx::TensorProto::INT64 &&
+          elem_type != onnx::TensorProto::INT32) {
+        continue;
+      }
+      if (!out->has_sizes()) continue;
+      std::vector<int64_t> dims;
+      bool dims_known = true;
+      for (const auto& d : out->sizes()) {
+        if (!d.is_int) {
+          dims_known = false;
+          break;
+        }
+        dims.push_back(d.dim);
+      }
+      if (!dims_known) continue;
+      int64_t element_count = 1;
+      for (int64_t d : dims) element_count *= d;
+      if (element_count != static_cast<int64_t>(flat.size())) continue;
+      onnx::Tensor t;
+      t.elem_type() = elem_type;
+      t.sizes() = dims;
+      if (elem_type == onnx::TensorProto::INT64) {
+        for (int64_t v : flat) t.int64s().push_back(v);
+      } else {
+        for (int64_t v : flat) t.int32s().push_back(static_cast<int32_t>(v));
+      }
+      folded_values.emplace(output, std::move(t));
+    }
+    for (onnx::Node* node : node_ptrs) {
+      if (node->kind() != onnx::kReshape || node->inputs().size() < 2 ||
+          node->outputs().size() != 1) {
+        continue;
+      }
+      const std::string& reshape_out = node->outputs()[0]->uniqueName();
+      if (reshape_fixes.count(reshape_out)) continue;
+      auto sym_iter = sym_values.find(node->inputs()[1]->uniqueName());
+      if (sym_iter == sym_values.end()) continue;
+      const onnxsim::SymTensor& shape_value = sym_iter->second;
+      if (shape_value.scalar || shape_value.data.empty()) continue;
+      int unknown = 0;
+      bool usable = true;
+      std::vector<int64_t> shape;
+      shape.reserve(shape_value.data.size());
+      for (const auto& e : shape_value.data) {
+        if (e.is_symbolic()) {
+          ++unknown;
+          shape.push_back(-1);
+        } else {
+          const int64_t v = e.to_int();
+          if (v <= 0) {
+            usable = false;
+            break;
+          }
+          shape.push_back(v);
+        }
+      }
+      if (!usable || unknown != 1) continue;
+      onnx::Tensor t;
+      t.elem_type() = onnx::TensorProto::INT64;
+      t.sizes() = {static_cast<int64_t>(shape.size())};
+      for (int64_t v : shape) t.int64s().push_back(v);
+      reshape_fixes.emplace(reshape_out, ReshapeShapeFix{std::move(t)});
+    }
+  }
+
+  // Restore the graph's shape/type state to what it was before this pass's
+  // own data-propagation inference call -- see the snapshot comment above.
+  restore();
+
+  if (folded_values.empty() && reshape_fixes.empty()) {
+    return false;
+  }
+
+  // Apply the two rewrites directly on the Graph: a folded node is replaced
+  // in place by a Constant node holding its value (insertBefore + replaceAll
+  // UsesWith + destroy preserves topological position without a full
+  // node-list rebuild); a Reshape fix inserts a Constant just before the
+  // Reshape and repoints its shape input at it, leaving the original
+  // shape-producing subgraph dead for the optimizer's own dead-node
+  // elimination to remove.
+  static const onnx::Symbol kValueAttr("value");
+  for (onnx::Node* node : node_ptrs) {
+    if (node->outputs().size() != 1) continue;
+    onnx::Value* out = node->outputs()[0];
+    auto iter = folded_values.find(out->uniqueName());
+    if (iter != folded_values.end()) {
+      onnx::Node* constant = g.create(onnx::kConstant, 1);
+      constant->t_(kValueAttr, iter->second);
+      constant->outputs()[0]->setElemType(iter->second.elem_type());
+      constant->outputs()[0]->setSizes(
+          std::vector<onnx::Dimension>(iter->second.sizes().begin(),
+                                       iter->second.sizes().end()));
+      constant->insertBefore(node);
+      node->replaceAllUsesWith(constant);
+      node->destroy();
+      continue;
+    }
+    auto fix_iter = reshape_fixes.find(out->uniqueName());
+    if (fix_iter != reshape_fixes.end() && node->kind() == onnx::kReshape) {
+      onnx::Node* shape_const = g.create(onnx::kConstant, 1);
+      shape_const->t_(kValueAttr, fix_iter->second.shape_tensor);
+      shape_const->outputs()[0]->setElemType(
+          fix_iter->second.shape_tensor.elem_type());
+      shape_const->outputs()[0]->setSizes(std::vector<onnx::Dimension>(
+          fix_iter->second.shape_tensor.sizes().begin(),
+          fix_iter->second.shape_tensor.sizes().end()));
+      shape_const->insertBefore(node);
+      node->replaceInput(1, shape_const->outputs()[0]);
+    }
+  }
+  return true;
 }
 
 // Whether every element of `tensor` is zero. Only the storage forms that can be
@@ -1727,6 +2148,413 @@ onnx::ModelProto _FoldConstant(const ModelExecutor& executor,
   // not balloon in size (issue #174).
   onnxsim::ProfiledScope eliminate_scope("EliminateUnusedInitializerScope");
   return EliminateUnusedInitializer(std::move(model));
+}
+
+// --- Graph-native counterpart of GetConstantNodes/FoldGroup/_FoldConstant ---
+//
+// Ports the ORT-execution-based constant folder above to walk onnx::Graph
+// directly, reached without a ModelProto <-> Graph round trip. Each fold
+// batch still serializes to a small, throwaway sub-ModelProto right at the
+// executor boundary (ORT has no Graph-native session API) -- exactly what
+// RunOps already did, just built from Graph Node/Value/Tensor objects
+// (reusing addAttribute/encodeTensor from ir_pb_converter_internal.h,
+// graph_shape_inference.cc's own pattern) instead of NodeProto copies.
+// Unlike the ModelProto path, no EliminateUnusedInitializer pass is run
+// here: onnx-optimizer's own eliminate_unused_initializer pass, already
+// part of config.optimizer_passes, prunes any initializer folding leaves
+// dangling on the very next OptAndShape round.
+
+struct ConstantNodePartitionGraph {
+  // Nodes whose output is materialized into an initializer by folding, in
+  // topological order.
+  std::vector<onnx::Node*> const_nodes;
+  // Unique names of "deferred" nodes' outputs -- see ConstantNodePartition's
+  // own doc comment; same semantics, ported verbatim.
+  std::unordered_set<std::string> deferred_outputs;
+};
+
+bool HasSubgraphAttr(onnx::Node* node) {
+  for (onnx::Symbol name : node->attributeNames()) {
+    const auto kind = node->kindOf(name);
+    if (kind == onnx::AttributeKind::g || kind == onnx::AttributeKind::gs) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// Graph-native counterpart of ProduceLargeTensor: reads the node's own
+// output Value directly instead of looking it up in a separate value_info
+// map (a Value already carries its own current shape/type in the IR).
+bool ProduceLargeTensorOnGraph(onnx::Node* node, size_t threshold) {
+  static const std::set<std::string> large_tensor_ops{"Tile", "ConstantOfShape",
+                                                       "Expand"};
+  if (large_tensor_ops.find(node->kind().toString()) == large_tensor_ops.end()) {
+    return false;
+  }
+  if (node->outputs().empty()) {
+    return true;
+  }
+  onnx::Value* out = node->outputs()[0];
+  if (out->elemType() == onnx::TensorProto::UNDEFINED || !out->has_sizes()) {
+    return true;
+  }
+  size_t size;
+  try {
+    size = size_of_dtype(static_cast<onnx::TensorProto::DataType>(out->elemType()));
+  } catch (const std::exception&) {
+    return true;
+  }
+  for (const auto& d : out->sizes()) {
+    if (!d.is_int) {
+      return true;
+    }
+    size *= static_cast<size_t>(d.dim);
+  }
+  return size > threshold;
+}
+
+// Graph-native counterpart of EstimateOutputBytes.
+size_t EstimateOutputBytesOnGraph(onnx::Node* node) {
+  size_t total = 0;
+  for (onnx::Value* out : node->outputs()) {
+    if (out->elemType() == onnx::TensorProto::UNDEFINED || !out->has_sizes()) {
+      continue;
+    }
+    size_t size;
+    try {
+      size = size_of_dtype(static_cast<onnx::TensorProto::DataType>(out->elemType()));
+    } catch (const std::exception&) {
+      continue;
+    }
+    bool known = true;
+    for (const auto& d : out->sizes()) {
+      if (!d.is_int) {
+        known = false;
+        break;
+      }
+      size *= static_cast<size_t>(d.dim);
+    }
+    if (known) {
+      total += size;
+    }
+  }
+  return total;
+}
+
+// Graph-native counterpart of GetConstantNodes.
+ConstantNodePartitionGraph GetConstantNodesOnGraph(
+    onnx::Graph& g, const std::vector<onnx::Node*>& node_ptrs) {
+  std::unordered_set<std::string> const_names{""};
+  ConstantNodePartitionGraph partition;
+  if (config.initializers_as_constants) {
+    for (const auto& name : g.initializer_names()) {
+      const_names.insert(name);
+    }
+  }
+  std::unordered_map<std::string, int> domain_to_version;
+  for (const onnx::OpSetID& opset : g.opset_versions_mutable()) {
+    const std::string& domain = opset.domain() == "ai.onnx" ? "" : opset.domain();
+    domain_to_version[domain] = static_cast<int>(opset.version());
+  }
+  auto opset_version_of = [&domain_to_version](const std::string& domain) {
+    const std::string& key = domain == "ai.onnx" ? "" : domain;
+    auto iter = domain_to_version.find(key);
+    return iter == domain_to_version.end() ? 0 : iter->second;
+  };
+  for (onnx::Node* node : node_ptrs) {
+    if (node->kind() == onnx::kUndefined || node->kind() == onnx::kCaptured) {
+      continue;
+    }
+    const std::string domain = node->has_domain() ? node->domain() : std::string();
+    const std::string op_type = node->kind().toString();
+    const bool foldable =
+        IsOfficialOp(domain, op_type) &&
+        IsDeterministic(domain, op_type, opset_version_of(domain)) &&
+        !IsQDQ(domain, op_type) && !HasSubgraphAttr(node) &&
+        std::all_of(node->inputs().begin(), node->inputs().end(),
+                    [&const_names](onnx::Value* v) {
+                      const std::string name =
+                          v->node()->kind() == onnx::kUndefined ? "" : v->uniqueName();
+                      return const_names.count(name) > 0;
+                    });
+    if (!foldable) {
+      continue;
+    }
+    if (!ProduceLargeTensorOnGraph(node, config.tensor_size_threshold)) {
+      for (onnx::Value* out : node->outputs()) {
+        const_names.insert(out->uniqueName());
+      }
+      partition.const_nodes.push_back(node);
+      continue;
+    }
+    if (op_type == "ConstantOfShape" || op_type == "Expand") {
+      for (onnx::Value* out : node->outputs()) {
+        const_names.insert(out->uniqueName());
+        partition.deferred_outputs.insert(out->uniqueName());
+      }
+    }
+  }
+  return partition;
+}
+
+// Graph-native counterpart of RunOps: builds the throwaway sub-model from
+// Graph Node/Value/Tensor objects. Each constant feed is encoded into its
+// own owned TensorProto (encodeTensor copies its bytes once) and handed to
+// the DLPack bridge via FromTensorProtoOwning, which takes ownership of the
+// moved proto -- safe regardless of the source onnx::Tensor's lifetime,
+// unlike borrowing a pointer into a temporary.
+struct RunOpsOnGraphResult {
+  std::vector<onnx::TensorProto> tensors;
+  // Parallel to `tensors`: the original graph Value each entry replaces
+  // (the node output RunOps computed a constant for).
+  std::vector<onnx::Value*> values;
+};
+
+RunOpsOnGraphResult RunOpsOnGraph(
+    const ModelExecutor& executor, onnx::Graph& g,
+    const std::vector<onnx::Node*>& ops,
+    const std::unordered_map<std::string, onnx::Node*>& deferred_producers) {
+  std::vector<std::string> input_names;
+  std::vector<const onnx::Tensor*> input_tensors;
+  std::set<std::string> seen_inputs;
+
+  google::protobuf::Arena arena;
+  onnx::ModelProto& op_model =
+      *google::protobuf::Arena::Create<onnx::ModelProto>(&arena);
+  op_model.set_ir_version(onnx::Version::IR_VERSION);
+  for (const onnx::OpSetID& opset : g.opset_versions_mutable()) {
+    auto* x = op_model.add_opset_import();
+    x->set_domain(opset.domain());
+    x->set_version(opset.version());
+  }
+
+  std::set<std::string> internal_outputs;
+  for (onnx::Node* op : ops) {
+    for (onnx::Value* out : op->outputs()) {
+      internal_outputs.insert(out->uniqueName());
+    }
+  }
+
+  std::set<onnx::Node*> included;
+  std::function<void(onnx::Node*)> include_node = [&](onnx::Node* node) {
+    if (!included.insert(node).second) {
+      return;
+    }
+    for (onnx::Value* input : node->inputs()) {
+      if (input->node()->kind() == onnx::kUndefined) {
+        continue;  // unset optional input
+      }
+      const std::string& name = input->uniqueName();
+      if (internal_outputs.count(name) > 0) {
+        continue;
+      }
+      auto deferred_iter = deferred_producers.find(name);
+      if (deferred_iter != deferred_producers.end()) {
+        include_node(deferred_iter->second);
+        continue;
+      }
+      if (!seen_inputs.insert(name).second) {
+        continue;
+      }
+      const onnx::Tensor* init = g.getInitializer(name);
+      if (init->sizes().size() == 1 && init->sizes()[0] == 0) {
+        onnx::TensorProto* p = op_model.mutable_graph()->add_initializer();
+        p->set_name(name);
+        onnx::encodeTensor(*p, *init);
+        continue;
+      }
+      input_names.push_back(name);
+      input_tensors.push_back(init);
+    }
+    onnx::NodeProto* np = op_model.mutable_graph()->add_node();
+    np->set_op_type(node->kind().toString());
+    if (node->has_domain()) {
+      np->set_domain(node->domain());
+    }
+    for (onnx::Value* input : node->inputs()) {
+      np->add_input(input->node()->kind() == onnx::kUndefined ? "" : input->uniqueName());
+    }
+    for (onnx::Value* output : node->outputs()) {
+      np->add_output(output->uniqueName());
+    }
+    for (onnx::Symbol attr_name : node->attributeNames()) {
+      onnx::addAttribute(*np, *node, attr_name, /*consume_tensor_data=*/false);
+    }
+  };
+  for (onnx::Node* op : ops) {
+    include_node(op);
+  }
+
+  for (size_t i = 0; i < input_names.size(); i++) {
+    onnx::ValueInfoProto* vi = op_model.mutable_graph()->add_input();
+    vi->set_name(input_names[i]);
+    auto* tensor_type = vi->mutable_type()->mutable_tensor_type();
+    tensor_type->set_elem_type(input_tensors[i]->elem_type());
+    for (int64_t d : input_tensors[i]->sizes()) {
+      tensor_type->mutable_shape()->add_dim()->set_dim_value(d);
+    }
+  }
+  std::vector<std::string> output_names;
+  std::vector<onnx::Value*> output_values;
+  for (onnx::Node* op : ops) {
+    for (onnx::Value* out : op->outputs()) {
+      op_model.mutable_graph()->add_output()->set_name(out->uniqueName());
+      output_names.push_back(out->uniqueName());
+      output_values.push_back(out);
+    }
+  }
+
+  std::vector<DLManagedTensorPtr> input_dls;
+  std::vector<const DLManagedTensor*> input_ptrs;
+  input_dls.reserve(input_tensors.size());
+  for (const auto* t : input_tensors) {
+    onnx::TensorProto tp;
+    onnx::encodeTensor(tp, *t);
+    input_dls.emplace_back(onnxsim::dlpack::FromTensorProtoOwning(std::move(tp)));
+  }
+  input_ptrs.reserve(input_dls.size());
+  for (const auto& p : input_dls) input_ptrs.push_back(p.get());
+
+  std::vector<DLManagedTensorPtr> output_dls = executor.Run(op_model, input_ptrs);
+  RunOpsOnGraphResult result;
+  result.tensors.reserve(output_dls.size());
+  for (size_t i = 0; i < output_dls.size(); i++) {
+    result.tensors.push_back(onnxsim::dlpack::ToTensorProto(
+        output_dls[i]->dl_tensor,
+        i < output_names.size() ? output_names[i] : std::string()));
+  }
+  // executor.Run() returns one tensor per graph output, in the same order
+  // output_values (built alongside output_names above) lists them in.
+  result.values = output_values;
+  result.values.resize(result.tensors.size());
+  return result;
+}
+
+// Graph-native counterpart of FoldGroup: splices each successfully-folded
+// output directly into `g` as a new initializer (Graph::
+// addInitializerAndCreateValue), rewires the folded node's uses onto it,
+// and removes the folded node -- no NodeProto rebuild needed.
+void FoldGroupOnGraph(const ModelExecutor& executor, onnx::Graph& g,
+                      const std::vector<onnx::Node*>& const_nodes, size_t begin,
+                      size_t end,
+                      const std::unordered_map<std::string, onnx::Node*>& deferred_producers,
+                      size_t& num_folded) {
+  if (begin >= end) {
+    return;
+  }
+  std::vector<onnx::Node*> ops(const_nodes.begin() + begin, const_nodes.begin() + end);
+  try {
+    RunOpsOnGraphResult result = RunOpsOnGraph(executor, g, ops, deferred_producers);
+    // Every op in this batch folded successfully (RunOpsOnGraph throws,
+    // rather than partially populating its result, on any failure) -- decode
+    // each returned TensorProto (ToTensorProto always emits raw_data, see
+    // dlpack_bridge.h) into a Tensor, add it as a new initializer, and
+    // rewire the Value it replaces onto it. A multi-output node's outputs
+    // are independent Values here, each replaced on its own; the owning
+    // node is only destroyed (never touched again after) once every one of
+    // its outputs has been replaced.
+    std::unordered_map<onnx::Node*, size_t> remaining_outputs;
+    for (onnx::Node* node : ops) {
+      remaining_outputs[node] = node->outputs().size();
+    }
+    for (size_t i = 0; i < result.tensors.size(); i++) {
+      const onnx::TensorProto& tp = result.tensors[i];
+      onnx::Value* old_value = result.values[i];
+      onnx::Node* owner = old_value->node();
+      onnx::Tensor t;
+      t.setName(tp.name());
+      t.elem_type() = tp.data_type();
+      for (int64_t d : tp.dims()) t.sizes().push_back(d);
+      if (tp.has_raw_data()) {
+        t.set_raw_data(tp.raw_data());
+      }
+      onnx::Value* new_value = g.addInitializerAndCreateValue(t);
+      old_value->replaceAllUsesWith(new_value);
+      if (--remaining_outputs[owner] == 0) {
+        owner->destroy();
+      }
+    }
+    num_folded += end - begin;
+  } catch (const std::exception& e) {
+    if (end - begin == 1) {
+      onnx::Node* node = const_nodes[begin];
+      std::cerr << "WARNING: failed to run \"" << node->kind().toString()
+                << "\" op (name is \"" << node->name() << "\"), skip... "
+                << e.what() << std::endl;
+      return;
+    }
+    const size_t mid = begin + (end - begin) / 2;
+    FoldGroupOnGraph(executor, g, const_nodes, begin, mid, deferred_producers, num_folded);
+    FoldGroupOnGraph(executor, g, const_nodes, mid, end, deferred_producers, num_folded);
+  }
+}
+
+// Graph-native counterpart of _FoldConstant. Returns whether anything
+// folded, mirroring OptimizeGraphChanged's own bool-returning convention so
+// the outer fixed point can detect convergence without a fingerprint
+// comparison. No EliminateUnusedInitializer call: see this section's own
+// top-of-file comment for why.
+bool _FoldConstantOnGraph(const ModelExecutor& executor, onnx::Graph& g) {
+  std::vector<onnx::Node*> node_ptrs(g.nodes().begin(), g.nodes().end());
+  ConstantNodePartitionGraph partition;
+  {
+    onnxsim::ProfiledScope analysis_scope("GetConstantNodes");
+    partition = GetConstantNodesOnGraph(g, node_ptrs);
+  }
+  const auto& const_nodes = partition.const_nodes;
+  if (const_nodes.empty()) {
+    return false;
+  }
+
+  std::unordered_map<std::string, onnx::Node*> deferred_producers;
+  if (!partition.deferred_outputs.empty()) {
+    for (onnx::Node* node : node_ptrs) {
+      for (onnx::Value* out : node->outputs()) {
+        if (partition.deferred_outputs.count(out->uniqueName()) > 0) {
+          deferred_producers.emplace(out->uniqueName(), node);
+        }
+      }
+    }
+  }
+
+  constexpr size_t kBatchByteBudget = size_t(256) << 20;  // 256 MiB
+  constexpr size_t kBatchMaxNodes = 1024;
+  auto consumes_deferred = [&](onnx::Node* node) {
+    if (partition.deferred_outputs.empty()) {
+      return false;
+    }
+    for (onnx::Value* input : node->inputs()) {
+      if (partition.deferred_outputs.count(input->uniqueName()) > 0) {
+        return true;
+      }
+    }
+    return false;
+  };
+
+  size_t num_folded = 0;
+  const size_t num_const_nodes = const_nodes.size();
+  for (size_t i = 0; i < num_const_nodes;) {
+    if (consumes_deferred(const_nodes[i])) {
+      FoldGroupOnGraph(executor, g, const_nodes, i, i + 1, deferred_producers, num_folded);
+      i++;
+      continue;
+    }
+    size_t j = i;
+    size_t bytes = 0;
+    while (j < num_const_nodes && j - i < kBatchMaxNodes &&
+           !consumes_deferred(const_nodes[j])) {
+      const size_t node_bytes = EstimateOutputBytesOnGraph(const_nodes[j]);
+      if (j > i && bytes + node_bytes > kBatchByteBudget) {
+        break;
+      }
+      bytes += node_bytes;
+      j++;
+    }
+    FoldGroupOnGraph(executor, g, const_nodes, i, j, deferred_producers, num_folded);
+    i = j;
+  }
+  return num_folded > 0;
 }
 
 // ``model`` is ``onnx::ModelProto&`` (not const): the call site below passes a
@@ -2513,6 +3341,61 @@ void RecordSimplifyOptionsMetadata(
   }
 }
 
+// Runs InferShapesOnGraph + OptimizeGraphFixed to their own inner fixed
+// point directly on `g`, with no ModelProto conversion at either end -- the
+// Graph-resident core shared by OptAndShape's ModelFn (which wraps this in
+// one Import before and one Export after, see below) and the fully
+// Graph-native outer Pipeline (which shares one Import/Export across the
+// *whole* outer fixed point instead, see Simplify's !rewriter branch).
+// Returns whether anything changed.
+bool OptAndShapeOnGraph(onnx::Graph& g, bool optimize, bool shape_inference,
+                        size_t fixed_point_iters) {
+  // See OptAndShape's own doc comment for why these caches are scoped to
+  // one call of this function rather than cleared every round underneath.
+  onnx::optimization::ClearTensorContentDigestCache();
+  onnx::optimization::ClearRawHashCache();
+  using GraphFnChanged = std::function<bool(onnx::Graph&)>;
+  bool any_changed = false;
+  GraphFnChanged InferShapesOnGraphChanged =
+      shape_inference
+          ? GraphFnChanged([&any_changed](onnx::Graph& graph) {
+              onnxsim::ProfiledScope scope("InferShapes");
+              const bool c = onnx::InferShapesOnGraph(graph);
+              any_changed |= c;
+              return c;
+            })
+          : GraphFnChanged([](onnx::Graph&) { return false; });
+  GraphFnChanged OptimizeGraphChanged = [optimize, &any_changed](onnx::Graph& graph) {
+    onnxsim::ProfiledScope scope("Optimize");
+    onnxsim::RegisterCustomOptimizerPasses();
+    if (optimize) {
+      // Unset all-zero recurrent initial states (issue #314) so the
+      // subgraph computing them becomes dead and the passes below can
+      // remove it. Not reflected in the "changed" signal below, but that
+      // is safe: see FixedPointFn's bool-returning overload comment -- any
+      // resulting dead-end elimination is itself reflected in the report.
+      EliminateZeroRnnInitialState(graph);
+    }
+    const bool prev = onnx::optimization::InitializersAsConstants();
+    onnx::optimization::SetInitializersAsConstants(config.initializers_as_constants);
+    std::map<std::string, unsigned int> report;
+    onnx::optimization::OptimizeGraphFixed(graph, config.optimizer_passes, &report,
+                                           /*clear_tensor_digest_cache=*/false);
+    onnx::optimization::SetInitializersAsConstants(prev);
+    bool changed = false;
+    for (const auto& pass_count : report) {
+      if (pass_count.second != 0) {
+        changed = true;
+        break;
+      }
+    }
+    any_changed |= changed;
+    return changed;
+  };
+  FixedPointFn(InferShapesOnGraphChanged, OptimizeGraphChanged, fixed_point_iters)(g);
+  return any_changed;
+}
+
 onnx::ModelProto Simplify(
     const ModelExecutor& executor, const onnx::ModelProto& model,
     std::optional<std::vector<std::string>> skip_optimizers,
@@ -2749,48 +3632,8 @@ onnx::ModelProto Simplify(
         // Dominated in practice by the raw_data cache: real exported models
         // are raw_data-heavy, and measured 98%+ of those hash calls were
         // otherwise recomputing a value already seen earlier in the same
-        // run (see onnxsim issue #633). OptimizeGraphChanged below passes
-        // clear_tensor_digest_cache=false to keep both caches alive across
-        // its own repeated OptimizeGraphFixed calls.
-        onnx::optimization::ClearTensorContentDigestCache();
-        onnx::optimization::ClearRawHashCache();
-        using GraphFnChanged = std::function<bool(onnx::Graph&)>;
-        GraphFnChanged InferShapesOnGraphChanged =
-            shape_inference
-                ? GraphFnChanged([](onnx::Graph& graph) {
-                    onnxsim::ProfiledScope scope("InferShapes");
-                    return onnx::InferShapesOnGraph(graph);
-                  })
-                : GraphFnChanged([](onnx::Graph&) { return false; });
-        GraphFnChanged OptimizeGraphChanged = [optimize](onnx::Graph& graph) {
-          onnxsim::ProfiledScope scope("Optimize");
-          onnxsim::RegisterCustomOptimizerPasses();
-          if (optimize) {
-            // Unset all-zero recurrent initial states (issue #314) so the
-            // subgraph computing them becomes dead and the passes below can
-            // remove it. Not reflected in the "changed" signal below, but
-            // that is safe: see FixedPointFn's bool-returning overload
-            // comment -- any resulting dead-end elimination is itself
-            // reflected in the report.
-            EliminateZeroRnnInitialState(graph);
-          }
-          const bool prev = onnx::optimization::InitializersAsConstants();
-          onnx::optimization::SetInitializersAsConstants(
-              config.initializers_as_constants);
-          std::map<std::string, unsigned int> report;
-          onnx::optimization::OptimizeGraphFixed(
-              graph, config.optimizer_passes, &report,
-              /*clear_tensor_digest_cache=*/false);
-          onnx::optimization::SetInitializersAsConstants(prev);
-          for (const auto& pass_count : report) {
-            if (pass_count.second != 0) {
-              return true;
-            }
-          }
-          return false;
-        };
-        FixedPointFn(InferShapesOnGraphChanged, OptimizeGraphChanged,
-                     fixed_point_iters)(*g);
+        // run (see onnxsim issue #633).
+        OptAndShapeOnGraph(*g, optimize, shape_inference, fixed_point_iters);
         onnx::ModelProto out = onnx::PrepareOutput(model);
         onnx::ExportModelProto(&out, g, /*consume_tensor_data=*/true);
         // OptimizeGraphFixed never sees model-local functions (they live
@@ -2828,10 +3671,55 @@ onnx::ModelProto Simplify(
         Profiled("Pipeline", FixedPointFn(OptAndShapeAndFold, RewriteInPlace,
                                           fixed_point_iters, &converged));
   } else {
-    Pipeline = Profiled(
-        "Pipeline",
-        FixedPointFn(OptAndShape, Profiled("FoldConstant", FoldConstant),
-                     fixed_point_iters, &converged));
+    // Fully Graph-resident outer pipeline: OptAndShapeOnGraph and the
+    // Graph-native constant folder (_EvalPartialShapeOnGraph +
+    // _FoldConstantOnGraph) both run directly against one onnx::Graph held
+    // for the *entire* outer fixed point, so this whole Simplify() call
+    // does exactly one Import and one Export -- instead of one Import+
+    // Export per outer round, which #637/#638 already eliminated at the
+    // *inner* (OptAndShape) level but which this pipeline still paid once
+    // per outer round until now. Only available without a rewriter:
+    // onnxscript's rewriter only understands ModelProto (see the `if
+    // (rewriter)` branch above), so a supplied rewriter still needs the
+    // ModelProto-based OptAndShape/FoldConstant path.
+    using GraphFn = std::function<void(onnx::Graph&)>;
+    using GraphFnChanged = std::function<bool(onnx::Graph&)>;
+    GraphFnChanged OptAndShapeOnGraphChanged =
+        [optimize, shape_inference, fixed_point_iters](onnx::Graph& graph) {
+          onnxsim::ProfiledScope scope("OptAndShape");
+          return OptAndShapeOnGraph(graph, optimize, shape_inference,
+                                    fixed_point_iters);
+        };
+    GraphFnChanged FoldConstantOnGraphChanged =
+        constant_folding
+            ? GraphFnChanged([&executor](onnx::Graph& graph) {
+                onnxsim::ProfiledScope scope("FoldConstant");
+                const bool a = _EvalPartialShapeOnGraph(graph);
+                const bool b = _FoldConstantOnGraph(executor, graph);
+                return a || b;
+              })
+            : GraphFnChanged([](onnx::Graph&) { return false; });
+    GraphFn PipelineOnGraph =
+        FixedPointFn(OptAndShapeOnGraphChanged, FoldConstantOnGraphChanged,
+                     fixed_point_iters, &converged);
+    Pipeline = Profiled("Pipeline", [PipelineOnGraph](onnx::ModelProto& model) {
+      std::shared_ptr<onnx::Graph> g(onnx::ImportModelProto(model));
+      if (g.get() == nullptr) {
+        // Same fallback as Optimizer::optimize(): if we can't parse the
+        // model, leave it untouched.
+        return;
+      }
+      PipelineOnGraph(*g);
+      onnx::ModelProto out = onnx::PrepareOutput(model);
+      onnx::ExportModelProto(&out, g, /*consume_tensor_data=*/true);
+      // OptimizeGraphFixed never sees model-local functions (they live on
+      // ModelProto, not Graph), so carry them over unchanged -- mirroring
+      // Optimizer::optimize()'s own AddFunctionsToModel.
+      for (const auto& function_proto : model.functions()) {
+        *out.add_functions() = function_proto;
+      }
+      model = std::move(out);
+    });
   }
   // The fixed points mutate in place, so make one working copy of the (const)
   // input model and simplify it in place.
