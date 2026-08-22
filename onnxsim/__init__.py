@@ -2,6 +2,7 @@ from onnxsim.calibration import (
     calibrate,
     generate_random_calibration_data,
     load_huggingface_calibration_data,
+    quantize_qoperator,
     quantize_static,
 )
 from onnxsim.onnx_simplifier import (
@@ -28,6 +29,7 @@ __all__ = [
     "quantize_weight_only",
     "quantize_weight_only_int4",
     "quantize_static",
+    "quantize_qoperator",
     "calibrate",
     "generate_random_calibration_data",
     "load_huggingface_calibration_data",
