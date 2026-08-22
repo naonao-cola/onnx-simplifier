@@ -277,11 +277,23 @@ agraph (float[N] X) =&gt; (float[N] Y) {
         <h2 id="sec-quantize">Quantize a model</h2>
         <div class="tool-panel">
             <p class="tool-note">
-                Quantizes the currently loaded model (the uploaded file, or one
-                loaded from Hugging Face / a backend test case / a parsed text
-                graph above) with onnxsim's WebAssembly module, entirely in your
-                browser -- nothing is uploaded. Pick a method:
+                Quantizes a model with onnxsim's WebAssembly module, entirely in
+                your browser -- nothing is uploaded. Its result is kept
+                independent of the plain <b>Convert</b> section above (it never
+                overwrites the "after" Netron pane or <code>converted</code>
+                inference source) so you can inspect all three stages side by
+                side: <b>original</b> -- <b>onnxsim-simplified</b> (Convert
+                section, optional) -- <b>quantized</b> (its own "Quantized"
+                Netron pane and <code>quantized</code> inference source below).
+                Pick what to quantize:
             </p>
+            <div class="convert-modes">
+                <input type="radio" name="quantize-source" value="original" id="quantize_source_original" checked>
+                <label for="quantize_source_original">Original upload</label>
+                <input type="radio" name="quantize-source" value="converted" id="quantize_source_converted">
+                <label for="quantize_source_converted" title="Runs the selected quantize method on the Convert section's own simplify/optimize output, so it applies to already-simplified graphs (e.g. fused Conv+BN, MatMul+Add -> Gemm) rather than the raw upload. Run Simplify/Optimize above first.">onnxsim-simplified (Convert section result)</label>
+            </div>
+            <p class="tool-note">Pick a method:</p>
             <ul class="tool-note">
                 <li><b>Dynamic</b> -- MatMul/Gemm weights are quantized to INT8
                     ahead of time; the activation is quantized at inference time
@@ -346,15 +358,19 @@ agraph (float[N] X) =&gt; (float[N] Y) {
             <div id="quantize-metrics" style="display: none; margin-top: 0.4em;"></div>
         </div>
         <script type="module" src="./quantize_ui.mjs"></script>
-        <h2 id="sec-visualize">Visualize with Netron (before / after)</h2>
+        <h2 id="sec-visualize">Visualize with Netron (original / onnxsim / quantized)</h2>
         <p>
             Renders the model graph with a self-hosted
-            <a href="https://github.com/onnxsim/netron" target="_blank" rel="noopener">Netron</a>:
-            the original model on the left and the simplified/optimized result on
-            the right, so you can compare them side by side. Nothing is uploaded —
-            the model bytes are posted straight into the embedded Netron in your
-            browser, so there is no model-size limit. Use <b>export SVG</b> to save
-            the rendered graph as an SVG image.
+            <a href="https://github.com/onnxsim/netron" target="_blank" rel="noopener">Netron</a>,
+            one pane per pipeline stage, so you can compare them side by side:
+            the original upload, the Convert section's simplify/optimize
+            result, and the Quantize panel's result (independent of the
+            middle pane -- quantizing never overwrites it, see the Quantize
+            panel above). A pane stays empty until that stage has actually
+            run. Nothing is uploaded — the model bytes are posted straight
+            into the embedded Netron in your browser, so there is no
+            model-size limit. Use <b>export SVG</b> to save the rendered
+            graph as an SVG image.
         </p>
         <p class="macs-note">
             Netron is driven here purely as an embeddable model-preview component
@@ -384,6 +400,17 @@ agraph (float[N] X) =&gt; (float[N] Y) {
                 </div>
                 <iframe id="netron-after-frame" class="netron-frame" title="Netron — simplified model" style="display: none;"></iframe>
                 <div id="netron-after-note" class="netron-note"></div>
+            </div>
+            <div class="netron-pane">
+                <div class="netron-head">
+                    <strong>Quantized</strong> —
+                    <button id="netron-quantized-open" type="button" style="display: none;">open in a new tab ↗</button>
+                    <button id="netron-quantized-download" type="button" style="display: none;">download model ↓</button>
+                    <button id="netron-quantized-svg" type="button" style="display: none;">export SVG ↓</button>
+                    <button id="netron-quantized-png" type="button" style="display: none;">export PNG ↓</button>
+                </div>
+                <iframe id="netron-quantized-frame" class="netron-frame" title="Netron — quantized model" style="display: none;"></iframe>
+                <div id="netron-quantized-note" class="netron-note"></div>
             </div>
         </div>
         <script type="module" src="./netron_view.mjs"></script>
@@ -532,6 +559,7 @@ agraph (float[N] X) =&gt; (float[N] Y) {
             <select id="inference-source">
                 <option value="compare">compare (before vs after conversion)</option>
                 <option value="converted">converted (simplify/optimize output)</option>
+                <option value="quantized">quantized (Quantize panel output)</option>
                 <option value="original">original (uploaded)</option>
             </select>
             <label for="inference-ep">execution provider</label>

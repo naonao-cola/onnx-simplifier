@@ -283,9 +283,11 @@ export async function resolveOriginalModelBytes(fileInput) {
 }
 
 // Resolve the model bytes for the chosen source. "converted" uses the bytes
-// the converter page published on window.__onnxsimConverted; "original"
-// delegates to resolveOriginalModelBytes. Returns { bytes, label, name } or
-// throws with a user-facing message.
+// the converter page published on window.__onnxsimConverted; "quantized"
+// uses window.__onnxsimQuantized (the Quantize panel's own output, kept
+// independent of "converted" -- see quantize_ui.mjs); "original" delegates
+// to resolveOriginalModelBytes. Returns { bytes, label, name } or throws
+// with a user-facing message.
 async function resolveModelBytes(source, fileInput) {
   if (source === "converted") {
     const converted = window.__onnxsimConverted;
@@ -297,6 +299,16 @@ async function resolveModelBytes(source, fileInput) {
       );
     }
     return { bytes: converted.bytes, label: `converted (${converted.name})`, name: converted.name };
+  }
+  if (source === "quantized") {
+    const quantized = window.__onnxsimQuantized;
+    if (!quantized || !quantized.bytes) {
+      throw new Error(
+        "no quantized model yet — quantize a model in the Quantize panel " +
+          "above first, or switch the model dropdown to 'original'/'converted'.",
+      );
+    }
+    return { bytes: quantized.bytes, label: `quantized (${quantized.name})`, name: quantized.name };
   }
   return resolveOriginalModelBytes(fileInput);
 }

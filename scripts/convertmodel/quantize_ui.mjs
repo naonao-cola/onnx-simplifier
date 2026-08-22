@@ -1,7 +1,8 @@
 // Browser glue for the "Quantize a model" panel on the converter page.
 //
-// Runs one of onnxsim's quantization methods on the currently loaded model
-// (see resolveOriginalModelBytes in inference_browser.mjs), entirely in the
+// Runs one of onnxsim's quantization methods on either the original upload or
+// the Convert section's own simplify/optimize output (a "Quantize input"
+// radio picks which -- see resolveQuantizeInput below), entirely in the
 // browser -- nothing is uploaded:
 //   - Dynamic / Ternary / Weight-only / Weight-only INT4 need no calibration
 //     data, so it's a single WASM call.
@@ -11,6 +12,13 @@
 //     and their (min, max) ranges are measured by actually running the model
 //     over synthetic random inputs through onnxruntime-web
 //     (quantize_calibration.mjs), mirroring onnxsim.calibration.calibrate().
+//
+// The result is kept independent of the Convert section's own output: it is
+// published on window.__onnxsimQuantized (not window.__onnxsimConverted) and
+// shown in its own "Quantized" Netron pane (window.netronShowQuantized, not
+// netronShowAfter) -- so a user can inspect all three pipeline stages side by
+// side (original / onnxsim-simplified / quantized) rather than the quantized
+// result silently replacing the plain simplify/optimize one.
 //
 // Like debug_tools.mjs's "parse a text graph" panel, the quantization
 // rewrites themselves need no model executor, so they run on this page's own
@@ -22,6 +30,27 @@ import { downloadBytes } from "./download.mjs";
 import { resolveOriginalModelBytes } from "./inference_browser.mjs";
 import { calibrateRanges } from "./quantize_calibration.mjs";
 import { computeQuantizationQuality, renderQuantizationQuality } from "./quantize_metrics.mjs";
+
+// Resolves the model to quantize per the "Quantize input" radio: the raw
+// original upload, or the Convert section's own simplify/optimize output
+// (window.__onnxsimConverted, published by index.html's worker glue when a
+// conversion finishes) -- letting quantization run on an already-simplified
+// graph, where fused patterns (e.g. Conv+BN, MatMul+Add -> Gemm) match more
+// of what onnxsim's quantize passes look for. Throws a user-facing message
+// if "converted" is selected but nothing has been converted yet.
+async function resolveQuantizeInput(source, fileInput) {
+  if (source === "converted") {
+    const converted = window.__onnxsimConverted;
+    if (!converted || !converted.bytes) {
+      throw new Error(
+        "no onnxsim-simplified result yet -- run Simplify/Optimize in the " +
+          "Convert section above first, or switch back to 'Original upload'.",
+      );
+    }
+    return { bytes: converted.bytes, name: converted.name };
+  }
+  return resolveOriginalModelBytes(fileInput);
+}
 
 // Resolve this page's WASM runtime (published by index.html's inline loader).
 function getRuntime() {
@@ -64,6 +93,8 @@ function initQuantizePanel() {
   btn.addEventListener("click", async () => {
     const methodEl = document.querySelector('input[name="quantize-method"]:checked');
     const method = methodEl ? methodEl.value : "dynamic";
+    const sourceEl = document.querySelector('input[name="quantize-source"]:checked');
+    const source = sourceEl ? sourceEl.value : "original";
     btn.disabled = true;
     if (dlBtn) dlBtn.style.display = "none";
     if (metricsEl) {
@@ -72,7 +103,7 @@ function initQuantizePanel() {
     }
     try {
       setStatus("loading model…");
-      const { bytes, name } = await resolveOriginalModelBytes(fileInput);
+      const { bytes, name } = await resolveQuantizeInput(source, fileInput);
       // A fresh ArrayBuffer copy: the WASM calls below read it (never
       // transferred/detached), and it's reused across several calls when
       // calibrating.
@@ -127,10 +158,13 @@ function initQuantizePanel() {
         dlBtn.style.display = "";
         dlBtn.onclick = () => downloadBytes(lastBytes, outName);
       }
-      // Show the result in the "After" Netron pane and publish it as the
-      // inference panel's "converted" source, same as a Simplify/Optimize run.
-      if (window.netronShowAfter) window.netronShowAfter(dataUrl, outName);
-      window.__onnxsimConverted = { bytes: outBytes, name: outName };
+      // Show the result in its own "Quantized" Netron pane and publish it as
+      // the inference panel's "quantized" source -- deliberately independent
+      // of netronShowAfter/window.__onnxsimConverted (the Convert section's
+      // own output), so quantizing never clobbers the plain simplify/optimize
+      // result and all three stages stay inspectable side by side.
+      if (window.netronShowQuantized) window.netronShowQuantized(dataUrl, outName);
+      window.__onnxsimQuantized = { bytes: outBytes, name: outName };
 
       // Best-effort result-quality report: runs float vs. quantized on the
       // same random input through onnxruntime-web. A failure here (e.g. no
