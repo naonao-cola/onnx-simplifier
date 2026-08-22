@@ -19,6 +19,7 @@ from onnxsim.onnx_simplifier import (
     quantize_ternary,
     quantize_weight_only,
     quantize_weight_only_int4,
+    quantize_weight_only_int8_block,
     quantize_weight_only_int16,
     simplify,
 )
@@ -32,6 +33,7 @@ __all__ = [
     "quantize_ternary",
     "quantize_weight_only",
     "quantize_weight_only_int4",
+    "quantize_weight_only_int8_block",
     "quantize_weight_only_int16",
     "quantize_static",
     "quantize_qoperator",

@@ -18,6 +18,7 @@ onnx::ModelProto QuantizeTernary(const onnx::ModelProto& model);
 onnx::ModelProto QuantizeWeightOnly(const onnx::ModelProto& model);
 onnx::ModelProto QuantizeWeightOnlyInt4(const onnx::ModelProto& model);
 onnx::ModelProto QuantizeWeightOnlyInt16(const onnx::ModelProto& model);
+onnx::ModelProto QuantizeWeightOnlyInt8Block(const onnx::ModelProto& model);
 
 std::vector<std::string> ListQuantizableActivations(
     const onnx::ModelProto& model);

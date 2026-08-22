@@ -427,6 +427,75 @@ inline bool TryQuantizeWeightBlockwiseInt4InPlace(const Tensor& w_t,
   return true;
 }
 
+// Same block-wise scheme as TryQuantizeWeightBlockwiseInt4InPlace, but INT8
+// (values in [-127, 127], scale = max(|w|) / 127 per block) instead of
+// INT4 -- a middle ground between QuantizeWeightPerChannelInPlace's single
+// per-channel INT8 scale (coarser, no block overhead) and INT4's block-wise
+// scheme (finer, but a much narrower 4-bit code range): the same per-channel
+// bit width as quantize_weight_only, with block-wise quantization's better
+// resolution for channels a single per-channel scale would under-resolve.
+// Used by weight_only_quantize_int8_block_matmul.h.
+//
+// Unlike INT4, INT8 has no dedicated typed field in TensorProto either, but
+// (like INT8/UINT8/INT16/etc. generally) it lives in `int32_data`/
+// `Tensor::int32s()`, not raw_data -- see ConvertFloatTensorToFp16's comment
+// in quantize_fp16.h for the general rule this follows, and contrast with
+// TryQuantizeWeightBlockwiseInt4InPlace's raw_data nibble-packing, which INT8
+// does not need.
+inline bool TryQuantizeWeightBlockwiseInt8InPlace(const Tensor& w_t,
+                                                  int64_t channel_axis,
+                                                  int64_t block_size,
+                                                  Tensor& q_out,
+                                                  Tensor& scale_out) {
+  const auto& sizes = w_t.sizes();
+  const int64_t dim0 = sizes[0];
+  const int64_t dim1 = sizes[1];
+  const int64_t reduction_axis = 1 - channel_axis;
+  const int64_t K = reduction_axis == 0 ? dim0 : dim1;
+  if (block_size <= 0 || K % block_size != 0) {
+    return false;
+  }
+  const int64_t num_blocks = K / block_size;
+
+  const std::vector<float> data = ReadFloatMatrix(w_t);
+  auto at = [&](int64_t i, int64_t j) { return data[i * dim1 + j]; };
+  const int64_t scale_dim0 = reduction_axis == 0 ? num_blocks : dim0;
+  const int64_t scale_dim1 = reduction_axis == 1 ? num_blocks : dim1;
+  auto scale_index = [&](int64_t i, int64_t j) {
+    const int64_t si = reduction_axis == 0 ? i / block_size : i;
+    const int64_t sj = reduction_axis == 1 ? j / block_size : j;
+    return si * scale_dim1 + sj;
+  };
+
+  std::vector<float> scale(static_cast<size_t>(scale_dim0 * scale_dim1), 0.0f);
+  for (int64_t i = 0; i < dim0; ++i) {
+    for (int64_t j = 0; j < dim1; ++j) {
+      float& s = scale[static_cast<size_t>(scale_index(i, j))];
+      s = std::max(s, std::fabs(at(i, j)));
+    }
+  }
+  for (float& s : scale) {
+    s = s > 0.0f ? s / 127.0f : 1.0f;
+  }
+
+  q_out.elem_type() = TensorProto_DataType_INT8;
+  q_out.sizes() = {dim0, dim1};
+  q_out.int32s().resize(static_cast<size_t>(dim0 * dim1));
+  for (int64_t i = 0; i < dim0; ++i) {
+    for (int64_t j = 0; j < dim1; ++j) {
+      const float s = scale[static_cast<size_t>(scale_index(i, j))];
+      const float q = std::round(at(i, j) / s);
+      q_out.int32s()[i * dim1 + j] =
+          static_cast<int32_t>(std::clamp(q, -127.0f, 127.0f));
+    }
+  }
+
+  scale_out.elem_type() = TensorProto_DataType_FLOAT;
+  scale_out.sizes() = {scale_dim0, scale_dim1};
+  scale_out.floats() = std::move(scale);
+  return true;
+}
+
 }  // namespace onnxsim_passes
 }  // namespace optimization
 }  // namespace ONNX_NAMESPACE

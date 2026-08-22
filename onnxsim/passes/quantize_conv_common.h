@@ -241,6 +241,62 @@ inline bool TryQuantizeConvWeightBlockwiseInt4Flat(const Tensor& w_t,
   return true;
 }
 
+// Same flatten-then-block scheme as TryQuantizeConvWeightBlockwiseInt4Flat,
+// but INT8 (values in [-127, 127], scale = max(|w|) / 127 per block) instead
+// of INT4 -- see TryQuantizeWeightBlockwiseInt8InPlace in
+// quantize_matmul_common.h for why this exists alongside the per-channel
+// INT8 scheme (QuantizeConvWeightPerOutputChannel) and the INT4 block-wise
+// one. Used by weight_only_quantize_int8_block_conv.h. `q_out`/`scale_out`
+// are 2-D ([C, inner] and [C, inner / block_size]) even though `w_t` is not
+// -- like the INT4 version, the caller reshapes the DequantizeLinear output
+// back to `w_t`'s original shape.
+inline bool TryQuantizeConvWeightBlockwiseInt8Flat(const Tensor& w_t,
+                                                   int64_t block_size,
+                                                   Tensor& q_out,
+                                                   Tensor& scale_out) {
+  const auto& sizes = w_t.sizes();
+  const int64_t C = sizes[0];
+  int64_t inner = 1;
+  for (size_t i = 1; i < sizes.size(); ++i) {
+    inner *= sizes[i];
+  }
+  if (block_size <= 0 || inner % block_size != 0) {
+    return false;
+  }
+  const int64_t num_blocks = inner / block_size;
+
+  const std::vector<float> data = ReadFloatTensorFlat(w_t);
+
+  std::vector<float> scale(static_cast<size_t>(C * num_blocks), 0.0f);
+  for (int64_t c = 0; c < C; ++c) {
+    for (int64_t j = 0; j < inner; ++j) {
+      float& s = scale[static_cast<size_t>(c * num_blocks + j / block_size)];
+      s = std::max(s, std::fabs(data[static_cast<size_t>(c * inner + j)]));
+    }
+  }
+  for (float& s : scale) {
+    s = s > 0.0f ? s / 127.0f : 1.0f;
+  }
+
+  q_out.elem_type() = TensorProto_DataType_INT8;
+  q_out.sizes() = {C, inner};
+  q_out.int32s().resize(static_cast<size_t>(C * inner));
+  for (int64_t c = 0; c < C; ++c) {
+    for (int64_t j = 0; j < inner; ++j) {
+      const float s =
+          scale[static_cast<size_t>(c * num_blocks + j / block_size)];
+      const float q = std::round(data[static_cast<size_t>(c * inner + j)] / s);
+      q_out.int32s()[c * inner + j] =
+          static_cast<int32_t>(std::clamp(q, -127.0f, 127.0f));
+    }
+  }
+
+  scale_out.elem_type() = TensorProto_DataType_FLOAT;
+  scale_out.sizes() = {C, num_blocks};
+  scale_out.floats() = std::move(scale);
+  return true;
+}
+
 }  // namespace onnxsim_passes
 }  // namespace optimization
 }  // namespace ONNX_NAMESPACE

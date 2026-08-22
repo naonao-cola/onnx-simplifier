@@ -562,6 +562,55 @@ def quantize_weight_only_int16(model: Union[str, onnx.ModelProto]) -> onnx.Model
     )
 
 
+def quantize_weight_only_int8_block(
+    model: Union[str, onnx.ModelProto],
+) -> onnx.ModelProto:
+    """
+    Block-wise INT8 weight-only quantize every MatMul, every "vanilla" Gemm
+    (transA=0, alpha=1, beta=1), and every Conv, whose weight is a constant
+    float32 tensor whose flattened reduction size -- ``K`` for MatMul/Gemm;
+    ``Cin/groups * prod(kernel dims)`` for Conv -- is evenly divisible by 32.
+
+    The weight is quantized to INT8 (values in ``[-127, 127]``) with a
+    separate symmetric scale per 32-element block of that reduction, per
+    output channel -- the same block-wise granularity
+    :func:`quantize_weight_only_int4` uses, just at INT8's wider code range
+    -- inserting a single ``DequantizeLinear(..., block_size=32)`` in its
+    place (Conv's weight is flattened to 2-D for this, then a ``Reshape``
+    restores its original shape). Like :func:`quantize_weight_only`, the
+    activation is never touched: no calibration data, no runtime
+    quantize/dequantize cost on the activation path.
+
+    This sits between :func:`quantize_weight_only`'s single per-channel INT8
+    scale (coarser, no block overhead) and
+    :func:`quantize_weight_only_int4`'s block-wise INT4 (finer blocks, but
+    only 15 representable codes per block): the same storage as
+    :func:`quantize_weight_only` (INT8 codes are still 1 byte each; only the
+    scale tensor grows, from one float per channel to one float per (block,
+    channel) pair), with resolution closer to a per-block scheme. Uses ONNX
+    opset 21's ``DequantizeLinear`` ``block_size`` attribute -- standard
+    ONNX, not a contrib op -- the same opset floor as
+    :func:`quantize_weight_only_int4`, even though plain INT8 itself needs
+    only opset 13.
+
+    This is a single, self-contained graph rewrite: unlike :func:`simplify`,
+    it does not run shape inference, constant folding, or any other pass.
+    Nodes that do not match (dynamic or unsupported-rank weights, a
+    reduction size not divisible by 32, non-default Gemm attributes,
+    non-float32 operands, an opset older than 21) are left untouched.
+    Consider calling :func:`simplify` before and/or after to clean up the
+    graph.
+
+    :param model: onnx ModelProto object or file path
+    :returns: the quantized onnx ModelProto
+    """
+    if isinstance(model, str):
+        model = onnx.load(model, load_external_data=False)
+    return onnx.load_from_string(
+        C.quantize_weight_only_int8_block(model.SerializeToString())
+    )
+
+
 def quantize_fp16(
     model: Union[str, onnx.ModelProto], keep_io_types: bool = True
 ) -> onnx.ModelProto:
@@ -1638,6 +1687,19 @@ def main():
         action="store_true",
     )
     parser.add_argument(
+        "--weight-only-quantize-int8-block",
+        help="After simplifying, block-wise INT8 weight-only quantize "
+        "MatMul/Gemm/Conv weights (one symmetric scale per 32-element block "
+        "of the flattened reduction dimension, per output channel, values "
+        "in [-127, 127]), inserting a single "
+        "DequantizeLinear(block_size=32) per weight. Activations are never "
+        "touched. Same storage as --weight-only-quantize's INT8, but "
+        "resolution closer to --weight-only-quantize-int4's block-wise "
+        "scheme. Needs opset >= 21. See "
+        "onnxsim.quantize_weight_only_int8_block.",
+        action="store_true",
+    )
+    parser.add_argument(
         "--fp16-quantize",
         help="After simplifying, convert every float32 weight (and, by "
         "default, every internal activation) to float16 -- no calibration "
@@ -1948,6 +2010,10 @@ def main():
     if args.weight_only_quantize_int16:
         print("INT16 weight-only quantizing MatMul/Gemm/Conv weights...")
         model_opt = quantize_weight_only_int16(model_opt)
+
+    if args.weight_only_quantize_int8_block:
+        print("Block-wise INT8 weight-only quantizing MatMul/Gemm/Conv weights...")
+        model_opt = quantize_weight_only_int8_block(model_opt)
 
     if args.fp16_quantize:
         print("Converting float32 weights/activations to float16...")
