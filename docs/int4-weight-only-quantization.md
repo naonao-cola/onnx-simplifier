@@ -2,11 +2,14 @@
 
 ## What this is
 
-`onnxsim.quantize_weight_only_int4` is a single, self-contained C++ graph
-rewrite (`onnxsim/passes/weight_only_quantize_int4_matmul.h`) that
-block-wise quantizes every `MatMul`, and every "vanilla" `Gemm` (`transA=0`,
-`alpha=1`, `beta=1`), whose weight is a constant 2-D float32 tensor whose
-reduction dimension `K` is evenly divisible by 32.
+`onnxsim.quantize_weight_only_int4` is a pair of single, self-contained C++
+graph rewrites (`onnxsim/passes/weight_only_quantize_int4_matmul.h`,
+`onnxsim/passes/weight_only_quantize_int4_conv.h`) that block-wise quantize
+every `MatMul`, every "vanilla" `Gemm` (`transA=0`, `alpha=1`, `beta=1`), and
+every `Conv`, whose weight is a constant float32 tensor whose flattened
+reduction size is evenly divisible by 32 -- `K` for MatMul/Gemm; `Cin/groups
+* prod(kernel dims)` for Conv, since Conv has no single reduction axis the
+way MatMul does (see "Conv's flattened reduction" below).
 
 It extends `quantize_weight_only` (INT8, one scale per output channel) with
 a smaller data type and finer granularity:
@@ -55,6 +58,36 @@ error low, without so many blocks that the scale tensor's own storage
 overhead erodes the compression this pass exists to provide (a fixed
 constant for now -- see Scope).
 
+## Conv's flattened reduction
+
+Conv's weight (`[Cout, Cin/groups, k...]`) has no single axis that plays
+`K`'s role the way MatMul/Gemm's weight does -- every one of `Cin/groups`
+and the kernel's spatial dims contributes to one output pixel's sum.
+Blocking one of Conv's own axes directly (say, `Cin/groups`) would put an
+*independent* scale on every kernel spatial position, which for a 3x3 kernel
+means 9x the scale-tensor overhead for little accuracy benefit, since each
+of those 9 positions would get its own scale regardless of block size.
+
+Instead, `weight_only_quantize_int4_conv.h` flattens everything but the
+output channel into one sequence (`inner = Cin/groups * prod(k...)`) and
+blocks *that*, exactly as MatMul's `K` is blocked:
+
+```
+Before:
+  Y = Conv(X, W)              # W constant, [Cout, Cin/groups, k...], float32
+
+After:
+  Wq_flat  = <int4, [Cout, inner]>                        # inner = Cin/groups * prod(k...)
+  Ws_flat  = <float32, [Cout, inner / 32]>
+  Wdq_flat = DequantizeLinear(Wq_flat, Ws_flat, axis=1, block_size=32)
+  Wdq      = Reshape(Wdq_flat, [Cout, Cin/groups, k...])   # restore Conv's expected shape
+  Y        = Conv(X, Wdq)
+```
+
+The extra `Reshape` is the only structural difference from the MatMul/Gemm
+rewrite; the quantization scheme itself (symmetric INT4, block-local scale)
+is identical.
+
 ## Scope
 
 Handled:
@@ -62,15 +95,15 @@ Handled:
   dimension (`K`) is a multiple of 32.
 - `Gemm(X, W[, B])` with `transA=0`, `alpha=1`, `beta=1` (when `B` is
   present), same weight constraint. `transB` may be 0 or 1.
+- `Conv(X, W[, B])` with `W` a constant float32 tensor, rank >= 3, whose
+  flattened `Cin/groups * prod(k...)` is a multiple of 32.
 - Opsets >= 21.
 
 Left untouched (safe no-op, node passes through as-is):
-- A `K` that is not a multiple of 32 -- a ragged last block is left to a
-  future extension rather than approximated.
-- Non-constant or non-2-D weights, non-default Gemm attributes, non-float32
-  operands, or an opset older than 21.
-- `Conv` -- not yet covered by this pass (unlike `quantize_weight_only`,
-  which does cover it); a natural, still-open follow-up.
+- A reduction size that is not a multiple of 32 -- a ragged last block is
+  left to a future extension rather than approximated.
+- Non-constant or unsupported-rank weights, non-default Gemm attributes,
+  non-float32 operands, or an opset older than 21.
 
 ## End-to-end: simplify -> quantize -> deploy
 
@@ -99,8 +132,8 @@ outputs = sess.run(None, {"input": your_input_array})
 ```
 
 `tests/test_weight_only_quantize_int4.py` runs this simplify -> quantize ->
-deploy sequence on small `MatMul`/`Gemm` models, executing both the float and
-quantized graphs through `onnxruntime.InferenceSession`.
+deploy sequence on small `MatMul`/`Gemm`/`Conv` models, executing both the
+float and quantized graphs through `onnxruntime.InferenceSession`.
 
 ## Relationship to `quantize_weight_only`
 
