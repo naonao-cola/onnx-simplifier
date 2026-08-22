@@ -2796,35 +2796,36 @@ std::function<void(T&)> FixedPointFn(const std::function<void(T&)>& f1,
 // InferShapes value-change count are exact for onnxsim's pass list (no
 // pass with an ``Empty``/uncounted analysis type is used), so a ``false``
 // return means that call provably made no change -- not just "probably".
-// A false negative here (missing a real change) would still not produce an
-// incorrect model: it only makes this inner loop stop one round early, and
-// the fingerprint-based fixed point one level up (which wraps every call
-// to ``OptAndShape`` as a whole) re-drives it from the top if that whole
-// call's net effect changed anything, same as a ``Fingerprint`` hash
-// collision would.
+//
+// Convergence requires a whole *round* (one ``f1`` call followed by one
+// ``f2`` call) to report no change from either, not just the most recent
+// call: ``f1`` reporting false only means it found nothing new, not that
+// ``f2``'s previous call is done making downstream cleanup available (e.g.
+// a Complete-efficiency onnx-optimizer pass firing late in
+// ``OptimizeGraphFixed``'s own pass-list order can leave a now-dead node
+// that an earlier-ordered pass in that same call never got a chance to
+// revisit -- ``f1`` correctly reports no new shape info either way, but
+// ``f2`` still has cleanup work left for its *next* call). Stopping right
+// after a lone ``f1`` false, as an earlier version of this function did,
+// silently left that cleanup undone whenever nothing above this loop
+// happened to re-drive it; matching a whole round instead of a single call
+// closes that gap unconditionally, with no dependence on some caller
+// incidentally running this again.
 template <typename T>
 std::function<void(T&)> FixedPointFn(const std::function<bool(T&)>& f1,
                                      const std::function<bool(T&)>& f2,
                                      size_t max_iters, bool* converged) {
   return [f1, f2, max_iters, converged](T& model) -> void {
     size_t _max_iters = max_iters;
-    f1(model);
-    bool last_changed = f2(model);
     while (_max_iters-- > 0) {
-      if (!last_changed) {
+      const bool c1 = f1(model);
+      const bool c2 = f2(model);
+      if (!c1 && !c2) {
         if (converged) {
           *converged = true;
         }
         return;
       }
-      last_changed = f1(model);
-      if (!last_changed) {
-        if (converged) {
-          *converged = true;
-        }
-        return;
-      }
-      last_changed = f2(model);
     }
 
     if (converged) {
