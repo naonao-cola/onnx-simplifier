@@ -38,6 +38,7 @@
 #include "onnx/common/assertions.h"
 #include "onnxoptimizer/pass.h"
 #include "onnxoptimizer/passes/pass_util.h"
+#include "passes/endian_read.h"
 
 namespace ONNX_NAMESPACE {
 namespace optimization {
@@ -69,11 +70,35 @@ struct FuseBNIntoConv final : public PredicateBasedPass {
   // specialization) so ModifyConvNumeric<T>() below can call it unqualified
   // for either T -- ordinary member lookup resolves the right one per
   // instantiation since it is a plain overload set, not a template itself.
+  // A typed field needs no endian handling on the way out either: protobuf
+  // encodes it correctly regardless of host byte order (see endian_read.h).
   static void SetTensorData(Tensor& t, std::vector<float> v) {
     t.floats() = std::move(v);
   }
   static void SetTensorData(Tensor& t, std::vector<double> v) {
     t.doubles() = std::move(v);
+  }
+
+  // Read `t` (`numel` elements of type T) into a flat, host-byte-order
+  // vector, regardless of whether it's stored as raw bytes (little-endian on
+  // the wire regardless of host -- see endian_read.h) or a typed array
+  // (already host-order). The trailing `T` parameter is an unused dispatch
+  // tag: overloaded (not a template) for the same reason as SetTensorData
+  // above, but a plain overload can't be selected on return type alone, so
+  // ModifyConvNumeric<T>() passes `T()` to pick the right one.
+  static std::vector<float> ReadTensorFlat(const Tensor& t, int64_t numel,
+                                           float) {
+    if (t.is_raw_data()) {
+      return ReadRawDataHostOrder<float>(t.data<float>(), numel);
+    }
+    return t.floats();
+  }
+  static std::vector<double> ReadTensorFlat(const Tensor& t, int64_t numel,
+                                            double) {
+    if (t.is_raw_data()) {
+      return ReadRawDataHostOrder<double>(t.data<double>(), numel);
+    }
+    return t.doubles();
   }
 
   // Fold the BN parameters into the conv/conv-transpose weight and bias with
@@ -108,11 +133,10 @@ struct FuseBNIntoConv final : public PredicateBasedPass {
                          const Tensor& bn_mean, const Tensor& bn_var,
                          const Tensor& conv_W, const Tensor* conv_bias,
                          int64_t C, int axis) {
-    const T* scale = bn_scale.data<T>();
-    const T* bias = bn_bias.data<T>();
-    const T* mean = bn_mean.data<T>();
-    const T* var = bn_var.data<T>();
-    const T* w_in = conv_W.data<T>();
+    const std::vector<T> scale = ReadTensorFlat(bn_scale, C, T());
+    const std::vector<T> bias = ReadTensorFlat(bn_bias, C, T());
+    const std::vector<T> mean = ReadTensorFlat(bn_mean, C, T());
+    const std::vector<T> var = ReadTensorFlat(bn_var, C, T());
     const T eps =
         static_cast<T>(GetValueFromAttrWithDefault(bn, kepsilon, 1e-5f));
 
@@ -125,18 +149,21 @@ struct FuseBNIntoConv final : public PredicateBasedPass {
     for (size_t i = static_cast<size_t>(axis) + 1; i < w_sizes.size(); ++i) {
       inner *= w_sizes[i];
     }
+    const int64_t w_numel = outer * C * inner;
+    const std::vector<T> w_in = ReadTensorFlat(conv_W, w_numel, T());
+    const std::vector<T> orig_bias =
+        conv_bias == nullptr ? std::vector<T>(static_cast<size_t>(C), T(0))
+                             : ReadTensorFlat(*conv_bias, C, T());
 
     std::vector<T> s(static_cast<size_t>(C));
     std::vector<T> new_bias(static_cast<size_t>(C));
     for (int64_t c = 0; c < C; ++c) {
       s[static_cast<size_t>(c)] = scale[c] / std::sqrt(var[c] + eps);
-      const T orig_bias_c =
-          conv_bias == nullptr ? T(0) : conv_bias->data<T>()[c];
       new_bias[static_cast<size_t>(c)] =
-          (orig_bias_c - mean[c]) * s[static_cast<size_t>(c)] + bias[c];
+          (orig_bias[c] - mean[c]) * s[static_cast<size_t>(c)] + bias[c];
     }
 
-    std::vector<T> new_w(static_cast<size_t>(outer * C * inner));
+    std::vector<T> new_w(static_cast<size_t>(w_numel));
     for (int64_t o = 0; o < outer; ++o) {
       for (int64_t c = 0; c < C; ++c) {
         const T sc = s[static_cast<size_t>(c)];
