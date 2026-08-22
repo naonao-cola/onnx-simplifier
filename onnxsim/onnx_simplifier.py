@@ -812,9 +812,13 @@ def simplify(
             Chrome Trace Event Format JSON to this path (an empty string uses
             ``onnxsim_profile.json``). Open the file in ``chrome://tracing`` or
             https://ui.perfetto.dev to see the flame graph; a per-function summary
-            is also printed to stdout. Implemented in the C++ core via the
-            ``ONNXSIM_PROFILE`` environment variable, so it works from every
-            binding; setting this argument simply sets that variable for the call.
+            is also printed to stdout. The trace also records a "NodeCount"
+            counter event after every round of each fixed-point loop, tagged
+            with which loop produced it -- see ``onnxsim.profile_plot`` (or
+            ``--node-reduction-plot``) to turn that into a node-count-per-round
+            plot. Implemented in the C++ core via the ``ONNXSIM_PROFILE``
+            environment variable, so it works from every binding; setting this
+            argument simply sets that variable for the call.
     :param ort_profile: When set, turn on onnxruntime's own built-in session
             profiler for the onnxruntime sessions onnxsim runs while simplifying
             (the constant-folding sessions, plus the correctness-check runs when
@@ -1535,6 +1539,19 @@ def main():
         action="store_true",
     )
     parser.add_argument(
+        "--node-reduction-plot",
+        help="After simplifying, plot node count per round for each "
+        "simplification fixed-point loop (from the --profile trace's "
+        "'NodeCount' events) and save it as a PNG at the given path (defaults "
+        "to the --profile trace's path with '_node_reduction.png' appended). "
+        "Implies --profile (defaults to 'onnxsim_profile.json') if not "
+        "already given. Needs matplotlib: 'pip install onnxsim[plot]'.",
+        type=str,
+        nargs="?",
+        const="",
+        default=None,
+    )
+    parser.add_argument(
         "--graph-diff",
         help="Print a node- and value-level diff between the original and "
         "simplified graphs after simplification, matched by output tensor "
@@ -1833,6 +1850,12 @@ def main():
                 )
             )
 
+    # Plotting the node-reduction curve needs the "NodeCount" events a
+    # profiled run writes, so turn --profile on if the user only asked for
+    # the plot.
+    if args.node_reduction_plot is not None and args.profile is None:
+        args.profile = "onnxsim_profile.json"
+
     input_tensors = None
     if args.input_data_path is not None:
         input_tensors = {}
@@ -1872,6 +1895,17 @@ def main():
         ort_profile=args.ort_profile,
         merge_ort_profile=args.merge_ort_profile,
     )
+
+    if args.node_reduction_plot is not None:
+        from . import profile_plot
+
+        plot_out = args.node_reduction_plot or None
+        try:
+            plot_path = profile_plot.plot_node_reduction(args.profile, plot_out)
+        except RuntimeError as e:
+            print(Text(f"WARNING: --node-reduction-plot failed: {e}", style="bold red"))
+        else:
+            print(f"Node reduction plot written to {plot_path}")
 
     if args.dynamic_quantize:
         print("Dynamically quantizing MatMul/Gemm weights to INT8...")

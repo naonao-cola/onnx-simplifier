@@ -1062,6 +1062,16 @@ void RecordSimplifyOptionsMetadata(
   }
 }
 
+// Number of nodes currently in `graph`'s main node list. Only used to feed
+// the profiler's per-round "node reduction" counter (see RecordNodeCount
+// call sites below); callers already guard this behind
+// Profiler::Instance().enabled() so the O(n) walk never runs when profiling
+// is off.
+size_t CountGraphNodes(const onnx::Graph& graph) {
+  return static_cast<size_t>(
+      std::distance(graph.nodes().begin(), graph.nodes().end()));
+}
+
 // Runs InferShapesOnGraph + OptimizeGraphFixed to their own inner fixed
 // point directly on `g`, with no ModelProto conversion at either end -- the
 // Graph-resident core shared by OptAndShape's ModelFn (which wraps this in
@@ -1113,6 +1123,10 @@ bool OptAndShapeOnGraph(onnx::Graph& g, bool optimize, bool shape_inference,
       }
     }
     any_changed |= changed;
+    if (onnxsim::Profiler::Instance().enabled()) {
+      onnxsim::Profiler::Instance().RecordNodeCount("Optimize",
+                                                     CountGraphNodes(graph));
+    }
     return changed;
   };
   FixedPointFn(InferShapesOnGraphChanged, OptimizeGraphChanged,
@@ -1232,6 +1246,10 @@ onnx::ModelProto Simplify(
       // constants that the ordinary constant folder can then propagate.
       _EvalPartialShape(model);
       model = _FoldConstant(executor, std::move(model));
+      if (onnxsim::Profiler::Instance().enabled()) {
+        onnxsim::Profiler::Instance().RecordNodeCount(
+            "FoldConstant", static_cast<size_t>(model.graph().node_size()));
+      }
     };
   } else {
     FoldConstant = Identity;
@@ -1305,6 +1323,12 @@ onnx::ModelProto Simplify(
   struct ProfilerFinishGuard {
     ~ProfilerFinishGuard() { onnxsim::Profiler::Instance().Finish(); }
   } profiler_finish_guard;
+  // Baseline point for the "node reduction per loop" plot: the node count
+  // before any fixed-point round has run.
+  if (onnxsim::Profiler::Instance().enabled()) {
+    onnxsim::Profiler::Instance().RecordNodeCount(
+        "Initial", static_cast<size_t>(model.graph().node_size()));
+  }
   auto Profiled = [](const char* name, ModelFn fn) -> ModelFn {
     if (!onnxsim::Profiler::Instance().enabled()) {
       return fn;
@@ -1399,6 +1423,10 @@ onnx::ModelProto Simplify(
           // unchanged model and converges without an extra ModelProto
           // round-trip.
           rewriter->_Run(model);
+          if (onnxsim::Profiler::Instance().enabled()) {
+            onnxsim::Profiler::Instance().RecordNodeCount(
+                "Rewrite", static_cast<size_t>(model.graph().node_size()));
+          }
         });
     Pipeline =
         Profiled("Pipeline", FixedPointFn(OptAndShapeAndFold, RewriteInPlace,
@@ -1434,6 +1462,10 @@ onnx::ModelProto Simplify(
                 const bool a = _EvalPartialShapeOnGraph(graph);
                 const bool b =
                     _FoldConstantOnGraph(executor, graph, fold_ir_version);
+                if (onnxsim::Profiler::Instance().enabled()) {
+                  onnxsim::Profiler::Instance().RecordNodeCount(
+                      "FoldConstant", CountGraphNodes(graph));
+                }
                 return a || b;
               })
             : GraphFnChanged([](onnx::Graph&) { return false; });

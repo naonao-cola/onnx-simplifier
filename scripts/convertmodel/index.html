@@ -542,6 +542,16 @@ agraph (float[N] X) =&gt; (float[N] Y) {
             open the full Perfetto timeline inline on this page.
         </p>
         <div id="simplify-trace" class="wide"></div>
+        <h3 id="sec-node-reduction">Node reduction per loop</h3>
+        <p>
+            How many nodes the graph held right after every round of each
+            simplification fixed-point loop, until it stopped changing (a
+            <b>fixed point</b>) or hit the round cap. One chart per loop —
+            <b>Optimize</b> (shape inference + onnx-optimizer passes) usually
+            does the most rounds; <b>FoldConstant</b> is the outer pipeline
+            wrapping it.
+        </p>
+        <div id="simplify-node-reduction" class="wide"></div>
         <h2 id="sec-inference">Run inference (onnxruntime-web)</h2>
         <p>
             Runs a model for a few iterations to check it executes, using dummy

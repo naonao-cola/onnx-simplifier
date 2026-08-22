@@ -421,6 +421,30 @@ needed. It implies `ONNXSIM_PROFILE` (defaulting to `onnxsim_profile.json`):
 ONNXSIM_MERGE_ORT_PROFILE=1 onnxsim input_onnx_model output_onnx_model
 ```
 
+### Node-reduction plot
+
+A `profile` trace also records how many nodes the graph holds right after
+every round of each fixed-point loop (`Optimize`, `FoldConstant`, and
+`Rewrite` when a `custom_rewriter` is given), as `NodeCount` counter events.
+`onnxsim.profile_plot.plot_node_reduction` (or `--node-reduction-plot` on the
+command line) turns those into a PNG with one subplot per loop -- node count
+against round index -- so you can see at a glance how many rounds each loop
+took and whether it converged (a flat tail) or hit the round cap
+(`ONNXSIM_FIXED_POINT_ITERS`, default 50) still descending. It needs
+matplotlib (`pip install onnxsim[plot]`):
+
+```python
+model_simp, check = onnxsim.simplify(model, profile="profile.json")
+
+from onnxsim.profile_plot import plot_node_reduction
+plot_node_reduction("profile.json")  # -> profile.json_node_reduction.png
+```
+
+```
+# Implies --profile if not given explicitly.
+onnxsim input_onnx_model output_onnx_model --node-reduction-plot
+```
+
 ## Custom rewriters
 
 Beyond the built-in optimizer passes, you can plug your own graph rewriting
