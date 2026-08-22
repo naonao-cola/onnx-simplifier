@@ -142,6 +142,26 @@ onnx::ModelProto QuantizeStatic(
                                       "static_quantize_conv"});
 }
 
+onnx::ModelProto QuantizeStaticInt16(
+    const onnx::ModelProto& model,
+    const std::unordered_map<std::string, std::pair<float, float>>&
+        activation_ranges) {
+  PrepareSchemasForDebug(model);
+  // Registers static_quantize_int16_matmul/_conv (idempotent) into
+  // onnxoptimizer's registry so OptimizeFixed can find them by name below.
+  onnxsim::RegisterCustomOptimizerPasses();
+  // Reads/writes the same calibration-ranges global QuantizeStatic uses --
+  // safe as long as only one of QuantizeStatic/QuantizeStaticInt16/
+  // QuantizeQOperator runs per call, which OptimizeFixed's single
+  // pass-name list here ensures (see QuantizeQOperator's own comment on
+  // this).
+  onnx::optimization::onnxsim_passes::StaticQuantizationCalibrationRanges() =
+      activation_ranges;
+  return onnx::optimization::OptimizeFixed(
+      model, std::vector<std::string>{"static_quantize_int16_matmul",
+                                      "static_quantize_int16_conv"});
+}
+
 std::vector<std::string> ListQOperatorQuantizableOutputs(
     const onnx::ModelProto& model) {
   PrepareSchemasForDebug(model);

@@ -28,6 +28,11 @@ onnx::ModelProto QuantizeStatic(
     const std::unordered_map<std::string, std::pair<float, float>>&
         activation_ranges);
 
+onnx::ModelProto QuantizeStaticInt16(
+    const onnx::ModelProto& model,
+    const std::unordered_map<std::string, std::pair<float, float>>&
+        activation_ranges);
+
 std::vector<std::string> ListQOperatorQuantizableOutputs(
     const onnx::ModelProto& model);
 

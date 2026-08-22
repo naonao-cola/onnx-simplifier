@@ -531,6 +531,57 @@ def quantize_static(
     return onnx.load_from_string(C.quantize_static(model.SerializeToString(), ranges))
 
 
+def quantize_static_int16(
+    model: Union[str, onnx.ModelProto],
+    calibration_data: Optional[Sequence[Tensors]] = None,
+    num_calibration_samples: int = 8,
+    seed: int = 0,
+    providers: Optional[Sequence[str]] = None,
+    method: str = "minmax",
+) -> onnx.ModelProto:
+    """
+    Same as :func:`quantize_static`, but a "W8A16" scheme: the weight stays
+    INT8 (identical per-output-channel symmetric scheme), while the
+    activation is quantized to uint16 instead of uint8 -- an 8x finer
+    calibrated affine step (1/65535 relative vs uint8's 1/255).
+
+    Useful for activations a QDQ round trip is unusually sensitive to (e.g.
+    post-softmax attention scores, or a tensor whose calibrated range is wide
+    relative to its typical value), without giving up INT8's weight
+    compression the way widening the weight too would. Needs opset >= 21
+    (uint16 QuantizeLinear/DequantizeLinear support), unlike
+    :func:`quantize_static`'s uint8 scheme, which only needs opset 13.
+
+    :param model: onnx ModelProto object or file path
+    :param calibration_data: representative input batches to calibrate
+            activation ranges from. Each batch is a ``{input_name: np.ndarray}``
+            dict matching the model's graph inputs -- see
+            :func:`generate_random_calibration_data` (the default, a quick
+            smoke test) and :func:`load_huggingface_calibration_data` (real
+            data, a much better calibration source for real deployment).
+    :param num_calibration_samples: number of random batches to generate when
+            ``calibration_data`` is not supplied
+    :param seed: seed for the random calibration data (ignored if
+            ``calibration_data`` is supplied)
+    :param providers: onnxruntime execution providers to run calibration on
+    :param method: calibration range method, passed through to
+            :func:`calibrate` -- ``"minmax"`` (default) or ``"entropy"``
+            (KL-divergence calibration; see that function for the tradeoff
+            and its extra data requirement).
+    :returns: the quantized onnx ModelProto
+    """
+    if isinstance(model, str):
+        model = onnx.load(model, load_external_data=False)
+    if calibration_data is None:
+        calibration_data = generate_random_calibration_data(
+            model, num_samples=num_calibration_samples, seed=seed
+        )
+    ranges = calibrate(model, calibration_data, providers=providers, method=method)
+    return onnx.load_from_string(
+        C.quantize_static_int16(model.SerializeToString(), ranges)
+    )
+
+
 def quantize_qoperator(
     model: Union[str, onnx.ModelProto],
     calibration_data: Optional[Sequence[Tensors]] = None,

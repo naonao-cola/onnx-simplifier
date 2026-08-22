@@ -4,6 +4,7 @@ from onnxsim.calibration import (
     load_huggingface_calibration_data,
     quantize_qoperator,
     quantize_static,
+    quantize_static_int16,
 )
 from onnxsim.onnx_simplifier import (
     export_gguf,
@@ -36,6 +37,7 @@ __all__ = [
     "quantize_weight_only_int8_block",
     "quantize_weight_only_int16",
     "quantize_static",
+    "quantize_static_int16",
     "quantize_qoperator",
     "quantize_fp16",
     "quantize_bf16",
