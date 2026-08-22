@@ -333,11 +333,17 @@ agraph (float[N] X) =&gt; (float[N] Y) {
             </div>
             <label for="quantize-samples">calibration samples (Static / QOperator only)</label>
             <input type="number" id="quantize-samples" value="8" min="1" max="64" step="1" style="width: 4em;">
+            <br/>
+            <input type="checkbox" id="quantize-metrics-toggle" checked>
+            <label for="quantize-metrics-toggle" title="After quantizing, run the float and quantized models on the same random input through onnxruntime-web and report the size change plus how far the outputs drifted -- relative L2 error and SQNR, the same aggregate-error metric onnxsim's own test suite checks.">
+                report result quality (size change, relative L2 error, SQNR) after quantizing
+            </label>
             <div class="debug-actions">
                 <button id="quantize-button" type="button">Quantize</button>
                 <button id="quantize-download" type="button" style="display: none;">download model ↓</button>
                 <span id="quantize-status" class="tool-note"></span>
             </div>
+            <div id="quantize-metrics" style="display: none; margin-top: 0.4em;"></div>
         </div>
         <script type="module" src="./quantize_ui.mjs"></script>
         <h2 id="sec-visualize">Visualize with Netron (before / after)</h2>

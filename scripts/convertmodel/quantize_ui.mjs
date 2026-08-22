@@ -21,6 +21,7 @@
 import { downloadBytes } from "./download.mjs";
 import { resolveOriginalModelBytes } from "./inference_browser.mjs";
 import { calibrateRanges } from "./quantize_calibration.mjs";
+import { computeQuantizationQuality, renderQuantizationQuality } from "./quantize_metrics.mjs";
 
 // Resolve this page's WASM runtime (published by index.html's inline loader).
 function getRuntime() {
@@ -51,6 +52,8 @@ function initQuantizePanel() {
   const statusEl = document.getElementById("quantize-status");
   const dlBtn = document.getElementById("quantize-download");
   const samplesEl = document.getElementById("quantize-samples");
+  const metricsToggleEl = document.getElementById("quantize-metrics-toggle");
+  const metricsEl = document.getElementById("quantize-metrics");
 
   const setStatus = (msg) => {
     if (statusEl) statusEl.textContent = msg;
@@ -63,6 +66,10 @@ function initQuantizePanel() {
     const method = methodEl ? methodEl.value : "dynamic";
     btn.disabled = true;
     if (dlBtn) dlBtn.style.display = "none";
+    if (metricsEl) {
+      metricsEl.style.display = "none";
+      metricsEl.innerHTML = "";
+    }
     try {
       setStatus("loading model…");
       const { bytes, name } = await resolveOriginalModelBytes(fileInput);
@@ -124,6 +131,30 @@ function initQuantizePanel() {
       // inference panel's "converted" source, same as a Simplify/Optimize run.
       if (window.netronShowAfter) window.netronShowAfter(dataUrl, outName);
       window.__onnxsimConverted = { bytes: outBytes, name: outName };
+
+      // Best-effort result-quality report: runs float vs. quantized on the
+      // same random input through onnxruntime-web. A failure here (e.g. no
+      // usable execution provider, or an input shape onnxruntime-web can't
+      // auto-fill) shouldn't take away the quantized model itself, which is
+      // already valid and downloadable at this point -- so it only appends a
+      // note to the status line rather than replacing it or throwing.
+      if (!metricsToggleEl || metricsToggleEl.checked) {
+        try {
+          setStatus(`done (${outBytes.length.toLocaleString()} bytes). measuring result quality…`);
+          const quality = await computeQuantizationQuality(bytes, outBytes, setStatus);
+          if (metricsEl) {
+            metricsEl.innerHTML = renderQuantizationQuality(quality);
+            metricsEl.style.display = "";
+          }
+          setStatus(`done (${outBytes.length.toLocaleString()} bytes).`);
+        } catch (metricsErr) {
+          setStatus(
+            `done (${outBytes.length.toLocaleString()} bytes). ` +
+              "result-quality check failed: " +
+              (metricsErr && metricsErr.message ? metricsErr.message : metricsErr),
+          );
+        }
+      }
     } catch (err) {
       setStatus("quantize error: " + (err && err.message ? err.message : err));
     } finally {
