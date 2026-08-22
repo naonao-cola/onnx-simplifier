@@ -351,6 +351,17 @@ onnx::ModelProto QuantizeQOperator(
 onnx::ModelProto QuantizeFp16(const onnx::ModelProto& model,
                               bool keep_io_types = true);
 
+// Converts a model's float32 weights and (by default) internal activations
+// to bfloat16. The same kind of calibration-free, whole-graph "quantization"
+// as ``QuantizeFp16``, just to a different narrow floating-point format:
+// bfloat16 keeps float32's full 8-bit exponent range and narrows only the
+// mantissa (7 bits instead of float32's 23), so no clamping is needed --
+// every finite float32 value maps to a finite bfloat16 value. See
+// ``passes/quantize_bf16.h`` for the rewrite itself; ``keep_io_types``, scope,
+// and every other semantic exactly mirror ``QuantizeFp16`` above.
+onnx::ModelProto QuantizeBf16(const onnx::ModelProto& model,
+                              bool keep_io_types = true);
+
 void SimplifyPath(
     const ModelExecutor& executor, const std::string& in_path,
     const std::string& out_path,

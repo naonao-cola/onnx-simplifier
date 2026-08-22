@@ -573,6 +573,57 @@ def quantize_fp16(
     )
 
 
+def quantize_bf16(
+    model: Union[str, onnx.ModelProto], keep_io_types: bool = True
+) -> onnx.ModelProto:
+    """
+    Convert every float32 weight -- and, by default, every internal
+    activation -- in ``model`` to bfloat16.
+
+    The same calibration-free, whole-graph conversion as
+    :func:`quantize_fp16`, just to a different narrow floating-point format:
+    bfloat16 keeps float32's full 8-bit exponent range and narrows only the
+    mantissa (7 bits instead of float32's 23), so every finite float32 value
+    maps to a finite bfloat16 value -- unlike float16, no clamping is ever
+    needed.
+
+    With ``keep_io_types`` (the default ``True``), the model's own external
+    input/output types stay float32 -- a ``Cast`` is inserted right after
+    each float32 graph input and right before each float32 graph output, so
+    the model's public interface is unchanged and only its internal weights
+    and compute switch to bfloat16. Pass ``False`` to redeclare graph
+    inputs/outputs bfloat16 directly instead (no casts; callers must then
+    feed/read bfloat16 tensors).
+
+    No node's op_type or attributes are touched, and there is no per-op
+    bfloat16-support check: an ordinary feedforward graph ends up computing
+    end-to-end in bfloat16 as a side effect of every value along the way now
+    being bfloat16-typed, since almost every ONNX op propagates its input
+    dtype to its output dtype. A model containing an op with no bfloat16
+    kernel in the runtime it is deployed on will fail at *execution* time,
+    not at conversion time here.
+
+    This is a single, self-contained graph rewrite: unlike :func:`simplify`,
+    it does not run shape inference, constant folding, or any other pass.
+    Only the top-level graph is converted -- nodes inside control-flow
+    subgraphs (If/Loop/Scan bodies) are left untouched -- and an initializer
+    whose name is also a graph input (the rarely-used ONNX "optional input
+    with a default value" convention) is left alone entirely. Consider
+    calling :func:`simplify` before and/or after to clean up the graph.
+
+    :param model: onnx ModelProto object or file path
+    :param keep_io_types: keep the graph's own external input/output types
+            at float32 (inserting boundary Cast nodes) instead of
+            redeclaring them bfloat16 directly
+    :returns: the converted onnx ModelProto
+    """
+    if isinstance(model, str):
+        model = onnx.load(model, load_external_data=False)
+    return onnx.load_from_string(
+        C.quantize_bf16(model.SerializeToString(), keep_io_types)
+    )
+
+
 def simplify(
     model: Union[str, onnx.ModelProto],
     check_n: int = 0,
@@ -1471,6 +1522,17 @@ def main():
         action="store_true",
     )
     parser.add_argument(
+        "--bf16-quantize",
+        help="After simplifying, convert every float32 weight (and, by "
+        "default, every internal activation) to bfloat16 -- no calibration "
+        "data needed, since bfloat16 is still a floating-point format, not "
+        "an integer scheme. Keeps float32's exponent range, so no clamping "
+        "is needed. The model's own external input/output types stay "
+        "float32 (a Cast is inserted at each boundary). See "
+        "onnxsim.quantize_bf16.",
+        action="store_true",
+    )
+    parser.add_argument(
         "--static-quantize",
         help="After simplifying, statically (calibration-based) quantize "
         "MatMul/Gemm/Conv weights and activations to INT8/uint8, inserting a "
@@ -1739,6 +1801,10 @@ def main():
     if args.fp16_quantize:
         print("Converting float32 weights/activations to float16...")
         model_opt = quantize_fp16(model_opt)
+
+    if args.bf16_quantize:
+        print("Converting float32 weights/activations to bfloat16...")
+        model_opt = quantize_bf16(model_opt)
 
     if args.static_quantize:
         from . import calibration
