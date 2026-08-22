@@ -32,9 +32,9 @@ namespace onnxsim_passes {
 // The largest reduction depth (K, the number of terms MatMulInteger's int32
 // accumulator sums for one output element) for which that accumulator cannot
 // overflow. Both operands' worst case is fixed by the surrounding
-// quantization scheme, not by the actual weight data: QuantizeWeightPerChannelKN
-// / QuantizeWeightPerChannelInPlace always scale a channel so its
-// largest-magnitude element quantizes to exactly +-127, and
+// quantization scheme, not by the actual weight data:
+// QuantizeWeightPerChannelKN / QuantizeWeightPerChannelInPlace always scale a
+// channel so its largest-magnitude element quantizes to exactly +-127, and
 // DynamicQuantizeLinear / QuantizeLinear produce uint8 (max 255). So the
 // worst possible per-term product is 127 * 255, and K of them can sum to at
 // most K * 127 * 255 -- once that exceeds INT32_MAX the accumulator can wrap
