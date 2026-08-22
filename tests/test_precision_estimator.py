@@ -109,7 +109,9 @@ def test_gemm_transb_reduction_depth_uses_transposed_layout():
 
 def test_conv_reduction_depth_is_cin_times_kernel_volume():
     cout, cin, kh, kw = 6, 3, 5, 5
-    weight = _f32(np.random.default_rng(5).standard_normal((cout, cin, kh, kw)) * 0.1, "W")
+    weight = _f32(
+        np.random.default_rng(5).standard_normal((cout, cin, kh, kw)) * 0.1, "W"
+    )
     x = _vi("X", [1, cin, 16, 16])
     y = _vi("Y", [1, cout, 12, 12])
     nodes = [onnx.helper.make_node("Conv", ["X", "W"], ["Y"])]
@@ -173,9 +175,7 @@ def test_matmul_fed_by_softmax_reports_known_activation_range():
     weight = _f32(np.random.default_rng(7).standard_normal((K, N)) * 0.1, "W")
     softmax = onnx.helper.make_node("Softmax", ["X"], ["S"], axis=-1)
     matmul = onnx.helper.make_node("MatMul", ["S", "W"], ["Y"])
-    model = _model(
-        [softmax, matmul], [_vi("X", [1, K])], [_vi("Y", [1, N])], [weight]
-    )
+    model = _model([softmax, matmul], [_vi("X", [1, K])], [_vi("Y", [1, N])], [weight])
 
     (est,) = onnxsim.estimate_quantization_precision(model)
     assert est.activation_producer_op == "Softmax"
@@ -230,9 +230,7 @@ def test_matmul_fed_by_relu_has_no_known_fixed_range():
     weight = _f32(np.random.default_rng(10).standard_normal((16, 4)) * 0.1, "W")
     relu = onnx.helper.make_node("Relu", ["X"], ["R"])
     matmul = onnx.helper.make_node("MatMul", ["R", "W"], ["Y"])
-    model = _model(
-        [relu, matmul], [_vi("X", [1, 16])], [_vi("Y", [1, 4])], [weight]
-    )
+    model = _model([relu, matmul], [_vi("X", [1, 16])], [_vi("Y", [1, 4])], [weight])
 
     (est,) = onnxsim.estimate_quantization_precision(model)
     assert est.activation_producer_op is None
@@ -244,9 +242,7 @@ def test_non_constant_weight_and_unrelated_ops_are_skipped():
         onnx.helper.make_node("MatMul", ["X", "W"], ["Y"]),  # W not a constant
         onnx.helper.make_node("Relu", ["Y"], ["Z"]),
     ]
-    model = _model(
-        nodes, [_vi("X", [1, 8]), _vi("W", [8, 4])], [_vi("Z", [1, 4])], []
-    )
+    model = _model(nodes, [_vi("X", [1, 8]), _vi("W", [8, 4])], [_vi("Z", [1, 4])], [])
     assert onnxsim.estimate_quantization_precision(model) == []
 
 

@@ -112,7 +112,10 @@ MAX_EXACT_FLOAT32_REDUCTION_DEPTH = (2**24) // (127 * 255)
 # only bounded on one side, which isn't enough to pick a fixed scale.
 FIXED_ACTIVATION_RANGES: Dict[str, Tuple[float, float]] = {
     "Sigmoid": (0.0, 1.0),
-    "HardSigmoid": (0.0, 1.0),  # max(0, min(1, alpha*x+beta)) -- bounded by construction
+    "HardSigmoid": (
+        0.0,
+        1.0,
+    ),  # max(0, min(1, alpha*x+beta)) -- bounded by construction
     "Tanh": (-1.0, 1.0),
     "Softmax": (0.0, 1.0),
 }
@@ -158,7 +161,9 @@ class MatMulGemmPrecisionEstimate:
     num_channels: int
     int32_accumulator_safe: bool
     float32_cast_exact: bool  # False just means routine float rounding, not a bug
-    max_outlier_ratio: float  # max over channels of max|w| / median(|w|); nan if unknown
+    max_outlier_ratio: (
+        float  # max over channels of max|w| / median(|w|); nan if unknown
+    )
     outlier_risk: bool
     activation_producer_op: Optional[str]  # e.g. "Sigmoid"; None if not recognized
     activation_range: Optional[Tuple[float, float]]  # analytically-known (lo, hi)
@@ -303,6 +308,11 @@ def _estimate_matmul_gemm(
     outlier_risk = bool(finite_ratios) and max_ratio > OUTLIER_RATIO_THRESHOLD
     act_producer = producer.get(node.input[0]) if node.input else None
     act_range = _activation_range(act_producer, initializers)
+    act_producer_op = (
+        act_producer.op_type
+        if act_producer is not None and act_range is not None
+        else None
+    )
 
     return MatMulGemmPrecisionEstimate(
         node_name=node.name or f"{node.op_type}({node.input[1]})",
@@ -313,14 +323,10 @@ def _estimate_matmul_gemm(
         float32_cast_exact=float32_exact,
         max_outlier_ratio=max_ratio,
         outlier_risk=outlier_risk,
-        activation_producer_op=act_producer.op_type if act_range is not None else None,
+        activation_producer_op=act_producer_op,
         activation_range=act_range,
         recommendation=_recommendation(
-            safe,
-            float32_exact,
-            outlier_risk,
-            act_producer.op_type if act_range is not None else None,
-            act_range,
+            safe, float32_exact, outlier_risk, act_producer_op, act_range
         ),
     )
 
@@ -350,6 +356,11 @@ def _estimate_conv(
     outlier_risk = bool(finite_ratios) and max_ratio > OUTLIER_RATIO_THRESHOLD
     act_producer = producer.get(node.input[0]) if node.input else None
     act_range = _activation_range(act_producer, initializers)
+    act_producer_op = (
+        act_producer.op_type
+        if act_producer is not None and act_range is not None
+        else None
+    )
 
     return ConvPrecisionEstimate(
         node_name=node.name or f"Conv({node.input[1]})",
@@ -359,19 +370,17 @@ def _estimate_conv(
         float32_cast_exact=float32_exact,
         max_outlier_ratio=max_ratio,
         outlier_risk=outlier_risk,
-        activation_producer_op=act_producer.op_type if act_range is not None else None,
+        activation_producer_op=act_producer_op,
         activation_range=act_range,
         recommendation=_recommendation(
-            safe,
-            float32_exact,
-            outlier_risk,
-            act_producer.op_type if act_range is not None else None,
-            act_range,
+            safe, float32_exact, outlier_risk, act_producer_op, act_range
         ),
     )
 
 
-def _static_dims(shape_proto: Optional[onnx.TensorShapeProto]) -> Optional[List[Optional[int]]]:
+def _static_dims(
+    shape_proto: Optional[onnx.TensorShapeProto],
+) -> Optional[List[Optional[int]]]:
     if shape_proto is None:
         return None
     dims: List[Optional[int]] = []
@@ -474,12 +483,11 @@ def estimate_quantization_precision(model: onnx.ModelProto) -> List[PrecisionEst
     """
     initializers = {init.name: init for init in model.graph.initializer}
     shapes = _collect_static_shapes(model)
-    producer = {
-        out: node for node in model.graph.node for out in node.output if out
-    }
+    producer = {out: node for node in model.graph.node for out in node.output if out}
 
     estimates: List[PrecisionEstimate] = []
     for node in model.graph.node:
+        est: Optional[PrecisionEstimate]
         if node.op_type in ("MatMul", "Gemm"):
             est = _estimate_matmul_gemm(node, initializers, producer)
         elif node.op_type == "Conv":
