@@ -2358,6 +2358,16 @@ RunOpsOnGraphResult RunOpsOnGraph(
         continue;
       }
       const onnx::Tensor* init = g.getInitializer(name);
+      if (init == nullptr) {
+        // Mirrors FindInitializerByName's own throwing behavior: `name`
+        // was classified constant during GetConstantNodesOnGraph's static
+        // partition, but its producer never actually materialized an
+        // initializer for it (e.g. an earlier batch's fold for it failed
+        // and was skipped, see FoldGroupOnGraph's catch clause). Throwing
+        // here lets the same catch-and-bisect/skip machinery handle this
+        // node too, instead of crashing.
+        throw std::invalid_argument("no initializer " + name);
+      }
       if (init->sizes().size() == 1 && init->sizes()[0] == 0) {
         onnx::TensorProto* p = op_model.mutable_graph()->add_initializer();
         p->set_name(name);
