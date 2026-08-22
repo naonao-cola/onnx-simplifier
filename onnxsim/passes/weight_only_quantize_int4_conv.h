@@ -44,6 +44,7 @@
 #pragma once
 
 #include <cstdint>
+#include <vector>
 
 #include "onnx/common/assertions.h"
 #include "onnxoptimizer/pass.h"
@@ -132,7 +133,11 @@ struct WeightOnlyQuantizeInt4Conv final : public PredicateBasedPass {
     wdq->i_(Symbol("block_size"), kBlockSize);
     wdq->insertBefore(n);
     wdq->output()->setElemType(TensorProto_DataType_FLOAT);
-    wdq->output()->setSizes(w_q.sizes());
+    // Value::setSizes takes vector<Dimension>, not Tensor::sizes()'s
+    // vector<int64_t> -- Dimension(int64_t) is an explicit converting
+    // constructor, so a range-construction from the int64 shape works.
+    wdq->output()->setSizes(
+        std::vector<Dimension>(w_q.sizes().begin(), w_q.sizes().end()));
 
     // Wdq = Reshape(Wdq_flat, W's original [Cout, Cin/groups, k...] shape).
     Tensor shape_t;
@@ -146,7 +151,8 @@ struct WeightOnlyQuantizeInt4Conv final : public PredicateBasedPass {
     reshape->addInput(shape_v);
     reshape->insertBefore(n);
     reshape->output()->setElemType(TensorProto_DataType_FLOAT);
-    reshape->output()->setSizes(w_t->sizes());
+    reshape->output()->setSizes(
+        std::vector<Dimension>(w_t->sizes().begin(), w_t->sizes().end()));
 
     // Conv and its activation input are left untouched; only the weight
     // input changes, to its dequantized (and reshaped-back) counterpart.
