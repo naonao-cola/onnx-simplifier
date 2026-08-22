@@ -31,12 +31,19 @@
 // which output tensors need calibrating, on top of
 // ListQuantizableActivations' input tensors.
 //
-// Wq/Ws (int8, per-output-channel symmetric) are the same weight
-// quantization every other onnxsim quantization pass uses; Wzp is an
-// explicit all-zero tensor of the same shape as Ws (QLinearMatMul, unlike
-// DequantizeLinear, has no optional-zero-point convention -- all 8 inputs
-// are required). X and Y both use a single (scalar) scale/zero-point rather
-// than QLinearMatMul's per-row/per-column option, matching
+// Wq/Ws (int8, per-output-channel symmetric) use the same per-channel
+// quantization math every other onnxsim quantization pass uses, but --
+// unlike static_quantize_matmul.h's QDQ rewrite, which keeps the original
+// Gemm node (transB attribute and all) and so can leave W in its own
+// storage layout -- QLinearMatMul has no transpose attribute of its own: it
+// is a strict numpy.matmul-style op that requires its B operand already in
+// [K, N] layout. So W is always transposed into [K, N] first (see
+// QuantizeWeightPerChannelKN), the same helper dynamic_quantize_matmul.h
+// uses for MatMulInteger, another transpose-attribute-free replacement op.
+// Wzp is an explicit all-zero tensor of the same shape as Ws (QLinearMatMul,
+// unlike DequantizeLinear, has no optional-zero-point convention -- all 8
+// inputs are required). X and Y both use a single (scalar) scale/zero-point
+// rather than QLinearMatMul's per-row/per-column option, matching
 // static_quantize_matmul.h's activation convention.
 //
 // Only the common, unambiguous shape is handled -- see
@@ -117,21 +124,24 @@ struct QOperatorQuantizeMatMul final : public PredicateBasedPass {
 
     float x_scale_f = 1.0f;
     int32_t x_zp_i = 0;
-    ComputeAsymmetricUint8QuantParams(x_range_it->second.first,
-                                      x_range_it->second.second, x_scale_f,
-                                      x_zp_i);
+    ComputeAsymmetricUint8QuantParams(
+        x_range_it->second.first, x_range_it->second.second, x_scale_f, x_zp_i);
     float y_scale_f = 1.0f;
     int32_t y_zp_i = 0;
-    ComputeAsymmetricUint8QuantParams(y_range_it->second.first,
-                                      y_range_it->second.second, y_scale_f,
-                                      y_zp_i);
+    ComputeAsymmetricUint8QuantParams(
+        y_range_it->second.first, y_range_it->second.second, y_scale_f, y_zp_i);
 
-    // W's output-channel axis in its own (untransposed) layout: axis 0 when
-    // Gemm's transB made W [N, K], else axis 1 ([K, N], MatMul's own layout).
-    const int64_t channel_axis = info.weight_transposed ? 0 : 1;
+    // Unlike static_quantize_matmul.h's QDQ rewrite (which keeps the
+    // original Gemm node, transB attribute and all, so the weight can stay
+    // in its own storage layout), QLinearMatMul has no transpose attribute
+    // of its own -- it is a strict numpy.matmul-style op expecting its B
+    // operand already in [K, N] layout. So this needs
+    // QuantizeWeightPerChannelKN (which transposes when `weight_transposed`
+    // is set), the same helper dynamic_quantize_matmul.h uses for
+    // MatMulInteger, another transpose-attribute-free replacement op.
     Tensor w_q;
     Tensor w_scale;
-    QuantizeWeightPerChannelInPlace(*w_t, channel_axis, w_q, w_scale);
+    QuantizeWeightPerChannelKN(*w_t, info.weight_transposed, w_q, w_scale);
     // QLinearMatMul (unlike DequantizeLinear) has no optional-zero-point
     // convention -- b_zero_point is required, so an explicit all-zero tensor
     // (symmetric quantization) of w_scale's shape is needed.
