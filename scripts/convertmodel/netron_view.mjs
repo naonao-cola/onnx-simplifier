@@ -94,6 +94,7 @@ function driveNetron(target, buffer, name, onStatus) {
 const panes = {
   before: { buffer: null, name: "", teardown: null, loading: false, loaded: false },
   after: { buffer: null, name: "", teardown: null, loading: false, loaded: false },
+  quantized: { buffer: null, name: "", teardown: null, loading: false, loaded: false },
 };
 
 // Point one pane ("before" | "after") at a model, embedding it inline and
@@ -308,6 +309,17 @@ function initNetronPanel() {
       renderPane("after", dataUrlToArrayBuffer(dataUrl), name);
     } catch (err) {
       console.error("netron (after):", err);
+    }
+  };
+
+  // Called by quantize_ui.mjs when a quantize finishes. Deliberately separate
+  // from netronShowAfter -- the Quantize panel's result stays independent of
+  // the Convert section's plain simplify/optimize output (see quantize_ui.mjs).
+  window.netronShowQuantized = (dataUrl, name) => {
+    try {
+      renderPane("quantized", dataUrlToArrayBuffer(dataUrl), name);
+    } catch (err) {
+      console.error("netron (quantized):", err);
     }
   };
 }

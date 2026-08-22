@@ -271,37 +271,45 @@ onnx::ModelProto QuantizeStatic(
 
 // Lists the *output* tensor names that ``QuantizeQOperator`` could quantize
 // in ``model``, on top of the input tensor names ``ListQuantizableActivations``
-// already reports -- one entry per MatMul/"vanilla" Gemm whose weight
-// qualifies (same shape ``ListQuantizableActivations`` checks). QOperator
-// format's ``QLinearMatMul`` computes directly in int8 with no float
-// intermediate, so it needs a calibrated range for the node's *output* too,
+// already reports -- one entry per MatMul/"vanilla" Gemm/Conv whose weight
+// qualifies (same shape ``ListQuantizableActivations`` checks), and, for a
+// Conv with a bias, whose bias is also a constant float32 ``[Cout]`` tensor
+// (``QLinearConv`` needs its bias pre-quantized to a static INT32 tensor;
+// see ``passes/qoperator_quantize_conv.h``). QOperator format's
+// ``QLinearMatMul``/``QLinearConv`` compute directly in int8 with no float
+// intermediate, so they need a calibrated range for the node's *output* too,
 // unlike QDQ format (``QuantizeStatic``), whose DequantizeLinear can leave
 // the result in float. A caller preparing to call ``QuantizeQOperator``
 // should calibrate the union of this and ``ListQuantizableActivations``.
 std::vector<std::string> ListQOperatorQuantizableOutputs(
     const onnx::ModelProto& model);
 
-// Statically (calibration-based) quantizes every MatMul and every "vanilla"
-// Gemm (transA=0, alpha=1, beta=1), whose weight is a constant 2-D float32
-// tensor, whose activation's tensor name *and* whose own output's tensor
-// name are both keys of ``activation_ranges``: the weight is quantized to
-// INT8 ahead of time (per output channel, symmetric, from its static values
-// -- same as ``QuantizeStatic``), and both the activation and the output are
-// quantized to uint8 using *fixed* (scale, zero_point) pairs derived from
-// their calibrated (min, max) ranges (see ``ListQuantizableActivations`` and
+// Statically (calibration-based) quantizes every MatMul, every "vanilla"
+// Gemm (transA=0, alpha=1, beta=1), and every Conv, whose weight is a
+// constant float32 tensor (2-D for MatMul/Gemm, rank >= 3 for Conv), whose
+// activation's tensor name *and* whose own output's tensor name are both
+// keys of ``activation_ranges``: the weight is quantized to INT8 ahead of
+// time (per output channel, symmetric, from its static values -- same as
+// ``QuantizeStatic``), and both the activation and the output are quantized
+// to uint8 using *fixed* (scale, zero_point) pairs derived from their
+// calibrated (min, max) ranges (see ``ListQuantizableActivations`` and
 // ``ListQOperatorQuantizableOutputs`` to discover which tensors to
 // calibrate). Unlike ``QuantizeStatic``'s QDQ format, this replaces the
-// MatMul/Gemm itself with ``QLinearMatMul`` -- ONNX's directly-quantized
-// matmul op (the "QOperator" format) -- so the graph computes in true int8
-// with no float MatMul left in it. See ``passes/qoperator_quantize_matmul.h``
-// for the rewrite itself and its doc comment for the QDQ-vs-QOperator
+// MatMul/Gemm/Conv itself with ``QLinearMatMul``/``QLinearConv`` -- ONNX's
+// directly-quantized ops (the "QOperator" format) -- so the graph computes
+// in true int8 with no float MatMul/Conv left in it. A Conv's bias (if any)
+// is quantized to INT32 ahead of time too (``QLinearConv``'s own bias input
+// convention), which is why a Conv with a non-constant bias is left alone
+// (see ``ListQOperatorQuantizableOutputs``). See
+// ``passes/qoperator_quantize_matmul.h``/``passes/qoperator_quantize_conv.h``
+// for the rewrites themselves and their doc comments for the QDQ-vs-QOperator
 // tradeoff.
 //
 // Unlike ``Simplify``, this does not run shape inference, constant folding or
-// any other simplification pass -- it applies exactly this one rewrite, once,
-// to a copy of ``model`` (which is left untouched) and returns the result.
-// Nodes that do not match, or whose activation/output has no entry in
-// ``activation_ranges``, are left as-is.
+// any other simplification pass -- it applies exactly these rewrites, once
+// each, to a copy of ``model`` (which is left untouched) and returns the
+// result. Nodes that do not match, or whose activation/output has no entry
+// in ``activation_ranges``, are left as-is.
 onnx::ModelProto QuantizeQOperator(
     const onnx::ModelProto& model,
     const std::unordered_map<std::string, std::pair<float, float>>&
