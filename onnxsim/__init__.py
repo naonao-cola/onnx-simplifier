@@ -16,6 +16,7 @@ from onnxsim.onnx_simplifier import (
     quantize_weight_only,
     simplify,
 )
+from onnxsim.precision_estimator import estimate_quantization_precision
 
 from .version import version as __version__
 
@@ -28,6 +29,7 @@ __all__ = [
     "calibrate",
     "generate_random_calibration_data",
     "load_huggingface_calibration_data",
+    "estimate_quantization_precision",
     "main",
     "import_onnx_schemas",
     "export_safetensors",

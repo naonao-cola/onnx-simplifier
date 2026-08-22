@@ -18,6 +18,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <limits>
 
 #include "onnx/common/assertions.h"
 #include "onnxoptimizer/pass.h"
@@ -27,6 +28,28 @@
 namespace ONNX_NAMESPACE {
 namespace optimization {
 namespace onnxsim_passes {
+
+// The largest reduction depth (K, the number of terms MatMulInteger's int32
+// accumulator sums for one output element) for which that accumulator cannot
+// overflow. Both operands' worst case is fixed by the surrounding
+// quantization scheme, not by the actual weight data:
+// QuantizeWeightPerChannelKN / QuantizeWeightPerChannelInPlace always scale a
+// channel so its largest-magnitude element quantizes to exactly +-127, and
+// DynamicQuantizeLinear / QuantizeLinear produce uint8 (max 255). So the
+// worst possible per-term product is 127 * 255, and K of them can sum to at
+// most K * 127 * 255 -- once that exceeds INT32_MAX the accumulator can wrap
+// around, silently corrupting the result. This bound is exact and
+// independent of the weight's actual values.
+inline int64_t MaxSafeInt32ReductionDepth() {
+  return static_cast<int64_t>(std::numeric_limits<int32_t>::max()) /
+         (127 * 255);
+}
+
+// Whether a reduction depth of `k` is safe from int32 accumulator overflow
+// under the worst-case bound above (see MaxSafeInt32ReductionDepth).
+inline bool IsSafeInt32ReductionDepth(int64_t k) {
+  return k <= MaxSafeInt32ReductionDepth();
+}
 
 // The pieces of a MatMul/vanilla-Gemm node these passes care about.
 struct MatMulLikeInfo {
