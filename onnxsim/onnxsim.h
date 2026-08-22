@@ -362,6 +362,26 @@ onnx::ModelProto QuantizeFp16(const onnx::ModelProto& model,
 onnx::ModelProto QuantizeBf16(const onnx::ModelProto& model,
                               bool keep_io_types = true);
 
+// Converts a model's float32 weights and (by default) internal activations
+// to an 8-bit floating-point format -- the same kind of calibration-free,
+// whole-graph "quantization" as ``QuantizeFp16``/``QuantizeBf16``, just to a
+// much narrower floating-point format. ``format`` selects which one:
+// ``"e4m3"`` (the default -- E4M3FN, 4 exponent bits / 3 mantissa bits, max
+// finite magnitude 448, typically used for weights) or ``"e5m2"`` (5
+// exponent bits / 2 mantissa bits, max finite magnitude 57344, a dynamic
+// range similar to float16, typically used for gradients). Both are
+// converted with saturation: a value whose magnitude exceeds the target
+// format's max finite value (including +-Inf itself) is clamped to it
+// rather than mapped to an infinity/NaN. See ``passes/quantize_fp8.h`` for
+// the rewrite itself, including why the FNUZ variants of these formats are
+// not offered; ``keep_io_types``, scope, and every other semantic exactly
+// mirror ``QuantizeFp16`` above. Casting to/from these types needs opset >=
+// 19. Throws ``std::invalid_argument`` if ``format`` is not ``"e4m3"`` or
+// ``"e5m2"``.
+onnx::ModelProto QuantizeFp8(const onnx::ModelProto& model,
+                             const std::string& format = "e4m3",
+                             bool keep_io_types = true);
+
 void SimplifyPath(
     const ModelExecutor& executor, const std::string& in_path,
     const std::string& out_path,

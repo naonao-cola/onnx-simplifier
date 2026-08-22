@@ -52,6 +52,7 @@
 #include "passes/quantize_bf16.h"
 #include "passes/quantize_conv_common.h"
 #include "passes/quantize_fp16.h"
+#include "passes/quantize_fp8.h"
 #include "passes/quantize_matmul_common.h"
 #include "passes/static_quantize_matmul.h"
 #include "profiler.h"
@@ -3612,6 +3613,31 @@ onnx::ModelProto QuantizeBf16(const onnx::ModelProto& model,
   onnx::optimization::onnxsim_passes::QuantizeBf16KeepIoTypes() = keep_io_types;
   return onnx::optimization::OptimizeFixed(
       model, std::vector<std::string>{"quantize_bf16"});
+}
+
+onnx::ModelProto QuantizeFp8(const onnx::ModelProto& model,
+                             const std::string& format, bool keep_io_types) {
+  onnx::optimization::onnxsim_passes::Float8Format target_format;
+  if (format == "e4m3") {
+    target_format = onnx::optimization::onnxsim_passes::Float8Format::kE4M3FN;
+  } else if (format == "e5m2") {
+    target_format = onnx::optimization::onnxsim_passes::Float8Format::kE5M2;
+  } else {
+    throw std::invalid_argument(
+        "QuantizeFp8: format must be \"e4m3\" or \"e5m2\", got \"" + format +
+        "\"");
+  }
+  PrepareSchemasForDebug(model);
+  // Registers quantize_fp8 (idempotent) into onnxoptimizer's registry so
+  // OptimizeFixed can find it by name below.
+  onnxsim::RegisterCustomOptimizerPasses();
+  // quantize_fp8 reads these the same way quantize_fp16 reads
+  // QuantizeFp16KeepIoTypes() -- OptimizeFixed's pass-name list has no way
+  // to carry a parameter directly.
+  onnx::optimization::onnxsim_passes::QuantizeFp8TargetFormat() = target_format;
+  onnx::optimization::onnxsim_passes::QuantizeFp8KeepIoTypes() = keep_io_types;
+  return onnx::optimization::OptimizeFixed(
+      model, std::vector<std::string>{"quantize_fp8"});
 }
 
 // Records the options this Simplify() call actually used (skip_optimizers
