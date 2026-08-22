@@ -1026,7 +1026,8 @@ std::optional<onnxsim::SymTensor> IntTensorToSymTensor(const onnx::Tensor& t) {
 // Graph-native counterpart of TypeProtoToSymShape, reading a Value's own
 // elemType()/sizes() -- no ModelProto value_info map needed, since a Value
 // already carries its own current shape/type in the IR.
-std::optional<onnxsim::SymShape> ValueToSymShape(onnx::Value* v, int64_t& fresh) {
+std::optional<onnxsim::SymShape> ValueToSymShape(onnx::Value* v,
+                                                 int64_t& fresh) {
   if (!v->has_sizes()) return std::nullopt;
   onnxsim::SymShape shape;
   for (const auto& d : v->sizes()) {
@@ -1045,10 +1046,13 @@ std::optional<onnxsim::SymShape> ValueToSymShape(onnx::Value* v, int64_t& fresh)
 // Graph-native counterpart of ToSymNode.
 onnxsim::SymNode ToSymNode(onnx::Node* node) {
   onnxsim::SymNode n;
-  const std::string domain = node->has_domain() ? node->domain() : std::string();
-  n.op_type = (domain.empty() || domain == "ai.onnx") ? node->kind().toString() : "";
+  const std::string domain =
+      node->has_domain() ? node->domain() : std::string();
+  n.op_type =
+      (domain.empty() || domain == "ai.onnx") ? node->kind().toString() : "";
   for (onnx::Value* v : node->inputs()) {
-    n.input.push_back(v->node()->kind() == onnx::kUndefined ? "" : v->uniqueName());
+    n.input.push_back(v->node()->kind() == onnx::kUndefined ? ""
+                                                            : v->uniqueName());
   }
   for (onnx::Value* v : node->outputs()) {
     n.output.push_back(v->uniqueName());
@@ -1064,7 +1068,8 @@ onnxsim::SymNode ToSymNode(onnx::Node* node) {
         a.ints = node->is(attr_name);
         break;
       case onnx::AttributeKind::t:
-        if (auto t = IntTensorToSymTensor(node->t(attr_name))) a.t = std::move(*t);
+        if (auto t = IntTensorToSymTensor(node->t(attr_name)))
+          a.t = std::move(*t);
         break;
       default:
         break;
@@ -1081,7 +1086,8 @@ std::map<std::string, onnxsim::SymTensor> EvaluateGraphSymbolicValues(
   std::vector<onnxsim::SymNode> nodes;
   nodes.reserve(node_ptrs.size());
   for (onnx::Node* node : node_ptrs) {
-    if (node->kind() == onnx::kUndefined || node->kind() == onnx::kCaptured) continue;
+    if (node->kind() == onnx::kUndefined || node->kind() == onnx::kCaptured)
+      continue;
     nodes.push_back(ToSymNode(node));
   }
 
@@ -1090,14 +1096,17 @@ std::map<std::string, onnxsim::SymTensor> EvaluateGraphSymbolicValues(
   const auto& inits = g.initializers();
   const auto& init_names = g.initializer_names();
   for (size_t i = 0; i < inits.size(); ++i) {
-    if (auto t = IntTensorToSymTensor(*inits[i])) initializers[init_names[i]] = *t;
+    if (auto t = IntTensorToSymTensor(*inits[i]))
+      initializers[init_names[i]] = *t;
     onnxsim::SymShape s;
     for (int64_t d : inits[i]->sizes()) s.emplace_back(d);
     shapes_seed[init_names[i]] = std::move(s);
   }
   auto seed = [&](onnx::Value* v) {
-    if (shapes_seed.count(v->uniqueName())) return;  // keep the concrete initializer shape
-    if (auto s = ValueToSymShape(v, fresh)) shapes_seed[v->uniqueName()] = std::move(*s);
+    if (shapes_seed.count(v->uniqueName()))
+      return;  // keep the concrete initializer shape
+    if (auto s = ValueToSymShape(v, fresh))
+      shapes_seed[v->uniqueName()] = std::move(*s);
   };
   for (onnx::Value* v : g.inputs()) seed(v);
   for (onnx::Node* node : node_ptrs) {
@@ -1466,8 +1475,9 @@ bool _EvalPartialShapeOnGraph(onnx::Graph& g) {
   std::vector<onnx::Node*> node_ptrs(g.nodes().begin(), g.nodes().end());
   std::unordered_map<onnx::Value*, ValueTypeSnapshot> snapshot;
   auto save = [&](onnx::Value* v) {
-    snapshot[v] = {v->elemType(), v->has_sizes(),
-                   v->has_sizes() ? v->sizes() : std::vector<onnx::Dimension>{}};
+    snapshot[v] = {
+        v->elemType(), v->has_sizes(),
+        v->has_sizes() ? v->sizes() : std::vector<onnx::Dimension>{}};
   };
   for (onnx::Value* v : g.inputs()) save(v);
   for (onnx::Node* node : node_ptrs) {
@@ -1702,9 +1712,8 @@ bool _EvalPartialShapeOnGraph(onnx::Graph& g) {
       onnx::Node* constant = g.create(onnx::kConstant, 1);
       constant->t_(kValueAttr, iter->second);
       constant->outputs()[0]->setElemType(iter->second.elem_type());
-      constant->outputs()[0]->setSizes(
-          std::vector<onnx::Dimension>(iter->second.sizes().begin(),
-                                       iter->second.sizes().end()));
+      constant->outputs()[0]->setSizes(std::vector<onnx::Dimension>(
+          iter->second.sizes().begin(), iter->second.sizes().end()));
       constant->insertBefore(node);
       node->replaceAllUsesWith(constant);
       node->destroy();
@@ -2159,10 +2168,12 @@ onnx::ModelProto _FoldConstant(const ModelExecutor& executor,
 // RunOps already did, just built from Graph Node/Value/Tensor objects
 // (reusing addAttribute/encodeTensor from ir_pb_converter_internal.h,
 // graph_shape_inference.cc's own pattern) instead of NodeProto copies.
-// Unlike the ModelProto path, no EliminateUnusedInitializer pass is run
-// here: onnx-optimizer's own eliminate_unused_initializer pass, already
-// part of config.optimizer_passes, prunes any initializer folding leaves
-// dangling on the very next OptAndShape round.
+// Like the ModelProto path, _FoldConstantOnGraph runs onnx-optimizer's
+// eliminate_unused_initializer pass directly (not just via
+// config.optimizer_passes) at the end of every call: that pass list is
+// empty when the caller asked to skip optimization entirely
+// (perform_optimization=False), so nothing else is guaranteed to sweep up
+// an initializer folding leaves dangling in that mode.
 
 struct ConstantNodePartitionGraph {
   // Nodes whose output is materialized into an initializer by folding, in
@@ -2188,8 +2199,9 @@ bool HasSubgraphAttr(onnx::Node* node) {
 // map (a Value already carries its own current shape/type in the IR).
 bool ProduceLargeTensorOnGraph(onnx::Node* node, size_t threshold) {
   static const std::set<std::string> large_tensor_ops{"Tile", "ConstantOfShape",
-                                                       "Expand"};
-  if (large_tensor_ops.find(node->kind().toString()) == large_tensor_ops.end()) {
+                                                      "Expand"};
+  if (large_tensor_ops.find(node->kind().toString()) ==
+      large_tensor_ops.end()) {
     return false;
   }
   if (node->outputs().empty()) {
@@ -2201,7 +2213,8 @@ bool ProduceLargeTensorOnGraph(onnx::Node* node, size_t threshold) {
   }
   size_t size;
   try {
-    size = size_of_dtype(static_cast<onnx::TensorProto::DataType>(out->elemType()));
+    size = size_of_dtype(
+        static_cast<onnx::TensorProto::DataType>(out->elemType()));
   } catch (const std::exception&) {
     return true;
   }
@@ -2223,7 +2236,8 @@ size_t EstimateOutputBytesOnGraph(onnx::Node* node) {
     }
     size_t size;
     try {
-      size = size_of_dtype(static_cast<onnx::TensorProto::DataType>(out->elemType()));
+      size = size_of_dtype(
+          static_cast<onnx::TensorProto::DataType>(out->elemType()));
     } catch (const std::exception&) {
       continue;
     }
@@ -2254,7 +2268,8 @@ ConstantNodePartitionGraph GetConstantNodesOnGraph(
   }
   std::unordered_map<std::string, int> domain_to_version;
   for (const onnx::OpSetID& opset : g.opset_versions_mutable()) {
-    const std::string& domain = opset.domain() == "ai.onnx" ? "" : opset.domain();
+    const std::string& domain =
+        opset.domain() == "ai.onnx" ? "" : opset.domain();
     domain_to_version[domain] = static_cast<int>(opset.version());
   }
   auto opset_version_of = [&domain_to_version](const std::string& domain) {
@@ -2266,18 +2281,20 @@ ConstantNodePartitionGraph GetConstantNodesOnGraph(
     if (node->kind() == onnx::kUndefined || node->kind() == onnx::kCaptured) {
       continue;
     }
-    const std::string domain = node->has_domain() ? node->domain() : std::string();
+    const std::string domain =
+        node->has_domain() ? node->domain() : std::string();
     const std::string op_type = node->kind().toString();
     const bool foldable =
         IsOfficialOp(domain, op_type) &&
         IsDeterministic(domain, op_type, opset_version_of(domain)) &&
         !IsQDQ(domain, op_type) && !HasSubgraphAttr(node) &&
-        std::all_of(node->inputs().begin(), node->inputs().end(),
-                    [&const_names](onnx::Value* v) {
-                      const std::string name =
-                          v->node()->kind() == onnx::kUndefined ? "" : v->uniqueName();
-                      return const_names.count(name) > 0;
-                    });
+        std::all_of(
+            node->inputs().begin(), node->inputs().end(),
+            [&const_names](onnx::Value* v) {
+              const std::string name =
+                  v->node()->kind() == onnx::kUndefined ? "" : v->uniqueName();
+              return const_names.count(name) > 0;
+            });
     if (!foldable) {
       continue;
     }
@@ -2314,7 +2331,8 @@ struct RunOpsOnGraphResult {
 RunOpsOnGraphResult RunOpsOnGraph(
     const ModelExecutor& executor, onnx::Graph& g,
     const std::vector<onnx::Node*>& ops,
-    const std::unordered_map<std::string, onnx::Node*>& deferred_producers) {
+    const std::unordered_map<std::string, onnx::Node*>& deferred_producers,
+    int64_t ir_version) {
   std::vector<std::string> input_names;
   std::vector<const onnx::Tensor*> input_tensors;
   std::set<std::string> seen_inputs;
@@ -2322,7 +2340,14 @@ RunOpsOnGraphResult RunOpsOnGraph(
   google::protobuf::Arena arena;
   onnx::ModelProto& op_model =
       *google::protobuf::Arena::Create<onnx::ModelProto>(&arena);
-  op_model.set_ir_version(onnx::Version::IR_VERSION);
+  // Inherited from the model being simplified (not onnx::Version::IR_VERSION,
+  // this library's own compiled-in constant): onnxsim's vendored onnx tracks
+  // upstream's IR_VERSION ahead of what any released onnxruntime actually
+  // supports, and this throwaway sub-model still has to load in a real
+  // onnxruntime session for its one Run() call -- the original model's own
+  // ir_version is what the caller's onnxruntime install already proved it
+  // could handle.
+  op_model.set_ir_version(ir_version);
   for (const onnx::OpSetID& opset : g.opset_versions_mutable()) {
     auto* x = op_model.add_opset_import();
     x->set_domain(opset.domain());
@@ -2383,7 +2408,8 @@ RunOpsOnGraphResult RunOpsOnGraph(
       np->set_domain(node->domain());
     }
     for (onnx::Value* input : node->inputs()) {
-      np->add_input(input->node()->kind() == onnx::kUndefined ? "" : input->uniqueName());
+      np->add_input(
+          input->node()->kind() == onnx::kUndefined ? "" : input->uniqueName());
     }
     for (onnx::Value* output : node->outputs()) {
       np->add_output(output->uniqueName());
@@ -2421,12 +2447,21 @@ RunOpsOnGraphResult RunOpsOnGraph(
   for (const auto* t : input_tensors) {
     onnx::TensorProto tp;
     onnx::encodeTensor(tp, *t);
-    input_dls.emplace_back(onnxsim::dlpack::FromTensorProtoOwning(std::move(tp)));
+    input_dls.emplace_back(
+        onnxsim::dlpack::FromTensorProtoOwning(std::move(tp)));
   }
   input_ptrs.reserve(input_dls.size());
   for (const auto& p : input_dls) input_ptrs.push_back(p.get());
 
-  std::vector<DLManagedTensorPtr> output_dls = executor.Run(op_model, input_ptrs);
+  std::vector<DLManagedTensorPtr> output_dls;
+  {
+    // Profiled under the same "OrtSession" span name as the ModelProto-based
+    // RunOps (see its own comment): the one spot common to every executor
+    // binding, so a trace can find the actual session-run time regardless of
+    // which folding path produced it.
+    onnxsim::ProfiledScope session_scope("OrtSession");
+    output_dls = executor.Run(op_model, input_ptrs);
+  }
   RunOpsOnGraphResult result;
   result.tensors.reserve(output_dls.size());
   for (size_t i = 0; i < output_dls.size(); i++) {
@@ -2445,17 +2480,19 @@ RunOpsOnGraphResult RunOpsOnGraph(
 // output directly into `g` as a new initializer (Graph::
 // addInitializerAndCreateValue), rewires the folded node's uses onto it,
 // and removes the folded node -- no NodeProto rebuild needed.
-void FoldGroupOnGraph(const ModelExecutor& executor, onnx::Graph& g,
-                      const std::vector<onnx::Node*>& const_nodes, size_t begin,
-                      size_t end,
-                      const std::unordered_map<std::string, onnx::Node*>& deferred_producers,
-                      size_t& num_folded) {
+void FoldGroupOnGraph(
+    const ModelExecutor& executor, onnx::Graph& g,
+    const std::vector<onnx::Node*>& const_nodes, size_t begin, size_t end,
+    const std::unordered_map<std::string, onnx::Node*>& deferred_producers,
+    size_t& num_folded, int64_t ir_version) {
   if (begin >= end) {
     return;
   }
-  std::vector<onnx::Node*> ops(const_nodes.begin() + begin, const_nodes.begin() + end);
+  std::vector<onnx::Node*> ops(const_nodes.begin() + begin,
+                               const_nodes.begin() + end);
   try {
-    RunOpsOnGraphResult result = RunOpsOnGraph(executor, g, ops, deferred_producers);
+    RunOpsOnGraphResult result =
+        RunOpsOnGraph(executor, g, ops, deferred_producers, ir_version);
     // Every op in this batch folded successfully (RunOpsOnGraph throws,
     // rather than partially populating its result, on any failure) -- decode
     // each returned TensorProto (ToTensorProto always emits raw_data, see
@@ -2495,17 +2532,20 @@ void FoldGroupOnGraph(const ModelExecutor& executor, onnx::Graph& g,
       return;
     }
     const size_t mid = begin + (end - begin) / 2;
-    FoldGroupOnGraph(executor, g, const_nodes, begin, mid, deferred_producers, num_folded);
-    FoldGroupOnGraph(executor, g, const_nodes, mid, end, deferred_producers, num_folded);
+    FoldGroupOnGraph(executor, g, const_nodes, begin, mid, deferred_producers,
+                     num_folded, ir_version);
+    FoldGroupOnGraph(executor, g, const_nodes, mid, end, deferred_producers,
+                     num_folded, ir_version);
   }
 }
 
 // Graph-native counterpart of _FoldConstant. Returns whether anything
 // folded, mirroring OptimizeGraphChanged's own bool-returning convention so
 // the outer fixed point can detect convergence without a fingerprint
-// comparison. No EliminateUnusedInitializer call: see this section's own
-// top-of-file comment for why.
-bool _FoldConstantOnGraph(const ModelExecutor& executor, onnx::Graph& g) {
+// comparison. Always sweeps unused initializers at the end (see this
+// section's own top-of-file comment for why).
+bool _FoldConstantOnGraph(const ModelExecutor& executor, onnx::Graph& g,
+                          int64_t ir_version) {
   std::vector<onnx::Node*> node_ptrs(g.nodes().begin(), g.nodes().end());
   ConstantNodePartitionGraph partition;
   {
@@ -2514,6 +2554,11 @@ bool _FoldConstantOnGraph(const ModelExecutor& executor, onnx::Graph& g) {
   }
   const auto& const_nodes = partition.const_nodes;
   if (const_nodes.empty()) {
+    // Nothing to fold this call, but a dangling initializer could already be
+    // sitting in `g` from a previous round or the input model itself -- see
+    // this function's own doc comment for why this sweep cannot be skipped.
+    onnx::optimization::EliminateUnusedInitializer()
+        .eliminate_unused_initializer(g);
     return false;
   }
 
@@ -2546,7 +2591,8 @@ bool _FoldConstantOnGraph(const ModelExecutor& executor, onnx::Graph& g) {
   const size_t num_const_nodes = const_nodes.size();
   for (size_t i = 0; i < num_const_nodes;) {
     if (consumes_deferred(const_nodes[i])) {
-      FoldGroupOnGraph(executor, g, const_nodes, i, i + 1, deferred_producers, num_folded);
+      FoldGroupOnGraph(executor, g, const_nodes, i, i + 1, deferred_producers,
+                       num_folded, ir_version);
       i++;
       continue;
     }
@@ -2561,9 +2607,15 @@ bool _FoldConstantOnGraph(const ModelExecutor& executor, onnx::Graph& g) {
       bytes += node_bytes;
       j++;
     }
-    FoldGroupOnGraph(executor, g, const_nodes, i, j, deferred_producers, num_folded);
+    FoldGroupOnGraph(executor, g, const_nodes, i, j, deferred_producers,
+                     num_folded, ir_version);
     i = j;
   }
+  // Drop initializers left dangling by folding so the graph does not balloon
+  // in size (issue #174) -- see this function's own doc comment for why this
+  // cannot be left to config.optimizer_passes alone.
+  onnx::optimization::EliminateUnusedInitializer().eliminate_unused_initializer(
+      g);
   return num_folded > 0;
 }
 
@@ -3368,15 +3420,15 @@ bool OptAndShapeOnGraph(onnx::Graph& g, bool optimize, bool shape_inference,
   using GraphFnChanged = std::function<bool(onnx::Graph&)>;
   bool any_changed = false;
   GraphFnChanged InferShapesOnGraphChanged =
-      shape_inference
-          ? GraphFnChanged([&any_changed](onnx::Graph& graph) {
-              onnxsim::ProfiledScope scope("InferShapes");
-              const bool c = onnx::InferShapesOnGraph(graph);
-              any_changed |= c;
-              return c;
-            })
-          : GraphFnChanged([](onnx::Graph&) { return false; });
-  GraphFnChanged OptimizeGraphChanged = [optimize, &any_changed](onnx::Graph& graph) {
+      shape_inference ? GraphFnChanged([&any_changed](onnx::Graph& graph) {
+        onnxsim::ProfiledScope scope("InferShapes");
+        const bool c = onnx::InferShapesOnGraph(graph);
+        any_changed |= c;
+        return c;
+      })
+                      : GraphFnChanged([](onnx::Graph&) { return false; });
+  GraphFnChanged OptimizeGraphChanged = [optimize,
+                                         &any_changed](onnx::Graph& graph) {
     onnxsim::ProfiledScope scope("Optimize");
     onnxsim::RegisterCustomOptimizerPasses();
     if (optimize) {
@@ -3388,9 +3440,11 @@ bool OptAndShapeOnGraph(onnx::Graph& g, bool optimize, bool shape_inference,
       EliminateZeroRnnInitialState(graph);
     }
     const bool prev = onnx::optimization::InitializersAsConstants();
-    onnx::optimization::SetInitializersAsConstants(config.initializers_as_constants);
+    onnx::optimization::SetInitializersAsConstants(
+        config.initializers_as_constants);
     std::map<std::string, unsigned int> report;
-    onnx::optimization::OptimizeGraphFixed(graph, config.optimizer_passes, &report,
+    onnx::optimization::OptimizeGraphFixed(graph, config.optimizer_passes,
+                                           &report,
                                            /*clear_tensor_digest_cache=*/false);
     onnx::optimization::SetInitializersAsConstants(prev);
     bool changed = false;
@@ -3403,7 +3457,8 @@ bool OptAndShapeOnGraph(onnx::Graph& g, bool optimize, bool shape_inference,
     any_changed |= changed;
     return changed;
   };
-  FixedPointFn(InferShapesOnGraphChanged, OptimizeGraphChanged, fixed_point_iters)(g);
+  FixedPointFn(InferShapesOnGraphChanged, OptimizeGraphChanged,
+               fixed_point_iters)(g);
   return any_changed;
 }
 
@@ -3701,25 +3756,33 @@ onnx::ModelProto Simplify(
           return OptAndShapeOnGraph(graph, optimize, shape_inference,
                                     fixed_point_iters);
         };
+    // Set from `model.ir_version()` right before `PipelineOnGraph` runs
+    // below, once per Simplify() call -- fold's throwaway sub-models need it
+    // (see RunOpsOnGraph's own comment), but it's only known once the
+    // ModelProto being simplified is in scope, after this closure is built.
+    int64_t fold_ir_version = 0;
     GraphFnChanged FoldConstantOnGraphChanged =
         constant_folding
-            ? GraphFnChanged([&executor](onnx::Graph& graph) {
+            ? GraphFnChanged([&executor, &fold_ir_version](onnx::Graph& graph) {
                 onnxsim::ProfiledScope scope("FoldConstant");
                 const bool a = _EvalPartialShapeOnGraph(graph);
-                const bool b = _FoldConstantOnGraph(executor, graph);
+                const bool b =
+                    _FoldConstantOnGraph(executor, graph, fold_ir_version);
                 return a || b;
               })
             : GraphFnChanged([](onnx::Graph&) { return false; });
     GraphFn PipelineOnGraph =
         FixedPointFn(OptAndShapeOnGraphChanged, FoldConstantOnGraphChanged,
                      fixed_point_iters, &converged);
-    Pipeline = Profiled("Pipeline", [PipelineOnGraph](onnx::ModelProto& model) {
+    Pipeline = Profiled("Pipeline", [PipelineOnGraph, &fold_ir_version](
+                                        onnx::ModelProto& model) {
       std::shared_ptr<onnx::Graph> g(onnx::ImportModelProto(model));
       if (g.get() == nullptr) {
         // Same fallback as Optimizer::optimize(): if we can't parse the
         // model, leave it untouched.
         return;
       }
+      fold_ir_version = model.ir_version();
       PipelineOnGraph(*g);
       onnx::ModelProto out = onnx::PrepareOutput(model);
       onnx::ExportModelProto(&out, g, /*consume_tensor_data=*/true);
