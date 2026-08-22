@@ -117,6 +117,31 @@ agraph (float[N] X) =&gt; (float[N] Y) {
                 one <code>.onnx</code>, the largest is auto-detected; use the
                 <b>file</b> selector to convert a different one.
             </div>
+            <div id="hf-token-row" style="margin-top: 0.4em;">
+                <label for="hf-token-input">Hugging Face token</label>
+                <input type="password" id="hf-token-input" size="38"
+                       placeholder="hf_… (only needed for gated / private repos)"
+                       autocomplete="off" spellcheck="false">
+                <button id="hf-token-toggle" type="button" title="Show/hide the token">show</button>
+                <input type="checkbox" id="hf-token-remember">
+                <label for="hf-token-remember">remember in this browser</label>
+                <span id="hf-token-status" class="note" style="margin-left: 0.3em;"></span>
+                <div class="note" style="margin-top: 0.2em;">
+                    Optional — only needed to load a <b>gated</b> or
+                    <b>private</b> repo you have access to; public repos (like
+                    <code>onnxmodelzoo</code>) don't need one. Create one at
+                    <a href="https://huggingface.co/settings/tokens" target="_blank" rel="noopener">huggingface.co/settings/tokens</a>
+                    ("read" access is enough). It is sent straight from your
+                    browser to <code>huggingface.co</code> as an
+                    <code>Authorization</code> header for size checks, file
+                    listing, and the download itself — never anywhere else, and
+                    never included in the "Copy shareable link" URL above. With
+                    <b>remember</b> off (the default) it lives only in this
+                    page's memory and is gone on reload; checking it saves the
+                    token in this browser's local storage (still local to your
+                    machine) so it survives a reload.
+                </div>
+            </div>
             <div class="note" style="margin-top: 0.25em;">
                 <b>Shareable link:</b> the input model and options can be set from
                 the URL — e.g.
