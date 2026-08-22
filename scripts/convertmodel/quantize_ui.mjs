@@ -60,12 +60,18 @@ function getRuntime() {
 // Methods that quantize straight from a single WASM call -- the weight is
 // quantized from its own static values and the activation either isn't
 // touched (weight-only) or is quantized dynamically at inference time
-// (dynamic/ternary), so no calibration data is needed.
+// (dynamic/ternary), so no calibration data is needed. Float16/BFloat16 are
+// a different kind of "quantization" (a narrower floating-point format, not
+// an integer scheme) but need no calibration data either, so they fit the
+// same single-call shape; Float8 needs an extra "e4m3"/"e5m2" format
+// argument and is called separately below instead of through this map.
 const NO_CALIBRATION_METHODS = {
   dynamic: "onnxsim_quantize_dynamic",
   ternary: "onnxsim_quantize_ternary",
   weight_only: "onnxsim_quantize_weight_only",
   weight_only_int4: "onnxsim_quantize_weight_only_int4",
+  fp16: "onnxsim_quantize_fp16",
+  bf16: "onnxsim_quantize_bf16",
 };
 
 function toArray(vec) {
@@ -111,7 +117,12 @@ function initQuantizePanel() {
       const runtime = await getRuntime();
 
       let resultBuf;
-      if (method in NO_CALIBRATION_METHODS) {
+      if (method === "fp8") {
+        const formatEl = document.getElementById("quantize-fp8-format");
+        const format = formatEl ? formatEl.value : "e4m3";
+        setStatus(`quantizing (fp8, ${format})…`);
+        resultBuf = runtime.onnxsim_quantize_fp8(modelBuf, format);
+      } else if (method in NO_CALIBRATION_METHODS) {
         setStatus(`quantizing (${method})…`);
         resultBuf = runtime[NO_CALIBRATION_METHODS[method]](modelBuf);
       } else if (method === "static" || method === "qoperator") {
