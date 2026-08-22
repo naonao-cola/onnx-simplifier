@@ -1,5 +1,6 @@
 """Tests for ``onnxsim.quantize_weight_only_int4`` (the
-``weight_only_quantize_int4_matmul`` C++ pass).
+``weight_only_quantize_int4_matmul``/``weight_only_quantize_int4_conv`` C++
+passes).
 
 Each model is built directly with ``onnx.helper`` (no torch dependency),
 quantized, and then actually run through ONNX Runtime -- both before and
@@ -142,6 +143,75 @@ def test_quantize_skips_k_not_divisible_by_block_size():
 
     quant = onnxsim.quantize_weight_only_int4(model)
     assert _op_counts(quant)["MatMul"] == 1
+    assert _op_counts(quant)["DequantizeLinear"] == 0
+
+
+def test_quantize_conv_pointwise():
+    # A 1x1 (pointwise) Conv: inner = Cin/groups * kH * kW = Cin * 1 * 1, so
+    # Cin=32 gives exactly one block -- the simplest Conv case, structurally
+    # equivalent to a per-pixel MatMul.
+    rng = np.random.default_rng(5)
+    cout, cin = 16, 32
+    weight = _f32(rng.standard_normal((cout, cin, 1, 1)) * 0.5, "W")
+    nodes = [onnx.helper.make_node("Conv", ["X", "W"], ["Y"], kernel_shape=[1, 1])]
+    model = _model(
+        nodes, [_vi("X", [1, cin, 8, 8])], [_vi("Y", [1, cout, 8, 8])], [weight]
+    )
+
+    quant = onnxsim.quantize_weight_only_int4(model)
+    onnx.checker.check_model(quant)
+    ops = _op_counts(quant)
+    assert ops["Conv"] == 1
+    assert ops["DequantizeLinear"] == 1
+    assert ops["Reshape"] == 1
+
+    w_init = next(
+        t for t in quant.graph.initializer if t.data_type == onnx.TensorProto.INT4
+    )
+    assert list(w_init.dims) == [cout, cin]  # flattened [Cout, inner]
+
+    x = rng.standard_normal((1, cin, 8, 8)).astype(np.float32)
+    _assert_close(_run(model, {"X": x}), _run(quant, {"X": x}))
+
+
+def test_quantize_conv_spatial_kernel_with_bias():
+    # kernel_shape=[2, 2], Cin=8 -> inner = 8 * 2 * 2 = 32: the flattening
+    # spans both the channel and spatial dims, unlike the pointwise case.
+    rng = np.random.default_rng(6)
+    cout, cin = 4, 8
+    weight = _f32(rng.standard_normal((cout, cin, 2, 2)) * 0.5, "W")
+    bias = _f32(rng.standard_normal(cout), "B")
+    nodes = [onnx.helper.make_node("Conv", ["X", "W", "B"], ["Y"], kernel_shape=[2, 2])]
+    model = _model(
+        nodes, [_vi("X", [1, cin, 8, 8])], [_vi("Y", [1, cout, 7, 7])], [weight, bias]
+    )
+
+    quant = onnxsim.quantize_weight_only_int4(model)
+    onnx.checker.check_model(quant)
+    ops = _op_counts(quant)
+    assert ops["Conv"] == 1
+    assert ops["DequantizeLinear"] == 1
+    assert ops["Reshape"] == 1
+
+    x = rng.standard_normal((1, cin, 8, 8)).astype(np.float32)
+    _assert_close(_run(model, {"X": x}), _run(quant, {"X": x}))
+
+
+def test_quantize_conv_skips_inner_not_divisible_by_block_size():
+    # inner = Cin * kH * kW = 4 * 3 * 3 = 36, not a multiple of 32.
+    rng = np.random.default_rng(7)
+    cout, cin = 4, 4
+    weight = _f32(rng.standard_normal((cout, cin, 3, 3)) * 0.5, "W")
+    nodes = [onnx.helper.make_node("Conv", ["X", "W"], ["Y"], kernel_shape=[3, 3])]
+    model = _model(
+        nodes,
+        [_vi("X", [1, cin, 8, 8])],
+        [_vi("Y", [1, cout, 6, 6])],
+        [weight],
+    )
+
+    quant = onnxsim.quantize_weight_only_int4(model)
+    assert _op_counts(quant)["Conv"] == 1
     assert _op_counts(quant)["DequantizeLinear"] == 0
 
 

@@ -17,6 +17,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <string>
 #include <vector>
 
 #include "onnx/common/assertions.h"
@@ -110,6 +111,93 @@ inline void QuantizeConvWeightPerOutputChannel(const Tensor& w_t, Tensor& q_out,
   scale_out.elem_type() = TensorProto_DataType_FLOAT;
   scale_out.sizes() = {C};
   scale_out.floats() = std::move(scale);
+}
+
+// Block-wise INT4 quantization of `w_t` (a constant float32 Conv weight,
+// [Cout, Cin/groups, k...]), mirroring
+// quantize_matmul_common.h's TryQuantizeWeightBlockwiseInt4InPlace but for
+// Conv's multi-axis weight: Conv has no single reduction axis the way
+// MatMul/Gemm does (every one of ``Cin/groups`` and the kernel dims
+// contributes to one output pixel's sum), so instead of blocking along one
+// of Conv's own axes (which would put an independent scale on every kernel
+// spatial position -- little compression benefit when the kernel is, say,
+// 3x3), this flattens everything but the output channel into one sequence
+// of length `inner = Cin/groups * prod(k...)` and blocks *that*, exactly
+// like a MatMul weight would be. `q_out`/`scale_out` are therefore 2-D
+// ([Cout, inner] and [Cout, inner / block_size]) even though `w_t` is not --
+// the caller reshapes `q_out`'s DequantizeLinear output back to `w_t`'s
+// original shape (see weight_only_quantize_int4_conv.h).
+//
+// Returns false (nothing written) when `inner` is not evenly divisible by
+// `block_size` -- the common, unambiguous case only, matching the MatMul
+// version.
+inline bool TryQuantizeConvWeightBlockwiseInt4Flat(const Tensor& w_t,
+                                                   int64_t block_size,
+                                                   Tensor& q_out,
+                                                   Tensor& scale_out) {
+  const auto& sizes = w_t.sizes();
+  const int64_t C = sizes[0];
+  int64_t inner = 1;
+  for (size_t i = 1; i < sizes.size(); ++i) {
+    inner *= sizes[i];
+  }
+  if (block_size <= 0 || inner % block_size != 0) {
+    return false;
+  }
+  const int64_t num_blocks = inner / block_size;
+
+  const std::vector<float> data = ReadFloatTensorFlat(w_t);
+
+  std::vector<float> scale(static_cast<size_t>(C * num_blocks), 0.0f);
+  for (int64_t c = 0; c < C; ++c) {
+    for (int64_t j = 0; j < inner; ++j) {
+      float& s = scale[static_cast<size_t>(c * num_blocks + j / block_size)];
+      s = std::max(s, std::fabs(data[static_cast<size_t>(c * inner + j)]));
+    }
+  }
+  for (float& s : scale) {
+    s = s > 0.0f ? s / 7.0f : 1.0f;
+  }
+
+  // Pack two int4 codes per byte, low nibble first -- see
+  // TryQuantizeWeightBlockwiseInt4InPlace's identical packing for why this
+  // bypasses q_out.int32s() (ONNX's wire format for INT4 packs raw_data;
+  // onnxsim's vendored onnx-optimizer has no INT4-aware packing for the
+  // typed int32_data field). `inner % block_size == 0` with an even
+  // block_size makes `C * inner` always even, so no odd-count padding byte
+  // is needed.
+  const int64_t numel = C * inner;
+  std::vector<int8_t> codes(static_cast<size_t>(numel));
+  for (int64_t c = 0; c < C; ++c) {
+    for (int64_t j = 0; j < inner; ++j) {
+      const float s =
+          scale[static_cast<size_t>(c * num_blocks + j / block_size)];
+      const float q = std::round(data[static_cast<size_t>(c * inner + j)] / s);
+      codes[static_cast<size_t>(c * inner + j)] =
+          static_cast<int8_t>(std::clamp(q, -7.0f, 7.0f));
+    }
+  }
+  std::string packed(static_cast<size_t>((numel + 1) / 2), '\0');
+  for (int64_t i = 0; i < numel; ++i) {
+    const uint8_t nibble =
+        static_cast<uint8_t>(codes[static_cast<size_t>(i)]) & 0x0F;
+    uint8_t& byte =
+        reinterpret_cast<uint8_t&>(packed[static_cast<size_t>(i / 2)]);
+    if (i % 2 == 0) {
+      byte = nibble;
+    } else {
+      byte = static_cast<uint8_t>(byte | (nibble << 4));
+    }
+  }
+
+  q_out.elem_type() = TensorProto_DataType_INT4;
+  q_out.sizes() = {C, inner};
+  q_out.set_raw_data(std::move(packed));
+
+  scale_out.elem_type() = TensorProto_DataType_FLOAT;
+  scale_out.sizes() = {C, num_blocks};
+  scale_out.floats() = std::move(scale);
+  return true;
 }
 
 }  // namespace onnxsim_passes

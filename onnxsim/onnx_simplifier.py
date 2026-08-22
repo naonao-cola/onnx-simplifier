@@ -482,30 +482,33 @@ def quantize_weight_only(model: Union[str, onnx.ModelProto]) -> onnx.ModelProto:
 
 def quantize_weight_only_int4(model: Union[str, onnx.ModelProto]) -> onnx.ModelProto:
     """
-    Block-wise INT4 weight-only quantize every MatMul, and every "vanilla"
-    Gemm (transA=0, alpha=1, beta=1), whose weight is a constant 2-D float32
-    tensor whose reduction dimension (K) is evenly divisible by 32.
+    Block-wise INT4 weight-only quantize every MatMul, every "vanilla" Gemm
+    (transA=0, alpha=1, beta=1), and every Conv, whose weight is a constant
+    float32 tensor whose flattened reduction size -- ``K`` for MatMul/Gemm;
+    ``Cin/groups * prod(kernel dims)`` for Conv -- is evenly divisible by 32.
 
     The weight is quantized to INT4 (values in ``[-7, 7]``) with a separate
-    symmetric scale per 32-element block of ``K``, per output channel --
-    the GPTQ/AWQ-style block quantization real weight-heavy LLM/ASR
-    deployments increasingly ship -- inserting a single
-    ``DequantizeLinear(axis=<K's axis>, block_size=32)`` in its place. Like
-    :func:`quantize_weight_only`, the activation is never touched: no
-    calibration data, no runtime quantize/dequantize cost on the activation
-    path. Storage is roughly half of :func:`quantize_weight_only`'s INT8
-    scheme for a comparable accuracy cost, since block-local scales absorb
-    most of what a single wider per-channel range would otherwise lose. Uses
-    ONNX opset 21's INT4 tensor type and ``DequantizeLinear``'s
+    symmetric scale per 32-element block of that reduction, per output
+    channel -- the GPTQ/AWQ-style block quantization real weight-heavy
+    LLM/ASR deployments increasingly ship -- inserting a single
+    ``DequantizeLinear(..., block_size=32)`` in its place (Conv's weight is
+    flattened to 2-D for this, then a ``Reshape`` restores its original
+    shape). Like :func:`quantize_weight_only`, the activation is never
+    touched: no calibration data, no runtime quantize/dequantize cost on the
+    activation path. Storage is roughly half of :func:`quantize_weight_only`'s
+    INT8 scheme for a comparable accuracy cost, since block-local scales
+    absorb most of what a single wider per-channel range would otherwise
+    lose. Uses ONNX opset 21's INT4 tensor type and ``DequantizeLinear``'s
     ``block_size`` attribute -- standard ONNX, not a contrib op, so the
     result loads on any conformant opset-21+ runtime.
 
     This is a single, self-contained graph rewrite: unlike :func:`simplify`,
     it does not run shape inference, constant folding, or any other pass.
-    Nodes that do not match (dynamic or non-2-D weights, a reduction
-    dimension not divisible by 32, non-default Gemm attributes, non-float32
-    operands, an opset older than 21) are left untouched. Consider calling
-    :func:`simplify` before and/or after to clean up the graph.
+    Nodes that do not match (dynamic or unsupported-rank weights, a
+    reduction size not divisible by 32, non-default Gemm attributes,
+    non-float32 operands, an opset older than 21) are left untouched.
+    Consider calling :func:`simplify` before and/or after to clean up the
+    graph.
 
     :param model: onnx ModelProto object or file path
     :returns: the quantized onnx ModelProto
@@ -1395,11 +1398,11 @@ def main():
     parser.add_argument(
         "--weight-only-quantize-int4",
         help="After simplifying, block-wise INT4 weight-only quantize "
-        "MatMul/Gemm weights (one symmetric scale per 32-element block of "
-        "the reduction dimension, per output channel), inserting a single "
-        "DequantizeLinear(block_size=32) per weight. Activations are never "
-        "touched. Needs opset >= 21 (INT4 tensors, DequantizeLinear's "
-        "block_size). See onnxsim.quantize_weight_only_int4.",
+        "MatMul/Gemm/Conv weights (one symmetric scale per 32-element block "
+        "of the flattened reduction dimension, per output channel), "
+        "inserting a single DequantizeLinear(block_size=32) per weight. "
+        "Activations are never touched. Needs opset >= 21 (INT4 tensors, "
+        "DequantizeLinear's block_size). See onnxsim.quantize_weight_only_int4.",
         action="store_true",
     )
     parser.add_argument(
@@ -1654,7 +1657,7 @@ def main():
         model_opt = quantize_weight_only(model_opt)
 
     if args.weight_only_quantize_int4:
-        print("Block-wise INT4 weight-only quantizing MatMul/Gemm weights...")
+        print("Block-wise INT4 weight-only quantizing MatMul/Gemm/Conv weights...")
         model_opt = quantize_weight_only_int4(model_opt)
 
     if args.static_quantize:
