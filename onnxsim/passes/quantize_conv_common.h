@@ -113,6 +113,47 @@ inline void QuantizeConvWeightPerOutputChannel(const Tensor& w_t, Tensor& q_out,
   scale_out.floats() = std::move(scale);
 }
 
+// Same as QuantizeConvWeightPerOutputChannel, but INT16
+// (max(|w[c, ...]|) / 32767 per channel) instead of INT8 -- used by
+// weight_only_quantize_int16_conv.h. See
+// QuantizeWeightPerChannelInPlaceInt16 in quantize_matmul_common.h for why.
+inline void QuantizeConvWeightPerOutputChannelInt16(const Tensor& w_t,
+                                                    Tensor& q_out,
+                                                    Tensor& scale_out) {
+  const auto& sizes = w_t.sizes();
+  const int64_t C = sizes[0];
+  int64_t inner = 1;
+  for (size_t i = 1; i < sizes.size(); ++i) {
+    inner *= sizes[i];
+  }
+  const std::vector<float> data = ReadFloatTensorFlat(w_t);
+
+  std::vector<float> scale(static_cast<size_t>(C), 0.0f);
+  for (int64_t c = 0; c < C; ++c) {
+    for (int64_t j = 0; j < inner; ++j) {
+      scale[c] = std::max(scale[c], std::fabs(data[c * inner + j]));
+    }
+  }
+  for (float& s : scale) {
+    s = s > 0.0f ? s / 32767.0f : 1.0f;
+  }
+
+  q_out.elem_type() = TensorProto_DataType_INT16;
+  q_out.sizes() = sizes;
+  q_out.int32s().resize(static_cast<size_t>(C * inner));
+  for (int64_t c = 0; c < C; ++c) {
+    for (int64_t j = 0; j < inner; ++j) {
+      const float q = std::round(data[c * inner + j] / scale[c]);
+      q_out.int32s()[c * inner + j] =
+          static_cast<int32_t>(std::clamp(q, -32767.0f, 32767.0f));
+    }
+  }
+
+  scale_out.elem_type() = TensorProto_DataType_FLOAT;
+  scale_out.sizes() = {C};
+  scale_out.floats() = std::move(scale);
+}
+
 // Block-wise INT4 quantization of `w_t` (a constant float32 Conv weight,
 // [Cout, Cin/groups, k...]), mirroring
 // quantize_matmul_common.h's TryQuantizeWeightBlockwiseInt4InPlace but for
