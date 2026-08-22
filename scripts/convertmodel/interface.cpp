@@ -891,6 +891,49 @@ em::val onnxsim_quantize_weight_only_int4(const std::string& data) {
     }
 }
 
+em::val onnxsim_quantize_fp16(const std::string& data) {
+    onnx::ModelProto xmodel;
+    if (!xmodel.ParseFromArray(data.data(), data.size())) {
+        std::cerr << "Parse failed" << std::endl;
+        return em::val::null();
+    }
+    try {
+        return SerializeModel(QuantizeFp16(xmodel));
+    } catch (const std::exception& e) {
+        std::cerr << "quantize_fp16 error: " << e.what() << std::endl;
+        return em::val::null();
+    }
+}
+
+em::val onnxsim_quantize_bf16(const std::string& data) {
+    onnx::ModelProto xmodel;
+    if (!xmodel.ParseFromArray(data.data(), data.size())) {
+        std::cerr << "Parse failed" << std::endl;
+        return em::val::null();
+    }
+    try {
+        return SerializeModel(QuantizeBf16(xmodel));
+    } catch (const std::exception& e) {
+        std::cerr << "quantize_bf16 error: " << e.what() << std::endl;
+        return em::val::null();
+    }
+}
+
+// `format` is "e4m3" or "e5m2" -- see QuantizeFp8 in onnxsim.h.
+em::val onnxsim_quantize_fp8(const std::string& data, const std::string& format) {
+    onnx::ModelProto xmodel;
+    if (!xmodel.ParseFromArray(data.data(), data.size())) {
+        std::cerr << "Parse failed" << std::endl;
+        return em::val::null();
+    }
+    try {
+        return SerializeModel(QuantizeFp8(xmodel, format));
+    } catch (const std::exception& e) {
+        std::cerr << "quantize_fp8 error: " << e.what() << std::endl;
+        return em::val::null();
+    }
+}
+
 // Both list_* functions below are used by the page to discover which tensor
 // names to calibrate (run the model over sample inputs and record each
 // tensor's observed min/max) before calling quantize_static/quantize_qoperator.
@@ -997,6 +1040,9 @@ EMSCRIPTEN_BINDINGS(module) {
     function("onnxsim_quantize_ternary", &onnxsim_quantize_ternary);
     function("onnxsim_quantize_weight_only", &onnxsim_quantize_weight_only);
     function("onnxsim_quantize_weight_only_int4", &onnxsim_quantize_weight_only_int4);
+    function("onnxsim_quantize_fp16", &onnxsim_quantize_fp16);
+    function("onnxsim_quantize_bf16", &onnxsim_quantize_bf16);
+    function("onnxsim_quantize_fp8", &onnxsim_quantize_fp8);
     // Calibration-based quantization: list_* discovers which tensors to
     // calibrate, quantize_static/quantize_qoperator take the calibrated
     // ranges back as parallel [name] / [min0, max0, min1, max1, ...] arrays.

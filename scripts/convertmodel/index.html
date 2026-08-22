@@ -341,6 +341,15 @@ agraph (float[N] X) =&gt; (float[N] Y) {
                     <code>QLinearMatMul</code>, computing directly in int8; also
                     needs a calibrated <i>output</i> range, not just the
                     activation. Needs calibration (below).</li>
+                <li><b>Float16</b> / <b>BFloat16</b> / <b>Float8</b> -- a
+                    different kind of "quantization": every weight (and, by
+                    default, every internal activation -- a boundary
+                    <code>Cast</code> keeps the model's own external
+                    input/output types float32) is simply rounded to a
+                    narrower floating-point format, not an integer scheme, so
+                    no calibration data is needed at all. Float16/BFloat16
+                    halve storage; Float8 (E4M3 or E5M2, below) quarters it,
+                    at the cost of the least precision of any format here.</li>
             </ul>
             <p class="tool-note">
                 <b>Calibration</b> (Static/QOperator only) runs the model over a
@@ -367,7 +376,19 @@ agraph (float[N] X) =&gt; (float[N] Y) {
                 <label for="quantize_static">Static (QDQ)</label>
                 <input type="radio" name="quantize-method" value="qoperator" id="quantize_qoperator">
                 <label for="quantize_qoperator">QOperator (QLinearMatMul)</label>
+                <input type="radio" name="quantize-method" value="fp16" id="quantize_fp16">
+                <label for="quantize_fp16">Float16</label>
+                <input type="radio" name="quantize-method" value="bf16" id="quantize_bf16">
+                <label for="quantize_bf16">BFloat16</label>
+                <input type="radio" name="quantize-method" value="fp8" id="quantize_fp8">
+                <label for="quantize_fp8">Float8</label>
             </div>
+            <label for="quantize-fp8-format">Float8 format</label>
+            <select id="quantize-fp8-format">
+                <option value="e4m3" selected>E4M3FN (max 448, typically weights)</option>
+                <option value="e5m2">E5M2 (max 57344, typically gradients)</option>
+            </select>
+            <br/>
             <label for="quantize-samples">calibration samples (Static / QOperator only)</label>
             <input type="number" id="quantize-samples" value="8" min="1" max="64" step="1" style="width: 4em;">
             <br/>
