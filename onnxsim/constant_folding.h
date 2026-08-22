@@ -45,11 +45,11 @@ void FixupSchemaDeterminism();
 // dropping the folded nodes and sweeping up initializers left unused by the
 // fold.
 onnx::ModelProto _FoldConstant(const ModelExecutor& executor,
-                                onnx::ModelProto model);
+                               onnx::ModelProto model);
 
 // Graph-native counterpart of _FoldConstant. Returns whether anything folded.
 bool _FoldConstantOnGraph(const ModelExecutor& executor, onnx::Graph& g,
-                           int64_t ir_version);
+                          int64_t ir_version);
 
 // Runs onnxsim's own optimizer-pass fixed point once over `model` (via an
 // onnx::ModelProto <-> Graph round trip), honoring `config`.

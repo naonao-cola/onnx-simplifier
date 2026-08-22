@@ -6,15 +6,6 @@
 #ifdef ONNXSIM_HAS_ORT
 #include "onnxruntime_cxx_api.h"
 #endif
-#include "custom_optimizer_passes.h"
-#include "dlpack_bridge.h"
-#include "onnx/common/ir_pb_converter.h"
-#include "onnx/common/ir_pb_converter_internal.h"
-#include "onnx/defs/schema.h"
-#include "onnxoptimizer/optimize.h"
-#include "onnxoptimizer/passes/logging.h"
-#include "profiler.h"
-
 #include <algorithm>
 #include <cstring>
 #include <functional>
@@ -25,6 +16,15 @@
 #include <stdexcept>
 #include <unordered_map>
 #include <unordered_set>
+
+#include "custom_optimizer_passes.h"
+#include "dlpack_bridge.h"
+#include "onnx/common/ir_pb_converter.h"
+#include "onnx/common/ir_pb_converter_internal.h"
+#include "onnx/defs/schema.h"
+#include "onnxoptimizer/optimize.h"
+#include "onnxoptimizer/passes/logging.h"
+#include "profiler.h"
 
 Config config;
 

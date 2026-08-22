@@ -3,13 +3,6 @@
 #include <google/protobuf/repeated_ptr_field.h>
 #include <onnx/onnx_pb.h>
 
-#include "onnx/common/graph_shape_inference.h"
-#include "onnx/common/ir_pb_converter.h"
-#include "onnx/defs/schema.h"
-#include "onnx/shape_inference/implementation.h"
-#include "sym_shape_infer.h"
-#include "sym_value_eval.h"
-
 #include <algorithm>
 #include <cstdint>
 #include <map>
@@ -18,6 +11,13 @@
 #include <type_traits>
 #include <unordered_map>
 #include <vector>
+
+#include "onnx/common/graph_shape_inference.h"
+#include "onnx/common/ir_pb_converter.h"
+#include "onnx/defs/schema.h"
+#include "onnx/shape_inference/implementation.h"
+#include "sym_shape_infer.h"
+#include "sym_value_eval.h"
 
 // Mutates the model in place; ``onnx::shape_inference::InferShapes`` already
 // works in place, so no extra ModelProto copy is made (the previous ``const&``
