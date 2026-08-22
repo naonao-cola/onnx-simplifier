@@ -132,9 +132,9 @@ inline void QuantizeConvWeightPerOutputChannel(const Tensor& w_t, Tensor& q_out,
 // `block_size` -- the common, unambiguous case only, matching the MatMul
 // version.
 inline bool TryQuantizeConvWeightBlockwiseInt4Flat(const Tensor& w_t,
-                                                    int64_t block_size,
-                                                    Tensor& q_out,
-                                                    Tensor& scale_out) {
+                                                   int64_t block_size,
+                                                   Tensor& q_out,
+                                                   Tensor& scale_out) {
   const auto& sizes = w_t.sizes();
   const int64_t C = sizes[0];
   int64_t inner = 1;
@@ -170,7 +170,8 @@ inline bool TryQuantizeConvWeightBlockwiseInt4Flat(const Tensor& w_t,
   std::vector<int8_t> codes(static_cast<size_t>(numel));
   for (int64_t c = 0; c < C; ++c) {
     for (int64_t j = 0; j < inner; ++j) {
-      const float s = scale[static_cast<size_t>(c * num_blocks + j / block_size)];
+      const float s =
+          scale[static_cast<size_t>(c * num_blocks + j / block_size)];
       const float q = std::round(data[static_cast<size_t>(c * inner + j)] / s);
       codes[static_cast<size_t>(c * inner + j)] =
           static_cast<int8_t>(std::clamp(q, -7.0f, 7.0f));
@@ -178,8 +179,10 @@ inline bool TryQuantizeConvWeightBlockwiseInt4Flat(const Tensor& w_t,
   }
   std::string packed(static_cast<size_t>((numel + 1) / 2), '\0');
   for (int64_t i = 0; i < numel; ++i) {
-    const uint8_t nibble = static_cast<uint8_t>(codes[static_cast<size_t>(i)]) & 0x0F;
-    uint8_t& byte = reinterpret_cast<uint8_t&>(packed[static_cast<size_t>(i / 2)]);
+    const uint8_t nibble =
+        static_cast<uint8_t>(codes[static_cast<size_t>(i)]) & 0x0F;
+    uint8_t& byte =
+        reinterpret_cast<uint8_t&>(packed[static_cast<size_t>(i / 2)]);
     if (i % 2 == 0) {
       byte = nibble;
     } else {

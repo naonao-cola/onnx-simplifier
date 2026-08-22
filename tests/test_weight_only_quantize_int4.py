@@ -165,7 +165,9 @@ def test_quantize_conv_pointwise():
     assert ops["DequantizeLinear"] == 1
     assert ops["Reshape"] == 1
 
-    w_init = next(t for t in quant.graph.initializer if t.data_type == onnx.TensorProto.INT4)
+    w_init = next(
+        t for t in quant.graph.initializer if t.data_type == onnx.TensorProto.INT4
+    )
     assert list(w_init.dims) == [cout, cin]  # flattened [Cout, inner]
 
     x = rng.standard_normal((1, cin, 8, 8)).astype(np.float32)
@@ -179,9 +181,7 @@ def test_quantize_conv_spatial_kernel_with_bias():
     cout, cin = 4, 8
     weight = _f32(rng.standard_normal((cout, cin, 2, 2)) * 0.5, "W")
     bias = _f32(rng.standard_normal(cout), "B")
-    nodes = [
-        onnx.helper.make_node("Conv", ["X", "W", "B"], ["Y"], kernel_shape=[2, 2])
-    ]
+    nodes = [onnx.helper.make_node("Conv", ["X", "W", "B"], ["Y"], kernel_shape=[2, 2])]
     model = _model(
         nodes, [_vi("X", [1, cin, 8, 8])], [_vi("Y", [1, cout, 7, 7])], [weight, bias]
     )

@@ -20,12 +20,15 @@
 // (TryQuantizeConvWeightBlockwiseInt4Flat), then reshapes the dequantized
 // result back to Conv's expected weight shape:
 //
+// inner = Cin/groups * prod(k...)
+//
 // Before:
 //   Y = Conv(X, W)             W constant, float32, [Cout, Cin/groups, k...]
 // After:
-//   Wq_flat  = <int4, [Cout, inner]>              inner = Cin/groups * prod(k...)
+//   Wq_flat  = <int4, [Cout, inner]>
 //   Ws_flat  = <float32, [Cout, inner / kBlockSize]>
-//   Wdq_flat = DequantizeLinear(Wq_flat, Ws_flat, axis=1, block_size=kBlockSize)
+//   Wdq_flat = DequantizeLinear(Wq_flat, Ws_flat, axis=1,
+//                                block_size=kBlockSize)
 //   Wdq      = Reshape(Wdq_flat, [Cout, Cin/groups, k...])
 //   Y        = Conv(X, Wdq)
 //
