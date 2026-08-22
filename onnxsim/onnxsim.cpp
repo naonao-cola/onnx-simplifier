@@ -1001,23 +1001,95 @@ std::map<std::string, onnxsim::SymTensor> EvaluateModelSymbolicValues(
 // This pass rewrites every node whose lone output has a fully concrete
 // propagated value into a `Constant` node. Downstream ops then fold through the
 // ordinary constant folder, and now-dead nodes are removed by the optimizer.
+// A graph's ``value_info``/``output`` annotations, snapshotted recursively:
+// one entry for the graph itself, followed by one entry per nested subgraph
+// (the branches of an ``If``, the body of a ``Loop``/``Scan``, ...) in the
+// same pre-order that ``RestoreGraphAnnotations`` below walks them back in.
+struct GraphAnnotationSnapshot {
+  google::protobuf::RepeatedPtrField<onnx::ValueInfoProto> value_info;
+  google::protobuf::RepeatedPtrField<onnx::ValueInfoProto> output;
+};
+
+void SnapshotGraphAnnotations(const onnx::GraphProto& graph,
+                              std::vector<GraphAnnotationSnapshot>& out) {
+  out.push_back({graph.value_info(), graph.output()});
+  for (const auto& node : graph.node()) {
+    for (const auto& attr : node.attribute()) {
+      if (attr.has_g()) {
+        SnapshotGraphAnnotations(attr.g(), out);
+      }
+      for (const auto& subgraph : attr.graphs()) {
+        SnapshotGraphAnnotations(subgraph, out);
+      }
+    }
+  }
+}
+
+// ``restore_self`` gates whether `graph` itself (as opposed to the nested
+// subgraphs found in its nodes) gets its snapshot re-applied: callers that
+// intentionally keep a graph's own data-propagated annotations (because
+// something in that graph did get folded using them) still want every nested
+// ``If``/``Loop`` subgraph restored unconditionally -- this pass never folds
+// a subgraph-local node, so a subgraph's annotations are never allowed to
+// stick regardless of what happened at the level above it.
+void RestoreGraphAnnotations(onnx::GraphProto* graph,
+                             const std::vector<GraphAnnotationSnapshot>& snaps,
+                             size_t& idx, bool restore_self = true) {
+  if (restore_self) {
+    *graph->mutable_value_info() = snaps[idx].value_info;
+    *graph->mutable_output() = snaps[idx].output;
+  }
+  idx++;
+  for (auto& node : *graph->mutable_node()) {
+    for (auto& attr : *node.mutable_attribute()) {
+      if (attr.has_g()) {
+        RestoreGraphAnnotations(attr.mutable_g(), snaps, idx);
+      }
+      for (auto& subgraph : *attr.mutable_graphs()) {
+        RestoreGraphAnnotations(&subgraph, snaps, idx);
+      }
+    }
+  }
+}
+
 void _EvalPartialShape(onnx::ModelProto& model) {
   // This pass runs shape inference with *data propagation* (lenient options)
   // purely to discover foldable shape values; it must not otherwise change the
-  // model. InferShapes mutates value_info and output types in place, so
-  // snapshot those annotations and restore them on the paths that fold nothing,
-  // leaving the model byte-for-byte unchanged (the old code returned the
-  // untouched input there). The snapshot is metadata only -- no tensor weights
-  // -- so it is cheap, unlike the full-model ``CopyFrom`` it replaces.
-  // Restoring also keeps this pass's data-propagation value_info out of the
-  // model, which matters: it differs from the regular shape-inference pass's
-  // value_info, and leaving it behind could make the outer fixed point
-  // oscillate.
-  auto saved_value_info = model.graph().value_info();
-  auto saved_output = model.graph().output();
+  // model. InferShapes mutates value_info and output types in place --
+  // including inside nested subgraphs (the branches of an ``If``, a ``Loop``
+  // body, ...), since data-propagating shape inference recurses into them
+  // too -- so snapshot those annotations *recursively* and restore them on
+  // the paths that fold nothing, leaving the model byte-for-byte unchanged
+  // (the old code returned the untouched input there). Restoring only the
+  // top-level graph's annotations left a subgraph's lenient, data-propagated
+  // value_info in place even when nothing here was foldable; two sibling
+  // branches of the same ``If`` can independently reuse the same local
+  // output name (e.g. both a decoder's no-past and with-past branches
+  // producing their own "ConstantOfShape_2"), so leaking one branch's
+  // data-propagation shape onto the model let onnxruntime's later merge of
+  // the ``If`` node's branch output types find the two incompatible and
+  // reject the model outright. The snapshot is metadata only -- no tensor
+  // weights -- so it is cheap, unlike the full-model ``CopyFrom`` it
+  // replaces. Restoring also keeps this pass's data-propagation value_info
+  // out of the model, which matters: it differs from the regular
+  // shape-inference pass's value_info, and leaving it behind could make the
+  // outer fixed point oscillate.
+  std::vector<GraphAnnotationSnapshot> saved_annotations;
+  SnapshotGraphAnnotations(model.graph(), saved_annotations);
   auto restore = [&]() {
-    *model.mutable_graph()->mutable_value_info() = saved_value_info;
-    *model.mutable_graph()->mutable_output() = saved_output;
+    size_t idx = 0;
+    RestoreGraphAnnotations(model.mutable_graph(), saved_annotations, idx);
+  };
+  // Unlike `restore`, this leaves the top-level graph's own (possibly folded)
+  // annotations alone and only reverts every nested subgraph -- for the path
+  // below where something *was* foldable at the top level, so the top-level
+  // graph's data-propagated value_info is allowed to stick (nothing here
+  // ever folds a subgraph-local node, so a subgraph's annotations must
+  // revert either way).
+  auto restore_subgraphs_only = [&]() {
+    size_t idx = 0;
+    RestoreGraphAnnotations(model.mutable_graph(), saved_annotations, idx,
+                            /*restore_self=*/false);
   };
 
   onnx::shape_inference::DataValueMap data_map;
@@ -1263,6 +1335,7 @@ void _EvalPartialShape(onnx::ModelProto& model) {
     restore();
     return;
   }
+  restore_subgraphs_only();
 
   // Rewrite each foldable node into a `Constant` node in the same position,
   // keeping the graph topologically sorted. Emitting a `Constant` node (rather
