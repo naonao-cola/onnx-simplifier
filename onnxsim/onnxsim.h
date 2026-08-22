@@ -256,6 +256,39 @@ onnx::ModelProto QuantizeWeightOnlyInt4(const onnx::ModelProto& model);
 // are left as-is.
 onnx::ModelProto QuantizeWeightOnlyInt16(const onnx::ModelProto& model);
 
+// Block-wise INT8 weight-only quantizes every MatMul, every "vanilla" Gemm
+// (transA=0, alpha=1, beta=1), and every Conv, whose weight is a constant
+// float32 tensor whose flattened reduction size (K for MatMul/Gemm --
+// transposed [N, K] or not; Cin/groups * prod(kernel dims) for Conv) is
+// evenly divisible by 32: the weight is quantized to INT8 (values in
+// [-127, 127]) with a separate symmetric scale per 32-element block of that
+// reduction, per output channel, inserting a single
+// ``DequantizeLinear(axis=..., block_size=32)`` in its place (Conv's weight
+// is flattened to 2-D for this, then a ``Reshape`` restores its original
+// shape -- see ``passes/weight_only_quantize_int8_block_conv.h``). Sits
+// between ``QuantizeWeightOnly``'s single per-channel INT8 scale (coarser,
+// no block overhead) and ``QuantizeWeightOnlyInt4``'s block-wise INT4
+// (finer blocks, but only 15 representable codes per block): the same
+// storage as ``QuantizeWeightOnly`` (INT8 codes are still 1 byte each; only
+// the scale tensor grows, from one float per channel to one float per
+// (block, channel) pair) with resolution closer to a per-block scheme.
+// Like ``QuantizeWeightOnly``, the activation is never touched -- no
+// calibration data, no runtime quantize/dequantize cost on the activation
+// path. Uses ONNX opset 21's ``DequantizeLinear`` `block_size` attribute
+// (standard ONNX, not a contrib op) -- the same opset floor as
+// ``QuantizeWeightOnlyInt4``, even though plain INT8 itself needs only
+// opset 13. See ``passes/weight_only_quantize_int8_block_matmul.h`` and
+// ``passes/weight_only_quantize_int8_block_conv.h`` for the rewrites
+// themselves.
+//
+// Unlike ``Simplify``, this does not run shape inference, constant folding or
+// any other simplification pass -- it applies exactly these rewrites, once
+// each, to a copy of ``model`` (which is left untouched) and returns the
+// result. Nodes that do not match (dynamic or unsupported-rank weights, a
+// reduction size not divisible by 32, non-default Gemm attributes,
+// non-float32 operands, an opset older than 21) are left as-is.
+onnx::ModelProto QuantizeWeightOnlyInt8Block(const onnx::ModelProto& model);
+
 // Lists the activation tensor names that ``QuantizeStatic`` could quantize in
 // ``model`` -- the first input of every MatMul, every "vanilla" Gemm
 // (transA=0, alpha=1, beta=1), and every Conv, whose weight is a constant

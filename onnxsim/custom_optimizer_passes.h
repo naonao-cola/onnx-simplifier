@@ -35,6 +35,8 @@ namespace onnxsim {
 //   - weight_only_quantize_int4_conv
 //   - weight_only_quantize_int16_matmul
 //   - weight_only_quantize_int16_conv
+//   - weight_only_quantize_int8_block_matmul
+//   - weight_only_quantize_int8_block_conv
 //   - qoperator_quantize_matmul
 //   - qoperator_quantize_conv
 //   - quantize_fp16
