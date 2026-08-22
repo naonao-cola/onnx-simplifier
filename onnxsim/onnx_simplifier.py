@@ -480,6 +480,41 @@ def quantize_weight_only(model: Union[str, onnx.ModelProto]) -> onnx.ModelProto:
     return onnx.load_from_string(C.quantize_weight_only(model.SerializeToString()))
 
 
+def quantize_weight_only_int4(model: Union[str, onnx.ModelProto]) -> onnx.ModelProto:
+    """
+    Block-wise INT4 weight-only quantize every MatMul, and every "vanilla"
+    Gemm (transA=0, alpha=1, beta=1), whose weight is a constant 2-D float32
+    tensor whose reduction dimension (K) is evenly divisible by 32.
+
+    The weight is quantized to INT4 (values in ``[-7, 7]``) with a separate
+    symmetric scale per 32-element block of ``K``, per output channel --
+    the GPTQ/AWQ-style block quantization real weight-heavy LLM/ASR
+    deployments increasingly ship -- inserting a single
+    ``DequantizeLinear(axis=<K's axis>, block_size=32)`` in its place. Like
+    :func:`quantize_weight_only`, the activation is never touched: no
+    calibration data, no runtime quantize/dequantize cost on the activation
+    path. Storage is roughly half of :func:`quantize_weight_only`'s INT8
+    scheme for a comparable accuracy cost, since block-local scales absorb
+    most of what a single wider per-channel range would otherwise lose. Uses
+    ONNX opset 21's INT4 tensor type and ``DequantizeLinear``'s
+    ``block_size`` attribute -- standard ONNX, not a contrib op, so the
+    result loads on any conformant opset-21+ runtime.
+
+    This is a single, self-contained graph rewrite: unlike :func:`simplify`,
+    it does not run shape inference, constant folding, or any other pass.
+    Nodes that do not match (dynamic or non-2-D weights, a reduction
+    dimension not divisible by 32, non-default Gemm attributes, non-float32
+    operands, an opset older than 21) are left untouched. Consider calling
+    :func:`simplify` before and/or after to clean up the graph.
+
+    :param model: onnx ModelProto object or file path
+    :returns: the quantized onnx ModelProto
+    """
+    if isinstance(model, str):
+        model = onnx.load(model, load_external_data=False)
+    return onnx.load_from_string(C.quantize_weight_only_int4(model.SerializeToString()))
+
+
 def simplify(
     model: Union[str, onnx.ModelProto],
     check_n: int = 0,
@@ -1358,6 +1393,16 @@ def main():
         action="store_true",
     )
     parser.add_argument(
+        "--weight-only-quantize-int4",
+        help="After simplifying, block-wise INT4 weight-only quantize "
+        "MatMul/Gemm weights (one symmetric scale per 32-element block of "
+        "the reduction dimension, per output channel), inserting a single "
+        "DequantizeLinear(block_size=32) per weight. Activations are never "
+        "touched. Needs opset >= 21 (INT4 tensors, DequantizeLinear's "
+        "block_size). See onnxsim.quantize_weight_only_int4.",
+        action="store_true",
+    )
+    parser.add_argument(
         "--static-quantize",
         help="After simplifying, statically (calibration-based) quantize "
         "MatMul/Gemm/Conv weights and activations to INT8/uint8, inserting a "
@@ -1607,6 +1652,10 @@ def main():
     if args.weight_only_quantize:
         print("Weight-only quantizing MatMul/Gemm/Conv weights to INT8...")
         model_opt = quantize_weight_only(model_opt)
+
+    if args.weight_only_quantize_int4:
+        print("Block-wise INT4 weight-only quantizing MatMul/Gemm weights...")
+        model_opt = quantize_weight_only_int4(model_opt)
 
     if args.static_quantize:
         from . import calibration

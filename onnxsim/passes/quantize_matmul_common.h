@@ -19,6 +19,8 @@
 #include <cmath>
 #include <cstdint>
 #include <limits>
+#include <string>
+#include <vector>
 
 #include "onnx/common/assertions.h"
 #include "onnxoptimizer/pass.h"
@@ -270,6 +272,109 @@ inline bool TryQuantizeWeightTernaryKN(const Tensor& w_t, bool transposed,
 
   scale_out.elem_type() = TensorProto_DataType_FLOAT;
   scale_out.sizes() = {N};
+  scale_out.floats() = std::move(scale);
+  return true;
+}
+
+// Block-wise INT4 quantization of `w_t` (a 2-D float32 constant) *in its own
+// layout* (no transpose), mirroring QuantizeWeightPerChannelInPlace's
+// per-channel INT8 scheme but along the *reduction* axis instead of the
+// output-channel one: `channel_axis` (0 or 1) is the output-channel axis, so
+// the reduction axis (`K`, the one MatMulInteger/MatMul actually sums over)
+// is the other one. `K` is split into `K / block_size` consecutive blocks,
+// each with its own scale per output channel -- the scheme GPTQ/AWQ-style
+// weight-only INT4 quantization and ONNX opset 21's blocked
+// QuantizeLinear/DequantizeLinear both use (see block_size). Finer blocks
+// trade more scale-tensor overhead for lower quantization error than a
+// single per-channel scale.
+//
+// Returns false (nothing written) when `K` is not evenly divisible by
+// `block_size` -- the common, unambiguous case only; a ragged last block is
+// left to a future extension rather than handled approximately here.
+// Otherwise `q_out` has the SAME shape as `w_t` (int4, values in [-7, 7]),
+// and `scale_out` also has `w_t`'s shape except the reduction axis is
+// replaced by the block count `K / block_size` -- exactly the shape ONNX's
+// DequantizeLinear(axis=<reduction axis>, block_size=block_size) expects for
+// its `x_scale` input.
+inline bool TryQuantizeWeightBlockwiseInt4InPlace(const Tensor& w_t,
+                                                  int64_t channel_axis,
+                                                  int64_t block_size,
+                                                  Tensor& q_out,
+                                                  Tensor& scale_out) {
+  const auto& sizes = w_t.sizes();
+  const int64_t dim0 = sizes[0];
+  const int64_t dim1 = sizes[1];
+  const int64_t reduction_axis = 1 - channel_axis;
+  const int64_t K = reduction_axis == 0 ? dim0 : dim1;
+  if (block_size <= 0 || K % block_size != 0) {
+    return false;
+  }
+  const int64_t num_blocks = K / block_size;
+
+  const std::vector<float> data = ReadFloatMatrix(w_t);
+  auto at = [&](int64_t i, int64_t j) { return data[i * dim1 + j]; };
+  // scale_out's shape is w_t's shape with the reduction axis divided by
+  // block_size; this maps element (i, j) of w_t to its (block, channel)
+  // group's flat index in that smaller tensor.
+  const int64_t scale_dim0 = reduction_axis == 0 ? num_blocks : dim0;
+  const int64_t scale_dim1 = reduction_axis == 1 ? num_blocks : dim1;
+  auto scale_index = [&](int64_t i, int64_t j) {
+    const int64_t si = reduction_axis == 0 ? i / block_size : i;
+    const int64_t sj = reduction_axis == 1 ? j / block_size : j;
+    return si * scale_dim1 + sj;
+  };
+
+  std::vector<float> scale(static_cast<size_t>(scale_dim0 * scale_dim1), 0.0f);
+  for (int64_t i = 0; i < dim0; ++i) {
+    for (int64_t j = 0; j < dim1; ++j) {
+      float& s = scale[static_cast<size_t>(scale_index(i, j))];
+      s = std::max(s, std::fabs(at(i, j)));
+    }
+  }
+  for (float& s : scale) {
+    s = s > 0.0f ? s / 7.0f : 1.0f;
+  }
+
+  // Unlike INT8 (whose q_out.int32s() the pb-converter serializes verbatim
+  // into TensorProto.int32_data, one slot per element), ONNX's wire format
+  // packs INT4 two values per byte in raw_data -- low nibble first, i.e.
+  // byte[i] = (code[2i] & 0xF) | ((code[2i+1] & 0xF) << 4), matching
+  // onnx.numpy_helper's _pack_4bitx2 -- and onnxsim's vendored onnx-optimizer
+  // ir_pb_converter has no INT4-aware packing path of its own for the typed
+  // int32_data field, so this builds the packed bytes directly and hands
+  // them to the Tensor via set_raw_data() rather than going through
+  // int32s(). `K % block_size == 0` (checked above) makes `dim0 * dim1`
+  // always even here (block_size is even), so no odd-count padding byte is
+  // needed.
+  const int64_t numel = dim0 * dim1;
+  std::vector<int8_t> codes(static_cast<size_t>(numel));
+  for (int64_t i = 0; i < dim0; ++i) {
+    for (int64_t j = 0; j < dim1; ++j) {
+      const float s = scale[static_cast<size_t>(scale_index(i, j))];
+      const float q = std::round(at(i, j) / s);
+      codes[static_cast<size_t>(i * dim1 + j)] =
+          static_cast<int8_t>(std::clamp(q, -7.0f, 7.0f));
+    }
+  }
+  std::string packed(static_cast<size_t>((numel + 1) / 2), '\0');
+  for (int64_t i = 0; i < numel; ++i) {
+    const uint8_t nibble =
+        static_cast<uint8_t>(codes[static_cast<size_t>(i)]) & 0x0F;
+    uint8_t& byte =
+        reinterpret_cast<uint8_t&>(packed[static_cast<size_t>(i / 2)]);
+    if (i % 2 == 0) {
+      byte = nibble;
+    } else {
+      byte = static_cast<uint8_t>(byte | (nibble << 4));
+    }
+  }
+
+  q_out.elem_type() = TensorProto_DataType_INT4;
+  q_out.sizes() = {dim0, dim1};
+  q_out.set_raw_data(std::move(packed));
+
+  scale_out.elem_type() = TensorProto_DataType_FLOAT;
+  scale_out.sizes() = {scale_dim0, scale_dim1};
   scale_out.floats() = std::move(scale);
   return true;
 }

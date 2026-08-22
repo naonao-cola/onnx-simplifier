@@ -399,6 +399,25 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
       },
       "model_bytes"_a);
 
+  // Block-wise INT4 weight-only quantizes MatMul/Gemm weights (one symmetric
+  // scale per 32-element block of the reduction dimension, per output
+  // channel) via a single DequantizeLinear(block_size=32) -- activations are
+  // never touched, so no calibration data or ModelExecutor is needed. See
+  // QuantizeWeightOnlyInt4 in onnxsim.h.
+  m.def(
+      "quantize_weight_only_int4",
+      [](const py::bytes& model_proto_bytes) -> py::bytes {
+        InitEnv();
+        ONNX_NAMESPACE::ModelProto model;
+        ParseProtoFromBytes(&model, model_proto_bytes.c_str(),
+                            model_proto_bytes.size());
+        const auto result = QuantizeWeightOnlyInt4(model);
+        std::string out;
+        result.SerializeToString(&out);
+        return py::bytes(out.data(), out.size());
+      },
+      "model_bytes"_a);
+
   // Lists the activation tensor names quantize_static could quantize --
   // see ListQuantizableActivations in onnxsim.h.
   m.def(

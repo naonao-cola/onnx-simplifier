@@ -14,6 +14,7 @@ from onnxsim.onnx_simplifier import (
     quantize_dynamic,
     quantize_ternary,
     quantize_weight_only,
+    quantize_weight_only_int4,
     simplify,
 )
 from onnxsim.precision_estimator import estimate_quantization_precision
@@ -25,6 +26,7 @@ __all__ = [
     "quantize_dynamic",
     "quantize_ternary",
     "quantize_weight_only",
+    "quantize_weight_only_int4",
     "quantize_static",
     "calibrate",
     "generate_random_calibration_data",
