@@ -26,6 +26,7 @@
 #include "passes/fuse_rms_norm.h"
 #include "passes/qoperator_quantize_conv.h"
 #include "passes/qoperator_quantize_matmul.h"
+#include "passes/quantize_fp16.h"
 #include "passes/static_quantize_conv.h"
 #include "passes/static_quantize_matmul.h"
 #include "passes/weight_only_quantize_conv.h"
@@ -78,6 +79,7 @@ void RegisterCustomOptimizerPasses() {
     RegisterOrReplace<p::FuseRMSNorm>(registry);
     RegisterOrReplace<p::QOperatorQuantizeConv>(registry);
     RegisterOrReplace<p::QOperatorQuantizeMatMul>(registry);
+    RegisterOrReplace<p::QuantizeFp16Pass>(registry);
     RegisterOrReplace<p::StaticQuantizeConv>(registry);
     RegisterOrReplace<p::StaticQuantizeMatMul>(registry);
     RegisterOrReplace<p::WeightOnlyQuantizeConv>(registry);

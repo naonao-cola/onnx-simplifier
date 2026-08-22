@@ -490,6 +490,26 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
       },
       "model_bytes"_a, "activation_ranges"_a);
 
+  // Converts every float32 weight (and, by default, every internal
+  // activation) to float16 -- no calibration data needed, since float16 is
+  // still a floating-point format, not an integer scheme. With
+  // keep_io_types (the default true), the graph's own external input/output
+  // types stay float32 via boundary Cast nodes. See QuantizeFp16 in
+  // onnxsim.h.
+  m.def(
+      "quantize_fp16",
+      [](const py::bytes& model_proto_bytes, bool keep_io_types) -> py::bytes {
+        InitEnv();
+        ONNX_NAMESPACE::ModelProto model;
+        ParseProtoFromBytes(&model, model_proto_bytes.c_str(),
+                            model_proto_bytes.size());
+        const auto result = QuantizeFp16(model, keep_io_types);
+        std::string out;
+        result.SerializeToString(&out);
+        return py::bytes(out.data(), out.size());
+      },
+      "model_bytes"_a, "keep_io_types"_a = true);
+
   m.def(
        "simplify",
        [](std::shared_ptr<PyModelExecutor> executor,

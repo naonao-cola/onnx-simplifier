@@ -315,6 +315,42 @@ onnx::ModelProto QuantizeQOperator(
     const std::unordered_map<std::string, std::pair<float, float>>&
         activation_ranges);
 
+// Converts every float32 weight (and, by default, every internal activation)
+// in ``model`` to float16 -- a different kind of "quantization" from every
+// other ``Quantize*`` function here: float16 is still a floating-point
+// format (just narrower than float32), so unlike the INT8/INT4 schemes there
+// is no scale, no zero-point, and no calibration data needed at all -- every
+// float32 value is simply rounded to its nearest representable float16
+// value (values outside float16's finite range are clamped rather than
+// rounded to an infinity). See ``passes/quantize_fp16.h`` for the rewrite
+// itself.
+//
+// When ``keep_io_types`` is true (the default), the graph's own external
+// input/output types stay float32 -- a ``Cast`` is inserted right after
+// each float32 graph input and right before each float32 graph output, so
+// the model's public interface is unchanged and only its internal weights
+// and compute switch to float16. With ``keep_io_types`` false, graph
+// inputs/outputs are redeclared float16 directly instead (no casts).
+//
+// No node's op_type or attributes are touched, and there is no per-op
+// float16-support check: an ordinary feedforward graph ends up computing
+// end-to-end in float16 as a side effect of every value along the way now
+// being float16-typed, since almost every ONNX op propagates its input
+// dtype to its output dtype. A model containing an op with no float16
+// kernel in the runtime it is deployed on will fail at *execution* time,
+// not at conversion time here -- the same limitation every other
+// float32-to-float16 model converter has.
+//
+// Unlike ``Simplify``, this does not run shape inference, constant folding
+// or any other simplification pass -- it applies exactly this one rewrite,
+// once, to a copy of ``model`` (which is left untouched) and returns the
+// result. Only the top-level graph is converted; nodes inside control-flow
+// subgraphs (If/Loop/Scan bodies) are left as-is, and an initializer whose
+// name is also a graph input (the rarely-used ONNX "optional input with a
+// default value" convention) is left alone entirely.
+onnx::ModelProto QuantizeFp16(const onnx::ModelProto& model,
+                              bool keep_io_types = true);
+
 void SimplifyPath(
     const ModelExecutor& executor, const std::string& in_path,
     const std::string& out_path,

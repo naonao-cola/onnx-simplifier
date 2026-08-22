@@ -49,6 +49,7 @@
 #include "onnxoptimizer/passes/cse_util.h"
 #include "onnxoptimizer/passes/logging.h"
 #include "passes/quantize_conv_common.h"
+#include "passes/quantize_fp16.h"
 #include "passes/quantize_matmul_common.h"
 #include "passes/static_quantize_matmul.h"
 #include "profiler.h"
@@ -2691,6 +2692,20 @@ onnx::ModelProto QuantizeQOperator(
   return onnx::optimization::OptimizeFixed(
       model, std::vector<std::string>{"qoperator_quantize_matmul",
                                       "qoperator_quantize_conv"});
+}
+
+onnx::ModelProto QuantizeFp16(const onnx::ModelProto& model,
+                              bool keep_io_types) {
+  PrepareSchemasForDebug(model);
+  // Registers quantize_fp16 (idempotent) into onnxoptimizer's registry so
+  // OptimizeFixed can find it by name below.
+  onnxsim::RegisterCustomOptimizerPasses();
+  // quantize_fp16 reads this the same way static_quantize_matmul.h's passes
+  // read StaticQuantizationCalibrationRanges() -- OptimizeFixed's pass-name
+  // list has no way to carry a parameter directly.
+  onnx::optimization::onnxsim_passes::QuantizeFp16KeepIoTypes() = keep_io_types;
+  return onnx::optimization::OptimizeFixed(
+      model, std::vector<std::string>{"quantize_fp16"});
 }
 
 // Records the options this Simplify() call actually used (skip_optimizers
