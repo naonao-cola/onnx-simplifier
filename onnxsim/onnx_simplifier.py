@@ -518,6 +518,50 @@ def quantize_weight_only_int4(model: Union[str, onnx.ModelProto]) -> onnx.ModelP
     return onnx.load_from_string(C.quantize_weight_only_int4(model.SerializeToString()))
 
 
+def quantize_weight_only_int16(model: Union[str, onnx.ModelProto]) -> onnx.ModelProto:
+    """
+    INT16 weight-only quantize every MatMul, every "vanilla" Gemm (transA=0,
+    alpha=1, beta=1), and every Conv, whose weight is a constant float32
+    tensor.
+
+    The weight is quantized to INT16 (per output channel, symmetric, scale =
+    ``max(|w|) / 32767``) with a single ``DequantizeLinear(axis=...)`` in its
+    place -- the exact same per-channel scheme :func:`quantize_weight_only`
+    uses, just with INT16's ~8x finer step (1/32767 relative) instead of
+    INT8's 1/127. Like :func:`quantize_weight_only`, the activation is never
+    touched: no calibration data, no runtime quantize/dequantize cost on the
+    activation path.
+
+    That extra resolution matters specifically for channels with a few
+    extreme-outlier weights, where INT8's coarser step would leave the
+    channel's *typical* (median-magnitude) weight rounding to within one
+    quantization step of zero -- effectively lost.
+    :func:`estimate_quantization_precision` flags exactly this case (a
+    channel's ``max(|w|) / median(|w|)`` ratio past 127) and recommends INT16
+    as one fix; this is that fix. The tradeoff: INT16 is only ~2x smaller
+    than float32 (INT8 is ~4x), so use this for the specific outlier-heavy
+    weights :func:`quantize_weight_only`'s INT8 handles poorly, not as a
+    blanket replacement for it. Uses ONNX opset 21's INT16
+    ``QuantizeLinear``/``DequantizeLinear`` type support -- standard ONNX,
+    not a contrib op.
+
+    This is a single, self-contained graph rewrite: unlike :func:`simplify`,
+    it does not run shape inference, constant folding, or any other pass.
+    Nodes that do not match (dynamic or unsupported-rank weights, non-default
+    Gemm attributes, non-float32 operands, an opset older than 21) are left
+    untouched. Consider calling :func:`simplify` before and/or after to clean
+    up the graph.
+
+    :param model: onnx ModelProto object or file path
+    :returns: the quantized onnx ModelProto
+    """
+    if isinstance(model, str):
+        model = onnx.load(model, load_external_data=False)
+    return onnx.load_from_string(
+        C.quantize_weight_only_int16(model.SerializeToString())
+    )
+
+
 def quantize_fp16(
     model: Union[str, onnx.ModelProto], keep_io_types: bool = True
 ) -> onnx.ModelProto:
@@ -1582,6 +1626,18 @@ def main():
         action="store_true",
     )
     parser.add_argument(
+        "--weight-only-quantize-int16",
+        help="After simplifying, INT16 weight-only quantize MatMul/Gemm/Conv "
+        "weights (one symmetric scale per output channel, INT16's ~8x finer "
+        "step than INT8's), inserting a single DequantizeLinear per weight. "
+        "Activations are never touched. For channels with a few "
+        "extreme-outlier weights, where INT8's coarser step loses the "
+        "channel's typical-magnitude weights -- see "
+        "onnxsim.estimate_quantization_precision's max_outlier_ratio check. "
+        "Needs opset >= 21. See onnxsim.quantize_weight_only_int16.",
+        action="store_true",
+    )
+    parser.add_argument(
         "--fp16-quantize",
         help="After simplifying, convert every float32 weight (and, by "
         "default, every internal activation) to float16 -- no calibration "
@@ -1888,6 +1944,10 @@ def main():
     if args.weight_only_quantize_int4:
         print("Block-wise INT4 weight-only quantizing MatMul/Gemm/Conv weights...")
         model_opt = quantize_weight_only_int4(model_opt)
+
+    if args.weight_only_quantize_int16:
+        print("INT16 weight-only quantizing MatMul/Gemm/Conv weights...")
+        model_opt = quantize_weight_only_int16(model_opt)
 
     if args.fp16_quantize:
         print("Converting float32 weights/activations to float16...")

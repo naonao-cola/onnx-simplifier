@@ -210,6 +210,54 @@ inline void QuantizeWeightPerChannelInPlace(const Tensor& w_t,
   scale_out.floats() = std::move(scale);
 }
 
+// Same as QuantizeWeightPerChannelInPlace, but INT16 (max(|w[:, j]|) / 32767
+// per channel) instead of INT8 -- used by weight_only_quantize_int16_matmul.h
+// for the outlier-heavy channels INT8's coarser step (1/127 relative) resolves
+// poorly (see docs/int16-quantization.md and precision_estimator.py's own
+// max_outlier_ratio-driven recommendation, which names INT16 as the fix).
+inline void QuantizeWeightPerChannelInPlaceInt16(const Tensor& w_t,
+                                                 int64_t channel_axis,
+                                                 Tensor& q_out,
+                                                 Tensor& scale_out) {
+  const auto& sizes = w_t.sizes();
+  const int64_t dim0 = sizes[0];
+  const int64_t dim1 = sizes[1];
+  const int64_t C = channel_axis == 0 ? dim0 : dim1;
+
+  const std::vector<float> data = ReadFloatMatrix(w_t);
+  auto at = [&](int64_t i, int64_t j) { return data[i * dim1 + j]; };
+  auto channel_of = [&](int64_t i, int64_t j) {
+    return channel_axis == 0 ? i : j;
+  };
+
+  std::vector<float> scale(static_cast<size_t>(C), 0.0f);
+  for (int64_t i = 0; i < dim0; ++i) {
+    for (int64_t j = 0; j < dim1; ++j) {
+      const int64_t c = channel_of(i, j);
+      scale[c] = std::max(scale[c], std::fabs(at(i, j)));
+    }
+  }
+  for (float& s : scale) {
+    s = s > 0.0f ? s / 32767.0f : 1.0f;
+  }
+
+  q_out.elem_type() = TensorProto_DataType_INT16;
+  q_out.sizes() = {dim0, dim1};
+  q_out.int32s().resize(static_cast<size_t>(dim0 * dim1));
+  for (int64_t i = 0; i < dim0; ++i) {
+    for (int64_t j = 0; j < dim1; ++j) {
+      const int64_t c = channel_of(i, j);
+      const float q = std::round(at(i, j) / scale[c]);
+      q_out.int32s()[i * dim1 + j] =
+          static_cast<int32_t>(std::clamp(q, -32767.0f, 32767.0f));
+    }
+  }
+
+  scale_out.elem_type() = TensorProto_DataType_FLOAT;
+  scale_out.sizes() = {C};
+  scale_out.floats() = std::move(scale);
+}
+
 // Attempts a *ternary* decomposition of `w_t` (a 2-D float32 constant, laid
 // out as [N, K] when `transposed` else [K, N]): each output column may use
 // only one of {-s, 0, +s} for a single per-column scale `s` -- the weight

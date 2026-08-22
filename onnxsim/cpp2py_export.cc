@@ -418,6 +418,24 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
       },
       "model_bytes"_a);
 
+  // INT16 weight-only quantizes MatMul/Gemm/Conv weights (one symmetric
+  // scale per output channel, INT16's finer step than INT8's) -- activations
+  // are never touched, so no calibration data or ModelExecutor is needed.
+  // See QuantizeWeightOnlyInt16 in onnxsim.h.
+  m.def(
+      "quantize_weight_only_int16",
+      [](const py::bytes& model_proto_bytes) -> py::bytes {
+        InitEnv();
+        ONNX_NAMESPACE::ModelProto model;
+        ParseProtoFromBytes(&model, model_proto_bytes.c_str(),
+                            model_proto_bytes.size());
+        const auto result = QuantizeWeightOnlyInt16(model);
+        std::string out;
+        result.SerializeToString(&out);
+        return py::bytes(out.data(), out.size());
+      },
+      "model_bytes"_a);
+
   // Lists the activation tensor names quantize_static could quantize --
   // see ListQuantizableActivations in onnxsim.h.
   m.def(
