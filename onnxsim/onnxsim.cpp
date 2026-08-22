@@ -2537,6 +2537,57 @@ onnx::ModelProto QuantizeStatic(
                                       "static_quantize_conv"});
 }
 
+std::vector<std::string> ListQOperatorQuantizableOutputs(
+    const onnx::ModelProto& model) {
+  PrepareSchemasForDebug(model);
+  std::shared_ptr<onnx::Graph> g(onnx::ImportModelProto(model));
+  if (g.get() == nullptr) {
+    return {};
+  }
+  std::vector<std::string> names;
+  std::unordered_set<std::string> seen;
+  for (auto* node : g->nodes()) {
+    onnx::optimization::onnxsim_passes::MatMulLikeInfo info;
+    if (!onnx::optimization::onnxsim_passes::MatchMatMulLike(node, info)) {
+      continue;
+    }
+    if (info.x->elemType() != onnx::TensorProto_DataType_FLOAT) {
+      continue;
+    }
+    const onnx::Tensor* w_t = onnx::optimization::FetchConstantTensor(info.w);
+    if (w_t == nullptr ||
+        w_t->elem_type() != onnx::TensorProto_DataType_FLOAT ||
+        w_t->sizes().size() != 2) {
+      continue;
+    }
+    if (seen.insert(node->output()->uniqueName()).second) {
+      names.push_back(node->output()->uniqueName());
+    }
+  }
+  return names;
+}
+
+onnx::ModelProto QuantizeQOperator(
+    const onnx::ModelProto& model,
+    const std::unordered_map<std::string, std::pair<float, float>>&
+        activation_ranges) {
+  PrepareSchemasForDebug(model);
+  // Registers qoperator_quantize_matmul (idempotent) into onnxoptimizer's
+  // registry so OptimizeFixed can find it by name below.
+  onnxsim::RegisterCustomOptimizerPasses();
+  // qoperator_quantize_matmul reads the same calibration-ranges global
+  // static_quantize_matmul does (see StaticQuantizationCalibrationRanges's
+  // doc comment) -- both are keyed by tensor name, and QOperator format's
+  // ranges are a superset (activation names plus output names) of QDQ
+  // format's, so sharing the map is safe as long as only one of
+  // QuantizeStatic/QuantizeQOperator runs per call, which OptimizeFixed's
+  // single pass-name list here ensures.
+  onnx::optimization::onnxsim_passes::StaticQuantizationCalibrationRanges() =
+      activation_ranges;
+  return onnx::optimization::OptimizeFixed(
+      model, std::vector<std::string>{"qoperator_quantize_matmul"});
+}
+
 // Records the options this Simplify() call actually used (skip_optimizers
 // reflects any auto-added unhashable-tensor protections) as string
 // key/value pairs in the model's metadata_props, namespaced under
