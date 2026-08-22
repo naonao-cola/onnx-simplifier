@@ -38,7 +38,7 @@
 #include "onnx/common/assertions.h"
 #include "onnxoptimizer/pass.h"
 #include "onnxoptimizer/passes/pass_util.h"
-#include "passes/endian_read.h"
+#include "onnxoptimizer/passes/tensor_util.h"
 
 namespace ONNX_NAMESPACE {
 namespace optimization {
@@ -70,35 +70,17 @@ struct FuseBNIntoConv final : public PredicateBasedPass {
   // specialization) so ModifyConvNumeric<T>() below can call it unqualified
   // for either T -- ordinary member lookup resolves the right one per
   // instantiation since it is a plain overload set, not a template itself.
-  // A typed field needs no endian handling on the way out either: protobuf
-  // encodes it correctly regardless of host byte order (see endian_read.h).
+  // A typed field needs no endian handling on the way out: protobuf encodes
+  // it correctly regardless of host byte order. (Reading, further down, uses
+  // onnxoptimizer's own ParseTensorData<T>() -- pass_util.h's tensor_util.h
+  // -- which byte-swaps raw_data on a big-endian host; that is the same
+  // utility dozens of other passes already rely on, rather than this file
+  // rolling its own.)
   static void SetTensorData(Tensor& t, std::vector<float> v) {
     t.floats() = std::move(v);
   }
   static void SetTensorData(Tensor& t, std::vector<double> v) {
     t.doubles() = std::move(v);
-  }
-
-  // Read `t` (`numel` elements of type T) into a flat, host-byte-order
-  // vector, regardless of whether it's stored as raw bytes (little-endian on
-  // the wire regardless of host -- see endian_read.h) or a typed array
-  // (already host-order). The trailing `T` parameter is an unused dispatch
-  // tag: overloaded (not a template) for the same reason as SetTensorData
-  // above, but a plain overload can't be selected on return type alone, so
-  // ModifyConvNumeric<T>() passes `T()` to pick the right one.
-  static std::vector<float> ReadTensorFlat(const Tensor& t, int64_t numel,
-                                           float) {
-    if (t.is_raw_data()) {
-      return ReadRawDataHostOrder<float>(t.data<float>(), numel);
-    }
-    return t.floats();
-  }
-  static std::vector<double> ReadTensorFlat(const Tensor& t, int64_t numel,
-                                            double) {
-    if (t.is_raw_data()) {
-      return ReadRawDataHostOrder<double>(t.data<double>(), numel);
-    }
-    return t.doubles();
   }
 
   // Fold the BN parameters into the conv/conv-transpose weight and bias with
@@ -133,10 +115,10 @@ struct FuseBNIntoConv final : public PredicateBasedPass {
                          const Tensor& bn_mean, const Tensor& bn_var,
                          const Tensor& conv_W, const Tensor* conv_bias,
                          int64_t C, int axis) {
-    const std::vector<T> scale = ReadTensorFlat(bn_scale, C, T());
-    const std::vector<T> bias = ReadTensorFlat(bn_bias, C, T());
-    const std::vector<T> mean = ReadTensorFlat(bn_mean, C, T());
-    const std::vector<T> var = ReadTensorFlat(bn_var, C, T());
+    const std::vector<T> scale = ParseTensorData<T>(&bn_scale);
+    const std::vector<T> bias = ParseTensorData<T>(&bn_bias);
+    const std::vector<T> mean = ParseTensorData<T>(&bn_mean);
+    const std::vector<T> var = ParseTensorData<T>(&bn_var);
     const T eps =
         static_cast<T>(GetValueFromAttrWithDefault(bn, kepsilon, 1e-5f));
 
@@ -150,10 +132,10 @@ struct FuseBNIntoConv final : public PredicateBasedPass {
       inner *= w_sizes[i];
     }
     const int64_t w_numel = outer * C * inner;
-    const std::vector<T> w_in = ReadTensorFlat(conv_W, w_numel, T());
+    const std::vector<T> w_in = ParseTensorData<T>(&conv_W);
     const std::vector<T> orig_bias =
         conv_bias == nullptr ? std::vector<T>(static_cast<size_t>(C), T(0))
-                             : ReadTensorFlat(*conv_bias, C, T());
+                             : ParseTensorData<T>(conv_bias);
 
     std::vector<T> s(static_cast<size_t>(C));
     std::vector<T> new_bias(static_cast<size_t>(C));
