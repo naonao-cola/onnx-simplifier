@@ -2,13 +2,15 @@
 
 ## What this is
 
-`onnxsim.quantize_qoperator` is a single, self-contained C++ graph rewrite
-(`onnxsim/passes/qoperator_quantize_matmul.h`) that statically
-(calibration-based) quantizes every `MatMul` and every "vanilla" `Gemm`
-(`transA=0`, `alpha=1`, `beta=1`), whose weight is a constant 2-D float32
-tensor, into the **"QOperator" format** -- `QLinearMatMul`, ONNX's
-directly-quantized matmul op -- rather than `quantize_static`'s **QDQ**
-format (`QuantizeLinear`/`DequantizeLinear` wrapping a float `MatMul`).
+`onnxsim.quantize_qoperator` is two self-contained C++ graph rewrites
+(`onnxsim/passes/qoperator_quantize_matmul.h` and
+`onnxsim/passes/qoperator_quantize_conv.h`) that statically
+(calibration-based) quantize every `MatMul`, every "vanilla" `Gemm`
+(`transA=0`, `alpha=1`, `beta=1`), and every `Conv`, whose weight is a
+constant float32 tensor (2-D for `MatMul`/`Gemm`, rank >= 3 for `Conv`), into
+the **"QOperator" format** -- `QLinearMatMul`/`QLinearConv`, ONNX's
+directly-quantized matmul/convolution ops -- rather than `quantize_static`'s
+**QDQ** format (`QuantizeLinear`/`DequantizeLinear` wrapping a float op).
 
 Both are standard ONNX operators, and both need the same kind of calibrated
 activation range `quantize_static` does. The difference is what the rewrite
@@ -35,6 +37,12 @@ After (QDQ format, quantize_static):
 
 `Wq`/`Ws` are the same per-output-channel symmetric INT8 weight
 quantization every other onnxsim quantization pass uses.
+
+`Conv` follows the identical shape with `QLinearConv` in place of
+`QLinearMatMul`; its optional bias, unlike Gemm's, is pre-quantized to INT32
+(`QLinearConv`'s own bias input) rather than added back in float, since
+`QLinearConv` accepts one directly -- see "Scope" below for the constraint
+that puts on which Conv nodes get rewritten.
 
 ## Why this needs an extra calibration step
 
@@ -78,14 +86,19 @@ Handled:
   present), same weight constraint. `transB` may be 0 or 1. `B`, if present,
   is added back in float after dequantization (`QLinearMatMul` has no bias
   input).
-- Opsets >= 10 (`QLinearMatMul`'s own minimum).
+- `Conv(X, W[, B])` with `W` a constant float32 tensor, rank >= 3
+  (`[Cout, Cin/groups, k...]`). `B`, if present, must be a constant float32
+  `[Cout]` tensor -- `QLinearConv` takes its bias pre-quantized to INT32
+  (scale = `x_scale * w_scale[c]`, zero_point 0), so unlike Gemm's bias there
+  is no float fallback for a non-constant one; such a Conv is left untouched
+  instead (see `passes/qoperator_quantize_conv.h`).
+- Opsets >= 10 (`QLinearMatMul`/`QLinearConv`'s own minimum).
 
 Left untouched (safe no-op, node passes through as-is):
-- Non-constant or non-2-D weights, non-default Gemm attributes, non-float32
-  operands, an opset older than 10, or a node whose activation and/or output
-  tensor has no calibrated range.
-- `Conv` -- not yet covered (`QLinearConv` is a natural, still-open
-  follow-up with the same shape as this pass).
+- Non-constant or wrong-rank weights, non-default Gemm attributes,
+  non-float32 operands, an opset older than 10, a node whose activation
+  and/or output tensor has no calibrated range, or a Conv whose bias is
+  present but not a constant float32 `[Cout]` tensor.
 
 ## End-to-end: simplify -> quantize -> deploy
 

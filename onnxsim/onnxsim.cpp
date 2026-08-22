@@ -2564,6 +2564,37 @@ std::vector<std::string> ListQOperatorQuantizableOutputs(
       names.push_back(node->output()->uniqueName());
     }
   }
+  for (auto* node : g->nodes()) {
+    onnx::optimization::onnxsim_passes::ConvInfo info;
+    if (!onnx::optimization::onnxsim_passes::MatchConv(node, info)) {
+      continue;
+    }
+    if (info.x->elemType() != onnx::TensorProto_DataType_FLOAT) {
+      continue;
+    }
+    const onnx::Tensor* w_t = onnx::optimization::FetchConstantTensor(info.w);
+    if (w_t == nullptr ||
+        w_t->elem_type() != onnx::TensorProto_DataType_FLOAT ||
+        w_t->sizes().size() < 3) {
+      continue;
+    }
+    if (info.bias != nullptr) {
+      // qoperator_quantize_conv only rewrites a Conv whose bias (if any) is a
+      // constant float32 [Cout] tensor it can pre-quantize to INT32 -- see
+      // that pass's doc comment. Skip listing this Conv's output otherwise,
+      // since it will never actually be rewritten.
+      const onnx::Tensor* b_t =
+          onnx::optimization::FetchConstantTensor(info.bias);
+      if (b_t == nullptr ||
+          b_t->elem_type() != onnx::TensorProto_DataType_FLOAT ||
+          b_t->sizes().size() != 1) {
+        continue;
+      }
+    }
+    if (seen.insert(node->output()->uniqueName()).second) {
+      names.push_back(node->output()->uniqueName());
+    }
+  }
   return names;
 }
 
@@ -2572,11 +2603,11 @@ onnx::ModelProto QuantizeQOperator(
     const std::unordered_map<std::string, std::pair<float, float>>&
         activation_ranges) {
   PrepareSchemasForDebug(model);
-  // Registers qoperator_quantize_matmul (idempotent) into onnxoptimizer's
-  // registry so OptimizeFixed can find it by name below.
+  // Registers qoperator_quantize_matmul/_conv (idempotent) into
+  // onnxoptimizer's registry so OptimizeFixed can find them by name below.
   onnxsim::RegisterCustomOptimizerPasses();
-  // qoperator_quantize_matmul reads the same calibration-ranges global
-  // static_quantize_matmul does (see StaticQuantizationCalibrationRanges's
+  // qoperator_quantize_matmul/_conv read the same calibration-ranges global
+  // static_quantize_matmul/_conv do (see StaticQuantizationCalibrationRanges's
   // doc comment) -- both are keyed by tensor name, and QOperator format's
   // ranges are a superset (activation names plus output names) of QDQ
   // format's, so sharing the map is safe as long as only one of
@@ -2585,7 +2616,8 @@ onnx::ModelProto QuantizeQOperator(
   onnx::optimization::onnxsim_passes::StaticQuantizationCalibrationRanges() =
       activation_ranges;
   return onnx::optimization::OptimizeFixed(
-      model, std::vector<std::string>{"qoperator_quantize_matmul"});
+      model, std::vector<std::string>{"qoperator_quantize_matmul",
+                                      "qoperator_quantize_conv"});
 }
 
 // Records the options this Simplify() call actually used (skip_optimizers
