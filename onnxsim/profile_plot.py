@@ -90,7 +90,7 @@ def plot_node_reduction(trace_path: str, out_path: Optional[str] = None) -> str:
     node_counts = load_node_counts(trace_path)
     if not node_counts:
         raise RuntimeError(
-            f"{trace_path!r} has no \"NodeCount\" events -- was it written by "
+            f'{trace_path!r} has no "NodeCount" events -- was it written by '
             "a profiled simplify(..., profile=...) call?"
         )
     if out_path is None:
@@ -107,7 +107,13 @@ def plot_node_reduction(trace_path: str, out_path: Optional[str] = None) -> str:
         rounds = list(range(len(counts)))
         ax.plot(rounds, counts, marker="o", markersize=4, linewidth=1.5)
         converged = len(counts) >= 2 and counts[-1] == counts[-2]
-        status = "" if len(counts) < 2 else " (converged)" if converged else " (hit round cap)"
+        status = (
+            ""
+            if len(counts) < 2
+            else " (converged)"
+            if converged
+            else " (hit round cap)"
+        )
         ax.set_title(f"{loop}: {len(counts)} round(s){status}")
         ax.set_xlabel("round")
         ax.set_ylabel("node count")

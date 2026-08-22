@@ -123,9 +123,7 @@ def test_profile_records_node_counts(tmp_path):
     assert ok
 
     _, counters = _load_trace(out)
-    node_count_events = [
-        e for e in counters if e.get("name") == "NodeCount"
-    ]
+    node_count_events = [e for e in counters if e.get("name") == "NodeCount"]
     assert node_count_events, "expected NodeCount counter events in the trace"
 
     for e in node_count_events:
