@@ -3711,6 +3711,15 @@ onnx::ModelProto Simplify(
         model = std::move(out);
       });
   bool converged = false;
+  // Set from `model.ir_version()` right before `Pipeline` runs at the bottom
+  // of this function -- fold's throwaway sub-models need it (see
+  // RunOpsOnGraph's own comment). Declared here, alongside `converged`, and
+  // not inside the `else` branch below that builds `Pipeline`'s closures:
+  // those closures (and the reference to this variable they capture) are
+  // still called from `Pipeline(sim_model)` well after that branch's own
+  // scope -- and this variable's lifetime, were it declared there instead --
+  // has ended.
+  int64_t fold_ir_version = 0;
   ModelFn Pipeline;
   if (rewriter) {
     // Run the user-supplied rewriter (e.g. an onnxscript.rewriter rule set) as
@@ -3756,11 +3765,10 @@ onnx::ModelProto Simplify(
           return OptAndShapeOnGraph(graph, optimize, shape_inference,
                                     fixed_point_iters);
         };
-    // Set from `model.ir_version()` right before `PipelineOnGraph` runs
-    // below, once per Simplify() call -- fold's throwaway sub-models need it
-    // (see RunOpsOnGraph's own comment), but it's only known once the
-    // ModelProto being simplified is in scope, after this closure is built.
-    int64_t fold_ir_version = 0;
+    // `fold_ir_version` is declared above, alongside `converged`: see its own
+    // comment for why it cannot live in this block despite only being read
+    // here and set (from `model.ir_version()`) in the `Pipeline` lambda
+    // below.
     GraphFnChanged FoldConstantOnGraphChanged =
         constant_folding
             ? GraphFnChanged([&executor, &fold_ir_version](onnx::Graph& graph) {
