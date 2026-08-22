@@ -37,6 +37,7 @@ namespace onnxsim {
 //   - qoperator_quantize_conv
 //   - quantize_fp16
 //   - quantize_bf16
+//   - quantize_fp8
 //
 // The registration runs at most once per process and is safe to call from any
 // simplification entry point. It MUST run before the pass list is built (a
