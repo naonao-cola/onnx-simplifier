@@ -51,6 +51,10 @@ def _f32(array, name):
     return onnx.numpy_helper.from_array(array.astype(np.float32), name)
 
 
+def _f64(array, name):
+    return onnx.numpy_helper.from_array(array.astype(np.float64), name)
+
+
 def _i64(array, name):
     return onnx.numpy_helper.from_array(np.asarray(array, dtype=np.int64), name)
 
@@ -80,6 +84,86 @@ def test_fuse_conv_bn_into_conv():
     _, ops = _simplify(model)
     assert ops["BatchNormalization"] == 0
     assert ops["Conv"] == 1
+
+
+def test_fuse_conv_with_bias_bn_into_conv():
+    # Same fusion, but the Conv already has its own bias input -- a distinct
+    # code path in fuse_bn_into_conv (the BN mean is subtracted from the
+    # existing bias, not folded from zero).
+    inits = [
+        _f32(np.random.randn(8, 3, 3, 3), "W"),
+        _f32(np.random.randn(8), "B"),
+        _f32(np.random.rand(8) + 0.5, "scale"),
+        _f32(np.random.randn(8), "bias"),
+        _f32(np.random.randn(8), "mean"),
+        _f32(np.random.rand(8) + 0.5, "var"),
+    ]
+    nodes = [
+        onnx.helper.make_node(
+            "Conv", ["X", "W", "B"], ["c"], kernel_shape=[3, 3], pads=[1, 1, 1, 1]
+        ),
+        onnx.helper.make_node(
+            "BatchNormalization", ["c", "scale", "bias", "mean", "var"], ["Y"]
+        ),
+    ]
+    model = _model(nodes, [_vi("X", [1, 3, 16, 16])], [_vi("Y", [1, 8, 16, 16])], inits)
+    _, ops = _simplify(model)
+    assert ops["BatchNormalization"] == 0
+    assert ops["Conv"] == 1
+
+
+def test_fuse_conv_bn_into_conv_double():
+    # Same fusion in float64: fuse_bn_into_conv's numeric fast path is
+    # templated on the tensor element type (float or double), so this
+    # exercises the double instantiation independently of the float32 tests
+    # above. onnxruntime has no CPU kernel for a double-typed Conv (a
+    # pre-existing runtime gap, unrelated to this fusion), so check_n's
+    # normal onnxruntime-backed equivalence check can't run here; instead
+    # this validates the fused Conv's weight/bias directly against the
+    # pass's own documented formula, computed independently with numpy.
+    rng = np.random.default_rng(0)
+    w = rng.standard_normal((8, 3, 3, 3))
+    scale = rng.random(8) + 0.5
+    bias = rng.standard_normal(8)
+    mean = rng.standard_normal(8)
+    var = rng.random(8) + 0.5
+    inits = [
+        _f64(w, "W"),
+        _f64(scale, "scale"),
+        _f64(bias, "bias"),
+        _f64(mean, "mean"),
+        _f64(var, "var"),
+    ]
+    nodes = [
+        onnx.helper.make_node(
+            "Conv", ["X", "W"], ["c"], kernel_shape=[3, 3], pads=[1, 1, 1, 1]
+        ),
+        onnx.helper.make_node(
+            "BatchNormalization", ["c", "scale", "bias", "mean", "var"], ["Y"]
+        ),
+    ]
+    x = onnx.helper.make_tensor_value_info("X", onnx.TensorProto.DOUBLE, [1, 3, 16, 16])
+    y = onnx.helper.make_tensor_value_info("Y", onnx.TensorProto.DOUBLE, [1, 8, 16, 16])
+    model = _model(nodes, [x], [y], inits)
+    sim_model, check_ok = onnxsim.simplify(model, check_n=0)
+    assert check_ok
+    ops = collections.Counter(n.op_type for n in sim_model.graph.node)
+    assert ops["BatchNormalization"] == 0
+    assert ops["Conv"] == 1
+
+    conv_node = next(n for n in sim_model.graph.node if n.op_type == "Conv")
+    by_name = {
+        init.name: onnx.numpy_helper.to_array(init)
+        for init in sim_model.graph.initializer
+    }
+    fused_w = by_name[conv_node.input[1]]
+    fused_b = by_name[conv_node.input[2]]
+
+    s = scale / np.sqrt(var + 1e-5)
+    expected_w = w * s.reshape(-1, 1, 1, 1)
+    expected_b = (0.0 - mean) * s + bias
+    np.testing.assert_allclose(fused_w, expected_w, rtol=1e-10, atol=1e-12)
+    np.testing.assert_allclose(fused_b, expected_b, rtol=1e-10, atol=1e-12)
 
 
 def test_fuse_matmul_add_into_gemm():
