@@ -1125,7 +1125,7 @@ bool OptAndShapeOnGraph(onnx::Graph& g, bool optimize, bool shape_inference,
     any_changed |= changed;
     if (onnxsim::Profiler::Instance().enabled()) {
       onnxsim::Profiler::Instance().RecordNodeCount("Optimize",
-                                                     CountGraphNodes(graph));
+                                                    CountGraphNodes(graph));
     }
     return changed;
   };
