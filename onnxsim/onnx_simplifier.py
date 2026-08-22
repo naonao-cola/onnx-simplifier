@@ -512,9 +512,7 @@ def quantize_weight_only_int4(model: Union[str, onnx.ModelProto]) -> onnx.ModelP
     """
     if isinstance(model, str):
         model = onnx.load(model, load_external_data=False)
-    return onnx.load_from_string(
-        C.quantize_weight_only_int4(model.SerializeToString())
-    )
+    return onnx.load_from_string(C.quantize_weight_only_int4(model.SerializeToString()))
 
 
 def simplify(

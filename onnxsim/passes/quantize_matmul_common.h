@@ -297,10 +297,10 @@ inline bool TryQuantizeWeightTernaryKN(const Tensor& w_t, bool transposed,
 // DequantizeLinear(axis=<reduction axis>, block_size=block_size) expects for
 // its `x_scale` input.
 inline bool TryQuantizeWeightBlockwiseInt4InPlace(const Tensor& w_t,
-                                                   int64_t channel_axis,
-                                                   int64_t block_size,
-                                                   Tensor& q_out,
-                                                   Tensor& scale_out) {
+                                                  int64_t channel_axis,
+                                                  int64_t block_size,
+                                                  Tensor& q_out,
+                                                  Tensor& scale_out) {
   const auto& sizes = w_t.sizes();
   const int64_t dim0 = sizes[0];
   const int64_t dim1 = sizes[1];
@@ -324,8 +324,7 @@ inline bool TryQuantizeWeightBlockwiseInt4InPlace(const Tensor& w_t,
     return si * scale_dim1 + sj;
   };
 
-  std::vector<float> scale(static_cast<size_t>(scale_dim0 * scale_dim1),
-                           0.0f);
+  std::vector<float> scale(static_cast<size_t>(scale_dim0 * scale_dim1), 0.0f);
   for (int64_t i = 0; i < dim0; ++i) {
     for (int64_t j = 0; j < dim1; ++j) {
       float& s = scale[static_cast<size_t>(scale_index(i, j))];
@@ -359,8 +358,10 @@ inline bool TryQuantizeWeightBlockwiseInt4InPlace(const Tensor& w_t,
   }
   std::string packed(static_cast<size_t>((numel + 1) / 2), '\0');
   for (int64_t i = 0; i < numel; ++i) {
-    const uint8_t nibble = static_cast<uint8_t>(codes[static_cast<size_t>(i)]) & 0x0F;
-    uint8_t& byte = reinterpret_cast<uint8_t&>(packed[static_cast<size_t>(i / 2)]);
+    const uint8_t nibble =
+        static_cast<uint8_t>(codes[static_cast<size_t>(i)]) & 0x0F;
+    uint8_t& byte =
+        reinterpret_cast<uint8_t&>(packed[static_cast<size_t>(i / 2)]);
     if (i % 2 == 0) {
       byte = nibble;
     } else {
