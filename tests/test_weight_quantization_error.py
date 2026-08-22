@@ -72,6 +72,14 @@ def test_matmul_weight_quantization_error():
     assert r.sqnr_db > 20.0
     assert all(0.0 <= e < 0.2 for e in r.per_channel_relative_l2)
 
+    # ENOB is just SQNR re-expressed in bits -- must track it exactly.
+    assert r.enob_bits == pytest.approx((r.sqnr_db - 1.76) / 6.02)
+    # PSNR is peak- rather than energy-normalized, so it never falls below SQNR.
+    assert r.psnr_db >= r.sqnr_db
+    # A close element-wise reconstruction should also leave the value
+    # histogram's shape close to unchanged.
+    assert 0.0 <= r.histogram_js_divergence < 0.05
+
 
 def test_gemm_transb_weight_quantization_error():
     # PyTorch's nn.Linear layout: weight stored [N, K], transB=1 -- the output
@@ -126,7 +134,32 @@ def test_exact_reconstruction_is_zero_error():
     assert r.relative_l2 == 0.0
     assert r.cosine_similarity == pytest.approx(1.0)
     assert r.sqnr_db == float("inf")
+    assert r.enob_bits == float("inf")
+    assert r.psnr_db == float("inf")
+    assert r.histogram_js_divergence == 0.0
     assert all(e == 0.0 for e in r.per_channel_relative_l2)
+
+
+def test_outlier_channel_increases_histogram_js_divergence():
+    # A single large per-channel outlier forces a coarse scale (scale =
+    # max|w| / 127), crushing the rest of the channel's continuous-looking
+    # values down into just a handful of discrete INT8 levels -- a
+    # distributional collapse the histogram JS divergence should flag even
+    # though the element-wise relative L2 error stays fairly small.
+    rng = np.random.default_rng(3)
+    K, N = 300, 1
+    w = (rng.standard_normal((K, N)) * 0.01).astype(np.float32)
+    w[0, 0] = 1.0  # the outlier
+    weight = _f32(w, "W")
+    nodes = [onnx.helper.make_node("MatMul", ["X", "W"], ["Y"])]
+    model = _model(nodes, [_vi("X", [1, K])], [_vi("Y", [1, N])], [weight])
+    quant = onnxsim.quantize_static(model, num_calibration_samples=4, seed=3)
+
+    results = weight_quantization_error(model, quant)
+    assert len(results) == 1
+    r = results[0]
+    assert r.relative_l2 < 0.1  # element-wise error alone looks unremarkable
+    assert r.histogram_js_divergence > 0.1  # but the distribution shape moved
 
 
 def test_no_results_when_weight_not_constant():
@@ -173,6 +206,9 @@ def test_print_weight_quantization_error_caps_output(capsys):
             relative_l2=float(i),
             cosine_similarity=1.0,
             sqnr_db=float("inf"),
+            enob_bits=float("inf"),
+            psnr_db=float("inf"),
+            histogram_js_divergence=0.0,
             per_channel_relative_l2=[0.0, 0.0],
         )
         for i in range(5)

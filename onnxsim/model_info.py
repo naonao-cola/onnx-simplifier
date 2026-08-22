@@ -1192,6 +1192,9 @@ class WeightQuantizationError:
     relative_l2: float  # ||w - dequant||_2 / ||w||_2
     cosine_similarity: float
     sqnr_db: float  # 20*log10(||w||_2 / ||w - dequant||_2); +inf if exact
+    enob_bits: float  # (sqnr_db - 1.76) / 6.02 -- SQNR re-expressed as "effective bits"
+    psnr_db: float  # 20*log10(max|w| / rmse); the peak- rather than energy-normalized twin of sqnr_db
+    histogram_js_divergence: float  # Jensen-Shannon divergence (nats) between w's and dequant's value histograms -- a *distributional* check, complementing the element-wise metrics above
     per_channel_relative_l2: List[float]  # one entry per channel along `axis`
 
 
@@ -1225,12 +1228,46 @@ def _broadcast_along_axis(values: np.ndarray, ndim: int, axis: int) -> np.ndarra
     return values.reshape(shape)
 
 
+def _histogram_js_divergence(
+    a: np.ndarray, b: np.ndarray, num_bins: int = 256
+) -> float:
+    """Jensen-Shannon divergence (nats; 0 = identical histograms, ``ln(2)`` =
+    disjoint) between ``a``'s and ``b``'s value histograms over their shared
+    range -- unlike the element-wise metrics in :func:`_tensor_error_metrics`
+    (which compare ``a[i]`` against ``b[i]``), this compares the *shape* of the
+    two distributions, so it can catch distortion (e.g. many distinct values
+    collapsing onto one quantization level) that averages out of the
+    element-wise metrics.
+
+    Unlike plain KL divergence, JS needs no epsilon-smoothing for empty bins:
+    the mixture ``m = (p + q) / 2`` is positive everywhere either input is, so
+    ``p * log(p / m)`` never divides by zero.
+    """
+    lo = float(min(a.min(), b.min()))
+    hi = float(max(a.max(), b.max()))
+    if hi <= lo:
+        return 0.0  # every value (in both arrays) is identical
+
+    p, _ = np.histogram(a, bins=num_bins, range=(lo, hi))
+    q, _ = np.histogram(b, bins=num_bins, range=(lo, hi))
+    p = p.astype(np.float64) / max(p.sum(), 1)
+    q = q.astype(np.float64) / max(q.sum(), 1)
+    m = 0.5 * (p + q)
+
+    def _kl(x: np.ndarray, y: np.ndarray) -> float:
+        mask = x > 0
+        return float(np.sum(x[mask] * np.log(x[mask] / y[mask])))
+
+    return 0.5 * _kl(p, m) + 0.5 * _kl(q, m)
+
+
 def _tensor_error_metrics(
     original: np.ndarray, dequantized: np.ndarray, axis: int
-) -> Tuple[float, float, float, float, float, List[float]]:
-    """``(mse, max_abs_error, relative_l2, cosine_similarity, sqnr_db,
-    per_channel_relative_l2)`` between ``original`` and ``dequantized`` (same
-    shape), the last computed per channel along ``axis``.
+) -> Tuple[float, float, float, float, float, float, float, float, List[float]]:
+    """``(mse, max_abs_error, relative_l2, cosine_similarity, sqnr_db, enob_bits,
+    psnr_db, histogram_js_divergence, per_channel_relative_l2)`` between
+    ``original`` and ``dequantized`` (same shape), the last computed per channel
+    along ``axis``.
     """
     orig = original.astype(np.float64)
     deq = dequantized.astype(np.float64)
@@ -1259,6 +1296,20 @@ def _tensor_error_metrics(
         float(np.dot(orig.ravel(), deq.ravel()) / denom) if denom > 0 else 1.0
     )
 
+    # ENOB re-expresses SQNR in "effective bits" (the standard ADC/DSP
+    # conversion); +-inf propagates through the arithmetic unchanged.
+    enob_bits = (sqnr_db - 1.76) / 6.02
+
+    peak_orig = float(np.max(np.abs(orig))) if orig.size else 0.0
+    if mse == 0.0:
+        psnr_db = math.inf
+    elif peak_orig == 0.0:
+        psnr_db = -math.inf
+    else:
+        psnr_db = 20.0 * math.log10(peak_orig / math.sqrt(mse))
+
+    histogram_js_divergence = _histogram_js_divergence(orig, deq)
+
     moved_orig = np.moveaxis(orig, axis, 0)
     moved_deq = np.moveaxis(deq, axis, 0)
     per_channel_relative_l2 = []
@@ -1276,6 +1327,9 @@ def _tensor_error_metrics(
         relative_l2,
         cosine_similarity,
         sqnr_db,
+        enob_bits,
+        psnr_db,
+        histogram_js_divergence,
         per_channel_relative_l2,
     )
 
@@ -1379,6 +1433,9 @@ def weight_quantization_error(
             relative_l2,
             cosine_similarity,
             sqnr_db,
+            enob_bits,
+            psnr_db,
+            histogram_js_divergence,
             per_channel_relative_l2,
         ) = _tensor_error_metrics(w_orig, w_dequant, axis)
 
@@ -1393,6 +1450,9 @@ def weight_quantization_error(
                 relative_l2=relative_l2,
                 cosine_similarity=cosine_similarity,
                 sqnr_db=sqnr_db,
+                enob_bits=enob_bits,
+                psnr_db=psnr_db,
+                histogram_js_divergence=histogram_js_divergence,
                 per_channel_relative_l2=per_channel_relative_l2,
             )
         )
@@ -1406,6 +1466,12 @@ def print_weight_quantization_error(
     worst (highest relative L2 error) weight first, capped at ``limit`` rows (with
     a "... and N more" line) so a large model's report stays readable.
     """
+
+    def _fmt(value: float) -> str:
+        if math.isinf(value):
+            return "inf" if value > 0 else "-inf"
+        return f"{value:.1f}"
+
     table = Table()
     table.add_column("Node")
     table.add_column("Weight")
@@ -1415,6 +1481,9 @@ def print_weight_quantization_error(
     table.add_column("Relative L2")
     table.add_column("Cosine Sim.")
     table.add_column("SQNR (dB)")
+    table.add_column("ENOB (bits)")
+    table.add_column("PSNR (dB)")
+    table.add_column("JS Div.")
 
     ordered = sorted(results, key=lambda r: r.relative_l2, reverse=True)
     for r in ordered[:limit]:
@@ -1426,7 +1495,10 @@ def print_weight_quantization_error(
             f"{r.max_abs_error:.3e}",
             f"{r.relative_l2:.4f}",
             f"{r.cosine_similarity:.6f}",
-            "inf" if math.isinf(r.sqnr_db) else f"{r.sqnr_db:.1f}",
+            _fmt(r.sqnr_db),
+            _fmt(r.enob_bits),
+            _fmt(r.psnr_db),
+            f"{r.histogram_js_divergence:.4f}",
         )
     print(table)
     if len(ordered) > limit:
