@@ -31,6 +31,7 @@ namespace onnxsim {
 //   - static_quantize_conv
 //   - weight_only_quantize_matmul
 //   - weight_only_quantize_conv
+//   - weight_only_quantize_int4_matmul
 //
 // The registration runs at most once per process and is safe to call from any
 // simplification entry point. It MUST run before the pass list is built (a

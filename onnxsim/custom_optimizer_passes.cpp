@@ -27,6 +27,7 @@
 #include "passes/static_quantize_conv.h"
 #include "passes/static_quantize_matmul.h"
 #include "passes/weight_only_quantize_conv.h"
+#include "passes/weight_only_quantize_int4_matmul.h"
 #include "passes/weight_only_quantize_matmul.h"
 
 namespace onnxsim {
@@ -75,6 +76,7 @@ void RegisterCustomOptimizerPasses() {
     RegisterOrReplace<p::StaticQuantizeConv>(registry);
     RegisterOrReplace<p::StaticQuantizeMatMul>(registry);
     RegisterOrReplace<p::WeightOnlyQuantizeConv>(registry);
+    RegisterOrReplace<p::WeightOnlyQuantizeInt4MatMul>(registry);
     RegisterOrReplace<p::WeightOnlyQuantizeMatMul>(registry);
 
     // onnxsim's patched versions of built-in onnxoptimizer passes. These

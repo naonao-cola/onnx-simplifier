@@ -200,6 +200,29 @@ onnx::ModelProto QuantizeTernary(const onnx::ModelProto& model);
 // are left as-is.
 onnx::ModelProto QuantizeWeightOnly(const onnx::ModelProto& model);
 
+// Block-wise INT4 weight-only quantizes every MatMul, and every "vanilla"
+// Gemm (transA=0, alpha=1, beta=1), whose weight is a constant 2-D float32
+// tensor whose reduction dimension (K) is evenly divisible by 32: the weight
+// is quantized to INT4 (values in [-7, 7]) with a separate symmetric scale
+// per 32-element block of K, per output channel, inserting a single
+// ``DequantizeLinear(axis=<K's axis>, block_size=32)`` in its place. Like
+// ``QuantizeWeightOnly``, the activation is never touched -- no calibration
+// data, no runtime quantize/dequantize cost on the activation path -- but at
+// roughly half the storage for a comparable accuracy cost, since block-local
+// scales absorb most of what a single wider INT8 per-channel range would
+// otherwise lose. Uses ONNX opset 21's INT4 tensor type and
+// DequantizeLinear's `block_size` attribute (standard ONNX, not a contrib
+// op). See ``passes/weight_only_quantize_int4_matmul.h`` for the rewrite
+// itself.
+//
+// Unlike ``Simplify``, this does not run shape inference, constant folding or
+// any other simplification pass -- it applies exactly this one rewrite, once,
+// to a copy of ``model`` (which is left untouched) and returns the result.
+// Nodes that do not match (dynamic or non-2-D weights, a reduction dimension
+// not divisible by 32, non-default Gemm attributes, non-float32 operands, an
+// opset older than 21) are left as-is.
+onnx::ModelProto QuantizeWeightOnlyInt4(const onnx::ModelProto& model);
+
 // Lists the activation tensor names that ``QuantizeStatic`` could quantize in
 // ``model`` -- the first input of every MatMul, every "vanilla" Gemm
 // (transA=0, alpha=1, beta=1), and every Conv, whose weight is a constant
