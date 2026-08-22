@@ -35,7 +35,7 @@ one it can't.
 
 The ``halide`` PyPI package is not part of onnxsim's test requirements, so
 the whole module is skipped when it is not installed. The dedicated
-``halide-integration`` CI workflow installs it and runs these tests; the
+``backend-integration`` CI workflow installs it and runs these tests; the
 regular build-and-test matrix skips them.
 """
 
