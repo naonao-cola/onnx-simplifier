@@ -89,9 +89,19 @@ export function fileUrl(repo, file, revision = "main") {
   return `${HF}/${repo}/resolve/${revision}/${encoded}`;
 }
 
-// List a repo's files (with sizes) via the Hub API.
-async function repoSiblings(repo) {
-  const r = await fetch(`${HF}/api/models/${repo}?blobs=true`);
+// Build a fetch `headers` object carrying a Hub access token, or undefined when
+// no token is given, so every call below can just spread `authHeaders(token)`
+// without an if/else at each call site. The token is only ever sent to
+// huggingface.co (and its subdomains) — see fetchModelBytes / probeModelSize.
+function authHeaders(token) {
+  return token ? { Authorization: `Bearer ${token}` } : undefined;
+}
+
+// List a repo's files (with sizes) via the Hub API. `token` (a Hub access
+// token, "hf_…") is sent as a Bearer token so gated / private repos the token
+// has access to resolve like any other.
+async function repoSiblings(repo, token) {
+  const r = await fetch(`${HF}/api/models/${repo}?blobs=true`, { headers: authHeaders(token) });
   if (!r.ok) {
     throw new Error(`Hugging Face API returned HTTP ${r.status} for ${repo}`);
   }
@@ -113,8 +123,8 @@ function pickOnnxSibling(siblings, repo) {
 // let the user pick which file to convert instead of always taking the auto-
 // detected (largest) one. `size` is a byte count or null when undisclosed.
 // Returns [] when the repo has no .onnx file (the caller decides what to do).
-export async function listOnnxFiles(repo) {
-  const siblings = await repoSiblings(repo);
+export async function listOnnxFiles(repo, token) {
+  const siblings = await repoSiblings(repo, token);
   return siblings
     .filter((s) => s.rfilename && s.rfilename.endsWith(".onnx"))
     .map((s) => ({
@@ -127,8 +137,8 @@ export async function listOnnxFiles(repo) {
 // Pick the main .onnx file in a repo (largest, matching the regression workers)
 // and warn when the graph relies on external-data blobs the in-browser,
 // single-file converter can't load.
-async function findOnnxFile(repo, onLog) {
-  const siblings = await repoSiblings(repo);
+async function findOnnxFile(repo, onLog, token) {
+  const siblings = await repoSiblings(repo, token);
   const { sibling, count } = pickOnnxSibling(siblings, repo);
   const chosen = sibling.rfilename;
   if (count > 1) {
@@ -149,10 +159,12 @@ async function findOnnxFile(repo, onLog) {
 
 // Read a URL's byte size from its Content-Length via a HEAD request, without
 // downloading the body. Returns a positive integer, or null when the size can't
-// be determined (request failed, header absent, or CORS hid it).
-async function headContentLength(url) {
+// be determined (request failed, header absent, or CORS hid it). `token` is
+// only meaningful (and should only ever be passed) for a Hugging Face URL —
+// callers must not leak it to an arbitrary third-party host.
+async function headContentLength(url, token) {
   try {
-    const r = await fetch(url, { method: "HEAD" });
+    const r = await fetch(url, { method: "HEAD", headers: authHeaders(token) });
     if (!r.ok) return null;
     const n = Number(r.headers && r.headers.get("content-length"));
     return Number.isFinite(n) && n > 0 ? n : null;
@@ -168,8 +180,10 @@ async function headContentLength(url) {
 // HEAD request and reads Content-Length. Returns { size, name, repo?, file?,
 // url? }, where `size` is a byte count or null when it can't be determined.
 // Throws only when the reference itself can't be resolved (empty ref, or a repo
-// with no .onnx file).
-export async function probeModelSize(ref) {
+// with no .onnx file). `token` (a Hub access token) is sent only to
+// huggingface.co endpoints — never to a direct/non-Hub URL, since `parsed.url`
+// is an arbitrary third-party host.
+export async function probeModelSize(ref, token) {
   const parsed = parseRef(ref);
   if (parsed.url) {
     return { size: await headContentLength(parsed.url), name: parsed.name, url: parsed.url };
@@ -178,13 +192,13 @@ export async function probeModelSize(ref) {
   if (parsed.file) {
     const url = fileUrl(parsed.repo, parsed.file, revision);
     return {
-      size: await headContentLength(url),
+      size: await headContentLength(url, token),
       name: parsed.file.split("/").pop(),
       repo: parsed.repo,
       file: parsed.file,
     };
   }
-  const siblings = await repoSiblings(parsed.repo);
+  const siblings = await repoSiblings(parsed.repo, token);
   const { sibling } = pickOnnxSibling(siblings, parsed.repo);
   const size = Number.isFinite(sibling.size) && sibling.size > 0 ? sibling.size : null;
   return {
@@ -241,28 +255,32 @@ async function readWithProgress(resp, onProgress) {
 // Resolve a reference and download the model. Returns { bytes, name, repo }.
 // `onLog` receives progress lines for the page's console output; `onProgress`
 // receives { loaded, total } byte counts as the download streams, for a live
-// progress indicator.
-export async function fetchModelBytes(ref, onLog = () => {}, onProgress = () => {}) {
+// progress indicator. `token` (a Hub access token) is sent as a Bearer token
+// only when downloading from a Hugging Face repo — never to a direct URL,
+// which may point at an arbitrary third-party host.
+export async function fetchModelBytes(ref, onLog = () => {}, onProgress = () => {}, token) {
   const parsed = parseRef(ref);
 
   let url;
   let name;
+  let sendToken = false;
   if (parsed.url) {
     url = parsed.url;
     name = parsed.name;
   } else {
+    sendToken = true;
     const revision = parsed.revision || "main";
     let file = parsed.file;
     if (!file) {
       onLog(`querying Hugging Face for the .onnx file in ${parsed.repo}…`);
-      file = await findOnnxFile(parsed.repo, onLog);
+      file = await findOnnxFile(parsed.repo, onLog, token);
     }
     url = fileUrl(parsed.repo, file, revision);
     name = file.split("/").pop();
   }
 
   onLog(`downloading ${url}`);
-  const resp = await fetch(url);
+  const resp = await fetch(url, { headers: authHeaders(sendToken ? token : undefined) });
   if (!resp.ok) {
     throw new Error(`download failed: HTTP ${resp.status} ${resp.statusText}`);
   }
@@ -320,7 +338,7 @@ async function readBlobWithProgress(blob, onProgress) {
 // into byte-range shards ourselves.
 export async function fetchModelBytesXet(
   ref,
-  { onLog = () => {}, onProgress = () => {}, fetchImpl, concurrency = 1 } = {},
+  { onLog = () => {}, onProgress = () => {}, fetchImpl, concurrency = 1, token } = {},
 ) {
   const parsed = parseRef(ref);
   if (!parsed.repo) {
@@ -330,7 +348,7 @@ export async function fetchModelBytesXet(
   let file = parsed.file;
   if (!file) {
     onLog(`querying Hugging Face for the .onnx file in ${parsed.repo}…`);
-    file = await findOnnxFile(parsed.repo, onLog);
+    file = await findOnnxFile(parsed.repo, onLog, token);
   }
 
   const shards = Math.max(1, Math.floor(concurrency) || 1);
@@ -347,6 +365,9 @@ export async function fetchModelBytesXet(
     revision,
     fetch: fetchImpl,
     parallelDownloads,
+    // @huggingface/hub's CredentialsParams: pass accessToken only when set, so
+    // an anonymous load never sends `accessToken: undefined` through.
+    ...(token ? { accessToken: token } : {}),
   });
   if (!blob) throw new Error(`file not found: ${parsed.repo}/${file}`);
 

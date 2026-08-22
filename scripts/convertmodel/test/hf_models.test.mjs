@@ -32,9 +32,12 @@ async function acheck(name, fn) {
 //   { ok?, status?, statusText?, json?, arrayBuffer?, chunks?, contentLength? }
 // A `chunks` array (of Uint8Array) yields a streaming ReadableStream-style body
 // so the progress path can be exercised; otherwise only arrayBuffer() is served.
-function withFetch(routes, fn) {
+// Every call's (url, options) is recorded in `calls` (when passed in), so tests
+// can assert on what headers a given request carried.
+function withFetch(routes, fn, calls) {
   const saved = globalThis.fetch;
-  globalThis.fetch = async (url) => {
+  globalThis.fetch = async (url, options) => {
+    if (calls) calls.push({ url, options });
     const r = routes[url];
     if (!r) {
       return { ok: false, status: 404, statusText: "Not Found", headers: headersOf() };
@@ -339,6 +342,79 @@ await acheck("probeModelSize surfaces a repo with no .onnx", async () => {
       await assert.rejects(probeModelSize("empty"), /no \.onnx file found/);
     },
   );
+});
+
+await acheck("fetchModelBytes sends a Bearer token for a Hub repo download", async () => {
+  const api = "https://huggingface.co/api/models/o/gated?blobs=true";
+  const url = "https://huggingface.co/o/gated/resolve/main/m.onnx";
+  const calls = [];
+  await withFetch(
+    {
+      [api]: { json: { siblings: [{ rfilename: "m.onnx", size: 4 }] } },
+      [url]: { arrayBuffer: new Uint8Array([1, 2, 3, 4]).buffer },
+    },
+    () => fetchModelBytes("o/gated", () => {}, () => {}, "hf_secrettoken"),
+    calls,
+  );
+  const apiCall = calls.find((c) => c.url === api);
+  const downloadCall = calls.find((c) => c.url === url);
+  assert.equal(apiCall.options.headers.Authorization, "Bearer hf_secrettoken");
+  assert.equal(downloadCall.options.headers.Authorization, "Bearer hf_secrettoken");
+});
+
+await acheck("fetchModelBytes sends no Authorization header without a token", async () => {
+  const url = "https://huggingface.co/o/r/resolve/main/m.onnx";
+  const calls = [];
+  await withFetch(
+    { [url]: { arrayBuffer: new Uint8Array([1]).buffer } },
+    () => fetchModelBytes(url, () => {}, () => {}),
+    calls,
+  );
+  assert.equal(calls[0].options.headers, undefined);
+});
+
+await acheck("fetchModelBytes never sends a token to a non-Hub direct URL", async () => {
+  const url = "https://example.com/models/net.onnx";
+  const calls = [];
+  await withFetch(
+    { [url]: { arrayBuffer: new Uint8Array([1]).buffer } },
+    () => fetchModelBytes(url, () => {}, () => {}, "hf_secrettoken"),
+    calls,
+  );
+  assert.equal(calls[0].options.headers, undefined);
+});
+
+await acheck("probeModelSize sends a Bearer token for a Hub repo", async () => {
+  const api = "https://huggingface.co/api/models/o/gated?blobs=true";
+  const calls = [];
+  await withFetch(
+    { [api]: { json: { siblings: [{ rfilename: "m.onnx", size: 4 }] } } },
+    () => probeModelSize("o/gated", "hf_secrettoken"),
+    calls,
+  );
+  assert.equal(calls[0].options.headers.Authorization, "Bearer hf_secrettoken");
+});
+
+await acheck("probeModelSize never sends a token to a non-Hub direct URL", async () => {
+  const url = "https://example.com/models/net.onnx";
+  const calls = [];
+  await withFetch(
+    { [url]: { contentLength: 10 } },
+    () => probeModelSize(url, "hf_secrettoken"),
+    calls,
+  );
+  assert.equal(calls[0].options.headers, undefined);
+});
+
+await acheck("listOnnxFiles sends a Bearer token for a Hub repo", async () => {
+  const api = "https://huggingface.co/api/models/o/gated?blobs=true";
+  const calls = [];
+  await withFetch(
+    { [api]: { json: { siblings: [{ rfilename: "m.onnx", size: 4 }] } } },
+    () => listOnnxFiles("o/gated", "hf_secrettoken"),
+    calls,
+  );
+  assert.equal(calls[0].options.headers.Authorization, "Bearer hf_secrettoken");
 });
 
 console.log(`\n${passed} checks passed`);
