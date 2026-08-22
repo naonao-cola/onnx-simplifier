@@ -10,12 +10,19 @@
 //     int64") are thrown on an internal ORT promise that isn't chained to the
 //     awaited session.run(), so they surface as an *uncaught* promise rejection
 //     rather than rejecting the run the panel awaits.
+//   * WebGPU validation errors that no error scope captures (e.g. a kernel
+//     needing more storage buffers than the device's per-stage limit, as with
+//     a wide `Concat`) are logged by the browser straight to the DevTools
+//     protocol — they never pass through the page's `console.error`, so the
+//     wrap above can't see them. The only page-visible signal is the
+//     `GPUDevice`'s own `uncapturederror` event.
 //
-// captureOrtDiagnostics() wraps console.warn/console.error and listens for
-// unhandledrejection while a run is active, forwarding the onnxruntime/WebNN
-// ones to a provided sink (the panel log). The console output is preserved, so
-// devtools still shows everything it did before. The pure pieces take injected
-// console/target so they can be unit-tested under Node.
+// captureOrtDiagnostics() wraps console.warn/console.error, listens for
+// unhandledrejection, and (given the `ort` module) listens for the active
+// WebGPU device's `uncapturederror` event while a run is active, forwarding
+// matches to a provided sink (the panel log). The console output is
+// preserved, so devtools still shows everything it did before. The pure
+// pieces take injected console/target so they can be unit-tested under Node.
 
 // onnxruntime-web tags these messages with the library or backend name; match on
 // that so unrelated page logging (or another library's console noise) is not
@@ -46,8 +53,9 @@ export function formatLogArgs(args) {
   return (args || []).map(valueToText).join(" ");
 }
 
-// Install console.warn/console.error wrappers and an unhandledrejection listener
-// that forward onnxruntime-web's own diagnostics to `log`. Returns a restore()
+// Install console.warn/console.error wrappers, an unhandledrejection listener,
+// and (when `ort` is given) a WebGPU device `uncapturederror` listener, all
+// forwarding onnxruntime-web's own diagnostics to `log`. Returns a restore()
 // that removes every hook; call it in a finally so the global console/handlers
 // are always put back. `con`/`target` are injectable for testing (default to the
 // page's console and window).
@@ -55,6 +63,7 @@ export function captureOrtDiagnostics({
   log,
   con = typeof console !== "undefined" ? console : undefined,
   target = typeof window !== "undefined" ? window : undefined,
+  ort = null,
 } = {}) {
   const restores = [];
 
@@ -85,6 +94,32 @@ export function captureOrtDiagnostics({
     restores.push(() =>
       target.removeEventListener("unhandledrejection", onRejection),
     );
+  }
+
+  // `ort.env.webgpu.device` is a Promise that resolves once the WebGPU backend
+  // has created its GPUDevice — before any session exists if it's read early
+  // (the getter is valid "before or after the first WebGPU inference session
+  // is created"), so wiring this up here catches errors from the very first
+  // compute pipeline the run compiles. Resolves to undefined and is silently
+  // skipped when the page never touches WebGPU (wasm-only run) or the loaded
+  // onnxruntime-web build predates this property.
+  if (ort && ort.env && ort.env.webgpu) {
+    let device = null;
+    const onUncaptured = (event) => {
+      const reason = event && event.error;
+      const text = reason && reason.message ? reason.message : String(reason);
+      log(`WebGPU uncaptured error: ${text}`);
+    };
+    Promise.resolve(ort.env.webgpu.device)
+      .then((d) => {
+        if (!d || typeof d.addEventListener !== "function") return;
+        device = d;
+        device.addEventListener("uncapturederror", onUncaptured);
+      })
+      .catch(() => {});
+    restores.push(() => {
+      if (device) device.removeEventListener("uncapturederror", onUncaptured);
+    });
   }
 
   return () => {
