@@ -650,12 +650,15 @@ export function initInferencePanel() {
     if (traceContainer) traceContainer.innerHTML = "";
     if (macsContainer) macsContainer.innerHTML = "";
     if (sampleIoContainer) sampleIoContainer.innerHTML = "";
-    // Mirror onnxruntime-web's own console diagnostics and unhandled WebNN/ORT
-    // promise rejections into this panel's log for the duration of the run —
-    // e.g. "WebNN backend does not support data type: int64", which ORT throws
-    // on an internal promise that bypasses the try/catch below and otherwise
-    // only shows in devtools. restoreOrtLogs() is called in finally.
-    const restoreOrtLogs = captureOrtDiagnostics({ log });
+    // Mirror onnxruntime-web's own console diagnostics, unhandled WebNN/ORT
+    // promise rejections, and uncaptured WebGPU device errors into this
+    // panel's log for the duration of the run — e.g. "WebNN backend does not
+    // support data type: int64" (thrown on an internal promise that bypasses
+    // the try/catch below) or a WebGPU storage-buffer-limit validation error
+    // (logged by the browser straight to devtools, never through
+    // console.error). Without this, all three only show in devtools.
+    // restoreOrtLogs() is called in finally.
+    let restoreOrtLogs = () => {};
     try {
       const source = sourceSelect ? sourceSelect.value : "original";
       const iterations = Math.max(1, parseInt(itersInput.value, 10) || 5);
@@ -667,6 +670,17 @@ export function initInferencePanel() {
       const epValue = epSelect.value;
       const { providers, needWebnn } = providersForEp(epValue);
       const profile = !profileChk || profileChk.checked;
+      // Load onnxruntime-web (cached by variant, so runOnModel/runCompare's own
+      // loadOrt() below is a no-op fetch) here first so, on a WebGPU run, the
+      // device error listener is armed before session creation compiles the
+      // first compute pipeline. Only wired for a WebGPU-EP run — reading
+      // env.webgpu.device this early would otherwise ask the backend to spin
+      // up a GPUDevice for a plain wasm/WebNN run that never needs one.
+      const ort = await loadOrt(needWebnn ? "all" : "default");
+      restoreOrtLogs = captureOrtDiagnostics({
+        log,
+        ort: providers.includes("webgpu") ? ort : null,
+      });
       // How the auto-generated inputs are valued: one of input_fill.mjs's
       // synthetic modes, or "sample" (real image/tokenized-text data — see
       // sample_inputs.mjs). Guard against an unexpected value so a
