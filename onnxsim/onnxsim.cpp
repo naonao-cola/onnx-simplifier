@@ -49,6 +49,7 @@
 #include "onnxoptimizer/optimize.h"
 #include "onnxoptimizer/passes/cse_util.h"
 #include "onnxoptimizer/passes/logging.h"
+#include "passes/quantize_bf16.h"
 #include "passes/quantize_conv_common.h"
 #include "passes/quantize_fp16.h"
 #include "passes/quantize_matmul_common.h"
@@ -3597,6 +3598,20 @@ onnx::ModelProto QuantizeFp16(const onnx::ModelProto& model,
   onnx::optimization::onnxsim_passes::QuantizeFp16KeepIoTypes() = keep_io_types;
   return onnx::optimization::OptimizeFixed(
       model, std::vector<std::string>{"quantize_fp16"});
+}
+
+onnx::ModelProto QuantizeBf16(const onnx::ModelProto& model,
+                              bool keep_io_types) {
+  PrepareSchemasForDebug(model);
+  // Registers quantize_bf16 (idempotent) into onnxoptimizer's registry so
+  // OptimizeFixed can find it by name below.
+  onnxsim::RegisterCustomOptimizerPasses();
+  // quantize_bf16 reads this the same way quantize_fp16 reads
+  // QuantizeFp16KeepIoTypes() -- OptimizeFixed's pass-name list has no way
+  // to carry a parameter directly.
+  onnx::optimization::onnxsim_passes::QuantizeBf16KeepIoTypes() = keep_io_types;
+  return onnx::optimization::OptimizeFixed(
+      model, std::vector<std::string>{"quantize_bf16"});
 }
 
 // Records the options this Simplify() call actually used (skip_optimizers
