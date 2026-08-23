@@ -621,6 +621,42 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
       },
       "model_bytes"_a, "activation_ranges"_a);
 
+  // Lists the tensor names quantize_qoperator_concat could quantize -- every
+  // input plus the output of every qualifying Concat node -- see
+  // ListQOperatorConcatQuantizableTensors in onnxsim.h.
+  m.def(
+      "list_qoperator_concat_quantizable_tensors",
+      [](const py::bytes& model_proto_bytes) -> std::vector<std::string> {
+        InitEnv();
+        ONNX_NAMESPACE::ModelProto model;
+        ParseProtoFromBytes(&model, model_proto_bytes.c_str(),
+                            model_proto_bytes.size());
+        return ListQOperatorConcatQuantizableTensors(model);
+      },
+      "model_bytes"_a);
+
+  // Statically (calibration-based) quantizes Concat into ONNX Runtime's
+  // "com.microsoft" QLinearConcat contrib op -- needs a calibrated range for
+  // every input and the node's own output (see
+  // list_qoperator_concat_quantizable_tensors) since this computes directly
+  // in int8, with no float intermediate -- see QuantizeQOperatorConcat in
+  // onnxsim.h.
+  m.def(
+      "quantize_qoperator_concat",
+      [](const py::bytes& model_proto_bytes,
+         const std::unordered_map<std::string, std::pair<float, float>>&
+             activation_ranges) -> py::bytes {
+        InitEnv();
+        ONNX_NAMESPACE::ModelProto model;
+        ParseProtoFromBytes(&model, model_proto_bytes.c_str(),
+                            model_proto_bytes.size());
+        const auto result = QuantizeQOperatorConcat(model, activation_ranges);
+        std::string out;
+        result.SerializeToString(&out);
+        return py::bytes(out.data(), out.size());
+      },
+      "model_bytes"_a, "activation_ranges"_a);
+
   // Converts every float32 weight (and, by default, every internal
   // activation) to float16 -- no calibration data needed, since float16 is
   // still a floating-point format, not an integer scheme. With
