@@ -331,6 +331,30 @@ onnx::ModelProto QuantizeStatic(
     const std::unordered_map<std::string, std::pair<float, float>>&
         activation_ranges);
 
+// Same as ``QuantizeStatic``, but a "W8A16" scheme: the weight stays INT8
+// (identical per-output-channel symmetric scheme), while the activation is
+// quantized to UINT16 instead of UINT8 -- an 8x finer calibrated affine step
+// (1/65535 relative vs UINT8's 1/255). Useful for activations a QDQ round
+// trip is unusually sensitive to (e.g. post-softmax attention scores, or a
+// tensor whose calibrated range is wide relative to its typical value),
+// without giving up INT8's weight compression the way widening the weight
+// too would. Uses the same ``activation_ranges`` shape and
+// ``ListQuantizableActivations`` to discover candidate tensors as
+// ``QuantizeStatic``. See ``passes/static_quantize_int16_matmul.h`` and
+// ``passes/static_quantize_int16_conv.h`` for the rewrites themselves.
+// Needs opset >= 21 (UINT16 QuantizeLinear/DequantizeLinear support),
+// unlike ``QuantizeStatic``'s UINT8 scheme, which only needs opset 13.
+//
+// Unlike ``Simplify``, this does not run shape inference, constant folding or
+// any other simplification pass -- it applies exactly these rewrites, once
+// each, to a copy of ``model`` (which is left untouched) and returns the
+// result. Nodes that do not match, whose activation has no entry in
+// ``activation_ranges``, or whose opset is older than 21, are left as-is.
+onnx::ModelProto QuantizeStaticInt16(
+    const onnx::ModelProto& model,
+    const std::unordered_map<std::string, std::pair<float, float>>&
+        activation_ranges);
+
 // Lists the *output* tensor names that ``QuantizeQOperator`` could quantize
 // in ``model``, on top of the input tensor names ``ListQuantizableActivations``
 // already reports -- one entry per MatMul/"vanilla" Gemm/Conv whose weight

@@ -29,6 +29,8 @@ namespace onnxsim {
 //   - dynamic_quantize_ternary_matmul
 //   - static_quantize_matmul
 //   - static_quantize_conv
+//   - static_quantize_int16_matmul
+//   - static_quantize_int16_conv
 //   - weight_only_quantize_matmul
 //   - weight_only_quantize_conv
 //   - weight_only_quantize_int4_matmul

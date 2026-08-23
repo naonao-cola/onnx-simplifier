@@ -93,6 +93,27 @@ inline void ComputeAsymmetricUint8QuantParams(float min_val, float max_val,
   zero_point = static_cast<int32_t>(std::clamp(zp, 0.0f, 255.0f));
 }
 
+// Same as ComputeAsymmetricUint8QuantParams, but UINT16 (65536 codes instead
+// of 256) -- used by static_quantize_int16_matmul.h/_conv.h for a finer
+// activation quantization step (1/65535 relative vs UINT8's 1/255) while the
+// weight stays at the ordinary INT8 per-channel scheme (a "W8A16" scheme:
+// finer activation precision, same weight compression) -- useful for
+// activations a QDQ round trip is unusually sensitive to (e.g. attention
+// softmax outputs feeding a subsequent MatMul), where UINT8's coarser step
+// costs more accuracy than its extra compression is worth.
+inline void ComputeAsymmetricUint16QuantParams(float min_val, float max_val,
+                                               float& scale,
+                                               int32_t& zero_point) {
+  float lo = std::min(0.0f, min_val);
+  float hi = std::max(0.0f, max_val);
+  if (hi <= lo) {
+    hi = lo + 1.0f;  // Degenerate calibration range (e.g. all-zero data).
+  }
+  scale = (hi - lo) / 65535.0f;
+  const float zp = std::round(-lo / scale);
+  zero_point = static_cast<int32_t>(std::clamp(zp, 0.0f, 65535.0f));
+}
+
 struct StaticQuantizeMatMul final : public PredicateBasedPass {
   explicit StaticQuantizeMatMul()
       : PredicateBasedPass(PassType::Other, PassEfficiency::Complete,

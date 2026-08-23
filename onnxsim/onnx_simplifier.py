@@ -1751,6 +1751,15 @@ def main():
         action="store_true",
     )
     parser.add_argument(
+        "--static-quantize-int16",
+        help="Same as --static-quantize, but a 'W8A16' scheme: weights stay "
+        "INT8, while activations are quantized to uint16 instead of uint8 "
+        "(an 8x finer calibrated step) -- useful for activations a QDQ "
+        "round trip is unusually sensitive to. Needs opset >= 21. See "
+        "onnxsim.quantize_static_int16.",
+        action="store_true",
+    )
+    parser.add_argument(
         "--qoperator-quantize",
         help="After simplifying, statically (calibration-based) quantize "
         "MatMul/Gemm weights and activations to INT8/uint8 into the "
@@ -1763,8 +1772,9 @@ def main():
     parser.add_argument(
         "--calibration-dataset",
         help="Hugging Face Hub dataset id (e.g. 'mnist') to pull "
-        "--calibration-samples real examples from for --static-quantize's "
-        "or --qoperator-quantize's calibration, instead of random data. See "
+        "--calibration-samples real examples from for --static-quantize's, "
+        "--static-quantize-int16's, or --qoperator-quantize's calibration, "
+        "instead of random data. See "
         "onnxsim.load_huggingface_calibration_data (needs the optional "
         "'datasets' package: pip install datasets).",
         type=str,
@@ -2048,6 +2058,31 @@ def main():
             )
         print("Statically quantizing MatMul/Gemm/Conv weights and activations...")
         model_opt = calibration.quantize_static(
+            model_opt, calibration_data=calibration_data, method=args.calibration_method
+        )
+
+    if args.static_quantize_int16:
+        from . import calibration
+
+        if args.calibration_dataset:
+            print(
+                f'Calibrating from Hugging Face dataset "{args.calibration_dataset}"...'
+            )
+            calibration_data = calibration.load_huggingface_calibration_data(
+                args.calibration_dataset,
+                model_opt,
+                num_samples=args.calibration_samples,
+            )
+        else:
+            print("Calibrating from random data...")
+            calibration_data = calibration.generate_random_calibration_data(
+                model_opt, num_samples=args.calibration_samples
+            )
+        print(
+            "Statically quantizing MatMul/Gemm/Conv weights (INT8) and "
+            "activations (uint16)..."
+        )
+        model_opt = calibration.quantize_static_int16(
             model_opt, calibration_data=calibration_data, method=args.calibration_method
         )
 

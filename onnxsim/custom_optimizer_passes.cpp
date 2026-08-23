@@ -30,6 +30,8 @@
 #include "passes/quantize_fp16.h"
 #include "passes/quantize_fp8.h"
 #include "passes/static_quantize_conv.h"
+#include "passes/static_quantize_int16_conv.h"
+#include "passes/static_quantize_int16_matmul.h"
 #include "passes/static_quantize_matmul.h"
 #include "passes/weight_only_quantize_conv.h"
 #include "passes/weight_only_quantize_int16_conv.h"
@@ -89,6 +91,8 @@ void RegisterCustomOptimizerPasses() {
     RegisterOrReplace<p::QuantizeFp16Pass>(registry);
     RegisterOrReplace<p::QuantizeFp8Pass>(registry);
     RegisterOrReplace<p::StaticQuantizeConv>(registry);
+    RegisterOrReplace<p::StaticQuantizeInt16Conv>(registry);
+    RegisterOrReplace<p::StaticQuantizeInt16MatMul>(registry);
     RegisterOrReplace<p::StaticQuantizeMatMul>(registry);
     RegisterOrReplace<p::WeightOnlyQuantizeConv>(registry);
     RegisterOrReplace<p::WeightOnlyQuantizeInt16Conv>(registry);

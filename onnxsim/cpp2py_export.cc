@@ -492,6 +492,25 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
       },
       "model_bytes"_a, "activation_ranges"_a);
 
+  // Same as quantize_static, but a "W8A16" scheme: the weight stays INT8,
+  // while the activation is quantized to uint16 instead of uint8 (an 8x
+  // finer calibrated affine step) -- see QuantizeStaticInt16 in onnxsim.h.
+  m.def(
+      "quantize_static_int16",
+      [](const py::bytes& model_proto_bytes,
+         const std::unordered_map<std::string, std::pair<float, float>>&
+             activation_ranges) -> py::bytes {
+        InitEnv();
+        ONNX_NAMESPACE::ModelProto model;
+        ParseProtoFromBytes(&model, model_proto_bytes.c_str(),
+                            model_proto_bytes.size());
+        const auto result = QuantizeStaticInt16(model, activation_ranges);
+        std::string out;
+        result.SerializeToString(&out);
+        return py::bytes(out.data(), out.size());
+      },
+      "model_bytes"_a, "activation_ranges"_a);
+
   // Lists the *output* tensor names quantize_qoperator could additionally
   // quantize, on top of list_quantizable_activations' input names -- see
   // ListQOperatorQuantizableOutputs in onnxsim.h.
