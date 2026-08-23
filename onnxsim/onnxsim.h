@@ -401,6 +401,46 @@ onnx::ModelProto QuantizeQOperator(
     const std::unordered_map<std::string, std::pair<float, float>>&
         activation_ranges);
 
+// Lists the tensor names ``QuantizeQOperatorElementwise`` could quantize in
+// ``model``: for every Add/Mul node with exactly 2 float32 inputs, neither a
+// constant, one entry per operand plus one for the node's own output (three
+// entries per qualifying node, since QLinearAdd/QLinearMul -- unlike
+// QLinearMatMul/QLinearConv -- have no "weight" operand pre-quantized from
+// its own static values; both operands are treated as calibrated
+// activations). A caller preparing to call ``QuantizeQOperatorElementwise``
+// should calibrate this list (there is no separate
+// ``ListQuantizableActivations``-style overlap to union it with, since
+// MatMul/Conv activation names and Add/Mul operand names never coincide).
+std::vector<std::string> ListQOperatorElementwiseQuantizableTensors(
+    const onnx::ModelProto& model);
+
+// Statically (calibration-based) quantizes every elementwise Add/Mul node
+// whose two inputs are both non-constant float32 tensors, and whose two
+// input names *and* whose own output name are all keys of
+// ``activation_ranges``, into ONNX Runtime's "com.microsoft" contrib ops
+// ``QLinearAdd``/``QLinearMul`` -- the elementwise, "QOperator"-format
+// analogue of ``QuantizeQOperator``'s ``QLinearMatMul``/``QLinearConv``
+// rewrite. Unlike every other ``Quantize*`` entry point in this header,
+// QLinearAdd/QLinearMul are not standard ONNX ops -- they are ONNX Runtime
+// contrib ops, so the emitted model needs a "com.microsoft"-aware runtime
+// (ONNX Runtime itself, or another runtime importing the same contrib
+// schemas) to execute; this function adds "com.microsoft" (version 1) to
+// the model's opset imports the first time it rewrites a node. See
+// ``ListQOperatorElementwiseQuantizableTensors`` to discover which tensors
+// to calibrate, and ``passes/qoperator_quantize_elementwise.h`` for the
+// rewrite itself and its doc comment on why a constant operand is left
+// alone.
+//
+// Unlike ``Simplify``, this does not run shape inference, constant folding
+// or any other simplification pass -- it applies exactly this rewrite, once,
+// to a copy of ``model`` (which is left untouched) and returns the result.
+// Nodes that do not match, or whose operands/output have no entry in
+// ``activation_ranges``, are left as-is.
+onnx::ModelProto QuantizeQOperatorElementwise(
+    const onnx::ModelProto& model,
+    const std::unordered_map<std::string, std::pair<float, float>>&
+        activation_ranges);
+
 // Converts every float32 weight (and, by default, every internal activation)
 // in ``model`` to float16 -- a different kind of "quantization" from every
 // other ``Quantize*`` function here: float16 is still a floating-point
