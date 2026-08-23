@@ -1799,11 +1799,24 @@ def main():
         action="store_true",
     )
     parser.add_argument(
+        "--qoperator-quantize-activation",
+        help="After simplifying, statically (calibration-based) quantize "
+        "standalone Sigmoid/LeakyRelu nodes into ONNX Runtime's "
+        "'com.microsoft' contrib ops QLinearSigmoid/QLinearLeakyRelu, with a "
+        "fixed scale/zero-point calibrated from --calibration-dataset if "
+        "given, else from random data. Unlike the other --*-quantize flags "
+        "(except --qoperator-quantize-elementwise), the result needs a "
+        "com.microsoft-aware runtime (e.g. ONNX Runtime) to execute -- see "
+        "onnxsim.quantize_qoperator_activation.",
+        action="store_true",
+    )
+    parser.add_argument(
         "--calibration-dataset",
         help="Hugging Face Hub dataset id (e.g. 'mnist') to pull "
         "--calibration-samples real examples from for --static-quantize's, "
-        "--static-quantize-int16's, --qoperator-quantize's, or "
-        "--qoperator-quantize-elementwise's calibration, instead of random "
+        "--static-quantize-int16's, --qoperator-quantize's, "
+        "--qoperator-quantize-elementwise's, or "
+        "--qoperator-quantize-activation's calibration, instead of random "
         "data. See onnxsim.load_huggingface_calibration_data (needs the "
         "optional 'datasets' package: pip install datasets).",
         type=str,
@@ -1812,15 +1825,16 @@ def main():
     parser.add_argument(
         "--calibration-samples",
         help="Number of calibration batches/examples for --static-quantize, "
-        "--qoperator-quantize, or --qoperator-quantize-elementwise "
-        "(default: 8).",
+        "--qoperator-quantize, --qoperator-quantize-elementwise, or "
+        "--qoperator-quantize-activation (default: 8).",
         type=int,
         default=8,
     )
     parser.add_argument(
         "--calibration-method",
         help="Calibration range method for --static-quantize, "
-        "--qoperator-quantize, or --qoperator-quantize-elementwise: "
+        "--qoperator-quantize, --qoperator-quantize-elementwise, or "
+        "--qoperator-quantize-activation: "
         "'minmax' "
         "(default) uses each tensor's observed min/max directly; 'entropy' "
         "instead searches for the clip threshold minimizing KL divergence "
@@ -2181,6 +2195,31 @@ def main():
             "format, com.microsoft contrib ops)..."
         )
         model_opt = calibration.quantize_qoperator_elementwise(
+            model_opt, calibration_data=calibration_data, method=args.calibration_method
+        )
+
+    if args.qoperator_quantize_activation:
+        from . import calibration
+
+        if args.calibration_dataset:
+            print(
+                f'Calibrating from Hugging Face dataset "{args.calibration_dataset}"...'
+            )
+            calibration_data = calibration.load_huggingface_calibration_data(
+                args.calibration_dataset,
+                model_opt,
+                num_samples=args.calibration_samples,
+            )
+        else:
+            print("Calibrating from random data...")
+            calibration_data = calibration.generate_random_calibration_data(
+                model_opt, num_samples=args.calibration_samples
+            )
+        print(
+            "Statically quantizing Sigmoid/LeakyRelu nodes (QOperator "
+            "format, com.microsoft contrib ops)..."
+        )
+        model_opt = calibration.quantize_qoperator_activation(
             model_opt, calibration_data=calibration_data, method=args.calibration_method
         )
 

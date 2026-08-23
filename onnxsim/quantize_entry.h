@@ -49,6 +49,14 @@ onnx::ModelProto QuantizeQOperatorElementwise(
     const std::unordered_map<std::string, std::pair<float, float>>&
         activation_ranges);
 
+std::vector<std::string> ListQOperatorActivationQuantizableTensors(
+    const onnx::ModelProto& model);
+
+onnx::ModelProto QuantizeQOperatorActivation(
+    const onnx::ModelProto& model,
+    const std::unordered_map<std::string, std::pair<float, float>>&
+        activation_ranges);
+
 onnx::ModelProto QuantizeFp16(const onnx::ModelProto& model,
                               bool keep_io_types);
 onnx::ModelProto QuantizeBf16(const onnx::ModelProto& model,

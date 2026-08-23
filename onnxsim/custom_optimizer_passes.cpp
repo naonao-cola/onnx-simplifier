@@ -24,6 +24,7 @@
 #include "passes/fuse_pad_into_pool.h"
 #include "passes/fuse_preceding_mul_into_conv.h"
 #include "passes/fuse_rms_norm.h"
+#include "passes/qoperator_quantize_activation.h"
 #include "passes/qoperator_quantize_conv.h"
 #include "passes/qoperator_quantize_elementwise.h"
 #include "passes/qoperator_quantize_matmul.h"
@@ -86,6 +87,7 @@ void RegisterCustomOptimizerPasses() {
     RegisterOrReplace<p::FuseMulIntoConv>(registry);
     RegisterOrReplace<p::FusePrecedingMulIntoConv>(registry);
     RegisterOrReplace<p::FuseRMSNorm>(registry);
+    RegisterOrReplace<p::QOperatorQuantizeActivation>(registry);
     RegisterOrReplace<p::QOperatorQuantizeConv>(registry);
     RegisterOrReplace<p::QOperatorQuantizeElementwise>(registry);
     RegisterOrReplace<p::QOperatorQuantizeMatMul>(registry);
