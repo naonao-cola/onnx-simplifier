@@ -43,6 +43,7 @@ namespace onnxsim {
 //   - qoperator_quantize_conv
 //   - qoperator_quantize_elementwise
 //   - qoperator_quantize_activation
+//   - qoperator_quantize_concat
 //   - quantize_fp16
 //   - quantize_bf16
 //   - quantize_fp8
