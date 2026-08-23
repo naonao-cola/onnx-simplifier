@@ -124,19 +124,16 @@ struct QOperatorQuantizeElementwise final : public PredicateBasedPass {
 
     float a_scale_f = 1.0f;
     int32_t a_zp_i = 0;
-    ComputeAsymmetricUint8QuantParams(a_range_it->second.first,
-                                      a_range_it->second.second, a_scale_f,
-                                      a_zp_i);
+    ComputeAsymmetricUint8QuantParams(
+        a_range_it->second.first, a_range_it->second.second, a_scale_f, a_zp_i);
     float b_scale_f = 1.0f;
     int32_t b_zp_i = 0;
-    ComputeAsymmetricUint8QuantParams(b_range_it->second.first,
-                                      b_range_it->second.second, b_scale_f,
-                                      b_zp_i);
+    ComputeAsymmetricUint8QuantParams(
+        b_range_it->second.first, b_range_it->second.second, b_scale_f, b_zp_i);
     float z_scale_f = 1.0f;
     int32_t z_zp_i = 0;
-    ComputeAsymmetricUint8QuantParams(z_range_it->second.first,
-                                      z_range_it->second.second, z_scale_f,
-                                      z_zp_i);
+    ComputeAsymmetricUint8QuantParams(
+        z_range_it->second.first, z_range_it->second.second, z_scale_f, z_zp_i);
 
     Tensor a_scale_t;
     a_scale_t.elem_type() = TensorProto_DataType_FLOAT;
