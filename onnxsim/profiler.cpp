@@ -173,6 +173,14 @@ struct Sample {
   size_t rss;
 };
 
+// One "NodeCount" sample: how many nodes the graph held right after a round
+// of the named fixed-point loop.
+struct NodeCountSample {
+  std::string loop;
+  uint64_t ts_us;
+  size_t node_count;
+};
+
 // The calling thread's live span stack. File-scope thread_local so the header
 // stays free of <vector>.
 thread_local std::vector<Frame> g_stack;
@@ -184,9 +192,10 @@ struct Profiler::Impl {
   std::chrono::steady_clock::time_point t0;
   unsigned sample_interval_ms = 5;
 
-  std::mutex mu;  // guards events, samples and ort_trace_paths
+  std::mutex mu;  // guards events, samples, node_counts and ort_trace_paths
   std::vector<Event> events;
   std::vector<Sample> samples;
+  std::vector<NodeCountSample> node_counts;
   // Paths of ONNX Runtime's own per-session traces to merge at Finish().
   std::vector<std::string> ort_trace_paths;
 
@@ -317,6 +326,14 @@ void Profiler::End() {
     ev.peak_rss = peak;
     impl_->events.push_back(std::move(ev));
   }
+}
+
+void Profiler::RecordNodeCount(const std::string& loop, size_t node_count) {
+  if (!enabled_) {
+    return;
+  }
+  std::lock_guard<std::mutex> lk(impl_->mu);
+  impl_->node_counts.push_back({loop, impl_->NowUs(), node_count});
 }
 
 namespace {
@@ -742,6 +759,16 @@ void Profiler::Finish() {
     json << "{\"name\":\"RSS\",\"ph\":\"C\",\"ts\":" << s.ts_us
          << ",\"pid\":1,\"tid\":0,\"args\":{\"rss_mb\":" << BytesToMiB(s.rss)
          << "}}";
+  }
+
+  // The node-count-per-round curve, one counter event per fixed-point round,
+  // tagged with which loop produced it -- the raw data for the "node
+  // reduction per loop" plot (onnxsim/profile_plot.py).
+  for (const auto& nc : impl_->node_counts) {
+    comma();
+    json << "{\"name\":\"NodeCount\",\"ph\":\"C\",\"ts\":" << nc.ts_us
+         << ",\"pid\":1,\"tid\":0,\"args\":{\"node_count\":" << nc.node_count
+         << ",\"loop\":\"" << JsonEscape(nc.loop) << "\"}}";
   }
 
   json << "\n]}\n";

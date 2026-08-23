@@ -141,14 +141,18 @@ PR. Widen the `paths` filter to `onnxsim/**` to make it stricter.
 
 ## Known unrelated failure in the no-onnxruntime configuration
 
-`test_fuse_conv_bn_into_conv` and `test_fuse_convtranspose_bn` fail onnxsim's
-own `check_n` equivalence check (max diff ~2.4, far past float noise) whenever
+`test_fuse_conv_bn_into_conv`, `test_fuse_convtranspose_bn` and
+`test_fuse_conv_with_bias_bn_into_conv` fail onnxsim's own `check_n`
+equivalence check (max diff order ~1-2.4, far past float noise) whenever
 onnxruntime is absent and the reference evaluator runs instead. This is **not**
 byte-order related — they fail identically on x86_64 under the same conditions,
-and they failed before the byte-order fixes landed. onnxruntime has no s390x
-build, so the big-endian job cannot avoid that configuration; it deselects
-those two by name in `run_s390x_tests.sh` rather than tolerating failures
-generally, so a real big-endian regression still turns the job red.
+and the original two failed before the byte-order fixes landed;
+`test_fuse_conv_with_bias_bn_into_conv` is a later addition exercising the
+same fuse_bn_into_conv pass with a pre-existing Conv bias, and hits the exact
+same reference-evaluator disagreement. onnxruntime has no s390x build, so the
+big-endian job cannot avoid that configuration; it deselects these by name in
+`run_s390x_tests.sh` rather than tolerating failures generally, so a real
+big-endian regression still turns the job red.
 
 Worth chasing separately: either BN fusion is subtly wrong and ORT's tolerance
 hides it, or the reference evaluator disagrees with ORT on

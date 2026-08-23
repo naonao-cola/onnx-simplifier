@@ -113,6 +113,36 @@ def _contained_in(inner, outer):
     )
 
 
+def test_profile_records_node_counts(tmp_path):
+    """The profiler also records a "NodeCount" counter event right after every
+    round of each fixed-point loop, tagged with which loop produced it (see
+    onnxsim.profile_plot, which turns this into the "node reduction per loop"
+    plot)."""
+    out = str(tmp_path / "trace.json")
+    model_opt, ok = onnxsim.simplify(_foldable_model(), profile=out)
+    assert ok
+
+    _, counters = _load_trace(out)
+    node_count_events = [e for e in counters if e.get("name") == "NodeCount"]
+    assert node_count_events, "expected NodeCount counter events in the trace"
+
+    for e in node_count_events:
+        args = e["args"]
+        assert isinstance(args["node_count"], int)
+        assert args["node_count"] >= 0
+        assert isinstance(args["loop"], str)
+
+    loops = {e["args"]["loop"] for e in node_count_events}
+    # "Initial" is recorded once unconditionally; "Optimize" is recorded every
+    # inner-loop round, which always runs at least once.
+    assert {"Initial", "Optimize"} <= loops
+
+    # The very first NodeCount sample is the "Initial" baseline, matching the
+    # original (pre-simplification) node count.
+    initial = next(e for e in node_count_events if e["args"]["loop"] == "Initial")
+    assert initial["args"]["node_count"] == 2  # add_const, add_x
+
+
 def test_profile_captures_ort_session_runs(tmp_path):
     """Constant folding's real work is running ONNX Runtime sessions; those runs
     are profiled too. When a fold actually executes, an ``OrtSession`` span

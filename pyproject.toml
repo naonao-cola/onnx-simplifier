@@ -36,6 +36,9 @@ onnxruntime = ["onnxruntime >= 1.6.0"]
 # sympy lets the MACs/FLOPs report keep dynamic dimensions (dim_param, e.g.
 # "batch") as symbols and produce a formula instead of assuming them to be 1.
 symbolic = ["sympy"]
+# Needed by onnxsim.profile_plot.plot_node_reduction() / --node-reduction-plot,
+# which renders the "NodeCount" events in a simplify(..., profile=...) trace.
+plot = ["matplotlib"]
 
 [project.urls]
 Homepage = "https://github.com/onnxsim/onnxsim"

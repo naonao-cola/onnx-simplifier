@@ -88,6 +88,7 @@
                 const format_select = document.getElementById("download-format");
                 const format_status = document.getElementById("download-format-status");
                 const trace_container = document.getElementById("simplify-trace");
+                const node_reduction_container = document.getElementById("simplify-node-reduction");
                 let result_name = "";
                 let original_name = "";
                 // Decode a "data:...;base64,<b64>" URL back into a Uint8Array.
@@ -236,6 +237,7 @@
                             // Render the onnxsim simplification profile, if one
                             // came back, as an inline flame graph.
                             if (trace_container) trace_container.innerHTML = "";
+                            if (node_reduction_container) node_reduction_container.innerHTML = "";
                             if (trace_json && trace_container) {
                                 try {
                                     const trace = JSON.parse(trace_json);
@@ -245,6 +247,11 @@
                                             filename: "onnxsim.simplify.trace.json",
                                         });
                                     });
+                                    if (node_reduction_container) {
+                                        import("./node_reduction_view.mjs").then(({ renderNodeReduction }) => {
+                                            renderNodeReduction(node_reduction_container, trace);
+                                        });
+                                    }
                                 } catch (err) {
                                     log_output.value += "failed to parse profiling trace: " + err + "\n";
                                     log_output.scrollTop = log_output.scrollHeight;
