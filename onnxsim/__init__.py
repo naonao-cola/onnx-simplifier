@@ -3,6 +3,7 @@ from onnxsim.calibration import (
     generate_random_calibration_data,
     load_huggingface_calibration_data,
     quantize_qoperator,
+    quantize_qoperator_elementwise,
     quantize_static,
     quantize_static_int16,
 )
@@ -39,6 +40,7 @@ __all__ = [
     "quantize_static",
     "quantize_static_int16",
     "quantize_qoperator",
+    "quantize_qoperator_elementwise",
     "quantize_fp16",
     "quantize_bf16",
     "quantize_fp8",

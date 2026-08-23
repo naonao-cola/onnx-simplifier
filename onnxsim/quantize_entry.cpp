@@ -245,6 +245,64 @@ onnx::ModelProto QuantizeQOperator(
                                       "qoperator_quantize_conv"});
 }
 
+std::vector<std::string> ListQOperatorElementwiseQuantizableTensors(
+    const onnx::ModelProto& model) {
+  PrepareSchemasForDebug(model);
+  std::shared_ptr<onnx::Graph> g(onnx::ImportModelProto(model));
+  if (g.get() == nullptr) {
+    return {};
+  }
+  std::vector<std::string> names;
+  std::unordered_set<std::string> seen;
+  auto add_name = [&](const std::string& name) {
+    if (seen.insert(name).second) {
+      names.push_back(name);
+    }
+  };
+  for (auto* node : g->nodes()) {
+    if (node->kind() != onnx::kAdd && node->kind() != onnx::kMul) {
+      continue;
+    }
+    if (node->inputs().size() != 2) {
+      continue;
+    }
+    onnx::Value* a = node->inputs()[0];
+    onnx::Value* b = node->inputs()[1];
+    if (a->elemType() != onnx::TensorProto_DataType_FLOAT ||
+        b->elemType() != onnx::TensorProto_DataType_FLOAT) {
+      continue;
+    }
+    if (onnx::optimization::FetchConstantTensor(a) != nullptr ||
+        onnx::optimization::FetchConstantTensor(b) != nullptr) {
+      continue;
+    }
+    add_name(a->uniqueName());
+    add_name(b->uniqueName());
+    add_name(node->output()->uniqueName());
+  }
+  return names;
+}
+
+onnx::ModelProto QuantizeQOperatorElementwise(
+    const onnx::ModelProto& model,
+    const std::unordered_map<std::string, std::pair<float, float>>&
+        activation_ranges) {
+  PrepareSchemasForDebug(model);
+  // Registers qoperator_quantize_elementwise (idempotent) into
+  // onnxoptimizer's registry so OptimizeFixed can find it by name below.
+  onnxsim::RegisterCustomOptimizerPasses();
+  // qoperator_quantize_elementwise reads the same calibration-ranges global
+  // every other static/QOperator pass does (see
+  // StaticQuantizationCalibrationRanges's doc comment) -- keyed by tensor
+  // name, both operands' and the output's, so sharing the map is safe as
+  // long as only one Quantize* entry point runs per call, which
+  // OptimizeFixed's single pass-name list here ensures.
+  onnx::optimization::onnxsim_passes::StaticQuantizationCalibrationRanges() =
+      activation_ranges;
+  return onnx::optimization::OptimizeFixed(
+      model, std::vector<std::string>{"qoperator_quantize_elementwise"});
+}
+
 onnx::ModelProto QuantizeFp16(const onnx::ModelProto& model,
                               bool keep_io_types) {
   PrepareSchemasForDebug(model);

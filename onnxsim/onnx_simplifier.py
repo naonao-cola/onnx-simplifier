@@ -1787,27 +1787,41 @@ def main():
         action="store_true",
     )
     parser.add_argument(
+        "--qoperator-quantize-elementwise",
+        help="After simplifying, statically (calibration-based) quantize "
+        "elementwise Add/Mul nodes (both inputs non-constant, e.g. a "
+        "residual connection) into ONNX Runtime's 'com.microsoft' contrib "
+        "ops QLinearAdd/QLinearMul, with a fixed scale/zero-point "
+        "calibrated from --calibration-dataset if given, else from random "
+        "data. Unlike the other --*-quantize flags, the result needs a "
+        "com.microsoft-aware runtime (e.g. ONNX Runtime) to execute -- see "
+        "onnxsim.quantize_qoperator_elementwise.",
+        action="store_true",
+    )
+    parser.add_argument(
         "--calibration-dataset",
         help="Hugging Face Hub dataset id (e.g. 'mnist') to pull "
         "--calibration-samples real examples from for --static-quantize's, "
-        "--static-quantize-int16's, or --qoperator-quantize's calibration, "
-        "instead of random data. See "
-        "onnxsim.load_huggingface_calibration_data (needs the optional "
-        "'datasets' package: pip install datasets).",
+        "--static-quantize-int16's, --qoperator-quantize's, or "
+        "--qoperator-quantize-elementwise's calibration, instead of random "
+        "data. See onnxsim.load_huggingface_calibration_data (needs the "
+        "optional 'datasets' package: pip install datasets).",
         type=str,
         default=None,
     )
     parser.add_argument(
         "--calibration-samples",
-        help="Number of calibration batches/examples for --static-quantize "
-        "or --qoperator-quantize (default: 8).",
+        help="Number of calibration batches/examples for --static-quantize, "
+        "--qoperator-quantize, or --qoperator-quantize-elementwise "
+        "(default: 8).",
         type=int,
         default=8,
     )
     parser.add_argument(
         "--calibration-method",
-        help="Calibration range method for --static-quantize or "
-        "--qoperator-quantize: 'minmax' "
+        help="Calibration range method for --static-quantize, "
+        "--qoperator-quantize, or --qoperator-quantize-elementwise: "
+        "'minmax' "
         "(default) uses each tensor's observed min/max directly; 'entropy' "
         "instead searches for the clip threshold minimizing KL divergence "
         "between the observed and simulated-quantized distributions "
@@ -2142,6 +2156,31 @@ def main():
             "(QOperator format)..."
         )
         model_opt = calibration.quantize_qoperator(
+            model_opt, calibration_data=calibration_data, method=args.calibration_method
+        )
+
+    if args.qoperator_quantize_elementwise:
+        from . import calibration
+
+        if args.calibration_dataset:
+            print(
+                f'Calibrating from Hugging Face dataset "{args.calibration_dataset}"...'
+            )
+            calibration_data = calibration.load_huggingface_calibration_data(
+                args.calibration_dataset,
+                model_opt,
+                num_samples=args.calibration_samples,
+            )
+        else:
+            print("Calibrating from random data...")
+            calibration_data = calibration.generate_random_calibration_data(
+                model_opt, num_samples=args.calibration_samples
+            )
+        print(
+            "Statically quantizing elementwise Add/Mul nodes (QOperator "
+            "format, com.microsoft contrib ops)..."
+        )
+        model_opt = calibration.quantize_qoperator_elementwise(
             model_opt, calibration_data=calibration_data, method=args.calibration_method
         )
 
