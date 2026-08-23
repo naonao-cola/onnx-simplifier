@@ -84,7 +84,7 @@ print(sys.byteorder, \"endian | python\", sys.version.split()[0],
 # above, only tests/ and pyproject.toml are copied into the chroot, so none of
 # those imports resolve there regardless of what's pip-installed.
 #
-# The two deselected BN-fusion tests fail onnxsim's own check_n equivalence
+# The three deselected BN-fusion tests fail onnxsim's own check_n equivalence
 # check whenever onnxruntime is absent and the reference evaluator is used
 # instead -- identically on x86_64, so this is not a byte-order problem and
 # deselecting them here does not weaken the endianness coverage. Tracked
@@ -111,7 +111,8 @@ chroot "${SYSROOT}" /bin/sh -c "cd /work && GITHUB_STEP_SUMMARY=${CHROOT_SUMMARY
   --ignore=tests/test_coreml_compat.py --ignore=tests/test_migraphx_compat.py \
   --ignore=tests/test_openvino_compat.py \
   --deselect tests/test_fusion_patterns.py::test_fuse_conv_bn_into_conv \
-  --deselect tests/test_fusion_patterns.py::test_fuse_convtranspose_bn ${PYTEST_ARGS:-}"
+  --deselect tests/test_fusion_patterns.py::test_fuse_convtranspose_bn \
+  --deselect tests/test_fusion_patterns.py::test_fuse_conv_with_bias_bn_into_conv ${PYTEST_ARGS:-}"
 pytest_status=$?
 set -e
 
