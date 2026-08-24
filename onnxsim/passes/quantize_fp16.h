@@ -215,6 +215,49 @@ struct QuantizeFp16Pass final : public FullGraphBasedPass {
       tryReplacingAllUsesWith(old_v, new_v);
     }
 
+    // 1.5. Every *interior* activation value (every existing node's output --
+    // not yet the boundary Cast nodes steps 2/3 below add, which set their
+    // own output's type explicitly and correctly) now silently computes in
+    // float16 as a side effect of step 1's retyped weights/constants,
+    // exactly as this file's own header comment describes -- but its
+    // declared elemType/shape metadata is whatever an *earlier* pass (e.g.
+    // onnxsim's own shape inference, if this model went through
+    // ``simplify()`` first) set it to, still float32, and this pass never
+    // re-runs shape inference itself to correct it (see the header comment).
+    // Left alone, that stale metadata round-trips into the exported model's
+    // value_info as an outright *wrong* declaration (still float32) for a
+    // tensor the graph now actually produces as float16 -- unlike a merely
+    // *missing* value_info entry, which every conformant consumer (ONNX
+    // Runtime included) is expected to -- and does -- infer for itself, a
+    // wrong one is exactly the kind of type mismatch ONNX Runtime's own
+    // stricter load-time type-checking rejects outright. Clear it rather
+    // than guess a replacement: this pass doesn't model individual ops'
+    // real type-propagation rules (e.g. `Cast`'s output type depends only on
+    // its own `to` attribute, never its input, so blindly relabeling every
+    // float32-declared output float16 here would just trade one wrong
+    // declaration for another), so wiping the stale metadata for every
+    // existing node's float32-declared output is the only *always-correct*
+    // move available without doing full type inference -- whatever
+    // eventually reads this model performs it fresh instead.
+    //
+    // Graph outputs are skipped here even when they coincide with a node's
+    // output (the common case): step 3 below still needs to see each one's
+    // *original* elemType()==FLOAT to decide whether to convert/cast it, and
+    // sets its final type explicitly itself either way.
+    std::unordered_set<std::string> graph_output_names;
+    for (Value* v : graph.outputs()) {
+      graph_output_names.insert(v->uniqueName());
+    }
+    for (Node* n : graph.nodes()) {
+      for (Value* out : n->outputs()) {
+        if (out->elemType() == TensorProto_DataType_FLOAT &&
+            graph_output_names.count(out->uniqueName()) == 0) {
+          out->setElemType(TensorProto_DataType_UNDEFINED);
+          out->wipeSizes();
+        }
+      }
+    }
+
     // 2. Graph inputs.
     for (Value* value : graph.inputs()) {
       if (initializer_names.count(value->uniqueName()) > 0 ||

@@ -149,6 +149,31 @@ struct QuantizeBf16Pass final : public FullGraphBasedPass {
       tryReplacingAllUsesWith(old_v, new_v);
     }
 
+    // 1.5. Clear stale float32 elemType/shape metadata on every existing
+    // node's output (except graph outputs, which step 3 below still needs
+    // to see as FLOAT to decide whether to convert/cast them, and sets
+    // explicitly itself either way) -- see quantize_fp16.h's own step 1.5
+    // for the full rationale: this pass never re-runs shape inference, so a
+    // stale float32 declaration left over from an earlier pass (e.g.
+    // ``simplify()``) would otherwise round-trip into the exported model's
+    // value_info as a wrong type for a tensor now actually bfloat16, which
+    // ONNX Runtime's own load-time type-checking rejects outright. A
+    // cleared (omitted) value_info entry is always safe -- inferred fresh
+    // by any conformant consumer -- unlike a wrong one.
+    std::unordered_set<std::string> graph_output_names;
+    for (Value* v : graph.outputs()) {
+      graph_output_names.insert(v->uniqueName());
+    }
+    for (Node* n : graph.nodes()) {
+      for (Value* out : n->outputs()) {
+        if (out->elemType() == TensorProto_DataType_FLOAT &&
+            graph_output_names.count(out->uniqueName()) == 0) {
+          out->setElemType(TensorProto_DataType_UNDEFINED);
+          out->wipeSizes();
+        }
+      }
+    }
+
     // 2. Graph inputs.
     for (Value* value : graph.inputs()) {
       if (initializer_names.count(value->uniqueName()) > 0 ||
