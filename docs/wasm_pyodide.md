@@ -141,12 +141,20 @@ the script's own header comment for the full prerequisite list and defaults
 
 Output: `<BUILD_DIR>/onnxsim_cpp2py_export.abi3.so`, the script's last line.
 
-## What's next (not done here)
+## What's next
 
-To actually verify this: load the `.so` inside a real Pyodide distribution
-(matching the Python/Emscripten versions used to build it) alongside
-onnxsim's pure-Python package files -- e.g. via a micropip-installable wheel
-laid out the same way a native onnxsim wheel is, or by writing it directly
-into `pyodide.FS` and importing -- and confirm `import onnxsim` succeeds and
-`onnxsim.simplify()` runs against a real model. None of that is scripted
-here yet.
+CI now attempts the runtime verification this section used to describe as
+unscripted: `.github/workflows/pyodide-wasm.yml` runs `build_wasm_pyodide.sh`
+end to end (pinned Emscripten 5.0.3, Pyodide 314.0.5 xbuildenv headers), then
+loads the resulting `.abi3.so` inside a real Pyodide runtime (the `pyodide`
+npm package, under Node -- `scripts/pyodide_smoke_test.mjs`) and confirms
+`import onnxsim_cpp2py_export` succeeds and a real binding
+(`_list_optimizers()`) runs. That's still narrower than the top of this doc
+describes: it exercises the low-level nanobind extension module alone, not
+`import onnxsim` / `onnxsim.simplify()`, which additionally needs `onnx` and
+`rich` present inside the Pyodide environment -- not yet scripted.
+
+**Until that workflow has actually gone green on a real run, treat this as
+still unverified** -- the "Status" line at the top of this doc is the source
+of truth; update it only once CI confirms the import works, not based on this
+section alone.

@@ -1,0 +1,216 @@
+# Builds onnxsim's nanobind Python extension (`onnxsim_cpp2py_export`) for
+# Pyodide / wasm32-emscripten via `build_wasm_pyodide.sh`, then actually loads
+# the resulting `.abi3.so` inside a real Pyodide runtime (the `pyodide` npm
+# package, run under Node) and confirms it imports and runs. See
+# docs/wasm_pyodide.md for the full story of why this build needs the
+# toolchain pinning below, and its Status section for what is/isn't verified.
+#
+# This is a THIRD, separate build path from the Python wheel (setup.py) and
+# the standalone WASM CLI (build_wasm.sh / static.yml) -- see CLAUDE.md and
+# build_wasm_pyodide.sh's own header comment. It does not touch either.
+#
+# Toolchain pins, and why (see docs/wasm_pyodide.md for the full detail):
+#   - Emscripten 5.0.3: pyodide-build's own default Emscripten (3.1.46,
+#     clang-18) fails to compile onnxsim's vendored protobuf 31.1 (a
+#     `constinit` compile-time-evaluation limit in that old clang). 5.0.3 is
+#     the version validated end-to-end against Pyodide release 314.0.5's
+#     Python 3.14 headers.
+#   - Pyodide release 314.0.5: the xbuildenv (target Python headers) that
+#     matches the validated Emscripten 5.0.3, and the exact `pyodide` npm
+#     package version this workflow loads the built module with -- a mismatch
+#     between the JS runtime and the headers used to compile could produce
+#     confusing failures unrelated to the thing actually being tested.
+name: Pyodide / wasm32-emscripten build
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/pyodide-wasm.yml"
+      - "build_wasm_pyodide.sh"
+      - "docs/wasm_pyodide.md"
+      - "scripts/pyodide_smoke_test.mjs"
+      - "CMakeLists.txt"
+      - "cmake/**"
+      - "onnxsim/**"
+      - ".gitmodules"
+  push:
+    branches: ["master"]
+    paths:
+      - ".github/workflows/pyodide-wasm.yml"
+      - "build_wasm_pyodide.sh"
+      - "docs/wasm_pyodide.md"
+      - "scripts/pyodide_smoke_test.mjs"
+      - "CMakeLists.txt"
+      - "cmake/**"
+      - "onnxsim/**"
+      - ".gitmodules"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# One run per ref at a time; a newer push/PR update supersedes an in-flight
+# run of the same ref rather than queuing behind it.
+concurrency:
+  group: "pyodide-wasm-${{ github.ref }}"
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    name: Build + Pyodide/Node integration test
+    # The full C++ compile (abseil/protobuf/onnx/onnx-optimizer/onnxsim, all
+    # for wasm32) needs real CPU/RAM, matching what static.yml uses for its
+    # own, comparably-sized wasm build.
+    runs-on: ubuntu-latest
+    env:
+      CMAKE_GENERATOR: Ninja
+      EMSCRIPTEN_VERSION: "5.0.3"
+      PYODIDE_VERSION: "314.0.5"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          submodules: recursive
+
+      # The TARGET Python minor version (3.14, matching PYODIDE_VERSION's
+      # CPython) -- also used as the HOST interpreter build_wasm_pyodide.sh
+      # shells out to for `nanobind --cmake_dir` and that onnx-optimizer's
+      # combined find_package(Python...) call runs directly. Their minor
+      # versions must match (see build_wasm_pyodide.sh's header comment), so
+      # this one interpreter serves both roles.
+      - name: Set up Python 3.14
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.14"
+
+      - run: pip install cmake ninja nanobind pyodide-build
+
+      # --- Host protoc -----------------------------------------------------
+      # Same requirement as build_wasm.sh/static.yml's protoc handling:
+      # CMake's ONNX_CUSTOM_PROTOC_EXECUTABLE needs a host protoc whose
+      # codegen matches the vendored protobuf runtime being linked. onnxsim's
+      # own CMake FetchContent pulls protobuf 31.1 for onnx/onnx-optimizer
+      # (see third_party/onnx/sbom.cdx.json) -- the SAME version static.yml
+      # already downloads a prebuilt binary for (there for the separate
+      # ORT-web wasm build's bundled protobuf 6.31.1, which is the same
+      # release). Reusing a version-matched prebuilt binary here too, rather
+      # than building protoc from source (build_wasm_pyodide.sh's fallback
+      # when protoc isn't already on PATH), saves ~15 minutes per run.
+      - name: Install protoc 31.1 (matches onnxsim's vendored protobuf)
+        run: |
+          PROTOC_VERSION=31.1
+          curl -sSL -o /tmp/protoc.zip \
+            "https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/protoc-${PROTOC_VERSION}-linux-x86_64.zip"
+          sudo unzip -o /tmp/protoc.zip -d /usr/local bin/protoc 'include/*'
+          sudo chmod +x /usr/local/bin/protoc
+          protoc --version
+
+      # --- Pyodide xbuildenv (target Python headers) -----------------------
+      # A real download (tens of MB), so cache it -- keyed on the installed
+      # pyodide-build's version too, since xbuildenv install compatibility is
+      # checked against it.
+      - name: Get installed pyodide-build version
+        id: pyodide-build-version
+        run: |
+          echo "version=$(python -m pip show pyodide-build | sed -n 's/^Version: //p')" >> "$GITHUB_OUTPUT"
+      - name: Cache Pyodide xbuildenv
+        id: xbuildenv-cache
+        uses: actions/cache@v6
+        with:
+          path: .pyodide-xbuildenv
+          key: pyodide-xbuildenv-${{ env.PYODIDE_VERSION }}-pyodide-build-${{ steps.pyodide-build-version.outputs.version }}
+      - name: Install Pyodide xbuildenv ${{ env.PYODIDE_VERSION }}
+        if: steps.xbuildenv-cache.outputs.cache-hit != 'true'
+        run: pyodide xbuildenv install "${PYODIDE_VERSION}" --path .pyodide-xbuildenv
+      - name: Locate the target Python headers in the xbuildenv
+        run: |
+          PYODIDE_PYTHON_INCLUDE=$(find "$PWD/.pyodide-xbuildenv" -type d -path "*/include/python3.14*" | head -1)
+          if [ -z "$PYODIDE_PYTHON_INCLUDE" ]; then
+            echo "::error::could not find a python3.14* headers dir under .pyodide-xbuildenv (xbuildenv install broken/incomplete?)" >&2
+            find "$PWD/.pyodide-xbuildenv" -maxdepth 6 -type d
+            exit 1
+          fi
+          echo "PYODIDE_PYTHON_INCLUDE=${PYODIDE_PYTHON_INCLUDE}" >> "$GITHUB_ENV"
+          echo "found target Python headers at ${PYODIDE_PYTHON_INCLUDE}"
+
+      # --- ccache (same pattern as static.yml) ------------------------------
+      - name: Prepare ccache timestamp
+        id: ccache_cache_timestamp
+        run: echo "timestamp=$(date -Iseconds)" >> "${GITHUB_OUTPUT}"
+      - name: ccache cache files
+        uses: actions/cache@v6
+        with:
+          path: .ccache
+          key: pyodide-wasm-ccache-${{ steps.ccache_cache_timestamp.outputs.timestamp }}
+          restore-keys: |
+              pyodide-wasm-ccache-
+      - run: |
+          sudo apt install -y ccache
+          which ccache
+          ccache -z
+          echo "CCACHE_DIR=${PWD}/.ccache" >> "${GITHUB_ENV}"
+          echo "CCACHE_MAXSIZE=500M" >> "${GITHUB_ENV}"
+          echo "_EMCC_CCACHE=1" >> "${GITHUB_ENV}"
+
+      # --- emsdk (same clone+install+activate pattern as static.yml) -------
+      - name: Install emsdk ${{ env.EMSCRIPTEN_VERSION }}
+        run: |
+          git clone --depth 1 https://github.com/emscripten-core/emsdk.git
+          ./emsdk/emsdk install "${EMSCRIPTEN_VERSION}"
+          ./emsdk/emsdk activate "${EMSCRIPTEN_VERSION}"
+
+      - name: Build onnxsim's Pyodide side module
+        run: |
+          . ./emsdk/emsdk_env.sh
+          export PYTHON_EXECUTABLE=python3
+          ./build_wasm_pyodide.sh
+          echo "SO_PATH=${PWD}/build-wasm-pyodide/onnxsim_cpp2py_export.abi3.so" >> "$GITHUB_ENV"
+
+      - name: ccache statistics
+        if: always()
+        run: ccache -s
+
+      # --- Structural sanity check ------------------------------------------
+      # The script's own last line already confirms this by construction
+      # (it discovers PyInit_... from the object file to build
+      # -sEXPORTED_FUNCTIONS), but check independently here so a change to
+      # the script that silently breaks this fails the job loudly rather than
+      # only being caught (confusingly) by the import test below.
+      - name: Sanity-check the built module (WebAssembly binary, exports PyInit_onnxsim_cpp2py_export)
+        run: |
+          test -f "${SO_PATH}" || { echo "::error::expected build output not found at ${SO_PATH}"; exit 1; }
+          file "${SO_PATH}"
+          file "${SO_PATH}" | grep -qi "WebAssembly" || { echo "::error::${SO_PATH} is not reported as a WebAssembly binary"; exit 1; }
+          . ./emsdk/emsdk_env.sh
+          NM=$(command -v llvm-nm || true)
+          if [ -z "${NM}" ]; then
+            echo "::warning::llvm-nm not found on PATH after activating emsdk -- skipping export symbol check"
+          else
+            "${NM}" "${SO_PATH}" | grep -q "T PyInit_onnxsim_cpp2py_export" || {
+              echo "::error::${SO_PATH} does not export PyInit_onnxsim_cpp2py_export"
+              exit 1
+            }
+            echo "confirmed: ${SO_PATH} exports PyInit_onnxsim_cpp2py_export"
+          fi
+
+      # --- Integration test: load it in a real Pyodide/Node runtime --------
+      # This is the actual new coverage this workflow adds: everything above
+      # only checks the module's shape, never that it loads and runs.
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+      - name: Install the pyodide npm package (pinned to ${{ env.PYODIDE_VERSION }})
+        run: |
+          mkdir -p /tmp/pyodide-smoke-test-env
+          cd /tmp/pyodide-smoke-test-env
+          npm install --no-save "pyodide@${PYODIDE_VERSION}"
+          # Node resolves a bare `import "pyodide"` relative to the script's
+          # own location, not the process cwd -- copy the test script next to
+          # the node_modules/ we just installed rather than running it from
+          # its checkout path.
+          cp "${GITHUB_WORKSPACE}/scripts/pyodide_smoke_test.mjs" .
+      - name: Import the built module under Pyodide and call a real binding
+        run: |
+          cd /tmp/pyodide-smoke-test-env
+          node ./pyodide_smoke_test.mjs "${SO_PATH}"
