@@ -5,12 +5,13 @@
 #
 # The model below is the same KV-cache attention block used to motivate that
 # work: exported with ``torch.onnx.export(..., dynamo=True)`` and
-# ``torch.export.Dim``, it produces a ``Shape -> Gather -> Add -> Concat ->
-# Reshape`` chain computing ``past_len + seq_len`` (two dynamic dims added
-# together) and ``num_heads * head_dim`` (a dynamic-looking dim times a
-# constant) -- exactly the case plain ONNX data propagation cannot fold
-# because it has no arithmetic over a ``dim_param``, but onnxsim's SymExpr
-# can. Three things are checked:
+# ``torch.export.Dim``, it produces a ``Shape -> Gather -> Add -> Range``
+# chain computing ``past_len + seq_len`` (two dynamic dims added together,
+# feeding the position-aware causal mask's ``torch.arange`` bound) and a
+# ``num_heads * head_dim`` product (a dynamic-looking dim times a constant,
+# merging back into a plain Reshape target) -- exactly the case plain ONNX
+# data propagation cannot fold because it has no arithmetic over a
+# ``dim_param``, but onnxsim's SymExpr can. Three things are checked:
 #
 #   * ``test_onnxsim_removes_kv_cache_shape_scaffolding``: the scaffolding
 #     pattern is actually present in the raw export (a sanity check that
@@ -80,6 +81,7 @@ class _CausalSelfAttentionWithCache(nn.Module):
 
     def forward(self, x, past_key, past_value):
         b, s, h = x.shape
+        past_len = past_key.shape[2]
         q, k, v = self.qkv(x).split(HIDDEN, dim=-1)
 
         def split_heads(t):
@@ -91,8 +93,27 @@ class _CausalSelfAttentionWithCache(nn.Module):
         k = torch.cat([past_key, k], dim=2)
         v = torch.cat([past_value, v], dim=2)
 
+        # A position-aware causal mask, not SDPA's is_causal=True: query i
+        # sits at absolute position past_len+i (it may attend to every key
+        # up to and including its own position), which is the correct,
+        # cache-aware causal rule -- is_causal=True instead assumes the
+        # current chunk's queries start at position 0, which is wrong the
+        # moment past_key is non-empty. Building this mask is also what
+        # forces total_len = past_len + seq_len to be computed as a real
+        # graph value (feeding torch.arange's dynamic length) rather than
+        # staying implicit in Concat's output shape -- i.e. this is the
+        # fix for both the correctness bug and the vacuous scaffolding
+        # check below, together, not a workaround for one at the cost of
+        # the other.
+        total_len = past_len + s
+        query_pos = torch.arange(s, device=x.device) + past_len
+        key_pos = torch.arange(total_len, device=x.device)
+        causal_mask = torch.where(
+            key_pos[None, :] <= query_pos[:, None], 0.0, float("-inf")
+        )
+
         out = torch.nn.functional.scaled_dot_product_attention(
-            q, k, v, is_causal=True
+            q, k, v, attn_mask=causal_mask
         )
         # num_heads * head_dim -> hidden: a dynamic-looking dim times a
         # constant, merging back into a plain Reshape target.
@@ -221,10 +242,10 @@ def test_onnxsim_symexpr_matches_torch_shapeenv_symbols(exported_and_simplified)
 @pytest.mark.parametrize(
     "batch,seq_len,past_len",
     [
-        (1, 4, 0),   # prefill, empty cache
+        (1, 4, 0),  # prefill, empty cache
         (1, 1, 12),  # single-token decode step with a long cache
-        (3, 6, 5),   # batch > 1, both seq_len and past_len nontrivial
-        (2, 1, 0),   # batch > 1, prefill, empty cache
+        (3, 6, 5),  # batch > 1, both seq_len and past_len nontrivial
+        (2, 1, 0),  # batch > 1, prefill, empty cache
     ],
 )
 def test_onnxsim_kv_cache_consistency(
@@ -311,9 +332,7 @@ def test_onnxsim_captures_symbolic_dim_expressions_to_metadata_props(
     simplified.CopyFrom(shared_simplified)
 
     try:
-        captured = _capture_dim_expressions_to_metadata_props(
-            simplified, onnx_program
-        )
+        captured = _capture_dim_expressions_to_metadata_props(simplified, onnx_program)
     except AttributeError as e:
         pytest.skip(
             f"ExportedProgram/ShapeEnv internals didn't match what this "
