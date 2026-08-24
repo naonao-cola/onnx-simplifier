@@ -88,12 +88,20 @@ BUILD_DIR=${BUILD_DIR:-build-wasm-pyodide}
 mkdir -p "$BUILD_DIR"
 cd "$BUILD_DIR"
 
-# Python3_INCLUDE_DIR(S) and Python_INCLUDE_DIRS are all set to the same
-# path deliberately: nanobind's own CMake config reads the undocumented
-# plural "Python3_INCLUDE_DIRS" variable, while onnx-optimizer's
-# CMakeLists.txt does a combined find_package(Python 3 ...) call (singular,
-# unversioned) rather than onnx's own split Interpreter/Development calls --
-# see docs/wasm_pyodide.md.
+# CMake's FindPython, FindPython3, and nanobind's own config each read from
+# a DIFFERENT hint-variable namespace, so all three need to be seeded with
+# the same values or whichever one is missed fails outright:
+#   - onnx's own CMakeLists.txt calls find_package(Python3 ...) (versioned)
+#     -> Python3_EXECUTABLE / Python3_INCLUDE_DIR(S).
+#   - onnx-optimizer's CMakeLists.txt instead calls the GENERIC, UNVERSIONED
+#     find_package(Python 3 ...) -> Python_EXECUTABLE / Python_INCLUDE_DIR,
+#     a separate CMake module with its own variables; passing only the
+#     Python3_* ones leaves this one unable to find Python.Development at
+#     all ("Could NOT find Python (missing: Python_INCLUDE_DIRS
+#     Development.Module)").
+#   - nanobind's own CMake config reads the undocumented plural
+#     "Python_INCLUDE_DIRS" variable specifically.
+# See docs/wasm_pyodide.md.
 emcmake cmake \
     -DONNX_CUSTOM_PROTOC_EXECUTABLE="$PROTOC" \
     -DCMAKE_BUILD_TYPE=Release \
@@ -105,8 +113,11 @@ emcmake cmake \
     -DPython3_EXECUTABLE="$PYTHON_EXECUTABLE" \
     -DPython3_INCLUDE_DIR="$PYODIDE_PYTHON_INCLUDE" \
     -DPython3_INCLUDE_DIRS="$PYODIDE_PYTHON_INCLUDE" \
-    -DPython_INCLUDE_DIRS="$PYODIDE_PYTHON_INCLUDE" \
     -DPython3_FIND_ABI="ANY;ANY;ANY;ANY" \
+    -DPython_EXECUTABLE="$PYTHON_EXECUTABLE" \
+    -DPython_INCLUDE_DIR="$PYODIDE_PYTHON_INCLUDE" \
+    -DPython_INCLUDE_DIRS="$PYODIDE_PYTHON_INCLUDE" \
+    -DPython_FIND_ABI="ANY;ANY;ANY;ANY" \
     "$SCRIPT_DIR"
 
 cmake --build . --target onnxsim_cpp2py_export -j"$(nproc)"

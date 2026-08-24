@@ -48,25 +48,40 @@ mismatches the runtime headers. This script reuses `build_wasm.sh`'s exact
 protoc discovery/build logic (`third_party/onnx/workflow_scripts/protobuf/build_protobuf_unix.sh`)
 rather than duplicating or diverging from it.
 
-### 2. Plumbing target Python headers through CMake's Python3 find logic
+### 2. Plumbing target Python headers through three separate CMake hint namespaces
 
-`ONNXSIM_PYTHON=ON` triggers `find_package(Python ...)` calls in both
-onnxsim's own `CMakeLists.txt` and (transitively) `onnx-optimizer`'s. The
-former correctly splits `Interpreter`/`Development` so a *host* interpreter
-can be used to locate a *target* `Development` (headers), but
-onnx-optimizer's does a single combined `find_package(Python 3 REQUIRED
-COMPONENTS Interpreter Development.Module)` call, which fails outright on a
-version mismatch between the host interpreter it runs and the target headers
-it's pointed at. Two mitigations, both required:
+`ONNXSIM_PYTHON=ON` triggers Python detection in onnxsim's own
+`CMakeLists.txt`, onnx's, onnx-optimizer's, and nanobind's own CMake config --
+and CMake's `FindPython`, `FindPython3`, and nanobind's config each read
+hints from a **different** variable namespace, so missing any one of them
+fails outright even with the other two correctly set:
+
+- onnx's own `CMakeLists.txt` calls the **versioned** `find_package(Python3
+  ...)`, correctly split into `Interpreter`/`Development` -- hints:
+  `Python3_EXECUTABLE`, `Python3_INCLUDE_DIR(S)`.
+- onnx-optimizer's `CMakeLists.txt` instead calls the **generic, unversioned**
+  `find_package(Python 3 REQUIRED COMPONENTS Interpreter
+  Development.Module)` -- a separate CMake module with its own variables:
+  `Python_EXECUTABLE`, `Python_INCLUDE_DIR(S)`. Passing only the `Python3_*`
+  hints leaves this call unable to find `Python.Development` at all
+  (`Could NOT find Python (missing: Python_INCLUDE_DIRS
+  Development.Module)`) -- this only surfaces on a fresh configure with no
+  stale `CMakeCache.txt` from a previous, differently-argued run to paper
+  over it, which is how it slipped past local testing before CI caught it.
+- nanobind's own CMake config reads the undocumented plural
+  `Python_INCLUDE_DIRS` variable specifically (not `Python3_INCLUDE_DIRS`).
+
+So both the versioned and unversioned forms of every hint need to be passed,
+to the same target headers, together with:
 
 - Host and target Python **minor versions must match** (e.g. host
-  `python3.14` for a Pyodide release shipping CPython 3.14.x).
-- The target include dir must be passed as **both** the documented
-  `Python3_INCLUDE_DIR` and the undocumented plural `Python3_INCLUDE_DIRS` /
-  `Python_INCLUDE_DIRS` -- nanobind's own CMake config reads the plural form,
-  which `find_package` alone does not populate consistently across these
-  call sites. `Python3_FIND_ABI=ANY;ANY;ANY;ANY` avoids a strict-ABI mismatch
-  rejection between the host interpreter and the target's ABI tag.
+  `python3.14` for a Pyodide release shipping CPython 3.14.x), since
+  `Python3_EXECUTABLE`/`Python_EXECUTABLE` point at the *host* interpreter
+  CMake actually runs to introspect Python, while the `INCLUDE_DIR(S)` hints
+  point at the *target*'s headers.
+- `Python3_FIND_ABI`/`Python_FIND_ABI` set to `ANY;ANY;ANY;ANY`, to avoid a
+  strict-ABI mismatch rejection between the host interpreter and the
+  target's ABI tag.
 
 ### 3. nanobind 3.0.0's missing `<cstdio>` include
 
