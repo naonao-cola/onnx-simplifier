@@ -29,6 +29,22 @@
 #     ``(batch, seq_len, past_len)`` instantiations, the onnxsim-simplified
 #     ONNX model still matches the original eager PyTorch module -- the
 #     algebra is only useful if simplifying with it never changes behavior.
+#   * ``test_onnxsim_captures_symbolic_dim_expressions_to_metadata_props``:
+#     a *temporary*, purely local prototype of the "persist a resolved
+#     formula" idea from onnxsim/onnx#0008's Future Possibilities section,
+#     using infrastructure the ONNX spec already has today --
+#     ``ValueInfoProto.metadata_props`` (a ``repeated StringStringEntryProto``,
+#     present on ``ValueInfoProto`` since the IR-version-9/10 metadata-props
+#     additions) -- rather than the new field that proposal describes. This
+#     is deliberately *not* a proposal for that exact key/value convention;
+#     it only demonstrates that the annotation is expressible, inert, and
+#     spec-compliant with nothing new to standardize, as one data point for
+#     that future discussion. Scope is limited to the graph's declared
+#     inputs/outputs, where FX values and ONNX ``ValueInfoProto``s can be
+#     correlated reliably (by position, since both come from the same
+#     ``output_names`` list) -- correlating arbitrary *intermediate* values
+#     is exactly the "no FX-name -> ONNX-name correlation" difficulty noted
+#     elsewhere, and is out of scope here.
 #
 # To run locally::
 #
@@ -236,6 +252,111 @@ def test_onnxsim_kv_cache_consistency(
         },
     )
 
+    np.testing.assert_allclose(ref_out.numpy(), got_out, rtol=1e-4, atol=1e-5)
+    np.testing.assert_allclose(ref_k.numpy(), got_k, rtol=1e-4, atol=1e-5)
+    np.testing.assert_allclose(ref_v.numpy(), got_v, rtol=1e-4, atol=1e-5)
+
+
+_OUTPUT_NAMES = ["out", "present_key", "present_value"]
+
+_METADATA_KEY_PREFIX = "onnxsim.symexpr:axis"
+
+
+def _capture_dim_expressions_to_metadata_props(model, onnx_program):
+    """Write each graph *output*'s compound (multi-symbol) dim expressions,
+    as torch.export's own ShapeEnv already computed them, into that
+    ValueInfoProto's ``metadata_props`` -- in place, mutating ``model``.
+
+    Temporary/local prototype only; see the module docstring. Returns
+    ``{(output_name, axis): expr_str}`` for the entries actually written, so
+    a caller can assert on what was captured without re-parsing metadata.
+    """
+    exported_program = onnx_program.exported_program
+    output_node = next(
+        n for n in exported_program.graph_module.graph.nodes if n.op == "output"
+    )
+    fx_outputs = output_node.args[0]
+    assert len(fx_outputs) == len(_OUTPUT_NAMES), (
+        "the FX graph's traced outputs and the ONNX output_names must line "
+        "up positionally -- both come from the same torch.onnx.export call"
+    )
+
+    vi_by_name = {vi.name: vi for vi in model.graph.output}
+    captured = {}
+    for name, fx_val in zip(_OUTPUT_NAMES, fx_outputs):
+        vi = vi_by_name.get(name)
+        val = getattr(fx_val, "meta", {}).get("val") if fx_val is not None else None
+        if vi is None or val is None or not hasattr(val, "shape"):
+            continue
+        for axis, d in enumerate(val.shape):
+            expr = getattr(getattr(d, "node", None), "expr", None)
+            if expr is None or len(getattr(expr, "free_symbols", ())) < 2:
+                continue  # only compound expressions are worth recording
+            entry = vi.metadata_props.add()
+            entry.key = f"{_METADATA_KEY_PREFIX}{axis}"
+            entry.value = str(expr)
+            captured[(name, axis)] = str(expr)
+    return captured
+
+
+def test_onnxsim_captures_symbolic_dim_expressions_to_metadata_props(
+    exported_and_simplified,
+):
+    _, shared_simplified, onnx_program, eager_model = exported_and_simplified
+
+    # The fixture is module-scoped and shared with other tests -- work on a
+    # private copy rather than mutating it in place, so this test's writes
+    # to metadata_props can't leak into or depend on test execution order.
+    simplified = onnx.ModelProto()
+    simplified.CopyFrom(shared_simplified)
+
+    try:
+        captured = _capture_dim_expressions_to_metadata_props(
+            simplified, onnx_program
+        )
+    except AttributeError as e:
+        pytest.skip(
+            f"ExportedProgram/ShapeEnv internals didn't match what this "
+            f"test expects on torch {torch.__version__} ({e})"
+        )
+
+    # present_key/present_value's cache-length axis is past_len + seq_len;
+    # `out`'s dims are each a single symbol or constant, so nothing on it
+    # should be captured.
+    assert captured, "expected at least one compound dim expression"
+    assert all(name != "out" for name, _axis in captured), (
+        "out has no compound-expression dims; capturing something for it "
+        "means the model or the capture logic changed"
+    )
+    assert any("+" in expr for expr in captured.values()), (
+        "expected the past_len+seq_len cache-length expression among the "
+        "captured metadata_props entries"
+    )
+
+    present_key_vi = next(
+        vi for vi in simplified.graph.output if vi.name == "present_key"
+    )
+    keys = {e.key for e in present_key_vi.metadata_props}
+    assert any(k.startswith(_METADATA_KEY_PREFIX) for k in keys)
+
+    # metadata_props is spec-defined, backward-compatible, advisory
+    # metadata: writing it must keep the model valid and must not change
+    # what it computes.
+    onnx.checker.check_model(simplified)
+
+    torch.manual_seed(2)
+    x = torch.randn(2, 3, HIDDEN)
+    past_k = torch.randn(2, NUM_HEADS, 4, HEAD_DIM)
+    past_v = torch.randn(2, NUM_HEADS, 4, HEAD_DIM)
+    with torch.no_grad():
+        ref_out, ref_k, ref_v = eager_model(x, past_k, past_v)
+    session = onnxruntime.InferenceSession(
+        simplified.SerializeToString(), providers=["CPUExecutionProvider"]
+    )
+    got_out, got_k, got_v = session.run(
+        None,
+        {"x": x.numpy(), "past_key": past_k.numpy(), "past_value": past_v.numpy()},
+    )
     np.testing.assert_allclose(ref_out.numpy(), got_out, rtol=1e-4, atol=1e-5)
     np.testing.assert_allclose(ref_k.numpy(), got_k, rtol=1e-4, atol=1e-5)
     np.testing.assert_allclose(ref_v.numpy(), got_v, rtol=1e-4, atol=1e-5)
