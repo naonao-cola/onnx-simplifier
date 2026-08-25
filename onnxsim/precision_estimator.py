@@ -171,7 +171,9 @@ class ModelQuantizationEstimate:
     per_node: List[PrecisionEstimate]
 
 
-def _weight_estimate_from_tuple(t) -> Union[MatMulGemmPrecisionEstimate, ConvPrecisionEstimate]:
+def _weight_estimate_from_tuple(
+    t,
+) -> Union[MatMulGemmPrecisionEstimate, ConvPrecisionEstimate]:
     (
         node_name,
         op_type,
