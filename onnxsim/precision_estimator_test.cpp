@@ -19,6 +19,8 @@
 #include <string>
 #include <vector>
 
+#include "dlpack_dtype.h"
+
 using onnxsim::AttentionPrecisionEstimate;
 using onnxsim::EstimateModelQuantizationDrop;
 using onnxsim::EstimateQuantizationPrecision;
@@ -60,8 +62,21 @@ onnx::TensorProto MakeFloatInitializer(const std::string& name,
   t.set_data_type(onnx::TensorProto::FLOAT);
   for (int64_t d : dims) t.add_dims(d);
   if (raw) {
-    t.set_raw_data(std::string(reinterpret_cast<const char*>(data.data()),
-                               data.size() * sizeof(float)));
+    // ONNX's raw_data wire format is little-endian on every host (see
+    // endian_read.h's doc comment and precision_estimator.cpp's
+    // ReadFloatTensorFlat, which this mirrors on the write side) -- so this
+    // must byte-swap on a big-endian host, not just memcpy the host-native
+    // float bytes verbatim, else this test builds a malformed raw_data blob
+    // that only happens to read back correctly on the little-endian hosts
+    // most CI runs on.
+    std::string bytes(reinterpret_cast<const char*>(data.data()),
+                      data.size() * sizeof(float));
+    if constexpr (!onnxsim::dlpack::kRawDataIsHostOrder) {
+      onnxsim::dlpack::SwapElementBytes(
+          reinterpret_cast<uint8_t*>(bytes.data()), bytes.size(),
+          sizeof(float));
+    }
+    t.set_raw_data(std::move(bytes));
   } else {
     for (float v : data) t.add_float_data(v);
   }
