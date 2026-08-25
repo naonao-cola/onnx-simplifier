@@ -27,6 +27,7 @@ namespace onnxsim {
 //   - fuse_gelu
 //   - fuse_gqa
 //   - fuse_layer_norm
+//   - dynamic_quantize_attention
 //   - dynamic_quantize_matmul
 //   - dynamic_quantize_matmul_integer_to_float
 //   - dynamic_quantize_ternary_matmul

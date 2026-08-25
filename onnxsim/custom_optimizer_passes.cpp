@@ -9,6 +9,7 @@
 #include <string>
 
 #include "onnxoptimizer/optimize.h"
+#include "passes/dynamic_quantize_attention.h"
 #include "passes/dynamic_quantize_matmul.h"
 #include "passes/dynamic_quantize_matmul_integer_to_float.h"
 #include "passes/dynamic_quantize_ternary_matmul.h"
@@ -87,6 +88,7 @@ void RegisterCustomOptimizerPasses() {
     auto& registry = ONNX_NAMESPACE::optimization::Optimizer::passes;
 
     // onnxsim-only rewrites (no built-in of the same name today).
+    RegisterOrReplace<p::DynamicQuantizeAttention>(registry);
     RegisterOrReplace<p::DynamicQuantizeMatMul>(registry);
     RegisterOrReplace<p::DynamicQuantizeMatMulIntegerToFloat>(registry);
     RegisterOrReplace<p::DynamicQuantizeTernaryMatMul>(registry);

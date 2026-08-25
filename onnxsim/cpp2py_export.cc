@@ -384,6 +384,25 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
       },
       "model_bytes"_a);
 
+  // Dynamically quantizes an existing "com.microsoft" Attention node (see
+  // fuse_attention.h -- this does not fuse attention itself) into its
+  // quantized counterpart, QAttention -- see QuantizeAttentionDynamic in
+  // onnxsim.h. Pure graph rewrite: no ModelExecutor or calibration data
+  // needed.
+  m.def(
+      "quantize_attention_dynamic",
+      [](const py::bytes& model_proto_bytes) -> py::bytes {
+        InitEnv();
+        ONNX_NAMESPACE::ModelProto model;
+        ParseProtoFromBytes(&model, model_proto_bytes.c_str(),
+                            model_proto_bytes.size());
+        const auto result = QuantizeAttentionDynamic(model);
+        std::string out;
+        result.SerializeToString(&out);
+        return py::bytes(out.data(), out.size());
+      },
+      "model_bytes"_a);
+
   // Dynamically quantizes MatMul/Gemm nodes whose weight is structurally
   // ternary ({-s, 0, +s} per output column, e.g. BitNet b1.58) into the same
   // DynamicQuantizeLinear/MatMulInteger shape as quantize_dynamic, but with a

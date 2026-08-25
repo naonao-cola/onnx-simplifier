@@ -178,6 +178,28 @@ onnx::ModelProto QuantizeDynamic(const onnx::ModelProto& model);
 onnx::ModelProto QuantizeDynamicMatMulIntegerToFloat(
     const onnx::ModelProto& model);
 
+// Dynamically quantizes an existing "com.microsoft" ``Attention`` node (see
+// ``passes/fuse_attention.h`` -- this does not fuse attention itself, it
+// expects one to already be present) into ``Attention``'s quantized
+// counterpart, ``QAttention``: the merged Q/K/V weight is quantized to INT8
+// ahead of time (per output channel, symmetric, from its static values --
+// no calibration data needed), while the activation is quantized to uint8 in
+// the graph itself via ``DynamicQuantizeLinear``, mirroring
+// ``QuantizeDynamic``'s own scheme. See ``passes/dynamic_quantize_attention.h``
+// for the rewrite itself, including why an uneven ``qkv_hidden_sizes`` split
+// (V's hidden size differing from Q/K's, which plain ``Attention`` allows) is
+// declined.
+//
+// Unlike ``Simplify``, this does not run shape inference, constant folding,
+// fuse_attention, or any other pass -- it applies exactly this one rewrite,
+// once, to a copy of ``model`` (which is left untouched) and returns the
+// result. Call ``Simplify`` first to produce ``Attention`` nodes to quantize
+// if the input model doesn't already have any. Nodes that do not match (no
+// ``Attention`` node, a non-constant or non-2-D weight, a non-float32
+// operand, an opset older than 11, or an uneven ``qkv_hidden_sizes`` split)
+// are left as-is.
+onnx::ModelProto QuantizeAttentionDynamic(const onnx::ModelProto& model);
+
 // Dynamically quantizes every MatMul/"vanilla" Gemm whose constant weight is
 // *structurally ternary* -- every element of every output column is one of
 // {-s, 0, +s} for that column's own scale ``s``, the representation BitNet

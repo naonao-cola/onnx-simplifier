@@ -479,6 +479,48 @@ def quantize_dynamic_matmul_integer_to_float(
     )
 
 
+def quantize_attention_dynamic(
+    model: Union[str, onnx.ModelProto],
+) -> onnx.ModelProto:
+    """
+    Dynamically quantizes every "com.microsoft" ``Attention`` node already
+    present in ``model`` (this does not fuse attention itself -- run
+    :func:`simplify` first to produce ``Attention`` nodes if the input model
+    doesn't already have any; see :mod:`onnxsim`'s ``fuse_attention`` pass)
+    into ``Attention``'s quantized counterpart, ``QAttention``.
+
+    The merged Q/K/V weight is quantized to INT8 ahead of time (per output
+    channel, symmetric, from its static values -- no calibration data is
+    needed), while the activation is quantized to uint8 *in the graph* via
+    ``DynamicQuantizeLinear``, which computes its own scale/zero-point from
+    each run's actual input range -- mirroring :func:`quantize_dynamic`'s own
+    scheme for MatMul/Gemm.
+
+    ``Attention``'s optional ``qkv_hidden_sizes`` attribute lets V's hidden
+    size differ from Q/K's (see :func:`simplify`'s ``fuse_attention`` pass),
+    but ``QAttention``'s schema assumes an even three-way split -- a node
+    with an uneven split is left unquantized rather than guessing how (or
+    whether) the kernel would handle it.
+
+    This is a single, self-contained graph rewrite: unlike :func:`simplify`,
+    it does not run shape inference, constant folding, fuse_attention, or any
+    other pass. Nodes that do not match (no ``Attention`` node, a
+    non-constant or non-2-D weight, a non-float32 activation, an opset older
+    than 11 -- which ``DynamicQuantizeLinear`` requires -- or an uneven
+    ``qkv_hidden_sizes`` split) are left untouched. Consider calling
+    :func:`simplify` before and/or after to produce ``Attention`` nodes and
+    clean up the graph.
+
+    :param model: onnx ModelProto object or file path
+    :returns: the quantized onnx ModelProto
+    """
+    if isinstance(model, str):
+        model = onnx.load(model, load_external_data=False)
+    return onnx.load_from_string(
+        C.quantize_attention_dynamic(model.SerializeToString())
+    )
+
+
 def quantize_ternary(model: Union[str, onnx.ModelProto]) -> onnx.ModelProto:
     """
     Dynamically quantize every MatMul, and every "vanilla" Gemm (transA=0,
