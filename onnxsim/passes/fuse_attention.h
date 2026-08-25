@@ -22,7 +22,17 @@
 //   Q = Reshape(Linear(X, Wq[, Bq]), [B,S,H,D]).Transpose([0,2,1,3])
 //   K = Reshape(Linear(X, Wk[, Bk]), [B,S,H,D]).Transpose([0,2,3,1])
 //   V = Reshape(Linear(X, Wv[, Bv]), [B,S,H,D]).Transpose([0,2,1,3])
-//   scores = (Q @ K) / sqrt(head_size)      -- or `* (1/sqrt(head_size))`
+//   scores = (Q @ K) / sqrt(head_size)      -- or `* (1/sqrt(head_size))`,
+//            or `(Q * sqrt(1/sqrt(head_size))) @ (K * sqrt(1/sqrt(head_size)))`
+//            -- see MatchScaledQKMatMul for why this third, pre-scaled shape
+//            is also handled: it is what `torch.nn.functional.
+//            scaled_dot_product_attention`'s own ONNX export decomposes
+//            into, in both PyTorch's legacy TorchScript and newer dynamo
+//            exporters, once the dynamic Shape/Slice/Cast/Sqrt/... chain
+//            computing that scale from Q's runtime shape is constant-folded
+//            (which happens automatically, earlier in the same simplify()
+//            fixed point this pass itself runs inside, whenever the model's
+//            shapes are static).
 //   attn   = Softmax(scores, axis=-1)
 //   ctx    = (attn @ V).Transpose([0,2,1,3]).Reshape([B,S,H*D])
 //   Y      = Linear(ctx, Wout[, Bout])
@@ -45,7 +55,13 @@
 // [0,2,3,1] (X.Transpose([0,2,1,3]) is the more common overall convention,
 // but the exact spelling of a *second*, standalone "swap the last two axes"
 // transpose that some exporters emit for K specifically is not matched --
-// only the single-transpose-straight-to-[0,2,3,1] form is; see MatchHeadSplit).
+// only the single-transpose-straight-to-[0,2,3,1] form is; see
+// MatchHeadSplit). This is why `scaled_dot_product_attention`'s *dynamo*
+// export (unlike its legacy TorchScript export, which does use the direct
+// [0,2,3,1] form) is not yet handled: it head-splits K the same way as Q/V
+// (perm [0,2,1,3]) and spells the "swap the last two axes for K^T" step
+// separately, as `Reshape -> Transpose -> Reshape` rather than folding it
+// into one 4-D permutation -- left as a follow-up.
 // Only self-attention (Q, K, V all reading the *same* source activation) with
 // no attention mask, no past/present KV cache, and a Softmax over the last
 // axis (`axis=-1` or the input's last dimension index -- both are safe here
@@ -57,6 +73,7 @@
 // Q@K^T dot product to be well-formed); V's hidden size may differ, per
 // `Attention`'s own documented `qkv_hidden_sizes` semantics.
 
+#include <cmath>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -174,6 +191,116 @@ inline bool FetchScalarAsDouble(Value* v, double& out) {
   return false;
 }
 
+// Matches `scores` (Softmax's sole input, already known single-use by the
+// caller) as a scaled Q@K^T dot product, in either of two shapes real
+// exporters produce:
+//
+//  - "post-scaled": scores = Div(QK, c) or Mul(QK, c), where QK is itself a
+//    plain MatMul -- the shape a hand-rolled `(Q @ K) / sqrt(head_size)`
+//    attention implementation emits.
+//  - "pre-scaled": scores = MatMul(Mul(q_side, c), Mul(k_side, c)), i.e. the
+//    same combined scale split as `sqrt(c)` onto each operand *before* the
+//    dot product rather than applied to its result once -- see this file's
+//    top-of-file doc comment for why this is `scaled_dot_product_attention`'s
+//    own decomposition. Both Muls' scalar operands must fetch to the same
+//    value (within a small relative tolerance, since real graphs sometimes
+//    compute the same folded constant via two syntactically distinct nodes
+//    rather than sharing one Value*); an asymmetric split isn't this shape.
+//
+// On success sets `q_side`/`k_side` to the two (not yet head-split-matched)
+// operands and `scale` to the *combined* scale factor (already squared back
+// up in the pre-scaled case, so the caller never needs to know which shape
+// matched). Every node this consumed -- the Div/Mul wrapper and the inner
+// MatMul in the post-scaled case, or the qk MatMul and its two Mul operands
+// in the pre-scaled case -- is appended to `dead_chain` **in a valid destroy
+// order** (each consumer before the producer(s) feeding it: `dead_chain`'s
+// own contract, since the two shapes need opposite relative orders here --
+// post-scaled destroys the Div/Mul *before* the MatMul it wraps, but
+// pre-scaled destroys the MatMul *before* the two Muls feeding *it* -- a
+// single fixed push order in the caller can't satisfy both, so this function
+// owns it instead of returning the qk MatMul node separately).
+inline bool MatchScaledQKMatMul(Value* scores, Value*& q_side, Value*& k_side,
+                                double& scale, std::vector<Node*>& dead_chain) {
+  Node* scores_node = scores->node();
+
+  Value* qk = nullptr;
+  if (CheckKind(scores_node, kDiv) && scores_node->inputs().size() == 2) {
+    double divisor = 0.0;
+    if (FetchScalarAsDouble(scores_node->input(1), divisor) && divisor != 0.0) {
+      qk = scores_node->input(0);
+      scale = 1.0 / divisor;
+    }
+  } else if (CheckKind(scores_node, kMul) &&
+             scores_node->inputs().size() == 2) {
+    for (int i = 0; i < 2; ++i) {
+      double mult = 0.0;
+      if (FetchScalarAsDouble(scores_node->input(1 - i), mult)) {
+        qk = scores_node->input(i);
+        scale = mult;
+        break;
+      }
+    }
+  }
+  if (qk != nullptr) {
+    if (qk->uses().size() != 1 || !CheckKind(qk, kMatMul)) {
+      return false;
+    }
+    Node* mm = qk->node();
+    if (mm->inputs().size() != 2) {
+      return false;
+    }
+    dead_chain.push_back(scores_node);  // consumer of mm's output: first.
+    dead_chain.push_back(mm);
+    q_side = mm->input(0);
+    k_side = mm->input(1);
+    return true;
+  }
+
+  if (!CheckKind(scores_node, kMatMul) || scores_node->inputs().size() != 2) {
+    return false;
+  }
+  double c[2] = {0.0, 0.0};
+  Value* operand[2] = {nullptr, nullptr};
+  Node* muls[2] = {nullptr, nullptr};
+  for (int i = 0; i < 2; ++i) {
+    Value* in = scores_node->input(i);
+    if (in->uses().size() != 1 || !CheckKind(in, kMul)) {
+      return false;
+    }
+    Node* mul = in->node();
+    if (mul->inputs().size() != 2) {
+      return false;
+    }
+    bool found = false;
+    for (int j = 0; j < 2; ++j) {
+      double v = 0.0;
+      if (FetchScalarAsDouble(mul->input(1 - j), v)) {
+        operand[i] = mul->input(j);
+        c[i] = v;
+        found = true;
+        break;
+      }
+    }
+    if (!found) {
+      return false;
+    }
+    muls[i] = mul;
+  }
+  if (std::fabs(c[0] - c[1]) >
+      1e-6 * std::max(std::fabs(c[0]), std::fabs(c[1]))) {
+    return false;
+  }
+  // scores_node (the qk MatMul) consumes both muls' outputs: destroy it
+  // first, then its two (now-unused) producers.
+  dead_chain.push_back(scores_node);
+  dead_chain.push_back(muls[0]);
+  dead_chain.push_back(muls[1]);
+  q_side = operand[0];
+  k_side = operand[1];
+  scale = c[0] * c[1];
+  return true;
+}
+
 // Matches `transposed = Transpose(Reshape(proj_out, [B, S, num_heads,
 // head_size]), want_perm)`, both single-use, extracting num_heads/head_size
 // from the Reshape's constant target-shape input. Appends [transpose,
@@ -211,6 +338,57 @@ inline bool MatchAttentionHeadSplit(Value* transposed, int64_t& num_heads,
   chain.push_back(tr);
   chain.push_back(rs);
   return true;
+}
+
+// `Attention`'s schema requires a rank-3 X input ([batch_size,
+// sequence_length, input_hidden_size]). Q/K/V's shared source is usually
+// exactly the model's own rank-3 activation, but when an earlier fixed-point
+// iteration has already rewritten a MatMul+Add projection into Gemm (Gemm
+// requires 2-D operands, so onnx-optimizer's own fuse_matmul_add_into_gemm
+// flattens a batch/sequence-dim input to 2-D with a Reshape first) before
+// this pass gets its turn -- which for a `torch.nn.functional.
+// scaled_dot_product_attention` export is close to guaranteed: its own scale
+// computation needs an earlier constant-folding pass to resolve before
+// MatchScaledQKMatMul's pattern is even structurally satisfiable, so
+// Gemm-conversion (which has no such prerequisite) reliably wins that race
+// -- `input` ends up rank-2 instead of rank-3.
+//
+// Recovers the original rank-3 activation in that specific case: when
+// `input` is exactly `Reshape(x3, ...)` with `x3` rank-3 and the same
+// trailing (hidden-size) dimension `input` itself has, returns `x3`. This is
+// mathematically transparent to wire into Attention's X input in place of
+// `input` -- fuse_matmul_add_into_gemm's flattening Reshape only ever merges
+// the leading (batch/sequence) dims and keeps the last one, which is exactly
+// what both Gemm's row-wise application and Attention's own per-token QKV
+// projection already treat those leading dims as, so there is nothing to
+// numerically "correct for", just a different, already-live Value* for the
+// same quantity. Falls through to returning `input` unchanged -- rank-3,
+// rank-2, or otherwise -- whenever this specific shape isn't matched; the
+// caller still validates the final rank itself.
+inline Value* RecoverRank3AttentionInput(Value* input) {
+  if (input->has_sizes() && input->sizes().size() == 3) {
+    return input;
+  }
+  if (!input->has_sizes() || input->sizes().size() != 2 ||
+      !CheckKind(input, kReshape)) {
+    return input;
+  }
+  Node* rs = input->node();
+  if (rs->inputs().size() != 2) {
+    return input;
+  }
+  Value* x3 = rs->input(0);
+  if (!x3->has_sizes() || x3->sizes().size() != 3) {
+    return input;
+  }
+  const Dimension& last3 = x3->sizes()[2];
+  const Dimension& last2 = input->sizes()[1];
+  if (last3.is_int != last2.is_int ||
+      (last3.is_int && last3.dim != last2.dim) ||
+      (!last3.is_int && last3.param != last2.param)) {
+    return input;
+  }
+  return x3;
 }
 
 struct AttentionMatch {
@@ -291,45 +469,18 @@ inline bool MatchAttention(Node* n, AttentionMatch& m) {
     return false;
   }
 
-  Node* scores_node = scores->node();
-  Value* qk = nullptr;
-  if (CheckKind(scores_node, kDiv) && scores_node->inputs().size() == 2) {
-    double divisor = 0.0;
-    if (!FetchScalarAsDouble(scores_node->input(1), divisor) ||
-        divisor == 0.0) {
-      return false;
-    }
-    qk = scores_node->input(0);
-    m.scale = 1.0 / divisor;
-  } else if (CheckKind(scores_node, kMul) &&
-             scores_node->inputs().size() == 2) {
-    for (int i = 0; i < 2; ++i) {
-      double mult = 0.0;
-      if (FetchScalarAsDouble(scores_node->input(1 - i), mult)) {
-        qk = scores_node->input(i);
-        m.scale = mult;
-        break;
-      }
-    }
-    if (qk == nullptr) {
-      return false;
-    }
-  } else {
-    return false;
-  }
-  if (qk->uses().size() != 1 || !CheckKind(qk, kMatMul)) {
-    return false;
-  }
-  Node* qk_mm = qk->node();
-  if (qk_mm->inputs().size() != 2) {
+  Value* q_side = nullptr;
+  Value* k_side = nullptr;
+  std::vector<Node*> scale_chain;
+  if (!MatchScaledQKMatMul(scores, q_side, k_side, m.scale, scale_chain)) {
     return false;
   }
 
   std::vector<Node*> q_head_chain;
   Value* q_proj_out = nullptr;
   int64_t q_heads = 0, q_head_size = 0;
-  if (!MatchAttentionHeadSplit(qk_mm->input(0), q_heads, q_head_size,
-                               q_proj_out, {0, 2, 1, 3}, q_head_chain) ||
+  if (!MatchAttentionHeadSplit(q_side, q_heads, q_head_size, q_proj_out,
+                               {0, 2, 1, 3}, q_head_chain) ||
       !MatchAttentionProjection(q_proj_out, m.q)) {
     return false;
   }
@@ -337,8 +488,8 @@ inline bool MatchAttention(Node* n, AttentionMatch& m) {
   std::vector<Node*> k_head_chain;
   Value* k_proj_out = nullptr;
   int64_t k_heads = 0, k_head_size = 0;
-  if (!MatchAttentionHeadSplit(qk_mm->input(1), k_heads, k_head_size,
-                               k_proj_out, {0, 2, 3, 1}, k_head_chain) ||
+  if (!MatchAttentionHeadSplit(k_side, k_heads, k_head_size, k_proj_out,
+                               {0, 2, 3, 1}, k_head_chain) ||
       !MatchAttentionProjection(k_proj_out, m.k)) {
     return false;
   }
@@ -350,6 +501,16 @@ inline bool MatchAttention(Node* n, AttentionMatch& m) {
 
   if (m.q.input != m.k.input || m.q.input != m.v.input) {
     return false;  // Self-attention only: Q/K/V share the same source.
+  }
+  m.q.input = m.k.input = m.v.input = RecoverRank3AttentionInput(m.q.input);
+  // `Attention`'s schema requires a rank-3 X input ([batch_size,
+  // sequence_length, input_hidden_size]) -- if RecoverRank3AttentionInput
+  // could not find one (see its own doc comment for when/why this happens),
+  // firing anyway would emit a shape-invalid Attention node (rejected at
+  // load time by a real runtime) rather than a wrong-but-loadable one, so
+  // this declines conservatively instead of guessing further.
+  if (!m.q.input->has_sizes() || m.q.input->sizes().size() != 3) {
+    return false;
   }
 
   const bool any_bias =
@@ -365,8 +526,7 @@ inline bool MatchAttention(Node* n, AttentionMatch& m) {
   m.dead_chain.push_back(softmax);
   for (Node* nd : v_head_chain) m.dead_chain.push_back(nd);
   for (Node* nd : m.v.chain) m.dead_chain.push_back(nd);
-  m.dead_chain.push_back(scores_node);
-  m.dead_chain.push_back(qk_mm);
+  for (Node* nd : scale_chain) m.dead_chain.push_back(nd);
   for (Node* nd : q_head_chain) m.dead_chain.push_back(nd);
   for (Node* nd : m.q.chain) m.dead_chain.push_back(nd);
   for (Node* nd : k_head_chain) m.dead_chain.push_back(nd);
@@ -493,7 +653,10 @@ struct FuseAttention final : public PredicateBasedPass {
     attn->is_(Symbol("qkv_hidden_sizes"), std::vector<int64_t>{nq, nk, nv});
     attn->setDomain("com.microsoft");
     attn->insertBefore(n);
-    attn->output()->copyMetadata(n->output());
+    // No copyMetadata here: `attn`'s output is always rank-3
+    // ([batch_size, sequence_length, hidden_size], per Attention's own
+    // schema), which is not necessarily n's own shape -- see the Reshape
+    // built below. Left for the next shape-inference pass to (re)infer.
 
     bool has_ms_domain = false;
     for (const OpSetID& opset : graph.opset_versions_mutable()) {
@@ -506,12 +669,32 @@ struct FuseAttention final : public PredicateBasedPass {
       graph.opset_versions_mutable().emplace_back("com.microsoft", 1);
     }
 
-    // `n` (the ctx-producing Reshape) is fully replaced by `attn`'s output
-    // -- whatever consumed `ctx` (the untouched output projection) now
-    // reads straight from `attn` -- and destroyed by the pass driver below
+    // `n`'s own target shape (its second input) is reused, unchanged, to
+    // reshape `attn`'s raw output into whatever shape `n`'s consumers
+    // actually expect -- almost always identical to `attn`'s own natural
+    // [B,S,H*D] shape (a cheap identity reshape onnx-optimizer's own
+    // eliminate_nop_reshape prunes in a later fixed-point iteration), but
+    // when an earlier iteration has already collapsed `n`'s reshape target
+    // together with a downstream Gemm's own input-flattening reshape into
+    // one direct-to-2-D [B*S,H*D] target, substituting `attn`'s raw output
+    // for every use of `n` directly (the way this used to work) would
+    // silently mismatch that shape. Reusing `n`'s own target value here --
+    // rather than assuming it is always the "natural" 3-D one -- is correct
+    // either way, since it is simply whatever `n` already reshaped this same
+    // ctx data into.
+    Value* n_shape = n->input(1);
+    Node* reshape_out = graph.create(Symbol("Reshape"), 1);
+    reshape_out->addInput(attn->output());
+    reshape_out->addInput(n_shape);
+    reshape_out->insertBefore(n);
+    reshape_out->output()->copyMetadata(n->output());
+
+    // `n` is fully replaced by `reshape_out`'s output -- whatever consumed
+    // `ctx` (the untouched output projection) now reads straight from it --
+    // and `n` itself is destroyed by the pass driver below
     // (destroy_current = DestroyOne), the same idiom fuse_rms_norm.h and
     // fuse_add_bias_into_conv.h use for their own anchors.
-    if (!tryReplacingAllUsesWith(n, attn)) {
+    if (!tryReplacingAllUsesWith(n, reshape_out)) {
       return false;
     }
 
