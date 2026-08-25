@@ -218,11 +218,15 @@ def main(argv):
         )
 
     # --- Aggregate: which span dominates across the whole sampled set ------- #
+    # Same reasoning as the per-model "dominant span" above: exclude wrapper
+    # spans, or e.g. OptAndShape (which contains ~all of Optimize's time)
+    # would double-count against it and the percentages below wouldn't mean
+    # what they say.
     totals = {}
     for m in models:
         for name, a in m["spans"].items():
-            if name in ("Simplify", "Pipeline"):
-                continue  # wrappers, not independent cost
+            if name in WRAPPER_SPANS:
+                continue
             totals[name] = totals.get(name, 0.0) + a["wall_ms"]
     grand_total = sum(m["root"]["wall_ms"] for m in models) or 1.0
     if totals:
