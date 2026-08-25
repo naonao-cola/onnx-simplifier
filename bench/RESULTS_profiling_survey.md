@@ -48,9 +48,14 @@ does its *own* internal `SerializeToString()` to hand the model to the C++ check
 **This directly costs the regression harness itself:** `scripts/regression/worker.py`
 loaded every model into a `ModelProto` before calling `simplify()`, taking the slow
 path on every run, including the timings that seed `models.json`'s
-`baseline_seconds` (shard balancing) and the `known_slow` classification. Fixed in
-this change (see below) by passing the path straight through, which lets large
-models take the C++ core's existing fast path (`C.simplify_path`) instead.
+`baseline_seconds` (shard balancing) and the `known_slow` classification. Both
+gaps are fixed in this change: `worker.py` now passes the path straight through
+(letting large models take the C++ core's existing fast path, `C.simplify_path`),
+and `simplify()` itself no longer makes `onnx.checker.check_model()` re-serialize a
+model it had already serialized moments earlier. Measured together with `cProfile`
+on `mvp_Opset18` (the sample's largest model, immune to this host's wall-clock
+noise -- see below): **99.86s -> 37.98s, a 2.6x reduction**, with `SerializeToString`
+no longer appearing anywhere in `simplify()`'s or `check_model()`'s call graph.
 
 ## Profiled-span coverage vs. total wall time
 
@@ -136,17 +141,59 @@ via `known_slow: true` (`longt5_Opset17`, `resnetv2_50x3_bitm_Opset17`, both cap
 at the 900s known-slow ceiling) -- worth re-measuring baselines after this change
 lands to see whether either can move back into the regular shards.
 
+## Second fix: `check_model()` was re-serializing a model we'd already serialized
+
+The first fix's own `cProfile` breakdown pointed at a second, separate cost:
+`onnx.checker.check_model()` -- which always runs, even at the default `check_n=0`
+-- was paying its *own* `SerializeToString()` (13.18s of `mvp_Opset18`'s time)
+because `model_checking.compare()` handed it an already-*deserialized*
+`ModelProto`, moments after `simplify()` had a serialized copy in hand (the bytes
+`C.simplify()` returned, or the file `C.simplify_path` had just written) and threw
+it away. `onnx.checker.check_model()`'s own dispatch (`onnx/checker.py`) already
+special-cases this: given a path it calls `C.check_model_path` (no Python
+serialization at all); given `bytes` it uses them as-is; only a `ModelProto`
+triggers `SerializeToString()`.
+
+Fixed by passing the bytes/path straight through to `model_checking.compare()`
+instead of the freshly-loaded `ModelProto`, in both `simplify()` fast-path branches
+and the slow path when `check_n == 0`. Safe because `compare()` only touches
+`model_opt` for the `check_model()` call at `check_n == 0` -- the per-trial
+inference loop that needs a real `ModelProto` never runs. The one exception is the
+custom-domain-op tolerance scan (`_custom_default_domain_ops`, for models like a
+TensorRT `BatchedNMS_TRT` plugin exported into the default domain -- issues #107,
+#220), which does need a real `ModelProto` to walk the graph; it only runs on a
+`checker.ValidationError`, so `model_checking.compare()` now materializes one
+lazily right there instead of unconditionally up front. Verified both custom-op
+scenarios (`ModelProto` input and path input, exercising both fast-path branches)
+still resolve to `check_ok=True` with the op preserved.
+
+**Combined effect, measured with `cProfile` (not wall-clock -- see below) on
+`mvp_Opset18`:** before either fix (`onnx.load()` + `simplify(model)`, what
+`worker.py` used to do), `simplify()`'s own call tree took **99.86s**, with
+`SerializeToString` alone accounting for 33.17s across three sources (11.66s
+`simplify()`'s model->bytes, 13.18s `check_model`'s model_opt->bytes, ~8.3s
+per-tensor constant-fold outputs). After both fixes (`simplify(path)`), the same
+model takes **37.98s** total -- a **2.6x** reduction -- and `SerializeToString` no
+longer appears as a caller of either `simplify()` or `check_model()` at all;
+`check_model`'s cumulative time drops from 14.64s to **5.98s**, all of it now the
+checker's actual C++ validation work rather than marshalling.
+
+We report this pair as `cProfile` call counts rather than wall-clock seconds
+specifically because the host's own variance (documented throughout this report)
+is large enough to make a single before/after wall-clock pair unpersuasive on its
+own; call-graph attribution is immune to that noise and shows the same functions
+(`SerializeToString` inside `simplify()` and inside `check_model()`) simply
+stopped being called, which wall-clock numbers alone couldn't prove as cleanly.
+
 ## What's still open
 
-`onnx.checker.check_model()`'s own internal `SerializeToString()` (~13s of
-`mvp_Opset18`'s ~53s fast-path time in the trial above) is a separate cost, paid
-unconditionally by `simplify()` even at `check_n=0`, and is itself invisible to
-`ONNXSIM_PROFILE` since it runs entirely in Python via `model_checking.compare()`,
-never inside the profiled `Simplify()` call. Unlike the marshalling gap above, this
-one isn't obviously avoidable -- the checker call is real validation, not
-incidental overhead -- so it wasn't touched here. It's the natural next lever once
-the harness's own numbers reflect the fix above rather than being dominated by it:
-worth its own profiling pass (does the checker's cost scale with tensor bytes the
-same way, and is there a cheaper validation mode for the "just want structural
-sanity, not a byte-for-byte round trip" case `simplify()` needs here) once it's
-the largest remaining unaccounted-for cost rather than the second-largest.
+With both marshalling costs gone, `mvp_Opset18`'s remaining ~38s is dominated by
+`simplify()`'s own frame (~30.6s `tottime`, i.e. time cProfile can't attribute to
+a named sub-call) -- the actual C++ `Simplify()` core plus the C++-side file
+read/parse/write around it, `check_model`'s genuine validation work (~6s), and
+`onnx.load()` of the result (~1.2s). None of that is obviously more marshalling to
+cut; it looks like real work on a large model. The natural next step is re-running
+this same survey against the harness's *own* numbers once `models.json`'s
+`baseline_seconds` are refreshed with these fixes in place, to see which models
+(if any) still stand out disproportionately to their node count -- that would
+point at the next real algorithmic bottleneck rather than another marshalling gap.
