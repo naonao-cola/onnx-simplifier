@@ -268,3 +268,163 @@ def test_quantize_dynamic_composes_with_fuse_rope():
     angle = rng.standard_normal((B, S, half)).astype(np.float32)
     feeds = {"x": x, "angle": angle}
     _assert_close(_run(simplified, feeds), _run(quantized, feeds))
+
+
+# --------------------------------------------------------------------------- #
+# The models above are hand-built with ``onnx.helper`` (this module's own
+# established convention, and every other pass-isolated test file's), which
+# mirrors what a real trace produces but isn't one. These two tests trace a
+# real ``torch.onnx.export`` model for each fusion instead, to confirm the
+# composition on the genuine article -- requested during review of the
+# hand-built-only version of this file.
+# --------------------------------------------------------------------------- #
+torch = pytest.importorskip("torch")
+import torch.nn as nn  # noqa: E402  (after the torch importorskip guard)
+
+
+def _repeat_kv(x, n_rep):
+    B, NKV, S, D = x.shape
+    if n_rep == 1:
+        return x
+    x = x[:, :, None, :, :].expand(B, NKV, n_rep, S, D)
+    return x.reshape(B, NKV * n_rep, S, D)
+
+
+class _TorchGQAAttention(nn.Module):
+    def __init__(self, hidden=64, num_heads=8, num_kv_heads=2, seq_len=6):
+        super().__init__()
+        self.num_heads = num_heads
+        self.num_kv_heads = num_kv_heads
+        self.head_dim = hidden // num_heads
+        self.n_rep = num_heads // num_kv_heads
+        self.q_proj = nn.Linear(hidden, num_heads * self.head_dim, bias=False)
+        self.k_proj = nn.Linear(hidden, num_kv_heads * self.head_dim, bias=False)
+        self.v_proj = nn.Linear(hidden, num_kv_heads * self.head_dim, bias=False)
+        self.o_proj = nn.Linear(num_heads * self.head_dim, hidden, bias=False)
+        # A *baked* (buffer, not runtime-input) causal mask -- fuse_gqa only
+        # fires when the additive mask is a provable constant matching the
+        # causal pattern exactly (GroupQueryAttention applies causal masking
+        # internally and unconditionally; see fuse_gqa.h's own top comment).
+        mask = torch.zeros(1, 1, seq_len, seq_len)
+        mask.masked_fill_(
+            torch.triu(torch.ones(seq_len, seq_len), diagonal=1).bool(), -3.0e38
+        )
+        self.register_buffer("mask", mask, persistent=True)
+
+    def forward(self, x):
+        B, S, H = x.shape
+        q = self.q_proj(x).view(B, S, self.num_heads, self.head_dim).transpose(1, 2)
+        k = self.k_proj(x).view(B, S, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        v = self.v_proj(x).view(B, S, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        k = _repeat_kv(k, self.n_rep)
+        v = _repeat_kv(v, self.n_rep)
+        scores = torch.matmul(q, k.transpose(-2, -1)) / (self.head_dim**0.5)
+        scores = scores + self.mask
+        probs = torch.softmax(scores, dim=-1)
+        ctx = (
+            torch.matmul(probs, v)
+            .transpose(1, 2)
+            .reshape(B, S, self.num_heads * self.head_dim)
+        )
+        return self.o_proj(ctx)
+
+
+def test_quantize_dynamic_composes_with_fuse_gqa_real_torch_export(tmp_path):
+    B, S, H = 2, 6, 64
+    model_module = _TorchGQAAttention(hidden=H, seq_len=S).eval()
+    x = torch.randn(B, S, H)
+    onnx_path = str(tmp_path / "gqa.onnx")
+    torch.onnx.export(
+        model_module,
+        (x,),
+        onnx_path,
+        input_names=["x"],
+        output_names=["y"],
+        dynamo=False,
+        opset_version=17,
+    )
+    exported = onnx.load(onnx_path)
+
+    simplified, ok = onnxsim.simplify(exported)
+    assert ok
+    assert _op_counts(simplified)["GroupQueryAttention"] == 1
+
+    quantized = onnxsim.quantize_dynamic(simplified)
+    onnx.checker.check_model(quantized)
+    ops = _op_counts(quantized)
+    assert ops["GroupQueryAttention"] == 1
+    assert ops["MatMul"] == 0
+
+    x_np = x.numpy()
+    _assert_close(_run(exported, {"x": x_np}), _run(simplified, {"x": x_np}), tol=1e-4)
+    _assert_close(_run(simplified, {"x": x_np}), _run(quantized, {"x": x_np}))
+
+
+def _torch_rotate_half(x):
+    x1 = x[..., : x.shape[-1] // 2]
+    x2 = x[..., x.shape[-1] // 2 :]
+    return torch.cat((-x2, x1), dim=-1)
+
+
+class _TorchRoPEProjection(nn.Module):
+    def __init__(self, hidden=64, num_heads=4):
+        super().__init__()
+        self.num_heads = num_heads
+        self.head_dim = hidden // num_heads
+        self.q_proj = nn.Linear(hidden, hidden, bias=False)
+        self.k_proj = nn.Linear(hidden, hidden, bias=False)
+        inv_freq = 1.0 / (
+            10000 ** (torch.arange(0, self.head_dim, 2).float() / self.head_dim)
+        )
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+
+    def forward(self, x, position_ids):
+        B, S, H = x.shape
+        q = self.q_proj(x).view(B, S, self.num_heads, self.head_dim).transpose(1, 2)
+        k = self.k_proj(x).view(B, S, self.num_heads, self.head_dim).transpose(1, 2)
+        angle = position_ids[:, :, None].float() * self.inv_freq[None, None, :]
+        emb = torch.cat((angle, angle), dim=-1)
+        cos, sin = emb.cos()[:, None], emb.sin()[:, None]
+        q_embed = q * cos + _torch_rotate_half(q) * sin
+        k_embed = k * cos + _torch_rotate_half(k) * sin
+        return q_embed, k_embed
+
+
+def test_quantize_dynamic_composes_with_fuse_rope_real_torch_export(tmp_path):
+    from onnx import version_converter
+
+    B, S, H = 2, 6, 64
+    model_module = _TorchRoPEProjection(hidden=H).eval()
+    x = torch.randn(B, S, H)
+    position_ids = torch.arange(S)[None].expand(B, S).contiguous()
+    onnx_path = str(tmp_path / "rope.onnx")
+    torch.onnx.export(
+        model_module,
+        (x, position_ids),
+        onnx_path,
+        input_names=["x", "position_ids"],
+        output_names=["q_embed", "k_embed"],
+        dynamo=False,
+        opset_version=17,
+    )
+    exported = onnx.load(onnx_path)
+    # RotaryEmbedding needs opset >= 23 (see fuse_rope.h); the legacy
+    # exporter's own ops are all opset<=17-compatible, so upgrading the
+    # *declared* opset via onnx's own version_converter is safe here.
+    exported23 = version_converter.convert_version(exported, 23)
+    exported23.ir_version = 11
+    onnx.checker.check_model(exported23)
+
+    simplified, ok = onnxsim.simplify(exported23)
+    assert ok
+    assert _op_counts(simplified)["RotaryEmbedding"] == 2
+
+    quantized = onnxsim.quantize_dynamic(simplified)
+    onnx.checker.check_model(quantized)
+    ops = _op_counts(quantized)
+    assert ops["RotaryEmbedding"] == 2
+    assert ops["MatMul"] == 0
+
+    feeds = {"x": x.numpy(), "position_ids": position_ids.numpy().astype(np.int64)}
+    _assert_close(_run(exported23, feeds), _run(simplified, feeds), tol=1e-4)
+    _assert_close(_run(simplified, feeds), _run(quantized, feeds))
