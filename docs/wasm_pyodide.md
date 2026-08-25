@@ -12,10 +12,12 @@ covers.
 
 **What's still open**: this verifies the low-level nanobind extension
 module alone, not the full `import onnxsim` / `onnxsim.simplify()` --
-`onnxsim` the pure-Python package additionally needs `onnx` and `rich`
-present inside the Pyodide environment (e.g. via `micropip`), which nothing
-here has attempted yet. Treat the extension itself as proven; the full
-package experience as not yet exercised.
+checked directly (not left unattempted): `onnx`'s only PyPI wasm wheel is
+tagged for a Pyodide ABI epoch this toolchain's Pyodide release doesn't
+match, so `import onnx` itself isn't currently possible inside Pyodide. See
+"Browser demo" below for the details and for what a real, working demo
+built on the confirmed-working extension alone looks like
+(`scripts/pyodide_demo/index.html`).
 
 ## What this is
 
@@ -174,7 +176,61 @@ xbuildenv headers), and `scripts/pyodide_smoke_test.mjs` confirms
 onnx-optimizer's real registered passes under a real Pyodide 314.0.5
 runtime. See the "Status" section at the top of this doc.
 
-Still not done: a full `import onnxsim` / `onnxsim.simplify()` integration
-test, which additionally needs `onnx` and `rich` installed inside the
-Pyodide environment (e.g. via `micropip`) -- a separate, not-yet-attempted
-step from verifying the compiled extension itself.
+## Browser demo
+
+`scripts/pyodide_demo/index.html` is a self-contained, client-side-only demo
+page: drop in a real `.onnx` file, run one of onnxsim's native
+quantization/precision-conversion passes on it (weight-only int8/int4/
+int16/block, dynamic, ternary, bf16/fp16/fp8), see real before/after size
+and op-count deltas, download the result. Everything runs in the browser via
+Pyodide 314.0.5 -- no server involved.
+
+**To try it:**
+
+```sh
+# 1. Build the extension (see "Building" above), or download a recent build
+#    from the "Upload the built module as a workflow artifact" step of a
+#    pyodide-wasm.yml CI run instead of building locally.
+# 2. Put it next to the demo page:
+cp <BUILD_DIR>/onnxsim_cpp2py_export.abi3.so scripts/pyodide_demo/
+# 3. Serve the directory (opening the file directly won't work -- the page
+#    fetches the .so over HTTP):
+python3 -m http.server -d scripts/pyodide_demo 8000
+# 4. Open http://localhost:8000/ and click "Load runtime".
+```
+
+**Why this demo doesn't run full `onnxsim.simplify()`**: that needs
+`import onnx` (`onnx.checker`, `onnx.shape_inference`, and a Python-side
+`PyModelExecutor` for constant folding), which needs the `onnx` package
+present inside Pyodide too -- checked directly, not assumed. PyPI's only
+`onnx` wasm wheel (`onnx-1.22.0-cp312-abi3-pyemscripten_2025_0_wasm32.whl`)
+is tagged for Pyodide's ABI epoch `2025_0`; Pyodide 314.0.5 (the release
+this repo's toolchain targets, per `sysconfig.get_config_var
+("PYODIDE_ABI_VERSION")`) is epoch `2026_0`, so `micropip.install("onnx")`
+fails outright:
+
+```
+ValueError: Wheel was built with Emscripten vpyemscripten.2025.0 but
+Pyodide was built with Emscripten v5.0.3
+```
+
+No other onnx release on PyPI has a matching-epoch wheel. Bypassing that
+check doesn't help either: onnx's own `numpy`/`protobuf`/`ml_dtypes`
+dependencies have no wasm wheels on PyPI at all -- only inside Pyodide's own
+CDN-hosted package repository, which onnx isn't part of. This is a real,
+structural gap in the current wasm packaging ecosystem, not a quick fix
+available to onnxsim.
+
+What the demo runs instead is real: several bindings in
+`onnxsim/cpp2py_export.cc` (`_list_optimizers`, `_model_metrics`, and the
+`quantize_*` passes) operate directly on raw serialized ONNX `ModelProto`
+bytes using onnxsim's own *statically-linked* copy of onnx/onnx-optimizer/
+protobuf, and need no Python `onnx` package at all.
+
+**Hosting is provisional**: the page fetches `./onnxsim_cpp2py_export.abi3.so`
+as a same-directory relative path. That `.so` is not committed (like every
+other `*.so` in this repo, it's gitignored) -- get one via the CI artifact
+or a local build, as above. It is not yet wired into this repo's GitHub
+Pages deployment (`static.yml`, which currently deploys the unrelated
+ORT-web/JS convertmodel demo) -- doing that is a real follow-up, not
+attempted here.

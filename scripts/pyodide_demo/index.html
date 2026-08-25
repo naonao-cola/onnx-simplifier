@@ -1,0 +1,606 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>onnxsim WebAssembly demo (Pyodide, extension-only)</title>
+<!--
+  onnxsim / Pyodide browser demo -- PROVISIONAL, experimental, additive to
+  onnxsim/onnxsim#696. Not wired into any build; open this file directly (or
+  via a static file server) to try it.
+
+  SCOPE, and why it stops where it does
+  ======================================
+  The goal was a page where you drop in an .onnx file and get back a
+  simplified one via the real `onnxsim.simplify()` Python entry point,
+  running entirely client-side in Pyodide. That was verified NOT to be
+  possible yet, for a concrete, checked-not-assumed reason:
+
+    `onnxsim.simplify()` needs `import onnx` (onnx.checker, onnx.shape_inference,
+    and a PyModelExecutor built on top of it). The only onnx wasm wheel on PyPI
+    (onnx 1.22.0, `onnx-1.22.0-cp312-abi3-pyemscripten_2025_0_wasm32.whl`) is
+    tagged for Pyodide's ABI epoch "2025_0". This page loads Pyodide 314.0.5 --
+    the same release this repo's own CI (.github/workflows/pyodide-wasm.yml)
+    builds and tests onnxsim's extension against -- whose own ABI epoch is
+    "2026_0" (confirmed via `sysconfig.get_config_var("PYODIDE_ABI_VERSION")`
+    inside that exact Pyodide build). micropip's own compatibility check
+    rejects the wheel outright:
+
+      ValueError: Wheel was built with Emscripten vpyemscripten.2025.0 but
+      Pyodide was built with Emscripten v5.0.3
+
+    No other onnx release on PyPI has a matching wheel. Bypassing the check
+    (monkeypatching micropip's tag gate, as an investigative-only test, NOT
+    done by this page) doesn't help either: onnx's own hard dependencies --
+    numpy, protobuf, ml_dtypes -- have NO wasm/emscripten wheels on PyPI at
+    all (checked via PyPI's JSON API); they exist only inside Pyodide's own
+    package repository (loaded from a CDN). So this is a real, structural gap
+    in the current wasm packaging ecosystem, not a one-line fix here.
+
+  What IS proven and IS what this page actually does: onnxsim's own compiled
+  extension (`onnxsim_cpp2py_export`, built by `build_wasm_pyodide.sh` for
+  wasm32-emscripten -- see docs/wasm_pyodide.md) loads and runs for real
+  inside a real Pyodide 314.0.5 runtime, and several of its bindings
+  (onnxsim/cpp2py_export.cc) operate directly on raw serialized ONNX
+  `ModelProto` bytes using onnxsim's own *statically-linked* copy of onnx/
+  onnx-optimizer/protobuf -- they need NO Python `onnx` package at all:
+  `_list_optimizers`, `_model_metrics`, and the calibration-free `quantize_*`
+  passes (weight-only int8/int4/int16/block-int8, dynamic, ternary, bf16,
+  fp16, fp8). That's real, working, in-browser ONNX model transformation --
+  just not full `simplify()` (which specifically needs onnx.shape_inference
+  and a Python-side model executor for constant folding).
+
+  HOSTING, honestly -- this is provisional
+  ==========================================
+  This page fetches `./onnxsim_cpp2py_export.abi3.so` (a same-directory,
+  relative path) -- co-located next to this HTML file in this PR's working
+  tree rather than solved as a real release/CDN/GitHub-Pages artifact. That's
+  a deliberate, called-out shortcut: it works for local testing (a static
+  file server rooted at this directory) and would work as-is if this
+  directory were published via GitHub Pages (static.yml), but is NOT a real
+  distribution story (versioning, cache-busting, artifact provenance are all
+  unaddressed). Pyodide itself is loaded from the real jsdelivr CDN
+  (cdn.jsdelivr.net/pyodide/v314.0.5/full/), matching the URL format Pyodide's
+  own loader constructs internally for this exact version.
+-->
+<style>
+  :root {
+    --bg: #0f1220;
+    --panel: #171b2e;
+    --panel-2: #1f2440;
+    --border: #2c3358;
+    --text: #e7e9f5;
+    --text-dim: #9aa2c7;
+    --accent: #7c9fff;
+    --accent-2: #6ee7b7;
+    --warn: #f5a623;
+    --err: #ff6b6b;
+    --ok: #6ee7b7;
+    --mono: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; padding: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  }
+  body { min-height: 100vh; }
+  .wrap { max-width: 900px; margin: 0 auto; padding: 28px 20px 60px; }
+  h1 { font-size: 22px; margin: 0 0 4px; }
+  .subtitle { color: var(--text-dim); font-size: 14px; margin: 0 0 20px; }
+  .scope-banner {
+    border: 1px solid var(--border);
+    background: linear-gradient(180deg, rgba(245,166,35,0.10), rgba(245,166,35,0.03));
+    border-left: 3px solid var(--warn);
+    border-radius: 8px;
+    padding: 14px 16px;
+    margin-bottom: 20px;
+    font-size: 13.5px;
+    line-height: 1.55;
+  }
+  .scope-banner b { color: var(--warn); }
+  .scope-banner code { background: rgba(255,255,255,0.08); padding: 1px 5px; border-radius: 4px; font-family: var(--mono); font-size: 12.5px; }
+  .scope-banner details { margin-top: 8px; }
+  .scope-banner summary { cursor: pointer; color: var(--text-dim); }
+  .panel {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 18px;
+    margin-bottom: 16px;
+  }
+  .panel h2 { font-size: 14px; text-transform: uppercase; letter-spacing: 0.04em; color: var(--text-dim); margin: 0 0 12px; }
+  button {
+    background: var(--accent);
+    color: #0c1020;
+    border: none;
+    border-radius: 7px;
+    padding: 10px 16px;
+    font-size: 14px;
+    font-weight: 600;
+    cursor: pointer;
+  }
+  button:disabled { opacity: 0.45; cursor: not-allowed; }
+  button.secondary {
+    background: transparent;
+    color: var(--text);
+    border: 1px solid var(--border);
+    font-weight: 500;
+  }
+  #load-status-list {
+    font-family: var(--mono);
+    font-size: 12.5px;
+    line-height: 1.7;
+    color: var(--text-dim);
+    white-space: pre-wrap;
+    max-height: 220px;
+    overflow-y: auto;
+    background: #0b0e1c;
+    border: 1px solid var(--border);
+    border-radius: 7px;
+    padding: 10px 12px;
+    margin-top: 12px;
+  }
+  .status-line.ok { color: var(--ok); }
+  .status-line.err { color: var(--err); }
+  .status-line.active { color: var(--accent); }
+  .dropzone {
+    border: 2px dashed var(--border);
+    border-radius: 10px;
+    padding: 30px 16px;
+    text-align: center;
+    color: var(--text-dim);
+    cursor: pointer;
+    transition: border-color 0.15s, background 0.15s;
+  }
+  .dropzone.drag { border-color: var(--accent); background: rgba(124,159,255,0.06); }
+  .dropzone input { display: none; }
+  .dropzone .fname { color: var(--text); font-weight: 600; margin-top: 6px; }
+  .row { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; margin-top: 14px; }
+  select {
+    background: var(--panel-2);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 7px;
+    padding: 9px 10px;
+    font-size: 13.5px;
+  }
+  .metrics-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-top: 14px; }
+  .metric-card { background: var(--panel-2); border: 1px solid var(--border); border-radius: 8px; padding: 12px 14px; }
+  .metric-card .label { font-size: 11.5px; color: var(--text-dim); text-transform: uppercase; letter-spacing: 0.03em; }
+  .metric-card .value { font-size: 20px; font-weight: 700; margin-top: 4px; }
+  .metric-card .value .delta { font-size: 13px; color: var(--accent-2); font-weight: 500; margin-left: 6px; }
+  pre.opcounts {
+    font-family: var(--mono);
+    font-size: 12px;
+    background: #0b0e1c;
+    border: 1px solid var(--border);
+    border-radius: 7px;
+    padding: 10px 12px;
+    overflow-x: auto;
+    margin: 8px 0 0;
+  }
+  .error-box {
+    border: 1px solid var(--err);
+    background: rgba(255,107,107,0.08);
+    color: var(--err);
+    border-radius: 8px;
+    padding: 12px 14px;
+    font-family: var(--mono);
+    font-size: 12.5px;
+    white-space: pre-wrap;
+    margin-top: 12px;
+    overflow-x: auto;
+  }
+  .optimizer-list {
+    font-family: var(--mono);
+    font-size: 12px;
+    color: var(--text-dim);
+    columns: 2;
+    column-gap: 20px;
+    max-height: 200px;
+    overflow-y: auto;
+    margin-top: 8px;
+  }
+  .badge {
+    display: inline-block;
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 0.03em;
+    text-transform: uppercase;
+    padding: 3px 8px;
+    border-radius: 999px;
+    background: rgba(110,231,183,0.15);
+    color: var(--ok);
+    border: 1px solid rgba(110,231,183,0.35);
+  }
+  a.download-link {
+    display: inline-block;
+    margin-top: 14px;
+    background: var(--accent-2);
+    color: #0c1020;
+    border-radius: 7px;
+    padding: 10px 16px;
+    font-weight: 700;
+    font-size: 14px;
+    text-decoration: none;
+  }
+  footer { color: var(--text-dim); font-size: 12px; margin-top: 30px; line-height: 1.6; }
+  footer a { color: var(--accent); }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>onnxsim WebAssembly demo</h1>
+  <p class="subtitle">onnxsim's compiled C++ extension, running for real inside Pyodide, in your browser.</p>
+
+  <div class="scope-banner">
+    <b>Scope note:</b> this demonstrates onnxsim's compiled
+    <code>onnxsim_cpp2py_export</code> extension running under Pyodide and
+    transforming real <code>.onnx</code> files client-side. It does
+    <b>not</b> run the full <code>onnxsim.simplify()</code> pipeline yet --
+    that needs the Python <code>onnx</code> package, and PyPI's only onnx
+    wasm wheel (1.22.0) is tagged for a different Pyodide ABI epoch
+    (<code>pyemscripten_2025_0</code>) than this page's Pyodide 314.0.5
+    (<code>2026_0</code>), so <code>micropip.install("onnx")</code> fails.
+    What <b>is</b> real here: parsing your uploaded model and running one of
+    onnxsim's own native quantization/precision-conversion passes on it --
+    these operate on raw ONNX bytes using onnxsim's statically-linked onnx
+    copy and need no Python <code>onnx</code> package at all.
+    <details>
+      <summary>Why not full simplify() -- the exact error</summary>
+      <pre style="white-space:pre-wrap;margin:8px 0 0;font-size:12px;">ValueError: Wheel was built with Emscripten vpyemscripten.2025.0 but Pyodide was built with Emscripten v5.0.3
+
+(no other onnx release on PyPI has a matching-epoch wasm wheel; onnx's own
+numpy/protobuf/ml_dtypes dependencies additionally have no PyPI wasm wheels
+at all, only Pyodide's own CDN-hosted package repo -- a compounding gap,
+not just a version off-by-one.)</pre>
+    </details>
+  </div>
+
+  <div class="panel">
+    <h2>1. Load Pyodide + onnxsim extension</h2>
+    <button id="load-btn">Load runtime</button>
+    <span id="load-badge"></span>
+    <div id="load-status-list">idle -- click "Load runtime" to begin (this fetches Pyodide from a CDN and can take 20-60s the first time)</div>
+  </div>
+
+  <div class="panel" id="run-panel" style="display:none;">
+    <h2>2. Pick an .onnx file</h2>
+    <div class="dropzone" id="dropzone">
+      <div>Drop an .onnx file here, or click to choose one</div>
+      <div class="fname" id="fname"></div>
+      <input type="file" id="file-input" accept=".onnx" />
+    </div>
+
+    <div class="row">
+      <label for="pass-select" style="color:var(--text-dim);font-size:13.5px;">Native pass:</label>
+      <select id="pass-select">
+        <option value="quantize_weight_only">Weight-only INT8 quantization</option>
+        <option value="quantize_weight_only_int4">Weight-only INT4 quantization</option>
+        <option value="quantize_weight_only_int16">Weight-only INT16 quantization</option>
+        <option value="quantize_weight_only_int8_block">Weight-only INT8 (block-wise) quantization</option>
+        <option value="quantize_dynamic">Dynamic INT8 quantization (weights + activations)</option>
+        <option value="quantize_dynamic_matmul_integer_to_float">Dynamic quantization (fused MatMulIntegerToFloat)</option>
+        <option value="quantize_ternary">Ternary quantization (BitNet-style)</option>
+        <option value="quantize_bf16">Convert to bfloat16</option>
+        <option value="quantize_fp16">Convert to float16</option>
+        <option value="quantize_fp8_e4m3">Convert to float8 (E4M3)</option>
+        <option value="quantize_fp8_e5m2">Convert to float8 (E5M2)</option>
+      </select>
+      <button id="run-btn" disabled>Run pass</button>
+    </div>
+
+    <div id="run-output"></div>
+  </div>
+
+  <div class="panel" id="optimizers-panel" style="display:none;">
+    <h2>Registered onnx-optimizer passes (<span id="opt-count">0</span>)</h2>
+    <p style="color:var(--text-dim);font-size:12.5px;margin:0 0 4px;">
+      Fuse/elimination passes onnxsim's statically-linked onnx-optimizer registers -- listed here
+      as further confirmation the extension initialized correctly, not currently run by this demo.
+    </p>
+    <div class="optimizer-list" id="optimizer-list"></div>
+  </div>
+
+  <footer>
+    Source: <a href="https://github.com/onnxsim/onnxsim/pull/696" target="_blank" rel="noopener">onnxsim/onnxsim#696</a>.
+    Build details: <code>docs/wasm_pyodide.md</code>, <code>build_wasm_pyodide.sh</code>,
+    <code>.github/workflows/pyodide-wasm.yml</code>. This page is experimental and not linked
+    from anywhere in the built site.
+  </footer>
+</div>
+
+<script src="https://cdn.jsdelivr.net/pyodide/v314.0.5/full/pyodide.js"></script>
+<script>
+(function () {
+  "use strict";
+
+  const PASS_LABELS = {
+    quantize_weight_only: "Weight-only INT8 quantization",
+    quantize_weight_only_int4: "Weight-only INT4 quantization",
+    quantize_weight_only_int16: "Weight-only INT16 quantization",
+    quantize_weight_only_int8_block: "Weight-only INT8 (block-wise) quantization",
+    quantize_dynamic: "Dynamic INT8 quantization",
+    quantize_dynamic_matmul_integer_to_float: "Dynamic quantization (fused MatMulIntegerToFloat)",
+    quantize_ternary: "Ternary quantization",
+    quantize_bf16: "bfloat16 conversion",
+    quantize_fp16: "float16 conversion",
+    quantize_fp8_e4m3: "float8 (E4M3) conversion",
+    quantize_fp8_e5m2: "float8 (E5M2) conversion",
+  };
+
+  const loadBtn = document.getElementById("load-btn");
+  const loadBadge = document.getElementById("load-badge");
+  const statusList = document.getElementById("load-status-list");
+  const runPanel = document.getElementById("run-panel");
+  const optimizersPanel = document.getElementById("optimizers-panel");
+  const optCount = document.getElementById("opt-count");
+  const optimizerList = document.getElementById("optimizer-list");
+  const dropzone = document.getElementById("dropzone");
+  const fileInput = document.getElementById("file-input");
+  const fname = document.getElementById("fname");
+  const passSelect = document.getElementById("pass-select");
+  const runBtn = document.getElementById("run-btn");
+  const runOutput = document.getElementById("run-output");
+
+  let pyodide = null;
+  let modelBytes = null;
+  let modelFileName = "";
+  let statusLines = [];
+
+  function logStatus(msg, kind) {
+    statusLines.push({ msg, kind: kind || "" });
+    statusList.innerHTML = statusLines
+      .map((l) => `<div class="status-line ${l.kind}">${escapeHtml(l.msg)}</div>`)
+      .join("");
+    statusList.scrollTop = statusList.scrollHeight;
+  }
+
+  function escapeHtml(s) {
+    return String(s).replace(/[&<>"']/g, (c) => ({
+      "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
+    }[c]));
+  }
+
+  function showError(container, err) {
+    const box = document.createElement("div");
+    box.className = "error-box";
+    box.textContent = typeof err === "string" ? err : (err && err.stack) || String(err);
+    container.appendChild(box);
+  }
+
+  async function loadRuntime() {
+    loadBtn.disabled = true;
+    statusLines = [];
+    runOutput.innerHTML = "";
+    try {
+      logStatus("booting Pyodide 314.0.5 (fetching wasm runtime from CDN)...", "active");
+      const t0 = performance.now();
+      pyodide = await loadPyodide();
+      logStatus(`Pyodide ${pyodide.version} ready (${((performance.now() - t0) / 1000).toFixed(1)}s)`, "ok");
+
+      logStatus("locating site-packages...", "active");
+      const sitePackages = pyodide.runPython(`
+import site
+[p for p in site.getsitepackages() if p.endswith("site-packages")][0]
+`);
+      logStatus(`site-packages: ${sitePackages}`, "ok");
+
+      logStatus("fetching onnxsim_cpp2py_export.abi3.so (compiled wasm32 extension, ~6MB)...", "active");
+      const soResp = await fetch("./onnxsim_cpp2py_export.abi3.so");
+      if (!soResp.ok) {
+        throw new Error(`fetch of onnxsim_cpp2py_export.abi3.so failed: HTTP ${soResp.status}`);
+      }
+      const soBytes = new Uint8Array(await soResp.arrayBuffer());
+      logStatus(`downloaded ${(soBytes.length / 1e6).toFixed(2)} MB`, "ok");
+
+      pyodide.FS.writeFile(`${sitePackages}/onnxsim_cpp2py_export.abi3.so`, soBytes);
+      logStatus("wrote extension into Pyodide's virtual filesystem", "ok");
+
+      logStatus("import onnxsim_cpp2py_export (async dlopen under wasm32-emscripten)...", "active");
+      await pyodide.runPythonAsync(`
+import onnxsim_cpp2py_export as m
+`);
+      logStatus("import succeeded", "ok");
+
+      logStatus("calling _list_optimizers() to confirm onnx-optimizer's passes registered...", "active");
+      const optimizers = pyodide.runPython(`
+import json
+import onnxsim_cpp2py_export as m
+json.dumps(m._list_optimizers())
+`);
+      const optList = JSON.parse(optimizers);
+      logStatus(`OK: ${optList.length} optimizer passes registered`, "ok");
+      optCount.textContent = optList.length;
+      optimizerList.innerHTML = optList.map((p) => `<div>${escapeHtml(p)}</div>`).join("");
+      optimizersPanel.style.display = "";
+
+      loadBadge.innerHTML = '<span class="badge">runtime ready</span>';
+      runPanel.style.display = "";
+    } catch (err) {
+      logStatus(`FAILED: ${(err && err.message) || err}`, "err");
+      showError(statusList.parentElement, err);
+      loadBtn.disabled = false;
+    }
+  }
+
+  function setFile(file) {
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      modelBytes = new Uint8Array(reader.result);
+      modelFileName = file.name;
+      fname.textContent = `${file.name} (${modelBytes.length.toLocaleString()} bytes)`;
+      runBtn.disabled = false;
+      runOutput.innerHTML = "";
+    };
+    reader.onerror = () => {
+      showError(runOutput, `Could not read ${file.name}: ${reader.error}`);
+    };
+    reader.readAsArrayBuffer(file);
+  }
+
+  dropzone.addEventListener("click", () => fileInput.click());
+  fileInput.addEventListener("change", (e) => setFile(e.target.files[0]));
+  ["dragenter", "dragover"].forEach((evt) =>
+    dropzone.addEventListener(evt, (e) => {
+      e.preventDefault();
+      dropzone.classList.add("drag");
+    })
+  );
+  ["dragleave", "drop"].forEach((evt) =>
+    dropzone.addEventListener(evt, (e) => {
+      e.preventDefault();
+      dropzone.classList.remove("drag");
+    })
+  );
+  dropzone.addEventListener("drop", (e) => {
+    const file = e.dataTransfer.files && e.dataTransfer.files[0];
+    setFile(file);
+  });
+
+  function fmtOpCounts(obj) {
+    const entries = Object.entries(obj).sort((a, b) => b[1] - a[1]);
+    return entries.map(([op, n]) => `${op}: ${n}`).join("\n");
+  }
+
+  async function runPass() {
+    if (!modelBytes || !pyodide) return;
+    runBtn.disabled = true;
+    runOutput.innerHTML = "";
+
+    const passKey = passSelect.value;
+    const label = PASS_LABELS[passKey] || passKey;
+
+    try {
+      pyodide.FS.writeFile("/tmp/uploaded_model.onnx", modelBytes);
+
+      const resultJson = await pyodide.runPythonAsync(`
+import json
+import onnxsim_cpp2py_export as m
+
+report = {}
+with open("/tmp/uploaded_model.onnx", "rb") as f:
+    model_bytes = f.read()
+report["size_before"] = len(model_bytes)
+
+# _model_metrics is best-effort: some models use ops/domains onnxsim's
+# built-in (statically-linked) schema registry doesn't know about without
+# the Python onnx package's schema registration helpers. Don't let that
+# fail the whole run.
+try:
+    op_nums, model_size, _macs, _mem, _footprint = m._model_metrics(model_bytes, False)
+    report["op_nums_before"] = op_nums
+    report["metrics_ok"] = True
+except Exception as e:
+    report["metrics_ok"] = False
+    report["metrics_error"] = f"{type(e).__name__}: {e}"
+
+pass_key = ${JSON.stringify(passKey)}
+try:
+    if pass_key == "quantize_fp8_e4m3":
+        result_bytes = m.quantize_fp8(model_bytes, "e4m3", True)
+    elif pass_key == "quantize_fp8_e5m2":
+        result_bytes = m.quantize_fp8(model_bytes, "e5m2", True)
+    elif pass_key in ("quantize_bf16", "quantize_fp16"):
+        result_bytes = getattr(m, pass_key)(model_bytes, True)
+    else:
+        result_bytes = getattr(m, pass_key)(model_bytes)
+    report["run_ok"] = True
+    report["size_after"] = len(result_bytes)
+    import base64
+    report["result_b64"] = base64.b64encode(result_bytes).decode("ascii")
+
+    if report.get("metrics_ok"):
+        try:
+            op_nums_after, _sz, _macs2, _mem2, _fp2 = m._model_metrics(result_bytes, False)
+            report["op_nums_after"] = op_nums_after
+        except Exception:
+            pass
+except Exception as e:
+    import traceback
+    report["run_ok"] = False
+    report["run_error"] = f"{type(e).__name__}: {e}"
+    report["run_traceback"] = traceback.format_exc()
+
+json.dumps(report)
+`);
+      const result = JSON.parse(resultJson);
+
+      if (!result.run_ok) {
+        showError(runOutput, `${label} failed on this model:\n\n${result.run_error}\n\n${result.run_traceback || ""}`);
+        return;
+      }
+
+      const totalOpsBefore = Object.values(result.op_nums_before || {}).reduce((a, b) => a + b, 0);
+      const looksEmpty = result.metrics_ok && totalOpsBefore === 0 && result.size_before > 8;
+      if (looksEmpty) {
+        showError(
+          runOutput,
+          `Warning: this file parsed with 0 graph nodes (${result.size_before} bytes). ` +
+          `It probably isn't a valid serialized ONNX model, so the "result" below is not meaningful ` +
+          `-- onnx's own protobuf parser tolerates malformed input rather than always raising. ` +
+          `Try a real .onnx file (e.g. scripts/convertmodel/test/model.onnx in this repo).`
+        );
+      }
+
+      const sizeDelta = result.size_after - result.size_before;
+      const sizePct = ((sizeDelta / result.size_before) * 100).toFixed(1);
+
+      const grid = document.createElement("div");
+      grid.className = "metrics-grid";
+      grid.innerHTML = `
+        <div class="metric-card">
+          <div class="label">Model size (bytes)</div>
+          <div class="value">${result.size_before.toLocaleString()} &rarr; ${result.size_after.toLocaleString()}
+            <span class="delta">${sizeDelta <= 0 ? "" : "+"}${sizePct}%</span>
+          </div>
+        </div>
+        <div class="metric-card">
+          <div class="label">Pass applied</div>
+          <div class="value" style="font-size:15px;">${escapeHtml(label)}</div>
+        </div>
+      `;
+      runOutput.appendChild(grid);
+
+      if (result.metrics_ok) {
+        const pre = document.createElement("pre");
+        pre.className = "opcounts";
+        const before = fmtOpCounts(result.op_nums_before);
+        const after = result.op_nums_after ? fmtOpCounts(result.op_nums_after) : "(unavailable)";
+        pre.textContent = `op counts before:\n${before}\n\nop counts after:\n${after}`;
+        runOutput.appendChild(pre);
+      } else {
+        const note = document.createElement("div");
+        note.style.cssText = "color:var(--text-dim);font-size:12px;margin-top:8px;";
+        note.textContent = `(op-count breakdown unavailable for this model: ${result.metrics_error})`;
+        runOutput.appendChild(note);
+      }
+
+      const blob = new Blob(
+        [Uint8Array.from(atob(result.result_b64), (c) => c.charCodeAt(0))],
+        { type: "application/octet-stream" }
+      );
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.className = "download-link";
+      link.href = url;
+      const base = modelFileName.replace(/\.onnx$/i, "");
+      link.download = `${base}.${passKey}.onnx`;
+      link.textContent = `Download ${link.download}`;
+      runOutput.appendChild(link);
+    } catch (err) {
+      showError(runOutput, err);
+    } finally {
+      runBtn.disabled = false;
+    }
+  }
+
+  loadBtn.addEventListener("click", loadRuntime);
+  runBtn.addEventListener("click", runPass);
+})();
+</script>
+</body>
+</html>

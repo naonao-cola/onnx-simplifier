@@ -214,3 +214,16 @@ jobs:
         run: |
           cd /tmp/pyodide-smoke-test-env
           node ./pyodide_smoke_test.mjs "${SO_PATH}"
+
+      # scripts/pyodide_demo/index.html fetches this module at runtime rather
+      # than it being committed (it's gitignored like every other *.so in this
+      # repo) -- upload it here so a reviewer/user can download a fresh build
+      # straight from the Actions run and drop it next to that page, without
+      # needing the wasm toolchain locally. See docs/wasm_pyodide.md's Demo
+      # section for the exact steps.
+      - name: Upload the built module as a workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: onnxsim_cpp2py_export-wasm32-pyodide-${{ env.PYODIDE_VERSION }}
+          path: ${{ env.SO_PATH }}
+          retention-days: 30
