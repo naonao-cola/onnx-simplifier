@@ -23,6 +23,8 @@ workflow on a weekly schedule and on demand.
 | `worker.py` | downloads one model, then runs **both** onnxsim and onnxslim over it, **each in its own child subprocess** with its own timeout (so a hang/abort in one tool is contained and can't corrupt the other's result), records both outcomes + per-tool peak RSS, and deletes the download. |
 | `run_regression.py` | assigns a balanced shard of the model set (or the known-slow set) and runs each model through `worker.py` with a per-tool timeout. Exits non-zero if any model in the shard **crashed, timed out, or failed onnxsim's correctness check** — onnxslim outcomes are recorded but never affect the exit code. |
 | `summarize.py` | merges the per-shard CSVs into `regression-report.csv` and a Markdown run summary, including the onnxsim-vs-onnxslim comparison tables. |
+| `profile_sample.py` | runs `simplify(path, profile=...)` over named models (via `model_zoo.py`) in isolated subprocesses, for ad hoc investigation of a specific model's profile -- see [Profiling](#profiling). |
+| `summarize_profiles.py` | merges per-model `ONNXSIM_PROFILE` traces (written by `worker.py` when profiling is on) into a Markdown summary: which fixed-point span dominates each model, aggregated across the whole sampled set, and (given the regression CSVs too) how much of each model's real wall-clock time the profiler's spans actually cover. See [Profiling](#profiling). |
 | `yolov5_regression.py` | standalone check that `onnxsim` can replace the `onnxslim.slim` call in [ultralytics/yolov5](https://github.com/ultralytics/yolov5)'s `export.py`: exports the raw graph, runs both simplifiers, and gates on onnxsim producing a valid graph numerically equivalent to the original. Latest run: [`RESULTS_yolov5.md`](./RESULTS_yolov5.md). |
 | `model_zoo.py` | reference a regression model by short name from Python or the CLI, downloading it from the [`onnxmodelzoo`](https://huggingface.co/onnxmodelzoo) org (cached) and returning the path to its main `.onnx`. See [Referencing a model by name](#referencing-a-model-by-name). |
 
@@ -94,6 +96,37 @@ python scripts/regression/summarize.py "shard-*.csv" slow.csv
 
 Set `SLIM_CHECK=0` to skip onnxslim's (optional) equivalence check, which halves
 onnxslim's per-model work when you only care about its robustness and node counts.
+
+## Profiling
+
+`run_regression.py --profile-dir DIR` (or the Model Regression workflow's
+`profile` `workflow_dispatch` input) captures onnxsim's built-in
+`ONNXSIM_PROFILE` trace for every model in that run, one `<model>.json` in
+`DIR` per model. It's off by default: a per-model trace adds a background
+RSS-sampler thread and a trace write onnxsim otherwise skips, overhead not
+worth paying on every scheduled run when nothing's wrong -- turn it on when
+investigating a specific slow or regressed run, not routinely.
+
+```bash
+# one shard, with a profile trace per model
+python scripts/regression/run_regression.py --shard 0 --num-shards 6 \
+  --output shard-0.csv --profile-dir profiles
+
+# summarize: which span dominates each model, aggregated across the set, and
+# (given the CSV too) how much of each model's real wall-clock time the
+# profiler's spans actually cover -- see bench/RESULTS_profiling_survey.md
+# for why that gap can be the more important number for a large model.
+python scripts/regression/summarize_profiles.py "profiles/*.json" --csv shard-0.csv
+```
+
+On the workflow, set `profile: true` on a manual `workflow_dispatch` run;
+`regression-profiles-shard-N` / `regression-profiles-slow` artifacts hold the
+raw traces (open one in `chrome://tracing` or `ui.perfetto.dev` for the full
+flame graph) and a `profile-summary` artifact holds the merged Markdown report.
+
+For an ad hoc look at one model outside the regression set entirely,
+`profile_sample.py MODEL_NAME [MODEL_NAME ...]` fetches it via `model_zoo.py`
+and prints the same per-span breakdown directly (no CSV, no CI).
 
 ## Referencing a model by name
 

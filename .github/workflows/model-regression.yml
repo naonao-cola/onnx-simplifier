@@ -14,6 +14,13 @@ name: Model Regression
 # so it runs on a schedule and on demand rather than on every push. The work is
 # split across balanced shards to keep wall-clock down. To switch cadence,
 # change the cron below (weekly `0 6 * * 1` vs daily `0 6 * * *`).
+#
+# The `profile` workflow_dispatch input opts a run into capturing onnxsim's
+# ONNXSIM_PROFILE trace for every model (uploaded per-shard, then merged into a
+# `profile-summary` artifact by the summary job) -- off by default, since it
+# adds per-model overhead nobody wants paid on the routine scheduled run; turn
+# it on when investigating a specific slow/regressed run. See
+# scripts/regression/README.md#profiling.
 
 on:
   schedule:
@@ -27,6 +34,10 @@ on:
       include_slow:
         description: "Also run the known-slow models (non-blocking)"
         default: true
+        type: boolean
+      profile:
+        description: "Capture an ONNXSIM_PROFILE trace per model (uploaded as an artifact). Adds overhead (a background RSS sampler + a trace write per model) -- use for investigating a specific slow/regressed run, not routinely."
+        default: false
         type: boolean
   pull_request:
     # Validate the harness itself whenever it changes.
@@ -103,6 +114,7 @@ jobs:
       # with the intermittent connection resets anonymous access to the Hub
       # sometimes hits under load. huggingface_hub picks this up automatically.
       HF_TOKEN: ${{ secrets.HF_TOKEN }}
+      PROFILE: ${{ github.event.inputs.profile == 'true' && '1' || '' }}
     strategy:
       fail-fast: false
       matrix:
@@ -127,16 +139,27 @@ jobs:
       - name: Run regression shard
         working-directory: ${{ runner.temp }}
         run: |
+          profile_args=()
+          if [ -n "$PROFILE" ]; then
+            profile_args=(--profile-dir profiles)
+          fi
           python "$GITHUB_WORKSPACE/scripts/regression/run_regression.py" \
             --shard "${{ matrix.shard }}" \
             --num-shards "$NUM_SHARDS" \
             --timeout 900 \
-            --output "shard-${{ matrix.shard }}.csv"
+            --output "shard-${{ matrix.shard }}.csv" \
+            "${profile_args[@]}"
       - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: regression-csv-shard-${{ matrix.shard }}
           path: ${{ runner.temp }}/shard-${{ matrix.shard }}.csv
+          if-no-files-found: ignore
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: regression-profiles-shard-${{ matrix.shard }}
+          path: ${{ runner.temp }}/profiles
           if-no-files-found: ignore
 
   known-slow:
@@ -148,6 +171,7 @@ jobs:
     continue-on-error: true
     env:
       HF_TOKEN: ${{ secrets.HF_TOKEN }}
+      PROFILE: ${{ github.event.inputs.profile == 'true' && '1' || '' }}
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
@@ -165,15 +189,26 @@ jobs:
       - name: Run known-slow models
         working-directory: ${{ runner.temp }}
         run: |
+          profile_args=()
+          if [ -n "$PROFILE" ]; then
+            profile_args=(--profile-dir profiles)
+          fi
           python "$GITHUB_WORKSPACE/scripts/regression/run_regression.py" \
             --slow-only \
             --timeout 2400 \
-            --output "slow.csv"
+            --output "slow.csv" \
+            "${profile_args[@]}"
       - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: regression-csv-slow
           path: ${{ runner.temp }}/slow.csv
+          if-no-files-found: ignore
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: regression-profiles-slow
+          path: ${{ runner.temp }}/profiles
           if-no-files-found: ignore
 
   summary:
@@ -202,6 +237,30 @@ jobs:
         id: sum
         continue-on-error: true
         run: python "$GITHUB_WORKSPACE/scripts/regression/summarize.py" "csvs/*.csv"
+      # Profile artifacts only exist when the "profile" workflow_dispatch input
+      # was set (see the regression/known-slow jobs above); a normal scheduled
+      # run has none, so this whole block is a no-op then.
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: regression-profiles-*
+          path: profiles
+          merge-multiple: true
+          if-no-artifact-found: ignore
+      - name: Build profile summary
+        if: always()
+        continue-on-error: true
+        run: |
+          if find profiles -name '*.json' -print -quit 2>/dev/null | grep -q .; then
+            python "$GITHUB_WORKSPACE/scripts/regression/summarize_profiles.py" "profiles/*.json" --csv "csvs/*.csv"
+          else
+            echo "no profile traces present (profiling was not requested for this run)"
+          fi
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: profile-summary
+          path: profile-summary.md
+          if-no-files-found: ignore
       - uses: actions/upload-artifact@v7
         if: always()
         with:
