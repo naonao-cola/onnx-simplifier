@@ -386,6 +386,14 @@ await micropip.install(["onnx", "rich"])
     }
     logStatus("onnxsim pure-Python package written into site-packages", "ok");
 
+    // onnxsim's own modules import the compiled extension as
+    // `onnxsim.onnxsim_cpp2py_export` (a submodule of the onnxsim package),
+    // not the top-level `onnxsim_cpp2py_export` loadRuntime() wrote above
+    // (that copy is only for testing the extension in isolation). Copy the
+    // already-downloaded bytes to the real, package-relative location.
+    const soBytes = pyodide.FS.readFile(`${sitePackages}/onnxsim_cpp2py_export.abi3.so`);
+    pyodide.FS.writeFile(`${sitePackages}/onnxsim/onnxsim_cpp2py_export.abi3.so`, soBytes);
+
     await pyodide.runPythonAsync(`import onnxsim`);
     logStatus("import onnxsim: OK", "ok");
     fullOnnxsimReady = true;
