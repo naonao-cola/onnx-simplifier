@@ -42,6 +42,15 @@ onnx::ModelProto QuantizeDynamicMatMulIntegerToFloat(
       std::vector<std::string>{"dynamic_quantize_matmul_integer_to_float"});
 }
 
+onnx::ModelProto QuantizeAttentionDynamic(const onnx::ModelProto& model) {
+  PrepareSchemasForDebug(model);
+  // Registers dynamic_quantize_attention (idempotent) into onnxoptimizer's
+  // registry so OptimizeFixed can find it by name below.
+  onnxsim::RegisterCustomOptimizerPasses();
+  return onnx::optimization::OptimizeFixed(
+      model, std::vector<std::string>{"dynamic_quantize_attention"});
+}
+
 onnx::ModelProto QuantizeTernary(const onnx::ModelProto& model) {
   PrepareSchemasForDebug(model);
   // Registers dynamic_quantize_ternary_matmul (idempotent) into

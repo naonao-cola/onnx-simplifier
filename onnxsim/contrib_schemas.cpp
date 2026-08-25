@@ -705,6 +705,94 @@ OpSchema MakeAttentionSchema() {
                       "Constrain mask index to integer types.");
 }
 
+// Quantized counterpart of MakeAttentionSchema, above -- ONNX Runtime's
+// int8/uint8 attention kernel. Registered here so
+// dynamic_quantize_attention.h's fused output -- which only ever emits
+// inputs 0-2 (input, weight, bias), 3-4 (input_scale, weight_scale), 6-7
+// (input_zero_point, weight_zero_point, with mask_index at 5 skipped via an
+// Undefined placeholder) and attrs num_heads/scale -- passes the ONNX
+// checker and shape-inference sweeps the rest of onnxsim's pipeline runs;
+// the remaining attrs/inputs (unidirectional, mask_filter_value,
+// past_present_share_buffer, do_rotary, past) are declared for schema
+// completeness/compatibility with externally-authored models, not because
+// this pass ever produces them.
+OpSchema MakeQAttentionSchema() {
+  return OpSchema()
+      .SetName("QAttention")
+      .SetDomain(kMSDomain)
+      .SinceVersion(1)
+      .SetDoc("Quantization of Multi-Head Self Attention.")
+      .Attr("num_heads", "Number of attention heads.",
+            onnx::AttributeProto::INT, /*required=*/true)
+      .Attr("unidirectional",
+            "Whether every token can only attend to previous tokens.",
+            onnx::AttributeProto::INT, static_cast<int64_t>(0))
+      .Attr("scale",
+            "Custom scale will be used if specified. Default value is "
+            "1/sqrt(head_size).",
+            onnx::AttributeProto::FLOAT, /*required=*/false)
+      .Attr("mask_filter_value",
+            "The value to be filled in the attention mask. Default value "
+            "is -10000.0.",
+            onnx::AttributeProto::FLOAT, static_cast<float>(-10000.0f))
+      .Attr("do_rotary", "Whether to use rotary position embedding.",
+            onnx::AttributeProto::INT, static_cast<int64_t>(0))
+      .Attr("past_present_share_buffer",
+            "Corresponding past and present are same tensor, its shape is "
+            "(2, batch_size, num_heads, max_sequence_length, head_size).",
+            onnx::AttributeProto::INT, /*required=*/false)
+      .Input(0, "input",
+             "3D input tensor with shape (batch_size, sequence_length, "
+             "input_hidden_size).",
+             "T1")
+      .Input(1, "weight",
+             "2D input tensor with shape (input_hidden_size, 3 * "
+             "hidden_size), hidden_size = num_heads * head_size.",
+             "T2")
+      .Input(2, "bias", "1D input tensor with shape (3 * hidden_size).", "T3")
+      .Input(3, "input_scale",
+             "Scale of quantized input tensor. Scalar (per-tensor "
+             "quantization).",
+             "T3")
+      .Input(4, "weight_scale",
+             "Scale of quantized weight tensor. Scalar or 1D "
+             "(per-tensor/per-column quantization).",
+             "T3")
+      .Input(5, "mask_index",
+             "Attention mask index with shape "
+             "(batch_size).",
+             "T4", OpSchema::Optional)
+      .Input(6, "input_zero_point",
+             "Zero point of quantized input tensor. Scalar (per-tensor "
+             "quantization).",
+             "T1", OpSchema::Optional)
+      .Input(7, "weight_zero_point",
+             "Zero point of quantized weight tensor. Scalar or 1D "
+             "(per-tensor/per-column quantization).",
+             "T2", OpSchema::Optional)
+      .Input(8, "past",
+             "Past state for key and value with shape (2, batch_size, "
+             "num_heads, past_sequence_length, head_size).",
+             "T3", OpSchema::Optional)
+      .Output(0, "output",
+              "3D output tensor with shape (batch_size, sequence_length, "
+              "hidden_size).",
+              "T3")
+      .Output(1, "present",
+              "Present state for key and value with shape (2, batch_size, "
+              "num_heads, total_sequence_length, head_size).",
+              "T3", OpSchema::Optional)
+      .TypeConstraint("T1", {"tensor(int8)", "tensor(uint8)"},
+                      "Constrain input and its zero point to int8/uint8.")
+      .TypeConstraint("T2", {"tensor(int8)", "tensor(uint8)"},
+                      "Constrain weight and its zero point to int8/uint8.")
+      .TypeConstraint("T3", {"tensor(float)", "tensor(float16)"},
+                      "Constrain bias, scales, past, present, and output to "
+                      "float tensors.")
+      .TypeConstraint("T4", {"tensor(int32)"},
+                      "Constrain mask index to integer types.");
+}
+
 void RegisterAll() {
   // The custom domain must be known to the schema registry before any schema
   // in it can be registered.
@@ -728,6 +816,7 @@ void RegisterAll() {
   RegisterIfAbsent(MakeQGemmSchema());
   RegisterIfAbsent(MakeMatMulIntegerToFloatSchema());
   RegisterIfAbsent(MakeAttentionSchema());
+  RegisterIfAbsent(MakeQAttentionSchema());
 
   // Augment the standard Reshape schema with a data-propagation function so
   // shape tensors can flow through a Reshape during partial shape evaluation.
