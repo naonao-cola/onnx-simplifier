@@ -306,9 +306,22 @@ jobs:
       # uploads it (as "onnxsim_cpp2py_export-wasm32-pyodide-<version>") on
       # any push/PR that touches that build path.
       #
-      # Best-effort: this commit may not have a matching pyodide-wasm.yml run
-      # at all (that workflow is itself path-filtered, so most changes don't
-      # trigger it) -- staging is skipped, not failed, when none is found.
+      # This commit may not have a matching pyodide-wasm.yml run of its own at
+      # all -- that workflow is itself path-filtered (see its `on:` block), so
+      # a change to, say, scripts/convertmodel/index.html alone never triggers
+      # it. Originally this meant staging was skipped outright whenever there
+      # was no run for the EXACT current sha -- which turned out to be the
+      # common case, silently dropping the demo from every deploy/preview that
+      # didn't itself touch the Pyodide build path (confirmed: PR #699, which
+      # only touched the top-page link, deployed with no pyodide-demo/ at
+      # all). Fixed by falling back to the most recent successful
+      # pyodide-wasm.yml run on ANY branch when there's no exact match -- the
+      # extension only actually changes when its own path-filtered inputs do,
+      # so "latest successful build, whichever commit produced it" is a
+      # reasonable stand-in, not a real staleness risk in practice. Only skip
+      # staging if there has NEVER been a successful build at all (e.g. right
+      # after pyodide-wasm.yml is first introduced, before its first green
+      # run).
       # Demo-only, PLUS workflow_dispatch (unlike the models.json/Netron gate
       # above): a plain pull_request run doesn't deploy anywhere this would be
       # visible, but workflow_dispatch is included here specifically because
@@ -332,10 +345,16 @@ jobs:
               status: 'success',
               per_page: 20,
             });
-            const match = data.workflow_runs.find((r) => r.head_sha === sha);
+            // listWorkflowRuns returns newest-first, so [0] is the latest
+            // successful build on any branch once there's no exact-sha match.
+            const exact = data.workflow_runs.find((r) => r.head_sha === sha);
+            const match = exact || data.workflow_runs[0];
             if (!match) {
-              core.notice(`No successful pyodide-wasm.yml run found for ${sha} -- skipping Pyodide demo staging.`);
+              core.notice(`No successful pyodide-wasm.yml run found at all -- skipping Pyodide demo staging.`);
               core.setOutput('run_id', '');
+            } else if (!exact) {
+              core.notice(`No pyodide-wasm.yml run for ${sha} -- falling back to the latest successful run (${match.head_sha}, run ${match.id}).`);
+              core.setOutput('run_id', String(match.id));
             } else {
               core.setOutput('run_id', String(match.id));
             }
