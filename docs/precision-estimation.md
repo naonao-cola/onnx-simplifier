@@ -111,6 +111,59 @@ quantization or INT16 would preserve more resolution for this node's
 typical-magnitude weights
 ```
 
+## Whole-model rollup (`estimate_model_quantization_drop`)
+
+`estimate_quantization_precision`'s per-node estimates answer "is this one
+node safe?" — `onnxsim.estimate_model_quantization_drop` rolls all of them
+into a single whole-model risk summary and one *estimated relative error*
+number, still purely from the model's static weights and shapes:
+
+```python
+est = onnxsim.estimate_model_quantization_drop(model)
+print(est.risk_level, est.estimated_relative_error)
+```
+
+It returns a `ModelQuantizationEstimate`:
+
+| Field | Meaning |
+| --- | --- |
+| `total_nodes_analyzed` | how many MatMul/Gemm/Conv/Attention nodes were recognized |
+| `unsafe_nodes` | node names that fail the int32-accumulator-safe check |
+| `outlier_risk_nodes` | node names with `outlier_risk=True` |
+| `worst_outlier_ratio` | max `max(\|w\|)/median(\|w\|)` over nodes that had one computable |
+| `estimated_relative_error` | see below; `nan` whenever `unsafe_nodes` is non-empty |
+| `risk_level` | `"unsafe"` \| `"degraded"` \| `"safe"` |
+| `per_node` | the same list `estimate_quantization_precision` returns |
+
+`risk_level` is `"unsafe"` if any node overflows its int32 accumulator (a
+real correctness bug — `estimated_relative_error` is `nan` in this case,
+since an overflowing accumulator's output isn't bounded by any small error
+term); `"degraded"` if none overflow but at least one has an outlier-driven
+resolution loss; `"safe"` otherwise.
+
+`estimated_relative_error` comes from the standard **uniform-quantizer
+noise model**: a symmetric INT8 quantizer with step `Δ = max(|w|) / 127` has
+quantization error uniformly distributed in `[-Δ/2, Δ/2]`, whose RMS is
+`Δ / sqrt(12)`. Relative to a channel's *typical* (median-magnitude, not
+peak) weight, that RMS error scales by the channel's own outlier ratio `r`
+(1 when no ratio was computable):
+
+```
+per_node_relative_error = r / (127 * sqrt(12))
+```
+
+The whole-model figure combines every analyzed node's
+`per_node_relative_error` in root-sum-square — the standard back-of-envelope
+combination for independent noise sources. This is a **heuristic screening
+signal, not a certified bound**: it assumes each node's quantization error
+behaves as an independent perturbation that neither compounds
+multiplicatively through the network's depth nor cancels out, which real
+networks only approximate. Use it to rank/screen models or compare
+candidate schemes quickly, with no data required — for an actual,
+data-driven measurement of a specific quantized model's real accuracy drop,
+see [accuracy-drop.md](accuracy-drop.md)'s `measure_accuracy_drop`, the
+ground-truth counterpart to this estimate.
+
 ## Scope and limitations
 
 - Only the top-level graph is walked — nodes inside `If`/`Loop`/`Scan`

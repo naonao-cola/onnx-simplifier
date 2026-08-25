@@ -499,3 +499,113 @@ def estimate_quantization_precision(model: onnx.ModelProto) -> List[PrecisionEst
         if est is not None:
             estimates.append(est)
     return estimates
+
+
+# sqrt(12): the standard deviation, in units of the quantization step size Delta,
+# of a uniformly-distributed quantization error in [-Delta/2, Delta/2] -- the
+# textbook uniform-quantizer noise model this module's aggregate error estimate
+# below is built on.
+_UNIFORM_QUANTIZER_NOISE_DIVISOR = 127.0 * math.sqrt(12.0)
+
+
+@dataclass
+class ModelQuantizationEstimate:
+    """A single, whole-model rollup of :func:`estimate_quantization_precision`'s
+    per-node estimates -- see :func:`estimate_model_quantization_drop`."""
+
+    total_nodes_analyzed: int
+    unsafe_nodes: List[str]  # node names failing the int32-accumulator-safe check
+    outlier_risk_nodes: List[str]  # node names flagged outlier_risk=True
+    worst_outlier_ratio: float  # max over all analyzed nodes; nan if none had one
+    estimated_relative_error: float  # see docstring below; nan if any unsafe_nodes
+    risk_level: str  # "unsafe" | "degraded" | "safe"
+    per_node: List[PrecisionEstimate]
+
+
+def estimate_model_quantization_drop(
+    model: onnx.ModelProto,
+) -> ModelQuantizationEstimate:
+    """Aggregates :func:`estimate_quantization_precision`'s per-node estimates
+    into a single whole-model INT8-quantization risk summary and an
+    *estimated* relative-error figure -- purely from the model's static
+    weights and shapes, no execution or calibration data needed. For an
+    actual, data-driven measurement of a specific quantized model's real
+    accuracy drop, see :func:`onnxsim.accuracy.measure_accuracy_drop` instead
+    -- this function is the fast, no-data pre-check; that one is the ground
+    truth.
+
+    ``risk_level``:
+
+    - ``"unsafe"``: at least one MatMul/Gemm/Conv node's reduction depth
+      exceeds the int32-accumulator-safe bound (see this module's docstring,
+      point 1) -- a real correctness bug, not a precision tradeoff.
+      ``estimated_relative_error`` is ``nan`` in this case: an overflowing
+      accumulator's output isn't bounded by any small error term, so no
+      single number would honestly describe it.
+    - ``"degraded"``: no unsafe nodes, but at least one node has a
+      ``max(|w|) / median(|w|)`` outlier ratio past
+      :data:`OUTLIER_RATIO_THRESHOLD` -- INT8 quantization is safe but loses
+      meaningful resolution on that node's typical-magnitude weights.
+    - ``"safe"``: neither of the above.
+
+    ``estimated_relative_error`` (only meaningful when ``risk_level`` is not
+    ``"unsafe"``): a per-node relative RMS quantization-noise estimate, from
+    the standard uniform-quantizer noise model -- a symmetric INT8 quantizer
+    with step ``Delta = max(|w|) / 127`` has quantization error uniformly
+    distributed in ``[-Delta/2, Delta/2]``, whose RMS is ``Delta / sqrt(12)``.
+    Relative to a channel's *typical* (median-magnitude, not peak-magnitude)
+    weight, that RMS error scales by the channel's own outlier ratio ``r =
+    max(|w|) / median(|w|)`` (``r = 1`` when no outlier ratio was computable,
+    e.g. a channel with fewer than two nonzero weights):
+
+        per_node_relative_error = r / (127 * sqrt(12))
+
+    Whole-model ``estimated_relative_error`` combines every analyzed
+    MatMul/Gemm/Conv node's ``per_node_relative_error`` in root-sum-square --
+    the standard back-of-envelope combination for independent noise sources
+    -- as a **heuristic**, not a guarantee: it assumes each node's
+    quantization error behaves as an independent random perturbation that
+    neither compounds multiplicatively through the network's depth nor
+    cancels out, which real networks only approximate. Treat this as a
+    relative ranking/screening signal (worse models get a bigger number),
+    not a certified error bound -- :func:`onnxsim.accuracy.measure_accuracy_drop`
+    is the tool for an actual bound on a specific model and dataset.
+    Attention nodes are excluded from this sum (no weight-quantization error
+    term applies to them in this scheme -- see this module's docstring).
+    """
+    per_node = estimate_quantization_precision(model)
+
+    unsafe_nodes = []
+    outlier_risk_nodes = []
+    outlier_ratios = []
+    squared_errors = []
+    for est in per_node:
+        if isinstance(est, AttentionPrecisionEstimate):
+            continue
+        if not est.int32_accumulator_safe:
+            unsafe_nodes.append(est.node_name)
+            continue
+        if est.outlier_risk:
+            outlier_risk_nodes.append(est.node_name)
+        if not math.isnan(est.max_outlier_ratio):
+            outlier_ratios.append(est.max_outlier_ratio)
+        ratio = est.max_outlier_ratio if not math.isnan(est.max_outlier_ratio) else 1.0
+        per_node_relative_error = ratio / _UNIFORM_QUANTIZER_NOISE_DIVISOR
+        squared_errors.append(per_node_relative_error**2)
+
+    if unsafe_nodes:
+        risk_level = "unsafe"
+        estimated_relative_error = math.nan
+    else:
+        risk_level = "degraded" if outlier_risk_nodes else "safe"
+        estimated_relative_error = math.sqrt(sum(squared_errors))
+
+    return ModelQuantizationEstimate(
+        total_nodes_analyzed=len(per_node),
+        unsafe_nodes=unsafe_nodes,
+        outlier_risk_nodes=outlier_risk_nodes,
+        worst_outlier_ratio=max(outlier_ratios) if outlier_ratios else math.nan,
+        estimated_relative_error=estimated_relative_error,
+        risk_level=risk_level,
+        per_node=per_node,
+    )

@@ -16,6 +16,7 @@ import onnxsim
 from onnxsim.precision_estimator import (
     MAX_EXACT_FLOAT32_REDUCTION_DEPTH,
     MAX_SAFE_INT32_REDUCTION_DEPTH,
+    OUTLIER_RATIO_THRESHOLD,
     AttentionPrecisionEstimate,
     ConvPrecisionEstimate,
     MatMulGemmPrecisionEstimate,
@@ -254,3 +255,94 @@ def test_never_modifies_the_model():
     before = model.SerializeToString()
     onnxsim.estimate_quantization_precision(model)
     assert model.SerializeToString() == before
+
+
+# --------------------------------------------------------------------------- #
+# estimate_model_quantization_drop -- whole-model aggregate
+# --------------------------------------------------------------------------- #
+def test_model_drop_safe_with_no_outliers():
+    # Every weight has the exact same magnitude (alternating sign), so each
+    # channel's max(|w|)/median(|w|) outlier ratio is exactly 1 -- the
+    # uniform-quantizer-noise baseline case, with no outlier-driven penalty.
+    K, N = 16, 4
+    weight = np.tile([0.1, -0.1], (K // 2, N)).astype(np.float32)
+    nodes = [onnx.helper.make_node("MatMul", ["X", "W"], ["Y"])]
+    model = _model(nodes, [_vi("X", [1, K])], [_vi("Y", [1, N])], [_f32(weight, "W")])
+
+    est = onnxsim.estimate_model_quantization_drop(model)
+    assert est.total_nodes_analyzed == 1
+    assert est.unsafe_nodes == []
+    assert est.outlier_risk_nodes == []
+    assert est.risk_level == "safe"
+    assert math.isclose(est.worst_outlier_ratio, 1.0, rel_tol=1e-9)
+    # The uniform-quantizer-noise baseline (ratio=1): a single analyzed
+    # node's relative error is exactly 1 / (127 * sqrt(12)).
+    assert math.isclose(
+        est.estimated_relative_error, 1.0 / (127.0 * math.sqrt(12.0)), rel_tol=1e-9
+    )
+
+
+def test_model_drop_degraded_when_outlier_channel_present():
+    K, N = 32, 2
+    rng = np.random.default_rng(21)
+    weight = rng.standard_normal((K, N)).astype(np.float32) * 0.05
+    weight[:, 1] = 0.01
+    weight[0, 1] = 10.0  # channel 1: a single extreme outlier
+    nodes = [onnx.helper.make_node("MatMul", ["X", "W"], ["Y"])]
+    model = _model(nodes, [_vi("X", [1, K])], [_vi("Y", [1, N])], [_f32(weight, "W")])
+
+    est = onnxsim.estimate_model_quantization_drop(model)
+    assert est.risk_level == "degraded"
+    assert est.outlier_risk_nodes == [est.per_node[0].node_name]
+    assert est.unsafe_nodes == []
+    assert est.worst_outlier_ratio > OUTLIER_RATIO_THRESHOLD
+    # A node with a big outlier ratio must dominate the aggregate error over
+    # the safe/no-outlier baseline case.
+    assert est.estimated_relative_error > 1.0 / (127.0 * math.sqrt(12.0))
+
+
+def test_model_drop_unsafe_reports_nan_error_and_lists_the_node():
+    k = MAX_SAFE_INT32_REDUCTION_DEPTH + 1
+    weight = _f32(np.random.default_rng(22).standard_normal((k, 1)) * 0.01, "W")
+    nodes = [onnx.helper.make_node("MatMul", ["X", "W"], ["Y"])]
+    model = _model(nodes, [_vi("X", [1, k])], [_vi("Y", [1, 1])], [weight])
+
+    est = onnxsim.estimate_model_quantization_drop(model)
+    assert est.risk_level == "unsafe"
+    assert est.unsafe_nodes == [est.per_node[0].node_name]
+    assert math.isnan(est.estimated_relative_error)
+
+
+def test_model_drop_more_unsafe_nodes_widen_the_aggregate_error():
+    # Two safe nodes (independent noise, root-sum-square) must report a
+    # bigger aggregate error than either alone.
+    rng = np.random.default_rng(23)
+    K, N = 16, 4
+    w1 = _f32(rng.standard_normal((K, N)) * 0.1, "W1")
+    w2 = _f32(rng.standard_normal((K, N)) * 0.1, "W2")
+    nodes = [
+        onnx.helper.make_node("MatMul", ["X", "W1"], ["Y1"]),
+        onnx.helper.make_node("MatMul", ["X", "W2"], ["Y2"]),
+    ]
+    model = _model(
+        nodes, [_vi("X", [1, K])], [_vi("Y1", [1, N]), _vi("Y2", [1, N])], [w1, w2]
+    )
+    one_node_model = _model([nodes[0]], [_vi("X", [1, K])], [_vi("Y1", [1, N])], [w1])
+
+    est_two = onnxsim.estimate_model_quantization_drop(model)
+    est_one = onnxsim.estimate_model_quantization_drop(one_node_model)
+    assert est_two.total_nodes_analyzed == 2
+    assert est_two.estimated_relative_error > est_one.estimated_relative_error
+
+
+def test_model_drop_no_analyzable_nodes_is_safe_with_zero_error():
+    model = _model(
+        [onnx.helper.make_node("Relu", ["X"], ["Y"])],
+        [_vi("X", [1, 4])],
+        [_vi("Y", [1, 4])],
+        [],
+    )
+    est = onnxsim.estimate_model_quantization_drop(model)
+    assert est.total_nodes_analyzed == 0
+    assert est.risk_level == "safe"
+    assert est.estimated_relative_error == 0.0
