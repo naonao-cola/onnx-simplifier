@@ -92,6 +92,10 @@ permissions:
   id-token: write
   pull-requests: write
   issues: write
+  # Needed only by the "Find the matching Pyodide demo build" step below,
+  # which lists/reads workflow runs and artifacts from pyodide-wasm.yml (a
+  # separate workflow) via the REST API.
+  actions: read
 
 # Allow only one concurrent deployment, skipping runs queued between the run in-progress and latest queued.
 # However, do NOT cancel in-progress runs as we want to allow these production deployments to complete.
@@ -292,6 +296,71 @@ jobs:
       # deploy the demo, so a release or plain pull_request run skips this.
       - if: ${{ github.event_name == 'push' || github.event_name == 'issue_comment' }}
         run: cp scripts/regression/models.json scripts/convertmodel/models.json
+
+      # --- Pyodide demo (scripts/pyodide_demo/) -----------------------------
+      # A completely separate build (wasm32-emscripten Python extension via
+      # build_wasm_pyodide.sh, not this job's own emcmake build), so import
+      # its already-built module as a cross-workflow artifact rather than
+      # rebuilding it here -- see docs/wasm_pyodide.md and
+      # .github/workflows/pyodide-wasm.yml, which is what actually builds and
+      # uploads it (as "onnxsim_cpp2py_export-wasm32-pyodide-<version>") on
+      # any push/PR that touches that build path.
+      #
+      # Best-effort: this commit may not have a matching pyodide-wasm.yml run
+      # at all (that workflow is itself path-filtered, so most changes don't
+      # trigger it) -- staging is skipped, not failed, when none is found.
+      # Demo-only, PLUS workflow_dispatch (unlike the models.json/Netron gate
+      # above): a plain pull_request run doesn't deploy anywhere this would be
+      # visible, but workflow_dispatch is included here specifically because
+      # it's the only way to test THIS staging logic before it's merged --
+      # issue_comment-triggered runs (e.g. /preview) always use the base
+      # branch's workflow definition, never a PR branch's, so changes to
+      # these very steps are invisible to /preview until merged. Manually
+      # dispatching this workflow against a PR branch (which DOES use that
+      # branch's own workflow file) is the only pre-merge way to exercise it.
+      - name: Find the matching Pyodide demo build
+        if: ${{ github.event_name == 'push' || github.event_name == 'issue_comment' || github.event_name == 'workflow_dispatch' }}
+        id: find_pyodide_run
+        uses: actions/github-script@v9
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const sha = ${{ toJSON(steps.pr.outputs.head_sha || github.sha) }};
+            const { data } = await github.rest.actions.listWorkflowRuns({
+              owner, repo,
+              workflow_id: 'pyodide-wasm.yml',
+              status: 'success',
+              per_page: 20,
+            });
+            const match = data.workflow_runs.find((r) => r.head_sha === sha);
+            if (!match) {
+              core.notice(`No successful pyodide-wasm.yml run found for ${sha} -- skipping Pyodide demo staging.`);
+              core.setOutput('run_id', '');
+            } else {
+              core.setOutput('run_id', String(match.id));
+            }
+      - name: Download the Pyodide demo build
+        if: ${{ (github.event_name == 'push' || github.event_name == 'issue_comment' || github.event_name == 'workflow_dispatch') && steps.find_pyodide_run.outputs.run_id != '' }}
+        uses: actions/download-artifact@v8
+        with:
+          # Matched by prefix (not a hardcoded version) so this doesn't need
+          # updating every time pyodide-wasm.yml's PYODIDE_VERSION bumps.
+          pattern: onnxsim_cpp2py_export-wasm32-pyodide-*
+          path: pyodide-demo-artifact
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          run-id: ${{ steps.find_pyodide_run.outputs.run_id }}
+      - name: Stage the Pyodide demo
+        if: ${{ (github.event_name == 'push' || github.event_name == 'issue_comment' || github.event_name == 'workflow_dispatch') && steps.find_pyodide_run.outputs.run_id != '' }}
+        run: |
+          mkdir -p scripts/convertmodel/pyodide-demo
+          cp scripts/pyodide_demo/index.html scripts/convertmodel/pyodide-demo/
+          SO=$(find pyodide-demo-artifact -name 'onnxsim_cpp2py_export.abi3.so' | head -1)
+          if [ -z "$SO" ]; then
+            echo "::warning::downloaded Pyodide demo artifact did not contain onnxsim_cpp2py_export.abi3.so -- skipping"
+          else
+            cp "$SO" scripts/convertmodel/pyodide-demo/onnxsim_cpp2py_export.abi3.so
+            echo "staged Pyodide demo at scripts/convertmodel/pyodide-demo/"
+          fi
 
       # Build the patched Netron (embedding protocol + embedded mode) and serve
       # it from the converter's own origin at ./netron/, so the page can post

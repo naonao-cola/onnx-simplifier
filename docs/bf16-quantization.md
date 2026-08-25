@@ -95,7 +95,12 @@ exactly this one rewrite, once, to a copy of the model (which is left
 untouched) and returns the result. The old float32 initializer a converted
 weight replaces is left orphaned in the model rather than pruned; call
 `onnxsim.simplify()` afterward (or before, or both) to clean the graph up
-and drop it.
+and drop it. If the model already carries `value_info` for its interior
+activations (e.g. because `simplify()` ran on it first, as the recommended
+flow below does), this pass clears the now-stale float32 declarations those
+tensors no longer have -- rather than leaving a *wrong* type in the exported
+model, which ONNX Runtime's own load-time type-checking rejects outright,
+unlike a merely absent value_info entry, which it infers fresh.
 
 ## End-to-end: simplify -> quantize -> deploy
 
