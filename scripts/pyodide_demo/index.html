@@ -388,11 +388,18 @@ await micropip.install(["onnx", "rich"])
 
     // onnxsim's own modules import the compiled extension as
     // `onnxsim.onnxsim_cpp2py_export` (a submodule of the onnxsim package),
-    // not the top-level `onnxsim_cpp2py_export` loadRuntime() wrote above
-    // (that copy is only for testing the extension in isolation). Copy the
-    // already-downloaded bytes to the real, package-relative location.
-    const soBytes = pyodide.FS.readFile(`${sitePackages}/onnxsim_cpp2py_export.abi3.so`);
-    pyodide.FS.writeFile(`${sitePackages}/onnxsim/onnxsim_cpp2py_export.abi3.so`, soBytes);
+    // not the top-level `onnxsim_cpp2py_export` loadRuntime() loaded above
+    // (that's only for testing the extension in isolation). Don't dlopen a
+    // second copy of the same .so under that name -- nanobind's global
+    // per-process type registry sees the same C++ types being registered
+    // again and silently skips re-populating the new module object's
+    // attributes (it loads without error, logs "type 'X' was already
+    // registered!", then `onnxsim.onnxsim_cpp2py_export.ModelExecutor` etc.
+    // are simply missing). Alias the already-loaded module instead.
+    await pyodide.runPythonAsync(`
+import sys
+sys.modules["onnxsim.onnxsim_cpp2py_export"] = sys.modules["onnxsim_cpp2py_export"]
+`);
 
     await pyodide.runPythonAsync(`import onnxsim`);
     logStatus("import onnxsim: OK", "ok");

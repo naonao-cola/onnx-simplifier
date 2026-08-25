@@ -162,13 +162,21 @@ await micropip.install(["onnx", "rich"])
 
   // onnxsim's own modules import the compiled extension as
   // `onnxsim.onnxsim_cpp2py_export` (a submodule of the `onnxsim` package --
-  // see setup.py's `name=str('onnxsim.onnxsim_cpp2py_export')`), not as a
-  // top-level `onnxsim_cpp2py_export` (which is only how Phase 1 above
-  // tests it in isolation, by placing it directly in site-packages). Write a
-  // second copy at the real, package-relative location so `import onnxsim`
-  // (which transitively imports onnxsim.calibration ->
-  // `import onnxsim.onnxsim_cpp2py_export`) finds it.
-  pyodide.FS.writeFile(`${sitePackages}/onnxsim/${MODULE_NAME}.abi3.so`, soBytes);
+  // see setup.py's `name=str('onnxsim.onnxsim_cpp2py_export')`), not as the
+  // top-level `onnxsim_cpp2py_export` Phase 1 above tested it as. Rather
+  // than dlopen-ing a SECOND copy of the same .so under that name -- which
+  // fails: nanobind's global per-process type registry sees the same C++
+  // types being registered again and silently skips re-populating the new
+  // module object's attributes (confirmed directly: it loads without error,
+  // logs "type 'X' was already registered!", and is then missing that exact
+  // attribute, e.g. `AttributeError: module 'onnxsim.onnxsim_cpp2py_export'
+  // has no attribute 'ModelExecutor'`) -- alias the module Phase 1 already
+  // loaded (still live in this same Python interpreter across
+  // runPython(Async) calls) into the real, package-relative sys.modules key.
+  await pyodide.runPythonAsync(`
+import sys
+sys.modules["onnxsim.${MODULE_NAME}"] = sys.modules["${MODULE_NAME}"]
+`);
 
   const simplifyCode = `
 import onnx
