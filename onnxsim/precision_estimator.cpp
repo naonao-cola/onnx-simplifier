@@ -41,12 +41,13 @@ const double kUniformQuantizerNoiseDivisor = 127.0 * std::sqrt(12.0);
 // precision_estimator.py's FIXED_ACTIVATION_RANGES.
 const std::unordered_map<std::string, std::pair<double, double>>&
 FixedActivationRanges() {
-  static const std::unordered_map<std::string, std::pair<double, double>> kMap = {
-      {"Sigmoid", {0.0, 1.0}},
-      {"HardSigmoid", {0.0, 1.0}},
-      {"Tanh", {-1.0, 1.0}},
-      {"Softmax", {0.0, 1.0}},
-  };
+  static const std::unordered_map<std::string, std::pair<double, double>> kMap =
+      {
+          {"Sigmoid", {0.0, 1.0}},
+          {"HardSigmoid", {0.0, 1.0}},
+          {"Tanh", {-1.0, 1.0}},
+          {"Softmax", {0.0, 1.0}},
+      };
   return kMap;
 }
 
@@ -64,9 +65,9 @@ std::vector<float> ReadFloatTensorFlat(const onnx::TensorProto& t) {
     std::vector<float> out(n);
     std::memcpy(out.data(), raw.data(), n * sizeof(float));
     if constexpr (!onnxsim::dlpack::kRawDataIsHostOrder) {
-      onnxsim::dlpack::SwapElementBytes(
-          reinterpret_cast<uint8_t*>(out.data()), out.size() * sizeof(float),
-          sizeof(float));
+      onnxsim::dlpack::SwapElementBytes(reinterpret_cast<uint8_t*>(out.data()),
+                                        out.size() * sizeof(float),
+                                        sizeof(float));
     }
     return out;
   }
@@ -111,11 +112,10 @@ double ChannelOutlierRatio(std::vector<float> abs_weights_for_channel) {
   // central elements for an even count.
   std::sort(nonzero.begin(), nonzero.end());
   const size_t n = nonzero.size();
-  const double med = (n % 2 == 1)
-                         ? static_cast<double>(nonzero[n / 2])
-                         : (static_cast<double>(nonzero[n / 2 - 1]) +
-                            static_cast<double>(nonzero[n / 2])) /
-                               2.0;
+  const double med = (n % 2 == 1) ? static_cast<double>(nonzero[n / 2])
+                                  : (static_cast<double>(nonzero[n / 2 - 1]) +
+                                     static_cast<double>(nonzero[n / 2])) /
+                                        2.0;
   if (med == 0.0) {
     return std::numeric_limits<double>::quiet_NaN();
   }
@@ -193,8 +193,7 @@ bool ActivationRange(
     if (attr.name() == "min") clip_lo = attr.f();
     if (attr.name() == "max") clip_hi = attr.f();
   }
-  auto read_scalar = [&](const std::string& name,
-                         double* out) -> bool {
+  auto read_scalar = [&](const std::string& name, double* out) -> bool {
     auto init_it = initializers.find(name);
     if (init_it == initializers.end()) return false;
     std::vector<float> vals = ReadFloatTensorFlat(*init_it->second);
@@ -220,7 +219,8 @@ std::optional<WeightPrecisionEstimate> EstimateMatMulGemm(
     const std::unordered_map<std::string, const onnx::TensorProto*>&
         initializers,
     const std::unordered_map<std::string, const onnx::NodeProto*>& producer) {
-  if (node.op_type() != "MatMul" && node.op_type() != "Gemm") return std::nullopt;
+  if (node.op_type() != "MatMul" && node.op_type() != "Gemm")
+    return std::nullopt;
   if (node.input_size() < 2) return std::nullopt;
   auto init_it = initializers.find(node.input(1));
   if (init_it == initializers.end()) return std::nullopt;
@@ -264,10 +264,10 @@ std::optional<WeightPrecisionEstimate> EstimateMatMulGemm(
     const double ratio = ChannelOutlierRatio(std::move(channel));
     if (!std::isnan(ratio)) finite_ratios.push_back(ratio);
   }
-  const double max_ratio = finite_ratios.empty()
-                                ? std::numeric_limits<double>::quiet_NaN()
-                                : *std::max_element(finite_ratios.begin(),
-                                                    finite_ratios.end());
+  const double max_ratio =
+      finite_ratios.empty()
+          ? std::numeric_limits<double>::quiet_NaN()
+          : *std::max_element(finite_ratios.begin(), finite_ratios.end());
   const bool safe = k <= MaxSafeInt32ReductionDepth();
   const bool float32_exact = k <= MaxExactFloat32ReductionDepth();
   const bool outlier_risk =
@@ -298,9 +298,8 @@ std::optional<WeightPrecisionEstimate> EstimateMatMulGemm(
   est.has_activation_range = has_act_range;
   est.activation_range_lo = act_lo;
   est.activation_range_hi = act_hi;
-  est.recommendation = BuildRecommendation(safe, float32_exact, outlier_risk,
-                                           act_op, has_act_range, act_lo,
-                                           act_hi);
+  est.recommendation = BuildRecommendation(
+      safe, float32_exact, outlier_risk, act_op, has_act_range, act_lo, act_hi);
   return est;
 }
 
@@ -334,10 +333,10 @@ std::optional<WeightPrecisionEstimate> EstimateConv(
     const double ratio = ChannelOutlierRatio(std::move(channel));
     if (!std::isnan(ratio)) finite_ratios.push_back(ratio);
   }
-  const double max_ratio = finite_ratios.empty()
-                                ? std::numeric_limits<double>::quiet_NaN()
-                                : *std::max_element(finite_ratios.begin(),
-                                                    finite_ratios.end());
+  const double max_ratio =
+      finite_ratios.empty()
+          ? std::numeric_limits<double>::quiet_NaN()
+          : *std::max_element(finite_ratios.begin(), finite_ratios.end());
   const bool safe = inner <= MaxSafeInt32ReductionDepth();
   const bool float32_exact = inner <= MaxExactFloat32ReductionDepth();
   const bool outlier_risk =
@@ -354,8 +353,8 @@ std::optional<WeightPrecisionEstimate> EstimateConv(
       ActivationRange(act_producer, initializers, &act_op, &act_lo, &act_hi);
 
   WeightPrecisionEstimate est;
-  est.node_name = !node.name().empty() ? node.name()
-                                       : ("Conv(" + node.input(1) + ")");
+  est.node_name =
+      !node.name().empty() ? node.name() : ("Conv(" + node.input(1) + ")");
   est.op_type = "Conv";
   est.reduction_depth = inner;
   est.num_channels = cout;
@@ -367,9 +366,8 @@ std::optional<WeightPrecisionEstimate> EstimateConv(
   est.has_activation_range = has_act_range;
   est.activation_range_lo = act_lo;
   est.activation_range_hi = act_hi;
-  est.recommendation = BuildRecommendation(safe, float32_exact, outlier_risk,
-                                           act_op, has_act_range, act_lo,
-                                           act_hi);
+  est.recommendation = BuildRecommendation(
+      safe, float32_exact, outlier_risk, act_op, has_act_range, act_lo, act_hi);
   return est;
 }
 
@@ -451,24 +449,24 @@ std::optional<AttentionPrecisionEstimate> EstimateAttention(
       kv_heads = (*k_shape)[1];
     }
   } else if (q_shape != nullptr && k_shape != nullptr && q_shape->size() == 3 &&
-            k_shape->size() == 3 && kv_heads.has_value() &&
-            (*k_shape)[2].has_value()) {
+             k_shape->size() == 3 && kv_heads.has_value() &&
+             (*k_shape)[2].has_value()) {
     head_dim = *(*k_shape)[2] / *kv_heads;
   }
 
   const std::optional<double> default_scale =
-      head_dim.has_value() ? std::optional<double>(1.0 / std::sqrt(
-                                 static_cast<double>(*head_dim)))
-                           : std::nullopt;
+      head_dim.has_value()
+          ? std::optional<double>(1.0 /
+                                  std::sqrt(static_cast<double>(*head_dim)))
+          : std::nullopt;
   const std::optional<double> actual_scale = GetAttrFloat(node, "scale");
   int matches = -1;
   if (default_scale.has_value() && actual_scale.has_value()) {
     // math.isclose(..., rel_tol=1e-3)
     const double a = *default_scale, b = *actual_scale;
-    matches = (std::fabs(a - b) <=
-              1e-3 * std::max(std::fabs(a), std::fabs(b)))
-                 ? 1
-                 : 0;
+    matches = (std::fabs(a - b) <= 1e-3 * std::max(std::fabs(a), std::fabs(b)))
+                  ? 1
+                  : 0;
   }
 
   std::string recommendation;
@@ -579,16 +577,17 @@ ModelQuantizationEstimate EstimateModelQuantizationDrop(
     if (!std::isnan(est.max_outlier_ratio)) {
       outlier_ratios.push_back(est.max_outlier_ratio);
     }
-    const double per_node_relative_error = ratio / kUniformQuantizerNoiseDivisor;
+    const double per_node_relative_error =
+        ratio / kUniformQuantizerNoiseDivisor;
     sum_squared_errors += per_node_relative_error * per_node_relative_error;
   }
 
-  out.total_nodes_analyzed = static_cast<int64_t>(out.weight_estimates.size() +
-                                                   out.attention_estimates.size());
-  out.worst_outlier_ratio = outlier_ratios.empty()
-                                ? std::numeric_limits<double>::quiet_NaN()
-                                : *std::max_element(outlier_ratios.begin(),
-                                                    outlier_ratios.end());
+  out.total_nodes_analyzed = static_cast<int64_t>(
+      out.weight_estimates.size() + out.attention_estimates.size());
+  out.worst_outlier_ratio =
+      outlier_ratios.empty()
+          ? std::numeric_limits<double>::quiet_NaN()
+          : *std::max_element(outlier_ratios.begin(), outlier_ratios.end());
   if (!out.unsafe_nodes.empty()) {
     out.risk_level = "unsafe";
     out.estimated_relative_error = std::numeric_limits<double>::quiet_NaN();

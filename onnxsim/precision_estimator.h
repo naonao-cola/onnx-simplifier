@@ -74,7 +74,7 @@ struct ModelQuantizationEstimate {
   int64_t total_nodes_analyzed = 0;
   std::vector<std::string> unsafe_nodes;
   std::vector<std::string> outlier_risk_nodes;
-  double worst_outlier_ratio = 0.0;      // NaN if no node had one
+  double worst_outlier_ratio = 0.0;       // NaN if no node had one
   double estimated_relative_error = 0.0;  // NaN if any unsafe_nodes
   std::string risk_level;                 // "unsafe" | "degraded" | "safe"
 };

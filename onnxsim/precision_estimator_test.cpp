@@ -35,7 +35,8 @@ void Check(bool cond, const std::string& what) {
   }
 }
 
-void CheckClose(double a, double b, const std::string& what, double rtol = 1e-6) {
+void CheckClose(double a, double b, const std::string& what,
+                double rtol = 1e-6) {
   Check(std::fabs(a - b) <= rtol * std::max(std::fabs(a), std::fabs(b)), what);
 }
 
@@ -164,9 +165,9 @@ void TestMatMulPastInt32BoundIsUnsafe() {
   Check(weights.size() == 1, "matmul unsafe: one estimate");
   if (!weights.empty()) {
     Check(!weights[0].int32_accumulator_safe, "matmul unsafe: flagged unsafe");
-    Check(weights[0].recommendation.find("int32-safe bound") !=
-              std::string::npos,
-          "matmul unsafe: recommendation mentions bound");
+    Check(
+        weights[0].recommendation.find("int32-safe bound") != std::string::npos,
+        "matmul unsafe: recommendation mentions bound");
   }
 }
 
@@ -235,9 +236,8 @@ void TestConvReductionDepthIsCinTimesKernelVolume() {
   auto w = MakeFloatInitializer("W", {cout, cin, kh, kw},
                                 RandomVec(cout * cin * kh * kw, 0.1f, 5), true);
   auto node = MakeNode("Conv", {"X", "W"}, {"Y"});
-  auto model =
-      MakeModel({node}, {MakeValueInfo("X", {1, cin, 16, 16})},
-               {MakeValueInfo("Y", {1, cout, 12, 12})}, {w});
+  auto model = MakeModel({node}, {MakeValueInfo("X", {1, cin, 16, 16})},
+                         {MakeValueInfo("Y", {1, cout, 12, 12})}, {w});
 
   std::vector<WeightPrecisionEstimate> weights;
   std::vector<AttentionPrecisionEstimate> attn;
@@ -245,8 +245,7 @@ void TestConvReductionDepthIsCinTimesKernelVolume() {
   Check(weights.size() == 1, "conv: one estimate");
   if (!weights.empty()) {
     Check(weights[0].op_type == "Conv", "conv: op_type");
-    Check(weights[0].reduction_depth == cin * kh * kw,
-          "conv: reduction_depth");
+    Check(weights[0].reduction_depth == cin * kh * kw, "conv: reduction_depth");
     Check(weights[0].num_channels == cout, "conv: num_channels");
   }
 }
@@ -257,12 +256,12 @@ void TestAttentionReportsHeadDimAndFlagsScaleMismatch() {
   AddIntAttr(node, "q_num_heads", q_heads);
   AddIntAttr(node, "kv_num_heads", kv_heads);
   AddFloatAttr(node, "scale", 1.0f);  // deliberately not 1/sqrt(head_dim)
-  auto model = MakeModel(
-      {node},
-      {MakeValueInfo("Q", {1, sq, q_heads * head_dim}),
-       MakeValueInfo("K", {1, skv, kv_heads * head_dim}),
-       MakeValueInfo("V", {1, skv, kv_heads * head_dim})},
-      {MakeValueInfo("O", {1, sq, q_heads * head_dim})}, {}, 23);
+  auto model =
+      MakeModel({node},
+                {MakeValueInfo("Q", {1, sq, q_heads * head_dim}),
+                 MakeValueInfo("K", {1, skv, kv_heads * head_dim}),
+                 MakeValueInfo("V", {1, skv, kv_heads * head_dim})},
+                {MakeValueInfo("O", {1, sq, q_heads * head_dim})}, {}, 23);
 
   std::vector<WeightPrecisionEstimate> weights;
   std::vector<AttentionPrecisionEstimate> attn;
@@ -272,10 +271,9 @@ void TestAttentionReportsHeadDimAndFlagsScaleMismatch() {
     Check(attn[0].head_dim == head_dim, "attention mismatch: head_dim");
     Check(attn[0].num_query_heads == q_heads,
           "attention mismatch: num_query_heads");
-    Check(attn[0].num_kv_heads == kv_heads,
-          "attention mismatch: num_kv_heads");
+    Check(attn[0].num_kv_heads == kv_heads, "attention mismatch: num_kv_heads");
     CheckClose(attn[0].default_scale, 1.0 / std::sqrt(double(head_dim)),
-              "attention mismatch: default_scale");
+               "attention mismatch: default_scale");
     Check(attn[0].scale_matches_default == 0,
           "attention mismatch: flagged mismatched");
     Check(attn[0].recommendation.find("does not match") != std::string::npos,
@@ -288,12 +286,12 @@ void TestAttentionScaleMatchingDefaultIsNotFlagged() {
   auto node = MakeNode("Attention", {"Q", "K", "V"}, {"O"});
   AddIntAttr(node, "q_num_heads", q_heads);
   AddIntAttr(node, "kv_num_heads", kv_heads);
-  auto model = MakeModel(
-      {node},
-      {MakeValueInfo("Q", {1, sq, q_heads * head_dim}),
-       MakeValueInfo("K", {1, skv, kv_heads * head_dim}),
-       MakeValueInfo("V", {1, skv, kv_heads * head_dim})},
-      {MakeValueInfo("O", {1, sq, q_heads * head_dim})}, {}, 23);
+  auto model =
+      MakeModel({node},
+                {MakeValueInfo("Q", {1, sq, q_heads * head_dim}),
+                 MakeValueInfo("K", {1, skv, kv_heads * head_dim}),
+                 MakeValueInfo("V", {1, skv, kv_heads * head_dim})},
+                {MakeValueInfo("O", {1, sq, q_heads * head_dim})}, {}, 23);
 
   std::vector<WeightPrecisionEstimate> weights;
   std::vector<AttentionPrecisionEstimate> attn;
@@ -329,8 +327,7 @@ void TestMatMulFedBySoftmaxReportsKnownActivationRange() {
     Check(weights[0].activation_range_lo == 0.0 &&
               weights[0].activation_range_hi == 1.0,
           "softmax range: (0, 1)");
-    Check(weights[0].int32_accumulator_safe,
-          "softmax range: still int32 safe");
+    Check(weights[0].int32_accumulator_safe, "softmax range: still int32 safe");
     Check(weights[0].recommendation.find(
               "fixed static scale would quantize it exactly") !=
               std::string::npos,
@@ -346,9 +343,8 @@ void TestConvFedByClipWithConstantBoundsReportsRange() {
   auto hi = MakeFloatInitializer("hi", {}, {6.0f}, true);
   auto clip = MakeNode("Clip", {"X", "lo", "hi"}, {"C"});
   auto conv = MakeNode("Conv", {"C", "W"}, {"Y"});
-  auto model =
-      MakeModel({clip, conv}, {MakeValueInfo("X", {1, cin, 8, 8})},
-               {MakeValueInfo("Y", {1, cout, 6, 6})}, {w, lo, hi});
+  auto model = MakeModel({clip, conv}, {MakeValueInfo("X", {1, cin, 8, 8})},
+                         {MakeValueInfo("Y", {1, cout, 6, 6})}, {w, lo, hi});
 
   std::vector<WeightPrecisionEstimate> weights;
   std::vector<AttentionPrecisionEstimate> attn;
@@ -412,9 +408,10 @@ void TestModelDropSafeWithNoOutliers() {
   Check(est.unsafe_nodes.empty(), "model drop safe: no unsafe nodes");
   Check(est.outlier_risk_nodes.empty(), "model drop safe: no outlier nodes");
   Check(est.risk_level == "safe", "model drop safe: risk_level");
-  CheckClose(est.worst_outlier_ratio, 1.0, "model drop safe: worst ratio", 1e-9);
+  CheckClose(est.worst_outlier_ratio, 1.0, "model drop safe: worst ratio",
+             1e-9);
   CheckClose(est.estimated_relative_error, 1.0 / (127.0 * std::sqrt(12.0)),
-            "model drop safe: estimated error", 1e-9);
+             "model drop safe: estimated error", 1e-9);
 }
 
 void TestModelDropDegradedWhenOutlierChannelPresent() {
@@ -454,14 +451,15 @@ void TestModelDropUnsafeReportsNanErrorAndListsTheNode() {
 
 void TestModelDropMoreUnsafeNodesWidenTheAggregateError() {
   const int64_t K = 16, N = 4;
-  auto w1 = MakeFloatInitializer("W1", {K, N}, RandomVec(K * N, 0.1f, 23), true);
-  auto w2 = MakeFloatInitializer("W2", {K, N}, RandomVec(K * N, 0.1f, 24), true);
+  auto w1 =
+      MakeFloatInitializer("W1", {K, N}, RandomVec(K * N, 0.1f, 23), true);
+  auto w2 =
+      MakeFloatInitializer("W2", {K, N}, RandomVec(K * N, 0.1f, 24), true);
   auto n1 = MakeNode("MatMul", {"X", "W1"}, {"Y1"});
   auto n2 = MakeNode("MatMul", {"X", "W2"}, {"Y2"});
-  auto model_two =
-      MakeModel({n1, n2}, {MakeValueInfo("X", {1, K})},
-               {MakeValueInfo("Y1", {1, N}), MakeValueInfo("Y2", {1, N})},
-               {w1, w2});
+  auto model_two = MakeModel(
+      {n1, n2}, {MakeValueInfo("X", {1, K})},
+      {MakeValueInfo("Y1", {1, N}), MakeValueInfo("Y2", {1, N})}, {w1, w2});
   auto model_one = MakeModel({n1}, {MakeValueInfo("X", {1, K})},
                              {MakeValueInfo("Y1", {1, N})}, {w1});
 
