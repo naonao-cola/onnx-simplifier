@@ -68,15 +68,19 @@ def peak_rss_mb():
 # treats a missing line as a crash).
 # --------------------------------------------------------------------------- #
 def run_onnxsim(onnx_path):
-    import onnx
-
     from onnxsim import simplify
 
-    model = onnx.load(onnx_path)
+    # Pass the path straight through instead of pre-loading it into a
+    # ModelProto: simplify() has a fast path for a file-path input (the C++
+    # core reads the file directly) that skips a Python<->C++
+    # SerializeToString/ParseFromString round trip a pre-loaded ModelProto
+    # otherwise always pays -- for a large model that round trip alone can
+    # rival the actual simplification time (see
+    # bench/RESULTS_profiling_survey.md).
     skipped = []
     while True:
         try:
-            model_simp, check = simplify(model, skipped_optimizers=skipped or None)
+            model_simp, check = simplify(onnx_path, skipped_optimizers=skipped or None)
             break
         except RuntimeError as e:
             m = re.search(r"passes/([A-Za-z0-9_]+)\.h", str(e))
