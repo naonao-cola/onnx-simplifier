@@ -152,8 +152,7 @@ inline void QuantizeWeightPerChannelKN(const Tensor& w_t, bool transposed,
   for (int64_t k = 0; k < K; ++k) {
     for (int64_t n = 0; n < N; ++n) {
       const float q = std::round(at(k, n) / scale[n]);
-      codes[k * N + n] =
-          static_cast<int8_t>(std::clamp(q, -127.0f, 127.0f));
+      codes[k * N + n] = static_cast<int8_t>(std::clamp(q, -127.0f, 127.0f));
     }
   }
   q_out.set_raw_data(WriteRawDataLittleEndian(codes));
@@ -205,8 +204,7 @@ inline void QuantizeWeightPerChannelInPlace(const Tensor& w_t,
     for (int64_t j = 0; j < dim1; ++j) {
       const int64_t c = channel_of(i, j);
       const float q = std::round(at(i, j) / scale[c]);
-      codes[i * dim1 + j] =
-          static_cast<int8_t>(std::clamp(q, -127.0f, 127.0f));
+      codes[i * dim1 + j] = static_cast<int8_t>(std::clamp(q, -127.0f, 127.0f));
     }
   }
   q_out.set_raw_data(WriteRawDataLittleEndian(codes));
@@ -504,8 +502,7 @@ inline bool TryQuantizeWeightBlockwiseInt8InPlace(const Tensor& w_t,
     for (int64_t j = 0; j < dim1; ++j) {
       const float s = scale[static_cast<size_t>(scale_index(i, j))];
       const float q = std::round(at(i, j) / s);
-      codes[i * dim1 + j] =
-          static_cast<int8_t>(std::clamp(q, -127.0f, 127.0f));
+      codes[i * dim1 + j] = static_cast<int8_t>(std::clamp(q, -127.0f, 127.0f));
     }
   }
   q_out.set_raw_data(WriteRawDataLittleEndian(codes));
