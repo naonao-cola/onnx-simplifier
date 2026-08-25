@@ -90,7 +90,7 @@ jobs:
         with:
           python-version: "3.13"
 
-      - run: pip install cmake ninja nanobind pyodide-build
+      - run: pip install cmake ninja nanobind pyodide-build setuptools
 
       # --- Host protoc -----------------------------------------------------
       # Same requirement as build_wasm.sh/static.yml's protoc handling:
