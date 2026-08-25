@@ -12,13 +12,18 @@
 // use (314.0.5, epoch 2026_0) built cleanly but produced a module ABI-
 // incompatible with onnx's only published wheel.
 //
-// Usage: node pyodide_smoke_test.mjs <path-to-onnxsim_cpp2py_export.abi3.so>
+// Usage: node pyodide_smoke_test.mjs <path-to-onnxsim_cpp2py_export.abi3.so> [path-to-onnxsim-package-dir]
+//
+// The second argument is optional and defaults to this script's own
+// `../onnxsim` -- correct when run in place inside a checkout, but pass it
+// explicitly when the script is copied elsewhere before running (as this
+// repo's own CI does, to work around Node resolving a bare `import
+// "pyodide"` relative to the script's location rather than the process
+// cwd -- see pyodide-wasm.yml's "Install the pyodide npm package" step).
 import { loadPyodide } from "pyodide";
 import { readFileSync, existsSync, readdirSync, statSync } from "node:fs";
 import { resolve, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-
-const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 
 function copyDirIntoFS(pyodide, src, dst) {
   pyodide.FS.mkdirTree(dst);
@@ -43,7 +48,13 @@ function fail(message) {
 async function main() {
   const soPathArg = process.argv[2];
   if (!soPathArg) {
-    fail(`usage: node pyodide_smoke_test.mjs <path-to-${MODULE_NAME}.abi3.so>`);
+    fail(`usage: node pyodide_smoke_test.mjs <path-to-${MODULE_NAME}.abi3.so> [path-to-onnxsim-package-dir]`);
+  }
+  const onnxsimDir = resolve(
+    process.argv[3] || join(dirname(fileURLToPath(import.meta.url)), "..", "onnxsim")
+  );
+  if (!existsSync(onnxsimDir)) {
+    fail(`onnxsim package directory not found at ${onnxsimDir} (pass it explicitly as the 2nd argument if this script isn't running from inside the repo checkout)`);
   }
   const soPath = resolve(soPathArg);
   if (!existsSync(soPath)) {
@@ -135,7 +146,7 @@ await micropip.install(["onnx", "rich"])
   }
   console.log(`micropip.install(["onnx", "rich"]): OK`);
 
-  copyDirIntoFS(pyodide, join(REPO_ROOT, "onnxsim"), `${sitePackages}/onnxsim`);
+  copyDirIntoFS(pyodide, onnxsimDir, `${sitePackages}/onnxsim`);
   console.log("copied onnxsim's pure-Python package into site-packages");
 
   const simplifyCode = `

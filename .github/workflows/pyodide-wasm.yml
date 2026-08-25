@@ -220,7 +220,7 @@ jobs:
       - name: Import the built module under Pyodide and call a real binding
         run: |
           cd /tmp/pyodide-smoke-test-env
-          node ./pyodide_smoke_test.mjs "${SO_PATH}"
+          node ./pyodide_smoke_test.mjs "${SO_PATH}" "${GITHUB_WORKSPACE}/onnxsim"
 
       # scripts/pyodide_demo/index.html fetches this module at runtime rather
       # than it being committed (it's gitignored like every other *.so in this
