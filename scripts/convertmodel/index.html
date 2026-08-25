@@ -318,6 +318,17 @@ agraph (float[N] X) =&gt; (float[N] Y) {
                 <input type="radio" name="quantize-source" value="converted" id="quantize_source_converted">
                 <label for="quantize_source_converted" title="Runs the selected quantize method on the Convert section's own simplify/optimize output, so it applies to already-simplified graphs (e.g. fused Conv+BN, MatMul+Add -> Gemm) rather than the raw upload. Run Simplify/Optimize above first.">onnxsim-simplified (Convert section result)</label>
             </div>
+            <p class="tool-note">
+                Before picking a method, you can check whether INT8 (Dynamic /
+                Static / QOperator's scheme) looks numerically safe for this
+                model -- a static analysis of its own weights and shapes, no
+                execution or calibration data needed, so it runs instantly.
+            </p>
+            <div class="debug-actions">
+                <button id="quantize-risk-button" type="button">Check quantization risk</button>
+                <span id="quantize-risk-status" class="tool-note"></span>
+            </div>
+            <div id="quantize-risk-result" style="display: none; margin-top: 0.4em;"></div>
             <p class="tool-note">Pick a method:</p>
             <ul class="tool-note">
                 <li><b>Dynamic</b> -- MatMul/Gemm weights are quantized to INT8
@@ -415,6 +426,7 @@ agraph (float[N] X) =&gt; (float[N] Y) {
             </div>
         </div>
         <script type="module" src="./quantize_ui.mjs"></script>
+        <script type="module" src="./quantize_risk_estimate.mjs"></script>
         <h2 id="sec-visualize">Visualize with Netron (before / after)</h2>
         <p>
             Renders the model graph with a self-hosted

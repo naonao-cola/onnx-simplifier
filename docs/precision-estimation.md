@@ -2,19 +2,24 @@
 
 ## What this is
 
-`onnxsim.estimate_quantization_precision` is a pure-Python, read-only
-analysis (`onnxsim/precision_estimator.py`) that answers a narrower version of
-"is INT8 safe here?" than actually running the model: given only a node's
-**constant weight values** and its **shape hyperparameters** (the reduction
-depth for MatMul/Gemm, `Cin/groups * kernel-volume` for Conv, `num_heads` /
-`head_dim` for Attention), it estimates whether the INT8 scheme
-`onnxsim.quantize_dynamic`/`quantize_static` apply (see
-[dynamic-quantization.md](dynamic-quantization.md)) is numerically safe and
-well-resolved for that node — without executing the model or needing
-calibration data.
+`onnxsim.estimate_quantization_precision` is a read-only analysis that
+answers a narrower version of "is INT8 safe here?" than actually running the
+model: given only a node's **constant weight values** and its **shape
+hyperparameters** (the reduction depth for MatMul/Gemm, `Cin/groups *
+kernel-volume` for Conv, `num_heads` / `head_dim` for Attention), it
+estimates whether the INT8 scheme `onnxsim.quantize_dynamic`/`quantize_static`
+apply (see [dynamic-quantization.md](dynamic-quantization.md)) is numerically
+safe and well-resolved for that node — without executing the model or
+needing calibration data.
 
-It never modifies the model, has no C++/pybind component, and does not
-require building onnxsim's C++ extension.
+It never modifies the model. The analysis itself runs in C++
+(`onnxsim/precision_estimator.h`/`.cpp`) — the same implementation the WASM
+converter demo's "Check quantization risk" button calls into
+(`scripts/convertmodel/interface.cpp`), so the algorithm exists in exactly
+one place rather than a separate Python and C++ copy. `onnxsim/precision_estimator.py`
+is a thin wrapper that reconstructs the dataclasses documented below from the
+compiled extension's result, so this needs onnxsim's C++ extension built
+(the normal case for any `pip install onnxsim` / built-from-source install).
 
 ```python
 import onnx
