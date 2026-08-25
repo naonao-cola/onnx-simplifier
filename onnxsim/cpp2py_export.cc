@@ -14,7 +14,9 @@
 #include <nanobind/trampoline.h>
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <tuple>
 #include <unordered_map>
@@ -28,6 +30,7 @@
 #include "onnx/proto_utils.h"
 #include "onnxoptimizer/optimize.h"
 #include "onnxsim.h"
+#include "precision_estimator.h"
 #include "tensor_pool.h"
 #include "tensor_pool_bridge.h"
 #include "tensor_pool_gguf_bridge.h"
@@ -882,6 +885,89 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
         return py::bytes(out.data(), out.size());
       },
       "model_bytes"_a, "format"_a = "e4m3", "keep_io_types"_a = true);
+
+  // Static, calibration-free INT8-quantization risk analysis -- the single
+  // C++ implementation (onnxsim/precision_estimator.{h,cpp}) that both this
+  // Python binding and the WASM UI (scripts/convertmodel/interface.cpp) call
+  // into, so the algorithm exists in exactly one place rather than two
+  // (Python used to carry its own parallel implementation). The Python-facing
+  // ``onnxsim.precision_estimator`` module is a thin wrapper that reconstructs
+  // its public dataclasses from the tuples returned here; see that module's
+  // docstring. Each weight-estimate tuple is (node_name, op_type,
+  // reduction_depth, num_channels, int32_accumulator_safe, float32_cast_exact,
+  // max_outlier_ratio, outlier_risk, activation_producer_op,
+  // activation_range_lo, activation_range_hi, recommendation) -- the last
+  // three fields are None together (no known range) or all present. Each
+  // attention-estimate tuple is (node_name, num_query_heads, num_kv_heads,
+  // head_dim, default_scale, actual_scale, scale_matches_default,
+  // recommendation).
+  m.def(
+      "_estimate_model_quantization_drop",
+      [](const py::bytes& model_proto_bytes) {
+        ONNX_NAMESPACE::ModelProto model;
+        ParseProtoFromBytes(&model, model_proto_bytes.c_str(),
+                            model_proto_bytes.size());
+        const onnxsim::ModelQuantizationEstimate est =
+            onnxsim::EstimateModelQuantizationDrop(model);
+
+        using WeightTuple =
+            std::tuple<std::string, std::string, int64_t, int64_t, bool, bool,
+                       double, bool, std::optional<std::string>,
+                       std::optional<double>, std::optional<double>,
+                       std::string>;
+        std::vector<WeightTuple> weight_estimates;
+        weight_estimates.reserve(est.weight_estimates.size());
+        for (const auto& w : est.weight_estimates) {
+          weight_estimates.emplace_back(
+              w.node_name, w.op_type, w.reduction_depth, w.num_channels,
+              w.int32_accumulator_safe, w.float32_cast_exact,
+              w.max_outlier_ratio, w.outlier_risk,
+              w.activation_producer_op.empty()
+                  ? std::nullopt
+                  : std::optional<std::string>(w.activation_producer_op),
+              w.has_activation_range
+                  ? std::optional<double>(w.activation_range_lo)
+                  : std::nullopt,
+              w.has_activation_range
+                  ? std::optional<double>(w.activation_range_hi)
+                  : std::nullopt,
+              w.recommendation);
+        }
+
+        using AttentionTuple =
+            std::tuple<std::string, std::optional<int64_t>,
+                       std::optional<int64_t>, std::optional<int64_t>,
+                       std::optional<double>, std::optional<double>,
+                       std::optional<bool>, std::string>;
+        std::vector<AttentionTuple> attention_estimates;
+        attention_estimates.reserve(est.attention_estimates.size());
+        for (const auto& a : est.attention_estimates) {
+          attention_estimates.emplace_back(
+              a.node_name,
+              a.has_num_query_heads ? std::optional<int64_t>(a.num_query_heads)
+                                    : std::nullopt,
+              a.has_num_kv_heads ? std::optional<int64_t>(a.num_kv_heads)
+                                 : std::nullopt,
+              a.has_head_dim ? std::optional<int64_t>(a.head_dim)
+                             : std::nullopt,
+              std::isnan(a.default_scale)
+                  ? std::nullopt
+                  : std::optional<double>(a.default_scale),
+              std::isnan(a.actual_scale)
+                  ? std::nullopt
+                  : std::optional<double>(a.actual_scale),
+              a.scale_matches_default < 0
+                  ? std::nullopt
+                  : std::optional<bool>(a.scale_matches_default != 0),
+              a.recommendation);
+        }
+
+        return std::make_tuple(est.total_nodes_analyzed, est.unsafe_nodes,
+                               est.outlier_risk_nodes, est.worst_outlier_ratio,
+                               est.estimated_relative_error, est.risk_level,
+                               weight_estimates, attention_estimates);
+      },
+      "model_bytes"_a);
 
   m.def(
        "simplify",
