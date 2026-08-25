@@ -27,6 +27,7 @@
 #include "passes/fuse_preceding_mul_into_conv.h"
 #include "passes/fuse_qkv.h"
 #include "passes/fuse_rms_norm.h"
+#include "passes/fuse_rope.h"
 #include "passes/qoperator_quantize_activation.h"
 #include "passes/qoperator_quantize_concat.h"
 #include "passes/qoperator_quantize_conv.h"
@@ -97,6 +98,7 @@ void RegisterCustomOptimizerPasses() {
     RegisterOrReplace<p::FuseMulIntoConv>(registry);
     RegisterOrReplace<p::FusePrecedingMulIntoConv>(registry);
     RegisterOrReplace<p::FuseRMSNorm>(registry);
+    RegisterOrReplace<p::FuseRope>(registry);
     RegisterOrReplace<p::QOperatorQuantizeActivation>(registry);
     RegisterOrReplace<p::QOperatorQuantizeConcat>(registry);
     RegisterOrReplace<p::QOperatorQuantizeConv>(registry);

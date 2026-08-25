@@ -290,6 +290,178 @@ def test_fuse_rms_norm_below_opset_23_untouched():
     assert ops["Mul"] == 2
 
 
+# --------------------------------------------------------------------------- #
+# fuse_rope -- HuggingFace-style "rotate_half" rotary position embedding
+# application (see fuse_rope.h's own top comment and test_mnn_llm_export.py's
+# ``_Attention`` for a real traced example) collapsed into a single standard
+# ONNX ``RotaryEmbedding`` node (opset 23). Q's and K's applications share one
+# ``cos``/``sin``/``Concat`` computation (``emb = concat([angle, angle])``);
+# both must be recognized as reading the *same* ``angle`` Value for the
+# fusion to be numerically exact -- see MatchRopeCosSin's own doc comment.
+# --------------------------------------------------------------------------- #
+def _rope_apply_nodes(x_name, cos_bcast_name, sin_bcast_name, prefix, half):
+    # x_embed = x * cos_bcast + rotate_half(x) * sin_bcast
+    return [
+        onnx.helper.make_node("Mul", [x_name, cos_bcast_name], [f"{prefix}_a"]),
+        onnx.helper.make_node(
+            "Slice",
+            [x_name, "slice_start0", f"slice_end{half}", "slice_axism1"],
+            [f"{prefix}_x1"],
+        ),
+        onnx.helper.make_node(
+            "Slice",
+            [x_name, f"slice_start{half}", "slice_end_max", "slice_axism1"],
+            [f"{prefix}_x2"],
+        ),
+        onnx.helper.make_node("Neg", [f"{prefix}_x2"], [f"{prefix}_neg_x2"]),
+        onnx.helper.make_node(
+            "Concat",
+            [f"{prefix}_neg_x2", f"{prefix}_x1"],
+            [f"{prefix}_rotated"],
+            axis=-1,
+        ),
+        onnx.helper.make_node(
+            "Mul", [f"{prefix}_rotated", sin_bcast_name], [f"{prefix}_b"]
+        ),
+        onnx.helper.make_node(
+            "Add", [f"{prefix}_a", f"{prefix}_b"], [f"{prefix}_embed"]
+        ),
+    ]
+
+
+def _rope_model(B=2, NH=4, S=6, Dh=8, share_angle=True, opset=23):
+    half = Dh // 2
+    inits = [
+        _i64([0], "slice_start0"),
+        _i64([half], f"slice_end{half}"),
+        _i64([half], f"slice_start{half}"),
+        _i64([np.iinfo(np.int64).max], "slice_end_max"),
+        _i64([-1], "slice_axism1"),
+        _i64([1], "unsq_axis1"),
+    ]
+    angle2 = "angle" if share_angle else "angle2"
+    nodes = [
+        onnx.helper.make_node("Concat", ["angle", angle2], ["emb"], axis=-1),
+        onnx.helper.make_node("Cos", ["emb"], ["cos_full"]),
+        onnx.helper.make_node("Sin", ["emb"], ["sin_full"]),
+        onnx.helper.make_node("Unsqueeze", ["cos_full", "unsq_axis1"], ["cos_bcast"]),
+        onnx.helper.make_node("Unsqueeze", ["sin_full", "unsq_axis1"], ["sin_bcast"]),
+    ]
+    nodes += _rope_apply_nodes("q", "cos_bcast", "sin_bcast", "q", half)
+    nodes += _rope_apply_nodes("k", "cos_bcast", "sin_bcast", "k", half)
+
+    graph_inputs = [
+        _vi("q", [B, NH, S, Dh]),
+        _vi("k", [B, NH, S, Dh]),
+        _vi("angle", [B, S, half]),
+    ]
+    if not share_angle:
+        # A second, independent (shape-identical but not the same Value, and
+        # not foldable back to `angle`) input: the duplicating Concat's two
+        # inputs are then genuinely different, so fuse_rope must decline
+        # rather than assume this is duplication.
+        graph_inputs.append(_vi("angle2", [B, S, half]))
+    graph = onnx.helper.make_graph(
+        nodes,
+        "g",
+        graph_inputs,
+        [_vi("q_embed", [B, NH, S, Dh]), _vi("k_embed", [B, NH, S, Dh])],
+        inits,
+    )
+    return onnx.helper.make_model(
+        graph, opset_imports=[onnx.helper.make_opsetid("", opset)], ir_version=11
+    )
+
+
+def test_fuse_rope():
+    model = _rope_model()
+    _, ops = _simplify(model)
+    assert ops["RotaryEmbedding"] == 2
+    # The whole shared cos/sin/Concat/Unsqueeze chain, and each side's own
+    # Slice/Neg/Concat/Mul/Add chain, must be fully torn down -- not just
+    # left as dead code (see fuse_rope.h's MaybeAppendSharedChain).
+    assert ops["Concat"] == 0
+    assert ops["Slice"] == 0
+    assert ops["Neg"] == 0
+    assert ops["Unsqueeze"] == 0
+    assert ops["Mul"] == 0
+    assert ops["Add"] == 0
+
+
+def test_fuse_rope_below_opset_23_untouched():
+    # Below opset 23, RotaryEmbedding does not exist yet: the pass must not
+    # fire, leaving the decomposition intact.
+    model = _rope_model(opset=17)
+    model.ir_version = 10
+    _, ops = _simplify(model)
+    assert ops["RotaryEmbedding"] == 0
+    assert ops["Concat"] == 3  # shared emb + each side's rotate_half Concat
+
+
+def test_fuse_rope_declines_non_shared_angle():
+    # cos/sin are computed from concat([angle, angle2]) where angle2 is a
+    # *different* Value from angle (even though shape-identical) rather than
+    # literally the same one -- MatchRopeCosSin's reference-identity check on
+    # the Concat's two inputs must catch this and decline, since wiring a
+    # non-duplicated cos/sin into RotaryEmbedding would compute something
+    # else entirely.
+    model = _rope_model(share_angle=False)
+    _, ops = _simplify(model)
+    assert ops["RotaryEmbedding"] == 0
+
+
+def test_fuse_rope_partial_match_preserves_shared_chain():
+    # Only Q's side matches the rotate_half pattern; K instead just multiplies
+    # by cos_bcast directly (a stand-in for "some other, unmatched use").
+    # fuse_rope must still fuse Q, and must NOT tear down the shared
+    # cos/sin/Concat chain (K still reads it) -- MaybeAppendSharedChain's own
+    # live-use-count check should correctly see cos_bcast/sin_bcast still
+    # have a remaining consumer and leave them alone.
+    B, NH, S, Dh = 2, 4, 6, 8
+    half = Dh // 2
+    inits = [
+        _i64([0], "slice_start0"),
+        _i64([half], f"slice_end{half}"),
+        _i64([half], f"slice_start{half}"),
+        _i64([np.iinfo(np.int64).max], "slice_end_max"),
+        _i64([-1], "slice_axism1"),
+        _i64([1], "unsq_axis1"),
+    ]
+    nodes = [
+        onnx.helper.make_node("Concat", ["angle", "angle"], ["emb"], axis=-1),
+        onnx.helper.make_node("Cos", ["emb"], ["cos_full"]),
+        onnx.helper.make_node("Sin", ["emb"], ["sin_full"]),
+        onnx.helper.make_node("Unsqueeze", ["cos_full", "unsq_axis1"], ["cos_bcast"]),
+        onnx.helper.make_node("Unsqueeze", ["sin_full", "unsq_axis1"], ["sin_bcast"]),
+    ]
+    nodes += _rope_apply_nodes("q", "cos_bcast", "sin_bcast", "q", half)
+    # K: deliberately NOT the rotate_half pattern -- just k * cos_bcast.
+    nodes.append(onnx.helper.make_node("Mul", ["k", "cos_bcast"], ["k_embed"]))
+
+    graph = onnx.helper.make_graph(
+        nodes,
+        "g",
+        [
+            _vi("q", [B, NH, S, Dh]),
+            _vi("k", [B, NH, S, Dh]),
+            _vi("angle", [B, S, half]),
+        ],
+        [_vi("q_embed", [B, NH, S, Dh]), _vi("k_embed", [B, NH, S, Dh])],
+        inits,
+    )
+    model = onnx.helper.make_model(
+        graph, opset_imports=[onnx.helper.make_opsetid("", 23)], ir_version=11
+    )
+    simplified, ops = _simplify(model)
+    assert ops["RotaryEmbedding"] == 1
+    # K's own Mul(k, cos_bcast) must still resolve correctly -- proving the
+    # shared cos_bcast (and everything upstream of it) was left intact.
+    k_embed = next(o for o in simplified.graph.output if o.name == "k_embed")
+    assert k_embed is not None
+    remaining_muls = [n for n in simplified.graph.node if n.op_type == "Mul"]
+    assert any("k" in n.input for n in remaining_muls)
+
+
 def test_fuse_concat_into_reshape():
     # A Concat of constant shape pieces feeding a Reshape is folded into a single
     # Reshape with a constant target shape (fuse_concat_into_reshape).
