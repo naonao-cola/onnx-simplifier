@@ -10,11 +10,15 @@
 // onnxruntime-web to actually run the models).
 //
 // Loaded as its own top-level module (a <script type="module"> tag right
-// after quantize_ui.mjs's own in index.html), not imported by it -- so this
-// can import resolveQuantizeInput/getRuntime from quantize_ui.mjs directly
-// with no circular-import concern.
-
-import { getRuntime, resolveQuantizeInput } from "./quantize_ui.mjs";
+// after quantize_ui.mjs's own in index.html), not imported by it.
+// resolveQuantizeInput/getRuntime are imported lazily, inside the click
+// handler below, rather than at module scope: quantize_ui.mjs pulls in
+// inference_browser.mjs, which touches `document` unconditionally at module
+// scope (no browser-environment guard), so a static top-level import here
+// would make this module -- and therefore its pure, DOM-free helpers below --
+// impossible to load under plain Node (see test/quantize_risk_estimate.test.mjs,
+// which imports only those helpers and needs this module's own top-level code
+// to run without a DOM).
 
 // Runs onnxsim_estimate_quantization_drop on `bytes` via `runtime` (the
 // page's WASM module) and returns the parsed result. Throws if the model
@@ -111,6 +115,7 @@ function initQuantizeRiskPanel() {
       resultEl.innerHTML = "";
     }
     try {
+      const { getRuntime, resolveQuantizeInput } = await import("./quantize_ui.mjs");
       setStatus("loading model…");
       const { bytes } = await resolveQuantizeInput(source, fileInput);
 
@@ -131,4 +136,6 @@ function initQuantizeRiskPanel() {
   });
 }
 
-initQuantizeRiskPanel();
+if (typeof window !== "undefined" && typeof document !== "undefined") {
+  initQuantizeRiskPanel();
+}
