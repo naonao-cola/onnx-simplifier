@@ -1,9 +1,13 @@
 from onnxsim.accuracy import (
+    DEFAULT_QUANTIZATION_CANDIDATES,
     AccuracyDropReport,
     OutputAccuracyStats,
     QuantizationConfig,
+    QuantizationRecommendation,
     measure_accuracy_drop,
     quantize,
+    quantize_auto,
+    recommend_quantization,
 )
 from onnxsim.calibration import (
     calibrate,
@@ -53,6 +57,10 @@ __all__ = [
     "simplify",
     "quantize",
     "QuantizationConfig",
+    "recommend_quantization",
+    "quantize_auto",
+    "QuantizationRecommendation",
+    "DEFAULT_QUANTIZATION_CANDIDATES",
     "quantize_attention_dynamic",
     "quantize_dynamic",
     "quantize_dynamic_matmul_integer_to_float",
