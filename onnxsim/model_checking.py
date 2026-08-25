@@ -125,7 +125,7 @@ def _custom_default_domain_ops(model: onnx.ModelProto) -> Set[str]:
 
 
 def compare(
-    model_opt: Union[str, onnx.ModelProto],
+    model_opt: Union[str, bytes, onnx.ModelProto],
     model_ori: Union[str, onnx.ModelProto],
     n_times: int = 5,
     input_shapes: Optional[TensorShapes] = None,
@@ -137,7 +137,12 @@ def compare(
     input_fill: str = "random",
 ) -> bool:
     """
-    :param model_opt: The simplified ONNX model
+    :param model_opt: The simplified ONNX model. May be given as already-serialized
+        ``bytes`` or a file path instead of a loaded ``ModelProto`` when ``n_times
+        == 0`` -- ``onnx.checker.check_model`` accepts either directly (no
+        re-serialization needed), and nothing else touches ``model_opt`` in that
+        case. Passing bytes/a path with ``n_times > 0`` is not supported: the
+        per-trial inference loop needs a real ``ModelProto``.
     :param model_ori: The original ONNX model
     :param n_times: Generate n random inputs
     :param input_shapes: Shapes of generated random inputs
@@ -279,7 +284,18 @@ def compare(
         # registered for <op> ...". onnxsim preserves such ops unchanged, so
         # tolerate that specific error instead of failing (GitHub issues #107,
         # #220). Any other validation error is a genuine problem and re-raised.
-        custom_ops = _custom_default_domain_ops(model_opt)
+        # This is the one spot that needs a real ModelProto to walk the graph --
+        # rare enough (only reached on a validation failure) that materializing
+        # one here, if the caller instead handed us bytes/a path to save the
+        # checker a re-serialize on the common (no-error) path, costs nothing
+        # that matters.
+        if isinstance(model_opt, onnx.ModelProto):
+            model_opt_proto = model_opt
+        elif isinstance(model_opt, bytes):
+            model_opt_proto = onnx.load_from_string(model_opt)
+        else:
+            model_opt_proto = onnx.load(model_opt)
+        custom_ops = _custom_default_domain_ops(model_opt_proto)
         message = str(e)
         if custom_ops and any(op in message for op in custom_ops):
             print(
