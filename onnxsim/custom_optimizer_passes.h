@@ -23,7 +23,9 @@ namespace onnxsim {
 //   - fuse_matmul_add_bias_into_gemm_batched
 //   - eliminate_reshape_around_elementwise
 //   - fuse_rms_norm
+//   - fuse_rope
 //   - fuse_gelu
+//   - fuse_gqa
 //   - fuse_layer_norm
 //   - dynamic_quantize_matmul
 //   - dynamic_quantize_matmul_integer_to_float

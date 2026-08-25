@@ -491,3 +491,137 @@ def test_fuse_attention_recovers_input_flattened_by_gemm_conversion():
     rng2 = np.random.default_rng(21)
     x = rng2.standard_normal((B, S, H)).astype(np.float32)
     _assert_close(_run(model, {"x": x}), _run(simplified, {"x": x}))
+
+
+# --------------------------------------------------------------------------- #
+# scaled_dot_product_attention's *dynamo* export spells K's "swap the last
+# two axes for K^T" step differently from every other exporter this pass
+# handles: instead of folding it directly into K's own head-split Transpose
+# (perm [0,2,3,1], the "direct" form every other test above relies on), it
+# head-splits K exactly like Q/V (perm [0,2,1,3]) and then swaps the last two
+# axes as a *separate*, 3-D-round-tripping step: Reshape -> Transpose([0,2,1])
+# -> Reshape. See MatchKTransposeSwapChain in fuse_attention.h.
+# --------------------------------------------------------------------------- #
+def _k_transpose_swap_chain_nodes(
+    k_headsplit_out, B, NH, S, Dh, prefix, final_shape=None, flat_shape=None
+):
+    flat_shape = flat_shape if flat_shape is not None else [B * NH, S, Dh]
+    flat_shape = _i64(flat_shape, f"{prefix}_flat_shape")
+    final_shape = final_shape if final_shape is not None else [B, NH, Dh, S]
+    final_shape_init = _i64(final_shape, f"{prefix}_final_shape")
+    nodes = [
+        onnx.helper.make_node(
+            "Reshape", [k_headsplit_out, flat_shape.name], [f"{prefix}_flat"]
+        ),
+        onnx.helper.make_node(
+            "Transpose", [f"{prefix}_flat"], [f"{prefix}_swapped"], perm=[0, 2, 1]
+        ),
+        onnx.helper.make_node(
+            "Reshape", [f"{prefix}_swapped", final_shape_init.name], [f"{prefix}_kt"]
+        ),
+    ]
+    return nodes, [flat_shape, final_shape_init], f"{prefix}_kt"
+
+
+def _dynamo_style_k_model(
+    B=2, S=5, H=32, NH=4, bias=True, seed=30, k_final_shape=None, k_flat_shape=None
+):
+    Dh = H // NH
+    rng = np.random.default_rng(seed)
+    inits = []
+    nodes = []
+
+    shape_qkv = _i64([B, S, NH, Dh], "shape_qkv")
+    inits.append(shape_qkv)
+
+    q_nodes, q_inits, q_out = _linear_nodes(rng, "x", H, H, "q", bias)
+    k_nodes, k_inits, k_out = _linear_nodes(rng, "x", H, H, "k", bias)
+    v_nodes, v_inits, v_out = _linear_nodes(rng, "x", H, H, "v", bias)
+    nodes += q_nodes + k_nodes + v_nodes
+    inits += q_inits + k_inits + v_inits
+
+    qh_nodes, q_t = _head_split_nodes(q_out, "shape_qkv", [0, 2, 1, 3], "q")
+    # Unlike every other test above, K is head-split with the *same* perm as
+    # Q/V (not the direct-to-[0,2,3,1] form) -- the swap happens afterward.
+    kh_nodes, k_headsplit = _head_split_nodes(k_out, "shape_qkv", [0, 2, 1, 3], "k")
+    vh_nodes, v_t = _head_split_nodes(v_out, "shape_qkv", [0, 2, 1, 3], "v")
+    nodes += qh_nodes + kh_nodes + vh_nodes
+
+    kswap_nodes, kswap_inits, k_t = _k_transpose_swap_chain_nodes(
+        k_headsplit,
+        B,
+        NH,
+        S,
+        Dh,
+        "kswap",
+        final_shape=k_final_shape,
+        flat_shape=k_flat_shape,
+    )
+    nodes += kswap_nodes
+    inits += kswap_inits
+
+    divisor = _f32(np.array(float(Dh) ** 0.5), "divisor")
+    inits.append(divisor)
+    nodes.append(onnx.helper.make_node("MatMul", [q_t, k_t], ["qk"]))
+    nodes.append(onnx.helper.make_node("Div", ["qk", divisor.name], ["scores"]))
+    nodes.append(onnx.helper.make_node("Softmax", ["scores"], ["attn"], axis=-1))
+    nodes.append(onnx.helper.make_node("MatMul", ["attn", v_t], ["ctx0"]))
+    nodes.append(
+        onnx.helper.make_node("Transpose", ["ctx0"], ["ctx1"], perm=[0, 2, 1, 3])
+    )
+    shape_ctx = _i64([B, S, H], "shape_ctx")
+    inits.append(shape_ctx)
+    nodes.append(onnx.helper.make_node("Reshape", ["ctx1", "shape_ctx"], ["ctx2"]))
+
+    out_nodes, out_inits, out_name = _linear_nodes(rng, "ctx2", H, H, "out", bias)
+    nodes += out_nodes
+    inits += out_inits
+    nodes.append(onnx.helper.make_node("Identity", [out_name], ["y"]))
+
+    graph = onnx.helper.make_graph(
+        nodes, "g", [_vi("x", [B, S, H])], [_vi("y", [B, S, H])], inits
+    )
+    return onnx.helper.make_model(
+        graph, opset_imports=[onnx.helper.make_opsetid("", 17)], ir_version=10
+    )
+
+
+def test_fuse_attention_handles_dynamo_k_transpose_reshape_chain():
+    # K's Reshape -> Transpose([0,2,1]) -> Reshape "swap last two axes" spelling
+    # (what scaled_dot_product_attention's dynamo exporter emits) must be
+    # recognized as equivalent to the direct perm-[0,2,3,1] form every other
+    # test above relies on.
+    B, S, H, NH = 2, 6, 32, 4
+    model = _dynamo_style_k_model(B=B, S=S, H=H, NH=NH)
+    simplified, ok = onnxsim.simplify(model)
+    assert ok
+    ops = _op_counts(simplified)
+    assert ops["Attention"] == 1
+    assert ops["Softmax"] == 0
+    onnx.checker.check_model(simplified)
+
+    rng = np.random.default_rng(31)
+    x = rng.standard_normal((B, S, H)).astype(np.float32)
+    _assert_close(_run(model, {"x": x}), _run(simplified, {"x": x}))
+
+
+def test_fuse_attention_declines_mismatched_k_transpose_reshape_chain():
+    # The first Reshape merges NH and S together ([B, NH*S, Dh]) instead of
+    # merging headsplit_out's actual leading two dims ([B*NH, S, Dh]) --
+    # coincidentally landing on the *same* final 4-D shape ([B, NH, Dh, S])
+    # as the genuine "swap the last two axes" chain despite computing a
+    # different permutation of the underlying data entirely. Checking only
+    # the final Reshape's shape (as an earlier, less careful version of
+    # MatchKTransposeSwapChain did) would wrongly accept this as equivalent
+    # and fuse it into a numerically wrong Attention node; the intermediate
+    # shape check must catch it and decline instead.
+    B, S, H, NH = 2, 6, 32, 4
+    Dh = H // NH
+    model = _dynamo_style_k_model(B=B, S=S, H=H, NH=NH, k_flat_shape=[B, NH * S, Dh])
+    simplified, ok = onnxsim.simplify(model)
+    assert ok
+    assert _op_counts(simplified)["Attention"] == 0
+
+    rng = np.random.default_rng(32)
+    x = rng.standard_normal((B, S, H)).astype(np.float32)
+    _assert_close(_run(model, {"x": x}), _run(simplified, {"x": x}))
