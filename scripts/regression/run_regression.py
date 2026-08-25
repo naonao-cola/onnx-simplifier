@@ -19,6 +19,8 @@ does not fail the job (legitimate optimizer changes move those numbers).
 Usage:
     run_regression.py --shard 0 --num-shards 6 --output shard-0.csv
     run_regression.py --slow-only --output slow.csv     # the known-slow models
+    run_regression.py --shard 0 --num-shards 6 --output shard-0.csv \
+        --profile-dir profiles   # + one ONNXSIM_PROFILE trace per model
 """
 
 from __future__ import annotations
@@ -103,7 +105,26 @@ def main():
         "this budget); <=0 disables",
     )
     ap.add_argument("--output", default="regression.csv")
+    ap.add_argument(
+        "--profile-dir",
+        default=None,
+        help="capture onnxsim's ONNXSIM_PROFILE trace for each model into this "
+        "directory (one <model>.json per model), via worker.py's onnxsim runner. "
+        "Off by default: it adds a background RSS-sampler thread and a trace "
+        "write per model, overhead not worth paying on every scheduled run -- "
+        "use it for investigating a specific slow/regressed run "
+        "(see bench/RESULTS_profiling_survey.md).",
+    )
     args = ap.parse_args()
+
+    if args.profile_dir:
+        os.makedirs(args.profile_dir, exist_ok=True)
+        # Inherited by every worker.py subprocess this launches (the
+        # orchestrator, and in turn its own --run-tool onnxsim child), since
+        # none of those subprocess.run() calls override env=.
+        os.environ["ONNXSIM_REGRESSION_PROFILE_DIR"] = os.path.abspath(
+            args.profile_dir
+        )
 
     models = load_models()
     if args.slow_only:

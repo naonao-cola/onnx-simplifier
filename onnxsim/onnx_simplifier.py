@@ -1185,7 +1185,25 @@ def simplify(
                             overwrite_input_shapes,
                             unused_output,
                         )
+                        # check_n == 0 is guaranteed on this path (the fast-path
+                        # gate above requires it), so compare() only needs
+                        # model_opt for the checker call below -- check straight
+                        # from disk (the checker's own C++ file loader) rather
+                        # than loading it into a ModelProto first just to have
+                        # the checker re-serialize it right back to bytes.
+                        check_ok = model_checking.compare(
+                            fast_out_path,
+                            None,
+                            0,
+                            test_input_shapes,
+                            input_data,
+                            custom_lib,
+                            rtol=check_rtol,
+                            atol=check_atol,
+                            input_fill=input_fill,
+                        )
                         model_opt = onnx.load(fast_out_path)
+                    return model_opt, check_ok
                 else:
                     model_bytes = model.SerializeToString()
                     if len(model_bytes) >= 2 * 1024 * 1024 * 1024:
@@ -1207,18 +1225,22 @@ def simplify(
                     )
                     if len(model_opt_bytes) == 0:
                         raise ValueError("Simplified model larger than 2GB")
+                    # Same idea as the path branch above: check_n == 0 here too,
+                    # so hand the checker the bytes we already have instead of
+                    # loading them into a ModelProto (below) and making the
+                    # checker serialize that right back to bytes.
+                    check_ok = model_checking.compare(
+                        model_opt_bytes,
+                        None,
+                        0,
+                        test_input_shapes,
+                        input_data,
+                        custom_lib,
+                        rtol=check_rtol,
+                        atol=check_atol,
+                        input_fill=input_fill,
+                    )
                     model_opt = onnx.load_from_string(model_opt_bytes)
-                check_ok = model_checking.compare(
-                    model_opt,
-                    None,
-                    0,
-                    test_input_shapes,
-                    input_data,
-                    custom_lib,
-                    rtol=check_rtol,
-                    atol=check_atol,
-                    input_fill=input_fill,
-                )
                 return model_opt, check_ok
             except Exception:
                 pass
@@ -1342,7 +1364,11 @@ def simplify(
             model = None
         model_opt = onnx.load_from_string(model_opt_bytes)
         check_ok = model_checking.compare(
-            model_opt,
+            # At check_n == 0, compare() only feeds this to the checker (see the
+            # comment above), which accepts bytes directly -- pass the bytes we
+            # already have instead of the ModelProto we just deserialized them
+            # into, so the checker isn't made to re-serialize it right back.
+            model_opt_bytes if check_n == 0 else model_opt,
             model,
             check_n,
             test_input_shapes,

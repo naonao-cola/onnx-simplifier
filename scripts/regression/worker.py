@@ -68,15 +68,40 @@ def peak_rss_mb():
 # treats a missing line as a crash).
 # --------------------------------------------------------------------------- #
 def run_onnxsim(onnx_path):
-    import onnx
-
     from onnxsim import simplify
 
-    model = onnx.load(onnx_path)
+    # Pass the path straight through instead of pre-loading it into a
+    # ModelProto: simplify() has a fast path for a file-path input (the C++
+    # core reads the file directly) that skips a Python<->C++
+    # SerializeToString/ParseFromString round trip a pre-loaded ModelProto
+    # otherwise always pays -- for a large model that round trip alone can
+    # rival the actual simplification time (see
+    # bench/RESULTS_profiling_survey.md).
+    #
+    # Opt-in per-model profiling: set by run_regression.py's --profile-dir
+    # (itself wired to the Model Regression workflow's "profile"
+    # workflow_dispatch input), inherited down through the orchestrator's and
+    # this child's subprocess environments. Off by default -- ONNXSIM_PROFILE
+    # runs a background RSS-sampler thread and writes a Chrome trace per
+    # model, overhead nobody wants paid on every scheduled run.
+    profile_dir = os.environ.get("ONNXSIM_REGRESSION_PROFILE_DIR")
+    profile_path = None
+    if profile_dir:
+        os.makedirs(profile_dir, exist_ok=True)
+        # The parent directory name is orchestrate()'s `local` (model_id with
+        # "/" -> "__"), which is unique per model; onnx_path's own basename
+        # often isn't (many repos just call it "model.onnx").
+        model_tag = os.path.basename(os.path.dirname(onnx_path)) or os.path.splitext(
+            os.path.basename(onnx_path)
+        )[0]
+        profile_path = os.path.join(profile_dir, f"{model_tag}.json")
+
     skipped = []
     while True:
         try:
-            model_simp, check = simplify(model, skipped_optimizers=skipped or None)
+            model_simp, check = simplify(
+                onnx_path, skipped_optimizers=skipped or None, profile=profile_path
+            )
             break
         except RuntimeError as e:
             m = re.search(r"passes/([A-Za-z0-9_]+)\.h", str(e))
