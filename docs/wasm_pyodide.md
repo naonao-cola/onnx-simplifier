@@ -1,12 +1,21 @@
 # Pyodide / wasm32-emscripten Python extension (experimental)
 
-**Status: experimental / build-verified only, NOT runtime-verified.** Nobody
-has loaded the module this produces inside a real Pyodide/JS runtime and
-confirmed `import onnxsim` actually works -- only structural checks have been
-done (it's a genuine WebAssembly binary, it has a `dylink.0` section, it
-exports `PyInit_onnxsim_cpp2py_export`, and it has the shape of imports a
-Pyodide side module needs resolved at `dlopen` time). Treat it as a
-promising, structurally-correct artifact, not a working package.
+**Status: the compiled extension module is confirmed working under a real
+Pyodide runtime.** CI (`.github/workflows/pyodide-wasm.yml`) builds
+`onnxsim_cpp2py_export.abi3.so`, loads it into a real Pyodide 314.0.5 runtime
+(the `pyodide` npm package under Node), and confirms `import
+onnxsim_cpp2py_export` succeeds and a real binding runs
+(`_list_optimizers()` returns onnx-optimizer's actual registered passes --
+`nop`, `eliminate_nop_cast`, ... -- not a stub). See
+`scripts/pyodide_smoke_test.mjs` and the workflow for exactly what that
+covers.
+
+**What's still open**: this verifies the low-level nanobind extension
+module alone, not the full `import onnxsim` / `onnxsim.simplify()` --
+`onnxsim` the pure-Python package additionally needs `onnx` and `rich`
+present inside the Pyodide environment (e.g. via `micropip`), which nothing
+here has attempted yet. Treat the extension itself as proven; the full
+package experience as not yet exercised.
 
 ## What this is
 
@@ -158,18 +167,14 @@ Output: `<BUILD_DIR>/onnxsim_cpp2py_export.abi3.so`, the script's last line.
 
 ## What's next
 
-CI now attempts the runtime verification this section used to describe as
-unscripted: `.github/workflows/pyodide-wasm.yml` runs `build_wasm_pyodide.sh`
-end to end (pinned Emscripten 5.0.3, Pyodide 314.0.5 xbuildenv headers), then
-loads the resulting `.abi3.so` inside a real Pyodide runtime (the `pyodide`
-npm package, under Node -- `scripts/pyodide_smoke_test.mjs`) and confirms
-`import onnxsim_cpp2py_export` succeeds and a real binding
-(`_list_optimizers()`) runs. That's still narrower than the top of this doc
-describes: it exercises the low-level nanobind extension module alone, not
-`import onnxsim` / `onnxsim.simplify()`, which additionally needs `onnx` and
-`rich` present inside the Pyodide environment -- not yet scripted.
+CI (`.github/workflows/pyodide-wasm.yml`) has gone green on a real run:
+`build_wasm_pyodide.sh` builds end to end (Emscripten 5.0.3, Pyodide 314.0.5
+xbuildenv headers), and `scripts/pyodide_smoke_test.mjs` confirms
+`import onnxsim_cpp2py_export` succeeds and `_list_optimizers()` returns
+onnx-optimizer's real registered passes under a real Pyodide 314.0.5
+runtime. See the "Status" section at the top of this doc.
 
-**Until that workflow has actually gone green on a real run, treat this as
-still unverified** -- the "Status" line at the top of this doc is the source
-of truth; update it only once CI confirms the import works, not based on this
-section alone.
+Still not done: a full `import onnxsim` / `onnxsim.simplify()` integration
+test, which additionally needs `onnx` and `rich` installed inside the
+Pyodide environment (e.g. via `micropip`) -- a separate, not-yet-attempted
+step from verifying the compiled extension itself.
