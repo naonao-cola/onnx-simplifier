@@ -7,3 +7,4 @@ onnxruntime
 onnxscript==0.6.2
 timm==1.0.26
 sympy
+onnx_safetensors
