@@ -148,21 +148,23 @@ inline uint16_t FloatToFloat16Bits(float value) {
 }
 
 // Converts a constant float32 tensor of any rank/shape to float16, keeping
-// the same shape. float16 has no dedicated typed field in TensorProto (like
-// INT8/UINT8/etc., its values live in `int32_data`/`Tensor::int32s()`, each
-// entry the 16-bit bit pattern zero-extended to int32 -- see
-// third_party/onnx-optimizer/third_party/onnx/onnx/common/ir_pb_converter.cc's
-// FLOAT16 handling), unlike INT4, which needs the raw_data workaround other
-// onnxsim passes use.
+// the same shape. float16 has no dedicated typed field in TensorProto --
+// like INT8/UINT8/etc., ONNX's wire format allows storing its values in
+// `int32_data`/`Tensor::int32s()` too, each entry the 16-bit bit pattern
+// zero-extended to int32 -- but that costs up to 5x float16's own 2
+// bytes/element (see WriteRawDataLittleEndian's doc comment in
+// endian_read.h), so this packs the bit patterns into raw_data instead, the
+// same as INT4/INT8 do.
 inline Tensor ConvertFloatTensorToFp16(const Tensor& t) {
   const std::vector<float> data = ReadFloatTensorFlat(t);
   Tensor out;
   out.elem_type() = TensorProto_DataType_FLOAT16;
   out.sizes() = t.sizes();
-  out.int32s().resize(data.size());
+  std::vector<uint16_t> bits(data.size());
   for (size_t i = 0; i < data.size(); ++i) {
-    out.int32s()[i] = static_cast<int32_t>(FloatToFloat16Bits(data[i]));
+    bits[i] = FloatToFloat16Bits(data[i]);
   }
+  out.set_raw_data(WriteRawDataLittleEndian(bits));
   return out;
 }
 

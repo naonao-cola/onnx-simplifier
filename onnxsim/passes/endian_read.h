@@ -23,6 +23,7 @@
 
 #include <cstdint>
 #include <cstring>
+#include <string>
 #include <vector>
 
 #include "dlpack_dtype.h"
@@ -42,6 +43,36 @@ inline std::vector<T> ReadRawDataHostOrder(const T* raw, int64_t numel) {
   if constexpr (!onnxsim::dlpack::kRawDataIsHostOrder) {
     onnxsim::dlpack::SwapElementBytes(reinterpret_cast<uint8_t*>(out.data()),
                                       out.size() * sizeof(T), sizeof(T));
+  }
+  return out;
+}
+
+// The write-side counterpart of ReadRawDataHostOrder: packs a host-order
+// vector<T> into a little-endian-on-wire byte string, suitable for
+// Tensor::set_raw_data(). Every onnxsim quantization pass that builds a small
+// (1/2-byte-per-element) integer or float-bit-pattern tensor -- INT8/UINT8/
+// INT16/UINT16, or FLOAT16/BFLOAT16/FLOAT8's raw bit patterns -- should
+// prefer this over Tensor::int32s(): ONNX's wire format allows either
+// (TensorProto.int32_data is a valid, spec-legal field for all of these
+// types, and onnxsim's own ir_pb_converter serializes whichever one the
+// in-memory Tensor is carrying -- see is_raw_data() there), but int32_data is
+// a `repeated int32` protobuf field, individually varint-encoded: every
+// value takes at least 1 byte, values needing the sign bit (anything
+// negative, since this is a plain `int32` field, not zigzag-coded `sint32`)
+// take the full 10 bytes every such value's varint encoding requires,
+// regardless of the logical type's own width. raw_data instead packs each
+// element at its true byte width with no per-element framing, matching what
+// onnx's own reference tensor builder (onnx.numpy_helper.from_array, which
+// always uses raw_data, INT8 and FLOAT16 included) produces. A plain memcpy
+// on a little-endian host, byte-swapped on a big-endian one -- the same
+// convention ReadRawDataHostOrder uses in reverse.
+template <typename T>
+inline std::string WriteRawDataLittleEndian(const std::vector<T>& values) {
+  std::string out(values.size() * sizeof(T), '\0');
+  std::memcpy(out.data(), values.data(), out.size());
+  if constexpr (!onnxsim::dlpack::kRawDataIsHostOrder) {
+    onnxsim::dlpack::SwapElementBytes(reinterpret_cast<uint8_t*>(out.data()),
+                                      out.size(), sizeof(T));
   }
   return out;
 }

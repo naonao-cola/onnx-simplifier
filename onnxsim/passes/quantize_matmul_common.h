@@ -146,14 +146,17 @@ inline void QuantizeWeightPerChannelKN(const Tensor& w_t, bool transposed,
 
   q_out.elem_type() = TensorProto_DataType_INT8;
   q_out.sizes() = {K, N};
-  q_out.int32s().resize(static_cast<size_t>(K * N));
+  // raw_data, not int32s() -- see WriteRawDataLittleEndian's doc comment in
+  // endian_read.h for why.
+  std::vector<int8_t> codes(static_cast<size_t>(K * N));
   for (int64_t k = 0; k < K; ++k) {
     for (int64_t n = 0; n < N; ++n) {
       const float q = std::round(at(k, n) / scale[n]);
-      q_out.int32s()[k * N + n] =
-          static_cast<int32_t>(std::clamp(q, -127.0f, 127.0f));
+      codes[k * N + n] =
+          static_cast<int8_t>(std::clamp(q, -127.0f, 127.0f));
     }
   }
+  q_out.set_raw_data(WriteRawDataLittleEndian(codes));
 
   scale_out.elem_type() = TensorProto_DataType_FLOAT;
   scale_out.sizes() = {N};
@@ -195,15 +198,18 @@ inline void QuantizeWeightPerChannelInPlace(const Tensor& w_t,
 
   q_out.elem_type() = TensorProto_DataType_INT8;
   q_out.sizes() = {dim0, dim1};
-  q_out.int32s().resize(static_cast<size_t>(dim0 * dim1));
+  // raw_data, not int32s() -- see WriteRawDataLittleEndian's doc comment in
+  // endian_read.h for why.
+  std::vector<int8_t> codes(static_cast<size_t>(dim0 * dim1));
   for (int64_t i = 0; i < dim0; ++i) {
     for (int64_t j = 0; j < dim1; ++j) {
       const int64_t c = channel_of(i, j);
       const float q = std::round(at(i, j) / scale[c]);
-      q_out.int32s()[i * dim1 + j] =
-          static_cast<int32_t>(std::clamp(q, -127.0f, 127.0f));
+      codes[i * dim1 + j] =
+          static_cast<int8_t>(std::clamp(q, -127.0f, 127.0f));
     }
   }
+  q_out.set_raw_data(WriteRawDataLittleEndian(codes));
 
   scale_out.elem_type() = TensorProto_DataType_FLOAT;
   scale_out.sizes() = {C};
@@ -243,15 +249,18 @@ inline void QuantizeWeightPerChannelInPlaceInt16(const Tensor& w_t,
 
   q_out.elem_type() = TensorProto_DataType_INT16;
   q_out.sizes() = {dim0, dim1};
-  q_out.int32s().resize(static_cast<size_t>(dim0 * dim1));
+  // raw_data, not int32s() -- see WriteRawDataLittleEndian's doc comment in
+  // endian_read.h for why.
+  std::vector<int16_t> codes(static_cast<size_t>(dim0 * dim1));
   for (int64_t i = 0; i < dim0; ++i) {
     for (int64_t j = 0; j < dim1; ++j) {
       const int64_t c = channel_of(i, j);
       const float q = std::round(at(i, j) / scale[c]);
-      q_out.int32s()[i * dim1 + j] =
-          static_cast<int32_t>(std::clamp(q, -32767.0f, 32767.0f));
+      codes[i * dim1 + j] =
+          static_cast<int16_t>(std::clamp(q, -32767.0f, 32767.0f));
     }
   }
+  q_out.set_raw_data(WriteRawDataLittleEndian(codes));
 
   scale_out.elem_type() = TensorProto_DataType_FLOAT;
   scale_out.sizes() = {C};
@@ -304,9 +313,11 @@ inline bool TryQuantizeWeightTernaryKN(const Tensor& w_t, bool transposed,
     }
   }
 
-  q_out.elem_type() = TensorProto_DataType_INT8;
-  q_out.sizes() = {K, N};
-  q_out.int32s().resize(static_cast<size_t>(K * N));
+  // raw_data, not int32s() -- see WriteRawDataLittleEndian's doc comment in
+  // endian_read.h for why. Built into a local vector first (rather than
+  // q_out directly) so a not-ternary bail-out below leaves q_out completely
+  // untouched, not just its int32_data half-populated.
+  std::vector<int8_t> codes(static_cast<size_t>(K * N));
   for (int64_t k = 0; k < K; ++k) {
     for (int64_t n = 0; n < N; ++n) {
       const float normalized = at(k, n) / scale[n];
@@ -314,9 +325,13 @@ inline bool TryQuantizeWeightTernaryKN(const Tensor& w_t, bool transposed,
       if (std::fabs(code) > 1.0f || std::fabs(normalized - code) > rtol) {
         return false;  // Not ternary: bail before mutating the caller's q_out.
       }
-      q_out.int32s()[k * N + n] = static_cast<int32_t>(code);
+      codes[k * N + n] = static_cast<int8_t>(code);
     }
   }
+
+  q_out.elem_type() = TensorProto_DataType_INT8;
+  q_out.sizes() = {K, N};
+  q_out.set_raw_data(WriteRawDataLittleEndian(codes));
 
   scale_out.elem_type() = TensorProto_DataType_FLOAT;
   scale_out.sizes() = {N};
@@ -383,15 +398,16 @@ inline bool TryQuantizeWeightBlockwiseInt4InPlace(const Tensor& w_t,
     s = s > 0.0f ? s / 7.0f : 1.0f;
   }
 
-  // Unlike INT8 (whose q_out.int32s() the pb-converter serializes verbatim
-  // into TensorProto.int32_data, one slot per element), ONNX's wire format
-  // packs INT4 two values per byte in raw_data -- low nibble first, i.e.
-  // byte[i] = (code[2i] & 0xF) | ((code[2i+1] & 0xF) << 4), matching
-  // onnx.numpy_helper's _pack_4bitx2 -- and onnxsim's vendored onnx-optimizer
-  // ir_pb_converter has no INT4-aware packing path of its own for the typed
-  // int32_data field, so this builds the packed bytes directly and hands
-  // them to the Tensor via set_raw_data() rather than going through
-  // int32s(). `K % block_size == 0` (checked above) makes `dim0 * dim1`
+  // Unlike INT8 (which, like this function, now also goes to raw_data via
+  // WriteRawDataLittleEndian -- see endian_read.h -- just one whole byte per
+  // element instead of a nibble), ONNX's wire format packs INT4 two values
+  // per byte in raw_data -- low nibble first, i.e. byte[i] = (code[2i] &
+  // 0xF) | ((code[2i+1] & 0xF) << 4), matching onnx.numpy_helper's
+  // _pack_4bitx2 -- and onnxsim's vendored onnx-optimizer ir_pb_converter has
+  // no INT4-aware packing path of its own for the typed int32_data field, so
+  // this builds the packed bytes directly instead of going through a
+  // whole-byte-per-element helper. `K % block_size == 0` (checked above)
+  // makes `dim0 * dim1`
   // always even here (block_size is even), so no odd-count padding byte is
   // needed.
   const int64_t numel = dim0 * dim1;
@@ -436,12 +452,13 @@ inline bool TryQuantizeWeightBlockwiseInt4InPlace(const Tensor& w_t,
 // resolution for channels a single per-channel scale would under-resolve.
 // Used by weight_only_quantize_int8_block_matmul.h.
 //
-// Unlike INT4, INT8 has no dedicated typed field in TensorProto either, but
-// (like INT8/UINT8/INT16/etc. generally) it lives in `int32_data`/
-// `Tensor::int32s()`, not raw_data -- see ConvertFloatTensorToFp16's comment
-// in quantize_fp16.h for the general rule this follows, and contrast with
-// TryQuantizeWeightBlockwiseInt4InPlace's raw_data nibble-packing, which INT8
-// does not need.
+// Like INT4, this packs into raw_data (one whole byte per element, via
+// WriteRawDataLittleEndian -- see endian_read.h) rather than the typed
+// int32_data field, which -- though `int32_data` is a spec-legal field for
+// INT8/UINT8/INT16/etc. too -- costs far more than 1 byte per element there
+// (every varint-encoded entry needing the sign bit takes the field's full 10
+// bytes). Unlike INT4's nibble-packing, INT8 needs no bit-packing of its
+// own: each code is already a whole byte.
 inline bool TryQuantizeWeightBlockwiseInt8InPlace(const Tensor& w_t,
                                                   int64_t channel_axis,
                                                   int64_t block_size,
@@ -480,15 +497,18 @@ inline bool TryQuantizeWeightBlockwiseInt8InPlace(const Tensor& w_t,
 
   q_out.elem_type() = TensorProto_DataType_INT8;
   q_out.sizes() = {dim0, dim1};
-  q_out.int32s().resize(static_cast<size_t>(dim0 * dim1));
+  // raw_data, not int32s() -- see WriteRawDataLittleEndian's doc comment in
+  // endian_read.h for why.
+  std::vector<int8_t> codes(static_cast<size_t>(dim0 * dim1));
   for (int64_t i = 0; i < dim0; ++i) {
     for (int64_t j = 0; j < dim1; ++j) {
       const float s = scale[static_cast<size_t>(scale_index(i, j))];
       const float q = std::round(at(i, j) / s);
-      q_out.int32s()[i * dim1 + j] =
-          static_cast<int32_t>(std::clamp(q, -127.0f, 127.0f));
+      codes[i * dim1 + j] =
+          static_cast<int8_t>(std::clamp(q, -127.0f, 127.0f));
     }
   }
+  q_out.set_raw_data(WriteRawDataLittleEndian(codes));
 
   scale_out.elem_type() = TensorProto_DataType_FLOAT;
   scale_out.sizes() = {scale_dim0, scale_dim1};

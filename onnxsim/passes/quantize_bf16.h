@@ -84,19 +84,20 @@ inline uint16_t FloatToBFloat16Bits(float value) {
 
 // Converts a constant float32 tensor of any rank/shape to bfloat16, keeping
 // the same shape. Like float16, bfloat16 has no dedicated typed field in
-// TensorProto -- its values live in `int32_data`/`Tensor::int32s()`, each
-// entry the 16-bit bit pattern zero-extended to int32 (see
-// third_party/onnx-optimizer/third_party/onnx/onnx/common/ir_pb_converter.cc,
-// where BFLOAT16 is handled identically to FLOAT16).
+// TensorProto -- see ConvertFloatTensorToFp16's comment in quantize_fp16.h
+// for why this packs the bit patterns into raw_data (via
+// WriteRawDataLittleEndian, endian_read.h) rather than the far less compact
+// typed `int32_data` field ONNX's wire format also allows for it.
 inline Tensor ConvertFloatTensorToBf16(const Tensor& t) {
   const std::vector<float> data = ReadFloatTensorFlat(t);
   Tensor out;
   out.elem_type() = TensorProto_DataType_BFLOAT16;
   out.sizes() = t.sizes();
-  out.int32s().resize(data.size());
+  std::vector<uint16_t> bits(data.size());
   for (size_t i = 0; i < data.size(); ++i) {
-    out.int32s()[i] = static_cast<int32_t>(FloatToBFloat16Bits(data[i]));
+    bits[i] = FloatToBFloat16Bits(data[i]);
   }
+  out.set_raw_data(WriteRawDataLittleEndian(bits));
   return out;
 }
 
