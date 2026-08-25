@@ -473,7 +473,13 @@ struct FuseGQA final : public PredicateBasedPass {
     undef->insertBefore(n);
     undef->output()->setUniqueName("");
 
-    Node* gqa = graph.create(Symbol("GroupQueryAttention"), 1);
+    // GroupQueryAttention's schema requires at least 3 outputs (output,
+    // present_key, present_value) even though only "output" is used here --
+    // creating it with just 1 fails ONNX Runtime's own schema validation
+    // ("has output size 1 not in range [min=3, max=4]"), caught by CI on a
+    // real run rather than by the checker (which didn't flag it). The two
+    // extra outputs are simply left unused; nothing references them.
+    Node* gqa = graph.create(Symbol("GroupQueryAttention"), 3);
     gqa->addInput(m.q_proj_out);
     gqa->addInput(m.k_proj_out);
     gqa->addInput(m.v_proj_out);
@@ -500,7 +506,7 @@ struct FuseGQA final : public PredicateBasedPass {
 
     Value* n_shape = n->input(1);
     Node* reshape_out = graph.create(Symbol("Reshape"), 1);
-    reshape_out->addInput(gqa->output());
+    reshape_out->addInput(gqa->outputs()[0]);
     reshape_out->addInput(n_shape);
     reshape_out->insertBefore(n);
     reshape_out->output()->copyMetadata(n->output());
