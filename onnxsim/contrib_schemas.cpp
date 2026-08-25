@@ -619,6 +619,92 @@ OpSchema MakeMatMulIntegerToFloatSchema() {
       });
 }
 
+// Real ONNX Runtime multi-head self-/cross-attention op (docs/
+// ContribOperators.md, onnxruntime/core/graph/contrib_ops/contrib_defs.cc).
+// Registered here so fuse_attention.h's fused output -- which only ever
+// emits inputs 0-2 (input, weights, bias) and attrs num_heads/scale/
+// qkv_hidden_sizes -- passes the ONNX checker and shape-inference sweeps the
+// rest of onnxsim's pipeline runs after any Fuse pass fires; the remaining
+// attrs/inputs (do_rotary, past/present KV cache, attention_bias,
+// mask_index, rotary_embedding_dim, past_present_share_buffer) are declared
+// for schema completeness/compatibility with externally-authored models,
+// not because this pass ever produces them.
+OpSchema MakeAttentionSchema() {
+  return OpSchema()
+      .SetName("Attention")
+      .SetDomain(kMSDomain)
+      .SinceVersion(1)
+      .SetDoc(
+          "Multi-Head Self/Cross Attention. Bias from input projection is "
+          "included.")
+      .Attr("num_heads", "Number of attention heads.",
+            onnx::AttributeProto::INT, /*required=*/true)
+      .Attr("scale",
+            "Custom scale will be used if specified. Default value is "
+            "1/sqrt(head_size).",
+            onnx::AttributeProto::FLOAT, /*required=*/false)
+      .Attr("unidirectional",
+            "Whether every token can only attend to previous tokens.",
+            onnx::AttributeProto::INT, static_cast<int64_t>(0))
+      .Attr("qkv_hidden_sizes",
+            "Hidden dimension of Q, K, V: hidden_size, hidden_size and "
+            "v_hidden_size.",
+            onnx::AttributeProto::INTS, /*required=*/false)
+      .Attr("mask_filter_value",
+            "The value to be filled in the attention mask. Default value "
+            "is -10000.0.",
+            onnx::AttributeProto::FLOAT, static_cast<float>(-10000.0f))
+      .Attr("do_rotary", "Whether to use rotary position embedding.",
+            onnx::AttributeProto::INT, static_cast<int64_t>(0))
+      .Attr("rotary_embedding_dim",
+            "Dimension of rotary embedding. Limited to 32, 64 or 128.",
+            onnx::AttributeProto::INT, /*required=*/false)
+      .Attr("past_present_share_buffer",
+            "Corresponding past and present are same tensor, its shape is "
+            "(2, batch_size, num_heads, max_sequence_length, head_size).",
+            onnx::AttributeProto::INT, /*required=*/false)
+      .Input(0, "input",
+             "Input tensor with shape (batch_size, sequence_length, "
+             "input_hidden_size).",
+             "T")
+      .Input(1, "weights",
+             "Merged Q/K/V weights with shape (input_hidden_size, "
+             "hidden_size + hidden_size + v_hidden_size).",
+             "T")
+      .Input(2, "bias",
+             "Bias tensor with shape (hidden_size + hidden_size + "
+             "v_hidden_size).",
+             "T", OpSchema::Optional)
+      .Input(3, "mask_index", "Attention mask.", "M", OpSchema::Optional)
+      .Input(4, "past",
+             "Past state for key and value with shape (2, batch_size, "
+             "num_heads, past_sequence_length, head_size).",
+             "T", OpSchema::Optional)
+      .Input(5, "attention_bias",
+             "Additional add to QxK' with shape broadcastable to "
+             "(batch_size, num_heads, sequence_length, "
+             "total_sequence_length).",
+             "T", OpSchema::Optional)
+      .Input(6, "past_sequence_length",
+             "When past_present_share_buffer is used, it is required to "
+             "specify past_sequence_length (could be 0).",
+             "M", OpSchema::Optional)
+      .Output(0, "output",
+              "3D output tensor with shape (batch_size, sequence_length, "
+              "v_hidden_size).",
+              "T")
+      .Output(1, "present",
+              "Present state for key and value with shape (2, batch_size, "
+              "num_heads, total_sequence_length, head_size).",
+              "T", OpSchema::Optional)
+      .TypeConstraint(
+          "T", {"tensor(float)", "tensor(float16)"},
+          "Constrain input and output to float tensors. (bfloat16 omitted "
+          "-- onnxsim's own float32-only fuse target never emits it.)")
+      .TypeConstraint("M", {"tensor(int32)"},
+                      "Constrain mask index to integer types.");
+}
+
 void RegisterAll() {
   // The custom domain must be known to the schema registry before any schema
   // in it can be registered.
@@ -641,6 +727,7 @@ void RegisterAll() {
   RegisterIfAbsent(MakeQLinearWhereSchema());
   RegisterIfAbsent(MakeQGemmSchema());
   RegisterIfAbsent(MakeMatMulIntegerToFloatSchema());
+  RegisterIfAbsent(MakeAttentionSchema());
 
   // Augment the standard Reshape schema with a data-propagation function so
   // shape tensors can flow through a Reshape during partial shape evaluation.

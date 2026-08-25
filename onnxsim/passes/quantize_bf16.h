@@ -84,19 +84,20 @@ inline uint16_t FloatToBFloat16Bits(float value) {
 
 // Converts a constant float32 tensor of any rank/shape to bfloat16, keeping
 // the same shape. Like float16, bfloat16 has no dedicated typed field in
-// TensorProto -- its values live in `int32_data`/`Tensor::int32s()`, each
-// entry the 16-bit bit pattern zero-extended to int32 (see
-// third_party/onnx-optimizer/third_party/onnx/onnx/common/ir_pb_converter.cc,
-// where BFLOAT16 is handled identically to FLOAT16).
+// TensorProto -- see ConvertFloatTensorToFp16's comment in quantize_fp16.h
+// for why this packs the bit patterns into raw_data (via
+// WriteRawDataLittleEndian, endian_read.h) rather than the far less compact
+// typed `int32_data` field ONNX's wire format also allows for it.
 inline Tensor ConvertFloatTensorToBf16(const Tensor& t) {
   const std::vector<float> data = ReadFloatTensorFlat(t);
   Tensor out;
   out.elem_type() = TensorProto_DataType_BFLOAT16;
   out.sizes() = t.sizes();
-  out.int32s().resize(data.size());
+  std::vector<uint16_t> bits(data.size());
   for (size_t i = 0; i < data.size(); ++i) {
-    out.int32s()[i] = static_cast<int32_t>(FloatToBFloat16Bits(data[i]));
+    bits[i] = FloatToBFloat16Bits(data[i]);
   }
+  out.set_raw_data(WriteRawDataLittleEndian(bits));
   return out;
 }
 
@@ -147,6 +148,31 @@ struct QuantizeBf16Pass final : public FullGraphBasedPass {
       Tensor bf16_t = ConvertFloatTensorToBf16(*t);
       Value* new_v = graph.addInitializerAndCreateValue(bf16_t);
       tryReplacingAllUsesWith(old_v, new_v);
+    }
+
+    // 1.5. Clear stale float32 elemType/shape metadata on every existing
+    // node's output (except graph outputs, which step 3 below still needs
+    // to see as FLOAT to decide whether to convert/cast them, and sets
+    // explicitly itself either way) -- see quantize_fp16.h's own step 1.5
+    // for the full rationale: this pass never re-runs shape inference, so a
+    // stale float32 declaration left over from an earlier pass (e.g.
+    // ``simplify()``) would otherwise round-trip into the exported model's
+    // value_info as a wrong type for a tensor now actually bfloat16, which
+    // ONNX Runtime's own load-time type-checking rejects outright. A
+    // cleared (omitted) value_info entry is always safe -- inferred fresh
+    // by any conformant consumer -- unlike a wrong one.
+    std::unordered_set<std::string> graph_output_names;
+    for (Value* v : graph.outputs()) {
+      graph_output_names.insert(v->uniqueName());
+    }
+    for (Node* n : graph.nodes()) {
+      for (Value* out : n->outputs()) {
+        if (out->elemType() == TensorProto_DataType_FLOAT &&
+            graph_output_names.count(out->uniqueName()) == 0) {
+          out->setElemType(TensorProto_DataType_UNDEFINED);
+          out->wipeSizes();
+        }
+      }
     }
 
     // 2. Graph inputs.

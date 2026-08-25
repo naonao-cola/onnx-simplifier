@@ -99,14 +99,17 @@ inline void QuantizeConvWeightPerOutputChannel(const Tensor& w_t, Tensor& q_out,
 
   q_out.elem_type() = TensorProto_DataType_INT8;
   q_out.sizes() = sizes;
-  q_out.int32s().resize(static_cast<size_t>(C * inner));
+  // raw_data, not int32s() -- see WriteRawDataLittleEndian's doc comment in
+  // endian_read.h for why.
+  std::vector<int8_t> codes(static_cast<size_t>(C * inner));
   for (int64_t c = 0; c < C; ++c) {
     for (int64_t j = 0; j < inner; ++j) {
       const float q = std::round(data[c * inner + j] / scale[c]);
-      q_out.int32s()[c * inner + j] =
-          static_cast<int32_t>(std::clamp(q, -127.0f, 127.0f));
+      codes[c * inner + j] =
+          static_cast<int8_t>(std::clamp(q, -127.0f, 127.0f));
     }
   }
+  q_out.set_raw_data(WriteRawDataLittleEndian(codes));
 
   scale_out.elem_type() = TensorProto_DataType_FLOAT;
   scale_out.sizes() = {C};
@@ -140,14 +143,17 @@ inline void QuantizeConvWeightPerOutputChannelInt16(const Tensor& w_t,
 
   q_out.elem_type() = TensorProto_DataType_INT16;
   q_out.sizes() = sizes;
-  q_out.int32s().resize(static_cast<size_t>(C * inner));
+  // raw_data, not int32s() -- see WriteRawDataLittleEndian's doc comment in
+  // endian_read.h for why.
+  std::vector<int16_t> codes(static_cast<size_t>(C * inner));
   for (int64_t c = 0; c < C; ++c) {
     for (int64_t j = 0; j < inner; ++j) {
       const float q = std::round(data[c * inner + j] / scale[c]);
-      q_out.int32s()[c * inner + j] =
-          static_cast<int32_t>(std::clamp(q, -32767.0f, 32767.0f));
+      codes[c * inner + j] =
+          static_cast<int16_t>(std::clamp(q, -32767.0f, 32767.0f));
     }
   }
+  q_out.set_raw_data(WriteRawDataLittleEndian(codes));
 
   scale_out.elem_type() = TensorProto_DataType_FLOAT;
   scale_out.sizes() = {C};
@@ -280,16 +286,19 @@ inline bool TryQuantizeConvWeightBlockwiseInt8Flat(const Tensor& w_t,
 
   q_out.elem_type() = TensorProto_DataType_INT8;
   q_out.sizes() = {C, inner};
-  q_out.int32s().resize(static_cast<size_t>(C * inner));
+  // raw_data, not int32s() -- see WriteRawDataLittleEndian's doc comment in
+  // endian_read.h for why.
+  std::vector<int8_t> codes(static_cast<size_t>(C * inner));
   for (int64_t c = 0; c < C; ++c) {
     for (int64_t j = 0; j < inner; ++j) {
       const float s =
           scale[static_cast<size_t>(c * num_blocks + j / block_size)];
       const float q = std::round(data[static_cast<size_t>(c * inner + j)] / s);
-      q_out.int32s()[c * inner + j] =
-          static_cast<int32_t>(std::clamp(q, -127.0f, 127.0f));
+      codes[c * inner + j] =
+          static_cast<int8_t>(std::clamp(q, -127.0f, 127.0f));
     }
   }
+  q_out.set_raw_data(WriteRawDataLittleEndian(codes));
 
   scale_out.elem_type() = TensorProto_DataType_FLOAT;
   scale_out.sizes() = {C, num_blocks};

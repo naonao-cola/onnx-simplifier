@@ -155,7 +155,7 @@ set(ONNXSIM_BLAKE3_COMPILE_DEFS
     BLAKE3_NO_SSE2 BLAKE3_NO_SSE41 BLAKE3_NO_AVX2 BLAKE3_NO_AVX512
     BLAKE3_USE_NEON=0)
 
-add_library(onnxsim onnxsim/onnxsim.cpp onnxsim/constant_folding.cpp onnxsim/partial_shape_eval.cpp onnxsim/model_prep.cpp onnxsim/quantize_entry.cpp onnxsim/contrib_schemas.cpp onnxsim/custom_optimizer_passes.cpp onnxsim/function_rewriter.cpp onnxsim/profiler.cpp onnxsim/model_info.cpp onnxsim/sym_expr.cpp onnxsim/sym_value_eval.cpp onnxsim/sym_shape_infer.cpp onnxsim/model_metrics.cpp onnxsim/tensor_pool.cpp onnxsim/tensor_pool_gguf.cpp onnxsim/tensor_pool_hash.cpp ${ONNXSIM_BLAKE3_SOURCES})
+add_library(onnxsim onnxsim/onnxsim.cpp onnxsim/constant_folding.cpp onnxsim/partial_shape_eval.cpp onnxsim/model_prep.cpp onnxsim/quantize_entry.cpp onnxsim/contrib_schemas.cpp onnxsim/custom_optimizer_passes.cpp onnxsim/function_rewriter.cpp onnxsim/profiler.cpp onnxsim/model_info.cpp onnxsim/sym_expr.cpp onnxsim/sym_value_eval.cpp onnxsim/sym_shape_infer.cpp onnxsim/model_metrics.cpp onnxsim/precision_estimator.cpp onnxsim/tensor_pool.cpp onnxsim/tensor_pool_gguf.cpp onnxsim/tensor_pool_hash.cpp ${ONNXSIM_BLAKE3_SOURCES})
 target_compile_definitions(onnxsim PRIVATE ${ONNXSIM_BLAKE3_COMPILE_DEFS})
 if (ONNXSIM_BUILTIN_ORT)
   # Both ways of obtaining ONNX Runtime ship/install headers flat under this
@@ -534,6 +534,14 @@ if (ONNXSIM_TESTS)
   target_link_libraries(tensor_pool_bridge_test onnxsim)
   onnxsim_add_ort_rpath(tensor_pool_bridge_test)
   add_test(NAME tensor_pool_bridge_test COMMAND tensor_pool_bridge_test)
+
+  # precision_estimator.{h,cpp} needs onnx (ModelProto/shape inference), like
+  # tensor_pool_bridge_test above -- links the fully-configured `onnxsim`
+  # target rather than building standalone.
+  add_executable(precision_estimator_test onnxsim/precision_estimator_test.cpp)
+  target_link_libraries(precision_estimator_test onnxsim)
+  onnxsim_add_ort_rpath(precision_estimator_test)
+  add_test(NAME precision_estimator_test COMMAND precision_estimator_test)
 
   # The ONNX<->GGML dtype mapping (gguf_dtype.h), mirroring
   # tensor_pool_dtype_test.cpp above for the same reason.

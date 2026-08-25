@@ -1,3 +1,10 @@
+from onnxsim.accuracy import (
+    AccuracyDropReport,
+    OutputAccuracyStats,
+    QuantizationConfig,
+    measure_accuracy_drop,
+    quantize,
+)
 from onnxsim.calibration import (
     calibrate,
     generate_random_calibration_data,
@@ -33,12 +40,18 @@ from onnxsim.onnx_simplifier import (
     quantize_weight_only_int16,
     simplify,
 )
-from onnxsim.precision_estimator import estimate_quantization_precision
+from onnxsim.precision_estimator import (
+    ModelQuantizationEstimate,
+    estimate_model_quantization_drop,
+    estimate_quantization_precision,
+)
 
 from .version import version as __version__
 
 __all__ = [
     "simplify",
+    "quantize",
+    "QuantizationConfig",
     "quantize_dynamic",
     "quantize_dynamic_matmul_integer_to_float",
     "quantize_ternary",
@@ -63,6 +76,11 @@ __all__ = [
     "generate_random_calibration_data",
     "load_huggingface_calibration_data",
     "estimate_quantization_precision",
+    "ModelQuantizationEstimate",
+    "estimate_model_quantization_drop",
+    "measure_accuracy_drop",
+    "AccuracyDropReport",
+    "OutputAccuracyStats",
     "main",
     "import_onnx_schemas",
     "export_safetensors",

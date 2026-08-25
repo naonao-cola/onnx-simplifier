@@ -28,6 +28,7 @@ import numpy as np
 import onnx
 import onnx.helper
 import onnx.numpy_helper
+import onnx.shape_inference
 import pytest
 
 import onnxsim
@@ -206,6 +207,28 @@ def test_quantize_bf16_skips_optional_input_default_initializer():
     onnx.checker.check_model(quant)
     w_init = quant.graph.initializer[0]
     assert w_init.data_type == onnx.TensorProto.FLOAT  # untouched
+
+
+def test_quantize_bf16_clears_stale_value_info_on_already_shape_inferred_model():
+    # Same regression as test_quantize_fp16.py's identically-named test: a
+    # model that already went through shape inference has its interior
+    # activations' value_info pre-populated float32, and quantize_bf16 (like
+    # quantize_fp16) doesn't re-run shape inference itself, so it must not
+    # leave that now-wrong float32 declaration in place -- a real bug found
+    # via a real torchvision model. No onnxruntime.InferenceSession run here
+    # (CPU EP has no bfloat16 MatMul/Relu kernel, see this file's module
+    # docstring) -- the value_info correctness itself is the check.
+    model, rng, k, n2 = _two_matmul_model()
+    model = onnx.shape_inference.infer_shapes(model)
+    h_before = next(vi for vi in model.graph.value_info if vi.name == "H")
+    assert h_before.type.tensor_type.elem_type == onnx.TensorProto.FLOAT
+
+    quant = onnxsim.quantize_bf16(model)
+    onnx.checker.check_model(quant)
+
+    h_after = next((vi for vi in quant.graph.value_info if vi.name == "H"), None)
+    if h_after is not None:
+        assert h_after.type.tensor_type.elem_type != onnx.TensorProto.FLOAT
 
 
 def test_quantize_bf16_boundary_casts_execute():

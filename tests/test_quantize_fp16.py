@@ -14,6 +14,7 @@ import numpy as np
 import onnx
 import onnx.helper
 import onnx.numpy_helper
+import onnx.shape_inference
 import pytest
 
 import onnxsim
@@ -203,3 +204,37 @@ def test_quantize_fp16_skips_optional_input_default_initializer():
     onnx.checker.check_model(quant)
     w_init = quant.graph.initializer[0]
     assert w_init.data_type == onnx.TensorProto.FLOAT  # untouched
+
+
+def test_quantize_fp16_clears_stale_value_info_on_already_shape_inferred_model():
+    # A model that already went through shape inference (e.g. onnxsim's own
+    # simplify(), or just onnx.shape_inference.infer_shapes() directly, as
+    # here) has its interior activations' value_info pre-populated float32.
+    # quantize_fp16 doesn't re-run shape inference itself (see the file's own
+    # doc comment), so it must not leave that now-wrong float32 declaration
+    # in place for a tensor the graph actually produces as float16 -- ONNX
+    # Runtime's own load-time type-checking rejects a model with a *wrong*
+    # value_info outright (unlike a merely absent one, which every conformant
+    # consumer infers fresh). This was a real bug: found by running a real
+    # torchvision model (already simplify()'d) through quantize_fp16 and
+    # onnxruntime.InferenceSession.
+    model, rng, k, n2 = _two_matmul_model()
+    model = onnx.shape_inference.infer_shapes(model)
+    # Sanity: shape inference actually populated a float32 value_info for the
+    # interior activation "H" (or this test would not exercise the bug).
+    h_before = next(vi for vi in model.graph.value_info if vi.name == "H")
+    assert h_before.type.tensor_type.elem_type == onnx.TensorProto.FLOAT
+
+    quant = onnxsim.quantize_fp16(model)
+    onnx.checker.check_model(quant)
+
+    # No value_info entry for "H" may declare it float32 anymore -- either
+    # it's absent (cleared, the expected outcome) or correctly float16.
+    h_after = next((vi for vi in quant.graph.value_info if vi.name == "H"), None)
+    if h_after is not None:
+        assert h_after.type.tensor_type.elem_type != onnx.TensorProto.FLOAT
+
+    # The real regression check: ONNX Runtime must actually load and run the
+    # quantized model, not just pass the (more lenient) checker.
+    x = rng.standard_normal((4, k)).astype(np.float32)
+    _assert_close(_run(model, {"X": x}), _run(quant, {"X": x}))
