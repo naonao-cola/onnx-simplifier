@@ -51,17 +51,20 @@
 // to the model's opset imports the first time it fires, if not already
 // present, and the result needs a "com.microsoft"-aware runtime to execute.
 //
-// K's head-split transpose is required to land directly at permutation
-// [0,2,3,1] (X.Transpose([0,2,1,3]) is the more common overall convention,
-// but the exact spelling of a *second*, standalone "swap the last two axes"
-// transpose that some exporters emit for K specifically is not matched --
-// only the single-transpose-straight-to-[0,2,3,1] form is; see
-// MatchHeadSplit). This is why `scaled_dot_product_attention`'s *dynamo*
-// export (unlike its legacy TorchScript export, which does use the direct
-// [0,2,3,1] form) is not yet handled: it head-splits K the same way as Q/V
-// (perm [0,2,1,3]) and spells the "swap the last two axes for K^T" step
-// separately, as `Reshape -> Transpose -> Reshape` rather than folding it
-// into one 4-D permutation -- left as a follow-up.
+// K's head-split transpose usually lands directly at permutation [0,2,3,1]
+// (X.Transpose([0,2,1,3]) is the more common overall convention, but K
+// additionally needs its last two axes swapped for the Q@K^T dot product to
+// be well-formed, and most exporters -- including SDPA's legacy TorchScript
+// export -- fold that swap directly into K's own head-split Transpose rather
+// than emitting a separate one; see MatchAttentionHeadSplit). SDPA's *dynamo*
+// export instead head-splits K the same way as Q/V (perm [0,2,1,3]) and
+// spells the "swap the last two axes for K^T" step separately, as a
+// standalone `Reshape -> Transpose([0,2,1]) -> Reshape` 3-D round trip
+// (collapse batch/head into one leading dim, swap the remaining two, restore
+// the 4-D shape) rather than folding it into one 4-D permutation --
+// MatchKTransposeSwapChain recognizes this alternate spelling, verifying it
+// is shape-equivalent to the direct form via shape inference rather than by
+// decoding the two Reshapes' (possibly dynamic) target-shape computations.
 // Only self-attention (Q, K, V all reading the *same* source activation) with
 // no attention mask, no past/present KV cache, and a Softmax over the last
 // axis (`axis=-1` or the input's last dimension index -- both are safe here
@@ -340,6 +343,102 @@ inline bool MatchAttentionHeadSplit(Value* transposed, int64_t& num_heads,
   return true;
 }
 
+// Matches the alternate spelling `scaled_dot_product_attention`'s *dynamo*
+// exporter uses for K's "swap the last two (seq, head_size) axes" step:
+// rather than a single 4-D Transpose straight to perm [0,2,3,1] (the direct
+// form MatchAttentionHeadSplit's own want_perm looks for), it head-splits K
+// exactly like Q/V (Transpose perm [0,2,1,3]) and then swaps the last two
+// axes as a *separate* step that round-trips through 3-D:
+//   Reshape(Transpose(Reshape(headsplit_out, [B*H,S,D]), [0,2,1]), [B,H,D,S])
+// which is mathematically identical to `Transpose(headsplit_out, [0,1,3,2])`
+// -- and, composed with headsplit_out's own [0,2,1,3] transpose from
+// proj_out, to `Transpose(proj_out, [0,2,3,1])` directly, i.e. exactly what
+// the direct form already looks for. Rather than re-deriving that arithmetic
+// from the two Reshapes' target-shape inputs (which may themselves be
+// dynamic, Shape-derived values rather than literal constants), this
+// confirms the same identity a cheaper way: shape inference -- run earlier
+// in the same fixed-point loop this pass itself runs inside -- has already
+// resolved every intermediate value's static sizes whenever they're static
+// at all, so directly comparing them is sufficient regardless of how the two
+// Reshapes computed their target shapes internally. Two independent shape
+// checks are both required, not just the final one: a row-major Reshape's
+// semantics are only pinned down uniquely by which *trailing* dimensions it
+// leaves untouched, so this checks that the first Reshape's output keeps
+// `headsplit_out`'s own last two dims (S, D) unchanged in its own last two
+// positions (proving the merged leading dimension can only be B*H, in that
+// order -- the standard row-major flatten of exactly those two axes and no
+// other grouping, e.g. not S folded in instead) *and* that the final
+// Reshape's output exactly matches `headsplit_out`'s shape with its last two
+// dims exchanged (proving the corresponding unmerge/split recovers B and H
+// individually, in the same order, rather than some other factorization of
+// the same product). Checking only the final shape is not enough on its
+// own: a chain that merges a *different* pair of leading dims (or merges in
+// the opposite order) can still land on the same final 4-D shape by
+// coincidence while actually computing a different permutation of the
+// underlying data. Declines (rather than guessing) whenever any shape isn't
+// statically known.
+inline bool MatchKTransposeSwapChain(Value* k_side, int64_t& num_heads,
+                                     int64_t& head_size, Value*& proj_out,
+                                     std::vector<Node*>& chain) {
+  if (!CheckKind(k_side, kReshape) || k_side->uses().size() != 1) {
+    return false;
+  }
+  Node* outer_rs = k_side->node();
+  if (outer_rs->inputs().size() != 2) {
+    return false;
+  }
+  Value* swapped = outer_rs->input(0);
+  if (!CheckKind(swapped, kTranspose) || swapped->uses().size() != 1) {
+    return false;
+  }
+  Node* swap_tr = swapped->node();
+  std::vector<int64_t> swap_perm;
+  if (!GetValueFromAttr(swap_tr, kperm, swap_perm) ||
+      swap_perm != std::vector<int64_t>{0, 2, 1}) {
+    return false;
+  }
+  Value* flattened = swap_tr->input(0);
+  if (!CheckKind(flattened, kReshape) || flattened->uses().size() != 1) {
+    return false;
+  }
+  Node* inner_rs = flattened->node();
+  if (inner_rs->inputs().size() != 2) {
+    return false;
+  }
+  Value* headsplit_out = inner_rs->input(0);
+  std::vector<Node*> headsplit_chain;
+  if (!MatchAttentionHeadSplit(headsplit_out, num_heads, head_size, proj_out,
+                               {0, 2, 1, 3}, headsplit_chain)) {
+    return false;
+  }
+  if (!headsplit_out->has_sizes() || !flattened->has_sizes() ||
+      !k_side->has_sizes() || headsplit_out->sizes().size() != 4 ||
+      flattened->sizes().size() != 3 || k_side->sizes().size() != 4) {
+    return false;
+  }
+  const auto& h_sizes = headsplit_out->sizes();
+  const auto& f_sizes = flattened->sizes();
+  const auto& k_sizes = k_side->sizes();
+  auto same_dim = [](const Dimension& a, const Dimension& b) {
+    return a.is_int == b.is_int &&
+           (a.is_int ? a.dim == b.dim : a.param == b.param);
+  };
+  // First Reshape must merge exactly headsplit_out's leading two dims,
+  // leaving (S, D) as-is in the trailing two positions.
+  if (!same_dim(h_sizes[2], f_sizes[1]) || !same_dim(h_sizes[3], f_sizes[2])) {
+    return false;
+  }
+  if (!same_dim(h_sizes[0], k_sizes[0]) || !same_dim(h_sizes[1], k_sizes[1]) ||
+      !same_dim(h_sizes[2], k_sizes[3]) || !same_dim(h_sizes[3], k_sizes[2])) {
+    return false;
+  }
+  chain.push_back(outer_rs);
+  chain.push_back(swap_tr);
+  chain.push_back(inner_rs);
+  for (Node* nd : headsplit_chain) chain.push_back(nd);
+  return true;
+}
+
 // `Attention`'s schema requires a rank-3 X input ([batch_size,
 // sequence_length, input_hidden_size]). Q/K/V's shared source is usually
 // exactly the model's own rank-3 activation, but when an earlier fixed-point
@@ -488,8 +587,11 @@ inline bool MatchAttention(Node* n, AttentionMatch& m) {
   std::vector<Node*> k_head_chain;
   Value* k_proj_out = nullptr;
   int64_t k_heads = 0, k_head_size = 0;
-  if (!MatchAttentionHeadSplit(k_side, k_heads, k_head_size, k_proj_out,
-                               {0, 2, 3, 1}, k_head_chain) ||
+  const bool k_direct_split = MatchAttentionHeadSplit(
+      k_side, k_heads, k_head_size, k_proj_out, {0, 2, 3, 1}, k_head_chain);
+  if ((!k_direct_split &&
+       !MatchKTransposeSwapChain(k_side, k_heads, k_head_size, k_proj_out,
+                                 k_head_chain)) ||
       !MatchAttentionProjection(k_proj_out, m.k)) {
     return false;
   }
