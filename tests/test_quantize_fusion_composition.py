@@ -330,6 +330,11 @@ class _TorchGQAAttention(nn.Module):
 
 
 def test_quantize_dynamic_composes_with_fuse_gqa_real_torch_export(tmp_path):
+    # Seeded like every other model builder in this file (see _gqa_model,
+    # _rope_model) -- unseeded torch weights/inputs made this test flaky,
+    # occasionally drawing a weight distribution unlucky enough to push
+    # dynamic-quantization error past the tolerance below.
+    torch.manual_seed(0)
     B, S, H = 2, 6, 64
     model_module = _TorchGQAAttention(hidden=H, seq_len=S).eval()
     x = torch.randn(B, S, H)
@@ -393,6 +398,7 @@ class _TorchRoPEProjection(nn.Module):
 def test_quantize_dynamic_composes_with_fuse_rope_real_torch_export(tmp_path):
     from onnx import version_converter
 
+    torch.manual_seed(1)
     B, S, H = 2, 6, 64
     model_module = _TorchRoPEProjection(hidden=H).eval()
     x = torch.randn(B, S, H)
