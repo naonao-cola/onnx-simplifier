@@ -292,10 +292,10 @@
     {
       "id": "onnxmodelzoo/longt5_Opset17",
       "size": 893431657,
-      "baseline_seconds": 900.0,
-      "baseline_orig_nodes": null,
-      "baseline_simp_nodes": null,
-      "known_slow": true
+      "baseline_seconds": 9.1,
+      "baseline_orig_nodes": 4778,
+      "baseline_simp_nodes": 1467,
+      "known_slow": false
     },
     {
       "id": "onnxmodelzoo/mixer_l16_224_in21k_Opset17",
@@ -468,10 +468,10 @@
     {
       "id": "onnxmodelzoo/resnetv2_50x3_bitm_Opset17",
       "size": 1714321230,
-      "baseline_seconds": 900.0,
-      "baseline_orig_nodes": null,
-      "baseline_simp_nodes": null,
-      "known_slow": true
+      "baseline_seconds": 9.2,
+      "baseline_orig_nodes": 1090,
+      "baseline_simp_nodes": 368,
+      "known_slow": false
     },
     {
       "id": "onnxmodelzoo/rexnet_200_Opset17",

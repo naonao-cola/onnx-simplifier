@@ -245,7 +245,6 @@ jobs:
           pattern: regression-profiles-*
           path: profiles
           merge-multiple: true
-          if-no-artifact-found: ignore
       - name: Build profile summary
         if: always()
         continue-on-error: true
