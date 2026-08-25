@@ -1,5 +1,6 @@
 #include "onnxsim.h"
 #include "model_info.h"
+#include "precision_estimator.h"
 #include "onnxoptimizer/optimize.h"
 #include "onnx/checker.h"
 #include "onnx/defs/parser.h"
@@ -934,6 +935,99 @@ em::val onnxsim_quantize_fp8(const std::string& data, const std::string& format)
     }
 }
 
+em::val WeightPrecisionEstimateToVal(const onnxsim::WeightPrecisionEstimate& est) {
+    em::val out = em::val::object();
+    out.set("nodeName", est.node_name);
+    out.set("opType", est.op_type);
+    out.set("reductionDepth", static_cast<double>(est.reduction_depth));
+    out.set("numChannels", static_cast<double>(est.num_channels));
+    out.set("int32AccumulatorSafe", est.int32_accumulator_safe);
+    out.set("float32CastExact", est.float32_cast_exact);
+    out.set("maxOutlierRatio", est.max_outlier_ratio);
+    out.set("outlierRisk", est.outlier_risk);
+    out.set("activationProducerOp", est.activation_producer_op);
+    out.set("hasActivationRange", est.has_activation_range);
+    out.set("activationRangeLo", est.activation_range_lo);
+    out.set("activationRangeHi", est.activation_range_hi);
+    out.set("recommendation", est.recommendation);
+    return out;
+}
+
+em::val AttentionPrecisionEstimateToVal(const onnxsim::AttentionPrecisionEstimate& est) {
+    em::val out = em::val::object();
+    out.set("nodeName", est.node_name);
+    out.set("hasNumQueryHeads", est.has_num_query_heads);
+    out.set("numQueryHeads", static_cast<double>(est.num_query_heads));
+    out.set("hasNumKvHeads", est.has_num_kv_heads);
+    out.set("numKvHeads", static_cast<double>(est.num_kv_heads));
+    out.set("hasHeadDim", est.has_head_dim);
+    out.set("headDim", static_cast<double>(est.head_dim));
+    out.set("defaultScale", est.default_scale);
+    out.set("actualScale", est.actual_scale);
+    // -1 = unknown, 0 = false, 1 = true -- see AttentionPrecisionEstimate's
+    // doc comment in precision_estimator.h.
+    out.set("scaleMatchesDefault", est.scale_matches_default);
+    out.set("recommendation", est.recommendation);
+    return out;
+}
+
+// Static, calibration-free INT8-quantization risk pre-check -- see
+// precision_estimator.h (a C++ port of onnxsim/precision_estimator.py's
+// estimate_model_quantization_drop, kept in exact sync with it). Purely a
+// read-only analysis of the model's own weights and shapes: no execution and
+// no calibration data needed, so the page can run this the instant a model
+// loads -- before the user has picked a quantize method or run anything
+// through onnxruntime-web. Returns null on parse failure, else an object
+// mirroring onnxsim.ModelQuantizationEstimate: { totalNodesAnalyzed,
+// unsafeNodes, outlierRiskNodes, worstOutlierRatio, estimatedRelativeError,
+// riskLevel, weightEstimates: [...], attentionEstimates: [...] } (NaN fields
+// -- e.g. worstOutlierRatio when no node had a computable ratio, or
+// estimatedRelativeError when riskLevel is "unsafe" -- come through as the JS
+// value NaN, exactly like Python's math.nan does for the same fields).
+em::val onnxsim_estimate_quantization_drop(const std::string& data) {
+    onnx::ModelProto xmodel;
+    if (!xmodel.ParseFromArray(data.data(), data.size())) {
+        std::cerr << "Parse failed" << std::endl;
+        return em::val::null();
+    }
+    onnxsim::ModelQuantizationEstimate est;
+    try {
+        est = onnxsim::EstimateModelQuantizationDrop(xmodel);
+    } catch (const std::exception& e) {
+        std::cerr << "estimate_quantization_drop error: " << e.what() << std::endl;
+        return em::val::null();
+    }
+
+    em::val out = em::val::object();
+    out.set("totalNodesAnalyzed", static_cast<double>(est.total_nodes_analyzed));
+    em::val unsafe_nodes = em::val::array();
+    for (size_t i = 0; i < est.unsafe_nodes.size(); ++i) {
+        unsafe_nodes.set(i, est.unsafe_nodes[i]);
+    }
+    out.set("unsafeNodes", unsafe_nodes);
+    em::val outlier_nodes = em::val::array();
+    for (size_t i = 0; i < est.outlier_risk_nodes.size(); ++i) {
+        outlier_nodes.set(i, est.outlier_risk_nodes[i]);
+    }
+    out.set("outlierRiskNodes", outlier_nodes);
+    out.set("worstOutlierRatio", est.worst_outlier_ratio);
+    out.set("estimatedRelativeError", est.estimated_relative_error);
+    out.set("riskLevel", est.risk_level);
+
+    em::val weight_estimates = em::val::array();
+    for (size_t i = 0; i < est.weight_estimates.size(); ++i) {
+        weight_estimates.set(i, WeightPrecisionEstimateToVal(est.weight_estimates[i]));
+    }
+    out.set("weightEstimates", weight_estimates);
+
+    em::val attention_estimates = em::val::array();
+    for (size_t i = 0; i < est.attention_estimates.size(); ++i) {
+        attention_estimates.set(i, AttentionPrecisionEstimateToVal(est.attention_estimates[i]));
+    }
+    out.set("attentionEstimates", attention_estimates);
+    return out;
+}
+
 // Both list_* functions below are used by the page to discover which tensor
 // names to calibrate (run the model over sample inputs and record each
 // tensor's observed min/max) before calling quantize_static/quantize_qoperator.
@@ -1043,6 +1137,9 @@ EMSCRIPTEN_BINDINGS(module) {
     function("onnxsim_quantize_fp16", &onnxsim_quantize_fp16);
     function("onnxsim_quantize_bf16", &onnxsim_quantize_bf16);
     function("onnxsim_quantize_fp8", &onnxsim_quantize_fp8);
+    // Static, calibration-free INT8-quantization risk pre-check (see its own
+    // doc comment above).
+    em::function("onnxsim_estimate_quantization_drop", &onnxsim_estimate_quantization_drop);
     // Calibration-based quantization: list_* discovers which tensors to
     // calibrate, quantize_static/quantize_qoperator take the calibrated
     // ranges back as parallel [name] / [min0, max0, min1, max1, ...] arrays.

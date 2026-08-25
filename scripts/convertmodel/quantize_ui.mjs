@@ -38,7 +38,7 @@ import { computeQuantizationQuality, renderQuantizationQuality } from "./quantiz
 // graph, where fused patterns (e.g. Conv+BN, MatMul+Add -> Gemm) match more
 // of what onnxsim's quantize passes look for. Throws a user-facing message
 // if "converted" is selected but nothing has been converted yet.
-async function resolveQuantizeInput(source, fileInput) {
+export async function resolveQuantizeInput(source, fileInput) {
   if (source === "converted") {
     const converted = window.__onnxsimConverted;
     if (!converted || !converted.bytes) {
@@ -53,7 +53,7 @@ async function resolveQuantizeInput(source, fileInput) {
 }
 
 // Resolve this page's WASM runtime (published by index.html's inline loader).
-function getRuntime() {
+export function getRuntime() {
   return window.__onnxsimRuntimePromise;
 }
 
