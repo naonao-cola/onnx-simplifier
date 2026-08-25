@@ -15,6 +15,7 @@
 #include "passes/eliminate_nop_dropout.h"
 #include "passes/eliminate_reshape_around_elementwise.h"
 #include "passes/fuse_add_bias_into_conv.h"
+#include "passes/fuse_attention.h"
 #include "passes/fuse_bn_into_conv.h"
 #include "passes/fuse_consecutive_mul.h"
 #include "passes/fuse_consecutive_unsqueezes.h"
@@ -24,6 +25,7 @@
 #include "passes/fuse_mul_into_conv.h"
 #include "passes/fuse_pad_into_pool.h"
 #include "passes/fuse_preceding_mul_into_conv.h"
+#include "passes/fuse_qkv.h"
 #include "passes/fuse_rms_norm.h"
 #include "passes/qoperator_quantize_activation.h"
 #include "passes/qoperator_quantize_concat.h"
@@ -87,6 +89,7 @@ void RegisterCustomOptimizerPasses() {
     RegisterOrReplace<p::DynamicQuantizeMatMulIntegerToFloat>(registry);
     RegisterOrReplace<p::DynamicQuantizeTernaryMatMul>(registry);
     RegisterOrReplace<p::EliminateReshapeAroundElementwise>(registry);
+    RegisterOrReplace<p::FuseAttention>(registry);
     RegisterOrReplace<p::FuseConsecutiveMul>(registry);
     RegisterOrReplace<p::FuseGelu>(registry);
     RegisterOrReplace<p::FuseLayerNorm>(registry);
@@ -129,6 +132,7 @@ void RegisterCustomOptimizerPasses() {
     RegisterOrReplace<p::FuseBNIntoConv>(registry);
     RegisterOrReplace<p::FuseConsecutiveUnsqueezes>(registry);
     RegisterOrReplace<p::FusePadIntoPool>(registry);
+    RegisterOrReplace<p::FuseQKV>(registry);
   });
 }
 
