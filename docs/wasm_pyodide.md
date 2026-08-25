@@ -227,10 +227,60 @@ What the demo runs instead is real: several bindings in
 bytes using onnxsim's own *statically-linked* copy of onnx/onnx-optimizer/
 protobuf, and need no Python `onnx` package at all.
 
-**Hosting is provisional**: the page fetches `./onnxsim_cpp2py_export.abi3.so`
-as a same-directory relative path. That `.so` is not committed (like every
+**Hosting**: the page fetches `./onnxsim_cpp2py_export.abi3.so` as a
+same-directory relative path. That `.so` is not committed (like every
 other `*.so` in this repo, it's gitignored) -- get one via the CI artifact
-or a local build, as above. It is not yet wired into this repo's GitHub
-Pages deployment (`static.yml`, which currently deploys the unrelated
-ORT-web/JS convertmodel demo) -- doing that is a real follow-up, not
-attempted here.
+or a local build, as above. `static.yml` stages this demo (both the page
+and a freshly-built `.so`, imported as a cross-workflow artifact from
+`pyodide-wasm.yml`) at `pyodide-demo/` alongside its existing ORT-web/JS
+convertmodel deploy, on every production deploy and `/preview` -- see its
+"Pyodide demo" step for exactly how, including the fallback it uses when
+the exact commit being deployed has no matching `pyodide-wasm.yml` run of
+its own (most commits don't, since that workflow is path-filtered).
+
+## Distributable wheel (experimental, hand-verified once)
+
+`build_wasm_pyodide.sh` produces a loose `.so`, not something `micropip`
+can install directly. Closing that gap needs two things: (1) `setup.py`'s
+`build_ext` step doing the same manual `em++ -sSIDE_MODULE=2` relink
+`build_wasm_pyodide.sh` does (CMake alone still can't produce a real side
+module -- see above), and (2) assembling that relinked `.so` plus onnxsim's
+pure-Python files into an actual wheel with the right Pyodide platform tag.
+
+**(1) is now real and committed**, gated behind an explicit opt-in env var
+so it has zero effect on the normal native wheel build:
+
+```sh
+ONNXSIM_WASM_SIDE_MODULE_RELINK=1 <the rest of a normal `pip wheel .` /
+  `python setup.py build_ext` invocation, run under an activated emsdk>
+```
+
+When set, `build_ext` performs the exact relink `build_wasm_pyodide.sh`
+does (same object-file/archive discovery, same `-sEXPORTED_FUNCTIONS`
+entry-symbol handling) on CMake's output before copying it into the wheel,
+so whatever packages the wheel afterward picks up a genuine dynamic module
+instead of a static archive. Unset (the default), this code path is never
+even evaluated.
+
+**(2) is not yet automated** -- `pyodide build`'s own `pywasmcross`
+compiler-wrapping does NOT solve the `SIDE_MODULE` problem on its own
+(confirmed directly: it wraps individual `em++`/`emcc` invocations, but
+never CMake's own generator-level choice of link rule, which is what's
+actually blocked by `TARGET_SUPPORTS_SHARED_LIBS=FALSE`). A real wheel
+was hand-assembled for validation -- same `onnxsim/onnxsim_cpp2py_export.abi3.so`
+`build_wasm_pyodide.sh` produces (after the `ONNXSIM_WASM_SIDE_MODULE_RELINK=1`
+relink), onnxsim's pure-Python modules, and a hand-written `.dist-info/`
+(`METADATA`/`WHEEL`/`RECORD`) tagged `cp312-abi3-pyodide_2026_0_wasm32`
+(matching Pyodide 314.0.5's `PYODIDE_ABI_VERSION`, confirmed live inside
+that runtime) -- zipped together, no `pyodide build`/`bdist_wheel`
+involved. Wiring `pyodide build` through to produce this automatically is
+a real follow-up, not done here.
+
+**Verified working**: `micropip.install(<url to the hand-assembled wheel>,
+deps=False)` (`deps=False` because full dependency resolution hits the
+same `onnx` ABI-epoch gap described above -- a separate, already-documented
+issue, not a flaw in the wheel itself) installed cleanly in a real Pyodide
+314.0.5 runtime, and importing the *installed* module from its real
+site-packages path (not a hand-copied FS write, unlike the demo page)
+succeeded, with `_list_optimizers()` again confirming it's genuinely
+functional, not just importable.
