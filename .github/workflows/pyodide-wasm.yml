@@ -10,16 +10,21 @@
 # build_wasm_pyodide.sh's own header comment. It does not touch either.
 #
 # Toolchain pins, and why (see docs/wasm_pyodide.md for the full detail):
-#   - Emscripten 5.0.3: pyodide-build's own default Emscripten (3.1.46,
+#   - Emscripten 4.0.9: pyodide-build's own default Emscripten (3.1.46,
 #     clang-18) fails to compile onnxsim's vendored protobuf 31.1 (a
-#     `constinit` compile-time-evaluation limit in that old clang). 5.0.3 is
-#     the version validated end-to-end against Pyodide release 314.0.5's
-#     Python 3.14 headers.
-#   - Pyodide release 314.0.5: the xbuildenv (target Python headers) that
-#     matches the validated Emscripten 5.0.3, and the exact `pyodide` npm
-#     package version this workflow loads the built module with -- a mismatch
-#     between the JS runtime and the headers used to compile could produce
-#     confusing failures unrelated to the thing actually being tested.
+#     `constinit` compile-time-evaluation limit in that old clang) -- any
+#     newer Emscripten avoids it. 4.0.9 is specifically the version Pyodide
+#     release 0.29.4 itself was built with.
+#   - Pyodide release 0.29.4: this is the load-bearing pin. Its ABI epoch
+#     (`sysconfig.get_config_var("PYODIDE_ABI_VERSION")` -> `2025_0`) is the
+#     SAME epoch PyPI's `onnx` wheel is tagged for
+#     (`onnx-*-pyemscripten_2025_0_wasm32.whl`) -- confirmed by loading onnx's
+#     real compiled extension in this exact runtime. A later Pyodide release
+#     (e.g. 314.0.5, epoch `2026_0`) compiles onnxsim fine too, but produces a
+#     module ABI-incompatible with onnx's only published wasm wheel, which is
+#     what actually blocks running full `onnxsim.simplify()` (needs `onnx`)
+#     rather than just the compiled extension alone. Pin this xbuildenv/npm
+#     package version, not "whatever's current", so this stays matched.
 name: Pyodide / wasm32-emscripten build
 
 on:
@@ -66,24 +71,24 @@ jobs:
     runs-on: ubuntu-latest
     env:
       CMAKE_GENERATOR: Ninja
-      EMSCRIPTEN_VERSION: "5.0.3"
-      PYODIDE_VERSION: "314.0.5"
+      EMSCRIPTEN_VERSION: "4.0.9"
+      PYODIDE_VERSION: "0.29.4"
     steps:
       - name: Checkout
         uses: actions/checkout@v7
         with:
           submodules: recursive
 
-      # The TARGET Python minor version (3.14, matching PYODIDE_VERSION's
+      # The TARGET Python minor version (3.13, matching PYODIDE_VERSION's
       # CPython) -- also used as the HOST interpreter build_wasm_pyodide.sh
       # shells out to for `nanobind --cmake_dir` and that onnx-optimizer's
       # combined find_package(Python...) call runs directly. Their minor
       # versions must match (see build_wasm_pyodide.sh's header comment), so
       # this one interpreter serves both roles.
-      - name: Set up Python 3.14
+      - name: Set up Python 3.13
         uses: actions/setup-python@v7
         with:
-          python-version: "3.14"
+          python-version: "3.13"
 
       - run: pip install cmake ninja nanobind pyodide-build
 
@@ -126,9 +131,9 @@ jobs:
         run: pyodide xbuildenv install "${PYODIDE_VERSION}" --path .pyodide-xbuildenv
       - name: Locate the target Python headers in the xbuildenv
         run: |
-          PYODIDE_PYTHON_INCLUDE=$(find "$PWD/.pyodide-xbuildenv" -type d -path "*/include/python3.14*" | head -1)
+          PYODIDE_PYTHON_INCLUDE=$(find "$PWD/.pyodide-xbuildenv" -type d -path "*/include/python3.13*" | head -1)
           if [ -z "$PYODIDE_PYTHON_INCLUDE" ]; then
-            echo "::error::could not find a python3.14* headers dir under .pyodide-xbuildenv (xbuildenv install broken/incomplete?)" >&2
+            echo "::error::could not find a python3.13* headers dir under .pyodide-xbuildenv (xbuildenv install broken/incomplete?)" >&2
             find "$PWD/.pyodide-xbuildenv" -maxdepth 6 -type d
             exit 1
           fi

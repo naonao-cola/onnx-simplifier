@@ -378,6 +378,13 @@ jobs:
             echo "::warning::downloaded Pyodide demo artifact did not contain onnxsim_cpp2py_export.abi3.so -- skipping"
           else
             cp "$SO" scripts/convertmodel/pyodide-demo/onnxsim_cpp2py_export.abi3.so
+            # onnxsim's pure-Python package, staged alongside the compiled
+            # extension so the demo page can fetch each file and drop it into
+            # Pyodide's site-packages at runtime -- needed for the full
+            # onnxsim.simplify() path (import onnxsim), not just the native
+            # cpp2py_export bindings the demo could already reach without it.
+            mkdir -p scripts/convertmodel/pyodide-demo/onnxsim_src
+            cp onnxsim/*.py scripts/convertmodel/pyodide-demo/onnxsim_src/
             echo "staged Pyodide demo at scripts/convertmodel/pyodide-demo/"
           fi
 

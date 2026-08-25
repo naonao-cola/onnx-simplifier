@@ -1,23 +1,24 @@
-# Pyodide / wasm32-emscripten Python extension (experimental)
+# Pyodide / wasm32-emscripten Python extension
 
-**Status: the compiled extension module is confirmed working under a real
-Pyodide runtime.** CI (`.github/workflows/pyodide-wasm.yml`) builds
-`onnxsim_cpp2py_export.abi3.so`, loads it into a real Pyodide 314.0.5 runtime
-(the `pyodide` npm package under Node), and confirms `import
-onnxsim_cpp2py_export` succeeds and a real binding runs
-(`_list_optimizers()` returns onnx-optimizer's actual registered passes --
-`nop`, `eliminate_nop_cast`, ... -- not a stub). See
-`scripts/pyodide_smoke_test.mjs` and the workflow for exactly what that
-covers.
+**Status: full `onnxsim.simplify()` runs under a real Pyodide runtime,
+using onnx's real, unmodified PyPI wasm wheel.** CI
+(`.github/workflows/pyodide-wasm.yml`) builds `onnxsim_cpp2py_export.abi3.so`
+against **Pyodide 0.29.4** (Emscripten 4.0.9), loads it into that exact
+Pyodide runtime (the `pyodide` npm package under Node), confirms the
+low-level extension imports and runs, then installs `onnx` from PyPI via
+`micropip` for real and runs a full `onnxsim.simplify()` call on a real
+model. See `scripts/pyodide_smoke_test.mjs` and the workflow for exactly
+what that covers.
 
-**What's still open**: this verifies the low-level nanobind extension
-module alone, not the full `import onnxsim` / `onnxsim.simplify()` --
-checked directly (not left unattempted): `onnx`'s only PyPI wasm wheel is
-tagged for a Pyodide ABI epoch this toolchain's Pyodide release doesn't
-match, so `import onnx` itself isn't currently possible inside Pyodide. See
-"Browser demo" below for the details and for what a real, working demo
-built on the confirmed-working extension alone looks like
-(`scripts/pyodide_demo/index.html`).
+This resolves what earlier revisions of this doc described as a structural
+gap: PyPI's only `onnx` wasm wheel is tagged for Pyodide ABI epoch
+`2025_0`, and this repo's toolchain originally targeted Pyodide 314.0.5
+(epoch `2026_0`) -- a real, then-unmatched epoch mismatch that made
+`import onnx` fail inside Pyodide outright. The fix wasn't a change to
+onnxsim's code or a protobuf downgrade (an intermediate hypothesis that
+turned out to be wrong -- see "The ABI epoch mismatch, and how it was
+actually resolved" below) -- it was targeting the specific Pyodide release
+whose epoch already matches `onnx`'s wheel: **Pyodide 0.29.4**.
 
 ## What this is
 
@@ -143,15 +144,18 @@ would silently go stale as dependencies change.
 
 ```sh
 # Activate an emsdk whose Emscripten version compiles onnxsim's vendored
-# protobuf cleanly. pyodide-build's own default (Emscripten 3.1.46 /
-# clang-18) fails on a protobuf `constinit` compile error; a newer
-# Emscripten (e.g. the one bundled with a recent Pyodide xbuildenv, such as
-# Pyodide 314.0.5's Emscripten 5.0.3) is known to work. Use the SAME emsdk
-# for the whole run -- see the script's own header comment for why.
+# protobuf cleanly AND matches onnx's published wasm wheel's ABI epoch.
+# pyodide-build's own default (Emscripten 3.1.46 / clang-18) fails on a
+# protobuf `constinit` compile error; Emscripten 4.0.9, matching Pyodide
+# release 0.29.4 (ABI epoch 2025_0, the same epoch onnx's wheel is tagged
+# for), is the recommended target -- see "The ABI epoch mismatch" below for
+# why the epoch match matters, not just "new enough to compile". Use the
+# SAME emsdk for the whole run -- see the script's own header comment for
+# why.
 source /path/to/matching/emsdk/emsdk_env.sh
 
-PYODIDE_PYTHON_INCLUDE=/path/to/xbuildenv/.../include/python3.14 \
-PYTHON_EXECUTABLE=/path/to/host/python3.14 \
+PYODIDE_PYTHON_INCLUDE=/path/to/xbuildenv/.../include/python3.13 \
+PYTHON_EXECUTABLE=/path/to/host/python3.13 \
   ./build_wasm_pyodide.sh
 ```
 
@@ -167,23 +171,65 @@ the script's own header comment for the full prerequisite list and defaults
 
 Output: `<BUILD_DIR>/onnxsim_cpp2py_export.abi3.so`, the script's last line.
 
-## What's next
+## The ABI epoch mismatch, and how it was actually resolved
 
-CI (`.github/workflows/pyodide-wasm.yml`) has gone green on a real run:
-`build_wasm_pyodide.sh` builds end to end (Emscripten 5.0.3, Pyodide 314.0.5
-xbuildenv headers), and `scripts/pyodide_smoke_test.mjs` confirms
-`import onnxsim_cpp2py_export` succeeds and `_list_optimizers()` returns
-onnx-optimizer's real registered passes under a real Pyodide 314.0.5
-runtime. See the "Status" section at the top of this doc.
+`onnx`'s only PyPI wasm wheel
+(`onnx-1.22.0-cp312-abi3-pyemscripten_2025_0_wasm32.whl`) is tagged for
+Pyodide's ABI epoch `2025_0`. This repo's wasm build originally targeted
+Pyodide 314.0.5 (epoch `2026_0`), so `micropip.install("onnx")` failed
+outright:
+
+```
+ValueError: Wheel was built with Emscripten vpyemscripten.2025.0 but
+Pyodide was built with Emscripten v5.0.3
+```
+
+**First hypothesis, checked and wrong**: that onnx's wheel avoided the
+protobuf `constinit` compile error (obstacle 1 below) by building with
+`ONNX_USE_LITE_PROTO=ON` (onnx's own standard release convention, confirmed
+in `.github/workflows/release_pyodide_cibw.yml` upstream), so downgrading
+onnxsim's own protobuf version below the one that introduced that pattern
+(v30.0) might let onnxsim compile under the same old toolchain. Tested
+directly: it does NOT help -- the offending code
+(`fixed_address_empty_string` in `port.cc`) is compiled into
+`libprotobuf-lite` too, not just full `libprotobuf`; lite vs full doesn't
+matter for this specific bug.
+
+**What actually explains it**: Pyodide's ABI epoch tracks the *CPython*
+version, not the Emscripten version. Checked directly in Pyodide's own git
+history (`Makefile.envs`, the commit that bumped `PYODIDE_ABI_VERSION`
+`2025_0` -> `2026_0`): `PYODIDE_EMSCRIPTEN_VERSION` stayed at the same
+`5.0.x` line across that epoch boundary -- only `PYVERSION` changed (3.13.2
+-> 3.14.2). Epoch `2025_0` itself, per the last Pyodide release that shipped
+it (**0.29.4**), pairs with **Emscripten 4.0.9** -- a modern-enough
+toolchain that (like 5.0.3) has no trouble with onnxsim's protobuf 31.1 at
+all, full (non-lite) proto included. So the fix is simply: target Pyodide
+0.29.4 instead of 314.0.5. No protobuf downgrade, no upstream `onnx`
+change needed.
+
+**Verified, concretely**, before wiring this into CI: built
+`onnxsim_cpp2py_export.abi3.so` against Pyodide 0.29.4's xbuildenv with
+unmodified protobuf 31.1 -- compiled clean. Downloaded onnx's real
+`onnx-1.22.0-*-pyemscripten_2025_0_wasm32.whl` from PyPI and loaded its
+compiled extension (`onnx_cpp2py_export.cpython-313-wasm32-emscripten.so`)
+directly via `importlib` inside a real Pyodide 0.29.4 runtime (`pyodide`
+npm package under Node) -- it initialized successfully, side by side with
+onnxsim's own extension in the same runtime. `scripts/pyodide_smoke_test.mjs`
+now does the equivalent through the normal `micropip.install("onnx")` path
+(which additionally resolves `numpy`/`protobuf`/`ml_dtypes` from Pyodide's
+own package repository automatically) and runs a full `onnxsim.simplify()`
+call as its final check.
 
 ## Browser demo
 
 `scripts/pyodide_demo/index.html` is a self-contained, client-side-only demo
-page: drop in a real `.onnx` file, run one of onnxsim's native
-quantization/precision-conversion passes on it (weight-only int8/int4/
-int16/block, dynamic, ternary, bf16/fp16/fp8), see real before/after size
-and op-count deltas, download the result. Everything runs in the browser via
-Pyodide 314.0.5 -- no server involved.
+page: drop in a real `.onnx` file, either run the full `onnxsim.simplify()`
+pipeline (installs `onnx` from PyPI via `micropip`, same as the CI smoke
+test) or one of onnxsim's native quantization/precision-conversion passes
+(weight-only int8/int4/int16/block, dynamic, ternary, bf16/fp16/fp8) that
+work without `onnx` present at all -- see real before/after size and
+op-count deltas, download the result. Everything runs in the browser via
+Pyodide 0.29.4 -- no server involved.
 
 **To try it:**
 
@@ -199,33 +245,12 @@ python3 -m http.server -d scripts/pyodide_demo 8000
 # 4. Open http://localhost:8000/ and click "Load runtime".
 ```
 
-**Why this demo doesn't run full `onnxsim.simplify()`**: that needs
-`import onnx` (`onnx.checker`, `onnx.shape_inference`, and a Python-side
-`PyModelExecutor` for constant folding), which needs the `onnx` package
-present inside Pyodide too -- checked directly, not assumed. PyPI's only
-`onnx` wasm wheel (`onnx-1.22.0-cp312-abi3-pyemscripten_2025_0_wasm32.whl`)
-is tagged for Pyodide's ABI epoch `2025_0`; Pyodide 314.0.5 (the release
-this repo's toolchain targets, per `sysconfig.get_config_var
-("PYODIDE_ABI_VERSION")`) is epoch `2026_0`, so `micropip.install("onnx")`
-fails outright:
-
-```
-ValueError: Wheel was built with Emscripten vpyemscripten.2025.0 but
-Pyodide was built with Emscripten v5.0.3
-```
-
-No other onnx release on PyPI has a matching-epoch wheel. Bypassing that
-check doesn't help either: onnx's own `numpy`/`protobuf`/`ml_dtypes`
-dependencies have no wasm wheels on PyPI at all -- only inside Pyodide's own
-CDN-hosted package repository, which onnx isn't part of. This is a real,
-structural gap in the current wasm packaging ecosystem, not a quick fix
-available to onnxsim.
-
-What the demo runs instead is real: several bindings in
+The native quantization passes remain available (and remain the faster
+option -- no `onnx`/`numpy` download needed) since several bindings in
 `onnxsim/cpp2py_export.cc` (`_list_optimizers`, `_model_metrics`, and the
 `quantize_*` passes) operate directly on raw serialized ONNX `ModelProto`
 bytes using onnxsim's own *statically-linked* copy of onnx/onnx-optimizer/
-protobuf, and need no Python `onnx` package at all.
+protobuf, needing no Python `onnx` package at all.
 
 **Hosting**: the page fetches `./onnxsim_cpp2py_export.abi3.so` as a
 same-directory relative path. That `.so` is not committed (like every
@@ -277,10 +302,18 @@ involved. Wiring `pyodide build` through to produce this automatically is
 a real follow-up, not done here.
 
 **Verified working**: `micropip.install(<url to the hand-assembled wheel>,
-deps=False)` (`deps=False` because full dependency resolution hits the
-same `onnx` ABI-epoch gap described above -- a separate, already-documented
-issue, not a flaw in the wheel itself) installed cleanly in a real Pyodide
-314.0.5 runtime, and importing the *installed* module from its real
-site-packages path (not a hand-copied FS write, unlike the demo page)
-succeeded, with `_list_optimizers()` again confirming it's genuinely
-functional, not just importable.
+deps=False)` (`deps=False` because, at the time, full dependency resolution
+hit the `onnx` ABI-epoch gap described above -- a separate issue, not a
+flaw in the wheel itself) installed cleanly in a real Pyodide 314.0.5
+runtime, and importing the *installed* module from its real site-packages
+path (not a hand-copied FS write, unlike the demo page) succeeded, with
+`_list_optimizers()` again confirming it's genuinely functional, not just
+importable.
+
+This specific wheel-assembly test was done against Pyodide 314.0.5 (epoch
+`2026_0`), before the epoch-matching fix above. It hasn't been re-run
+against Pyodide 0.29.4 (epoch `2025_0`) yet -- the tag would become
+`cp312-abi3-pyodide_2025_0_wasm32` there, and given that epoch now matches
+onnx's own wheel, `micropip.install(..., deps=True)` (the default, pulling
+in `onnx` transitively) becomes worth testing too, not just `deps=False`.
+Re-verifying this specific combination is a real follow-up, not done here.

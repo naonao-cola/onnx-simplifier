@@ -3,65 +3,45 @@
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<title>onnxsim WebAssembly demo (Pyodide, extension-only)</title>
+<title>onnxsim WebAssembly demo</title>
 <!--
-  onnxsim / Pyodide browser demo -- PROVISIONAL, experimental, additive to
-  onnxsim/onnxsim#696. Not wired into any build; open this file directly (or
-  via a static file server) to try it.
+  onnxsim / Pyodide browser demo -- onnxsim/onnxsim#696, extended once the
+  ABI-epoch fix below landed. Open this file via a static file server (not
+  file://, since it fetches the .so over HTTP) to try it.
 
-  SCOPE, and why it stops where it does
-  ======================================
-  The goal was a page where you drop in an .onnx file and get back a
-  simplified one via the real `onnxsim.simplify()` Python entry point,
-  running entirely client-side in Pyodide. That was verified NOT to be
-  possible yet, for a concrete, checked-not-assumed reason:
+  SCOPE
+  ======
+  This page runs onnxsim entirely client-side in Pyodide, two ways:
 
-    `onnxsim.simplify()` needs `import onnx` (onnx.checker, onnx.shape_inference,
-    and a PyModelExecutor built on top of it). The only onnx wasm wheel on PyPI
-    (onnx 1.22.0, `onnx-1.22.0-cp312-abi3-pyemscripten_2025_0_wasm32.whl`) is
-    tagged for Pyodide's ABI epoch "2025_0". This page loads Pyodide 314.0.5 --
-    the same release this repo's own CI (.github/workflows/pyodide-wasm.yml)
-    builds and tests onnxsim's extension against -- whose own ABI epoch is
-    "2026_0" (confirmed via `sysconfig.get_config_var("PYODIDE_ABI_VERSION")`
-    inside that exact Pyodide build). micropip's own compatibility check
-    rejects the wheel outright:
+  1. Full `onnxsim.simplify()` -- the real Python entry point, same as a
+     normal `pip install onnxsim` use. This needed onnx's real PyPI wasm
+     wheel to actually load, which for a while didn't work: onnx's only
+     wasm wheel is tagged for Pyodide ABI epoch "2025_0", while this page
+     used to load Pyodide 314.0.5 (epoch "2026_0") -- a genuine mismatch,
+     confirmed via `micropip.install("onnx")` failing outright with
+     `ValueError: Wheel was built with Emscripten vpyemscripten.2025.0 but
+     Pyodide was built with Emscripten v5.0.3`. Fixed by targeting Pyodide
+     0.29.4 instead (same epoch, "2025_0", as onnx's wheel) -- see
+     docs/wasm_pyodide.md's "The ABI epoch mismatch" section for the full
+     story, including a downgrade-protobuf hypothesis that was tested and
+     turned out to be wrong.
+  2. onnxsim's native quantization/precision-conversion passes (weight-only
+     int8/int4/int16/block-int8, dynamic, ternary, bf16, fp16, fp8) via
+     `onnxsim_cpp2py_export` directly -- these operate on raw serialized
+     ONNX `ModelProto` bytes using onnxsim's own *statically-linked* copy of
+     onnx/onnx-optimizer/protobuf, so they're available even without `onnx`
+     installed, and skip the (~15MB) onnx/numpy/protobuf download full
+     simplify() needs.
 
-      ValueError: Wheel was built with Emscripten vpyemscripten.2025.0 but
-      Pyodide was built with Emscripten v5.0.3
-
-    No other onnx release on PyPI has a matching wheel. Bypassing the check
-    (monkeypatching micropip's tag gate, as an investigative-only test, NOT
-    done by this page) doesn't help either: onnx's own hard dependencies --
-    numpy, protobuf, ml_dtypes -- have NO wasm/emscripten wheels on PyPI at
-    all (checked via PyPI's JSON API); they exist only inside Pyodide's own
-    package repository (loaded from a CDN). So this is a real, structural gap
-    in the current wasm packaging ecosystem, not a one-line fix here.
-
-  What IS proven and IS what this page actually does: onnxsim's own compiled
-  extension (`onnxsim_cpp2py_export`, built by `build_wasm_pyodide.sh` for
-  wasm32-emscripten -- see docs/wasm_pyodide.md) loads and runs for real
-  inside a real Pyodide 314.0.5 runtime, and several of its bindings
-  (onnxsim/cpp2py_export.cc) operate directly on raw serialized ONNX
-  `ModelProto` bytes using onnxsim's own *statically-linked* copy of onnx/
-  onnx-optimizer/protobuf -- they need NO Python `onnx` package at all:
-  `_list_optimizers`, `_model_metrics`, and the calibration-free `quantize_*`
-  passes (weight-only int8/int4/int16/block-int8, dynamic, ternary, bf16,
-  fp16, fp8). That's real, working, in-browser ONNX model transformation --
-  just not full `simplify()` (which specifically needs onnx.shape_inference
-  and a Python-side model executor for constant folding).
-
-  HOSTING, honestly -- this is provisional
-  ==========================================
-  This page fetches `./onnxsim_cpp2py_export.abi3.so` (a same-directory,
-  relative path) -- co-located next to this HTML file in this PR's working
-  tree rather than solved as a real release/CDN/GitHub-Pages artifact. That's
-  a deliberate, called-out shortcut: it works for local testing (a static
-  file server rooted at this directory) and would work as-is if this
-  directory were published via GitHub Pages (static.yml), but is NOT a real
-  distribution story (versioning, cache-busting, artifact provenance are all
-  unaddressed). Pyodide itself is loaded from the real jsdelivr CDN
-  (cdn.jsdelivr.net/pyodide/v314.0.5/full/), matching the URL format Pyodide's
-  own loader constructs internally for this exact version.
+  HOSTING
+  ========
+  This page fetches `./onnxsim_cpp2py_export.abi3.so` and
+  `./onnxsim_src/*.py` as same-directory relative paths -- `static.yml`
+  stages both (see its "Stage the Pyodide demo" step) at `pyodide-demo/`
+  alongside the main WASM converter demo, on every production deploy and
+  `/preview`. Pyodide itself is loaded from the real jsdelivr CDN
+  (cdn.jsdelivr.net/pyodide/v0.29.4/full/), matching the URL format
+  Pyodide's own loader constructs internally for this exact version.
 -->
 <style>
   :root {
@@ -233,29 +213,30 @@
 <body>
 <div class="wrap">
   <h1>onnxsim WebAssembly demo</h1>
-  <p class="subtitle">onnxsim's compiled C++ extension, running for real inside Pyodide, in your browser.</p>
+  <p class="subtitle">onnxsim running for real inside Pyodide, in your browser -- full <code>simplify()</code> included.</p>
 
   <div class="scope-banner">
-    <b>Scope note:</b> this demonstrates onnxsim's compiled
-    <code>onnxsim_cpp2py_export</code> extension running under Pyodide and
-    transforming real <code>.onnx</code> files client-side. It does
-    <b>not</b> run the full <code>onnxsim.simplify()</code> pipeline yet --
-    that needs the Python <code>onnx</code> package, and PyPI's only onnx
-    wasm wheel (1.22.0) is tagged for a different Pyodide ABI epoch
-    (<code>pyemscripten_2025_0</code>) than this page's Pyodide 314.0.5
-    (<code>2026_0</code>), so <code>micropip.install("onnx")</code> fails.
-    What <b>is</b> real here: parsing your uploaded model and running one of
-    onnxsim's own native quantization/precision-conversion passes on it --
-    these operate on raw ONNX bytes using onnxsim's statically-linked onnx
-    copy and need no Python <code>onnx</code> package at all.
+    <b>Scope note:</b> "Full pipeline" below runs the real
+    <code>onnxsim.simplify()</code>, installing the real <code>onnx</code>
+    PyPI package via <code>micropip</code> the first time you use it (a
+    ~15MB one-time download of onnx/numpy/protobuf). "Native pass" runs one
+    of onnxsim's own quantization/precision-conversion passes directly via
+    the compiled <code>onnxsim_cpp2py_export</code> extension -- these work
+    on raw ONNX bytes using onnxsim's statically-linked onnx copy, need no
+    extra download, and are faster if that's all you need.
     <details>
-      <summary>Why not full simplify() -- the exact error</summary>
-      <pre style="white-space:pre-wrap;margin:8px 0 0;font-size:12px;">ValueError: Wheel was built with Emscripten vpyemscripten.2025.0 but Pyodide was built with Emscripten v5.0.3
-
-(no other onnx release on PyPI has a matching-epoch wasm wheel; onnx's own
-numpy/protobuf/ml_dtypes dependencies additionally have no PyPI wasm wheels
-at all, only Pyodide's own CDN-hosted package repo -- a compounding gap,
-not just a version off-by-one.)</pre>
+      <summary>Why full simplify() needed a toolchain fix to work at all</summary>
+      <div style="margin-top:8px;">
+        PyPI's only <code>onnx</code> wasm wheel is tagged for Pyodide ABI
+        epoch <code>pyemscripten_2025_0</code>. This page used to load
+        Pyodide 314.0.5 (epoch <code>2026_0</code>), so
+        <code>micropip.install("onnx")</code> failed outright:
+        <pre style="white-space:pre-wrap;margin:8px 0;font-size:12px;">ValueError: Wheel was built with Emscripten vpyemscripten.2025.0 but Pyodide was built with Emscripten v5.0.3</pre>
+        Fixed by building onnxsim's own extension against Pyodide 0.29.4
+        instead (same epoch as onnx's wheel) -- see
+        <code>docs/wasm_pyodide.md</code>'s "The ABI epoch mismatch" section
+        for the full investigation.
+      </div>
     </details>
   </div>
 
@@ -275,8 +256,9 @@ not just a version off-by-one.)</pre>
     </div>
 
     <div class="row">
-      <label for="pass-select" style="color:var(--text-dim);font-size:13.5px;">Native pass:</label>
+      <label for="pass-select" style="color:var(--text-dim);font-size:13.5px;">Pass:</label>
       <select id="pass-select">
+        <option value="onnxsim_simplify">onnxsim.simplify() -- full pipeline (installs onnx, ~15MB first time)</option>
         <option value="quantize_weight_only">Weight-only INT8 quantization</option>
         <option value="quantize_weight_only_int4">Weight-only INT4 quantization</option>
         <option value="quantize_weight_only_int16">Weight-only INT16 quantization</option>
@@ -312,12 +294,35 @@ not just a version off-by-one.)</pre>
   </footer>
 </div>
 
-<script src="https://cdn.jsdelivr.net/pyodide/v314.0.5/full/pyodide.js"></script>
+<script src="https://cdn.jsdelivr.net/pyodide/v0.29.4/full/pyodide.js"></script>
 <script>
 (function () {
   "use strict";
 
+  // Matches exactly what static.yml's "Stage the Pyodide demo" step copies
+  // from onnxsim/*.py into onnxsim_src/ next to this page -- kept as an
+  // explicit list (not a directory listing, which a static file server
+  // can't give this page) so a file added there without updating this list
+  // fails loudly (a 404 during loadFullOnnxsim) rather than silently
+  // shipping an incomplete package.
+  const ONNXSIM_PURE_PY_FILES = [
+    "__init__.py",
+    "__main__.py",
+    "accuracy.py",
+    "backend.py",
+    "calibration.py",
+    "model_checking.py",
+    "model_info.py",
+    "onnx_simplifier.py",
+    "precision_estimator.py",
+    "profile_merge.py",
+    "profile_plot.py",
+    "test_utils.py",
+    "version.py",
+  ];
+
   const PASS_LABELS = {
+    onnxsim_simplify: "onnxsim.simplify() (full pipeline)",
     quantize_weight_only: "Weight-only INT8 quantization",
     quantize_weight_only_int4: "Weight-only INT4 quantization",
     quantize_weight_only_int16: "Weight-only INT16 quantization",
@@ -349,6 +354,42 @@ not just a version off-by-one.)</pre>
   let modelBytes = null;
   let modelFileName = "";
   let statusLines = [];
+  let fullOnnxsimReady = false;
+  let sitePackagesPath = null;
+
+  // Installs the real onnx PyPI package via micropip (works now that this
+  // page's Pyodide version shares onnx's wheel's ABI epoch -- see the
+  // top-of-file comment), plus rich (a pure-Python onnxsim dependency), then
+  // drops onnxsim's own pure-Python files into site-packages next to the
+  // already-loaded onnxsim_cpp2py_export extension. Idempotent: safe to call
+  // before every "full pipeline" run, only does real work once.
+  async function loadFullOnnxsim(sitePackages) {
+    if (fullOnnxsimReady) return;
+    logStatus("loading micropip...", "active");
+    await pyodide.loadPackage("micropip");
+    logStatus("micropip.install([\"onnx\", \"rich\"]) -- ~15MB, first time only...", "active");
+    await pyodide.runPythonAsync(`
+import micropip
+await micropip.install(["onnx", "rich"])
+`);
+    logStatus("onnx + rich installed", "ok");
+
+    logStatus(`fetching onnxsim's pure-Python package (${ONNXSIM_PURE_PY_FILES.length} files)...`, "active");
+    pyodide.FS.mkdirTree(`${sitePackages}/onnxsim`);
+    for (const name of ONNXSIM_PURE_PY_FILES) {
+      const resp = await fetch(`./onnxsim_src/${name}`);
+      if (!resp.ok) {
+        throw new Error(`fetch of onnxsim_src/${name} failed: HTTP ${resp.status}`);
+      }
+      const bytes = new Uint8Array(await resp.arrayBuffer());
+      pyodide.FS.writeFile(`${sitePackages}/onnxsim/${name}`, bytes);
+    }
+    logStatus("onnxsim pure-Python package written into site-packages", "ok");
+
+    await pyodide.runPythonAsync(`import onnxsim`);
+    logStatus("import onnxsim: OK", "ok");
+    fullOnnxsimReady = true;
+  }
 
   function logStatus(msg, kind) {
     statusLines.push({ msg, kind: kind || "" });
@@ -376,7 +417,7 @@ not just a version off-by-one.)</pre>
     statusLines = [];
     runOutput.innerHTML = "";
     try {
-      logStatus("booting Pyodide 314.0.5 (fetching wasm runtime from CDN)...", "active");
+      logStatus("booting Pyodide 0.29.4 (fetching wasm runtime from CDN)...", "active");
       const t0 = performance.now();
       pyodide = await loadPyodide();
       logStatus(`Pyodide ${pyodide.version} ready (${((performance.now() - t0) / 1000).toFixed(1)}s)`, "ok");
@@ -386,6 +427,7 @@ not just a version off-by-one.)</pre>
 import site
 [p for p in site.getsitepackages() if p.endswith("site-packages")][0]
 `);
+      sitePackagesPath = sitePackages;
       logStatus(`site-packages: ${sitePackages}`, "ok");
 
       logStatus("fetching onnxsim_cpp2py_export.abi3.so (compiled wasm32 extension, ~6MB)...", "active");
@@ -475,6 +517,9 @@ json.dumps(m._list_optimizers())
     const label = PASS_LABELS[passKey] || passKey;
 
     try {
+      if (passKey === "onnxsim_simplify") {
+        await loadFullOnnxsim(sitePackagesPath);
+      }
       pyodide.FS.writeFile("/tmp/uploaded_model.onnx", modelBytes);
 
       const resultJson = await pyodide.runPythonAsync(`
@@ -500,7 +545,15 @@ except Exception as e:
 
 pass_key = ${JSON.stringify(passKey)}
 try:
-    if pass_key == "quantize_fp8_e4m3":
+    if pass_key == "onnxsim_simplify":
+        import onnx
+        import onnxsim
+        model = onnx.load_from_string(model_bytes)
+        simplified, check_ok = onnxsim.simplify(model)
+        if not check_ok:
+            raise RuntimeError("onnxsim.simplify() reported check_ok=False -- the simplified model did not pass onnxsim's own output-equivalence check")
+        result_bytes = simplified.SerializeToString()
+    elif pass_key == "quantize_fp8_e4m3":
         result_bytes = m.quantize_fp8(model_bytes, "e4m3", True)
     elif pass_key == "quantize_fp8_e5m2":
         result_bytes = m.quantize_fp8(model_bytes, "e5m2", True)

@@ -20,29 +20,43 @@ set -ex
 #   - emcmake/em++ on PATH, from an emsdk whose Emscripten version is
 #     KNOWN GOOD for onnxsim's vendored protobuf (clang-18/Emscripten
 #     3.1.46, pyodide-build's own default, fails on a protobuf `constinit`
-#     compile error -- a newer Emscripten, e.g. the one bundled in a recent
-#     Pyodide xbuildenv such as Pyodide 314.0.5's Emscripten 5.0.3, is
-#     needed). Activate it the same way build_wasm.sh expects emcmake to
-#     already be on PATH, e.g.:
+#     compile error -- any newer Emscripten avoids it). Activate it the same
+#     way build_wasm.sh expects emcmake to already be on PATH, e.g.:
 #       source /path/to/emsdk/emsdk_env.sh
 #     Use the SAME emsdk for the whole script run -- the manual link step
 #     near the end re-invokes em++ standalone, and mixing two different
 #     Emscripten toolchains between the CMake compile and that link step
 #     is not a combination this script tests for.
 #
+#     RECOMMENDED: Emscripten 4.0.9, matching Pyodide release 0.29.4 below.
+#     A newer Emscripten (e.g. 5.0.3, matching Pyodide 314.0.5) compiles
+#     fine too, but produces a module with a DIFFERENT, incompatible ABI
+#     epoch than PyPI's only `onnx` wheel -- see the Pyodide release note
+#     just below and docs/wasm_pyodide.md for why that's the pin that
+#     actually matters, not just "new enough to compile".
+#
 #   - PYODIDE_PYTHON_INCLUDE: the TARGET Python headers directory, i.e. the
 #     cross headers for the Python version the target Pyodide release ships,
 #     e.g. from a Pyodide xbuildenv:
-#       .../xbuildenv/pyodide-root/cpython/installs/python-3.14.2/include/python3.14
+#       .../xbuildenv/pyodide-root/cpython/installs/python-3.13.2/include/python3.13
 #     Get one via `pyodide xbuildenv install <version>` (pyodide-build) or
 #     reuse an already-downloaded one from ~/.cache/pyodide-build.
+#
+#     RECOMMENDED: Pyodide release 0.29.4. Its ABI epoch
+#     (`sysconfig.get_config_var("PYODIDE_ABI_VERSION")` -> `2025_0`) is the
+#     SAME epoch PyPI's `onnx` wheel is tagged for
+#     (`onnx-*-pyemscripten_2025_0_wasm32.whl`) -- confirmed by loading
+#     onnx's real compiled extension in this exact runtime. Building against
+#     a later Pyodide release (a different epoch) still produces a working
+#     onnxsim_cpp2py_export.abi3.so, but one that can't be combined with
+#     onnx's only published wasm wheel to run full `onnxsim.simplify()`.
 #
 #   - PYTHON_EXECUTABLE (optional, defaults to `python3` on PATH): a HOST
 #     Python interpreter with `nanobind` pip-installed (`pip install
 #     nanobind`) -- CMake shells out to `python -m nanobind --cmake_dir` on
 #     this interpreter to locate nanobind's CMake package config. Its MINOR
-#     version should match the target Python above (e.g. host python3.14 for
-#     a Pyodide release shipping CPython 3.14.x); CMake's Python3 find logic
+#     version should match the target Python above (e.g. host python3.13 for
+#     Pyodide 0.29.4's CPython 3.13.x); CMake's Python3 find logic
 #     in onnx-optimizer's CMakeLists.txt runs this interpreter directly and
 #     can fail on a minor-version mismatch against the target headers.
 #
@@ -51,8 +65,8 @@ set -ex
 #
 # Usage:
 #   source /path/to/matching/emsdk/emsdk_env.sh
-#   PYODIDE_PYTHON_INCLUDE=/path/to/target/include/python3.14 \
-#   PYTHON_EXECUTABLE=/path/to/host/python3.14 \
+#   PYODIDE_PYTHON_INCLUDE=/path/to/target/include/python3.13 \
+#   PYTHON_EXECUTABLE=/path/to/host/python3.13 \
 #     ./build_wasm_pyodide.sh
 # ---------------------------------------------------------------------------
 
