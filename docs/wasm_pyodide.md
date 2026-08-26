@@ -10,6 +10,13 @@ low-level extension imports and runs, then installs `onnx` from PyPI via
 model. See `scripts/pyodide_smoke_test.mjs` and the workflow for exactly
 what that covers.
 
+**Newly added, not yet confirmed green in CI**: a real, `micropip`-
+installable wheel is now built and smoke-tested as part of the release
+flow (`build_wheel_pyodide` in `.github/workflows/build-and-test.yml`) --
+see "Distributable wheel and release flow" below for what it does and why
+it's wired in as best-effort (`continue-on-error: true`) rather than a
+release-blocking step.
+
 This resolves what earlier revisions of this doc described as a structural
 gap: PyPI's only `onnx` wasm wheel is tagged for Pyodide ABI epoch
 `2025_0`, and this repo's toolchain originally targeted Pyodide 314.0.5
@@ -263,17 +270,18 @@ convertmodel deploy, on every production deploy and `/preview` -- see its
 the exact commit being deployed has no matching `pyodide-wasm.yml` run of
 its own (most commits don't, since that workflow is path-filtered).
 
-## Distributable wheel (experimental, hand-verified once)
+## Distributable wheel and release flow
 
 `build_wasm_pyodide.sh` produces a loose `.so`, not something `micropip`
-can install directly. Closing that gap needs two things: (1) `setup.py`'s
+can install directly. Closing that gap needed two things: (1) `setup.py`'s
 `build_ext` step doing the same manual `em++ -sSIDE_MODULE=2` relink
 `build_wasm_pyodide.sh` does (CMake alone still can't produce a real side
 module -- see above), and (2) assembling that relinked `.so` plus onnxsim's
 pure-Python files into an actual wheel with the right Pyodide platform tag.
 
-**(1) is now real and committed**, gated behind an explicit opt-in env var
-so it has zero effect on the normal native wheel build:
+**(1)**, `setup.py`'s `ONNXSIM_WASM_SIDE_MODULE_RELINK` flag, is gated
+behind an explicit opt-in env var so it has zero effect on the normal
+native wheel build:
 
 ```sh
 ONNXSIM_WASM_SIDE_MODULE_RELINK=1 <the rest of a normal `pip wheel .` /
@@ -287,33 +295,59 @@ so whatever packages the wheel afterward picks up a genuine dynamic module
 instead of a static archive. Unset (the default), this code path is never
 even evaluated.
 
-**(2) is not yet automated** -- `pyodide build`'s own `pywasmcross`
-compiler-wrapping does NOT solve the `SIDE_MODULE` problem on its own
-(confirmed directly: it wraps individual `em++`/`emcc` invocations, but
-never CMake's own generator-level choice of link rule, which is what's
-actually blocked by `TARGET_SUPPORTS_SHARED_LIBS=FALSE`). A real wheel
-was hand-assembled for validation -- same `onnxsim/onnxsim_cpp2py_export.abi3.so`
-`build_wasm_pyodide.sh` produces (after the `ONNXSIM_WASM_SIDE_MODULE_RELINK=1`
-relink), onnxsim's pure-Python modules, and a hand-written `.dist-info/`
-(`METADATA`/`WHEEL`/`RECORD`) tagged `cp312-abi3-pyodide_2026_0_wasm32`
-(matching Pyodide 314.0.5's `PYODIDE_ABI_VERSION`, confirmed live inside
-that runtime) -- zipped together, no `pyodide build`/`bdist_wheel`
-involved. Wiring `pyodide build` through to produce this automatically is
-a real follow-up, not done here.
+**(2)** is now automated: `.github/workflows/build-and-test.yml`'s
+`build_wheel_pyodide` job runs `pyodide build` (pyodide-build's own
+`pywasmcross` compiler-wrapping) with `ONNXSIM_WASM_SIDE_MODULE_RELINK=1`
+set, against the same pinned toolchain as `pyodide-wasm.yml` (Emscripten
+4.0.9 / Pyodide 0.29.4, for the same ABI-epoch reason as everywhere else in
+this doc). `pyodide build`'s own compiler wrapping does NOT solve the
+`SIDE_MODULE` problem by itself (confirmed directly: it wraps individual
+`em++`/`emcc` invocations, but never CMake's own generator-level choice of
+link rule, which is what's actually blocked by
+`TARGET_SUPPORTS_SHARED_LIBS=FALSE`) -- that's exactly the gap (1) closes,
+so the two combined are what let `pyodide build` produce a real,
+`micropip`-installable wheel (correct `.dist-info`/`RECORD` and platform
+tag) instead of a broken one containing a static archive.
 
-**Verified working**: `micropip.install(<url to the hand-assembled wheel>,
-deps=False)` (`deps=False` because, at the time, full dependency resolution
-hit the `onnx` ABI-epoch gap described above -- a separate issue, not a
-flaw in the wheel itself) installed cleanly in a real Pyodide 314.0.5
-runtime, and importing the *installed* module from its real site-packages
-path (not a hand-copied FS write, unlike the demo page) succeeded, with
-`_list_optimizers()` again confirming it's genuinely functional, not just
-importable.
+The job verifies the actual wheel it produces, not just the loose `.so`:
+`scripts/pyodide_wheel_smoke_test.mjs` writes it into a real Pyodide
+0.29.4 runtime's virtual filesystem, `micropip.install("emfs:...",
+deps=False)`s it, imports the *installed* `onnxsim` from its real
+site-packages path, and calls `_list_optimizers()` to confirm it's
+genuinely functional. `deps=False` because this check's only job is the
+wheel itself -- full dependency resolution (`onnx` and its own transitive
+`numpy`/`protobuf`/`ml_dtypes`) is already covered by
+`pyodide_smoke_test.mjs`'s Phase 2 against the loose `.so`.
 
-This specific wheel-assembly test was done against Pyodide 314.0.5 (epoch
-`2026_0`), before the epoch-matching fix above. It hasn't been re-run
-against Pyodide 0.29.4 (epoch `2025_0`) yet -- the tag would become
-`cp312-abi3-pyodide_2025_0_wasm32` there, and given that epoch now matches
-onnx's own wheel, `micropip.install(..., deps=True)` (the default, pulling
-in `onnx` transitively) becomes worth testing too, not just `deps=False`.
-Re-verifying this specific combination is a real follow-up, not done here.
+**Wired into the release flow, but as a best-effort addition, not a
+blocking one**: `build_wheel_pyodide` runs on `push`/`release`/
+`workflow_dispatch` (not a plain `pull_request` -- the underlying wasm32
+build is already functionally validated per-PR by the separate,
+path-filtered `pyodide-wasm.yml`; this job's own job is producing the
+release artifact, which has no consequence until a tag exists), and
+uploads its wheel as `python-dist-pyodide` -- the same `python-dist-*`
+naming convention `upload_pypi` already downloads by wildcard, so no
+change was needed there beyond adding the job to `needs:` for ordering.
+It runs with `continue-on-error: true`: this is genuinely new, first-time-
+in-CI automation (previously validated only once, by hand, at a now-
+outdated ABI epoch -- 314.0.5/`2026_0`, before the epoch-matching fix
+above), so a failure here must not hold back the native wheels every
+existing user actually depends on. A push to `master` already exercises
+the whole thing for real, safely, before it ever matters: `upload_pypi`
+publishes push builds to Test PyPI, not the real index, so this job's
+first few real runs are a genuine dry run, not a live release gate.
+
+**Still an open question, not yet observed**: this is the first time this
+exact combination (`pyodide build` + the `ONNXSIM_WASM_SIDE_MODULE_RELINK`
+relink, driven by CI rather than by hand) has actually been run end to
+end. The previous validation of this general approach (before this job
+existed) hand-assembled a wheel's `.dist-info` instead of using `pyodide
+build`, and did so at Pyodide 314.0.5/epoch `2026_0`, not the current
+0.29.4/`2025_0` pin -- so whether `pyodide build` itself runs cleanly
+against onnxsim's CMake-based `setup.py` (in particular, whether its
+cross-build environment's `sysconfig` shim correctly redirects
+`Python_INCLUDE_DIR`/`Python_EXECUTABLE` to the wasm32 target the way it's
+expected to for CMake-based extensions) is confirmed only once this job
+has actually gone green in CI. If it needs further iteration, that's
+expected -- see this file's own history for how many real, CI-discovered
+fixes the rest of this pipeline needed before it worked end to end.
