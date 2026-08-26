@@ -188,7 +188,7 @@ class cmake_build(setuptools.Command):
                 "-DONNX_INSTALL=OFF",
                 '-DONNXSIM_PYTHON=ON',
                 '-DONNXSIM_BUILTIN_ORT=OFF',
-                '-DONNX_USE_LITE_PROTO=OFF',
+                '-DONNX_USE_LITE_PROTO=ON',
                 '-DCMAKE_EXPORT_COMPILE_COMMANDS=ON',
                 '-DONNX_NAMESPACE={}'.format(ONNX_NAMESPACE),
                 '-DONNX_OPT_USE_SYSTEM_PROTOBUF={}'.format(
