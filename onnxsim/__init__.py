@@ -11,6 +11,7 @@ from onnxsim.accuracy import (
 )
 from onnxsim.adaround import apply_adaround
 from onnxsim.autoquant import AutoQuantResult, auto_quantize_int4
+from onnxsim.autoround import apply_autoround
 from onnxsim.awq import apply_awq
 from onnxsim.bias_correction import correct_bias
 from onnxsim.calibration import (
@@ -70,6 +71,7 @@ __all__ = [
     "cross_layer_equalize",
     "correct_bias",
     "apply_adaround",
+    "apply_autoround",
     "auto_quantize_int4",
     "AutoQuantResult",
     "apply_awq",
