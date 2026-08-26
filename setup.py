@@ -207,6 +207,25 @@ class cmake_build(setuptools.Command):
                 # around it the same way for its own CMake invocation. See
                 # docs/wasm_pyodide.md.
                 cmake_args.append('-DCMAKE_CXX_FLAGS=-include cstdio')
+                # protobuf's CMake build produces protoc as a
+                # wasm32-emscripten executable (a Node-launched .js
+                # wrapper, e.g. protoc.js-31.1.0) that onnx's own CMake
+                # code then runs at BUILD time (not just test time) to
+                # generate onnx-ml.pb.cc/onnx_ml_pb2.py from the .proto
+                # sources. `emcmake cmake` (what build_wasm_pyodide.sh
+                # uses) auto-populates CMAKE_CROSSCOMPILING_EMULATOR with
+                # the matching `node` binary, which is what makes CMake
+                # invoke that generator via `node protoc.js-...` instead
+                # of exec-ing the file directly -- `pyodide build`'s own
+                # wrapped cmake does NOT do this (confirmed directly: the
+                # exact same build fails there with "Permission denied"
+                # trying to exec protoc.js-31.1.0 as a shell script).
+                # Pass it explicitly so the two toolchains behave the same
+                # way here.
+                node = shutil.which('node')
+                if node:
+                    cmake_args.append(
+                        '-DCMAKE_CROSSCOMPILING_EMULATOR={}'.format(node))
             if COVERAGE:
                 cmake_args.append('-DONNX_COVERAGE=ON')
                 # Instrument onnxsim's own C++ (onnxsim.cpp, cpp2py_export.cc,
