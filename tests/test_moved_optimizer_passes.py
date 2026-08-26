@@ -215,7 +215,9 @@ def test_fuse_matmul_add_bias_into_gemm_batched_dynamic_many_matches():
     assert "MatMul" not in ops
 
     names = [init.name for init in sim.graph.initializer]
-    assert len(names) == len(set(names)), "duplicate initializer name: reserved-name collision"
+    assert len(names) == len(set(names)), (
+        "duplicate initializer name: reserved-name collision"
+    )
 
 
 # --------------------------------------------------------------------------- #
