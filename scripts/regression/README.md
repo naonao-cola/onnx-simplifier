@@ -128,6 +128,30 @@ For an ad hoc look at one model outside the regression set entirely,
 `profile_sample.py MODEL_NAME [MODEL_NAME ...]` fetches it via `model_zoo.py`
 and prints the same per-span breakdown directly (no CSV, no CI).
 
+### Per-pass profiling (`ONNXSIM_PROFILE_PASS_PHASES`)
+
+`run_regression.py --profile-pass-phases-dir DIR` (or the Model Regression
+workflow's `profile_pass_phases` `workflow_dispatch` input) captures onnxsim's
+`ONNXSIM_PROFILE_PASS_PHASES` per-optimizer-pass match/modify timing table for
+every model in that run, one `<model>.pass_phases.txt` in `DIR` per model --
+useful for finding *which single pass* (e.g. `extract_constant_to_initializer`,
+see `bench/RESULTS_issue633_followup.md`) dominates a slow or regressed model,
+finer-grained than `ONNXSIM_PROFILE`'s per-span trace. It's independent of
+`--profile-dir`/`profile` above and much cheaper (two `std::chrono` reads per
+node match, no background RSS sampler or trace write), so it's fine to turn on
+by itself:
+
+```bash
+python scripts/regression/run_regression.py --shard 0 --num-shards 6 \
+  --output shard-0.csv --profile-pass-phases-dir pass_phases
+```
+
+On the workflow, set `profile_pass_phases: true` on a manual `workflow_dispatch`
+run; `regression-pass-phases-shard-N` / `regression-pass-phases-slow`
+artifacts hold the raw per-model tables and a `profile-pass-phases` artifact
+holds them collected into one Markdown file (no separate summarizer -- the
+tables are already onnxsim's own formatted stderr output).
+
 ## Referencing a model by name
 
 `model_zoo.py` turns a short model name into a local `.onnx` path, so a script or
