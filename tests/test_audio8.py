@@ -276,6 +276,16 @@ def test_audio8_quantize_dynamic_matches_published_int8_quality(audio8_model_dir
     fp32_model = onnx.load(fp32_path)
     published_int8_model = onnx.load(published_int8_path)
 
+    # quantize_dynamic only rewrites a MatMul/Gemm whose weight is *already*
+    # a plain 2-D constant initializer (see dynamic-quantization.md); this
+    # export's weights reach their MatMul through Transpose/Reshape/Cast
+    # first, so skipping simplify() here would leave quantize_dynamic with
+    # nothing it recognizes to quantize at all. This is exactly the
+    # documented "simplify -> quantize -> deploy" flow, not a test-only
+    # workaround.
+    fp32_model, simplify_ok = onnxsim.simplify(fp32_model)
+    assert simplify_ok, "onnxsim.simplify failed its own numerical check"
+
     onnxsim_int8_model = onnxsim.quantize_dynamic(fp32_model)
 
     # Same calibration batches for both measurements, so "onnxsim's error"
@@ -293,8 +303,7 @@ def test_audio8_quantize_dynamic_matches_published_int8_quality(audio8_model_dir
     )
 
     assert onnxsim_report.all_finite, (
-        "onnxsim.quantize_dynamic produced non-finite output on "
-        "lm_cache_decode.onnx"
+        "onnxsim.quantize_dynamic produced non-finite output on lm_cache_decode.onnx"
     )
 
     # onnxsim's own dynamic quantization is not expected to be numerically
