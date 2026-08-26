@@ -12,6 +12,7 @@ from onnxsim.accuracy import (
 from onnxsim.adaround import apply_adaround
 from onnxsim.autoquant import AutoQuantResult, auto_quantize_int4
 from onnxsim.autoround import apply_autoround
+from onnxsim.awq import apply_awq
 from onnxsim.bias_correction import correct_bias
 from onnxsim.calibration import (
     calibrate,
@@ -73,6 +74,7 @@ __all__ = [
     "apply_autoround",
     "auto_quantize_int4",
     "AutoQuantResult",
+    "apply_awq",
     "quantize_attention_dynamic",
     "quantize_dynamic",
     "quantize_dynamic_matmul_integer_to_float",
