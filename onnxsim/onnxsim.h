@@ -139,6 +139,38 @@ onnx::ModelProto FoldConstantOnce(const ModelExecutor& executor,
                                   size_t tensor_size_threshold,
                                   bool initializers_as_constants = true);
 
+// Cross-Layer Equalization (CLE) -- the data-free weight-equalization
+// preprocessing technique from "Data-Free Quantization Through Weight
+// Equalization and Bias Correction" (Nagel et al., 2019), also shipped as
+// part of Qualcomm's AIMET toolkit. This is NOT a quantization scheme --
+// no Quantize/DequantizeLinear node is ever introduced, and every value
+// this produces is bit-for-bit the same computation as the input model, just
+// reparameterized -- it is meant to run *before* a quantize_* function, to
+// make the per-tensor or per-channel quantization that follows more
+// accurate.
+//
+// For every pair of adjacent Conv layers Conv1 -> [activation] -> Conv2
+// where the activation (if any) is positive-homogeneous of degree 1 --
+// f(a*x) = a*f(x) for every a > 0, true of Relu/PRelu/LeakyRelu and
+// trivially true of "no activation at all" -- and both convs have `group`
+// == 1, rescales each shared channel c by S[c] = sqrt(r1[c] / r2[c])
+// (r1[c]/r2[c] being Conv1's/Conv2's own per-channel weight range):
+// Conv1's weight/bias for channel c divided by S[c], Conv2's weight for
+// channel c multiplied by S[c]. This makes the two layers' per-channel
+// weight ranges identical (the most balanced a fixed pair can be), without
+// changing the composed function at all -- the activation's positive
+// homogeneity is exactly what lets S[c] and 1/S[c] cancel across it. See
+// ``passes/cross_layer_equalization.h`` for the full derivation, the
+// documented scope limitations (Conv only, no ConvTranspose or Gemm/MatMul,
+// FLOAT32 only), and why one call already equalizes a whole chain of layers
+// (not just one adjacent pair) via onnxsim's fixed-point pass driver.
+//
+// Unlike ``Simplify``, this does not run shape inference, constant folding or
+// any other simplification pass -- it applies exactly this one rewrite,
+// repeated to a fixed point, to a copy of ``model`` (which is left
+// untouched) and returns the result.
+onnx::ModelProto CrossLayerEqualize(const onnx::ModelProto& model);
+
 // Dynamically quantizes every MatMul, and every "vanilla" Gemm (transA=0,
 // alpha=1, beta=1), whose weight is a constant 2-D float32 tensor: the weight
 // is quantized to INT8 ahead of time (per output channel, symmetric, from its
