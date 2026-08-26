@@ -18,8 +18,9 @@ import onnx
 import onnxsim
 
 
-def _simplify(model):
-    sim_model, check_ok = onnxsim.simplify(model, check_n=3)
+def _simplify(model, **kwargs):
+    kwargs.setdefault("check_n", 3)
+    sim_model, check_ok = onnxsim.simplify(model, **kwargs)
     assert check_ok, "simplified model failed onnxsim's equivalence check"
     return sim_model, collections.Counter(n.op_type for n in sim_model.graph.node)
 
@@ -180,6 +181,43 @@ def test_fuse_matmul_add_bias_into_gemm_batched():
     sim, ops = _simplify(model)
     assert ops["Gemm"] >= 1
     assert "MatMul" not in ops
+
+
+def test_fuse_matmul_add_bias_into_gemm_batched_dynamic_many_matches():
+    # X has dynamic leading dims (symbolic "batch"/"seq"), so runTransform
+    # takes the Shape/Slice/Concat path (see the pass's own comment) instead
+    # of a plain Reshape-to-a-constant-shape -- that path mints up to 5 fresh
+    # initializer names per match instead of 2. Many independent linear
+    # layers over the same input force many such matches within one
+    # runPass() call, exercising FuseMatMulAddBiasIntoGemmBatched's batched
+    # name-reservation (nextReservedName/reserveUniqueNames): a bug in how it
+    # hands out/consumes reserved names would surface as a duplicate
+    # initializer name here, silently corrupting one layer's weights/bias
+    # with another's.
+    n_layers = 8
+    nodes = []
+    initializers = []
+    outputs = []
+    for i in range(n_layers):
+        w = _f32(np.random.randn(4, 5), f"W{i}")
+        b = _f32(np.random.randn(5), f"B{i}")
+        initializers += [w, b]
+        nodes += [
+            onnx.helper.make_node("MatMul", ["X", f"W{i}"], [f"Z{i}"]),
+            onnx.helper.make_node("Add", [f"Z{i}", f"B{i}"], [f"A{i}"]),
+        ]
+        outputs.append(_vi(f"A{i}", ("batch", "seq", 5)))
+    model = _model(
+        nodes, [_vi("X", ("batch", "seq", 4))], outputs, initializers, opset=13
+    )
+    sim, ops = _simplify(model, test_input_shapes={"X": (2, 3, 4)})
+    assert ops["Gemm"] >= n_layers
+    assert "MatMul" not in ops
+
+    names = [init.name for init in sim.graph.initializer]
+    assert len(names) == len(set(names)), (
+        "duplicate initializer name: reserved-name collision"
+    )
 
 
 # --------------------------------------------------------------------------- #
