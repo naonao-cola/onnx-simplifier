@@ -25,6 +25,7 @@ from onnxsim.calibration import (
     quantize_static_int16,
 )
 from onnxsim.onnx_simplifier import (
+    cross_layer_equalize,
     export_gguf,
     export_safetensors,
     import_gguf,
@@ -61,6 +62,7 @@ __all__ = [
     "quantize_auto",
     "QuantizationRecommendation",
     "DEFAULT_QUANTIZATION_CANDIDATES",
+    "cross_layer_equalize",
     "quantize_attention_dynamic",
     "quantize_dynamic",
     "quantize_dynamic_matmul_integer_to_float",
