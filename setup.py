@@ -196,6 +196,17 @@ class cmake_build(setuptools.Command):
             ]
             if IS_FREE_THREADED:
                 cmake_args.append('-DPython3_FIND_ABI=ANY;ANY;ANY;ANY')
+            if ONNXSIM_WASM_SIDE_MODULE_RELINK:
+                # nanobind 3.0.0's nb_backend.h/nb_types.h/ndarray.h use
+                # stderr/fprintf without including <cstdio> -- works by
+                # accident on glibc hosts (pulled in transitively through
+                # some other header) and fails outright under Emscripten's
+                # libc++, which doesn't ("error: use of undeclared
+                # identifier 'stderr'"). Real upstream nanobind bug, not
+                # onnxsim-specific -- build_wasm_pyodide.sh already works
+                # around it the same way for its own CMake invocation. See
+                # docs/wasm_pyodide.md.
+                cmake_args.append('-DCMAKE_CXX_FLAGS=-include cstdio')
             if COVERAGE:
                 cmake_args.append('-DONNX_COVERAGE=ON')
                 # Instrument onnxsim's own C++ (onnxsim.cpp, cpp2py_export.cc,
