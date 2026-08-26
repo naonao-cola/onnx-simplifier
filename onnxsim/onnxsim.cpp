@@ -28,6 +28,7 @@
 #include "constant_folding.h"
 #include "contrib_schemas.h"
 #include "custom_optimizer_passes.h"
+#include "model_info.h"
 #include "model_prep.h"
 #include "onnx/common/file_utils.h"
 #include "onnx/common/graph_shape_inference.h"
@@ -79,11 +80,16 @@ onnx::ModelProto FoldConstantOnce(const ModelExecutor& executor,
 // Records the options this Simplify() call actually used (skip_optimizers
 // reflects any auto-added unhashable-tensor protections) as string
 // key/value pairs in the model's metadata_props, namespaced under
-// "onnxsim:" so they cannot collide with the model's own metadata. Lets a
-// downstream consumer see how a model was simplified without having to have
-// kept the original call around. Replaces any pre-existing "onnxsim:*"
-// entries (e.g. left by a previous simplify() call) rather than
-// accumulating duplicates across repeated simplification.
+// "onnxsim." -- the same dotted convention as the rest of onnxsim's own
+// metadata (AnnotateModelInfo's "onnxsim.macs" and friends, and the Python
+// side's ``model_info.METADATA_PREFIX``) -- so they cannot collide with the
+// model's own metadata. Lets a downstream consumer see how a model was
+// simplified without having to have kept the original call around. Replaces
+// any pre-existing entries under these exact keys (e.g. left by a previous
+// simplify() call) rather than accumulating duplicates across repeated
+// simplification; unlike a prefix wipe, this leaves other "onnxsim.*"
+// entries (compute metrics, the structural diff recorded by
+// RecordSimplifyDiffMetadata) untouched.
 void RecordSimplifyOptionsMetadata(
     onnx::ModelProto& model,
     const std::optional<std::vector<std::string>>& skip_optimizers,
@@ -105,22 +111,22 @@ void RecordSimplifyOptionsMetadata(
   };
 
   std::vector<std::pair<std::string, std::string>> options;
-  options.emplace_back("onnxsim:skip_optimizers",
+  options.emplace_back("onnxsim.skip_optimizers",
                        skip_optimizers ? join(*skip_optimizers) : "<all>");
-  options.emplace_back("onnxsim:constant_folding",
+  options.emplace_back("onnxsim.constant_folding",
                        constant_folding ? "true" : "false");
-  options.emplace_back("onnxsim:shape_inference",
+  options.emplace_back("onnxsim.shape_inference",
                        shape_inference ? "true" : "false");
-  options.emplace_back("onnxsim:tensor_size_threshold",
+  options.emplace_back("onnxsim.tensor_size_threshold",
                        std::to_string(tensor_size_threshold));
   options.emplace_back(
-      "onnxsim:target_opset_version",
+      "onnxsim.target_opset_version",
       target_opset_version ? std::to_string(*target_opset_version) : "");
-  options.emplace_back("onnxsim:initializers_as_constants",
+  options.emplace_back("onnxsim.initializers_as_constants",
                        initializers_as_constants ? "true" : "false");
-  options.emplace_back("onnxsim:include_inline_functions",
+  options.emplace_back("onnxsim.include_inline_functions",
                        include_inline_functions ? "true" : "false");
-  options.emplace_back("onnxsim:mutable_initializer",
+  options.emplace_back("onnxsim.mutable_initializer",
                        mutable_initializer ? "true" : "false");
   if (overwrite_input_shapes) {
     std::string s;
@@ -138,16 +144,28 @@ void RecordSimplifyOptionsMetadata(
         s += std::to_string(shape[i]);
       }
     }
-    options.emplace_back("onnxsim:overwrite_input_shapes", s);
+    options.emplace_back("onnxsim.overwrite_input_shapes", s);
   }
   if (unused_output) {
-    options.emplace_back("onnxsim:unused_output", join(*unused_output));
+    options.emplace_back("onnxsim.unused_output", join(*unused_output));
   }
+
+  // Every key this function could ever write, not just the ones present in
+  // `options` this call -- ``overwrite_input_shapes``/``unused_output`` are
+  // conditional, so a stale value one of them left behind on a previous
+  // simplify() call (that did set it) must still be cleared on a later call
+  // that doesn't, or it would look like it's still in effect.
+  static const std::unordered_set<std::string> known_option_keys = {
+      "onnxsim.skip_optimizers",           "onnxsim.constant_folding",
+      "onnxsim.shape_inference",           "onnxsim.tensor_size_threshold",
+      "onnxsim.target_opset_version",      "onnxsim.initializers_as_constants",
+      "onnxsim.include_inline_functions",  "onnxsim.mutable_initializer",
+      "onnxsim.overwrite_input_shapes",    "onnxsim.unused_output"};
 
   auto* props = model.mutable_metadata_props();
   google::protobuf::RepeatedPtrField<onnx::StringStringEntryProto> kept;
   for (auto& prop : *props) {
-    if (prop.key().rfind("onnxsim:", 0) != 0) {
+    if (!known_option_keys.count(prop.key())) {
       *kept.Add() = std::move(prop);
     }
   }
@@ -798,6 +816,7 @@ onnx::ModelProto Simplify(
                                 target_opset_version, initializers_as_constants,
                                 include_inline_functions, mutable_initializer,
                                 overwrite_input_shapes, unused_output);
+  RecordSimplifyDiffMetadata(sim_model, model);
   Check(sim_model);
   if (!converged) {
     std::cout << "WARNING: the simplification stopped because of timeout. "

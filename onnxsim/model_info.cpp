@@ -598,3 +598,51 @@ std::string FormatGraphDiff(const onnx::ModelProto& model_ori,
 
   return out;
 }
+
+namespace {
+
+// Joins up to `limit` entries of `items` with ", ", appending a "... (+N
+// more)" marker when there were more. The metadata_props-value counterpart of
+// ``AppendCapped``: that one writes one line per entry into a multi-line
+// report, but a metadata_props value is a single flat string, so this stays
+// on one line.
+std::string JoinCapped(const std::vector<std::string>& items, size_t limit) {
+  std::string out;
+  for (size_t i = 0; i < items.size() && i < limit; ++i) {
+    if (i > 0) out += ", ";
+    out += items[i];
+  }
+  if (items.size() > limit) {
+    out += ", ... (+" + std::to_string(items.size() - limit) + " more)";
+  }
+  return out;
+}
+
+}  // namespace
+
+void RecordSimplifyDiffMetadata(onnx::ModelProto& sim_model,
+                                const onnx::ModelProto& model_ori,
+                                size_t limit) {
+  const GraphDiff diff = DiffGraphs(model_ori, sim_model);
+
+  std::vector<std::string> removed;
+  removed.reserve(diff.removed_nodes.size());
+  for (const auto& n : diff.removed_nodes) removed.push_back(NodeLabel(n));
+
+  std::vector<std::string> changed;
+  changed.reserve(diff.changed_nodes.size());
+  for (const auto& [before, after] : diff.changed_nodes) {
+    changed.push_back(NodeLabel(before) + " -> " + NodeLabel(after));
+  }
+
+  SetMetadata(sim_model, "onnxsim.removed_nodes.count",
+             std::to_string(diff.removed_nodes.size()));
+  SetMetadata(sim_model, "onnxsim.removed_nodes", JoinCapped(removed, limit));
+  SetMetadata(sim_model, "onnxsim.changed_nodes.count",
+             std::to_string(diff.changed_nodes.size()));
+  SetMetadata(sim_model, "onnxsim.changed_nodes", JoinCapped(changed, limit));
+  SetMetadata(sim_model, "onnxsim.removed_values.count",
+             std::to_string(diff.removed_values.size()));
+  SetMetadata(sim_model, "onnxsim.removed_values",
+             JoinCapped(diff.removed_values, limit));
+}
