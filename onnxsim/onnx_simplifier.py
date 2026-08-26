@@ -689,6 +689,53 @@ def quantize_weight_only_int4(model: Union[str, onnx.ModelProto]) -> onnx.ModelP
     return onnx.load_from_string(C.quantize_weight_only_int4(model.SerializeToString()))
 
 
+def quantize_weight_only_matmul_nbits(
+    model: Union[str, onnx.ModelProto],
+) -> onnx.ModelProto:
+    """
+    Block-wise INT4 weight-only quantize every MatMul, and every "vanilla"
+    Gemm (transA=0, alpha=1, beta=1), whose weight is a constant 2-D
+    float32 tensor, into ONNX Runtime's own ``com.microsoft::MatMulNBits``
+    contrib op.
+
+    This is a **vendor-specific** counterpart to
+    :func:`quantize_weight_only_int4`: same INT4 precision, same 32-element
+    block-wise scale, but packed into ONNX Runtime's own single fused op --
+    the format ORT's own GenAI/quantization tooling (Olive,
+    ``onnxruntime.quantization``'s ``matmul_4bits_quantizer``, ...) emits
+    for LLM/ASR weight compression -- instead of
+    :func:`quantize_weight_only_int4`'s portable, standard-ONNX
+    INT4-tensor-plus-``DequantizeLinear`` pair. Smaller and faster on ONNX
+    Runtime specifically, at the cost of needing ORT (or another runtime
+    implementing this contrib op) to run at all: unlike every other
+    ``quantize_*`` function in onnxsim, the result does **not** load on an
+    arbitrary conformant ONNX runtime.
+
+    Unlike :func:`quantize_weight_only_int4` (which needs opset 21 for
+    ONNX's own native INT4 tensor type and ``DequantizeLinear``'s
+    ``block_size`` attribute), this needs no minimum standard opset --
+    ``MatMulNBits`` is a self-contained contrib op -- and, unlike that
+    function, does not require the reduction dimension to be evenly
+    divisible by the 32-element block size: ``MatMulNBits`` itself defines
+    ``k_blocks = ceil(K / block_size)``, so a ragged last block is
+    quantized exactly like every other one instead of being declined.
+
+    This is a single, self-contained graph rewrite: unlike :func:`simplify`,
+    it does not run shape inference, constant folding, or any other pass.
+    Nodes that do not match (dynamic or non-2-D weights, non-default Gemm
+    attributes, non-float32 operands) are left untouched. Consider calling
+    :func:`simplify` before and/or after to clean up the graph.
+
+    :param model: onnx ModelProto object or file path
+    :returns: the quantized onnx ModelProto
+    """
+    if isinstance(model, str):
+        model = onnx.load(model, load_external_data=False)
+    return onnx.load_from_string(
+        C.quantize_weight_only_matmul_nbits(model.SerializeToString())
+    )
+
+
 def quantize_weight_only_int16(model: Union[str, onnx.ModelProto]) -> onnx.ModelProto:
     """
     INT16 weight-only quantize every MatMul, every "vanilla" Gemm (transA=0,

@@ -303,6 +303,28 @@ onnx::ModelProto QuantizeWeightOnly(const onnx::ModelProto& model);
 // non-float32 operands, an opset older than 21) are left as-is.
 onnx::ModelProto QuantizeWeightOnlyInt4(const onnx::ModelProto& model);
 
+// Weight-only quantizes every MatMul, and every "vanilla" Gemm (transA=0,
+// alpha=1, beta=1), whose weight is a constant 2-D float32 tensor, to ONNX
+// Runtime's ``com.microsoft::MatMulNBits`` contrib op -- a *vendor-specific*
+// counterpart to ``QuantizeWeightOnlyInt4``: same INT4, same 32-element
+// block-wise scale, but packed into ORT's own single fused op (the format
+// ORT's own GenAI/quantization tooling emits for LLM/ASR weight
+// compression) instead of ``QuantizeWeightOnlyInt4``'s portable, standard
+// ONNX opset-21 INT4-tensor-plus-``DequantizeLinear`` pair. Smaller and
+// faster on ONNX Runtime specifically, at the cost of needing ORT (or
+// another runtime implementing this contrib op) to run at all -- unlike
+// every other ``Quantize*`` function here, the result does not load on an
+// arbitrary conformant ONNX runtime. See
+// ``passes/weight_only_quantize_matmul_nbits.h`` for the rewrite itself,
+// including the exact bit-packing format.
+//
+// Unlike ``Simplify``, this does not run shape inference, constant folding or
+// any other simplification pass -- it applies exactly this one rewrite, once,
+// to a copy of ``model`` (which is left untouched) and returns the result.
+// Nodes that do not match (dynamic or non-2-D weights, non-default Gemm
+// attributes, non-float32 operands) are left as-is.
+onnx::ModelProto QuantizeWeightOnlyMatMulNBits(const onnx::ModelProto& model);
+
 // INT16 weight-only quantizes every MatMul, every "vanilla" Gemm (transA=0,
 // alpha=1, beta=1), and every Conv, whose weight is a constant float32
 // tensor: the weight is quantized to INT16 (per output channel, symmetric,
