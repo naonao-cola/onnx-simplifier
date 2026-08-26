@@ -476,6 +476,24 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
       },
       "model_bytes"_a);
 
+  // Block-wise INT4 weight-only quantizes MatMul/Gemm weights into ONNX
+  // Runtime's own com.microsoft::MatMulNBits contrib op -- a vendor-specific
+  // (ORT-only) counterpart to quantize_weight_only_int4's portable standard-
+  // ONNX output. See QuantizeWeightOnlyMatMulNBits in onnxsim.h.
+  m.def(
+      "quantize_weight_only_matmul_nbits",
+      [](const py::bytes& model_proto_bytes) -> py::bytes {
+        InitEnv();
+        ONNX_NAMESPACE::ModelProto model;
+        ParseProtoFromBytes(&model, model_proto_bytes.c_str(),
+                            model_proto_bytes.size());
+        const auto result = QuantizeWeightOnlyMatMulNBits(model);
+        std::string out;
+        result.SerializeToString(&out);
+        return py::bytes(out.data(), out.size());
+      },
+      "model_bytes"_a);
+
   // INT16 weight-only quantizes MatMul/Gemm/Conv weights (one symmetric
   // scale per output channel, INT16's finer step than INT8's) -- activations
   // are never touched, so no calibration data or ModelExecutor is needed.

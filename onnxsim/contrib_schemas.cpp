@@ -793,6 +793,74 @@ OpSchema MakeQAttentionSchema() {
                       "Constrain mask index to integer types.");
 }
 
+// ONNX Runtime's block-wise N-bit weight-only quantized MatMul (ORT GenAI's
+// own INT4 weight compression path for LLM/ASR deployment -- distinct from
+// onnxsim's own opset-21-native weight_only_quantize_int4_matmul.h, which
+// targets any conformant runtime instead of ORT specifically). Registered
+// here so weight_only_quantize_matmul_nbits.h's fused output -- which only
+// ever emits inputs 0-2 (A, B, scales) and attrs K/N/bits/block_size --
+// passes the ONNX checker and shape-inference sweeps the rest of onnxsim's
+// pipeline runs; the remaining inputs/attrs (zero_points, g_idx, bias,
+// weight_prepacked, accuracy_level) are declared for schema
+// completeness/compatibility with externally-authored models, not because
+// this pass ever produces them.
+OpSchema MakeMatMulNBitsSchema() {
+  return OpSchema()
+      .SetName("MatMulNBits")
+      .SetDomain(kMSDomain)
+      .SinceVersion(1)
+      .SetDoc(
+          "MatMulNBits performs a matrix multiplication where the "
+          "right-hand-side matrix (weights) is quantized to N bits.")
+      .Attr("K", "Size of the input feature dimension.",
+            onnx::AttributeProto::INT, /*required=*/true)
+      .Attr("N", "Size of the output feature dimension.",
+            onnx::AttributeProto::INT, /*required=*/true)
+      .Attr("block_size",
+            "Number of weight values quantized together along the K "
+            "dimension. Must be a power of 2 and >= 16.",
+            onnx::AttributeProto::INT, /*required=*/true)
+      .Attr("bits", "Number of bits used to quantize each weight value.",
+            onnx::AttributeProto::INT, static_cast<int64_t>(4))
+      .Attr("accuracy_level",
+            "Optional accuracy level hint for the internal computation.",
+            onnx::AttributeProto::INT, /*required=*/false)
+      .Attr("weight_prepacked",
+            "Whether B is prepacked into a runtime-specific layout.",
+            onnx::AttributeProto::INT, static_cast<int64_t>(0))
+      .Input(0, "A", "The input tensor, not quantized.", "T1")
+      .Input(1, "B",
+             "Packed uint8 tensor of shape (N, k_blocks, blob_size), "
+             "k_blocks = ceil(K / block_size), blob_size = block_size * "
+             "bits / 8, bit-packed low-nibble-first along K within each "
+             "block.",
+             "T2")
+      .Input(2, "scales",
+             "Per-block scaling factors with shape (N, k_blocks), same "
+             "type as A.",
+             "T1")
+      .Input(3, "zero_points",
+             "Per-block zero point. Packed (uint8, shape (N, "
+             "ceil(k_blocks * bits / 8))) or unpacked (same type as A, "
+             "shape (N, k_blocks)). Defaults to 2^(bits-1) when omitted.",
+             "T3", OpSchema::Optional)
+      .Input(4, "g_idx", "Deprecated group index input.", "T4",
+             OpSchema::Optional)
+      .Input(5, "bias", "Bias to add to the result, shape [N].", "T1",
+             OpSchema::Optional)
+      .Output(0, "Y", "The output tensor.", "T1")
+      .TypeConstraint("T1",
+                      {"tensor(float)", "tensor(float16)", "tensor(bfloat16)"},
+                      "Constrain A, scales, bias, and output to float tensors.")
+      .TypeConstraint("T2", {"tensor(uint8)"}, "Constrain B to uint8.")
+      .TypeConstraint("T3",
+                      {"tensor(uint8)", "tensor(float16)", "tensor(float)",
+                       "tensor(bfloat16)"},
+                      "Constrain zero_points to uint8 (packed) or a float type "
+                      "(unpacked).")
+      .TypeConstraint("T4", {"tensor(int32)"}, "Constrain g_idx to int32.");
+}
+
 void RegisterAll() {
   // The custom domain must be known to the schema registry before any schema
   // in it can be registered.
@@ -817,6 +885,7 @@ void RegisterAll() {
   RegisterIfAbsent(MakeMatMulIntegerToFloatSchema());
   RegisterIfAbsent(MakeAttentionSchema());
   RegisterIfAbsent(MakeQAttentionSchema());
+  RegisterIfAbsent(MakeMatMulNBitsSchema());
 
   // Augment the standard Reshape schema with a data-propagation function so
   // shape tensors can flow through a Reshape during partial shape evaluation.
