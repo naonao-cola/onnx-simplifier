@@ -8,6 +8,11 @@ on:
   pull_request:
   release:
     types: [published]
+  # Lets build_wheel_pyodide (which otherwise only runs on push/release, see
+  # its own comment) be exercised against a PR branch before merge -- same
+  # rationale as pyodide-wasm.yml and static.yml's own workflow_dispatch
+  # triggers.
+  workflow_dispatch:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -248,10 +253,171 @@ jobs:
         name: python-dist-sdist
         path: dist/*.tar.gz
 
+  # Builds a real, installable Pyodide/wasm32 wheel via `pyodide build`
+  # (pyodide-build's pywasmcross-wrapped toolchain) plus
+  # ONNXSIM_WASM_SIDE_MODULE_RELINK=1 (setup.py; see its own comment on that
+  # flag for why `pyodide build` alone doesn't produce a real side module),
+  # so onnxsim's release flow ships one alongside every other platform's
+  # wheel. See docs/wasm_pyodide.md's "Distributable wheel" section for the
+  # full story and what's still new/first-time-in-CI about this.
+  #
+  # Release-flow-only (push/release/workflow_dispatch), not a plain
+  # pull_request: the underlying wasm32 build is already functionally
+  # validated per-PR by the separate, path-filtered pyodide-wasm.yml (build +
+  # real Pyodide/Node import test). This job's only real job is producing the
+  # actual DISTRIBUTABLE ARTIFACT that matters for a release -- duplicating a
+  # ~10min wasm cross-compile on every one of this repo's PRs (unlike
+  # pyodide-wasm.yml, THIS workflow's own pull_request trigger has no path
+  # filter at all) isn't worth paying for something with no release
+  # consequence until a tag exists. A push to master already exercises this
+  # for real, safely: upload_pypi below publishes push builds to Test PyPI,
+  # not the real index, so this gets a genuine dry run on every master push
+  # before it can ever gate an actual release.
+  #
+  # continue-on-error: true -- this is new, first-time-in-CI automation (the
+  # only prior validation was one hand-assembled wheel, at a now-outdated ABI
+  # epoch -- see docs/wasm_pyodide.md). A failure here should not hold back
+  # the native wheels every existing user actually depends on; upload_pypi
+  # below only downloads whatever artifacts exist, so a failed/skipped run of
+  # this job just means that release ships without the wasm32 wheel, not
+  # that it ships nothing.
+  #
+  # Same toolchain pins as pyodide-wasm.yml (Emscripten 4.0.9 / Pyodide
+  # 0.29.4) and why: PyPI's only `onnx` wasm wheel is tagged for ABI epoch
+  # 2025_0, which is what this pin matches -- see docs/wasm_pyodide.md.
+  build_wheel_pyodide:
+    name: Build wheel (wasm32, Pyodide)
+    if: ${{ github.event_name != 'pull_request' }}
+    continue-on-error: true
+    runs-on: ubuntu-latest
+    env:
+      CMAKE_GENERATOR: Ninja
+      EMSCRIPTEN_VERSION: "4.0.9"
+      PYODIDE_VERSION: "0.29.4"
+      ONNXSIM_WASM_SIDE_MODULE_RELINK: "1"
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+          fetch-depth: 0
+      - name: Update version
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: echo "ONNXSIM_RELEASE=${{ github.ref_name }}" >> ${GITHUB_ENV}
+      # The TARGET Python minor version (3.13, matching PYODIDE_VERSION's
+      # CPython), same as pyodide-wasm.yml -- `pyodide build` runs setup.py
+      # under this HOST interpreter while its cross-build environment steers
+      # compilation at the wasm32 target.
+      - name: Set up Python 3.13
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+      - run: pip install cmake ninja nanobind pyodide-build setuptools build
+
+      # --- Host protoc, same requirement/approach as pyodide-wasm.yml ------
+      - name: Install protoc 31.1 (matches onnxsim's vendored protobuf)
+        run: |
+          PROTOC_VERSION=31.1
+          curl -sSL -o /tmp/protoc.zip \
+            "https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/protoc-${PROTOC_VERSION}-linux-x86_64.zip"
+          sudo unzip -o /tmp/protoc.zip -d /usr/local bin/protoc 'include/*'
+          sudo chmod +x /usr/local/bin/protoc
+          protoc --version
+
+      - name: Prepare ccache timestamp
+        id: ccache_cache_timestamp
+        run: echo "timestamp=$(date -Iseconds)" >> "${GITHUB_OUTPUT}"
+      - name: ccache cache files
+        uses: actions/cache@v6
+        with:
+          path: .ccache
+          key: pyodide-wheel-ccache-${{ steps.ccache_cache_timestamp.outputs.timestamp }}
+          restore-keys: |
+              pyodide-wheel-ccache-
+      - run: |
+          sudo apt install -y ccache
+          echo "CCACHE_DIR=${PWD}/.ccache" >> "${GITHUB_ENV}"
+          echo "CCACHE_MAXSIZE=500M" >> "${GITHUB_ENV}"
+          echo "_EMCC_CCACHE=1" >> "${GITHUB_ENV}"
+
+      # emsdk activated on PATH before `pyodide build` runs (rather than
+      # relying solely on pyodide-build's own internal toolchain management)
+      # for two reasons: (1) pins the EXACT Emscripten version validated to
+      # compile onnxsim's vendored protobuf cleanly (see pyodide-wasm.yml's
+      # header comment), and (2) setup.py's ONNXSIM_WASM_SIDE_MODULE_RELINK
+      # relink step shells out to `em++`/`llvm-nm` directly (`shutil.which`),
+      # which needs a real, unwrapped Emscripten toolchain on PATH -- `pyodide
+      # build` prepends its own pywasmcross wrapper directory in front of
+      # whatever's already on PATH for the subprocess it spawns, so this
+      # doesn't fight that wrapping, it just makes sure the real compiler is
+      # still reachable behind it.
+      - name: Install emsdk ${{ env.EMSCRIPTEN_VERSION }}
+        run: |
+          git clone --depth 1 https://github.com/emscripten-core/emsdk.git
+          ./emsdk/emsdk install "${EMSCRIPTEN_VERSION}"
+          ./emsdk/emsdk activate "${EMSCRIPTEN_VERSION}"
+
+      - name: Install Pyodide xbuildenv ${{ env.PYODIDE_VERSION }}
+        run: |
+          . ./emsdk/emsdk_env.sh
+          pyodide xbuildenv install "${PYODIDE_VERSION}"
+
+      - name: Build the Pyodide wheel
+        run: |
+          . ./emsdk/emsdk_env.sh
+          pyodide build
+          mkdir -p wheelhouse
+          # Not assuming a specific --outdir flag/default across
+          # pyodide-build versions (this repo's other pyodide jobs install it
+          # unpinned) -- find whatever it produced instead.
+          find . -maxdepth 3 -name 'onnxsim-*wasm32.whl' -not -path './wheelhouse/*' -exec cp -v {} wheelhouse/ \;
+          ls -la wheelhouse
+
+      - name: ccache statistics
+        if: always()
+        run: ccache -s
+
+      - name: Sanity-check the wheel was actually produced and tagged for wasm32
+        run: |
+          whl=$(ls wheelhouse/onnxsim-*.whl 2>/dev/null | head -1)
+          if [ -z "$whl" ]; then
+            echo "::error::no wheelhouse/onnxsim-*.whl produced by 'pyodide build'"
+            exit 1
+          fi
+          echo "built: ${whl}"
+          case "$(basename "$whl")" in
+            *wasm32.whl) ;;
+            *) echo "::error::${whl} is not tagged for wasm32"; exit 1 ;;
+          esac
+
+      # --- Integration test: install the real wheel in a real Pyodide/Node
+      # runtime, not just the loose .so pyodide-wasm.yml already covers -----
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+      - name: Install the pyodide npm package (pinned to ${{ env.PYODIDE_VERSION }})
+        run: |
+          mkdir -p /tmp/pyodide-wheel-smoke-test-env
+          cd /tmp/pyodide-wheel-smoke-test-env
+          npm install --no-save "pyodide@${PYODIDE_VERSION}"
+          cp "${GITHUB_WORKSPACE}/scripts/pyodide_wheel_smoke_test.mjs" .
+      - name: Verify the built wheel installs via micropip and runs
+        run: |
+          cd /tmp/pyodide-wheel-smoke-test-env
+          whl=$(ls "${GITHUB_WORKSPACE}"/wheelhouse/onnxsim-*.whl)
+          node ./pyodide_wheel_smoke_test.mjs "${whl}"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          # python-dist-* so upload_pypi's wildcard download pattern below
+          # picks this up automatically, same as every other wheel job.
+          name: python-dist-pyodide
+          path: wheelhouse/onnxsim-*.whl
+
   upload_pypi:
     if: (github.repository == 'onnxsim/onnxsim') && (github.event_name == 'push' || github.event_name == 'release')
     name: Upload to PyPI
-    needs: [build_wheels, build_wheels_windows_cross, test_wheels_windows_cross, build_sdist]
+    needs: [build_wheels, build_wheels_windows_cross, test_wheels_windows_cross, build_sdist, build_wheel_pyodide]
     runs-on: ubuntu-latest
     environment:
       name: pypi

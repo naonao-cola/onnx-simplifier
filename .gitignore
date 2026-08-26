@@ -166,6 +166,10 @@ rust/Cargo.lock
 # emscripten SDK cloned by build_wasm.sh helpers
 /emsdk/
 
+# Pyodide xbuildenv (target Python headers) fetched on demand for
+# build_wasm_pyodide.sh, e.g. via `pyodide xbuildenv install`
+/.pyodide-xbuildenv/
+
 # protobuf built on demand by build_wasm.sh when protoc is missing
 /protobuf/
 

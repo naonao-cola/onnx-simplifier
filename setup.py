@@ -159,10 +159,31 @@ class cmake_build(setuptools.Command):
             if WINDOWS:
                 build_type = 'Release'
             # configure
+            # onnx's own CMakeLists.txt calls the VERSIONED find_package(Python3
+            # ...), needing Python3_EXECUTABLE/Python3_INCLUDE_DIR(S); nanobind's
+            # own CMake config separately reads the plural, unversioned
+            # Python_INCLUDE_DIRS. A normal native build never needed these --
+            # CMake's automatic Python3 discovery just finds the host
+            # interpreter -- but pyodide build's cross-compilation environment
+            # doesn't seed those hints on its own, so `find_package(Python3
+            # ...)` fails outright there ("Could NOT find Python3 (missing:
+            # Python3_INCLUDE_DIRS Development.Module)") unless they're passed
+            # explicitly, same as build_wasm_pyodide.sh already does for its own
+            # (separate, non-setup.py) CMake invocation. Passing them here too,
+            # to the exact same values as the Python_* hints below, is a no-op
+            # for every existing native build (same interpreter/headers CMake
+            # would already have auto-discovered) and is what lets
+            # ONNXSIM_WASM_SIDE_MODULE_RELINK's `pyodide build` path configure
+            # at all. See docs/wasm_pyodide.md.
+            python_include = sysconfig.get_path('include')
             cmake_args = [
                 CMAKE,
-                '-DPython_INCLUDE_DIR={}'.format(sysconfig.get_path('include')),
+                '-DPython_INCLUDE_DIR={}'.format(python_include),
+                '-DPython_INCLUDE_DIRS={}'.format(python_include),
                 '-DPython_EXECUTABLE={}'.format(sys.executable),
+                '-DPython3_INCLUDE_DIR={}'.format(python_include),
+                '-DPython3_INCLUDE_DIRS={}'.format(python_include),
+                '-DPython3_EXECUTABLE={}'.format(sys.executable),
                 '-DONNX_BUILD_PYTHON=ON',
                 "-DONNX_INSTALL=OFF",
                 '-DONNXSIM_PYTHON=ON',
@@ -175,6 +196,44 @@ class cmake_build(setuptools.Command):
             ]
             if IS_FREE_THREADED:
                 cmake_args.append('-DPython3_FIND_ABI=ANY;ANY;ANY;ANY')
+            if ONNXSIM_WASM_SIDE_MODULE_RELINK:
+                # nanobind 3.0.0's nb_backend.h/nb_types.h/ndarray.h use
+                # stderr/fprintf without including <cstdio> -- works by
+                # accident on glibc hosts (pulled in transitively through
+                # some other header) and fails outright under Emscripten's
+                # libc++, which doesn't ("error: use of undeclared
+                # identifier 'stderr'"). Real upstream nanobind bug, not
+                # onnxsim-specific -- build_wasm_pyodide.sh already works
+                # around it the same way for its own CMake invocation. See
+                # docs/wasm_pyodide.md.
+                cmake_args.append('-DCMAKE_CXX_FLAGS=-include cstdio')
+                # Without an override, onnx's own CMakeLists.txt (see its
+                # relative_protobuf_generate_cpp()) defaults
+                # ONNX_PROTOC_EXECUTABLE to the in-tree, JUST-CROSS-BUILT
+                # `protoc` target -- under wasm32-emscripten, a Node-
+                # launched .js wrapper (e.g. protoc.js-31.1.0), invoked as
+                # a PLAIN `COMMAND "${ONNX_PROTOC_EXECUTABLE}" ...` with no
+                # CMAKE_CROSSCOMPILING_EMULATOR/node wrapping at all.
+                # Confirmed directly (both in onnx/CMakeLists.txt and by
+                # testing CMAKE_CROSSCOMPILING_EMULATOR, which has zero
+                # effect here since nothing reads it for this custom
+                # command): this only works when the file itself is
+                # directly executable, which it apparently isn't inside
+                # `pyodide build`'s isolated build env ("Permission
+                # denied" trying to exec protoc.js-31.1.0). Same
+                # requirement as obstacle 1 in docs/wasm_pyodide.md:
+                # build_wasm_pyodide.sh sidesteps this identical problem
+                # entirely by pointing ONNX_CUSTOM_PROTOC_EXECUTABLE at a
+                # HOST protoc binary instead (a normal native executable,
+                # no cross-exec concerns) -- do the same here. The CI job
+                # setting ONNXSIM_WASM_SIDE_MODULE_RELINK=1 is expected to
+                # have already installed a matching host protoc (same
+                # version as onnxsim's vendored protobuf) on PATH, exactly
+                # as pyodide-wasm.yml's own job already does.
+                protoc = shutil.which('protoc')
+                if protoc:
+                    cmake_args.append(
+                        '-DONNX_CUSTOM_PROTOC_EXECUTABLE={}'.format(protoc))
             if COVERAGE:
                 cmake_args.append('-DONNX_COVERAGE=ON')
                 # Instrument onnxsim's own C++ (onnxsim.cpp, cpp2py_export.cc,
