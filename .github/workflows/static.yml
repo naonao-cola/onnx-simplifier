@@ -425,13 +425,23 @@ jobs:
         uses: actions/deploy-pages@v5
         if: ${{ github.event_name == 'push' }}
 
-      # --- Preview: Cloudflare Pages (`/preview` comment only) ---
+      # --- Preview: Cloudflare Pages (`/preview` comment, or a manual
+      # workflow_dispatch run against a branch) ---
       # A fork of this repo will not have CLOUDFLARE_API_TOKEN configured, so
       # gate on it being set: those runs skip the deploy instead of failing
       # wrangler with "CLOUDFLARE_API_TOKEN is necessary".
+      #
+      # workflow_dispatch is included here for the exact reason noted on the
+      # Pyodide demo staging steps above: `/preview` always runs off the base
+      # branch's own workflow definition, so it's the only way to get a real,
+      # deployed preview of a PR branch's OWN static.yml changes (e.g. this
+      # job's own staging logic) before merge -- otherwise those changes are
+      # untestable pre-merge. steps.pr only has outputs on issue_comment (the
+      # only event with a real PR to resolve), so fall back to
+      # github.ref_name (the dispatched branch) on workflow_dispatch.
       - name: Deploy preview to Cloudflare Pages
         id: cf_deploy
-        if: ${{ github.event_name == 'issue_comment' && env.CLOUDFLARE_API_TOKEN != '' }}
+        if: ${{ (github.event_name == 'issue_comment' || github.event_name == 'workflow_dispatch') && env.CLOUDFLARE_API_TOKEN != '' }}
         uses: cloudflare/wrangler-action@v4
         with:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
@@ -441,7 +451,18 @@ jobs:
           command: >-
             pages deploy scripts/convertmodel
             --project-name=onnxsim
-            --branch=${{ steps.pr.outputs.head_ref }}
+            --branch=${{ steps.pr.outputs.head_ref || github.ref_name }}
+      # workflow_dispatch has no PR to comment on -- surface the URL in the
+      # job summary instead, where a human triggering it manually can find it.
+      - name: Print preview URL to the job summary
+        if: ${{ github.event_name == 'workflow_dispatch' && env.CLOUDFLARE_API_TOKEN != '' }}
+        run: |
+          {
+            echo "### ⚡ Cloudflare Pages preview"
+            echo ""
+            echo "- This build: ${{ steps.cf_deploy.outputs.deployment-url }}"
+            echo "- Branch alias: ${{ steps.cf_deploy.outputs.pages-deployment-alias-url }}"
+          } >> "${GITHUB_STEP_SUMMARY}"
       - name: Comment preview URL on the PR
         if: ${{ github.event_name == 'issue_comment' && env.CLOUDFLARE_API_TOKEN != '' }}
         uses: actions/github-script@v9
