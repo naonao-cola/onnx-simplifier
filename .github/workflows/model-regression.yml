@@ -309,6 +309,9 @@ jobs:
                 echo
               done
             } > pass-phase-profiles.md
+            # Also to the job log itself, not just the artifact -- readable
+            # straight from the Actions UI (or the API) without a download.
+            cat pass-phase-profiles.md
           else
             echo "no pass-phase tables present (unexpected -- every job captures them by default; check for an upstream failure)"
           fi
