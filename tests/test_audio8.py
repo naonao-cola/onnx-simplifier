@@ -23,9 +23,11 @@
 #
 # Downloads real model weights (10-290MB per case, ~450MB total across all 6)
 # from Hugging Face and, for the larger TTS models, takes over a minute per
-# model under check_n=3 -- too slow/network-dependent for every PR. It is
-# opt-in via ONNXSIM_RUN_AUDIO8_TESTS=1, set by the dedicated weekly
-# .github/workflows/audio8.yml. To run it locally::
+# model under check_n=3 -- too slow/network-dependent for every PR. The
+# quantization-quality test further down this file downloads its own
+# fp32/int8 pair from the same Audio8 ASR package (~520MB more) for the same
+# reason. It is opt-in via ONNXSIM_RUN_AUDIO8_TESTS=1, set by the dedicated
+# weekly .github/workflows/audio8.yml. To run it locally::
 #
 #     pip install onnxruntime
 #     pip install --force-reinstall --no-deps .   # the onnxsim under test
@@ -216,3 +218,98 @@ def test_audio8_model_simplify(audio8_model_dir, filename):
     # UNDEFINED) that onnx.checker.check_model tolerates but onnxruntime's
     # loader rejects outright (see DropIncompleteValueInfo in onnxsim.cpp).
     onnxruntime.InferenceSession(model_opt.SerializeToString())
+
+
+# ---------------------------------------------------------------------------
+# Quantization-quality integration test: does onnxsim's own quantize_dynamic
+# come within shouting distance of Audio8's own officially published
+# quantized export of the exact same graph?
+#
+# Audio8-ASR-0.1B-onnx-runtime is the one Audio8 package that publishes the
+# fp32 original *and* Audio8's own ORT-quantized export of the exact same
+# graph side by side: model_bundle/lm_cache_decode.onnx (fp32 reference) and
+# model_bundle/lm_cache_decode_int8.onnx (Audio8's own dynamic-quantized
+# export -- DynamicQuantizeLinear/MatMulInteger, the exact op pair
+# onnxsim.quantize_dynamic itself produces; see dynamic-quantization.md).
+# That is a real apples-to-apples target unavailable for onnxsim's other
+# quantize_* passes: quantize the *same* fp32 graph with onnxsim instead of
+# Audio8's own pipeline, measure both quantized graphs' accuracy drop against
+# the shared fp32 reference with onnxsim.measure_accuracy_drop on identical
+# calibration data, and check onnxsim's own quantization does not land
+# meaningfully further from the fp32 reference than Audio8's own published
+# conversion does.
+#
+# Same opt-in gate and ~450MB-plus-this-pair download budget as the rest of
+# this file -- see the module docstring above.
+# ---------------------------------------------------------------------------
+
+_QUALITY_REPO = "Audio8/Audio8-ASR-0.1B-onnx-runtime"
+_QUALITY_REVISION = "5b6d058a54853700223dd23cb4fe466b86c8fece"
+
+# filename -> (path within the repo, has external .onnx.data sidecar)
+_QUALITY_FILES = {
+    "lm_cache_decode_fp32.onnx": ("model_bundle/lm_cache_decode.onnx", False),
+    "lm_cache_decode_int8.onnx": ("model_bundle/lm_cache_decode_int8.onnx", True),
+}
+
+
+def _download_quality_file(filename: str, dest_dir) -> str:
+    path, has_external_data = _QUALITY_FILES[filename]
+    base_url = f"{_HF_BASE}/{_QUALITY_REPO}/resolve/{_QUALITY_REVISION}/{path}"
+    dest = str(dest_dir / filename)
+    _download_one(base_url, dest)
+    if has_external_data:
+        _download_one(f"{base_url}.data", f"{dest}.data")
+    return dest
+
+
+def test_audio8_quantize_dynamic_matches_published_int8_quality(audio8_model_dir):
+    fp32_path = _download_quality_file("lm_cache_decode_fp32.onnx", audio8_model_dir)
+    published_int8_path = _download_quality_file(
+        "lm_cache_decode_int8.onnx", audio8_model_dir
+    )
+
+    # Loaded (not passed as bare paths) so external data is resolved once,
+    # here, under our control -- onnxsim.measure_accuracy_drop/quantize_dynamic
+    # both load a bare path with load_external_data=False, which would leave
+    # published_int8's weights unresolved.
+    fp32_model = onnx.load(fp32_path)
+    published_int8_model = onnx.load(published_int8_path)
+
+    onnxsim_int8_model = onnxsim.quantize_dynamic(fp32_model)
+
+    # Same calibration batches for both measurements, so "onnxsim's error"
+    # and "Audio8's own error" are directly comparable numbers rather than
+    # each drawn from independent random inputs.
+    calibration_data = onnxsim.generate_random_calibration_data(
+        fp32_model, num_samples=4, seed=0
+    )
+
+    onnxsim_report = onnxsim.measure_accuracy_drop(
+        fp32_model, onnxsim_int8_model, calibration_data=calibration_data
+    )
+    published_report = onnxsim.measure_accuracy_drop(
+        fp32_model, published_int8_model, calibration_data=calibration_data
+    )
+
+    assert onnxsim_report.all_finite, (
+        "onnxsim.quantize_dynamic produced non-finite output on "
+        "lm_cache_decode.onnx"
+    )
+
+    # onnxsim's own dynamic quantization is not expected to be numerically
+    # identical to Audio8's own INT8 export -- different weight-quantization
+    # tie-breaks land on different int8 codes even under the same scheme --
+    # but it should land in the same ballpark of accuracy loss relative to
+    # fp32, not meaningfully worse. Generous factor: this is a coarse
+    # quality gate against a real published deployment artifact, not a tight
+    # numerical-equivalence check.
+    assert onnxsim_report.worst_relative_l2 <= max(
+        published_report.worst_relative_l2 * 3, 0.05
+    ), (
+        f"onnxsim.quantize_dynamic's relative L2 error "
+        f"({onnxsim_report.worst_relative_l2:.4g}) against the fp32 "
+        "reference is far worse than Audio8's own published INT8 export's "
+        f"({published_report.worst_relative_l2:.4g}) on the same graph and "
+        "calibration data"
+    )
