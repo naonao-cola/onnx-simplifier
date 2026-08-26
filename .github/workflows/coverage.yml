@@ -8,6 +8,10 @@ on:
   pull_request:
   workflow_dispatch:
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   # C++ + Python + JS coverage from a single pytest run plus the Node suite.
   # Emits Cobertura reports and hands them to the `report` job below rather than

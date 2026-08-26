@@ -8,6 +8,10 @@ on:
   pull_request:
   workflow_dispatch:
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   # Format + lint + type-check the Python sources. Tools are pinned so a local
   # run reports exactly what CI does; bump the pins here to upgrade everywhere.

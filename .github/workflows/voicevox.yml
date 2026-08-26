@@ -32,6 +32,10 @@ on:
     - cron: '0 8 * * 1'  # weekly, Monday 08:00 UTC
   workflow_dispatch:
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   voicevox:
     name: VOICEVOX sample.vvm -> onnxsim
