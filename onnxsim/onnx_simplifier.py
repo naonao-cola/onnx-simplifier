@@ -416,6 +416,58 @@ def import_gguf_weights(
     return result, skipped
 
 
+def cross_layer_equalize(model: Union[str, onnx.ModelProto]) -> onnx.ModelProto:
+    """
+    Data-free Cross-Layer Equalization (CLE) -- the weight-equalization
+    preprocessing technique from "Data-Free Quantization Through Weight
+    Equalization and Bias Correction" (Nagel et al., 2019), also shipped as
+    part of Qualcomm's AIMET toolkit.
+
+    This is **not** a quantization scheme: no ``Quantize``/``DequantizeLinear``
+    node is ever introduced, and the model's computed function is unchanged
+    bit-for-bit -- only its internal weight *parameterization* changes. Run
+    it *before* one of onnxsim's ``quantize_*`` functions to make the
+    per-tensor or per-channel quantization that follows more accurate.
+
+    For every pair of adjacent Conv layers ``Conv1 -> [activation] -> Conv2``
+    where the activation (if any) is positive-homogeneous of degree 1 --
+    ``f(a*x) == a*f(x)`` for every ``a > 0``, true of ``Relu``/``PRelu``/
+    ``LeakyRelu`` and trivially true of "no activation at all" -- and both
+    convs have ``group == 1``, this rescales each shared channel ``c`` by
+    ``S[c] = sqrt(r1[c] / r2[c])`` (``r1``/``r2`` being Conv1's/Conv2's own
+    per-channel weight range): Conv1's weight/bias for channel ``c`` divided
+    by ``S[c]``, Conv2's weight for channel ``c`` multiplied by ``S[c]``.
+    This makes the two layers' per-channel weight ranges identical -- the
+    most balanced a fixed pair can be -- without changing the composed
+    function at all, since the activation's positive homogeneity is exactly
+    what lets ``S[c]`` and ``1/S[c]`` cancel across it. A single call already
+    equalizes a whole chain of layers, not just one adjacent pair: onnxsim
+    reruns this pass, along with every other registered pass, to a
+    network-wide fixed point.
+
+    Scope of this implementation (each just declines the match rather than
+    mishandling it -- not correctness bugs):
+
+    - Conv only (no ConvTranspose, no Gemm/MatMul-based fully-connected
+      equalization).
+    - ``group`` must be 1 on both convs.
+    - FLOAT32 weights/bias only.
+    - No "high-bias absorption" (AIMET's optional follow-up step for a
+      following BatchNorm's bias) -- plain BN folding (already part of
+      :func:`simplify`) upstream of this pass covers the common case fine on
+      its own.
+
+    This is a single, self-contained graph rewrite: unlike :func:`simplify`,
+    it does not run shape inference, constant folding, or any other pass.
+
+    :param model: onnx ModelProto object or file path
+    :returns: the equalized onnx ModelProto
+    """
+    if isinstance(model, str):
+        model = onnx.load(model, load_external_data=False)
+    return onnx.load_from_string(C.cross_layer_equalize(model.SerializeToString()))
+
+
 def quantize_dynamic(model: Union[str, onnx.ModelProto]) -> onnx.ModelProto:
     """
     Dynamically quantize every MatMul, and every "vanilla" Gemm (transA=0,
