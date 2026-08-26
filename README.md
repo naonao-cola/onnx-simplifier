@@ -693,6 +693,31 @@ option.
 
 ## Safetensors / GGUF archives
 
+**Reading [onnx-safetensors](https://github.com/justinchuby/onnx-safetensors)-styled
+models needs no special handling.** `onnx_safetensors.save_file`/`save_model`/
+`load_file_as_external_data` write an ordinary `.onnx` graph whose initializers
+use *standard* ONNX external data (`location`/`offset`/`length`) pointing into a
+real `.safetensors` file — the safetensors JSON header is simply skipped over by
+`offset`. That's exactly the external-data mechanism `simplify()` already reads
+(from a path or from `onnx.load()`), so a model produced by onnx-safetensors —
+or any other tool following the same convention — loads and simplifies with no
+onnxsim-specific code involved:
+
+```python
+import onnx
+import onnxsim
+
+# model.onnx + model.safetensors, written by onnx_safetensors.save_model(...)
+model_opt, check_ok = onnxsim.simplify("model.onnx")
+# ...or with the weights already resolved into the ModelProto by onnx itself:
+model_opt, check_ok = onnxsim.simplify(onnx.load("model.onnx"))
+```
+
+This is unrelated to the standalone archive format described below (which
+embeds the *graph* in the safetensors/GGUF file too, in an onnxsim-specific
+layout) — onnx-safetensors' two-file layout is just a plain `.onnx` model as
+far as onnxsim (or any other ONNX consumer) is concerned.
+
 Besides plain `.onnx`, a model can be exported to (and imported back from) a
 **standalone safetensors or GGUF archive**: every initializer's bytes move into
 the archive with real, byte-accurate offsets — openable by the `safetensors`
