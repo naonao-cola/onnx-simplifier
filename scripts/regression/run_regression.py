@@ -21,6 +21,8 @@ Usage:
     run_regression.py --slow-only --output slow.csv     # the known-slow models
     run_regression.py --shard 0 --num-shards 6 --output shard-0.csv \
         --profile-dir profiles   # + one ONNXSIM_PROFILE trace per model
+    run_regression.py --shard 0 --num-shards 6 --output shard-0.csv \
+        --profile-pass-phases-dir pass_phases   # + one per-pass timing table per model
 """
 
 from __future__ import annotations
@@ -115,6 +117,17 @@ def main():
         "use it for investigating a specific slow/regressed run "
         "(see bench/RESULTS_profiling_survey.md).",
     )
+    ap.add_argument(
+        "--profile-pass-phases-dir",
+        default=None,
+        help="capture onnxsim's ONNXSIM_PROFILE_PASS_PHASES per-optimizer-pass "
+        "match/modify timing table for each model into this directory (one "
+        "<model>.pass_phases.txt per model), via worker.py's onnxsim runner. "
+        "Independent of --profile-dir: much cheaper (two chrono reads per node "
+        "match, no RSS sampler or trace write), so it's fine to turn on by "
+        "itself when investigating which optimizer pass dominates a specific "
+        "slow/regressed model (see bench/RESULTS_issue633_followup.md).",
+    )
     args = ap.parse_args()
 
     if args.profile_dir:
@@ -125,6 +138,15 @@ def main():
         os.environ["ONNXSIM_REGRESSION_PROFILE_DIR"] = os.path.abspath(
             args.profile_dir
         )
+    if args.profile_pass_phases_dir:
+        os.makedirs(args.profile_pass_phases_dir, exist_ok=True)
+        os.environ["ONNXSIM_REGRESSION_PASS_PHASES_DIR"] = os.path.abspath(
+            args.profile_pass_phases_dir
+        )
+        # Read directly by onnxsim's C++ core (onnxsim.cpp), not by this
+        # script or worker.py -- setting it here just makes it visible to
+        # every subprocess in the chain the same way the dir var above is.
+        os.environ["ONNXSIM_PROFILE_PASS_PHASES"] = "1"
 
     models = load_models()
     if args.slow_only:

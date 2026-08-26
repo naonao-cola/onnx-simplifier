@@ -61,6 +61,15 @@ def peak_rss_mb():
     return round(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024.0, 1)
 
 
+def _model_tag(onnx_path):
+    # The parent directory name is orchestrate()'s `local` (model_id with
+    # "/" -> "__"), which is unique per model; onnx_path's own basename often
+    # isn't (many repos just call it "model.onnx").
+    return os.path.basename(os.path.dirname(onnx_path)) or os.path.splitext(
+        os.path.basename(onnx_path)
+    )[0]
+
+
 # --------------------------------------------------------------------------- #
 # Child mode: run exactly one tool on an already-downloaded .onnx and print
 # __TOOLRESULT__<json>. Kept crash-safe so an import error or abort still yields
@@ -88,13 +97,7 @@ def run_onnxsim(onnx_path):
     profile_path = None
     if profile_dir:
         os.makedirs(profile_dir, exist_ok=True)
-        # The parent directory name is orchestrate()'s `local` (model_id with
-        # "/" -> "__"), which is unique per model; onnx_path's own basename
-        # often isn't (many repos just call it "model.onnx").
-        model_tag = os.path.basename(os.path.dirname(onnx_path)) or os.path.splitext(
-            os.path.basename(onnx_path)
-        )[0]
-        profile_path = os.path.join(profile_dir, f"{model_tag}.json")
+        profile_path = os.path.join(profile_dir, f"{_model_tag(onnx_path)}.json")
 
     skipped = []
     while True:
@@ -179,6 +182,26 @@ def run_tool_subprocess(tool, onnx_path, timeout):
                 "simp_nodes": None, "valid": None,
                 "seconds": float(timeout), "peak_rss_mb": None,
                 "skipped_optimizers": []}
+    # Opt-in ONNXSIM_PROFILE_PASS_PHASES capture: set by run_regression.py's
+    # --profile-pass-phases-dir (itself wired to the Model Regression
+    # workflow's "profile_pass_phases" workflow_dispatch input), inherited
+    # down through this subprocess's environment. onnxsim's C++ core reads
+    # ONNXSIM_PROFILE_PASS_PHASES directly (see onnxsim.cpp) and prints the
+    # per-pass match/modify timing table to stderr rather than writing a file
+    # itself, so save that here -- independent of ONNXSIM_REGRESSION_PROFILE_DIR
+    # (the heavier ONNXSIM_PROFILE trace) since this diagnostic is much
+    # cheaper (two chrono reads per node match, no RSS sampler or trace write).
+    pass_phases_dir = os.environ.get("ONNXSIM_REGRESSION_PASS_PHASES_DIR")
+    if tool == "onnxsim" and pass_phases_dir and proc.stderr:
+        try:
+            os.makedirs(pass_phases_dir, exist_ok=True)
+            with open(
+                os.path.join(pass_phases_dir, f"{_model_tag(onnx_path)}.pass_phases.txt"),
+                "w",
+            ) as f:
+                f.write(proc.stderr)
+        except OSError:
+            pass
     for line in proc.stdout.splitlines():
         if line.startswith("__TOOLRESULT__"):
             return json.loads(line[len("__TOOLRESULT__"):])
