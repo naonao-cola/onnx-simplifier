@@ -171,7 +171,9 @@ void Identity(onnx::ModelProto&);
 void RegisterCustomDefaultDomainOpSchemas(const onnx::ModelProto& model);
 
 // Assign names to any nodes left nameless after simplification (issue #269).
-void AssignMissingNodeNames(onnx::ModelProto& model);
+// Returns the names generated, in assignment order, so a caller can record
+// which nodes had no author-given name (e.g. as metadata_props).
+std::vector<std::string> AssignMissingNodeNames(onnx::ModelProto& model);
 
 // Drop value_info entries left with an UNDEFINED element type (see this
 // function's own doc comment in model_prep.cpp for why).

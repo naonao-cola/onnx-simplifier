@@ -599,8 +599,6 @@ std::string FormatGraphDiff(const onnx::ModelProto& model_ori,
   return out;
 }
 
-namespace {
-
 // Joins up to `limit` entries of `items` with ", ", appending a "... (+N
 // more)" marker when there were more. The metadata_props-value counterpart of
 // ``AppendCapped``: that one writes one line per entry into a multi-line
@@ -618,7 +616,12 @@ std::string JoinCapped(const std::vector<std::string>& items, size_t limit) {
   return out;
 }
 
-}  // namespace
+void RecordCappedListMetadata(onnx::ModelProto& model, const std::string& key,
+                              const std::vector<std::string>& items,
+                              size_t limit) {
+  SetMetadata(model, key + ".count", std::to_string(items.size()));
+  SetMetadata(model, key, JoinCapped(items, limit));
+}
 
 void RecordSimplifyDiffMetadata(onnx::ModelProto& sim_model,
                                 const onnx::ModelProto& model_ori,
@@ -635,14 +638,8 @@ void RecordSimplifyDiffMetadata(onnx::ModelProto& sim_model,
     changed.push_back(NodeLabel(before) + " -> " + NodeLabel(after));
   }
 
-  SetMetadata(sim_model, "onnxsim.removed_nodes.count",
-              std::to_string(diff.removed_nodes.size()));
-  SetMetadata(sim_model, "onnxsim.removed_nodes", JoinCapped(removed, limit));
-  SetMetadata(sim_model, "onnxsim.changed_nodes.count",
-              std::to_string(diff.changed_nodes.size()));
-  SetMetadata(sim_model, "onnxsim.changed_nodes", JoinCapped(changed, limit));
-  SetMetadata(sim_model, "onnxsim.removed_values.count",
-              std::to_string(diff.removed_values.size()));
-  SetMetadata(sim_model, "onnxsim.removed_values",
-              JoinCapped(diff.removed_values, limit));
+  RecordCappedListMetadata(sim_model, "onnxsim.removed_nodes", removed, limit);
+  RecordCappedListMetadata(sim_model, "onnxsim.changed_nodes", changed, limit);
+  RecordCappedListMetadata(sim_model, "onnxsim.removed_values",
+                           diff.removed_values, limit);
 }

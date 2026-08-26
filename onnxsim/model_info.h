@@ -149,3 +149,22 @@ std::string FormatGraphDiff(const onnx::ModelProto& model_ori,
 void RecordSimplifyDiffMetadata(onnx::ModelProto& sim_model,
                                 const onnx::ModelProto& model_ori,
                                 size_t limit = 20);
+
+// Joins up to `limit` entries of `items` with ", ", appending a "... (+N
+// more)" marker when there were more -- a single-line summary suitable for
+// one metadata_props value (as opposed to ``FormatGraphDiff``'s multi-line
+// report). Shared by ``RecordSimplifyDiffMetadata`` above and by other
+// metadata-recording call sites (e.g. onnxsim.cpp's node-naming and
+// function-inlining metadata) that need the same "capped list, one line"
+// shape.
+std::string JoinCapped(const std::vector<std::string>& items, size_t limit);
+
+// Writes ``key`` (``JoinCapped(items, limit)``) and ``key + ".count"``
+// (``items.size()``, uncapped) into ``model``'s metadata_props, overwriting
+// any existing entries under those two keys. This is the common "capped
+// list plus its true count" shape used by every list-valued onnxsim.*
+// metadata entry -- ``RecordSimplifyDiffMetadata``'s three categories below,
+// and onnxsim.cpp's own node-naming / function-inlining metadata.
+void RecordCappedListMetadata(onnx::ModelProto& model, const std::string& key,
+                              const std::vector<std::string>& items,
+                              size_t limit);

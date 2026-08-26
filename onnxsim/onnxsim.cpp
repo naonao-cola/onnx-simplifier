@@ -633,8 +633,34 @@ onnx::ModelProto Simplify(
   // conversion and fixed point so everything downstream operates on the inlined
   // graph; schema-defined functions are left untouched. Off by default, so a
   // model with functions is otherwise simplified exactly as before.
+  //
+  // Before inlining, tally how many top-level-graph nodes call each function
+  // (matched by (domain, op_type) against the function's own (domain, name)) so
+  // RecordSimplifyDiffMetadata's block below can record which functions
+  // disappeared and how many call sites each had -- InlineLocalFunctions clears
+  // model.functions() entirely, so this is the last point that information is
+  // available. Calls inside subgraphs or other functions are not counted, only
+  // the top-level graph (matching DiffGraphs' own top-level-only scope).
+  std::vector<std::string> inlined_function_labels;
   if (include_inline_functions) {
+    std::unordered_map<std::string, size_t> call_counts;
+    for (const auto& fn : sim_model.functions()) {
+      call_counts.emplace(fn.domain() + "::" + fn.name(), 0);
+    }
+    if (!call_counts.empty()) {
+      for (const auto& node : sim_model.graph().node()) {
+        auto it = call_counts.find(node.domain() + "::" + node.op_type());
+        if (it != call_counts.end()) {
+          ++it->second;
+        }
+      }
+    }
     onnx::inliner::InlineLocalFunctions(sim_model);
+    inlined_function_labels.reserve(call_counts.size());
+    for (const auto& [label, count] : call_counts) {
+      inlined_function_labels.push_back(label + ":" + std::to_string(count));
+    }
+    std::sort(inlined_function_labels.begin(), inlined_function_labels.end());
   }
   // Optionally convert the model to a different opset version (of the default
   // ONNX domain) first, so the simplification below can clean up any redundant
@@ -809,7 +835,8 @@ onnx::ModelProto Simplify(
   // Simplification (and some onnx-optimizer passes) can leave nodes without a
   // name; assign unique names to them so downstream tools that key on node
   // names keep working (issue #269).
-  AssignMissingNodeNames(sim_model);
+  const std::vector<std::string> assigned_node_names =
+      AssignMissingNodeNames(sim_model);
   DropIncompleteValueInfo(sim_model);
   RecordSimplifyOptionsMetadata(sim_model, skip_optimizers, constant_folding,
                                 shape_inference, tensor_size_threshold,
@@ -817,6 +844,15 @@ onnx::ModelProto Simplify(
                                 include_inline_functions, mutable_initializer,
                                 overwrite_input_shapes, unused_output);
   RecordSimplifyDiffMetadata(sim_model, model);
+  // Nodes onnxsim itself had to name (no author-given name survived), and
+  // functions inlined away (see the tally taken just before
+  // InlineLocalFunctions, above) -- two more places a name or a structural
+  // grouping present in the input model is gone from the output, alongside
+  // the fusion/folding changes RecordSimplifyDiffMetadata already covers.
+  RecordCappedListMetadata(sim_model, "onnxsim.assigned_node_names",
+                           assigned_node_names, 20);
+  RecordCappedListMetadata(sim_model, "onnxsim.inlined_functions",
+                           inlined_function_labels, 20);
   Check(sim_model);
   if (!converged) {
     std::cout << "WARNING: the simplification stopped because of timeout. "
