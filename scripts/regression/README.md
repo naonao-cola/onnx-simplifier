@@ -25,6 +25,7 @@ workflow on a weekly schedule and on demand.
 | `summarize.py` | merges the per-shard CSVs into `regression-report.csv` and a Markdown run summary, including the onnxsim-vs-onnxslim comparison tables. |
 | `profile_sample.py` | runs `simplify(path, profile=...)` over named models (via `model_zoo.py`) in isolated subprocesses, for ad hoc investigation of a specific model's profile -- see [Profiling](#profiling). |
 | `summarize_profiles.py` | merges per-model `ONNXSIM_PROFILE` traces (written by `worker.py` when profiling is on) into a Markdown summary: which fixed-point span dominates each model, aggregated across the whole sampled set, and (given the regression CSVs too) how much of each model's real wall-clock time the profiler's spans actually cover. See [Profiling](#profiling). |
+| `summarize_pass_phases.py` | aggregates every model's `ONNXSIM_PROFILE_PASS_PHASES` table (always captured, see [below](#per-pass-profiling-onnxsim_profile_pass_phases)) into a "where to optimize next" hint: which optimizer pass costs the most summed across the whole run, which model(s) are slowest, and the `CSETensorHash`/`CSETensorCompare` breakdown. Written to `$GITHUB_STEP_SUMMARY` on CI, so it's visible directly in the Actions UI's Summary tab. |
 | `yolov5_regression.py` | standalone check that `onnxsim` can replace the `onnxslim.slim` call in [ultralytics/yolov5](https://github.com/ultralytics/yolov5)'s `export.py`: exports the raw graph, runs both simplifiers, and gates on onnxsim producing a valid graph numerically equivalent to the original. Latest run: [`RESULTS_yolov5.md`](./RESULTS_yolov5.md). |
 | `model_zoo.py` | reference a regression model by short name from Python or the CLI, downloading it from the [`onnxmodelzoo`](https://huggingface.co/onnxmodelzoo) org (cached) and returning the path to its main `.onnx`. See [Referencing a model by name](#referencing-a-model-by-name). |
 
@@ -102,10 +103,14 @@ onnxslim's per-model work when you only care about its robustness and node count
 `run_regression.py --profile-dir DIR` (or the Model Regression workflow's
 `profile` `workflow_dispatch` input) captures onnxsim's built-in
 `ONNXSIM_PROFILE` trace for every model in that run, one `<model>.json` in
-`DIR` per model. It's off by default: a per-model trace adds a background
-RSS-sampler thread and a trace write onnxsim otherwise skips, overhead not
-worth paying on every scheduled run when nothing's wrong -- turn it on when
-investigating a specific slow or regressed run, not routinely.
+`DIR` per model. It adds a background RSS-sampler thread and a trace write
+onnxsim otherwise skips -- overhead that measures low next to onnxslim's own
+per-model cost (compare a `profile: true` and a `profile: false`
+`workflow_dispatch` run), so the workflow's `profile` input defaults to
+`true` for a manual run; pass `profile: false` to skip it for that run. The
+weekly schedule never sets `workflow_dispatch` inputs at all, so scheduled
+runs stay unprofiled regardless. `--profile-dir` itself still defaults to
+off when calling `run_regression.py` directly.
 
 ```bash
 # one shard, with a profile trace per model
@@ -119,7 +124,7 @@ python scripts/regression/run_regression.py --shard 0 --num-shards 6 \
 python scripts/regression/summarize_profiles.py "profiles/*.json" --csv shard-0.csv
 ```
 
-On the workflow, set `profile: true` on a manual `workflow_dispatch` run;
+On the workflow, a manual `workflow_dispatch` run captures it by default;
 `regression-profiles-shard-N` / `regression-profiles-slow` artifacts hold the
 raw traces (open one in `chrome://tracing` or `ui.perfetto.dev` for the full
 flame graph) and a `profile-summary` artifact holds the merged Markdown report.
@@ -152,9 +157,17 @@ python scripts/regression/run_regression.py --shard 0 --num-shards 6 \
 
 On the workflow, `regression-pass-phases-shard-N` / `regression-pass-phases-slow`
 artifacts hold the raw per-model tables from every run, and a
-`profile-pass-phases` artifact holds them collected into one Markdown file (no
-separate summarizer -- the tables are already onnxsim's own formatted stderr
-output).
+`profile-pass-phases` artifact holds them collected into one Markdown file (the
+raw tables verbatim -- no aggregation, since they're already onnxsim's own
+formatted stderr output). `summarize_pass_phases.py` aggregates those same
+tables into a bottleneck hint (top passes by summed cost, slowest models, the
+CSE hash breakdown) and writes it to `$GITHUB_STEP_SUMMARY`, so every run's
+Summary tab in the Actions UI shows where to optimize next without opening a
+single log or artifact:
+
+```bash
+python scripts/regression/summarize_pass_phases.py "pass_phases/*.pass_phases.txt"
+```
 
 ## Referencing a model by name
 

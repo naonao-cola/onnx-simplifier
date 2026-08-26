@@ -182,10 +182,10 @@ def run_tool_subprocess(tool, onnx_path, timeout):
                 "simp_nodes": None, "valid": None,
                 "seconds": float(timeout), "peak_rss_mb": None,
                 "skipped_optimizers": []}
-    # Opt-in ONNXSIM_PROFILE_PASS_PHASES capture: set by run_regression.py's
-    # --profile-pass-phases-dir (itself wired to the Model Regression
-    # workflow's "profile_pass_phases" workflow_dispatch input), inherited
-    # down through this subprocess's environment. onnxsim's C++ core reads
+    # Unconditional ONNXSIM_PROFILE_PASS_PHASES capture: set by
+    # run_regression.py's --profile-pass-phases-dir (on by default),
+    # inherited down through this subprocess's environment. onnxsim's C++
+    # core reads
     # ONNXSIM_PROFILE_PASS_PHASES directly (see onnxsim.cpp) and prints the
     # per-pass match/modify timing table to stderr rather than writing a file
     # itself, so save that here -- independent of ONNXSIM_REGRESSION_PROFILE_DIR
