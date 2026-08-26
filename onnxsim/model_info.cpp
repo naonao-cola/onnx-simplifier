@@ -623,6 +623,33 @@ void RecordCappedListMetadata(onnx::ModelProto& model, const std::string& key,
   SetMetadata(model, key, JoinCapped(items, limit));
 }
 
+// Counts top-level-graph nodes in `model_ori` that had a non-empty
+// doc_string but whose matched node in `model_opt` -- same output name(s),
+// the identity DiffGraphs itself matches nodes by -- carries none: either
+// the node was removed/fused away entirely, or whatever pass rebuilt it
+// didn't carry doc_string over (onnx-optimizer's fusion/elimination passes
+// generally don't). Reported as a plain count rather than the text itself:
+// doc_string is free-form prose, not a stable list of identifiers, so
+// there's no meaningful capped list to show here -- just how much was lost.
+static size_t CountDroppedDocStrings(const onnx::ModelProto& model_ori,
+                                     const onnx::ModelProto& model_opt) {
+  std::set<std::string> opt_keys_with_doc_string;
+  for (const auto& node : model_opt.graph().node()) {
+    if (!node.doc_string().empty()) {
+      opt_keys_with_doc_string.insert(OutputKey(MakeNodeDiffEntry(node)));
+    }
+  }
+
+  size_t dropped = 0;
+  for (const auto& node : model_ori.graph().node()) {
+    if (!node.doc_string().empty() &&
+        !opt_keys_with_doc_string.count(OutputKey(MakeNodeDiffEntry(node)))) {
+      ++dropped;
+    }
+  }
+  return dropped;
+}
+
 void RecordSimplifyDiffMetadata(onnx::ModelProto& sim_model,
                                 const onnx::ModelProto& model_ori,
                                 size_t limit) {
@@ -642,4 +669,6 @@ void RecordSimplifyDiffMetadata(onnx::ModelProto& sim_model,
   RecordCappedListMetadata(sim_model, "onnxsim.changed_nodes", changed, limit);
   RecordCappedListMetadata(sim_model, "onnxsim.removed_values",
                            diff.removed_values, limit);
+  SetMetadata(sim_model, "onnxsim.dropped_doc_strings",
+              std::to_string(CountDroppedDocStrings(model_ori, sim_model)));
 }
