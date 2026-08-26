@@ -138,14 +138,16 @@ std::string FormatGraphDiff(const onnx::ModelProto& model_ori,
 // Records a summary of what simplification changed structurally between
 // ``model_ori`` and ``sim_model`` -- nodes removed by fusion/elimination,
 // nodes changed in place under the same output name(s) (see ``DiffGraphs``),
-// and values that disappeared -- as ``metadata_props`` on ``sim_model``,
-// namespaced "onnxsim." like the rest of onnxsim's own metadata
-// (``AnnotateModelInfo``, ``RecordSimplifyOptionsMetadata``). This persists
-// the same diff ``FormatGraphDiff`` renders as a CLI report onto the model
-// itself, so a downstream consumer can see what was lost to fusion/constant
-// folding without needing the original model on hand. Each list is capped at
-// ``limit`` entries (with a paired ``*.count`` key holding the true total) to
-// keep the metadata compact on large graphs.
+// values that disappeared, and how many nodes' ``doc_string`` did not survive
+// (as a plain count: see ``CountDroppedDocStrings``'s doc comment for why a
+// capped list doesn't make sense for free-form prose) -- as ``metadata_props``
+// on ``sim_model``, namespaced "onnxsim." like the rest of onnxsim's own
+// metadata (``AnnotateModelInfo``, ``RecordSimplifyOptionsMetadata``). This
+// persists the same diff ``FormatGraphDiff`` renders as a CLI report onto the
+// model itself, so a downstream consumer can see what was lost to
+// fusion/constant folding without needing the original model on hand. Each
+// list is capped at ``limit`` entries (with a paired ``*.count`` key holding
+// the true total) to keep the metadata compact on large graphs.
 void RecordSimplifyDiffMetadata(onnx::ModelProto& sim_model,
                                 const onnx::ModelProto& model_ori,
                                 size_t limit = 20);
