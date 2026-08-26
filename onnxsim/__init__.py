@@ -9,6 +9,7 @@ from onnxsim.accuracy import (
     quantize_auto,
     recommend_quantization,
 )
+from onnxsim.adaround import apply_adaround
 from onnxsim.bias_correction import correct_bias
 from onnxsim.calibration import (
     calibrate,
@@ -66,6 +67,7 @@ __all__ = [
     "DEFAULT_QUANTIZATION_CANDIDATES",
     "cross_layer_equalize",
     "correct_bias",
+    "apply_adaround",
     "quantize_attention_dynamic",
     "quantize_dynamic",
     "quantize_dynamic_matmul_integer_to_float",
