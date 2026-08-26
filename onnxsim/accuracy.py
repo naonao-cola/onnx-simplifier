@@ -29,7 +29,8 @@ different price points:
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+import warnings
+from dataclasses import dataclass, field, replace
 from typing import Dict, List, Optional, Sequence, Union
 
 import numpy as np
@@ -371,3 +372,218 @@ def measure_accuracy_drop(
         worst_cosine_distance=1.0 - worst_cosine_similarity,
         all_finite=all_finite,
     )
+
+
+DEFAULT_QUANTIZATION_CANDIDATES: List[QuantizationConfig] = [
+    QuantizationConfig(scheme="ternary"),
+    QuantizationConfig(scheme="weight_only", dtype="int4"),
+    QuantizationConfig(scheme="dynamic"),
+    QuantizationConfig(scheme="weight_only", dtype="int8", granularity="per_block"),
+    QuantizationConfig(scheme="weight_only", dtype="int8", granularity="per_channel"),
+    QuantizationConfig(scheme="qoperator"),
+    QuantizationConfig(scheme="static"),
+    QuantizationConfig(scheme="weight_only", dtype="int16"),
+    QuantizationConfig(scheme="static_int16", dtype="int16"),
+    QuantizationConfig(scheme="float", dtype="float8_e4m3"),
+    QuantizationConfig(scheme="float", dtype="bfloat16"),
+    QuantizationConfig(scheme="float", dtype="float16"),
+]
+"""Default search order for :func:`recommend_quantization`, most compressed
+first: ~1-2 bit ternary, then 4/8/16-bit integer schemes (``dynamic`` before
+the per-channel/per-block ``weight_only`` int8 variants -- it needs no
+calibration data and is usually onnxsim's best-supported path), then 8-bit
+float, then 16-bit float as the final, almost-always-safe fallback. Not a
+benchmarked ranking -- actual size/latency/accuracy trade-offs are model- and
+backend-dependent; pass your own ``candidates`` to :func:`recommend_quantization`
+for a different order or a narrower/wider set."""
+
+
+@dataclass
+class QuantizationRecommendation:
+    """One :func:`recommend_quantization` result: the winning (or, if none
+    met the budget, least-lossy) scheme, its measured accuracy drop, and the
+    model already quantized with it."""
+
+    config: QuantizationConfig
+    report: AccuracyDropReport
+    quantized_model: onnx.ModelProto
+    meets_budget: bool
+
+
+def _initializer_nbytes(model: onnx.ModelProto) -> int:
+    """Total size of ``model``'s initializers actually referenced by a node
+    input. onnxsim's ``quantize_*`` passes rewrite a node to point at new
+    (smaller) quantized initializers but don't themselves prune the
+    now-unused original -- that's ``simplify()``'s job, run separately --
+    so counting every initializer regardless of reachability would make a
+    successful quantization look like it grew the model.
+    """
+    referenced = {name for n in model.graph.node for name in n.input}
+    total = 0
+    for t in model.graph.initializer:
+        if t.name not in referenced:
+            continue
+        total += (
+            len(t.raw_data) if t.HasField("raw_data") else len(t.SerializeToString())
+        )
+    return total
+
+
+def recommend_quantization(
+    model: Union[str, onnx.ModelProto],
+    accuracy_budget: float = 0.02,
+    candidates: Optional[Sequence[QuantizationConfig]] = None,
+    calibration_data: Optional[Sequence[Tensors]] = None,
+    num_samples: int = 8,
+    seed: int = 0,
+    providers: Optional[Sequence[str]] = None,
+) -> QuantizationRecommendation:
+    """Automatically picks a quantization scheme for ``model`` by measuring
+    (not estimating -- see :func:`measure_accuracy_drop`) each candidate in
+    ``candidates`` (default :data:`DEFAULT_QUANTIZATION_CANDIDATES`, most
+    compressed/lossy first) on the same data, and returning the first one
+    that both (a) actually shrinks the model's initializers and (b) keeps
+    the worst-case relative L2 error under ``accuracy_budget`` with only
+    finite outputs.
+
+    onnxsim has no notion of a deployment target -- no hardware, runtime, or
+    latency budget enters this search. It only ever optimizes for *accuracy*
+    under an ever-more-aggressive-first sweep of the schemes
+    :func:`quantize` already knows how to dispatch to. A candidate a given
+    runtime can't execute efficiently (or at all) is still a candidate here;
+    filter ``candidates`` yourself for that constraint.
+
+    Condition (a) exists because a scheme that finds nothing to quantize in
+    ``model`` (e.g. ``"ternary"`` on a model with no ternary-quantizable
+    pattern) still returns a valid -- just unchanged -- model, which would
+    otherwise look like a perfect (zero-error) "win" despite quantizing
+    nothing. Candidates that don't shrink the model are skipped outright,
+    including as the final fallback.
+
+    If no candidate meets both conditions, the least-lossy one that did
+    shrink the model is returned anyway (``meets_budget=False``) so the
+    caller can still inspect or use it, or retry with a raised
+    ``accuracy_budget``. Raises :class:`ValueError` only if every candidate
+    either failed to apply (:func:`quantize` itself raised) or failed to
+    shrink the model.
+
+    :param model: onnx ModelProto object or file path
+    :param accuracy_budget: maximum acceptable worst-case relative L2 error
+            (see :attr:`AccuracyDropReport.worst_relative_l2`) for a
+            candidate to be accepted
+    :param candidates: schemes to try, in order; defaults to
+            :data:`DEFAULT_QUANTIZATION_CANDIDATES`. Each candidate's
+            ``calibration_data``/``num_calibration_samples``/``seed``/
+            ``providers`` fields are overwritten with this function's own
+            same-named parameters -- set ``scheme``/``dtype``/``granularity``
+            only.
+    :param calibration_data: representative input batches, used both to
+            calibrate the calibration-based schemes (``"static"``,
+            ``"static_int16"``, ``"qoperator"``) and to measure every
+            candidate's accuracy drop. See
+            :func:`onnxsim.generate_random_calibration_data` (the default
+            when omitted) and :func:`onnxsim.load_huggingface_calibration_data`
+            (real data, a much more representative search than random input).
+    :param num_samples: random batches to generate when ``calibration_data``
+            is omitted
+    :param seed: seed for the random calibration data (ignored if
+            ``calibration_data`` is supplied)
+    :param providers: onnxruntime execution providers to calibrate/run on
+    :returns: the winning (or, if none met budget, least-lossy) candidate
+    """
+    if isinstance(model, str):
+        model = onnx.load(model, load_external_data=False)
+    if calibration_data is None:
+        calibration_data = generate_random_calibration_data(
+            model, num_samples=num_samples, seed=seed
+        )
+    float_nbytes = _initializer_nbytes(model)
+
+    best: Optional[QuantizationRecommendation] = None
+    for base_config in (
+        DEFAULT_QUANTIZATION_CANDIDATES if candidates is None else candidates
+    ):
+        config = replace(
+            base_config,
+            calibration_data=calibration_data,
+            num_calibration_samples=num_samples,
+            seed=seed,
+            providers=providers,
+        )
+        try:
+            quantized = quantize(model, config)
+            if _initializer_nbytes(quantized) >= float_nbytes:
+                continue  # no-op quantization -- not a real candidate
+            report = measure_accuracy_drop(
+                model,
+                quantized,
+                calibration_data=calibration_data,
+                num_samples=num_samples,
+                seed=seed,
+                providers=providers,
+            )
+        except Exception:
+            # Either quantize() declined this scheme, or the quantized
+            # model quantized fine but the execution backend can't run it
+            # (e.g. float8e4m3 MatMul on the CPU EP) -- either way, not a
+            # usable candidate on this model/backend; try the next.
+            continue
+        meets_budget = report.all_finite and report.worst_relative_l2 < accuracy_budget
+        recommendation = QuantizationRecommendation(
+            config=config,
+            report=report,
+            quantized_model=quantized,
+            meets_budget=meets_budget,
+        )
+        if meets_budget:
+            return recommendation
+        if best is None or (
+            report.all_finite
+            and (
+                not best.report.all_finite
+                or report.worst_relative_l2 < best.report.worst_relative_l2
+            )
+        ):
+            best = recommendation
+
+    if best is None:
+        raise ValueError(
+            "no candidate quantization scheme both applied to this model and "
+            "shrank it -- pass a different `candidates` list"
+        )
+    return best
+
+
+def quantize_auto(
+    model: Union[str, onnx.ModelProto],
+    accuracy_budget: float = 0.02,
+    **kwargs,
+) -> onnx.ModelProto:
+    """Convenience wrapper around :func:`recommend_quantization` that
+    returns just the quantized model -- see its docstring for every
+    parameter, forwarded here via ``**kwargs``.
+
+    Warns (does not raise) if no candidate met ``accuracy_budget``: the
+    returned model is still the least-lossy one actually measured, already
+    quantized and usable, just not guaranteed to be within budget. Call
+    :func:`recommend_quantization` directly instead if you need the measured
+    report or want to react to a missed budget programmatically rather than
+    via a warning.
+
+    :param model: onnx ModelProto object or file path
+    :param accuracy_budget: see :func:`recommend_quantization`
+    :param kwargs: forwarded to :func:`recommend_quantization`
+    :returns: the recommended scheme's quantized model
+    """
+    recommendation = recommend_quantization(
+        model, accuracy_budget=accuracy_budget, **kwargs
+    )
+    if not recommendation.meets_budget:
+        warnings.warn(
+            f"no quantization candidate met accuracy_budget={accuracy_budget}; "
+            f"returning the least-lossy one tried ({recommendation.config.scheme}/"
+            f"{recommendation.config.dtype}, worst_relative_l2="
+            f"{recommendation.report.worst_relative_l2:.4f})",
+            stacklevel=2,
+        )
+    return recommendation.quantized_model

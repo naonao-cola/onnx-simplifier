@@ -17,7 +17,11 @@ import onnx.numpy_helper
 import pytest
 
 import onnxsim
-from onnxsim.accuracy import AccuracyDropReport, OutputAccuracyStats
+from onnxsim.accuracy import (
+    AccuracyDropReport,
+    OutputAccuracyStats,
+    _initializer_nbytes,
+)
 
 ort = pytest.importorskip("onnxruntime")
 
@@ -202,3 +206,103 @@ def test_measure_accuracy_drop_uses_supplied_calibration_data():
         model, quantized, calibration_data=calibration_data
     )
     assert report.num_samples == 1
+
+
+# --------------------------------------------------------------------------- #
+# recommend_quantization() / quantize_auto()
+# --------------------------------------------------------------------------- #
+def test_recommend_quantization_returns_first_candidate_meeting_budget():
+    model = _linear_model(K=64, N=64, opset=21, seed=0)
+
+    recommendation = onnxsim.recommend_quantization(model, accuracy_budget=0.05)
+
+    assert recommendation.meets_budget
+    assert recommendation.report.worst_relative_l2 < 0.05
+    assert recommendation.report.all_finite
+    # Not pinning down *which* scheme wins here: weight_only/int4's own error
+    # on this model sits close enough to 0.05 that it can land on either side
+    # of the budget depending on the execution backend's exact int4
+    # rounding (observed both ~0.10 and <0.05 across environments) --
+    # test_recommend_quantization_tries_more_compressed_schemes_first below
+    # covers the search-order behavior with a budget decisively wide of that
+    # race instead.
+    assert _initializer_nbytes(recommendation.quantized_model) < _initializer_nbytes(
+        model
+    )
+
+
+def test_recommend_quantization_tries_more_compressed_schemes_first():
+    # weight_only/int4 (block-wise 4-bit) sorts before dynamic/int8 in
+    # DEFAULT_QUANTIZATION_CANDIDATES; a budget loose enough for int4's own
+    # (lossier) error should pick it over the less-compressed schemes tried
+    # after it.
+    model = _linear_model(K=64, N=64, opset=21, seed=0)
+
+    recommendation = onnxsim.recommend_quantization(model, accuracy_budget=0.3)
+
+    assert recommendation.meets_budget
+    assert recommendation.config.scheme == "weight_only"
+    assert recommendation.config.dtype == "int4"
+
+
+def test_recommend_quantization_shrink_check_rejects_a_noop_win():
+    # A model whose weight isn't structurally ternary makes "ternary" (this
+    # module's first, most-aggressive candidate) a no-op -- quantize()
+    # returns the model unchanged, which would look like a perfect
+    # (zero-error) win without the reachable-initializer shrink check.
+    model = _linear_model(K=64, N=64, opset=21, seed=0)
+
+    recommendation = onnxsim.recommend_quantization(model, accuracy_budget=1.0)
+
+    assert recommendation.config.scheme != "ternary"
+
+
+def test_recommend_quantization_falls_back_to_least_lossy_when_no_candidate_fits():
+    model = _linear_model(K=64, N=64, opset=21, seed=0)
+
+    recommendation = onnxsim.recommend_quantization(model, accuracy_budget=1e-9)
+
+    assert not recommendation.meets_budget
+    assert recommendation.report.all_finite
+    # A generous upper bound, not a tight one: the exact least-lossy error
+    # depends on the execution backend's numerics (see the comment on
+    # test_recommend_quantization_returns_first_candidate_meeting_budget),
+    # this just confirms the fallback is a real, small-but-nonzero drop
+    # rather than something badly broken.
+    assert 0 < recommendation.report.worst_relative_l2 < 0.01
+
+
+def test_recommend_quantization_raises_when_no_candidate_applies():
+    model = _linear_model(K=64, N=64, opset=21, seed=0)
+
+    with pytest.raises(ValueError):
+        onnxsim.recommend_quantization(model, accuracy_budget=0.05, candidates=[])
+
+
+def test_recommend_quantization_custom_candidates_restricts_search():
+    model = _linear_model(K=64, N=64, opset=21, seed=0)
+
+    recommendation = onnxsim.recommend_quantization(
+        model,
+        accuracy_budget=0.5,
+        candidates=[onnxsim.QuantizationConfig(scheme="dynamic")],
+    )
+
+    assert recommendation.config.scheme == "dynamic"
+
+
+def test_quantize_auto_returns_quantized_model():
+    model = _linear_model(K=64, N=64, opset=21, seed=0)
+
+    quantized = onnxsim.quantize_auto(model, accuracy_budget=0.05)
+
+    onnx.checker.check_model(quantized)
+    report = onnxsim.measure_accuracy_drop(model, quantized, seed=1)
+    assert report.worst_relative_l2 < 0.05
+
+
+def test_quantize_auto_warns_when_no_candidate_meets_budget():
+    model = _linear_model(K=64, N=64, opset=21, seed=0)
+
+    with pytest.warns(UserWarning, match="no quantization candidate met"):
+        onnxsim.quantize_auto(model, accuracy_budget=1e-9)
