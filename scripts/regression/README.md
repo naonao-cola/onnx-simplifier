@@ -130,27 +130,31 @@ and prints the same per-span breakdown directly (no CSV, no CI).
 
 ### Per-pass profiling (`ONNXSIM_PROFILE_PASS_PHASES`)
 
-`run_regression.py --profile-pass-phases-dir DIR` (or the Model Regression
-workflow's `profile_pass_phases` `workflow_dispatch` input) captures onnxsim's
+Every `run_regression.py` invocation -- including every scheduled and
+`workflow_dispatch` Model Regression run -- captures onnxsim's
 `ONNXSIM_PROFILE_PASS_PHASES` per-optimizer-pass match/modify timing table for
-every model in that run, one `<model>.pass_phases.txt` in `DIR` per model --
-useful for finding *which single pass* (e.g. `extract_constant_to_initializer`,
-see `bench/RESULTS_issue633_followup.md`) dominates a slow or regressed model,
-finer-grained than `ONNXSIM_PROFILE`'s per-span trace. It's independent of
-`--profile-dir`/`profile` above and much cheaper (two `std::chrono` reads per
-node match, no background RSS sampler or trace write), so it's fine to turn on
-by itself:
+every model, one `<model>.pass_phases.txt` in `--profile-pass-phases-dir`
+(default `pass_phases`) per model. This is what answers *which single pass*
+(e.g. `extract_constant_to_initializer`, see
+`bench/RESULTS_issue633_followup.md`) dominates a given model -- finer-grained
+than `ONNXSIM_PROFILE`'s per-span trace, and, unlike a coarse pass/fail +
+timing summary, actually points at what to optimize next once the obvious
+bottlenecks are gone. It's on unconditionally (unlike `--profile-dir`/`profile`
+above) because its cost is negligible -- two `std::chrono` reads per node
+match, no background RSS sampler or trace write -- so there's no real trade-off
+in always having it on hand instead of re-running with profiling after the
+fact. Pass `--profile-pass-phases-dir ""` to disable it if you ever need to:
 
 ```bash
 python scripts/regression/run_regression.py --shard 0 --num-shards 6 \
-  --output shard-0.csv --profile-pass-phases-dir pass_phases
+  --output shard-0.csv   # pass_phases/ is written by default
 ```
 
-On the workflow, set `profile_pass_phases: true` on a manual `workflow_dispatch`
-run; `regression-pass-phases-shard-N` / `regression-pass-phases-slow`
-artifacts hold the raw per-model tables and a `profile-pass-phases` artifact
-holds them collected into one Markdown file (no separate summarizer -- the
-tables are already onnxsim's own formatted stderr output).
+On the workflow, `regression-pass-phases-shard-N` / `regression-pass-phases-slow`
+artifacts hold the raw per-model tables from every run, and a
+`profile-pass-phases` artifact holds them collected into one Markdown file (no
+separate summarizer -- the tables are already onnxsim's own formatted stderr
+output).
 
 ## Referencing a model by name
 
