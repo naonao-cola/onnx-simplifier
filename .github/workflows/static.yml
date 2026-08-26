@@ -388,6 +388,20 @@ jobs:
             # install .`); this job never runs setup.py otherwise, so
             # generate it explicitly -- onnx_simplifier.py's `from . import
             # ..., version` fails without it.
+            #
+            # setup.py's own `setuptools.setup(...)` call parses
+            # pyproject.toml before create_version even runs, and this
+            # step's plain `python3` isn't the same interpreter the earlier
+            # `pip install cmake ninja setuptools` step's `pip` resolves to
+            # (confirmed directly: it picked up
+            # /usr/lib/python3/dist-packages/setuptools, the OS-packaged
+            # one) -- too old to understand pyproject.toml's SPDX
+            # license-expression string ("project.license must be valid
+            # exactly by one definition"; pyproject.toml's own
+            # build-system.requires already pins setuptools>=77 for exactly
+            # this). Force it via THIS interpreter specifically so there's
+            # no ambiguity about which site-packages it lands in.
+            python3 -m pip install --quiet --upgrade 'setuptools>=77'
             python3 setup.py create_version
             mkdir -p scripts/convertmodel/pyodide-demo/onnxsim_src
             cp onnxsim/*.py scripts/convertmodel/pyodide-demo/onnxsim_src/
