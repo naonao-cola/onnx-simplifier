@@ -636,13 +636,13 @@ void RecordSimplifyDiffMetadata(onnx::ModelProto& sim_model,
   }
 
   SetMetadata(sim_model, "onnxsim.removed_nodes.count",
-             std::to_string(diff.removed_nodes.size()));
+              std::to_string(diff.removed_nodes.size()));
   SetMetadata(sim_model, "onnxsim.removed_nodes", JoinCapped(removed, limit));
   SetMetadata(sim_model, "onnxsim.changed_nodes.count",
-             std::to_string(diff.changed_nodes.size()));
+              std::to_string(diff.changed_nodes.size()));
   SetMetadata(sim_model, "onnxsim.changed_nodes", JoinCapped(changed, limit));
   SetMetadata(sim_model, "onnxsim.removed_values.count",
-             std::to_string(diff.removed_values.size()));
+              std::to_string(diff.removed_values.size()));
   SetMetadata(sim_model, "onnxsim.removed_values",
-             JoinCapped(diff.removed_values, limit));
+              JoinCapped(diff.removed_values, limit));
 }

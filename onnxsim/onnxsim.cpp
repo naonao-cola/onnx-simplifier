@@ -156,11 +156,11 @@ void RecordSimplifyOptionsMetadata(
   // simplify() call (that did set it) must still be cleared on a later call
   // that doesn't, or it would look like it's still in effect.
   static const std::unordered_set<std::string> known_option_keys = {
-      "onnxsim.skip_optimizers",           "onnxsim.constant_folding",
-      "onnxsim.shape_inference",           "onnxsim.tensor_size_threshold",
-      "onnxsim.target_opset_version",      "onnxsim.initializers_as_constants",
-      "onnxsim.include_inline_functions",  "onnxsim.mutable_initializer",
-      "onnxsim.overwrite_input_shapes",    "onnxsim.unused_output"};
+      "onnxsim.skip_optimizers",          "onnxsim.constant_folding",
+      "onnxsim.shape_inference",          "onnxsim.tensor_size_threshold",
+      "onnxsim.target_opset_version",     "onnxsim.initializers_as_constants",
+      "onnxsim.include_inline_functions", "onnxsim.mutable_initializer",
+      "onnxsim.overwrite_input_shapes",   "onnxsim.unused_output"};
 
   auto* props = model.mutable_metadata_props();
   google::protobuf::RepeatedPtrField<onnx::StringStringEntryProto> kept;
