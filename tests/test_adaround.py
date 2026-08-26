@@ -66,15 +66,13 @@ def _dequantize_int4(quant_model):
     # Feed a zero/one probe matrix through the model's own DequantizeLinear
     # node isn't directly possible without extracting it into its own
     # session, so instead this decodes by hand from the initializer bytes.
-    wq = next(
-        t for t in quant_model.graph.initializer if t.data_type == onnx.TensorProto.INT4
-    )
-    ws = next(
-        t
-        for t in quant_model.graph.initializer
-        if t.data_type == onnx.TensorProto.FLOAT
-    )
     dq_node = next(n for n in quant_model.graph.node if n.op_type == "DequantizeLinear")
+    # Fetch Wq/Ws by the DequantizeLinear node's own input names, not by
+    # scanning for "some tensor of this dtype": quantize_weight_only_int4
+    # never prunes the original (now-dead) float32 weight initializer, so a
+    # dtype-only scan can silently grab that instead of the real scale.
+    wq = next(t for t in quant_model.graph.initializer if t.name == dq_node.input[0])
+    ws = next(t for t in quant_model.graph.initializer if t.name == dq_node.input[1])
     block_size = next(a.i for a in dq_node.attribute if a.name == "block_size")
     axis = next((a.i for a in dq_node.attribute if a.name == "axis"), 1)
 
@@ -147,22 +145,20 @@ def test_adaround_preserves_scale_and_shape():
     rng = np.random.default_rng(6)
     calibration_data = [{"X": rng.standard_normal((4, 32)).astype(np.float32)}]
 
+    quant_dq = next(
+        n for n in quant_model.graph.node if n.op_type == "DequantizeLinear"
+    )
     before_scale = onnx.numpy_helper.to_array(
-        next(
-            t
-            for t in quant_model.graph.initializer
-            if t.data_type == onnx.TensorProto.FLOAT
-        )
+        next(t for t in quant_model.graph.initializer if t.name == quant_dq.input[1])
     )
     adaround_model = onnxsim.apply_adaround(
         float_model, quant_model, calibration_data=calibration_data, num_iterations=50
     )
+    ada_dq = next(
+        n for n in adaround_model.graph.node if n.op_type == "DequantizeLinear"
+    )
     after_scale = onnx.numpy_helper.to_array(
-        next(
-            t
-            for t in adaround_model.graph.initializer
-            if t.data_type == onnx.TensorProto.FLOAT
-        )
+        next(t for t in adaround_model.graph.initializer if t.name == ada_dq.input[1])
     )
     np.testing.assert_array_equal(before_scale, after_scale)
 

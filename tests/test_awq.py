@@ -67,13 +67,13 @@ def _salient_channel_calibration(K=64, num_samples=32, salient_channels=(3, 7), 
 
 
 def _dequantize_int4(model):
-    wq = next(
-        t for t in model.graph.initializer if t.data_type == onnx.TensorProto.INT4
-    )
-    ws = next(
-        t for t in model.graph.initializer if t.data_type == onnx.TensorProto.FLOAT
-    )
     dq_node = next(n for n in model.graph.node if n.op_type == "DequantizeLinear")
+    # Fetch Wq/Ws by the DequantizeLinear node's own input names, not by
+    # scanning for "some tensor of this dtype": quantize_weight_only_int4
+    # never prunes the original (now-dead) float32 weight initializer, so a
+    # dtype-only scan can silently grab that instead of the real scale.
+    wq = next(t for t in model.graph.initializer if t.name == dq_node.input[0])
+    ws = next(t for t in model.graph.initializer if t.name == dq_node.input[1])
     block_size = next(a.i for a in dq_node.attribute if a.name == "block_size")
     axis = next((a.i for a in dq_node.attribute if a.name == "axis"), 1)
 

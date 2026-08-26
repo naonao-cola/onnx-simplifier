@@ -28,6 +28,7 @@ from onnxsim.calibration import (
     quantize_static,
     quantize_static_int16,
 )
+from onnxsim.gptq import apply_gptq
 from onnxsim.onnx_simplifier import (
     cross_layer_equalize,
     export_gguf,
@@ -73,6 +74,7 @@ __all__ = [
     "auto_quantize_int4",
     "AutoQuantResult",
     "apply_awq",
+    "apply_gptq",
     "quantize_attention_dynamic",
     "quantize_dynamic",
     "quantize_dynamic_matmul_integer_to_float",
