@@ -92,16 +92,26 @@ jobs:
           path: ./wheelhouse/*.whl
 
   # Emit the shard index list so the shard count is configurable from
-  # workflow_dispatch while defaulting to 6.
-  # One `python3 -c` line emitting the shard list -- no checkout, nothing built.
-  # ubuntu-slim's preinstalled Python is all this needs.
+  # workflow_dispatch while defaulting to 6, and whether models.json currently
+  # has any known_slow entries at all -- lets the known-slow job below skip
+  # itself (checkout, wheel download, deps install, all for nothing) on the
+  # common case where the list is empty rather than always paying that
+  # overhead to report "0 models, all passed".
+  # A sparse checkout of just models.json keeps this cheap; ubuntu-slim's
+  # preinstalled Python is all the rest needs.
   setup:
     name: Plan shards
     runs-on: ubuntu-slim
     outputs:
       shards: ${{ steps.plan.outputs.shards }}
       num_shards: ${{ steps.plan.outputs.num_shards }}
+      has_known_slow: ${{ steps.plan.outputs.has_known_slow }}
     steps:
+      - uses: actions/checkout@v7
+        with:
+          sparse-checkout: |
+            scripts/regression/models.json
+          sparse-checkout-cone-mode: false
       - id: plan
         run: |
           n="${{ github.event.inputs.num_shards || '6' }}"
@@ -109,6 +119,9 @@ jobs:
           echo "num_shards=$n" >> "$GITHUB_OUTPUT"
           echo "shards=$shards" >> "$GITHUB_OUTPUT"
           echo "planning $n shards: $shards"
+          has_slow=$(python3 -c "import json; d=json.load(open('scripts/regression/models.json')); print('true' if any(m.get('known_slow') for m in d['models']) else 'false')")
+          echo "has_known_slow=$has_slow" >> "$GITHUB_OUTPUT"
+          echo "known_slow models present: $has_slow"
 
   regression:
     name: Shard ${{ matrix.shard }}
@@ -179,8 +192,8 @@ jobs:
 
   known-slow:
     name: Known-slow models (non-blocking)
-    needs: [build]
-    if: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.include_slow == 'true' }}
+    needs: [build, setup]
+    if: ${{ needs.setup.outputs.has_known_slow == 'true' && (github.event_name != 'workflow_dispatch' || github.event.inputs.include_slow == 'true') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     continue-on-error: true
