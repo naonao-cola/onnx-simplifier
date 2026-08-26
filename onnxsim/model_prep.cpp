@@ -239,8 +239,8 @@ void CollectNodeNames(const onnx::GraphProto& graph,
 // graph (including names generated earlier in this pass). Subgraphs are handled
 // recursively so nodes inside If/Loop/Scan bodies are named too.
 void AssignMissingNodeNames(onnx::GraphProto& graph,
-                            std::set<std::string>& used_names,
-                            size_t& counter) {
+                            std::set<std::string>& used_names, size_t& counter,
+                            std::vector<std::string>& assigned) {
   for (auto& node : *graph.mutable_node()) {
     if (node.name().empty()) {
       std::string name;
@@ -249,24 +249,28 @@ void AssignMissingNodeNames(onnx::GraphProto& graph,
       } while (used_names.count(name) > 0);
       used_names.insert(name);
       node.set_name(name);
+      assigned.push_back(name);
     }
     for (auto& attr : *node.mutable_attribute()) {
       if (attr.has_g()) {
-        AssignMissingNodeNames(*attr.mutable_g(), used_names, counter);
+        AssignMissingNodeNames(*attr.mutable_g(), used_names, counter,
+                               assigned);
       }
       for (auto& subgraph : *attr.mutable_graphs()) {
-        AssignMissingNodeNames(subgraph, used_names, counter);
+        AssignMissingNodeNames(subgraph, used_names, counter, assigned);
       }
     }
   }
 }
 
 // Assign names to any nodes left nameless after simplification (issue #269).
-void AssignMissingNodeNames(onnx::ModelProto& model) {
+std::vector<std::string> AssignMissingNodeNames(onnx::ModelProto& model) {
   std::set<std::string> used_names;
   CollectNodeNames(model.graph(), used_names);
   size_t counter = 0;
-  AssignMissingNodeNames(*model.mutable_graph(), used_names, counter);
+  std::vector<std::string> assigned;
+  AssignMissingNodeNames(*model.mutable_graph(), used_names, counter, assigned);
+  return assigned;
 }
 
 // Shape inference can leave behind a value_info entry that records a shape

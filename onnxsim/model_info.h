@@ -134,3 +134,37 @@ GraphDiff DiffGraphs(const onnx::ModelProto& model_ori,
 std::string FormatGraphDiff(const onnx::ModelProto& model_ori,
                             const onnx::ModelProto& model_opt,
                             size_t limit = 50);
+
+// Records a summary of what simplification changed structurally between
+// ``model_ori`` and ``sim_model`` -- nodes removed by fusion/elimination,
+// nodes changed in place under the same output name(s) (see ``DiffGraphs``),
+// and values that disappeared -- as ``metadata_props`` on ``sim_model``,
+// namespaced "onnxsim." like the rest of onnxsim's own metadata
+// (``AnnotateModelInfo``, ``RecordSimplifyOptionsMetadata``). This persists
+// the same diff ``FormatGraphDiff`` renders as a CLI report onto the model
+// itself, so a downstream consumer can see what was lost to fusion/constant
+// folding without needing the original model on hand. Each list is capped at
+// ``limit`` entries (with a paired ``*.count`` key holding the true total) to
+// keep the metadata compact on large graphs.
+void RecordSimplifyDiffMetadata(onnx::ModelProto& sim_model,
+                                const onnx::ModelProto& model_ori,
+                                size_t limit = 20);
+
+// Joins up to `limit` entries of `items` with ", ", appending a "... (+N
+// more)" marker when there were more -- a single-line summary suitable for
+// one metadata_props value (as opposed to ``FormatGraphDiff``'s multi-line
+// report). Shared by ``RecordSimplifyDiffMetadata`` above and by other
+// metadata-recording call sites (e.g. onnxsim.cpp's node-naming and
+// function-inlining metadata) that need the same "capped list, one line"
+// shape.
+std::string JoinCapped(const std::vector<std::string>& items, size_t limit);
+
+// Writes ``key`` (``JoinCapped(items, limit)``) and ``key + ".count"``
+// (``items.size()``, uncapped) into ``model``'s metadata_props, overwriting
+// any existing entries under those two keys. This is the common "capped
+// list plus its true count" shape used by every list-valued onnxsim.*
+// metadata entry -- ``RecordSimplifyDiffMetadata``'s three categories below,
+// and onnxsim.cpp's own node-naming / function-inlining metadata.
+void RecordCappedListMetadata(onnx::ModelProto& model, const std::string& key,
+                              const std::vector<std::string>& items,
+                              size_t limit);

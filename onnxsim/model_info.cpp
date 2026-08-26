@@ -598,3 +598,48 @@ std::string FormatGraphDiff(const onnx::ModelProto& model_ori,
 
   return out;
 }
+
+// Joins up to `limit` entries of `items` with ", ", appending a "... (+N
+// more)" marker when there were more. The metadata_props-value counterpart of
+// ``AppendCapped``: that one writes one line per entry into a multi-line
+// report, but a metadata_props value is a single flat string, so this stays
+// on one line.
+std::string JoinCapped(const std::vector<std::string>& items, size_t limit) {
+  std::string out;
+  for (size_t i = 0; i < items.size() && i < limit; ++i) {
+    if (i > 0) out += ", ";
+    out += items[i];
+  }
+  if (items.size() > limit) {
+    out += ", ... (+" + std::to_string(items.size() - limit) + " more)";
+  }
+  return out;
+}
+
+void RecordCappedListMetadata(onnx::ModelProto& model, const std::string& key,
+                              const std::vector<std::string>& items,
+                              size_t limit) {
+  SetMetadata(model, key + ".count", std::to_string(items.size()));
+  SetMetadata(model, key, JoinCapped(items, limit));
+}
+
+void RecordSimplifyDiffMetadata(onnx::ModelProto& sim_model,
+                                const onnx::ModelProto& model_ori,
+                                size_t limit) {
+  const GraphDiff diff = DiffGraphs(model_ori, sim_model);
+
+  std::vector<std::string> removed;
+  removed.reserve(diff.removed_nodes.size());
+  for (const auto& n : diff.removed_nodes) removed.push_back(NodeLabel(n));
+
+  std::vector<std::string> changed;
+  changed.reserve(diff.changed_nodes.size());
+  for (const auto& [before, after] : diff.changed_nodes) {
+    changed.push_back(NodeLabel(before) + " -> " + NodeLabel(after));
+  }
+
+  RecordCappedListMetadata(sim_model, "onnxsim.removed_nodes", removed, limit);
+  RecordCappedListMetadata(sim_model, "onnxsim.changed_nodes", changed, limit);
+  RecordCappedListMetadata(sim_model, "onnxsim.removed_values",
+                           diff.removed_values, limit);
+}
