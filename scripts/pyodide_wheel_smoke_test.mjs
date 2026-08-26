@@ -58,24 +58,27 @@ async function main() {
 
   await pyodide.loadPackage("micropip");
 
-  // deps=False: this script's only job is to confirm the WHEEL ITSELF (its
-  // dist-info/RECORD/platform tag and the packaged .abi3.so) is genuinely
-  // installable and functional. Full dependency resolution (onnx, and its
-  // own transitive numpy/protobuf/ml_dtypes) is already covered by
-  // pyodide_smoke_test.mjs's Phase 2 -- duplicating that here would only
-  // slow this check down without adding new coverage.
+  // deps=True (the default): `onnxsim`'s pure-Python code (onnx_simplifier.py)
+  // imports numpy and onnx unconditionally at module level -- plain
+  // `import onnxsim` needs both, not just onnxsim.simplify(). deps=False was
+  // tried first and failed on exactly that ("ModuleNotFoundError: No module
+  // named 'numpy'"), confirming this isn't optional. Letting micropip
+  // resolve the wheel's own declared dependencies (onnx, rich, and onnx's
+  // own transitive numpy/protobuf/ml_dtypes) is also a better test than
+  // skipping it: it validates the wheel's METADATA declares them correctly,
+  // not just that the extension itself loads.
   try {
     await pyodide.runPythonAsync(`
 import micropip
-await micropip.install("emfs:${emfsPath}", deps=False)
+await micropip.install("emfs:${emfsPath}")
 `);
   } catch (e) {
     fail(
-      `micropip.install(the built wheel, deps=False) failed under Pyodide ` +
+      `micropip.install(the built wheel) failed under Pyodide ` +
         `${pyodide.version} (ABI epoch ${abiVersion}):\n${e.stack || e}`
     );
   }
-  console.log(`micropip.install(${whlName}, deps=False): OK`);
+  console.log(`micropip.install(${whlName}): OK`);
 
   const pythonCode = `
 import sys

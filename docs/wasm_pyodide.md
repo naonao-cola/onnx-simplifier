@@ -311,13 +311,14 @@ tag) instead of a broken one containing a static archive.
 
 The job verifies the actual wheel it produces, not just the loose `.so`:
 `scripts/pyodide_wheel_smoke_test.mjs` writes it into a real Pyodide
-0.29.4 runtime's virtual filesystem, `micropip.install("emfs:...",
-deps=False)`s it, imports the *installed* `onnxsim` from its real
-site-packages path, and calls `_list_optimizers()` to confirm it's
-genuinely functional. `deps=False` because this check's only job is the
-wheel itself -- full dependency resolution (`onnx` and its own transitive
-`numpy`/`protobuf`/`ml_dtypes`) is already covered by
-`pyodide_smoke_test.mjs`'s Phase 2 against the loose `.so`.
+0.29.4 runtime's virtual filesystem, `micropip.install("emfs:...")`s it
+(with the default `deps=True` -- `onnxsim`'s pure-Python code imports
+`numpy`/`onnx` unconditionally at module level, so even a plain `import
+onnxsim` needs them resolved, not just `onnxsim.simplify()`; this also
+exercises the wheel's own declared dependency metadata, not just the
+extension), imports the *installed* `onnxsim` from its real site-packages
+path, and calls `_list_optimizers()` to confirm it's genuinely
+functional.
 
 **Wired into the release flow, but as a best-effort addition, not a
 blocking one**: `build_wheel_pyodide` runs on `push`/`release`/
