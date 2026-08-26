@@ -50,16 +50,18 @@ def _matmul_model(weight, K, N, batch, opset=21):
 
 def _decode_int4(model):
     """Decodes the DequantizeLinear(Wq, Ws)-fed MatMul/Gemm's weight back
-    to a dense float array, straight from the initializer bytes -- same
-    approach as ``tests/test_adaround.py``'s own ``_dequantize_int4``, kept
-    independent of autoround.py's own math."""
-    wq = next(
-        t for t in model.graph.initializer if t.data_type == onnx.TensorProto.INT4
-    )
-    ws = next(
-        t for t in model.graph.initializer if t.data_type == onnx.TensorProto.FLOAT
-    )
+    to a dense float array, straight from the initializer bytes -- kept
+    independent of autoround.py's own math. Resolves Wq/Ws by the
+    DequantizeLinear node's actual inputs rather than by scanning for "the"
+    INT4/FLOAT initializer: quantize_weight_only_int4 leaves the original
+    float weight initializer in the graph too (now unused, since the
+    consuming node was rewired to the dequantized tensor), so a bare
+    "first FLOAT initializer" scan can silently grab that dead tensor
+    instead of the real (much smaller) per-block scale.
+    """
     dq_node = next(n for n in model.graph.node if n.op_type == "DequantizeLinear")
+    wq = next(t for t in model.graph.initializer if t.name == dq_node.input[0])
+    ws = next(t for t in model.graph.initializer if t.name == dq_node.input[1])
     block_size = next(a.i for a in dq_node.attribute if a.name == "block_size")
     axis = next((a.i for a in dq_node.attribute if a.name == "axis"), 1)
 
@@ -81,6 +83,14 @@ def _decode_int4(model):
     slicer[axis] = slice(0, codes.shape[axis])
     scale_full = scale_full[tuple(slicer)]
     return codes * scale_full
+
+
+def _scale_tensor(model):
+    """The real per-block scale initializer, resolved via the
+    DequantizeLinear node's own input -- see ``_decode_int4``'s docstring
+    for why a bare "the FLOAT initializer" scan is wrong here."""
+    dq_node = next(n for n in model.graph.node if n.op_type == "DequantizeLinear")
+    return next(t for t in model.graph.initializer if t.name == dq_node.input[1])
 
 
 def _outlier_block_weight(
@@ -197,36 +207,18 @@ def test_autoround_changes_scale_unlike_adaround():
     rng = np.random.default_rng(11)
     calibration_data = [{"X": rng.standard_normal((batch, K)).astype(np.float32)}]
 
-    before_scale = onnx.numpy_helper.to_array(
-        next(
-            t
-            for t in quant_model.graph.initializer
-            if t.data_type == onnx.TensorProto.FLOAT
-        )
-    )
+    before_scale = onnx.numpy_helper.to_array(_scale_tensor(quant_model))
 
     adaround_model = onnxsim.apply_adaround(
         float_model, quant_model, calibration_data=calibration_data, num_iterations=50
     )
-    after_ada_scale = onnx.numpy_helper.to_array(
-        next(
-            t
-            for t in adaround_model.graph.initializer
-            if t.data_type == onnx.TensorProto.FLOAT
-        )
-    )
+    after_ada_scale = onnx.numpy_helper.to_array(_scale_tensor(adaround_model))
     np.testing.assert_array_equal(before_scale, after_ada_scale)
 
     autoround_model = onnxsim.apply_autoround(
         float_model, quant_model, calibration_data=calibration_data, num_iterations=200
     )
-    after_auto_scale = onnx.numpy_helper.to_array(
-        next(
-            t
-            for t in autoround_model.graph.initializer
-            if t.data_type == onnx.TensorProto.FLOAT
-        )
-    )
+    after_auto_scale = onnx.numpy_helper.to_array(_scale_tensor(autoround_model))
     assert not np.allclose(before_scale, after_auto_scale)
 
 
