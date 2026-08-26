@@ -21,8 +21,10 @@ Usage:
     run_regression.py --slow-only --output slow.csv     # the known-slow models
     run_regression.py --shard 0 --num-shards 6 --output shard-0.csv \
         --profile-dir profiles   # + one ONNXSIM_PROFILE trace per model
-    run_regression.py --shard 0 --num-shards 6 --output shard-0.csv \
-        --profile-pass-phases-dir pass_phases   # + one per-pass timing table per model
+
+Every run also captures a per-model ONNXSIM_PROFILE_PASS_PHASES timing table
+into --profile-pass-phases-dir (default "pass_phases") unconditionally --
+pass an empty string to disable.
 """
 
 from __future__ import annotations
@@ -119,14 +121,16 @@ def main():
     )
     ap.add_argument(
         "--profile-pass-phases-dir",
-        default=None,
+        default="pass_phases",
         help="capture onnxsim's ONNXSIM_PROFILE_PASS_PHASES per-optimizer-pass "
         "match/modify timing table for each model into this directory (one "
         "<model>.pass_phases.txt per model), via worker.py's onnxsim runner. "
-        "Independent of --profile-dir: much cheaper (two chrono reads per node "
-        "match, no RSS sampler or trace write), so it's fine to turn on by "
-        "itself when investigating which optimizer pass dominates a specific "
-        "slow/regressed model (see bench/RESULTS_issue633_followup.md).",
+        "On unconditionally (unlike --profile-dir's heavier ONNXSIM_PROFILE "
+        "trace): it's just two chrono reads per node match, no RSS sampler or "
+        "trace write, negligible next to a model's simplify time -- and "
+        "without it there's no routine way to see which pass to optimize next "
+        "once the obvious bottlenecks are gone (see "
+        "bench/RESULTS_issue633_followup.md). Pass an empty string to disable.",
     )
     args = ap.parse_args()
 
