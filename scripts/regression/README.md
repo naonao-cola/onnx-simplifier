@@ -103,10 +103,14 @@ onnxslim's per-model work when you only care about its robustness and node count
 `run_regression.py --profile-dir DIR` (or the Model Regression workflow's
 `profile` `workflow_dispatch` input) captures onnxsim's built-in
 `ONNXSIM_PROFILE` trace for every model in that run, one `<model>.json` in
-`DIR` per model. It's off by default: a per-model trace adds a background
-RSS-sampler thread and a trace write onnxsim otherwise skips, overhead not
-worth paying on every scheduled run when nothing's wrong -- turn it on when
-investigating a specific slow or regressed run, not routinely.
+`DIR` per model. It adds a background RSS-sampler thread and a trace write
+onnxsim otherwise skips -- overhead that measures low next to onnxslim's own
+per-model cost (compare a `profile: true` and a `profile: false`
+`workflow_dispatch` run), so the workflow's `profile` input defaults to
+`true` for a manual run; pass `profile: false` to skip it for that run. The
+weekly schedule never sets `workflow_dispatch` inputs at all, so scheduled
+runs stay unprofiled regardless. `--profile-dir` itself still defaults to
+off when calling `run_regression.py` directly.
 
 ```bash
 # one shard, with a profile trace per model
@@ -120,7 +124,7 @@ python scripts/regression/run_regression.py --shard 0 --num-shards 6 \
 python scripts/regression/summarize_profiles.py "profiles/*.json" --csv shard-0.csv
 ```
 
-On the workflow, set `profile: true` on a manual `workflow_dispatch` run;
+On the workflow, a manual `workflow_dispatch` run captures it by default;
 `regression-profiles-shard-N` / `regression-profiles-slow` artifacts hold the
 raw traces (open one in `chrome://tracing` or `ui.perfetto.dev` for the full
 flame graph) and a `profile-summary` artifact holds the merged Markdown report.

@@ -17,9 +17,12 @@ name: Model Regression
 #
 # The `profile` workflow_dispatch input opts a run into capturing onnxsim's
 # ONNXSIM_PROFILE trace for every model (uploaded per-shard, then merged into a
-# `profile-summary` artifact by the summary job) -- off by default, since it
-# adds per-model overhead nobody wants paid on the routine scheduled run; turn
-# it on when investigating a specific slow/regressed run.
+# `profile-summary` artifact by the summary job) -- on by default for a manual
+# run, since comparing profiled vs. unprofiled workflow_dispatch runs found
+# its overhead low next to onnxslim's own per-model cost; the weekly schedule
+# never sets workflow_dispatch inputs at all, so scheduled runs stay
+# unprofiled regardless of this default. Pass `profile: false` to opt out of
+# a specific manual run.
 #
 # The finer-grained sibling, onnxsim's ONNXSIM_PROFILE_PASS_PHASES
 # per-optimizer-pass match/modify timing table, is captured on every run
@@ -48,8 +51,8 @@ on:
         default: true
         type: boolean
       profile:
-        description: "Capture an ONNXSIM_PROFILE trace per model (uploaded as an artifact). Adds overhead (a background RSS sampler + a trace write per model) -- use for investigating a specific slow/regressed run, not routinely."
-        default: false
+        description: "Capture an ONNXSIM_PROFILE trace per model (uploaded as an artifact). Adds overhead (a background RSS sampler + a trace write per model), but that overhead measures low next to onnxslim's own per-model cost -- on by default for a manual run; set false to skip it."
+        default: true
         type: boolean
   pull_request:
     # Validate the harness itself whenever it changes.
