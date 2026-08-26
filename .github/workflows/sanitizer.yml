@@ -8,6 +8,10 @@ on:
   pull_request:
   workflow_dispatch:
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   # A single instrumented build that runs AddressSanitizer and the alignment
   # UndefinedBehaviorSanitizer check together over the whole dependency tree

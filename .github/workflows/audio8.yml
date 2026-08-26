@@ -30,6 +30,10 @@ on:
     - cron: '0 9 * * 1'  # weekly, Monday 09:00 UTC
   workflow_dispatch:
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   audio8:
     name: Audio8 (Hugging Face) -> onnxsim
