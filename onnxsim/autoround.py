@@ -59,8 +59,8 @@ import onnx.numpy_helper
 
 from onnxsim import backend
 from onnxsim.adaround import (
-    _ZETA,
     _GAMMA,
+    _ZETA,
     _find_int4_matmul_candidates,
     _h_and_dhdv,
     _optimize_rounding,

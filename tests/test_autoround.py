@@ -53,8 +53,12 @@ def _decode_int4(model):
     to a dense float array, straight from the initializer bytes -- same
     approach as ``tests/test_adaround.py``'s own ``_dequantize_int4``, kept
     independent of autoround.py's own math."""
-    wq = next(t for t in model.graph.initializer if t.data_type == onnx.TensorProto.INT4)
-    ws = next(t for t in model.graph.initializer if t.data_type == onnx.TensorProto.FLOAT)
+    wq = next(
+        t for t in model.graph.initializer if t.data_type == onnx.TensorProto.INT4
+    )
+    ws = next(
+        t for t in model.graph.initializer if t.data_type == onnx.TensorProto.FLOAT
+    )
     dq_node = next(n for n in model.graph.node if n.op_type == "DequantizeLinear")
     block_size = next(a.i for a in dq_node.attribute if a.name == "block_size")
     axis = next((a.i for a in dq_node.attribute if a.name == "axis"), 1)
@@ -79,7 +83,9 @@ def _decode_int4(model):
     return codes * scale_full
 
 
-def _outlier_block_weight(K=32, N=4, seed=0, main_std=0.1, n_outliers=1, outlier_mag=3.0):
+def _outlier_block_weight(
+    K=32, N=4, seed=0, main_std=0.1, n_outliers=1, outlier_mag=3.0
+):
     """One 32-wide (single-block) weight matrix per output channel: most
     elements are small (``main_std``) and one or a few are a moderate
     outlier (``outlier_mag``). A fixed, abs-max-derived scale is set by the
@@ -147,23 +153,39 @@ def test_autoround_never_worse_than_adaround_across_seeds():
         weight = _outlier_block_weight(K=K, N=N, seed=seed)
         float_model = _matmul_model(weight, K, N, batch)
         quant_model = onnxsim.quantize_weight_only_int4(float_model)
-        x = np.random.default_rng(seed + 1).standard_normal((batch, K)).astype(np.float32)
+        x = (
+            np.random.default_rng(seed + 1)
+            .standard_normal((batch, K))
+            .astype(np.float32)
+        )
         calibration_data = [{"X": x}]
 
         w_float = weight.astype(np.float64)
         y_float = x.astype(np.float64) @ w_float
 
         adaround_model = onnxsim.apply_adaround(
-            float_model, quant_model, calibration_data=calibration_data, num_iterations=200
+            float_model,
+            quant_model,
+            calibration_data=calibration_data,
+            num_iterations=200,
         )
-        ada_err = np.linalg.norm(y_float - x.astype(np.float64) @ _decode_int4(adaround_model))
+        ada_err = np.linalg.norm(
+            y_float - x.astype(np.float64) @ _decode_int4(adaround_model)
+        )
 
         autoround_model = onnxsim.apply_autoround(
-            float_model, quant_model, calibration_data=calibration_data, num_iterations=200
+            float_model,
+            quant_model,
+            calibration_data=calibration_data,
+            num_iterations=200,
         )
-        auto_err = np.linalg.norm(y_float - x.astype(np.float64) @ _decode_int4(autoround_model))
+        auto_err = np.linalg.norm(
+            y_float - x.astype(np.float64) @ _decode_int4(autoround_model)
+        )
 
-        assert auto_err <= ada_err + 1e-6, f"seed={seed}: autoround regressed vs. adaround"
+        assert auto_err <= ada_err + 1e-6, (
+            f"seed={seed}: autoround regressed vs. adaround"
+        )
 
 
 def test_autoround_changes_scale_unlike_adaround():
@@ -176,14 +198,22 @@ def test_autoround_changes_scale_unlike_adaround():
     calibration_data = [{"X": rng.standard_normal((batch, K)).astype(np.float32)}]
 
     before_scale = onnx.numpy_helper.to_array(
-        next(t for t in quant_model.graph.initializer if t.data_type == onnx.TensorProto.FLOAT)
+        next(
+            t
+            for t in quant_model.graph.initializer
+            if t.data_type == onnx.TensorProto.FLOAT
+        )
     )
 
     adaround_model = onnxsim.apply_adaround(
         float_model, quant_model, calibration_data=calibration_data, num_iterations=50
     )
     after_ada_scale = onnx.numpy_helper.to_array(
-        next(t for t in adaround_model.graph.initializer if t.data_type == onnx.TensorProto.FLOAT)
+        next(
+            t
+            for t in adaround_model.graph.initializer
+            if t.data_type == onnx.TensorProto.FLOAT
+        )
     )
     np.testing.assert_array_equal(before_scale, after_ada_scale)
 
@@ -191,7 +221,11 @@ def test_autoround_changes_scale_unlike_adaround():
         float_model, quant_model, calibration_data=calibration_data, num_iterations=200
     )
     after_auto_scale = onnx.numpy_helper.to_array(
-        next(t for t in autoround_model.graph.initializer if t.data_type == onnx.TensorProto.FLOAT)
+        next(
+            t
+            for t in autoround_model.graph.initializer
+            if t.data_type == onnx.TensorProto.FLOAT
+        )
     )
     assert not np.allclose(before_scale, after_auto_scale)
 
@@ -211,7 +245,11 @@ def test_autoround_codes_stay_in_range_and_output_finite():
     )
     onnx.checker.check_model(autoround_model)
 
-    wq = next(t for t in autoround_model.graph.initializer if t.data_type == onnx.TensorProto.INT4)
+    wq = next(
+        t
+        for t in autoround_model.graph.initializer
+        if t.data_type == onnx.TensorProto.INT4
+    )
     numel = int(np.prod(list(wq.dims)))
     raw = np.frombuffer(wq.raw_data, dtype=np.uint8)
     lo = (raw & 0x0F).astype(np.int8)
