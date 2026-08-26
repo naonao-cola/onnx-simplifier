@@ -57,7 +57,15 @@ def _write_safetensors_like_onnx_safetensors(path, arrays):
     blobs = []
     cursor = 0
     for name, arr in arrays.items():
-        raw = arr.tobytes()
+        # Both safetensors and ONNX's raw_data/external_data are defined as
+        # little-endian on disk regardless of host byte order (see
+        # onnxsim/passes/endian_read.h's doc comment) -- `arr.tobytes()` would
+        # instead serialize in the host's native order, which is only
+        # correct by coincidence on little-endian hosts and produces
+        # byte-swapped garbage once a spec-compliant reader (onnx's own
+        # numpy_helper.to_array, or onnxsim's C++ loader) interprets it on a
+        # big-endian one.
+        raw = arr.astype(arr.dtype.newbyteorder("<")).tobytes()
         header[name] = {
             "dtype": _NUMPY_DTYPE_TO_SAFETENSORS[arr.dtype],
             "shape": list(arr.shape),
