@@ -29,6 +29,10 @@ name: Model Regression
 # finding which single pass (e.g. extract_constant_to_initializer) dominates a
 # slow model means re-running with profiling after the fact instead of just
 # reading the last scheduled run. See scripts/regression/README.md#profiling.
+# summarize_pass_phases.py aggregates those same tables into a "where to
+# optimize next" hint (top passes by summed cost, slowest models, the
+# CSETensorHash/CSETensorCompare breakdown) written straight to the Actions
+# UI's Summary tab -- see that step in the `summary` job below.
 
 on:
   schedule:
@@ -333,6 +337,30 @@ jobs:
         with:
           name: profile-pass-phases
           path: pass-phase-profiles.md
+          if-no-files-found: ignore
+      # Unlike the raw digest above (every model's table, verbatim -- useful
+      # for a deep dive but not something anyone reads end to end),
+      # summarize_pass_phases.py aggregates across the whole run: which pass
+      # costs the most summed across models, which model(s) are the slowest,
+      # and the CSETensorHash/CSETensorCompare breakdown that's twice now
+      # been the actual next bottleneck once the top-ranked pass got fixed
+      # (onnxsim#717, #720). Written to $GITHUB_STEP_SUMMARY so it shows up
+      # directly in the Actions UI's Summary tab -- no log-digging or
+      # artifact download needed to see where to optimize next.
+      - name: Build pass-phase bottleneck summary
+        if: always()
+        continue-on-error: true
+        run: |
+          if find pass_phases -name '*.pass_phases.txt' -print -quit 2>/dev/null | grep -q .; then
+            python "$GITHUB_WORKSPACE/scripts/regression/summarize_pass_phases.py" "pass_phases/*.pass_phases.txt"
+          else
+            echo "no pass-phase tables present (unexpected -- every job captures them by default; check for an upstream failure)"
+          fi
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: pass-phase-bottleneck-summary
+          path: pass-phase-summary.md
           if-no-files-found: ignore
       - uses: actions/upload-artifact@v7
         if: always()
