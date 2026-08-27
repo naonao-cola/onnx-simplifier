@@ -68,6 +68,11 @@ from onnxsim.precision_estimator import (
     estimate_model_quantization_drop,
     estimate_quantization_precision,
 )
+from onnxsim.pruning import (
+    apply_magnitude_pruning,
+    apply_wanda_pruning,
+    weight_sparsity,
+)
 from onnxsim.quip_sharp import apply_quip_sharp
 from onnxsim.smoothquant import apply_smoothquant
 from onnxsim.squeezellm import quantize_weight_only_squeezellm
@@ -95,6 +100,9 @@ __all__ = [
     "apply_llm_int8",
     "apply_low_rank_compensation",
     "apply_quip_sharp",
+    "apply_magnitude_pruning",
+    "apply_wanda_pruning",
+    "weight_sparsity",
     "workaround_ort_matmul_nbits_axis0_bug",
     "quantize_attention_dynamic",
     "quantize_dynamic",
