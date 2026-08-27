@@ -1,7 +1,8 @@
 // onnx-deploy: drive an optimum-onnx export directory's encoder/decoder(-with-past)
-// ONNX files through a greedy autoregressive generate() loop, in plain C++
-// via onnx_deploy::KvCachePipeline. No tokenizer -- pass/receive token ids
-// directly (get them from transformers.AutoTokenizer separately). See
+// ONNX files through a greedy autoregressive generate() loop, in plain C++,
+// via the onnx_deploy C ABI (onnx_deploy_c_api.h) -- the same swappable-libort
+// interface any other language would use. No tokenizer -- pass/receive token
+// ids directly (get them from transformers.AutoTokenizer separately). See
 // ../README.md for the design and its scope.
 
 #include <cstdio>
@@ -10,11 +11,12 @@
 #include <string>
 #include <vector>
 
-#include "onnx_deploy/kv_cache_pipeline.h"
+#include "onnx_deploy/onnx_deploy_c_api.h"
 
 namespace {
 
 struct Args {
+  std::string libort_path;
   std::string model_dir;
   std::vector<int64_t> input_ids;
   int64_t max_new_tokens = 32;
@@ -24,8 +26,11 @@ struct Args {
 
 [[noreturn]] void Usage(const char* prog) {
   std::fprintf(stderr,
-      "usage: %s <export_dir> <id1,id2,...> [--max-new-tokens N]\n"
+      "usage: %s --libort PATH <export_dir> <id1,id2,...> [--max-new-tokens N]\n"
       "          [--eos-token-id N] [--decoder-start-token-id N]\n\n"
+      "--libort PATH points at the libonnxruntime shared library to load at\n"
+      "runtime (e.g. an extracted onnxruntime-linux-x64-*.tgz's lib/libonnxruntime.so) --\n"
+      "any build works, nothing about this tool is compiled against a specific one.\n\n"
       "<export_dir> must contain decoder_model.onnx + decoder_with_past_model.onnx\n"
       "(and encoder_model.onnx for seq2seq models) -- the optimum-onnx\n"
       "no_post_process=True export shape. <id1,id2,...> are token ids (from a\n"
@@ -43,28 +48,38 @@ std::vector<int64_t> ParseIds(const std::string& csv) {
 }
 
 Args ParseArgs(int argc, char** argv) {
-  if (argc < 3) Usage(argv[0]);
   Args a;
-  a.model_dir = argv[1];
-  a.input_ids = ParseIds(argv[2]);
+  std::vector<std::string> positional;
 
   auto need = [&](int& i) -> std::string {
     if (i + 1 >= argc) Usage(argv[0]);
     return argv[++i];
   };
-  for (int i = 3; i < argc; ++i) {
+  for (int i = 1; i < argc; ++i) {
     std::string arg = argv[i];
-    if (arg == "--max-new-tokens") a.max_new_tokens = std::stoll(need(i));
+    if (arg == "--libort") a.libort_path = need(i);
+    else if (arg == "--max-new-tokens") a.max_new_tokens = std::stoll(need(i));
     else if (arg == "--eos-token-id") a.eos_token_id = std::stoll(need(i));
     else if (arg == "--decoder-start-token-id") a.decoder_start_token_id = std::stoll(need(i));
     else if (arg == "-h" || arg == "--help") Usage(argv[0]);
-    else {
+    else if (!arg.empty() && arg[0] == '-') {
       std::fprintf(stderr, "unknown argument: %s\n", arg.c_str());
       Usage(argv[0]);
+    } else {
+      positional.push_back(arg);
     }
   }
+  if (a.libort_path.empty() || positional.size() != 2) Usage(argv[0]);
+  a.model_dir = positional[0];
+  a.input_ids = ParseIds(positional[1]);
   if (a.input_ids.empty()) Usage(argv[0]);
   return a;
+}
+
+[[noreturn]] void Die(const char* what, char* err) {
+  std::fprintf(stderr, "error: %s: %s\n", what, err ? err : "(no message)");
+  onnx_deploy_free_string(err);
+  std::exit(1);
 }
 
 }  // namespace
@@ -72,27 +87,29 @@ Args ParseArgs(int argc, char** argv) {
 int main(int argc, char** argv) {
   Args args = ParseArgs(argc, argv);
 
-  Ort::Env env(ORT_LOGGING_LEVEL_WARNING, "onnx-deploy");
+  char* err = nullptr;
+  if (onnx_deploy_load_ort(args.libort_path.c_str(), &err) != ONNX_DEPLOY_OK) Die("onnx_deploy_load_ort", err);
 
-  try {
-    onnx_deploy::KvCachePipeline pipeline(env, args.model_dir);
-    std::printf("loaded %s pipeline from %s\n", pipeline.is_seq2seq() ? "seq2seq" : "decoder-only",
-                args.model_dir.c_str());
+  OnnxDeployPipeline* pipeline = onnx_deploy_create(args.model_dir.c_str(), &err);
+  if (!pipeline) Die("onnx_deploy_create", err);
+  std::printf("loaded %s pipeline from %s (via %s)\n", onnx_deploy_is_seq2seq(pipeline) ? "seq2seq" : "decoder-only",
+              args.model_dir.c_str(), args.libort_path.c_str());
 
-    onnx_deploy::GenerationConfig config;
-    config.max_new_tokens = args.max_new_tokens;
-    config.eos_token_id = args.eos_token_id;
-    config.decoder_start_token_id = args.decoder_start_token_id;
-
-    std::vector<int64_t> generated = pipeline.Generate(args.input_ids, config);
-
-    std::printf("generated %zu token(s):", generated.size());
-    for (int64_t id : generated) std::printf(" %lld", static_cast<long long>(id));
-    std::printf("\n");
-  } catch (const std::exception& e) {
-    std::fprintf(stderr, "error: %s\n", e.what());
-    return 1;
+  int64_t* out_ids = nullptr;
+  size_t out_count = 0;
+  OnnxDeployStatus status =
+      onnx_deploy_generate(pipeline, args.input_ids.data(), args.input_ids.size(), args.max_new_tokens,
+                            args.eos_token_id, args.decoder_start_token_id, &out_ids, &out_count, &err);
+  if (status != ONNX_DEPLOY_OK) {
+    onnx_deploy_destroy(pipeline);
+    Die("onnx_deploy_generate", err);
   }
 
+  std::printf("generated %zu token(s):", out_count);
+  for (size_t i = 0; i < out_count; ++i) std::printf(" %lld", static_cast<long long>(out_ids[i]));
+  std::printf("\n");
+
+  onnx_deploy_free_ids(out_ids);
+  onnx_deploy_destroy(pipeline);
   return 0;
 }
