@@ -741,6 +741,53 @@ def test_if_with_const_cond_is_folded():
     assert out.tolist() == [1.0, 2.0]
 
 
+def test_loop_with_const_trip_count_is_unrolled():
+    # A `Loop` with a compile-time-constant trip count and no break condition
+    # -- the shape emitted for a plain Python `for i in range(N): ...` with no
+    # `break` -- is unrolled into N copies of its body by the onnxoptimizer
+    # "eliminate_loop_with_const_trip_count" pass. This matters for
+    # downstream compilers that don't support `Loop` at all (e.g. TVM's Relax
+    # ONNX frontend, see docs/dlpack-executor.md).
+    step = helper.make_tensor("step", TensorProto.FLOAT, [2], [1.0, 1.0])
+    body = helper.make_graph(
+        [helper.make_node("Add", ["v_in", "step"], ["v_out"])],
+        "loop_body",
+        [
+            helper.make_tensor_value_info("iter", TensorProto.INT64, []),
+            helper.make_tensor_value_info("cond_in", TensorProto.BOOL, []),
+            helper.make_tensor_value_info("v_in", TensorProto.FLOAT, [2]),
+        ],
+        [
+            # cond_out: a direct passthrough of cond_in (never actually
+            # computed, since the outer Loop's `cond` input is omitted below).
+            helper.make_tensor_value_info("cond_in", TensorProto.BOOL, []),
+            helper.make_tensor_value_info("v_out", TensorProto.FLOAT, [2]),
+        ],
+        [step],
+    )
+    trip_count = helper.make_tensor("trip_count", TensorProto.INT64, [], [3])
+    loop_node = helper.make_node(
+        "Loop", ["trip_count", "", "x"], ["y"], body=body
+    )
+    graph = helper.make_graph(
+        [loop_node],
+        "g",
+        [helper.make_tensor_value_info("x", TensorProto.FLOAT, [2])],
+        [helper.make_tensor_value_info("y", TensorProto.FLOAT, [2])],
+        [trip_count],
+    )
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+    onnx.checker.check_model(model)
+
+    sim_model, check_ok = onnxsim.simplify(model)
+    assert check_ok
+    onnx.checker.check_model(sim_model)
+    # The Loop must be gone, unrolled into three Adds (onnxsim's own constant
+    # folding may further fuse/fold these, so check for absence of Loop
+    # rather than an exact Add count).
+    assert all(n.op_type != "Loop" for n in sim_model.graph.node)
+
+
 def test_ir3_conv_bn_fuses():
     # IR version 3 models (e.g. the opset-8 ``resnet101-v1-7``) list every
     # initializer as a graph input too, which is required before IR 4. onnxsim
