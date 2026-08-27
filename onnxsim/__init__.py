@@ -62,6 +62,7 @@ from onnxsim.onnx_simplifier import (
     read_gguf_metadata,
     simplify,
 )
+from onnxsim.ort_matmul_nbits_workaround import workaround_ort_matmul_nbits_axis0_bug
 from onnxsim.precision_estimator import (
     ModelQuantizationEstimate,
     estimate_model_quantization_drop,
@@ -92,6 +93,7 @@ __all__ = [
     "apply_smoothquant",
     "apply_llm_int8",
     "apply_low_rank_compensation",
+    "workaround_ort_matmul_nbits_axis0_bug",
     "quantize_attention_dynamic",
     "quantize_dynamic",
     "quantize_dynamic_matmul_integer_to_float",

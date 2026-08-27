@@ -94,24 +94,17 @@ def test_lorc_higher_rank_never_increases_error():
     assert all(errors[i] >= errors[i + 1] - 1e-6 for i in range(len(errors) - 1))
 
 
-@pytest.mark.xfail(
-    reason=(
-        "Not a bug in apply_low_rank_compensation: onnxruntime 1.29.0's "
-        "default graph optimization level (>= ORT_ENABLE_EXTENDED) "
-        "silently miscomputes axis=0 block-quantized DequantizeLinear "
-        "feeding a plain (non-transposed) MatMul, independent of this "
-        "module -- reproduces on quantize_weight_only_int4's own output "
-        "with no LoRC correction involved at all, and disappears with "
-        "graph optimizations disabled or on the axis=1 (Gemm transB=1) "
-        "path. See the PR discussion for the full repro."
-    ),
-    strict=False,
-)
 def test_lorc_exact_at_full_rank():
     # rank = min(K, N) recovers the residual exactly, so the compensated
     # layer should reproduce the float model almost exactly (up to
-    # fp32/SVD numerical precision) -- true when run with graph
-    # optimizations disabled; see the xfail reason above.
+    # fp32/SVD numerical precision). Requires
+    # workaround_ort_matmul_nbits_axis0_bug: onnxruntime 1.29.0's default
+    # graph optimization level otherwise silently miscomputes axis=0
+    # block-quantized DequantizeLinear feeding a plain (non-transposed)
+    # MatMul -- a bug in quantize_weight_only_int4's own output, not in
+    # apply_low_rank_compensation, but one this exact-reconstruction
+    # property is precise enough to notice (see
+    # onnxsim/ort_matmul_nbits_workaround.py's own docstring).
     K, N = 32, 16
     model = _matmul_model(K=K, N=N, seed=4)
     quant = onnxsim.quantize_weight_only_int4(model)
@@ -119,8 +112,9 @@ def test_lorc_exact_at_full_rank():
     x = rng.standard_normal((16, K)).astype(np.float32)
 
     lorc_model = onnxsim.apply_low_rank_compensation(model, quant, rank=min(K, N))
+    fixed = onnxsim.workaround_ort_matmul_nbits_axis0_bug(lorc_model)
     (float_y,) = _run(model, {"X": x})
-    (lorc_y,) = _run(lorc_model, {"X": x})
+    (lorc_y,) = _run(fixed, {"X": x})
     assert _rel_l2(float_y, lorc_y) < 1e-4
 
 
