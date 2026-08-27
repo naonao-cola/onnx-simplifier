@@ -2685,14 +2685,21 @@ def main():
             onnx.save(model_opt, args.output_model)
         else:
             raise ValueError("save_as_external_data")
-    except ValueError:
+    except (ValueError, EncodeError):
         # large models (>2GB) which onnx.save doesn't support,
         # or explicitly specified --save-as-external-data
         external_data_path = os.path.basename(args.output_model) + ".data"
         if os.path.exists(external_data_path):
             os.remove(external_data_path)
+        # Mutate ``model_opt`` in place (no deepcopy): ``save_as_external_data=True``
+        # moves each initializer's raw_data out to the external file, so the same
+        # object is left with external references instead of inline bytes. That
+        # matters below: model_info re-serializes ``model_opt`` to report size/diff,
+        # which would otherwise hit this same >2GB EncodeError on the very model we
+        # just went out of our way to save. main() doesn't need the inline-data
+        # version of model_opt again after this point.
         onnx.save(
-            copy.deepcopy(model_opt),
+            model_opt,
             args.output_model,
             save_as_external_data=True,
             all_tensors_to_one_file=True,
