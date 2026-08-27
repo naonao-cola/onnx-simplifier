@@ -163,7 +163,7 @@ jobs:
           set -e
           [ "$code" -eq 1 ]
 
-      - name: Execution-provider selection: cuda fails cleanly without a CUDA-enabled ORT build/GPU (this runner has neither)
+      - name: Execution-provider selection (cuda) fails cleanly without a CUDA-enabled ORT build/GPU (this runner has neither)
         working-directory: tools/onnx-deploy
         run: |
           set +e
@@ -180,7 +180,7 @@ jobs:
           set -e
           [ "$code" -eq 1 ]
 
-      - name: Execution-provider selection: webgpu (ORT's native EP, not onnxruntime-web's) also fails cleanly without a WebGPU-enabled ORT build/GPU
+      - name: Execution-provider selection (webgpu, ORT's native EP, not onnxruntime-web's) also fails cleanly without a WebGPU-enabled ORT build/GPU
         working-directory: tools/onnx-deploy
         run: |
           set +e
