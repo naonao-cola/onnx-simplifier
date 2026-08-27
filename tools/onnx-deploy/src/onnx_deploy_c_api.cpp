@@ -93,18 +93,34 @@ extern "C" OnnxDeployStatus onnx_deploy_load_ort(const char* libort_path, char**
 struct OnnxDeployPipeline {
   Ort::Env env;
   onnx_deploy::KvCachePipeline pipeline;
-  explicit OnnxDeployPipeline(const std::string& model_dir)
-      : env(ORT_LOGGING_LEVEL_WARNING, "onnx-deploy"), pipeline(env, model_dir) {}
+  OnnxDeployPipeline(const std::string& model_dir, const onnx_deploy::PipelineOptions& pipeline_options)
+      : env(ORT_LOGGING_LEVEL_WARNING, "onnx-deploy"), pipeline(env, model_dir, pipeline_options) {}
 };
 
 extern "C" OnnxDeployPipeline* onnx_deploy_create(const char* model_dir, char** out_error) {
+  return onnx_deploy_create_ex(model_dir, "cpu", 0, out_error);
+}
+
+extern "C" OnnxDeployPipeline* onnx_deploy_create_ex(const char* model_dir, const char* execution_provider,
+                                                      int cuda_device_id, char** out_error) {
   try {
-    return new OnnxDeployPipeline(model_dir ? model_dir : "");
+    onnx_deploy::PipelineOptions pipeline_options;
+    std::string ep = execution_provider ? execution_provider : "cpu";
+    if (ep == "cpu") {
+      pipeline_options.execution_provider = onnx_deploy::PipelineOptions::ExecutionProvider::kCpu;
+    } else if (ep == "cuda") {
+      pipeline_options.execution_provider = onnx_deploy::PipelineOptions::ExecutionProvider::kCuda;
+      pipeline_options.cuda_device_id = cuda_device_id;
+    } else {
+      SetError(out_error, "onnx_deploy_create_ex: unknown execution_provider '" + ep + "' (expected \"cpu\" or \"cuda\")");
+      return nullptr;
+    }
+    return new OnnxDeployPipeline(model_dir ? model_dir : "", pipeline_options);
   } catch (const std::exception& e) {
     SetError(out_error, e.what());
     return nullptr;
   } catch (...) {
-    SetError(out_error, "unknown error in onnx_deploy_create");
+    SetError(out_error, "unknown error in onnx_deploy_create_ex");
     return nullptr;
   }
 }

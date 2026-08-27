@@ -203,6 +203,54 @@ if that's the real requirement.
 - **The merged `decoder_model_merged.onnx` shape** (see above).
 - **Weight obfuscation/encryption** (see previous section).
 
+## Execution providers (accelerators)
+
+By default every layer runs on CPU (ORT's built-in CPU EP natively, the
+`wasm`/CPU backend in onnxruntime-web). Both native and WASM also support
+selecting an accelerator, threaded through the same swappable-libort design
+as everything else:
+
+- **Native, CUDA**: `onnx_deploy_create_ex(model_dir, "cuda", cuda_device_id, ...)`
+  (`onnx-deploy --execution-provider cuda --cuda-device-id N`; Python
+  `Pipeline(model_dir, execution_provider="cuda", cuda_device_id=N)`) calls
+  `Ort::SessionOptions::AppendExecutionProvider_CUDA`. This needs the
+  `--libort`/`load_ort()` target to actually be a CUDA-enabled ONNX Runtime
+  build (the plain CPU release tarballs this README's examples use are not;
+  a `-gpu-` release or a from-source `--use_cuda` build is) *and* a
+  CUDA-capable GPU/driver present at runtime -- neither is required at
+  **build** time by this library, same as the CPU case. If either is
+  missing, session creation fails with `ONNX_DEPLOY_ERROR` and ORT's own
+  error message (e.g. naming a missing `libonnxruntime_providers_*.so`, or
+  a CUDA driver error) -- not a crash.
+- **WASM, WebGPU**: `Module.generate(..., executionProviders)` where
+  `executionProviders` is a JS array like `["webgpu"]` (empty/omitted =
+  onnxruntime-web's own default). Requires the host to actually expose
+  `navigator.gpu` (a real WebGPU-capable browser, or a WebGPU-enabled Node
+  build -- plain Node does not have this). If it doesn't,
+  `ort.InferenceSession.create` fails and `generate()`'s returned Promise
+  rejects cleanly -- see the next paragraph for why that took more than
+  "just let the exception propagate."
+
+**What's actually verified vs. just implemented:** this sandbox has no GPU
+and no CUDA toolkit, and plain Node has no `navigator.gpu` -- so neither
+accelerated execution path has been run against real hardware. What *is*
+verified in CI (`.github/workflows/onnx-deploy.yml`, see "Verifying the
+flow" below): the CPU path is unaffected (regression-tested), and
+requesting `cuda`/`webgpu` where it's unavailable fails cleanly with a
+clear error rather than crashing -- a real, previously-broken behavior
+that testing this (not just implementing it) caught: an unhandled
+rejection crossing the WASM Asyncify boundary (see `CreateSession`/
+`RunSession` in `wasm/src/onnx_deploy_wasm.cpp`) was observed to crash the
+whole process instead of rejecting `generate()`'s Promise, no matter how
+carefully it was try/caught on either the JS or C++ side of that specific
+boundary. The fix: `Module.onnxDeployCreateSession`/`onnxDeployRunSession`
+never reject -- they resolve to `{ __onnxDeployError: message }` on
+failure (`wasm/test/ort_web_runtime.mjs`), which `onnx_deploy_wasm.cpp`
+checks for immediately after every `.await()` and turns into an ordinary,
+synchronously-thrown-and-caught C++ exception, entirely outside any
+Asyncify unwind. `wasm/test/run_test.mjs`'s WebGPU-unavailable case is
+exactly this, and is what actually caught the original crash.
+
 ## Building
 
 ```sh
@@ -243,6 +291,11 @@ checkout, on every change under `tools/onnx-deploy/`:
    process per ORT build).
 7. Checks that a bad model directory and a bad `--libort` path both fail
    cleanly (`ONNX_DEPLOY_ERROR` / exit 1 with a message), not a crash.
+8. Checks that `--execution-provider cuda` (no GPU/CUDA-enabled ORT build on
+   this runner) and an unknown provider name both fail cleanly the same way
+   -- see "Execution providers" above for what this does and doesn't prove.
+   The `wasm-verify` job's `run_test.mjs` run includes the equivalent
+   WebGPU-unavailable check for the WASM side.
 
 To reproduce locally: download any two ONNX Runtime releases from
 <https://github.com/microsoft/onnxruntime/releases> (`onnxruntime-linux-x64-*.tgz`
@@ -306,5 +359,7 @@ python3 ../scripts/make_toy_seq2seq.py -o /tmp/toy_seq2seq --vocab-size 7 --enco
 cd test && npm install && node run_test.mjs /tmp/toy_seq2seq
 # -> generate(max_new_tokens=8, eos=-1): [0, 1, 2, 3, 4, 5, 6, 0]
 #    generate(max_new_tokens=20, eos_token_id=6): [0, 1, 2, 3, 4, 5, 6]
+#    generate(execution_providers=["wasm"]): [0, 1, 2, 3, 4, 5, 6, 0]
+#    generate(execution_providers=["webgpu"]) correctly rejected (no navigator.gpu here): ...
 #    OK: onnx_deploy_wasm matches the native pipeline's expected output.
 ```

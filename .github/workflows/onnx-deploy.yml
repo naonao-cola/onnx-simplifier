@@ -16,6 +16,13 @@ name: onnx-deploy
 # that script's docstring for why the toy model's output is a direct
 # witness of the KV-cache threading being correct, not just "did it not
 # crash".
+#
+# Also checks execution-provider selection (--execution-provider cuda /
+# executionProviders: ["webgpu"]) fails cleanly on this GPU-less runner,
+# rather than crashing -- neither CUDA nor WebGPU acceleration is actually
+# exercised here (no GPU in CI), only that requesting them surfaces a clean
+# error instead of an uncaught exception/crash. See tools/onnx-deploy/README.md's
+# "Execution providers (accelerators)" section for what is and isn't verified.
 
 on:
   workflow_dispatch:
@@ -149,6 +156,23 @@ jobs:
           [ "$code" -eq 1 ]
           set +e
           ./build/onnx-deploy --libort /tmp/does-not-exist.so /tmp/toy_seq2seq 3,4
+          code=$?
+          set -e
+          [ "$code" -eq 1 ]
+
+      - name: Execution-provider selection: cuda fails cleanly without a CUDA-enabled ORT build/GPU (this runner has neither)
+        working-directory: tools/onnx-deploy
+        run: |
+          set +e
+          out=$(./build/onnx-deploy --libort "${{ env.ORT_OLDER_HOME }}/lib/libonnxruntime.so" /tmp/toy_seq2seq 3,4 --execution-provider cuda 2>&1)
+          code=$?
+          set -e
+          echo "$out"
+          [ "$code" -eq 1 ]
+          echo "$out" | grep -qi "provider"
+          # unknown provider name must also fail cleanly, not crash or silently ignore it
+          set +e
+          ./build/onnx-deploy --libort "${{ env.ORT_OLDER_HOME }}/lib/libonnxruntime.so" /tmp/toy_seq2seq 3,4 --execution-provider rocm
           code=$?
           set -e
           [ "$code" -eq 1 ]

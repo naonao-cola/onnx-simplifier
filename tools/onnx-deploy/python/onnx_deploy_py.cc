@@ -35,9 +35,10 @@ void LoadOrt(const std::string& libort_path) {
 
 class Pipeline {
  public:
-  explicit Pipeline(const std::string& model_dir) {
+  explicit Pipeline(const std::string& model_dir, const std::string& execution_provider = "cpu",
+                     int cuda_device_id = 0) {
     char* err = nullptr;
-    handle_ = onnx_deploy_create(model_dir.c_str(), &err);
+    handle_ = onnx_deploy_create_ex(model_dir.c_str(), execution_provider.c_str(), cuda_device_id, &err);
     if (!handle_) ThrowFromError("Pipeline", err);
   }
   ~Pipeline() { onnx_deploy_destroy(handle_); }
@@ -78,9 +79,13 @@ NB_MODULE(onnx_deploy_py, m) {
         "Pipeline.");
 
   nb::class_<Pipeline>(m, "Pipeline")
-      .def(nb::init<const std::string&>(), nb::arg("model_dir"),
+      .def(nb::init<const std::string&, const std::string&, int>(), nb::arg("model_dir"),
+           nb::arg("execution_provider") = "cpu", nb::arg("cuda_device_id") = 0,
            "Loads an optimum-onnx export directory (see ../README.md for the expected "
-           "file shape). load_ort() must have already succeeded.")
+           "file shape). load_ort() must have already succeeded. execution_provider is "
+           "\"cpu\" (default) or \"cuda\" -- \"cuda\" requires a CUDA-enabled ORT build "
+           "(loaded via load_ort()) and a CUDA-capable GPU; otherwise this raises with "
+           "ORT's own error, not a crash.")
       .def_prop_ro("is_seq2seq", &Pipeline::is_seq2seq)
       .def("generate", &Pipeline::generate, nb::arg("input_ids"), nb::arg("max_new_tokens") = 32,
            nb::arg("eos_token_id") = -1, nb::arg("decoder_start_token_id") = 0,

@@ -50,7 +50,36 @@ struct GenerationConfig {
   int64_t max_new_tokens = 32;
 };
 
+// Which execution provider every session in a KvCachePipeline runs on.
+// Defaults to ORT's built-in CPU EP (no explicit provider needed). "cuda"
+// calls Ort::SessionOptions::AppendExecutionProvider_CUDA -- this only
+// works if the libonnxruntime onnx_deploy_load_ort() loaded was actually
+// *built* with CUDA EP support (the official CPU-only release tarballs are
+// not; a GPU build, e.g. onnxruntime-linux-x64-gpu-*.tgz, is), and if a
+// CUDA-capable GPU/driver/toolkit is present at runtime. Neither is baked
+// into this header or its build -- exactly the same "swap by pointing at a
+// different libort" story as the rest of this library, just choosing a
+// GPU-capable one. If the loaded libort lacks CUDA support, or no GPU is
+// available, session construction throws Ort::Exception with ORT's own
+// message (e.g. "...providers_cuda... not found" or a CUDA driver error),
+// which propagates as a normal onnx_deploy_create failure -- not a crash.
+struct PipelineOptions {
+  enum class ExecutionProvider { kCpu, kCuda };
+  ExecutionProvider execution_provider = ExecutionProvider::kCpu;
+  int cuda_device_id = 0;
+};
+
 namespace detail {
+
+inline Ort::SessionOptions BuildSessionOptions(const PipelineOptions& options) {
+  Ort::SessionOptions session_options;
+  if (options.execution_provider == PipelineOptions::ExecutionProvider::kCuda) {
+    OrtCUDAProviderOptions cuda_options{};
+    cuda_options.device_id = options.cuda_device_id;
+    session_options.AppendExecutionProvider_CUDA(cuda_options);
+  }
+  return session_options;
+}
 
 #if defined(_WIN32)
 inline std::wstring ToOrtPath(const std::string& s) {
@@ -117,13 +146,16 @@ class KvCachePipeline {
   // model_dir must contain decoder_model.onnx + decoder_with_past_model.onnx
   // (the `no_post_process=True` export shape -- see README.md for why the
   // merged decoder_model_merged.onnx shape isn't supported here), plus
-  // encoder_model.onnx if this is a seq2seq export.
-  KvCachePipeline(Ort::Env& env, const std::string& model_dir) : env_(env) {
+  // encoder_model.onnx if this is a seq2seq export. `pipeline_options`
+  // selects the execution provider every session runs on (default: CPU) --
+  // see PipelineOptions above.
+  KvCachePipeline(Ort::Env& env, const std::string& model_dir, const PipelineOptions& pipeline_options = {})
+      : env_(env) {
     namespace fs = std::filesystem;
     auto load = [&](const std::string& filename) -> std::unique_ptr<Ort::Session> {
       fs::path p = fs::path(model_dir) / filename;
       if (!fs::exists(p)) return nullptr;
-      Ort::SessionOptions options;
+      Ort::SessionOptions options = detail::BuildSessionOptions(pipeline_options);
       return std::make_unique<Ort::Session>(env_, detail::ToOrtPath(p.string()).c_str(), options);
     };
 
