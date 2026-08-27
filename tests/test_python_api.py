@@ -293,6 +293,92 @@ def test_model_larger_than_2gb():
     assert sim_model.graph.node[0].op_type == "Add"
 
 
+def test_cli_large_model_save_fallback_mutates_in_place():
+    # Regression test for the CLI's >2GB save fallback in onnx_simplifier.main()
+    # (GitHub PR #730), reproduced exporting a real multi-gigabyte TTS model. Two
+    # distinct bugs lived in the same try/except:
+    #
+    # 1. onnx.save() raises google.protobuf.message.EncodeError (not ValueError)
+    #    once the serialized proto exceeds 2GB, so the external-data fallback
+    #    never triggered and the crash propagated straight out of main().
+    # 2. The fallback used to save a deepcopy of model_opt as external data while
+    #    leaving the original model_opt (with data still inline) around for the
+    #    subsequent model_info diff-printing step, which re-serializes model_opt
+    #    and would hit that same EncodeError on the very model just saved.
+    #
+    # Both are exercised here without needing an actual >2GB fixture: onnx.save
+    # is mocked to raise EncodeError on its first call (matching the real >2GB
+    # failure mode), and model_info.print_simplifying_info is wrapped to capture
+    # the exact model_opt object it receives so its data_location can be
+    # inspected afterward.
+    import sys
+
+    from google.protobuf.message import EncodeError
+
+    from onnxsim import model_info, onnx_simplifier
+
+    # A weight large enough (4 MiB) to actually be moved to external storage --
+    # onnx.save's external-data conversion leaves tensors below its size
+    # threshold inline regardless of save_as_external_data, which would make
+    # the data_location assertion below meaningless.
+    x = onnx.helper.make_tensor_value_info("x", onnx.TensorProto.FLOAT, [4, 1024])
+    y = onnx.helper.make_tensor_value_info("y", onnx.TensorProto.FLOAT, [4, 1024])
+    w = onnx.numpy_helper.from_array(
+        np.random.rand(1024, 1024).astype(np.float32), name="w"
+    )
+    node = onnx.helper.make_node("MatMul", ["x", "w"], ["y"])
+    model = onnx.helper.make_model(
+        onnx.helper.make_graph([node], "g", [x], [y], [w]),
+        opset_imports=[onnx.helper.make_opsetid("", 17)],
+    )
+    onnx.checker.check_model(model)
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        input_path = os.path.join(tmpdir, "in.onnx")
+        output_path = os.path.join(tmpdir, "out.onnx")
+        onnx.save(model, input_path)
+
+        real_save = onnx.save
+        call_count = 0
+
+        def fake_save(proto, path, *args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                # The exact failure onnx.save raises past the 2GB protobuf
+                # limit -- simulated here so the test stays fast and small.
+                raise EncodeError("Message larger than 2GiB")
+            return real_save(proto, path, *args, **kwargs)
+
+        captured = {}
+        real_print = model_info.print_simplifying_info
+
+        def capturing_print(ori, opt):
+            captured["opt"] = opt
+            return real_print(ori, opt)
+
+        argv = sys.argv
+        try:
+            onnx_simplifier.onnx.save = fake_save
+            onnx_simplifier.model_info.print_simplifying_info = capturing_print
+            sys.argv = ["onnxsim", input_path, output_path]
+            onnx_simplifier.main()  # must not raise EncodeError (bug 1)
+        finally:
+            onnx_simplifier.onnx.save = real_save
+            onnx_simplifier.model_info.print_simplifying_info = real_print
+            sys.argv = argv
+
+        assert call_count == 2  # the initial attempt, then the external-data save
+        assert os.path.exists(output_path)
+        assert os.path.exists(output_path + ".data")
+
+        # model_opt was mutated in place, not deep-copied (bug 2): the object
+        # model_info was handed after the fallback already carries external
+        # data references rather than inline bytes.
+        opt = captured["opt"]
+        assert opt.graph.initializer[0].data_location == onnx.TensorProto.EXTERNAL
+
+
 def test_unset_optional_input():
     fmap = []
     nodes = []
