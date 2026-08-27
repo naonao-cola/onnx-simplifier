@@ -1,4 +1,6 @@
 import os
+import subprocess
+import sys
 import tempfile
 
 import numpy as np
@@ -1080,6 +1082,246 @@ def test_simplify_path_with_external_data():
     assert len(sim_model.graph.initializer) == 1
     folded = onnx.numpy_helper.to_array(sim_model.graph.initializer[0])
     np.testing.assert_allclose(folded, a + b, rtol=1e-5, atol=1e-6)
+
+
+@skip_in_ci()
+@pytest.mark.skipif(sys.platform == "win32", reason="resource.getrusage is POSIX-only")
+def test_simplify_path_peak_memory_stays_near_model_size():
+    # Regression test for the root cause documented in
+    # bench/RESULTS_synthetic_decoder_oom.md / bench/TODO_large_decoder_submodule_oom.md:
+    # Simplify() used to unconditionally deep-copy its whole input model into a
+    # mutable working copy (`sim_model = model` in onnxsim.cpp), so peak RSS for a
+    # large external-data model was ~1.9-2x its own size. SimplifyConsumeInput
+    # (wired into SimplifyPath, which onnxsim.simplify(path, check_n=0)'s fast path
+    # calls) moves tensor data into the working copy instead of copying it,
+    # bringing peak RSS down to approximately 1x model size.
+    #
+    # This only shows up **above the 2GB protobuf limit**: below it, SimplifyPath's
+    # own C++ side still has to inline-serialize the *output* model into one
+    # contiguous buffer (onnxsim.cpp's `needs_external_data` only trips past
+    # kProtobufSizeLimit), and that serialize buffer's own size dominates enough to
+    # mask the fix at smaller scales -- measured empirically while writing this
+    # test: at 196 MiB-1.5 GiB, the pre-fix vs post-fix delta was a near-constant
+    # ~28 MiB regardless of model size (not a ratio), whereas at ~2.2+ GiB (crossing
+    # the threshold) it was a clean ~2.06x (pre-fix) vs ~1.07x (post-fix) at every
+    # size tried. So this reuses bench/decoder_oom_repro.py's own generator sized to
+    # land just above that threshold (11 layers, ~2.3 GiB) rather than
+    # reimplementing the same decoder-block shape here at a size that was never
+    # actually measured against pre-fix behavior.
+    #
+    # This is why it's gated behind @skip_in_ci() like this file's other
+    # multi-hundred-MB+ tests (e.g. test_model_larger_than_2gb): building and
+    # simplifying a ~2.3 GiB model takes real time and memory. Run locally with
+    # CI unset (skip_in_ci only skips when CI is a truthy env var).
+    bench_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "bench")
+    sys.path.insert(0, bench_dir)
+    try:
+        import decoder_oom_repro
+    finally:
+        sys.path.remove(bench_dir)
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        model_path, total_bytes = decoder_oom_repro.gen(
+            tmpdir,
+            layers=11,
+            hidden=decoder_oom_repro.DEFAULT_HIDDEN,
+            ffn=decoder_oom_repro.DEFAULT_FFN,
+            seq_len=8,
+            layout="single",
+            seed=0,
+        )
+        total_mib = total_bytes / 1024 / 1024
+
+        # Measured in a fresh child process: resource.getrusage(RUSAGE_SELF)'s
+        # ru_maxrss is a process-lifetime high-water mark, so it must be read from
+        # a process that only ever does this one simplify() call.
+        child_script = os.path.join(tmpdir, "child.py")
+        with open(child_script, "w") as f:
+            f.write(
+                "import resource, sys\n"
+                "import onnx, onnxsim\n"
+                "model_opt, ok = onnxsim.simplify(sys.argv[1], check_n=0)\n"
+                "assert ok\n"
+                "print(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)\n"
+            )
+        proc = subprocess.run(
+            [sys.executable, child_script, model_path],
+            capture_output=True,
+            text=True,
+        )
+        assert proc.returncode == 0, (
+            f"child process failed: stdout={proc.stdout!r} stderr={proc.stderr!r}"
+        )
+        peak_kib = int(proc.stdout.strip().splitlines()[-1])
+
+    peak_mib = peak_kib / 1024
+    # Empirically: ~1.07x post-fix, ~2.06x pre-fix at this size (see comment
+    # above). 1.5x sits cleanly between the two.
+    assert peak_mib < total_mib * 1.5, (
+        f"peak RSS ({peak_mib:.0f} MiB) for a {total_mib:.0f} MiB external-data "
+        "model is too high -- this is the double-materialization regression "
+        "SimplifyConsumeInput fixed (see bench/RESULTS_synthetic_decoder_oom.md)"
+    )
+
+
+def _make_add_model():
+    a = np.random.rand(64, 64).astype(np.float32)
+    b = np.random.rand(64, 64).astype(np.float32)
+    initializers = [
+        onnx.numpy_helper.from_array(a, "a"),
+        onnx.numpy_helper.from_array(b, "b"),
+    ]
+    node = onnx.helper.make_node("Add", ["a", "b"], ["y"])
+    out = onnx.helper.make_tensor_value_info("y", onnx.TensorProto.FLOAT, (64, 64))
+    graph_def = onnx.helper.make_graph([node], "g", [], [out], initializer=initializers)
+    model = onnx.helper.make_model(
+        graph_def, opset_imports=[onnx.helper.make_opsetid("", 14)], ir_version=10
+    )
+    return model, a, b
+
+
+def test_output_path_fast_path_saves_directly_and_skips_reload():
+    # Regression test for a real, if secondary, inefficiency documented in
+    # bench/RESULTS_synthetic_decoder_oom.md: on the check_n=0 fast path,
+    # simplify() used to always call onnx.load(fast_out_path) (full data inline)
+    # purely to satisfy its return contract, even when the caller's very next
+    # step is to save the result again (as onnxsim's own CLI does).
+    # ``output_path`` lets the C++ core write the final result directly, so the
+    # returned model can stay structure-only. (That doc's real headline fix --
+    # the dominant peak-memory cost, inside the C++ core's own working copy --
+    # is separate, in onnxsim.cpp's SimplifyConsumeInput; this reload is real
+    # but turned out not to be what was driving the original OOM report.)
+    #
+    # The C++ core only actually externalizes a saved model's data past the 2GB
+    # protobuf limit (onnxsim.cpp's SimplifyPath: ``needs_external_data =
+    # model.ByteSizeLong() >= kProtobufSizeLimit``), so a small test model's
+    # output is always inline regardless of output_path -- there is no
+    # multi-GB fixture to assert "raw_data is empty" against here. What *is*
+    # testable at this scale is the mechanism itself: with output_path set,
+    # simplify() must read the result back with ``load_external_data=False``
+    # instead of the eager default, which is exactly the reload this test
+    # guards against reintroducing.
+    from onnxsim import onnx_simplifier
+
+    model, a, b = _make_add_model()
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        model_path = os.path.join(tmpdir, "model.onnx")
+        output_path = os.path.join(tmpdir, "out.onnx")
+        onnx.save(model, model_path)
+
+        real_load = onnx.load
+        load_calls = []
+
+        def spying_load(path, *args, **kwargs):
+            load_calls.append((path, args, kwargs))
+            return real_load(path, *args, **kwargs)
+
+        try:
+            onnx_simplifier.onnx.load = spying_load
+            sim_model, check_ok = onnxsim.simplify(
+                model_path, check_n=0, output_path=output_path
+            )
+        finally:
+            onnx_simplifier.onnx.load = real_load
+
+        assert check_ok
+        # The result was saved directly to output_path by simplify() itself.
+        assert os.path.exists(output_path)
+        saved = onnx.load(output_path)
+        assert len(saved.graph.node) == 0
+        assert len(saved.graph.initializer) == 1
+        folded = onnx.numpy_helper.to_array(saved.graph.initializer[0])
+        np.testing.assert_allclose(folded, a + b, rtol=1e-5, atol=1e-6)
+
+    # Exactly one load, of output_path itself (never a throwaway temp file),
+    # with load_external_data explicitly disabled -- the actual fix.
+    assert len(load_calls) == 1
+    (loaded_path, load_args, load_kwargs) = load_calls[0]
+    assert loaded_path == output_path
+    assert load_kwargs.get("load_external_data") is False
+
+
+def test_output_path_requires_str_model():
+    model, _, _ = _make_add_model()
+    with tempfile.TemporaryDirectory() as tmpdir:
+        output_path = os.path.join(tmpdir, "out.onnx")
+        with pytest.raises(ValueError, match="output_path"):
+            onnxsim.simplify(model, output_path=output_path)
+
+
+def test_output_path_off_fast_path_still_saves_full_model():
+    # check_n > 0 takes the slow path (it needs the full model in memory
+    # regardless, to run the correctness check), so output_path can't skip the
+    # reload there -- but the file must still end up saved, and the returned
+    # model must carry real data (unlike the fast-path case above), since a
+    # caller who asked for check_n > 0 is presumably going to use it.
+    model, a, b = _make_add_model()
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        model_path = os.path.join(tmpdir, "model.onnx")
+        output_path = os.path.join(tmpdir, "out.onnx")
+        onnx.save(model, model_path)
+
+        sim_model, check_ok = onnxsim.simplify(
+            model_path, check_n=1, output_path=output_path
+        )
+
+        assert check_ok
+        assert os.path.exists(output_path)
+        saved = onnx.load(output_path)
+        folded = onnx.numpy_helper.to_array(saved.graph.initializer[0])
+        np.testing.assert_allclose(folded, a + b, rtol=1e-5, atol=1e-6)
+
+    # Unlike the fast-path case, the returned model actually has data: check_n > 0
+    # already required materializing it, so there is nothing left to save by
+    # deferring the load.
+    assert len(sim_model.graph.initializer[0].raw_data) > 0
+    folded_returned = onnx.numpy_helper.to_array(sim_model.graph.initializer[0])
+    np.testing.assert_allclose(folded_returned, a + b, rtol=1e-5, atol=1e-6)
+
+
+def test_output_path_falls_back_to_external_data_past_2gb():
+    # Same >2GB save fallback the CLI relies on (see
+    # test_cli_large_model_save_fallback_mutates_in_place), exercised here for
+    # output_path's own fallback save at the end of simplify() -- reached when
+    # output_path is set but the fast path doesn't apply (check_n > 0 here).
+    from google.protobuf.message import EncodeError
+
+    from onnxsim import onnx_simplifier
+
+    model, a, b = _make_add_model()
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        model_path = os.path.join(tmpdir, "model.onnx")
+        output_path = os.path.join(tmpdir, "out.onnx")
+        onnx.save(model, model_path)
+
+        real_save = onnx.save
+        call_count = 0
+
+        def fake_save(proto, path, *args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                raise EncodeError("Message larger than 2GiB")
+            return real_save(proto, path, *args, **kwargs)
+
+        try:
+            onnx_simplifier.onnx.save = fake_save
+            sim_model, check_ok = onnxsim.simplify(
+                model_path, check_n=1, output_path=output_path
+            )
+        finally:
+            onnx_simplifier.onnx.save = real_save
+
+        assert check_ok
+        assert call_count == 2  # the initial (faked-failing) attempt, then the fallback
+        assert os.path.exists(output_path)
+        assert os.path.exists(output_path + ".data")
+        saved = onnx.load(output_path)
+        folded = onnx.numpy_helper.to_array(saved.graph.initializer[0])
+        np.testing.assert_allclose(folded, a + b, rtol=1e-5, atol=1e-6)
 
 
 def test_model_info_size_counts_external_data_without_loading():
