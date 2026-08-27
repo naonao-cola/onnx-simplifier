@@ -107,6 +107,17 @@ struct FuseMatMulAddBiasIntoGemmBatched final : public PredicateBasedPass {
     }
     const int64_t k = x_shape.back().dim;
 
+    // ONNX Runtime's CPU execution provider has no fast Gemm kernel for
+    // FLOAT16 (it falls back to a naive/reference path) even though its
+    // MatMul kernel does -- see fuse_matmul_add_bias_into_gemm.h's file
+    // comment for the measurement (a K=1024, N=4096 case: ~110ms for
+    // MatMul+Add vs. ~7.8s for the fused Gemm). Bail out for any type but
+    // FLOAT32 so this pass only fires where the fusion is actually a
+    // speedup, not a ~70x regression.
+    if (x->elemType() != TensorProto_DataType_FLOAT) {
+      return false;
+    }
+
     // W: a 2-D constant [K, N] with static dims, matching K.
     if (!IsConstantTensor(w) || !w->has_sizes()) {
       return false;
