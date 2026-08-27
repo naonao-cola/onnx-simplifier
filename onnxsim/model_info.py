@@ -172,13 +172,28 @@ def _is_symbolic(value: Macs) -> bool:
     )
 
 
+# sympy.factor() on a multivariate polynomial is at best exponential in its
+# number of free symbols. Real models with properly-named/deduplicated dynamic
+# dims (e.g. "batch", "sequence") only ever contribute a handful of distinct
+# symbols, but a model whose shape inference didn't unify intermediate dynamic
+# dims back to the named input dims can produce hundreds of distinct symbols --
+# there factor() doesn't error, it just never returns in practical time. Skip
+# it above this threshold; it is purely a formatting nicety, never worth more
+# than a bounded amount of work.
+_MAX_FACTOR_FREE_SYMBOLS = 16
+
+
 def _factor_or_str(value: "sympy.Expr") -> str:
     # sympy.factor() is purely cosmetic here (a nicer-looking formula for the
     # report), but on models with many unresolved symbolic dims its polynomial
     # arithmetic can recurse deep enough to blow Python's recursion limit (seen
     # in practice on real-world models with 1000+ nodes, e.g. VOICEVOX's
-    # predict_sing_f0.onnx). Fall back to the unfactored expression rather than
-    # crashing the whole report over a formatting nicety.
+    # predict_sing_f0.onnx), or simply take intractably long without ever
+    # erroring (see ``_MAX_FACTOR_FREE_SYMBOLS`` above). Fall back to the
+    # unfactored expression rather than crashing or hanging the whole report
+    # over a formatting nicety.
+    if len(value.free_symbols) > _MAX_FACTOR_FREE_SYMBOLS:
+        return str(value)
     try:
         return str(sympy.factor(value))
     except RecursionError:
