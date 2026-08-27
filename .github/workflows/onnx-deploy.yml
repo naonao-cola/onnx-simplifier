@@ -44,6 +44,8 @@ env:
   # "upgrade your ORT build without recompiling onnx-deploy" case.
   ORT_VERSION_NEWER: 1.19.2
   ORT_VERSION_OLDER: 1.18.1
+  # Same Emscripten version static.yml (onnxsim's own wasm build) pins.
+  EMSCRIPTEN_VERSION: "5.0.0"
 
 jobs:
   build-and-verify:
@@ -150,3 +152,41 @@ jobs:
           code=$?
           set -e
           [ "$code" -eq 1 ]
+
+  wasm-verify:
+    name: WASM build + verify (onnxruntime-web via Node)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Python deps (toy model generator only)
+        run: pip install onnx
+
+      - name: Generate the toy seq2seq export
+        working-directory: tools/onnx-deploy
+        run: python3 scripts/make_toy_seq2seq.py -o /tmp/toy_seq2seq --vocab-size 7 --encoder-ids 3,4 --decoder-start-token-id 0
+
+      - name: Install Emscripten ${{ env.EMSCRIPTEN_VERSION }} (same version static.yml uses for onnxsim's own wasm build)
+        run: |
+          git clone --depth 1 https://github.com/emscripten-core/emsdk.git
+          ./emsdk/emsdk install ${{ env.EMSCRIPTEN_VERSION }}
+          ./emsdk/emsdk activate ${{ env.EMSCRIPTEN_VERSION }}
+
+      - name: Configure + build onnx_deploy_wasm
+        working-directory: tools/onnx-deploy/wasm
+        run: |
+          source "${{ github.workspace }}/emsdk/emsdk_env.sh"
+          emcmake cmake -B build -DCMAKE_BUILD_TYPE=Release
+          cmake --build build -j"$(nproc)"
+
+      - name: Install onnxruntime-web test harness deps
+        working-directory: tools/onnx-deploy/wasm/test
+        run: npm ci
+
+      - name: Run the Asyncify bridge end-to-end (persistent onnxruntime-web sessions, encoder-once + decoder loop, KV-cache threading) and assert it matches the native/Python output
+        working-directory: tools/onnx-deploy/wasm/test
+        run: node run_test.mjs /tmp/toy_seq2seq

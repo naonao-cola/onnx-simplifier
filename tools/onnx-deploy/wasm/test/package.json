@@ -1,0 +1,12 @@
+{
+  "name": "onnx-deploy-wasm-test",
+  "private": true,
+  "type": "module",
+  "description": "Node-based end-to-end test for onnx_deploy_wasm.cpp: proves the Asyncify bridge (persistent onnxruntime-web sessions held across many awaited calls, encoder-once + decoder-loop, KV-cache present.*->past_key_values.* threading) produces the same output as the native onnx-deploy CLI against the same toy model. See run_test.mjs and ../../README.md's WASM section.",
+  "scripts": {
+    "test": "node run_test.mjs"
+  },
+  "dependencies": {
+    "onnxruntime-web": "^1.19.2"
+  }
+}

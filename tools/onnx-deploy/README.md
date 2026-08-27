@@ -7,10 +7,9 @@ generation pipeline, entirely in C++/Python -- no `optimum`, no `torch`, no
 Python required at all for the C++ side.
 
 **Status: built and CI-verified** (`.github/workflows/onnx-deploy.yml`) for
-the native CLI, the C ABI, and the Python extension -- see "Verifying the
-flow" below for exactly what that CI proves and how to reproduce it
-locally. The WASM target described near the end is a design writeup only,
-not yet built.
+the native CLI, the C ABI, the Python extension, and the WASM module -- see
+"Verifying the flow" and the "WASM" section below for exactly what CI proves
+and how to reproduce it locally.
 
 ## The question this answers
 
@@ -135,6 +134,12 @@ The ABI's shape mirrors onnxsim's own C ABI conventions
   it has no ONNX Runtime header dependency of its own), following the same
   nanobind convention as onnxsim's own `onnxsim/cpp2py_export.cc`. See "Why
   a Python extension at all" below.
+- **`wasm/src/onnx_deploy_wasm.cpp`** -- a from-scratch WASM port of the same
+  algorithm (not the C ABI or `kv_cache_pipeline.h` reused verbatim -- see
+  "WASM" below for why), reached from JS through one Asyncify-awaited
+  `generate()` call, with ONNX Runtime itself swapped in via
+  [onnxruntime-web](https://github.com/microsoft/onnxruntime) instead of a
+  native `libonnxruntime`.
 
 ## Why a Python extension at all, when `optimum.onnxruntime` already does this in Python
 
@@ -244,22 +249,62 @@ To reproduce locally: download any two ONNX Runtime releases from
 et al.), then run the same `cmake`/`make_toy_seq2seq.py`/`onnx-deploy`
 sequence the workflow does.
 
-## WASM (design only -- not yet built)
+## WASM
 
-Not implemented here: this repo's existing WASM/ONNX Runtime bridge
-(`JsModelExecutor`, `scripts/convertmodel/js_model_executor.cpp`, see
-`docs/wasm_ort_web.md`) is an Asyncify bridge for exactly **one** awaited JS
-call per `Run()` -- built for onnxsim's single constant-fold call, not a
-multi-step decode loop. Reusing it for `KvCachePipeline::Generate()` (encoder
-once, decoder N times, cache threaded between awaited calls) needs an
-embind class that keeps an `ort.InferenceSession` (or two -- encoder and
-decoder) alive JS-side across the whole loop, rather than the current
-per-call session pattern -- `docs/wasm_ort_web.md` already flags
-per-call `InferenceSession.create` as a likely bottleneck for exactly this
-reason. "Swappable libort" in WASM terms would mean the JS host chooses
-which onnxruntime-web build/execution-provider backs that session, mirroring
-the native dlopen swap at the JS/wasm boundary instead of the OS loader.
-This needs real design + implementation + browser/Node test infrastructure
-beyond what fits here; flagging the shape of the work rather than shipping
-unverified code for it (this sandbox has no `emcc` to even compile-check
-a WASM attempt against).
+This repo's existing WASM/ONNX Runtime bridge (`JsModelExecutor`,
+`scripts/convertmodel/js_model_executor.cpp`, see `docs/wasm_ort_web.md`) is
+an Asyncify bridge for exactly **one** awaited JS call per `Run()` -- built
+for onnxsim's single constant-fold call, not a multi-step decode loop.
+`wasm/src/onnx_deploy_wasm.cpp` is a fresh implementation for the
+"persistent sessions across many awaited calls" case that bridge doesn't
+cover: it holds onnxruntime-web `InferenceSession`s (encoder, decoder,
+decoder-with-past) alive JS-side across the whole `generate()` loop, the
+same `docs/wasm_ort_web.md` already flags per-call `InferenceSession.create`
+as a likely bottleneck for exactly this reason.
+
+**Why a separate implementation instead of reusing `kv_cache_pipeline.h` or
+the C ABI:** both are built on `Ort::Value`/`Ort::Session`, ORT's native C++
+types -- there is no native ORT at all on the WASM side of this bridge
+(every tensor computation happens in JS/onnxruntime-web), so there is
+nothing for those types to wrap. `onnx_deploy_wasm.cpp` re-implements the
+same two design decisions instead (`present.*` -> `past_key_values.*`
+renamed by string substitution alone; a cache entry not re-output by a call
+stays valid for the next one) against a plain `WasmTensor` struct
+(`{dtype, shape, data}`, `data` always `std::vector<double>`) that crosses
+the JS boundary as a plain object.
+
+**"Swappable libort" in WASM terms** means the JS host chooses which
+onnxruntime-web build/version/execution-provider implements
+`Module.onnxDeployRunSession` -- see `wasm/test/ort_web_runtime.mjs` for the
+reference implementation -- mirroring the native side's `dlopen(libort_path)`
+swap at the JS/wasm boundary instead of the OS loader. There is zero ORT C/
+C++ code or dependency in `wasm/CMakeLists.txt`/`onnx_deploy_wasm.cpp` at
+all -- unlike `tools/onnx-finetune/wasm` (which statically compiles ONNX
+Runtime from source into its module), this target doesn't link ORT into
+wasm in any form.
+
+**Scope note:** this exposes one async entry point, `generate()` (create
+sessions, run the whole decode loop, return), rather than a reusable
+class wrapping multiple `generate()` calls without re-creating sessions
+each time -- enough to prove the persistent-session-across-many-awaited-
+calls mechanism works end-to-end (this repo's only prior Asyncify bridge is
+single-call), not a full session-lifecycle API. That's a natural follow-up.
+
+Build and test locally (mirrors the `wasm-verify` CI job):
+
+```sh
+# Install Emscripten once (any recent version; CI pins the same one
+# static.yml uses for onnxsim's own wasm build):
+git clone https://github.com/emscripten-core/emsdk.git
+./emsdk/emsdk install 5.0.0 && ./emsdk/emsdk activate 5.0.0
+source ./emsdk/emsdk_env.sh
+
+cd tools/onnx-deploy/wasm
+emcmake cmake -B build && cmake --build build
+
+python3 ../scripts/make_toy_seq2seq.py -o /tmp/toy_seq2seq --vocab-size 7 --encoder-ids 3,4 --decoder-start-token-id 0
+cd test && npm install && node run_test.mjs /tmp/toy_seq2seq
+# -> generate(max_new_tokens=8, eos=-1): [0, 1, 2, 3, 4, 5, 6, 0]
+#    generate(max_new_tokens=20, eos_token_id=6): [0, 1, 2, 3, 4, 5, 6]
+#    OK: onnx_deploy_wasm matches the native pipeline's expected output.
+```
