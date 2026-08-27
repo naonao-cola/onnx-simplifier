@@ -1062,6 +1062,7 @@ def simplify(
     check_atol: float = 1e-5,
     input_fill: str = "random",
     providers: Optional[Sequence[backend.Provider]] = None,
+    gemm_fusion_backend: Literal["ort_cpu", "unrestricted"] = "ort_cpu",
     profile: Optional[str] = None,
     ort_profile: Optional[str] = None,
     merge_ort_profile: bool = False,
@@ -1145,6 +1146,23 @@ def simplify(
             provider specifically needs the ``onnxruntime-gpu`` build); a
             requested provider that the installed onnxruntime does not offer
             raises ``ValueError`` instead of silently falling back.
+    :param gemm_fusion_backend: Which runtime the ``fuse_matmul_add_bias_into_gemm``
+            passes should assume will execute the *simplified* model -- unrelated to
+            ``providers`` above, which only picks constant folding's execution
+            provider during simplification itself. ``"ort_cpu"`` (the default)
+            restricts the MatMul+Add -> Gemm fusion to FLOAT32 operands: ONNX
+            Runtime's CPU execution provider has no fast Gemm kernel for FLOAT16 (it
+            falls back to a naive path) even though its MatMul kernel does, so
+            fusing a FLOAT16 MatMul+Add there was measured making that op ~70x
+            *slower* to run, not faster. ``"unrestricted"`` fuses regardless of
+            operand dtype (onnx-optimizer's original, backend-agnostic behavior) --
+            use it when the simplified model will run somewhere ORT CPU's FP16 Gemm
+            slowness does not apply (a different runtime, a different execution
+            provider such as CUDA, or an ONNX Runtime build with a real FP16 Gemm
+            kernel). Implemented in the C++ core via the
+            ``ONNXSIM_GEMM_FUSION_BACKEND`` environment variable, so it works from
+            every binding; setting this argument simply sets that variable for the
+            call.
     :param profile: When set, profile every simplification fixed-point function
             (shape inference, the onnx-optimizer passes, constant folding and any
             custom rewriter) -- recording each one's wall-clock and CPU duration
@@ -1316,6 +1334,8 @@ def simplify(
             if _fast_profile_active:
                 _fast_prev_profile_env = os.environ.get("ONNXSIM_PROFILE")
                 os.environ["ONNXSIM_PROFILE"] = _fast_profile_path
+            _fast_prev_gemm_backend_env = os.environ.get("ONNXSIM_GEMM_FUSION_BACKEND")
+            os.environ["ONNXSIM_GEMM_FUSION_BACKEND"] = gemm_fusion_backend
             try:
                 if isinstance(model, str):
                     # ``output_path`` given: write the result there directly instead of a
@@ -1441,6 +1461,12 @@ def simplify(
                         os.environ.pop("ONNXSIM_PROFILE", None)
                     else:
                         os.environ["ONNXSIM_PROFILE"] = _fast_prev_profile_env
+                if _fast_prev_gemm_backend_env is None:
+                    os.environ.pop("ONNXSIM_GEMM_FUSION_BACKEND", None)
+                else:
+                    os.environ["ONNXSIM_GEMM_FUSION_BACKEND"] = (
+                        _fast_prev_gemm_backend_env
+                    )
 
     # Slow path: either check_n > 0 (needs the original model to compare
     # against) or a shape dict uses the "None key" convenience (needs the
@@ -1493,6 +1519,14 @@ def simplify(
     if _profile_active:
         _prev_profile_env = os.environ.get("ONNXSIM_PROFILE")
         os.environ["ONNXSIM_PROFILE"] = _profile_path
+
+    # Select which runtime fuse_matmul_add_bias_into_gemm(_batched) should
+    # assume will execute the simplified model, for the duration of this call
+    # (read inside ``Simplify`` via ``ONNXSIM_GEMM_FUSION_BACKEND`` -- see
+    # gemm_fusion_backend.h), restoring any prior value afterwards so this
+    # does not leak into later calls in the same process.
+    _prev_gemm_backend_env = os.environ.get("ONNXSIM_GEMM_FUSION_BACKEND")
+    os.environ["ONNXSIM_GEMM_FUSION_BACKEND"] = gemm_fusion_backend
 
     # Turn on onnxruntime's own session profiler by setting ``ONNXSIM_ORT_PROFILE``
     # (read by the executor). It has two modes: ``ort_profile`` writes standalone
@@ -1634,6 +1668,10 @@ def simplify(
                 os.environ.pop("ONNXSIM_ORT_PROFILE", None)
             else:
                 os.environ["ONNXSIM_ORT_PROFILE"] = _prev_ort_profile_env
+        if _prev_gemm_backend_env is None:
+            os.environ.pop("ONNXSIM_GEMM_FUSION_BACKEND", None)
+        else:
+            os.environ["ONNXSIM_GEMM_FUSION_BACKEND"] = _prev_gemm_backend_env
         # Fold onnxruntime's captured per-operator traces into the onnxsim trace,
         # then drop the temporary files. Best-effort: a merge failure must not
         # sink an otherwise-successful simplification.

@@ -28,6 +28,7 @@
 #include "constant_folding.h"
 #include "contrib_schemas.h"
 #include "custom_optimizer_passes.h"
+#include "gemm_fusion_backend.h"
 #include "model_info.h"
 #include "model_prep.h"
 #include "onnx/common/file_utils.h"
@@ -389,6 +390,18 @@ static onnx::ModelProto SimplifyImpl(
       std::getenv("ONNXSIM_FIXED_POINT_ITERS")
           ? std::atoi(std::getenv("ONNXSIM_FIXED_POINT_ITERS"))
           : 50;
+
+  // Which runtime fuse_matmul_add_bias_into_gemm(_batched) should assume will
+  // execute the simplified model -- see gemm_fusion_backend.h. Mirrors
+  // ONNXSIM_FIXED_POINT_ITERS/ONNXSIM_PROFILE so it works from every binding
+  // without a signature change; set unconditionally (not just when the env
+  // var is present) so this call never inherits a setting left over from an
+  // unrelated prior Simplify() call in the same process.
+  onnxsim::SetGemmFusionBackend(
+      std::getenv("ONNXSIM_GEMM_FUSION_BACKEND")
+          ? onnxsim::ParseGemmFusionBackend(
+                std::getenv("ONNXSIM_GEMM_FUSION_BACKEND"))
+          : onnxsim::GemmFusionBackend::kOrtCpu);
 
   // Optionally profile every fixed-point function. Turned on by pointing
   // ``ONNXSIM_PROFILE`` at an output file (``ONNXSIM_PROFILE=1`` uses the

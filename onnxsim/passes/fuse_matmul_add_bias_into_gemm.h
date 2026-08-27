@@ -19,20 +19,25 @@
 // This is onnxsim's patched version of onnx-optimizer's built-in pass of the
 // same name (RegisterOrReplace overwrites the registry entry -- see
 // custom_optimizer_passes.cpp). The only difference from upstream is the
-// added FLOAT-only guard below: ONNX Runtime's CPU execution provider has no
-// fast Gemm kernel for FLOAT16 (it falls back to a naive/reference path),
-// while its MatMul kernel does -- fusing MatMul+Add into Gemm for a FLOAT16
-// operand was measured making that op ~70x *slower* to actually run (a
-// K=1024, N=4096 case: ~110ms for MatMul+Add vs. ~7.8s for the fused Gemm),
-// silently turning this "optimization" into a severe regression for exactly
-// the kind of fp16 codec/vocoder graphs the Audio8 model set covers (see
-// tests/test_audio8.py's codec_decoder_fp16.onnx case). Bailing out here
-// leaves the original MatMul+Add in place for FLOAT16 (and any other
-// non-FLOAT type), matching upstream's behavior only for the FLOAT32 case
-// where the fusion is actually a speedup.
+// added FLOAT-only guard below, active for the default
+// GemmFusionBackend::kOrtCpu (see gemm_fusion_backend.h): ONNX Runtime's CPU
+// execution provider has no fast Gemm kernel for FLOAT16 (it falls back to a
+// naive/reference path), while its MatMul kernel does -- fusing MatMul+Add
+// into Gemm for a FLOAT16 operand was measured making that op ~70x *slower*
+// to actually run (a K=1024, N=4096 case: ~110ms for MatMul+Add vs. ~7.8s
+// for the fused Gemm), silently turning this "optimization" into a severe
+// regression for exactly the kind of fp16 codec/vocoder graphs the Audio8
+// model set covers (see tests/test_audio8.py's codec_decoder_fp16.onnx
+// case). Bailing out here leaves the original MatMul+Add in place for
+// FLOAT16 (and any other non-FLOAT type) under that default, matching
+// upstream's behavior for the FLOAT32 case (always a speedup on ORT CPU) and
+// for every dtype when GemmFusionBackend::kUnrestricted is selected -- a
+// deployment target other than ORT CPU may have a perfectly good FP16 Gemm
+// kernel and benefit from this fusion the same way FLOAT32 does.
 
 #include <numeric>
 
+#include "gemm_fusion_backend.h"
 #include "onnx/common/assertions.h"
 #include "onnxoptimizer/pass.h"
 #include "onnxoptimizer/passes/pass_util.h"
@@ -54,6 +59,10 @@ struct FuseMatMulAddBiasIntoGemm final : public PredicateBasedPass {
   bool patternMatchPredicate(Node* node) override {
     if (!CheckKind(node, kAdd, 0, kMatMul)) {
       return false;
+    }
+    if (onnxsim::GetGemmFusionBackend() !=
+        onnxsim::GemmFusionBackend::kOrtCpu) {
+      return true;
     }
     // See the file comment: ONNX Runtime's CPU Gemm kernel has no fast path
     // for FLOAT16 (or any non-FLOAT32 type), so fusing into Gemm there is a
