@@ -144,6 +144,30 @@ def test_generate_random_calibration_data_shapes():
         assert batch["X"].dtype == np.float32
 
 
+def test_generate_random_calibration_data_keeps_static_zero_dim():
+    # A genuinely static, zero-length dimension (e.g. an empty KV-cache
+    # sentinel some exporters emit -- see pocket-tts's flow_lm_main.onnx,
+    # whose "state_1" input is exactly this) must survive as 0, not get
+    # silently promoted to 1: `dim.dim_value` reads back as 0 both when a
+    # dim is genuinely fixed to 0 and when it's unset/symbolic, so telling
+    # them apart requires `HasField("dim_value")`, not a bare `> 0` check.
+    weight = _f32(np.random.randn(8, 4).astype(np.float32), "W")
+    nodes = [onnx.helper.make_node("MatMul", ["X", "W"], ["Y"])]
+    # X's second dim is dynamic (symbolic "seq"); "state" has a real,
+    # static empty dimension at index 1.
+    x_vi = onnx.helper.make_tensor_value_info("X", onnx.TensorProto.FLOAT, [2, "seq"])
+    state_vi = onnx.helper.make_tensor_value_info(
+        "state", onnx.TensorProto.FLOAT, [1, 0, 4]
+    )
+    # "state" is unused by any node -- fine, only its declared shape matters
+    # for _input_specs, which looks at model.graph.input directly.
+    model = _model(nodes, [x_vi, state_vi], [_vi("Y", [2, 4])], [weight])
+
+    batches = onnxsim.generate_random_calibration_data(model, num_samples=1, seed=0)
+    assert batches[0]["X"].shape == (2, 1)  # symbolic dim -> defaults to 1
+    assert batches[0]["state"].shape == (1, 0, 4)  # static 0 dim -> stays 0
+
+
 def test_calibrate_returns_ranges_for_quantizable_tensors():
     weight = _f32(np.random.randn(8, 4).astype(np.float32), "W")
     nodes = [onnx.helper.make_node("MatMul", ["X", "W"], ["Y"])]
