@@ -30,6 +30,7 @@ from onnxsim.calibration import (
     quantize_static_int16,
 )
 from onnxsim.gptq import apply_gptq
+from onnxsim.hqq import quantize_weight_only_int4_hqq
 from onnxsim.onnx_simplifier import (
     cross_layer_equalize,
     export_gguf,
@@ -84,6 +85,7 @@ __all__ = [
     "quantize_ternary",
     "quantize_weight_only",
     "quantize_weight_only_int4",
+    "quantize_weight_only_int4_hqq",
     "quantize_weight_only_matmul_nbits",
     "quantize_weight_only_int8_block",
     "quantize_weight_only_int16",
