@@ -11,8 +11,41 @@ were exported from the same model; three (each <=1.7GB, serialized as a single i
 quota. Absolute numbers are specific to that environment; the qualitative finding
 (this submodule OOMs while smaller ones from the same export pipeline do not) is the
 useful part.
-**Reproduce:** not yet reduced to a runnable repro script. See "Next steps" below for
-what that would take.
+**Reproduce:** the real model is obtainable (see "How to get the model" below), but no
+export script or runnable repro exists yet -- see "Next steps" for what that takes.
+
+## How to get the model
+
+The model behind this observation is [`BreezeBlue/Breeze-TTS-2`](https://hf.co/BreezeBlue/Breeze-TTS-2)
+on Hugging Face (~3.4B params total across all submodules; check the model card's
+license before redistributing/using the weights). Reproducing the backbone export
+needs two things:
+
+1. **Weights** -- download the safetensors shards:
+   ```
+   huggingface-cli download BreezeBlue/Breeze-TTS-2 --local-dir breeze-model
+   ```
+2. **Model code** -- the weights load into classes (`BreezeConfig`,
+   `BreezeBackboneFactory`, etc.) from [`breezeblue-ai/breeze-tts`](https://github.com/breezeblue-ai/breeze-tts)
+   on GitHub (not published to PyPI):
+   ```
+   git clone https://github.com/breezeblue-ai/breeze-tts
+   ```
+   Its `requirements.txt` pins `torch==2.9.1`, `transformers==4.57.3`.
+
+No export script for the backbone submodule exists in this repo (it doesn't belong
+here -- it's specific to `breeze-tts`'s internal API). To reconstruct one: load only
+the `backbone_model.*`-prefixed tensors from the safetensors shards into
+`BreezeBackboneFactory.create_backbone(config)`, set `config._attn_implementation =
+"eager"`, and trace with `torch.onnx.export(model, (inputs_embeds, position_ids),
+..., dynamo=False)`. `dynamo=True` (`torch.export`) cannot trace this model as-is:
+transformers' `masking_utils` treats a call with `position_ids` but no
+`attention_mask`/`past_key_values` as a possibly-packed-sequence batch and routes mask
+construction through a `torch.vmap`-based function that neither `torch.export` nor the
+legacy TorchScript tracer can trace here -- a PyTorch/transformers tracing gap
+unrelated to onnxsim. Since only a single, unpacked sequence is ever exported per
+submodule, packed-sequence detection can be disabled for tracing with
+`transformers.masking_utils.find_packed_sequence_indices = lambda position_ids: None`.
 
 ## What's known
 
@@ -30,10 +63,12 @@ what that would take.
 
 ## Next steps, if picking this up
 
-1. Reduce to a runnable repro: either a synthetic ONNX model in this scale range
-   (~5GB, external data, a decoder-block-style repeated structure) built with
-   `onnx.helper`/`numpy_helper` (no torch/HF dependency needed), or point at a public
-   model of similar size if one exists in `onnxmodelzoo` or similar.
+1. Reduce to a runnable repro: either export the real backbone submodule per "How to
+   get the model" above, or build a synthetic ONNX model in this scale range (~5GB,
+   external data, a decoder-block-style repeated structure) with
+   `onnx.helper`/`numpy_helper` (no torch/HF dependency needed) -- the synthetic route
+   avoids the `breeze-tts` tracing workaround and is easier to share/CI, at the cost of
+   not being certain it reproduces the same failure.
 2. Re-run under an actual memory profiler and capture the trace, rather than reasoning
    from wall-clock OOM alone.
 3. Isolate file-count vs. total-bytes: consolidate the same model's external data into
