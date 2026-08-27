@@ -14,11 +14,15 @@
 # split-model shape described in this repo's own notes on why autoregressive
 # audio/LLM exports come out as several ``.onnx`` files instead of one (see
 # ``tests/test_audio8.py``'s docstring for the KV-cache-heavy real-world
-# case). This test exercises onnxsim as a post-export simplification step
-# over exactly that multi-file shape, then re-runs the *whole* generate()
-# loop -- encoder once, decoder-with-past repeatedly, KV-cache fed back each
-# step -- against the simplified files and checks the generated token ids are
-# unchanged.
+# case). This test exercises ``onnxsim.export_transformers_model()`` -- the
+# reusable wrapper around exactly this export-then-simplify-in-place recipe,
+# see ``onnxsim/transformers_export.py`` -- over that multi-file shape, then
+# re-runs the *whole* generate() loop -- encoder once, decoder-with-past
+# repeatedly, KV-cache fed back each step -- against the simplified files and
+# checks the generated token ids are unchanged. ``exported_dir`` below is a
+# separate, unsimplified export used only as the "before" baseline (node
+# counts and generation output to compare against): export_transformers_model
+# always simplifies, so it cannot itself produce that baseline.
 #
 # Exported with ``no_post_process=True``: by default, recent
 # ``optimum-onnx`` merges ``decoder_model``/``decoder_with_past_model`` into
@@ -54,7 +58,6 @@
 
 import glob
 import os
-import shutil
 
 import onnx
 import pytest
@@ -111,42 +114,46 @@ def test_optimum_export_simplify_and_deploy(exported_dir, tmp_path):
     baseline_model = ORTModelForSeq2SeqLM.from_pretrained(exported_dir)
     baseline_ids = baseline_model.generate(**inputs, max_new_tokens=8, do_sample=False)
 
-    # Simplify every exported graph and assemble a second, otherwise-identical
-    # deployment directory from the simplified files -- copying the
-    # tokenizer/config files across so ORTModelForSeq2SeqLM can load it the
-    # same way it loaded the original.
-    sim_dir = tmp_path / "simplified"
-    sim_dir.mkdir()
-    total_nodes_before = 0
-    total_nodes_after = 0
-    for src in glob.glob(os.path.join(exported_dir, "*")):
-        name = os.path.basename(src)
-        dst = str(sim_dir / name)
-        if not src.endswith(".onnx"):
-            shutil.copy(src, dst)
-            continue
-        nodes_before = len(onnx.load(src, load_external_data=False).graph.node)
-        sim_model, check_ok = onnxsim.simplify(src)
-        assert check_ok, f"{name}: onnxsim numerical check failed"
-        nodes_after = len(sim_model.graph.node)
-        assert nodes_after <= nodes_before, (
+    nodes_before = {
+        os.path.basename(f): len(onnx.load(f, load_external_data=False).graph.node)
+        for f in glob.glob(os.path.join(exported_dir, "*.onnx"))
+    }
+
+    # export_transformers_model does its own fresh export (same model/task,
+    # so structurally identical to exported_dir's) straight into sim_dir,
+    # simplifying every graph in place and writing the tokenizer/config files
+    # itself -- no manual glob-and-copy loop needed.
+    sim_dir = str(tmp_path / "simplified")
+    results = onnxsim.export_transformers_model(
+        _MODEL_ID,
+        sim_dir,
+        task="text2text-generation-with-past",
+    )
+    assert set(results.keys()) == set(nodes_before.keys())
+    assert all(results.values()), f"onnxsim numerical check failed: {results}"
+
+    nodes_after = {
+        name: len(
+            onnx.load(os.path.join(sim_dir, name), load_external_data=False).graph.node
+        )
+        for name in nodes_before
+    }
+    for name in nodes_before:
+        assert nodes_after[name] <= nodes_before[name], (
             f"{name}: simplification must not increase node count"
         )
-        total_nodes_before += nodes_before
-        total_nodes_after += nodes_after
-        onnx.save(sim_model, dst)
 
     # Plain Optimum export (no --optimize, no --slim) does no fusion/folding
     # beyond torch.onnx.export's own constant folding -- see this test
     # module's docstring and the "does export do any optimization" question
     # it answers. There should be real simplification left on the table for
     # onnxsim to find.
-    assert total_nodes_after < total_nodes_before
+    assert sum(nodes_after.values()) < sum(nodes_before.values())
 
     # The actual "deploy flow": encoder runs once, decoder_with_past_model
     # runs once per generated token with KV-cache fed back each step, all
     # driven by ORTModelForSeq2SeqLM.generate() exactly as a real deployment
     # would call it. Simplification must not change the generated sequence.
-    sim_model_ort = ORTModelForSeq2SeqLM.from_pretrained(str(sim_dir))
+    sim_model_ort = ORTModelForSeq2SeqLM.from_pretrained(sim_dir)
     sim_ids = sim_model_ort.generate(**inputs, max_new_tokens=8, do_sample=False)
     assert sim_ids.tolist() == baseline_ids.tolist()

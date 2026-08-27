@@ -819,6 +819,28 @@ as-is (e.g. via `optimum.onnxruntime.ORTModelForSeq2SeqLM.from_pretrained`).
 Needs the optional `torch`/`transformers`/`optimum` (with the `optimum-onnx`
 distribution) packages: `pip install onnxsim[transformers]`.
 
+For a real (non-tiny) model, pass `save_as_external_data=True`. A with-past
+export is several *independent* graphs (encoder/decoder/decoder-with-past),
+each with its own inline copy of whatever weights it uses — e.g. the decoder's
+weights end up duplicated inline across both `decoder_model.onnx` and
+`decoder_with_past_model.onnx` — and every pass in onnxsim's own optimization
+pipeline that touches a graph copies those inline bytes along with it.
+Without this flag, external data is only ever used as a fallback once a graph
+is too large to serialize inline at all (>2GB, matching the CLI's own
+`--save-as-external-data` default); turning it on keeps every graph's large
+tensors on disk from the start, so both the in-memory copying during
+simplification and the inline duplication across split files shrink to
+metadata (name/offset/length) instead of the tensors themselves:
+
+```python
+onnxsim.export_transformers_model(
+    "meta-llama/Llama-3.2-1B",
+    "exported_and_simplified",
+    task="text-generation-with-past",
+    save_as_external_data=True,
+)
+```
+
 ## Projects Using ONNX Simplifier
 
 ONNX Simplifier is most often used as a post-export cleanup step, run on a

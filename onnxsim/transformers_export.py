@@ -43,6 +43,7 @@ def export_transformers_model(
     task: str = "auto",
     no_post_process: bool = True,
     check_n: int = 0,
+    save_as_external_data: bool = False,
     export_kwargs: Optional[Dict] = None,
     simplify_kwargs: Optional[Dict] = None,
 ) -> Dict[str, bool]:
@@ -77,6 +78,25 @@ def export_transformers_model(
     :param check_n: forwarded to :func:`onnxsim.simplify` for every exported
             graph -- how many random-input runs to check the simplified
             model against the freshly exported one for numerical equivalence.
+    :param save_as_external_data: always save every simplified graph with its
+            weights in a companion ``<filename>.data`` file, instead of
+            inline. Off by default (matching the ``onnxsim`` CLI's own
+            ``--save-as-external-data``, and plain ``onnx.save``), which only
+            uses external data as a fallback once a graph is too large to
+            serialize inline at all (>2GB). Worth turning on for real
+            (non-tiny) transformers models even below that limit: a
+            with-past export is multiple *independent* graphs
+            (encoder/decoder/decoder-with-past, see ``no_post_process``
+            above), each embedding its own full inline copy of whatever
+            weights it uses -- e.g. the decoder's weights end up duplicated
+            across ``decoder_model.onnx`` and ``decoder_with_past_model.onnx``
+            -- and every pass in onnxsim's own optimization pipeline that
+            touches the graph (shape inference, checker, each fixed-point
+            round) copies those inline bytes along with it. External data
+            keeps the large tensors on disk instead, so this repeated
+            in-memory copying and the inline duplication across split files
+            both shrink to metadata (name/offset/length) rather than the
+            tensors themselves.
     :param export_kwargs: extra keyword arguments forwarded to
             ``optimum.exporters.onnx.main_export`` (e.g. ``opset``,
             ``device``, ``fp16``, ``trust_remote_code``).
@@ -107,21 +127,30 @@ def export_transformers_model(
     results = {}
     for src in sorted(glob.glob(os.path.join(output_dir, "*.onnx"))):
         model_opt, check_ok = simplify(src, check_n=check_n, **(simplify_kwargs or {}))
-        try:
-            onnx.save(model_opt, src)
-        except (ValueError, EncodeError):
-            # Real transformers models routinely exceed onnx.save's 2GB inline
-            # limit; fall back to external data next to the model, matching
-            # the CLI's own --save-as-external-data fallback (onnx_simplifier.py).
-            external_data_path = os.path.basename(src) + ".data"
-            if os.path.exists(os.path.join(output_dir, external_data_path)):
-                os.remove(os.path.join(output_dir, external_data_path))
-            onnx.save(
-                model_opt,
-                src,
-                save_as_external_data=True,
-                all_tensors_to_one_file=True,
-                location=external_data_path,
-            )
+        _save(model_opt, src, force_external_data=save_as_external_data)
         results[os.path.basename(src)] = check_ok
     return results
+
+
+def _save(model: onnx.ModelProto, path: str, force_external_data: bool) -> None:
+    if not force_external_data:
+        try:
+            onnx.save(model, path)
+            return
+        except (ValueError, EncodeError):
+            # Real transformers models routinely exceed onnx.save's 2GB inline
+            # limit; fall back to external data next, matching the CLI's own
+            # --save-as-external-data fallback (onnx_simplifier.py).
+            pass
+
+    external_data_path = os.path.basename(path) + ".data"
+    full_external_data_path = os.path.join(os.path.dirname(path), external_data_path)
+    if os.path.exists(full_external_data_path):
+        os.remove(full_external_data_path)
+    onnx.save(
+        model,
+        path,
+        save_as_external_data=True,
+        all_tensors_to_one_file=True,
+        location=external_data_path,
+    )

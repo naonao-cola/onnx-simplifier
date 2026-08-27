@@ -80,3 +80,28 @@ def test_export_transformers_model_returns_check_results(tmp_path):
         "decoder_with_past_model.onnx",
     }
     assert all(results.values()), results
+
+
+def test_export_transformers_model_save_as_external_data(tmp_path):
+    out_dir = str(tmp_path)
+    try:
+        onnxsim.export_transformers_model(
+            _MODEL_ID,
+            out_dir,
+            task="text2text-generation-with-past",
+            save_as_external_data=True,
+        )
+    except Exception as e:
+        pytest.skip(f"Could not export {_MODEL_ID} from Hugging Face Hub: {e}")
+
+    for name in (
+        "encoder_model.onnx",
+        "decoder_model.onnx",
+        "decoder_with_past_model.onnx",
+    ):
+        # Every graph gets its own companion .data file, even though this
+        # tiny model would easily fit inline -- save_as_external_data forces
+        # it on regardless of size.
+        assert os.path.exists(os.path.join(out_dir, name + ".data"))
+        model = onnx.load(os.path.join(out_dir, name))  # resolves external data
+        assert len(model.graph.node) > 0
