@@ -220,17 +220,30 @@ print("CHILD_RESULT " + repr({"ok": ok, "self_peak_mib": peak}))
 
 
 def measure(model_path, check_n):
-    child_script = os.path.join(BENCH, "_decoder_oom_repro_child.py")
-    with open(child_script, "w") as f:
+    # NOTE: resource.getrusage(RUSAGE_CHILDREN).ru_maxrss is a monotonic
+    # high-water mark across *every* child this process has ever reaped, not
+    # a per-call value -- so this function is only accurate as the *first and
+    # only* subprocess.run() a given Python process performs. Calling it
+    # more than once from the same long-lived process (as an earlier version
+    # of `matrix` below did, in-process) makes every measurement after the
+    # first report max(this run's true peak, every earlier run's peak) --
+    # silently overstating any run that happens to peak lower than a
+    # previous one in the same process. `matrix` avoids this by invoking
+    # `measure` as a fresh top-level process per row (see run_measure_subprocess).
+    import tempfile
+    fd, child_script = tempfile.mkstemp(suffix=".py", prefix="_onnxsim_oom_child_")
+    with os.fdopen(fd, "w") as f:
         f.write(_CHILD_SRC)
     t0 = time.time()
-    proc = subprocess.run(
-        [sys.executable, child_script, model_path, str(check_n)],
-        capture_output=True, text=True,
-    )
+    try:
+        proc = subprocess.run(
+            [sys.executable, child_script, model_path, str(check_n)],
+            capture_output=True, text=True,
+        )
+    finally:
+        os.remove(child_script)
     dt = time.time() - t0
     peak = resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss / 1024
-    os.remove(child_script)
     result = {
         "model": model_path,
         "check_n": check_n,
@@ -243,6 +256,22 @@ def measure(model_path, check_n):
     }
     print("RESULT " + json.dumps(result))
     return result
+
+
+def run_measure_subprocess(model_path, check_n):
+    """Run `measure` as a brand-new top-level process (see the accuracy note
+    in `measure` above for why `matrix` must not call `measure` in-process)."""
+    proc = subprocess.run(
+        [sys.executable, __file__, "measure", model_path, "--check-n", str(check_n)],
+        capture_output=True, text=True,
+    )
+    print(proc.stdout, end="")
+    if proc.stderr:
+        print(proc.stderr, file=sys.stderr, end="")
+    for line in proc.stdout.splitlines():
+        if line.startswith("RESULT "):
+            return json.loads(line[len("RESULT "):])
+    raise RuntimeError(f"measure subprocess produced no RESULT line (exit {proc.returncode})")
 
 
 # --------------------------------------------------------------------------- #
@@ -260,7 +289,7 @@ def matrix(work_dir, sizes_gb, keep):
                 d, layers, DEFAULT_HIDDEN, DEFAULT_FFN, 8, layout, seed=0
             )
             for check_n in (0, 1) if layout == "many" else (0,):
-                r = measure(model_path, check_n)
+                r = run_measure_subprocess(model_path, check_n)
                 r["layout"] = layout
                 r["total_gb"] = round(total_bytes / 1e9, 2)
                 r["ratio"] = round(r["peak_rss_child_mib"] / 1024 / r["total_gb"], 2)
