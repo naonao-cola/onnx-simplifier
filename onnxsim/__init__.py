@@ -36,6 +36,7 @@ from onnxsim.gguf_reconstruct import (
 from onnxsim.gptq import apply_gptq
 from onnxsim.hqq import quantize_weight_only_int4_hqq
 from onnxsim.llm_int8 import apply_llm_int8
+from onnxsim.low_rank_compensation import apply_low_rank_compensation
 from onnxsim.nf4 import NF4_CODEBOOK, quantize_weight_only_nf4
 from onnxsim.onnx_simplifier import (
     cross_layer_equalize,
@@ -61,6 +62,7 @@ from onnxsim.onnx_simplifier import (
     read_gguf_metadata,
     simplify,
 )
+from onnxsim.ort_matmul_nbits_workaround import workaround_ort_matmul_nbits_axis0_bug
 from onnxsim.precision_estimator import (
     ModelQuantizationEstimate,
     estimate_model_quantization_drop,
@@ -90,6 +92,8 @@ __all__ = [
     "apply_gptq",
     "apply_smoothquant",
     "apply_llm_int8",
+    "apply_low_rank_compensation",
+    "workaround_ort_matmul_nbits_axis0_bug",
     "quantize_attention_dynamic",
     "quantize_dynamic",
     "quantize_dynamic_matmul_integer_to_float",
