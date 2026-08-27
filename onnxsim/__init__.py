@@ -29,6 +29,10 @@ from onnxsim.calibration import (
     quantize_static,
     quantize_static_int16,
 )
+from onnxsim.gguf_reconstruct import (
+    UnsupportedArchitectureError,
+    reconstruct_gguf_graph,
+)
 from onnxsim.gptq import apply_gptq
 from onnxsim.onnx_simplifier import (
     cross_layer_equalize,
@@ -117,5 +121,7 @@ __all__ = [
     "import_gguf",
     "import_gguf_weights",
     "read_gguf_metadata",
+    "reconstruct_gguf_graph",
+    "UnsupportedArchitectureError",
     "__version__",
 ]
