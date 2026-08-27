@@ -129,6 +129,7 @@ def _run_with_onnxruntime(
     custom_lib: Optional[str],
     providers: Optional[Sequence[Provider]] = None,
     single_threaded: bool = False,
+    deterministic: bool = False,
 ) -> "OrderedDict[str, np.ndarray]":
     if providers is None:
         providers = DEFAULT_PROVIDERS
@@ -146,6 +147,21 @@ def _run_with_onnxruntime(
     # planning buffer reuse across *repeated* Run() calls -- pays for itself
     # never. Disabling it removes that planning cost from every session.
     sess_options.enable_mem_pattern = False
+    if deterministic:
+        # onnxruntime's own documented switch for exactly this: steers CPU/
+        # CUDA/ROCM kernels (MatMul, reductions, etc.) away from any
+        # algorithm whose result can depend on the host's available CPU/GPU
+        # instruction set (e.g. MLAS choosing an AVX-512 vs. AVX2 vs. SSE
+        # kernel), at some performance cost. Without this, two hosts that
+        # differ only in SIMD width can silently diverge in a
+        # graph_optimization_level=0 session too, since that level only
+        # controls *graph rewrites*, not which low-level kernel a node's op
+        # dispatches to. Combine with single_threaded=True (below) to also
+        # remove thread-partitioning as a source of divergence -- both matter
+        # for a *measurement* like :func:`onnxsim.measure_accuracy_drop`,
+        # which is only meaningful if it reproduces regardless of which
+        # machine runs it.
+        sess_options.use_deterministic_compute = True
     if single_threaded:
         # Constant folding creates one throwaway session per fold-group, often
         # hundreds of times per model (once per batch of foldable nodes, per
@@ -228,6 +244,7 @@ def run_model(
     custom_lib: Optional[str] = None,
     providers: Optional[Sequence[Provider]] = None,
     single_threaded: bool = False,
+    deterministic: bool = False,
 ) -> "OrderedDict[str, np.ndarray]":
     """Run ``model`` on ``inputs`` and return an ordered ``{name: array}`` map.
 
@@ -245,9 +262,25 @@ def run_model(
             work; leave this ``False`` for a full-size model. Ignored by the
             pure-Python reference-evaluator fallback (no onnxruntime installed),
             which has no thread pool to configure.
+    :param deterministic: Set onnxruntime's ``use_deterministic_compute``
+            session option, which steers kernels (CPU, CUDA, ROCM) away from
+            any algorithm whose numerical result depends on the host's SIMD
+            capabilities (e.g. AVX-512 vs. AVX2 vs. SSE) rather than the model
+            and inputs alone -- at some performance cost. Used by
+            :func:`onnxsim.measure_accuracy_drop`, a *measurement* that should
+            reproduce across hosts; combine with ``single_threaded=True`` to
+            also remove thread-partitioning as a source of divergence. Ignored
+            by the pure-Python reference-evaluator fallback (already fully
+            deterministic, no SIMD dispatch of its own).
     """
     if _HAS_ONNXRUNTIME:
         return _run_with_onnxruntime(
-            model, inputs, output_names, custom_lib, providers, single_threaded
+            model,
+            inputs,
+            output_names,
+            custom_lib,
+            providers,
+            single_threaded,
+            deterministic,
         )
     return _run_with_reference(model, inputs, output_names, custom_lib, providers)

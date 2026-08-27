@@ -288,6 +288,15 @@ def measure_accuracy_drop(
     float model's -- an empirical measurement, not
     :func:`onnxsim.estimate_model_quantization_drop`'s static estimate.
 
+    Runs single-threaded with onnxruntime's ``use_deterministic_compute`` set
+    (see :func:`onnxsim.backend.run_model`'s ``single_threaded``/
+    ``deterministic`` parameters), at some performance cost: a measurement
+    that silently varies with the host's core count or SIMD capabilities
+    (e.g. AVX-512 vs. AVX2) isn't a trustworthy quality gate for CI or
+    anywhere else the same model+data might be measured on different
+    machines. This does not change *what* is measured -- only removes those
+    two axes of run-to-run variance from how it is measured.
+
     Assumes ``float_model`` and ``quantized_model`` declare the same output
     *names* and count -- true of every onnxsim ``quantize_*``/:func:`quantize`
     call, which never renames or adds/removes graph outputs. Per-output
@@ -329,11 +338,19 @@ def measure_accuracy_drop(
     all_finite = True
 
     for batch in calibration_data:
-        float_out = backend.run_model(float_model, batch, providers=providers)
+        float_out = backend.run_model(
+            float_model,
+            batch,
+            providers=providers,
+            single_threaded=True,
+            deterministic=True,
+        )
         quantized_out = backend.run_model(
             quantized_model,
             _cast_batch_to_model_inputs(quantized_model, batch),
             providers=providers,
+            single_threaded=True,
+            deterministic=True,
         )
         for name in output_names:
             f = np.asarray(float_out[name], dtype=np.float64).ravel()
