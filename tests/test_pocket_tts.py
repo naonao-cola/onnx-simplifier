@@ -72,7 +72,6 @@ import time
 import urllib.error
 import urllib.request
 
-import numpy as np
 import onnx
 import pytest
 
@@ -214,7 +213,9 @@ def test_pocket_tts_flow_lm_main_quantize_weight_only(pocket_tts_model_dir):
     # initializer, exposing flow_lm_main's real ~226MB of Linear weights to
     # the quantizer.
     path = _download("flow_lm_main.onnx", pocket_tts_model_dir)
-    simplified, _ = onnxsim.simplify(path, check_n=0)  # check_n=0: no numerical check, just the fold
+    simplified, _ = onnxsim.simplify(
+        path, check_n=0
+    )  # check_n=0: no numerical check, just the fold
 
     float_bytes = sum(
         len(t.raw_data) if t.HasField("raw_data") else len(t.SerializeToString())

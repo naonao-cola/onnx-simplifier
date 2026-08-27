@@ -155,9 +155,7 @@ def test_generate_random_calibration_data_keeps_static_zero_dim():
     nodes = [onnx.helper.make_node("MatMul", ["X", "W"], ["Y"])]
     # X's second dim is dynamic (symbolic "seq"); "state" has a real,
     # static empty dimension at index 1.
-    x_vi = onnx.helper.make_tensor_value_info(
-        "X", onnx.TensorProto.FLOAT, [2, "seq"]
-    )
+    x_vi = onnx.helper.make_tensor_value_info("X", onnx.TensorProto.FLOAT, [2, "seq"])
     state_vi = onnx.helper.make_tensor_value_info(
         "state", onnx.TensorProto.FLOAT, [1, 0, 4]
     )
