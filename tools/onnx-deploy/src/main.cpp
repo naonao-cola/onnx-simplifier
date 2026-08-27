@@ -22,15 +22,26 @@ struct Args {
   int64_t max_new_tokens = 32;
   int64_t eos_token_id = -1;
   int64_t decoder_start_token_id = 0;
+  std::string execution_provider = "cpu";
+  int cuda_device_id = 0;
 };
 
 [[noreturn]] void Usage(const char* prog) {
   std::fprintf(stderr,
       "usage: %s --libort PATH <export_dir> <id1,id2,...> [--max-new-tokens N]\n"
-      "          [--eos-token-id N] [--decoder-start-token-id N]\n\n"
+      "          [--eos-token-id N] [--decoder-start-token-id N]\n"
+      "          [--execution-provider cpu|cuda|webgpu] [--cuda-device-id N]\n\n"
       "--libort PATH points at the libonnxruntime shared library to load at\n"
       "runtime (e.g. an extracted onnxruntime-linux-x64-*.tgz's lib/libonnxruntime.so) --\n"
       "any build works, nothing about this tool is compiled against a specific one.\n\n"
+      "--execution-provider cuda requires --libort to point at a CUDA-enabled ORT\n"
+      "build (e.g. an onnxruntime-linux-x64-gpu-*.tgz release) and a CUDA-capable\n"
+      "GPU/driver -- otherwise this fails cleanly with ORT's own error, not a crash.\n"
+      "--execution-provider webgpu requires --libort to point at an ORT build with\n"
+      "the native WebGPU EP compiled in (--use_webgpu from source as of ORT 1.23.0 --\n"
+      "the plain prebuilt release tarballs don't include it) and a GPU; this is ORT's\n"
+      "own native WebGPU EP (Dawn), not onnxruntime-web's browser one the wasm/ build\n"
+      "uses -- same clean-failure behavior if unavailable.\n\n"
       "<export_dir> must contain decoder_model.onnx + decoder_with_past_model.onnx\n"
       "(and encoder_model.onnx for seq2seq models) -- the optimum-onnx\n"
       "no_post_process=True export shape. <id1,id2,...> are token ids (from a\n"
@@ -61,6 +72,8 @@ Args ParseArgs(int argc, char** argv) {
     else if (arg == "--max-new-tokens") a.max_new_tokens = std::stoll(need(i));
     else if (arg == "--eos-token-id") a.eos_token_id = std::stoll(need(i));
     else if (arg == "--decoder-start-token-id") a.decoder_start_token_id = std::stoll(need(i));
+    else if (arg == "--execution-provider") a.execution_provider = need(i);
+    else if (arg == "--cuda-device-id") a.cuda_device_id = std::stoi(need(i));
     else if (arg == "-h" || arg == "--help") Usage(argv[0]);
     else if (!arg.empty() && arg[0] == '-') {
       std::fprintf(stderr, "unknown argument: %s\n", arg.c_str());
@@ -90,10 +103,12 @@ int main(int argc, char** argv) {
   char* err = nullptr;
   if (onnx_deploy_load_ort(args.libort_path.c_str(), &err) != ONNX_DEPLOY_OK) Die("onnx_deploy_load_ort", err);
 
-  OnnxDeployPipeline* pipeline = onnx_deploy_create(args.model_dir.c_str(), &err);
-  if (!pipeline) Die("onnx_deploy_create", err);
-  std::printf("loaded %s pipeline from %s (via %s)\n", onnx_deploy_is_seq2seq(pipeline) ? "seq2seq" : "decoder-only",
-              args.model_dir.c_str(), args.libort_path.c_str());
+  OnnxDeployPipeline* pipeline =
+      onnx_deploy_create_ex(args.model_dir.c_str(), args.execution_provider.c_str(), args.cuda_device_id, &err);
+  if (!pipeline) Die("onnx_deploy_create_ex", err);
+  std::printf("loaded %s pipeline from %s (via %s, execution provider: %s)\n",
+              onnx_deploy_is_seq2seq(pipeline) ? "seq2seq" : "decoder-only", args.model_dir.c_str(),
+              args.libort_path.c_str(), args.execution_provider.c_str());
 
   int64_t* out_ids = nullptr;
   size_t out_count = 0;

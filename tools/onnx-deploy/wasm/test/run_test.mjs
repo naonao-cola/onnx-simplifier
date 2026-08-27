@@ -29,8 +29,9 @@ const decoderPastBytes = new Uint8Array(readFileSync(path.join(modelDir, "decode
 const moduleConfig = installRuntime({});
 const Module = await createOnnxDeployWasmModule(moduleConfig);
 
-async function run(maxNewTokens, eosTokenId) {
-  const result = await Module.generate(encoderBytes, decoderBytes, decoderPastBytes, [3, 4], maxNewTokens, eosTokenId, 0);
+async function run(maxNewTokens, eosTokenId, executionProviders = []) {
+  const result = await Module.generate(
+    encoderBytes, decoderBytes, decoderPastBytes, [3, 4], maxNewTokens, eosTokenId, 0, executionProviders);
   return Array.from(result, (v) => Number(v));
 }
 
@@ -41,5 +42,23 @@ assert.deepEqual(full, [0, 1, 2, 3, 4, 5, 6, 0], "full 8-token sequence mismatch
 const early = await run(20, 6);
 console.log("generate(max_new_tokens=20, eos_token_id=6):", early);
 assert.deepEqual(early, [0, 1, 2, 3, 4, 5, 6], "eos_token_id early-stop mismatch");
+
+const explicitWasm = await run(8, -1, ["wasm"]);
+console.log('generate(execution_providers=["wasm"]):', explicitWasm);
+assert.deepEqual(explicitWasm, [0, 1, 2, 3, 4, 5, 6, 0], "explicit wasm EP sequence mismatch");
+
+// This environment has no navigator.gpu (plain Node, no GPU) -- requesting
+// webgpu must fail cleanly through the Asyncify boundary (a rejected
+// Promise from generate()), not hang or crash the process. Proves the
+// execution_providers plumbing actually reaches onnxruntime-web's EP
+// selection rather than silently ignoring it.
+let webgpuFailed = false;
+try {
+  await run(8, -1, ["webgpu"]);
+} catch (e) {
+  webgpuFailed = true;
+  console.log("generate(execution_providers=[\"webgpu\"]) correctly rejected (no navigator.gpu here):", String(e).slice(0, 120));
+}
+assert.ok(webgpuFailed, "expected generate() with webgpu EP to fail in a navigator.gpu-less environment");
 
 console.log("OK: onnx_deploy_wasm matches the native pipeline's expected output.");

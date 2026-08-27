@@ -203,6 +203,74 @@ if that's the real requirement.
 - **The merged `decoder_model_merged.onnx` shape** (see above).
 - **Weight obfuscation/encryption** (see previous section).
 
+## Execution providers (accelerators)
+
+By default every layer runs on CPU (ORT's built-in CPU EP natively, the
+`wasm`/CPU backend in onnxruntime-web). Native, native dynamic library, and
+WASM also support selecting an accelerator, threaded through the same
+swappable-libort design as everything else:
+
+- **Native, CUDA**: `onnx_deploy_create_ex(model_dir, "cuda", cuda_device_id, ...)`
+  (`onnx-deploy --execution-provider cuda --cuda-device-id N`; Python
+  `Pipeline(model_dir, execution_provider="cuda", cuda_device_id=N)`) calls
+  `Ort::SessionOptions::AppendExecutionProvider_CUDA`. This needs the
+  `--libort`/`load_ort()` target to actually be a CUDA-enabled ONNX Runtime
+  build (the plain CPU release tarballs this README's examples use are not;
+  a `-gpu-` release or a from-source `--use_cuda` build is) *and* a
+  CUDA-capable GPU/driver present at runtime -- neither is required at
+  **build** time by this library, same as the CPU case. If either is
+  missing, session creation fails with `ONNX_DEPLOY_ERROR` and ORT's own
+  error message (e.g. naming a missing `libonnxruntime_providers_*.so`, or
+  a CUDA driver error) -- not a crash.
+- **Native, WebGPU**: `onnx_deploy_create_ex(model_dir, "webgpu", 0, ...)`
+  (`--execution-provider webgpu`; Python `execution_provider="webgpu"`)
+  calls the generic `Ort::SessionOptions::AppendExecutionProvider("WebGPU", {})`
+  -- there's no dedicated `AppendExecutionProvider_WebGPU` typed helper the
+  way there is for CUDA, and no provider-options keys are documented for it
+  in `onnxruntime_c_api.h` as of this writing, so none are exposed beyond
+  selecting it by name. This is ORT's own **native** WebGPU EP (built on
+  [Dawn](https://dawn.googlesource.com/dawn), running against a real GPU via
+  Vulkan/Metal/D3D12) -- a genuinely different implementation from
+  onnxruntime-web's browser WebGPU EP the WASM target below uses, despite
+  the identical-looking name. As of ORT 1.23.0 (the latest release as of
+  this writing), confirmed empirically: the plain prebuilt release tarballs
+  (CPU *or* GPU) do **not** include it -- `AppendExecutionProvider("WebGPU", {})`
+  throws `"WebGPU execution provider is not supported in this build"`
+  against them; a from-source build with `--use_webgpu` is needed. Against
+  an even older ORT (1.18.1/1.19.2, which don't yet recognize the name in
+  this generic mechanism at all) it throws `"Unknown provider name..."`
+  instead -- either way, a clean `ONNX_DEPLOY_ERROR`, not a crash.
+- **WASM, WebGPU**: `Module.generate(..., executionProviders)` where
+  `executionProviders` is a JS array like `["webgpu"]` (empty/omitted =
+  onnxruntime-web's own default). Requires the host to actually expose
+  `navigator.gpu` (a real WebGPU-capable browser, or a WebGPU-enabled Node
+  build -- plain Node does not have this). If it doesn't,
+  `ort.InferenceSession.create` fails and `generate()`'s returned Promise
+  rejects cleanly -- see the next paragraph for why that took more than
+  "just let the exception propagate."
+
+**What's actually verified vs. just implemented:** this sandbox has no GPU,
+no CUDA toolkit, no WebGPU-enabled ORT build, and plain Node has no
+`navigator.gpu` -- so none of the three accelerated paths above has been
+run against real hardware. What *is* verified in CI
+(`.github/workflows/onnx-deploy.yml`, see "Verifying the flow" below): the
+CPU path is unaffected (regression-tested), and requesting
+`cuda`/native-`webgpu`/wasm-`webgpu` where unavailable fails cleanly with a
+clear error rather than crashing -- a real, previously-broken behavior for
+the WASM case that testing this (not just implementing it) caught: an
+unhandled rejection crossing the WASM Asyncify boundary (see
+`CreateSession`/`RunSession` in `wasm/src/onnx_deploy_wasm.cpp`) was
+observed to crash the whole process instead of rejecting `generate()`'s
+Promise, no matter how carefully it was try/caught on either the JS or C++
+side of that specific boundary. The fix:
+`Module.onnxDeployCreateSession`/`onnxDeployRunSession` never reject --
+they resolve to `{ __onnxDeployError: message }` on failure
+(`wasm/test/ort_web_runtime.mjs`), which `onnx_deploy_wasm.cpp` checks for
+immediately after every `.await()` and turns into an ordinary,
+synchronously-thrown-and-caught C++ exception, entirely outside any
+Asyncify unwind. `wasm/test/run_test.mjs`'s WebGPU-unavailable case is
+exactly this, and is what actually caught the original crash.
+
 ## Building
 
 ```sh
@@ -243,6 +311,13 @@ checkout, on every change under `tools/onnx-deploy/`:
    process per ORT build).
 7. Checks that a bad model directory and a bad `--libort` path both fail
    cleanly (`ONNX_DEPLOY_ERROR` / exit 1 with a message), not a crash.
+8. Checks that `--execution-provider cuda`, `--execution-provider webgpu`
+   (ORT's native EP -- no GPU/CUDA- or WebGPU-enabled ORT build on this
+   runner), and an unknown provider name all fail cleanly the same way --
+   see "Execution providers" above for what this does and doesn't prove.
+   The `wasm-verify` job's `run_test.mjs` run includes the equivalent
+   WebGPU-unavailable check for onnxruntime-web's (different) browser
+   WebGPU EP.
 
 To reproduce locally: download any two ONNX Runtime releases from
 <https://github.com/microsoft/onnxruntime/releases> (`onnxruntime-linux-x64-*.tgz`
@@ -306,5 +381,7 @@ python3 ../scripts/make_toy_seq2seq.py -o /tmp/toy_seq2seq --vocab-size 7 --enco
 cd test && npm install && node run_test.mjs /tmp/toy_seq2seq
 # -> generate(max_new_tokens=8, eos=-1): [0, 1, 2, 3, 4, 5, 6, 0]
 #    generate(max_new_tokens=20, eos_token_id=6): [0, 1, 2, 3, 4, 5, 6]
+#    generate(execution_providers=["wasm"]): [0, 1, 2, 3, 4, 5, 6, 0]
+#    generate(execution_providers=["webgpu"]) correctly rejected (no navigator.gpu here): ...
 #    OK: onnx_deploy_wasm matches the native pipeline's expected output.
 ```

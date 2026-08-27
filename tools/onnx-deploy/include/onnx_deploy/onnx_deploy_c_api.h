@@ -76,6 +76,32 @@ typedef struct OnnxDeployPipeline OnnxDeployPipeline;
  */
 ONNX_DEPLOY_C_API OnnxDeployPipeline* onnx_deploy_create(const char* model_dir, char** out_error);
 
+/*
+ * Same as onnx_deploy_create, but selects which execution provider every
+ * session in the pipeline runs on:
+ *   execution_provider == NULL or "cpu" -- ORT's built-in CPU EP (default,
+ *     same as onnx_deploy_create).
+ *   execution_provider == "cuda" -- Ort::SessionOptions::AppendExecutionProvider_CUDA,
+ *     with cuda_device_id selecting the GPU (ignored for "cpu"). This only
+ *     works if the libonnxruntime onnx_deploy_load_ort() loaded was itself
+ *     built with CUDA EP support (the plain CPU release tarballs are not;
+ *     a "-gpu-" release, or a from-source build with --use_cuda, is) and a
+ *     CUDA-capable GPU/driver is actually present -- neither is required at
+ *     build time by this library. If either is missing, this call fails
+ *     cleanly with ONNX_DEPLOY_ERROR and ORT's own error message in
+ *     *out_error (e.g. naming a missing provider shared library or a CUDA
+ *     driver error) -- not a crash.
+ *   execution_provider == "webgpu" -- ORT's *native* WebGPU EP (Dawn,
+ *     Vulkan/Metal/D3D12 -- not onnxruntime-web's browser one, which the
+ *     separate wasm/ target uses instead). cuda_device_id is ignored. As of
+ *     ORT 1.23.0 this needs a from-source build with --use_webgpu; the
+ *     plain prebuilt release tarballs (CPU or GPU) do not include it and
+ *     fail the same clean way as a missing CUDA build.
+ * Any other value is rejected with ONNX_DEPLOY_ERROR.
+ */
+ONNX_DEPLOY_C_API OnnxDeployPipeline* onnx_deploy_create_ex(const char* model_dir, const char* execution_provider,
+                                                             int cuda_device_id, char** out_error);
+
 /* Releases a pipeline created by onnx_deploy_create. NULL is ignored. */
 ONNX_DEPLOY_C_API void onnx_deploy_destroy(OnnxDeployPipeline* pipeline);
 

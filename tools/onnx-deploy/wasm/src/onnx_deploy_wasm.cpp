@@ -94,13 +94,32 @@ struct Session {
   std::vector<std::string> output_names;
 };
 
-// Awaits Module.onnxDeployCreateSession(bytes) and records the returned
-// handle + the graph's actual input/output names (mirrors
-// kv_cache_pipeline.h's detail::InputNames/OutputNames, which read them off
-// a native Ort::Session -- here they come back from the JS-side
-// ort.InferenceSession instead).
-Session CreateSession(const val& bytes) {
-  val result = val::module_property("onnxDeployCreateSession")(bytes).await();
+// Module.onnxDeployCreateSession/onnxDeployRunSession never reject their
+// returned Promise (see ort_web_runtime.mjs's errorResult) -- they resolve
+// to `{ __onnxDeployError: message }` on failure instead, because a
+// rejection surfacing through val::await() has been observed to crash the
+// process instead of reliably becoming a catchable C++ exception. Every
+// .await() result is checked with this immediately afterward, so a JS-side
+// failure becomes a normal, synchronously-thrown C++ exception -- ordinary
+// propagation from there, no Asyncify unwind involved.
+void ThrowIfJsError(const val& result) {
+  val error = result["__onnxDeployError"];
+  if (!error.isUndefined()) throw std::runtime_error(error.as<std::string>());
+}
+
+// Awaits Module.onnxDeployCreateSession(bytes, executionProviders) and
+// records the returned handle + the graph's actual input/output names
+// (mirrors kv_cache_pipeline.h's detail::InputNames/OutputNames, which read
+// them off a native Ort::Session -- here they come back from the JS-side
+// ort.InferenceSession instead). `execution_providers` is a JS array of
+// onnxruntime-web EP name strings (e.g. ["webgpu"]); pass val::array() (or
+// leave it default) for onnxruntime-web's own default (the wasm/CPU
+// backend). See ort_web_runtime.mjs's onnxDeployCreateSession for the other
+// half of this contract, including why a missing WebGPU host fails cleanly
+// here rather than crashing.
+Session CreateSession(const val& bytes, const val& execution_providers) {
+  val result = val::module_property("onnxDeployCreateSession")(bytes, execution_providers).await();
+  ThrowIfJsError(result);
   Session s;
   s.handle = result["handle"].as<double>();
   s.input_names = emscripten::vecFromJSArray<std::string>(result["inputNames"]);
@@ -120,6 +139,7 @@ std::vector<WasmTensor> RunSession(const Session& session, const std::map<std::s
   val output_names_arr = val::array(session.output_names.begin(), session.output_names.end());
 
   val result = val::module_property("onnxDeployRunSession")(session.handle, inputs_arr, output_names_arr).await();
+  ThrowIfJsError(result);
   std::vector<WasmTensor> outputs;
   outputs.reserve(session.output_names.size());
   for (size_t i = 0; i < session.output_names.size(); ++i) outputs.push_back(ValToTensor(result[i]));
@@ -187,21 +207,27 @@ int64_t ArgmaxLastToken(const WasmTensor& logits) {
 }
 
 // Mirrors KvCachePipeline::Generate. `encoder_bytes` may be val::undefined()/
-// val::null() for a decoder-only (causal LM) pipeline.
-val Generate(val encoder_bytes, val decoder_bytes, val decoder_past_bytes, val input_ids_val, double max_new_tokens,
-             double eos_token_id, double decoder_start_token_id) {
+// val::null() for a decoder-only (causal LM) pipeline. `execution_providers`
+// is a JS array of onnxruntime-web EP name strings applied to every session
+// (e.g. ["webgpu"]; an empty array uses onnxruntime-web's own default). See
+// CreateSession above and ort_web_runtime.mjs's onnxDeployCreateSession for
+// what this actually does and how it fails when the requested EP isn't
+// available on the host (e.g. no navigator.gpu for "webgpu").
+val GenerateImpl(val encoder_bytes, val decoder_bytes, val decoder_past_bytes, val input_ids_val,
+                  double max_new_tokens, double eos_token_id, double decoder_start_token_id,
+                  val execution_providers) {
   bool is_seq2seq = !(encoder_bytes.isUndefined() || encoder_bytes.isNull());
   std::vector<double> input_ids_d = emscripten::vecFromJSArray<double>(input_ids_val);
   std::vector<int64_t> input_ids(input_ids_d.begin(), input_ids_d.end());
 
-  Session decoder_session = CreateSession(decoder_bytes);
-  Session decoder_past_session = CreateSession(decoder_past_bytes);
+  Session decoder_session = CreateSession(decoder_bytes, execution_providers);
+  Session decoder_past_session = CreateSession(decoder_past_bytes, execution_providers);
 
   WasmTensor encoder_hidden_states;
   size_t encoder_seq_len = 0;
   bool have_encoder_hidden_states = false;
   if (is_seq2seq) {
-    Session encoder_session = CreateSession(encoder_bytes);
+    Session encoder_session = CreateSession(encoder_bytes, execution_providers);
     encoder_seq_len = input_ids.size();
     std::map<std::string, WasmTensor> enc_inputs;
     for (const auto& name : encoder_session.input_names) {
@@ -237,6 +263,31 @@ val Generate(val encoder_bytes, val decoder_bytes, val decoder_past_bytes, val i
   }
 
   return val::array(generated.begin(), generated.end());
+}
+
+// A C++ exception thrown after an Asyncify unwind (i.e. anywhere past the
+// first val::await()) does NOT reliably surface as a rejected
+// Module.generate() Promise on its own -- observed in practice as an
+// uncaught exception that crashes the whole process instead (e.g.
+// requesting the "webgpu" EP with no navigator.gpu available). Catching
+// here and explicitly returning a rejected JS Promise works around it: a
+// `val` that is itself a thenable, returned from an Asyncify-wrapped
+// exported function, is adopted by the outer Promise Emscripten's runtime
+// already builds around this call -- standard Promise resolution
+// semantics, not a wasm/embind-specific trick -- so the rejection reaches
+// the actual caller of Module.generate() normally. See
+// ../test/run_test.mjs's webgpu-unavailable case, which is exactly what
+// this fixes.
+val Generate(val encoder_bytes, val decoder_bytes, val decoder_past_bytes, val input_ids_val, double max_new_tokens,
+             double eos_token_id, double decoder_start_token_id, val execution_providers) {
+  try {
+    return GenerateImpl(encoder_bytes, decoder_bytes, decoder_past_bytes, input_ids_val, max_new_tokens,
+                         eos_token_id, decoder_start_token_id, execution_providers);
+  } catch (const std::exception& e) {
+    return val::global("Promise").call<val>("reject", val(std::string(e.what())));
+  } catch (...) {
+    return val::global("Promise").call<val>("reject", val(std::string("unknown error in onnx_deploy_wasm generate()")));
+  }
 }
 
 }  // namespace
