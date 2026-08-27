@@ -65,6 +65,7 @@ from onnxsim.precision_estimator import (
     estimate_model_quantization_drop,
     estimate_quantization_precision,
 )
+from onnxsim.smoothquant import apply_smoothquant
 from onnxsim.transformers_export import export_transformers_model
 
 from .version import version as __version__
@@ -85,6 +86,7 @@ __all__ = [
     "AutoQuantResult",
     "apply_awq",
     "apply_gptq",
+    "apply_smoothquant",
     "quantize_attention_dynamic",
     "quantize_dynamic",
     "quantize_dynamic_matmul_integer_to_float",
