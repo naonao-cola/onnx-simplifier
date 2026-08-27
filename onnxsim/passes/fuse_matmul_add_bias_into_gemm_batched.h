@@ -29,6 +29,7 @@
 
 #include <vector>
 
+#include "gemm_fusion_backend.h"
 #include "onnx/common/assertions.h"
 #include "onnxoptimizer/pass.h"
 #include "onnxoptimizer/passes/pass_util.h"
@@ -106,6 +107,21 @@ struct FuseMatMulAddBiasIntoGemmBatched final : public PredicateBasedPass {
       return false;
     }
     const int64_t k = x_shape.back().dim;
+
+    // ONNX Runtime's CPU execution provider has no fast Gemm kernel for
+    // FLOAT16 (it falls back to a naive/reference path) even though its
+    // MatMul kernel does -- see fuse_matmul_add_bias_into_gemm.h's file
+    // comment for the measurement (a K=1024, N=4096 case: ~110ms for
+    // MatMul+Add vs. ~7.8s for the fused Gemm). Under the default
+    // GemmFusionBackend::kOrtCpu (see gemm_fusion_backend.h), bail out for
+    // any type but FLOAT32 so this pass only fires where the fusion is
+    // actually a speedup on that backend; GemmFusionBackend::kUnrestricted
+    // skips this guard for a deployment target where it does not apply.
+    if (onnxsim::GetGemmFusionBackend() ==
+            onnxsim::GemmFusionBackend::kOrtCpu &&
+        x->elemType() != TensorProto_DataType_FLOAT) {
+      return false;
+    }
 
     // W: a 2-D constant [K, N] with static dims, matching K.
     if (!IsConstantTensor(w) || !w->has_sizes()) {
