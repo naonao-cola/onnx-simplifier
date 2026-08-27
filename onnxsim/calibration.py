@@ -50,8 +50,15 @@ _ELEM_TYPE_TO_NP = {
 def _input_specs(model: onnx.ModelProto) -> List[Tuple[str, List[int], type]]:
     """(name, shape, np_dtype) for every graph input that is not an initializer.
 
-    Dynamic dimensions (including an unset/symbolic batch dimension) are
-    fixed to 1, so the returned shapes are always fully concrete.
+    Dynamic dimensions (a symbolic ``dim_param``, or no dimension value set
+    at all -- typically an unset/symbolic batch dimension) are fixed to 1,
+    so the returned shapes are always fully concrete. A dimension whose
+    ``dim_value`` is genuinely, statically 0 (e.g. an empty KV-cache
+    sentinel state some exporters emit) is kept as 0 rather than promoted
+    to 1: ``dim.dim_value`` reads back as 0 both when it was explicitly set
+    to 0 and when the field is unset entirely, so only ``HasField`` tells
+    the two apart (matches ``model_info.py``'s own ``HasField`` check for
+    the same ambiguity).
     """
     initializer_names = {i.name for i in model.graph.initializer}
     specs = []
@@ -59,7 +66,7 @@ def _input_specs(model: onnx.ModelProto) -> List[Tuple[str, List[int], type]]:
         if ipt.name in initializer_names:
             continue
         shape = [
-            dim.dim_value if dim.dim_value > 0 else 1
+            dim.dim_value if dim.HasField("dim_value") else 1
             for dim in ipt.type.tensor_type.shape.dim
         ]
         np_dtype = _ELEM_TYPE_TO_NP.get(ipt.type.tensor_type.elem_type, np.float32)
