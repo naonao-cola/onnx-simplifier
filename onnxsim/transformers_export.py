@@ -43,7 +43,7 @@ def export_transformers_model(
     task: str = "auto",
     no_post_process: bool = True,
     check_n: int = 0,
-    save_as_external_data: bool = False,
+    save_as_external_data: bool = True,
     export_kwargs: Optional[Dict] = None,
     simplify_kwargs: Optional[Dict] = None,
 ) -> Dict[str, bool]:
@@ -80,12 +80,12 @@ def export_transformers_model(
             model against the freshly exported one for numerical equivalence.
     :param save_as_external_data: always save every simplified graph with its
             weights in a companion ``<filename>.data`` file, instead of
-            inline. Off by default (matching the ``onnxsim`` CLI's own
-            ``--save-as-external-data``, and plain ``onnx.save``), which only
-            uses external data as a fallback once a graph is too large to
-            serialize inline at all (>2GB). Worth turning on for real
-            (non-tiny) transformers models even below that limit: a
-            with-past export is multiple *independent* graphs
+            inline. On by default here -- unlike the ``onnxsim`` CLI's own
+            ``--save-as-external-data``/plain ``onnx.save``, which default off
+            and only use external data as a fallback once a graph is too
+            large to serialize inline at all (>2GB) -- because a real
+            (non-tiny) transformers with-past export is the common case this
+            function exists for, and it is multiple *independent* graphs
             (encoder/decoder/decoder-with-past, see ``no_post_process``
             above), each embedding its own full inline copy of whatever
             weights it uses -- e.g. the decoder's weights end up duplicated
@@ -96,7 +96,9 @@ def export_transformers_model(
             keeps the large tensors on disk instead, so this repeated
             in-memory copying and the inline duplication across split files
             both shrink to metadata (name/offset/length) rather than the
-            tensors themselves.
+            tensors themselves. Pass ``False`` to keep small/tiny models
+            (tests, toy checkpoints) as a single self-contained ``.onnx``
+            file with no companion ``.data``.
     :param export_kwargs: extra keyword arguments forwarded to
             ``optimum.exporters.onnx.main_export`` (e.g. ``opset``,
             ``device``, ``fp16``, ``trust_remote_code``).
