@@ -14,14 +14,27 @@ raw ONNX MatMul/Gemm weights rather than depending on those libraries
 directly: they operate one level up, on a model object onnxsim never has.
 
 *Structured* pruning (removing whole channels/filters, e.g. Torch-Pruning,
-NNI's L1/L2 filter pruning, network slimming) is set aside for a different
-reason: it changes tensor shapes, which ripples through every downstream
-consumer of the pruned dimension (the next layer's input channel count, any
-concat/broadcast that touches it, ...). That is real graph surgery, not a
-self-contained per-layer weight rewrite, and is a bigger and structurally
-different project than anything else in this module -- every other
-``apply_*``/``quantize_*`` pass in onnxsim rewrites one node's own
-initializer(s) in place and leaves every shape in the graph untouched.
+NNI's L1/L2 filter pruning, network slimming, or the expert-intermediate-
+channel/Mamba-state pruning inside NVIDIA's "Iterative Puzzle" compression
+pipeline for hybrid MoE LLMs, https://arxiv.org/abs/2607.04371) is a
+fundamentally bigger project than the rest of this module for two separate
+reasons, and this module only takes on one of them. It *does* change tensor
+shapes, which ripples through every downstream consumer of the pruned
+dimension -- real graph surgery, not the self-contained per-layer weight
+rewrite every other ``apply_*``/``quantize_*`` pass in onnxsim is. That part
+:func:`apply_structured_pruning` takes on, but deliberately only for the
+narrowest topology where the surgery is unambiguous: a single MatMul/Gemm
+whose output feeds, through a chain of shape-preserving elementwise ops
+(activations, a bias/scale add/mul) with no other consumer anywhere along
+that chain, into exactly one downstream MatMul/Gemm's reduction dimension.
+Any residual/skip connection, multi-consumer fan-out, or branch (all of
+which need real dependency-graph analysis -- what Torch-Pruning's DepGraph
+does in general) is left untouched rather than guessed at. The other part
+of the paper's pipeline -- an architecture *search* over what to prune,
+alternated with knowledge-distillation/RL recovery afterwards -- needs a
+training loop onnxsim does not have and is not in scope here at all; this
+is a single, static, no-retraining structural cut, closer in spirit to Li
+et al.'s L2-norm filter pruning (below) than to anything iterative.
 
 What *does* fit that mold, and needs no retraining loop: post-training
 *unstructured* (or semi-structured N:M) pruning, à la magnitude pruning
@@ -60,11 +73,25 @@ Both support two sparsity patterns, chosen per invocation:
 :func:`weight_sparsity` reports the fraction of exact-zero entries across
 every matched layer's weight, as a quick way to confirm a pruning call
 reached its target (or to measure an already-sparse model).
+
+:func:`apply_structured_pruning` actually removes channels (real shape
+reduction, real FLOP/parameter reduction on any runtime, no sparse-kernel
+support needed) from every producer -> consumer chain it can prove safe to
+cut, per output-channel L2-norm importance (Li et al., 2017, "Pruning
+Filters for Efficient ConvNets", https://arxiv.org/abs/1608.08710, adapted
+here from Conv filters to MatMul/Gemm output channels -- the same
+transplant :func:`apply_magnitude_pruning`/:func:`apply_wanda_pruning`
+already made for Han et al./Wanda's element-wise criteria). Because this
+changes shapes, it is unconditionally irreversible and, unlike a retrained
+pipeline, has no distillation/RL step to recover whatever accuracy the cut
+costs -- evaluate the result before shipping it, the same caution any
+lossy onnxsim pass deserves.
 """
 
 from __future__ import annotations
 
-from typing import Dict, Optional, Sequence, Union
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Sequence, Set, Tuple, Union
 
 import numpy as np
 import onnx
@@ -328,3 +355,295 @@ def weight_sparsity(model: Union[str, onnx.ModelProto]) -> float:
         total += w.size
 
     return zeros / total if total else 0.0
+
+
+# --- Structured (channel) pruning -------------------------------------------
+
+# Shape-preserving, channel-order-preserving elementwise ops that may sit
+# between a producer and consumer without blocking the chain: unary
+# activations (single input, single output, no other operand to worry
+# about) and Add/Mul against a constant per-channel bias/scale.
+_UNARY_PASS_THROUGH = {
+    "Relu",
+    "LeakyRelu",
+    "Elu",
+    "Selu",
+    "Sigmoid",
+    "Tanh",
+    "Softplus",
+    "Softsign",
+    "Gelu",
+    "HardSigmoid",
+    "Mish",
+    "Identity",
+    "Cast",
+}
+_BINARY_CHANNEL_OPS = {"Add", "Mul"}
+_MAX_CHAIN_HOPS = 8
+
+
+@dataclass(frozen=True)
+class _Chain:
+    producer: onnx.NodeProto
+    producer_weight: str
+    producer_weight_transposed: bool
+    producer_bias: Optional[str]
+    chain_ops: Tuple[Tuple[onnx.NodeProto, Optional[str]], ...]
+    consumer_weight: str
+    consumer_weight_transposed: bool
+    n_channels: int
+
+
+def _consumers_of(graph: onnx.GraphProto) -> Dict[str, List[onnx.NodeProto]]:
+    consumers: Dict[str, List[onnx.NodeProto]] = {}
+    for node in graph.node:
+        for inp in node.input:
+            if inp:
+                consumers.setdefault(inp, []).append(node)
+    return consumers
+
+
+def _find_chains(graph: onnx.GraphProto) -> List[_Chain]:
+    initializer_map = {t.name: t for t in graph.initializer}
+    consumers_of = _consumers_of(graph)
+    graph_outputs = {o.name for o in graph.output}
+
+    def _is_internal(name: str) -> bool:
+        # Safe to reshape only if exactly one node reads it and it isn't
+        # itself something the caller observes (a graph output).
+        return len(consumers_of.get(name, [])) == 1 and name not in graph_outputs
+
+    chains = []
+    for node in graph.node:
+        match = _match_matmul_like(node)
+        if match is None:
+            continue
+        _, w_name, weight_transposed = match
+        w_init = initializer_map.get(w_name)
+        if (
+            w_init is None
+            or w_init.data_type != onnx.TensorProto.FLOAT
+            or len(w_init.dims) != 2
+        ):
+            continue
+
+        out_name = node.output[0]
+        if not _is_internal(out_name):
+            continue
+
+        bias_name = None
+        if node.op_type == "Gemm" and len(node.input) == 3:
+            bias_name = node.input[2]
+            if bias_name not in initializer_map:
+                continue  # non-constant bias -- can't safely prune it
+
+        n_channels = w_init.dims[0] if weight_transposed else w_init.dims[1]
+
+        chain_ops: List[Tuple[onnx.NodeProto, Optional[str]]] = []
+        consumer = None
+        cur = out_name
+        for _hop in range(_MAX_CHAIN_HOPS):
+            candidates = consumers_of.get(cur, [])
+            if len(candidates) != 1:
+                break
+            nxt = candidates[0]
+
+            cm = _match_matmul_like(nxt)
+            if cm is not None and cm[0] == cur:
+                _, cw_name, c_weight_transposed = cm
+                cw_init = initializer_map.get(cw_name)
+                if (
+                    cw_init is not None
+                    and cw_init.data_type == onnx.TensorProto.FLOAT
+                    and len(cw_init.dims) == 2
+                ):
+                    k = cw_init.dims[1] if c_weight_transposed else cw_init.dims[0]
+                    if k == n_channels:
+                        consumer = (nxt, cw_name, c_weight_transposed)
+                break
+
+            const_name: Optional[str] = None
+            if (
+                nxt.op_type in _UNARY_PASS_THROUGH
+                and list(nxt.input) == [cur]
+                and len(nxt.output) == 1
+            ):
+                pass
+            elif (
+                nxt.op_type in _BINARY_CHANNEL_OPS
+                and len(nxt.input) == 2
+                and cur in nxt.input
+                and len(nxt.output) == 1
+            ):
+                other = nxt.input[1] if nxt.input[0] == cur else nxt.input[0]
+                const_init = initializer_map.get(other)
+                if (
+                    const_init is not None
+                    and const_init.data_type == onnx.TensorProto.FLOAT
+                    and list(const_init.dims)
+                    and const_init.dims[-1] == n_channels
+                    and int(np.prod(const_init.dims)) == n_channels
+                ):
+                    const_name = other
+                else:
+                    break
+            else:
+                break
+
+            out2 = nxt.output[0]
+            if not _is_internal(out2):
+                break
+            chain_ops.append((nxt, const_name))
+            cur = out2
+
+        if consumer is None:
+            continue
+
+        chains.append(
+            _Chain(
+                producer=node,
+                producer_weight=w_name,
+                producer_weight_transposed=weight_transposed,
+                producer_bias=bias_name,
+                chain_ops=tuple(chain_ops),
+                consumer_weight=consumer[1],
+                consumer_weight_transposed=consumer[2],
+                n_channels=n_channels,
+            )
+        )
+    return chains
+
+
+def _slice_producer_weight(
+    w_init: onnx.TensorProto, weight_transposed: bool, keep: np.ndarray
+) -> None:
+    w = onnx.numpy_helper.to_array(w_init)
+    # [N, K] storage (transB=1): output channel is axis 0. [K, N] storage
+    # (the common case): output channel is axis 1.
+    w_new = w[keep, :] if weight_transposed else w[:, keep]
+    w_init.CopyFrom(onnx.numpy_helper.from_array(w_new, name=w_init.name))
+
+
+def _slice_consumer_weight(
+    w_init: onnx.TensorProto, weight_transposed: bool, keep: np.ndarray
+) -> None:
+    w = onnx.numpy_helper.to_array(w_init)
+    # [N, K] storage (transB=1): reduction dim is axis 1. [K, N] storage:
+    # reduction dim is axis 0.
+    w_new = w[:, keep] if weight_transposed else w[keep, :]
+    w_init.CopyFrom(onnx.numpy_helper.from_array(w_new, name=w_init.name))
+
+
+def _slice_last_axis(init: onnx.TensorProto, keep: np.ndarray) -> None:
+    arr = onnx.numpy_helper.to_array(init)
+    new = np.take(arr, keep, axis=-1)
+    init.CopyFrom(onnx.numpy_helper.from_array(new, name=init.name))
+
+
+def apply_structured_pruning(
+    model: Union[str, onnx.ModelProto],
+    sparsity: float = 0.5,
+) -> onnx.ModelProto:
+    """Removes whole output channels from MatMul/vanilla-Gemm layers --
+    real structural pruning (smaller weight tensors, smaller matmuls on any
+    runtime, not just one with sparse-kernel support), as opposed to
+    :func:`apply_magnitude_pruning`/:func:`apply_wanda_pruning`'s value-only
+    zeroing. See this module's own docstring for the technique, its L2-norm
+    importance metric, and why it's restricted to an unambiguous single
+    producer -> consumer topology rather than general dependency-graph
+    pruning.
+
+    For every MatMul/vanilla-Gemm node (the "producer") whose output feeds,
+    through zero or more shape-preserving elementwise ops (an activation,
+    or an Add/Mul against a constant per-channel bias/scale) with no other
+    consumer anywhere along that path, into exactly one downstream
+    MatMul/vanilla-Gemm's reduction dimension (the "consumer"): ranks the
+    producer's output channels by L2 norm of their own weight row, drops
+    the lowest-``sparsity``-fraction of them, and removes the corresponding
+    rows/columns from the producer's weight (and bias, if it has a constant
+    one) and every intermediate per-channel constant, and the matching
+    columns/rows from the consumer's weight -- a shape change that leaves
+    the two layers' composition mathematically unaffected for every
+    surviving channel.
+
+    :param model: the original onnx ModelProto or file path
+    :param sparsity: target fraction of each matched producer's output
+            channels to remove (at least one channel is always kept)
+    :returns: ``model`` with every matched chain's tensors resized in
+            place; anything not matching that exact topology (branching,
+            a non-constant bias, a consumer whose reduction dimension
+            doesn't line up, ...) is left completely untouched
+    """
+    if not (0.0 <= sparsity < 1.0):
+        raise ValueError(f"sparsity must be in [0, 1), got {sparsity}")
+    if isinstance(model, str):
+        model = onnx.load(model, load_external_data=False)
+
+    out = onnx.ModelProto()
+    out.CopyFrom(model)
+    graph = out.graph
+
+    chains = _find_chains(graph)
+    if not chains:
+        return out
+
+    initializer_map = {t.name: t for t in graph.initializer}
+    # A weight legitimately plays both roles across two different chains --
+    # e.g. the middle layer of a 3-layer MLP is the *consumer* of the first
+    # chain (its reduction/input axis gets pruned) and the *producer* of the
+    # second (its own output axis gets pruned), two independent axes of the
+    # same tensor. Only collapse when the *same role* is claimed twice (a
+    # tied/shared weight), tracked separately per role; bias/scale constants
+    # only ever play one role, so a single shared set is enough for those.
+    producer_touched: Set[str] = set()
+    consumer_touched: Set[str] = set()
+    const_touched: Set[str] = set()
+    stale_value_info: Set[str] = set()
+
+    for chain in chains:
+        consts = {chain.producer_bias} if chain.producer_bias is not None else set()
+        consts.update(
+            const_name for _, const_name in chain.chain_ops if const_name is not None
+        )
+        if (
+            chain.producer_weight in producer_touched
+            or chain.consumer_weight in consumer_touched
+            or (consts & const_touched)
+        ):
+            continue  # a shared/tied initializer another chain already resized
+
+        n = chain.n_channels
+        keep_count = max(1, n - round(n * sparsity))
+        if keep_count >= n:
+            continue  # rounds down to nothing for this layer -- no-op
+
+        w_init = initializer_map[chain.producer_weight]
+        w = onnx.numpy_helper.to_array(w_init).astype(np.float64)
+        w_nk = w if chain.producer_weight_transposed else w.T  # [N, K]
+        importance = np.linalg.norm(w_nk, axis=1)
+        keep = np.sort(np.argsort(-importance)[:keep_count])
+
+        _slice_producer_weight(w_init, chain.producer_weight_transposed, keep)
+        if chain.producer_bias is not None:
+            _slice_last_axis(initializer_map[chain.producer_bias], keep)
+        for _, const_name in chain.chain_ops:
+            if const_name is not None:
+                _slice_last_axis(initializer_map[const_name], keep)
+        _slice_consumer_weight(
+            initializer_map[chain.consumer_weight],
+            chain.consumer_weight_transposed,
+            keep,
+        )
+
+        producer_touched.add(chain.producer_weight)
+        consumer_touched.add(chain.consumer_weight)
+        const_touched.update(consts)
+        stale_value_info.add(chain.producer.output[0])
+        stale_value_info.update(node.output[0] for node, _ in chain.chain_ops)
+
+    if stale_value_info:
+        kept = [vi for vi in graph.value_info if vi.name not in stale_value_info]
+        del graph.value_info[:]
+        graph.value_info.extend(kept)
+
+    return out

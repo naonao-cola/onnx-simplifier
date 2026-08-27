@@ -71,6 +71,7 @@ from onnxsim.precision_estimator import (
 )
 from onnxsim.pruning import (
     apply_magnitude_pruning,
+    apply_structured_pruning,
     apply_wanda_pruning,
     weight_sparsity,
 )
@@ -104,6 +105,7 @@ __all__ = [
     "apply_omniquant",
     "apply_magnitude_pruning",
     "apply_wanda_pruning",
+    "apply_structured_pruning",
     "weight_sparsity",
     "workaround_ort_matmul_nbits_axis0_bug",
     "quantize_attention_dynamic",
