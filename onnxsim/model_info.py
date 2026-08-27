@@ -204,8 +204,14 @@ def _representative_number(value: Macs) -> int:
     # Collapse a (possibly symbolic) MAC count to a single number by setting
     # every free dimension to 1. Used only for ordering and the summary table's
     # highlighting -- never for the reported value, which stays symbolic.
+    # ``xreplace`` (a direct, purely syntactic tree substitution), not ``subs``
+    # (which layers on structural-equality/simplification passes meant for
+    # pattern-based substitution): every replacement here is an exact Symbol
+    # swapped for a literal, and ``subs`` on that over hundreds of free symbols
+    # -- as models with undeduplicated dynamic dims can produce -- takes
+    # minutes where ``xreplace`` takes a fraction of a second.
     if sympy is not None and isinstance(value, sympy.Expr):
-        value = value.subs({s: 1 for s in value.free_symbols})
+        value = value.xreplace({s: sympy.Integer(1) for s in value.free_symbols})
     return int(value)
 
 
