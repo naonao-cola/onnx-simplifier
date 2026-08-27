@@ -187,10 +187,10 @@ def test_weight_sparsity_ignores_non_matching_layers():
 # --- apply_structured_pruning ------------------------------------------------
 
 
-def _mlp_model(K=8, H=32, O=4, bias=True, activation="Relu", seed=0):
+def _mlp_model(K=8, H=32, Out=4, bias=True, activation="Relu", seed=0):
     rng = np.random.default_rng(seed)
     w1 = rng.standard_normal((K, H)).astype(np.float32)
-    w2 = rng.standard_normal((H, O)).astype(np.float32)
+    w2 = rng.standard_normal((H, Out)).astype(np.float32)
     initializer = [_f32(w1, "W1"), _f32(w2, "W2")]
     if bias:
         b1 = rng.standard_normal((H,)).astype(np.float32)
@@ -204,7 +204,7 @@ def _mlp_model(K=8, H=32, O=4, bias=True, activation="Relu", seed=0):
         onnx.helper.make_node("MatMul", ["a", "W2"], ["Y"]),
     ]
     return _model(
-        nodes, [_vi("X", ["batch", K])], [_vi("Y", ["batch", O])], initializer
+        nodes, [_vi("X", ["batch", K])], [_vi("Y", ["batch", Out])], initializer
     )
 
 
@@ -214,7 +214,7 @@ def _oracle_keep_indices(w1, keep_count):
 
 
 def test_structured_pruning_shrinks_matched_layers():
-    model = _mlp_model(K=8, H=32, O=4)
+    model = _mlp_model(K=8, H=32, Out=4)
     pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
     onnx.checker.check_model(pruned)
 
@@ -229,8 +229,8 @@ def test_structured_pruning_matches_manual_channel_deletion_exactly():
     # half the hidden units on random weights changes the output a lot,
     # by design) -- it's exact equivalence to deleting the same channels
     # by hand in numpy.
-    K, H, O = 8, 32, 4
-    model = _mlp_model(K=K, H=H, O=O, bias=True)
+    K, H, Out = 8, 32, 4
+    model = _mlp_model(K=K, H=H, Out=Out, bias=True)
     orig = {t.name: onnx.numpy_helper.to_array(t) for t in model.graph.initializer}
     w1, b1, w2 = orig["W1"], orig["B1"], orig["W2"]
 
@@ -250,8 +250,8 @@ def test_structured_pruning_matches_manual_channel_deletion_exactly():
 
 def test_structured_pruning_matmul_only_chain_matches_oracle():
     # No Gemm bias at all -- a plain MatMul -> activation -> MatMul chain.
-    K, H, O = 8, 24, 4
-    model = _mlp_model(K=K, H=H, O=O, bias=False, activation="Sigmoid")
+    K, H, Out = 8, 24, 4
+    model = _mlp_model(K=K, H=H, Out=Out, bias=False, activation="Sigmoid")
     w1 = onnx.numpy_helper.to_array(model.graph.initializer[0])
     w2 = onnx.numpy_helper.to_array(model.graph.initializer[1])
 
@@ -272,11 +272,11 @@ def test_structured_pruning_matmul_only_chain_matches_oracle():
 def test_structured_pruning_bias_add_between_matmuls_matches_oracle():
     # Bias as a separate Add node (not Gemm's own 3rd input) must be caught
     # by the elementwise chain-walk, not just Gemm's native bias slot.
-    K, H, O = 8, 16, 4
+    K, H, Out = 8, 16, 4
     rng = np.random.default_rng(3)
     w1 = rng.standard_normal((K, H)).astype(np.float32)
     bias = rng.standard_normal((H,)).astype(np.float32)
-    w2 = rng.standard_normal((H, O)).astype(np.float32)
+    w2 = rng.standard_normal((H, Out)).astype(np.float32)
     nodes = [
         onnx.helper.make_node("MatMul", ["X", "W1"], ["h"]),
         onnx.helper.make_node("Add", ["h", "Bias"], ["hb"]),
@@ -286,7 +286,7 @@ def test_structured_pruning_bias_add_between_matmuls_matches_oracle():
     model = _model(
         nodes,
         [_vi("X", ["batch", K])],
-        [_vi("Y", ["batch", O])],
+        [_vi("Y", ["batch", Out])],
         [_f32(w1, "W1"), _f32(bias, "Bias"), _f32(w2, "W2")],
     )
 
@@ -308,25 +308,25 @@ def test_structured_pruning_skips_branching_output():
     # h feeds both the Relu->MatMul chain *and* is itself a graph output --
     # pruning it would silently change what the caller observes, so this
     # must be left completely untouched.
-    K, H, O = 8, 16, 4
-    model = _mlp_model(K=K, H=H, O=O, bias=False)
+    K, H, Out = 8, 16, 4
+    model = _mlp_model(K=K, H=H, Out=Out, bias=False)
     graph = model.graph
     graph.output.append(_vi("h", ["batch", H]))
 
     pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
     inits = {t.name: t for t in pruned.graph.initializer}
     assert list(inits["W1"].dims) == [K, H]
-    assert list(inits["W2"].dims) == [H, O]
+    assert list(inits["W2"].dims) == [H, Out]
 
 
 def test_structured_pruning_skips_multi_consumer_branch():
     # h feeds two separate downstream MatMuls -- not the single-consumer
     # chain this pass proves safe to cut, so it must be left untouched.
-    K, H, O = 8, 16, 4
+    K, H, Out = 8, 16, 4
     rng = np.random.default_rng(4)
     w1 = rng.standard_normal((K, H)).astype(np.float32)
-    w2 = rng.standard_normal((H, O)).astype(np.float32)
-    w3 = rng.standard_normal((H, O)).astype(np.float32)
+    w2 = rng.standard_normal((H, Out)).astype(np.float32)
+    w3 = rng.standard_normal((H, Out)).astype(np.float32)
     nodes = [
         onnx.helper.make_node("MatMul", ["X", "W1"], ["h"]),
         onnx.helper.make_node("MatMul", ["h", "W2"], ["Y1"]),
@@ -335,7 +335,7 @@ def test_structured_pruning_skips_multi_consumer_branch():
     model = _model(
         nodes,
         [_vi("X", ["batch", K])],
-        [_vi("Y1", ["batch", O]), _vi("Y2", ["batch", O])],
+        [_vi("Y1", ["batch", Out]), _vi("Y2", ["batch", Out])],
         [_f32(w1, "W1"), _f32(w2, "W2"), _f32(w3, "W3")],
     )
 
@@ -345,14 +345,14 @@ def test_structured_pruning_skips_multi_consumer_branch():
 
 
 def test_structured_pruning_zero_sparsity_is_a_no_op():
-    model = _mlp_model(K=8, H=16, O=4)
+    model = _mlp_model(K=8, H=16, Out=4)
     pruned = onnxsim.apply_structured_pruning(model, sparsity=0.0)
     inits = {t.name: t for t in pruned.graph.initializer}
     assert list(inits["W1"].dims) == [8, 16]
 
 
 def test_structured_pruning_invalid_sparsity_raises():
-    model = _mlp_model(K=8, H=16, O=4)
+    model = _mlp_model(K=8, H=16, Out=4)
     with pytest.raises(ValueError):
         onnxsim.apply_structured_pruning(model, sparsity=1.0)
     with pytest.raises(ValueError):
@@ -363,11 +363,11 @@ def test_structured_pruning_chains_through_a_third_layer():
     # W2 is a producer for one chain (its own output channels feeding W3)
     # and a consumer for another (W1's output channels feeding into it) --
     # independent axes of the same tensor, both must be pruned correctly.
-    K, H1, H2, O = 8, 16, 20, 4
+    K, H1, H2, Out = 8, 16, 20, 4
     rng = np.random.default_rng(5)
     w1 = rng.standard_normal((K, H1)).astype(np.float32)
     w2 = rng.standard_normal((H1, H2)).astype(np.float32)
-    w3 = rng.standard_normal((H2, O)).astype(np.float32)
+    w3 = rng.standard_normal((H2, Out)).astype(np.float32)
     nodes = [
         onnx.helper.make_node("MatMul", ["X", "W1"], ["h1"]),
         onnx.helper.make_node("Relu", ["h1"], ["a1"]),
@@ -378,7 +378,7 @@ def test_structured_pruning_chains_through_a_third_layer():
     model = _model(
         nodes,
         [_vi("X", ["batch", K])],
-        [_vi("Y", ["batch", O])],
+        [_vi("Y", ["batch", Out])],
         [_f32(w1, "W1"), _f32(w2, "W2"), _f32(w3, "W3")],
     )
 
@@ -387,7 +387,7 @@ def test_structured_pruning_chains_through_a_third_layer():
     inits = {t.name: t for t in pruned.graph.initializer}
     assert list(inits["W1"].dims) == [K, H1 // 2]
     assert list(inits["W2"].dims) == [H1 // 2, H2 // 2]
-    assert list(inits["W3"].dims) == [H2 // 2, O]
+    assert list(inits["W3"].dims) == [H2 // 2, Out]
 
     keep1 = _oracle_keep_indices(w1, H1 // 2)
     keep2 = _oracle_keep_indices(w2[keep1, :], H2 // 2)
