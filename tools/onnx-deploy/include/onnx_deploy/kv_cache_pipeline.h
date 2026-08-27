@@ -51,20 +51,35 @@ struct GenerationConfig {
 };
 
 // Which execution provider every session in a KvCachePipeline runs on.
-// Defaults to ORT's built-in CPU EP (no explicit provider needed). "cuda"
-// calls Ort::SessionOptions::AppendExecutionProvider_CUDA -- this only
-// works if the libonnxruntime onnx_deploy_load_ort() loaded was actually
-// *built* with CUDA EP support (the official CPU-only release tarballs are
-// not; a GPU build, e.g. onnxruntime-linux-x64-gpu-*.tgz, is), and if a
-// CUDA-capable GPU/driver/toolkit is present at runtime. Neither is baked
-// into this header or its build -- exactly the same "swap by pointing at a
-// different libort" story as the rest of this library, just choosing a
-// GPU-capable one. If the loaded libort lacks CUDA support, or no GPU is
-// available, session construction throws Ort::Exception with ORT's own
-// message (e.g. "...providers_cuda... not found" or a CUDA driver error),
-// which propagates as a normal onnx_deploy_create failure -- not a crash.
+// Defaults to ORT's built-in CPU EP (no explicit provider needed).
+//
+// "cuda" calls Ort::SessionOptions::AppendExecutionProvider_CUDA -- this
+// only works if the libonnxruntime onnx_deploy_load_ort() loaded was
+// actually *built* with CUDA EP support (the official CPU-only release
+// tarballs are not; a GPU build, e.g. onnxruntime-linux-x64-gpu-*.tgz, is),
+// and if a CUDA-capable GPU/driver/toolkit is present at runtime.
+//
+// "webgpu" calls the generic Ort::SessionOptions::AppendExecutionProvider
+// ("WebGPU", {}) -- this is ORT's *native* WebGPU EP (built on Dawn,
+// running against a real GPU via Vulkan/Metal/D3D12), a different thing
+// from onnxruntime-web's browser WebGPU EP that wasm/ uses. As of ORT
+// 1.23.0, the plain prebuilt release tarballs (CPU or GPU) do not include
+// it -- it needs a from-source build with --use_webgpu; confirmed
+// empirically here via AppendExecutionProvider("WebGPU", {}), which throws
+// "WebGPU execution provider is not supported in this build" against the
+// plain tarball rather than silently doing nothing. No provider-options
+// keys are documented for it in onnxruntime_c_api.h as of this writing, so
+// none are exposed here beyond selecting it by name.
+//
+// Neither EP is baked into this header or its build -- exactly the same
+// "swap by pointing at a different libort" story as the rest of this
+// library, just choosing a GPU-capable one. If the loaded libort lacks the
+// requested EP's support, or no GPU is available, session construction
+// throws Ort::Exception with ORT's own message (e.g. "...providers_cuda...
+// not found", "not supported in this build", or a GPU driver error), which
+// propagates as a normal onnx_deploy_create failure -- not a crash.
 struct PipelineOptions {
-  enum class ExecutionProvider { kCpu, kCuda };
+  enum class ExecutionProvider { kCpu, kCuda, kWebGpu };
   ExecutionProvider execution_provider = ExecutionProvider::kCpu;
   int cuda_device_id = 0;
 };
@@ -77,6 +92,8 @@ inline Ort::SessionOptions BuildSessionOptions(const PipelineOptions& options) {
     OrtCUDAProviderOptions cuda_options{};
     cuda_options.device_id = options.cuda_device_id;
     session_options.AppendExecutionProvider_CUDA(cuda_options);
+  } else if (options.execution_provider == PipelineOptions::ExecutionProvider::kWebGpu) {
+    session_options.AppendExecutionProvider("WebGPU", {});
   }
   return session_options;
 }

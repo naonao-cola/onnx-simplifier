@@ -83,9 +83,11 @@ NB_MODULE(onnx_deploy_py, m) {
            nb::arg("execution_provider") = "cpu", nb::arg("cuda_device_id") = 0,
            "Loads an optimum-onnx export directory (see ../README.md for the expected "
            "file shape). load_ort() must have already succeeded. execution_provider is "
-           "\"cpu\" (default) or \"cuda\" -- \"cuda\" requires a CUDA-enabled ORT build "
-           "(loaded via load_ort()) and a CUDA-capable GPU; otherwise this raises with "
-           "ORT's own error, not a crash.")
+           "\"cpu\" (default), \"cuda\", or \"webgpu\" -- \"cuda\" requires a CUDA-enabled "
+           "ORT build and a CUDA-capable GPU; \"webgpu\" requires ORT's native WebGPU EP "
+           "(Dawn -- not onnxruntime-web's browser one) compiled in and a GPU. Either "
+           "requirement missing (loaded via load_ort()) raises with ORT's own error, not "
+           "a crash.")
       .def_prop_ro("is_seq2seq", &Pipeline::is_seq2seq)
       .def("generate", &Pipeline::generate, nb::arg("input_ids"), nb::arg("max_new_tokens") = 32,
            nb::arg("eos_token_id") = -1, nb::arg("decoder_start_token_id") = 0,

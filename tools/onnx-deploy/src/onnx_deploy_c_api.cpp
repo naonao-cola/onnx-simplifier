@@ -111,8 +111,11 @@ extern "C" OnnxDeployPipeline* onnx_deploy_create_ex(const char* model_dir, cons
     } else if (ep == "cuda") {
       pipeline_options.execution_provider = onnx_deploy::PipelineOptions::ExecutionProvider::kCuda;
       pipeline_options.cuda_device_id = cuda_device_id;
+    } else if (ep == "webgpu") {
+      pipeline_options.execution_provider = onnx_deploy::PipelineOptions::ExecutionProvider::kWebGpu;
     } else {
-      SetError(out_error, "onnx_deploy_create_ex: unknown execution_provider '" + ep + "' (expected \"cpu\" or \"cuda\")");
+      SetError(out_error,
+               "onnx_deploy_create_ex: unknown execution_provider '" + ep + "' (expected \"cpu\", \"cuda\", or \"webgpu\")");
       return nullptr;
     }
     return new OnnxDeployPipeline(model_dir ? model_dir : "", pipeline_options);

@@ -17,12 +17,15 @@ name: onnx-deploy
 # witness of the KV-cache threading being correct, not just "did it not
 # crash".
 #
-# Also checks execution-provider selection (--execution-provider cuda /
-# executionProviders: ["webgpu"]) fails cleanly on this GPU-less runner,
-# rather than crashing -- neither CUDA nor WebGPU acceleration is actually
-# exercised here (no GPU in CI), only that requesting them surfaces a clean
-# error instead of an uncaught exception/crash. See tools/onnx-deploy/README.md's
-# "Execution providers (accelerators)" section for what is and isn't verified.
+# Also checks execution-provider selection fails cleanly on this GPU-less
+# runner, rather than crashing: native --execution-provider cuda/webgpu
+# (ORT's own native WebGPU EP, Dawn-based -- not onnxruntime-web's browser
+# one, which is what executionProviders: ["webgpu"] selects in the
+# wasm-verify job below) and unknown provider names. None of CUDA/native
+# WebGPU/onnxruntime-web-WebGPU acceleration is actually exercised here (no
+# GPU in CI), only that requesting them surfaces a clean error instead of an
+# uncaught exception/crash. See tools/onnx-deploy/README.md's "Execution
+# providers (accelerators)" section for what is and isn't verified.
 
 on:
   workflow_dispatch:
@@ -176,6 +179,17 @@ jobs:
           code=$?
           set -e
           [ "$code" -eq 1 ]
+
+      - name: Execution-provider selection: webgpu (ORT's native EP, not onnxruntime-web's) also fails cleanly without a WebGPU-enabled ORT build/GPU
+        working-directory: tools/onnx-deploy
+        run: |
+          set +e
+          out=$(./build/onnx-deploy --libort "${{ env.ORT_OLDER_HOME }}/lib/libonnxruntime.so" /tmp/toy_seq2seq 3,4 --execution-provider webgpu 2>&1)
+          code=$?
+          set -e
+          echo "$out"
+          [ "$code" -eq 1 ]
+          echo "$out" | grep -qi "provider"
 
   wasm-verify:
     name: WASM build + verify (onnxruntime-web via Node)
