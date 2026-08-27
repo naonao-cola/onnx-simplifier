@@ -79,7 +79,7 @@ from onnxsim.smoothquant import _match_matmul_like
 def _validate_pattern(sparsity: float, n: Optional[int], m: Optional[int]) -> None:
     if (n is None) != (m is None):
         raise ValueError("n and m must be given together (N:M pruning) or not at all")
-    if n is not None:
+    if n is not None and m is not None:
         if not (0 < n <= m):
             raise ValueError(f"require 0 < n <= m, got n={n}, m={m}")
     elif not (0.0 <= sparsity < 1.0):
