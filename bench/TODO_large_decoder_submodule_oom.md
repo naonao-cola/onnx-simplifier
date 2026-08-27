@@ -1,7 +1,10 @@
 # Open: onnxsim OOMs simplifying a ~5GB decoder-only transformer submodule
 
-**Status:** unresolved -- this documents an observation from a real export, not a
-diagnosed root cause or a fix. Filed as a starting point for whoever picks it up next.
+**Status:** likely root cause identified via a synthetic repro, fix not yet applied --
+see `bench/RESULTS_synthetic_decoder_oom.md`. The original real-export observation below
+is unconfirmed against the real model (no fix has been validated against it), but the
+mechanism found is generic (any large enough model) and doesn't depend on this specific
+model or export pipeline.
 
 **Model:** the backbone (decoder-only transformer) submodule of a multi-submodule TTS
 model, exported standalone via `torch.onnx.export(..., dynamo=False)`. Four submodules
@@ -52,28 +55,48 @@ submodule, packed-sequence detection can be disabled for tracing with
 - `torch.onnx.export`'s legacy (`dynamo=False`) exporter keeps weights inline for
   models under the 2GB protobuf limit, and automatically externalizes larger ones --
   but as one file per initializer (254 small files for this 5.3GB model), not one
-  consolidated file. Whether onnxsim's own peak memory during `simplify()` scales with
-  the *number* of external-data files (I/O/bookkeeping overhead per file) or just the
-  *total bytes* (fewer, larger allocations either way) was not isolated this round.
+  consolidated file.
 - The smaller submodules (<=1.7GB, single inline file) simplified without issue in the
   same ~15GB environment, so the failure is specific to this model, not universal to
   `simplify()` on any external-data model.
-- No profiling was done -- the OOM was observed (process killed) but no peak-memory
-  trace (`/usr/bin/time -v`, `valgrind --tool=massif`, or similar) was captured.
+- **Update -- see `bench/RESULTS_synthetic_decoder_oom.md` for the full writeup.** A
+  synthetic, torch/HF-free repro (`bench/decoder_oom_repro.py`) reproduced an
+  equivalent OOM and found:
+  - **File count vs. total bytes is resolved: file count doesn't matter.** A
+    168-file-external-data model and the same model consolidated into one file produced
+    byte-identical peak RSS at every size tested.
+  - `onnxsim.simplify()`'s peak RSS is consistently **~1.9x the model's total weight
+    bytes**, even at the default `check_n=0` (no correctness check). This traces to a
+    real double materialization in the "fast path" of `onnx_simplifier.py`
+    (~line 1281): `C.simplify_path` correctly avoids a Python-side round trip for the
+    *input*, but the very next line (~1332) unconditionally does
+    `model_opt = onnx.load(fast_out_path)`, fully reloading the *output* into Python
+    just to satisfy `simplify()`'s `ModelProto`-returning contract. The onnxsim CLI
+    compounds this with a third full pass (`onnx.save(model_opt, ...)` at ~line 2711)
+    that most callers of `onnxsim in.onnx out.onnx` never needed.
+  - `check_n>0` makes it substantially worse (~2.7x in the repro) because without
+    `onnxruntime` installed, each correctness-check trial reloads the entire model
+    again via onnx's pure-Python reference evaluator (`onnxsim/model_checking.py`
+    ~line 328-329).
+  - This ~1.9x-2.7x ratio is large enough on its own, at the real submodule's ~5.3GB
+    size in a ~15GB cap, to plausibly fully explain the original OOM without needing
+    any real-model-specific structure (KV-cache, RoPE, embeddings) as an explanation --
+    though that hasn't been confirmed against the actual model (see "Next steps" below).
 
 ## Next steps, if picking this up
 
-1. Reduce to a runnable repro: either export the real backbone submodule per "How to
-   get the model" above, or build a synthetic ONNX model in this scale range (~5GB,
-   external data, a decoder-block-style repeated structure) with
-   `onnx.helper`/`numpy_helper` (no torch/HF dependency needed) -- the synthetic route
-   avoids the `breeze-tts` tracing workaround and is easier to share/CI, at the cost of
-   not being certain it reproduces the same failure.
-2. Re-run under an actual memory profiler and capture the trace, rather than reasoning
-   from wall-clock OOM alone.
-3. Isolate file-count vs. total-bytes: consolidate the same model's external data into
-   a single file (`onnx.save_model(..., save_as_external_data=True,
-   all_tensors_to_one_file=True)`) and compare peak memory against the many-small-files
-   version at the same total size.
-4. Compare against `bench/RESULTS_pr482_peak_memory.md` (this repo's existing peak-memory
-   investigation) for methodology and whatever headroom that work already established.
+1. ~~Reduce to a runnable repro~~ -- done, see `bench/decoder_oom_repro.py` and
+   `bench/RESULTS_synthetic_decoder_oom.md`.
+2. Capture an actual memory profiler trace (`massif`/`heaptrack`) on the synthetic
+   repro to confirm the two-materialization theory at the allocation level, rather than
+   the black-box `ru_maxrss` deltas used so far.
+3. ~~Isolate file-count vs. total-bytes~~ -- done: file count does not affect peak
+   memory, only total bytes do.
+4. Design and implement a fix for the double materialization identified above --
+   e.g. a way for `simplify()`'s fast path to skip re-loading `fast_out_path` when the
+   caller doesn't need the `ModelProto` back (an API-surface change, needs design
+   discussion since the documented return contract is `(ModelProto, bool)`), and the
+   equivalent for the CLI's own extra `onnx.save(model_opt, ...)` round trip.
+5. Confirm the ~1.9x ratio found on the synthetic model holds against the real
+   backbone submodule (see "How to get the model" above), to check whether real
+   transformer structure (KV-cache concat, RoPE, embeddings) changes the ratio.
