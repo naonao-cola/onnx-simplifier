@@ -381,13 +381,26 @@ _UNARY_PASS_THROUGH = {
 _BINARY_CHANNEL_OPS = {"Add", "Mul"}
 _MAX_CHAIN_HOPS = 8
 
+_ConsumerMatch = Tuple[onnx.NodeProto, str, bool]  # (node, weight, weight_transposed)
+
+
+@dataclass(frozen=True)
+class _Producer:
+    node: onnx.NodeProto
+    weight: str
+    weight_transposed: bool
+    bias: Optional[str]
+    # Activation nodes between this producer's raw output and the point it
+    # combines with another producer (a gated pair only -- see
+    # :func:`_find_gated_chains`; empty for a plain single-producer chain).
+    pre_ops: Tuple[onnx.NodeProto, ...] = ()
+
 
 @dataclass(frozen=True)
 class _Chain:
-    producer: onnx.NodeProto
-    producer_weight: str
-    producer_weight_transposed: bool
-    producer_bias: Optional[str]
+    # One producer for a plain chain; two for a gated (elementwise-product)
+    # pair, where both branches must agree on which channels survive.
+    producers: Tuple[_Producer, ...]
     chain_ops: Tuple[Tuple[onnx.NodeProto, Optional[str]], ...]
     consumer_weight: str
     consumer_weight_transposed: bool
@@ -403,6 +416,108 @@ def _consumers_of(graph: onnx.GraphProto) -> Dict[str, List[onnx.NodeProto]]:
     return consumers
 
 
+def _match_producer(
+    node: onnx.NodeProto, initializer_map: Dict[str, onnx.TensorProto]
+) -> Optional[Tuple[str, bool, Optional[str], int]]:
+    """If `node` is a MatMul/vanilla-Gemm with a constant 2-D float32
+    weight (and, for Gemm, either no bias or a constant one), returns
+    ``(weight_name, weight_transposed, bias_name_or_None, n_channels)``.
+    """
+    match = _match_matmul_like(node)
+    if match is None:
+        return None
+    _, w_name, weight_transposed = match
+    w_init = initializer_map.get(w_name)
+    if (
+        w_init is None
+        or w_init.data_type != onnx.TensorProto.FLOAT
+        or len(w_init.dims) != 2
+    ):
+        return None
+    bias_name = None
+    if node.op_type == "Gemm" and len(node.input) == 3:
+        bias_name = node.input[2]
+        if bias_name not in initializer_map:
+            return None  # non-constant bias -- can't safely prune it
+    n_channels = w_init.dims[0] if weight_transposed else w_init.dims[1]
+    return w_name, weight_transposed, bias_name, n_channels
+
+
+def _walk_to_consumer(
+    start: str,
+    initializer_map: Dict[str, onnx.TensorProto],
+    consumers_of: Dict[str, List[onnx.NodeProto]],
+    graph_outputs: Set[str],
+    n_channels: int,
+    max_hops: int,
+) -> Tuple[Optional[_ConsumerMatch], Tuple[Tuple[onnx.NodeProto, Optional[str]], ...]]:
+    """From tensor `start`, walks forward through shape-preserving
+    elementwise ops (an activation, or an Add/Mul against a constant
+    per-channel bias/scale) with no other consumer anywhere along the way,
+    until a MatMul/vanilla-Gemm consumer is found whose reduction
+    dimension matches `n_channels`. Returns ``(None, ())`` if the walk
+    runs out of hops, hits a branch, or never reaches such a consumer.
+    """
+    chain_ops: List[Tuple[onnx.NodeProto, Optional[str]]] = []
+    consumer = None
+    cur = start
+    for _hop in range(max_hops):
+        candidates = consumers_of.get(cur, [])
+        if len(candidates) != 1:
+            break
+        nxt = candidates[0]
+
+        cm = _match_matmul_like(nxt)
+        if cm is not None and cm[0] == cur:
+            _, cw_name, c_weight_transposed = cm
+            cw_init = initializer_map.get(cw_name)
+            if (
+                cw_init is not None
+                and cw_init.data_type == onnx.TensorProto.FLOAT
+                and len(cw_init.dims) == 2
+            ):
+                k = cw_init.dims[1] if c_weight_transposed else cw_init.dims[0]
+                if k == n_channels:
+                    consumer = (nxt, cw_name, c_weight_transposed)
+            break
+
+        const_name: Optional[str] = None
+        if (
+            nxt.op_type in _UNARY_PASS_THROUGH
+            and list(nxt.input) == [cur]
+            and len(nxt.output) == 1
+        ):
+            pass
+        elif (
+            nxt.op_type in _BINARY_CHANNEL_OPS
+            and len(nxt.input) == 2
+            and cur in nxt.input
+            and len(nxt.output) == 1
+        ):
+            other = nxt.input[1] if nxt.input[0] == cur else nxt.input[0]
+            const_init = initializer_map.get(other)
+            if (
+                const_init is not None
+                and const_init.data_type == onnx.TensorProto.FLOAT
+                and list(const_init.dims)
+                and const_init.dims[-1] == n_channels
+                and int(np.prod(const_init.dims)) == n_channels
+            ):
+                const_name = other
+            else:
+                break
+        else:
+            break
+
+        out2 = nxt.output[0]
+        if len(consumers_of.get(out2, [])) != 1 or out2 in graph_outputs:
+            break
+        chain_ops.append((nxt, const_name))
+        cur = out2
+
+    return consumer, tuple(chain_ops)
+
+
 def _find_chains(graph: onnx.GraphProto) -> List[_Chain]:
     initializer_map = {t.name: t for t in graph.initializer}
     consumers_of = _consumers_of(graph)
@@ -415,100 +530,199 @@ def _find_chains(graph: onnx.GraphProto) -> List[_Chain]:
 
     chains = []
     for node in graph.node:
-        match = _match_matmul_like(node)
-        if match is None:
+        info = _match_producer(node, initializer_map)
+        if info is None:
             continue
-        _, w_name, weight_transposed = match
-        w_init = initializer_map.get(w_name)
-        if (
-            w_init is None
-            or w_init.data_type != onnx.TensorProto.FLOAT
-            or len(w_init.dims) != 2
+        w_name, weight_transposed, bias_name, n_channels = info
+
+        out_name = node.output[0]
+        if not _is_internal(out_name):
+            continue
+
+        consumer, chain_ops = _walk_to_consumer(
+            out_name,
+            initializer_map,
+            consumers_of,
+            graph_outputs,
+            n_channels,
+            _MAX_CHAIN_HOPS,
+        )
+        if consumer is None:
+            continue
+
+        chains.append(
+            _Chain(
+                producers=(_Producer(node, w_name, weight_transposed, bias_name),),
+                chain_ops=chain_ops,
+                consumer_weight=consumer[1],
+                consumer_weight_transposed=consumer[2],
+                n_channels=n_channels,
+            )
+        )
+    return chains
+
+
+def _trace_gate_producer_backward(
+    tensor_name: str,
+    node_by_output: Dict[str, onnx.NodeProto],
+    producer_infos: Dict[str, Tuple[onnx.NodeProto, str, bool, Optional[str], int]],
+    consumers_of: Dict[str, List[onnx.NodeProto]],
+    graph_outputs: Set[str],
+    max_hops: int,
+) -> Optional[
+    Tuple[
+        Tuple[onnx.NodeProto, str, bool, Optional[str], int], Tuple[onnx.NodeProto, ...]
+    ]
+]:
+    """Walks backward from `tensor_name` through unary activation ops
+    (Sigmoid, Gelu, ...) until it resolves to a matmul-like producer's raw
+    output -- the mirror image of :func:`_walk_to_consumer`'s forward walk,
+    used to recognize a gate branch's own activation (e.g. SwiGLU's
+    ``silu(gate)`` when exported as separate Sigmoid/Mul-by-a-second-
+    operand rather than a single node -- see :func:`_find_gated_chains`).
+    Every tensor walked through, `tensor_name` itself included, must have
+    exactly one consumer and not be a graph output: the same safety bar
+    the forward walk holds every intermediate tensor to.
+    """
+    pre_ops: List[onnx.NodeProto] = []
+    cur = tensor_name
+    for _ in range(max_hops):
+        if len(consumers_of.get(cur, [])) != 1 or cur in graph_outputs:
+            return None
+        if cur in producer_infos:
+            return producer_infos[cur], tuple(reversed(pre_ops))
+        producer_node = node_by_output.get(cur)
+        if producer_node is None:
+            return None
+        if not (
+            producer_node.op_type in _UNARY_PASS_THROUGH
+            and len(producer_node.input) == 1
+            and len(producer_node.output) == 1
         ):
+            return None
+        pre_ops.append(producer_node)
+        cur = producer_node.input[0]
+    return None
+
+
+def _find_gated_chains(graph: onnx.GraphProto) -> List[_Chain]:
+    """Finds gated FFN blocks -- SwiGLU/GeGLU-style ``down(act(gate(x)) *
+    up(x))``, the FFN architecture most current LLMs use (Llama, Mistral,
+    Qwen, Gemma, ...) -- that :func:`_find_chains` cannot see at all,
+    because it only ever follows a *single* producer's output. Two
+    matmul-like producers (gate and up) whose outputs, each optionally
+    through its own activation, combine via one of:
+
+    - a plain elementwise ``Mul`` of two non-constant operands (covers an
+      unactivated GLU, or any activation expressed as ordinary unary ops
+      -- e.g. GeGLU's ``Gelu``); or
+    - ONNX's native fused ``SwiGLU(a, b[, alpha]) = swish(a) * b`` node
+      (opset 28+), whose swish lives entirely inside the op, so ``a``/``b``
+      must be the two producers' raw outputs with nothing in between,
+
+    with no other consumer anywhere along either branch or at the combine
+    point, into exactly one downstream MatMul/vanilla-Gemm's reduction
+    dimension, are pruned together: both branches must drop the *same*
+    output-channel indices, since they're about to be multiplied
+    elementwise. A gate activation decomposed into more than one node
+    (e.g. SiLU exported as the self-referencing ``x * Sigmoid(x)`` rather
+    than a single ``Sigmoid``/native ``Swish``) isn't recognized -- that
+    block is safely left untouched, not guessed at.
+    """
+    initializer_map = {t.name: t for t in graph.initializer}
+    consumers_of = _consumers_of(graph)
+    graph_outputs = {o.name for o in graph.output}
+    node_by_output = {out: node for node in graph.node for out in node.output}
+
+    def _is_internal(name: str) -> bool:
+        return len(consumers_of.get(name, [])) == 1 and name not in graph_outputs
+
+    producer_infos: Dict[str, Tuple[onnx.NodeProto, str, bool, Optional[str], int]] = {}
+    for node in graph.node:
+        info = _match_producer(node, initializer_map)
+        if info is not None:
+            w_name, weight_transposed, bias_name, n_channels = info
+            producer_infos[node.output[0]] = (
+                node,
+                w_name,
+                weight_transposed,
+                bias_name,
+                n_channels,
+            )
+
+    def _producer(info, pre_ops) -> _Producer:
+        node, w_name, weight_transposed, bias_name, _n = info
+        return _Producer(node, w_name, weight_transposed, bias_name, pre_ops)
+
+    chains: List[_Chain] = []
+    for node in graph.node:
+        if node.op_type == "Mul" and len(node.input) == 2 and len(node.output) == 1:
+            a_name, b_name = node.input
+            if (
+                a_name == b_name
+                or a_name in initializer_map
+                or b_name in initializer_map
+            ):
+                continue
+            trace_a = _trace_gate_producer_backward(
+                a_name,
+                node_by_output,
+                producer_infos,
+                consumers_of,
+                graph_outputs,
+                _MAX_CHAIN_HOPS,
+            )
+            trace_b = _trace_gate_producer_backward(
+                b_name,
+                node_by_output,
+                producer_infos,
+                consumers_of,
+                graph_outputs,
+                _MAX_CHAIN_HOPS,
+            )
+            if trace_a is None or trace_b is None:
+                continue
+            info_a, pre_a = trace_a
+            info_b, pre_b = trace_b
+        elif (
+            node.op_type == "SwiGLU" and len(node.input) == 2 and len(node.output) == 1
+        ):
+            a_name, b_name = node.input
+            if a_name in initializer_map or b_name in initializer_map:
+                continue
+            if not (_is_internal(a_name) and _is_internal(b_name)):
+                continue
+            info_a_lookup = producer_infos.get(a_name)
+            info_b_lookup = producer_infos.get(b_name)
+            if info_a_lookup is None or info_b_lookup is None:
+                continue
+            info_a, pre_a = info_a_lookup, ()
+            info_b, pre_b = info_b_lookup, ()
+        else:
+            continue
+
+        node_a, n_a = info_a[0], info_a[4]
+        node_b, n_b = info_b[0], info_b[4]
+        if node_a is node_b or n_a != n_b:
             continue
 
         out_name = node.output[0]
         if not _is_internal(out_name):
             continue
 
-        bias_name = None
-        if node.op_type == "Gemm" and len(node.input) == 3:
-            bias_name = node.input[2]
-            if bias_name not in initializer_map:
-                continue  # non-constant bias -- can't safely prune it
-
-        n_channels = w_init.dims[0] if weight_transposed else w_init.dims[1]
-
-        chain_ops: List[Tuple[onnx.NodeProto, Optional[str]]] = []
-        consumer = None
-        cur = out_name
-        for _hop in range(_MAX_CHAIN_HOPS):
-            candidates = consumers_of.get(cur, [])
-            if len(candidates) != 1:
-                break
-            nxt = candidates[0]
-
-            cm = _match_matmul_like(nxt)
-            if cm is not None and cm[0] == cur:
-                _, cw_name, c_weight_transposed = cm
-                cw_init = initializer_map.get(cw_name)
-                if (
-                    cw_init is not None
-                    and cw_init.data_type == onnx.TensorProto.FLOAT
-                    and len(cw_init.dims) == 2
-                ):
-                    k = cw_init.dims[1] if c_weight_transposed else cw_init.dims[0]
-                    if k == n_channels:
-                        consumer = (nxt, cw_name, c_weight_transposed)
-                break
-
-            const_name: Optional[str] = None
-            if (
-                nxt.op_type in _UNARY_PASS_THROUGH
-                and list(nxt.input) == [cur]
-                and len(nxt.output) == 1
-            ):
-                pass
-            elif (
-                nxt.op_type in _BINARY_CHANNEL_OPS
-                and len(nxt.input) == 2
-                and cur in nxt.input
-                and len(nxt.output) == 1
-            ):
-                other = nxt.input[1] if nxt.input[0] == cur else nxt.input[0]
-                const_init = initializer_map.get(other)
-                if (
-                    const_init is not None
-                    and const_init.data_type == onnx.TensorProto.FLOAT
-                    and list(const_init.dims)
-                    and const_init.dims[-1] == n_channels
-                    and int(np.prod(const_init.dims)) == n_channels
-                ):
-                    const_name = other
-                else:
-                    break
-            else:
-                break
-
-            out2 = nxt.output[0]
-            if not _is_internal(out2):
-                break
-            chain_ops.append((nxt, const_name))
-            cur = out2
-
+        consumer, chain_ops = _walk_to_consumer(
+            out_name, initializer_map, consumers_of, graph_outputs, n_a, _MAX_CHAIN_HOPS
+        )
         if consumer is None:
             continue
 
         chains.append(
             _Chain(
-                producer=node,
-                producer_weight=w_name,
-                producer_weight_transposed=weight_transposed,
-                producer_bias=bias_name,
-                chain_ops=tuple(chain_ops),
+                producers=(_producer(info_a, pre_a), _producer(info_b, pre_b)),
+                chain_ops=chain_ops,
                 consumer_weight=consumer[1],
                 consumer_weight_transposed=consumer[2],
-                n_channels=n_channels,
+                n_channels=n_a,
             )
         )
     return chains
@@ -566,6 +780,13 @@ def apply_structured_pruning(
     the two layers' composition mathematically unaffected for every
     surviving channel.
 
+    Also handles the gated FFN pattern most current LLMs use in place of a
+    plain two-layer MLP (SwiGLU/GeGLU: ``down(act(gate(x)) * up(x))``, see
+    :func:`_find_gated_chains`) -- two producers (gate and up) combined by
+    an elementwise product feed one consumer; both branches are ranked by
+    combined (root-sum-square) importance and pruned to the *same*
+    surviving channel indices, since they're about to be multiplied.
+
     :param model: the original onnx ModelProto or file path
     :param sparsity: target fraction of each matched producer's output
             channels to remove (at least one channel is always kept)
@@ -583,7 +804,7 @@ def apply_structured_pruning(
     out.CopyFrom(model)
     graph = out.graph
 
-    chains = _find_chains(graph)
+    chains = _find_chains(graph) + _find_gated_chains(graph)
     if not chains:
         return out
 
@@ -601,12 +822,16 @@ def apply_structured_pruning(
     stale_value_info: Set[str] = set()
 
     for chain in chains:
-        consts = {chain.producer_bias} if chain.producer_bias is not None else set()
+        producer_weights = {p.weight for p in chain.producers}
+        if len(producer_weights) != len(chain.producers):
+            continue  # degenerate (a gated pair naming the same weight twice)
+
+        consts = {p.bias for p in chain.producers if p.bias is not None}
         consts.update(
             const_name for _, const_name in chain.chain_ops if const_name is not None
         )
         if (
-            chain.producer_weight in producer_touched
+            (producer_weights & producer_touched)
             or chain.consumer_weight in consumer_touched
             or (consts & const_touched)
         ):
@@ -617,15 +842,22 @@ def apply_structured_pruning(
         if keep_count >= n:
             continue  # rounds down to nothing for this layer -- no-op
 
-        w_init = initializer_map[chain.producer_weight]
-        w = onnx.numpy_helper.to_array(w_init).astype(np.float64)
-        w_nk = w if chain.producer_weight_transposed else w.T  # [N, K]
-        importance = np.linalg.norm(w_nk, axis=1)
+        # Combined (root-sum-square) importance across every producer in
+        # this chain: for a plain chain this is just that producer's own
+        # L2 norm; for a gated pair, both branches must agree on which
+        # channels survive, so their per-channel norms are combined first.
+        squared_norm = np.zeros(n, dtype=np.float64)
+        for p in chain.producers:
+            w = onnx.numpy_helper.to_array(initializer_map[p.weight]).astype(np.float64)
+            w_nk = w if p.weight_transposed else w.T  # [N, K]
+            squared_norm += np.square(np.linalg.norm(w_nk, axis=1))
+        importance = np.sqrt(squared_norm)
         keep = np.sort(np.argsort(-importance)[:keep_count])
 
-        _slice_producer_weight(w_init, chain.producer_weight_transposed, keep)
-        if chain.producer_bias is not None:
-            _slice_last_axis(initializer_map[chain.producer_bias], keep)
+        for p in chain.producers:
+            _slice_producer_weight(initializer_map[p.weight], p.weight_transposed, keep)
+            if p.bias is not None:
+                _slice_last_axis(initializer_map[p.bias], keep)
         for _, const_name in chain.chain_ops:
             if const_name is not None:
                 _slice_last_axis(initializer_map[const_name], keep)
@@ -635,11 +867,15 @@ def apply_structured_pruning(
             keep,
         )
 
-        producer_touched.add(chain.producer_weight)
+        producer_touched.update(producer_weights)
         consumer_touched.add(chain.consumer_weight)
         const_touched.update(consts)
-        stale_value_info.add(chain.producer.output[0])
-        stale_value_info.update(node.output[0] for node, _ in chain.chain_ops)
+        for p in chain.producers:
+            stale_value_info.add(p.node.output[0])
+            stale_value_info.update(pre_op.output[0] for pre_op in p.pre_ops)
+        stale_value_info.update(
+            chain_node.output[0] for chain_node, _ in chain.chain_ops
+        )
 
     if stale_value_info:
         kept = [vi for vi in graph.value_info if vi.name not in stale_value_info]

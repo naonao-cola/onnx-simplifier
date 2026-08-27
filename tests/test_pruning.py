@@ -399,3 +399,237 @@ def test_structured_pruning_chains_through_a_third_layer():
     a2 = np.maximum(a1 @ w2[np.ix_(keep1, keep2)], 0)
     y_oracle = a2 @ w3[keep2, :]
     np.testing.assert_allclose(y, y_oracle, rtol=1e-5, atol=1e-5)
+
+
+# --- apply_structured_pruning: gated FFN (SwiGLU/GeGLU) ----------------------
+
+
+def _combined_keep_indices(w_gate, w_up, keep_count):
+    importance = np.sqrt(
+        np.square(np.linalg.norm(w_gate.T, axis=1))
+        + np.square(np.linalg.norm(w_up.T, axis=1))
+    )
+    return np.sort(np.argsort(-importance)[:keep_count])
+
+
+def _swiglu_mlp_model(K=8, H=16, Out=4, gate_activation="Sigmoid", seed=0):
+    rng = np.random.default_rng(seed)
+    wg = rng.standard_normal((K, H)).astype(np.float32)
+    wu = rng.standard_normal((K, H)).astype(np.float32)
+    wd = rng.standard_normal((H, Out)).astype(np.float32)
+    nodes = [
+        onnx.helper.make_node("MatMul", ["X", "Wg"], ["gate"]),
+        onnx.helper.make_node(gate_activation, ["gate"], ["gate_act"]),
+        onnx.helper.make_node("MatMul", ["X", "Wu"], ["up"]),
+        onnx.helper.make_node("Mul", ["gate_act", "up"], ["h"]),
+        onnx.helper.make_node("MatMul", ["h", "Wd"], ["Y"]),
+    ]
+    model = _model(
+        nodes,
+        [_vi("X", ["batch", K])],
+        [_vi("Y", ["batch", Out])],
+        [_f32(wg, "Wg"), _f32(wu, "Wu"), _f32(wd, "Wd")],
+    )
+    return model, wg, wu, wd
+
+
+def test_structured_pruning_gated_ffn_matches_oracle():
+    K, H, Out = 8, 16, 4
+    model, wg, wu, wd = _swiglu_mlp_model(K=K, H=H, Out=Out)
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    inits = {t.name: t for t in pruned.graph.initializer}
+    assert list(inits["Wg"].dims) == [K, H // 2]
+    assert list(inits["Wu"].dims) == [K, H // 2]
+    assert list(inits["Wd"].dims) == [H // 2, Out]
+
+    keep = _combined_keep_indices(wg, wu, H // 2)
+    rng = np.random.default_rng(10)
+    x = rng.standard_normal((5, K)).astype(np.float32)
+    (y,) = _run(pruned, {"X": x})
+
+    gate = 1.0 / (1.0 + np.exp(-(x @ wg[:, keep])))
+    up = x @ wu[:, keep]
+    y_oracle = (gate * up) @ wd[keep, :]
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-5, atol=1e-5)
+
+
+def test_structured_pruning_gated_ffn_prunes_both_branches_to_same_channels():
+    # The real bug this pattern risks: gate and up disagreeing on which
+    # channels survive, which would silently break the elementwise
+    # product's alignment. Assert they select the identical index set,
+    # not just that both shrank to the same *count*.
+    K, H, Out = 8, 20, 4
+    model, wg, wu, _ = _swiglu_mlp_model(K=K, H=H, Out=Out, seed=1)
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.3)
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    keep = _combined_keep_indices(wg, wu, H - round(H * 0.3))
+
+    np.testing.assert_array_equal(inits["Wg"], wg[:, keep])
+    np.testing.assert_array_equal(inits["Wu"], wu[:, keep])
+
+
+def test_structured_pruning_gelu_gated_ffn_matches_oracle():
+    # GeGLU: same gated topology, a different (still-unary) gate activation.
+    # Uses Gelu's tanh approximation so the oracle needs no scipy/erf.
+    K, H, Out = 8, 16, 4
+    rng = np.random.default_rng(11)
+    wg = rng.standard_normal((K, H)).astype(np.float32)
+    wu = rng.standard_normal((K, H)).astype(np.float32)
+    wd = rng.standard_normal((H, Out)).astype(np.float32)
+    nodes = [
+        onnx.helper.make_node("MatMul", ["X", "Wg"], ["gate"]),
+        onnx.helper.make_node("Gelu", ["gate"], ["gate_act"], approximate="tanh"),
+        onnx.helper.make_node("MatMul", ["X", "Wu"], ["up"]),
+        onnx.helper.make_node("Mul", ["gate_act", "up"], ["h"]),
+        onnx.helper.make_node("MatMul", ["h", "Wd"], ["Y"]),
+    ]
+    model = _model(
+        nodes,
+        [_vi("X", ["batch", K])],
+        [_vi("Y", ["batch", Out])],
+        [_f32(wg, "Wg"), _f32(wu, "Wu"), _f32(wd, "Wd")],
+    )
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    keep = _combined_keep_indices(wg, wu, H // 2)
+
+    x = rng.standard_normal((5, K)).astype(np.float32)
+    (y,) = _run(pruned, {"X": x})
+
+    g = x @ wg[:, keep]
+    gate = 0.5 * g * (1.0 + np.tanh(np.sqrt(2.0 / np.pi) * (g + 0.044715 * g**3)))
+    up = x @ wu[:, keep]
+    y_oracle = (gate * up) @ wd[keep, :]
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-4, atol=1e-4)
+
+
+def test_structured_pruning_ungated_mul_of_two_producers_still_matches_oracle():
+    # No activation at all on either branch -- a plain (unactivated) GLU,
+    # both Mul operands are raw producer outputs directly.
+    K, H, Out = 8, 12, 4
+    rng = np.random.default_rng(2)
+    w1 = rng.standard_normal((K, H)).astype(np.float32)
+    w2 = rng.standard_normal((K, H)).astype(np.float32)
+    w3 = rng.standard_normal((H, Out)).astype(np.float32)
+    nodes = [
+        onnx.helper.make_node("MatMul", ["X", "W1"], ["a"]),
+        onnx.helper.make_node("MatMul", ["X", "W2"], ["b"]),
+        onnx.helper.make_node("Mul", ["a", "b"], ["h"]),
+        onnx.helper.make_node("MatMul", ["h", "W3"], ["Y"]),
+    ]
+    model = _model(
+        nodes,
+        [_vi("X", ["batch", K])],
+        [_vi("Y", ["batch", Out])],
+        [_f32(w1, "W1"), _f32(w2, "W2"), _f32(w3, "W3")],
+    )
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    keep = _combined_keep_indices(w1, w2, H // 2)
+
+    x = rng.standard_normal((5, K)).astype(np.float32)
+    (y,) = _run(pruned, {"X": x})
+    y_oracle = ((x @ w1[:, keep]) * (x @ w2[:, keep])) @ w3[keep, :]
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-5, atol=1e-5)
+
+
+def test_structured_pruning_gated_mul_against_constant_scale_is_not_a_gate():
+    # Mul(a, constant) is the existing per-channel-scale chain continuation
+    # (already covered elsewhere), not a two-producer gated pair -- the
+    # constant operand must never be mistaken for a second producer.
+    K, H, Out = 8, 12, 4
+    rng = np.random.default_rng(3)
+    w1 = rng.standard_normal((K, H)).astype(np.float32)
+    scale = rng.standard_normal((H,)).astype(np.float32)
+    w2 = rng.standard_normal((H, Out)).astype(np.float32)
+    nodes = [
+        onnx.helper.make_node("MatMul", ["X", "W1"], ["a"]),
+        onnx.helper.make_node("Mul", ["a", "Scale"], ["h"]),
+        onnx.helper.make_node("MatMul", ["h", "W2"], ["Y"]),
+    ]
+    model = _model(
+        nodes,
+        [_vi("X", ["batch", K])],
+        [_vi("Y", ["batch", Out])],
+        [_f32(w1, "W1"), _f32(scale, "Scale"), _f32(w2, "W2")],
+    )
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    inits = {t.name: t for t in pruned.graph.initializer}
+    assert list(inits["W1"].dims) == [K, H // 2]
+    assert list(inits["Scale"].dims) == [H // 2]
+    assert list(inits["W2"].dims) == [H // 2, Out]
+
+
+def test_structured_pruning_gated_ffn_skips_when_a_branch_also_feeds_elsewhere():
+    # "up" also feeding a second consumer directly means pruning its
+    # channels would silently change what that other consumer sees --
+    # must be left completely untouched, same bar as the plain-chain case.
+    K, H, Out = 8, 12, 4
+    rng = np.random.default_rng(4)
+    wg = rng.standard_normal((K, H)).astype(np.float32)
+    wu = rng.standard_normal((K, H)).astype(np.float32)
+    wd = rng.standard_normal((H, Out)).astype(np.float32)
+    wother = rng.standard_normal((H, Out)).astype(np.float32)
+    nodes = [
+        onnx.helper.make_node("MatMul", ["X", "Wg"], ["gate"]),
+        onnx.helper.make_node("Sigmoid", ["gate"], ["gate_act"]),
+        onnx.helper.make_node("MatMul", ["X", "Wu"], ["up"]),
+        onnx.helper.make_node("Mul", ["gate_act", "up"], ["h"]),
+        onnx.helper.make_node("MatMul", ["h", "Wd"], ["Y1"]),
+        onnx.helper.make_node("MatMul", ["up", "Wother"], ["Y2"]),
+    ]
+    model = _model(
+        nodes,
+        [_vi("X", ["batch", K])],
+        [_vi("Y1", ["batch", Out]), _vi("Y2", ["batch", Out])],
+        [_f32(wg, "Wg"), _f32(wu, "Wu"), _f32(wd, "Wd"), _f32(wother, "Wother")],
+    )
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    inits = {t.name: t for t in pruned.graph.initializer}
+    assert list(inits["Wg"].dims) == [K, H]
+    assert list(inits["Wu"].dims) == [K, H]
+    assert list(inits["Wd"].dims) == [H, Out]
+
+
+def test_structured_pruning_native_swiglu_node_prunes_both_producers_together():
+    # ONNX's native fused SwiGLU(a, b) = swish(a) * b (opset 28+): the
+    # activation lives entirely inside the op, so a/b must be raw producer
+    # outputs with no separate activation node in between. Not yet
+    # supported by the installed onnx checker/onnxruntime in this
+    # environment (opset 28 is still under development upstream), so this
+    # verifies the graph surgery directly via tensor values rather than
+    # onnx.checker/onnxruntime execution.
+    K, H, Out = 8, 16, 4
+    rng = np.random.default_rng(5)
+    wg = rng.standard_normal((K, H)).astype(np.float32)
+    wu = rng.standard_normal((K, H)).astype(np.float32)
+    wd = rng.standard_normal((H, Out)).astype(np.float32)
+    nodes = [
+        onnx.helper.make_node("MatMul", ["X", "Wg"], ["gate"]),
+        onnx.helper.make_node("MatMul", ["X", "Wu"], ["up"]),
+        onnx.helper.make_node("SwiGLU", ["gate", "up"], ["h"]),
+        onnx.helper.make_node("MatMul", ["h", "Wd"], ["Y"]),
+    ]
+    model = _model(
+        nodes,
+        [_vi("X", ["batch", K])],
+        [_vi("Y", ["batch", Out])],
+        [_f32(wg, "Wg"), _f32(wu, "Wu"), _f32(wd, "Wd")],
+        opset=28,
+    )
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    keep = _combined_keep_indices(wg, wu, H // 2)
+
+    np.testing.assert_array_equal(inits["Wg"], wg[:, keep])
+    np.testing.assert_array_equal(inits["Wu"], wu[:, keep])
+    np.testing.assert_array_equal(inits["Wd"], wd[keep, :])
