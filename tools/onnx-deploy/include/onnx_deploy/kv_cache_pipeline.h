@@ -1,18 +1,29 @@
 // onnx_deploy/kv_cache_pipeline.h
 //
-// Design sketch: generic C++ glue for the multi-file ONNX export shape that
-// `optimum-onnx` produces for autoregressive generation --
+// Generic C++ glue for the multi-file ONNX export shape that `optimum-onnx`
+// produces for autoregressive generation --
 //   encoder_model.onnx            (optional -- absent for decoder-only LMs)
 //   decoder_model.onnx            (no KV-cache inputs; first decode step)
 //   decoder_with_past_model.onnx  (KV-cache in and out; every step after)
 // -- with no Python/torch dependency. See ../../README.md for the design
 // writeup, the naming-convention assumptions this relies on, and what is
 // deliberately left out (tokenization, sampling beyond greedy, batching,
-// the merged decoder_model_merged.onnx shape). Not compiled/tested in this
-// environment -- read it with that in mind.
+// the merged decoder_model_merged.onnx shape).
+//
+// Usage contract: this header builds against ONNX Runtime's C++ API with
+// ORT_API_MANUAL_INIT (see the block below), so the ORT function table is
+// NOT resolved at static-init time and this header does not require linking
+// against libonnxruntime at all. The embedder must call `Ort::InitApi(api)`
+// with an `OrtApi*` obtained however it likes -- linked directly
+// (`OrtGetApiBase()->GetApi(ORT_API_VERSION)`), or resolved at runtime from
+// a dlopen'd/LoadLibrary'd libonnxruntime (see onnx_deploy_c_api.cpp, the
+// swappable-libort C ABI built on top of this header) -- exactly once,
+// before constructing any Ort::* object, including KvCachePipeline.
 #pragma once
 
+#define ORT_API_MANUAL_INIT
 #include <onnxruntime_cxx_api.h>
+#undef ORT_API_MANUAL_INIT
 
 #include <cstdint>
 #include <filesystem>
@@ -85,11 +96,11 @@ inline Ort::Value BorrowView(const Ort::Value& src) {
   std::vector<int64_t> shape = info.GetShape();
   static Ort::MemoryInfo mem_info = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
   switch (info.GetElementType()) {
-    case ONNX_TENSOR_ELEMENT_TYPE_FLOAT: {
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT: {
       auto* data = const_cast<float*>(src.GetTensorData<float>());
       return Ort::Value::CreateTensor<float>(mem_info, data, info.GetElementCount(), shape.data(), shape.size());
     }
-    case ONNX_TENSOR_ELEMENT_TYPE_INT64: {
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64: {
       auto* data = const_cast<int64_t*>(src.GetTensorData<int64_t>());
       return Ort::Value::CreateTensor<int64_t>(mem_info, data, info.GetElementCount(), shape.data(), shape.size());
     }
@@ -277,7 +288,9 @@ class KvCachePipeline {
     for (size_t i = 0; i < output_names.size(); ++i) {
       const std::string& name = output_names[i];
       if (name.rfind(kPresentPrefix, 0) != 0) continue;
-      cache[kPastPrefix + name.substr(kPresentPrefix.size())] = std::move(outputs[i]);
+      // std::map::operator[] would default-construct a Value first (it has
+      // no default constructor), so insert_or_assign instead.
+      cache.insert_or_assign(kPastPrefix + name.substr(kPresentPrefix.size()), std::move(outputs[i]));
     }
   }
 

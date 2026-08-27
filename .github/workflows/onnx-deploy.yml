@@ -1,0 +1,152 @@
+name: onnx-deploy
+
+# End-to-end verification for tools/onnx-deploy: the standalone C++ tool that
+# runs autoregressive generation over optimum-onnx's multi-file
+# encoder/decoder(-with-past) ONNX export, via a C ABI that loads
+# libonnxruntime at RUNTIME (dlopen) instead of linking a specific build at
+# compile time -- see tools/onnx-deploy/README.md.
+#
+# This downloads two different real ONNX Runtime releases and proves the
+# whole flow for real: build the CLI/C ABI/Python extension once (against
+# the OLDER release's headers only -- no link-time dependency on either
+# .so), then run the compiled artifacts against a tiny hand-built seq2seq
+# export (scripts/make_toy_seq2seq.py -- no torch/transformers/optimum
+# needed) through BOTH ORT builds with no rebuild in between, and assert the
+# generated token sequence is exactly right and identical either way. See
+# that script's docstring for why the toy model's output is a direct
+# witness of the KV-cache threading being correct, not just "did it not
+# crash".
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "tools/onnx-deploy/**"
+      - ".github/workflows/onnx-deploy.yml"
+  push:
+    branches: [master]
+    paths:
+      - "tools/onnx-deploy/**"
+
+concurrency:
+  group: onnx-deploy-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  # A newer and an older ONNX Runtime release. Deliberately built against
+  # the OLDER one's headers (ORT's C API is designed forward-compatible: an
+  # older-API build can load a newer .so, not vice versa -- GetApi() returns
+  # NULL if the .so is older than the API version requested), then swapped
+  # at runtime to the newer one, so the test exercises the realistic
+  # "upgrade your ORT build without recompiling onnx-deploy" case.
+  ORT_VERSION_NEWER: 1.19.2
+  ORT_VERSION_OLDER: 1.18.1
+
+jobs:
+  build-and-verify:
+    name: Build + swap-verify (ubuntu-24.04)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Python deps (toy model generator + Python extension build -- no torch/optimum)
+        run: pip install onnx nanobind
+
+      - name: Download ONNX Runtime ${{ env.ORT_VERSION_OLDER }} (build headers + first runtime target)
+        run: |
+          curl -sL -o ort_older.tgz "https://github.com/microsoft/onnxruntime/releases/download/v${{ env.ORT_VERSION_OLDER }}/onnxruntime-linux-x64-${{ env.ORT_VERSION_OLDER }}.tgz"
+          tar xzf ort_older.tgz
+          echo "ORT_OLDER_HOME=$PWD/onnxruntime-linux-x64-${{ env.ORT_VERSION_OLDER }}" >> "$GITHUB_ENV"
+
+      - name: Download ONNX Runtime ${{ env.ORT_VERSION_NEWER }} (second runtime target -- proves the ABI isn't tied to one build)
+        run: |
+          curl -sL -o ort_newer.tgz "https://github.com/microsoft/onnxruntime/releases/download/v${{ env.ORT_VERSION_NEWER }}/onnxruntime-linux-x64-${{ env.ORT_VERSION_NEWER }}.tgz"
+          tar xzf ort_newer.tgz
+          echo "ORT_NEWER_HOME=$PWD/onnxruntime-linux-x64-${{ env.ORT_VERSION_NEWER }}" >> "$GITHUB_ENV"
+
+      - name: Configure (headers from the older release only)
+        working-directory: tools/onnx-deploy
+        run: cmake -B build -DORT_HOME="${{ env.ORT_OLDER_HOME }}" -DONNX_DEPLOY_PYTHON=ON -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        working-directory: tools/onnx-deploy
+        run: cmake --build build -j"$(nproc)"
+
+      - name: Assert the C ABI has zero link-time dependency on libonnxruntime
+        working-directory: tools/onnx-deploy
+        run: |
+          ldd build/libonnx_deploy_c.so
+          if ldd build/libonnx_deploy_c.so | grep -qi onnxruntime; then
+            echo "::error::libonnx_deploy_c.so links libonnxruntime at build time -- swappability is broken"
+            exit 1
+          fi
+          echo "confirmed: no link-time libonnxruntime dependency"
+
+      - name: Generate the toy seq2seq export and compute the expected sequence
+        working-directory: tools/onnx-deploy
+        run: |
+          python3 scripts/make_toy_seq2seq.py -o /tmp/toy_seq2seq --vocab-size 7 --encoder-ids 3,4 --decoder-start-token-id 0
+          python3 -c "
+          import sys; sys.path.insert(0, 'scripts')
+          from make_toy_seq2seq import compute_expected_ids
+          expected = compute_expected_ids([3, 4], 0, 7, 8)
+          print('expected:', expected)
+          assert expected == [0, 1, 2, 3, 4, 5, 6, 0], expected
+          "
+
+      - name: Run the CLI against the build's own ORT (${{ env.ORT_VERSION_OLDER }})
+        working-directory: tools/onnx-deploy
+        run: |
+          out=$(./build/onnx-deploy --libort "${{ env.ORT_OLDER_HOME }}/lib/libonnxruntime.so" /tmp/toy_seq2seq 3,4 --max-new-tokens 8)
+          echo "$out"
+          echo "$out" | grep -qF "generated 8 token(s): 0 1 2 3 4 5 6 0"
+
+      - name: Swap to ORT ${{ env.ORT_VERSION_NEWER }} at runtime -- same binary, no rebuild
+        working-directory: tools/onnx-deploy
+        run: |
+          out=$(./build/onnx-deploy --libort "${{ env.ORT_NEWER_HOME }}/lib/libonnxruntime.so" /tmp/toy_seq2seq 3,4 --max-new-tokens 8)
+          echo "$out"
+          echo "$out" | grep -qF "generated 8 token(s): 0 1 2 3 4 5 6 0"
+
+      - name: Early-stop at eos_token_id
+        working-directory: tools/onnx-deploy
+        run: |
+          out=$(./build/onnx-deploy --libort "${{ env.ORT_OLDER_HOME }}/lib/libonnxruntime.so" /tmp/toy_seq2seq 3,4 --max-new-tokens 20 --eos-token-id 6)
+          echo "$out"
+          echo "$out" | grep -qF "generated 7 token(s): 0 1 2 3 4 5 6"
+
+      - name: Test the Python extension against both ORT builds (fresh process per build)
+        working-directory: tools/onnx-deploy
+        run: |
+          for libort in "${{ env.ORT_OLDER_HOME }}/lib/libonnxruntime.so" "${{ env.ORT_NEWER_HOME }}/lib/libonnxruntime.so"; do
+            PYTHONPATH=build/python python3 -c "
+          import onnx_deploy_py as od
+          od.load_ort('$libort')
+          p = od.Pipeline('/tmp/toy_seq2seq')
+          assert p.is_seq2seq
+          ids = p.generate([3, 4], max_new_tokens=8)
+          assert ids == [0, 1, 2, 3, 4, 5, 6, 0], ids
+          print('OK:', '$libort', ids)
+          "
+          done
+
+      - name: Error-path smoke test (bad model dir / bad libort must fail cleanly, not crash)
+        working-directory: tools/onnx-deploy
+        run: |
+          set +e
+          ./build/onnx-deploy --libort "${{ env.ORT_OLDER_HOME }}/lib/libonnxruntime.so" /tmp/does-not-exist 3,4
+          code=$?
+          set -e
+          [ "$code" -eq 1 ]
+          set +e
+          ./build/onnx-deploy --libort /tmp/does-not-exist.so /tmp/toy_seq2seq 3,4
+          code=$?
+          set -e
+          [ "$code" -eq 1 ]
