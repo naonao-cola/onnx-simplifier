@@ -4,6 +4,7 @@
 // is "just" the wire-format read/write.
 #include <algorithm>
 #include <cstdint>
+#include <cstring>
 #include <fstream>
 #include <istream>
 #include <optional>
@@ -184,6 +185,117 @@ std::optional<uint64_t> SkipMetadataValue(std::istream& in,
     default:
       return std::nullopt;  // signed ints / floats / bool: value not needed
   }
+}
+
+// Full decode of one scalar (non-STRING, non-ARRAY) metadata value,
+// already positioned just after its `value_type` tag. Unlike
+// SkipMetadataValue above (which only cares about unsigned-int scalars, for
+// the general.alignment probe), this handles every scalar type GGUF has:
+// signed integers are sign-extended from their actual width, and
+// FLOAT32/FLOAT64 are bit-reinterpreted (via the same little-endian byte
+// assembly ReadU32LE/ReadU64LE use, then memcpy into the native float/
+// double -- NOT a raw memcpy straight from the file bytes, which would be
+// wrong on a big-endian host; onnxsim supports s390x, see
+// scripts/cross/build_s390x_extension.sh, so this matters).
+GGUFMetadataValue DecodeScalarMetadataValue(std::istream& in,
+                                            const std::string& path,
+                                            uint32_t value_type) {
+  size_t size = FixedMetadataScalarSize(value_type);
+  if (size == 0) {
+    FailRead(path, "unknown metadata value type " + std::to_string(value_type));
+  }
+  unsigned char buf[8] = {};
+  in.read(reinterpret_cast<char*>(buf), static_cast<std::streamsize>(size));
+  if (!in) FailRead(path, "truncated metadata value");
+  uint64_t raw = 0;
+  for (size_t i = size; i-- > 0;) raw = (raw << 8) | buf[i];
+
+  GGUFMetadataValue v;
+  switch (value_type) {
+    case GGUF_METADATA_VALUE_TYPE_BOOL:
+      v.kind = GGUFMetadataValue::Kind::kBool;
+      v.bool_value = (raw != 0);
+      return v;
+    case GGUF_METADATA_VALUE_TYPE_FLOAT32: {
+      uint32_t bits = static_cast<uint32_t>(raw);
+      float f;
+      std::memcpy(&f, &bits, sizeof(f));
+      v.kind = GGUFMetadataValue::Kind::kFloat;
+      v.float_value = static_cast<double>(f);
+      return v;
+    }
+    case GGUF_METADATA_VALUE_TYPE_FLOAT64: {
+      double d;
+      std::memcpy(&d, &raw, sizeof(d));
+      v.kind = GGUFMetadataValue::Kind::kFloat;
+      v.float_value = d;
+      return v;
+    }
+    case GGUF_METADATA_VALUE_TYPE_INT8:
+      v.kind = GGUFMetadataValue::Kind::kInt;
+      v.int_value = static_cast<int8_t>(raw);
+      return v;
+    case GGUF_METADATA_VALUE_TYPE_INT16:
+      v.kind = GGUFMetadataValue::Kind::kInt;
+      v.int_value = static_cast<int16_t>(raw);
+      return v;
+    case GGUF_METADATA_VALUE_TYPE_INT32:
+      v.kind = GGUFMetadataValue::Kind::kInt;
+      v.int_value = static_cast<int32_t>(raw);
+      return v;
+    case GGUF_METADATA_VALUE_TYPE_INT64:
+      v.kind = GGUFMetadataValue::Kind::kInt;
+      v.int_value = static_cast<int64_t>(raw);
+      return v;
+    case GGUF_METADATA_VALUE_TYPE_UINT8:
+    case GGUF_METADATA_VALUE_TYPE_UINT16:
+    case GGUF_METADATA_VALUE_TYPE_UINT32:
+    case GGUF_METADATA_VALUE_TYPE_UINT64:
+      v.kind = GGUFMetadataValue::Kind::kInt;
+      v.int_value = static_cast<int64_t>(raw);
+      return v;
+    default:
+      FailRead(path, "DecodeScalarMetadataValue: unexpected value_type " +
+                         std::to_string(value_type));
+  }
+}
+
+// Reads one metadata value, already positioned just after its `value_type`
+// tag (the caller has already consumed that). Decodes STRING and every
+// scalar type fully; an ARRAY value is skipped (mirroring
+// SkipMetadataValue's own ARRAY handling exactly -- duplicated rather than
+// shared since the two functions need different return shapes) and
+// std::nullopt is returned instead, per GGUFMetadata's own doc comment on
+// why arrays are out of scope here.
+std::optional<GGUFMetadataValue> ReadOneMetadataValue(std::istream& in,
+                                                      const std::string& path,
+                                                      uint32_t value_type) {
+  if (value_type == GGUF_METADATA_VALUE_TYPE_STRING) {
+    GGUFMetadataValue v;
+    v.kind = GGUFMetadataValue::Kind::kString;
+    v.string_value = ReadGGUFString(in, path);
+    return v;
+  }
+  if (value_type == GGUF_METADATA_VALUE_TYPE_ARRAY) {
+    uint32_t elem_type = ReadU32LE(in, path);
+    uint64_t len = ReadU64LE(in, path);
+    if (elem_type == GGUF_METADATA_VALUE_TYPE_ARRAY) {
+      FailRead(path, "nested metadata arrays are not supported");
+    }
+    if (elem_type == GGUF_METADATA_VALUE_TYPE_STRING) {
+      for (uint64_t i = 0; i < len; ++i) ReadGGUFString(in, path);
+    } else {
+      size_t elem_size = FixedMetadataScalarSize(elem_type);
+      if (elem_size == 0) {
+        FailRead(path, "unknown metadata array element type " +
+                           std::to_string(elem_type));
+      }
+      in.seekg(static_cast<std::streamoff>(elem_size * len), std::ios::cur);
+      if (!in) FailRead(path, "truncated metadata array");
+    }
+    return std::nullopt;
+  }
+  return DecodeScalarMetadataValue(in, path, value_type);
 }
 
 struct TensorInfo {
@@ -572,6 +684,75 @@ bool TensorPool::DequantizeToFloat(const std::string& name,
   return DequantizeGgmlKQuant(
       reinterpret_cast<const uint8_t*>(entry->data.data()), entry->data.size(),
       ggml_type, numel, out);
+}
+
+// Mirrors LoadGGUF's header-parsing loop (magic/version check, then the
+// metadata-KV loop, then the tensor-info loop) structurally -- the two are
+// kept in sync deliberately, so a future GGUF version bump or header-layout
+// change needs both updated together. They can't share the loop bodies
+// directly: LoadGGUF's metadata loop only probes for general.alignment and
+// otherwise discards every value (SkipMetadataValue), while this one
+// decodes every scalar value it sees (ReadOneMetadataValue) into the
+// returned map; LoadGGUF's tensor loop also seeks into the data section to
+// read each tensor's bytes, which this one -- by design, see
+// GGUFMetadata's doc comment -- never does at all.
+GGUFMetadata ReadGGUFMetadata(const std::string& path) {
+  std::ifstream in(path, std::ios::binary);
+  if (!in) FailRead(path, "cannot open file");
+
+  uint32_t magic = ReadU32LE(in, path);
+  if (magic != kMagic) {
+    FailRead(path, "not a GGUF file (bad magic)");
+  }
+  uint32_t version = ReadU32LE(in, path);
+  if (version != kSupportedVersion) {
+    FailRead(path, "GGUF version " + std::to_string(version) +
+                       " is not supported (only version " +
+                       std::to_string(kSupportedVersion) + " is)");
+  }
+  uint64_t tensor_count = ReadU64LE(in, path);
+  uint64_t metadata_kv_count = ReadU64LE(in, path);
+  if (tensor_count > kMaxTensorCount) {
+    FailRead(path, "implausible tensor_count (" + std::to_string(tensor_count) +
+                       "), likely corrupt");
+  }
+  if (metadata_kv_count > kMaxMetadataCount) {
+    FailRead(path, "implausible metadata_kv_count (" +
+                       std::to_string(metadata_kv_count) + "), likely corrupt");
+  }
+
+  GGUFMetadata result;
+  for (uint64_t i = 0; i < metadata_kv_count; ++i) {
+    std::string key = ReadGGUFString(in, path);
+    uint32_t value_type = ReadU32LE(in, path);
+    std::optional<GGUFMetadataValue> value =
+        ReadOneMetadataValue(in, path, value_type);
+    if (value.has_value()) {
+      result.kv[key] = std::move(*value);
+    }
+  }
+
+  result.tensors.reserve(tensor_count);
+  for (uint64_t i = 0; i < tensor_count; ++i) {
+    GGUFTensorInfo info;
+    info.name = ReadGGUFString(in, path);
+    uint32_t n_dims = ReadU32LE(in, path);
+    if (n_dims > kMaxDims) {
+      FailRead(path, "tensor '" + info.name +
+                         "' has an implausible dimension count (" +
+                         std::to_string(n_dims) + ")");
+    }
+    std::vector<uint64_t> ne(n_dims);
+    for (uint32_t d = 0; d < n_dims; ++d) ne[d] = ReadU64LE(in, path);
+    info.ggml_type = ReadU32LE(in, path);
+    ReadU64LE(in, path);  // per-tensor data offset -- irrelevant, no data read
+    // Reverse of ggml's innermost-first ne[] to onnx's outermost-first shape
+    // -- same convention LoadGGUF/LoadGGUFMmap use for the tensors they
+    // actually pool.
+    info.shape.assign(ne.rbegin(), ne.rend());
+    result.tensors.push_back(std::move(info));
+  }
+  return result;
 }
 
 }  // namespace tensor_pool

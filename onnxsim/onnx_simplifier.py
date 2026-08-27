@@ -416,6 +416,34 @@ def import_gguf_weights(
     return result, skipped
 
 
+def read_gguf_metadata(path: str) -> dict:
+    """
+    Read a GGUF file's architecture hyperparameters and per-tensor
+    name/shape/dtype list, without reading any tensor byte data -- cheap
+    even against a multi-gigabyte real checkpoint.
+
+    This is the piece :func:`import_gguf_weights` never surfaces: both
+    functions parse the same GGUF header section, but ``import_gguf_weights``
+    only ever looks at the ``general.alignment`` key before moving on to
+    loading tensor *values* into an existing graph's initializers. Use this
+    instead when what you need is the checkpoint's own description of its
+    architecture -- e.g. ``general.architecture``, ``<arch>.block_count``,
+    ``<arch>.attention.head_count``, ``<arch>.rope.freq_base`` -- to decide
+    *what graph structure* to build in the first place (``import_gguf_weights``
+    only ever fills in the values of a graph you already have).
+
+    :param path: path to the GGUF file to read
+    :returns: ``{"kv": {key: int | float | str | bool, ...},
+            "tensors": [{"name": str, "shape": [int, ...],
+            "ggml_type": int}, ...]}``. ``ggml_type`` is the raw GGML type
+            code (see ``onnxsim/gguf_dtype.h``); an ARRAY-typed metadata
+            value (e.g. ``tokenizer.ggml.tokens``, which alone can hold
+            >100k strings in a real checkpoint) is omitted from ``"kv"``
+            entirely rather than decoded.
+    """
+    return C.read_gguf_metadata(path)
+
+
 def cross_layer_equalize(model: Union[str, onnx.ModelProto]) -> onnx.ModelProto:
     """
     Data-free Cross-Layer Equalization (CLE) -- the weight-equalization
