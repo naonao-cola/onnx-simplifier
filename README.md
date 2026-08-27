@@ -83,6 +83,9 @@ constant folding until the model stops changing. Around that it offers:
 - **[Safetensors / GGUF archives](#safetensors--gguf-archives).** Export a model
   to a standalone `.safetensors` or `.gguf` file (graph + weights in one
   ecosystem-standard archive) and import it back, from every binding.
+- **[Transformers export](#transformers-export).** Export a Hugging Face
+  `transformers` model straight to a simplified ONNX deployment directory with
+  `onnxsim.export_transformers_model()`.
 - **Subgraph simplification.** Simplify `If`/`Loop`/`Scan` subgraph bodies too
   with `--include-subgraph`.
 - **Large-model handling.** Guard against blow-up from ops like `Tile`/
@@ -770,6 +773,51 @@ Importing an archive with no embedded model — e.g. a plain, weights-only
 safetensors/GGUF file from somewhere else, with no onnxsim-authored graph
 alongside the tensors — fails with a clear error rather than silently
 returning nothing: there is no graph in it to import.
+
+## Transformers export
+
+A Hugging Face `transformers` model distribution (a `config.json` plus
+`.safetensors` weights, e.g. anything under a Hub repo like
+`meta-llama/...`/`Qwen/...`) has no ONNX graph in it at all — the model's
+structure lives in the `transformers` Python modeling code, driven by
+`config.json`, not in the weights file. onnxsim has no PyTorch tracing code of
+its own to turn that into a graph, and does not need any: Hugging Face's own
+[`optimum`](https://github.com/huggingface/optimum) package already exports
+hundreds of architectures (via `optimum.exporters.onnx`) to plain ONNX —
+including the split multi-file encoder/decoder-with-past shape autoregressive
+generation needs. That export deliberately does no runtime-specific op fusion,
+so there is real simplification left for onnxsim to find.
+
+This is a different tool for a different job than [ONNX Runtime GenAI](https://github.com/microsoft/onnxruntime-genai)'s
+own model builder (`onnxruntime_genai.models.builder`): that one only covers a
+fixed, curated list of decoder-only causal-LM architectures, and its output is
+already fused/quantized into ORT-specific ops (`com.microsoft::MatMulNBits`,
+`GroupQueryAttention`, ...) meant to be consumed directly by ORT GenAI's own
+`generate()` loop — there's little left for a generic simplifier to do to it,
+and it doesn't cover encoder-only, seq2seq, vision, or audio architectures at
+all. `optimum`'s export is the right shape for onnxsim to build on instead: a
+plain graph, for any architecture with an `OnnxConfig`.
+
+`onnxsim.export_transformers_model()` wraps the export-with-optimum,
+simplify-every-graph-in-place recipe as one call:
+
+```python
+import onnxsim
+
+results = onnxsim.export_transformers_model(
+    "hf-internal-testing/tiny-random-t5",
+    "exported_and_simplified",
+    task="text2text-generation-with-past",
+)
+# {"encoder_model.onnx": True, "decoder_model.onnx": True, "decoder_with_past_model.onnx": True}
+```
+
+`output_dir` ends up holding the same files a plain `optimum` export would
+(tokenizer/config files copied through untouched), except every `.onnx` file
+has been simplified in place — so the directory is still deployable exactly
+as-is (e.g. via `optimum.onnxruntime.ORTModelForSeq2SeqLM.from_pretrained`).
+Needs the optional `torch`/`transformers`/`optimum` (with the `optimum-onnx`
+distribution) packages: `pip install onnxsim[transformers]`.
 
 ## Projects Using ONNX Simplifier
 

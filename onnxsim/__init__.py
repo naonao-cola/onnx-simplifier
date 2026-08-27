@@ -63,6 +63,7 @@ from onnxsim.precision_estimator import (
     estimate_model_quantization_drop,
     estimate_quantization_precision,
 )
+from onnxsim.transformers_export import export_transformers_model
 
 from .version import version as __version__
 
@@ -123,5 +124,6 @@ __all__ = [
     "read_gguf_metadata",
     "reconstruct_gguf_graph",
     "UnsupportedArchitectureError",
+    "export_transformers_model",
     "__version__",
 ]
