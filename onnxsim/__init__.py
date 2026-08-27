@@ -67,6 +67,7 @@ from onnxsim.precision_estimator import (
     estimate_quantization_precision,
 )
 from onnxsim.smoothquant import apply_smoothquant
+from onnxsim.squeezellm import quantize_weight_only_squeezellm
 from onnxsim.transformers_export import export_transformers_model
 
 from .version import version as __version__
@@ -98,6 +99,7 @@ __all__ = [
     "quantize_weight_only_int4_hqq",
     "quantize_weight_only_nf4",
     "NF4_CODEBOOK",
+    "quantize_weight_only_squeezellm",
     "quantize_weight_only_matmul_nbits",
     "quantize_weight_only_int8_block",
     "quantize_weight_only_int16",
