@@ -50,6 +50,14 @@ from onnxsim.onnx_simplifier import import_gguf_weights, read_gguf_metadata
 # picking 17 avoids threading yet another small int64 constant through every
 # RMSNorm call for no benefit here.
 _OPSET = 17
+# The IR version opset 17 actually requires (see onnx.helper.VERSION_TABLE --
+# opset 17 first shipped in onnx 1.12.0, IR version 8), NOT
+# onnx.IR_VERSION/onnx.helper.make_model's own default, which is whatever IR
+# version the *installed* onnx package's newest opset needs regardless of
+# what opset_imports says -- setting it that way declares a model far newer
+# than this graph's actual opset, which older onnxruntime builds (bundled
+# with e.g. a cross-compiled wheel's smoke test) then refuse to load at all.
+_IR_VERSION = 8
 
 # Mirrors onnxsim/gguf_dtype.h's GgmlType enum and ToOnnx/IsKQuant mapping --
 # duplicated here rather than exposed through a new C++ binding, the same
@@ -522,7 +530,7 @@ def reconstruct_gguf_graph(
     model = onnx.helper.make_model(
         graph, opset_imports=[onnx.helper.make_opsetid("", _OPSET)]
     )
-    model.ir_version = onnx.IR_VERSION
+    model.ir_version = _IR_VERSION
 
     model, skipped = import_gguf_weights(model, gguf_path)
     return model, skipped
