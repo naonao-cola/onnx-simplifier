@@ -1,4 +1,4 @@
-# Investigating the ~5GB decoder-submodule OOM with a synthetic repro
+# Investigating (and fixing) the ~5GB decoder-submodule OOM
 
 **Follow-up to:** `bench/TODO_large_decoder_submodule_oom.md`
 **Reproduce:** `bench/decoder_oom_repro.py` (`gen` / `measure` / `matrix` subcommands)
@@ -9,54 +9,79 @@ onnx 1.22.0, no `onnxruntime` installed. Close enough to the original
 report's "~15GB RAM cap" to be a useful stand-in, and small enough that a
 several-GB model comfortably exercises the boundary.
 
+**Note on this document's history:** an earlier version of this investigation
+(still visible in git history) attributed the peak-memory ratio below to a
+redundant *Python-side* reload in `onnx_simplifier.py`'s fast path, and shipped
+an `output_path` parameter to skip it. That reload is real, but a follow-up
+measurement (`ONNXSIM_DEBUG_PATH_TIMING=1` plus external `/proc/<pid>/status`
+RSS sampling, bypassing the GIL-blocking issue that makes in-process sampling
+useless during a C++ call) proved it doesn't move the needle: removing it left
+the measured peak byte-for-byte identical. The actual cause -- found by
+sampling RSS through each phase of `SimplifyPath` and narrowing it down to a
+single line -- is inside the **C++ core**, described below. That's now fixed
+directly; the `output_path` parameter still exists (it helps a couple of
+narrower cases) but is no longer the headline fix.
+
 ## TL;DR
 
 * **File count doesn't matter, total bytes do.** A model with one external-data
   file per initializer (168 files, mimicking `torch.onnx.export`'s legacy
   exporter) and the same model consolidated into a single external file
-  produce **byte-identical peak RSS** at both sizes tested. This settles the
-  TODO doc's open question -- there is no separate per-file overhead.
-* **`onnxsim.simplify()`'s peak RSS is consistently ~1.9x the model's total
-  weight bytes**, even on the default, no-correctness-check path
-  (`check_n=0`). That ratio is large enough on its own to explain the
-  original OOM: it comes from a real, identifiable double materialization in
-  `onnx_simplifier.py`'s "fast path" (see below), not from file count, not
-  from constant folding, and not from shape inference.
-* **`check_n>0` (correctness verification) makes it substantially worse** --
-  up to ~2.7x -- because without `onnxruntime` installed, each check trial
-  reloads the *entire* model a fresh time through onnx's pure-Python
-  reference evaluator.
-* At this sandbox's 13.34 GiB cap, a **~4.93 GB** model survives at
-  `check_n=0` (peak 9.29 GiB) but **OOMs at `check_n=1`** (peak crosses
-  13.2 GiB before being killed). An **~8.02 GB** model OOMs even at
-  `check_n=0`. The real submodule was ~5.3 GB in a ~15 GB cap -- a very
-  similar margin -- so either a nonzero `check_n` somewhere in that export
-  pipeline, or a modest amount of concurrent memory use alongside onnxsim
-  (both very plausible for a real multi-submodule export script), is enough
-  to tip it over by this same mechanism.
+  produce **byte-identical peak RSS**. Settles the TODO doc's open question --
+  there is no separate per-file overhead.
+* **Root cause, found precisely:** `onnxsim.cpp`'s `Simplify()` takes its
+  input model by `const&` (so callers who need their original preserved get
+  that guarantee) and therefore always deep-copies it into a mutable working
+  copy (`onnx::ModelProto sim_model = model;`) before running the fixed
+  point. For a model whose weights dominate its size, that copy alone costs
+  another ~1x model size in peak RSS on top of the ~1x already needed to hold
+  the loaded input -- explaining a ~1.9x peak-to-model-size ratio with no
+  need to invoke Python, file count, or check_n at all.
+* **Fixed:** added `SimplifyConsumeInput`, an explicit, opt-in variant that
+  takes the model by mutable reference and *moves* its tensor data into the
+  working copy (the same move-based ModelProto&lt;-&gt;Graph round trip
+  already used elsewhere in this file for the per-round fixed-point Graph,
+  and in onnx-optimizer's own "consuming" `Optimizer::optimize()` overload)
+  instead of copying it. Wired into `SimplifyPath` (the file-to-file entry
+  point both the CLI and `onnxsim.simplify(path, check_n=0)`'s fast path use)
+  and into `C.simplify`'s in-memory/bytes entry point -- both own a model
+  they discard immediately after the call, which is exactly when this is
+  safe. **Verified fix:** the previously-OOMing ~8.02 GB model now completes
+  at 7.6 GiB peak (~0.97x model size, i.e. essentially just the cost of
+  holding it once) instead of being killed at >13.3 GiB.
+* **`check_n>0` is a separate, still-open issue**, unaffected by this fix (it
+  runs a different code path that must keep the original model around for
+  comparison, and additionally reloads full models per correctness-check
+  trial through onnx's pure-Python reference evaluator when `onnxruntime`
+  isn't installed). A model that now succeeds at `check_n=0` can still OOM at
+  `check_n=1`.
 
 ## Results
 
-| layout | check_n | model size | peak RSS | peak / size | outcome |
-|---|---:|---:|---:|---:|---|
-| many (168 files) | 0 | 4.93 GB | 9.29 GiB | 1.88x | OK |
-| single (1 file) | 0 | 4.93 GB | 9.29 GiB | 1.88x | OK (byte-identical to "many") |
-| many (168 files) | 1 | 4.93 GB | ≥13.22 GiB | ≥2.68x | **OOM-killed** |
-| many (273 files) | 0 | 8.02 GB | ≥13.22 GiB | ≥1.65x | **OOM-killed** |
-| many (273 files) | 1 | 8.02 GB | ≥13.21 GiB | ≥1.65x | **OOM-killed** |
-| single (1 file) | 0 | 8.02 GB | ≥13.22 GiB | ≥1.65x | **OOM-killed** (byte-identical to "many") |
+All measurements are `onnxsim.simplify(path, check_n=0)` (the CLI's and the
+fast path's exact call), single-file external-data layout (file count doesn't
+affect any of this, see above).
 
-"≥" marks a run that was killed by the kernel OOM killer (`SIGKILL`) while
-still climbing -- its true peak, had the cgroup allowed it, would have been
-higher. Reproduce with:
+| model size | peak RSS, before fix | peak RSS, after fix | ratio, before | ratio, after | outcome, before | outcome, after |
+|---|---:|---:|---:|---:|---|---|
+| 4.93 GB | 9.29 GiB | 4.74 GiB | 1.88x | 0.96x | OK | OK |
+| 8.02 GB | ≥13.22 GiB | 7.61 GiB | ≥1.65x | 0.95x | **OOM-killed** | OK |
+
+"≥" marks a run killed by the OOM killer (`SIGKILL`) while still climbing --
+its true peak, had the cgroup allowed it, would have been higher, so the
+before/after gap at 8.02 GB is a lower bound. `check_n=1` on the same 4.93 GB
+model still OOMs after the fix (peak reaches ≥13.27 GiB before being killed,
+essentially unchanged from before the fix) -- expected, since that path is
+untouched (see "What's still open" below).
+
+Reproduce the fixed numbers with:
 
 ```
 python bench/decoder_oom_repro.py matrix /tmp/work --sizes 5,8
 ```
 
-Each row regenerates its model and measures `onnxsim.simplify()` in a fresh
-subprocess (see the methodology note below for why that matters), so a run
-takes a few minutes per size.
+(the "many vs single" file-count comparison in that script's output is
+unaffected by this fix and still shows byte-identical peaks at every size.)
 
 ## The model
 
@@ -81,65 +106,148 @@ model's 254 external files in the first place), but it's a confound for what
 this bench actually measures, so `decoder_oom_repro.py gen` keeps generation
 at O(one tensor) of Python memory.
 
-## Root cause: the "fast path" materializes the result twice
+## Root cause, precisely
 
-`onnxsim.simplify(path, check_n=0)` -- what both `measure()` here and
-onnxsim's CLI actually call -- takes the "fast path" in
-`onnx_simplifier.py` (~line 1281: `if check_n == 0 and not _shapes_need_model
-and ...`). For a file-path input this calls `C.simplify_path(...)`, which is
-correctly designed to avoid a Python-side materialize/serialize round trip:
-the C++ core reads the external-data model straight from disk and writes the
-simplified result straight back to disk (`fast_out_path`), documented
-explicitly as avoiding exactly the cost this investigation found:
+Sampling `/proc/<pid>/status`'s `VmHWM` from an external shell loop every
+100ms (Python-level sampling can't run *during* a C++ call: the GIL blocks it,
+as `bench/peak_memory.py`'s own methodology notes already point out) against
+`onnxsim.simplify(path, check_n=0)` with `ONNXSIM_DEBUG_PATH_TIMING=1` shows
+RSS growing in two distinct, contiguous phases on the 4.93GB model:
 
-> every initializer's bytes get materialized into a Python `ModelProto`,
-> serialized back to a byte string, and reparsed on the C++ side, all before
-> simplification even starts
-
-That comment describes the *input* side correctly. But the very next line
-(~1332) is:
-
-```python
-model_opt = onnx.load(fast_out_path)
+```
+SimplifyPath: loadModel  21161.7ms   <- RSS: 0 -> ~4.85 GB  (one copy of the model)
+SimplifyPath: Simplify   11333.6ms   <- RSS: ~4.85 -> ~9.77 GB (a SECOND ~4.9GB copy)
+SimplifyPath: ByteSizeLong    0.2ms  <- flat
+SimplifyPath: saveModel   7780.7ms   <- flat (external-data write, no extra RSS)
 ```
 
-`simplify()`'s documented return value is `(model_opt: ModelProto, check_ok:
-bool)`, so the fast path -- despite going to the trouble of a pure
-file-to-file C++ call for the input -- **always fully loads the entire
-output back into Python** (default `load_external_data=True`) before
-returning, undoing half of its own optimization. For a multi-GB model this
-means:
+The peak is reached **and never exceeded again** by the end of the `Simplify`
+phase -- confirmed by comparing `getrusage(RUSAGE_SELF).ru_maxrss` sampled
+immediately after `C.simplify_path` returns to the same value sampled at the
+very end of the Python call: identical, so nothing afterward (not
+`model_checking.compare`, not any Python-side reload) contributes to the
+peak. That ruled out this document's original theory (a Python-side
+`onnx.load(fast_out_path)` reload) directly: removing it experimentally
+produced a byte-for-byte identical peak, which is only possible if the peak
+was already set before that reload ever ran.
 
-1. The C++ engine (`C.simplify_path`) holds the model's weights internally
-   while simplifying (~1x model size).
-2. Python then loads the same result again in full (~1x model size) just to
-   satisfy the API's `ModelProto`-returning contract.
+`Simplify()` (`onnxsim.cpp`) takes its model by `const&`:
 
-Nothing frees the first copy's memory back to the OS before the second copy
-is made (RSS is a monotonic high-water mark, and freed heap memory isn't
-necessarily returned to the kernel), so the two materializations largely
-**add** rather than reuse -- matching the observed ~1.9x ratio almost
-exactly, and explaining why it held steady across both a 4.93GB and an 8GB
-model (it's proportional to model size, not a fixed overhead).
+```cpp
+onnx::ModelProto Simplify(
+    const ModelExecutor& executor, const onnx::ModelProto& model, ...)
+```
 
-The onnxsim **CLI** compounds this further: `main()` gets back that same
-fully-materialized `model_opt` and immediately calls `onnx.save(model_opt,
-..., save_as_external_data=True, ...)` (`onnx_simplifier.py` ~line 2711) to
-write it back out to `args.output_model` -- a **third** full pass over the
-weights for a workflow (`onnxsim in.onnx out.onnx`) that never needed the
-result in Python memory at all. This bench measures the library API only
-(`onnxsim.simplify()`, no save), so the CLI's additional cost isn't in the
-numbers above, but it's visible directly in the code and is worth keeping in
-mind for anyone hitting this via the command line rather than the API.
+so that callers who need their original model preserved (e.g. anything
+needing a before/after comparison) get that guarantee. But the fixed point
+underneath mutates in place, so the function makes a working copy up front:
 
-`check_n>0` makes this worse for an orthogonal reason: without
-`onnxruntime` installed, `onnxsim/backend.py`'s `_run_with_reference` falls
-back to `onnx.reference.ReferenceEvaluator`, and `model_checking.compare()`
-calls it once per `check_n` trial for *both* the original and the simplified
-model (`onnxsim/model_checking.py` ~line 328-329) -- each call doing its own
-fresh `onnx.load()` of a full-size model. That's on top of the two
-materializations above, which is why `check_n=1` pushed the ratio from
-~1.88x to ~2.68x on the same 4.93GB model.
+```cpp
+// The fixed points mutate in place, so make one working copy of the (const)
+// input model and simplify it in place.
+onnx::ModelProto sim_model = model;
+```
+
+For an external-data model whose weights dominate its size, this is a second
+full deep copy of the whole tensor payload -- `model` (~1x, from `loadModel`)
+plus `sim_model` (another ~1x, from this line) simultaneously resident. That
+alone explains the ~1.9x peak-to-model-size ratio, independent of Python,
+file count, or `check_n`.
+
+The only other use of the original `model` parameter anywhere after this line
+is `RecordSimplifyDiffMetadata(sim_model, model)` near the end, which computes
+a structural diff (removed/changed nodes, dropped doc strings) -- confirmed
+by reading `model_info.cpp`'s implementation to never touch tensor byte data,
+only shapes, node lists, op types and doc strings.
+
+## The fix
+
+`onnxsim.cpp` already uses a move-based ModelProto&lt;-&gt;Graph round trip
+elsewhere -- `OptAndShape`'s per-round resident Graph calls
+`onnx::ExportModelProto(&out, g, /*consume_tensor_data=*/true)`, and
+onnx-optimizer's own `optimize.h` has an analogous "consuming" overload of
+`Optimizer::optimize()` with the exact comment: *"This roughly halves the
+memory traffic of one optimize() call for weight-heavy models."* The fix
+applies that same, already-proven pattern one level higher, to the `sim_model`
+copy itself:
+
+1. Extracted `Simplify()`'s body into a private `SimplifyImpl`, parameterized
+   by an optional `onnx::ModelProto* mutable_model`. When null, `sim_model`
+   is built exactly as before (a plain deep copy) -- so the existing
+   `Simplify()` entry point is byte-for-byte unchanged, and every other
+   caller (Rust bindings, C API, WASM, every existing test) is unaffected.
+2. Added `SimplifyConsumeInput(executor, onnx::ModelProto& model, ...)`: when
+   `mutable_model` is non-null, `sim_model` is instead built via
+   `ImportModelProto(*mutable_model)` (the *mutable* overload, which moves
+   each initializer's raw bytes out of `model`) followed by
+   `ExportModelProto(&sim_model, g, /*consume_tensor_data=*/true)` (moves
+   them into `sim_model`) -- the same Import/Export pair `OptAndShape`
+   already uses, just called once at the top instead of once per fixed-point
+   round. `model`'s structure survives intact (needed for the diff above);
+   only its tensor bytes move.
+3. Wired into the two callers that own a model they discard right after the
+   call and never read again beforehand -- exactly the condition
+   `SimplifyConsumeInput`'s doc comment requires:
+   - `SimplifyPath` (`onnxsim.cpp`): `model = SimplifyConsumeInput(executor, model, ...)`
+     -- the file-to-file entry point both the CLI and `simplify(path,
+     check_n=0)`'s Python fast path call.
+   - `C.simplify`'s bytes-based binding (`cpp2py_export.cc`): its `model` is
+     parsed fresh from the input bytes and only ever used for this one call.
+   No other call site was touched, and none needed to be: this is a new,
+   separately-named function, not an overload of `Simplify` that could
+   silently change behavior for an existing caller via overload resolution.
+
+See `onnxsim/onnxsim.h`/`onnxsim.cpp`/`cpp2py_export.cc` for the actual diff.
+
+### Why `output_path` (this doc's original fix) is now secondary
+
+The `output_path` parameter added to `onnxsim.simplify()` (a Python-level
+change to skip reloading the result after the fast path's C++ call) is still
+in the codebase and still does what it says, but measuring it against the
+*fixed* C++ core shows it no longer has anything left to save: with the C++
+fix in place, `output_path` and no `output_path` produce the same peak
+(4856.9 vs 4857.3 MiB on the 4.93GB model -- noise). That's expected: once
+the C++ side needs only ~1x model size, there's no second large peak left for
+a Python-side reload to add on top of. `output_path` still helps in the two
+cases the C++ fix doesn't reach:
+
+* `check_n > 0` (goes through the slow path, `Simplify()`'s plain overload,
+  which must still deep-copy to preserve the original for comparison) --
+  `output_path` at least avoids re-loading the *already-materialized* result
+  a second time before returning.
+* A caller who wants the saved file but supplies an in-memory `ModelProto`
+  rather than a path (`output_path` requires a path input, so this doesn't
+  apply, but see the parameter's docstring for the exact conditions).
+
+## What's still open
+
+* **`check_n > 0` is not fixed.** `model_checking.compare()` still reloads a
+  full model per correctness-check trial via onnx's pure-Python reference
+  evaluator when `onnxruntime` isn't installed (`onnxsim/model_checking.py`
+  ~line 328-329), on top of `Simplify()`'s own const-preserving path (which
+  correctly cannot use `SimplifyConsumeInput`, since check_n > 0 needs the
+  original model intact for the comparison). A model that now succeeds at
+  `check_n=0` can still OOM at `check_n=1` -- confirmed on the 4.93GB model
+  above. If the real backbone submodule's export pipeline used a nonzero
+  `check_n`, this fix alone would not have resolved the original report.
+* **The CLI's own extra save.** `main()` still calls `onnx.save(model_opt,
+  ...)` after `simplify()` returns, which is now cheap relative to before (no
+  second giant copy already happened inside `simplify()`) but is still a
+  second write of a potentially large model. Not urgent given the fix above
+  already addresses the actual OOM, but worth revisiting if the CLI path
+  specifically needs to shave further memory or time.
+* **Not validated against the real backbone submodule** (see the TODO doc's
+  "How to get the model") -- the mechanism found here is generic to any
+  external-data model whose weights dominate its size, but a real
+  transformer's additional structure (KV-cache concat, RoPE, embeddings)
+  hasn't been checked against this exact fix.
+* **No `massif`/`heaptrack` trace was captured** -- the root cause was
+  isolated by external `/proc/<pid>/status` RSS sampling correlated with the
+  existing `ONNXSIM_DEBUG_PATH_TIMING` phase markers, and confirmed by
+  reading the relevant source directly (finding the exact `sim_model = model`
+  line and tracing its only other later use), not by a line-level allocator
+  profile. A real profiler run would be a good independent confirmation but
+  wasn't necessary to find or fix this.
 
 ## Methodology note: a bug this investigation ran into and fixed
 
@@ -154,44 +262,6 @@ consecutive rows -- one killed by OOM, one that completed successfully --
 reported the exact same peak-RSS figure down to the decimal, which is not
 plausible for two different outcomes. Fixed by having `matrix` invoke
 `measure` as a fresh top-level subprocess per row, so each one starts from
-`RUSAGE_CHILDREN == 0`. All numbers in this document are from the corrected
-version. Anyone extending this bench with more in-process measurement loops
-should keep this in mind -- it's an easy mistake to reproduce.
-
-## What this doesn't establish
-
-* This isolates onnxsim's own `simplify()` call. It does not reproduce the
-  *export* step (`torch.onnx.export`) or confirm the real
-  `BreezeBlue/Breeze-TTS-2` backbone hits precisely this code path -- the
-  qualitative mechanism (fast-path double materialization, worsened by
-  `check_n>0`) is generic to any sufficiently large model, but the exact
-  ratio could differ for a real transformer graph (embeddings, KV-cache
-  concat, RoPE, causal masking) versus this bench's simpler repeated
-  matmul-chain structure.
-* No `massif`/`heaptrack`-level trace was captured (the TODO doc's "next
-  steps" #2) -- the ~1.9x figure is inferred from black-box `ru_maxrss`
-  deltas across model sizes and check_n values, not from a line-level
-  allocation profile. It's consistent enough across two model sizes and two
-  layouts to trust qualitatively, but a real profiler would be needed to
-  confirm the two-materialization explanation at the allocation level rather
-  than by elimination.
-
-## Next steps, if picking this up
-
-1. **Fix candidate:** give `simplify()`'s fast path a way to skip the
-   `onnx.load(fast_out_path)` re-materialization when the caller doesn't need
-   the in-memory `ModelProto` back -- e.g. an `output_path` parameter so
-   `simplify()` can leave the result on disk, or a lazy/deferred-load return
-   value. This is an API-surface change (the documented return contract is
-   `(ModelProto, bool)`), so it needs design discussion, not a silent
-   behavior change; not attempted here.
-2. Apply the same fix to the CLI's own extra `onnx.save(model_opt, ...)`
-   round trip once/if the above lands -- the CLI's dominant use case
-   (`onnxsim in.onnx out.onnx`) never needs the intermediate `ModelProto` at
-   all.
-3. Confirm this against the real backbone submodule (see the TODO doc's "How
-   to get the model") to check whether the ~1.9x ratio found here holds for
-   an actual transformer export, or whether real-model structure (KV-cache
-   concat, RoPE, embeddings) pushes it higher.
-4. Capture an actual `massif`/`heaptrack` trace on this bench's synthetic
-   model to confirm the two-materialization theory at the allocation level.
+`RUSAGE_CHILDREN == 0`. Anyone extending this bench with more in-process
+measurement loops should keep this in mind -- it's an easy mistake to
+reproduce.

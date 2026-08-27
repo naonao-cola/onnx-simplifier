@@ -1099,13 +1099,16 @@ def _make_add_model():
 
 
 def test_output_path_fast_path_saves_directly_and_skips_reload():
-    # Regression test for the double materialization documented in
-    # bench/RESULTS_synthetic_decoder_oom.md / bench/TODO_large_decoder_submodule_oom.md:
-    # on the check_n=0 fast path, simplify() used to always call
-    # onnx.load(fast_out_path) (full data inline) purely to satisfy its return
-    # contract, even when the caller's very next step is to save the result again
-    # (as onnxsim's own CLI does). ``output_path`` lets the C++ core write the
-    # final result directly, so the returned model can stay structure-only.
+    # Regression test for a real, if secondary, inefficiency documented in
+    # bench/RESULTS_synthetic_decoder_oom.md: on the check_n=0 fast path,
+    # simplify() used to always call onnx.load(fast_out_path) (full data inline)
+    # purely to satisfy its return contract, even when the caller's very next
+    # step is to save the result again (as onnxsim's own CLI does).
+    # ``output_path`` lets the C++ core write the final result directly, so the
+    # returned model can stay structure-only. (That doc's real headline fix --
+    # the dominant peak-memory cost, inside the C++ core's own working copy --
+    # is separate, in onnxsim.cpp's SimplifyConsumeInput; this reload is real
+    # but turned out not to be what was driving the original OOM report.)
     #
     # The C++ core only actually externalizes a saved model's data past the 2GB
     # protobuf limit (onnxsim.cpp's SimplifyPath: ``needs_external_data =

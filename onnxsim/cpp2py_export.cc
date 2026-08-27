@@ -1041,7 +1041,13 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
          ONNX_NAMESPACE::ModelProto model;
          ParseProtoFromBytes(&model, model_proto_bytes.c_str(),
                              model_proto_bytes.size());
-         auto const result = Simplify(
+         // ``model`` is this lambda's own local, parsed fresh from
+         // ``model_proto_bytes`` and never read again after this call --
+         // exactly the case SimplifyConsumeInput's doc comment calls out as
+         // safe, and it does not touch the caller's own Python object (which
+         // was only ever serialized *from*, not aliased). See
+         // bench/RESULTS_synthetic_decoder_oom.md for why this matters.
+         auto const result = SimplifyConsumeInput(
              *executor, model, skip_optimizers, constant_folding,
              shape_inference, tensor_size_threshold, target_opset_version,
              rewriter.get(), initializers_as_constants,

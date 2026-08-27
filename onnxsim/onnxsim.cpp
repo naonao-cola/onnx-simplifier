@@ -249,8 +249,18 @@ bool OptAndShapeOnGraph(onnx::Graph& g, bool optimize, bool shape_inference,
   return any_changed;
 }
 
-onnx::ModelProto Simplify(
+// Shared body of Simplify()/SimplifyConsumeInput() below, differing only in
+// how ``sim_model`` -- the mutable working copy the fixed point runs on --
+// gets built from ``model``. ``mutable_model`` is null (and ``model`` is
+// deep-copied into ``sim_model``, as always) for the plain, input-preserving
+// path; when non-null, it aliases ``model`` and this instead does the same
+// move-based ModelProto -> Graph -> ModelProto round trip already used for
+// OptAndShape's own resident Graph above (and Optimizer::optimize()'s own
+// consuming overload in onnxoptimizer/optimize.h) -- see
+// SimplifyConsumeInput's own doc comment for when that's safe to ask for.
+static onnx::ModelProto SimplifyImpl(
     const ModelExecutor& executor, const onnx::ModelProto& model,
+    onnx::ModelProto* mutable_model,
     std::optional<std::vector<std::string>> skip_optimizers,
     bool constant_folding, bool shape_inference, size_t tensor_size_threshold,
     std::optional<int> target_opset_version, const GraphRewriter* rewriter,
@@ -609,8 +619,29 @@ onnx::ModelProto Simplify(
     });
   }
   // The fixed points mutate in place, so make one working copy of the (const)
-  // input model and simplify it in place.
-  onnx::ModelProto sim_model = model;
+  // input model and simplify it in place. When the caller has told us
+  // ``model``'s tensor data can be consumed (``mutable_model`` non-null), do
+  // the same move-based Import/Export round trip as OptAndShape's own
+  // resident Graph above, instead of a deep copy -- this is what actually
+  // avoids the extra ~1x-model-size peak documented in
+  // bench/RESULTS_synthetic_decoder_oom.md, since it was traced to exactly
+  // this copy, not (as first suspected) anything on the Python side.
+  onnx::ModelProto sim_model;
+  if (mutable_model != nullptr) {
+    std::shared_ptr<onnx::Graph> g(onnx::ImportModelProto(*mutable_model));
+    if (g.get() == nullptr) {
+      // Same fallback as the plain path: if we can't parse it, just copy.
+      sim_model = model;
+    } else {
+      sim_model = onnx::PrepareOutput(model);
+      onnx::ExportModelProto(&sim_model, g, /*consume_tensor_data=*/true);
+      for (const auto& function_proto : model.functions()) {
+        *sim_model.add_functions() = function_proto;
+      }
+    }
+  } else {
+    sim_model = model;
+  }
   // Matches onnx_simplifier.py's default (mutable_initializer=False): fold
   // initializers that also appear as graph inputs like any other constant.
   if (!mutable_initializer) {
@@ -864,6 +895,42 @@ onnx::ModelProto Simplify(
   return sim_model;
 }
 
+onnx::ModelProto Simplify(
+    const ModelExecutor& executor, const onnx::ModelProto& model,
+    std::optional<std::vector<std::string>> skip_optimizers,
+    bool constant_folding, bool shape_inference, size_t tensor_size_threshold,
+    std::optional<int> target_opset_version, const GraphRewriter* rewriter,
+    bool initializers_as_constants, bool include_inline_functions,
+    bool mutable_initializer,
+    const std::optional<std::unordered_map<std::string, std::vector<int64_t>>>&
+        overwrite_input_shapes,
+    const std::optional<std::vector<std::string>>& unused_output) {
+  return SimplifyImpl(executor, model, /*mutable_model=*/nullptr,
+                      skip_optimizers, constant_folding, shape_inference,
+                      tensor_size_threshold, target_opset_version, rewriter,
+                      initializers_as_constants, include_inline_functions,
+                      mutable_initializer, overwrite_input_shapes,
+                      unused_output);
+}
+
+onnx::ModelProto SimplifyConsumeInput(
+    const ModelExecutor& executor, onnx::ModelProto& model,
+    std::optional<std::vector<std::string>> skip_optimizers,
+    bool constant_folding, bool shape_inference, size_t tensor_size_threshold,
+    std::optional<int> target_opset_version, const GraphRewriter* rewriter,
+    bool initializers_as_constants, bool include_inline_functions,
+    bool mutable_initializer,
+    const std::optional<std::unordered_map<std::string, std::vector<int64_t>>>&
+        overwrite_input_shapes,
+    const std::optional<std::vector<std::string>>& unused_output) {
+  return SimplifyImpl(executor, model, /*mutable_model=*/&model,
+                      skip_optimizers, constant_folding, shape_inference,
+                      tensor_size_threshold, target_opset_version, rewriter,
+                      initializers_as_constants, include_inline_functions,
+                      mutable_initializer, overwrite_input_shapes,
+                      unused_output);
+}
+
 void SimplifyPath(
     const ModelExecutor& executor, const std::string& in_path,
     const std::string& out_path,
@@ -893,11 +960,19 @@ void SimplifyPath(
 
   {
     const auto t0 = now();
-    model =
-        Simplify(executor, model, skip_optimizers, constant_folding,
-                 shape_inference, tensor_size_threshold, target_opset_version,
-                 rewriter, initializers_as_constants, include_inline_functions,
-                 mutable_initializer, overwrite_input_shapes, unused_output);
+    // ``model`` is this function's own local, about to be overwritten by the
+    // result and never read again beforehand -- exactly the case
+    // SimplifyConsumeInput's doc comment calls out as safe, and the one this
+    // investigation was written for (see
+    // bench/RESULTS_synthetic_decoder_oom.md): it avoids the ~1x-model-size
+    // deep copy ``Simplify()`` would otherwise make of ``model`` to get a
+    // mutable working copy, cutting the peak RSS of simplifying a large
+    // external-data model roughly in half.
+    model = SimplifyConsumeInput(
+        executor, model, skip_optimizers, constant_folding, shape_inference,
+        tensor_size_threshold, target_opset_version, rewriter,
+        initializers_as_constants, include_inline_functions,
+        mutable_initializer, overwrite_input_shapes, unused_output);
     if (debug_timing) {
       std::cerr << "SimplifyPath: Simplify " << elapsed_ms(t0, now()) << "ms\n";
     }

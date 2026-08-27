@@ -119,6 +119,34 @@ onnx::ModelProto Simplify(
     const std::optional<std::vector<std::string>>& unused_output =
         std::nullopt);
 
+// Same as ``Simplify`` above, except ``model`` is taken by mutable reference
+// and its initializers' raw tensor bytes are moved out (via the same
+// move-based ModelProto -> Graph -> ModelProto round trip already used
+// internally for shape inference / constant folding's own resident Graph)
+// instead of deep-copied into the working copy the fixed point runs on. For
+// a model whose weights dominate its size, this roughly halves
+// ``Simplify``'s own peak memory (see bench/RESULTS_synthetic_decoder_oom.md
+// for measurements and bench/TODO_large_decoder_submodule_oom.md for the
+// original report this traces back to).
+//
+// Only call this when ``model`` is about to be discarded or overwritten by
+// the caller -- afterward its initializers are left with empty raw data
+// (structure otherwise intact: shapes, names, node list, doc strings, ...).
+// ``SimplifyPath`` uses this for exactly that reason: its own ``model`` is
+// immediately overwritten by the result and never read again beforehand.
+onnx::ModelProto SimplifyConsumeInput(
+    const ModelExecutor& executor, onnx::ModelProto& model,
+    std::optional<std::vector<std::string>> skip_optimizers,
+    bool constant_folding, bool shape_inference, size_t tensor_size_threshold,
+    std::optional<int> target_opset_version = std::nullopt,
+    const GraphRewriter* rewriter = nullptr,
+    bool initializers_as_constants = true,
+    bool include_inline_functions = false, bool mutable_initializer = true,
+    const std::optional<std::unordered_map<std::string, std::vector<int64_t>>>&
+        overwrite_input_shapes = std::nullopt,
+    const std::optional<std::vector<std::string>>& unused_output =
+        std::nullopt);
+
 // Debugging helpers: run a *single* one of the transforms that ``Simplify``
 // otherwise drives to a fixed point, once, on a copy of ``model``, and return
 // the result. They let a caller inspect the isolated effect of a step (e.g. the

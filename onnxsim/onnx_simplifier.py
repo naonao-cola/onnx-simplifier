@@ -1184,25 +1184,21 @@ def simplify(
     :param output_path: Save the simplified model to this path directly, instead of (or as
             well as) relying on the caller to save the returned ``ModelProto`` themselves.
             Requires ``model`` to be a file path (there is no file to redirect otherwise).
-            This matters for large models: when ``model`` is a path and ``check_n == 0``
-            (the default) -- the common case of just simplifying a file and saving the
-            result, e.g. the CLI's ``onnxsim in.onnx out.onnx`` -- ``simplify()`` already
-            hands the whole job to the C++ core via a path-to-path call
-            (``C.simplify_path``), never materializing the *input* in Python. Passing
-            ``output_path`` lets it skip the matching waste on the *output* side too: without
-            it, the result is always read back into a full in-memory ``ModelProto`` (to
-            satisfy this function's return contract) even when the caller's very next step is
-            to save it again, which for an N-byte model costs roughly another N bytes of peak
-            RSS for no benefit (see ``bench/RESULTS_synthetic_decoder_oom.md`` for
-            measurements -- this is the double materialization documented there). With
-            ``output_path`` set, that path is used as the real save location instead of a
-            throwaway temporary file, and the returned ``model_opt`` is loaded structure-only
-            (``load_external_data=False``): correct for inspecting the graph (shapes, node
-            counts, ...), but call ``onnx.load_external_data_for_model(model_opt)`` yourself
-            if you need actual tensor values from it afterward. Outside that fast-path case
-            (``check_n > 0``, or another reason the fast path doesn't apply) the model is
-            still saved to ``output_path`` before returning, just without the memory saving,
-            since the full model has to be materialized anyway to run the correctness check.
+            When ``model`` is a path and ``check_n == 0`` (the default), this lets the fast
+            path skip reading the result back with its tensor data inline (default
+            ``load_external_data=True``) purely to satisfy this function's return contract,
+            loading it structure-only (``load_external_data=False``) instead -- correct for
+            inspecting the graph (shapes, node counts, ...), but call
+            ``onnx.load_external_data_for_model(model_opt)`` yourself if you need actual
+            tensor values from it afterward. Note this is a secondary optimization: the
+            dominant peak-memory cost for a large external-data model was traced to the C++
+            core's own working copy of the model, not to this reload -- see
+            ``bench/RESULTS_synthetic_decoder_oom.md`` for the measurements and the (now
+            separately fixed, via ``SimplifyConsumeInput`` in ``onnxsim.cpp``) root cause.
+            Outside the fast-path case (``check_n > 0``, or another reason it doesn't apply)
+            the model is still saved to ``output_path`` before returning, just without that
+            reload-skipping benefit, since the full model has to be materialized anyway to
+            run the correctness check.
     :return: A tuple (simplified model, success(True) or failed(False))
     """
     # Validate the requested execution providers up front. onnxsim's constant
@@ -1324,13 +1320,14 @@ def simplify(
                 if isinstance(model, str):
                     # ``output_path`` given: write the result there directly instead of a
                     # throwaway temporary file, and skip loading it back with data inline.
-                    # Reloading in full here would undo the very optimization this branch
-                    # exists for -- see the double materialization documented in
-                    # ``output_path``'s docstring above and in
-                    # ``bench/RESULTS_synthetic_decoder_oom.md`` (this was the root cause
-                    # found for bench/TODO_large_decoder_submodule_oom.md). A structure-only
-                    # load still satisfies this function's ``ModelProto``-returning contract
-                    # for callers who only need the graph shape, not the tensor values.
+                    # A structure-only load still satisfies this function's
+                    # ``ModelProto``-returning contract for callers who only need the graph
+                    # shape, not the tensor values. See ``output_path``'s docstring above for
+                    # why this is a secondary optimization rather than the main fix for
+                    # bench/TODO_large_decoder_submodule_oom.md -- that turned out to be
+                    # inside the C++ core (``SimplifyConsumeInput`` in ``onnxsim.cpp``), not
+                    # here; see ``bench/RESULTS_synthetic_decoder_oom.md`` for how that was
+                    # found.
                     if output_path is not None:
                         C.simplify_path(
                             _get_model_executor(providers),
