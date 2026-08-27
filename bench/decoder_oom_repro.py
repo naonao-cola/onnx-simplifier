@@ -19,6 +19,7 @@ Usage:
     python bench/decoder_oom_repro.py measure <model.onnx> [--check-n N]
     python bench/decoder_oom_repro.py matrix <work_dir> [--sizes 5,8] [--keep]
 """
+
 import argparse
 import json
 import os
@@ -29,8 +30,7 @@ import sys
 import time
 
 import numpy as np
-import onnx
-from onnx import helper, TensorProto
+from onnx import TensorProto, helper
 
 BENCH = os.path.dirname(os.path.abspath(__file__))
 
@@ -52,7 +52,11 @@ def layers_for_gb(gb):
 def _set_external(tensor, location, offset, length):
     tensor.data_location = TensorProto.EXTERNAL
     tensor.ClearField("external_data")
-    for k, v in (("location", location), ("offset", str(offset)), ("length", str(length))):
+    for k, v in (
+        ("location", location),
+        ("offset", str(offset)),
+        ("length", str(length)),
+    ):
         entry = tensor.external_data.add()
         entry.key = k
         entry.value = v
@@ -199,9 +203,11 @@ def gen(out_dir, layers, hidden, ffn, seq_len, layout, seed):
         f.write(model.SerializeToString())
 
     n_files = sum(1 for f in os.listdir(out_dir) if f != "model.onnx")
-    print(f"{onnx_path}: {writer.n_initializers} initializers, "
-          f"{writer.total_bytes / 1e9:.2f} GB, {n_files} external-data file(s), "
-          f"layout={layout}")
+    print(
+        f"{onnx_path}: {writer.n_initializers} initializers, "
+        f"{writer.total_bytes / 1e9:.2f} GB, {n_files} external-data file(s), "
+        f"layout={layout}"
+    )
     return onnx_path, writer.total_bytes
 
 
@@ -231,6 +237,7 @@ def measure(model_path, check_n):
     # previous one in the same process. `matrix` avoids this by invoking
     # `measure` as a fresh top-level process per row (see run_measure_subprocess).
     import tempfile
+
     fd, child_script = tempfile.mkstemp(suffix=".py", prefix="_onnxsim_oom_child_")
     with os.fdopen(fd, "w") as f:
         f.write(_CHILD_SRC)
@@ -238,7 +245,8 @@ def measure(model_path, check_n):
     try:
         proc = subprocess.run(
             [sys.executable, child_script, model_path, str(check_n)],
-            capture_output=True, text=True,
+            capture_output=True,
+            text=True,
         )
     finally:
         os.remove(child_script)
@@ -263,15 +271,18 @@ def run_measure_subprocess(model_path, check_n):
     in `measure` above for why `matrix` must not call `measure` in-process)."""
     proc = subprocess.run(
         [sys.executable, __file__, "measure", model_path, "--check-n", str(check_n)],
-        capture_output=True, text=True,
+        capture_output=True,
+        text=True,
     )
     print(proc.stdout, end="")
     if proc.stderr:
         print(proc.stderr, file=sys.stderr, end="")
     for line in proc.stdout.splitlines():
         if line.startswith("RESULT "):
-            return json.loads(line[len("RESULT "):])
-    raise RuntimeError(f"measure subprocess produced no RESULT line (exit {proc.returncode})")
+            return json.loads(line[len("RESULT ") :])
+    raise RuntimeError(
+        f"measure subprocess produced no RESULT line (exit {proc.returncode})"
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -297,12 +308,23 @@ def matrix(work_dir, sizes_gb, keep):
             if not keep:
                 shutil.rmtree(d, ignore_errors=True)
 
-    print("\n%-8s %-7s %-8s %-9s %-6s %-8s %s" % (
-        "layout", "check_n", "size_GB", "peak_GiB", "ratio", "exit", "time_s"))
+    print(
+        "\n%-8s %-7s %-8s %-9s %-6s %-8s %s"
+        % ("layout", "check_n", "size_GB", "peak_GiB", "ratio", "exit", "time_s")
+    )
     for r in rows:
-        print("%-8s %-7d %-8.2f %-9.2f %-6.2f %-8d %.1f" % (
-            r["layout"], r["check_n"], r["total_gb"],
-            r["peak_rss_child_mib"] / 1024, r["ratio"], r["exit_code"], r["time_s"]))
+        print(
+            "%-8s %-7d %-8.2f %-9.2f %-6.2f %-8d %.1f"
+            % (
+                r["layout"],
+                r["check_n"],
+                r["total_gb"],
+                r["peak_rss_child_mib"] / 1024,
+                r["ratio"],
+                r["exit_code"],
+                r["time_s"],
+            )
+        )
     return rows
 
 
@@ -326,12 +348,21 @@ def main():
     x = sub.add_parser("matrix")
     x.add_argument("work_dir")
     x.add_argument("--sizes", default="5,8", help="comma-separated model sizes in GB")
-    x.add_argument("--keep", action="store_true", help="keep generated models afterwards")
+    x.add_argument(
+        "--keep", action="store_true", help="keep generated models afterwards"
+    )
 
     args = ap.parse_args()
     if args.cmd == "gen":
-        gen(args.out_dir, args.layers, args.hidden, args.ffn, args.seq_len,
-            args.layout, args.seed)
+        gen(
+            args.out_dir,
+            args.layers,
+            args.hidden,
+            args.ffn,
+            args.seq_len,
+            args.layout,
+            args.seed,
+        )
     elif args.cmd == "measure":
         measure(args.model, args.check_n)
     elif args.cmd == "matrix":
