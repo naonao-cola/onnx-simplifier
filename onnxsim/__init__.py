@@ -51,6 +51,7 @@ from onnxsim.onnx_simplifier import (
     quantize_weight_only_int8_block,
     quantize_weight_only_int16,
     quantize_weight_only_matmul_nbits,
+    read_gguf_metadata,
     simplify,
 )
 from onnxsim.precision_estimator import (
@@ -115,5 +116,6 @@ __all__ = [
     "export_gguf",
     "import_gguf",
     "import_gguf_weights",
+    "read_gguf_metadata",
     "__version__",
 ]

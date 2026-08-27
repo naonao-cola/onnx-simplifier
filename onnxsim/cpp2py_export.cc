@@ -1315,4 +1315,58 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
         return {py::bytes(out.data(), out.size()), std::move(skipped)};
       },
       "model_bytes"_a, "gguf_path"_a);
+
+  // Reads a GGUF file's architecture hyperparameters (general.architecture,
+  // <arch>.block_count, <arch>.attention.head_count, <arch>.rope.freq_base,
+  // ...) and per-tensor name/shape/ggml_type list, WITHOUT reading any
+  // tensor byte data -- see tensor_pool.h's GGUFMetadata/ReadGGUFMetadata
+  // doc comments. This is the piece TensorPool::LoadGGUF/import_gguf_weights
+  // above never surfaced: they parse the same header section but only ever
+  // look at general.alignment before moving on to loading tensor *values*.
+  // Returns {"kv": {key: int|float|str|bool, ...},
+  //          "tensors": [{"name": str, "shape": [int, ...],
+  //                       "ggml_type": int}, ...]}. ARRAY-typed metadata
+  // values (e.g. tokenizer.ggml.tokens) are omitted from "kv" entirely --
+  // see GGUFMetadata's doc comment for why.
+  m.def(
+      "read_gguf_metadata",
+      [](const std::string& path) -> py::dict {
+        onnxsim::tensor_pool::GGUFMetadata meta =
+            onnxsim::tensor_pool::ReadGGUFMetadata(path);
+
+        py::dict kv;
+        for (const auto& [key, value] : meta.kv) {
+          switch (value.kind) {
+            case onnxsim::tensor_pool::GGUFMetadataValue::Kind::kInt:
+              kv[key.c_str()] = value.int_value;
+              break;
+            case onnxsim::tensor_pool::GGUFMetadataValue::Kind::kFloat:
+              kv[key.c_str()] = value.float_value;
+              break;
+            case onnxsim::tensor_pool::GGUFMetadataValue::Kind::kString:
+              kv[key.c_str()] = value.string_value;
+              break;
+            case onnxsim::tensor_pool::GGUFMetadataValue::Kind::kBool:
+              kv[key.c_str()] = value.bool_value;
+              break;
+          }
+        }
+
+        py::list tensors;
+        for (const auto& t : meta.tensors) {
+          py::dict entry;
+          entry["name"] = t.name;
+          py::list shape;
+          for (int64_t d : t.shape) shape.append(d);
+          entry["shape"] = shape;
+          entry["ggml_type"] = t.ggml_type;
+          tensors.append(entry);
+        }
+
+        py::dict out;
+        out["kv"] = kv;
+        out["tensors"] = tensors;
+        return out;
+      },
+      "path"_a);
 }

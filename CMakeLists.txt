@@ -567,6 +567,17 @@ if (ONNXSIM_TESTS)
   target_compile_definitions(tensor_pool_gguf_test PRIVATE ${ONNXSIM_BLAKE3_COMPILE_DEFS})
   add_test(NAME tensor_pool_gguf_test COMMAND tensor_pool_gguf_test)
 
+  # ReadGGUFMetadata (tensor_pool_gguf.cpp) -- same standalone-buildable
+  # dependency footprint as tensor_pool_gguf_test above.
+  add_executable(read_gguf_metadata_test onnxsim/read_gguf_metadata_test.cpp
+                                         onnxsim/tensor_pool.cpp
+                                         onnxsim/tensor_pool_hash.cpp
+                                         onnxsim/tensor_pool_gguf.cpp
+                                         ${ONNXSIM_BLAKE3_SOURCES})
+  target_include_directories(read_gguf_metadata_test PRIVATE onnxsim third_party)
+  target_compile_definitions(read_gguf_metadata_test PRIVATE ${ONNXSIM_BLAKE3_COMPILE_DEFS})
+  add_test(NAME read_gguf_metadata_test COMMAND read_gguf_metadata_test)
+
   # tensor_pool_gguf_bridge.h needs onnx, same reason as
   # tensor_pool_bridge_test above.
   add_executable(tensor_pool_gguf_bridge_test
