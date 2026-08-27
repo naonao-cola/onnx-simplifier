@@ -1065,6 +1065,7 @@ def simplify(
     profile: Optional[str] = None,
     ort_profile: Optional[str] = None,
     merge_ort_profile: bool = False,
+    output_path: Optional[str] = None,
 ) -> Tuple[onnx.ModelProto, bool]:
     """
     :param model: onnx ModelProto object or file path
@@ -1180,6 +1181,28 @@ def simplify(
             left behind. Takes precedence over ``ort_profile`` (which requests
             standalone files). Works for every executor, including the Python
             ``PyModelExecutor`` used by ``simplify()``.
+    :param output_path: Save the simplified model to this path directly, instead of (or as
+            well as) relying on the caller to save the returned ``ModelProto`` themselves.
+            Requires ``model`` to be a file path (there is no file to redirect otherwise).
+            This matters for large models: when ``model`` is a path and ``check_n == 0``
+            (the default) -- the common case of just simplifying a file and saving the
+            result, e.g. the CLI's ``onnxsim in.onnx out.onnx`` -- ``simplify()`` already
+            hands the whole job to the C++ core via a path-to-path call
+            (``C.simplify_path``), never materializing the *input* in Python. Passing
+            ``output_path`` lets it skip the matching waste on the *output* side too: without
+            it, the result is always read back into a full in-memory ``ModelProto`` (to
+            satisfy this function's return contract) even when the caller's very next step is
+            to save it again, which for an N-byte model costs roughly another N bytes of peak
+            RSS for no benefit (see ``bench/RESULTS_synthetic_decoder_oom.md`` for
+            measurements -- this is the double materialization documented there). With
+            ``output_path`` set, that path is used as the real save location instead of a
+            throwaway temporary file, and the returned ``model_opt`` is loaded structure-only
+            (``load_external_data=False``): correct for inspecting the graph (shapes, node
+            counts, ...), but call ``onnx.load_external_data_for_model(model_opt)`` yourself
+            if you need actual tensor values from it afterward. Outside that fast-path case
+            (``check_n > 0``, or another reason the fast path doesn't apply) the model is
+            still saved to ``output_path`` before returning, just without the memory saving,
+            since the full model has to be materialized anyway to run the correctness check.
     :return: A tuple (simplified model, success(True) or failed(False))
     """
     # Validate the requested execution providers up front. onnxsim's constant
@@ -1223,6 +1246,11 @@ def simplify(
         raise ValueError(
             "custom_rewriter and function_rewrite_rules are mutually exclusive; "
             "pass only one."
+        )
+    if output_path is not None and not isinstance(model, str):
+        raise ValueError(
+            "output_path requires `model` to be a file path (there is no file to "
+            "redirect the saved result from otherwise)"
         )
     if function_rewrite_rules:
         rewriter = C.make_function_proto_rewriter(
@@ -1294,6 +1322,45 @@ def simplify(
                 os.environ["ONNXSIM_PROFILE"] = _fast_profile_path
             try:
                 if isinstance(model, str):
+                    # ``output_path`` given: write the result there directly instead of a
+                    # throwaway temporary file, and skip loading it back with data inline.
+                    # Reloading in full here would undo the very optimization this branch
+                    # exists for -- see the double materialization documented in
+                    # ``output_path``'s docstring above and in
+                    # ``bench/RESULTS_synthetic_decoder_oom.md`` (this was the root cause
+                    # found for bench/TODO_large_decoder_submodule_oom.md). A structure-only
+                    # load still satisfies this function's ``ModelProto``-returning contract
+                    # for callers who only need the graph shape, not the tensor values.
+                    if output_path is not None:
+                        C.simplify_path(
+                            _get_model_executor(providers),
+                            model,
+                            output_path,
+                            skipped_optimizers,
+                            not skip_constant_folding,
+                            not skip_shape_inference,
+                            _fast_threshold_bytes,
+                            target_opset_version,
+                            rewriter,
+                            initializers_as_constants,
+                            inline_functions,
+                            mutable_initializer,
+                            overwrite_input_shapes,
+                            unused_output,
+                        )
+                        check_ok = model_checking.compare(
+                            output_path,
+                            None,
+                            0,
+                            test_input_shapes,
+                            input_data,
+                            custom_lib,
+                            rtol=check_rtol,
+                            atol=check_atol,
+                            input_fill=input_fill,
+                        )
+                        model_opt = onnx.load(output_path, load_external_data=False)
+                        return model_opt, check_ok
                     with tempfile.TemporaryDirectory() as tmpdirname:
                         fast_out_path = os.path.join(tmpdirname, "opt.onnx")
                         C.simplify_path(
@@ -1582,6 +1649,25 @@ def simplify(
                 pass
             finally:
                 shutil.rmtree(_ort_merge_dir, ignore_errors=True)
+    if output_path is not None:
+        # Reached with ``output_path`` set only when the fast path above either
+        # doesn't apply (e.g. ``check_n > 0``, which needs ``model_opt``
+        # materialized anyway to run the correctness check) or fell back from an
+        # internal error. Either way ``model_opt`` is already a full ModelProto
+        # here, so there is no reload to avoid -- just honor the save request.
+        try:
+            onnx.save(model_opt, output_path)
+        except (ValueError, EncodeError):
+            external_data_path = os.path.basename(output_path) + ".data"
+            if os.path.exists(external_data_path):
+                os.remove(external_data_path)
+            onnx.save(
+                model_opt,
+                output_path,
+                save_as_external_data=True,
+                all_tensors_to_one_file=True,
+                location=external_data_path,
+            )
     return model_opt, check_ok
 
 

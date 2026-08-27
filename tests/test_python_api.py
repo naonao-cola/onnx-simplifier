@@ -1082,6 +1082,163 @@ def test_simplify_path_with_external_data():
     np.testing.assert_allclose(folded, a + b, rtol=1e-5, atol=1e-6)
 
 
+def _make_add_model():
+    a = np.random.rand(64, 64).astype(np.float32)
+    b = np.random.rand(64, 64).astype(np.float32)
+    initializers = [
+        onnx.numpy_helper.from_array(a, "a"),
+        onnx.numpy_helper.from_array(b, "b"),
+    ]
+    node = onnx.helper.make_node("Add", ["a", "b"], ["y"])
+    out = onnx.helper.make_tensor_value_info("y", onnx.TensorProto.FLOAT, (64, 64))
+    graph_def = onnx.helper.make_graph([node], "g", [], [out], initializer=initializers)
+    model = onnx.helper.make_model(
+        graph_def, opset_imports=[onnx.helper.make_opsetid("", 14)], ir_version=10
+    )
+    return model, a, b
+
+
+def test_output_path_fast_path_saves_directly_and_skips_reload():
+    # Regression test for the double materialization documented in
+    # bench/RESULTS_synthetic_decoder_oom.md / bench/TODO_large_decoder_submodule_oom.md:
+    # on the check_n=0 fast path, simplify() used to always call
+    # onnx.load(fast_out_path) (full data inline) purely to satisfy its return
+    # contract, even when the caller's very next step is to save the result again
+    # (as onnxsim's own CLI does). ``output_path`` lets the C++ core write the
+    # final result directly, so the returned model can stay structure-only.
+    #
+    # The C++ core only actually externalizes a saved model's data past the 2GB
+    # protobuf limit (onnxsim.cpp's SimplifyPath: ``needs_external_data =
+    # model.ByteSizeLong() >= kProtobufSizeLimit``), so a small test model's
+    # output is always inline regardless of output_path -- there is no
+    # multi-GB fixture to assert "raw_data is empty" against here. What *is*
+    # testable at this scale is the mechanism itself: with output_path set,
+    # simplify() must read the result back with ``load_external_data=False``
+    # instead of the eager default, which is exactly the reload this test
+    # guards against reintroducing.
+    from onnxsim import onnx_simplifier
+
+    model, a, b = _make_add_model()
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        model_path = os.path.join(tmpdir, "model.onnx")
+        output_path = os.path.join(tmpdir, "out.onnx")
+        onnx.save(model, model_path)
+
+        real_load = onnx.load
+        load_calls = []
+
+        def spying_load(path, *args, **kwargs):
+            load_calls.append((path, args, kwargs))
+            return real_load(path, *args, **kwargs)
+
+        try:
+            onnx_simplifier.onnx.load = spying_load
+            sim_model, check_ok = onnxsim.simplify(
+                model_path, check_n=0, output_path=output_path
+            )
+        finally:
+            onnx_simplifier.onnx.load = real_load
+
+        assert check_ok
+        # The result was saved directly to output_path by simplify() itself.
+        assert os.path.exists(output_path)
+        saved = onnx.load(output_path)
+        assert len(saved.graph.node) == 0
+        assert len(saved.graph.initializer) == 1
+        folded = onnx.numpy_helper.to_array(saved.graph.initializer[0])
+        np.testing.assert_allclose(folded, a + b, rtol=1e-5, atol=1e-6)
+
+    # Exactly one load, of output_path itself (never a throwaway temp file),
+    # with load_external_data explicitly disabled -- the actual fix.
+    assert len(load_calls) == 1
+    (loaded_path, load_args, load_kwargs) = load_calls[0]
+    assert loaded_path == output_path
+    assert load_kwargs.get("load_external_data") is False
+
+
+def test_output_path_requires_str_model():
+    model, _, _ = _make_add_model()
+    with tempfile.TemporaryDirectory() as tmpdir:
+        output_path = os.path.join(tmpdir, "out.onnx")
+        with pytest.raises(ValueError, match="output_path"):
+            onnxsim.simplify(model, output_path=output_path)
+
+
+def test_output_path_off_fast_path_still_saves_full_model():
+    # check_n > 0 takes the slow path (it needs the full model in memory
+    # regardless, to run the correctness check), so output_path can't skip the
+    # reload there -- but the file must still end up saved, and the returned
+    # model must carry real data (unlike the fast-path case above), since a
+    # caller who asked for check_n > 0 is presumably going to use it.
+    model, a, b = _make_add_model()
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        model_path = os.path.join(tmpdir, "model.onnx")
+        output_path = os.path.join(tmpdir, "out.onnx")
+        onnx.save(model, model_path)
+
+        sim_model, check_ok = onnxsim.simplify(
+            model_path, check_n=1, output_path=output_path
+        )
+
+        assert check_ok
+        assert os.path.exists(output_path)
+        saved = onnx.load(output_path)
+        folded = onnx.numpy_helper.to_array(saved.graph.initializer[0])
+        np.testing.assert_allclose(folded, a + b, rtol=1e-5, atol=1e-6)
+
+    # Unlike the fast-path case, the returned model actually has data: check_n > 0
+    # already required materializing it, so there is nothing left to save by
+    # deferring the load.
+    assert len(sim_model.graph.initializer[0].raw_data) > 0
+    folded_returned = onnx.numpy_helper.to_array(sim_model.graph.initializer[0])
+    np.testing.assert_allclose(folded_returned, a + b, rtol=1e-5, atol=1e-6)
+
+
+def test_output_path_falls_back_to_external_data_past_2gb():
+    # Same >2GB save fallback the CLI relies on (see
+    # test_cli_large_model_save_fallback_mutates_in_place), exercised here for
+    # output_path's own fallback save at the end of simplify() -- reached when
+    # output_path is set but the fast path doesn't apply (check_n > 0 here).
+    from google.protobuf.message import EncodeError
+
+    from onnxsim import onnx_simplifier
+
+    model, a, b = _make_add_model()
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        model_path = os.path.join(tmpdir, "model.onnx")
+        output_path = os.path.join(tmpdir, "out.onnx")
+        onnx.save(model, model_path)
+
+        real_save = onnx.save
+        call_count = 0
+
+        def fake_save(proto, path, *args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                raise EncodeError("Message larger than 2GiB")
+            return real_save(proto, path, *args, **kwargs)
+
+        try:
+            onnx_simplifier.onnx.save = fake_save
+            sim_model, check_ok = onnxsim.simplify(
+                model_path, check_n=1, output_path=output_path
+            )
+        finally:
+            onnx_simplifier.onnx.save = real_save
+
+        assert check_ok
+        assert call_count == 2  # the initial (faked-failing) attempt, then the fallback
+        assert os.path.exists(output_path)
+        assert os.path.exists(output_path + ".data")
+        saved = onnx.load(output_path)
+        folded = onnx.numpy_helper.to_array(saved.graph.initializer[0])
+        np.testing.assert_allclose(folded, a + b, rtol=1e-5, atol=1e-6)
+
+
 def test_model_info_size_counts_external_data_without_loading():
     # ModelInfo must report a model's size from external-data metadata, so a
     # model whose weights live on disk can be measured without loading them --
