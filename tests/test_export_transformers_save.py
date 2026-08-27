@@ -48,6 +48,12 @@ def test_save_default_keeps_weights_inline(tmp_path):
 def test_save_force_external_data_writes_companion_file(tmp_path):
     model = _tiny_model()
     path = str(tmp_path / "model.onnx")
+    # Snapshot the expected value before _save(): onnx.save's own
+    # save_as_external_data mutates the passed-in model's initializers in
+    # place (clears raw_data, points them at the external file), so
+    # model.graph.initializer[0] is no longer a plain in-memory tensor once
+    # _save() returns.
+    expected_w = onnx.numpy_helper.to_array(model.graph.initializer[0]).copy()
 
     _save(model, path, force_external_data=True)
 
@@ -56,9 +62,7 @@ def test_save_force_external_data_writes_companion_file(tmp_path):
     w = onnx.numpy_helper.to_array(
         next(i for i in reloaded.graph.initializer if i.name == "W")
     )
-    np.testing.assert_array_equal(
-        w, onnx.numpy_helper.to_array(model.graph.initializer[0])
-    )
+    np.testing.assert_array_equal(w, expected_w)
 
 
 def test_save_force_external_data_overwrites_stale_companion_file(tmp_path):
