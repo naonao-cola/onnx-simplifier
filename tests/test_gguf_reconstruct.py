@@ -79,7 +79,14 @@ def _write_gguf(path, kv_chunks, weights):
     offset = 0
     for name, arr in weights.items():
         ne = list(reversed(arr.shape))
-        raw = arr.astype(np.float32).tobytes()
+        # GGUF tensor data is little-endian regardless of host byte order
+        # (same convention as ONNX's raw_data -- see
+        # onnxsim/passes/endian_read.h's doc comment and
+        # test_onnx_safetensors_input.py's mirror of this note).
+        # `arr.astype(np.float32).tobytes()` would serialize in numpy's
+        # native/host order instead, which is only correct by coincidence on
+        # little-endian hosts.
+        raw = arr.astype("<f4").tobytes()
         infos += _string_bytes(name)
         infos += struct.pack("<I", len(ne))
         for d in ne:
