@@ -296,6 +296,64 @@ def test_print_simplifying_info_factor_recursion_error_falls_back(monkeypatch):
     assert human_readable_density(9472 * batch) == f"{9472 * batch} FLOP/Byte"
 
 
+def test_factor_skipped_above_max_free_symbols(monkeypatch):
+    # A model whose shape inference doesn't deduplicate dynamic dims back to a
+    # handful of named input dims (reproduced exporting a real multi-submodule
+    # TTS model to ONNX) can produce formulas with hundreds of distinct free
+    # symbols. sympy.factor() over that many variables doesn't raise -- it just
+    # never returns -- so it must be skipped by symbol count, not just guarded
+    # against RecursionError. Prove it's skipped (not merely fast) by making
+    # factor() itself blow up if it's ever called.
+    sympy = pytest.importorskip("sympy")
+
+    def _must_not_be_called(_expr):
+        raise AssertionError("sympy.factor() must be skipped above the threshold")
+
+    monkeypatch.setattr(sympy, "factor", _must_not_be_called)
+
+    symbols = sympy.symbols(
+        f"s0:{model_info._MAX_FACTOR_FREE_SYMBOLS + 1}", positive=True, integer=True
+    )
+    expr = sum(symbols)
+    assert model_info._factor_or_str(expr) == str(expr)
+
+
+def test_factor_still_applied_within_threshold():
+    # Below the threshold, factoring must still run (it is a real formatting
+    # nicety for the common, well-named-dims case) -- confirm it actually
+    # changes the printed form rather than always falling back.
+    sympy = pytest.importorskip("sympy")
+    a, b, c = sympy.symbols("a b c", positive=True, integer=True)
+    expr = 2 * a * b + 4 * a * c
+    factored = model_info._factor_or_str(expr)
+    assert factored != str(expr)
+    # Re-parse against the *same* symbol objects: sympify() would otherwise
+    # mint fresh, assumption-less a/b/c that don't cancel against the
+    # positive-integer ones above.
+    reparsed = sympy.sympify(factored, locals={"a": a, "b": b, "c": c})
+    assert sympy.simplify(reparsed - expr) == 0
+
+
+def test_representative_number_does_not_use_subs(monkeypatch):
+    # _representative_number collapses every free symbol to 1 via xreplace, a
+    # direct syntactic substitution. subs() additionally runs structural-
+    # equality/simplification passes meant for pattern-based substitution, and
+    # over hundreds of undeduplicated dynamic-dim symbols (see above) that took
+    # minutes instead of milliseconds. Prove xreplace (not subs) is used by
+    # making subs() itself blow up if it's ever called.
+    sympy = pytest.importorskip("sympy")
+
+    def _must_not_be_called(self, *args, **kwargs):
+        raise AssertionError("Expr.subs() must not be used here; use xreplace")
+
+    monkeypatch.setattr(sympy.Expr, "subs", _must_not_be_called)
+
+    n = 300
+    symbols = sympy.symbols(f"s0:{n}", positive=True, integer=True)
+    expr = sum(symbols)
+    assert model_info._representative_number(expr) == n
+
+
 def test_dynamic_dim_without_sympy_assumes_one(monkeypatch):
     # With sympy unavailable, dynamic dims are assumed 1 (per-sample MACs).
     monkeypatch.setattr(model_info, "sympy", None)
