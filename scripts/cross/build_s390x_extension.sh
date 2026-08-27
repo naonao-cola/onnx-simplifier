@@ -202,13 +202,14 @@ cmake --build "${BUILD_DIR}" --target onnx_cpp2py_export -j "${JOBS}"
 # the one that covers the byte-order conversion directly; the rest come along
 # because they are cheap and exercise the same cross-built toolchain.
 # tensor_pool_dtype_test/tensor_pool_test (safetensors) and
-# gguf_dtype_test/tensor_pool_gguf_test (GGUF) are likewise dependency-free
-# (each format's own byte-order handling; see tensor_pool.h's "Byte order"
-# note and tensor_pool_gguf.cpp's mirror of it) and belong in this list for
-# the same reason. ggml_kquant_test (the GGML K-quant dequantization
-# ggml_kquant.h implements -- decoded values are real numeric output, not
-# just copied bytes, so this is exactly the kind of logic a big-endian run
-# needs to check) is dependency-free too, for the same reason.
+# gguf_dtype_test/tensor_pool_gguf_test/read_gguf_metadata_test (GGUF) are
+# likewise dependency-free (each format's own byte-order handling; see
+# tensor_pool.h's "Byte order" note and tensor_pool_gguf.cpp's mirror of it)
+# and belong in this list for the same reason. ggml_kquant_test (the GGML
+# K-quant dequantization ggml_kquant.h implements -- decoded values are real
+# numeric output, not just copied bytes, so this is exactly the kind of logic
+# a big-endian run needs to check) is dependency-free too, for the same
+# reason.
 # tensor_pool_hash_test (TensorPool::ContentHash's BLAKE3 / SHA-256
 # backends) is dependency-free too and belongs here for the same reason --
 # CMake still registers each of these as a ctest target even if left off
@@ -218,7 +219,8 @@ cmake --build "${BUILD_DIR}" --target onnx_cpp2py_export -j "${JOBS}"
 cmake --build "${BUILD_DIR}" --target sym_expr_test model_metrics_test \
   sym_value_eval_test sym_shape_infer_test dlpack_dtype_test \
   tensor_pool_dtype_test tensor_pool_test tensor_pool_hash_test \
-  gguf_dtype_test ggml_kquant_test tensor_pool_gguf_test -j "${JOBS}"
+  gguf_dtype_test ggml_kquant_test tensor_pool_gguf_test \
+  read_gguf_metadata_test -j "${JOBS}"
 # tensor_pool_bridge_test, tensor_pool_gguf_bridge_test,
 # tensor_pool_archive_test, and precision_estimator_test are NOT
 # dependency-free (they exercise onnx::ModelProto / the TensorProto <->
