@@ -153,4 +153,10 @@ def _save(model: onnx.ModelProto, path: str, force_external_data: bool) -> None:
         save_as_external_data=True,
         all_tensors_to_one_file=True,
         location=external_data_path,
+        # onnx's own default (1024) leaves any tensor smaller than that
+        # inline regardless of save_as_external_data -- fine for the >2GB
+        # fallback above (the handful of huge tensors that tripped the limit
+        # are what matters), but force_external_data promises *every*
+        # tensor moves out, so drop the threshold to 0 only in that case.
+        size_threshold=0 if force_external_data else 1024,
     )
