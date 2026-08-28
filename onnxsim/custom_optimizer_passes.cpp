@@ -14,6 +14,7 @@
 #include "passes/dynamic_quantize_matmul.h"
 #include "passes/dynamic_quantize_matmul_integer_to_float.h"
 #include "passes/dynamic_quantize_ternary_matmul.h"
+#include "passes/eliminate_loop_with_const_trip_count.h"
 #include "passes/eliminate_nop_dropout.h"
 #include "passes/eliminate_reshape_around_elementwise.h"
 #include "passes/fuse_add_bias_into_conv.h"
@@ -96,6 +97,7 @@ void RegisterCustomOptimizerPasses() {
     RegisterOrReplace<p::DynamicQuantizeMatMul>(registry);
     RegisterOrReplace<p::DynamicQuantizeMatMulIntegerToFloat>(registry);
     RegisterOrReplace<p::DynamicQuantizeTernaryMatMul>(registry);
+    RegisterOrReplace<p::EliminateLoopWithConstTripCount>(registry);
     RegisterOrReplace<p::EliminateReshapeAroundElementwise>(registry);
     RegisterOrReplace<p::FuseAttention>(registry);
     RegisterOrReplace<p::FuseConsecutiveMul>(registry);
