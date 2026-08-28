@@ -43,6 +43,13 @@ def main():
     )
     p.add_argument("--seed", type=int, default=0)
     p.add_argument(
+        "--adapter-inputs",
+        action="store_true",
+        help="also declare each lora_A/lora_B as a graph input (with the initializer as its default "
+        "value), so it can later be overridden at Run() time via ONNX Runtime's native LoraAdapter "
+        "instead of only by baking a merged copy of the model per adapter -- see export_onnx_adapter.py.",
+    )
+    p.add_argument(
         "--params-out",
         required=True,
         help="where to write the JSON adapter manifest (rank/alpha/param names), needed by "
@@ -54,7 +61,12 @@ def main():
 
     model = onnx.load(args.model)
     added = lora_surgery.inject(
-        model, args.target_contains, args.rank, alpha, seed=args.seed
+        model,
+        args.target_contains,
+        args.rank,
+        alpha,
+        seed=args.seed,
+        adapter_inputs=args.adapter_inputs,
     )
     if not added:
         sys.exit("error: no eligible MatMul/Gemm/1x1-Conv targets matched")

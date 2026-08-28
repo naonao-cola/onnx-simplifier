@@ -29,6 +29,13 @@ def main():
         required=True,
         help="where to write the ready-to-run inference model",
     )
+    p.add_argument(
+        "--adapter-inputs",
+        action="store_true",
+        help="also declare each lora_A/lora_B as a graph input defaulting to the applied trained "
+        "value, so a *different* trained adapter can later be swapped in at Run() time via ONNX "
+        "Runtime's native LoraAdapter, instead of re-running this script -- see export_onnx_adapter.py.",
+    )
     args = p.parse_args()
 
     with open(args.params_file) as f:
@@ -52,6 +59,7 @@ def main():
         manifest["alpha"],
         lora_values=lora_values,
         exact_names=set(lora_values.keys()),
+        adapter_inputs=args.adapter_inputs,
     )
 
     onnx.checker.check_model(model)

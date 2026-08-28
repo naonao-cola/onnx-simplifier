@@ -501,15 +501,24 @@ def test_wanda_pruning_conv_falls_back_to_magnitude_for_dilated_conv():
     )
 
 
-def test_sparsegpt_pruning_leaves_conv_layers_completely_untouched():
-    # apply_sparsegpt_pruning deliberately does not match Conv (see its own
-    # docstring for why): a correct-but-unverified from-scratch im2col
-    # Hessian was judged worse to ship than none at all.
-    Cin, Cout, spatial = 4, 8, 10
+def test_sparsegpt_pruning_conv_skips_grouped_conv():
+    # A depthwise Conv (group == in_channels == out_channels) is left
+    # completely untouched -- apply_sparsegpt_pruning reuses _candidates()'s
+    # own group=1 matching, so this is the same restriction
+    # test_magnitude_pruning_skips_grouped_conv already exercises.
+    C = 8
     rng = np.random.default_rng(76)
-    w = rng.standard_normal((Cout, Cin, 3, 3)).astype(np.float32)
-    model = _single_conv_model(w, spatial=spatial)
-    x_cal = rng.standard_normal((2, Cin, spatial, spatial)).astype(np.float32)
+    w = rng.standard_normal((C, 1, 3, 3)).astype(np.float32)
+    model = _model(
+        f"""
+        g (float[N,{C},10,10] X) => (float[N,{C},8,8] Y)
+        {{
+          Y = Conv<kernel_shape=[3,3], group={C}>(X, W1)
+        }}
+        """,
+        initializer=[_f32(w, "W1")],
+    )
+    x_cal = rng.standard_normal((4, C, 10, 10)).astype(np.float32)
 
     pruned = onnxsim.apply_sparsegpt_pruning(
         model, calibration_data=[{"X": x_cal}], sparsity=0.5
@@ -682,6 +691,299 @@ def test_sparsegpt_pruning_requires_n_and_m_together():
         onnxsim.apply_sparsegpt_pruning(model, n=2)
     with pytest.raises(ValueError):
         onnxsim.apply_sparsegpt_pruning(model, m=4)
+
+
+# --- apply_sparsegpt_pruning: Conv2D ------------------------------------
+
+
+def _naive_conv_patch_hessian(x, attrs):
+    # Slow, obviously-correct nested-loop reference for the full [K, K]
+    # im2col cross-covariance Hessian SparseGPT's Conv support needs --
+    # built a completely different way from
+    # onnxsim.pruning._conv_im2col_patches's own sliding_window_view-based
+    # implementation (an explicit outer-product accumulation per output
+    # position instead of any vectorized unfolding), the same bar
+    # _naive_conv_patch_sq_sum already set for Wanda's diagonal-only
+    # per-offset norm above.
+    n, cin, h, w = x.shape
+    xp = np.pad(
+        x,
+        (
+            (0, 0),
+            (0, 0),
+            (attrs.pad_top, attrs.pad_bottom),
+            (attrs.pad_left, attrs.pad_right),
+        ),
+    )
+    hp, wp = xp.shape[2], xp.shape[3]
+    h_out = (hp - attrs.kh) // attrs.stride_h + 1
+    w_out = (wp - attrs.kw) // attrs.stride_w + 1
+    k = cin * attrs.kh * attrs.kw
+    hessian = np.zeros((k, k), dtype=np.float64)
+    count = 0
+    for ni in range(n):
+        for oh in range(h_out):
+            for ow in range(w_out):
+                patch = np.zeros(k, dtype=np.float64)
+                idx = 0
+                for c in range(cin):
+                    for i in range(attrs.kh):
+                        for j in range(attrs.kw):
+                            patch[idx] = xp[
+                                ni, c, oh * attrs.stride_h + i, ow * attrs.stride_w + j
+                            ]
+                            idx += 1
+                hessian += np.outer(patch, patch)
+                count += 1
+    return hessian, count
+
+
+def test_sparsegpt_conv_hessian_matches_naive_nested_loop_oracle():
+    from onnxsim.pruning import _conv_im2col_patches, _ConvSpatialAttrs
+
+    rng = np.random.default_rng(90)
+    x = rng.standard_normal((2, 3, 4, 4))
+    cases = [
+        _ConvSpatialAttrs(
+            kh=3,
+            kw=3,
+            pad_top=1,
+            pad_left=1,
+            pad_bottom=1,
+            pad_right=1,
+            stride_h=2,
+            stride_w=2,
+        ),
+        _ConvSpatialAttrs(
+            kh=2,
+            kw=2,
+            pad_top=0,
+            pad_left=0,
+            pad_bottom=0,
+            pad_right=0,
+            stride_h=1,
+            stride_w=1,
+        ),
+        _ConvSpatialAttrs(
+            kh=3,
+            kw=3,
+            pad_top=0,
+            pad_left=2,
+            pad_bottom=1,
+            pad_right=0,
+            stride_h=1,
+            stride_w=2,
+        ),
+    ]
+    for attrs in cases:
+        patches = _conv_im2col_patches(x, attrs)
+        h_vec = patches.T @ patches
+        h_naive, count_naive = _naive_conv_patch_hessian(x, attrs)
+        assert patches.shape[0] == count_naive
+        np.testing.assert_allclose(h_vec, h_naive)
+
+
+def test_sparsegpt_pruning_conv_matches_reference_transliteration_exactly():
+    # End-to-end correctness: an independent nested-loop patch unfold (not
+    # onnxsim.pruning._conv_im2col_patches) feeds the *reference*
+    # SparseGPT transliteration (_reference_sparsegpt, already validated
+    # against the MatMul/Gemm path above) to build an expected Conv
+    # weight, entirely independent of onnxsim's own Conv Hessian/pruning
+    # code -- two independently-built pieces must agree with onnxsim's
+    # actual output before this is trusted.
+    Cin, Cout, kh, kw, spatial = 3, 6, 3, 3, 8
+    rng = np.random.default_rng(91)
+    w = rng.standard_normal((Cout, Cin, kh, kw)).astype(np.float32) * 0.5
+    model = _single_conv_model(w, spatial=spatial)
+    rng_x = np.random.default_rng(92)
+    x = rng_x.standard_normal((3, Cin, spatial, spatial)).astype(np.float32)
+
+    pruned = onnxsim.apply_sparsegpt_pruning(
+        model, calibration_data=[{"X": x}], sparsity=0.5, proc_block_size=12
+    )
+    onnx.checker.check_model(pruned)
+
+    out_spatial = spatial - kh + 1
+    K = Cin * kh * kw
+    patches = np.zeros((x.shape[0] * out_spatial * out_spatial, K), dtype=np.float64)
+    idx = 0
+    for ni in range(x.shape[0]):
+        for oh in range(out_spatial):
+            for ow in range(out_spatial):
+                patch = x[ni, :, oh : oh + kh, ow : ow + kw].astype(np.float64)
+                patches[idx] = patch.reshape(-1)
+                idx += 1
+    h = patches.T @ patches
+
+    w_nk = w.astype(np.float64).reshape(Cout, K)
+    expected_nk = _reference_sparsegpt(
+        w_nk, h, sparsity=0.5, n=None, m=None, percdamp=0.01, blocksize=12
+    )
+    expected = expected_nk.reshape(Cout, Cin, kh, kw)
+    np.testing.assert_allclose(
+        _conv_weight(pruned).astype(np.float64), expected, rtol=1e-6, atol=1e-6
+    )
+
+
+def test_sparsegpt_pruning_conv_nm_pattern_matches_reference_transliteration():
+    Cin, Cout, kh, kw, spatial = 4, 8, 3, 3, 8
+    rng = np.random.default_rng(93)
+    w = rng.standard_normal((Cout, Cin, kh, kw)).astype(np.float32) * 0.5
+    model = _single_conv_model(w, spatial=spatial)
+    rng_x = np.random.default_rng(94)
+    x = rng_x.standard_normal((3, Cin, spatial, spatial)).astype(np.float32)
+
+    pruned = onnxsim.apply_sparsegpt_pruning(
+        model, calibration_data=[{"X": x}], n=2, m=4, proc_block_size=12
+    )
+    onnx.checker.check_model(pruned)
+
+    out_spatial = spatial - kh + 1
+    K = Cin * kh * kw
+    patches = np.zeros((x.shape[0] * out_spatial * out_spatial, K), dtype=np.float64)
+    idx = 0
+    for ni in range(x.shape[0]):
+        for oh in range(out_spatial):
+            for ow in range(out_spatial):
+                patch = x[ni, :, oh : oh + kh, ow : ow + kw].astype(np.float64)
+                patches[idx] = patch.reshape(-1)
+                idx += 1
+    h = patches.T @ patches
+
+    w_nk = w.astype(np.float64).reshape(Cout, K)
+    expected_nk = _reference_sparsegpt(
+        w_nk, h, sparsity=0.0, n=2, m=4, percdamp=0.01, blocksize=12
+    )
+    expected = expected_nk.reshape(Cout, Cin, kh, kw)
+    np.testing.assert_allclose(
+        _conv_weight(pruned).astype(np.float64), expected, rtol=1e-6, atol=1e-6
+    )
+
+    w_flat = _conv_weight(pruned).reshape(Cout, K)
+    for row in w_flat:
+        for start in range(0, len(row), 4):
+            group = row[start : start + 4]
+            if len(group) == 4:
+                assert np.count_nonzero(group) == 2
+
+
+def test_sparsegpt_pruning_conv_reaches_target_sparsity():
+    # Unlike magnitude/Wanda's exact per-row quantile, SparseGPT's
+    # block-shared threshold (this module's own docstring) picks the
+    # target-index order statistic and keeps every entry <= it, so a tied
+    # threshold value can round the actual count up slightly -- checked
+    # with a small tolerance instead of exact equality, the same
+    # "shared per-block, not per-row" caveat the MatMul/Gemm path already
+    # documents.
+    Cin, Cout, spatial = 4, 8, 10
+    rng = np.random.default_rng(95)
+    w = rng.standard_normal((Cout, Cin, 3, 3)).astype(np.float32) * 0.5
+    model = _single_conv_model(w, spatial=spatial)
+    x_cal = rng.standard_normal((16, Cin, spatial, spatial)).astype(np.float32)
+
+    pruned = onnxsim.apply_sparsegpt_pruning(
+        model, calibration_data=[{"X": x_cal}], sparsity=0.5
+    )
+    onnx.checker.check_model(pruned)
+    assert onnxsim.weight_sparsity(pruned) == pytest.approx(0.5, abs=0.02)
+
+
+def test_sparsegpt_pruning_conv_zero_sparsity_is_a_no_op():
+    Cin, Cout, spatial = 4, 8, 10
+    rng = np.random.default_rng(96)
+    w = rng.standard_normal((Cout, Cin, 3, 3)).astype(np.float32)
+    model = _single_conv_model(w, spatial=spatial)
+    x_cal = rng.standard_normal((8, Cin, spatial, spatial)).astype(np.float32)
+
+    pruned = onnxsim.apply_sparsegpt_pruning(
+        model, calibration_data=[{"X": x_cal}], sparsity=0.0
+    )
+    np.testing.assert_array_equal(_conv_weight(pruned), w)
+
+
+def test_sparsegpt_pruning_conv_no_calibration_batches_leaves_layer_untouched():
+    Cin, Cout, spatial = 4, 8, 10
+    rng = np.random.default_rng(97)
+    w = rng.standard_normal((Cout, Cin, 3, 3)).astype(np.float32)
+    model = _single_conv_model(w, spatial=spatial)
+
+    pruned = onnxsim.apply_sparsegpt_pruning(model, calibration_data=[], sparsity=0.5)
+    np.testing.assert_array_equal(_conv_weight(pruned), w)
+
+
+def test_sparsegpt_pruning_conv_declines_auto_pad():
+    # auto_pad SAME_UPPER's padding depends on the input's own spatial
+    # size -- _conv_spatial_attrs declines it, so (unlike Wanda, which
+    # falls back to plain magnitude) SparseGPT must leave the layer
+    # completely untouched: there is no data-free fallback here.
+    Cin, Cout, spatial = 3, 6, 10
+    rng = np.random.default_rng(98)
+    w = rng.standard_normal((Cout, Cin, 3, 3)).astype(np.float32)
+    model = _single_conv_model(
+        w, spatial=spatial, extra_attrs='auto_pad="SAME_UPPER"', out_spatial=spatial
+    )
+    x_cal = rng.standard_normal((4, Cin, spatial, spatial)).astype(np.float32)
+
+    pruned = onnxsim.apply_sparsegpt_pruning(
+        model, calibration_data=[{"X": x_cal}], sparsity=0.5
+    )
+    np.testing.assert_array_equal(_conv_weight(pruned), w)
+
+
+def test_sparsegpt_pruning_conv_declines_dilated_conv():
+    # A dilated receptive field's (kh, kw) offsets aren't evenly spaced in
+    # the padded input the way sliding_window_view assumes --
+    # _conv_spatial_attrs declines non-all-ones dilations, so this layer
+    # is left completely untouched too.
+    Cin, Cout, spatial = 3, 6, 10
+    rng = np.random.default_rng(99)
+    w = rng.standard_normal((Cout, Cin, 3, 3)).astype(np.float32)
+    out_spatial = spatial - 2 * (3 - 1)  # dilation=2, kernel=3, no padding
+    model = _single_conv_model(
+        w, spatial=spatial, extra_attrs="dilations=[2,2]", out_spatial=out_spatial
+    )
+    x_cal = rng.standard_normal((4, Cin, spatial, spatial)).astype(np.float32)
+
+    pruned = onnxsim.apply_sparsegpt_pruning(
+        model, calibration_data=[{"X": x_cal}], sparsity=0.5
+    )
+    np.testing.assert_array_equal(_conv_weight(pruned), w)
+
+
+def test_sparsegpt_pruning_conv_reconstructs_better_than_a_same_mask_style_baseline():
+    # The Conv analogue of
+    # test_sparsegpt_pruning_reconstructs_better_than_a_same_mask_style_baseline:
+    # given comparable calibration signal, SparseGPT's Hessian-compensated
+    # Conv weight should reconstruct the layer's real (onnxruntime) output
+    # at least as well as naively zeroing the same-shaped lowest-magnitude
+    # entries with no compensation at all.
+    Cin, Cout, spatial = 4, 8, 10
+    rng = np.random.default_rng(100)
+    w = rng.standard_normal((Cout, Cin, 3, 3)).astype(np.float32) * 0.5
+    model = _single_conv_model(w, spatial=spatial)
+    # Well-conditioned H: n_positions = 16*8*8 = 1024 >> K = 4*3*3 = 36.
+    x_cal = rng.standard_normal((16, Cin, spatial, spatial)).astype(np.float32)
+
+    pruned = onnxsim.apply_sparsegpt_pruning(
+        model, calibration_data=[{"X": x_cal}], sparsity=0.5
+    )
+    onnx.checker.check_model(pruned)
+
+    K = Cin * 3 * 3
+    w64 = w.astype(np.float64).reshape(Cout, K)
+    score = np.abs(w64)
+    thresh = np.sort(score.flatten())[int(score.size * 0.5)]
+    w_naive = np.where(score <= thresh, 0.0, w64).reshape(Cout, Cin, 3, 3)
+    naive_model = _single_conv_model(w_naive.astype(np.float32), spatial=spatial)
+
+    (float_y,) = _run(model, {"X": x_cal})
+    (sparsegpt_y,) = _run(pruned, {"X": x_cal})
+    (naive_y,) = _run(naive_model, {"X": x_cal})
+    err_sparsegpt = np.sum(
+        (float_y.astype(np.float64) - sparsegpt_y.astype(np.float64)) ** 2
+    )
+    err_naive = np.sum((float_y.astype(np.float64) - naive_y.astype(np.float64)) ** 2)
+    assert err_sparsegpt <= err_naive
 
 
 # --- apply_structured_pruning ------------------------------------------------
@@ -1478,61 +1780,213 @@ def test_structured_pruning_skips_grouped_consumer_conv():
     np.testing.assert_array_equal(inits["W2"], w2)
 
 
-def test_structured_pruning_skips_general_grouped_producer_conv():
-    # A *general* grouped Conv (group=2, neither 1 nor equal to its own
-    # channel count) is not the depthwise special case above -- it stays
-    # completely out of scope, exactly as before this pass learned to cross
-    # depthwise Convs transparently.
-    C = 8
-    rng = np.random.default_rng(57)
-    w1 = rng.standard_normal((C, C // 2, 3, 3)).astype(np.float32)  # group=2
-    w2 = rng.standard_normal((C, C, 3, 3)).astype(np.float32)
-    model = _model(
+def _grouped_conv_pair_model(
+    w1, w2, group1=1, group2=1, b1=None, spatial=10, activation="Relu"
+):
+    """`_conv_pair_model`, extended with an explicit ``group`` attribute on
+    each Conv -- lets the same oracle-comparison-via-onnxruntime pattern
+    used throughout this section cover a general grouped Conv producer
+    (`group1`) and/or consumer (`group2`), not just the ``group=1`` case
+    `_conv_pair_model` builds. `w1`'s shape must already be
+    ``[C1, Cin/group1, kH, kW]`` and `w2`'s ``[C2, C1/group2, kH, kW]`` --
+    same caller-responsibility convention `_conv_pair_model` already has for
+    the two weights' shapes lining up.
+    """
+    Cin, C2 = w1.shape[1] * group1, w2.shape[0]
+    initializer = [_f32(w1, "W1"), _f32(w2, "W2")]
+    g1 = f", group={group1}" if group1 != 1 else ""
+    g2 = f", group={group2}" if group2 != 1 else ""
+    if b1 is not None:
+        conv1 = f"h = Conv<kernel_shape=[3,3]{g1}>(X, W1, B1)"
+        initializer.append(_f32(b1, "B1"))
+    else:
+        conv1 = f"h = Conv<kernel_shape=[3,3]{g1}>(X, W1)"
+    out_spatial = spatial - 4  # two valid (no-pad) 3x3 convs
+    return _model(
         f"""
-        g (float[N,{C},10,10] X) => (float[N,{C},6,6] Y)
+        g (float[N,{Cin},{spatial},{spatial}] X) => (float[N,{C2},{out_spatial},{out_spatial}] Y)
         {{
-          h = Conv<kernel_shape=[3,3], group=2>(X, W1)
-          a = Relu(h)
-          Y = Conv<kernel_shape=[3,3]>(a, W2)
+          {conv1}
+          a = {activation}(h)
+          Y = Conv<kernel_shape=[3,3]{g2}>(a, W2)
         }}
         """,
-        initializer=[_f32(w1, "W1"), _f32(w2, "W2")],
+        initializer=initializer,
     )
+
+
+def _oracle_keep_indices_conv_grouped(w, group, sparsity):
+    """The per-group analogue of `_oracle_keep_indices_conv`: ranks each of
+    `group` equal-sized blocks of output filters (`w`'s axis 0) by L2 norm
+    *independently*, keeping the same count from every block -- a from-
+    scratch reimplementation of the production per-group selection in
+    `_apply_chains`/`_chain_group`, not a call into it, so this stays a real
+    check on the algorithm rather than the algorithm checking itself.
+    """
+    out_channels = w.shape[0]
+    block = out_channels // group
+    per_group_keep = max(1, round(block * (1.0 - sparsity)))
+    parts = []
+    for gi in range(group):
+        lo, hi = gi * block, (gi + 1) * block
+        parts.append(_oracle_keep_indices_conv(w[lo:hi], per_group_keep) + lo)
+    return np.concatenate(parts)
+
+
+def _oracle_slice_grouped_consumer_conv(w2, keep, group, n_channels):
+    """The per-group analogue of the ordinary `w2[:, keep]` consumer slice:
+    a grouped consumer's axis 1 is only `n_channels / group` wide and
+    per-group-relative (weight column `j` on a filter in output-group `g`
+    means global input channel `g * block + j`), so each output-filter
+    group needs its own local slice of `keep` -- translated from global
+    indices back to that group's own local ones -- rather than one global
+    index set applied to the whole axis. A from-scratch reimplementation of
+    `_slice_grouped_consumer_conv_weight`, for the same reason
+    `_oracle_keep_indices_conv_grouped` reimplements the selection side.
+    """
+    out_channels = w2.shape[0]
+    out_per_group = out_channels // group
+    block = n_channels // group
+    parts = []
+    for gi in range(group):
+        lo, hi = gi * block, (gi + 1) * block
+        local_keep = keep[(keep >= lo) & (keep < hi)] - lo
+        parts.append(w2[gi * out_per_group : (gi + 1) * out_per_group][:, local_keep])
+    return np.concatenate(parts, axis=0)
+
+
+def test_structured_pruning_general_grouped_producer_conv_prunes_per_group_independently():
+    # A general grouped Conv producer (group=2, neither 1 nor its own
+    # channel count) feeding an ordinary consumer. Per this module's own
+    # docstring, a grouped Conv splits its output channels into `group`
+    # equal blocks that must each be ranked and pruned *independently*,
+    # keeping the same count per block (so `out_channels % group == 0`
+    # survives). Engineer block 0's filters (indices 0-3) to all have a far
+    # larger L2 norm than every filter in block 1 (indices 4-7): a *global*
+    # top-k over all 8 filters would keep every one of block 0's filters and
+    # none of block 1's, leaving block 1 with zero survivors -- violating
+    # its own group structure. The correct per-group behavior instead keeps
+    # each block's own top half, which -- given this engineered disparity
+    # -- provably differs from the global top-k.
+    Cin, C1, C2, group = 4, 8, 4, 2
+    rng = np.random.default_rng(80)
+    w1 = rng.standard_normal((C1, Cin // group, 3, 3)).astype(np.float32)
+    w1[:4] *= 10.0  # block 0 dominates block 1
+    w2 = rng.standard_normal((C2, C1, 3, 3)).astype(np.float32)
+    model = _grouped_conv_pair_model(w1, w2, group1=group)
+
     pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    keep_grouped = _oracle_keep_indices_conv_grouped(w1, group, 0.5)
+    keep_global = _oracle_keep_indices_conv(w1, 4)
+    assert list(keep_grouped) != list(keep_global)  # sanity: the engineered
+    # disparity really does make per-group and global selection disagree
+    assert sum(i < 4 for i in keep_grouped) == 2  # exactly half of block 0 ...
+    assert sum(i >= 4 for i in keep_grouped) == 2  # ... and half of block 1
+
     inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
-    np.testing.assert_array_equal(inits["W1"], w1)
-    np.testing.assert_array_equal(inits["W2"], w2)
+    np.testing.assert_array_equal(inits["W1"], w1[keep_grouped])
+    dw_node = next(n for n in pruned.graph.node if "W1" in n.input)
+    group_attr = next(a.i for a in dw_node.attribute if a.name == "group")
+    assert group_attr == group  # the group count itself never shrinks
+
+    oracle = _grouped_conv_pair_model(
+        w1[keep_grouped], w2[:, keep_grouped], group1=group
+    )
+    rng_x = np.random.default_rng(81)
+    x = rng_x.standard_normal((2, Cin, 10, 10)).astype(np.float32)
+    (y,) = _run(pruned, {"X": x})
+    (y_oracle,) = _run(oracle, {"X": x})
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-5, atol=1e-5)
 
 
-def test_structured_pruning_skips_general_grouped_consumer_conv():
-    # A general group=2 Conv sitting *between* a real producer and a real
-    # further consumer must also stay a hard stop, not a transparent hop --
-    # only the depthwise case (group == channel count, weight [C, 1, kH,
-    # kW]) is safe to cross, since only there is every output channel tied
-    # 1:1 to a single input channel with no cross-channel mixing at all.
-    Cin, C1, C2 = 3, 8, 4
-    rng = np.random.default_rng(58)
+def test_structured_pruning_general_grouped_consumer_conv_matches_manual_channel_deletion_exactly():
+    # A general grouped Conv consumer (group=2): the shared dimension being
+    # pruned is the consumer's own *input* channel axis, but that axis is
+    # per-group-relative in a grouped Conv's weight layout ([out_channels,
+    # in_channels/group, kH, kW]) -- weight column j on an output filter in
+    # group g means global input channel g*(in_channels/group) + j, not
+    # global channel j the way an ordinary (group=1) consumer's flat axis
+    # works. This is the part of grouped-Conv support that needs real new
+    # slicing logic (_slice_grouped_consumer_conv_weight), exercised here
+    # with block 0 given a far larger weight norm than block 1 so the two
+    # blocks' independently-selected local keep sets aren't trivially
+    # identical on both sides.
+    Cin, C1, C2, group = 3, 8, 6, 2
+    rng = np.random.default_rng(82)
     w1 = rng.standard_normal((C1, Cin, 3, 3)).astype(np.float32)
-    w2 = rng.standard_normal((C1, C1 // 2, 3, 3)).astype(np.float32)  # group=2
-    w3 = rng.standard_normal((C2, C1, 3, 3)).astype(np.float32)
-    model = _model(
-        f"""
-        g (float[N,{Cin},14,14] X) => (float[N,{C2},8,8] Y)
-        {{
-          h = Conv<kernel_shape=[3,3]>(X, W1)
-          a = Relu(h)
-          m = Conv<kernel_shape=[3,3], group=2>(a, W2)
-          b = Relu(m)
-          Y = Conv<kernel_shape=[3,3]>(b, W3)
-        }}
-        """,
-        initializer=[_f32(w1, "W1"), _f32(w2, "W2"), _f32(w3, "W3")],
-    )
+    w1[:4] *= 8.0  # block 0 dominates block 1
+    w2 = rng.standard_normal((C2, C1 // group, 3, 3)).astype(np.float32)
+    model = _grouped_conv_pair_model(w1, w2, group2=group)
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    keep = _oracle_keep_indices_conv_grouped(w1, group, 0.5)
+    w2_sliced = _oracle_slice_grouped_consumer_conv(w2, keep, group, C1)
+
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    np.testing.assert_array_equal(inits["W1"], w1[keep])
+    np.testing.assert_array_equal(inits["W2"], w2_sliced)
+
+    oracle = _grouped_conv_pair_model(w1[keep], w2_sliced, group2=group)
+    rng_x = np.random.default_rng(83)
+    x = rng_x.standard_normal((2, Cin, 10, 10)).astype(np.float32)
+    (y,) = _run(pruned, {"X": x})
+    (y_oracle,) = _run(oracle, {"X": x})
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-5, atol=1e-5)
+
+
+def test_structured_pruning_both_sides_grouped_matching_group_count_matches_oracle():
+    # Both producer and consumer are general grouped Convs, sharing the
+    # exact same `group` count -- the one cross-chain composition this pass
+    # supports when *both* sides are grouped (see this module's own
+    # docstring): the producer's own per-group keep selection (uniform
+    # count per block, by construction) already lines up exactly with the
+    # consumer's own group boundaries, since both partition the same
+    # `n_channels` into the same number of equal contiguous blocks.
+    Cin, C1, C2, group = 4, 8, 6, 2
+    rng = np.random.default_rng(84)
+    w1 = rng.standard_normal((C1, Cin // group, 3, 3)).astype(np.float32)
+    w1[:4] *= 6.0
+    w2 = rng.standard_normal((C2, C1 // group, 3, 3)).astype(np.float32)
+    model = _grouped_conv_pair_model(w1, w2, group1=group, group2=group)
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    keep = _oracle_keep_indices_conv_grouped(w1, group, 0.5)
+    w2_sliced = _oracle_slice_grouped_consumer_conv(w2, keep, group, C1)
+    oracle = _grouped_conv_pair_model(w1[keep], w2_sliced, group1=group, group2=group)
+
+    rng_x = np.random.default_rng(85)
+    x = rng_x.standard_normal((2, Cin, 10, 10)).astype(np.float32)
+    (y,) = _run(pruned, {"X": x})
+    (y_oracle,) = _run(oracle, {"X": x})
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-5, atol=1e-5)
+
+
+def test_structured_pruning_skips_mismatched_grouped_producer_and_consumer():
+    # Producer group=2, consumer group=4: both sides grouped, but with a
+    # *different* group count. Per this module's own docstring, both sides
+    # grouped is only supported when the group counts match -- otherwise
+    # the two sides' block boundaries wouldn't generally align (a channel
+    # surviving as "the 2nd of the producer's own group" has no
+    # well-defined membership in any of the consumer's differently-sized
+    # groups), so this composition is declined outright and the whole
+    # chain -- both layers -- is left completely untouched, not partially
+    # or incorrectly pruned.
+    Cin, C1, C2, gp, gc = 4, 8, 8, 2, 4
+    rng = np.random.default_rng(86)
+    w1 = rng.standard_normal((C1, Cin // gp, 3, 3)).astype(np.float32)
+    w2 = rng.standard_normal((C2, C1 // gc, 3, 3)).astype(np.float32)
+    model = _grouped_conv_pair_model(w1, w2, group1=gp, group2=gc)
+
     pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
     inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
     np.testing.assert_array_equal(inits["W1"], w1)
     np.testing.assert_array_equal(inits["W2"], w2)
-    np.testing.assert_array_equal(inits["W3"], w3)
 
 
 def test_structured_pruning_conv_into_non_pass_through_op_is_left_untouched():
@@ -2873,6 +3327,190 @@ def test_magnitude_pruning_gqa_qkv_weights_already_matched():
     assert y.shape == (cfg["batch"], cfg["seq"], cfg["Out"])
 
 
+# --- apply_attention_head_pruning / _wanda_pruning -- plain ai.onnx Attention --
+#
+# ``onnx.defs.get_schema("Attention", domain="")`` against this environment's
+# installed ``onnx==1.22.0`` confirms: `since_version=24`, inputs `Q, K, V,
+# attn_mask?, past_key?, past_value?, nonpad_kv_seqlen?`, attributes
+# `q_num_heads`/`kv_num_heads` (both schema-optional, required here -- see
+# `_match_onnx_attention_producer`'s own docstring), and -- per the op's own
+# backend-test suite (`onnx/backend/test/case/node/attention.py`) -- V may
+# carry its own, independent head_size, a shape this pass declines rather
+# than mis-slices (see `test_onnx_attention_pruning_diff_v_head_size_...`
+# below). onnxruntime 1.29.0 in this environment executes the op directly
+# (confirmed empirically), so every test below runs the real oracle-vs-
+# onnxruntime comparison the rest of this file uses, the same as the
+# `com.microsoft::GroupQueryAttention` section above -- no structural-only
+# fallback was needed for this op.
+
+
+def _onnx_attention_model(
+    K=8,
+    H=4,
+    KVH=2,
+    D=4,
+    Out=6,
+    seed=0,
+    batch=2,
+    seq=5,
+    bias=False,
+    with_reshape=False,
+    wq=None,
+    wk=None,
+    wv=None,
+    bq=None,
+    bk=None,
+    bv=None,
+    wout=None,
+    attn_mask=None,  # None (omitted) | "nonempty" (constant) | "dynamic" (graph input)
+    past_kv=None,  # None (omitted) | "nonempty" (constant) | "dynamic" (graph input)
+):
+    # Unlike `com.microsoft::GroupQueryAttention` (see `_gqa_model`'s own
+    # comment), this op's real onnxruntime CPU kernel has no observed
+    # head_size-multiple-of-8 requirement -- verified empirically above --
+    # so D defaults to a small 4, mirroring `_attention_model`'s own default.
+    rng = np.random.default_rng(seed)
+    Nq, Nkv = H * D, KVH * D
+    if wq is None:
+        wq = rng.standard_normal((K, Nq)).astype(np.float32)
+    if wk is None:
+        wk = rng.standard_normal((K, Nkv)).astype(np.float32)
+    if wv is None:
+        wv = rng.standard_normal((K, Nkv)).astype(np.float32)
+    if wout is None:
+        wout = rng.standard_normal((Nq, Out)).astype(np.float32)
+
+    initializer = [_f32(wq, "Wq"), _f32(wk, "Wk"), _f32(wv, "Wv"), _f32(wout, "Wout")]
+    q_op, k_op, v_op = "MatMul(X, Wq)", "MatMul(X, Wk)", "MatMul(X, Wv)"
+    if bias:
+        if bq is None:
+            bq = rng.standard_normal((Nq,)).astype(np.float32)
+        if bk is None:
+            bk = rng.standard_normal((Nkv,)).astype(np.float32)
+        if bv is None:
+            bv = rng.standard_normal((Nkv,)).astype(np.float32)
+        initializer += [_f32(bq, "Bq"), _f32(bk, "Bk"), _f32(bv, "Bv")]
+        q_op, k_op, v_op = "Gemm(X, Wq, Bq)", "Gemm(X, Wk, Bk)", "Gemm(X, Wv, Bv)"
+
+    operands = ["q", "k", "v"]
+    extra_graph_inputs = ""
+
+    if attn_mask == "nonempty":
+        mask = np.zeros((seq, seq), dtype=np.float32)
+        initializer.append(_f32(mask, "AttnMask"))
+        operands.append("AttnMask")
+    elif attn_mask == "dynamic":
+        operands.append("AttnMaskIn")
+        extra_graph_inputs += f", float[{seq},{seq}] AttnMaskIn"
+    else:
+        operands.append("")
+
+    if past_kv == "nonempty":
+        past_key = rng.standard_normal((batch, KVH, 1, D)).astype(np.float32)
+        past_value = rng.standard_normal((batch, KVH, 1, D)).astype(np.float32)
+        initializer += [_f32(past_key, "PastKey"), _f32(past_value, "PastValue")]
+        operands += ["PastKey", "PastValue"]
+    elif past_kv == "dynamic":
+        operands += ["PastKeyIn", "PastValueIn"]
+        extra_graph_inputs += (
+            f", float[{batch},{KVH},1,{D}] PastKeyIn"
+            f", float[{batch},{KVH},1,{D}] PastValueIn"
+        )
+    else:
+        operands += ["", ""]
+
+    # Trailing optional inputs may simply be omitted from the node's own
+    # input list rather than spelled out as empty placeholders.
+    while operands and operands[-1] == "":
+        operands.pop()
+
+    if with_reshape:
+        shape = np.array([batch, seq, Nq], dtype=np.int64)
+        initializer.append(onnx.numpy_helper.from_array(shape, "Shape"))
+        tail = "ctx2 = Reshape(ctx, Shape)\n          Y = MatMul(ctx2, Wout)"
+    else:
+        tail = "Y = MatMul(ctx, Wout)"
+
+    body = f"""
+        g (float[{batch},{seq},{K}] X{extra_graph_inputs}) => (float[{batch},{seq},{Out}] Y)
+        {{
+          q = {q_op}
+          k = {k_op}
+          v = {v_op}
+          ctx = Attention <q_num_heads={H}, kv_num_heads={KVH}> ({", ".join(operands)})
+          {tail}
+        }}
+        """
+
+    model = parser.parse_model(
+        f"""
+        <
+          ir_version: 10,
+          opset_import: ["": 24]
+        >
+        {body}
+        """
+    )
+    model.graph.initializer.extend(initializer)
+    return model, dict(
+        K=K,
+        H=H,
+        KVH=KVH,
+        D=D,
+        Out=Out,
+        Nq=Nq,
+        Nkv=Nkv,
+        wq=wq,
+        wk=wk,
+        wv=wv,
+        bq=bq,
+        bk=bk,
+        bv=bv,
+        wout=wout,
+        batch=batch,
+        seq=seq,
+    )
+
+
+def _onnx_attention_node(model):
+    # Filters on `.domain` too, not just `.op_type == "Attention"` (unlike
+    # this file's own `_attention_node`) -- necessary once a graph can
+    # contain both this op and `com.microsoft::Attention` side by side (see
+    # `test_attention_head_pruning_handles_all_three_attention_op_types_...`
+    # below), which share the bare op_type "Attention" but not the domain.
+    return next(
+        n for n in model.graph.node if n.op_type == "Attention" and n.domain == ""
+    )
+
+
+def _onnx_attention_attrs(node):
+    q_num_heads = next(a.i for a in node.attribute if a.name == "q_num_heads")
+    kv_num_heads = next(a.i for a in node.attribute if a.name == "kv_num_heads")
+    return q_num_heads, kv_num_heads
+
+
+def test_onnx_attention_pruning_shrinks_matched_block():
+    model, cfg = _onnx_attention_model(K=8, H=4, KVH=4, D=4, Out=6)
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    node = _onnx_attention_node(pruned)
+    q_num_heads, kv_num_heads = _onnx_attention_attrs(node)
+    assert q_num_heads == 2  # round(4 - 4*0.5) query heads ...
+    assert kv_num_heads == 2  # ... and KV heads alike, since group_size == 1 here
+
+    inits = {t.name: t for t in pruned.graph.initializer}
+    assert list(inits["Wq"].dims) == [8, 8]
+    assert list(inits["Wk"].dims) == [8, 8]
+    assert list(inits["Wv"].dims) == [8, 8]
+    assert list(inits["Wout"].dims) == [8, 6]
+
+    rng = np.random.default_rng(1)
+    x = rng.standard_normal((cfg["batch"], cfg["seq"], cfg["K"])).astype(np.float32)
+    (y,) = _run(pruned, {"X": x})
+    assert y.shape == (cfg["batch"], cfg["seq"], cfg["Out"])
+
+
 def test_weight_sparsity_includes_attention_and_gqa_weights():
     model, cfg = _attention_model(K=8, H=4, D=4, Out=6, seed=29)
     assert onnxsim.weight_sparsity(model) == 0.0
@@ -2887,3 +3525,520 @@ def test_weight_sparsity_includes_attention_and_gqa_weights():
     assert onnxsim.weight_sparsity(gqa_model) == 0.0
     gqa_pruned = onnxsim.apply_magnitude_pruning(gqa_model, sparsity=0.5)
     assert onnxsim.weight_sparsity(gqa_pruned) == pytest.approx(0.5, abs=1e-9)
+
+
+def test_onnx_attention_pruning_zero_sparsity_is_a_no_op():
+    model, cfg = _onnx_attention_model(K=8, H=8, KVH=2, D=4, Out=6, seed=7)
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.0)
+    node = _onnx_attention_node(pruned)
+    q_num_heads, kv_num_heads = _onnx_attention_attrs(node)
+    assert q_num_heads == cfg["H"]
+    assert kv_num_heads == cfg["KVH"]
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    np.testing.assert_array_equal(inits["Wq"], cfg["wq"])
+    np.testing.assert_array_equal(inits["Wk"], cfg["wk"])
+    np.testing.assert_array_equal(inits["Wv"], cfg["wv"])
+
+
+def test_onnx_attention_pruning_unequal_heads_drops_whole_groups_and_preserves_ratio():
+    # 8 query heads sharing 4 KV heads (2 query heads per KV head); at
+    # sparsity=0.5 two of the four *groups* must be dropped, never an
+    # individual query head in isolation -- exactly the same GQA-style
+    # granularity `com.microsoft::GroupQueryAttention` enforces (see
+    # `test_gqa_pruning_unequal_heads_drops_whole_groups_and_preserves_ratio`),
+    # since this pass reuses that op's own `_apply_one_gqa_chain` unmodified.
+    model, cfg = _onnx_attention_model(K=8, H=8, KVH=4, D=4, Out=6, seed=11)
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    node = _onnx_attention_node(pruned)
+    q_num_heads, kv_num_heads = _onnx_attention_attrs(node)
+    assert kv_num_heads == 2
+    assert q_num_heads == 4
+    assert q_num_heads // kv_num_heads == cfg["H"] // cfg["KVH"]  # ratio preserved
+
+    group_size = cfg["H"] // cfg["KVH"]
+    keep_groups = _oracle_keep_groups(
+        cfg["wq"], cfg["wk"], cfg["wv"], cfg["H"], cfg["KVH"], cfg["D"], 2
+    )
+    keep_q_heads = _group_q_heads(keep_groups, group_size)
+    d = cfg["D"]
+
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    np.testing.assert_array_equal(inits["Wq"], cfg["wq"][:, _head_idx(keep_q_heads, d)])
+    np.testing.assert_array_equal(inits["Wk"], cfg["wk"][:, _head_idx(keep_groups, d)])
+    np.testing.assert_array_equal(inits["Wv"], cfg["wv"][:, _head_idx(keep_groups, d)])
+
+
+def test_onnx_attention_pruning_matches_oracle_exactly():
+    model, cfg = _onnx_attention_model(K=8, H=8, KVH=2, D=4, Out=6, seed=1)
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    node = _onnx_attention_node(pruned)
+    q_num_heads, kv_num_heads = _onnx_attention_attrs(node)
+    group_size = cfg["H"] // cfg["KVH"]
+    assert kv_num_heads == 1  # max(1, 2 - round(2*0.5))
+    assert q_num_heads == kv_num_heads * group_size
+
+    keep_groups = _oracle_keep_groups(
+        cfg["wq"], cfg["wk"], cfg["wv"], cfg["H"], cfg["KVH"], cfg["D"], kv_num_heads
+    )
+    keep_q_heads = _group_q_heads(keep_groups, group_size)
+    d = cfg["D"]
+    q_idx, kv_idx = _head_idx(keep_q_heads, d), _head_idx(keep_groups, d)
+
+    oracle, _ = _onnx_attention_model(
+        K=cfg["K"],
+        H=len(keep_q_heads),
+        KVH=len(keep_groups),
+        D=d,
+        Out=cfg["Out"],
+        seed=1,
+        wq=cfg["wq"][:, q_idx],
+        wk=cfg["wk"][:, kv_idx],
+        wv=cfg["wv"][:, kv_idx],
+        wout=cfg["wout"][q_idx, :],
+        batch=cfg["batch"],
+        seq=cfg["seq"],
+    )
+
+    rng = np.random.default_rng(2)
+    x = rng.standard_normal((cfg["batch"], cfg["seq"], cfg["K"])).astype(np.float32)
+    (y_pruned,) = _run(pruned, {"X": x})
+    (y_oracle,) = _run(oracle, {"X": x})
+    np.testing.assert_allclose(y_pruned, y_oracle, rtol=1e-4, atol=1e-4)
+
+
+def test_onnx_attention_pruning_slices_bias_when_producer_has_one():
+    # Gemm's own ONNX spec requires a rank-2 input, so a bias-carrying Gemm
+    # producer can't sit directly ahead of this op's rank-3 query/key/value
+    # inputs in a graph meant to actually run through onnxruntime (see
+    # `test_gqa_pruning_slices_bias_when_producer_has_one`'s own comment) --
+    # this exercises the bias-slicing path (shared with every other producer
+    # match in this module via `_match_producer`) directly against the
+    # initializers instead.
+    model, cfg = _onnx_attention_model(K=8, H=4, KVH=2, D=4, Out=6, seed=14, bias=True)
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+
+    node = _onnx_attention_node(pruned)
+    q_num_heads, kv_num_heads = _onnx_attention_attrs(node)
+    group_size = cfg["H"] // cfg["KVH"]
+    assert kv_num_heads == 1
+    assert q_num_heads == group_size
+
+    keep_groups = _oracle_keep_groups(
+        cfg["wq"], cfg["wk"], cfg["wv"], cfg["H"], cfg["KVH"], cfg["D"], kv_num_heads
+    )
+    keep_q_heads = _group_q_heads(keep_groups, group_size)
+    d = cfg["D"]
+    q_idx, kv_idx = _head_idx(keep_q_heads, d), _head_idx(keep_groups, d)
+
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    np.testing.assert_array_equal(inits["Wq"], cfg["wq"][:, q_idx])
+    np.testing.assert_array_equal(inits["Wk"], cfg["wk"][:, kv_idx])
+    np.testing.assert_array_equal(inits["Wv"], cfg["wv"][:, kv_idx])
+    np.testing.assert_array_equal(inits["Bq"], cfg["bq"][q_idx])
+    np.testing.assert_array_equal(inits["Bk"], cfg["bk"][kv_idx])
+    np.testing.assert_array_equal(inits["Bv"], cfg["bv"][kv_idx])
+
+
+def test_onnx_attention_pruning_reshape_hop_is_recognized_and_shape_updated():
+    model, cfg = _onnx_attention_model(
+        K=8, H=4, KVH=2, D=4, Out=6, seed=3, with_reshape=True
+    )
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    assert [n.op_type for n in pruned.graph.node] == [
+        "MatMul",
+        "MatMul",
+        "MatMul",
+        "Attention",
+        "Reshape",
+        "MatMul",
+    ]
+
+    node = _onnx_attention_node(pruned)
+    q_num_heads, kv_num_heads = _onnx_attention_attrs(node)
+    assert kv_num_heads == 1  # max(1, 2 - round(2*0.5)) == 1
+    assert q_num_heads == 2  # group_size(2) * kv_num_heads(1)
+
+    shape = onnx.numpy_helper.to_array(
+        next(t for t in pruned.graph.initializer if t.name == "Shape")
+    )
+    assert shape[-1] == q_num_heads * cfg["D"]  # updated to the new (post-prune) Nq
+
+    rng = np.random.default_rng(4)
+    x = rng.standard_normal((cfg["batch"], cfg["seq"], cfg["K"])).astype(np.float32)
+    (y,) = _run(pruned, {"X": x})
+    assert y.shape == (cfg["batch"], cfg["seq"], cfg["Out"])
+
+
+def test_onnx_attention_pruning_nonempty_past_kv_constant_is_left_untouched():
+    # A non-empty constant past_key/past_value holds real per-KV-head cache
+    # data along the kv_num_heads axis this module would need to slice but
+    # doesn't attempt to -- declined outright, mirroring
+    # `test_gqa_pruning_nonempty_past_kv_constant_is_left_untouched` exactly
+    # (`_match_onnx_attention_producer` applies the identical safety check).
+    model, cfg = _onnx_attention_model(
+        K=8, H=8, KVH=2, D=4, Out=6, seed=12, past_kv="nonempty"
+    )
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    inits_before = {
+        t.name: onnx.numpy_helper.to_array(t) for t in model.graph.initializer
+    }
+    inits_after = {
+        t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer
+    }
+    for name in inits_before:
+        np.testing.assert_array_equal(inits_before[name], inits_after[name])
+
+
+def test_onnx_attention_pruning_dynamic_past_kv_input_is_still_pruned():
+    # A *dynamic* (non-constant) past_key/past_value -- an ordinary graph
+    # input here -- is not a weight this module could corrupt by leaving it
+    # untouched, so it must not block the match the way a non-empty constant
+    # does (mirrors `test_gqa_pruning_dynamic_past_kv_input_is_still_pruned`).
+    model, cfg = _onnx_attention_model(
+        K=8, H=8, KVH=2, D=4, Out=6, seed=13, past_kv="dynamic"
+    )
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    node = _onnx_attention_node(pruned)
+    q_num_heads, kv_num_heads = _onnx_attention_attrs(node)
+    assert kv_num_heads == 1
+    assert q_num_heads == 4
+    assert list(node.input[4:6]) == ["PastKeyIn", "PastValueIn"]
+
+    inits = {t.name: t for t in pruned.graph.initializer}
+    assert list(inits["Wq"].dims) == [8, 4 * cfg["D"]]
+    assert list(inits["Wk"].dims) == [8, 1 * cfg["D"]]
+    assert list(inits["Wv"].dims) == [8, 1 * cfg["D"]]
+
+
+def test_onnx_attention_pruning_nonempty_attn_mask_constant_is_left_untouched():
+    # `attn_mask` is an optional input this op has that `GroupQueryAttention`
+    # does not; a non-empty constant one is given the identical
+    # decline-outright treatment `_match_gqa_producer` already applies to
+    # `past_key`/`past_value` (see `_match_onnx_attention_producer`'s own
+    # docstring) -- this exercises that specific input, not just the two
+    # `past_key`/`past_value` inputs the two ops share the same shape of.
+    model, cfg = _onnx_attention_model(
+        K=8, H=8, KVH=2, D=4, Out=6, seed=15, attn_mask="nonempty"
+    )
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    inits_before = {
+        t.name: onnx.numpy_helper.to_array(t) for t in model.graph.initializer
+    }
+    inits_after = {
+        t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer
+    }
+    for name in inits_before:
+        np.testing.assert_array_equal(inits_before[name], inits_after[name])
+
+
+def test_onnx_attention_pruning_dynamic_attn_mask_input_is_still_pruned():
+    # The dynamic-input counterpart of the test above: an ordinary graph
+    # input standing in for real runtime mask data is left alone and must
+    # not block the match.
+    model, cfg = _onnx_attention_model(
+        K=8, H=8, KVH=2, D=4, Out=6, seed=16, attn_mask="dynamic"
+    )
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    node = _onnx_attention_node(pruned)
+    q_num_heads, kv_num_heads = _onnx_attention_attrs(node)
+    assert kv_num_heads == 1
+    assert q_num_heads == 4
+    assert node.input[3] == "AttnMaskIn"
+
+    rng = np.random.default_rng(17)
+    x = rng.standard_normal((cfg["batch"], cfg["seq"], cfg["K"])).astype(np.float32)
+    mask = np.zeros((cfg["seq"], cfg["seq"]), dtype=np.float32)
+    (y,) = _run(pruned, {"X": x, "AttnMaskIn": mask})
+    assert y.shape == (cfg["batch"], cfg["seq"], cfg["Out"])
+
+
+def test_onnx_attention_pruning_missing_kv_num_heads_attribute_is_left_untouched():
+    # Both `q_num_heads`/`kv_num_heads` are schema-*optional* (inferable
+    # from a rank-4 Q/K input this pass never produces/matches -- see
+    # `_match_onnx_attention_producer`'s own docstring), so a node giving
+    # only one of the two isn't a topology this pass tracks and must be
+    # left alone rather than guessed at.
+    K, H, D, Out = 8, 4, 4, 6
+    N = H * D
+    rng = np.random.default_rng(18)
+    wq = rng.standard_normal((K, N)).astype(np.float32)
+    wk = rng.standard_normal((K, N)).astype(np.float32)
+    wv = rng.standard_normal((K, N)).astype(np.float32)
+    wout = rng.standard_normal((N, Out)).astype(np.float32)
+    model = parser.parse_model(
+        f"""
+        <
+          ir_version: 10,
+          opset_import: ["": 24]
+        >
+        g (float[2,5,{K}] X) => (float[2,5,{Out}] Y)
+        {{
+          q = MatMul(X, Wq)
+          k = MatMul(X, Wk)
+          v = MatMul(X, Wv)
+          ctx = Attention <q_num_heads={H}> (q, k, v)
+          Y = MatMul(ctx, Wout)
+        }}
+        """
+    )
+    model.graph.initializer.extend(
+        [_f32(wq, "Wq"), _f32(wk, "Wk"), _f32(wv, "Wv"), _f32(wout, "Wout")]
+    )
+    onnx.checker.check_model(model)
+
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    inits_before = {
+        t.name: onnx.numpy_helper.to_array(t) for t in model.graph.initializer
+    }
+    inits_after = {
+        t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer
+    }
+    for name in inits_before:
+        np.testing.assert_array_equal(inits_before[name], inits_after[name])
+
+
+def test_onnx_attention_pruning_diff_v_head_size_is_left_untouched():
+    # This op's real schema (unlike `com.microsoft::GroupQueryAttention`,
+    # which `fuse_gqa.h` always emits with equal Q/K/V head_size) genuinely
+    # allows V its own, independent head_size -- confirmed via the op's own
+    # backend-test suite (`test_attention_3d_diff_heads_sizes` and friends
+    # in `onnx/backend/test/case/node/attention.py`). This pass reuses
+    # `_apply_one_gqa_chain`'s shared, uniform-head_size slicing body
+    # unmodified rather than a parallel implementation (see this module's
+    # own "Attention-head pruning" section comment), so a node whose V head
+    # size actually differs from Q/K's is declined here rather than
+    # mis-sliced -- checked directly against `_find_onnx_attention_chains`
+    # too, since nothing downstream needs exercising once the node fails to
+    # match at all.
+    K, H, KVH, D, Dv, Out = 8, 4, 4, 4, 6, 5
+    Nq, Nk, Nv = H * D, KVH * D, KVH * Dv
+    rng = np.random.default_rng(19)
+    wq = rng.standard_normal((K, Nq)).astype(np.float32)
+    wk = rng.standard_normal((K, Nk)).astype(np.float32)
+    wv = rng.standard_normal((K, Nv)).astype(np.float32)
+    wout = rng.standard_normal((Nq, Out)).astype(np.float32)
+    # V's own head_size (`Dv`) differs from Q/K's (`D`) -- a shape this pass
+    # declines rather than mis-slices.
+    model = parser.parse_model(
+        f"""
+        <
+          ir_version: 10,
+          opset_import: ["": 24]
+        >
+        g (float[2,5,{K}] X) => (float[2,5,{Out}] Y)
+        {{
+          q = MatMul(X, Wq)
+          k = MatMul(X, Wk)
+          v = MatMul(X, Wv)
+          ctx = Attention <q_num_heads={H}, kv_num_heads={KVH}> (q, k, v)
+          Y = MatMul(ctx, Wout)
+        }}
+        """
+    )
+    model.graph.initializer.extend(
+        [_f32(wq, "Wq"), _f32(wk, "Wk"), _f32(wv, "Wv"), _f32(wout, "Wout")]
+    )
+    onnx.checker.check_model(model)
+
+    assert onnxsim.pruning._find_onnx_attention_chains(model.graph) == []
+
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    inits_before = {
+        t.name: onnx.numpy_helper.to_array(t) for t in model.graph.initializer
+    }
+    inits_after = {
+        t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer
+    }
+    for name in inits_before:
+        np.testing.assert_array_equal(inits_before[name], inits_after[name])
+
+
+def test_onnx_attention_wanda_pruning_matches_oracle_exactly():
+    model, cfg = _onnx_attention_model(K=8, H=8, KVH=2, D=4, Out=6, seed=8)
+
+    rng = np.random.default_rng(9)
+    x_cal = rng.standard_normal((cfg["batch"], cfg["seq"], cfg["K"])).astype(np.float32)
+    calibration_data = [{"X": x_cal}]
+
+    pruned = onnxsim.apply_attention_head_wanda_pruning(
+        model, calibration_data=calibration_data, sparsity=0.5
+    )
+    onnx.checker.check_model(pruned)
+
+    probe_model = onnx.ModelProto()
+    probe_model.CopyFrom(model)
+    probe_model.graph.output.append(onnx.ValueInfoProto(name="ctx"))
+    (_, ctx_cal) = _run(probe_model, {"X": x_cal})
+    act_norm = np.sqrt(np.mean(np.square(ctx_cal.astype(np.float64)), axis=(0, 1)))
+
+    d = cfg["D"]
+    group_size = cfg["H"] // cfg["KVH"]
+    importance = np.zeros(cfg["KVH"])
+    for kv in range(cfg["KVH"]):
+        q_block = np.concatenate(
+            [
+                cfg["wq"][:, h * d : (h + 1) * d]
+                for h in range(kv * group_size, (kv + 1) * group_size)
+            ],
+            axis=1,
+        )
+        k_block = cfg["wk"][:, kv * d : (kv + 1) * d]
+        v_block = cfg["wv"][:, kv * d : (kv + 1) * d]
+        base = np.linalg.norm(np.concatenate([q_block, k_block, v_block], axis=1))
+        act_group = np.linalg.norm(
+            act_norm[kv * group_size * d : (kv + 1) * group_size * d]
+        )
+        importance[kv] = base * max(act_group, 1e-8)
+    keep_groups = np.sort(np.argsort(-importance)[:1])  # max(1, 2 - round(2*0.5)) == 1
+
+    keep_q_heads = _group_q_heads(keep_groups, group_size)
+    q_idx, kv_idx = _head_idx(keep_q_heads, d), _head_idx(keep_groups, d)
+
+    oracle, _ = _onnx_attention_model(
+        K=cfg["K"],
+        H=len(keep_q_heads),
+        KVH=len(keep_groups),
+        D=d,
+        Out=cfg["Out"],
+        seed=8,
+        wq=cfg["wq"][:, q_idx],
+        wk=cfg["wk"][:, kv_idx],
+        wv=cfg["wv"][:, kv_idx],
+        wout=cfg["wout"][q_idx, :],
+        batch=cfg["batch"],
+        seq=cfg["seq"],
+    )
+
+    x = rng.standard_normal((cfg["batch"], cfg["seq"], cfg["K"])).astype(np.float32)
+    (y_pruned,) = _run(pruned, {"X": x})
+    (y_oracle,) = _run(oracle, {"X": x})
+    np.testing.assert_allclose(y_pruned, y_oracle, rtol=1e-4, atol=1e-4)
+
+
+def test_onnx_attention_wanda_pruning_falls_back_to_plain_with_no_calibration_batches():
+    model, cfg = _onnx_attention_model(K=8, H=8, KVH=2, D=4, Out=6, seed=10)
+    plain = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    wanda = onnxsim.apply_attention_head_wanda_pruning(
+        model, calibration_data=[], sparsity=0.5
+    )
+    inits_plain = {
+        t.name: onnx.numpy_helper.to_array(t) for t in plain.graph.initializer
+    }
+    inits_wanda = {
+        t.name: onnx.numpy_helper.to_array(t) for t in wanda.graph.initializer
+    }
+    for name in inits_plain:
+        np.testing.assert_array_equal(inits_plain[name], inits_wanda[name])
+
+
+def test_attention_head_pruning_handles_all_three_attention_op_types_in_one_model():
+    # Regression check for `_apply_attention_chains`'s per-chain-type
+    # dispatch once a third node type shares it: a plain
+    # `com.microsoft::Attention` block, a `GroupQueryAttention` block, and a
+    # plain `ai.onnx::Attention` block in the same graph, sharing no
+    # tensors, must each be pruned correctly and independently -- no chain
+    # family may disturb another, extending
+    # `test_attention_head_pruning_handles_attention_and_gqa_in_one_model`'s
+    # own two-type check to all three now-matched op types.
+    K, H, D, Out1 = 8, 4, 4, 6
+    Nqkv = H * D
+    rng = np.random.default_rng(40)
+    wqkv = rng.standard_normal((K, 3 * Nqkv)).astype(np.float32)
+    bqkv = rng.standard_normal((3 * Nqkv,)).astype(np.float32)
+    wout1 = rng.standard_normal((Nqkv, Out1)).astype(np.float32)
+
+    GH, GKVH, GD, Out2 = 8, 2, 8, 5
+    Nq2, Nkv2 = GH * GD, GKVH * GD
+    wq2 = rng.standard_normal((K, Nq2)).astype(np.float32)
+    wk2 = rng.standard_normal((K, Nkv2)).astype(np.float32)
+    wv2 = rng.standard_normal((K, Nkv2)).astype(np.float32)
+    wout2 = rng.standard_normal((Nq2, Out2)).astype(np.float32)
+
+    AH, AKVH, AD, Out3 = 8, 2, 4, 7
+    Nq3, Nkv3 = AH * AD, AKVH * AD
+    wq3 = rng.standard_normal((K, Nq3)).astype(np.float32)
+    wk3 = rng.standard_normal((K, Nkv3)).astype(np.float32)
+    wv3 = rng.standard_normal((K, Nkv3)).astype(np.float32)
+    wout3 = rng.standard_normal((Nq3, Out3)).astype(np.float32)
+
+    batch, seq = 2, 5
+    seqlens_k = np.full((batch,), seq - 1, dtype=np.int32)
+    total_seq = np.array(seq, dtype=np.int32)
+
+    model = parser.parse_model(
+        f"""
+        <
+          ir_version: 10,
+          opset_import: ["": 24, "com.microsoft": 1]
+        >
+        g (float[{batch},{seq},{K}] X1, float[{batch},{seq},{K}] X2, float[{batch},{seq},{K}] X3) => (float[{batch},{seq},{Out1}] Y1, float[{batch},{seq},{Out2}] Y2, float[{batch},{seq},{Out3}] Y3)
+        {{
+          ctx1 = com.microsoft.Attention <num_heads={H}, qkv_hidden_sizes=[{Nqkv},{Nqkv},{Nqkv}]> (X1, Wqkv, Bqkv)
+          Y1 = MatMul(ctx1, Wout1)
+          q2 = MatMul(X2, Wq2)
+          k2 = MatMul(X2, Wk2)
+          v2 = MatMul(X2, Wv2)
+          ctx2, pk, pv = com.microsoft.GroupQueryAttention <num_heads={GH}, kv_num_heads={GKVH}> (q2, k2, v2, , , SeqLensK, TotalSeq)
+          Y2 = MatMul(ctx2, Wout2)
+          q3 = MatMul(X3, Wq3)
+          k3 = MatMul(X3, Wk3)
+          v3 = MatMul(X3, Wv3)
+          ctx3 = Attention <q_num_heads={AH}, kv_num_heads={AKVH}> (q3, k3, v3)
+          Y3 = MatMul(ctx3, Wout3)
+        }}
+        """
+    )
+    model.graph.initializer.extend(
+        [
+            _f32(wqkv, "Wqkv"),
+            _f32(bqkv, "Bqkv"),
+            _f32(wout1, "Wout1"),
+            _f32(wq2, "Wq2"),
+            _f32(wk2, "Wk2"),
+            _f32(wv2, "Wv2"),
+            _f32(wout2, "Wout2"),
+            onnx.numpy_helper.from_array(seqlens_k, "SeqLensK"),
+            onnx.numpy_helper.from_array(total_seq, "TotalSeq"),
+            _f32(wq3, "Wq3"),
+            _f32(wk3, "Wk3"),
+            _f32(wv3, "Wv3"),
+            _f32(wout3, "Wout3"),
+        ]
+    )
+
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    attn_node = next(
+        n
+        for n in pruned.graph.node
+        if n.op_type == "Attention" and n.domain == "com.microsoft"
+    )
+    gqa_node = next(n for n in pruned.graph.node if n.op_type == "GroupQueryAttention")
+    onnx_attn_node = _onnx_attention_node(pruned)
+    attn_heads, _ = _attention_attrs(attn_node)
+    gqa_heads, gqa_kv_heads = _gqa_attrs(gqa_node)
+    onnx_attn_heads, onnx_attn_kv_heads = _onnx_attention_attrs(onnx_attn_node)
+    assert attn_heads == 2
+    assert gqa_kv_heads == 1
+    assert gqa_heads == 4
+    assert onnx_attn_kv_heads == 1
+    assert onnx_attn_heads == 4
+
+    rng2 = np.random.default_rng(41)
+    x1 = rng2.standard_normal((batch, seq, K)).astype(np.float32)
+    x2 = rng2.standard_normal((batch, seq, K)).astype(np.float32)
+    x3 = rng2.standard_normal((batch, seq, K)).astype(np.float32)
+    y1, y2, y3 = _run(pruned, {"X1": x1, "X2": x2, "X3": x3})
+    assert y1.shape == (batch, seq, Out1)
+    assert y2.shape == (batch, seq, Out2)
+    assert y3.shape == (batch, seq, Out3)

@@ -166,10 +166,60 @@ rule. `adapter.onnx` from step 4 is not a runnable model by itself -- it's a
 plain tensor container holding just the `lora_A`/`lora_B` initializers --
 meant to be re-merged with `apply_lora_adapter.py`, not loaded directly into
 a session. This is a portable, ONNX-native adapter format built on these
-scripts; it is not the same binary format as ONNX Runtime GenAI's
-`.onnx_adapter` files (those come out of Olive's `convert-adapters`, for
-loading multiple adapters into one inference session via
-`Ort::LoraAdapter`/`RunOptions`).
+scripts, distinct from ONNX Runtime's own `.onnx_adapter` file format
+described next.
+
+### Loading an adapter natively at inference time (no Olive needed)
+
+`apply_lora_adapter.py`/`extract_lora_adapter.py` above bake one specific
+trained adapter into its own merged copy of the model. ONNX Runtime has a
+native alternative for swapping adapters in and out of a *single* loaded
+session instead: `onnxruntime.LoraAdapter` / `RunOptions.add_active_adapter`
+(ORT >= 1.20), fed by a `.onnx_adapter` file. People usually reach that
+format through Microsoft's separate Olive tool (`olive convert-adapters`),
+but Olive's own command is a thin wrapper around one public onnxruntime
+class (`onnxruntime.AdapterFormat`) -- see `ConvertAdaptersCommand.run` in
+Olive's source. `scripts/export_onnx_adapter.py` calls that class directly,
+needing only `onnxruntime` itself (no `olive-ai`/`torch`/`peft`):
+
+```sh
+# 1. Inject with --adapter-inputs: lora_A/lora_B become optional graph
+#    inputs (defaulting to their baked initializer) instead of pure
+#    constants, so ONNX Runtime can override them at Run() time.
+python3 scripts/inject_lora.py model.onnx -o model_lora.onnx \
+  --rank 4 --adapter-inputs --params-out lora.json
+
+# 2-3. Generate artifacts and train exactly as in the plain-LoRA workflow.
+
+# 4. Extract the trained adapter as usual.
+python3 scripts/extract_lora_adapter.py finetuned.onnx --params-file lora.json -o adapter.onnx
+
+# 5. Export it to ONNX Runtime's native format.
+python3 scripts/export_onnx_adapter.py adapter.onnx --params-file lora.json -o adapter.onnx_adapter
+```
+
+```python
+import onnxruntime as ort
+
+session = ort.InferenceSession("model_lora.onnx")  # loaded once
+adapter = ort.LoraAdapter()
+adapter.Load("adapter.onnx_adapter")
+run_opts = ort.RunOptions()
+run_opts.add_active_adapter(adapter)  # swap adapters per call, no reload
+outputs = session.run(None, {"input": x}, run_options=run_opts)
+```
+
+Calling `session.run` without an active adapter falls back to the baked
+(zero-init, or whatever `apply_lora_adapter.py --adapter-inputs` last
+applied) default -- verified end-to-end in
+`tests/test_lora.py::test_export_onnx_adapter_matches_merged_model_via_native_lora_adapter`,
+which checks this against the merged-model output bit for bit. `--adapter-
+inputs` is also available on `apply_lora_adapter.py`, for turning a
+specific trained adapter into a natively swappable base model without
+retraining. `export_onnx_adapter.py`'s tensor names only need to be
+internally consistent with the model's own graph input names (both come
+from this same toolchain); unlike Olive's own HuggingFace-oriented naming
+convention, there is no fixed scheme to match here.
 
 ### QLoRA (NF4-quantized base + LoRA)
 

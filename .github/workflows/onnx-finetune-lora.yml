@@ -8,14 +8,17 @@ name: onnx-finetune LoRA/QLoRA
 # full native build.
 #
 # lora-scripts (ubuntu-slim) covers the LoRA graph surgery itself (MatMul,
-# Gemm with any transA/transB, 1x1/group=1 Conv) with only onnx + numpy +
-# pytest installed -- no compiled onnxsim extension needed.
+# Gemm with any transA/transB, 1x1/group=1 Conv) plus export_onnx_adapter.py's
+# native ONNX Runtime .onnx_adapter export/load (onnxruntime.AdapterFormat/
+# LoraAdapter, ORT >= 1.20 -- a plain onnxruntime install, not the training-
+# enabled build generate_artifacts.py needs) with only onnx + numpy +
+# onnxruntime + pytest -- no compiled onnxsim extension needed.
 #
 # lora-scripts-with-qlora additionally builds this repo's own onnxsim wheel
 # (ONNXSIM_BUILTIN_ORT=OFF, the same wheel-build path setup.py always uses --
 # see the top-level CLAUDE.md note that this does NOT build ONNX Runtime) so
 # prepare_qlora.py's onnxsim.nf4 integration -- the part that actually needs
-# onnxsim importable -- gets exercised for real instead of always skipping.
+# onnxsim importable -- gets exercised for real too instead of always skipping.
 
 on:
   workflow_dispatch:
@@ -51,7 +54,7 @@ jobs:
         with:
           python-version: "3.11"
       - name: Install deps
-        run: pip install onnx numpy pytest
+        run: pip install onnx numpy onnxruntime pytest
       - name: pytest tools/onnx-finetune/tests
         run: pytest tools/onnx-finetune/tests -v
 
@@ -66,8 +69,8 @@ jobs:
         with:
           python-version: "3.11"
       - name: Install build + test deps
-        run: pip install nanobind pytest
+        run: pip install nanobind onnxruntime pytest
       - name: Build and install onnxsim (ONNXSIM_BUILTIN_ORT=OFF -- no ONNX Runtime build, see CLAUDE.md)
         run: pip install -e . --no-build-isolation
-      - name: pytest tools/onnx-finetune/tests (including the onnxsim.nf4 / prepare_qlora.py path)
+      - name: "pytest tools/onnx-finetune/tests (every path: LoRA surgery, native .onnx_adapter export/load, and onnxsim.nf4 / prepare_qlora.py)"
         run: pytest tools/onnx-finetune/tests -v

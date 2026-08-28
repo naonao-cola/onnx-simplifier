@@ -18,8 +18,8 @@ import struct
 
 import numpy as np
 import onnx
-import onnx.helper
 import onnx.numpy_helper
+from onnx import parser
 
 import onnxsim
 
@@ -127,19 +127,34 @@ def _make_q4_k_block(rng):
     return raw, expected
 
 
-def _vi(name, shape, dtype=onnx.TensorProto.FLOAT):
-    return onnx.helper.make_tensor_value_info(name, dtype, shape)
+def _model(body, initializer=(), opset=13, ir_version=10):
+    model = parser.parse_model(
+        f"""
+        <
+          ir_version: {ir_version},
+          opset_import: ["": {opset}]
+        >
+        {body}
+        """
+    )
+    model.graph.initializer.extend(initializer)
+    return model
 
 
 def _identity_model(name, shape):
     # A minimal single-initializer graph: Identity(W) -> Y, with W the
     # initializer import_gguf_weights should hydrate. Seeded with zeros so a
     # test failing to actually hydrate is caught (not accidentally correct).
+    dims = ",".join(str(d) for d in shape)
     weight = onnx.numpy_helper.from_array(np.zeros(shape, dtype=np.float32), name)
-    nodes = [onnx.helper.make_node("Identity", [name], ["Y"])]
-    graph = onnx.helper.make_graph(nodes, "g", [], [_vi("Y", shape)], [weight])
-    return onnx.helper.make_model(
-        graph, opset_imports=[onnx.helper.make_opsetid("", 13)], ir_version=10
+    return _model(
+        f"""
+        g () => (float[{dims}] Y)
+        {{
+          Y = Identity({name})
+        }}
+        """,
+        initializer=[weight],
     )
 
 
