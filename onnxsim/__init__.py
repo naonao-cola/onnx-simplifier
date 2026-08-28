@@ -84,6 +84,7 @@ from onnxsim.pruning import (
 from onnxsim.quip_sharp import apply_quip_sharp
 from onnxsim.smoothquant import apply_smoothquant
 from onnxsim.squeezellm import quantize_weight_only_squeezellm
+from onnxsim.tensorrt_sparsity import convert_matmul_to_gemm
 from onnxsim.transformers_export import export_transformers_model
 
 from .version import version as __version__
@@ -113,6 +114,7 @@ __all__ = [
     "apply_wanda_pruning",
     "apply_structured_pruning",
     "weight_sparsity",
+    "convert_matmul_to_gemm",
     "workaround_ort_matmul_nbits_axis0_bug",
     "quantize_attention_dynamic",
     "quantize_dynamic",
