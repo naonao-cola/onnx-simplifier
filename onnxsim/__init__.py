@@ -88,6 +88,7 @@ from onnxsim.pruning import (
 from onnxsim.quip_sharp import apply_quip_sharp
 from onnxsim.smoothquant import apply_smoothquant
 from onnxsim.spinquant import apply_spinquant
+from onnxsim.spqr import quantize_weight_only_spqr
 from onnxsim.squeezellm import quantize_weight_only_squeezellm
 from onnxsim.tensorrt_sparsity import convert_matmul_to_gemm
 from onnxsim.transformers_export import export_transformers_model
@@ -137,6 +138,7 @@ __all__ = [
     "NF4_CODEBOOK",
     "quantize_weight_only_squeezellm",
     "quantize_weight_only_aqlm",
+    "quantize_weight_only_spqr",
     "quantize_kv_cache",
     "quantize_embedding_binary",
     "quantize_embedding_int8",
