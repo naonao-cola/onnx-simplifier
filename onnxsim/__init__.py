@@ -30,6 +30,7 @@ from onnxsim.calibration import (
     quantize_static,
     quantize_static_int16,
 )
+from onnxsim.double_quantization import apply_double_quantization
 from onnxsim.embedding_quantization import (
     quantize_embedding_binary,
     quantize_embedding_int8,
@@ -141,6 +142,7 @@ __all__ = [
     "quantize_weight_only_squeezellm",
     "quantize_weight_only_aqlm",
     "quantize_weight_only_spqr",
+    "apply_double_quantization",
     "quantize_kv_cache",
     "quantize_embedding_binary",
     "quantize_embedding_int8",
