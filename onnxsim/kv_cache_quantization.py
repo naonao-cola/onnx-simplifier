@@ -27,24 +27,38 @@ freshly computed activation, concatenated along the sequence axis, feeding a
 graph output (``present_key``/``present.{i}.key``, ...) that the caller
 feeds back in as next step's ``past_*`` input.
 
-What this module does **not** reproduce: KIVI's own per-token Value
-quantization (a fresh scale per cached token, rather than one static
-per-channel scale) and its residual-window bookkeeping (the most recent
-``R`` tokens kept in full precision, only finalized into low-bit once they
-age out of that window). Per-token Value quantization would need the scale
-itself to be a second, parallel growing KV-cache stream (one scale per
-cached row, concatenated alongside the codes every step) -- a real
-increase in I/O surface this module's MVP scope skips, applying the same
-static per-channel scheme (calibrated once, shared across every cached
-token) to Value too, matching what many serving engines' plain "int8/fp8 KV
-cache" flag already does in production. KIVI's residual window is inherently
-cross-step, host-side bookkeeping -- deciding which tokens have "aged out"
-and need finalizing is not something one exported ONNX graph can express on
-its own -- and belongs in ``tools/onnx-deploy/include/onnx_deploy/kv_cache_pipeline.h``
-(which already owns exactly this kind of cross-step cache state) as a
-follow-up, not here.
+KIVI's *other* empirical finding is that Value activations don't have that
+persistent-channel structure, so a static per-channel scale is the wrong
+shape for Value -- a **fresh, per-token scale** (computed from that token's
+own values, the instant it's produced) preserves much more accuracy there
+instead. This module reproduces that too, for every matched stream whose
+``present`` output name contains ``".value"`` (matching this repo's own
+``present.{i}.decoder.value``/``present.{i}.encoder.value`` convention --
+see ``tools/onnx-deploy/scripts/make_toy_seq2seq.py``) or is named
+explicitly via ``value_output_names`` -- every other matched stream keeps
+the per-channel treatment above. Per-token quantization needs no
+calibration data at all (each token's own scale is computed from that
+token's own values, at graph-run time), but it does need the scale itself
+carried forward as a **second, parallel growing KV-cache stream**
+alongside the codes -- see the graph rewrite below. It also needs opset 18
+(``ReduceMax``'s ``axes``-as-input form, unlike ``ReduceSum``'s -- already
+opset 13 -- only arrived there; each ``Reduce*`` op moved its ``axes``
+attribute to an input on its own schedule, not all at once); a stream
+matched as Value-style below opset 18 is left completely untouched rather
+than silently downgraded to Key-style.
 
-Graph rewrite, per matched ``Concat(past, new, axis=seq)`` cache stream:
+What this module does **not** reproduce: KIVI's residual-window
+bookkeeping (the most recent ``R`` tokens kept in full precision, only
+finalized into low-bit once they age out of that window). Deciding which
+tokens have "aged out" and need finalizing is cross-step, host-side
+bookkeeping -- not something one exported ONNX graph can express on its
+own -- and belongs in
+``tools/onnx-deploy/include/onnx_deploy/kv_cache_pipeline.h`` (which
+already owns exactly this kind of cross-step cache state) as a follow-up,
+not here.
+
+Graph rewrite, per matched ``Concat(past, new, axis=seq)`` cache stream --
+**Key-style** (default; static, calibrated, per-channel):
 
     Before:
       past_key: graph input, float32 [..., seq_past, head_dim]
@@ -72,6 +86,35 @@ cost per decode step stays constant as the sequence grows, and the graph's
 own ``present_*`` output is genuinely compressed (roughly 4x smaller than
 float32) the whole way through a caller's decode loop -- not just an
 internal round-trip that still stores float32 everywhere.
+
+**Value-style** (data-free, per-token, matched by name -- see above):
+
+    Before:
+      past_value: graph input, float32 [..., seq_past, head_dim]
+      new_value:  float32 [..., seq_new, head_dim]
+      present_value = Concat(past_value, new_value, axis=seq)
+
+    After:
+      past_value: graph input, INT8 [..., seq_past, head_dim]
+      past_value_scale: graph input, float32 [..., seq_past, 1]   -- NEW input,
+        one scale per already-cached token -- threaded by
+        KvCachePipeline's existing present./past_key_values. convention
+        with no C++ changes (it stays float32, and BorrowView already
+        handled float32 before this module existed)
+      new_scale = Max(ReduceMax(Abs(new_value), axes=[-1], keepdims=1), eps) / 127
+        -- one scale per *new* token, computed fresh from that token's own
+        values, no calibration data involved
+      new_value_q = Cast(Clip(Round(new_value / new_scale), -128, 127), INT8)
+      present_value = Concat(past_value, new_value_q, axis=seq)        -- INT8
+      present_value_scale = Concat(past_value_scale, new_scale, axis=seq)  -- NEW
+        output, float32, grows in lockstep with present_value
+      present_value_f = Cast(present_value, float32) * present_value_scale
+        -- broadcasts present_value_scale's trailing size-1 axis over head_dim
+      <every other consumer of the old float present_value now reads present_value_f>
+
+Past tokens' scales are never revised once set (matching the Key-style
+scheme's "no compounding requantization error" property above) -- only
+this step's new token(s) are ever quantized, at a fresh, tailored scale.
 """
 
 from __future__ import annotations
@@ -87,6 +130,13 @@ import onnx.numpy_helper
 from onnxsim import backend
 from onnxsim.bias_correction import _add_probe_outputs, _all_names, _unique_name
 from onnxsim.calibration import Tensors, generate_random_calibration_data
+
+
+def _has_min_opset(model: onnx.ModelProto, min_version: int) -> bool:
+    return any(
+        o.domain in ("", "ai.onnx") and o.version >= min_version
+        for o in model.opset_import
+    )
 
 
 @dataclass
@@ -190,21 +240,28 @@ def quantize_kv_cache(
     num_samples: int = 8,
     seed: int = 0,
     providers: Optional[Sequence[str]] = None,
+    value_output_names: Optional[Sequence[str]] = None,
 ) -> onnx.ModelProto:
     """Quantizes every ``Concat(past, new, axis=seq)`` KV-cache stream this
     module can find (see this module's own docstring for the exact pattern
-    and graph rewrite) to INT8, symmetric, one scale per channel (the last
-    axis -- head-dim), calibrated once from representative data and shared
-    by every cached token for that stream's whole lifetime.
+    and both graph rewrites) to INT8, symmetric. Key-style streams (the
+    default) get one scale per channel (the last axis -- head-dim),
+    calibrated once from representative data and shared by every cached
+    token for that stream's whole lifetime. Value-style streams (matched by
+    name -- see ``value_output_names``) get a fresh, data-free scale per
+    token instead, computed from that token's own values the moment it's
+    produced.
 
     :param model: the original (unquantized) onnx ModelProto or file path
     :param calibration_data: representative input batches (each a
             ``{input_name: np.ndarray}`` dict matching ``model``'s graph
-            inputs) to calibrate the per-channel scale on -- see
-            :func:`onnxsim.generate_random_calibration_data` (the default
-            when omitted) and :func:`onnxsim.load_huggingface_calibration_data`
-            (real data, a more representative calibration than random
-            input). A ``past_key``/``past_key_values.*`` input with a
+            inputs) to calibrate Key-style streams' per-channel scale on --
+            see :func:`onnxsim.generate_random_calibration_data` (the
+            default when omitted) and
+            :func:`onnxsim.load_huggingface_calibration_data` (real data, a
+            more representative calibration than random input). Ignored
+            for Value-style streams, which need no calibration data at
+            all. A ``past_key``/``past_key_values.*`` input with a
             genuinely empty (statically zero) sequence-length dimension in
             ``model``'s own declared shape is filled in as an empty tensor
             by :func:`onnxsim.generate_random_calibration_data` automatically
@@ -216,20 +273,30 @@ def quantize_kv_cache(
     :param seed: seed for the random calibration data (ignored if
             ``calibration_data`` is supplied)
     :param providers: onnxruntime execution providers to calibrate on
+    :param value_output_names: which matched streams' ``present`` output
+            names get Value-style (per-token) treatment instead of the
+            default Key-style (per-channel) one -- if omitted, any matched
+            stream whose ``present`` output name contains ``".value"`` is
+            treated as Value-style automatically (matching this repo's own
+            ``present.{i}.decoder.value``/``present.{i}.encoder.value``
+            convention), every other stream gets Key-style. A stream
+            matched as Value-style is left completely untouched (not
+            downgraded to Key-style) when ``model``'s opset is below 18 --
+            see this module's own docstring
     :returns: ``model`` with every matched KV-cache stream's ``past_*``
-            graph input and ``present_*`` graph output changed to INT8, and
-            a ``QuantizeLinear``/``DequantizeLinear`` pair inserted around
-            it (see the module docstring's diagram); a model with no
+            graph input and ``present_*`` graph output changed to INT8
+            (Value-style streams additionally gain a new
+            ``past_*_scale``/``present_*_scale`` float32 input/output
+            pair -- see the module docstring's diagram); a model with no
             matching Concat pattern, or an opset older than 13
-            (``QuantizeLinear``/``DequantizeLinear``'s per-channel ``axis``
-            needs opset 13), is returned unchanged
+            (``QuantizeLinear``/``DequantizeLinear``'s per-channel ``axis``,
+            and ``ReduceMax``'s ``axes``-as-input, both need opset 13), is
+            returned unchanged
     """
     if isinstance(model, str):
         model = onnx.load(model, load_external_data=False)
 
-    if not any(
-        o.domain in ("", "ai.onnx") and o.version >= 13 for o in model.opset_import
-    ):
+    if not _has_min_opset(model, 13):
         return model
 
     out = onnx.ModelProto()
@@ -240,89 +307,279 @@ def quantize_kv_cache(
     if not candidates:
         return out
 
-    if calibration_data is None:
-        calibration_data = generate_random_calibration_data(
-            model, num_samples=num_samples, seed=seed
+    # Value-style needs ReduceMax's axes-as-input form, which (unlike
+    # ReduceSum's, already opset13) only arrived at opset 18 -- each
+    # Reduce* op moved its axes attribute to an input on its own schedule,
+    # not all together at opset13. A stream matched as Value-style below
+    # opset 18 is left completely untouched (not silently downgraded to
+    # Key-style) rather than guessing.
+    has_opset18 = _has_min_opset(model, 18)
+
+    value_candidates = []
+    channel_candidates = []
+    for c in candidates:
+        if _is_value_style(c.present_name, value_output_names):
+            if has_opset18:
+                value_candidates.append(c)
+            # else: leave this stream untouched -- see comment above.
+        else:
+            channel_candidates.append(c)
+
+    absmax: Dict[str, np.ndarray] = {}
+    if channel_candidates:
+        if calibration_data is None:
+            calibration_data = generate_random_calibration_data(
+                model, num_samples=num_samples, seed=seed
+            )
+        absmax = _per_channel_absmax(
+            channel_candidates, model, calibration_data, providers
         )
 
-    absmax = _per_channel_absmax(candidates, model, calibration_data, providers)
     taken_names: Set[str] = _all_names(graph)
     input_by_name = {i.name: i for i in graph.input}
     output_by_name = {o.name: o for o in graph.output}
 
-    for c in candidates:
+    for c in channel_candidates:
         if c.new_name not in absmax:
             continue  # this stream's activation never appeared in any batch
-        channel_absmax = np.maximum(absmax[c.new_name], 1e-12)
-        scale = (channel_absmax / 127.0).astype(np.float32)
-        num_channels = scale.shape[0]
-
-        scale_name = _unique_name(f"{c.present_name}_kv_scale", taken_names)
-        zp_name = _unique_name(f"{c.present_name}_kv_zero_point", taken_names)
-        graph.initializer.append(onnx.numpy_helper.from_array(scale, name=scale_name))
-        zp = np.zeros(num_channels, dtype=np.int8)
-        graph.initializer.append(onnx.numpy_helper.from_array(zp, name=zp_name))
-
-        # past_key/past_key_values.*: FLOAT -> INT8 (same shape).
-        past_input = input_by_name[c.past_name]
-        past_input.type.tensor_type.elem_type = onnx.TensorProto.INT8
-
-        # new_key_q = QuantizeLinear(new_key, scale, zero_point, axis=channel_axis)
-        new_q_name = _unique_name(f"{c.new_name}_kv_q", taken_names)
-        quantize_node = onnx.helper.make_node(
-            "QuantizeLinear",
-            [c.new_name, scale_name, zp_name],
-            [new_q_name],
-            name=_unique_name(f"{c.new_name}_kv_quantize_node", taken_names),
-            axis=c.channel_axis,
+        _apply_channel_style(
+            graph, c, absmax[c.new_name], taken_names, input_by_name, output_by_name
         )
 
-        # Rewire Concat's "new" input to the now-quantized tensor; the
-        # "past" input already reads the (now INT8) graph input as-is, so
-        # Concat's own output is INT8 -- exactly present_key's new dtype.
-        if c.new_is_first_input:
-            c.concat_node.input[0] = new_q_name
-        else:
-            c.concat_node.input[1] = new_q_name
-
-        present_output = output_by_name[c.present_name]
-        present_output.type.tensor_type.elem_type = onnx.TensorProto.INT8
-
-        # present_key_f = DequantizeLinear(present_key, scale, zero_point,
-        # axis=channel_axis) -- every *node* consumer of the old float
-        # present_key (the attention math) is rewired to this; the graph
-        # output binding itself is untouched, so it keeps resolving to
-        # Concat's own (now INT8) output tensor by name, unchanged.
-        dequant_name = _unique_name(f"{c.present_name}_kv_f", taken_names)
-        dequant_node = onnx.helper.make_node(
-            "DequantizeLinear",
-            [c.present_name, scale_name, zp_name],
-            [dequant_name],
-            name=_unique_name(f"{c.present_name}_kv_dequantize_node", taken_names),
-            axis=c.channel_axis,
-        )
-
-        # Rewire every *existing* consumer of present_name (everything
-        # except Concat itself) to the dequantized tensor now, before
-        # quantize_node/dequant_node are inserted below -- graph.node is a
-        # protobuf repeated field, and RepeatedCompositeFieldContainer.insert()
-        # copies the given message into a freshly allocated element rather
-        # than storing the object itself, so an `is quantize_node`/
-        # `is dequant_node` identity check taken *after* inserting them would
-        # never match anything actually in the container (silently leaving
-        # them out of the loop's exclusion and making dequant_node consume
-        # its own output). Doing the rewiring first sidesteps that: neither
-        # new node exists in graph.node yet, so there is nothing to
-        # incorrectly self-reference.
-        for node in graph.node:
-            if node is c.concat_node:
-                continue
-            for i, inp in enumerate(node.input):
-                if inp == c.present_name:
-                    node.input[i] = dequant_name
-
-        concat_idx = next(i for i, n in enumerate(graph.node) if n is c.concat_node)
-        graph.node.insert(concat_idx, quantize_node)
-        graph.node.insert(concat_idx + 2, dequant_node)
+    for c in value_candidates:
+        _apply_value_style(graph, c, taken_names, input_by_name, output_by_name)
 
     return out
+
+
+def _is_value_style(
+    present_name: str, value_output_names: Optional[Sequence[str]]
+) -> bool:
+    if value_output_names is not None:
+        return present_name in value_output_names
+    return ".value" in present_name
+
+
+def _rewire_consumers(
+    graph: onnx.GraphProto, c: _KvCacheCandidate, dequant_name: str
+) -> None:
+    # Must run *before* any new node referencing c.present_name is
+    # inserted into graph.node: RepeatedCompositeFieldContainer.insert()
+    # copies the given message into a freshly allocated element rather
+    # than storing the object itself, so an `is`-based identity check
+    # taken afterward would never match anything actually in the
+    # container (silently leaving a just-inserted node out of the
+    # exclusion below and making it consume its own output). Running this
+    # first sidesteps that: none of the new nodes exist in graph.node yet,
+    # so there is nothing to incorrectly self-reference.
+    for node in graph.node:
+        if node is c.concat_node:
+            continue
+        for i, inp in enumerate(node.input):
+            if inp == c.present_name:
+                node.input[i] = dequant_name
+
+
+def _apply_channel_style(
+    graph: onnx.GraphProto,
+    c: _KvCacheCandidate,
+    channel_absmax: np.ndarray,
+    taken_names: Set[str],
+    input_by_name: Dict[str, onnx.ValueInfoProto],
+    output_by_name: Dict[str, onnx.ValueInfoProto],
+) -> None:
+    """Static, calibrated, per-channel (Key-style) rewrite -- see the
+    module docstring's diagram.
+    """
+    scale = (np.maximum(channel_absmax, 1e-12) / 127.0).astype(np.float32)
+    num_channels = scale.shape[0]
+
+    scale_name = _unique_name(f"{c.present_name}_kv_scale", taken_names)
+    zp_name = _unique_name(f"{c.present_name}_kv_zero_point", taken_names)
+    graph.initializer.append(onnx.numpy_helper.from_array(scale, name=scale_name))
+    zp = np.zeros(num_channels, dtype=np.int8)
+    graph.initializer.append(onnx.numpy_helper.from_array(zp, name=zp_name))
+
+    # past_key/past_key_values.*: FLOAT -> INT8 (same shape).
+    past_input = input_by_name[c.past_name]
+    past_input.type.tensor_type.elem_type = onnx.TensorProto.INT8
+
+    # new_key_q = QuantizeLinear(new_key, scale, zero_point, axis=channel_axis)
+    new_q_name = _unique_name(f"{c.new_name}_kv_q", taken_names)
+    quantize_node = onnx.helper.make_node(
+        "QuantizeLinear",
+        [c.new_name, scale_name, zp_name],
+        [new_q_name],
+        name=_unique_name(f"{c.new_name}_kv_quantize_node", taken_names),
+        axis=c.channel_axis,
+    )
+
+    # Rewire Concat's "new" input to the now-quantized tensor; the "past"
+    # input already reads the (now INT8) graph input as-is, so Concat's
+    # own output is INT8 -- exactly present_key's new dtype.
+    if c.new_is_first_input:
+        c.concat_node.input[0] = new_q_name
+    else:
+        c.concat_node.input[1] = new_q_name
+
+    present_output = output_by_name[c.present_name]
+    present_output.type.tensor_type.elem_type = onnx.TensorProto.INT8
+
+    # present_key_f = DequantizeLinear(present_key, scale, zero_point,
+    # axis=channel_axis) -- every *node* consumer of the old float
+    # present_key (the attention math) is rewired to this; the graph
+    # output binding itself is untouched, so it keeps resolving to
+    # Concat's own (now INT8) output tensor by name, unchanged.
+    dequant_name = _unique_name(f"{c.present_name}_kv_f", taken_names)
+    dequant_node = onnx.helper.make_node(
+        "DequantizeLinear",
+        [c.present_name, scale_name, zp_name],
+        [dequant_name],
+        name=_unique_name(f"{c.present_name}_kv_dequantize_node", taken_names),
+        axis=c.channel_axis,
+    )
+
+    _rewire_consumers(graph, c, dequant_name)
+
+    concat_idx = next(i for i, n in enumerate(graph.node) if n is c.concat_node)
+    graph.node.insert(concat_idx, quantize_node)
+    graph.node.insert(concat_idx + 2, dequant_node)
+
+
+def _apply_value_style(
+    graph: onnx.GraphProto,
+    c: _KvCacheCandidate,
+    taken_names: Set[str],
+    input_by_name: Dict[str, onnx.ValueInfoProto],
+    output_by_name: Dict[str, onnx.ValueInfoProto],
+) -> None:
+    """Data-free, per-token (Value-style) rewrite -- see the module
+    docstring's diagram. Needs no calibration: each new token's own scale
+    is computed from that token's own values, at graph-run time.
+    """
+    prefix = f"{c.present_name}_kv"
+    past_input = input_by_name[c.past_name]
+    present_output = output_by_name[c.present_name]
+    past_rank = len(past_input.type.tensor_type.shape.dim)
+
+    # New past_*_scale graph input: same rank/leading dims as past_* (read
+    # before past_input's own dtype is mutated below), channel axis forced
+    # to size 1 -- one scale per already-cached token, broadcasting over
+    # head_dim. Picked up by KvCachePipeline's existing
+    # present./past_key_values. string-substitution convention with no
+    # C++ changes needed -- it stays float32, already handled.
+    past_scale_name = _unique_name(f"{c.past_name}_scale", taken_names)
+    past_scale_input = onnx.ValueInfoProto()
+    past_scale_input.name = past_scale_name
+    past_scale_input.type.tensor_type.elem_type = onnx.TensorProto.FLOAT
+    for i, d in enumerate(past_input.type.tensor_type.shape.dim):
+        new_dim = past_scale_input.type.tensor_type.shape.dim.add()
+        if i == c.channel_axis:
+            new_dim.dim_value = 1
+        elif d.HasField("dim_value"):
+            new_dim.dim_value = d.dim_value
+        elif d.HasField("dim_param"):
+            new_dim.dim_param = d.dim_param
+    graph.input.append(past_scale_input)
+
+    past_input.type.tensor_type.elem_type = onnx.TensorProto.INT8
+
+    eps_name = _unique_name(f"{prefix}_eps", taken_names)
+    graph.initializer.append(
+        onnx.numpy_helper.from_array(np.array(1e-12, dtype=np.float32), name=eps_name)
+    )
+    div127_name = _unique_name(f"{prefix}_127", taken_names)
+    graph.initializer.append(
+        onnx.numpy_helper.from_array(
+            np.array(127.0, dtype=np.float32), name=div127_name
+        )
+    )
+    clip_min_name = _unique_name(f"{prefix}_clip_min", taken_names)
+    graph.initializer.append(
+        onnx.numpy_helper.from_array(
+            np.array(-128.0, dtype=np.float32), name=clip_min_name
+        )
+    )
+    clip_max_name = _unique_name(f"{prefix}_clip_max", taken_names)
+    graph.initializer.append(
+        onnx.numpy_helper.from_array(
+            np.array(127.0, dtype=np.float32), name=clip_max_name
+        )
+    )
+    axes_name = _unique_name(f"{prefix}_reduce_axes", taken_names)
+    graph.initializer.append(
+        onnx.numpy_helper.from_array(
+            np.array([c.channel_axis], dtype=np.int64), name=axes_name
+        )
+    )
+
+    # new_scale = max(reduce_max(abs(new_value), axis=channel_axis), eps) / 127
+    abs_name = _unique_name(f"{prefix}_abs", taken_names)
+    max_name = _unique_name(f"{prefix}_max", taken_names)
+    safe_max_name = _unique_name(f"{prefix}_safe_max", taken_names)
+    new_scale_name = _unique_name(f"{prefix}_new_scale", taken_names)
+    # new_value_q = cast(clip(round(new_value / new_scale), -128, 127), INT8)
+    scaled_name = _unique_name(f"{prefix}_scaled", taken_names)
+    rounded_name = _unique_name(f"{prefix}_rounded", taken_names)
+    clipped_name = _unique_name(f"{prefix}_clipped", taken_names)
+    new_q_name = _unique_name(f"{c.new_name}_kv_q", taken_names)
+
+    pre_nodes = [
+        onnx.helper.make_node("Abs", [c.new_name], [abs_name]),
+        onnx.helper.make_node(
+            "ReduceMax", [abs_name, axes_name], [max_name], keepdims=1
+        ),
+        onnx.helper.make_node("Clip", [max_name, eps_name], [safe_max_name]),
+        onnx.helper.make_node("Div", [safe_max_name, div127_name], [new_scale_name]),
+        onnx.helper.make_node("Div", [c.new_name, new_scale_name], [scaled_name]),
+        onnx.helper.make_node("Round", [scaled_name], [rounded_name]),
+        onnx.helper.make_node(
+            "Clip", [rounded_name, clip_min_name, clip_max_name], [clipped_name]
+        ),
+        onnx.helper.make_node(
+            "Cast", [clipped_name], [new_q_name], to=onnx.TensorProto.INT8
+        ),
+    ]
+
+    if c.new_is_first_input:
+        c.concat_node.input[0] = new_q_name
+    else:
+        c.concat_node.input[1] = new_q_name
+    present_output.type.tensor_type.elem_type = onnx.TensorProto.INT8
+
+    # present_*_scale: NEW graph output, grows in lockstep with present_*
+    # itself (same seq_axis Concat, same two operands' relative order).
+    present_scale_name = _unique_name(f"{c.present_name}_scale", taken_names)
+    present_scale_output = onnx.ValueInfoProto()
+    present_scale_output.name = present_scale_name
+    present_scale_output.type.tensor_type.elem_type = onnx.TensorProto.FLOAT
+    for _ in range(past_rank):
+        present_scale_output.type.tensor_type.shape.dim.add()
+    present_scale_output.type.tensor_type.shape.dim[c.channel_axis].dim_value = 1
+    graph.output.append(present_scale_output)
+
+    present_f32_name = _unique_name(f"{prefix}_present_f32", taken_names)
+    dequant_name = _unique_name(f"{c.present_name}_kv_f", taken_names)
+    post_nodes = [
+        onnx.helper.make_node(
+            "Concat",
+            [past_scale_name, new_scale_name],
+            [present_scale_name],
+            name=_unique_name(f"{prefix}_concat_scale_node", taken_names),
+            axis=c.seq_axis,
+        ),
+        onnx.helper.make_node(
+            "Cast", [c.present_name], [present_f32_name], to=onnx.TensorProto.FLOAT
+        ),
+        onnx.helper.make_node(
+            "Mul", [present_f32_name, present_scale_name], [dequant_name]
+        ),
+    ]
+
+    _rewire_consumers(graph, c, dequant_name)
+
+    concat_idx = next(i for i, n in enumerate(graph.node) if n is c.concat_node)
+    for offset, node in enumerate(pre_nodes):
+        graph.node.insert(concat_idx + offset, node)
+    for offset, node in enumerate(post_nodes):
+        graph.node.insert(concat_idx + len(pre_nodes) + 1 + offset, node)

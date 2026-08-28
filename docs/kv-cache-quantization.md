@@ -9,9 +9,16 @@ sequence axis, feeding a graph output (`present_key`/`present.{i}.key`,
 ...) that a caller feeds back in as next step's `past_*` input, exactly the
 shape `tools/onnx-deploy`'s own `KvCachePipeline` and
 `tests/test_symexpr_kv_cache_consistency.py`'s toy model both use -- and
-quantizes it to INT8, symmetric, one scale per channel (the head-dim axis),
-calibrated once from representative data and shared by every cached token
-for that stream's whole lifetime.
+quantizes it to INT8, symmetric, in one of two ways depending on the
+stream:
+
+- **Key-style** (the default): one scale per channel (the head-dim axis),
+  calibrated once from representative data and shared by every cached
+  token for that stream's whole lifetime.
+- **Value-style** (matched by name, or via `value_output_names`): a fresh,
+  data-free scale per *token*, computed from that token's own values the
+  instant it's produced, carried forward as a second growing KV-cache
+  stream alongside the codes.
 
 Every other quantizer in onnxsim compresses a **weight**: something
 computed once, offline, before the model ever runs. A KV cache is the
@@ -21,13 +28,13 @@ exactly why it is worth quantizing at all: it is the part of an LLM's
 memory footprint that scales with sequence length, unlike the weights.
 
 ```
-Before:
+Key-style, before:
   past_key: graph input, float32 [..., seq_past, head_dim]
   new_key:  float32 [..., seq_new, head_dim]         -- this step's own K/V
   present_key = Concat(past_key, new_key, axis=seq)  -- graph output,
                 and consumed by the attention math (QK^T / softmax@V)
 
-After:
+Key-style, after:
   past_key: graph input, INT8 [..., seq_past, head_dim]    -- dtype changed
   key_scale: initializer, float32 [head_dim]                 -- per-channel
   key_zero_point: initializer, INT8 [head_dim], all zero     -- symmetric
@@ -49,6 +56,34 @@ decode step stays constant as the sequence grows, and the graph's own
 float32) the whole way through a caller's decode loop -- not just an
 internal round-trip that still stores float32 everywhere.
 
+Value-style streams (matched by a `present` output name containing
+`".value"`, or listed explicitly via `value_output_names`) get a different
+rewrite -- no calibration, but a second parallel scale stream:
+
+```
+Value-style, after:
+  past_value: graph input, INT8 [..., seq_past, head_dim]
+  past_value_scale: graph input, float32 [..., seq_past, 1]   -- NEW input,
+    one scale per already-cached token
+  new_scale = max(reduce_max(abs(new_value), axis=head_dim), eps) / 127
+    -- one scale per new token, computed fresh from that token's own
+    values, no calibration data involved
+  new_value_q = cast(clip(round(new_value / new_scale), -128, 127), INT8)
+  present_value = Concat(past_value, new_value_q, axis=seq)          -- INT8
+  present_value_scale = Concat(past_value_scale, new_scale, axis=seq) -- NEW
+    output, float32, grows in lockstep with present_value
+  present_value_f = cast(present_value, float32) * present_value_scale
+  <every other consumer of the old float present_value now reads present_value_f>
+```
+
+Past tokens' scales are never revised once set (the same "no compounding
+requantization error" property as Key-style above) -- only this step's new
+token is ever quantized, at a scale tailored to it specifically. The new
+`past_value_scale`/`present_value_scale` pair is picked up by
+`KvCachePipeline`'s existing `present.`/`past_key_values.`
+string-substitution convention automatically, with no C++ changes needed
+(it's float32, a dtype `detail::BorrowView` already handled).
+
 ## Where this comes from
 
 Two published techniques quantize the KV cache well: **KIVI** (Liu et al.,
@@ -57,20 +92,17 @@ al., NeurIPS 2024, <https://arxiv.org/abs/2401.18079>). Both share the same
 core empirical finding: Key activations have a handful of channels with
 persistently large magnitude across the *whole* sequence, so quantizing Key
 **per channel** (one scale shared by every cached token) preserves far more
-accuracy than quantizing it per token. `quantize_kv_cache` reproduces that
-part of both papers.
+accuracy than quantizing it per token. `quantize_kv_cache`'s Key-style
+rewrite reproduces that part of both papers.
+
+KIVI's other empirical finding -- Value activations *don't* have that
+persistent-channel structure, so a **per-token** scale preserves more
+accuracy there instead -- is reproduced by `quantize_kv_cache`'s
+Value-style rewrite (matched automatically by name, or via
+`value_output_names`; needs opset 18, see Scope below).
 
 What it does **not** reproduce:
 
-- **KIVI's per-token Value quantization** (a fresh scale per cached token,
-  rather than one static per-channel scale). Per-token quantization would
-  need the scale itself to be a second, parallel growing KV-cache stream
-  (one scale per cached row, concatenated alongside the codes every step) --
-  a real increase in I/O surface this module's MVP scope skips, applying
-  the same static per-channel scheme to Value too. This matches what many
-  serving engines' plain "int8/fp8 KV cache" flag already does in
-  production, even though it is a documented simplification relative to
-  KIVI's own per-token scheme for Value specifically.
 - **KIVI's residual-window bookkeeping** (the most recent `R` tokens kept
   in full precision, only finalized into low-bit once they age out of that
   window). Deciding which tokens have "aged out" and need finalizing is
@@ -95,7 +127,10 @@ Handled:
   matches `past_key`/`present_key` as well as `optimum-onnx`'s own
   `past_key_values.{i}.key`/`present.{i}.key` convention.
 - Opsets >= 13 (`QuantizeLinear`/`DequantizeLinear`'s per-channel `axis`
-  needs opset 13).
+  needs opset 13) for Key-style streams; opsets >= 18
+  (`ReduceMax`'s `axes`-as-input form) for Value-style streams -- each
+  `Reduce*` op moved its `axes` attribute to an input on its own schedule,
+  not all at opset 13 the way `ReduceSum` did.
 
 Left untouched (safe no-op, node passes through as-is):
 
@@ -104,6 +139,8 @@ Left untouched (safe no-op, node passes through as-is):
 - A Concat whose axis *is* the last (channel) axis -- no distinct axis is
   left to quantize per-channel on.
 - A model with no matching Concat pattern, or an opset older than 13.
+- A stream matched as Value-style, when the model's opset is below 18 --
+  left completely untouched (not silently downgraded to Key-style).
 
 ## Usage
 
@@ -112,6 +149,10 @@ import onnx
 import onnxsim
 
 model = onnx.load("decoder_with_past_model.onnx")
+# Key-style (calibrated, per-channel) by default; any matched stream whose
+# present output name contains ".value" automatically gets Value-style
+# (data-free, per-token) treatment instead -- see value_output_names to
+# name streams explicitly.
 quantized = onnxsim.quantize_kv_cache(model, num_samples=32)
 onnx.save(quantized, "decoder_with_past_model.kv_int8.onnx")
 ```
