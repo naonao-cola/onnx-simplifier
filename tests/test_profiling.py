@@ -13,10 +13,24 @@ import os
 import numpy as np
 import onnx
 import pytest
-from onnx import TensorProto, helper, numpy_helper
+from onnx import numpy_helper, parser
 
 import onnxsim
 from onnxsim import backend
+
+
+def _model(body, initializer=(), opset=17, ir_version=10):
+    model = parser.parse_model(
+        f"""
+        <
+          ir_version: {ir_version},
+          opset_import: ["": {opset}]
+        >
+        {body}
+        """
+    )
+    model.graph.initializer.extend(initializer)
+    return model
 
 
 def _foldable_model() -> onnx.ModelProto:
@@ -24,12 +38,16 @@ def _foldable_model() -> onnx.ModelProto:
     real simplification round runs (shape inference + optimizer + folding)."""
     a = numpy_helper.from_array(np.ones((1, 4), dtype=np.float32), name="A")
     b = numpy_helper.from_array(np.full((1, 4), 2.0, dtype=np.float32), name="B")
-    add_const = helper.make_node("Add", ["A", "B"], ["c"], name="add_const")
-    add_x = helper.make_node("Add", ["c", "x"], ["y"], name="add_x")
-    x = helper.make_tensor_value_info("x", TensorProto.FLOAT, [1, 4])
-    y = helper.make_tensor_value_info("y", TensorProto.FLOAT, [1, 4])
-    graph = helper.make_graph([add_const, add_x], "g", [x], [y], [a, b])
-    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 17)])
+    model = _model(
+        """
+        g (float[1,4] x) => (float[1,4] y)
+        {
+          c = Add(A, B)
+          y = Add(c, x)
+        }
+        """,
+        initializer=[a, b],
+    )
     onnx.checker.check_model(model)
     return model
 
