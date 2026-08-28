@@ -85,6 +85,7 @@ from onnxsim.pruning import (
     apply_wanda_pruning,
     weight_sparsity,
 )
+from onnxsim.quarot import apply_quarot
 from onnxsim.quip_sharp import apply_quip_sharp
 from onnxsim.smoothquant import apply_smoothquant
 from onnxsim.spinquant import apply_spinquant
@@ -115,6 +116,7 @@ __all__ = [
     "apply_llm_int8",
     "apply_low_rank_compensation",
     "apply_quip_sharp",
+    "apply_quarot",
     "apply_spinquant",
     "apply_omniquant",
     "apply_magnitude_pruning",
