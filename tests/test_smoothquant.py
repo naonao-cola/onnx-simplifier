@@ -8,37 +8,45 @@ ahead of a separate W8A8 quantizer.
 
 import numpy as np
 import onnx
-import onnx.helper
 import onnx.numpy_helper
 import pytest
+from onnx import parser
 
 import onnxsim
 
 ort = pytest.importorskip("onnxruntime")
 
 
-def _vi(name, shape):
-    return onnx.helper.make_tensor_value_info(name, onnx.TensorProto.FLOAT, shape)
-
-
 def _f32(array, name):
     return onnx.numpy_helper.from_array(array.astype(np.float32), name)
 
 
-def _model(nodes, inputs, outputs, initializer, opset=13):
-    graph = onnx.helper.make_graph(nodes, "g", inputs, outputs, initializer)
-    return onnx.helper.make_model(
-        graph, opset_imports=[onnx.helper.make_opsetid("", opset)], ir_version=8
+def _model(body, initializer=(), opset=13, ir_version=8):
+    model = parser.parse_model(
+        f"""
+        <
+          ir_version: {ir_version},
+          opset_import: ["": {opset}]
+        >
+        {body}
+        """
     )
+    model.graph.initializer.extend(initializer)
+    return model
 
 
 def _matmul_model(K=64, N=16, weight=None, seed=0):
     if weight is None:
         rng = np.random.default_rng(seed)
         weight = rng.standard_normal((K, N)).astype(np.float32) * 0.5
-    nodes = [onnx.helper.make_node("MatMul", ["X", "W"], ["Y"])]
     return _model(
-        nodes, [_vi("X", ["batch", K])], [_vi("Y", ["batch", N])], [_f32(weight, "W")]
+        f"""
+        g (float[batch,{K}] X) => (float[batch,{N}] Y)
+        {{
+          Y = MatMul(X, W)
+        }}
+        """,
+        initializer=[_f32(weight, "W")],
     )
 
 
@@ -163,9 +171,14 @@ def test_smoothquant_gemm_transb():
     rng = np.random.default_rng(8)
     K, N = 96, 12
     weight = rng.standard_normal((N, K)).astype(np.float32) * 0.5
-    nodes = [onnx.helper.make_node("Gemm", ["X", "W"], ["Y"], transB=1)]
     model = _model(
-        nodes, [_vi("X", ["batch", K])], [_vi("Y", ["batch", N])], [_f32(weight, "W")]
+        f"""
+        g (float[batch,{K}] X) => (float[batch,{N}] Y)
+        {{
+          Y = Gemm<transB = 1>(X, W)
+        }}
+        """,
+        initializer=[_f32(weight, "W")],
     )
     x = _outlier_channel_calibration(
         K=K, num_samples=32, outlier_channels=(10, 50), seed=9
@@ -181,8 +194,14 @@ def test_smoothquant_gemm_transb():
 
 
 def test_smoothquant_noop_when_no_matmul_present():
-    nodes = [onnx.helper.make_node("Relu", ["X"], ["Y"])]
-    model = _model(nodes, [_vi("X", [4, 4])], [_vi("Y", [4, 4])], [])
+    model = _model(
+        """
+        g (float[4,4] X) => (float[4,4] Y)
+        {
+          Y = Relu(X)
+        }
+        """
+    )
     result = onnxsim.apply_smoothquant(
         model, calibration_data=[{"X": np.zeros((4, 4), dtype=np.float32)}]
     )
@@ -190,9 +209,13 @@ def test_smoothquant_noop_when_no_matmul_present():
 
 
 def test_smoothquant_skips_non_constant_weight():
-    nodes = [onnx.helper.make_node("MatMul", ["X", "W"], ["Y"])]
     model = _model(
-        nodes, [_vi("X", [4, 64]), _vi("W", [64, 4])], [_vi("Y", [4, 4])], []
+        """
+        g (float[4,64] X, float[64,4] W) => (float[4,4] Y)
+        {
+          Y = MatMul(X, W)
+        }
+        """
     )
     result = onnxsim.apply_smoothquant(
         model, calibration_data=[{"X": np.zeros((4, 64), dtype=np.float32)}]
@@ -207,12 +230,14 @@ def test_smoothquant_skips_non_2d_activation():
     K, N = 16, 8
     rng = np.random.default_rng(10)
     weight = rng.standard_normal((K, N)).astype(np.float32)
-    nodes = [onnx.helper.make_node("MatMul", ["X", "W"], ["Y"])]
     model = _model(
-        nodes,
-        [_vi("X", ["batch", "seq", K])],
-        [_vi("Y", ["batch", "seq", N])],
-        [_f32(weight, "W")],
+        f"""
+        g (float[batch,seq,{K}] X) => (float[batch,seq,{N}] Y)
+        {{
+          Y = MatMul(X, W)
+        }}
+        """,
+        initializer=[_f32(weight, "W")],
     )
     x = rng.standard_normal((2, 3, K)).astype(np.float32)
     result = onnxsim.apply_smoothquant(model, calibration_data=[{"X": x}])

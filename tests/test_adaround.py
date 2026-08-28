@@ -7,24 +7,27 @@ layer's real reconstruction error, instead of the round-to-nearest every
 
 import numpy as np
 import onnx
-import onnx.helper
 import onnx.numpy_helper
 import pytest
+from onnx import parser
 
 import onnxsim
 
 ort = pytest.importorskip("onnxruntime")
 
 
-def _model(nodes, inputs, outputs, initializer, opset=21):
-    graph = onnx.helper.make_graph(nodes, "g", inputs, outputs, initializer)
-    return onnx.helper.make_model(
-        graph, opset_imports=[onnx.helper.make_opsetid("", opset)], ir_version=10
+def _model(body, initializer=(), opset=21, ir_version=10):
+    model = parser.parse_model(
+        f"""
+        <
+          ir_version: {ir_version},
+          opset_import: ["": {opset}]
+        >
+        {body}
+        """
     )
-
-
-def _vi(name, shape):
-    return onnx.helper.make_tensor_value_info(name, onnx.TensorProto.FLOAT, shape)
+    model.graph.initializer.extend(initializer)
+    return model
 
 
 def _f32(array, name):
@@ -47,11 +50,13 @@ def _rel_l2(a, b):
 def _matmul_matmul_int4_models(K=64, N=16, batch=4, seed=0, opset=21):
     rng = np.random.default_rng(seed)
     weight = rng.standard_normal((K, N)).astype(np.float32) * 0.5
-    nodes = [onnx.helper.make_node("MatMul", ["X", "W"], ["Y"])]
     float_model = _model(
-        nodes,
-        [_vi("X", [batch, K])],
-        [_vi("Y", [batch, N])],
+        f"""
+        g (float[{batch},{K}] X) => (float[{batch},{N}] Y)
+        {{
+          Y = MatMul(X, W)
+        }}
+        """,
         [_f32(weight, "W")],
         opset=opset,
     )
@@ -200,11 +205,13 @@ def test_adaround_gemm_transb_with_bias():
     K, N = 96, 12
     weight = rng.standard_normal((N, K)).astype(np.float32) * 0.5
     bias = rng.standard_normal(N).astype(np.float32)
-    nodes = [onnx.helper.make_node("Gemm", ["X", "W", "B"], ["Y"], transB=1)]
     float_model = _model(
-        nodes,
-        [_vi("X", [8, K])],
-        [_vi("Y", [8, N])],
+        f"""
+        g (float[8,{K}] X) => (float[8,{N}] Y)
+        {{
+          Y = Gemm<transB = 1>(X, W, B)
+        }}
+        """,
         [_f32(weight, "W"), _f32(bias, "B")],
     )
     quant_model = onnxsim.quantize_weight_only_int4(float_model)
@@ -224,8 +231,14 @@ def test_adaround_gemm_transb_with_bias():
 
 
 def test_adaround_noop_when_no_int4_matmul_present():
-    nodes = [onnx.helper.make_node("Relu", ["X"], ["Y"])]
-    model = _model(nodes, [_vi("X", [4, 4])], [_vi("Y", [4, 4])], [])
+    model = _model(
+        """
+        g (float[4,4] X) => (float[4,4] Y)
+        {
+          Y = Relu(X)
+        }
+        """
+    )
     result = onnxsim.apply_adaround(
         model, model, calibration_data=[{"X": np.zeros((4, 4), dtype=np.float32)}]
     )

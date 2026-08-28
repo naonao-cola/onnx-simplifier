@@ -12,19 +12,23 @@ import collections
 import numpy as np
 import onnx
 import pytest
+from onnx import parser
 
 import onnxsim
 
 
-def _model(nodes, inputs, outputs, initializer, opset=13):
-    graph = onnx.helper.make_graph(nodes, "g", inputs, outputs, initializer)
-    return onnx.helper.make_model(
-        graph, opset_imports=[onnx.helper.make_opsetid("", opset)], ir_version=10
+def _model(body, initializer=(), opset=13, ir_version=10):
+    model = parser.parse_model(
+        f"""
+        <
+          ir_version: {ir_version},
+          opset_import: ["": {opset}]
+        >
+        {body}
+        """
     )
-
-
-def _vi(name, shape):
-    return onnx.helper.make_tensor_value_info(name, onnx.TensorProto.FLOAT, shape)
+    model.graph.initializer.extend(initializer)
+    return model
 
 
 def _f32(array, name):
@@ -33,19 +37,26 @@ def _f32(array, name):
 
 def _matmul_add_model():
     """x @ W + B, i.e. a MatMul feeding an Add -- the classic Gemm fusion."""
-    nodes = [
-        onnx.helper.make_node("MatMul", ["x", "W"], ["mm"], name="mm"),
-        onnx.helper.make_node("Add", ["mm", "B"], ["y"], name="add"),
-    ]
-    inits = [
-        _f32(np.random.randn(4, 5), "W"),
-        _f32(np.random.randn(5), "B"),
-    ]
     return _model(
-        nodes,
-        [_vi("x", [3, 4])],
-        [_vi("y", [3, 5])],
-        inits,
+        """
+        g (float[3,4] x) => (float[3,5] y)
+        {
+          mm = MatMul(x, W)
+          y = Add(mm, B)
+        }
+        """,
+        initializer=[_f32(np.random.randn(4, 5), "W"), _f32(np.random.randn(5), "B")],
+    )
+
+
+def _relu_model():
+    return _model(
+        """
+        g (float[2,2] x) => (float[2,2] y)
+        {
+          y = Relu(x)
+        }
+        """
     )
 
 
@@ -60,12 +71,7 @@ def test_custom_rewriter_runs_and_rewrites():
     elementwise op valid in opset 13, so the rewritten model stays schema-valid
     (unlike, say, Gelu, which is only registered from opset 20).
     """
-    model = _model(
-        [onnx.helper.make_node("Relu", ["x"], ["y"], name="r")],
-        [_vi("x", [2, 2])],
-        [_vi("y", [2, 2])],
-        [],
-    )
+    model = _relu_model()
 
     def rewrite(m: onnx.ModelProto) -> onnx.ModelProto:
         for node in m.graph.node:
@@ -80,12 +86,7 @@ def test_custom_rewriter_runs_and_rewrites():
 
 def test_custom_rewriter_in_place_none_return():
     """A rewriter that mutates in place and returns ``None`` is supported."""
-    model = _model(
-        [onnx.helper.make_node("Relu", ["x"], ["y"], name="r")],
-        [_vi("x", [2, 2])],
-        [_vi("y", [2, 2])],
-        [],
-    )
+    model = _relu_model()
 
     def rewrite(m: onnx.ModelProto) -> None:
         for node in m.graph.node:
@@ -127,12 +128,7 @@ def test_custom_rewriter_false_signals_no_change():
     rewrite. It also must not loop forever -- ``False`` lets the fixed point
     converge.
     """
-    model = _model(
-        [onnx.helper.make_node("Relu", ["x"], ["y"], name="r")],
-        [_vi("x", [2, 2])],
-        [_vi("y", [2, 2])],
-        [],
-    )
+    model = _relu_model()
     calls = {"n": 0}
 
     def rewrite(m: onnx.ModelProto):

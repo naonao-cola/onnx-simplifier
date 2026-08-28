@@ -7,9 +7,9 @@ ordinary Gather/Reshape/Mul (no contrib op, no opset-21 features).
 
 import numpy as np
 import onnx
-import onnx.helper
 import onnx.numpy_helper
 import pytest
+from onnx import parser
 
 import onnxsim
 from onnxsim.nf4 import NF4_CODEBOOK
@@ -17,28 +17,36 @@ from onnxsim.nf4 import NF4_CODEBOOK
 ort = pytest.importorskip("onnxruntime")
 
 
-def _vi(name, shape):
-    return onnx.helper.make_tensor_value_info(name, onnx.TensorProto.FLOAT, shape)
-
-
 def _f32(array, name):
     return onnx.numpy_helper.from_array(array.astype(np.float32), name)
 
 
-def _model(nodes, inputs, outputs, initializer, opset=13):
-    graph = onnx.helper.make_graph(nodes, "g", inputs, outputs, initializer)
-    return onnx.helper.make_model(
-        graph, opset_imports=[onnx.helper.make_opsetid("", opset)], ir_version=8
+def _model(body, initializer=(), opset=13, ir_version=8):
+    model = parser.parse_model(
+        f"""
+        <
+          ir_version: {ir_version},
+          opset_import: ["": {opset}]
+        >
+        {body}
+        """
     )
+    model.graph.initializer.extend(initializer)
+    return model
 
 
 def _matmul_model(K=64, N=16, weight=None, seed=0):
     if weight is None:
         rng = np.random.default_rng(seed)
         weight = rng.standard_normal((K, N)).astype(np.float32) * 0.5
-    nodes = [onnx.helper.make_node("MatMul", ["X", "W"], ["Y"])]
     return _model(
-        nodes, [_vi("X", ["batch", K])], [_vi("Y", ["batch", N])], [_f32(weight, "W")]
+        f"""
+        g (float[batch,{K}] X) => (float[batch,{N}] Y)
+        {{
+          Y = MatMul(X, W)
+        }}
+        """,
+        initializer=[_f32(weight, "W")],
     )
 
 
@@ -124,9 +132,14 @@ def test_nf4_gemm_transb():
     rng = np.random.default_rng(4)
     K, N = 128, 12
     weight = rng.standard_normal((N, K)).astype(np.float32) * 0.5
-    nodes = [onnx.helper.make_node("Gemm", ["X", "W"], ["Y"], transB=1)]
     model = _model(
-        nodes, [_vi("X", ["batch", K])], [_vi("Y", ["batch", N])], [_f32(weight, "W")]
+        f"""
+        g (float[batch,{K}] X) => (float[batch,{N}] Y)
+        {{
+          Y = Gemm<transB = 1>(X, W)
+        }}
+        """,
+        initializer=[_f32(weight, "W")],
     )
     nf4_model = onnxsim.quantize_weight_only_nf4(model, block_size=64)
     onnx.checker.check_model(nf4_model)
@@ -160,15 +173,15 @@ def test_nf4_skip_names_leaves_matched_weight_untouched():
     rng = np.random.default_rng(7)
     w_base = rng.standard_normal((64, 16)).astype(np.float32) * 0.5
     w_lora_a = rng.standard_normal((64, 4)).astype(np.float32) * 0.1
-    nodes = [
-        onnx.helper.make_node("MatMul", ["X", "W"], ["Y"]),
-        onnx.helper.make_node("MatMul", ["X", "W_lora_A"], ["H"]),
-    ]
     model = _model(
-        nodes,
-        [_vi("X", ["batch", 64])],
-        [_vi("Y", ["batch", 16]), _vi("H", ["batch", 4])],
-        [_f32(w_base, "W"), _f32(w_lora_a, "W_lora_A")],
+        """
+        g (float[batch,64] X) => (float[batch,16] Y, float[batch,4] H)
+        {
+          Y = MatMul(X, W)
+          H = MatMul(X, W_lora_A)
+        }
+        """,
+        initializer=[_f32(w_base, "W"), _f32(w_lora_a, "W_lora_A")],
     )
     nf4_model = onnxsim.quantize_weight_only_nf4(
         model, block_size=64, skip_names=["W_lora_A"]
@@ -187,9 +200,13 @@ def test_nf4_skip_names_leaves_matched_weight_untouched():
 
 
 def test_nf4_skips_non_constant_weight():
-    nodes = [onnx.helper.make_node("MatMul", ["X", "W"], ["Y"])]
     model = _model(
-        nodes, [_vi("X", [4, 64]), _vi("W", [64, 4])], [_vi("Y", [4, 4])], []
+        """
+        g (float[4,64] X, float[64,4] W) => (float[4,4] Y)
+        {
+          Y = MatMul(X, W)
+        }
+        """
     )
     nf4_model = onnxsim.quantize_weight_only_nf4(model)
     assert nf4_model.SerializeToString() == model.SerializeToString()

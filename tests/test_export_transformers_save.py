@@ -9,23 +9,39 @@ import os
 
 import numpy as np
 import onnx
-import onnx.helper
 import onnx.numpy_helper
 import pytest
+from onnx import parser
 
 from onnxsim.transformers_export import _save
+
+
+def _model(body, initializer=(), opset=17, ir_version=9):
+    model = parser.parse_model(
+        f"""
+        <
+          ir_version: {ir_version},
+          opset_import: ["": {opset}]
+        >
+        {body}
+        """
+    )
+    model.graph.initializer.extend(initializer)
+    return model
 
 
 def _tiny_model():
     w = onnx.numpy_helper.from_array(
         np.random.RandomState(0).rand(4, 4).astype(np.float32), "W"
     )
-    x = onnx.helper.make_tensor_value_info("X", onnx.TensorProto.FLOAT, [4, 4])
-    y = onnx.helper.make_tensor_value_info("Y", onnx.TensorProto.FLOAT, [4, 4])
-    node = onnx.helper.make_node("Add", ["X", "W"], ["Y"])
-    graph = onnx.helper.make_graph([node], "g", [x], [y], initializer=[w])
-    return onnx.helper.make_model(
-        graph, opset_imports=[onnx.helper.make_opsetid("", 17)], ir_version=9
+    return _model(
+        """
+        g (float[4,4] X) => (float[4,4] Y)
+        {
+          Y = Add(X, W)
+        }
+        """,
+        initializer=[w],
     )
 
 
