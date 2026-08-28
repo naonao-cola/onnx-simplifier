@@ -5,7 +5,7 @@ op, a *vendor-specific* counterpart to
 ``onnxsim.quantize_weight_only_int4``'s portable standard-ONNX output (see
 ``passes/weight_only_quantize_matmul_nbits.h``).
 
-Each model is built directly with ``onnx.helper`` (no torch dependency),
+Each model is built directly with ``onnx.parser`` (no torch dependency),
 quantized, and then actually run through ONNX Runtime -- both before and
 after quantization -- so these tests double as a minimal end-to-end
 simplify/quantize/deploy check: the quantized graph must load and execute
@@ -23,9 +23,9 @@ import collections
 
 import numpy as np
 import onnx
-import onnx.helper
 import onnx.numpy_helper
 import pytest
+from onnx import parser
 
 import onnxsim
 
@@ -34,15 +34,18 @@ import onnxsim
 ort = pytest.importorskip("onnxruntime")
 
 
-def _model(nodes, inputs, outputs, initializer, opset=17):
-    graph = onnx.helper.make_graph(nodes, "g", inputs, outputs, initializer)
-    return onnx.helper.make_model(
-        graph, opset_imports=[onnx.helper.make_opsetid("", opset)], ir_version=8
+def _model(body, initializer=(), opset=17):
+    model = parser.parse_model(
+        f"""
+        <
+          ir_version: 8,
+          opset_import: ["": {opset}]
+        >
+        {body}
+        """
     )
-
-
-def _vi(name, shape):
-    return onnx.helper.make_tensor_value_info(name, onnx.TensorProto.FLOAT, shape)
+    model.graph.initializer.extend(initializer)
+    return model
 
 
 def _f32(array, name):
@@ -81,8 +84,15 @@ def test_quantize_matmul():
     rng = np.random.default_rng(0)
     K, N = 64, 16
     weight = _f32(rng.standard_normal((K, N)) * 0.5, "W")
-    nodes = [onnx.helper.make_node("MatMul", ["X", "W"], ["Y"])]
-    model = _model(nodes, [_vi("X", [4, K])], [_vi("Y", [4, N])], [weight])
+    model = _model(
+        f"""
+        g (float[4,{K}] X) => (float[4,{N}] Y)
+        {{
+          Y = MatMul(X, W)
+        }}
+        """,
+        initializer=[weight],
+    )
 
     quant = onnxsim.quantize_weight_only_matmul_nbits(model)
     onnx.checker.check_model(quant)
@@ -105,8 +115,15 @@ def test_quantize_gemm_transb_with_bias():
     K, N = 96, 12
     weight = _f32(rng.standard_normal((N, K)) * 0.5, "W")
     bias = _f32(rng.standard_normal(N), "B")
-    nodes = [onnx.helper.make_node("Gemm", ["X", "W", "B"], ["Y"], transB=1)]
-    model = _model(nodes, [_vi("X", [3, K])], [_vi("Y", [3, N])], [weight, bias])
+    model = _model(
+        f"""
+        g (float[3,{K}] X) => (float[3,{N}] Y)
+        {{
+          Y = Gemm<transB = 1>(X, W, B)
+        }}
+        """,
+        initializer=[weight, bias],
+    )
 
     quant = onnxsim.quantize_weight_only_matmul_nbits(model)
     onnx.checker.check_model(quant)
@@ -131,8 +148,15 @@ def test_quantize_scale_shape_matches_block_count():
     rng = np.random.default_rng(2)
     K, N = 64, 8
     weight = _f32(rng.standard_normal((K, N)) * 0.5, "W")
-    nodes = [onnx.helper.make_node("MatMul", ["X", "W"], ["Y"])]
-    model = _model(nodes, [_vi("X", [1, K])], [_vi("Y", [1, N])], [weight])
+    model = _model(
+        f"""
+        g (float[1,{K}] X) => (float[1,{N}] Y)
+        {{
+          Y = MatMul(X, W)
+        }}
+        """,
+        initializer=[weight],
+    )
 
     quant = onnxsim.quantize_weight_only_matmul_nbits(model)
     scale_init = _find(
@@ -149,8 +173,15 @@ def test_quantize_handles_k_not_divisible_by_block_size():
     rng = np.random.default_rng(3)
     K, N = 48, 8
     weight = _f32(rng.standard_normal((K, N)) * 0.5, "W")
-    nodes = [onnx.helper.make_node("MatMul", ["X", "W"], ["Y"])]
-    model = _model(nodes, [_vi("X", [1, K])], [_vi("Y", [1, N])], [weight])
+    model = _model(
+        f"""
+        g (float[1,{K}] X) => (float[1,{N}] Y)
+        {{
+          Y = MatMul(X, W)
+        }}
+        """,
+        initializer=[weight],
+    )
 
     quant = onnxsim.quantize_weight_only_matmul_nbits(model)
     onnx.checker.check_model(quant)
@@ -171,8 +202,16 @@ def test_quantize_works_at_low_opset():
     rng = np.random.default_rng(4)
     K, N = 32, 4
     weight = _f32(rng.standard_normal((K, N)) * 0.5, "W")
-    nodes = [onnx.helper.make_node("MatMul", ["X", "W"], ["Y"])]
-    model = _model(nodes, [_vi("X", [1, K])], [_vi("Y", [1, N])], [weight], opset=11)
+    model = _model(
+        f"""
+        g (float[1,{K}] X) => (float[1,{N}] Y)
+        {{
+          Y = MatMul(X, W)
+        }}
+        """,
+        initializer=[weight],
+        opset=11,
+    )
 
     quant = onnxsim.quantize_weight_only_matmul_nbits(model)
     onnx.checker.check_model(quant)
@@ -183,9 +222,13 @@ def test_quantize_works_at_low_opset():
 
 
 def test_quantize_skips_non_constant_weight():
-    nodes = [onnx.helper.make_node("MatMul", ["X", "W"], ["Y"])]
     model = _model(
-        nodes, [_vi("X", [4, 64]), _vi("W", [64, 4])], [_vi("Y", [4, 4])], []
+        """
+        g (float[4,64] X, float[64,4] W) => (float[4,4] Y)
+        {
+          Y = MatMul(X, W)
+        }
+        """
     )
     quant = onnxsim.quantize_weight_only_matmul_nbits(model)
     assert _op_counts(quant)[("MatMul", "")] == 1
@@ -200,8 +243,15 @@ def test_quantize_bit_packing_matches_reference_dequantization():
     rng = np.random.default_rng(5)
     K, N = 40, 3  # a ragged last block (40 = 32 + 8)
     weight = rng.standard_normal((K, N)).astype(np.float32) * 0.3
-    nodes = [onnx.helper.make_node("MatMul", ["X", "W"], ["Y"])]
-    model = _model(nodes, [_vi("X", [1, K])], [_vi("Y", [1, N])], [_f32(weight, "W")])
+    model = _model(
+        f"""
+        g (float[1,{K}] X) => (float[1,{N}] Y)
+        {{
+          Y = MatMul(X, W)
+        }}
+        """,
+        initializer=[_f32(weight, "W")],
+    )
     quant = onnxsim.quantize_weight_only_matmul_nbits(model)
 
     b_init = _find(quant, lambda t: t.data_type == onnx.TensorProto.UINT8)
