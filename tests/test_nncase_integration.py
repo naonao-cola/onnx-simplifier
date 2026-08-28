@@ -35,7 +35,7 @@ regular build-and-test matrix skips them.
 import numpy as np
 import onnx
 import pytest
-from onnx import TensorProto, helper, numpy_helper
+from onnx import numpy_helper, parser
 
 nncase = pytest.importorskip("nncase", reason="nncase is not installed")
 from nncase import CompileOptions, Compiler, ImportOptions, RuntimeTensor  # noqa: E402
@@ -46,10 +46,19 @@ _OPSET = 17
 _IR_VERSION = 8
 
 
-def _model(nodes, inputs, outputs, initializers, name) -> onnx.ModelProto:
-    graph = helper.make_graph(nodes, name, inputs, outputs, initializers)
-    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", _OPSET)])
-    model.ir_version = _IR_VERSION
+def _model(
+    body, initializer=(), opset=_OPSET, ir_version=_IR_VERSION
+) -> onnx.ModelProto:
+    model = parser.parse_model(
+        f"""
+        <
+          ir_version: {ir_version},
+          opset_import: ["": {opset}]
+        >
+        {body}
+        """
+    )
+    model.graph.initializer.extend(initializer)
     onnx.checker.check_model(model)
     return model
 
@@ -65,36 +74,32 @@ def _conv_bn_relu() -> onnx.ModelProto:
     shift = numpy_helper.from_array(_rand(8, seed=3), "shift")
     mean = numpy_helper.from_array(_rand(8, seed=4), "mean")
     var = numpy_helper.from_array(np.abs(_rand(8, seed=5)) + 1.0, "var")
-    nodes = [
-        helper.make_node("Conv", ["x", "w"], ["c"], pads=[1, 1, 1, 1]),
-        helper.make_node(
-            "BatchNormalization", ["c", "scale", "shift", "mean", "var"], ["bn"]
-        ),
-        helper.make_node("Relu", ["bn"], ["y"]),
-    ]
     return _model(
-        nodes,
-        [helper.make_tensor_value_info("x", TensorProto.FLOAT, [1, 3, 8, 8])],
-        [helper.make_tensor_value_info("y", TensorProto.FLOAT, [1, 8, 8, 8])],
-        [w, scale, shift, mean, var],
-        "conv_bn_relu",
+        """
+        conv_bn_relu (float[1,3,8,8] x) => (float[1,8,8,8] y)
+        {
+          c = Conv<pads = [1, 1, 1, 1]>(x, w)
+          bn = BatchNormalization(c, scale, shift, mean, var)
+          y = Relu(bn)
+        }
+        """,
+        initializer=[w, scale, shift, mean, var],
     )
 
 
 def _redundant_transpose() -> onnx.ModelProto:
     """An identity Transpose (perm=[0,1,2,3]) that onnxsim removes outright."""
     w = numpy_helper.from_array(_rand(8, 3, 3, 3, seed=1), "w")
-    nodes = [
-        helper.make_node("Transpose", ["x"], ["t"], perm=[0, 1, 2, 3]),
-        helper.make_node("Conv", ["t", "w"], ["c"], pads=[1, 1, 1, 1]),
-        helper.make_node("Relu", ["c"], ["y"]),
-    ]
     return _model(
-        nodes,
-        [helper.make_tensor_value_info("x", TensorProto.FLOAT, [1, 3, 8, 8])],
-        [helper.make_tensor_value_info("y", TensorProto.FLOAT, [1, 8, 8, 8])],
-        [w],
-        "redundant_transpose",
+        """
+        redundant_transpose (float[1,3,8,8] x) => (float[1,8,8,8] y)
+        {
+          t = Transpose<perm = [0, 1, 2, 3]>(x)
+          c = Conv<pads = [1, 1, 1, 1]>(t, w)
+          y = Relu(c)
+        }
+        """,
+        initializer=[w],
     )
 
 
@@ -106,23 +111,20 @@ def _foldable_shape_reshape() -> onnx.ModelProto:
     materialize a runtime-computed shape.
     """
     w = numpy_helper.from_array(_rand(8, 3, 3, 3, seed=1), "w")
-    idx = numpy_helper.from_array(np.array([0], np.int64), "idx")
-    minus1 = numpy_helper.from_array(np.array([-1], np.int64), "m1")
-    ch = numpy_helper.from_array(np.array([8], np.int64), "ch")
-    nodes = [
-        helper.make_node("Conv", ["x", "w"], ["c"], pads=[1, 1, 1, 1]),
-        helper.make_node("Relu", ["c"], ["r"]),
-        helper.make_node("Shape", ["r"], ["shp"]),
-        helper.make_node("Gather", ["shp", "idx"], ["n"], axis=0),
-        helper.make_node("Concat", ["n", "ch", "m1"], ["newshape"], axis=0),
-        helper.make_node("Reshape", ["r", "newshape"], ["y"]),
-    ]
     return _model(
-        nodes,
-        [helper.make_tensor_value_info("x", TensorProto.FLOAT, [1, 3, 8, 8])],
-        [helper.make_tensor_value_info("y", TensorProto.FLOAT, [1, 8, 64])],
-        [w, idx, minus1, ch],
-        "foldable_shape_reshape",
+        """
+        foldable_shape_reshape (float[1,3,8,8] x) => (float[1,8,64] y)
+        <int64[1] idx = {0}, int64[1] ch = {8}, int64[1] m1 = {-1}>
+        {
+          c = Conv<pads = [1, 1, 1, 1]>(x, w)
+          r = Relu(c)
+          shp = Shape(r)
+          n = Gather<axis = 0>(shp, idx)
+          newshape = Concat<axis = 0>(n, ch, m1)
+          y = Reshape(r, newshape)
+        }
+        """,
+        initializer=[w],
     )
 
 
