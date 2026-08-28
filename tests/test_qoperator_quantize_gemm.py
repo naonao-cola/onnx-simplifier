@@ -10,9 +10,9 @@ import collections
 
 import numpy as np
 import onnx
-import onnx.helper
 import onnx.numpy_helper
 import pytest
+from onnx import parser
 
 import onnxsim
 
@@ -21,15 +21,18 @@ import onnxsim
 ort = pytest.importorskip("onnxruntime")
 
 
-def _model(nodes, inputs, outputs, initializer, opset=13):
-    graph = onnx.helper.make_graph(nodes, "g", inputs, outputs, initializer)
-    return onnx.helper.make_model(
-        graph, opset_imports=[onnx.helper.make_opsetid("", opset)], ir_version=10
+def _model(body, initializer=(), opset=13, ir_version=10):
+    model = parser.parse_model(
+        f"""
+        <
+          ir_version: {ir_version},
+          opset_import: ["": {opset}]
+        >
+        {body}
+        """
     )
-
-
-def _vi(name, shape):
-    return onnx.helper.make_tensor_value_info(name, onnx.TensorProto.FLOAT, shape)
+    model.graph.initializer.extend(initializer)
+    return model
 
 
 def _f32(array, name):
@@ -68,9 +71,14 @@ def test_quantize_vanilla_gemm_with_bias():
     rng = np.random.default_rng(0)
     w = rng.standard_normal((16, 8)).astype(np.float32)  # [K, N]
     b = rng.standard_normal((8,)).astype(np.float32)
-    nodes = [onnx.helper.make_node("Gemm", ["X", "W", "B"], ["Y"])]
     model = _model(
-        nodes, [_vi("X", [3, 16])], [_vi("Y", [3, 8])], [_f32(w, "W"), _f32(b, "B")]
+        """
+        g (float[3,16] X) => (float[3,8] Y)
+        {
+          Y = Gemm(X, W, B)
+        }
+        """,
+        [_f32(w, "W"), _f32(b, "B")],
     )
 
     quant = onnxsim.quantize_qoperator_gemm(model, num_calibration_samples=32, seed=0)
@@ -100,8 +108,15 @@ def test_quantize_vanilla_gemm_with_bias():
 def test_quantize_gemm_no_bias():
     rng = np.random.default_rng(1)
     w = rng.standard_normal((8, 4)).astype(np.float32)
-    nodes = [onnx.helper.make_node("Gemm", ["X", "W"], ["Y"])]
-    model = _model(nodes, [_vi("X", [3, 8])], [_vi("Y", [3, 4])], [_f32(w, "W")])
+    model = _model(
+        """
+        g (float[3,8] X) => (float[3,4] Y)
+        {
+          Y = Gemm(X, W)
+        }
+        """,
+        [_f32(w, "W")],
+    )
 
     quant = onnxsim.quantize_qoperator_gemm(model, num_calibration_samples=16, seed=1)
     onnx.checker.check_model(quant)
@@ -122,19 +137,15 @@ def test_quantize_gemm_transa_transb_alpha():
     rng = np.random.default_rng(2)
     w = rng.standard_normal((8, 16)).astype(np.float32)  # [N, K] since transB=1
     b = rng.standard_normal((8,)).astype(np.float32)
-    nodes = [
-        onnx.helper.make_node(
-            "Gemm",
-            ["X", "W", "B"],
-            ["Y"],
-            transA=1,
-            transB=1,
-            alpha=2.5,
-        )
-    ]
     # X is [K, M] = [16, 3] since transA=1.
     model = _model(
-        nodes, [_vi("X", [16, 3])], [_vi("Y", [3, 8])], [_f32(w, "W"), _f32(b, "B")]
+        """
+        g (float[16,3] X) => (float[3,8] Y)
+        {
+          Y = Gemm<transA = 1, transB = 1, alpha = 2.5>(X, W, B)
+        }
+        """,
+        [_f32(w, "W"), _f32(b, "B")],
     )
 
     quant = onnxsim.quantize_qoperator_gemm(model, num_calibration_samples=32, seed=2)
@@ -156,9 +167,14 @@ def test_quantize_skips_non_vector_bias():
     rng = np.random.default_rng(3)
     w = rng.standard_normal((8, 4)).astype(np.float32)
     c2d = rng.standard_normal((3, 4)).astype(np.float32)
-    nodes = [onnx.helper.make_node("Gemm", ["X", "W", "C"], ["Y"])]
     model = _model(
-        nodes, [_vi("X", [3, 8])], [_vi("Y", [3, 4])], [_f32(w, "W"), _f32(c2d, "C")]
+        """
+        g (float[3,8] X) => (float[3,4] Y)
+        {
+          Y = Gemm(X, W, C)
+        }
+        """,
+        [_f32(w, "W"), _f32(c2d, "C")],
     )
 
     import onnxsim.onnxsim_cpp2py_export as C
@@ -175,9 +191,14 @@ def test_quantize_skips_non_default_beta_with_bias():
     rng = np.random.default_rng(4)
     w = rng.standard_normal((8, 4)).astype(np.float32)
     b = rng.standard_normal((4,)).astype(np.float32)
-    nodes = [onnx.helper.make_node("Gemm", ["X", "W", "B"], ["Y"], beta=0.5)]
     model = _model(
-        nodes, [_vi("X", [3, 8])], [_vi("Y", [3, 4])], [_f32(w, "W"), _f32(b, "B")]
+        """
+        g (float[3,8] X) => (float[3,4] Y)
+        {
+          Y = Gemm<beta = 0.5>(X, W, B)
+        }
+        """,
+        [_f32(w, "W"), _f32(b, "B")],
     )
     quant = onnxsim.quantize_qoperator_gemm(model)
     assert _op_counts(quant)["Gemm"] == 1
@@ -185,20 +206,15 @@ def test_quantize_skips_non_default_beta_with_bias():
 
 
 def test_quantize_skips_non_float():
-    nodes = [onnx.helper.make_node("Gemm", ["X", "W"], ["Y"])]
-    graph = onnx.helper.make_graph(
-        nodes,
-        "g",
-        [onnx.helper.make_tensor_value_info("X", onnx.TensorProto.FLOAT16, [3, 8])],
-        [onnx.helper.make_tensor_value_info("Y", onnx.TensorProto.FLOAT16, [3, 4])],
-        [
-            onnx.numpy_helper.from_array(
-                np.zeros((8, 4), dtype=np.float32).astype(np.float16), "W"
-            )
-        ],
-    )
-    model = onnx.helper.make_model(
-        graph, opset_imports=[onnx.helper.make_opsetid("", 13)], ir_version=10
+    w = np.zeros((8, 4), dtype=np.float32).astype(np.float16)
+    model = _model(
+        """
+        g (float16[3,8] X) => (float16[3,4] Y)
+        {
+          Y = Gemm(X, W)
+        }
+        """,
+        [onnx.numpy_helper.from_array(w, "W")],
     )
     quant = onnxsim.quantize_qoperator_gemm(model)
     assert _op_counts(quant)["Gemm"] == 1
@@ -208,8 +224,15 @@ def test_quantize_skips_non_float():
 def test_list_qoperator_gemm_quantizable_tensors():
     rng = np.random.default_rng(5)
     w = rng.standard_normal((8, 4)).astype(np.float32)
-    nodes = [onnx.helper.make_node("Gemm", ["X", "W"], ["Y"])]
-    model = _model(nodes, [_vi("X", [3, 8])], [_vi("Y", [3, 4])], [_f32(w, "W")])
+    model = _model(
+        """
+        g (float[3,8] X) => (float[3,4] Y)
+        {
+          Y = Gemm(X, W)
+        }
+        """,
+        [_f32(w, "W")],
+    )
     import onnxsim.onnxsim_cpp2py_export as C
 
     names = C.list_qoperator_gemm_quantizable_tensors(model.SerializeToString())
