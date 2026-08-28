@@ -1413,10 +1413,13 @@ def test_attention_head_pruning_reshape_hop_is_recognized_and_shape_updated():
     assert y.shape == (2, 5, cfg["Out"])
 
 
-def test_attention_head_pruning_group_query_attention_is_left_untouched():
-    # GroupQueryAttention -- separate, un-merged Q/K/V weights and possibly
-    # unequal num_heads/kv_num_heads -- is explicitly out of scope; this
-    # must not be mistaken for a plain `Attention` node.
+def test_attention_head_pruning_group_query_attention_missing_required_inputs_is_left_untouched():
+    # GroupQueryAttention is supported (see the "-- GroupQueryAttention"
+    # section below), but its schema requires seqlens_k/
+    # total_sequence_length even for a plain forward pass -- a node missing
+    # them (as here, only q/k/v given) isn't a complete/safe-to-act-on GQA
+    # node and must not be mistaken for one, nor for a plain `Attention`
+    # node (whose merged-QKV-weight shape this one doesn't have either).
     K, H, D, Out = 8, 4, 4, 6
     Nqkv = H * D
     rng = np.random.default_rng(5)
@@ -1590,3 +1593,522 @@ def test_attention_head_wanda_pruning_falls_back_to_plain_with_no_calibration_ba
     }
     for name in inits_plain:
         np.testing.assert_array_equal(inits_plain[name], inits_wanda[name])
+
+
+# --- apply_attention_head_pruning / _wanda_pruning -- GroupQueryAttention --
+
+
+def _gqa_model(
+    K=8,
+    H=4,
+    KVH=2,
+    D=8,
+    Out=6,
+    seed=0,
+    batch=2,
+    seq=5,
+    bias=False,
+    with_reshape=False,
+    wq=None,
+    wk=None,
+    wv=None,
+    bq=None,
+    bk=None,
+    bv=None,
+    wout=None,
+    past_kv=None,  # None (empty) | "nonempty" (constant) | "dynamic" (graph input)
+):
+    # Real ONNX Runtime CPU kernels for GroupQueryAttention require
+    # head_size to be a multiple of 8 (verified empirically -- a smaller
+    # head_size segfaults/errors at run time the same way a 2-input
+    # com.microsoft::Attention does elsewhere in this file), so D defaults
+    # to 8 rather than mirroring _attention_model's smaller default.
+    rng = np.random.default_rng(seed)
+    Nq, Nkv = H * D, KVH * D
+    if wq is None:
+        wq = rng.standard_normal((K, Nq)).astype(np.float32)
+    if wk is None:
+        wk = rng.standard_normal((K, Nkv)).astype(np.float32)
+    if wv is None:
+        wv = rng.standard_normal((K, Nkv)).astype(np.float32)
+    if wout is None:
+        wout = rng.standard_normal((Nq, Out)).astype(np.float32)
+
+    initializer = [_f32(wq, "Wq"), _f32(wk, "Wk"), _f32(wv, "Wv"), _f32(wout, "Wout")]
+    q_op, k_op, v_op = "MatMul(X, Wq)", "MatMul(X, Wk)", "MatMul(X, Wv)"
+    if bias:
+        if bq is None:
+            bq = rng.standard_normal((Nq,)).astype(np.float32)
+        if bk is None:
+            bk = rng.standard_normal((Nkv,)).astype(np.float32)
+        if bv is None:
+            bv = rng.standard_normal((Nkv,)).astype(np.float32)
+        initializer += [_f32(bq, "Bq"), _f32(bk, "Bk"), _f32(bv, "Bv")]
+        q_op, k_op, v_op = "Gemm(X, Wq, Bq)", "Gemm(X, Wk, Bk)", "Gemm(X, Wv, Bv)"
+
+    # seqlens_k/total_sequence_length: mandatory KV-cache bookkeeping inputs
+    # GroupQueryAttention's schema requires even for a plain, no-cache
+    # forward pass (see fuse_gqa.h's own top comment) -- `S-1` per batch row
+    # and `S`, exactly what fuse_gqa.h itself synthesizes.
+    initializer.append(
+        onnx.numpy_helper.from_array(
+            np.full((batch,), seq - 1, dtype=np.int32), "SeqLensK"
+        )
+    )
+    initializer.append(
+        onnx.numpy_helper.from_array(np.array(seq, dtype=np.int32), "TotalSeq")
+    )
+
+    operands = ["q", "k", "v"]
+    extra_graph_inputs = ""
+    if past_kv == "nonempty":
+        past_key = rng.standard_normal((batch, KVH, 1, D)).astype(np.float32)
+        past_value = rng.standard_normal((batch, KVH, 1, D)).astype(np.float32)
+        initializer += [_f32(past_key, "PastKey"), _f32(past_value, "PastValue")]
+        operands += ["PastKey", "PastValue"]
+    elif past_kv == "dynamic":
+        operands += ["PastKeyIn", "PastValueIn"]
+        extra_graph_inputs = (
+            f", float[{batch},{KVH},1,{D}] PastKeyIn"
+            f", float[{batch},{KVH},1,{D}] PastValueIn"
+        )
+    else:
+        operands += ["", ""]
+    operands += ["SeqLensK", "TotalSeq"]
+
+    if with_reshape:
+        shape = np.array([batch, seq, Nq], dtype=np.int64)
+        initializer.append(onnx.numpy_helper.from_array(shape, "Shape"))
+        tail = "ctx2 = Reshape(ctx, Shape)\n          Y = MatMul(ctx2, Wout)"
+    else:
+        tail = "Y = MatMul(ctx, Wout)"
+
+    body = f"""
+        g (float[{batch},{seq},{K}] X{extra_graph_inputs}) => (float[{batch},{seq},{Out}] Y)
+        {{
+          q = {q_op}
+          k = {k_op}
+          v = {v_op}
+          ctx, pk, pv = com.microsoft.GroupQueryAttention <num_heads={H}, kv_num_heads={KVH}> ({", ".join(operands)})
+          {tail}
+        }}
+        """
+
+    model = parser.parse_model(
+        f"""
+        <
+          ir_version: 10,
+          opset_import: ["": 17, "com.microsoft": 1]
+        >
+        {body}
+        """
+    )
+    model.graph.initializer.extend(initializer)
+    return model, dict(
+        K=K,
+        H=H,
+        KVH=KVH,
+        D=D,
+        Out=Out,
+        Nq=Nq,
+        Nkv=Nkv,
+        wq=wq,
+        wk=wk,
+        wv=wv,
+        bq=bq,
+        bk=bk,
+        bv=bv,
+        wout=wout,
+        batch=batch,
+        seq=seq,
+    )
+
+
+def _gqa_node(model):
+    return next(n for n in model.graph.node if n.op_type == "GroupQueryAttention")
+
+
+def _gqa_attrs(node):
+    num_heads = next(a.i for a in node.attribute if a.name == "num_heads")
+    kv_num_heads = next(a.i for a in node.attribute if a.name == "kv_num_heads")
+    return num_heads, kv_num_heads
+
+
+def _oracle_keep_groups(wq, wk, wv, num_heads, kv_num_heads, head_size, keep_count):
+    group_size = num_heads // kv_num_heads
+    importance = np.zeros(kv_num_heads)
+    for kv in range(kv_num_heads):
+        q_block = np.concatenate(
+            [
+                wq[:, h * head_size : (h + 1) * head_size]
+                for h in range(kv * group_size, (kv + 1) * group_size)
+            ],
+            axis=1,
+        )
+        k_block = wk[:, kv * head_size : (kv + 1) * head_size]
+        v_block = wv[:, kv * head_size : (kv + 1) * head_size]
+        importance[kv] = np.linalg.norm(
+            np.concatenate([q_block, k_block, v_block], axis=1)
+        )
+    return np.sort(np.argsort(-importance)[:keep_count])
+
+
+def _group_q_heads(keep_groups, group_size):
+    return np.concatenate(
+        [np.arange(g * group_size, (g + 1) * group_size) for g in keep_groups]
+    )
+
+
+def test_gqa_pruning_shrinks_matched_block():
+    model, cfg = _gqa_model(K=8, H=4, KVH=4, D=8, Out=6)
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    node = _gqa_node(pruned)
+    num_heads, kv_num_heads = _gqa_attrs(node)
+    assert num_heads == 2  # round(4 - 4*0.5) query heads ...
+    assert kv_num_heads == 2  # ... and KV heads alike, since group_size == 1 here
+
+    inits = {t.name: t for t in pruned.graph.initializer}
+    assert list(inits["Wq"].dims) == [8, 16]
+    assert list(inits["Wk"].dims) == [8, 16]
+    assert list(inits["Wv"].dims) == [8, 16]
+    assert list(inits["Wout"].dims) == [16, 6]
+
+
+def test_gqa_pruning_zero_sparsity_is_a_no_op():
+    model, cfg = _gqa_model(K=8, H=8, KVH=2, D=8, Out=6, seed=7)
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.0)
+    node = _gqa_node(pruned)
+    num_heads, kv_num_heads = _gqa_attrs(node)
+    assert num_heads == cfg["H"]
+    assert kv_num_heads == cfg["KVH"]
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    np.testing.assert_array_equal(inits["Wq"], cfg["wq"])
+    np.testing.assert_array_equal(inits["Wk"], cfg["wk"])
+    np.testing.assert_array_equal(inits["Wv"], cfg["wv"])
+
+
+def test_gqa_pruning_unequal_heads_drops_whole_groups_and_preserves_ratio():
+    # 8 query heads sharing 4 KV heads (2 query heads per KV head); at
+    # sparsity=0.5 two of the four *groups* must be dropped, never an
+    # individual query head in isolation -- confirmed here by checking the
+    # surviving Wq columns are exactly the two kept groups' own contiguous
+    # 2-head blocks, matching the kept Wk/Wv columns' own group indices.
+    model, cfg = _gqa_model(K=8, H=8, KVH=4, D=8, Out=6, seed=11)
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    node = _gqa_node(pruned)
+    num_heads, kv_num_heads = _gqa_attrs(node)
+    assert kv_num_heads == 2
+    assert num_heads == 4
+    assert num_heads // kv_num_heads == cfg["H"] // cfg["KVH"]  # ratio preserved
+
+    group_size = cfg["H"] // cfg["KVH"]
+    keep_groups = _oracle_keep_groups(
+        cfg["wq"], cfg["wk"], cfg["wv"], cfg["H"], cfg["KVH"], cfg["D"], 2
+    )
+    keep_q_heads = _group_q_heads(keep_groups, group_size)
+    d = cfg["D"]
+
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    np.testing.assert_array_equal(inits["Wq"], cfg["wq"][:, _head_idx(keep_q_heads, d)])
+    np.testing.assert_array_equal(inits["Wk"], cfg["wk"][:, _head_idx(keep_groups, d)])
+    np.testing.assert_array_equal(inits["Wv"], cfg["wv"][:, _head_idx(keep_groups, d)])
+
+
+def test_gqa_pruning_matches_oracle_exactly():
+    model, cfg = _gqa_model(K=8, H=8, KVH=2, D=8, Out=6, seed=1)
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    node = _gqa_node(pruned)
+    num_heads, kv_num_heads = _gqa_attrs(node)
+    group_size = cfg["H"] // cfg["KVH"]
+    assert kv_num_heads == 1  # max(1, 2 - round(2*0.5))
+    assert num_heads == kv_num_heads * group_size
+
+    keep_groups = _oracle_keep_groups(
+        cfg["wq"], cfg["wk"], cfg["wv"], cfg["H"], cfg["KVH"], cfg["D"], kv_num_heads
+    )
+    keep_q_heads = _group_q_heads(keep_groups, group_size)
+    d = cfg["D"]
+    q_idx, kv_idx = _head_idx(keep_q_heads, d), _head_idx(keep_groups, d)
+
+    oracle, _ = _gqa_model(
+        K=cfg["K"],
+        H=num_heads,
+        KVH=kv_num_heads,
+        D=d,
+        Out=cfg["Out"],
+        seed=1,
+        wq=cfg["wq"][:, q_idx],
+        wk=cfg["wk"][:, kv_idx],
+        wv=cfg["wv"][:, kv_idx],
+        wout=cfg["wout"][q_idx, :],
+        batch=cfg["batch"],
+        seq=cfg["seq"],
+    )
+
+    rng = np.random.default_rng(2)
+    x = rng.standard_normal((cfg["batch"], cfg["seq"], cfg["K"])).astype(np.float32)
+    (y_pruned,) = _run(pruned, {"X": x})
+    (y_oracle,) = _run(oracle, {"X": x})
+    np.testing.assert_allclose(y_pruned, y_oracle, rtol=1e-4, atol=1e-4)
+
+
+def test_gqa_pruning_slices_bias_when_producer_has_one():
+    # Gemm's own ONNX spec requires a rank-2 input, so a bias-carrying Gemm
+    # producer can't sit directly ahead of GroupQueryAttention's rank-3
+    # query/key/value inputs in a graph meant to actually run through
+    # onnxruntime -- this exercises the bias-slicing path itself (shared
+    # with every other producer match in this module via `_match_producer`)
+    # directly against the initializers instead.
+    model, cfg = _gqa_model(K=8, H=4, KVH=2, D=8, Out=6, seed=14, bias=True)
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+
+    node = _gqa_node(pruned)
+    num_heads, kv_num_heads = _gqa_attrs(node)
+    group_size = cfg["H"] // cfg["KVH"]
+    assert kv_num_heads == 1
+    assert num_heads == group_size
+
+    keep_groups = _oracle_keep_groups(
+        cfg["wq"], cfg["wk"], cfg["wv"], cfg["H"], cfg["KVH"], cfg["D"], kv_num_heads
+    )
+    keep_q_heads = _group_q_heads(keep_groups, group_size)
+    d = cfg["D"]
+    q_idx, kv_idx = _head_idx(keep_q_heads, d), _head_idx(keep_groups, d)
+
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    np.testing.assert_array_equal(inits["Wq"], cfg["wq"][:, q_idx])
+    np.testing.assert_array_equal(inits["Wk"], cfg["wk"][:, kv_idx])
+    np.testing.assert_array_equal(inits["Wv"], cfg["wv"][:, kv_idx])
+    np.testing.assert_array_equal(inits["Bq"], cfg["bq"][q_idx])
+    np.testing.assert_array_equal(inits["Bk"], cfg["bk"][kv_idx])
+    np.testing.assert_array_equal(inits["Bv"], cfg["bv"][kv_idx])
+
+
+def test_gqa_pruning_reshape_hop_is_recognized_and_shape_updated():
+    model, cfg = _gqa_model(K=8, H=4, KVH=2, D=8, Out=6, seed=3, with_reshape=True)
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    assert [n.op_type for n in pruned.graph.node] == [
+        "MatMul",
+        "MatMul",
+        "MatMul",
+        "GroupQueryAttention",
+        "Reshape",
+        "MatMul",
+    ]
+
+    node = _gqa_node(pruned)
+    num_heads, kv_num_heads = _gqa_attrs(node)
+    assert kv_num_heads == 1  # max(1, 2 - round(2*0.5)) == 1
+    assert num_heads == 2  # group_size(2) * kv_num_heads(1)
+
+    shape = onnx.numpy_helper.to_array(
+        next(t for t in pruned.graph.initializer if t.name == "Shape")
+    )
+    assert shape[-1] == num_heads * cfg["D"]  # updated to the new (post-prune) Nq
+
+    rng = np.random.default_rng(4)
+    x = rng.standard_normal((cfg["batch"], cfg["seq"], cfg["K"])).astype(np.float32)
+    (y,) = _run(pruned, {"X": x})
+    assert y.shape == (cfg["batch"], cfg["seq"], cfg["Out"])
+
+
+def test_gqa_pruning_nonempty_past_kv_constant_is_left_untouched():
+    # A non-empty constant past_key/past_value holds real per-KV-head cache
+    # data along the kv_num_heads axis that this module would need to slice
+    # but doesn't attempt to -- declined outright rather than corrupted.
+    model, cfg = _gqa_model(K=8, H=8, KVH=2, D=8, Out=6, seed=12, past_kv="nonempty")
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    inits_before = {
+        t.name: onnx.numpy_helper.to_array(t) for t in model.graph.initializer
+    }
+    inits_after = {
+        t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer
+    }
+    for name in inits_before:
+        np.testing.assert_array_equal(inits_before[name], inits_after[name])
+
+
+def test_gqa_pruning_dynamic_past_kv_input_is_still_pruned():
+    # A *dynamic* (non-constant) past_key/past_value -- an ordinary graph
+    # input here, standing in for real runtime KV-cache data -- is not a
+    # weight this module could corrupt by leaving it untouched, so it must
+    # not block the match the way a non-empty constant does.
+    model, cfg = _gqa_model(K=8, H=8, KVH=2, D=8, Out=6, seed=13, past_kv="dynamic")
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    node = _gqa_node(pruned)
+    num_heads, kv_num_heads = _gqa_attrs(node)
+    assert kv_num_heads == 1
+    assert num_heads == 4
+    assert list(node.input[3:5]) == ["PastKeyIn", "PastValueIn"]
+
+    inits = {t.name: t for t in pruned.graph.initializer}
+    assert list(inits["Wq"].dims) == [8, 4 * cfg["D"]]
+    assert list(inits["Wk"].dims) == [8, 1 * cfg["D"]]
+    assert list(inits["Wv"].dims) == [8, 1 * cfg["D"]]
+
+
+def test_gqa_wanda_pruning_matches_oracle_exactly():
+    # Calibration and eval data must share the model's own fixed batch/seq
+    # here (unlike the plain-Attention wanda test, which uses symbolic
+    # batch/seq dims): seqlens_k/total_sequence_length are baked-in
+    # constants tied to a specific batch/seq (see _gqa_model), a real
+    # constraint of GroupQueryAttention's own KV-cache-bookkeeping inputs,
+    # not a limitation of this pass.
+    model, cfg = _gqa_model(K=8, H=8, KVH=2, D=8, Out=6, seed=8)
+
+    rng = np.random.default_rng(9)
+    x_cal = rng.standard_normal((cfg["batch"], cfg["seq"], cfg["K"])).astype(np.float32)
+    calibration_data = [{"X": x_cal}]
+
+    pruned = onnxsim.apply_attention_head_wanda_pruning(
+        model, calibration_data=calibration_data, sparsity=0.5
+    )
+    onnx.checker.check_model(pruned)
+
+    probe_model = onnx.ModelProto()
+    probe_model.CopyFrom(model)
+    probe_model.graph.output.append(onnx.ValueInfoProto(name="ctx"))
+    (_, ctx_cal) = _run(probe_model, {"X": x_cal})
+    act_norm = np.sqrt(np.mean(np.square(ctx_cal.astype(np.float64)), axis=(0, 1)))
+
+    d = cfg["D"]
+    group_size = cfg["H"] // cfg["KVH"]
+    importance = np.zeros(cfg["KVH"])
+    for kv in range(cfg["KVH"]):
+        q_block = np.concatenate(
+            [
+                cfg["wq"][:, h * d : (h + 1) * d]
+                for h in range(kv * group_size, (kv + 1) * group_size)
+            ],
+            axis=1,
+        )
+        k_block = cfg["wk"][:, kv * d : (kv + 1) * d]
+        v_block = cfg["wv"][:, kv * d : (kv + 1) * d]
+        base = np.linalg.norm(np.concatenate([q_block, k_block, v_block], axis=1))
+        act_group = np.linalg.norm(
+            act_norm[kv * group_size * d : (kv + 1) * group_size * d]
+        )
+        importance[kv] = base * max(act_group, 1e-8)
+    keep_groups = np.sort(np.argsort(-importance)[:1])  # max(1, 2 - round(2*0.5)) == 1
+
+    keep_q_heads = _group_q_heads(keep_groups, group_size)
+    q_idx, kv_idx = _head_idx(keep_q_heads, d), _head_idx(keep_groups, d)
+
+    oracle, _ = _gqa_model(
+        K=cfg["K"],
+        H=len(keep_q_heads),
+        KVH=len(keep_groups),
+        D=d,
+        Out=cfg["Out"],
+        seed=8,
+        wq=cfg["wq"][:, q_idx],
+        wk=cfg["wk"][:, kv_idx],
+        wv=cfg["wv"][:, kv_idx],
+        wout=cfg["wout"][q_idx, :],
+        batch=cfg["batch"],
+        seq=cfg["seq"],
+    )
+
+    x = rng.standard_normal((cfg["batch"], cfg["seq"], cfg["K"])).astype(np.float32)
+    (y_pruned,) = _run(pruned, {"X": x})
+    (y_oracle,) = _run(oracle, {"X": x})
+    np.testing.assert_allclose(y_pruned, y_oracle, rtol=1e-4, atol=1e-4)
+
+
+def test_gqa_wanda_pruning_falls_back_to_plain_with_no_calibration_batches():
+    model, cfg = _gqa_model(K=8, H=8, KVH=2, D=8, Out=6, seed=10)
+    plain = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    wanda = onnxsim.apply_attention_head_wanda_pruning(
+        model, calibration_data=[], sparsity=0.5
+    )
+    inits_plain = {
+        t.name: onnx.numpy_helper.to_array(t) for t in plain.graph.initializer
+    }
+    inits_wanda = {
+        t.name: onnx.numpy_helper.to_array(t) for t in wanda.graph.initializer
+    }
+    for name in inits_plain:
+        np.testing.assert_array_equal(inits_plain[name], inits_wanda[name])
+
+
+def test_attention_head_pruning_handles_attention_and_gqa_in_one_model():
+    # Regression check for _apply_attention_chains's per-chain-type
+    # dispatch: a plain `Attention` block and a `GroupQueryAttention` block
+    # in the same graph, sharing no tensors, must each be pruned correctly
+    # and independently -- one chain family must not disturb the other.
+    K, H, D, Out1 = 8, 4, 4, 6
+    Nqkv = H * D
+    rng = np.random.default_rng(30)
+    wqkv = rng.standard_normal((K, 3 * Nqkv)).astype(np.float32)
+    # A real onnxruntime CPU build's `Attention` kernel can segfault given
+    # only 2 inputs (no bias) -- see this file's own `_attention_model`
+    # default and the other plain-Attention tests above, all of which
+    # always give it one.
+    bqkv = rng.standard_normal((3 * Nqkv,)).astype(np.float32)
+    wout1 = rng.standard_normal((Nqkv, Out1)).astype(np.float32)
+
+    GH, GKVH, GD, Out2 = 8, 2, 8, 5
+    Nq2, Nkv2 = GH * GD, GKVH * GD
+    wq = rng.standard_normal((K, Nq2)).astype(np.float32)
+    wk = rng.standard_normal((K, Nkv2)).astype(np.float32)
+    wv = rng.standard_normal((K, Nkv2)).astype(np.float32)
+    wout2 = rng.standard_normal((Nq2, Out2)).astype(np.float32)
+
+    batch, seq = 2, 5
+    seqlens_k = np.full((batch,), seq - 1, dtype=np.int32)
+    total_seq = np.array(seq, dtype=np.int32)
+
+    model = _model(
+        f"""
+        g (float[{batch},{seq},{K}] X1, float[{batch},{seq},{K}] X2) => (float[{batch},{seq},{Out1}] Y1, float[{batch},{seq},{Out2}] Y2)
+        {{
+          ctx1 = com.microsoft.Attention <num_heads={H}, qkv_hidden_sizes=[{Nqkv},{Nqkv},{Nqkv}]> (X1, Wqkv, Bqkv)
+          Y1 = MatMul(ctx1, Wout1)
+          q = MatMul(X2, Wq)
+          k = MatMul(X2, Wk)
+          v = MatMul(X2, Wv)
+          ctx2, pk, pv = com.microsoft.GroupQueryAttention <num_heads={GH}, kv_num_heads={GKVH}> (q, k, v, , , SeqLensK, TotalSeq)
+          Y2 = MatMul(ctx2, Wout2)
+        }}
+        """,
+        initializer=[
+            _f32(wqkv, "Wqkv"),
+            _f32(bqkv, "Bqkv"),
+            _f32(wout1, "Wout1"),
+            _f32(wq, "Wq"),
+            _f32(wk, "Wk"),
+            _f32(wv, "Wv"),
+            _f32(wout2, "Wout2"),
+            onnx.numpy_helper.from_array(seqlens_k, "SeqLensK"),
+            onnx.numpy_helper.from_array(total_seq, "TotalSeq"),
+        ],
+        opset=17,
+    )
+    model.opset_import.append(onnx.helper.make_opsetid("com.microsoft", 1))
+
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    attn_node = next(n for n in pruned.graph.node if n.op_type == "Attention")
+    gqa_node = next(n for n in pruned.graph.node if n.op_type == "GroupQueryAttention")
+    attn_heads, _ = _attention_attrs(attn_node)
+    gqa_heads, gqa_kv_heads = _gqa_attrs(gqa_node)
+    assert attn_heads == 2
+    assert gqa_kv_heads == 1
+    assert gqa_heads == 4
+
+    rng2 = np.random.default_rng(31)
+    x1 = rng2.standard_normal((batch, seq, K)).astype(np.float32)
+    x2 = rng2.standard_normal((batch, seq, K)).astype(np.float32)
+    y1, y2 = _run(pruned, {"X1": x1, "X2": x2})
+    assert y1.shape == (batch, seq, Out1)
+    assert y2.shape == (batch, seq, Out2)
