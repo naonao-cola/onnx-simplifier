@@ -9,6 +9,7 @@
 #include "tensor_pool_bridge.h"
 
 #include <onnx/onnx_pb.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include <cstdio>
@@ -53,6 +54,42 @@ onnx::TensorProto MakeInitializer(const std::string& name,
   for (int64_t d : dims) t.add_dims(d);
   t.set_raw_data(raw);
   return t;
+}
+
+void WriteFile(const std::string& path, const std::string& bytes) {
+  std::ofstream out(path, std::ios::binary);
+  out.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+}
+
+// A classic-ONNX-external-data placeholder tensor: EXTERNAL with a
+// location/offset/length record, no raw_data -- what a real .onnx exported
+// with save_as_external_data=True looks like on disk.
+onnx::TensorProto MakeExternalInitializer(const std::string& name,
+                                          onnx::TensorProto::DataType dtype,
+                                          const std::vector<int64_t>& dims,
+                                          const std::string& location,
+                                          uint64_t offset, uint64_t length) {
+  onnx::TensorProto t;
+  t.set_name(name);
+  t.set_data_type(dtype);
+  for (int64_t d : dims) t.add_dims(d);
+  t.set_data_location(onnx::TensorProto::EXTERNAL);
+  auto set_kv = [&](const std::string& k, const std::string& v) {
+    auto* e = t.add_external_data();
+    e->set_key(k);
+    e->set_value(v);
+  };
+  set_kv("location", location);
+  set_kv("offset", std::to_string(offset));
+  set_kv("length", std::to_string(length));
+  return t;
+}
+
+void WriteModel(const std::string& path, const onnx::ModelProto& model) {
+  std::ofstream out(path, std::ios::binary);
+  std::string serialized;
+  model.SerializeToString(&serialized);
+  out.write(serialized.data(), static_cast<std::streamsize>(serialized.size()));
 }
 
 void TestAdoptAndHydrateSingleTensor() {
@@ -343,6 +380,157 @@ void TestAttachContentHashMetadata() {
   std::remove(path.c_str());
 }
 
+void TestLoadModelWithTensorPoolSharedFile() {
+  // Two tensors packed into one shared external data file (the common
+  // all_tensors_to_one_file=True layout) -- LoadModelWithTensorPool should
+  // mmap that one file once and resolve both tensors from it.
+  std::string data_path = TempPath("_ext.data");
+  std::string w1_bytes(12, '\xAA');
+  std::string w2_bytes(8, '\xBB');
+  WriteFile(data_path, w1_bytes + w2_bytes);
+
+  onnx::ModelProto model;
+  auto* g = model.mutable_graph();
+  *g->add_initializer() = MakeExternalInitializer(
+      "w1", onnx::TensorProto::FLOAT, {3}, data_path, 0, w1_bytes.size());
+  *g->add_initializer() =
+      MakeExternalInitializer("w2", onnx::TensorProto::INT32, {2}, data_path,
+                              w1_bytes.size(), w2_bytes.size());
+
+  std::string onnx_path = TempPath("_ext.onnx");
+  WriteModel(onnx_path, model);
+
+  onnx::ModelProto loaded;
+  TensorPool pool;
+  size_t n = LoadModelWithTensorPool(onnx_path, &loaded, pool);
+  Check(n == 2, "both external tensors resolved");
+
+  const auto& lg = loaded.graph();
+  Check(lg.initializer(0).data_location() == onnx::TensorProto::DEFAULT,
+        "w1 hydrated to DEFAULT location");
+  Check(lg.initializer(0).raw_data() == w1_bytes, "w1 bytes match");
+  Check(lg.initializer(1).raw_data() == w2_bytes, "w2 bytes match");
+
+  std::remove(data_path.c_str());
+  std::remove(onnx_path.c_str());
+}
+
+void TestLoadModelWithTensorPoolLazy() {
+  std::string data_path = TempPath("_ext_lazy.data");
+  std::string bytes(4, '\xCC');
+  WriteFile(data_path, bytes);
+
+  onnx::ModelProto model;
+  *model.mutable_graph()->add_initializer() = MakeExternalInitializer(
+      "lazy", onnx::TensorProto::FLOAT, {1}, data_path, 0, bytes.size());
+  std::string onnx_path = TempPath("_ext_lazy.onnx");
+  WriteModel(onnx_path, model);
+
+  onnx::ModelProto loaded;
+  TensorPool pool;
+  size_t n =
+      LoadModelWithTensorPool(onnx_path, &loaded, pool, /*hydrate_all=*/false);
+  Check(n == 1, "lazy load still reports the resolved tensor");
+  Check(loaded.graph().initializer(0).data_location() ==
+            onnx::TensorProto::EXTERNAL,
+        "lazy load leaves the tensor EXTERNAL");
+  Check(!loaded.graph().initializer(0).has_raw_data(),
+        "lazy load leaves raw_data unset");
+  const Entry* e = pool.Find("lazy");
+  Check(e != nullptr && e->data == bytes,
+        "the pool itself already holds the bytes");
+
+  bool hydrated = HydrateTensorProto(
+      "lazy", *loaded.mutable_graph()->mutable_initializer(0), pool);
+  Check(hydrated && loaded.graph().initializer(0).raw_data() == bytes,
+        "on-demand HydrateTensorProto recovers the bytes");
+
+  std::remove(data_path.c_str());
+  std::remove(onnx_path.c_str());
+}
+
+void TestLoadModelWithTensorPoolNoLengthReadsToEndOfFile() {
+  // No "length" key -- per the ONNX external-data spec, this means the
+  // tensor's data extends to the end of the file.
+  std::string data_path = TempPath("_ext_nolen.data");
+  std::string bytes(6, '\xDD');
+  WriteFile(data_path, bytes);
+
+  onnx::TensorProto t;
+  t.set_name("tail");
+  t.set_data_type(onnx::TensorProto::UINT8);
+  t.add_dims(6);
+  t.set_data_location(onnx::TensorProto::EXTERNAL);
+  auto* e = t.add_external_data();
+  e->set_key("location");
+  e->set_value(data_path);
+  // No "offset" and no "length" entries at all.
+
+  onnx::ModelProto model;
+  *model.mutable_graph()->add_initializer() = t;
+  std::string onnx_path = TempPath("_ext_nolen.onnx");
+  WriteModel(onnx_path, model);
+
+  onnx::ModelProto loaded;
+  TensorPool pool;
+  size_t n = LoadModelWithTensorPool(onnx_path, &loaded, pool);
+  Check(n == 1, "the tensor with no offset/length is still resolved");
+  Check(loaded.graph().initializer(0).raw_data() == bytes,
+        "missing length defaults to reading through the end of the file");
+
+  std::remove(data_path.c_str());
+  std::remove(onnx_path.c_str());
+}
+
+void TestLoadModelWithTensorPoolMissingFileIsSkipped() {
+  onnx::TensorProto t =
+      MakeExternalInitializer("missing", onnx::TensorProto::FLOAT, {1},
+                              "/nonexistent/path.data", 0, 4);
+  onnx::ModelProto model;
+  *model.mutable_graph()->add_initializer() = t;
+  std::string onnx_path = TempPath("_ext_missing.onnx");
+  WriteModel(onnx_path, model);
+
+  onnx::ModelProto loaded;
+  TensorPool pool;
+  size_t n = LoadModelWithTensorPool(onnx_path, &loaded, pool);
+  Check(n == 0, "a tensor whose external file is missing resolves nothing");
+  Check(loaded.graph().initializer(0).data_location() ==
+            onnx::TensorProto::EXTERNAL,
+        "the unresolved tensor is left as its original EXTERNAL reference");
+
+  std::remove(onnx_path.c_str());
+}
+
+void TestLoadModelWithTensorPoolRelativeLocation() {
+  // A relative "location" is resolved against the directory containing the
+  // .onnx file, not the process's current working directory.
+  std::string dir = TempPath("_ext_reldir");
+  ::mkdir(dir.c_str(), 0755);
+  std::string data_path = dir + "/weights.bin";
+  std::string bytes(4, '\xEE');
+  WriteFile(data_path, bytes);
+
+  onnx::TensorProto t = MakeExternalInitializer(
+      "w", onnx::TensorProto::FLOAT, {1}, "weights.bin", 0, bytes.size());
+  onnx::ModelProto model;
+  *model.mutable_graph()->add_initializer() = t;
+  std::string onnx_path = dir + "/model.onnx";
+  WriteModel(onnx_path, model);
+
+  onnx::ModelProto loaded;
+  TensorPool pool;
+  size_t n = LoadModelWithTensorPool(onnx_path, &loaded, pool);
+  Check(n == 1, "the relatively-located tensor resolves");
+  Check(loaded.graph().initializer(0).raw_data() == bytes,
+        "bytes match when location is relative to the .onnx file's own "
+        "directory");
+
+  std::remove(data_path.c_str());
+  std::remove(onnx_path.c_str());
+  ::rmdir(dir.c_str());
+}
+
 }  // namespace
 
 int main() {
@@ -353,6 +541,11 @@ int main() {
   TestImportModelWithSafetensorsHydrateAll();
   TestImportModelWithSafetensorsLazy();
   TestAttachContentHashMetadata();
+  TestLoadModelWithTensorPoolSharedFile();
+  TestLoadModelWithTensorPoolLazy();
+  TestLoadModelWithTensorPoolNoLengthReadsToEndOfFile();
+  TestLoadModelWithTensorPoolMissingFileIsSkipped();
+  TestLoadModelWithTensorPoolRelativeLocation();
 
   if (g_failures == 0) {
     std::printf("tensor_pool_bridge_test: all checks passed\n");

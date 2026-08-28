@@ -161,6 +161,12 @@ def check_and_update_input_shapes(
 # A very very large threshold
 DEFAULT_TENSOR_SIZE_THRESHOLDHOLD = "1.5GB"
 
+# Above this serialized size, ``simplify(..., output_path=...)`` and the CLI
+# save the model as external data by default, even without
+# ``--save-as-external-data`` -- see the ``external_data_threshold`` param
+# below and ``main()``'s ``--external-data-threshold`` flag.
+DEFAULT_EXTERNAL_DATA_THRESHOLD = "100MB"
+
 
 # ONNX ``TensorProto`` element types that onnxoptimizer's tensor-value hashing
 # (``cse_util.h``) knows how to hash. Any other type makes those passes raise
@@ -360,6 +366,35 @@ def import_safetensors(in_path: str) -> onnx.ModelProto:
     """
     model = onnx.ModelProto()
     model.ParseFromString(C.import_safetensors(in_path))
+    return model
+
+
+def load_model(path: str) -> onnx.ModelProto:
+    """Load a ``.onnx`` file, mmap'ing classic ONNX external data through a
+    ``TensorPool`` instead of onnx's own external-data loader.
+
+    Behaves like ``onnx.load(path)`` (structure plus every tensor's values,
+    inline) for any model, but loads faster for a model whose weights live in
+    external data (``onnx.save(..., save_as_external_data=True)``, the
+    default this package's own :func:`simplify` and CLI now use once a
+    model's serialized size passes 100MB -- see
+    ``DEFAULT_EXTERNAL_DATA_THRESHOLD``): onnx's own loader opens and reads
+    each referenced file once per tensor, while this mmaps each *distinct*
+    external file exactly once and hydrates every tensor from that one
+    mapping -- most of the win shows up on the common
+    ``all_tensors_to_one_file=True`` layout, where every initializer shares a
+    single weights file.
+
+    :param path: path to the ``.onnx`` file to load. A relative external-data
+            ``location`` is resolved against this file's own directory, same
+            as onnx's own loader.
+    :returns: the fully hydrated ``ModelProto`` (no external references left
+            for a tensor this could resolve; a tensor whose external file is
+            missing or malformed is left as-is, matching onnx's own loader's
+            leniency for one bad reference in an otherwise-loadable model).
+    """
+    model = onnx.ModelProto()
+    model.ParseFromString(C.load_model_with_tensor_pool(path))
     return model
 
 
@@ -1068,6 +1103,7 @@ def simplify(
     ort_profile: Optional[str] = None,
     merge_ort_profile: bool = False,
     output_path: Optional[str] = None,
+    external_data_threshold: str = DEFAULT_EXTERNAL_DATA_THRESHOLD,
 ) -> Tuple[onnx.ModelProto, bool]:
     """
     :param model: onnx ModelProto object or file path
@@ -1229,6 +1265,16 @@ def simplify(
             the model is still saved to ``output_path`` before returning, just without that
             reload-skipping benefit, since the full model has to be materialized anyway to
             run the correctness check.
+    :param external_data_threshold: When saving to ``output_path``, save the model as
+            external data (weights in a sibling ``.data`` file, same as passing
+            ``save_as_external_data=True`` to ``onnx.save``) whenever its serialized size
+            exceeds this threshold -- by default ``"100MB"``, so a model that size or larger
+            gets external data with no extra argument needed. A model over 2GB always saves
+            as external data regardless of this setting (inline serialization is not possible
+            past that size). Accepts the same ``"<number><unit>"`` strings as
+            ``tensor_size_threshold`` (e.g. ``"500MB"``, ``"2GB"``); raise it (e.g. to
+            ``"2GB"``) to keep the pre-existing behavior of only externalizing when inline
+            saving is impossible.
     :return: A tuple (simplified model, success(True) or failed(False))
     """
     # Validate the requested execution providers up front. onnxsim's constant
@@ -1707,7 +1753,10 @@ def simplify(
         # materialized anyway to run the correctness check) or fell back from an
         # internal error. Either way ``model_opt`` is already a full ModelProto
         # here, so there is no reload to avoid -- just honor the save request.
+        _external_data_threshold_bytes = parse_size(external_data_threshold)
         try:
+            if model_opt.ByteSize() > _external_data_threshold_bytes:
+                raise ValueError("external_data_threshold")
             onnx.save(model_opt, output_path)
         except (ValueError, EncodeError):
             external_data_path = os.path.basename(output_path) + ".data"
@@ -1978,6 +2027,12 @@ def main():
         "--save-as-external-data",
         help="Save parameters as external data. This will make the .onnx file much smaller, but the .onnx file will depend on the external data file (.data).",
         action="store_true",
+    )
+    parser.add_argument(
+        "--external-data-threshold",
+        help="Save parameters as external data whenever the simplified model's serialized size exceeds this, without needing --save-as-external-data. Accepts the same '<number><unit>' syntax as --no-large-tensor, e.g. '500MB' or '2GB'. Defaults to '100MB'; raise it (e.g. to '2GB') to only externalize when inline saving is impossible, matching pre-existing behavior.",
+        type=str,
+        default=DEFAULT_EXTERNAL_DATA_THRESHOLD,
     )
     parser.add_argument(
         "--skip-schema-import",
@@ -2866,14 +2921,18 @@ def main():
             model_opt, calibration_data=calibration_data, method=args.calibration_method
         )
 
+    _external_data_threshold_bytes = parse_size(args.external_data_threshold)
     try:
-        if not args.save_as_external_data:
+        if not args.save_as_external_data and (
+            model_opt.ByteSize() <= _external_data_threshold_bytes
+        ):
             onnx.save(model_opt, args.output_model)
         else:
             raise ValueError("save_as_external_data")
     except (ValueError, EncodeError):
-        # large models (>2GB) which onnx.save doesn't support,
-        # or explicitly specified --save-as-external-data
+        # large models (>2GB) which onnx.save doesn't support, explicitly
+        # specified --save-as-external-data, or the model's serialized size
+        # exceeds --external-data-threshold (100MB by default)
         external_data_path = os.path.basename(args.output_model) + ".data"
         if os.path.exists(external_data_path):
             os.remove(external_data_path)

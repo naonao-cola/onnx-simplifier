@@ -1297,6 +1297,26 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
       },
       "in_path"_a);
 
+  // Loads a plain .onnx file (produced by any exporter, not necessarily
+  // onnxsim) whose weights live in classic ONNX external data, mmap'ing
+  // each distinct referenced file exactly once via a TensorPool instead of
+  // paying onnx's own per-tensor open+seek+read cost -- see
+  // tensor_pool_bridge.h's LoadModelWithTensorPool for the full rationale.
+  // Always hydrates every resolved tensor back to an ordinary in-memory
+  // TensorProto, since the pool itself (and its lazy hydrate_all=false
+  // mode) isn't exposed to Python.
+  m.def(
+      "load_model_with_tensor_pool",
+      [](const std::string& onnx_path) -> py::bytes {
+        onnx::ModelProto model;
+        onnxsim::tensor_pool::TensorPool pool;
+        onnxsim::tensor_pool::LoadModelWithTensorPool(onnx_path, &model, pool,
+                                                      /*hydrate_all=*/true);
+        const std::string out = model.SerializeAsString();
+        return py::bytes(out.data(), out.size());
+      },
+      "onnx_path"_a);
+
   m.def(
       "export_gguf",
       [](const py::bytes& model_bytes, const std::string& out_path) {
