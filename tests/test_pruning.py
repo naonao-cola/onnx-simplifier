@@ -3132,6 +3132,333 @@ def test_structured_wanda_pruning_matmul_residual_add_matches_oracle():
     np.testing.assert_allclose(y, y_oracle, rtol=1e-5, atol=1e-5)
 
 
+# --- apply_structured_pruning: MatMul/Gemm residual via SkipLayerNormalization ---
+#
+# The realistic shape the MatMul/Gemm residual tests above rarely see in
+# practice: a transformer already run through onnxruntime's own
+# transformer-optimizer tool, which fuses each residual `Add` (plus an
+# optional per-channel bias `Add`) together with the *following*
+# LayerNorm/RMSNorm into one `com.microsoft::SkipLayerNormalization`/
+# `SkipSimplifiedLayerNormalization` node -- see
+# `_match_matmul_residual_merge`'s own docstring and this module's "MatMul/
+# Gemm residual" section comment for the exact fused arithmetic (confirmed
+# against onnxruntime's own `skip_layer_norm.cc` kernel source and by
+# direct execution before any of this was written).
+
+
+def _skip_layer_norm_residual_diamond_model(
+    wf, ws, wout, gamma, beta=None, bias=None, simplified=False, epsilon=1e-5
+):
+    # y = SkipLayerNormalization(MatMul_f(X), MatMul_s(X), gamma, beta?,
+    # bias?) -- the SkipLayerNormalization/SkipSimplifiedLayerNormalization
+    # analogue of _matmul_residual_diamond_model: two entirely independent
+    # MatMul producers merge via the fused node instead of a bare `Add`, and
+    # must therefore still share one surviving channel-index set, feeding
+    # one real consumer. `beta`/`bias` are each included only if given --
+    # `beta` absent but `bias` present (SkipLayerNormalization only; the
+    # simplified/RMSNorm variant has no `beta` at all) uses the onnx text
+    # format's positional-placeholder syntax (an empty operand) to reach
+    # `bias`'s own input index with `beta` skipped, exactly the way this
+    # file's own GroupQueryAttention model builders already skip an unused
+    # optional input.
+    K, C = wf.shape
+    Out = wout.shape[1]
+    op = "SkipSimplifiedLayerNormalization" if simplified else "SkipLayerNormalization"
+    initializer = [
+        _f32(wf, "WF"),
+        _f32(ws, "WS"),
+        _f32(wout, "WOUT"),
+        _f32(gamma, "Gamma"),
+    ]
+    inputs = ["f", "s", "Gamma"]
+    if not simplified:
+        inputs.append("Beta" if beta is not None else "")
+        if beta is not None:
+            initializer.append(_f32(beta, "Beta"))
+    if bias is not None:
+        inputs.append("Bias")
+        initializer.append(_f32(bias, "Bias"))
+    while inputs and inputs[-1] == "":
+        inputs.pop()
+    ins = ", ".join(inputs)
+    model = _model(
+        f"""
+        g (float[batch,{K}] X) => (float[batch,{Out}] Y)
+        {{
+          f = MatMul(X, WF)
+          s = MatMul(X, WS)
+          y = com.microsoft.{op} <epsilon={epsilon}> ({ins})
+          Y = MatMul(y, WOUT)
+        }}
+        """,
+        initializer=initializer,
+        opset=17,
+    )
+    model.opset_import.append(onnx.helper.make_opsetid("com.microsoft", 1))
+    return model
+
+
+def _skip_layer_norm_keep(wf, ws, C):
+    importance = np.sqrt(
+        np.square(np.linalg.norm(wf.astype(np.float64), axis=0))
+        + np.square(np.linalg.norm(ws.astype(np.float64), axis=0))
+    )
+    keep = np.sort(np.argsort(-importance)[: C // 2])
+    # The conflicting-importance construction every test below uses is only
+    # doing its job if the combined keep set actually straddles both halves.
+    assert np.any(keep < C // 2) and np.any(keep >= C // 2)
+    return keep
+
+
+def _conflicting_wf_ws(seed, K, C):
+    rng = np.random.default_rng(seed)
+    scale_f = np.where(np.arange(C) < C // 2, 3.0, 0.3).astype(np.float32)
+    scale_s = np.where(np.arange(C) < C // 2, 0.3, 3.0).astype(np.float32)
+    wf = rng.standard_normal((K, C)).astype(np.float32) * scale_f
+    ws = rng.standard_normal((K, C)).astype(np.float32) * scale_s
+    return rng, wf, ws
+
+
+def test_structured_pruning_skip_layer_norm_residual_shrinks_matched_layers():
+    K, C, Out = 8, 16, 4
+    rng = np.random.default_rng(110)
+    wf = rng.standard_normal((K, C)).astype(np.float32)
+    ws = rng.standard_normal((K, C)).astype(np.float32)
+    wout = rng.standard_normal((C, Out)).astype(np.float32)
+    gamma = rng.standard_normal((C,)).astype(np.float32)
+    beta = rng.standard_normal((C,)).astype(np.float32)
+    model = _skip_layer_norm_residual_diamond_model(wf, ws, wout, gamma, beta=beta)
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    inits = {t.name: t for t in pruned.graph.initializer}
+    assert list(inits["WF"].dims) == [K, C // 2]
+    assert list(inits["WS"].dims) == [K, C // 2]
+    assert list(inits["WOUT"].dims) == [C // 2, Out]
+    assert list(inits["Gamma"].dims) == [C // 2]
+    assert list(inits["Beta"].dims) == [C // 2]
+
+
+def test_structured_pruning_skip_layer_norm_residual_matches_oracle():
+    # Correctness bar: exact equivalence to hand-slicing both independent
+    # MatMul producers *and* Gamma/Beta to the same combined-importance keep
+    # set -- with weights deliberately built so the two branches disagree
+    # about which channels matter most, so a bug that used only one
+    # branch's importance (or forgot to slice Gamma/Beta) would be caught,
+    # including by onnx.checker (a missed Gamma/Beta slice is a shape
+    # mismatch against the now-pruned MatMul outputs) and, more precisely,
+    # by the numeric oracle comparison below (a missed slice that
+    # onnxruntime's broadcasting rules happened to tolerate anyway would
+    # still compute the wrong per-channel scale/shift).
+    K, C, Out = 8, 16, 4
+    rng, wf, ws = _conflicting_wf_ws(110, K, C)
+    wout = rng.standard_normal((C, Out)).astype(np.float32)
+    gamma = rng.standard_normal((C,)).astype(np.float32)
+    beta = rng.standard_normal((C,)).astype(np.float32)
+    model = _skip_layer_norm_residual_diamond_model(wf, ws, wout, gamma, beta=beta)
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    keep = _skip_layer_norm_keep(wf, ws, C)
+    oracle = _skip_layer_norm_residual_diamond_model(
+        wf[:, keep], ws[:, keep], wout[keep, :], gamma[keep], beta=beta[keep]
+    )
+
+    rng_x = np.random.default_rng(111)
+    x = rng_x.standard_normal((5, K)).astype(np.float32)
+    (y,) = _run(pruned, {"X": x})
+    (y_oracle,) = _run(oracle, {"X": x})
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-5, atol=1e-5)
+
+
+def test_structured_pruning_skip_simplified_layer_norm_residual_matches_oracle():
+    # SkipSimplifiedLayerNormalization -- the RMSNorm variant LLaMA-style
+    # models use -- drops `beta`/mean-centering entirely (see this module's
+    # own docstring and the "MatMul/Gemm residual" section comment for the
+    # exact RMSNorm arithmetic); this is the same oracle bar as the plain
+    # SkipLayerNormalization test above, minus `beta`.
+    K, C, Out = 8, 16, 4
+    rng, wf, ws = _conflicting_wf_ws(112, K, C)
+    wout = rng.standard_normal((C, Out)).astype(np.float32)
+    gamma = rng.standard_normal((C,)).astype(np.float32)
+    model = _skip_layer_norm_residual_diamond_model(
+        wf, ws, wout, gamma, simplified=True
+    )
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    inits = {t.name: t for t in pruned.graph.initializer}
+    assert "Beta" not in inits
+
+    keep = _skip_layer_norm_keep(wf, ws, C)
+    oracle = _skip_layer_norm_residual_diamond_model(
+        wf[:, keep], ws[:, keep], wout[keep, :], gamma[keep], simplified=True
+    )
+
+    rng_x = np.random.default_rng(113)
+    x = rng_x.standard_normal((5, K)).astype(np.float32)
+    (y,) = _run(pruned, {"X": x})
+    (y_oracle,) = _run(oracle, {"X": x})
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-5, atol=1e-5)
+
+
+def test_structured_pruning_skip_layer_norm_residual_with_bias_matches_oracle():
+    # `bias` present (and, deliberately, `beta` absent -- SkipLayerNorm's
+    # own optional inputs are independent of each other): exercises the
+    # bias-idx-shift in `_skip_layer_norm_const_names` (bias lives at input
+    # index 4 when beta is declared, but the model builder above still
+    # reaches it via the parser's positional-placeholder syntax when beta
+    # is skipped) and confirms `Bias` is sliced correctly alongside `Gamma`.
+    K, C, Out = 8, 16, 4
+    rng, wf, ws = _conflicting_wf_ws(114, K, C)
+    wout = rng.standard_normal((C, Out)).astype(np.float32)
+    gamma = rng.standard_normal((C,)).astype(np.float32)
+    bias = rng.standard_normal((C,)).astype(np.float32)
+    model = _skip_layer_norm_residual_diamond_model(wf, ws, wout, gamma, bias=bias)
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    inits = {t.name: t for t in pruned.graph.initializer}
+    assert list(inits["Bias"].dims) == [C // 2]
+
+    keep = _skip_layer_norm_keep(wf, ws, C)
+    oracle = _skip_layer_norm_residual_diamond_model(
+        wf[:, keep], ws[:, keep], wout[keep, :], gamma[keep], bias=bias[keep]
+    )
+
+    rng_x = np.random.default_rng(115)
+    x = rng_x.standard_normal((5, K)).astype(np.float32)
+    (y,) = _run(pruned, {"X": x})
+    (y_oracle,) = _run(oracle, {"X": x})
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-5, atol=1e-5)
+
+
+def test_structured_pruning_skip_layer_norm_residual_declines_on_nonconstant_beta():
+    # `Beta` is a graph input, not a constant initializer -- `gamma` (also
+    # required) is fine, but a *present* non-constant `beta` still means
+    # this pass can't slice it, so the whole chain is declined and the
+    # model is left byte-identical, the same conservative bar a
+    # non-constant Gemm bias already gets elsewhere in this module.
+    K, C, Out = 8, 16, 4
+    rng = np.random.default_rng(116)
+    wf = rng.standard_normal((K, C)).astype(np.float32)
+    ws = rng.standard_normal((K, C)).astype(np.float32)
+    wout = rng.standard_normal((C, Out)).astype(np.float32)
+    gamma = rng.standard_normal((C,)).astype(np.float32)
+    model = _model(
+        f"""
+        g (float[batch,{K}] X, float[{C}] Beta) => (float[batch,{Out}] Y)
+        {{
+          f = MatMul(X, WF)
+          s = MatMul(X, WS)
+          y = com.microsoft.SkipLayerNormalization <epsilon=1e-5> (f, s, Gamma, Beta)
+          Y = MatMul(y, WOUT)
+        }}
+        """,
+        initializer=[
+            _f32(wf, "WF"),
+            _f32(ws, "WS"),
+            _f32(wout, "WOUT"),
+            _f32(gamma, "Gamma"),
+        ],
+        opset=17,
+    )
+    model.opset_import.append(onnx.helper.make_opsetid("com.microsoft", 1))
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    assert pruned.SerializeToString() == model.SerializeToString()
+
+
+def test_structured_pruning_skip_layer_norm_residual_declines_on_consumed_mean_output():
+    # The training-only `mean` output (index 1) is actually consumed here
+    # (wired straight to a second graph output) -- onnxruntime's own CPU
+    # kernel never actually populates it (see this module's own docstring),
+    # and this pass has no basis for whether pruning keeps it meaningful for
+    # whatever reads it, so the whole chain is declined outright rather
+    # than guessed at, leaving the model byte-identical.
+    K, C, Out = 8, 16, 4
+    rng = np.random.default_rng(117)
+    wf = rng.standard_normal((K, C)).astype(np.float32)
+    ws = rng.standard_normal((K, C)).astype(np.float32)
+    wout = rng.standard_normal((C, Out)).astype(np.float32)
+    gamma = rng.standard_normal((C,)).astype(np.float32)
+    beta = rng.standard_normal((C,)).astype(np.float32)
+    model = _model(
+        f"""
+        g (float[batch,{K}] X) => (float[batch,{Out}] Y, float[batch] MeanOut)
+        {{
+          f = MatMul(X, WF)
+          s = MatMul(X, WS)
+          y, MeanOut = com.microsoft.SkipLayerNormalization <epsilon=1e-5> (f, s, Gamma, Beta)
+          Y = MatMul(y, WOUT)
+        }}
+        """,
+        initializer=[
+            _f32(wf, "WF"),
+            _f32(ws, "WS"),
+            _f32(wout, "WOUT"),
+            _f32(gamma, "Gamma"),
+            _f32(beta, "Beta"),
+        ],
+        opset=17,
+    )
+    model.opset_import.append(onnx.helper.make_opsetid("com.microsoft", 1))
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    assert pruned.SerializeToString() == model.SerializeToString()
+
+
+def test_structured_wanda_pruning_skip_layer_norm_residual_matches_oracle():
+    # apply_structured_wanda_pruning picks up SkipLayerNormalization-fused
+    # residual grouping for free -- _find_matmul_residual_chains is shared
+    # with apply_structured_pruning, and the activation norm is captured at
+    # the same probe point (`chain.consumer_node.input[0]`) any other
+    # MatMul/Gemm chain uses.
+    K, C, Out = 8, 16, 4
+    rng = np.random.default_rng(118)
+    wf = rng.standard_normal((K, C)).astype(np.float32)
+    ws = rng.standard_normal((K, C)).astype(np.float32)
+    wout = rng.standard_normal((C, Out)).astype(np.float32)
+    gamma = rng.standard_normal((C,)).astype(np.float32)
+    beta = rng.standard_normal((C,)).astype(np.float32)
+    model = _skip_layer_norm_residual_diamond_model(wf, ws, wout, gamma, beta=beta)
+
+    probe_model = onnx.ModelProto()
+    probe_model.CopyFrom(model)
+    probe_model.graph.output.append(
+        onnx.helper.make_tensor_value_info("y", onnx.TensorProto.FLOAT, None)
+    )
+
+    rng_cal = np.random.default_rng(119)
+    x_cal = rng_cal.standard_normal((6, K)).astype(np.float32)
+    calibration_data = [{"X": x_cal}]
+
+    _, y_cal = _run(probe_model, {"X": x_cal})
+    act_norm = np.sqrt(np.mean(np.square(y_cal.astype(np.float64)), axis=0))
+    base_importance = np.sqrt(
+        np.square(np.linalg.norm(wf.astype(np.float64), axis=0))
+        + np.square(np.linalg.norm(ws.astype(np.float64), axis=0))
+    )
+    importance = base_importance * np.maximum(act_norm, 1e-8)
+    keep = np.sort(np.argsort(-importance)[: C // 2])
+
+    pruned = onnxsim.apply_structured_wanda_pruning(
+        model, calibration_data=calibration_data, sparsity=0.5
+    )
+    onnx.checker.check_model(pruned)
+
+    oracle = _skip_layer_norm_residual_diamond_model(
+        wf[:, keep], ws[:, keep], wout[keep, :], gamma[keep], beta=beta[keep]
+    )
+    rng_x = np.random.default_rng(120)
+    x = rng_x.standard_normal((5, K)).astype(np.float32)
+    (y,) = _run(pruned, {"X": x})
+    (y_oracle,) = _run(oracle, {"X": x})
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-5, atol=1e-5)
+
+
 # --- apply_structured_wanda_pruning ------------------------------------------
 
 
