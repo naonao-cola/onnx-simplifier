@@ -299,6 +299,48 @@ int main() {
     assert(Is(v, "sq", {"batch**2", "9"}, false));
   }
 
+  // === Split: even implicit split preserves the dynamic dim's identity =====
+  //   Shape([batch, 8]) -> Split(num_outputs=2) -> b == batch, eight == 8
+  {
+    SymGraph g;
+    g.shape["x"] = {batch, SymExpr(8)};
+    g.node = {N("Shape", {"x"}, {"s"}),
+              N("Split", {"s"}, {"b", "eight"}, {AInt("axis", 0)})};
+    const auto v = onnxsim::EvaluateSymbolicValues(g);
+    assert(Is(v, "b", {"batch"}, false));
+    assert(Is(v, "eight", {"8"}, false));
+  }
+
+  // Split with explicit sizes (the "split" attribute / opset-13+ 2nd input).
+  {
+    SymGraph g;
+    g.initializer["data"] = Vec({1, 2, 3, 4, 5});
+    g.node = {N("Split", {"data"}, {"head", "tail"}, {AInts("split", {2, 3})})};
+    const auto v = onnxsim::EvaluateSymbolicValues(g);
+    assert(Is(v, "head", {"1", "2"}, false));
+    assert(Is(v, "tail", {"3", "4", "5"}, false));
+  }
+
+  // An implicit split that does not divide evenly is left unresolved rather
+  // than guessing at the opset-specific remainder rule.
+  {
+    SymGraph g;
+    g.initializer["data"] = Vec({1, 2, 3});
+    g.node = {N("Split", {"data"}, {"a", "b"})};
+    const auto v = onnxsim::EvaluateSymbolicValues(g);
+    assert(v.find("a") == v.end());
+    assert(v.find("b") == v.end());
+  }
+
+  // === Identity passes the value through unchanged =========================
+  {
+    SymGraph g;
+    g.shape["x"] = {batch};
+    g.node = {N("Shape", {"x"}, {"s"}), N("Identity", {"s"}, {"id"})};
+    const auto v = onnxsim::EvaluateSymbolicValues(g);
+    assert(Is(v, "id", {"batch"}, false));
+  }
+
   // === Constant node seeds (value_ints) ====================================
   {
     SymGraph g;

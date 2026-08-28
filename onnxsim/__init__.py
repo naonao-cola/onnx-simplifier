@@ -87,6 +87,7 @@ from onnxsim.pruning import (
 )
 from onnxsim.quip_sharp import apply_quip_sharp
 from onnxsim.smoothquant import apply_smoothquant
+from onnxsim.spinquant import apply_spinquant
 from onnxsim.squeezellm import quantize_weight_only_squeezellm
 from onnxsim.tensorrt_sparsity import convert_matmul_to_gemm
 from onnxsim.transformers_export import export_transformers_model
@@ -113,6 +114,7 @@ __all__ = [
     "apply_llm_int8",
     "apply_low_rank_compensation",
     "apply_quip_sharp",
+    "apply_spinquant",
     "apply_omniquant",
     "apply_magnitude_pruning",
     "apply_wanda_pruning",

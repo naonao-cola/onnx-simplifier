@@ -10,9 +10,9 @@ import collections
 
 import numpy as np
 import onnx
-import onnx.helper
 import onnx.numpy_helper
 import pytest
+from onnx import parser
 
 import onnxsim
 
@@ -21,15 +21,18 @@ import onnxsim
 ort = pytest.importorskip("onnxruntime")
 
 
-def _model(nodes, inputs, outputs, initializer, opset=13):
-    graph = onnx.helper.make_graph(nodes, "g", inputs, outputs, initializer)
-    return onnx.helper.make_model(
-        graph, opset_imports=[onnx.helper.make_opsetid("", opset)], ir_version=10
+def _model(body, initializer=(), opset=13, ir_version=10):
+    model = parser.parse_model(
+        f"""
+        <
+          ir_version: {ir_version},
+          opset_import: ["": {opset}]
+        >
+        {body}
+        """
     )
-
-
-def _vi(name, shape):
-    return onnx.helper.make_tensor_value_info(name, onnx.TensorProto.FLOAT, shape)
+    model.graph.initializer.extend(initializer)
+    return model
 
 
 def _f32(array, name):
@@ -66,8 +69,15 @@ def test_quantize_matmul():
     rng = np.random.default_rng(0)
     K, N = 32, 16
     weight = _f32(rng.standard_normal((K, N)) * 0.5, "W")
-    nodes = [onnx.helper.make_node("MatMul", ["X", "W"], ["Y"])]
-    model = _model(nodes, [_vi("X", [4, K])], [_vi("Y", [4, N])], [weight])
+    model = _model(
+        f"""
+        g (float[4,{K}] X) => (float[4,{N}] Y)
+        {{
+          Y = MatMul(X, W)
+        }}
+        """,
+        initializer=[weight],
+    )
 
     quant = onnxsim.quantize_dynamic_matmul_integer_to_float(model)
     onnx.checker.check_model(quant)
@@ -94,8 +104,15 @@ def test_quantize_gemm_transb_with_bias():
     K, N = 24, 12
     weight = _f32(rng.standard_normal((N, K)) * 0.5, "W")
     bias = _f32(rng.standard_normal(N), "B")
-    nodes = [onnx.helper.make_node("Gemm", ["X", "W", "B"], ["Y"], transB=1)]
-    model = _model(nodes, [_vi("X", [3, K])], [_vi("Y", [3, N])], [weight, bias])
+    model = _model(
+        f"""
+        g (float[3,{K}] X) => (float[3,{N}] Y)
+        {{
+          Y = Gemm<transB = 1>(X, W, B)
+        }}
+        """,
+        initializer=[weight, bias],
+    )
 
     quant = onnxsim.quantize_dynamic_matmul_integer_to_float(model)
     onnx.checker.check_model(quant)
@@ -119,8 +136,15 @@ def test_quantize_matmul_no_bias_uses_empty_placeholder():
     rng = np.random.default_rng(2)
     K, N = 16, 8
     weight = _f32(rng.standard_normal((K, N)) * 0.5, "W")
-    nodes = [onnx.helper.make_node("MatMul", ["X", "W"], ["Y"])]
-    model = _model(nodes, [_vi("X", [2, K])], [_vi("Y", [2, N])], [weight])
+    model = _model(
+        f"""
+        g (float[2,{K}] X) => (float[2,{N}] Y)
+        {{
+          Y = MatMul(X, W)
+        }}
+        """,
+        initializer=[weight],
+    )
 
     quant = onnxsim.quantize_dynamic_matmul_integer_to_float(model)
     onnx.checker.check_model(quant)
@@ -132,16 +156,29 @@ def test_quantize_matmul_no_bias_uses_empty_placeholder():
 
 
 def test_quantize_skips_non_constant_weight():
-    nodes = [onnx.helper.make_node("MatMul", ["X", "W"], ["Y"])]
-    model = _model(nodes, [_vi("X", [4, 8]), _vi("W", [8, 4])], [_vi("Y", [4, 4])], [])
+    model = _model(
+        """
+        g (float[4,8] X, float[8,4] W) => (float[4,4] Y)
+        {
+          Y = MatMul(X, W)
+        }
+        """
+    )
     quant = onnxsim.quantize_dynamic_matmul_integer_to_float(model)
     assert _op_counts(quant)["MatMul"] == 1
 
 
 def test_quantize_skips_non_default_gemm_attrs():
     weight = _f32(np.random.randn(8, 4).astype(np.float32), "W")
-    nodes = [onnx.helper.make_node("Gemm", ["X", "W"], ["Y"], alpha=2.0)]
-    model = _model(nodes, [_vi("X", [4, 8])], [_vi("Y", [4, 4])], [weight])
+    model = _model(
+        """
+        g (float[4,8] X) => (float[4,4] Y)
+        {
+          Y = Gemm<alpha = 2.0>(X, W)
+        }
+        """,
+        initializer=[weight],
+    )
     quant = onnxsim.quantize_dynamic_matmul_integer_to_float(model)
     assert _op_counts(quant)["Gemm"] == 1
 
@@ -151,8 +188,15 @@ def test_quantize_skips_reduction_depth_that_would_overflow_int32():
 
     k = MAX_SAFE_INT32_REDUCTION_DEPTH + 1
     weight = _f32(np.random.randn(k, 1) * 0.01, "W")
-    nodes = [onnx.helper.make_node("MatMul", ["X", "W"], ["Y"])]
-    model = _model(nodes, [_vi("X", [1, k])], [_vi("Y", [1, 1])], [weight])
+    model = _model(
+        f"""
+        g (float[1,{k}] X) => (float[1,1] Y)
+        {{
+          Y = MatMul(X, W)
+        }}
+        """,
+        initializer=[weight],
+    )
 
     quant = onnxsim.quantize_dynamic_matmul_integer_to_float(model)
     onnx.checker.check_model(quant)
