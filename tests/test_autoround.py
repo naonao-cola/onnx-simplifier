@@ -6,24 +6,27 @@ INT4-quantized MatMul/Gemm layer, on top of what
 
 import numpy as np
 import onnx
-import onnx.helper
 import onnx.numpy_helper
 import pytest
+from onnx import parser
 
 import onnxsim
 
 ort = pytest.importorskip("onnxruntime")
 
 
-def _model(nodes, inputs, outputs, initializer, opset=21):
-    graph = onnx.helper.make_graph(nodes, "g", inputs, outputs, initializer)
-    return onnx.helper.make_model(
-        graph, opset_imports=[onnx.helper.make_opsetid("", opset)], ir_version=10
+def _model(body, initializer=(), opset=21, ir_version=10):
+    model = parser.parse_model(
+        f"""
+        <
+          ir_version: {ir_version},
+          opset_import: ["": {opset}]
+        >
+        {body}
+        """
     )
-
-
-def _vi(name, shape):
-    return onnx.helper.make_tensor_value_info(name, onnx.TensorProto.FLOAT, shape)
+    model.graph.initializer.extend(initializer)
+    return model
 
 
 def _f32(array, name):
@@ -38,11 +41,13 @@ def _run(model, feeds):
 
 
 def _matmul_model(weight, K, N, batch, opset=21):
-    nodes = [onnx.helper.make_node("MatMul", ["X", "W"], ["Y"])]
     return _model(
-        nodes,
-        [_vi("X", [batch, K])],
-        [_vi("Y", [batch, N])],
+        f"""
+        g (float[{batch},{K}] X) => (float[{batch},{N}] Y)
+        {{
+          Y = MatMul(X, W)
+        }}
+        """,
         [_f32(weight, "W")],
         opset=opset,
     )
@@ -260,8 +265,14 @@ def test_autoround_codes_stay_in_range_and_output_finite():
 
 
 def test_autoround_noop_when_no_int4_matmul_present():
-    nodes = [onnx.helper.make_node("Relu", ["X"], ["Y"])]
-    model = _model(nodes, [_vi("X", [4, 4])], [_vi("Y", [4, 4])], [])
+    model = _model(
+        """
+        g (float[4,4] X) => (float[4,4] Y)
+        {
+          Y = Relu(X)
+        }
+        """
+    )
     result = onnxsim.apply_autoround(
         model, model, calibration_data=[{"X": np.zeros((4, 4), dtype=np.float32)}]
     )
