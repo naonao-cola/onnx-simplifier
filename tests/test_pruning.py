@@ -3410,6 +3410,49 @@ def test_structured_pruning_skip_layer_norm_residual_declines_on_consumed_mean_o
     assert pruned.SerializeToString() == model.SerializeToString()
 
 
+def test_structured_pruning_skip_layer_norm_residual_declines_on_consumed_sum_output():
+    # The fourth output, `input_skip_bias_sum` (the raw, pre-normalization
+    # `f + s`), is consumed directly here by a second graph output. Unlike
+    # `mean`/`inv_std_var`, this pass never reads this output itself and its
+    # *value* would still be correct post-pruning (it's a plain runtime sum
+    # of two already-consistently-pruned tensors) -- but its *shape* shrinks
+    # along with `f`/`s`, and this pass has no way to confirm the outside
+    # consumer (here, the graph's own declared output shape) still expects
+    # the new, narrower width. Declined outright, model left byte-identical
+    # -- confirmed to actually matter: before this decline existed, pruning
+    # produced a model whose `SumOut` graph output disagreed with its own
+    # declared shape (a lenient-merge warning from onnxruntime, and a hard
+    # failure for any stricter consumer of that output elsewhere).
+    K, C, Out = 8, 16, 4
+    rng = np.random.default_rng(119)
+    wf = rng.standard_normal((K, C)).astype(np.float32)
+    ws = rng.standard_normal((K, C)).astype(np.float32)
+    wout = rng.standard_normal((C, Out)).astype(np.float32)
+    gamma = rng.standard_normal((C,)).astype(np.float32)
+    model = _model(
+        f"""
+        g (float[batch,{K}] X) => (float[batch,{Out}] Y, float[batch,{C}] SumOut)
+        {{
+          f = MatMul(X, WF)
+          s = MatMul(X, WS)
+          y, mean, inv_std, SumOut = com.microsoft.SkipSimplifiedLayerNormalization <epsilon=1e-5> (f, s, Gamma)
+          Y = MatMul(y, WOUT)
+        }}
+        """,
+        initializer=[
+            _f32(wf, "WF"),
+            _f32(ws, "WS"),
+            _f32(wout, "WOUT"),
+            _f32(gamma, "Gamma"),
+        ],
+        opset=17,
+    )
+    model.opset_import.append(onnx.helper.make_opsetid("com.microsoft", 1))
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    assert pruned.SerializeToString() == model.SerializeToString()
+
+
 def test_structured_wanda_pruning_skip_layer_norm_residual_matches_oracle():
     # apply_structured_wanda_pruning picks up SkipLayerNormalization-fused
     # residual grouping for free -- _find_matmul_residual_chains is shared
@@ -3456,6 +3499,73 @@ def test_structured_wanda_pruning_skip_layer_norm_residual_matches_oracle():
     x = rng_x.standard_normal((5, K)).astype(np.float32)
     (y,) = _run(pruned, {"X": x})
     (y_oracle,) = _run(oracle, {"X": x})
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-5, atol=1e-5)
+
+
+def test_structured_pruning_mixed_add_and_skip_layer_norm_spine_matches_oracle():
+    # A transitive spine of *two different* merge-node kinds sharing one
+    # channel count: a bare `Add` (f1, s1) feeds forward as one operand of a
+    # downstream `SkipLayerNormalization` merge (with f2 as the other) --
+    # the "many residual blocks share one spine" case, but mixing an
+    # ordinary transformer-block Add-residual with a fused post-LN block
+    # right after it, exactly the shape a real model transitioning between
+    # an un-fused and a fused block would take. `_walk_matmul_producer_backward`'s
+    # own "resolves to another eligible merge node's raw output" case
+    # doesn't care which kind of node it resolves to -- confirmed here with
+    # a genuinely mixed pair rather than two of the same kind.
+    K, C, Kz, Out = 8, 16, 5, 4
+    rng = np.random.default_rng(121)
+    wf1 = rng.standard_normal((K, C)).astype(np.float32)
+    ws1 = rng.standard_normal((K, C)).astype(np.float32)
+    wf2 = rng.standard_normal((Kz, C)).astype(np.float32)
+    wout = rng.standard_normal((C, Out)).astype(np.float32)
+    gamma = rng.standard_normal((C,)).astype(np.float32)
+
+    def _build(wf1, ws1, wf2, wout, gamma):
+        return _model(
+            f"""
+            g (float[batch,{wf1.shape[0]}] X, float[batch,{wf2.shape[0]}] Z) => (float[batch,{wout.shape[1]}] Y)
+            {{
+              f1 = MatMul(X, WF1)
+              s1 = MatMul(X, WS1)
+              add1 = Add(f1, s1)
+              f2 = MatMul(Z, WF2)
+              merged, mean, inv_std, sbs = com.microsoft.SkipSimplifiedLayerNormalization <epsilon=1e-5> (f2, add1, Gamma)
+              Y = MatMul(merged, WOUT)
+            }}
+            """,
+            initializer=[
+                _f32(wf1, "WF1"),
+                _f32(ws1, "WS1"),
+                _f32(wf2, "WF2"),
+                _f32(wout, "WOUT"),
+                _f32(gamma, "Gamma"),
+            ],
+            opset=17,
+        )
+
+    model = _build(wf1, ws1, wf2, wout, gamma)
+    model.opset_import.append(onnx.helper.make_opsetid("com.microsoft", 1))
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    importance = np.sqrt(
+        np.square(np.linalg.norm(wf1.astype(np.float64), axis=0))
+        + np.square(np.linalg.norm(ws1.astype(np.float64), axis=0))
+        + np.square(np.linalg.norm(wf2.astype(np.float64), axis=0))
+    )
+    keep = np.sort(np.argsort(-importance)[: C // 2])
+    oracle = _build(
+        wf1[:, keep], ws1[:, keep], wf2[:, keep], wout[keep, :], gamma[keep]
+    )
+    oracle.opset_import.append(onnx.helper.make_opsetid("com.microsoft", 1))
+
+    rng_x = np.random.default_rng(122)
+    x = rng_x.standard_normal((5, K)).astype(np.float32)
+    z = rng_x.standard_normal((5, Kz)).astype(np.float32)
+    (y,) = _run(pruned, {"X": x, "Z": z})
+    (y_oracle,) = _run(oracle, {"X": x, "Z": z})
     np.testing.assert_allclose(y, y_oracle, rtol=1e-5, atol=1e-5)
 
 

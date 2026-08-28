@@ -2545,15 +2545,24 @@ def _find_conv_residual_chains(graph: onnx.GraphProto) -> List[_Chain]:
 # for whether pruning keeps those values meaningful for whatever reads them,
 # so it declines outright rather than guessing, same as everywhere else in
 # this pass. The optional fourth output, `input_skip_bias_sum` (the raw,
-# pre-normalization sum), needs no special handling at all: this pass never
-# reads it, and in the common post-LN transformer shape a later residual
-# connection's own `skip` operand is simply the *previous*
-# `SkipLayerNormalization`'s ordinary (normalized) `output` -- not that raw
-# sum -- so the very same "resolves to another eligible merge node's raw
-# output" backward-walk case :func:`_walk_matmul_producer_backward` already
-# handles for a chain of bare `Add`s (the "many residual blocks share one
-# spine" case) covers a chain of `SkipLayerNormalization` nodes for free,
-# with no dedicated code of its own.
+# pre-normalization sum), gets the same "declines if consumed" treatment,
+# for a different reason: this pass never reads it itself, and in the
+# common post-LN transformer shape a later residual connection's own `skip`
+# operand is simply the *previous* `SkipLayerNormalization`'s ordinary
+# (normalized) `output` -- not that raw sum -- so the "resolves to another
+# eligible merge node's raw output" backward-walk case
+# :func:`_walk_matmul_producer_backward` already handles for a chain of
+# bare `Add`s covers a chain of `SkipLayerNormalization` nodes for free.
+# But if *something else* in the graph reads `input_skip_bias_sum`
+# directly, pruning still changes its width -- it's a plain runtime sum of
+# `input`/`skip`, so it naturally comes out however wide those two end up
+# post-pruning, no static array to reslice -- and this pass has no way to
+# confirm that other consumer expects the new width rather than the
+# original one (confirmed concretely: a second graph output reading it
+# directly ends up with a shape mismatch against its own originally
+# declared shape). So it's declined whenever consumed by anything, the
+# same conservative bar `mean`/`inv_std_var` get, just for a shape reason
+# rather than a values-still-meaningful one.
 
 
 _SKIP_LAYER_NORM_OPS = ("SkipLayerNormalization", "SkipSimplifiedLayerNormalization")
@@ -2649,12 +2658,25 @@ def _match_matmul_residual_merge(
 
     Declines (``None``) the same way :func:`_skip_layer_norm_const_names`
     does for a non-constant/tied `gamma`/`beta`/`bias`, and additionally
-    whenever the op's optional `mean`/`inv_std_var` outputs (training-only;
-    onnxruntime's own CPU kernel never actually writes them, see this
-    section's own comment) are actually consumed by anything else in the
-    graph: this pass has no basis for whether pruning keeps those still
-    meaningful for whatever reads them, so it declines outright rather than
-    guessing, the same conservative bar this module draws everywhere else.
+    whenever any of the op's optional secondary outputs -- `mean`/
+    `inv_std_var` (training-only; onnxruntime's own CPU kernel never
+    actually writes them) *or* `input_skip_bias_sum` (the raw pre-norm sum)
+    -- are actually consumed by anything else in the graph. `mean`/
+    `inv_std_var`: this pass has no basis for whether pruning keeps those
+    still meaningful for whatever reads them. `input_skip_bias_sum` is
+    different in kind -- this pass never reads it itself, and its *shape*
+    (not its meaningfulness) is what's at risk: it naturally comes out
+    however wide `input`/`skip` end up post-pruning (a plain runtime sum of
+    two already-consistently-pruned tensors, nothing to reslice), but any
+    *other* consumer of it outside this chain has no idea that width just
+    changed and may expect the original one -- confirmed concretely: a
+    second graph output reading it directly ends up with a shape mismatch
+    against its own originally-declared shape once pruned. So this output
+    is held to the same "not consumed elsewhere" bar as `mean`/
+    `inv_std_var`, not because its value would be wrong, but because
+    nothing here can confirm whatever reads it still expects the resulting
+    shape -- the same "no basis to guess a shape survives" reasoning this
+    module already applies to fan-out generally.
     """
     if _is_eligible_add_merge(node, initializer_map):
         return (node.input[0], node.input[1]), ()
@@ -2681,7 +2703,7 @@ def _match_matmul_residual_merge(
         return None
     gamma_name, beta_name, bias_name = const_names
 
-    for out_idx in (1, 2):  # mean, inv_std_var: training-only, see docstring
+    for out_idx in (1, 2, 3):  # mean, inv_std_var, input_skip_bias_sum
         if len(node.output) > out_idx and node.output[out_idx]:
             out_name = node.output[out_idx]
             if consumers_of.get(out_name) or out_name in graph_outputs:
