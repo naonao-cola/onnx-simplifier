@@ -766,9 +766,7 @@ def test_loop_with_const_trip_count_is_unrolled():
         [step],
     )
     trip_count = helper.make_tensor("trip_count", TensorProto.INT64, [], [3])
-    loop_node = helper.make_node(
-        "Loop", ["trip_count", "", "x"], ["y"], body=body
-    )
+    loop_node = helper.make_node("Loop", ["trip_count", "", "x"], ["y"], body=body)
     graph = helper.make_graph(
         [loop_node],
         "g",
