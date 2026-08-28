@@ -22,9 +22,9 @@ import collections
 
 import numpy as np
 import onnx
-import onnx.helper
 import onnx.numpy_helper
 import pytest
+from onnx import parser
 
 import onnxsim
 
@@ -34,8 +34,18 @@ import onnxsim
 ort = pytest.importorskip("onnxruntime")
 
 
-def _vi(name, shape):
-    return onnx.helper.make_tensor_value_info(name, onnx.TensorProto.FLOAT, shape)
+def _model(body, initializer=(), opset=17, ir_version=10):
+    model = parser.parse_model(
+        f"""
+        <
+          ir_version: {ir_version},
+          opset_import: ["": {opset}]
+        >
+        {body}
+        """
+    )
+    model.graph.initializer.extend(initializer)
+    return model
 
 
 def _f32(array, name):
@@ -99,46 +109,44 @@ def _gqa_model(B=2, S=6, NH=8, NKV=2, Dh=16, seed=0):
         _i64([B, S, H], "shape_ctx"),
     ]
 
-    def repeat_kv_nodes(raw_name, prefix):
-        return [
-            onnx.helper.make_node(
-                "Unsqueeze", [raw_name, "unsq_axes"], [f"{prefix}_unsq"]
-            ),
-            onnx.helper.make_node(
-                "Expand", [f"{prefix}_unsq", "expand_shape"], [f"{prefix}_exp"]
-            ),
-            onnx.helper.make_node(
-                "Reshape", [f"{prefix}_exp", "merge_shape"], [f"{prefix}_rep"]
-            ),
-        ]
+    def repeat_kv_body(raw_name, prefix):
+        return (
+            f"{prefix}_unsq = Unsqueeze({raw_name}, unsq_axes)\n"
+            f"{prefix}_exp = Expand({prefix}_unsq, expand_shape)\n"
+            f"{prefix}_rep = Reshape({prefix}_exp, merge_shape)\n"
+        )
 
-    nodes = [
-        onnx.helper.make_node("MatMul", ["x", "wq"], ["q_mm"]),
-        onnx.helper.make_node("Reshape", ["q_mm", "shape_q"], ["q_r"]),
-        onnx.helper.make_node("Transpose", ["q_r"], ["q_t"], perm=[0, 2, 1, 3]),
-        onnx.helper.make_node("MatMul", ["x", "wk"], ["k_mm"]),
-        onnx.helper.make_node("Reshape", ["k_mm", "shape_kv"], ["k_r"]),
-        onnx.helper.make_node("Transpose", ["k_r"], ["k_raw"], perm=[0, 2, 1, 3]),
-        *repeat_kv_nodes("k_raw", "k"),
-        onnx.helper.make_node("Transpose", ["k_rep"], ["k_t"], perm=[0, 1, 3, 2]),
-        onnx.helper.make_node("MatMul", ["x", "wv"], ["v_mm"]),
-        onnx.helper.make_node("Reshape", ["v_mm", "shape_kv"], ["v_r"]),
-        onnx.helper.make_node("Transpose", ["v_r"], ["v_raw"], perm=[0, 2, 1, 3]),
-        *repeat_kv_nodes("v_raw", "v"),
-        onnx.helper.make_node("MatMul", ["q_t", "k_t"], ["qk"]),
-        onnx.helper.make_node("Div", ["qk", "sqrt_dh"], ["scores"]),
-        onnx.helper.make_node("Add", ["scores", "mask"], ["masked"]),
-        onnx.helper.make_node("Softmax", ["masked"], ["probs"], axis=-1),
-        onnx.helper.make_node("MatMul", ["probs", "v_rep"], ["ctx0"]),
-        onnx.helper.make_node("Transpose", ["ctx0"], ["ctx1"], perm=[0, 2, 1, 3]),
-        onnx.helper.make_node("Reshape", ["ctx1", "shape_ctx"], ["ctx2"]),
-        onnx.helper.make_node("MatMul", ["ctx2", "wo"], ["y"]),
-    ]
-    graph = onnx.helper.make_graph(
-        nodes, "g", [_vi("x", [B, S, H])], [_vi("y", [B, S, H])], inits
+    body = (
+        "q_mm = MatMul(x, wq)\n"
+        "q_r = Reshape(q_mm, shape_q)\n"
+        "q_t = Transpose<perm = [0, 2, 1, 3]>(q_r)\n"
+        "k_mm = MatMul(x, wk)\n"
+        "k_r = Reshape(k_mm, shape_kv)\n"
+        "k_raw = Transpose<perm = [0, 2, 1, 3]>(k_r)\n"
+        + repeat_kv_body("k_raw", "k")
+        + "k_t = Transpose<perm = [0, 1, 3, 2]>(k_rep)\n"
+        "v_mm = MatMul(x, wv)\n"
+        "v_r = Reshape(v_mm, shape_kv)\n"
+        "v_raw = Transpose<perm = [0, 2, 1, 3]>(v_r)\n"
+        + repeat_kv_body("v_raw", "v")
+        + "qk = MatMul(q_t, k_t)\n"
+        "scores = Div(qk, sqrt_dh)\n"
+        "masked = Add(scores, mask)\n"
+        "probs = Softmax<axis = -1>(masked)\n"
+        "ctx0 = MatMul(probs, v_rep)\n"
+        "ctx1 = Transpose<perm = [0, 2, 1, 3]>(ctx0)\n"
+        "ctx2 = Reshape(ctx1, shape_ctx)\n"
+        "y = MatMul(ctx2, wo)\n"
     )
-    return onnx.helper.make_model(
-        graph, opset_imports=[onnx.helper.make_opsetid("", 17)], ir_version=10
+
+    return _model(
+        f"""
+        g (float[{B},{S},{H}] x) => (float[{B},{S},{H}] y)
+        {{
+          {body}
+        }}
+        """,
+        initializer=inits,
     )
 
 
@@ -173,6 +181,7 @@ def _rope_model(B=2, NH=4, S=6, Dh=8, seed=0):
     half = Dh // 2
     H = NH * Dh
     rng = np.random.default_rng(seed)
+    int_max = np.iinfo(np.int64).max
     inits = [
         _f32(rng.standard_normal((H, H)) * 0.1, "wq"),
         _f32(rng.standard_normal((H, H)) * 0.1, "wk"),
@@ -180,66 +189,50 @@ def _rope_model(B=2, NH=4, S=6, Dh=8, seed=0):
         _i64([0], "slice_start0"),
         _i64([half], f"slice_end{half}"),
         _i64([half], f"slice_start{half}"),
-        _i64([np.iinfo(np.int64).max], "slice_end_max"),
+        _i64([int_max], "slice_end_max"),
         _i64([-1], "slice_axism1"),
         _i64([1], "unsq_axis1"),
     ]
 
-    def rope_apply_nodes(x_name, prefix):
-        return [
-            onnx.helper.make_node("Mul", [x_name, "cos_bcast"], [f"{prefix}_a"]),
-            onnx.helper.make_node(
-                "Slice",
-                [x_name, "slice_start0", f"slice_end{half}", "slice_axism1"],
-                [f"{prefix}_x1"],
-            ),
-            onnx.helper.make_node(
-                "Slice",
-                [x_name, f"slice_start{half}", "slice_end_max", "slice_axism1"],
-                [f"{prefix}_x2"],
-            ),
-            onnx.helper.make_node("Neg", [f"{prefix}_x2"], [f"{prefix}_neg_x2"]),
-            onnx.helper.make_node(
-                "Concat",
-                [f"{prefix}_neg_x2", f"{prefix}_x1"],
-                [f"{prefix}_rotated"],
-                axis=-1,
-            ),
-            onnx.helper.make_node(
-                "Mul", [f"{prefix}_rotated", "sin_bcast"], [f"{prefix}_b"]
-            ),
-            onnx.helper.make_node(
-                "Add", [f"{prefix}_a", f"{prefix}_b"], [f"{prefix}_embed"]
-            ),
-        ]
+    def rope_apply_body(x_name, prefix):
+        return (
+            f"{prefix}_a = Mul({x_name}, cos_bcast)\n"
+            f"{prefix}_x1 = Slice({x_name}, slice_start0, slice_end{half}, slice_axism1)\n"
+            f"{prefix}_x2 = Slice({x_name}, slice_start{half}, slice_end_max, slice_axism1)\n"
+            f"{prefix}_neg_x2 = Neg({prefix}_x2)\n"
+            f"{prefix}_rotated = Concat<axis = -1>({prefix}_neg_x2, {prefix}_x1)\n"
+            f"{prefix}_b = Mul({prefix}_rotated, sin_bcast)\n"
+            f"{prefix}_embed = Add({prefix}_a, {prefix}_b)\n"
+        )
 
-    nodes = [
-        onnx.helper.make_node("MatMul", ["x", "wq"], ["q_mm"]),
-        onnx.helper.make_node("Reshape", ["q_mm", "shape_qk"], ["q_r"]),
-        onnx.helper.make_node("Transpose", ["q_r"], ["q"], perm=[0, 2, 1, 3]),
-        onnx.helper.make_node("MatMul", ["x", "wk"], ["k_mm"]),
-        onnx.helper.make_node("Reshape", ["k_mm", "shape_qk"], ["k_r"]),
-        onnx.helper.make_node("Transpose", ["k_r"], ["k"], perm=[0, 2, 1, 3]),
-        onnx.helper.make_node("Concat", ["angle", "angle"], ["emb"], axis=-1),
-        onnx.helper.make_node("Cos", ["emb"], ["cos_full"]),
-        onnx.helper.make_node("Sin", ["emb"], ["sin_full"]),
-        onnx.helper.make_node("Unsqueeze", ["cos_full", "unsq_axis1"], ["cos_bcast"]),
-        onnx.helper.make_node("Unsqueeze", ["sin_full", "unsq_axis1"], ["sin_bcast"]),
-    ]
-    nodes += rope_apply_nodes("q", "q")
-    nodes += rope_apply_nodes("k", "k")
-    nodes.append(onnx.helper.make_node("Identity", ["q_embed"], ["y_q"]))
-    nodes.append(onnx.helper.make_node("Identity", ["k_embed"], ["y_k"]))
-
-    graph = onnx.helper.make_graph(
-        nodes,
-        "g",
-        [_vi("x", [B, S, H]), _vi("angle", [B, S, half])],
-        [_vi("y_q", [B, NH, S, Dh]), _vi("y_k", [B, NH, S, Dh])],
-        inits,
+    body = (
+        "q_mm = MatMul(x, wq)\n"
+        "q_r = Reshape(q_mm, shape_qk)\n"
+        "q = Transpose<perm = [0, 2, 1, 3]>(q_r)\n"
+        "k_mm = MatMul(x, wk)\n"
+        "k_r = Reshape(k_mm, shape_qk)\n"
+        "k = Transpose<perm = [0, 2, 1, 3]>(k_r)\n"
+        "emb = Concat<axis = -1>(angle, angle)\n"
+        "cos_full = Cos(emb)\n"
+        "sin_full = Sin(emb)\n"
+        "cos_bcast = Unsqueeze(cos_full, unsq_axis1)\n"
+        "sin_bcast = Unsqueeze(sin_full, unsq_axis1)\n"
+        + rope_apply_body("q", "q")
+        + rope_apply_body("k", "k")
+        + "y_q = Identity(q_embed)\n"
+        "y_k = Identity(k_embed)\n"
     )
-    return onnx.helper.make_model(
-        graph, opset_imports=[onnx.helper.make_opsetid("", 23)], ir_version=11
+
+    return _model(
+        f"""
+        g (float[{B},{S},{H}] x, float[{B},{S},{half}] angle) => (float[{B},{NH},{S},{Dh}] y_q, float[{B},{NH},{S},{Dh}] y_k)
+        {{
+          {body}
+        }}
+        """,
+        initializer=inits,
+        opset=23,
+        ir_version=11,
     )
 
 
