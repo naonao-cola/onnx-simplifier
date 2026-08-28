@@ -440,6 +440,9 @@ def test_cli_external_data_threshold_forces_external_data():
         hydrated, _pool = onnxsim.load_model(output_path)
         folded = onnx.numpy_helper.to_array(hydrated.graph.initializer[0])
         np.testing.assert_allclose(folded, a + b, rtol=1e-5, atol=1e-6)
+        # _pool mmaps output_path + ".data" -- on Windows an open mapping
+        # blocks deleting the file, so it must not outlive this block.
+        del _pool
 
 
 def test_unset_optional_input():
@@ -1083,6 +1086,20 @@ def test_load_model_hydrates_classic_external_data():
 
         loaded, pool = onnxsim.load_model(model_path)
 
+        # Read everything needed from the pool while it's still alive: its
+        # classic-external-data entries mmap model.data, and on Windows an
+        # open mapping blocks deleting the file, so `pool` must not outlive
+        # this block's directory cleanup. The values captured here (ints,
+        # strs, bytes) are plain copies, independent of the mapping.
+        pool_len = len(pool)
+        pool_names = set(pool.names())
+        pool_bytes_a = pool.bytes("a")
+        pool_bytes_b = pool.bytes("b")
+        pool_dtype_a = pool.dtype("a")
+        pool_shape_a = pool.shape("a")
+        pool_hash_a = pool.content_hash("a")
+        del pool
+
     for init in loaded.graph.initializer:
         assert init.data_location == onnx.TensorProto.DEFAULT
     values = {
@@ -1091,13 +1108,13 @@ def test_load_model_hydrates_classic_external_data():
     np.testing.assert_allclose(values["a"], a)
     np.testing.assert_allclose(values["b"], b)
 
-    assert len(pool) == 2
-    assert set(pool.names()) == {"a", "b"}
-    assert pool.bytes("a") == a.tobytes()
-    assert pool.bytes("b") == b.tobytes()
-    assert pool.dtype("a") == onnx.TensorProto.FLOAT
-    assert pool.shape("a") == [64, 64]
-    assert len(pool.content_hash("a")) == 64  # hex-encoded BLAKE3 digest
+    assert pool_len == 2
+    assert pool_names == {"a", "b"}
+    assert pool_bytes_a == a.tobytes()
+    assert pool_bytes_b == b.tobytes()
+    assert pool_dtype_a == onnx.TensorProto.FLOAT
+    assert pool_shape_a == [64, 64]
+    assert len(pool_hash_a) == 64  # hex-encoded BLAKE3 digest
 
 
 def test_load_model_hydrate_all_false_leaves_tensors_external():
@@ -1130,11 +1147,17 @@ def test_load_model_hydrate_all_false_leaves_tensors_external():
         )
         loaded, pool = onnxsim.load_model(model_path, hydrate_all=False)
 
+        # See test_load_model_hydrates_classic_external_data's comment on
+        # why `pool` must not outlive this block.
+        pool_has_a = "a" in pool
+        pool_bytes_a = pool.bytes("a")
+        del pool
+
     assert loaded.graph.initializer[0].data_location == onnx.TensorProto.EXTERNAL
     assert loaded.graph.initializer[0].raw_data == b""
-    assert "a" in pool
+    assert pool_has_a
     np.testing.assert_allclose(
-        np.frombuffer(pool.bytes("a"), dtype=np.float32).reshape(64, 64), a
+        np.frombuffer(pool_bytes_a, dtype=np.float32).reshape(64, 64), a
     )
 
 
@@ -1432,6 +1455,10 @@ def test_output_path_falls_back_to_external_data_past_2gb():
         saved, _pool = onnxsim.load_model(output_path)
         folded = onnx.numpy_helper.to_array(saved.graph.initializer[0])
         np.testing.assert_allclose(folded, a + b, rtol=1e-5, atol=1e-6)
+        # _pool's classic-external-data entries mmap output_path + ".data";
+        # on Windows an open mapping blocks deleting the file, so it must not
+        # outlive this block's directory cleanup.
+        del _pool
 
 
 def test_output_path_external_data_threshold_default_keeps_small_model_inline():
@@ -1482,6 +1509,9 @@ def test_output_path_external_data_threshold_forces_external_data():
         hydrated, _pool = onnxsim.load_model(output_path)
         folded = onnx.numpy_helper.to_array(hydrated.graph.initializer[0])
         np.testing.assert_allclose(folded, a + b, rtol=1e-5, atol=1e-6)
+        # _pool mmaps output_path + ".data" -- on Windows an open mapping
+        # blocks deleting the file, so it must not outlive this block.
+        del _pool
 
 
 def test_model_info_size_counts_external_data_without_loading():

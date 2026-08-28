@@ -416,6 +416,15 @@ def load_model(
             ``name in pool``, ``pool.names()``, and, per tensor,
             ``pool.dtype(name)``, ``pool.shape(name)``, ``pool.bytes(name)``
             and ``pool.content_hash(name)``.
+
+            For an ordinary ``.onnx`` file, the pool's entries may be a
+            zero-copy memory mapping of the external-data file(s) on disk
+            (see above): on Windows (unlike POSIX), the mapped file cannot
+            be deleted or moved while the pool is still alive. Drop the
+            pool (e.g. ``del pool``, or simply let it go out of scope)
+            before deleting or replacing that file -- ``pool.bytes(name)``
+            and friends already return independent copies, so extracting
+            what you need and then dropping the pool is always safe.
     """
     model_bytes, pool = C.load_model(path, hydrate_all)
     model = onnx.ModelProto()

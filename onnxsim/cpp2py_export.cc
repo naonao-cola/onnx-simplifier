@@ -1271,6 +1271,14 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
   // caller can inspect what was actually loaded -- e.g. verify a tensor's
   // ContentHash, or hydrate one on demand after a ``hydrate_all=False``
   // load -- without re-deriving it from the model's own initializers.
+  //
+  // Caveat inherited from mmap_file.h's TryMmapFile (see its own doc
+  // comment): for a classic-external-data load, an entry's bytes may alias
+  // a live memory mapping of the file on disk, so on Windows that file
+  // can't be deleted or moved while this pool object is still alive (POSIX
+  // has no such restriction). `bytes`/`dtype`/`shape`/`content_hash` below
+  // all return independent copies, so extracting what's needed and then
+  // dropping the pool is always safe.
   py::class_<onnxsim::tensor_pool::TensorPool>(m, "TensorPool")
       .def("__len__", &onnxsim::tensor_pool::TensorPool::size)
       .def("__contains__",
