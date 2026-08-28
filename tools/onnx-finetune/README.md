@@ -159,14 +159,48 @@ python3 scripts/apply_lora_adapter.py model.onnx --adapter adapter.onnx \
 `inject_lora.py` adds, per targeted weight `W`, a
 `(alpha/rank) * (X @ lora_A @ lora_B)` branch alongside that layer's existing
 output (`lora_A` Kaiming-normal, `lora_B` zero, so injecting is a no-op until
-trained). `adapter.onnx` from step 4 is not a runnable model by itself --
-it's a plain tensor container holding just the `lora_A`/`lora_B` initializers
--- meant to be re-merged with `apply_lora_adapter.py`, not loaded directly
-into a session. This is a portable, ONNX-native adapter format built on
-these scripts; it is not the same binary format as ONNX Runtime GenAI's
+trained). Eligible layers are MatMul, Gemm (any `transA`/`transB`), and
+1x1/`group=1` Conv (a pointwise conv is just a per-pixel linear layer over
+channels) -- see `scripts/lora_surgery.py`'s own docstring for the exact
+rule. `adapter.onnx` from step 4 is not a runnable model by itself -- it's a
+plain tensor container holding just the `lora_A`/`lora_B` initializers --
+meant to be re-merged with `apply_lora_adapter.py`, not loaded directly into
+a session. This is a portable, ONNX-native adapter format built on these
+scripts; it is not the same binary format as ONNX Runtime GenAI's
 `.onnx_adapter` files (those come out of Olive's `convert-adapters`, for
 loading multiple adapters into one inference session via
 `Ort::LoraAdapter`/`RunOptions`).
+
+### QLoRA (NF4-quantized base + LoRA)
+
+`scripts/prepare_qlora.py` wires the LoRA graph surgery above together with
+`onnxsim.nf4.quantize_weight_only_nf4` (bitsandbytes' NF4 4-bit format, see
+`onnxsim/nf4.py`) to reproduce Dettmers et al. 2023's actual QLoRA recipe:
+freeze a 4-bit-quantized base model and train small full-precision adapters
+on top of its on-the-fly dequantized weights, instead of plain LoRA on an
+unquantized base. It replaces step 1 above; steps 2-5 are unchanged:
+
+```sh
+python3 scripts/prepare_qlora.py model.onnx -o model_qlora.onnx \
+  --rank 4 --block-size 64 --params-out lora.json
+
+python3 scripts/generate_artifacts.py model_qlora.onnx -o artifacts \
+  --lora-params-file lora.json --loss cross-entropy --optimizer adamw
+# ...then train, extract, and re-apply exactly as in the plain-LoRA workflow.
+```
+
+This needs the `onnxsim` package itself importable (build/install this
+repo's own wheel) for the NF4 quantization step -- unlike every other
+onnx-finetune script, which needs only `onnx` + `numpy`. Injection must run
+before quantization (quantizing first leaves nothing recognizable for
+`inject_lora.py`'s graph surgery to graft onto), and `prepare_qlora.py`
+always excludes the newly-injected `lora_A`/`lora_B` weights from
+quantization itself -- structurally they're just another small MatMul
+against a 2-D initializer, indistinguishable from any other layer's weight
+by shape alone, so leaving them eligible would NF4-quantize the adapter too
+and defeat the point of keeping it full precision. NF4 quantization only
+covers 2-D MatMul/vanilla-Gemm weights (see `onnxsim/nf4.py`), so a 1x1-Conv
+LoRA target stays full precision under `prepare_qlora.py` too.
 
 ## CLI reference
 

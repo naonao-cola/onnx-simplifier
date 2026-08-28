@@ -2,11 +2,12 @@
 """Inject trainable LoRA (low-rank adaptation) branches into a bare .onnx
 model, in place of full-parameter fine-tuning.
 
-Every targeted MatMul/Gemm weight stays frozen; a small
+Every targeted MatMul/Gemm/1x1-Conv weight stays frozen; a small
 `(alpha/rank) * (X @ lora_A @ lora_B)` branch is added alongside its output
 (lora_A Kaiming-normal, lora_B zero, so the model is numerically unchanged
 until trained). Feed the output to generate_artifacts.py --lora-params-file
-to train only the injected adapter weights.
+to train only the injected adapter weights. See lora_surgery.py's own
+docstring for exactly which layers are eligible.
 """
 
 import argparse
@@ -37,7 +38,7 @@ def main():
         "--target-contains",
         action="append",
         default=[],
-        help="only target MatMul/Gemm nodes whose 2-D weight initializer name contains this "
+        help="only target MatMul/Gemm/1x1-Conv nodes whose weight initializer name contains this "
         "substring (repeatable). Omit to target every eligible node.",
     )
     p.add_argument("--seed", type=int, default=0)
@@ -56,9 +57,7 @@ def main():
         model, args.target_contains, args.rank, alpha, seed=args.seed
     )
     if not added:
-        sys.exit(
-            "error: no eligible MatMul/Gemm targets matched (2-D weight initializer, non-transposed input)"
-        )
+        sys.exit("error: no eligible MatMul/Gemm/1x1-Conv targets matched")
 
     onnx.checker.check_model(model)
     onnx.save(model, args.output)
