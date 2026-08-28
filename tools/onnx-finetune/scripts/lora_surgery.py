@@ -21,6 +21,10 @@ import numpy as np
 from onnx import helper, numpy_helper
 
 
+def _dtype_to_onnx_elem_type(dtype):
+    return int(numpy_helper.from_array(np.zeros(1, dtype=dtype)).data_type)
+
+
 def _attr_value(node, name, default=None):
     for attr in node.attribute:
         if attr.name == name:
@@ -77,13 +81,29 @@ def lora_param_names(weight_name):
 
 
 def inject(
-    model, name_contains, rank, alpha, lora_values=None, seed=0, exact_names=None
+    model,
+    name_contains,
+    rank,
+    alpha,
+    lora_values=None,
+    seed=0,
+    exact_names=None,
+    adapter_inputs=False,
 ):
     """Add a LoRA branch to every targeted node.
 
     lora_values, when given, maps weight name -> (A, B) numpy arrays to use
     verbatim (grafting a trained adapter); otherwise A/B are freshly
     initialized (preparing a model for training).
+
+    adapter_inputs additionally declares each new lora_A/lora_B initializer
+    as a graph input of the same name/shape/dtype. ONNX (and ONNX Runtime)
+    treats a name that is both an initializer and a graph input as an
+    optional input defaulting to that initializer -- so the model still
+    runs standalone unchanged, but lora_A/lora_B can also be overridden at
+    Run() time, e.g. via ONNX Runtime's native LoraAdapter/AdapterFormat
+    (see export_onnx_adapter.py) instead of only by baking a merged copy of
+    the model per adapter.
 
     Returns the list of (lora_A_name, lora_B_name) pairs added, one per
     targeted weight.
@@ -117,6 +137,14 @@ def inject(
 
         model.graph.initializer.append(numpy_helper.from_array(a, a_name))
         model.graph.initializer.append(numpy_helper.from_array(b, b_name))
+        if adapter_inputs:
+            elem_type = _dtype_to_onnx_elem_type(dtype)
+            model.graph.input.append(
+                helper.make_tensor_value_info(a_name, elem_type, list(a.shape))
+            )
+            model.graph.input.append(
+                helper.make_tensor_value_info(b_name, elem_type, list(b.shape))
+            )
 
         x_name = node.input[0]
         orig_out = node.output[0]
