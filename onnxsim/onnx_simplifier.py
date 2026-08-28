@@ -1056,6 +1056,7 @@ def simplify(
     import_custom_schemas: bool = True,
     input_shapes=None,
     target_opset_version: Optional[int] = None,
+    extra_optimizers: Optional[List[str]] = None,
     custom_rewriter: Optional[ModelRewriter] = None,
     function_rewrite_rules: Optional[Sequence[FunctionRewriteRule]] = None,
     check_rtol: float = 1e-4,
@@ -1107,6 +1108,17 @@ def simplify(
             before simplifying, using onnx's version converter (run inside the C++ core so every
             binding shares the behavior). This can be used to upgrade (or downgrade) the model's
             opset during simplification. When None (the default), the opset version is left unchanged.
+    :param extra_optimizers: The counterpart to ``skipped_optimizers``: run these named onnx-optimizer
+            passes in addition to the default fuse/elimination set, rather than excluding some of it.
+            This is how a pass registered as ``PassType::Other`` -- excluded from the default set
+            because it is a graph-shape rewrite rather than a pure node reduction or fusion (e.g. a
+            defusion that trades a backend-specific op for a more portable but larger equivalent) --
+            gets opted into, without changing what runs by default for every other caller. List valid
+            names with ``onnxsim --list-other-optimizers`` (``--list-default-optimizers`` lists the
+            ones already on by default, which do not need naming here). Has no effect when
+            ``perform_optimization`` is ``False``. An unknown name raises, since -- unlike a typo in
+            ``skipped_optimizers``, which just means nothing new is skipped -- a typo here means the
+            pass you asked for silently never runs.
     :param custom_rewriter: An optional callable ``ModelProto -> Optional[ModelProto]`` run as an extra
             stage inside onnxsim's simplification fixed point, interleaved with the built-in optimizer,
             shape inference and constant folding so a rewrite can unlock further simplification and vice
@@ -1364,6 +1376,7 @@ def simplify(
                             mutable_initializer,
                             overwrite_input_shapes,
                             unused_output,
+                            extra_optimizers,
                         )
                         check_ok = model_checking.compare(
                             output_path,
@@ -1395,6 +1408,7 @@ def simplify(
                             mutable_initializer,
                             overwrite_input_shapes,
                             unused_output,
+                            extra_optimizers,
                         )
                         # check_n == 0 is guaranteed on this path (the fast-path
                         # gate above requires it), so compare() only needs
@@ -1433,6 +1447,7 @@ def simplify(
                         mutable_initializer,
                         overwrite_input_shapes,
                         unused_output,
+                        extra_optimizers,
                     )
                     if len(model_opt_bytes) == 0:
                         raise ValueError("Simplified model larger than 2GB")
@@ -1567,6 +1582,7 @@ def simplify(
             mutable_initializer,
             overwrite_input_shapes,
             unused_output,
+            extra_optimizers,
         )
         # The serialized original (~1x model) is not needed once the C++
         # simplifier has consumed it -- the large-model fallback below
@@ -1644,6 +1660,7 @@ def simplify(
                 mutable_initializer,
                 overwrite_input_shapes,
                 unused_output,
+                extra_optimizers,
             )
             check_ok = model_checking.compare(
                 os.path.join(tmpdirname, "opt.onnx"),
@@ -1844,6 +1861,12 @@ def main():
         help="Skip all ONNX optimizers or some of them. To skip all optimizers, use `onnxsim a.onnx b.onnx --skip-optimization`. To skip some of optimizers, use something like `onnxsim a.onnx b.onnx --skip-optimization fuse_bn_into_conv fuse_pad_into_pool`.",
         type=str,
         nargs="*",
+    )
+    parser.add_argument(
+        "--enable-optimization",
+        help="The counterpart to --skip-optimization: run these named optimizer passes in addition to the default set, rather than excluding some of it. Use for a pass not already on by default (see --list-other-optimizers for valid names), for example `onnxsim a.onnx b.onnx --enable-optimization fuse_matmul_add_bias_into_gemm_batched`.",
+        type=str,
+        nargs="+",
     )
     parser.add_argument(
         "--skip-constant-folding", help="Skip constant folding", action="store_true"
@@ -2338,6 +2361,19 @@ def main():
         action=ListOptimizers,
     )
 
+    class ListOtherOptimizers(argparse.Action):
+        def __call__(self, parser, ns, v, option_string=None):
+            for p in C._list_other_optimizers():
+                print(p)
+            parser.exit()
+
+    parser.add_argument(
+        "--list-other-optimizers",
+        help="List optimizer pass names valid for --enable-optimization (i.e. registered but not already part of the default set listed by --list-default-optimizers)",
+        nargs=0,
+        action=ListOtherOptimizers,
+    )
+
     args = parser.parse_args()
 
     if args.enable_fuse_bn:
@@ -2517,6 +2553,7 @@ def main():
         inline_functions=args.inline_functions,
         import_custom_schemas=not args.skip_schema_import,
         target_opset_version=args.target_opset,
+        extra_optimizers=args.enable_optimization,
         check_rtol=args.check_rtol,
         check_atol=args.check_atol,
         input_fill=args.input_fill,

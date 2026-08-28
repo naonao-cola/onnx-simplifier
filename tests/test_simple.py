@@ -4,6 +4,7 @@ from typing import Optional
 
 import onnx
 import onnxruntime
+import pytest
 import torch
 from onnx import TensorProto, helper, numpy_helper
 
@@ -994,6 +995,66 @@ def test_arg_reduce_select_last_index_is_rewritten():
         orig_out = sess_orig.run(None, {"x": v})[0]
         sim_out = sess_sim.run(None, {"x": v})[0]
         assert np.array_equal(orig_out, sim_out)
+
+
+def _einsum_matmul_model():
+    x = helper.make_tensor_value_info("x", TensorProto.FLOAT, [2, 3])
+    y = helper.make_tensor_value_info("y", TensorProto.FLOAT, [3, 4])
+    einsum = helper.make_node("Einsum", ["x", "y"], ["z"], equation="ij,jk->ik")
+    graph = helper.make_graph(
+        [einsum],
+        "g",
+        [x, y],
+        [helper.make_tensor_value_info("z", TensorProto.FLOAT, [2, 4])],
+    )
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+    onnx.checker.check_model(model)
+    return model
+
+
+def test_extra_optimizers_opts_into_an_off_by_default_pass():
+    # extra_optimizers is the counterpart to skipped_optimizers: it runs a
+    # named pass in addition to the default fuse/elimination set.
+    # replace_einsum_with_matmul is a real onnx-optimizer pass that is not
+    # part of that default set (confirmed via the second assertion below), so
+    # it only fires when named explicitly.
+    model = _einsum_matmul_model()
+
+    sim_default, ok_default = onnxsim.simplify(model, check_n=0)
+    assert ok_default
+    assert [n.op_type for n in sim_default.graph.node] == ["Einsum"]
+
+    from onnxsim.onnx_simplifier import C
+
+    assert "replace_einsum_with_matmul" not in C._list_optimizers()
+    assert "replace_einsum_with_matmul" in C._list_other_optimizers()
+
+    sim_extra, ok_extra = onnxsim.simplify(
+        model, check_n=0, extra_optimizers=["replace_einsum_with_matmul"]
+    )
+    assert ok_extra
+    assert [n.op_type for n in sim_extra.graph.node] == ["MatMul"]
+
+
+def test_extra_optimizers_unknown_name_raises():
+    model = _einsum_matmul_model()
+    with pytest.raises(Exception):
+        onnxsim.simplify(model, check_n=0, extra_optimizers=["not_a_real_pass"])
+
+
+def test_extra_optimizers_has_no_effect_when_optimization_disabled():
+    # perform_optimization=False means skipped_optimizers=None internally,
+    # which already disables the whole default pass set; extra_optimizers is
+    # documented to have no effect in that case either.
+    model = _einsum_matmul_model()
+    sim, ok = onnxsim.simplify(
+        model,
+        check_n=0,
+        perform_optimization=False,
+        extra_optimizers=["replace_einsum_with_matmul"],
+    )
+    assert ok
+    assert [n.op_type for n in sim.graph.node] == ["Einsum"]
 
 
 def test_ir3_conv_bn_fuses():

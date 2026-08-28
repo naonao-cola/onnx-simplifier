@@ -57,7 +57,10 @@ constant folding until the model stops changing. Around that it offers:
 - **Graph optimization passes.** Runs onnx-optimizer's fusions and eliminations
   (e.g. fuse BatchNorm into Conv). List them with
   `onnxsim --list-default-optimizers`; skip all or some with
-  `--skip-optimization [pass ...]`.
+  `--skip-optimization [pass ...]`. A pass not in the default set (typically a
+  graph-shape rewrite rather than a pure node reduction, e.g. a defusion) can
+  be requested explicitly with `--enable-optimization pass [pass ...]`
+  (Python: `extra_optimizers=`); list those with `--list-other-optimizers`.
 - **Shape inference.** Propagates tensor shapes through the graph — including
   partial shape evaluation via ONNX data propagation — to unlock more folding.
 - **Correctness checking.** Optionally validates the simplified model against the
