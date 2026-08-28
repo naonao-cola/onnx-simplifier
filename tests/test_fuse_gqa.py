@@ -17,9 +17,9 @@ causal references on the same random inputs).
 
 import numpy as np
 import onnx
-import onnx.helper
 import onnx.numpy_helper
 import pytest
+from onnx import parser
 
 import onnxsim
 
@@ -27,10 +27,6 @@ import onnxsim
 # platforms onnxruntime doesn't ship wheels for; the fused output is a
 # "com.microsoft" contrib op that only onnxruntime can execute.
 ort = pytest.importorskip("onnxruntime")
-
-
-def _vi(name, shape):
-    return onnx.helper.make_tensor_value_info(name, onnx.TensorProto.FLOAT, shape)
 
 
 def _f32(array, name):
@@ -72,62 +68,64 @@ def _gqa_model(B=2, S=6, NH=8, NKV=2, Dh=16, mask=None, mask_is_input=False):
         _i64([B, S, H], "shape_ctx"),
     ]
 
-    def repeat_kv_nodes(raw_name, prefix):
-        return [
-            onnx.helper.make_node(
-                "Unsqueeze", [raw_name, "unsq_axes"], [f"{prefix}_unsq"]
-            ),
-            onnx.helper.make_node(
-                "Expand", [f"{prefix}_unsq", "expand_shape"], [f"{prefix}_exp"]
-            ),
-            onnx.helper.make_node(
-                "Reshape", [f"{prefix}_exp", "merge_shape"], [f"{prefix}_rep"]
-            ),
-        ]
+    def repeat_kv_body(raw_name, prefix):
+        return f"""
+        {prefix}_unsq = Unsqueeze({raw_name}, unsq_axes)
+        {prefix}_exp = Expand({prefix}_unsq, expand_shape)
+        {prefix}_rep = Reshape({prefix}_exp, merge_shape)
+        """
 
-    nodes = [
-        onnx.helper.make_node("MatMul", ["x", "wq"], ["q_mm"]),
-        onnx.helper.make_node("Reshape", ["q_mm", "shape_q"], ["q_r"]),
-        onnx.helper.make_node("Transpose", ["q_r"], ["q_t"], perm=[0, 2, 1, 3]),
-        onnx.helper.make_node("MatMul", ["x", "wk"], ["k_mm"]),
-        onnx.helper.make_node("Reshape", ["k_mm", "shape_kv"], ["k_r"]),
-        onnx.helper.make_node("Transpose", ["k_r"], ["k_raw"], perm=[0, 2, 1, 3]),
-        *repeat_kv_nodes("k_raw", "k"),
-        onnx.helper.make_node("Transpose", ["k_rep"], ["k_t"], perm=[0, 1, 3, 2]),
-        onnx.helper.make_node("MatMul", ["x", "wv"], ["v_mm"]),
-        onnx.helper.make_node("Reshape", ["v_mm", "shape_kv"], ["v_r"]),
-        onnx.helper.make_node("Transpose", ["v_r"], ["v_raw"], perm=[0, 2, 1, 3]),
-        *repeat_kv_nodes("v_raw", "v"),
-        onnx.helper.make_node("MatMul", ["q_t", "k_t"], ["qk"]),
-        onnx.helper.make_node("Div", ["qk", "sqrt_dh"], ["scores"]),
-    ]
+    body = f"""
+    q_mm = MatMul(x, wq)
+    q_r = Reshape(q_mm, shape_q)
+    q_t = Transpose<perm = [0, 2, 1, 3]>(q_r)
+    k_mm = MatMul(x, wk)
+    k_r = Reshape(k_mm, shape_kv)
+    k_raw = Transpose<perm = [0, 2, 1, 3]>(k_r)
+    {repeat_kv_body("k_raw", "k")}
+    k_t = Transpose<perm = [0, 1, 3, 2]>(k_rep)
+    v_mm = MatMul(x, wv)
+    v_r = Reshape(v_mm, shape_kv)
+    v_raw = Transpose<perm = [0, 2, 1, 3]>(v_r)
+    {repeat_kv_body("v_raw", "v")}
+    qk = MatMul(q_t, k_t)
+    scores = Div(qk, sqrt_dh)
+    """
 
-    graph_inputs = [_vi("x", [B, S, H])]
+    inputs = [f"float[{B},{S},{H}] x"]
     if mask is None:
         softmax_input = "scores"
     elif mask_is_input:
-        nodes.append(onnx.helper.make_node("Add", ["scores", "mask"], ["masked"]))
-        graph_inputs.append(_vi("mask", [1, 1, S, S]))
+        body += "masked = Add(scores, mask)\n"
+        inputs.append(f"float[1,1,{S},{S}] mask")
         softmax_input = "masked"
     else:
         inits.append(_f32(mask, "mask"))
-        nodes.append(onnx.helper.make_node("Add", ["scores", "mask"], ["masked"]))
+        body += "masked = Add(scores, mask)\n"
         softmax_input = "masked"
 
-    nodes += [
-        onnx.helper.make_node("Softmax", [softmax_input], ["probs"], axis=-1),
-        onnx.helper.make_node("MatMul", ["probs", "v_rep"], ["ctx0"]),
-        onnx.helper.make_node("Transpose", ["ctx0"], ["ctx1"], perm=[0, 2, 1, 3]),
-        onnx.helper.make_node("Reshape", ["ctx1", "shape_ctx"], ["ctx2"]),
-        onnx.helper.make_node("MatMul", ["ctx2", "wo"], ["y"]),
-    ]
+    body += f"""
+    probs = Softmax<axis = -1>({softmax_input})
+    ctx0 = MatMul(probs, v_rep)
+    ctx1 = Transpose<perm = [0, 2, 1, 3]>(ctx0)
+    ctx2 = Reshape(ctx1, shape_ctx)
+    y = MatMul(ctx2, wo)
+    """
 
-    graph = onnx.helper.make_graph(
-        nodes, "g", graph_inputs, [_vi("y", [B, S, H])], inits
+    model = parser.parse_model(
+        f"""
+        <
+          ir_version: 10,
+          opset_import: ["": 17]
+        >
+        g ({", ".join(inputs)}) => (float[{B},{S},{H}] y)
+        {{
+          {body}
+        }}
+        """
     )
-    return onnx.helper.make_model(
-        graph, opset_imports=[onnx.helper.make_opsetid("", 17)], ir_version=10
-    )
+    model.graph.initializer.extend(inits)
+    return model
 
 
 def _op_counts(model):

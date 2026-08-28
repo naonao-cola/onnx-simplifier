@@ -11,9 +11,11 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
+#include "custom_optimizer_passes.h"
 #include "function_rewriter.h"
 #include "model_info.h"
 #include "onnx/proto_utils.h"
@@ -78,6 +80,25 @@ std::optional<std::vector<std::string>> BuildSkipOptimizers(
   for (size_t i = 0; i < num_skip_optimizers; ++i) {
     const char* name =
         skip_optimizers != nullptr ? skip_optimizers[i] : nullptr;
+    passes.emplace_back(name != nullptr ? name : "");
+  }
+  return passes;
+}
+
+// Translate the (pointer array, count) FFI encoding into the optional vector
+// the C++ core expects. Unlike BuildSkipOptimizers there is no is_null flag:
+// num_extra_optimizers == 0 and std::nullopt behave identically (no extra
+// passes), so a plain count of 0 already means "none".
+std::optional<std::vector<std::string>> BuildExtraOptimizers(
+    const char* const* extra_optimizers, size_t num_extra_optimizers) {
+  if (num_extra_optimizers == 0) {
+    return std::nullopt;
+  }
+  std::vector<std::string> passes;
+  passes.reserve(num_extra_optimizers);
+  for (size_t i = 0; i < num_extra_optimizers; ++i) {
+    const char* name =
+        extra_optimizers != nullptr ? extra_optimizers[i] : nullptr;
     passes.emplace_back(name != nullptr ? name : "");
   }
   return passes;
@@ -204,6 +225,7 @@ OnnxsimStatus SimplifyToBuffer(
     const char* const* skip_optimizers, size_t num_skip_optimizers,
     int skip_optimizers_is_null, int constant_folding, int shape_inference,
     size_t tensor_size_threshold, int target_opset_version,
+    const char* const* extra_optimizers, size_t num_extra_optimizers,
     const GraphRewriter* rewriter, const ModelExecutor* executor,
     void** out_data, size_t* out_size, char** out_error) {
   if (out_data != nullptr) {
@@ -233,7 +255,13 @@ OnnxsimStatus SimplifyToBuffer(
         BuildSkipOptimizers(skip_optimizers, num_skip_optimizers,
                             skip_optimizers_is_null),
         constant_folding != 0, shape_inference != 0, tensor_size_threshold,
-        BuildTargetOpsetVersion(target_opset_version), rewriter);
+        BuildTargetOpsetVersion(target_opset_version), rewriter,
+        /*initializers_as_constants=*/true,
+        /*include_inline_functions=*/false,
+        /*mutable_initializer=*/true,
+        /*overwrite_input_shapes=*/std::nullopt,
+        /*unused_output=*/std::nullopt,
+        BuildExtraOptimizers(extra_optimizers, num_extra_optimizers));
 
     std::string out;
     if (!result.SerializeToString(&out)) {
@@ -296,6 +324,7 @@ OnnxsimStatus onnxsim_simplify(
     const char* const* skip_optimizers, size_t num_skip_optimizers,
     int skip_optimizers_is_null, int constant_folding, int shape_inference,
     size_t tensor_size_threshold, int target_opset_version,
+    const char* const* extra_optimizers, size_t num_extra_optimizers,
     OnnxsimRewriteFn rewrite_fn, OnnxsimRewriteFreeFn rewrite_free_fn,
     void* rewrite_user_data, void** out_data, size_t* out_size,
     char** out_error) {
@@ -303,12 +332,12 @@ OnnxsimStatus onnxsim_simplify(
   if (rewrite_fn != nullptr) {
     rewriter.emplace(rewrite_fn, rewrite_free_fn, rewrite_user_data);
   }
-  return SimplifyToBuffer(model_data, model_size, skip_optimizers,
-                          num_skip_optimizers, skip_optimizers_is_null,
-                          constant_folding, shape_inference,
-                          tensor_size_threshold, target_opset_version,
-                          rewriter.has_value() ? &rewriter.value() : nullptr,
-                          /*executor=*/nullptr, out_data, out_size, out_error);
+  return SimplifyToBuffer(
+      model_data, model_size, skip_optimizers, num_skip_optimizers,
+      skip_optimizers_is_null, constant_folding, shape_inference,
+      tensor_size_threshold, target_opset_version, extra_optimizers,
+      num_extra_optimizers, rewriter.has_value() ? &rewriter.value() : nullptr,
+      /*executor=*/nullptr, out_data, out_size, out_error);
 }
 
 OnnxsimStatus onnxsim_simplify_with_executor(
@@ -316,6 +345,7 @@ OnnxsimStatus onnxsim_simplify_with_executor(
     const char* const* skip_optimizers, size_t num_skip_optimizers,
     int skip_optimizers_is_null, int constant_folding, int shape_inference,
     size_t tensor_size_threshold, int target_opset_version,
+    const char* const* extra_optimizers, size_t num_extra_optimizers,
     OnnxsimRewriteFn rewrite_fn, OnnxsimRewriteFreeFn rewrite_free_fn,
     void* rewrite_user_data, OnnxsimExecuteFn execute_fn,
     OnnxsimExecuteFreeFn execute_free_fn, void* execute_user_data,
@@ -328,13 +358,13 @@ OnnxsimStatus onnxsim_simplify_with_executor(
   if (execute_fn != nullptr) {
     executor.emplace(execute_fn, execute_free_fn, execute_user_data);
   }
-  return SimplifyToBuffer(model_data, model_size, skip_optimizers,
-                          num_skip_optimizers, skip_optimizers_is_null,
-                          constant_folding, shape_inference,
-                          tensor_size_threshold, target_opset_version,
-                          rewriter.has_value() ? &rewriter.value() : nullptr,
-                          executor.has_value() ? &executor.value() : nullptr,
-                          out_data, out_size, out_error);
+  return SimplifyToBuffer(
+      model_data, model_size, skip_optimizers, num_skip_optimizers,
+      skip_optimizers_is_null, constant_folding, shape_inference,
+      tensor_size_threshold, target_opset_version, extra_optimizers,
+      num_extra_optimizers, rewriter.has_value() ? &rewriter.value() : nullptr,
+      executor.has_value() ? &executor.value() : nullptr, out_data, out_size,
+      out_error);
 }
 
 OnnxsimStatus onnxsim_simplify_with_rules(
@@ -344,13 +374,16 @@ OnnxsimStatus onnxsim_simplify_with_rules(
     size_t tensor_size_threshold, int target_opset_version,
     const void* const* pattern_data, const size_t* pattern_sizes,
     const void* const* replacement_data, const size_t* replacement_sizes,
-    size_t num_rules, void** out_data, size_t* out_size, char** out_error) {
+    size_t num_rules, const char* const* extra_optimizers,
+    size_t num_extra_optimizers, void** out_data, size_t* out_size,
+    char** out_error) {
   // With no rules this is just onnxsim_simplify (no callback rewriter).
   if (num_rules == 0) {
     return onnxsim_simplify(
         model_data, model_size, skip_optimizers, num_skip_optimizers,
         skip_optimizers_is_null, constant_folding, shape_inference,
-        tensor_size_threshold, target_opset_version, /*rewrite_fn=*/nullptr,
+        tensor_size_threshold, target_opset_version, extra_optimizers,
+        num_extra_optimizers, /*rewrite_fn=*/nullptr,
         /*rewrite_free_fn=*/nullptr, /*rewrite_user_data=*/nullptr, out_data,
         out_size, out_error);
   }
@@ -376,7 +409,8 @@ OnnxsimStatus onnxsim_simplify_with_rules(
     return SimplifyToBuffer(
         model_data, model_size, skip_optimizers, num_skip_optimizers,
         skip_optimizers_is_null, constant_folding, shape_inference,
-        tensor_size_threshold, target_opset_version, rewriter.get(),
+        tensor_size_threshold, target_opset_version, extra_optimizers,
+        num_extra_optimizers, rewriter.get(),
         /*executor=*/nullptr, out_data, out_size, out_error);
   } catch (const std::exception& e) {
     SetError(out_error, e.what());
@@ -392,6 +426,7 @@ OnnxsimStatus onnxsim_simplify_path(
     const char* const* skip_optimizers, size_t num_skip_optimizers,
     int skip_optimizers_is_null, int constant_folding, int shape_inference,
     size_t tensor_size_threshold, int target_opset_version,
+    const char* const* extra_optimizers, size_t num_extra_optimizers,
     OnnxsimRewriteFn rewrite_fn, OnnxsimRewriteFreeFn rewrite_free_fn,
     void* rewrite_user_data, char** out_error) {
   if (out_error != nullptr) {
@@ -415,7 +450,13 @@ OnnxsimStatus onnxsim_simplify_path(
                                      skip_optimizers_is_null),
                  constant_folding != 0, shape_inference != 0,
                  tensor_size_threshold,
-                 BuildTargetOpsetVersion(target_opset_version), rewriter_ptr);
+                 BuildTargetOpsetVersion(target_opset_version), rewriter_ptr,
+                 /*initializers_as_constants=*/true,
+                 /*include_inline_functions=*/false,
+                 /*mutable_initializer=*/true,
+                 /*overwrite_input_shapes=*/std::nullopt,
+                 /*unused_output=*/std::nullopt,
+                 BuildExtraOptimizers(extra_optimizers, num_extra_optimizers));
     return ONNXSIM_OK;
   } catch (const std::exception& e) {
     SetError(out_error, e.what());
@@ -430,6 +471,28 @@ char* onnxsim_list_optimizers(void) {
   try {
     std::string joined;
     for (const auto& pass : onnx::optimization::GetFuseAndEliminationPass()) {
+      if (!joined.empty()) {
+        joined.push_back('\n');
+      }
+      joined.append(pass);
+    }
+    return DupCString(joined);
+  } catch (...) {
+    return nullptr;
+  }
+}
+
+char* onnxsim_list_other_optimizers(void) {
+  try {
+    onnxsim::RegisterCustomOptimizerPasses();
+    const auto default_passes = onnx::optimization::GetFuseAndEliminationPass();
+    const std::unordered_set<std::string> default_set(default_passes.begin(),
+                                                      default_passes.end());
+    std::string joined;
+    for (const auto& pass : onnx::optimization::GetAvailablePasses()) {
+      if (default_set.count(pass) != 0) {
+        continue;
+      }
       if (!joined.empty()) {
         joined.push_back('\n');
       }
