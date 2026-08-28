@@ -633,3 +633,169 @@ def test_structured_pruning_native_swiglu_node_prunes_both_producers_together():
     np.testing.assert_array_equal(inits["Wg"], wg[:, keep])
     np.testing.assert_array_equal(inits["Wu"], wu[:, keep])
     np.testing.assert_array_equal(inits["Wd"], wd[keep, :])
+
+
+# --- apply_structured_wanda_pruning ------------------------------------------
+
+
+def _kept_columns(pruned_model, weight_name, original_w):
+    w_pruned = onnx.numpy_helper.to_array(
+        next(t for t in pruned_model.graph.initializer if t.name == weight_name)
+    )
+    kept = []
+    for j in range(original_w.shape[1]):
+        col = original_w[:, j]
+        if any(np.array_equal(col, w_pruned[:, jj]) for jj in range(w_pruned.shape[1])):
+            kept.append(j)
+    return kept
+
+
+def test_structured_wanda_pruning_protects_channels_with_small_weight_but_large_activation():
+    # A structured analogue of Wanda's own motivating scenario: a hidden
+    # unit whose own weight column is deliberately *smaller* than typical
+    # (so plain L2-norm structured pruning ranks it lowest and cuts it),
+    # but which is wired to an input feature that calibration data makes
+    # consistently huge -- its actual contribution to the network is large
+    # even though its weight norm alone doesn't show it.
+    K, H, Out = 8, 32, 4
+    salient = (3, 7, 20)
+    k0 = 0
+    rng = np.random.default_rng(20)
+    w1 = rng.standard_normal((K, H)).astype(np.float32) * 0.5
+    w2 = rng.standard_normal((H, Out)).astype(np.float32)
+    non_salient = [j for j in range(H) if j not in salient]
+    w1[k0, non_salient] = 0.0  # only salient channels respond to k0 at all
+    small_scale = 0.4
+    for j in salient:
+        w1[:, j] = 0.0
+        w1[k0, j] = small_scale  # weight norm well below the ~1.4 typical column
+
+    nodes = [
+        onnx.helper.make_node("MatMul", ["X", "W1"], ["h"]),
+        onnx.helper.make_node("Relu", ["h"], ["a"]),
+        onnx.helper.make_node("MatMul", ["a", "W2"], ["Y"]),
+    ]
+    model = _model(
+        nodes,
+        [_vi("X", ["batch", K])],
+        [_vi("Y", ["batch", Out])],
+        [_f32(w1, "W1"), _f32(w2, "W2")],
+    )
+
+    x = rng.standard_normal((64, K)).astype(np.float32)
+    x[:, k0] *= 40.0
+    calibration_data = [{"X": x}]
+
+    plain = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    wanda = onnxsim.apply_structured_wanda_pruning(
+        model, calibration_data=calibration_data, sparsity=0.5
+    )
+    onnx.checker.check_model(plain)
+    onnx.checker.check_model(wanda)
+
+    plain_kept = _kept_columns(plain, "W1", w1)
+    wanda_kept = _kept_columns(wanda, "W1", w1)
+    assert all(j not in plain_kept for j in salient)
+    assert all(j in wanda_kept for j in salient)
+
+
+def test_structured_wanda_pruning_matches_oracle_exactly():
+    K, H, Out = 8, 24, 4
+    rng = np.random.default_rng(21)
+    w1 = rng.standard_normal((K, H)).astype(np.float32)
+    w2 = rng.standard_normal((H, Out)).astype(np.float32)
+    nodes = [
+        onnx.helper.make_node("MatMul", ["X", "W1"], ["h"]),
+        onnx.helper.make_node("Relu", ["h"], ["a"]),
+        onnx.helper.make_node("MatMul", ["a", "W2"], ["Y"]),
+    ]
+    model = _model(
+        nodes,
+        [_vi("X", ["batch", "seq", K])],
+        [_vi("Y", ["batch", "seq", Out])],
+        [_f32(w1, "W1"), _f32(w2, "W2")],
+    )
+
+    rng_cal = np.random.default_rng(22)
+    x_cal = rng_cal.standard_normal((2, 16, K)).astype(np.float32)
+    calibration_data = [{"X": x_cal}]
+
+    pruned = onnxsim.apply_structured_wanda_pruning(
+        model, calibration_data=calibration_data, sparsity=0.5
+    )
+    onnx.checker.check_model(pruned)
+
+    a_cal = np.maximum(x_cal.reshape(-1, K) @ w1, 0)
+    act_norm = np.sqrt(np.mean(np.square(a_cal), axis=0))
+    importance = np.linalg.norm(w1.T, axis=1) * np.maximum(act_norm, 1e-8)
+    keep = np.sort(np.argsort(-importance)[: H // 2])
+
+    x = rng_cal.standard_normal((3, 5, K)).astype(np.float32)
+    (y,) = _run(pruned, {"X": x})
+    h = np.maximum(x @ w1[:, keep], 0)
+    y_oracle = h @ w2[keep, :]
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-5, atol=1e-5)
+
+
+def test_structured_wanda_pruning_falls_back_to_plain_with_no_calibration_batches():
+    K, H, Out = 8, 16, 4
+    model = _mlp_model(K=K, H=H, Out=Out, bias=False)
+
+    plain = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    wanda = onnxsim.apply_structured_wanda_pruning(
+        model, calibration_data=[], sparsity=0.5
+    )
+    inits_plain = {
+        t.name: onnx.numpy_helper.to_array(t) for t in plain.graph.initializer
+    }
+    inits_wanda = {
+        t.name: onnx.numpy_helper.to_array(t) for t in wanda.graph.initializer
+    }
+    np.testing.assert_array_equal(inits_plain["W1"], inits_wanda["W1"])
+    np.testing.assert_array_equal(inits_plain["W2"], inits_wanda["W2"])
+
+
+def test_structured_wanda_pruning_gated_ffn_matches_oracle():
+    K, H, Out = 8, 16, 4
+    model, wg, wu, wd = _swiglu_mlp_model(K=K, H=H, Out=Out, seed=23)
+
+    rng = np.random.default_rng(24)
+    x_cal = rng.standard_normal((32, K)).astype(np.float32)
+    calibration_data = [{"X": x_cal}]
+
+    pruned = onnxsim.apply_structured_wanda_pruning(
+        model, calibration_data=calibration_data, sparsity=0.5
+    )
+    onnx.checker.check_model(pruned)
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    assert inits["Wg"].shape == (K, H // 2)
+    assert inits["Wu"].shape == (K, H // 2)
+    assert inits["Wd"].shape == (H // 2, Out)
+
+    # Both branches must still select the identical channel-index set.
+    kept_g = _kept_columns(pruned, "Wg", wg)
+    kept_u = _kept_columns(pruned, "Wu", wu)
+    assert kept_g == kept_u
+
+    x = rng.standard_normal((5, K)).astype(np.float32)
+    (y,) = _run(pruned, {"X": x})
+    keep = kept_g
+    gate = 1.0 / (1.0 + np.exp(-(x @ wg[:, keep])))
+    up = x @ wu[:, keep]
+    y_oracle = (gate * up) @ wd[keep, :]
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-5, atol=1e-5)
+
+
+def test_structured_wanda_pruning_zero_sparsity_is_a_no_op():
+    model = _mlp_model(K=8, H=16, Out=4)
+    pruned = onnxsim.apply_structured_wanda_pruning(model, sparsity=0.0)
+    inits = {t.name: t for t in pruned.graph.initializer}
+    assert list(inits["W1"].dims) == [8, 16]
+
+
+def test_structured_wanda_pruning_invalid_sparsity_raises():
+    model = _mlp_model(K=8, H=16, Out=4)
+    with pytest.raises(ValueError):
+        onnxsim.apply_structured_wanda_pruning(model, sparsity=1.0)
+    with pytest.raises(ValueError):
+        onnxsim.apply_structured_wanda_pruning(model, sparsity=-0.1)
