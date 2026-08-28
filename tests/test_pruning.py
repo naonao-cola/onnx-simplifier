@@ -2132,6 +2132,313 @@ def test_structured_wanda_pruning_depthwise_pass_through_matches_oracle_exactly(
     np.testing.assert_allclose(y, y_oracle, rtol=1e-5, atol=1e-5)
 
 
+# --- Conv residual (Add-merge) structured pruning ------------------------
+# See onnxsim/pruning.py's own "Conv residual (Add-merged) chains" section
+# comment for the full reasoning: a bounded slice of general dependency-
+# graph pruning, restricted to Conv chains merged by a channel-preserving
+# `Add(a, b)` with two non-constant operands (every residual connection's
+# shape), still holding every branch to the same single-consumer safety bar
+# as the rest of this pass -- so a real multi-block ResNet's necessary
+# fan-out (the post-block tensor read by both the next block's own first
+# Conv and, unchanged, that block's own Add) is declined, not guessed at.
+
+
+def _residual_diamond_model(w_f, w_s, w_out, spatial=10):
+    # y = Conv_out(Relu(Add(Conv_f(X), Conv_s(X)))) -- a "projection
+    # shortcut" residual block: two entirely independent Conv producers
+    # merge via Add and must therefore share one surviving channel-index
+    # set, feeding one real consumer. The smallest instance
+    # _find_conv_residual_chains recognizes (a union-find group of size
+    # one -- no further Add to transitively union with).
+    Cin = w_f.shape[1]
+    Cout = w_out.shape[0]
+    out_spatial = spatial - 4  # two chained 3x3 valid convs
+    return _model(
+        f"""
+        g (float[N,{Cin},{spatial},{spatial}] X) => (float[N,{Cout},{out_spatial},{out_spatial}] Y)
+        {{
+          f = Conv<kernel_shape=[3,3]>(X, WF)
+          s = Conv<kernel_shape=[3,3]>(X, WS)
+          addr = Add(f, s)
+          r = Relu(addr)
+          Y = Conv<kernel_shape=[3,3]>(r, WOUT)
+        }}
+        """,
+        initializer=[_f32(w_f, "WF"), _f32(w_s, "WS"), _f32(w_out, "WOUT")],
+    )
+
+
+def _residual_transitive_model(w_f1, w_s1, w_f2, w_out, spatial=10):
+    # Two Add merges chained transitively, sharing one spine channel count
+    # ("many residual blocks share one spine") with *no* branch anywhere
+    # along the chain: add1's own output feeds *only* into add2 (as a
+    # second, entirely separate producer's merge partner), never reused
+    # elsewhere -- unlike a real ResNet stage's interior block boundary
+    # (see test_structured_pruning_conv_residual_add_declines_on_fan_out_branch
+    # below), so the union-find grouping in _find_conv_residual_chains
+    # extends across both Adds into one group of three producers.
+    Cin = w_f1.shape[1]
+    Cz = w_f2.shape[1]
+    Cout = w_out.shape[0]
+    add1_spatial = spatial - 2  # one 3x3 valid conv each, from X
+    out_spatial = add1_spatial - 2  # WOUT's own 3x3 valid conv
+    return _model(
+        f"""
+        g (float[N,{Cin},{spatial},{spatial}] X, float[N,{Cz},{add1_spatial},{add1_spatial}] Z)
+            => (float[N,{Cout},{out_spatial},{out_spatial}] Y)
+        {{
+          f1 = Conv<kernel_shape=[3,3]>(X, WF1)
+          s1 = Conv<kernel_shape=[3,3]>(X, WS1)
+          add1 = Add(f1, s1)
+          f2 = Conv<kernel_shape=[1,1]>(Z, WF2)
+          add2 = Add(f2, add1)
+          r = Relu(add2)
+          Y = Conv<kernel_shape=[3,3]>(r, WOUT)
+        }}
+        """,
+        initializer=[
+            _f32(w_f1, "WF1"),
+            _f32(w_s1, "WS1"),
+            _f32(w_f2, "WF2"),
+            _f32(w_out, "WOUT"),
+        ],
+    )
+
+
+def test_structured_pruning_conv_residual_add_shrinks_matched_layers():
+    Cin, C, Cout = 3, 16, 8
+    rng = np.random.default_rng(80)
+    w_f = rng.standard_normal((C, Cin, 3, 3)).astype(np.float32)
+    w_s = rng.standard_normal((C, Cin, 3, 3)).astype(np.float32)
+    w_out = rng.standard_normal((Cout, C, 3, 3)).astype(np.float32)
+    model = _residual_diamond_model(w_f, w_s, w_out)
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    inits = {t.name: t for t in pruned.graph.initializer}
+    assert list(inits["WF"].dims) == [C // 2, Cin, 3, 3]
+    assert list(inits["WS"].dims) == [C // 2, Cin, 3, 3]
+    assert list(inits["WOUT"].dims) == [Cout, C // 2, 3, 3]
+
+
+def test_structured_pruning_conv_residual_add_matches_oracle():
+    # Correctness bar: exact equivalence to hand-slicing *both* independent
+    # producers to the same combined-importance keep set, not just "the
+    # checker doesn't complain".
+    Cin, C, Cout = 3, 16, 8
+    rng = np.random.default_rng(80)
+    w_f = rng.standard_normal((C, Cin, 3, 3)).astype(np.float32)
+    w_s = rng.standard_normal((C, Cin, 3, 3)).astype(np.float32)
+    w_out = rng.standard_normal((Cout, C, 3, 3)).astype(np.float32)
+    model = _residual_diamond_model(w_f, w_s, w_out)
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    importance = np.sqrt(
+        np.square(np.linalg.norm(w_f.reshape(C, -1).astype(np.float64), axis=1))
+        + np.square(np.linalg.norm(w_s.reshape(C, -1).astype(np.float64), axis=1))
+    )
+    keep = np.sort(np.argsort(-importance)[: C // 2])
+    oracle = _residual_diamond_model(w_f[keep], w_s[keep], w_out[:, keep])
+
+    rng_x = np.random.default_rng(81)
+    x = rng_x.standard_normal((2, Cin, 10, 10)).astype(np.float32)
+    (y,) = _run(pruned, {"X": x})
+    (y_oracle,) = _run(oracle, {"X": x})
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-5, atol=1e-5)
+
+
+def test_structured_pruning_conv_residual_add_transitive_chain_matches_oracle():
+    # Two Add merges unioned transitively into one group of three
+    # producers, all pruned to one shared index set -- see
+    # _residual_transitive_model's own docstring above.
+    Cin, C, Cz, Cout = 3, 16, 5, 8
+    rng = np.random.default_rng(82)
+    w_f1 = rng.standard_normal((C, Cin, 3, 3)).astype(np.float32)
+    w_s1 = rng.standard_normal((C, Cin, 3, 3)).astype(np.float32)
+    w_f2 = rng.standard_normal((C, Cz, 1, 1)).astype(np.float32)
+    w_out = rng.standard_normal((Cout, C, 3, 3)).astype(np.float32)
+    model = _residual_transitive_model(w_f1, w_s1, w_f2, w_out)
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    importance = np.sqrt(
+        np.square(np.linalg.norm(w_f1.reshape(C, -1).astype(np.float64), axis=1))
+        + np.square(np.linalg.norm(w_s1.reshape(C, -1).astype(np.float64), axis=1))
+        + np.square(np.linalg.norm(w_f2.reshape(C, -1).astype(np.float64), axis=1))
+    )
+    keep = np.sort(np.argsort(-importance)[: C // 2])
+    oracle = _residual_transitive_model(
+        w_f1[keep], w_s1[keep], w_f2[keep], w_out[:, keep]
+    )
+
+    rng_x = np.random.default_rng(83)
+    x = rng_x.standard_normal((2, Cin, 10, 10)).astype(np.float32)
+    z = rng_x.standard_normal((2, Cz, 8, 8)).astype(np.float32)
+    (y,) = _run(pruned, {"X": x, "Z": z})
+    (y_oracle,) = _run(oracle, {"X": x, "Z": z})
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-5, atol=1e-5)
+
+
+def test_structured_pruning_conv_residual_add_declines_on_fan_out_branch():
+    # A realistic multi-block residual stage's interior boundary: `r`
+    # (add1's own post-block tensor) is read *twice* -- once by the next
+    # block's own first Conv (`nxt`), once unchanged as that next block's
+    # own Add shortcut operand (`add2`) -- exactly the fan-out
+    # _walk_conv_producer_backward's single-consumer bar declines. Left
+    # completely untouched (no partial/incorrect pruning), the same
+    # guarantee every other branch case in this module holds to.
+    Cin, C, Cout = 3, 16, 8
+    rng = np.random.default_rng(84)
+    w_f = rng.standard_normal((C, Cin, 3, 3)).astype(np.float32)
+    w_s = rng.standard_normal((C, Cin, 3, 3)).astype(np.float32)
+    w_next = rng.standard_normal((C, C, 1, 1)).astype(np.float32)
+    w_out = rng.standard_normal((Cout, C, 1, 1)).astype(np.float32)
+    model = _model(
+        f"""
+        g (float[N,{Cin},10,10] X) => (float[N,{Cout},8,8] Y)
+        {{
+          f = Conv<kernel_shape=[3,3]>(X, WF)
+          s = Conv<kernel_shape=[3,3]>(X, WS)
+          add1 = Add(f, s)
+          r = Relu(add1)
+          nxt = Conv<kernel_shape=[1,1]>(r, WNEXT)
+          add2 = Add(nxt, r)
+          Y = Conv<kernel_shape=[1,1]>(add2, WOUT)
+        }}
+        """,
+        initializer=[
+            _f32(w_f, "WF"),
+            _f32(w_s, "WS"),
+            _f32(w_next, "WNEXT"),
+            _f32(w_out, "WOUT"),
+        ],
+    )
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    np.testing.assert_array_equal(inits["WF"], w_f)
+    np.testing.assert_array_equal(inits["WS"], w_s)
+    np.testing.assert_array_equal(inits["WNEXT"], w_next)
+    np.testing.assert_array_equal(inits["WOUT"], w_out)
+
+
+def test_structured_pruning_conv_residual_add_declines_on_identity_shortcut():
+    # y = Conv2(Relu(Add(Conv1(X), X))): a classic identity-shortcut
+    # residual block with *no* Conv on the shortcut path at all. `X` has no
+    # producer this pass owns (it's a graph input) *and* is itself read
+    # twice (by Conv1 and directly by Add) -- either alone is enough to
+    # decline: nothing can slice a graph input's own channel count to match
+    # a pruned Conv1, so the whole block is left untouched rather than
+    # guessed at.
+    C, Cout = 8, 4
+    rng = np.random.default_rng(85)
+    w1 = rng.standard_normal((C, C, 1, 1)).astype(np.float32)
+    w2 = rng.standard_normal((Cout, C, 1, 1)).astype(np.float32)
+    model = _model(
+        f"""
+        g (float[N,{C},10,10] X) => (float[N,{Cout},10,10] Y)
+        {{
+          f = Conv<kernel_shape=[1,1]>(X, W1)
+          add1 = Add(f, X)
+          r = Relu(add1)
+          Y = Conv<kernel_shape=[1,1]>(r, W2)
+        }}
+        """,
+        initializer=[_f32(w1, "W1"), _f32(w2, "W2")],
+    )
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    np.testing.assert_array_equal(inits["W1"], w1)
+    np.testing.assert_array_equal(inits["W2"], w2)
+
+
+def test_structured_pruning_conv_residual_add_declines_on_grouped_conv_consumer():
+    # Two independent Conv branches merge via Add, same shape
+    # _residual_diamond_model uses, but the downstream consumer is a
+    # *general grouped* Conv (group=2) -- the composition _find_conv_chains
+    # handles for a single-producer chain (see
+    # test_structured_pruning_grouped_conv_consumer_only, if present) isn't
+    # verified for a multi-producer residual chain: _chain_group's
+    # per-group top-k assumes each producer feeds the consumer's full
+    # channel range, which a residual group's combined-importance ranking
+    # doesn't establish. _walk_to_conv_consumer still matches this grouped
+    # Conv (it's an ordinary forward consumer match, unrelated to the
+    # residual grouping above it), so this exercises
+    # _find_conv_residual_chains's own explicit decline of a non-1
+    # `consumer_group` rather than accidentally exiting earlier for some
+    # unrelated reason.
+    Cin, C, Cout, group = 3, 16, 8, 2
+    rng = np.random.default_rng(89)
+    w_f = rng.standard_normal((C, Cin, 3, 3)).astype(np.float32)
+    w_s = rng.standard_normal((C, Cin, 3, 3)).astype(np.float32)
+    w_out = rng.standard_normal((Cout, C // group, 1, 1)).astype(np.float32)
+    model = _model(
+        f"""
+        g (float[N,{Cin},10,10] X) => (float[N,{Cout},8,8] Y)
+        {{
+          f = Conv<kernel_shape=[3,3]>(X, WF)
+          s = Conv<kernel_shape=[3,3]>(X, WS)
+          addr = Add(f, s)
+          r = Relu(addr)
+          Y = Conv<kernel_shape=[1,1],group={group}>(r, WOUT)
+        }}
+        """,
+        initializer=[_f32(w_f, "WF"), _f32(w_s, "WS"), _f32(w_out, "WOUT")],
+    )
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    np.testing.assert_array_equal(inits["WF"], w_f)
+    np.testing.assert_array_equal(inits["WS"], w_s)
+    np.testing.assert_array_equal(inits["WOUT"], w_out)
+
+
+def test_structured_wanda_pruning_conv_residual_add_matches_oracle():
+    # apply_structured_wanda_pruning picks up residual grouping for free --
+    # _find_conv_residual_chains is shared with apply_structured_pruning,
+    # and the activation norm is captured at the same probe point
+    # (`chain.consumer_node.input[0]`) any other Conv chain uses.
+    Cin, C, Cout = 3, 16, 8
+    rng = np.random.default_rng(86)
+    w_f = rng.standard_normal((C, Cin, 3, 3)).astype(np.float32)
+    w_s = rng.standard_normal((C, Cin, 3, 3)).astype(np.float32)
+    w_out = rng.standard_normal((Cout, C, 3, 3)).astype(np.float32)
+    model = _residual_diamond_model(w_f, w_s, w_out)
+
+    probe_model = onnx.ModelProto()
+    probe_model.CopyFrom(model)
+    probe_model.graph.output.append(
+        onnx.helper.make_tensor_value_info("r", onnx.TensorProto.FLOAT, None)
+    )
+
+    rng_cal = np.random.default_rng(87)
+    x_cal = rng_cal.standard_normal((2, Cin, 10, 10)).astype(np.float32)
+    calibration_data = [{"X": x_cal}]
+
+    _, r_cal = _run(probe_model, {"X": x_cal})
+    act_norm = np.sqrt(np.mean(np.square(r_cal.astype(np.float64)), axis=(0, 2, 3)))
+    base_importance = np.sqrt(
+        np.square(np.linalg.norm(w_f.reshape(C, -1).astype(np.float64), axis=1))
+        + np.square(np.linalg.norm(w_s.reshape(C, -1).astype(np.float64), axis=1))
+    )
+    importance = base_importance * np.maximum(act_norm, 1e-8)
+    keep = np.sort(np.argsort(-importance)[: C // 2])
+
+    pruned = onnxsim.apply_structured_wanda_pruning(
+        model, calibration_data=calibration_data, sparsity=0.5
+    )
+    onnx.checker.check_model(pruned)
+
+    oracle = _residual_diamond_model(w_f[keep], w_s[keep], w_out[:, keep])
+    rng_x = np.random.default_rng(88)
+    x = rng_x.standard_normal((2, Cin, 10, 10)).astype(np.float32)
+    (y,) = _run(pruned, {"X": x})
+    (y_oracle,) = _run(oracle, {"X": x})
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-5, atol=1e-5)
+
+
 # --- apply_structured_wanda_pruning ------------------------------------------
 
 
