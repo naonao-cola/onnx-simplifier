@@ -1,0 +1,84 @@
+name: FireRedAudio regression test
+
+# Builds onnxsim from source and runs tests/test_fireredaudio.py, which
+# targets two real, pretrained submodules from FireRedTeam's FireRedAudio
+# (https://huggingface.co/FireRedTeam/FireRedAudio,
+# https://github.com/FireRedTeam/FireRedAudio) generation pathway --
+# RedPatchEncoder and RedDiT's flow-matching estimator -- and simplifies
+# their real-weight ONNX exports with onnxsim. See tests/test_fireredaudio.py's
+# module docstring for why FireRedAudio (no published ONNX export, a ~21GB+
+# checkpoint) is targeted this way instead of via a pre-exported ONNX bundle
+# like tests/test_pocket_tts.py / tests/test_voicevox.py.
+#
+# fireredaudio isn't pip-installable as-is (its repo root has both
+# fireredaudio/ and assets/ as top-level directories, which trips
+# setuptools' flat-layout auto-discovery), so it's put on PYTHONPATH instead
+# of pip installed.
+#
+# Downloads ~850MB of real pretrained weights over the network -- too
+# slow/network-dependent to run on every PR unconditionally. It always runs
+# weekly and on push to the default branch, and additionally runs on a PR
+# when the PR itself touches the files this test exists to guard; use
+# workflow_dispatch to trigger it manually against a branch for any other
+# change.
+on:
+  push:
+    branches:
+      - main
+      - master
+  pull_request:
+    paths:
+      - tests/test_fireredaudio.py
+      - .github/workflows/fireredaudio.yml
+  schedule:
+    - cron: '0 12 * * 1'  # weekly, Monday 12:00 UTC
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  fireredaudio:
+    name: FireRedAudio (Hugging Face) -> onnxsim
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      CMAKE_GENERATOR: Ninja
+      CMAKE_CXX_COMPILER_LAUNCHER: sccache
+      SCCACHE_GHA_ENABLED: 'on'
+      ACTIONS_CACHE_SERVICE_V2: 'on'
+      ONNXSIM_RUN_FIREREDAUDIO_TESTS: '1'
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.11'
+      - uses: mozilla-actions/sccache-action@v0.0.11
+
+      - name: Install build tooling
+        run: pip install cmake ninja "setuptools>=77" sccache nanobind
+
+      - name: Install test dependencies
+        run: pip install pytest onnxruntime torch transformers==5.8.0 einops
+
+      # Build the onnxsim under test last so it wins over anything a dependency
+      # might have pulled. --no-build-isolation reuses the tooling installed above.
+      - name: Build onnxsim (editable)
+        run: pip install --no-build-isolation -ve .
+
+      - name: Verify onnxsim under test is the source build
+        run: python -c "import onnxsim, onnxsim.onnxsim_cpp2py_export; print('onnxsim', onnxsim.__version__, onnxsim.__file__)"
+
+      # Not pip-installable as-is -- see tests/test_fireredaudio.py's module
+      # docstring -- so it's checked out and put on PYTHONPATH instead.
+      - name: Check out FireRedAudio source
+        run: git clone --depth 1 https://github.com/FireRedTeam/FireRedAudio /tmp/fireredaudio_src
+
+      - name: Run FireRedAudio regression test
+        run: pytest -v tests/test_fireredaudio.py
+        env:
+          PYTHONPATH: /tmp/fireredaudio_src
