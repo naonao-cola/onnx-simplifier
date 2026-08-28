@@ -1,23 +1,23 @@
 """Tests for ``onnxsim.quantize_ternary`` (the
 ``dynamic_quantize_ternary_matmul`` C++ pass).
 
-Each model is built directly with ``onnx.helper`` (no torch dependency,
-unlike a full BitNet b1.58 export), quantized, and then actually run through
-ONNX Runtime -- both before and after quantization -- so these tests double
-as a minimal end-to-end simplify/quantize/deploy check: the quantized graph
-must load and execute under a real inference engine, and its outputs must
-stay close to the float baseline. Since the ternary weight encoding is
-lossless (only the activation is quantized), the tolerance here is tighter
-than ``quantize_dynamic``'s own tests.
+Each model is built directly with the ONNX text format parser (``onnx.parser``,
+no torch dependency, unlike a full BitNet b1.58 export), quantized, and then
+actually run through ONNX Runtime -- both before and after quantization -- so
+these tests double as a minimal end-to-end simplify/quantize/deploy check: the
+quantized graph must load and execute under a real inference engine, and its
+outputs must stay close to the float baseline. Since the ternary weight
+encoding is lossless (only the activation is quantized), the tolerance here is
+tighter than ``quantize_dynamic``'s own tests.
 """
 
 import collections
 
 import numpy as np
 import onnx
-import onnx.helper
 import onnx.numpy_helper
 import pytest
+from onnx import parser
 
 import onnxsim
 
@@ -26,17 +26,20 @@ import onnxsim
 ort = pytest.importorskip("onnxruntime")
 
 
-def _model(nodes, inputs, outputs, initializer, opset=13):
-    graph = onnx.helper.make_graph(nodes, "g", inputs, outputs, initializer)
+def _model(body, initializer=(), opset=13, ir_version=10):
     # Pin a low IR version so the model loads under older onnxruntime builds
     # (which cap at IR version 11), matching test_fusion_patterns.py.
-    return onnx.helper.make_model(
-        graph, opset_imports=[onnx.helper.make_opsetid("", opset)], ir_version=10
+    model = parser.parse_model(
+        f"""
+        <
+          ir_version: {ir_version},
+          opset_import: ["": {opset}]
+        >
+        {body}
+        """
     )
-
-
-def _vi(name, shape):
-    return onnx.helper.make_tensor_value_info(name, onnx.TensorProto.FLOAT, shape)
+    model.graph.initializer.extend(initializer)
+    return model
 
 
 def _f32(array, name):
@@ -78,8 +81,15 @@ def test_quantize_ternary_matmul():
     rng = np.random.default_rng(0)
     K, N = 32, 16
     weight = _f32(_ternary_weight(rng, (K, N)), "W")
-    nodes = [onnx.helper.make_node("MatMul", ["X", "W"], ["Y"])]
-    model = _model(nodes, [_vi("X", [4, K])], [_vi("Y", [4, N])], [weight])
+    model = _model(
+        f"""
+        g (float[4,{K}] X) => (float[4,{N}] Y)
+        {{
+          Y = MatMul(X, W)
+        }}
+        """,
+        [weight],
+    )
 
     quant = onnxsim.quantize_ternary(model)
     onnx.checker.check_model(quant)
@@ -101,8 +111,15 @@ def test_quantize_ternary_gemm_transb_with_bias():
     K, N = 24, 12
     weight = _f32(_ternary_weight(rng, (N, K)), "W")
     bias = _f32(rng.standard_normal(N), "B")
-    nodes = [onnx.helper.make_node("Gemm", ["X", "W", "B"], ["Y"], transB=1)]
-    model = _model(nodes, [_vi("X", [3, K])], [_vi("Y", [3, N])], [weight, bias])
+    model = _model(
+        f"""
+        g (float[3,{K}] X) => (float[3,{N}] Y)
+        {{
+          Y = Gemm<transB = 1>(X, W, B)
+        }}
+        """,
+        [weight, bias],
+    )
 
     quant = onnxsim.quantize_ternary(model)
     onnx.checker.check_model(quant)
@@ -126,8 +143,15 @@ def test_quantize_ternary_weight_codes_are_lossless():
     scales = np.array([0.1, 0.2, 0.05, 0.4], dtype=np.float32)
     codes = rng.choice([-1, 0, 1], size=(K, N)).astype(np.float32)
     weight = _f32(codes * scales[np.newaxis, :], "W")
-    nodes = [onnx.helper.make_node("MatMul", ["X", "W"], ["Y"])]
-    model = _model(nodes, [_vi("X", [1, K])], [_vi("Y", [1, N])], [weight])
+    model = _model(
+        f"""
+        g (float[1,{K}] X) => (float[1,{N}] Y)
+        {{
+          Y = MatMul(X, W)
+        }}
+        """,
+        [weight],
+    )
 
     quant = onnxsim.quantize_ternary(model)
     initializers = {init.name: init for init in quant.graph.initializer}
@@ -143,8 +167,15 @@ def test_quantize_ternary_skips_non_ternary_weight():
     # Ordinary float weights (not restricted to {-s, 0, +s}) are left for
     # quantize_dynamic, not this pass.
     weight = _f32(np.random.default_rng(3).standard_normal((8, 4)), "W")
-    nodes = [onnx.helper.make_node("MatMul", ["X", "W"], ["Y"])]
-    model = _model(nodes, [_vi("X", [4, 8])], [_vi("Y", [4, 4])], [weight])
+    model = _model(
+        """
+        g (float[4,8] X) => (float[4,4] Y)
+        {
+          Y = MatMul(X, W)
+        }
+        """,
+        [weight],
+    )
     quant = onnxsim.quantize_ternary(model)
     assert _op_counts(quant)["MatMul"] == 1
     assert _op_counts(quant)["DynamicQuantizeLinear"] == 0
@@ -154,8 +185,15 @@ def test_quantize_ternary_skips_four_level_weight():
     # {-2, -1, 0, 1} * scale is one level too many to be ternary.
     rng = np.random.default_rng(4)
     weight = _f32(rng.choice([-2, -1, 0, 1], size=(8, 4)).astype(np.float32) * 0.1, "W")
-    nodes = [onnx.helper.make_node("MatMul", ["X", "W"], ["Y"])]
-    model = _model(nodes, [_vi("X", [4, 8])], [_vi("Y", [4, 4])], [weight])
+    model = _model(
+        """
+        g (float[4,8] X) => (float[4,4] Y)
+        {
+          Y = MatMul(X, W)
+        }
+        """,
+        [weight],
+    )
     quant = onnxsim.quantize_ternary(model)
     assert _op_counts(quant)["MatMul"] == 1
 
@@ -164,8 +202,15 @@ def test_quantize_ternary_skips_all_zero_weight():
     # An all-zero weight carries no ternary signal -- rewriting it only adds
     # nodes, so it is left as a (degenerate but harmless) float MatMul.
     weight = _f32(np.zeros((8, 4), np.float32), "W")
-    nodes = [onnx.helper.make_node("MatMul", ["X", "W"], ["Y"])]
-    model = _model(nodes, [_vi("X", [4, 8])], [_vi("Y", [4, 4])], [weight])
+    model = _model(
+        """
+        g (float[4,8] X) => (float[4,4] Y)
+        {
+          Y = MatMul(X, W)
+        }
+        """,
+        [weight],
+    )
     quant = onnxsim.quantize_ternary(model)
     assert _op_counts(quant)["MatMul"] == 1
 
@@ -185,12 +230,15 @@ def test_quantize_ternary_leaves_non_ternary_nodes_for_quantize_dynamic():
     K, N, batch = 64, 32, 8
     ternary_w = _f32(_ternary_weight(rng, (K, N)), "Wt")
     ordinary_w = _f32(rng.standard_normal((N, N)) * 0.5, "Wo")
-    nodes = [
-        onnx.helper.make_node("MatMul", ["X", "Wt"], ["H"]),
-        onnx.helper.make_node("MatMul", ["H", "Wo"], ["Y"]),
-    ]
     model = _model(
-        nodes, [_vi("X", [batch, K])], [_vi("Y", [batch, N])], [ternary_w, ordinary_w]
+        f"""
+        g (float[{batch},{K}] X) => (float[{batch},{N}] Y)
+        {{
+          H = MatMul(X, Wt)
+          Y = MatMul(H, Wo)
+        }}
+        """,
+        [ternary_w, ordinary_w],
     )
 
     ternary_only = onnxsim.quantize_ternary(model)
@@ -208,7 +256,15 @@ def test_quantize_ternary_skips_old_opset():
     # DynamicQuantizeLinear needs opset >= 11.
     rng = np.random.default_rng(6)
     weight = _f32(_ternary_weight(rng, (8, 4)), "W")
-    nodes = [onnx.helper.make_node("MatMul", ["X", "W"], ["Y"])]
-    model = _model(nodes, [_vi("X", [4, 8])], [_vi("Y", [4, 4])], [weight], opset=10)
+    model = _model(
+        """
+        g (float[4,8] X) => (float[4,4] Y)
+        {
+          Y = MatMul(X, W)
+        }
+        """,
+        [weight],
+        opset=10,
+    )
     quant = onnxsim.quantize_ternary(model)
     assert _op_counts(quant)["MatMul"] == 1
