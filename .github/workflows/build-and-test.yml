@@ -54,18 +54,18 @@ jobs:
         # not natively here.
         os: [ubuntu-24.04, ubuntu-24.04-arm, macos-15]
         # Full Python coverage on push/release; a reduced set on pull_request to
-        # cut CI jobs. cp310 exercises a version-specific (below-abi3-floor)
-        # wheel and cp312 the abi3 wheel that also serves 3.13/3.14, so cp311 and
-        # cp313 add no distinct build coverage on PRs. The free-threaded cp314t
+        # cut CI jobs. cp311 exercises a version-specific (below-abi3-floor)
+        # wheel and cp312 the abi3 wheel that also serves 3.13/3.14, so cp313
+        # adds no distinct build coverage on PRs. The free-threaded cp314t
         # job (via include below) still runs on every event.
-        py_ver: ${{ github.event_name == 'pull_request' && fromJSON('["cp310", "cp312"]') || fromJSON('["cp310", "cp311", "cp312", "cp313"]') }}
+        py_ver: ${{ github.event_name == 'pull_request' && fromJSON('["cp311", "cp312"]') || fromJSON('["cp311", "cp312", "cp313"]') }}
         include:
           - os: ubuntu-24.04
             py_ver: cp314t
             # test_ext allocates a ~2 GiB fp16 tensor and OOM-kills the
             # free-threaded runner (SIGKILL / exit 137), just as it does on the
             # Windows runner (see test_wheels_windows_cross). Skip it here; the
-            # same test still runs on the cp310-cp313 jobs (cp310/cp312 on PRs).
+            # same test still runs on the cp311-cp313 jobs (cp311/cp312 on PRs).
             pytest_args: '-k "not test_ext"'
     steps:
     - uses: actions/checkout@v7
@@ -95,8 +95,8 @@ jobs:
   # (clang + lld + a self-contained UCRT sysroot) instead of built natively on a
   # Windows runner. 3.12 and 3.13 share a single cp312-abi3 wheel (nanobind
   # limited-API module + the stable-ABI python3.lib from the CPython NuGet
-  # package); 3.10 and 3.11 are below the abi3 floor and get version-specific
-  # wheels. See scripts/cross/README.md.
+  # package); 3.11 is below the abi3 floor and gets a version-specific
+  # wheel. See scripts/cross/README.md.
   build_wheels_windows_cross:
     name: Cross-build Windows wheel on Ubuntu (${{ matrix.artifact }}, llvm-mingw)
     env:
@@ -109,7 +109,6 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { py_ver: '3.10', abi3: '0', artifact: cp310 }   # version-specific (below abi3 floor)
           - { py_ver: '3.11', abi3: '0', artifact: cp311 }   # version-specific (below abi3 floor)
           - { py_ver: '3.12', abi3: '1', artifact: abi3 }    # abi3: also serves 3.13+
     steps:
@@ -159,7 +158,7 @@ jobs:
         # The 3.13 job re-tests the exact cp312-abi3 wheel the 3.12 job already
         # covers, so drop it on pull_request to cut a CI job; push/release still
         # test both.
-        include: ${{ github.event_name == 'pull_request' && fromJSON('[{"py_ver":"3.10","artifact":"cp310"},{"py_ver":"3.11","artifact":"cp311"},{"py_ver":"3.12","artifact":"abi3"}]') || fromJSON('[{"py_ver":"3.10","artifact":"cp310"},{"py_ver":"3.11","artifact":"cp311"},{"py_ver":"3.12","artifact":"abi3"},{"py_ver":"3.13","artifact":"abi3"}]') }}
+        include: ${{ github.event_name == 'pull_request' && fromJSON('[{"py_ver":"3.11","artifact":"cp311"},{"py_ver":"3.12","artifact":"abi3"}]') || fromJSON('[{"py_ver":"3.11","artifact":"cp311"},{"py_ver":"3.12","artifact":"abi3"},{"py_ver":"3.13","artifact":"abi3"}]') }}
     steps:
       - uses: actions/checkout@v7
         with:

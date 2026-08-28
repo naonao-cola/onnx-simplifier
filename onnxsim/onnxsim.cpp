@@ -99,7 +99,8 @@ void RecordSimplifyOptionsMetadata(
     bool include_inline_functions, bool mutable_initializer,
     const std::optional<std::unordered_map<std::string, std::vector<int64_t>>>&
         overwrite_input_shapes,
-    const std::optional<std::vector<std::string>>& unused_output) {
+    const std::optional<std::vector<std::string>>& unused_output,
+    const std::optional<std::vector<std::string>>& extra_optimizers) {
   auto join = [](const std::vector<std::string>& v) {
     std::string out;
     for (size_t i = 0; i < v.size(); ++i) {
@@ -150,18 +151,23 @@ void RecordSimplifyOptionsMetadata(
   if (unused_output) {
     options.emplace_back("onnxsim.unused_output", join(*unused_output));
   }
+  if (extra_optimizers) {
+    options.emplace_back("onnxsim.extra_optimizers", join(*extra_optimizers));
+  }
 
   // Every key this function could ever write, not just the ones present in
-  // `options` this call -- ``overwrite_input_shapes``/``unused_output`` are
-  // conditional, so a stale value one of them left behind on a previous
-  // simplify() call (that did set it) must still be cleared on a later call
-  // that doesn't, or it would look like it's still in effect.
+  // `options` this call -- ``overwrite_input_shapes``/``unused_output``/
+  // ``extra_optimizers`` are conditional, so a stale value one of them left
+  // behind on a previous simplify() call (that did set it) must still be
+  // cleared on a later call that doesn't, or it would look like it's still
+  // in effect.
   static const std::unordered_set<std::string> known_option_keys = {
       "onnxsim.skip_optimizers",          "onnxsim.constant_folding",
       "onnxsim.shape_inference",          "onnxsim.tensor_size_threshold",
       "onnxsim.target_opset_version",     "onnxsim.initializers_as_constants",
       "onnxsim.include_inline_functions", "onnxsim.mutable_initializer",
-      "onnxsim.overwrite_input_shapes",   "onnxsim.unused_output"};
+      "onnxsim.overwrite_input_shapes",   "onnxsim.unused_output",
+      "onnxsim.extra_optimizers"};
 
   auto* props = model.mutable_metadata_props();
   google::protobuf::RepeatedPtrField<onnx::StringStringEntryProto> kept;
@@ -269,7 +275,8 @@ static onnx::ModelProto SimplifyImpl(
     bool mutable_initializer,
     const std::optional<std::unordered_map<std::string, std::vector<int64_t>>>&
         overwrite_input_shapes,
-    const std::optional<std::vector<std::string>>& unused_output) {
+    const std::optional<std::vector<std::string>>& unused_output,
+    const std::optional<std::vector<std::string>>& extra_optimizers) {
   // Register onnxsim's own optimizer passes into onnxoptimizer's registry
   // before the pass list is built below: fuse_attention, fuse_consecutive_mul,
   // fuse_mul_into_conv, fuse_preceding_mul_into_conv, fuse_rms_norm and
@@ -359,6 +366,26 @@ static onnx::ModelProto SimplifyImpl(
     if (!is_disabled(*skip_optimizers, batched_gemm) &&
         !is_disabled(always_disabled_passes, batched_gemm)) {
       passes.push_back(batched_gemm);
+    }
+    // extra_optimizers is the general form of the batched_gemm carve-out
+    // above: a caller-named pass -- typically PassType::Other, since
+    // GetFuseAndEliminationPass already covers every Fuse/Nop pass -- runs in
+    // addition to the default set. skip_optimizers/always_disabled_passes
+    // still apply, so an explicit --skip-optimization wins, and a name
+    // already present (e.g. the caller redundantly names a default-set pass)
+    // is not duplicated. An unknown name is deliberately not filtered out
+    // here: OptimizeGraphFixed's Optimizer construction looks every entry of
+    // ``passes`` up in the global pass registry and throws on one that does
+    // not exist, which is the desired behavior -- see extra_optimizers' own
+    // doc comment in onnxsim.h.
+    if (extra_optimizers) {
+      for (const auto& pass : *extra_optimizers) {
+        if (!is_disabled(*skip_optimizers, pass) &&
+            !is_disabled(always_disabled_passes, pass) &&
+            std::find(passes.begin(), passes.end(), pass) == passes.end()) {
+          passes.push_back(pass);
+        }
+      }
     }
     config.optimizer_passes = passes;
   }
@@ -882,11 +909,11 @@ static onnx::ModelProto SimplifyImpl(
   const std::vector<std::string> assigned_node_names =
       AssignMissingNodeNames(sim_model);
   DropIncompleteValueInfo(sim_model);
-  RecordSimplifyOptionsMetadata(sim_model, skip_optimizers, constant_folding,
-                                shape_inference, tensor_size_threshold,
-                                target_opset_version, initializers_as_constants,
-                                include_inline_functions, mutable_initializer,
-                                overwrite_input_shapes, unused_output);
+  RecordSimplifyOptionsMetadata(
+      sim_model, skip_optimizers, constant_folding, shape_inference,
+      tensor_size_threshold, target_opset_version, initializers_as_constants,
+      include_inline_functions, mutable_initializer, overwrite_input_shapes,
+      unused_output, extra_optimizers);
   RecordSimplifyDiffMetadata(sim_model, model);
   // Nodes onnxsim itself had to name (no author-given name survived), and
   // functions inlined away (see the tally taken just before
@@ -917,13 +944,14 @@ onnx::ModelProto Simplify(
     bool mutable_initializer,
     const std::optional<std::unordered_map<std::string, std::vector<int64_t>>>&
         overwrite_input_shapes,
-    const std::optional<std::vector<std::string>>& unused_output) {
+    const std::optional<std::vector<std::string>>& unused_output,
+    const std::optional<std::vector<std::string>>& extra_optimizers) {
   return SimplifyImpl(executor, model, /*mutable_model=*/nullptr,
                       skip_optimizers, constant_folding, shape_inference,
                       tensor_size_threshold, target_opset_version, rewriter,
                       initializers_as_constants, include_inline_functions,
                       mutable_initializer, overwrite_input_shapes,
-                      unused_output);
+                      unused_output, extra_optimizers);
 }
 
 onnx::ModelProto SimplifyConsumeInput(
@@ -935,13 +963,14 @@ onnx::ModelProto SimplifyConsumeInput(
     bool mutable_initializer,
     const std::optional<std::unordered_map<std::string, std::vector<int64_t>>>&
         overwrite_input_shapes,
-    const std::optional<std::vector<std::string>>& unused_output) {
+    const std::optional<std::vector<std::string>>& unused_output,
+    const std::optional<std::vector<std::string>>& extra_optimizers) {
   return SimplifyImpl(executor, model, /*mutable_model=*/&model,
                       skip_optimizers, constant_folding, shape_inference,
                       tensor_size_threshold, target_opset_version, rewriter,
                       initializers_as_constants, include_inline_functions,
                       mutable_initializer, overwrite_input_shapes,
-                      unused_output);
+                      unused_output, extra_optimizers);
 }
 
 void SimplifyPath(
@@ -954,7 +983,8 @@ void SimplifyPath(
     bool mutable_initializer,
     const std::optional<std::unordered_map<std::string, std::vector<int64_t>>>&
         overwrite_input_shapes,
-    const std::optional<std::vector<std::string>>& unused_output) {
+    const std::optional<std::vector<std::string>>& unused_output,
+    const std::optional<std::vector<std::string>>& extra_optimizers) {
   const bool debug_timing = std::getenv("ONNXSIM_DEBUG_PATH_TIMING") != nullptr;
   auto now = []() { return std::chrono::steady_clock::now(); };
   auto elapsed_ms = [](auto t0, auto t1) {
@@ -985,7 +1015,8 @@ void SimplifyPath(
         executor, model, skip_optimizers, constant_folding, shape_inference,
         tensor_size_threshold, target_opset_version, rewriter,
         initializers_as_constants, include_inline_functions,
-        mutable_initializer, overwrite_input_shapes, unused_output);
+        mutable_initializer, overwrite_input_shapes, unused_output,
+        extra_optimizers);
     if (debug_timing) {
       std::cerr << "SimplifyPath: Simplify " << elapsed_ms(t0, now()) << "ms\n";
     }

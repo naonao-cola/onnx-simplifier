@@ -30,6 +30,10 @@ from onnxsim.calibration import (
     quantize_static,
     quantize_static_int16,
 )
+from onnxsim.embedding_quantization import (
+    quantize_embedding_binary,
+    quantize_embedding_int8,
+)
 from onnxsim.gguf_reconstruct import (
     UnsupportedArchitectureError,
     reconstruct_gguf_graph,
@@ -74,12 +78,14 @@ from onnxsim.precision_estimator import (
 from onnxsim.pruning import (
     apply_magnitude_pruning,
     apply_structured_pruning,
+    apply_structured_wanda_pruning,
     apply_wanda_pruning,
     weight_sparsity,
 )
 from onnxsim.quip_sharp import apply_quip_sharp
 from onnxsim.smoothquant import apply_smoothquant
 from onnxsim.squeezellm import quantize_weight_only_squeezellm
+from onnxsim.tensorrt_sparsity import convert_matmul_to_gemm
 from onnxsim.transformers_export import export_transformers_model
 
 from .version import version as __version__
@@ -108,7 +114,9 @@ __all__ = [
     "apply_magnitude_pruning",
     "apply_wanda_pruning",
     "apply_structured_pruning",
+    "apply_structured_wanda_pruning",
     "weight_sparsity",
+    "convert_matmul_to_gemm",
     "workaround_ort_matmul_nbits_axis0_bug",
     "quantize_attention_dynamic",
     "quantize_dynamic",
@@ -122,6 +130,8 @@ __all__ = [
     "quantize_weight_only_squeezellm",
     "quantize_weight_only_aqlm",
     "quantize_kv_cache",
+    "quantize_embedding_binary",
+    "quantize_embedding_int8",
     "quantize_weight_only_matmul_nbits",
     "quantize_weight_only_int8_block",
     "quantize_weight_only_int16",

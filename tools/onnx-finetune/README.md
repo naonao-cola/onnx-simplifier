@@ -126,6 +126,48 @@ python3 scripts/generate_artifacts.py toy_model.onnx -o artifacts
 The toy task is learning `y = sum(x)` with a 2-layer MLP; loss should drop
 from roughly 5 to under 0.001 over the 20 epochs.
 
+## LoRA (low-rank adaptation)
+
+`--freeze-prefix` above still trains full-size parameter tensors, just fewer
+of them. For real LoRA -- freezing every original weight and training only a
+pair of small rank-decomposition matrices alongside each targeted layer --
+use `scripts/inject_lora.py` to do the graph surgery first, then point
+`generate_artifacts.py` at the resulting adapter manifest:
+
+```sh
+# 1. Graft a rank-4 adapter onto every eligible MatMul/Gemm weight (or use
+#    --target-contains to pick specific layers, e.g. --target-contains q_proj).
+python3 scripts/inject_lora.py model.onnx -o model_lora.onnx \
+  --rank 4 --params-out lora.json
+
+# 2. Generate training artifacts that train *only* the injected lora_A/lora_B
+#    tensors -- everything else (including the original weights) is frozen.
+python3 scripts/generate_artifacts.py model_lora.onnx -o artifacts \
+  --lora-params-file lora.json --loss cross-entropy --optimizer adamw
+
+# 3. Train as usual.
+./build/onnx-finetune --artifacts-dir artifacts ... --output-model finetuned.onnx --output-names output
+
+# 4. Pull just the trained adapter back out (a few KB, not the whole model).
+python3 scripts/extract_lora_adapter.py finetuned.onnx --params-file lora.json -o adapter.onnx
+
+# 5. Re-apply that adapter to any fresh copy of the base model, no retraining.
+python3 scripts/apply_lora_adapter.py model.onnx --adapter adapter.onnx \
+  --params-file lora.json -o finetuned2.onnx
+```
+
+`inject_lora.py` adds, per targeted weight `W`, a
+`(alpha/rank) * (X @ lora_A @ lora_B)` branch alongside that layer's existing
+output (`lora_A` Kaiming-normal, `lora_B` zero, so injecting is a no-op until
+trained). `adapter.onnx` from step 4 is not a runnable model by itself --
+it's a plain tensor container holding just the `lora_A`/`lora_B` initializers
+-- meant to be re-merged with `apply_lora_adapter.py`, not loaded directly
+into a session. This is a portable, ONNX-native adapter format built on
+these scripts; it is not the same binary format as ONNX Runtime GenAI's
+`.onnx_adapter` files (those come out of Olive's `convert-adapters`, for
+loading multiple adapters into one inference session via
+`Ort::LoraAdapter`/`RunOptions`).
+
 ## CLI reference
 
 | flag | required | description |
@@ -139,5 +181,5 @@ from roughly 5 to under 0.001 over the 20 epochs.
 | `--batch-size` | no (default 8) | |
 | `--epochs` | no (default 10) | |
 | `--lr` | no (default 1e-3) | |
-| `--save-checkpoint` | no | also save the post-training checkpoint (for resuming later, or LoRA-style adapter export) |
+| `--save-checkpoint` | no | also save the post-training checkpoint (for resuming training later) |
 | `--log-every` | no (default 50) | print loss every N steps; 0 disables |

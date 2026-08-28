@@ -81,11 +81,15 @@ cut, per output-channel L2-norm importance (Li et al., 2017, "Pruning
 Filters for Efficient ConvNets", https://arxiv.org/abs/1608.08710, adapted
 here from Conv filters to MatMul/Gemm output channels -- the same
 transplant :func:`apply_magnitude_pruning`/:func:`apply_wanda_pruning`
-already made for Han et al./Wanda's element-wise criteria). Because this
-changes shapes, it is unconditionally irreversible and, unlike a retrained
-pipeline, has no distillation/RL step to recover whatever accuracy the cut
-costs -- evaluate the result before shipping it, the same caution any
-lossy onnxsim pass deserves.
+already made for Han et al./Wanda's element-wise criteria).
+:func:`apply_structured_wanda_pruning` is the calibrated upgrade of that
+same technique -- ``||W_row||_2 * ||X||_2`` per channel instead of weight
+magnitude alone -- exactly the same relationship Wanda has to plain
+magnitude pruning, transplanted from individual weights to whole channels.
+Because either changes shapes, the result is unconditionally irreversible
+and, unlike a retrained pipeline, has no distillation/RL step to recover
+whatever accuracy the cut costs -- evaluate the result before shipping it,
+the same caution any lossy onnxsim pass deserves.
 """
 
 from __future__ import annotations
@@ -402,6 +406,7 @@ class _Chain:
     # pair, where both branches must agree on which channels survive.
     producers: Tuple[_Producer, ...]
     chain_ops: Tuple[Tuple[onnx.NodeProto, Optional[str]], ...]
+    consumer_node: onnx.NodeProto
     consumer_weight: str
     consumer_weight_transposed: bool
     n_channels: int
@@ -554,6 +559,7 @@ def _find_chains(graph: onnx.GraphProto) -> List[_Chain]:
             _Chain(
                 producers=(_Producer(node, w_name, weight_transposed, bias_name),),
                 chain_ops=chain_ops,
+                consumer_node=consumer[0],
                 consumer_weight=consumer[1],
                 consumer_weight_transposed=consumer[2],
                 n_channels=n_channels,
@@ -720,6 +726,7 @@ def _find_gated_chains(graph: onnx.GraphProto) -> List[_Chain]:
             _Chain(
                 producers=(_producer(info_a, pre_a), _producer(info_b, pre_b)),
                 chain_ops=chain_ops,
+                consumer_node=consumer[0],
                 consumer_weight=consumer[1],
                 consumer_weight_transposed=consumer[2],
                 n_channels=n_a,
@@ -754,6 +761,102 @@ def _slice_last_axis(init: onnx.TensorProto, keep: np.ndarray) -> None:
     init.CopyFrom(onnx.numpy_helper.from_array(new, name=init.name))
 
 
+def _plain_structured_importance(
+    chain: _Chain, w_arrays_nk: List[np.ndarray]
+) -> np.ndarray:
+    # Combined (root-sum-square) importance across every producer in this
+    # chain: for a plain chain this is just that producer's own L2 norm;
+    # for a gated pair, both branches must agree on which channels survive,
+    # so their per-channel norms are combined first.
+    squared_norm = np.zeros(chain.n_channels, dtype=np.float64)
+    for w_nk in w_arrays_nk:
+        squared_norm += np.square(np.linalg.norm(w_nk, axis=1))
+    return np.sqrt(squared_norm)
+
+
+def _apply_chains(
+    graph: onnx.GraphProto,
+    chains: List[_Chain],
+    sparsity: float,
+    compute_importance,
+) -> None:
+    """Shared body for :func:`apply_structured_pruning` and
+    :func:`apply_structured_wanda_pruning`: resolves cross-chain touched-role
+    conflicts, computes each surviving chain's target channel count, calls
+    ``compute_importance(chain, w_arrays_nk) -> np.ndarray[n_channels]`` for
+    the ranking, and performs the actual slicing plus stale ``value_info``
+    cleanup. Mutates ``graph`` in place.
+    """
+    initializer_map = {t.name: t for t in graph.initializer}
+    # A weight legitimately plays both roles across two different chains --
+    # e.g. the middle layer of a 3-layer MLP is the *consumer* of the first
+    # chain (its reduction/input axis gets pruned) and the *producer* of the
+    # second (its own output axis gets pruned), two independent axes of the
+    # same tensor. Only collapse when the *same role* is claimed twice (a
+    # tied/shared weight), tracked separately per role; bias/scale constants
+    # only ever play one role, so a single shared set is enough for those.
+    producer_touched: Set[str] = set()
+    consumer_touched: Set[str] = set()
+    const_touched: Set[str] = set()
+    stale_value_info: Set[str] = set()
+
+    for chain in chains:
+        producer_weights = {p.weight for p in chain.producers}
+        if len(producer_weights) != len(chain.producers):
+            continue  # degenerate (a gated pair naming the same weight twice)
+
+        consts = {p.bias for p in chain.producers if p.bias is not None}
+        consts.update(
+            const_name for _, const_name in chain.chain_ops if const_name is not None
+        )
+        if (
+            (producer_weights & producer_touched)
+            or chain.consumer_weight in consumer_touched
+            or (consts & const_touched)
+        ):
+            continue  # a shared/tied initializer another chain already resized
+
+        n = chain.n_channels
+        keep_count = max(1, n - round(n * sparsity))
+        if keep_count >= n:
+            continue  # rounds down to nothing for this layer -- no-op
+
+        w_arrays_nk = []
+        for p in chain.producers:
+            w = onnx.numpy_helper.to_array(initializer_map[p.weight]).astype(np.float64)
+            w_arrays_nk.append(w if p.weight_transposed else w.T)  # [N, K]
+        importance = compute_importance(chain, w_arrays_nk)
+        keep = np.sort(np.argsort(-importance)[:keep_count])
+
+        for p in chain.producers:
+            _slice_producer_weight(initializer_map[p.weight], p.weight_transposed, keep)
+            if p.bias is not None:
+                _slice_last_axis(initializer_map[p.bias], keep)
+        for _, const_name in chain.chain_ops:
+            if const_name is not None:
+                _slice_last_axis(initializer_map[const_name], keep)
+        _slice_consumer_weight(
+            initializer_map[chain.consumer_weight],
+            chain.consumer_weight_transposed,
+            keep,
+        )
+
+        producer_touched.update(producer_weights)
+        consumer_touched.add(chain.consumer_weight)
+        const_touched.update(consts)
+        for p in chain.producers:
+            stale_value_info.add(p.node.output[0])
+            stale_value_info.update(pre_op.output[0] for pre_op in p.pre_ops)
+        stale_value_info.update(
+            chain_node.output[0] for chain_node, _ in chain.chain_ops
+        )
+
+    if stale_value_info:
+        kept = [vi for vi in graph.value_info if vi.name not in stale_value_info]
+        del graph.value_info[:]
+        graph.value_info.extend(kept)
+
+
 def apply_structured_pruning(
     model: Union[str, onnx.ModelProto],
     sparsity: float = 0.5,
@@ -765,7 +868,9 @@ def apply_structured_pruning(
     zeroing. See this module's own docstring for the technique, its L2-norm
     importance metric, and why it's restricted to an unambiguous single
     producer -> consumer topology rather than general dependency-graph
-    pruning.
+    pruning. :func:`apply_structured_wanda_pruning` is the calibrated
+    upgrade of this same technique, exactly as :func:`apply_wanda_pruning`
+    is to :func:`apply_magnitude_pruning`.
 
     For every MatMul/vanilla-Gemm node (the "producer") whose output feeds,
     through zero or more shape-preserving elementwise ops (an activation,
@@ -805,81 +910,108 @@ def apply_structured_pruning(
     graph = out.graph
 
     chains = _find_chains(graph) + _find_gated_chains(graph)
+    if chains:
+        _apply_chains(graph, chains, sparsity, _plain_structured_importance)
+
+    return out
+
+
+def apply_structured_wanda_pruning(
+    model: Union[str, onnx.ModelProto],
+    calibration_data: Optional[Sequence[Tensors]] = None,
+    num_samples: int = 8,
+    seed: int = 0,
+    sparsity: float = 0.5,
+    epsilon: float = 1e-8,
+    providers: Optional[Sequence[str]] = None,
+) -> onnx.ModelProto:
+    """The calibrated upgrade of :func:`apply_structured_pruning`, exactly
+    as :func:`apply_wanda_pruning` is to :func:`apply_magnitude_pruning`:
+    same real structural channel removal, same topology matching (a single
+    producer or a gated pair -> zero or more shape-preserving elementwise
+    ops -> one consumer, see :func:`apply_structured_pruning`'s own
+    docstring), but each chain's output channels are ranked by
+    ``||W_row||_2 * ||X||_2`` -- L2 norm of that channel's own weight
+    row(s), times the L2 norm of the *activation* actually flowing through
+    that channel over calibration data (captured right where the chain
+    feeds into its consumer) -- instead of weight magnitude alone. This is
+    the same protection Wanda's element-wise metric gives unstructured
+    pruning, transplanted to whole channels: a channel whose weight is
+    individually unremarkable but which gates a consistently
+    high-magnitude activation is kept over one with a larger weight norm
+    but a near-dead activation.
+
+    :param model: the original onnx ModelProto or file path
+    :param calibration_data: representative input batches to measure each
+            chain's consumer-side activation norm on. Each batch is a
+            ``{input_name: np.ndarray}`` dict matching ``model``'s graph
+            inputs -- see :func:`onnxsim.generate_random_calibration_data`
+            (the default when omitted)
+    :param num_samples: random batches to generate when
+            ``calibration_data`` is omitted
+    :param seed: seed for the random calibration data (ignored if
+            ``calibration_data`` is supplied)
+    :param sparsity: target fraction of each matched chain's output
+            channels to remove (at least one channel is always kept)
+    :param epsilon: floor applied to the accumulated per-channel activation
+            norm, avoiding every channel of an all-zero activation tying at
+            exactly the weight-only importance
+    :param providers: onnxruntime execution providers to run ``model`` on
+            when capturing calibration activations
+    :returns: ``model`` with every matched chain's tensors resized in
+            place; anything not matching that exact topology falls back to
+            :func:`apply_structured_pruning`'s plain L2-norm ranking if no
+            matching activation was ever observed for that chain's consumer
+    """
+    if not (0.0 <= sparsity < 1.0):
+        raise ValueError(f"sparsity must be in [0, 1), got {sparsity}")
+    if isinstance(model, str):
+        model = onnx.load(model, load_external_data=False)
+    if calibration_data is None:
+        calibration_data = generate_random_calibration_data(
+            model, num_samples=num_samples, seed=seed
+        )
+
+    out = onnx.ModelProto()
+    out.CopyFrom(model)
+    graph = out.graph
+
+    chains = _find_chains(graph) + _find_gated_chains(graph)
     if not chains:
         return out
 
-    initializer_map = {t.name: t for t in graph.initializer}
-    # A weight legitimately plays both roles across two different chains --
-    # e.g. the middle layer of a 3-layer MLP is the *consumer* of the first
-    # chain (its reduction/input axis gets pruned) and the *producer* of the
-    # second (its own output axis gets pruned), two independent axes of the
-    # same tensor. Only collapse when the *same role* is claimed twice (a
-    # tied/shared weight), tracked separately per role; bias/scale constants
-    # only ever play one role, so a single shared set is enough for those.
-    producer_touched: Set[str] = set()
-    consumer_touched: Set[str] = set()
-    const_touched: Set[str] = set()
-    stale_value_info: Set[str] = set()
+    probe_names = sorted({chain.consumer_node.input[0] for chain in chains})
+    probe_model = _add_probe_outputs(out, probe_names)
 
-    for chain in chains:
-        producer_weights = {p.weight for p in chain.producers}
-        if len(producer_weights) != len(chain.producers):
-            continue  # degenerate (a gated pair naming the same weight twice)
+    sq_sum: Dict[str, np.ndarray] = {}
+    count: Dict[str, int] = {}
+    for batch in calibration_data:
+        result = backend.run_model(probe_model, batch, providers=providers)
+        for name in probe_names:
+            x = np.asarray(result[name], dtype=np.float64)
+            if x.ndim < 1:
+                continue
+            # Sum of squares over every axis but the last (the channel
+            # axis feeding the consumer's reduction dimension) -- correct
+            # for any activation rank, not just the 2-D case.
+            reduce_axes = tuple(range(x.ndim - 1))
+            s = np.square(x).sum(axis=reduce_axes) if reduce_axes else np.square(x)
+            cnt = int(np.prod(x.shape[:-1], dtype=np.int64)) if x.ndim > 1 else 1
+            sq_sum[name] = s if name not in sq_sum else sq_sum[name] + s
+            count[name] = count.get(name, 0) + cnt
 
-        consts = {p.bias for p in chain.producers if p.bias is not None}
-        consts.update(
-            const_name for _, const_name in chain.chain_ops if const_name is not None
-        )
-        if (
-            (producer_weights & producer_touched)
-            or chain.consumer_weight in consumer_touched
-            or (consts & const_touched)
-        ):
-            continue  # a shared/tied initializer another chain already resized
+    act_norm: Dict[str, np.ndarray] = {
+        name: np.sqrt(s / max(count[name], 1)) for name, s in sq_sum.items()
+    }
 
-        n = chain.n_channels
-        keep_count = max(1, n - round(n * sparsity))
-        if keep_count >= n:
-            continue  # rounds down to nothing for this layer -- no-op
+    def _wanda_structured_importance(
+        chain: _Chain, w_arrays_nk: List[np.ndarray]
+    ) -> np.ndarray:
+        base = _plain_structured_importance(chain, w_arrays_nk)
+        norm = act_norm.get(chain.consumer_node.input[0])
+        if norm is None or norm.shape[0] != chain.n_channels:
+            return base  # no matching activation observed -- fall back to |W|
+        return base * np.maximum(norm, epsilon)
 
-        # Combined (root-sum-square) importance across every producer in
-        # this chain: for a plain chain this is just that producer's own
-        # L2 norm; for a gated pair, both branches must agree on which
-        # channels survive, so their per-channel norms are combined first.
-        squared_norm = np.zeros(n, dtype=np.float64)
-        for p in chain.producers:
-            w = onnx.numpy_helper.to_array(initializer_map[p.weight]).astype(np.float64)
-            w_nk = w if p.weight_transposed else w.T  # [N, K]
-            squared_norm += np.square(np.linalg.norm(w_nk, axis=1))
-        importance = np.sqrt(squared_norm)
-        keep = np.sort(np.argsort(-importance)[:keep_count])
-
-        for p in chain.producers:
-            _slice_producer_weight(initializer_map[p.weight], p.weight_transposed, keep)
-            if p.bias is not None:
-                _slice_last_axis(initializer_map[p.bias], keep)
-        for _, const_name in chain.chain_ops:
-            if const_name is not None:
-                _slice_last_axis(initializer_map[const_name], keep)
-        _slice_consumer_weight(
-            initializer_map[chain.consumer_weight],
-            chain.consumer_weight_transposed,
-            keep,
-        )
-
-        producer_touched.update(producer_weights)
-        consumer_touched.add(chain.consumer_weight)
-        const_touched.update(consts)
-        for p in chain.producers:
-            stale_value_info.add(p.node.output[0])
-            stale_value_info.update(pre_op.output[0] for pre_op in p.pre_ops)
-        stale_value_info.update(
-            chain_node.output[0] for chain_node, _ in chain.chain_ops
-        )
-
-    if stale_value_info:
-        kept = [vi for vi in graph.value_info if vi.name not in stale_value_info]
-        del graph.value_info[:]
-        graph.value_info.extend(kept)
-
+    _apply_chains(graph, chains, sparsity, _wanda_structured_importance)
     return out

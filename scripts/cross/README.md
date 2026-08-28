@@ -73,13 +73,13 @@ run is a cold cache, later runs reuse it.
 ## Scope / status
 
 * Covers the Windows CPython versions shipped by `build-and-test.yml`:
-  **3.10, 3.11, 3.12, 3.13**. This cross-build **is** the Windows release path —
+  **3.11, 3.12, 3.13**. This cross-build **is** the Windows release path —
   it replaces the native Windows build, and its wheels are published to PyPI by
   the `upload_pypi` job alongside the natively-built Linux/macOS wheels.
 * **3.12 and 3.13 share one `cp312-abi3` wheel**: a genuine limited-API module
   (nanobind sets `Py_LIMITED_API` and links nuget's `python3.lib`, so the `.pyd`
-  imports `python3.dll`). **3.10 and 3.11** are below nanobind's abi3 floor
-  (3.12), so they get **version-specific** wheels (`ABI3=0`, tag `cp3XX-cp3XX`,
+  imports `python3.dll`). **3.11** is below nanobind's abi3 floor
+  (3.12), so it gets a **version-specific** wheel (`ABI3=0`, tag `cp3XX-cp3XX`,
   linking `pythonXY.dll`).
 * onnxruntime is **not** compiled in (`-DONNXSIM_BUILTIN_ORT=OFF`, matching the
   pip build), keeping the cross-compile surface to onnx + protobuf + nanobind.

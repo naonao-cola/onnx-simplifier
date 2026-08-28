@@ -20,8 +20,10 @@
 #include <string>
 #include <tuple>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
+#include "custom_optimizer_passes.h"
 #include "dlpack_bridge.h"
 #include "function_rewriter.h"
 #include "model_info.h"
@@ -1035,7 +1037,9 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
           bool mutable_initializer,
           std::optional<std::unordered_map<std::string, std::vector<int64_t>>>
               overwrite_input_shapes,
-          std::optional<std::vector<std::string>> unused_output) -> py::bytes {
+          std::optional<std::vector<std::string>> unused_output,
+          std::optional<std::vector<std::string>> extra_optimizers)
+           -> py::bytes {
          // force env initialization to register opset
          InitEnv();
          ONNX_NAMESPACE::ModelProto model;
@@ -1052,7 +1056,7 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
              shape_inference, tensor_size_threshold, target_opset_version,
              rewriter.get(), initializers_as_constants,
              include_inline_functions, mutable_initializer,
-             overwrite_input_shapes, unused_output);
+             overwrite_input_shapes, unused_output, extra_optimizers);
          std::string out;
          result.SerializeToString(&out);
          return py::bytes(out.data(), out.size());
@@ -1062,7 +1066,8 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
        "tensor_size_threshold"_a, "target_opset_version"_a.none(),
        "rewriter"_a.none(), "initializers_as_constants"_a = true,
        "include_inline_functions"_a = false, "mutable_initializer"_a = true,
-       "overwrite_input_shapes"_a.none(), "unused_output"_a.none())
+       "overwrite_input_shapes"_a.none(), "unused_output"_a.none(),
+       "extra_optimizers"_a.none())
       .def(
           "simplify_path",
           [](std::shared_ptr<PyModelExecutor> executor,
@@ -1077,15 +1082,16 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
              std::optional<
                  std::unordered_map<std::string, std::vector<int64_t>>>
                  overwrite_input_shapes,
-             std::optional<std::vector<std::string>> unused_output) -> bool {
+             std::optional<std::vector<std::string>> unused_output,
+             std::optional<std::vector<std::string>> extra_optimizers) -> bool {
             // force env initialization to register opset
             InitEnv();
-            SimplifyPath(*executor, in_path, out_path, skip_optimizers,
-                         constant_folding, shape_inference,
-                         tensor_size_threshold, target_opset_version,
-                         rewriter.get(), initializers_as_constants,
-                         include_inline_functions, mutable_initializer,
-                         overwrite_input_shapes, unused_output);
+            SimplifyPath(
+                *executor, in_path, out_path, skip_optimizers, constant_folding,
+                shape_inference, tensor_size_threshold, target_opset_version,
+                rewriter.get(), initializers_as_constants,
+                include_inline_functions, mutable_initializer,
+                overwrite_input_shapes, unused_output, extra_optimizers);
             return true;
           },
           "executor"_a, "in_path"_a, "out_path"_a, "skip_optimizers"_a.none(),
@@ -1093,13 +1099,35 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
           "tensor_size_threshold"_a, "target_opset_version"_a.none(),
           "rewriter"_a.none(), "initializers_as_constants"_a = true,
           "include_inline_functions"_a = false, "mutable_initializer"_a = true,
-          "overwrite_input_shapes"_a.none(), "unused_output"_a.none())
+          "overwrite_input_shapes"_a.none(), "unused_output"_a.none(),
+          "extra_optimizers"_a.none())
       .def("_list_optimizers",
            []() {
              py::list ret;
              for (const auto& p :
                   onnx::optimization::GetFuseAndEliminationPass()) {
                ret.append(p);
+             }
+             return ret;
+           })
+      // The counterpart to _list_optimizers: pass names valid for
+      // extra_optimizers specifically -- registered but not already part of
+      // the default fuse/elimination set (typically PassType::Other, e.g.
+      // fuse_matmul_add_bias_into_gemm_batched). Registers onnxsim's own
+      // custom passes first so this is accurate even if called before any
+      // simplify()/simplify_path() call has done so.
+      .def("_list_other_optimizers",
+           []() {
+             onnxsim::RegisterCustomOptimizerPasses();
+             const auto default_passes =
+                 onnx::optimization::GetFuseAndEliminationPass();
+             const std::unordered_set<std::string> default_set(
+                 default_passes.begin(), default_passes.end());
+             py::list ret;
+             for (const auto& p : onnx::optimization::GetAvailablePasses()) {
+               if (!default_set.count(p)) {
+                 ret.append(p);
+               }
              }
              return ret;
            })
