@@ -9,9 +9,9 @@ import collections
 
 import numpy as np
 import onnx
-import onnx.helper
 import onnx.numpy_helper
 import pytest
+from onnx import parser
 
 import onnxsim
 
@@ -20,15 +20,18 @@ import onnxsim
 ort = pytest.importorskip("onnxruntime")
 
 
-def _model(nodes, inputs, outputs, initializer, opset=13):
-    graph = onnx.helper.make_graph(nodes, "g", inputs, outputs, initializer)
-    return onnx.helper.make_model(
-        graph, opset_imports=[onnx.helper.make_opsetid("", opset)], ir_version=10
+def _model(body, initializer=(), opset=13):
+    model = parser.parse_model(
+        f"""
+        <
+          ir_version: 10,
+          opset_import: ["": {opset}]
+        >
+        {body}
+        """
     )
-
-
-def _vi(name, shape):
-    return onnx.helper.make_tensor_value_info(name, onnx.TensorProto.FLOAT, shape)
+    model.graph.initializer.extend(initializer)
+    return model
 
 
 def _f32(array, name):
@@ -57,8 +60,14 @@ def _assert_close(float_outputs, quant_outputs, rel_l2_tol=0.1):
 
 def test_quantize_add():
     rng = np.random.default_rng(0)
-    nodes = [onnx.helper.make_node("Add", ["A", "B"], ["C"])]
-    model = _model(nodes, [_vi("A", [4, 8]), _vi("B", [4, 8])], [_vi("C", [4, 8])], [])
+    model = _model(
+        """
+        g (float[4,8] A, float[4,8] B) => (float[4,8] C)
+        {
+          C = Add(A, B)
+        }
+        """
+    )
 
     quant = onnxsim.quantize_qoperator_elementwise(
         model, num_calibration_samples=16, seed=0
@@ -79,8 +88,14 @@ def test_quantize_add():
 
 def test_quantize_mul():
     rng = np.random.default_rng(1)
-    nodes = [onnx.helper.make_node("Mul", ["A", "B"], ["C"])]
-    model = _model(nodes, [_vi("A", [4, 8]), _vi("B", [4, 8])], [_vi("C", [4, 8])], [])
+    model = _model(
+        """
+        g (float[4,8] A, float[4,8] B) => (float[4,8] C)
+        {
+          C = Mul(A, B)
+        }
+        """
+    )
 
     quant = onnxsim.quantize_qoperator_elementwise(
         model, num_calibration_samples=16, seed=1
@@ -101,8 +116,14 @@ def test_quantize_broadcast():
     # QLinearAdd/QLinearMul support the same bidirectional broadcasting as
     # plain Add/Mul (see QLinearBinaryShapeInference in contrib_schemas.cpp).
     rng = np.random.default_rng(2)
-    nodes = [onnx.helper.make_node("Add", ["A", "B"], ["C"])]
-    model = _model(nodes, [_vi("A", [4, 8]), _vi("B", [1, 8])], [_vi("C", [4, 8])], [])
+    model = _model(
+        """
+        g (float[4,8] A, float[1,8] B) => (float[4,8] C)
+        {
+          C = Add(A, B)
+        }
+        """
+    )
 
     quant = onnxsim.quantize_qoperator_elementwise(
         model, num_calibration_samples=16, seed=2
@@ -125,16 +146,15 @@ def test_quantize_multiple_independent_nodes():
     # node's activation-range lookup (keyed by the *original* tensor name)
     # no longer finds an entry -- not exercised here.
     rng = np.random.default_rng(3)
-    nodes = [
-        onnx.helper.make_node("Add", ["A", "B"], ["T1"]),
-        onnx.helper.make_node("Add", ["C", "D"], ["T2"]),
-        onnx.helper.make_node("Concat", ["T1", "T2"], ["E"], axis=0),
-    ]
     model = _model(
-        nodes,
-        [_vi("A", [4, 8]), _vi("B", [4, 8]), _vi("C", [4, 8]), _vi("D", [4, 8])],
-        [_vi("E", [8, 8])],
-        [],
+        """
+        g (float[4,8] A, float[4,8] B, float[4,8] C, float[4,8] D) => (float[8,8] E)
+        {
+          T1 = Add(A, B)
+          T2 = Add(C, D)
+          E = Concat<axis = 0>(T1, T2)
+        }
+        """
     )
 
     quant = onnxsim.quantize_qoperator_elementwise(
@@ -156,8 +176,15 @@ def test_quantize_skips_constant_operand():
     # it should be quantized from its own static values, not force-fed
     # through the calibration harness.
     bias = _f32(np.random.default_rng(4).standard_normal(8), "B")
-    nodes = [onnx.helper.make_node("Add", ["A", "B"], ["C"])]
-    model = _model(nodes, [_vi("A", [4, 8])], [_vi("C", [4, 8])], [bias])
+    model = _model(
+        """
+        g (float[4,8] A) => (float[4,8] C)
+        {
+          C = Add(A, B)
+        }
+        """,
+        initializer=[bias],
+    )
     import onnxsim.onnxsim_cpp2py_export as C
 
     names = C.list_qoperator_elementwise_quantizable_tensors(model.SerializeToString())
@@ -169,19 +196,13 @@ def test_quantize_skips_constant_operand():
 
 
 def test_quantize_skips_non_float():
-    nodes = [onnx.helper.make_node("Add", ["A", "B"], ["C"])]
-    graph = onnx.helper.make_graph(
-        nodes,
-        "g",
-        [
-            onnx.helper.make_tensor_value_info("A", onnx.TensorProto.INT64, [4]),
-            onnx.helper.make_tensor_value_info("B", onnx.TensorProto.INT64, [4]),
-        ],
-        [onnx.helper.make_tensor_value_info("C", onnx.TensorProto.INT64, [4])],
-        [],
-    )
-    model = onnx.helper.make_model(
-        graph, opset_imports=[onnx.helper.make_opsetid("", 13)], ir_version=10
+    model = _model(
+        """
+        g (int64[4] A, int64[4] B) => (int64[4] C)
+        {
+          C = Add(A, B)
+        }
+        """
     )
     quant = onnxsim.quantize_qoperator_elementwise(model)
     assert _op_counts(quant)["Add"] == 1
@@ -189,8 +210,14 @@ def test_quantize_skips_non_float():
 
 
 def test_list_qoperator_elementwise_quantizable_tensors():
-    nodes = [onnx.helper.make_node("Add", ["A", "B"], ["C"])]
-    model = _model(nodes, [_vi("A", [4, 8]), _vi("B", [4, 8])], [_vi("C", [4, 8])], [])
+    model = _model(
+        """
+        g (float[4,8] A, float[4,8] B) => (float[4,8] C)
+        {
+          C = Add(A, B)
+        }
+        """
+    )
     import onnxsim.onnxsim_cpp2py_export as C
 
     names = C.list_qoperator_elementwise_quantizable_tensors(model.SerializeToString())
