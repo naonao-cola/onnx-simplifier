@@ -9,9 +9,9 @@ import collections
 
 import numpy as np
 import onnx
-import onnx.helper
 import onnx.numpy_helper
 import pytest
+from onnx import parser
 
 import onnxsim
 
@@ -20,15 +20,16 @@ import onnxsim
 ort = pytest.importorskip("onnxruntime")
 
 
-def _model(nodes, inputs, outputs, initializer, opset=13):
-    graph = onnx.helper.make_graph(nodes, "g", inputs, outputs, initializer)
-    return onnx.helper.make_model(
-        graph, opset_imports=[onnx.helper.make_opsetid("", opset)], ir_version=10
+def _model(body, opset=13):
+    return parser.parse_model(
+        f"""
+        <
+          ir_version: 10,
+          opset_import: ["": {opset}]
+        >
+        {body}
+        """
     )
-
-
-def _vi(name, shape):
-    return onnx.helper.make_tensor_value_info(name, onnx.TensorProto.FLOAT, shape)
 
 
 def _run(model, feeds):
@@ -53,8 +54,14 @@ def _assert_close(float_outputs, quant_outputs, rel_l2_tol=0.1):
 
 def test_quantize_softmax_default_axis():
     rng = np.random.default_rng(0)
-    nodes = [onnx.helper.make_node("Softmax", ["X"], ["Y"])]
-    model = _model(nodes, [_vi("X", [4, 8])], [_vi("Y", [4, 8])], [])
+    model = _model(
+        """
+        g (float[4,8] X) => (float[4,8] Y)
+        {
+          Y = Softmax(X)
+        }
+        """
+    )
 
     quant = onnxsim.quantize_qoperator_softmax(
         model, num_calibration_samples=16, seed=0
@@ -80,8 +87,14 @@ def test_quantize_softmax_default_axis():
 
 def test_quantize_softmax_explicit_axis():
     rng = np.random.default_rng(1)
-    nodes = [onnx.helper.make_node("Softmax", ["X"], ["Y"], axis=1)]
-    model = _model(nodes, [_vi("X", [2, 4, 8])], [_vi("Y", [2, 4, 8])], [])
+    model = _model(
+        """
+        g (float[2,4,8] X) => (float[2,4,8] Y)
+        {
+          Y = Softmax<axis = 1>(X)
+        }
+        """
+    )
 
     quant = onnxsim.quantize_qoperator_softmax(
         model, num_calibration_samples=16, seed=1
@@ -103,8 +116,15 @@ def test_quantize_softmax_pre_opset13_semantics():
     # ONNX Runtime's kernel replicates the *correct* one, not silently
     # assume the newer semantics.
     rng = np.random.default_rng(2)
-    nodes = [onnx.helper.make_node("Softmax", ["X"], ["Y"], axis=1)]
-    model = _model(nodes, [_vi("X", [2, 3, 4])], [_vi("Y", [2, 3, 4])], [], opset=11)
+    model = _model(
+        """
+        g (float[2,3,4] X) => (float[2,3,4] Y)
+        {
+          Y = Softmax<axis = 1>(X)
+        }
+        """,
+        opset=11,
+    )
 
     quant = onnxsim.quantize_qoperator_softmax(
         model, num_calibration_samples=16, seed=2
@@ -120,12 +140,16 @@ def test_quantize_softmax_pre_opset13_semantics():
 
 def test_quantize_multiple_independent_nodes():
     rng = np.random.default_rng(3)
-    nodes = [
-        onnx.helper.make_node("Softmax", ["A"], ["T1"], axis=-1),
-        onnx.helper.make_node("Sigmoid", ["B"], ["T2"]),
-        onnx.helper.make_node("Concat", ["T1", "T2"], ["C"], axis=0),
-    ]
-    model = _model(nodes, [_vi("A", [4, 8]), _vi("B", [4, 8])], [_vi("C", [8, 8])], [])
+    model = _model(
+        """
+        g (float[4,8] A, float[4,8] B) => (float[8,8] C)
+        {
+          T1 = Softmax<axis = -1>(A)
+          T2 = Sigmoid(B)
+          C = Concat<axis = 0>(T1, T2)
+        }
+        """
+    )
 
     quant = onnxsim.quantize_qoperator_softmax(
         model, num_calibration_samples=16, seed=3
@@ -142,16 +166,13 @@ def test_quantize_multiple_independent_nodes():
 
 
 def test_quantize_skips_non_float():
-    nodes = [onnx.helper.make_node("Softmax", ["X"], ["Y"])]
-    graph = onnx.helper.make_graph(
-        nodes,
-        "g",
-        [onnx.helper.make_tensor_value_info("X", onnx.TensorProto.FLOAT16, [4])],
-        [onnx.helper.make_tensor_value_info("Y", onnx.TensorProto.FLOAT16, [4])],
-        [],
-    )
-    model = onnx.helper.make_model(
-        graph, opset_imports=[onnx.helper.make_opsetid("", 13)], ir_version=10
+    model = _model(
+        """
+        g (float16[4] X) => (float16[4] Y)
+        {
+          Y = Softmax(X)
+        }
+        """
     )
     quant = onnxsim.quantize_qoperator_softmax(model)
     assert _op_counts(quant)["Softmax"] == 1
@@ -159,8 +180,14 @@ def test_quantize_skips_non_float():
 
 
 def test_list_qoperator_softmax_quantizable_tensors():
-    nodes = [onnx.helper.make_node("Softmax", ["X"], ["Y"])]
-    model = _model(nodes, [_vi("X", [4, 8])], [_vi("Y", [4, 8])], [])
+    model = _model(
+        """
+        g (float[4,8] X) => (float[4,8] Y)
+        {
+          Y = Softmax(X)
+        }
+        """
+    )
     import onnxsim.onnxsim_cpp2py_export as C
 
     names = C.list_qoperator_softmax_quantizable_tensors(model.SerializeToString())
@@ -170,11 +197,15 @@ def test_list_qoperator_softmax_quantizable_tensors():
 def test_list_qoperator_softmax_quantizable_tensors_no_opset_import():
     # A model with no resolvable default-domain opset import has nothing
     # quantizable -- there is no safe "opset" attribute value to guess.
-    nodes = [onnx.helper.make_node("Softmax", ["X"], ["Y"])]
-    graph = onnx.helper.make_graph(
-        nodes, "g", [_vi("X", [4, 8])], [_vi("Y", [4, 8])], []
+    model = parser.parse_model(
+        """
+        <ir_version: 10, opset_import: []>
+        g (float[4,8] X) => (float[4,8] Y)
+        {
+          Y = Softmax(X)
+        }
+        """
     )
-    model = onnx.helper.make_model(graph, opset_imports=[], ir_version=10)
     import onnxsim.onnxsim_cpp2py_export as C
 
     names = C.list_qoperator_softmax_quantizable_tensors(model.SerializeToString())
