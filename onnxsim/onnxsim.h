@@ -106,6 +106,19 @@ std::shared_ptr<const ModelExecutor> GetBuiltinModelExecutor();
 // graph outputs before simplification so dead-end elimination cleans up
 // nodes that only fed them. Both throw std::runtime_error if a name does
 // not match an existing graph input/output.
+// ``extra_optimizers``, when set, runs the named onnx-optimizer passes in
+// addition to the default fuse/elimination set -- the counterpart to
+// ``skip_optimizers``. This is how a pass registered as ``PassType::Other``
+// (excluded from the default set because it is a graph-shape rewrite rather
+// than a pure node reduction or fusion, e.g. a defusion that trades a
+// backend-specific op for a more portable but larger equivalent) gets
+// opted into, without changing what runs by default for every other caller.
+// Has no effect when ``skip_optimizers`` is ``std::nullopt`` (which disables
+// optimization entirely). An unknown pass name throws (surfaced from
+// onnx-optimizer's own pass registry lookup) rather than being silently
+// ignored, since -- unlike a typo in ``skip_optimizers``, which just means
+// nothing new is skipped -- a typo here means the caller's requested pass
+// silently never runs.
 onnx::ModelProto Simplify(
     const ModelExecutor& executor, const onnx::ModelProto& model,
     std::optional<std::vector<std::string>> skip_optimizers,
@@ -116,7 +129,8 @@ onnx::ModelProto Simplify(
     bool include_inline_functions = false, bool mutable_initializer = true,
     const std::optional<std::unordered_map<std::string, std::vector<int64_t>>>&
         overwrite_input_shapes = std::nullopt,
-    const std::optional<std::vector<std::string>>& unused_output =
+    const std::optional<std::vector<std::string>>& unused_output = std::nullopt,
+    const std::optional<std::vector<std::string>>& extra_optimizers =
         std::nullopt);
 
 // Same as ``Simplify`` above, except ``model`` is taken by mutable reference
@@ -144,7 +158,8 @@ onnx::ModelProto SimplifyConsumeInput(
     bool include_inline_functions = false, bool mutable_initializer = true,
     const std::optional<std::unordered_map<std::string, std::vector<int64_t>>>&
         overwrite_input_shapes = std::nullopt,
-    const std::optional<std::vector<std::string>>& unused_output =
+    const std::optional<std::vector<std::string>>& unused_output = std::nullopt,
+    const std::optional<std::vector<std::string>>& extra_optimizers =
         std::nullopt);
 
 // Debugging helpers: run a *single* one of the transforms that ``Simplify``
@@ -861,5 +876,6 @@ void SimplifyPath(
     bool include_inline_functions = false, bool mutable_initializer = true,
     const std::optional<std::unordered_map<std::string, std::vector<int64_t>>>&
         overwrite_input_shapes = std::nullopt,
-    const std::optional<std::vector<std::string>>& unused_output =
+    const std::optional<std::vector<std::string>>& unused_output = std::nullopt,
+    const std::optional<std::vector<std::string>>& extra_optimizers =
         std::nullopt);

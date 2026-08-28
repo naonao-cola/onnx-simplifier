@@ -10,6 +10,7 @@
 
 #include "onnxoptimizer/optimize.h"
 #include "passes/cross_layer_equalization.h"
+#include "passes/defuse_matmul_integer_to_float.h"
 #include "passes/dynamic_quantize_attention.h"
 #include "passes/dynamic_quantize_matmul.h"
 #include "passes/dynamic_quantize_matmul_integer_to_float.h"
@@ -98,6 +99,7 @@ void RegisterCustomOptimizerPasses() {
 
     // onnxsim-only rewrites (no built-in of the same name today).
     RegisterOrReplace<p::CrossLayerEqualization>(registry);
+    RegisterOrReplace<p::DefuseMatMulIntegerToFloat>(registry);
     RegisterOrReplace<p::DynamicQuantizeAttention>(registry);
     RegisterOrReplace<p::DynamicQuantizeMatMul>(registry);
     RegisterOrReplace<p::DynamicQuantizeMatMulIntegerToFloat>(registry);

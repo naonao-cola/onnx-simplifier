@@ -4,6 +4,7 @@ from typing import Optional
 
 import onnx
 import onnxruntime
+import pytest
 import torch
 from onnx import TensorProto, helper, numpy_helper
 
@@ -957,6 +958,11 @@ def test_arg_reduce_select_last_index_is_rewritten():
         [helper.make_tensor_value_info("y", TensorProto.INT64, [1])],
     )
     model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+    # Pinned rather than left at helper.make_model's default (the currently
+    # installed onnx package's latest IR version): this test runs the raw
+    # model through onnxruntime directly, and CI's bundled onnxruntime build
+    # doesn't necessarily support the newest IR version.
+    model.ir_version = 10
     onnx.checker.check_model(model)
 
     sim_model, check_ok = onnxsim.simplify(model, check_n=0)
@@ -989,6 +995,228 @@ def test_arg_reduce_select_last_index_is_rewritten():
         orig_out = sess_orig.run(None, {"x": v})[0]
         sim_out = sess_sim.run(None, {"x": v})[0]
         assert np.array_equal(orig_out, sim_out)
+
+
+def _einsum_matmul_model():
+    x = helper.make_tensor_value_info("x", TensorProto.FLOAT, [2, 3])
+    y = helper.make_tensor_value_info("y", TensorProto.FLOAT, [3, 4])
+    einsum = helper.make_node("Einsum", ["x", "y"], ["z"], equation="ij,jk->ik")
+    graph = helper.make_graph(
+        [einsum],
+        "g",
+        [x, y],
+        [helper.make_tensor_value_info("z", TensorProto.FLOAT, [2, 4])],
+    )
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+    onnx.checker.check_model(model)
+    return model
+
+
+def test_extra_optimizers_opts_into_an_off_by_default_pass():
+    # extra_optimizers is the counterpart to skipped_optimizers: it runs a
+    # named pass in addition to the default fuse/elimination set.
+    # replace_einsum_with_matmul is a real onnx-optimizer pass that is not
+    # part of that default set (confirmed via the second assertion below), so
+    # it only fires when named explicitly.
+    model = _einsum_matmul_model()
+
+    sim_default, ok_default = onnxsim.simplify(model, check_n=0)
+    assert ok_default
+    assert [n.op_type for n in sim_default.graph.node] == ["Einsum"]
+
+    from onnxsim.onnx_simplifier import C
+
+    assert "replace_einsum_with_matmul" not in C._list_optimizers()
+    assert "replace_einsum_with_matmul" in C._list_other_optimizers()
+
+    sim_extra, ok_extra = onnxsim.simplify(
+        model, check_n=0, extra_optimizers=["replace_einsum_with_matmul"]
+    )
+    assert ok_extra
+    assert [n.op_type for n in sim_extra.graph.node] == ["MatMul"]
+
+
+def test_extra_optimizers_unknown_name_raises():
+    model = _einsum_matmul_model()
+    with pytest.raises(Exception):
+        onnxsim.simplify(model, check_n=0, extra_optimizers=["not_a_real_pass"])
+
+
+def test_extra_optimizers_has_no_effect_when_optimization_disabled():
+    # perform_optimization=False means skipped_optimizers=None internally,
+    # which already disables the whole default pass set; extra_optimizers is
+    # documented to have no effect in that case either.
+    model = _einsum_matmul_model()
+    sim, ok = onnxsim.simplify(
+        model,
+        check_n=0,
+        perform_optimization=False,
+        extra_optimizers=["replace_einsum_with_matmul"],
+    )
+    assert ok
+    assert [n.op_type for n in sim.graph.node] == ["Einsum"]
+
+
+def _matmul_weight_data():
+    return [
+        1.0,
+        -2.0,
+        0.5,
+        3.0,
+        0.25,
+        -1.5,
+        -0.75,
+        2.5,
+        1.0,
+        0.1,
+        -0.2,
+        4.0,
+    ]  # [4, 3]
+
+
+def _matmul_model():
+    x = helper.make_tensor_value_info("x", TensorProto.FLOAT, [2, 4])
+    w = helper.make_tensor("w", TensorProto.FLOAT, [4, 3], _matmul_weight_data())
+    node = helper.make_node("MatMul", ["x", "w"], ["y"])
+    graph = helper.make_graph(
+        [node],
+        "g",
+        [x],
+        [helper.make_tensor_value_info("y", TensorProto.FLOAT, [2, 3])],
+        initializer=[w],
+    )
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+    model.ir_version = 10
+    onnx.checker.check_model(model)
+    return model
+
+
+def _gemm_with_bias_model():
+    x = helper.make_tensor_value_info("x", TensorProto.FLOAT, [2, 4])
+    w = helper.make_tensor("w", TensorProto.FLOAT, [4, 3], _matmul_weight_data())
+    b = helper.make_tensor("b", TensorProto.FLOAT, [3], [0.1, -0.2, 0.3])
+    node = helper.make_node("Gemm", ["x", "w", "b"], ["y"])
+    graph = helper.make_graph(
+        [node],
+        "g",
+        [x],
+        [helper.make_tensor_value_info("y", TensorProto.FLOAT, [2, 3])],
+        initializer=[w, b],
+    )
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+    model.ir_version = 10
+    onnx.checker.check_model(model)
+    return model
+
+
+def _matmul_test_input():
+    import numpy as np
+
+    return np.array([[1.0, 2.0, 3.0, 4.0], [0.5, -1.0, 2.0, -3.0]], dtype=np.float32)
+
+
+def test_defuse_matmul_integer_to_float_undoes_dynamic_quantize_matmul():
+    # defuse_matmul_integer_to_float is the exact inverse of
+    # dynamic_quantize_matmul: it folds the DynamicQuantizeLinear +
+    # MatMulInteger + Cast + Mul + Mul chain that pass builds back into a
+    # single plain MatMul, for consumers that cannot import the quantized
+    # ops at all. Both passes are PassType::Other, off by default.
+    import numpy as np
+
+    from onnxsim.onnx_simplifier import C
+
+    model = _matmul_model()
+
+    assert "dynamic_quantize_matmul" not in C._list_optimizers()
+    assert "dynamic_quantize_matmul" in C._list_other_optimizers()
+    assert "defuse_matmul_integer_to_float" not in C._list_optimizers()
+    assert "defuse_matmul_integer_to_float" in C._list_other_optimizers()
+
+    sim_q, ok_q = onnxsim.simplify(
+        model, check_n=0, extra_optimizers=["dynamic_quantize_matmul"]
+    )
+    assert ok_q
+    assert set(n.op_type for n in sim_q.graph.node) == {
+        "DynamicQuantizeLinear",
+        "MatMulInteger",
+        "Cast",
+        "Mul",
+    }
+
+    sim_d, ok_d = onnxsim.simplify(
+        sim_q, check_n=0, extra_optimizers=["defuse_matmul_integer_to_float"]
+    )
+    assert ok_d
+    assert [n.op_type for n in sim_d.graph.node] == ["MatMul"]
+
+    sess_orig = onnxruntime.InferenceSession(model.SerializeToString())
+    sess_defused = onnxruntime.InferenceSession(sim_d.SerializeToString())
+    x = _matmul_test_input()
+    y_orig = sess_orig.run(None, {"x": x})[0]
+    y_defused = sess_defused.run(None, {"x": x})[0]
+    # Only W went through lossy INT8 quantization (X stays float, unlike the
+    # actual quantized graph), so this should be close, not bitwise equal.
+    np.testing.assert_allclose(y_defused, y_orig, atol=0.05)
+
+
+def test_defuse_matmul_integer_to_float_with_bias():
+    import numpy as np
+
+    from onnxsim.onnx_simplifier import C
+
+    model = _gemm_with_bias_model()
+
+    # The forward pass's Gemm(+bias) handling, combined with the full default
+    # pass set, has an unrelated pre-existing flakiness on some weight
+    # values; run it alone (skip every default pass) to build a
+    # deterministic quantized fixture.
+    sim_q, ok_q = onnxsim.simplify(
+        model,
+        check_n=0,
+        skipped_optimizers=list(C._list_optimizers()),
+        extra_optimizers=["dynamic_quantize_matmul"],
+    )
+    assert ok_q
+    assert "Add" in [n.op_type for n in sim_q.graph.node]
+
+    sim_d, ok_d = onnxsim.simplify(
+        sim_q, check_n=0, extra_optimizers=["defuse_matmul_integer_to_float"]
+    )
+    assert ok_d
+    # The default pass set is still active alongside the extra one, so the
+    # MatMul + Add(bias) this pass emits is immediately re-fused into a
+    # single Gemm by fuse_matmul_add_bias_into_gemm -- also a correct
+    # result, just a more idiomatic one.
+    assert [n.op_type for n in sim_d.graph.node] == ["Gemm"]
+
+    sess_orig = onnxruntime.InferenceSession(model.SerializeToString())
+    sess_defused = onnxruntime.InferenceSession(sim_d.SerializeToString())
+    x = _matmul_test_input()
+    y_orig = sess_orig.run(None, {"x": x})[0]
+    y_defused = sess_defused.run(None, {"x": x})[0]
+    np.testing.assert_allclose(y_defused, y_orig, atol=0.05)
+
+
+def test_defuse_matmul_integer_to_float_is_off_by_default():
+    model = _matmul_model()
+    sim_q, ok_q = onnxsim.simplify(
+        model, check_n=0, extra_optimizers=["dynamic_quantize_matmul"]
+    )
+    assert ok_q
+    quantized_ops = set(n.op_type for n in sim_q.graph.node)
+
+    sim_default, ok_default = onnxsim.simplify(sim_q, check_n=0)
+    assert ok_default
+    assert set(n.op_type for n in sim_default.graph.node) == quantized_ops
+
+
+def test_defuse_matmul_integer_to_float_leaves_plain_matmul_alone():
+    model = _matmul_model()
+    sim, ok = onnxsim.simplify(
+        model, check_n=0, extra_optimizers=["defuse_matmul_integer_to_float"]
+    )
+    assert ok
+    assert [n.op_type for n in sim.graph.node] == ["MatMul"]
 
 
 def test_ir3_conv_bn_fuses():
