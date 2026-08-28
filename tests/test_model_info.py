@@ -710,6 +710,10 @@ def test_warns_when_shape_inference_fails(monkeypatch):
         raise RuntimeError("boom")
 
     monkeypatch.setattr(model_info.shape_inference, "infer_shapes", boom)
+    # Disable the optional onnx-shape-inference backend so this exercises the
+    # plain onnx.shape_inference path (and its failure) regardless of whether
+    # onnx-shape-inference happens to be installed.
+    monkeypatch.setattr(model_info, "infer_symbolic_shapes", None)
     x = _vi("x", [1, 4])
     y = _vi("y", [1, 4])
     node = helper.make_node("Relu", ["x"], ["y"])
