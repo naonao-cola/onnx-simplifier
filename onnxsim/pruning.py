@@ -1,4 +1,5 @@
-"""Post-training weight pruning for MatMul/vanilla-Gemm layers.
+"""Post-training weight pruning for MatMul/vanilla-Gemm (and, for structured
+pruning, Conv) layers.
 
 Surveying the pruning literature against what onnxsim can actually act on
 (an exported ONNX graph, no training loop, no gradients, usually no labels)
@@ -24,9 +25,11 @@ dimension -- real graph surgery, not the self-contained per-layer weight
 rewrite every other ``apply_*``/``quantize_*`` pass in onnxsim is. That part
 :func:`apply_structured_pruning` takes on, but deliberately only for the
 narrowest topology where the surgery is unambiguous: a single MatMul/Gemm
-whose output feeds, through a chain of shape-preserving elementwise ops
-(activations, a bias/scale add/mul) with no other consumer anywhere along
-that chain, into exactly one downstream MatMul/Gemm's reduction dimension.
+or ordinary (``group=1``) Conv whose output feeds, through a chain of
+shape-preserving elementwise ops (activations, and for MatMul/Gemm also a
+bias/scale add/mul) with no other consumer anywhere along that chain, into
+exactly one downstream layer of the same family whose reduction/input-
+channel dimension matches.
 Any residual/skip connection, multi-consumer fan-out, or branch (all of
 which need real dependency-graph analysis -- what Torch-Pruning's DepGraph
 does in general) is left untouched rather than guessed at. The other part
@@ -78,18 +81,33 @@ reached its target (or to measure an already-sparse model).
 reduction, real FLOP/parameter reduction on any runtime, no sparse-kernel
 support needed) from every producer -> consumer chain it can prove safe to
 cut, per output-channel L2-norm importance (Li et al., 2017, "Pruning
-Filters for Efficient ConvNets", https://arxiv.org/abs/1608.08710, adapted
-here from Conv filters to MatMul/Gemm output channels -- the same
-transplant :func:`apply_magnitude_pruning`/:func:`apply_wanda_pruning`
-already made for Han et al./Wanda's element-wise criteria).
+Filters for Efficient ConvNets", https://arxiv.org/abs/1608.08710) -- for a
+MatMul/Gemm chain, that criterion is a transplant from Conv filters to
+output channels (the same one :func:`apply_magnitude_pruning`/
+:func:`apply_wanda_pruning` already made for Han et al./Wanda's element-wise
+criteria); for a Conv chain it is the paper's own original setting, applied
+directly: each output filter's full ``[in_channels, kH, kW]`` kernel is
+flattened and ranked by its own L2 norm. Conv support is deliberately
+narrower than the MatMul/Gemm path: only ordinary (``group=1``) 2-D
+``Conv`` producers/consumers are matched, joined by unary activations alone
+-- no per-channel ``Add``/``Mul`` scale-or-bias op, since a real Conv
+already carries any bias in its own optional third input, and
+``BatchNormalization`` is expected to already be fused into the preceding
+Conv's weight by the time this pass runs (onnxsim's own default
+optimization does exactly that, see ``fuse_bn_into_conv``), so a raw
+per-channel affine between two Convs isn't a shape this pass special-cases.
+A grouped or depthwise Conv (``group != 1``) is left untouched entirely:
+its output and input channels aren't independent per-index the way this
+pass's single producer/consumer cut assumes.
 :func:`apply_structured_wanda_pruning` is the calibrated upgrade of that
 same technique -- ``||W_row||_2 * ||X||_2`` per channel instead of weight
 magnitude alone -- exactly the same relationship Wanda has to plain
-magnitude pruning, transplanted from individual weights to whole channels.
-Because either changes shapes, the result is unconditionally irreversible
-and, unlike a retrained pipeline, has no distillation/RL step to recover
-whatever accuracy the cut costs -- evaluate the result before shipping it,
-the same caution any lossy onnxsim pass deserves.
+magnitude pruning, transplanted from individual weights (or, for Conv,
+whole filters) to whole channels. Because either changes shapes, the
+result is unconditionally irreversible and, unlike a retrained pipeline,
+has no distillation/RL step to recover whatever accuracy the cut costs --
+evaluate the result before shipping it, the same caution any lossy onnxsim
+pass deserves.
 """
 
 from __future__ import annotations
@@ -398,6 +416,10 @@ class _Producer:
     # combines with another producer (a gated pair only -- see
     # :func:`_find_gated_chains`; empty for a plain single-producer chain).
     pre_ops: Tuple[onnx.NodeProto, ...] = ()
+    # True for a Conv producer: `weight_transposed` is meaningless then
+    # (Conv's ``[out_channels, in_channels, kH, kW]`` weight layout is
+    # fixed), and output channels always live on axis 0.
+    is_conv: bool = False
 
 
 @dataclass(frozen=True)
@@ -410,6 +432,10 @@ class _Chain:
     consumer_weight: str
     consumer_weight_transposed: bool
     n_channels: int
+    # True for a Conv consumer: input channels always live on axis 1 of its
+    # ``[out_channels, in_channels, kH, kW]`` weight, regardless of
+    # `consumer_weight_transposed` (unused then).
+    consumer_is_conv: bool = False
 
 
 def _consumers_of(graph: onnx.GraphProto) -> Dict[str, List[onnx.NodeProto]]:
@@ -563,6 +589,156 @@ def _find_chains(graph: onnx.GraphProto) -> List[_Chain]:
                 consumer_weight=consumer[1],
                 consumer_weight_transposed=consumer[2],
                 n_channels=n_channels,
+            )
+        )
+    return chains
+
+
+def _conv_group(node: onnx.NodeProto) -> int:
+    for attr in node.attribute:
+        if attr.name == "group":
+            return attr.i
+    return 1  # ONNX default
+
+
+def _match_conv_producer(
+    node: onnx.NodeProto, initializer_map: Dict[str, onnx.TensorProto]
+) -> Optional[Tuple[str, Optional[str], int]]:
+    """If `node` is an ordinary (``group=1``) 2-D ``Conv`` with a constant
+    4-D float32 ``[out_channels, in_channels, kH, kW]`` weight (and, if
+    present, a constant bias), returns
+    ``(weight_name, bias_name_or_None, out_channels)``. A grouped or
+    depthwise Conv (``group != 1``) never matches: its output and input
+    channels aren't independent per-index the way this pass's single
+    producer/consumer cut assumes.
+    """
+    if node.op_type != "Conv" or len(node.input) < 2:
+        return None
+    w_name = node.input[1]
+    w_init = initializer_map.get(w_name)
+    if (
+        w_init is None
+        or w_init.data_type != onnx.TensorProto.FLOAT
+        or len(w_init.dims) != 4
+        or _conv_group(node) != 1
+    ):
+        return None
+    bias_name = None
+    if len(node.input) == 3 and node.input[2]:
+        bias_name = node.input[2]
+        if bias_name not in initializer_map:
+            return None  # non-constant bias -- can't safely prune it
+    return w_name, bias_name, w_init.dims[0]
+
+
+def _match_conv_consumer(
+    node: onnx.NodeProto, initializer_map: Dict[str, onnx.TensorProto]
+) -> Optional[Tuple[str, int]]:
+    """If `node` is an ordinary (``group=1``) 2-D ``Conv`` with a constant
+    4-D float32 weight, returns ``(weight_name, in_channels)``.
+    """
+    if node.op_type != "Conv" or len(node.input) < 2:
+        return None
+    w_name = node.input[1]
+    w_init = initializer_map.get(w_name)
+    if (
+        w_init is None
+        or w_init.data_type != onnx.TensorProto.FLOAT
+        or len(w_init.dims) != 4
+        or _conv_group(node) != 1
+    ):
+        return None
+    return w_name, w_init.dims[1]
+
+
+def _walk_to_conv_consumer(
+    start: str,
+    initializer_map: Dict[str, onnx.TensorProto],
+    consumers_of: Dict[str, List[onnx.NodeProto]],
+    graph_outputs: Set[str],
+    n_channels: int,
+    max_hops: int,
+) -> Tuple[
+    Optional[Tuple[onnx.NodeProto, str]], Tuple[Tuple[onnx.NodeProto, None], ...]
+]:
+    """The Conv analogue of :func:`_walk_to_consumer`: from tensor `start`,
+    walks forward through unary shape-preserving activations (see
+    `_UNARY_PASS_THROUGH`) with no other consumer anywhere along the way,
+    until an ordinary Conv consumer is found whose input channel count
+    matches `n_channels`. Unlike the MatMul/Gemm walk, no per-channel
+    ``Add``/``Mul`` op is recognized -- see this module's own docstring for
+    why that's out of scope for Conv chains.
+    """
+    chain_ops: List[Tuple[onnx.NodeProto, None]] = []
+    consumer = None
+    cur = start
+    for _hop in range(max_hops):
+        candidates = consumers_of.get(cur, [])
+        if len(candidates) != 1:
+            break
+        nxt = candidates[0]
+
+        if nxt.op_type == "Conv" and nxt.input[0] == cur:
+            match = _match_conv_consumer(nxt, initializer_map)
+            if match is not None and match[1] == n_channels:
+                consumer = (nxt, match[0])
+            break
+
+        if not (
+            nxt.op_type in _UNARY_PASS_THROUGH
+            and list(nxt.input) == [cur]
+            and len(nxt.output) == 1
+        ):
+            break
+
+        out2 = nxt.output[0]
+        if len(consumers_of.get(out2, [])) != 1 or out2 in graph_outputs:
+            break
+        chain_ops.append((nxt, None))
+        cur = out2
+
+    return consumer, tuple(chain_ops)
+
+
+def _find_conv_chains(graph: onnx.GraphProto) -> List[_Chain]:
+    initializer_map = {t.name: t for t in graph.initializer}
+    consumers_of = _consumers_of(graph)
+    graph_outputs = {o.name for o in graph.output}
+
+    def _is_internal(name: str) -> bool:
+        return len(consumers_of.get(name, [])) == 1 and name not in graph_outputs
+
+    chains = []
+    for node in graph.node:
+        info = _match_conv_producer(node, initializer_map)
+        if info is None:
+            continue
+        w_name, bias_name, n_channels = info
+
+        out_name = node.output[0]
+        if not _is_internal(out_name):
+            continue
+
+        consumer, chain_ops = _walk_to_conv_consumer(
+            out_name,
+            initializer_map,
+            consumers_of,
+            graph_outputs,
+            n_channels,
+            _MAX_CHAIN_HOPS,
+        )
+        if consumer is None:
+            continue
+
+        chains.append(
+            _Chain(
+                producers=(_Producer(node, w_name, False, bias_name, is_conv=True),),
+                chain_ops=chain_ops,
+                consumer_node=consumer[0],
+                consumer_weight=consumer[1],
+                consumer_weight_transposed=False,
+                n_channels=n_channels,
+                consumer_is_conv=True,
             )
         )
     return chains
@@ -736,22 +912,36 @@ def _find_gated_chains(graph: onnx.GraphProto) -> List[_Chain]:
 
 
 def _slice_producer_weight(
-    w_init: onnx.TensorProto, weight_transposed: bool, keep: np.ndarray
+    w_init: onnx.TensorProto,
+    weight_transposed: bool,
+    keep: np.ndarray,
+    is_conv: bool = False,
 ) -> None:
     w = onnx.numpy_helper.to_array(w_init)
-    # [N, K] storage (transB=1): output channel is axis 0. [K, N] storage
-    # (the common case): output channel is axis 1.
-    w_new = w[keep, :] if weight_transposed else w[:, keep]
+    if is_conv:
+        # [out_channels, in_channels, kH, kW]: output channel is always axis 0.
+        w_new = w[keep, ...]
+    else:
+        # [N, K] storage (transB=1): output channel is axis 0. [K, N]
+        # storage (the common case): output channel is axis 1.
+        w_new = w[keep, :] if weight_transposed else w[:, keep]
     w_init.CopyFrom(onnx.numpy_helper.from_array(w_new, name=w_init.name))
 
 
 def _slice_consumer_weight(
-    w_init: onnx.TensorProto, weight_transposed: bool, keep: np.ndarray
+    w_init: onnx.TensorProto,
+    weight_transposed: bool,
+    keep: np.ndarray,
+    is_conv: bool = False,
 ) -> None:
     w = onnx.numpy_helper.to_array(w_init)
-    # [N, K] storage (transB=1): reduction dim is axis 1. [K, N] storage:
-    # reduction dim is axis 0.
-    w_new = w[:, keep] if weight_transposed else w[keep, :]
+    if is_conv:
+        # [out_channels, in_channels, kH, kW]: input channel is always axis 1.
+        w_new = w[:, keep, ...]
+    else:
+        # [N, K] storage (transB=1): reduction dim is axis 1. [K, N] storage:
+        # reduction dim is axis 0.
+        w_new = w[:, keep] if weight_transposed else w[keep, :]
     w_init.CopyFrom(onnx.numpy_helper.from_array(w_new, name=w_init.name))
 
 
@@ -824,12 +1014,18 @@ def _apply_chains(
         w_arrays_nk = []
         for p in chain.producers:
             w = onnx.numpy_helper.to_array(initializer_map[p.weight]).astype(np.float64)
-            w_arrays_nk.append(w if p.weight_transposed else w.T)  # [N, K]
+            if p.is_conv:
+                w_nk = w.reshape(w.shape[0], -1)  # [out_channels, in_channels*kH*kW]
+            else:
+                w_nk = w if p.weight_transposed else w.T  # [N, K]
+            w_arrays_nk.append(w_nk)
         importance = compute_importance(chain, w_arrays_nk)
         keep = np.sort(np.argsort(-importance)[:keep_count])
 
         for p in chain.producers:
-            _slice_producer_weight(initializer_map[p.weight], p.weight_transposed, keep)
+            _slice_producer_weight(
+                initializer_map[p.weight], p.weight_transposed, keep, is_conv=p.is_conv
+            )
             if p.bias is not None:
                 _slice_last_axis(initializer_map[p.bias], keep)
         for _, const_name in chain.chain_ops:
@@ -839,6 +1035,7 @@ def _apply_chains(
             initializer_map[chain.consumer_weight],
             chain.consumer_weight_transposed,
             keep,
+            is_conv=chain.consumer_is_conv,
         )
 
         producer_touched.update(producer_weights)
@@ -885,12 +1082,21 @@ def apply_structured_pruning(
     the two layers' composition mathematically unaffected for every
     surviving channel.
 
+    The same cut applies to ordinary (``group=1``) 2-D ``Conv`` producer ->
+    consumer pairs -- each output filter's whole ``[in_channels, kH, kW]``
+    kernel ranked by its own L2 norm, exactly Li et al.'s original filter-
+    pruning criterion -- joined only by unary activations (no per-channel
+    Add/Mul: a Conv already carries its own bias, and ``BatchNormalization``
+    is expected to already be fused into the preceding Conv by the time this
+    pass runs). A grouped or depthwise Conv is left untouched.
+
     Also handles the gated FFN pattern most current LLMs use in place of a
     plain two-layer MLP (SwiGLU/GeGLU: ``down(act(gate(x)) * up(x))``, see
     :func:`_find_gated_chains`) -- two producers (gate and up) combined by
     an elementwise product feed one consumer; both branches are ranked by
     combined (root-sum-square) importance and pruned to the *same*
-    surviving channel indices, since they're about to be multiplied.
+    surviving channel indices, since they're about to be multiplied. This
+    gated form is MatMul/Gemm-only -- Conv chains don't take part in it.
 
     :param model: the original onnx ModelProto or file path
     :param sparsity: target fraction of each matched producer's output
@@ -909,7 +1115,7 @@ def apply_structured_pruning(
     out.CopyFrom(model)
     graph = out.graph
 
-    chains = _find_chains(graph) + _find_gated_chains(graph)
+    chains = _find_chains(graph) + _find_gated_chains(graph) + _find_conv_chains(graph)
     if chains:
         _apply_chains(graph, chains, sparsity, _plain_structured_importance)
 
@@ -929,17 +1135,19 @@ def apply_structured_wanda_pruning(
     as :func:`apply_wanda_pruning` is to :func:`apply_magnitude_pruning`:
     same real structural channel removal, same topology matching (a single
     producer or a gated pair -> zero or more shape-preserving elementwise
-    ops -> one consumer, see :func:`apply_structured_pruning`'s own
-    docstring), but each chain's output channels are ranked by
-    ``||W_row||_2 * ||X||_2`` -- L2 norm of that channel's own weight
-    row(s), times the L2 norm of the *activation* actually flowing through
-    that channel over calibration data (captured right where the chain
-    feeds into its consumer) -- instead of weight magnitude alone. This is
-    the same protection Wanda's element-wise metric gives unstructured
-    pruning, transplanted to whole channels: a channel whose weight is
-    individually unremarkable but which gates a consistently
-    high-magnitude activation is kept over one with a larger weight norm
-    but a near-dead activation.
+    ops -> one consumer, MatMul/Gemm or Conv, see
+    :func:`apply_structured_pruning`'s own docstring), but each chain's
+    output channels are ranked by ``||W_row||_2 * ||X||_2`` -- L2 norm of
+    that channel's own weight row (or, for Conv, whole filter), times the
+    L2 norm of the *activation* actually flowing through that channel over
+    calibration data (captured right where the chain feeds into its
+    consumer, reduced over every axis but the channel one -- the last axis
+    for a MatMul/Gemm consumer, axis 1 of ``[N, C, H, W]`` for a Conv
+    consumer) -- instead of weight magnitude alone. This is the same
+    protection Wanda's element-wise metric gives unstructured pruning,
+    transplanted to whole channels: a channel whose weight is individually
+    unremarkable but which gates a consistently high-magnitude activation
+    is kept over one with a larger weight norm but a near-dead activation.
 
     :param model: the original onnx ModelProto or file path
     :param calibration_data: representative input batches to measure each
@@ -976,11 +1184,20 @@ def apply_structured_wanda_pruning(
     out.CopyFrom(model)
     graph = out.graph
 
-    chains = _find_chains(graph) + _find_gated_chains(graph)
+    chains = _find_chains(graph) + _find_gated_chains(graph) + _find_conv_chains(graph)
     if not chains:
         return out
 
-    probe_names = sorted({chain.consumer_node.input[0] for chain in chains})
+    # The channel axis of the activation feeding each chain's consumer: a
+    # MatMul/Gemm's reduction dimension is its input's last axis, while a
+    # Conv's input channel dimension is always axis 1 of [N, C, H, W]. Two
+    # chains can't disagree on a shared probe name -- a tensor has exactly
+    # one producer node, so it feeds one consumer type.
+    channel_axis: Dict[str, int] = {
+        chain.consumer_node.input[0]: (1 if chain.consumer_is_conv else -1)
+        for chain in chains
+    }
+    probe_names = sorted(channel_axis)
     probe_model = _add_probe_outputs(out, probe_names)
 
     sq_sum: Dict[str, np.ndarray] = {}
@@ -989,14 +1206,15 @@ def apply_structured_wanda_pruning(
         result = backend.run_model(probe_model, batch, providers=providers)
         for name in probe_names:
             x = np.asarray(result[name], dtype=np.float64)
-            if x.ndim < 1:
+            axis = channel_axis[name]
+            axis = axis if axis >= 0 else x.ndim + axis
+            if axis < 0 or axis >= x.ndim:
                 continue
-            # Sum of squares over every axis but the last (the channel
-            # axis feeding the consumer's reduction dimension) -- correct
+            # Sum of squares over every axis but the channel one -- correct
             # for any activation rank, not just the 2-D case.
-            reduce_axes = tuple(range(x.ndim - 1))
+            reduce_axes = tuple(i for i in range(x.ndim) if i != axis)
             s = np.square(x).sum(axis=reduce_axes) if reduce_axes else np.square(x)
-            cnt = int(np.prod(x.shape[:-1], dtype=np.int64)) if x.ndim > 1 else 1
+            cnt = int(np.prod(x.shape, dtype=np.int64)) // x.shape[axis]
             sq_sum[name] = s if name not in sq_sum else sq_sum[name] + s
             count[name] = count.get(name, 0) + cnt
 

@@ -662,6 +662,253 @@ def test_structured_pruning_native_swiglu_node_prunes_both_producers_together():
     np.testing.assert_array_equal(inits["Wd"], wd[keep, :])
 
 
+# --- Conv2D structured pruning ------------------------------------------
+
+
+def _conv_pair_model(w1, w2, b1=None, spatial=10, activation="Relu"):
+    Cin, C2 = w1.shape[1], w2.shape[0]
+    initializer = [_f32(w1, "W1"), _f32(w2, "W2")]
+    if b1 is not None:
+        conv1 = "h = Conv<kernel_shape=[3,3]>(X, W1, B1)"
+        initializer.append(_f32(b1, "B1"))
+    else:
+        conv1 = "h = Conv<kernel_shape=[3,3]>(X, W1)"
+    out_spatial = spatial - 4  # two valid (no-pad) 3x3 convs
+    return _model(
+        f"""
+        g (float[N,{Cin},{spatial},{spatial}] X) => (float[N,{C2},{out_spatial},{out_spatial}] Y)
+        {{
+          {conv1}
+          a = {activation}(h)
+          Y = Conv<kernel_shape=[3,3]>(a, W2)
+        }}
+        """,
+        initializer=initializer,
+    )
+
+
+def _conv_model(Cin=3, C1=16, C2=8, bias=True, activation="Relu", seed=0, spatial=10):
+    rng = np.random.default_rng(seed)
+    w1 = rng.standard_normal((C1, Cin, 3, 3)).astype(np.float32)
+    w2 = rng.standard_normal((C2, C1, 3, 3)).astype(np.float32)
+    b1 = rng.standard_normal((C1,)).astype(np.float32) if bias else None
+    return _conv_pair_model(w1, w2, b1=b1, spatial=spatial, activation=activation)
+
+
+def _oracle_keep_indices_conv(w, keep_count):
+    importance = np.linalg.norm(w.reshape(w.shape[0], -1).astype(np.float64), axis=1)
+    return np.sort(np.argsort(-importance)[:keep_count])
+
+
+def test_structured_pruning_conv_chain_shrinks_matched_layers():
+    Cin, C1, C2 = 3, 16, 8
+    model = _conv_model(Cin=Cin, C1=C1, C2=C2, bias=True)
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    inits = {t.name: t for t in pruned.graph.initializer}
+    assert list(inits["W1"].dims) == [C1 // 2, Cin, 3, 3]
+    assert list(inits["B1"].dims) == [C1 // 2]
+    assert list(inits["W2"].dims) == [C2, C1 // 2, 3, 3]
+
+
+def test_structured_pruning_conv_chain_matches_manual_channel_deletion_exactly():
+    # Same correctness bar as the MatMul/Gemm chain tests: exact
+    # equivalence to deleting the same output filters by hand, not just
+    # "close to the float model". Conv has no simple numpy one-liner
+    # standing in for the op itself, so the oracle is a second, smaller
+    # ONNX graph built directly from the same sliced weights and run
+    # through onnxruntime, rather than hand-rolled conv math.
+    Cin, C1, C2 = 3, 16, 8
+    rng = np.random.default_rng(30)
+    w1 = rng.standard_normal((C1, Cin, 3, 3)).astype(np.float32)
+    b1 = rng.standard_normal((C1,)).astype(np.float32)
+    w2 = rng.standard_normal((C2, C1, 3, 3)).astype(np.float32)
+    model = _conv_pair_model(w1, w2, b1=b1)
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    keep = _oracle_keep_indices_conv(w1, C1 // 2)
+    oracle = _conv_pair_model(w1[keep], w2[:, keep], b1=b1[keep])
+
+    rng_x = np.random.default_rng(31)
+    x = rng_x.standard_normal((2, Cin, 10, 10)).astype(np.float32)
+    (y,) = _run(pruned, {"X": x})
+    (y_oracle,) = _run(oracle, {"X": x})
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-5, atol=1e-5)
+
+
+def test_structured_pruning_conv_only_chain_matches_oracle_no_bias():
+    # No Conv bias at all, and a non-Relu activation -- a plain
+    # Conv -> Sigmoid -> Conv chain.
+    Cin, C1, C2 = 4, 12, 6
+    rng = np.random.default_rng(32)
+    w1 = rng.standard_normal((C1, Cin, 3, 3)).astype(np.float32)
+    w2 = rng.standard_normal((C2, C1, 3, 3)).astype(np.float32)
+    model = _conv_pair_model(w1, w2, activation="Sigmoid")
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.25)
+    onnx.checker.check_model(pruned)
+
+    keep = _oracle_keep_indices_conv(w1, C1 - round(C1 * 0.25))
+    oracle = _conv_pair_model(w1[keep], w2[:, keep], activation="Sigmoid")
+
+    rng_x = np.random.default_rng(33)
+    x = rng_x.standard_normal((2, Cin, 10, 10)).astype(np.float32)
+    (y,) = _run(pruned, {"X": x})
+    (y_oracle,) = _run(oracle, {"X": x})
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-5, atol=1e-5)
+
+
+def test_structured_pruning_skips_grouped_producer_conv():
+    # A depthwise Conv (group == in_channels == out_channels) has its
+    # output and input channels tied 1:1 through its own weight -- not the
+    # independent per-index relationship this pass's cut assumes -- so it
+    # must be left completely untouched as a producer, even though the
+    # topology otherwise looks identical to a matched pair.
+    C = 8
+    rng = np.random.default_rng(34)
+    w1 = rng.standard_normal((C, 1, 3, 3)).astype(np.float32)
+    w2 = rng.standard_normal((C, C, 3, 3)).astype(np.float32)
+    model = _model(
+        f"""
+        g (float[N,{C},10,10] X) => (float[N,{C},6,6] Y)
+        {{
+          h = Conv<kernel_shape=[3,3], group={C}>(X, W1)
+          a = Relu(h)
+          Y = Conv<kernel_shape=[3,3]>(a, W2)
+        }}
+        """,
+        initializer=[_f32(w1, "W1"), _f32(w2, "W2")],
+    )
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    np.testing.assert_array_equal(inits["W1"], w1)
+    np.testing.assert_array_equal(inits["W2"], w2)
+
+
+def test_structured_pruning_skips_grouped_consumer_conv():
+    Cin, C1 = 3, 8
+    rng = np.random.default_rng(35)
+    w1 = rng.standard_normal((C1, Cin, 3, 3)).astype(np.float32)
+    w2 = rng.standard_normal((C1, 1, 3, 3)).astype(np.float32)  # depthwise consumer
+    model = _model(
+        f"""
+        g (float[N,{Cin},10,10] X) => (float[N,{C1},6,6] Y)
+        {{
+          h = Conv<kernel_shape=[3,3]>(X, W1)
+          a = Relu(h)
+          Y = Conv<kernel_shape=[3,3], group={C1}>(a, W2)
+        }}
+        """,
+        initializer=[_f32(w1, "W1"), _f32(w2, "W2")],
+    )
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    np.testing.assert_array_equal(inits["W1"], w1)
+    np.testing.assert_array_equal(inits["W2"], w2)
+
+
+def test_structured_pruning_conv_into_non_pass_through_op_is_left_untouched():
+    # An ordinary CNN classifier tail: Conv -> GlobalAveragePool -> Flatten
+    # -> MatMul head. Neither pooling nor flattening is a shape-preserving
+    # elementwise op the chain walk recognizes, so the Conv producer is
+    # left completely untouched rather than matched to the MatMul by
+    # coincidence of a downstream reduction dimension.
+    Cin, C1, Out = 3, 8, 4
+    rng = np.random.default_rng(36)
+    w1 = rng.standard_normal((C1, Cin, 3, 3)).astype(np.float32)
+    w2 = rng.standard_normal((C1, Out)).astype(np.float32)
+    model = _model(
+        f"""
+        g (float[N,{Cin},10,10] X) => (float[N,{Out}] Y)
+        {{
+          h = Conv<kernel_shape=[3,3]>(X, W1)
+          p = GlobalAveragePool(h)
+          f = Flatten<axis=1>(p)
+          Y = MatMul(f, W2)
+        }}
+        """,
+        initializer=[_f32(w1, "W1"), _f32(w2, "W2")],
+    )
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    np.testing.assert_array_equal(inits["W1"], w1)
+    np.testing.assert_array_equal(inits["W2"], w2)
+
+
+def test_structured_pruning_conv_chain_scale_between_convs_is_left_untouched():
+    # A per-channel Mul (e.g. an un-fused BatchNormalization's scale, or a
+    # standalone SE-style gate) between two Convs isn't recognized -- unlike
+    # the MatMul/Gemm chain walk, which does allow Add/Mul against a
+    # per-channel constant. See this module's own docstring for why Conv
+    # chains restrict to unary activations only (a real Conv already
+    # carries its own bias, and onnxsim's own default optimization fuses
+    # BatchNormalization into the preceding Conv before this pass would
+    # ever see it).
+    Cin, C1, C2 = 3, 8, 4
+    rng = np.random.default_rng(37)
+    w1 = rng.standard_normal((C1, Cin, 3, 3)).astype(np.float32)
+    scale = rng.standard_normal((1, C1, 1, 1)).astype(np.float32)
+    w2 = rng.standard_normal((C2, C1, 3, 3)).astype(np.float32)
+    model = _model(
+        f"""
+        g (float[N,{Cin},10,10] X) => (float[N,{C2},6,6] Y)
+        {{
+          h = Conv<kernel_shape=[3,3]>(X, W1)
+          s = Mul(h, Scale)
+          a = Relu(s)
+          Y = Conv<kernel_shape=[3,3]>(a, W2)
+        }}
+        """,
+        initializer=[_f32(w1, "W1"), _f32(scale, "Scale"), _f32(w2, "W2")],
+    )
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    np.testing.assert_array_equal(inits["W1"], w1)
+    np.testing.assert_array_equal(inits["W2"], w2)
+
+
+def test_structured_wanda_pruning_conv_chain_matches_oracle_exactly():
+    Cin, C1, C2 = 3, 16, 8
+    rng = np.random.default_rng(40)
+    w1 = rng.standard_normal((C1, Cin, 3, 3)).astype(np.float32)
+    w2 = rng.standard_normal((C2, C1, 3, 3)).astype(np.float32)
+    model = _conv_pair_model(w1, w2)
+
+    probe_model = onnx.ModelProto()
+    probe_model.CopyFrom(model)
+    probe_model.graph.output.append(
+        onnx.helper.make_tensor_value_info("a", onnx.TensorProto.FLOAT, None)
+    )
+
+    rng_cal = np.random.default_rng(41)
+    x_cal = rng_cal.standard_normal((2, Cin, 10, 10)).astype(np.float32)
+    calibration_data = [{"X": x_cal}]
+
+    _, a_cal = _run(probe_model, {"X": x_cal})
+    # Reduce over every axis but the channel one (axis 1 of NCHW) -- the
+    # Conv analogue of the MatMul/Gemm oracle's last-axis reduction above.
+    act_norm = np.sqrt(np.mean(np.square(a_cal.astype(np.float64)), axis=(0, 2, 3)))
+    importance = np.linalg.norm(
+        w1.reshape(C1, -1).astype(np.float64), axis=1
+    ) * np.maximum(act_norm, 1e-8)
+    keep = np.sort(np.argsort(-importance)[: C1 // 2])
+
+    pruned = onnxsim.apply_structured_wanda_pruning(
+        model, calibration_data=calibration_data, sparsity=0.5
+    )
+    onnx.checker.check_model(pruned)
+
+    oracle = _conv_pair_model(w1[keep], w2[:, keep])
+    rng_x = np.random.default_rng(42)
+    x = rng_x.standard_normal((2, Cin, 10, 10)).astype(np.float32)
+    (y,) = _run(pruned, {"X": x})
+    (y_oracle,) = _run(oracle, {"X": x})
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-5, atol=1e-5)
+
+
 # --- apply_structured_wanda_pruning ------------------------------------------
 
 
