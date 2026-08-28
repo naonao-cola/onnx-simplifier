@@ -68,6 +68,17 @@ class Evaluator {
 
   std::map<std::string, SymTensor> Run() {
     for (const SymNode& node : graph_.node) {
+      // Split is the one op this pass folds that produces more than one
+      // output, so it is dispatched separately from the single-output Eval.
+      if (node.op_type == "Split") {
+        if (auto outs = EvalSplit(node)) {
+          for (std::size_t i = 0; i < node.output.size(); ++i) {
+            if (!node.output[i].empty())
+              values_[node.output[i]] = std::move((*outs)[i]);
+          }
+        }
+        continue;
+      }
       auto value = Eval(node);
       if (value && node.output.size() == 1 && !node.output[0].empty()) {
         values_[node.output[0]] = std::move(*value);
@@ -119,6 +130,7 @@ class Evaluator {
   std::optional<SymTensor> Eval(const SymNode& node) {
     const std::string& op = node.op_type;
     if (op == "Constant") return EvalConstant(node);
+    if (op == "Identity") return EvalIdentity(node);
     if (op == "Shape") return EvalShape(node);
     if (op == "Size") return EvalSize(node);
     if (op == "Gather") return EvalGather(node);
@@ -165,6 +177,13 @@ class Evaluator {
       if (a->i) return SymTensor::Scalar(SymExpr(*a->i));
     }
     return std::nullopt;
+  }
+
+  std::optional<SymTensor> EvalIdentity(const SymNode& node) {
+    if (node.input.empty()) return std::nullopt;
+    const SymTensor* data = Value(node.input[0]);
+    if (!data) return std::nullopt;
+    return *data;
   }
 
   std::optional<SymTensor> EvalShape(const SymNode& node) {
@@ -230,6 +249,49 @@ class Evaluator {
       out.insert(out.end(), t->data.begin(), t->data.end());
     }
     return SymTensor::Vector(std::move(out));
+  }
+
+  // Split is dispatched from Run() (see above), not from the single-output
+  // Eval() switch, since it has one output per node.output entry.
+  std::optional<std::vector<SymTensor>> EvalSplit(const SymNode& node) {
+    if (node.input.empty() || node.output.empty()) return std::nullopt;
+    const SymTensor* data = Value(node.input[0]);
+    if (!data || !data->is_vector()) return std::nullopt;
+    const int64_t axis = IntAttr(node, "axis", 0).value();
+    if (!(axis == 0 || axis == -1)) return std::nullopt;  // rank-1 data only
+    const int64_t len = data->size();
+    const std::size_t num_outputs = node.output.size();
+
+    // Split sizes: explicit via the deprecated "split" attribute or the
+    // opset-13+ second input; otherwise split evenly across num_outputs. The
+    // uneven-remainder rule for an implicit split (last chunk gets the
+    // remainder) varies across opsets, so an implicit split that does not
+    // divide evenly is left unresolved rather than guessed at.
+    std::vector<int64_t> sizes;
+    if (auto s = IntListOperand(node, "split", 1)) {
+      sizes = *s;
+    } else {
+      if (len % static_cast<int64_t>(num_outputs) != 0) return std::nullopt;
+      sizes.assign(num_outputs, len / static_cast<int64_t>(num_outputs));
+    }
+    if (sizes.size() != num_outputs) return std::nullopt;
+
+    int64_t total = 0;
+    for (int64_t s : sizes) {
+      if (s < 0) return std::nullopt;
+      total += s;
+    }
+    if (total != len) return std::nullopt;
+
+    std::vector<SymTensor> outs;
+    outs.reserve(num_outputs);
+    auto it = data->data.begin();
+    for (int64_t s : sizes) {
+      std::vector<SymExpr> chunk(it, it + s);
+      outs.push_back(SymTensor::Vector(std::move(chunk)));
+      it += s;
+    }
+    return outs;
   }
 
   std::optional<SymTensor> EvalUnsqueeze(const SymNode& node) {
