@@ -8,25 +8,32 @@ import onnx
 import onnx.helper
 import onnx.numpy_helper
 import pytest
+from onnx import parser
 
 import onnxsim
 
 ort = pytest.importorskip("onnxruntime")
 
 
-def _vi(name, shape):
-    return onnx.helper.make_tensor_value_info(name, onnx.TensorProto.FLOAT, shape)
+def _model(body, initializer=(), opset=21):
+    # Pinning ir_version: 10 matches the older onnxruntime bundled with some
+    # CI wheels (which cap at IR version 11); `_run` and onnxsim's own
+    # checks below run these models through onnxruntime.
+    model = parser.parse_model(
+        f"""
+        <
+          ir_version: 10,
+          opset_import: ["": {opset}]
+        >
+        {body}
+        """
+    )
+    model.graph.initializer.extend(initializer)
+    return model
 
 
 def _f32(array, name):
     return onnx.numpy_helper.from_array(array.astype(np.float32), name)
-
-
-def _model(nodes, inputs, outputs, initializer, opset=21):
-    graph = onnx.helper.make_graph(nodes, "g", inputs, outputs, initializer)
-    return onnx.helper.make_model(
-        graph, opset_imports=[onnx.helper.make_opsetid("", opset)], ir_version=10
-    )
 
 
 def _run(model, feeds):
@@ -39,9 +46,14 @@ def _run(model, feeds):
 def _matmul_model(K=64, N=16, seed=0):
     rng = np.random.default_rng(seed)
     weight = rng.standard_normal((K, N)).astype(np.float32) * 0.5
-    nodes = [onnx.helper.make_node("MatMul", ["X", "W"], ["Y"])]
     return _model(
-        nodes, [_vi("X", ["batch", K])], [_vi("Y", ["batch", N])], [_f32(weight, "W")]
+        f"""
+        g (float[batch,{K}] X) => (float[batch,{N}] Y)
+        {{
+          Y = MatMul(X, W)
+        }}
+        """,
+        initializer=[_f32(weight, "W")],
     )
 
 
@@ -108,9 +120,14 @@ def test_wanda_pruning_protects_high_activation_channels():
     salient = (3, 7, 40)
     rng = np.random.default_rng(0)
     weight = rng.standard_normal((K, N)).astype(np.float32) * 0.5
-    nodes = [onnx.helper.make_node("MatMul", ["X", "W"], ["Y"])]
     model = _model(
-        nodes, [_vi("X", ["batch", K])], [_vi("Y", ["batch", N])], [_f32(weight, "W")]
+        f"""
+        g (float[batch,{K}] X) => (float[batch,{N}] Y)
+        {{
+          Y = MatMul(X, W)
+        }}
+        """,
+        initializer=[_f32(weight, "W")],
     )
 
     x = rng.standard_normal((32, K)).astype(np.float32)
@@ -149,12 +166,14 @@ def test_wanda_pruning_falls_back_to_magnitude_without_matching_activation():
     K, N = 32, 8
     rng = np.random.default_rng(0)
     weight = rng.standard_normal((K, N)).astype(np.float32)
-    nodes = [onnx.helper.make_node("MatMul", ["X", "W"], ["Y"])]
     model = _model(
-        nodes,
-        [_vi("X", ["batch", "seq", K])],
-        [_vi("Y", ["batch", "seq", N])],
-        [_f32(weight, "W")],
+        f"""
+        g (float[batch,seq,{K}] X) => (float[batch,seq,{N}] Y)
+        {{
+          Y = MatMul(X, W)
+        }}
+        """,
+        initializer=[_f32(weight, "W")],
     )
     x = rng.standard_normal((2, 4, K)).astype(np.float32)
 
@@ -172,14 +191,13 @@ def test_weight_sparsity_of_unpruned_model_is_zero():
 
 
 def test_weight_sparsity_ignores_non_matching_layers():
-    graph = onnx.helper.make_graph(
-        [onnx.helper.make_node("Relu", ["X"], ["Y"])],
-        "g",
-        [_vi("X", [4])],
-        [_vi("Y", [4])],
-    )
-    model = onnx.helper.make_model(
-        graph, opset_imports=[onnx.helper.make_opsetid("", 21)], ir_version=10
+    model = _model(
+        """
+        g (float[4] X) => (float[4] Y)
+        {
+          Y = Relu(X)
+        }
+        """
     )
     assert onnxsim.weight_sparsity(model) == 0.0
 
@@ -194,17 +212,20 @@ def _mlp_model(K=8, H=32, Out=4, bias=True, activation="Relu", seed=0):
     initializer = [_f32(w1, "W1"), _f32(w2, "W2")]
     if bias:
         b1 = rng.standard_normal((H,)).astype(np.float32)
-        gemm1 = onnx.helper.make_node("Gemm", ["X", "W1", "B1"], ["h"])
+        gemm1 = "h = Gemm(X, W1, B1)"
         initializer.append(_f32(b1, "B1"))
     else:
-        gemm1 = onnx.helper.make_node("MatMul", ["X", "W1"], ["h"])
-    nodes = [
-        gemm1,
-        onnx.helper.make_node(activation, ["h"], ["a"]),
-        onnx.helper.make_node("MatMul", ["a", "W2"], ["Y"]),
-    ]
+        gemm1 = "h = MatMul(X, W1)"
     return _model(
-        nodes, [_vi("X", ["batch", K])], [_vi("Y", ["batch", Out])], initializer
+        f"""
+        g (float[batch,{K}] X) => (float[batch,{Out}] Y)
+        {{
+          {gemm1}
+          a = {activation}(h)
+          Y = MatMul(a, W2)
+        }}
+        """,
+        initializer=initializer,
     )
 
 
@@ -277,17 +298,17 @@ def test_structured_pruning_bias_add_between_matmuls_matches_oracle():
     w1 = rng.standard_normal((K, H)).astype(np.float32)
     bias = rng.standard_normal((H,)).astype(np.float32)
     w2 = rng.standard_normal((H, Out)).astype(np.float32)
-    nodes = [
-        onnx.helper.make_node("MatMul", ["X", "W1"], ["h"]),
-        onnx.helper.make_node("Add", ["h", "Bias"], ["hb"]),
-        onnx.helper.make_node("Relu", ["hb"], ["a"]),
-        onnx.helper.make_node("MatMul", ["a", "W2"], ["Y"]),
-    ]
     model = _model(
-        nodes,
-        [_vi("X", ["batch", K])],
-        [_vi("Y", ["batch", Out])],
-        [_f32(w1, "W1"), _f32(bias, "Bias"), _f32(w2, "W2")],
+        f"""
+        g (float[batch,{K}] X) => (float[batch,{Out}] Y)
+        {{
+          h = MatMul(X, W1)
+          hb = Add(h, Bias)
+          a = Relu(hb)
+          Y = MatMul(a, W2)
+        }}
+        """,
+        initializer=[_f32(w1, "W1"), _f32(bias, "Bias"), _f32(w2, "W2")],
     )
 
     pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
@@ -310,8 +331,9 @@ def test_structured_pruning_skips_branching_output():
     # must be left completely untouched.
     K, H, Out = 8, 16, 4
     model = _mlp_model(K=K, H=H, Out=Out, bias=False)
-    graph = model.graph
-    graph.output.append(_vi("h", ["batch", H]))
+    model.graph.output.append(
+        onnx.helper.make_tensor_value_info("h", onnx.TensorProto.FLOAT, ["batch", H])
+    )
 
     pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
     inits = {t.name: t for t in pruned.graph.initializer}
@@ -327,16 +349,16 @@ def test_structured_pruning_skips_multi_consumer_branch():
     w1 = rng.standard_normal((K, H)).astype(np.float32)
     w2 = rng.standard_normal((H, Out)).astype(np.float32)
     w3 = rng.standard_normal((H, Out)).astype(np.float32)
-    nodes = [
-        onnx.helper.make_node("MatMul", ["X", "W1"], ["h"]),
-        onnx.helper.make_node("MatMul", ["h", "W2"], ["Y1"]),
-        onnx.helper.make_node("MatMul", ["h", "W3"], ["Y2"]),
-    ]
     model = _model(
-        nodes,
-        [_vi("X", ["batch", K])],
-        [_vi("Y1", ["batch", Out]), _vi("Y2", ["batch", Out])],
-        [_f32(w1, "W1"), _f32(w2, "W2"), _f32(w3, "W3")],
+        f"""
+        g (float[batch,{K}] X) => (float[batch,{Out}] Y1, float[batch,{Out}] Y2)
+        {{
+          h = MatMul(X, W1)
+          Y1 = MatMul(h, W2)
+          Y2 = MatMul(h, W3)
+        }}
+        """,
+        initializer=[_f32(w1, "W1"), _f32(w2, "W2"), _f32(w3, "W3")],
     )
 
     pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
@@ -368,18 +390,18 @@ def test_structured_pruning_chains_through_a_third_layer():
     w1 = rng.standard_normal((K, H1)).astype(np.float32)
     w2 = rng.standard_normal((H1, H2)).astype(np.float32)
     w3 = rng.standard_normal((H2, Out)).astype(np.float32)
-    nodes = [
-        onnx.helper.make_node("MatMul", ["X", "W1"], ["h1"]),
-        onnx.helper.make_node("Relu", ["h1"], ["a1"]),
-        onnx.helper.make_node("MatMul", ["a1", "W2"], ["h2"]),
-        onnx.helper.make_node("Relu", ["h2"], ["a2"]),
-        onnx.helper.make_node("MatMul", ["a2", "W3"], ["Y"]),
-    ]
     model = _model(
-        nodes,
-        [_vi("X", ["batch", K])],
-        [_vi("Y", ["batch", Out])],
-        [_f32(w1, "W1"), _f32(w2, "W2"), _f32(w3, "W3")],
+        f"""
+        g (float[batch,{K}] X) => (float[batch,{Out}] Y)
+        {{
+          h1 = MatMul(X, W1)
+          a1 = Relu(h1)
+          h2 = MatMul(a1, W2)
+          a2 = Relu(h2)
+          Y = MatMul(a2, W3)
+        }}
+        """,
+        initializer=[_f32(w1, "W1"), _f32(w2, "W2"), _f32(w3, "W3")],
     )
 
     pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
@@ -417,18 +439,18 @@ def _swiglu_mlp_model(K=8, H=16, Out=4, gate_activation="Sigmoid", seed=0):
     wg = rng.standard_normal((K, H)).astype(np.float32)
     wu = rng.standard_normal((K, H)).astype(np.float32)
     wd = rng.standard_normal((H, Out)).astype(np.float32)
-    nodes = [
-        onnx.helper.make_node("MatMul", ["X", "Wg"], ["gate"]),
-        onnx.helper.make_node(gate_activation, ["gate"], ["gate_act"]),
-        onnx.helper.make_node("MatMul", ["X", "Wu"], ["up"]),
-        onnx.helper.make_node("Mul", ["gate_act", "up"], ["h"]),
-        onnx.helper.make_node("MatMul", ["h", "Wd"], ["Y"]),
-    ]
     model = _model(
-        nodes,
-        [_vi("X", ["batch", K])],
-        [_vi("Y", ["batch", Out])],
-        [_f32(wg, "Wg"), _f32(wu, "Wu"), _f32(wd, "Wd")],
+        f"""
+        g (float[batch,{K}] X) => (float[batch,{Out}] Y)
+        {{
+          gate = MatMul(X, Wg)
+          gate_act = {gate_activation}(gate)
+          up = MatMul(X, Wu)
+          h = Mul(gate_act, up)
+          Y = MatMul(h, Wd)
+        }}
+        """,
+        initializer=[_f32(wg, "Wg"), _f32(wu, "Wu"), _f32(wd, "Wd")],
     )
     return model, wg, wu, wd
 
@@ -479,18 +501,18 @@ def test_structured_pruning_gelu_gated_ffn_matches_oracle():
     wg = rng.standard_normal((K, H)).astype(np.float32)
     wu = rng.standard_normal((K, H)).astype(np.float32)
     wd = rng.standard_normal((H, Out)).astype(np.float32)
-    nodes = [
-        onnx.helper.make_node("MatMul", ["X", "Wg"], ["gate"]),
-        onnx.helper.make_node("Gelu", ["gate"], ["gate_act"], approximate="tanh"),
-        onnx.helper.make_node("MatMul", ["X", "Wu"], ["up"]),
-        onnx.helper.make_node("Mul", ["gate_act", "up"], ["h"]),
-        onnx.helper.make_node("MatMul", ["h", "Wd"], ["Y"]),
-    ]
     model = _model(
-        nodes,
-        [_vi("X", ["batch", K])],
-        [_vi("Y", ["batch", Out])],
-        [_f32(wg, "Wg"), _f32(wu, "Wu"), _f32(wd, "Wd")],
+        f"""
+        g (float[batch,{K}] X) => (float[batch,{Out}] Y)
+        {{
+          gate = MatMul(X, Wg)
+          gate_act = Gelu<approximate = "tanh">(gate)
+          up = MatMul(X, Wu)
+          h = Mul(gate_act, up)
+          Y = MatMul(h, Wd)
+        }}
+        """,
+        initializer=[_f32(wg, "Wg"), _f32(wu, "Wu"), _f32(wd, "Wd")],
     )
 
     pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
@@ -515,17 +537,17 @@ def test_structured_pruning_ungated_mul_of_two_producers_still_matches_oracle():
     w1 = rng.standard_normal((K, H)).astype(np.float32)
     w2 = rng.standard_normal((K, H)).astype(np.float32)
     w3 = rng.standard_normal((H, Out)).astype(np.float32)
-    nodes = [
-        onnx.helper.make_node("MatMul", ["X", "W1"], ["a"]),
-        onnx.helper.make_node("MatMul", ["X", "W2"], ["b"]),
-        onnx.helper.make_node("Mul", ["a", "b"], ["h"]),
-        onnx.helper.make_node("MatMul", ["h", "W3"], ["Y"]),
-    ]
     model = _model(
-        nodes,
-        [_vi("X", ["batch", K])],
-        [_vi("Y", ["batch", Out])],
-        [_f32(w1, "W1"), _f32(w2, "W2"), _f32(w3, "W3")],
+        f"""
+        g (float[batch,{K}] X) => (float[batch,{Out}] Y)
+        {{
+          a = MatMul(X, W1)
+          b = MatMul(X, W2)
+          h = Mul(a, b)
+          Y = MatMul(h, W3)
+        }}
+        """,
+        initializer=[_f32(w1, "W1"), _f32(w2, "W2"), _f32(w3, "W3")],
     )
 
     pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
@@ -547,16 +569,16 @@ def test_structured_pruning_gated_mul_against_constant_scale_is_not_a_gate():
     w1 = rng.standard_normal((K, H)).astype(np.float32)
     scale = rng.standard_normal((H,)).astype(np.float32)
     w2 = rng.standard_normal((H, Out)).astype(np.float32)
-    nodes = [
-        onnx.helper.make_node("MatMul", ["X", "W1"], ["a"]),
-        onnx.helper.make_node("Mul", ["a", "Scale"], ["h"]),
-        onnx.helper.make_node("MatMul", ["h", "W2"], ["Y"]),
-    ]
     model = _model(
-        nodes,
-        [_vi("X", ["batch", K])],
-        [_vi("Y", ["batch", Out])],
-        [_f32(w1, "W1"), _f32(scale, "Scale"), _f32(w2, "W2")],
+        f"""
+        g (float[batch,{K}] X) => (float[batch,{Out}] Y)
+        {{
+          a = MatMul(X, W1)
+          h = Mul(a, Scale)
+          Y = MatMul(h, W2)
+        }}
+        """,
+        initializer=[_f32(w1, "W1"), _f32(scale, "Scale"), _f32(w2, "W2")],
     )
 
     pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
@@ -577,19 +599,24 @@ def test_structured_pruning_gated_ffn_skips_when_a_branch_also_feeds_elsewhere()
     wu = rng.standard_normal((K, H)).astype(np.float32)
     wd = rng.standard_normal((H, Out)).astype(np.float32)
     wother = rng.standard_normal((H, Out)).astype(np.float32)
-    nodes = [
-        onnx.helper.make_node("MatMul", ["X", "Wg"], ["gate"]),
-        onnx.helper.make_node("Sigmoid", ["gate"], ["gate_act"]),
-        onnx.helper.make_node("MatMul", ["X", "Wu"], ["up"]),
-        onnx.helper.make_node("Mul", ["gate_act", "up"], ["h"]),
-        onnx.helper.make_node("MatMul", ["h", "Wd"], ["Y1"]),
-        onnx.helper.make_node("MatMul", ["up", "Wother"], ["Y2"]),
-    ]
     model = _model(
-        nodes,
-        [_vi("X", ["batch", K])],
-        [_vi("Y1", ["batch", Out]), _vi("Y2", ["batch", Out])],
-        [_f32(wg, "Wg"), _f32(wu, "Wu"), _f32(wd, "Wd"), _f32(wother, "Wother")],
+        f"""
+        g (float[batch,{K}] X) => (float[batch,{Out}] Y1, float[batch,{Out}] Y2)
+        {{
+          gate = MatMul(X, Wg)
+          gate_act = Sigmoid(gate)
+          up = MatMul(X, Wu)
+          h = Mul(gate_act, up)
+          Y1 = MatMul(h, Wd)
+          Y2 = MatMul(up, Wother)
+        }}
+        """,
+        initializer=[
+            _f32(wg, "Wg"),
+            _f32(wu, "Wu"),
+            _f32(wd, "Wd"),
+            _f32(wother, "Wother"),
+        ],
     )
 
     pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
@@ -612,17 +639,17 @@ def test_structured_pruning_native_swiglu_node_prunes_both_producers_together():
     wg = rng.standard_normal((K, H)).astype(np.float32)
     wu = rng.standard_normal((K, H)).astype(np.float32)
     wd = rng.standard_normal((H, Out)).astype(np.float32)
-    nodes = [
-        onnx.helper.make_node("MatMul", ["X", "Wg"], ["gate"]),
-        onnx.helper.make_node("MatMul", ["X", "Wu"], ["up"]),
-        onnx.helper.make_node("SwiGLU", ["gate", "up"], ["h"]),
-        onnx.helper.make_node("MatMul", ["h", "Wd"], ["Y"]),
-    ]
     model = _model(
-        nodes,
-        [_vi("X", ["batch", K])],
-        [_vi("Y", ["batch", Out])],
-        [_f32(wg, "Wg"), _f32(wu, "Wu"), _f32(wd, "Wd")],
+        f"""
+        g (float[batch,{K}] X) => (float[batch,{Out}] Y)
+        {{
+          gate = MatMul(X, Wg)
+          up = MatMul(X, Wu)
+          h = SwiGLU(gate, up)
+          Y = MatMul(h, Wd)
+        }}
+        """,
+        initializer=[_f32(wg, "Wg"), _f32(wu, "Wu"), _f32(wd, "Wd")],
         opset=28,
     )
 
@@ -670,16 +697,16 @@ def test_structured_wanda_pruning_protects_channels_with_small_weight_but_large_
         w1[:, j] = 0.0
         w1[k0, j] = small_scale  # weight norm well below the ~1.4 typical column
 
-    nodes = [
-        onnx.helper.make_node("MatMul", ["X", "W1"], ["h"]),
-        onnx.helper.make_node("Relu", ["h"], ["a"]),
-        onnx.helper.make_node("MatMul", ["a", "W2"], ["Y"]),
-    ]
     model = _model(
-        nodes,
-        [_vi("X", ["batch", K])],
-        [_vi("Y", ["batch", Out])],
-        [_f32(w1, "W1"), _f32(w2, "W2")],
+        f"""
+        g (float[batch,{K}] X) => (float[batch,{Out}] Y)
+        {{
+          h = MatMul(X, W1)
+          a = Relu(h)
+          Y = MatMul(a, W2)
+        }}
+        """,
+        initializer=[_f32(w1, "W1"), _f32(w2, "W2")],
     )
 
     x = rng.standard_normal((64, K)).astype(np.float32)
@@ -704,16 +731,16 @@ def test_structured_wanda_pruning_matches_oracle_exactly():
     rng = np.random.default_rng(21)
     w1 = rng.standard_normal((K, H)).astype(np.float32)
     w2 = rng.standard_normal((H, Out)).astype(np.float32)
-    nodes = [
-        onnx.helper.make_node("MatMul", ["X", "W1"], ["h"]),
-        onnx.helper.make_node("Relu", ["h"], ["a"]),
-        onnx.helper.make_node("MatMul", ["a", "W2"], ["Y"]),
-    ]
     model = _model(
-        nodes,
-        [_vi("X", ["batch", "seq", K])],
-        [_vi("Y", ["batch", "seq", Out])],
-        [_f32(w1, "W1"), _f32(w2, "W2")],
+        f"""
+        g (float[batch,seq,{K}] X) => (float[batch,seq,{Out}] Y)
+        {{
+          h = MatMul(X, W1)
+          a = Relu(h)
+          Y = MatMul(a, W2)
+        }}
+        """,
+        initializer=[_f32(w1, "W1"), _f32(w2, "W2")],
     )
 
     rng_cal = np.random.default_rng(22)
