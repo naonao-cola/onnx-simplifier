@@ -46,7 +46,7 @@ variant is a possible future addition, not attempted here.
 
 from __future__ import annotations
 
-from typing import List, Union
+from typing import Iterable, List, Optional, Union
 
 import numpy as np
 import onnx
@@ -137,7 +137,9 @@ def _quantize_nf4_blockwise(
 
 
 def quantize_weight_only_nf4(
-    model: Union[str, onnx.ModelProto], block_size: int = 64
+    model: Union[str, onnx.ModelProto],
+    block_size: int = 64,
+    skip_names: Optional[Iterable[str]] = None,
 ) -> onnx.ModelProto:
     """Quantizes every MatMul/vanilla-Gemm layer with a constant 2-D
     float32 weight (whose reduction dimension ``K`` is evenly divisible by
@@ -150,6 +152,12 @@ def quantize_weight_only_nf4(
     :param block_size: elements per (output-channel, block) scale group
             along the reduction dimension; bitsandbytes' own QLoRA default
             is 64 (versus 32 for onnxsim's uniform-grid INT4 schemes)
+    :param skip_names: weight initializer names to leave unquantized even
+            if otherwise eligible -- e.g. QLoRA's own low-rank adapter
+            weights, which the recipe keeps at full precision and would
+            otherwise get caught here too (a LoRA branch is itself a plain
+            MatMul against a small 2-D initializer, indistinguishable from
+            any other layer's weight by shape alone)
     :returns: ``model`` with every matched layer's weight replaced by
             ``Mul(Reshape(Gather(codebook, Cast(Wq, INT64)), ...), Ws) ->
             Reshape(..., original shape)`` feeding the original MatMul/Gemm
@@ -160,6 +168,7 @@ def quantize_weight_only_nf4(
     """
     if isinstance(model, str):
         model = onnx.load(model, load_external_data=False)
+    skip_names = set(skip_names) if skip_names is not None else frozenset()
 
     out = onnx.ModelProto()
     out.CopyFrom(model)
@@ -174,6 +183,8 @@ def quantize_weight_only_nf4(
         if match is None:
             continue
         w_name, weight_transposed = match
+        if w_name in skip_names:
+            continue
         w_init = initializer_map.get(w_name)
         if (
             w_init is None

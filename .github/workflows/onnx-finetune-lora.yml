@@ -1,0 +1,73 @@
+name: onnx-finetune LoRA/QLoRA
+
+# tools/onnx-finetune's LoRA/QLoRA scripts (inject_lora.py, extract_lora_
+# adapter.py, apply_lora_adapter.py, prepare_qlora.py, lora_surgery.py) are
+# pure graph-surgery: unlike generate_artifacts.py/onnx-finetune itself (see
+# ../README.md), they need no training-enabled onnxruntime build -- so they
+# get their own lightweight, fast job here rather than piggybacking on a
+# full native build.
+#
+# lora-scripts (ubuntu-slim) covers the LoRA graph surgery itself (MatMul,
+# Gemm with any transA/transB, 1x1/group=1 Conv) with only onnx + numpy +
+# pytest installed -- no compiled onnxsim extension needed.
+#
+# lora-scripts-with-qlora additionally builds this repo's own onnxsim wheel
+# (ONNXSIM_BUILTIN_ORT=OFF, the same wheel-build path setup.py always uses --
+# see the top-level CLAUDE.md note that this does NOT build ONNX Runtime) so
+# prepare_qlora.py's onnxsim.nf4 integration -- the part that actually needs
+# onnxsim importable -- gets exercised for real instead of always skipping.
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "tools/onnx-finetune/**"
+      - "onnxsim/nf4.py"
+      - "onnxsim/bias_correction.py"
+      - ".github/workflows/onnx-finetune-lora.yml"
+  push:
+    branches: [master]
+    paths:
+      - "tools/onnx-finetune/**"
+      - "onnxsim/nf4.py"
+      - "onnxsim/bias_correction.py"
+
+concurrency:
+  group: onnx-finetune-lora-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  lora-scripts:
+    name: LoRA graph surgery (onnx + numpy only)
+    runs-on: ubuntu-slim
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+      - name: Install deps
+        run: pip install onnx numpy pytest
+      - name: pytest tools/onnx-finetune/tests
+        run: pytest tools/onnx-finetune/tests -v
+
+  lora-scripts-with-qlora:
+    name: LoRA + QLoRA (builds this repo's own onnxsim wheel)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+      - name: Install build + test deps
+        run: pip install nanobind pytest
+      - name: Build and install onnxsim (ONNXSIM_BUILTIN_ORT=OFF -- no ONNX Runtime build, see CLAUDE.md)
+        run: pip install -e . --no-build-isolation
+      - name: pytest tools/onnx-finetune/tests (including the onnxsim.nf4 / prepare_qlora.py path)
+        run: pytest tools/onnx-finetune/tests -v

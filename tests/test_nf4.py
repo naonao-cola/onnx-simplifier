@@ -153,6 +153,39 @@ def test_nf4_skips_non_block_divisible_k():
     assert nf4_model.SerializeToString() == model.SerializeToString()
 
 
+def test_nf4_skip_names_leaves_matched_weight_untouched():
+    # QLoRA freezes the base weight (quantized here) but keeps its own
+    # low-rank adapter weights -- structurally indistinguishable plain
+    # MatMul-against-a-2-D-initializer layers -- at full precision.
+    rng = np.random.default_rng(7)
+    w_base = rng.standard_normal((64, 16)).astype(np.float32) * 0.5
+    w_lora_a = rng.standard_normal((64, 4)).astype(np.float32) * 0.1
+    nodes = [
+        onnx.helper.make_node("MatMul", ["X", "W"], ["Y"]),
+        onnx.helper.make_node("MatMul", ["X", "W_lora_A"], ["H"]),
+    ]
+    model = _model(
+        nodes,
+        [_vi("X", ["batch", 64])],
+        [_vi("Y", ["batch", 16]), _vi("H", ["batch", 4])],
+        [_f32(w_base, "W"), _f32(w_lora_a, "W_lora_A")],
+    )
+    nf4_model = onnxsim.quantize_weight_only_nf4(
+        model, block_size=64, skip_names=["W_lora_A"]
+    )
+    onnx.checker.check_model(nf4_model)
+
+    names = {t.name for t in nf4_model.graph.initializer}
+    assert "W_nf4_q" in names  # base weight was quantized
+    assert "W_lora_A_nf4_q" not in names  # adapter weight was not
+    lora_a_out = next(
+        onnx.numpy_helper.to_array(t)
+        for t in nf4_model.graph.initializer
+        if t.name == "W_lora_A"
+    )
+    assert np.array_equal(lora_a_out, w_lora_a)  # untouched, byte-for-byte
+
+
 def test_nf4_skips_non_constant_weight():
     nodes = [onnx.helper.make_node("MatMul", ["X", "W"], ["Y"])]
     model = _model(
