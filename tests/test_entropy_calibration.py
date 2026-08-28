@@ -13,9 +13,9 @@ import collections
 
 import numpy as np
 import onnx
-import onnx.helper
 import onnx.numpy_helper
 import pytest
+from onnx import parser
 
 import onnxsim
 from onnxsim.calibration import _entropy_threshold, _kl_divergence, _smooth_distribution
@@ -25,15 +25,20 @@ from onnxsim.calibration import _entropy_threshold, _kl_divergence, _smooth_dist
 ort = pytest.importorskip("onnxruntime")
 
 
-def _model(nodes, inputs, outputs, initializer, opset=13):
-    graph = onnx.helper.make_graph(nodes, "g", inputs, outputs, initializer)
-    return onnx.helper.make_model(
-        graph, opset_imports=[onnx.helper.make_opsetid("", opset)], ir_version=10
+def _model(body, initializer=(), opset=13, ir_version=10):
+    # Pin a low IR version by default so the model loads under the older
+    # onnxruntime bundled with some CI wheels (which cap at IR version 11).
+    model = parser.parse_model(
+        f"""
+        <
+          ir_version: {ir_version},
+          opset_import: ["": {opset}]
+        >
+        {body}
+        """
     )
-
-
-def _vi(name, shape):
-    return onnx.helper.make_tensor_value_info(name, onnx.TensorProto.FLOAT, shape)
+    model.graph.initializer.extend(initializer)
+    return model
 
 
 def _f32(array, name):
@@ -121,8 +126,15 @@ def test_calibrate_entropy_tighter_than_minmax_with_outliers():
     # minmax's range has to stretch to cover it; entropy calibration should
     # clip it instead, giving a visibly tighter (min, max).
     weight = _f32(np.random.default_rng(0).standard_normal((16, 8)), "W")
-    nodes = [onnx.helper.make_node("MatMul", ["X", "W"], ["Y"])]
-    model = _model(nodes, [_vi("X", [4, 16])], [_vi("Y", [4, 8])], [weight])
+    model = _model(
+        """
+        g (float[4,16] X) => (float[4,8] Y)
+        {
+          Y = MatMul(X, W)
+        }
+        """,
+        [weight],
+    )
 
     rng = np.random.default_rng(1)
     calibration_data = [
@@ -147,8 +159,15 @@ def test_quantize_static_entropy_method_end_to_end():
     rng = np.random.default_rng(2)
     K, N = 32, 16
     weight = _f32(rng.standard_normal((K, N)) * 0.5, "W")
-    nodes = [onnx.helper.make_node("MatMul", ["X", "W"], ["Y"])]
-    model = _model(nodes, [_vi("X", [4, K])], [_vi("Y", [4, N])], [weight])
+    model = _model(
+        f"""
+        g (float[4,{K}] X) => (float[4,{N}] Y)
+        {{
+          Y = MatMul(X, W)
+        }}
+        """,
+        [weight],
+    )
 
     calibration_data = [
         {"X": rng.standard_normal((4, K)).astype(np.float32)} for _ in range(128)
@@ -168,8 +187,15 @@ def test_quantize_static_entropy_method_end_to_end():
 
 def test_calibrate_unknown_method_raises():
     weight = _f32(np.random.randn(8, 4).astype(np.float32), "W")
-    nodes = [onnx.helper.make_node("MatMul", ["X", "W"], ["Y"])]
-    model = _model(nodes, [_vi("X", [2, 8])], [_vi("Y", [2, 4])], [weight])
+    model = _model(
+        """
+        g (float[2,8] X) => (float[2,4] Y)
+        {
+          Y = MatMul(X, W)
+        }
+        """,
+        [weight],
+    )
     data = [{"X": np.zeros((2, 8), dtype=np.float32)}]
     with pytest.raises(ValueError):
         onnxsim.calibrate(model, data, method="bogus")
