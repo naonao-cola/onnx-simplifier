@@ -786,6 +786,84 @@ def test_loop_with_const_trip_count_is_unrolled():
     assert all(n.op_type != "Loop" for n in sim_model.graph.node)
 
 
+def test_sequence_at_construct_is_folded():
+    # `SequenceAt(SequenceConstruct(a, b, c), i)` with a constant index -- a
+    # common PyTorch-export artifact for indexing a fixed-size Python list of
+    # tensors -- folds straight to the indexed tensor, dropping the Sequence
+    # type entirely. Downstream compilers (e.g. TVM's Relax ONNX frontend)
+    # generally have little to no support for Sequence.
+    a = helper.make_tensor_value_info("a", TensorProto.FLOAT, [2])
+    b = helper.make_tensor_value_info("b", TensorProto.FLOAT, [2])
+    c = helper.make_tensor_value_info("c", TensorProto.FLOAT, [2])
+    seq = helper.make_node("SequenceConstruct", ["a", "b", "c"], ["seq"])
+    idx = helper.make_tensor("idx", TensorProto.INT64, [], [1])
+    at = helper.make_node("SequenceAt", ["seq", "idx"], ["y"])
+    graph = helper.make_graph(
+        [seq, at],
+        "g",
+        [a, b, c],
+        [helper.make_tensor_value_info("y", TensorProto.FLOAT, [2])],
+        [idx],
+    )
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+    onnx.checker.check_model(model)
+
+    sim_model, check_ok = onnxsim.simplify(model)
+    assert check_ok
+    onnx.checker.check_model(sim_model)
+    assert all(
+        n.op_type not in ("Sequence", "SequenceConstruct", "SequenceAt")
+        for n in sim_model.graph.node
+    )
+
+
+def test_sequence_length_construct_folds_and_unrolls_loop():
+    # `SequenceLength(SequenceConstruct(...))` folds to a constant, which is
+    # exactly what a `for i in range(len(some_list)): ...` loop exports as: a
+    # Sequence feeding a Loop's trip count. Folding SequenceLength lets
+    # eliminate_loop_with_const_trip_count unroll the Loop in turn, so the
+    # whole pattern collapses to plain feed-forward ops.
+    a = helper.make_tensor_value_info("a", TensorProto.FLOAT, [2])
+    b = helper.make_tensor_value_info("b", TensorProto.FLOAT, [2])
+    c = helper.make_tensor_value_info("c", TensorProto.FLOAT, [2])
+    seq = helper.make_node("SequenceConstruct", ["a", "b", "c"], ["seq"])
+    length = helper.make_node("SequenceLength", ["seq"], ["n"])
+
+    step = helper.make_tensor("step", TensorProto.FLOAT, [2], [1.0, 1.0])
+    body = helper.make_graph(
+        [helper.make_node("Add", ["v_in", "step"], ["v_out"])],
+        "loop_body",
+        [
+            helper.make_tensor_value_info("iter", TensorProto.INT64, []),
+            helper.make_tensor_value_info("cond_in", TensorProto.BOOL, []),
+            helper.make_tensor_value_info("v_in", TensorProto.FLOAT, [2]),
+        ],
+        [
+            helper.make_tensor_value_info("cond_in", TensorProto.BOOL, []),
+            helper.make_tensor_value_info("v_out", TensorProto.FLOAT, [2]),
+        ],
+        [step],
+    )
+    loop_node = helper.make_node("Loop", ["n", "", "x"], ["y"], body=body)
+    graph = helper.make_graph(
+        [seq, length, loop_node],
+        "g",
+        [a, b, c, helper.make_tensor_value_info("x", TensorProto.FLOAT, [2])],
+        [helper.make_tensor_value_info("y", TensorProto.FLOAT, [2])],
+        [],
+    )
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+    onnx.checker.check_model(model)
+
+    sim_model, check_ok = onnxsim.simplify(model)
+    assert check_ok
+    onnx.checker.check_model(sim_model)
+    op_types = [n.op_type for n in sim_model.graph.node]
+    assert "Loop" not in op_types
+    assert "SequenceConstruct" not in op_types
+    assert "SequenceLength" not in op_types
+
+
 def test_ir3_conv_bn_fuses():
     # IR version 3 models (e.g. the opset-8 ``resnet101-v1-7``) list every
     # initializer as a graph input too, which is required before IR 4. onnxsim

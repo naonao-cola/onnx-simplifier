@@ -17,6 +17,8 @@
 #include "passes/eliminate_loop_with_const_trip_count.h"
 #include "passes/eliminate_nop_dropout.h"
 #include "passes/eliminate_reshape_around_elementwise.h"
+#include "passes/eliminate_sequence_at_construct.h"
+#include "passes/eliminate_sequence_length_construct.h"
 #include "passes/fuse_add_bias_into_conv.h"
 #include "passes/fuse_attention.h"
 #include "passes/fuse_bn_into_conv.h"
@@ -99,6 +101,8 @@ void RegisterCustomOptimizerPasses() {
     RegisterOrReplace<p::DynamicQuantizeTernaryMatMul>(registry);
     RegisterOrReplace<p::EliminateLoopWithConstTripCount>(registry);
     RegisterOrReplace<p::EliminateReshapeAroundElementwise>(registry);
+    RegisterOrReplace<p::EliminateSequenceAtConstruct>(registry);
+    RegisterOrReplace<p::EliminateSequenceLengthConstruct>(registry);
     RegisterOrReplace<p::FuseAttention>(registry);
     RegisterOrReplace<p::FuseConsecutiveMul>(registry);
     RegisterOrReplace<p::FuseGelu>(registry);
