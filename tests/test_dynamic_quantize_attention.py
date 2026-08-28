@@ -2,23 +2,24 @@
 ``dynamic_quantize_attention`` C++ pass).
 
 Unlike ``test_dynamic_quantize_matmul.py``, the input model here is an
-``Attention`` (``com.microsoft``) node built directly with ``onnx.helper`` --
-the shape ``fuse_attention.h`` produces (see ``onnxsim/passes/fuse_attention.h``
-and ``tests/test_fuse_attention.py``), not a bare MatMul -- since this pass
-expects one to already be present rather than fusing it itself. Each model is
-quantized and then actually run through ONNX Runtime, both before and after,
-so these tests double as a minimal end-to-end check: the quantized graph must
-load and execute under a real inference engine, and its outputs must stay
-close to the float baseline.
+``Attention`` (``com.microsoft``) node built directly via the ONNX text
+format parser -- the shape ``fuse_attention.h`` produces (see
+``onnxsim/passes/fuse_attention.h`` and ``tests/test_fuse_attention.py``),
+not a bare MatMul -- since this pass expects one to already be present
+rather than fusing it itself. Each model is quantized and then actually run
+through ONNX Runtime, both before and after, so these tests double as a
+minimal end-to-end check: the quantized graph must load and execute under a
+real inference engine, and its outputs must stay close to the float
+baseline.
 """
 
 import collections
 
 import numpy as np
 import onnx
-import onnx.helper
 import onnx.numpy_helper
 import pytest
+from onnx import parser
 
 import onnxsim
 
@@ -28,8 +29,18 @@ import onnxsim
 ort = pytest.importorskip("onnxruntime")
 
 
-def _vi(name, shape):
-    return onnx.helper.make_tensor_value_info(name, onnx.TensorProto.FLOAT, shape)
+def _model(body, initializer=(), opset=17, ir_version=10):
+    model = parser.parse_model(
+        f"""
+        <
+          ir_version: {ir_version},
+          opset_import: ["": {opset}, "com.microsoft": 1]
+        >
+        {body}
+        """
+    )
+    model.graph.initializer.extend(initializer)
+    return model
 
 
 def _f32(array, name):
@@ -59,31 +70,25 @@ def _assert_close(float_outputs, quant_outputs, tol=0.1):
         assert rel_l2 < tol, f"relative L2 error too large: {rel_l2:.4f}"
 
 
-def _attention_model(B=2, S=5, H=32, NH=4, VH=None, seed=0, opset=17):
+def _attention_model(B=2, S=5, H=32, NH=4, VH=None, seed=0, opset=17, scale=None):
     # Y = Attention(X, Wqkv, Bqkv, num_heads=NH, qkv_hidden_sizes=[H,H,VH])
     # -- exactly fuse_attention.h's own runTransform output shape.
     VH = VH or H
     rng = np.random.default_rng(seed)
     wqkv = _f32(rng.standard_normal((H, H + H + VH)) * 0.1, "wqkv")
     bqkv = _f32(rng.standard_normal(H + H + VH) * 0.1, "bqkv")
-    attn = onnx.helper.make_node(
-        "Attention",
-        ["x", "wqkv", "bqkv"],
-        ["y"],
-        domain="com.microsoft",
-        num_heads=NH,
-        qkv_hidden_sizes=[H, H, VH],
-    )
-    graph = onnx.helper.make_graph(
-        [attn], "g", [_vi("x", [B, S, H])], [_vi("y", [B, S, VH])], [wqkv, bqkv]
-    )
-    return onnx.helper.make_model(
-        graph,
-        opset_imports=[
-            onnx.helper.make_opsetid("", opset),
-            onnx.helper.make_opsetid("com.microsoft", 1),
-        ],
-        ir_version=10,
+    attrs = f"num_heads = {NH}, qkv_hidden_sizes = [{H}, {H}, {VH}]"
+    if scale is not None:
+        attrs += f", scale = {scale}"
+    return _model(
+        f"""
+        g (float[{B},{S},{H}] x) => (float[{B},{S},{VH}] y)
+        {{
+          y = com.microsoft.Attention<{attrs}>(x, wqkv, bqkv)
+        }}
+        """,
+        [wqkv, bqkv],
+        opset=opset,
     )
 
 
@@ -112,9 +117,7 @@ def test_quantize_attention():
 
 def test_quantize_attention_preserves_scale_attribute():
     B, S, H, NH = 2, 5, 32, 4
-    model = _attention_model(B=B, S=S, H=H, NH=NH)
-    attn = model.graph.node[0]
-    attn.attribute.append(onnx.helper.make_attribute("scale", 0.25))
+    model = _attention_model(B=B, S=S, H=H, NH=NH, scale=0.25)
 
     quant = onnxsim.quantize_attention_dynamic(model)
     onnx.checker.check_model(quant)
@@ -149,28 +152,15 @@ def test_quantize_attention_declines_non_constant_weight():
     B, S, H, NH = 2, 5, 32, 4
     rng = np.random.default_rng(5)
     bqkv = _f32(rng.standard_normal(H * 3) * 0.1, "bqkv")
-    attn = onnx.helper.make_node(
-        "Attention",
-        ["x", "wqkv", "bqkv"],
-        ["y"],
-        domain="com.microsoft",
-        num_heads=NH,
-        qkv_hidden_sizes=[H, H, H],
-    )
-    graph = onnx.helper.make_graph(
-        [attn],
-        "g",
-        [_vi("x", [B, S, H]), _vi("wqkv", [H, H * 3])],
-        [_vi("y", [B, S, H])],
+    model = _model(
+        f"""
+        g (float[{B},{S},{H}] x, float[{H},{H * 3}] wqkv) => (float[{B},{S},{H}] y)
+        {{
+          y = com.microsoft.Attention<num_heads = {NH}, qkv_hidden_sizes = [{H}, {H}, {H}]>(x, wqkv, bqkv)
+        }}
+        """,
         [bqkv],
-    )
-    model = onnx.helper.make_model(
-        graph,
-        opset_imports=[
-            onnx.helper.make_opsetid("", 17),
-            onnx.helper.make_opsetid("com.microsoft", 1),
-        ],
-        ir_version=10,
+        opset=17,
     )
     quant = onnxsim.quantize_attention_dynamic(model)
     ops = _op_counts(quant)

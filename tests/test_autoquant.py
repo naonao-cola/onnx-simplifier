@@ -6,33 +6,35 @@ techniques and ``onnxsim.quantize_weight_only_int4``.
 
 import numpy as np
 import onnx
-import onnx.helper
 import onnx.numpy_helper
 import onnx.shape_inference
 import pytest
+from onnx import parser
 
 import onnxsim
 
 ort = pytest.importorskip("onnxruntime")
 
 
-def _vi(name, shape):
-    return onnx.helper.make_tensor_value_info(name, onnx.TensorProto.FLOAT, shape)
-
-
 def _f32(array, name):
     return onnx.numpy_helper.from_array(np.asarray(array, dtype=np.float32), name)
 
 
-def _model(nodes, inputs, outputs, initializer, opset=21):
-    graph = onnx.helper.make_graph(nodes, "g", inputs, outputs, initializer)
-    model = onnx.helper.make_model(
-        graph, opset_imports=[onnx.helper.make_opsetid("", opset)], ir_version=10
+def _model(body, initializer=(), opset=21, ir_version=10):
+    model = parser.parse_model(
+        f"""
+        <
+          ir_version: {ir_version},
+          opset_import: ["": {opset}]
+        >
+        {body}
+        """
     )
+    model.graph.initializer.extend(initializer)
     # weight_only_quantize_int4_matmul.h declines a MatMul/Gemm whose
     # activation input's elem_type isn't known -- true for an intermediate
-    # tensor (e.g. Flatten's output) with no declared value_info, which
-    # onnx.helper.make_graph never infers on its own.
+    # tensor (e.g. Flatten's output) with no declared value_info, which the
+    # parser never infers on its own.
     return onnx.shape_inference.infer_shapes(model)
 
 
@@ -40,12 +42,14 @@ def _gemm_model(K=64, N=16, batch=8, seed=0):
     rng = np.random.default_rng(seed)
     weight = rng.standard_normal((N, K)).astype(np.float32) * 0.5
     bias = rng.standard_normal(N).astype(np.float32) * 0.1
-    nodes = [onnx.helper.make_node("Gemm", ["X", "W", "B"], ["Y"], transB=1)]
     return _model(
-        nodes,
-        [_vi("X", [batch, K])],
-        [_vi("Y", [batch, N])],
-        [_f32(weight, "W"), _f32(bias, "B")],
+        f"""
+        g (float[{batch},{K}] X) => (float[{batch},{N}] Y)
+        {{
+          Y = Gemm<transB = 1>(X, W, B)
+        }}
+        """,
+        initializer=[_f32(weight, "W"), _f32(bias, "B")],
     )
 
 
@@ -63,22 +67,18 @@ def _conv_and_gemm_model(seed=0):
     wg = rng.standard_normal((4, 4 * 8 * 8)).astype(np.float32) * 0.05
     bg = rng.standard_normal(4).astype(np.float32) * 0.01
 
-    nodes = [
-        onnx.helper.make_node(
-            "Conv", ["X", "W1", "B1"], ["C1"], kernel_shape=[3, 3], pads=[1, 1, 1, 1]
-        ),
-        onnx.helper.make_node("Relu", ["C1"], ["R1"]),
-        onnx.helper.make_node(
-            "Conv", ["R1", "W2", "B2"], ["C2"], kernel_shape=[3, 3], pads=[1, 1, 1, 1]
-        ),
-        onnx.helper.make_node("Flatten", ["C2"], ["F"]),
-        onnx.helper.make_node("Gemm", ["F", "WG", "BG"], ["Y"], transB=1),
-    ]
     return _model(
-        nodes,
-        [_vi("X", [2, 4, 8, 8])],
-        [_vi("Y", [2, 4])],
-        [
+        """
+        g (float[2,4,8,8] X) => (float[2,4] Y)
+        {
+          C1 = Conv<kernel_shape = [3, 3], pads = [1, 1, 1, 1]>(X, W1, B1)
+          R1 = Relu(C1)
+          C2 = Conv<kernel_shape = [3, 3], pads = [1, 1, 1, 1]>(R1, W2, B2)
+          F = Flatten(C2)
+          Y = Gemm<transB = 1>(F, WG, BG)
+        }
+        """,
+        initializer=[
             _f32(w1, "W1"),
             _f32(b1, "B1"),
             _f32(w2, "W2"),

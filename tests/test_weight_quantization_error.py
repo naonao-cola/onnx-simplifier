@@ -6,9 +6,9 @@ weight it was quantized from.
 
 import numpy as np
 import onnx
-import onnx.helper
 import onnx.numpy_helper
 import pytest
+from onnx import parser
 
 import onnxsim
 from onnxsim.model_info import (
@@ -22,15 +22,18 @@ from onnxsim.model_info import (
 ort = pytest.importorskip("onnxruntime")
 
 
-def _model(nodes, inputs, outputs, initializer, opset=13):
-    graph = onnx.helper.make_graph(nodes, "g", inputs, outputs, initializer)
-    return onnx.helper.make_model(
-        graph, opset_imports=[onnx.helper.make_opsetid("", opset)], ir_version=10
+def _model(body, initializer=(), opset=13, ir_version=10):
+    model = parser.parse_model(
+        f"""
+        <
+          ir_version: {ir_version},
+          opset_import: ["": {opset}]
+        >
+        {body}
+        """
     )
-
-
-def _vi(name, shape):
-    return onnx.helper.make_tensor_value_info(name, onnx.TensorProto.FLOAT, shape)
+    model.graph.initializer.extend(initializer)
+    return model
 
 
 def _f32(array, name):
@@ -40,15 +43,29 @@ def _f32(array, name):
 def _matmul_model(K=32, N=16, seed=0):
     rng = np.random.default_rng(seed)
     weight = _f32(rng.standard_normal((K, N)) * 0.5, "W")
-    nodes = [onnx.helper.make_node("MatMul", ["X", "W"], ["Y"])]
-    return _model(nodes, [_vi("X", [4, K])], [_vi("Y", [4, N])], [weight])
+    return _model(
+        f"""
+        g (float[4,{K}] X) => (float[4,{N}] Y)
+        {{
+          Y = MatMul(X, W)
+        }}
+        """,
+        [weight],
+    )
 
 
 def _conv_model(seed=0):
     rng = np.random.default_rng(seed)
     weight = _f32(rng.standard_normal((6, 3, 3, 3)), "W")
-    nodes = [onnx.helper.make_node("Conv", ["X", "W"], ["Y"], kernel_shape=[3, 3])]
-    return _model(nodes, [_vi("X", [1, 3, 8, 8])], [_vi("Y", [1, 6, 6, 6])], [weight])
+    return _model(
+        """
+        g (float[1,3,8,8] X) => (float[1,6,6,6] Y)
+        {
+          Y = Conv<kernel_shape = [3, 3]>(X, W)
+        }
+        """,
+        [weight],
+    )
 
 
 def test_matmul_weight_quantization_error():
@@ -88,8 +105,15 @@ def test_gemm_transb_weight_quantization_error():
     K, N = 24, 12
     weight = _f32(rng.standard_normal((N, K)) * 0.5, "W")
     bias = _f32(rng.standard_normal(N), "B")
-    nodes = [onnx.helper.make_node("Gemm", ["X", "W", "B"], ["Y"], transB=1)]
-    model = _model(nodes, [_vi("X", [3, K])], [_vi("Y", [3, N])], [weight, bias])
+    model = _model(
+        f"""
+        g (float[3,{K}] X) => (float[3,{N}] Y)
+        {{
+          Y = Gemm<transB = 1>(X, W, B)
+        }}
+        """,
+        [weight, bias],
+    )
     quant = onnxsim.quantize_static(model, num_calibration_samples=16, seed=1)
 
     results = weight_quantization_error(model, quant)
@@ -123,8 +147,15 @@ def test_exact_reconstruction_is_zero_error():
     w[:, 0] = np.array([127, -127, 64, -64], dtype=np.float32)  # scale=1
     w[:, 1] = np.array([254, -254, 128, -128], dtype=np.float32)  # scale=2
     weight = _f32(w, "W")
-    nodes = [onnx.helper.make_node("MatMul", ["X", "W"], ["Y"])]
-    model = _model(nodes, [_vi("X", [1, K])], [_vi("Y", [1, N])], [weight])
+    model = _model(
+        f"""
+        g (float[1,{K}] X) => (float[1,{N}] Y)
+        {{
+          Y = MatMul(X, W)
+        }}
+        """,
+        [weight],
+    )
     quant = onnxsim.quantize_static(model, num_calibration_samples=4, seed=0)
 
     results = weight_quantization_error(model, quant)
@@ -151,8 +182,15 @@ def test_outlier_channel_increases_histogram_js_divergence():
     w = (rng.standard_normal((K, N)) * 0.01).astype(np.float32)
     w[0, 0] = 1.0  # the outlier
     weight = _f32(w, "W")
-    nodes = [onnx.helper.make_node("MatMul", ["X", "W"], ["Y"])]
-    model = _model(nodes, [_vi("X", [1, K])], [_vi("Y", [1, N])], [weight])
+    model = _model(
+        f"""
+        g (float[1,{K}] X) => (float[1,{N}] Y)
+        {{
+          Y = MatMul(X, W)
+        }}
+        """,
+        [weight],
+    )
     quant = onnxsim.quantize_static(model, num_calibration_samples=4, seed=3)
 
     results = weight_quantization_error(model, quant)
@@ -163,8 +201,14 @@ def test_outlier_channel_increases_histogram_js_divergence():
 
 
 def test_no_results_when_weight_not_constant():
-    nodes = [onnx.helper.make_node("MatMul", ["X", "W"], ["Y"])]
-    model = _model(nodes, [_vi("X", [4, 8]), _vi("W", [8, 4])], [_vi("Y", [4, 4])], [])
+    model = _model(
+        """
+        g (float[4,8] X, float[8,4] W) => (float[4,4] Y)
+        {
+          Y = MatMul(X, W)
+        }
+        """
+    )
     quant = onnxsim.quantize_static(model)
     assert weight_quantization_error(model, quant) == []
 
