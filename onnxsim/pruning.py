@@ -1,5 +1,5 @@
-"""Post-training weight pruning for MatMul/vanilla-Gemm (and, for structured
-pruning, Conv) layers.
+"""Post-training weight pruning for MatMul/vanilla-Gemm and ordinary
+(``group=1``) Conv layers.
 
 Surveying the pruning literature against what onnxsim can actually act on
 (an exported ONNX graph, no training loop, no gradients, usually no labels)
@@ -63,7 +63,34 @@ Wanda paper -- better protects weights that multiply high-magnitude
 activations even when the weight itself is individually small, the same
 class of outlier-activation effect that motivates :mod:`onnxsim.smoothquant`.
 
-Both support two sparsity patterns, chosen per invocation:
+Both also match ordinary (``group=1``) 2-D ``Conv`` weights, not just
+MatMul/vanilla-Gemm: a Conv's ``[out_channels, in_channels, kH, kW]``
+weight is reshaped to ``[out_channels, in_channels*kH*kW]`` -- the same
+convention :func:`apply_structured_pruning` already uses for Conv filter
+importance below -- and each output filter becomes one comparison group,
+exactly like a MatMul/Gemm output channel. For magnitude pruning that's
+the entire story: ``|W|`` on the reshaped weight, mask computed, reshaped
+back. For Wanda it needs one more step, since ``X_j`` isn't simply "input
+feature ``j``" once a sliding kernel is involved: ``j`` indexes one
+``(in_channel, kh, kw)`` offset within the receptive field, so its
+activation statistic is the norm of the *im2col-unfolded* input patch
+value at that specific offset, over every output spatial position and
+calibration sample -- computed via ``numpy.lib.stride_tricks.
+sliding_window_view`` on the zero-padded input (per the Conv node's own
+``pads``/``strides`` attributes) rather than materializing an explicit
+im2col matrix. A Conv whose attributes aren't a combination this
+confidently handles (non-default ``auto_pad``, since ``SAME_*``/``VALID``
+padding depends on input spatial size rather than being fixed per node;
+or non-all-ones ``dilations``, since a dilated receptive field's offsets
+aren't evenly spaced in the padded input the way ``sliding_window_view``
+assumes) falls back to plain magnitude for that layer, the same as any
+other layer whose activation norm was never observed.
+:func:`apply_sparsegpt_pruning` deliberately does **not** extend to Conv --
+see its own docstring for why a coarse approximation there would be worse
+than no compensation at all, not just less precise.
+
+Both magnitude and Wanda pruning support two sparsity patterns, chosen per
+invocation:
 
 - unstructured: for every output row (comparison group), the lowest-
   importance entries are zeroed until that row reaches the target
@@ -214,36 +241,224 @@ def _nm_mask(importance: np.ndarray, n: int, m: int) -> np.ndarray:
     return mask
 
 
-def _candidates(graph: onnx.GraphProto):
+def _match_conv_weight_only(
+    node: onnx.NodeProto, initializer_map: Dict[str, onnx.TensorProto]
+) -> Optional[Tuple[str, str]]:
+    """If `node` is an ordinary (``group=1``) 2-D ``Conv`` with a constant
+    4-D float32 ``[out_channels, in_channels, kH, kW]`` weight, returns
+    ``(x_name, weight_name)``. Mirrors the "Conv2D structured pruning"
+    section's own :func:`_match_conv_producer` matching criteria, minus
+    that function's bias handling -- magnitude/Wanda/SparseGPT never touch
+    bias, only the weight, so there's nothing to validate there. A grouped
+    or depthwise Conv (``group != 1``) never matches, the same restriction
+    :func:`_match_conv_producer`/:func:`_match_conv_consumer` draw: its
+    output and input channels aren't independent per-index the way this
+    module's per-row/per-filter importance ranking assumes.
+    """
+    if node.op_type != "Conv" or len(node.input) < 2:
+        return None
+    w_name = node.input[1]
+    w_init = initializer_map.get(w_name)
+    if (
+        w_init is None
+        or w_init.data_type != onnx.TensorProto.FLOAT
+        or len(w_init.dims) != 4
+        or _conv_group(node) != 1
+    ):
+        return None
+    return node.input[0], w_name
+
+
+def _candidates(graph: onnx.GraphProto, include_conv: bool = True):
+    """Every MatMul/vanilla-Gemm node with a constant 2-D float32 weight,
+    plus -- when `include_conv` (the default; :func:`apply_sparsegpt_pruning`
+    passes ``False``, see its own docstring for why) -- every ordinary
+    (``group=1``) 2-D ``Conv`` node matched by :func:`_match_conv_weight_only`.
+    Returns ``(node, x_name, w_name, weight_transposed, is_conv)`` tuples;
+    `weight_transposed` is always ``False`` (meaningless) for a Conv entry,
+    whose output channel always lives on axis 0 of its fixed
+    ``[out_channels, in_channels, kH, kW]`` layout.
+    """
     initializer_map = {t.name: t for t in graph.initializer}
     out = []
     for node in graph.node:
         match = _match_matmul_like(node)
-        if match is None:
+        if match is not None:
+            x_name, w_name, weight_transposed = match
+            w_init = initializer_map.get(w_name)
+            if (
+                w_init is None
+                or w_init.data_type != onnx.TensorProto.FLOAT
+                or len(w_init.dims) != 2
+            ):
+                continue
+            out.append((node, x_name, w_name, weight_transposed, False))
             continue
-        x_name, w_name, weight_transposed = match
-        w_init = initializer_map.get(w_name)
-        if (
-            w_init is None
-            or w_init.data_type != onnx.TensorProto.FLOAT
-            or len(w_init.dims) != 2
-        ):
-            continue
-        out.append((node, x_name, w_name, weight_transposed))
+        if include_conv:
+            conv_match = _match_conv_weight_only(node, initializer_map)
+            if conv_match is not None:
+                x_name, w_name = conv_match
+                out.append((node, x_name, w_name, False, True))
     return out
 
 
 def _prune_weight(
-    w_init: onnx.TensorProto, weight_transposed: bool, importance_of_nk
+    w_init: onnx.TensorProto,
+    weight_transposed: bool,
+    importance_of_nk,
+    is_conv: bool = False,
 ) -> None:
     w = onnx.numpy_helper.to_array(w_init).astype(np.float64)
-    dim0, dim1 = w.shape
-    w_nk = w if weight_transposed else w.T  # [N, K], output channel first
-    mask = importance_of_nk(w_nk)
-    w_pruned_nk = np.where(mask, w_nk, 0.0)
-    w_new = w_pruned_nk if weight_transposed else w_pruned_nk.T
-    w_new = w_new.reshape(dim0, dim1).astype(np.float32)
+    if is_conv:
+        # [out_channels, in_channels, kH, kW] -> [N, K], the same
+        # output-channel-first, flattened-receptive-field reshape
+        # :func:`_apply_chains` already uses for Conv importance.
+        n, cin, kh, kw = w.shape
+        w_nk = w.reshape(n, cin * kh * kw)
+        mask = importance_of_nk(w_nk)
+        w_pruned_nk = np.where(mask, w_nk, 0.0)
+        w_new = w_pruned_nk.reshape(n, cin, kh, kw).astype(np.float32)
+    else:
+        dim0, dim1 = w.shape
+        w_nk = w if weight_transposed else w.T  # [N, K], output channel first
+        mask = importance_of_nk(w_nk)
+        w_pruned_nk = np.where(mask, w_nk, 0.0)
+        w_new = w_pruned_nk if weight_transposed else w_pruned_nk.T
+        w_new = w_new.reshape(dim0, dim1).astype(np.float32)
     w_init.CopyFrom(onnx.numpy_helper.from_array(w_new, name=w_init.name))
+
+
+# --- Conv im2col-unfolded activation statistics (Wanda only) -----------
+
+
+@dataclass(frozen=True)
+class _ConvSpatialAttrs:
+    kh: int
+    kw: int
+    pad_top: int
+    pad_left: int
+    pad_bottom: int
+    pad_right: int
+    stride_h: int
+    stride_w: int
+
+
+def _conv_spatial_attrs(
+    node: onnx.NodeProto, w_init: onnx.TensorProto
+) -> Optional[_ConvSpatialAttrs]:
+    """Extracts the padding/stride a Conv node's calibration input needs to
+    be correctly im2col-unfolded for Wanda's per-``(in_channel, kh, kw)``
+    activation norm (see this module's own docstring). Declines
+    (``None``) on any attribute combination not confidently handled:
+
+    - non-default ``auto_pad`` -- its ``SAME_*``/``VALID`` padding depends
+      on the input's own spatial size, not something fixed per node the
+      way an explicit ``pads`` (or the schema's all-zero default) is;
+    - a non-all-ones ``dilations`` -- a dilated receptive field's
+      ``(kh, kw)`` offsets aren't evenly spaced in the padded input the
+      way ``numpy.lib.stride_tricks.sliding_window_view`` assumes below.
+
+    Per this module's own docstring, it's better to leave such a layer's
+    activation norm unobserved (falling back to plain magnitude for it,
+    same as any layer whose calibration activation was never a usable
+    shape) than to guess at either.
+    """
+    kh, kw = int(w_init.dims[2]), int(w_init.dims[3])
+    auto_pad = "NOTSET"
+    pads: Optional[List[int]] = None
+    strides: Optional[List[int]] = None
+    dilations: Optional[List[int]] = None
+    for attr in node.attribute:
+        if attr.name == "auto_pad":
+            auto_pad = attr.s.decode("utf-8") if isinstance(attr.s, bytes) else attr.s
+        elif attr.name == "pads":
+            pads = list(attr.ints)
+        elif attr.name == "strides":
+            strides = list(attr.ints)
+        elif attr.name == "dilations":
+            dilations = list(attr.ints)
+        elif attr.name == "kernel_shape":
+            ks = list(attr.ints)
+            if len(ks) != 2 or ks[0] != kh or ks[1] != kw:
+                return None  # weight/attribute mismatch -- don't guess
+
+    if auto_pad not in ("NOTSET", ""):
+        return None
+    if dilations is not None and dilations != [1, 1]:
+        return None
+    if pads is None:
+        pads = [0, 0, 0, 0]  # ONNX Conv schema default
+    if len(pads) != 4 or any(p < 0 for p in pads):
+        return None
+    if strides is None:
+        strides = [1, 1]  # ONNX Conv schema default
+    if len(strides) != 2 or any(s <= 0 for s in strides):
+        return None
+
+    return _ConvSpatialAttrs(
+        kh=kh,
+        kw=kw,
+        pad_top=pads[0],
+        pad_left=pads[1],
+        pad_bottom=pads[2],
+        pad_right=pads[3],
+        stride_h=strides[0],
+        stride_w=strides[1],
+    )
+
+
+def _conv_patch_sq_sum(
+    x: np.ndarray, attrs: _ConvSpatialAttrs
+) -> Tuple[Optional[np.ndarray], int]:
+    """Sum of squares of the im2col-unfolded activation patch value at
+    every ``(in_channel, kh, kw)`` receptive-field offset -- Wanda's
+    ``||X_j||_2`` statistic, generalized from "input feature ``j``" (a
+    MatMul/Gemm column) to "receptive-field offset ``j``" (a Conv column
+    of the reshaped ``[out_channels, in_channels*kH*kW]`` weight, see this
+    module's own docstring) -- reduced over the batch and every output
+    spatial position, for one calibration batch's raw ``[N, Cin, H, W]``
+    Conv input `x`. Returns ``(sq_sum, count)`` with `sq_sum` shaped
+    ``[Cin, kh, kw]`` (flattening it in that order matches
+    :func:`_prune_weight`'s own ``w.reshape(n, cin * kh * kw)``), or
+    ``(None, 0)`` if `x` isn't a plausible 4-D NCHW activation for this
+    Conv's own kernel once padded (too small, or not rank-4 at all --
+    the same "no usable calibration signal" case
+    :func:`apply_wanda_pruning`'s MatMul/Gemm branch already declines
+    with a plain ``x.ndim != 2`` check).
+
+    Uses ``numpy.lib.stride_tricks.sliding_window_view`` on the
+    zero-padded input rather than materializing an explicit im2col
+    matrix: a view of every ``(kh, kw)`` window at every unit-stride
+    position, then subsampled by the Conv's own stride -- exactly the
+    positions the real Conv itself would read from, at zero extra
+    calibration-data copies for the (potentially large) unstrided
+    intermediate.
+    """
+    if x.ndim != 4:
+        return None, 0
+    n = x.shape[0]
+    xp = np.pad(
+        x,
+        (
+            (0, 0),
+            (0, 0),
+            (attrs.pad_top, attrs.pad_bottom),
+            (attrs.pad_left, attrs.pad_right),
+        ),
+    )
+    if xp.shape[2] < attrs.kh or xp.shape[3] < attrs.kw:
+        return None, 0
+    # [N, Cin, Hfull, Wfull, kh, kw], Hfull/Wfull at unit stride.
+    windows = np.lib.stride_tricks.sliding_window_view(
+        xp, (attrs.kh, attrs.kw), axis=(2, 3)
+    )
+    windows = windows[:, :, :: attrs.stride_h, :: attrs.stride_w, :, :]
+    h_out, w_out = windows.shape[2], windows.shape[3]
+    count = n * h_out * w_out
+    if count == 0:
+        return None, 0
+    sq_sum = np.sum(np.square(windows), axis=(0, 2, 3))  # [Cin, kh, kw]
+    return sq_sum, count
 
 
 def apply_magnitude_pruning(
@@ -253,20 +468,24 @@ def apply_magnitude_pruning(
     m: Optional[int] = None,
 ) -> onnx.ModelProto:
     """Zeros the least-magnitude entries of every MatMul/vanilla-Gemm
-    layer's constant 2-D float32 weight -- the data-free pruning baseline
-    (Han et al., 2015). See this module's own docstring for how importance
-    is grouped and why structured (shape-changing) pruning isn't offered.
+    layer's constant 2-D float32 weight, and every ordinary (``group=1``)
+    2-D ``Conv`` layer's constant 4-D float32 weight -- the data-free
+    pruning baseline (Han et al., 2015). See this module's own docstring
+    for how importance is grouped (including the Conv reshape convention)
+    and why structured (shape-changing) pruning isn't offered here.
 
     :param model: the original onnx ModelProto or file path
-    :param sparsity: target fraction of each row's entries to zero,
-            ignored when ``n``/``m`` are given
+    :param sparsity: target fraction of each row's (or, for Conv, each
+            output filter's) entries to zero, ignored when ``n``/``m`` are
+            given
     :param n: keep the ``n`` highest-magnitude entries per group of ``m``
             (semi-structured N:M pruning, e.g. NVIDIA's 2:4). Must be given
             together with ``m``.
     :param m: group size for N:M pruning; see ``n``
     :returns: ``model`` with every matched layer's weight zeroed in place
-            to the target pattern; layers with a non-constant or non-2-D
-            weight are left untouched
+            to the target pattern; layers with a non-constant weight, a
+            non-2-D MatMul/Gemm weight, or a grouped/non-4-D Conv weight
+            are left untouched
     """
     _validate_pattern(sparsity, n, m)
     if isinstance(model, str):
@@ -276,7 +495,7 @@ def apply_magnitude_pruning(
     out.CopyFrom(model)
     initializer_map = {t.name: t for t in out.graph.initializer}
 
-    for _, _, w_name, weight_transposed in _candidates(out.graph):
+    for _, _, w_name, weight_transposed, is_conv in _candidates(out.graph):
         w_init = initializer_map[w_name]
 
         def importance_of_nk(w_nk, n=n, m=m, sparsity=sparsity):
@@ -287,7 +506,7 @@ def apply_magnitude_pruning(
                 else _sparsity_mask(importance, sparsity)
             )
 
-        _prune_weight(w_init, weight_transposed, importance_of_nk)
+        _prune_weight(w_init, weight_transposed, importance_of_nk, is_conv=is_conv)
 
     return out
 
@@ -304,25 +523,31 @@ def apply_wanda_pruning(
     providers: Optional[Sequence[str]] = None,
 ) -> onnx.ModelProto:
     """Wanda pruning (Sun et al., 2023): zeros the least-important entries
-    of every MatMul/vanilla-Gemm layer's constant 2-D float32 weight, using
-    ``|W_ij| * ||X_j||_2`` (weight magnitude times its input channel's
-    activation norm over calibration data) as the importance metric instead
-    of plain ``|W|``. See this module's own docstring for the technique and
-    :func:`apply_magnitude_pruning` for the calibration-free baseline this
-    upgrades.
+    of every MatMul/vanilla-Gemm layer's constant 2-D float32 weight, and
+    every ordinary (``group=1``) 2-D ``Conv`` layer's constant 4-D float32
+    weight, using ``|W_ij| * ||X_j||_2`` (weight magnitude times its
+    reduction-dimension entry's activation norm over calibration data) as
+    the importance metric instead of plain ``|W|``. See this module's own
+    docstring for the technique -- including what ``X_j`` means for a Conv
+    column (one ``(in_channel, kh, kw)`` receptive-field offset, not a
+    whole input channel) and which Conv attribute combinations this
+    confidently handles -- and :func:`apply_magnitude_pruning` for the
+    calibration-free baseline this upgrades.
 
     :param model: the original onnx ModelProto or file path
     :param calibration_data: representative input batches to measure each
-            input channel's activation norm on. Each batch is a
-            ``{input_name: np.ndarray}`` dict matching ``model``'s graph
-            inputs -- see :func:`onnxsim.generate_random_calibration_data`
-            (the default when omitted)
+            input channel's (or, for Conv, each receptive-field offset's)
+            activation norm on. Each batch is a ``{input_name: np.ndarray}``
+            dict matching ``model``'s graph inputs -- see
+            :func:`onnxsim.generate_random_calibration_data` (the default
+            when omitted)
     :param num_samples: random batches to generate when
             ``calibration_data`` is omitted
     :param seed: seed for the random calibration data (ignored if
             ``calibration_data`` is supplied)
-    :param sparsity: target fraction of each row's entries to zero,
-            ignored when ``n``/``m`` are given
+    :param sparsity: target fraction of each row's (or, for Conv, each
+            output filter's) entries to zero, ignored when ``n``/``m`` are
+            given
     :param n: keep the ``n`` highest-importance entries per group of ``m``
             (semi-structured N:M pruning, e.g. NVIDIA's 2:4). Must be given
             together with ``m``.
@@ -333,10 +558,13 @@ def apply_wanda_pruning(
     :param providers: onnxruntime execution providers to run ``model`` on
             when capturing calibration activations
     :returns: ``model`` with every matched layer's weight zeroed in place
-            to the target pattern; layers with a non-constant, non-2-D
-            weight, or whose activation input isn't a plain 2-D tensor
-            matching the weight's reduction dimension, fall back to plain
-            magnitude pruning (no activation norm was ever observed)
+            to the target pattern; a MatMul/Gemm layer with a non-constant
+            or non-2-D weight, a Conv layer with a grouped or non-4-D
+            weight, or any matched layer whose activation input isn't
+            usable (not a plain 2-D tensor for MatMul/Gemm; not a 4-D NCHW
+            tensor, or a Conv attribute combination :func:`_conv_spatial_attrs`
+            declines, for Conv) falls back to plain magnitude pruning (no
+            activation norm was ever observed)
     """
     _validate_pattern(sparsity, n, m)
     if isinstance(model, str):
@@ -355,11 +583,23 @@ def apply_wanda_pruning(
     if not candidates:
         return out
 
-    probe_names = sorted({x_name for _, x_name, _, _ in candidates})
+    probe_names = sorted({x_name for _, x_name, _, _, _ in candidates})
     probe_model = _add_probe_outputs(out, probe_names)
+
+    # Conv attributes are per-node (two Convs can share an input tensor
+    # with different kernels/strides), so the per-node Conv statistic is
+    # keyed by its own weight name, not the (possibly shared) input name
+    # the plain MatMul/Gemm statistic below is keyed by.
+    conv_attrs: Dict[str, Optional[_ConvSpatialAttrs]] = {
+        w_name: _conv_spatial_attrs(node, initializer_map[w_name])
+        for node, _, w_name, _, is_conv in candidates
+        if is_conv
+    }
 
     sq_sum: Dict[str, np.ndarray] = {}
     count: Dict[str, int] = {}
+    conv_sq_sum: Dict[str, np.ndarray] = {}
+    conv_count: Dict[str, int] = {}
     for batch in calibration_data:
         result = backend.run_model(probe_model, batch, providers=providers)
         for name in probe_names:
@@ -369,14 +609,32 @@ def apply_wanda_pruning(
             s = np.square(x).sum(axis=0)
             sq_sum[name] = s if name not in sq_sum else sq_sum[name] + s
             count[name] = count.get(name, 0) + x.shape[0]
+        for _, x_name, w_name, _, is_conv in candidates:
+            if not is_conv:
+                continue
+            attrs = conv_attrs[w_name]
+            if attrs is None:
+                continue
+            x = np.asarray(result[x_name], dtype=np.float64)
+            s, cnt = _conv_patch_sq_sum(x, attrs)
+            if s is None:
+                continue
+            conv_sq_sum[w_name] = (
+                s if w_name not in conv_sq_sum else conv_sq_sum[w_name] + s
+            )
+            conv_count[w_name] = conv_count.get(w_name, 0) + cnt
 
     act_norm: Dict[str, np.ndarray] = {
         name: np.sqrt(s / max(count[name], 1)) for name, s in sq_sum.items()
     }
+    conv_act_norm: Dict[str, np.ndarray] = {
+        name: np.sqrt(s / max(conv_count[name], 1)).reshape(-1)
+        for name, s in conv_sq_sum.items()
+    }
 
-    for _, x_name, w_name, weight_transposed in candidates:
+    for _, x_name, w_name, weight_transposed, is_conv in candidates:
         w_init = initializer_map[w_name]
-        norm = act_norm.get(x_name)
+        norm = conv_act_norm.get(w_name) if is_conv else act_norm.get(x_name)
 
         def importance_of_nk(w_nk, norm=norm, n=n, m=m, sparsity=sparsity):
             if norm is None or norm.shape[0] != w_nk.shape[1]:
@@ -389,16 +647,17 @@ def apply_wanda_pruning(
                 else _sparsity_mask(importance, sparsity)
             )
 
-        _prune_weight(w_init, weight_transposed, importance_of_nk)
+        _prune_weight(w_init, weight_transposed, importance_of_nk, is_conv=is_conv)
 
     return out
 
 
 def weight_sparsity(model: Union[str, onnx.ModelProto]) -> float:
     """Fraction of exact-zero entries across every matched MatMul/vanilla-
-    Gemm layer's constant 2-D float32 weight -- a quick way to confirm a
-    pruning call reached its target, or to measure an already-sparse model.
-    Returns ``0.0`` if no matching layer is present.
+    Gemm or ordinary (``group=1``) 2-D Conv layer's constant weight -- a
+    quick way to confirm a pruning call reached its target, or to measure
+    an already-sparse model. Returns ``0.0`` if no matching layer is
+    present.
     """
     if isinstance(model, str):
         model = onnx.load(model, load_external_data=False)
@@ -406,7 +665,7 @@ def weight_sparsity(model: Union[str, onnx.ModelProto]) -> float:
     zeros = 0
     total = 0
     initializer_map = {t.name: t for t in model.graph.initializer}
-    for _, _, w_name, _ in _candidates(model.graph):
+    for _, _, w_name, _, _ in _candidates(model.graph):
         w = onnx.numpy_helper.to_array(initializer_map[w_name])
         zeros += int(np.count_nonzero(w == 0))
         total += w.size
@@ -519,6 +778,26 @@ def apply_sparsegpt_pruning(
     output row within each ``proc_block_size``-wide column block (the
     reference implementation's own behavior), not chosen per row.
 
+    Unlike :func:`apply_magnitude_pruning`/:func:`apply_wanda_pruning`,
+    this function does **not** match Conv layers, on purpose. SparseGPT's
+    correctness rests entirely on ``H`` accurately capturing which columns
+    correlate -- error compensation propagated through a wrong Hessian
+    would actively produce a *worse* result than no compensation at all
+    (i.e. than magnitude pruning), not just a less-precise one. A correct
+    Conv Hessian needs the full ``[K, K]`` cross-covariance of every
+    ``(in_channel, kh, kw)`` receptive-field offset against every other,
+    accumulated from the same im2col-unfolded patch matrix
+    :func:`apply_wanda_pruning` builds per-offset norms from (here,
+    ``patches.T @ patches`` in place of this function's own MatMul/Gemm
+    ``h = x.T @ x``) -- a materially bigger piece of new numerical
+    machinery than Wanda's per-offset norm, and not yet built. Nor is
+    there a correct reference to port: the official implementation's own
+    ``add_batch`` (https://github.com/IST-DASLab/sparsegpt) has no actual
+    im2col unfolding for ``nn.Conv2d`` (that branch handles only the
+    weight reshape; the codebase is only ever exercised on OPT/BLOOM,
+    which have zero Conv layers). Rather than ship an unverified from-
+    scratch Hessian, Conv is left unmatched here for now.
+
     :param model: the original onnx ModelProto or file path
     :param calibration_data: representative input batches to compute each
             layer's Hessian from. Each batch is a
@@ -570,11 +849,11 @@ def apply_sparsegpt_pruning(
     graph = out.graph
     initializer_map = {t.name: t for t in graph.initializer}
 
-    candidates = _candidates(graph)
+    candidates = _candidates(graph, include_conv=False)
     if not candidates:
         return out
 
-    probe_names = sorted({x_name for _, x_name, _, _ in candidates})
+    probe_names = sorted({x_name for _, x_name, _, _, _ in candidates})
     probe_model = _add_probe_outputs(out, probe_names)
 
     activations: Dict[str, List[np.ndarray]] = {name: [] for name in probe_names}
@@ -586,7 +865,7 @@ def apply_sparsegpt_pruning(
                 continue
             activations[name].append(x.reshape(-1, x.shape[-1]))
 
-    for _, x_name, w_name, weight_transposed in candidates:
+    for _, x_name, w_name, weight_transposed, _ in candidates:
         acts = activations[x_name]
         if not acts:
             continue
