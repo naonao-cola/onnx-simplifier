@@ -95,12 +95,22 @@ gemm_replacement (x, w, b) => (y)
 )
 
 
+def _model(body, initializer=(), opset=18, ir_version=10):
+    model = parser.parse_model(
+        f"""
+        <
+          ir_version: {ir_version},
+          opset_import: ["": {opset}]
+        >
+        {body}
+        """
+    )
+    model.graph.initializer.extend(initializer)
+    return model
+
+
 def _f32(array, name):
     return onnx.numpy_helper.from_array(array.astype(np.float32), name)
-
-
-def _vi(name, shape):
-    return helper.make_tensor_value_info(name, onnx.TensorProto.FLOAT, shape)
 
 
 # ==========================================================================
@@ -108,16 +118,18 @@ def _vi(name, shape):
 # ==========================================================================
 def test_parity_matmul_add_to_gemm():
     def build():
-        nodes = [
-            helper.make_node("MatMul", ["x", "W"], ["mm"]),
-            helper.make_node("Add", ["mm", "B"], ["y"]),
-        ]
-        inits = [_f32(np.random.randn(4, 5), "W"), _f32(np.random.randn(5), "B")]
-        graph = helper.make_graph(
-            nodes, "g", [_vi("x", [3, 4])], [_vi("y", [3, 5])], inits
-        )
-        return helper.make_model(
-            graph, opset_imports=[helper.make_opsetid("", 18)], ir_version=10
+        return _model(
+            """
+            g (float[3,4] x) => (float[3,5] y)
+            {
+                mm = MatMul(x, W)
+                y = Add(mm, B)
+            }
+            """,
+            initializer=[
+                _f32(np.random.randn(4, 5), "W"),
+                _f32(np.random.randn(5), "B"),
+            ],
         )
 
     ours, _ = onnxsim.simplify(
@@ -141,32 +153,29 @@ def test_parity_matmul_add_to_gemm():
 # version starts traversing subgraphs, this test flips and must be updated.
 # ==========================================================================
 def _model_with_pattern_in_subgraph():
-    then_nodes = [
-        helper.make_node("MatMul", ["x", "W"], ["mm"]),
-        helper.make_node("Add", ["mm", "B"], ["tb"]),
-    ]
-    then_g = helper.make_graph(then_nodes, "then", [], [_vi("tb", [3, 5])])
-    else_g = helper.make_graph(
-        [helper.make_node("Identity", ["B2"], ["eb"])], "else", [], [_vi("eb", [3, 5])]
-    )
-    nodes = [
-        helper.make_node("If", ["cond"], ["y"], then_branch=then_g, else_branch=else_g)
-    ]
-    inits = [
-        _f32(np.random.randn(4, 5), "W"),
-        _f32(np.random.randn(5), "B"),
-        _f32(np.random.randn(3, 5), "B2"),
-        _f32(np.random.randn(3, 4), "x"),
-    ]
-    graph = helper.make_graph(
-        nodes,
-        "g",
-        [helper.make_tensor_value_info("cond", onnx.TensorProto.BOOL, [])],
-        [_vi("y", [3, 5])],
-        inits,
-    )
-    return helper.make_model(
-        graph, opset_imports=[helper.make_opsetid("", 18)], ir_version=10
+    return _model(
+        """
+        g (bool cond) => (float[3,5] y)
+        {
+            y = If (cond) <
+                then_branch = then_graph () => (float[3,5] tb)
+                {
+                    mm = MatMul(x, W)
+                    tb = Add(mm, B)
+                },
+                else_branch = else_graph () => (float[3,5] eb)
+                {
+                    eb = Identity(B2)
+                }
+            >
+        }
+        """,
+        initializer=[
+            _f32(np.random.randn(4, 5), "W"),
+            _f32(np.random.randn(5), "B"),
+            _f32(np.random.randn(3, 5), "B2"),
+            _f32(np.random.randn(3, 4), "x"),
+        ],
     )
 
 
