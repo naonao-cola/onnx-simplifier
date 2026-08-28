@@ -7,9 +7,12 @@ isolation. onnxsim performs the equivalent optimizations through onnxoptimizer
 and its constant folding, but only exercised them indirectly through full
 torchvision / timm models. This module adds the missing isolated coverage.
 
-Every model is built directly with ``onnx.helper`` (no torch dependency) and run
-through ``onnxsim.simplify`` with ``check_n=3`` so onnxsim's own random-input
-equivalence check guards correctness of each rewrite.
+Every model is built directly with the ONNX text format parser (``onnx.parser``,
+no torch dependency) and run through ``onnxsim.simplify`` with ``check_n=3`` so
+onnxsim's own random-input equivalence check guards correctness of each
+rewrite. Weight-shaped initializers still need real (usually random) data, so
+those are built with numpy and attached to the parsed graph programmatically
+rather than spelled out as text literals.
 
 ConvTranspose+BN, ConvTranspose+Add-bias and no-op ``Dropout`` fusions -- once
 gaps versus OnnxSlim -- are now covered by onnxsim's optimizer (issue #543) and
@@ -23,6 +26,7 @@ import collections
 import numpy as np
 import onnx
 import pytest
+from onnx import parser
 
 import onnxsim
 
@@ -33,18 +37,25 @@ def _simplify(model):
     return sim_model, collections.Counter(n.op_type for n in sim_model.graph.node)
 
 
-def _model(nodes, inputs, outputs, initializer, opset=13):
-    graph = onnx.helper.make_graph(nodes, "g", inputs, outputs, initializer)
-    # Pin a low IR version so the model loads under the older onnxruntime
-    # bundled with some CI wheels (which cap at IR version 11); onnxsim's
-    # check_n runs the model through onnxruntime.
-    return onnx.helper.make_model(
-        graph, opset_imports=[onnx.helper.make_opsetid("", opset)], ir_version=10
+def _model(body, initializer=(), opset=13, ir_version=10):
+    # Pin a low IR version by default so the model loads under the older
+    # onnxruntime bundled with some CI wheels (which cap at IR version 11);
+    # onnxsim's check_n runs the model through onnxruntime. `body` is the
+    # ONNX text form graph declaration (and, optionally, its own inline
+    # literal initializers); `initializer` holds extra TensorProtos -- e.g.
+    # random weights -- attached after parsing rather than spelled out as
+    # text literals.
+    model = parser.parse_model(
+        f"""
+        <
+          ir_version: {ir_version},
+          opset_import: ["": {opset}]
+        >
+        {body}
+        """
     )
-
-
-def _vi(name, shape):
-    return onnx.helper.make_tensor_value_info(name, onnx.TensorProto.FLOAT, shape)
+    model.graph.initializer.extend(initializer)
+    return model
 
 
 def _f32(array, name):
@@ -65,22 +76,27 @@ def _i64(array, name):
 def test_fuse_conv_bn_into_conv():
     # Conv followed by BatchNormalization folds the BN affine transform into the
     # Conv weights/bias (fuse_bn_into_conv), leaving a single Conv.
-    inits = [
-        _f32(np.random.randn(8, 3, 3, 3), "W"),
-        _f32(np.random.rand(8) + 0.5, "scale"),
-        _f32(np.random.randn(8), "bias"),
-        _f32(np.random.randn(8), "mean"),
-        _f32(np.random.rand(8) + 0.5, "var"),
-    ]
-    nodes = [
-        onnx.helper.make_node(
-            "Conv", ["X", "W"], ["c"], kernel_shape=[3, 3], pads=[1, 1, 1, 1]
-        ),
-        onnx.helper.make_node(
-            "BatchNormalization", ["c", "scale", "bias", "mean", "var"], ["Y"]
-        ),
-    ]
-    model = _model(nodes, [_vi("X", [1, 3, 16, 16])], [_vi("Y", [1, 8, 16, 16])], inits)
+    W = np.random.randn(8, 3, 3, 3)
+    scale = np.random.rand(8) + 0.5
+    bias = np.random.randn(8)
+    mean = np.random.randn(8)
+    var = np.random.rand(8) + 0.5
+    model = _model(
+        """
+        g (float[1,3,16,16] X) => (float[1,8,16,16] Y)
+        {
+          c = Conv<kernel_shape = [3, 3], pads = [1, 1, 1, 1]>(X, W)
+          Y = BatchNormalization(c, scale, bias, mean, var)
+        }
+        """,
+        initializer=[
+            _f32(W, "W"),
+            _f32(scale, "scale"),
+            _f32(bias, "bias"),
+            _f32(mean, "mean"),
+            _f32(var, "var"),
+        ],
+    )
     _, ops = _simplify(model)
     assert ops["BatchNormalization"] == 0
     assert ops["Conv"] == 1
@@ -90,23 +106,29 @@ def test_fuse_conv_with_bias_bn_into_conv():
     # Same fusion, but the Conv already has its own bias input -- a distinct
     # code path in fuse_bn_into_conv (the BN mean is subtracted from the
     # existing bias, not folded from zero).
-    inits = [
-        _f32(np.random.randn(8, 3, 3, 3), "W"),
-        _f32(np.random.randn(8), "B"),
-        _f32(np.random.rand(8) + 0.5, "scale"),
-        _f32(np.random.randn(8), "bias"),
-        _f32(np.random.randn(8), "mean"),
-        _f32(np.random.rand(8) + 0.5, "var"),
-    ]
-    nodes = [
-        onnx.helper.make_node(
-            "Conv", ["X", "W", "B"], ["c"], kernel_shape=[3, 3], pads=[1, 1, 1, 1]
-        ),
-        onnx.helper.make_node(
-            "BatchNormalization", ["c", "scale", "bias", "mean", "var"], ["Y"]
-        ),
-    ]
-    model = _model(nodes, [_vi("X", [1, 3, 16, 16])], [_vi("Y", [1, 8, 16, 16])], inits)
+    W = np.random.randn(8, 3, 3, 3)
+    B = np.random.randn(8)
+    scale = np.random.rand(8) + 0.5
+    bias = np.random.randn(8)
+    mean = np.random.randn(8)
+    var = np.random.rand(8) + 0.5
+    model = _model(
+        """
+        g (float[1,3,16,16] X) => (float[1,8,16,16] Y)
+        {
+          c = Conv<kernel_shape = [3, 3], pads = [1, 1, 1, 1]>(X, W, B)
+          Y = BatchNormalization(c, scale, bias, mean, var)
+        }
+        """,
+        initializer=[
+            _f32(W, "W"),
+            _f32(B, "B"),
+            _f32(scale, "scale"),
+            _f32(bias, "bias"),
+            _f32(mean, "mean"),
+            _f32(var, "var"),
+        ],
+    )
     _, ops = _simplify(model)
     assert ops["BatchNormalization"] == 0
     assert ops["Conv"] == 1
@@ -127,24 +149,22 @@ def test_fuse_conv_bn_into_conv_double():
     bias = rng.standard_normal(8)
     mean = rng.standard_normal(8)
     var = rng.random(8) + 0.5
-    inits = [
-        _f64(w, "W"),
-        _f64(scale, "scale"),
-        _f64(bias, "bias"),
-        _f64(mean, "mean"),
-        _f64(var, "var"),
-    ]
-    nodes = [
-        onnx.helper.make_node(
-            "Conv", ["X", "W"], ["c"], kernel_shape=[3, 3], pads=[1, 1, 1, 1]
-        ),
-        onnx.helper.make_node(
-            "BatchNormalization", ["c", "scale", "bias", "mean", "var"], ["Y"]
-        ),
-    ]
-    x = onnx.helper.make_tensor_value_info("X", onnx.TensorProto.DOUBLE, [1, 3, 16, 16])
-    y = onnx.helper.make_tensor_value_info("Y", onnx.TensorProto.DOUBLE, [1, 8, 16, 16])
-    model = _model(nodes, [x], [y], inits)
+    model = _model(
+        """
+        g (double[1,3,16,16] X) => (double[1,8,16,16] Y)
+        {
+          c = Conv<kernel_shape = [3, 3], pads = [1, 1, 1, 1]>(X, W)
+          Y = BatchNormalization(c, scale, bias, mean, var)
+        }
+        """,
+        initializer=[
+            _f64(w, "W"),
+            _f64(scale, "scale"),
+            _f64(bias, "bias"),
+            _f64(mean, "mean"),
+            _f64(var, "var"),
+        ],
+    )
     sim_model, check_ok = onnxsim.simplify(model, check_n=0)
     assert check_ok
     ops = collections.Counter(n.op_type for n in sim_model.graph.node)
@@ -168,12 +188,18 @@ def test_fuse_conv_bn_into_conv_double():
 
 def test_fuse_matmul_add_into_gemm():
     # MatMul followed by a bias Add on 2-D inputs fuses into a single Gemm.
-    inits = [_f32(np.random.randn(16, 8), "W"), _f32(np.random.randn(8), "B")]
-    nodes = [
-        onnx.helper.make_node("MatMul", ["X", "W"], ["mm"]),
-        onnx.helper.make_node("Add", ["mm", "B"], ["Y"]),
-    ]
-    model = _model(nodes, [_vi("X", [4, 16])], [_vi("Y", [4, 8])], inits)
+    W = np.random.randn(16, 8)
+    B = np.random.randn(8)
+    model = _model(
+        """
+        g (float[4,16] X) => (float[4,8] Y)
+        {
+          mm = MatMul(X, W)
+          Y = Add(mm, B)
+        }
+        """,
+        initializer=[_f32(W, "W"), _f32(B, "B")],
+    )
     _, ops = _simplify(model)
     assert ops["Gemm"] == 1
     assert ops["MatMul"] == 0 and ops["Add"] == 0
@@ -184,12 +210,18 @@ def test_batched_matmul_add_into_gemm():
     # adds a bias (exported bias-first, as HuggingFace does). onnxsim converts
     # the batched MatMul+Add into a Gemm (fuse_matmul_add_bias_into_gemm_batched,
     # opted in by onnxsim) so runtimes can dispatch tuned GEMM kernels.
-    inits = [_f32(np.random.randn(8, 16), "W"), _f32(np.random.randn(16), "b")]
-    nodes = [
-        onnx.helper.make_node("MatMul", ["X", "W"], ["mm"]),
-        onnx.helper.make_node("Add", ["b", "mm"], ["Y"]),
-    ]
-    model = _model(nodes, [_vi("X", [2, 4, 8])], [_vi("Y", [2, 4, 16])], inits)
+    W = np.random.randn(8, 16)
+    b = np.random.randn(16)
+    model = _model(
+        """
+        g (float[2,4,8] X) => (float[2,4,16] Y)
+        {
+          mm = MatMul(X, W)
+          Y = Add(b, mm)
+        }
+        """,
+        initializer=[_f32(W, "W"), _f32(b, "b")],
+    )
     _, ops = _simplify(model)
     assert ops["Gemm"] == 1
     assert ops["MatMul"] == 0
@@ -198,15 +230,18 @@ def test_batched_matmul_add_into_gemm():
 def test_fuse_pad_into_conv():
     # A constant zero-value Pad on the spatial dims is folded into the Conv pads
     # attribute (fuse_pad_into_conv), removing the Pad node.
-    inits = [
-        _i64([0, 0, 1, 1, 0, 0, 1, 1], "pads"),
-        _f32(np.random.randn(8, 3, 3, 3), "W"),
-    ]
-    nodes = [
-        onnx.helper.make_node("Pad", ["X", "pads"], ["p"], mode="constant"),
-        onnx.helper.make_node("Conv", ["p", "W"], ["Y"], kernel_shape=[3, 3]),
-    ]
-    model = _model(nodes, [_vi("X", [1, 3, 16, 16])], [_vi("Y", [1, 8, 16, 16])], inits)
+    W = np.random.randn(8, 3, 3, 3)
+    model = _model(
+        """
+        g (float[1,3,16,16] X) => (float[1,8,16,16] Y)
+        <int64[8] pads = {0, 0, 1, 1, 0, 0, 1, 1}>
+        {
+          p = Pad<mode = "constant">(X, pads)
+          Y = Conv<kernel_shape = [3, 3]>(p, W)
+        }
+        """,
+        initializer=[_f32(W, "W")],
+    )
     _, ops = _simplify(model)
     assert ops["Pad"] == 0
     assert ops["Conv"] == 1
@@ -215,12 +250,16 @@ def test_fuse_pad_into_conv():
 def test_fuse_consecutive_reduce_unsqueeze():
     # ReduceSum(keepdims=0) immediately followed by an Unsqueeze on the reduced
     # axis collapses into a single keepdims reduction.
-    inits = [_i64([2], "raxes"), _i64([2], "uaxes")]
-    nodes = [
-        onnx.helper.make_node("ReduceSum", ["X", "raxes"], ["r"], keepdims=0),
-        onnx.helper.make_node("Unsqueeze", ["r", "uaxes"], ["Y"]),
-    ]
-    model = _model(nodes, [_vi("X", [2, 3, 4])], [_vi("Y", [2, 3, 1])], inits)
+    model = _model(
+        """
+        g (float[2,3,4] X) => (float[2,3,1] Y)
+        <int64[1] raxes = {2}, int64[1] uaxes = {2}>
+        {
+          r = ReduceSum<keepdims = 0>(X, raxes)
+          Y = Unsqueeze(r, uaxes)
+        }
+        """
+    )
     _, ops = _simplify(model)
     assert ops["Unsqueeze"] == 0
     assert ops["ReduceSum"] == 1
@@ -232,28 +271,25 @@ def test_fuse_rms_norm():
     # exports (see test_mnn_llm_export.py's ``_RMSNorm``). At opset >= 23
     # (RMSNormalization's introducing version) the whole chain collapses to a
     # single node (fuse_rms_norm). RMSNormalization needs ir_version 11
-    # (opset 23 shipped in onnx 1.18), so this model is built directly rather
-    # than through the shared ``_model`` helper, which pins ir_version 10.
-    inits = [
-        _f32(np.array(2.0), "two"),
-        _i64([-1], "axes"),
-        _f32(np.array(1e-6), "eps"),
-        _f32(np.random.randn(8) * 0.02 + 1.0, "weight"),
-    ]
-    nodes = [
-        onnx.helper.make_node("Pow", ["X", "two"], ["sq"]),
-        onnx.helper.make_node("ReduceMean", ["sq", "axes"], ["var"], keepdims=1),
-        onnx.helper.make_node("Add", ["var", "eps"], ["var_eps"]),
-        onnx.helper.make_node("Sqrt", ["var_eps"], ["rms"]),
-        onnx.helper.make_node("Reciprocal", ["rms"], ["inv_rms"]),
-        onnx.helper.make_node("Mul", ["X", "inv_rms"], ["normed"]),
-        onnx.helper.make_node("Mul", ["weight", "normed"], ["Y"]),
-    ]
-    graph = onnx.helper.make_graph(
-        nodes, "g", [_vi("X", [2, 4, 8])], [_vi("Y", [2, 4, 8])], inits
-    )
-    model = onnx.helper.make_model(
-        graph, opset_imports=[onnx.helper.make_opsetid("", 23)], ir_version=11
+    # (opset 23 shipped in onnx 1.18).
+    weight = np.random.randn(8) * 0.02 + 1.0
+    model = _model(
+        """
+        g (float[2,4,8] X) => (float[2,4,8] Y)
+        <float two = {2.0}, int64[1] axes = {-1}, float eps = {1e-06}>
+        {
+          sq = Pow(X, two)
+          var = ReduceMean<keepdims = 1>(sq, axes)
+          var_eps = Add(var, eps)
+          rms = Sqrt(var_eps)
+          inv_rms = Reciprocal(rms)
+          normed = Mul(X, inv_rms)
+          Y = Mul(weight, normed)
+        }
+        """,
+        initializer=[_f32(weight, "weight")],
+        opset=23,
+        ir_version=11,
     )
     _, ops = _simplify(model)
     assert ops["RMSNormalization"] == 1
@@ -270,21 +306,24 @@ def test_fuse_rms_norm_below_opset_23_untouched():
     # fire, leaving the decomposition (and its behavior on older runtimes)
     # intact. ReduceMean's axes is an attribute (not a second input) below
     # opset 18, so this also exercises that spelling of the pattern.
-    inits = [
-        _f32(np.array(2.0), "two"),
-        _f32(np.array(1e-6), "eps"),
-        _f32(np.random.randn(8) * 0.02 + 1.0, "weight"),
-    ]
-    nodes = [
-        onnx.helper.make_node("Pow", ["X", "two"], ["sq"]),
-        onnx.helper.make_node("ReduceMean", ["sq"], ["var"], axes=[-1], keepdims=1),
-        onnx.helper.make_node("Add", ["var", "eps"], ["var_eps"]),
-        onnx.helper.make_node("Sqrt", ["var_eps"], ["rms"]),
-        onnx.helper.make_node("Reciprocal", ["rms"], ["inv_rms"]),
-        onnx.helper.make_node("Mul", ["X", "inv_rms"], ["normed"]),
-        onnx.helper.make_node("Mul", ["weight", "normed"], ["Y"]),
-    ]
-    model = _model(nodes, [_vi("X", [2, 4, 8])], [_vi("Y", [2, 4, 8])], inits, opset=17)
+    weight = np.random.randn(8) * 0.02 + 1.0
+    model = _model(
+        """
+        g (float[2,4,8] X) => (float[2,4,8] Y)
+        <float two = {2.0}, float eps = {1e-06}>
+        {
+          sq = Pow(X, two)
+          var = ReduceMean<axes = [-1], keepdims = 1>(sq)
+          var_eps = Add(var, eps)
+          rms = Sqrt(var_eps)
+          inv_rms = Reciprocal(rms)
+          normed = Mul(X, inv_rms)
+          Y = Mul(weight, normed)
+        }
+        """,
+        initializer=[_f32(weight, "weight")],
+        opset=17,
+    )
     _, ops = _simplify(model)
     assert ops["RMSNormalization"] == 0
     assert ops["Mul"] == 2
@@ -299,78 +338,55 @@ def test_fuse_rms_norm_below_opset_23_untouched():
 # both must be recognized as reading the *same* ``angle`` Value for the
 # fusion to be numerically exact -- see MatchRopeCosSin's own doc comment.
 # --------------------------------------------------------------------------- #
-def _rope_apply_nodes(x_name, cos_bcast_name, sin_bcast_name, prefix, half):
+def _rope_apply_body(x_name, cos_bcast_name, sin_bcast_name, prefix, half):
     # x_embed = x * cos_bcast + rotate_half(x) * sin_bcast
-    return [
-        onnx.helper.make_node("Mul", [x_name, cos_bcast_name], [f"{prefix}_a"]),
-        onnx.helper.make_node(
-            "Slice",
-            [x_name, "slice_start0", f"slice_end{half}", "slice_axism1"],
-            [f"{prefix}_x1"],
-        ),
-        onnx.helper.make_node(
-            "Slice",
-            [x_name, f"slice_start{half}", "slice_end_max", "slice_axism1"],
-            [f"{prefix}_x2"],
-        ),
-        onnx.helper.make_node("Neg", [f"{prefix}_x2"], [f"{prefix}_neg_x2"]),
-        onnx.helper.make_node(
-            "Concat",
-            [f"{prefix}_neg_x2", f"{prefix}_x1"],
-            [f"{prefix}_rotated"],
-            axis=-1,
-        ),
-        onnx.helper.make_node(
-            "Mul", [f"{prefix}_rotated", sin_bcast_name], [f"{prefix}_b"]
-        ),
-        onnx.helper.make_node(
-            "Add", [f"{prefix}_a", f"{prefix}_b"], [f"{prefix}_embed"]
-        ),
-    ]
+    return f"""
+          {prefix}_a = Mul({x_name}, {cos_bcast_name})
+          {prefix}_x1 = Slice({x_name}, slice_start0, slice_end{half}, slice_axism1)
+          {prefix}_x2 = Slice({x_name}, slice_start{half}, slice_end_max, slice_axism1)
+          {prefix}_neg_x2 = Neg({prefix}_x2)
+          {prefix}_rotated = Concat<axis = -1>({prefix}_neg_x2, {prefix}_x1)
+          {prefix}_b = Mul({prefix}_rotated, {sin_bcast_name})
+          {prefix}_embed = Add({prefix}_a, {prefix}_b)
+    """
+
+
+def _rope_slice_inits(half):
+    int_max = np.iinfo(np.int64).max
+    return f"""
+          int64[1] slice_start0 = {{0}},
+          int64[1] slice_end{half} = {{{half}}},
+          int64[1] slice_start{half} = {{{half}}},
+          int64[1] slice_end_max = {{{int_max}}},
+          int64[1] slice_axism1 = {{-1}},
+          int64[1] unsq_axis1 = {{1}}
+    """
 
 
 def _rope_model(B=2, NH=4, S=6, Dh=8, share_angle=True, opset=23):
     half = Dh // 2
-    inits = [
-        _i64([0], "slice_start0"),
-        _i64([half], f"slice_end{half}"),
-        _i64([half], f"slice_start{half}"),
-        _i64([np.iinfo(np.int64).max], "slice_end_max"),
-        _i64([-1], "slice_axism1"),
-        _i64([1], "unsq_axis1"),
-    ]
     angle2 = "angle" if share_angle else "angle2"
-    nodes = [
-        onnx.helper.make_node("Concat", ["angle", angle2], ["emb"], axis=-1),
-        onnx.helper.make_node("Cos", ["emb"], ["cos_full"]),
-        onnx.helper.make_node("Sin", ["emb"], ["sin_full"]),
-        onnx.helper.make_node("Unsqueeze", ["cos_full", "unsq_axis1"], ["cos_bcast"]),
-        onnx.helper.make_node("Unsqueeze", ["sin_full", "unsq_axis1"], ["sin_bcast"]),
-    ]
-    nodes += _rope_apply_nodes("q", "cos_bcast", "sin_bcast", "q", half)
-    nodes += _rope_apply_nodes("k", "cos_bcast", "sin_bcast", "k", half)
-
-    graph_inputs = [
-        _vi("q", [B, NH, S, Dh]),
-        _vi("k", [B, NH, S, Dh]),
-        _vi("angle", [B, S, half]),
-    ]
+    inputs = f"float[{B},{NH},{S},{Dh}] q, float[{B},{NH},{S},{Dh}] k, float[{B},{S},{half}] angle"
     if not share_angle:
         # A second, independent (shape-identical but not the same Value, and
         # not foldable back to `angle`) input: the duplicating Concat's two
         # inputs are then genuinely different, so fuse_rope must decline
         # rather than assume this is duplication.
-        graph_inputs.append(_vi("angle2", [B, S, half]))
-    graph = onnx.helper.make_graph(
-        nodes,
-        "g",
-        graph_inputs,
-        [_vi("q_embed", [B, NH, S, Dh]), _vi("k_embed", [B, NH, S, Dh])],
-        inits,
-    )
-    return onnx.helper.make_model(
-        graph, opset_imports=[onnx.helper.make_opsetid("", opset)], ir_version=11
-    )
+        inputs += f", float[{B},{S},{half}] angle2"
+    body = f"""
+        g ({inputs}) => (float[{B},{NH},{S},{Dh}] q_embed, float[{B},{NH},{S},{Dh}] k_embed)
+        <{_rope_slice_inits(half)}>
+        {{
+          emb = Concat<axis = -1>(angle, {angle2})
+          cos_full = Cos(emb)
+          sin_full = Sin(emb)
+          cos_bcast = Unsqueeze(cos_full, unsq_axis1)
+          sin_bcast = Unsqueeze(sin_full, unsq_axis1)
+          {_rope_apply_body("q", "cos_bcast", "sin_bcast", "q", half)}
+          {_rope_apply_body("k", "cos_bcast", "sin_bcast", "k", half)}
+        }}
+        """
+    return _model(body, opset=opset, ir_version=11)
 
 
 def test_fuse_rope():
@@ -419,38 +435,22 @@ def test_fuse_rope_partial_match_preserves_shared_chain():
     # have a remaining consumer and leave them alone.
     B, NH, S, Dh = 2, 4, 6, 8
     half = Dh // 2
-    inits = [
-        _i64([0], "slice_start0"),
-        _i64([half], f"slice_end{half}"),
-        _i64([half], f"slice_start{half}"),
-        _i64([np.iinfo(np.int64).max], "slice_end_max"),
-        _i64([-1], "slice_axism1"),
-        _i64([1], "unsq_axis1"),
-    ]
-    nodes = [
-        onnx.helper.make_node("Concat", ["angle", "angle"], ["emb"], axis=-1),
-        onnx.helper.make_node("Cos", ["emb"], ["cos_full"]),
-        onnx.helper.make_node("Sin", ["emb"], ["sin_full"]),
-        onnx.helper.make_node("Unsqueeze", ["cos_full", "unsq_axis1"], ["cos_bcast"]),
-        onnx.helper.make_node("Unsqueeze", ["sin_full", "unsq_axis1"], ["sin_bcast"]),
-    ]
-    nodes += _rope_apply_nodes("q", "cos_bcast", "sin_bcast", "q", half)
-    # K: deliberately NOT the rotate_half pattern -- just k * cos_bcast.
-    nodes.append(onnx.helper.make_node("Mul", ["k", "cos_bcast"], ["k_embed"]))
-
-    graph = onnx.helper.make_graph(
-        nodes,
-        "g",
-        [
-            _vi("q", [B, NH, S, Dh]),
-            _vi("k", [B, NH, S, Dh]),
-            _vi("angle", [B, S, half]),
-        ],
-        [_vi("q_embed", [B, NH, S, Dh]), _vi("k_embed", [B, NH, S, Dh])],
-        inits,
-    )
-    model = onnx.helper.make_model(
-        graph, opset_imports=[onnx.helper.make_opsetid("", 23)], ir_version=11
+    model = _model(
+        f"""
+        g (float[{B},{NH},{S},{Dh}] q, float[{B},{NH},{S},{Dh}] k, float[{B},{S},{half}] angle) => (float[{B},{NH},{S},{Dh}] q_embed, float[{B},{NH},{S},{Dh}] k_embed)
+        <{_rope_slice_inits(half)}>
+        {{
+          emb = Concat<axis = -1>(angle, angle)
+          cos_full = Cos(emb)
+          sin_full = Sin(emb)
+          cos_bcast = Unsqueeze(cos_full, unsq_axis1)
+          sin_bcast = Unsqueeze(sin_full, unsq_axis1)
+          {_rope_apply_body("q", "cos_bcast", "sin_bcast", "q", half)}
+          k_embed = Mul(k, cos_bcast)
+        }}
+        """,
+        opset=23,
+        ir_version=11,
     )
     simplified, ops = _simplify(model)
     assert ops["RotaryEmbedding"] == 1
@@ -465,12 +465,16 @@ def test_fuse_rope_partial_match_preserves_shared_chain():
 def test_fuse_concat_into_reshape():
     # A Concat of constant shape pieces feeding a Reshape is folded into a single
     # Reshape with a constant target shape (fuse_concat_into_reshape).
-    inits = [_i64([2], "c0"), _i64([-1], "c1")]
-    nodes = [
-        onnx.helper.make_node("Concat", ["c0", "c1"], ["shape"], axis=0),
-        onnx.helper.make_node("Reshape", ["X", "shape"], ["Y"]),
-    ]
-    model = _model(nodes, [_vi("X", [2, 3, 4])], [_vi("Y", [2, 12])], inits)
+    model = _model(
+        """
+        g (float[2,3,4] X) => (float[2,12] Y)
+        <int64[1] c0 = {2}, int64[1] c1 = {-1}>
+        {
+          shape = Concat<axis = 0>(c0, c1)
+          Y = Reshape(X, shape)
+        }
+        """
+    )
     _, ops = _simplify(model)
     assert ops["Concat"] == 0
     assert ops["Reshape"] == 1
@@ -480,11 +484,15 @@ def test_fuse_concat_into_reshape():
 # Dead-node / no-op elimination
 # --------------------------------------------------------------------------- #
 def test_eliminate_identity():
-    nodes = [
-        onnx.helper.make_node("Identity", ["X"], ["a"]),
-        onnx.helper.make_node("Relu", ["a"], ["Y"]),
-    ]
-    model = _model(nodes, [_vi("X", [4, 8])], [_vi("Y", [4, 8])], [])
+    model = _model(
+        """
+        g (float[4,8] X) => (float[4,8] Y)
+        {
+          a = Identity(X)
+          Y = Relu(a)
+        }
+        """
+    )
     _, ops = _simplify(model)
     assert ops["Identity"] == 0
     assert ops["Relu"] == 1
@@ -492,11 +500,15 @@ def test_eliminate_identity():
 
 def test_eliminate_nop_transpose():
     # A Transpose whose permutation is the identity ordering is a no-op.
-    nodes = [
-        onnx.helper.make_node("Relu", ["X"], ["a"]),
-        onnx.helper.make_node("Transpose", ["a"], ["Y"], perm=[0, 1]),
-    ]
-    model = _model(nodes, [_vi("X", [4, 8])], [_vi("Y", [4, 8])], [])
+    model = _model(
+        """
+        g (float[4,8] X) => (float[4,8] Y)
+        {
+          a = Relu(X)
+          Y = Transpose<perm = [0, 1]>(a)
+        }
+        """
+    )
     _, ops = _simplify(model)
     assert ops["Transpose"] == 0
     assert ops["Relu"] == 1
@@ -504,12 +516,16 @@ def test_eliminate_nop_transpose():
 
 def test_eliminate_nop_expand():
     # Expand to the already-existing shape does nothing and is removed.
-    inits = [_i64([4, 8], "eshape")]
-    nodes = [
-        onnx.helper.make_node("Relu", ["X"], ["a"]),
-        onnx.helper.make_node("Expand", ["a", "eshape"], ["Y"]),
-    ]
-    model = _model(nodes, [_vi("X", [4, 8])], [_vi("Y", [4, 8])], inits)
+    model = _model(
+        """
+        g (float[4,8] X) => (float[4,8] Y)
+        <int64[2] eshape = {4, 8}>
+        {
+          a = Relu(X)
+          Y = Expand(a, eshape)
+        }
+        """
+    )
     _, ops = _simplify(model)
     assert ops["Expand"] == 0
     assert ops["Relu"] == 1
@@ -517,12 +533,16 @@ def test_eliminate_nop_expand():
 
 def test_eliminate_mul_by_one():
     # Multiplying by a unit constant is a no-op and is eliminated.
-    inits = [_f32(np.array([1.0]), "one")]
-    nodes = [
-        onnx.helper.make_node("Relu", ["X"], ["a"]),
-        onnx.helper.make_node("Mul", ["a", "one"], ["Y"]),
-    ]
-    model = _model(nodes, [_vi("X", [4, 8])], [_vi("Y", [4, 8])], inits)
+    model = _model(
+        """
+        g (float[4,8] X) => (float[4,8] Y)
+        <float[1] one = {1.0}>
+        {
+          a = Relu(X)
+          Y = Mul(a, one)
+        }
+        """
+    )
     _, ops = _simplify(model)
     assert ops["Mul"] == 0
     assert ops["Relu"] == 1
@@ -530,11 +550,15 @@ def test_eliminate_mul_by_one():
 
 def test_eliminate_consecutive_cancelling_transposes():
     # Two transposes that invert each other collapse away entirely.
-    nodes = [
-        onnx.helper.make_node("Transpose", ["X"], ["t"], perm=[1, 0]),
-        onnx.helper.make_node("Transpose", ["t"], ["Y"], perm=[1, 0]),
-    ]
-    model = _model(nodes, [_vi("X", [4, 8])], [_vi("Y", [4, 8])], [])
+    model = _model(
+        """
+        g (float[4,8] X) => (float[4,8] Y)
+        {
+          t = Transpose<perm = [1, 0]>(X)
+          Y = Transpose<perm = [1, 0]>(t)
+        }
+        """
+    )
     sim_model, ops = _simplify(model)
     # The pair either cancels to a bare passthrough (<=1 node) with no residual
     # transpose logic changing the data.
@@ -547,12 +571,16 @@ def test_eliminate_consecutive_cancelling_transposes():
 def test_eliminate_common_subexpression():
     # Two structurally identical Sqrt nodes over the same input are deduplicated
     # into one shared node (eliminate_common_subexpression).
-    nodes = [
-        onnx.helper.make_node("Sqrt", ["X"], ["s1"]),
-        onnx.helper.make_node("Sqrt", ["X"], ["s2"]),
-        onnx.helper.make_node("Add", ["s1", "s2"], ["Y"]),
-    ]
-    model = _model(nodes, [_vi("X", [4, 8])], [_vi("Y", [4, 8])], [])
+    model = _model(
+        """
+        g (float[4,8] X) => (float[4,8] Y)
+        {
+          s1 = Sqrt(X)
+          s2 = Sqrt(X)
+          Y = Add(s1, s2)
+        }
+        """
+    )
     _, ops = _simplify(model)
     assert ops["Sqrt"] == 1
     assert ops["Add"] == 1
@@ -582,14 +610,18 @@ def test_defer_constantofshape_folds_small_consumer():
     # scalar, which the executor still folds by running ConstantOfShape+ReduceSum
     # together; the scalar feeds a runtime Add. The large tensor is never stored
     # and the ConstantOfShape/ReduceSum chain disappears.
-    inits = [_i64([256, 256], "shape")]
-    value = onnx.helper.make_tensor("value", onnx.TensorProto.FLOAT, [1], [2.0])
-    nodes = [
-        onnx.helper.make_node("ConstantOfShape", ["shape"], ["big"], value=value),
-        onnx.helper.make_node("ReduceSum", ["big"], ["s"], keepdims=0),
-        onnx.helper.make_node("Add", ["X", "s"], ["Y"]),
-    ]
-    model = _model(nodes, [_vi("X", [4, 8])], [_vi("Y", [4, 8])], inits, opset=11)
+    model = _model(
+        """
+        g (float[4,8] X) => (float[4,8] Y)
+        <int64[2] shape = {256, 256}>
+        {
+          big = ConstantOfShape<value = float[1] {2.0}>(shape)
+          s = ReduceSum<keepdims = 0>(big)
+          Y = Add(X, s)
+        }
+        """,
+        opset=11,
+    )
     sim_model, ops = _simplify_no_large_tensor(model)
     assert ops["ConstantOfShape"] == 0
     assert ops["ReduceSum"] == 0
@@ -608,15 +640,19 @@ def test_defer_constant_expand_folds_small_consumer():
     # not handled by shape propagation). The executor still folds it by running
     # Expand+ReduceSum together, and the scalar feeds a runtime Add, so the whole
     # constant chain collapses without ever storing the expanded tensor.
-    inits = [_i64([512, 512], "eshape")]
-    scalar = onnx.helper.make_tensor("c", onnx.TensorProto.FLOAT, [1, 1], [3.0])
-    nodes = [
-        onnx.helper.make_node("Constant", [], ["small"], value=scalar),
-        onnx.helper.make_node("Expand", ["small", "eshape"], ["big"]),
-        onnx.helper.make_node("ReduceSum", ["big"], ["s"], keepdims=0),
-        onnx.helper.make_node("Add", ["X", "s"], ["Y"]),
-    ]
-    model = _model(nodes, [_vi("X", [4, 8])], [_vi("Y", [4, 8])], inits, opset=11)
+    model = _model(
+        """
+        g (float[4,8] X) => (float[4,8] Y)
+        <int64[2] eshape = {512, 512}>
+        {
+          small = Constant<value = float[1,1] {3.0}>()
+          big = Expand(small, eshape)
+          s = ReduceSum<keepdims = 0>(big)
+          Y = Add(X, s)
+        }
+        """,
+        opset=11,
+    )
     sim_model, ops = _simplify_no_large_tensor(model)
     assert ops["Expand"] == 0
     assert ops["ReduceSum"] == 0
@@ -634,47 +670,61 @@ def test_defer_constant_expand_folds_small_consumer():
 # fuse_bn_into_conv / fuse_add_bias_into_conv passes extended to ConvTranspose.
 # --------------------------------------------------------------------------- #
 def test_eliminate_nop_dropout():
-    inits = [onnx.numpy_helper.from_array(np.array(0.0, dtype=np.float32), "ratio")]
-    nodes = [
-        onnx.helper.make_node("Relu", ["X"], ["a"]),
-        onnx.helper.make_node("Dropout", ["a", "ratio"], ["Y"]),
-    ]
-    model = _model(nodes, [_vi("X", [4, 8])], [_vi("Y", [4, 8])], inits)
+    model = _model(
+        """
+        g (float[4,8] X) => (float[4,8] Y)
+        <float ratio = {0.0}>
+        {
+          a = Relu(X)
+          Y = Dropout(a, ratio)
+        }
+        """
+    )
     _, ops = _simplify(model)
     assert ops["Dropout"] == 0
     assert ops["Relu"] == 1
 
 
 def test_fuse_convtranspose_bn():
-    inits = [
-        _f32(np.random.randn(3, 8, 3, 3), "W"),  # ConvTranspose: [Cin, Cout, kH, kW]
-        _f32(np.random.rand(8) + 0.5, "scale"),
-        _f32(np.random.randn(8), "bias"),
-        _f32(np.random.randn(8), "mean"),
-        _f32(np.random.rand(8) + 0.5, "var"),
-    ]
-    nodes = [
-        onnx.helper.make_node("ConvTranspose", ["X", "W"], ["c"], kernel_shape=[3, 3]),
-        onnx.helper.make_node(
-            "BatchNormalization", ["c", "scale", "bias", "mean", "var"], ["Y"]
-        ),
-    ]
-    model = _model(nodes, [_vi("X", [1, 3, 8, 8])], [_vi("Y", [1, 8, 10, 10])], inits)
+    W = np.random.randn(3, 8, 3, 3)  # ConvTranspose: [Cin, Cout, kH, kW]
+    scale = np.random.rand(8) + 0.5
+    bias = np.random.randn(8)
+    mean = np.random.randn(8)
+    var = np.random.rand(8) + 0.5
+    model = _model(
+        """
+        g (float[1,3,8,8] X) => (float[1,8,10,10] Y)
+        {
+          c = ConvTranspose<kernel_shape = [3, 3]>(X, W)
+          Y = BatchNormalization(c, scale, bias, mean, var)
+        }
+        """,
+        initializer=[
+            _f32(W, "W"),
+            _f32(scale, "scale"),
+            _f32(bias, "bias"),
+            _f32(mean, "mean"),
+            _f32(var, "var"),
+        ],
+    )
     _, ops = _simplify(model)
     assert ops["BatchNormalization"] == 0
     assert ops["ConvTranspose"] == 1
 
 
 def test_fuse_convtranspose_add():
-    inits = [
-        _f32(np.random.randn(3, 8, 3, 3), "W"),
-        _f32(np.random.randn(1, 8, 1, 1), "bias"),
-    ]
-    nodes = [
-        onnx.helper.make_node("ConvTranspose", ["X", "W"], ["c"], kernel_shape=[3, 3]),
-        onnx.helper.make_node("Add", ["c", "bias"], ["Y"]),
-    ]
-    model = _model(nodes, [_vi("X", [1, 3, 8, 8])], [_vi("Y", [1, 8, 10, 10])], inits)
+    W = np.random.randn(3, 8, 3, 3)
+    bias = np.random.randn(1, 8, 1, 1)
+    model = _model(
+        """
+        g (float[1,3,8,8] X) => (float[1,8,10,10] Y)
+        {
+          c = ConvTranspose<kernel_shape = [3, 3]>(X, W)
+          Y = Add(c, bias)
+        }
+        """,
+        initializer=[_f32(W, "W"), _f32(bias, "bias")],
+    )
     _, ops = _simplify(model)
     assert ops["Add"] == 0
     assert ops["ConvTranspose"] == 1
@@ -695,26 +745,31 @@ def test_eliminate_reshape_around_elementwise():
     # Relu -> Reshape(2-D) -> Gemm. The two middle reshapes are exact inverses
     # (they only split / merge the leading dims), so they collapse and the Relu
     # ends up directly between the two Gemms.
-    inits = [
-        _i64([-1, 8], "s1"),
-        _f32(np.random.randn(8, 16), "W1"),
-        _f32(np.random.randn(16), "b1"),
-        _i64([2, 4, 16], "s2"),
-        _i64([-1, 16], "s3"),
-        _f32(np.random.randn(16, 8), "W2"),
-        _f32(np.random.randn(8), "b2"),
-        _i64([2, 4, 8], "s4"),
-    ]
-    nodes = [
-        onnx.helper.make_node("Reshape", ["X", "s1"], ["rx1"]),
-        onnx.helper.make_node("Gemm", ["rx1", "W1", "b1"], ["g1"]),
-        onnx.helper.make_node("Reshape", ["g1", "s2"], ["u1"]),
-        onnx.helper.make_node("Relu", ["u1"], ["r"]),
-        onnx.helper.make_node("Reshape", ["r", "s3"], ["f2"]),
-        onnx.helper.make_node("Gemm", ["f2", "W2", "b2"], ["g2"]),
-        onnx.helper.make_node("Reshape", ["g2", "s4"], ["Y"]),
-    ]
-    model = _model(nodes, [_vi("X", [2, 4, 8])], [_vi("Y", [2, 4, 8])], inits)
+    W1 = np.random.randn(8, 16)
+    b1 = np.random.randn(16)
+    W2 = np.random.randn(16, 8)
+    b2 = np.random.randn(8)
+    model = _model(
+        """
+        g (float[2,4,8] X) => (float[2,4,8] Y)
+        <
+          int64[2] s1 = {-1, 8},
+          int64[3] s2 = {2, 4, 16},
+          int64[2] s3 = {-1, 16},
+          int64[3] s4 = {2, 4, 8}
+        >
+        {
+          rx1 = Reshape(X, s1)
+          g1 = Gemm(rx1, W1, b1)
+          u1 = Reshape(g1, s2)
+          r = Relu(u1)
+          f2 = Reshape(r, s3)
+          g2 = Gemm(f2, W2, b2)
+          Y = Reshape(g2, s4)
+        }
+        """,
+        initializer=[_f32(W1, "W1"), _f32(b1, "b1"), _f32(W2, "W2"), _f32(b2, "b2")],
+    )
     _, ops = _simplify(model)
     # Both Gemms are kept (tuned-kernel dispatch preserved)...
     assert ops["Gemm"] == 2
@@ -732,20 +787,21 @@ def test_eliminate_reshape_around_elementwise():
 # --------------------------------------------------------------------------- #
 def test_fuse_gelu():
     # 0.5 * x * (1 + erf(x / sqrt(2))) is the exact-erf GELU formulation.
-    inits = [
-        _f32(np.array([0.5]), "half"),
-        _f32(np.array([1.0]), "one"),
-        _f32(np.array([1.4142135623730951]), "sqrt2"),
-    ]
-    nodes = [
-        onnx.helper.make_node("Div", ["X", "sqrt2"], ["t0"]),
-        onnx.helper.make_node("Erf", ["t0"], ["t1"]),
-        onnx.helper.make_node("Add", ["t1", "one"], ["t2"]),
-        onnx.helper.make_node("Mul", ["X", "t2"], ["t3"]),
-        onnx.helper.make_node("Mul", ["t3", "half"], ["Y"]),
-    ]
-    # Gelu is only in the default domain from opset 20.
-    model = _model(nodes, [_vi("X", [4, 8])], [_vi("Y", [4, 8])], inits, opset=20)
+    model = _model(
+        """
+        g (float[4,8] X) => (float[4,8] Y)
+        <float half = {0.5}, float one = {1.0}, float sqrt2 = {1.4142135623730951}>
+        {
+          t0 = Div(X, sqrt2)
+          t1 = Erf(t0)
+          t2 = Add(t1, one)
+          t3 = Mul(X, t2)
+          Y = Mul(t3, half)
+        }
+        """,
+        # Gelu is only in the default domain from opset 20.
+        opset=20,
+    )
     _, ops = _simplify(model)
     assert ops["Gelu"] == 1
     assert ops["Erf"] == 0
@@ -753,19 +809,20 @@ def test_fuse_gelu():
 
 def test_fuse_gelu_commuted_operands():
     # Same pattern, but with every commutative Mul/Add's operands swapped.
-    inits = [
-        _f32(np.array([0.5]), "half"),
-        _f32(np.array([1.0]), "one"),
-        _f32(np.array([1.4142135623730951]), "sqrt2"),
-    ]
-    nodes = [
-        onnx.helper.make_node("Div", ["X", "sqrt2"], ["t0"]),
-        onnx.helper.make_node("Erf", ["t0"], ["t1"]),
-        onnx.helper.make_node("Add", ["one", "t1"], ["t2"]),
-        onnx.helper.make_node("Mul", ["t2", "X"], ["t3"]),
-        onnx.helper.make_node("Mul", ["half", "t3"], ["Y"]),
-    ]
-    model = _model(nodes, [_vi("X", [4, 8])], [_vi("Y", [4, 8])], inits, opset=20)
+    model = _model(
+        """
+        g (float[4,8] X) => (float[4,8] Y)
+        <float half = {0.5}, float one = {1.0}, float sqrt2 = {1.4142135623730951}>
+        {
+          t0 = Div(X, sqrt2)
+          t1 = Erf(t0)
+          t2 = Add(one, t1)
+          t3 = Mul(t2, X)
+          Y = Mul(half, t3)
+        }
+        """,
+        opset=20,
+    )
     _, ops = _simplify(model)
     assert ops["Gelu"] == 1
     assert ops["Erf"] == 0
@@ -774,19 +831,20 @@ def test_fuse_gelu_commuted_operands():
 def test_fuse_gelu_skips_old_opset():
     # Gelu is only in the default domain from opset 20; an older-opset graph
     # keeps the decomposition rather than emitting an invalid node.
-    inits = [
-        _f32(np.array([0.5]), "half"),
-        _f32(np.array([1.0]), "one"),
-        _f32(np.array([1.4142135623730951]), "sqrt2"),
-    ]
-    nodes = [
-        onnx.helper.make_node("Div", ["X", "sqrt2"], ["t0"]),
-        onnx.helper.make_node("Erf", ["t0"], ["t1"]),
-        onnx.helper.make_node("Add", ["t1", "one"], ["t2"]),
-        onnx.helper.make_node("Mul", ["X", "t2"], ["t3"]),
-        onnx.helper.make_node("Mul", ["t3", "half"], ["Y"]),
-    ]
-    model = _model(nodes, [_vi("X", [4, 8])], [_vi("Y", [4, 8])], inits, opset=13)
+    model = _model(
+        """
+        g (float[4,8] X) => (float[4,8] Y)
+        <float half = {0.5}, float one = {1.0}, float sqrt2 = {1.4142135623730951}>
+        {
+          t0 = Div(X, sqrt2)
+          t1 = Erf(t0)
+          t2 = Add(t1, one)
+          t3 = Mul(X, t2)
+          Y = Mul(t3, half)
+        }
+        """,
+        opset=13,
+    )
     _, ops = _simplify(model)
     assert ops["Gelu"] == 0
     assert ops["Erf"] == 1
@@ -798,23 +856,19 @@ def test_fuse_gelu_skips_old_opset():
 # Pow(diff,2) for the square) and fuses it to a single
 # ``LayerNormalization`` node (fuse_layer_norm, opset >= 17).
 # --------------------------------------------------------------------------- #
-def _layer_norm_nodes(square_op):
-    square = (
-        onnx.helper.make_node("Mul", ["diff", "diff"], ["sq"])
-        if square_op == "Mul"
-        else onnx.helper.make_node("Pow", ["diff", "two"], ["sq"])
-    )
-    return [
-        onnx.helper.make_node("ReduceMean", ["X"], ["mean"], axes=[-1], keepdims=1),
-        onnx.helper.make_node("Sub", ["X", "mean"], ["diff"]),
-        square,
-        onnx.helper.make_node("ReduceMean", ["sq"], ["var"], axes=[-1], keepdims=1),
-        onnx.helper.make_node("Add", ["var", "eps"], ["var_eps"]),
-        onnx.helper.make_node("Sqrt", ["var_eps"], ["std"]),
-        onnx.helper.make_node("Div", ["diff", "std"], ["norm"]),
-        onnx.helper.make_node("Mul", ["norm", "scale"], ["scaled"]),
-        onnx.helper.make_node("Add", ["scaled", "bias"], ["Y"]),
-    ]
+def _layer_norm_body(square_op):
+    square = "sq = Mul(diff, diff)" if square_op == "Mul" else "sq = Pow(diff, two)"
+    return f"""
+          mean = ReduceMean<axes = [-1], keepdims = 1>(X)
+          diff = Sub(X, mean)
+          {square}
+          var = ReduceMean<axes = [-1], keepdims = 1>(sq)
+          var_eps = Add(var, eps)
+          std = Sqrt(var_eps)
+          norm = Div(diff, std)
+          scaled = Mul(norm, scale)
+          Y = Add(scaled, bias)
+    """
 
 
 def _layer_norm_inits():
@@ -828,12 +882,14 @@ def _layer_norm_inits():
 
 @pytest.mark.parametrize("square_op", ["Mul", "Pow"])
 def test_fuse_layer_norm(square_op):
-    nodes = _layer_norm_nodes(square_op)
     model = _model(
-        nodes,
-        [_vi("X", [2, 4, 8])],
-        [_vi("Y", [2, 4, 8])],
-        _layer_norm_inits(),
+        f"""
+        g (float[2,4,8] X) => (float[2,4,8] Y)
+        {{
+          {_layer_norm_body(square_op)}
+        }}
+        """,
+        initializer=_layer_norm_inits(),
         opset=17,
     )
     _, ops = _simplify(model)
@@ -843,12 +899,14 @@ def test_fuse_layer_norm(square_op):
 
 def test_fuse_layer_norm_skips_old_opset():
     # LayerNormalization is only in the default domain from opset 17.
-    nodes = _layer_norm_nodes("Mul")
     model = _model(
-        nodes,
-        [_vi("X", [2, 4, 8])],
-        [_vi("Y", [2, 4, 8])],
-        _layer_norm_inits(),
+        f"""
+        g (float[2,4,8] X) => (float[2,4,8] Y)
+        {{
+          {_layer_norm_body("Mul")}
+        }}
+        """,
+        initializer=_layer_norm_inits(),
         opset=13,
     )
     _, ops = _simplify(model)
@@ -861,9 +919,17 @@ def test_fuse_layer_norm_skips_mismatched_scale_shape():
     # LayerNormalization's Scale/B inputs; a scalar scale (which still
     # broadcasts fine in the plain decomposition, so the model stays valid)
     # does not match and is left unfused.
-    nodes = _layer_norm_nodes("Mul")
     inits = _layer_norm_inits()
     inits[2] = _f32(np.array(1.5), "scale")
-    model = _model(nodes, [_vi("X", [2, 4, 8])], [_vi("Y", [2, 4, 8])], inits, opset=17)
+    model = _model(
+        f"""
+        g (float[2,4,8] X) => (float[2,4,8] Y)
+        {{
+          {_layer_norm_body("Mul")}
+        }}
+        """,
+        initializer=inits,
+        opset=17,
+    )
     _, ops = _simplify(model)
     assert ops["LayerNormalization"] == 0
