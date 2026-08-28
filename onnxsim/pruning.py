@@ -85,9 +85,11 @@ or non-all-ones ``dilations``, since a dilated receptive field's offsets
 aren't evenly spaced in the padded input the way ``sliding_window_view``
 assumes) falls back to plain magnitude for that layer, the same as any
 other layer whose activation norm was never observed.
-:func:`apply_sparsegpt_pruning` deliberately does **not** extend to Conv --
-see its own docstring for why a coarse approximation there would be worse
-than no compensation at all, not just less precise.
+:func:`apply_sparsegpt_pruning` now also matches those same ordinary
+(``group=1``) 2-D ``Conv`` layers -- see its own docstring below for the
+full ``[K, K]`` im2col cross-covariance Hessian this needed (a real step
+up from Wanda's per-offset norm above, not just a reuse of it) and how
+it's verified.
 
 Both magnitude and Wanda pruning support two sparsity patterns, chosen per
 invocation:
@@ -190,6 +192,54 @@ here rather than "corrected" to match, since the point of this function is
 to reproduce SparseGPT specifically. N:M pruning is unaffected (it is
 already per-row in the reference too, and matches this module's own
 ``n``/``m`` convention exactly).
+
+:func:`apply_sparsegpt_pruning` also matches ordinary (``group=1``) 2-D
+``Conv`` layers, using exactly the same producer matching, Cholesky
+machinery, and column-processing loop above -- the only genuinely new
+piece is how ``H`` itself gets built. For a MatMul/Gemm layer
+``H = X.T @ X`` is already a full cross-covariance, since each column
+*is* an independent input feature; for Conv, a weight column instead
+indexes one ``(in_channel, kh, kw)`` receptive-field offset (the same
+reshape :func:`apply_magnitude_pruning`/:func:`apply_wanda_pruning` and
+:func:`apply_structured_pruning` already use), so a correct ``H`` needs
+the full ``[K, K]`` cross-covariance of every offset against every other
+-- not merely each offset's own norm the way Wanda's diagonal-only
+``_conv_patch_sq_sum`` needs. :func:`_conv_im2col_patches` builds that:
+the same zero-padded ``numpy.lib.stride_tricks.sliding_window_view``
+unfolding :func:`_conv_patch_sq_sum` already does (reusing
+:func:`_conv_spatial_attrs` for the padding/stride extraction, and
+declining the same ``auto_pad``/non-unit-``dilations`` combinations that
+function does -- in which case the layer is left completely untouched,
+there being no data-free fallback for SparseGPT, Conv included), but
+returning the actual ``[n_positions, K]`` patch matrix rather than
+reducing straight to a per-offset sum of squares, so ``H = patches.T @
+patches`` can be formed from it. Verified two independent ways before
+being trusted here: a brute-force nested-loop oracle that builds the same
+``[K, K]`` Hessian a completely different way (one Python triple-loop per
+output position, accumulating an explicit outer product, rather than any
+vectorized unfolding), the same bar
+``test_conv_patch_sq_sum_matches_naive_nested_loop_oracle`` already set
+for Wanda's per-offset norm; and, end to end, the same reconstruction-
+error property the MatMul/Gemm path is already validated against -- a
+SparseGPT-pruned Conv layer's output should reconstruct the float layer's
+output at least as well as naive same-mask zeroing with no compensation,
+on well-conditioned calibration data. Because a full patch matrix for a
+realistic layer can be large (``n_positions`` grows with output spatial
+size, not just channel count), ``H`` accumulates incrementally, one
+calibration batch's own unfolded patches at a time (``H += patches.T @
+patches``, each batch's patches discarded once folded in), rather than
+ever concatenating every batch's patches into one array first the way the
+MatMul/Gemm path above still concatenates its (much smaller, already
+per-feature) 2-D activations. Unlike the reference implementation's own
+``add_batch`` (https://github.com/IST-DASLab/sparsegpt/blob/master/
+sparsegpt.py), which never actually unfolds a Conv2d activation at all --
+its Conv branch reshapes only the *weight* (``W.flatten(1)``), and its own
+driver scripts (``opt.py``, ``llama.py``, ...) never exercise a Conv layer
+in the first place, since OPT/BLOOM/Llama have none -- there was no
+correct reference to port here, unlike every other technique this module
+ports from an upstream implementation; this is original, from-first-
+principles machinery, held to the verification bar above precisely
+because of that.
 """
 
 from __future__ import annotations
@@ -775,6 +825,61 @@ def _sparsegpt_prune_columns(
     return w_pruned
 
 
+def _conv_im2col_patches(
+    x: np.ndarray, attrs: _ConvSpatialAttrs
+) -> Optional[np.ndarray]:
+    """Returns the ``[n_positions, Cin*kh*kw]`` im2col-unfolded patch
+    matrix for one calibration batch's raw ``[N, Cin, H, W]`` Conv input
+    `x` -- every output spatial position's full receptive-field patch,
+    flattened in the same ``(in_channel, kh, kw)`` row-major order
+    :func:`_prune_weight`'s own ``w.reshape(n, cin*kh*kw)`` uses (verified
+    against a nested-loop oracle by
+    ``test_sparsegpt_conv_hessian_matches_naive_nested_loop_oracle``).
+    SparseGPT's Conv Hessian is ``H = patches.T @ patches``, this
+    function's own return value being the only new piece: everything else
+    (the zero-padded ``numpy.lib.stride_tricks.sliding_window_view``
+    unfolding, the attribute handling) mirrors
+    :func:`_conv_patch_sq_sum` exactly, reusing the same
+    :class:`_ConvSpatialAttrs`/:func:`_conv_spatial_attrs` Wanda's own
+    Conv support already built -- see this module's own docstring for why
+    a *diagonal-only* per-offset norm (Wanda's ``_conv_patch_sq_sum``) is
+    not enough here and the *full* cross-covariance this returns is
+    needed instead. Returns ``None`` on the same "not usable" conditions
+    :func:`_conv_patch_sq_sum` declines (not a rank-4 activation, or too
+    small once padded for this kernel).
+    """
+    if x.ndim != 4:
+        return None
+    n, cin = x.shape[0], x.shape[1]
+    xp = np.pad(
+        x,
+        (
+            (0, 0),
+            (0, 0),
+            (attrs.pad_top, attrs.pad_bottom),
+            (attrs.pad_left, attrs.pad_right),
+        ),
+    )
+    if xp.shape[2] < attrs.kh or xp.shape[3] < attrs.kw:
+        return None
+    # [N, Cin, Hfull, Wfull, kh, kw], Hfull/Wfull at unit stride.
+    windows = np.lib.stride_tricks.sliding_window_view(
+        xp, (attrs.kh, attrs.kw), axis=(2, 3)
+    )
+    windows = windows[:, :, :: attrs.stride_h, :: attrs.stride_w, :, :]
+    h_out, w_out = windows.shape[2], windows.shape[3]
+    n_positions = n * h_out * w_out
+    if n_positions == 0:
+        return None
+    # [N, Cin, Hout, Wout, kh, kw] -> [N, Hout, Wout, Cin, kh, kw]: moves
+    # every output position to the leading axes and (in_channel, kh, kw)
+    # to the trailing ones, so the final reshape's row-major flatten of
+    # those trailing axes matches w.reshape(n, cin*kh*kw)'s own column
+    # order exactly.
+    patches = np.transpose(windows, (0, 2, 3, 1, 4, 5))
+    return patches.reshape(n_positions, cin * attrs.kh * attrs.kw)
+
+
 def apply_sparsegpt_pruning(
     model: Union[str, onnx.ModelProto],
     calibration_data: Optional[Sequence[Tensors]] = None,
@@ -800,25 +905,22 @@ def apply_sparsegpt_pruning(
     output row within each ``proc_block_size``-wide column block (the
     reference implementation's own behavior), not chosen per row.
 
-    Unlike :func:`apply_magnitude_pruning`/:func:`apply_wanda_pruning`,
-    this function does **not** match Conv layers, on purpose. SparseGPT's
-    correctness rests entirely on ``H`` accurately capturing which columns
-    correlate -- error compensation propagated through a wrong Hessian
-    would actively produce a *worse* result than no compensation at all
-    (i.e. than magnitude pruning), not just a less-precise one. A correct
-    Conv Hessian needs the full ``[K, K]`` cross-covariance of every
-    ``(in_channel, kh, kw)`` receptive-field offset against every other,
-    accumulated from the same im2col-unfolded patch matrix
-    :func:`apply_wanda_pruning` builds per-offset norms from (here,
-    ``patches.T @ patches`` in place of this function's own MatMul/Gemm
-    ``h = x.T @ x``) -- a materially bigger piece of new numerical
-    machinery than Wanda's per-offset norm, and not yet built. Nor is
-    there a correct reference to port: the official implementation's own
-    ``add_batch`` (https://github.com/IST-DASLab/sparsegpt) has no actual
-    im2col unfolding for ``nn.Conv2d`` (that branch handles only the
-    weight reshape; the codebase is only ever exercised on OPT/BLOOM,
-    which have zero Conv layers). Rather than ship an unverified from-
-    scratch Hessian, Conv is left unmatched here for now.
+    Also matches ordinary (``group=1``) 2-D ``Conv`` layers, exactly like
+    :func:`apply_magnitude_pruning`/:func:`apply_wanda_pruning` -- see
+    this module's own docstring for the full ``[K, K]`` im2col
+    cross-covariance Hessian this needed (materially more machinery than
+    Wanda's per-offset norm, and -- unlike everything else this function
+    ports from the reference implementation -- with no correct reference
+    to work from at all: the official implementation's own ``add_batch``
+    (https://github.com/IST-DASLab/sparsegpt) never actually unfolds a
+    ``nn.Conv2d`` activation, only reshapes the *weight*, since its own
+    driver scripts never exercise a Conv layer), how it's verified, and
+    how ``H`` accumulates batch by batch rather than ever materializing
+    every calibration batch's unfolded patches at once. A Conv layer whose
+    ``auto_pad``/``dilations`` aren't a combination
+    :func:`_conv_spatial_attrs` confidently handles is left completely
+    untouched, same as a layer with no observed calibration activation at
+    all -- there is still no data-free fallback for SparseGPT.
 
     :param model: the original onnx ModelProto or file path
     :param calibration_data: representative input batches to compute each
@@ -852,9 +954,12 @@ def apply_sparsegpt_pruning(
     :returns: ``model`` with every matched layer's weight rewritten in
             place to the target pattern -- every surviving entry may also
             change value, having accumulated compensation for entries
-            pruned before it; a layer with no observed 2-D calibration
-            activation (dead input, or every batch's activation isn't
-            plain 2-D/higher-rank-with-a-trailing-feature-axis) is left
+            pruned before it; a MatMul/Gemm layer with no observed 2-D
+            calibration activation (dead input, or every batch's
+            activation isn't plain 2-D/higher-rank-with-a-trailing-
+            feature-axis), or a Conv layer with no observed usable 4-D
+            activation (dead input, or an ``auto_pad``/``dilations``
+            combination :func:`_conv_spatial_attrs` declines), is left
             completely untouched -- unlike Wanda, there is no data-free
             fallback for a technique whose entire mechanism is the Hessian
     """
@@ -871,42 +976,88 @@ def apply_sparsegpt_pruning(
     graph = out.graph
     initializer_map = {t.name: t for t in graph.initializer}
 
-    candidates = _candidates(graph, include_conv=False)
+    candidates = _candidates(graph)
     if not candidates:
         return out
 
     probe_names = sorted({x_name for _, x_name, _, _, _ in candidates})
     probe_model = _add_probe_outputs(out, probe_names)
 
-    activations: Dict[str, List[np.ndarray]] = {name: [] for name in probe_names}
+    # Conv attributes are per-node (two Convs can share an input tensor
+    # with different kernels/strides), so the Conv Hessian below is keyed
+    # by its own weight name, mirroring apply_wanda_pruning's own
+    # conv_attrs/conv_act_norm.
+    conv_attrs: Dict[str, Optional[_ConvSpatialAttrs]] = {
+        w_name: _conv_spatial_attrs(node, initializer_map[w_name])
+        for node, _, w_name, _, is_conv in candidates
+        if is_conv
+    }
+
+    activations: Dict[str, List[np.ndarray]] = {
+        x_name: [] for _, x_name, _, _, is_conv in candidates if not is_conv
+    }
+    # Unlike the MatMul/Gemm activations above (each layer's whole
+    # calibration set concatenated once, below -- small enough per layer
+    # to keep entirely in memory), each Conv layer's H accumulates
+    # incrementally, one calibration batch's own im2col-unfolded patch
+    # matrix at a time: a full [n_positions, K] patch matrix can be large,
+    # so no batch's patches outlive the H += they fold into. See this
+    # module's own docstring.
+    conv_h: Dict[str, np.ndarray] = {}
+
     for batch in calibration_data:
         result = backend.run_model(probe_model, batch, providers=providers)
-        for name in probe_names:
+        for name in activations:
             x = np.asarray(result[name], dtype=np.float64)
             if x.ndim < 2:
                 continue
             activations[name].append(x.reshape(-1, x.shape[-1]))
+        for _, x_name, w_name, _, is_conv in candidates:
+            if not is_conv:
+                continue
+            attrs = conv_attrs[w_name]
+            if attrs is None:
+                continue
+            x_conv = np.asarray(result[x_name], dtype=np.float64)
+            patches = _conv_im2col_patches(x_conv, attrs)
+            if patches is None:
+                continue
+            h_batch = patches.T @ patches
+            conv_h[w_name] = (
+                h_batch if w_name not in conv_h else conv_h[w_name] + h_batch
+            )
 
-    for _, x_name, w_name, weight_transposed, _ in candidates:
-        acts = activations[x_name]
-        if not acts:
-            continue
-        x = np.concatenate(acts, axis=0)
-
+    for _, x_name, w_name, weight_transposed, is_conv in candidates:
         w_init = initializer_map[w_name]
         w = onnx.numpy_helper.to_array(w_init).astype(np.float64)
-        dim0, dim1 = w.shape
-        w_nk = w if weight_transposed else w.T  # [N, K]
-        if x.shape[1] != w_nk.shape[1]:
-            continue
 
-        h = x.T @ x
-        w_pruned_nk = _sparsegpt_prune_columns(
-            w_nk, h, sparsity, n, m, percdamp, proc_block_size
-        )
+        if is_conv:
+            cout, cin, kh, kw = w.shape
+            h = conv_h.get(w_name)
+            if h is None:
+                continue
+            w_nk = w.reshape(cout, cin * kh * kw)
+            w_pruned_nk = _sparsegpt_prune_columns(
+                w_nk, h, sparsity, n, m, percdamp, proc_block_size
+            )
+            w_new = w_pruned_nk.reshape(cout, cin, kh, kw).astype(np.float32)
+        else:
+            acts = activations[x_name]
+            if not acts:
+                continue
+            x = np.concatenate(acts, axis=0)
+            dim0, dim1 = w.shape
+            w_nk = w if weight_transposed else w.T  # [N, K]
+            if x.shape[1] != w_nk.shape[1]:
+                continue
 
-        w_new = w_pruned_nk if weight_transposed else w_pruned_nk.T
-        w_new = w_new.reshape(dim0, dim1).astype(np.float32)
+            h = x.T @ x
+            w_pruned_nk = _sparsegpt_prune_columns(
+                w_nk, h, sparsity, n, m, percdamp, proc_block_size
+            )
+            w_new = w_pruned_nk if weight_transposed else w_pruned_nk.T
+            w_new = w_new.reshape(dim0, dim1).astype(np.float32)
+
         w_init.CopyFrom(onnx.numpy_helper.from_array(w_new, name=w_init.name))
 
     return out

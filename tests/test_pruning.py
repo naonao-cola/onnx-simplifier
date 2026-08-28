@@ -501,15 +501,24 @@ def test_wanda_pruning_conv_falls_back_to_magnitude_for_dilated_conv():
     )
 
 
-def test_sparsegpt_pruning_leaves_conv_layers_completely_untouched():
-    # apply_sparsegpt_pruning deliberately does not match Conv (see its own
-    # docstring for why): a correct-but-unverified from-scratch im2col
-    # Hessian was judged worse to ship than none at all.
-    Cin, Cout, spatial = 4, 8, 10
+def test_sparsegpt_pruning_conv_skips_grouped_conv():
+    # A depthwise Conv (group == in_channels == out_channels) is left
+    # completely untouched -- apply_sparsegpt_pruning reuses _candidates()'s
+    # own group=1 matching, so this is the same restriction
+    # test_magnitude_pruning_skips_grouped_conv already exercises.
+    C = 8
     rng = np.random.default_rng(76)
-    w = rng.standard_normal((Cout, Cin, 3, 3)).astype(np.float32)
-    model = _single_conv_model(w, spatial=spatial)
-    x_cal = rng.standard_normal((2, Cin, spatial, spatial)).astype(np.float32)
+    w = rng.standard_normal((C, 1, 3, 3)).astype(np.float32)
+    model = _model(
+        f"""
+        g (float[N,{C},10,10] X) => (float[N,{C},8,8] Y)
+        {{
+          Y = Conv<kernel_shape=[3,3], group={C}>(X, W1)
+        }}
+        """,
+        initializer=[_f32(w, "W1")],
+    )
+    x_cal = rng.standard_normal((4, C, 10, 10)).astype(np.float32)
 
     pruned = onnxsim.apply_sparsegpt_pruning(
         model, calibration_data=[{"X": x_cal}], sparsity=0.5
@@ -682,6 +691,299 @@ def test_sparsegpt_pruning_requires_n_and_m_together():
         onnxsim.apply_sparsegpt_pruning(model, n=2)
     with pytest.raises(ValueError):
         onnxsim.apply_sparsegpt_pruning(model, m=4)
+
+
+# --- apply_sparsegpt_pruning: Conv2D ------------------------------------
+
+
+def _naive_conv_patch_hessian(x, attrs):
+    # Slow, obviously-correct nested-loop reference for the full [K, K]
+    # im2col cross-covariance Hessian SparseGPT's Conv support needs --
+    # built a completely different way from
+    # onnxsim.pruning._conv_im2col_patches's own sliding_window_view-based
+    # implementation (an explicit outer-product accumulation per output
+    # position instead of any vectorized unfolding), the same bar
+    # _naive_conv_patch_sq_sum already set for Wanda's diagonal-only
+    # per-offset norm above.
+    n, cin, h, w = x.shape
+    xp = np.pad(
+        x,
+        (
+            (0, 0),
+            (0, 0),
+            (attrs.pad_top, attrs.pad_bottom),
+            (attrs.pad_left, attrs.pad_right),
+        ),
+    )
+    hp, wp = xp.shape[2], xp.shape[3]
+    h_out = (hp - attrs.kh) // attrs.stride_h + 1
+    w_out = (wp - attrs.kw) // attrs.stride_w + 1
+    k = cin * attrs.kh * attrs.kw
+    hessian = np.zeros((k, k), dtype=np.float64)
+    count = 0
+    for ni in range(n):
+        for oh in range(h_out):
+            for ow in range(w_out):
+                patch = np.zeros(k, dtype=np.float64)
+                idx = 0
+                for c in range(cin):
+                    for i in range(attrs.kh):
+                        for j in range(attrs.kw):
+                            patch[idx] = xp[
+                                ni, c, oh * attrs.stride_h + i, ow * attrs.stride_w + j
+                            ]
+                            idx += 1
+                hessian += np.outer(patch, patch)
+                count += 1
+    return hessian, count
+
+
+def test_sparsegpt_conv_hessian_matches_naive_nested_loop_oracle():
+    from onnxsim.pruning import _conv_im2col_patches, _ConvSpatialAttrs
+
+    rng = np.random.default_rng(90)
+    x = rng.standard_normal((2, 3, 4, 4))
+    cases = [
+        _ConvSpatialAttrs(
+            kh=3,
+            kw=3,
+            pad_top=1,
+            pad_left=1,
+            pad_bottom=1,
+            pad_right=1,
+            stride_h=2,
+            stride_w=2,
+        ),
+        _ConvSpatialAttrs(
+            kh=2,
+            kw=2,
+            pad_top=0,
+            pad_left=0,
+            pad_bottom=0,
+            pad_right=0,
+            stride_h=1,
+            stride_w=1,
+        ),
+        _ConvSpatialAttrs(
+            kh=3,
+            kw=3,
+            pad_top=0,
+            pad_left=2,
+            pad_bottom=1,
+            pad_right=0,
+            stride_h=1,
+            stride_w=2,
+        ),
+    ]
+    for attrs in cases:
+        patches = _conv_im2col_patches(x, attrs)
+        h_vec = patches.T @ patches
+        h_naive, count_naive = _naive_conv_patch_hessian(x, attrs)
+        assert patches.shape[0] == count_naive
+        np.testing.assert_allclose(h_vec, h_naive)
+
+
+def test_sparsegpt_pruning_conv_matches_reference_transliteration_exactly():
+    # End-to-end correctness: an independent nested-loop patch unfold (not
+    # onnxsim.pruning._conv_im2col_patches) feeds the *reference*
+    # SparseGPT transliteration (_reference_sparsegpt, already validated
+    # against the MatMul/Gemm path above) to build an expected Conv
+    # weight, entirely independent of onnxsim's own Conv Hessian/pruning
+    # code -- two independently-built pieces must agree with onnxsim's
+    # actual output before this is trusted.
+    Cin, Cout, kh, kw, spatial = 3, 6, 3, 3, 8
+    rng = np.random.default_rng(91)
+    w = rng.standard_normal((Cout, Cin, kh, kw)).astype(np.float32) * 0.5
+    model = _single_conv_model(w, spatial=spatial)
+    rng_x = np.random.default_rng(92)
+    x = rng_x.standard_normal((3, Cin, spatial, spatial)).astype(np.float32)
+
+    pruned = onnxsim.apply_sparsegpt_pruning(
+        model, calibration_data=[{"X": x}], sparsity=0.5, proc_block_size=12
+    )
+    onnx.checker.check_model(pruned)
+
+    out_spatial = spatial - kh + 1
+    K = Cin * kh * kw
+    patches = np.zeros((x.shape[0] * out_spatial * out_spatial, K), dtype=np.float64)
+    idx = 0
+    for ni in range(x.shape[0]):
+        for oh in range(out_spatial):
+            for ow in range(out_spatial):
+                patch = x[ni, :, oh : oh + kh, ow : ow + kw].astype(np.float64)
+                patches[idx] = patch.reshape(-1)
+                idx += 1
+    h = patches.T @ patches
+
+    w_nk = w.astype(np.float64).reshape(Cout, K)
+    expected_nk = _reference_sparsegpt(
+        w_nk, h, sparsity=0.5, n=None, m=None, percdamp=0.01, blocksize=12
+    )
+    expected = expected_nk.reshape(Cout, Cin, kh, kw)
+    np.testing.assert_allclose(
+        _conv_weight(pruned).astype(np.float64), expected, rtol=1e-6, atol=1e-6
+    )
+
+
+def test_sparsegpt_pruning_conv_nm_pattern_matches_reference_transliteration():
+    Cin, Cout, kh, kw, spatial = 4, 8, 3, 3, 8
+    rng = np.random.default_rng(93)
+    w = rng.standard_normal((Cout, Cin, kh, kw)).astype(np.float32) * 0.5
+    model = _single_conv_model(w, spatial=spatial)
+    rng_x = np.random.default_rng(94)
+    x = rng_x.standard_normal((3, Cin, spatial, spatial)).astype(np.float32)
+
+    pruned = onnxsim.apply_sparsegpt_pruning(
+        model, calibration_data=[{"X": x}], n=2, m=4, proc_block_size=12
+    )
+    onnx.checker.check_model(pruned)
+
+    out_spatial = spatial - kh + 1
+    K = Cin * kh * kw
+    patches = np.zeros((x.shape[0] * out_spatial * out_spatial, K), dtype=np.float64)
+    idx = 0
+    for ni in range(x.shape[0]):
+        for oh in range(out_spatial):
+            for ow in range(out_spatial):
+                patch = x[ni, :, oh : oh + kh, ow : ow + kw].astype(np.float64)
+                patches[idx] = patch.reshape(-1)
+                idx += 1
+    h = patches.T @ patches
+
+    w_nk = w.astype(np.float64).reshape(Cout, K)
+    expected_nk = _reference_sparsegpt(
+        w_nk, h, sparsity=0.0, n=2, m=4, percdamp=0.01, blocksize=12
+    )
+    expected = expected_nk.reshape(Cout, Cin, kh, kw)
+    np.testing.assert_allclose(
+        _conv_weight(pruned).astype(np.float64), expected, rtol=1e-6, atol=1e-6
+    )
+
+    w_flat = _conv_weight(pruned).reshape(Cout, K)
+    for row in w_flat:
+        for start in range(0, len(row), 4):
+            group = row[start : start + 4]
+            if len(group) == 4:
+                assert np.count_nonzero(group) == 2
+
+
+def test_sparsegpt_pruning_conv_reaches_target_sparsity():
+    # Unlike magnitude/Wanda's exact per-row quantile, SparseGPT's
+    # block-shared threshold (this module's own docstring) picks the
+    # target-index order statistic and keeps every entry <= it, so a tied
+    # threshold value can round the actual count up slightly -- checked
+    # with a small tolerance instead of exact equality, the same
+    # "shared per-block, not per-row" caveat the MatMul/Gemm path already
+    # documents.
+    Cin, Cout, spatial = 4, 8, 10
+    rng = np.random.default_rng(95)
+    w = rng.standard_normal((Cout, Cin, 3, 3)).astype(np.float32) * 0.5
+    model = _single_conv_model(w, spatial=spatial)
+    x_cal = rng.standard_normal((16, Cin, spatial, spatial)).astype(np.float32)
+
+    pruned = onnxsim.apply_sparsegpt_pruning(
+        model, calibration_data=[{"X": x_cal}], sparsity=0.5
+    )
+    onnx.checker.check_model(pruned)
+    assert onnxsim.weight_sparsity(pruned) == pytest.approx(0.5, abs=0.02)
+
+
+def test_sparsegpt_pruning_conv_zero_sparsity_is_a_no_op():
+    Cin, Cout, spatial = 4, 8, 10
+    rng = np.random.default_rng(96)
+    w = rng.standard_normal((Cout, Cin, 3, 3)).astype(np.float32)
+    model = _single_conv_model(w, spatial=spatial)
+    x_cal = rng.standard_normal((8, Cin, spatial, spatial)).astype(np.float32)
+
+    pruned = onnxsim.apply_sparsegpt_pruning(
+        model, calibration_data=[{"X": x_cal}], sparsity=0.0
+    )
+    np.testing.assert_array_equal(_conv_weight(pruned), w)
+
+
+def test_sparsegpt_pruning_conv_no_calibration_batches_leaves_layer_untouched():
+    Cin, Cout, spatial = 4, 8, 10
+    rng = np.random.default_rng(97)
+    w = rng.standard_normal((Cout, Cin, 3, 3)).astype(np.float32)
+    model = _single_conv_model(w, spatial=spatial)
+
+    pruned = onnxsim.apply_sparsegpt_pruning(model, calibration_data=[], sparsity=0.5)
+    np.testing.assert_array_equal(_conv_weight(pruned), w)
+
+
+def test_sparsegpt_pruning_conv_declines_auto_pad():
+    # auto_pad SAME_UPPER's padding depends on the input's own spatial
+    # size -- _conv_spatial_attrs declines it, so (unlike Wanda, which
+    # falls back to plain magnitude) SparseGPT must leave the layer
+    # completely untouched: there is no data-free fallback here.
+    Cin, Cout, spatial = 3, 6, 10
+    rng = np.random.default_rng(98)
+    w = rng.standard_normal((Cout, Cin, 3, 3)).astype(np.float32)
+    model = _single_conv_model(
+        w, spatial=spatial, extra_attrs='auto_pad="SAME_UPPER"', out_spatial=spatial
+    )
+    x_cal = rng.standard_normal((4, Cin, spatial, spatial)).astype(np.float32)
+
+    pruned = onnxsim.apply_sparsegpt_pruning(
+        model, calibration_data=[{"X": x_cal}], sparsity=0.5
+    )
+    np.testing.assert_array_equal(_conv_weight(pruned), w)
+
+
+def test_sparsegpt_pruning_conv_declines_dilated_conv():
+    # A dilated receptive field's (kh, kw) offsets aren't evenly spaced in
+    # the padded input the way sliding_window_view assumes --
+    # _conv_spatial_attrs declines non-all-ones dilations, so this layer
+    # is left completely untouched too.
+    Cin, Cout, spatial = 3, 6, 10
+    rng = np.random.default_rng(99)
+    w = rng.standard_normal((Cout, Cin, 3, 3)).astype(np.float32)
+    out_spatial = spatial - 2 * (3 - 1)  # dilation=2, kernel=3, no padding
+    model = _single_conv_model(
+        w, spatial=spatial, extra_attrs="dilations=[2,2]", out_spatial=out_spatial
+    )
+    x_cal = rng.standard_normal((4, Cin, spatial, spatial)).astype(np.float32)
+
+    pruned = onnxsim.apply_sparsegpt_pruning(
+        model, calibration_data=[{"X": x_cal}], sparsity=0.5
+    )
+    np.testing.assert_array_equal(_conv_weight(pruned), w)
+
+
+def test_sparsegpt_pruning_conv_reconstructs_better_than_a_same_mask_style_baseline():
+    # The Conv analogue of
+    # test_sparsegpt_pruning_reconstructs_better_than_a_same_mask_style_baseline:
+    # given comparable calibration signal, SparseGPT's Hessian-compensated
+    # Conv weight should reconstruct the layer's real (onnxruntime) output
+    # at least as well as naively zeroing the same-shaped lowest-magnitude
+    # entries with no compensation at all.
+    Cin, Cout, spatial = 4, 8, 10
+    rng = np.random.default_rng(100)
+    w = rng.standard_normal((Cout, Cin, 3, 3)).astype(np.float32) * 0.5
+    model = _single_conv_model(w, spatial=spatial)
+    # Well-conditioned H: n_positions = 16*8*8 = 1024 >> K = 4*3*3 = 36.
+    x_cal = rng.standard_normal((16, Cin, spatial, spatial)).astype(np.float32)
+
+    pruned = onnxsim.apply_sparsegpt_pruning(
+        model, calibration_data=[{"X": x_cal}], sparsity=0.5
+    )
+    onnx.checker.check_model(pruned)
+
+    K = Cin * 3 * 3
+    w64 = w.astype(np.float64).reshape(Cout, K)
+    score = np.abs(w64)
+    thresh = np.sort(score.flatten())[int(score.size * 0.5)]
+    w_naive = np.where(score <= thresh, 0.0, w64).reshape(Cout, Cin, 3, 3)
+    naive_model = _single_conv_model(w_naive.astype(np.float32), spatial=spatial)
+
+    (float_y,) = _run(model, {"X": x_cal})
+    (sparsegpt_y,) = _run(pruned, {"X": x_cal})
+    (naive_y,) = _run(naive_model, {"X": x_cal})
+    err_sparsegpt = np.sum(
+        (float_y.astype(np.float64) - sparsegpt_y.astype(np.float64)) ** 2
+    )
+    err_naive = np.sum((float_y.astype(np.float64) - naive_y.astype(np.float64)) ** 2)
+    assert err_sparsegpt <= err_naive
 
 
 # --- apply_structured_pruning ------------------------------------------------
