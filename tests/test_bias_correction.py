@@ -15,9 +15,9 @@ particular quantize_* scheme happens to leave a large enough bias to see.
 
 import numpy as np
 import onnx
-import onnx.helper
 import onnx.numpy_helper
 import pytest
+from onnx import parser
 
 import onnxsim
 from onnxsim import backend
@@ -25,8 +25,18 @@ from onnxsim import backend
 ort = pytest.importorskip("onnxruntime")
 
 
-def _vi(name, shape):
-    return onnx.helper.make_tensor_value_info(name, onnx.TensorProto.FLOAT, shape)
+def _model(body, initializer=(), opset=13, ir_version=8):
+    model = parser.parse_model(
+        f"""
+        <
+          ir_version: {ir_version},
+          opset_import: ["": {opset}]
+        >
+        {body}
+        """
+    )
+    model.graph.initializer.extend(initializer)
+    return model
 
 
 def _f32(array, name):
@@ -34,37 +44,29 @@ def _f32(array, name):
 
 
 def _gemm_model(w, b, K, N, batch=4):
-    nodes = [onnx.helper.make_node("Gemm", ["x", "w", "b"], ["y"])]
-    inits = [_f32(w, "w"), _f32(b, "b")]
-    graph = onnx.helper.make_graph(
-        nodes, "g", [_vi("x", [batch, K])], [_vi("y", [batch, N])], inits
+    return _model(
+        f"""
+        g (float[{batch},{K}] x) => (float[{batch},{N}] y)
+        {{
+          y = Gemm(x, w, b)
+        }}
+        """,
+        initializer=[_f32(w, "w"), _f32(b, "b")],
+        opset=17,
     )
-    model = onnx.helper.make_model(
-        graph, opset_imports=[onnx.helper.make_opsetid("", 17)], ir_version=8
-    )
-    onnx.checker.check_model(model)
-    return model
 
 
 def _conv_model(w, b, c_in, c_out, batch=1, spatial=8):
-    nodes = [
-        onnx.helper.make_node(
-            "Conv", ["x", "w", "b"], ["y"], kernel_shape=[3, 3], pads=[1, 1, 1, 1]
-        )
-    ]
-    inits = [_f32(w, "w"), _f32(b, "b")]
-    graph = onnx.helper.make_graph(
-        nodes,
-        "g",
-        [_vi("x", [batch, c_in, spatial, spatial])],
-        [_vi("y", [batch, c_out, spatial, spatial])],
-        inits,
+    return _model(
+        f"""
+        g (float[{batch},{c_in},{spatial},{spatial}] x) => (float[{batch},{c_out},{spatial},{spatial}] y)
+        {{
+          y = Conv<kernel_shape = [3, 3], pads = [1, 1, 1, 1]>(x, w, b)
+        }}
+        """,
+        initializer=[_f32(w, "w"), _f32(b, "b")],
+        opset=13,
     )
-    model = onnx.helper.make_model(
-        graph, opset_imports=[onnx.helper.make_opsetid("", 13)], ir_version=8
-    )
-    onnx.checker.check_model(model)
-    return model
 
 
 def test_correct_bias_recovers_known_injected_gemm_bias():
@@ -168,12 +170,13 @@ def test_correct_bias_is_a_noop_when_quantized_model_is_identical():
 
 
 def test_correct_bias_is_a_noop_on_a_model_with_no_candidate_ops():
-    x = _vi("x", [2, 4])
-    y = _vi("y", [2, 4])
-    node = onnx.helper.make_node("Relu", ["x"], ["y"])
-    graph = onnx.helper.make_graph([node], "g", [x], [y], [])
-    model = onnx.helper.make_model(
-        graph, opset_imports=[onnx.helper.make_opsetid("", 13)], ir_version=8
+    model = _model(
+        """
+        g (float[2,4] x) => (float[2,4] y)
+        {
+          y = Relu(x)
+        }
+        """
     )
 
     corrected = onnxsim.correct_bias(model, model)
