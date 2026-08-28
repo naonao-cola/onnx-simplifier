@@ -23,7 +23,7 @@ import collections
 import numpy as np
 import onnx
 import pytest
-from onnx import helper
+from onnx import parser
 
 import onnxsim
 
@@ -100,8 +100,22 @@ def _f32(array, name):
     return onnx.numpy_helper.from_array(array.astype(np.float32), name)
 
 
-def _vi(name, shape):
-    return helper.make_tensor_value_info(name, onnx.TensorProto.FLOAT, shape)
+def _model(body, initializer=(), opset=18, ir_version=10):
+    # `body` is the ONNX text form graph declaration (and, optionally, its own
+    # inline literal initializers); `initializer` holds extra TensorProtos --
+    # e.g. random weights -- attached after parsing rather than spelled out as
+    # text literals.
+    model = parser.parse_model(
+        f"""
+        <
+          ir_version: {ir_version},
+          opset_import: ["": {opset}]
+        >
+        {body}
+        """
+    )
+    model.graph.initializer.extend(initializer)
+    return model
 
 
 def test_script_to_function_proto_shape():
@@ -116,16 +130,18 @@ def test_script_to_function_proto_shape():
 
 def test_script_matmul_add_to_gemm():
     def build():
-        nodes = [
-            helper.make_node("MatMul", ["x", "W"], ["mm"]),
-            helper.make_node("Add", ["mm", "B"], ["y"]),
-        ]
-        inits = [_f32(np.random.randn(4, 5), "W"), _f32(np.random.randn(5), "B")]
-        graph = helper.make_graph(
-            nodes, "g", [_vi("x", [3, 4])], [_vi("y", [3, 5])], inits
-        )
-        return helper.make_model(
-            graph, opset_imports=[helper.make_opsetid("", 18)], ir_version=10
+        return _model(
+            """
+            g (float[3,4] x) => (float[3,5] y)
+            {
+              mm = MatMul(x, W)
+              y = Add(mm, B)
+            }
+            """,
+            initializer=[
+                _f32(np.random.randn(4, 5), "W"),
+                _f32(np.random.randn(5), "B"),
+            ],
         )
 
     # onnxsim applies the @script-authored rule (built-in Gemm fusion skipped so
@@ -148,19 +164,15 @@ def test_script_matmul_add_to_gemm():
 
 def test_script_reshape_reshape():
     def build():
-        nodes = [
-            helper.make_node("Reshape", ["x", "s1"], ["t"]),
-            helper.make_node("Reshape", ["t", "s2"], ["y"]),
-        ]
-        inits = [
-            onnx.numpy_helper.from_array(np.array([2, 12], dtype=np.int64), "s1"),
-            onnx.numpy_helper.from_array(np.array([4, 6], dtype=np.int64), "s2"),
-        ]
-        graph = helper.make_graph(
-            nodes, "g", [_vi("x", [3, 8])], [_vi("y", [4, 6])], inits
-        )
-        return helper.make_model(
-            graph, opset_imports=[helper.make_opsetid("", 18)], ir_version=10
+        return _model(
+            """
+            g (float[3,8] x) => (float[4,6] y)
+            <int64[2] s1 = {2, 12}, int64[2] s2 = {4, 6}>
+            {
+              t = Reshape(x, s1)
+              y = Reshape(t, s2)
+            }
+            """
         )
 
     ours, check_ok = onnxsim.simplify(
@@ -180,19 +192,14 @@ def test_script_attribute_wildcard():
     matched ``LeakyRelu``'s ``alpha`` and substitutes it into the replacement,
     dropping the ``Relu``. (Structural demo -- not semantics preserving, so no
     correctness check.)"""
-    model = helper.make_model(
-        helper.make_graph(
-            [
-                helper.make_node("Relu", ["x"], ["t"], name="relu"),
-                helper.make_node("LeakyRelu", ["t"], ["y"], alpha=0.2, name="lr"),
-            ],
-            "g",
-            [_vi("x", [2, 2])],
-            [_vi("y", [2, 2])],
-            [],
-        ),
-        opset_imports=[helper.make_opsetid("", 18)],
-        ir_version=10,
+    model = _model(
+        """
+        g (float[2,2] x) => (float[2,2] y)
+        {
+          t = Relu(x)
+          y = LeakyRelu<alpha = 0.2>(t)
+        }
+        """
     )
     ours, _ = onnxsim.simplify(
         model, check_n=0, function_rewrite_rules=[_RELU_LEAKY_RULE]
