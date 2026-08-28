@@ -33,7 +33,7 @@ def export_simplify_and_check_by_python_api(
     with tempfile.TemporaryDirectory() as tmpdirname:
         model_fn = os.path.join(tmpdirname, "tmp.onnx")
         torch.onnx.export(m, input, model_fn, **export_kwargs)
-        model = onnx.load(model_fn)
+        model = onnx.load(model_fn, load_external_data=False)
         if not is_model_valid(model):
             raise AssertionError(f"model is invalid:\n{model}")
         # read the model from filesystem to support >2GB large model
