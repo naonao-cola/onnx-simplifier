@@ -60,7 +60,7 @@ jobs:
       background: true
       run: |
         pip install torch==2.10.0 torchvision==0.25.0 --index-url https://download.pytorch.org/whl/cpu/
-        pip install flake8 onnxruntime onnxscript==0.6.2 timm==1.0.26
+        pip install flake8 onnxruntime onnxscript==0.6.2 timm==1.0.26 sympy onnx-shape-inference
 
     - name: Build instrumented extension (editable)
       run: pip install --no-build-isolation -ve .

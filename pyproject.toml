@@ -35,6 +35,12 @@ onnxruntime = ["onnxruntime >= 1.6.0"]
 # sympy lets the MACs/FLOPs report keep dynamic dimensions (dim_param, e.g.
 # "batch") as symbols and produce a formula instead of assuming them to be 1.
 symbolic = ["sympy"]
+# onnx-shape-inference (https://github.com/justinchuby/onnx-shape-inference) is
+# used by ModelInfo (the MACs/FLOPs/memory report) as a drop-in replacement for
+# onnx.shape_inference when installed: it resolves more shapes via symbolic
+# data propagation, so fewer nodes fall back to contributing 0. Falls back to
+# onnx.shape_inference when it is not installed.
+shape-inference = ["onnx-shape-inference"]
 # Needed by onnxsim.profile_plot.plot_node_reduction() / --node-reduction-plot,
 # which renders the "NodeCount" events in a simplify(..., profile=...) trace.
 plot = ["matplotlib"]
