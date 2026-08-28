@@ -202,6 +202,321 @@ def test_weight_sparsity_ignores_non_matching_layers():
     assert onnxsim.weight_sparsity(model) == 0.0
 
 
+# --- magnitude/Wanda pruning: Conv2D -------------------------------------
+
+
+def _single_conv_model(w, spatial=10, extra_attrs="", out_spatial=None):
+    Cout, Cin, kh, kw = w.shape
+    if out_spatial is None:
+        out_spatial = spatial - kh + 1  # no padding, unit stride
+    attrs = f"kernel_shape=[{kh},{kw}]"
+    if extra_attrs:
+        attrs += ", " + extra_attrs
+    return _model(
+        f"""
+        g (float[N,{Cin},{spatial},{spatial}] X) => (float[N,{Cout},{out_spatial},{out_spatial}] Y)
+        {{
+          Y = Conv<{attrs}>(X, W1)
+        }}
+        """,
+        initializer=[_f32(w, "W1")],
+    )
+
+
+def _conv_weight(model):
+    return onnx.numpy_helper.to_array(model.graph.initializer[0])
+
+
+def test_magnitude_pruning_conv_reaches_target_sparsity():
+    Cin, Cout = 4, 8  # K = Cin*3*3 = 36, evenly halved by sparsity=0.5
+    rng = np.random.default_rng(60)
+    w = rng.standard_normal((Cout, Cin, 3, 3)).astype(np.float32)
+    model = _single_conv_model(w)
+
+    pruned = onnxsim.apply_magnitude_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    assert onnxsim.weight_sparsity(pruned) == pytest.approx(0.5, abs=1e-9)
+    assert _conv_weight(pruned).shape == w.shape
+
+
+def test_magnitude_pruning_conv_keeps_the_largest_entries_per_filter():
+    Cin, Cout = 4, 8
+    rng = np.random.default_rng(61)
+    w = rng.standard_normal((Cout, Cin, 3, 3)).astype(np.float32) * 0.5
+    model = _single_conv_model(w)
+
+    pruned = onnxsim.apply_magnitude_pruning(model, sparsity=0.75)
+    K = Cin * 3 * 3
+    w_flat = w.astype(np.float64).reshape(Cout, K)
+    w_pruned_flat = _conv_weight(pruned).astype(np.float64).reshape(Cout, K)
+    keep_count = round(K * 0.25)
+    for row in range(Cout):
+        kept = np.flatnonzero(w_pruned_flat[row] != 0)
+        assert len(kept) == keep_count
+        threshold = np.abs(w_flat[row])[kept].min()
+        dropped_max = np.abs(w_flat[row])[np.flatnonzero(w_pruned_flat[row] == 0)].max()
+        assert dropped_max <= threshold
+
+
+def test_magnitude_pruning_conv_nm_pattern():
+    Cin, Cout = 4, 8
+    rng = np.random.default_rng(62)
+    w = rng.standard_normal((Cout, Cin, 3, 3)).astype(np.float32)
+    model = _single_conv_model(w)
+
+    pruned = onnxsim.apply_magnitude_pruning(model, n=2, m=4)
+    K = Cin * 3 * 3
+    w_flat = _conv_weight(pruned).reshape(Cout, K)
+    assert onnxsim.weight_sparsity(pruned) == pytest.approx(0.5, abs=1e-9)
+    for row in w_flat:
+        for start in range(0, len(row), 4):
+            group = row[start : start + 4]
+            assert np.count_nonzero(group) <= 2
+
+
+def test_magnitude_pruning_skips_grouped_conv():
+    # A depthwise Conv (group == in_channels == out_channels) is left
+    # completely untouched -- the same restriction the Conv2D structured
+    # pruning section's own producer/consumer matching draws (see
+    # :func:`_match_conv_weight_only`'s own docstring).
+    C = 8
+    rng = np.random.default_rng(63)
+    w = rng.standard_normal((C, 1, 3, 3)).astype(np.float32)
+    model = _model(
+        f"""
+        g (float[N,{C},10,10] X) => (float[N,{C},8,8] Y)
+        {{
+          Y = Conv<kernel_shape=[3,3], group={C}>(X, W1)
+        }}
+        """,
+        initializer=[_f32(w, "W1")],
+    )
+    pruned = onnxsim.apply_magnitude_pruning(model, sparsity=0.5)
+    np.testing.assert_array_equal(_conv_weight(pruned), w)
+
+
+def _naive_conv_patch_sq_sum(x, attrs):
+    # Slow, obviously-correct nested-loop reference for the per-``(in_
+    # channel, kh, kw)`` offset activation statistic Wanda needs for Conv
+    # -- the oracle :func:`onnxsim.pruning._conv_patch_sq_sum`'s own
+    # ``sliding_window_view``-based implementation is checked against
+    # below, before it's ever trusted inside the actual pruning path.
+    n, cin, h, w = x.shape
+    xp = np.pad(
+        x,
+        (
+            (0, 0),
+            (0, 0),
+            (attrs.pad_top, attrs.pad_bottom),
+            (attrs.pad_left, attrs.pad_right),
+        ),
+    )
+    hp, wp = xp.shape[2], xp.shape[3]
+    h_out = (hp - attrs.kh) // attrs.stride_h + 1
+    w_out = (wp - attrs.kw) // attrs.stride_w + 1
+    sq = np.zeros((cin, attrs.kh, attrs.kw), dtype=np.float64)
+    count = 0
+    for ni in range(n):
+        for oh in range(h_out):
+            for ow in range(w_out):
+                count += 1
+                for c in range(cin):
+                    for i in range(attrs.kh):
+                        for j in range(attrs.kw):
+                            val = xp[
+                                ni, c, oh * attrs.stride_h + i, ow * attrs.stride_w + j
+                            ]
+                            sq[c, i, j] += val * val
+    return sq, count
+
+
+def test_conv_patch_sq_sum_matches_naive_nested_loop_oracle():
+    from onnxsim.pruning import _conv_patch_sq_sum, _ConvSpatialAttrs
+
+    rng = np.random.default_rng(70)
+    x = rng.standard_normal((2, 3, 4, 4))
+    cases = [
+        _ConvSpatialAttrs(
+            kh=3,
+            kw=3,
+            pad_top=1,
+            pad_left=1,
+            pad_bottom=1,
+            pad_right=1,
+            stride_h=2,
+            stride_w=2,
+        ),
+        _ConvSpatialAttrs(
+            kh=2,
+            kw=2,
+            pad_top=0,
+            pad_left=0,
+            pad_bottom=0,
+            pad_right=0,
+            stride_h=1,
+            stride_w=1,
+        ),
+        _ConvSpatialAttrs(
+            kh=3,
+            kw=3,
+            pad_top=0,
+            pad_left=2,
+            pad_bottom=1,
+            pad_right=0,
+            stride_h=1,
+            stride_w=2,
+        ),
+    ]
+    for attrs in cases:
+        sq_vec, count_vec = _conv_patch_sq_sum(x, attrs)
+        sq_naive, count_naive = _naive_conv_patch_sq_sum(x, attrs)
+        assert count_vec == count_naive
+        np.testing.assert_allclose(sq_vec, sq_naive)
+
+
+def test_wanda_pruning_conv_matches_manual_im2col_importance_oracle_exactly():
+    # Same correctness bar as the MatMul/Gemm Wanda tests, but the oracle's
+    # activation norm is computed by manually unfolding X into overlapping
+    # kh*kw patches (a second, independent im2col implementation from the
+    # one under test, see :func:`onnxsim.pruning._conv_patch_sq_sum`) and
+    # reducing over batch and every output position.
+    Cin, Cout, kh, kw, spatial = 3, 6, 3, 3, 8
+    rng = np.random.default_rng(72)
+    w = rng.standard_normal((Cout, Cin, kh, kw)).astype(np.float32)
+    model = _single_conv_model(w, spatial=spatial)
+
+    rng_x = np.random.default_rng(73)
+    x = rng_x.standard_normal((3, Cin, spatial, spatial)).astype(np.float32)
+
+    pruned = onnxsim.apply_wanda_pruning(
+        model, calibration_data=[{"X": x}], sparsity=0.5
+    )
+    onnx.checker.check_model(pruned)
+
+    out_spatial = spatial - kh + 1
+    K = Cin * kh * kw
+    patches = np.zeros((x.shape[0] * out_spatial * out_spatial, K), dtype=np.float64)
+    idx = 0
+    for ni in range(x.shape[0]):
+        for oh in range(out_spatial):
+            for ow in range(out_spatial):
+                patch = x[ni, :, oh : oh + kh, ow : ow + kw].astype(np.float64)
+                patches[idx] = patch.reshape(-1)
+                idx += 1
+    act_norm = np.sqrt(np.mean(np.square(patches), axis=0))
+
+    w_flat = w.astype(np.float64).reshape(Cout, K)
+    importance = np.abs(w_flat) * act_norm[np.newaxis, :]
+    keep = round(K * 0.5)
+    order = np.argsort(importance, axis=1)
+    drop = order[:, : K - keep]
+    mask = np.ones((Cout, K), dtype=bool)
+    np.put_along_axis(mask, drop, False, axis=1)
+    expected = np.where(mask, w_flat, 0.0).reshape(Cout, Cin, kh, kw)
+
+    np.testing.assert_allclose(_conv_weight(pruned).astype(np.float64), expected)
+
+
+def test_wanda_pruning_conv_protects_high_activation_channel():
+    # Same motivating scenario as the MatMul Wanda test: one input channel
+    # carries much larger activation magnitude than the rest, but a
+    # merely-average weight magnitude -- Wanda's per-offset activation
+    # norm (rolled up here to a whole input channel, since every (kh, kw)
+    # offset of that channel gets boosted identically) should protect it
+    # more than plain |W| magnitude pruning does.
+    Cin, Cout, spatial = 3, 8, 10
+    salient_channel = 1
+    rng = np.random.default_rng(71)
+    w = rng.standard_normal((Cout, Cin, 3, 3)).astype(np.float32) * 0.5
+    model = _single_conv_model(w, spatial=spatial)
+
+    x = rng.standard_normal((4, Cin, spatial, spatial)).astype(np.float32)
+    x[:, salient_channel, :, :] *= 20.0
+    calibration_data = [{"X": x}]
+
+    magnitude_pruned = onnxsim.apply_magnitude_pruning(model, sparsity=0.5)
+    wanda_pruned = onnxsim.apply_wanda_pruning(
+        model, calibration_data=calibration_data, sparsity=0.5
+    )
+    onnx.checker.check_model(wanda_pruned)
+
+    w_magnitude = _conv_weight(magnitude_pruned)
+    w_wanda = _conv_weight(wanda_pruned)
+    salient_kept_magnitude = np.count_nonzero(w_magnitude[:, salient_channel, :, :])
+    salient_kept_wanda = np.count_nonzero(w_wanda[:, salient_channel, :, :])
+    assert salient_kept_wanda > salient_kept_magnitude
+
+    (float_y,) = _run(model, {"X": x})
+    (magnitude_y,) = _run(magnitude_pruned, {"X": x})
+    (wanda_y,) = _run(wanda_pruned, {"X": x})
+    magnitude_err = np.linalg.norm(float_y.astype(np.float64) - magnitude_y)
+    wanda_err = np.linalg.norm(float_y.astype(np.float64) - wanda_y)
+    assert wanda_err < magnitude_err
+
+
+def test_wanda_pruning_conv_falls_back_to_magnitude_for_auto_pad():
+    # auto_pad SAME_UPPER's padding depends on the input's own spatial
+    # size, not something fixed per node -- :func:`_conv_spatial_attrs`
+    # declines it, so Wanda must fall back to plain magnitude for this
+    # layer rather than guessing at the padding.
+    Cin, Cout, spatial = 3, 6, 10
+    rng = np.random.default_rng(74)
+    w = rng.standard_normal((Cout, Cin, 3, 3)).astype(np.float32)
+    model = _single_conv_model(
+        w, spatial=spatial, extra_attrs='auto_pad="SAME_UPPER"', out_spatial=spatial
+    )
+    x = rng.standard_normal((2, Cin, spatial, spatial)).astype(np.float32)
+
+    magnitude_pruned = onnxsim.apply_magnitude_pruning(model, sparsity=0.5)
+    wanda_pruned = onnxsim.apply_wanda_pruning(
+        model, calibration_data=[{"X": x}], sparsity=0.5
+    )
+    onnx.checker.check_model(wanda_pruned)
+    np.testing.assert_array_equal(
+        _conv_weight(wanda_pruned), _conv_weight(magnitude_pruned)
+    )
+
+
+def test_wanda_pruning_conv_falls_back_to_magnitude_for_dilated_conv():
+    # A dilated receptive field's (kh, kw) offsets aren't evenly spaced in
+    # the padded input the way sliding_window_view assumes --
+    # :func:`_conv_spatial_attrs` declines non-all-ones dilations, so
+    # Wanda must fall back to plain magnitude for this layer too.
+    Cin, Cout, spatial = 3, 6, 10
+    rng = np.random.default_rng(75)
+    w = rng.standard_normal((Cout, Cin, 3, 3)).astype(np.float32)
+    out_spatial = spatial - 2 * (3 - 1)  # dilation=2, kernel=3, no padding
+    model = _single_conv_model(
+        w, spatial=spatial, extra_attrs="dilations=[2,2]", out_spatial=out_spatial
+    )
+    x = rng.standard_normal((2, Cin, spatial, spatial)).astype(np.float32)
+
+    magnitude_pruned = onnxsim.apply_magnitude_pruning(model, sparsity=0.5)
+    wanda_pruned = onnxsim.apply_wanda_pruning(
+        model, calibration_data=[{"X": x}], sparsity=0.5
+    )
+    onnx.checker.check_model(wanda_pruned)
+    np.testing.assert_array_equal(
+        _conv_weight(wanda_pruned), _conv_weight(magnitude_pruned)
+    )
+
+
+def test_sparsegpt_pruning_leaves_conv_layers_completely_untouched():
+    # apply_sparsegpt_pruning deliberately does not match Conv (see its own
+    # docstring for why): a correct-but-unverified from-scratch im2col
+    # Hessian was judged worse to ship than none at all.
+    Cin, Cout, spatial = 4, 8, 10
+    rng = np.random.default_rng(76)
+    w = rng.standard_normal((Cout, Cin, 3, 3)).astype(np.float32)
+    model = _single_conv_model(w, spatial=spatial)
+    x_cal = rng.standard_normal((2, Cin, spatial, spatial)).astype(np.float32)
+
+    pruned = onnxsim.apply_sparsegpt_pruning(
+        model, calibration_data=[{"X": x_cal}], sparsity=0.5
+    )
+    np.testing.assert_array_equal(_conv_weight(pruned), w)
+
+
 # --- apply_sparsegpt_pruning --------------------------------------------
 
 
