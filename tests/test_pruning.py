@@ -2439,6 +2439,478 @@ def test_structured_wanda_pruning_conv_residual_add_matches_oracle():
     np.testing.assert_allclose(y, y_oracle, rtol=1e-5, atol=1e-5)
 
 
+# --- apply_structured_pruning: MatMul/Gemm residual (Add-merged) chains -----
+#
+# The MatMul/Gemm analogue of the Conv residual tests above -- see
+# onnxsim.pruning's own module docstring and
+# _find_matmul_residual_chains's own section comment for the shared
+# reasoning. Mirrors the Conv residual test suite's own shape (diamond,
+# transitive, fan-out decline, identity-shortcut decline, Wanda-for-free)
+# plus the composition-safety cases specific to the wider MatMul/Gemm hop
+# set: a per-channel bias Add hop, a transposed (`transB=1`) Gemm producer,
+# a gated-FFN branch with no downstream projection, and a bare fused
+# self-attention op shortcut.
+
+
+def _matmul_residual_diamond_model(wf, ws, wout):
+    # y = MatMul_out(Relu(Add(MatMul_f(X), MatMul_s(X)))) -- the MatMul/Gemm
+    # analogue of _residual_diamond_model: two entirely independent MatMul
+    # producers merge via Add and must therefore share one surviving
+    # channel-index set, feeding one real consumer.
+    K, C = wf.shape
+    Out = wout.shape[1]
+    return _model(
+        f"""
+        g (float[batch,{K}] X) => (float[batch,{Out}] Y)
+        {{
+          f = MatMul(X, WF)
+          s = MatMul(X, WS)
+          addr = Add(f, s)
+          r = Relu(addr)
+          Y = MatMul(r, WOUT)
+        }}
+        """,
+        initializer=[_f32(wf, "WF"), _f32(ws, "WS"), _f32(wout, "WOUT")],
+    )
+
+
+def _matmul_residual_transitive_model(wf1, ws1, wf2, wout):
+    # Two Add merges chained transitively, sharing one spine channel count
+    # -- the MatMul/Gemm analogue of _residual_transitive_model. add1's own
+    # output feeds *only* into add2 (as a second, entirely separate
+    # producer's merge partner), never reused elsewhere, so the union-find
+    # grouping in _find_matmul_residual_chains extends across both Adds
+    # into one group of three producers.
+    K, C = wf1.shape
+    Kz = wf2.shape[0]
+    Out = wout.shape[1]
+    return _model(
+        f"""
+        g (float[batch,{K}] X, float[batch,{Kz}] Z) => (float[batch,{Out}] Y)
+        {{
+          f1 = MatMul(X, WF1)
+          s1 = MatMul(X, WS1)
+          add1 = Add(f1, s1)
+          f2 = MatMul(Z, WF2)
+          add2 = Add(f2, add1)
+          r = Relu(add2)
+          Y = MatMul(r, WOUT)
+        }}
+        """,
+        initializer=[
+            _f32(wf1, "WF1"),
+            _f32(ws1, "WS1"),
+            _f32(wf2, "WF2"),
+            _f32(wout, "WOUT"),
+        ],
+    )
+
+
+def test_structured_pruning_matmul_residual_add_shrinks_matched_layers():
+    K, C, Out = 8, 16, 4
+    rng = np.random.default_rng(90)
+    wf = rng.standard_normal((K, C)).astype(np.float32)
+    ws = rng.standard_normal((K, C)).astype(np.float32)
+    wout = rng.standard_normal((C, Out)).astype(np.float32)
+    model = _matmul_residual_diamond_model(wf, ws, wout)
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    inits = {t.name: t for t in pruned.graph.initializer}
+    assert list(inits["WF"].dims) == [K, C // 2]
+    assert list(inits["WS"].dims) == [K, C // 2]
+    assert list(inits["WOUT"].dims) == [C // 2, Out]
+
+
+def test_structured_pruning_matmul_residual_add_matches_oracle():
+    # Correctness bar: exact equivalence to hand-slicing *both* independent
+    # producers to the same combined-importance keep set -- with weights
+    # deliberately built so the two branches disagree about which channels
+    # matter most (the first half of the columns dominate WF's own norm,
+    # the second half dominate WS's own norm), so the correct combined-
+    # importance keep set is neither branch's own individual top-k and a
+    # bug that used only one branch's importance would be caught.
+    K, C, Out = 8, 16, 4
+    rng = np.random.default_rng(90)
+    scale_f = np.where(np.arange(C) < C // 2, 3.0, 0.3).astype(np.float32)
+    scale_s = np.where(np.arange(C) < C // 2, 0.3, 3.0).astype(np.float32)
+    wf = rng.standard_normal((K, C)).astype(np.float32) * scale_f
+    ws = rng.standard_normal((K, C)).astype(np.float32) * scale_s
+    wout = rng.standard_normal((C, Out)).astype(np.float32)
+    model = _matmul_residual_diamond_model(wf, ws, wout)
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    importance = np.sqrt(
+        np.square(np.linalg.norm(wf.astype(np.float64), axis=0))
+        + np.square(np.linalg.norm(ws.astype(np.float64), axis=0))
+    )
+    keep = np.sort(np.argsort(-importance)[: C // 2])
+    # The conflicting-importance construction above is only doing its job
+    # if the combined keep set actually straddles both halves.
+    assert np.any(keep < C // 2) and np.any(keep >= C // 2)
+    oracle = _matmul_residual_diamond_model(wf[:, keep], ws[:, keep], wout[keep, :])
+
+    rng_x = np.random.default_rng(91)
+    x = rng_x.standard_normal((5, K)).astype(np.float32)
+    (y,) = _run(pruned, {"X": x})
+    (y_oracle,) = _run(oracle, {"X": x})
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-5, atol=1e-5)
+
+
+def test_structured_pruning_matmul_residual_add_transitive_chain_matches_oracle():
+    K, C, Kz, Out = 8, 16, 5, 4
+    rng = np.random.default_rng(92)
+    wf1 = rng.standard_normal((K, C)).astype(np.float32)
+    ws1 = rng.standard_normal((K, C)).astype(np.float32)
+    wf2 = rng.standard_normal((Kz, C)).astype(np.float32)
+    wout = rng.standard_normal((C, Out)).astype(np.float32)
+    model = _matmul_residual_transitive_model(wf1, ws1, wf2, wout)
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    importance = np.sqrt(
+        np.square(np.linalg.norm(wf1.astype(np.float64), axis=0))
+        + np.square(np.linalg.norm(ws1.astype(np.float64), axis=0))
+        + np.square(np.linalg.norm(wf2.astype(np.float64), axis=0))
+    )
+    keep = np.sort(np.argsort(-importance)[: C // 2])
+    oracle = _matmul_residual_transitive_model(
+        wf1[:, keep], ws1[:, keep], wf2[:, keep], wout[keep, :]
+    )
+
+    rng_x = np.random.default_rng(93)
+    x = rng_x.standard_normal((5, K)).astype(np.float32)
+    z = rng_x.standard_normal((5, Kz)).astype(np.float32)
+    (y,) = _run(pruned, {"X": x, "Z": z})
+    (y_oracle,) = _run(oracle, {"X": x, "Z": z})
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-5, atol=1e-5)
+
+
+def test_structured_pruning_matmul_residual_add_declines_on_fan_out_branch():
+    # A realistic multi-block residual stack's interior boundary: `r`
+    # (add1's own post-block tensor) is read *twice* -- once by the next
+    # block's own first MatMul (`nxt`), once unchanged as that next block's
+    # own Add shortcut operand (`add2`) -- exactly the fan-out
+    # _walk_matmul_producer_backward's single-consumer bar declines. Left
+    # completely untouched, the same guarantee the Conv version holds to.
+    K, C, Out = 8, 16, 4
+    rng = np.random.default_rng(94)
+    wf = rng.standard_normal((K, C)).astype(np.float32)
+    ws = rng.standard_normal((K, C)).astype(np.float32)
+    wnext = rng.standard_normal((C, C)).astype(np.float32)
+    wout = rng.standard_normal((C, Out)).astype(np.float32)
+    model = _model(
+        f"""
+        g (float[batch,{K}] X) => (float[batch,{Out}] Y)
+        {{
+          f = MatMul(X, WF)
+          s = MatMul(X, WS)
+          add1 = Add(f, s)
+          r = Relu(add1)
+          nxt = MatMul(r, WNEXT)
+          add2 = Add(nxt, r)
+          Y = MatMul(add2, WOUT)
+        }}
+        """,
+        initializer=[
+            _f32(wf, "WF"),
+            _f32(ws, "WS"),
+            _f32(wnext, "WNEXT"),
+            _f32(wout, "WOUT"),
+        ],
+    )
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    np.testing.assert_array_equal(inits["WF"], wf)
+    np.testing.assert_array_equal(inits["WS"], ws)
+    np.testing.assert_array_equal(inits["WNEXT"], wnext)
+    np.testing.assert_array_equal(inits["WOUT"], wout)
+
+
+def test_structured_pruning_matmul_residual_add_declines_on_identity_shortcut():
+    # y = MatMul2(Relu(Add(MatMul1(X), X))): the exact `x = x + f(x)`
+    # transformer-residual identity-shortcut shape, no MatMul on the
+    # shortcut path at all. `X` has no producer this pass owns (it's a
+    # graph input) *and* is itself read twice (by MatMul1 and directly by
+    # Add) -- either alone is enough to decline: nothing can slice a graph
+    # input's own channel count to match a pruned MatMul1, so the whole
+    # block is left untouched rather than guessed at.
+    C, Out = 8, 4
+    rng = np.random.default_rng(95)
+    w1 = rng.standard_normal((C, C)).astype(np.float32)
+    w2 = rng.standard_normal((C, Out)).astype(np.float32)
+    model = _model(
+        f"""
+        g (float[batch,{C}] X) => (float[batch,{Out}] Y)
+        {{
+          f = MatMul(X, W1)
+          add1 = Add(f, X)
+          r = Relu(add1)
+          Y = MatMul(r, W2)
+        }}
+        """,
+        initializer=[_f32(w1, "W1"), _f32(w2, "W2")],
+    )
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    np.testing.assert_array_equal(inits["W1"], w1)
+    np.testing.assert_array_equal(inits["W2"], w2)
+
+
+def test_structured_pruning_matmul_residual_add_with_bias_hop_matches_oracle():
+    # One branch has a per-channel bias Add (a separate node, not Gemm's own
+    # bias input) between its producer and the residual merge -- exercises
+    # _walk_matmul_producer_backward's wider MatMul/Gemm-only hop set (see
+    # this module's own docstring's "and for MatMul/Gemm also a bias/scale
+    # add/mul" phrase) and the self-consistent-then-revalidate check that
+    # tells this per-channel bias Add apart from an eligible residual-merge
+    # Add (one constant operand vs. two non-constant ones).
+    K, C, Out = 8, 16, 4
+    rng = np.random.default_rng(96)
+    w1 = rng.standard_normal((K, C)).astype(np.float32)
+    bias = rng.standard_normal((C,)).astype(np.float32)
+    ws = rng.standard_normal((K, C)).astype(np.float32)
+    wout = rng.standard_normal((C, Out)).astype(np.float32)
+    model = _model(
+        f"""
+        g (float[batch,{K}] X) => (float[batch,{Out}] Y)
+        {{
+          h = MatMul(X, W1)
+          hb = Add(h, Bias)
+          f = Relu(hb)
+          s = MatMul(X, WS)
+          addr = Add(f, s)
+          r = Relu(addr)
+          Y = MatMul(r, WOUT)
+        }}
+        """,
+        initializer=[
+            _f32(w1, "W1"),
+            _f32(bias, "Bias"),
+            _f32(ws, "WS"),
+            _f32(wout, "WOUT"),
+        ],
+    )
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    inits = {t.name: t for t in pruned.graph.initializer}
+    assert list(inits["Bias"].dims) == [C // 2]
+
+    importance = np.sqrt(
+        np.square(np.linalg.norm(w1.astype(np.float64), axis=0))
+        + np.square(np.linalg.norm(ws.astype(np.float64), axis=0))
+    )
+    keep = np.sort(np.argsort(-importance)[: C // 2])
+
+    rng_x = np.random.default_rng(97)
+    x = rng_x.standard_normal((5, K)).astype(np.float32)
+    (y,) = _run(pruned, {"X": x})
+    f = np.maximum(x @ w1[:, keep] + bias[keep], 0)
+    s = x @ ws[:, keep]
+    y_oracle = np.maximum(f + s, 0) @ wout[keep, :]
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-5, atol=1e-5)
+
+
+def test_structured_pruning_matmul_residual_add_transposed_gemm_producer_matches_oracle():
+    # One branch is a Gemm with transB=1 (weight stored [N, K], the common
+    # real-world PyTorch-exported layout) rather than a plain MatMul's
+    # [K, N] -- a regression test for the same class of bug the Conv
+    # residual feature's own development turned up (a field the backward
+    # walk must carry through from the real producer, here
+    # `weight_transposed`, silently dropped/defaulted would mis-slice this
+    # producer's weight along the wrong axis).
+    K, C, Out = 8, 16, 4
+    rng = np.random.default_rng(98)
+    w1t = rng.standard_normal((C, K)).astype(np.float32)  # [N, K] -- transB=1 layout
+    ws = rng.standard_normal((K, C)).astype(np.float32)
+    wout = rng.standard_normal((C, Out)).astype(np.float32)
+    model = _model(
+        f"""
+        g (float[batch,{K}] X) => (float[batch,{Out}] Y)
+        {{
+          f = Gemm<transB = 1>(X, W1T)
+          s = MatMul(X, WS)
+          addr = Add(f, s)
+          r = Relu(addr)
+          Y = MatMul(r, WOUT)
+        }}
+        """,
+        initializer=[_f32(w1t, "W1T"), _f32(ws, "WS"), _f32(wout, "WOUT")],
+    )
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    inits = {t.name: t for t in pruned.graph.initializer}
+    # transB=1 storage: output channel is axis 0, so a correctly-sliced
+    # producer keeps [N/2, K], not [N, K/2] (the bug a dropped
+    # `weight_transposed` field would produce -- it would slice axis 1
+    # instead, the wrong axis entirely, or crash on a mismatched shape).
+    assert list(inits["W1T"].dims) == [C // 2, K]
+
+    importance = np.sqrt(
+        np.square(np.linalg.norm(w1t.astype(np.float64), axis=1))
+        + np.square(np.linalg.norm(ws.astype(np.float64), axis=0))
+    )
+    keep = np.sort(np.argsort(-importance)[: C // 2])
+
+    rng_x = np.random.default_rng(99)
+    x = rng_x.standard_normal((5, K)).astype(np.float32)
+    (y,) = _run(pruned, {"X": x})
+    f = x @ w1t[keep, :].T
+    s = x @ ws[:, keep]
+    y_oracle = np.maximum(f + s, 0) @ wout[keep, :]
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-5, atol=1e-5)
+
+
+def test_structured_pruning_matmul_residual_add_declines_on_gated_branch_with_no_projection():
+    # A gated (SwiGLU-style) combine feeding directly into a residual Add,
+    # with no output-projection MatMul between the Mul and the Add -- see
+    # _find_matmul_residual_chains's own section comment for why this
+    # composition is declined rather than guessed at (the backward walk
+    # would have no principled way to pick "the" one branch through a Mul
+    # of two non-constant operands without silently dropping the other's
+    # contribution). Left completely untouched; the far more common shape
+    # -- the gated FFN's own down-projection feeding the residual Add --
+    # is exercised by every other test in this section (WD below plays
+    # exactly that role in every oracle-verified case).
+    K, C, Out = 8, 16, 4
+    rng = np.random.default_rng(100)
+    wg = rng.standard_normal((K, C)).astype(np.float32)
+    wu = rng.standard_normal((K, C)).astype(np.float32)
+    wp = rng.standard_normal((K, C)).astype(np.float32)
+    wout = rng.standard_normal((C, Out)).astype(np.float32)
+    model = _model(
+        f"""
+        g (float[batch,{K}] X) => (float[batch,{Out}] Y)
+        {{
+          gate = MatMul(X, WG)
+          gate_act = Sigmoid(gate)
+          up = MatMul(X, WU)
+          h = Mul(gate_act, up)
+          p = MatMul(X, WP)
+          addr = Add(p, h)
+          r = Relu(addr)
+          Y = MatMul(r, WOUT)
+        }}
+        """,
+        initializer=[
+            _f32(wg, "WG"),
+            _f32(wu, "WU"),
+            _f32(wp, "WP"),
+            _f32(wout, "WOUT"),
+        ],
+    )
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    np.testing.assert_array_equal(inits["WG"], wg)
+    np.testing.assert_array_equal(inits["WU"], wu)
+    np.testing.assert_array_equal(inits["WP"], wp)
+    np.testing.assert_array_equal(inits["WOUT"], wout)
+
+
+def test_structured_pruning_matmul_residual_add_declines_on_bare_gqa_shortcut():
+    # A residual branch whose backward walk would need to cross a fused
+    # self-attention op boundary to reach a real producer -- `ctx` (a
+    # GroupQueryAttention node's own raw output) feeds directly into the
+    # residual Add, with no output-projection MatMul in between. Neither
+    # GroupQueryAttention nor its Q/K/V MatMul producers can be reached
+    # through it: the walk starting from `ctx` finds an unrecognized node
+    # (not a MatMul/Gemm, not an eligible Add, not a unary activation) on
+    # its very first hop and fails immediately, without ever looking past
+    # GroupQueryAttention at its own Q/K/V inputs. Left completely
+    # untouched, the same conservative bar as the gated-branch case above.
+    K, H, D, Out = 8, 4, 4, 6
+    Nqkv = H * D
+    rng = np.random.default_rng(101)
+    wq = rng.standard_normal((K, Nqkv)).astype(np.float32)
+    wk = rng.standard_normal((K, Nqkv)).astype(np.float32)
+    wv = rng.standard_normal((K, Nqkv)).astype(np.float32)
+    wp = rng.standard_normal((K, Nqkv)).astype(np.float32)
+    wout = rng.standard_normal((Nqkv, Out)).astype(np.float32)
+    model = _model(
+        f"""
+        g (float[2,5,{K}] X) => (float[2,5,{Out}] Y)
+        {{
+          q = MatMul(X, Wq)
+          k = MatMul(X, Wk)
+          v = MatMul(X, Wv)
+          ctx, present_k, present_v = com.microsoft.GroupQueryAttention <num_heads={H}, kv_num_heads={H}> (q, k, v)
+          p = MatMul(X, Wp)
+          addr = Add(p, ctx)
+          r = Relu(addr)
+          Y = MatMul(r, Wout)
+        }}
+        """,
+        initializer=[
+            _f32(wq, "Wq"),
+            _f32(wk, "Wk"),
+            _f32(wv, "Wv"),
+            _f32(wp, "Wp"),
+            _f32(wout, "Wout"),
+        ],
+        opset=17,
+    )
+    model.opset_import.append(onnx.helper.make_opsetid("com.microsoft", 1))
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    np.testing.assert_array_equal(inits["Wq"], wq)
+    np.testing.assert_array_equal(inits["Wk"], wk)
+    np.testing.assert_array_equal(inits["Wv"], wv)
+    np.testing.assert_array_equal(inits["Wp"], wp)
+    np.testing.assert_array_equal(inits["Wout"], wout)
+
+
+def test_structured_wanda_pruning_matmul_residual_add_matches_oracle():
+    # apply_structured_wanda_pruning picks up MatMul/Gemm residual grouping
+    # for free -- _find_matmul_residual_chains is shared with
+    # apply_structured_pruning, and the activation norm is captured at the
+    # same probe point (`chain.consumer_node.input[0]`) any other MatMul/Gemm
+    # chain uses.
+    K, C, Out = 8, 16, 4
+    rng = np.random.default_rng(102)
+    wf = rng.standard_normal((K, C)).astype(np.float32)
+    ws = rng.standard_normal((K, C)).astype(np.float32)
+    wout = rng.standard_normal((C, Out)).astype(np.float32)
+    model = _matmul_residual_diamond_model(wf, ws, wout)
+
+    probe_model = onnx.ModelProto()
+    probe_model.CopyFrom(model)
+    probe_model.graph.output.append(
+        onnx.helper.make_tensor_value_info("r", onnx.TensorProto.FLOAT, None)
+    )
+
+    rng_cal = np.random.default_rng(103)
+    x_cal = rng_cal.standard_normal((6, K)).astype(np.float32)
+    calibration_data = [{"X": x_cal}]
+
+    _, r_cal = _run(probe_model, {"X": x_cal})
+    act_norm = np.sqrt(np.mean(np.square(r_cal.astype(np.float64)), axis=0))
+    base_importance = np.sqrt(
+        np.square(np.linalg.norm(wf.astype(np.float64), axis=0))
+        + np.square(np.linalg.norm(ws.astype(np.float64), axis=0))
+    )
+    importance = base_importance * np.maximum(act_norm, 1e-8)
+    keep = np.sort(np.argsort(-importance)[: C // 2])
+
+    pruned = onnxsim.apply_structured_wanda_pruning(
+        model, calibration_data=calibration_data, sparsity=0.5
+    )
+    onnx.checker.check_model(pruned)
+
+    oracle = _matmul_residual_diamond_model(wf[:, keep], ws[:, keep], wout[keep, :])
+    rng_x = np.random.default_rng(104)
+    x = rng_x.standard_normal((5, K)).astype(np.float32)
+    (y,) = _run(pruned, {"X": x})
+    (y_oracle,) = _run(oracle, {"X": x})
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-5, atol=1e-5)
+
+
 # --- apply_structured_wanda_pruning ------------------------------------------
 
 
