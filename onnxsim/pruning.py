@@ -1,5 +1,4 @@
-"""Post-training weight pruning for MatMul/vanilla-Gemm and ordinary
-(``group=1``) Conv layers.
+"""Post-training weight pruning for MatMul/vanilla-Gemm and Conv layers.
 
 Surveying the pruning literature against what onnxsim can actually act on
 (an exported ONNX graph, no training loop, no gradients, usually no labels)
@@ -86,15 +85,25 @@ Wanda paper -- better protects weights that multiply high-magnitude
 activations even when the weight itself is individually small, the same
 class of outlier-activation effect that motivates :mod:`onnxsim.smoothquant`.
 
-Both also match ordinary (``group=1``) 2-D ``Conv`` weights, not just
-MatMul/vanilla-Gemm: a Conv's ``[out_channels, in_channels, kH, kW]``
-weight is reshaped to ``[out_channels, in_channels*kH*kW]`` -- the same
-convention :func:`apply_structured_pruning` already uses for Conv filter
-importance below -- and each output filter becomes one comparison group,
-exactly like a MatMul/Gemm output channel. For magnitude pruning that's
-the entire story: ``|W|`` on the reshaped weight, mask computed, reshaped
-back. For Wanda it needs one more step, since ``X_j`` isn't simply "input
-feature ``j``" once a sliding kernel is involved: ``j`` indexes one
+Both also match 2-D ``Conv`` weights, not just MatMul/vanilla-Gemm: a
+Conv's ``[out_channels, in_channels/group, kH, kW]`` weight is reshaped to
+``[out_channels, (in_channels/group)*kH*kW]`` -- the same convention
+:func:`apply_structured_pruning` already uses for Conv filter importance
+below -- and each output filter becomes one comparison group, exactly like
+a MatMul/Gemm output channel. Unlike :func:`apply_structured_pruning`'s
+producer/consumer chain matching below, this reshape-and-rank-per-filter
+operation is completely agnostic to ``group``: it never touches another
+layer's channel indices, only ranks each output filter's own row against
+itself, so ordinary (``group=1``), depthwise (``group == in_channels ==
+out_channels``), and general grouped (``group`` neither 1 nor the channel
+count) Conv are all matched identically here by
+:func:`_match_conv_weight_only` -- a materially different, and much
+easier, bar than the shape-changing coupling problem
+:func:`_match_conv_producer`/:func:`_match_conv_consumer` decline part of
+below. For magnitude pruning that's the entire story: ``|W|`` on the
+reshaped weight, mask computed, reshaped back, working unchanged for every
+``group``. For Wanda it needs one more step, since ``X_j`` isn't simply
+"input feature ``j``" once a sliding kernel is involved: ``j`` indexes one
 ``(in_channel, kh, kw)`` offset within the receptive field, so its
 activation statistic is the norm of the *im2col-unfolded* input patch
 value at that specific offset, over every output spatial position and
@@ -108,11 +117,46 @@ or non-all-ones ``dilations``, since a dilated receptive field's offsets
 aren't evenly spaced in the padded input the way ``sliding_window_view``
 assumes) falls back to plain magnitude for that layer, the same as any
 other layer whose activation norm was never observed.
-:func:`apply_sparsegpt_pruning` now also matches those same ordinary
-(``group=1``) 2-D ``Conv`` layers -- see its own docstring below for the
-full ``[K, K]`` im2col cross-covariance Hessian this needed (a real step
-up from Wanda's per-offset norm above, not just a reuse of it) and how
-it's verified.
+
+For a grouped or depthwise Conv, Wanda's per-offset activation norm needs
+one more piece of care beyond the reshape above: that norm is always
+computed once from the *raw, full-channel* input (:func:`_conv_patch_sq_sum`
+never looks at `group` at all, and doesn't need to -- unfolding the whole
+input once is cheaper than unfolding it again per group), but a grouped
+Conv's output filter ``i`` only ever *reads* its own group's
+``in_channels/group``-wide slice of that input (filter ``i`` belongs to
+group ``i // (out_channels/group)``, per ONNX's grouped-Conv weight
+layout), so "local receptive-field offset ``j``" names a *different*
+global input channel depending on which group filter ``i`` falls in.
+Sharing one norm row across every filter -- correct, and what this module
+did before grouped Conv was matched here at all, when `group` was always 1
+-- would silently score every filter outside group 0 against the wrong
+channels' statistics for any `group` > 1. :func:`_conv_group_relative_norm`
+is the fix: it slices the full-input norm's ``[Cin, kh, kw]`` shape along
+its channel axis once per group and repeats each group's own slice across
+exactly the filter rows belonging to it, before that expanded,
+per-filter-row norm ever reaches the ``|W_ij| * ||X_j||_2`` importance
+computation -- collapsing to the previous single-shared-row behavior
+exactly when ``group=1``. Verified against a dedicated test engineering one
+group's calibration input to have deliberately different activation
+statistics from another group's, confirming each filter's resulting mask
+reflects its own group's statistics and not another group's or a global
+average (``test_wanda_pruning_conv_grouped_uses_own_groups_activation_norm``).
+
+:func:`apply_sparsegpt_pruning` also matches Conv layers, but -- unlike
+magnitude and Wanda above -- only ordinary (``group=1``) ones; see its own
+docstring below for the full ``[K, K]`` im2col cross-covariance Hessian
+this needed (a real step up from Wanda's per-offset norm above, not just a
+reuse of it), how it's verified, and why extending it to grouped/depthwise
+Conv was deliberately left undone rather than guessed at: doing so
+correctly needs a *per-group* Hessian (each group's own filters only ever
+see their own group's input-channel patches -- the same channel-slicing
+subtlety Wanda's grouped support above handles, but now for the full
+cross-covariance rather than a per-offset norm, and needing the sequential
+column-processing/error-compensation loop partitioned per group rather
+than run once across the whole weight) -- comparable in scope to the
+original SparseGPT+Conv work this module already did from first
+principles, and not undertaken speculatively here.
 
 All three unstructured/N:M functions also match the two fused self-
 attention ops the "Attention-head pruning" section below performs
@@ -363,7 +407,12 @@ in the first place, since OPT/BLOOM/Llama have none -- there was no
 correct reference to port here, unlike every other technique this module
 ports from an upstream implementation; this is original, from-first-
 principles machinery, held to the verification bar above precisely
-because of that.
+because of that. Unlike :func:`apply_magnitude_pruning`/
+:func:`apply_wanda_pruning`, this stays ``group=1``-only rather than also
+matching depthwise/general grouped Conv -- see the earlier paragraph above
+(right after Wanda's grouped-Conv support) for why extending this
+specific Hessian to grouped Conv is a materially bigger, declined-for-now
+undertaking rather than a mechanical extension of the matching alone.
 """
 
 from __future__ import annotations
@@ -438,18 +487,39 @@ def _nm_mask(importance: np.ndarray, n: int, m: int) -> np.ndarray:
 
 
 def _match_conv_weight_only(
-    node: onnx.NodeProto, initializer_map: Dict[str, onnx.TensorProto]
+    node: onnx.NodeProto,
+    initializer_map: Dict[str, onnx.TensorProto],
+    allow_grouped: bool = True,
 ) -> Optional[Tuple[str, str]]:
-    """If `node` is an ordinary (``group=1``) 2-D ``Conv`` with a constant
-    4-D float32 ``[out_channels, in_channels, kH, kW]`` weight, returns
+    """If `node` is a 2-D ``Conv`` with a constant 4-D float32
+    ``[out_channels, in_channels/group, kH, kW]`` weight, returns
     ``(x_name, weight_name)``. Mirrors the "Conv2D structured pruning"
     section's own :func:`_match_conv_producer` matching criteria, minus
     that function's bias handling -- magnitude/Wanda/SparseGPT never touch
-    bias, only the weight, so there's nothing to validate there. A grouped
-    or depthwise Conv (``group != 1``) never matches, the same restriction
-    :func:`_match_conv_producer`/:func:`_match_conv_consumer` draw: its
-    output and input channels aren't independent per-index the way this
-    module's per-row/per-filter importance ranking assumes.
+    bias, only the weight, so there's nothing to validate there.
+
+    Unlike :func:`_match_conv_producer`/:func:`_match_conv_consumer`, a
+    grouped or depthwise Conv (``group != 1``) is matched here too when
+    `allow_grouped` (the default, used by :func:`apply_magnitude_pruning`/
+    :func:`apply_wanda_pruning`): those two functions' own ``group=1``
+    restriction exists because *structured* pruning's producer/consumer
+    channel-index coupling genuinely doesn't survive grouping (an output
+    or input channel's index meaning depends on which of `group`'s blocks
+    it falls into on each side of a chain -- see this module's own
+    docstring). Nothing here inherits that problem: unstructured/N:M
+    pruning never changes any shape or needs any cross-layer index
+    agreement -- it only zeros individual weight entries within one output
+    filter's own kernel, independently of every other filter -- and
+    :func:`_prune_weight`'s ``w.reshape(n, cin*kh*kw)`` (`cin` here already
+    being ``in_channels/group`` by ONNX's own grouped-Conv weight layout)
+    ranks and masks each of the `n` output filters' rows exactly the same
+    way regardless of `group`. `allow_grouped=False` (only
+    :func:`apply_sparsegpt_pruning` passes this, see its own docstring for
+    why) restores the ``group=1``-only match. When `allow_grouped` and
+    ``group > 1``, ``out_channels % group`` must still be zero -- the
+    standard grouped-Conv well-formedness requirement (`group` equal-sized
+    output blocks) that :func:`_conv_group_relative_norm` also relies on to
+    line up each output filter with its own group's input-channel slice.
     """
     if node.op_type != "Conv" or len(node.input) < 2:
         return None
@@ -459,8 +529,14 @@ def _match_conv_weight_only(
         w_init is None
         or w_init.data_type != onnx.TensorProto.FLOAT
         or len(w_init.dims) != 4
-        or _conv_group(node) != 1
     ):
+        return None
+    group = _conv_group(node)
+    if group < 1:
+        return None
+    if not allow_grouped and group != 1:
+        return None
+    if group > 1 and w_init.dims[0] % group != 0:
         return None
     return node.input[0], w_name
 
@@ -497,7 +573,9 @@ def _match_attention_weight_only(
     return node.input[0], node.input[1]
 
 
-def _candidates(graph: onnx.GraphProto, include_conv: bool = True):
+def _candidates(
+    graph: onnx.GraphProto, include_conv: bool = True, allow_grouped_conv: bool = True
+):
     """Every MatMul/vanilla-Gemm node with a constant 2-D float32 weight
     (this already includes a ``com.microsoft::GroupQueryAttention`` node's
     separate Q/K/V projections: per :func:`_match_gqa_producer`'s own
@@ -511,22 +589,27 @@ def _candidates(graph: onnx.GraphProto, include_conv: bool = True):
       GQA's separate projections, this *is* a weight the op itself owns
       (``node.input[1]``), so it needs its own matcher; and
     - when `include_conv` (the default; :func:`apply_sparsegpt_pruning`
-      passes ``False``, see its own docstring for why) -- every ordinary
-      (``group=1``) 2-D ``Conv`` node matched by
-      :func:`_match_conv_weight_only`.
+      passes ``False``, see its own docstring for why) -- every 2-D
+      ``Conv`` node matched by :func:`_match_conv_weight_only`, which by
+      default (`allow_grouped_conv`, also default) includes depthwise and
+      general grouped Conv, not just ordinary (``group=1``) Conv --
+      :func:`apply_sparsegpt_pruning` still matches Conv at all
+      (`include_conv` stays ``True`` there) but passes
+      ``allow_grouped_conv=False``, since its own Conv im2col-Hessian
+      machinery is ``group=1``-only (see its own docstring).
 
     Returns ``(node, x_name, w_name, weight_transposed, is_conv)`` tuples;
     `weight_transposed` is always ``False`` (meaningless) for a Conv entry,
     whose output channel always lives on axis 0 of its fixed
-    ``[out_channels, in_channels, kH, kW]`` layout, and likewise always
-    ``False`` (this time literally correct, not just meaningless -- see
-    :func:`_match_attention_weight_only`) for an Attention entry. Attention
-    matching is unconditional (not gated by `include_conv`, which -- per its
-    own name and :func:`apply_sparsegpt_pruning`'s own docstring -- concerns
-    only Conv's im2col-Hessian gap): see :func:`apply_sparsegpt_pruning`'s
-    own docstring for why a merged QKV weight has no analogous problem and
-    is deliberately included in its ``include_conv=False`` candidate list
-    too.
+    ``[out_channels, in_channels/group, kH, kW]`` layout, and likewise
+    always ``False`` (this time literally correct, not just meaningless --
+    see :func:`_match_attention_weight_only`) for an Attention entry.
+    Attention matching is unconditional (not gated by `include_conv`, which
+    -- per its own name and :func:`apply_sparsegpt_pruning`'s own docstring
+    -- concerns only Conv's im2col-Hessian gap): see
+    :func:`apply_sparsegpt_pruning`'s own docstring for why a merged QKV
+    weight has no analogous problem and is deliberately included in its
+    ``include_conv=False`` candidate list too.
     """
     initializer_map = {t.name: t for t in graph.initializer}
     out = []
@@ -544,7 +627,9 @@ def _candidates(graph: onnx.GraphProto, include_conv: bool = True):
             out.append((node, x_name, w_name, weight_transposed, False))
             continue
         if include_conv:
-            conv_match = _match_conv_weight_only(node, initializer_map)
+            conv_match = _match_conv_weight_only(
+                node, initializer_map, allow_grouped=allow_grouped_conv
+            )
             if conv_match is not None:
                 x_name, w_name = conv_match
                 out.append((node, x_name, w_name, False, True))
@@ -715,6 +800,61 @@ def _conv_patch_sq_sum(
     return sq_sum, count
 
 
+def _conv_group_relative_norm(
+    norm_flat: np.ndarray, cout: int, cin_per_group: int, kh: int, kw: int, group: int
+) -> Optional[np.ndarray]:
+    """Expands a Conv layer's flat per-``(in_channel, kh, kw)``-offset
+    activation norm (:func:`_conv_patch_sq_sum`'s accumulated statistic,
+    ``[Cin, kh, kw]`` flattened to length ``Cin*kh*kw`` -- `Cin` here being
+    the raw, *full* input channel count :func:`_conv_patch_sq_sum` unfolds
+    from, i.e. ``cin_per_group * group``) into a ``[out_channels,
+    in_channels/group * kh * kw]`` array matching the shape of that Conv's
+    own reshaped weight (:func:`_prune_weight`'s ``w.reshape(n,
+    cin*kh*kw)``) -- one row per output filter, ready to multiply
+    elementwise against ``|W|``.
+
+    This is the piece that makes Wanda's Conv support correct for a
+    grouped/depthwise Conv rather than silently wrong for every group but
+    the first: `norm_flat` is computed once from the *raw, full-channel*
+    input (an ordinary Conv's `X`, `_conv_patch_sq_sum` never sees `group`
+    at all), but output filter ``i`` of a grouped Conv only ever reads its
+    *own* group's global input-channel slice, ``[g * cin_per_group, (g+1)
+    * cin_per_group)`` where ``g = i // (out_channels/group)`` (ONNX's
+    grouped-Conv weight layout: the first ``out_channels/group`` filters
+    belong to group 0, the next block to group 1, and so on) -- so "local
+    receptive-field offset ``j``" means a *different* global input channel
+    depending on the filter's own group, and reusing one shared
+    (group-0-shaped) norm row for every filter would silently score every
+    other group's filters against the wrong channels' activation
+    statistics. This function slices `norm_flat`'s ``[Cin, kh, kw]`` shape
+    along its channel axis once per group and repeats that group's own
+    slice across exactly the filter rows that belong to it, so each row
+    the caller gets back already carries its own filter's own group's
+    statistic -- the "unfold once, select each filter's own group-relative
+    channel slice" approach (see this module's own docstring), avoiding a
+    second, per-group im2col unfold of the same input.
+
+    For an ordinary (``group=1``) Conv this collapses to the previous
+    behavior exactly: one group spanning every channel, broadcast to every
+    output filter row identically. Returns ``None`` if `norm_flat`'s length
+    doesn't match ``cin_per_group * group * kh * kw`` -- the "no usable
+    calibration signal" case, same as this module's other norm-shape
+    checks (e.g. a probe whose captured input channel count doesn't match
+    the weight this Conv node claims, an already-declined-elsewhere kind
+    of malformed model this function simply doesn't guess at either).
+    """
+    cin_full = cin_per_group * group
+    if norm_flat.shape[0] != cin_full * kh * kw:
+        return None
+    norm_full = norm_flat.reshape(cin_full, kh, kw)
+    filters_per_group = cout // group
+    rows = np.empty((cout, cin_per_group * kh * kw), dtype=norm_flat.dtype)
+    for g in range(group):
+        block = norm_full[g * cin_per_group : (g + 1) * cin_per_group].reshape(-1)
+        rows[g * filters_per_group : (g + 1) * filters_per_group, :] = block
+    return rows
+
+
 def apply_magnitude_pruning(
     model: Union[str, onnx.ModelProto],
     sparsity: float = 0.5,
@@ -724,14 +864,16 @@ def apply_magnitude_pruning(
     """Zeros the least-magnitude entries of every MatMul/vanilla-Gemm
     layer's constant 2-D float32 weight (this includes
     ``com.microsoft::GroupQueryAttention``'s separate Q/K/V projections,
-    ordinary MatMul/Gemm nodes in their own right), every ordinary
-    (``group=1``) 2-D ``Conv`` layer's constant 4-D float32 weight, and
-    every ``com.microsoft::Attention`` node's constant 2-D float32 merged
-    QKV weight -- the data-free pruning baseline (Han et al., 2015). See
-    this module's own docstring for how importance is grouped (including
-    the Conv reshape convention), why the merged QKV weight needs no
-    special handling here beyond matching it (:func:`_candidates`, via
-    :func:`_match_attention_weight_only`), and why structured
+    ordinary MatMul/Gemm nodes in their own right), every 2-D ``Conv``
+    layer's constant 4-D float32 weight -- ordinary (``group=1``),
+    depthwise, and general grouped Conv alike, see this module's own
+    docstring for why grouping needs no special-casing for this technique
+    -- and every ``com.microsoft::Attention`` node's constant 2-D float32
+    merged QKV weight -- the data-free pruning baseline (Han et al., 2015).
+    See this module's own docstring for how importance is grouped
+    (including the Conv reshape convention), why the merged QKV weight
+    needs no special handling here beyond matching it (:func:`_candidates`,
+    via :func:`_match_attention_weight_only`), and why structured
     (shape-changing) pruning isn't offered here.
 
     :param model: the original onnx ModelProto or file path
@@ -744,8 +886,8 @@ def apply_magnitude_pruning(
     :param m: group size for N:M pruning; see ``n``
     :returns: ``model`` with every matched layer's weight zeroed in place
             to the target pattern; layers with a non-constant weight, a
-            non-2-D MatMul/Gemm weight, or a grouped/non-4-D Conv weight
-            are left untouched
+            non-2-D MatMul/Gemm weight, or a non-4-D Conv weight are left
+            untouched
     """
     _validate_pattern(sparsity, n, m)
     if isinstance(model, str):
@@ -785,20 +927,23 @@ def apply_wanda_pruning(
     """Wanda pruning (Sun et al., 2023): zeros the least-important entries
     of every MatMul/vanilla-Gemm layer's constant 2-D float32 weight (this
     includes ``com.microsoft::GroupQueryAttention``'s separate Q/K/V
-    projections, ordinary MatMul/Gemm nodes in their own right), every
-    ordinary (``group=1``) 2-D ``Conv`` layer's constant 4-D float32 weight,
-    and every ``com.microsoft::Attention`` node's constant 2-D float32
-    merged QKV weight, using ``|W_ij| * ||X_j||_2`` (weight magnitude times
-    its reduction-dimension entry's activation norm over calibration data)
-    as the importance metric instead of plain ``|W|``. See this module's own
+    projections, ordinary MatMul/Gemm nodes in their own right), every 2-D
+    ``Conv`` layer's constant 4-D float32 weight -- ordinary (``group=1``),
+    depthwise, and general grouped Conv alike -- and every
+    ``com.microsoft::Attention`` node's constant 2-D float32 merged QKV
+    weight, using ``|W_ij| * ||X_j||_2`` (weight magnitude times its
+    reduction-dimension entry's activation norm over calibration data) as
+    the importance metric instead of plain ``|W|``. See this module's own
     docstring for the technique -- including what ``X_j`` means for a Conv
     column (one ``(in_channel, kh, kw)`` receptive-field offset, not a
-    whole input channel), which Conv attribute combinations this confidently
-    handles, and why ``Attention``'s merged weight -- whose own activation
-    input is rank-3, not the plain 2-D tensor this metric requires -- always
-    falls back to plain magnitude here rather than being calibrated too --
-    and :func:`apply_magnitude_pruning` for the calibration-free baseline
-    this upgrades.
+    whole input channel), how a grouped/depthwise Conv's activation norm is
+    kept group-relative rather than shared across every filter
+    (:func:`_conv_group_relative_norm`), which Conv attribute combinations
+    this confidently handles, and why ``Attention``'s merged weight -- whose
+    own activation input is rank-3, not the plain 2-D tensor this metric
+    requires -- always falls back to plain magnitude here rather than being
+    calibrated too -- and :func:`apply_magnitude_pruning` for the
+    calibration-free baseline this upgrades.
 
     :param model: the original onnx ModelProto or file path
     :param calibration_data: representative input batches to measure each
@@ -825,14 +970,13 @@ def apply_wanda_pruning(
             when capturing calibration activations
     :returns: ``model`` with every matched layer's weight zeroed in place
             to the target pattern; a MatMul/Gemm layer with a non-constant
-            or non-2-D weight, a Conv layer with a grouped or non-4-D
-            weight, or any matched layer whose activation input isn't
-            usable (not a plain 2-D tensor for MatMul/Gemm or Attention --
-            Attention's own ``X`` input is always rank-3, so it always
-            falls into this case; not a 4-D NCHW tensor, or a Conv
-            attribute combination :func:`_conv_spatial_attrs` declines, for
-            Conv) falls back to plain magnitude pruning (no activation norm
-            was ever observed)
+            or non-2-D weight, a Conv layer with a non-4-D weight, or any
+            matched layer whose activation input isn't usable (not a plain
+            2-D tensor for MatMul/Gemm or Attention -- Attention's own
+            ``X`` input is always rank-3, so it always falls into this
+            case; not a 4-D NCHW tensor, or a Conv attribute combination
+            :func:`_conv_spatial_attrs` declines, for Conv) falls back to
+            plain magnitude pruning (no activation norm was ever observed)
     """
     _validate_pattern(sparsity, n, m)
     if isinstance(model, str):
@@ -900,15 +1044,40 @@ def apply_wanda_pruning(
         for name, s in conv_sq_sum.items()
     }
 
-    for _, x_name, w_name, weight_transposed, is_conv in candidates:
+    for node, x_name, w_name, weight_transposed, is_conv in candidates:
         w_init = initializer_map[w_name]
-        norm = conv_act_norm.get(w_name) if is_conv else act_norm.get(x_name)
+        # `norm` is always kept 2-D here, broadcastable elementwise against
+        # `w_nk` ([out_channels, K]) inside importance_of_nk below: shape
+        # (1, K) for a MatMul/Gemm layer (one shared norm row for every
+        # output channel, the same broadcast the plain
+        # ``norm[np.newaxis, :]`` used to do directly), or -- for Conv --
+        # shape (out_channels, K), already expanded per output filter's own
+        # group by :func:`_conv_group_relative_norm` (trivially identical
+        # across every row when ``group=1``, genuinely different per group
+        # otherwise -- see that function's own docstring for why a single
+        # shared row would be wrong for a grouped/depthwise Conv).
+        norm: Optional[np.ndarray]
+        if is_conv:
+            flat_norm = conv_act_norm.get(w_name)
+            norm = None
+            if flat_norm is not None:
+                cout, cin_per_group, kh, kw = (int(d) for d in w_init.dims)
+                norm = _conv_group_relative_norm(
+                    flat_norm, cout, cin_per_group, kh, kw, _conv_group(node)
+                )
+        else:
+            norm_flat = act_norm.get(x_name)
+            norm = norm_flat[np.newaxis, :] if norm_flat is not None else None
 
         def importance_of_nk(w_nk, norm=norm, n=n, m=m, sparsity=sparsity):
-            if norm is None or norm.shape[0] != w_nk.shape[1]:
+            if (
+                norm is None
+                or norm.shape[-1] != w_nk.shape[1]
+                or (norm.shape[0] != 1 and norm.shape[0] != w_nk.shape[0])
+            ):
                 importance = np.abs(w_nk)  # fall back to plain magnitude
             else:
-                importance = np.abs(w_nk) * np.maximum(norm, epsilon)[np.newaxis, :]
+                importance = np.abs(w_nk) * np.maximum(norm, epsilon)
             return (
                 _nm_mask(importance, n, m)
                 if n is not None
@@ -923,12 +1092,14 @@ def apply_wanda_pruning(
 def weight_sparsity(model: Union[str, onnx.ModelProto]) -> float:
     """Fraction of exact-zero entries across every matched MatMul/vanilla-
     Gemm layer (including ``com.microsoft::GroupQueryAttention``'s separate
-    Q/K/V projections), ordinary (``group=1``) 2-D Conv layer, or
-    ``com.microsoft::Attention`` merged-QKV-weight layer's constant weight
-    -- a quick way to confirm a pruning call reached its target, or to
-    measure an already-sparse model. Shares :func:`_candidates` with every
-    ``apply_*_pruning`` function above, so it automatically reports across
-    whatever layer types they match, with no separate list to keep in sync.
+    Q/K/V projections), 2-D Conv layer -- ordinary (``group=1``), depthwise,
+    and general grouped alike, since :func:`_candidates`'s default
+    `allow_grouped_conv` matches all three -- or ``com.microsoft::Attention``
+    merged-QKV-weight layer's constant weight -- a quick way to confirm a
+    pruning call reached its target, or to measure an already-sparse model.
+    Shares :func:`_candidates` with every ``apply_*_pruning`` function
+    above, so it automatically reports across whatever layer types they
+    match, with no separate list to keep in sync.
     Returns ``0.0`` if no matching layer is present.
     """
     if isinstance(model, str):
@@ -1108,19 +1279,23 @@ def apply_sparsegpt_pruning(
     output row within each ``proc_block_size``-wide column block (the
     reference implementation's own behavior), not chosen per row.
 
-    Also matches ordinary (``group=1``) 2-D ``Conv`` layers, exactly like
-    :func:`apply_magnitude_pruning`/:func:`apply_wanda_pruning` -- see
-    this module's own docstring for the full ``[K, K]`` im2col
-    cross-covariance Hessian this needed (materially more machinery than
-    Wanda's per-offset norm, and -- unlike everything else this function
-    ports from the reference implementation -- with no correct reference
-    to work from at all: the official implementation's own ``add_batch``
+    Also matches, unlike :func:`apply_magnitude_pruning`/
+    :func:`apply_wanda_pruning`, only *ordinary* (``group=1``) 2-D ``Conv``
+    layers (``_candidates(graph, allow_grouped_conv=False)``) -- see this
+    module's own docstring for the full ``[K, K]`` im2col cross-covariance
+    Hessian this needed (materially more machinery than Wanda's per-offset
+    norm, and -- unlike everything else this function ports from the
+    reference implementation -- with no correct reference to work from at
+    all: the official implementation's own ``add_batch``
     (https://github.com/IST-DASLab/sparsegpt) never actually unfolds a
     ``nn.Conv2d`` activation, only reshapes the *weight*, since its own
-    driver scripts never exercise a Conv layer), how it's verified, and
-    how ``H`` accumulates batch by batch rather than ever materializing
-    every calibration batch's unfolded patches at once. A Conv layer whose
-    ``auto_pad``/``dilations`` aren't a combination
+    driver scripts never exercise a Conv layer), how it's verified, why --
+    unlike magnitude/Wanda above -- extending it to depthwise/general
+    grouped Conv is deliberately left undone (a per-group Hessian and a
+    per-group column-processing loop, not a mechanical extension of the
+    matching alone), and how ``H`` accumulates batch by batch rather than
+    ever materializing every calibration batch's unfolded patches at once.
+    A Conv layer whose ``auto_pad``/``dilations`` aren't a combination
     :func:`_conv_spatial_attrs` confidently handles is left completely
     untouched, same as a layer with no observed calibration activation at
     all -- there is still no data-free fallback for SparseGPT.
@@ -1190,7 +1365,13 @@ def apply_sparsegpt_pruning(
     graph = out.graph
     initializer_map = {t.name: t for t in graph.initializer}
 
-    candidates = _candidates(graph)
+    # allow_grouped_conv=False: unlike apply_magnitude_pruning/
+    # apply_wanda_pruning, this function's Conv Hessian machinery
+    # (_conv_im2col_patches, H = patches.T @ patches) is only correct for
+    # group=1 -- see this function's own docstring and this module's own
+    # docstring for why extending it to grouped/depthwise Conv needs a real
+    # per-group Hessian this pass does not attempt.
+    candidates = _candidates(graph, allow_grouped_conv=False)
     if not candidates:
         return out
 

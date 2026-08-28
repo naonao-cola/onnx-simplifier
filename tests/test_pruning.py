@@ -205,11 +205,17 @@ def test_weight_sparsity_ignores_non_matching_layers():
 # --- magnitude/Wanda pruning: Conv2D -------------------------------------
 
 
-def _single_conv_model(w, spatial=10, extra_attrs="", out_spatial=None):
-    Cout, Cin, kh, kw = w.shape
+def _single_conv_model(w, spatial=10, extra_attrs="", out_spatial=None, group=1):
+    # `w`'s shape must already be [Cout, Cin/group, kH, kW] when `group` > 1
+    # -- same caller-responsibility convention `_grouped_conv_pair_model`
+    # below has.
+    Cout, Cin_per_group, kh, kw = w.shape
+    Cin = Cin_per_group * group
     if out_spatial is None:
         out_spatial = spatial - kh + 1  # no padding, unit stride
     attrs = f"kernel_shape=[{kh},{kw}]"
+    if group != 1:
+        attrs += f", group={group}"
     if extra_attrs:
         attrs += ", " + extra_attrs
     return _model(
@@ -274,19 +280,96 @@ def test_magnitude_pruning_conv_nm_pattern():
             assert np.count_nonzero(group) <= 2
 
 
-def test_magnitude_pruning_skips_grouped_conv():
-    # A depthwise Conv (group == in_channels == out_channels) is left
-    # completely untouched -- the same restriction the Conv2D structured
-    # pruning section's own producer/consumer matching draws (see
-    # :func:`_match_conv_weight_only`'s own docstring).
+def test_magnitude_pruning_conv_depthwise_reaches_target_sparsity_and_matches_oracle():
+    # Unlike the earlier restriction this module used to draw (mirroring
+    # structured pruning's producer/consumer channel-index coupling
+    # problem, which does not actually apply to unstructured pruning at
+    # all -- see this module's own docstring and
+    # :func:`_match_conv_weight_only`'s), a depthwise Conv (group ==
+    # in_channels == out_channels) is now pruned per-filter exactly like an
+    # ordinary Conv's own filters: each of its `C` single-input-channel
+    # filters is its own independent comparison group.
     C = 8
     rng = np.random.default_rng(63)
-    w = rng.standard_normal((C, 1, 3, 3)).astype(np.float32)
+    w = rng.standard_normal((C, 1, 4, 4)).astype(np.float32)  # K=16, halved exactly
+    model = _single_conv_model(w, spatial=10, group=C)
+
+    pruned = onnxsim.apply_magnitude_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    assert onnxsim.weight_sparsity(pruned) == pytest.approx(0.5, abs=1e-9)
+    w_pruned = _conv_weight(pruned)
+    assert w_pruned.shape == w.shape
+    # group/kernel_shape attributes (and hence output shape) are untouched
+    # -- this is a value-only rewrite.
+    conv_node = pruned.graph.node[0]
+    assert next(a.i for a in conv_node.attribute if a.name == "group") == C
+
+    K = 1 * 4 * 4  # each filter's own single-channel kernel
+    w_flat = w.astype(np.float64).reshape(C, K)
+    keep = round(K * 0.5)
+    order = np.argsort(np.abs(w_flat), axis=1)
+    mask = np.ones((C, K), dtype=bool)
+    np.put_along_axis(mask, order[:, : K - keep], False, axis=1)
+    oracle_w = np.where(mask, w_flat, 0.0).reshape(w.shape).astype(np.float32)
+    np.testing.assert_array_equal(w_pruned, oracle_w)
+
+    oracle = _single_conv_model(oracle_w, spatial=10, group=C)
+    rng_x = np.random.default_rng(64)
+    x = rng_x.standard_normal((2, C, 10, 10)).astype(np.float32)
+    (y_pruned,) = _run(pruned, {"X": x})
+    (y_oracle,) = _run(oracle, {"X": x})
+    np.testing.assert_allclose(y_pruned, y_oracle, rtol=1e-5, atol=1e-5)
+
+
+def test_magnitude_pruning_conv_general_grouped_reaches_target_sparsity_and_matches_oracle():
+    # A general grouped Conv (1 < group < in_channels): each of the 8
+    # output filters -- 4 per group -- is still its own independent
+    # per-filter comparison group, exactly like the group=1 case; `group`
+    # only changes what each filter's own [Cin/group, kH, kW] kernel
+    # covers, never how filters are ranked against each other.
+    Cin, Cout, group = 8, 8, 2  # K = (Cin/group)*3*3 = 36
+    rng = np.random.default_rng(65)
+    w = rng.standard_normal((Cout, Cin // group, 3, 3)).astype(np.float32)
+    model = _single_conv_model(w, spatial=10, group=group)
+
+    pruned = onnxsim.apply_magnitude_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    assert onnxsim.weight_sparsity(pruned) == pytest.approx(0.5, abs=1e-9)
+    w_pruned = _conv_weight(pruned)
+    assert w_pruned.shape == w.shape
+    conv_node = pruned.graph.node[0]
+    assert next(a.i for a in conv_node.attribute if a.name == "group") == group
+
+    K = (Cin // group) * 3 * 3
+    w_flat = w.astype(np.float64).reshape(Cout, K)
+    keep = round(K * 0.5)
+    order = np.argsort(np.abs(w_flat), axis=1)
+    mask = np.ones((Cout, K), dtype=bool)
+    np.put_along_axis(mask, order[:, : K - keep], False, axis=1)
+    oracle_w = np.where(mask, w_flat, 0.0).reshape(w.shape).astype(np.float32)
+    np.testing.assert_array_equal(w_pruned, oracle_w)
+
+    oracle = _single_conv_model(oracle_w, spatial=10, group=group)
+    rng_x = np.random.default_rng(66)
+    x = rng_x.standard_normal((2, Cin, 10, 10)).astype(np.float32)
+    (y_pruned,) = _run(pruned, {"X": x})
+    (y_oracle,) = _run(oracle, {"X": x})
+    np.testing.assert_allclose(y_pruned, y_oracle, rtol=1e-5, atol=1e-5)
+
+
+def test_magnitude_pruning_skips_malformed_grouped_conv():
+    # out_channels % group != 0 -- not a valid grouped-Conv shape (`group`
+    # equal-sized output blocks is required, the same well-formedness
+    # :func:`_match_conv_producer` already requires for structured pruning)
+    # -- :func:`_match_conv_weight_only` declines it rather than guessing.
+    Cout, group = 6, 4  # 6 % 4 != 0; Cin/group = 1 (Cin=4) is otherwise valid
+    rng = np.random.default_rng(67)
+    w = rng.standard_normal((Cout, 1, 3, 3)).astype(np.float32)
     model = _model(
         f"""
-        g (float[N,{C},10,10] X) => (float[N,{C},8,8] Y)
+        g (float[N,4,10,10] X) => (float[N,{Cout},8,8] Y)
         {{
-          Y = Conv<kernel_shape=[3,3], group={C}>(X, W1)
+          Y = Conv<kernel_shape=[3,3], group={group}>(X, W1)
         }}
         """,
         initializer=[_f32(w, "W1")],
@@ -501,24 +584,162 @@ def test_wanda_pruning_conv_falls_back_to_magnitude_for_dilated_conv():
     )
 
 
+def test_wanda_pruning_conv_grouped_uses_own_groups_activation_norm():
+    # The test that actually proves _conv_group_relative_norm's correctness
+    # (not just "it runs"): a general grouped Conv (group=2, 4 filters per
+    # group) whose two groups' calibration input channels are engineered to
+    # have wildly different activation magnitude -- group 0's input channel
+    # carries a much larger norm than group 1's. Every filter's own weight
+    # magnitude is identical across both groups (same `w` block, just
+    # tiled), so plain magnitude pruning treats every filter identically,
+    # but Wanda must not: group 0's filters should end up importance-
+    # weighted (and therefore masked) according to group 0's own inflated
+    # activation norm, and group 1's filters according to group 1's own
+    # (much smaller, unmodified) norm -- not a global average and not one
+    # group's statistic bleeding into the other's filters, which is exactly
+    # the bug a single shared per-offset norm (as if every filter read the
+    # full input) would silently produce for every group but the first.
+    Cin_per_group, Cout, group, spatial = 2, 8, 2, 8
+    filters_per_group = Cout // group
+    rng = np.random.default_rng(90)
+    # Same weight block reused for both groups so the two groups' own
+    # weight magnitude carries no information -- any masking difference
+    # between the two groups can only come from the activation norm.
+    w_block = rng.standard_normal((filters_per_group, Cin_per_group, 3, 3)).astype(
+        np.float32
+    )
+    w = np.concatenate([w_block, w_block], axis=0)
+    model = _single_conv_model(w, spatial=spatial, group=group)
+
+    Cin = Cin_per_group * group
+    x = rng.standard_normal((4, Cin, spatial, spatial)).astype(np.float32)
+    x[:, :Cin_per_group, :, :] *= 50.0  # group 0's input channels only
+
+    pruned = onnxsim.apply_wanda_pruning(
+        model, calibration_data=[{"X": x}], sparsity=0.5
+    )
+    onnx.checker.check_model(pruned)
+    w_pruned = _conv_weight(pruned)
+
+    # Group 0's filters (indices 0:4) see their own group's inflated norm,
+    # group 1's (4:8) their own group's ordinary norm -- despite starting
+    # from bit-identical weight blocks, the two groups' resulting masks
+    # must therefore differ (a global-average or group-0-shared norm would
+    # instead make every filter's mask identical, both groups included).
+    group0_mask = w_pruned[:filters_per_group] != 0
+    group1_mask = w_pruned[filters_per_group:] != 0
+    assert not np.array_equal(group0_mask, group1_mask)
+
+    # And each group's own mask must independently match a manually
+    # unfolded, per-group im2col oracle -- not merely "differ from the
+    # other group", but the *correct* per-group statistic.
+    out_spatial = spatial - 3 + 1
+    K = Cin_per_group * 3 * 3
+    for g in range(group):
+        x_group = x[:, g * Cin_per_group : (g + 1) * Cin_per_group, :, :]
+        patches = np.zeros(
+            (x.shape[0] * out_spatial * out_spatial, K), dtype=np.float64
+        )
+        idx = 0
+        for ni in range(x.shape[0]):
+            for oh in range(out_spatial):
+                for ow in range(out_spatial):
+                    patch = x_group[ni, :, oh : oh + 3, ow : ow + 3].astype(np.float64)
+                    patches[idx] = patch.reshape(-1)
+                    idx += 1
+        act_norm = np.sqrt(np.mean(np.square(patches), axis=0))
+
+        w_flat = w_block.astype(np.float64).reshape(filters_per_group, K)
+        importance = np.abs(w_flat) * act_norm[np.newaxis, :]
+        keep = round(K * 0.5)
+        order = np.argsort(importance, axis=1)
+        mask = np.ones((filters_per_group, K), dtype=bool)
+        np.put_along_axis(mask, order[:, : K - keep], False, axis=1)
+        expected = np.where(mask, w_flat, 0.0).reshape(w_block.shape)
+
+        got = w_pruned[g * filters_per_group : (g + 1) * filters_per_group]
+        np.testing.assert_allclose(got.astype(np.float64), expected)
+
+
+def test_wanda_pruning_conv_depthwise_matches_manual_group_relative_oracle_exactly():
+    # Depthwise Conv (group == in_channels == out_channels): each output
+    # filter reads exactly one input channel, so _conv_group_relative_norm
+    # degenerates to "each filter's own channel's own norm" -- checked here
+    # against a manual per-channel im2col oracle, the same bar
+    # test_wanda_pruning_conv_matches_manual_im2col_importance_oracle_exactly
+    # already sets for the group=1 case.
+    C, kh, kw, spatial = 6, 3, 3, 8
+    rng = np.random.default_rng(91)
+    w = rng.standard_normal((C, 1, kh, kw)).astype(np.float32)
+    model = _single_conv_model(w, spatial=spatial, group=C)
+
+    rng_x = np.random.default_rng(92)
+    x = rng_x.standard_normal((3, C, spatial, spatial)).astype(np.float32)
+    x[:, 2, :, :] *= 15.0  # one channel salient -- only its own filter cares
+
+    pruned = onnxsim.apply_wanda_pruning(
+        model, calibration_data=[{"X": x}], sparsity=0.5
+    )
+    onnx.checker.check_model(pruned)
+    w_pruned = _conv_weight(pruned)
+
+    out_spatial = spatial - kh + 1
+    K = kh * kw
+    expected = np.zeros_like(w)
+    for c in range(C):
+        patches = np.zeros(
+            (x.shape[0] * out_spatial * out_spatial, K), dtype=np.float64
+        )
+        idx = 0
+        for ni in range(x.shape[0]):
+            for oh in range(out_spatial):
+                for ow in range(out_spatial):
+                    patch = x[ni, c, oh : oh + kh, ow : ow + kw].astype(np.float64)
+                    patches[idx] = patch.reshape(-1)
+                    idx += 1
+        act_norm = np.sqrt(np.mean(np.square(patches), axis=0))
+        w_flat = w[c].astype(np.float64).reshape(1, K)
+        importance = np.abs(w_flat) * act_norm[np.newaxis, :]
+        keep = round(K * 0.5)
+        order = np.argsort(importance, axis=1)
+        mask = np.ones((1, K), dtype=bool)
+        np.put_along_axis(mask, order[:, : K - keep], False, axis=1)
+        expected[c] = np.where(mask, w_flat, 0.0).reshape(1, kh, kw)
+
+    np.testing.assert_allclose(w_pruned.astype(np.float64), expected)
+
+
 def test_sparsegpt_pruning_conv_skips_grouped_conv():
     # A depthwise Conv (group == in_channels == out_channels) is left
-    # completely untouched -- apply_sparsegpt_pruning reuses _candidates()'s
-    # own group=1 matching, so this is the same restriction
-    # test_magnitude_pruning_skips_grouped_conv already exercises.
+    # completely untouched -- unlike apply_magnitude_pruning/
+    # apply_wanda_pruning (which now do match depthwise/general grouped
+    # Conv, see test_magnitude_pruning_conv_depthwise_reaches_target_
+    # sparsity_and_matches_oracle and friends above),
+    # apply_sparsegpt_pruning deliberately calls
+    # _candidates(graph, allow_grouped_conv=False) -- its Conv Hessian
+    # machinery is group=1-only, see this module's own docstring.
     C = 8
     rng = np.random.default_rng(76)
     w = rng.standard_normal((C, 1, 3, 3)).astype(np.float32)
-    model = _model(
-        f"""
-        g (float[N,{C},10,10] X) => (float[N,{C},8,8] Y)
-        {{
-          Y = Conv<kernel_shape=[3,3], group={C}>(X, W1)
-        }}
-        """,
-        initializer=[_f32(w, "W1")],
-    )
+    model = _single_conv_model(w, spatial=10, group=C)
     x_cal = rng.standard_normal((4, C, 10, 10)).astype(np.float32)
+
+    pruned = onnxsim.apply_sparsegpt_pruning(
+        model, calibration_data=[{"X": x_cal}], sparsity=0.5
+    )
+    np.testing.assert_array_equal(_conv_weight(pruned), w)
+
+
+def test_sparsegpt_pruning_conv_skips_general_grouped_conv():
+    # Same restriction as the depthwise case above, for a general grouped
+    # Conv (1 < group < in_channels) instead: apply_sparsegpt_pruning's
+    # allow_grouped_conv=False excludes it too, even though
+    # apply_magnitude_pruning/apply_wanda_pruning now match it.
+    Cin, Cout, group = 8, 8, 2
+    rng = np.random.default_rng(77)
+    w = rng.standard_normal((Cout, Cin // group, 3, 3)).astype(np.float32)
+    model = _single_conv_model(w, spatial=10, group=group)
+    x_cal = rng.standard_normal((4, Cin, 10, 10)).astype(np.float32)
 
     pruned = onnxsim.apply_sparsegpt_pruning(
         model, calibration_data=[{"X": x_cal}], sparsity=0.5
