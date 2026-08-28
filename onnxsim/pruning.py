@@ -108,9 +108,11 @@ or non-all-ones ``dilations``, since a dilated receptive field's offsets
 aren't evenly spaced in the padded input the way ``sliding_window_view``
 assumes) falls back to plain magnitude for that layer, the same as any
 other layer whose activation norm was never observed.
-:func:`apply_sparsegpt_pruning` deliberately does **not** extend to Conv --
-see its own docstring for why a coarse approximation there would be worse
-than no compensation at all, not just less precise.
+:func:`apply_sparsegpt_pruning` now also matches those same ordinary
+(``group=1``) 2-D ``Conv`` layers -- see its own docstring below for the
+full ``[K, K]`` im2col cross-covariance Hessian this needed (a real step
+up from Wanda's per-offset norm above, not just a reuse of it) and how
+it's verified.
 
 Both magnitude and Wanda pruning support two sparsity patterns, chosen per
 invocation:
@@ -138,39 +140,81 @@ output channels (the same one :func:`apply_magnitude_pruning`/
 criteria); for a Conv chain it is the paper's own original setting, applied
 directly: each output filter's full ``[in_channels, kH, kW]`` kernel is
 flattened and ranked by its own L2 norm. Conv support is deliberately
-narrower than the MatMul/Gemm path: only ordinary (``group=1``) 2-D
-``Conv`` producers/consumers are matched, joined by unary activations alone
--- no per-channel ``Add``/``Mul`` scale-or-bias op, since a real Conv
+narrower than the MatMul/Gemm path in one respect that stays true
+regardless of grouping: producers/consumers are joined by unary activations
+alone -- no per-channel ``Add``/``Mul`` scale-or-bias op, since a real Conv
 already carries any bias in its own optional third input, and
 ``BatchNormalization`` is expected to already be fused into the preceding
 Conv's weight by the time this pass runs (onnxsim's own default
 optimization does exactly that, see ``fuse_bn_into_conv``), so a raw
 per-channel affine between two Convs isn't a shape this pass special-cases.
-A *general* grouped Conv (``group`` neither 1 nor equal to its channel
-count) is left untouched entirely: its output and input channels aren't
-independent per-index the way this pass's single producer/consumer cut
-assumes, and safely cutting a shared group's channels needs real
-group-aware bookkeeping this pass does not attempt (the same boundary
-attention-head pruning below draws around GroupQueryAttention). The
-*depthwise* special case (``group == in_channels == out_channels``,
-weight ``[C, 1, kH, kW]``) is different: with one filter per channel and
-no cross-channel mixing at all, output channel ``i`` depends only on
-input channel ``i``, so a depthwise Conv sitting between a chain's real
-producer and real consumer needs no independent importance of its own --
-the chain walk (:func:`_walk_to_conv_consumer`) crosses it transparently,
-like one more shape-preserving activation hop, carrying whatever
-channel-index set survives upstream straight through unchanged, while
-still slicing that depthwise layer's own weight/bias by the same indices
-and shrinking its ``group`` attribute to match. This is exactly the
-``Conv(1x1, group=1) -> DepthwiseConv(3x3, group=C) -> Conv(1x1,
-group=1)`` "inverted residual" block MobileNet/EfficientNet-style
-efficient CNN backbones use throughout, so it's worth the special case; a
-depthwise Conv is never itself matched as a producer or consumer (see
+
+Within that, three ``group`` shapes are distinguished. Ordinary
+(``group=1``) Conv is the base case already described above. The
+*depthwise* special case (``group == in_channels == out_channels``, weight
+``[C, 1, kH, kW]``) is different: with one filter per channel and no
+cross-channel mixing at all, output channel ``i`` depends only on input
+channel ``i``, so a depthwise Conv sitting between a chain's real producer
+and real consumer needs no independent importance of its own -- the chain
+walk (:func:`_walk_to_conv_consumer`) crosses it transparently, like one
+more shape-preserving activation hop, carrying whatever channel-index set
+survives upstream straight through unchanged, while still slicing that
+depthwise layer's own weight/bias by the same indices and shrinking its
+``group`` attribute to match. This is exactly the ``Conv(1x1, group=1) ->
+DepthwiseConv(3x3, group=C) -> Conv(1x1, group=1)`` "inverted residual"
+block MobileNet/EfficientNet-style efficient CNN backbones use throughout,
+so it's worth the special case; a depthwise Conv is never itself matched as
+a producer or consumer (see
 :func:`_match_conv_producer`/:func:`_match_conv_consumer`), only ever a
-transparent hop between two real ``group=1`` Conv boundaries -- one
-sitting last before a graph output or an unhandled branch simply ends the
-chain unmatched, same as any other topology this pass declines to guess
-at.
+transparent hop between two real Conv boundaries -- one sitting last before
+a graph output or an unhandled branch simply ends the chain unmatched, same
+as any other topology this pass declines to guess at.
+
+A *general* grouped Conv (``group`` neither 1 nor equal to its channel
+count, weight ``[out_channels, in_channels/group, kH, kW]``) is the
+remaining case, and -- unlike the fully-out-of-scope treatment an earlier
+version of this pass gave it -- is now matched as a real producer and/or
+consumer, because its structure turns out to be tractable in a way general
+dependency-graph coupling isn't: since a grouped Conv's ``group`` blocks
+never mix (full mixing *within* a block, none across), pruning block ``k``
+is completely independent of every other block, as long as the *same
+count* is pruned from every block (so ``channels % group == 0`` survives,
+exactly as ONNX's Conv schema requires). Concretely:
+
+- **As a producer**, its output-channel axis is flat/global regardless of
+  grouping (grouping only ever splits the *input* axis), so each of its
+  ``group`` output-filter blocks is ranked and pruned independently by the
+  same per-filter L2-norm criterion above, applied within each block's own
+  slice rather than across the whole ``out_channels`` axis -- keeping the
+  same count from every block.
+- **As a consumer**, its input-channel axis *is* per-group-relative (weight
+  column ``j`` on a filter belonging to group ``g`` means global input
+  channel ``g * (in_channels / group) + j``, not global channel ``j``), so
+  slicing it needs dedicated per-group-relative logic
+  (:func:`_slice_grouped_consumer_conv_weight`) rather than the flat
+  column selection an ordinary consumer's weight uses -- but the *set* of
+  surviving channels is still whatever the chain's producer side decided,
+  now constrained to keep a uniform count within each of the consumer's own
+  ``group`` blocks.
+- **Composing the two**: a grouped producer feeding an ordinary
+  (``group=1``) consumer is supported -- the consumer imposes no grouping
+  constraint of its own, so the producer's own per-block selection is
+  already all that's needed. An ordinary producer feeding a grouped
+  consumer is likewise supported -- the producer has no grouping constraint
+  of its own either, so its selection is simply constrained to the
+  consumer's own block boundaries instead of an unconstrained global top-k.
+  Both sides grouped is supported *only* when both share the exact same
+  ``group`` count (their blocks then partition the shared channel count
+  identically, so either side's per-block selection already satisfies the
+  other); a mismatched ``group`` count on the two sides is declined
+  outright and the whole chain is left untouched, since the two sides'
+  block boundaries then wouldn't generally align at all, and reconciling
+  that would need real cross-chain bookkeeping this pass does not attempt
+  (the same kind of boundary attention-head pruning below draws around
+  GroupQueryAttention, and general residual/branch dependency-graph
+  coupling is left out of this pass entirely). See
+  :func:`_match_conv_producer`/:func:`_match_conv_consumer`/
+  :func:`_chain_group` for the exact matching and selection logic.
 :func:`apply_structured_wanda_pruning` is the calibrated upgrade of that
 same technique -- ``||W_row||_2 * ||X||_2`` per channel instead of weight
 magnitude alone -- exactly the same relationship Wanda has to plain
@@ -213,6 +257,54 @@ here rather than "corrected" to match, since the point of this function is
 to reproduce SparseGPT specifically. N:M pruning is unaffected (it is
 already per-row in the reference too, and matches this module's own
 ``n``/``m`` convention exactly).
+
+:func:`apply_sparsegpt_pruning` also matches ordinary (``group=1``) 2-D
+``Conv`` layers, using exactly the same producer matching, Cholesky
+machinery, and column-processing loop above -- the only genuinely new
+piece is how ``H`` itself gets built. For a MatMul/Gemm layer
+``H = X.T @ X`` is already a full cross-covariance, since each column
+*is* an independent input feature; for Conv, a weight column instead
+indexes one ``(in_channel, kh, kw)`` receptive-field offset (the same
+reshape :func:`apply_magnitude_pruning`/:func:`apply_wanda_pruning` and
+:func:`apply_structured_pruning` already use), so a correct ``H`` needs
+the full ``[K, K]`` cross-covariance of every offset against every other
+-- not merely each offset's own norm the way Wanda's diagonal-only
+``_conv_patch_sq_sum`` needs. :func:`_conv_im2col_patches` builds that:
+the same zero-padded ``numpy.lib.stride_tricks.sliding_window_view``
+unfolding :func:`_conv_patch_sq_sum` already does (reusing
+:func:`_conv_spatial_attrs` for the padding/stride extraction, and
+declining the same ``auto_pad``/non-unit-``dilations`` combinations that
+function does -- in which case the layer is left completely untouched,
+there being no data-free fallback for SparseGPT, Conv included), but
+returning the actual ``[n_positions, K]`` patch matrix rather than
+reducing straight to a per-offset sum of squares, so ``H = patches.T @
+patches`` can be formed from it. Verified two independent ways before
+being trusted here: a brute-force nested-loop oracle that builds the same
+``[K, K]`` Hessian a completely different way (one Python triple-loop per
+output position, accumulating an explicit outer product, rather than any
+vectorized unfolding), the same bar
+``test_conv_patch_sq_sum_matches_naive_nested_loop_oracle`` already set
+for Wanda's per-offset norm; and, end to end, the same reconstruction-
+error property the MatMul/Gemm path is already validated against -- a
+SparseGPT-pruned Conv layer's output should reconstruct the float layer's
+output at least as well as naive same-mask zeroing with no compensation,
+on well-conditioned calibration data. Because a full patch matrix for a
+realistic layer can be large (``n_positions`` grows with output spatial
+size, not just channel count), ``H`` accumulates incrementally, one
+calibration batch's own unfolded patches at a time (``H += patches.T @
+patches``, each batch's patches discarded once folded in), rather than
+ever concatenating every batch's patches into one array first the way the
+MatMul/Gemm path above still concatenates its (much smaller, already
+per-feature) 2-D activations. Unlike the reference implementation's own
+``add_batch`` (https://github.com/IST-DASLab/sparsegpt/blob/master/
+sparsegpt.py), which never actually unfolds a Conv2d activation at all --
+its Conv branch reshapes only the *weight* (``W.flatten(1)``), and its own
+driver scripts (``opt.py``, ``llama.py``, ...) never exercise a Conv layer
+in the first place, since OPT/BLOOM/Llama have none -- there was no
+correct reference to port here, unlike every other technique this module
+ports from an upstream implementation; this is original, from-first-
+principles machinery, held to the verification bar above precisely
+because of that.
 """
 
 from __future__ import annotations
@@ -798,6 +890,61 @@ def _sparsegpt_prune_columns(
     return w_pruned
 
 
+def _conv_im2col_patches(
+    x: np.ndarray, attrs: _ConvSpatialAttrs
+) -> Optional[np.ndarray]:
+    """Returns the ``[n_positions, Cin*kh*kw]`` im2col-unfolded patch
+    matrix for one calibration batch's raw ``[N, Cin, H, W]`` Conv input
+    `x` -- every output spatial position's full receptive-field patch,
+    flattened in the same ``(in_channel, kh, kw)`` row-major order
+    :func:`_prune_weight`'s own ``w.reshape(n, cin*kh*kw)`` uses (verified
+    against a nested-loop oracle by
+    ``test_sparsegpt_conv_hessian_matches_naive_nested_loop_oracle``).
+    SparseGPT's Conv Hessian is ``H = patches.T @ patches``, this
+    function's own return value being the only new piece: everything else
+    (the zero-padded ``numpy.lib.stride_tricks.sliding_window_view``
+    unfolding, the attribute handling) mirrors
+    :func:`_conv_patch_sq_sum` exactly, reusing the same
+    :class:`_ConvSpatialAttrs`/:func:`_conv_spatial_attrs` Wanda's own
+    Conv support already built -- see this module's own docstring for why
+    a *diagonal-only* per-offset norm (Wanda's ``_conv_patch_sq_sum``) is
+    not enough here and the *full* cross-covariance this returns is
+    needed instead. Returns ``None`` on the same "not usable" conditions
+    :func:`_conv_patch_sq_sum` declines (not a rank-4 activation, or too
+    small once padded for this kernel).
+    """
+    if x.ndim != 4:
+        return None
+    n, cin = x.shape[0], x.shape[1]
+    xp = np.pad(
+        x,
+        (
+            (0, 0),
+            (0, 0),
+            (attrs.pad_top, attrs.pad_bottom),
+            (attrs.pad_left, attrs.pad_right),
+        ),
+    )
+    if xp.shape[2] < attrs.kh or xp.shape[3] < attrs.kw:
+        return None
+    # [N, Cin, Hfull, Wfull, kh, kw], Hfull/Wfull at unit stride.
+    windows = np.lib.stride_tricks.sliding_window_view(
+        xp, (attrs.kh, attrs.kw), axis=(2, 3)
+    )
+    windows = windows[:, :, :: attrs.stride_h, :: attrs.stride_w, :, :]
+    h_out, w_out = windows.shape[2], windows.shape[3]
+    n_positions = n * h_out * w_out
+    if n_positions == 0:
+        return None
+    # [N, Cin, Hout, Wout, kh, kw] -> [N, Hout, Wout, Cin, kh, kw]: moves
+    # every output position to the leading axes and (in_channel, kh, kw)
+    # to the trailing ones, so the final reshape's row-major flatten of
+    # those trailing axes matches w.reshape(n, cin*kh*kw)'s own column
+    # order exactly.
+    patches = np.transpose(windows, (0, 2, 3, 1, 4, 5))
+    return patches.reshape(n_positions, cin * attrs.kh * attrs.kw)
+
+
 def apply_sparsegpt_pruning(
     model: Union[str, onnx.ModelProto],
     calibration_data: Optional[Sequence[Tensors]] = None,
@@ -823,25 +970,22 @@ def apply_sparsegpt_pruning(
     output row within each ``proc_block_size``-wide column block (the
     reference implementation's own behavior), not chosen per row.
 
-    Unlike :func:`apply_magnitude_pruning`/:func:`apply_wanda_pruning`,
-    this function does **not** match Conv layers, on purpose. SparseGPT's
-    correctness rests entirely on ``H`` accurately capturing which columns
-    correlate -- error compensation propagated through a wrong Hessian
-    would actively produce a *worse* result than no compensation at all
-    (i.e. than magnitude pruning), not just a less-precise one. A correct
-    Conv Hessian needs the full ``[K, K]`` cross-covariance of every
-    ``(in_channel, kh, kw)`` receptive-field offset against every other,
-    accumulated from the same im2col-unfolded patch matrix
-    :func:`apply_wanda_pruning` builds per-offset norms from (here,
-    ``patches.T @ patches`` in place of this function's own MatMul/Gemm
-    ``h = x.T @ x``) -- a materially bigger piece of new numerical
-    machinery than Wanda's per-offset norm, and not yet built. Nor is
-    there a correct reference to port: the official implementation's own
-    ``add_batch`` (https://github.com/IST-DASLab/sparsegpt) has no actual
-    im2col unfolding for ``nn.Conv2d`` (that branch handles only the
-    weight reshape; the codebase is only ever exercised on OPT/BLOOM,
-    which have zero Conv layers). Rather than ship an unverified from-
-    scratch Hessian, Conv is left unmatched here for now.
+    Also matches ordinary (``group=1``) 2-D ``Conv`` layers, exactly like
+    :func:`apply_magnitude_pruning`/:func:`apply_wanda_pruning` -- see
+    this module's own docstring for the full ``[K, K]`` im2col
+    cross-covariance Hessian this needed (materially more machinery than
+    Wanda's per-offset norm, and -- unlike everything else this function
+    ports from the reference implementation -- with no correct reference
+    to work from at all: the official implementation's own ``add_batch``
+    (https://github.com/IST-DASLab/sparsegpt) never actually unfolds a
+    ``nn.Conv2d`` activation, only reshapes the *weight*, since its own
+    driver scripts never exercise a Conv layer), how it's verified, and
+    how ``H`` accumulates batch by batch rather than ever materializing
+    every calibration batch's unfolded patches at once. A Conv layer whose
+    ``auto_pad``/``dilations`` aren't a combination
+    :func:`_conv_spatial_attrs` confidently handles is left completely
+    untouched, same as a layer with no observed calibration activation at
+    all -- there is still no data-free fallback for SparseGPT.
 
     :param model: the original onnx ModelProto or file path
     :param calibration_data: representative input batches to compute each
@@ -875,9 +1019,12 @@ def apply_sparsegpt_pruning(
     :returns: ``model`` with every matched layer's weight rewritten in
             place to the target pattern -- every surviving entry may also
             change value, having accumulated compensation for entries
-            pruned before it; a layer with no observed 2-D calibration
-            activation (dead input, or every batch's activation isn't
-            plain 2-D/higher-rank-with-a-trailing-feature-axis) is left
+            pruned before it; a MatMul/Gemm layer with no observed 2-D
+            calibration activation (dead input, or every batch's
+            activation isn't plain 2-D/higher-rank-with-a-trailing-
+            feature-axis), or a Conv layer with no observed usable 4-D
+            activation (dead input, or an ``auto_pad``/``dilations``
+            combination :func:`_conv_spatial_attrs` declines), is left
             completely untouched -- unlike Wanda, there is no data-free
             fallback for a technique whose entire mechanism is the Hessian
     """
@@ -894,42 +1041,88 @@ def apply_sparsegpt_pruning(
     graph = out.graph
     initializer_map = {t.name: t for t in graph.initializer}
 
-    candidates = _candidates(graph, include_conv=False)
+    candidates = _candidates(graph)
     if not candidates:
         return out
 
     probe_names = sorted({x_name for _, x_name, _, _, _ in candidates})
     probe_model = _add_probe_outputs(out, probe_names)
 
-    activations: Dict[str, List[np.ndarray]] = {name: [] for name in probe_names}
+    # Conv attributes are per-node (two Convs can share an input tensor
+    # with different kernels/strides), so the Conv Hessian below is keyed
+    # by its own weight name, mirroring apply_wanda_pruning's own
+    # conv_attrs/conv_act_norm.
+    conv_attrs: Dict[str, Optional[_ConvSpatialAttrs]] = {
+        w_name: _conv_spatial_attrs(node, initializer_map[w_name])
+        for node, _, w_name, _, is_conv in candidates
+        if is_conv
+    }
+
+    activations: Dict[str, List[np.ndarray]] = {
+        x_name: [] for _, x_name, _, _, is_conv in candidates if not is_conv
+    }
+    # Unlike the MatMul/Gemm activations above (each layer's whole
+    # calibration set concatenated once, below -- small enough per layer
+    # to keep entirely in memory), each Conv layer's H accumulates
+    # incrementally, one calibration batch's own im2col-unfolded patch
+    # matrix at a time: a full [n_positions, K] patch matrix can be large,
+    # so no batch's patches outlive the H += they fold into. See this
+    # module's own docstring.
+    conv_h: Dict[str, np.ndarray] = {}
+
     for batch in calibration_data:
         result = backend.run_model(probe_model, batch, providers=providers)
-        for name in probe_names:
+        for name in activations:
             x = np.asarray(result[name], dtype=np.float64)
             if x.ndim < 2:
                 continue
             activations[name].append(x.reshape(-1, x.shape[-1]))
+        for _, x_name, w_name, _, is_conv in candidates:
+            if not is_conv:
+                continue
+            attrs = conv_attrs[w_name]
+            if attrs is None:
+                continue
+            x_conv = np.asarray(result[x_name], dtype=np.float64)
+            patches = _conv_im2col_patches(x_conv, attrs)
+            if patches is None:
+                continue
+            h_batch = patches.T @ patches
+            conv_h[w_name] = (
+                h_batch if w_name not in conv_h else conv_h[w_name] + h_batch
+            )
 
-    for _, x_name, w_name, weight_transposed, _ in candidates:
-        acts = activations[x_name]
-        if not acts:
-            continue
-        x = np.concatenate(acts, axis=0)
-
+    for _, x_name, w_name, weight_transposed, is_conv in candidates:
         w_init = initializer_map[w_name]
         w = onnx.numpy_helper.to_array(w_init).astype(np.float64)
-        dim0, dim1 = w.shape
-        w_nk = w if weight_transposed else w.T  # [N, K]
-        if x.shape[1] != w_nk.shape[1]:
-            continue
 
-        h = x.T @ x
-        w_pruned_nk = _sparsegpt_prune_columns(
-            w_nk, h, sparsity, n, m, percdamp, proc_block_size
-        )
+        if is_conv:
+            cout, cin, kh, kw = w.shape
+            h = conv_h.get(w_name)
+            if h is None:
+                continue
+            w_nk = w.reshape(cout, cin * kh * kw)
+            w_pruned_nk = _sparsegpt_prune_columns(
+                w_nk, h, sparsity, n, m, percdamp, proc_block_size
+            )
+            w_new = w_pruned_nk.reshape(cout, cin, kh, kw).astype(np.float32)
+        else:
+            acts = activations[x_name]
+            if not acts:
+                continue
+            x = np.concatenate(acts, axis=0)
+            dim0, dim1 = w.shape
+            w_nk = w if weight_transposed else w.T  # [N, K]
+            if x.shape[1] != w_nk.shape[1]:
+                continue
 
-        w_new = w_pruned_nk if weight_transposed else w_pruned_nk.T
-        w_new = w_new.reshape(dim0, dim1).astype(np.float32)
+            h = x.T @ x
+            w_pruned_nk = _sparsegpt_prune_columns(
+                w_nk, h, sparsity, n, m, percdamp, proc_block_size
+            )
+            w_new = w_pruned_nk if weight_transposed else w_pruned_nk.T
+            w_new = w_new.reshape(dim0, dim1).astype(np.float32)
+
         w_init.CopyFrom(onnx.numpy_helper.from_array(w_new, name=w_init.name))
 
     return out
@@ -976,6 +1169,13 @@ class _Producer:
     # (Conv's ``[out_channels, in_channels, kH, kW]`` weight layout is
     # fixed), and output channels always live on axis 0.
     is_conv: bool = False
+    # This Conv's own ``group`` attribute (always 1 for a MatMul/Gemm
+    # producer, or an ordinary ``group=1`` Conv). > 1 for a general grouped
+    # Conv producer (see :func:`_match_conv_producer`) -- output channel
+    # axis 0 stays flat/global either way (grouping only splits the *input*
+    # axis), so this only changes how :func:`_apply_chains` picks `keep`,
+    # never how the producer's own weight is sliced.
+    group: int = 1
 
 
 @dataclass(frozen=True)
@@ -1015,6 +1215,14 @@ class _Chain:
     # real producer and the real consumer (Conv chains only -- see
     # :class:`_ConvPassThrough`; always empty for a MatMul/Gemm chain).
     conv_pass_through: Tuple[_ConvPassThrough, ...] = ()
+    # The consumer's own ``group`` attribute (always 1 for a MatMul/Gemm
+    # consumer, or an ordinary ``group=1`` Conv). > 1 for a general grouped
+    # Conv consumer (see :func:`_match_conv_consumer`) -- unlike the
+    # producer side, the consumer's input-channel axis *is*
+    # per-group-relative, so this drives both `keep` selection (see
+    # :func:`_chain_group`) and the dedicated slicing
+    # :func:`_slice_grouped_consumer_conv_weight` performs.
+    consumer_group: int = 1
 
 
 def _consumers_of(graph: onnx.GraphProto) -> Dict[str, List[onnx.NodeProto]]:
@@ -1182,20 +1390,26 @@ def _conv_group(node: onnx.NodeProto) -> int:
 
 def _match_conv_producer(
     node: onnx.NodeProto, initializer_map: Dict[str, onnx.TensorProto]
-) -> Optional[Tuple[str, Optional[str], int]]:
-    """If `node` is an ordinary (``group=1``) 2-D ``Conv`` with a constant
-    4-D float32 ``[out_channels, in_channels, kH, kW]`` weight (and, if
-    present, a constant bias), returns
-    ``(weight_name, bias_name_or_None, out_channels)``. A grouped or
-    depthwise Conv (``group != 1``) never matches: its output and input
-    channels aren't independent per-index the way this pass's single
-    producer/consumer cut assumes -- true here too for the depthwise case,
-    even though a depthwise Conv *is* given a narrower exception elsewhere
-    in this pass, as a transparent pass-through hop the chain walk may
-    cross between two real producer/consumer boundaries (see
+) -> Optional[Tuple[str, Optional[str], int, int]]:
+    """If `node` is an ordinary (``group=1``) *or* a general grouped
+    (``1 < group < in_channels``, ``group != out_channels`` -- see this
+    module's own docstring) 2-D ``Conv`` with a constant 4-D float32
+    ``[out_channels, in_channels/group, kH, kW]`` weight (and, if present, a
+    constant bias), returns
+    ``(weight_name, bias_name_or_None, out_channels, group)``. A depthwise
+    Conv (``group == in_channels == out_channels``) never matches: even
+    though it *is* given a narrower exception elsewhere in this pass, as a
+    transparent pass-through hop the chain walk may cross between two real
+    producer/consumer boundaries (see
     :func:`_match_depthwise_conv_pass_through`,
-    :func:`_walk_to_conv_consumer`) -- it is never itself matched as a
-    producer.
+    :func:`_walk_to_conv_consumer`), it is never itself matched as a
+    producer -- only a *general* grouped Conv (this function's new case) is.
+    A general grouped Conv's `group` output channels never need slicing
+    themselves here: axis 0 (`out_channels`) is flat/global regardless of
+    grouping (grouping only ever splits the *input* axis), so the caller's
+    existing `keep`-index slicing of a producer's own weight/bias needs no
+    special-casing for this -- only *which* `keep` indices get chosen (one
+    independent top-k per group, see :func:`_apply_chains`) changes.
     """
     if node.op_type != "Conv" or len(node.input) < 2:
         return None
@@ -1205,7 +1419,18 @@ def _match_conv_producer(
         w_init is None
         or w_init.data_type != onnx.TensorProto.FLOAT
         or len(w_init.dims) != 4
-        or _conv_group(node) != 1
+    ):
+        return None
+    group = _conv_group(node)
+    if group < 1:
+        return None
+    out_channels = w_init.dims[0]
+    in_channels = w_init.dims[1] * group
+    if group > 1 and (
+        group >= in_channels  # depthwise (a transparent hop, not a
+        # producer) or an unsupported in-channels-per-group == 1 grouping
+        or group == out_channels
+        or out_channels % group != 0  # groups must stay equal-sized
     ):
         return None
     bias_name = None
@@ -1213,18 +1438,26 @@ def _match_conv_producer(
         bias_name = node.input[2]
         if bias_name not in initializer_map:
             return None  # non-constant bias -- can't safely prune it
-    return w_name, bias_name, w_init.dims[0]
+    return w_name, bias_name, out_channels, group
 
 
 def _match_conv_consumer(
     node: onnx.NodeProto, initializer_map: Dict[str, onnx.TensorProto]
-) -> Optional[Tuple[str, int]]:
-    """If `node` is an ordinary (``group=1``) 2-D ``Conv`` with a constant
-    4-D float32 weight, returns ``(weight_name, in_channels)``. Like
+) -> Optional[Tuple[str, int, int]]:
+    """If `node` is an ordinary (``group=1``) *or* a general grouped Conv
+    (see :func:`_match_conv_producer`) with a constant 4-D float32 weight,
+    returns ``(weight_name, in_channels, group)``. Like
     :func:`_match_conv_producer`, a depthwise Conv never matches here
     either -- it's only ever a transparent pass-through hop the chain walk
-    crosses en route to a *real* ``group=1`` consumer, never a consumer
-    itself (see :func:`_match_depthwise_conv_pass_through`).
+    crosses en route to a *real* consumer, never a consumer itself (see
+    :func:`_match_depthwise_conv_pass_through`). Unlike the producer side, a
+    grouped consumer's input-channel axis (axis 1 of its weight) *is*
+    per-group-relative -- weight column ``j`` on an output filter belonging
+    to group ``g`` means global input channel ``g * (in_channels / group) +
+    j``, not global channel ``j`` -- so slicing it by the chain's `keep`
+    indices needs the dedicated
+    :func:`_slice_grouped_consumer_conv_weight`, not the flat
+    ``w[:, keep, ...]`` an ordinary consumer's weight uses.
     """
     if node.op_type != "Conv" or len(node.input) < 2:
         return None
@@ -1234,10 +1467,18 @@ def _match_conv_consumer(
         w_init is None
         or w_init.data_type != onnx.TensorProto.FLOAT
         or len(w_init.dims) != 4
-        or _conv_group(node) != 1
     ):
         return None
-    return w_name, w_init.dims[1]
+    group = _conv_group(node)
+    if group < 1:
+        return None
+    out_channels = w_init.dims[0]
+    in_channels = w_init.dims[1] * group
+    if group > 1 and (
+        group >= in_channels or group == out_channels or out_channels % group != 0
+    ):
+        return None
+    return w_name, in_channels, group
 
 
 def _match_depthwise_conv_pass_through(
@@ -1289,7 +1530,7 @@ def _walk_to_conv_consumer(
     n_channels: int,
     max_hops: int,
 ) -> Tuple[
-    Optional[Tuple[onnx.NodeProto, str]],
+    Optional[Tuple[onnx.NodeProto, str, int]],
     Tuple[Tuple[onnx.NodeProto, None], ...],
     Tuple[_ConvPassThrough, ...],
 ]:
@@ -1300,18 +1541,19 @@ def _walk_to_conv_consumer(
     channel-index mapping, but each still needs its own weight/bias sliced
     and its ``group`` attribute updated, so they're returned separately as
     `conv_pass_through` rather than folded into `chain_ops`) with no other
-    consumer anywhere along the way, until an ordinary (``group=1``) Conv
-    consumer is found whose input channel count matches `n_channels`. A
-    depthwise Conv is only ever a transparent hop, never a match for the
-    consumer role itself -- one sitting last before a graph output or a
-    branch simply ends the walk with no consumer found, same as any other
+    consumer anywhere along the way, until an ordinary (``group=1``) *or*
+    general grouped Conv consumer is found whose input channel count
+    matches `n_channels` (see :func:`_match_conv_consumer`). A depthwise
+    Conv is only ever a transparent hop, never a match for the consumer
+    role itself -- one sitting last before a graph output or a branch
+    simply ends the walk with no consumer found, same as any other
     unmatched topology. Unlike the MatMul/Gemm walk, no per-channel
     ``Add``/``Mul`` op is recognized -- see this module's own docstring for
     why that's out of scope for Conv chains.
     """
     chain_ops: List[Tuple[onnx.NodeProto, None]] = []
     conv_pass_through: List[_ConvPassThrough] = []
-    consumer = None
+    consumer: Optional[Tuple[onnx.NodeProto, str, int]] = None
     cur = start
     for _hop in range(max_hops):
         candidates = consumers_of.get(cur, [])
@@ -1334,7 +1576,7 @@ def _walk_to_conv_consumer(
 
             match = _match_conv_consumer(nxt, initializer_map)
             if match is not None and match[1] == n_channels:
-                consumer = (nxt, match[0])
+                consumer = (nxt, match[0], match[2])
             break
 
         if not (
@@ -1366,7 +1608,7 @@ def _find_conv_chains(graph: onnx.GraphProto) -> List[_Chain]:
         info = _match_conv_producer(node, initializer_map)
         if info is None:
             continue
-        w_name, bias_name, n_channels = info
+        w_name, bias_name, n_channels, producer_group = info
 
         out_name = node.output[0]
         if not _is_internal(out_name):
@@ -1382,17 +1624,43 @@ def _find_conv_chains(graph: onnx.GraphProto) -> List[_Chain]:
         )
         if consumer is None:
             continue
+        consumer_node, consumer_weight, consumer_group = consumer
+
+        if (
+            producer_group > 1
+            and consumer_group > 1
+            and producer_group != consumer_group
+        ):
+            # Both sides grouped, but with a different group count: the two
+            # sides' block boundaries wouldn't generally align (a channel
+            # surviving as "the k-th of the producer's own group" has no
+            # well-defined membership in any of the consumer's
+            # differently-sized groups), so this composition needs real
+            # cross-chain bookkeeping this pass doesn't attempt -- declined
+            # outright, same as any other topology left unmatched rather
+            # than guessed at. See this module's own docstring.
+            continue
 
         chains.append(
             _Chain(
-                producers=(_Producer(node, w_name, False, bias_name, is_conv=True),),
+                producers=(
+                    _Producer(
+                        node,
+                        w_name,
+                        False,
+                        bias_name,
+                        is_conv=True,
+                        group=producer_group,
+                    ),
+                ),
                 chain_ops=chain_ops,
-                consumer_node=consumer[0],
-                consumer_weight=consumer[1],
+                consumer_node=consumer_node,
+                consumer_weight=consumer_weight,
                 consumer_weight_transposed=False,
                 n_channels=n_channels,
                 consumer_is_conv=True,
                 conv_pass_through=conv_pass_through,
+                consumer_group=consumer_group,
             )
         )
     return chains
@@ -1544,7 +1812,14 @@ def _walk_conv_producer_backward(
 
         prod_info = _match_conv_producer(node, initializer_map)
         if prod_info is not None:
-            w_name, bias_name, n_channels = prod_info
+            w_name, bias_name, n_channels, producer_group = prod_info
+            if producer_group != 1:
+                # General grouped Conv is deliberately out of scope for the
+                # residual/Add-merge case -- see this function's own
+                # docstring ("a real group=1 Conv producer"). Combining
+                # per-group independent top-k with cross-branch
+                # combined-importance ranking isn't verified here.
+                return "fail", None, (), ()
             producer = _Producer(node, w_name, False, bias_name, is_conv=True)
             return (
                 "producer",
@@ -1718,6 +1993,14 @@ def _find_conv_residual_chains(graph: onnx.GraphProto) -> List[_Chain]:
         )
         if consumer is None:
             continue
+        consumer_node, consumer_weight, consumer_group = consumer
+        if consumer_group != 1:
+            # As with the producer side above, a general grouped Conv
+            # consumer is out of scope here: _chain_group's per-group
+            # top-k assumes every producer feeds the consumer's full
+            # (ungrouped) channel range, an assumption a multi-producer
+            # residual group doesn't verify against per-group slicing.
+            continue
 
         chain_ops = (
             tuple((op, None) for op in unary_ops)
@@ -1729,8 +2012,8 @@ def _find_conv_residual_chains(graph: onnx.GraphProto) -> List[_Chain]:
             _Chain(
                 producers=tuple(leaf_producers),
                 chain_ops=chain_ops,
-                consumer_node=consumer[0],
-                consumer_weight=consumer[1],
+                consumer_node=consumer_node,
+                consumer_weight=consumer_weight,
                 consumer_weight_transposed=False,
                 n_channels=n_channels,
                 consumer_is_conv=True,
@@ -1941,6 +2224,51 @@ def _slice_consumer_weight(
     w_init.CopyFrom(onnx.numpy_helper.from_array(w_new, name=w_init.name))
 
 
+def _slice_grouped_consumer_conv_weight(
+    w_init: onnx.TensorProto,
+    keep: np.ndarray,
+    group: int,
+    n_channels: int,
+) -> None:
+    """Slices a *general grouped* Conv consumer's ``[out_channels,
+    in_channels/group, kH, kW]`` weight by a global (whole-``in_channels``)
+    `keep` index set. Unlike :func:`_slice_consumer_weight`'s flat ``w[:,
+    keep, ...]`` (correct only for an ordinary ``group=1`` consumer, whose
+    axis 1 truly spans every input channel), a grouped consumer's axis 1 is
+    only `in_channels/group` wide and is *per-group-relative*: weight
+    column ``j`` on output filter ``o`` means global input channel
+    ``(o // out_per_group) * block + j`` -- `block` (`n_channels // group`)
+    input channels per group, not `j` itself. So each output-filter group
+    needs its own local slice of `keep` -- that group's own retained
+    channels, translated from global indices back to local ones by
+    subtracting the group's own block offset -- rather than one shared
+    index set applied uniformly across the whole axis.
+
+    This is well-defined only because whatever produced `keep` already
+    guarantees a *uniform count* of survivors per `group`-sized block (see
+    :func:`_chain_group`/:func:`_apply_chains`): both producer-grouped and
+    consumer-grouped selection independently keep the same count from every
+    block by construction, and the "both sides grouped" composition this
+    pass supports requires a matching `group` count on both ends (see
+    :func:`_find_conv_chains`), so the producer's own blocks and this
+    consumer's own blocks are always the exact same partition of
+    `n_channels` -- never a case where one side's block boundaries split a
+    count unevenly relative to the other's.
+    """
+    w = onnx.numpy_helper.to_array(w_init)
+    out_channels = w.shape[0]
+    out_per_group = out_channels // group
+    block = n_channels // group
+    parts = []
+    for gi in range(group):
+        lo, hi = gi * block, (gi + 1) * block
+        local_keep = keep[(keep >= lo) & (keep < hi)] - lo
+        filt_lo, filt_hi = gi * out_per_group, (gi + 1) * out_per_group
+        parts.append(w[filt_lo:filt_hi, local_keep, ...])
+    w_new = np.concatenate(parts, axis=0)
+    w_init.CopyFrom(onnx.numpy_helper.from_array(w_new, name=w_init.name))
+
+
 def _slice_last_axis(init: onnx.TensorProto, keep: np.ndarray) -> None:
     arr = onnx.numpy_helper.to_array(init)
     new = np.take(arr, keep, axis=-1)
@@ -1960,6 +2288,36 @@ def _plain_structured_importance(
     return np.sqrt(squared_norm)
 
 
+def _chain_group(chain: _Chain) -> int:
+    """The `group` count that governs this chain's `keep`-index selection
+    (see :func:`_apply_chains`): 1 for every chain this pass already
+    supported before general grouped Conv (a MatMul/Gemm chain, a gated
+    pair, or an ordinary ``group=1`` Conv producer/consumer -- all leave
+    every `group` field at its default), and > 1 whenever either side of a
+    Conv chain is a general grouped Conv.
+
+    Worked example for why the producer side takes priority when *only* the
+    producer is grouped: a grouped producer (`group=g`, `g` output-channel
+    blocks of `out_channels/g` filters each) feeding an ordinary `group=1`
+    consumer needs every one of the producer's own `g` blocks pruned to a
+    uniform count so `out_channels % g == 0` survives -- a requirement the
+    consumer itself doesn't share (an ordinary consumer accepts any subset
+    of surviving input channels), so the producer's own grouping is what
+    the shared `keep` selection must honor. Symmetrically, an ordinary
+    `group=1` producer feeding a grouped consumer (`group=g_c`) has no
+    grouping constraint of its own -- any subset of its output channels is
+    individually a valid producer-side cut -- so it's the *consumer's* `g_c`
+    blocks that constrain which subset is safe to choose, making the
+    consumer's `group` the one that governs `keep` selection there. When
+    both sides are grouped, :func:`_find_conv_chains` already declined the
+    chain unless `producer_group == consumer_group`, so either field gives
+    the same answer.
+    """
+    if len(chain.producers) == 1 and chain.producers[0].group > 1:
+        return chain.producers[0].group
+    return chain.consumer_group
+
+
 def _apply_chains(
     graph: onnx.GraphProto,
     chains: List[_Chain],
@@ -1972,6 +2330,19 @@ def _apply_chains(
     ``compute_importance(chain, w_arrays_nk) -> np.ndarray[n_channels]`` for
     the ranking, and performs the actual slicing plus stale ``value_info``
     cleanup. Mutates ``graph`` in place.
+
+    For a chain with :func:`_chain_group` (`group`) > 1 -- a general grouped
+    Conv producer or consumer, see this module's own docstring -- `keep` is
+    chosen independently *within each of `group` equal-sized blocks* of the
+    channel-importance vector, keeping the same count from every block
+    (`_chain_group`'s own docstring works through why one side's `group`
+    always suffices to pick the block boundaries both roles need to honor).
+    This reduces to today's single whole-vector top-k exactly when
+    `group == 1` -- the code below keeps that as a literal separate branch,
+    not a `group=1` special case of the block formula, so every
+    already-supported chain's rounding (and therefore its exact `keep`
+    selection) stays byte-identical to before this function learned about
+    grouped Conv at all.
     """
     initializer_map = {t.name: t for t in graph.initializer}
     # A weight legitimately plays both roles across two different chains --
@@ -2009,7 +2380,13 @@ def _apply_chains(
             continue  # a shared/tied initializer another chain already resized
 
         n = chain.n_channels
-        keep_count = max(1, n - round(n * sparsity))
+        group = _chain_group(chain)
+        if group > 1:
+            block = n // group
+            per_group_keep = max(1, round(block * (1.0 - sparsity)))
+            keep_count = per_group_keep * group
+        else:
+            keep_count = max(1, n - round(n * sparsity))
         if keep_count >= n:
             continue  # rounds down to nothing for this layer -- no-op
 
@@ -2022,7 +2399,26 @@ def _apply_chains(
                 w_nk = w if p.weight_transposed else w.T  # [N, K]
             w_arrays_nk.append(w_nk)
         importance = compute_importance(chain, w_arrays_nk)
-        keep = np.sort(np.argsort(-importance)[:keep_count])
+        if group > 1:
+            # One independent top-k per block -- see _chain_group and this
+            # function's own docstring. Blocks are contiguous and already
+            # increasing, and each block's own local top-k is sorted
+            # ascending before its offset is added back, so the
+            # concatenation is sorted ascending overall too, same as the
+            # group=1 branch's own `keep` invariant.
+            keep = np.concatenate(
+                [
+                    np.sort(
+                        np.argsort(-importance[gi * block : (gi + 1) * block])[
+                            :per_group_keep
+                        ]
+                    )
+                    + gi * block
+                    for gi in range(group)
+                ]
+            )
+        else:
+            keep = np.sort(np.argsort(-importance)[:keep_count])
 
         for p in chain.producers:
             _slice_producer_weight(
@@ -2055,12 +2451,17 @@ def _apply_chains(
                 hop.node.attribute.append(
                     onnx.helper.make_attribute("group", keep_count)
                 )
-        _slice_consumer_weight(
-            initializer_map[chain.consumer_weight],
-            chain.consumer_weight_transposed,
-            keep,
-            is_conv=chain.consumer_is_conv,
-        )
+        if chain.consumer_is_conv and chain.consumer_group > 1:
+            _slice_grouped_consumer_conv_weight(
+                initializer_map[chain.consumer_weight], keep, chain.consumer_group, n
+            )
+        else:
+            _slice_consumer_weight(
+                initializer_map[chain.consumer_weight],
+                chain.consumer_weight_transposed,
+                keep,
+                is_conv=chain.consumer_is_conv,
+            )
 
         producer_touched.update(producer_weights)
         consumer_touched.add(chain.consumer_weight)
@@ -2108,20 +2509,29 @@ def apply_structured_pruning(
     the two layers' composition mathematically unaffected for every
     surviving channel.
 
-    The same cut applies to ordinary (``group=1``) 2-D ``Conv`` producer ->
-    consumer pairs -- each output filter's whole ``[in_channels, kH, kW]``
-    kernel ranked by its own L2 norm, exactly Li et al.'s original filter-
-    pruning criterion -- joined by unary activations and/or depthwise Conv
-    hops (``group == in_channels == out_channels``: one filter per channel,
-    no cross-channel mixing, so it's crossed transparently -- its own
-    weight/bias sliced by the producer's channel indices and its ``group``
-    attribute shrunk to match, but it contributes no importance of its own
-    and can't itself be the producer or consumer -- see this module's own
-    docstring). No per-channel Add/Mul between two Convs (a Conv already
-    carries its own bias, and ``BatchNormalization`` is expected to already
-    be fused into the preceding Conv by the time this pass runs). A
-    *general* grouped Conv (``group`` neither 1 nor its channel count) is
-    left untouched.
+    The same cut applies to 2-D ``Conv`` producer -> consumer pairs -- each
+    output filter's whole ``[in_channels/group, kH, kW]`` kernel ranked by
+    its own L2 norm, exactly Li et al.'s original filter-pruning criterion
+    -- joined by unary activations and/or depthwise Conv hops (``group ==
+    in_channels == out_channels``: one filter per channel, no cross-channel
+    mixing, so it's crossed transparently -- its own weight/bias sliced by
+    the producer's channel indices and its ``group`` attribute shrunk to
+    match, but it contributes no importance of its own and can't itself be
+    the producer or consumer -- see this module's own docstring). No
+    per-channel Add/Mul between two Convs (a Conv already carries its own
+    bias, and ``BatchNormalization`` is expected to already be fused into
+    the preceding Conv by the time this pass runs).
+
+    A *general* grouped Conv (``group`` neither 1 nor its channel count) is
+    also matched, as a producer and/or a consumer, ranking/pruning each of
+    its ``group`` channel blocks independently (see this module's own
+    docstring for exactly why that's safe and how the two roles differ). A
+    grouped producer paired with an ordinary consumer, an ordinary producer
+    paired with a grouped consumer, and both sides grouped *with the same
+    ``group`` count* are all supported; both sides grouped with a
+    *different* ``group`` count is declined and the chain is left
+    completely untouched, same as any other topology this pass can't prove
+    safe to cut.
 
     Also handles the gated FFN pattern most current LLMs use in place of a
     plain two-layer MLP (SwiGLU/GeGLU: ``down(act(gate(x)) * up(x))``, see
@@ -2191,7 +2601,8 @@ def apply_structured_wanda_pruning(
     same real structural channel removal, same topology matching (a single
     producer, a gated pair, or a bounded Conv residual/``Add``-merge group
     -> zero or more shape-preserving elementwise ops and, for a Conv chain,
-    depthwise Conv hops -> one consumer, MatMul/Gemm or Conv, see
+    depthwise Conv hops -> one consumer, MatMul/Gemm or Conv, general
+    grouped Conv included on either side, see
     :func:`apply_structured_pruning`'s own docstring) including the same
     depthwise-Conv pass-through sliced by the producer's channel indices
     alone -- it contributes no activation norm of its own to the ranking
@@ -2302,9 +2713,10 @@ def apply_structured_wanda_pruning(
 
 # --- Attention-head pruning -----------------------------------------------
 
-# Two ``com.microsoft`` domain contrib ops are matched here, each produced
-# by one of onnxsim's own fusion passes from a decomposed self-attention
-# block, and each pruned at the granularity its own kernel contract allows:
+# Three fused self-attention ops are matched here -- two from the
+# ``com.microsoft`` domain, produced by onnxsim's own fusion passes from a
+# decomposed self-attention block, plus the standard ``ai.onnx`` op -- each
+# pruned at the granularity its own kernel contract allows:
 #
 # - `Attention` (onnxsim/passes/fuse_attention.h): a single merged QKV
 #   weight/bias ([hidden_size, Nq+Nk+Nv] / [Nq+Nk+Nv]) plus
@@ -2332,10 +2744,40 @@ def apply_structured_wanda_pruning(
 #   (which would itself need slicing along the `kv_num_heads` axis) or a
 #   packed-QKV/missing-required-input node this module cannot prove safe to
 #   leave alone is declined outright -- see :func:`_match_gqa_producer`.
-#
-# The plain `ai.onnx` `Attention` op (opset 23+, a different schema again)
-# remains out of scope, the same kind of narrower-than-general-case boundary
-# Conv-group pruning above draws.
+# - the plain ``ai.onnx`` `Attention` (opset 24+, domain ``""``, schema
+#   confirmed against this environment's installed ``onnx==1.22.0`` via
+#   ``onnx.defs.get_schema("Attention", domain="")`` -- it is fully defined
+#   there, unlike the still-under-development op ``fuse_attention.h``'s own
+#   comment warns about for a different opset/op; see
+#   :func:`_match_onnx_attention_producer`'s own docstring for the exact
+#   attributes/inputs read off that schema): structurally the same shape as
+#   `GroupQueryAttention` -- separate, un-merged Q/K/V projections plus
+#   independent `q_num_heads`/`kv_num_heads` attributes, `q_num_heads` a
+#   positive multiple of `kv_num_heads` (the op's schema doc names this same
+#   MHA/GQA/MQA taxonomy explicitly) -- close enough a cousin that this pass
+#   reuses :class:`_GQAChain`, :func:`_apply_one_gqa_chain`, and
+#   :func:`_gqa_group_importance` for it outright rather than a parallel
+#   implementation (see :func:`_find_separate_qkv_chains`, the two matchers'
+#   shared caller). It differs in three ways this pass accounts for: (1) its
+#   query-head-count attribute is named `q_num_heads`, not `num_heads` --
+#   :class:`_GQAChain` carries which attribute name to write back
+#   (`num_heads_attr`); (2) it schema-allows V its own `head_size`
+#   independent of Q/K's (confirmed via the op's own backend test suite,
+#   e.g. ``test_attention_3d_diff_heads_sizes``) -- since
+#   :func:`_apply_one_gqa_chain`'s shared slicing assumes one uniform
+#   `head_size` the way `fuse_gqa.h` itself requires, a node whose V head
+#   size actually differs is declined rather than mis-sliced; (3) its
+#   optional `attn_mask`/`past_key`/`past_value` inputs (a different set
+#   from `GroupQueryAttention`'s own `past_key`/`past_value`/`seqlens_k`/
+#   `total_sequence_length`/`cos_cache`/`sin_cache`) get the same
+#   non-empty-constant-is-declined, dynamic-is-left-alone treatment
+#   :func:`_match_gqa_producer` already applies -- see
+#   :func:`_match_onnx_attention_producer`. Verified here via actual
+#   execution (``onnx.checker`` plus onnxruntime, both of which handle this
+#   op in this environment -- see ``tests/test_pruning.py``'s own "plain
+#   ai.onnx Attention" section), the same oracle-vs-onnxruntime bar every
+#   other function in this module is held to; no structural-only fallback
+#   was needed.
 _ATTENTION_DOMAIN = "com.microsoft"
 
 
@@ -2373,6 +2815,14 @@ class _GQAChain:
     consumer_node: onnx.NodeProto
     consumer_weight: str
     consumer_weight_transposed: bool
+    # Which attribute on `.node` holds the query head count:
+    # ``com.microsoft::GroupQueryAttention`` names it `num_heads`, the plain
+    # ``ai.onnx::Attention`` op (see :func:`_match_onnx_attention_producer`)
+    # names the same concept `q_num_heads` -- both share `kv_num_heads`
+    # verbatim, so only this one name needs to travel with the chain for
+    # :func:`_apply_one_gqa_chain`'s shared write-back to target the right
+    # attribute on either op.
+    num_heads_attr: str = "num_heads"
 
 
 # Either kind of matched attention block, sharing enough of a common shape
@@ -2380,7 +2830,12 @@ class _GQAChain:
 # :func:`_apply_attention_chains`'s own bookkeeping (touched-role tracking,
 # stale value_info cleanup) and the activation-probing setup in
 # :func:`apply_attention_head_wanda_pruning` treat both uniformly, only
-# dispatching on which one a given chain is for the actual slicing.
+# dispatching on which one a given chain is for the actual slicing. A
+# matched plain ``ai.onnx::Attention`` node is represented as a
+# :class:`_GQAChain` too (see that class's own `num_heads_attr` field) --
+# it is a *third* matched node type, not a third dataclass, since its
+# separate-Q/K/V-producer shape and whole-KV-group pruning unit are
+# identical to `GroupQueryAttention`'s own.
 _AttnLikeChain = Union[_AttentionChain, _GQAChain]
 
 
@@ -2627,7 +3082,86 @@ def _match_gqa_producer(
     return num_heads, kv_num_heads
 
 
-def _find_gqa_chains(graph: onnx.GraphProto) -> List[_GQAChain]:
+def _match_onnx_attention_producer(
+    node: onnx.NodeProto, initializer_map: Dict[str, onnx.TensorProto]
+) -> Optional[Tuple[int, int]]:
+    """If `node` is a plain ``ai.onnx`` ``Attention`` node (domain ``""``,
+    opset 24+ -- confirmed via ``onnx.defs.get_schema("Attention",
+    domain="")`` against this environment's installed ``onnx==1.22.0``, see
+    this module's own "Attention-head pruning" section comment) this module
+    can safely act on, returns ``(q_num_heads, kv_num_heads)``.
+
+    Structurally the closest cousin of :func:`_match_gqa_producer`: three
+    separate, un-merged query/key/value inputs (``Q``, ``K``, ``V`` at
+    indices 0/1/2, all required by the schema) rather than one merged
+    weight, plus independent `q_num_heads`/`kv_num_heads` attributes with
+    `q_num_heads` a positive multiple of `kv_num_heads` -- the same
+    MHA/GQA/MQA taxonomy the op's own schema doc names explicitly. Both
+    attributes are schema-*optional* (inferable from a rank-4 ``Q``/``K``
+    input's own head axis, per ``onnx.reference.ops.op_attention``'s
+    reference kernel), but this function requires both given explicitly:
+    the topology this pass matches -- ``Q``/``K``/``V`` arriving directly
+    from a MatMul/vanilla-Gemm projection's raw (rank-3,
+    ``[batch, seq, hidden]``) output, the same shape
+    :func:`_match_gqa_producer` already assumes for `GroupQueryAttention`
+    -- is exactly the case the reference kernel itself asserts both
+    attributes for, so a node relying on rank-4-inferred head counts isn't
+    a shape this pass tracks and is declined rather than guessed at.
+
+    The optional `attn_mask`/`past_key`/`past_value` inputs (indices 3/4/5
+    -- a different set from `GroupQueryAttention`'s own, and this op has no
+    `seqlens_k`/`total_sequence_length` equivalent to require) get the same
+    treatment :func:`_match_gqa_producer` gives `past_key`/`past_value`:
+    each is declined outright if it is connected to a non-empty constant
+    (real per-head mask or KV-cache data this function doesn't attempt to
+    slice), but left alone -- and does not block the match -- if dynamic
+    (an ordinary graph input or intermediate activation, the caller's own
+    runtime data). `nonpad_kv_seqlen` (index 6), like `GroupQueryAttention`'s
+    own `seqlens_k`, is `[batch_size]`-shaped and independent of head count,
+    so its presence never blocks a match either.
+    """
+    if node.domain != "" or node.op_type != "Attention":
+        return None
+    if len(node.input) < 3 or not (node.input[0] and node.input[1] and node.input[2]):
+        return None
+
+    q_num_heads = kv_num_heads = None
+    for attr in node.attribute:
+        if attr.name == "q_num_heads":
+            q_num_heads = attr.i
+        elif attr.name == "kv_num_heads":
+            kv_num_heads = attr.i
+    if not q_num_heads or not kv_num_heads or q_num_heads <= 0 or kv_num_heads <= 0:
+        return None
+    if q_num_heads % kv_num_heads != 0:
+        return None
+
+    for idx in (3, 4, 5):  # attn_mask, past_key, past_value
+        if len(node.input) <= idx or not node.input[idx]:
+            continue
+        const_init = initializer_map.get(node.input[idx])
+        if const_init is not None and int(np.prod(const_init.dims)) > 0:
+            return None  # non-empty constant -- would need slicing
+
+    return q_num_heads, kv_num_heads
+
+
+def _find_separate_qkv_chains(
+    graph: onnx.GraphProto,
+    match_producer,
+    num_heads_attr: str,
+) -> List[_GQAChain]:
+    """Shared body for :func:`_find_gqa_chains` and
+    :func:`_find_onnx_attention_chains`: both match a fused attention node
+    fed by three separate, un-merged Q/K/V MatMul/vanilla-Gemm projections
+    (as opposed to :func:`_find_attention_chains`'s single merged-QKV-weight
+    ``com.microsoft::Attention``) and prune it at whole-KV-group granularity
+    (see :func:`_apply_one_gqa_chain`/:func:`_gqa_group_importance`),
+    differing only in which node/attributes `match_producer` recognizes
+    (:func:`_match_gqa_producer` or :func:`_match_onnx_attention_producer`)
+    and which attribute on the matched node holds the query head count
+    (`num_heads_attr` -- see :class:`_GQAChain`'s own field of that name).
+    """
     initializer_map = {t.name: t for t in graph.initializer}
     consumers_of = _consumers_of(graph)
     graph_outputs = {o.name for o in graph.output}
@@ -2638,7 +3172,7 @@ def _find_gqa_chains(graph: onnx.GraphProto) -> List[_GQAChain]:
 
     chains = []
     for node in graph.node:
-        info = _match_gqa_producer(node, initializer_map)
+        info = match_producer(node, initializer_map)
         if info is None:
             continue
         num_heads, kv_num_heads = info
@@ -2681,17 +3215,27 @@ def _find_gqa_chains(graph: onnx.GraphProto) -> List[_GQAChain]:
             or nk // kv_num_heads != head_size
             or nv // kv_num_heads != head_size
         ):
-            continue  # fuse_gqa.h requires equal Q/K/V head_size
+            # `fuse_gqa.h` requires equal Q/K/V head_size, and this is the
+            # same restriction :func:`_match_onnx_attention_producer`'s own
+            # docstring narrows the plain ai.onnx op's own, more permissive
+            # schema down to (that op genuinely allows V its own head_size,
+            # see this module's "Attention-head pruning" section comment) --
+            # a node whose V head size actually differs is declined here
+            # rather than mis-sliced by this shared, uniform-head_size body.
+            continue
 
         out_name = node.output[0]
         if not _is_internal(out_name):
             continue
 
-        # GroupQueryAttention's raw output is Nq (= num_heads * head_size)
-        # wide -- unlike plain `Attention` (V-hidden-size-wide), its output
-        # is head-count-and-size symmetric with the query side, per
-        # fuse_gqa.h's own "Y = GroupQueryAttention(...)" shape comment --
-        # so `_walk_to_attention_consumer`'s generic "raw output width"
+        # Both matched ops' raw output is Nq (= num_heads * head_size) wide
+        # -- unlike plain `com.microsoft::Attention` (V-hidden-size-wide),
+        # each is head-count-and-size symmetric with the query side (per
+        # fuse_gqa.h's own "Y = GroupQueryAttention(...)" shape comment, and
+        # -- since this function only ever matches the equal-head_size case
+        # above -- the ai.onnx op's own "q_num_heads * head_size_v" output
+        # width, see its reference kernel) -- so
+        # `_walk_to_attention_consumer`'s generic "raw output width"
         # parameter is passed `nq` here, not an analogue of `nv`.
         consumer, chain_ops = _walk_to_attention_consumer(
             out_name, initializer_map, consumers_of, graph_outputs, nq
@@ -2718,9 +3262,25 @@ def _find_gqa_chains(graph: onnx.GraphProto) -> List[_GQAChain]:
                 consumer_node=consumer[0],
                 consumer_weight=consumer[1],
                 consumer_weight_transposed=consumer[2],
+                num_heads_attr=num_heads_attr,
             )
         )
     return chains
+
+
+def _find_gqa_chains(graph: onnx.GraphProto) -> List[_GQAChain]:
+    return _find_separate_qkv_chains(graph, _match_gqa_producer, "num_heads")
+
+
+def _find_onnx_attention_chains(graph: onnx.GraphProto) -> List[_GQAChain]:
+    """The plain ``ai.onnx::Attention`` analogue of :func:`_find_gqa_chains`
+    -- see :func:`_find_separate_qkv_chains` (the shared body) and
+    :func:`_match_onnx_attention_producer` (what's matched and why it's
+    declined otherwise).
+    """
+    return _find_separate_qkv_chains(
+        graph, _match_onnx_attention_producer, "q_num_heads"
+    )
 
 
 def _plain_attention_head_importance(
@@ -2867,12 +3427,14 @@ def _apply_one_gqa_chain(
     compute_group_importance,
 ) -> Optional[Tuple[Set[str], str, Set[str]]]:
     """Applies whole-KV-group pruning to one matched ``GroupQueryAttention``
-    block in place: every dropped group removes one *contiguous*
-    ``head_size``-wide column block from each of K's and V's own separate
-    weights, together with the ``num_heads / kv_num_heads`` query-head-sized
-    blocks mapped to that group from Q's own separate weight (and the
-    matching row block from the consumer) -- never an individual query head
-    in isolation. Returns
+    or plain ``ai.onnx::Attention`` block (see :class:`_GQAChain`'s own
+    `num_heads_attr` field for how the two are told apart when writing the
+    new query head count back) in place: every dropped group removes one
+    *contiguous* ``head_size``-wide column block from each of K's and V's
+    own separate weights, together with the ``num_heads / kv_num_heads``
+    query-head-sized blocks mapped to that group from Q's own separate
+    weight (and the matching row block from the consumer) -- never an
+    individual query head in isolation. Returns
     ``(producer_weight_names, consumer_weight_name, stale_output_names)`` on
     success, or ``None`` if `sparsity` rounds to no groups dropped for this
     block (a no-op, left for the caller to skip).
@@ -2927,7 +3489,7 @@ def _apply_one_gqa_chain(
     new_kv_num_heads = keep_count
     new_num_heads = keep_count * group_size
     for attr in chain.node.attribute:
-        if attr.name == "num_heads":
+        if attr.name == chain.num_heads_attr:
             attr.i = new_num_heads
         elif attr.name == "kv_num_heads":
             attr.i = new_kv_num_heads
@@ -3018,51 +3580,63 @@ def apply_attention_head_pruning(
     sparsity: float = 0.5,
 ) -> onnx.ModelProto:
     """Removes whole attention heads -- or, for grouped-query attention,
-    whole KV groups -- from every matched ``com.microsoft::Attention`` or
-    ``com.microsoft::GroupQueryAttention`` node (the fused self-attention
-    blocks onnxsim's own ``fuse_attention``/``fuse_gqa`` optimizer passes
-    produce, see this module's own "Attention-head pruning" section
-    comment) whose output feeds, optionally through a single shape-
-    preserving ``Reshape``, exactly one downstream MatMul/vanilla-Gemm's
-    reduction dimension (the output projection) -- the attention analogue
-    of :func:`apply_structured_pruning`, at head (or KV-group) instead of
-    single-channel granularity.
+    whole KV groups -- from every matched ``com.microsoft::Attention``,
+    ``com.microsoft::GroupQueryAttention``, or plain ``ai.onnx::Attention``
+    node (the fused self-attention blocks onnxsim's own
+    ``fuse_attention``/``fuse_gqa`` optimizer passes produce, plus the
+    standard ONNX op those two contrib ops are converging towards -- see
+    this module's own "Attention-head pruning" section comment for the real
+    schema each was confirmed against and how) whose output feeds,
+    optionally through a single shape-preserving ``Reshape``, exactly one
+    downstream MatMul/vanilla-Gemm's reduction dimension (the output
+    projection) -- the attention analogue of :func:`apply_structured_pruning`,
+    at head (or KV-group) instead of single-channel granularity.
 
-    For each matched plain ``Attention`` block: ranks every head by the
-    combined Frobenius norm of its own ``[hidden_size, head_size]`` Q, K,
-    and V weight columns, drops the lowest-``sparsity``-fraction of heads
-    (at least one head is always kept), and removes the corresponding
-    column blocks from the merged QKV weight (and bias, if present),
-    decrementing ``num_heads``/``qkv_hidden_sizes`` accordingly, and the
-    matching row block from the output projection's weight -- mathematically
-    unaffected for every surviving head, the same guarantee
+    For each matched plain ``com.microsoft::Attention`` block: ranks every
+    head by the combined Frobenius norm of its own
+    ``[hidden_size, head_size]`` Q, K, and V weight columns, drops the
+    lowest-``sparsity``-fraction of heads (at least one head is always
+    kept), and removes the corresponding column blocks from the merged QKV
+    weight (and bias, if present), decrementing
+    ``num_heads``/``qkv_hidden_sizes`` accordingly, and the matching row
+    block from the output projection's weight -- mathematically unaffected
+    for every surviving head, the same guarantee
     :func:`apply_structured_pruning` gives per channel.
 
-    For each matched ``GroupQueryAttention`` block: ranks every *KV group*
-    (a KV head and the ``num_heads / kv_num_heads`` query heads the kernel
-    maps to it) by the combined Frobenius norm of that group's own Q+K+V
-    weight block across Q's, K's, and V's own separate producer weights,
-    drops the lowest-``sparsity``-fraction of groups (at least one group is
-    always kept), and removes the corresponding column blocks from all
-    three producers (and their biases, if present) together with the
-    matching row block from the output projection's weight, decrementing
-    ``num_heads``/``kv_num_heads`` by the number of groups dropped -- so
-    their ratio (query heads per KV head) is unchanged, keeping every
-    surviving KV head mapped to exactly the same number of query heads the
-    kernel requires. An individual query head is never dropped on its own:
-    only a whole group, since GQA's kernel has no way to keep a KV head
-    alive for some, but not all, of the query heads that shared it.
+    For each matched ``GroupQueryAttention`` or plain ``ai.onnx::Attention``
+    block: ranks every *KV group* (a KV head and the
+    ``num_heads / kv_num_heads`` query heads the kernel maps to it) by the
+    combined Frobenius norm of that group's own Q+K+V weight block across
+    Q's, K's, and V's own separate producer weights, drops the
+    lowest-``sparsity``-fraction of groups (at least one group is always
+    kept), and removes the corresponding column blocks from all three
+    producers (and their biases, if present) together with the matching row
+    block from the output projection's weight, decrementing the query head
+    count (``num_heads`` for `GroupQueryAttention`, ``q_num_heads`` for the
+    plain ``ai.onnx`` op) and ``kv_num_heads`` by the number of groups
+    dropped -- so their ratio (query heads per KV head) is unchanged,
+    keeping every surviving KV head mapped to exactly the same number of
+    query heads the kernel requires. An individual query head is never
+    dropped on its own: only a whole group, since neither kernel has a way
+    to keep a KV head alive for some, but not all, of the query heads that
+    shared it. A plain ``ai.onnx::Attention`` node whose V head size
+    genuinely differs from Q/K's own (a shape that op's schema allows but
+    `GroupQueryAttention` never produces) is declined rather than mis-sliced
+    -- see :func:`_match_onnx_attention_producer`.
 
     :param model: the original onnx ModelProto or file path
     :param sparsity: target fraction of each matched block's heads (or, for
-            GroupQueryAttention, KV groups) to remove (at least one is
-            always kept)
+            GroupQueryAttention/plain ai.onnx Attention, KV groups) to
+            remove (at least one is always kept)
     :returns: ``model`` with every matched block's tensors resized in
             place; anything not matching that exact topology (a
             non-constant weight, a packed-QKV GroupQueryAttention node, a
-            GroupQueryAttention node with a non-empty constant past-KV-cache
-            input, a consumer whose reduction dimension doesn't line up,
-            ...) is left completely untouched
+            GroupQueryAttention/plain ai.onnx Attention node with a
+            non-empty constant past-KV-cache or attention-mask input, an
+            ai.onnx Attention node with differing Q/K/V head sizes or
+            without explicit ``q_num_heads``/``kv_num_heads`` attributes, a
+            consumer whose reduction dimension doesn't line up, ...) is left
+            completely untouched
     """
     if not (0.0 <= sparsity < 1.0):
         raise ValueError(f"sparsity must be in [0, 1), got {sparsity}")
@@ -3076,6 +3650,7 @@ def apply_attention_head_pruning(
     chains: List[_AttnLikeChain] = [
         *_find_attention_chains(graph),
         *_find_gqa_chains(graph),
+        *_find_onnx_attention_chains(graph),
     ]
     if chains:
         _apply_attention_chains(
@@ -3101,16 +3676,20 @@ def apply_attention_head_wanda_pruning(
     """The calibrated upgrade of :func:`apply_attention_head_pruning`,
     exactly as :func:`apply_structured_wanda_pruning` is to
     :func:`apply_structured_pruning`: same real head (or, for
-    GroupQueryAttention, whole-KV-group) removal, same topology matching,
-    but each unit's importance is ``||W||_F * ||X||_2`` -- the plain
-    Frobenius-norm weight score times the combined (root-sum-square)
-    activation norm of that unit's own slice of the *output projection's*
-    input, captured over calibration data -- instead of weight magnitude
-    alone. For a plain ``Attention`` block this is per head, exactly as
-    before; for a ``GroupQueryAttention`` block the activation norm is
-    combined (root-sum-square) over every query head a KV group owns,
-    mirroring how :func:`_gqa_group_importance` combines that same group's
-    weight norm across Q+K+V.
+    GroupQueryAttention/plain ai.onnx Attention, whole-KV-group) removal,
+    same topology matching (see :func:`apply_attention_head_pruning`'s own
+    docstring for the three matched op types), but each unit's importance
+    is ``||W||_F * ||X||_2`` -- the plain Frobenius-norm weight score times
+    the combined (root-sum-square) activation norm of that unit's own slice
+    of the *output projection's* input, captured over calibration data --
+    instead of weight magnitude alone. For a plain ``com.microsoft::Attention``
+    block this is per head, exactly as before; for a ``GroupQueryAttention``
+    or plain ``ai.onnx::Attention`` block the activation norm is combined
+    (root-sum-square) over every query head a KV group owns, mirroring how
+    :func:`_gqa_group_importance` combines that same group's weight norm
+    across Q+K+V -- both matched separate-Q/K/V-producer ops share that one
+    importance function (and this one calibrated wrapper around it)
+    unmodified.
 
     :param model: the original onnx ModelProto or file path
     :param calibration_data: representative input batches to measure each
@@ -3124,8 +3703,8 @@ def apply_attention_head_wanda_pruning(
     :param seed: seed for the random calibration data (ignored if
             ``calibration_data`` is supplied)
     :param sparsity: target fraction of each matched block's heads (or, for
-            GroupQueryAttention, KV groups) to remove (at least one is
-            always kept)
+            GroupQueryAttention/plain ai.onnx Attention, KV groups) to
+            remove (at least one is always kept)
     :param epsilon: floor applied to the accumulated per-unit activation
             norm, avoiding every unit of an all-zero activation tying at
             exactly the weight-only importance
@@ -3153,6 +3732,7 @@ def apply_attention_head_wanda_pruning(
     chains: List[_AttnLikeChain] = [
         *_find_attention_chains(graph),
         *_find_gqa_chains(graph),
+        *_find_onnx_attention_chains(graph),
     ]
     if not chains:
         return out
