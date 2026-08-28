@@ -34,31 +34,31 @@ model still executes and agrees with the pre-simplified one.
 
 import numpy as np
 import onnx
-import onnx.helper
 import onnx.numpy_helper
 import pytest
-from onnx import TensorProto, helper
+from onnx import TensorProto, parser
 
 import onnxsim
 
 ort = pytest.importorskip("onnxruntime")
 
 
-def _vi(name, shape, dtype=TensorProto.FLOAT):
-    return helper.make_tensor_value_info(name, dtype, shape)
+def _model(body, initializer=(), opset=17, ir_version=8):
+    model = parser.parse_model(
+        f"""
+        <
+          ir_version: {ir_version},
+          opset_import: ["": {opset}]
+        >
+        {body}
+        """
+    )
+    model.graph.initializer.extend(initializer)
+    return model
 
 
 def _tensor(array, name, dtype=np.float32):
     return onnx.numpy_helper.from_array(np.asarray(array, dtype=dtype), name)
-
-
-def _model(nodes, inputs, outputs, initializer, opset=17):
-    graph = helper.make_graph(nodes, "g", inputs, outputs, initializer)
-    model = helper.make_model(
-        graph, opset_imports=[helper.make_opsetid("", opset)], ir_version=8
-    )
-    onnx.checker.check_model(model)
-    return model
 
 
 def _op_domains(model, op_type):
@@ -83,38 +83,19 @@ def test_simplify_preserves_per_channel_weight_qdq_for_conv():
     w_scale = np.maximum(w_scale, 1e-6).astype(np.float32)
     w_zp = np.zeros(cout, dtype=np.int8)
 
-    nodes = [
-        helper.make_node(
-            "QuantizeLinear", ["X", "a_scale", "a_zp"], ["Xq"], name="act_q"
-        ),
-        helper.make_node(
-            "DequantizeLinear", ["Xq", "a_scale", "a_zp"], ["Xdq"], name="act_dq"
-        ),
-        helper.make_node(
-            "QuantizeLinear",
-            ["W", "w_scale", "w_zp"],
-            ["Wq"],
-            axis=0,
-            name="weight_q",
-        ),
-        helper.make_node(
-            "DequantizeLinear",
-            ["Wq", "w_scale", "w_zp"],
-            ["Wdq"],
-            axis=0,
-            name="weight_dq",
-        ),
-        helper.make_node(
-            "Conv", ["Xdq", "Wdq"], ["Y"], kernel_shape=[3, 3], pads=[1, 1, 1, 1]
-        ),
-    ]
     model = _model(
-        nodes,
-        [_vi("X", [1, cin, 8, 8])],
-        [_vi("Y", [1, cout, 8, 8])],
+        f"""
+        g (float[1,{cin},8,8] X) => (float[1,{cout},8,8] Y)
+        <float a_scale = {{0.05}}, int8 a_zp = {{0}}>
+        {{
+          Xq = QuantizeLinear(X, a_scale, a_zp)
+          Xdq = DequantizeLinear(Xq, a_scale, a_zp)
+          Wq = QuantizeLinear<axis = 0>(W, w_scale, w_zp)
+          Wdq = DequantizeLinear<axis = 0>(Wq, w_scale, w_zp)
+          Y = Conv<kernel_shape = [3, 3], pads = [1, 1, 1, 1]>(Xdq, Wdq)
+        }}
+        """,
         [
-            _tensor(0.05, "a_scale"),
-            _tensor(0, "a_zp", dtype=np.int8),
             _tensor(w, "W"),
             _tensor(w_scale, "w_scale"),
             _tensor(w_zp, "w_zp", dtype=np.int8),
@@ -156,24 +137,20 @@ def test_simplify_preserves_symmetric_int8_zero_point():
     rng = np.random.default_rng(1)
     w = rng.standard_normal((4, 4)).astype(np.float32) * 0.2
 
-    nodes = [
-        helper.make_node("QuantizeLinear", ["X", "a_scale", "a_zp"], ["Xq"]),
-        helper.make_node("DequantizeLinear", ["Xq", "a_scale", "a_zp"], ["Xdq"]),
-        helper.make_node("QuantizeLinear", ["W", "w_scale", "w_zp"], ["Wq"]),
-        helper.make_node("DequantizeLinear", ["Wq", "w_scale", "w_zp"], ["Wdq"]),
-        helper.make_node("MatMul", ["Xdq", "Wdq"], ["Y"]),
-    ]
     model = _model(
-        nodes,
-        [_vi("X", [2, 4])],
-        [_vi("Y", [2, 4])],
-        [
-            _tensor(0.03, "a_scale"),
-            _tensor(0, "a_zp", dtype=np.int8),
-            _tensor(w, "W"),
-            _tensor(0.01, "w_scale"),
-            _tensor(0, "w_zp", dtype=np.int8),
-        ],
+        """
+        g (float[2,4] X) => (float[2,4] Y)
+        <float a_scale = {0.03}, int8 a_zp = {0},
+         float w_scale = {0.01}, int8 w_zp = {0}>
+        {
+          Xq = QuantizeLinear(X, a_scale, a_zp)
+          Xdq = DequantizeLinear(Xq, a_scale, a_zp)
+          Wq = QuantizeLinear(W, w_scale, w_zp)
+          Wdq = DequantizeLinear(Wq, w_scale, w_zp)
+          Y = MatMul(Xdq, Wdq)
+        }
+        """,
+        [_tensor(w, "W")],
     )
 
     sim_model, check_ok = onnxsim.simplify(model)
@@ -200,42 +177,21 @@ def test_simplify_preserves_independent_residual_branch_qdq():
     w1 = rng.standard_normal((cout, cout, 3, 3)).astype(np.float32) * 0.1
     w2 = rng.standard_normal((cout, cout, 3, 3)).astype(np.float32) * 0.1
 
-    def _branch(x_name, w_name, w, out_name, suffix):
-        return [
-            helper.make_node(
-                "Conv",
-                [x_name, w_name],
-                [f"conv{suffix}"],
-                kernel_shape=[3, 3],
-                pads=[1, 1, 1, 1],
-            ),
-            helper.make_node(
-                "QuantizeLinear",
-                [f"conv{suffix}", "branch_scale", "branch_zp"],
-                [f"q{suffix}"],
-            ),
-            helper.make_node(
-                "DequantizeLinear",
-                [f"q{suffix}", "branch_scale", "branch_zp"],
-                [out_name],
-            ),
-        ]
-
-    nodes = (
-        _branch("X", "W1", w1, "B1", "1")
-        + _branch("X", "W2", w2, "B2", "2")
-        + [helper.make_node("Add", ["B1", "B2"], ["Y"])]
-    )
     model = _model(
-        nodes,
-        [_vi("X", [1, cout, 8, 8])],
-        [_vi("Y", [1, cout, 8, 8])],
-        [
-            _tensor(w1, "W1"),
-            _tensor(w2, "W2"),
-            _tensor(0.02, "branch_scale"),
-            _tensor(0, "branch_zp", dtype=np.int8),
-        ],
+        f"""
+        g (float[1,{cout},8,8] X) => (float[1,{cout},8,8] Y)
+        <float branch_scale = {{0.02}}, int8 branch_zp = {{0}}>
+        {{
+          conv1 = Conv<kernel_shape = [3, 3], pads = [1, 1, 1, 1]>(X, W1)
+          q1 = QuantizeLinear(conv1, branch_scale, branch_zp)
+          B1 = DequantizeLinear(q1, branch_scale, branch_zp)
+          conv2 = Conv<kernel_shape = [3, 3], pads = [1, 1, 1, 1]>(X, W2)
+          q2 = QuantizeLinear(conv2, branch_scale, branch_zp)
+          B2 = DequantizeLinear(q2, branch_scale, branch_zp)
+          Y = Add(B1, B2)
+        }}
+        """,
+        [_tensor(w1, "W1"), _tensor(w2, "W2")],
     )
 
     sim_model, check_ok = onnxsim.simplify(model)
@@ -262,24 +218,20 @@ def test_simplify_keeps_qdq_nodes_in_default_domain():
     # onnxsim's own com.microsoft-domain contrib-op passes).
     rng = np.random.default_rng(3)
     w = rng.standard_normal((4, 4)).astype(np.float32) * 0.2
-    nodes = [
-        helper.make_node("QuantizeLinear", ["X", "a_scale", "a_zp"], ["Xq"]),
-        helper.make_node("DequantizeLinear", ["Xq", "a_scale", "a_zp"], ["Xdq"]),
-        helper.make_node("QuantizeLinear", ["W", "w_scale", "w_zp"], ["Wq"]),
-        helper.make_node("DequantizeLinear", ["Wq", "w_scale", "w_zp"], ["Wdq"]),
-        helper.make_node("MatMul", ["Xdq", "Wdq"], ["Y"]),
-    ]
     model = _model(
-        nodes,
-        [_vi("X", [2, 4])],
-        [_vi("Y", [2, 4])],
-        [
-            _tensor(0.03, "a_scale"),
-            _tensor(0, "a_zp", dtype=np.int8),
-            _tensor(w, "W"),
-            _tensor(0.01, "w_scale"),
-            _tensor(0, "w_zp", dtype=np.int8),
-        ],
+        """
+        g (float[2,4] X) => (float[2,4] Y)
+        <float a_scale = {0.03}, int8 a_zp = {0},
+         float w_scale = {0.01}, int8 w_zp = {0}>
+        {
+          Xq = QuantizeLinear(X, a_scale, a_zp)
+          Xdq = DequantizeLinear(Xq, a_scale, a_zp)
+          Wq = QuantizeLinear(W, w_scale, w_zp)
+          Wdq = DequantizeLinear(Wq, w_scale, w_zp)
+          Y = MatMul(Xdq, Wdq)
+        }
+        """,
+        [_tensor(w, "W")],
     )
     assert _op_domains(model, "QuantizeLinear") == [""] * 2
     assert _op_domains(model, "DequantizeLinear") == [""] * 2
