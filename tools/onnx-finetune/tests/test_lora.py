@@ -315,3 +315,74 @@ def test_prepare_qlora_excludes_adapter_from_quantization(tmp_path):
     y_qlora = ReferenceEvaluator(str(qlora_path)).run(None, {"input": x})[0]
     rel_l2 = np.linalg.norm(y_base - y_qlora) / np.linalg.norm(y_base)
     assert rel_l2 < 0.25  # NF4 quantization noise only, adapters are zero-init
+
+
+def test_export_onnx_adapter_matches_merged_model_via_native_lora_adapter(tmp_path):
+    ort = pytest.importorskip("onnxruntime")
+    pytest.importorskip("packaging")
+    from packaging.version import Version
+
+    if Version(ort.__version__) < Version("1.20"):
+        pytest.skip("onnxruntime.AdapterFormat/LoraAdapter need onnxruntime >= 1.20")
+
+    base_path = tmp_path / "base.onnx"
+    _matmul_model(base_path)
+    lora_path = tmp_path / "lora.onnx"
+    manifest_path = tmp_path / "manifest.json"
+    _run(
+        "inject_lora.py",
+        str(base_path),
+        "-o",
+        str(lora_path),
+        "--rank",
+        "2",
+        "--adapter-inputs",
+        "--params-out",
+        str(manifest_path),
+    )
+
+    finetuned_path = tmp_path / "finetuned.onnx"
+    _perturb_lora_b(lora_path, finetuned_path)
+    adapter_path = tmp_path / "adapter.onnx"
+    _run(
+        "extract_lora_adapter.py",
+        str(finetuned_path),
+        "--params-file",
+        str(manifest_path),
+        "-o",
+        str(adapter_path),
+    )
+    onnx_adapter_path = tmp_path / "adapter.onnx_adapter"
+    _run(
+        "export_onnx_adapter.py",
+        str(adapter_path),
+        "--params-file",
+        str(manifest_path),
+        "-o",
+        str(onnx_adapter_path),
+    )
+    assert onnx_adapter_path.exists() and onnx_adapter_path.stat().st_size > 0
+
+    x = np.random.default_rng(6).standard_normal((3, 4)).astype(np.float32)
+
+    base_session = ort.InferenceSession(
+        str(lora_path), providers=["CPUExecutionProvider"]
+    )
+    (y_no_adapter,) = base_session.run(None, {"input": x})
+    (y_original,) = ort.InferenceSession(
+        str(base_path), providers=["CPUExecutionProvider"]
+    ).run(None, {"input": x})
+    assert np.allclose(
+        y_no_adapter, y_original, atol=1e-6
+    )  # unchanged with no adapter active
+
+    adapter = ort.LoraAdapter()
+    adapter.Load(str(onnx_adapter_path))
+    run_opts = ort.RunOptions()
+    run_opts.add_active_adapter(adapter)
+    (y_active,) = base_session.run(None, {"input": x}, run_options=run_opts)
+
+    (y_finetuned,) = ort.InferenceSession(
+        str(finetuned_path), providers=["CPUExecutionProvider"]
+    ).run(None, {"input": x})
+    assert np.allclose(y_active, y_finetuned, atol=1e-5)
