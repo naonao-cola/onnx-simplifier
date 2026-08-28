@@ -217,7 +217,8 @@ def _export_llm(tmp_path):
         "position_ids": position_ids.numpy().astype(np.int64),
         "logits_index": logits_index.numpy(),
     }
-    reference = _run(onnx.load(onnx_path), feed)
+    loaded, _pool = onnxsim.load_model(onnx_path)
+    reference = _run(loaded, feed)
     return onnx_path, feed, reference
 
 
@@ -243,11 +244,11 @@ def _slim_onnx_with_onnxsim(onnx_model):
 
 def test_onnxsim_slims_mnn_llm_export(tmp_path):
     onnx_path, feed, reference = _export_llm(tmp_path)
-    original = onnx.load(onnx_path)
+    original, _pool = onnxsim.load_model(onnx_path)
 
     # The onnxsim drop-in for MNN's slim_onnx: reduce in place.
     _slim_onnx_with_onnxsim(onnx_path)
-    simplified = onnx.load(onnx_path)
+    simplified, _pool = onnxsim.load_model(onnx_path)
 
     # Still a valid ONNX model after the swap.
     onnx.checker.check_model(simplified)
@@ -281,11 +282,12 @@ def test_onnxsim_matches_onnxslim_on_mnn_llm_export(tmp_path):
     onnxslim = pytest.importorskip("onnxslim")
 
     onnx_path, feed, reference = _export_llm(tmp_path)
-    original = onnx.load(onnx_path)
+    original, _pool = onnxsim.load_model(onnx_path)
 
     onnxsim_model, check_ok = onnxsim.simplify(onnx_path)
     assert check_ok
-    onnxslim_model = onnxslim.slim(onnx.load(onnx_path))
+    onnxslim_input, _pool = onnxsim.load_model(onnx_path)
+    onnxslim_model = onnxslim.slim(onnxslim_input)
 
     onnx.checker.check_model(onnxsim_model)
     onnx.checker.check_model(onnxslim_model)

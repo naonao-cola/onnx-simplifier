@@ -87,8 +87,9 @@ import time
 import urllib.error
 import urllib.request
 
-import onnx
 import pytest
+
+import onnxsim
 
 # A bare ``import onnxruntime`` would fail collection (not skip the test) on
 # platforms onnxruntime doesn't ship wheels for, before the
@@ -250,7 +251,8 @@ def test_firered_audio_patch_encoder_simplify(
             output_names=["hidden_states"],
             dynamo=False,
         )
-        nodes_before = len(onnx.load(export_fn).graph.node)
+        loaded, _pool = onnxsim.load_model(export_fn)
+        nodes_before = len(loaded.graph.node)
 
     opt = export_simplify_and_check_by_python_api(
         model,

@@ -369,33 +369,58 @@ def import_safetensors(in_path: str) -> onnx.ModelProto:
     return model
 
 
-def load_model(path: str) -> onnx.ModelProto:
-    """Load a ``.onnx`` file, mmap'ing classic ONNX external data through a
-    ``TensorPool`` instead of onnx's own external-data loader.
+def load_model(
+    path: str, hydrate_all: bool = True
+) -> Tuple[onnx.ModelProto, C.TensorPool]:
+    """Load a model file, resolving its external weights through a
+    :class:`onnxsim.onnxsim_cpp2py_export.TensorPool` instead of onnx's own
+    external-data loader, and return that pool alongside the model.
 
-    Behaves like ``onnx.load(path)`` (structure plus every tensor's values,
-    inline) for any model, but loads faster for a model whose weights live in
-    external data (``onnx.save(..., save_as_external_data=True)``, the
-    default this package's own :func:`simplify` and CLI now use once a
-    model's serialized size passes 100MB -- see
-    ``DEFAULT_EXTERNAL_DATA_THRESHOLD``): onnx's own loader opens and reads
-    each referenced file once per tensor, while this mmaps each *distinct*
-    external file exactly once and hydrates every tensor from that one
-    mapping -- most of the win shows up on the common
-    ``all_tensors_to_one_file=True`` layout, where every initializer shares a
-    single weights file.
+    Dispatches on ``path``'s extension:
 
-    :param path: path to the ``.onnx`` file to load. A relative external-data
-            ``location`` is resolved against this file's own directory, same
-            as onnx's own loader.
-    :returns: the fully hydrated ``ModelProto`` (no external references left
-            for a tensor this could resolve; a tensor whose external file is
-            missing or malformed is left as-is, matching onnx's own loader's
-            leniency for one bad reference in an otherwise-loadable model).
+    * ``.safetensors`` / ``.gguf`` -- one of onnxsim's own self-describing
+      archives (see :func:`export_safetensors` / :func:`export_gguf`): the
+      graph and weights both live in this one file. Raises ``RuntimeError``
+      if the archive has no embedded onnxsim model (e.g. a plain
+      weights-only file with no graph to import).
+    * anything else -- an ordinary ``.onnx`` file (produced by any exporter,
+      not necessarily onnxsim). Behaves like ``onnx.load(path)`` (structure
+      plus every tensor's values, inline) for any such model, but loads
+      faster for one whose weights live in classic ONNX external data
+      (``onnx.save(..., save_as_external_data=True)``, the default this
+      package's own :func:`simplify` and CLI now use once a model's
+      serialized size passes 100MB -- see ``DEFAULT_EXTERNAL_DATA_THRESHOLD``):
+      onnx's own loader opens and reads each referenced file once per
+      tensor, while this mmaps each *distinct* external file exactly once
+      and resolves every tensor from that one mapping -- most of the win
+      shows up on the common ``all_tensors_to_one_file=True`` layout, where
+      every initializer shares a single weights file. A relative external-data
+      ``location`` is resolved against this file's own directory, same as
+      onnx's own loader; a tensor whose external file is missing or
+      malformed is left as an unresolved ``EXTERNAL`` reference rather than
+      failing the whole load, matching onnx's own loader's leniency for one
+      bad reference in an otherwise-loadable model.
+
+    :param path: path to the model file to load.
+    :param hydrate_all: when ``True`` (the default), every tensor the pool
+            resolves is also written into the returned ``ModelProto`` as an
+            ordinary in-memory tensor, ready for any onnxsim pass or onnx
+            tool. Pass ``False`` to leave the model's tensors as lazy
+            ``EXTERNAL`` references instead -- the returned pool already
+            holds their bytes (``pool.bytes(name)``), so nothing is lost,
+            but the model itself is not usable by code that doesn't know to
+            hydrate from the pool on demand.
+    :returns: ``(model, pool)`` -- the loaded model, and the ``TensorPool``
+            every external tensor was resolved into (empty if ``path`` had
+            no external weights to resolve). The pool supports ``len()``,
+            ``name in pool``, ``pool.names()``, and, per tensor,
+            ``pool.dtype(name)``, ``pool.shape(name)``, ``pool.bytes(name)``
+            and ``pool.content_hash(name)``.
     """
+    model_bytes, pool = C.load_model(path, hydrate_all)
     model = onnx.ModelProto()
-    model.ParseFromString(C.load_model_with_tensor_pool(path))
-    return model
+    model.ParseFromString(model_bytes)
+    return model, pool
 
 
 def export_gguf(model: onnx.ModelProto, out_path: str) -> None:
