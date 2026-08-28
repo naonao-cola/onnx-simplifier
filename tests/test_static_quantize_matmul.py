@@ -1,7 +1,7 @@
 """Tests for ``onnxsim.quantize_static`` (the ``static_quantize_matmul`` C++
 pass) and its calibration-data helpers in ``onnxsim.calibration``.
 
-Each model is built directly with ``onnx.helper`` (no torch dependency),
+Each model is built directly with ``onnx.parser`` (no torch dependency),
 calibrated with random data, quantized, and then actually run through ONNX
 Runtime -- both before and after quantization -- so these tests double as a
 minimal end-to-end calibrate/quantize/deploy check: the quantized graph must
@@ -13,9 +13,9 @@ import collections
 
 import numpy as np
 import onnx
-import onnx.helper
 import onnx.numpy_helper
 import pytest
+from onnx import parser
 
 import onnxsim
 
@@ -24,17 +24,20 @@ import onnxsim
 ort = pytest.importorskip("onnxruntime")
 
 
-def _model(nodes, inputs, outputs, initializer, opset=13):
-    graph = onnx.helper.make_graph(nodes, "g", inputs, outputs, initializer)
+def _model(body, initializer=(), opset=13, ir_version=10):
     # Pin a low IR version so the model loads under older onnxruntime builds
     # (which cap at IR version 11), matching test_fusion_patterns.py.
-    return onnx.helper.make_model(
-        graph, opset_imports=[onnx.helper.make_opsetid("", opset)], ir_version=10
+    model = parser.parse_model(
+        f"""
+        <
+          ir_version: {ir_version},
+          opset_import: ["": {opset}]
+        >
+        {body}
+        """
     )
-
-
-def _vi(name, shape):
-    return onnx.helper.make_tensor_value_info(name, onnx.TensorProto.FLOAT, shape)
+    model.graph.initializer.extend(initializer)
+    return model
 
 
 def _f32(array, name):
@@ -68,8 +71,15 @@ def test_quantize_matmul():
     rng = np.random.default_rng(0)
     K, N = 32, 16
     weight = _f32(rng.standard_normal((K, N)) * 0.5, "W")
-    nodes = [onnx.helper.make_node("MatMul", ["X", "W"], ["Y"])]
-    model = _model(nodes, [_vi("X", [4, K])], [_vi("Y", [4, N])], [weight])
+    model = _model(
+        """
+        g (float[4,32] X) => (float[4,16] Y)
+        {
+          Y = MatMul(X, W)
+        }
+        """,
+        initializer=[weight],
+    )
 
     quant = onnxsim.quantize_static(model, num_calibration_samples=16, seed=0)
     onnx.checker.check_model(quant)
@@ -89,8 +99,15 @@ def test_quantize_gemm_transb_with_bias():
     K, N = 24, 12
     weight = _f32(rng.standard_normal((N, K)) * 0.5, "W")
     bias = _f32(rng.standard_normal(N), "B")
-    nodes = [onnx.helper.make_node("Gemm", ["X", "W", "B"], ["Y"], transB=1)]
-    model = _model(nodes, [_vi("X", [3, K])], [_vi("Y", [3, N])], [weight, bias])
+    model = _model(
+        """
+        g (float[3,24] X) => (float[3,12] Y)
+        {
+          Y = Gemm<transB = 1>(X, W, B)
+        }
+        """,
+        initializer=[weight, bias],
+    )
 
     quant = onnxsim.quantize_static(model, num_calibration_samples=16, seed=1)
     onnx.checker.check_model(quant)
@@ -108,8 +125,14 @@ def test_quantize_gemm_transb_with_bias():
 def test_quantize_skips_non_constant_weight():
     # Both MatMul operands are graph inputs (neither is a constant), so there
     # is nothing to quantize ahead of time.
-    nodes = [onnx.helper.make_node("MatMul", ["X", "W"], ["Y"])]
-    model = _model(nodes, [_vi("X", [4, 8]), _vi("W", [8, 4])], [_vi("Y", [4, 4])], [])
+    model = _model(
+        """
+        g (float[4,8] X, float[8,4] W) => (float[4,4] Y)
+        {
+          Y = MatMul(X, W)
+        }
+        """
+    )
     quant = onnxsim.quantize_static(model)
     assert _op_counts(quant)["MatMul"] == 1
 
@@ -117,8 +140,15 @@ def test_quantize_skips_non_constant_weight():
 def test_quantize_skips_non_default_gemm_attrs():
     # alpha != 1 falls outside the "vanilla" Gemm shape this pass handles.
     weight = _f32(np.random.randn(8, 4).astype(np.float32), "W")
-    nodes = [onnx.helper.make_node("Gemm", ["X", "W"], ["Y"], alpha=2.0)]
-    model = _model(nodes, [_vi("X", [4, 8])], [_vi("Y", [4, 4])], [weight])
+    model = _model(
+        """
+        g (float[4,8] X) => (float[4,4] Y)
+        {
+          Y = Gemm<alpha = 2.0>(X, W)
+        }
+        """,
+        initializer=[weight],
+    )
     quant = onnxsim.quantize_static(model)
     assert _op_counts(quant)["Gemm"] == 1
 
@@ -126,16 +156,31 @@ def test_quantize_skips_non_default_gemm_attrs():
 def test_quantize_skips_old_opset():
     # DequantizeLinear's per-channel `axis` attribute needs opset >= 13.
     weight = _f32(np.random.randn(8, 4).astype(np.float32), "W")
-    nodes = [onnx.helper.make_node("MatMul", ["X", "W"], ["Y"])]
-    model = _model(nodes, [_vi("X", [4, 8])], [_vi("Y", [4, 4])], [weight], opset=12)
+    model = _model(
+        """
+        g (float[4,8] X) => (float[4,4] Y)
+        {
+          Y = MatMul(X, W)
+        }
+        """,
+        initializer=[weight],
+        opset=12,
+    )
     quant = onnxsim.quantize_static(model)
     assert _op_counts(quant)["MatMul"] == 1
 
 
 def test_generate_random_calibration_data_shapes():
     weight = _f32(np.random.randn(8, 4).astype(np.float32), "W")
-    nodes = [onnx.helper.make_node("MatMul", ["X", "W"], ["Y"])]
-    model = _model(nodes, [_vi("X", [2, 8])], [_vi("Y", [2, 4])], [weight])
+    model = _model(
+        """
+        g (float[2,8] X) => (float[2,4] Y)
+        {
+          Y = MatMul(X, W)
+        }
+        """,
+        initializer=[weight],
+    )
     batches = onnxsim.generate_random_calibration_data(model, num_samples=3, seed=0)
     assert len(batches) == 3
     for batch in batches:
@@ -152,16 +197,19 @@ def test_generate_random_calibration_data_keeps_static_zero_dim():
     # dim is genuinely fixed to 0 and when it's unset/symbolic, so telling
     # them apart requires `HasField("dim_value")`, not a bare `> 0` check.
     weight = _f32(np.random.randn(8, 4).astype(np.float32), "W")
-    nodes = [onnx.helper.make_node("MatMul", ["X", "W"], ["Y"])]
     # X's second dim is dynamic (symbolic "seq"); "state" has a real,
     # static empty dimension at index 1.
-    x_vi = onnx.helper.make_tensor_value_info("X", onnx.TensorProto.FLOAT, [2, "seq"])
-    state_vi = onnx.helper.make_tensor_value_info(
-        "state", onnx.TensorProto.FLOAT, [1, 0, 4]
-    )
     # "state" is unused by any node -- fine, only its declared shape matters
     # for _input_specs, which looks at model.graph.input directly.
-    model = _model(nodes, [x_vi, state_vi], [_vi("Y", [2, 4])], [weight])
+    model = _model(
+        """
+        g (float[2,seq] X, float[1,0,4] state) => (float[2,4] Y)
+        {
+          Y = MatMul(X, W)
+        }
+        """,
+        initializer=[weight],
+    )
 
     batches = onnxsim.generate_random_calibration_data(model, num_samples=1, seed=0)
     assert batches[0]["X"].shape == (2, 1)  # symbolic dim -> defaults to 1
@@ -170,8 +218,15 @@ def test_generate_random_calibration_data_keeps_static_zero_dim():
 
 def test_calibrate_returns_ranges_for_quantizable_tensors():
     weight = _f32(np.random.randn(8, 4).astype(np.float32), "W")
-    nodes = [onnx.helper.make_node("MatMul", ["X", "W"], ["Y"])]
-    model = _model(nodes, [_vi("X", [2, 8])], [_vi("Y", [2, 4])], [weight])
+    model = _model(
+        """
+        g (float[2,8] X) => (float[2,4] Y)
+        {
+          Y = MatMul(X, W)
+        }
+        """,
+        initializer=[weight],
+    )
     data = onnxsim.generate_random_calibration_data(model, num_samples=4, seed=0)
     ranges = onnxsim.calibrate(model, data)
     assert set(ranges.keys()) == {"X"}
