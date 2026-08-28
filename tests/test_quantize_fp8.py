@@ -34,6 +34,7 @@ import onnx.helper
 import onnx.numpy_helper
 import onnx.shape_inference
 import pytest
+from onnx import parser
 
 import onnxsim
 
@@ -56,15 +57,18 @@ _MAX_VALUE = {
 }
 
 
-def _model(nodes, inputs, outputs, initializer, opset=19):
-    graph = onnx.helper.make_graph(nodes, "g", inputs, outputs, initializer)
-    return onnx.helper.make_model(
-        graph, opset_imports=[onnx.helper.make_opsetid("", opset)], ir_version=10
+def _model(body, initializer=(), opset=19, ir_version=10):
+    model = parser.parse_model(
+        f"""
+        <
+          ir_version: {ir_version},
+          opset_import: ["": {opset}]
+        >
+        {body}
+        """
     )
-
-
-def _vi(name, shape, elem_type=onnx.TensorProto.FLOAT):
-    return onnx.helper.make_tensor_value_info(name, elem_type, shape)
+    model.graph.initializer.extend(initializer)
+    return model
 
 
 def _f32(array, name):
@@ -112,12 +116,17 @@ def _two_matmul_model():
     k, n1, n2 = 16, 12, 8
     w1 = _f32(rng.standard_normal((k, n1)) * 0.5, "W1")
     w2 = _f32(rng.standard_normal((n1, n2)) * 0.5, "W2")
-    nodes = [
-        onnx.helper.make_node("MatMul", ["X", "W1"], ["H"]),
-        onnx.helper.make_node("Relu", ["H"], ["Hr"]),
-        onnx.helper.make_node("MatMul", ["Hr", "W2"], ["Y"]),
-    ]
-    model = _model(nodes, [_vi("X", [4, k])], [_vi("Y", [4, n2])], [w1, w2])
+    model = _model(
+        f"""
+        g (float[4,{k}] X) => (float[4,{n2}] Y)
+        {{
+          H = MatMul(X, W1)
+          Hr = Relu(H)
+          Y = MatMul(Hr, W2)
+        }}
+        """,
+        [w1, w2],
+    )
     return model, rng, k, n2
 
 
@@ -184,16 +193,25 @@ def test_quantize_fp8_converts_constant_node(fmt):
     rng = np.random.default_rng(1)
     k, n = 8, 4
     w = rng.standard_normal((k, n)).astype(np.float32)
+
+    model = _model(
+        f"""
+        g (float[3,{k}] X) => (float[3,{n}] Y)
+        {{
+          Y = MatMul(X, W)
+        }}
+        """
+    )
+    # W's random data can't be spelled out cleanly as a text literal, so the
+    # Constant node producing it is built with onnx.helper (as before) and
+    # spliced into the parsed graph.
     const_node = onnx.helper.make_node(
         "Constant",
         [],
         ["W"],
         value=onnx.numpy_helper.from_array(w, "W"),
     )
-    matmul_node = onnx.helper.make_node("MatMul", ["X", "W"], ["Y"])
-    model = _model(
-        [const_node, matmul_node], [_vi("X", [3, k])], [_vi("Y", [3, n])], []
-    )
+    model.graph.node.insert(0, const_node)
 
     quant = onnxsim.quantize_fp8(model, format=fmt)
     onnx.checker.check_model(quant)
@@ -214,9 +232,15 @@ def test_quantize_fp8_e4m3_rounds_ties_to_even():
     # 1.1875 is exactly halfway between 1.125 (odd) and 1.25 (mantissa 010,
     # even) and must round up to 1.25.
     w = np.array([[1.0625, 1.1875, -1.0625]], dtype=np.float32)
-    weight = _f32(w, "W")
-    nodes = [onnx.helper.make_node("MatMul", ["X", "W"], ["Y"])]
-    model = _model(nodes, [_vi("X", [2, 1])], [_vi("Y", [2, 3])], [weight])
+    model = _model(
+        """
+        g (float[2,1] X) => (float[2,3] Y)
+        <float[1,3] W = {1.0625, 1.1875, -1.0625}>
+        {
+          Y = MatMul(X, W)
+        }
+        """
+    )
 
     quant = onnxsim.quantize_fp8(model, format="e4m3")
     w_init = _node_input_initializer(quant, "MatMul", 1)
@@ -234,10 +258,15 @@ def test_quantize_fp8_saturates_out_of_range_weight(fmt):
     # ml_dtypes's own plain .astype(), which does the latter (see this
     # file's module docstring and docs/fp8-quantization.md).
     max_value = _MAX_VALUE[fmt]
-    w = np.array([[1.0e10, -1.0e10, 3.0, float("inf"), float("nan")]], dtype=np.float32)
-    weight = _f32(w, "W")
-    nodes = [onnx.helper.make_node("MatMul", ["X", "W"], ["Y"])]
-    model = _model(nodes, [_vi("X", [2, 1])], [_vi("Y", [2, 5])], [weight])
+    model = _model(
+        """
+        g (float[2,1] X) => (float[2,5] Y)
+        <float[1,5] W = {1.0e10, -1.0e10, 3.0, inf, nan}>
+        {
+          Y = MatMul(X, W)
+        }
+        """
+    )
 
     quant = onnxsim.quantize_fp8(model, format=fmt)
     onnx.checker.check_model(quant)
@@ -256,11 +285,13 @@ def test_quantize_fp8_skips_optional_input_default_initializer():
     # input with a default value" convention) is left alone entirely -- see
     # quantize_fp8.h's doc comment.
     w = _f32(np.random.randn(4, 2).astype(np.float32), "W")
-    nodes = [onnx.helper.make_node("MatMul", ["X", "W"], ["Y"])]
     model = _model(
-        nodes,
-        [_vi("X", [3, 4]), _vi("W", [4, 2])],
-        [_vi("Y", [3, 2])],
+        """
+        g (float[3,4] X, float[4,2] W) => (float[3,2] Y)
+        {
+          Y = MatMul(X, W)
+        }
+        """,
         [w],
     )
 
@@ -299,8 +330,14 @@ def test_quantize_fp8_boundary_casts_execute():
     # Identity is used as the compute op in the middle since float8 compute
     # kernel coverage on CPUExecutionProvider is narrow -- see this file's
     # module docstring.
-    nodes = [onnx.helper.make_node("Identity", ["X"], ["Y"])]
-    model = _model(nodes, [_vi("X", [2, 3])], [_vi("Y", [2, 3])], [])
+    model = _model(
+        """
+        g (float[2,3] X) => (float[2,3] Y)
+        {
+          Y = Identity(X)
+        }
+        """
+    )
 
     quant = onnxsim.quantize_fp8(model)
     onnx.checker.check_model(quant)
