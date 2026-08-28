@@ -49,6 +49,7 @@
 #include "passes/quantize_bf16.h"
 #include "passes/quantize_fp16.h"
 #include "passes/quantize_fp8.h"
+#include "passes/rewrite_arg_reduce_select_last_index.h"
 #include "passes/static_quantize_conv.h"
 #include "passes/static_quantize_int16_conv.h"
 #include "passes/static_quantize_int16_matmul.h"
@@ -129,6 +130,7 @@ void RegisterCustomOptimizerPasses() {
     RegisterOrReplace<p::QuantizeBf16Pass>(registry);
     RegisterOrReplace<p::QuantizeFp16Pass>(registry);
     RegisterOrReplace<p::QuantizeFp8Pass>(registry);
+    RegisterOrReplace<p::RewriteArgReduceSelectLastIndex>(registry);
     RegisterOrReplace<p::StaticQuantizeConv>(registry);
     RegisterOrReplace<p::StaticQuantizeInt16Conv>(registry);
     RegisterOrReplace<p::StaticQuantizeInt16MatMul>(registry);

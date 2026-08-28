@@ -937,6 +937,60 @@ def test_optional_has_element_is_folded():
     assert bool(values[out_names[2]]) is False  # h_no_input
 
 
+def test_arg_reduce_select_last_index_is_rewritten():
+    # `select_last_index=1` (added at opset 12) isn't implemented by some
+    # downstream ONNX consumers (e.g. TVM's Relax ONNX frontend). It's
+    # rewritten to an equivalent computation over `Shape`/`Gather`/`Slice`/
+    # `Sub`/`ArgMax` that never needs the attribute: flip the axis, take the
+    # *first* occurrence there (select_last_index's own default), and map
+    # the index back through the flip.
+    import numpy as np
+
+    x = helper.make_tensor_value_info("x", TensorProto.FLOAT, [4])
+    argmax = helper.make_node(
+        "ArgMax", ["x"], ["y"], axis=0, keepdims=1, select_last_index=1
+    )
+    graph = helper.make_graph(
+        [argmax],
+        "g",
+        [x],
+        [helper.make_tensor_value_info("y", TensorProto.INT64, [1])],
+    )
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+    onnx.checker.check_model(model)
+
+    sim_model, check_ok = onnxsim.simplify(model, check_n=0)
+    assert check_ok
+    onnx.checker.check_model(sim_model)
+    op_types = [n.op_type for n in sim_model.graph.node]
+    assert "ArgMax" in op_types  # rewritten, not eliminated
+    for node in sim_model.graph.node:
+        if node.op_type == "ArgMax":
+            select_last_index = [
+                a.i for a in node.attribute if a.name == "select_last_index"
+            ]
+            # Absent (defaults to 0) or explicitly reset to 0 -- either is
+            # fine, since the rewrite compensates by flipping the axis.
+            assert not select_last_index or select_last_index[0] == 0
+
+    # Numeric check on inputs with ties, where select_last_index actually
+    # changes the result relative to the default (first-occurrence) index.
+    sess_orig = onnxruntime.InferenceSession(
+        model.SerializeToString(), providers=["CPUExecutionProvider"]
+    )
+    sess_sim = onnxruntime.InferenceSession(
+        sim_model.SerializeToString(), providers=["CPUExecutionProvider"]
+    )
+    for v in (
+        np.array([3, 5, 5, 2], dtype=np.float32),
+        np.array([4, 4, 4, 4], dtype=np.float32),
+        np.array([1, 2, 3, 4], dtype=np.float32),
+    ):
+        orig_out = sess_orig.run(None, {"x": v})[0]
+        sim_out = sess_sim.run(None, {"x": v})[0]
+        assert np.array_equal(orig_out, sim_out)
+
+
 def test_ir3_conv_bn_fuses():
     # IR version 3 models (e.g. the opset-8 ``resnet101-v1-7``) list every
     # initializer as a graph input too, which is required before IR 4. onnxsim
