@@ -142,8 +142,10 @@ dmypy.json
 compile_commands.json
 temp*.py
 test*.py
-# ...but the real test suite under tests/ is tracked.
+# ...but the real test suites under tests/ and tools/onnx-finetune/tests/ are
+# tracked.
 !tests/test*.py
+!tools/onnx-finetune/tests/test*.py
 
 .setuptools-cmake-build/
 onnxsim/version.py
