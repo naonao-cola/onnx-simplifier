@@ -7,8 +7,9 @@
 #include "onnxsim_option.h"
 
 // In the ORT-web WASM build (ONNXSIM_WASM_ORT_WEB) onnxsim links no ONNX
-// Runtime (NO_BUILTIN_ORT), so GetBuiltinModelExecutor() does not exist;
-// folding is delegated to onnxruntime-web via GetJsModelExecutor() instead.
+// Runtime (ONNXSIM_HAS_ORT is not defined), so GetBuiltinModelExecutor() does
+// not exist; folding is delegated to onnxruntime-web via GetJsModelExecutor()
+// instead.
 // main() is not auto-run under Emscripten (INVOKE_RUN=0) but still has to
 // compile.
 #ifdef ONNXSIM_WASM_ORT_WEB
@@ -23,6 +24,7 @@ int main(int argc, char** argv) {
   bool no_sim = option.Get<bool>("no-sim");
   bool no_shape_inference = option.Get<bool>("no-shape-inference");
   int target_opset = option.Get<int>("target-opset");
+  bool graph_diff = option.Get<bool>("graph-diff");
   auto input_model_filename = option.Get<std::string>("input-model");
   auto output_model_filename = option.Get<std::string>("output-model");
 
@@ -50,5 +52,8 @@ int main(int argc, char** argv) {
   // the Python CLI's "Finish! Here is the difference:" output.
   std::cout << "Finish! Here is the difference:\n";
   std::cout << FormatSimplifyingInfo(model, simplified);
+  if (graph_diff) {
+    std::cout << FormatGraphDiff(model, simplified);
+  }
   return 0;
 }

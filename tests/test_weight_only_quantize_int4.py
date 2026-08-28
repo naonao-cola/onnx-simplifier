@@ -1,0 +1,289 @@
+"""Tests for ``onnxsim.quantize_weight_only_int4`` (the
+``weight_only_quantize_int4_matmul``/``weight_only_quantize_int4_conv`` C++
+passes).
+
+Each model is built directly with the ONNX text format (no torch
+dependency), quantized, and then actually run through ONNX Runtime -- both
+before and after quantization -- so these tests double as a minimal
+end-to-end simplify/quantize/deploy check: the quantized graph must load and
+execute under a real inference engine, and its outputs must stay close to the
+float baseline. Needs opset 21 for INT4 tensors and DequantizeLinear's
+block_size attribute.
+"""
+
+import collections
+
+import numpy as np
+import onnx
+import onnx.numpy_helper
+import pytest
+from onnx import parser
+
+import onnxsim
+
+# A bare ``import onnxruntime`` would fail collection (not skip the test) on
+# platforms onnxruntime doesn't ship wheels for (e.g. s390x).
+ort = pytest.importorskip("onnxruntime")
+
+
+def _model(body, initializer=(), opset=21, ir_version=10):
+    # Pin a low-ish IR version so the model loads under older onnxruntime
+    # builds, matching test_fusion_patterns.py -- IR version 10 supports
+    # opset 21 fine (IR version only gates the *envelope*, not individual op
+    # opsets).
+    model = parser.parse_model(
+        f"""
+        <
+          ir_version: {ir_version},
+          opset_import: ["": {opset}]
+        >
+        {body}
+        """
+    )
+    model.graph.initializer.extend(initializer)
+    return model
+
+
+def _f32(array, name):
+    return onnx.numpy_helper.from_array(array.astype(np.float32), name)
+
+
+def _run(model, feeds):
+    sess = ort.InferenceSession(
+        model.SerializeToString(), providers=["CPUExecutionProvider"]
+    )
+    return sess.run(None, feeds)
+
+
+def _op_counts(model):
+    return collections.Counter(n.op_type for n in model.graph.node)
+
+
+def _assert_close(float_outputs, quant_outputs, rel_l2_tol=0.25):
+    # INT4 weight-only quantization is considerably lossier than INT8 (16
+    # levels per block instead of 255), so this needs more headroom than
+    # test_weight_only_quantize.py's INT8 tests -- see that file's
+    # identically-named helper for why aggregate relative L2 error is used
+    # instead of a tight per-element bound. Verified empirically across 15
+    # random seeds at this test's K/N: round-to-nearest INT4 (no calibration,
+    # unlike GPTQ/AWQ) on random Gaussian weights lands in the ~0.07-0.16
+    # range on its own, so 0.1 (this scheme's INT8 counterpart's bound) was
+    # too tight and flaked; 0.25 gives real headroom above the observed max.
+    for f, q in zip(float_outputs, quant_outputs):
+        f = np.asarray(f, dtype=np.float64).ravel()
+        q = np.asarray(q, dtype=np.float64).ravel()
+        assert np.all(np.isfinite(q))
+        rel_l2 = np.linalg.norm(f - q) / max(np.linalg.norm(f), 1e-6)
+        assert rel_l2 < rel_l2_tol, f"relative L2 error too large: {rel_l2:.4f}"
+
+
+def test_quantize_matmul():
+    rng = np.random.default_rng(0)
+    K, N = 64, 16
+    weight = _f32(rng.standard_normal((K, N)) * 0.5, "W")
+    model = _model(
+        f"""
+        g (float[4,{K}] X) => (float[4,{N}] Y)
+        {{
+          Y = MatMul(X, W)
+        }}
+        """,
+        initializer=[weight],
+    )
+
+    quant = onnxsim.quantize_weight_only_int4(model)
+    onnx.checker.check_model(quant)
+    ops = _op_counts(quant)
+    assert ops["MatMul"] == 1
+    assert ops["DequantizeLinear"] == 1
+
+    w_init = next(t for t in quant.graph.initializer if t.name != "W")
+    assert w_init.data_type == onnx.TensorProto.INT4
+
+    x = rng.standard_normal((4, K)).astype(np.float32)
+    _assert_close(_run(model, {"X": x}), _run(quant, {"X": x}))
+
+
+def test_quantize_gemm_transb_with_bias():
+    # PyTorch's nn.Linear layout: weight is [out_features, in_features], i.e.
+    # [N, K], exported as Gemm(X, W, B, transB=1) -- the common real-world case.
+    rng = np.random.default_rng(1)
+    K, N = 96, 12
+    weight = _f32(rng.standard_normal((N, K)) * 0.5, "W")
+    bias = _f32(rng.standard_normal(N), "B")
+    model = _model(
+        f"""
+        g (float[3,{K}] X) => (float[3,{N}] Y)
+        {{
+          Y = Gemm<transB = 1>(X, W, B)
+        }}
+        """,
+        initializer=[weight, bias],
+    )
+
+    quant = onnxsim.quantize_weight_only_int4(model)
+    onnx.checker.check_model(quant)
+    ops = _op_counts(quant)
+    assert ops["Gemm"] == 1
+    assert ops["DequantizeLinear"] == 1
+
+    x = rng.standard_normal((3, K)).astype(np.float32)
+    _assert_close(_run(model, {"X": x}), _run(quant, {"X": x}))
+
+
+def test_quantize_scale_shape_matches_block_count():
+    # K=64 with the pass's block_size=32 gives 2 blocks; the scale
+    # initializer must be [2, N] (block axis 0, matching MatMul's own [K, N]
+    # weight layout).
+    rng = np.random.default_rng(2)
+    K, N = 64, 8
+    weight = _f32(rng.standard_normal((K, N)) * 0.5, "W")
+    model = _model(
+        f"""
+        g (float[1,{K}] X) => (float[1,{N}] Y)
+        {{
+          Y = MatMul(X, W)
+        }}
+        """,
+        initializer=[weight],
+    )
+
+    quant = onnxsim.quantize_weight_only_int4(model)
+    scale_init = next(
+        t
+        for t in quant.graph.initializer
+        if t.name != "W" and t.data_type == onnx.TensorProto.FLOAT
+    )
+    assert list(scale_init.dims) == [2, N]
+
+
+def test_quantize_skips_k_not_divisible_by_block_size():
+    # K=48 is not a multiple of the pass's block_size=32.
+    rng = np.random.default_rng(3)
+    K, N = 48, 8
+    weight = _f32(rng.standard_normal((K, N)) * 0.5, "W")
+    model = _model(
+        f"""
+        g (float[1,{K}] X) => (float[1,{N}] Y)
+        {{
+          Y = MatMul(X, W)
+        }}
+        """,
+        initializer=[weight],
+    )
+
+    quant = onnxsim.quantize_weight_only_int4(model)
+    assert _op_counts(quant)["MatMul"] == 1
+    assert _op_counts(quant)["DequantizeLinear"] == 0
+
+
+def test_quantize_conv_pointwise():
+    # A 1x1 (pointwise) Conv: inner = Cin/groups * kH * kW = Cin * 1 * 1, so
+    # Cin=32 gives exactly one block -- the simplest Conv case, structurally
+    # equivalent to a per-pixel MatMul.
+    rng = np.random.default_rng(5)
+    cout, cin = 16, 32
+    weight = _f32(rng.standard_normal((cout, cin, 1, 1)) * 0.5, "W")
+    model = _model(
+        f"""
+        g (float[1,{cin},8,8] X) => (float[1,{cout},8,8] Y)
+        {{
+          Y = Conv<kernel_shape = [1, 1]>(X, W)
+        }}
+        """,
+        initializer=[weight],
+    )
+
+    quant = onnxsim.quantize_weight_only_int4(model)
+    onnx.checker.check_model(quant)
+    ops = _op_counts(quant)
+    assert ops["Conv"] == 1
+    assert ops["DequantizeLinear"] == 1
+    assert ops["Reshape"] == 1
+
+    w_init = next(
+        t for t in quant.graph.initializer if t.data_type == onnx.TensorProto.INT4
+    )
+    assert list(w_init.dims) == [cout, cin]  # flattened [Cout, inner]
+
+    x = rng.standard_normal((1, cin, 8, 8)).astype(np.float32)
+    _assert_close(_run(model, {"X": x}), _run(quant, {"X": x}))
+
+
+def test_quantize_conv_spatial_kernel_with_bias():
+    # kernel_shape=[2, 2], Cin=8 -> inner = 8 * 2 * 2 = 32: the flattening
+    # spans both the channel and spatial dims, unlike the pointwise case.
+    rng = np.random.default_rng(6)
+    cout, cin = 4, 8
+    weight = _f32(rng.standard_normal((cout, cin, 2, 2)) * 0.5, "W")
+    bias = _f32(rng.standard_normal(cout), "B")
+    model = _model(
+        f"""
+        g (float[1,{cin},8,8] X) => (float[1,{cout},7,7] Y)
+        {{
+          Y = Conv<kernel_shape = [2, 2]>(X, W, B)
+        }}
+        """,
+        initializer=[weight, bias],
+    )
+
+    quant = onnxsim.quantize_weight_only_int4(model)
+    onnx.checker.check_model(quant)
+    ops = _op_counts(quant)
+    assert ops["Conv"] == 1
+    assert ops["DequantizeLinear"] == 1
+    assert ops["Reshape"] == 1
+
+    x = rng.standard_normal((1, cin, 8, 8)).astype(np.float32)
+    _assert_close(_run(model, {"X": x}), _run(quant, {"X": x}))
+
+
+def test_quantize_conv_skips_inner_not_divisible_by_block_size():
+    # inner = Cin * kH * kW = 4 * 3 * 3 = 36, not a multiple of 32.
+    rng = np.random.default_rng(7)
+    cout, cin = 4, 4
+    weight = _f32(rng.standard_normal((cout, cin, 3, 3)) * 0.5, "W")
+    model = _model(
+        f"""
+        g (float[1,{cin},8,8] X) => (float[1,{cout},6,6] Y)
+        {{
+          Y = Conv<kernel_shape = [3, 3]>(X, W)
+        }}
+        """,
+        initializer=[weight],
+    )
+
+    quant = onnxsim.quantize_weight_only_int4(model)
+    assert _op_counts(quant)["Conv"] == 1
+    assert _op_counts(quant)["DequantizeLinear"] == 0
+
+
+def test_quantize_skips_non_constant_weight():
+    model = _model(
+        """
+        g (float[4,64] X, float[64,4] W) => (float[4,4] Y)
+        {
+          Y = MatMul(X, W)
+        }
+        """
+    )
+    quant = onnxsim.quantize_weight_only_int4(model)
+    assert _op_counts(quant)["MatMul"] == 1
+
+
+def test_quantize_skips_old_opset():
+    # INT4 tensors and DequantizeLinear's block_size both need opset >= 21.
+    weight = _f32(np.random.default_rng(4).standard_normal((64, 4)), "W")
+    model = _model(
+        """
+        g (float[4,64] X) => (float[4,4] Y)
+        {
+          Y = MatMul(X, W)
+        }
+        """,
+        initializer=[weight],
+        opset=20,
+    )
+    quant = onnxsim.quantize_weight_only_int4(model)
+    assert _op_counts(quant)["MatMul"] == 1
+    assert _op_counts(quant)["DequantizeLinear"] == 0

@@ -14,27 +14,32 @@ import collections
 
 import numpy as np
 import onnx
+from onnx import parser
 
 import onnxsim
 
 
-def _simplify(model):
-    sim_model, check_ok = onnxsim.simplify(model, check_n=3)
+def _simplify(model, **kwargs):
+    kwargs.setdefault("check_n", 3)
+    sim_model, check_ok = onnxsim.simplify(model, **kwargs)
     assert check_ok, "simplified model failed onnxsim's equivalence check"
     return sim_model, collections.Counter(n.op_type for n in sim_model.graph.node)
 
 
-def _model(nodes, inputs, outputs, initializer, opset=13):
-    graph = onnx.helper.make_graph(nodes, "g", inputs, outputs, initializer)
+def _model(body, initializer=(), opset=13):
     # Pin a low IR version so the model loads under the older onnxruntime
     # bundled with some CI wheels; onnxsim's check_n runs the model through it.
-    return onnx.helper.make_model(
-        graph, opset_imports=[onnx.helper.make_opsetid("", opset)], ir_version=10
+    model = parser.parse_model(
+        f"""
+        <
+          ir_version: 10,
+          opset_import: ["": {opset}]
+        >
+        {body}
+        """
     )
-
-
-def _vi(name, shape):
-    return onnx.helper.make_tensor_value_info(name, onnx.TensorProto.FLOAT, shape)
+    model.graph.initializer.extend(initializer)
+    return model
 
 
 def _f32(array, name):
@@ -57,11 +62,16 @@ def test_fuse_mul_into_conv_per_channel():
     # the Conv weights, so nothing multiplies the Conv output afterwards.
     w = _f32(np.random.rand(4, 3, 3, 3), "W")
     s = _f32(np.random.rand(1, 4, 1, 1), "S")
-    nodes = [
-        onnx.helper.make_node("Conv", ["X", "W"], ["Z"], pads=[1, 1, 1, 1]),
-        onnx.helper.make_node("Mul", ["Z", "S"], ["Y"]),
-    ]
-    model = _model(nodes, [_vi("X", (1, 3, 8, 8))], [_vi("Y", (1, 4, 8, 8))], [w, s])
+    model = _model(
+        """
+        g (float[1,3,8,8] X) => (float[1,4,8,8] Y)
+        {
+          Z = Conv<pads = [1, 1, 1, 1]>(X, W)
+          Y = Mul(Z, S)
+        }
+        """,
+        initializer=[w, s],
+    )
     sim, ops = _simplify(model)
     assert ops["Conv"] == 1
     assert not _conv_out_feeds_mul(sim)
@@ -69,14 +79,88 @@ def test_fuse_mul_into_conv_per_channel():
 
 def test_fuse_mul_into_conv_scalar():
     w = _f32(np.random.rand(4, 3, 3, 3), "W")
-    s = _f32(np.array(2.0), "S")  # scalar scale
-    nodes = [
-        onnx.helper.make_node("Conv", ["X", "W"], ["Z"], pads=[1, 1, 1, 1]),
-        onnx.helper.make_node("Mul", ["Z", "S"], ["Y"]),
-    ]
-    model = _model(nodes, [_vi("X", (1, 3, 8, 8))], [_vi("Y", (1, 4, 8, 8))], [w, s])
+    model = _model(
+        """
+        g (float[1,3,8,8] X) => (float[1,4,8,8] Y)
+        <float S = {2.0}>
+        {
+          Z = Conv<pads = [1, 1, 1, 1]>(X, W)
+          Y = Mul(Z, S)
+        }
+        """,
+        initializer=[w],
+    )
     sim, _ = _simplify(model)
     assert not _conv_out_feeds_mul(sim)
+
+
+# --------------------------------------------------------------------------- #
+# fuse_preceding_mul_into_conv
+# --------------------------------------------------------------------------- #
+def _mul_feeds_conv_in(model):
+    conv_first_inputs = {n.input[0] for n in model.graph.node if n.op_type == "Conv"}
+    return any(
+        n.op_type == "Mul" and n.output[0] in conv_first_inputs
+        for n in model.graph.node
+    )
+
+
+def test_fuse_preceding_mul_into_conv_per_channel():
+    # Mul(X, per-input-channel [1, C, 1, 1] scale) -> Conv: the scale folds
+    # into the Conv weights, so nothing multiplies the Conv input beforehand.
+    w = _f32(np.random.rand(4, 3, 3, 3), "W")
+    b = _f32(np.random.rand(4), "B")
+    s = _f32(np.random.rand(1, 3, 1, 1), "S")
+    model = _model(
+        """
+        g (float[1,3,8,8] X) => (float[1,4,8,8] Y)
+        {
+          X2 = Mul(X, S)
+          Y = Conv<pads = [1, 1, 1, 1]>(X2, W, B)
+        }
+        """,
+        initializer=[w, b, s],
+    )
+    sim, ops = _simplify(model)
+    assert ops["Conv"] == 1
+    assert not _mul_feeds_conv_in(sim)
+
+
+def test_fuse_preceding_mul_into_conv_scalar():
+    w = _f32(np.random.rand(4, 3, 3, 3), "W")
+    model = _model(
+        """
+        g (float[1,3,8,8] X) => (float[1,4,8,8] Y)
+        <float S = {2.0}>
+        {
+          X2 = Mul(X, S)
+          Y = Conv<pads = [1, 1, 1, 1]>(X2, W)
+        }
+        """,
+        initializer=[w],
+    )
+    sim, _ = _simplify(model)
+    assert not _mul_feeds_conv_in(sim)
+
+
+def test_fuse_preceding_mul_into_conv_grouped_per_channel_not_fused():
+    # A per-channel scale on a grouped Conv is left alone: it would need
+    # re-slicing per group to line up with the weight layout, which this pass
+    # does not attempt. The model must still simplify correctly.
+    w = _f32(np.random.rand(4, 1, 3, 3), "W")
+    s = _f32(np.random.rand(1, 4, 1, 1), "S")
+    model = _model(
+        """
+        g (float[1,4,8,8] X) => (float[1,4,8,8] Y)
+        {
+          X2 = Mul(X, S)
+          Y = Conv<pads = [1, 1, 1, 1], group = 4>(X2, W)
+        }
+        """,
+        initializer=[w, s],
+    )
+    sim, ops = _simplify(model)
+    assert ops["Conv"] == 1
 
 
 # --------------------------------------------------------------------------- #
@@ -85,26 +169,32 @@ def test_fuse_mul_into_conv_scalar():
 def test_fuse_consecutive_mul_scalar():
     # Mul(X, C1) -> Mul(., C2) with constant C1/C2 collapses to a single Mul by
     # a fused C1*C2 constant (X is a runtime input, so it cannot be folded away).
-    c1 = _f32(np.array(2.0), "C1")
-    c2 = _f32(np.array(3.0), "C2")
-    nodes = [
-        onnx.helper.make_node("Mul", ["X", "C1"], ["Y"]),
-        onnx.helper.make_node("Mul", ["Y", "C2"], ["Z"]),
-    ]
-    model = _model(nodes, [_vi("X", (2, 3))], [_vi("Z", (2, 3))], [c1, c2])
+    model = _model(
+        """
+        g (float[2,3] X) => (float[2,3] Z)
+        <float C1 = {2.0}, float C2 = {3.0}>
+        {
+          Y = Mul(X, C1)
+          Z = Mul(Y, C2)
+        }
+        """
+    )
     sim, ops = _simplify(model)
     assert ops["Mul"] == 1
 
 
 def test_fuse_consecutive_mul_per_channel():
     # Per-channel (C, 1, 1) scale composed with a scalar factor (LayerScale).
-    c1 = _f32(np.arange(4).reshape(4, 1, 1) + 1.0, "C1")
-    c2 = _f32(np.array(0.5), "C2")
-    nodes = [
-        onnx.helper.make_node("Mul", ["X", "C1"], ["Y"]),
-        onnx.helper.make_node("Mul", ["Y", "C2"], ["Z"]),
-    ]
-    model = _model(nodes, [_vi("X", (1, 4, 2, 2))], [_vi("Z", (1, 4, 2, 2))], [c1, c2])
+    model = _model(
+        """
+        g (float[1,4,2,2] X) => (float[1,4,2,2] Z)
+        <float[4,1,1] C1 = {1.0, 2.0, 3.0, 4.0}, float C2 = {0.5}>
+        {
+          Y = Mul(X, C1)
+          Z = Mul(Y, C2)
+        }
+        """
+    )
     sim, ops = _simplify(model)
     assert ops["Mul"] == 1
 
@@ -118,14 +208,60 @@ def test_fuse_matmul_add_bias_into_gemm_batched():
     # scaffolding), so no batched MatMul remains.
     w = _f32(np.random.randn(4, 5), "W")
     b = _f32(np.random.randn(5), "B")
-    nodes = [
-        onnx.helper.make_node("MatMul", ["X", "W"], ["Z"]),
-        onnx.helper.make_node("Add", ["Z", "B"], ["A"]),
-    ]
-    model = _model(nodes, [_vi("X", (2, 3, 4))], [_vi("A", (2, 3, 5))], [w, b])
+    model = _model(
+        """
+        g (float[2,3,4] X) => (float[2,3,5] A)
+        {
+          Z = MatMul(X, W)
+          A = Add(Z, B)
+        }
+        """,
+        initializer=[w, b],
+    )
     sim, ops = _simplify(model)
     assert ops["Gemm"] >= 1
     assert "MatMul" not in ops
+
+
+def test_fuse_matmul_add_bias_into_gemm_batched_dynamic_many_matches():
+    # X has dynamic leading dims (symbolic "batch"/"seq"), so runTransform
+    # takes the Shape/Slice/Concat path (see the pass's own comment) instead
+    # of a plain Reshape-to-a-constant-shape -- that path mints up to 5 fresh
+    # initializer names per match instead of 2. Many independent linear
+    # layers over the same input force many such matches within one
+    # runPass() call, exercising FuseMatMulAddBiasIntoGemmBatched's batched
+    # name-reservation (nextReservedName/reserveUniqueNames): a bug in how it
+    # hands out/consumes reserved names would surface as a duplicate
+    # initializer name here, silently corrupting one layer's weights/bias
+    # with another's.
+    n_layers = 8
+    initializers = []
+    body = ""
+    outputs = []
+    for i in range(n_layers):
+        w = _f32(np.random.randn(4, 5), f"W{i}")
+        b = _f32(np.random.randn(5), f"B{i}")
+        initializers += [w, b]
+        body += f"Z{i} = MatMul(X, W{i})\nA{i} = Add(Z{i}, B{i})\n"
+        outputs.append(f"float[batch,seq,5] A{i}")
+    model = _model(
+        f"""
+        g (float[batch,seq,4] X) => ({", ".join(outputs)})
+        {{
+          {body}
+        }}
+        """,
+        initializer=initializers,
+        opset=13,
+    )
+    sim, ops = _simplify(model, test_input_shapes={"X": (2, 3, 4)})
+    assert ops["Gemm"] >= n_layers
+    assert "MatMul" not in ops
+
+    names = [init.name for init in sim.graph.initializer]
+    assert len(names) == len(set(names)), (
+        "duplicate initializer name: reserved-name collision"
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -140,15 +276,18 @@ def test_eliminate_reshape_around_elementwise():
     b0 = _f32(np.random.randn(6), "B0")
     w1 = _f32(np.random.randn(6, 5), "W1")
     b1 = _f32(np.random.randn(5), "B1")
-    nodes = [
-        onnx.helper.make_node("MatMul", ["X", "W0"], ["Z0"]),
-        onnx.helper.make_node("Add", ["Z0", "B0"], ["A0"]),
-        onnx.helper.make_node("Relu", ["A0"], ["R"]),
-        onnx.helper.make_node("MatMul", ["R", "W1"], ["Z1"]),
-        onnx.helper.make_node("Add", ["Z1", "B1"], ["A1"]),
-    ]
     model = _model(
-        nodes, [_vi("X", (2, 3, 4))], [_vi("A1", (2, 3, 5))], [w0, b0, w1, b1]
+        """
+        g (float[2,3,4] X) => (float[2,3,5] A1)
+        {
+          Z0 = MatMul(X, W0)
+          A0 = Add(Z0, B0)
+          R = Relu(A0)
+          Z1 = MatMul(R, W1)
+          A1 = Add(Z1, B1)
+        }
+        """,
+        initializer=[w0, b0, w1, b1],
     )
     sim, ops = _simplify(model)
     # Both linear layers dispatch as Gemms and the batched MatMuls are gone.

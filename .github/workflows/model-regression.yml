@@ -14,6 +14,28 @@ name: Model Regression
 # so it runs on a schedule and on demand rather than on every push. The work is
 # split across balanced shards to keep wall-clock down. To switch cadence,
 # change the cron below (weekly `0 6 * * 1` vs daily `0 6 * * *`).
+#
+# The `profile` workflow_dispatch input opts a run into capturing onnxsim's
+# ONNXSIM_PROFILE trace for every model (uploaded per-shard, then merged into a
+# `profile-summary` artifact by the summary job) -- on by default for a manual
+# run, since comparing profiled vs. unprofiled workflow_dispatch runs found
+# its overhead low next to onnxslim's own per-model cost; the weekly schedule
+# never sets workflow_dispatch inputs at all, so scheduled runs stay
+# unprofiled regardless of this default. Pass `profile: false` to opt out of
+# a specific manual run.
+#
+# The finer-grained sibling, onnxsim's ONNXSIM_PROFILE_PASS_PHASES
+# per-optimizer-pass match/modify timing table, is captured on every run
+# unconditionally (merged into a `profile-pass-phases` artifact) -- unlike
+# `profile` its overhead is two chrono reads per node match, no RSS sampler or
+# trace write, so it's cheap enough to always have on hand: without it,
+# finding which single pass (e.g. extract_constant_to_initializer) dominates a
+# slow model means re-running with profiling after the fact instead of just
+# reading the last scheduled run. See scripts/regression/README.md#profiling.
+# summarize_pass_phases.py aggregates those same tables into a "where to
+# optimize next" hint (top passes by summed cost, slowest models, the
+# CSETensorHash/CSETensorCompare breakdown) written straight to the Actions
+# UI's Summary tab -- see that step in the `summary` job below.
 
 on:
   schedule:
@@ -26,6 +48,10 @@ on:
         type: string
       include_slow:
         description: "Also run the known-slow models (non-blocking)"
+        default: true
+        type: boolean
+      profile:
+        description: "Capture an ONNXSIM_PROFILE trace per model (uploaded as an artifact). Adds overhead (a background RSS sampler + a trace write per model), but that overhead measures low next to onnxslim's own per-model cost -- on by default for a manual run; set false to skip it."
         default: true
         type: boolean
   pull_request:
@@ -57,14 +83,14 @@ jobs:
           fetch-depth: 0
       - uses: mozilla-actions/sccache-action@v0.0.11
       - name: Build cp312 wheel
-        uses: pypa/cibuildwheel@v4.1.1
+        uses: pypa/cibuildwheel@v4.2.0
         env:
           CIBW_BUILD: "cp312-manylinux_x86_64"
           CIBW_ARCHS: native
           CIBW_BUILD_FRONTEND: "pip; args: --no-build-isolation"
           CIBW_MANYLINUX_X86_64_IMAGE: manylinux_2_28
           CIBW_ENVIRONMENT_PASS_LINUX: CI SCCACHE_GHA_ENABLED ACTIONS_RESULTS_URL ACTIONS_RUNTIME_TOKEN ACTIONS_CACHE_SERVICE_V2
-          CIBW_BEFORE_BUILD: "python3 -m pip install --break-system-packages cmake ninja setuptools sccache"
+          CIBW_BEFORE_BUILD: "python3 -m pip install --break-system-packages cmake ninja setuptools sccache nanobind"
           CIBW_ENVIRONMENT: CMAKE_ARGS="-DONNX_USE_PROTOBUF_SHARED_LIBS=OFF" CMAKE_GENERATOR=Ninja CMAKE_CXX_COMPILER_LAUNCHER=sccache CMAKE_LINKER_TYPE=LLD
           CIBW_REPAIR_WHEEL_COMMAND_LINUX: "auditwheel repair -w {dest_dir} {wheel} --strip"
       - uses: actions/upload-artifact@v7
@@ -73,14 +99,26 @@ jobs:
           path: ./wheelhouse/*.whl
 
   # Emit the shard index list so the shard count is configurable from
-  # workflow_dispatch while defaulting to 6.
+  # workflow_dispatch while defaulting to 6, and whether models.json currently
+  # has any known_slow entries at all -- lets the known-slow job below skip
+  # itself (checkout, wheel download, deps install, all for nothing) on the
+  # common case where the list is empty rather than always paying that
+  # overhead to report "0 models, all passed".
+  # A sparse checkout of just models.json keeps this cheap; ubuntu-slim's
+  # preinstalled Python is all the rest needs.
   setup:
     name: Plan shards
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-slim
     outputs:
       shards: ${{ steps.plan.outputs.shards }}
       num_shards: ${{ steps.plan.outputs.num_shards }}
+      has_known_slow: ${{ steps.plan.outputs.has_known_slow }}
     steps:
+      - uses: actions/checkout@v7
+        with:
+          sparse-checkout: |
+            scripts/regression/models.json
+          sparse-checkout-cone-mode: false
       - id: plan
         run: |
           n="${{ github.event.inputs.num_shards || '6' }}"
@@ -88,6 +126,9 @@ jobs:
           echo "num_shards=$n" >> "$GITHUB_OUTPUT"
           echo "shards=$shards" >> "$GITHUB_OUTPUT"
           echo "planning $n shards: $shards"
+          has_slow=$(python3 -c "import json; d=json.load(open('scripts/regression/models.json')); print('true' if any(m.get('known_slow') for m in d['models']) else 'false')")
+          echo "has_known_slow=$has_slow" >> "$GITHUB_OUTPUT"
+          echo "known_slow models present: $has_slow"
 
   regression:
     name: Shard ${{ matrix.shard }}
@@ -97,6 +138,11 @@ jobs:
     env:
       NUM_SHARDS: ${{ needs.setup.outputs.num_shards }}
       HF_HUB_ENABLE_HF_TRANSFER: "0"
+      # Authenticated downloads get their own rate-limit bucket, which helps
+      # with the intermittent connection resets anonymous access to the Hub
+      # sometimes hits under load. huggingface_hub picks this up automatically.
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
+      PROFILE: ${{ github.event.inputs.profile == 'true' && '1' || '' }}
     strategy:
       fail-fast: false
       matrix:
@@ -121,25 +167,46 @@ jobs:
       - name: Run regression shard
         working-directory: ${{ runner.temp }}
         run: |
+          profile_args=()
+          if [ -n "$PROFILE" ]; then
+            profile_args+=(--profile-dir profiles)
+          fi
           python "$GITHUB_WORKSPACE/scripts/regression/run_regression.py" \
             --shard "${{ matrix.shard }}" \
             --num-shards "$NUM_SHARDS" \
             --timeout 900 \
-            --output "shard-${{ matrix.shard }}.csv"
+            --output "shard-${{ matrix.shard }}.csv" \
+            --profile-pass-phases-dir pass_phases \
+            "${profile_args[@]}"
       - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: regression-csv-shard-${{ matrix.shard }}
           path: ${{ runner.temp }}/shard-${{ matrix.shard }}.csv
           if-no-files-found: ignore
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: regression-profiles-shard-${{ matrix.shard }}
+          path: ${{ runner.temp }}/profiles
+          if-no-files-found: ignore
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: regression-pass-phases-shard-${{ matrix.shard }}
+          path: ${{ runner.temp }}/pass_phases
+          if-no-files-found: ignore
 
   known-slow:
     name: Known-slow models (non-blocking)
-    needs: [build]
-    if: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.include_slow == 'true' }}
+    needs: [build, setup]
+    if: ${{ needs.setup.outputs.has_known_slow == 'true' && (github.event_name != 'workflow_dispatch' || github.event.inputs.include_slow == 'true') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     continue-on-error: true
+    env:
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
+      PROFILE: ${{ github.event.inputs.profile == 'true' && '1' || '' }}
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
@@ -157,15 +224,33 @@ jobs:
       - name: Run known-slow models
         working-directory: ${{ runner.temp }}
         run: |
+          profile_args=()
+          if [ -n "$PROFILE" ]; then
+            profile_args+=(--profile-dir profiles)
+          fi
           python "$GITHUB_WORKSPACE/scripts/regression/run_regression.py" \
             --slow-only \
             --timeout 2400 \
-            --output "slow.csv"
+            --output "slow.csv" \
+            --profile-pass-phases-dir pass_phases \
+            "${profile_args[@]}"
       - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: regression-csv-slow
           path: ${{ runner.temp }}/slow.csv
+          if-no-files-found: ignore
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: regression-profiles-slow
+          path: ${{ runner.temp }}/profiles
+          if-no-files-found: ignore
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: regression-pass-phases-slow
+          path: ${{ runner.temp }}/pass_phases
           if-no-files-found: ignore
 
   summary:
@@ -194,6 +279,92 @@ jobs:
         id: sum
         continue-on-error: true
         run: python "$GITHUB_WORKSPACE/scripts/regression/summarize.py" "csvs/*.csv"
+      # Profile artifacts only exist when the "profile" workflow_dispatch input
+      # was set (see the regression/known-slow jobs above); a normal scheduled
+      # run has none, so this whole block is a no-op then.
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: regression-profiles-*
+          path: profiles
+          merge-multiple: true
+      - name: Build profile summary
+        if: always()
+        continue-on-error: true
+        run: |
+          if find profiles -name '*.json' -print -quit 2>/dev/null | grep -q .; then
+            python "$GITHUB_WORKSPACE/scripts/regression/summarize_profiles.py" "profiles/*.json" --csv "csvs/*.csv"
+          else
+            echo "no profile traces present (profiling was not requested for this run)"
+          fi
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: profile-summary
+          path: profile-summary.md
+          if-no-files-found: ignore
+      # Pass-phase text tables are captured unconditionally by every
+      # regression/known-slow job (see run_regression.py's
+      # --profile-pass-phases-dir default), so this block always has
+      # something to collect. No dedicated summarizer for these -- they're
+      # onnxsim's own already-formatted stderr tables, so just collect them
+      # into one file per run instead of parsing/re-rendering them.
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: regression-pass-phases-*
+          path: pass_phases
+          merge-multiple: true
+      - name: Build pass-phase profile digest
+        if: always()
+        continue-on-error: true
+        run: |
+          if find pass_phases -name '*.pass_phases.txt' -print -quit 2>/dev/null | grep -q .; then
+            {
+              echo "# ONNXSIM_PROFILE_PASS_PHASES digest"
+              echo
+              for f in pass_phases/*.pass_phases.txt; do
+                echo "## $(basename "$f" .pass_phases.txt)"
+                echo '```'
+                cat "$f"
+                echo '```'
+                echo
+              done
+            } > pass-phase-profiles.md
+            # Also to the job log itself, not just the artifact -- readable
+            # straight from the Actions UI (or the API) without a download.
+            cat pass-phase-profiles.md
+          else
+            echo "no pass-phase tables present (unexpected -- every job captures them by default; check for an upstream failure)"
+          fi
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: profile-pass-phases
+          path: pass-phase-profiles.md
+          if-no-files-found: ignore
+      # Unlike the raw digest above (every model's table, verbatim -- useful
+      # for a deep dive but not something anyone reads end to end),
+      # summarize_pass_phases.py aggregates across the whole run: which pass
+      # costs the most summed across models, which model(s) are the slowest,
+      # and the CSETensorHash/CSETensorCompare breakdown that's twice now
+      # been the actual next bottleneck once the top-ranked pass got fixed
+      # (onnxsim#717, #720). Written to $GITHUB_STEP_SUMMARY so it shows up
+      # directly in the Actions UI's Summary tab -- no log-digging or
+      # artifact download needed to see where to optimize next.
+      - name: Build pass-phase bottleneck summary
+        if: always()
+        continue-on-error: true
+        run: |
+          if find pass_phases -name '*.pass_phases.txt' -print -quit 2>/dev/null | grep -q .; then
+            python "$GITHUB_WORKSPACE/scripts/regression/summarize_pass_phases.py" "pass_phases/*.pass_phases.txt"
+          else
+            echo "no pass-phase tables present (unexpected -- every job captures them by default; check for an upstream failure)"
+          fi
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: pass-phase-bottleneck-summary
+          path: pass-phase-summary.md
+          if-no-files-found: ignore
       - uses: actions/upload-artifact@v7
         if: always()
         with:

@@ -1,4 +1,6 @@
 import os
+import subprocess
+import sys
 import tempfile
 
 import numpy as np
@@ -7,6 +9,7 @@ import onnx.defs
 import pytest
 import torch
 import torchvision as tv
+from onnx import parser
 
 import onnxsim
 from onnxsim.test_utils import export_simplify_and_check_by_python_api
@@ -293,53 +296,117 @@ def test_model_larger_than_2gb():
     assert sim_model.graph.node[0].op_type == "Add"
 
 
+def test_cli_large_model_save_fallback_mutates_in_place():
+    # Regression test for the CLI's >2GB save fallback in onnx_simplifier.main()
+    # (GitHub PR #730), reproduced exporting a real multi-gigabyte TTS model. Two
+    # distinct bugs lived in the same try/except:
+    #
+    # 1. onnx.save() raises google.protobuf.message.EncodeError (not ValueError)
+    #    once the serialized proto exceeds 2GB, so the external-data fallback
+    #    never triggered and the crash propagated straight out of main().
+    # 2. The fallback used to save a deepcopy of model_opt as external data while
+    #    leaving the original model_opt (with data still inline) around for the
+    #    subsequent model_info diff-printing step, which re-serializes model_opt
+    #    and would hit that same EncodeError on the very model just saved.
+    #
+    # Both are exercised here without needing an actual >2GB fixture: onnx.save
+    # is mocked to raise EncodeError on its first call (matching the real >2GB
+    # failure mode), and model_info.print_simplifying_info is wrapped to capture
+    # the exact model_opt object it receives so its data_location can be
+    # inspected afterward.
+    import sys
+
+    from google.protobuf.message import EncodeError
+
+    from onnxsim import model_info, onnx_simplifier
+
+    # A weight large enough (4 MiB) to actually be moved to external storage --
+    # onnx.save's external-data conversion leaves tensors below its size
+    # threshold inline regardless of save_as_external_data, which would make
+    # the data_location assertion below meaningless.
+    model = parser.parse_model(
+        """
+        <
+          ir_version: 8,
+          opset_import: ["": 17]
+        >
+        g (float[4,1024] x) => (float[4,1024] y)
+        {
+          y = MatMul(x, w)
+        }
+        """
+    )
+    model.graph.initializer.append(
+        onnx.numpy_helper.from_array(
+            np.random.rand(1024, 1024).astype(np.float32), name="w"
+        )
+    )
+    onnx.checker.check_model(model)
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        input_path = os.path.join(tmpdir, "in.onnx")
+        output_path = os.path.join(tmpdir, "out.onnx")
+        onnx.save(model, input_path)
+
+        real_save = onnx.save
+        call_count = 0
+
+        def fake_save(proto, path, *args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                # The exact failure onnx.save raises past the 2GB protobuf
+                # limit -- simulated here so the test stays fast and small.
+                raise EncodeError("Message larger than 2GiB")
+            return real_save(proto, path, *args, **kwargs)
+
+        captured = {}
+        real_print = model_info.print_simplifying_info
+
+        def capturing_print(ori, opt):
+            captured["opt"] = opt
+            return real_print(ori, opt)
+
+        argv = sys.argv
+        try:
+            onnx_simplifier.onnx.save = fake_save
+            onnx_simplifier.model_info.print_simplifying_info = capturing_print
+            sys.argv = ["onnxsim", input_path, output_path]
+            onnx_simplifier.main()  # must not raise EncodeError (bug 1)
+        finally:
+            onnx_simplifier.onnx.save = real_save
+            onnx_simplifier.model_info.print_simplifying_info = real_print
+            sys.argv = argv
+
+        assert call_count == 2  # the initial attempt, then the external-data save
+        assert os.path.exists(output_path)
+        assert os.path.exists(output_path + ".data")
+
+        # model_opt was mutated in place, not deep-copied (bug 2): the object
+        # model_info was handed after the fallback already carries external
+        # data references rather than inline bytes.
+        opt = captured["opt"]
+        assert opt.graph.initializer[0].data_location == onnx.TensorProto.EXTERNAL
+
+
 def test_unset_optional_input():
-    fmap = []
-    nodes = []
-    initializers = []
-
-    fmap.append(
-        onnx.helper.make_tensor_value_info(
-            "y", onnx.TensorProto.FLOAT, shape=(1, 3, 4, 4)
-        )
-    )
-
-    X = np.random.rand(1, 3, 2, 2).astype(np.float32)
-    initializers.append(
-        onnx.helper.make_tensor(
-            "X", onnx.TensorProto.FLOAT, X.shape, X.copy().tobytes(), raw=True
-        )
-    )
-    sizes = np.asarray([1, 3, 4, 4]).astype(np.int64)
-    initializers.append(
-        onnx.helper.make_tensor(
-            "sizes",
-            onnx.TensorProto.INT64,
-            sizes.shape,
-            sizes.copy().tobytes(),
-            raw=True,
-        )
-    )
-
-    nodes.append(
-        onnx.helper.make_node(
-            "Resize", inputs=["X", "", "", "sizes"], outputs=["y"], mode="linear"
-        )
-    )
-
-    graph_def = onnx.helper.make_graph(
-        nodes,
-        "test_unset_optional_input",
-        [],
-        [fmap[-1]],
-        value_info=fmap,
-        initializer=initializers,
-    )
-
-    opset_imports = [onnx.helper.make_opsetid("", 14)]
-
-    model = onnx.helper.make_model(
-        graph_def, opset_imports=opset_imports, ir_version=10
+    # A Resize with its unused optional "roi"/"scales" inputs left empty (""),
+    # only "sizes" provided.
+    model = parser.parse_model(
+        """
+        <
+          ir_version: 10,
+          opset_import: ["": 14]
+        >
+        test_unset_optional_input () => (float[1,3,4,4] y)
+        <
+          float[1,3,2,2] X = {0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.1, 1.2},
+          int64[4] sizes = {1, 3, 4, 4}
+        >
+        {
+          y = Resize<mode = "linear">(X, , , sizes)
+        }
+        """
     )
     sim_model, check_ok = onnxsim.simplify(model, check_n=3)
     assert check_ok
@@ -352,23 +419,21 @@ def test_unset_optional_input():
 def test_fold_deterministic_op():
     # An op that the operator schema marks as deterministic and whose inputs are
     # all constants should be constant-folded away.
-    a = np.random.rand(2, 3).astype(np.float32)
-    b = np.random.rand(2, 3).astype(np.float32)
-    initializers = [
-        onnx.helper.make_tensor(
-            "a", onnx.TensorProto.FLOAT, a.shape, a.tobytes(), raw=True
-        ),
-        onnx.helper.make_tensor(
-            "b", onnx.TensorProto.FLOAT, b.shape, b.tobytes(), raw=True
-        ),
-    ]
-    node = onnx.helper.make_node("Add", inputs=["a", "b"], outputs=["y"])
-    out = onnx.helper.make_tensor_value_info("y", onnx.TensorProto.FLOAT, (2, 3))
-    graph_def = onnx.helper.make_graph(
-        [node], "test_fold_deterministic_op", [], [out], initializer=initializers
-    )
-    model = onnx.helper.make_model(
-        graph_def, opset_imports=[onnx.helper.make_opsetid("", 14)], ir_version=10
+    model = parser.parse_model(
+        """
+        <
+          ir_version: 10,
+          opset_import: ["": 14]
+        >
+        test_fold_deterministic_op () => (float[2,3] y)
+        <
+          float[2,3] a = {0.1, 0.2, 0.3, 0.4, 0.5, 0.6},
+          float[2,3] b = {0.6, 0.5, 0.4, 0.3, 0.2, 0.1}
+        >
+        {
+          y = Add(a, b)
+        }
+        """
     )
 
     sim_model, check_ok = onnxsim.simplify(model, check_n=3)
@@ -382,17 +447,17 @@ def test_do_not_fold_random_op():
     # RandomUniform is non-deterministic according to the operator schema
     # determinism attribute, so it must not be constant-folded even though it
     # has no non-constant inputs.
-    node = onnx.helper.make_node(
-        "RandomUniform",
-        inputs=[],
-        outputs=["y"],
-        shape=[2, 3],
-        dtype=onnx.TensorProto.FLOAT,
-    )
-    out = onnx.helper.make_tensor_value_info("y", onnx.TensorProto.FLOAT, (2, 3))
-    graph_def = onnx.helper.make_graph([node], "test_do_not_fold_random_op", [], [out])
-    model = onnx.helper.make_model(
-        graph_def, opset_imports=[onnx.helper.make_opsetid("", 14)], ir_version=10
+    model = parser.parse_model(
+        """
+        <
+          ir_version: 10,
+          opset_import: ["": 14]
+        >
+        test_do_not_fold_random_op () => (float[2,3] y)
+        {
+          y = RandomUniform<shape = [2, 3], dtype = 1>()
+        }
+        """
     )
 
     sim_model, _ = onnxsim.simplify(model, check_n=0)
@@ -404,19 +469,18 @@ def test_do_not_fold_random_op():
 def test_do_not_fold_random_like_op():
     # RandomNormalLike is non-deterministic; it must not be folded even when its
     # input is a constant.
-    x = np.zeros((2, 3), dtype=np.float32)
-    initializers = [
-        onnx.helper.make_tensor(
-            "x", onnx.TensorProto.FLOAT, x.shape, x.tobytes(), raw=True
-        ),
-    ]
-    node = onnx.helper.make_node("RandomNormalLike", inputs=["x"], outputs=["y"])
-    out = onnx.helper.make_tensor_value_info("y", onnx.TensorProto.FLOAT, (2, 3))
-    graph_def = onnx.helper.make_graph(
-        [node], "test_do_not_fold_random_like_op", [], [out], initializer=initializers
-    )
-    model = onnx.helper.make_model(
-        graph_def, opset_imports=[onnx.helper.make_opsetid("", 14)], ir_version=10
+    model = parser.parse_model(
+        """
+        <
+          ir_version: 10,
+          opset_import: ["": 14]
+        >
+        test_do_not_fold_random_like_op () => (float[2,3] y)
+        <float[2,3] x = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0}>
+        {
+          y = RandomNormalLike(x)
+        }
+        """
     )
 
     sim_model, _ = onnxsim.simplify(model, check_n=0)
@@ -427,19 +491,18 @@ def test_overwrite_input_shape_ignores_non_positive():
     # A non-positive value in overwrite_input_shapes must not be written to the
     # graph as a literal (e.g. 0) dimension; the original dimension should be
     # kept instead so the simplified model stays runnable (GitHub issue #237).
-    x = onnx.helper.make_tensor_value_info(
-        "input", onnx.TensorProto.FLOAT, ["N", 3, "H", "W"]
+    model = parser.parse_model(
+        """
+        <
+          opset_import: ["": 13]
+        >
+        test_overwrite_input_shape_ignores_non_positive (float[N,3,H,W] input) => (float[N,3,H,W] output)
+        {
+          output = Relu(input)
+        }
+        """
     )
-    y = onnx.helper.make_tensor_value_info(
-        "output", onnx.TensorProto.FLOAT, ["N", 3, "H", "W"]
-    )
-    node = onnx.helper.make_node("Relu", ["input"], ["output"])
-    graph_def = onnx.helper.make_graph(
-        [node], "test_overwrite_input_shape_ignores_non_positive", [x], [y]
-    )
-    model = onnx.helper.make_model(
-        graph_def, opset_imports=[onnx.helper.make_opsetid("", 13)]
-    )
+    model.ir_version = onnx.IR_VERSION
 
     sim_model, _ = onnxsim.simplify(
         model, overwrite_input_shapes={"input": [1, 3, 0, 0]}
@@ -454,18 +517,24 @@ def test_overwrite_input_shape_ignores_non_positive():
 
 def test_preserve_doc_strings():
     # onnxsim must not drop the doc_string fields of the model / graph / inputs
-    # / outputs while simplifying (GitHub issue #428).
-    x = onnx.helper.make_tensor_value_info("X", onnx.TensorProto.FLOAT, [1, 4])
-    x.doc_string = "input documentation"
-    y = onnx.helper.make_tensor_value_info("Y", onnx.TensorProto.FLOAT, [1, 4])
-    y.doc_string = "output documentation"
-    node = onnx.helper.make_node("Relu", ["X"], ["Y"])
-    graph_def = onnx.helper.make_graph([node], "test_preserve_doc_strings", [x], [y])
-    graph_def.doc_string = "graph documentation"
-    model = onnx.helper.make_model(
-        graph_def, opset_imports=[onnx.helper.make_opsetid("", 13)]
+    # / outputs while simplifying (GitHub issue #428). doc_string isn't part of
+    # the ONNX text grammar, so it's set programmatically after parsing.
+    model = parser.parse_model(
+        """
+        <
+          opset_import: ["": 13]
+        >
+        test_preserve_doc_strings (float[1,4] X) => (float[1,4] Y)
+        {
+          Y = Relu(X)
+        }
+        """
     )
+    model.ir_version = onnx.IR_VERSION
     model.doc_string = "model documentation"
+    model.graph.doc_string = "graph documentation"
+    model.graph.input[0].doc_string = "input documentation"
+    model.graph.output[0].doc_string = "output documentation"
 
     sim_model, check_ok = onnxsim.simplify(model)
     assert check_ok
@@ -473,30 +542,6 @@ def test_preserve_doc_strings():
     assert sim_model.graph.doc_string == "graph documentation"
     assert sim_model.graph.input[0].doc_string == "input documentation"
     assert sim_model.graph.output[0].doc_string == "output documentation"
-
-
-def _make_scalar_initializer(name: str, value, dtype) -> onnx.TensorProto:
-    return onnx.numpy_helper.from_array(np.array(value, dtype=dtype), name)
-
-
-def _quant_params():
-    return [
-        _make_scalar_initializer("s", 0.01, np.float32),
-        _make_scalar_initializer("zp", 128, np.uint8),
-    ]
-
-
-def _build_contrib_model(nodes, inputs, outputs, initializer):
-    graph = onnx.helper.make_graph(nodes, "g", inputs, outputs, initializer=initializer)
-    model = onnx.helper.make_model(
-        graph,
-        opset_imports=[
-            onnx.helper.make_opsetid("", 13),
-            onnx.helper.make_opsetid("com.microsoft", 1),
-        ],
-    )
-    model.ir_version = 9
-    return model
 
 
 def _value_info_shape(model: onnx.ModelProto, name: str):
@@ -513,51 +558,40 @@ def test_qlinear_add_shape_inference():
     # QLinearAdd is an ONNX Runtime "com.microsoft" contrib op. Without a schema
     # registered for it, ONNX shape inference stops and the intermediate tensor
     # never gets a shape (GitHub issue #245).
-    nodes = [
-        onnx.helper.make_node(
-            "QLinearAdd",
-            ["A", "s", "zp", "B", "s", "zp", "s", "zp"],
-            ["C"],
-            domain="com.microsoft",
-        ),
-        onnx.helper.make_node("DequantizeLinear", ["C", "s", "zp"], ["out"]),
-    ]
-    inputs = [
-        onnx.helper.make_tensor_value_info("A", onnx.TensorProto.UINT8, [1, 3, 16, 16]),
-        onnx.helper.make_tensor_value_info("B", onnx.TensorProto.UINT8, [1, 3, 16, 16]),
-    ]
-    outputs = [
-        onnx.helper.make_tensor_value_info(
-            "out", onnx.TensorProto.FLOAT, [1, 3, 16, 16]
-        )
-    ]
-    model = _build_contrib_model(nodes, inputs, outputs, _quant_params())
+    model = parser.parse_model(
+        """
+        <
+          ir_version: 9,
+          opset_import: ["": 13, "com.microsoft": 1]
+        >
+        g (uint8[1,3,16,16] A, uint8[1,3,16,16] B) => (float[1,3,16,16] out)
+        <float s = {0.01}, uint8 zp = {128}>
+        {
+          C = com.microsoft.QLinearAdd(A, s, zp, B, s, zp, s, zp)
+          out = DequantizeLinear(C, s, zp)
+        }
+        """
+    )
     sim_model, check_ok = onnxsim.simplify(model)
     assert check_ok
     assert _value_info_shape(sim_model, "C") == [1, 3, 16, 16]
 
 
 def test_qlinear_concat_shape_inference():
-    nodes = [
-        onnx.helper.make_node(
-            "QLinearConcat",
-            ["s", "zp", "A", "s", "zp", "B", "s", "zp"],
-            ["C"],
-            domain="com.microsoft",
-            axis=1,
-        ),
-        onnx.helper.make_node("DequantizeLinear", ["C", "s", "zp"], ["out"]),
-    ]
-    inputs = [
-        onnx.helper.make_tensor_value_info("A", onnx.TensorProto.UINT8, [1, 3, 16, 16]),
-        onnx.helper.make_tensor_value_info("B", onnx.TensorProto.UINT8, [1, 5, 16, 16]),
-    ]
-    outputs = [
-        onnx.helper.make_tensor_value_info(
-            "out", onnx.TensorProto.FLOAT, [1, 8, 16, 16]
-        )
-    ]
-    model = _build_contrib_model(nodes, inputs, outputs, _quant_params())
+    model = parser.parse_model(
+        """
+        <
+          ir_version: 9,
+          opset_import: ["": 13, "com.microsoft": 1]
+        >
+        g (uint8[1,3,16,16] A, uint8[1,5,16,16] B) => (float[1,8,16,16] out)
+        <float s = {0.01}, uint8 zp = {128}>
+        {
+          C = com.microsoft.QLinearConcat<axis = 1>(s, zp, A, s, zp, B, s, zp)
+          out = DequantizeLinear(C, s, zp)
+        }
+        """
+    )
     sim_model, check_ok = onnxsim.simplify(model)
     assert check_ok
     assert _value_info_shape(sim_model, "C") == [1, 8, 16, 16]
@@ -566,29 +600,21 @@ def test_qlinear_concat_shape_inference():
 def test_unknown_contrib_op_is_tolerated():
     # Registering schemas for the supported quantized ops must not make the
     # checker reject other, unregistered "com.microsoft" contrib operators.
-    nodes = [
-        onnx.helper.make_node(
-            "QLinearAdd",
-            ["A", "s", "zp", "B", "s", "zp", "s", "zp"],
-            ["C"],
-            domain="com.microsoft",
-        ),
-        onnx.helper.make_node(
-            "SomeUnknownContribOp", ["C"], ["D"], domain="com.microsoft"
-        ),
-        onnx.helper.make_node("DequantizeLinear", ["C", "s", "zp"], ["out"]),
-    ]
-    inputs = [
-        onnx.helper.make_tensor_value_info("A", onnx.TensorProto.UINT8, [1, 3, 16, 16]),
-        onnx.helper.make_tensor_value_info("B", onnx.TensorProto.UINT8, [1, 3, 16, 16]),
-    ]
-    outputs = [
-        onnx.helper.make_tensor_value_info(
-            "out", onnx.TensorProto.FLOAT, [1, 3, 16, 16]
-        ),
-        onnx.helper.make_tensor_value_info("D", onnx.TensorProto.UINT8, [1, 3, 16, 16]),
-    ]
-    model = _build_contrib_model(nodes, inputs, outputs, _quant_params())
+    model = parser.parse_model(
+        """
+        <
+          ir_version: 9,
+          opset_import: ["": 13, "com.microsoft": 1]
+        >
+        g (uint8[1,3,16,16] A, uint8[1,3,16,16] B) => (float[1,3,16,16] out, uint8[1,3,16,16] D)
+        <float s = {0.01}, uint8 zp = {128}>
+        {
+          C = com.microsoft.QLinearAdd(A, s, zp, B, s, zp, s, zp)
+          D = com.microsoft.SomeUnknownContribOp(C)
+          out = DequantizeLinear(C, s, zp)
+        }
+        """
+    )
     sim_model, check_ok = onnxsim.simplify(model, skip_constant_folding=True)
     assert check_ok
     assert _value_info_shape(sim_model, "C") == [1, 3, 16, 16]
@@ -604,18 +630,17 @@ def test_run_coerces_non_ndarray_output():
     # serialization keeps working.
     from onnxsim import onnx_simplifier
 
-    node = onnx.helper.make_node(
-        "SequenceEmpty", [], ["seq"], dtype=onnx.TensorProto.FLOAT
-    )
-    seq_out = onnx.helper.make_value_info(
-        "seq",
-        onnx.helper.make_sequence_type_proto(
-            onnx.helper.make_tensor_type_proto(onnx.TensorProto.FLOAT, None)
-        ),
-    )
-    graph = onnx.helper.make_graph([node], "g", [], [seq_out])
-    model = onnx.helper.make_model(
-        graph, opset_imports=[onnx.helper.make_opsetid("", 13)], ir_version=10
+    model = parser.parse_model(
+        """
+        <
+          ir_version: 10,
+          opset_import: ["": 13]
+        >
+        g () => (seq(float) seq)
+        {
+          seq = SequenceEmpty<dtype = 1>()
+        }
+        """
     )
 
     # Drive the executor with the real backend: SequenceEmpty yields an empty
@@ -634,49 +659,28 @@ def _make_batched_nms_trt_model():
     # A model whose only compute node is the TensorRT plugin ``BatchedNMS_TRT``
     # exported into the *default* ONNX domain, exactly as reported in GitHub
     # issue #107 ("No Op registered for BatchedNMS_TRT with domain_version of 9").
-    boxes = onnx.helper.make_tensor_value_info(
-        "boxes", onnx.TensorProto.FLOAT, [1, 100, 1, 4]
+    model = parser.parse_model(
+        """
+        <
+          ir_version: 6,
+          opset_import: ["": 9]
+        >
+        batched_nms_trt (float[1,100,1,4] boxes, float[1,100,5] scores) => (int32[1,1] num_detections, float[1,20,4] nmsed_boxes, float[1,20] nmsed_scores, float[1,20] nmsed_classes)
+        {
+          num_detections, nmsed_boxes, nmsed_scores, nmsed_classes = BatchedNMS_TRT<
+            shareLocation = 1,
+            backgroundLabelId = -1,
+            numClasses = 5,
+            topK = 100,
+            keepTopK = 20,
+            scoreThreshold = 0.3,
+            iouThreshold = 0.5,
+            isNormalized = 1,
+            clipBoxes = 1
+          >(boxes, scores)
+        }
+        """
     )
-    scores = onnx.helper.make_tensor_value_info(
-        "scores", onnx.TensorProto.FLOAT, [1, 100, 5]
-    )
-    num_detections = onnx.helper.make_tensor_value_info(
-        "num_detections", onnx.TensorProto.INT32, [1, 1]
-    )
-    nmsed_boxes = onnx.helper.make_tensor_value_info(
-        "nmsed_boxes", onnx.TensorProto.FLOAT, [1, 20, 4]
-    )
-    nmsed_scores = onnx.helper.make_tensor_value_info(
-        "nmsed_scores", onnx.TensorProto.FLOAT, [1, 20]
-    )
-    nmsed_classes = onnx.helper.make_tensor_value_info(
-        "nmsed_classes", onnx.TensorProto.FLOAT, [1, 20]
-    )
-    node = onnx.helper.make_node(
-        "BatchedNMS_TRT",
-        ["boxes", "scores"],
-        ["num_detections", "nmsed_boxes", "nmsed_scores", "nmsed_classes"],
-        # plugin-specific attributes of assorted types
-        shareLocation=1,
-        backgroundLabelId=-1,
-        numClasses=5,
-        topK=100,
-        keepTopK=20,
-        scoreThreshold=0.3,
-        iouThreshold=0.5,
-        isNormalized=1,
-        clipBoxes=1,
-    )
-    graph = onnx.helper.make_graph(
-        [node],
-        "batched_nms_trt",
-        [boxes, scores],
-        [num_detections, nmsed_boxes, nmsed_scores, nmsed_classes],
-    )
-    model = onnx.helper.make_model(
-        graph, opset_imports=[onnx.helper.make_opsetid("", 9)]
-    )
-    model.ir_version = 6
     return model
 
 
@@ -704,31 +708,19 @@ def test_custom_trt_op_does_not_block_surrounding_simplification():
     # The presence of a default-domain custom op must not prevent onnxsim from
     # simplifying the rest of the graph. Here a redundant Identity feeding the
     # plugin should be eliminated while the custom op survives (issues #107/#220).
-    boxes = onnx.helper.make_tensor_value_info(
-        "boxes", onnx.TensorProto.FLOAT, [1, 100, 1, 4]
+    model = parser.parse_model(
+        """
+        <
+          ir_version: 6,
+          opset_import: ["": 11]
+        >
+        g (float[1,100,1,4] boxes, float[1,100,5] scores) => (int32[1,1] num_detections)
+        {
+          boxes_id = Identity(boxes)
+          num_detections = BatchedNMS_TRT<numClasses = 5, topK = 100, keepTopK = 20>(boxes_id, scores)
+        }
+        """
     )
-    scores = onnx.helper.make_tensor_value_info(
-        "scores", onnx.TensorProto.FLOAT, [1, 100, 5]
-    )
-    out = onnx.helper.make_tensor_value_info(
-        "num_detections", onnx.TensorProto.INT32, [1, 1]
-    )
-    nodes = [
-        onnx.helper.make_node("Identity", ["boxes"], ["boxes_id"]),
-        onnx.helper.make_node(
-            "BatchedNMS_TRT",
-            ["boxes_id", "scores"],
-            ["num_detections"],
-            numClasses=5,
-            topK=100,
-            keepTopK=20,
-        ),
-    ]
-    graph = onnx.helper.make_graph(nodes, "g", [boxes, scores], [out])
-    model = onnx.helper.make_model(
-        graph, opset_imports=[onnx.helper.make_opsetid("", 11)]
-    )
-    model.ir_version = 6
 
     sim_model, check_ok = onnxsim.simplify(model)
     assert check_ok
@@ -795,21 +787,19 @@ def test_custom_op_with_registered_schema_is_simplified():
     domain = "onnxsim.custom.ops"
     _register_custom_onnx_schema(op_type, domain)
 
-    x = onnx.helper.make_tensor_value_info("X", onnx.TensorProto.FLOAT, [1, 3, 8, 8])
-    y = onnx.helper.make_tensor_value_info("Y", onnx.TensorProto.FLOAT, [1, 3, 8, 8])
-    nodes = [
-        onnx.helper.make_node("Identity", ["X"], ["X_id"]),
-        onnx.helper.make_node(op_type, ["X_id"], ["Y"], domain=domain, alpha=0.1),
-    ]
-    graph = onnx.helper.make_graph(nodes, "custom_op_graph", [x], [y])
-    model = onnx.helper.make_model(
-        graph,
-        opset_imports=[
-            onnx.helper.make_opsetid("", 13),
-            onnx.helper.make_opsetid(domain, 1),
-        ],
+    model = parser.parse_model(
+        f"""
+        <
+          ir_version: 9,
+          opset_import: ["": 13, "{domain}": 1]
+        >
+        custom_op_graph (float[1,3,8,8] X) => (float[1,3,8,8] Y)
+        {{
+          X_id = Identity(X)
+          Y = {domain}.{op_type}<alpha = 0.1>(X_id)
+        }}
+        """
     )
-    model.ir_version = 9
 
     sim_model, check_ok = onnxsim.simplify(model)
     assert check_ok
@@ -834,13 +824,18 @@ def test_import_custom_schemas_can_be_disabled():
     assert not C._has_schema(op_type, domain)
 
     # A trivial model that does not even use the custom op.
-    x = onnx.helper.make_tensor_value_info("X", onnx.TensorProto.FLOAT, [1, 4])
-    y = onnx.helper.make_tensor_value_info("Y", onnx.TensorProto.FLOAT, [1, 4])
-    node = onnx.helper.make_node("Relu", ["X"], ["Y"])
-    graph = onnx.helper.make_graph([node], "g", [x], [y])
-    model = onnx.helper.make_model(
-        graph, opset_imports=[onnx.helper.make_opsetid("", 13)]
+    model = parser.parse_model(
+        """
+        <
+          opset_import: ["": 13]
+        >
+        g (float[1,4] X) => (float[1,4] Y)
+        {
+          Y = Relu(X)
+        }
+        """
     )
+    model.ir_version = onnx.IR_VERSION
 
     # With the import disabled, onnxsim's registry stays untouched.
     onnxsim.simplify(model, import_custom_schemas=False)
@@ -891,21 +886,19 @@ def test_custom_op_shape_inference_via_python_trampoline():
         # The custom op feeds an ``Add`` (which survives simplification), so the
         # intermediate ``t`` keeps a value_info entry whose shape is produced only
         # by the custom operator's inference function.
-        x = onnx.helper.make_tensor_value_info("X", onnx.TensorProto.FLOAT, [2, 3])
-        y = onnx.helper.make_tensor_value_info("Y", onnx.TensorProto.FLOAT, [2, 3, 99])
-        nodes = [
-            onnx.helper.make_node(op_type, ["X"], ["t"], domain=domain, pad=99),
-            onnx.helper.make_node("Add", ["t", "t"], ["Y"]),
-        ]
-        graph = onnx.helper.make_graph(nodes, "shape_infer_graph", [x], [y])
-        model = onnx.helper.make_model(
-            graph,
-            opset_imports=[
-                onnx.helper.make_opsetid("", 13),
-                onnx.helper.make_opsetid(domain, 1),
-            ],
+        model = parser.parse_model(
+            f"""
+            <
+              ir_version: 9,
+              opset_import: ["": 13, "{domain}": 1]
+            >
+            shape_infer_graph (float[2,3] X) => (float[2,3,99] Y)
+            {{
+              t = {domain}.{op_type}<pad = 99>(X)
+              Y = Add(t, t)
+            }}
+            """
         )
-        model.ir_version = 9
 
         sim_model, check_ok = onnxsim.simplify(model)
         assert check_ok
@@ -921,18 +914,21 @@ def test_nameless_nodes_get_names():
     # model (and nodes left nameless by onnx-optimizer passes) must be assigned
     # unique names during simplification, otherwise downstream tools that key on
     # node names break.
-    x = onnx.helper.make_tensor_value_info("X", onnx.TensorProto.FLOAT, [1, 4])
-    y = onnx.helper.make_tensor_value_info("Y", onnx.TensorProto.FLOAT, [1, 4])
-    # Both nodes are created without a name (the `name` argument is omitted) and
+    # Nodes written in the ONNX text form (the `name` argument is omitted) and
     # operate on the non-constant graph input, so they survive simplification.
-    nodes = [
-        onnx.helper.make_node("Abs", ["X"], ["t"]),
-        onnx.helper.make_node("Relu", ["t"], ["Y"]),
-    ]
-    graph_def = onnx.helper.make_graph(nodes, "test_nameless_nodes", [x], [y])
-    model = onnx.helper.make_model(
-        graph_def, opset_imports=[onnx.helper.make_opsetid("", 13)]
+    model = parser.parse_model(
+        """
+        <
+          opset_import: ["": 13]
+        >
+        test_nameless_nodes (float[1,4] X) => (float[1,4] Y)
+        {
+          t = Abs(X)
+          Y = Relu(t)
+        }
+        """
     )
+    model.ir_version = onnx.IR_VERSION
     # Sanity check: the input model really has nameless nodes.
     assert all(node.name == "" for node in model.graph.node)
 
@@ -956,21 +952,20 @@ def test_simplify_path_with_external_data():
     # the constant fold below can happen and the values are preserved.
     a = np.random.rand(64, 64).astype(np.float32)
     b = np.random.rand(64, 64).astype(np.float32)
-    initializers = [
-        onnx.numpy_helper.from_array(a, "a"),
-        onnx.numpy_helper.from_array(b, "b"),
-    ]
-    node = onnx.helper.make_node("Add", ["a", "b"], ["y"])
-    out = onnx.helper.make_tensor_value_info("y", onnx.TensorProto.FLOAT, (64, 64))
-    graph_def = onnx.helper.make_graph(
-        [node],
-        "test_simplify_path_with_external_data",
-        [],
-        [out],
-        initializer=initializers,
+    model = parser.parse_model(
+        """
+        <
+          ir_version: 10,
+          opset_import: ["": 14]
+        >
+        test_simplify_path_with_external_data () => (float[64,64] y)
+        {
+          y = Add(a, b)
+        }
+        """
     )
-    model = onnx.helper.make_model(
-        graph_def, opset_imports=[onnx.helper.make_opsetid("", 14)], ir_version=10
+    model.graph.initializer.extend(
+        [onnx.numpy_helper.from_array(a, "a"), onnx.numpy_helper.from_array(b, "b")]
     )
 
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -996,6 +991,251 @@ def test_simplify_path_with_external_data():
     np.testing.assert_allclose(folded, a + b, rtol=1e-5, atol=1e-6)
 
 
+@skip_in_ci()
+@pytest.mark.skipif(sys.platform == "win32", reason="resource.getrusage is POSIX-only")
+def test_simplify_path_peak_memory_stays_near_model_size():
+    # Regression test for the root cause documented in
+    # bench/RESULTS_synthetic_decoder_oom.md / bench/TODO_large_decoder_submodule_oom.md:
+    # Simplify() used to unconditionally deep-copy its whole input model into a
+    # mutable working copy (`sim_model = model` in onnxsim.cpp), so peak RSS for a
+    # large external-data model was ~1.9-2x its own size. SimplifyConsumeInput
+    # (wired into SimplifyPath, which onnxsim.simplify(path, check_n=0)'s fast path
+    # calls) moves tensor data into the working copy instead of copying it,
+    # bringing peak RSS down to approximately 1x model size.
+    #
+    # This only shows up **above the 2GB protobuf limit**: below it, SimplifyPath's
+    # own C++ side still has to inline-serialize the *output* model into one
+    # contiguous buffer (onnxsim.cpp's `needs_external_data` only trips past
+    # kProtobufSizeLimit), and that serialize buffer's own size dominates enough to
+    # mask the fix at smaller scales -- measured empirically while writing this
+    # test: at 196 MiB-1.5 GiB, the pre-fix vs post-fix delta was a near-constant
+    # ~28 MiB regardless of model size (not a ratio), whereas at ~2.2+ GiB (crossing
+    # the threshold) it was a clean ~2.06x (pre-fix) vs ~1.07x (post-fix) at every
+    # size tried. So this reuses bench/decoder_oom_repro.py's own generator sized to
+    # land just above that threshold (11 layers, ~2.3 GiB) rather than
+    # reimplementing the same decoder-block shape here at a size that was never
+    # actually measured against pre-fix behavior.
+    #
+    # This is why it's gated behind @skip_in_ci() like this file's other
+    # multi-hundred-MB+ tests (e.g. test_model_larger_than_2gb): building and
+    # simplifying a ~2.3 GiB model takes real time and memory. Run locally with
+    # CI unset (skip_in_ci only skips when CI is a truthy env var).
+    bench_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "bench")
+    sys.path.insert(0, bench_dir)
+    try:
+        import decoder_oom_repro
+    finally:
+        sys.path.remove(bench_dir)
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        model_path, total_bytes = decoder_oom_repro.gen(
+            tmpdir,
+            layers=11,
+            hidden=decoder_oom_repro.DEFAULT_HIDDEN,
+            ffn=decoder_oom_repro.DEFAULT_FFN,
+            seq_len=8,
+            layout="single",
+            seed=0,
+        )
+        total_mib = total_bytes / 1024 / 1024
+
+        # Measured in a fresh child process: resource.getrusage(RUSAGE_SELF)'s
+        # ru_maxrss is a process-lifetime high-water mark, so it must be read from
+        # a process that only ever does this one simplify() call.
+        child_script = os.path.join(tmpdir, "child.py")
+        with open(child_script, "w") as f:
+            f.write(
+                "import resource, sys\n"
+                "import onnx, onnxsim\n"
+                "model_opt, ok = onnxsim.simplify(sys.argv[1], check_n=0)\n"
+                "assert ok\n"
+                "print(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)\n"
+            )
+        proc = subprocess.run(
+            [sys.executable, child_script, model_path],
+            capture_output=True,
+            text=True,
+        )
+        assert proc.returncode == 0, (
+            f"child process failed: stdout={proc.stdout!r} stderr={proc.stderr!r}"
+        )
+        peak_kib = int(proc.stdout.strip().splitlines()[-1])
+
+    peak_mib = peak_kib / 1024
+    # Empirically: ~1.07x post-fix, ~2.06x pre-fix at this size (see comment
+    # above). 1.5x sits cleanly between the two.
+    assert peak_mib < total_mib * 1.5, (
+        f"peak RSS ({peak_mib:.0f} MiB) for a {total_mib:.0f} MiB external-data "
+        "model is too high -- this is the double-materialization regression "
+        "SimplifyConsumeInput fixed (see bench/RESULTS_synthetic_decoder_oom.md)"
+    )
+
+
+def _make_add_model():
+    a = np.random.rand(64, 64).astype(np.float32)
+    b = np.random.rand(64, 64).astype(np.float32)
+    model = parser.parse_model(
+        """
+        <
+          ir_version: 10,
+          opset_import: ["": 14]
+        >
+        g () => (float[64,64] y)
+        {
+          y = Add(a, b)
+        }
+        """
+    )
+    model.graph.initializer.extend(
+        [onnx.numpy_helper.from_array(a, "a"), onnx.numpy_helper.from_array(b, "b")]
+    )
+    return model, a, b
+
+
+def test_output_path_fast_path_saves_directly_and_skips_reload():
+    # Regression test for a real, if secondary, inefficiency documented in
+    # bench/RESULTS_synthetic_decoder_oom.md: on the check_n=0 fast path,
+    # simplify() used to always call onnx.load(fast_out_path) (full data inline)
+    # purely to satisfy its return contract, even when the caller's very next
+    # step is to save the result again (as onnxsim's own CLI does).
+    # ``output_path`` lets the C++ core write the final result directly, so the
+    # returned model can stay structure-only. (That doc's real headline fix --
+    # the dominant peak-memory cost, inside the C++ core's own working copy --
+    # is separate, in onnxsim.cpp's SimplifyConsumeInput; this reload is real
+    # but turned out not to be what was driving the original OOM report.)
+    #
+    # The C++ core only actually externalizes a saved model's data past the 2GB
+    # protobuf limit (onnxsim.cpp's SimplifyPath: ``needs_external_data =
+    # model.ByteSizeLong() >= kProtobufSizeLimit``), so a small test model's
+    # output is always inline regardless of output_path -- there is no
+    # multi-GB fixture to assert "raw_data is empty" against here. What *is*
+    # testable at this scale is the mechanism itself: with output_path set,
+    # simplify() must read the result back with ``load_external_data=False``
+    # instead of the eager default, which is exactly the reload this test
+    # guards against reintroducing.
+    from onnxsim import onnx_simplifier
+
+    model, a, b = _make_add_model()
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        model_path = os.path.join(tmpdir, "model.onnx")
+        output_path = os.path.join(tmpdir, "out.onnx")
+        onnx.save(model, model_path)
+
+        real_load = onnx.load
+        load_calls = []
+
+        def spying_load(path, *args, **kwargs):
+            load_calls.append((path, args, kwargs))
+            return real_load(path, *args, **kwargs)
+
+        try:
+            onnx_simplifier.onnx.load = spying_load
+            sim_model, check_ok = onnxsim.simplify(
+                model_path, check_n=0, output_path=output_path
+            )
+        finally:
+            onnx_simplifier.onnx.load = real_load
+
+        assert check_ok
+        # The result was saved directly to output_path by simplify() itself.
+        assert os.path.exists(output_path)
+        saved = onnx.load(output_path)
+        assert len(saved.graph.node) == 0
+        assert len(saved.graph.initializer) == 1
+        folded = onnx.numpy_helper.to_array(saved.graph.initializer[0])
+        np.testing.assert_allclose(folded, a + b, rtol=1e-5, atol=1e-6)
+
+    # Exactly one load, of output_path itself (never a throwaway temp file),
+    # with load_external_data explicitly disabled -- the actual fix.
+    assert len(load_calls) == 1
+    (loaded_path, load_args, load_kwargs) = load_calls[0]
+    assert loaded_path == output_path
+    assert load_kwargs.get("load_external_data") is False
+
+
+def test_output_path_requires_str_model():
+    model, _, _ = _make_add_model()
+    with tempfile.TemporaryDirectory() as tmpdir:
+        output_path = os.path.join(tmpdir, "out.onnx")
+        with pytest.raises(ValueError, match="output_path"):
+            onnxsim.simplify(model, output_path=output_path)
+
+
+def test_output_path_off_fast_path_still_saves_full_model():
+    # check_n > 0 takes the slow path (it needs the full model in memory
+    # regardless, to run the correctness check), so output_path can't skip the
+    # reload there -- but the file must still end up saved, and the returned
+    # model must carry real data (unlike the fast-path case above), since a
+    # caller who asked for check_n > 0 is presumably going to use it.
+    model, a, b = _make_add_model()
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        model_path = os.path.join(tmpdir, "model.onnx")
+        output_path = os.path.join(tmpdir, "out.onnx")
+        onnx.save(model, model_path)
+
+        sim_model, check_ok = onnxsim.simplify(
+            model_path, check_n=1, output_path=output_path
+        )
+
+        assert check_ok
+        assert os.path.exists(output_path)
+        saved = onnx.load(output_path)
+        folded = onnx.numpy_helper.to_array(saved.graph.initializer[0])
+        np.testing.assert_allclose(folded, a + b, rtol=1e-5, atol=1e-6)
+
+    # Unlike the fast-path case, the returned model actually has data: check_n > 0
+    # already required materializing it, so there is nothing left to save by
+    # deferring the load.
+    assert len(sim_model.graph.initializer[0].raw_data) > 0
+    folded_returned = onnx.numpy_helper.to_array(sim_model.graph.initializer[0])
+    np.testing.assert_allclose(folded_returned, a + b, rtol=1e-5, atol=1e-6)
+
+
+def test_output_path_falls_back_to_external_data_past_2gb():
+    # Same >2GB save fallback the CLI relies on (see
+    # test_cli_large_model_save_fallback_mutates_in_place), exercised here for
+    # output_path's own fallback save at the end of simplify() -- reached when
+    # output_path is set but the fast path doesn't apply (check_n > 0 here).
+    from google.protobuf.message import EncodeError
+
+    from onnxsim import onnx_simplifier
+
+    model, a, b = _make_add_model()
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        model_path = os.path.join(tmpdir, "model.onnx")
+        output_path = os.path.join(tmpdir, "out.onnx")
+        onnx.save(model, model_path)
+
+        real_save = onnx.save
+        call_count = 0
+
+        def fake_save(proto, path, *args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                raise EncodeError("Message larger than 2GiB")
+            return real_save(proto, path, *args, **kwargs)
+
+        try:
+            onnx_simplifier.onnx.save = fake_save
+            sim_model, check_ok = onnxsim.simplify(
+                model_path, check_n=1, output_path=output_path
+            )
+        finally:
+            onnx_simplifier.onnx.save = real_save
+
+        assert check_ok
+        assert call_count == 2  # the initial (faked-failing) attempt, then the fallback
+        assert os.path.exists(output_path)
+        assert os.path.exists(output_path + ".data")
+        saved = onnx.load(output_path)
+        folded = onnx.numpy_helper.to_array(saved.graph.initializer[0])
+        np.testing.assert_allclose(folded, a + b, rtol=1e-5, atol=1e-6)
+
+
 def test_model_info_size_counts_external_data_without_loading():
     # ModelInfo must report a model's size from external-data metadata, so a
     # model whose weights live on disk can be measured without loading them --
@@ -1003,15 +1243,19 @@ def test_model_info_size_counts_external_data_without_loading():
     from onnxsim import model_info
 
     w = np.random.rand(256, 256).astype(np.float32)  # 256 KiB of weights
-    initializer = onnx.numpy_helper.from_array(w, "w")
-    node = onnx.helper.make_node("Identity", ["w"], ["y"])
-    out = onnx.helper.make_tensor_value_info("y", onnx.TensorProto.FLOAT, (256, 256))
-    graph_def = onnx.helper.make_graph(
-        [node], "g", [], [out], initializer=[initializer]
+    model = parser.parse_model(
+        """
+        <
+          ir_version: 10,
+          opset_import: ["": 14]
+        >
+        g () => (float[256,256] y)
+        {
+          y = Identity(w)
+        }
+        """
     )
-    model = onnx.helper.make_model(
-        graph_def, opset_imports=[onnx.helper.make_opsetid("", 14)], ir_version=10
-    )
+    model.graph.initializer.append(onnx.numpy_helper.from_array(w, "w"))
 
     full_size = model_info.ModelInfo(model).model_size
     # The weights dominate the reported size.
@@ -1090,50 +1334,42 @@ def _make_lstm_model_with_dynamic_zero_state(
     batch size off the input at runtime. ``X`` here is the ONNX LSTM layout
     [seq_length, batch_size, input_size] with a dynamic batch.
     """
-    x = onnx.helper.make_tensor_value_info(
-        "X", onnx.TensorProto.FLOAT, ["seq", "batch", input_size]
-    )
-    y = onnx.helper.make_tensor_value_info(
-        "Y", onnx.TensorProto.FLOAT, ["seq", 1, "batch", hidden_size]
-    )
-
     w = np.random.rand(1, 4 * hidden_size, input_size).astype(np.float32)
     r = np.random.rand(1, 4 * hidden_size, hidden_size).astype(np.float32)
     # The tiled state seed: [1, 2, hidden_size], holding initial_h and
     # initial_c stacked along axis 1.
     state = np.full((1, 2, hidden_size), initial_state_value, dtype=np.float32)
-    initializers = [
-        onnx.numpy_helper.from_array(w, "W"),
-        onnx.numpy_helper.from_array(r, "R"),
-        onnx.numpy_helper.from_array(state, "state"),
-        onnx.numpy_helper.from_array(np.array([1], dtype=np.int64), "one"),
-        onnx.numpy_helper.from_array(np.array([2], dtype=np.int64), "two"),
-        onnx.numpy_helper.from_array(np.array([0], dtype=np.int64), "zero"),
-        onnx.numpy_helper.from_array(np.array([1, 1], dtype=np.int64), "ones2"),
-    ]
-    nodes = [
-        onnx.helper.make_node("Shape", ["X"], ["shape"]),
-        # shape[1:2] == [batch]
-        onnx.helper.make_node("Slice", ["shape", "one", "two", "zero"], ["batch"]),
-        onnx.helper.make_node("Concat", ["batch", "ones2"], ["repeats"], axis=0),
-        # [1, 2, hidden] -> [batch, 2, hidden] -> [2, batch, hidden]
-        onnx.helper.make_node("Tile", ["state", "repeats"], ["tiled"]),
-        onnx.helper.make_node("Transpose", ["tiled"], ["states"], perm=[1, 0, 2]),
-        onnx.helper.make_node("Slice", ["states", "zero", "one", "zero"], ["h0"]),
-        onnx.helper.make_node("Slice", ["states", "one", "two", "zero"], ["c0"]),
-        onnx.helper.make_node(
-            "LSTM",
-            ["X", "W", "R", "", "", "h0", "c0"],
-            ["Y"],
-            hidden_size=hidden_size,
-        ),
-    ]
-    graph_def = onnx.helper.make_graph(
-        nodes, "lstm_zero_state", [x], [y], initializer=initializers
+
+    model = parser.parse_model(
+        f"""
+        <
+          ir_version: 10,
+          opset_import: ["": 13]
+        >
+        lstm_zero_state (float[seq,batch,{input_size}] X) => (float[seq,1,batch,{hidden_size}] Y)
+        <int64[1] one = {{1}}, int64[1] two = {{2}}, int64[1] zero = {{0}}, int64[2] ones2 = {{1, 1}}>
+        {{
+          shape = Shape(X)
+          # shape[1:2] == [batch]
+          batch = Slice(shape, one, two, zero)
+          repeats = Concat<axis = 0>(batch, ones2)
+          # [1, 2, hidden] -> [batch, 2, hidden] -> [2, batch, hidden]
+          tiled = Tile(state, repeats)
+          states = Transpose<perm = [1, 0, 2]>(tiled)
+          h0 = Slice(states, zero, one, zero)
+          c0 = Slice(states, one, two, zero)
+          Y = LSTM<hidden_size = {hidden_size}>(X, W, R, , , h0, c0)
+        }}
+        """
     )
-    return onnx.helper.make_model(
-        graph_def, opset_imports=[onnx.helper.make_opsetid("", 13)], ir_version=10
+    model.graph.initializer.extend(
+        [
+            onnx.numpy_helper.from_array(w, "W"),
+            onnx.numpy_helper.from_array(r, "R"),
+            onnx.numpy_helper.from_array(state, "state"),
+        ]
     )
+    return model
 
 
 def test_eliminate_zero_lstm_initial_state():
@@ -1169,41 +1405,29 @@ def test_eliminate_zero_gru_initial_state_from_constant_of_shape():
     # the zero state produced by a bare ConstantOfShape whose `value` attribute
     # is omitted and therefore defaults to zero.
     hidden_size, input_size = 4, 3
-    x = onnx.helper.make_tensor_value_info(
-        "X", onnx.TensorProto.FLOAT, ["seq", "batch", input_size]
+    w = np.random.rand(1, 3 * hidden_size, input_size).astype(np.float32)
+    r = np.random.rand(1, 3 * hidden_size, hidden_size).astype(np.float32)
+
+    model = parser.parse_model(
+        f"""
+        <
+          ir_version: 10,
+          opset_import: ["": 13]
+        >
+        gru_zero_state (float[seq,batch,{input_size}] X) => (float[seq,1,batch,{hidden_size}] Y)
+        <int64[1] zero = {{0}}, int64[1] one = {{1}}, int64[1] two = {{2}}, int64[1] hidden = {{{hidden_size}}}>
+        {{
+          shape = Shape(X)
+          batch = Slice(shape, one, two, zero)
+          # [1, batch, hidden_size]
+          state_shape = Concat<axis = 0>(one, batch, hidden)
+          h0 = ConstantOfShape(state_shape)
+          Y = GRU<hidden_size = {hidden_size}>(X, W, R, , , h0)
+        }}
+        """
     )
-    y = onnx.helper.make_tensor_value_info(
-        "Y", onnx.TensorProto.FLOAT, ["seq", 1, "batch", hidden_size]
-    )
-    initializers = [
-        onnx.numpy_helper.from_array(
-            np.random.rand(1, 3 * hidden_size, input_size).astype(np.float32), "W"
-        ),
-        onnx.numpy_helper.from_array(
-            np.random.rand(1, 3 * hidden_size, hidden_size).astype(np.float32), "R"
-        ),
-        onnx.numpy_helper.from_array(np.array([0], dtype=np.int64), "zero"),
-        onnx.numpy_helper.from_array(np.array([1], dtype=np.int64), "one"),
-        onnx.numpy_helper.from_array(np.array([2], dtype=np.int64), "two"),
-        onnx.numpy_helper.from_array(np.array([hidden_size], dtype=np.int64), "hidden"),
-    ]
-    nodes = [
-        onnx.helper.make_node("Shape", ["X"], ["shape"]),
-        onnx.helper.make_node("Slice", ["shape", "one", "two", "zero"], ["batch"]),
-        # [1, batch, hidden_size]
-        onnx.helper.make_node(
-            "Concat", ["one", "batch", "hidden"], ["state_shape"], axis=0
-        ),
-        onnx.helper.make_node("ConstantOfShape", ["state_shape"], ["h0"]),
-        onnx.helper.make_node(
-            "GRU", ["X", "W", "R", "", "", "h0"], ["Y"], hidden_size=hidden_size
-        ),
-    ]
-    graph_def = onnx.helper.make_graph(
-        nodes, "gru_zero_state", [x], [y], initializer=initializers
-    )
-    model = onnx.helper.make_model(
-        graph_def, opset_imports=[onnx.helper.make_opsetid("", 13)], ir_version=10
+    model.graph.initializer.extend(
+        [onnx.numpy_helper.from_array(w, "W"), onnx.numpy_helper.from_array(r, "R")]
     )
 
     sim_model, check_ok = onnxsim.simplify(
@@ -1233,13 +1457,18 @@ def test_keep_nonzero_lstm_initial_state():
 def test_target_opset_version_upgrades_model():
     # ``target_opset_version`` must upgrade the model's default-domain opset
     # during simplification, using onnx's version converter.
-    x = onnx.helper.make_tensor_value_info("X", onnx.TensorProto.FLOAT, [1, 4])
-    y = onnx.helper.make_tensor_value_info("Y", onnx.TensorProto.FLOAT, [1, 4])
-    node = onnx.helper.make_node("Relu", ["X"], ["Y"])
-    graph_def = onnx.helper.make_graph([node], "g", [x], [y])
-    model = onnx.helper.make_model(
-        graph_def, opset_imports=[onnx.helper.make_opsetid("", 11)]
+    model = parser.parse_model(
+        """
+        <
+          opset_import: ["": 11]
+        >
+        g (float[1,4] X) => (float[1,4] Y)
+        {
+          Y = Relu(X)
+        }
+        """
     )
+    model.ir_version = onnx.IR_VERSION
 
     def _default_opset(m):
         return next(o.version for o in m.opset_import if o.domain in ("", "ai.onnx"))
@@ -1253,13 +1482,18 @@ def test_target_opset_version_upgrades_model():
 
 def test_target_opset_version_none_keeps_opset():
     # The default (None) must leave the model's opset version untouched.
-    x = onnx.helper.make_tensor_value_info("X", onnx.TensorProto.FLOAT, [1, 4])
-    y = onnx.helper.make_tensor_value_info("Y", onnx.TensorProto.FLOAT, [1, 4])
-    node = onnx.helper.make_node("Relu", ["X"], ["Y"])
-    graph_def = onnx.helper.make_graph([node], "g", [x], [y])
-    model = onnx.helper.make_model(
-        graph_def, opset_imports=[onnx.helper.make_opsetid("", 11)]
+    model = parser.parse_model(
+        """
+        <
+          opset_import: ["": 11]
+        >
+        g (float[1,4] X) => (float[1,4] Y)
+        {
+          Y = Relu(X)
+        }
+        """
     )
+    model.ir_version = onnx.IR_VERSION
 
     sim_model, check_ok = onnxsim.simplify(model)
     assert check_ok
@@ -1295,13 +1529,18 @@ def test_perform_optimization_false():
 
 def _add_const_model(delta: float) -> onnx.ModelProto:
     """A minimal model computing ``y = x + delta`` (delta baked as initializer)."""
-    x = onnx.helper.make_tensor_value_info("x", onnx.TensorProto.FLOAT, [1, 4])
-    y = onnx.helper.make_tensor_value_info("y", onnx.TensorProto.FLOAT, [1, 4])
-    const = onnx.helper.make_tensor("c", onnx.TensorProto.FLOAT, [1], [delta])
-    node = onnx.helper.make_node("Add", inputs=["x", "c"], outputs=["y"])
-    graph = onnx.helper.make_graph([node], "g", [x], [y], initializer=[const])
-    return onnx.helper.make_model(
-        graph, opset_imports=[onnx.helper.make_opsetid("", 14)], ir_version=10
+    return parser.parse_model(
+        f"""
+        <
+          ir_version: 10,
+          opset_import: ["": 14]
+        >
+        g (float[1,4] x) => (float[1,4] y)
+        <float[1] c = {{{delta}}}>
+        {{
+          y = Add(x, c)
+        }}
+        """
     )
 
 
@@ -1407,24 +1646,20 @@ def _mul_init_by_const_model() -> onnx.ModelProto:
     """A model ``y = (W * K) + x`` where ``W`` is an initializer and ``K`` is a
     ``Constant`` node. ``W * K`` is foldable only when initializers count as
     constants; ``x`` is a genuine graph input so the ``Add`` never folds."""
-    x = onnx.helper.make_tensor_value_info("x", onnx.TensorProto.FLOAT, [1, 3])
-    y = onnx.helper.make_tensor_value_info("y", onnx.TensorProto.FLOAT, [1, 3])
-    w = onnx.helper.make_tensor("W", onnx.TensorProto.FLOAT, [1, 3], [1.0, 2.0, 3.0])
-    const_node = onnx.helper.make_node(
-        "Constant",
-        inputs=[],
-        outputs=["K"],
-        value=onnx.helper.make_tensor(
-            "value", onnx.TensorProto.FLOAT, [1, 3], [2.0, 2.0, 2.0]
-        ),
-    )
-    mul = onnx.helper.make_node("Mul", inputs=["W", "K"], outputs=["M"])
-    add = onnx.helper.make_node("Add", inputs=["x", "M"], outputs=["y"])
-    graph = onnx.helper.make_graph(
-        [const_node, mul, add], "g", [x], [y], initializer=[w]
-    )
-    return onnx.helper.make_model(
-        graph, opset_imports=[onnx.helper.make_opsetid("", 14)], ir_version=10
+    return parser.parse_model(
+        """
+        <
+          ir_version: 10,
+          opset_import: ["": 14]
+        >
+        g (float[1,3] x) => (float[1,3] y)
+        <float[1,3] W = {1.0, 2.0, 3.0}>
+        {
+          K = Constant<value = float[1,3] {2.0, 2.0, 2.0}>()
+          M = Mul(W, K)
+          y = Add(x, M)
+        }
+        """
     )
 
 
@@ -1457,8 +1692,6 @@ def _model_with_local_function() -> onnx.ModelProto:
     # A model whose main graph calls a single model-defined (local) function
     # ``custom.AddRelu`` -- authored via the ONNX text form so the FunctionProto
     # rides along in ``model.functions``.
-    from onnx import parser
-
     return parser.parse_model(
         """
         <

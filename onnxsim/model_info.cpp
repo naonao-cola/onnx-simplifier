@@ -5,6 +5,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <iterator>
 #include <optional>
 #include <set>
 #include <string>
@@ -262,6 +263,80 @@ void SetMetadata(Proto& proto, const std::string& key,
   entry->set_value(value);
 }
 
+// --- Graph diff (DiffGraphs / FormatGraphDiff) -------------------------------
+
+NodeDiffEntry MakeNodeDiffEntry(const onnx::NodeProto& node) {
+  NodeDiffEntry entry;
+  entry.op_type = node.op_type();
+  entry.name = node.name();
+  entry.inputs.assign(node.input().begin(), node.input().end());
+  entry.outputs.assign(node.output().begin(), node.output().end());
+  return entry;
+}
+
+// A node's output names joined with a separator unlikely to appear in an ONNX
+// identifier, used as the map key so a node's *set* of output names (order
+// preserved, exactly as ONNX requires them unique within the graph) acts as
+// its diff identity.
+std::string OutputKey(const NodeDiffEntry& entry) {
+  std::string key;
+  for (const auto& name : entry.outputs) {
+    key += name;
+    key.push_back('\x1f');
+  }
+  return key;
+}
+
+// Every named tensor the (top-level) graph produces or consumes: node
+// outputs, initializers and graph inputs. A node *input* that is neither an
+// initializer nor another node's output is a graph input already, so this set
+// covers every value a diff could plausibly care about.
+std::set<std::string> GraphValueNames(const onnx::GraphProto& graph) {
+  std::set<std::string> names;
+  for (const auto& node : graph.node()) {
+    for (const auto& name : node.output()) {
+      if (!name.empty()) names.insert(name);
+    }
+  }
+  for (const auto& init : graph.initializer()) names.insert(init.name());
+  for (const auto& input : graph.input()) names.insert(input.name());
+  return names;
+}
+
+std::string NodeLabel(const NodeDiffEntry& entry) {
+  std::string name = entry.name;
+  if (name.empty()) {
+    for (size_t i = 0; i < entry.outputs.size(); ++i) {
+      if (i > 0) name.push_back('/');
+      name += entry.outputs[i];
+    }
+  }
+  return entry.op_type + " (" + name + ")";
+}
+
+std::string JoinList(const std::vector<std::string>& items) {
+  std::string out = "[";
+  for (size_t i = 0; i < items.size(); ++i) {
+    if (i > 0) out += ", ";
+    out += items[i];
+  }
+  out.push_back(']');
+  return out;
+}
+
+// Append at most `limit` lines to `out`, followed by an "... and N more" line
+// when there were more, so a large model's diff section stays readable.
+void AppendCapped(std::string& out, const std::vector<std::string>& lines,
+                  size_t limit) {
+  for (size_t i = 0; i < lines.size() && i < limit; ++i) {
+    out += lines[i];
+    out.push_back('\n');
+  }
+  if (lines.size() > limit) {
+    out += "  ... and " + std::to_string(lines.size() - limit) + " more\n";
+  }
+}
+
 }  // namespace
 
 void AnnotateModelInfo(onnx::ModelProto& model) {
@@ -425,4 +500,175 @@ std::string FormatSimplifyingInfo(const onnx::ModelProto& model_ori,
   }
   out += border();
   return out;
+}
+
+GraphDiff DiffGraphs(const onnx::ModelProto& model_ori,
+                     const onnx::ModelProto& model_opt) {
+  std::map<std::string, NodeDiffEntry> ori_by_output;
+  for (const auto& node : model_ori.graph().node()) {
+    NodeDiffEntry entry = MakeNodeDiffEntry(node);
+    ori_by_output.emplace(OutputKey(entry), std::move(entry));
+  }
+  std::map<std::string, NodeDiffEntry> opt_by_output;
+  for (const auto& node : model_opt.graph().node()) {
+    NodeDiffEntry entry = MakeNodeDiffEntry(node);
+    opt_by_output.emplace(OutputKey(entry), std::move(entry));
+  }
+
+  GraphDiff diff;
+  for (const auto& [key, before] : ori_by_output) {
+    auto it = opt_by_output.find(key);
+    if (it == opt_by_output.end()) {
+      diff.removed_nodes.push_back(before);
+    } else {
+      const NodeDiffEntry& after = it->second;
+      if (after.op_type != before.op_type || after.inputs != before.inputs) {
+        diff.changed_nodes.emplace_back(before, after);
+      }
+    }
+  }
+  for (const auto& [key, after] : opt_by_output) {
+    if (ori_by_output.find(key) == ori_by_output.end()) {
+      diff.added_nodes.push_back(after);
+    }
+  }
+
+  const std::set<std::string> ori_values = GraphValueNames(model_ori.graph());
+  const std::set<std::string> opt_values = GraphValueNames(model_opt.graph());
+  std::set_difference(ori_values.begin(), ori_values.end(), opt_values.begin(),
+                      opt_values.end(),
+                      std::back_inserter(diff.removed_values));
+  std::set_difference(opt_values.begin(), opt_values.end(), ori_values.begin(),
+                      ori_values.end(), std::back_inserter(diff.added_values));
+  return diff;
+}
+
+std::string FormatGraphDiff(const onnx::ModelProto& model_ori,
+                            const onnx::ModelProto& model_opt, size_t limit) {
+  const GraphDiff diff = DiffGraphs(model_ori, model_opt);
+
+  std::string out = "Graph diff (matched by node output / value name):\n";
+
+  out += "Nodes removed (" + std::to_string(diff.removed_nodes.size()) + "):\n";
+  {
+    std::vector<std::string> lines;
+    for (const auto& n : diff.removed_nodes)
+      lines.push_back("  - " + NodeLabel(n));
+    AppendCapped(out, lines, limit);
+  }
+
+  out += "Nodes added (" + std::to_string(diff.added_nodes.size()) + "):\n";
+  {
+    std::vector<std::string> lines;
+    for (const auto& n : diff.added_nodes)
+      lines.push_back("  + " + NodeLabel(n));
+    AppendCapped(out, lines, limit);
+  }
+
+  out += "Nodes changed (" + std::to_string(diff.changed_nodes.size()) + "):\n";
+  {
+    std::vector<std::string> lines;
+    for (const auto& [before, after] : diff.changed_nodes) {
+      std::string label = NodeLabel(after);
+      if (before.op_type != after.op_type) {
+        lines.push_back("  ~ " + label + ": " + before.op_type + " -> " +
+                        after.op_type);
+      } else {
+        lines.push_back("  ~ " + label + ": inputs " + JoinList(before.inputs) +
+                        " -> " + JoinList(after.inputs));
+      }
+    }
+    AppendCapped(out, lines, limit);
+  }
+
+  out +=
+      "Values removed (" + std::to_string(diff.removed_values.size()) + "):\n";
+  {
+    std::vector<std::string> lines;
+    for (const auto& v : diff.removed_values) lines.push_back("  - " + v);
+    AppendCapped(out, lines, limit);
+  }
+
+  out += "Values added (" + std::to_string(diff.added_values.size()) + "):\n";
+  {
+    std::vector<std::string> lines;
+    for (const auto& v : diff.added_values) lines.push_back("  + " + v);
+    AppendCapped(out, lines, limit);
+  }
+
+  return out;
+}
+
+// Joins up to `limit` entries of `items` with ", ", appending a "... (+N
+// more)" marker when there were more. The metadata_props-value counterpart of
+// ``AppendCapped``: that one writes one line per entry into a multi-line
+// report, but a metadata_props value is a single flat string, so this stays
+// on one line.
+std::string JoinCapped(const std::vector<std::string>& items, size_t limit) {
+  std::string out;
+  for (size_t i = 0; i < items.size() && i < limit; ++i) {
+    if (i > 0) out += ", ";
+    out += items[i];
+  }
+  if (items.size() > limit) {
+    out += ", ... (+" + std::to_string(items.size() - limit) + " more)";
+  }
+  return out;
+}
+
+void RecordCappedListMetadata(onnx::ModelProto& model, const std::string& key,
+                              const std::vector<std::string>& items,
+                              size_t limit) {
+  SetMetadata(model, key + ".count", std::to_string(items.size()));
+  SetMetadata(model, key, JoinCapped(items, limit));
+}
+
+// Counts top-level-graph nodes in `model_ori` that had a non-empty
+// doc_string but whose matched node in `model_opt` -- same output name(s),
+// the identity DiffGraphs itself matches nodes by -- carries none: either
+// the node was removed/fused away entirely, or whatever pass rebuilt it
+// didn't carry doc_string over (onnx-optimizer's fusion/elimination passes
+// generally don't). Reported as a plain count rather than the text itself:
+// doc_string is free-form prose, not a stable list of identifiers, so
+// there's no meaningful capped list to show here -- just how much was lost.
+static size_t CountDroppedDocStrings(const onnx::ModelProto& model_ori,
+                                     const onnx::ModelProto& model_opt) {
+  std::set<std::string> opt_keys_with_doc_string;
+  for (const auto& node : model_opt.graph().node()) {
+    if (!node.doc_string().empty()) {
+      opt_keys_with_doc_string.insert(OutputKey(MakeNodeDiffEntry(node)));
+    }
+  }
+
+  size_t dropped = 0;
+  for (const auto& node : model_ori.graph().node()) {
+    if (!node.doc_string().empty() &&
+        !opt_keys_with_doc_string.count(OutputKey(MakeNodeDiffEntry(node)))) {
+      ++dropped;
+    }
+  }
+  return dropped;
+}
+
+void RecordSimplifyDiffMetadata(onnx::ModelProto& sim_model,
+                                const onnx::ModelProto& model_ori,
+                                size_t limit) {
+  const GraphDiff diff = DiffGraphs(model_ori, sim_model);
+
+  std::vector<std::string> removed;
+  removed.reserve(diff.removed_nodes.size());
+  for (const auto& n : diff.removed_nodes) removed.push_back(NodeLabel(n));
+
+  std::vector<std::string> changed;
+  changed.reserve(diff.changed_nodes.size());
+  for (const auto& [before, after] : diff.changed_nodes) {
+    changed.push_back(NodeLabel(before) + " -> " + NodeLabel(after));
+  }
+
+  RecordCappedListMetadata(sim_model, "onnxsim.removed_nodes", removed, limit);
+  RecordCappedListMetadata(sim_model, "onnxsim.changed_nodes", changed, limit);
+  RecordCappedListMetadata(sim_model, "onnxsim.removed_values",
+                           diff.removed_values, limit);
+  SetMetadata(sim_model, "onnxsim.dropped_doc_strings",
+              std::to_string(CountDroppedDocStrings(model_ori, sim_model)));
 }

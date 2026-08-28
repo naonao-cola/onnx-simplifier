@@ -123,6 +123,62 @@ check("captureOrtDiagnostics mirrors unhandled WebNN rejections", () => {
   restore();
 });
 
+// Node has no global GPUDevice; a fakeTarget() stub (already used for
+// `window` above) has the same addEventListener/removeEventListener shape, so
+// it doubles as a fake device here.
+async function checkAsync(name, fn) {
+  await fn();
+  passed += 1;
+  console.log("  ok -", name);
+}
+
+await checkAsync(
+  "captureOrtDiagnostics mirrors an uncaptured WebGPU device error",
+  async () => {
+    const target = fakeTarget();
+    const device = fakeTarget();
+    const ort = { env: { webgpu: { device: Promise.resolve(device) } } };
+    const logged = [];
+    const restore = captureOrtDiagnostics({
+      log: (m) => logged.push(m),
+      con: fakeConsole(),
+      target,
+      ort,
+    });
+
+    // The device promise resolves asynchronously; give it a tick to attach.
+    await Promise.resolve();
+    await Promise.resolve();
+
+    assert.equal(device.count("uncapturederror"), 1);
+    device.dispatch("uncapturederror", {
+      error: { message: "storage buffers (9) ... exceeds ... limit (8)" },
+    });
+    assert.equal(logged.length, 1);
+    assert.match(logged[0], /^WebGPU uncaptured error: /);
+    assert.match(logged[0], /storage buffers/);
+
+    restore();
+    assert.equal(device.count("uncapturederror"), 0);
+  },
+);
+
+await checkAsync(
+  "captureOrtDiagnostics without `ort` never touches a device",
+  async () => {
+    const target = fakeTarget();
+    const logged = [];
+    const restore = captureOrtDiagnostics({
+      log: (m) => logged.push(m),
+      con: fakeConsole(),
+      target,
+    });
+    await Promise.resolve();
+    restore(); // must not throw with no device ever attached
+    assert.equal(logged.length, 0);
+  },
+);
+
 check("restore() removes console wrappers and the rejection listener", () => {
   const con = fakeConsole();
   const target = fakeTarget();

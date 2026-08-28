@@ -1,6 +1,24 @@
-# Builds the WASM convertmodel demo once, then:
+# Builds the WASM convertmodel demo, then:
 #   - on push to master/pages: deploys it to GitHub Pages (production)
-#   - on pull_request:          deploys a per-PR preview to Cloudflare Pages
+#   - on a `/preview` PR comment: deploys a per-PR preview to Cloudflare Pages
+#   - on a `v*` GitHub release: stages the `onnxsim` npm package for release
+#     (npm/onnxsim/; see docs/wasm_ort_web.md "npm package" section)
+#   - on a pull request touching wasm/npm paths: builds the wasm module and
+#     validates the npm package (tests + `npm pack`), but skips the
+#     (unrelated, expensive) Netron build and never deploys anywhere
+#
+# The npm package ships the exact same ORT-web wasm module as the demo, so its
+# packaging (npm test && npm pack, and on a release npm stage publish) rides
+# along with whichever build this workflow is already doing, rather than a
+# separate workflow rebuilding the module a second time.
+#
+# The hosted demo preview is on-demand rather than automatic: the full build
+# (emscripten + a full Netron web build) is expensive, and most PRs don't touch
+# the demo or don't need a hosted preview of it. Comment `/preview` on a pull
+# request and this workflow builds that PR's head and deploys it, replying with
+# the URL. The npm build+validate above is a separate, cheaper path (no Netron)
+# that runs unconditionally on a relevant PR, since it's the only per-PR
+# coverage npm packaging gets.
 #
 # The demo is built as the ORT-web variant (ONNXSIM_WASM_ORT_WEB=ON): onnxsim's
 # WebAssembly module links no ONNX Runtime and delegates constant folding to the
@@ -15,69 +33,153 @@ on:
     branches: ["master", "pages"]
     # Only rebuild/deploy the WASM convertmodel demo when files that actually
     # affect it change (the C++ sources, the build scripts, the demo assets,
-    # or this workflow itself).
-    paths:
+    # or this workflow itself). `!onnxsim/**/*.py` excludes onnxsim's
+    # Python-only files -- this build compiles onnxsim's C++ core into the
+    # wasm module and never touches them.
+    paths: &static-paths
       - ".github/workflows/static.yml"
       - "build_wasm.sh"
       - "CMakeLists.txt"
       - "cmake/**"
       - "onnxsim/**"
+      - "!onnxsim/**/*.py"
       - "scripts/convertmodel/**"
       - "scripts/regression/models.json"
+      - "npm/onnxsim/**"
+      - "scripts/build_npm_package.sh"
+      - "scripts/stage_npm_package.sh"
       - ".gitmodules"
 
+  # Validates the wasm build + npm package on every PR that touches it (same
+  # paths as the push trigger above) -- see the "Demo-only" step gates below
+  # for what this skips (Netron, Pages/Cloudflare deploy) to keep it cheaper
+  # than a full demo build.
   pull_request:
-    paths:
-      - ".github/workflows/static.yml"
-      - "build_wasm.sh"
-      - "CMakeLists.txt"
-      - "cmake/**"
-      - "onnxsim/**"
-      - "scripts/convertmodel/**"
-      - "scripts/regression/models.json"
-      - ".gitmodules"
+    paths: *static-paths
+
+  # Per-PR Cloudflare previews are opt-in: comment `/preview` on the pull
+  # request. `issue_comment` has no path filter, which is fine — the whole point
+  # is that a human asked for this build.
+  issue_comment:
+    types: [created]
+
+  # Stages the `onnxsim` npm package for a maintainer to approve (see the "npm
+  # stage publish" step below) — only a GitHub release actually attempts this,
+  # not workflow_dispatch, so a manual "redeploy the demo" run can never
+  # accidentally touch npm.
+  release:
+    types: [published]
 
   # Allows you to run this workflow manually from the Actions tab
   workflow_dispatch:
 
-# Sets permissions of the GITHUB_TOKEN to allow deployment to GitHub Pages
-# and to post the Cloudflare preview URL as a PR comment.
+# Sets permissions of the GITHUB_TOKEN to allow deployment to GitHub Pages, to
+# react to the `/preview` comment and post the Cloudflare preview URL back on
+# the PR (PR conversation comments go through the issues API), and (id-token)
+# for npm's OIDC trusted publishing on a release -- the same token also used
+# for the Pages OIDC deployment below, just exchanged with a different party.
 permissions:
   contents: read
   pages: write
   id-token: write
   pull-requests: write
+  issues: write
+  # Needed only by the "Find the matching Pyodide demo build" step below,
+  # which lists/reads workflow runs and artifacts from pyodide-wasm.yml (a
+  # separate workflow) via the REST API.
+  actions: read
 
 # Allow only one concurrent deployment, skipping runs queued between the run in-progress and latest queued.
 # However, do NOT cancel in-progress runs as we want to allow these production deployments to complete.
+# `/preview` runs are keyed by PR number: an `issue_comment` run reports
+# github.ref as the default branch, so without this a preview would share a
+# group with — and cancel — the production Pages deployment. A release run's
+# github.ref is its tag, which is unique per release, so it never collides
+# with a push or preview group either.
 concurrency:
-  group: "pages-${{ github.ref }}"
+  group: "pages-${{ github.event.issue.number || github.ref }}"
   cancel-in-progress: true
 
 jobs:
   # Single deploy job since we're just deploying
   deploy:
+    # For comments: only `/preview` on a pull request, and only from someone
+    # with write access. That last check matters — an `issue_comment` run
+    # executes with the repo's secrets, and the preview builds the PR head
+    # (possibly from a fork), so a maintainer has to ask for it.
+    if: >-
+      github.event_name != 'issue_comment' || (
+        github.event.issue.pull_request != null &&
+        startsWith(github.event.comment.body, '/preview') &&
+        contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association)
+      )
     environment:
-      name: ${{ case(github.event_name == 'push', 'github-pages', '') }}
-      url: ${{ steps.deployment.outputs.page_url }}
+      name: ${{ case(github.event_name == 'push', 'github-pages', github.event_name == 'release', 'npm', '') }}
+      url: ${{ github.event_name == 'release' && 'https://www.npmjs.com/package/onnxsim' || steps.deployment.outputs.page_url }}
     runs-on: ubuntu-latest
     env:
       CMAKE_GENERATOR: Ninja
       EMSCRIPTEN_VERSION: "5.0.0"
       # Surfaced so the Cloudflare preview steps can gate on the secret being
-      # present. It is empty for fork PRs and for Dependabot PRs (GitHub does
-      # not share repo secrets with either), so the steps below skip instead of
-      # failing wrangler with "CLOUDFLARE_API_TOKEN is necessary".
+      # present. `issue_comment` runs always get the repo's secrets (they run in
+      # the base repo's context, not the PR's), so this is only empty in a fork
+      # of this repo that has not configured its own Cloudflare credentials.
       CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
     steps:
+      # An `issue_comment` payload carries no head ref, so ask the API which
+      # commit the PR currently points at and build exactly that. The 👀
+      # reaction is the "your build started" ack, since the run itself is not
+      # attached to the PR's checks.
+      - name: Resolve the PR the comment is on
+        id: pr
+        if: ${{ github.event_name == 'issue_comment' }}
+        uses: actions/github-script@v9
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const { data: pr } = await github.rest.pulls.get({
+              owner, repo, pull_number: context.issue.number,
+            });
+            core.setOutput('head_repo', pr.head.repo.full_name);
+            core.setOutput('head_ref', pr.head.ref);
+            core.setOutput('head_sha', pr.head.sha);
+            await github.rest.reactions.createForIssueComment({
+              owner, repo, comment_id: context.payload.comment.id, content: 'eyes',
+            });
       - name: Checkout
         uses: actions/checkout@v7
         with:
+          # Empty for push/release/workflow_dispatch, which keeps checkout's
+          # default (the ref that triggered the run — a release run checks out
+          # its tag).
+          repository: ${{ steps.pr.outputs.head_repo }}
+          ref: ${{ steps.pr.outputs.head_sha }}
           submodules: recursive
       - name: Setup Pages
         if: ${{ github.event_name == 'push' }}
         uses: actions/configure-pages@v6
-      - run: pip install cmake ninja
+      # Needed early (rather than right before the npm packaging steps
+      # further down, where it used to live) because the release-only bump
+      # step right below calls npm.
+      - name: Setup Node
+        uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+          registry-url: "https://registry.npmjs.org"
+      # Forces every binding manifest (npm/onnxsim/package.json,
+      # rust/Cargo.toml + rust/onnxsim/Cargo.toml, and the root VERSION file
+      # -- which CMakeLists.txt bakes into the WASM module below as
+      # ONNXSIM_VERSION_STRING, the demo's "versions" panel / issue report)
+      # to the release tag before anything downstream reads them. This is the
+      # same script the automated bump PR (version-sync.yml) runs, but that
+      # one only updates the repo's committed files *after* the release, once
+      # a maintainer merges it -- so relying on what's currently committed
+      # here would let the WASM module and the published npm package report a
+      # stale version.
+      - name: Bump binding versions to the release tag
+        if: ${{ github.event_name == 'release' && startsWith(github.ref, 'refs/tags/v') }}
+        run: ./scripts/bump_binding_versions.sh "${GITHUB_REF#refs/tags/}"
+      - run: pip install cmake ninja setuptools
       # The ORT-web build forces ONNX_BUILD_CUSTOM_PROTOBUF=ON (CMakeLists.txt),
       # so onnx fetches and builds protobuf 6.31.1 for the wasm target (see its
       # sbom.cdx.json). build_wasm.sh passes `which protoc` as
@@ -133,19 +235,184 @@ jobs:
           } >> "${GITHUB_STEP_SUMMARY}"
           ccache -s
 
+      # --- npm package (npm/onnxsim/): stage onnxsim.{js->cjs,wasm} + the
+      # shared JS executor from the module just built above; see
+      # docs/wasm_ort_web.md "npm package".
+      - run: ./scripts/stage_npm_package.sh
+      # `npm stage` (staged publishing, https://docs.npmjs.com/staged-publishing)
+      # needs npm CLI >= 11.15.0; setup-node's bundled version can lag behind it.
+      - run: npm install -g npm@latest
+      # Installs onnxruntime-web, the package's one runtime dependency -- needed
+      # both to actually run test/index.test.mjs below and because
+      # index.mjs always imports it (the npm build always reports
+      # onnxsim_needs_ort_web() true; see docs/wasm_ort_web.md).
+      - name: Install npm/onnxsim's dependencies
+        working-directory: npm/onnxsim
+        run: npm install
+      # Unit tests, then pack the tarball locally as a packaging smoke test --
+      # no separate CI step duplicates either. Runs on every trigger of this
+      # workflow (push, pull_request, /preview, workflow_dispatch, release).
+      # `npm publish --dry-run` used to cover this, but it queries the
+      # registry and fails outright once package.json's version is already
+      # live on npm -- the normal state between releases, not an error -- so
+      # it isn't safe to run unconditionally; `npm pack` never contacts the
+      # registry.
+      - name: npm test && npm pack (unit tests + packaging smoke test, no publish/registry check)
+        working-directory: npm/onnxsim
+        run: npm test && npm pack
+      # This only *stages* the release -- it does not go live on its own.
+      # `npm stage publish` uploads the tarball to a review queue instead of
+      # the registry; a maintainer with 2FA still has to run
+      # `npm stage approve <stage-id>` (or approve on npmjs.com) before it's
+      # installable. That keeps a compromised workflow (or a compromised
+      # transitive build dependency) from being able to push a live release by
+      # itself -- OIDC trusted publishing here can only propose one.
+      #
+      # The `onnxsim` package's trusted publisher entry on npmjs.com must list
+      # this workflow (static.yml) with "npm stage publish" among its allowed
+      # actions (ideally stage-only, rejecting direct `npm publish`) for this
+      # to succeed -- that's a one-time setting on the package's npmjs.com
+      # settings page, not something this workflow can configure.
+      - name: npm stage publish
+        if: >-
+          github.repository == 'onnxsim/onnxsim' &&
+          github.event_name == 'release' &&
+          startsWith(github.ref, 'refs/tags/v')
+        working-directory: npm/onnxsim
+        run: npm stage publish --provenance
+
       # Ship the curated regression model set next to the page so the
       # "Load from Hugging Face" dropdown can fetch it same-origin (it falls
       # back to the raw GitHub copy when this file is absent, e.g. local dev).
-      - run: cp scripts/regression/models.json scripts/convertmodel/models.json
+      # Demo-only: only push (production) and issue_comment (/preview) actually
+      # deploy the demo, so a release or plain pull_request run skips this.
+      - if: ${{ github.event_name == 'push' || github.event_name == 'issue_comment' }}
+        run: cp scripts/regression/models.json scripts/convertmodel/models.json
+
+      # --- Pyodide demo (scripts/pyodide_demo/) -----------------------------
+      # A completely separate build (wasm32-emscripten Python extension via
+      # build_wasm_pyodide.sh, not this job's own emcmake build), so import
+      # its already-built module as a cross-workflow artifact rather than
+      # rebuilding it here -- see docs/wasm_pyodide.md and
+      # .github/workflows/pyodide-wasm.yml, which is what actually builds and
+      # uploads it (as "onnxsim_cpp2py_export-wasm32-pyodide-<version>") on
+      # any push/PR that touches that build path.
+      #
+      # This commit may not have a matching pyodide-wasm.yml run of its own at
+      # all -- that workflow is itself path-filtered (see its `on:` block), so
+      # a change to, say, scripts/convertmodel/index.html alone never triggers
+      # it. Originally this meant staging was skipped outright whenever there
+      # was no run for the EXACT current sha -- which turned out to be the
+      # common case, silently dropping the demo from every deploy/preview that
+      # didn't itself touch the Pyodide build path (confirmed: PR #699, which
+      # only touched the top-page link, deployed with no pyodide-demo/ at
+      # all). Fixed by falling back to the most recent successful
+      # pyodide-wasm.yml run on ANY branch when there's no exact match -- the
+      # extension only actually changes when its own path-filtered inputs do,
+      # so "latest successful build, whichever commit produced it" is a
+      # reasonable stand-in, not a real staleness risk in practice. Only skip
+      # staging if there has NEVER been a successful build at all (e.g. right
+      # after pyodide-wasm.yml is first introduced, before its first green
+      # run).
+      # Demo-only, PLUS workflow_dispatch (unlike the models.json/Netron gate
+      # above): a plain pull_request run doesn't deploy anywhere this would be
+      # visible, but workflow_dispatch is included here specifically because
+      # it's the only way to test THIS staging logic before it's merged --
+      # issue_comment-triggered runs (e.g. /preview) always use the base
+      # branch's workflow definition, never a PR branch's, so changes to
+      # these very steps are invisible to /preview until merged. Manually
+      # dispatching this workflow against a PR branch (which DOES use that
+      # branch's own workflow file) is the only pre-merge way to exercise it.
+      - name: Find the matching Pyodide demo build
+        if: ${{ github.event_name == 'push' || github.event_name == 'issue_comment' || github.event_name == 'workflow_dispatch' }}
+        id: find_pyodide_run
+        uses: actions/github-script@v9
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const sha = ${{ toJSON(steps.pr.outputs.head_sha || github.sha) }};
+            const { data } = await github.rest.actions.listWorkflowRuns({
+              owner, repo,
+              workflow_id: 'pyodide-wasm.yml',
+              status: 'success',
+              per_page: 20,
+            });
+            // listWorkflowRuns returns newest-first, so [0] is the latest
+            // successful build on any branch once there's no exact-sha match.
+            const exact = data.workflow_runs.find((r) => r.head_sha === sha);
+            const match = exact || data.workflow_runs[0];
+            if (!match) {
+              core.notice(`No successful pyodide-wasm.yml run found at all -- skipping Pyodide demo staging.`);
+              core.setOutput('run_id', '');
+            } else if (!exact) {
+              core.notice(`No pyodide-wasm.yml run for ${sha} -- falling back to the latest successful run (${match.head_sha}, run ${match.id}).`);
+              core.setOutput('run_id', String(match.id));
+            } else {
+              core.setOutput('run_id', String(match.id));
+            }
+      - name: Download the Pyodide demo build
+        if: ${{ (github.event_name == 'push' || github.event_name == 'issue_comment' || github.event_name == 'workflow_dispatch') && steps.find_pyodide_run.outputs.run_id != '' }}
+        uses: actions/download-artifact@v8
+        with:
+          # Matched by prefix (not a hardcoded version) so this doesn't need
+          # updating every time pyodide-wasm.yml's PYODIDE_VERSION bumps.
+          pattern: onnxsim_cpp2py_export-wasm32-pyodide-*
+          path: pyodide-demo-artifact
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          run-id: ${{ steps.find_pyodide_run.outputs.run_id }}
+      - name: Stage the Pyodide demo
+        if: ${{ (github.event_name == 'push' || github.event_name == 'issue_comment' || github.event_name == 'workflow_dispatch') && steps.find_pyodide_run.outputs.run_id != '' }}
+        run: |
+          mkdir -p scripts/convertmodel/pyodide-demo
+          cp scripts/pyodide_demo/index.html scripts/convertmodel/pyodide-demo/
+          SO=$(find pyodide-demo-artifact -name 'onnxsim_cpp2py_export.abi3.so' | head -1)
+          if [ -z "$SO" ]; then
+            echo "::warning::downloaded Pyodide demo artifact did not contain onnxsim_cpp2py_export.abi3.so -- skipping"
+          else
+            cp "$SO" scripts/convertmodel/pyodide-demo/onnxsim_cpp2py_export.abi3.so
+            # onnxsim's pure-Python package, staged alongside the compiled
+            # extension so the demo page can fetch each file and drop it into
+            # Pyodide's site-packages at runtime -- needed for the full
+            # onnxsim.simplify() path (import onnxsim), not just the native
+            # cpp2py_export bindings the demo could already reach without it.
+            # onnxsim/version.py is gitignored and normally generated by
+            # `setup.py`'s create_version command (part of a real `pip
+            # install .`); this job never runs setup.py otherwise, so
+            # generate it explicitly -- onnx_simplifier.py's `from . import
+            # ..., version` fails without it.
+            #
+            # setup.py's own `setuptools.setup(...)` call parses
+            # pyproject.toml before create_version even runs, and this
+            # step's plain `python3` isn't the same interpreter the earlier
+            # `pip install cmake ninja setuptools` step's `pip` resolves to
+            # (confirmed directly: it picked up
+            # /usr/lib/python3/dist-packages/setuptools, the OS-packaged
+            # one) -- too old to understand pyproject.toml's SPDX
+            # license-expression string ("project.license must be valid
+            # exactly by one definition"; pyproject.toml's own
+            # build-system.requires already pins setuptools>=77 for exactly
+            # this). Force it via THIS interpreter specifically so there's
+            # no ambiguity about which site-packages it lands in.
+            # setuptools>=77's own SPDX license-expression normalization
+            # additionally needs packaging>=24.2 to actually run -- without
+            # it, it doesn't just skip validation as its own warning
+            # implies, it crashes outright ("ImportError: Cannot import
+            # `packaging.licenses`"), confirmed directly once the
+            # setuptools>=77 fix above was already in place on its own.
+            python3 -m pip install --quiet --upgrade 'setuptools>=77' 'packaging>=24.2'
+            python3 setup.py create_version
+            mkdir -p scripts/convertmodel/pyodide-demo/onnxsim_src
+            cp onnxsim/*.py scripts/convertmodel/pyodide-demo/onnxsim_src/
+            echo "staged Pyodide demo at scripts/convertmodel/pyodide-demo/"
+          fi
 
       # Build the patched Netron (embedding protocol + embedded mode) and serve
       # it from the converter's own origin at ./netron/, so the page can post
-      # models straight into it — no upload, no URL-length limit.
-      - name: Setup Node
-        uses: actions/setup-node@v7
-        with:
-          node-version: "22"
+      # models straight into it — no upload, no URL-length limit. Demo-only
+      # (see above) -- skipping it is what keeps the pull_request validation
+      # path cheaper than a full demo build.
       - name: Build and embed Netron
+        if: ${{ github.event_name == 'push' || github.event_name == 'issue_comment' }}
         env:
           NETRON_REPO: https://github.com/onnxsim/netron
           # Netron 9.1.9 + the embedding protocol, now also exposing an
@@ -170,14 +437,23 @@ jobs:
         uses: actions/deploy-pages@v5
         if: ${{ github.event_name == 'push' }}
 
-      # --- Preview: Cloudflare Pages (pull requests only) ---
-      # Repo secrets are not shared with fork PRs or Dependabot PRs, so
-      # CLOUDFLARE_API_TOKEN is empty there. Gate on it being set so those runs
-      # skip the deploy instead of failing wrangler. Same-repo branches (which
-      # do get the secret) still produce previews.
+      # --- Preview: Cloudflare Pages (`/preview` comment, or a manual
+      # workflow_dispatch run against a branch) ---
+      # A fork of this repo will not have CLOUDFLARE_API_TOKEN configured, so
+      # gate on it being set: those runs skip the deploy instead of failing
+      # wrangler with "CLOUDFLARE_API_TOKEN is necessary".
+      #
+      # workflow_dispatch is included here for the exact reason noted on the
+      # Pyodide demo staging steps above: `/preview` always runs off the base
+      # branch's own workflow definition, so it's the only way to get a real,
+      # deployed preview of a PR branch's OWN static.yml changes (e.g. this
+      # job's own staging logic) before merge -- otherwise those changes are
+      # untestable pre-merge. steps.pr only has outputs on issue_comment (the
+      # only event with a real PR to resolve), so fall back to
+      # github.ref_name (the dispatched branch) on workflow_dispatch.
       - name: Deploy preview to Cloudflare Pages
         id: cf_deploy
-        if: ${{ github.event_name == 'pull_request' && env.CLOUDFLARE_API_TOKEN != '' }}
+        if: ${{ (github.event_name == 'issue_comment' || github.event_name == 'workflow_dispatch') && env.CLOUDFLARE_API_TOKEN != '' }}
         uses: cloudflare/wrangler-action@v4
         with:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
@@ -187,14 +463,26 @@ jobs:
           command: >-
             pages deploy scripts/convertmodel
             --project-name=onnxsim
-            --branch=${{ github.head_ref }}
+            --branch=${{ steps.pr.outputs.head_ref || github.ref_name }}
+      # workflow_dispatch has no PR to comment on -- surface the URL in the
+      # job summary instead, where a human triggering it manually can find it.
+      - name: Print preview URL to the job summary
+        if: ${{ github.event_name == 'workflow_dispatch' && env.CLOUDFLARE_API_TOKEN != '' }}
+        run: |
+          {
+            echo "### ⚡ Cloudflare Pages preview"
+            echo ""
+            echo "- This build: ${{ steps.cf_deploy.outputs.deployment-url }}"
+            echo "- Branch alias: ${{ steps.cf_deploy.outputs.pages-deployment-alias-url }}"
+          } >> "${GITHUB_STEP_SUMMARY}"
       - name: Comment preview URL on the PR
-        if: ${{ github.event_name == 'pull_request' && env.CLOUDFLARE_API_TOKEN != '' }}
+        if: ${{ github.event_name == 'issue_comment' && env.CLOUDFLARE_API_TOKEN != '' }}
         uses: actions/github-script@v9
         with:
           script: |
             const url = ${{ toJSON(steps.cf_deploy.outputs.deployment-url) }};
             const alias = ${{ toJSON(steps.cf_deploy.outputs.pages-deployment-alias-url) }};
+            const sha = ${{ toJSON(steps.pr.outputs.head_sha) }};
             const marker = '<!-- cloudflare-pages-preview -->';
             const body = [
               marker,
@@ -205,7 +493,7 @@ jobs:
               `| **This build** | ${url} |`,
               alias ? `| **Branch alias** | ${alias} |` : '',
               '',
-              `_Preview of ${context.payload.pull_request.head.sha.slice(0, 7)} — updates on every push to this PR._`,
+              `_Preview of ${sha.slice(0, 7)} — comment \`/preview\` again to rebuild._`,
             ].filter(Boolean).join('\n');
             const { owner, repo } = context.repo;
             const issue_number = context.issue.number;

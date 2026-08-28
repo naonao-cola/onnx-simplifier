@@ -1,0 +1,80 @@
+name: Pocket TTS regression test
+
+# Builds onnxsim from source and runs tests/test_pocket_tts.py, which
+# downloads the community ONNX export of Kyutai's Pocket TTS
+# (https://huggingface.co/KevinAHM/pocket-tts-onnx, a public mirror of the
+# gated https://huggingface.co/kyutai/pocket-tts weights) and simplifies
+# and quantizes each graph with onnxsim. This guards against onnxsim
+# regressions on Pocket TTS-style graphs -- see tests/test_pocket_tts.py's
+# module docstring for the real onnxsim bug this surfaced: a genuinely
+# static, zero-length input dimension (an empty KV-cache sentinel) was
+# silently promoted to 1 by generate_random_calibration_data, breaking
+# calibration/accuracy-drop measurement -- and recommend_quantization's
+# candidate loop -- on flow_lm_main.onnx and mimi_decoder.onnx. Fixed in
+# onnxsim/calibration.py.
+
+# Downloads real models over the network (~460MB total across all 5 graphs)
+# and, for flow_lm_main.onnx, takes well over a minute under check_n=3 --
+# too slow/network-dependent to run on every PR unconditionally. It always
+# runs weekly and on push to the default branch, and additionally runs on a
+# PR when the PR itself touches the files this test exists to guard (the
+# test itself, or the modules it exercises); use workflow_dispatch to
+# trigger it manually against a branch for any other change.
+on:
+  push:
+    branches:
+      - main
+      - master
+  pull_request:
+    paths:
+      - tests/test_pocket_tts.py
+      - tests/test_static_quantize_matmul.py
+      - onnxsim/calibration.py
+      - onnxsim/accuracy.py
+      - onnxsim/autoquant.py
+      - .github/workflows/pocket_tts.yml
+  schedule:
+    - cron: '0 10 * * 1'  # weekly, Monday 10:00 UTC
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  pocket_tts:
+    name: Pocket TTS (Hugging Face) -> onnxsim
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      CMAKE_GENERATOR: Ninja
+      CMAKE_CXX_COMPILER_LAUNCHER: sccache
+      SCCACHE_GHA_ENABLED: 'on'
+      ACTIONS_CACHE_SERVICE_V2: 'on'
+      ONNXSIM_RUN_POCKET_TTS_TESTS: '1'
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.11'
+      - uses: mozilla-actions/sccache-action@v0.0.11
+
+      - name: Install build tooling
+        run: pip install cmake ninja "setuptools>=77" sccache nanobind
+
+      - name: Install test dependencies
+        run: pip install pytest onnxruntime
+
+      # Build the onnxsim under test last so it wins over anything a dependency
+      # might have pulled. --no-build-isolation reuses the tooling installed above.
+      - name: Build onnxsim (editable)
+        run: pip install --no-build-isolation -ve .
+
+      - name: Verify onnxsim under test is the source build
+        run: python -c "import onnxsim, onnxsim.onnxsim_cpp2py_export; print('onnxsim', onnxsim.__version__, onnxsim.__file__)"
+
+      - name: Run Pocket TTS regression test
+        run: pytest -v tests/test_pocket_tts.py

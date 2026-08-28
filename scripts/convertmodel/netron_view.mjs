@@ -28,6 +28,15 @@ function fileToArrayBuffer(file) {
   return file.arrayBuffer();
 }
 
+// "safetensors" | "gguf" | null, sniffed from a filename's extension -- same
+// detection converter_main.js's startConversion uses to route an upload
+// through the matching TensorPool import binding before conversion.
+function archiveFormat(name) {
+  if (/\.safetensors$/i.test(name)) return "safetensors";
+  if (/\.gguf$/i.test(name)) return "gguf";
+  return null;
+}
+
 // Netron is served from the converter's own origin, so we only ever talk to a
 // same-origin window and can pin the target origin.
 const NETRON_ORIGIN = window.location.origin;
@@ -85,6 +94,7 @@ function driveNetron(target, buffer, name, onStatus) {
 const panes = {
   before: { buffer: null, name: "", teardown: null, loading: false, loaded: false },
   after: { buffer: null, name: "", teardown: null, loading: false, loaded: false },
+  quantized: { buffer: null, name: "", teardown: null, loading: false, loaded: false },
 };
 
 // Point one pane ("before" | "after") at a model, embedding it inline and
@@ -250,7 +260,34 @@ function initNetronPanel() {
         return;
       }
       fileToArrayBuffer(file)
-        .then((buffer) => renderPane("before", toArrayBuffer(buffer), file.name))
+        .then(async (buffer) => {
+          // A standalone safetensors/gguf archive (e.g. one downloaded from
+          // this page's own format selector): decode it to ONNX first, same
+          // as the conversion pipeline does, so this pane shows the actual
+          // model graph instead of Netron's opaque raw-weights view of the
+          // archive bytes. Falls back to rendering the raw bytes (with a
+          // note) if decoding fails, e.g. a plain weights-only archive with
+          // no embedded graph -- Netron's raw view is still better than
+          // nothing for those.
+          const format = archiveFormat(file.name);
+          if (format && typeof window.__onnxsimImportArchive === "function") {
+            try {
+              const decoded = await window.__onnxsimImportArchive(toArrayBuffer(buffer), format);
+              renderPane("before", toArrayBuffer(decoded), file.name);
+              return;
+            } catch (err) {
+              renderPane("before", toArrayBuffer(buffer), file.name);
+              const note = document.getElementById("netron-before-note");
+              if (note) {
+                note.textContent =
+                    `Could not decode this ${format} file as an onnxsim archive ` +
+                    `(${err.message || err}) -- showing its raw structure instead.`;
+              }
+              return;
+            }
+          }
+          renderPane("before", toArrayBuffer(buffer), file.name);
+        })
         .catch((err) => console.error("netron (before):", err));
     });
   }
@@ -272,6 +309,17 @@ function initNetronPanel() {
       renderPane("after", dataUrlToArrayBuffer(dataUrl), name);
     } catch (err) {
       console.error("netron (after):", err);
+    }
+  };
+
+  // Called by quantize_ui.mjs when a quantize finishes. Deliberately separate
+  // from netronShowAfter -- the Quantize panel's result stays independent of
+  // the Convert section's plain simplify/optimize output (see quantize_ui.mjs).
+  window.netronShowQuantized = (dataUrl, name) => {
+    try {
+      renderPane("quantized", dataUrlToArrayBuffer(dataUrl), name);
+    } catch (err) {
+      console.error("netron (quantized):", err);
     }
   };
 }

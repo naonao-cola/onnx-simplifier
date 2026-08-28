@@ -2,13 +2,32 @@ import os
 import tempfile
 from typing import Optional
 
+import numpy as np
 import onnx
 import onnxruntime
+import pytest
 import torch
-from onnx import TensorProto, helper, numpy_helper
+from onnx import TensorProto, helper, numpy_helper, parser
 
 import onnxsim
 from onnxsim.test_utils import export_simplify_and_check_by_python_api
+
+
+def _model(body, initializer=(), opset=13, ir_version=10):
+    # Pinning ir_version to 10 by default matches the older onnxruntime bundled
+    # with some CI wheels (which cap at IR version 11); several tests below run
+    # models through onnxruntime directly, and onnxsim's own checks do too.
+    model = parser.parse_model(
+        f"""
+        <
+          ir_version: {ir_version},
+          opset_import: ["": {opset}]
+        >
+        {body}
+        """
+    )
+    model.graph.initializer.extend(initializer)
+    return model
 
 
 def test_onnx_simplifier():
@@ -222,15 +241,16 @@ def test_partial_shape_evaluation_gather():
     # Partial shape evaluation for https://github.com/onnxsim/onnxsim/issues/139
     # The input's leading dimension is dynamic, but a Gather that reads only the
     # static dimensions of its shape must still be pre-computed into a constant.
-    x = helper.make_tensor_value_info("x", TensorProto.FLOAT, ["batch", 3, 4, 5])
-    g = helper.make_tensor_value_info("g", TensorProto.INT64, [3])
-    indices = helper.make_tensor("indices", TensorProto.INT64, [3], [1, 2, 3])
-    nodes = [
-        helper.make_node("Shape", ["x"], ["s"]),
-        helper.make_node("Gather", ["s", "indices"], ["g"], axis=0),
-    ]
-    graph = helper.make_graph(nodes, "g", [x], [g], initializer=[indices])
-    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+    model = _model(
+        """
+        g (float[batch,3,4,5] x) => (int64[3] g)
+        <int64[3] indices = {1, 2, 3}>
+        {
+          s = Shape(x)
+          g = Gather<axis=0>(s, indices)
+        }
+        """
+    )
     onnx.checker.check_model(model)
 
     sim_model, check_ok = onnxsim.simplify(model)
@@ -249,15 +269,16 @@ def test_partial_shape_evaluation_gather():
 def test_partial_shape_evaluation_keeps_dynamic_gather():
     # A Gather that reads the dynamic dimension must NOT be folded: its value is
     # unknown until runtime.
-    x = helper.make_tensor_value_info("x", TensorProto.FLOAT, ["batch", 3, 4, 5])
-    g = helper.make_tensor_value_info("g", TensorProto.INT64, [1])
-    indices = helper.make_tensor("indices", TensorProto.INT64, [1], [0])
-    nodes = [
-        helper.make_node("Shape", ["x"], ["s"]),
-        helper.make_node("Gather", ["s", "indices"], ["g"], axis=0),
-    ]
-    graph = helper.make_graph(nodes, "g", [x], [g], initializer=[indices])
-    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+    model = _model(
+        """
+        g (float[batch,3,4,5] x) => (int64[1] g)
+        <int64[1] indices = {0}>
+        {
+          s = Shape(x)
+          g = Gather<axis=0>(s, indices)
+        }
+        """
+    )
     onnx.checker.check_model(model)
 
     sim_model, check_ok = onnxsim.simplify(model)
@@ -278,18 +299,18 @@ def test_partial_shape_evaluation_reshape_single_dynamic_dim():
     # materializes it as the constant [-1, 60] -- the single -1 lets ONNX infer
     # the dynamic dim from the total element count, which is provably equivalent
     # -- so the whole Shape -> Gather -> Concat scaffolding collapses away.
-    x = helper.make_tensor_value_info("x", TensorProto.FLOAT, ["batch", 3, 4, 5])
-    y = helper.make_tensor_value_info("y", TensorProto.FLOAT, ["batch", 60])
-    idx0 = helper.make_tensor("idx0", TensorProto.INT64, [1], [0])
-    sixty = helper.make_tensor("sixty", TensorProto.INT64, [1], [60])  # 3*4*5
-    nodes = [
-        helper.make_node("Shape", ["x"], ["s"]),
-        helper.make_node("Gather", ["s", "idx0"], ["b"], axis=0),
-        helper.make_node("Concat", ["b", "sixty"], ["newshape"], axis=0),
-        helper.make_node("Reshape", ["x", "newshape"], ["y"]),
-    ]
-    graph = helper.make_graph(nodes, "g", [x], [y], initializer=[idx0, sixty])
-    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+    model = _model(
+        """
+        g (float[batch,3,4,5] x) => (float[batch,60] y)
+        <int64[1] idx0 = {0}, int64[1] sixty = {60}>
+        {
+          s = Shape(x)
+          b = Gather<axis=0>(s, idx0)
+          newshape = Concat<axis=0>(b, sixty)
+          y = Reshape(x, newshape)
+        }
+        """
+    )
     onnx.checker.check_model(model)
 
     sim_model, check_ok = onnxsim.simplify(model)
@@ -315,17 +336,17 @@ def test_data_propagation_through_reshape():
     # folds. Here Shape(x) -> Reshape(., [-1]) -> Gather([1, 2]) reads only the
     # static dims, so it must pre-compute to [3, 4] even though the batch is
     # dynamic -- which requires the value to survive the Reshape.
-    x = helper.make_tensor_value_info("x", TensorProto.FLOAT, ["batch", 3, 4])
-    g = helper.make_tensor_value_info("g", TensorProto.INT64, [2])
-    flat = helper.make_tensor("flat", TensorProto.INT64, [1], [-1])
-    indices = helper.make_tensor("indices", TensorProto.INT64, [2], [1, 2])
-    nodes = [
-        helper.make_node("Shape", ["x"], ["s"]),
-        helper.make_node("Reshape", ["s", "flat"], ["s2"]),
-        helper.make_node("Gather", ["s2", "indices"], ["g"], axis=0),
-    ]
-    graph = helper.make_graph(nodes, "g", [x], [g], initializer=[flat, indices])
-    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+    model = _model(
+        """
+        g (float[batch,3,4] x) => (int64[2] g)
+        <int64[1] flat = {-1}, int64[2] indices = {1, 2}>
+        {
+          s = Shape(x)
+          s2 = Reshape(s, flat)
+          g = Gather<axis=0>(s2, indices)
+        }
+        """
+    )
     onnx.checker.check_model(model)
 
     sim_model, check_ok = onnxsim.simplify(model)
@@ -351,19 +372,19 @@ def test_partial_shape_evaluation_symbolic_arithmetic_reshape():
     # sees a single symbolic entry, and materializes the shape as the constant
     # [-1, 2] -- provably equivalent since batch*384*2 == numel(x) for every
     # batch -- so the scaffolding collapses.
-    x = helper.make_tensor_value_info("x", TensorProto.FLOAT, ["batch", 768])
-    y = helper.make_tensor_value_info("y", TensorProto.FLOAT, [None, 2])
-    two = helper.make_tensor("two", TensorProto.INT64, [1], [2])
-    two2 = helper.make_tensor("two2", TensorProto.INT64, [1], [2])
-    nodes = [
-        helper.make_node("Shape", ["x"], ["s"]),
-        helper.make_node("ReduceProd", ["s"], ["total"], keepdims=1),
-        helper.make_node("Div", ["total", "two"], ["half"]),
-        helper.make_node("Concat", ["half", "two2"], ["newshape"], axis=0),
-        helper.make_node("Reshape", ["x", "newshape"], ["y"]),
-    ]
-    graph = helper.make_graph(nodes, "g", [x], [y], initializer=[two, two2])
-    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+    model = _model(
+        """
+        g (float[batch,768] x) => (float[?,2] y)
+        <int64[1] two = {2}, int64[1] two2 = {2}>
+        {
+          s = Shape(x)
+          total = ReduceProd<keepdims=1>(s)
+          half = Div(total, two)
+          newshape = Concat<axis=0>(half, two2)
+          y = Reshape(x, newshape)
+        }
+        """
+    )
     onnx.checker.check_model(model)
 
     sim_model, check_ok = onnxsim.simplify(model)
@@ -397,15 +418,16 @@ def test_unfoldable_const_node_keeps_topological_order():
     # semantically wrong for a sequence. Skipping folding keeps the sequence
     # pipeline intact so we exercise the topological ordering of the preserved
     # nodes.
-    x = helper.make_tensor_value_info("x", TensorProto.FLOAT, [2])
-    y = helper.make_tensor_value_info("y", TensorProto.FLOAT, [2])
-    nodes = [
-        helper.make_node("SequenceEmpty", [], ["seq"]),
-        helper.make_node("SequenceInsert", ["seq", "x"], ["seq2"]),
-        helper.make_node("ConcatFromSequence", ["seq2"], ["y"], axis=0, new_axis=0),
-    ]
-    graph = helper.make_graph(nodes, "g", [x], [y])
-    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+    model = _model(
+        """
+        g (float[2] x) => (float[2] y)
+        {
+          seq = SequenceEmpty()
+          seq2 = SequenceInsert(seq, x)
+          y = ConcatFromSequence<axis=0, new_axis=0>(seq2)
+        }
+        """
+    )
     onnx.checker.check_model(model)
 
     sim_model, check_ok = onnxsim.simplify(model, skip_constant_folding=True)
@@ -422,15 +444,16 @@ def test_folding_does_not_duplicate_initializers():
     # operand initializer dangling in the graph. Otherwise the weight data is
     # duplicated, which can push a large model past onnx's 2GB protobuf limit
     # before the optimizer runs (issue #174).
-    x = helper.make_tensor_value_info("x", TensorProto.FLOAT, [3, 4])
-    y = helper.make_tensor_value_info("y", TensorProto.FLOAT, [3, 4])
-    w = helper.make_tensor("w", TensorProto.FLOAT, [4, 3], list(range(12)))
-    nodes = [
-        helper.make_node("Transpose", ["w"], ["wt"], perm=[1, 0]),
-        helper.make_node("Add", ["x", "wt"], ["y"]),
-    ]
-    graph = helper.make_graph(nodes, "g", [x], [y], initializer=[w])
-    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+    model = _model(
+        """
+        g (float[3,4] x) => (float[3,4] y)
+        <float[4,3] w = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11}>
+        {
+          wt = Transpose<perm=[1, 0]>(w)
+          y = Add(x, wt)
+        }
+        """
+    )
     onnx.checker.check_model(model)
 
     # Disable the onnx optimizer so the constant folding logic alone is
@@ -461,36 +484,29 @@ def test_batched_constant_folding():
     # then added to the runtime input, and checks that every constant node is
     # folded into a single initializer and that the result stays numerically
     # correct.
-    import numpy as np
-
     n = 40
     base = np.arange(8, dtype=np.float32)
-    x = helper.make_tensor_value_info("x", TensorProto.FLOAT, [8])
-    y = helper.make_tensor_value_info("y", TensorProto.FLOAT, [8])
-    base_init = numpy_helper.from_array(base, name="base")
 
-    nodes = []
+    fanin_lines = []
     prod_names = []
     for i in range(n):
-        c_name = f"c{i}"
-        p_name = f"p{i}"
-        nodes.append(
-            helper.make_node(
-                "Constant",
-                [],
-                [c_name],
-                value=numpy_helper.from_array(
-                    np.array(float(i), dtype=np.float32), name=c_name
-                ),
-            )
-        )
-        nodes.append(helper.make_node("Mul", ["base", c_name], [p_name]))
-        prod_names.append(p_name)
-    nodes.append(helper.make_node("Sum", prod_names, ["acc"]))
-    nodes.append(helper.make_node("Add", ["x", "acc"], ["y"]))
+        fanin_lines.append(f"c{i} = Constant<value = float {{{float(i)}}}>()")
+        fanin_lines.append(f"p{i} = Mul(base, c{i})")
+        prod_names.append(f"p{i}")
+    fanin_body = "\n".join(fanin_lines)
+    base_literal = ", ".join(str(float(v)) for v in base)
 
-    graph = helper.make_graph(nodes, "g", [x], [y], initializer=[base_init])
-    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+    model = _model(
+        f"""
+        g (float[8] x) => (float[8] y)
+        <float[8] base = {{{base_literal}}}>
+        {{
+          {fanin_body}
+          acc = Sum({", ".join(prod_names)})
+          y = Add(x, acc)
+        }}
+        """
+    )
     onnx.checker.check_model(model)
 
     sim_model, check_ok = onnxsim.simplify(model, perform_optimization=False)
@@ -516,6 +532,13 @@ def test_batched_constant_folding():
         np.testing.assert_allclose(out, x_val + acc, rtol=1e-5, atol=1e-5)
 
 
+def _fp8_zero_point(name):
+    # A single float8_e4m3fn zero. The parser's text form encodes a float8
+    # tensor literal as an integer ({0}), so this needs neither raw bytes nor an
+    # ml_dtypes dependency.
+    return f"float8e4m3fn {name} = {{0}}"
+
+
 def test_fp8_qdq_model():
     # Regression test for GitHub issue #348. NVIDIA ModelOpt emits fp8 QDQ
     # models whose QuantizeLinear/DequantizeLinear zero points use the
@@ -524,43 +547,26 @@ def test_fp8_qdq_model():
     # cannot hash such tensors and used to abort the whole simplification with
     # "RuntimeError: no supported data type: 17". onnxsim now detects these
     # tensors and transparently skips the offending passes instead of crashing.
-    def fp8_zero_point(name: str) -> onnx.TensorProto:
-        # A single float8_e4m3fn zero, expressed as its raw byte so the test
-        # does not depend on ml_dtypes.
-        return helper.make_tensor(name, TensorProto.FLOAT8E4M3FN, [], b"\x00", raw=True)
-
-    weight = helper.make_tensor(
-        "W", TensorProto.FLOAT, [4, 3], [0.1 * i for i in range(12)]
+    weight_literal = ", ".join(str(0.1 * i) for i in range(12))
+    model = _model(
+        f"""
+        g (float[2,4] X) => (float[2,3] Y)
+        <float[4,3] W = {{{weight_literal}}},
+         float w_scale = {{0.05}},
+         float a_scale = {{0.1}},
+         {_fp8_zero_point("a_zp")},
+         {_fp8_zero_point("w_zp")},
+         {_fp8_zero_point("w_zp2")}>
+        {{
+          X_q = QuantizeLinear(X, a_scale, a_zp)
+          X_dq = DequantizeLinear(X_q, a_scale, a_zp)
+          W_q = QuantizeLinear(W, w_scale, w_zp)
+          W_dq = DequantizeLinear(W_q, w_scale, w_zp2)
+          Y = MatMul(X_dq, W_dq)
+        }}
+        """,
+        opset=21,
     )
-    w_scale = helper.make_tensor("w_scale", TensorProto.FLOAT, [], [0.05])
-    a_scale = helper.make_tensor("a_scale", TensorProto.FLOAT, [], [0.1])
-
-    nodes = [
-        # activation QDQ (dynamic input, must be preserved)
-        helper.make_node("QuantizeLinear", ["X", "a_scale", "a_zp"], ["X_q"]),
-        helper.make_node("DequantizeLinear", ["X_q", "a_scale", "a_zp"], ["X_dq"]),
-        # weight QDQ (constant inputs) plus a duplicated weight zero point to
-        # exercise eliminate_duplicate_initializer as well.
-        helper.make_node("QuantizeLinear", ["W", "w_scale", "w_zp"], ["W_q"]),
-        helper.make_node("DequantizeLinear", ["W_q", "w_scale", "w_zp2"], ["W_dq"]),
-        helper.make_node("MatMul", ["X_dq", "W_dq"], ["Y"]),
-    ]
-    graph = helper.make_graph(
-        nodes,
-        "fp8_qdq",
-        [helper.make_tensor_value_info("X", TensorProto.FLOAT, [2, 4])],
-        [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [2, 3])],
-        [
-            weight,
-            w_scale,
-            a_scale,
-            fp8_zero_point("a_zp"),
-            fp8_zero_point("w_zp"),
-            fp8_zero_point("w_zp2"),
-        ],
-    )
-    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 21)])
-    model.ir_version = 10
     onnx.checker.check_model(model)
 
     # Must not raise "no supported data type: 17".
@@ -584,74 +590,45 @@ def test_fp8_qdq_modelopt_integration():
     # ModelOpt-like graph -- Conv + Gemm with both activation and weight QDQ and
     # duplicated float8 zero points -- to guard that onnxsim simplifies it
     # without crashing and preserves the QDQ structure TensorRT relies on.
-    def fp8_zero_point(name: str) -> onnx.TensorProto:
-        # A single float8_e4m3fn zero as its raw byte (no ml_dtypes dependency).
-        return helper.make_tensor(name, TensorProto.FLOAT8E4M3FN, [], b"\x00", raw=True)
+    conv_idx = np.arange(8 * 3 * 3 * 3)
+    conv_w = (0.01 * (conv_idx % 7 - 3)).astype(np.float32).reshape(8, 3, 3, 3)
+    gemm_idx = np.arange(8 * 8)
+    gemm_w = (0.02 * (gemm_idx % 5 - 2)).astype(np.float32).reshape(8, 8)
 
-    conv_w = helper.make_tensor(
-        "conv_w",
-        TensorProto.FLOAT,
-        [8, 3, 3, 3],
-        [0.01 * (i % 7 - 3) for i in range(8 * 3 * 3 * 3)],
-    )
-    gemm_w = helper.make_tensor(
-        "gemm_w", TensorProto.FLOAT, [8, 8], [0.02 * (i % 5 - 2) for i in range(64)]
-    )
-    conv_ws = helper.make_tensor("conv_w_scale", TensorProto.FLOAT, [], [0.02])
-    gemm_ws = helper.make_tensor("gemm_w_scale", TensorProto.FLOAT, [], [0.03])
-    act_s = helper.make_tensor("act_scale", TensorProto.FLOAT, [], [0.1])
-    act_s2 = helper.make_tensor("act_scale2", TensorProto.FLOAT, [], [0.1])
-
-    nodes = [
-        # activation QDQ on the dynamic input -- must survive simplification.
-        helper.make_node("QuantizeLinear", ["X", "act_scale", "a_zp"], ["Xq"]),
-        helper.make_node("DequantizeLinear", ["Xq", "act_scale", "a_zp"], ["Xdq"]),
-        # weight QDQ (constant). ModelOpt duplicates fp8 zero points across
-        # weights, which is what tripped eliminate_duplicate_initializer.
-        helper.make_node(
-            "QuantizeLinear", ["conv_w", "conv_w_scale", "cw_zp"], ["cwq"]
-        ),
-        helper.make_node(
-            "DequantizeLinear", ["cwq", "conv_w_scale", "cw_zp2"], ["cwdq"]
-        ),
-        helper.make_node("Conv", ["Xdq", "cwdq"], ["conv_out"], kernel_shape=[3, 3]),
-        helper.make_node("GlobalAveragePool", ["conv_out"], ["pooled"]),
-        helper.make_node("Flatten", ["pooled"], ["flat"], axis=1),
-        # second activation QDQ + weight QDQ feeding a Gemm.
-        helper.make_node("QuantizeLinear", ["flat", "act_scale2", "a_zp2"], ["flatq"]),
-        helper.make_node(
-            "DequantizeLinear", ["flatq", "act_scale2", "a_zp2"], ["flatdq"]
-        ),
-        helper.make_node(
-            "QuantizeLinear", ["gemm_w", "gemm_w_scale", "gw_zp"], ["gwq"]
-        ),
-        helper.make_node(
-            "DequantizeLinear", ["gwq", "gemm_w_scale", "gw_zp2"], ["gwdq"]
-        ),
-        helper.make_node("Gemm", ["flatdq", "gwdq"], ["Y"], transB=1),
-    ]
-    graph = helper.make_graph(
-        nodes,
-        "modelopt_fp8_qdq",
-        [helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, 3, 6, 6])],
-        [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, 8])],
-        [
-            conv_w,
-            gemm_w,
-            conv_ws,
-            gemm_ws,
-            act_s,
-            act_s2,
-            fp8_zero_point("a_zp"),
-            fp8_zero_point("a_zp2"),
-            fp8_zero_point("cw_zp"),
-            fp8_zero_point("cw_zp2"),
-            fp8_zero_point("gw_zp"),
-            fp8_zero_point("gw_zp2"),
+    model = _model(
+        f"""
+        g (float[1,3,6,6] X) => (float[1,8] Y)
+        <float conv_w_scale = {{0.02}},
+         float gemm_w_scale = {{0.03}},
+         float act_scale = {{0.1}},
+         float act_scale2 = {{0.1}},
+         {_fp8_zero_point("a_zp")},
+         {_fp8_zero_point("a_zp2")},
+         {_fp8_zero_point("cw_zp")},
+         {_fp8_zero_point("cw_zp2")},
+         {_fp8_zero_point("gw_zp")},
+         {_fp8_zero_point("gw_zp2")}>
+        {{
+          Xq = QuantizeLinear(X, act_scale, a_zp)
+          Xdq = DequantizeLinear(Xq, act_scale, a_zp)
+          cwq = QuantizeLinear(conv_w, conv_w_scale, cw_zp)
+          cwdq = DequantizeLinear(cwq, conv_w_scale, cw_zp2)
+          conv_out = Conv<kernel_shape=[3, 3]>(Xdq, cwdq)
+          pooled = GlobalAveragePool(conv_out)
+          flat = Flatten<axis=1>(pooled)
+          flatq = QuantizeLinear(flat, act_scale2, a_zp2)
+          flatdq = DequantizeLinear(flatq, act_scale2, a_zp2)
+          gwq = QuantizeLinear(gemm_w, gemm_w_scale, gw_zp)
+          gwdq = DequantizeLinear(gwq, gemm_w_scale, gw_zp2)
+          Y = Gemm<transB=1>(flatdq, gwdq)
+        }}
+        """,
+        initializer=[
+            numpy_helper.from_array(conv_w, "conv_w"),
+            numpy_helper.from_array(gemm_w, "gemm_w"),
         ],
+        opset=21,
     )
-    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 21)])
-    model.ir_version = 10
     onnx.checker.check_model(model)
 
     # ModelOpt's exact former call shape. Must not raise "no supported data
@@ -678,6 +655,9 @@ def test_if_with_const_cond_is_folded():
     # output was now an initializer with no producing node). With the fixed pass
     # the `If` is folded away and its output becomes the taken branch's constant
     # (GitHub issue #452).
+    #
+    # onnx.parser's text format has no syntax for GRAPH-typed attributes
+    # (then_branch/else_branch), so this stays on onnx.helper construction.
     tv = helper.make_tensor("tv", TensorProto.FLOAT, [2], [1.0, 2.0])
     fv = helper.make_tensor("fv", TensorProto.FLOAT, [2], [3.0, 4.0])
     then_b = helper.make_graph(
@@ -741,6 +721,466 @@ def test_if_with_const_cond_is_folded():
     assert out.tolist() == [1.0, 2.0]
 
 
+def test_loop_with_const_trip_count_is_unrolled():
+    # A `Loop` with a compile-time-constant trip count and no break condition
+    # -- the shape emitted for a plain Python `for i in range(N): ...` with no
+    # `break` -- is unrolled into N copies of its body by the onnxoptimizer
+    # "eliminate_loop_with_const_trip_count" pass. This matters for
+    # downstream compilers that don't support `Loop` at all (e.g. TVM's Relax
+    # ONNX frontend, see docs/dlpack-executor.md).
+    #
+    # onnx.parser's text format has no syntax for GRAPH-typed attributes (the
+    # Loop `body`), so this stays on onnx.helper construction.
+    step = helper.make_tensor("step", TensorProto.FLOAT, [2], [1.0, 1.0])
+    body = helper.make_graph(
+        [helper.make_node("Add", ["v_in", "step"], ["v_out"])],
+        "loop_body",
+        [
+            helper.make_tensor_value_info("iter", TensorProto.INT64, []),
+            helper.make_tensor_value_info("cond_in", TensorProto.BOOL, []),
+            helper.make_tensor_value_info("v_in", TensorProto.FLOAT, [2]),
+        ],
+        [
+            # cond_out: a direct passthrough of cond_in (never actually
+            # computed, since the outer Loop's `cond` input is omitted below).
+            helper.make_tensor_value_info("cond_in", TensorProto.BOOL, []),
+            helper.make_tensor_value_info("v_out", TensorProto.FLOAT, [2]),
+        ],
+        [step],
+    )
+    trip_count = helper.make_tensor("trip_count", TensorProto.INT64, [], [3])
+    loop_node = helper.make_node("Loop", ["trip_count", "", "x"], ["y"], body=body)
+    graph = helper.make_graph(
+        [loop_node],
+        "g",
+        [helper.make_tensor_value_info("x", TensorProto.FLOAT, [2])],
+        [helper.make_tensor_value_info("y", TensorProto.FLOAT, [2])],
+        [trip_count],
+    )
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+    onnx.checker.check_model(model)
+
+    sim_model, check_ok = onnxsim.simplify(model)
+    assert check_ok
+    onnx.checker.check_model(sim_model)
+    # The Loop must be gone, unrolled into three Adds (onnxsim's own constant
+    # folding may further fuse/fold these, so check for absence of Loop
+    # rather than an exact Add count).
+    assert all(n.op_type != "Loop" for n in sim_model.graph.node)
+
+
+def test_sequence_at_construct_is_folded():
+    # `SequenceAt(SequenceConstruct(a, b, c), i)` with a constant index -- a
+    # common PyTorch-export artifact for indexing a fixed-size Python list of
+    # tensors -- folds straight to the indexed tensor, dropping the Sequence
+    # type entirely. Downstream compilers (e.g. TVM's Relax ONNX frontend)
+    # generally have little to no support for Sequence.
+    model = _model(
+        """
+        g (float[2] a, float[2] b, float[2] c) => (float[2] y)
+        <int64 idx = {1}>
+        {
+          seq = SequenceConstruct(a, b, c)
+          y = SequenceAt(seq, idx)
+        }
+        """
+    )
+    onnx.checker.check_model(model)
+
+    sim_model, check_ok = onnxsim.simplify(model)
+    assert check_ok
+    onnx.checker.check_model(sim_model)
+    assert all(
+        n.op_type not in ("Sequence", "SequenceConstruct", "SequenceAt")
+        for n in sim_model.graph.node
+    )
+
+
+def test_sequence_length_construct_folds_and_unrolls_loop():
+    # `SequenceLength(SequenceConstruct(...))` folds to a constant, which is
+    # exactly what a `for i in range(len(some_list)): ...` loop exports as: a
+    # Sequence feeding a Loop's trip count. Folding SequenceLength lets
+    # eliminate_loop_with_const_trip_count unroll the Loop in turn, so the
+    # whole pattern collapses to plain feed-forward ops.
+    #
+    # onnx.parser's text format has no syntax for GRAPH-typed attributes (the
+    # Loop `body`), so this stays on onnx.helper construction.
+    a = helper.make_tensor_value_info("a", TensorProto.FLOAT, [2])
+    b = helper.make_tensor_value_info("b", TensorProto.FLOAT, [2])
+    c = helper.make_tensor_value_info("c", TensorProto.FLOAT, [2])
+    seq = helper.make_node("SequenceConstruct", ["a", "b", "c"], ["seq"])
+    length = helper.make_node("SequenceLength", ["seq"], ["n"])
+
+    step = helper.make_tensor("step", TensorProto.FLOAT, [2], [1.0, 1.0])
+    body = helper.make_graph(
+        [helper.make_node("Add", ["v_in", "step"], ["v_out"])],
+        "loop_body",
+        [
+            helper.make_tensor_value_info("iter", TensorProto.INT64, []),
+            helper.make_tensor_value_info("cond_in", TensorProto.BOOL, []),
+            helper.make_tensor_value_info("v_in", TensorProto.FLOAT, [2]),
+        ],
+        [
+            helper.make_tensor_value_info("cond_in", TensorProto.BOOL, []),
+            helper.make_tensor_value_info("v_out", TensorProto.FLOAT, [2]),
+        ],
+        [step],
+    )
+    loop_node = helper.make_node("Loop", ["n", "", "x"], ["y"], body=body)
+    graph = helper.make_graph(
+        [seq, length, loop_node],
+        "g",
+        [a, b, c, helper.make_tensor_value_info("x", TensorProto.FLOAT, [2])],
+        [helper.make_tensor_value_info("y", TensorProto.FLOAT, [2])],
+        [],
+    )
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+    onnx.checker.check_model(model)
+
+    sim_model, check_ok = onnxsim.simplify(model)
+    assert check_ok
+    onnx.checker.check_model(sim_model)
+    op_types = [n.op_type for n in sim_model.graph.node]
+    assert "Loop" not in op_types
+    assert "SequenceConstruct" not in op_types
+    assert "SequenceLength" not in op_types
+
+
+def test_optional_get_element_of_optional_is_folded():
+    # `OptionalGetElement(Optional(x))` -- a common `torch.jit.script`-export
+    # artifact for an `Optional[Tensor]` argument that is known to be present
+    # -- folds straight to `x`, dropping the Optional type entirely. Most
+    # ONNX consumers (this includes compilers such as TVM's Relax ONNX
+    # frontend) have little to no support for the Optional type.
+    model = _model(
+        """
+        g (float[2] x) => (float[2] y)
+        {
+          opt = Optional(x)
+          y = OptionalGetElement(opt)
+        }
+        """,
+        opset=18,
+    )
+    onnx.checker.check_model(model)
+
+    sim_model, check_ok = onnxsim.simplify(model)
+    assert check_ok
+    onnx.checker.check_model(sim_model)
+    op_types = [n.op_type for n in sim_model.graph.node]
+    assert "Optional" not in op_types
+    assert "OptionalGetElement" not in op_types
+
+
+def test_optional_has_element_is_folded():
+    # `OptionalHasElement` folds to a constant bool whenever its emptiness is
+    # already known: true for `Optional(x)`, false for an explicitly-empty
+    # `Optional()` and for the op's own input being omitted entirely.
+    #
+    # onnx.parser's text format has no syntax for TYPE_PROTO-typed node
+    # attributes (the explicit `type` on the empty `Optional`), so this stays
+    # on onnx.helper construction.
+    x = helper.make_tensor_value_info("x", TensorProto.FLOAT, [2])
+    opt = helper.make_node("Optional", ["x"], ["opt"])
+    opt_empty = helper.make_node(
+        "Optional",
+        [],
+        ["opt_empty"],
+        type=helper.make_tensor_type_proto(TensorProto.FLOAT, [2]),
+    )
+    has_present = helper.make_node("OptionalHasElement", ["opt"], ["h_present"])
+    has_empty = helper.make_node("OptionalHasElement", ["opt_empty"], ["h_empty"])
+    has_no_input = helper.make_node("OptionalHasElement", [], ["h_no_input"])
+    graph = helper.make_graph(
+        [opt, opt_empty, has_present, has_empty, has_no_input],
+        "g",
+        [x],
+        [
+            helper.make_tensor_value_info("h_present", TensorProto.BOOL, []),
+            helper.make_tensor_value_info("h_empty", TensorProto.BOOL, []),
+            helper.make_tensor_value_info("h_no_input", TensorProto.BOOL, []),
+        ],
+    )
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 18)])
+    onnx.checker.check_model(model)
+
+    sim_model, check_ok = onnxsim.simplify(model, check_n=0)
+    assert check_ok
+    onnx.checker.check_model(sim_model)
+    assert all(n.op_type != "OptionalHasElement" for n in sim_model.graph.node)
+
+    values = {}
+    for init in sim_model.graph.initializer:
+        values[init.name] = numpy_helper.to_array(init)
+    for node in sim_model.graph.node:
+        if node.op_type == "Constant":
+            (attr,) = [a for a in node.attribute if a.name == "value"]
+            values[node.output[0]] = numpy_helper.to_array(attr.t)
+
+    out_names = [o.name for o in sim_model.graph.output]
+    assert bool(values[out_names[0]]) is True  # h_present
+    assert bool(values[out_names[1]]) is False  # h_empty
+    assert bool(values[out_names[2]]) is False  # h_no_input
+
+
+def test_arg_reduce_select_last_index_is_rewritten():
+    # `select_last_index=1` (added at opset 12) isn't implemented by some
+    # downstream ONNX consumers (e.g. TVM's Relax ONNX frontend). It's
+    # rewritten to an equivalent computation over `Shape`/`Gather`/`Slice`/
+    # `Sub`/`ArgMax` that never needs the attribute: flip the axis, take the
+    # *first* occurrence there (select_last_index's own default), and map
+    # the index back through the flip.
+    model = _model(
+        """
+        g (float[4] x) => (int64[1] y)
+        {
+          y = ArgMax<axis=0, keepdims=1, select_last_index=1>(x)
+        }
+        """
+    )
+    onnx.checker.check_model(model)
+
+    sim_model, check_ok = onnxsim.simplify(model, check_n=0)
+    assert check_ok
+    onnx.checker.check_model(sim_model)
+    op_types = [n.op_type for n in sim_model.graph.node]
+    assert "ArgMax" in op_types  # rewritten, not eliminated
+    for node in sim_model.graph.node:
+        if node.op_type == "ArgMax":
+            select_last_index = [
+                a.i for a in node.attribute if a.name == "select_last_index"
+            ]
+            # Absent (defaults to 0) or explicitly reset to 0 -- either is
+            # fine, since the rewrite compensates by flipping the axis.
+            assert not select_last_index or select_last_index[0] == 0
+
+    # Numeric check on inputs with ties, where select_last_index actually
+    # changes the result relative to the default (first-occurrence) index.
+    sess_orig = onnxruntime.InferenceSession(
+        model.SerializeToString(), providers=["CPUExecutionProvider"]
+    )
+    sess_sim = onnxruntime.InferenceSession(
+        sim_model.SerializeToString(), providers=["CPUExecutionProvider"]
+    )
+    for v in (
+        np.array([3, 5, 5, 2], dtype=np.float32),
+        np.array([4, 4, 4, 4], dtype=np.float32),
+        np.array([1, 2, 3, 4], dtype=np.float32),
+    ):
+        orig_out = sess_orig.run(None, {"x": v})[0]
+        sim_out = sess_sim.run(None, {"x": v})[0]
+        assert np.array_equal(orig_out, sim_out)
+
+
+def _einsum_matmul_model():
+    model = _model(
+        """
+        g (float[2,3] x, float[3,4] y) => (float[2,4] z)
+        {
+          z = Einsum<equation="ij,jk->ik">(x, y)
+        }
+        """
+    )
+    onnx.checker.check_model(model)
+    return model
+
+
+def test_extra_optimizers_opts_into_an_off_by_default_pass():
+    # extra_optimizers is the counterpart to skipped_optimizers: it runs a
+    # named pass in addition to the default fuse/elimination set.
+    # replace_einsum_with_matmul is a real onnx-optimizer pass that is not
+    # part of that default set (confirmed via the second assertion below), so
+    # it only fires when named explicitly.
+    model = _einsum_matmul_model()
+
+    sim_default, ok_default = onnxsim.simplify(model, check_n=0)
+    assert ok_default
+    assert [n.op_type for n in sim_default.graph.node] == ["Einsum"]
+
+    from onnxsim.onnx_simplifier import C
+
+    assert "replace_einsum_with_matmul" not in C._list_optimizers()
+    assert "replace_einsum_with_matmul" in C._list_other_optimizers()
+
+    sim_extra, ok_extra = onnxsim.simplify(
+        model, check_n=0, extra_optimizers=["replace_einsum_with_matmul"]
+    )
+    assert ok_extra
+    assert [n.op_type for n in sim_extra.graph.node] == ["MatMul"]
+
+
+def test_extra_optimizers_unknown_name_raises():
+    model = _einsum_matmul_model()
+    with pytest.raises(Exception):
+        onnxsim.simplify(model, check_n=0, extra_optimizers=["not_a_real_pass"])
+
+
+def test_extra_optimizers_has_no_effect_when_optimization_disabled():
+    # perform_optimization=False means skipped_optimizers=None internally,
+    # which already disables the whole default pass set; extra_optimizers is
+    # documented to have no effect in that case either.
+    model = _einsum_matmul_model()
+    sim, ok = onnxsim.simplify(
+        model,
+        check_n=0,
+        perform_optimization=False,
+        extra_optimizers=["replace_einsum_with_matmul"],
+    )
+    assert ok
+    assert [n.op_type for n in sim.graph.node] == ["Einsum"]
+
+
+def _matmul_weight_data():
+    return [
+        1.0,
+        -2.0,
+        0.5,
+        3.0,
+        0.25,
+        -1.5,
+        -0.75,
+        2.5,
+        1.0,
+        0.1,
+        -0.2,
+        4.0,
+    ]  # [4, 3]
+
+
+def _matmul_model():
+    weight_literal = ", ".join(str(v) for v in _matmul_weight_data())
+    model = _model(
+        f"""
+        g (float[2,4] x) => (float[2,3] y)
+        <float[4,3] w = {{{weight_literal}}}>
+        {{
+          y = MatMul(x, w)
+        }}
+        """
+    )
+    onnx.checker.check_model(model)
+    return model
+
+
+def _gemm_with_bias_model():
+    weight_literal = ", ".join(str(v) for v in _matmul_weight_data())
+    model = _model(
+        f"""
+        g (float[2,4] x) => (float[2,3] y)
+        <float[4,3] w = {{{weight_literal}}}, float[3] b = {{0.1, -0.2, 0.3}}>
+        {{
+          y = Gemm(x, w, b)
+        }}
+        """
+    )
+    onnx.checker.check_model(model)
+    return model
+
+
+def _matmul_test_input():
+    return np.array([[1.0, 2.0, 3.0, 4.0], [0.5, -1.0, 2.0, -3.0]], dtype=np.float32)
+
+
+def test_defuse_matmul_integer_to_float_undoes_dynamic_quantize_matmul():
+    # defuse_matmul_integer_to_float is the exact inverse of
+    # dynamic_quantize_matmul: it folds the DynamicQuantizeLinear +
+    # MatMulInteger + Cast + Mul + Mul chain that pass builds back into a
+    # single plain MatMul, for consumers that cannot import the quantized
+    # ops at all. Both passes are PassType::Other, off by default.
+    from onnxsim.onnx_simplifier import C
+
+    model = _matmul_model()
+
+    assert "dynamic_quantize_matmul" not in C._list_optimizers()
+    assert "dynamic_quantize_matmul" in C._list_other_optimizers()
+    assert "defuse_matmul_integer_to_float" not in C._list_optimizers()
+    assert "defuse_matmul_integer_to_float" in C._list_other_optimizers()
+
+    sim_q, ok_q = onnxsim.simplify(
+        model, check_n=0, extra_optimizers=["dynamic_quantize_matmul"]
+    )
+    assert ok_q
+    assert set(n.op_type for n in sim_q.graph.node) == {
+        "DynamicQuantizeLinear",
+        "MatMulInteger",
+        "Cast",
+        "Mul",
+    }
+
+    sim_d, ok_d = onnxsim.simplify(
+        sim_q, check_n=0, extra_optimizers=["defuse_matmul_integer_to_float"]
+    )
+    assert ok_d
+    assert [n.op_type for n in sim_d.graph.node] == ["MatMul"]
+
+    sess_orig = onnxruntime.InferenceSession(model.SerializeToString())
+    sess_defused = onnxruntime.InferenceSession(sim_d.SerializeToString())
+    x = _matmul_test_input()
+    y_orig = sess_orig.run(None, {"x": x})[0]
+    y_defused = sess_defused.run(None, {"x": x})[0]
+    # Only W went through lossy INT8 quantization (X stays float, unlike the
+    # actual quantized graph), so this should be close, not bitwise equal.
+    np.testing.assert_allclose(y_defused, y_orig, atol=0.05)
+
+
+def test_defuse_matmul_integer_to_float_with_bias():
+    from onnxsim.onnx_simplifier import C
+
+    model = _gemm_with_bias_model()
+
+    # The forward pass's Gemm(+bias) handling, combined with the full default
+    # pass set, has an unrelated pre-existing flakiness on some weight
+    # values; run it alone (skip every default pass) to build a
+    # deterministic quantized fixture.
+    sim_q, ok_q = onnxsim.simplify(
+        model,
+        check_n=0,
+        skipped_optimizers=list(C._list_optimizers()),
+        extra_optimizers=["dynamic_quantize_matmul"],
+    )
+    assert ok_q
+    assert "Add" in [n.op_type for n in sim_q.graph.node]
+
+    sim_d, ok_d = onnxsim.simplify(
+        sim_q, check_n=0, extra_optimizers=["defuse_matmul_integer_to_float"]
+    )
+    assert ok_d
+    # The default pass set is still active alongside the extra one, so the
+    # MatMul + Add(bias) this pass emits is immediately re-fused into a
+    # single Gemm by fuse_matmul_add_bias_into_gemm -- also a correct
+    # result, just a more idiomatic one.
+    assert [n.op_type for n in sim_d.graph.node] == ["Gemm"]
+
+    sess_orig = onnxruntime.InferenceSession(model.SerializeToString())
+    sess_defused = onnxruntime.InferenceSession(sim_d.SerializeToString())
+    x = _matmul_test_input()
+    y_orig = sess_orig.run(None, {"x": x})[0]
+    y_defused = sess_defused.run(None, {"x": x})[0]
+    np.testing.assert_allclose(y_defused, y_orig, atol=0.05)
+
+
+def test_defuse_matmul_integer_to_float_is_off_by_default():
+    model = _matmul_model()
+    sim_q, ok_q = onnxsim.simplify(
+        model, check_n=0, extra_optimizers=["dynamic_quantize_matmul"]
+    )
+    assert ok_q
+    quantized_ops = set(n.op_type for n in sim_q.graph.node)
+
+    sim_default, ok_default = onnxsim.simplify(sim_q, check_n=0)
+    assert ok_default
+    assert set(n.op_type for n in sim_default.graph.node) == quantized_ops
+
+
+def test_defuse_matmul_integer_to_float_leaves_plain_matmul_alone():
+    model = _matmul_model()
+    sim, ok = onnxsim.simplify(
+        model, check_n=0, extra_optimizers=["defuse_matmul_integer_to_float"]
+    )
+    assert ok
+    assert [n.op_type for n in sim.graph.node] == ["MatMul"]
+
+
 def test_ir3_conv_bn_fuses():
     # IR version 3 models (e.g. the opset-8 ``resnet101-v1-7``) list every
     # initializer as a graph input too, which is required before IR 4. onnxsim
@@ -749,39 +1189,34 @@ def test_ir3_conv_bn_fuses():
     # ``fuse_bn_into_conv`` never fired and the graph came out unchanged
     # (GitHub issue #543). onnxsim now bumps these to IR 4 and drops the
     # initializer inputs, so the Conv+BN pair fuses away.
-    import numpy as np
-
     out_ch, in_ch = 4, 3
     W = np.random.randn(out_ch, in_ch, 3, 3).astype(np.float32)
     scale = np.abs(np.random.randn(out_ch).astype(np.float32)) + 1
     bias = np.random.randn(out_ch).astype(np.float32)
     mean = np.random.randn(out_ch).astype(np.float32)
     var = np.abs(np.random.randn(out_ch).astype(np.float32)) + 1
-    inits = [
-        numpy_helper.from_array(W, "W"),
-        numpy_helper.from_array(scale, "scale"),
-        numpy_helper.from_array(bias, "bias"),
-        numpy_helper.from_array(mean, "mean"),
-        numpy_helper.from_array(var, "var"),
-    ]
-    conv = helper.make_node("Conv", ["X", "W"], ["conv_out"])
-    bn = helper.make_node(
-        "BatchNormalization", ["conv_out", "scale", "bias", "mean", "var"], ["Y"]
-    )
-    graph = helper.make_graph(
-        [conv, bn],
-        "g",
-        # Initializers are *also* listed as graph inputs, as IR<4 requires.
-        [helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, in_ch, 8, 8])]
-        + [
-            helper.make_tensor_value_info(t.name, TensorProto.FLOAT, t.dims)
-            for t in inits
+
+    # Initializers are *also* listed as graph inputs, as IR<4 requires.
+    model = _model(
+        f"""
+        g (float[1,{in_ch},8,8] X, float[{out_ch},{in_ch},3,3] W,
+           float[{out_ch}] scale, float[{out_ch}] bias, float[{out_ch}] mean,
+           float[{out_ch}] var) => (float[1,{out_ch},6,6] Y)
+        {{
+          conv_out = Conv(X, W)
+          Y = BatchNormalization(conv_out, scale, bias, mean, var)
+        }}
+        """,
+        initializer=[
+            numpy_helper.from_array(W, "W"),
+            numpy_helper.from_array(scale, "scale"),
+            numpy_helper.from_array(bias, "bias"),
+            numpy_helper.from_array(mean, "mean"),
+            numpy_helper.from_array(var, "var"),
         ],
-        [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, out_ch, 6, 6])],
-        inits,
+        opset=8,
+        ir_version=3,
     )
-    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 8)])
-    model.ir_version = 3
     onnx.checker.check_model(model)
 
     sim_model, check_ok = onnxsim.simplify(model)
@@ -795,22 +1230,18 @@ def test_ir3_conv_bn_fuses():
 def _ir3_matmul_model(opset: int) -> onnx.ModelProto:
     # A minimal IR-3 model whose weight ``W`` is *also* listed as a graph input,
     # as IR<4 required. ``opset`` selects the ai.onnx version under test.
-    import numpy as np
-
-    W = numpy_helper.from_array(np.ones((2, 2), dtype=np.float32), "W")
-    graph = helper.make_graph(
-        [helper.make_node("MatMul", ["X", "W"], ["Y"])],
-        "g",
-        [
-            helper.make_tensor_value_info("X", TensorProto.FLOAT, [2, 2]),
-            helper.make_tensor_value_info("W", TensorProto.FLOAT, [2, 2]),
-        ],
-        [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [2, 2])],
-        [W],
+    W = np.ones((2, 2), dtype=np.float32)
+    return _model(
+        """
+        g (float[2,2] X, float[2,2] W) => (float[2,2] Y)
+        {
+          Y = MatMul(X, W)
+        }
+        """,
+        initializer=[numpy_helper.from_array(W, "W")],
+        opset=opset,
+        ir_version=3,
     )
-    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", opset)])
-    model.ir_version = 3
-    return model
 
 
 def test_remove_initializer_from_input_skips_ancient_opset():

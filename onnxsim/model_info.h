@@ -5,6 +5,8 @@
 #include <cstdint>
 #include <map>
 #include <string>
+#include <utility>
+#include <vector>
 
 #include "model_metrics.h"
 
@@ -79,3 +81,92 @@ void AnnotateModelInfo(onnx::ModelProto& model);
 // ends with a newline.
 std::string FormatSimplifyingInfo(const onnx::ModelProto& model_ori,
                                   const onnx::ModelProto& model_opt);
+
+// A node's identity for diffing (see ``DiffGraphs``): enough to describe it on
+// a diff line, not the full ``NodeProto`` -- attributes are not compared, so a
+// node whose only change is an attribute value is not reported as "changed".
+struct NodeDiffEntry {
+  std::string op_type;
+  std::string name;
+  std::vector<std::string> inputs;
+  std::vector<std::string> outputs;
+};
+
+// Node- and value-level diff between an original and simplified graph (see
+// ``DiffGraphs``), the C++ counterpart of the Python ``model_info.GraphDiff``
+// (used by onnxsim's non-Python bindings: the CLI binary, the C ABI / Rust
+// wrapper, and the WASM converter).
+struct GraphDiff {
+  std::vector<NodeDiffEntry> removed_nodes;
+  std::vector<NodeDiffEntry> added_nodes;
+  // (before, after) pairs that produce the same output(s) but whose op_type or
+  // inputs changed, e.g. a Conv whose bias input was folded away.
+  std::vector<std::pair<NodeDiffEntry, NodeDiffEntry>> changed_nodes;
+  std::vector<std::string> removed_values;
+  std::vector<std::string> added_values;
+};
+
+// Diff ``model_ori``'s top-level graph against ``model_opt``'s, matched by
+// name rather than position, so the result reflects what simplification
+// actually did to named values instead of a meaningless positional diff.
+//
+// Nodes are matched by their output tensor name(s) -- unique within a graph by
+// the ONNX spec, and the identity a downstream consumer actually depends on --
+// so a node is reported as "changed" (rather than removed + added) only when
+// simplification kept the same output name(s) but altered the op_type or
+// inputs. This is precisely why onnxsim tries to preserve value names across
+// simplification passes where possible: it is what keeps this diff (and any
+// other name-keyed tooling) meaningful instead of turning every fused/folded
+// node into an unrelated remove+add pair.
+//
+// Only the top-level graph is compared -- nodes inside control-flow subgraphs
+// (If/Loop/Scan bodies) are not matched across models, since names are only
+// required to be unique within their own graph scope.
+GraphDiff DiffGraphs(const onnx::ModelProto& model_ori,
+                     const onnx::ModelProto& model_opt);
+
+// Render the node- and value-level diff between ``model_ori`` and
+// ``model_opt`` (see ``DiffGraphs``) as plain ASCII text, in a unified-diff
+// style: ``-`` for what simplification removed, ``+`` for what it added, ``~``
+// for a node kept under the same output name(s) but changed. Each section is
+// capped at ``limit`` entries (with a "... and N more" line) so a large
+// model's diff stays readable. The returned string ends with a newline.
+std::string FormatGraphDiff(const onnx::ModelProto& model_ori,
+                            const onnx::ModelProto& model_opt,
+                            size_t limit = 50);
+
+// Records a summary of what simplification changed structurally between
+// ``model_ori`` and ``sim_model`` -- nodes removed by fusion/elimination,
+// nodes changed in place under the same output name(s) (see ``DiffGraphs``),
+// values that disappeared, and how many nodes' ``doc_string`` did not survive
+// (as a plain count: see ``CountDroppedDocStrings``'s doc comment for why a
+// capped list doesn't make sense for free-form prose) -- as ``metadata_props``
+// on ``sim_model``, namespaced "onnxsim." like the rest of onnxsim's own
+// metadata (``AnnotateModelInfo``, ``RecordSimplifyOptionsMetadata``). This
+// persists the same diff ``FormatGraphDiff`` renders as a CLI report onto the
+// model itself, so a downstream consumer can see what was lost to
+// fusion/constant folding without needing the original model on hand. Each
+// list is capped at ``limit`` entries (with a paired ``*.count`` key holding
+// the true total) to keep the metadata compact on large graphs.
+void RecordSimplifyDiffMetadata(onnx::ModelProto& sim_model,
+                                const onnx::ModelProto& model_ori,
+                                size_t limit = 20);
+
+// Joins up to `limit` entries of `items` with ", ", appending a "... (+N
+// more)" marker when there were more -- a single-line summary suitable for
+// one metadata_props value (as opposed to ``FormatGraphDiff``'s multi-line
+// report). Shared by ``RecordSimplifyDiffMetadata`` above and by other
+// metadata-recording call sites (e.g. onnxsim.cpp's node-naming and
+// function-inlining metadata) that need the same "capped list, one line"
+// shape.
+std::string JoinCapped(const std::vector<std::string>& items, size_t limit);
+
+// Writes ``key`` (``JoinCapped(items, limit)``) and ``key + ".count"``
+// (``items.size()``, uncapped) into ``model``'s metadata_props, overwriting
+// any existing entries under those two keys. This is the common "capped
+// list plus its true count" shape used by every list-valued onnxsim.*
+// metadata entry -- ``RecordSimplifyDiffMetadata``'s three categories below,
+// and onnxsim.cpp's own node-naming / function-inlining metadata.
+void RecordCappedListMetadata(onnx::ModelProto& model, const std::string& key,
+                              const std::vector<std::string>& items,
+                              size_t limit);

@@ -8,12 +8,12 @@ repository.workspace = true
 homepage.workspace = true
 authors.workspace = true
 rust-version.workspace = true
-readme = "README.md"
+readme = "../README.md"
 categories = ["api-bindings", "science"]
 keywords = ["onnx", "onnxsim", "simplifier", "machine-learning", "inference"]
 
 [dependencies]
-onnxsim-sys = { path = "../onnxsim-sys", version = "0.1.0" }
+onnxsim-sys = { path = "../onnxsim-sys", version = "0.7.3" }
 
 [package.metadata.docs.rs]
 # docs.rs cannot build the native ONNX Runtime stack; skip it and just render docs.

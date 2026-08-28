@@ -9,14 +9,21 @@
 #include <nanobind/stl/shared_ptr.h>
 #include <nanobind/stl/string.h>
 #include <nanobind/stl/tuple.h>
+#include <nanobind/stl/unordered_map.h>
 #include <nanobind/stl/vector.h>
 #include <nanobind/trampoline.h>
 
 #include <algorithm>
+#include <cmath>
+#include <cstdint>
+#include <optional>
 #include <string>
 #include <tuple>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
+#include "custom_optimizer_passes.h"
 #include "dlpack_bridge.h"
 #include "function_rewriter.h"
 #include "model_info.h"
@@ -25,6 +32,10 @@
 #include "onnx/proto_utils.h"
 #include "onnxoptimizer/optimize.h"
 #include "onnxsim.h"
+#include "precision_estimator.h"
+#include "tensor_pool.h"
+#include "tensor_pool_bridge.h"
+#include "tensor_pool_gguf_bridge.h"
 
 namespace py = nanobind;
 using namespace nanobind::literals;
@@ -328,9 +339,8 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
         const ModelInfo info = GetModelInfo(model, run_shape_inference);
         auto to_poly = [](const onnxsim::SymExpr& expr) {
           std::vector<std::pair<int64_t, std::vector<std::string>>> poly;
-          for (const auto& [monomial, coeff] : expr.terms()) {
+          for (const auto& [monomial, coeff] : expr.terms())
             poly.emplace_back(coeff, monomial);
-          }
           return poly;
         };
         return std::make_tuple(info.op_nums, info.model_size,
@@ -338,6 +348,682 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
                                to_poly(info.memory_footprint));
       },
       "model_bytes"_a, "run_shape_inference"_a = true);
+
+  // Data-free Cross-Layer Equalization preprocessing (not itself a
+  // quantization scheme) -- see CrossLayerEqualize in onnxsim.h. Pure graph
+  // rewrite: no ModelExecutor or calibration data needed.
+  m.def(
+      "cross_layer_equalize",
+      [](const py::bytes& model_proto_bytes) -> py::bytes {
+        InitEnv();
+        ONNX_NAMESPACE::ModelProto model;
+        ParseProtoFromBytes(&model, model_proto_bytes.c_str(),
+                            model_proto_bytes.size());
+        const auto result = CrossLayerEqualize(model);
+        std::string out;
+        result.SerializeToString(&out);
+        return py::bytes(out.data(), out.size());
+      },
+      "model_bytes"_a);
+
+  // Dynamically quantizes MatMul/Gemm weights to INT8 (per output channel,
+  // symmetric) and activations to uint8 at runtime via DynamicQuantizeLinear
+  // -- see QuantizeDynamic in onnxsim.h. Pure graph rewrite: no ModelExecutor
+  // or calibration data needed.
+  m.def(
+      "quantize_dynamic",
+      [](const py::bytes& model_proto_bytes) -> py::bytes {
+        InitEnv();
+        ONNX_NAMESPACE::ModelProto model;
+        ParseProtoFromBytes(&model, model_proto_bytes.c_str(),
+                            model_proto_bytes.size());
+        const auto result = QuantizeDynamic(model);
+        std::string out;
+        result.SerializeToString(&out);
+        return py::bytes(out.data(), out.size());
+      },
+      "model_bytes"_a);
+
+  // Same rewrite as quantize_dynamic, but the dequantize step is a single
+  // ONNX Runtime "com.microsoft" contrib op (MatMulIntegerToFloat) instead
+  // of quantize_dynamic's separate MatMulInteger+Cast+Mul(+Add) node chain
+  // -- see QuantizeDynamicMatMulIntegerToFloat in onnxsim.h. Pure graph
+  // rewrite: no ModelExecutor or calibration data needed.
+  m.def(
+      "quantize_dynamic_matmul_integer_to_float",
+      [](const py::bytes& model_proto_bytes) -> py::bytes {
+        InitEnv();
+        ONNX_NAMESPACE::ModelProto model;
+        ParseProtoFromBytes(&model, model_proto_bytes.c_str(),
+                            model_proto_bytes.size());
+        const auto result = QuantizeDynamicMatMulIntegerToFloat(model);
+        std::string out;
+        result.SerializeToString(&out);
+        return py::bytes(out.data(), out.size());
+      },
+      "model_bytes"_a);
+
+  // Dynamically quantizes an existing "com.microsoft" Attention node (see
+  // fuse_attention.h -- this does not fuse attention itself) into its
+  // quantized counterpart, QAttention -- see QuantizeAttentionDynamic in
+  // onnxsim.h. Pure graph rewrite: no ModelExecutor or calibration data
+  // needed.
+  m.def(
+      "quantize_attention_dynamic",
+      [](const py::bytes& model_proto_bytes) -> py::bytes {
+        InitEnv();
+        ONNX_NAMESPACE::ModelProto model;
+        ParseProtoFromBytes(&model, model_proto_bytes.c_str(),
+                            model_proto_bytes.size());
+        const auto result = QuantizeAttentionDynamic(model);
+        std::string out;
+        result.SerializeToString(&out);
+        return py::bytes(out.data(), out.size());
+      },
+      "model_bytes"_a);
+
+  // Dynamically quantizes MatMul/Gemm nodes whose weight is structurally
+  // ternary ({-s, 0, +s} per output column, e.g. BitNet b1.58) into the same
+  // DynamicQuantizeLinear/MatMulInteger shape as quantize_dynamic, but with a
+  // lossless ternary weight encoding instead of a rounded approximation --
+  // see QuantizeTernary in onnxsim.h.
+  m.def(
+      "quantize_ternary",
+      [](const py::bytes& model_proto_bytes) -> py::bytes {
+        InitEnv();
+        ONNX_NAMESPACE::ModelProto model;
+        ParseProtoFromBytes(&model, model_proto_bytes.c_str(),
+                            model_proto_bytes.size());
+        const auto result = QuantizeTernary(model);
+        std::string out;
+        result.SerializeToString(&out);
+        return py::bytes(out.data(), out.size());
+      },
+      "model_bytes"_a);
+
+  // Weight-only quantizes MatMul/Gemm/Conv weights to INT8 (per output
+  // channel, symmetric) via a single DequantizeLinear -- activations are
+  // never touched, so no calibration data or ModelExecutor is needed. See
+  // QuantizeWeightOnly in onnxsim.h.
+  m.def(
+      "quantize_weight_only",
+      [](const py::bytes& model_proto_bytes) -> py::bytes {
+        InitEnv();
+        ONNX_NAMESPACE::ModelProto model;
+        ParseProtoFromBytes(&model, model_proto_bytes.c_str(),
+                            model_proto_bytes.size());
+        const auto result = QuantizeWeightOnly(model);
+        std::string out;
+        result.SerializeToString(&out);
+        return py::bytes(out.data(), out.size());
+      },
+      "model_bytes"_a);
+
+  // Block-wise INT4 weight-only quantizes MatMul/Gemm/Conv weights (one
+  // symmetric scale per 32-element block of the reduction dimension, per
+  // output channel) via a single DequantizeLinear(block_size=32) --
+  // activations are never touched, so no calibration data or ModelExecutor
+  // is needed. See QuantizeWeightOnlyInt4 in onnxsim.h.
+  m.def(
+      "quantize_weight_only_int4",
+      [](const py::bytes& model_proto_bytes) -> py::bytes {
+        InitEnv();
+        ONNX_NAMESPACE::ModelProto model;
+        ParseProtoFromBytes(&model, model_proto_bytes.c_str(),
+                            model_proto_bytes.size());
+        const auto result = QuantizeWeightOnlyInt4(model);
+        std::string out;
+        result.SerializeToString(&out);
+        return py::bytes(out.data(), out.size());
+      },
+      "model_bytes"_a);
+
+  // Block-wise INT4 weight-only quantizes MatMul/Gemm weights into ONNX
+  // Runtime's own com.microsoft::MatMulNBits contrib op -- a vendor-specific
+  // (ORT-only) counterpart to quantize_weight_only_int4's portable standard-
+  // ONNX output. See QuantizeWeightOnlyMatMulNBits in onnxsim.h.
+  m.def(
+      "quantize_weight_only_matmul_nbits",
+      [](const py::bytes& model_proto_bytes) -> py::bytes {
+        InitEnv();
+        ONNX_NAMESPACE::ModelProto model;
+        ParseProtoFromBytes(&model, model_proto_bytes.c_str(),
+                            model_proto_bytes.size());
+        const auto result = QuantizeWeightOnlyMatMulNBits(model);
+        std::string out;
+        result.SerializeToString(&out);
+        return py::bytes(out.data(), out.size());
+      },
+      "model_bytes"_a);
+
+  // INT16 weight-only quantizes MatMul/Gemm/Conv weights (one symmetric
+  // scale per output channel, INT16's finer step than INT8's) -- activations
+  // are never touched, so no calibration data or ModelExecutor is needed.
+  // See QuantizeWeightOnlyInt16 in onnxsim.h.
+  m.def(
+      "quantize_weight_only_int16",
+      [](const py::bytes& model_proto_bytes) -> py::bytes {
+        InitEnv();
+        ONNX_NAMESPACE::ModelProto model;
+        ParseProtoFromBytes(&model, model_proto_bytes.c_str(),
+                            model_proto_bytes.size());
+        const auto result = QuantizeWeightOnlyInt16(model);
+        std::string out;
+        result.SerializeToString(&out);
+        return py::bytes(out.data(), out.size());
+      },
+      "model_bytes"_a);
+
+  // Block-wise INT8 weight-only quantizes MatMul/Gemm/Conv weights (one
+  // symmetric scale per 32-element block of the flattened reduction
+  // dimension, per output channel) via a single DequantizeLinear(axis=...,
+  // block_size=32) -- activations are never touched, so no calibration data
+  // or ModelExecutor is needed. See QuantizeWeightOnlyInt8Block in
+  // onnxsim.h.
+  m.def(
+      "quantize_weight_only_int8_block",
+      [](const py::bytes& model_proto_bytes) -> py::bytes {
+        InitEnv();
+        ONNX_NAMESPACE::ModelProto model;
+        ParseProtoFromBytes(&model, model_proto_bytes.c_str(),
+                            model_proto_bytes.size());
+        const auto result = QuantizeWeightOnlyInt8Block(model);
+        std::string out;
+        result.SerializeToString(&out);
+        return py::bytes(out.data(), out.size());
+      },
+      "model_bytes"_a);
+
+  // Lists the activation tensor names quantize_static could quantize --
+  // see ListQuantizableActivations in onnxsim.h.
+  m.def(
+      "list_quantizable_activations",
+      [](const py::bytes& model_proto_bytes) -> std::vector<std::string> {
+        InitEnv();
+        ONNX_NAMESPACE::ModelProto model;
+        ParseProtoFromBytes(&model, model_proto_bytes.c_str(),
+                            model_proto_bytes.size());
+        return ListQuantizableActivations(model);
+      },
+      "model_bytes"_a);
+
+  // Statically (calibration-based) quantizes MatMul/Gemm/Conv: weights to
+  // INT8
+  // (per output channel, symmetric, ahead of time) and activations to uint8
+  // via a QuantizeLinear/DequantizeLinear pair with a *fixed* scale/zero-point
+  // derived from `activation_ranges` (tensor name -> (min, max), typically
+  // from list_quantizable_activations plus running the float model over
+  // calibration data) -- see QuantizeStatic in onnxsim.h.
+  m.def(
+      "quantize_static",
+      [](const py::bytes& model_proto_bytes,
+         const std::unordered_map<std::string, std::pair<float, float>>&
+             activation_ranges) -> py::bytes {
+        InitEnv();
+        ONNX_NAMESPACE::ModelProto model;
+        ParseProtoFromBytes(&model, model_proto_bytes.c_str(),
+                            model_proto_bytes.size());
+        const auto result = QuantizeStatic(model, activation_ranges);
+        std::string out;
+        result.SerializeToString(&out);
+        return py::bytes(out.data(), out.size());
+      },
+      "model_bytes"_a, "activation_ranges"_a);
+
+  // Same as quantize_static, but a "W8A16" scheme: the weight stays INT8,
+  // while the activation is quantized to uint16 instead of uint8 (an 8x
+  // finer calibrated affine step) -- see QuantizeStaticInt16 in onnxsim.h.
+  m.def(
+      "quantize_static_int16",
+      [](const py::bytes& model_proto_bytes,
+         const std::unordered_map<std::string, std::pair<float, float>>&
+             activation_ranges) -> py::bytes {
+        InitEnv();
+        ONNX_NAMESPACE::ModelProto model;
+        ParseProtoFromBytes(&model, model_proto_bytes.c_str(),
+                            model_proto_bytes.size());
+        const auto result = QuantizeStaticInt16(model, activation_ranges);
+        std::string out;
+        result.SerializeToString(&out);
+        return py::bytes(out.data(), out.size());
+      },
+      "model_bytes"_a, "activation_ranges"_a);
+
+  // Lists the *output* tensor names quantize_qoperator could additionally
+  // quantize, on top of list_quantizable_activations' input names -- see
+  // ListQOperatorQuantizableOutputs in onnxsim.h.
+  m.def(
+      "list_qoperator_quantizable_outputs",
+      [](const py::bytes& model_proto_bytes) -> std::vector<std::string> {
+        InitEnv();
+        ONNX_NAMESPACE::ModelProto model;
+        ParseProtoFromBytes(&model, model_proto_bytes.c_str(),
+                            model_proto_bytes.size());
+        return ListQOperatorQuantizableOutputs(model);
+      },
+      "model_bytes"_a);
+
+  // Statically (calibration-based) quantizes MatMul/Gemm into the
+  // "QOperator" format (QLinearMatMul) rather than quantize_static's QDQ
+  // format -- needs a calibrated range for both the activation and the
+  // node's own output (see list_qoperator_quantizable_outputs) since
+  // QLinearMatMul computes directly in int8, with no float intermediate --
+  // see QuantizeQOperator in onnxsim.h.
+  m.def(
+      "quantize_qoperator",
+      [](const py::bytes& model_proto_bytes,
+         const std::unordered_map<std::string, std::pair<float, float>>&
+             activation_ranges) -> py::bytes {
+        InitEnv();
+        ONNX_NAMESPACE::ModelProto model;
+        ParseProtoFromBytes(&model, model_proto_bytes.c_str(),
+                            model_proto_bytes.size());
+        const auto result = QuantizeQOperator(model, activation_ranges);
+        std::string out;
+        result.SerializeToString(&out);
+        return py::bytes(out.data(), out.size());
+      },
+      "model_bytes"_a, "activation_ranges"_a);
+
+  // Lists the tensor names quantize_qoperator_elementwise could quantize --
+  // both operands and the output of every qualifying Add/Mul node -- see
+  // ListQOperatorElementwiseQuantizableTensors in onnxsim.h.
+  m.def(
+      "list_qoperator_elementwise_quantizable_tensors",
+      [](const py::bytes& model_proto_bytes) -> std::vector<std::string> {
+        InitEnv();
+        ONNX_NAMESPACE::ModelProto model;
+        ParseProtoFromBytes(&model, model_proto_bytes.c_str(),
+                            model_proto_bytes.size());
+        return ListQOperatorElementwiseQuantizableTensors(model);
+      },
+      "model_bytes"_a);
+
+  // Statically (calibration-based) quantizes elementwise Add/Mul into ONNX
+  // Runtime's "com.microsoft" QLinearAdd/QLinearMul contrib ops -- needs a
+  // calibrated range for both operands and the node's own output (see
+  // list_qoperator_elementwise_quantizable_tensors) since these compute
+  // directly in int8, with no float intermediate -- see
+  // QuantizeQOperatorElementwise in onnxsim.h.
+  m.def(
+      "quantize_qoperator_elementwise",
+      [](const py::bytes& model_proto_bytes,
+         const std::unordered_map<std::string, std::pair<float, float>>&
+             activation_ranges) -> py::bytes {
+        InitEnv();
+        ONNX_NAMESPACE::ModelProto model;
+        ParseProtoFromBytes(&model, model_proto_bytes.c_str(),
+                            model_proto_bytes.size());
+        const auto result =
+            QuantizeQOperatorElementwise(model, activation_ranges);
+        std::string out;
+        result.SerializeToString(&out);
+        return py::bytes(out.data(), out.size());
+      },
+      "model_bytes"_a, "activation_ranges"_a);
+
+  // Lists the tensor names quantize_qoperator_activation could quantize --
+  // the input and output of every qualifying Sigmoid/LeakyRelu node -- see
+  // ListQOperatorActivationQuantizableTensors in onnxsim.h.
+  m.def(
+      "list_qoperator_activation_quantizable_tensors",
+      [](const py::bytes& model_proto_bytes) -> std::vector<std::string> {
+        InitEnv();
+        ONNX_NAMESPACE::ModelProto model;
+        ParseProtoFromBytes(&model, model_proto_bytes.c_str(),
+                            model_proto_bytes.size());
+        return ListQOperatorActivationQuantizableTensors(model);
+      },
+      "model_bytes"_a);
+
+  // Statically (calibration-based) quantizes standalone Sigmoid/LeakyRelu
+  // into ONNX Runtime's "com.microsoft" QLinearSigmoid/QLinearLeakyRelu
+  // contrib ops -- needs a calibrated range for both the input and the
+  // node's own output (see list_qoperator_activation_quantizable_tensors)
+  // since these compute directly in int8, with no float intermediate -- see
+  // QuantizeQOperatorActivation in onnxsim.h.
+  m.def(
+      "quantize_qoperator_activation",
+      [](const py::bytes& model_proto_bytes,
+         const std::unordered_map<std::string, std::pair<float, float>>&
+             activation_ranges) -> py::bytes {
+        InitEnv();
+        ONNX_NAMESPACE::ModelProto model;
+        ParseProtoFromBytes(&model, model_proto_bytes.c_str(),
+                            model_proto_bytes.size());
+        const auto result =
+            QuantizeQOperatorActivation(model, activation_ranges);
+        std::string out;
+        result.SerializeToString(&out);
+        return py::bytes(out.data(), out.size());
+      },
+      "model_bytes"_a, "activation_ranges"_a);
+
+  // Lists the tensor names quantize_qoperator_concat could quantize -- every
+  // input plus the output of every qualifying Concat node -- see
+  // ListQOperatorConcatQuantizableTensors in onnxsim.h.
+  m.def(
+      "list_qoperator_concat_quantizable_tensors",
+      [](const py::bytes& model_proto_bytes) -> std::vector<std::string> {
+        InitEnv();
+        ONNX_NAMESPACE::ModelProto model;
+        ParseProtoFromBytes(&model, model_proto_bytes.c_str(),
+                            model_proto_bytes.size());
+        return ListQOperatorConcatQuantizableTensors(model);
+      },
+      "model_bytes"_a);
+
+  // Statically (calibration-based) quantizes Concat into ONNX Runtime's
+  // "com.microsoft" QLinearConcat contrib op -- needs a calibrated range for
+  // every input and the node's own output (see
+  // list_qoperator_concat_quantizable_tensors) since this computes directly
+  // in int8, with no float intermediate -- see QuantizeQOperatorConcat in
+  // onnxsim.h.
+  m.def(
+      "quantize_qoperator_concat",
+      [](const py::bytes& model_proto_bytes,
+         const std::unordered_map<std::string, std::pair<float, float>>&
+             activation_ranges) -> py::bytes {
+        InitEnv();
+        ONNX_NAMESPACE::ModelProto model;
+        ParseProtoFromBytes(&model, model_proto_bytes.c_str(),
+                            model_proto_bytes.size());
+        const auto result = QuantizeQOperatorConcat(model, activation_ranges);
+        std::string out;
+        result.SerializeToString(&out);
+        return py::bytes(out.data(), out.size());
+      },
+      "model_bytes"_a, "activation_ranges"_a);
+
+  // Lists the tensor names quantize_qoperator_softmax could quantize -- the
+  // input and output of every qualifying Softmax node -- see
+  // ListQOperatorSoftmaxQuantizableTensors in onnxsim.h.
+  m.def(
+      "list_qoperator_softmax_quantizable_tensors",
+      [](const py::bytes& model_proto_bytes) -> std::vector<std::string> {
+        InitEnv();
+        ONNX_NAMESPACE::ModelProto model;
+        ParseProtoFromBytes(&model, model_proto_bytes.c_str(),
+                            model_proto_bytes.size());
+        return ListQOperatorSoftmaxQuantizableTensors(model);
+      },
+      "model_bytes"_a);
+
+  // Statically (calibration-based) quantizes standalone Softmax into ONNX
+  // Runtime's "com.microsoft" QLinearSoftmax contrib op -- needs a
+  // calibrated range for both the input and the node's own output (see
+  // list_qoperator_softmax_quantizable_tensors) since this computes
+  // directly in int8, with no float intermediate -- see
+  // QuantizeQOperatorSoftmax in onnxsim.h.
+  m.def(
+      "quantize_qoperator_softmax",
+      [](const py::bytes& model_proto_bytes,
+         const std::unordered_map<std::string, std::pair<float, float>>&
+             activation_ranges) -> py::bytes {
+        InitEnv();
+        ONNX_NAMESPACE::ModelProto model;
+        ParseProtoFromBytes(&model, model_proto_bytes.c_str(),
+                            model_proto_bytes.size());
+        const auto result = QuantizeQOperatorSoftmax(model, activation_ranges);
+        std::string out;
+        result.SerializeToString(&out);
+        return py::bytes(out.data(), out.size());
+      },
+      "model_bytes"_a, "activation_ranges"_a);
+
+  // Lists the tensor names quantize_qoperator_pool could quantize -- the
+  // input and output of every qualifying AveragePool/GlobalAveragePool node
+  // -- see ListQOperatorPoolQuantizableTensors in onnxsim.h.
+  m.def(
+      "list_qoperator_pool_quantizable_tensors",
+      [](const py::bytes& model_proto_bytes) -> std::vector<std::string> {
+        InitEnv();
+        ONNX_NAMESPACE::ModelProto model;
+        ParseProtoFromBytes(&model, model_proto_bytes.c_str(),
+                            model_proto_bytes.size());
+        return ListQOperatorPoolQuantizableTensors(model);
+      },
+      "model_bytes"_a);
+
+  // Statically (calibration-based) quantizes standalone AveragePool/
+  // GlobalAveragePool into ONNX Runtime's "com.microsoft"
+  // QLinearAveragePool/QLinearGlobalAveragePool contrib ops -- needs a
+  // calibrated range for both the input and the node's own output (see
+  // list_qoperator_pool_quantizable_tensors) since these compute directly
+  // in int8, with no float intermediate -- see QuantizeQOperatorPool in
+  // onnxsim.h.
+  m.def(
+      "quantize_qoperator_pool",
+      [](const py::bytes& model_proto_bytes,
+         const std::unordered_map<std::string, std::pair<float, float>>&
+             activation_ranges) -> py::bytes {
+        InitEnv();
+        ONNX_NAMESPACE::ModelProto model;
+        ParseProtoFromBytes(&model, model_proto_bytes.c_str(),
+                            model_proto_bytes.size());
+        const auto result = QuantizeQOperatorPool(model, activation_ranges);
+        std::string out;
+        result.SerializeToString(&out);
+        return py::bytes(out.data(), out.size());
+      },
+      "model_bytes"_a, "activation_ranges"_a);
+
+  // Lists the tensor names quantize_qoperator_where could quantize -- both
+  // operands and the output of every qualifying Where node -- see
+  // ListQOperatorWhereQuantizableTensors in onnxsim.h.
+  m.def(
+      "list_qoperator_where_quantizable_tensors",
+      [](const py::bytes& model_proto_bytes) -> std::vector<std::string> {
+        InitEnv();
+        ONNX_NAMESPACE::ModelProto model;
+        ParseProtoFromBytes(&model, model_proto_bytes.c_str(),
+                            model_proto_bytes.size());
+        return ListQOperatorWhereQuantizableTensors(model);
+      },
+      "model_bytes"_a);
+
+  // Statically (calibration-based) quantizes Where into ONNX Runtime's
+  // "com.microsoft" QLinearWhere contrib op -- needs a calibrated range for
+  // both operands and the node's own output (see
+  // list_qoperator_where_quantizable_tensors) since this computes directly
+  // in int8, with no float intermediate -- see QuantizeQOperatorWhere in
+  // onnxsim.h.
+  m.def(
+      "quantize_qoperator_where",
+      [](const py::bytes& model_proto_bytes,
+         const std::unordered_map<std::string, std::pair<float, float>>&
+             activation_ranges) -> py::bytes {
+        InitEnv();
+        ONNX_NAMESPACE::ModelProto model;
+        ParseProtoFromBytes(&model, model_proto_bytes.c_str(),
+                            model_proto_bytes.size());
+        const auto result = QuantizeQOperatorWhere(model, activation_ranges);
+        std::string out;
+        result.SerializeToString(&out);
+        return py::bytes(out.data(), out.size());
+      },
+      "model_bytes"_a, "activation_ranges"_a);
+
+  // Lists the tensor names quantize_qoperator_gemm could quantize -- the
+  // activation and output of every qualifying Gemm node -- see
+  // ListQOperatorGemmQuantizableTensors in onnxsim.h.
+  m.def(
+      "list_qoperator_gemm_quantizable_tensors",
+      [](const py::bytes& model_proto_bytes) -> std::vector<std::string> {
+        InitEnv();
+        ONNX_NAMESPACE::ModelProto model;
+        ParseProtoFromBytes(&model, model_proto_bytes.c_str(),
+                            model_proto_bytes.size());
+        return ListQOperatorGemmQuantizableTensors(model);
+      },
+      "model_bytes"_a);
+
+  // Statically (calibration-based) quantizes Gemm into ONNX Runtime's
+  // "com.microsoft" QGemm contrib op -- the fully-general analogue of
+  // quantize_qoperator's QLinearMatMul rewrite (handles any transA/transB/
+  // alpha) -- needs a calibrated range for the activation and the node's
+  // own output (see list_qoperator_gemm_quantizable_tensors) since this
+  // computes directly in int8, with no float intermediate -- see
+  // QuantizeQOperatorGemm in onnxsim.h.
+  m.def(
+      "quantize_qoperator_gemm",
+      [](const py::bytes& model_proto_bytes,
+         const std::unordered_map<std::string, std::pair<float, float>>&
+             activation_ranges) -> py::bytes {
+        InitEnv();
+        ONNX_NAMESPACE::ModelProto model;
+        ParseProtoFromBytes(&model, model_proto_bytes.c_str(),
+                            model_proto_bytes.size());
+        const auto result = QuantizeQOperatorGemm(model, activation_ranges);
+        std::string out;
+        result.SerializeToString(&out);
+        return py::bytes(out.data(), out.size());
+      },
+      "model_bytes"_a, "activation_ranges"_a);
+
+  // Converts every float32 weight (and, by default, every internal
+  // activation) to float16 -- no calibration data needed, since float16 is
+  // still a floating-point format, not an integer scheme. With
+  // keep_io_types (the default true), the graph's own external input/output
+  // types stay float32 via boundary Cast nodes. See QuantizeFp16 in
+  // onnxsim.h.
+  m.def(
+      "quantize_fp16",
+      [](const py::bytes& model_proto_bytes, bool keep_io_types) -> py::bytes {
+        InitEnv();
+        ONNX_NAMESPACE::ModelProto model;
+        ParseProtoFromBytes(&model, model_proto_bytes.c_str(),
+                            model_proto_bytes.size());
+        const auto result = QuantizeFp16(model, keep_io_types);
+        std::string out;
+        result.SerializeToString(&out);
+        return py::bytes(out.data(), out.size());
+      },
+      "model_bytes"_a, "keep_io_types"_a = true);
+
+  // Converts every float32 weight (and, by default, every internal
+  // activation) to bfloat16 -- the same calibration-free, whole-graph
+  // conversion as quantize_fp16 above, just to a different narrow
+  // floating-point format (bfloat16 keeps float32's full exponent range, so
+  // there is no clamping concern). See QuantizeBf16 in onnxsim.h.
+  m.def(
+      "quantize_bf16",
+      [](const py::bytes& model_proto_bytes, bool keep_io_types) -> py::bytes {
+        InitEnv();
+        ONNX_NAMESPACE::ModelProto model;
+        ParseProtoFromBytes(&model, model_proto_bytes.c_str(),
+                            model_proto_bytes.size());
+        const auto result = QuantizeBf16(model, keep_io_types);
+        std::string out;
+        result.SerializeToString(&out);
+        return py::bytes(out.data(), out.size());
+      },
+      "model_bytes"_a, "keep_io_types"_a = true);
+
+  // Converts every float32 weight (and, by default, every internal
+  // activation) to an 8-bit floating-point format -- the same
+  // calibration-free, whole-graph conversion as quantize_fp16/quantize_bf16
+  // above, just to a much narrower floating-point format. `format` selects
+  // "e4m3" (E4M3FN, the default) or "e5m2" (E5M2); both convert with
+  // saturation (clamping) rather than producing an infinity/NaN for an
+  // out-of-range magnitude. See QuantizeFp8 in onnxsim.h.
+  m.def(
+      "quantize_fp8",
+      [](const py::bytes& model_proto_bytes, const std::string& format,
+         bool keep_io_types) -> py::bytes {
+        InitEnv();
+        ONNX_NAMESPACE::ModelProto model;
+        ParseProtoFromBytes(&model, model_proto_bytes.c_str(),
+                            model_proto_bytes.size());
+        const auto result = QuantizeFp8(model, format, keep_io_types);
+        std::string out;
+        result.SerializeToString(&out);
+        return py::bytes(out.data(), out.size());
+      },
+      "model_bytes"_a, "format"_a = "e4m3", "keep_io_types"_a = true);
+
+  // Static, calibration-free INT8-quantization risk analysis -- the single
+  // C++ implementation (onnxsim/precision_estimator.{h,cpp}) that both this
+  // Python binding and the WASM UI (scripts/convertmodel/interface.cpp) call
+  // into, so the algorithm exists in exactly one place rather than two
+  // (Python used to carry its own parallel implementation). The Python-facing
+  // ``onnxsim.precision_estimator`` module is a thin wrapper that reconstructs
+  // its public dataclasses from the tuples returned here; see that module's
+  // docstring. Each weight-estimate tuple is (node_name, op_type,
+  // reduction_depth, num_channels, int32_accumulator_safe, float32_cast_exact,
+  // max_outlier_ratio, outlier_risk, activation_producer_op,
+  // activation_range_lo, activation_range_hi, recommendation) -- the last
+  // three fields are None together (no known range) or all present. Each
+  // attention-estimate tuple is (node_name, num_query_heads, num_kv_heads,
+  // head_dim, default_scale, actual_scale, scale_matches_default,
+  // recommendation).
+  m.def(
+      "_estimate_model_quantization_drop",
+      [](const py::bytes& model_proto_bytes) {
+        ONNX_NAMESPACE::ModelProto model;
+        ParseProtoFromBytes(&model, model_proto_bytes.c_str(),
+                            model_proto_bytes.size());
+        const onnxsim::ModelQuantizationEstimate est =
+            onnxsim::EstimateModelQuantizationDrop(model);
+
+        using WeightTuple =
+            std::tuple<std::string, std::string, int64_t, int64_t, bool, bool,
+                       double, bool, std::optional<std::string>,
+                       std::optional<double>, std::optional<double>,
+                       std::string>;
+        std::vector<WeightTuple> weight_estimates;
+        weight_estimates.reserve(est.weight_estimates.size());
+        for (const auto& w : est.weight_estimates) {
+          weight_estimates.emplace_back(
+              w.node_name, w.op_type, w.reduction_depth, w.num_channels,
+              w.int32_accumulator_safe, w.float32_cast_exact,
+              w.max_outlier_ratio, w.outlier_risk,
+              w.activation_producer_op.empty()
+                  ? std::nullopt
+                  : std::optional<std::string>(w.activation_producer_op),
+              w.has_activation_range
+                  ? std::optional<double>(w.activation_range_lo)
+                  : std::nullopt,
+              w.has_activation_range
+                  ? std::optional<double>(w.activation_range_hi)
+                  : std::nullopt,
+              w.recommendation);
+        }
+
+        using AttentionTuple =
+            std::tuple<std::string, std::optional<int64_t>,
+                       std::optional<int64_t>, std::optional<int64_t>,
+                       std::optional<double>, std::optional<double>,
+                       std::optional<bool>, std::string>;
+        std::vector<AttentionTuple> attention_estimates;
+        attention_estimates.reserve(est.attention_estimates.size());
+        for (const auto& a : est.attention_estimates) {
+          attention_estimates.emplace_back(
+              a.node_name,
+              a.has_num_query_heads ? std::optional<int64_t>(a.num_query_heads)
+                                    : std::nullopt,
+              a.has_num_kv_heads ? std::optional<int64_t>(a.num_kv_heads)
+                                 : std::nullopt,
+              a.has_head_dim ? std::optional<int64_t>(a.head_dim)
+                             : std::nullopt,
+              std::isnan(a.default_scale)
+                  ? std::nullopt
+                  : std::optional<double>(a.default_scale),
+              std::isnan(a.actual_scale)
+                  ? std::nullopt
+                  : std::optional<double>(a.actual_scale),
+              a.scale_matches_default < 0
+                  ? std::nullopt
+                  : std::optional<bool>(a.scale_matches_default != 0),
+              a.recommendation);
+        }
+
+        return std::make_tuple(est.total_nodes_analyzed, est.unsafe_nodes,
+                               est.outlier_risk_nodes, est.worst_outlier_ratio,
+                               est.estimated_relative_error, est.risk_level,
+                               weight_estimates, attention_estimates);
+      },
+      "model_bytes"_a);
 
   m.def(
        "simplify",
@@ -347,18 +1033,30 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
           bool constant_folding, bool shape_inference,
           size_t tensor_size_threshold, std::optional<int> target_opset_version,
           std::shared_ptr<GraphRewriter> rewriter,
-          bool initializers_as_constants,
-          bool include_inline_functions) -> py::bytes {
+          bool initializers_as_constants, bool include_inline_functions,
+          bool mutable_initializer,
+          std::optional<std::unordered_map<std::string, std::vector<int64_t>>>
+              overwrite_input_shapes,
+          std::optional<std::vector<std::string>> unused_output,
+          std::optional<std::vector<std::string>> extra_optimizers)
+           -> py::bytes {
          // force env initialization to register opset
          InitEnv();
          ONNX_NAMESPACE::ModelProto model;
          ParseProtoFromBytes(&model, model_proto_bytes.c_str(),
                              model_proto_bytes.size());
-         auto const result =
-             Simplify(*executor, model, skip_optimizers, constant_folding,
-                      shape_inference, tensor_size_threshold,
-                      target_opset_version, rewriter.get(),
-                      initializers_as_constants, include_inline_functions);
+         // ``model`` is this lambda's own local, parsed fresh from
+         // ``model_proto_bytes`` and never read again after this call --
+         // exactly the case SimplifyConsumeInput's doc comment calls out as
+         // safe, and it does not touch the caller's own Python object (which
+         // was only ever serialized *from*, not aliased). See
+         // bench/RESULTS_synthetic_decoder_oom.md for why this matters.
+         auto const result = SimplifyConsumeInput(
+             *executor, model, skip_optimizers, constant_folding,
+             shape_inference, tensor_size_threshold, target_opset_version,
+             rewriter.get(), initializers_as_constants,
+             include_inline_functions, mutable_initializer,
+             overwrite_input_shapes, unused_output, extra_optimizers);
          std::string out;
          result.SerializeToString(&out);
          return py::bytes(out.data(), out.size());
@@ -367,7 +1065,9 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
        "constant_folding"_a = true, "shape_inference"_a = true,
        "tensor_size_threshold"_a, "target_opset_version"_a.none(),
        "rewriter"_a.none(), "initializers_as_constants"_a = true,
-       "include_inline_functions"_a = false)
+       "include_inline_functions"_a = false, "mutable_initializer"_a = true,
+       "overwrite_input_shapes"_a.none(), "unused_output"_a.none(),
+       "extra_optimizers"_a.none())
       .def(
           "simplify_path",
           [](std::shared_ptr<PyModelExecutor> executor,
@@ -377,28 +1077,57 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
              size_t tensor_size_threshold,
              std::optional<int> target_opset_version,
              std::shared_ptr<GraphRewriter> rewriter,
-             bool initializers_as_constants,
-             bool include_inline_functions) -> bool {
+             bool initializers_as_constants, bool include_inline_functions,
+             bool mutable_initializer,
+             std::optional<
+                 std::unordered_map<std::string, std::vector<int64_t>>>
+                 overwrite_input_shapes,
+             std::optional<std::vector<std::string>> unused_output,
+             std::optional<std::vector<std::string>> extra_optimizers) -> bool {
             // force env initialization to register opset
             InitEnv();
-            SimplifyPath(*executor, in_path, out_path, skip_optimizers,
-                         constant_folding, shape_inference,
-                         tensor_size_threshold, target_opset_version,
-                         rewriter.get(), initializers_as_constants,
-                         include_inline_functions);
+            SimplifyPath(
+                *executor, in_path, out_path, skip_optimizers, constant_folding,
+                shape_inference, tensor_size_threshold, target_opset_version,
+                rewriter.get(), initializers_as_constants,
+                include_inline_functions, mutable_initializer,
+                overwrite_input_shapes, unused_output, extra_optimizers);
             return true;
           },
           "executor"_a, "in_path"_a, "out_path"_a, "skip_optimizers"_a.none(),
           "constant_folding"_a = true, "shape_inference"_a = true,
           "tensor_size_threshold"_a, "target_opset_version"_a.none(),
           "rewriter"_a.none(), "initializers_as_constants"_a = true,
-          "include_inline_functions"_a = false)
+          "include_inline_functions"_a = false, "mutable_initializer"_a = true,
+          "overwrite_input_shapes"_a.none(), "unused_output"_a.none(),
+          "extra_optimizers"_a.none())
       .def("_list_optimizers",
            []() {
              py::list ret;
              for (const auto& p :
                   onnx::optimization::GetFuseAndEliminationPass()) {
                ret.append(p);
+             }
+             return ret;
+           })
+      // The counterpart to _list_optimizers: pass names valid for
+      // extra_optimizers specifically -- registered but not already part of
+      // the default fuse/elimination set (typically PassType::Other, e.g.
+      // fuse_matmul_add_bias_into_gemm_batched). Registers onnxsim's own
+      // custom passes first so this is accurate even if called before any
+      // simplify()/simplify_path() call has done so.
+      .def("_list_other_optimizers",
+           []() {
+             onnxsim::RegisterCustomOptimizerPasses();
+             const auto default_passes =
+                 onnx::optimization::GetFuseAndEliminationPass();
+             const std::unordered_set<std::string> default_set(
+                 default_passes.begin(), default_passes.end());
+             py::list ret;
+             for (const auto& p : onnx::optimization::GetAvailablePasses()) {
+               if (!default_set.count(p)) {
+                 ret.append(p);
+               }
              }
              return ret;
            })
@@ -534,4 +1263,144 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
         return onnxsim::MakeFunctionProtoRewriter(std::move(converted));
       },
       "rules"_a);
+
+  // Standalone safetensors/GGUF archive export/import: a model's graph and
+  // weights packaged together in one ecosystem-standard file (see
+  // onnxsim/tensor_pool_bridge.h and tensor_pool_gguf_bridge.h's *Standalone
+  // functions for the real-offset design). Exchanged as bytes for the model
+  // (like ``simplify``) and a real path for the archive itself, since the
+  // archive is inherently file-based.
+  m.def(
+      "export_safetensors",
+      [](const py::bytes& model_bytes, const std::string& out_path) {
+        onnx::ModelProto model;
+        ParseProtoFromBytes(&model, model_bytes.c_str(), model_bytes.size());
+        onnxsim::tensor_pool::TensorPool pool;
+        onnxsim::tensor_pool::SaveModelAsSafetensorsStandalone(model, out_path,
+                                                               pool);
+      },
+      "model_bytes"_a, "out_path"_a);
+
+  m.def(
+      "import_safetensors",
+      [](const std::string& in_path) -> py::bytes {
+        onnx::ModelProto model;
+        onnxsim::tensor_pool::TensorPool pool;
+        if (!onnxsim::tensor_pool::LoadModelFromSafetensors(in_path, &model,
+                                                            pool)) {
+          throw std::runtime_error(
+              "safetensors file has no embedded onnxsim model (a plain "
+              "weights-only archive is not importable as a graph)");
+        }
+        const std::string out = model.SerializeAsString();
+        return py::bytes(out.data(), out.size());
+      },
+      "in_path"_a);
+
+  m.def(
+      "export_gguf",
+      [](const py::bytes& model_bytes, const std::string& out_path) {
+        onnx::ModelProto model;
+        ParseProtoFromBytes(&model, model_bytes.c_str(), model_bytes.size());
+        onnxsim::tensor_pool::TensorPool pool;
+        onnxsim::tensor_pool::SaveModelAsGGUFStandalone(model, out_path, pool);
+      },
+      "model_bytes"_a, "out_path"_a);
+
+  m.def(
+      "import_gguf",
+      [](const std::string& in_path) -> py::bytes {
+        onnx::ModelProto model;
+        onnxsim::tensor_pool::TensorPool pool;
+        if (!onnxsim::tensor_pool::LoadModelFromGGUF(in_path, &model, pool)) {
+          throw std::runtime_error(
+              "gguf file has no embedded onnxsim model (a plain weights-only "
+              "archive is not importable as a graph)");
+        }
+        const std::string out = model.SerializeAsString();
+        return py::bytes(out.data(), out.size());
+      },
+      "in_path"_a);
+
+  // Hydrates `model`'s initializers, by name, from any GGUF file --
+  // including a plain third-party weights-only checkpoint with no embedded
+  // onnxsim model (unlike import_gguf, which requires one). A K-quant
+  // tensor (Q4_K/Q5_K/Q6_K/Q8_0 -- what most real quantized checkpoints,
+  // e.g. Unsloth's GGUF exports, actually use for the bulk of their
+  // weights) is decoded to float32; see
+  // ImportModelWithGGUF/HydrateTensorProtoFromGGUF in
+  // tensor_pool_gguf_bridge.h. Returns (updated model bytes, names of GGUF
+  // tensors present in the file but skipped because their ggml_type has no
+  // representation TensorPool can hold at all, e.g. a legacy Q4_0 or IQ*-
+  // family tensor -- NOT tensors simply absent from `model`'s
+  // initializers, which this silently leaves alone rather than reporting).
+  m.def(
+      "import_gguf_weights",
+      [](const py::bytes& model_bytes, const std::string& gguf_path)
+          -> std::tuple<py::bytes, std::vector<std::string>> {
+        onnx::ModelProto model;
+        ParseProtoFromBytes(&model, model_bytes.c_str(), model_bytes.size());
+        onnxsim::tensor_pool::TensorPool pool;
+        std::vector<std::string> skipped;
+        onnxsim::tensor_pool::ImportModelWithGGUF(model, gguf_path, pool,
+                                                  /*hydrate_all=*/true,
+                                                  &skipped);
+        const std::string out = model.SerializeAsString();
+        return {py::bytes(out.data(), out.size()), std::move(skipped)};
+      },
+      "model_bytes"_a, "gguf_path"_a);
+
+  // Reads a GGUF file's architecture hyperparameters (general.architecture,
+  // <arch>.block_count, <arch>.attention.head_count, <arch>.rope.freq_base,
+  // ...) and per-tensor name/shape/ggml_type list, WITHOUT reading any
+  // tensor byte data -- see tensor_pool.h's GGUFMetadata/ReadGGUFMetadata
+  // doc comments. This is the piece TensorPool::LoadGGUF/import_gguf_weights
+  // above never surfaced: they parse the same header section but only ever
+  // look at general.alignment before moving on to loading tensor *values*.
+  // Returns {"kv": {key: int|float|str|bool, ...},
+  //          "tensors": [{"name": str, "shape": [int, ...],
+  //                       "ggml_type": int}, ...]}. ARRAY-typed metadata
+  // values (e.g. tokenizer.ggml.tokens) are omitted from "kv" entirely --
+  // see GGUFMetadata's doc comment for why.
+  m.def(
+      "read_gguf_metadata",
+      [](const std::string& path) -> py::dict {
+        onnxsim::tensor_pool::GGUFMetadata meta =
+            onnxsim::tensor_pool::ReadGGUFMetadata(path);
+
+        py::dict kv;
+        for (const auto& [key, value] : meta.kv) {
+          switch (value.kind) {
+            case onnxsim::tensor_pool::GGUFMetadataValue::Kind::kInt:
+              kv[key.c_str()] = value.int_value;
+              break;
+            case onnxsim::tensor_pool::GGUFMetadataValue::Kind::kFloat:
+              kv[key.c_str()] = value.float_value;
+              break;
+            case onnxsim::tensor_pool::GGUFMetadataValue::Kind::kString:
+              kv[key.c_str()] = value.string_value;
+              break;
+            case onnxsim::tensor_pool::GGUFMetadataValue::Kind::kBool:
+              kv[key.c_str()] = value.bool_value;
+              break;
+          }
+        }
+
+        py::list tensors;
+        for (const auto& t : meta.tensors) {
+          py::dict entry;
+          entry["name"] = t.name;
+          py::list shape;
+          for (int64_t d : t.shape) shape.append(d);
+          entry["shape"] = shape;
+          entry["ggml_type"] = t.ggml_type;
+          tensors.append(entry);
+        }
+
+        py::dict out;
+        out["kv"] = kv;
+        out["tensors"] = tensors;
+        return out;
+      },
+      "path"_a);
 }

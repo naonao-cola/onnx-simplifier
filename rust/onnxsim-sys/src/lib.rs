@@ -200,14 +200,18 @@ extern "C" {
     /// See `onnxsim_c_api.h` for the full contract. In brief:
     /// `skip_optimizers_is_null != 0` skips every optimizer pass; otherwise all
     /// passes run except the `num_skip_optimizers` names in `skip_optimizers`.
-    /// On success (`ONNXSIM_OK`) `out_data`/`out_size` own a buffer to free with
-    /// [`onnxsim_free_buffer`]; on failure (`ONNXSIM_ERROR`) `out_error` owns a
-    /// string to free with [`onnxsim_free_string`].
+    /// `extra_optimizers`/`num_extra_optimizers` name passes to run in ADDITION
+    /// to the default set (the counterpart to `skip_optimizers`); `0` behaves
+    /// like no extra passes. On success (`ONNXSIM_OK`) `out_data`/`out_size` own
+    /// a buffer to free with [`onnxsim_free_buffer`]; on failure
+    /// (`ONNXSIM_ERROR`) `out_error` owns a string to free with
+    /// [`onnxsim_free_string`].
     ///
     /// # Safety
     /// All non-null pointers must be valid; `model_data` must point to at least
-    /// `model_size` bytes and `skip_optimizers` to `num_skip_optimizers`
-    /// NUL-terminated strings when `skip_optimizers_is_null == 0`. When
+    /// `model_size` bytes, `skip_optimizers` to `num_skip_optimizers`
+    /// NUL-terminated strings when `skip_optimizers_is_null == 0`, and
+    /// `extra_optimizers` to `num_extra_optimizers` NUL-terminated strings. When
     /// `rewrite_fn` is `Some`, it (and the matching `rewrite_free_fn`) must obey
     /// the callback contract in `onnxsim_c_api.h`.
     pub fn onnxsim_simplify(
@@ -220,6 +224,8 @@ extern "C" {
         shape_inference: c_int,
         tensor_size_threshold: usize,
         target_opset_version: c_int,
+        extra_optimizers: *const *const c_char,
+        num_extra_optimizers: usize,
         rewrite_fn: Option<OnnxsimRewriteFn>,
         rewrite_free_fn: Option<OnnxsimRewriteFreeFn>,
         rewrite_user_data: *mut c_void,
@@ -234,7 +240,7 @@ extern "C" {
     /// This is the seam for embedding onnxsim in another ONNX-based stack. A
     /// `None` `execute_fn` falls back to the built-in executor, making this a
     /// drop-in superset of [`onnxsim_simplify`]. See `onnxsim_c_api.h` for the
-    /// full contract; the rewrite parameters match [`onnxsim_simplify`].
+    /// full contract; the other parameters match [`onnxsim_simplify`].
     ///
     /// # Safety
     /// All non-null pointers must be valid; `model_data` must point to at least
@@ -253,6 +259,8 @@ extern "C" {
         shape_inference: c_int,
         tensor_size_threshold: usize,
         target_opset_version: c_int,
+        extra_optimizers: *const *const c_char,
+        num_extra_optimizers: usize,
         rewrite_fn: Option<OnnxsimRewriteFn>,
         rewrite_free_fn: Option<OnnxsimRewriteFreeFn>,
         rewrite_user_data: *mut c_void,
@@ -292,6 +300,8 @@ extern "C" {
         replacement_data: *const *const c_void,
         replacement_sizes: *const usize,
         num_rules: usize,
+        extra_optimizers: *const *const c_char,
+        num_extra_optimizers: usize,
         out_data: *mut *mut c_void,
         out_size: *mut usize,
         out_error: *mut *mut c_char,
@@ -301,8 +311,8 @@ extern "C" {
     ///
     /// # Safety
     /// `in_path`/`out_path` must be valid NUL-terminated paths; the
-    /// `skip_optimizers` and `rewrite_fn`/`rewrite_free_fn` rules match
-    /// [`onnxsim_simplify`].
+    /// `skip_optimizers`, `extra_optimizers`, and `rewrite_fn`/`rewrite_free_fn`
+    /// rules match [`onnxsim_simplify`].
     pub fn onnxsim_simplify_path(
         in_path: *const c_char,
         out_path: *const c_char,
@@ -313,6 +323,8 @@ extern "C" {
         shape_inference: c_int,
         tensor_size_threshold: usize,
         target_opset_version: c_int,
+        extra_optimizers: *const *const c_char,
+        num_extra_optimizers: usize,
         rewrite_fn: Option<OnnxsimRewriteFn>,
         rewrite_free_fn: Option<OnnxsimRewriteFreeFn>,
         rewrite_user_data: *mut c_void,
@@ -326,6 +338,16 @@ extern "C" {
     /// # Safety
     /// Always safe to call; the returned pointer must be freed exactly once.
     pub fn onnxsim_list_optimizers() -> *mut c_char;
+
+    /// Return the names of the optimizer passes registered but NOT in the
+    /// default fuse/elimination set (typically `PassType::Other`, e.g.
+    /// `defuse_matmul_integer_to_float`) -- the names valid for
+    /// `extra_optimizers`/`num_extra_optimizers` above. Same format/ownership
+    /// contract as [`onnxsim_list_optimizers`].
+    ///
+    /// # Safety
+    /// Always safe to call; the returned pointer must be freed exactly once.
+    pub fn onnxsim_list_other_optimizers() -> *mut c_char;
 
     /// Render a human-readable diff (op counts + model size) between an original
     /// and a simplified model, both serialized `ModelProto` bytes. On
@@ -342,6 +364,91 @@ extern "C" {
         simplified_data: *const c_void,
         simplified_size: usize,
         out_text: *mut *mut c_char,
+        out_error: *mut *mut c_char,
+    ) -> c_int;
+
+    /// Render a node- and value-level diff (matched by output tensor name)
+    /// between an original and a simplified model, both serialized
+    /// `ModelProto` bytes: which nodes/values were removed, added, or changed.
+    /// Complementary to [`onnxsim_model_info_diff`], which reports
+    /// op-count/size/MACs aggregates rather than the specific nodes and values
+    /// involved. On `ONNXSIM_OK`, `out_text` owns a NUL-terminated string to
+    /// free with [`onnxsim_free_string`]; on `ONNXSIM_ERROR`, `out_error` owns
+    /// a message.
+    ///
+    /// # Safety
+    /// `original_data`/`simplified_data` must each point to at least the matching
+    /// size in bytes; `out_text`/`out_error`, if non-null, receive owned strings
+    /// that must be freed exactly once.
+    pub fn onnxsim_graph_diff(
+        original_data: *const c_void,
+        original_size: usize,
+        simplified_data: *const c_void,
+        simplified_size: usize,
+        out_text: *mut *mut c_char,
+        out_error: *mut *mut c_char,
+    ) -> c_int;
+
+    /// Export a serialized ONNX `ModelProto` to a standalone safetensors
+    /// archive at `out_path`: every initializer's bytes move into the archive
+    /// with real, byte-accurate offsets (openable by the `safetensors` Python
+    /// package / HF tooling with no onnxsim involved), and the graph itself is
+    /// embedded alongside them, so `out_path` alone is both the model's
+    /// weights and its graph. Reload it with [`onnxsim_import_safetensors`].
+    /// On `ONNXSIM_ERROR`, `out_error` owns a message to free with
+    /// [`onnxsim_free_string`].
+    ///
+    /// # Safety
+    /// `model_data` must point to at least `model_size` bytes; `out_path` must
+    /// be a valid NUL-terminated path; `out_error`, if non-null, receives an
+    /// owned string that must be freed exactly once.
+    pub fn onnxsim_export_safetensors(
+        model_data: *const c_void,
+        model_size: usize,
+        out_path: *const c_char,
+        out_error: *mut *mut c_char,
+    ) -> c_int;
+
+    /// Import a standalone safetensors archive at `in_path` (as produced by
+    /// [`onnxsim_export_safetensors`], or any other tool following the same
+    /// self-describing-archive convention) back into an ordinary, fully
+    /// in-memory ONNX `ModelProto`. On `ONNXSIM_OK`, `out_data`/`out_size` own
+    /// a buffer to free with [`onnxsim_free_buffer`]. Fails with
+    /// `ONNXSIM_ERROR` if the archive has no embedded onnxsim model (e.g. a
+    /// plain weights-only safetensors file with no graph to import).
+    ///
+    /// # Safety
+    /// `in_path` must be a valid NUL-terminated path; `out_data`/`out_size`/
+    /// `out_error`, if non-null, receive owned values that must be freed
+    /// exactly once.
+    pub fn onnxsim_import_safetensors(
+        in_path: *const c_char,
+        out_data: *mut *mut c_void,
+        out_size: *mut usize,
+        out_error: *mut *mut c_char,
+    ) -> c_int;
+
+    /// GGUF counterpart of [`onnxsim_export_safetensors`]. Same contract.
+    ///
+    /// # Safety
+    /// Same as [`onnxsim_export_safetensors`].
+    pub fn onnxsim_export_gguf(
+        model_data: *const c_void,
+        model_size: usize,
+        out_path: *const c_char,
+        out_error: *mut *mut c_char,
+    ) -> c_int;
+
+    /// GGUF counterpart of [`onnxsim_import_safetensors`]. Same contract,
+    /// including failing with `ONNXSIM_ERROR` when the archive has no
+    /// embedded model.
+    ///
+    /// # Safety
+    /// Same as [`onnxsim_import_safetensors`].
+    pub fn onnxsim_import_gguf(
+        in_path: *const c_char,
+        out_data: *mut *mut c_void,
+        out_size: *mut usize,
         out_error: *mut *mut c_char,
     ) -> c_int;
 

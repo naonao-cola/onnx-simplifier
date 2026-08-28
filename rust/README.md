@@ -55,16 +55,22 @@ fn main() -> Result<(), Box<dyn std::error::Error + 'static>> {
     let opts = onnxsim::Options::new()
         .shape_inference(false)                       // skip if it crashes on your model
         .skip_optimizer("eliminate_nop_transpose")    // keep a specific pass off
+        .extra_optimizer("defuse_matmul_integer_to_float") // opt into a non-default pass
         .tensor_size_threshold(512 * 1024 * 1024);
     let simplified = onnxsim::simplify_with(&model, &opts)?;
     Ok(())
 }
 ```
 
-List the optimizer passes you can skip:
+List the optimizer passes you can skip, and the ones you can opt into with
+[`Options::extra_optimizer`] (off by default -- typically a graph-shape rewrite
+rather than a pure node reduction or fusion):
 
 ```rust
 for name in onnxsim::list_optimizers() {
+    println!("{name}");
+}
+for name in onnxsim::list_other_optimizers() {
     println!("{name}");
 }
 ```
@@ -77,6 +83,36 @@ fn main() -> Result<(), Box<dyn std::error::Error + 'static>> {
     let model = std::fs::read("model.onnx")?;
     let simplified = onnxsim::simplify(&model)?;
     print!("{}", onnxsim::model_info_diff(&model, &simplified)?);
+    Ok(())
+}
+```
+
+For the specific nodes and values that changed rather than just the aggregate
+counts, use `graph_diff` instead: which nodes/values were removed, added, or
+changed (matched by output tensor name), e.g. a Conv whose bias input got
+folded into its weight.
+
+```rust
+fn main() -> Result<(), Box<dyn std::error::Error + 'static>> {
+    let model = std::fs::read("model.onnx")?;
+    let simplified = onnxsim::simplify(&model)?;
+    print!("{}", onnxsim::graph_diff(&model, &simplified)?);
+    Ok(())
+}
+```
+
+Export a model to a standalone safetensors or GGUF archive (graph + weights in
+one ecosystem-standard file) and import it back:
+
+```rust
+fn main() -> Result<(), Box<dyn std::error::Error + 'static>> {
+    let model = std::fs::read("model.onnx")?;
+    onnxsim::export_safetensors(&model, "model.onnx.safetensors")?;
+    onnxsim::export_gguf(&model, "model.onnx.gguf")?;
+
+    let model = onnxsim::import_safetensors("model.onnx.safetensors")?;
+    let model = onnxsim::import_gguf("model.onnx.gguf")?;
+    let _ = model;
     Ok(())
 }
 ```
@@ -165,6 +201,13 @@ three modes:
    (docs.rs sets `DOCS_RS` automatically). The crate type-checks but cannot be
    linked into a runnable binary.
 
+Mode 1 is the default only *inside* this repository, where the C++ sources sit
+two directories above the crate. The published crate ships without them, so a
+build from crates.io stops immediately with a message pointing at the three
+modes rather than attempting a source build that cannot work; pick mode 2 or 3
+there. [The standalone package build test](#standalone-package-build-test)
+covers exactly that situation.
+
 ### Environment variables
 
 | Variable             | Effect                                                        |
@@ -236,6 +279,95 @@ summary and pull-request comment.
 
 The integration test in `onnxsim/tests/` is ignored by default because it needs
 the linked native library and an ONNX model; see the file header to enable it.
+
+## Standalone package build test
+
+`cargo publish --no-verify` (see [Publishing](#publishing)) means the archive
+that actually ships is never compiled by the in-tree build: `cargo build` in
+`rust/` always has the C++ sources, the submodules and the sibling crate next
+to it, and the published crate has none of that. Anything that only breaks
+there — a file missing from the package, a path dependency that stops resolving
+once cargo rewrites it to a registry dependency, a build script that assumes the
+onnxsim source tree is two directories up — would otherwise surface as a broken
+release on crates.io.
+
+[`scripts/test_rust_package_standalone.sh`](../scripts/test_rust_package_standalone.sh)
+closes that gap. It runs `cargo package`, unpacks both `.crate` archives into a
+directory **outside** this repository, patches `onnxsim`'s registry dependency
+on `onnxsim-sys` back to the freshly unpacked sibling, and builds the unpacked
+crates plus a throwaway downstream crate against them:
+
+```sh
+# Check-only (no native build, ~a minute): type-checks the unpacked crates and
+# a consumer of them, and asserts that a build with no mode selected fails fast
+# with an actionable message.
+scripts/test_rust_package_standalone.sh
+
+# Link and run the packaged crates against a native library. `--lib-dir auto`
+# reuses whatever a previous `cargo build` in rust/ already produced; pass an
+# explicit `dir[:dir...]` for a library built elsewhere.
+scripts/test_rust_package_standalone.sh --lib-dir auto --model model.onnx
+
+# Or build the native library from source against a checkout (slow):
+ONNXSIM_PREBUILT_ORT=1 scripts/test_rust_package_standalone.sh --source-dir "$PWD"
+```
+
+Useful options: `--workdir DIR` to unpack somewhere specific (it must be outside
+the repository, or the build script would find the C++ sources after all),
+`--keep` to leave the unpacked tree and the generated consumer crate around for
+inspection, and `--model PATH` to have the consumer actually simplify a model
+once the native library is linked.
+
+In CI this runs as the `package` job in
+[`.github/workflows/rust.yml`](../.github/workflows/rust.yml) (check-only, on
+every PR) and again at the end of the `build` job with `--lib-dir auto`, which
+links the packaged crates against the native library that job just built and
+runs them.
+
+## Publishing
+
+`onnxsim-sys` builds by shelling out to CMake against the onnxsim C++ source
+tree that lives outside the crate directory (`../..` from
+`rust/onnxsim-sys`), compiling ONNX Runtime, onnx, onnx-optimizer and
+protobuf from source. `cargo publish`'s default verification step packages
+the crate into an isolated directory with no monorepo around it, so that
+build can't succeed there — every publish (automated or manual) has to pass
+`--no-verify` to skip it. This does mean the crate isn't buildable from
+crates.io metadata alone: consumers need `ONNXSIM_SOURCE_DIR` pointed at a
+checkout of this monorepo (with submodules), or a pre-built library via
+`ONNXSIM_LIB_DIR` — see "Building the native library" above.
+
+### Automated (GitHub Actions)
+
+The `publish` job in
+[`.github/workflows/rust.yml`](../.github/workflows/rust.yml) runs whenever a
+GitHub release is published (tag `vX.Y.Z`), after the `lint` and `build` jobs
+pass. It bumps every binding manifest to the release tag
+(`scripts/bump_binding_versions.sh`, the same script the `lint`/`build` jobs
+run to validate against), then publishes `onnxsim-sys`, polls
+`https://crates.io/api/v1/crates/onnxsim-sys/<version>` until it lands on the
+index, and publishes `onnxsim`.
+
+It authenticates via crates.io [Trusted Publishing](https://crates.io/docs/trusted-publishing)
+(OIDC) rather than a long-lived API token: the job requests an `id-token`,
+[`rust-lang/crates-io-auth-action`](https://github.com/rust-lang/crates-io-auth-action)
+exchanges it for a short-lived (30-minute) crates.io token that's revoked when
+the job ends. This requires a trusted-publishing config on crates.io for both
+`onnxsim-sys` and `onnxsim` naming this repository, the `rust.yml` workflow,
+and the `cargo` environment (which the job runs under, matching that config)
+— no repository secret needed.
+
+### Manual
+
+```sh
+cd rust
+cargo publish -p onnxsim-sys --no-verify
+# wait for crates.io's index to pick up onnxsim-sys, then:
+cargo publish -p onnxsim --no-verify
+```
+
+`onnxsim-sys` must publish first and be visible on the index before
+`onnxsim` (which depends on it by version) can publish.
 
 ## License
 

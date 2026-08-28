@@ -34,6 +34,12 @@ def _median(xs):
     return statistics.median(xs) if xs else None
 
 
+def _p90(xs):
+    if len(xs) < 2:
+        return xs[0] if xs else None
+    return statistics.quantiles(xs, n=10, method="inclusive")[8]
+
+
 def comparison_section(rows):
     """Build the onnxsim-vs-onnxslim comparison (robustness / optimization /
     speed). Returns a list of Markdown lines, or [] if no onnxslim data is
@@ -133,19 +139,50 @@ def comparison_section(rows):
                 timed.append((r, a, b))
     if timed:
         slim_faster = sum(1 for _, a, b in timed if b < a)
+        sim_faster = sum(1 for _, a, b in timed if a < b)
         sim_secs = [a for _, a, _ in timed]
         slim_secs = [b for _, _, b in timed]
         lines.append(f"Over the {len(timed)} models both tools completed:\n")
         lines.append("| metric | onnxsim | onnxslim |")
         lines.append("| --- | --- | --- |")
+        lines.append(f"| fastest (s) | {min(sim_secs):.1f} | {min(slim_secs):.1f} |")
         lines.append(f"| median time (s) | {_median(sim_secs):.1f} | {_median(slim_secs):.1f} |")
+        lines.append(f"| mean time (s) | {statistics.mean(sim_secs):.1f} | {statistics.mean(slim_secs):.1f} |")
+        lines.append(f"| p90 time (s) | {_p90(sim_secs):.1f} | {_p90(slim_secs):.1f} |")
+        lines.append(f"| slowest (s) | {max(sim_secs):.1f} | {max(slim_secs):.1f} |")
         sim_rss = [_num(r.get("peak_rss_mb")) for r, _, _ in timed if _num(r.get("peak_rss_mb"))]
         slim_rss = [_num(r.get("slim_peak_rss_mb")) for r, _, _ in timed if _num(r.get("slim_peak_rss_mb"))]
         if sim_rss and slim_rss:
             lines.append(f"| median peak RSS (MiB) | {_median(sim_rss):.0f} | {_median(slim_rss):.0f} |")
         lines.append("")
-        lines.append(f"- onnxslim was faster on {slim_faster}/{len(timed)} models.")
+        lines.append(f"- onnxslim was faster on {slim_faster}/{len(timed)} models, "
+                     f"onnxsim was faster on {sim_faster}/{len(timed)}, "
+                     f"tied on {len(timed) - slim_faster - sim_faster}.")
         lines.append("")
+
+        # Biggest wall-clock gaps (either direction), same spirit as the
+        # node-count divergence table above.
+        div = sorted(timed, key=lambda t: -abs(t[1] - t[2]))[:15]
+        div = [t for t in div if t[1] != t[2]]
+        if div:
+            lines.append("Largest speed divergences (onnxsim vs onnxslim):\n")
+            lines.append("| model | onnxsim (s) | onnxslim (s) | faster |")
+            lines.append("| --- | ---: | ---: | --- |")
+            for r, a, b in div:
+                faster = "onnxslim" if b < a else "onnxsim"
+                lines.append(f"| {r['model']} | {a:.1f} | {b:.1f} | {faster} |")
+            lines.append("")
+
+        # Every model where onnxsim lost, not just the ones large enough to
+        # make the top-15 gap table above.
+        slower = sorted((t for t in timed if t[2] < t[1]), key=lambda t: -(t[1] - t[2]))
+        if slower:
+            lines.append(f"onnxsim slower than onnxslim on all {len(slower)} models:\n")
+            lines.append("| model | onnxsim (s) | onnxslim (s) | onnxsim is |")
+            lines.append("| --- | ---: | ---: | ---: |")
+            for r, a, b in slower:
+                lines.append(f"| {r['model']} | {a:.1f} | {b:.1f} | {a / b:.1f}x slower |")
+            lines.append("")
     else:
         lines.append("_No model was completed by both tools._\n")
 
@@ -233,6 +270,19 @@ def main(argv):
         lines.append("")
 
     lines.extend(comparison_section(rows))
+
+    timed_ok = sorted(
+        ((r, _num(r.get("seconds"))) for r in rows if r["status"] == "ok"),
+        key=lambda t: -(t[1] or 0),
+    )
+    timed_ok = [(r, s) for r, s in timed_ok if s is not None][:15]
+    if timed_ok:
+        lines.append("## 🐢 Slowest model conversions (onnxsim)\n")
+        lines.append("| model | time (s) | nodes (orig→simp) |")
+        lines.append("| --- | ---: | --- |")
+        for r, s in timed_ok:
+            lines.append(f"| {r['model']} | {s:.1f} | {r.get('orig_nodes', '')}→{r.get('simp_nodes', '')} |")
+        lines.append("")
 
     lines.append("## All models (onnxsim)\n")
     lines.append("| model | status | nodes (orig→simp) | baseline simp | Δ | time (s) |")

@@ -15,16 +15,21 @@ These tests use only the ``onnx`` Python API, so they run without torch.
 
 import numpy as np
 import onnx
-from onnx import TensorProto, helper
+from onnx import parser
 
 import onnxsim
 
 
-def _make_model(nodes, outputs, initializers, inputs=None, opset=18):
-    graph = helper.make_graph(nodes, "g", inputs or [], outputs, initializers)
-    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", opset)])
-    model.ir_version = 8
-    return model
+def _model(body, opset=18, ir_version=8):
+    return parser.parse_model(
+        f"""
+        <
+          ir_version: {ir_version},
+          opset_import: ["": {opset}]
+        >
+        {body}
+        """
+    )
 
 
 def _op_types(model):
@@ -36,14 +41,15 @@ def test_range_on_constants_is_folded():
     # (a Loop for opset < 27, a context-dependent function for opset >= 27), so
     # its schema determinism is not reported as ``Deterministic``. With constant
     # inputs it must still fold away.
-    inits = [
-        helper.make_tensor("start", TensorProto.INT64, [], [0]),
-        helper.make_tensor("limit", TensorProto.INT64, [], [8]),
-        helper.make_tensor("delta", TensorProto.INT64, [], [1]),
-    ]
-    nodes = [helper.make_node("Range", ["start", "limit", "delta"], ["out"])]
-    outputs = [helper.make_tensor_value_info("out", TensorProto.INT64, [8])]
-    model = _make_model(nodes, outputs, inits)
+    model = _model(
+        """
+        g () => (int64[8] out)
+        <int64 start = {0}, int64 limit = {8}, int64 delta = {1}>
+        {
+          out = Range(start, limit, delta)
+        }
+        """
+    )
 
     sim, ok = onnxsim.simplify(model)
 
@@ -55,18 +61,21 @@ def test_range_rooted_subgraph_is_fully_folded():
     # Range -> Add(range, bias): the whole chain is constant and should collapse
     # to a single initializer. Before the fix the unfoldable Range left both
     # nodes in the graph.
-    inits = [
-        helper.make_tensor("start", TensorProto.INT64, [], [0]),
-        helper.make_tensor("limit", TensorProto.INT64, [], [6]),
-        helper.make_tensor("delta", TensorProto.INT64, [], [1]),
-        helper.make_tensor("bias", TensorProto.INT64, [6], [10, 20, 30, 40, 50, 60]),
-    ]
-    nodes = [
-        helper.make_node("Range", ["start", "limit", "delta"], ["r"]),
-        helper.make_node("Add", ["r", "bias"], ["out"]),
-    ]
-    outputs = [helper.make_tensor_value_info("out", TensorProto.INT64, [6])]
-    model = _make_model(nodes, outputs, inits)
+    model = _model(
+        """
+        g () => (int64[6] out)
+        <
+          int64 start = {0},
+          int64 limit = {6},
+          int64 delta = {1},
+          int64[6] bias = {10, 20, 30, 40, 50, 60}
+        >
+        {
+          r = Range(start, limit, delta)
+          out = Add(r, bias)
+        }
+        """
+    )
 
     sim, ok = onnxsim.simplify(model)
 
@@ -83,13 +92,15 @@ def test_range_rooted_subgraph_is_fully_folded():
 def test_random_ops_are_not_folded():
     # Genuinely non-deterministic generators must be preserved even though all
     # their (attribute) inputs are "constant".
-    for op, extra in [
-        ("RandomUniform", {"shape": [4]}),
-        ("RandomNormal", {"shape": [4]}),
-    ]:
-        nodes = [helper.make_node(op, [], ["out"], **extra)]
-        outputs = [helper.make_tensor_value_info("out", TensorProto.FLOAT, [4])]
-        model = _make_model(nodes, outputs, [])
+    for op in ["RandomUniform", "RandomNormal"]:
+        model = _model(
+            f"""
+            g () => (float[4] out)
+            {{
+              out = {op}<shape = [4]>()
+            }}
+            """
+        )
         sim, ok = onnxsim.simplify(model)
         assert ok
         assert op in _op_types(sim), (op, _op_types(sim))

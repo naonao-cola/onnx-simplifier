@@ -7,7 +7,7 @@ reference evaluator instead of requiring / auto-installing onnxruntime.
 import numpy as np
 import onnx
 import pytest
-from onnx import TensorProto, helper, numpy_helper
+from onnx import parser
 
 import onnxsim
 from onnxsim import backend
@@ -15,19 +15,16 @@ from onnxsim import backend
 
 def _make_foldable_model() -> onnx.ModelProto:
     """A model whose ``a + b`` can be constant-folded, then added to input."""
-    a = numpy_helper.from_array(np.ones((2, 2), np.float32), "a")
-    b = numpy_helper.from_array(np.ones((2, 2), np.float32) * 2, "b")
-    add_const = helper.make_node("Add", ["a", "b"], ["c"])
-    add_input = helper.make_node("Add", ["c", "x"], ["y"])
-    graph = helper.make_graph(
-        [add_const, add_input],
-        "foldable",
-        [helper.make_tensor_value_info("x", TensorProto.FLOAT, [2, 2])],
-        [helper.make_tensor_value_info("y", TensorProto.FLOAT, [2, 2])],
-        [a, b],
-    )
-    model = helper.make_model(
-        graph, opset_imports=[helper.make_opsetid("", 18)], ir_version=10
+    model = parser.parse_model(
+        """
+        <ir_version: 10, opset_import: ["": 18]>
+        foldable (float[2,2] x) => (float[2,2] y)
+        <float[2,2] a = {1.0, 1.0, 1.0, 1.0}, float[2,2] b = {2.0, 2.0, 2.0, 2.0}>
+        {
+          c = Add(a, b)
+          y = Add(c, x)
+        }
+        """
     )
     onnx.checker.check_model(model)
     return model
@@ -81,10 +78,11 @@ def test_simplify_with_explicit_provider():
 def test_simplify_with_unavailable_provider_raises():
     # Requesting a provider the installed onnxruntime does not offer surfaces a
     # clear error rather than silently folding on the CPU.
-    import onnxruntime as rt
-
     if not backend.has_onnxruntime():
         pytest.skip("requires onnxruntime")
+
+    import onnxruntime as rt
+
     if "CUDAExecutionProvider" in rt.get_available_providers():
         pytest.skip("CUDA provider is available; cannot test the unavailable path")
     model = _make_foldable_model()

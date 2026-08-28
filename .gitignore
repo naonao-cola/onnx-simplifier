@@ -1,3 +1,6 @@
+# Local profiling traces (ONNXSIM_PROFILE=1)
+onnxsim_profile.json
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
@@ -9,7 +12,7 @@ __pycache__/
 # Distribution / packaging
 .Python
 build/
-build-wasm-*/
+build-*/
 develop-eggs/
 dist/
 downloads/
@@ -139,11 +142,18 @@ dmypy.json
 compile_commands.json
 temp*.py
 test*.py
-# ...but the real test suite under tests/ is tracked.
+# ...but the real test suites under tests/ and tools/onnx-finetune/tests/ are
+# tracked.
 !tests/test*.py
+!tools/onnx-finetune/tests/test*.py
 
 .setuptools-cmake-build/
 onnxsim/version.py
+
+# scripts/cross/ build trees (Windows wheel, s390x big-endian, native control)
+.cross-build/
+.cross-build-s390x/
+.native-build-control/
 
 # Rust
 /rust/target/
@@ -157,6 +167,10 @@ rust/Cargo.lock
 
 # emscripten SDK cloned by build_wasm.sh helpers
 /emsdk/
+
+# Pyodide xbuildenv (target Python headers) fetched on demand for
+# build_wasm_pyodide.sh, e.g. via `pyodide xbuildenv install`
+/.pyodide-xbuildenv/
 
 # protobuf built on demand by build_wasm.sh when protoc is missing
 /protobuf/
@@ -177,3 +191,10 @@ node_modules/
 # the "Load from Hugging Face" dropdown can read it same-origin. The source of
 # truth is scripts/regression/models.json; the copy is a build artifact.
 /scripts/convertmodel/models.json
+
+# npm/onnxsim's wasm module + JS executor are build artifacts staged by
+# scripts/build_npm_package.sh (from the ORT-web build and
+# scripts/convertmodel/ort_executor.mjs respectively), not checked into git.
+/npm/onnxsim/onnxsim.cjs
+/npm/onnxsim/onnxsim.wasm
+/npm/onnxsim/ort_executor.mjs

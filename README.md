@@ -57,7 +57,10 @@ constant folding until the model stops changing. Around that it offers:
 - **Graph optimization passes.** Runs onnx-optimizer's fusions and eliminations
   (e.g. fuse BatchNorm into Conv). List them with
   `onnxsim --list-default-optimizers`; skip all or some with
-  `--skip-optimization [pass ...]`.
+  `--skip-optimization [pass ...]`. A pass not in the default set (typically a
+  graph-shape rewrite rather than a pure node reduction, e.g. a defusion) can
+  be requested explicitly with `--enable-optimization pass [pass ...]`
+  (Python: `extra_optimizers=`); list those with `--list-other-optimizers`.
 - **Shape inference.** Propagates tensor shapes through the graph — including
   partial shape evaluation via ONNX data propagation — to unlock more folding.
 - **Correctness checking.** Optionally validates the simplified model against the
@@ -80,6 +83,12 @@ constant folding until the model stops changing. Around that it offers:
 - **[Custom rewriters](#custom-rewriters).** Plug your own rewriting logic into
   the fixed point with `custom_rewriter`, or express data-only `FunctionProto`
   rules that also run from the C and Rust bindings.
+- **[Safetensors / GGUF archives](#safetensors--gguf-archives).** Export a model
+  to a standalone `.safetensors` or `.gguf` file (graph + weights in one
+  ecosystem-standard archive) and import it back, from every binding.
+- **[Transformers export](#transformers-export).** Export a Hugging Face
+  `transformers` model straight to a simplified ONNX deployment directory with
+  `onnxsim.export_transformers_model()`.
 - **Subgraph simplification.** Simplify `If`/`Loop`/`Scan` subgraph bodies too
   with `--include-subgraph`.
 - **[MLIR export](#exporting-to-mlir-torch-mlir--onnx-mlir).** Hand the simplified
@@ -118,6 +127,17 @@ For more advanced features, try the following command for help message
 
 ```
 onnxsim -h
+```
+
+### Node.js version
+
+The same WebAssembly build backing the web version above is also published as
+an npm package, for JavaScript tooling that wants ONNX simplification without
+a native build step or a Python runtime. See
+[`npm/onnxsim/README.md`](npm/onnxsim/README.md) for usage.
+
+```
+npm install onnxsim
 ```
 
 ## Demonstration
@@ -502,6 +522,30 @@ needed. It implies `ONNXSIM_PROFILE` (defaulting to `onnxsim_profile.json`):
 ONNXSIM_MERGE_ORT_PROFILE=1 onnxsim input_onnx_model output_onnx_model
 ```
 
+### Node-reduction plot
+
+A `profile` trace also records how many nodes the graph holds right after
+every round of each fixed-point loop (`Optimize`, `FoldConstant`, and
+`Rewrite` when a `custom_rewriter` is given), as `NodeCount` counter events.
+`onnxsim.profile_plot.plot_node_reduction` (or `--node-reduction-plot` on the
+command line) turns those into a PNG with one subplot per loop -- node count
+against round index -- so you can see at a glance how many rounds each loop
+took and whether it converged (a flat tail) or hit the round cap
+(`ONNXSIM_FIXED_POINT_ITERS`, default 50) still descending. It needs
+matplotlib (`pip install onnxsim[plot]`):
+
+```python
+model_simp, check = onnxsim.simplify(model, profile="profile.json")
+
+from onnxsim.profile_plot import plot_node_reduction
+plot_node_reduction("profile.json")  # -> profile.json_node_reduction.png
+```
+
+```
+# Implies --profile if not given explicitly.
+onnxsim input_onnx_model output_onnx_model --node-reduction-plot
+```
+
 ## Custom rewriters
 
 Beyond the built-in optimizer passes, you can plug your own graph rewriting
@@ -747,6 +791,158 @@ bodies, handle variadic/optional-input arity mismatches, match >2-operand
 commutative permutations, or evaluate attribute *predicates* — for those, the
 Python-only `onnxscript.rewriter` via `custom_rewriter` remains the richer
 option.
+
+## Safetensors / GGUF archives
+
+**Reading [onnx-safetensors](https://github.com/justinchuby/onnx-safetensors)-styled
+models needs no special handling.** `onnx_safetensors.save_file`/`save_model`/
+`load_file_as_external_data` write an ordinary `.onnx` graph whose initializers
+use *standard* ONNX external data (`location`/`offset`/`length`) pointing into a
+real `.safetensors` file — the safetensors JSON header is simply skipped over by
+`offset`. That's exactly the external-data mechanism `simplify()` already reads
+(from a path or from `onnx.load()`), so a model produced by onnx-safetensors —
+or any other tool following the same convention — loads and simplifies with no
+onnxsim-specific code involved:
+
+```python
+import onnx
+import onnxsim
+
+# model.onnx + model.safetensors, written by onnx_safetensors.save_model(...)
+model_opt, check_ok = onnxsim.simplify("model.onnx")
+# ...or with the weights already resolved into the ModelProto by onnx itself:
+model_opt, check_ok = onnxsim.simplify(onnx.load("model.onnx"))
+```
+
+This is unrelated to the standalone archive format described below (which
+embeds the *graph* in the safetensors/GGUF file too, in an onnxsim-specific
+layout) — onnx-safetensors' two-file layout is just a plain `.onnx` model as
+far as onnxsim (or any other ONNX consumer) is concerned.
+
+Besides plain `.onnx`, a model can be exported to (and imported back from) a
+**standalone safetensors or GGUF archive**: every initializer's bytes move into
+the archive with real, byte-accurate offsets — openable by the `safetensors`
+Python package / HF tooling, or any GGUF reader, with no onnxsim involved — and
+the graph itself is embedded alongside them, so the one archive file is both
+the model's weights and its graph. This is useful for interop with the
+safetensors/GGUF ecosystems, or simply as a one-file way to move a model
+around; it does not itself simplify anything, so pair it with `simplify()` if
+you want both.
+
+From Python:
+
+```python
+import onnx
+import onnxsim
+
+model = onnx.load("model.onnx")
+onnxsim.export_safetensors(model, "model.onnx.safetensors")
+onnxsim.export_gguf(model, "model.onnx.gguf")
+
+# ... later, or in another process:
+model = onnxsim.import_safetensors("model.onnx.safetensors")
+model = onnxsim.import_gguf("model.onnx.gguf")
+```
+
+From Rust:
+
+```rust
+let model_bytes = std::fs::read("model.onnx")?;
+onnxsim::export_safetensors(&model_bytes, "model.onnx.safetensors")?;
+onnxsim::export_gguf(&model_bytes, "model.onnx.gguf")?;
+
+let model_bytes = onnxsim::import_safetensors("model.onnx.safetensors")?;
+let model_bytes = onnxsim::import_gguf("model.onnx.gguf")?;
+```
+
+From C, `onnxsim_export_safetensors`/`onnxsim_import_safetensors` and their
+`_gguf` counterparts follow the same `out_data`/`out_size`/`out_error`
+convention as `onnxsim_simplify` (see
+[`onnxsim/capi/onnxsim_c_api.h`](onnxsim/capi/onnxsim_c_api.h)); the export
+side takes the model as bytes and writes straight to a path, the import side
+reads a path and hands back a freshly allocated buffer of model bytes.
+
+The [web version](#web-version) exposes the same thing as UI: a format
+dropdown (`.onnx` / `.onnx.safetensors` / `.onnx.gguf`) next to the converter's
+**Download** button, and the file picker accepts either archive format as an
+upload, decoding it back to ONNX before simplifying.
+
+Importing an archive with no embedded model — e.g. a plain, weights-only
+safetensors/GGUF file from somewhere else, with no onnxsim-authored graph
+alongside the tensors — fails with a clear error rather than silently
+returning nothing: there is no graph in it to import.
+
+## Transformers export
+
+A Hugging Face `transformers` model distribution (a `config.json` plus
+`.safetensors` weights, e.g. anything under a Hub repo like
+`meta-llama/...`/`Qwen/...`) has no ONNX graph in it at all — the model's
+structure lives in the `transformers` Python modeling code, driven by
+`config.json`, not in the weights file. onnxsim has no PyTorch tracing code of
+its own to turn that into a graph, and does not need any: Hugging Face's own
+[`optimum`](https://github.com/huggingface/optimum) package already exports
+hundreds of architectures (via `optimum.exporters.onnx`) to plain ONNX —
+including the split multi-file encoder/decoder-with-past shape autoregressive
+generation needs. That export deliberately does no runtime-specific op fusion,
+so there is real simplification left for onnxsim to find.
+
+This is a different tool for a different job than [ONNX Runtime GenAI](https://github.com/microsoft/onnxruntime-genai)'s
+own model builder (`onnxruntime_genai.models.builder`): that one only covers a
+fixed, curated list of decoder-only causal-LM architectures, and its output is
+already fused/quantized into ORT-specific ops (`com.microsoft::MatMulNBits`,
+`GroupQueryAttention`, ...) meant to be consumed directly by ORT GenAI's own
+`generate()` loop — there's little left for a generic simplifier to do to it,
+and it doesn't cover encoder-only, seq2seq, vision, or audio architectures at
+all. `optimum`'s export is the right shape for onnxsim to build on instead: a
+plain graph, for any architecture with an `OnnxConfig`.
+
+`onnxsim.export_transformers_model()` wraps the export-with-optimum,
+simplify-every-graph-in-place recipe as one call:
+
+```python
+import onnxsim
+
+results = onnxsim.export_transformers_model(
+    "hf-internal-testing/tiny-random-t5",
+    "exported_and_simplified",
+    task="text2text-generation-with-past",
+)
+# {"encoder_model.onnx": True, "decoder_model.onnx": True, "decoder_with_past_model.onnx": True}
+```
+
+`output_dir` ends up holding the same files a plain `optimum` export would
+(tokenizer/config files copied through untouched), except every `.onnx` file
+has been simplified in place — so the directory is still deployable exactly
+as-is (e.g. via `optimum.onnxruntime.ORTModelForSeq2SeqLM.from_pretrained`).
+Needs the optional `torch`/`transformers`/`optimum` (with the `optimum-onnx`
+distribution) packages: `pip install onnxsim[transformers]`.
+
+Every simplified graph is saved with its weights in a companion `.data` file
+by default (`save_as_external_data=True`) rather than inline — unlike the
+`onnxsim` CLI's own `--save-as-external-data`/plain `onnx.save`, which default
+off and only use external data as a fallback once a graph is too large to
+serialize inline at all (>2GB). A real with-past export is several
+*independent* graphs (encoder/decoder/decoder-with-past), each with its own
+inline copy of whatever weights it uses — e.g. the decoder's weights end up
+duplicated inline across both `decoder_model.onnx` and
+`decoder_with_past_model.onnx` — and every pass in onnxsim's own optimization
+pipeline that touches a graph copies those inline bytes along with it. Keeping
+every graph's large tensors on disk from the start means both the in-memory
+copying during simplification and the inline duplication across split files
+shrink to metadata (name/offset/length) instead of the tensors themselves —
+worth it even for the tiny example above, which now writes e.g.
+`encoder_model.onnx` + `encoder_model.onnx.data` side by side. Pass
+`save_as_external_data=False` to keep a small/toy checkpoint as a single
+self-contained `.onnx` file instead:
+
+```python
+onnxsim.export_transformers_model(
+    "hf-internal-testing/tiny-random-t5",
+    "exported_and_simplified",
+    task="text2text-generation-with-past",
+    save_as_external_data=False,
+)
+```
 
 ## Projects Using ONNX Simplifier
 

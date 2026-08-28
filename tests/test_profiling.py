@@ -13,10 +13,24 @@ import os
 import numpy as np
 import onnx
 import pytest
-from onnx import TensorProto, helper, numpy_helper
+from onnx import numpy_helper, parser
 
 import onnxsim
 from onnxsim import backend
+
+
+def _model(body, initializer=(), opset=17, ir_version=10):
+    model = parser.parse_model(
+        f"""
+        <
+          ir_version: {ir_version},
+          opset_import: ["": {opset}]
+        >
+        {body}
+        """
+    )
+    model.graph.initializer.extend(initializer)
+    return model
 
 
 def _foldable_model() -> onnx.ModelProto:
@@ -24,12 +38,16 @@ def _foldable_model() -> onnx.ModelProto:
     real simplification round runs (shape inference + optimizer + folding)."""
     a = numpy_helper.from_array(np.ones((1, 4), dtype=np.float32), name="A")
     b = numpy_helper.from_array(np.full((1, 4), 2.0, dtype=np.float32), name="B")
-    add_const = helper.make_node("Add", ["A", "B"], ["c"], name="add_const")
-    add_x = helper.make_node("Add", ["c", "x"], ["y"], name="add_x")
-    x = helper.make_tensor_value_info("x", TensorProto.FLOAT, [1, 4])
-    y = helper.make_tensor_value_info("y", TensorProto.FLOAT, [1, 4])
-    graph = helper.make_graph([add_const, add_x], "g", [x], [y], [a, b])
-    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 17)])
+    model = _model(
+        """
+        g (float[1,4] x) => (float[1,4] y)
+        {
+          c = Add(A, B)
+          y = Add(c, x)
+        }
+        """,
+        initializer=[a, b],
+    )
     onnx.checker.check_model(model)
     return model
 
@@ -111,6 +129,36 @@ def _contained_in(inner, outer):
         inner["ts"] >= outer["ts"]
         and inner["ts"] + inner["dur"] <= outer["ts"] + outer["dur"] + 1
     )
+
+
+def test_profile_records_node_counts(tmp_path):
+    """The profiler also records a "NodeCount" counter event right after every
+    round of each fixed-point loop, tagged with which loop produced it (see
+    onnxsim.profile_plot, which turns this into the "node reduction per loop"
+    plot)."""
+    out = str(tmp_path / "trace.json")
+    model_opt, ok = onnxsim.simplify(_foldable_model(), profile=out)
+    assert ok
+
+    _, counters = _load_trace(out)
+    node_count_events = [e for e in counters if e.get("name") == "NodeCount"]
+    assert node_count_events, "expected NodeCount counter events in the trace"
+
+    for e in node_count_events:
+        args = e["args"]
+        assert isinstance(args["node_count"], int)
+        assert args["node_count"] >= 0
+        assert isinstance(args["loop"], str)
+
+    loops = {e["args"]["loop"] for e in node_count_events}
+    # "Initial" is recorded once unconditionally; "Optimize" is recorded every
+    # inner-loop round, which always runs at least once.
+    assert {"Initial", "Optimize"} <= loops
+
+    # The very first NodeCount sample is the "Initial" baseline, matching the
+    # original (pre-simplification) node count.
+    initial = next(e for e in node_count_events if e["args"]["loop"] == "Initial")
+    assert initial["args"]["node_count"] == 2  # add_const, add_x
 
 
 def test_profile_captures_ort_session_runs(tmp_path):

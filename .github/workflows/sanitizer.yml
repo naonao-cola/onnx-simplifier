@@ -1,12 +1,32 @@
 name: Build and Test with sanitizers
 
+# This job's whole point is catching memory-safety/alignment bugs in onnxsim's
+# C++ core (and the onnx/onnx-optimizer/protobuf tree it links), so restrict
+# it to changes that can actually affect that: no point re-running an
+# instrumented ~native build for a Python-only change.
 on:
   push:
     branches:
       - main
       - master
+    paths: &sanitizer-paths
+      - "onnxsim/**"
+      - "!onnxsim/**/*.py"
+      - "CMakeLists.txt"
+      - "cmake/**"
+      - "third_party/**"
+      - "setup.py"
+      - "pyproject.toml"
+      - ".gitmodules"
+      - "scripts/leak.txt"
+      - ".github/workflows/sanitizer.yml"
   pull_request:
+    paths: *sanitizer-paths
   workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   # A single instrumented build that runs AddressSanitizer and the alignment
@@ -55,7 +75,7 @@ jobs:
         python-version: '3.14'
     - uses: mozilla-actions/sccache-action@v0.0.11
 
-    - run: pip install cmake ninja setuptools sccache
+    - run: pip install cmake ninja setuptools sccache nanobind
 
     # Download/install the build-independent test dependencies (all prebuilt
     # wheels) in the background so they fetch while the instrumented build below

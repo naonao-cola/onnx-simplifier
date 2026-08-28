@@ -85,7 +85,10 @@
                 const log_output = document.getElementById("log-output");
                 const input = document.getElementById("file-input");
                 const dl_btn = document.getElementById("download-button");
+                const format_select = document.getElementById("download-format");
+                const format_status = document.getElementById("download-format-status");
                 const trace_container = document.getElementById("simplify-trace");
+                const node_reduction_container = document.getElementById("simplify-node-reduction");
                 let result_name = "";
                 let original_name = "";
                 // Decode a "data:...;base64,<b64>" URL back into a Uint8Array.
@@ -96,8 +99,30 @@
                     for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
                     return bytes;
                 };
+                // The in-flight window.__onnxsimImportArchive() request (see
+                // below), resolved/rejected by the "import-format-done"/
+                // "import-format-error" cases below. Only one archive decode
+                // is ever in flight at a time -- a later request implicitly
+                // supersedes an earlier one, which matches the file picker it
+                // serves (picking a new file makes any previous one moot).
+                let pendingImport = null;
+
                 worker.onmessage = (e) => {
                     switch (e.data[0]) {
+                        case "import-format-done":
+                            // e.data[2] is the decoded model's raw bytes (an
+                            // ArrayBuffer, transferred -- see worker.js).
+                            if (pendingImport) {
+                                pendingImport.resolve(new Uint8Array(e.data[2]));
+                                pendingImport = null;
+                            }
+                            break;
+                        case "import-format-error":
+                            if (pendingImport) {
+                                pendingImport.reject(new Error(e.data[2]));
+                                pendingImport = null;
+                            }
+                            break;
                         case "ready":
                             // The worker's WASM runtime has finished loading and
                             // is now listening for conversion requests.
@@ -112,17 +137,64 @@
                             log_output.value += e.data[1] + "\n";
                             log_output.scrollTop = log_output.scrollHeight;
                             break;
+                        // The download-format selector asked for the already-
+                        // converted model re-exported as a standalone
+                        // safetensors/gguf archive (see dl_btn.onclick below);
+                        // this is that export's result, so trigger the download
+                        // now and re-enable the controls it disabled meanwhile.
+                        case "export-format-done": {
+                            dl_btn.disabled = false;
+                            format_select.disabled = false;
+                            format_status.textContent = "";
+                            // e.data[2] is the raw archive bytes (an
+                            // ArrayBuffer, transferred rather than a base64
+                            // data URL -- see worker.js). downloadBytes wraps
+                            // it in a Blob URL, which is O(1) to create/click
+                            // regardless of size, unlike a multi-ten-MB data:
+                            // URL.
+                            import("./download.mjs").then(({ downloadBytes }) => {
+                                downloadBytes(e.data[2], e.data[3]);
+                            });
+                            break;
+                        }
+                        case "export-format-error":
+                            dl_btn.disabled = false;
+                            format_select.disabled = false;
+                            format_status.textContent = `${e.data[1]} export failed: ${e.data[2]}`;
+                            break;
                         case "convert-done":
                             input.disabled = false;
                             dl_btn.disabled = false;
+                            format_status.textContent = "";
                             const data_url = e.data[1];
                             const trace_json = e.data[2];
                             const original_data_url = e.data[3];
                             dl_btn.onclick = () => {
-                                const a = document.createElement("a");
-                                a.href = data_url;
-                                a.download = result_name;
-                                a.click();
+                                const format = format_select.value;
+                                if (format === "onnx") {
+                                    const a = document.createElement("a");
+                                    a.href = data_url;
+                                    a.download = result_name;
+                                    a.click();
+                                    return;
+                                }
+                                // Safetensors / GGUF: ask the worker to re-export
+                                // the already-converted bytes into that standalone
+                                // archive format (it owns the WASM runtime that
+                                // does the export). Async, so disable the controls
+                                // until "export-format-done"/"-error" above fires.
+                                const converted = window.__onnxsimConverted;
+                                if (!converted || !converted.bytes) return;
+                                const ext = format === "gguf" ? ".gguf" : ".safetensors";
+                                const bytes = converted.bytes;
+                                const export_buf = bytes.buffer.slice(
+                                    bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
+                                dl_btn.disabled = true;
+                                format_select.disabled = true;
+                                format_status.textContent = `exporting ${format}…`;
+                                worker.postMessage(
+                                    ["export_" + format, export_buf, result_name + ext],
+                                    [export_buf]);
                             };
                             // Visualize the simplified/optimized model with Netron.
                             if (window.netronShowAfter) {
@@ -165,6 +237,7 @@
                             // Render the onnxsim simplification profile, if one
                             // came back, as an inline flame graph.
                             if (trace_container) trace_container.innerHTML = "";
+                            if (node_reduction_container) node_reduction_container.innerHTML = "";
                             if (trace_json && trace_container) {
                                 try {
                                     const trace = JSON.parse(trace_json);
@@ -174,6 +247,11 @@
                                             filename: "onnxsim.simplify.trace.json",
                                         });
                                     });
+                                    if (node_reduction_container) {
+                                        import("./node_reduction_view.mjs").then(({ renderNodeReduction }) => {
+                                            renderNodeReduction(node_reduction_container, trace);
+                                        });
+                                    }
                                 } catch (err) {
                                     log_output.value += "failed to parse profiling trace: " + err + "\n";
                                     log_output.scrollTop = log_output.scrollHeight;
@@ -190,7 +268,25 @@
                 // handle published below).
                 const startConversion = (modelName, buf) => {
                     const optimizer = document.querySelector('input[name="optimizer"]:checked').value;
-                    result_name = (modelName.endsWith(".onnx") ? modelName.substring(0, modelName.length - 5) : modelName) + "." + optimizer + ".onnx"
+                    // A ".onnx.safetensors"/".onnx.gguf" upload (the same standalone
+                    // archive format the download-format selector produces) needs
+                    // decoding back to ONNX before conversion -- see worker.js's
+                    // import pre-step. Strip whichever archive suffix is present
+                    // first, then the ".onnx" underneath it, so the result name
+                    // matches a plain ".onnx" upload's either way.
+                    let base = modelName;
+                    let source_format = "onnx";
+                    if (/\.safetensors$/i.test(base)) {
+                        source_format = "safetensors";
+                        base = base.slice(0, -".safetensors".length);
+                    } else if (/\.gguf$/i.test(base)) {
+                        source_format = "gguf";
+                        base = base.slice(0, -".gguf".length);
+                    }
+                    if (/\.onnx$/i.test(base)) {
+                        base = base.slice(0, -".onnx".length);
+                    }
+                    result_name = base + "." + optimizer + ".onnx";
                     original_name = modelName;
                     // Drop any previous run's cached models so the inference panel
                     // never serves a stale converted/annotated result for the new
@@ -200,7 +296,7 @@
 
                     input.disabled = true;
                     dl_btn.disabled = true;
-                    console.log("sending: ", modelName);
+                    format_status.textContent = "";
                     let passes = null;
                     if (optimizer == "simplify") {
                         passes = Array.from(document.querySelectorAll('input[class="pass"]:not(:checked)')).map((v) => v.name);
@@ -230,14 +326,34 @@
                     // unchanged unless the user opts in.
                     const inline_functions = document.getElementById("id_inline_functions").checked;
                     last_run_info.inline_functions = inline_functions;
+                    // Print a node/value-level diff (which nodes/values were removed,
+                    // added, or changed) to the log alongside the op-count summary.
+                    // Only meaningful for "simplify", where onnxsim actually changes
+                    // the graph. Off by default: it can be long for a big model.
+                    const graph_diff = optimizer == "simplify" && document.getElementById("id_graph_diff").checked;
+                    last_run_info.graph_diff = graph_diff;
                     // Expose the latest run parameters to the report-issue module.
                     window.__onnxsimLastRunInfo = last_run_info;
-                    worker.postMessage([optimizer, buf, passes, constant_fold, shape_inference, tensor_size_threshold, target_opset_version, profile, annotate_model_info, inline_functions], [buf]);
+                    worker.postMessage([optimizer, buf, passes, constant_fold, shape_inference, tensor_size_threshold, target_opset_version, profile, annotate_model_info, inline_functions, graph_diff, source_format], [buf]);
                 };
                 // Expose the conversion entry point for the Hugging Face loader
                 // module (hf_load.mjs), which downloads model bytes and drives
                 // the same path as an uploaded file.
                 window.__onnxsimStartConversion = startConversion;
+
+                // Decode a standalone safetensors/gguf archive (ArrayBuffer) into
+                // plain ONNX model bytes, without running a conversion. Used by
+                // netron_view.mjs's "before" pane so a safetensors/gguf upload
+                // renders the actual model graph instead of the raw archive
+                // bytes (which Netron can only show as an opaque weights list).
+                // `format` is "safetensors" or "gguf"; `buf` is transferred to
+                // the worker, so the caller must not reuse it afterwards.
+                window.__onnxsimImportArchive = (buf, format) => {
+                    return new Promise((resolve, reject) => {
+                        pendingImport = { resolve, reject };
+                        worker.postMessage(["import_" + format, buf], [buf]);
+                    });
+                };
 
                 input.addEventListener("change", async (e) => {
                     const file = e.target.files[0];

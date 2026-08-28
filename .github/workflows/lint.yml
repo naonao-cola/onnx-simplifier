@@ -8,17 +8,26 @@ on:
   pull_request:
   workflow_dispatch:
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   # Format + lint + type-check the Python sources. Tools are pinned so a local
   # run reports exactly what CI does; bump the pins here to upgrade everywhere.
+  #
+  # ubuntu-slim (1 vCPU, 15-minute job limit) is enough: nothing is compiled and
+  # no third-party deps are installed, so this finishes in well under a minute.
+  # setup-python stays -- the slim image's system Python is externally managed
+  # (PEP 668), so `pip install` into it would fail.
   python:
     name: ruff + mypy (Python)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-slim
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
         with:
-          python-version: "3.10"
+          python-version: "3.11"
       - name: Install tools
         run: |
           python -m pip install --upgrade pip
@@ -37,10 +46,11 @@ jobs:
 
   # Check C/C++ formatting. clang-format is installed from the PyPI wheel so its
   # version is pinned and identical across machines (apt/system clang-format
-  # versions differ and would disagree on the output).
+  # versions differ and would disagree on the output). One pip install plus a
+  # formatting check over a handful of files, so ubuntu-slim covers it.
   clang-format:
     name: clang-format (C/C++)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-slim
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7

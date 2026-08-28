@@ -19,6 +19,12 @@ does not fail the job (legitimate optimizer changes move those numbers).
 Usage:
     run_regression.py --shard 0 --num-shards 6 --output shard-0.csv
     run_regression.py --slow-only --output slow.csv     # the known-slow models
+    run_regression.py --shard 0 --num-shards 6 --output shard-0.csv \
+        --profile-dir profiles   # + one ONNXSIM_PROFILE trace per model
+
+Every run also captures a per-model ONNXSIM_PROFILE_PASS_PHASES timing table
+into --profile-pass-phases-dir (default "pass_phases") unconditionally --
+pass an empty string to disable.
 """
 
 from __future__ import annotations
@@ -103,7 +109,48 @@ def main():
         "this budget); <=0 disables",
     )
     ap.add_argument("--output", default="regression.csv")
+    ap.add_argument(
+        "--profile-dir",
+        default=None,
+        help="capture onnxsim's ONNXSIM_PROFILE trace for each model into this "
+        "directory (one <model>.json per model), via worker.py's onnxsim runner. "
+        "Off by default: it adds a background RSS-sampler thread and a trace "
+        "write per model, overhead not worth paying on every scheduled run -- "
+        "use it for investigating a specific slow/regressed run "
+        "(see bench/RESULTS_profiling_survey.md).",
+    )
+    ap.add_argument(
+        "--profile-pass-phases-dir",
+        default="pass_phases",
+        help="capture onnxsim's ONNXSIM_PROFILE_PASS_PHASES per-optimizer-pass "
+        "match/modify timing table for each model into this directory (one "
+        "<model>.pass_phases.txt per model), via worker.py's onnxsim runner. "
+        "On unconditionally (unlike --profile-dir's heavier ONNXSIM_PROFILE "
+        "trace): it's just two chrono reads per node match, no RSS sampler or "
+        "trace write, negligible next to a model's simplify time -- and "
+        "without it there's no routine way to see which pass to optimize next "
+        "once the obvious bottlenecks are gone (see "
+        "bench/RESULTS_issue633_followup.md). Pass an empty string to disable.",
+    )
     args = ap.parse_args()
+
+    if args.profile_dir:
+        os.makedirs(args.profile_dir, exist_ok=True)
+        # Inherited by every worker.py subprocess this launches (the
+        # orchestrator, and in turn its own --run-tool onnxsim child), since
+        # none of those subprocess.run() calls override env=.
+        os.environ["ONNXSIM_REGRESSION_PROFILE_DIR"] = os.path.abspath(
+            args.profile_dir
+        )
+    if args.profile_pass_phases_dir:
+        os.makedirs(args.profile_pass_phases_dir, exist_ok=True)
+        os.environ["ONNXSIM_REGRESSION_PASS_PHASES_DIR"] = os.path.abspath(
+            args.profile_pass_phases_dir
+        )
+        # Read directly by onnxsim's C++ core (onnxsim.cpp), not by this
+        # script or worker.py -- setting it here just makes it visible to
+        # every subprocess in the chain the same way the dir var above is.
+        os.environ["ONNXSIM_PROFILE_PASS_PHASES"] = "1"
 
     models = load_models()
     if args.slow_only:

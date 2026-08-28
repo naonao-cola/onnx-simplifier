@@ -69,7 +69,7 @@ Classifier: Intended Audience :: Developers
 Classifier: Programming Language :: Python :: 3 :: Only
 Classifier: Topic :: Scientific/Engineering
 Classifier: Topic :: Software Development
-Requires-Python: >=3.10
+Requires-Python: >=3.11
 Requires-Dist: onnx
 Requires-Dist: rich
 Provides-Extra: onnxruntime

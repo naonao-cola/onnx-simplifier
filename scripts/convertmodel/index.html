@@ -28,9 +28,18 @@
             compiled to WebAssembly. Everything runs locally in your browser —
             models are never uploaded.
         </p>
+        <p class="note">
+            Also experimental: a
+            <a href="./pyodide-demo/">Pyodide (Python-in-the-browser) demo</a>
+            running full <code>onnxsim.simplify()</code>, or onnxsim's native
+            quantization passes on their own; see
+            <a href="https://github.com/onnxsim/onnxsim/blob/master/docs/wasm_pyodide.md" target="_blank" rel="noopener">docs/wasm_pyodide.md</a>
+            for the toolchain story behind it.
+        </p>
         <nav class="section-nav" aria-label="Jump to section">
             <a href="#sec-parse">Parse graph</a>
             <a href="#sec-convert">Convert</a>
+            <a href="#sec-quantize">Quantize</a>
             <a href="#sec-visualize">Netron</a>
             <a href="#sec-dims">Dynamic dims</a>
             <a href="#sec-console">Console</a>
@@ -77,9 +86,20 @@ agraph (float[N] X) =&gt; (float[N] Y) {
         <script type="module" src="./debug_tools.mjs"></script>
 
         <h2 id="sec-convert">Convert a model</h2>
-        <input type="file" id="file-input" disabled title="Loading WebAssembly runtime…" />
+        <input type="file" id="file-input" accept=".onnx,.onnx.safetensors,.onnx.gguf,.safetensors,.gguf" disabled title="Loading WebAssembly runtime…" />
         <span id="loading-status" role="status" aria-live="polite">⏳ Loading WebAssembly runtime… the file picker is disabled until it is ready.</span>
+        <div class="note">
+            Also accepts a standalone <code>.onnx.safetensors</code> or <code>.onnx.gguf</code> archive
+            (e.g. one downloaded from the format selector below) -- it is decoded back to ONNX before converting.
+        </div>
         <button id="download-button" disabled>Download ↓</button>
+        <label for="download-format" style="margin-left: 0.5em;">as</label>
+        <select id="download-format" title="Choose the downloaded file's format. Safetensors and GGUF each produce one self-contained file: the model graph plus its weights, in that ecosystem's standard tensor format.">
+            <option value="onnx" selected>.onnx</option>
+            <option value="safetensors">.onnx.safetensors</option>
+            <option value="gguf">.onnx.gguf</option>
+        </select>
+        <span id="download-format-status" class="tool-note"></span>
         <div id="hf-loader" style="margin-top: 0.6em;">
             <label for="hf-model-select">…or load from <a href="https://huggingface.co/onnxmodelzoo" target="_blank" rel="noopener">Hugging Face</a>:</label>
             <select id="hf-model-select" disabled title="Loading WebAssembly runtime…">
@@ -105,6 +125,31 @@ agraph (float[N] X) =&gt; (float[N] Y) {
                 can see how big it is before fetching. When a repo holds more than
                 one <code>.onnx</code>, the largest is auto-detected; use the
                 <b>file</b> selector to convert a different one.
+            </div>
+            <div id="hf-token-row" style="margin-top: 0.4em;">
+                <label for="hf-token-input">Hugging Face token</label>
+                <input type="password" id="hf-token-input" size="38"
+                       placeholder="hf_… (only needed for gated / private repos)"
+                       autocomplete="off" spellcheck="false">
+                <button id="hf-token-toggle" type="button" title="Show/hide the token">show</button>
+                <input type="checkbox" id="hf-token-remember">
+                <label for="hf-token-remember">remember in this browser</label>
+                <span id="hf-token-status" class="note" style="margin-left: 0.3em;"></span>
+                <div class="note" style="margin-top: 0.2em;">
+                    Optional — only needed to load a <b>gated</b> or
+                    <b>private</b> repo you have access to; public repos (like
+                    <code>onnxmodelzoo</code>) don't need one. Create one at
+                    <a href="https://huggingface.co/settings/tokens" target="_blank" rel="noopener">huggingface.co/settings/tokens</a>
+                    ("read" access is enough). It is sent straight from your
+                    browser to <code>huggingface.co</code> as an
+                    <code>Authorization</code> header for size checks, file
+                    listing, and the download itself — never anywhere else, and
+                    never included in the "Copy shareable link" URL above. With
+                    <b>remember</b> off (the default) it lives only in this
+                    page's memory and is gone on reload; checking it saves the
+                    token in this browser's local storage (still local to your
+                    machine) so it survives a reload.
+                </div>
             </div>
             <div class="note" style="margin-top: 0.25em;">
                 <b>Shareable link:</b> the input model and options can be set from
@@ -145,10 +190,10 @@ agraph (float[N] X) =&gt; (float[N] Y) {
                     Use <a href="https://huggingface.co/docs/xet/en/index" target="_blank" rel="noopener">Xet</a>
                     protocol (default; falls back to a direct download)
                 </label>
-                <label for="hf-xet-concurrency" style="margin-left: 0.6em;">parallel shards</label>
+                <label for="hf-xet-concurrency" style="margin-left: 0.6em;">max connections</label>
                 <input type="number" id="hf-xet-concurrency" value="8" min="1" max="16" step="1"
                        style="width: 3.5em;"
-                       title="How many parallel byte-range shards to read a Xet download in. XetBlob fetches serially, so this is what parallelizes the transfer; ~10 or fewer is usually best.">
+                       title="Ceiling on parallel connections for a Xet download. XetBlob tunes the actual count adaptively from measured throughput, up to this limit; ~10 or fewer is usually best.">
                 <button id="hf-clear-cache" type="button">clear chunk cache</button>
                 <span id="hf-cache-size" class="note" style="margin-left: 0.4em;"></span>
                 <div class="note" style="margin-top: 0.2em;">
@@ -160,11 +205,12 @@ agraph (float[N] X) =&gt; (float[N] Y) {
                     <br>
                     The in-browser Xet client
                     (<a href="https://github.com/huggingface/huggingface.js/blob/main/packages/hub/src/utils/XetBlob.ts" target="_blank" rel="noopener"><code>XetBlob</code></a>)
-                    fetches a file <i>serially</i>, so <b>parallel shards</b> reads
-                    it in that many concurrent byte-range slices to saturate your
-                    link — this is what makes Xet fast enough to be the default
-                    (~10 or fewer is usually best; <code>1</code> disables
-                    sharding). Xet also gives chunk dedup / cache reuse across
+                    fetches multiple content-addressed blocks at once and adapts
+                    the connection count to measured throughput, up to
+                    <b>max connections</b>, to saturate your link — this is what
+                    makes Xet fast enough to be the default (~10 or fewer is
+                    usually best; <code>1</code> forces a single serial
+                    connection). Xet also gives chunk dedup / cache reuse across
                     repeated or overlapping loads.
                 </div>
             </div>
@@ -255,9 +301,140 @@ agraph (float[N] X) =&gt; (float[N] Y) {
             <input type="checkbox" name="annotate_model_info" id="id_annotate_model_info" checked>
             <label for="id_annotate_model_info">annotate model info — bake MACs/FLOPs into <code>metadata_props</code> (shown in "Run inference" below)</label>
             <br/>
+            <input type="checkbox" name="graph_diff" id="id_graph_diff">
+            <label for="id_graph_diff">graph diff (simplify only) — print which nodes/values were removed, added, or changed in the log below</label>
+            <br/>
             <div id="pass-list" style="height: 300px; overflow-y: auto; border: 1px solid var(--border); border-radius: var(--radius); padding: 4px; margin-top: 4px;"></div>
         </div>
         </section>
+        <h2 id="sec-quantize">Quantize a model</h2>
+        <div class="tool-panel">
+            <p class="tool-note">
+                Quantizes a model with onnxsim's WebAssembly module, entirely in
+                your browser -- nothing is uploaded. Its result is kept
+                independent of the plain <b>Convert</b> section above (it never
+                overwrites the "after" Netron pane or <code>converted</code>
+                inference source) so you can inspect all three stages side by
+                side: <b>original</b> -- <b>onnxsim-simplified</b> (Convert
+                section, optional) -- <b>quantized</b> (its own "Quantized"
+                Netron pane and <code>quantized</code> inference source below).
+                Pick what to quantize:
+            </p>
+            <div class="convert-modes">
+                <input type="radio" name="quantize-source" value="original" id="quantize_source_original" checked>
+                <label for="quantize_source_original">Original upload</label>
+                <input type="radio" name="quantize-source" value="converted" id="quantize_source_converted">
+                <label for="quantize_source_converted" title="Runs the selected quantize method on the Convert section's own simplify/optimize output, so it applies to already-simplified graphs (e.g. fused Conv+BN, MatMul+Add -> Gemm) rather than the raw upload. Run Simplify/Optimize above first.">onnxsim-simplified (Convert section result)</label>
+            </div>
+            <p class="tool-note">
+                Before picking a method, you can check whether INT8 (Dynamic /
+                Static / QOperator's scheme) looks numerically safe for this
+                model -- a static analysis of its own weights and shapes, no
+                execution or calibration data needed, so it runs instantly.
+            </p>
+            <div class="debug-actions">
+                <button id="quantize-risk-button" type="button">Check quantization risk</button>
+                <span id="quantize-risk-status" class="tool-note"></span>
+            </div>
+            <div id="quantize-risk-result" style="display: none; margin-top: 0.4em;"></div>
+            <p class="tool-note">Pick a method:</p>
+            <ul class="tool-note">
+                <li><b>Dynamic</b> -- MatMul/Gemm weights are quantized to INT8
+                    ahead of time; the activation is quantized at inference time
+                    via <code>DynamicQuantizeLinear</code>. No calibration
+                    needed.</li>
+                <li><b>Ternary</b> -- like Dynamic, but for weights whose values
+                    are already (approximately) ternary
+                    (<code>{-1, 0, 1} × scale</code>), e.g. BitNet-style models.
+                    No calibration needed.</li>
+                <li><b>Weight-only</b> / <b>Weight-only INT4</b> -- only the
+                    weight is quantized (INT8 / block-wise INT4); the activation
+                    is never touched. No calibration needed, smallest download,
+                    but needs a runtime that supports on-the-fly dequantization.</li>
+                <li><b>Static (QDQ)</b> -- MatMul/Gemm/Conv are wrapped in
+                    <code>QuantizeLinear</code>/<code>DequantizeLinear</code>
+                    pairs using a <i>calibrated</i> activation range; the graph
+                    still computes in float32, and a QDQ-aware runtime fuses the
+                    pattern into an integer kernel. Needs calibration (below).</li>
+                <li><b>QOperator</b> -- MatMul/Gemm are replaced outright with
+                    <code>QLinearMatMul</code>, computing directly in int8; also
+                    needs a calibrated <i>output</i> range, not just the
+                    activation. Needs calibration (below).</li>
+                <li><b>Float16</b> / <b>BFloat16</b> / <b>Float8</b> -- a
+                    different kind of "quantization": every weight (and, by
+                    default, every internal activation -- a boundary
+                    <code>Cast</code> keeps the model's own external
+                    input/output types float32) is simply rounded to a
+                    narrower floating-point format, not an integer scheme, so
+                    no calibration data is needed at all. Float16/BFloat16
+                    halve storage; Float8 (E4M3 or E5M2, below) quarters it,
+                    at the cost of the least precision of any format here.</li>
+            </ul>
+            <p class="tool-note">
+                <b>Calibration</b> (Static/QOperator only) runs the model over a
+                few batches of synthetic random input through
+                <a href="https://github.com/microsoft/onnxruntime" target="_blank" rel="noopener">onnxruntime-web</a>
+                (downloaded on demand, same as the "Run inference" panel below)
+                to observe each quantizable tensor's actual value range -- the
+                same approach <code>onnxsim.calibrate()</code> uses in Python,
+                just run here in the browser instead. Random data is a
+                reasonable stand-in when representative data isn't at hand, but
+                real calibration data (e.g. via the Python API) usually gives
+                tighter, more accurate ranges.
+            </p>
+            <div class="convert-modes quantize-modes">
+                <input type="radio" name="quantize-method" value="dynamic" id="quantize_dynamic" checked>
+                <label for="quantize_dynamic">Dynamic</label>
+                <input type="radio" name="quantize-method" value="ternary" id="quantize_ternary">
+                <label for="quantize_ternary">Ternary</label>
+                <input type="radio" name="quantize-method" value="weight_only" id="quantize_weight_only">
+                <label for="quantize_weight_only">Weight-only</label>
+                <input type="radio" name="quantize-method" value="weight_only_int4" id="quantize_weight_only_int4">
+                <label for="quantize_weight_only_int4">Weight-only INT4</label>
+                <input type="radio" name="quantize-method" value="static" id="quantize_static">
+                <label for="quantize_static">Static (QDQ)</label>
+                <input type="radio" name="quantize-method" value="qoperator" id="quantize_qoperator">
+                <label for="quantize_qoperator">QOperator (QLinearMatMul)</label>
+                <input type="radio" name="quantize-method" value="fp16" id="quantize_fp16">
+                <label for="quantize_fp16">Float16</label>
+                <input type="radio" name="quantize-method" value="bf16" id="quantize_bf16">
+                <label for="quantize_bf16">BFloat16</label>
+                <input type="radio" name="quantize-method" value="fp8" id="quantize_fp8">
+                <label for="quantize_fp8">Float8</label>
+            </div>
+            <label for="quantize-fp8-format">Float8 format</label>
+            <select id="quantize-fp8-format">
+                <option value="e4m3" selected>E4M3FN (max 448, typically weights)</option>
+                <option value="e5m2">E5M2 (max 57344, typically gradients)</option>
+            </select>
+            <br/>
+            <label for="quantize-samples">calibration samples (Static / QOperator only)</label>
+            <input type="number" id="quantize-samples" value="8" min="1" max="64" step="1" style="width: 4em;">
+            <br/>
+            <input type="checkbox" id="quantize-metrics-toggle" checked>
+            <label for="quantize-metrics-toggle" title="After quantizing, run the float and quantized models on the same random input through onnxruntime-web and report the size change plus how far the outputs drifted -- relative L2 error and SQNR, the same aggregate-error metric onnxsim's own test suite checks.">
+                report result quality (size change, relative L2 error, SQNR) after quantizing
+            </label>
+            <div class="debug-actions">
+                <button id="quantize-button" type="button">Quantize</button>
+                <button id="quantize-download" type="button" style="display: none;">download model ↓</button>
+                <span id="quantize-status" class="tool-note"></span>
+            </div>
+            <div id="quantize-metrics" style="display: none; margin-top: 0.4em;"></div>
+            <div class="netron-pane" style="margin-top: 0.6em; max-width: 480px;">
+                <div class="netron-head">
+                    <strong>Quantized preview</strong> —
+                    <button id="netron-quantized-open" type="button" style="display: none;">open in a new tab ↗</button>
+                    <button id="netron-quantized-download" type="button" style="display: none;">download model ↓</button>
+                    <button id="netron-quantized-svg" type="button" style="display: none;">export SVG ↓</button>
+                    <button id="netron-quantized-png" type="button" style="display: none;">export PNG ↓</button>
+                </div>
+                <iframe id="netron-quantized-frame" class="netron-frame" title="Netron — quantized model" style="display: none;"></iframe>
+                <div id="netron-quantized-note" class="netron-note"></div>
+            </div>
+        </div>
+        <script type="module" src="./quantize_ui.mjs"></script>
+        <script type="module" src="./quantize_risk_estimate.mjs"></script>
         <h2 id="sec-visualize">Visualize with Netron (before / after)</h2>
         <p>
             Renders the model graph with a self-hosted
@@ -267,6 +444,10 @@ agraph (float[N] X) =&gt; (float[N] Y) {
             the model bytes are posted straight into the embedded Netron in your
             browser, so there is no model-size limit. Use <b>export SVG</b> to save
             the rendered graph as an SVG image.
+            <br>
+            The quantized result has its own Netron preview inside the
+            <a href="#sec-quantize">Quantize panel</a> above instead of a third
+            pane here, so it never crowds this before/after comparison.
         </p>
         <p class="macs-note">
             Netron is driven here purely as an embeddable model-preview component
@@ -381,6 +562,16 @@ agraph (float[N] X) =&gt; (float[N] Y) {
             open the full Perfetto timeline inline on this page.
         </p>
         <div id="simplify-trace" class="wide"></div>
+        <h3 id="sec-node-reduction">Node reduction per loop</h3>
+        <p>
+            How many nodes the graph held right after every round of each
+            simplification fixed-point loop, until it stopped changing (a
+            <b>fixed point</b>) or hit the round cap. One chart per loop —
+            <b>Optimize</b> (shape inference + onnx-optimizer passes) usually
+            does the most rounds; <b>FoldConstant</b> is the outer pipeline
+            wrapping it.
+        </p>
+        <div id="simplify-node-reduction" class="wide"></div>
         <h2 id="sec-inference">Run inference (onnxruntime-web)</h2>
         <p>
             Runs a model for a few iterations to check it executes, using dummy
@@ -401,6 +592,21 @@ agraph (float[N] X) =&gt; (float[N] Y) {
             unavailable. Tick <b>auto-run after each conversion</b> to run this
             panel automatically whenever a conversion finishes (with the options
             selected here), instead of clicking <b>Run inference</b> each time.
+            The <b>input fill</b> picker's <b>sample data</b> option feeds real
+            data instead of synthetic numbers: a photo from
+            <a href="https://huggingface.co/datasets/frgfm/imagenette" target="_blank" rel="noopener">frgfm/imagenette</a>
+            for an image-shaped input, or a tokenized sentence from
+            <a href="https://huggingface.co/datasets/stanfordnlp/sst2" target="_blank" rel="noopener">stanfordnlp/sst2</a>
+            for a recognized NLP model's <code>input_ids</code>/
+            <code>attention_mask</code>/<code>token_type_ids</code> — both
+            fetched live from Hugging Face for each run. Any input that doesn't
+            match one of those shapes, or an NLP model whose tokenizer family
+            isn't recognized, falls back to random fill (logged in the output
+            below). With <b>sample data</b> selected, a run also shows what it
+            actually fed the model and got back — the fetched image/sentence
+            next to the model's raw output, decoded as top-5 ImageNet-1k
+            predictions when the output looks like a standard 1000-way
+            classifier (a best-effort guess, not verified per model).
         </p>
         <p>
             The execution-provider picker also offers
@@ -429,6 +635,7 @@ agraph (float[N] X) =&gt; (float[N] Y) {
             <select id="inference-source">
                 <option value="compare">compare (before vs after conversion)</option>
                 <option value="converted">converted (simplify/optimize output)</option>
+                <option value="quantized">quantized (Quantize panel output)</option>
                 <option value="original">original (uploaded)</option>
             </select>
             <label for="inference-ep">execution provider</label>
@@ -449,11 +656,12 @@ agraph (float[N] X) =&gt; (float[N] Y) {
                    title="Size for the model's dynamic batch (first) axis; ignored on fixed-shape inputs.">
             <label for="inference-fill">input fill</label>
             <select id="inference-fill"
-                    title="How the auto-generated float inputs are valued (integer/bool inputs stay zero). 'random' varies the input so the before/after compare actually exercises the graph; 'zeros' can mask a divergence. Mirrors the CLI's --input-fill.">
+                    title="How the auto-generated inputs are valued. 'random'/'ones'/'zeros'/'arange' are synthetic (integer/bool inputs stay zero; mirrors the CLI's --input-fill). 'sample data' fetches a real image (frgfm/imagenette) or tokenized sentence (stanfordnlp/sst2) from Hugging Face for inputs shaped like one; any other input, or a model whose tokenizer isn't recognized, falls back to random fill (logged).">
                 <option value="random">random (deterministic)</option>
                 <option value="ones">ones</option>
                 <option value="zeros">zeros</option>
                 <option value="arange">arange (0, 1, 2, …)</option>
+                <option value="sample">sample data (real image/text from Hugging Face)</option>
             </select>
             <input type="checkbox" id="inference-profile" checked>
             <label for="inference-profile">profile (Chrome trace)</label>
@@ -465,6 +673,7 @@ agraph (float[N] X) =&gt; (float[N] Y) {
         <div id="webnn-status" class="note" style="margin-top: 0.3em;" title="">WebNN status: probing…</div>
         <textarea id="inference-output" readonly rows="12" style="width: 100%; box-sizing: border-box;"></textarea>
         <div id="inference-macs"></div>
+        <div id="inference-sample-io" class="wide"></div>
         <p>
             With profiling on (default), the run captures an onnxruntime-web
             trace: on WebGPU, one span per GPU kernel invocation; on WASM (or as

@@ -1,4 +1,6 @@
 import copy
+import dataclasses
+import math
 import warnings
 from collections import defaultdict
 from typing import (
@@ -8,13 +10,15 @@ from typing import (
     Iterable,
     List,
     Optional,
+    Set,
     Tuple,
     TypeGuard,
     Union,
 )
 
+import numpy as np
 import onnx
-from onnx import defs, helper, shape_inference
+from onnx import defs, helper, numpy_helper, shape_inference
 from onnx.external_data_helper import ExternalDataInfo, uses_external_data
 from rich import print
 from rich.table import Table
@@ -30,12 +34,26 @@ try:
 except ImportError:  # onnx.inliner was added in onnx 1.14; see ModelInfo.__init__.
     onnx_inliner = None
 
+try:
+    import onnx_ir
+    from onnx_shape_inference import infer_symbolic_shapes
+except ImportError:  # optional dependency; see ModelInfo._infer_shapes below.
+    onnx_ir = None
+    infer_symbolic_shapes = None
+
 
 __all__ = [
     "ModelInfo",
     "print_simplifying_info",
     "annotate_metadata",
     "METADATA_PREFIX",
+    "GraphDiff",
+    "NodeDiffEntry",
+    "diff_graphs",
+    "print_graph_diff",
+    "WeightQuantizationError",
+    "weight_quantization_error",
+    "print_weight_quantization_error",
 ]
 
 # metadata_props keys written by ``annotate_metadata`` are namespaced with this
@@ -82,7 +100,7 @@ def human_readable_size(num, suffix="B"):
     # A symbolic byte count (dynamic shapes + sympy) is printed as the formula
     # itself, matching human_readable_num.
     if _is_symbolic(num):
-        return str(sympy.factor(num))
+        return _factor_or_str(num)
     for unit in ["", "Ki", "Mi", "Gi", "Ti", "Pi", "Ei", "Zi"]:
         if abs(num) < 1024.0:
             return f"{num:3.1f}{unit}{suffix}"
@@ -94,7 +112,7 @@ def human_readable_num(num, suffix=""):
     # A symbolic MAC count (dynamic shapes + sympy) is printed as the formula
     # itself, e.g. "512*batch*seq**2 + 5419008*batch".
     if _is_symbolic(num):
-        return str(sympy.factor(num))
+        return _factor_or_str(num)
     for unit in ["", "K", "M", "G", "T", "P", "E"]:
         if abs(num) < 1000.0:
             return f"{num:3.1f}{unit}{suffix}"
@@ -106,7 +124,7 @@ def human_readable_density(num, suffix=" FLOP/Byte"):
     # Arithmetic intensity is a small ratio; print it plainly. When symbolic
     # (dynamic shapes cancel unevenly) fall back to the factored formula.
     if _is_symbolic(num):
-        return f"{sympy.factor(num)}{suffix}"
+        return f"{_factor_or_str(num)}{suffix}"
     return f"{float(num):.2f}{suffix}"
 
 
@@ -161,12 +179,46 @@ def _is_symbolic(value: Macs) -> bool:
     )
 
 
+# sympy.factor() on a multivariate polynomial is at best exponential in its
+# number of free symbols. Real models with properly-named/deduplicated dynamic
+# dims (e.g. "batch", "sequence") only ever contribute a handful of distinct
+# symbols, but a model whose shape inference didn't unify intermediate dynamic
+# dims back to the named input dims can produce hundreds of distinct symbols --
+# there factor() doesn't error, it just never returns in practical time. Skip
+# it above this threshold; it is purely a formatting nicety, never worth more
+# than a bounded amount of work.
+_MAX_FACTOR_FREE_SYMBOLS = 16
+
+
+def _factor_or_str(value: "sympy.Expr") -> str:
+    # sympy.factor() is purely cosmetic here (a nicer-looking formula for the
+    # report), but on models with many unresolved symbolic dims its polynomial
+    # arithmetic can recurse deep enough to blow Python's recursion limit (seen
+    # in practice on real-world models with 1000+ nodes, e.g. VOICEVOX's
+    # predict_sing_f0.onnx), or simply take intractably long without ever
+    # erroring (see ``_MAX_FACTOR_FREE_SYMBOLS`` above). Fall back to the
+    # unfactored expression rather than crashing or hanging the whole report
+    # over a formatting nicety.
+    if len(value.free_symbols) > _MAX_FACTOR_FREE_SYMBOLS:
+        return str(value)
+    try:
+        return str(sympy.factor(value))
+    except RecursionError:
+        return str(value)
+
+
 def _representative_number(value: Macs) -> int:
     # Collapse a (possibly symbolic) MAC count to a single number by setting
     # every free dimension to 1. Used only for ordering and the summary table's
     # highlighting -- never for the reported value, which stays symbolic.
+    # ``xreplace`` (a direct, purely syntactic tree substitution), not ``subs``
+    # (which layers on structural-equality/simplification passes meant for
+    # pattern-based substitution): every replacement here is an exact Symbol
+    # swapped for a literal, and ``subs`` on that over hundreds of free symbols
+    # -- as models with undeduplicated dynamic dims can produce -- takes
+    # minutes where ``xreplace`` takes a fraction of a second.
     if sympy is not None and isinstance(value, sympy.Expr):
-        value = value.subs({s: 1 for s in value.free_symbols})
+        value = value.xreplace({s: sympy.Integer(1) for s in value.free_symbols})
     return int(value)
 
 
@@ -414,9 +466,11 @@ def _schema_function_body(
     if any(name and types.get(name) is None for name in node.input):
         return None
     input_types = [
-        types[name].SerializeToString()
-        if name
-        else onnx.TypeProto().SerializeToString()
+        (
+            types[name].SerializeToString()
+            if name
+            else onnx.TypeProto().SerializeToString()
+        )
         for name in node.input
     ]
     try:
@@ -510,7 +564,11 @@ class ModelInfo:
     3. MACs / FLOPs of the compute-dominant operators: Conv, ConvTranspose,
        Gemm, MatMul, Attention, and the quantized twins (ConvInteger,
        QLinearConv, MatMulInteger, QLinearMatMul). Shapes come from ONNX shape
-       inference; nodes whose shapes cannot be inferred contribute 0. Dynamic
+       inference -- or, when the optional ``onnx-shape-inference`` package
+       (https://github.com/justinchuby/onnx-shape-inference) is installed, its
+       symbolic shape inference, which resolves more shapes via data
+       propagation through chains like Shape -> Slice -> Concat -> Reshape;
+       nodes whose shapes still cannot be inferred contribute 0. Dynamic
        dimensions (``dim_param``, e.g. "batch") become sympy symbols when sympy
        is installed, so ``macs`` / ``flops`` may be a symbolic formula; without
        sympy they are assumed 1 (per-sample MACs). Function ops are expanded
@@ -637,6 +695,22 @@ class ModelInfo:
     def _infer_shapes(
         model: onnx.ModelProto, data_prop: bool = False
     ) -> onnx.ModelProto:
+        # onnx-shape-inference (https://github.com/justinchuby/onnx-shape-inference),
+        # when installed, resolves more shapes than onnx's own shape_inference: it
+        # always does data propagation and tracks values through chains like
+        # Shape -> Slice -> Concat -> Reshape, so dynamic reshapes that onnx leaves
+        # unknown often still get a shape here. Its dim_param names for dynamic
+        # dims are still picked up as sympy symbols by _tensor_shape below.
+        if infer_symbolic_shapes is not None:
+            try:
+                inferred = infer_symbolic_shapes(onnx_ir.from_proto(model))
+                return onnx_ir.to_proto(inferred)
+            except Exception as e:
+                warnings.warn(
+                    f"onnx-shape-inference failed ({e}); falling back to "
+                    "onnx.shape_inference.",
+                    stacklevel=2,
+                )
         try:
             return shape_inference.infer_shapes(model, data_prop=data_prop)
         except Exception as e:
@@ -841,11 +915,181 @@ def print_simplifying_info(
     print(table)
 
 
+# --------------------------------------------------------------------------- #
+# Node/value level diff between the original and simplified graph
+# --------------------------------------------------------------------------- #
+@dataclasses.dataclass(frozen=True)
+class NodeDiffEntry:
+    """One node's identity for diffing: enough to describe it on a diff line,
+    not the full ``NodeProto`` (attributes are omitted; a node whose attributes
+    changed but whose op_type/inputs/outputs did not is not detected as
+    "changed" -- see ``diff_graphs``).
+    """
+
+    op_type: str
+    name: str
+    inputs: Tuple[str, ...]
+    outputs: Tuple[str, ...]
+
+
+def _node_diff_entry(node: onnx.NodeProto) -> NodeDiffEntry:
+    return NodeDiffEntry(
+        op_type=node.op_type,
+        name=node.name,
+        inputs=tuple(node.input),
+        outputs=tuple(node.output),
+    )
+
+
+@dataclasses.dataclass(frozen=True)
+class GraphDiff:
+    """Node- and value-level diff between an original and simplified graph,
+    matched by name -- see ``diff_graphs``.
+    """
+
+    removed_nodes: List[NodeDiffEntry]
+    added_nodes: List[NodeDiffEntry]
+    # (before, after) pairs that produce the same output(s) but whose op_type
+    # or inputs changed, e.g. a Conv whose bias input was folded away.
+    changed_nodes: List[Tuple[NodeDiffEntry, NodeDiffEntry]]
+    removed_values: List[str]
+    added_values: List[str]
+
+
+def _graph_value_names(graph: onnx.GraphProto) -> Set[str]:
+    # Every named tensor the (top-level) graph produces or consumes: node
+    # outputs, initializers and graph inputs. Node *inputs* that are neither an
+    # initializer nor another node's output are graph inputs already, so this
+    # set covers every value a diff could plausibly care about.
+    names: Set[str] = set()
+    for node in graph.node:
+        names.update(n for n in node.output if n)
+    names.update(init.name for init in graph.initializer)
+    names.update(inp.name for inp in graph.input)
+    return names
+
+
+def diff_graphs(model_ori: onnx.ModelProto, model_opt: onnx.ModelProto) -> GraphDiff:
+    """Diff ``model_ori``'s top-level graph against ``model_opt``'s, matched by
+    name rather than position, so the result reflects what simplification
+    actually did to named values instead of a meaningless positional diff.
+
+    Nodes are matched by their output tensor name(s) -- unique within a graph
+    by the ONNX spec, and the identity a downstream consumer actually depends
+    on -- so a node is reported as "changed" (rather than removed + added) only
+    when simplification kept the same output name(s) but altered the op_type or
+    inputs (e.g. folding a Conv's bias into its weight). This is precisely why
+    onnxsim tries to preserve value names across simplification passes where
+    possible: it is what keeps this diff (and any other name-keyed tooling)
+    meaningful instead of turning every fused/folded node into an unrelated
+    remove+add pair.
+
+    Only the top-level graph is compared -- nodes inside control-flow
+    subgraphs (If/Loop/Scan bodies) are not matched across models, since names
+    are only required to be unique within their own graph scope.
+    """
+    ori_by_output = {
+        _node_diff_entry(n).outputs: _node_diff_entry(n) for n in model_ori.graph.node
+    }
+    opt_by_output = {
+        _node_diff_entry(n).outputs: _node_diff_entry(n) for n in model_opt.graph.node
+    }
+
+    removed_nodes = []
+    changed_nodes = []
+    for outputs, before in ori_by_output.items():
+        after = opt_by_output.get(outputs)
+        if after is None:
+            removed_nodes.append(before)
+        elif (after.op_type, after.inputs) != (before.op_type, before.inputs):
+            changed_nodes.append((before, after))
+    added_nodes = [
+        after
+        for outputs, after in opt_by_output.items()
+        if outputs not in ori_by_output
+    ]
+
+    ori_values = _graph_value_names(model_ori.graph)
+    opt_values = _graph_value_names(model_opt.graph)
+
+    return GraphDiff(
+        removed_nodes=removed_nodes,
+        added_nodes=added_nodes,
+        changed_nodes=changed_nodes,
+        removed_values=sorted(ori_values - opt_values),
+        added_values=sorted(opt_values - ori_values),
+    )
+
+
+def _node_label(entry: NodeDiffEntry) -> str:
+    name = entry.name or "/".join(entry.outputs)
+    return f"{entry.op_type} ({name})"
+
+
+def print_graph_diff(
+    model_ori: onnx.ModelProto, model_opt: onnx.ModelProto, limit: int = 50
+) -> None:
+    """Print the node- and value-level diff between ``model_ori`` and
+    ``model_opt`` (see ``diff_graphs``), in a unified-diff style: ``-`` for
+    what simplification removed, ``+`` for what it added, ``~`` for a node kept
+    under the same output name(s) but changed. Each section is capped at
+    ``limit`` entries (with a "... and N more" line) so a large model's diff
+    stays readable.
+    """
+    diff = diff_graphs(model_ori, model_opt)
+
+    def print_section(title: str, count: int) -> None:
+        print(f"[bold]{title} ({count}):[/bold]")
+
+    def print_capped(lines: List[Text]) -> None:
+        for line in lines[:limit]:
+            print(line)
+        if len(lines) > limit:
+            print(Text(f"  ... and {len(lines) - limit} more", style="dim"))
+
+    print(Text("Graph diff (matched by node output / value name):", style="bold"))
+
+    print_section("Nodes removed", len(diff.removed_nodes))
+    print_capped(
+        [Text(f"  - {_node_label(n)}", style="red") for n in diff.removed_nodes]
+    )
+
+    print_section("Nodes added", len(diff.added_nodes))
+    print_capped(
+        [Text(f"  + {_node_label(n)}", style="green") for n in diff.added_nodes]
+    )
+
+    print_section("Nodes changed", len(diff.changed_nodes))
+    changed_lines = []
+    for before, after in diff.changed_nodes:
+        label = _node_label(after)
+        if before.op_type != after.op_type:
+            changed_lines.append(
+                Text(
+                    f"  ~ {label}: {before.op_type} -> {after.op_type}", style="yellow"
+                )
+            )
+        else:
+            changed_lines.append(
+                Text(
+                    f"  ~ {label}: inputs {list(before.inputs)} -> {list(after.inputs)}",
+                    style="yellow",
+                )
+            )
+    print_capped(changed_lines)
+
+    print_section("Values removed", len(diff.removed_values))
+    print_capped([Text(f"  - {v}", style="red") for v in diff.removed_values])
+
+    print_section("Values added", len(diff.added_values))
+    print_capped([Text(f"  + {v}", style="green") for v in diff.added_values])
+
+
 def _metric_str(value: Macs) -> str:
     # A metadata value is always a string. A symbolic metric is stored as its
     # factored formula (e.g. "512*batch"); a concrete one as its plain number.
     if _is_symbolic(value):
-        return str(sympy.factor(value))
+        return _factor_or_str(value)
     return str(value)
 
 
@@ -973,3 +1217,337 @@ def annotate_metadata(
     for key in ("macs", "flops", "mem_access"):
         _set_metadata(work.graph, prefix + key, _metric_str(totals[key]))
     return work
+
+
+# --------------------------------------------------------------------------- #
+# Weight quantization error: original float weight vs. its dequantized
+# (quantize -> dequantize round-trip) reconstruction
+# --------------------------------------------------------------------------- #
+@dataclasses.dataclass(frozen=True)
+class WeightQuantizationError:
+    """Accuracy metrics for one weight quantized by :func:`onnxsim.quantize_static`,
+    comparing the original float weight against ``(w_q - zero_point) * scale`` --
+    the inverse of the quantize step, i.e. rematerializing the weight through its
+    own quantization parameters -- computed by :func:`weight_quantization_error`.
+    """
+
+    node: str  # the quantized node's name, or its output name(s) if unnamed
+    weight_name: str  # the original float weight's initializer/tensor name
+    shape: Tuple[int, ...]
+    axis: int  # the per-channel quantization axis
+    mse: float
+    max_abs_error: float
+    relative_l2: float  # ||w - dequant||_2 / ||w||_2
+    cosine_similarity: float
+    sqnr_db: float  # 20*log10(||w||_2 / ||w - dequant||_2); +inf if exact
+    enob_bits: float  # (sqnr_db - 1.76) / 6.02 -- SQNR re-expressed as "effective bits"
+    psnr_db: float  # 20*log10(max|w| / rmse); the peak- rather than energy-normalized twin of sqnr_db
+    histogram_js_divergence: float  # Jensen-Shannon divergence (nats) between w's and dequant's value histograms -- a *distributional* check, complementing the element-wise metrics above
+    per_channel_relative_l2: List[float]  # one entry per channel along `axis`
+
+
+def _resolve_constant(graph: onnx.GraphProto, name: str) -> Optional[onnx.TensorProto]:
+    """The constant ``TensorProto`` backing value ``name`` -- an initializer, or a
+    ``Constant`` node's ``value`` attribute -- or ``None`` if ``name`` is not
+    constant (or not found).
+    """
+    for initializer in graph.initializer:
+        if initializer.name == name:
+            return initializer
+    for node in graph.node:
+        if node.op_type == "Constant" and node.output and node.output[0] == name:
+            for attr in node.attribute:
+                if attr.name == "value" and attr.HasField("t"):
+                    return attr.t
+    return None
+
+
+def _broadcast_along_axis(values: np.ndarray, ndim: int, axis: int) -> np.ndarray:
+    """Reshape a per-channel 1-D array (or a scalar) so it broadcasts against an
+    ``ndim``-D array along ``axis`` -- turns ``DequantizeLinear``'s ``scale`` /
+    ``zero_point`` (one value per channel, or a single scalar for per-tensor
+    quantization) into the shape numpy needs to apply it channel-wise.
+    """
+    values = np.asarray(values, dtype=np.float64)
+    if values.ndim == 0:
+        return values
+    shape = [1] * ndim
+    shape[axis] = values.shape[0]
+    return values.reshape(shape)
+
+
+def _histogram_js_divergence(
+    a: np.ndarray, b: np.ndarray, num_bins: int = 256
+) -> float:
+    """Jensen-Shannon divergence (nats; 0 = identical histograms, ``ln(2)`` =
+    disjoint) between ``a``'s and ``b``'s value histograms over their shared
+    range -- unlike the element-wise metrics in :func:`_tensor_error_metrics`
+    (which compare ``a[i]`` against ``b[i]``), this compares the *shape* of the
+    two distributions, so it can catch distortion (e.g. many distinct values
+    collapsing onto one quantization level) that averages out of the
+    element-wise metrics.
+
+    Unlike plain KL divergence, JS needs no epsilon-smoothing for empty bins:
+    the mixture ``m = (p + q) / 2`` is positive everywhere either input is, so
+    ``p * log(p / m)`` never divides by zero.
+    """
+    lo = float(min(a.min(), b.min()))
+    hi = float(max(a.max(), b.max()))
+    if hi <= lo:
+        return 0.0  # every value (in both arrays) is identical
+
+    p, _ = np.histogram(a, bins=num_bins, range=(lo, hi))
+    q, _ = np.histogram(b, bins=num_bins, range=(lo, hi))
+    p = p.astype(np.float64) / max(p.sum(), 1)
+    q = q.astype(np.float64) / max(q.sum(), 1)
+    m = 0.5 * (p + q)
+
+    def _kl(x: np.ndarray, y: np.ndarray) -> float:
+        mask = x > 0
+        return float(np.sum(x[mask] * np.log(x[mask] / y[mask])))
+
+    return 0.5 * _kl(p, m) + 0.5 * _kl(q, m)
+
+
+def _tensor_error_metrics(
+    original: np.ndarray, dequantized: np.ndarray, axis: int
+) -> Tuple[float, float, float, float, float, float, float, float, List[float]]:
+    """``(mse, max_abs_error, relative_l2, cosine_similarity, sqnr_db, enob_bits,
+    psnr_db, histogram_js_divergence, per_channel_relative_l2)`` between
+    ``original`` and ``dequantized`` (same shape), the last computed per channel
+    along ``axis``.
+    """
+    orig = original.astype(np.float64)
+    deq = dequantized.astype(np.float64)
+    diff = deq - orig
+
+    mse = float(np.mean(diff**2)) if diff.size else 0.0
+    max_abs_error = float(np.max(np.abs(diff))) if diff.size else 0.0
+
+    norm_orig = float(np.linalg.norm(orig))
+    norm_diff = float(np.linalg.norm(diff))
+    if norm_orig > 0:
+        relative_l2 = norm_diff / norm_orig
+        sqnr_db = (
+            math.inf if norm_diff == 0 else 20.0 * math.log10(norm_orig / norm_diff)
+        )
+    else:
+        # An all-zero original weight: any reconstruction error is undefined as a
+        # *relative* quantity, so report exact-zero as perfect and anything else
+        # as unbounded rather than dividing by zero.
+        relative_l2 = 0.0 if norm_diff == 0 else math.inf
+        sqnr_db = math.inf if norm_diff == 0 else -math.inf
+
+    norm_deq = float(np.linalg.norm(deq))
+    denom = norm_orig * norm_deq
+    cosine_similarity = (
+        float(np.dot(orig.ravel(), deq.ravel()) / denom) if denom > 0 else 1.0
+    )
+
+    # ENOB re-expresses SQNR in "effective bits" (the standard ADC/DSP
+    # conversion); +-inf propagates through the arithmetic unchanged.
+    enob_bits = (sqnr_db - 1.76) / 6.02
+
+    peak_orig = float(np.max(np.abs(orig))) if orig.size else 0.0
+    if mse == 0.0:
+        psnr_db = math.inf
+    elif peak_orig == 0.0:
+        psnr_db = -math.inf
+    else:
+        psnr_db = 20.0 * math.log10(peak_orig / math.sqrt(mse))
+
+    histogram_js_divergence = _histogram_js_divergence(orig, deq)
+
+    moved_orig = np.moveaxis(orig, axis, 0)
+    moved_deq = np.moveaxis(deq, axis, 0)
+    per_channel_relative_l2 = []
+    for c in range(moved_orig.shape[0]):
+        c_norm_orig = float(np.linalg.norm(moved_orig[c]))
+        c_norm_diff = float(np.linalg.norm(moved_deq[c] - moved_orig[c]))
+        if c_norm_orig > 0:
+            per_channel_relative_l2.append(c_norm_diff / c_norm_orig)
+        else:
+            per_channel_relative_l2.append(0.0 if c_norm_diff == 0 else math.inf)
+
+    return (
+        mse,
+        max_abs_error,
+        relative_l2,
+        cosine_similarity,
+        sqnr_db,
+        enob_bits,
+        psnr_db,
+        histogram_js_divergence,
+        per_channel_relative_l2,
+    )
+
+
+def weight_quantization_error(
+    model_before: onnx.ModelProto, model_after: onnx.ModelProto
+) -> List[WeightQuantizationError]:
+    """Measure how much each weight :func:`onnxsim.quantize_static` (the QDQ,
+    calibration-based pass) perturbed, by rematerializing every quantized weight
+    through its ``DequantizeLinear`` -- ``w_dequant = (w_q - zero_point) * scale``,
+    the inverse of the quantize step -- and diffing that reconstruction against
+    the original float weight from ``model_before``.
+
+    ``model_after`` must be the direct result of running
+    :func:`onnxsim.quantize_static` on ``model_before`` (or on a simplified copy
+    of it -- node *identity*, not exact byte content, is what matters here): a
+    ``Conv``/``MatMul``/``Gemm`` node is matched between the two models by its
+    output name, since ``quantize_static`` never renames or removes these nodes,
+    only rewires their ``X``/``W`` inputs (see
+    ``onnxsim/passes/static_quantize_matmul.h`` and ``static_quantize_conv.h``).
+    A match is only reported when the matched node's weight input traces back to
+    a ``DequantizeLinear`` whose inputs are a constant int8/uint8 tensor and a
+    constant float scale -- i.e. only where ``quantize_static`` actually
+    quantized that weight.
+
+    Not applicable to :func:`onnxsim.quantize_dynamic`: that pass replaces the
+    MatMul/Gemm node itself with ``MatMulInteger`` rather than dequantizing the
+    weight back to float in the graph, so there is no ``DequantizeLinear`` to
+    walk back through here. Its quantized weight and per-channel scale are still
+    plain initializers though (the ``B`` input of the ``MatMulInteger`` node, and
+    the constant operand of the ``Mul`` that combines it with the activation's
+    runtime-computed scale) -- extract them by name and feed
+    ``(w_q * w_scale)`` through the same reconstruction by hand if needed.
+
+    :param model_before: the float model, before quantization
+    :param model_after: ``onnxsim.quantize_static(model_before, ...)``'s result
+    :returns: one :class:`WeightQuantizationError` per matched weight, in the
+            order its node appears in ``model_after``
+    """
+    graph_before = model_before.graph
+    graph_after = model_after.graph
+    nodes_before = {tuple(n.output): n for n in graph_before.node if n.output}
+
+    results: List[WeightQuantizationError] = []
+    for node in graph_after.node:
+        if node.op_type not in ("Conv", "MatMul", "Gemm") or len(node.input) < 2:
+            continue
+        before_node = nodes_before.get(tuple(node.output))
+        if before_node is None or before_node.op_type != node.op_type:
+            continue
+
+        dq = next(
+            (
+                n
+                for n in graph_after.node
+                if n.op_type == "DequantizeLinear"
+                and n.output
+                and n.output[0] == node.input[1]
+            ),
+            None,
+        )
+        if dq is None or len(dq.input) < 2:
+            continue
+
+        wq_t = _resolve_constant(graph_after, dq.input[0])
+        ws_t = _resolve_constant(graph_after, dq.input[1])
+        w_orig_t = _resolve_constant(graph_before, before_node.input[1])
+        if wq_t is None or ws_t is None or w_orig_t is None:
+            continue
+        if wq_t.data_type not in (
+            onnx.TensorProto.INT8,
+            onnx.TensorProto.UINT8,
+        ):
+            continue
+
+        wq = numpy_helper.to_array(wq_t)
+        w_orig = numpy_helper.to_array(w_orig_t)
+        if wq.shape != w_orig.shape:
+            continue  # unexpected shape mismatch; skip rather than guess
+
+        axis = 1
+        for attr in dq.attribute:
+            if attr.name == "axis":
+                axis = attr.i
+        axis %= wq.ndim
+
+        zero_point = np.array(0.0)
+        if len(dq.input) >= 3 and dq.input[2]:
+            zp_t = _resolve_constant(graph_after, dq.input[2])
+            if zp_t is not None:
+                zero_point = numpy_helper.to_array(zp_t)
+
+        ws = numpy_helper.to_array(ws_t)
+        w_dequant = (
+            wq.astype(np.float64) - _broadcast_along_axis(zero_point, wq.ndim, axis)
+        ) * _broadcast_along_axis(ws, wq.ndim, axis)
+
+        (
+            mse,
+            max_abs_error,
+            relative_l2,
+            cosine_similarity,
+            sqnr_db,
+            enob_bits,
+            psnr_db,
+            histogram_js_divergence,
+            per_channel_relative_l2,
+        ) = _tensor_error_metrics(w_orig, w_dequant, axis)
+
+        results.append(
+            WeightQuantizationError(
+                node=before_node.name or "/".join(before_node.output),
+                weight_name=before_node.input[1],
+                shape=tuple(w_orig.shape),
+                axis=axis,
+                mse=mse,
+                max_abs_error=max_abs_error,
+                relative_l2=relative_l2,
+                cosine_similarity=cosine_similarity,
+                sqnr_db=sqnr_db,
+                enob_bits=enob_bits,
+                psnr_db=psnr_db,
+                histogram_js_divergence=histogram_js_divergence,
+                per_channel_relative_l2=per_channel_relative_l2,
+            )
+        )
+    return results
+
+
+def print_weight_quantization_error(
+    results: List[WeightQuantizationError], limit: int = 50
+) -> None:
+    """Pretty-print :func:`weight_quantization_error`'s results as a table,
+    worst (highest relative L2 error) weight first, capped at ``limit`` rows (with
+    a "... and N more" line) so a large model's report stays readable.
+    """
+
+    def _fmt(value: float) -> str:
+        if math.isinf(value):
+            return "inf" if value > 0 else "-inf"
+        return f"{value:.1f}"
+
+    table = Table()
+    table.add_column("Node")
+    table.add_column("Weight")
+    table.add_column("Shape")
+    table.add_column("MSE")
+    table.add_column("Max |Δ|")
+    table.add_column("Relative L2")
+    table.add_column("Cosine Sim.")
+    table.add_column("SQNR (dB)")
+    table.add_column("ENOB (bits)")
+    table.add_column("PSNR (dB)")
+    table.add_column("JS Div.")
+
+    ordered = sorted(results, key=lambda r: r.relative_l2, reverse=True)
+    for r in ordered[:limit]:
+        table.add_row(
+            r.node,
+            r.weight_name,
+            "x".join(str(d) for d in r.shape),
+            f"{r.mse:.3e}",
+            f"{r.max_abs_error:.3e}",
+            f"{r.relative_l2:.4f}",
+            f"{r.cosine_similarity:.6f}",
+            _fmt(r.sqnr_db),
+            _fmt(r.enob_bits),
+            _fmt(r.psnr_db),
+            f"{r.histogram_js_divergence:.4f}",
+        )
+    print(table)
+    if len(ordered) > limit:
+        print(Text(f"... and {len(ordered) - limit} more", style="dim"))

@@ -147,6 +147,14 @@ pub struct Options {
     /// * `Some(list)` — run every fuse/elimination pass except the names in
     ///   `list` (an empty list runs them all).
     skip_optimizers: Option<Vec<String>>,
+    /// Optimizer passes to run in ADDITION to the default fuse/elimination set
+    /// (plus whatever `skip_optimizers` left in) -- the counterpart to
+    /// `skip_optimizers`, for a pass registered outside the default set
+    /// (typically `PassType::Other`, e.g. a defusion that trades a
+    /// backend-specific op for a more portable one). Empty (the default) means
+    /// no extra passes. See [`list_other_optimizers`] for valid names; an
+    /// unknown name is an error at simplify time, not silently ignored.
+    extra_optimizers: Vec<String>,
     constant_folding: bool,
     shape_inference: bool,
     tensor_size_threshold: usize,
@@ -163,6 +171,7 @@ impl Default for Options {
     fn default() -> Self {
         Options {
             skip_optimizers: Some(Vec::new()),
+            extra_optimizers: Vec::new(),
             constant_folding: true,
             shape_inference: true,
             tensor_size_threshold: DEFAULT_TENSOR_SIZE_THRESHOLD,
@@ -239,6 +248,30 @@ impl Options {
         self
     }
 
+    /// Run these optimizer passes in addition to the default fuse/elimination
+    /// set. Replaces any previously configured extra-optimizer list.
+    ///
+    /// This is how a pass registered outside the default set (typically
+    /// `PassType::Other`, since it's a graph-shape rewrite rather than a pure
+    /// node reduction or fusion) gets opted into. Has no effect if optimization
+    /// is entirely disabled ([`Options::without_optimizers`]). Use
+    /// [`list_other_optimizers`] to discover valid names; an unknown name is an
+    /// error at simplify time.
+    pub fn extra_optimizers<I, S>(mut self, names: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.extra_optimizers = names.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// Add a single optimizer pass to the extra-optimizer list.
+    pub fn extra_optimizer<S: Into<String>>(mut self, name: S) -> Self {
+        self.extra_optimizers.push(name.into());
+        self
+    }
+
     /// Add a FunctionProto-based rewrite rule, matched and applied by onnxsim's
     /// C++ core inside the simplification fixed point.
     ///
@@ -272,6 +305,7 @@ pub fn simplify(model_bytes: &[u8]) -> Result<Vec<u8>, Error> {
 /// Returns the serialized simplified model.
 pub fn simplify_with(model_bytes: &[u8], options: &Options) -> Result<Vec<u8>, Error> {
     let ffi = FfiSkipOptimizers::new(options)?;
+    let extra = FfiExtraOptimizers::new(options)?;
 
     let mut out_data: *mut c_void = ptr::null_mut();
     let mut out_size: usize = 0;
@@ -289,6 +323,8 @@ pub fn simplify_with(model_bytes: &[u8], options: &Options) -> Result<Vec<u8>, E
                 bool_to_c(options.shape_inference),
                 options.tensor_size_threshold,
                 target_opset_to_c(options.target_opset_version),
+                extra.ptr(),
+                extra.len(),
                 None,
                 None,
                 ptr::null_mut(),
@@ -327,6 +363,8 @@ pub fn simplify_with(model_bytes: &[u8], options: &Options) -> Result<Vec<u8>, E
                 replacement_ptrs.as_ptr(),
                 replacement_sizes.as_ptr(),
                 rules.len(),
+                extra.ptr(),
+                extra.len(),
                 &mut out_data,
                 &mut out_size,
                 &mut out_error,
@@ -371,6 +409,7 @@ pub fn simplify_path_with<P: AsRef<Path>, Q: AsRef<Path>>(
     let in_c = path_to_cstring(input_path.as_ref())?;
     let out_c = path_to_cstring(output_path.as_ref())?;
     let ffi = FfiSkipOptimizers::new(options)?;
+    let extra = FfiExtraOptimizers::new(options)?;
 
     let mut out_error: *mut c_char = ptr::null_mut();
     let status = unsafe {
@@ -384,6 +423,8 @@ pub fn simplify_path_with<P: AsRef<Path>, Q: AsRef<Path>>(
             bool_to_c(options.shape_inference),
             options.tensor_size_threshold,
             target_opset_to_c(options.target_opset_version),
+            extra.ptr(),
+            extra.len(),
             None,
             None,
             ptr::null_mut(),
@@ -537,6 +578,7 @@ where
         panicked: false,
     };
     let ffi = FfiSkipOptimizers::new(options)?;
+    let extra = FfiExtraOptimizers::new(options)?;
 
     let mut out_data: *mut c_void = ptr::null_mut();
     let mut out_size: usize = 0;
@@ -553,6 +595,8 @@ where
             bool_to_c(options.shape_inference),
             options.tensor_size_threshold,
             target_opset_to_c(options.target_opset_version),
+            extra.ptr(),
+            extra.len(),
             Some(rewrite_trampoline),
             Some(rewrite_free_trampoline),
             &mut state as *mut RewriterState as *mut c_void,
@@ -598,6 +642,7 @@ where
         panicked: false,
     };
     let ffi = FfiSkipOptimizers::new(options)?;
+    let extra = FfiExtraOptimizers::new(options)?;
 
     let mut out_error: *mut c_char = ptr::null_mut();
     let status = unsafe {
@@ -611,6 +656,8 @@ where
             bool_to_c(options.shape_inference),
             options.tensor_size_threshold,
             target_opset_to_c(options.target_opset_version),
+            extra.ptr(),
+            extra.len(),
             Some(rewrite_trampoline),
             Some(rewrite_free_trampoline),
             &mut state as *mut RewriterState as *mut c_void,
@@ -631,6 +678,25 @@ where
 /// [`Options::skip_optimizers`].
 pub fn list_optimizers() -> Vec<String> {
     let raw = unsafe { onnxsim_sys::onnxsim_list_optimizers() };
+    if raw.is_null() {
+        return Vec::new();
+    }
+    let text = unsafe { CStr::from_ptr(raw) }
+        .to_string_lossy()
+        .into_owned();
+    unsafe { onnxsim_sys::onnxsim_free_string(raw) };
+    text.lines()
+        .filter(|line| !line.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Return the names of the optimizer passes registered but NOT in the default
+/// fuse/elimination set (typically `PassType::Other`, e.g.
+/// `defuse_matmul_integer_to_float`) -- the names accepted by
+/// [`Options::extra_optimizer`] and [`Options::extra_optimizers`].
+pub fn list_other_optimizers() -> Vec<String> {
+    let raw = unsafe { onnxsim_sys::onnxsim_list_other_optimizers() };
     if raw.is_null() {
         return Vec::new();
     }
@@ -689,6 +755,183 @@ pub fn model_info_diff(original: &[u8], simplified: &[u8]) -> Result<String, Err
     }
 }
 
+/// Render a node- and value-level diff between an `original` and a
+/// `simplified` model, both serialized ONNX `ModelProto` bytes: which
+/// nodes/values were removed, added, or changed (matched by output tensor
+/// name), e.g. a Conv whose bias input got folded into its weight.
+///
+/// Complementary to [`model_info_diff`], which reports op-count/size/MACs
+/// aggregates rather than the specific nodes and values involved.
+///
+/// ```no_run
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// let model = std::fs::read("model.onnx")?;
+/// let simplified = onnxsim::simplify(&model)?;
+/// print!("{}", onnxsim::graph_diff(&model, &simplified)?);
+/// # Ok(())
+/// # }
+/// ```
+pub fn graph_diff(original: &[u8], simplified: &[u8]) -> Result<String, Error> {
+    let mut out_text: *mut c_char = ptr::null_mut();
+    let mut out_error: *mut c_char = ptr::null_mut();
+
+    let status = unsafe {
+        onnxsim_sys::onnxsim_graph_diff(
+            original.as_ptr() as *const c_void,
+            original.len(),
+            simplified.as_ptr() as *const c_void,
+            simplified.len(),
+            &mut out_text,
+            &mut out_error,
+        )
+    };
+
+    if status == onnxsim_sys::ONNXSIM_OK {
+        if out_text.is_null() {
+            return Ok(String::new());
+        }
+        let text = unsafe { CStr::from_ptr(out_text) }
+            .to_string_lossy()
+            .into_owned();
+        unsafe { onnxsim_sys::onnxsim_free_string(out_text) };
+        Ok(text)
+    } else {
+        Err(take_error(out_error))
+    }
+}
+
+/// Export a serialized ONNX `ModelProto` to a standalone safetensors archive
+/// at `out_path`.
+///
+/// Every initializer's bytes move into the archive with real, byte-accurate
+/// offsets — openable by the `safetensors` Python package / HF tooling with
+/// no onnxsim involved — and the graph itself is embedded alongside them, so
+/// `out_path` alone is both the model's weights and its graph. Reload it with
+/// [`import_safetensors`].
+///
+/// ```no_run
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// let model = std::fs::read("model.onnx")?;
+/// onnxsim::export_safetensors(&model, "model.onnx.safetensors")?;
+/// # Ok(())
+/// # }
+/// ```
+pub fn export_safetensors<P: AsRef<Path>>(model_bytes: &[u8], out_path: P) -> Result<(), Error> {
+    let out_c = path_to_cstring(out_path.as_ref())?;
+    let mut out_error: *mut c_char = ptr::null_mut();
+    let status = unsafe {
+        onnxsim_sys::onnxsim_export_safetensors(
+            model_bytes.as_ptr() as *const c_void,
+            model_bytes.len(),
+            out_c.as_ptr(),
+            &mut out_error,
+        )
+    };
+    if status == onnxsim_sys::ONNXSIM_OK {
+        Ok(())
+    } else {
+        Err(take_error(out_error))
+    }
+}
+
+/// Import a standalone safetensors archive at `in_path` back into a
+/// serialized ONNX `ModelProto`.
+///
+/// `in_path` must be an archive produced by [`export_safetensors`] (or any
+/// other tool following the same self-describing-archive convention: an
+/// embedded `model.onnx` entry alongside the tensors). Fails if the archive
+/// has no embedded onnxsim model, e.g. a plain weights-only safetensors file
+/// with no graph to import.
+///
+/// ```no_run
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// let model_bytes = onnxsim::import_safetensors("model.onnx.safetensors")?;
+/// std::fs::write("model.onnx", &model_bytes)?;
+/// # Ok(())
+/// # }
+/// ```
+pub fn import_safetensors<P: AsRef<Path>>(in_path: P) -> Result<Vec<u8>, Error> {
+    let in_c = path_to_cstring(in_path.as_ref())?;
+    let mut out_data: *mut c_void = ptr::null_mut();
+    let mut out_size: usize = 0;
+    let mut out_error: *mut c_char = ptr::null_mut();
+    let status = unsafe {
+        onnxsim_sys::onnxsim_import_safetensors(
+            in_c.as_ptr(),
+            &mut out_data,
+            &mut out_size,
+            &mut out_error,
+        )
+    };
+    if status == onnxsim_sys::ONNXSIM_OK {
+        let result =
+            unsafe { std::slice::from_raw_parts(out_data as *const u8, out_size) }.to_vec();
+        unsafe { onnxsim_sys::onnxsim_free_buffer(out_data) };
+        Ok(result)
+    } else {
+        Err(take_error(out_error))
+    }
+}
+
+/// GGUF counterpart of [`export_safetensors`].
+///
+/// ```no_run
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// let model = std::fs::read("model.onnx")?;
+/// onnxsim::export_gguf(&model, "model.onnx.gguf")?;
+/// # Ok(())
+/// # }
+/// ```
+pub fn export_gguf<P: AsRef<Path>>(model_bytes: &[u8], out_path: P) -> Result<(), Error> {
+    let out_c = path_to_cstring(out_path.as_ref())?;
+    let mut out_error: *mut c_char = ptr::null_mut();
+    let status = unsafe {
+        onnxsim_sys::onnxsim_export_gguf(
+            model_bytes.as_ptr() as *const c_void,
+            model_bytes.len(),
+            out_c.as_ptr(),
+            &mut out_error,
+        )
+    };
+    if status == onnxsim_sys::ONNXSIM_OK {
+        Ok(())
+    } else {
+        Err(take_error(out_error))
+    }
+}
+
+/// GGUF counterpart of [`import_safetensors`].
+///
+/// ```no_run
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// let model_bytes = onnxsim::import_gguf("model.onnx.gguf")?;
+/// std::fs::write("model.onnx", &model_bytes)?;
+/// # Ok(())
+/// # }
+/// ```
+pub fn import_gguf<P: AsRef<Path>>(in_path: P) -> Result<Vec<u8>, Error> {
+    let in_c = path_to_cstring(in_path.as_ref())?;
+    let mut out_data: *mut c_void = ptr::null_mut();
+    let mut out_size: usize = 0;
+    let mut out_error: *mut c_char = ptr::null_mut();
+    let status = unsafe {
+        onnxsim_sys::onnxsim_import_gguf(
+            in_c.as_ptr(),
+            &mut out_data,
+            &mut out_size,
+            &mut out_error,
+        )
+    };
+    if status == onnxsim_sys::ONNXSIM_OK {
+        let result =
+            unsafe { std::slice::from_raw_parts(out_data as *const u8, out_size) }.to_vec();
+        unsafe { onnxsim_sys::onnxsim_free_buffer(out_data) };
+        Ok(result)
+    } else {
+        Err(take_error(out_error))
+    }
+}
+
 /// Owns the `CString`s and pointer array backing the `skip_optimizers` FFI
 /// arguments, keeping them alive for the duration of a call.
 struct FfiSkipOptimizers {
@@ -740,6 +983,47 @@ impl FfiSkipOptimizers {
 
     fn is_null_flag(&self) -> c_int {
         bool_to_c(self.is_null)
+    }
+}
+
+/// Owns the `CString`s and pointer array backing the `extra_optimizers` FFI
+/// arguments, keeping them alive for the duration of a call. Unlike
+/// [`FfiSkipOptimizers`] there is no null/empty distinction: an empty list
+/// already means "no extra passes".
+struct FfiExtraOptimizers {
+    // `_owned` keeps the C strings alive; `ptrs` points into them.
+    _owned: Vec<CString>,
+    ptrs: Vec<*const c_char>,
+}
+
+impl FfiExtraOptimizers {
+    fn new(options: &Options) -> Result<Self, Error> {
+        let mut owned = Vec::with_capacity(options.extra_optimizers.len());
+        for name in &options.extra_optimizers {
+            let c = CString::new(name.as_str()).map_err(|_| {
+                Error::InvalidArgument(format!(
+                    "optimizer name contains an interior NUL byte: {name:?}"
+                ))
+            })?;
+            owned.push(c);
+        }
+        let ptrs = owned.iter().map(|c| c.as_ptr()).collect();
+        Ok(FfiExtraOptimizers {
+            _owned: owned,
+            ptrs,
+        })
+    }
+
+    fn ptr(&self) -> *const *const c_char {
+        if self.ptrs.is_empty() {
+            ptr::null()
+        } else {
+            self.ptrs.as_ptr()
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.ptrs.len()
     }
 }
 
@@ -1183,6 +1467,7 @@ where
         panicked: false,
     };
     let ffi = FfiSkipOptimizers::new(options)?;
+    let extra = FfiExtraOptimizers::new(options)?;
 
     let mut out_data: *mut c_void = ptr::null_mut();
     let mut out_size: usize = 0;
@@ -1199,6 +1484,8 @@ where
             bool_to_c(options.shape_inference),
             options.tensor_size_threshold,
             target_opset_to_c(options.target_opset_version),
+            extra.ptr(),
+            extra.len(),
             None,
             None,
             ptr::null_mut(),
@@ -1279,8 +1566,56 @@ mod tests {
         assert!(opts.constant_folding);
         assert!(opts.shape_inference);
         assert_eq!(opts.skip_optimizers, Some(Vec::new()));
+        assert!(opts.extra_optimizers.is_empty());
         assert_eq!(opts.tensor_size_threshold, DEFAULT_TENSOR_SIZE_THRESHOLD);
         assert_eq!(opts.target_opset_version, None);
+    }
+
+    #[test]
+    fn extra_optimizer_appends() {
+        let opts = Options::new()
+            .extra_optimizer("replace_einsum_with_matmul")
+            .extra_optimizer("defuse_matmul_integer_to_float");
+        assert_eq!(
+            opts.extra_optimizers,
+            vec![
+                "replace_einsum_with_matmul".to_string(),
+                "defuse_matmul_integer_to_float".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn extra_optimizers_replaces_list() {
+        let opts = Options::new()
+            .extra_optimizer("a")
+            .extra_optimizers(["b", "c"]);
+        assert_eq!(
+            opts.extra_optimizers,
+            vec!["b".to_string(), "c".to_string()]
+        );
+    }
+
+    #[test]
+    fn ffi_extra_optimizers_layout() {
+        let opts = Options::new().extra_optimizers(["a", "bb"]);
+        let ffi = FfiExtraOptimizers::new(&opts).unwrap();
+        assert_eq!(ffi.len(), 2);
+        assert!(!ffi.ptr().is_null());
+
+        let empty = Options::new();
+        let ffi_empty = FfiExtraOptimizers::new(&empty).unwrap();
+        assert_eq!(ffi_empty.len(), 0);
+        assert!(ffi_empty.ptr().is_null());
+    }
+
+    #[test]
+    fn extra_optimizer_interior_nul_is_rejected() {
+        let opts = Options::new().extra_optimizer("bad\0name");
+        assert!(matches!(
+            FfiExtraOptimizers::new(&opts),
+            Err(Error::InvalidArgument(_))
+        ));
     }
 
     #[test]

@@ -37,6 +37,22 @@ DEBUG = bool(os.getenv('DEBUG'))
 COVERAGE = bool(os.getenv('COVERAGE'))
 VERSION_FILE = os.path.join(TOP_DIR, 'VERSION')
 
+# Opt-in only -- see docs/wasm_pyodide.md. When building under `pyodide build`
+# (pywasmcross-wrapped compilers targeting wasm32-emscripten), CMake's own
+# MODULE/SHARED library support is unavailable (Emscripten's CMake toolchain
+# file hardcodes TARGET_SUPPORTS_SHARED_LIBS=FALSE), so the
+# onnxsim_cpp2py_export target CMake produces is a static ar archive, not a
+# loadable Pyodide side module -- byte-identical to the dead end
+# build_wasm_pyodide.sh's manual em++ relink step already works around.
+# This flag makes build_ext perform that exact same manual relink, in place,
+# before the artifact is copied into the wheel. It does nothing (and this
+# whole code path is not even imported/evaluated beyond this flag check)
+# unless explicitly set -- a normal `pip install .` / native wheel build is
+# completely unaffected. Deliberately an explicit env var rather than
+# auto-detection, so this never silently changes native-build behavior.
+ONNXSIM_WASM_SIDE_MODULE_RELINK = bool(
+    os.getenv('ONNXSIM_WASM_SIDE_MODULE_RELINK') == '1')
+
 try:
     version = subprocess.check_output(['git', 'describe', '--tags', '--abbrev=0'],
                                       cwd=TOP_DIR).decode('ascii').strip()
@@ -143,15 +159,36 @@ class cmake_build(setuptools.Command):
             if WINDOWS:
                 build_type = 'Release'
             # configure
+            # onnx's own CMakeLists.txt calls the VERSIONED find_package(Python3
+            # ...), needing Python3_EXECUTABLE/Python3_INCLUDE_DIR(S); nanobind's
+            # own CMake config separately reads the plural, unversioned
+            # Python_INCLUDE_DIRS. A normal native build never needed these --
+            # CMake's automatic Python3 discovery just finds the host
+            # interpreter -- but pyodide build's cross-compilation environment
+            # doesn't seed those hints on its own, so `find_package(Python3
+            # ...)` fails outright there ("Could NOT find Python3 (missing:
+            # Python3_INCLUDE_DIRS Development.Module)") unless they're passed
+            # explicitly, same as build_wasm_pyodide.sh already does for its own
+            # (separate, non-setup.py) CMake invocation. Passing them here too,
+            # to the exact same values as the Python_* hints below, is a no-op
+            # for every existing native build (same interpreter/headers CMake
+            # would already have auto-discovered) and is what lets
+            # ONNXSIM_WASM_SIDE_MODULE_RELINK's `pyodide build` path configure
+            # at all. See docs/wasm_pyodide.md.
+            python_include = sysconfig.get_path('include')
             cmake_args = [
                 CMAKE,
-                '-DPython_INCLUDE_DIR={}'.format(sysconfig.get_path('include')),
+                '-DPython_INCLUDE_DIR={}'.format(python_include),
+                '-DPython_INCLUDE_DIRS={}'.format(python_include),
                 '-DPython_EXECUTABLE={}'.format(sys.executable),
+                '-DPython3_INCLUDE_DIR={}'.format(python_include),
+                '-DPython3_INCLUDE_DIRS={}'.format(python_include),
+                '-DPython3_EXECUTABLE={}'.format(sys.executable),
                 '-DONNX_BUILD_PYTHON=ON',
                 "-DONNX_INSTALL=OFF",
                 '-DONNXSIM_PYTHON=ON',
                 '-DONNXSIM_BUILTIN_ORT=OFF',
-                '-DONNX_USE_LITE_PROTO=OFF',
+                '-DONNX_USE_LITE_PROTO=ON',
                 '-DCMAKE_EXPORT_COMPILE_COMMANDS=ON',
                 '-DONNX_NAMESPACE={}'.format(ONNX_NAMESPACE),
                 '-DONNX_OPT_USE_SYSTEM_PROTOBUF={}'.format(
@@ -159,6 +196,44 @@ class cmake_build(setuptools.Command):
             ]
             if IS_FREE_THREADED:
                 cmake_args.append('-DPython3_FIND_ABI=ANY;ANY;ANY;ANY')
+            if ONNXSIM_WASM_SIDE_MODULE_RELINK:
+                # nanobind 3.0.0's nb_backend.h/nb_types.h/ndarray.h use
+                # stderr/fprintf without including <cstdio> -- works by
+                # accident on glibc hosts (pulled in transitively through
+                # some other header) and fails outright under Emscripten's
+                # libc++, which doesn't ("error: use of undeclared
+                # identifier 'stderr'"). Real upstream nanobind bug, not
+                # onnxsim-specific -- build_wasm_pyodide.sh already works
+                # around it the same way for its own CMake invocation. See
+                # docs/wasm_pyodide.md.
+                cmake_args.append('-DCMAKE_CXX_FLAGS=-include cstdio')
+                # Without an override, onnx's own CMakeLists.txt (see its
+                # relative_protobuf_generate_cpp()) defaults
+                # ONNX_PROTOC_EXECUTABLE to the in-tree, JUST-CROSS-BUILT
+                # `protoc` target -- under wasm32-emscripten, a Node-
+                # launched .js wrapper (e.g. protoc.js-31.1.0), invoked as
+                # a PLAIN `COMMAND "${ONNX_PROTOC_EXECUTABLE}" ...` with no
+                # CMAKE_CROSSCOMPILING_EMULATOR/node wrapping at all.
+                # Confirmed directly (both in onnx/CMakeLists.txt and by
+                # testing CMAKE_CROSSCOMPILING_EMULATOR, which has zero
+                # effect here since nothing reads it for this custom
+                # command): this only works when the file itself is
+                # directly executable, which it apparently isn't inside
+                # `pyodide build`'s isolated build env ("Permission
+                # denied" trying to exec protoc.js-31.1.0). Same
+                # requirement as obstacle 1 in docs/wasm_pyodide.md:
+                # build_wasm_pyodide.sh sidesteps this identical problem
+                # entirely by pointing ONNX_CUSTOM_PROTOC_EXECUTABLE at a
+                # HOST protoc binary instead (a normal native executable,
+                # no cross-exec concerns) -- do the same here. The CI job
+                # setting ONNXSIM_WASM_SIDE_MODULE_RELINK=1 is expected to
+                # have already installed a matching host protoc (same
+                # version as onnxsim's vendored protobuf) on PATH, exactly
+                # as pyodide-wasm.yml's own job already does.
+                protoc = shutil.which('protoc')
+                if protoc:
+                    cmake_args.append(
+                        '-DONNX_CUSTOM_PROTOC_EXECUTABLE={}'.format(protoc))
             if COVERAGE:
                 cmake_args.append('-DONNX_COVERAGE=ON')
                 # Instrument onnxsim's own C++ (onnxsim.cpp, cpp2py_export.cc,
@@ -219,6 +294,85 @@ class develop(setuptools.command.develop.develop):
         setuptools.command.develop.develop.run(self)
 
 
+def _relink_wasm_side_module(build_dir, so_path):
+    """Re-link `so_path` (a CMake-produced static ar archive containing only
+    onnxsim_cpp2py_export's own object file, under Emscripten's CMake
+    toolchain -- see ONNXSIM_WASM_SIDE_MODULE_RELINK above) into a genuine
+    Pyodide side module, in place.
+
+    Exact same approach as build_wasm_pyodide.sh's manual link step: reuses
+    the object file and every dependency archive (abseil/protobuf/onnx/
+    onnx-optimizer/onnxsim/nanobind) CMake already built under `build_dir`,
+    discovering both at run time rather than hand-maintaining a list. See
+    docs/wasm_pyodide.md for why this manual step is necessary at all.
+    """
+    em_plus_plus = shutil.which('em++')
+    if not em_plus_plus:
+        raise RuntimeError(
+            'ONNXSIM_WASM_SIDE_MODULE_RELINK=1 but no em++ on PATH -- '
+            'activate the emsdk (or run under pyodide build, which puts a '
+            'pywasmcross-wrapped em++ on PATH) before building.')
+
+    module_name = 'onnxsim_cpp2py_export'
+    obj = None
+    for root, _dirs, files in os.walk(
+            os.path.join(build_dir, 'CMakeFiles', f'{module_name}.dir')):
+        for f in files:
+            if f == 'cpp2py_export.cc.o':
+                obj = os.path.join(root, f)
+                break
+        if obj:
+            break
+    if not obj:
+        raise RuntimeError(
+            f'ONNXSIM_WASM_SIDE_MODULE_RELINK=1: could not find '
+            f'cpp2py_export.cc.o under {build_dir}/CMakeFiles/'
+            f'{module_name}.dir (did the CMake build actually run?)')
+
+    archives = []
+    for root, _dirs, files in os.walk(build_dir):
+        for f in files:
+            if f.endswith('.a'):
+                archives.append(os.path.join(root, f))
+    archives.sort()
+    if not archives:
+        raise RuntimeError(
+            f'ONNXSIM_WASM_SIDE_MODULE_RELINK=1: no .a archives found under '
+            f'{build_dir} -- expected dependency archives '
+            f'(abseil/protobuf/onnx/onnx-optimizer/onnxsim/nanobind) to '
+            f'already be built at this point.')
+
+    # Discover the real entry symbol (PyInit_<module name>, per CPython's
+    # extension-module ABI) from the object file via llvm-nm rather than
+    # assuming it matches module_name, so a future module rename doesn't
+    # silently produce a link missing its only real entry point.
+    entry_symbol = None
+    llvm_nm = shutil.which('llvm-nm')
+    if llvm_nm:
+        out = subprocess.run([llvm_nm, obj], capture_output=True, text=True)
+        for line in out.stdout.splitlines():
+            parts = line.split()
+            if len(parts) >= 3 and parts[1] == 'T' and parts[2].startswith('PyInit_'):
+                entry_symbol = parts[2]
+                break
+    if not entry_symbol:
+        entry_symbol = f'PyInit_{module_name}'
+
+    # -sEXPORTED_FUNCTIONS is required: without an explicit root symbol, the
+    # linker's dead-code elimination strips the module down to a couple KB,
+    # since nothing else in this standalone link references the nanobind
+    # entry point (there's no main()/other symbol pulling it in, unlike
+    # inside Pyodide's real loader).
+    cmd = [
+        em_plus_plus, '-O2', '-sSIDE_MODULE=2',
+        f'-sEXPORTED_FUNCTIONS=_{entry_symbol}',
+        '-o', so_path, obj,
+    ] + archives
+    print(f'ONNXSIM_WASM_SIDE_MODULE_RELINK=1: relinking wasm side module: '
+          f'{" ".join(cmd[:6])} ... (+{len(archives)} archives)')
+    subprocess.check_call(cmd)
+
+
 class build_ext(setuptools.command.build_ext.build_ext):
     def run(self):
         self.run_command('cmake_build')
@@ -238,6 +392,8 @@ class build_ext(setuptools.command.build_ext.build_ext):
                 elif os.path.exists(release_lib_dir):
                     lib_path = release_lib_dir
             src = os.path.join(lib_path, filename)
+            if ONNXSIM_WASM_SIDE_MODULE_RELINK:
+                _relink_wasm_side_module(lib_path, src)
             dst_dir = os.path.join(os.path.realpath(
                 self.build_lib), "onnxsim")
             dst = os.path.join(dst_dir, filename)

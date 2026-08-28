@@ -29,6 +29,7 @@
 
 #include <vector>
 
+#include "gemm_fusion_backend.h"
 #include "onnx/common/assertions.h"
 #include "onnxoptimizer/pass.h"
 #include "onnxoptimizer/passes/pass_util.h"
@@ -48,12 +49,27 @@ struct FuseMatMulAddBiasIntoGemmBatched final : public PredicateBasedPass {
     return "fuse_matmul_add_bias_into_gemm_batched";
   }
 
-  static Value* MakeInt64Constant(Graph& graph, std::vector<int64_t> data) {
+  // This pass instance is reused across every round of onnxsim's
+  // simplification fixed point, but a batch of reserved names is only valid
+  // for the graph state it was reserved against -- other passes/rounds can
+  // introduce new names in between. Drop any leftover reservation from a
+  // prior runPass() call so nextReservedName() always reserves fresh against
+  // the current graph (mirrors ExtractConstantToInitializer's own
+  // initializePass, same rationale).
+  bool initializePass(Graph&) override {
+    reserved_names_.clear();
+    reserved_used_ = 0;
+    return false;
+  }
+
+  static Value* MakeInt64Constant(Graph& graph, std::vector<int64_t> data,
+                                  std::string name) {
     Tensor t;
+    t.setName(std::move(name));
     t.sizes().push_back(static_cast<int64_t>(data.size()));
     t.elem_type() = TensorProto_DataType_INT64;
     t.int64s() = std::move(data);
-    return graph.addInitializerAndCreateValue(t);
+    return graph.addInitializerAndCreateValue(std::move(t));
   }
 
   // Add is commutative, so the MatMul may be either operand. Exporters differ:
@@ -91,6 +107,21 @@ struct FuseMatMulAddBiasIntoGemmBatched final : public PredicateBasedPass {
       return false;
     }
     const int64_t k = x_shape.back().dim;
+
+    // ONNX Runtime's CPU execution provider has no fast Gemm kernel for
+    // FLOAT16 (it falls back to a naive/reference path) even though its
+    // MatMul kernel does -- see fuse_matmul_add_bias_into_gemm.h's file
+    // comment for the measurement (a K=1024, N=4096 case: ~110ms for
+    // MatMul+Add vs. ~7.8s for the fused Gemm). Under the default
+    // GemmFusionBackend::kOrtCpu (see gemm_fusion_backend.h), bail out for
+    // any type but FLOAT32 so this pass only fires where the fusion is
+    // actually a speedup on that backend; GemmFusionBackend::kUnrestricted
+    // skips this guard for a deployment target where it does not apply.
+    if (onnxsim::GetGemmFusionBackend() ==
+            onnxsim::GemmFusionBackend::kOrtCpu &&
+        x->elemType() != TensorProto_DataType_FLOAT) {
+      return false;
+    }
 
     // W: a 2-D constant [K, N] with static dims, matching K.
     if (!IsConstantTensor(w) || !w->has_sizes()) {
@@ -150,7 +181,7 @@ struct FuseMatMulAddBiasIntoGemmBatched final : public PredicateBasedPass {
     // X2 = Reshape(X, [-1, K])
     Node* pre = graph.create(kReshape, 1);
     pre->addInput(x);
-    pre->addInput(MakeInt64Constant(graph, {-1, k}));
+    pre->addInput(MakeInt64Constant(graph, {-1, k}, nextReservedName(graph)));
 
     // G = Gemm(X2, W, bias)
     Node* gemm = graph.create(kGemm, 1);
@@ -183,7 +214,8 @@ struct FuseMatMulAddBiasIntoGemmBatched final : public PredicateBasedPass {
     if (leading_static) {
       std::vector<int64_t> out_shape = leading_dims;
       out_shape.push_back(out_n);
-      post->addInput(MakeInt64Constant(graph, std::move(out_shape)));
+      post->addInput(MakeInt64Constant(graph, std::move(out_shape),
+                                       nextReservedName(graph)));
     } else {
       // shape(X) -> slice off the last dim -> concat with [N]
       Node* shape = graph.create(Symbol("Shape"), 1);
@@ -192,14 +224,18 @@ struct FuseMatMulAddBiasIntoGemmBatched final : public PredicateBasedPass {
 
       Node* slice = graph.create(kSlice, 1);
       slice->addInput(shape->output());
-      slice->addInput(MakeInt64Constant(graph, {0}));         // starts
-      slice->addInput(MakeInt64Constant(graph, {rank - 1}));  // ends
-      slice->addInput(MakeInt64Constant(graph, {0}));         // axes
+      slice->addInput(
+          MakeInt64Constant(graph, {0}, nextReservedName(graph)));  // starts
+      slice->addInput(MakeInt64Constant(graph, {rank - 1},
+                                        nextReservedName(graph)));  // ends
+      slice->addInput(
+          MakeInt64Constant(graph, {0}, nextReservedName(graph)));  // axes
       slice->insertBefore(n);
 
       Node* concat = graph.create(kConcat, 1);
       concat->addInput(slice->output());
-      concat->addInput(MakeInt64Constant(graph, {out_n}));
+      concat->addInput(
+          MakeInt64Constant(graph, {out_n}, nextReservedName(graph)));
       concat->i_(kaxis, 0);
       concat->insertBefore(n);
 
@@ -217,6 +253,32 @@ struct FuseMatMulAddBiasIntoGemmBatched final : public PredicateBasedPass {
     // Destroy the Add; the now-dead MatMul is cleaned up by DCE.
     destroy_current = NodeDestroyType::DestroyOne;
     return true;
+  }
+
+ private:
+  // Each match mints up to 5 fresh initializer names (pre-reshape's shape,
+  // plus either the post-reshape's shape or -- on the dynamic-leading-dims
+  // path -- Slice's starts/ends/axes and Concat's [N]). Each of those,
+  // undrawn from a reservation, would go through
+  // Graph::addInitializerAndCreateValue -> getNextUniqueName(), and every
+  // such call pays a full graph (and subgraph) scan of its own -- on a
+  // transformer model with dozens of batched Linear layers this made the
+  // pass's modify-phase cost scale with matches * graph size instead of
+  // matches (see model-regression CI's pass-phase profiling: BERT showed
+  // ~1.4ms/match here despite patternMatchPredicate being ~0). Same fix as
+  // ExtractConstantToInitializer (onnxsim issue #651): draw from a batch
+  // reserved via Graph::reserveUniqueNames() (one scan per batch) instead of
+  // one scan per name.
+  static constexpr size_t kNameBatchSize = 256;
+  std::vector<std::string> reserved_names_;
+  size_t reserved_used_ = 0;
+
+  std::string nextReservedName(Graph& graph) {
+    if (reserved_used_ >= reserved_names_.size()) {
+      reserved_names_ = graph.reserveUniqueNames(kNameBatchSize);
+      reserved_used_ = 0;
+    }
+    return std::move(reserved_names_[reserved_used_++]);
   }
 };
 

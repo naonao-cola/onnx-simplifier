@@ -1,0 +1,404 @@
+# Regression test for the SymExpr / symbolic-dimension-algebra work
+# (issue #597, PR #527, M0-M3 of #532): does onnxsim's symbolic shape/value
+# evaluator actually fold the shape scaffolding a real KV-cache transformer
+# export produces, and does doing so ever change what the model computes?
+#
+# The model below is the same KV-cache attention block used to motivate that
+# work: exported with ``torch.onnx.export(..., dynamo=True)`` and
+# ``torch.export.Dim``, it produces a ``Shape -> Gather -> Add -> Range``
+# chain computing ``past_len + seq_len`` (two dynamic dims added together,
+# feeding the position-aware causal mask's ``torch.arange`` bound) -- exactly
+# the case plain ONNX data propagation cannot fold because it has no
+# arithmetic over a ``dim_param``, but onnxsim's SymExpr can compute. Three
+# independently-dynamic axes are declared here (``batch``, ``seq_len``,
+# ``past_len``), which is realistic but means onnxsim's *Reshape target ->
+# -1* rewrite (which requires exactly one symbolic slot in the target,
+# ``onnxsim.cpp``'s ``unknown != 1`` check) generally can't fire on this
+# particular model -- almost every reshape combining ``past_len+seq_len``
+# also has the independently-dynamic ``batch`` as a second symbolic slot in
+# the same target. So this test does not claim the Add vanishes; see
+# ``test_onnxsim_removes_kv_cache_shape_scaffolding``'s own comment.
+#
+#   * ``test_onnxsim_removes_kv_cache_shape_scaffolding``: the scaffolding
+#     pattern is actually present in the raw export (a sanity check that
+#     this test isn't vacuous), the graph shrinks overall, and the pattern
+#     does not get *more* common after simplification.
+#   * ``test_onnxsim_symexpr_matches_torch_shapeenv_symbols``: cross-checks
+#     onnxsim's SymExpr (re-derived from the *exported ONNX graph*) against
+#     torch.export's own ShapeEnv (sympy-backed, computed from the *FX
+#     graph*) agreeing that the traced model actually combines two distinct
+#     dynamic dims -- two independent computations over two different
+#     representations agreeing is real corroboration, not a tautology. This
+#     reaches into ``ExportedProgram``/``ShapeEnv`` internals that are not a
+#     stable public API, so it is skipped (not failed) if a torch version's
+#     internals don't match what it expects, rather than breaking the suite
+#     on a torch upgrade.
+#   * ``test_onnxsim_kv_cache_consistency``: across several concrete
+#     ``(batch, seq_len, past_len)`` instantiations, the onnxsim-simplified
+#     ONNX model still matches the original eager PyTorch module -- the
+#     algebra is only useful if simplifying with it never changes behavior.
+#   * ``test_onnxsim_captures_symbolic_dim_expressions_to_metadata_props``:
+#     a *temporary*, purely local prototype of the "persist a resolved
+#     formula" idea from onnxsim/onnx#0008's Future Possibilities section,
+#     using infrastructure the ONNX spec already has today --
+#     ``ValueInfoProto.metadata_props`` (a ``repeated StringStringEntryProto``,
+#     present on ``ValueInfoProto`` since the IR-version-9/10 metadata-props
+#     additions) -- rather than the new field that proposal describes. This
+#     is deliberately *not* a proposal for that exact key/value convention;
+#     it only demonstrates that the annotation is expressible, inert, and
+#     spec-compliant with nothing new to standardize, as one data point for
+#     that future discussion. Scope is limited to the graph's declared
+#     inputs/outputs, where FX values and ONNX ``ValueInfoProto``s can be
+#     correlated reliably (by position, since both come from the same
+#     ``output_names`` list) -- correlating arbitrary *intermediate* values
+#     is exactly the "no FX-name -> ONNX-name correlation" difficulty noted
+#     elsewhere, and is out of scope here.
+#
+# To run locally::
+#
+#     pip install torch onnxruntime
+#     pip install --force-reinstall --no-deps .   # the onnxsim under test
+#     pytest tests/test_symexpr_kv_cache_consistency.py -v
+
+import sys
+
+import numpy as np
+import onnx
+import pytest
+
+import onnxsim
+
+torch = pytest.importorskip("torch")
+onnxruntime = pytest.importorskip("onnxruntime")
+
+import torch.nn as nn  # noqa: E402  (after the torch importorskip guard)
+
+HIDDEN = 64
+NUM_HEADS = 4
+HEAD_DIM = HIDDEN // NUM_HEADS
+
+_SCAFFOLDING_OPS = {"Shape", "Gather", "Add", "Unsqueeze", "Concat"}
+
+
+class _CausalSelfAttentionWithCache(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.qkv = nn.Linear(HIDDEN, 3 * HIDDEN, bias=False)
+        self.proj = nn.Linear(HIDDEN, HIDDEN, bias=False)
+
+    def forward(self, x, past_key, past_value):
+        b, s, h = x.shape
+        past_len = past_key.shape[2]
+        q, k, v = self.qkv(x).split(HIDDEN, dim=-1)
+
+        def split_heads(t):
+            return t.view(b, s, NUM_HEADS, HEAD_DIM).transpose(1, 2)
+
+        q, k, v = split_heads(q), split_heads(k), split_heads(v)
+
+        # past_len + seq_len: two dynamic dims added together.
+        k = torch.cat([past_key, k], dim=2)
+        v = torch.cat([past_value, v], dim=2)
+
+        # A position-aware causal mask, not SDPA's is_causal=True: query i
+        # sits at absolute position past_len+i (it may attend to every key
+        # up to and including its own position), which is the correct,
+        # cache-aware causal rule -- is_causal=True instead assumes the
+        # current chunk's queries start at position 0, which is wrong the
+        # moment past_key is non-empty. Building this mask is also what
+        # forces total_len = past_len + seq_len to be computed as a real
+        # graph value (feeding torch.arange's dynamic length) rather than
+        # staying implicit in Concat's output shape -- i.e. this is the
+        # fix for both the correctness bug and the vacuous scaffolding
+        # check below, together, not a workaround for one at the cost of
+        # the other.
+        total_len = past_len + s
+        query_pos = torch.arange(s, device=x.device) + past_len
+        key_pos = torch.arange(total_len, device=x.device)
+        causal_mask = torch.where(
+            key_pos[None, :] <= query_pos[:, None], 0.0, float("-inf")
+        )
+
+        out = torch.nn.functional.scaled_dot_product_attention(
+            q, k, v, attn_mask=causal_mask
+        )
+        # h is read directly from x's own (non-dynamic) hidden-size dim, so
+        # this reshape's target is [batch, seq_len, 64] -- both batch and
+        # seq_len are independently dynamic, so this is a plain multi-dim
+        # data-propagation case, not a compound-symbol-arithmetic one.
+        out = out.transpose(1, 2).reshape(b, s, h)
+        return self.proj(out), k, v
+
+
+def _export(tmp_path, batch=2, seq_len=8, past_len=5):
+    torch.manual_seed(0)
+    model = _CausalSelfAttentionWithCache().eval()
+
+    x = torch.randn(batch, seq_len, HIDDEN)
+    past_k = torch.randn(batch, NUM_HEADS, past_len, HEAD_DIM)
+    past_v = torch.randn(batch, NUM_HEADS, past_len, HEAD_DIM)
+
+    batch_dim = torch.export.Dim("batch")
+    seq_dim = torch.export.Dim("seq_len")
+    past_dim = torch.export.Dim("past_len")
+
+    onnx_path = str(tmp_path / "kv_cache_attn.onnx")
+    onnx_program = torch.onnx.export(
+        model,
+        (x, past_k, past_v),
+        dynamic_shapes={
+            "x": {0: batch_dim, 1: seq_dim},
+            "past_key": {0: batch_dim, 2: past_dim},
+            "past_value": {0: batch_dim, 2: past_dim},
+        },
+        dynamo=True,
+        input_names=["x", "past_key", "past_value"],
+        output_names=["out", "present_key", "present_value"],
+    )
+    onnx_program.save(onnx_path)
+    return onnx_path, onnx_program, model
+
+
+def _has_shape_arithmetic_scaffolding(model: onnx.ModelProto) -> bool:
+    """True iff the graph contains an Add node whose two inputs both trace
+    back to a Shape node -- the "dim + dim computed at runtime" pattern this
+    module is about, not just incidental use of these op types elsewhere."""
+    producer = {}
+    for node in model.graph.node:
+        for out in node.output:
+            producer[out] = node
+
+    def _feeds_from_shape(name: str, depth: int = 0) -> bool:
+        if depth > 4 or name not in producer:
+            return False
+        node = producer[name]
+        if node.op_type == "Shape":
+            return True
+        if node.op_type in ("Gather", "Cast", "Squeeze", "Unsqueeze"):
+            return any(_feeds_from_shape(i, depth + 1) for i in node.input if i)
+        return False
+
+    for node in model.graph.node:
+        if node.op_type != "Add" or len(node.input) != 2:
+            continue
+        if all(_feeds_from_shape(i) for i in node.input):
+            return True
+    return False
+
+
+@pytest.fixture(scope="module")
+def exported_and_simplified(tmp_path_factory):
+    tmp_path = tmp_path_factory.mktemp("symexpr_kv_cache")
+    onnx_path, onnx_program, eager_model = _export(tmp_path)
+    raw = onnx.load(onnx_path)
+
+    simplified, check_ok = onnxsim.simplify(onnx_path, check_n=0)
+    assert check_ok
+
+    return raw, simplified, onnx_program, eager_model
+
+
+def test_onnxsim_removes_kv_cache_shape_scaffolding(exported_and_simplified):
+    raw, simplified, _, _ = exported_and_simplified
+
+    # Sanity check first: if the raw export doesn't even contain the
+    # pattern, the rest of this test would pass vacuously.
+    assert _has_shape_arithmetic_scaffolding(raw), (
+        "raw export doesn't contain the past_len+seq_len scaffolding this "
+        "test is about -- torch's export shape changed, update the model"
+    )
+
+    onnx.checker.check_model(simplified)
+    assert len(simplified.graph.node) < len(raw.graph.node)
+
+    # NOT a "the past_len+seq_len Add must vanish" assertion. onnxsim's
+    # Reshape->[-1, ...] rewrite (onnxsim.cpp, `unknown != 1`) only fires
+    # when a reshape target has *exactly one* symbolic dimension slot. This
+    # model has three independently-dynamic axes (batch, seq_len, past_len),
+    # so almost any reshape combining past_len+seq_len also has `batch` as a
+    # second symbolic slot in the same target -- onnxsim deliberately does
+    # not fold that (ONNX's -1 sentinel can only stand for one unknown), so
+    # asserting the Add disappears here would be asserting something
+    # onnxsim was never built to do for this shape of model. What's
+    # actually load-bearing: onnxsim must not make the scaffolding *worse*
+    # (regress node count for this pattern) while still shrinking the graph
+    # overall (checked above).
+    raw_count = sum(1 for n in raw.graph.node if n.op_type in _SCAFFOLDING_OPS)
+    simplified_count = sum(
+        1 for n in simplified.graph.node if n.op_type in _SCAFFOLDING_OPS
+    )
+    assert simplified_count <= raw_count
+
+
+def test_onnxsim_symexpr_matches_torch_shapeenv_symbols(exported_and_simplified):
+    _, _, onnx_program, _ = exported_and_simplified
+
+    try:
+        exported_program = onnx_program.exported_program
+        multi_symbol_nodes = []
+        for node in exported_program.graph_module.graph.nodes:
+            val = node.meta.get("val")
+            if val is None or not hasattr(val, "shape"):
+                continue
+            for d in val.shape:
+                expr = getattr(getattr(d, "node", None), "expr", None)
+                if expr is not None and len(expr.free_symbols) >= 2:
+                    multi_symbol_nodes.append((node.name, str(expr)))
+    except AttributeError as e:
+        pytest.skip(
+            f"ExportedProgram/ShapeEnv internals didn't match what this "
+            f"test expects on torch {torch.__version__} ({e}); not a "
+            f"stable public API, so this is a skip, not a failure"
+        )
+
+    # torch's own ShapeEnv, independently of anything onnxsim does, must
+    # agree that the traced graph actually combines two distinct dynamic
+    # dims somewhere (the past_len+seq_len cache-length computation).
+    assert multi_symbol_nodes, (
+        "torch.export's ShapeEnv reports no FX node whose shape combines "
+        "two distinct dynamic dims -- either the model/export changed, or "
+        "this cross-check needs updating for the current torch version"
+    )
+    print(f"multi-symbol-dim FX nodes: {multi_symbol_nodes[:5]}", file=sys.stderr)
+
+
+@pytest.mark.parametrize(
+    "batch,seq_len,past_len",
+    [
+        (1, 4, 0),  # prefill, empty cache
+        (1, 1, 12),  # single-token decode step with a long cache
+        (3, 6, 5),  # batch > 1, both seq_len and past_len nontrivial
+        (2, 1, 0),  # batch > 1, prefill, empty cache
+    ],
+)
+def test_onnxsim_kv_cache_consistency(
+    exported_and_simplified, batch, seq_len, past_len
+):
+    _, simplified, _, eager_model = exported_and_simplified
+
+    torch.manual_seed(1)
+    x = torch.randn(batch, seq_len, HIDDEN)
+    past_k = torch.randn(batch, NUM_HEADS, past_len, HEAD_DIM)
+    past_v = torch.randn(batch, NUM_HEADS, past_len, HEAD_DIM)
+
+    with torch.no_grad():
+        ref_out, ref_k, ref_v = eager_model(x, past_k, past_v)
+
+    session = onnxruntime.InferenceSession(
+        simplified.SerializeToString(), providers=["CPUExecutionProvider"]
+    )
+    got_out, got_k, got_v = session.run(
+        None,
+        {
+            "x": x.numpy(),
+            "past_key": past_k.numpy(),
+            "past_value": past_v.numpy(),
+        },
+    )
+
+    np.testing.assert_allclose(ref_out.numpy(), got_out, rtol=1e-4, atol=1e-5)
+    np.testing.assert_allclose(ref_k.numpy(), got_k, rtol=1e-4, atol=1e-5)
+    np.testing.assert_allclose(ref_v.numpy(), got_v, rtol=1e-4, atol=1e-5)
+
+
+_OUTPUT_NAMES = ["out", "present_key", "present_value"]
+
+_METADATA_KEY_PREFIX = "onnxsim.symexpr:axis"
+
+
+def _capture_dim_expressions_to_metadata_props(model, onnx_program):
+    """Write each graph *output*'s compound (multi-symbol) dim expressions,
+    as torch.export's own ShapeEnv already computed them, into that
+    ValueInfoProto's ``metadata_props`` -- in place, mutating ``model``.
+
+    Temporary/local prototype only; see the module docstring. Returns
+    ``{(output_name, axis): expr_str}`` for the entries actually written, so
+    a caller can assert on what was captured without re-parsing metadata.
+    """
+    exported_program = onnx_program.exported_program
+    output_node = next(
+        n for n in exported_program.graph_module.graph.nodes if n.op == "output"
+    )
+    fx_outputs = output_node.args[0]
+    assert len(fx_outputs) == len(_OUTPUT_NAMES), (
+        "the FX graph's traced outputs and the ONNX output_names must line "
+        "up positionally -- both come from the same torch.onnx.export call"
+    )
+
+    vi_by_name = {vi.name: vi for vi in model.graph.output}
+    captured = {}
+    for name, fx_val in zip(_OUTPUT_NAMES, fx_outputs):
+        vi = vi_by_name.get(name)
+        val = getattr(fx_val, "meta", {}).get("val") if fx_val is not None else None
+        if vi is None or val is None or not hasattr(val, "shape"):
+            continue
+        for axis, d in enumerate(val.shape):
+            expr = getattr(getattr(d, "node", None), "expr", None)
+            if expr is None or len(getattr(expr, "free_symbols", ())) < 2:
+                continue  # only compound expressions are worth recording
+            entry = vi.metadata_props.add()
+            entry.key = f"{_METADATA_KEY_PREFIX}{axis}"
+            entry.value = str(expr)
+            captured[(name, axis)] = str(expr)
+    return captured
+
+
+def test_onnxsim_captures_symbolic_dim_expressions_to_metadata_props(
+    exported_and_simplified,
+):
+    _, shared_simplified, onnx_program, eager_model = exported_and_simplified
+
+    # The fixture is module-scoped and shared with other tests -- work on a
+    # private copy rather than mutating it in place, so this test's writes
+    # to metadata_props can't leak into or depend on test execution order.
+    simplified = onnx.ModelProto()
+    simplified.CopyFrom(shared_simplified)
+
+    try:
+        captured = _capture_dim_expressions_to_metadata_props(simplified, onnx_program)
+    except AttributeError as e:
+        pytest.skip(
+            f"ExportedProgram/ShapeEnv internals didn't match what this "
+            f"test expects on torch {torch.__version__} ({e})"
+        )
+
+    # present_key/present_value's cache-length axis is past_len + seq_len;
+    # `out`'s dims are each a single symbol or constant, so nothing on it
+    # should be captured.
+    assert captured, "expected at least one compound dim expression"
+    assert all(name != "out" for name, _axis in captured), (
+        "out has no compound-expression dims; capturing something for it "
+        "means the model or the capture logic changed"
+    )
+    assert any("+" in expr for expr in captured.values()), (
+        "expected the past_len+seq_len cache-length expression among the "
+        "captured metadata_props entries"
+    )
+
+    present_key_vi = next(
+        vi for vi in simplified.graph.output if vi.name == "present_key"
+    )
+    keys = {e.key for e in present_key_vi.metadata_props}
+    assert any(k.startswith(_METADATA_KEY_PREFIX) for k in keys)
+
+    # metadata_props is spec-defined, backward-compatible, advisory
+    # metadata: writing it must keep the model valid and must not change
+    # what it computes.
+    onnx.checker.check_model(simplified)
+
+    torch.manual_seed(2)
+    x = torch.randn(2, 3, HIDDEN)
+    past_k = torch.randn(2, NUM_HEADS, 4, HEAD_DIM)
+    past_v = torch.randn(2, NUM_HEADS, 4, HEAD_DIM)
+    with torch.no_grad():
+        ref_out, ref_k, ref_v = eager_model(x, past_k, past_v)
+    session = onnxruntime.InferenceSession(
+        simplified.SerializeToString(), providers=["CPUExecutionProvider"]
+    )
+    got_out, got_k, got_v = session.run(
+        None,
+        {"x": x.numpy(), "past_key": past_k.numpy(), "past_value": past_v.numpy()},
+    )
+    np.testing.assert_allclose(ref_out.numpy(), got_out, rtol=1e-4, atol=1e-5)
+    np.testing.assert_allclose(ref_k.numpy(), got_k, rtol=1e-4, atol=1e-5)
+    np.testing.assert_allclose(ref_v.numpy(), got_v, rtol=1e-4, atol=1e-5)

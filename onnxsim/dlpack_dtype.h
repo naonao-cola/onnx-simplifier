@@ -21,7 +21,9 @@
 #ifndef ONNXSIM_DLPACK_DTYPE_H_
 #define ONNXSIM_DLPACK_DTYPE_H_
 
+#include <bit>
 #include <cstdint>
+#include <utility>
 
 #include "dlpack/dlpack.h"
 
@@ -58,6 +60,27 @@ inline size_t SizeOf(DLDataType dt) {
 
 inline bool operator==(DLDataType a, DLDataType b) {
   return a.code == b.code && a.bits == b.bits && a.lanes == b.lanes;
+}
+
+// ONNX fixes the byte order of TensorProto::raw_data: "elements MUST be stored
+// in as fixed-width, little-endian order", on every host. DLPack carries no
+// byte-order field, so DLTensors are host order by convention. The two agree on
+// a little-endian machine and disagree on a big-endian one, where the payload
+// has to be swapped at each TensorProto <-> DLPack crossing.
+inline constexpr bool kRawDataIsHostOrder =
+    std::endian::native == std::endian::little;
+
+// Reverse the bytes of each `elem_size`-wide element of `data` in place,
+// converting between raw_data's little-endian layout and host order (the
+// conversion is its own inverse, so one function serves both directions).
+// A no-op for 1-byte elements. A trailing partial element is left alone.
+inline void SwapElementBytes(uint8_t* data, size_t nbytes, size_t elem_size) {
+  if (elem_size < 2) return;
+  for (size_t off = 0; off + elem_size <= nbytes; off += elem_size) {
+    for (size_t i = 0, j = elem_size - 1; i < j; ++i, --j) {
+      std::swap(data[off + i], data[off + j]);
+    }
+  }
 }
 
 // Map an ONNX dtype code to a DLDataType. Returns true and fills `*out` for a

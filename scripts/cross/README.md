@@ -73,13 +73,13 @@ run is a cold cache, later runs reuse it.
 ## Scope / status
 
 * Covers the Windows CPython versions shipped by `build-and-test.yml`:
-  **3.10, 3.11, 3.12, 3.13**. This cross-build **is** the Windows release path —
+  **3.11, 3.12, 3.13**. This cross-build **is** the Windows release path —
   it replaces the native Windows build, and its wheels are published to PyPI by
   the `upload_pypi` job alongside the natively-built Linux/macOS wheels.
 * **3.12 and 3.13 share one `cp312-abi3` wheel**: a genuine limited-API module
   (nanobind sets `Py_LIMITED_API` and links nuget's `python3.lib`, so the `.pyd`
-  imports `python3.dll`). **3.10 and 3.11** are below nanobind's abi3 floor
-  (3.12), so they get **version-specific** wheels (`ABI3=0`, tag `cp3XX-cp3XX`,
+  imports `python3.dll`). **3.11** is below nanobind's abi3 floor
+  (3.12), so it gets a **version-specific** wheel (`ABI3=0`, tag `cp3XX-cp3XX`,
   linking `pythonXY.dll`).
 * onnxruntime is **not** compiled in (`-DONNXSIM_BUILTIN_ORT=OFF`, matching the
   pip build), keeping the cross-compile surface to onnx + protobuf + nanobind.
@@ -94,3 +94,132 @@ additionally need `xwin` on `PATH`, which downloads the MSVC SDK from Microsoft.
 BACKEND=llvm-mingw PYVER=3.12 ABI3=1 bash scripts/cross/build_windows_wheel.sh
 # -> wheelhouse/onnxsim-<ver>-cp312-abi3-win_amd64.whl
 ```
+
+---
+
+# Cross-building for s390x (big endian)
+
+The second cross-build in this directory targets **s390x Linux**, for a
+different reason than the Windows one: not to ship wheels, but to run onnxsim's
+test suite on a **big-endian** CPU. ONNX defines `TensorProto.raw_data` as
+little-endian on every host, so any code that reinterprets those bytes in host
+order is a latent bug that only x86/ARM's byte order hides. s390x is the only
+mainstream big-endian Linux target a major distro still supports, and Ubuntu
+ships `python3-onnx` / `python3-numpy` / `python3-pytest` for it — which is what
+makes this practical, since PyPI has no s390x wheels.
+
+Everything is compiled by the **host** toolchain (`s390x-linux-gnu-g++`), so the
+build runs at native speed; only the resulting binaries execute under
+`qemu-s390x-static`. An emulated build of the onnx + protobuf stack would take
+hours.
+
+## Procedure
+
+```sh
+# 1. Ubuntu s390x rootfs + binfmt_misc -> qemu-s390x-static  (root; once)
+sudo bash scripts/cross/bootstrap_s390x_rootfs.sh
+
+# 2. Cross-build the extension (host protoc, target abseil/protobuf, onnxsim)
+bash scripts/cross/build_s390x_extension.sh
+
+# 3. Install it into the rootfs and run pytest there, big endian
+sudo bash scripts/cross/run_s390x_tests.sh
+```
+
+## The little-endian control
+
+A big-endian test run on its own is hard to read: a failure may be an
+endianness bug, or just an artifact of this unusual environment (no
+onnxruntime, no torch, an older distro onnx). So build the **same commit** for
+x86_64 and run the **same suite** in an amd64 rootfs with the **same package
+versions**. Then byte order is the only variable and the two failure sets can be
+diffed directly:
+
+```sh
+sudo ARCH=amd64 bash scripts/cross/bootstrap_s390x_rootfs.sh
+bash scripts/cross/build_native_control.sh
+sudo SYSROOT=/rootfs-amd64 BUILD=$PWD/.native-build-control/onnxsim-build \
+     bash scripts/cross/run_s390x_tests.sh
+```
+
+## Notes / gotchas
+
+* **binfmt magic must mask `EI_OSABI`.** glibc's own binaries (notably
+  `ldconfig.real`) are tagged `ELFOSABI_GNU`, so a handler that pins byte 7 to
+  SYSV makes exactly those fail with `Exec format error` part-way through
+  `debootstrap`, corrupting the dpkg status file. The mask also has to accept
+  `ET_DYN` for static-pie binaries.
+* **The host interpreter must match the target CPython's X.Y.** CMake's
+  `FindPython` validates the interpreter against the target headers and refuses
+  a mismatch, even though the interpreter only runs ONNX's codegen.
+* **The distro's `python3-onnx` is too old** for onnxsim's vendored onnx and
+  fails a large part of the suite for reasons unrelated to byte order.
+  `run_s390x_tests.sh` therefore installs the vendored onnx (assembled from the
+  same cross-build) ahead of it on `PYTHONPATH`. protobuf has a pure-Python
+  wheel, so it needs no s390x build; `ml_dtypes` does not, and is compiled once
+  inside the rootfs under emulation by the bootstrap script.
+* onnxruntime, torch and timm have no s390x builds, so the test modules that
+  import them at module scope cannot be collected. onnxsim falls back to onnx's
+  reference evaluator, which is the supported no-onnxruntime path.
+
+## In CI
+
+`.github/workflows/big-endian.yml` runs all three steps plus `ctest`. It is
+weekly, on demand, and on pull requests touching the harness or the files that
+read and write `raw_data` — a cold run is ~40 minutes, too much for every PR.
+sccache carries every compile across runs — host protoc, target
+abseil/protobuf, **and** onnx/onnx-optimizer/onnxsim itself, which is the bulk
+of the work. The one step the host toolchain cannot take over (compiling
+`ml_dtypes` inside the rootfs under emulation) has its wheel cached separately
+via `WHEELHOUSE`, at ~4 MB.
+
+### Why the rootfs is not cached
+
+It would be the obvious next thing to cache, and it is deliberately not:
+
+* It is **1.1 GB across ~28k files, ~500 MB gzipped** — around 5% of the
+  repository's 10 GB Actions cache budget, which it would be competing for with
+  sccache, whose entries are worth far more per byte.
+* It only saves the `debootstrap` step (~3 min). Restoring and unpacking half a
+  gigabyte is not obviously faster than just rebuilding it.
+* `actions/cache` tars as the runner user, which cannot preserve the root
+  ownership, setuid bits and device nodes a chroot needs, so a restored rootfs
+  would likely be subtly broken anyway.
+
+Caching the one emulated compile instead gets the same wall-clock win for
+0.7% of the storage.
+
+### Why the bootstrap is ~280s and not much less
+
+Measured on a 4-core runner, building the rootfs from scratch:
+
+| package set | time | rootfs |
+| --- | ---: | ---: |
+| the original 14 packages | 289s | 888 MB |
+| current set (dead ones dropped) | 281s | 694 MB |
+| also dropping `build-essential` | 216s | 384 MB |
+| prebuilt `ubuntu-base` tarball + apt | 144s | 509 MB |
+
+Stage 1 — download and native unpack — is only ~40s. The rest is dpkg
+*configuring* every package under emulation, and that is what sets the floor.
+Things that turned out not to help: caching the `.deb` files saves 19s for a
+57 MB cache entry, and dpkg's `force-unsafe-io` saves nothing measurable.
+
+Two faster options were rejected on purpose:
+
+* **Dropping `build-essential`** (216s) shifts the ml_dtypes build's
+  dependencies to an `apt-get` *inside* the chroot on a cache miss, where
+  unpack and configure both run emulated — an order of magnitude slower than
+  debootstrap's native stage-1 unpack. With a weekly schedule and a 7-day cache
+  eviction window, misses are near the norm, so this trades 65s a run against
+  ten minutes on the runs that miss.
+* **The prebuilt `ubuntu-base` tarball** (144s) is genuinely faster, but that
+  image ships no `gpgv`, so apt cannot verify repository signatures — the
+  measurement above only reached 144s with verification disabled. Trading
+  package authenticity for ~140s on a ~20 min job is not a good deal.
+
+The build, not the bootstrap, is where the time is; sccache is the lever that
+matters there.
+
+See `docs/big-endian.md` for what these runs found, and for the one known
+failure the job deselects by name.

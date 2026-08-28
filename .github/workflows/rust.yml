@@ -1,12 +1,38 @@
 name: Rust wrapper
 
+# `release`/`workflow_dispatch` are intentionally left without a `paths` filter
+# below (GitHub Actions only applies `paths` to `push`/`pull_request` anyway):
+# a release must always build+publish, and a manual dispatch should always run
+# regardless of what last changed.
 on:
   push:
     branches:
       - main
       - master
+    # Skip this (slow, native-build-heavy) workflow when a push/PR only
+    # touches onnxsim's Python side (onnxsim/**/*.py, tests/, docs/, etc.) --
+    # none of that affects the Rust crates or the C++ core they link against.
+    paths: &rust-paths
+      - "rust/**"
+      - "CMakeLists.txt"
+      - "cmake/**"
+      - "onnxsim/**"
+      - "!onnxsim/**/*.py"
+      - "third_party/**"
+      - ".gitmodules"
+      - "scripts/bump_binding_versions.sh"
+      - "scripts/test_rust_package_standalone.sh"
+      - "scripts/convertmodel/test/model.onnx"
+      - ".github/workflows/rust.yml"
   pull_request:
+    paths: *rust-paths
+  release:
+    types: [published]
   workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 defaults:
   run:
@@ -23,6 +49,19 @@ jobs:
       ONNXSIM_NO_BUILD: "1"
     steps:
       - uses: actions/checkout@v7
+      # A release build should validate against the tagged version: bump every
+      # binding manifest to the release tag (scripts/bump_binding_versions.sh --
+      # the same script version-sync.yml's bump job and static.yml's npm build
+      # already run) before clippy resolves the workspace, so this actually
+      # exercises the tagged version's onnxsim-sys constraint instead of
+      # whatever happened to be committed (this is exactly what broke #606:
+      # the workspace version moved but rust/onnxsim/Cargo.toml's pinned
+      # onnxsim-sys dependency didn't, and cargo failed to resolve). The publish
+      # job below does the same bump before `cargo publish`.
+      - name: Bump binding versions to the release tag
+        if: ${{ github.event_name == 'release' && startsWith(github.ref, 'refs/tags/v') }}
+        working-directory: ${{ github.workspace }}
+        run: ./scripts/bump_binding_versions.sh "${GITHUB_REF#refs/tags/}"
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -30,6 +69,30 @@ jobs:
         run: cargo fmt --all --check
       - name: clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
+
+  # Builds the crates as a downstream consumer gets them: `cargo package`, then
+  # unpack the archives outside the repository and compile against the unpacked
+  # copies. Because `cargo publish` has to run with --no-verify (see
+  # "Publishing" in rust/README.md), nothing else in CI ever compiles what
+  # actually ships -- a file missing from the package, or a build script that
+  # assumes the onnxsim C++ tree sits two directories up, only breaks there.
+  # No native build, so this stays as quick as the lint job.
+  package:
+    name: standalone package build (no native build)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      # See the matching step in the lint job above for why this runs.
+      - name: Bump binding versions to the release tag
+        if: ${{ github.event_name == 'release' && startsWith(github.ref, 'refs/tags/v') }}
+        working-directory: ${{ github.workspace }}
+        run: ./scripts/bump_binding_versions.sh "${GITHUB_REF#refs/tags/}"
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Package and build the crates outside the source tree
+        working-directory: ${{ github.workspace }}
+        # RUNNER_TEMP is outside the checkout, which is what the test needs.
+        run: ./scripts/test_rust_package_standalone.sh --workdir "${RUNNER_TEMP}/rust-standalone"
 
   # Full build that compiles the C API and links it against onnxsim.
   build:
@@ -48,6 +111,11 @@ jobs:
         with:
           submodules: recursive
           fetch-depth: 0
+      # See the matching step in the lint job above for why this runs.
+      - name: Bump binding versions to the release tag
+        if: ${{ github.event_name == 'release' && startsWith(github.ref, 'refs/tags/v') }}
+        working-directory: ${{ github.workspace }}
+        run: ./scripts/bump_binding_versions.sh "${GITHUB_REF#refs/tags/}"
       - uses: mozilla-actions/sccache-action@v0.0.11
       - uses: dtolnay/rust-toolchain@stable
       - name: Install build tools
@@ -65,3 +133,83 @@ jobs:
         run: |
           cargo test --release --workspace
           cargo test --release -- --ignored list_optimizers_is_non_empty
+      # Same standalone package test as the `package` job, but linking the
+      # native library this job just built (--lib-dir auto finds it under
+      # rust/target), so the packaged crates are linked and executed outside
+      # the source tree rather than only type-checked. Reusing the existing
+      # build tree keeps this to seconds instead of another native build.
+      - name: Standalone package build against the native library
+        working-directory: ${{ github.workspace }}
+        run: |
+          ./scripts/test_rust_package_standalone.sh \
+            --workdir "${RUNNER_TEMP}/rust-standalone-native" \
+            --lib-dir auto \
+            --model scripts/convertmodel/test/model.onnx
+
+  # Publish onnxsim-sys and onnxsim to crates.io once a GitHub release is
+  # published, gated on the lint, package and build jobs passing first. See
+  # "Publishing" in rust/README.md for why --no-verify is required and why
+  # onnxsim-sys has to land on the index before onnxsim (which depends on it
+  # by version) can publish. Authenticates via crates.io Trusted Publishing
+  # (OIDC) instead of a long-lived CARGO_REGISTRY_TOKEN secret -- id-token:
+  # write lets crates-io-auth-action exchange this job's OIDC identity (repo +
+  # workflow + the `cargo` environment below, matching the trusted-publishing
+  # config on crates.io) for a short-lived token that's revoked when the job
+  # ends.
+  publish:
+    name: publish to crates.io
+    if: ${{ github.event_name == 'release' && startsWith(github.ref, 'refs/tags/v') }}
+    needs: [lint, package, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment: cargo
+    permissions:
+      id-token: write
+      contents: read
+    env:
+      # crates.io's API rejects requests with no descriptive User-Agent
+      # (https://crates.io/data-access), which used to make every curl check
+      # below fail regardless of whether the crate was actually published.
+      CRATES_IO_USER_AGENT: "onnxsim-release-workflow (https://github.com/onnxsim/onnxsim)"
+    steps:
+      - uses: actions/checkout@v7
+      - name: Bump binding versions to the release tag
+        working-directory: ${{ github.workspace }}
+        run: ./scripts/bump_binding_versions.sh "${GITHUB_REF#refs/tags/}"
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Authenticate with crates.io
+        id: auth
+        uses: rust-lang/crates-io-auth-action@v1
+      - name: Publish onnxsim-sys
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+        run: |
+          version="${GITHUB_REF#refs/tags/v}"
+          if curl -sf -H "User-Agent: ${CRATES_IO_USER_AGENT}" "https://crates.io/api/v1/crates/onnxsim-sys/${version}" > /dev/null; then
+            echo "onnxsim-sys ${version} is already published, skipping"
+          else
+            cargo publish -p onnxsim-sys --no-verify
+          fi
+      - name: Wait for onnxsim-sys to land on the crates.io index
+        run: |
+          version="${GITHUB_REF#refs/tags/v}"
+          for i in $(seq 1 30); do
+            if curl -sf -H "User-Agent: ${CRATES_IO_USER_AGENT}" "https://crates.io/api/v1/crates/onnxsim-sys/${version}" > /dev/null; then
+              echo "onnxsim-sys ${version} is live"
+              exit 0
+            fi
+            echo "waiting for onnxsim-sys ${version} to appear on crates.io ($i/30)..."
+            sleep 10
+          done
+          echo "::error::onnxsim-sys ${version} did not appear on crates.io in time"
+          exit 1
+      - name: Publish onnxsim
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+        run: |
+          version="${GITHUB_REF#refs/tags/v}"
+          if curl -sf -H "User-Agent: ${CRATES_IO_USER_AGENT}" "https://crates.io/api/v1/crates/onnxsim/${version}" > /dev/null; then
+            echo "onnxsim ${version} is already published, skipping"
+          else
+            cargo publish -p onnxsim --no-verify
+          fi

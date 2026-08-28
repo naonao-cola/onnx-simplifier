@@ -11,6 +11,22 @@ set(CMAKE_OSX_DEPLOYMENT_TARGET 13.3 CACHE STRING "Minimum OS X deployment versi
 
 project(onnxsim CXX)
 
+# The BLAKE3 sources backing TensorPool's content hashing (onnxsim/
+# tensor_pool_hash.cpp, third_party/blake3/c/*.c) are plain C, unlike
+# the rest of this project, and are compiled into the `onnxsim` target in
+# EVERY configuration (see ONNXSIM_BLAKE3_SOURCES below) -- unlike the
+# ONNXSIM_BUILTIN_ORT path's own enable_language(C) call below, which only
+# runs when that option is ON and is skipped under Emscripten (that path
+# only ever configures ONNX Runtime, whose own from-source CMake build
+# enables the C/ASM it needs on its own). BLAKE3 has no such transitive
+# helper, and Emscripten does NOT enable C on its own just because CXX was
+# requested in project() above -- confirmed by the WASM build failing with
+# "CMAKE_C_COMPILE_OBJECT ... not set" without this. So enable C
+# unconditionally, including under Emscripten (emcc compiles C same as
+# C++), before any target needs it. A second enable_language(C) call below
+# is a harmless no-op.
+enable_language(C)
+
 set(CMAKE_CXX_VISIBILITY_PRESET "hidden")
 set(CMAKE_VISIBILITY_INLINES_HIDDEN TRUE)
 
@@ -29,17 +45,22 @@ option(ONNXSIM_WASM_ORT_WEB "For the Emscripten build: delegate constant folding
 if (ONNXSIM_WASM_ORT_WEB)
   # The whole point of this mode is to NOT bundle ONNX Runtime -- constant
   # folding is delegated to the page's onnxruntime-web at runtime -- so force the
-  # built-in ORT off. onnxsim then compiles with NO_BUILTIN_ORT (all Ort:: code
-  # #ifdef'd out) and no ORT source is fetched or compiled.
+  # built-in ORT off. onnxsim then compiles without ONNXSIM_HAS_ORT (all Ort::
+  # code #ifdef'd out) and no ORT source is fetched or compiled.
   set(ONNXSIM_BUILTIN_ORT OFF)
-  # In the default WASM build, ONNX Runtime builds protobuf for the wasm target
-  # and hands it to onnx (build_ort.cmake sets onnxruntime_USE_FULL_PROTOBUF and
-  # ONNX_TARGET_NAME). With ORT gone, onnx has no wasm protobuf and its generated
-  # .pb.* code fails to compile. Have onnx build its own bundled protobuf for the
-  # target instead; the host protoc is still used for codegen via
-  # ONNX_CUSTOM_PROTOC_EXECUTABLE (passed by build_wasm.sh).
-  set(ONNX_BUILD_CUSTOM_PROTOBUF ON CACHE BOOL "" FORCE)
 endif()
+
+# onnxsim's own onnx/onnx-optimizer fork (third_party/onnx, added below) is
+# always built independently, in every configuration -- never provided
+# transitively through ONNX Runtime's own build the way a from-source
+# in-tree ORT used to (for Emscripten in particular: build_ort.cmake used to
+# hand onnx a wasm protobuf ORT itself built via onnxruntime_USE_FULL_PROTOBUF
+# + ONNX_TARGET_NAME=onnxruntime_webassembly). Without that transitive
+# protobuf-for-wasm, onnx's generated .pb.* code fails to compile for the wasm
+# target unless it builds its own bundled protobuf instead -- see
+# ONNX_BUILD_CUSTOM_PROTOBUF below, set unconditionally for exactly this
+# reason (the host protoc is still used for codegen via
+# ONNX_CUSTOM_PROTOC_EXECUTABLE, passed by build_wasm.sh, when EMSCRIPTEN).
 
 if (ONNXSIM_PYTHON AND EMSCRIPTEN)
   message(STATUS "python and emscripten cannot be built at the same time")
@@ -77,35 +98,71 @@ if (ONNXSIM_BUILTIN_ORT)
     # target and sets ONNXRUNTIME_INCLUDE_DIR, mirroring build_ort.cmake's
     # outputs so the rest of this file is unchanged.
     include(cmake/prebuilt_ort.cmake)
-    set(ORT_NAME onnxruntime)
   else()
-    # The top-level project only enables CXX, but ONNX Runtime (added below as a
-    # subdirectory) compiles C and assembly sources. Enable the languages it needs
+    # The top-level project only enables CXX, but ONNX Runtime (built below, out
+    # of tree) compiles C and assembly sources. Enable the languages it needs
     # before configuring it. Emscripten's toolchain handles this on its own.
     if (NOT EMSCRIPTEN)
       enable_language(C)
       enable_language(ASM)
     endif()
     include(cmake/build_ort.cmake)
-    if (EMSCRIPTEN)
-      set(ORT_NAME onnxruntime_webassembly)
-    else()
-      set(ORT_NAME onnxruntime)
-    endif()
   endif()
+  set(ORT_NAME onnxruntime)
 endif()
 
-# configure onnx-optimizer after onnxruntime, because they both depend on onnx and onnxruntime has its own flags for onnx
+# onnxsim's own onnx/onnx-optimizer fork provides the `onnx` target -- used for
+# every build (onnxsim's own Graph-native optimizer/shape-inference fixed
+# point needs onnxsim-fork-only extensions, e.g. onnx/common/
+# graph_shape_inference.h, that plain upstream onnx does not have), not just
+# when ONNX Runtime is unavailable. When ONNXSIM_BUILTIN_ORT is ON, ONNX
+# Runtime is now built/linked fully out-of-tree (see cmake/build_ort.cmake /
+# cmake/prebuilt_ort.cmake) specifically so its own, separately-versioned
+# vendored onnx never enters this project's target graph and never collides
+# with the `onnx`/`onnx_proto` targets defined here (onnx's own CMakeLists.txt
+# hardcodes those names, so two copies cannot coexist in one CMake project).
+option(ONNX_OPT_USE_SYSTEM_PROTOBUF "" OFF)
+if (NOT ONNX_OPT_USE_SYSTEM_PROTOBUF)
+  option(protobuf_BUILD_TESTS "" OFF)
+  option(protobuf_MSVC_STATIC_RUNTIME "" ${ONNX_USE_MSVC_STATIC_RUNTIME})
+  set(protobuf_FORCE_FETCH_DEPENDENCIES ON)
+  set(ONNX_BUILD_CUSTOM_PROTOBUF ON)
+endif()
+add_subdirectory(third_party/onnx EXCLUDE_FROM_ALL)
+
 add_subdirectory(third_party/onnx-optimizer EXCLUDE_FROM_ALL)
 
-add_library(onnxsim onnxsim/onnxsim.cpp onnxsim/contrib_schemas.cpp onnxsim/custom_optimizer_passes.cpp onnxsim/function_rewriter.cpp onnxsim/profiler.cpp onnxsim/model_info.cpp onnxsim/sym_expr.cpp onnxsim/sym_value_eval.cpp onnxsim/sym_shape_infer.cpp onnxsim/model_metrics.cpp)
+# BLAKE3 (third_party/blake3, a git submodule pinned to a specific upstream
+# commit -- see .gitmodules / `git submodule status`, and LICENSE_A2 /
+# LICENSE_CC0 in that directory) backing TensorPool::ContentHash's default
+# HashAlgorithm -- see tensor_pool_hash.h's file comment. Its C sources live
+# under the submodule's own c/ subdirectory (upstream's layout, alongside
+# Rust/other-language bindings this repo doesn't use). Only the portable
+# files are compiled (no per-architecture SIMD), with every SIMD backend
+# disabled: that makes blake3_dispatch.c's runtime CPU-feature dispatch fall
+# through to blake3_portable.c unconditionally, which is what makes omitting
+# the SIMD source files (and their assembly) correct rather than merely
+# omitted. Applied via target_sources / target_compile_definitions below to
+# each target that (transitively, via tensor_pool.cpp) needs TensorPool's
+# hashing -- mirroring how tensor_pool.cpp itself is listed per-target
+# rather than built once into a shared object library, matching this file's
+# existing tensor_pool_test / tensor_pool_gguf_test pattern below.
+set(ONNXSIM_BLAKE3_SOURCES
+    third_party/blake3/c/blake3.c
+    third_party/blake3/c/blake3_dispatch.c
+    third_party/blake3/c/blake3_portable.c)
+set(ONNXSIM_BLAKE3_COMPILE_DEFS
+    BLAKE3_NO_SSE2 BLAKE3_NO_SSE41 BLAKE3_NO_AVX2 BLAKE3_NO_AVX512
+    BLAKE3_USE_NEON=0)
+
+add_library(onnxsim onnxsim/onnxsim.cpp onnxsim/constant_folding.cpp onnxsim/partial_shape_eval.cpp onnxsim/model_prep.cpp onnxsim/quantize_entry.cpp onnxsim/cross_layer_equalization_entry.cpp onnxsim/contrib_schemas.cpp onnxsim/custom_optimizer_passes.cpp onnxsim/function_rewriter.cpp onnxsim/profiler.cpp onnxsim/model_info.cpp onnxsim/sym_expr.cpp onnxsim/sym_value_eval.cpp onnxsim/sym_shape_infer.cpp onnxsim/model_metrics.cpp onnxsim/precision_estimator.cpp onnxsim/tensor_pool.cpp onnxsim/tensor_pool_gguf.cpp onnxsim/tensor_pool_hash.cpp onnxsim/gemm_fusion_backend.cpp ${ONNXSIM_BLAKE3_SOURCES})
+target_compile_definitions(onnxsim PRIVATE ${ONNXSIM_BLAKE3_COMPILE_DEFS})
 if (ONNXSIM_BUILTIN_ORT)
+  # Both ways of obtaining ONNX Runtime ship/install headers flat under this
+  # directory (an official release tarball, or cmake/build_ort.cmake's own
+  # `cmake --install` of the ExternalProject build -- see that file), so
+  # onnxsim.cpp/dlpack_bridge.h include onnxruntime_cxx_api.h directly.
   target_include_directories(onnxsim PRIVATE ${ONNXRUNTIME_INCLUDE_DIR})
-  if (ONNXSIM_PREBUILT_ORT)
-    # Prebuilt releases ship the public headers flat under include/, so onnxsim.cpp
-    # includes onnxruntime_cxx_api.h directly instead of the nested source path.
-    target_compile_definitions(onnxsim PRIVATE ONNXSIM_ORT_FLAT_HEADERS)
-  endif()
 endif()
 target_include_directories(onnxsim PUBLIC onnxsim)
 # dlpack.h (at third_party/dlpack/dlpack.h) is the tensor-exchange type at the
@@ -113,16 +170,17 @@ target_include_directories(onnxsim PUBLIC onnxsim)
 # include root is third_party/ so `#include "dlpack/dlpack.h"` resolves. PUBLIC
 # so the C API and any target that includes onnxsim.h / dlpack_bridge.h finds it.
 target_include_directories(onnxsim PUBLIC third_party)
-if (NOT ONNXSIM_BUILTIN_ORT)
-  target_compile_definitions(onnxsim PUBLIC NO_BUILTIN_ORT)
+if (ONNXSIM_BUILTIN_ORT)
+  # Guards the Ort:: C++ API glue (dlpack_bridge.h, GetBuiltinModelExecutor) --
+  # the only code that still needs to know whether ONNX Runtime is available,
+  # since onnxsim's optimizer/shape-inference pipeline itself no longer forks
+  # on this (see onnxsim.cpp).
+  target_compile_definitions(onnxsim PUBLIC ONNXSIM_HAS_ORT)
 endif()
 if (EMSCRIPTEN)
+  target_link_libraries(onnxsim onnx_optimizer onnx)
   if (ONNXSIM_BUILTIN_ORT)
-    target_link_libraries(onnxsim ${ORT_NAME} onnx_optimizer)
-  else()
-    # ORT-web build: no ONNX Runtime is linked in, so onnx is no longer provided
-    # transitively by it. Link onnx (and onnx_optimizer) directly instead.
-    target_link_libraries(onnxsim onnx_optimizer onnx)
+    target_link_libraries(onnxsim ${ORT_NAME})
   endif()
 else()
   # The profiler samples RSS on a background std::thread, so link the platform
@@ -130,8 +188,26 @@ else()
   # through ONNX Runtime. Emscripten provides threading through its own toolchain
   # flags, so skip it there.
   find_package(Threads REQUIRED)
-  target_link_libraries(onnxsim ${ORT_NAME} onnx_optimizer onnx Threads::Threads)
+  target_link_libraries(onnxsim onnx_optimizer onnx Threads::Threads)
+  if (ONNXSIM_BUILTIN_ORT)
+    target_link_libraries(onnxsim ${ORT_NAME})
+  endif()
 endif()
+
+# ORT is always a separate shared library now, whether built from source
+# out-of-tree (cmake/build_ort.cmake) or an official prebuilt release
+# (cmake/prebuilt_ort.cmake), so every executable/shared-object that links
+# onnxsim needs to find libonnxruntime.* at runtime. rpath is a property of
+# the final linked binary (not the static onnxsim library in between), so bake
+# it into each such consumer individually via this helper rather than
+# requiring LD_LIBRARY_PATH/DYLD_LIBRARY_PATH to be set by hand.
+function(onnxsim_add_ort_rpath target)
+  if (ONNXSIM_BUILTIN_ORT AND NOT WIN32 AND NOT EMSCRIPTEN)
+    set_target_properties(${target} PROPERTIES
+      INSTALL_RPATH "${ONNXRUNTIME_LIB_DIR}"
+      BUILD_RPATH "${ONNXRUNTIME_LIB_DIR}")
+  endif()
+endfunction()
 
 if(EMSCRIPTEN)
   list(APPEND ONNXSIM_WASM_INTERFACE scripts/convertmodel/interface.cpp)
@@ -141,11 +217,27 @@ if(EMSCRIPTEN)
   endif()
 endif()
 
-add_executable(
-  onnxsim_bin
-  onnxsim/bin/onnxsim_bin.cpp
-  onnxsim/bin/onnxsim_option.cpp
-  ${ONNXSIM_WASM_INTERFACE})
+# onnxsim_bin needs a constant-folding executor: GetBuiltinModelExecutor()
+# (ONNXSIM_HAS_ORT) natively, or GetJsModelExecutor() (ONNXSIM_WASM_ORT_WEB)
+# under Emscripten. With neither -- ONNXSIM_BUILTIN_ORT=OFF on a native,
+# non-Emscripten build, e.g. the Python wheel's own configure -- there is no
+# executor available at all, so exclude it from the default `all` target
+# rather than failing that build (setup.py already only ever targets
+# onnxsim_cpp2py_export explicitly; this just keeps a plain `cmake --build .`
+# from tripping over a target that cannot link in that configuration).
+if (ONNXSIM_HAS_ORT OR ONNXSIM_WASM_ORT_WEB)
+  add_executable(
+    onnxsim_bin
+    onnxsim/bin/onnxsim_bin.cpp
+    onnxsim/bin/onnxsim_option.cpp
+    ${ONNXSIM_WASM_INTERFACE})
+else()
+  add_executable(
+    onnxsim_bin EXCLUDE_FROM_ALL
+    onnxsim/bin/onnxsim_bin.cpp
+    onnxsim/bin/onnxsim_option.cpp
+    ${ONNXSIM_WASM_INTERFACE})
+endif()
 set_target_properties(onnxsim_bin PROPERTIES OUTPUT_NAME onnxsim)
 
 # Bake the onnxsim and onnx-optimizer version strings into the module so the
@@ -180,6 +272,7 @@ if (EMSCRIPTEN)
   target_link_libraries(onnxsim_bin embind "-Wl,--whole-archive" onnxsim "-Wl,--no-whole-archive")
 else()
   target_link_libraries(onnxsim_bin onnxsim)
+  onnxsim_add_ort_rpath(onnxsim_bin)
 endif()
 
 if (ONNXSIM_WASM_ORT_WEB)
@@ -200,28 +293,14 @@ if (ONNXSIM_C_API)
   if (NOT ONNXSIM_BUILTIN_ORT)
     message(FATAL_ERROR "ONNXSIM_C_API requires ONNXSIM_BUILTIN_ORT=ON")
   endif()
-  # onnx_optimizer, onnx and onnx_proto are built as part of the builtin-ORT
-  # subtree and absorbed statically into onnxsim_c (option 1; see
-  # build_ort.cmake). Two settings they inherit from that subtree must be undone
-  # for onnxsim_c to link:
-  #
-  #  * Visibility -- they inherit the project-wide "hidden" preset. onnxsim_c
-  #    calls onnx_optimizer entry points (OptimizeFixed, GetFuseAndElimination
-  #    Pass, ...) and, historically when these were separate shared libraries,
-  #    needed them exported, so restore default visibility (harmless now that
-  #    they link in statically).
-  #  * RTTI -- ONNX Runtime configures its subtree with onnxruntime_DISABLE_RTTI
-  #    =ON (-fno-rtti), so onnx, the generated *.pb.cc and the bundled protobuf
-  #    omit their typeinfo (onnx-ml.pb.cc emits onnx::ModelProto's vtable but not
-  #    its typeinfo; libprotobuf omits google::protobuf::Message/MessageLite
-  #    typeinfo). onnxsim is compiled RTTI-on -- it has to be, because
-  #    onnx-optimizer's cse_util.h uses typeid(T) -- and references
-  #    onnx::ModelProto's typeinfo, so the link fails with "undefined symbol:
-  #    typeinfo for onnx::ModelProto" (and, once that resolves, its
-  #    google::protobuf::Message base). Compiling onnxsim -fno-rtti to match the
-  #    stack is therefore not possible; instead force -frtti back on for the onnx
-  #    and protobuf targets so the whole typeinfo chain is emitted (-frtti wins
-  #    as the last -f(no-)rtti on the command line).
+  # onnx_optimizer, onnx and onnx_proto (onnxsim's own fork, always built --
+  # see the add_subdirectory(third_party/onnx) above) are absorbed statically
+  # into onnxsim_c. They inherit the project-wide "hidden" visibility preset
+  # (CMakeLists.txt's CMAKE_CXX_VISIBILITY_PRESET), which onnxsim_c needs
+  # undone: it calls onnx_optimizer entry points (OptimizeFixed,
+  # GetFuseAndEliminationPass, ...) and, historically when these were separate
+  # shared libraries, needed them exported, so restore default visibility
+  # (harmless now that they link in statically).
   foreach(_onnxsim_shared_dep onnx_optimizer onnx onnx_proto)
     if (TARGET ${_onnxsim_shared_dep})
       set_target_properties(${_onnxsim_shared_dep} PROPERTIES
@@ -229,14 +308,8 @@ if (ONNXSIM_C_API)
         VISIBILITY_INLINES_HIDDEN FALSE)
     endif()
   endforeach()
-  foreach(_onnxsim_rtti_dep onnx onnx_proto libprotobuf libprotobuf-lite)
-    if (TARGET ${_onnxsim_rtti_dep})
-      target_compile_options(${_onnxsim_rtti_dep} PRIVATE
-        $<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:-frtti>)
-    endif()
-  endforeach()
   add_library(onnxsim_c SHARED onnxsim/capi/onnxsim_c_api.cpp)
-  # With the onnx stack built static (option 1) the linker prunes archive members
+  # With the onnx stack built static, the linker prunes archive members
   # nothing references directly: onnx's operator schemas and shape-inference fns
   # (e.g. onnx::RNNShapeInference, self-registered via static initializers) and
   # onnx.pb.cc (onnx::ModelProto's vtable/typeinfo, referenced only through a
@@ -278,6 +351,7 @@ if (ONNXSIM_C_API)
   # the header, so the project-wide "hidden" preset keeps everything else local.
   set_target_properties(onnxsim_c PROPERTIES C_VISIBILITY_PRESET hidden
                                              CXX_VISIBILITY_PRESET hidden)
+  onnxsim_add_ort_rpath(onnxsim_c)
 endif()
 
 if (ONNXSIM_PYTHON)
@@ -285,6 +359,40 @@ if (ONNXSIM_PYTHON)
     Python 3.10
     COMPONENTS Interpreter Development.Module REQUIRED
     OPTIONAL_COMPONENTS Development.SABIModule)
+
+  # nanobind ships its CMake package config inside its own pip-installed
+  # wheel (not on any default CMake search path), so it must be located via
+  # its Python API before find_package(nanobind) can locate it -- this is
+  # nanobind's documented CMake integration pattern. Set nanobind_DIR
+  # directly to the directory --cmake_dir prints (which already *is* the
+  # directory containing nanobind-config.cmake).
+  #
+  # nanobind-config.cmake self-computes its OWN "NB_DIR" (nanobind's package
+  # root, used e.g. as "${NB_DIR}/cmake/darwin-ld-cpython.sym" for the macOS
+  # linker response file) via get_filename_component(... CMAKE_CURRENT_LIST_FILE
+  # ...) and caches it as NB_DIR CACHE INTERNAL. That collides by name with a
+  # local (non-cache) variable this block used to set for the very same
+  # --cmake_dir output -- on at least one macOS cibuildwheel build this left
+  # nanobind's own NB_DIR one directory level too deep (pointing at the
+  # cmake/ subdirectory instead of the package root), producing a doubled
+  # ".../nanobind/cmake/cmake/darwin-ld-cpython.sym" link failure. Use a
+  # differently-named local variable to avoid any chance of that collision,
+  # and force nanobind's own NB_DIR to the independently-known-correct value
+  # (one directory above --cmake_dir's output) as a defensive follow-up, in
+  # case a stale NB_DIR cache entry from an earlier configure attempt in the
+  # same build directory would otherwise have survived (plain `CACHE
+  # INTERNAL` sets, as nanobind's config script uses, only take effect the
+  # first time -- they do not overwrite an existing cache entry).
+  execute_process(
+    COMMAND "${Python_EXECUTABLE}" -m nanobind --cmake_dir
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    OUTPUT_VARIABLE ONNXSIM_NANOBIND_CMAKE_DIR)
+  set(nanobind_DIR "${ONNXSIM_NANOBIND_CMAKE_DIR}" CACHE PATH "" FORCE)
+  find_package(nanobind CONFIG REQUIRED)
+  get_filename_component(ONNXSIM_NANOBIND_PACKAGE_ROOT
+                          "${ONNXSIM_NANOBIND_CMAKE_DIR}" DIRECTORY)
+  set(NB_DIR "${ONNXSIM_NANOBIND_PACKAGE_ROOT}" CACHE INTERNAL "" FORCE)
+
   # FREE_THREADED marks the module Py_MOD_GIL_NOT_USED so free-threaded
   # interpreters (e.g. the cp314t wheel) keep the GIL disabled instead of
   # re-enabling it at import. nanobind ignores STABLE_ABI on free-threaded
@@ -292,6 +400,7 @@ if (ONNXSIM_PYTHON)
   # STABLE_ABI applies on regular interpreters, FREE_THREADED on cp314t.
   nanobind_add_module(onnxsim_cpp2py_export onnxsim/cpp2py_export.cc STABLE_ABI FREE_THREADED)
   target_link_libraries(onnxsim_cpp2py_export PRIVATE onnxsim)
+  onnxsim_add_ort_rpath(onnxsim_cpp2py_export)
 
   # onnxsim links the ONNX and protobuf C++ libraries statically into this
   # extension, but the running Python process ALSO loads the separate pip
@@ -388,4 +497,103 @@ if (ONNXSIM_TESTS)
   add_executable(dlpack_dtype_test onnxsim/dlpack_dtype_test.cpp)
   target_include_directories(dlpack_dtype_test PRIVATE onnxsim third_party)
   add_test(NAME dlpack_dtype_test COMMAND dlpack_dtype_test)
+
+  # The ONNX<->safetensors dtype mapping (tensor_pool_dtype.h) is likewise
+  # pure and dependency-free, mirroring dlpack_dtype_test.cpp above.
+  add_executable(tensor_pool_dtype_test onnxsim/tensor_pool_dtype_test.cpp)
+  target_include_directories(tensor_pool_dtype_test PRIVATE onnxsim)
+  add_test(NAME tensor_pool_dtype_test COMMAND tensor_pool_dtype_test)
+
+  # TensorPool's storage, safetensors read/write, and content hashing
+  # (tensor_pool.{h,cpp}, tensor_pool_hash.{h,cpp}) depend only on
+  # tensor_pool_dtype.h and the vendored BLAKE3, so this too builds and
+  # runs standalone without ONNX / ONNX Runtime configured.
+  add_executable(tensor_pool_test onnxsim/tensor_pool_test.cpp
+                                  onnxsim/tensor_pool.cpp
+                                  onnxsim/tensor_pool_hash.cpp
+                                  ${ONNXSIM_BLAKE3_SOURCES})
+  target_include_directories(tensor_pool_test PRIVATE onnxsim third_party)
+  target_compile_definitions(tensor_pool_test PRIVATE ${ONNXSIM_BLAKE3_COMPILE_DEFS})
+  add_test(NAME tensor_pool_test COMMAND tensor_pool_test)
+
+  # tensor_pool_hash.{h,cpp}'s two backends (BLAKE3, this repo's own
+  # SHA-256) checked against each algorithm's published test vectors, plus
+  # ContentDigest's dtype/shape domain separation -- pure and
+  # dependency-free like tensor_pool_dtype_test.cpp above.
+  add_executable(tensor_pool_hash_test onnxsim/tensor_pool_hash_test.cpp
+                                       onnxsim/tensor_pool_hash.cpp
+                                       ${ONNXSIM_BLAKE3_SOURCES})
+  target_include_directories(tensor_pool_hash_test PRIVATE onnxsim third_party)
+  target_compile_definitions(tensor_pool_hash_test PRIVATE ${ONNXSIM_BLAKE3_COMPILE_DEFS})
+  add_test(NAME tensor_pool_hash_test COMMAND tensor_pool_hash_test)
+
+  # tensor_pool_bridge.h is the one piece that DOES need onnx (it converts
+  # onnx::TensorProto <-> TensorPool), so its test links the fully-configured
+  # `onnxsim` target rather than building standalone like the tests above.
+  add_executable(tensor_pool_bridge_test onnxsim/tensor_pool_bridge_test.cpp)
+  target_link_libraries(tensor_pool_bridge_test onnxsim)
+  onnxsim_add_ort_rpath(tensor_pool_bridge_test)
+  add_test(NAME tensor_pool_bridge_test COMMAND tensor_pool_bridge_test)
+
+  # precision_estimator.{h,cpp} needs onnx (ModelProto/shape inference), like
+  # tensor_pool_bridge_test above -- links the fully-configured `onnxsim`
+  # target rather than building standalone.
+  add_executable(precision_estimator_test onnxsim/precision_estimator_test.cpp)
+  target_link_libraries(precision_estimator_test onnxsim)
+  onnxsim_add_ort_rpath(precision_estimator_test)
+  add_test(NAME precision_estimator_test COMMAND precision_estimator_test)
+
+  # The ONNX<->GGML dtype mapping (gguf_dtype.h), mirroring
+  # tensor_pool_dtype_test.cpp above for the same reason.
+  add_executable(gguf_dtype_test onnxsim/gguf_dtype_test.cpp)
+  target_include_directories(gguf_dtype_test PRIVATE onnxsim)
+  add_test(NAME gguf_dtype_test COMMAND gguf_dtype_test)
+
+  # GGML K-quant dequantization (ggml_kquant.h) depends only on gguf_dtype.h,
+  # so it too builds and runs standalone -- mirroring gguf_dtype_test.cpp.
+  add_executable(ggml_kquant_test onnxsim/ggml_kquant_test.cpp)
+  target_include_directories(ggml_kquant_test PRIVATE onnxsim)
+  add_test(NAME ggml_kquant_test COMMAND ggml_kquant_test)
+
+  # TensorPool's GGUF read/write (tensor_pool_gguf.cpp) depends only on
+  # tensor_pool.{h,cpp} and gguf_dtype.h, so it too builds and runs
+  # standalone without ONNX / ONNX Runtime configured.
+  add_executable(tensor_pool_gguf_test onnxsim/tensor_pool_gguf_test.cpp
+                                       onnxsim/tensor_pool.cpp
+                                       onnxsim/tensor_pool_hash.cpp
+                                       onnxsim/tensor_pool_gguf.cpp
+                                       ${ONNXSIM_BLAKE3_SOURCES})
+  target_include_directories(tensor_pool_gguf_test PRIVATE onnxsim third_party)
+  target_compile_definitions(tensor_pool_gguf_test PRIVATE ${ONNXSIM_BLAKE3_COMPILE_DEFS})
+  add_test(NAME tensor_pool_gguf_test COMMAND tensor_pool_gguf_test)
+
+  # ReadGGUFMetadata (tensor_pool_gguf.cpp) -- same standalone-buildable
+  # dependency footprint as tensor_pool_gguf_test above.
+  add_executable(read_gguf_metadata_test onnxsim/read_gguf_metadata_test.cpp
+                                         onnxsim/tensor_pool.cpp
+                                         onnxsim/tensor_pool_hash.cpp
+                                         onnxsim/tensor_pool_gguf.cpp
+                                         ${ONNXSIM_BLAKE3_SOURCES})
+  target_include_directories(read_gguf_metadata_test PRIVATE onnxsim third_party)
+  target_compile_definitions(read_gguf_metadata_test PRIVATE ${ONNXSIM_BLAKE3_COMPILE_DEFS})
+  add_test(NAME read_gguf_metadata_test COMMAND read_gguf_metadata_test)
+
+  # tensor_pool_gguf_bridge.h needs onnx, same reason as
+  # tensor_pool_bridge_test above.
+  add_executable(tensor_pool_gguf_bridge_test
+                onnxsim/tensor_pool_gguf_bridge_test.cpp)
+  target_link_libraries(tensor_pool_gguf_bridge_test onnxsim)
+  onnxsim_add_ort_rpath(tensor_pool_gguf_bridge_test)
+  add_test(NAME tensor_pool_gguf_bridge_test
+          COMMAND tensor_pool_gguf_bridge_test)
+
+  # The self-describing single-file archive functions (EmbedModel/
+  # ExtractModel and their Save/LoadModelAs* wrappers) span both bridge
+  # headers, so this one test exercises both the safetensors and the GGUF
+  # archive path; needs onnx for the same reason as the two tests above.
+  add_executable(tensor_pool_archive_test
+                onnxsim/tensor_pool_archive_test.cpp)
+  target_link_libraries(tensor_pool_archive_test onnxsim)
+  onnxsim_add_ort_rpath(tensor_pool_archive_test)
+  add_test(NAME tensor_pool_archive_test COMMAND tensor_pool_archive_test)
 endif()

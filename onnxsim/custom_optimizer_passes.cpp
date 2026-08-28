@@ -9,15 +9,61 @@
 #include <string>
 
 #include "onnxoptimizer/optimize.h"
+#include "passes/cross_layer_equalization.h"
+#include "passes/defuse_matmul_integer_to_float.h"
+#include "passes/dynamic_quantize_attention.h"
+#include "passes/dynamic_quantize_matmul.h"
+#include "passes/dynamic_quantize_matmul_integer_to_float.h"
+#include "passes/dynamic_quantize_ternary_matmul.h"
+#include "passes/eliminate_loop_with_const_trip_count.h"
 #include "passes/eliminate_nop_dropout.h"
+#include "passes/eliminate_optional_get_element.h"
+#include "passes/eliminate_optional_has_element.h"
 #include "passes/eliminate_reshape_around_elementwise.h"
+#include "passes/eliminate_sequence_at_construct.h"
+#include "passes/eliminate_sequence_length_construct.h"
 #include "passes/fuse_add_bias_into_conv.h"
+#include "passes/fuse_attention.h"
 #include "passes/fuse_bn_into_conv.h"
 #include "passes/fuse_consecutive_mul.h"
 #include "passes/fuse_consecutive_unsqueezes.h"
+#include "passes/fuse_gelu.h"
+#include "passes/fuse_gqa.h"
+#include "passes/fuse_layer_norm.h"
+#include "passes/fuse_matmul_add_bias_into_gemm.h"
 #include "passes/fuse_matmul_add_bias_into_gemm_batched.h"
 #include "passes/fuse_mul_into_conv.h"
 #include "passes/fuse_pad_into_pool.h"
+#include "passes/fuse_preceding_mul_into_conv.h"
+#include "passes/fuse_qkv.h"
+#include "passes/fuse_rms_norm.h"
+#include "passes/fuse_rope.h"
+#include "passes/qoperator_quantize_activation.h"
+#include "passes/qoperator_quantize_concat.h"
+#include "passes/qoperator_quantize_conv.h"
+#include "passes/qoperator_quantize_elementwise.h"
+#include "passes/qoperator_quantize_gemm.h"
+#include "passes/qoperator_quantize_matmul.h"
+#include "passes/qoperator_quantize_pool.h"
+#include "passes/qoperator_quantize_softmax.h"
+#include "passes/qoperator_quantize_where.h"
+#include "passes/quantize_bf16.h"
+#include "passes/quantize_fp16.h"
+#include "passes/quantize_fp8.h"
+#include "passes/rewrite_arg_reduce_select_last_index.h"
+#include "passes/static_quantize_conv.h"
+#include "passes/static_quantize_int16_conv.h"
+#include "passes/static_quantize_int16_matmul.h"
+#include "passes/static_quantize_matmul.h"
+#include "passes/weight_only_quantize_conv.h"
+#include "passes/weight_only_quantize_int16_conv.h"
+#include "passes/weight_only_quantize_int16_matmul.h"
+#include "passes/weight_only_quantize_int4_conv.h"
+#include "passes/weight_only_quantize_int4_matmul.h"
+#include "passes/weight_only_quantize_int8_block_conv.h"
+#include "passes/weight_only_quantize_int8_block_matmul.h"
+#include "passes/weight_only_quantize_matmul.h"
+#include "passes/weight_only_quantize_matmul_nbits.h"
 
 namespace onnxsim {
 
@@ -52,10 +98,54 @@ void RegisterCustomOptimizerPasses() {
     auto& registry = ONNX_NAMESPACE::optimization::Optimizer::passes;
 
     // onnxsim-only rewrites (no built-in of the same name today).
+    RegisterOrReplace<p::CrossLayerEqualization>(registry);
+    RegisterOrReplace<p::DefuseMatMulIntegerToFloat>(registry);
+    RegisterOrReplace<p::DynamicQuantizeAttention>(registry);
+    RegisterOrReplace<p::DynamicQuantizeMatMul>(registry);
+    RegisterOrReplace<p::DynamicQuantizeMatMulIntegerToFloat>(registry);
+    RegisterOrReplace<p::DynamicQuantizeTernaryMatMul>(registry);
+    RegisterOrReplace<p::EliminateLoopWithConstTripCount>(registry);
+    RegisterOrReplace<p::EliminateOptionalGetElement>(registry);
+    RegisterOrReplace<p::EliminateOptionalHasElement>(registry);
     RegisterOrReplace<p::EliminateReshapeAroundElementwise>(registry);
+    RegisterOrReplace<p::EliminateSequenceAtConstruct>(registry);
+    RegisterOrReplace<p::EliminateSequenceLengthConstruct>(registry);
+    RegisterOrReplace<p::FuseAttention>(registry);
     RegisterOrReplace<p::FuseConsecutiveMul>(registry);
+    RegisterOrReplace<p::FuseGelu>(registry);
+    RegisterOrReplace<p::FuseGQA>(registry);
+    RegisterOrReplace<p::FuseLayerNorm>(registry);
     RegisterOrReplace<p::FuseMatMulAddBiasIntoGemmBatched>(registry);
     RegisterOrReplace<p::FuseMulIntoConv>(registry);
+    RegisterOrReplace<p::FusePrecedingMulIntoConv>(registry);
+    RegisterOrReplace<p::FuseRMSNorm>(registry);
+    RegisterOrReplace<p::FuseRope>(registry);
+    RegisterOrReplace<p::QOperatorQuantizeActivation>(registry);
+    RegisterOrReplace<p::QOperatorQuantizeConcat>(registry);
+    RegisterOrReplace<p::QOperatorQuantizeConv>(registry);
+    RegisterOrReplace<p::QOperatorQuantizeElementwise>(registry);
+    RegisterOrReplace<p::QOperatorQuantizeGemm>(registry);
+    RegisterOrReplace<p::QOperatorQuantizeMatMul>(registry);
+    RegisterOrReplace<p::QOperatorQuantizePool>(registry);
+    RegisterOrReplace<p::QOperatorQuantizeSoftmax>(registry);
+    RegisterOrReplace<p::QOperatorQuantizeWhere>(registry);
+    RegisterOrReplace<p::QuantizeBf16Pass>(registry);
+    RegisterOrReplace<p::QuantizeFp16Pass>(registry);
+    RegisterOrReplace<p::QuantizeFp8Pass>(registry);
+    RegisterOrReplace<p::RewriteArgReduceSelectLastIndex>(registry);
+    RegisterOrReplace<p::StaticQuantizeConv>(registry);
+    RegisterOrReplace<p::StaticQuantizeInt16Conv>(registry);
+    RegisterOrReplace<p::StaticQuantizeInt16MatMul>(registry);
+    RegisterOrReplace<p::StaticQuantizeMatMul>(registry);
+    RegisterOrReplace<p::WeightOnlyQuantizeConv>(registry);
+    RegisterOrReplace<p::WeightOnlyQuantizeInt16Conv>(registry);
+    RegisterOrReplace<p::WeightOnlyQuantizeInt16MatMul>(registry);
+    RegisterOrReplace<p::WeightOnlyQuantizeInt4Conv>(registry);
+    RegisterOrReplace<p::WeightOnlyQuantizeInt4MatMul>(registry);
+    RegisterOrReplace<p::WeightOnlyQuantizeInt8BlockConv>(registry);
+    RegisterOrReplace<p::WeightOnlyQuantizeInt8BlockMatMul>(registry);
+    RegisterOrReplace<p::WeightOnlyQuantizeMatMul>(registry);
+    RegisterOrReplace<p::WeightOnlyQuantizeMatMulNBits>(registry);
 
     // onnxsim's patched versions of built-in onnxoptimizer passes. These
     // overwrite the registry entries the submodule registers under the same
@@ -66,7 +156,9 @@ void RegisterCustomOptimizerPasses() {
     RegisterOrReplace<p::FuseAddBiasIntoConv>(registry);
     RegisterOrReplace<p::FuseBNIntoConv>(registry);
     RegisterOrReplace<p::FuseConsecutiveUnsqueezes>(registry);
+    RegisterOrReplace<p::FuseMatMulAddBiasIntoGemm>(registry);
     RegisterOrReplace<p::FusePadIntoPool>(registry);
+    RegisterOrReplace<p::FuseQKV>(registry);
   });
 }
 

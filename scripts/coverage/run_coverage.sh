@@ -101,12 +101,33 @@ python3 -m pytest \
 #    gcov emits a value gcovr 8.x flags as "suspicious" and, by default, aborts
 #    the whole run over (exit 64). Those counts are legitimate, so downgrade the
 #    suspicious-hit error to a warning and keep going.
+#
+#    --exclude-directory '.*/_deps/.*': skip gcov'ing CMake's FetchContent
+#    dependencies (protobuf, abseil, ...) entirely. Their .gcda/.gcno end up
+#    stale relative to each other under sccache (a cache-hit replays an old
+#    object's notes file, which can carry a stamp that no longer matches this
+#    run's .gcda), and gcov then reports a "stamp mismatch with notes file" /
+#    "could not write output file" for those files. Those deps are already
+#    dropped from the report by --filter above, so there's nothing to lose by
+#    not gcov'ing them -- and it removes the flaky trigger instead of merely
+#    tolerating it.
+#
+#    --gcov-ignore-errors=output_error --gcov-ignore-errors=no_working_dir_found:
+#    belt-and-suspenders for any other file gcovr can't cleanly gcov (e.g. the
+#    same stamp-mismatch class of error surfacing somewhere --exclude-directory
+#    doesn't cover). Without this, gcovr treats a single bad file as fatal for
+#    the whole run (exit 64) instead of just dropping that file's coverage.
+#    (--gcov-ignore-errors takes one choice per flag, so it's repeated rather
+#    than comma-separated.)
 echo "==> Collecting C++ coverage with gcovr"
 gcovr \
   --root "${REPO_ROOT}" \
   --filter "${REPO_ROOT}/onnxsim/" \
   --exclude '.*third_party.*' \
+  --exclude-directory '.*/_deps/.*' \
   --gcov-ignore-parse-errors=suspicious_hits.warn \
+  --gcov-ignore-errors=output_error \
+  --gcov-ignore-errors=no_working_dir_found \
   --print-summary \
   --xml-pretty --output "${OUTPUT_DIR}/cpp.xml" \
   --html-details "${OUTPUT_DIR}/cpp.html" \

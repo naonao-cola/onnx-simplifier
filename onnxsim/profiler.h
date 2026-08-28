@@ -78,6 +78,17 @@ class Profiler {
   // by Enable() (default 5ms); exposed for tests.
   void set_sample_interval_ms(unsigned ms);
 
+  // Record a live node-count sample for the "node reduction per loop" curve:
+  // how many nodes the graph holds right after one round of a fixed-point
+  // loop (``loop`` names which one, e.g. "Optimize", "FoldConstant",
+  // "Rewrite", or "Initial" for the count before simplification starts).
+  // Written to the trace as "NodeCount" counter (``ph:"C"``) events tagged
+  // with ``loop`` in their args, so onnxsim/profile_plot.py can group them
+  // into one subplot per loop. A no-op unless profiling is enabled -- callers
+  // should still guard the (O(n)) node count they pass in behind enabled()
+  // themselves, so that count is never computed when profiling is off.
+  void RecordNodeCount(const std::string& loop, size_t node_count);
+
  private:
   Profiler() = default;
   ~Profiler();

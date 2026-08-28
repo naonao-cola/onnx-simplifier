@@ -48,6 +48,15 @@ UNIT_MAP: dict[Unit, int] = {
 }
 
 
+def parse_size(size: str) -> int:
+    m = re.fullmatch(r"([\d.]+)\s*([KMGT]?B)", size.strip(), re.I)
+    if not m:
+        raise ValueError(size)
+    number: float = float(m.group(1))
+    unit: Unit = m.group(2).upper()  # type: ignore
+    return int(number * UNIT_MAP[unit])
+
+
 def get_output_names(model: onnx.ModelProto) -> List[str]:
     output_names = [opt.name for opt in model.graph.output]
     return output_names
@@ -328,32 +337,700 @@ def import_onnx_schemas() -> int:
     return imported
 
 
-def _snapshot_doc_strings(model: onnx.ModelProto) -> dict:
-    """Capture the ``doc_string`` fields that the C++ optimizer discards."""
-    return {
-        "model": model.doc_string,
-        "graph": model.graph.doc_string,
-        "inputs": {i.name: i.doc_string for i in model.graph.input},
-        "outputs": {o.name: o.doc_string for o in model.graph.output},
-    }
+def export_safetensors(model: onnx.ModelProto, out_path: str) -> None:
+    """Export ``model`` to a standalone safetensors archive at ``out_path``.
 
-
-def _restore_doc_strings(model: onnx.ModelProto, snapshot: dict) -> None:
-    """Restore doc strings captured by :func:`_snapshot_doc_strings`.
-
-    Only fields that the optimizer left empty are restored, so any doc string
-    produced by the optimizer itself takes precedence.
+    Every initializer's bytes move into the archive with real, byte-accurate
+    offsets -- openable by the ``safetensors`` Python package / HF tooling with
+    no onnxsim involved -- and the graph itself is embedded alongside them, so
+    ``out_path`` alone is both the model's weights and its graph. Reload it
+    with :func:`import_safetensors`.
     """
-    if not model.doc_string and snapshot["model"]:
-        model.doc_string = snapshot["model"]
-    if not model.graph.doc_string and snapshot["graph"]:
-        model.graph.doc_string = snapshot["graph"]
-    for ipt in model.graph.input:
-        if not ipt.doc_string and snapshot["inputs"].get(ipt.name):
-            ipt.doc_string = snapshot["inputs"][ipt.name]
-    for opt in model.graph.output:
-        if not opt.doc_string and snapshot["outputs"].get(opt.name):
-            opt.doc_string = snapshot["outputs"][opt.name]
+    C.export_safetensors(model.SerializeToString(), out_path)
+
+
+def import_safetensors(in_path: str) -> onnx.ModelProto:
+    """Import a standalone safetensors archive back into an ``onnx.ModelProto``.
+
+    ``in_path`` must be an archive produced by :func:`export_safetensors` (or
+    any other tool following the same self-describing-archive convention: an
+    embedded ``model.onnx`` entry alongside the tensors). Raises
+    ``RuntimeError`` if the archive has no embedded onnxsim model, e.g. a
+    plain weights-only safetensors file with no graph to import.
+    """
+    model = onnx.ModelProto()
+    model.ParseFromString(C.import_safetensors(in_path))
+    return model
+
+
+def export_gguf(model: onnx.ModelProto, out_path: str) -> None:
+    """GGUF counterpart of :func:`export_safetensors`."""
+    C.export_gguf(model.SerializeToString(), out_path)
+
+
+def import_gguf(in_path: str) -> onnx.ModelProto:
+    """GGUF counterpart of :func:`import_safetensors`."""
+    model = onnx.ModelProto()
+    model.ParseFromString(C.import_gguf(in_path))
+    return model
+
+
+def import_gguf_weights(
+    model: Union[str, onnx.ModelProto], gguf_path: str
+) -> Tuple[onnx.ModelProto, List[str]]:
+    """
+    Hydrate ``model``'s initializers, by name, from ``gguf_path`` -- unlike
+    :func:`import_gguf`, this works on any GGUF file, including a plain
+    third-party weights-only checkpoint (e.g. a Hugging Face GGUF export)
+    with no embedded onnxsim model: bring your own graph (e.g. exported by
+    another tool for the same architecture) with initializers named to
+    match the checkpoint's own tensor names, and this fills in their
+    values.
+
+    A K-quant tensor (``Q4_K``/``Q5_K``/``Q6_K``/``Q8_0`` -- the block
+    format most real quantized checkpoints, e.g. Unsloth's GGUF exports,
+    actually use for the bulk of their weights) is dequantized to float32
+    in the process; every other quantized GGML format (the legacy ``Q4_0``
+    family, every ``IQ*`` variant, ...) has no decoder here and is skipped
+    -- see the second return value.
+
+    :param model: onnx ModelProto object or file path -- the graph to
+            hydrate. Its initializers' own declared dtype/shape are left
+            alone except for a matched K-quant tensor, whose data_type is
+            forced to FLOAT (the only meaningful type for a dequantized
+            result) regardless of what the initializer previously declared.
+    :param gguf_path: path to the GGUF file to pull weight values from
+    :returns: ``(model, skipped)`` -- the hydrated model, and the names of
+            GGUF tensors present in the file but skipped because their
+            quantized format has no decoder here (the legacy ``Q4_0``
+            family, every ``IQ*`` variant, ...). A GGUF tensor with no
+            matching initializer name in ``model`` is simply not brought
+            in -- it does NOT appear in ``skipped``, which reports only
+            unsupported *formats*, not name mismatches.
+    """
+    if isinstance(model, str):
+        model = onnx.load(model, load_external_data=False)
+    model_bytes, skipped = C.import_gguf_weights(model.SerializeToString(), gguf_path)
+    result = onnx.ModelProto()
+    result.ParseFromString(model_bytes)
+    return result, skipped
+
+
+def read_gguf_metadata(path: str) -> dict:
+    """
+    Read a GGUF file's architecture hyperparameters and per-tensor
+    name/shape/dtype list, without reading any tensor byte data -- cheap
+    even against a multi-gigabyte real checkpoint.
+
+    This is the piece :func:`import_gguf_weights` never surfaces: both
+    functions parse the same GGUF header section, but ``import_gguf_weights``
+    only ever looks at the ``general.alignment`` key before moving on to
+    loading tensor *values* into an existing graph's initializers. Use this
+    instead when what you need is the checkpoint's own description of its
+    architecture -- e.g. ``general.architecture``, ``<arch>.block_count``,
+    ``<arch>.attention.head_count``, ``<arch>.rope.freq_base`` -- to decide
+    *what graph structure* to build in the first place (``import_gguf_weights``
+    only ever fills in the values of a graph you already have).
+
+    :param path: path to the GGUF file to read
+    :returns: ``{"kv": {key: int | float | str | bool, ...},
+            "tensors": [{"name": str, "shape": [int, ...],
+            "ggml_type": int}, ...]}``. ``ggml_type`` is the raw GGML type
+            code (see ``onnxsim/gguf_dtype.h``); an ARRAY-typed metadata
+            value (e.g. ``tokenizer.ggml.tokens``, which alone can hold
+            >100k strings in a real checkpoint) is omitted from ``"kv"``
+            entirely rather than decoded.
+    """
+    return C.read_gguf_metadata(path)
+
+
+def cross_layer_equalize(model: Union[str, onnx.ModelProto]) -> onnx.ModelProto:
+    """
+    Data-free Cross-Layer Equalization (CLE) -- the weight-equalization
+    preprocessing technique from "Data-Free Quantization Through Weight
+    Equalization and Bias Correction" (Nagel et al., 2019), also shipped as
+    part of Qualcomm's AIMET toolkit.
+
+    This is **not** a quantization scheme: no ``Quantize``/``DequantizeLinear``
+    node is ever introduced, and the model's computed function is unchanged
+    bit-for-bit -- only its internal weight *parameterization* changes. Run
+    it *before* one of onnxsim's ``quantize_*`` functions to make the
+    per-tensor or per-channel quantization that follows more accurate.
+
+    For every pair of adjacent Conv layers ``Conv1 -> [activation] -> Conv2``
+    where the activation (if any) is positive-homogeneous of degree 1 --
+    ``f(a*x) == a*f(x)`` for every ``a > 0``, true of ``Relu``/``PRelu``/
+    ``LeakyRelu`` and trivially true of "no activation at all" -- and both
+    convs have ``group == 1``, this rescales each shared channel ``c`` by
+    ``S[c] = sqrt(r1[c] / r2[c])`` (``r1``/``r2`` being Conv1's/Conv2's own
+    per-channel weight range): Conv1's weight/bias for channel ``c`` divided
+    by ``S[c]``, Conv2's weight for channel ``c`` multiplied by ``S[c]``.
+    This makes the two layers' per-channel weight ranges identical -- the
+    most balanced a fixed pair can be -- without changing the composed
+    function at all, since the activation's positive homogeneity is exactly
+    what lets ``S[c]`` and ``1/S[c]`` cancel across it. A single call already
+    equalizes a whole chain of layers, not just one adjacent pair: onnxsim
+    reruns this pass, along with every other registered pass, to a
+    network-wide fixed point.
+
+    Scope of this implementation (each just declines the match rather than
+    mishandling it -- not correctness bugs):
+
+    - Conv only (no ConvTranspose, no Gemm/MatMul-based fully-connected
+      equalization).
+    - ``group`` must be 1 on both convs.
+    - FLOAT32 weights/bias only.
+    - No "high-bias absorption" (AIMET's optional follow-up step for a
+      following BatchNorm's bias) -- plain BN folding (already part of
+      :func:`simplify`) upstream of this pass covers the common case fine on
+      its own.
+
+    This is a single, self-contained graph rewrite: unlike :func:`simplify`,
+    it does not run shape inference, constant folding, or any other pass.
+
+    :param model: onnx ModelProto object or file path
+    :returns: the equalized onnx ModelProto
+    """
+    if isinstance(model, str):
+        model = onnx.load(model, load_external_data=False)
+    return onnx.load_from_string(C.cross_layer_equalize(model.SerializeToString()))
+
+
+def quantize_dynamic(model: Union[str, onnx.ModelProto]) -> onnx.ModelProto:
+    """
+    Dynamically quantize every MatMul, and every "vanilla" Gemm (transA=0,
+    alpha=1, beta=1), whose weight is a constant 2-D float32 tensor.
+
+    The weight is quantized to INT8 ahead of time (per output channel,
+    symmetric, from its static values -- no calibration data is needed),
+    while the activation is quantized to uint8 *in the graph* via
+    ``DynamicQuantizeLinear``, which computes its own scale/zero-point from
+    each run's actual input range. This mirrors the "dynamic quantization"
+    scheme ONNX Runtime's ``quantize_dynamic`` applies to MatMul/Gemm.
+
+    This is a single, self-contained graph rewrite: unlike :func:`simplify`,
+    it does not run shape inference, constant folding, or any other pass.
+    Nodes that do not match (dynamic or non-2-D weights, non-default Gemm
+    attributes, non-float32 operands, an opset older than 11 -- which
+    ``DynamicQuantizeLinear`` requires) are left untouched. Consider calling
+    :func:`simplify` before and/or after to clean up the graph.
+
+    :param model: onnx ModelProto object or file path
+    :returns: the quantized onnx ModelProto
+    """
+    if isinstance(model, str):
+        model = onnx.load(model, load_external_data=False)
+    return onnx.load_from_string(C.quantize_dynamic(model.SerializeToString()))
+
+
+def quantize_dynamic_matmul_integer_to_float(
+    model: Union[str, onnx.ModelProto],
+) -> onnx.ModelProto:
+    """
+    Same rewrite as :func:`quantize_dynamic` -- same matching rules, same
+    per-output-channel weight quantization, same runtime
+    ``DynamicQuantizeLinear`` activation quantization -- but the dequantize
+    step is a single ONNX Runtime "com.microsoft" contrib op,
+    ``MatMulIntegerToFloat``, instead of :func:`quantize_dynamic`'s
+    three-to-four separate standard-ONNX nodes (``MatMulInteger`` + ``Cast``
+    + two ``Mul``s + an optional ``Add``): ``MatMulIntegerToFloat``'s own
+    schema dequantizes and adds an optional bias directly, so this needs
+    only ``DynamicQuantizeLinear`` plus the one contrib op.
+
+    Unlike :func:`quantize_dynamic`, the result is **not** portable standard
+    ONNX -- ``MatMulIntegerToFloat`` is an ONNX Runtime contrib op, so the
+    quantized model needs a "com.microsoft"-aware runtime to execute. No
+    calibration data is needed either way.
+
+    This is a single, self-contained graph rewrite: unlike :func:`simplify`,
+    it does not run shape inference, constant folding, or any other pass.
+    Nodes that do not match (dynamic or non-2-D weights, non-default Gemm
+    attributes, non-float32 operands, an opset older than 11 -- which
+    ``DynamicQuantizeLinear`` requires) are left untouched. Consider calling
+    :func:`simplify` before and/or after to clean up the graph.
+
+    :param model: onnx ModelProto object or file path
+    :returns: the quantized onnx ModelProto
+    """
+    if isinstance(model, str):
+        model = onnx.load(model, load_external_data=False)
+    return onnx.load_from_string(
+        C.quantize_dynamic_matmul_integer_to_float(model.SerializeToString())
+    )
+
+
+def quantize_attention_dynamic(
+    model: Union[str, onnx.ModelProto],
+) -> onnx.ModelProto:
+    """
+    Dynamically quantizes every "com.microsoft" ``Attention`` node already
+    present in ``model`` (this does not fuse attention itself -- run
+    :func:`simplify` first to produce ``Attention`` nodes if the input model
+    doesn't already have any; see :mod:`onnxsim`'s ``fuse_attention`` pass)
+    into ``Attention``'s quantized counterpart, ``QAttention``.
+
+    The merged Q/K/V weight is quantized to INT8 ahead of time (per output
+    channel, symmetric, from its static values -- no calibration data is
+    needed), while the activation is quantized to uint8 *in the graph* via
+    ``DynamicQuantizeLinear``, which computes its own scale/zero-point from
+    each run's actual input range -- mirroring :func:`quantize_dynamic`'s own
+    scheme for MatMul/Gemm.
+
+    ``Attention``'s optional ``qkv_hidden_sizes`` attribute lets V's hidden
+    size differ from Q/K's (see :func:`simplify`'s ``fuse_attention`` pass),
+    but ``QAttention``'s schema assumes an even three-way split -- a node
+    with an uneven split is left unquantized rather than guessing how (or
+    whether) the kernel would handle it.
+
+    This is a single, self-contained graph rewrite: unlike :func:`simplify`,
+    it does not run shape inference, constant folding, fuse_attention, or any
+    other pass. Nodes that do not match (no ``Attention`` node, a
+    non-constant or non-2-D weight, a non-float32 activation, an opset older
+    than 11 -- which ``DynamicQuantizeLinear`` requires -- or an uneven
+    ``qkv_hidden_sizes`` split) are left untouched. Consider calling
+    :func:`simplify` before and/or after to produce ``Attention`` nodes and
+    clean up the graph.
+
+    :param model: onnx ModelProto object or file path
+    :returns: the quantized onnx ModelProto
+    """
+    if isinstance(model, str):
+        model = onnx.load(model, load_external_data=False)
+    return onnx.load_from_string(
+        C.quantize_attention_dynamic(model.SerializeToString())
+    )
+
+
+def quantize_ternary(model: Union[str, onnx.ModelProto]) -> onnx.ModelProto:
+    """
+    Dynamically quantize every MatMul, and every "vanilla" Gemm (transA=0,
+    alpha=1, beta=1), whose constant weight is *structurally ternary*: every
+    element of every output column is one of ``{-s, 0, +s}`` for that
+    column's own scale ``s``. This is the weight representation `BitNet
+    b1.58 <https://github.com/microsoft/BitNet>`_ and similar ternary-weight
+    models use internally, which a generic ONNX export still stores as a
+    dense float32 initializer -- 16x larger than it needs to be, and running
+    on the generic float MatMul kernel.
+
+    A detected node gets exactly :func:`quantize_dynamic`'s rewrite
+    (``DynamicQuantizeLinear`` + ``MatMulInteger`` + dequantize) -- the only
+    difference is that the weight's INT8 encoding here is a **lossless**
+    ``{-1, 0, 1}`` code (derived structurally, not by rounding), rather than
+    a rounded approximation of the weight's full dynamic range. A node whose
+    weight is not structurally ternary is left untouched by this call --
+    combine with :func:`quantize_dynamic` (which fires on any constant
+    float32 weight) if a model mixes ternary and ordinary layers and both
+    should be quantized.
+
+    This only targets standard ONNX operators, like the rest of onnxsim's
+    quantization passes -- not a contrib op like
+    ``com.microsoft::MatMulNBits``, which would pack the ternary codes down
+    to 2 bits for a further ~4x weight-storage saving on top of what this
+    function gets, at the cost of only running on onnxruntime builds that
+    ship it. See docs/ternary-quantization.md.
+
+    This is a single, self-contained graph rewrite: unlike :func:`simplify`,
+    it does not run shape inference, constant folding, or any other pass.
+    Nodes that do not match (dynamic or non-2-D weights, non-default Gemm
+    attributes, non-float32 operands, a non-ternary weight, an opset older
+    than 11) are left untouched. Consider calling :func:`simplify` before
+    and/or after to clean up the graph.
+
+    :param model: onnx ModelProto object or file path
+    :returns: the quantized onnx ModelProto
+    """
+    if isinstance(model, str):
+        model = onnx.load(model, load_external_data=False)
+    return onnx.load_from_string(C.quantize_ternary(model.SerializeToString()))
+
+
+def quantize_weight_only(model: Union[str, onnx.ModelProto]) -> onnx.ModelProto:
+    """
+    Weight-only quantize every MatMul, every "vanilla" Gemm (transA=0,
+    alpha=1, beta=1), and every Conv, whose weight is a constant float32
+    tensor (2-D for MatMul/Gemm, rank >= 3 for Conv).
+
+    The weight is quantized to INT8 ahead of time (per output channel,
+    symmetric, from its static values -- the same scheme
+    :func:`quantize_dynamic`/:func:`quantize_static` use), inserting a single
+    ``DequantizeLinear`` in its place. Unlike both of those, the activation is
+    never touched: no ``DynamicQuantizeLinear``, no QuantizeLinear/
+    DequantizeLinear pair, no calibration data of any kind. This only shrinks
+    the model's weight storage (~4x for the quantized weights); it does not
+    change activation precision or add any runtime quantize/dequantize cost
+    to the activation path. This mirrors the "weight-only quantization"
+    scheme most real-world weight-heavy ONNX deployments -- large linear/
+    embedding layers in transformer-style decoders, for example -- actually
+    ship, as opposed to full activation quantization.
+
+    This is a single, self-contained graph rewrite: unlike :func:`simplify`,
+    it does not run shape inference, constant folding, or any other pass.
+    Nodes that do not match (dynamic or unsupported-rank weights, non-default
+    Gemm attributes, non-float32 operands, an opset older than 13 -- which
+    ``DequantizeLinear``'s per-channel ``axis`` requires) are left untouched.
+    Consider calling :func:`simplify` before and/or after to clean up the
+    graph.
+
+    :param model: onnx ModelProto object or file path
+    :returns: the quantized onnx ModelProto
+    """
+    if isinstance(model, str):
+        model = onnx.load(model, load_external_data=False)
+    return onnx.load_from_string(C.quantize_weight_only(model.SerializeToString()))
+
+
+def quantize_weight_only_int4(model: Union[str, onnx.ModelProto]) -> onnx.ModelProto:
+    """
+    Block-wise INT4 weight-only quantize every MatMul, every "vanilla" Gemm
+    (transA=0, alpha=1, beta=1), and every Conv, whose weight is a constant
+    float32 tensor whose flattened reduction size -- ``K`` for MatMul/Gemm;
+    ``Cin/groups * prod(kernel dims)`` for Conv -- is evenly divisible by 32.
+
+    The weight is quantized to INT4 (values in ``[-7, 7]``) with a separate
+    symmetric scale per 32-element block of that reduction, per output
+    channel -- the GPTQ/AWQ-style block quantization real weight-heavy
+    LLM/ASR deployments increasingly ship -- inserting a single
+    ``DequantizeLinear(..., block_size=32)`` in its place (Conv's weight is
+    flattened to 2-D for this, then a ``Reshape`` restores its original
+    shape). Like :func:`quantize_weight_only`, the activation is never
+    touched: no calibration data, no runtime quantize/dequantize cost on the
+    activation path. Storage is roughly half of :func:`quantize_weight_only`'s
+    INT8 scheme for a comparable accuracy cost, since block-local scales
+    absorb most of what a single wider per-channel range would otherwise
+    lose. Uses ONNX opset 21's INT4 tensor type and ``DequantizeLinear``'s
+    ``block_size`` attribute -- standard ONNX, not a contrib op, so the
+    result loads on any conformant opset-21+ runtime.
+
+    This is a single, self-contained graph rewrite: unlike :func:`simplify`,
+    it does not run shape inference, constant folding, or any other pass.
+    Nodes that do not match (dynamic or unsupported-rank weights, a
+    reduction size not divisible by 32, non-default Gemm attributes,
+    non-float32 operands, an opset older than 21) are left untouched.
+    Consider calling :func:`simplify` before and/or after to clean up the
+    graph.
+
+    :param model: onnx ModelProto object or file path
+    :returns: the quantized onnx ModelProto
+    """
+    if isinstance(model, str):
+        model = onnx.load(model, load_external_data=False)
+    return onnx.load_from_string(C.quantize_weight_only_int4(model.SerializeToString()))
+
+
+def quantize_weight_only_matmul_nbits(
+    model: Union[str, onnx.ModelProto],
+) -> onnx.ModelProto:
+    """
+    Block-wise INT4 weight-only quantize every MatMul, and every "vanilla"
+    Gemm (transA=0, alpha=1, beta=1), whose weight is a constant 2-D
+    float32 tensor, into ONNX Runtime's own ``com.microsoft::MatMulNBits``
+    contrib op.
+
+    This is a **vendor-specific** counterpart to
+    :func:`quantize_weight_only_int4`: same INT4 precision, same 32-element
+    block-wise scale, but packed into ONNX Runtime's own single fused op --
+    the format ORT's own GenAI/quantization tooling (Olive,
+    ``onnxruntime.quantization``'s ``matmul_4bits_quantizer``, ...) emits
+    for LLM/ASR weight compression -- instead of
+    :func:`quantize_weight_only_int4`'s portable, standard-ONNX
+    INT4-tensor-plus-``DequantizeLinear`` pair. Smaller and faster on ONNX
+    Runtime specifically, at the cost of needing ORT (or another runtime
+    implementing this contrib op) to run at all: unlike every other
+    ``quantize_*`` function in onnxsim, the result does **not** load on an
+    arbitrary conformant ONNX runtime.
+
+    Unlike :func:`quantize_weight_only_int4` (which needs opset 21 for
+    ONNX's own native INT4 tensor type and ``DequantizeLinear``'s
+    ``block_size`` attribute), this needs no minimum standard opset --
+    ``MatMulNBits`` is a self-contained contrib op -- and, unlike that
+    function, does not require the reduction dimension to be evenly
+    divisible by the 32-element block size: ``MatMulNBits`` itself defines
+    ``k_blocks = ceil(K / block_size)``, so a ragged last block is
+    quantized exactly like every other one instead of being declined.
+
+    This is a single, self-contained graph rewrite: unlike :func:`simplify`,
+    it does not run shape inference, constant folding, or any other pass.
+    Nodes that do not match (dynamic or non-2-D weights, non-default Gemm
+    attributes, non-float32 operands) are left untouched. Consider calling
+    :func:`simplify` before and/or after to clean up the graph.
+
+    :param model: onnx ModelProto object or file path
+    :returns: the quantized onnx ModelProto
+    """
+    if isinstance(model, str):
+        model = onnx.load(model, load_external_data=False)
+    return onnx.load_from_string(
+        C.quantize_weight_only_matmul_nbits(model.SerializeToString())
+    )
+
+
+def quantize_weight_only_int16(model: Union[str, onnx.ModelProto]) -> onnx.ModelProto:
+    """
+    INT16 weight-only quantize every MatMul, every "vanilla" Gemm (transA=0,
+    alpha=1, beta=1), and every Conv, whose weight is a constant float32
+    tensor.
+
+    The weight is quantized to INT16 (per output channel, symmetric, scale =
+    ``max(|w|) / 32767``) with a single ``DequantizeLinear(axis=...)`` in its
+    place -- the exact same per-channel scheme :func:`quantize_weight_only`
+    uses, just with INT16's ~8x finer step (1/32767 relative) instead of
+    INT8's 1/127. Like :func:`quantize_weight_only`, the activation is never
+    touched: no calibration data, no runtime quantize/dequantize cost on the
+    activation path.
+
+    That extra resolution matters specifically for channels with a few
+    extreme-outlier weights, where INT8's coarser step would leave the
+    channel's *typical* (median-magnitude) weight rounding to within one
+    quantization step of zero -- effectively lost.
+    :func:`estimate_quantization_precision` flags exactly this case (a
+    channel's ``max(|w|) / median(|w|)`` ratio past 127) and recommends INT16
+    as one fix; this is that fix. The tradeoff: INT16 is only ~2x smaller
+    than float32 (INT8 is ~4x), so use this for the specific outlier-heavy
+    weights :func:`quantize_weight_only`'s INT8 handles poorly, not as a
+    blanket replacement for it. Uses ONNX opset 21's INT16
+    ``QuantizeLinear``/``DequantizeLinear`` type support -- standard ONNX,
+    not a contrib op.
+
+    This is a single, self-contained graph rewrite: unlike :func:`simplify`,
+    it does not run shape inference, constant folding, or any other pass.
+    Nodes that do not match (dynamic or unsupported-rank weights, non-default
+    Gemm attributes, non-float32 operands, an opset older than 21) are left
+    untouched. Consider calling :func:`simplify` before and/or after to clean
+    up the graph.
+
+    :param model: onnx ModelProto object or file path
+    :returns: the quantized onnx ModelProto
+    """
+    if isinstance(model, str):
+        model = onnx.load(model, load_external_data=False)
+    return onnx.load_from_string(
+        C.quantize_weight_only_int16(model.SerializeToString())
+    )
+
+
+def quantize_weight_only_int8_block(
+    model: Union[str, onnx.ModelProto],
+) -> onnx.ModelProto:
+    """
+    Block-wise INT8 weight-only quantize every MatMul, every "vanilla" Gemm
+    (transA=0, alpha=1, beta=1), and every Conv, whose weight is a constant
+    float32 tensor whose flattened reduction size -- ``K`` for MatMul/Gemm;
+    ``Cin/groups * prod(kernel dims)`` for Conv -- is evenly divisible by 32.
+
+    The weight is quantized to INT8 (values in ``[-127, 127]``) with a
+    separate symmetric scale per 32-element block of that reduction, per
+    output channel -- the same block-wise granularity
+    :func:`quantize_weight_only_int4` uses, just at INT8's wider code range
+    -- inserting a single ``DequantizeLinear(..., block_size=32)`` in its
+    place (Conv's weight is flattened to 2-D for this, then a ``Reshape``
+    restores its original shape). Like :func:`quantize_weight_only`, the
+    activation is never touched: no calibration data, no runtime
+    quantize/dequantize cost on the activation path.
+
+    This sits between :func:`quantize_weight_only`'s single per-channel INT8
+    scale (coarser, no block overhead) and
+    :func:`quantize_weight_only_int4`'s block-wise INT4 (finer blocks, but
+    only 15 representable codes per block): the same storage as
+    :func:`quantize_weight_only` (INT8 codes are still 1 byte each; only the
+    scale tensor grows, from one float per channel to one float per (block,
+    channel) pair), with resolution closer to a per-block scheme. Uses ONNX
+    opset 21's ``DequantizeLinear`` ``block_size`` attribute -- standard
+    ONNX, not a contrib op -- the same opset floor as
+    :func:`quantize_weight_only_int4`, even though plain INT8 itself needs
+    only opset 13.
+
+    This is a single, self-contained graph rewrite: unlike :func:`simplify`,
+    it does not run shape inference, constant folding, or any other pass.
+    Nodes that do not match (dynamic or unsupported-rank weights, a
+    reduction size not divisible by 32, non-default Gemm attributes,
+    non-float32 operands, an opset older than 21) are left untouched.
+    Consider calling :func:`simplify` before and/or after to clean up the
+    graph.
+
+    :param model: onnx ModelProto object or file path
+    :returns: the quantized onnx ModelProto
+    """
+    if isinstance(model, str):
+        model = onnx.load(model, load_external_data=False)
+    return onnx.load_from_string(
+        C.quantize_weight_only_int8_block(model.SerializeToString())
+    )
+
+
+def quantize_fp16(
+    model: Union[str, onnx.ModelProto], keep_io_types: bool = True
+) -> onnx.ModelProto:
+    """
+    Convert every float32 weight -- and, by default, every internal
+    activation -- in ``model`` to float16.
+
+    Unlike every other ``quantize_*`` function in onnxsim, this needs no
+    calibration data and has no scale/zero-point: float16 is still a
+    floating-point format (5 exponent bits / 10 mantissa bits, versus
+    float32's 8/23), not an integer scheme, so every float32 value is simply
+    rounded to its nearest representable float16 value. A value outside
+    float16's finite range (magnitude > 65504, including +-Inf itself) is
+    clamped to float16's largest finite magnitude rather than rounded to an
+    infinity.
+
+    With ``keep_io_types`` (the default ``True``), the model's own external
+    input/output types stay float32 -- a ``Cast`` is inserted right after
+    each float32 graph input and right before each float32 graph output, so
+    the model's public interface is unchanged and only its internal weights
+    and compute switch to float16. Pass ``False`` to redeclare graph
+    inputs/outputs float16 directly instead (no casts; callers must then
+    feed/read float16 tensors).
+
+    No node's op_type or attributes are touched, and there is no per-op
+    float16-support check: an ordinary feedforward graph ends up computing
+    end-to-end in float16 as a side effect of every value along the way now
+    being float16-typed, since almost every ONNX op propagates its input
+    dtype to its output dtype. A model containing an op with no float16
+    kernel in the runtime it is deployed on will fail at *execution* time,
+    not at conversion time here -- the same limitation every other
+    float32-to-float16 model converter (e.g. ``onnxconverter-common``'s
+    ``convert_float_to_float16``) has.
+
+    This is a single, self-contained graph rewrite: unlike :func:`simplify`,
+    it does not run shape inference, constant folding, or any other pass.
+    Only the top-level graph is converted -- nodes inside control-flow
+    subgraphs (If/Loop/Scan bodies) are left untouched -- and an initializer
+    whose name is also a graph input (the rarely-used ONNX "optional input
+    with a default value" convention) is left alone entirely. Consider
+    calling :func:`simplify` before and/or after to clean up the graph.
+
+    :param model: onnx ModelProto object or file path
+    :param keep_io_types: keep the graph's own external input/output types
+            at float32 (inserting boundary Cast nodes) instead of
+            redeclaring them float16 directly
+    :returns: the converted onnx ModelProto
+    """
+    if isinstance(model, str):
+        model = onnx.load(model, load_external_data=False)
+    return onnx.load_from_string(
+        C.quantize_fp16(model.SerializeToString(), keep_io_types)
+    )
+
+
+def quantize_bf16(
+    model: Union[str, onnx.ModelProto], keep_io_types: bool = True
+) -> onnx.ModelProto:
+    """
+    Convert every float32 weight -- and, by default, every internal
+    activation -- in ``model`` to bfloat16.
+
+    The same calibration-free, whole-graph conversion as
+    :func:`quantize_fp16`, just to a different narrow floating-point format:
+    bfloat16 keeps float32's full 8-bit exponent range and narrows only the
+    mantissa (7 bits instead of float32's 23), so every finite float32 value
+    maps to a finite bfloat16 value -- unlike float16, no clamping is ever
+    needed.
+
+    With ``keep_io_types`` (the default ``True``), the model's own external
+    input/output types stay float32 -- a ``Cast`` is inserted right after
+    each float32 graph input and right before each float32 graph output, so
+    the model's public interface is unchanged and only its internal weights
+    and compute switch to bfloat16. Pass ``False`` to redeclare graph
+    inputs/outputs bfloat16 directly instead (no casts; callers must then
+    feed/read bfloat16 tensors).
+
+    No node's op_type or attributes are touched, and there is no per-op
+    bfloat16-support check: an ordinary feedforward graph ends up computing
+    end-to-end in bfloat16 as a side effect of every value along the way now
+    being bfloat16-typed, since almost every ONNX op propagates its input
+    dtype to its output dtype. A model containing an op with no bfloat16
+    kernel in the runtime it is deployed on will fail at *execution* time,
+    not at conversion time here.
+
+    This is a single, self-contained graph rewrite: unlike :func:`simplify`,
+    it does not run shape inference, constant folding, or any other pass.
+    Only the top-level graph is converted -- nodes inside control-flow
+    subgraphs (If/Loop/Scan bodies) are left untouched -- and an initializer
+    whose name is also a graph input (the rarely-used ONNX "optional input
+    with a default value" convention) is left alone entirely. Consider
+    calling :func:`simplify` before and/or after to clean up the graph.
+
+    :param model: onnx ModelProto object or file path
+    :param keep_io_types: keep the graph's own external input/output types
+            at float32 (inserting boundary Cast nodes) instead of
+            redeclaring them bfloat16 directly
+    :returns: the converted onnx ModelProto
+    """
+    if isinstance(model, str):
+        model = onnx.load(model, load_external_data=False)
+    return onnx.load_from_string(
+        C.quantize_bf16(model.SerializeToString(), keep_io_types)
+    )
+
+
+def quantize_fp8(
+    model: Union[str, onnx.ModelProto],
+    format: str = "e4m3",
+    keep_io_types: bool = True,
+) -> onnx.ModelProto:
+    """
+    Convert every float32 weight -- and, by default, every internal
+    activation -- in ``model`` to an 8-bit floating-point format.
+
+    The same calibration-free, whole-graph conversion as
+    :func:`quantize_fp16`/:func:`quantize_bf16`, just to a much narrower
+    floating-point format. ``format`` selects which one:
+
+    - ``"e4m3"`` (the default): E4M3FN -- 4 exponent bits, 3 mantissa bits,
+      max finite magnitude 448. No infinities. Typically used for weights.
+    - ``"e5m2"``: 5 exponent bits, 2 mantissa bits, max finite magnitude
+      57344 -- a dynamic range similar to float16. Typically used for
+      gradients.
+
+    Both are converted with saturation: a value whose magnitude exceeds the
+    target format's max finite value (including +-Inf itself) is clamped to
+    it rather than mapped to an infinity/NaN, the same design choice
+    :func:`quantize_fp16` makes for its own out-of-range values. Rounding is
+    round-to-nearest, ties-to-even -- float8's mantissa is only 2-3 bits
+    wide, so exact ties are common enough on real data that the simpler
+    ties-away-from-zero rule :func:`quantize_fp16`/:func:`quantize_bf16` use
+    is not a good enough approximation here.
+
+    With ``keep_io_types`` (the default ``True``), the model's own external
+    input/output types stay float32 -- a ``Cast`` is inserted right after
+    each float32 graph input and right before each float32 graph output, so
+    the model's public interface is unchanged and only its internal weights
+    and compute switch to the target float8 format. Pass ``False`` to
+    redeclare graph inputs/outputs in that format directly instead (no
+    casts; callers must then feed/read float8 tensors).
+
+    No node's op_type or attributes are touched, and there is no per-op
+    float8-support check: an ordinary feedforward graph ends up computing
+    end-to-end in the target format as a side effect of every value along
+    the way now being that format, since almost every ONNX op propagates its
+    input dtype to its output dtype. A model containing an op with no float8
+    kernel in the runtime it is deployed on will fail at *execution* time,
+    not at conversion time here -- and as of most current runtimes, float8
+    compute kernel coverage is narrower than even bfloat16's, so expect this
+    to mostly be useful for storage-size reduction and for deployment
+    targets with real float8 kernel support today.
+
+    This is a single, self-contained graph rewrite: unlike :func:`simplify`,
+    it does not run shape inference, constant folding, or any other pass.
+    Only the top-level graph is converted -- nodes inside control-flow
+    subgraphs (If/Loop/Scan bodies) are left untouched -- and an initializer
+    whose name is also a graph input (the rarely-used ONNX "optional input
+    with a default value" convention) is left alone entirely. Consider
+    calling :func:`simplify` before and/or after to clean up the graph.
+    Casting to/from these types needs opset >= 19.
+
+    :param model: onnx ModelProto object or file path
+    :param format: target float8 format, ``"e4m3"`` (default) or ``"e5m2"``
+    :param keep_io_types: keep the graph's own external input/output types
+            at float32 (inserting boundary Cast nodes) instead of
+            redeclaring them in the target format directly
+    :returns: the converted onnx ModelProto
+    """
+    if isinstance(model, str):
+        model = onnx.load(model, load_external_data=False)
+    return onnx.load_from_string(
+        C.quantize_fp8(model.SerializeToString(), format, keep_io_types)
+    )
 
 
 def simplify(
@@ -379,15 +1056,18 @@ def simplify(
     import_custom_schemas: bool = True,
     input_shapes=None,
     target_opset_version: Optional[int] = None,
+    extra_optimizers: Optional[List[str]] = None,
     custom_rewriter: Optional[ModelRewriter] = None,
     function_rewrite_rules: Optional[Sequence[FunctionRewriteRule]] = None,
     check_rtol: float = 1e-4,
     check_atol: float = 1e-5,
     input_fill: str = "random",
     providers: Optional[Sequence[backend.Provider]] = None,
+    gemm_fusion_backend: Literal["ort_cpu", "unrestricted"] = "ort_cpu",
     profile: Optional[str] = None,
     ort_profile: Optional[str] = None,
     merge_ort_profile: bool = False,
+    output_path: Optional[str] = None,
 ) -> Tuple[onnx.ModelProto, bool]:
     """
     :param model: onnx ModelProto object or file path
@@ -428,6 +1108,17 @@ def simplify(
             before simplifying, using onnx's version converter (run inside the C++ core so every
             binding shares the behavior). This can be used to upgrade (or downgrade) the model's
             opset during simplification. When None (the default), the opset version is left unchanged.
+    :param extra_optimizers: The counterpart to ``skipped_optimizers``: run these named onnx-optimizer
+            passes in addition to the default fuse/elimination set, rather than excluding some of it.
+            This is how a pass registered as ``PassType::Other`` -- excluded from the default set
+            because it is a graph-shape rewrite rather than a pure node reduction or fusion (e.g. a
+            defusion that trades a backend-specific op for a more portable but larger equivalent) --
+            gets opted into, without changing what runs by default for every other caller. List valid
+            names with ``onnxsim --list-other-optimizers`` (``--list-default-optimizers`` lists the
+            ones already on by default, which do not need naming here). Has no effect when
+            ``perform_optimization`` is ``False``. An unknown name raises, since -- unlike a typo in
+            ``skipped_optimizers``, which just means nothing new is skipped -- a typo here means the
+            pass you asked for silently never runs.
     :param custom_rewriter: An optional callable ``ModelProto -> Optional[ModelProto]`` run as an extra
             stage inside onnxsim's simplification fixed point, interleaved with the built-in optimizer,
             shape inference and constant folding so a rewrite can unlock further simplification and vice
@@ -467,6 +1158,23 @@ def simplify(
             provider specifically needs the ``onnxruntime-gpu`` build); a
             requested provider that the installed onnxruntime does not offer
             raises ``ValueError`` instead of silently falling back.
+    :param gemm_fusion_backend: Which runtime the ``fuse_matmul_add_bias_into_gemm``
+            passes should assume will execute the *simplified* model -- unrelated to
+            ``providers`` above, which only picks constant folding's execution
+            provider during simplification itself. ``"ort_cpu"`` (the default)
+            restricts the MatMul+Add -> Gemm fusion to FLOAT32 operands: ONNX
+            Runtime's CPU execution provider has no fast Gemm kernel for FLOAT16 (it
+            falls back to a naive path) even though its MatMul kernel does, so
+            fusing a FLOAT16 MatMul+Add there was measured making that op ~70x
+            *slower* to run, not faster. ``"unrestricted"`` fuses regardless of
+            operand dtype (onnx-optimizer's original, backend-agnostic behavior) --
+            use it when the simplified model will run somewhere ORT CPU's FP16 Gemm
+            slowness does not apply (a different runtime, a different execution
+            provider such as CUDA, or an ONNX Runtime build with a real FP16 Gemm
+            kernel). Implemented in the C++ core via the
+            ``ONNXSIM_GEMM_FUSION_BACKEND`` environment variable, so it works from
+            every binding; setting this argument simply sets that variable for the
+            call.
     :param profile: When set, profile every simplification fixed-point function
             (shape inference, the onnx-optimizer passes, constant folding and any
             custom rewriter) -- recording each one's wall-clock and CPU duration
@@ -474,9 +1182,13 @@ def simplify(
             Chrome Trace Event Format JSON to this path (an empty string uses
             ``onnxsim_profile.json``). Open the file in ``chrome://tracing`` or
             https://ui.perfetto.dev to see the flame graph; a per-function summary
-            is also printed to stdout. Implemented in the C++ core via the
-            ``ONNXSIM_PROFILE`` environment variable, so it works from every
-            binding; setting this argument simply sets that variable for the call.
+            is also printed to stdout. The trace also records a "NodeCount"
+            counter event after every round of each fixed-point loop, tagged
+            with which loop produced it -- see ``onnxsim.profile_plot`` (or
+            ``--node-reduction-plot``) to turn that into a node-count-per-round
+            plot. Implemented in the C++ core via the ``ONNXSIM_PROFILE``
+            environment variable, so it works from every binding; setting this
+            argument simply sets that variable for the call.
     :param ort_profile: When set, turn on onnxruntime's own built-in session
             profiler for the onnxruntime sessions onnxsim runs while simplifying
             (the constant-folding sessions, plus the correctness-check runs when
@@ -499,6 +1211,24 @@ def simplify(
             left behind. Takes precedence over ``ort_profile`` (which requests
             standalone files). Works for every executor, including the Python
             ``PyModelExecutor`` used by ``simplify()``.
+    :param output_path: Save the simplified model to this path directly, instead of (or as
+            well as) relying on the caller to save the returned ``ModelProto`` themselves.
+            Requires ``model`` to be a file path (there is no file to redirect otherwise).
+            When ``model`` is a path and ``check_n == 0`` (the default), this lets the fast
+            path skip reading the result back with its tensor data inline (default
+            ``load_external_data=True``) purely to satisfy this function's return contract,
+            loading it structure-only (``load_external_data=False``) instead -- correct for
+            inspecting the graph (shapes, node counts, ...), but call
+            ``onnx.load_external_data_for_model(model_opt)`` yourself if you need actual
+            tensor values from it afterward. Note this is a secondary optimization: the
+            dominant peak-memory cost for a large external-data model was traced to the C++
+            core's own working copy of the model, not to this reload -- see
+            ``bench/RESULTS_synthetic_decoder_oom.md`` for the measurements and the (now
+            separately fixed, via ``SimplifyConsumeInput`` in ``onnxsim.cpp``) root cause.
+            Outside the fast-path case (``check_n > 0``, or another reason it doesn't apply)
+            the model is still saved to ``output_path`` before returning, just without that
+            reload-skipping benefit, since the full model has to be materialized anyway to
+            run the correctness check.
     :return: A tuple (simplified model, success(True) or failed(False))
     """
     # Validate the requested execution providers up front. onnxsim's constant
@@ -543,6 +1273,11 @@ def simplify(
             "custom_rewriter and function_rewrite_rules are mutually exclusive; "
             "pass only one."
         )
+    if output_path is not None and not isinstance(model, str):
+        raise ValueError(
+            "output_path requires `model` to be a file path (there is no file to "
+            "redirect the saved result from otherwise)"
+        )
     if function_rewrite_rules:
         rewriter = C.make_function_proto_rewriter(
             [(pattern, replacement) for pattern, replacement in function_rewrite_rules]
@@ -560,21 +1295,205 @@ def simplify(
 
     if skip_fuse_bn and skipped_optimizers is not None:
         skipped_optimizers.append("fuse_bn_into_conv")
+
+    # onnxsim's model transforms -- input-shape overwrite, unused-output
+    # removal, initializer-from-input folding, and the unhashable-tensor
+    # optimizer skip -- all run natively in C++ (Simplify()/SimplifyPath()),
+    # so this function never needs to parse the model into a Python object
+    # itself: it only marshals options through to the C++ core. The one
+    # exception is the deprecated "``None`` key means the model's single
+    # input" convenience on ``overwrite_input_shapes``/``test_input_shapes``
+    # (and the legacy ``input_shapes`` argument, which sets both) -- resolving
+    # it needs the model's own input names, so it is the one case that still
+    # requires loading the model up front.
+    _shapes_need_model = (input_shapes is not None) or any(
+        d and None in d for d in (overwrite_input_shapes, test_input_shapes)
+    )
+
+    # Fast path: no ``check_n`` verification (which needs the original model
+    # loaded anyway to compare against), no shape dict needing the model to
+    # resolve, and no onnxruntime-side session profiling requested (this
+    # function's ``ort_profile``/``merge_ort_profile`` handling below sets up
+    # ``ONNXSIM_ORT_PROFILE`` and merges the resulting traces into the onnxsim
+    # profile after simplification -- machinery the fast path does not
+    # replicate). A file path goes straight through the C++ core's native
+    # path-based entry point (``C.simplify_path``), skipping the Python-level
+    # parse-then-reserialize round trip a large model otherwise pays crossing
+    # into C++ -- every initializer's bytes get materialized into a Python
+    # ``ModelProto``, serialized back to a byte string, and reparsed on the
+    # C++ side, all before simplification even starts. On an 833MB model this
+    # dwarfs the actual simplification work (tens of seconds of marshalling
+    # for ~5 seconds of real work). An in-memory ``ModelProto`` has no file to
+    # hand to C++, so it pays one unavoidable ``SerializeToString``/
+    # ``C.simplify`` bytes round trip -- still far cheaper than the removed
+    # Python-side transforms, which needed the model fully materialized and
+    # walked repeatedly. Falls back to the standard path below on ANY
+    # exception -- e.g. a model whose tensors onnxoptimizer's CSE cannot hash
+    # (issue #348), which the C++ core already detects and works around
+    # itself -- so this is never less correct than before, only sometimes not
+    # faster.
+    if (
+        check_n == 0
+        and not _shapes_need_model
+        and ort_profile is None
+        and not merge_ort_profile
+    ):
+        _fast_threshold_bytes = parse_size(tensor_size_threshold)
+        if _fast_threshold_bytes <= 2**31 - 9999:
+            _fast_prev_profile_env = None
+            _fast_profile_active = profile is not None
+            _fast_profile_path = profile or "onnxsim_profile.json"
+            if _fast_profile_active:
+                _fast_prev_profile_env = os.environ.get("ONNXSIM_PROFILE")
+                os.environ["ONNXSIM_PROFILE"] = _fast_profile_path
+            _fast_prev_gemm_backend_env = os.environ.get("ONNXSIM_GEMM_FUSION_BACKEND")
+            os.environ["ONNXSIM_GEMM_FUSION_BACKEND"] = gemm_fusion_backend
+            try:
+                if isinstance(model, str):
+                    # ``output_path`` given: write the result there directly instead of a
+                    # throwaway temporary file, and skip loading it back with data inline.
+                    # A structure-only load still satisfies this function's
+                    # ``ModelProto``-returning contract for callers who only need the graph
+                    # shape, not the tensor values. See ``output_path``'s docstring above for
+                    # why this is a secondary optimization rather than the main fix for
+                    # bench/TODO_large_decoder_submodule_oom.md -- that turned out to be
+                    # inside the C++ core (``SimplifyConsumeInput`` in ``onnxsim.cpp``), not
+                    # here; see ``bench/RESULTS_synthetic_decoder_oom.md`` for how that was
+                    # found.
+                    if output_path is not None:
+                        C.simplify_path(
+                            _get_model_executor(providers),
+                            model,
+                            output_path,
+                            skipped_optimizers,
+                            not skip_constant_folding,
+                            not skip_shape_inference,
+                            _fast_threshold_bytes,
+                            target_opset_version,
+                            rewriter,
+                            initializers_as_constants,
+                            inline_functions,
+                            mutable_initializer,
+                            overwrite_input_shapes,
+                            unused_output,
+                            extra_optimizers,
+                        )
+                        check_ok = model_checking.compare(
+                            output_path,
+                            None,
+                            0,
+                            test_input_shapes,
+                            input_data,
+                            custom_lib,
+                            rtol=check_rtol,
+                            atol=check_atol,
+                            input_fill=input_fill,
+                        )
+                        model_opt = onnx.load(output_path, load_external_data=False)
+                        return model_opt, check_ok
+                    with tempfile.TemporaryDirectory() as tmpdirname:
+                        fast_out_path = os.path.join(tmpdirname, "opt.onnx")
+                        C.simplify_path(
+                            _get_model_executor(providers),
+                            model,
+                            fast_out_path,
+                            skipped_optimizers,
+                            not skip_constant_folding,
+                            not skip_shape_inference,
+                            _fast_threshold_bytes,
+                            target_opset_version,
+                            rewriter,
+                            initializers_as_constants,
+                            inline_functions,
+                            mutable_initializer,
+                            overwrite_input_shapes,
+                            unused_output,
+                            extra_optimizers,
+                        )
+                        # check_n == 0 is guaranteed on this path (the fast-path
+                        # gate above requires it), so compare() only needs
+                        # model_opt for the checker call below -- check straight
+                        # from disk (the checker's own C++ file loader) rather
+                        # than loading it into a ModelProto first just to have
+                        # the checker re-serialize it right back to bytes.
+                        check_ok = model_checking.compare(
+                            fast_out_path,
+                            None,
+                            0,
+                            test_input_shapes,
+                            input_data,
+                            custom_lib,
+                            rtol=check_rtol,
+                            atol=check_atol,
+                            input_fill=input_fill,
+                        )
+                        model_opt = onnx.load(fast_out_path)
+                    return model_opt, check_ok
+                else:
+                    model_bytes = model.SerializeToString()
+                    if len(model_bytes) >= 2 * 1024 * 1024 * 1024:
+                        raise EncodeError("Message larger than 2GiB")
+                    model_opt_bytes = C.simplify(
+                        _get_model_executor(providers),
+                        model_bytes,
+                        skipped_optimizers,
+                        not skip_constant_folding,
+                        not skip_shape_inference,
+                        _fast_threshold_bytes,
+                        target_opset_version,
+                        rewriter,
+                        initializers_as_constants,
+                        inline_functions,
+                        mutable_initializer,
+                        overwrite_input_shapes,
+                        unused_output,
+                        extra_optimizers,
+                    )
+                    if len(model_opt_bytes) == 0:
+                        raise ValueError("Simplified model larger than 2GB")
+                    # Same idea as the path branch above: check_n == 0 here too,
+                    # so hand the checker the bytes we already have instead of
+                    # loading them into a ModelProto (below) and making the
+                    # checker serialize that right back to bytes.
+                    check_ok = model_checking.compare(
+                        model_opt_bytes,
+                        None,
+                        0,
+                        test_input_shapes,
+                        input_data,
+                        custom_lib,
+                        rtol=check_rtol,
+                        atol=check_atol,
+                        input_fill=input_fill,
+                    )
+                    model_opt = onnx.load_from_string(model_opt_bytes)
+                return model_opt, check_ok
+            except Exception:
+                pass
+            finally:
+                if _fast_profile_active:
+                    if _fast_prev_profile_env is None:
+                        os.environ.pop("ONNXSIM_PROFILE", None)
+                    else:
+                        os.environ["ONNXSIM_PROFILE"] = _fast_prev_profile_env
+                if _fast_prev_gemm_backend_env is None:
+                    os.environ.pop("ONNXSIM_GEMM_FUSION_BACKEND", None)
+                else:
+                    os.environ["ONNXSIM_GEMM_FUSION_BACKEND"] = (
+                        _fast_prev_gemm_backend_env
+                    )
+
+    # Slow path: either check_n > 0 (needs the original model to compare
+    # against) or a shape dict uses the "None key" convenience (needs the
+    # model's own input names to resolve). The model transforms themselves
+    # still run natively in C++ (passed through as arguments below); this
+    # only loads the model for those two Python-side needs.
+    #
     # Track whether we own the in-memory model. When the caller passes a file
     # path we load it here, so the resulting ``ModelProto`` is private to this
     # function and may be mutated freely (e.g. saved as external data without a
     # defensive copy). When the caller passes their own ``ModelProto`` we must
     # not mutate it.
-    #
-    # When the caller passes a file path, defer loading the (potentially
-    # multi-GB) external tensor data until it is actually needed -- right before
-    # the model is serialized for the C++ simplifier. Every graph transformation
-    # in between (input-shape overwrite, unused-output/initializer pruning,
-    # unhashable-tensor detection, doc-string snapshotting) reads only tensor
-    # *metadata* -- names, shapes, element types -- never the raw bytes, so
-    # keeping the weights on disk through these phases lowers active memory use
-    # and avoids loading them at all when an earlier phase raises. The directory
-    # is remembered so the external data can be resolved later.
     external_data_dir: Optional[str] = None
     if isinstance(model, str):
         model_owned = True
@@ -588,65 +1507,6 @@ def simplify(
         model, overwrite_input_shapes
     )
     test_input_shapes = check_and_update_input_shapes(model, test_input_shapes)
-
-    for name, input_shape in overwrite_input_shapes.items():
-        for ipt in model.graph.input:
-            if ipt.name == name:
-                for i, dim in enumerate(ipt.type.tensor_type.shape.dim):
-                    # A non-positive value means "keep the original (possibly
-                    # dynamic) dimension" rather than hardcoding an invalid size
-                    # such as 0, which would make the model impossible to run
-                    # (see GitHub issue #237).
-                    if input_shape[i] > 0:
-                        dim.dim_value = input_shape[i]
-    if unused_output is not None:
-        model = remove_unused_output(model, unused_output)
-    if not mutable_initializer:
-        # ``remove_initializer_from_input`` bumps IR<4 models to IR 4 so the
-        # freed initializers become foldable constants (previously gated on
-        # ``ir_version >= 4``, which left opset-8 graphs such as resnet101-v1-7
-        # completely unsimplified) -- except for opsets too old to encode the
-        # nodes those fusions insert, which it leaves untouched.
-        model = remove_initializer_from_input(model)
-
-    # onnxoptimizer's common-subexpression / duplicate-initializer passes hash
-    # tensor values and crash with "no supported data type: <N>" on element
-    # types they cannot hash, such as the float8 zero points produced by NVIDIA
-    # ModelOpt fp8 QDQ models (GitHub issue #348). When such a tensor is present
-    # we transparently skip those two passes so the rest of the simplification
-    # still runs, instead of failing outright. ``skipped_optimizers is None``
-    # means "skip every optimizer", so there is nothing to add in that case.
-    if skipped_optimizers is not None and _has_cse_unhashable_tensor(model):
-        added = [
-            opt
-            for opt in _TENSOR_VALUE_HASHING_OPTIMIZERS
-            if opt not in skipped_optimizers
-        ]
-        if added:
-            skipped_optimizers.extend(added)
-            print(
-                Text(
-                    "The model contains tensors with element types that "
-                    "onnxoptimizer cannot hash (e.g. float8/int4 in NVIDIA "
-                    "ModelOpt fp8 QDQ models). Skipping the optimizers "
-                    f"{added} to avoid a crash; all other simplifications "
-                    "still run.",
-                    style="bold magenta",
-                )
-            )
-
-    # The C++ optimizer re-serializes the graph and drops the `doc_string`
-    # fields on the model, graph and input/output value infos. Snapshot them
-    # here so they can be restored on the simplified model (GitHub issue #428).
-    doc_strings = _snapshot_doc_strings(model)
-
-    def parse_size(size: str) -> int:
-        m = re.fullmatch(r"([\d.]+)\s*([KMGT]?B)", size.strip(), re.I)
-        if not m:
-            raise ValueError(size)
-        number: float = float(m.group(1))
-        unit: Unit = m.group(2).upper()  # type: ignore
-        return int(number * UNIT_MAP[unit])
 
     tensor_size_threshold_bytes = parse_size(tensor_size_threshold)
     if tensor_size_threshold_bytes > 2**31 - 9999:
@@ -674,6 +1534,14 @@ def simplify(
     if _profile_active:
         _prev_profile_env = os.environ.get("ONNXSIM_PROFILE")
         os.environ["ONNXSIM_PROFILE"] = _profile_path
+
+    # Select which runtime fuse_matmul_add_bias_into_gemm(_batched) should
+    # assume will execute the simplified model, for the duration of this call
+    # (read inside ``Simplify`` via ``ONNXSIM_GEMM_FUSION_BACKEND`` -- see
+    # gemm_fusion_backend.h), restoring any prior value afterwards so this
+    # does not leak into later calls in the same process.
+    _prev_gemm_backend_env = os.environ.get("ONNXSIM_GEMM_FUSION_BACKEND")
+    os.environ["ONNXSIM_GEMM_FUSION_BACKEND"] = gemm_fusion_backend
 
     # Turn on onnxruntime's own session profiler by setting ``ONNXSIM_ORT_PROFILE``
     # (read by the executor). It has two modes: ``ort_profile`` writes standalone
@@ -711,6 +1579,10 @@ def simplify(
             rewriter,
             initializers_as_constants,
             inline_functions,
+            mutable_initializer,
+            overwrite_input_shapes,
+            unused_output,
+            extra_optimizers,
         )
         # The serialized original (~1x model) is not needed once the C++
         # simplifier has consumed it -- the large-model fallback below
@@ -733,7 +1605,11 @@ def simplify(
             model = None
         model_opt = onnx.load_from_string(model_opt_bytes)
         check_ok = model_checking.compare(
-            model_opt,
+            # At check_n == 0, compare() only feeds this to the checker (see the
+            # comment above), which accepts bytes directly -- pass the bytes we
+            # already have instead of the ModelProto we just deserialized them
+            # into, so the checker isn't made to re-serialize it right back.
+            model_opt_bytes if check_n == 0 else model_opt,
             model,
             check_n,
             test_input_shapes,
@@ -781,6 +1657,10 @@ def simplify(
                 rewriter,
                 initializers_as_constants,
                 inline_functions,
+                mutable_initializer,
+                overwrite_input_shapes,
+                unused_output,
+                extra_optimizers,
             )
             check_ok = model_checking.compare(
                 os.path.join(tmpdirname, "opt.onnx"),
@@ -805,6 +1685,10 @@ def simplify(
                 os.environ.pop("ONNXSIM_ORT_PROFILE", None)
             else:
                 os.environ["ONNXSIM_ORT_PROFILE"] = _prev_ort_profile_env
+        if _prev_gemm_backend_env is None:
+            os.environ.pop("ONNXSIM_GEMM_FUSION_BACKEND", None)
+        else:
+            os.environ["ONNXSIM_GEMM_FUSION_BACKEND"] = _prev_gemm_backend_env
         # Fold onnxruntime's captured per-operator traces into the onnxsim trace,
         # then drop the temporary files. Best-effort: a merge failure must not
         # sink an otherwise-successful simplification.
@@ -817,7 +1701,25 @@ def simplify(
                 pass
             finally:
                 shutil.rmtree(_ort_merge_dir, ignore_errors=True)
-    _restore_doc_strings(model_opt, doc_strings)
+    if output_path is not None:
+        # Reached with ``output_path`` set only when the fast path above either
+        # doesn't apply (e.g. ``check_n > 0``, which needs ``model_opt``
+        # materialized anyway to run the correctness check) or fell back from an
+        # internal error. Either way ``model_opt`` is already a full ModelProto
+        # here, so there is no reload to avoid -- just honor the save request.
+        try:
+            onnx.save(model_opt, output_path)
+        except (ValueError, EncodeError):
+            external_data_path = os.path.basename(output_path) + ".data"
+            if os.path.exists(external_data_path):
+                os.remove(external_data_path)
+            onnx.save(
+                model_opt,
+                output_path,
+                save_as_external_data=True,
+                all_tensors_to_one_file=True,
+                location=external_data_path,
+            )
     return model_opt, check_ok
 
 
@@ -841,7 +1743,15 @@ class PyModelExecutor(C.ModelExecutor):
         input_arrs = map(onnx.numpy_helper.to_array, input_tps)
         input_names = [x.name for x in model.graph.input]
         inputs = dict(zip(input_names, input_arrs))
-        outputs = backend.run_model(model, inputs, providers=self.providers)
+        # This executor is only ever invoked by the C++ core's constant-folding
+        # ``RunOps`` (see onnxsim.cpp) to run one throwaway fold-group
+        # sub-model, never for the full-size correctness check -- so it is
+        # always safe (and, given how many of these run per model, usually a
+        # meaningful speedup) to skip onnxruntime's per-session thread-pool
+        # spin-up.
+        outputs = backend.run_model(
+            model, inputs, providers=self.providers, single_threaded=True
+        )
         # The inference backend may return a non-ndarray for an output (for
         # example onnxruntime yields an empty Python list for an empty sequence
         # output). onnx.numpy_helper.from_array only accepts numpy arrays, so
@@ -951,6 +1861,12 @@ def main():
         help="Skip all ONNX optimizers or some of them. To skip all optimizers, use `onnxsim a.onnx b.onnx --skip-optimization`. To skip some of optimizers, use something like `onnxsim a.onnx b.onnx --skip-optimization fuse_bn_into_conv fuse_pad_into_pool`.",
         type=str,
         nargs="*",
+    )
+    parser.add_argument(
+        "--enable-optimization",
+        help="The counterpart to --skip-optimization: run these named optimizer passes in addition to the default set, rather than excluding some of it. Use for a pass not already on by default (see --list-other-optimizers for valid names), for example `onnxsim a.onnx b.onnx --enable-optimization fuse_matmul_add_bias_into_gemm_batched`.",
+        type=str,
+        nargs="+",
     )
     parser.add_argument(
         "--skip-constant-folding", help="Skip constant folding", action="store_true"
@@ -1158,6 +2074,303 @@ def main():
         "$ONNX_MLIR_HOME/bin/onnx-mlir, then the onnx-mlir on PATH.",
     )
     parser.add_argument(
+        "--node-reduction-plot",
+        help="After simplifying, plot node count per round for each "
+        "simplification fixed-point loop (from the --profile trace's "
+        "'NodeCount' events) and save it as a PNG at the given path (defaults "
+        "to the --profile trace's path with '_node_reduction.png' appended). "
+        "Implies --profile (defaults to 'onnxsim_profile.json') if not "
+        "already given. Needs matplotlib: 'pip install onnxsim[plot]'.",
+        type=str,
+        nargs="?",
+        const="",
+        default=None,
+    )
+    parser.add_argument(
+        "--graph-diff",
+        help="Print a node- and value-level diff between the original and "
+        "simplified graphs after simplification, matched by output tensor "
+        "name: which nodes/values were removed, added, or changed (e.g. a "
+        "Conv whose bias input got folded away).",
+        action="store_true",
+    )
+    parser.add_argument(
+        "--dynamic-quantize",
+        help="After simplifying, dynamically quantize MatMul/Gemm weights to "
+        "INT8 (per output channel, symmetric, from their static values) and "
+        "quantize activations to uint8 at runtime via DynamicQuantizeLinear. "
+        "No calibration data is needed. See onnxsim.quantize_dynamic.",
+        action="store_true",
+    )
+    parser.add_argument(
+        "--dynamic-quantize-matmul-integer-to-float",
+        help="Same as --dynamic-quantize, but the dequantize step is a "
+        "single ONNX Runtime 'com.microsoft' contrib op "
+        "(MatMulIntegerToFloat) instead of a MatMulInteger+Cast+Mul(+Add) "
+        "node chain. Unlike --dynamic-quantize, the result needs a "
+        "com.microsoft-aware runtime (e.g. ONNX Runtime) to execute. See "
+        "onnxsim.quantize_dynamic_matmul_integer_to_float.",
+        action="store_true",
+    )
+    parser.add_argument(
+        "--ternary-quantize",
+        help="After simplifying, dynamically quantize MatMul/Gemm nodes "
+        "whose constant weight is structurally ternary ({-s, 0, +s} per "
+        "output column, e.g. BitNet b1.58) using a lossless ternary weight "
+        "encoding, rather than quantize_dynamic's rounded full-range one. "
+        "Nodes whose weight is not ternary are left untouched -- combine "
+        "with --dynamic-quantize to also quantize those. See "
+        "onnxsim.quantize_ternary.",
+        action="store_true",
+    )
+    parser.add_argument(
+        "--weight-only-quantize",
+        help="After simplifying, weight-only quantize MatMul/Gemm/Conv "
+        "weights to INT8 (per output channel, symmetric, from their static "
+        "values), inserting a single DequantizeLinear per weight. "
+        "Activations are never touched -- no calibration data is needed and "
+        "no quantize/dequantize node is added on the activation path. See "
+        "onnxsim.quantize_weight_only.",
+        action="store_true",
+    )
+    parser.add_argument(
+        "--weight-only-quantize-int4",
+        help="After simplifying, block-wise INT4 weight-only quantize "
+        "MatMul/Gemm/Conv weights (one symmetric scale per 32-element block "
+        "of the flattened reduction dimension, per output channel), "
+        "inserting a single DequantizeLinear(block_size=32) per weight. "
+        "Activations are never touched. Needs opset >= 21 (INT4 tensors, "
+        "DequantizeLinear's block_size). See onnxsim.quantize_weight_only_int4.",
+        action="store_true",
+    )
+    parser.add_argument(
+        "--weight-only-quantize-int16",
+        help="After simplifying, INT16 weight-only quantize MatMul/Gemm/Conv "
+        "weights (one symmetric scale per output channel, INT16's ~8x finer "
+        "step than INT8's), inserting a single DequantizeLinear per weight. "
+        "Activations are never touched. For channels with a few "
+        "extreme-outlier weights, where INT8's coarser step loses the "
+        "channel's typical-magnitude weights -- see "
+        "onnxsim.estimate_quantization_precision's max_outlier_ratio check. "
+        "Needs opset >= 21. See onnxsim.quantize_weight_only_int16.",
+        action="store_true",
+    )
+    parser.add_argument(
+        "--weight-only-quantize-int8-block",
+        help="After simplifying, block-wise INT8 weight-only quantize "
+        "MatMul/Gemm/Conv weights (one symmetric scale per 32-element block "
+        "of the flattened reduction dimension, per output channel, values "
+        "in [-127, 127]), inserting a single "
+        "DequantizeLinear(block_size=32) per weight. Activations are never "
+        "touched. Same storage as --weight-only-quantize's INT8, but "
+        "resolution closer to --weight-only-quantize-int4's block-wise "
+        "scheme. Needs opset >= 21. See "
+        "onnxsim.quantize_weight_only_int8_block.",
+        action="store_true",
+    )
+    parser.add_argument(
+        "--fp16-quantize",
+        help="After simplifying, convert every float32 weight (and, by "
+        "default, every internal activation) to float16 -- no calibration "
+        "data needed, since float16 is still a floating-point format, not "
+        "an integer scheme. The model's own external input/output types "
+        "stay float32 (a Cast is inserted at each boundary). See "
+        "onnxsim.quantize_fp16.",
+        action="store_true",
+    )
+    parser.add_argument(
+        "--bf16-quantize",
+        help="After simplifying, convert every float32 weight (and, by "
+        "default, every internal activation) to bfloat16 -- no calibration "
+        "data needed, since bfloat16 is still a floating-point format, not "
+        "an integer scheme. Keeps float32's exponent range, so no clamping "
+        "is needed. The model's own external input/output types stay "
+        "float32 (a Cast is inserted at each boundary). See "
+        "onnxsim.quantize_bf16.",
+        action="store_true",
+    )
+    parser.add_argument(
+        "--fp8-quantize",
+        help="After simplifying, convert every float32 weight (and, by "
+        "default, every internal activation) to an 8-bit floating-point "
+        "format -- no calibration data needed, since float8 is still a "
+        "floating-point format, not an integer scheme. Out-of-range values "
+        "are saturated (clamped) rather than mapped to an infinity/NaN. The "
+        "model's own external input/output types stay float32 (a Cast is "
+        "inserted at each boundary). Needs opset >= 19. See "
+        "onnxsim.quantize_fp8.",
+        action="store_true",
+    )
+    parser.add_argument(
+        "--fp8-format",
+        help="Target float8 format for --fp8-quantize: 'e4m3' (E4M3FN, the "
+        "default -- max finite magnitude 448, typically used for weights) "
+        "or 'e5m2' (max finite magnitude 57344, a dynamic range similar to "
+        "float16, typically used for gradients).",
+        choices=["e4m3", "e5m2"],
+        default="e4m3",
+    )
+    parser.add_argument(
+        "--static-quantize",
+        help="After simplifying, statically (calibration-based) quantize "
+        "MatMul/Gemm/Conv weights and activations to INT8/uint8, inserting a "
+        "QuantizeLinear/DequantizeLinear pair (QDQ format) with a fixed "
+        "scale/zero-point calibrated from --calibration-dataset if given, "
+        "else from random data. See onnxsim.quantize_static.",
+        action="store_true",
+    )
+    parser.add_argument(
+        "--static-quantize-int16",
+        help="Same as --static-quantize, but a 'W8A16' scheme: weights stay "
+        "INT8, while activations are quantized to uint16 instead of uint8 "
+        "(an 8x finer calibrated step) -- useful for activations a QDQ "
+        "round trip is unusually sensitive to. Needs opset >= 21. See "
+        "onnxsim.quantize_static_int16.",
+        action="store_true",
+    )
+    parser.add_argument(
+        "--qoperator-quantize",
+        help="After simplifying, statically (calibration-based) quantize "
+        "MatMul/Gemm weights and activations to INT8/uint8 into the "
+        "'QOperator' format (QLinearMatMul) rather than --static-quantize's "
+        "QDQ format, with a fixed scale/zero-point calibrated from "
+        "--calibration-dataset if given, else from random data. See "
+        "onnxsim.quantize_qoperator.",
+        action="store_true",
+    )
+    parser.add_argument(
+        "--qoperator-quantize-elementwise",
+        help="After simplifying, statically (calibration-based) quantize "
+        "elementwise Add/Mul nodes (both inputs non-constant, e.g. a "
+        "residual connection) into ONNX Runtime's 'com.microsoft' contrib "
+        "ops QLinearAdd/QLinearMul, with a fixed scale/zero-point "
+        "calibrated from --calibration-dataset if given, else from random "
+        "data. Unlike the other --*-quantize flags, the result needs a "
+        "com.microsoft-aware runtime (e.g. ONNX Runtime) to execute -- see "
+        "onnxsim.quantize_qoperator_elementwise.",
+        action="store_true",
+    )
+    parser.add_argument(
+        "--qoperator-quantize-activation",
+        help="After simplifying, statically (calibration-based) quantize "
+        "standalone Sigmoid/LeakyRelu nodes into ONNX Runtime's "
+        "'com.microsoft' contrib ops QLinearSigmoid/QLinearLeakyRelu, with a "
+        "fixed scale/zero-point calibrated from --calibration-dataset if "
+        "given, else from random data. Unlike the other --*-quantize flags "
+        "(except --qoperator-quantize-elementwise), the result needs a "
+        "com.microsoft-aware runtime (e.g. ONNX Runtime) to execute -- see "
+        "onnxsim.quantize_qoperator_activation.",
+        action="store_true",
+    )
+    parser.add_argument(
+        "--qoperator-quantize-concat",
+        help="After simplifying, statically (calibration-based) quantize "
+        "Concat nodes (all inputs non-constant) into ONNX Runtime's "
+        "'com.microsoft' contrib op QLinearConcat, with a fixed "
+        "scale/zero-point calibrated from --calibration-dataset if given, "
+        "else from random data. Unlike the other --*-quantize flags (except "
+        "--qoperator-quantize-elementwise/-activation), the result needs a "
+        "com.microsoft-aware runtime (e.g. ONNX Runtime) to execute -- see "
+        "onnxsim.quantize_qoperator_concat.",
+        action="store_true",
+    )
+    parser.add_argument(
+        "--qoperator-quantize-softmax",
+        help="After simplifying, statically (calibration-based) quantize "
+        "standalone Softmax nodes into ONNX Runtime's 'com.microsoft' "
+        "contrib op QLinearSoftmax, with a fixed scale/zero-point "
+        "calibrated from --calibration-dataset if given, else from random "
+        "data. Unlike the other --*-quantize flags (except "
+        "--qoperator-quantize-elementwise/-activation/-concat), the result "
+        "needs a com.microsoft-aware runtime (e.g. ONNX Runtime) to "
+        "execute -- see onnxsim.quantize_qoperator_softmax.",
+        action="store_true",
+    )
+    parser.add_argument(
+        "--qoperator-quantize-pool",
+        help="After simplifying, statically (calibration-based) quantize "
+        "standalone AveragePool/GlobalAveragePool nodes into ONNX Runtime's "
+        "'com.microsoft' contrib ops QLinearAveragePool/"
+        "QLinearGlobalAveragePool, with a fixed scale/zero-point calibrated "
+        "from --calibration-dataset if given, else from random data. "
+        "Unlike the other --*-quantize flags (except "
+        "--qoperator-quantize-elementwise/-activation/-concat/-softmax), "
+        "the result needs a com.microsoft-aware runtime (e.g. ONNX "
+        "Runtime) to execute -- see onnxsim.quantize_qoperator_pool.",
+        action="store_true",
+    )
+    parser.add_argument(
+        "--qoperator-quantize-where",
+        help="After simplifying, statically (calibration-based) quantize "
+        "Where nodes (both data operands non-constant) into ONNX Runtime's "
+        "'com.microsoft' contrib op QLinearWhere, with a fixed "
+        "scale/zero-point calibrated from --calibration-dataset if given, "
+        "else from random data. Unlike the other --*-quantize flags "
+        "(except --qoperator-quantize-elementwise/-activation/-concat/"
+        "-softmax/-pool), the result needs a com.microsoft-aware runtime "
+        "(e.g. ONNX Runtime) to execute -- see "
+        "onnxsim.quantize_qoperator_where.",
+        action="store_true",
+    )
+    parser.add_argument(
+        "--qoperator-quantize-gemm",
+        help="After simplifying, statically (calibration-based) quantize "
+        "Gemm nodes (constant 2-D weight; any transA/transB/alpha, unlike "
+        "--qoperator-quantize's vanilla-only QLinearMatMul path) into ONNX "
+        "Runtime's 'com.microsoft' contrib op QGemm, with a fixed "
+        "scale/zero-point calibrated from --calibration-dataset if given, "
+        "else from random data. Unlike the other --*-quantize flags "
+        "(except --qoperator-quantize-elementwise/-activation/-concat/"
+        "-softmax/-pool/-where), the result needs a com.microsoft-aware "
+        "runtime (e.g. ONNX Runtime) to execute -- see "
+        "onnxsim.quantize_qoperator_gemm.",
+        action="store_true",
+    )
+    parser.add_argument(
+        "--calibration-dataset",
+        help="Hugging Face Hub dataset id (e.g. 'mnist') to pull "
+        "--calibration-samples real examples from for --static-quantize's, "
+        "--static-quantize-int16's, --qoperator-quantize's, "
+        "--qoperator-quantize-elementwise's, --qoperator-quantize-activation's, "
+        "--qoperator-quantize-concat's, --qoperator-quantize-softmax's, "
+        "--qoperator-quantize-pool's, --qoperator-quantize-where's, or "
+        "--qoperator-quantize-gemm's calibration, instead of random data. "
+        "See onnxsim.load_huggingface_calibration_data (needs the optional "
+        "'datasets' package: pip install datasets).",
+        type=str,
+        default=None,
+    )
+    parser.add_argument(
+        "--calibration-samples",
+        help="Number of calibration batches/examples for --static-quantize, "
+        "--qoperator-quantize, --qoperator-quantize-elementwise, "
+        "--qoperator-quantize-activation, --qoperator-quantize-concat, "
+        "--qoperator-quantize-softmax, --qoperator-quantize-pool, "
+        "--qoperator-quantize-where, or --qoperator-quantize-gemm "
+        "(default: 8).",
+        type=int,
+        default=8,
+    )
+    parser.add_argument(
+        "--calibration-method",
+        help="Calibration range method for --static-quantize, "
+        "--qoperator-quantize, --qoperator-quantize-elementwise, "
+        "--qoperator-quantize-activation, --qoperator-quantize-concat, "
+        "--qoperator-quantize-softmax, --qoperator-quantize-pool, "
+        "--qoperator-quantize-where, or --qoperator-quantize-gemm: "
+        "'minmax' "
+        "(default) uses each tensor's observed min/max directly; 'entropy' "
+        "instead searches for the clip threshold minimizing KL divergence "
+        "between the observed and simulated-quantized distributions "
+        "(TensorRT-style entropy calibration), which can give a tighter "
+        "range for heavy-tailed activations but wants more calibration data "
+        "than minmax to build a meaningful histogram. See "
+        "onnxsim.calibrate.",
+        type=str,
+        choices=["minmax", "entropy"],
+        default="minmax",
+    )
+    parser.add_argument(
         "-v", "--version", action="version", version="onnxsim " + version.version
     )
 
@@ -1172,6 +2385,19 @@ def main():
         help="List default optimizer pass names",
         nargs=0,
         action=ListOptimizers,
+    )
+
+    class ListOtherOptimizers(argparse.Action):
+        def __call__(self, parser, ns, v, option_string=None):
+            for p in C._list_other_optimizers():
+                print(p)
+            parser.exit()
+
+    parser.add_argument(
+        "--list-other-optimizers",
+        help="List optimizer pass names valid for --enable-optimization (i.e. registered but not already part of the default set listed by --list-default-optimizers)",
+        nargs=0,
+        action=ListOtherOptimizers,
     )
 
     args = parser.parse_args()
@@ -1316,6 +2542,12 @@ def main():
                 )
             )
 
+    # Plotting the node-reduction curve needs the "NodeCount" events a
+    # profiled run writes, so turn --profile on if the user only asked for
+    # the plot.
+    if args.node_reduction_plot is not None and args.profile is None:
+        args.profile = "onnxsim_profile.json"
+
     input_tensors = None
     if args.input_data_path is not None:
         input_tensors = {}
@@ -1347,6 +2579,7 @@ def main():
         inline_functions=args.inline_functions,
         import_custom_schemas=not args.skip_schema_import,
         target_opset_version=args.target_opset,
+        extra_optimizers=args.enable_optimization,
         check_rtol=args.check_rtol,
         check_atol=args.check_atol,
         input_fill=args.input_fill,
@@ -1356,19 +2589,329 @@ def main():
         merge_ort_profile=args.merge_ort_profile,
     )
 
+    if args.node_reduction_plot is not None:
+        from . import profile_plot
+
+        plot_out = args.node_reduction_plot or None
+        try:
+            plot_path = profile_plot.plot_node_reduction(args.profile, plot_out)
+        except RuntimeError as e:
+            print(Text(f"WARNING: --node-reduction-plot failed: {e}", style="bold red"))
+        else:
+            print(f"Node reduction plot written to {plot_path}")
+
+    if args.dynamic_quantize:
+        print("Dynamically quantizing MatMul/Gemm weights to INT8...")
+        model_opt = quantize_dynamic(model_opt)
+
+    if args.dynamic_quantize_matmul_integer_to_float:
+        print(
+            "Dynamically quantizing MatMul/Gemm weights to INT8 "
+            "(com.microsoft MatMulIntegerToFloat)..."
+        )
+        model_opt = quantize_dynamic_matmul_integer_to_float(model_opt)
+
+    if args.ternary_quantize:
+        print("Dynamically quantizing structurally-ternary MatMul/Gemm weights...")
+        model_opt = quantize_ternary(model_opt)
+
+    if args.weight_only_quantize:
+        print("Weight-only quantizing MatMul/Gemm/Conv weights to INT8...")
+        model_opt = quantize_weight_only(model_opt)
+
+    if args.weight_only_quantize_int4:
+        print("Block-wise INT4 weight-only quantizing MatMul/Gemm/Conv weights...")
+        model_opt = quantize_weight_only_int4(model_opt)
+
+    if args.weight_only_quantize_int16:
+        print("INT16 weight-only quantizing MatMul/Gemm/Conv weights...")
+        model_opt = quantize_weight_only_int16(model_opt)
+
+    if args.weight_only_quantize_int8_block:
+        print("Block-wise INT8 weight-only quantizing MatMul/Gemm/Conv weights...")
+        model_opt = quantize_weight_only_int8_block(model_opt)
+
+    if args.fp16_quantize:
+        print("Converting float32 weights/activations to float16...")
+        model_opt = quantize_fp16(model_opt)
+
+    if args.bf16_quantize:
+        print("Converting float32 weights/activations to bfloat16...")
+        model_opt = quantize_bf16(model_opt)
+
+    if args.fp8_quantize:
+        print(
+            f"Converting float32 weights/activations to float8 ({args.fp8_format})..."
+        )
+        model_opt = quantize_fp8(model_opt, format=args.fp8_format)
+
+    if args.static_quantize:
+        from . import calibration
+
+        if args.calibration_dataset:
+            print(
+                f'Calibrating from Hugging Face dataset "{args.calibration_dataset}"...'
+            )
+            calibration_data = calibration.load_huggingface_calibration_data(
+                args.calibration_dataset,
+                model_opt,
+                num_samples=args.calibration_samples,
+            )
+        else:
+            print("Calibrating from random data...")
+            calibration_data = calibration.generate_random_calibration_data(
+                model_opt, num_samples=args.calibration_samples
+            )
+        print("Statically quantizing MatMul/Gemm/Conv weights and activations...")
+        model_opt = calibration.quantize_static(
+            model_opt, calibration_data=calibration_data, method=args.calibration_method
+        )
+
+    if args.static_quantize_int16:
+        from . import calibration
+
+        if args.calibration_dataset:
+            print(
+                f'Calibrating from Hugging Face dataset "{args.calibration_dataset}"...'
+            )
+            calibration_data = calibration.load_huggingface_calibration_data(
+                args.calibration_dataset,
+                model_opt,
+                num_samples=args.calibration_samples,
+            )
+        else:
+            print("Calibrating from random data...")
+            calibration_data = calibration.generate_random_calibration_data(
+                model_opt, num_samples=args.calibration_samples
+            )
+        print(
+            "Statically quantizing MatMul/Gemm/Conv weights (INT8) and "
+            "activations (uint16)..."
+        )
+        model_opt = calibration.quantize_static_int16(
+            model_opt, calibration_data=calibration_data, method=args.calibration_method
+        )
+
+    if args.qoperator_quantize:
+        from . import calibration
+
+        if args.calibration_dataset:
+            print(
+                f'Calibrating from Hugging Face dataset "{args.calibration_dataset}"...'
+            )
+            calibration_data = calibration.load_huggingface_calibration_data(
+                args.calibration_dataset,
+                model_opt,
+                num_samples=args.calibration_samples,
+            )
+        else:
+            print("Calibrating from random data...")
+            calibration_data = calibration.generate_random_calibration_data(
+                model_opt, num_samples=args.calibration_samples
+            )
+        print(
+            "Statically quantizing MatMul/Gemm weights and activations "
+            "(QOperator format)..."
+        )
+        model_opt = calibration.quantize_qoperator(
+            model_opt, calibration_data=calibration_data, method=args.calibration_method
+        )
+
+    if args.qoperator_quantize_elementwise:
+        from . import calibration
+
+        if args.calibration_dataset:
+            print(
+                f'Calibrating from Hugging Face dataset "{args.calibration_dataset}"...'
+            )
+            calibration_data = calibration.load_huggingface_calibration_data(
+                args.calibration_dataset,
+                model_opt,
+                num_samples=args.calibration_samples,
+            )
+        else:
+            print("Calibrating from random data...")
+            calibration_data = calibration.generate_random_calibration_data(
+                model_opt, num_samples=args.calibration_samples
+            )
+        print(
+            "Statically quantizing elementwise Add/Mul nodes (QOperator "
+            "format, com.microsoft contrib ops)..."
+        )
+        model_opt = calibration.quantize_qoperator_elementwise(
+            model_opt, calibration_data=calibration_data, method=args.calibration_method
+        )
+
+    if args.qoperator_quantize_activation:
+        from . import calibration
+
+        if args.calibration_dataset:
+            print(
+                f'Calibrating from Hugging Face dataset "{args.calibration_dataset}"...'
+            )
+            calibration_data = calibration.load_huggingface_calibration_data(
+                args.calibration_dataset,
+                model_opt,
+                num_samples=args.calibration_samples,
+            )
+        else:
+            print("Calibrating from random data...")
+            calibration_data = calibration.generate_random_calibration_data(
+                model_opt, num_samples=args.calibration_samples
+            )
+        print(
+            "Statically quantizing Sigmoid/LeakyRelu nodes (QOperator "
+            "format, com.microsoft contrib ops)..."
+        )
+        model_opt = calibration.quantize_qoperator_activation(
+            model_opt, calibration_data=calibration_data, method=args.calibration_method
+        )
+
+    if args.qoperator_quantize_concat:
+        from . import calibration
+
+        if args.calibration_dataset:
+            print(
+                f'Calibrating from Hugging Face dataset "{args.calibration_dataset}"...'
+            )
+            calibration_data = calibration.load_huggingface_calibration_data(
+                args.calibration_dataset,
+                model_opt,
+                num_samples=args.calibration_samples,
+            )
+        else:
+            print("Calibrating from random data...")
+            calibration_data = calibration.generate_random_calibration_data(
+                model_opt, num_samples=args.calibration_samples
+            )
+        print(
+            "Statically quantizing Concat nodes (QOperator format, "
+            "com.microsoft contrib ops)..."
+        )
+        model_opt = calibration.quantize_qoperator_concat(
+            model_opt, calibration_data=calibration_data, method=args.calibration_method
+        )
+
+    if args.qoperator_quantize_softmax:
+        from . import calibration
+
+        if args.calibration_dataset:
+            print(
+                f'Calibrating from Hugging Face dataset "{args.calibration_dataset}"...'
+            )
+            calibration_data = calibration.load_huggingface_calibration_data(
+                args.calibration_dataset,
+                model_opt,
+                num_samples=args.calibration_samples,
+            )
+        else:
+            print("Calibrating from random data...")
+            calibration_data = calibration.generate_random_calibration_data(
+                model_opt, num_samples=args.calibration_samples
+            )
+        print(
+            "Statically quantizing Softmax nodes (QOperator format, "
+            "com.microsoft contrib ops)..."
+        )
+        model_opt = calibration.quantize_qoperator_softmax(
+            model_opt, calibration_data=calibration_data, method=args.calibration_method
+        )
+
+    if args.qoperator_quantize_pool:
+        from . import calibration
+
+        if args.calibration_dataset:
+            print(
+                f'Calibrating from Hugging Face dataset "{args.calibration_dataset}"...'
+            )
+            calibration_data = calibration.load_huggingface_calibration_data(
+                args.calibration_dataset,
+                model_opt,
+                num_samples=args.calibration_samples,
+            )
+        else:
+            print("Calibrating from random data...")
+            calibration_data = calibration.generate_random_calibration_data(
+                model_opt, num_samples=args.calibration_samples
+            )
+        print(
+            "Statically quantizing AveragePool/GlobalAveragePool nodes "
+            "(QOperator format, com.microsoft contrib ops)..."
+        )
+        model_opt = calibration.quantize_qoperator_pool(
+            model_opt, calibration_data=calibration_data, method=args.calibration_method
+        )
+
+    if args.qoperator_quantize_where:
+        from . import calibration
+
+        if args.calibration_dataset:
+            print(
+                f'Calibrating from Hugging Face dataset "{args.calibration_dataset}"...'
+            )
+            calibration_data = calibration.load_huggingface_calibration_data(
+                args.calibration_dataset,
+                model_opt,
+                num_samples=args.calibration_samples,
+            )
+        else:
+            print("Calibrating from random data...")
+            calibration_data = calibration.generate_random_calibration_data(
+                model_opt, num_samples=args.calibration_samples
+            )
+        print(
+            "Statically quantizing Where nodes (QOperator format, "
+            "com.microsoft contrib ops)..."
+        )
+        model_opt = calibration.quantize_qoperator_where(
+            model_opt, calibration_data=calibration_data, method=args.calibration_method
+        )
+
+    if args.qoperator_quantize_gemm:
+        from . import calibration
+
+        if args.calibration_dataset:
+            print(
+                f'Calibrating from Hugging Face dataset "{args.calibration_dataset}"...'
+            )
+            calibration_data = calibration.load_huggingface_calibration_data(
+                args.calibration_dataset,
+                model_opt,
+                num_samples=args.calibration_samples,
+            )
+        else:
+            print("Calibrating from random data...")
+            calibration_data = calibration.generate_random_calibration_data(
+                model_opt, num_samples=args.calibration_samples
+            )
+        print(
+            "Statically quantizing Gemm nodes (QOperator format, "
+            "com.microsoft QGemm)..."
+        )
+        model_opt = calibration.quantize_qoperator_gemm(
+            model_opt, calibration_data=calibration_data, method=args.calibration_method
+        )
+
     try:
         if not args.save_as_external_data:
             onnx.save(model_opt, args.output_model)
         else:
             raise ValueError("save_as_external_data")
-    except ValueError:
+    except (ValueError, EncodeError):
         # large models (>2GB) which onnx.save doesn't support,
         # or explicitly specified --save-as-external-data
         external_data_path = os.path.basename(args.output_model) + ".data"
         if os.path.exists(external_data_path):
             os.remove(external_data_path)
+        # Mutate ``model_opt`` in place (no deepcopy): ``save_as_external_data=True``
+        # moves each initializer's raw_data out to the external file, so the same
+        # object is left with external references instead of inline bytes. That
+        # matters below: model_info re-serializes ``model_opt`` to report size/diff,
+        # which would otherwise hit this same >2GB EncodeError on the very model we
+        # just went out of our way to save. main() doesn't need the inline-data
+        # version of model_opt again after this point.
         onnx.save(
-            copy.deepcopy(model_opt),
+            model_opt,
             args.output_model,
             save_as_external_data=True,
             all_tensors_to_one_file=True,
@@ -1399,10 +2942,14 @@ def main():
     if check_ok:
         print("Finish! Here is the difference:")
         model_info.print_simplifying_info(model, model_opt)
+        if args.graph_diff:
+            model_info.print_graph_diff(model, model_opt)
     else:
         print(
             'Check failed. Please be careful to use the simplified model, or try specifying "--skip-fuse-bn" or "--skip-optimization" (run "onnxsim -h" for details).'
         )
         print("Here is the difference after simplification:")
         model_info.print_simplifying_info(model, model_opt)
+        if args.graph_diff:
+            model_info.print_graph_diff(model, model_opt)
         sys.exit(1)

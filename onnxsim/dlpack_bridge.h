@@ -16,9 +16,13 @@
  *      out ORT's own output buffer by moving the Ort::Value into the managed
  *      tensor's manager_ctx (zero copy) and freeing it in the deleter.
  *
- * DLManagedTensors returned here are always CPU (kDLCPU), contiguous, and
- * little-endian. Callers own every returned DLManagedTensor* and must release
- * it exactly once via `self->deleter(self)` (see DLPack's contract).
+ * DLManagedTensors returned here are always CPU (kDLCPU), contiguous, and in
+ * host byte order. TensorProto::raw_data is little-endian by spec on every
+ * host, so on a big-endian host both directions swap the payload (which also
+ * costs the input direction its zero copy); on a little-endian host the two
+ * layouts coincide and nothing is swapped. Callers own every returned
+ * DLManagedTensor* and must release it exactly once via `self->deleter(self)`
+ * (see DLPack's contract).
  *
  * See docs/dlpack-executor.md for the boundary design and the separate-heap
  * analysis that applies to a JS/onnxruntime-web executor.
@@ -28,22 +32,17 @@
 
 #include <onnx/onnx_pb.h>
 
-#include <bit>
 #include <cstdint>
-#include <cstring>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "dlpack/dlpack.h"
 #include "dlpack_dtype.h"
 
-#ifndef NO_BUILTIN_ORT
-#ifdef ONNXSIM_ORT_FLAT_HEADERS
+#ifdef ONNXSIM_HAS_ORT
 #include "onnxruntime_cxx_api.h"
-#else
-#include "onnxruntime/core/session/onnxruntime_cxx_api.h"
-#endif
 #endif
 
 namespace onnxsim {
@@ -83,7 +82,7 @@ struct TensorProtoManagerCtx {
 };
 
 // Pack an onnx::TensorProto that keeps its data in a typed repeated field (no
-// raw_data) into little-endian bytes. Mirrors the dtype set the previous
+// raw_data) into host-order bytes. Mirrors the dtype set the previous
 // TensorProto->ORT converter handled; FLOAT16/BFLOAT16 without raw_data are
 // rejected (they were unsupported before too and essentially never occur --
 // half-precision initializers are always raw_data).
@@ -128,11 +127,6 @@ inline std::vector<uint8_t> PackTypedFields(const onnx::TensorProto& tp) {
 // external proto (borrowing) or ctx->owned_proto (owning).
 inline DLManagedTensor* BuildFromProto(const onnx::TensorProto& src,
                                        TensorProtoManagerCtx* ctx) {
-  if constexpr (std::endian::native != std::endian::little) {
-    delete ctx;
-    throw std::invalid_argument(
-        "dlpack bridge: only little endian is supported");
-  }
   if (src.data_location() == onnx::TensorProto::EXTERNAL) {
     delete ctx;
     throw std::invalid_argument(
@@ -148,8 +142,23 @@ inline DLManagedTensor* BuildFromProto(const onnx::TensorProto& src,
   ctx->shape.assign(src.dims().begin(), src.dims().end());
   const void* data_ptr;
   if (src.has_raw_data()) {
-    data_ptr = src.raw_data().data();  // borrow src's buffer
+    if constexpr (kRawDataIsHostOrder) {
+      data_ptr = src.raw_data().data();  // borrow src's buffer
+    } else {
+      // Big endian: raw_data is little-endian by spec, so it cannot be handed
+      // to the executor as-is. Copy into ctx-owned storage and swap there,
+      // leaving `src` untouched (callers of the borrowing entry point below
+      // hand us initializers they still own). The branch above is the
+      // little-endian fast path and stays zero copy.
+      const std::string& raw = src.raw_data();
+      ctx->owned_bytes.assign(raw.begin(), raw.end());
+      SwapElementBytes(ctx->owned_bytes.data(), ctx->owned_bytes.size(),
+                       SizeOf(dt));
+      data_ptr = ctx->owned_bytes.data();
+    }
   } else {
+    // Typed repeated fields arrive already decoded into host-order scalars, so
+    // PackTypedFields' blit needs no swap on either byte order.
     ctx->owned_bytes = PackTypedFields(src);
     data_ptr = ctx->owned_bytes.data();
   }
@@ -171,9 +180,10 @@ inline DLManagedTensor* BuildFromProto(const onnx::TensorProto& src,
 }
 
 // Build a DLManagedTensor that BORROWS `tp`'s buffer with no copy (when `tp`
-// stores raw_data; typed fields are materialized once). `tp` must outlive the
-// returned tensor. Use for feeds whose TensorProto the caller keeps alive
-// (e.g. initializer tensors held by RunOps). Caller frees via deleter.
+// stores raw_data and the host is little-endian; typed fields, and any tensor
+// on a big-endian host, are materialized once). `tp` must outlive the returned
+// tensor. Use for feeds whose TensorProto the caller keeps alive (e.g.
+// initializer tensors held by RunOps). Caller frees via deleter.
 inline DLManagedTensor* FromTensorProtoBorrowing(const onnx::TensorProto& tp) {
   return BuildFromProto(tp, new TensorProtoManagerCtx);
 }
@@ -188,8 +198,9 @@ inline DLManagedTensor* FromTensorProtoOwning(onnx::TensorProto tp) {
 }
 
 // Copy a DLPack tensor into a fresh onnx::TensorProto, writing the payload as
-// raw_data in a single memcpy. The tensor must be CPU, contiguous, and of a
-// supported dtype. `name` is optional (RunOps sets output names afterwards).
+// raw_data in a single copy (plus an in-place byte swap on a big-endian host).
+// The tensor must be CPU, contiguous, and of a supported dtype. `name` is
+// optional (RunOps sets output names afterwards).
 inline onnx::TensorProto ToTensorProto(const DLTensor& t,
                                        const std::string& name = "") {
   if (t.device.device_type != kDLCPU) {
@@ -213,11 +224,21 @@ inline onnx::TensorProto ToTensorProto(const DLTensor& t,
 
   const size_t nbytes = NumElements(t.shape, t.ndim) * SizeOf(t.dtype);
   const auto* base = static_cast<const uint8_t*>(t.data) + t.byte_offset;
-  tp.set_raw_data(base, nbytes);  // single copy into the persisted model
+  if constexpr (kRawDataIsHostOrder) {
+    tp.set_raw_data(base, nbytes);  // single copy into the persisted model
+  } else {
+    // raw_data is little-endian whatever the host is, so a big-endian result
+    // has to be swapped on the way out. Still one copy: build the string, then
+    // swap it in place before it is moved into the proto.
+    std::string raw(reinterpret_cast<const char*>(base), nbytes);
+    SwapElementBytes(reinterpret_cast<uint8_t*>(raw.data()), raw.size(),
+                     SizeOf(t.dtype));
+    tp.set_raw_data(std::move(raw));
+  }
   return tp;
 }
 
-#ifndef NO_BUILTIN_ORT
+#ifdef ONNXSIM_HAS_ORT
 // A process-wide CPU OrtMemoryInfo for wrapping/borrowing host buffers.
 inline Ort::MemoryInfo& CpuMemoryInfo() {
   static Ort::MemoryInfo info =
@@ -283,7 +304,7 @@ inline DLManagedTensor* FromOrtValue(Ort::Value&& value) {
   };
   return managed;
 }
-#endif  // NO_BUILTIN_ORT
+#endif  // ONNXSIM_HAS_ORT
 
 }  // namespace dlpack
 }  // namespace onnxsim

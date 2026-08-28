@@ -18,6 +18,7 @@ import {
 } from "./hf_models.mjs";
 import { openXetCache, makeCachingFetch } from "./xet_cache.mjs";
 import { parseInputParams, applyOptionParams, syncInputUrl, syncUrlParam } from "./query_params.mjs";
+import { loadStoredToken, saveToken } from "./hf_token.mjs";
 
 const select = document.getElementById("hf-model-select");
 const refInput = document.getElementById("hf-model-input");
@@ -32,6 +33,57 @@ const cacheSizeEl = document.getElementById("hf-cache-size");
 const fileRow = document.getElementById("hf-file-row");
 const fileSelect = document.getElementById("hf-file-select");
 const fileNote = document.getElementById("hf-file-note");
+const tokenInput = document.getElementById("hf-token-input");
+const tokenToggle = document.getElementById("hf-token-toggle");
+const tokenRemember = document.getElementById("hf-token-remember");
+const tokenStatusEl = document.getElementById("hf-token-status");
+
+// The current token, trimmed to "" when blank -- passed to hf_models.mjs so it
+// can attach it as a Bearer token to Hugging Face requests only. Read fresh on
+// every call rather than cached, so an edit takes effect on the very next size
+// probe / load without extra wiring.
+function hfToken() {
+  return (tokenInput && tokenInput.value.trim()) || undefined;
+}
+
+// localStorage itself can throw just from being accessed (some sandboxed /
+// storage-disabled contexts), not only from get/setItem -- hf_token.mjs only
+// guards the latter, so this wrapper covers the former too.
+function safeLocalStorage() {
+  try {
+    return window.localStorage;
+  } catch {
+    return null;
+  }
+}
+
+// Restore a remembered token (if any) from localStorage on load.
+if (tokenInput) {
+  const stored = loadStoredToken(safeLocalStorage());
+  if (stored) {
+    tokenInput.value = stored;
+    if (tokenRemember) tokenRemember.checked = true;
+  }
+}
+
+// "remember" persists (or, unchecked, forgets) the token in localStorage; it
+// is otherwise kept in page memory only and lost on reload.
+function syncTokenStorage() {
+  if (!tokenInput || !tokenRemember) return;
+  saveToken(safeLocalStorage(), tokenRemember.checked ? tokenInput.value.trim() : "");
+}
+if (tokenInput) tokenInput.addEventListener("change", syncTokenStorage);
+if (tokenRemember) tokenRemember.addEventListener("change", syncTokenStorage);
+
+// Plain show/hide toggle -- a token is easy to mistype, and password-masked
+// input makes that hard to catch.
+if (tokenToggle && tokenInput) {
+  tokenToggle.addEventListener("click", () => {
+    const showing = tokenInput.type === "text";
+    tokenInput.type = showing ? "password" : "text";
+    tokenToggle.textContent = showing ? "show" : "hide";
+  });
+}
 
 // parseRef throws on empty/garbage; this never does, for use in event handlers.
 function safeParse(ref) {
@@ -48,9 +100,9 @@ function isPlainRepo(parsed) {
   return !!(parsed && parsed.repo && !parsed.file && !parsed.url);
 }
 
-// How many parallel byte-range shards to read a Xet download in. XetBlob fetches
-// serially, so >1 shard is what actually parallelizes the transfer. Clamped to a
-// sane range; past ~10 the returns fade and the Hub may throttle.
+// Ceiling on parallel connections XetBlob may open for a Xet download (it tunes
+// the actual count adaptively from measured throughput). Clamped to a sane
+// range; past ~10 the returns fade and the Hub may throttle.
 const XET_CONCURRENCY_MAX = 16;
 function xetConcurrency() {
   const n = parseInt(xetConcurrencyInput && xetConcurrencyInput.value, 10);
@@ -85,6 +137,19 @@ const log = (msg) => {
   logOutput.value += msg + "\n";
   logOutput.scrollTop = logOutput.scrollHeight;
 };
+
+// A 401/403 from the Hub almost always means "gated or private repo, no (or
+// the wrong) token" -- surface that next to the token field instead of making
+// the user infer it from a raw HTTP status in the console log.
+function noteAuthHint(e) {
+  if (!tokenStatusEl) return;
+  const msg = e && e.message ? e.message : String(e || "");
+  if (/\b(401|403)\b/.test(msg)) {
+    tokenStatusEl.textContent = hfToken()
+      ? "access denied — check the token has access to this repo"
+      : "access denied — this repo may be gated/private; add a token above";
+  }
+}
 
 // Curated model id -> download size (bytes), from models.json. Lets a dropdown
 // pick show its size instantly, with no network probe.
@@ -133,6 +198,7 @@ async function showSizeFor(ref, knownSize) {
   if (loading) return;
   ref = (ref || "").trim();
   const token = ++probeToken;
+  if (tokenStatusEl) tokenStatusEl.textContent = "";
   if (!ref) {
     if (statusEl) statusEl.textContent = "";
     return;
@@ -144,13 +210,14 @@ async function showSizeFor(ref, knownSize) {
   }
   if (statusEl) statusEl.textContent = "checking size…";
   try {
-    const { size, name } = await probeModelSize(ref);
+    const { size, name } = await probeModelSize(ref, hfToken());
     if (token !== probeToken) return; // a newer reference superseded this probe
     renderSize(size, name);
   } catch (e) {
     if (token !== probeToken) return;
     if (statusEl) statusEl.textContent = "size unavailable — see console output";
     log(`could not determine model size for "${ref}": ${e && e.message ? e.message : e}`);
+    noteAuthHint(e);
   }
 }
 
@@ -185,7 +252,7 @@ async function refreshFileList(repo, knownSize) {
   if (fileNote) fileNote.textContent = "listing files…";
   if (fileRow) fileRow.style.display = "";
   try {
-    const files = await listOnnxFiles(repo);
+    const files = await listOnnxFiles(repo, hfToken());
     if (token !== fileListToken || loading) return;
     if (!files.length) {
       hideFileRow();
@@ -289,6 +356,8 @@ async function doLoad() {
   loadBtn.disabled = true;
   if (fileInput) fileInput.disabled = true;
   if (statusEl) statusEl.textContent = "loading…";
+  if (tokenStatusEl) tokenStatusEl.textContent = "";
+  const token = hfToken();
   // Reflect this input in the address bar so the link is shareable/reproducible
   // (a Hugging Face repo id or a direct .onnx URL). Uploaded local files have no
   // URL and are handled by the file-input path, which does not call this.
@@ -384,6 +453,7 @@ async function doLoad() {
           onProgress,
           fetchImpl: cachingFetch,
           concurrency: xetConcurrency(),
+          token,
         }));
         if (hits > 0) log(`reused ${hits} cached chunk(s) (${humanBytes(hitBytes)})`);
       } catch (e) {
@@ -393,10 +463,10 @@ async function doLoad() {
         usedXet = false;
         speedFn = () => emaRate;
         resetProgress();
-        ({ bytes, name } = await fetchModelBytes(ref, log, onProgress));
+        ({ bytes, name } = await fetchModelBytes(ref, log, onProgress, token));
       }
     } else {
-      ({ bytes, name } = await fetchModelBytes(ref, log, onProgress));
+      ({ bytes, name } = await fetchModelBytes(ref, log, onProgress, token));
     }
     // Report the average download speed over the whole transfer. For Xet, the
     // honest figure is over the bytes that actually crossed the network — cached
@@ -448,6 +518,7 @@ async function doLoad() {
   } catch (e) {
     log("Hugging Face load failed: " + (e && e.message ? e.message : String(e)));
     if (statusEl) statusEl.textContent = "failed — see console output";
+    noteAuthHint(e);
     // The conversion never started, so re-enable the file picker here (normally
     // the worker's convert-done message does that).
     if (fileInput) fileInput.disabled = false;

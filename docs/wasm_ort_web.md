@@ -14,7 +14,7 @@ onnxsim's constant folding runs sub-models through a `ModelExecutor` abstraction
   ONNX Runtime from source into onnxsim's own `.wasm`.
 - `PyModelExecutor` — the Python "trampoline": `Run` calls back into the pip
   `onnxruntime` package, so the wheel links no ONNX Runtime C++
-  (`NO_BUILTIN_ORT`).
+  (no `ONNXSIM_HAS_ORT`).
 
 The `ModelExecutor` boundary exchanges tensors as DLPack `DLManagedTensor`
 (`onnxsim.h` / `onnxsim/dlpack_bridge.h`, see `docs/dlpack-executor.md`), so no
@@ -91,9 +91,9 @@ ORT_WEB=ON ./build_wasm.sh
 
 `ORT_WEB=ON` skips the ONNX Runtime source download, configures with
 `-DONNXSIM_WASM_ORT_WEB=ON`, and builds into `build-wasm-node-OFF-ortweb/`. The
-CMake option forces `ONNXSIM_BUILTIN_ORT=OFF`, links `onnx` directly (ORT no
-longer provides it transitively), compiles `js_model_executor.cpp`, and adds
-the Asyncify link flags.
+CMake option forces `ONNXSIM_BUILTIN_ORT=OFF` (onnxsim's own onnx/onnx-optimizer
+fork is linked directly either way -- see CMakeLists.txt), compiles
+`js_model_executor.cpp`, and adds the Asyncify link flags.
 
 Deploy the resulting `onnxsim.js` / `onnxsim.wasm` next to the page as usual.
 `worker.js` detects the variant at runtime via `onnxsim_needs_ort_web()`, loads
@@ -105,9 +105,10 @@ byte-for-byte the old behavior.
 
 - The deployed convertmodel demo IS the ORT-web variant:
   `.github/workflows/static.yml` builds with `ORT_WEB=ON` and ships the module to
-  GitHub Pages (production) and to the per-PR Cloudflare preview. Open that page,
-  convert a model with constant folding enabled, and the folding runs through the
-  page's onnxruntime-web.
+  GitHub Pages (production). Open that page, convert a model with constant folding
+  enabled, and the folding runs through the page's onnxruntime-web. To get the same
+  page built from a pull request, comment `/preview` on it — the workflow then
+  deploys that PR's head to Cloudflare Pages and replies with the URL.
 - Manual/local: build with `ORT_WEB=ON`, serve `scripts/convertmodel/`, convert a
   model with constant folding enabled, and confirm the output matches the
   built-in-ORT build for the same model.
@@ -123,8 +124,11 @@ Removing ORT (`ONNXSIM_BUILTIN_ORT=OFF`) also removes that wasm protobuf, so
 onnx's generated `.pb.*` code fails to compile; `build_wasm.sh` only builds a
 **host** protoc (for codegen), not a wasm protobuf runtime.
 
-Fix: the `ONNXSIM_WASM_ORT_WEB` path sets `ONNX_BUILD_CUSTOM_PROTOBUF=ON`, so
-onnx builds its own bundled protobuf cross-compiled for the wasm target. onnx
+Fix: `ONNX_BUILD_CUSTOM_PROTOBUF=ON` is now set unconditionally for every build
+(not just `ONNXSIM_WASM_ORT_WEB` -- onnxsim's own onnx fork is always linked
+directly rather than sometimes provided transitively through ORT, see
+CMakeLists.txt), so onnx builds its own bundled protobuf cross-compiled for the
+wasm target. onnx
 fetches a **pinned protobuf version** (25.1, per onnx's `sbom.cdx.json`) and
 still uses a **host** protoc for codegen via `ONNX_CUSTOM_PROTOC_EXECUTABLE`
 (passed by `build_wasm.sh` as `which protoc`). The host protoc must match that
@@ -133,6 +137,66 @@ version, or the generated `.pb.*` code is incompatible with the runtime headers
 (`static.yml`) therefore installs **protoc 25.1** rather than the distro's older
 `protobuf-compiler`. When building locally, put a protoc matching onnx's pinned
 protobuf on `PATH` before running `ORT_WEB=ON ./build_wasm.sh`.
+
+## npm package
+
+This variant is also what ships as the [`onnxsim` npm
+package](https://www.npmjs.com/package/onnxsim) (`npm/onnxsim/`) — a
+Node.js-friendly wrapper around the same `onnxsim.js` / `onnxsim.wasm` built
+here, with `onnxruntime-web` as an ordinary npm dependency instead of a CDN
+load. See `npm/onnxsim/README.md` for usage.
+
+It's built and published from `.github/workflows/static.yml` itself, right
+after that workflow's own wasm build (`scripts/stage_npm_package.sh` stages
+the module into `npm/onnxsim/`) — not a separate workflow, so the module is
+never built twice. Every run of that workflow (push, pull request, `/preview`,
+`workflow_dispatch`, or a release) also does a `npm publish --dry-run`
+packaging smoke test; only a `v*` GitHub release goes on to actually stage a
+release (see below). A pull request touching wasm/npm paths runs this same
+build+validate path but skips the Netron build and never deploys anywhere, so
+it's cheaper than a full demo build while still giving every such PR real npm
+packaging coverage. `scripts/build_npm_package.sh` is the local-dev equivalent
+(build from source + stage in one command) for testing `npm/onnxsim` without
+pushing.
+
+`npm/onnxsim/test/index.test.mjs` unit-tests the public API (`simplify()` /
+`versions()`) against the actual built module — run it directly with
+`cd npm/onnxsim && npm install && npm test`, or it runs automatically as part
+of `npm publish --dry-run` / `npm stage publish` (wired in as the
+`prepublishOnly` script in `npm/onnxsim/package.json`), so it's covered by the
+same CI step as the packaging smoke test rather than a separate one. It runs
+`simplify()` with constant folding disabled so it never needs
+onnxruntime-web's wasm assets located on disk; the end-to-end
+constant-folding path is covered by the convertmodel demo's own
+`scripts/convertmodel/test/inference.test.mjs`.
+
+### Releasing (staged publishing)
+
+`npm/onnxsim/package.json`'s `version` is independent of the root `VERSION`
+file (like the Rust crate's own versioning) — bump it before tagging a release
+that should also publish npm. The registry rejects publishing (even
+`--dry-run`) over a version that's already there, so leaving it unbumped fails
+every subsequent PR/push build's packaging smoke test too, not just the
+release itself.
+
+The `npm stage publish` step in static.yml — not `npm publish` — only runs on
+a `v*` GitHub release. [Staged publishing](https://docs.npmjs.com/staged-publishing)
+uploads the release to a review queue rather than the registry directly, so a
+maintainer still has to approve it with 2FA before it's installable (a
+compromised workflow run can propose a release but not ship one on its own).
+After a `v*` GitHub release runs the workflow:
+
+1. Check the queued release: `npm stage list --package onnxsim` (or the
+   "Staged" tab on the package's npmjs.com page).
+2. Inspect it if you want to double check contents: `npm stage view <stage-id>`.
+3. Approve (prompts for 2FA) to publish it: `npm stage approve <stage-id>`, or
+   reject with `npm stage reject <stage-id>`.
+
+One-time setup: the `onnxsim` package's trusted publisher entry on
+npmjs.com must list this repo's `static.yml` workflow with
+"npm stage publish" among its allowed actions (ideally stage-only, so a
+direct `npm publish` from CI is rejected) — that's configured on the
+package's npmjs.com settings page, not in this repo.
 
 ## Not done yet / follow-ups
 
