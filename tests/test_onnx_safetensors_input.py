@@ -32,9 +32,9 @@ import struct
 import numpy as np
 import onnx
 import onnx.checker
-import onnx.helper
 import onnx.numpy_helper
 import pytest
+from onnx import parser
 
 import onnxsim
 
@@ -42,6 +42,20 @@ _NUMPY_DTYPE_TO_SAFETENSORS = {
     np.dtype("float32"): "F32",
     np.dtype("int64"): "I64",
 }
+
+
+def _model(body, initializer=(), opset=17, ir_version=9):
+    model = parser.parse_model(
+        f"""
+        <
+          ir_version: {ir_version},
+          opset_import: ["": {opset}]
+        >
+        {body}
+        """
+    )
+    model.graph.initializer.extend(initializer)
+    return model
 
 
 def _write_safetensors_like_onnx_safetensors(path, arrays):
@@ -104,30 +118,30 @@ def _external_initializer(name, arr, location, offset, length):
     return tensor
 
 
-def _build_matmul_add_model(w, b):
+def _matmul_add_model(w, b, initializer):
     # X: [K, K] (K = w.shape[0]) so X @ W is always valid regardless of
     # whether W itself is square; Y: [K, N] (N = w.shape[1] == b.shape[0]).
     k = w.shape[0]
-    x = onnx.helper.make_tensor_value_info("X", onnx.TensorProto.FLOAT, [k, k])
-    y = onnx.helper.make_tensor_value_info("Y", onnx.TensorProto.FLOAT, [k, b.shape[0]])
-    nodes = [
-        onnx.helper.make_node("MatMul", ["X", "W"], ["MM"]),
-        onnx.helper.make_node("Add", ["MM", "B"], ["Y"]),
-    ]
-    return nodes, x, y
+    n = b.shape[0]
+    return _model(
+        f"""
+        g (float[{k},{k}] X) => (float[{k},{n}] Y)
+        {{
+          MM = MatMul(X, W)
+          Y = Add(MM, B)
+        }}
+        """,
+        initializer,
+    )
 
 
 def _make_safetensors_backed_model(tmp_path, w, b):
     st_path = str(tmp_path / "model.safetensors")
     refs = _write_safetensors_like_onnx_safetensors(st_path, {"W": w, "B": b})
 
-    nodes, x, y = _build_matmul_add_model(w, b)
     w_init = _external_initializer("W", w, *refs["W"])
     b_init = _external_initializer("B", b, *refs["B"])
-    graph = onnx.helper.make_graph(nodes, "g", [x], [y], initializer=[w_init, b_init])
-    model = onnx.helper.make_model(
-        graph, opset_imports=[onnx.helper.make_opsetid("", 17)], ir_version=9
-    )
+    model = _matmul_add_model(w, b, [w_init, b_init])
 
     model_path = str(tmp_path / "model.onnx")
     onnx.save(model, model_path)
@@ -196,12 +210,10 @@ def test_onnx_safetensors_package_round_trip(tmp_path):
 
     w = np.random.RandomState(7).rand(4, 4).astype(np.float32)
     b = np.random.RandomState(8).rand(4).astype(np.float32)
-    nodes, x, y = _build_matmul_add_model(w, b)
-    w_init = onnx.numpy_helper.from_array(w, "W")
-    b_init = onnx.numpy_helper.from_array(b, "B")
-    graph = onnx.helper.make_graph(nodes, "g", [x], [y], initializer=[w_init, b_init])
-    model = onnx.helper.make_model(
-        graph, opset_imports=[onnx.helper.make_opsetid("", 17)], ir_version=9
+    model = _matmul_add_model(
+        w,
+        b,
+        [onnx.numpy_helper.from_array(w, "W"), onnx.numpy_helper.from_array(b, "B")],
     )
 
     model_path = str(tmp_path / "model.onnx")

@@ -9,9 +9,9 @@ import collections
 
 import numpy as np
 import onnx
-import onnx.helper
 import onnx.numpy_helper
 import pytest
+from onnx import parser
 
 import onnxsim
 
@@ -20,15 +20,18 @@ import onnxsim
 ort = pytest.importorskip("onnxruntime")
 
 
-def _model(nodes, inputs, outputs, initializer, opset=13):
-    graph = onnx.helper.make_graph(nodes, "g", inputs, outputs, initializer)
-    return onnx.helper.make_model(
-        graph, opset_imports=[onnx.helper.make_opsetid("", opset)], ir_version=10
+def _model(body, initializer=(), opset=13, ir_version=10):
+    model = parser.parse_model(
+        f"""
+        <
+          ir_version: {ir_version},
+          opset_import: ["": {opset}]
+        >
+        {body}
+        """
     )
-
-
-def _vi(name, shape):
-    return onnx.helper.make_tensor_value_info(name, onnx.TensorProto.FLOAT, shape)
+    model.graph.initializer.extend(initializer)
+    return model
 
 
 def _f32(array, name):
@@ -57,8 +60,14 @@ def _assert_close(float_outputs, quant_outputs, rel_l2_tol=0.1):
 
 def test_quantize_concat_two_inputs():
     rng = np.random.default_rng(0)
-    nodes = [onnx.helper.make_node("Concat", ["A", "B"], ["C"], axis=1)]
-    model = _model(nodes, [_vi("A", [4, 8]), _vi("B", [4, 4])], [_vi("C", [4, 12])], [])
+    model = _model(
+        """
+        g (float[4,8] A, float[4,4] B) => (float[4,12] C)
+        {
+          C = Concat<axis = 1>(A, B)
+        }
+        """
+    )
 
     quant = onnxsim.quantize_qoperator_concat(model, num_calibration_samples=16, seed=0)
     onnx.checker.check_model(quant)
@@ -77,12 +86,13 @@ def test_quantize_concat_two_inputs():
 
 def test_quantize_concat_three_inputs():
     rng = np.random.default_rng(1)
-    nodes = [onnx.helper.make_node("Concat", ["A", "B", "C"], ["D"], axis=0)]
     model = _model(
-        nodes,
-        [_vi("A", [2, 8]), _vi("B", [3, 8]), _vi("C", [1, 8])],
-        [_vi("D", [6, 8])],
-        [],
+        """
+        g (float[2,8] A, float[3,8] B, float[1,8] C) => (float[6,8] D)
+        {
+          D = Concat<axis = 0>(A, B, C)
+        }
+        """
     )
 
     quant = onnxsim.quantize_qoperator_concat(model, num_calibration_samples=16, seed=1)
@@ -103,8 +113,15 @@ def test_quantize_skips_constant_operand():
     # A constant operand is left alone -- it should be quantized from its
     # own static values, not force-fed through the calibration harness.
     const = _f32(np.random.default_rng(2).standard_normal((1, 8)), "B")
-    nodes = [onnx.helper.make_node("Concat", ["A", "B"], ["C"], axis=0)]
-    model = _model(nodes, [_vi("A", [4, 8])], [_vi("C", [5, 8])], [const])
+    model = _model(
+        """
+        g (float[4,8] A) => (float[5,8] C)
+        {
+          C = Concat<axis = 0>(A, B)
+        }
+        """,
+        initializer=[const],
+    )
 
     import onnxsim.onnxsim_cpp2py_export as C
 
@@ -117,19 +134,13 @@ def test_quantize_skips_constant_operand():
 
 
 def test_quantize_skips_non_float():
-    nodes = [onnx.helper.make_node("Concat", ["A", "B"], ["C"], axis=0)]
-    graph = onnx.helper.make_graph(
-        nodes,
-        "g",
-        [
-            onnx.helper.make_tensor_value_info("A", onnx.TensorProto.INT64, [2]),
-            onnx.helper.make_tensor_value_info("B", onnx.TensorProto.INT64, [2]),
-        ],
-        [onnx.helper.make_tensor_value_info("C", onnx.TensorProto.INT64, [4])],
-        [],
-    )
-    model = onnx.helper.make_model(
-        graph, opset_imports=[onnx.helper.make_opsetid("", 13)], ir_version=10
+    model = _model(
+        """
+        g (int64[2] A, int64[2] B) => (int64[4] C)
+        {
+          C = Concat<axis = 0>(A, B)
+        }
+        """
     )
     quant = onnxsim.quantize_qoperator_concat(model)
     assert _op_counts(quant)["Concat"] == 1
@@ -137,8 +148,14 @@ def test_quantize_skips_non_float():
 
 
 def test_list_qoperator_concat_quantizable_tensors():
-    nodes = [onnx.helper.make_node("Concat", ["A", "B"], ["C"], axis=1)]
-    model = _model(nodes, [_vi("A", [4, 8]), _vi("B", [4, 4])], [_vi("C", [4, 12])], [])
+    model = _model(
+        """
+        g (float[4,8] A, float[4,4] B) => (float[4,12] C)
+        {
+          C = Concat<axis = 1>(A, B)
+        }
+        """
+    )
     import onnxsim.onnxsim_cpp2py_export as C
 
     names = C.list_qoperator_concat_quantizable_tensors(model.SerializeToString())

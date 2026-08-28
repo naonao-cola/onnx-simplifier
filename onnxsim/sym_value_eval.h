@@ -12,8 +12,8 @@ namespace onnxsim {
 
 // M1 of issue #532: a dependency-free *symbolic value evaluator* for the shape
 // scaffolding (`Shape -> Gather -> Unsqueeze -> Concat -> Reshape`, plus
-// `Where`/`Equal`/`Div`/`Expand`) that ONNX data propagation cannot fold on a
-// graph with a dynamic dimension.
+// `Where`/`Equal`/`Div`/`Expand`/`Split`/`Identity`) that ONNX data
+// propagation cannot fold on a graph with a dynamic dimension.
 //
 // ONNX data propagation carries a tensor's value as a TensorShapeProto whose
 // entries are either a concrete int or an *opaque* dim_param string; it cannot
