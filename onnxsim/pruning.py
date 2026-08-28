@@ -114,6 +114,29 @@ full ``[K, K]`` im2col cross-covariance Hessian this needed (a real step
 up from Wanda's per-offset norm above, not just a reuse of it) and how
 it's verified.
 
+All three unstructured/N:M functions also match the two fused self-
+attention ops the "Attention-head pruning" section below performs
+*structural* (whole-head) pruning on -- ``com.microsoft::Attention``'s
+merged QKV weight (``[K, Nq+Nk+Nv]``, matched by
+:func:`_match_attention_weight_only`, reusing :func:`_match_attention_producer`'s
+own criteria) and ``com.microsoft::GroupQueryAttention``'s separate Q/K/V
+projections, which need no special-casing at all: per
+:func:`_match_gqa_producer`'s own docstring they are ordinary MatMul/
+vanilla-Gemm nodes feeding into that op, not weights the op itself owns, so
+:func:`_candidates`' existing MatMul/Gemm matching already reaches them
+(ranked no differently from any other MatMul/Gemm layer). This is a
+completely different code path from head pruning below: it zeros
+individual weight entries within a head's columns rather than removing
+whole heads, exactly as useful on its own (e.g. reaching NVIDIA Ampere's
+2:4 sparse Tensor Cores, via :func:`onnxsim.convert_matmul_to_gemm`, on an
+already-``fuse_attention``'d model's QKV weight) as it is combined with
+head pruning first. Since unstructured/N:M pruning only ever zeros values
+and never changes shape, an ``Attention`` node's ``num_heads``/
+``qkv_hidden_sizes`` attributes -- which describe the merged weight's
+column layout, not any zeroed-vs-nonzero distinction within it -- can never
+drift out of sync with the (unchanged) weight shape, the same invariant
+this holds for every other matched layer type.
+
 Both magnitude and Wanda pruning support two sparsity patterns, chosen per
 invocation:
 
@@ -257,6 +280,42 @@ here rather than "corrected" to match, since the point of this function is
 to reproduce SparseGPT specifically. N:M pruning is unaffected (it is
 already per-row in the reference too, and matches this module's own
 ``n``/``m`` convention exactly).
+
+Unlike Conv, ``com.microsoft::Attention``'s merged QKV weight is **not**
+excluded from :func:`apply_sparsegpt_pruning`'s candidate list (nor, since
+they were never excluded to begin with, are ``GroupQueryAttention``'s
+separate Q/K/V projections -- see above). SparseGPT's correctness rests on
+``H`` accurately capturing which columns of *this weight's own input*
+correlate; unlike a Conv's im2col-unfolded receptive field, a merged QKV
+weight's input is the same plain ``[*, K]`` activation feeding an ordinary
+MatMul, with the same ``H = X^T X`` this function already computes for
+every other MatMul/Gemm layer, no new numerical machinery needed. What each
+output column of that weight is later used for downstream (split into
+Q/K/V, fed into a fused attention kernel) has no bearing on the linear-
+algebra correctness of pruning *this* layer's own weight against *this*
+layer's own input -- exactly why it would be inconsistent to include GQA's
+separate Q/K/V MatMuls (already unconditionally in scope, being ordinary
+MatMul/Gemm nodes) while excluding Attention's merged one on some notion of
+"this is an attention weight, treat it specially": neither needs it.
+
+Wanda's calibrated metric, by contrast, still falls back to plain magnitude
+for ``Attention``'s merged weight, the same as it already does for any
+MatMul/Gemm layer whose activation isn't a plain 2-D tensor at the probe
+point (see :func:`apply_wanda_pruning`'s own docstring): the op's own `X`
+input is rank-3 (``[batch, seq, hidden]``), and generalizing that one check
+to reduce over leading axes (mirroring :func:`apply_sparsegpt_pruning`'s
+own ``x.reshape(-1, x.shape[-1])``) would also change the documented,
+tested fallback behavior of every *existing* MatMul/Gemm layer whose own
+activation happens to be rank 3+ (a batched-sequence input is an entirely
+ordinary shape for a plain linear layer too, not something unique to
+Attention) -- a strictly larger behavior change than this task asked for,
+and not a free one: a per-row Wanda mask computed from a 2-D activation
+reduces over the batch axis alone, while the same computation over a
+reshaped 3-D activation reduces over batch *and* sequence position, a
+different (arguably more correct, but different) statistic. Left as a
+data-free-baseline fallback rather than changed silently underfoot; a
+future pass that wants Wanda calibration for a rank-3 activation is free to
+generalize this deliberately, as its own decision.
 
 :func:`apply_sparsegpt_pruning` also matches ordinary (``group=1``) 2-D
 ``Conv`` layers, using exactly the same producer matching, Cholesky
@@ -406,15 +465,68 @@ def _match_conv_weight_only(
     return node.input[0], w_name
 
 
+def _match_attention_weight_only(
+    node: onnx.NodeProto, initializer_map: Dict[str, onnx.TensorProto]
+) -> Optional[Tuple[str, str]]:
+    """If `node` is a ``com.microsoft::Attention`` node with a constant 2-D
+    float32 merged QKV weight (``[K, Nq+Nk+Nv]``), returns
+    ``(x_name, weight_name)``. Mirrors the "Attention-head pruning"
+    section's own :func:`_match_attention_producer` matching criteria
+    (including its ``num_heads``/``qkv_hidden_sizes`` consistency checks --
+    reused verbatim rather than re-implemented, even though nothing here
+    reads `num_heads` itself, so that a node this module's *structural*
+    head-pruning functions would decline as malformed is declined the same
+    way here), minus that function's bias handling -- magnitude/Wanda/
+    SparseGPT never touch bias, only the weight, so there's nothing to
+    validate there. Per :func:`_match_attention_producer`'s own docstring,
+    the merged weight has no transpose attribute of its own -- it is
+    already ``[K, N]``-shaped by construction -- so it is matched here
+    exactly like a non-transposed MatMul weight (``weight_transposed =
+    False`` in :func:`_candidates`' returned tuple); :func:`_prune_weight`'s
+    existing non-Conv path handles that shape with no Attention-specific
+    code at all. Unstructured/N:M pruning only ever zeros entries -- it
+    never changes `w_name`'s shape -- so the un-pruned merged weight's
+    ``num_heads``/``qkv_hidden_sizes`` attributes (read by every other
+    consumer of this weight, e.g. onnx.checker and any runtime) never drift
+    out of sync with its actual shape, the same invariant every other
+    matched layer type already gets from this module's value-only rewrite.
+    """
+    info = _match_attention_producer(node, initializer_map)
+    if info is None:
+        return None
+    return node.input[0], node.input[1]
+
+
 def _candidates(graph: onnx.GraphProto, include_conv: bool = True):
-    """Every MatMul/vanilla-Gemm node with a constant 2-D float32 weight,
-    plus -- when `include_conv` (the default; :func:`apply_sparsegpt_pruning`
-    passes ``False``, see its own docstring for why) -- every ordinary
-    (``group=1``) 2-D ``Conv`` node matched by :func:`_match_conv_weight_only`.
+    """Every MatMul/vanilla-Gemm node with a constant 2-D float32 weight
+    (this already includes a ``com.microsoft::GroupQueryAttention`` node's
+    separate Q/K/V projections: per :func:`_match_gqa_producer`'s own
+    docstring they are ordinary MatMul/vanilla-Gemm nodes feeding into that
+    op, not weights the op itself owns, so they need no special-casing here
+    at all -- they are ranked and pruned no differently from any other
+    MatMul/Gemm layer), plus:
+
+    - every ``com.microsoft::Attention`` node's constant 2-D float32 merged
+      QKV weight, matched by :func:`_match_attention_weight_only` -- unlike
+      GQA's separate projections, this *is* a weight the op itself owns
+      (``node.input[1]``), so it needs its own matcher; and
+    - when `include_conv` (the default; :func:`apply_sparsegpt_pruning`
+      passes ``False``, see its own docstring for why) -- every ordinary
+      (``group=1``) 2-D ``Conv`` node matched by
+      :func:`_match_conv_weight_only`.
+
     Returns ``(node, x_name, w_name, weight_transposed, is_conv)`` tuples;
     `weight_transposed` is always ``False`` (meaningless) for a Conv entry,
     whose output channel always lives on axis 0 of its fixed
-    ``[out_channels, in_channels, kH, kW]`` layout.
+    ``[out_channels, in_channels, kH, kW]`` layout, and likewise always
+    ``False`` (this time literally correct, not just meaningless -- see
+    :func:`_match_attention_weight_only`) for an Attention entry. Attention
+    matching is unconditional (not gated by `include_conv`, which -- per its
+    own name and :func:`apply_sparsegpt_pruning`'s own docstring -- concerns
+    only Conv's im2col-Hessian gap): see :func:`apply_sparsegpt_pruning`'s
+    own docstring for why a merged QKV weight has no analogous problem and
+    is deliberately included in its ``include_conv=False`` candidate list
+    too.
     """
     initializer_map = {t.name: t for t in graph.initializer}
     out = []
@@ -436,6 +548,11 @@ def _candidates(graph: onnx.GraphProto, include_conv: bool = True):
             if conv_match is not None:
                 x_name, w_name = conv_match
                 out.append((node, x_name, w_name, False, True))
+                continue
+        attn_match = _match_attention_weight_only(node, initializer_map)
+        if attn_match is not None:
+            x_name, w_name = attn_match
+            out.append((node, x_name, w_name, False, False))
     return out
 
 
@@ -605,11 +722,17 @@ def apply_magnitude_pruning(
     m: Optional[int] = None,
 ) -> onnx.ModelProto:
     """Zeros the least-magnitude entries of every MatMul/vanilla-Gemm
-    layer's constant 2-D float32 weight, and every ordinary (``group=1``)
-    2-D ``Conv`` layer's constant 4-D float32 weight -- the data-free
-    pruning baseline (Han et al., 2015). See this module's own docstring
-    for how importance is grouped (including the Conv reshape convention)
-    and why structured (shape-changing) pruning isn't offered here.
+    layer's constant 2-D float32 weight (this includes
+    ``com.microsoft::GroupQueryAttention``'s separate Q/K/V projections,
+    ordinary MatMul/Gemm nodes in their own right), every ordinary
+    (``group=1``) 2-D ``Conv`` layer's constant 4-D float32 weight, and
+    every ``com.microsoft::Attention`` node's constant 2-D float32 merged
+    QKV weight -- the data-free pruning baseline (Han et al., 2015). See
+    this module's own docstring for how importance is grouped (including
+    the Conv reshape convention), why the merged QKV weight needs no
+    special handling here beyond matching it (:func:`_candidates`, via
+    :func:`_match_attention_weight_only`), and why structured
+    (shape-changing) pruning isn't offered here.
 
     :param model: the original onnx ModelProto or file path
     :param sparsity: target fraction of each row's (or, for Conv, each
@@ -660,16 +783,22 @@ def apply_wanda_pruning(
     providers: Optional[Sequence[str]] = None,
 ) -> onnx.ModelProto:
     """Wanda pruning (Sun et al., 2023): zeros the least-important entries
-    of every MatMul/vanilla-Gemm layer's constant 2-D float32 weight, and
-    every ordinary (``group=1``) 2-D ``Conv`` layer's constant 4-D float32
-    weight, using ``|W_ij| * ||X_j||_2`` (weight magnitude times its
-    reduction-dimension entry's activation norm over calibration data) as
-    the importance metric instead of plain ``|W|``. See this module's own
+    of every MatMul/vanilla-Gemm layer's constant 2-D float32 weight (this
+    includes ``com.microsoft::GroupQueryAttention``'s separate Q/K/V
+    projections, ordinary MatMul/Gemm nodes in their own right), every
+    ordinary (``group=1``) 2-D ``Conv`` layer's constant 4-D float32 weight,
+    and every ``com.microsoft::Attention`` node's constant 2-D float32
+    merged QKV weight, using ``|W_ij| * ||X_j||_2`` (weight magnitude times
+    its reduction-dimension entry's activation norm over calibration data)
+    as the importance metric instead of plain ``|W|``. See this module's own
     docstring for the technique -- including what ``X_j`` means for a Conv
     column (one ``(in_channel, kh, kw)`` receptive-field offset, not a
-    whole input channel) and which Conv attribute combinations this
-    confidently handles -- and :func:`apply_magnitude_pruning` for the
-    calibration-free baseline this upgrades.
+    whole input channel), which Conv attribute combinations this confidently
+    handles, and why ``Attention``'s merged weight -- whose own activation
+    input is rank-3, not the plain 2-D tensor this metric requires -- always
+    falls back to plain magnitude here rather than being calibrated too --
+    and :func:`apply_magnitude_pruning` for the calibration-free baseline
+    this upgrades.
 
     :param model: the original onnx ModelProto or file path
     :param calibration_data: representative input batches to measure each
@@ -698,10 +827,12 @@ def apply_wanda_pruning(
             to the target pattern; a MatMul/Gemm layer with a non-constant
             or non-2-D weight, a Conv layer with a grouped or non-4-D
             weight, or any matched layer whose activation input isn't
-            usable (not a plain 2-D tensor for MatMul/Gemm; not a 4-D NCHW
-            tensor, or a Conv attribute combination :func:`_conv_spatial_attrs`
-            declines, for Conv) falls back to plain magnitude pruning (no
-            activation norm was ever observed)
+            usable (not a plain 2-D tensor for MatMul/Gemm or Attention --
+            Attention's own ``X`` input is always rank-3, so it always
+            falls into this case; not a 4-D NCHW tensor, or a Conv
+            attribute combination :func:`_conv_spatial_attrs` declines, for
+            Conv) falls back to plain magnitude pruning (no activation norm
+            was ever observed)
     """
     _validate_pattern(sparsity, n, m)
     if isinstance(model, str):
@@ -791,10 +922,14 @@ def apply_wanda_pruning(
 
 def weight_sparsity(model: Union[str, onnx.ModelProto]) -> float:
     """Fraction of exact-zero entries across every matched MatMul/vanilla-
-    Gemm or ordinary (``group=1``) 2-D Conv layer's constant weight -- a
-    quick way to confirm a pruning call reached its target, or to measure
-    an already-sparse model. Returns ``0.0`` if no matching layer is
-    present.
+    Gemm layer (including ``com.microsoft::GroupQueryAttention``'s separate
+    Q/K/V projections), ordinary (``group=1``) 2-D Conv layer, or
+    ``com.microsoft::Attention`` merged-QKV-weight layer's constant weight
+    -- a quick way to confirm a pruning call reached its target, or to
+    measure an already-sparse model. Shares :func:`_candidates` with every
+    ``apply_*_pruning`` function above, so it automatically reports across
+    whatever layer types they match, with no separate list to keep in sync.
+    Returns ``0.0`` if no matching layer is present.
     """
     if isinstance(model, str):
         model = onnx.load(model, load_external_data=False)
@@ -959,7 +1094,10 @@ def apply_sparsegpt_pruning(
 ) -> onnx.ModelProto:
     """SparseGPT (Frantar & Alistarh, 2023): zeros the least-important
     entries of every MatMul/vanilla-Gemm layer's constant 2-D float32
-    weight, the same unstructured-or-N:M patterns
+    weight (this includes ``com.microsoft::GroupQueryAttention``'s separate
+    Q/K/V projections, ordinary MatMul/Gemm nodes in their own right) and
+    every ``com.microsoft::Attention`` node's constant 2-D float32 merged
+    QKV weight, the same unstructured-or-N:M patterns
     :func:`apply_magnitude_pruning`/:func:`apply_wanda_pruning` offer, but
     -- unlike either -- using a sequential, Hessian-error-compensating
     algorithm ported from GPTQ (:mod:`onnxsim.gptq`, same authors, same
@@ -986,6 +1124,17 @@ def apply_sparsegpt_pruning(
     :func:`_conv_spatial_attrs` confidently handles is left completely
     untouched, same as a layer with no observed calibration activation at
     all -- there is still no data-free fallback for SparseGPT.
+
+    ``Attention``'s merged QKV weight has no analogous gap and is
+    deliberately matched here too (unconditionally -- see
+    :func:`_candidates`'s own docstring): its own input is a plain
+    ``[*, K]`` activation (the same ``X`` any ordinary MatMul reads), not an
+    im2col-unfolded receptive field, so ``H = X^T X`` is exactly as correct
+    for it as for every other MatMul/Gemm layer already matched here, with
+    no new machinery needed. See this module's own docstring for the fuller
+    reasoning, including why it would be inconsistent to exclude it while
+    ``GroupQueryAttention``'s separate Q/K/V MatMuls remain (and always
+    were) in scope.
 
     :param model: the original onnx ModelProto or file path
     :param calibration_data: representative input batches to compute each
