@@ -26,7 +26,7 @@ import collections
 import numpy as np
 import onnx
 import pytest
-from onnx import helper, parser
+from onnx import parser
 
 import onnxsim
 
@@ -46,12 +46,22 @@ def _apply_onnxscript_rule(model, rule):
     return _rewriter.rewrite(model, pattern_rewrite_rules=rules)
 
 
+def _model(body, initializer=(), opset=18, ir_version=10):
+    model = parser.parse_model(
+        f"""
+        <
+          ir_version: {ir_version},
+          opset_import: ["": {opset}]
+        >
+        {body}
+        """
+    )
+    model.graph.initializer.extend(initializer)
+    return model
+
+
 def _f32(array, name):
     return onnx.numpy_helper.from_array(array.astype(np.float32), name)
-
-
-def _vi(name, shape):
-    return helper.make_tensor_value_info(name, onnx.TensorProto.FLOAT, shape)
 
 
 # --------------------------------------------------------------------------
@@ -79,14 +89,15 @@ gemm (a, b, c) => (y)
 
 
 def _matmul_add_model():
-    nodes = [
-        helper.make_node("MatMul", ["x", "W"], ["mm"], name="mm"),
-        helper.make_node("Add", ["mm", "B"], ["y"], name="add"),
-    ]
-    inits = [_f32(np.random.randn(4, 5), "W"), _f32(np.random.randn(5), "B")]
-    graph = helper.make_graph(nodes, "g", [_vi("x", [3, 4])], [_vi("y", [3, 5])], inits)
-    return helper.make_model(
-        graph, opset_imports=[helper.make_opsetid("", 18)], ir_version=10
+    return _model(
+        """
+        g (float[3,4] x) => (float[3,5] y)
+        {
+            mm = MatMul(x, W)
+            y = Add(mm, B)
+        }
+        """,
+        initializer=[_f32(np.random.randn(4, 5), "W"), _f32(np.random.randn(5), "B")],
     )
 
 
@@ -137,17 +148,15 @@ reshape (x, s2) => (y)
 
 
 def _reshape_reshape_model():
-    nodes = [
-        helper.make_node("Reshape", ["x", "s1"], ["t"], name="r1"),
-        helper.make_node("Reshape", ["t", "s2"], ["y"], name="r2"),
-    ]
-    inits = [
-        onnx.numpy_helper.from_array(np.array([2, 12], dtype=np.int64), "s1"),
-        onnx.numpy_helper.from_array(np.array([4, 6], dtype=np.int64), "s2"),
-    ]
-    graph = helper.make_graph(nodes, "g", [_vi("x", [3, 8])], [_vi("y", [4, 6])], inits)
-    return helper.make_model(
-        graph, opset_imports=[helper.make_opsetid("", 18)], ir_version=10
+    return _model(
+        """
+        g (float[3,8] x) => (float[4,6] y)
+        <int64[2] s1 = {2, 12}, int64[2] s2 = {4, 6}>
+        {
+            t = Reshape(x, s1)
+            y = Reshape(t, s2)
+        }
+        """
     )
 
 
