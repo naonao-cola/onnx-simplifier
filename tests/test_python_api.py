@@ -389,6 +389,58 @@ def test_cli_large_model_save_fallback_mutates_in_place():
         assert opt.graph.initializer[0].data_location == onnx.TensorProto.EXTERNAL
 
 
+def test_cli_external_data_threshold_forces_external_data():
+    # --external-data-threshold lets a model below the 2GB protobuf limit (and
+    # below onnxsim's own 100MB default) still be forced to external data
+    # without --save-as-external-data. Weights need to individually clear
+    # onnx.save's own default per-tensor size_threshold (1024 bytes) too, or
+    # onnx keeps them inline regardless (see
+    # test_cli_large_model_save_fallback_mutates_in_place's own note on this).
+    from onnxsim import onnx_simplifier
+
+    a = np.random.rand(64, 64).astype(np.float32)
+    b = np.random.rand(64, 64).astype(np.float32)
+    model = parser.parse_model(
+        """
+        <
+          ir_version: 10,
+          opset_import: ["": 14]
+        >
+        g () => (float[64,64] y)
+        {
+          y = Add(a, b)
+        }
+        """
+    )
+    model.graph.initializer.extend(
+        [onnx.numpy_helper.from_array(a, "a"), onnx.numpy_helper.from_array(b, "b")]
+    )
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        input_path = os.path.join(tmpdir, "in.onnx")
+        output_path = os.path.join(tmpdir, "out.onnx")
+        onnx.save(model, input_path)
+
+        argv = sys.argv
+        try:
+            sys.argv = [
+                "onnxsim",
+                input_path,
+                output_path,
+                "--external-data-threshold",
+                "1KB",
+            ]
+            onnx_simplifier.main()
+        finally:
+            sys.argv = argv
+
+        assert os.path.exists(output_path + ".data")
+        saved = onnx.load(output_path, load_external_data=False)
+        assert saved.graph.initializer[0].data_location == onnx.TensorProto.EXTERNAL
+        folded = onnx.numpy_helper.to_array(onnx.load(output_path).graph.initializer[0])
+        np.testing.assert_allclose(folded, a + b, rtol=1e-5, atol=1e-6)
+
+
 def test_unset_optional_input():
     # A Resize with its unused optional "roi"/"scales" inputs left empty (""),
     # only "sizes" provided.
@@ -991,6 +1043,69 @@ def test_simplify_path_with_external_data():
     np.testing.assert_allclose(folded, a + b, rtol=1e-5, atol=1e-6)
 
 
+def test_load_model_hydrates_classic_external_data():
+    # onnxsim.load_model mmaps a model's classic ONNX external data (through
+    # tensor_pool_bridge.h's LoadModelWithTensorPool) instead of using onnx's
+    # own per-tensor loader -- verify it round-trips a model saved with
+    # save_as_external_data=True back to plain in-memory tensors carrying the
+    # original values.
+    a = np.random.rand(64, 64).astype(np.float32)
+    b = np.random.rand(64, 64).astype(np.float32)
+    model = parser.parse_model(
+        """
+        <
+          ir_version: 10,
+          opset_import: ["": 14]
+        >
+        g () => (float[64,64] y)
+        {
+          y = Add(a, b)
+        }
+        """
+    )
+    model.graph.initializer.extend(
+        [onnx.numpy_helper.from_array(a, "a"), onnx.numpy_helper.from_array(b, "b")]
+    )
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        model_path = os.path.join(tmpdir, "model.onnx")
+        onnx.save(
+            model,
+            model_path,
+            save_as_external_data=True,
+            all_tensors_to_one_file=True,
+            location="model.data",
+        )
+        # All the data really is external -- this exercises the mmap'd path,
+        # not a no-op passthrough.
+        assert os.path.exists(os.path.join(tmpdir, "model.data"))
+
+        loaded = onnxsim.load_model(model_path)
+
+    for init in loaded.graph.initializer:
+        assert init.data_location == onnx.TensorProto.DEFAULT
+    values = {
+        init.name: onnx.numpy_helper.to_array(init) for init in loaded.graph.initializer
+    }
+    np.testing.assert_allclose(values["a"], a)
+    np.testing.assert_allclose(values["b"], b)
+
+
+def test_load_model_passes_through_inline_model():
+    # A model with no external data at all must still load correctly (no
+    # EXTERNAL tensors for LoadModelWithTensorPool to resolve).
+    model, a, b = _make_add_model()
+    with tempfile.TemporaryDirectory() as tmpdir:
+        model_path = os.path.join(tmpdir, "model.onnx")
+        onnx.save(model, model_path)
+        loaded = onnxsim.load_model(model_path)
+
+    assert loaded.graph.initializer[0].data_location == onnx.TensorProto.DEFAULT
+    np.testing.assert_allclose(
+        onnx.numpy_helper.to_array(loaded.graph.initializer[0]), a
+    )
+
+
 @skip_in_ci()
 @pytest.mark.skipif(sys.platform == "win32", reason="resource.getrusage is POSIX-only")
 def test_simplify_path_peak_memory_stays_near_model_size():
@@ -1233,6 +1348,55 @@ def test_output_path_falls_back_to_external_data_past_2gb():
         assert os.path.exists(output_path + ".data")
         saved = onnx.load(output_path)
         folded = onnx.numpy_helper.to_array(saved.graph.initializer[0])
+        np.testing.assert_allclose(folded, a + b, rtol=1e-5, atol=1e-6)
+
+
+def test_output_path_external_data_threshold_default_keeps_small_model_inline():
+    # The default external_data_threshold (100MB) leaves a small model inline
+    # with no extra argument needed, matching pre-existing behavior.
+    model, a, b = _make_add_model()
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        model_path = os.path.join(tmpdir, "model.onnx")
+        output_path = os.path.join(tmpdir, "out.onnx")
+        onnx.save(model, model_path)
+
+        sim_model, check_ok = onnxsim.simplify(
+            model_path, check_n=1, output_path=output_path
+        )
+
+        assert check_ok
+        assert not os.path.exists(output_path + ".data")
+        saved = onnx.load(output_path, load_external_data=False)
+        assert saved.graph.initializer[0].data_location == onnx.TensorProto.DEFAULT
+
+
+def test_output_path_external_data_threshold_forces_external_data():
+    # A low external_data_threshold forces external data even for a model far
+    # below the 2GB protobuf limit and the 100MB default -- exercised at this
+    # scale by passing an explicit threshold. Weights need to individually
+    # clear onnx.save's own default per-tensor size_threshold (1024 bytes)
+    # too, or onnx keeps them inline regardless of save_as_external_data
+    # (_make_add_model's 64x64 float32 initializers, 16KB each, clear it).
+    model, a, b = _make_add_model()
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        model_path = os.path.join(tmpdir, "model.onnx")
+        output_path = os.path.join(tmpdir, "out.onnx")
+        onnx.save(model, model_path)
+
+        sim_model, check_ok = onnxsim.simplify(
+            model_path,
+            check_n=1,
+            output_path=output_path,
+            external_data_threshold="1KB",
+        )
+
+        assert check_ok
+        assert os.path.exists(output_path + ".data")
+        saved = onnx.load(output_path, load_external_data=False)
+        assert saved.graph.initializer[0].data_location == onnx.TensorProto.EXTERNAL
+        folded = onnx.numpy_helper.to_array(onnx.load(output_path).graph.initializer[0])
         np.testing.assert_allclose(folded, a + b, rtol=1e-5, atol=1e-6)
 
 
