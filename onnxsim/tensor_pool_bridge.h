@@ -157,9 +157,9 @@ inline std::string ExternalDataValue(const onnx::TensorProto& t,
 // relative one is joined to `base_dir`.
 inline std::string ResolveExternalDataPath(const std::string& base_dir,
                                            const std::string& location) {
-  bool is_absolute = !location.empty() &&
-                     (location[0] == '/' || location[0] == '\\' ||
-                      (location.size() > 1 && location[1] == ':'));
+  bool is_absolute =
+      !location.empty() && (location[0] == '/' || location[0] == '\\' ||
+                            (location.size() > 1 && location[1] == ':'));
   if (is_absolute || base_dir.empty()) return location;
   char sep = base_dir.back();
   return (sep == '/' || sep == '\\') ? base_dir + location
@@ -351,61 +351,59 @@ inline size_t LoadModelWithTensorPool(const std::string& onnx_path,
       mapped;
 
   size_t loaded = 0;
-  detail::ForEachTensor(
-      *model->mutable_graph(),
-      [&](const std::string& name, onnx::TensorProto& t) {
-        if (t.data_location() != onnx::TensorProto::EXTERNAL) return;
-        std::string location = detail::ExternalDataValue(t, "location");
-        if (location.empty()) return;  // malformed; leave untouched
-        std::string full_path =
-            detail::ResolveExternalDataPath(base_dir, location);
+  detail::ForEachTensor(*model->mutable_graph(), [&](const std::string& name,
+                                                     onnx::TensorProto& t) {
+    if (t.data_location() != onnx::TensorProto::EXTERNAL) return;
+    std::string location = detail::ExternalDataValue(t, "location");
+    if (location.empty()) return;  // malformed; leave untouched
+    std::string full_path = detail::ResolveExternalDataPath(base_dir, location);
 
-        auto it = mapped.find(full_path);
-        if (it == mapped.end()) {
-          it = mapped.emplace(full_path, TryMmapFile(full_path)).first;
-        }
-        const std::shared_ptr<const char[]>& owner = it->second.first;
-        const uint64_t file_size = it->second.second;
+    auto it = mapped.find(full_path);
+    if (it == mapped.end()) {
+      it = mapped.emplace(full_path, TryMmapFile(full_path)).first;
+    }
+    const std::shared_ptr<const char[]>& owner = it->second.first;
+    const uint64_t file_size = it->second.second;
 
-        uint64_t offset = 0;
-        {
-          std::string offset_str = detail::ExternalDataValue(t, "offset");
-          if (!offset_str.empty()) offset = std::stoull(offset_str);
-        }
-        std::string length_str = detail::ExternalDataValue(t, "length");
-        std::vector<int64_t> shape(t.dims().begin(), t.dims().end());
+    uint64_t offset = 0;
+    {
+      std::string offset_str = detail::ExternalDataValue(t, "offset");
+      if (!offset_str.empty()) offset = std::stoull(offset_str);
+    }
+    std::string length_str = detail::ExternalDataValue(t, "length");
+    std::vector<int64_t> shape(t.dims().begin(), t.dims().end());
 
-        if (owner != nullptr) {
-          uint64_t length = length_str.empty()
-                                ? (file_size > offset ? file_size - offset : 0)
-                                : std::stoull(length_str);
-          if (offset + length > file_size) return;  // out-of-range record
-          std::string_view view(owner.get() + offset, length);
-          pool.Add(name, t.data_type(), shape, owner, view);
-        } else {
-          // mmap unavailable/failed for this file -- fall back to reading
-          // just this tensor's own byte range, same as onnx's own
-          // external-data loader.
-          std::ifstream data_in(full_path, std::ios::binary);
-          if (!data_in) return;  // leave this tensor's EXTERNAL ref as-is
-          uint64_t length;
-          if (length_str.empty()) {
-            data_in.seekg(0, std::ios::end);
-            std::streamoff end = data_in.tellg();
-            length = end > static_cast<std::streamoff>(offset)
-                        ? static_cast<uint64_t>(end) - offset
-                        : 0;
-          } else {
-            length = std::stoull(length_str);
-          }
-          data_in.seekg(static_cast<std::streamoff>(offset));
-          std::string bytes(length, '\0');
-          data_in.read(bytes.data(), static_cast<std::streamsize>(length));
-          pool.Add(name, t.data_type(), shape, std::move(bytes));
-        }
-        ++loaded;
-        if (hydrate_all) HydrateTensorProto(name, t, pool);
-      });
+    if (owner != nullptr) {
+      uint64_t length = length_str.empty()
+                            ? (file_size > offset ? file_size - offset : 0)
+                            : std::stoull(length_str);
+      if (offset + length > file_size) return;  // out-of-range record
+      std::string_view view(owner.get() + offset, length);
+      pool.Add(name, t.data_type(), shape, owner, view);
+    } else {
+      // mmap unavailable/failed for this file -- fall back to reading
+      // just this tensor's own byte range, same as onnx's own
+      // external-data loader.
+      std::ifstream data_in(full_path, std::ios::binary);
+      if (!data_in) return;  // leave this tensor's EXTERNAL ref as-is
+      uint64_t length;
+      if (length_str.empty()) {
+        data_in.seekg(0, std::ios::end);
+        std::streamoff end = data_in.tellg();
+        length = end > static_cast<std::streamoff>(offset)
+                     ? static_cast<uint64_t>(end) - offset
+                     : 0;
+      } else {
+        length = std::stoull(length_str);
+      }
+      data_in.seekg(static_cast<std::streamoff>(offset));
+      std::string bytes(length, '\0');
+      data_in.read(bytes.data(), static_cast<std::streamsize>(length));
+      pool.Add(name, t.data_type(), shape, std::move(bytes));
+    }
+    ++loaded;
+    if (hydrate_all) HydrateTensorProto(name, t, pool);
+  });
   return loaded;
 }
 

@@ -483,9 +483,8 @@ void TestLoadModelWithTensorPoolNoLengthReadsToEndOfFile() {
 }
 
 void TestLoadModelWithTensorPoolMissingFileIsSkipped() {
-  onnx::TensorProto t =
-      MakeExternalInitializer("missing", onnx::TensorProto::FLOAT, {1},
-                              "/nonexistent/path.data", 0, 4);
+  onnx::TensorProto t = MakeExternalInitializer(
+      "missing", onnx::TensorProto::FLOAT, {1}, "/nonexistent/path.data", 0, 4);
   onnx::ModelProto model;
   *model.mutable_graph()->add_initializer() = t;
   std::string onnx_path = TempPath("_ext_missing.onnx");
