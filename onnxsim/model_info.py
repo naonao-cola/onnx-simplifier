@@ -34,6 +34,13 @@ try:
 except ImportError:  # onnx.inliner was added in onnx 1.14; see ModelInfo.__init__.
     onnx_inliner = None
 
+try:
+    import onnx_ir
+    from onnx_shape_inference import infer_symbolic_shapes
+except ImportError:  # optional dependency; see ModelInfo._infer_shapes below.
+    onnx_ir = None
+    infer_symbolic_shapes = None
+
 
 __all__ = [
     "ModelInfo",
@@ -557,7 +564,11 @@ class ModelInfo:
     3. MACs / FLOPs of the compute-dominant operators: Conv, ConvTranspose,
        Gemm, MatMul, Attention, and the quantized twins (ConvInteger,
        QLinearConv, MatMulInteger, QLinearMatMul). Shapes come from ONNX shape
-       inference; nodes whose shapes cannot be inferred contribute 0. Dynamic
+       inference -- or, when the optional ``onnx-shape-inference`` package
+       (https://github.com/justinchuby/onnx-shape-inference) is installed, its
+       symbolic shape inference, which resolves more shapes via data
+       propagation through chains like Shape -> Slice -> Concat -> Reshape;
+       nodes whose shapes still cannot be inferred contribute 0. Dynamic
        dimensions (``dim_param``, e.g. "batch") become sympy symbols when sympy
        is installed, so ``macs`` / ``flops`` may be a symbolic formula; without
        sympy they are assumed 1 (per-sample MACs). Function ops are expanded
@@ -684,6 +695,22 @@ class ModelInfo:
     def _infer_shapes(
         model: onnx.ModelProto, data_prop: bool = False
     ) -> onnx.ModelProto:
+        # onnx-shape-inference (https://github.com/justinchuby/onnx-shape-inference),
+        # when installed, resolves more shapes than onnx's own shape_inference: it
+        # always does data propagation and tracks values through chains like
+        # Shape -> Slice -> Concat -> Reshape, so dynamic reshapes that onnx leaves
+        # unknown often still get a shape here. Its dim_param names for dynamic
+        # dims are still picked up as sympy symbols by _tensor_shape below.
+        if infer_symbolic_shapes is not None:
+            try:
+                inferred = infer_symbolic_shapes(onnx_ir.from_proto(model))
+                return onnx_ir.to_proto(inferred)
+            except Exception as e:
+                warnings.warn(
+                    f"onnx-shape-inference failed ({e}); falling back to "
+                    "onnx.shape_inference.",
+                    stacklevel=2,
+                )
         try:
             return shape_inference.infer_shapes(model, data_prop=data_prop)
         except Exception as e:

@@ -367,6 +367,74 @@ def test_dynamic_dim_without_sympy_assumes_one(monkeypatch):
 
 
 # --------------------------------------------------------------------------- #
+# onnx-shape-inference backend (onnxsim[shape-inference])
+# --------------------------------------------------------------------------- #
+def test_infer_shapes_uses_onnx_shape_inference_when_installed():
+    # onnx-shape-inference (https://github.com/justinchuby/onnx-shape-inference)
+    # does data propagation through a Shape -> Gather -> Concat -> Reshape chain
+    # that onnx.shape_inference, called without data_prop (as ModelInfo does by
+    # default), cannot see through -- it should recover "y"'s shape as
+    # ["batch", 2, 3] instead of leaving it unknown.
+    pytest.importorskip("onnx_shape_inference")
+    x = _vi("x", ["batch", 6])
+    y = _vi("y", None)
+    idx = helper.make_tensor("idx", TensorProto.INT64, [], [0])
+    axes = helper.make_tensor("axes", TensorProto.INT64, [1], [0])
+    two = helper.make_tensor("two", TensorProto.INT64, [1], [2])
+    three = helper.make_tensor("three", TensorProto.INT64, [1], [3])
+    nodes = [
+        helper.make_node("Shape", ["x"], ["x_shape"]),
+        helper.make_node("Gather", ["x_shape", "idx"], ["batch_dim"], axis=0),
+        helper.make_node("Unsqueeze", ["batch_dim", "axes"], ["batch_dim_1"]),
+        helper.make_node(
+            "Concat", ["batch_dim_1", "two", "three"], ["new_shape"], axis=0
+        ),
+        helper.make_node("Reshape", ["x", "new_shape"], ["y"]),
+    ]
+    model = _model(nodes, [x], [y], [idx, axes, two, three])
+    inferred = ModelInfo._infer_shapes(model)
+    (out,) = [o for o in inferred.graph.output if o.name == "y"]
+    dims = list(out.type.tensor_type.shape.dim)
+    assert dims[0].dim_param == "batch"
+    assert dims[1].dim_value == 2
+    assert dims[2].dim_value == 3
+
+
+def test_infer_shapes_falls_back_without_onnx_shape_inference(monkeypatch):
+    # With the optional onnx-shape-inference backend unavailable, _infer_shapes
+    # must still work via onnx's own shape_inference.
+    monkeypatch.setattr(model_info, "infer_symbolic_shapes", None)
+    x = _vi("x", [1, 3, 8, 8])
+    w = _weight("w", [4, 3, 3, 3])
+    y = _vi("y", [1, 4, 8, 8])
+    node = helper.make_node(
+        "Conv", ["x", "w"], ["y"], kernel_shape=[3, 3], pads=[1, 1, 1, 1]
+    )
+    inferred = model_info.ModelInfo._infer_shapes(_model([node], [x], [y], [w]))
+    assert any(vi.name == "y" for vi in inferred.graph.output)
+
+
+def test_infer_shapes_falls_back_when_onnx_shape_inference_raises(monkeypatch):
+    # A failure in the optional backend (e.g. an unsupported op) must degrade to
+    # onnx.shape_inference with a warning, not propagate.
+    pytest.importorskip("onnx_shape_inference")
+
+    def _raise(_ir_model):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(model_info, "infer_symbolic_shapes", _raise)
+    x = _vi("x", [1, 3, 8, 8])
+    w = _weight("w", [4, 3, 3, 3])
+    y = _vi("y", [1, 4, 8, 8])
+    node = helper.make_node(
+        "Conv", ["x", "w"], ["y"], kernel_shape=[3, 3], pads=[1, 1, 1, 1]
+    )
+    with pytest.warns(UserWarning, match="onnx-shape-inference failed"):
+        inferred = ModelInfo._infer_shapes(_model([node], [x], [y], [w]))
+    assert any(vi.name == "y" for vi in inferred.graph.output)
+
+
+# --------------------------------------------------------------------------- #
 # Formatting helpers
 # --------------------------------------------------------------------------- #
 def test_human_readable_num_units():
