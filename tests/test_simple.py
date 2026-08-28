@@ -864,6 +864,79 @@ def test_sequence_length_construct_folds_and_unrolls_loop():
     assert "SequenceLength" not in op_types
 
 
+def test_optional_get_element_of_optional_is_folded():
+    # `OptionalGetElement(Optional(x))` -- a common `torch.jit.script`-export
+    # artifact for an `Optional[Tensor]` argument that is known to be present
+    # -- folds straight to `x`, dropping the Optional type entirely. Most
+    # ONNX consumers (this includes compilers such as TVM's Relax ONNX
+    # frontend) have little to no support for the Optional type.
+    x = helper.make_tensor_value_info("x", TensorProto.FLOAT, [2])
+    opt = helper.make_node("Optional", ["x"], ["opt"])
+    get = helper.make_node("OptionalGetElement", ["opt"], ["y"])
+    graph = helper.make_graph(
+        [opt, get],
+        "g",
+        [x],
+        [helper.make_tensor_value_info("y", TensorProto.FLOAT, [2])],
+    )
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 18)])
+    onnx.checker.check_model(model)
+
+    sim_model, check_ok = onnxsim.simplify(model)
+    assert check_ok
+    onnx.checker.check_model(sim_model)
+    op_types = [n.op_type for n in sim_model.graph.node]
+    assert "Optional" not in op_types
+    assert "OptionalGetElement" not in op_types
+
+
+def test_optional_has_element_is_folded():
+    # `OptionalHasElement` folds to a constant bool whenever its emptiness is
+    # already known: true for `Optional(x)`, false for an explicitly-empty
+    # `Optional()` and for the op's own input being omitted entirely.
+    x = helper.make_tensor_value_info("x", TensorProto.FLOAT, [2])
+    opt = helper.make_node("Optional", ["x"], ["opt"])
+    opt_empty = helper.make_node(
+        "Optional",
+        [],
+        ["opt_empty"],
+        type=helper.make_tensor_type_proto(TensorProto.FLOAT, [2]),
+    )
+    has_present = helper.make_node("OptionalHasElement", ["opt"], ["h_present"])
+    has_empty = helper.make_node("OptionalHasElement", ["opt_empty"], ["h_empty"])
+    has_no_input = helper.make_node("OptionalHasElement", [], ["h_no_input"])
+    graph = helper.make_graph(
+        [opt, opt_empty, has_present, has_empty, has_no_input],
+        "g",
+        [x],
+        [
+            helper.make_tensor_value_info("h_present", TensorProto.BOOL, []),
+            helper.make_tensor_value_info("h_empty", TensorProto.BOOL, []),
+            helper.make_tensor_value_info("h_no_input", TensorProto.BOOL, []),
+        ],
+    )
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 18)])
+    onnx.checker.check_model(model)
+
+    sim_model, check_ok = onnxsim.simplify(model, check_n=0)
+    assert check_ok
+    onnx.checker.check_model(sim_model)
+    assert all(n.op_type != "OptionalHasElement" for n in sim_model.graph.node)
+
+    values = {}
+    for init in sim_model.graph.initializer:
+        values[init.name] = numpy_helper.to_array(init)
+    for node in sim_model.graph.node:
+        if node.op_type == "Constant":
+            (attr,) = [a for a in node.attribute if a.name == "value"]
+            values[node.output[0]] = numpy_helper.to_array(attr.t)
+
+    out_names = [o.name for o in sim_model.graph.output]
+    assert bool(values[out_names[0]]) is True  # h_present
+    assert bool(values[out_names[1]]) is False  # h_empty
+    assert bool(values[out_names[2]]) is False  # h_no_input
+
+
 def test_ir3_conv_bn_fuses():
     # IR version 3 models (e.g. the opset-8 ``resnet101-v1-7``) list every
     # initializer as a graph input too, which is required before IR 4. onnxsim
