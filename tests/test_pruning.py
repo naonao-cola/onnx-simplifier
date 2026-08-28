@@ -1478,61 +1478,213 @@ def test_structured_pruning_skips_grouped_consumer_conv():
     np.testing.assert_array_equal(inits["W2"], w2)
 
 
-def test_structured_pruning_skips_general_grouped_producer_conv():
-    # A *general* grouped Conv (group=2, neither 1 nor equal to its own
-    # channel count) is not the depthwise special case above -- it stays
-    # completely out of scope, exactly as before this pass learned to cross
-    # depthwise Convs transparently.
-    C = 8
-    rng = np.random.default_rng(57)
-    w1 = rng.standard_normal((C, C // 2, 3, 3)).astype(np.float32)  # group=2
-    w2 = rng.standard_normal((C, C, 3, 3)).astype(np.float32)
-    model = _model(
+def _grouped_conv_pair_model(
+    w1, w2, group1=1, group2=1, b1=None, spatial=10, activation="Relu"
+):
+    """`_conv_pair_model`, extended with an explicit ``group`` attribute on
+    each Conv -- lets the same oracle-comparison-via-onnxruntime pattern
+    used throughout this section cover a general grouped Conv producer
+    (`group1`) and/or consumer (`group2`), not just the ``group=1`` case
+    `_conv_pair_model` builds. `w1`'s shape must already be
+    ``[C1, Cin/group1, kH, kW]`` and `w2`'s ``[C2, C1/group2, kH, kW]`` --
+    same caller-responsibility convention `_conv_pair_model` already has for
+    the two weights' shapes lining up.
+    """
+    Cin, C2 = w1.shape[1] * group1, w2.shape[0]
+    initializer = [_f32(w1, "W1"), _f32(w2, "W2")]
+    g1 = f", group={group1}" if group1 != 1 else ""
+    g2 = f", group={group2}" if group2 != 1 else ""
+    if b1 is not None:
+        conv1 = f"h = Conv<kernel_shape=[3,3]{g1}>(X, W1, B1)"
+        initializer.append(_f32(b1, "B1"))
+    else:
+        conv1 = f"h = Conv<kernel_shape=[3,3]{g1}>(X, W1)"
+    out_spatial = spatial - 4  # two valid (no-pad) 3x3 convs
+    return _model(
         f"""
-        g (float[N,{C},10,10] X) => (float[N,{C},6,6] Y)
+        g (float[N,{Cin},{spatial},{spatial}] X) => (float[N,{C2},{out_spatial},{out_spatial}] Y)
         {{
-          h = Conv<kernel_shape=[3,3], group=2>(X, W1)
-          a = Relu(h)
-          Y = Conv<kernel_shape=[3,3]>(a, W2)
+          {conv1}
+          a = {activation}(h)
+          Y = Conv<kernel_shape=[3,3]{g2}>(a, W2)
         }}
         """,
-        initializer=[_f32(w1, "W1"), _f32(w2, "W2")],
+        initializer=initializer,
     )
+
+
+def _oracle_keep_indices_conv_grouped(w, group, sparsity):
+    """The per-group analogue of `_oracle_keep_indices_conv`: ranks each of
+    `group` equal-sized blocks of output filters (`w`'s axis 0) by L2 norm
+    *independently*, keeping the same count from every block -- a from-
+    scratch reimplementation of the production per-group selection in
+    `_apply_chains`/`_chain_group`, not a call into it, so this stays a real
+    check on the algorithm rather than the algorithm checking itself.
+    """
+    out_channels = w.shape[0]
+    block = out_channels // group
+    per_group_keep = max(1, round(block * (1.0 - sparsity)))
+    parts = []
+    for gi in range(group):
+        lo, hi = gi * block, (gi + 1) * block
+        parts.append(_oracle_keep_indices_conv(w[lo:hi], per_group_keep) + lo)
+    return np.concatenate(parts)
+
+
+def _oracle_slice_grouped_consumer_conv(w2, keep, group, n_channels):
+    """The per-group analogue of the ordinary `w2[:, keep]` consumer slice:
+    a grouped consumer's axis 1 is only `n_channels / group` wide and
+    per-group-relative (weight column `j` on a filter in output-group `g`
+    means global input channel `g * block + j`), so each output-filter
+    group needs its own local slice of `keep` -- translated from global
+    indices back to that group's own local ones -- rather than one global
+    index set applied to the whole axis. A from-scratch reimplementation of
+    `_slice_grouped_consumer_conv_weight`, for the same reason
+    `_oracle_keep_indices_conv_grouped` reimplements the selection side.
+    """
+    out_channels = w2.shape[0]
+    out_per_group = out_channels // group
+    block = n_channels // group
+    parts = []
+    for gi in range(group):
+        lo, hi = gi * block, (gi + 1) * block
+        local_keep = keep[(keep >= lo) & (keep < hi)] - lo
+        parts.append(w2[gi * out_per_group : (gi + 1) * out_per_group][:, local_keep])
+    return np.concatenate(parts, axis=0)
+
+
+def test_structured_pruning_general_grouped_producer_conv_prunes_per_group_independently():
+    # A general grouped Conv producer (group=2, neither 1 nor its own
+    # channel count) feeding an ordinary consumer. Per this module's own
+    # docstring, a grouped Conv splits its output channels into `group`
+    # equal blocks that must each be ranked and pruned *independently*,
+    # keeping the same count per block (so `out_channels % group == 0`
+    # survives). Engineer block 0's filters (indices 0-3) to all have a far
+    # larger L2 norm than every filter in block 1 (indices 4-7): a *global*
+    # top-k over all 8 filters would keep every one of block 0's filters and
+    # none of block 1's, leaving block 1 with zero survivors -- violating
+    # its own group structure. The correct per-group behavior instead keeps
+    # each block's own top half, which -- given this engineered disparity
+    # -- provably differs from the global top-k.
+    Cin, C1, C2, group = 4, 8, 4, 2
+    rng = np.random.default_rng(80)
+    w1 = rng.standard_normal((C1, Cin // group, 3, 3)).astype(np.float32)
+    w1[:4] *= 10.0  # block 0 dominates block 1
+    w2 = rng.standard_normal((C2, C1, 3, 3)).astype(np.float32)
+    model = _grouped_conv_pair_model(w1, w2, group1=group)
+
     pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    keep_grouped = _oracle_keep_indices_conv_grouped(w1, group, 0.5)
+    keep_global = _oracle_keep_indices_conv(w1, 4)
+    assert list(keep_grouped) != list(keep_global)  # sanity: the engineered
+    # disparity really does make per-group and global selection disagree
+    assert sum(i < 4 for i in keep_grouped) == 2  # exactly half of block 0 ...
+    assert sum(i >= 4 for i in keep_grouped) == 2  # ... and half of block 1
+
     inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
-    np.testing.assert_array_equal(inits["W1"], w1)
-    np.testing.assert_array_equal(inits["W2"], w2)
+    np.testing.assert_array_equal(inits["W1"], w1[keep_grouped])
+    dw_node = next(n for n in pruned.graph.node if "W1" in n.input)
+    group_attr = next(a.i for a in dw_node.attribute if a.name == "group")
+    assert group_attr == group  # the group count itself never shrinks
+
+    oracle = _grouped_conv_pair_model(
+        w1[keep_grouped], w2[:, keep_grouped], group1=group
+    )
+    rng_x = np.random.default_rng(81)
+    x = rng_x.standard_normal((2, Cin, 10, 10)).astype(np.float32)
+    (y,) = _run(pruned, {"X": x})
+    (y_oracle,) = _run(oracle, {"X": x})
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-5, atol=1e-5)
 
 
-def test_structured_pruning_skips_general_grouped_consumer_conv():
-    # A general group=2 Conv sitting *between* a real producer and a real
-    # further consumer must also stay a hard stop, not a transparent hop --
-    # only the depthwise case (group == channel count, weight [C, 1, kH,
-    # kW]) is safe to cross, since only there is every output channel tied
-    # 1:1 to a single input channel with no cross-channel mixing at all.
-    Cin, C1, C2 = 3, 8, 4
-    rng = np.random.default_rng(58)
+def test_structured_pruning_general_grouped_consumer_conv_matches_manual_channel_deletion_exactly():
+    # A general grouped Conv consumer (group=2): the shared dimension being
+    # pruned is the consumer's own *input* channel axis, but that axis is
+    # per-group-relative in a grouped Conv's weight layout ([out_channels,
+    # in_channels/group, kH, kW]) -- weight column j on an output filter in
+    # group g means global input channel g*(in_channels/group) + j, not
+    # global channel j the way an ordinary (group=1) consumer's flat axis
+    # works. This is the part of grouped-Conv support that needs real new
+    # slicing logic (_slice_grouped_consumer_conv_weight), exercised here
+    # with block 0 given a far larger weight norm than block 1 so the two
+    # blocks' independently-selected local keep sets aren't trivially
+    # identical on both sides.
+    Cin, C1, C2, group = 3, 8, 6, 2
+    rng = np.random.default_rng(82)
     w1 = rng.standard_normal((C1, Cin, 3, 3)).astype(np.float32)
-    w2 = rng.standard_normal((C1, C1 // 2, 3, 3)).astype(np.float32)  # group=2
-    w3 = rng.standard_normal((C2, C1, 3, 3)).astype(np.float32)
-    model = _model(
-        f"""
-        g (float[N,{Cin},14,14] X) => (float[N,{C2},8,8] Y)
-        {{
-          h = Conv<kernel_shape=[3,3]>(X, W1)
-          a = Relu(h)
-          m = Conv<kernel_shape=[3,3], group=2>(a, W2)
-          b = Relu(m)
-          Y = Conv<kernel_shape=[3,3]>(b, W3)
-        }}
-        """,
-        initializer=[_f32(w1, "W1"), _f32(w2, "W2"), _f32(w3, "W3")],
-    )
+    w1[:4] *= 8.0  # block 0 dominates block 1
+    w2 = rng.standard_normal((C2, C1 // group, 3, 3)).astype(np.float32)
+    model = _grouped_conv_pair_model(w1, w2, group2=group)
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    keep = _oracle_keep_indices_conv_grouped(w1, group, 0.5)
+    w2_sliced = _oracle_slice_grouped_consumer_conv(w2, keep, group, C1)
+
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    np.testing.assert_array_equal(inits["W1"], w1[keep])
+    np.testing.assert_array_equal(inits["W2"], w2_sliced)
+
+    oracle = _grouped_conv_pair_model(w1[keep], w2_sliced, group2=group)
+    rng_x = np.random.default_rng(83)
+    x = rng_x.standard_normal((2, Cin, 10, 10)).astype(np.float32)
+    (y,) = _run(pruned, {"X": x})
+    (y_oracle,) = _run(oracle, {"X": x})
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-5, atol=1e-5)
+
+
+def test_structured_pruning_both_sides_grouped_matching_group_count_matches_oracle():
+    # Both producer and consumer are general grouped Convs, sharing the
+    # exact same `group` count -- the one cross-chain composition this pass
+    # supports when *both* sides are grouped (see this module's own
+    # docstring): the producer's own per-group keep selection (uniform
+    # count per block, by construction) already lines up exactly with the
+    # consumer's own group boundaries, since both partition the same
+    # `n_channels` into the same number of equal contiguous blocks.
+    Cin, C1, C2, group = 4, 8, 6, 2
+    rng = np.random.default_rng(84)
+    w1 = rng.standard_normal((C1, Cin // group, 3, 3)).astype(np.float32)
+    w1[:4] *= 6.0
+    w2 = rng.standard_normal((C2, C1 // group, 3, 3)).astype(np.float32)
+    model = _grouped_conv_pair_model(w1, w2, group1=group, group2=group)
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    keep = _oracle_keep_indices_conv_grouped(w1, group, 0.5)
+    w2_sliced = _oracle_slice_grouped_consumer_conv(w2, keep, group, C1)
+    oracle = _grouped_conv_pair_model(w1[keep], w2_sliced, group1=group, group2=group)
+
+    rng_x = np.random.default_rng(85)
+    x = rng_x.standard_normal((2, Cin, 10, 10)).astype(np.float32)
+    (y,) = _run(pruned, {"X": x})
+    (y_oracle,) = _run(oracle, {"X": x})
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-5, atol=1e-5)
+
+
+def test_structured_pruning_skips_mismatched_grouped_producer_and_consumer():
+    # Producer group=2, consumer group=4: both sides grouped, but with a
+    # *different* group count. Per this module's own docstring, both sides
+    # grouped is only supported when the group counts match -- otherwise
+    # the two sides' block boundaries wouldn't generally align (a channel
+    # surviving as "the 2nd of the producer's own group" has no
+    # well-defined membership in any of the consumer's differently-sized
+    # groups), so this composition is declined outright and the whole
+    # chain -- both layers -- is left completely untouched, not partially
+    # or incorrectly pruned.
+    Cin, C1, C2, gp, gc = 4, 8, 8, 2, 4
+    rng = np.random.default_rng(86)
+    w1 = rng.standard_normal((C1, Cin // gp, 3, 3)).astype(np.float32)
+    w2 = rng.standard_normal((C2, C1 // gc, 3, 3)).astype(np.float32)
+    model = _grouped_conv_pair_model(w1, w2, group1=gp, group2=gc)
+
     pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
     inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
     np.testing.assert_array_equal(inits["W1"], w1)
     np.testing.assert_array_equal(inits["W2"], w2)
-    np.testing.assert_array_equal(inits["W3"], w3)
 
 
 def test_structured_pruning_conv_into_non_pass_through_op_is_left_untouched():
