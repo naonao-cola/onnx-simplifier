@@ -5,17 +5,25 @@ for the technique (static, per-channel INT8 quantization of a decoder's
 
 import numpy as np
 import onnx
-import onnx.helper
 import onnx.numpy_helper
 import pytest
+from onnx import parser
 
 import onnxsim
 
 ort = pytest.importorskip("onnxruntime")
 
 
-def _vi(name, shape, dtype=onnx.TensorProto.FLOAT):
-    return onnx.helper.make_tensor_value_info(name, dtype, shape)
+def _model(body, opset=13, ir_version=8):
+    return parser.parse_model(
+        f"""
+        <
+          ir_version: {ir_version},
+          opset_import: ["": {opset}]
+        >
+        {body}
+        """
+    )
 
 
 def _kv_cache_model(batch=1, heads=2, head_dim=4, opset=13, symbolic_seq=True):
@@ -29,28 +37,19 @@ def _kv_cache_model(batch=1, heads=2, head_dim=4, opset=13, symbolic_seq=True):
     # inputs with a single consumer).
     seq_past = "seq_past" if symbolic_seq else 3
     seq_present = "seq_present" if symbolic_seq else 4
-    nodes = [
-        onnx.helper.make_node("Identity", ["new_key_raw"], ["new_key"]),
-        onnx.helper.make_node(
-            "Concat", ["past_key", "new_key"], ["present_key"], axis=2
-        ),
-        onnx.helper.make_node("ReduceSum", ["present_key"], ["summary"], keepdims=0),
-    ]
-    graph = onnx.helper.make_graph(
-        nodes,
-        "g",
-        [
-            _vi("past_key", [batch, heads, seq_past, head_dim]),
-            _vi("new_key_raw", [batch, heads, 1, head_dim]),
-        ],
-        [
-            _vi("present_key", [batch, heads, seq_present, head_dim]),
-            _vi("summary", []),
-        ],
-        [],
-    )
-    return onnx.helper.make_model(
-        graph, opset_imports=[onnx.helper.make_opsetid("", opset)], ir_version=8
+    return _model(
+        f"""
+        g (float[{batch},{heads},{seq_past},{head_dim}] past_key,
+           float[{batch},{heads},1,{head_dim}] new_key_raw)
+          => (float[{batch},{heads},{seq_present},{head_dim}] present_key,
+              float summary)
+        {{
+          new_key = Identity(new_key_raw)
+          present_key = Concat<axis = 2>(past_key, new_key)
+          summary = ReduceSum<keepdims = 0>(present_key)
+        }}
+        """,
+        opset=opset,
     )
 
 
@@ -144,41 +143,32 @@ def test_kv_cache_quantization_two_step_round_trip_close_to_float():
 
 
 def test_kv_cache_quantization_declines_when_past_has_other_consumers():
-    nodes = [
-        onnx.helper.make_node("Identity", ["new_key_raw"], ["new_key"]),
-        onnx.helper.make_node(
-            "Concat", ["past_key", "new_key"], ["present_key"], axis=2
-        ),
-        onnx.helper.make_node("ReduceSum", ["present_key"], ["summary"], keepdims=0),
-        # A second, direct consumer of past_key -- the pattern must decline
-        # rather than silently break this other use.
-        onnx.helper.make_node("ReduceSum", ["past_key"], ["past_summary"], keepdims=0),
-    ]
-    graph = onnx.helper.make_graph(
-        nodes,
-        "g",
-        [_vi("past_key", [1, 2, 3, 4]), _vi("new_key_raw", [1, 2, 1, 4])],
-        [
-            _vi("present_key", [1, 2, 4, 4]),
-            _vi("summary", []),
-            _vi("past_summary", []),
-        ],
-        [],
-    )
-    model = onnx.helper.make_model(
-        graph, opset_imports=[onnx.helper.make_opsetid("", 13)], ir_version=8
+    # past_summary is a second, direct consumer of past_key -- the pattern
+    # must decline rather than silently break this other use.
+    model = _model(
+        """
+        g (float[1,2,3,4] past_key, float[1,2,1,4] new_key_raw)
+          => (float[1,2,4,4] present_key, float summary, float past_summary)
+        {
+          new_key = Identity(new_key_raw)
+          present_key = Concat<axis = 2>(past_key, new_key)
+          summary = ReduceSum<keepdims = 0>(present_key)
+          past_summary = ReduceSum<keepdims = 0>(past_key)
+        }
+        """
     )
     q = onnxsim.quantize_kv_cache(model)
     assert q.SerializeToString() == model.SerializeToString()
 
 
 def test_kv_cache_quantization_noop_without_kv_cache_pattern():
-    nodes = [onnx.helper.make_node("Relu", ["x"], ["y"])]
-    graph = onnx.helper.make_graph(
-        nodes, "g", [_vi("x", [4, 4])], [_vi("y", [4, 4])], []
-    )
-    model = onnx.helper.make_model(
-        graph, opset_imports=[onnx.helper.make_opsetid("", 13)], ir_version=8
+    model = _model(
+        """
+        g (float[4,4] x) => (float[4,4] y)
+        {
+          y = Relu(x)
+        }
+        """
     )
     result = onnxsim.quantize_kv_cache(model)
     assert result.SerializeToString() == model.SerializeToString()
