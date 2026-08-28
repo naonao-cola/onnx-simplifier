@@ -108,6 +108,39 @@ result is unconditionally irreversible and, unlike a retrained pipeline,
 has no distillation/RL step to recover whatever accuracy the cut costs --
 evaluate the result before shipping it, the same caution any lossy onnxsim
 pass deserves.
+
+:func:`apply_sparsegpt_pruning` is a third, more accurate way to reach an
+unstructured or N:M pattern (alongside magnitude and Wanda pruning above):
+SparseGPT (Frantar & Alistarh, 2023, "SparseGPT: Massive Language Models
+Can Be Accurately Pruned in One-Shot", https://arxiv.org/abs/2301.00774) --
+the pruning sibling of :mod:`onnxsim.gptq`, from the same authors, reusing
+the exact same machinery (:func:`onnxsim.gptq._inverse_hessian_cholesky`'s
+Cholesky-factored inverse Hessian, and the same left-to-right,
+error-propagating column processing) but pruning each column to a mask
+instead of quantizing it to a grid point. Where magnitude/Wanda pick a
+mask once from a static (weight- or weight-times-activation-) importance
+score and stop, SparseGPT computes each column's OBS-style saliency score
+``w_ij^2 / Hinv_jj^2`` from calibration data, then -- after masking a
+column -- propagates the resulting reconstruction error into every
+not-yet-processed column via the same Hessian-based correction GPTQ uses
+for quantization error, so later columns compensate for earlier ones'
+removal instead of every column being scored independently against the
+original, uncorrected weights. This reliably beats magnitude/Wanda at the
+same sparsity, at the cost of needing calibration data (there is no
+data-free variant, unlike magnitude vs. Wanda) and being noticeably more
+expensive per layer (one Cholesky factorization plus a sequential,
+Hessian-propagating pass over every column, rather than one static
+element-wise score). Ported directly from the reference implementation's
+``fasterprune`` (https://github.com/IST-DASLab/sparsegpt), including one
+behavior that's otherwise a departure from every other function in this
+module: for *unstructured* sparsity, the reference selects one threshold
+per ``proc_block_size``-wide column block, shared across every output row
+in that block, rather than :func:`apply_magnitude_pruning`/
+:func:`apply_wanda_pruning`'s per-row threshold -- faithfully reproduced
+here rather than "corrected" to match, since the point of this function is
+to reproduce SparseGPT specifically. N:M pruning is unaffected (it is
+already per-row in the reference too, and matches this module's own
+``n``/``m`` convention exactly).
 """
 
 from __future__ import annotations
@@ -117,11 +150,13 @@ from typing import Dict, List, Optional, Sequence, Set, Tuple, Union
 
 import numpy as np
 import onnx
+import onnx.helper
 import onnx.numpy_helper
 
 from onnxsim import backend
 from onnxsim.bias_correction import _add_probe_outputs
 from onnxsim.calibration import Tensors, generate_random_calibration_data
+from onnxsim.gptq import _inverse_hessian_cholesky
 from onnxsim.smoothquant import _match_matmul_like
 
 
@@ -377,6 +412,203 @@ def weight_sparsity(model: Union[str, onnx.ModelProto]) -> float:
         total += w.size
 
     return zeros / total if total else 0.0
+
+
+# --- SparseGPT ----------------------------------------------------------
+
+
+def _sparsegpt_prune_columns(
+    w_nk: np.ndarray,
+    h: np.ndarray,
+    sparsity: float,
+    n: Optional[int],
+    m: Optional[int],
+    percdamp: float,
+    proc_block_size: int,
+) -> np.ndarray:
+    """Returns SparseGPT-pruned values for ``w_nk`` ([N, K], output channel
+    first), a direct port of the reference implementation's own
+    ``fasterprune`` (https://github.com/IST-DASLab/sparsegpt/blob/master/
+    sparsegpt.py). Unlike :func:`_prune_weight`'s ``importance_of_nk``
+    callbacks, this returns fully-formed replacement values, not a mask --
+    every *kept* entry may also change, having accumulated Hessian-based
+    compensation for every *pruned* entry processed before it.
+    """
+    n_rows, k = w_nk.shape
+    diag = np.arange(k)
+    dead = h[diag, diag] == 0.0
+
+    w_work = w_nk.copy()
+    w_work[:, dead] = 0.0
+    w_pruned = np.zeros_like(w_work)
+
+    if n is None and sparsity <= 0.0:
+        return w_nk.copy()  # true no-op, rather than the reference's own
+        # "always drop the single lowest-scoring entry" edge case at
+        # sparsity == 0.0 -- matching every other apply_*_pruning function
+        # in this module, all of which treat sparsity=0.0 as a no-op.
+
+    hinv = _inverse_hessian_cholesky(h, percdamp)
+
+    for i1 in range(0, k, proc_block_size):
+        i2 = min(i1 + proc_block_size, k)
+        count = i2 - i1
+        w1 = w_work[:, i1:i2].copy()
+        err1 = np.zeros_like(w1)
+        hinv1 = hinv[i1:i2, i1:i2]
+        hinv1_diag = np.diag(hinv1)
+
+        if n is None:
+            score = np.square(w1) / np.square(hinv1_diag)[np.newaxis, :]
+            thresh = np.sort(score.reshape(-1))[int(score.size * sparsity)]
+            mask1 = score <= thresh
+        else:
+            mask1 = np.zeros_like(w1, dtype=bool)
+
+        for i in range(count):
+            if n is not None and m is not None and i % m == 0:
+                group_end = min(i + m, count)
+                group_score = (
+                    np.square(w1[:, i:group_end])
+                    / np.square(hinv1_diag[i:group_end])[np.newaxis, :]
+                )
+                prune_count = min(group_end - i, m - n)
+                mask1[:, i:group_end] = False
+                if prune_count > 0:
+                    drop_local = np.argsort(group_score, axis=1)[:, :prune_count]
+                    np.put_along_axis(mask1[:, i:group_end], drop_local, True, axis=1)
+
+            w_col = w1[:, i]
+            d = hinv1_diag[i]
+            q_col = np.where(mask1[:, i], 0.0, w_col)
+            w_pruned[:, i1 + i] = q_col
+
+            err = (w_col - q_col) / d
+            err1[:, i] = err
+            if i + 1 < count:
+                w1[:, i + 1 :] -= np.outer(err, hinv1[i, i + 1 :])
+
+        if i2 < k:
+            w_work[:, i2:] -= err1 @ hinv[i1:i2, i2:]
+
+    return w_pruned
+
+
+def apply_sparsegpt_pruning(
+    model: Union[str, onnx.ModelProto],
+    calibration_data: Optional[Sequence[Tensors]] = None,
+    num_samples: int = 8,
+    seed: int = 0,
+    sparsity: float = 0.5,
+    n: Optional[int] = None,
+    m: Optional[int] = None,
+    percdamp: float = 0.01,
+    proc_block_size: int = 128,
+    providers: Optional[Sequence[str]] = None,
+) -> onnx.ModelProto:
+    """SparseGPT (Frantar & Alistarh, 2023): zeros the least-important
+    entries of every MatMul/vanilla-Gemm layer's constant 2-D float32
+    weight, the same unstructured-or-N:M patterns
+    :func:`apply_magnitude_pruning`/:func:`apply_wanda_pruning` offer, but
+    -- unlike either -- using a sequential, Hessian-error-compensating
+    algorithm ported from GPTQ (:mod:`onnxsim.gptq`, same authors, same
+    Cholesky-factored inverse Hessian) rather than a one-shot static
+    importance score. See this module's own docstring for the technique,
+    including the one deliberate departure from every other function here:
+    for unstructured sparsity, the pruning threshold is shared across every
+    output row within each ``proc_block_size``-wide column block (the
+    reference implementation's own behavior), not chosen per row.
+
+    :param model: the original onnx ModelProto or file path
+    :param calibration_data: representative input batches to compute each
+            layer's Hessian from. Each batch is a
+            ``{input_name: np.ndarray}`` dict matching ``model``'s graph
+            inputs -- see :func:`onnxsim.generate_random_calibration_data`
+            (the default when omitted)
+    :param num_samples: random batches to generate when
+            ``calibration_data`` is omitted
+    :param seed: seed for the random calibration data (ignored if
+            ``calibration_data`` is supplied)
+    :param sparsity: target fraction of entries to zero (shared per column
+            block, not per row -- see above), ignored when ``n``/``m`` are
+            given
+    :param n: keep the ``n`` highest-importance entries per group of ``m``
+            (semi-structured N:M pruning, e.g. NVIDIA's 2:4, per-row exactly
+            as :func:`apply_magnitude_pruning`). Must be given together
+            with ``m``.
+    :param m: group size for N:M pruning; see ``n``
+    :param percdamp: Hessian damping factor (fraction of the mean diagonal
+            added to every diagonal entry before inversion), matching
+            :func:`onnxsim.apply_gptq`'s own default
+    :param proc_block_size: column-processing block size -- both the
+            lazy-update granularity (how many columns' errors accumulate
+            locally before a full cross-block update, matching
+            :func:`onnxsim.apply_gptq`'s ``proc_block_size``) and, for
+            unstructured sparsity only, the width each shared per-block
+            threshold is computed over
+    :param providers: onnxruntime execution providers to run ``model`` on
+            when capturing calibration activations
+    :returns: ``model`` with every matched layer's weight rewritten in
+            place to the target pattern -- every surviving entry may also
+            change value, having accumulated compensation for entries
+            pruned before it; a layer with no observed 2-D calibration
+            activation (dead input, or every batch's activation isn't
+            plain 2-D/higher-rank-with-a-trailing-feature-axis) is left
+            completely untouched -- unlike Wanda, there is no data-free
+            fallback for a technique whose entire mechanism is the Hessian
+    """
+    _validate_pattern(sparsity, n, m)
+    if isinstance(model, str):
+        model = onnx.load(model, load_external_data=False)
+    if calibration_data is None:
+        calibration_data = generate_random_calibration_data(
+            model, num_samples=num_samples, seed=seed
+        )
+
+    out = onnx.ModelProto()
+    out.CopyFrom(model)
+    graph = out.graph
+    initializer_map = {t.name: t for t in graph.initializer}
+
+    candidates = _candidates(graph)
+    if not candidates:
+        return out
+
+    probe_names = sorted({x_name for _, x_name, _, _ in candidates})
+    probe_model = _add_probe_outputs(out, probe_names)
+
+    activations: Dict[str, List[np.ndarray]] = {name: [] for name in probe_names}
+    for batch in calibration_data:
+        result = backend.run_model(probe_model, batch, providers=providers)
+        for name in probe_names:
+            x = np.asarray(result[name], dtype=np.float64)
+            if x.ndim < 2:
+                continue
+            activations[name].append(x.reshape(-1, x.shape[-1]))
+
+    for _, x_name, w_name, weight_transposed in candidates:
+        acts = activations[x_name]
+        if not acts:
+            continue
+        x = np.concatenate(acts, axis=0)
+
+        w_init = initializer_map[w_name]
+        w = onnx.numpy_helper.to_array(w_init).astype(np.float64)
+        dim0, dim1 = w.shape
+        w_nk = w if weight_transposed else w.T  # [N, K]
+        if x.shape[1] != w_nk.shape[1]:
+            continue
+
+        h = x.T @ x
+        w_pruned_nk = _sparsegpt_prune_columns(
+            w_nk, h, sparsity, n, m, percdamp, proc_block_size
+        )
+
+        w_new = w_pruned_nk if weight_transposed else w_pruned_nk.T
+        w_new = w_new.reshape(dim0, dim1).astype(np.float32)
+        w_init.CopyFrom(onnx.numpy_helper.from_array(w_new, name=w_init.name))
+
+    return out
 
 
 # --- Structured (channel) pruning -------------------------------------------
@@ -1232,4 +1464,498 @@ def apply_structured_wanda_pruning(
         return base * np.maximum(norm, epsilon)
 
     _apply_chains(graph, chains, sparsity, _wanda_structured_importance)
+    return out
+
+
+# --- Attention-head pruning -----------------------------------------------
+
+# The ``com.microsoft`` domain contrib op onnxsim's own `fuse_attention`
+# optimizer pass (onnxsim/passes/fuse_attention.h) fuses a decomposed
+# multi-head self-attention block into: a single merged QKV weight/bias
+# ([hidden_size, Nq+Nk+Nv] / [Nq+Nk+Nv]) plus `num_heads`/`qkv_hidden_sizes`
+# attributes. GroupQueryAttention (unequal Q/KV head counts, separate,
+# un-merged Q/K/V weights -- see fuse_gqa.h) and the plain `ai.onnx`
+# `Attention` op (opset 23+, a different schema) are both out of scope here,
+# the same kind of narrower-than-general-case boundary Conv-group pruning
+# above draws: pruning a *shared* KV head out from under some, but not all,
+# of the query heads mapped to it needs real group-aware bookkeeping this
+# function does not attempt.
+_ATTENTION_DOMAIN = "com.microsoft"
+
+
+@dataclass(frozen=True)
+class _AttentionChain:
+    node: onnx.NodeProto
+    weight: str
+    bias: Optional[str]
+    num_heads: int
+    nq: int
+    nk: int
+    nv: int
+    chain_ops: Tuple[Tuple[onnx.NodeProto, Optional[str]], ...]
+    consumer_node: onnx.NodeProto
+    consumer_weight: str
+    consumer_weight_transposed: bool
+
+
+def _match_attention_producer(
+    node: onnx.NodeProto, initializer_map: Dict[str, onnx.TensorProto]
+) -> Optional[Tuple[str, Optional[str], int, int, int, int]]:
+    """If `node` is a ``com.microsoft::Attention`` node with a constant 2-D
+    float32 merged QKV weight ``[K, Nq+Nk+Nv]`` (and, if present, a
+    constant 1-D float32 merged bias), returns
+    ``(weight_name, bias_name_or_None, num_heads, Nq, Nk, Nv)``.
+    """
+    if node.domain != _ATTENTION_DOMAIN or node.op_type != "Attention":
+        return None
+    if len(node.input) < 2:
+        return None
+    w_name = node.input[1]
+    w_init = initializer_map.get(w_name)
+    if (
+        w_init is None
+        or w_init.data_type != onnx.TensorProto.FLOAT
+        or len(w_init.dims) != 2
+    ):
+        return None
+    total_n = w_init.dims[1]
+
+    bias_name = None
+    if len(node.input) >= 3 and node.input[2]:
+        bias_name = node.input[2]
+        b_init = initializer_map.get(bias_name)
+        if (
+            b_init is None
+            or b_init.data_type != onnx.TensorProto.FLOAT
+            or list(b_init.dims) != [total_n]
+        ):
+            return None
+
+    num_heads = None
+    qkv_hidden_sizes: Optional[List[int]] = None
+    for attr in node.attribute:
+        if attr.name == "num_heads":
+            num_heads = attr.i
+        elif attr.name == "qkv_hidden_sizes":
+            qkv_hidden_sizes = list(attr.ints)
+    if not num_heads or num_heads <= 0:
+        return None
+
+    if qkv_hidden_sizes is not None:
+        if len(qkv_hidden_sizes) != 3:
+            return None
+        nq, nk, nv = qkv_hidden_sizes
+    else:
+        # Schema default: Q/K/V evenly split the merged width.
+        if total_n % 3 != 0:
+            return None
+        nq = nk = nv = total_n // 3
+    if (
+        nq <= 0
+        or nk <= 0
+        or nv <= 0
+        or nq + nk + nv != total_n
+        or nq % num_heads
+        or nk % num_heads
+        or nv % num_heads
+    ):
+        return None
+
+    return w_name, bias_name, num_heads, nq, nk, nv
+
+
+def _reshape_last_dim(
+    node: onnx.NodeProto, initializer_map: Dict[str, onnx.TensorProto]
+) -> Optional[int]:
+    """If `node` is a ``Reshape`` whose target-shape input is a constant
+    int64 tensor, returns its last entry (or ``None`` if that entry is a
+    wildcard/inferred ``-1`` or ``0``, or the shape can't be read at all).
+    """
+    if node.op_type != "Reshape" or len(node.input) != 2:
+        return None
+    shape_init = initializer_map.get(node.input[1])
+    if shape_init is None or shape_init.data_type != onnx.TensorProto.INT64:
+        return None
+    dims = onnx.numpy_helper.to_array(shape_init)
+    if dims.size == 0:
+        return None
+    last = int(dims[-1])
+    return last if last > 0 else None
+
+
+def _walk_to_attention_consumer(
+    start: str,
+    initializer_map: Dict[str, onnx.TensorProto],
+    consumers_of: Dict[str, List[onnx.NodeProto]],
+    graph_outputs: Set[str],
+    nv: int,
+) -> Tuple[Optional[_ConsumerMatch], Tuple[Tuple[onnx.NodeProto, Optional[str]], ...]]:
+    """From `Attention`'s raw (V-hidden-size-wide) output tensor `start`,
+    optionally through a single ``Reshape`` hop whose target shape's last
+    entry is provably still `nv` (the shape onnxsim's own `fuse_attention`
+    pass always appends, reusing the original ``ctx`` reshape's own target
+    -- see fuse_attention.h's own doc comment; a hand-authored or
+    differently-sourced graph is still handled the same way as long as it
+    matches this same shape), to a MatMul/vanilla-Gemm consumer (the output
+    projection) whose reduction dimension matches `nv`. Declines (``None``)
+    on anything else -- a branch, an activation, a mismatched Reshape --
+    rather than guessing. When a Reshape hop is matched, its second (shape)
+    input must be single-use too -- the caller overwrites that constant's
+    last entry to the post-pruning `nv` in place, which would corrupt any
+    other reader of the same tensor.
+    """
+    candidates = consumers_of.get(start, [])
+    if len(candidates) != 1:
+        return None, ()
+    node = candidates[0]
+    chain_ops: Tuple[Tuple[onnx.NodeProto, Optional[str]], ...] = ()
+    cur = start
+
+    if node.op_type == "Reshape" and node.input[:1] == [cur]:
+        last_dim = _reshape_last_dim(node, initializer_map)
+        if last_dim != nv:
+            return None, ()
+        shape_name = node.input[1]
+        if len(consumers_of.get(shape_name, [])) != 1:
+            return None, ()  # shared shape constant -- mutating it isn't safe
+        out_name = node.output[0]
+        if len(consumers_of.get(out_name, [])) != 1 or out_name in graph_outputs:
+            return None, ()
+        chain_ops = ((node, shape_name),)
+        cur = out_name
+        node = consumers_of[cur][0]
+
+    cm = _match_matmul_like(node)
+    if cm is None or cm[0] != cur:
+        return None, chain_ops
+    _, cw_name, c_weight_transposed = cm
+    cw_init = initializer_map.get(cw_name)
+    if (
+        cw_init is None
+        or cw_init.data_type != onnx.TensorProto.FLOAT
+        or len(cw_init.dims) != 2
+    ):
+        return None, chain_ops
+    k = cw_init.dims[1] if c_weight_transposed else cw_init.dims[0]
+    if k != nv:
+        return None, chain_ops
+    return (node, cw_name, c_weight_transposed), chain_ops
+
+
+def _find_attention_chains(graph: onnx.GraphProto) -> List[_AttentionChain]:
+    initializer_map = {t.name: t for t in graph.initializer}
+    consumers_of = _consumers_of(graph)
+    graph_outputs = {o.name for o in graph.output}
+
+    def _is_internal(name: str) -> bool:
+        return len(consumers_of.get(name, [])) == 1 and name not in graph_outputs
+
+    chains = []
+    for node in graph.node:
+        info = _match_attention_producer(node, initializer_map)
+        if info is None:
+            continue
+        w_name, bias_name, num_heads, nq, nk, nv = info
+
+        out_name = node.output[0]
+        if not _is_internal(out_name):
+            continue
+
+        consumer, chain_ops = _walk_to_attention_consumer(
+            out_name, initializer_map, consumers_of, graph_outputs, nv
+        )
+        if consumer is None:
+            continue
+
+        chains.append(
+            _AttentionChain(
+                node=node,
+                weight=w_name,
+                bias=bias_name,
+                num_heads=num_heads,
+                nq=nq,
+                nk=nk,
+                nv=nv,
+                chain_ops=chain_ops,
+                consumer_node=consumer[0],
+                consumer_weight=consumer[1],
+                consumer_weight_transposed=consumer[2],
+            )
+        )
+    return chains
+
+
+def _plain_attention_head_importance(
+    chain: _AttentionChain,
+    wq: np.ndarray,
+    wk: np.ndarray,
+    wv: np.ndarray,
+    dq: int,
+    dk: int,
+    dv: int,
+) -> np.ndarray:
+    # Combined (Frobenius-norm) importance of each head's full Q+K+V
+    # weight block -- the Li et al. filter-norm criterion this module uses
+    # everywhere else, applied to a whole head's block of columns (across
+    # every input row) at once instead of a single output channel/filter.
+    importance = np.zeros(chain.num_heads, dtype=np.float64)
+    for h in range(chain.num_heads):
+        block = np.concatenate(
+            [
+                wq[:, h * dq : (h + 1) * dq],
+                wk[:, h * dk : (h + 1) * dk],
+                wv[:, h * dv : (h + 1) * dv],
+            ],
+            axis=1,
+        )
+        importance[h] = np.linalg.norm(block)
+    return importance
+
+
+def _head_column_indices(keep_heads: np.ndarray, head_size: int) -> np.ndarray:
+    return np.concatenate(
+        [np.arange(h * head_size, (h + 1) * head_size) for h in keep_heads]
+    )
+
+
+def _apply_attention_chains(
+    graph: onnx.GraphProto,
+    chains: List[_AttentionChain],
+    sparsity: float,
+    compute_importance,
+) -> None:
+    """Shared body for :func:`apply_attention_head_pruning` and
+    :func:`apply_attention_head_wanda_pruning`, mirroring
+    :func:`_apply_chains`'s own shape (touched-role bookkeeping, keep-count
+    computation, a ``compute_importance`` callback for the ranking) but at
+    whole-head granularity: every dropped head removes a *contiguous*
+    ``head_size``-wide column block from each of Q/K/V (and the matching
+    row block from the consumer), not an arbitrary top-k column subset.
+    """
+    initializer_map = {t.name: t for t in graph.initializer}
+    producer_touched: Set[str] = set()
+    consumer_touched: Set[str] = set()
+    stale_value_info: Set[str] = set()
+
+    for chain in chains:
+        if (
+            chain.weight in producer_touched
+            or chain.consumer_weight in consumer_touched
+        ):
+            continue
+
+        h = chain.num_heads
+        keep_count = max(1, h - round(h * sparsity))
+        if keep_count >= h:
+            continue
+
+        dq, dk, dv = chain.nq // h, chain.nk // h, chain.nv // h
+        w_init = initializer_map[chain.weight]
+        w = onnx.numpy_helper.to_array(w_init).astype(np.float64)  # [K, Nq+Nk+Nv]
+        wq = w[:, : chain.nq]
+        wk = w[:, chain.nq : chain.nq + chain.nk]
+        wv = w[:, chain.nq + chain.nk :]
+
+        importance = compute_importance(chain, wq, wk, wv, dq, dk, dv)
+        keep_heads = np.sort(np.argsort(-importance)[:keep_count])
+
+        q_idx = _head_column_indices(keep_heads, dq)
+        k_idx = _head_column_indices(keep_heads, dk) + chain.nq
+        v_idx_local = _head_column_indices(keep_heads, dv)
+        v_idx = v_idx_local + chain.nq + chain.nk
+        all_idx = np.concatenate([q_idx, k_idx, v_idx])
+
+        w_arr = onnx.numpy_helper.to_array(w_init)
+        w_init.CopyFrom(
+            onnx.numpy_helper.from_array(w_arr[:, all_idx], name=w_init.name)
+        )
+        if chain.bias is not None:
+            _slice_last_axis(initializer_map[chain.bias], all_idx)
+
+        found_qkv = False
+        for attr in chain.node.attribute:
+            if attr.name == "num_heads":
+                attr.i = keep_count
+            elif attr.name == "qkv_hidden_sizes":
+                found_qkv = True
+                del attr.ints[:]
+                attr.ints.extend([keep_count * dq, keep_count * dk, keep_count * dv])
+        if not found_qkv:
+            chain.node.attribute.append(
+                onnx.helper.make_attribute(
+                    "qkv_hidden_sizes",
+                    [keep_count * dq, keep_count * dk, keep_count * dv],
+                )
+            )
+
+        _slice_consumer_weight(
+            initializer_map[chain.consumer_weight],
+            chain.consumer_weight_transposed,
+            v_idx_local,
+        )
+
+        for _, shape_name in chain.chain_ops:
+            if shape_name is not None:
+                shape_init = initializer_map[shape_name]
+                dims = onnx.numpy_helper.to_array(shape_init).copy()
+                dims[-1] = keep_count * dv
+                shape_init.CopyFrom(
+                    onnx.numpy_helper.from_array(dims, name=shape_init.name)
+                )
+
+        producer_touched.add(chain.weight)
+        consumer_touched.add(chain.consumer_weight)
+        stale_value_info.add(chain.node.output[0])
+        stale_value_info.update(op.output[0] for op, _ in chain.chain_ops)
+
+    if stale_value_info:
+        kept = [vi for vi in graph.value_info if vi.name not in stale_value_info]
+        del graph.value_info[:]
+        graph.value_info.extend(kept)
+
+
+def apply_attention_head_pruning(
+    model: Union[str, onnx.ModelProto],
+    sparsity: float = 0.5,
+) -> onnx.ModelProto:
+    """Removes whole attention heads from every ``com.microsoft::Attention``
+    node (the fused multi-head self-attention block onnxsim's own
+    ``fuse_attention`` optimizer pass produces, see this module's own
+    docstring) whose output feeds, optionally through a single shape-
+    preserving ``Reshape``, exactly one downstream MatMul/vanilla-Gemm's
+    reduction dimension (the output projection) -- the attention analogue
+    of :func:`apply_structured_pruning`, at head instead of single-channel
+    granularity.
+
+    For each matched block: ranks every head by the combined Frobenius
+    norm of its own ``[hidden_size, head_size]`` Q, K, and V weight
+    columns, drops the lowest-``sparsity``-fraction of heads (at least one
+    head is always kept), and removes the corresponding column blocks from
+    the merged QKV weight (and bias, if present), decrementing
+    ``num_heads``/``qkv_hidden_sizes`` accordingly, and the matching row
+    block from the output projection's weight -- mathematically unaffected
+    for every surviving head, the same guarantee
+    :func:`apply_structured_pruning` gives per channel.
+
+    :param model: the original onnx ModelProto or file path
+    :param sparsity: target fraction of each matched block's heads to
+            remove (at least one head is always kept)
+    :returns: ``model`` with every matched block's tensors resized in
+            place; anything not matching that exact topology (a
+            non-constant weight, GroupQueryAttention's separate-weights
+            shape, a consumer whose reduction dimension doesn't line up,
+            ...) is left completely untouched
+    """
+    if not (0.0 <= sparsity < 1.0):
+        raise ValueError(f"sparsity must be in [0, 1), got {sparsity}")
+    if isinstance(model, str):
+        model = onnx.load(model, load_external_data=False)
+
+    out = onnx.ModelProto()
+    out.CopyFrom(model)
+    graph = out.graph
+
+    chains = _find_attention_chains(graph)
+    if chains:
+        _apply_attention_chains(
+            graph, chains, sparsity, _plain_attention_head_importance
+        )
+
+    return out
+
+
+def apply_attention_head_wanda_pruning(
+    model: Union[str, onnx.ModelProto],
+    calibration_data: Optional[Sequence[Tensors]] = None,
+    num_samples: int = 8,
+    seed: int = 0,
+    sparsity: float = 0.5,
+    epsilon: float = 1e-8,
+    providers: Optional[Sequence[str]] = None,
+) -> onnx.ModelProto:
+    """The calibrated upgrade of :func:`apply_attention_head_pruning`,
+    exactly as :func:`apply_structured_wanda_pruning` is to
+    :func:`apply_structured_pruning`: same real head removal, same
+    topology matching, but each head's importance is
+    ``||W_head||_F * ||X_head||_2`` -- the plain Frobenius-norm score times
+    the combined (root-sum-square) activation norm of that head's own
+    slice of the *output projection's* input, captured over calibration
+    data -- instead of weight magnitude alone.
+
+    :param model: the original onnx ModelProto or file path
+    :param calibration_data: representative input batches to measure each
+            block's output-projection-side activation norm on. Each batch
+            is a ``{input_name: np.ndarray}`` dict matching ``model``'s
+            graph inputs -- see
+            :func:`onnxsim.generate_random_calibration_data` (the default
+            when omitted)
+    :param num_samples: random batches to generate when
+            ``calibration_data`` is omitted
+    :param seed: seed for the random calibration data (ignored if
+            ``calibration_data`` is supplied)
+    :param sparsity: target fraction of each matched block's heads to
+            remove (at least one head is always kept)
+    :param epsilon: floor applied to the accumulated per-head activation
+            norm, avoiding every head of an all-zero activation tying at
+            exactly the weight-only importance
+    :param providers: onnxruntime execution providers to run ``model`` on
+            when capturing calibration activations
+    :returns: ``model`` with every matched block's tensors resized in
+            place; anything not matching that exact topology falls back to
+            :func:`apply_attention_head_pruning`'s plain Frobenius-norm
+            ranking if no matching activation was ever observed for that
+            block's consumer
+    """
+    if not (0.0 <= sparsity < 1.0):
+        raise ValueError(f"sparsity must be in [0, 1), got {sparsity}")
+    if isinstance(model, str):
+        model = onnx.load(model, load_external_data=False)
+    if calibration_data is None:
+        calibration_data = generate_random_calibration_data(
+            model, num_samples=num_samples, seed=seed
+        )
+
+    out = onnx.ModelProto()
+    out.CopyFrom(model)
+    graph = out.graph
+
+    chains = _find_attention_chains(graph)
+    if not chains:
+        return out
+
+    probe_names = sorted({chain.consumer_node.input[0] for chain in chains})
+    probe_model = _add_probe_outputs(out, probe_names)
+
+    sq_sum: Dict[str, np.ndarray] = {}
+    count: Dict[str, int] = {}
+    for batch in calibration_data:
+        result = backend.run_model(probe_model, batch, providers=providers)
+        for name in probe_names:
+            x = np.asarray(result[name], dtype=np.float64)
+            if x.ndim < 1:
+                continue
+            reduce_axes = tuple(range(x.ndim - 1))
+            s = np.square(x).sum(axis=reduce_axes) if reduce_axes else np.square(x)
+            cnt = int(np.prod(x.shape[:-1], dtype=np.int64)) if x.ndim > 1 else 1
+            sq_sum[name] = s if name not in sq_sum else sq_sum[name] + s
+            count[name] = count.get(name, 0) + cnt
+
+    act_norm: Dict[str, np.ndarray] = {
+        name: np.sqrt(s / max(count[name], 1)) for name, s in sq_sum.items()
+    }
+
+    def _wanda_attention_head_importance(chain, wq, wk, wv, dq, dk, dv):
+        base = _plain_attention_head_importance(chain, wq, wk, wv, dq, dk, dv)
+        norm = act_norm.get(chain.consumer_node.input[0])
+        if norm is None or norm.shape[0] != chain.nv:
+            return base  # no matching activation observed -- fall back to plain
+        act_head = np.array(
+            [
+                np.linalg.norm(norm[h * dv : (h + 1) * dv])
+                for h in range(chain.num_heads)
+            ]
+        )
+        return base * np.maximum(act_head, epsilon)
+
+    _apply_attention_chains(graph, chains, sparsity, _wanda_attention_head_importance)
     return out
