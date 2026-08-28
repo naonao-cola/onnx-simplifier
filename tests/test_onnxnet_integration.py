@@ -25,17 +25,28 @@ still has the shape that pipeline assumes.
 
 import numpy as np
 import onnx
-from onnx import TensorProto, helper, numpy_helper
+import onnx.numpy_helper
+from onnx import parser
 
 import onnxsim
 
 
-def _vi(name, shape):
-    return helper.make_tensor_value_info(name, TensorProto.FLOAT, shape)
+def _model(body, initializer=(), opset=13, ir_version=10):
+    model = parser.parse_model(
+        f"""
+        <
+          ir_version: {ir_version},
+          opset_import: ["": {opset}]
+        >
+        {body}
+        """
+    )
+    model.graph.initializer.extend(initializer)
+    return model
 
 
 def _f32(array, name):
-    return numpy_helper.from_array(array.astype(np.float32), name)
+    return onnx.numpy_helper.from_array(array.astype(np.float32), name)
 
 
 def _build_mlp_with_scaffolding():
@@ -50,24 +61,20 @@ def _build_mlp_with_scaffolding():
     w2 = _f32(rng.randn(8, 8), "W2")
     b2 = _f32(rng.randn(8), "B2")
 
-    nodes = [
-        helper.make_node("Identity", ["X"], ["x_id"]),
-        helper.make_node("MatMul", ["x_id", "W1"], ["mm1"]),
-        helper.make_node("Add", ["mm1", "B1"], ["lin1"]),
-        helper.make_node("Relu", ["lin1"], ["act1"]),
-        helper.make_node("Identity", ["act1"], ["act1_id"]),
-        helper.make_node("MatMul", ["act1_id", "W2"], ["mm2"]),
-        helper.make_node("Add", ["mm2", "B2"], ["Y"]),
-    ]
-    graph = helper.make_graph(
-        nodes,
-        "mlp_with_scaffolding",
-        [_vi("X", [4, 16])],
-        [_vi("Y", [4, 8])],
-        [w1, b1, w2, b2],
-    )
-    model = helper.make_model(
-        graph, opset_imports=[helper.make_opsetid("", 13)], ir_version=10
+    model = _model(
+        """
+        mlp_with_scaffolding (float[4,16] X) => (float[4,8] Y)
+        {
+          x_id = Identity(X)
+          mm1 = MatMul(x_id, W1)
+          lin1 = Add(mm1, B1)
+          act1 = Relu(lin1)
+          act1_id = Identity(act1)
+          mm2 = MatMul(act1_id, W2)
+          Y = Add(mm2, B2)
+        }
+        """,
+        initializer=[w1, b1, w2, b2],
     )
     onnx.checker.check_model(model)
     return model
