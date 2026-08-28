@@ -18,15 +18,18 @@ from onnx import parser
 import onnxsim
 
 
-def _model(nodes, inputs, outputs, initializer, opset=18):
-    graph = onnx.helper.make_graph(nodes, "g", inputs, outputs, initializer)
-    return onnx.helper.make_model(
-        graph, opset_imports=[onnx.helper.make_opsetid("", opset)], ir_version=10
+def _model(body, initializer=(), opset=18):
+    model = parser.parse_model(
+        f"""
+        <
+          ir_version: 10,
+          opset_import: ["": {opset}]
+        >
+        {body}
+        """
     )
-
-
-def _vi(name, shape):
-    return onnx.helper.make_tensor_value_info(name, onnx.TensorProto.FLOAT, shape)
+    model.graph.initializer.extend(initializer)
+    return model
 
 
 def _f32(array, name):
@@ -39,13 +42,17 @@ def _op_types(model):
 
 def _matmul_add_model(swap_add_operands=False):
     """x @ W + B, i.e. a MatMul feeding an Add -- the classic Gemm fusion."""
-    add_inputs = ["B", "mm"] if swap_add_operands else ["mm", "B"]
-    nodes = [
-        onnx.helper.make_node("MatMul", ["x", "W"], ["mm"], name="mm"),
-        onnx.helper.make_node("Add", add_inputs, ["y"], name="add"),
-    ]
-    inits = [_f32(np.random.randn(4, 5), "W"), _f32(np.random.randn(5), "B")]
-    return _model(nodes, [_vi("x", [3, 4])], [_vi("y", [3, 5])], inits)
+    add_body = "y = Add(B, mm)" if swap_add_operands else "y = Add(mm, B)"
+    return _model(
+        f"""
+        g (float[3,4] x) => (float[3,5] y)
+        {{
+          mm = MatMul(x, W)
+          {add_body}
+        }}
+        """,
+        initializer=[_f32(np.random.randn(4, 5), "W"), _f32(np.random.randn(5), "B")],
+    )
 
 
 # The canonical rule: y = MatMul(x, w) + b  ==>  y = Gemm(x, w, b).
@@ -117,13 +124,13 @@ leaky (x) => (y)
 """
     )
     model = _model(
-        [
-            onnx.helper.make_node("Relu", ["x"], ["t"], name="relu"),
-            onnx.helper.make_node("LeakyRelu", ["t"], ["y"], alpha=0.2, name="lr"),
-        ],
-        [_vi("x", [2, 2])],
-        [_vi("y", [2, 2])],
-        [],
+        """
+        g (float[2,2] x) => (float[2,2] y)
+        {
+          t = Relu(x)
+          y = LeakyRelu<alpha = 0.2>(t)
+        }
+        """
     )
     sim_model, _ = onnxsim.simplify(
         model, check_n=0, function_rewrite_rules=[(pattern, replacement)]
@@ -139,6 +146,11 @@ def test_function_rewriter_constant_value_match():
     """A pattern ``Constant`` matches a host initializer with a byte-equal
     tensor: ``Mul(x, ones)`` rewrites to ``Identity(x)``."""
     ones = np.ones([4], dtype=np.float32)
+    # The matched host initializer ("ones" below) is serialized as raw_data by
+    # numpy_helper.from_array; the parser instead encodes tensor literals as
+    # float_data. The matcher this test exercises compares tensor bytes
+    # directly, so the pattern's Constant must use the same raw_data encoding
+    # -- onnx.helper.make_function is used here, not the text parser.
     pattern = onnx.helper.make_function(
         "com.onnxsim.test",
         "mul_ones",
@@ -152,19 +164,23 @@ def test_function_rewriter_constant_value_match():
         ],
         [onnx.helper.make_opsetid("", 18)],
     )
-    replacement = onnx.helper.make_function(
-        "com.onnxsim.test",
-        "identity",
-        ["x"],
-        ["y"],
-        [onnx.helper.make_node("Identity", ["x"], ["y"])],
-        [onnx.helper.make_opsetid("", 18)],
+    replacement = parser.parse_function(
+        """
+<domain: "com.onnxsim.test", opset_import: ["" : 18]>
+identity (x) => (y)
+{
+    y = Identity(x)
+}
+"""
     )
     model = _model(
-        [onnx.helper.make_node("Mul", ["x", "ones"], ["y"], name="mul")],
-        [_vi("x", [4])],
-        [_vi("y", [4])],
-        [onnx.numpy_helper.from_array(ones, "ones")],
+        """
+        g (float[4] x) => (float[4] y)
+        {
+          y = Mul(x, ones)
+        }
+        """,
+        initializer=[onnx.numpy_helper.from_array(ones, "ones")],
     )
     sim_model, _ = onnxsim.simplify(
         model, check_n=0, function_rewrite_rules=[(pattern, replacement)]
@@ -176,10 +192,13 @@ def test_function_rewriter_constant_value_match():
 def test_function_rewriter_no_match_is_noop():
     """A rule whose pattern never matches leaves the model's ops unchanged."""
     model = _model(
-        [onnx.helper.make_node("MatMul", ["x", "W"], ["y"], name="mm")],
-        [_vi("x", [3, 4])],
-        [_vi("y", [3, 5])],
-        [_f32(np.random.randn(4, 5), "W")],
+        """
+        g (float[3,4] x) => (float[3,5] y)
+        {
+          y = MatMul(x, W)
+        }
+        """,
+        initializer=[_f32(np.random.randn(4, 5), "W")],
     )
     baseline, _ = onnxsim.simplify(model, check_n=0)
     sim_model, _ = onnxsim.simplify(
@@ -193,14 +212,16 @@ def test_function_rewriter_safety_shared_intermediate():
     """The matched interior value (the MatMul output) is also consumed by a Relu
     outside the match, so fusing would break the Relu -- the rewrite must be
     skipped and MatMul/Add kept."""
-    nodes = [
-        onnx.helper.make_node("MatMul", ["x", "W"], ["mm"], name="mm"),
-        onnx.helper.make_node("Add", ["mm", "B"], ["y"], name="add"),
-        onnx.helper.make_node("Relu", ["mm"], ["z"], name="relu"),
-    ]
-    inits = [_f32(np.random.randn(4, 5), "W"), _f32(np.random.randn(5), "B")]
     model = _model(
-        nodes, [_vi("x", [3, 4])], [_vi("y", [3, 5]), _vi("z", [3, 5])], inits
+        """
+        g (float[3,4] x) => (float[3,5] y, float[3,5] z)
+        {
+          mm = MatMul(x, W)
+          y = Add(mm, B)
+          z = Relu(mm)
+        }
+        """,
+        initializer=[_f32(np.random.randn(4, 5), "W"), _f32(np.random.randn(5), "B")],
     )
     sim_model, _ = onnxsim.simplify(
         model, check_n=0, function_rewrite_rules=[(_GEMM_PATTERN, _GEMM_REPLACEMENT)]
@@ -254,18 +275,25 @@ def test_function_rewriter_batches_independent_matches():
     time, so this also exercises that every block gets a distinct fresh
     interior-name prefix instead of colliding."""
     n = 5
-    nodes = []
     inputs = []
-    inits = []
     outputs = []
+    inits = []
+    body = ""
     for i in range(n):
         x, w, b, y = f"x{i}", f"w{i}", f"b{i}", f"y{i}"
-        nodes.append(onnx.helper.make_node("MatMul", [x, w], [f"mm{i}"], name=f"mm{i}"))
-        nodes.append(onnx.helper.make_node("Add", [f"mm{i}", b], [y], name=f"add{i}"))
-        inputs.append(_vi(x, [3, 4]))
+        inputs.append(f"float[3,4] {x}")
+        outputs.append(f"float[3,5] {y}")
         inits += [_f32(np.random.randn(4, 5), w), _f32(np.random.randn(5), b)]
-        outputs.append(_vi(y, [3, 5]))
-    model = _model(nodes, inputs, outputs, inits)
+        body += f"mm{i} = MatMul({x}, {w})\n{y} = Add(mm{i}, {b})\n"
+    model = _model(
+        f"""
+        g ({", ".join(inputs)}) => ({", ".join(outputs)})
+        {{
+          {body}
+        }}
+        """,
+        initializer=inits,
+    )
 
     sim_model, check_ok = onnxsim.simplify(
         model,
@@ -317,20 +345,19 @@ def test_function_rewriter_overlapping_candidates_resolved_across_rounds():
     Here the second candidate becomes permanently unmatchable once the first
     is applied (its predecessor becomes ``MyOpFused``, a different op), so the
     correct fixed point is exactly one fusion, not two and not zero."""
-    domain = "com.onnxsim.test"
-    n1 = onnx.helper.make_node("MyOp", ["x"], ["v1"], name="n1", domain=domain)
-    n2 = onnx.helper.make_node("MyOp", ["v1"], ["v2"], name="n2", domain=domain)
-    n3 = onnx.helper.make_node("MyOp", ["v2"], ["v3"], name="n3", domain=domain)
-    graph = onnx.helper.make_graph(
-        [n1, n2, n3], "g", [_vi("x", [4])], [_vi("v3", [4])], []
-    )
-    model = onnx.helper.make_model(
-        graph,
-        opset_imports=[
-            onnx.helper.make_opsetid("", 18),
-            onnx.helper.make_opsetid(domain, 1),
-        ],
-        ir_version=10,
+    model = parser.parse_model(
+        """
+        <
+          ir_version: 10,
+          opset_import: ["": 18, "com.onnxsim.test": 1]
+        >
+        g (float[4] x) => (float[4] v3)
+        {
+          v1 = com.onnxsim.test.MyOp(x)
+          v2 = com.onnxsim.test.MyOp(v1)
+          v3 = com.onnxsim.test.MyOp(v2)
+        }
+        """
     )
     onnx.checker.check_model(model)
 
