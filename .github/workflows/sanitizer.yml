@@ -1,11 +1,27 @@
 name: Build and Test with sanitizers
 
+# This job's whole point is catching memory-safety/alignment bugs in onnxsim's
+# C++ core (and the onnx/onnx-optimizer/protobuf tree it links), so restrict
+# it to changes that can actually affect that: no point re-running an
+# instrumented ~native build for a Python-only change.
 on:
   push:
     branches:
       - main
       - master
+    paths: &sanitizer-paths
+      - "onnxsim/**"
+      - "!onnxsim/**/*.py"
+      - "CMakeLists.txt"
+      - "cmake/**"
+      - "third_party/**"
+      - "setup.py"
+      - "pyproject.toml"
+      - ".gitmodules"
+      - "scripts/leak.txt"
+      - ".github/workflows/sanitizer.yml"
   pull_request:
+    paths: *sanitizer-paths
   workflow_dispatch:
 
 concurrency:
