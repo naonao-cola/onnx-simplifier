@@ -8,28 +8,31 @@ instead of rounding independently.
 
 import numpy as np
 import onnx
-import onnx.helper
 import onnx.numpy_helper
 import pytest
+from onnx import parser
 
 import onnxsim
 
 ort = pytest.importorskip("onnxruntime")
 
 
-def _vi(name, shape):
-    return onnx.helper.make_tensor_value_info(name, onnx.TensorProto.FLOAT, shape)
+def _model(body, initializer=(), opset=21, ir_version=10):
+    model = parser.parse_model(
+        f"""
+        <
+          ir_version: {ir_version},
+          opset_import: ["": {opset}]
+        >
+        {body}
+        """
+    )
+    model.graph.initializer.extend(initializer)
+    return model
 
 
 def _f32(array, name):
     return onnx.numpy_helper.from_array(array.astype(np.float32), name)
-
-
-def _model(nodes, inputs, outputs, initializer, opset=21):
-    graph = onnx.helper.make_graph(nodes, "g", inputs, outputs, initializer)
-    return onnx.helper.make_model(
-        graph, opset_imports=[onnx.helper.make_opsetid("", opset)], ir_version=10
-    )
 
 
 def _run(model, feeds):
@@ -48,9 +51,14 @@ def _rel_l2(a, b):
 def _matmul_model(K=64, N=16, seed=0):
     rng = np.random.default_rng(seed)
     weight = rng.standard_normal((K, N)).astype(np.float32) * 0.5
-    nodes = [onnx.helper.make_node("MatMul", ["X", "W"], ["Y"])]
     return _model(
-        nodes, [_vi("X", ["batch", K])], [_vi("Y", ["batch", N])], [_f32(weight, "W")]
+        f"""
+        g (float[batch,{K}] X) => (float[batch,{N}] Y)
+        {{
+          Y = MatMul(X, W)
+        }}
+        """,
+        [_f32(weight, "W")],
     )
 
 
@@ -190,9 +198,14 @@ def test_gptq_gemm_transb_with_small_processing_block():
     rng = np.random.default_rng(8)
     K, N = 96, 12
     weight = rng.standard_normal((N, K)).astype(np.float32) * 0.5
-    nodes = [onnx.helper.make_node("Gemm", ["X", "W"], ["Y"], transB=1)]
     model = _model(
-        nodes, [_vi("X", ["batch", K])], [_vi("Y", ["batch", N])], [_f32(weight, "W")]
+        f"""
+        g (float[batch,{K}] X) => (float[batch,{N}] Y)
+        {{
+          Y = Gemm<transB = 1>(X, W)
+        }}
+        """,
+        [_f32(weight, "W")],
     )
     quant = onnxsim.quantize_weight_only_int4(model)
     onnx.checker.check_model(quant)
@@ -227,8 +240,14 @@ def test_gptq_handles_dead_input_channel():
 
 
 def test_gptq_noop_when_no_int4_matmul_present():
-    nodes = [onnx.helper.make_node("Relu", ["X"], ["Y"])]
-    model = _model(nodes, [_vi("X", [4, 4])], [_vi("Y", [4, 4])], [])
+    model = _model(
+        """
+        g (float[4,4] X) => (float[4,4] Y)
+        {
+          Y = Relu(X)
+        }
+        """
+    )
     result = onnxsim.apply_gptq(
         model, model, calibration_data=[{"X": np.zeros((4, 4), dtype=np.float32)}]
     )
