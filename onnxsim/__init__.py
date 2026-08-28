@@ -31,6 +31,7 @@ from onnxsim.calibration import (
     quantize_static_int16,
 )
 from onnxsim.double_quantization import apply_double_quantization
+from onnxsim.duquant import apply_duquant
 from onnxsim.embedding_quantization import (
     quantize_embedding_binary,
     quantize_embedding_int8,
@@ -118,6 +119,7 @@ __all__ = [
     "apply_low_rank_compensation",
     "apply_quip_sharp",
     "apply_quarot",
+    "apply_duquant",
     "apply_spinquant",
     "apply_omniquant",
     "apply_magnitude_pruning",
