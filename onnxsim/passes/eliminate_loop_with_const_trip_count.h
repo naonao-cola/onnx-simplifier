@@ -257,7 +257,8 @@ struct EliminateLoopWithConstTripCount final : public PredicateBasedPass {
               // verbatim would add several distinctly-owned initializers
               // under the same name to parent_graph, one per iteration.
               Tensor initializer_parent_graph = initializer_subgraph;
-              initializer_parent_graph.setName(parent_graph.getNextUniqueName());
+              initializer_parent_graph.setName(
+                  parent_graph.getNextUniqueName());
               new_node->addInput(parent_graph.addInitializerAndCreateValue(
                   initializer_parent_graph));
             } else {
