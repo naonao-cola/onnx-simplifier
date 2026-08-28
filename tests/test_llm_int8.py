@@ -8,40 +8,45 @@ scale and an offline per-output-channel weight scale).
 
 import numpy as np
 import onnx
-import onnx.helper
 import onnx.numpy_helper
 import pytest
+from onnx import parser
 
 import onnxsim
 
 ort = pytest.importorskip("onnxruntime")
 
 
-def _vi(name, shape):
-    return onnx.helper.make_tensor_value_info(name, onnx.TensorProto.FLOAT, shape)
-
-
 def _f32(array, name):
     return onnx.numpy_helper.from_array(array.astype(np.float32), name)
 
 
-def _model(nodes, inputs, outputs, initializer, opset=18):
-    graph = onnx.helper.make_graph(nodes, "g", inputs, outputs, initializer)
-    return onnx.helper.make_model(
-        graph, opset_imports=[onnx.helper.make_opsetid("", opset)], ir_version=9
+def _model(body, initializer=(), opset=18, ir_version=9):
+    model = parser.parse_model(
+        f"""
+        <
+          ir_version: {ir_version},
+          opset_import: ["": {opset}]
+        >
+        {body}
+        """
     )
+    model.graph.initializer.extend(initializer)
+    return model
 
 
 def _matmul_model(K=64, N=16, weight=None, seed=0, opset=18):
     if weight is None:
         rng = np.random.default_rng(seed)
         weight = rng.standard_normal((K, N)).astype(np.float32) * 0.5
-    nodes = [onnx.helper.make_node("MatMul", ["X", "W"], ["Y"])]
     return _model(
-        nodes,
-        [_vi("X", ["batch", K])],
-        [_vi("Y", ["batch", N])],
-        [_f32(weight, "W")],
+        f"""
+        g (float[batch,{K}] X) => (float[batch,{N}] Y)
+        {{
+          Y = MatMul(X, W)
+        }}
+        """,
+        initializer=[_f32(weight, "W")],
         opset=opset,
     )
 
@@ -99,16 +104,16 @@ def test_llm_int8_output_name_and_node_count_unchanged_elsewhere():
     K, N = 32, 8
     rng = np.random.default_rng(2)
     weight = rng.standard_normal((K, N)).astype(np.float32) * 0.5
-    nodes = [
-        onnx.helper.make_node("Relu", ["X0"], ["X"]),
-        onnx.helper.make_node("MatMul", ["X", "W"], ["Y0"]),
-        onnx.helper.make_node("Relu", ["Y0"], ["Y"]),
-    ]
     model = _model(
-        nodes,
-        [_vi("X0", ["batch", K])],
-        [_vi("Y", ["batch", N])],
-        [_f32(weight, "W")],
+        f"""
+        g (float[batch,{K}] X0) => (float[batch,{N}] Y)
+        {{
+          X = Relu(X0)
+          Y0 = MatMul(X, W)
+          Y = Relu(Y0)
+        }}
+        """,
+        initializer=[_f32(weight, "W")],
     )
     x0 = _outlier_channel_calibration(
         K=K, num_samples=32, outlier_channels=(5,), seed=3
@@ -129,12 +134,14 @@ def test_llm_int8_gemm_with_bias():
     K, N = 48, 12
     weight = rng.standard_normal((K, N)).astype(np.float32) * 0.5
     bias = rng.standard_normal(N).astype(np.float32)
-    nodes = [onnx.helper.make_node("Gemm", ["X", "W", "B"], ["Y"])]
     model = _model(
-        nodes,
-        [_vi("X", ["batch", K])],
-        [_vi("Y", ["batch", N])],
-        [_f32(weight, "W"), _f32(bias, "B")],
+        f"""
+        g (float[batch,{K}] X) => (float[batch,{N}] Y)
+        {{
+          Y = Gemm(X, W, B)
+        }}
+        """,
+        initializer=[_f32(weight, "W"), _f32(bias, "B")],
     )
     x = _outlier_channel_calibration(
         K=K, num_samples=32, outlier_channels=(2, 30), seed=5
@@ -153,9 +160,14 @@ def test_llm_int8_gemm_transb():
     rng = np.random.default_rng(6)
     K, N = 80, 10
     weight = rng.standard_normal((N, K)).astype(np.float32) * 0.5
-    nodes = [onnx.helper.make_node("Gemm", ["X", "W"], ["Y"], transB=1)]
     model = _model(
-        nodes, [_vi("X", ["batch", K])], [_vi("Y", ["batch", N])], [_f32(weight, "W")]
+        f"""
+        g (float[batch,{K}] X) => (float[batch,{N}] Y)
+        {{
+          Y = Gemm<transB = 1>(X, W)
+        }}
+        """,
+        initializer=[_f32(weight, "W")],
     )
     x = _outlier_channel_calibration(
         K=K, num_samples=32, outlier_channels=(15, 60), seed=7
@@ -193,8 +205,14 @@ def test_llm_int8_noop_when_every_channel_is_an_outlier():
 
 
 def test_llm_int8_noop_when_no_matmul_present():
-    nodes = [onnx.helper.make_node("Relu", ["X"], ["Y"])]
-    model = _model(nodes, [_vi("X", [4, 4])], [_vi("Y", [4, 4])], [])
+    model = _model(
+        """
+        g (float[4,4] X) => (float[4,4] Y)
+        {
+          Y = Relu(X)
+        }
+        """
+    )
     result = onnxsim.apply_llm_int8(
         model, calibration_data=[{"X": np.zeros((4, 4), dtype=np.float32)}]
     )
@@ -212,9 +230,13 @@ def test_llm_int8_noop_on_old_opset():
 
 
 def test_llm_int8_skips_non_constant_weight():
-    nodes = [onnx.helper.make_node("MatMul", ["X", "W"], ["Y"])]
     model = _model(
-        nodes, [_vi("X", [4, 64]), _vi("W", [64, 4])], [_vi("Y", [4, 4])], []
+        """
+        g (float[4,64] X, float[64,4] W) => (float[4,4] Y)
+        {
+          Y = MatMul(X, W)
+        }
+        """
     )
     result = onnxsim.apply_llm_int8(
         model, calibration_data=[{"X": np.zeros((4, 64), dtype=np.float32)}]
