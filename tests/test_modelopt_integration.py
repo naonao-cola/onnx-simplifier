@@ -21,8 +21,9 @@ runs these tests; the regular build-and-test matrix skips them.
 
 import numpy as np
 import onnx
+import onnx.numpy_helper
 import pytest
-from onnx import TensorProto, helper
+from onnx import TensorProto, parser
 
 # Skip the entire module unless NVIDIA ModelOpt's ONNX quantization is available.
 # Checked before importing onnxsim so a ModelOpt-less run skips cleanly.
@@ -32,6 +33,20 @@ moq = pytest.importorskip(
 )
 
 import onnxsim  # noqa: E402  (imported after the ModelOpt availability check)
+
+
+def _model(body, initializer=(), opset=21, ir_version=10):
+    model = parser.parse_model(
+        f"""
+        <
+          ir_version: {ir_version},
+          opset_import: ["": {opset}]
+        >
+        {body}
+        """
+    )
+    model.graph.initializer.extend(initializer)
+    return model
 
 
 def _build_fp32_model(path: str) -> None:
@@ -46,36 +61,25 @@ def _build_fp32_model(path: str) -> None:
     32-channel Conv and 32x32 MatMul below are deliberately above those floors.
     """
     rng = np.random.RandomState(0)
-    conv_w = helper.make_tensor(
-        "conv_w",
-        TensorProto.FLOAT,
-        [32, 32, 3, 3],
-        rng.randn(32 * 32 * 3 * 3).astype(np.float32).tolist(),
+    # Random/large weight arrays: kept as numpy-built initializers per the
+    # established convention rather than spelled out as text literals.
+    conv_w = onnx.numpy_helper.from_array(
+        rng.randn(32, 32, 3, 3).astype(np.float32), "conv_w"
     )
-    mm_w = helper.make_tensor(
-        "mm_w",
-        TensorProto.FLOAT,
-        [32, 32],
-        rng.randn(32 * 32).astype(np.float32).tolist(),
-    )
-    nodes = [
-        helper.make_node(
-            "Conv", ["X", "conv_w"], ["c"], kernel_shape=[3, 3], pads=[1, 1, 1, 1]
-        ),
-        helper.make_node("Relu", ["c"], ["r"]),
-        helper.make_node("GlobalAveragePool", ["r"], ["p"]),
-        helper.make_node("Flatten", ["p"], ["f"], axis=1),
-        helper.make_node("MatMul", ["f", "mm_w"], ["Y"]),
-    ]
-    graph = helper.make_graph(
-        nodes,
-        "modelopt_src",
-        [helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, 32, 8, 8])],
-        [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, 32])],
+    mm_w = onnx.numpy_helper.from_array(rng.randn(32, 32).astype(np.float32), "mm_w")
+    model = _model(
+        """
+        modelopt_src (float[1,32,8,8] X) => (float[1,32] Y)
+        {
+          c = Conv<kernel_shape=[3,3], pads=[1,1,1,1]>(X, conv_w)
+          r = Relu(c)
+          p = GlobalAveragePool(r)
+          f = Flatten<axis=1>(p)
+          Y = MatMul(f, mm_w)
+        }
+        """,
         [conv_w, mm_w],
     )
-    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 21)])
-    model.ir_version = 10
     onnx.checker.check_model(model)
     onnx.save(model, path)
 
