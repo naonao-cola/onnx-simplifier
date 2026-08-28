@@ -4,34 +4,51 @@ pinning added for models like VOICEVOX's predict_sing_f0.onnx (see below).
 
 import numpy as np
 import onnx
-from onnx import TensorProto, helper
+from onnx import parser
 
 from onnxsim import model_checking
 from onnxsim.model_checking import compare
 
 
+def _model(body, opset=17, ir_version=10):
+    # Pin ir_version: the installed onnx package's default IR version can be
+    # newer than the onnxruntime build available in some CI jobs supports
+    # (matches test_backend.py's _make_foldable_model).
+    return parser.parse_model(
+        f"""
+        <
+          ir_version: {ir_version},
+          opset_import: ["": {opset}]
+        >
+        {body}
+        """
+    )
+
+
 def _random_normal_like_model(with_seed: bool = False) -> onnx.ModelProto:
-    x = helper.make_tensor_value_info("x", TensorProto.FLOAT, [1])
-    y = helper.make_tensor_value_info("y", TensorProto.FLOAT, [1])
-    attrs = {"seed": 1.0} if with_seed else {}
-    node = helper.make_node("RandomNormalLike", ["x"], ["y"], **attrs)
-    graph = helper.make_graph([node], "g", [x], [y])
-    # Pin ir_version: helper.make_model() otherwise defaults to the installed
-    # onnx package's current IR version, which can be newer than the
-    # onnxruntime build available in some CI jobs supports (matches
-    # test_backend.py's _make_foldable_model).
-    return helper.make_model(
-        graph, opset_imports=[helper.make_opsetid("", 17)], ir_version=10
+    node = (
+        "y = RandomNormalLike<seed = 1.0>(x)"
+        if with_seed
+        else "y = RandomNormalLike(x)"
+    )
+    return _model(
+        f"""
+        g (float[1] x) => (float[1] y)
+        {{
+          {node}
+        }}
+        """
     )
 
 
 def _plain_model() -> onnx.ModelProto:
-    x = helper.make_tensor_value_info("x", TensorProto.FLOAT, [1])
-    y = helper.make_tensor_value_info("y", TensorProto.FLOAT, [1])
-    node = helper.make_node("Identity", ["x"], ["y"])
-    graph = helper.make_graph([node], "g", [x], [y])
-    return helper.make_model(
-        graph, opset_imports=[helper.make_opsetid("", 17)], ir_version=10
+    return _model(
+        """
+        g (float[1] x) => (float[1] y)
+        {
+          y = Identity(x)
+        }
+        """
     )
 
 
