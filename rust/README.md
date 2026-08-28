@@ -55,16 +55,22 @@ fn main() -> Result<(), Box<dyn std::error::Error + 'static>> {
     let opts = onnxsim::Options::new()
         .shape_inference(false)                       // skip if it crashes on your model
         .skip_optimizer("eliminate_nop_transpose")    // keep a specific pass off
+        .extra_optimizer("defuse_matmul_integer_to_float") // opt into a non-default pass
         .tensor_size_threshold(512 * 1024 * 1024);
     let simplified = onnxsim::simplify_with(&model, &opts)?;
     Ok(())
 }
 ```
 
-List the optimizer passes you can skip:
+List the optimizer passes you can skip, and the ones you can opt into with
+[`Options::extra_optimizer`] (off by default -- typically a graph-shape rewrite
+rather than a pure node reduction or fusion):
 
 ```rust
 for name in onnxsim::list_optimizers() {
+    println!("{name}");
+}
+for name in onnxsim::list_other_optimizers() {
     println!("{name}");
 }
 ```
