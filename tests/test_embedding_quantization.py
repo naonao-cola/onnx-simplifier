@@ -6,30 +6,50 @@ higher-precision query side and an aggressively compressed document side).
 
 import numpy as np
 import onnx
-import onnx.helper
 import onnx.numpy_helper
 import pytest
+from onnx import parser
 
 import onnxsim
 
 ort = pytest.importorskip("onnxruntime")
 
 
-def _vi(name, shape, dtype=onnx.TensorProto.FLOAT):
-    return onnx.helper.make_tensor_value_info(name, dtype, shape)
+def _model(body, opset=13, ir_version=8):
+    return parser.parse_model(
+        f"""
+        <
+          ir_version: {ir_version},
+          opset_import: ["": {opset}]
+        >
+        {body}
+        """
+    )
 
 
 def _embed_model(batch=2, embed_dim=16, opset=13, output_name="embedding"):
-    nodes = [onnx.helper.make_node("Identity", ["X"], [output_name])]
-    graph = onnx.helper.make_graph(
-        nodes,
-        "g",
-        [_vi("X", [batch, embed_dim])],
-        [_vi(output_name, [batch, embed_dim])],
-        [],
+    return _model(
+        f"""
+        g (float[{batch},{embed_dim}] X) => (float[{batch},{embed_dim}] {output_name})
+        {{
+          {output_name} = Identity(X)
+        }}
+        """,
+        opset=opset,
     )
-    return onnx.helper.make_model(
-        graph, opset_imports=[onnx.helper.make_opsetid("", opset)], ir_version=8
+
+
+def _ambiguous_model():
+    # Two independent Identity outputs from the same input -- neither is
+    # unambiguously "the embedding output" without an explicit output_name.
+    return _model(
+        """
+        g (float[2,16] X) => (float[2,16] a, float[2,16] b)
+        {
+          a = Identity(X)
+          b = Identity(X)
+        }
+        """
     )
 
 
@@ -75,31 +95,13 @@ def test_binary_declines_below_opset13():
 
 
 def test_binary_declines_when_output_ambiguous():
-    nodes = [
-        onnx.helper.make_node("Identity", ["X"], ["a"]),
-        onnx.helper.make_node("Identity", ["X"], ["b"]),
-    ]
-    graph = onnx.helper.make_graph(
-        nodes, "g", [_vi("X", [2, 16])], [_vi("a", [2, 16]), _vi("b", [2, 16])], []
-    )
-    model = onnx.helper.make_model(
-        graph, opset_imports=[onnx.helper.make_opsetid("", 13)], ir_version=8
-    )
+    model = _ambiguous_model()
     q = onnxsim.quantize_embedding_binary(model)
     assert q.SerializeToString() == model.SerializeToString()
 
 
 def test_binary_honors_explicit_output_name():
-    nodes = [
-        onnx.helper.make_node("Identity", ["X"], ["a"]),
-        onnx.helper.make_node("Identity", ["X"], ["b"]),
-    ]
-    graph = onnx.helper.make_graph(
-        nodes, "g", [_vi("X", [2, 16])], [_vi("a", [2, 16]), _vi("b", [2, 16])], []
-    )
-    model = onnx.helper.make_model(
-        graph, opset_imports=[onnx.helper.make_opsetid("", 13)], ir_version=8
-    )
+    model = _ambiguous_model()
     q = onnxsim.quantize_embedding_binary(model, output_name="b")
     onnx.checker.check_model(q)
     assert q.graph.output[0].type.tensor_type.elem_type == onnx.TensorProto.FLOAT
@@ -150,16 +152,7 @@ def test_int8_declines_below_opset13():
 
 
 def test_int8_declines_when_output_ambiguous():
-    nodes = [
-        onnx.helper.make_node("Identity", ["X"], ["a"]),
-        onnx.helper.make_node("Identity", ["X"], ["b"]),
-    ]
-    graph = onnx.helper.make_graph(
-        nodes, "g", [_vi("X", [2, 16])], [_vi("a", [2, 16]), _vi("b", [2, 16])], []
-    )
-    model = onnx.helper.make_model(
-        graph, opset_imports=[onnx.helper.make_opsetid("", 13)], ir_version=8
-    )
+    model = _ambiguous_model()
     q = onnxsim.quantize_embedding_int8(model)
     assert q.SerializeToString() == model.SerializeToString()
 

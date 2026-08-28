@@ -139,6 +139,19 @@ typedef void (*OnnxsimExecuteFreeFn)(void* user_data, DLManagedTensor** outputs,
  * the default ONNX domain (using onnx's version converter) before simplifying;
  * a value <= 0 leaves the opset version unchanged.
  *
+ * extra_optimizers/num_extra_optimizers name onnx-optimizer passes to run in
+ * ADDITION to the default fuse/elimination set (plus whatever
+ * skip_optimizers left in) -- the counterpart to skip_optimizers, and how a
+ * pass registered outside the default set (typically PassType::Other, e.g. a
+ * defusion that trades a backend-specific op for a more portable one) gets
+ * opted into. num_extra_optimizers == 0 behaves exactly like the C++ core's
+ * ``std::nullopt`` (no extra passes; also a no-op when skip_optimizers_is_null
+ * != 0, since that already disables optimization entirely). An unknown pass
+ * name is not validated here -- it throws from onnx-optimizer's own pass
+ * registry lookup, surfaced as ONNXSIM_ERROR with a message in *out_error,
+ * rather than being silently ignored. See onnxsim_list_other_optimizers for
+ * the set of names this can name.
+ *
  * rewrite_fn, when non-NULL, is a custom graph rewriter run inside the
  * simplification fixed point (see OnnxsimRewriteFn). rewrite_free_fn releases
  * the buffers it produces (may be NULL). rewrite_user_data is passed through to
@@ -155,7 +168,8 @@ onnxsim_simplify(const void* model_data, size_t model_size,
                  const char* const* skip_optimizers, size_t num_skip_optimizers,
                  int skip_optimizers_is_null, int constant_folding,
                  int shape_inference, size_t tensor_size_threshold,
-                 int target_opset_version, OnnxsimRewriteFn rewrite_fn,
+                 int target_opset_version, const char* const* extra_optimizers,
+                 size_t num_extra_optimizers, OnnxsimRewriteFn rewrite_fn,
                  OnnxsimRewriteFreeFn rewrite_free_fn, void* rewrite_user_data,
                  void** out_data, size_t* out_size, char** out_error);
 
@@ -167,13 +181,14 @@ onnxsim_simplify(const void* model_data, size_t model_size,
  * executor, making this a drop-in superset of onnxsim_simplify. execute_free_fn
  * (may be NULL) releases each output array; execute_user_data is passed through
  * to both callbacks. All other parameters and the out_* contract match
- * onnxsim_simplify.
+ * onnxsim_simplify, including extra_optimizers/num_extra_optimizers.
  */
 ONNXSIM_C_API OnnxsimStatus onnxsim_simplify_with_executor(
     const void* model_data, size_t model_size,
     const char* const* skip_optimizers, size_t num_skip_optimizers,
     int skip_optimizers_is_null, int constant_folding, int shape_inference,
     size_t tensor_size_threshold, int target_opset_version,
+    const char* const* extra_optimizers, size_t num_extra_optimizers,
     OnnxsimRewriteFn rewrite_fn, OnnxsimRewriteFreeFn rewrite_free_fn,
     void* rewrite_user_data, OnnxsimExecuteFn execute_fn,
     OnnxsimExecuteFreeFn execute_free_fn, void* execute_user_data,
@@ -192,7 +207,7 @@ ONNXSIM_C_API OnnxsimStatus onnxsim_simplify_with_executor(
  * `pattern_data[i]`/`pattern_sizes[i]` and `replacement_data[i]`/
  * `replacement_sizes[i]` describe rule `i`, for `i` in [0, num_rules). Passing
  * num_rules == 0 behaves exactly like onnxsim_simplify. All other parameters
- * match onnxsim_simplify.
+ * match onnxsim_simplify, including extra_optimizers/num_extra_optimizers.
  */
 ONNXSIM_C_API OnnxsimStatus onnxsim_simplify_with_rules(
     const void* model_data, size_t model_size,
@@ -201,7 +216,9 @@ ONNXSIM_C_API OnnxsimStatus onnxsim_simplify_with_rules(
     size_t tensor_size_threshold, int target_opset_version,
     const void* const* pattern_data, const size_t* pattern_sizes,
     const void* const* replacement_data, const size_t* replacement_sizes,
-    size_t num_rules, void** out_data, size_t* out_size, char** out_error);
+    size_t num_rules, const char* const* extra_optimizers,
+    size_t num_extra_optimizers, void** out_data, size_t* out_size,
+    char** out_error);
 
 /*
  * Same as onnxsim_simplify, but reads the input model from `in_path` and writes
@@ -213,6 +230,7 @@ ONNXSIM_C_API OnnxsimStatus onnxsim_simplify_path(
     const char* const* skip_optimizers, size_t num_skip_optimizers,
     int skip_optimizers_is_null, int constant_folding, int shape_inference,
     size_t tensor_size_threshold, int target_opset_version,
+    const char* const* extra_optimizers, size_t num_extra_optimizers,
     OnnxsimRewriteFn rewrite_fn, OnnxsimRewriteFreeFn rewrite_free_fn,
     void* rewrite_user_data, char** out_error);
 
@@ -222,6 +240,17 @@ ONNXSIM_C_API OnnxsimStatus onnxsim_simplify_path(
  * Returns NULL on allocation failure. Release with onnxsim_free_string.
  */
 ONNXSIM_C_API char* onnxsim_list_optimizers(void);
+
+/*
+ * Return the names of the optimizer passes registered but NOT in the default
+ * fuse/elimination set (typically PassType::Other, e.g.
+ * defuse_matmul_integer_to_float)
+ * -- the names valid for extra_optimizers/num_extra_optimizers on the
+ * onnxsim_simplify* functions above. Same format/ownership contract as
+ * onnxsim_list_optimizers: one name per line, NUL-terminated, NULL on
+ * allocation failure, release with onnxsim_free_string.
+ */
+ONNXSIM_C_API char* onnxsim_list_other_optimizers(void);
 
 /*
  * Render a human-readable diff between an original and a simplified model, both

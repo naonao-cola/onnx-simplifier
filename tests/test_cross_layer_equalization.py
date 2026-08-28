@@ -16,9 +16,9 @@ import collections
 
 import numpy as np
 import onnx
-import onnx.helper
 import onnx.numpy_helper
 import pytest
+from onnx import parser
 
 import onnxsim
 
@@ -27,8 +27,18 @@ import onnxsim
 ort = pytest.importorskip("onnxruntime")
 
 
-def _vi(name, shape):
-    return onnx.helper.make_tensor_value_info(name, onnx.TensorProto.FLOAT, shape)
+def _model(body, initializer=(), opset=13, ir_version=8):
+    model = parser.parse_model(
+        f"""
+        <
+          ir_version: {ir_version},
+          opset_import: ["": {opset}]
+        >
+        {body}
+        """
+    )
+    model.graph.initializer.extend(initializer)
+    return model
 
 
 def _f32(array, name):
@@ -88,47 +98,44 @@ def _conv_chain_model(
     w2 = rng.standard_normal((c2_out, c1_out // group2, 3, 3)).astype(np.float32) * 0.1
     b2 = rng.standard_normal(c2_out).astype(np.float32) * 0.01
 
-    nodes = [
-        onnx.helper.make_node(
-            "Conv", ["x", "w1", "b1"], ["c1"], kernel_shape=[3, 3], pads=[1, 1, 1, 1]
-        )
-    ]
     inits = [_f32(w1, "w1"), _f32(b1, "b1"), _f32(w2, "w2"), _f32(b2, "b2")]
+    body = "c1 = Conv<kernel_shape = [3, 3], pads = [1, 1, 1, 1]>(x, w1, b1)\n"
     feed = "c1"
     if activation == "relu":
-        nodes.append(onnx.helper.make_node("Relu", ["c1"], ["act"]))
+        body += "act = Relu(c1)\n"
         feed = "act"
     elif activation == "prelu":
         slope = np.full(c1_out, 0.1, dtype=np.float32)
         inits.append(_f32(slope, "slope"))
-        nodes.append(onnx.helper.make_node("PRelu", ["c1", "slope"], ["act"]))
+        body += "act = PRelu(c1, slope)\n"
         feed = "act"
     elif activation == "clip":
         inits.append(_f32(np.float32(0.0), "clip_min"))
         inits.append(_f32(np.float32(6.0), "clip_max"))
-        nodes.append(
-            onnx.helper.make_node("Clip", ["c1", "clip_min", "clip_max"], ["act"])
-        )
+        body += "act = Clip(c1, clip_min, clip_max)\n"
         feed = "act"
     elif activation is not None:
         raise ValueError(activation)
 
-    conv2_kwargs = {"kernel_shape": [3, 3], "pads": [1, 1, 1, 1]}
+    conv2_attrs = "kernel_shape = [3, 3], pads = [1, 1, 1, 1]"
     if group2 != 1:
-        conv2_kwargs["group"] = group2
-    nodes.append(
-        onnx.helper.make_node("Conv", [feed, "w2", "b2"], ["y"], **conv2_kwargs)
-    )
-    outputs = [_vi("y", [1, c2_out, 8, 8])]
-    if branch:
-        nodes.append(onnx.helper.make_node("Identity", [feed], ["branch_out"]))
-        outputs.append(_vi("branch_out", [1, c1_out, 8, 8]))
+        conv2_attrs += f", group = {group2}"
+    body += f"y = Conv<{conv2_attrs}>({feed}, w2, b2)\n"
 
-    graph = onnx.helper.make_graph(
-        nodes, "g", [_vi("x", [1, c1_in, 8, 8])], outputs, inits
-    )
-    model = onnx.helper.make_model(
-        graph, opset_imports=[onnx.helper.make_opsetid("", opset)], ir_version=8
+    outputs = [f"float[1,{c2_out},8,8] y"]
+    if branch:
+        body += f"branch_out = Identity({feed})\n"
+        outputs.append(f"float[1,{c1_out},8,8] branch_out")
+
+    model = _model(
+        f"""
+        g (float[1,{c1_in},8,8] x) => ({", ".join(outputs)})
+        {{
+          {body}
+        }}
+        """,
+        initializer=inits,
+        opset=opset,
     )
     return model, w1
 
@@ -216,13 +223,15 @@ def test_equalize_declines_when_conv1_output_branches():
 
 
 def test_equalize_is_a_noop_on_a_model_with_no_matching_pattern():
-    x = _vi("x", [2, 4])
-    y = _vi("y", [2, 4])
     w = _f32(np.random.default_rng(0).standard_normal((4, 4)), "w")
-    node = onnx.helper.make_node("MatMul", ["x", "w"], ["y"])
-    graph = onnx.helper.make_graph([node], "g", [x], [y], [w])
-    model = onnx.helper.make_model(
-        graph, opset_imports=[onnx.helper.make_opsetid("", 13)], ir_version=8
+    model = _model(
+        """
+        g (float[2,4] x) => (float[2,4] y)
+        {
+          y = MatMul(x, w)
+        }
+        """,
+        initializer=[w],
     )
 
     equalized = onnxsim.cross_layer_equalize(model)
@@ -253,35 +262,29 @@ def test_equalize_propagates_across_a_three_conv_chain():
         weights.append(w)
         biases.append(rng.standard_normal(channels[i + 1]).astype(np.float32) * 0.01)
 
-    nodes = []
     inits = []
+    body = ""
     feed = "x"
     for i in range(3):
         inits += [_f32(weights[i], f"w{i}"), _f32(biases[i], f"b{i}")]
-        nodes.append(
-            onnx.helper.make_node(
-                "Conv",
-                [feed, f"w{i}", f"b{i}"],
-                [f"c{i}"],
-                kernel_shape=[3, 3],
-                pads=[1, 1, 1, 1],
-            )
+        body += (
+            f"c{i} = Conv<kernel_shape = [3, 3], pads = [1, 1, 1, 1]>"
+            f"({feed}, w{i}, b{i})\n"
         )
         feed = f"c{i}"
         if i < 2:
-            nodes.append(onnx.helper.make_node("Relu", [feed], [f"r{i}"]))
+            body += f"r{i} = Relu({feed})\n"
             feed = f"r{i}"
-    nodes.append(onnx.helper.make_node("Identity", [feed], ["y"]))
+    body += f"y = Identity({feed})\n"
 
-    graph = onnx.helper.make_graph(
-        nodes,
-        "g",
-        [_vi("x", [1, channels[0], 8, 8])],
-        [_vi("y", [1, channels[3], 8, 8])],
-        inits,
-    )
-    model = onnx.helper.make_model(
-        graph, opset_imports=[onnx.helper.make_opsetid("", 13)], ir_version=8
+    model = _model(
+        f"""
+        g (float[1,{channels[0]},8,8] x) => (float[1,{channels[3]},8,8] y)
+        {{
+          {body}
+        }}
+        """,
+        initializer=inits,
     )
     onnx.checker.check_model(model)
 

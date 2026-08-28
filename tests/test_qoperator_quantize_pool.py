@@ -9,9 +9,9 @@ import collections
 
 import numpy as np
 import onnx
-import onnx.helper
 import onnx.numpy_helper
 import pytest
+from onnx import parser
 
 import onnxsim
 
@@ -20,15 +20,16 @@ import onnxsim
 ort = pytest.importorskip("onnxruntime")
 
 
-def _model(nodes, inputs, outputs, initializer, opset=13):
-    graph = onnx.helper.make_graph(nodes, "g", inputs, outputs, initializer)
-    return onnx.helper.make_model(
-        graph, opset_imports=[onnx.helper.make_opsetid("", opset)], ir_version=10
+def _model(body, opset=13):
+    return parser.parse_model(
+        f"""
+        <
+          ir_version: 10,
+          opset_import: ["": {opset}]
+        >
+        {body}
+        """
     )
-
-
-def _vi(name, shape):
-    return onnx.helper.make_tensor_value_info(name, onnx.TensorProto.FLOAT, shape)
 
 
 def _run(model, feeds):
@@ -53,12 +54,14 @@ def _assert_close(float_outputs, quant_outputs, rel_l2_tol=0.1):
 
 def test_quantize_average_pool():
     rng = np.random.default_rng(0)
-    nodes = [
-        onnx.helper.make_node(
-            "AveragePool", ["X"], ["Y"], kernel_shape=[2, 2], strides=[2, 2]
-        )
-    ]
-    model = _model(nodes, [_vi("X", [1, 3, 4, 4])], [_vi("Y", [1, 3, 2, 2])], [])
+    model = _model(
+        """
+        g (float[1,3,4,4] X) => (float[1,3,2,2] Y)
+        {
+          Y = AveragePool<kernel_shape = [2, 2], strides = [2, 2]>(X)
+        }
+        """
+    )
 
     quant = onnxsim.quantize_qoperator_pool(model, num_calibration_samples=16, seed=0)
     onnx.checker.check_model(quant)
@@ -86,17 +89,16 @@ def test_quantize_average_pool():
 
 def test_quantize_average_pool_with_padding_and_count_include_pad():
     rng = np.random.default_rng(1)
-    nodes = [
-        onnx.helper.make_node(
-            "AveragePool",
-            ["X"],
-            ["Y"],
-            kernel_shape=[3, 3],
-            pads=[1, 1, 1, 1],
-            count_include_pad=1,
-        )
-    ]
-    model = _model(nodes, [_vi("X", [1, 2, 5, 5])], [_vi("Y", [1, 2, 5, 5])], [])
+    model = _model(
+        """
+        g (float[1,2,5,5] X) => (float[1,2,5,5] Y)
+        {
+          Y = AveragePool<
+            kernel_shape = [3, 3], pads = [1, 1, 1, 1], count_include_pad = 1
+          >(X)
+        }
+        """
+    )
 
     quant = onnxsim.quantize_qoperator_pool(model, num_calibration_samples=16, seed=1)
     onnx.checker.check_model(quant)
@@ -114,8 +116,14 @@ def test_quantize_average_pool_with_padding_and_count_include_pad():
 
 def test_quantize_global_average_pool():
     rng = np.random.default_rng(2)
-    nodes = [onnx.helper.make_node("GlobalAveragePool", ["X"], ["Y"])]
-    model = _model(nodes, [_vi("X", [1, 3, 4, 4])], [_vi("Y", [1, 3, 1, 1])], [])
+    model = _model(
+        """
+        g (float[1,3,4,4] X) => (float[1,3,1,1] Y)
+        {
+          Y = GlobalAveragePool(X)
+        }
+        """
+    )
 
     quant = onnxsim.quantize_qoperator_pool(model, num_calibration_samples=16, seed=2)
     onnx.checker.check_model(quant)
@@ -129,15 +137,14 @@ def test_quantize_global_average_pool():
 
 def test_quantize_multiple_independent_nodes():
     rng = np.random.default_rng(3)
-    nodes = [
-        onnx.helper.make_node("AveragePool", ["A"], ["T1"], kernel_shape=[2, 2]),
-        onnx.helper.make_node("Sigmoid", ["B"], ["T2"]),
-    ]
     model = _model(
-        nodes,
-        [_vi("A", [1, 2, 4, 4]), _vi("B", [1, 2, 3, 3])],
-        [_vi("T1", [1, 2, 3, 3]), _vi("T2", [1, 2, 3, 3])],
-        [],
+        """
+        g (float[1,2,4,4] A, float[1,2,3,3] B) => (float[1,2,3,3] T1, float[1,2,3,3] T2)
+        {
+          T1 = AveragePool<kernel_shape = [2, 2]>(A)
+          T2 = Sigmoid(B)
+        }
+        """
     )
 
     quant = onnxsim.quantize_qoperator_pool(model, num_calibration_samples=16, seed=3)
@@ -156,13 +163,14 @@ def test_quantize_skips_dilations():
     # Standard ONNX AveragePool gained an optional `dilations` attribute in
     # opset 19; ONNX Runtime's QLinearAveragePool kernel rejects it, so a
     # node carrying it must be left untouched.
-    nodes = [
-        onnx.helper.make_node(
-            "AveragePool", ["X"], ["Y"], kernel_shape=[2, 2], dilations=[1, 1]
-        )
-    ]
     model = _model(
-        nodes, [_vi("X", [1, 2, 4, 4])], [_vi("Y", [1, 2, 3, 3])], [], opset=19
+        """
+        g (float[1,2,4,4] X) => (float[1,2,3,3] Y)
+        {
+          Y = AveragePool<kernel_shape = [2, 2], dilations = [1, 1]>(X)
+        }
+        """,
+        opset=19,
     )
     quant = onnxsim.quantize_qoperator_pool(model)
     assert _op_counts(quant)["AveragePool"] == 1
@@ -170,24 +178,13 @@ def test_quantize_skips_dilations():
 
 
 def test_quantize_skips_non_float():
-    nodes = [onnx.helper.make_node("GlobalAveragePool", ["X"], ["Y"])]
-    graph = onnx.helper.make_graph(
-        nodes,
-        "g",
-        [
-            onnx.helper.make_tensor_value_info(
-                "X", onnx.TensorProto.FLOAT16, [1, 2, 4, 4]
-            )
-        ],
-        [
-            onnx.helper.make_tensor_value_info(
-                "Y", onnx.TensorProto.FLOAT16, [1, 2, 1, 1]
-            )
-        ],
-        [],
-    )
-    model = onnx.helper.make_model(
-        graph, opset_imports=[onnx.helper.make_opsetid("", 13)], ir_version=10
+    model = _model(
+        """
+        g (float16[1,2,4,4] X) => (float16[1,2,1,1] Y)
+        {
+          Y = GlobalAveragePool(X)
+        }
+        """
     )
     quant = onnxsim.quantize_qoperator_pool(model)
     assert _op_counts(quant)["GlobalAveragePool"] == 1
@@ -195,8 +192,14 @@ def test_quantize_skips_non_float():
 
 
 def test_list_qoperator_pool_quantizable_tensors():
-    nodes = [onnx.helper.make_node("AveragePool", ["X"], ["Y"], kernel_shape=[2, 2])]
-    model = _model(nodes, [_vi("X", [1, 2, 4, 4])], [_vi("Y", [1, 2, 3, 3])], [])
+    model = _model(
+        """
+        g (float[1,2,4,4] X) => (float[1,2,3,3] Y)
+        {
+          Y = AveragePool<kernel_shape = [2, 2]>(X)
+        }
+        """
+    )
     import onnxsim.onnxsim_cpp2py_export as C
 
     names = C.list_qoperator_pool_quantizable_tensors(model.SerializeToString())
