@@ -115,39 +115,81 @@ output channels (the same one :func:`apply_magnitude_pruning`/
 criteria); for a Conv chain it is the paper's own original setting, applied
 directly: each output filter's full ``[in_channels, kH, kW]`` kernel is
 flattened and ranked by its own L2 norm. Conv support is deliberately
-narrower than the MatMul/Gemm path: only ordinary (``group=1``) 2-D
-``Conv`` producers/consumers are matched, joined by unary activations alone
--- no per-channel ``Add``/``Mul`` scale-or-bias op, since a real Conv
+narrower than the MatMul/Gemm path in one respect that stays true
+regardless of grouping: producers/consumers are joined by unary activations
+alone -- no per-channel ``Add``/``Mul`` scale-or-bias op, since a real Conv
 already carries any bias in its own optional third input, and
 ``BatchNormalization`` is expected to already be fused into the preceding
 Conv's weight by the time this pass runs (onnxsim's own default
 optimization does exactly that, see ``fuse_bn_into_conv``), so a raw
 per-channel affine between two Convs isn't a shape this pass special-cases.
-A *general* grouped Conv (``group`` neither 1 nor equal to its channel
-count) is left untouched entirely: its output and input channels aren't
-independent per-index the way this pass's single producer/consumer cut
-assumes, and safely cutting a shared group's channels needs real
-group-aware bookkeeping this pass does not attempt (the same boundary
-attention-head pruning below draws around GroupQueryAttention). The
-*depthwise* special case (``group == in_channels == out_channels``,
-weight ``[C, 1, kH, kW]``) is different: with one filter per channel and
-no cross-channel mixing at all, output channel ``i`` depends only on
-input channel ``i``, so a depthwise Conv sitting between a chain's real
-producer and real consumer needs no independent importance of its own --
-the chain walk (:func:`_walk_to_conv_consumer`) crosses it transparently,
-like one more shape-preserving activation hop, carrying whatever
-channel-index set survives upstream straight through unchanged, while
-still slicing that depthwise layer's own weight/bias by the same indices
-and shrinking its ``group`` attribute to match. This is exactly the
-``Conv(1x1, group=1) -> DepthwiseConv(3x3, group=C) -> Conv(1x1,
-group=1)`` "inverted residual" block MobileNet/EfficientNet-style
-efficient CNN backbones use throughout, so it's worth the special case; a
-depthwise Conv is never itself matched as a producer or consumer (see
+
+Within that, three ``group`` shapes are distinguished. Ordinary
+(``group=1``) Conv is the base case already described above. The
+*depthwise* special case (``group == in_channels == out_channels``, weight
+``[C, 1, kH, kW]``) is different: with one filter per channel and no
+cross-channel mixing at all, output channel ``i`` depends only on input
+channel ``i``, so a depthwise Conv sitting between a chain's real producer
+and real consumer needs no independent importance of its own -- the chain
+walk (:func:`_walk_to_conv_consumer`) crosses it transparently, like one
+more shape-preserving activation hop, carrying whatever channel-index set
+survives upstream straight through unchanged, while still slicing that
+depthwise layer's own weight/bias by the same indices and shrinking its
+``group`` attribute to match. This is exactly the ``Conv(1x1, group=1) ->
+DepthwiseConv(3x3, group=C) -> Conv(1x1, group=1)`` "inverted residual"
+block MobileNet/EfficientNet-style efficient CNN backbones use throughout,
+so it's worth the special case; a depthwise Conv is never itself matched as
+a producer or consumer (see
 :func:`_match_conv_producer`/:func:`_match_conv_consumer`), only ever a
-transparent hop between two real ``group=1`` Conv boundaries -- one
-sitting last before a graph output or an unhandled branch simply ends the
-chain unmatched, same as any other topology this pass declines to guess
-at.
+transparent hop between two real Conv boundaries -- one sitting last before
+a graph output or an unhandled branch simply ends the chain unmatched, same
+as any other topology this pass declines to guess at.
+
+A *general* grouped Conv (``group`` neither 1 nor equal to its channel
+count, weight ``[out_channels, in_channels/group, kH, kW]``) is the
+remaining case, and -- unlike the fully-out-of-scope treatment an earlier
+version of this pass gave it -- is now matched as a real producer and/or
+consumer, because its structure turns out to be tractable in a way general
+dependency-graph coupling isn't: since a grouped Conv's ``group`` blocks
+never mix (full mixing *within* a block, none across), pruning block ``k``
+is completely independent of every other block, as long as the *same
+count* is pruned from every block (so ``channels % group == 0`` survives,
+exactly as ONNX's Conv schema requires). Concretely:
+
+- **As a producer**, its output-channel axis is flat/global regardless of
+  grouping (grouping only ever splits the *input* axis), so each of its
+  ``group`` output-filter blocks is ranked and pruned independently by the
+  same per-filter L2-norm criterion above, applied within each block's own
+  slice rather than across the whole ``out_channels`` axis -- keeping the
+  same count from every block.
+- **As a consumer**, its input-channel axis *is* per-group-relative (weight
+  column ``j`` on a filter belonging to group ``g`` means global input
+  channel ``g * (in_channels / group) + j``, not global channel ``j``), so
+  slicing it needs dedicated per-group-relative logic
+  (:func:`_slice_grouped_consumer_conv_weight`) rather than the flat
+  column selection an ordinary consumer's weight uses -- but the *set* of
+  surviving channels is still whatever the chain's producer side decided,
+  now constrained to keep a uniform count within each of the consumer's own
+  ``group`` blocks.
+- **Composing the two**: a grouped producer feeding an ordinary
+  (``group=1``) consumer is supported -- the consumer imposes no grouping
+  constraint of its own, so the producer's own per-block selection is
+  already all that's needed. An ordinary producer feeding a grouped
+  consumer is likewise supported -- the producer has no grouping constraint
+  of its own either, so its selection is simply constrained to the
+  consumer's own block boundaries instead of an unconstrained global top-k.
+  Both sides grouped is supported *only* when both share the exact same
+  ``group`` count (their blocks then partition the shared channel count
+  identically, so either side's per-block selection already satisfies the
+  other); a mismatched ``group`` count on the two sides is declined
+  outright and the whole chain is left untouched, since the two sides'
+  block boundaries then wouldn't generally align at all, and reconciling
+  that would need real cross-chain bookkeeping this pass does not attempt
+  (the same kind of boundary attention-head pruning below draws around
+  GroupQueryAttention, and general residual/branch dependency-graph
+  coupling is left out of this pass entirely). See
+  :func:`_match_conv_producer`/:func:`_match_conv_consumer`/
+  :func:`_chain_group` for the exact matching and selection logic.
 :func:`apply_structured_wanda_pruning` is the calibrated upgrade of that
 same technique -- ``||W_row||_2 * ||X||_2`` per channel instead of weight
 magnitude alone -- exactly the same relationship Wanda has to plain
@@ -953,6 +995,13 @@ class _Producer:
     # (Conv's ``[out_channels, in_channels, kH, kW]`` weight layout is
     # fixed), and output channels always live on axis 0.
     is_conv: bool = False
+    # This Conv's own ``group`` attribute (always 1 for a MatMul/Gemm
+    # producer, or an ordinary ``group=1`` Conv). > 1 for a general grouped
+    # Conv producer (see :func:`_match_conv_producer`) -- output channel
+    # axis 0 stays flat/global either way (grouping only splits the *input*
+    # axis), so this only changes how :func:`_apply_chains` picks `keep`,
+    # never how the producer's own weight is sliced.
+    group: int = 1
 
 
 @dataclass(frozen=True)
@@ -992,6 +1041,14 @@ class _Chain:
     # real producer and the real consumer (Conv chains only -- see
     # :class:`_ConvPassThrough`; always empty for a MatMul/Gemm chain).
     conv_pass_through: Tuple[_ConvPassThrough, ...] = ()
+    # The consumer's own ``group`` attribute (always 1 for a MatMul/Gemm
+    # consumer, or an ordinary ``group=1`` Conv). > 1 for a general grouped
+    # Conv consumer (see :func:`_match_conv_consumer`) -- unlike the
+    # producer side, the consumer's input-channel axis *is*
+    # per-group-relative, so this drives both `keep` selection (see
+    # :func:`_chain_group`) and the dedicated slicing
+    # :func:`_slice_grouped_consumer_conv_weight` performs.
+    consumer_group: int = 1
 
 
 def _consumers_of(graph: onnx.GraphProto) -> Dict[str, List[onnx.NodeProto]]:
@@ -1159,20 +1216,26 @@ def _conv_group(node: onnx.NodeProto) -> int:
 
 def _match_conv_producer(
     node: onnx.NodeProto, initializer_map: Dict[str, onnx.TensorProto]
-) -> Optional[Tuple[str, Optional[str], int]]:
-    """If `node` is an ordinary (``group=1``) 2-D ``Conv`` with a constant
-    4-D float32 ``[out_channels, in_channels, kH, kW]`` weight (and, if
-    present, a constant bias), returns
-    ``(weight_name, bias_name_or_None, out_channels)``. A grouped or
-    depthwise Conv (``group != 1``) never matches: its output and input
-    channels aren't independent per-index the way this pass's single
-    producer/consumer cut assumes -- true here too for the depthwise case,
-    even though a depthwise Conv *is* given a narrower exception elsewhere
-    in this pass, as a transparent pass-through hop the chain walk may
-    cross between two real producer/consumer boundaries (see
+) -> Optional[Tuple[str, Optional[str], int, int]]:
+    """If `node` is an ordinary (``group=1``) *or* a general grouped
+    (``1 < group < in_channels``, ``group != out_channels`` -- see this
+    module's own docstring) 2-D ``Conv`` with a constant 4-D float32
+    ``[out_channels, in_channels/group, kH, kW]`` weight (and, if present, a
+    constant bias), returns
+    ``(weight_name, bias_name_or_None, out_channels, group)``. A depthwise
+    Conv (``group == in_channels == out_channels``) never matches: even
+    though it *is* given a narrower exception elsewhere in this pass, as a
+    transparent pass-through hop the chain walk may cross between two real
+    producer/consumer boundaries (see
     :func:`_match_depthwise_conv_pass_through`,
-    :func:`_walk_to_conv_consumer`) -- it is never itself matched as a
-    producer.
+    :func:`_walk_to_conv_consumer`), it is never itself matched as a
+    producer -- only a *general* grouped Conv (this function's new case) is.
+    A general grouped Conv's `group` output channels never need slicing
+    themselves here: axis 0 (`out_channels`) is flat/global regardless of
+    grouping (grouping only ever splits the *input* axis), so the caller's
+    existing `keep`-index slicing of a producer's own weight/bias needs no
+    special-casing for this -- only *which* `keep` indices get chosen (one
+    independent top-k per group, see :func:`_apply_chains`) changes.
     """
     if node.op_type != "Conv" or len(node.input) < 2:
         return None
@@ -1182,7 +1245,18 @@ def _match_conv_producer(
         w_init is None
         or w_init.data_type != onnx.TensorProto.FLOAT
         or len(w_init.dims) != 4
-        or _conv_group(node) != 1
+    ):
+        return None
+    group = _conv_group(node)
+    if group < 1:
+        return None
+    out_channels = w_init.dims[0]
+    in_channels = w_init.dims[1] * group
+    if group > 1 and (
+        group >= in_channels  # depthwise (a transparent hop, not a
+        # producer) or an unsupported in-channels-per-group == 1 grouping
+        or group == out_channels
+        or out_channels % group != 0  # groups must stay equal-sized
     ):
         return None
     bias_name = None
@@ -1190,18 +1264,26 @@ def _match_conv_producer(
         bias_name = node.input[2]
         if bias_name not in initializer_map:
             return None  # non-constant bias -- can't safely prune it
-    return w_name, bias_name, w_init.dims[0]
+    return w_name, bias_name, out_channels, group
 
 
 def _match_conv_consumer(
     node: onnx.NodeProto, initializer_map: Dict[str, onnx.TensorProto]
-) -> Optional[Tuple[str, int]]:
-    """If `node` is an ordinary (``group=1``) 2-D ``Conv`` with a constant
-    4-D float32 weight, returns ``(weight_name, in_channels)``. Like
+) -> Optional[Tuple[str, int, int]]:
+    """If `node` is an ordinary (``group=1``) *or* a general grouped Conv
+    (see :func:`_match_conv_producer`) with a constant 4-D float32 weight,
+    returns ``(weight_name, in_channels, group)``. Like
     :func:`_match_conv_producer`, a depthwise Conv never matches here
     either -- it's only ever a transparent pass-through hop the chain walk
-    crosses en route to a *real* ``group=1`` consumer, never a consumer
-    itself (see :func:`_match_depthwise_conv_pass_through`).
+    crosses en route to a *real* consumer, never a consumer itself (see
+    :func:`_match_depthwise_conv_pass_through`). Unlike the producer side, a
+    grouped consumer's input-channel axis (axis 1 of its weight) *is*
+    per-group-relative -- weight column ``j`` on an output filter belonging
+    to group ``g`` means global input channel ``g * (in_channels / group) +
+    j``, not global channel ``j`` -- so slicing it by the chain's `keep`
+    indices needs the dedicated
+    :func:`_slice_grouped_consumer_conv_weight`, not the flat
+    ``w[:, keep, ...]`` an ordinary consumer's weight uses.
     """
     if node.op_type != "Conv" or len(node.input) < 2:
         return None
@@ -1211,10 +1293,18 @@ def _match_conv_consumer(
         w_init is None
         or w_init.data_type != onnx.TensorProto.FLOAT
         or len(w_init.dims) != 4
-        or _conv_group(node) != 1
     ):
         return None
-    return w_name, w_init.dims[1]
+    group = _conv_group(node)
+    if group < 1:
+        return None
+    out_channels = w_init.dims[0]
+    in_channels = w_init.dims[1] * group
+    if group > 1 and (
+        group >= in_channels or group == out_channels or out_channels % group != 0
+    ):
+        return None
+    return w_name, in_channels, group
 
 
 def _match_depthwise_conv_pass_through(
@@ -1266,7 +1356,7 @@ def _walk_to_conv_consumer(
     n_channels: int,
     max_hops: int,
 ) -> Tuple[
-    Optional[Tuple[onnx.NodeProto, str]],
+    Optional[Tuple[onnx.NodeProto, str, int]],
     Tuple[Tuple[onnx.NodeProto, None], ...],
     Tuple[_ConvPassThrough, ...],
 ]:
@@ -1277,18 +1367,19 @@ def _walk_to_conv_consumer(
     channel-index mapping, but each still needs its own weight/bias sliced
     and its ``group`` attribute updated, so they're returned separately as
     `conv_pass_through` rather than folded into `chain_ops`) with no other
-    consumer anywhere along the way, until an ordinary (``group=1``) Conv
-    consumer is found whose input channel count matches `n_channels`. A
-    depthwise Conv is only ever a transparent hop, never a match for the
-    consumer role itself -- one sitting last before a graph output or a
-    branch simply ends the walk with no consumer found, same as any other
+    consumer anywhere along the way, until an ordinary (``group=1``) *or*
+    general grouped Conv consumer is found whose input channel count
+    matches `n_channels` (see :func:`_match_conv_consumer`). A depthwise
+    Conv is only ever a transparent hop, never a match for the consumer
+    role itself -- one sitting last before a graph output or a branch
+    simply ends the walk with no consumer found, same as any other
     unmatched topology. Unlike the MatMul/Gemm walk, no per-channel
     ``Add``/``Mul`` op is recognized -- see this module's own docstring for
     why that's out of scope for Conv chains.
     """
     chain_ops: List[Tuple[onnx.NodeProto, None]] = []
     conv_pass_through: List[_ConvPassThrough] = []
-    consumer = None
+    consumer: Optional[Tuple[onnx.NodeProto, str, int]] = None
     cur = start
     for _hop in range(max_hops):
         candidates = consumers_of.get(cur, [])
@@ -1311,7 +1402,7 @@ def _walk_to_conv_consumer(
 
             match = _match_conv_consumer(nxt, initializer_map)
             if match is not None and match[1] == n_channels:
-                consumer = (nxt, match[0])
+                consumer = (nxt, match[0], match[2])
             break
 
         if not (
@@ -1343,7 +1434,7 @@ def _find_conv_chains(graph: onnx.GraphProto) -> List[_Chain]:
         info = _match_conv_producer(node, initializer_map)
         if info is None:
             continue
-        w_name, bias_name, n_channels = info
+        w_name, bias_name, n_channels, producer_group = info
 
         out_name = node.output[0]
         if not _is_internal(out_name):
@@ -1359,17 +1450,43 @@ def _find_conv_chains(graph: onnx.GraphProto) -> List[_Chain]:
         )
         if consumer is None:
             continue
+        consumer_node, consumer_weight, consumer_group = consumer
+
+        if (
+            producer_group > 1
+            and consumer_group > 1
+            and producer_group != consumer_group
+        ):
+            # Both sides grouped, but with a different group count: the two
+            # sides' block boundaries wouldn't generally align (a channel
+            # surviving as "the k-th of the producer's own group" has no
+            # well-defined membership in any of the consumer's
+            # differently-sized groups), so this composition needs real
+            # cross-chain bookkeeping this pass doesn't attempt -- declined
+            # outright, same as any other topology left unmatched rather
+            # than guessed at. See this module's own docstring.
+            continue
 
         chains.append(
             _Chain(
-                producers=(_Producer(node, w_name, False, bias_name, is_conv=True),),
+                producers=(
+                    _Producer(
+                        node,
+                        w_name,
+                        False,
+                        bias_name,
+                        is_conv=True,
+                        group=producer_group,
+                    ),
+                ),
                 chain_ops=chain_ops,
-                consumer_node=consumer[0],
-                consumer_weight=consumer[1],
+                consumer_node=consumer_node,
+                consumer_weight=consumer_weight,
                 consumer_weight_transposed=False,
                 n_channels=n_channels,
                 consumer_is_conv=True,
                 conv_pass_through=conv_pass_through,
+                consumer_group=consumer_group,
             )
         )
     return chains
@@ -1576,6 +1693,51 @@ def _slice_consumer_weight(
     w_init.CopyFrom(onnx.numpy_helper.from_array(w_new, name=w_init.name))
 
 
+def _slice_grouped_consumer_conv_weight(
+    w_init: onnx.TensorProto,
+    keep: np.ndarray,
+    group: int,
+    n_channels: int,
+) -> None:
+    """Slices a *general grouped* Conv consumer's ``[out_channels,
+    in_channels/group, kH, kW]`` weight by a global (whole-``in_channels``)
+    `keep` index set. Unlike :func:`_slice_consumer_weight`'s flat ``w[:,
+    keep, ...]`` (correct only for an ordinary ``group=1`` consumer, whose
+    axis 1 truly spans every input channel), a grouped consumer's axis 1 is
+    only `in_channels/group` wide and is *per-group-relative*: weight
+    column ``j`` on output filter ``o`` means global input channel
+    ``(o // out_per_group) * block + j`` -- `block` (`n_channels // group`)
+    input channels per group, not `j` itself. So each output-filter group
+    needs its own local slice of `keep` -- that group's own retained
+    channels, translated from global indices back to local ones by
+    subtracting the group's own block offset -- rather than one shared
+    index set applied uniformly across the whole axis.
+
+    This is well-defined only because whatever produced `keep` already
+    guarantees a *uniform count* of survivors per `group`-sized block (see
+    :func:`_chain_group`/:func:`_apply_chains`): both producer-grouped and
+    consumer-grouped selection independently keep the same count from every
+    block by construction, and the "both sides grouped" composition this
+    pass supports requires a matching `group` count on both ends (see
+    :func:`_find_conv_chains`), so the producer's own blocks and this
+    consumer's own blocks are always the exact same partition of
+    `n_channels` -- never a case where one side's block boundaries split a
+    count unevenly relative to the other's.
+    """
+    w = onnx.numpy_helper.to_array(w_init)
+    out_channels = w.shape[0]
+    out_per_group = out_channels // group
+    block = n_channels // group
+    parts = []
+    for gi in range(group):
+        lo, hi = gi * block, (gi + 1) * block
+        local_keep = keep[(keep >= lo) & (keep < hi)] - lo
+        filt_lo, filt_hi = gi * out_per_group, (gi + 1) * out_per_group
+        parts.append(w[filt_lo:filt_hi, local_keep, ...])
+    w_new = np.concatenate(parts, axis=0)
+    w_init.CopyFrom(onnx.numpy_helper.from_array(w_new, name=w_init.name))
+
+
 def _slice_last_axis(init: onnx.TensorProto, keep: np.ndarray) -> None:
     arr = onnx.numpy_helper.to_array(init)
     new = np.take(arr, keep, axis=-1)
@@ -1595,6 +1757,36 @@ def _plain_structured_importance(
     return np.sqrt(squared_norm)
 
 
+def _chain_group(chain: _Chain) -> int:
+    """The `group` count that governs this chain's `keep`-index selection
+    (see :func:`_apply_chains`): 1 for every chain this pass already
+    supported before general grouped Conv (a MatMul/Gemm chain, a gated
+    pair, or an ordinary ``group=1`` Conv producer/consumer -- all leave
+    every `group` field at its default), and > 1 whenever either side of a
+    Conv chain is a general grouped Conv.
+
+    Worked example for why the producer side takes priority when *only* the
+    producer is grouped: a grouped producer (`group=g`, `g` output-channel
+    blocks of `out_channels/g` filters each) feeding an ordinary `group=1`
+    consumer needs every one of the producer's own `g` blocks pruned to a
+    uniform count so `out_channels % g == 0` survives -- a requirement the
+    consumer itself doesn't share (an ordinary consumer accepts any subset
+    of surviving input channels), so the producer's own grouping is what
+    the shared `keep` selection must honor. Symmetrically, an ordinary
+    `group=1` producer feeding a grouped consumer (`group=g_c`) has no
+    grouping constraint of its own -- any subset of its output channels is
+    individually a valid producer-side cut -- so it's the *consumer's* `g_c`
+    blocks that constrain which subset is safe to choose, making the
+    consumer's `group` the one that governs `keep` selection there. When
+    both sides are grouped, :func:`_find_conv_chains` already declined the
+    chain unless `producer_group == consumer_group`, so either field gives
+    the same answer.
+    """
+    if len(chain.producers) == 1 and chain.producers[0].group > 1:
+        return chain.producers[0].group
+    return chain.consumer_group
+
+
 def _apply_chains(
     graph: onnx.GraphProto,
     chains: List[_Chain],
@@ -1607,6 +1799,19 @@ def _apply_chains(
     ``compute_importance(chain, w_arrays_nk) -> np.ndarray[n_channels]`` for
     the ranking, and performs the actual slicing plus stale ``value_info``
     cleanup. Mutates ``graph`` in place.
+
+    For a chain with :func:`_chain_group` (`group`) > 1 -- a general grouped
+    Conv producer or consumer, see this module's own docstring -- `keep` is
+    chosen independently *within each of `group` equal-sized blocks* of the
+    channel-importance vector, keeping the same count from every block
+    (`_chain_group`'s own docstring works through why one side's `group`
+    always suffices to pick the block boundaries both roles need to honor).
+    This reduces to today's single whole-vector top-k exactly when
+    `group == 1` -- the code below keeps that as a literal separate branch,
+    not a `group=1` special case of the block formula, so every
+    already-supported chain's rounding (and therefore its exact `keep`
+    selection) stays byte-identical to before this function learned about
+    grouped Conv at all.
     """
     initializer_map = {t.name: t for t in graph.initializer}
     # A weight legitimately plays both roles across two different chains --
@@ -1644,7 +1849,13 @@ def _apply_chains(
             continue  # a shared/tied initializer another chain already resized
 
         n = chain.n_channels
-        keep_count = max(1, n - round(n * sparsity))
+        group = _chain_group(chain)
+        if group > 1:
+            block = n // group
+            per_group_keep = max(1, round(block * (1.0 - sparsity)))
+            keep_count = per_group_keep * group
+        else:
+            keep_count = max(1, n - round(n * sparsity))
         if keep_count >= n:
             continue  # rounds down to nothing for this layer -- no-op
 
@@ -1657,7 +1868,26 @@ def _apply_chains(
                 w_nk = w if p.weight_transposed else w.T  # [N, K]
             w_arrays_nk.append(w_nk)
         importance = compute_importance(chain, w_arrays_nk)
-        keep = np.sort(np.argsort(-importance)[:keep_count])
+        if group > 1:
+            # One independent top-k per block -- see _chain_group and this
+            # function's own docstring. Blocks are contiguous and already
+            # increasing, and each block's own local top-k is sorted
+            # ascending before its offset is added back, so the
+            # concatenation is sorted ascending overall too, same as the
+            # group=1 branch's own `keep` invariant.
+            keep = np.concatenate(
+                [
+                    np.sort(
+                        np.argsort(-importance[gi * block : (gi + 1) * block])[
+                            :per_group_keep
+                        ]
+                    )
+                    + gi * block
+                    for gi in range(group)
+                ]
+            )
+        else:
+            keep = np.sort(np.argsort(-importance)[:keep_count])
 
         for p in chain.producers:
             _slice_producer_weight(
@@ -1690,12 +1920,17 @@ def _apply_chains(
                 hop.node.attribute.append(
                     onnx.helper.make_attribute("group", keep_count)
                 )
-        _slice_consumer_weight(
-            initializer_map[chain.consumer_weight],
-            chain.consumer_weight_transposed,
-            keep,
-            is_conv=chain.consumer_is_conv,
-        )
+        if chain.consumer_is_conv and chain.consumer_group > 1:
+            _slice_grouped_consumer_conv_weight(
+                initializer_map[chain.consumer_weight], keep, chain.consumer_group, n
+            )
+        else:
+            _slice_consumer_weight(
+                initializer_map[chain.consumer_weight],
+                chain.consumer_weight_transposed,
+                keep,
+                is_conv=chain.consumer_is_conv,
+            )
 
         producer_touched.update(producer_weights)
         consumer_touched.add(chain.consumer_weight)
@@ -1743,20 +1978,29 @@ def apply_structured_pruning(
     the two layers' composition mathematically unaffected for every
     surviving channel.
 
-    The same cut applies to ordinary (``group=1``) 2-D ``Conv`` producer ->
-    consumer pairs -- each output filter's whole ``[in_channels, kH, kW]``
-    kernel ranked by its own L2 norm, exactly Li et al.'s original filter-
-    pruning criterion -- joined by unary activations and/or depthwise Conv
-    hops (``group == in_channels == out_channels``: one filter per channel,
-    no cross-channel mixing, so it's crossed transparently -- its own
-    weight/bias sliced by the producer's channel indices and its ``group``
-    attribute shrunk to match, but it contributes no importance of its own
-    and can't itself be the producer or consumer -- see this module's own
-    docstring). No per-channel Add/Mul between two Convs (a Conv already
-    carries its own bias, and ``BatchNormalization`` is expected to already
-    be fused into the preceding Conv by the time this pass runs). A
-    *general* grouped Conv (``group`` neither 1 nor its channel count) is
-    left untouched.
+    The same cut applies to 2-D ``Conv`` producer -> consumer pairs -- each
+    output filter's whole ``[in_channels/group, kH, kW]`` kernel ranked by
+    its own L2 norm, exactly Li et al.'s original filter-pruning criterion
+    -- joined by unary activations and/or depthwise Conv hops (``group ==
+    in_channels == out_channels``: one filter per channel, no cross-channel
+    mixing, so it's crossed transparently -- its own weight/bias sliced by
+    the producer's channel indices and its ``group`` attribute shrunk to
+    match, but it contributes no importance of its own and can't itself be
+    the producer or consumer -- see this module's own docstring). No
+    per-channel Add/Mul between two Convs (a Conv already carries its own
+    bias, and ``BatchNormalization`` is expected to already be fused into
+    the preceding Conv by the time this pass runs).
+
+    A *general* grouped Conv (``group`` neither 1 nor its channel count) is
+    also matched, as a producer and/or a consumer, ranking/pruning each of
+    its ``group`` channel blocks independently (see this module's own
+    docstring for exactly why that's safe and how the two roles differ). A
+    grouped producer paired with an ordinary consumer, an ordinary producer
+    paired with a grouped consumer, and both sides grouped *with the same
+    ``group`` count* are all supported; both sides grouped with a
+    *different* ``group`` count is declined and the chain is left
+    completely untouched, same as any other topology this pass can't prove
+    safe to cut.
 
     Also handles the gated FFN pattern most current LLMs use in place of a
     plain two-layer MLP (SwiGLU/GeGLU: ``down(act(gate(x)) * up(x))``, see
@@ -1804,12 +2048,12 @@ def apply_structured_wanda_pruning(
     same real structural channel removal, same topology matching (a single
     producer or a gated pair -> zero or more shape-preserving elementwise
     ops and, for a Conv chain, depthwise Conv hops -> one consumer,
-    MatMul/Gemm or Conv, see :func:`apply_structured_pruning`'s own
-    docstring) including the same depthwise-Conv pass-through sliced by the
-    producer's channel indices alone -- it contributes no activation norm
-    of its own to the ranking either, being transparent to the chain's
-    channel-index mapping just as it is to plain L2-norm importance -- but
-    each chain's
+    MatMul/Gemm or Conv, general grouped Conv included on either side, see
+    :func:`apply_structured_pruning`'s own docstring) including the same
+    depthwise-Conv pass-through sliced by the producer's channel indices
+    alone -- it contributes no activation norm of its own to the ranking
+    either, being transparent to the chain's channel-index mapping just as
+    it is to plain L2-norm importance -- but each chain's
     output channels are ranked by ``||W_row||_2 * ||X||_2`` -- L2 norm of
     that channel's own weight row (or, for Conv, whole filter), times the
     L2 norm of the *activation* actually flowing through that channel over
