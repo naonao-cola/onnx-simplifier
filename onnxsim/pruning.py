@@ -30,10 +30,33 @@ shape-preserving elementwise ops (activations, and for MatMul/Gemm also a
 bias/scale add/mul) with no other consumer anywhere along that chain, into
 exactly one downstream layer of the same family whose reduction/input-
 channel dimension matches.
-Any residual/skip connection, multi-consumer fan-out, or branch (all of
-which need real dependency-graph analysis -- what Torch-Pruning's DepGraph
-does in general) is left untouched rather than guessed at. The other part
-of the paper's pipeline -- an architecture *search* over what to prune,
+Any multi-consumer fan-out or branch (which needs real dependency-graph
+analysis -- what Torch-Pruning's DepGraph does in general) is left
+untouched rather than guessed at. One narrow, bounded slice of the
+residual/skip-connection case *is* handled -- see
+:func:`_find_conv_residual_chains`'s own section comment for the full
+reasoning -- because it turns out to have a provably-safe special case: a
+Conv chain whose forward walk hits a channel-preserving ``Add(a, b)`` with
+two non-constant operands (every residual connection's shape) is, rather
+than declined outright, treated as a merge point requiring whichever real
+Conv producer(s) feed `a` and `b` to be pruned to one shared channel-index
+set, found by walking backward from each operand (through the same
+unary-activation/depthwise-pass-through hops the forward walk already
+allows) to a real ``group=1`` Conv producer -- or, transitively, to
+*another* such `Add` merge point, unioning that one's own group in too (the
+"many residual blocks share one spine" case). This is still bounded, not
+general DepGraph: it holds every hop, on every branch, to the same
+single-consumer safety bar as the rest of this pass, so a real multi-block
+ResNet's shared "post-block" tensor -- read by both the next block's own
+first Conv *and* directly by that block's own `Add` -- is exactly the kind
+of fan-out this still declines rather than guesses at, leaving an
+*interior* block of a deep residual stage untouched; what it does reach is
+a single residual connection whose branches don't fan out elsewhere (e.g. a
+projection-shortcut block, or a stage's last block before something else
+consumes its output) and a genuinely linear stack of `Add`-only merges.
+General multi-branch dependency-graph pruning -- arbitrary fan-out, non-Add
+merges (`Concat`, ...), MatMul/Gemm residuals -- remains out of scope. The
+other part of the paper's pipeline -- an architecture *search* over what to prune,
 alternated with knowledge-distillation/RL recovery afterwards -- needs a
 training loop onnxsim does not have and is not in scope here at all; this
 is a single, static, no-retraining structural cut, closer in spirit to Li
@@ -1375,6 +1398,348 @@ def _find_conv_chains(graph: onnx.GraphProto) -> List[_Chain]:
     return chains
 
 
+# --- Conv residual (Add-merged) chains -------------------------------------
+#
+# A bounded slice of the general dependency-graph-grouping problem this
+# module's own docstring otherwise disclaims (see its "residual/skip
+# connection" paragraph): a channel-preserving `Add(a, b)` where *both*
+# operands are non-constant tensors -- `y = Add(x, f(x))`, the shape every
+# residual/skip connection takes -- forces whichever real Conv producer(s)
+# feed `a` and `b` to be pruned to the exact same channel-index set, since
+# they're about to be summed elementwise. `_walk_to_conv_consumer`'s own
+# forward walk just breaks at such an `Add` (an ordinary Conv chain has no
+# way to represent "two producers must agree"), so this is a *separate*
+# finder -- `_find_conv_residual_chains` below -- built entirely on top of
+# the existing `_Chain`/`_apply_chains` machinery rather than a change to
+# `_walk_to_conv_consumer`/`_find_conv_chains` themselves: every `_Chain` it
+# produces still has exactly one (real, `group=1`) consumer and some tuple
+# of producers, precisely the shape `_apply_chains` (and both importance
+# callbacks, `_plain_structured_importance`'s already-generic root-sum-
+# square combination included) already knows how to ride a shared `keep`
+# index set through -- only *finding* that tuple of producers needs new
+# code.
+#
+# The union-find grouping :func:`_walk_conv_producer_backward` and
+# :func:`_find_conv_residual_chains` build together covers not just a
+# single `Add(x, f(x))` but a whole *chain* of such merges transitively
+# sharing one spine channel count -- "many residual blocks share one
+# spine" -- by walking backward from each `Add` operand and, on hitting
+# *another* eligible `Add`'s raw output, unioning that `Add`'s own group in
+# rather than stopping. What it does **not** do, on purpose, is relax the
+# single-consumer bar every other hop in this module already holds every
+# intermediate tensor to: a real multi-block ResNet stage's post-block
+# tensor is read *twice* (once by the next block's own first Conv, once
+# as-is by that block's own `Add`), and that fan-out is exactly the
+# "more than one ... consumer anywhere along it" case this pass declines
+# rather than guesses at -- so an *interior* block of a real deep ResNet
+# stage is left completely untouched by this mechanism (the same
+# conservative "no branch-following" boundary as everywhere else in this
+# module), while a lone residual connection (a single `Add`, each branch
+# its own uninterrupted Conv/depthwise-pass-through chain back to a real
+# producer -- e.g. a projection-shortcut block, or the very last block of a
+# stage before something else consumes its output) or a genuinely linear
+# stack of `Add`-only combinations (no intervening branch at all) is
+# pruned, with the same oracle-verified numeric guarantee as every other
+# chain kind here. See this module's own docstring for how this changes
+# (without fully retiring) the "left untouched" residual paragraph above.
+
+
+def _is_eligible_add_merge(
+    node: onnx.NodeProto, initializer_map: Dict[str, onnx.TensorProto]
+) -> bool:
+    """True for an ``Add`` node :func:`_find_conv_residual_chains` may treat
+    as a residual merge point: exactly two distinct, non-constant operands.
+    A per-channel bias/scale ``Add`` (one operand a constant initializer --
+    already out of scope for Conv chains generally, see this module's own
+    docstring) or a degenerate ``Add(x, x)`` never qualifies -- neither is a
+    "two independent producers must agree" merge point at all.
+    """
+    return (
+        node.op_type == "Add"
+        and len(node.input) == 2
+        and len(node.output) == 1
+        and node.input[0] != node.input[1]
+        and node.input[0] not in initializer_map
+        and node.input[1] not in initializer_map
+    )
+
+
+def _match_conv_pass_through_self(
+    node: onnx.NodeProto, initializer_map: Dict[str, onnx.TensorProto]
+) -> Optional[Tuple[str, Optional[str]]]:
+    """The depthwise-Conv pass-through check :func:`_walk_conv_producer_backward`
+    uses: unlike :func:`_match_depthwise_conv_pass_through`, which validates
+    a hop against an externally supplied `n_channels`, the backward residual
+    walk doesn't know its group's shared channel count yet at the point it
+    first crosses a hop (it's still walking toward whichever real producer
+    -- or other ``Add`` -- eventually establishes it), so this checks the
+    node's own weight is self-consistently depthwise-shaped (``dims[0] ==
+    group``, ``dims[1] == 1``) by calling that same matcher with the node's
+    own ``dims[0]`` as the "expected" count -- trivially satisfying that one
+    check and leaving every other one intact. :func:`_find_conv_residual_chains`
+    re-validates every such hop against the group's real, established
+    channel count once the whole group is resolved.
+    """
+    if node.op_type != "Conv" or len(node.input) < 2:
+        return None
+    w_init = initializer_map.get(node.input[1])
+    if (
+        w_init is None
+        or w_init.data_type != onnx.TensorProto.FLOAT
+        or len(w_init.dims) != 4
+    ):
+        return None
+    return _match_depthwise_conv_pass_through(node, initializer_map, w_init.dims[0])
+
+
+def _walk_conv_producer_backward(
+    start: str,
+    node_by_output: Dict[str, onnx.NodeProto],
+    initializer_map: Dict[str, onnx.TensorProto],
+    consumers_of: Dict[str, List[onnx.NodeProto]],
+    graph_outputs: Set[str],
+    max_hops: int,
+) -> Tuple[
+    str,
+    Optional[Union[Tuple[_Producer, int], onnx.NodeProto]],
+    Tuple[_ConvPassThrough, ...],
+    Tuple[onnx.NodeProto, ...],
+]:
+    """The backward counterpart of :func:`_walk_to_conv_consumer`, used only
+    by :func:`_find_conv_residual_chains` to resolve one operand of an
+    ``Add`` merge point back to whatever produces it. Walks backward from
+    tensor `start` through unary pass-through activations and
+    self-consistently-depthwise Conv hops (see
+    :func:`_match_conv_pass_through_self`), requiring every tensor crossed
+    -- `start` itself included -- to have exactly one consumer, the same
+    safety bar every other hop in this module already holds every
+    intermediate tensor to. This is exactly what makes a real multi-block
+    ResNet's shared "post-block" tensor -- read both by the next block's
+    own first Conv and, unchanged, by that block's own ``Add`` -- resolve to
+    ``"fail"`` rather than being silently pruned wrong: whichever of its two
+    readers this walk is approached from finds more than one consumer on
+    the very first hop and stops.
+
+    Returns one of:
+
+    - ``("producer", (producer, n_channels), pass_through, unary_ops)`` --
+      resolved all the way back to a real ``group=1`` Conv producer;
+    - ``("add", add_node, pass_through, unary_ops)`` -- resolved to another
+      eligible ``Add`` merge node's raw output instead (the "many residual
+      blocks share one spine" case: the caller unions this group with that
+      ``Add``'s own rather than treating it as a separate producer);
+    - ``("fail", None, (), ())`` -- a graph input, a non-Conv/non-``Add``
+      producer, a branch, or the hop limit -- the caller declines the whole
+      group this operand belongs to, rather than guessing.
+    """
+    pass_through: List[_ConvPassThrough] = []
+    unary_ops: List[onnx.NodeProto] = []
+    cur = start
+    for _hop in range(max_hops):
+        if len(consumers_of.get(cur, [])) != 1 or cur in graph_outputs:
+            return "fail", None, (), ()
+        node = node_by_output.get(cur)
+        if node is None or len(node.output) != 1 or node.output[0] != cur:
+            return "fail", None, (), ()
+
+        prod_info = _match_conv_producer(node, initializer_map)
+        if prod_info is not None:
+            w_name, bias_name, n_channels = prod_info
+            producer = _Producer(node, w_name, False, bias_name, is_conv=True)
+            return (
+                "producer",
+                (producer, n_channels),
+                tuple(reversed(pass_through)),
+                tuple(reversed(unary_ops)),
+            )
+
+        dw = _match_conv_pass_through_self(node, initializer_map)
+        if dw is not None:
+            dw_weight, dw_bias = dw
+            pass_through.append(_ConvPassThrough(node, dw_weight, dw_bias))
+            cur = node.input[0]
+            continue
+
+        if node.op_type in _UNARY_PASS_THROUGH and len(node.input) == 1:
+            unary_ops.append(node)
+            cur = node.input[0]
+            continue
+
+        if _is_eligible_add_merge(node, initializer_map):
+            return (
+                "add",
+                node,
+                tuple(reversed(pass_through)),
+                tuple(reversed(unary_ops)),
+            )
+
+        return "fail", None, (), ()
+
+    return "fail", None, (), ()
+
+
+def _find_conv_residual_chains(graph: onnx.GraphProto) -> List[_Chain]:
+    """Finds Conv residual/skip-connection groups -- see the section comment
+    above. For every maximal union-find group of transitively-connected
+    eligible ``Add`` merge points (:func:`_is_eligible_add_merge`), resolves
+    every member's two operands via :func:`_walk_conv_producer_backward`:
+    each must reach either a real ``group=1`` Conv producer (a "leaf" of the
+    group) or another `Add` already in the same group. If *any* operand,
+    anywhere in the group, fails to resolve that way, or the leaf
+    producers' channel counts don't all agree, the *entire* group is
+    declined -- never partially pruned. A correctly-resolved group must
+    reduce to exactly one "sink" `Add` (the one whose own output isn't
+    itself consumed by another `Add` in the group); the chain walk
+    continues forward from there via the ordinary :func:`_walk_to_conv_consumer`
+    to find the group's one real downstream consumer, exactly as any other
+    Conv chain does.
+    """
+    initializer_map = {t.name: t for t in graph.initializer}
+    consumers_of = _consumers_of(graph)
+    node_by_output = {out: node for node in graph.node for out in node.output}
+    graph_outputs = {o.name for o in graph.output}
+
+    def _is_internal(name: str) -> bool:
+        return len(consumers_of.get(name, [])) == 1 and name not in graph_outputs
+
+    eligible_adds = [
+        node for node in graph.node if _is_eligible_add_merge(node, initializer_map)
+    ]
+    if not eligible_adds:
+        return []
+    add_index = {id(node): i for i, node in enumerate(eligible_adds)}
+
+    parent = list(range(len(eligible_adds)))
+
+    def find(i: int) -> int:
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    def union(i: int, j: int) -> None:
+        ri, rj = find(i), find(j)
+        if ri != rj:
+            parent[ri] = rj
+
+    Edge = Tuple[
+        str,
+        Optional[Union[Tuple[_Producer, int], onnx.NodeProto]],
+        Tuple[_ConvPassThrough, ...],
+        Tuple[onnx.NodeProto, ...],
+    ]
+    edge_results: Dict[int, List[Edge]] = {}
+    poisoned: Set[int] = set()
+    for idx, add_node in enumerate(eligible_adds):
+        results: List[Edge] = []
+        for operand in add_node.input:
+            edge = _walk_conv_producer_backward(
+                operand,
+                node_by_output,
+                initializer_map,
+                consumers_of,
+                graph_outputs,
+                _MAX_CHAIN_HOPS,
+            )
+            results.append(edge)
+            kind, payload = edge[0], edge[1]
+            if kind == "fail":
+                poisoned.add(idx)
+            elif kind == "add":
+                assert isinstance(payload, onnx.NodeProto)
+                j = add_index.get(id(payload))
+                if j is None:
+                    poisoned.add(idx)  # defensive -- shouldn't happen
+                else:
+                    union(idx, j)
+        edge_results[idx] = results
+
+    groups: Dict[int, List[int]] = {}
+    for idx in range(len(eligible_adds)):
+        groups.setdefault(find(idx), []).append(idx)
+
+    chains: List[_Chain] = []
+    for members in groups.values():
+        if any(i in poisoned for i in members):
+            continue
+
+        leaf_producers: List[_Producer] = []
+        n_channels_set: Set[int] = set()
+        pass_through: List[_ConvPassThrough] = []
+        unary_ops: List[onnx.NodeProto] = []
+        referenced: Set[int] = set()
+
+        for idx in members:
+            for kind, payload, pt, uops in edge_results[idx]:
+                pass_through.extend(pt)
+                unary_ops.extend(uops)
+                if kind == "producer":
+                    assert payload is not None and not isinstance(
+                        payload, onnx.NodeProto
+                    )
+                    producer, n_channels = payload
+                    leaf_producers.append(producer)
+                    n_channels_set.add(n_channels)
+                elif kind == "add":
+                    assert isinstance(payload, onnx.NodeProto)
+                    referenced.add(add_index[id(payload)])
+
+        if len(n_channels_set) != 1:
+            continue  # branches disagree on channel count -- decline
+        n_channels = next(iter(n_channels_set))
+
+        # Every depthwise pass-through hop was only self-consistently
+        # checked when first crossed (see _match_conv_pass_through_self);
+        # now that the group's real channel count is known, re-validate.
+        if any(
+            initializer_map[hop.weight].dims[0] != n_channels for hop in pass_through
+        ):
+            continue
+
+        sinks = [idx for idx in members if idx not in referenced]
+        if len(sinks) != 1:
+            continue  # not a single linear chain of merges -- decline
+        sink_add = eligible_adds[sinks[0]]
+
+        if len({p.weight for p in leaf_producers}) != len(leaf_producers):
+            continue  # degenerate -- the same producer named twice
+
+        sink_out = sink_add.output[0]
+        if not _is_internal(sink_out):
+            continue
+
+        consumer, fwd_chain_ops, fwd_pass_through = _walk_to_conv_consumer(
+            sink_out,
+            initializer_map,
+            consumers_of,
+            graph_outputs,
+            n_channels,
+            _MAX_CHAIN_HOPS,
+        )
+        if consumer is None:
+            continue
+
+        chain_ops = (
+            tuple((op, None) for op in unary_ops)
+            + tuple((eligible_adds[i], None) for i in members)
+            + fwd_chain_ops
+        )
+
+        chains.append(
+            _Chain(
+                producers=tuple(leaf_producers),
+                chain_ops=chain_ops,
+                consumer_node=consumer[0],
+                consumer_weight=consumer[1],
+                consumer_weight_transposed=False,
+                n_channels=n_channels,
+                consumer_is_conv=True,
+                conv_pass_through=tuple(pass_through) + fwd_pass_through,
+            )
+        )
+    return chains
+
+
 def _trace_gate_producer_backward(
     tensor_name: str,
     node_by_output: Dict[str, onnx.NodeProto],
@@ -1766,6 +2131,23 @@ def apply_structured_pruning(
     surviving channel indices, since they're about to be multiplied. This
     gated form is MatMul/Gemm-only -- Conv chains don't take part in it.
 
+    Also handles a bounded slice of the Conv residual/skip-connection case
+    (see :func:`_find_conv_residual_chains` and this module's own
+    docstring): a channel-preserving ``Add(a, b)`` with two non-constant
+    operands -- every residual connection's shape -- forces whichever real
+    Conv producer(s) feed `a` and `b` (found by walking backward through the
+    same unary-activation/depthwise-pass-through hops the forward walk
+    already allows, transitively through any further such `Add` merges
+    sharing the same spine) to be pruned to one shared channel-index set,
+    ranked the same combined (root-sum-square) way as a gated pair. Bounded,
+    not general DepGraph: every branch is still held to the same
+    single-consumer bar as everywhere else in this pass, so a real
+    multi-block ResNet stage's shared "post-block" tensor -- read by both
+    the next block's own first Conv and, unchanged, that block's own `Add`
+    -- is a fan-out this declines rather than guesses at; a lone residual
+    connection whose branches don't fan out elsewhere, or a linear stack of
+    `Add`-only merges, is what this reaches.
+
     :param model: the original onnx ModelProto or file path
     :param sparsity: target fraction of each matched producer's output
             channels to remove (at least one channel is always kept)
@@ -1783,7 +2165,12 @@ def apply_structured_pruning(
     out.CopyFrom(model)
     graph = out.graph
 
-    chains = _find_chains(graph) + _find_gated_chains(graph) + _find_conv_chains(graph)
+    chains = (
+        _find_chains(graph)
+        + _find_gated_chains(graph)
+        + _find_conv_chains(graph)
+        + _find_conv_residual_chains(graph)
+    )
     if chains:
         _apply_chains(graph, chains, sparsity, _plain_structured_importance)
 
@@ -1802,14 +2189,14 @@ def apply_structured_wanda_pruning(
     """The calibrated upgrade of :func:`apply_structured_pruning`, exactly
     as :func:`apply_wanda_pruning` is to :func:`apply_magnitude_pruning`:
     same real structural channel removal, same topology matching (a single
-    producer or a gated pair -> zero or more shape-preserving elementwise
-    ops and, for a Conv chain, depthwise Conv hops -> one consumer,
-    MatMul/Gemm or Conv, see :func:`apply_structured_pruning`'s own
-    docstring) including the same depthwise-Conv pass-through sliced by the
-    producer's channel indices alone -- it contributes no activation norm
-    of its own to the ranking either, being transparent to the chain's
-    channel-index mapping just as it is to plain L2-norm importance -- but
-    each chain's
+    producer, a gated pair, or a bounded Conv residual/``Add``-merge group
+    -> zero or more shape-preserving elementwise ops and, for a Conv chain,
+    depthwise Conv hops -> one consumer, MatMul/Gemm or Conv, see
+    :func:`apply_structured_pruning`'s own docstring) including the same
+    depthwise-Conv pass-through sliced by the producer's channel indices
+    alone -- it contributes no activation norm of its own to the ranking
+    either, being transparent to the chain's channel-index mapping just as
+    it is to plain L2-norm importance -- but each chain's
     output channels are ranked by ``||W_row||_2 * ||X||_2`` -- L2 norm of
     that channel's own weight row (or, for Conv, whole filter), times the
     L2 norm of the *activation* actually flowing through that channel over
@@ -1857,7 +2244,12 @@ def apply_structured_wanda_pruning(
     out.CopyFrom(model)
     graph = out.graph
 
-    chains = _find_chains(graph) + _find_gated_chains(graph) + _find_conv_chains(graph)
+    chains = (
+        _find_chains(graph)
+        + _find_gated_chains(graph)
+        + _find_conv_chains(graph)
+        + _find_conv_residual_chains(graph)
+    )
     if not chains:
         return out
 
