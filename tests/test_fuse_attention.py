@@ -9,11 +9,16 @@ this is a default-on graph-shape fusion (registered the same way
 ``custom_optimizer_passes.cpp``) -- it always runs as part of plain
 ``onnxsim.simplify()``, with no separate Python entry point or CLI flag.
 
-Every model here is built directly with ``onnx.helper`` (no torch dependency)
-to mirror exactly what a real PyTorch export of a hand-rolled (eager, not
-``nn.MultiheadAttention``) attention module produces -- see
-``onnxsim/passes/fuse_attention.h``'s own file comment for the node-by-node
-shape this targets, which was derived by tracing real PyTorch exports.
+Every model here is built directly with the ONNX text format parser
+(``onnx.parser``, no torch dependency) to mirror exactly what a real PyTorch
+export of a hand-rolled (eager, not ``nn.MultiheadAttention``) attention
+module produces -- see ``onnxsim/passes/fuse_attention.h``'s own file comment
+for the node-by-node shape this targets, which was derived by tracing real
+PyTorch exports. Weight/bias/shape initializers are still built with numpy
+and attached to the parsed graph programmatically, since the graphs here are
+assembled from composable node-text fragments (one per Q/K/V projection, head
+split, etc.) that are much easier to read and thread together as plain
+strings than as lists of ``onnx.helper``-built node protos.
 """
 
 import collections
@@ -21,9 +26,9 @@ import math
 
 import numpy as np
 import onnx
-import onnx.helper
 import onnx.numpy_helper
 import pytest
+from onnx import parser
 
 import onnxsim
 
@@ -33,8 +38,21 @@ import onnxsim
 ort = pytest.importorskip("onnxruntime")
 
 
-def _vi(name, shape):
-    return onnx.helper.make_tensor_value_info(name, onnx.TensorProto.FLOAT, shape)
+def _model(body, initializer=(), opset=17):
+    # Pinning ir_version: 10 matches the older onnxruntime bundled with some
+    # CI wheels (which cap at IR version 11); `_run` and onnxsim's own
+    # checks below run these models through onnxruntime.
+    model = parser.parse_model(
+        f"""
+        <
+          ir_version: 10,
+          opset_import: ["": {opset}]
+        >
+        {body}
+        """
+    )
+    model.graph.initializer.extend(initializer)
+    return model
 
 
 def _f32(array, name):
@@ -45,32 +63,31 @@ def _i64(array, name):
     return onnx.numpy_helper.from_array(np.asarray(array, dtype=np.int64), name)
 
 
-def _linear_nodes(rng, x_name, in_dim, out_dim, prefix, bias):
+def _linear_body(rng, x_name, in_dim, out_dim, prefix, bias):
     # MatMul(x, W)[+ Add(., B)] -- the shape a plain ``nn.Linear`` exported via
     # ``MatMul`` (not ``Gemm``) produces; matches fuse_attention.h's
     # MatchAttentionProjection Add-branch.
     w = _f32(rng.standard_normal((in_dim, out_dim)) * 0.3, f"{prefix}_w")
-    nodes = [onnx.helper.make_node("MatMul", [x_name, w.name], [f"{prefix}_mm"])]
     inits = [w]
+    text = f"{prefix}_mm = MatMul({x_name}, {prefix}_w)\n"
     out_name = f"{prefix}_mm"
     if bias:
         b = _f32(rng.standard_normal(out_dim) * 0.1, f"{prefix}_b")
-        nodes.append(
-            onnx.helper.make_node("Add", [b.name, out_name], [f"{prefix}_out"])
-        )
         inits.append(b)
+        text += f"{prefix}_out = Add({prefix}_b, {out_name})\n"
         out_name = f"{prefix}_out"
-    return nodes, inits, out_name
+    return text, inits, out_name
 
 
-def _head_split_nodes(x_name, shape_name, perm, prefix):
+def _head_split_body(x_name, shape_name, perm, prefix):
     reshape_out = f"{prefix}_reshape"
     transpose_out = f"{prefix}_transpose"
-    nodes = [
-        onnx.helper.make_node("Reshape", [x_name, shape_name], [reshape_out]),
-        onnx.helper.make_node("Transpose", [reshape_out], [transpose_out], perm=perm),
-    ]
-    return nodes, transpose_out
+    perm_str = ", ".join(str(p) for p in perm)
+    text = (
+        f"{reshape_out} = Reshape({x_name}, {shape_name})\n"
+        f"{transpose_out} = Transpose<perm = [{perm_str}]>({reshape_out})\n"
+    )
+    return text, transpose_out
 
 
 def _attention_model(
@@ -91,55 +108,51 @@ def _attention_model(
     rng = np.random.default_rng(seed)
     VH = VH or H
     Dh, Dv = H // NH, VH // NH
-    inits = []
-    nodes = []
+    inits = [_i64([B, S, NH, Dh], "shape_qk"), _i64([B, S, NH, Dv], "shape_v")]
+    body = ""
 
-    shape_qk = _i64([B, S, NH, Dh], "shape_qk")
-    shape_v = _i64([B, S, NH, Dv], "shape_v")
-    inits += [shape_qk, shape_v]
-
-    q_nodes, q_inits, q_out = _linear_nodes(rng, "x", H, H, "q", bias)
-    k_nodes, k_inits, k_out = _linear_nodes(rng, kv_source, H, H, "k", bias)
-    v_nodes, v_inits, v_out = _linear_nodes(rng, kv_source, H, VH, "v", bias)
-    nodes += q_nodes + k_nodes + v_nodes
+    q_text, q_inits, q_out = _linear_body(rng, "x", H, H, "q", bias)
+    k_text, k_inits, k_out = _linear_body(rng, kv_source, H, H, "k", bias)
+    v_text, v_inits, v_out = _linear_body(rng, kv_source, H, VH, "v", bias)
+    body += q_text + k_text + v_text
     inits += q_inits + k_inits + v_inits
 
-    qh_nodes, q_t = _head_split_nodes(q_out, "shape_qk", [0, 2, 1, 3], "q")
-    kh_nodes, k_t = _head_split_nodes(k_out, "shape_qk", [0, 2, 3, 1], "k")
-    vh_nodes, v_t = _head_split_nodes(v_out, "shape_v", [0, 2, 1, 3], "v")
-    nodes += qh_nodes + kh_nodes + vh_nodes
+    qh_text, q_t = _head_split_body(q_out, "shape_qk", [0, 2, 1, 3], "q")
+    kh_text, k_t = _head_split_body(k_out, "shape_qk", [0, 2, 3, 1], "k")
+    vh_text, v_t = _head_split_body(v_out, "shape_v", [0, 2, 1, 3], "v")
+    body += qh_text + kh_text + vh_text
 
-    nodes.append(onnx.helper.make_node("MatMul", [q_t, k_t], ["qk"]))
+    body += f"qk = MatMul({q_t}, {k_t})\n"
     if scale_op == "Div":
-        divisor = _f32(np.array(float(Dh) ** 0.5), "divisor")
-        inits.append(divisor)
-        nodes.append(onnx.helper.make_node("Div", ["qk", divisor.name], ["scores"]))
+        inits.append(_f32(np.array(float(Dh) ** 0.5), "divisor"))
+        body += "scores = Div(qk, divisor)\n"
     else:
-        mult = _f32(np.array(float(Dh) ** -0.5), "mult")
-        inits.append(mult)
-        nodes.append(onnx.helper.make_node("Mul", ["qk", mult.name], ["scores"]))
-    nodes.append(onnx.helper.make_node("Softmax", ["scores"], ["attn"], axis=-1))
-    nodes.append(onnx.helper.make_node("MatMul", ["attn", v_t], ["ctx0"]))
-    nodes.append(
-        onnx.helper.make_node("Transpose", ["ctx0"], ["ctx1"], perm=[0, 2, 1, 3])
-    )
-    shape_ctx = _i64([B, S, NH * Dv], "shape_ctx")
-    inits.append(shape_ctx)
-    nodes.append(onnx.helper.make_node("Reshape", ["ctx1", "shape_ctx"], ["ctx2"]))
+        inits.append(_f32(np.array(float(Dh) ** -0.5), "mult"))
+        body += "scores = Mul(qk, mult)\n"
+    body += "attn = Softmax<axis = -1>(scores)\n"
+    body += f"ctx0 = MatMul(attn, {v_t})\n"
+    body += "ctx1 = Transpose<perm = [0, 2, 1, 3]>(ctx0)\n"
+    inits.append(_i64([B, S, NH * Dv], "shape_ctx"))
+    body += "ctx2 = Reshape(ctx1, shape_ctx)\n"
 
-    out_nodes, out_inits, out_name = _linear_nodes(rng, "ctx2", VH, H, "out", bias)
-    nodes += out_nodes
+    out_text, out_inits, out_name = _linear_body(rng, "ctx2", VH, H, "out", bias)
+    body += out_text
     inits += out_inits
-    nodes.append(onnx.helper.make_node("Identity", [out_name], ["y"]))
+    body += f"y = Identity({out_name})\n"
 
-    graph_inputs = [_vi("x", [B, S, H])]
+    inputs = f"float[{B},{S},{H}] x"
     if kv_source != "x":
-        graph_inputs.append(_vi(kv_source, [B, S, H]))
-    graph = onnx.helper.make_graph(
-        nodes, "g", graph_inputs, [_vi("y", [B, S, H])], inits
-    )
-    return onnx.helper.make_model(
-        graph, opset_imports=[onnx.helper.make_opsetid("", opset)], ir_version=10
+        inputs += f", float[{B},{S},{H}] {kv_source}"
+
+    return _model(
+        f"""
+        g ({inputs}) => (float[{B},{S},{H}] y)
+        {{
+          {body}
+        }}
+        """,
+        initializer=inits,
+        opset=opset,
     )
 
 
@@ -269,7 +282,7 @@ def test_fuse_attention_declines_cross_attention():
 # once its own dynamic Shape/Slice/Cast/Sqrt/... scale computation is
 # constant-folded -- verified directly against real torch.onnx.export output
 # during development; these tests reproduce the resulting shape directly via
-# onnx.helper so they need no torch dependency.
+# the ONNX text parser so they need no torch dependency.
 # --------------------------------------------------------------------------- #
 def _sdpa_prescaled_model(
     B=2, S=5, H=32, NH=4, scale=None, k_scale=None, ctx_rank3=True, seed=10
@@ -287,42 +300,34 @@ def _sdpa_prescaled_model(
     c = math.sqrt(scale)
     k_c = c if k_scale is None else math.sqrt(k_scale)
     rng = np.random.default_rng(seed)
-    inits = []
-    nodes = []
+    inits = [_i64([B, S, NH, Dh], "shape_qkv")]
+    body = ""
 
-    shape_qkv = _i64([B, S, NH, Dh], "shape_qkv")
-    inits.append(shape_qkv)
-
-    q_nodes, q_inits, q_out = _linear_nodes(rng, "x", H, H, "q", True)
-    k_nodes, k_inits, k_out = _linear_nodes(rng, "x", H, H, "k", True)
-    v_nodes, v_inits, v_out = _linear_nodes(rng, "x", H, H, "v", True)
-    nodes += q_nodes + k_nodes + v_nodes
+    q_text, q_inits, q_out = _linear_body(rng, "x", H, H, "q", True)
+    k_text, k_inits, k_out = _linear_body(rng, "x", H, H, "k", True)
+    v_text, v_inits, v_out = _linear_body(rng, "x", H, H, "v", True)
+    body += q_text + k_text + v_text
     inits += q_inits + k_inits + v_inits
 
-    qh_nodes, q_t = _head_split_nodes(q_out, "shape_qkv", [0, 2, 1, 3], "q")
-    kh_nodes, k_t = _head_split_nodes(k_out, "shape_qkv", [0, 2, 3, 1], "k")
-    vh_nodes, v_t = _head_split_nodes(v_out, "shape_qkv", [0, 2, 1, 3], "v")
-    nodes += qh_nodes + kh_nodes + vh_nodes
+    qh_text, q_t = _head_split_body(q_out, "shape_qkv", [0, 2, 1, 3], "q")
+    kh_text, k_t = _head_split_body(k_out, "shape_qkv", [0, 2, 3, 1], "k")
+    vh_text, v_t = _head_split_body(v_out, "shape_qkv", [0, 2, 1, 3], "v")
+    body += qh_text + kh_text + vh_text
 
-    c_init = _f32(np.array(c), "q_scale_c")
-    k_c_init = _f32(np.array(k_c), "k_scale_c")
-    inits += [c_init, k_c_init]
-    nodes.append(onnx.helper.make_node("Mul", [q_t, c_init.name], ["q_scaled"]))
-    nodes.append(onnx.helper.make_node("Mul", [k_t, k_c_init.name], ["k_scaled"]))
-    nodes.append(onnx.helper.make_node("MatMul", ["q_scaled", "k_scaled"], ["scores"]))
-    nodes.append(onnx.helper.make_node("Softmax", ["scores"], ["attn"], axis=-1))
-    nodes.append(onnx.helper.make_node("MatMul", ["attn", v_t], ["ctx0"]))
-    nodes.append(
-        onnx.helper.make_node("Transpose", ["ctx0"], ["ctx1"], perm=[0, 2, 1, 3])
-    )
+    inits += [_f32(np.array(c), "q_scale_c"), _f32(np.array(k_c), "k_scale_c")]
+    body += f"q_scaled = Mul({q_t}, q_scale_c)\n"
+    body += f"k_scaled = Mul({k_t}, k_scale_c)\n"
+    body += "scores = MatMul(q_scaled, k_scaled)\n"
+    body += "attn = Softmax<axis = -1>(scores)\n"
+    body += f"ctx0 = MatMul(attn, {v_t})\n"
+    body += "ctx1 = Transpose<perm = [0, 2, 1, 3]>(ctx0)\n"
     ctx_shape = [B, S, H] if ctx_rank3 else [B * S, H]
-    shape_ctx = _i64(ctx_shape, "shape_ctx")
-    inits.append(shape_ctx)
-    nodes.append(onnx.helper.make_node("Reshape", ["ctx1", "shape_ctx"], ["ctx2"]))
+    inits.append(_i64(ctx_shape, "shape_ctx"))
+    body += "ctx2 = Reshape(ctx1, shape_ctx)\n"
 
     if ctx_rank3:
-        out_nodes, out_inits, out_name = _linear_nodes(rng, "ctx2", H, H, "out", True)
-        nodes += out_nodes
+        out_text, out_inits, out_name = _linear_body(rng, "ctx2", H, H, "out", True)
+        body += out_text
         inits += out_inits
     else:
         # Mirrors the real SDPA-export trace exactly: ctx2 is already 2-D, so
@@ -332,18 +337,20 @@ def _sdpa_prescaled_model(
         w = _f32(rng.standard_normal((H, H)) * 0.3, "out_w")
         b = _f32(rng.standard_normal(H) * 0.1, "out_b")
         inits += [w, b]
-        nodes.append(
-            onnx.helper.make_node("Gemm", ["ctx2", w.name, b.name], ["out_out"])
-        )
+        body += "out_out = Gemm(ctx2, out_w, out_b)\n"
         out_name = "out_out"
-    out_shape = [B, S, H] if ctx_rank3 else [B * S, H]
-    nodes.append(onnx.helper.make_node("Identity", [out_name], ["y"]))
+    body += f"y = Identity({out_name})\n"
 
-    graph = onnx.helper.make_graph(
-        nodes, "g", [_vi("x", [B, S, H])], [_vi("y", out_shape)], inits
-    )
-    return onnx.helper.make_model(
-        graph, opset_imports=[onnx.helper.make_opsetid("", 17)], ir_version=10
+    out_shape = [B, S, H] if ctx_rank3 else [B * S, H]
+    out_shape_str = ",".join(str(d) for d in out_shape)
+    return _model(
+        f"""
+        g (float[{B},{S},{H}] x) => (float[{out_shape_str}] y)
+        {{
+          {body}
+        }}
+        """,
+        initializer=inits,
     )
 
 
@@ -430,52 +437,45 @@ def test_fuse_attention_recovers_input_flattened_by_gemm_conversion():
     B, S, H, NH = 2, 5, 32, 4
     Dh = H // NH
     rng = np.random.default_rng(20)
-    inits = []
-    nodes = []
-
-    shape_flat = _i64([B * S, H], "shape_flat")
-    inits.append(shape_flat)
-    nodes.append(onnx.helper.make_node("Reshape", ["x", "shape_flat"], ["x_flat"]))
+    inits = [_i64([B * S, H], "shape_flat")]
+    body = "x_flat = Reshape(x, shape_flat)\n"
 
     def gemm_linear(prefix, in_name, in_dim, out_dim):
+        nonlocal body
         w = _f32(rng.standard_normal((in_dim, out_dim)) * 0.3, f"{prefix}_w")
         b = _f32(rng.standard_normal(out_dim) * 0.1, f"{prefix}_b")
-        nodes.append(
-            onnx.helper.make_node("Gemm", [in_name, w.name, b.name], [f"{prefix}_out"])
-        )
         inits.extend([w, b])
+        body += f"{prefix}_out = Gemm({in_name}, {prefix}_w, {prefix}_b)\n"
         return f"{prefix}_out"
 
     q_out = gemm_linear("q", "x_flat", H, H)
     k_out = gemm_linear("k", "x_flat", H, H)
     v_out = gemm_linear("v", "x_flat", H, H)
 
-    shape_qkv = _i64([B, S, NH, Dh], "shape_qkv")
-    inits.append(shape_qkv)
-    qh_nodes, q_t = _head_split_nodes(q_out, "shape_qkv", [0, 2, 1, 3], "q")
-    kh_nodes, k_t = _head_split_nodes(k_out, "shape_qkv", [0, 2, 3, 1], "k")
-    vh_nodes, v_t = _head_split_nodes(v_out, "shape_qkv", [0, 2, 1, 3], "v")
-    nodes += qh_nodes + kh_nodes + vh_nodes
+    inits.append(_i64([B, S, NH, Dh], "shape_qkv"))
+    qh_text, q_t = _head_split_body(q_out, "shape_qkv", [0, 2, 1, 3], "q")
+    kh_text, k_t = _head_split_body(k_out, "shape_qkv", [0, 2, 3, 1], "k")
+    vh_text, v_t = _head_split_body(v_out, "shape_qkv", [0, 2, 1, 3], "v")
+    body += qh_text + kh_text + vh_text
 
-    divisor = _f32(np.array(float(Dh) ** 0.5), "divisor")
-    inits.append(divisor)
-    nodes.append(onnx.helper.make_node("MatMul", [q_t, k_t], ["qk"]))
-    nodes.append(onnx.helper.make_node("Div", ["qk", divisor.name], ["scores"]))
-    nodes.append(onnx.helper.make_node("Softmax", ["scores"], ["attn"], axis=-1))
-    nodes.append(onnx.helper.make_node("MatMul", ["attn", v_t], ["ctx0"]))
-    nodes.append(
-        onnx.helper.make_node("Transpose", ["ctx0"], ["ctx1"], perm=[0, 2, 1, 3])
-    )
-    shape_ctx = _i64([B, S, H], "shape_ctx")
-    inits.append(shape_ctx)
-    nodes.append(onnx.helper.make_node("Reshape", ["ctx1", "shape_ctx"], ["ctx2"]))
-    nodes.append(onnx.helper.make_node("Identity", ["ctx2"], ["y"]))
+    inits.append(_f32(np.array(float(Dh) ** 0.5), "divisor"))
+    body += f"qk = MatMul({q_t}, {k_t})\n"
+    body += "scores = Div(qk, divisor)\n"
+    body += "attn = Softmax<axis = -1>(scores)\n"
+    body += f"ctx0 = MatMul(attn, {v_t})\n"
+    body += "ctx1 = Transpose<perm = [0, 2, 1, 3]>(ctx0)\n"
+    inits.append(_i64([B, S, H], "shape_ctx"))
+    body += "ctx2 = Reshape(ctx1, shape_ctx)\n"
+    body += "y = Identity(ctx2)\n"
 
-    graph = onnx.helper.make_graph(
-        nodes, "g", [_vi("x", [B, S, H])], [_vi("y", [B, S, H])], inits
-    )
-    model = onnx.helper.make_model(
-        graph, opset_imports=[onnx.helper.make_opsetid("", 17)], ir_version=10
+    model = _model(
+        f"""
+        g (float[{B},{S},{H}] x) => (float[{B},{S},{H}] y)
+        {{
+          {body}
+        }}
+        """,
+        initializer=inits,
     )
 
     simplified, ok = onnxsim.simplify(model)
@@ -502,25 +502,21 @@ def test_fuse_attention_recovers_input_flattened_by_gemm_conversion():
 # axes as a *separate*, 3-D-round-tripping step: Reshape -> Transpose([0,2,1])
 # -> Reshape. See MatchKTransposeSwapChain in fuse_attention.h.
 # --------------------------------------------------------------------------- #
-def _k_transpose_swap_chain_nodes(
+def _k_transpose_swap_chain_body(
     k_headsplit_out, B, NH, S, Dh, prefix, final_shape=None, flat_shape=None
 ):
     flat_shape = flat_shape if flat_shape is not None else [B * NH, S, Dh]
-    flat_shape = _i64(flat_shape, f"{prefix}_flat_shape")
     final_shape = final_shape if final_shape is not None else [B, NH, Dh, S]
-    final_shape_init = _i64(final_shape, f"{prefix}_final_shape")
-    nodes = [
-        onnx.helper.make_node(
-            "Reshape", [k_headsplit_out, flat_shape.name], [f"{prefix}_flat"]
-        ),
-        onnx.helper.make_node(
-            "Transpose", [f"{prefix}_flat"], [f"{prefix}_swapped"], perm=[0, 2, 1]
-        ),
-        onnx.helper.make_node(
-            "Reshape", [f"{prefix}_swapped", final_shape_init.name], [f"{prefix}_kt"]
-        ),
+    inits = [
+        _i64(flat_shape, f"{prefix}_flat_shape"),
+        _i64(final_shape, f"{prefix}_final_shape"),
     ]
-    return nodes, [flat_shape, final_shape_init], f"{prefix}_kt"
+    text = (
+        f"{prefix}_flat = Reshape({k_headsplit_out}, {prefix}_flat_shape)\n"
+        f"{prefix}_swapped = Transpose<perm = [0, 2, 1]>({prefix}_flat)\n"
+        f"{prefix}_kt = Reshape({prefix}_swapped, {prefix}_final_shape)\n"
+    )
+    return text, inits, f"{prefix}_kt"
 
 
 def _dynamo_style_k_model(
@@ -528,26 +524,23 @@ def _dynamo_style_k_model(
 ):
     Dh = H // NH
     rng = np.random.default_rng(seed)
-    inits = []
-    nodes = []
+    inits = [_i64([B, S, NH, Dh], "shape_qkv")]
+    body = ""
 
-    shape_qkv = _i64([B, S, NH, Dh], "shape_qkv")
-    inits.append(shape_qkv)
-
-    q_nodes, q_inits, q_out = _linear_nodes(rng, "x", H, H, "q", bias)
-    k_nodes, k_inits, k_out = _linear_nodes(rng, "x", H, H, "k", bias)
-    v_nodes, v_inits, v_out = _linear_nodes(rng, "x", H, H, "v", bias)
-    nodes += q_nodes + k_nodes + v_nodes
+    q_text, q_inits, q_out = _linear_body(rng, "x", H, H, "q", bias)
+    k_text, k_inits, k_out = _linear_body(rng, "x", H, H, "k", bias)
+    v_text, v_inits, v_out = _linear_body(rng, "x", H, H, "v", bias)
+    body += q_text + k_text + v_text
     inits += q_inits + k_inits + v_inits
 
-    qh_nodes, q_t = _head_split_nodes(q_out, "shape_qkv", [0, 2, 1, 3], "q")
+    qh_text, q_t = _head_split_body(q_out, "shape_qkv", [0, 2, 1, 3], "q")
     # Unlike every other test above, K is head-split with the *same* perm as
     # Q/V (not the direct-to-[0,2,3,1] form) -- the swap happens afterward.
-    kh_nodes, k_headsplit = _head_split_nodes(k_out, "shape_qkv", [0, 2, 1, 3], "k")
-    vh_nodes, v_t = _head_split_nodes(v_out, "shape_qkv", [0, 2, 1, 3], "v")
-    nodes += qh_nodes + kh_nodes + vh_nodes
+    kh_text, k_headsplit = _head_split_body(k_out, "shape_qkv", [0, 2, 1, 3], "k")
+    vh_text, v_t = _head_split_body(v_out, "shape_qkv", [0, 2, 1, 3], "v")
+    body += qh_text + kh_text + vh_text
 
-    kswap_nodes, kswap_inits, k_t = _k_transpose_swap_chain_nodes(
+    kswap_text, kswap_inits, k_t = _k_transpose_swap_chain_body(
         k_headsplit,
         B,
         NH,
@@ -557,32 +550,31 @@ def _dynamo_style_k_model(
         final_shape=k_final_shape,
         flat_shape=k_flat_shape,
     )
-    nodes += kswap_nodes
+    body += kswap_text
     inits += kswap_inits
 
-    divisor = _f32(np.array(float(Dh) ** 0.5), "divisor")
-    inits.append(divisor)
-    nodes.append(onnx.helper.make_node("MatMul", [q_t, k_t], ["qk"]))
-    nodes.append(onnx.helper.make_node("Div", ["qk", divisor.name], ["scores"]))
-    nodes.append(onnx.helper.make_node("Softmax", ["scores"], ["attn"], axis=-1))
-    nodes.append(onnx.helper.make_node("MatMul", ["attn", v_t], ["ctx0"]))
-    nodes.append(
-        onnx.helper.make_node("Transpose", ["ctx0"], ["ctx1"], perm=[0, 2, 1, 3])
-    )
-    shape_ctx = _i64([B, S, H], "shape_ctx")
-    inits.append(shape_ctx)
-    nodes.append(onnx.helper.make_node("Reshape", ["ctx1", "shape_ctx"], ["ctx2"]))
+    inits.append(_f32(np.array(float(Dh) ** 0.5), "divisor"))
+    body += f"qk = MatMul({q_t}, {k_t})\n"
+    body += "scores = Div(qk, divisor)\n"
+    body += "attn = Softmax<axis = -1>(scores)\n"
+    body += f"ctx0 = MatMul(attn, {v_t})\n"
+    body += "ctx1 = Transpose<perm = [0, 2, 1, 3]>(ctx0)\n"
+    inits.append(_i64([B, S, H], "shape_ctx"))
+    body += "ctx2 = Reshape(ctx1, shape_ctx)\n"
 
-    out_nodes, out_inits, out_name = _linear_nodes(rng, "ctx2", H, H, "out", bias)
-    nodes += out_nodes
+    out_text, out_inits, out_name = _linear_body(rng, "ctx2", H, H, "out", bias)
+    body += out_text
     inits += out_inits
-    nodes.append(onnx.helper.make_node("Identity", [out_name], ["y"]))
+    body += f"y = Identity({out_name})\n"
 
-    graph = onnx.helper.make_graph(
-        nodes, "g", [_vi("x", [B, S, H])], [_vi("y", [B, S, H])], inits
-    )
-    return onnx.helper.make_model(
-        graph, opset_imports=[onnx.helper.make_opsetid("", 17)], ir_version=10
+    return _model(
+        f"""
+        g (float[{B},{S},{H}] x) => (float[{B},{S},{H}] y)
+        {{
+          {body}
+        }}
+        """,
+        initializer=inits,
     )
 
 
