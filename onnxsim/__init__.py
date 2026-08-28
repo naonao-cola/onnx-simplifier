@@ -78,6 +78,7 @@ from onnxsim.precision_estimator import (
 from onnxsim.pruning import (
     apply_magnitude_pruning,
     apply_structured_pruning,
+    apply_structured_wanda_pruning,
     apply_wanda_pruning,
     weight_sparsity,
 )
@@ -113,6 +114,7 @@ __all__ = [
     "apply_magnitude_pruning",
     "apply_wanda_pruning",
     "apply_structured_pruning",
+    "apply_structured_wanda_pruning",
     "weight_sparsity",
     "convert_matmul_to_gemm",
     "workaround_ort_matmul_nbits_axis0_bug",
