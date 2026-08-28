@@ -2714,3 +2714,176 @@ def test_attention_head_pruning_handles_attention_and_gqa_in_one_model():
     y1, y2 = _run(pruned, {"X1": x1, "X2": x2})
     assert y1.shape == (batch, seq, Out1)
     assert y2.shape == (batch, seq, Out2)
+
+
+# --- magnitude/Wanda/SparseGPT pruning: Attention/GQA weights -----------
+#
+# The value-only (unstructured/N:M) pruning functions above -- as opposed
+# to this file's own attention *head* pruning section, which removes whole
+# heads -- reuse `_candidates()`/`_prune_weight()` unchanged for these
+# layer types; see onnxsim/pruning.py's own module docstring and
+# `_candidates`'s own docstring for the full reasoning. `_attention_model`/
+# `_gqa_model` (defined above, in the head-pruning section) are reused here
+# too -- same fused-attention topology, just pruned along a different axis.
+
+
+def test_magnitude_pruning_attention_merged_weight_reaches_target_sparsity():
+    model, cfg = _attention_model(K=8, H=4, D=4, Out=6, seed=20)
+    pruned = onnxsim.apply_magnitude_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    inits = {t.name: t for t in pruned.graph.initializer}
+    wqkv_pruned = onnx.numpy_helper.to_array(inits["Wqkv"])
+    assert wqkv_pruned.shape == cfg["wqkv"].shape
+    zeros = np.count_nonzero(wqkv_pruned == 0)
+    assert zeros / wqkv_pruned.size == pytest.approx(0.5, abs=1e-9)
+
+    # Bias is never touched by this pass -- only the matched weight is.
+    np.testing.assert_array_equal(
+        onnx.numpy_helper.to_array(inits["Bqkv"]), cfg["bqkv"]
+    )
+
+    # num_heads/qkv_hidden_sizes describe the merged weight's *column
+    # layout*, not any zeroed-vs-nonzero split within it -- since this pass
+    # only zeros values and never reshapes the weight, the whole node (not
+    # just these two attributes) must come out byte-identical.
+    node_before = _attention_node(model)
+    node_after = _attention_node(pruned)
+    assert node_after.SerializeToString() == node_before.SerializeToString()
+    num_heads, qkv = _attention_attrs(node_after)
+    assert num_heads == cfg["H"]
+    assert qkv == [cfg["Nq"], cfg["Nk"], cfg["Nv"]]
+
+
+def test_magnitude_pruning_attention_merged_weight_keeps_the_largest_entries_per_column():
+    model, cfg = _attention_model(K=8, H=4, D=4, Out=6, seed=21)
+    pruned = onnxsim.apply_magnitude_pruning(model, sparsity=0.75)
+
+    inits = {t.name: t for t in pruned.graph.initializer}
+    w = cfg["wqkv"].astype(np.float64)  # [K, N]
+    w_pruned = onnx.numpy_helper.to_array(inits["Wqkv"]).astype(np.float64)
+    keep_count = round(cfg["K"] * 0.25)
+    for col in range(w.shape[1]):
+        kept = np.flatnonzero(w_pruned[:, col] != 0)
+        assert len(kept) == keep_count
+        threshold = np.abs(w[:, col])[kept].min()
+        dropped_max = np.abs(w[:, col])[np.flatnonzero(w_pruned[:, col] == 0)].max()
+        assert dropped_max <= threshold
+
+
+def test_magnitude_pruning_attention_merged_weight_nm_pattern():
+    model, cfg = _attention_model(K=16, H=4, D=4, Out=6, seed=22)
+    pruned = onnxsim.apply_magnitude_pruning(model, n=2, m=4)
+    onnx.checker.check_model(pruned)
+
+    inits = {t.name: t for t in pruned.graph.initializer}
+    w_pruned = onnx.numpy_helper.to_array(inits["Wqkv"]).T  # [N, K]
+    for row in w_pruned:
+        for start in range(0, len(row), 4):
+            group = row[start : start + 4]
+            assert np.count_nonzero(group) <= 2
+
+
+def test_wanda_pruning_attention_merged_weight_falls_back_to_magnitude():
+    # `Attention`'s own `X` input is rank-3 ([batch, seq, hidden]), not the
+    # plain 2-D tensor Wanda's calibrated metric requires at the probe
+    # point -- the documented fallback every other MatMul/Gemm layer with a
+    # non-2-D activation already gets (see apply_wanda_pruning's own
+    # docstring), not a crash and not an untouched layer.
+    model, cfg = _attention_model(K=8, H=4, D=4, Out=6, seed=23)
+    rng = np.random.default_rng(24)
+    x = rng.standard_normal((2, 5, cfg["K"])).astype(np.float32)
+
+    magnitude_pruned = onnxsim.apply_magnitude_pruning(model, sparsity=0.5)
+    wanda_pruned = onnxsim.apply_wanda_pruning(
+        model, calibration_data=[{"X": x}], sparsity=0.5
+    )
+    onnx.checker.check_model(wanda_pruned)
+
+    inits_m = {t.name: t for t in magnitude_pruned.graph.initializer}
+    inits_w = {t.name: t for t in wanda_pruned.graph.initializer}
+    np.testing.assert_array_equal(
+        onnx.numpy_helper.to_array(inits_m["Wqkv"]),
+        onnx.numpy_helper.to_array(inits_w["Wqkv"]),
+    )
+
+
+def test_sparsegpt_pruning_attention_merged_weight_matches_reference_transliteration():
+    # Unlike Conv, `Attention`'s merged QKV weight has a plain `[*, K]`
+    # activation as its own input (no im2col unfolding), so it is
+    # deliberately included in SparseGPT's candidate list -- see
+    # apply_sparsegpt_pruning's own docstring. `H = X^T X` is computed the
+    # same way as any other MatMul/Gemm layer, reduced over every leading
+    # axis of the rank-3 `X`.
+    K = 8
+    model, cfg = _attention_model(K=K, H=4, D=4, Out=6, seed=25)
+    rng = np.random.default_rng(26)
+    x_cal = rng.standard_normal((3, 6, K)).astype(np.float32)  # [batch, seq, K]
+
+    pruned = onnxsim.apply_sparsegpt_pruning(
+        model, calibration_data=[{"X": x_cal}], sparsity=0.5, proc_block_size=6
+    )
+    onnx.checker.check_model(pruned)
+
+    x_flat = x_cal.reshape(-1, K).astype(np.float64)
+    w_nk = cfg["wqkv"].T.astype(np.float64)  # [N, K]
+    h = x_flat.T @ x_flat
+    expected_nk = _reference_sparsegpt(
+        w_nk, h, sparsity=0.5, n=None, m=None, percdamp=0.01, blocksize=6
+    )
+
+    inits = {t.name: t for t in pruned.graph.initializer}
+    w_pruned = onnx.numpy_helper.to_array(inits["Wqkv"]).T.astype(np.float64)
+    np.testing.assert_allclose(w_pruned, expected_nk, rtol=1e-6, atol=1e-6)
+
+    node_before = _attention_node(model)
+    node_after = _attention_node(pruned)
+    assert node_after.SerializeToString() == node_before.SerializeToString()
+
+
+def test_magnitude_pruning_gqa_qkv_weights_already_matched():
+    # Not new behavior: Wq/Wk/Wv are ordinary MatMul producers feeding
+    # GroupQueryAttention, not weights the op itself owns (see
+    # _match_gqa_producer's own docstring) -- `_candidates` already matched
+    # them as plain MatMul/Gemm layers before this task added any
+    # Attention-specific matching at all. This test exists to prove that
+    # explicitly rather than leaving it implicit.
+    model, cfg = _gqa_model(K=8, H=4, KVH=2, D=8, Out=6, seed=27)
+    pruned = onnxsim.apply_magnitude_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    inits = {t.name: t for t in pruned.graph.initializer}
+    for name, original in (("Wq", cfg["wq"]), ("Wk", cfg["wk"]), ("Wv", cfg["wv"])):
+        w = onnx.numpy_helper.to_array(inits[name])
+        assert w.shape == original.shape
+        zeros = np.count_nonzero(w == 0)
+        assert zeros / w.size == pytest.approx(0.5, abs=1e-9)
+        assert not np.array_equal(w, original)
+
+    # num_heads/kv_num_heads are untouched -- this is a value-only rewrite
+    # of Wq/Wk/Wv/Wout, not the structural head-pruning this file's own
+    # `apply_attention_head_pruning` performs on the same node type.
+    node_before = _gqa_node(model)
+    node_after = _gqa_node(pruned)
+    assert node_after.SerializeToString() == node_before.SerializeToString()
+
+    rng = np.random.default_rng(28)
+    x = rng.standard_normal((cfg["batch"], cfg["seq"], cfg["K"])).astype(np.float32)
+    (y,) = _run(pruned, {"X": x})
+    assert y.shape == (cfg["batch"], cfg["seq"], cfg["Out"])
+
+
+def test_weight_sparsity_includes_attention_and_gqa_weights():
+    model, cfg = _attention_model(K=8, H=4, D=4, Out=6, seed=29)
+    assert onnxsim.weight_sparsity(model) == 0.0
+    pruned = onnxsim.apply_magnitude_pruning(model, sparsity=0.5)
+    # Both Wqkv (newly matched here) and Wout (already matched before this
+    # task) are now exactly half-zero, so the whole model's aggregate
+    # sparsity is still 0.5 -- automatic, since weight_sparsity shares
+    # `_candidates` with every apply_*_pruning function.
+    assert onnxsim.weight_sparsity(pruned) == pytest.approx(0.5, abs=1e-9)
+
+    gqa_model, _ = _gqa_model(K=8, H=4, KVH=2, D=8, Out=6, seed=30)
+    assert onnxsim.weight_sparsity(gqa_model) == 0.0
+    gqa_pruned = onnxsim.apply_magnitude_pruning(gqa_model, sparsity=0.5)
+    assert onnxsim.weight_sparsity(gqa_pruned) == pytest.approx(0.5, abs=1e-9)
