@@ -1910,9 +1910,10 @@ def apply_structured_wanda_pruning(
 
 # --- Attention-head pruning -----------------------------------------------
 
-# Two ``com.microsoft`` domain contrib ops are matched here, each produced
-# by one of onnxsim's own fusion passes from a decomposed self-attention
-# block, and each pruned at the granularity its own kernel contract allows:
+# Three fused self-attention ops are matched here -- two from the
+# ``com.microsoft`` domain, produced by onnxsim's own fusion passes from a
+# decomposed self-attention block, plus the standard ``ai.onnx`` op -- each
+# pruned at the granularity its own kernel contract allows:
 #
 # - `Attention` (onnxsim/passes/fuse_attention.h): a single merged QKV
 #   weight/bias ([hidden_size, Nq+Nk+Nv] / [Nq+Nk+Nv]) plus
@@ -1940,10 +1941,40 @@ def apply_structured_wanda_pruning(
 #   (which would itself need slicing along the `kv_num_heads` axis) or a
 #   packed-QKV/missing-required-input node this module cannot prove safe to
 #   leave alone is declined outright -- see :func:`_match_gqa_producer`.
-#
-# The plain `ai.onnx` `Attention` op (opset 23+, a different schema again)
-# remains out of scope, the same kind of narrower-than-general-case boundary
-# Conv-group pruning above draws.
+# - the plain ``ai.onnx`` `Attention` (opset 24+, domain ``""``, schema
+#   confirmed against this environment's installed ``onnx==1.22.0`` via
+#   ``onnx.defs.get_schema("Attention", domain="")`` -- it is fully defined
+#   there, unlike the still-under-development op ``fuse_attention.h``'s own
+#   comment warns about for a different opset/op; see
+#   :func:`_match_onnx_attention_producer`'s own docstring for the exact
+#   attributes/inputs read off that schema): structurally the same shape as
+#   `GroupQueryAttention` -- separate, un-merged Q/K/V projections plus
+#   independent `q_num_heads`/`kv_num_heads` attributes, `q_num_heads` a
+#   positive multiple of `kv_num_heads` (the op's schema doc names this same
+#   MHA/GQA/MQA taxonomy explicitly) -- close enough a cousin that this pass
+#   reuses :class:`_GQAChain`, :func:`_apply_one_gqa_chain`, and
+#   :func:`_gqa_group_importance` for it outright rather than a parallel
+#   implementation (see :func:`_find_separate_qkv_chains`, the two matchers'
+#   shared caller). It differs in three ways this pass accounts for: (1) its
+#   query-head-count attribute is named `q_num_heads`, not `num_heads` --
+#   :class:`_GQAChain` carries which attribute name to write back
+#   (`num_heads_attr`); (2) it schema-allows V its own `head_size`
+#   independent of Q/K's (confirmed via the op's own backend test suite,
+#   e.g. ``test_attention_3d_diff_heads_sizes``) -- since
+#   :func:`_apply_one_gqa_chain`'s shared slicing assumes one uniform
+#   `head_size` the way `fuse_gqa.h` itself requires, a node whose V head
+#   size actually differs is declined rather than mis-sliced; (3) its
+#   optional `attn_mask`/`past_key`/`past_value` inputs (a different set
+#   from `GroupQueryAttention`'s own `past_key`/`past_value`/`seqlens_k`/
+#   `total_sequence_length`/`cos_cache`/`sin_cache`) get the same
+#   non-empty-constant-is-declined, dynamic-is-left-alone treatment
+#   :func:`_match_gqa_producer` already applies -- see
+#   :func:`_match_onnx_attention_producer`. Verified here via actual
+#   execution (``onnx.checker`` plus onnxruntime, both of which handle this
+#   op in this environment -- see ``tests/test_pruning.py``'s own "plain
+#   ai.onnx Attention" section), the same oracle-vs-onnxruntime bar every
+#   other function in this module is held to; no structural-only fallback
+#   was needed.
 _ATTENTION_DOMAIN = "com.microsoft"
 
 
@@ -1981,6 +2012,14 @@ class _GQAChain:
     consumer_node: onnx.NodeProto
     consumer_weight: str
     consumer_weight_transposed: bool
+    # Which attribute on `.node` holds the query head count:
+    # ``com.microsoft::GroupQueryAttention`` names it `num_heads`, the plain
+    # ``ai.onnx::Attention`` op (see :func:`_match_onnx_attention_producer`)
+    # names the same concept `q_num_heads` -- both share `kv_num_heads`
+    # verbatim, so only this one name needs to travel with the chain for
+    # :func:`_apply_one_gqa_chain`'s shared write-back to target the right
+    # attribute on either op.
+    num_heads_attr: str = "num_heads"
 
 
 # Either kind of matched attention block, sharing enough of a common shape
@@ -1988,7 +2027,12 @@ class _GQAChain:
 # :func:`_apply_attention_chains`'s own bookkeeping (touched-role tracking,
 # stale value_info cleanup) and the activation-probing setup in
 # :func:`apply_attention_head_wanda_pruning` treat both uniformly, only
-# dispatching on which one a given chain is for the actual slicing.
+# dispatching on which one a given chain is for the actual slicing. A
+# matched plain ``ai.onnx::Attention`` node is represented as a
+# :class:`_GQAChain` too (see that class's own `num_heads_attr` field) --
+# it is a *third* matched node type, not a third dataclass, since its
+# separate-Q/K/V-producer shape and whole-KV-group pruning unit are
+# identical to `GroupQueryAttention`'s own.
 _AttnLikeChain = Union[_AttentionChain, _GQAChain]
 
 
@@ -2235,7 +2279,86 @@ def _match_gqa_producer(
     return num_heads, kv_num_heads
 
 
-def _find_gqa_chains(graph: onnx.GraphProto) -> List[_GQAChain]:
+def _match_onnx_attention_producer(
+    node: onnx.NodeProto, initializer_map: Dict[str, onnx.TensorProto]
+) -> Optional[Tuple[int, int]]:
+    """If `node` is a plain ``ai.onnx`` ``Attention`` node (domain ``""``,
+    opset 24+ -- confirmed via ``onnx.defs.get_schema("Attention",
+    domain="")`` against this environment's installed ``onnx==1.22.0``, see
+    this module's own "Attention-head pruning" section comment) this module
+    can safely act on, returns ``(q_num_heads, kv_num_heads)``.
+
+    Structurally the closest cousin of :func:`_match_gqa_producer`: three
+    separate, un-merged query/key/value inputs (``Q``, ``K``, ``V`` at
+    indices 0/1/2, all required by the schema) rather than one merged
+    weight, plus independent `q_num_heads`/`kv_num_heads` attributes with
+    `q_num_heads` a positive multiple of `kv_num_heads` -- the same
+    MHA/GQA/MQA taxonomy the op's own schema doc names explicitly. Both
+    attributes are schema-*optional* (inferable from a rank-4 ``Q``/``K``
+    input's own head axis, per ``onnx.reference.ops.op_attention``'s
+    reference kernel), but this function requires both given explicitly:
+    the topology this pass matches -- ``Q``/``K``/``V`` arriving directly
+    from a MatMul/vanilla-Gemm projection's raw (rank-3,
+    ``[batch, seq, hidden]``) output, the same shape
+    :func:`_match_gqa_producer` already assumes for `GroupQueryAttention`
+    -- is exactly the case the reference kernel itself asserts both
+    attributes for, so a node relying on rank-4-inferred head counts isn't
+    a shape this pass tracks and is declined rather than guessed at.
+
+    The optional `attn_mask`/`past_key`/`past_value` inputs (indices 3/4/5
+    -- a different set from `GroupQueryAttention`'s own, and this op has no
+    `seqlens_k`/`total_sequence_length` equivalent to require) get the same
+    treatment :func:`_match_gqa_producer` gives `past_key`/`past_value`:
+    each is declined outright if it is connected to a non-empty constant
+    (real per-head mask or KV-cache data this function doesn't attempt to
+    slice), but left alone -- and does not block the match -- if dynamic
+    (an ordinary graph input or intermediate activation, the caller's own
+    runtime data). `nonpad_kv_seqlen` (index 6), like `GroupQueryAttention`'s
+    own `seqlens_k`, is `[batch_size]`-shaped and independent of head count,
+    so its presence never blocks a match either.
+    """
+    if node.domain != "" or node.op_type != "Attention":
+        return None
+    if len(node.input) < 3 or not (node.input[0] and node.input[1] and node.input[2]):
+        return None
+
+    q_num_heads = kv_num_heads = None
+    for attr in node.attribute:
+        if attr.name == "q_num_heads":
+            q_num_heads = attr.i
+        elif attr.name == "kv_num_heads":
+            kv_num_heads = attr.i
+    if not q_num_heads or not kv_num_heads or q_num_heads <= 0 or kv_num_heads <= 0:
+        return None
+    if q_num_heads % kv_num_heads != 0:
+        return None
+
+    for idx in (3, 4, 5):  # attn_mask, past_key, past_value
+        if len(node.input) <= idx or not node.input[idx]:
+            continue
+        const_init = initializer_map.get(node.input[idx])
+        if const_init is not None and int(np.prod(const_init.dims)) > 0:
+            return None  # non-empty constant -- would need slicing
+
+    return q_num_heads, kv_num_heads
+
+
+def _find_separate_qkv_chains(
+    graph: onnx.GraphProto,
+    match_producer,
+    num_heads_attr: str,
+) -> List[_GQAChain]:
+    """Shared body for :func:`_find_gqa_chains` and
+    :func:`_find_onnx_attention_chains`: both match a fused attention node
+    fed by three separate, un-merged Q/K/V MatMul/vanilla-Gemm projections
+    (as opposed to :func:`_find_attention_chains`'s single merged-QKV-weight
+    ``com.microsoft::Attention``) and prune it at whole-KV-group granularity
+    (see :func:`_apply_one_gqa_chain`/:func:`_gqa_group_importance`),
+    differing only in which node/attributes `match_producer` recognizes
+    (:func:`_match_gqa_producer` or :func:`_match_onnx_attention_producer`)
+    and which attribute on the matched node holds the query head count
+    (`num_heads_attr` -- see :class:`_GQAChain`'s own field of that name).
+    """
     initializer_map = {t.name: t for t in graph.initializer}
     consumers_of = _consumers_of(graph)
     graph_outputs = {o.name for o in graph.output}
@@ -2246,7 +2369,7 @@ def _find_gqa_chains(graph: onnx.GraphProto) -> List[_GQAChain]:
 
     chains = []
     for node in graph.node:
-        info = _match_gqa_producer(node, initializer_map)
+        info = match_producer(node, initializer_map)
         if info is None:
             continue
         num_heads, kv_num_heads = info
@@ -2289,17 +2412,27 @@ def _find_gqa_chains(graph: onnx.GraphProto) -> List[_GQAChain]:
             or nk // kv_num_heads != head_size
             or nv // kv_num_heads != head_size
         ):
-            continue  # fuse_gqa.h requires equal Q/K/V head_size
+            # `fuse_gqa.h` requires equal Q/K/V head_size, and this is the
+            # same restriction :func:`_match_onnx_attention_producer`'s own
+            # docstring narrows the plain ai.onnx op's own, more permissive
+            # schema down to (that op genuinely allows V its own head_size,
+            # see this module's "Attention-head pruning" section comment) --
+            # a node whose V head size actually differs is declined here
+            # rather than mis-sliced by this shared, uniform-head_size body.
+            continue
 
         out_name = node.output[0]
         if not _is_internal(out_name):
             continue
 
-        # GroupQueryAttention's raw output is Nq (= num_heads * head_size)
-        # wide -- unlike plain `Attention` (V-hidden-size-wide), its output
-        # is head-count-and-size symmetric with the query side, per
-        # fuse_gqa.h's own "Y = GroupQueryAttention(...)" shape comment --
-        # so `_walk_to_attention_consumer`'s generic "raw output width"
+        # Both matched ops' raw output is Nq (= num_heads * head_size) wide
+        # -- unlike plain `com.microsoft::Attention` (V-hidden-size-wide),
+        # each is head-count-and-size symmetric with the query side (per
+        # fuse_gqa.h's own "Y = GroupQueryAttention(...)" shape comment, and
+        # -- since this function only ever matches the equal-head_size case
+        # above -- the ai.onnx op's own "q_num_heads * head_size_v" output
+        # width, see its reference kernel) -- so
+        # `_walk_to_attention_consumer`'s generic "raw output width"
         # parameter is passed `nq` here, not an analogue of `nv`.
         consumer, chain_ops = _walk_to_attention_consumer(
             out_name, initializer_map, consumers_of, graph_outputs, nq
@@ -2326,9 +2459,25 @@ def _find_gqa_chains(graph: onnx.GraphProto) -> List[_GQAChain]:
                 consumer_node=consumer[0],
                 consumer_weight=consumer[1],
                 consumer_weight_transposed=consumer[2],
+                num_heads_attr=num_heads_attr,
             )
         )
     return chains
+
+
+def _find_gqa_chains(graph: onnx.GraphProto) -> List[_GQAChain]:
+    return _find_separate_qkv_chains(graph, _match_gqa_producer, "num_heads")
+
+
+def _find_onnx_attention_chains(graph: onnx.GraphProto) -> List[_GQAChain]:
+    """The plain ``ai.onnx::Attention`` analogue of :func:`_find_gqa_chains`
+    -- see :func:`_find_separate_qkv_chains` (the shared body) and
+    :func:`_match_onnx_attention_producer` (what's matched and why it's
+    declined otherwise).
+    """
+    return _find_separate_qkv_chains(
+        graph, _match_onnx_attention_producer, "q_num_heads"
+    )
 
 
 def _plain_attention_head_importance(
@@ -2475,12 +2624,14 @@ def _apply_one_gqa_chain(
     compute_group_importance,
 ) -> Optional[Tuple[Set[str], str, Set[str]]]:
     """Applies whole-KV-group pruning to one matched ``GroupQueryAttention``
-    block in place: every dropped group removes one *contiguous*
-    ``head_size``-wide column block from each of K's and V's own separate
-    weights, together with the ``num_heads / kv_num_heads`` query-head-sized
-    blocks mapped to that group from Q's own separate weight (and the
-    matching row block from the consumer) -- never an individual query head
-    in isolation. Returns
+    or plain ``ai.onnx::Attention`` block (see :class:`_GQAChain`'s own
+    `num_heads_attr` field for how the two are told apart when writing the
+    new query head count back) in place: every dropped group removes one
+    *contiguous* ``head_size``-wide column block from each of K's and V's
+    own separate weights, together with the ``num_heads / kv_num_heads``
+    query-head-sized blocks mapped to that group from Q's own separate
+    weight (and the matching row block from the consumer) -- never an
+    individual query head in isolation. Returns
     ``(producer_weight_names, consumer_weight_name, stale_output_names)`` on
     success, or ``None`` if `sparsity` rounds to no groups dropped for this
     block (a no-op, left for the caller to skip).
@@ -2535,7 +2686,7 @@ def _apply_one_gqa_chain(
     new_kv_num_heads = keep_count
     new_num_heads = keep_count * group_size
     for attr in chain.node.attribute:
-        if attr.name == "num_heads":
+        if attr.name == chain.num_heads_attr:
             attr.i = new_num_heads
         elif attr.name == "kv_num_heads":
             attr.i = new_kv_num_heads
@@ -2626,51 +2777,63 @@ def apply_attention_head_pruning(
     sparsity: float = 0.5,
 ) -> onnx.ModelProto:
     """Removes whole attention heads -- or, for grouped-query attention,
-    whole KV groups -- from every matched ``com.microsoft::Attention`` or
-    ``com.microsoft::GroupQueryAttention`` node (the fused self-attention
-    blocks onnxsim's own ``fuse_attention``/``fuse_gqa`` optimizer passes
-    produce, see this module's own "Attention-head pruning" section
-    comment) whose output feeds, optionally through a single shape-
-    preserving ``Reshape``, exactly one downstream MatMul/vanilla-Gemm's
-    reduction dimension (the output projection) -- the attention analogue
-    of :func:`apply_structured_pruning`, at head (or KV-group) instead of
-    single-channel granularity.
+    whole KV groups -- from every matched ``com.microsoft::Attention``,
+    ``com.microsoft::GroupQueryAttention``, or plain ``ai.onnx::Attention``
+    node (the fused self-attention blocks onnxsim's own
+    ``fuse_attention``/``fuse_gqa`` optimizer passes produce, plus the
+    standard ONNX op those two contrib ops are converging towards -- see
+    this module's own "Attention-head pruning" section comment for the real
+    schema each was confirmed against and how) whose output feeds,
+    optionally through a single shape-preserving ``Reshape``, exactly one
+    downstream MatMul/vanilla-Gemm's reduction dimension (the output
+    projection) -- the attention analogue of :func:`apply_structured_pruning`,
+    at head (or KV-group) instead of single-channel granularity.
 
-    For each matched plain ``Attention`` block: ranks every head by the
-    combined Frobenius norm of its own ``[hidden_size, head_size]`` Q, K,
-    and V weight columns, drops the lowest-``sparsity``-fraction of heads
-    (at least one head is always kept), and removes the corresponding
-    column blocks from the merged QKV weight (and bias, if present),
-    decrementing ``num_heads``/``qkv_hidden_sizes`` accordingly, and the
-    matching row block from the output projection's weight -- mathematically
-    unaffected for every surviving head, the same guarantee
+    For each matched plain ``com.microsoft::Attention`` block: ranks every
+    head by the combined Frobenius norm of its own
+    ``[hidden_size, head_size]`` Q, K, and V weight columns, drops the
+    lowest-``sparsity``-fraction of heads (at least one head is always
+    kept), and removes the corresponding column blocks from the merged QKV
+    weight (and bias, if present), decrementing
+    ``num_heads``/``qkv_hidden_sizes`` accordingly, and the matching row
+    block from the output projection's weight -- mathematically unaffected
+    for every surviving head, the same guarantee
     :func:`apply_structured_pruning` gives per channel.
 
-    For each matched ``GroupQueryAttention`` block: ranks every *KV group*
-    (a KV head and the ``num_heads / kv_num_heads`` query heads the kernel
-    maps to it) by the combined Frobenius norm of that group's own Q+K+V
-    weight block across Q's, K's, and V's own separate producer weights,
-    drops the lowest-``sparsity``-fraction of groups (at least one group is
-    always kept), and removes the corresponding column blocks from all
-    three producers (and their biases, if present) together with the
-    matching row block from the output projection's weight, decrementing
-    ``num_heads``/``kv_num_heads`` by the number of groups dropped -- so
-    their ratio (query heads per KV head) is unchanged, keeping every
-    surviving KV head mapped to exactly the same number of query heads the
-    kernel requires. An individual query head is never dropped on its own:
-    only a whole group, since GQA's kernel has no way to keep a KV head
-    alive for some, but not all, of the query heads that shared it.
+    For each matched ``GroupQueryAttention`` or plain ``ai.onnx::Attention``
+    block: ranks every *KV group* (a KV head and the
+    ``num_heads / kv_num_heads`` query heads the kernel maps to it) by the
+    combined Frobenius norm of that group's own Q+K+V weight block across
+    Q's, K's, and V's own separate producer weights, drops the
+    lowest-``sparsity``-fraction of groups (at least one group is always
+    kept), and removes the corresponding column blocks from all three
+    producers (and their biases, if present) together with the matching row
+    block from the output projection's weight, decrementing the query head
+    count (``num_heads`` for `GroupQueryAttention`, ``q_num_heads`` for the
+    plain ``ai.onnx`` op) and ``kv_num_heads`` by the number of groups
+    dropped -- so their ratio (query heads per KV head) is unchanged,
+    keeping every surviving KV head mapped to exactly the same number of
+    query heads the kernel requires. An individual query head is never
+    dropped on its own: only a whole group, since neither kernel has a way
+    to keep a KV head alive for some, but not all, of the query heads that
+    shared it. A plain ``ai.onnx::Attention`` node whose V head size
+    genuinely differs from Q/K's own (a shape that op's schema allows but
+    `GroupQueryAttention` never produces) is declined rather than mis-sliced
+    -- see :func:`_match_onnx_attention_producer`.
 
     :param model: the original onnx ModelProto or file path
     :param sparsity: target fraction of each matched block's heads (or, for
-            GroupQueryAttention, KV groups) to remove (at least one is
-            always kept)
+            GroupQueryAttention/plain ai.onnx Attention, KV groups) to
+            remove (at least one is always kept)
     :returns: ``model`` with every matched block's tensors resized in
             place; anything not matching that exact topology (a
             non-constant weight, a packed-QKV GroupQueryAttention node, a
-            GroupQueryAttention node with a non-empty constant past-KV-cache
-            input, a consumer whose reduction dimension doesn't line up,
-            ...) is left completely untouched
+            GroupQueryAttention/plain ai.onnx Attention node with a
+            non-empty constant past-KV-cache or attention-mask input, an
+            ai.onnx Attention node with differing Q/K/V head sizes or
+            without explicit ``q_num_heads``/``kv_num_heads`` attributes, a
+            consumer whose reduction dimension doesn't line up, ...) is left
+            completely untouched
     """
     if not (0.0 <= sparsity < 1.0):
         raise ValueError(f"sparsity must be in [0, 1), got {sparsity}")
@@ -2684,6 +2847,7 @@ def apply_attention_head_pruning(
     chains: List[_AttnLikeChain] = [
         *_find_attention_chains(graph),
         *_find_gqa_chains(graph),
+        *_find_onnx_attention_chains(graph),
     ]
     if chains:
         _apply_attention_chains(
@@ -2709,16 +2873,20 @@ def apply_attention_head_wanda_pruning(
     """The calibrated upgrade of :func:`apply_attention_head_pruning`,
     exactly as :func:`apply_structured_wanda_pruning` is to
     :func:`apply_structured_pruning`: same real head (or, for
-    GroupQueryAttention, whole-KV-group) removal, same topology matching,
-    but each unit's importance is ``||W||_F * ||X||_2`` -- the plain
-    Frobenius-norm weight score times the combined (root-sum-square)
-    activation norm of that unit's own slice of the *output projection's*
-    input, captured over calibration data -- instead of weight magnitude
-    alone. For a plain ``Attention`` block this is per head, exactly as
-    before; for a ``GroupQueryAttention`` block the activation norm is
-    combined (root-sum-square) over every query head a KV group owns,
-    mirroring how :func:`_gqa_group_importance` combines that same group's
-    weight norm across Q+K+V.
+    GroupQueryAttention/plain ai.onnx Attention, whole-KV-group) removal,
+    same topology matching (see :func:`apply_attention_head_pruning`'s own
+    docstring for the three matched op types), but each unit's importance
+    is ``||W||_F * ||X||_2`` -- the plain Frobenius-norm weight score times
+    the combined (root-sum-square) activation norm of that unit's own slice
+    of the *output projection's* input, captured over calibration data --
+    instead of weight magnitude alone. For a plain ``com.microsoft::Attention``
+    block this is per head, exactly as before; for a ``GroupQueryAttention``
+    or plain ``ai.onnx::Attention`` block the activation norm is combined
+    (root-sum-square) over every query head a KV group owns, mirroring how
+    :func:`_gqa_group_importance` combines that same group's weight norm
+    across Q+K+V -- both matched separate-Q/K/V-producer ops share that one
+    importance function (and this one calibrated wrapper around it)
+    unmodified.
 
     :param model: the original onnx ModelProto or file path
     :param calibration_data: representative input batches to measure each
@@ -2732,8 +2900,8 @@ def apply_attention_head_wanda_pruning(
     :param seed: seed for the random calibration data (ignored if
             ``calibration_data`` is supplied)
     :param sparsity: target fraction of each matched block's heads (or, for
-            GroupQueryAttention, KV groups) to remove (at least one is
-            always kept)
+            GroupQueryAttention/plain ai.onnx Attention, KV groups) to
+            remove (at least one is always kept)
     :param epsilon: floor applied to the accumulated per-unit activation
             norm, avoiding every unit of an all-zero activation tying at
             exactly the weight-only importance
@@ -2761,6 +2929,7 @@ def apply_attention_head_wanda_pruning(
     chains: List[_AttnLikeChain] = [
         *_find_attention_chains(graph),
         *_find_gqa_chains(graph),
+        *_find_onnx_attention_chains(graph),
     ]
     if not chains:
         return out
