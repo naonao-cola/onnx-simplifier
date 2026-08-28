@@ -11,7 +11,9 @@
 // INT8 per output channel from its static values; they differ only in how
 // the *activation* is quantized (a runtime-computed DynamicQuantizeLinear vs.
 // a calibrated, fixed QuantizeLinear/DequantizeLinear pair) and, downstream
-// of that, in the rest of the graph they build.
+// of that, in the rest of the graph they build. ReadInt8Matrix is also used
+// by defuse_matmul_integer_to_float.h, which reads back a weight one of
+// these passes quantized.
 
 #pragma once
 
@@ -110,6 +112,28 @@ inline std::vector<float> ReadFloatMatrix(const Tensor& w_t) {
     return ReadRawDataHostOrder<float>(w_t.data<float>(), numel);
   }
   return w_t.floats();
+}
+
+// Reads `q_t` (a 2-D INT8 constant) into a flat row-major vector<int8_t>,
+// regardless of whether it is stored as raw bytes (int8_t has no
+// byte-order concerns, but this still goes through ReadRawDataHostOrder for
+// consistency with every other raw_data read site -- see endian_read.h) or
+// ONNX's typed field for sub-32-bit integer types, which is int32_data (a
+// signed 8-bit code always round-trips through it unchanged).
+inline std::vector<int8_t> ReadInt8Matrix(const Tensor& q_t) {
+  const auto& sizes = q_t.sizes();
+  const int64_t numel = sizes[0] * sizes[1];
+  if (q_t.is_raw_data()) {
+    return ReadRawDataHostOrder<int8_t>(
+        reinterpret_cast<const int8_t*>(q_t.raw().data()), numel);
+  }
+  const std::vector<int32_t>& codes = q_t.int32s();
+  std::vector<int8_t> out(static_cast<size_t>(numel));
+  for (int64_t i = 0; i < numel; ++i) {
+    out[static_cast<size_t>(i)] =
+        static_cast<int8_t>(codes[static_cast<size_t>(i)]);
+  }
+  return out;
 }
 
 // Quantizes `w_t` (a 2-D float32 constant, laid out as [N, K] when
