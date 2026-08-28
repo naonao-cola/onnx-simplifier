@@ -957,6 +957,11 @@ def test_arg_reduce_select_last_index_is_rewritten():
         [helper.make_tensor_value_info("y", TensorProto.INT64, [1])],
     )
     model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+    # Pinned rather than left at helper.make_model's default (the currently
+    # installed onnx package's latest IR version): this test runs the raw
+    # model through onnxruntime directly, and CI's bundled onnxruntime build
+    # doesn't necessarily support the newest IR version.
+    model.ir_version = 10
     onnx.checker.check_model(model)
 
     sim_model, check_ok = onnxsim.simplify(model, check_n=0)
