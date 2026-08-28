@@ -27,9 +27,12 @@
 #     package version, not "whatever's current", so this stays matched.
 name: Pyodide / wasm32-emscripten build
 
+# `onnxsim/**` below still needs `!onnxsim/**/*.py` next to it: this build
+# only compiles onnxsim's C++ core into the nanobind extension, so a
+# Python-only change under onnxsim/ (or elsewhere) doesn't affect it.
 on:
   pull_request:
-    paths:
+    paths: &pyodide-wasm-paths
       - ".github/workflows/pyodide-wasm.yml"
       - "build_wasm_pyodide.sh"
       - "docs/wasm_pyodide.md"
@@ -38,19 +41,11 @@ on:
       - "CMakeLists.txt"
       - "cmake/**"
       - "onnxsim/**"
+      - "!onnxsim/**/*.py"
       - ".gitmodules"
   push:
     branches: ["master"]
-    paths:
-      - ".github/workflows/pyodide-wasm.yml"
-      - "build_wasm_pyodide.sh"
-      - "docs/wasm_pyodide.md"
-      - "scripts/pyodide_smoke_test.mjs"
-      - "scripts/pyodide_demo/**"
-      - "CMakeLists.txt"
-      - "cmake/**"
-      - "onnxsim/**"
-      - ".gitmodules"
+    paths: *pyodide-wasm-paths
   workflow_dispatch:
 
 permissions:

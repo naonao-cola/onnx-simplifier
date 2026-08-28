@@ -33,13 +33,16 @@ on:
     branches: ["master", "pages"]
     # Only rebuild/deploy the WASM convertmodel demo when files that actually
     # affect it change (the C++ sources, the build scripts, the demo assets,
-    # or this workflow itself).
-    paths:
+    # or this workflow itself). `!onnxsim/**/*.py` excludes onnxsim's
+    # Python-only files -- this build compiles onnxsim's C++ core into the
+    # wasm module and never touches them.
+    paths: &static-paths
       - ".github/workflows/static.yml"
       - "build_wasm.sh"
       - "CMakeLists.txt"
       - "cmake/**"
       - "onnxsim/**"
+      - "!onnxsim/**/*.py"
       - "scripts/convertmodel/**"
       - "scripts/regression/models.json"
       - "npm/onnxsim/**"
@@ -52,18 +55,7 @@ on:
   # for what this skips (Netron, Pages/Cloudflare deploy) to keep it cheaper
   # than a full demo build.
   pull_request:
-    paths:
-      - ".github/workflows/static.yml"
-      - "build_wasm.sh"
-      - "CMakeLists.txt"
-      - "cmake/**"
-      - "onnxsim/**"
-      - "scripts/convertmodel/**"
-      - "scripts/regression/models.json"
-      - "npm/onnxsim/**"
-      - "scripts/build_npm_package.sh"
-      - "scripts/stage_npm_package.sh"
-      - ".gitmodules"
+    paths: *static-paths
 
   # Per-PR Cloudflare previews are opt-in: comment `/preview` on the pull
   # request. `issue_comment` has no path filter, which is fine — the whole point
