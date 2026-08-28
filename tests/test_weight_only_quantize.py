@@ -1,7 +1,7 @@
 """Tests for ``onnxsim.quantize_weight_only`` (the
 ``weight_only_quantize_matmul``/``weight_only_quantize_conv`` C++ passes).
 
-Each model is built directly with ``onnx.helper`` (no torch dependency),
+Each model is built directly with ``onnx.parser`` (no torch dependency),
 quantized, and then actually run through ONNX Runtime -- both before and after
 quantization -- so these tests double as a minimal end-to-end
 simplify/quantize/deploy check: the quantized graph must load and execute
@@ -14,9 +14,9 @@ import collections
 
 import numpy as np
 import onnx
-import onnx.helper
 import onnx.numpy_helper
 import pytest
+from onnx import parser
 
 import onnxsim
 
@@ -25,17 +25,21 @@ import onnxsim
 ort = pytest.importorskip("onnxruntime")
 
 
-def _model(nodes, inputs, outputs, initializer, opset=13):
-    graph = onnx.helper.make_graph(nodes, "g", inputs, outputs, initializer)
-    # Pin a low IR version so the model loads under older onnxruntime builds
-    # (which cap at IR version 11), matching test_fusion_patterns.py.
-    return onnx.helper.make_model(
-        graph, opset_imports=[onnx.helper.make_opsetid("", opset)], ir_version=10
+def _model(body, initializer=(), opset=13, ir_version=10):
+    # Pin a low IR version by default so the model loads under older
+    # onnxruntime builds (which cap at IR version 11), matching
+    # test_fusion_patterns.py.
+    model = parser.parse_model(
+        f"""
+        <
+          ir_version: {ir_version},
+          opset_import: ["": {opset}]
+        >
+        {body}
+        """
     )
-
-
-def _vi(name, shape):
-    return onnx.helper.make_tensor_value_info(name, onnx.TensorProto.FLOAT, shape)
+    model.graph.initializer.extend(initializer)
+    return model
 
 
 def _f32(array, name):
@@ -69,8 +73,15 @@ def test_quantize_matmul():
     rng = np.random.default_rng(0)
     K, N = 32, 16
     weight = _f32(rng.standard_normal((K, N)) * 0.5, "W")
-    nodes = [onnx.helper.make_node("MatMul", ["X", "W"], ["Y"])]
-    model = _model(nodes, [_vi("X", [4, K])], [_vi("Y", [4, N])], [weight])
+    model = _model(
+        f"""
+        g (float[4,{K}] X) => (float[4,{N}] Y)
+        {{
+          Y = MatMul(X, W)
+        }}
+        """,
+        initializer=[weight],
+    )
 
     quant = onnxsim.quantize_weight_only(model)
     onnx.checker.check_model(quant)
@@ -93,8 +104,15 @@ def test_quantize_gemm_transb_with_bias():
     K, N = 24, 12
     weight = _f32(rng.standard_normal((N, K)) * 0.5, "W")
     bias = _f32(rng.standard_normal(N), "B")
-    nodes = [onnx.helper.make_node("Gemm", ["X", "W", "B"], ["Y"], transB=1)]
-    model = _model(nodes, [_vi("X", [3, K])], [_vi("Y", [3, N])], [weight, bias])
+    model = _model(
+        f"""
+        g (float[3,{K}] X) => (float[3,{N}] Y)
+        {{
+          Y = Gemm<transB = 1>(X, W, B)
+        }}
+        """,
+        initializer=[weight, bias],
+    )
 
     quant = onnxsim.quantize_weight_only(model)
     onnx.checker.check_model(quant)
@@ -110,13 +128,14 @@ def test_quantize_conv():
     rng = np.random.default_rng(2)
     cout, cin = 8, 3
     weight = _f32(rng.standard_normal((cout, cin, 3, 3)) * 0.5, "W")
-    nodes = [
-        onnx.helper.make_node(
-            "Conv", ["X", "W"], ["Y"], kernel_shape=[3, 3], pads=[1, 1, 1, 1]
-        )
-    ]
     model = _model(
-        nodes, [_vi("X", [1, cin, 16, 16])], [_vi("Y", [1, cout, 16, 16])], [weight]
+        f"""
+        g (float[1,{cin},16,16] X) => (float[1,{cout},16,16] Y)
+        {{
+          Y = Conv<kernel_shape = [3, 3], pads = [1, 1, 1, 1]>(X, W)
+        }}
+        """,
+        initializer=[weight],
     )
 
     quant = onnxsim.quantize_weight_only(model)
@@ -135,16 +154,14 @@ def test_quantize_conv_with_bias():
     cout, cin = 4, 2
     weight = _f32(rng.standard_normal((cout, cin, 3, 3)) * 0.5, "W")
     bias = _f32(rng.standard_normal(cout), "B")
-    nodes = [
-        onnx.helper.make_node(
-            "Conv", ["X", "W", "B"], ["Y"], kernel_shape=[3, 3], pads=[1, 1, 1, 1]
-        )
-    ]
     model = _model(
-        nodes,
-        [_vi("X", [2, cin, 8, 8])],
-        [_vi("Y", [2, cout, 8, 8])],
-        [weight, bias],
+        f"""
+        g (float[2,{cin},8,8] X) => (float[2,{cout},8,8] Y)
+        {{
+          Y = Conv<kernel_shape = [3, 3], pads = [1, 1, 1, 1]>(X, W, B)
+        }}
+        """,
+        initializer=[weight, bias],
     )
 
     quant = onnxsim.quantize_weight_only(model)
@@ -162,8 +179,14 @@ def test_quantize_conv_with_bias():
 def test_quantize_skips_non_constant_weight():
     # Both MatMul operands are graph inputs (neither is a constant), so there
     # is nothing to quantize ahead of time.
-    nodes = [onnx.helper.make_node("MatMul", ["X", "W"], ["Y"])]
-    model = _model(nodes, [_vi("X", [4, 8]), _vi("W", [8, 4])], [_vi("Y", [4, 4])], [])
+    model = _model(
+        """
+        g (float[4,8] X, float[8,4] W) => (float[4,4] Y)
+        {
+          Y = MatMul(X, W)
+        }
+        """
+    )
     quant = onnxsim.quantize_weight_only(model)
     assert _op_counts(quant)["MatMul"] == 1
     assert _op_counts(quant)["DequantizeLinear"] == 0
@@ -172,8 +195,15 @@ def test_quantize_skips_non_constant_weight():
 def test_quantize_skips_non_default_gemm_attrs():
     # alpha != 1 falls outside the "vanilla" Gemm shape this pass handles.
     weight = _f32(np.random.randn(8, 4).astype(np.float32), "W")
-    nodes = [onnx.helper.make_node("Gemm", ["X", "W"], ["Y"], alpha=2.0)]
-    model = _model(nodes, [_vi("X", [4, 8])], [_vi("Y", [4, 4])], [weight])
+    model = _model(
+        """
+        g (float[4,8] X) => (float[4,4] Y)
+        {
+          Y = Gemm<alpha = 2.0>(X, W)
+        }
+        """,
+        initializer=[weight],
+    )
     quant = onnxsim.quantize_weight_only(model)
     assert _op_counts(quant)["Gemm"] == 1
     assert _op_counts(quant)["DequantizeLinear"] == 0
@@ -182,8 +212,16 @@ def test_quantize_skips_non_default_gemm_attrs():
 def test_quantize_skips_old_opset():
     # DequantizeLinear's per-channel `axis` attribute needs opset >= 13.
     weight = _f32(np.random.randn(8, 4).astype(np.float32), "W")
-    nodes = [onnx.helper.make_node("MatMul", ["X", "W"], ["Y"])]
-    model = _model(nodes, [_vi("X", [4, 8])], [_vi("Y", [4, 4])], [weight], opset=12)
+    model = _model(
+        """
+        g (float[4,8] X) => (float[4,4] Y)
+        {
+          Y = MatMul(X, W)
+        }
+        """,
+        initializer=[weight],
+        opset=12,
+    )
     quant = onnxsim.quantize_weight_only(model)
     assert _op_counts(quant)["MatMul"] == 1
     assert _op_counts(quant)["DequantizeLinear"] == 0

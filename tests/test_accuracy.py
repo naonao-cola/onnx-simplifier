@@ -1,7 +1,7 @@
 """Tests for ``onnxsim.accuracy`` -- the unified ``QuantizationConfig``/
 ``quantize()`` dispatcher and the empirical ``measure_accuracy_drop`` tool.
 
-Models are built directly with ``onnx.helper``. ``measure_accuracy_drop``
+Models are built via ``onnx.parser.parse_model``. ``measure_accuracy_drop``
 and the ``quantize()``-dispatched calibration-based schemes execute the
 model (through ``onnxsim.backend``, onnxruntime when installed), so this
 mirrors ``test_dynamic_quantize_matmul_integer_to_float.py``'s
@@ -12,9 +12,9 @@ onnxruntime doesn't ship wheels for.
 
 import numpy as np
 import onnx
-import onnx.helper
 import onnx.numpy_helper
 import pytest
+from onnx import parser
 
 import onnxsim
 from onnxsim.accuracy import (
@@ -26,27 +26,38 @@ from onnxsim.accuracy import (
 ort = pytest.importorskip("onnxruntime")
 
 
-def _vi(name, shape):
-    return onnx.helper.make_tensor_value_info(name, onnx.TensorProto.FLOAT, shape)
-
-
-def _f32(array, name):
-    return onnx.numpy_helper.from_array(np.asarray(array, dtype=np.float32), name)
+def _model(body, initializer=(), opset=21, ir_version=10):
+    model = parser.parse_model(
+        f"""
+        <
+          ir_version: {ir_version},
+          opset_import: ["": {opset}]
+        >
+        {body}
+        """
+    )
+    model.graph.initializer.extend(initializer)
+    return model
 
 
 def _linear_model(K=64, N=32, opset=21, seed=0):
     rng = np.random.default_rng(seed)
-    w = _f32(rng.standard_normal((K, N)) * 0.3, "W")
-    b = _f32(rng.standard_normal(N) * 0.1, "B")
-    nodes = [
-        onnx.helper.make_node("MatMul", ["X", "W"], ["mm"]),
-        onnx.helper.make_node("Add", ["mm", "B"], ["Y"]),
-    ]
-    graph = onnx.helper.make_graph(
-        nodes, "g", [_vi("X", [4, K])], [_vi("Y", [4, N])], [w, b]
+    w = onnx.numpy_helper.from_array(
+        (rng.standard_normal((K, N)) * 0.3).astype(np.float32), "W"
     )
-    return onnx.helper.make_model(
-        graph, opset_imports=[onnx.helper.make_opsetid("", opset)], ir_version=10
+    b = onnx.numpy_helper.from_array(
+        (rng.standard_normal(N) * 0.1).astype(np.float32), "B"
+    )
+    return _model(
+        f"""
+        g (float[4,{K}] X) => (float[4,{N}] Y)
+        {{
+          mm = MatMul(X, W)
+          Y = Add(mm, B)
+        }}
+        """,
+        initializer=[w, b],
+        opset=opset,
     )
 
 
