@@ -9,9 +9,9 @@ import collections
 
 import numpy as np
 import onnx
-import onnx.helper
 import onnx.numpy_helper
 import pytest
+from onnx import parser
 
 import onnxsim
 
@@ -20,15 +20,16 @@ import onnxsim
 ort = pytest.importorskip("onnxruntime")
 
 
-def _model(nodes, inputs, outputs, initializer, opset=13):
-    graph = onnx.helper.make_graph(nodes, "g", inputs, outputs, initializer)
-    return onnx.helper.make_model(
-        graph, opset_imports=[onnx.helper.make_opsetid("", opset)], ir_version=10
+def _model(body, opset=13):
+    return parser.parse_model(
+        f"""
+        <
+          ir_version: 10,
+          opset_import: ["": {opset}]
+        >
+        {body}
+        """
     )
-
-
-def _vi(name, shape):
-    return onnx.helper.make_tensor_value_info(name, onnx.TensorProto.FLOAT, shape)
 
 
 def _run(model, feeds):
@@ -53,8 +54,14 @@ def _assert_close(float_outputs, quant_outputs, rel_l2_tol=0.1):
 
 def test_quantize_sigmoid():
     rng = np.random.default_rng(0)
-    nodes = [onnx.helper.make_node("Sigmoid", ["X"], ["Y"])]
-    model = _model(nodes, [_vi("X", [4, 8])], [_vi("Y", [4, 8])], [])
+    model = _model(
+        """
+        g (float[4,8] X) => (float[4,8] Y)
+        {
+          Y = Sigmoid(X)
+        }
+        """
+    )
 
     quant = onnxsim.quantize_qoperator_activation(
         model, num_calibration_samples=16, seed=0
@@ -74,8 +81,14 @@ def test_quantize_sigmoid():
 
 def test_quantize_leaky_relu():
     rng = np.random.default_rng(1)
-    nodes = [onnx.helper.make_node("LeakyRelu", ["X"], ["Y"], alpha=0.2)]
-    model = _model(nodes, [_vi("X", [4, 8])], [_vi("Y", [4, 8])], [])
+    model = _model(
+        """
+        g (float[4,8] X) => (float[4,8] Y)
+        {
+          Y = LeakyRelu<alpha = 0.2>(X)
+        }
+        """
+    )
 
     quant = onnxsim.quantize_qoperator_activation(
         model, num_calibration_samples=16, seed=1
@@ -99,8 +112,14 @@ def test_quantize_leaky_relu_default_alpha():
     # LeakyRelu's alpha defaults to 0.01 when omitted -- the rewrite must
     # carry that default over, not silently drop it to 0.
     rng = np.random.default_rng(2)
-    nodes = [onnx.helper.make_node("LeakyRelu", ["X"], ["Y"])]
-    model = _model(nodes, [_vi("X", [4, 8])], [_vi("Y", [4, 8])], [])
+    model = _model(
+        """
+        g (float[4,8] X) => (float[4,8] Y)
+        {
+          Y = LeakyRelu(X)
+        }
+        """
+    )
 
     quant = onnxsim.quantize_qoperator_activation(
         model, num_calibration_samples=16, seed=2
@@ -116,12 +135,16 @@ def test_quantize_leaky_relu_default_alpha():
 
 def test_quantize_multiple_independent_nodes():
     rng = np.random.default_rng(3)
-    nodes = [
-        onnx.helper.make_node("Sigmoid", ["A"], ["T1"]),
-        onnx.helper.make_node("LeakyRelu", ["B"], ["T2"], alpha=0.1),
-        onnx.helper.make_node("Concat", ["T1", "T2"], ["C"], axis=0),
-    ]
-    model = _model(nodes, [_vi("A", [4, 8]), _vi("B", [4, 8])], [_vi("C", [8, 8])], [])
+    model = _model(
+        """
+        g (float[4,8] A, float[4,8] B) => (float[8,8] C)
+        {
+          T1 = Sigmoid(A)
+          T2 = LeakyRelu<alpha = 0.1>(B)
+          C = Concat<axis = 0>(T1, T2)
+        }
+        """
+    )
 
     quant = onnxsim.quantize_qoperator_activation(
         model, num_calibration_samples=16, seed=3
@@ -138,16 +161,13 @@ def test_quantize_multiple_independent_nodes():
 
 
 def test_quantize_skips_non_float():
-    nodes = [onnx.helper.make_node("Sigmoid", ["X"], ["Y"])]
-    graph = onnx.helper.make_graph(
-        nodes,
-        "g",
-        [onnx.helper.make_tensor_value_info("X", onnx.TensorProto.FLOAT16, [4])],
-        [onnx.helper.make_tensor_value_info("Y", onnx.TensorProto.FLOAT16, [4])],
-        [],
-    )
-    model = onnx.helper.make_model(
-        graph, opset_imports=[onnx.helper.make_opsetid("", 13)], ir_version=10
+    model = _model(
+        """
+        g (float16[4] X) => (float16[4] Y)
+        {
+          Y = Sigmoid(X)
+        }
+        """
     )
     quant = onnxsim.quantize_qoperator_activation(model)
     assert _op_counts(quant)["Sigmoid"] == 1
@@ -155,8 +175,14 @@ def test_quantize_skips_non_float():
 
 
 def test_list_qoperator_activation_quantizable_tensors():
-    nodes = [onnx.helper.make_node("Sigmoid", ["X"], ["Y"])]
-    model = _model(nodes, [_vi("X", [4, 8])], [_vi("Y", [4, 8])], [])
+    model = _model(
+        """
+        g (float[4,8] X) => (float[4,8] Y)
+        {
+          Y = Sigmoid(X)
+        }
+        """
+    )
     import onnxsim.onnxsim_cpp2py_export as C
 
     names = C.list_qoperator_activation_quantizable_tensors(model.SerializeToString())
