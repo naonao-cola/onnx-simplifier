@@ -9,9 +9,9 @@ import collections
 
 import numpy as np
 import onnx
-import onnx.helper
 import onnx.numpy_helper
 import pytest
+from onnx import parser
 
 import onnxsim
 
@@ -20,19 +20,18 @@ import onnxsim
 ort = pytest.importorskip("onnxruntime")
 
 
-def _model(nodes, inputs, outputs, initializer, opset=13):
-    graph = onnx.helper.make_graph(nodes, "g", inputs, outputs, initializer)
-    return onnx.helper.make_model(
-        graph, opset_imports=[onnx.helper.make_opsetid("", opset)], ir_version=10
+def _model(body, initializer=(), opset=13, ir_version=10):
+    model = parser.parse_model(
+        f"""
+        <
+          ir_version: {ir_version},
+          opset_import: ["": {opset}]
+        >
+        {body}
+        """
     )
-
-
-def _vi(name, shape):
-    return onnx.helper.make_tensor_value_info(name, onnx.TensorProto.FLOAT, shape)
-
-
-def _bvi(name, shape):
-    return onnx.helper.make_tensor_value_info(name, onnx.TensorProto.BOOL, shape)
+    model.graph.initializer.extend(initializer)
+    return model
 
 
 def _f32(array, name):
@@ -61,12 +60,13 @@ def _assert_close(float_outputs, quant_outputs, rel_l2_tol=0.1):
 
 def test_quantize_where():
     rng = np.random.default_rng(0)
-    nodes = [onnx.helper.make_node("Where", ["Cond", "A", "B"], ["C"])]
     model = _model(
-        nodes,
-        [_bvi("Cond", [4, 8]), _vi("A", [4, 8]), _vi("B", [4, 8])],
-        [_vi("C", [4, 8])],
-        [],
+        """
+        g (bool[4,8] Cond, float[4,8] A, float[4,8] B) => (float[4,8] C)
+        {
+          C = Where(Cond, A, B)
+        }
+        """
     )
 
     quant = onnxsim.quantize_qoperator_where(model, num_calibration_samples=16, seed=0)
@@ -88,12 +88,13 @@ def test_quantize_where():
 
 def test_quantize_where_broadcast():
     rng = np.random.default_rng(4)
-    nodes = [onnx.helper.make_node("Where", ["Cond", "A", "B"], ["C"])]
     model = _model(
-        nodes,
-        [_bvi("Cond", [1, 8]), _vi("A", [4, 8]), _vi("B", [4, 1])],
-        [_vi("C", [4, 8])],
-        [],
+        """
+        g (bool[1,8] Cond, float[4,8] A, float[4,1] B) => (float[4,8] C)
+        {
+          C = Where(Cond, A, B)
+        }
+        """
     )
 
     quant = onnxsim.quantize_qoperator_where(model, num_calibration_samples=16, seed=4)
@@ -111,9 +112,14 @@ def test_quantize_skips_constant_operand():
     # A constant operand is left alone -- it should be quantized from its
     # own static values, not force-fed through the calibration harness.
     const = _f32(np.random.default_rng(2).standard_normal((4, 8)), "B")
-    nodes = [onnx.helper.make_node("Where", ["Cond", "A", "B"], ["C"])]
     model = _model(
-        nodes, [_bvi("Cond", [4, 8]), _vi("A", [4, 8])], [_vi("C", [4, 8])], [const]
+        """
+        g (bool[4,8] Cond, float[4,8] A) => (float[4,8] C)
+        {
+          C = Where(Cond, A, B)
+        }
+        """,
+        initializer=[const],
     )
 
     import onnxsim.onnxsim_cpp2py_export as C
@@ -127,20 +133,13 @@ def test_quantize_skips_constant_operand():
 
 
 def test_quantize_skips_non_float():
-    nodes = [onnx.helper.make_node("Where", ["Cond", "A", "B"], ["C"])]
-    graph = onnx.helper.make_graph(
-        nodes,
-        "g",
-        [
-            _bvi("Cond", [4]),
-            onnx.helper.make_tensor_value_info("A", onnx.TensorProto.INT64, [4]),
-            onnx.helper.make_tensor_value_info("B", onnx.TensorProto.INT64, [4]),
-        ],
-        [onnx.helper.make_tensor_value_info("C", onnx.TensorProto.INT64, [4])],
-        [],
-    )
-    model = onnx.helper.make_model(
-        graph, opset_imports=[onnx.helper.make_opsetid("", 13)], ir_version=10
+    model = _model(
+        """
+        g (bool[4] Cond, int64[4] A, int64[4] B) => (int64[4] C)
+        {
+          C = Where(Cond, A, B)
+        }
+        """
     )
     quant = onnxsim.quantize_qoperator_where(model)
     assert _op_counts(quant)["Where"] == 1
@@ -148,12 +147,13 @@ def test_quantize_skips_non_float():
 
 
 def test_list_qoperator_where_quantizable_tensors():
-    nodes = [onnx.helper.make_node("Where", ["Cond", "A", "B"], ["C"])]
     model = _model(
-        nodes,
-        [_bvi("Cond", [4, 8]), _vi("A", [4, 8]), _vi("B", [4, 8])],
-        [_vi("C", [4, 8])],
-        [],
+        """
+        g (bool[4,8] Cond, float[4,8] A, float[4,8] B) => (float[4,8] C)
+        {
+          C = Where(Cond, A, B)
+        }
+        """
     )
     import onnxsim.onnxsim_cpp2py_export as C
 
