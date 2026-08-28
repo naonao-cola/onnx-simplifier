@@ -6,9 +6,9 @@ round-to-nearest quantization of both the weight and the activation).
 
 import numpy as np
 import onnx
-import onnx.helper
 import onnx.numpy_helper
 import pytest
+from onnx import parser
 
 import onnxsim
 from onnxsim.duquant import _build_duquant_rotation
@@ -16,31 +16,36 @@ from onnxsim.duquant import _build_duquant_rotation
 ort = pytest.importorskip("onnxruntime")
 
 
-def _vi(name, shape):
-    return onnx.helper.make_tensor_value_info(name, onnx.TensorProto.FLOAT, shape)
+def _model(body, initializer=(), opset=21, ir_version=10):
+    model = parser.parse_model(
+        f"""
+        <
+          ir_version: {ir_version},
+          opset_import: ["": {opset}]
+        >
+        {body}
+        """
+    )
+    model.graph.initializer.extend(initializer)
+    return model
 
 
 def _f32(array, name):
     return onnx.numpy_helper.from_array(array.astype(np.float32), name)
 
 
-def _model(nodes, inputs, outputs, initializer, opset=21):
-    graph = onnx.helper.make_graph(nodes, "g", inputs, outputs, initializer)
-    return onnx.helper.make_model(
-        graph, opset_imports=[onnx.helper.make_opsetid("", opset)], ir_version=10
-    )
-
-
 def _matmul_model(K=32, N=8, weight=None, seed=0, opset=21):
     if weight is None:
         rng = np.random.default_rng(seed)
         weight = rng.standard_normal((K, N)).astype(np.float32) * 0.5
-    nodes = [onnx.helper.make_node("MatMul", ["X", "W"], ["Y"])]
     return _model(
-        nodes,
-        [_vi("X", ["batch", K])],
-        [_vi("Y", ["batch", N])],
-        [_f32(weight, "W")],
+        f"""
+        g (float[batch,{K}] X) => (float[batch,{N}] Y)
+        {{
+          Y = MatMul(X, W)
+        }}
+        """,
+        initializer=[_f32(weight, "W")],
         opset=opset,
     )
 
@@ -131,12 +136,14 @@ def test_duquant_gemm_transb_with_bias():
     K, N = 32, 8
     weight = rng.standard_normal((N, K)).astype(np.float32) * 0.5
     bias = rng.standard_normal((N,)).astype(np.float32) * 0.1
-    nodes = [onnx.helper.make_node("Gemm", ["X", "W", "B"], ["Y"], transB=1)]
     model = _model(
-        nodes,
-        [_vi("X", ["batch", K])],
-        [_vi("Y", ["batch", N])],
-        [_f32(weight, "W"), _f32(bias, "B")],
+        f"""
+        g (float[batch,{K}] X) => (float[batch,{N}] Y)
+        {{
+          Y = Gemm<transB=1>(X, W, B)
+        }}
+        """,
+        initializer=[_f32(weight, "W"), _f32(bias, "B")],
     )
     q = onnxsim.apply_duquant(model, block_size=8, num_samples=16, seed=6)
     onnx.checker.check_model(q)
@@ -155,17 +162,27 @@ def test_duquant_declines_when_k_not_divisible_by_block_size():
 
 
 def test_duquant_declines_non_constant_weight():
-    nodes = [onnx.helper.make_node("MatMul", ["X", "W"], ["Y"])]
     model = _model(
-        nodes, [_vi("X", [4, 32]), _vi("W", [32, 4])], [_vi("Y", [4, 4])], []
+        """
+        g (float[4,32] X, float[32,4] W) => (float[4,4] Y)
+        {
+          Y = MatMul(X, W)
+        }
+        """
     )
     q = onnxsim.apply_duquant(model)
     assert q.SerializeToString() == model.SerializeToString()
 
 
 def test_duquant_noop_when_no_matmul_present():
-    nodes = [onnx.helper.make_node("Relu", ["X"], ["Y"])]
-    model = _model(nodes, [_vi("X", [4, 4])], [_vi("Y", [4, 4])], [])
+    model = _model(
+        """
+        g (float[4,4] X) => (float[4,4] Y)
+        {
+          Y = Relu(X)
+        }
+        """
+    )
     result = onnxsim.apply_duquant(model)
     assert result.SerializeToString() == model.SerializeToString()
 
