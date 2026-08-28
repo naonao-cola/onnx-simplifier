@@ -53,8 +53,37 @@ of fan-out this still declines rather than guesses at, leaving an
 a single residual connection whose branches don't fan out elsewhere (e.g. a
 projection-shortcut block, or a stage's last block before something else
 consumes its output) and a genuinely linear stack of `Add`-only merges.
+
+The exact same construction is repeated for MatMul/Gemm chains -- see
+:func:`_find_matmul_residual_chains`'s own section comment for the full
+reasoning, which mirrors the Conv case's above closely enough that only the
+differences are worth restating here: the backward walk mirrors
+:func:`_walk_to_consumer`'s own *wider* MatMul/Gemm hop set (unary
+activations plus a per-channel bias/scale ``Add``/``Mul`` against a
+constant, not just unary activations) rather than the Conv walk's narrower
+one, since MatMul/Gemm has no depthwise-Conv-style transparent pass-through
+hop at all. This is exactly the residual-stream shape every current
+transformer block takes (``x = x + SelfAttn(LN(x))``, ``x = x + MLP(LN(x))``)
+-- previously declined outright, now reached the same way a Conv
+projection-shortcut block is. Two compositions were checked and found not
+safe to fold in silently, so both are declined the same conservative way as
+everything else in this pass: a gated (SwiGLU/GeGLU) combine feeding a
+residual branch directly, with no output-projection MatMul in between (the
+backward walk has no way to pick "the" one branch through a `Mul` of two
+non-constant operands without silently dropping the other's contribution);
+and a residual branch that would need to cross a fused self-attention op
+boundary (`Attention`/`GroupQueryAttention`, see the "Attention-head
+pruning" section far below) to reach a real producer, with no
+output-projection MatMul between the attention op and the `Add` either.
+Both are narrow, exporter-dependent shapes rather than the common case --
+an FFN's own down-projection or an attention block's own output projection
+feeding the residual `Add` (overwhelmingly the normal shape) needs no
+special handling at all, since the backward walk stops at that projection's
+own MatMul/Gemm node without ever looking further upstream at what feeds
+it.
+
 General multi-branch dependency-graph pruning -- arbitrary fan-out, non-Add
-merges (`Concat`, ...), MatMul/Gemm residuals -- remains out of scope. The
+merges (`Concat`, ...) -- remains out of scope. The
 other part of the paper's pipeline -- an architecture *search* over what to prune,
 alternated with knowledge-distillation/RL recovery afterwards -- needs a
 training loop onnxsim does not have and is not in scope here at all; this
@@ -2045,8 +2074,9 @@ def _find_conv_chains(graph: onnx.GraphProto) -> List[_Chain]:
 def _is_eligible_add_merge(
     node: onnx.NodeProto, initializer_map: Dict[str, onnx.TensorProto]
 ) -> bool:
-    """True for an ``Add`` node :func:`_find_conv_residual_chains` may treat
-    as a residual merge point: exactly two distinct, non-constant operands.
+    """True for an ``Add`` node :func:`_find_conv_residual_chains`/
+    :func:`_find_matmul_residual_chains` may treat as a residual merge
+    point: exactly two distinct, non-constant operands.
     A per-channel bias/scale ``Add`` (one operand a constant initializer --
     already out of scope for Conv chains generally, see this module's own
     docstring) or a degenerate ``Add(x, x)`` never qualifies -- neither is a
@@ -2348,6 +2378,366 @@ def _find_conv_residual_chains(graph: onnx.GraphProto) -> List[_Chain]:
                 n_channels=n_channels,
                 consumer_is_conv=True,
                 conv_pass_through=tuple(pass_through) + fwd_pass_through,
+            )
+        )
+    return chains
+
+
+# --- MatMul/Gemm residual (Add-merged) chains -------------------------------
+#
+# The MatMul/Gemm analogue of the Conv residual/Add-merge grouping above --
+# same union-find-over-eligible-`Add`-merge-points construction, same
+# provably-safe special case (`y = Add(a, b)`, two non-constant operands,
+# forces whichever real producer(s) feed `a`/`b` to agree on one shared
+# channel-index set), same single-consumer safety bar on every hop of every
+# branch, and the same reasoning for why an *interior* block of a deep
+# residual stack (its own "post-block" tensor read both by the next block
+# and directly by that block's own `Add`) is declined while a lone residual
+# connection or a linear stack of `Add`-only merges is reached. See
+# `_find_conv_residual_chains`'s own section comment above for the shared
+# half of that reasoning; only what's different for MatMul/Gemm is covered
+# here. `_is_eligible_add_merge` above is reused unchanged -- it was never
+# Conv-specific to begin with (it only inspects the `Add` node's own
+# operands against `initializer_map`), so no MatMul-specific variant is
+# needed.
+#
+# This is exactly the shape every current transformer block's residual
+# stream takes -- `x = x + SelfAttn(LN(x))`, `x = x + MLP(LN(x))` -- the
+# single most valuable gap this closes versus the Conv-only residual
+# support above, since a MatMul/Gemm residual chain was previously declined
+# outright (see this module's own docstring's prior "MatMul/Gemm
+# residuals ... remains out of scope" sentence, now narrowed).
+#
+# One real structural difference from the Conv version, not just a
+# find-and-replace of "Conv" with "MatMul/Gemm": `_walk_to_consumer` (the
+# MatMul/Gemm forward walk) allows a *wider* hop set than
+# `_walk_to_conv_consumer` does -- not just unary activations, but also a
+# per-channel bias/scale `Add`/`Mul` against a *constant* initializer (see
+# this module's own docstring's "shape-preserving elementwise ops ...
+# and for MatMul/Gemm also a bias/scale add/mul" phrase, and
+# `_walk_to_consumer`'s own `_BINARY_CHANNEL_OPS` branch). There is no
+# MatMul/Gemm analogue of a depthwise-Conv pass-through hop at all -- nothing
+# in the MatMul/Gemm producer/consumer vocabulary mixes channels
+# transparently the way a depthwise Conv does -- so `_walk_matmul_producer_backward`
+# below mirrors *that* wider hop set symmetrically instead: unary
+# pass-through activations (as before) plus a per-channel `Add`/`Mul` against
+# a constant, walked backward through to whichever tensor it combined with.
+# Distinguishing that per-channel bias/scale hop from an eligible residual
+# merge is the crux of the whole backward walk, and it falls out for free
+# from `_is_eligible_add_merge`'s own definition: an `Add` with exactly one
+# constant operand can never be an eligible merge (it requires *both*
+# operands non-constant), so it is unambiguously a bias hop instead, and a
+# `Mul` is never a merge candidate at all (only `Add` is, per
+# `_is_eligible_add_merge`'s own op-type check) -- a per-channel `Mul` hop and
+# a residual `Add` merge are never the same node under any input shape.
+#
+# Because the backward walk doesn't yet know the group's real, shared
+# channel count at the point it first crosses a bias/scale hop (the same
+# situation `_match_conv_pass_through_self` documents for a depthwise Conv
+# hop), it only self-consistently checks the constant is float and
+# effectively a flat per-last-axis vector (`prod(dims) == dims[-1]`) when
+# first crossed, deferring the real `dims[-1] == n_channels` check to
+# `_find_matmul_residual_chains` once the group's producers establish it --
+# exactly the same defer-then-revalidate split the depthwise Conv hop above
+# uses for its own group-count check.
+#
+# Two compositions this was checked against and found *not* safe to handle
+# silently, so both are declined outright (the group is poisoned, left
+# untouched) rather than guessed at, the same conservative choice
+# `_find_conv_chains` makes for "both sides grouped with a different group
+# count":
+#
+# - **A gated (SwiGLU/GeGLU-style) pair feeding directly into a residual
+#   branch with no downstream projection in between** -- `Add(x, Mul(gate,
+#   up))` rather than the usual `Add(x, MatMul(Mul(gate, up), Wd))`. A `Mul`
+#   node reached while walking backward always has *two* non-constant
+#   operands to choose between (unlike a bias/scale `Mul`, which has exactly
+#   one constant operand and is walked through as an ordinary hop above) --
+#   there is no way to pick "the" single upstream producer through it without
+#   silently assuming which operand is "the" branch and dropping the other's
+#   contribution to the combined channel-index set entirely, so this case
+#   simply isn't reachable by any hop this walk recognizes and falls straight
+#   through to `"fail"`. The far more common shape -- a gated FFN's own
+#   *output* projection (`Wd`) feeding a residual `Add` -- needs no special
+#   handling at all: `Wd` is an entirely ordinary MatMul/Gemm producer to
+#   `_match_producer`, gated combine or not upstream of it, exactly the
+#   `x = x + MLP(LN(x))` shape this feature exists for. See
+#   `test_structured_pruning_matmul_residual_add_declines_on_gated_branch_with_no_projection`.
+# - **A residual branch whose backward walk would need to cross a fused
+#   self-attention op boundary** (`com.microsoft::Attention`,
+#   `GroupQueryAttention`, or the plain `ai.onnx` `Attention` -- see the
+#   "Attention-head pruning" section far below) to reach a real producer --
+#   e.g. `Add(x, GroupQueryAttention(q, k, v))` with no output projection
+#   MatMul between the attention op and the `Add`. None of those ops is a
+#   MatMul/Gemm (`_match_producer` never matches them), an `Add` (never an
+#   eligible-merge candidate), or one of `_UNARY_PASS_THROUGH`'s shape-preserving
+#   activations, so a residual branch that bottoms out at one is simply
+#   unrecognized by any hop this walk knows and falls through to `"fail"` --
+#   the same outcome as any other unmatched topology, not a special case that
+#   needed its own check. The realistic version of this pattern -- an
+#   attention block's own output-projection MatMul (`Wo`) feeding the
+#   residual `Add`, with `GroupQueryAttention`/`Attention` sitting further
+#   upstream of `Wo` -- needs no special handling either, for the same reason
+#   the gated-FFN case above doesn't: the backward walk starts at the `Add`
+#   operand and stops at the very first node it finds (`Wo`, an ordinary
+#   MatMul/Gemm producer), never looking any further upstream at what feeds
+#   `Wo`. See
+#   `test_structured_pruning_matmul_residual_add_declines_on_bare_gqa_shortcut`.
+
+
+def _walk_matmul_producer_backward(
+    start: str,
+    node_by_output: Dict[str, onnx.NodeProto],
+    initializer_map: Dict[str, onnx.TensorProto],
+    consumers_of: Dict[str, List[onnx.NodeProto]],
+    graph_outputs: Set[str],
+    max_hops: int,
+) -> Tuple[
+    str,
+    Optional[Union[Tuple[_Producer, int], onnx.NodeProto]],
+    Tuple[Tuple[onnx.NodeProto, Optional[str]], ...],
+]:
+    """The backward counterpart of :func:`_walk_to_consumer`, used only by
+    :func:`_find_matmul_residual_chains` to resolve one operand of an ``Add``
+    merge point back to whatever produces it -- the MatMul/Gemm analogue of
+    :func:`_walk_conv_producer_backward` (see this function's own section
+    comment above for how the two differ: a wider hop set mirroring
+    `_walk_to_consumer`'s own per-channel bias/scale ``Add``/``Mul`` hop,
+    and no depthwise-pass-through analogue at all). Requires every tensor
+    crossed -- `start` itself included -- to have exactly one consumer, the
+    same safety bar every other hop in this module already holds every
+    intermediate tensor to; this is what makes a shared "post-block" tensor
+    (read by both the next stage and directly by an `Add`) resolve to
+    ``"fail"`` rather than being silently pruned wrong.
+
+    Returns one of:
+
+    - ``("producer", (producer, n_channels), chain_ops)`` -- resolved all
+      the way back to a real MatMul/vanilla-Gemm producer;
+    - ``("add", add_node, chain_ops)`` -- resolved to another eligible
+      ``Add`` merge node's raw output instead (the caller unions this
+      group with that ``Add``'s own rather than treating it as a separate
+      producer);
+    - ``("fail", None, ())`` -- a graph input, an unrecognized producer
+      (attention-op boundary, gated-Mul combine, ...), a branch, or the hop
+      limit -- the caller declines the whole group this operand belongs to.
+
+    `chain_ops` mirrors :class:`_Chain`'s own field exactly (each entry a
+    ``(node, const_name_or_None)`` pair, in forward -- producer-to-merge --
+    order), so it can be concatenated directly into the resolved chain's
+    `chain_ops` the same way `_find_chains` builds them for an ordinary
+    single-producer chain.
+    """
+    chain_ops: List[Tuple[onnx.NodeProto, Optional[str]]] = []
+    cur = start
+    for _hop in range(max_hops):
+        if len(consumers_of.get(cur, [])) != 1 or cur in graph_outputs:
+            return "fail", None, ()
+        node = node_by_output.get(cur)
+        if node is None or len(node.output) != 1 or node.output[0] != cur:
+            return "fail", None, ()
+
+        prod_info = _match_producer(node, initializer_map)
+        if prod_info is not None:
+            w_name, weight_transposed, bias_name, n_channels = prod_info
+            producer = _Producer(node, w_name, weight_transposed, bias_name)
+            return "producer", (producer, n_channels), tuple(reversed(chain_ops))
+
+        if node.op_type in _UNARY_PASS_THROUGH and len(node.input) == 1:
+            chain_ops.append((node, None))
+            cur = node.input[0]
+            continue
+
+        if node.op_type in _BINARY_CHANNEL_OPS and len(node.input) == 2:
+            a_name, b_name = node.input
+            a_const = a_name in initializer_map
+            b_const = b_name in initializer_map
+            if a_const != b_const:
+                const_name, other = (a_name, b_name) if a_const else (b_name, a_name)
+                const_init = initializer_map[const_name]
+                if (
+                    const_init.data_type == onnx.TensorProto.FLOAT
+                    and list(const_init.dims)
+                    and int(np.prod(const_init.dims)) == const_init.dims[-1]
+                ):
+                    chain_ops.append((node, const_name))
+                    cur = other
+                    continue
+                return "fail", None, ()
+            # Both operands constant (degenerate) or both non-constant: for
+            # `Add` the latter is exactly `_is_eligible_add_merge`'s own
+            # shape, handled below; for `Mul` it's a gated (SwiGLU/GeGLU)
+            # combine point this walk doesn't try to pick a branch through
+            # (see this section's own comment) -- either way, falling
+            # through to the `Add`-merge check (which requires `Add`
+            # specifically) or `"fail"` is correct.
+
+        if _is_eligible_add_merge(node, initializer_map):
+            return "add", node, tuple(reversed(chain_ops))
+
+        return "fail", None, ()
+
+    return "fail", None, ()
+
+
+def _find_matmul_residual_chains(graph: onnx.GraphProto) -> List[_Chain]:
+    """Finds MatMul/Gemm residual/skip-connection groups -- see this
+    section's own comment above and :func:`_find_conv_residual_chains`'s
+    (this function mirrors that one's union-find structure exactly, over
+    :func:`_walk_matmul_producer_backward` instead of
+    :func:`_walk_conv_producer_backward`). For every maximal union-find
+    group of transitively-connected eligible ``Add`` merge points
+    (:func:`_is_eligible_add_merge`), resolves every member's two operands:
+    each must reach either a real MatMul/vanilla-Gemm producer (a "leaf" of
+    the group) or another `Add` already in the same group. If *any* operand,
+    anywhere in the group, fails to resolve that way, or the leaf producers'
+    channel counts don't all agree, the *entire* group is declined -- never
+    partially pruned. A correctly-resolved group must reduce to exactly one
+    "sink" `Add` (the one whose own output isn't itself consumed by another
+    `Add` in the group); the chain walk continues forward from there via the
+    ordinary :func:`_walk_to_consumer` to find the group's one real
+    downstream consumer, exactly as any other MatMul/Gemm chain does.
+    """
+    initializer_map = {t.name: t for t in graph.initializer}
+    consumers_of = _consumers_of(graph)
+    node_by_output = {out: node for node in graph.node for out in node.output}
+    graph_outputs = {o.name for o in graph.output}
+
+    def _is_internal(name: str) -> bool:
+        return len(consumers_of.get(name, [])) == 1 and name not in graph_outputs
+
+    eligible_adds = [
+        node for node in graph.node if _is_eligible_add_merge(node, initializer_map)
+    ]
+    if not eligible_adds:
+        return []
+    add_index = {id(node): i for i, node in enumerate(eligible_adds)}
+
+    parent = list(range(len(eligible_adds)))
+
+    def find(i: int) -> int:
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    def union(i: int, j: int) -> None:
+        ri, rj = find(i), find(j)
+        if ri != rj:
+            parent[ri] = rj
+
+    Edge = Tuple[
+        str,
+        Optional[Union[Tuple[_Producer, int], onnx.NodeProto]],
+        Tuple[Tuple[onnx.NodeProto, Optional[str]], ...],
+    ]
+    edge_results: Dict[int, List[Edge]] = {}
+    poisoned: Set[int] = set()
+    for idx, add_node in enumerate(eligible_adds):
+        results: List[Edge] = []
+        for operand in add_node.input:
+            edge = _walk_matmul_producer_backward(
+                operand,
+                node_by_output,
+                initializer_map,
+                consumers_of,
+                graph_outputs,
+                _MAX_CHAIN_HOPS,
+            )
+            results.append(edge)
+            kind, payload = edge[0], edge[1]
+            if kind == "fail":
+                poisoned.add(idx)
+            elif kind == "add":
+                assert isinstance(payload, onnx.NodeProto)
+                j = add_index.get(id(payload))
+                if j is None:
+                    poisoned.add(idx)  # defensive -- shouldn't happen
+                else:
+                    union(idx, j)
+        edge_results[idx] = results
+
+    groups: Dict[int, List[int]] = {}
+    for idx in range(len(eligible_adds)):
+        groups.setdefault(find(idx), []).append(idx)
+
+    chains: List[_Chain] = []
+    for members in groups.values():
+        if any(i in poisoned for i in members):
+            continue
+
+        leaf_producers: List[_Producer] = []
+        n_channels_set: Set[int] = set()
+        pre_chain_ops: List[Tuple[onnx.NodeProto, Optional[str]]] = []
+        referenced: Set[int] = set()
+
+        for idx in members:
+            for kind, payload, ops in edge_results[idx]:
+                pre_chain_ops.extend(ops)
+                if kind == "producer":
+                    assert payload is not None and not isinstance(
+                        payload, onnx.NodeProto
+                    )
+                    producer, n_channels = payload
+                    leaf_producers.append(producer)
+                    n_channels_set.add(n_channels)
+                elif kind == "add":
+                    assert isinstance(payload, onnx.NodeProto)
+                    referenced.add(add_index[id(payload)])
+
+        if len(n_channels_set) != 1:
+            continue  # branches disagree on channel count -- decline
+        n_channels = next(iter(n_channels_set))
+
+        # Every bias/scale hop's constant was only self-consistently checked
+        # when first crossed (see _walk_matmul_producer_backward); now that
+        # the group's real channel count is known, re-validate it actually
+        # matches -- mirroring the depthwise-Conv-hop re-validation in
+        # _find_conv_residual_chains.
+        if any(
+            const_name is not None
+            and initializer_map[const_name].dims[-1] != n_channels
+            for _, const_name in pre_chain_ops
+        ):
+            continue
+
+        sinks = [idx for idx in members if idx not in referenced]
+        if len(sinks) != 1:
+            continue  # not a single linear chain of merges -- decline
+        sink_add = eligible_adds[sinks[0]]
+
+        if len({p.weight for p in leaf_producers}) != len(leaf_producers):
+            continue  # degenerate -- the same producer named twice
+
+        sink_out = sink_add.output[0]
+        if not _is_internal(sink_out):
+            continue
+
+        consumer, fwd_chain_ops = _walk_to_consumer(
+            sink_out,
+            initializer_map,
+            consumers_of,
+            graph_outputs,
+            n_channels,
+            _MAX_CHAIN_HOPS,
+        )
+        if consumer is None:
+            continue
+
+        chain_ops = (
+            tuple(pre_chain_ops)
+            + tuple((eligible_adds[i], None) for i in members)
+            + fwd_chain_ops
+        )
+
+        chains.append(
+            _Chain(
+                producers=tuple(leaf_producers),
+                chain_ops=chain_ops,
+                consumer_node=consumer[0],
+                consumer_weight=consumer[1],
+                consumer_weight_transposed=consumer[2],
+                n_channels=n_channels,
             )
         )
     return chains
@@ -2888,6 +3278,29 @@ def apply_structured_pruning(
     connection whose branches don't fan out elsewhere, or a linear stack of
     `Add`-only merges, is what this reaches.
 
+    The MatMul/Gemm analogue of that same residual/skip-connection case is
+    also handled (see :func:`_find_matmul_residual_chains` and this
+    module's own docstring) -- the transformer-block residual stream shape
+    (``x = x + SelfAttn(LN(x))``, ``x = x + MLP(LN(x))``) that was
+    previously declined outright. Same union-find grouping over eligible
+    ``Add`` merges, same single-consumer bar on every hop of every branch,
+    same combined (root-sum-square) importance ranking; the one real
+    difference is the backward walk mirrors :func:`_walk_to_consumer`'s own
+    *wider* MatMul/Gemm hop set (unary activations plus a per-channel
+    bias/scale ``Add``/``Mul`` against a constant) rather than the Conv
+    walk's narrower one, since there is no depthwise-Conv-style pass-through
+    analogue for MatMul/Gemm at all. A gated (SwiGLU/GeGLU) combine feeding
+    a residual branch with no downstream projection in between, and a
+    residual branch that would need to cross a fused self-attention op
+    boundary (``com.microsoft::Attention``/``GroupQueryAttention``/``ai.onnx``
+    ``Attention``) to reach a real producer, are both declined rather than
+    guessed at -- see the section comment above
+    :func:`_walk_matmul_producer_backward` for why neither is actually
+    reachable by any hop this walk recognizes, and why the far more common
+    shapes (a gated FFN's own output projection, or an attention block's own
+    output-projection MatMul, feeding the residual `Add`) need no special
+    handling at all.
+
     :param model: the original onnx ModelProto or file path
     :param sparsity: target fraction of each matched producer's output
             channels to remove (at least one channel is always kept)
@@ -2910,6 +3323,7 @@ def apply_structured_pruning(
         + _find_gated_chains(graph)
         + _find_conv_chains(graph)
         + _find_conv_residual_chains(graph)
+        + _find_matmul_residual_chains(graph)
     )
     if chains:
         _apply_chains(graph, chains, sparsity, _plain_structured_importance)
@@ -2929,10 +3343,10 @@ def apply_structured_wanda_pruning(
     """The calibrated upgrade of :func:`apply_structured_pruning`, exactly
     as :func:`apply_wanda_pruning` is to :func:`apply_magnitude_pruning`:
     same real structural channel removal, same topology matching (a single
-    producer, a gated pair, or a bounded Conv residual/``Add``-merge group
-    -> zero or more shape-preserving elementwise ops and, for a Conv chain,
-    depthwise Conv hops -> one consumer, MatMul/Gemm or Conv, general
-    grouped Conv included on either side, see
+    producer, a gated pair, or a bounded Conv *or* MatMul/Gemm
+    residual/``Add``-merge group -> zero or more shape-preserving elementwise
+    ops and, for a Conv chain, depthwise Conv hops -> one consumer,
+    MatMul/Gemm or Conv, general grouped Conv included on either side, see
     :func:`apply_structured_pruning`'s own docstring) including the same
     depthwise-Conv pass-through sliced by the producer's channel indices
     alone -- it contributes no activation norm of its own to the ranking
@@ -2990,6 +3404,7 @@ def apply_structured_wanda_pruning(
         + _find_gated_chains(graph)
         + _find_conv_chains(graph)
         + _find_conv_residual_chains(graph)
+        + _find_matmul_residual_chains(graph)
     )
     if not chains:
         return out
