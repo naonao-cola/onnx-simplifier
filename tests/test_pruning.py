@@ -4919,6 +4919,264 @@ def test_gqa_wanda_pruning_falls_back_to_plain_with_no_calibration_batches():
         np.testing.assert_array_equal(inits_plain[name], inits_wanda[name])
 
 
+# --- apply_attention_head_pruning / _wanda_pruning -- GroupQueryAttention,
+# cross-attention (Q and K/V from genuinely different source tensors) ------
+#
+# See onnxsim/pruning.py's own "Attention-head pruning" section comment for
+# the full investigation this proves: GroupQueryAttention's matchers never
+# tie Q's own producer to K/V's own, so a real encoder/decoder pair (Q from
+# one graph input, K/V from a different one, with its own different feature
+# dimension) matches and prunes correctly -- oracle-verified here exactly
+# like every self-attention GroupQueryAttention test above. Sequence length
+# is kept equal between the two source tensors (a real onnxruntime
+# GroupQueryAttention CPU-kernel restriction confirmed empirically, not a
+# limitation this module's own matching/pruning logic adds -- see that same
+# section comment); the plain ai.onnx Attention cross-attention section
+# further below uses genuinely different sequence lengths too, since that
+# op's own kernel has no such restriction.
+
+
+def _gqa_cross_model(
+    K_dec=8,
+    K_enc=6,
+    H=4,
+    KVH=2,
+    D=8,
+    Out=6,
+    seed=0,
+    batch=2,
+    seq=5,
+    wq=None,
+    wk=None,
+    wv=None,
+    wout=None,
+):
+    rng = np.random.default_rng(seed)
+    Nq, Nkv = H * D, KVH * D
+    if wq is None:
+        wq = rng.standard_normal((K_dec, Nq)).astype(np.float32)
+    if wk is None:
+        wk = rng.standard_normal((K_enc, Nkv)).astype(np.float32)
+    if wv is None:
+        wv = rng.standard_normal((K_enc, Nkv)).astype(np.float32)
+    if wout is None:
+        wout = rng.standard_normal((Nq, Out)).astype(np.float32)
+
+    initializer = [
+        _f32(wq, "Wq"),
+        _f32(wk, "Wk"),
+        _f32(wv, "Wv"),
+        _f32(wout, "Wout"),
+        onnx.numpy_helper.from_array(
+            np.full((batch,), seq - 1, dtype=np.int32), "SeqLensK"
+        ),
+        onnx.numpy_helper.from_array(np.array(seq, dtype=np.int32), "TotalSeq"),
+    ]
+
+    body = f"""
+        g (float[{batch},{seq},{K_dec}] Xdec, float[{batch},{seq},{K_enc}] Xenc) => (float[{batch},{seq},{Out}] Y)
+        {{
+          q = MatMul(Xdec, Wq)
+          k = MatMul(Xenc, Wk)
+          v = MatMul(Xenc, Wv)
+          ctx, pk, pv = com.microsoft.GroupQueryAttention <num_heads={H}, kv_num_heads={KVH}> (q, k, v, , , SeqLensK, TotalSeq)
+          Y = MatMul(ctx, Wout)
+        }}
+        """
+
+    model = parser.parse_model(
+        f"""
+        <
+          ir_version: 10,
+          opset_import: ["": 17, "com.microsoft": 1]
+        >
+        {body}
+        """
+    )
+    model.graph.initializer.extend(initializer)
+    return model, dict(
+        K_dec=K_dec,
+        K_enc=K_enc,
+        H=H,
+        KVH=KVH,
+        D=D,
+        Out=Out,
+        Nq=Nq,
+        Nkv=Nkv,
+        wq=wq,
+        wk=wk,
+        wv=wv,
+        wout=wout,
+        batch=batch,
+        seq=seq,
+    )
+
+
+def _oracle_keep_groups_cross(
+    wq, wk, wv, num_heads, kv_num_heads, head_size, keep_count
+):
+    # Like `_oracle_keep_groups` above, but combines each KV group's Q/K/V
+    # block importance via sqrt(sum of squared per-block Frobenius norms)
+    # rather than norm(concatenate(...)) -- required once wq's own row count
+    # (Q's source tensor's own feature dimension) differs from wk's/wv's own
+    # (K/V's source tensor's own feature dimension), exactly the shape this
+    # helper is for. See `_gqa_group_importance`'s own updated comment in
+    # onnxsim/pruning.py for why the two formulas agree whenever
+    # concatenation is legal, and why only this one stays well-defined when
+    # it isn't.
+    group_size = num_heads // kv_num_heads
+    importance = np.zeros(kv_num_heads)
+    for kv in range(kv_num_heads):
+        q_block = np.concatenate(
+            [
+                wq[:, h * head_size : (h + 1) * head_size]
+                for h in range(kv * group_size, (kv + 1) * group_size)
+            ],
+            axis=1,
+        )
+        k_block = wk[:, kv * head_size : (kv + 1) * head_size]
+        v_block = wv[:, kv * head_size : (kv + 1) * head_size]
+        importance[kv] = np.sqrt(
+            np.linalg.norm(q_block) ** 2
+            + np.linalg.norm(k_block) ** 2
+            + np.linalg.norm(v_block) ** 2
+        )
+    return np.sort(np.argsort(-importance)[:keep_count])
+
+
+def test_gqa_pruning_cross_attention_matches_oracle_exactly():
+    # Without the `_gqa_group_importance` fix (concatenate-then-norm, which
+    # requires wq's row count to equal wk's/wv's own), this raises a bare
+    # numpy ValueError instead of reaching the assertions below -- K_dec=8 !=
+    # K_enc=6 here is deliberate.
+    model, cfg = _gqa_cross_model(K_dec=8, K_enc=6, H=8, KVH=2, D=8, Out=6, seed=20)
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    node = _gqa_node(pruned)
+    num_heads, kv_num_heads = _gqa_attrs(node)
+    group_size = cfg["H"] // cfg["KVH"]
+    assert kv_num_heads == 1  # max(1, 2 - round(2*0.5))
+    assert num_heads == kv_num_heads * group_size
+
+    keep_groups = _oracle_keep_groups_cross(
+        cfg["wq"], cfg["wk"], cfg["wv"], cfg["H"], cfg["KVH"], cfg["D"], kv_num_heads
+    )
+    keep_q_heads = _group_q_heads(keep_groups, group_size)
+    d = cfg["D"]
+    q_idx, kv_idx = _head_idx(keep_q_heads, d), _head_idx(keep_groups, d)
+
+    oracle, _ = _gqa_cross_model(
+        K_dec=cfg["K_dec"],
+        K_enc=cfg["K_enc"],
+        H=num_heads,
+        KVH=kv_num_heads,
+        D=d,
+        Out=cfg["Out"],
+        seed=20,
+        wq=cfg["wq"][:, q_idx],
+        wk=cfg["wk"][:, kv_idx],
+        wv=cfg["wv"][:, kv_idx],
+        wout=cfg["wout"][q_idx, :],
+        batch=cfg["batch"],
+        seq=cfg["seq"],
+    )
+
+    rng = np.random.default_rng(21)
+    xdec = rng.standard_normal((cfg["batch"], cfg["seq"], cfg["K_dec"])).astype(
+        np.float32
+    )
+    xenc = rng.standard_normal((cfg["batch"], cfg["seq"], cfg["K_enc"])).astype(
+        np.float32
+    )
+    (y_pruned,) = _run(pruned, {"Xdec": xdec, "Xenc": xenc})
+    (y_oracle,) = _run(oracle, {"Xdec": xdec, "Xenc": xenc})
+    np.testing.assert_allclose(y_pruned, y_oracle, rtol=1e-4, atol=1e-4)
+
+    # Sanity: Q and K/V really are independently sourced, not accidentally
+    # both reading the same tensor -- perturbing Xenc alone (Xdec held
+    # fixed) must still change the output.
+    (y_pruned2,) = _run(pruned, {"Xdec": xdec, "Xenc": xenc + 1.0})
+    assert not np.allclose(y_pruned, y_pruned2)
+
+
+def test_gqa_wanda_pruning_cross_attention_matches_oracle_exactly():
+    model, cfg = _gqa_cross_model(K_dec=8, K_enc=6, H=8, KVH=2, D=8, Out=6, seed=22)
+
+    rng = np.random.default_rng(23)
+    xdec_cal = rng.standard_normal((cfg["batch"], cfg["seq"], cfg["K_dec"])).astype(
+        np.float32
+    )
+    xenc_cal = rng.standard_normal((cfg["batch"], cfg["seq"], cfg["K_enc"])).astype(
+        np.float32
+    )
+    calibration_data = [{"Xdec": xdec_cal, "Xenc": xenc_cal}]
+
+    pruned = onnxsim.apply_attention_head_wanda_pruning(
+        model, calibration_data=calibration_data, sparsity=0.5
+    )
+    onnx.checker.check_model(pruned)
+
+    probe_model = onnx.ModelProto()
+    probe_model.CopyFrom(model)
+    probe_model.graph.output.append(onnx.ValueInfoProto(name="ctx"))
+    (_, ctx_cal) = _run(probe_model, {"Xdec": xdec_cal, "Xenc": xenc_cal})
+    act_norm = np.sqrt(np.mean(np.square(ctx_cal.astype(np.float64)), axis=(0, 1)))
+
+    d = cfg["D"]
+    group_size = cfg["H"] // cfg["KVH"]
+    importance = np.zeros(cfg["KVH"])
+    for kv in range(cfg["KVH"]):
+        q_block = np.concatenate(
+            [
+                cfg["wq"][:, h * d : (h + 1) * d]
+                for h in range(kv * group_size, (kv + 1) * group_size)
+            ],
+            axis=1,
+        )
+        k_block = cfg["wk"][:, kv * d : (kv + 1) * d]
+        v_block = cfg["wv"][:, kv * d : (kv + 1) * d]
+        base = np.sqrt(
+            np.linalg.norm(q_block) ** 2
+            + np.linalg.norm(k_block) ** 2
+            + np.linalg.norm(v_block) ** 2
+        )
+        act_group = np.linalg.norm(
+            act_norm[kv * group_size * d : (kv + 1) * group_size * d]
+        )
+        importance[kv] = base * max(act_group, 1e-8)
+    keep_groups = np.sort(np.argsort(-importance)[:1])  # max(1, 2 - round(2*0.5)) == 1
+
+    keep_q_heads = _group_q_heads(keep_groups, group_size)
+    q_idx, kv_idx = _head_idx(keep_q_heads, d), _head_idx(keep_groups, d)
+
+    oracle, _ = _gqa_cross_model(
+        K_dec=cfg["K_dec"],
+        K_enc=cfg["K_enc"],
+        H=len(keep_q_heads),
+        KVH=len(keep_groups),
+        D=d,
+        Out=cfg["Out"],
+        seed=22,
+        wq=cfg["wq"][:, q_idx],
+        wk=cfg["wk"][:, kv_idx],
+        wv=cfg["wv"][:, kv_idx],
+        wout=cfg["wout"][q_idx, :],
+        batch=cfg["batch"],
+        seq=cfg["seq"],
+    )
+
+    xdec = rng.standard_normal((cfg["batch"], cfg["seq"], cfg["K_dec"])).astype(
+        np.float32
+    )
+    xenc = rng.standard_normal((cfg["batch"], cfg["seq"], cfg["K_enc"])).astype(
+        np.float32
+    )
+    (y_pruned,) = _run(pruned, {"Xdec": xdec, "Xenc": xenc})
+    (y_oracle,) = _run(oracle, {"Xdec": xdec, "Xenc": xenc})
+    np.testing.assert_allclose(y_pruned, y_oracle, rtol=1e-4, atol=1e-4)
+
+
 def test_attention_head_pruning_handles_attention_and_gqa_in_one_model():
     # Regression check for _apply_attention_chains's per-chain-type
     # dispatch: a plain `Attention` block and a `GroupQueryAttention` block
@@ -5761,6 +6019,229 @@ def test_onnx_attention_wanda_pruning_falls_back_to_plain_with_no_calibration_ba
     }
     for name in inits_plain:
         np.testing.assert_array_equal(inits_plain[name], inits_wanda[name])
+
+
+# --- apply_attention_head_pruning / _wanda_pruning -- plain ai.onnx
+# Attention, cross-attention (Q and K/V from genuinely different source
+# tensors, at genuinely different sequence lengths) ------------------------
+#
+# Unlike GroupQueryAttention's own cross-attention section above (equal
+# sequence length only, an onnxruntime CPU-kernel restriction on that op --
+# see onnxsim/pruning.py's own "Attention-head pruning" section comment),
+# this op's own onnxruntime kernel has no such restriction (confirmed
+# empirically): `seq_q` and `seq_kv` genuinely differ below, exercising this
+# op's own schema doc ("For cross attention, query and key might have
+# different lengths") at full strength, oracle-verified via onnxruntime like
+# every other function in this module.
+
+
+def _onnx_attention_cross_model(
+    K_dec=8,
+    K_enc=6,
+    H=4,
+    KVH=2,
+    D=4,
+    Out=6,
+    seed=0,
+    batch=2,
+    seq_q=5,
+    seq_kv=7,
+    wq=None,
+    wk=None,
+    wv=None,
+    wout=None,
+):
+    rng = np.random.default_rng(seed)
+    Nq, Nkv = H * D, KVH * D
+    if wq is None:
+        wq = rng.standard_normal((K_dec, Nq)).astype(np.float32)
+    if wk is None:
+        wk = rng.standard_normal((K_enc, Nkv)).astype(np.float32)
+    if wv is None:
+        wv = rng.standard_normal((K_enc, Nkv)).astype(np.float32)
+    if wout is None:
+        wout = rng.standard_normal((Nq, Out)).astype(np.float32)
+
+    initializer = [_f32(wq, "Wq"), _f32(wk, "Wk"), _f32(wv, "Wv"), _f32(wout, "Wout")]
+
+    body = f"""
+        g (float[{batch},{seq_q},{K_dec}] Xdec, float[{batch},{seq_kv},{K_enc}] Xenc) => (float[{batch},{seq_q},{Out}] Y)
+        {{
+          q = MatMul(Xdec, Wq)
+          k = MatMul(Xenc, Wk)
+          v = MatMul(Xenc, Wv)
+          ctx = Attention <q_num_heads={H}, kv_num_heads={KVH}> (q, k, v)
+          Y = MatMul(ctx, Wout)
+        }}
+        """
+
+    model = parser.parse_model(
+        f"""
+        <
+          ir_version: 10,
+          opset_import: ["": 24]
+        >
+        {body}
+        """
+    )
+    model.graph.initializer.extend(initializer)
+    return model, dict(
+        K_dec=K_dec,
+        K_enc=K_enc,
+        H=H,
+        KVH=KVH,
+        D=D,
+        Out=Out,
+        Nq=Nq,
+        Nkv=Nkv,
+        wq=wq,
+        wk=wk,
+        wv=wv,
+        wout=wout,
+        batch=batch,
+        seq_q=seq_q,
+        seq_kv=seq_kv,
+    )
+
+
+def test_onnx_attention_pruning_cross_attention_matches_oracle_exactly():
+    # Without the `_gqa_group_importance` fix this shares with the
+    # GroupQueryAttention cross-attention test above, this raises a bare
+    # numpy ValueError instead of reaching the assertions below --
+    # K_dec=8 != K_enc=6 here is deliberate, and (unlike that test)
+    # seq_q=5 != seq_kv=7 too, since this op's own kernel allows it.
+    model, cfg = _onnx_attention_cross_model(
+        K_dec=8, K_enc=6, H=8, KVH=2, D=4, Out=6, seed=24
+    )
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    node = _onnx_attention_node(pruned)
+    q_num_heads, kv_num_heads = _onnx_attention_attrs(node)
+    group_size = cfg["H"] // cfg["KVH"]
+    assert kv_num_heads == 1  # max(1, 2 - round(2*0.5))
+    assert q_num_heads == kv_num_heads * group_size
+
+    keep_groups = _oracle_keep_groups_cross(
+        cfg["wq"], cfg["wk"], cfg["wv"], cfg["H"], cfg["KVH"], cfg["D"], kv_num_heads
+    )
+    keep_q_heads = _group_q_heads(keep_groups, group_size)
+    d = cfg["D"]
+    q_idx, kv_idx = _head_idx(keep_q_heads, d), _head_idx(keep_groups, d)
+
+    oracle, _ = _onnx_attention_cross_model(
+        K_dec=cfg["K_dec"],
+        K_enc=cfg["K_enc"],
+        H=q_num_heads,
+        KVH=kv_num_heads,
+        D=d,
+        Out=cfg["Out"],
+        seed=24,
+        wq=cfg["wq"][:, q_idx],
+        wk=cfg["wk"][:, kv_idx],
+        wv=cfg["wv"][:, kv_idx],
+        wout=cfg["wout"][q_idx, :],
+        batch=cfg["batch"],
+        seq_q=cfg["seq_q"],
+        seq_kv=cfg["seq_kv"],
+    )
+
+    rng = np.random.default_rng(25)
+    xdec = rng.standard_normal((cfg["batch"], cfg["seq_q"], cfg["K_dec"])).astype(
+        np.float32
+    )
+    xenc = rng.standard_normal((cfg["batch"], cfg["seq_kv"], cfg["K_enc"])).astype(
+        np.float32
+    )
+    (y_pruned,) = _run(pruned, {"Xdec": xdec, "Xenc": xenc})
+    (y_oracle,) = _run(oracle, {"Xdec": xdec, "Xenc": xenc})
+    np.testing.assert_allclose(y_pruned, y_oracle, rtol=1e-4, atol=1e-4)
+
+    # Sanity: Q and K/V really are independently sourced, at genuinely
+    # different sequence lengths -- perturbing Xenc alone (Xdec held fixed)
+    # must still change the output.
+    (y_pruned2,) = _run(pruned, {"Xdec": xdec, "Xenc": xenc + 1.0})
+    assert not np.allclose(y_pruned, y_pruned2)
+
+
+def test_onnx_attention_wanda_pruning_cross_attention_matches_oracle_exactly():
+    model, cfg = _onnx_attention_cross_model(
+        K_dec=8, K_enc=6, H=8, KVH=2, D=4, Out=6, seed=26
+    )
+
+    rng = np.random.default_rng(27)
+    xdec_cal = rng.standard_normal((cfg["batch"], cfg["seq_q"], cfg["K_dec"])).astype(
+        np.float32
+    )
+    xenc_cal = rng.standard_normal((cfg["batch"], cfg["seq_kv"], cfg["K_enc"])).astype(
+        np.float32
+    )
+    calibration_data = [{"Xdec": xdec_cal, "Xenc": xenc_cal}]
+
+    pruned = onnxsim.apply_attention_head_wanda_pruning(
+        model, calibration_data=calibration_data, sparsity=0.5
+    )
+    onnx.checker.check_model(pruned)
+
+    probe_model = onnx.ModelProto()
+    probe_model.CopyFrom(model)
+    probe_model.graph.output.append(onnx.ValueInfoProto(name="ctx"))
+    (_, ctx_cal) = _run(probe_model, {"Xdec": xdec_cal, "Xenc": xenc_cal})
+    act_norm = np.sqrt(np.mean(np.square(ctx_cal.astype(np.float64)), axis=(0, 1)))
+
+    d = cfg["D"]
+    group_size = cfg["H"] // cfg["KVH"]
+    importance = np.zeros(cfg["KVH"])
+    for kv in range(cfg["KVH"]):
+        q_block = np.concatenate(
+            [
+                cfg["wq"][:, h * d : (h + 1) * d]
+                for h in range(kv * group_size, (kv + 1) * group_size)
+            ],
+            axis=1,
+        )
+        k_block = cfg["wk"][:, kv * d : (kv + 1) * d]
+        v_block = cfg["wv"][:, kv * d : (kv + 1) * d]
+        base = np.sqrt(
+            np.linalg.norm(q_block) ** 2
+            + np.linalg.norm(k_block) ** 2
+            + np.linalg.norm(v_block) ** 2
+        )
+        act_group = np.linalg.norm(
+            act_norm[kv * group_size * d : (kv + 1) * group_size * d]
+        )
+        importance[kv] = base * max(act_group, 1e-8)
+    keep_groups = np.sort(np.argsort(-importance)[:1])  # max(1, 2 - round(2*0.5)) == 1
+
+    keep_q_heads = _group_q_heads(keep_groups, group_size)
+    q_idx, kv_idx = _head_idx(keep_q_heads, d), _head_idx(keep_groups, d)
+
+    oracle, _ = _onnx_attention_cross_model(
+        K_dec=cfg["K_dec"],
+        K_enc=cfg["K_enc"],
+        H=len(keep_q_heads),
+        KVH=len(keep_groups),
+        D=d,
+        Out=cfg["Out"],
+        seed=26,
+        wq=cfg["wq"][:, q_idx],
+        wk=cfg["wk"][:, kv_idx],
+        wv=cfg["wv"][:, kv_idx],
+        wout=cfg["wout"][q_idx, :],
+        batch=cfg["batch"],
+        seq_q=cfg["seq_q"],
+        seq_kv=cfg["seq_kv"],
+    )
+
+    xdec = rng.standard_normal((cfg["batch"], cfg["seq_q"], cfg["K_dec"])).astype(
+        np.float32
+    )
+    xenc = rng.standard_normal((cfg["batch"], cfg["seq_kv"], cfg["K_enc"])).astype(
+        np.float32
+    )
+    (y_pruned,) = _run(pruned, {"Xdec": xdec, "Xenc": xenc})
+    (y_oracle,) = _run(oracle, {"Xdec": xdec, "Xenc": xenc})
+    np.testing.assert_allclose(y_pruned, y_oracle, rtol=1e-4, atol=1e-4)
 
 
 def test_attention_head_pruning_handles_all_three_attention_op_types_in_one_model():

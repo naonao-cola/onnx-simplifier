@@ -3980,6 +3980,86 @@ def apply_structured_wanda_pruning(
 #   ai.onnx Attention" section), the same oracle-vs-onnxruntime bar every
 #   other function in this module is held to; no structural-only fallback
 #   was needed.
+#
+# Cross-attention (Q projected from one source tensor, K/V from a genuinely
+# *different* one -- the encoder-decoder shape) was investigated explicitly
+# for all three matched op types, not left an untested assumption:
+#
+# - `com.microsoft::Attention`'s own contrib-op schema (`bert_defs.cc`, the
+#   same source consulted elsewhere in this module for `SkipLayerNormalization`)
+#   takes a single `input` tensor that its one merged weight projects to
+#   Q, K, *and* V alike -- there is no second, encoder-side input for K/V
+#   to come from at all. Cross-attention isn't a shape this op's schema can
+#   express, so it's simply not applicable here -- not a gap in
+#   :func:`_match_attention_producer` to close.
+# - `GroupQueryAttention` and the plain ``ai.onnx`` `Attention` op both
+#   already support it, confirmed by construction and by execution: neither
+#   :func:`_match_gqa_producer`/:func:`_match_onnx_attention_producer` nor
+#   :func:`_find_separate_qkv_chains` (their shared caller) ever compares
+#   Q's own producer against K's or V's own -- each of the three is matched,
+#   via :func:`_match_producer`, purely from its own MatMul/vanilla-Gemm
+#   node and its own weight, with no check tying it to where the *other two*
+#   ultimately trace back to. A model where Q's producer reads from one
+#   graph input and K/V's producers read from an entirely different one (a
+#   real decoder/encoder pair, potentially different feature dimensions
+#   too) matches exactly the same way a self-attention model does. Both
+#   ops' own schema docs name this explicitly -- `GroupQueryAttention`'s
+#   own doc string opens with "Group Query **Self/Cross** Attention", and
+#   the plain op's doc (`onnx.defs.get_schema("Attention", domain="")` on
+#   this environment's installed ``onnx==1.22.0``) states outright "this
+#   operator covers self and cross variants ... For cross attention, query
+#   and key might have different lengths" -- and this is verified here the
+#   same oracle-vs-onnxruntime way as everything else (see
+#   ``tests/test_pruning.py``'s own "cross-attention" subsections under the
+#   GroupQueryAttention/plain-Attention sections), with distinct source
+#   tensors of distinct feature dimensions feeding Q vs K/V.
+# - One real bug turned up along the way and is fixed here:
+#   :func:`_gqa_group_importance`'s combined-importance score used to
+#   ``np.concatenate`` each group's Q, K, and V weight *blocks* into one
+#   matrix before taking a single Frobenius norm -- silently assuming Q's
+#   own producer weight has the same row count (its source tensor's own
+#   feature dimension) as K/V's own, true for every self-attention shape
+#   but not guaranteed once Q and K/V read from different source tensors of
+#   different widths. On such a model it didn't mis-rank -- it raised a
+#   bare ``ValueError`` from numpy and crashed the whole pruning call. Fixed
+#   to combine each block's own Frobenius norm via
+#   ``sqrt(sum of squares)`` instead of concatenating first -- numerically
+#   identical to the old formula whenever the concatenation was even legal
+#   (``||[A B]||_F^2 == ||A||_F^2 + ||B||_F^2``), well-defined when it isn't
+#   -- see that function's own updated comment, and
+#   ``test_gqa_pruning_cross_attention_matches_oracle_exactly``/
+#   ``test_onnx_attention_pruning_cross_attention_matches_oracle_exactly``
+#   in ``tests/test_pruning.py`` (both fail with that bare ``ValueError``
+#   without this fix).
+# - The Wanda-calibrated variant's own activation probe
+#   (:func:`apply_attention_head_wanda_pruning`) sits at
+#   `chain.consumer_node.input[0]` -- the *single* tensor downstream of the
+#   matched op's own output projection, after Q/K/V have already been
+#   reduced to one attention output -- never at Q's or K/V's own activation
+#   directly, so it needs no per-source calibration-data key of its own and
+#   is unaffected by whether Q and K/V trace back to the same graph input or
+#   two different ones; a calibration batch dict simply needs an entry for
+#   every graph input the model actually has (both the decoder- and
+#   encoder-side ones for cross-attention), exactly as
+#   :func:`onnxsim.generate_random_calibration_data` already produces.
+# - `GroupQueryAttention`'s own real-world calling convention does impose
+#   one genuine restriction beyond this module's control: this environment's
+#   onnxruntime (1.29.0) CPU kernel requires Q's and K/V's sequence length
+#   to match unless a non-empty `past_key`/`past_value` is also supplied --
+#   confirmed empirically, not merely read off the schema doc, which
+#   promises cross-attention support without mentioning this -- and a
+#   non-empty constant `past_key`/`past_value` is already a shape
+#   :func:`_match_gqa_producer` declines outright (see its own docstring).
+#   A single-call `GroupQueryAttention` cross-attention model with a
+#   genuinely different K/V sequence length therefore isn't a topology this
+#   module ever has the chance to match in the first place -- an
+#   onnxruntime-kernel-level restriction on the op itself, not a limitation
+#   this module's own matching or pruning logic adds. The plain ``ai.onnx``
+#   `Attention` op has no such restriction (also confirmed empirically): its
+#   cross-attention test below uses genuinely different Q/K-V sequence
+#   lengths (as well as different source tensors and different feature
+#   dimensions) throughout, oracle-verified via onnxruntime with no
+#   restriction of this pass's own.
 _ATTENTION_DOMAIN = "com.microsoft"
 
 
@@ -4527,6 +4607,28 @@ def _gqa_group_importance(
     # at group instead of individual-head granularity, since a lone query
     # head can't be pruned out from under a shared KV head in isolation
     # (see this module's own "Attention-head pruning" section comment).
+    #
+    # Combined via sqrt(sum of squared per-block Frobenius norms) rather
+    # than norm(concatenate(q_block, k_block, v_block, axis=1)) -- the two
+    # are numerically identical whenever the concatenation is even legal
+    # (||[A B]||_F^2 == ||A||_F^2 + ||B||_F^2 for any A, B sharing a row
+    # count, since Frobenius norm squared is just the sum of every entry
+    # squared, and concatenating along columns doesn't change that sum) --
+    # but this form stays well-defined when it isn't: Q's own producer
+    # weight has as many rows as Q's own source tensor's feature dimension,
+    # while K/V's own producer weight has as many rows as K/V's own source
+    # tensor's feature dimension, and for cross-attention (Q and K/V drawn
+    # from genuinely different source tensors, e.g. a decoder/encoder pair)
+    # those two feature dimensions need not match at all -- an ordinary,
+    # correctly-matched shape this function must still rank, not one
+    # :func:`_match_gqa_producer`/:func:`_match_onnx_attention_producer`
+    # decline (nothing about either matcher, or :func:`_find_separate_qkv_chains`
+    # that calls them, ties Q's producer weight's row count to K/V's own --
+    # see this module's "Attention-head pruning" section comment for the
+    # confirmed-supported cross-attention shape this guards). The old
+    # concatenate-based form would raise a bare ``ValueError`` from numpy
+    # the moment it ran on such a model, crashing the whole pruning call
+    # instead of ranking it.
     d = chain.head_size
     group_size = chain.num_heads // chain.kv_num_heads
     importance = np.zeros(chain.kv_num_heads, dtype=np.float64)
@@ -4540,8 +4642,10 @@ def _gqa_group_importance(
         )
         k_block = wk[:, kv * d : (kv + 1) * d]
         v_block = wv[:, kv * d : (kv + 1) * d]
-        importance[kv] = np.linalg.norm(
-            np.concatenate([q_block, k_block, v_block], axis=1)
+        importance[kv] = np.sqrt(
+            np.linalg.norm(q_block) ** 2
+            + np.linalg.norm(k_block) ** 2
+            + np.linalg.norm(v_block) ** 2
         )
     return importance
 
