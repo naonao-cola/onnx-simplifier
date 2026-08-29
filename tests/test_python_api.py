@@ -52,7 +52,11 @@ def test_a_model_not_need_simplification():
     net = ModelNotNeedSimplification()
     dummy_input = torch.randn(2, 3, 4, 5)
     sim_model = export_simplify_and_check_by_python_api(net, dummy_input)
-    assert len(sim_model.graph.node) == 1
+    # The exporter emits the literal `1` as a Constant node; onnxsim now leaves
+    # a genuine Constant node as-is rather than baking it into an initializer
+    # (only a fold's *result* gets that treatment), so it survives alongside
+    # the (unfoldable, `x` being a real input) Add.
+    assert len(sim_model.graph.node) == 2
 
 
 def test_exprimental_simplify_subgraph():
@@ -75,9 +79,14 @@ def test_exprimental_simplify_subgraph():
     sim_model = export_simplify_and_check_by_python_api(
         net, dummy_input, simplify_kwargs={"include_subgraph": True}
     )
-    assert len(sim_model.graph.node) == 3
-    assert len(sim_model.graph.node[2].attribute[0].g.node) == 2
-    assert len(sim_model.graph.node[2].attribute[1].g.node) == 1
+    # The exporter's literal constants (the `1.0` comparison threshold, and the
+    # `3`s / `4` added to `x`) are each a genuine Constant node; onnxsim leaves
+    # them as-is rather than baking them into initializers, so they now show up
+    # as their own nodes (one at the top level, two in then_branch, one in
+    # else_branch) alongside the previously-counted ops.
+    assert len(sim_model.graph.node) == 4
+    assert len(sim_model.graph.node[3].attribute[0].g.node) == 4
+    assert len(sim_model.graph.node[3].attribute[1].g.node) == 2
 
 
 def test_dynamic_batch_size():
@@ -99,7 +108,9 @@ def test_dynamic_batch_size():
         },
         simplify_kwargs={"test_input_shapes": {"input": [2, 3, 4, 5]}},
     )
-    assert len(sim_model.graph.node) == 1
+    # The exporter emits the literal `2` as a Constant node, which onnxsim now
+    # leaves as-is (see test_a_model_not_need_simplification).
+    assert len(sim_model.graph.node) == 2
 
 
 def test_dynamic_axes_preserve_dynamic_dimension():
@@ -241,7 +252,11 @@ def test_unused_output():
         },
         simplify_kwargs={"unused_output": ["output1", "output2"]},
     )
-    assert len(sim_model.graph.node) == 4
+    # The exporter emits one shared Constant node for the literal `2` reused by
+    # all four ops; onnxsim now leaves it as-is (see
+    # test_a_model_not_need_simplification) instead of baking it into an
+    # initializer, so it survives alongside them.
+    assert len(sim_model.graph.node) == 5
 
 
 def test_remove_unused_initializer():
@@ -2139,7 +2154,7 @@ def test_fold_not_purely_from_initializer_becomes_constant_node():
     (m_node,) = [n for n in sim_model.graph.node if "M" in n.output]
     assert m_node.op_type == "Constant"
     value = onnx.numpy_helper.to_array(m_node.attribute[0].t)
-    np.testing.assert_array_equal(value, np.array([2.0, 4.0, 6.0], dtype=np.float32))
+    np.testing.assert_array_equal(value, np.array([[2.0, 4.0, 6.0]], dtype=np.float32))
 
 
 def test_fold_purely_from_initializer_stays_initializer():
