@@ -2205,6 +2205,32 @@ def main():
         action="store_true",
     )
     parser.add_argument(
+        "--emit-mlir",
+        nargs="?",
+        const="",
+        default=None,
+        metavar="PATH",
+        help="Also emit the simplified model as MLIR (see --mlir-target). "
+        "Optionally give an output path; when the flag is passed without one, the "
+        "MLIR is written next to the output model with a '.mlir' extension.",
+    )
+    parser.add_argument(
+        "--mlir-target",
+        choices=["torch", "onnx"],
+        default="torch",
+        help="Which MLIR dialect --emit-mlir produces: 'torch' (Torch dialect, via "
+        "torch-mlir; pip install torch-mlir) or 'onnx' (ONNX dialect, via the "
+        "onnx-mlir compiler binary). Default: torch.",
+    )
+    parser.add_argument(
+        "--onnx-mlir",
+        metavar="PATH",
+        default=None,
+        help="Path to the onnx-mlir compiler binary, used with "
+        "'--mlir-target onnx'. Defaults to $ONNX_MLIR, "
+        "$ONNX_MLIR_HOME/bin/onnx-mlir, then the onnx-mlir on PATH.",
+    )
+    parser.add_argument(
         "--node-reduction-plot",
         help="After simplifying, plot node count per round for each "
         "simplification fixed-point loop (from the --profile trace's "
@@ -3052,6 +3078,27 @@ def main():
             all_tensors_to_one_file=True,
             location=external_data_path,
         )
+
+    if args.emit_mlir is not None:
+        from onnxsim import mlir_export
+
+        if args.emit_mlir:
+            mlir_path = args.emit_mlir
+        else:
+            mlir_path = os.path.splitext(args.output_model)[0] + ".mlir"
+        dialect = "ONNX" if args.mlir_target == "onnx" else "Torch"
+        print(f"Emitting {dialect}-dialect MLIR to {mlir_path} ...")
+        mlir_kwargs = {}
+        if args.mlir_target == "onnx" and args.onnx_mlir:
+            mlir_kwargs["onnx_mlir"] = args.onnx_mlir
+        try:
+            mlir_export.export_mlir(
+                model_opt, mlir_path, target=args.mlir_target, **mlir_kwargs
+            )
+        except RuntimeError as e:
+            print(Text(str(e), style="bold red"))
+            sys.exit(1)
+        print(f"MLIR written to {mlir_path}")
 
     if check_ok:
         print("Finish! Here is the difference:")
