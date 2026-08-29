@@ -4790,6 +4790,108 @@ def test_structured_wanda_pruning_matmul_concat_protects_low_weight_high_activat
     assert 0 in _kept_columns(wanda, "W1", wb)
 
 
+def test_structured_wanda_pruning_matmul_concat_composed_residual_branch_matches_oracle():
+    # The Wanda-calibrated analogue of
+    # test_structured_pruning_matmul_concat_composes_with_residual_merge_branch_matches_oracle:
+    # confirms the composed branch's own Wanda probe point is exactly where
+    # the residual group's own combined output (`addr`) feeds the `Concat`
+    # node -- not the shared downstream consumer, and not either individual
+    # producer's own raw output -- and that the base (weight-only) term
+    # combines both leaf producers' own per-row norms via the same
+    # root-sum-square formula _plain_structured_importance already uses for
+    # an ordinary multi-producer chain, exactly as
+    # _plain_branch_importance now does for a composed branch.
+    K, C, Cb, Out = 8, 8, 6, 3
+    rng = np.random.default_rng(221)
+    wf = rng.standard_normal((K, C)).astype(np.float32)
+    ws = rng.standard_normal((K, C)).astype(np.float32)
+    wb = rng.standard_normal((K, Cb)).astype(np.float32)
+    wout = rng.standard_normal((C + Cb, Out)).astype(np.float32)
+    model = _model(
+        f"""
+        g (float[batch,{K}] X) => (float[batch,{Out}] Y)
+        {{
+          f = MatMul(X, WF)
+          s = MatMul(X, WS)
+          addr = Add(f, s)
+          hb = MatMul(X, WB)
+          merged = Concat<axis=-1>(addr, hb)
+          Y = MatMul(merged, WOUT)
+        }}
+        """,
+        initializer=[
+            _f32(wf, "WF"),
+            _f32(ws, "WS"),
+            _f32(wb, "WB"),
+            _f32(wout, "WOUT"),
+        ],
+    )
+
+    probe_model = onnx.ModelProto()
+    probe_model.CopyFrom(model)
+    probe_model.graph.output.append(
+        onnx.helper.make_tensor_value_info("addr", onnx.TensorProto.FLOAT, None)
+    )
+    probe_model.graph.output.append(
+        onnx.helper.make_tensor_value_info("hb", onnx.TensorProto.FLOAT, None)
+    )
+
+    rng_cal = np.random.default_rng(222)
+    x_cal = rng_cal.standard_normal((16, K)).astype(np.float32)
+    calibration_data = [{"X": x_cal}]
+    _, addr_cal, hb_cal = _run(probe_model, {"X": x_cal})
+    norm_r = np.sqrt(np.mean(np.square(addr_cal.astype(np.float64)), axis=0))
+    norm_b = np.sqrt(np.mean(np.square(hb_cal.astype(np.float64)), axis=0))
+
+    pruned = onnxsim.apply_structured_wanda_pruning(
+        model, calibration_data=calibration_data, sparsity=0.5
+    )
+    onnx.checker.check_model(pruned)
+
+    base_r = np.sqrt(
+        np.square(np.linalg.norm(wf.astype(np.float64), axis=0))
+        + np.square(np.linalg.norm(ws.astype(np.float64), axis=0))
+    )
+    importance_r = base_r * np.maximum(norm_r, 1e-8)
+    importance_b = np.linalg.norm(wb.astype(np.float64), axis=0) * np.maximum(
+        norm_b, 1e-8
+    )
+    keep_r = np.sort(np.argsort(-importance_r)[: C // 2])
+    keep_b = np.sort(np.argsort(-importance_b)[: Cb // 2])
+    global_keep = np.concatenate([keep_r, keep_b + C])
+
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    np.testing.assert_array_equal(inits["WF"], wf[:, keep_r])
+    np.testing.assert_array_equal(inits["WS"], ws[:, keep_r])
+    np.testing.assert_array_equal(inits["WB"], wb[:, keep_b])
+    np.testing.assert_array_equal(inits["WOUT"], wout[global_keep, :])
+
+    oracle = _model(
+        f"""
+        g (float[batch,{K}] X) => (float[batch,{Out}] Y)
+        {{
+          f = MatMul(X, WF)
+          s = MatMul(X, WS)
+          addr = Add(f, s)
+          hb = MatMul(X, WB)
+          merged = Concat<axis=-1>(addr, hb)
+          Y = MatMul(merged, WOUT)
+        }}
+        """,
+        initializer=[
+            _f32(wf[:, keep_r], "WF"),
+            _f32(ws[:, keep_r], "WS"),
+            _f32(wb[:, keep_b], "WB"),
+            _f32(wout[global_keep, :], "WOUT"),
+        ],
+    )
+    rng_x = np.random.default_rng(223)
+    x = rng_x.standard_normal((5, K)).astype(np.float32)
+    (y,) = _run(pruned, {"X": x})
+    (y_oracle,) = _run(oracle, {"X": x})
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-5, atol=1e-5)
+
+
 def test_structured_pruning_matmul_concat_declines_on_positive_axis():
     # `axis=1` on a 2-D [batch, C] tensor is numerically the same as
     # `axis=-1`, but this pass never looks up a tensor's rank (see this
@@ -4868,18 +4970,27 @@ def test_structured_pruning_matmul_concat_declines_on_graph_input_branch():
     np.testing.assert_array_equal(inits["WOUT"], wout)
 
 
-def test_structured_pruning_matmul_concat_declines_on_residual_merge_branch():
+def test_structured_pruning_matmul_concat_composes_with_residual_merge_branch_matches_oracle():
     # One Concat operand is itself an eligible Add-residual merge point's
-    # raw output -- composing a residual merge with a Concat merge on the
-    # same branch isn't verified (see this section's own comment): the
-    # backward walk's "add" outcome is declined exactly like "fail", so the
-    # whole group -- both the residual pair and the plain second branch --
-    # is left untouched.
-    K, C, Cb, Out = 8, 6, 4, 3
+    # raw output, with no consumer anywhere else -- composed, not declined
+    # (see this section's own comment on the `"add"` outcome): the merge's
+    # own whole group (WF, WS) is resolved exactly as
+    # _find_matmul_residual_chains would resolve it standalone, and the
+    # group's own combined-importance keep set becomes this one branch's
+    # own contribution, independent of the plain second branch (WB).
+    # Deliberately adversarial on both axes at once: WF/WS individually
+    # disagree about which half of the columns matter most (so only their
+    # *combined* norm, not either producer's own, can be driving the
+    # residual branch's keep set), and WB is scaled 10x larger so a bug that
+    # (wrongly) mixed the two Concat branches' importances into one ranking
+    # would starve WB's own columns entirely.
+    K, C, Cb, Out = 8, 16, 6, 3
     rng = np.random.default_rng(213)
-    wf = rng.standard_normal((K, C)).astype(np.float32)
-    ws = rng.standard_normal((K, C)).astype(np.float32)
-    wb = rng.standard_normal((K, Cb)).astype(np.float32)
+    scale_f = np.where(np.arange(C) < C // 2, 3.0, 0.3).astype(np.float32)
+    scale_s = np.where(np.arange(C) < C // 2, 0.3, 3.0).astype(np.float32)
+    wf = rng.standard_normal((K, C)).astype(np.float32) * scale_f
+    ws = rng.standard_normal((K, C)).astype(np.float32) * scale_s
+    wb = rng.standard_normal((K, Cb)).astype(np.float32) * 10.0
     wout = rng.standard_normal((C + Cb, Out)).astype(np.float32)
     model = _model(
         f"""
@@ -4901,10 +5012,231 @@ def test_structured_pruning_matmul_concat_declines_on_residual_merge_branch():
         ],
     )
     pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    importance_r = np.sqrt(
+        np.square(np.linalg.norm(wf.astype(np.float64), axis=0))
+        + np.square(np.linalg.norm(ws.astype(np.float64), axis=0))
+    )
+    keep_r = np.sort(np.argsort(-importance_r)[: C // 2])
+    # The conflicting-importance construction above is only doing its job
+    # if the combined keep set actually straddles both halves.
+    assert np.any(keep_r < C // 2) and np.any(keep_r >= C // 2)
+    importance_b = np.linalg.norm(wb.astype(np.float64), axis=0)
+    keep_b = np.sort(np.argsort(-importance_b)[: Cb // 2])
+    assert len(keep_b) == Cb // 2  # branch b kept its own top half, not starved to 0
+    global_keep = np.concatenate([keep_r, keep_b + C])
+
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    np.testing.assert_array_equal(inits["WF"], wf[:, keep_r])
+    np.testing.assert_array_equal(inits["WS"], ws[:, keep_r])
+    np.testing.assert_array_equal(inits["WB"], wb[:, keep_b])
+    np.testing.assert_array_equal(inits["WOUT"], wout[global_keep, :])
+
+    oracle = _model(
+        f"""
+        g (float[batch,{K}] X) => (float[batch,{Out}] Y)
+        {{
+          f = MatMul(X, WF)
+          s = MatMul(X, WS)
+          addr = Add(f, s)
+          hb = MatMul(X, WB)
+          merged = Concat<axis=-1>(addr, hb)
+          Y = MatMul(merged, WOUT)
+        }}
+        """,
+        initializer=[
+            _f32(wf[:, keep_r], "WF"),
+            _f32(ws[:, keep_r], "WS"),
+            _f32(wb[:, keep_b], "WB"),
+            _f32(wout[global_keep, :], "WOUT"),
+        ],
+    )
+    rng_x = np.random.default_rng(214)
+    x = rng_x.standard_normal((5, K)).astype(np.float32)
+    (y,) = _run(pruned, {"X": x})
+    (y_oracle,) = _run(oracle, {"X": x})
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-5, atol=1e-5)
+
+
+def test_structured_pruning_matmul_concat_composes_with_skip_layer_norm_branch_matches_oracle():
+    # The composed branch's own merge point can be a fused
+    # `SkipLayerNormalization` node, not just a bare `Add` -- its own
+    # `gamma`/`beta` constants are folded into the composed branch's own
+    # `pre_ops` (via `_match_matmul_residual_merge`'s own `extra_ops`,
+    # reused unchanged inside `_resolve_matmul_residual_group_for_concat`)
+    # and sliced by the branch's own local `keep`, exactly as they would be
+    # for a standalone SkipLayerNormalization residual chain.
+    K, C, Cb, Out = 8, 16, 6, 3
+    rng, wf, ws = _conflicting_wf_ws(224, K, C)
+    gamma = rng.standard_normal((C,)).astype(np.float32)
+    beta = rng.standard_normal((C,)).astype(np.float32)
+    wb = rng.standard_normal((K, Cb)).astype(np.float32) * 10.0
+    wout = rng.standard_normal((C + Cb, Out)).astype(np.float32)
+
+    def _build(wf_, ws_, gamma_, beta_, wb_, wout_):
+        m = _model(
+            f"""
+            g (float[batch,{K}] X) => (float[batch,{Out}] Y)
+            {{
+              f = MatMul(X, WF)
+              s = MatMul(X, WS)
+              addr = com.microsoft.SkipLayerNormalization <epsilon=1e-5> (f, s, Gamma, Beta)
+              hb = MatMul(X, WB)
+              merged = Concat<axis=-1>(addr, hb)
+              Y = MatMul(merged, WOUT)
+            }}
+            """,
+            initializer=[
+                _f32(wf_, "WF"),
+                _f32(ws_, "WS"),
+                _f32(gamma_, "Gamma"),
+                _f32(beta_, "Beta"),
+                _f32(wb_, "WB"),
+                _f32(wout_, "WOUT"),
+            ],
+            opset=17,
+        )
+        m.opset_import.append(onnx.helper.make_opsetid("com.microsoft", 1))
+        return m
+
+    model = _build(wf, ws, gamma, beta, wb, wout)
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    keep_r = _skip_layer_norm_keep(wf, ws, C)
+    importance_b = np.linalg.norm(wb.astype(np.float64), axis=0)
+    keep_b = np.sort(np.argsort(-importance_b)[: Cb // 2])
+    assert len(keep_b) == Cb // 2
+    global_keep = np.concatenate([keep_r, keep_b + C])
+
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    np.testing.assert_array_equal(inits["WF"], wf[:, keep_r])
+    np.testing.assert_array_equal(inits["WS"], ws[:, keep_r])
+    np.testing.assert_array_equal(inits["Gamma"], gamma[keep_r])
+    np.testing.assert_array_equal(inits["Beta"], beta[keep_r])
+    np.testing.assert_array_equal(inits["WB"], wb[:, keep_b])
+    np.testing.assert_array_equal(inits["WOUT"], wout[global_keep, :])
+
+    oracle = _build(
+        wf[:, keep_r],
+        ws[:, keep_r],
+        gamma[keep_r],
+        beta[keep_r],
+        wb[:, keep_b],
+        wout[global_keep, :],
+    )
+    rng_x = np.random.default_rng(225)
+    x = rng_x.standard_normal((5, K)).astype(np.float32)
+    (y,) = _run(pruned, {"X": x})
+    (y_oracle,) = _run(oracle, {"X": x})
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-4, atol=1e-4)
+
+
+def test_structured_pruning_matmul_concat_declines_on_residual_merge_branch_direct_fan_out():
+    # Same shape as the composed test above, except `addr` (the residual
+    # group's own sink, and the tensor directly feeding the `Concat`
+    # operand) also feeds a second, ordinary consumer (`Z`) -- caught by the
+    # same `_branch_walk_has_fanout` check an ordinary (non-composed) branch
+    # is already held to: `addr`'s own consumer count is 2, not 1, so the
+    # `"add"` outcome is declined before group resolution is even
+    # attempted. Real fan-out this composition deliberately doesn't try to
+    # reconcile with the `Concat` branch's own fixed-offset slice (see this
+    # section's own comment on the `"add"` outcome): the whole `Concat`
+    # group is declined, exactly as if the branch had failed to resolve at
+    # all, so nothing here is touched -- not the residual pair, the plain
+    # second branch, or `Z`'s own consumer.
+    K, C, Cb, Cz, Out = 8, 6, 4, 3, 3
+    rng = np.random.default_rng(215)
+    wf = rng.standard_normal((K, C)).astype(np.float32)
+    ws = rng.standard_normal((K, C)).astype(np.float32)
+    wb = rng.standard_normal((K, Cb)).astype(np.float32)
+    wz = rng.standard_normal((C, Cz)).astype(np.float32)
+    wout = rng.standard_normal((C + Cb, Out)).astype(np.float32)
+    model = _model(
+        f"""
+        g (float[batch,{K}] X) => (float[batch,{Out}] Y, float[batch,{Cz}] Z)
+        {{
+          f = MatMul(X, WF)
+          s = MatMul(X, WS)
+          addr = Add(f, s)
+          hb = MatMul(X, WB)
+          merged = Concat<axis=-1>(addr, hb)
+          Y = MatMul(merged, WOUT)
+          Z = MatMul(addr, WZ)
+        }}
+        """,
+        initializer=[
+            _f32(wf, "WF"),
+            _f32(ws, "WS"),
+            _f32(wb, "WB"),
+            _f32(wz, "WZ"),
+            _f32(wout, "WOUT"),
+        ],
+    )
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
     inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
     np.testing.assert_array_equal(inits["WF"], wf)
     np.testing.assert_array_equal(inits["WS"], ws)
     np.testing.assert_array_equal(inits["WB"], wb)
+    np.testing.assert_array_equal(inits["WZ"], wz)
+    np.testing.assert_array_equal(inits["WOUT"], wout)
+
+
+def test_structured_pruning_matmul_concat_declines_on_residual_merge_group_interior_fan_out():
+    # A three-producer transitive group -- addr1 = Add(f, s), addr2 =
+    # Add(addr1, t) -- whose *sink* (`addr2`) feeds the `Concat` cleanly
+    # (its own only consumer), but whose *interior* tensor `addr1` also
+    # feeds a second, ordinary consumer (`Z`) elsewhere. `addr2`'s own
+    # direct walk to the `Concat` operand sees no fan-out at all (only
+    # `addr1`, an entirely different tensor, is over-read) -- so this
+    # exercises the deeper check, once the whole group is resolved:
+    # `_resolve_matmul_fanout_branches` finds `Z` as a real, resolvable
+    # extra consumer of the group's own internal wiring, and this
+    # composition declines rather than trying to reconcile a `Concat`
+    # branch's own fixed-offset slice with an ordinary chain sharing the
+    # same weights. The whole `Concat` group is declined -- nothing here is
+    # touched, not the three-producer group, the plain second branch, or
+    # `Z`'s own consumer.
+    K, C, Cb, Cz, Out = 8, 6, 4, 3, 3
+    rng = np.random.default_rng(216)
+    wf = rng.standard_normal((K, C)).astype(np.float32)
+    ws = rng.standard_normal((K, C)).astype(np.float32)
+    wt = rng.standard_normal((K, C)).astype(np.float32)
+    wb = rng.standard_normal((K, Cb)).astype(np.float32)
+    wz = rng.standard_normal((C, Cz)).astype(np.float32)
+    wout = rng.standard_normal((C + Cb, Out)).astype(np.float32)
+    model = _model(
+        f"""
+        g (float[batch,{K}] X) => (float[batch,{Out}] Y, float[batch,{Cz}] Z)
+        {{
+          f = MatMul(X, WF)
+          s = MatMul(X, WS)
+          addr1 = Add(f, s)
+          t = MatMul(X, WT)
+          addr2 = Add(addr1, t)
+          hb = MatMul(X, WB)
+          merged = Concat<axis=-1>(addr2, hb)
+          Y = MatMul(merged, WOUT)
+          Z = MatMul(addr1, WZ)
+        }}
+        """,
+        initializer=[
+            _f32(wf, "WF"),
+            _f32(ws, "WS"),
+            _f32(wt, "WT"),
+            _f32(wb, "WB"),
+            _f32(wz, "WZ"),
+            _f32(wout, "WOUT"),
+        ],
+    )
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    np.testing.assert_array_equal(inits["WF"], wf)
+    np.testing.assert_array_equal(inits["WS"], ws)
+    np.testing.assert_array_equal(inits["WT"], wt)
+    np.testing.assert_array_equal(inits["WB"], wb)
+    np.testing.assert_array_equal(inits["WZ"], wz)
     np.testing.assert_array_equal(inits["WOUT"], wout)
 
 
@@ -5106,6 +5438,95 @@ def test_structured_wanda_pruning_conv_concat_matches_oracle():
     oracle = _conv_concat_model([wa[keep_a], wb[keep_b]], wout[:, global_keep])
 
     rng_x = np.random.default_rng(222)
+    x = rng_x.standard_normal((2, Cin, 10, 10)).astype(np.float32)
+    (y,) = _run(pruned, {"X": x})
+    (y_oracle,) = _run(oracle, {"X": x})
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-5, atol=1e-5)
+
+
+def test_structured_pruning_conv_concat_composes_with_residual_merge_branch_matches_oracle():
+    # The Conv analogue of
+    # test_structured_pruning_matmul_concat_composes_with_residual_merge_branch_matches_oracle:
+    # one Concat branch (`addr = Add(Conv_f(X), Conv_s(X))`) is itself a
+    # residual-merge group with no consumer anywhere else, composed via
+    # _resolve_conv_residual_group_for_concat exactly as
+    # _find_conv_residual_chains would resolve it standalone; the other
+    # branch (`hb`) is plain and ranked entirely independently. Same double
+    # adversarial construction: WF/WS individually disagree about which
+    # half of the *filters* matter most (so only the group's own combined
+    # importance can be driving its keep set), and WB is scaled 10x larger
+    # (so a bug mixing the two Concat branches' importances would starve
+    # WB's own filters).
+    Cin, C, Cb, Cout = 3, 16, 6, 5
+    rng = np.random.default_rng(219)
+    scale_f = (
+        np.where(np.arange(C) < C // 2, 3.0, 0.3).astype(np.float32).reshape(C, 1, 1, 1)
+    )
+    scale_s = (
+        np.where(np.arange(C) < C // 2, 0.3, 3.0).astype(np.float32).reshape(C, 1, 1, 1)
+    )
+    wf = rng.standard_normal((C, Cin, 3, 3)).astype(np.float32) * scale_f
+    ws = rng.standard_normal((C, Cin, 3, 3)).astype(np.float32) * scale_s
+    wb = rng.standard_normal((Cb, Cin, 3, 3)).astype(np.float32) * 10.0
+    wout = rng.standard_normal((Cout, C + Cb, 3, 3)).astype(np.float32)
+    model = _model(
+        f"""
+        g (float[N,{Cin},10,10] X) => (float[N,{Cout},6,6] Y)
+        {{
+          f = Conv<kernel_shape=[3,3]>(X, WF)
+          s = Conv<kernel_shape=[3,3]>(X, WS)
+          addr = Add(f, s)
+          hb = Conv<kernel_shape=[3,3]>(X, WB)
+          merged = Concat<axis=1>(addr, hb)
+          Y = Conv<kernel_shape=[3,3]>(merged, WOUT)
+        }}
+        """,
+        initializer=[
+            _f32(wf, "WF"),
+            _f32(ws, "WS"),
+            _f32(wb, "WB"),
+            _f32(wout, "WOUT"),
+        ],
+    )
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    importance_r = np.sqrt(
+        np.square(np.linalg.norm(wf.reshape(C, -1).astype(np.float64), axis=1))
+        + np.square(np.linalg.norm(ws.reshape(C, -1).astype(np.float64), axis=1))
+    )
+    keep_r = np.sort(np.argsort(-importance_r)[: C // 2])
+    assert np.any(keep_r < C // 2) and np.any(keep_r >= C // 2)
+    keep_b = _oracle_keep_indices_conv(wb, Cb // 2)
+    assert len(keep_b) == Cb // 2
+    global_keep = np.concatenate([keep_r, keep_b + C])
+
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    np.testing.assert_array_equal(inits["WF"], wf[keep_r])
+    np.testing.assert_array_equal(inits["WS"], ws[keep_r])
+    np.testing.assert_array_equal(inits["WB"], wb[keep_b])
+    np.testing.assert_array_equal(inits["WOUT"], wout[:, global_keep])
+
+    oracle = _model(
+        f"""
+        g (float[N,{Cin},10,10] X) => (float[N,{Cout},6,6] Y)
+        {{
+          f = Conv<kernel_shape=[3,3]>(X, WF)
+          s = Conv<kernel_shape=[3,3]>(X, WS)
+          addr = Add(f, s)
+          hb = Conv<kernel_shape=[3,3]>(X, WB)
+          merged = Concat<axis=1>(addr, hb)
+          Y = Conv<kernel_shape=[3,3]>(merged, WOUT)
+        }}
+        """,
+        initializer=[
+            _f32(wf[keep_r], "WF"),
+            _f32(ws[keep_r], "WS"),
+            _f32(wb[keep_b], "WB"),
+            _f32(wout[:, global_keep], "WOUT"),
+        ],
+    )
+    rng_x = np.random.default_rng(220)
     x = rng_x.standard_normal((2, Cin, 10, 10)).astype(np.float32)
     (y,) = _run(pruned, {"X": x})
     (y_oracle,) = _run(oracle, {"X": x})
