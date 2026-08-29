@@ -217,8 +217,10 @@ inline bool LoadModelFromGGUF(const std::string& path, onnx::ModelProto* model,
 // written to disk exactly once despite the model blob needing two passes.
 inline void SaveModelAsGGUFStandalone(
     onnx::ModelProto& model, const std::string& path, TensorPool& pool,
-    const std::map<std::string, std::string>& string_metadata = {}) {
-  auto adopted = AdoptAllWithPlaceholderOffsets(model, path, pool);
+    const std::map<std::string, std::string>& string_metadata = {},
+    std::map<std::string, std::string>* external_tensor_bytes = nullptr) {
+  auto adopted =
+      AdoptAllWithPlaceholderOffsets(model, path, pool, external_tensor_bytes);
   CheckNoEmbeddedModelKeyCollision(pool);
 
   std::string placeholder_bytes;

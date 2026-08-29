@@ -343,6 +343,91 @@ def import_onnx_schemas() -> int:
     return imported
 
 
+def _extract_tensor_to_dict(
+    tensor: onnx.TensorProto, key: str, tensor_bytes: Dict[str, bytes]
+) -> None:
+    if (
+        tensor.data_location == onnx.TensorProto.EXTERNAL
+        or tensor.data_type == onnx.TensorProto.STRING
+        or not tensor.HasField("raw_data")
+    ):
+        return
+    tensor_bytes[key] = tensor.raw_data
+    tensor.ClearField("raw_data")
+
+
+def _extract_attr_tensors_to_dict(
+    attr: onnx.AttributeProto, path: str, tensor_bytes: Dict[str, bytes]
+) -> None:
+    if attr.HasField("t"):
+        _extract_tensor_to_dict(attr.t, attr.t.name or f"{path}/t", tensor_bytes)
+    for i, t in enumerate(attr.tensors):
+        _extract_tensor_to_dict(t, t.name or f"{path}/tensors{i}", tensor_bytes)
+    if attr.HasField("g"):
+        _extract_graph_tensors_to_dict(attr.g, tensor_bytes)
+    for g in attr.graphs:
+        _extract_graph_tensors_to_dict(g, tensor_bytes)
+
+
+def _extract_graph_tensors_to_dict(
+    graph: onnx.GraphProto, tensor_bytes: Dict[str, bytes]
+) -> None:
+    """Reverse of :func:`_hydrate_graph_tensors_from_pool`: pulls every
+    eligible tensor's ``raw_data`` out of ``graph`` (initializers and node
+    attribute tensors, recursing into subgraphs) into ``tensor_bytes`` --
+    keyed the same way tensor_pool_bridge.h's ForEachTensor derives pool
+    keys -- and clears it from the tensor in place, so the ``ModelProto``
+    this graph belongs to can be serialized across the FFI boundary without
+    paying to encode/decode the (potentially huge) tensor bytes a second
+    time; ``AdoptAllWithPlaceholderOffsets``'s C++ side expects exactly this
+    stripped state when given an ``external_tensor_bytes`` map.
+    """
+    for i, init in enumerate(graph.initializer):
+        _extract_tensor_to_dict(init, init.name or f"initializer{i}", tensor_bytes)
+    for ni, node in enumerate(graph.node):
+        node_path = node.name or f"node{ni}"
+        for ai, attr in enumerate(node.attribute):
+            _extract_attr_tensors_to_dict(attr, f"{node_path}/attr{ai}", tensor_bytes)
+
+
+def _restore_tensor_raw_data(
+    tensor: onnx.TensorProto, key: str, tensor_bytes: Dict[str, bytes]
+) -> None:
+    if key in tensor_bytes:
+        tensor.raw_data = tensor_bytes[key]
+
+
+def _restore_attr_tensors_raw_data(
+    attr: onnx.AttributeProto, path: str, tensor_bytes: Dict[str, bytes]
+) -> None:
+    if attr.HasField("t"):
+        _restore_tensor_raw_data(attr.t, attr.t.name or f"{path}/t", tensor_bytes)
+    for i, t in enumerate(attr.tensors):
+        _restore_tensor_raw_data(t, t.name or f"{path}/tensors{i}", tensor_bytes)
+    if attr.HasField("g"):
+        _restore_graph_tensors_raw_data(attr.g, tensor_bytes)
+    for g in attr.graphs:
+        _restore_graph_tensors_raw_data(g, tensor_bytes)
+
+
+def _restore_graph_tensors_raw_data(
+    graph: onnx.GraphProto, tensor_bytes: Dict[str, bytes]
+) -> None:
+    """Undoes :func:`_extract_graph_tensors_to_dict`: puts each extracted
+    tensor's ``raw_data`` back so the caller's ``model`` is left exactly as
+    it was, once the export call that needed it stripped out has returned
+    (or raised). This restore is a plain in-memory field assignment --
+    no serialization, no FFI crossing -- so it doesn't reintroduce the
+    protobuf round-trip cost the extraction was written to avoid.
+    """
+    for i, init in enumerate(graph.initializer):
+        _restore_tensor_raw_data(init, init.name or f"initializer{i}", tensor_bytes)
+    for ni, node in enumerate(graph.node):
+        node_path = node.name or f"node{ni}"
+        for ai, attr in enumerate(node.attribute):
+            _restore_attr_tensors_raw_data(attr, f"{node_path}/attr{ai}", tensor_bytes)
+
+
 def export_safetensors(model: onnx.ModelProto, out_path: str) -> None:
     """Export ``model`` to a standalone safetensors archive at ``out_path``.
 
@@ -351,8 +436,20 @@ def export_safetensors(model: onnx.ModelProto, out_path: str) -> None:
     no onnxsim involved -- and the graph itself is embedded alongside them, so
     ``out_path`` alone is both the model's weights and its graph. Reload it
     with :func:`import_safetensors`.
+
+    ``model`` is left unchanged once this returns (including on error): each
+    tensor's ``raw_data`` is transiently cleared before crossing into C++ (so
+    the accompanying model-structure serialize doesn't also re-encode the
+    -- potentially huge -- tensor bytes a second time) and restored
+    afterwards, a plain in-memory assignment with no serialization or FFI
+    cost of its own.
     """
-    C.export_safetensors(model.SerializeToString(), out_path)
+    tensor_bytes: Dict[str, bytes] = {}
+    _extract_graph_tensors_to_dict(model.graph, tensor_bytes)
+    try:
+        C.export_safetensors(model.SerializeToString(), tensor_bytes, out_path)
+    finally:
+        _restore_graph_tensors_raw_data(model.graph, tensor_bytes)
 
 
 def import_safetensors(in_path: str) -> onnx.ModelProto:
@@ -364,8 +461,10 @@ def import_safetensors(in_path: str) -> onnx.ModelProto:
     ``RuntimeError`` if the archive has no embedded onnxsim model, e.g. a
     plain weights-only safetensors file with no graph to import.
     """
+    model_bytes, pool = C.import_safetensors(in_path)
     model = onnx.ModelProto()
-    model.ParseFromString(C.import_safetensors(in_path))
+    model.ParseFromString(model_bytes)
+    _hydrate_graph_tensors_from_pool(model.graph, pool)
     return model
 
 
@@ -485,14 +584,23 @@ def load_model(
 
 
 def export_gguf(model: onnx.ModelProto, out_path: str) -> None:
-    """GGUF counterpart of :func:`export_safetensors`."""
-    C.export_gguf(model.SerializeToString(), out_path)
+    """GGUF counterpart of :func:`export_safetensors`, including its
+    leaves-``model``-unchanged contract.
+    """
+    tensor_bytes: Dict[str, bytes] = {}
+    _extract_graph_tensors_to_dict(model.graph, tensor_bytes)
+    try:
+        C.export_gguf(model.SerializeToString(), tensor_bytes, out_path)
+    finally:
+        _restore_graph_tensors_raw_data(model.graph, tensor_bytes)
 
 
 def import_gguf(in_path: str) -> onnx.ModelProto:
     """GGUF counterpart of :func:`import_safetensors`."""
+    model_bytes, pool = C.import_gguf(in_path)
     model = onnx.ModelProto()
-    model.ParseFromString(C.import_gguf(in_path))
+    model.ParseFromString(model_bytes)
+    _hydrate_graph_tensors_from_pool(model.graph, pool)
     return model
 
 

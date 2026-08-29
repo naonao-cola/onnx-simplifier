@@ -1288,6 +1288,88 @@ def test_load_model_dispatches_to_gguf_archive():
     assert set(pool.names()) >= {"a", "b"}
 
 
+@pytest.mark.parametrize(
+    "export_fn,import_fn,ext",
+    [
+        (onnxsim.export_safetensors, onnxsim.import_safetensors, "safetensors"),
+        (onnxsim.export_gguf, onnxsim.import_gguf, "gguf"),
+    ],
+)
+def test_export_archive_leaves_model_unchanged(export_fn, import_fn, ext):
+    # export_safetensors/export_gguf used to cross the whole model (tensor
+    # bytes included) into C++ via a single SerializeToString()/ParseFromString()
+    # round trip -- the same double-encode pattern load_model's hydrate_all=True
+    # path had (see that function's docstring). The fix pulls each tensor's
+    # raw_data out into a separate dict up front (so the accompanying
+    # model-structure serialize is cheap) and puts it back once the C++ call
+    # returns -- this must be transparent to the caller: `model` compares
+    # byte-equal to a snapshot taken before the call, even though it was
+    # mutated and restored in between.
+    model, a, b = _make_add_model()
+    before = onnx.ModelProto()
+    before.CopyFrom(model)
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        archive_path = os.path.join(tmpdir, f"model.{ext}")
+        export_fn(model, archive_path)
+        assert model == before
+
+        loaded = import_fn(archive_path)
+
+    onnx.checker.check_model(loaded)
+    np.testing.assert_allclose(
+        onnx.numpy_helper.to_array(loaded.graph.initializer[0]), a
+    )
+    np.testing.assert_allclose(
+        onnx.numpy_helper.to_array(loaded.graph.initializer[1]), b
+    )
+
+
+@pytest.mark.parametrize(
+    "export_fn,import_fn",
+    [
+        (onnxsim.export_safetensors, onnxsim.import_safetensors),
+        (onnxsim.export_gguf, onnxsim.import_gguf),
+    ],
+)
+def test_export_archive_roundtrips_unnamed_attribute_tensor(export_fn, import_fn):
+    # The extraction side of the same fix (_extract_graph_tensors_to_dict)
+    # must key an unnamed node-attribute tensor the same positional way
+    # (`node<i>/attr<j>/t`) its hydration counterpart does, or the C++ side's
+    # external_tensor_bytes lookup misses and the tensor is silently dropped
+    # from the archive instead of exported.
+    model = parser.parse_model(
+        """
+        <
+          ir_version: 10,
+          opset_import: ["": 17]
+        >
+        g (float[2,2] x) => (float[2,2] y)
+        {
+          c = Constant<value = float[2,2] {0.0, 1.0, 2.0, 3.0}>()
+          y = Add(x, c)
+        }
+        """
+    )
+    (const_node,) = [n for n in model.graph.node if n.op_type == "Constant"]
+    (value_attr,) = [a for a in const_node.attribute if a.name == "value"]
+    value_attr.t.ClearField("name")
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        archive_path = os.path.join(tmpdir, "model.archive")
+        export_fn(model, archive_path)
+        loaded = import_fn(archive_path)
+
+    onnx.checker.check_model(loaded)
+    (loaded_const,) = [n for n in loaded.graph.node if n.op_type == "Constant"]
+    (loaded_value,) = [a for a in loaded_const.attribute if a.name == "value"]
+    assert loaded_value.t.data_location == onnx.TensorProto.DEFAULT
+    np.testing.assert_allclose(
+        onnx.numpy_helper.to_array(loaded_value.t),
+        np.array([[0.0, 1.0], [2.0, 3.0]], dtype=np.float32),
+    )
+
+
 @skip_in_ci()
 @pytest.mark.skipif(sys.platform == "win32", reason="resource.getrusage is POSIX-only")
 def test_simplify_path_peak_memory_stays_near_model_size():
