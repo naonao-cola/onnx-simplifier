@@ -955,18 +955,29 @@ onnx::ModelProto _FoldConstant(const ModelExecutor& executor,
       }
     }
   }
-  // Map each pre-existing Constant node's output to the node itself, seeding
-  // the lookup RunOps uses to inline a Constant node's embedded value instead
-  // of looking it up as an initializer. Grown as folding creates new Constant
-  // nodes for impure outputs (see RunOpsAndAddInitializers); new_constant_nodes
-  // owns those (a std::deque, not a std::vector, so the pointers this map
-  // holds into it stay valid as more are appended).
+  // Map each pre-existing, non-transient Constant node's output to the node
+  // itself, seeding the lookup RunOps uses to inline a Constant node's
+  // embedded value instead of looking it up as an initializer. Grown as
+  // folding creates new Constant nodes for impure outputs (see
+  // RunOpsAndAddInitializers); new_constant_nodes owns those (a std::deque,
+  // not a std::vector, so the pointers this map holds into it stay valid as
+  // more are appended).
+  //
+  // Transient Constant nodes (kTransientConstantAttr) are deliberately
+  // excluded: unlike a genuine Constant node -- which GetConstantNodes leaves
+  // untouched for this whole call -- a transient one is *not* special-cased
+  // there and flows through the ordinary foldable path instead, so it may be
+  // folded (and its NodeProto dropped from the model) by RebuildNodeList
+  // before this map is next consulted. Seeding it here would eventually
+  // dangle. It doesn't need to be seeded anyway: once folded, its value is a
+  // plain initializer that FindInitializerByName already resolves.
   std::unordered_map<std::string, const onnx::NodeProto*>
       constant_node_producers;
   for (const auto& node : model.graph().node()) {
     const bool is_default_domain =
         node.domain().empty() || node.domain() == "ai.onnx";
-    if (is_default_domain && node.op_type() == "Constant") {
+    if (is_default_domain && node.op_type() == "Constant" &&
+        !IsTransientConstant(node)) {
       for (const auto& output : node.output()) {
         constant_node_producers.emplace(output, &node);
       }
@@ -1555,16 +1566,28 @@ bool _FoldConstantOnGraph(const ModelExecutor& executor, onnx::Graph& g,
       }
     }
   }
-  // Map each pre-existing Constant node's output to the node itself, seeding
-  // the lookup RunOpsOnGraph uses to inline a Constant node's embedded value
-  // instead of looking it up as an initializer. Grown as folding creates new
-  // Constant nodes for impure outputs (see FoldGroupOnGraph).
+  // Map each pre-existing, non-transient Constant node's output to the node
+  // itself, seeding the lookup RunOpsOnGraph uses to inline a Constant node's
+  // embedded value instead of looking it up as an initializer. Grown as
+  // folding creates new Constant nodes for impure outputs (see
+  // FoldGroupOnGraph).
+  //
+  // Transient Constant nodes (kTransientConstantAttr) are deliberately
+  // excluded -- see _FoldConstant's identical seeding loop for the full
+  // rationale. Here it's a use-after-free, not just staleness: a transient
+  // node flows through the ordinary foldable path and gets destroyed
+  // (FoldGroupOnGraph's `owner->destroy()`) once folded, but this map is
+  // seeded once up front and never told, so a later batch's lookup could
+  // dereference the freed Node*. It doesn't need seeding anyway: once
+  // folded, its value is a plain initializer that g.getInitializer already
+  // resolves.
   std::unordered_map<std::string, onnx::Node*> constant_node_producers;
   for (onnx::Node* node : node_ptrs) {
     const std::string domain =
         node->has_domain() ? node->domain() : std::string();
     const bool is_default_domain = domain.empty() || domain == "ai.onnx";
-    if (is_default_domain && node->kind() == onnx::kConstant) {
+    if (is_default_domain && node->kind() == onnx::kConstant &&
+        !IsTransientConstantOnGraph(node)) {
       for (onnx::Value* out : node->outputs()) {
         constant_node_producers.emplace(out->uniqueName(), node);
       }
