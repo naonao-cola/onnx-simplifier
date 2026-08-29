@@ -204,7 +204,9 @@ def test_pipeline_report_matches_returned_model():
     recomputed = onnxsim.measure_accuracy_drop(
         simplified, result.optimized_model, calibration_data=calibration_data
     )
-    assert recomputed.worst_relative_l2 == pytest.approx(result.report.worst_relative_l2)
+    assert recomputed.worst_relative_l2 == pytest.approx(
+        result.report.worst_relative_l2
+    )
 
 
 def test_pipeline_is_deterministic_for_a_given_seed():

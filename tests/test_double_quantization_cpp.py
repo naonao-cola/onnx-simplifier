@@ -95,7 +95,9 @@ def test_cpp_double_quantization_inserts_nested_dequantize_and_keeps_output_clos
 def test_cpp_double_quantization_scale_codes_are_uint8():
     model = _blockwise_int4_model(k=512, n=8, block_size=8, seed=2)
     q = onnxsim.apply_double_quantization_cpp(model)
-    uint8_inits = [t for t in q.graph.initializer if t.data_type == onnx.TensorProto.UINT8]
+    uint8_inits = [
+        t for t in q.graph.initializer if t.data_type == onnx.TensorProto.UINT8
+    ]
     assert len(uint8_inits) == 1
     codes = onnx.numpy_helper.to_array(uint8_inits[0])
     assert codes.min() >= 0 and codes.max() <= 255

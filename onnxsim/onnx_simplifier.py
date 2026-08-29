@@ -1040,9 +1040,7 @@ def apply_double_quantization_cpp(
     """
     if isinstance(model, str):
         model = onnx.load(model, load_external_data=False)
-    return onnx.load_from_string(
-        C.apply_double_quantization(model.SerializeToString())
-    )
+    return onnx.load_from_string(C.apply_double_quantization(model.SerializeToString()))
 
 
 def prune_magnitude_cpp(
@@ -1077,9 +1075,7 @@ def prune_magnitude_cpp(
     """
     if isinstance(model, str):
         model = onnx.load(model, load_external_data=False)
-    return onnx.load_from_string(
-        C.prune_magnitude(model.SerializeToString(), sparsity)
-    )
+    return onnx.load_from_string(C.prune_magnitude(model.SerializeToString(), sparsity))
 
 
 def apply_quarot_cpp(

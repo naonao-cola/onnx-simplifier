@@ -49,10 +49,6 @@ from onnxsim.mixed_precision import apply_mixed_precision_quantization
 from onnxsim.mx_quantization import MXFP4_CODEBOOK, quantize_weight_only_mxfp4
 from onnxsim.nf4 import NF4_CODEBOOK, quantize_weight_only_nf4
 from onnxsim.omniquant import apply_omniquant
-from onnxsim.optimize_pipeline import (
-    OptimizationPipelineResult,
-    apply_optimization_pipeline,
-)
 from onnxsim.onnx_simplifier import (
     apply_double_quantization_cpp,
     apply_quarot_cpp,
@@ -81,6 +77,10 @@ from onnxsim.onnx_simplifier import (
     quantize_weight_only_mxfp4_cpp,
     read_gguf_metadata,
     simplify,
+)
+from onnxsim.optimize_pipeline import (
+    OptimizationPipelineResult,
+    apply_optimization_pipeline,
 )
 from onnxsim.ort_matmul_nbits_workaround import workaround_ort_matmul_nbits_axis0_bug
 from onnxsim.precision_estimator import (
