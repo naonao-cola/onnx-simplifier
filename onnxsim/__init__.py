@@ -11,6 +11,7 @@ from onnxsim.accuracy import (
 )
 from onnxsim.adaround import apply_adaround
 from onnxsim.aqlm import quantize_weight_only_aqlm
+from onnxsim.attention_quantization import apply_attention_quantization
 from onnxsim.autoquant import AutoQuantResult, auto_quantize_int4
 from onnxsim.autoround import apply_autoround
 from onnxsim.awq import apply_awq
@@ -127,6 +128,7 @@ __all__ = [
     "apply_optimization_pipeline",
     "OptimizationPipelineResult",
     "apply_awq",
+    "apply_attention_quantization",
     "apply_gptq",
     "apply_smoothquant",
     "apply_llm_int8",
