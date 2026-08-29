@@ -2,10 +2,14 @@
 
 // Constant folding: partitioning a graph's nodes into foldable/non-foldable,
 // running the foldable ones through a ModelExecutor, and materializing their
-// outputs as initializers. Two parallel implementations live here: one that
-// works on onnx::ModelProto (used by the legacy Simplify path), and a
-// Graph-native one that walks onnx::Graph directly (see this file's own
-// top-of-.cpp comment on the Graph-native section for why both exist).
+// outputs -- as a plain initializer when the fold traces back purely to graph
+// initializers, or as a fresh Constant node otherwise (e.g. a fold that
+// consumed a pre-existing Constant node's embedded value), so that
+// provenance stays visible in the output model. Two parallel implementations
+// live here: one that works on onnx::ModelProto (used by the legacy Simplify
+// path), and a Graph-native one that walks onnx::Graph directly (see this
+// file's own top-of-.cpp comment on the Graph-native section for why both
+// exist).
 
 #include <onnx/onnx_pb.h>
 
@@ -19,6 +23,18 @@
 namespace onnx {
 class Graph;
 }  // namespace onnx
+
+// Attribute name marking a `Constant` node as "transient": created by another
+// onnxsim pass (partial_shape_eval.cpp) purely as an intermediate
+// representation for a value that pass already proved is fully known, with
+// the explicit expectation (see that file's own comments) that the ordinary
+// constant folder will normalize it -- into a plain initializer if its value
+// is otherwise purely initializer-derived, exactly as if the pass had never
+// represented it as a Constant node at all. Such a node must not be treated
+// as a source of "not from initializers" provenance the way a genuine (user-
+// authored, or another impure fold's own) Constant node is; see
+// GetConstantNodes/GetConstantNodesOnGraph's Constant-node special case.
+inline constexpr char kTransientConstantAttr[] = "onnxsim_transient_constant";
 
 // Shared simplification configuration. Read by constant folding (this file)
 // and by Optimize()/OptAndShapeOnGraph() (onnxsim.cpp) to keep both in sync
@@ -41,9 +57,9 @@ extern Config config;
 // once, before the first folding round.
 void FixupSchemaDeterminism();
 
-// Fold every foldable constant subexpression of `model` into initializers,
-// dropping the folded nodes and sweeping up initializers left unused by the
-// fold.
+// Fold every foldable constant subexpression of `model` (into initializers or
+// Constant nodes, see this file's own top-of-file comment), dropping the
+// folded nodes and sweeping up initializers left unused by the fold.
 onnx::ModelProto _FoldConstant(const ModelExecutor& executor,
                                onnx::ModelProto model);
 
