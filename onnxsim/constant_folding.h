@@ -24,6 +24,18 @@ namespace onnx {
 class Graph;
 }  // namespace onnx
 
+// Attribute name marking a `Constant` node as "transient": created by another
+// onnxsim pass (partial_shape_eval.cpp) purely as an intermediate
+// representation for a value that pass already proved is fully known, with
+// the explicit expectation (see that file's own comments) that the ordinary
+// constant folder will normalize it -- into a plain initializer if its value
+// is otherwise purely initializer-derived, exactly as if the pass had never
+// represented it as a Constant node at all. Such a node must not be treated
+// as a source of "not from initializers" provenance the way a genuine (user-
+// authored, or another impure fold's own) Constant node is; see
+// GetConstantNodes/GetConstantNodesOnGraph's Constant-node special case.
+inline constexpr char kTransientConstantAttr[] = "onnxsim_transient_constant";
+
 // Shared simplification configuration. Read by constant folding (this file)
 // and by Optimize()/OptAndShapeOnGraph() (onnxsim.cpp) to keep both in sync
 // on how initializers are treated and which optimizer passes run.

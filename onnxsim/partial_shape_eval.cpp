@@ -12,6 +12,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "constant_folding.h"
 #include "onnx/common/graph_shape_inference.h"
 #include "onnx/common/ir_pb_converter.h"
 #include "onnx/defs/schema.h"
@@ -752,6 +753,16 @@ void _EvalPartialShape(onnx::ModelProto& model) {
       attr->set_name("value");
       attr->set_type(onnx::AttributeProto::TENSOR);
       *attr->mutable_t() = std::move(iter->second);
+      // Marked transient (see kTransientConstantAttr's own comment): this
+      // Constant node is this pass's own intermediate representation for a
+      // value it already proved fully known, not a source of "not from
+      // initializers" provenance -- the ordinary constant folder should
+      // normalize it away like any other node, not treat it as an opaque
+      // Constant to leave alone.
+      onnx::AttributeProto* transient_attr = constant->add_attribute();
+      transient_attr->set_name(kTransientConstantAttr);
+      transient_attr->set_type(onnx::AttributeProto::INT);
+      transient_attr->set_i(1);
       continue;
     }
     auto fix_iter = node.output_size() == 1 ? reshape_fixes.find(node.output(0))
@@ -768,6 +779,11 @@ void _EvalPartialShape(onnx::ModelProto& model) {
       attr->set_name("value");
       attr->set_type(onnx::AttributeProto::TENSOR);
       *attr->mutable_t() = std::move(fix_iter->second.shape_tensor);
+      // Transient -- see the other creation site's own comment above.
+      onnx::AttributeProto* transient_attr = shape_const->add_attribute();
+      transient_attr->set_name(kTransientConstantAttr);
+      transient_attr->set_type(onnx::AttributeProto::INT);
+      transient_attr->set_i(1);
 
       onnx::NodeProto* reshape = model.mutable_graph()->add_node();
       *reshape = std::move(node);
@@ -1029,6 +1045,12 @@ bool _EvalPartialShapeOnGraph(onnx::Graph& g) {
   // shape-producing subgraph dead for the optimizer's own dead-node
   // elimination to remove.
   static const onnx::Symbol kValueAttr("value");
+  // Marked transient (see kTransientConstantAttr's own comment): this pass's
+  // Constant nodes are its own intermediate representation for a value
+  // already proved fully known, not a source of "not from initializers"
+  // provenance -- the ordinary constant folder should normalize them away
+  // like any other node.
+  static const onnx::Symbol kTransientAttr(kTransientConstantAttr);
   for (onnx::Node* node : node_ptrs) {
     if (node->outputs().size() != 1) continue;
     onnx::Value* out = node->outputs()[0];
@@ -1036,6 +1058,7 @@ bool _EvalPartialShapeOnGraph(onnx::Graph& g) {
     if (iter != folded_values.end()) {
       onnx::Node* constant = g.create(onnx::kConstant, 1);
       constant->t_(kValueAttr, iter->second);
+      constant->i_(kTransientAttr, 1);
       constant->outputs()[0]->setElemType(iter->second.elem_type());
       constant->outputs()[0]->setSizes(std::vector<onnx::Dimension>(
           iter->second.sizes().begin(), iter->second.sizes().end()));
@@ -1048,6 +1071,7 @@ bool _EvalPartialShapeOnGraph(onnx::Graph& g) {
     if (fix_iter != reshape_fixes.end() && node->kind() == onnx::kReshape) {
       onnx::Node* shape_const = g.create(onnx::kConstant, 1);
       shape_const->t_(kValueAttr, fix_iter->second.shape_tensor);
+      shape_const->i_(kTransientAttr, 1);
       shape_const->outputs()[0]->setElemType(
           fix_iter->second.shape_tensor.elem_type());
       shape_const->outputs()[0]->setSizes(std::vector<onnx::Dimension>(

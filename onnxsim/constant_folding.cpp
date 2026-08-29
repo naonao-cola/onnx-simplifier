@@ -647,6 +647,17 @@ struct ConstantNodePartition {
   std::set<std::string> impure_outputs;
 };
 
+// Whether `node` (assumed op_type "Constant") was marked transient by another
+// onnxsim pass -- see kTransientConstantAttr's own comment.
+bool IsTransientConstant(const onnx::NodeProto& node) {
+  for (const auto& attr : node.attribute()) {
+    if (attr.name() == kTransientConstantAttr) {
+      return true;
+    }
+  }
+  return false;
+}
+
 ConstantNodePartition GetConstantNodes(const onnx::ModelProto& model) {
   // tensor with empty name("") represents the empty value of an optional input
   // so "" should be treated as a name of a constant tensor.
@@ -703,10 +714,14 @@ ConstantNodePartition GetConstantNodes(const onnx::ModelProto& model) {
     // provenance distinction on the very next fixed-point iteration. Its
     // output still joins const_names so downstream nodes recognize it as a
     // constant input -- but never pure_names, so any consumer is correctly
-    // treated as not purely initializer-derived either.
+    // treated as not purely initializer-derived either. Exception: a node
+    // marked transient (kTransientConstantAttr) is another onnxsim pass's own
+    // intermediate representation, not a provenance-worthy Constant, so it
+    // falls through to the ordinary foldable path below instead.
     const bool is_default_domain =
         node.domain().empty() || node.domain() == "ai.onnx";
-    if (is_default_domain && node.op_type() == "Constant") {
+    if (is_default_domain && node.op_type() == "Constant" &&
+        !IsTransientConstant(node)) {
       const_names.insert(node.output().begin(), node.output().end());
       non_const_nodes.push_back(node);
       continue;
@@ -1145,6 +1160,12 @@ size_t EstimateOutputBytesOnGraph(onnx::Node* node) {
   return total;
 }
 
+// Graph-native counterpart of IsTransientConstant.
+bool IsTransientConstantOnGraph(onnx::Node* node) {
+  static const onnx::Symbol kTransientAttr(kTransientConstantAttr);
+  return node->hasAttribute(kTransientAttr);
+}
+
 // Graph-native counterpart of GetConstantNodes.
 ConstantNodePartitionGraph GetConstantNodesOnGraph(
     onnx::Graph& g, const std::vector<onnx::Node*>& node_ptrs) {
@@ -1178,12 +1199,14 @@ ConstantNodePartitionGraph GetConstantNodesOnGraph(
     const std::string domain =
         node->has_domain() ? node->domain() : std::string();
     const std::string op_type = node->kind().toString();
-    // Leave Constant nodes untouched -- see GetConstantNodes' own comment on
-    // its identical special case for the full rationale (idempotence: a
-    // Constant node created by a previous round for an impure fold must not
-    // be trivially re-folded straight back into an initializer).
+    // Leave Constant nodes untouched, transient ones excepted -- see
+    // GetConstantNodes' own comment on its identical special case for the
+    // full rationale (idempotence: a Constant node created by a previous
+    // round for an impure fold must not be trivially re-folded straight back
+    // into an initializer) and kTransientConstantAttr's own comment.
     const bool is_default_domain = domain.empty() || domain == "ai.onnx";
-    if (is_default_domain && node->kind() == onnx::kConstant) {
+    if (is_default_domain && node->kind() == onnx::kConstant &&
+        !IsTransientConstantOnGraph(node)) {
       for (onnx::Value* out : node->outputs()) {
         const_names.insert(out->uniqueName());
       }
