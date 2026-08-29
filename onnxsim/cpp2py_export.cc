@@ -548,6 +548,78 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
       },
       "model_bytes"_a);
 
+  // OCP Microscaling MXFP4 weight-only quantizes every MatMul/vanilla-Gemm
+  // whose weight is a constant float32 tensor whose reduction dimension is
+  // divisible by 32, via a Gather-a-codebook-then-scale dequant chain (no
+  // native ONNX MX tensor type). Activations are never touched, so no
+  // calibration data is needed. See QuantizeWeightOnlyMXFP4 in onnxsim.h.
+  m.def(
+      "quantize_weight_only_mxfp4",
+      [](const py::bytes& model_proto_bytes) -> py::bytes {
+        InitEnv();
+        ONNX_NAMESPACE::ModelProto model;
+        ParseProtoFromBytes(&model, model_proto_bytes.c_str(),
+                            model_proto_bytes.size());
+        const auto result = QuantizeWeightOnlyMXFP4(model);
+        std::string out;
+        result.SerializeToString(&out);
+        return py::bytes(out.data(), out.size());
+      },
+      "model_bytes"_a);
+
+  // QLoRA-style double quantization: quantizes every already-present
+  // DequantizeLinear node's own (large enough) constant scale tensor to
+  // UINT8 with a per-tensor meta-scale. See ApplyDoubleQuantization in
+  // onnxsim.h.
+  m.def(
+      "apply_double_quantization",
+      [](const py::bytes& model_proto_bytes) -> py::bytes {
+        InitEnv();
+        ONNX_NAMESPACE::ModelProto model;
+        ParseProtoFromBytes(&model, model_proto_bytes.c_str(),
+                            model_proto_bytes.size());
+        const auto result = ApplyDoubleQuantization(model);
+        std::string out;
+        result.SerializeToString(&out);
+        return py::bytes(out.data(), out.size());
+      },
+      "model_bytes"_a);
+
+  // Magnitude pruning (Han et al., 2015): zeros the least-magnitude entries
+  // of every MatMul/vanilla-Gemm/Conv layer's constant weight, independently
+  // per output row/filter. Data-free. See PruneMagnitude in onnxsim.h.
+  m.def(
+      "prune_magnitude",
+      [](const py::bytes& model_proto_bytes, double sparsity) -> py::bytes {
+        InitEnv();
+        ONNX_NAMESPACE::ModelProto model;
+        ParseProtoFromBytes(&model, model_proto_bytes.c_str(),
+                            model_proto_bytes.size());
+        const auto result = PruneMagnitude(model, sparsity);
+        std::string out;
+        result.SerializeToString(&out);
+        return py::bytes(out.data(), out.size());
+      },
+      "model_bytes"_a, "sparsity"_a);
+
+  // QuaRot (Ashkboos et al., 2024): rotation preprocessing plus INT4
+  // round-to-nearest quantization of both the weight and the activation of
+  // every MatMul/vanilla-Gemm layer. Data-free. See ApplyQuarot in
+  // onnxsim.h.
+  m.def(
+      "apply_quarot",
+      [](const py::bytes& model_proto_bytes, uint64_t seed) -> py::bytes {
+        InitEnv();
+        ONNX_NAMESPACE::ModelProto model;
+        ParseProtoFromBytes(&model, model_proto_bytes.c_str(),
+                            model_proto_bytes.size());
+        const auto result = ApplyQuarot(model, seed);
+        std::string out;
+        result.SerializeToString(&out);
+        return py::bytes(out.data(), out.size());
+      },
+      "model_bytes"_a, "seed"_a);
+
   // Lists the activation tensor names quantize_static could quantize --
   // see ListQuantizableActivations in onnxsim.h.
   m.def(
@@ -1490,25 +1562,32 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
   // tensor (Q4_K/Q5_K/Q6_K/Q8_0 -- what most real quantized checkpoints,
   // e.g. Unsloth's GGUF exports, actually use for the bulk of their
   // weights) is decoded to float32; see
-  // ImportModelWithGGUF/HydrateTensorProtoFromGGUF in
-  // tensor_pool_gguf_bridge.h. Returns (updated model bytes, names of GGUF
-  // tensors present in the file but skipped because their ggml_type has no
+  // ImportModelWithGGUFToPool/HydrateTensorProtoFromGGUF in
+  // tensor_pool_gguf_bridge.h. Returns (byte-free model bytes, the matched
+  // tensors' already-decoded bytes as a TensorPool, names of GGUF tensors
+  // present in the file but skipped because their ggml_type has no
   // representation TensorPool can hold at all, e.g. a legacy Q4_0 or IQ*-
   // family tensor -- NOT tensors simply absent from `model`'s
   // initializers, which this silently leaves alone rather than reporting).
+  // Splitting the matched tensors out into a TensorPool, rather than
+  // writing them into `model` and returning the whole thing serialized,
+  // avoids a full protobuf encode (here) + decode (Python) of the
+  // (potentially huge) newly-hydrated tensor data on top of the copies
+  // ImportModelWithGGUFToPool already makes.
   m.def(
       "import_gguf_weights",
       [](const py::bytes& model_bytes, const std::string& gguf_path)
-          -> std::tuple<py::bytes, std::vector<std::string>> {
+          -> std::tuple<py::bytes, onnxsim::tensor_pool::TensorPool,
+                        std::vector<std::string>> {
         onnx::ModelProto model;
         ParseProtoFromBytes(&model, model_bytes.c_str(), model_bytes.size());
-        onnxsim::tensor_pool::TensorPool pool;
+        onnxsim::tensor_pool::TensorPool matched;
         std::vector<std::string> skipped;
-        onnxsim::tensor_pool::ImportModelWithGGUF(model, gguf_path, pool,
-                                                  /*hydrate_all=*/true,
-                                                  &skipped);
+        onnxsim::tensor_pool::ImportModelWithGGUFToPool(model, gguf_path,
+                                                        matched, &skipped);
         const std::string out = model.SerializeAsString();
-        return {py::bytes(out.data(), out.size()), std::move(skipped)};
+        return {py::bytes(out.data(), out.size()), std::move(matched),
+                std::move(skipped)};
       },
       "model_bytes"_a, "gguf_path"_a);
 

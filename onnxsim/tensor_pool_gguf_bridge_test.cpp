@@ -398,6 +398,98 @@ void TestImportModelWithGGUFDecodesKQuant() {
   std::remove(path.c_str());
 }
 
+// ImportModelWithGGUFToPool is import_gguf_weights's FFI-friendly sibling of
+// ImportModelWithGGUF(hydrate_all=true): same K-quant decode
+// (HydrateTensorProtoFromGGUF, reused unchanged), but the matched tensor's
+// bytes land in a caller-supplied pool -- keyed by name, dtype-normalized
+// exactly like the direct-hydration path -- instead of being written into
+// `model`, which is left with that initializer's raw_data cleared (not
+// hydrated) and every unmatched initializer completely untouched.
+void TestImportModelWithGGUFToPool() {
+  std::string path = TempPath("_to_pool_import.gguf");
+  {
+    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    auto write_string = [&](const std::string& s) {
+      WriteLE<uint64_t>(out, s.size());
+      out.write(s.data(), static_cast<std::streamsize>(s.size()));
+    };
+    WriteLE<uint32_t>(out, kMagic);
+    WriteLE<uint32_t>(out, kSupportedVersion);
+    WriteLE<uint64_t>(out, 1);  // tensor_count
+    WriteLE<uint64_t>(out, 0);  // metadata_kv_count
+
+    write_string("w");
+    WriteLE<uint32_t>(out, 1);
+    WriteLE<uint64_t>(out, 32);  // ne[0]
+    WriteLE<uint32_t>(out, GGML_TYPE_Q8_0);
+    WriteLE<uint64_t>(out, 0);  // offset
+
+    uint64_t header_end = static_cast<uint64_t>(out.tellp());
+    uint64_t data_start = (header_end + kDefaultAlignment - 1) /
+                          kDefaultAlignment * kDefaultAlignment;
+    for (uint64_t i = header_end; i < data_start; ++i) out.put('\0');
+    WriteLE<uint16_t>(out, 0x4000);  // d = 2.0 (fp16)
+    for (int i = 0; i < 32; ++i) {
+      out.put(static_cast<char>(static_cast<int8_t>(i - 16)));  // qs[i]
+    }
+  }
+
+  onnx::ModelProto model;
+  auto* w = model.mutable_graph()->add_initializer();
+  w->set_name("w");
+  w->set_data_type(onnx::TensorProto::INT32);  // deliberately wrong
+  w->add_dims(32);
+  const std::string kept_bytes = "unmatched-bytes";
+  *model.mutable_graph()->add_initializer() =
+      MakeInitializer("untouched", onnx::TensorProto::FLOAT, {1}, kept_bytes);
+
+  TensorPool matched;
+  std::vector<std::string> skipped;
+  size_t n = ImportModelWithGGUFToPool(model, path, matched, &skipped);
+  Check(n == 1, "one tensor matched");
+  Check(matched.size() == 1, "the pool holds exactly the matched tensor");
+  Check(skipped.empty(), "nothing skipped -- Q8_0 is a supported K-quant type");
+
+  const auto& w_after = model.graph().initializer(0);
+  Check(!w_after.has_raw_data(),
+        "the matched initializer's OLD raw_data is cleared, not hydrated, "
+        "in `model` itself -- the caller fills it in from `matched`");
+  Check(w_after.data_type() == onnx::TensorProto::INT32,
+        "model itself is untouched beyond clearing raw_data -- data_type "
+        "override only applies to the pool entry, mirroring how a caller "
+        "would apply it");
+
+  const auto& untouched_after = model.graph().initializer(1);
+  Check(untouched_after.has_raw_data() &&
+            untouched_after.raw_data() == kept_bytes,
+        "the unmatched initializer is completely untouched");
+
+  const Entry* entry = matched.Find("w");
+  Check(entry != nullptr, "pool has an entry for the matched tensor");
+  bool values_ok = entry != nullptr &&
+                   entry->dtype == onnx::TensorProto::FLOAT &&
+                   entry->data.size() == 32 * sizeof(float);
+  Check(values_ok, "pool entry is FLOAT32 (K-quant decode target), 32 values");
+  if (values_ok) {
+    std::string bytes(entry->data);
+    if constexpr (!onnxsim::dlpack::kRawDataIsHostOrder) {
+      onnxsim::dlpack::SwapElementBytes(
+          reinterpret_cast<uint8_t*>(bytes.data()), bytes.size(),
+          sizeof(float));
+    }
+    float floats[32];
+    std::memcpy(floats, bytes.data(), sizeof(floats));
+    for (int i = 0; i < 32 && values_ok; ++i) {
+      float want = static_cast<float>(i - 16) * 2.0f;
+      values_ok = std::fabs(floats[i] - want) < 1e-4f;
+    }
+  }
+  Check(values_ok,
+        "pool entry decodes to (i - 16) * 2.0, same as direct hydration");
+
+  std::remove(path.c_str());
+}
+
 }  // namespace
 
 int main() {
@@ -407,6 +499,7 @@ int main() {
   TestImportModelWithGGUFLazy();
   TestImportModelWithGGUFSkipsQuantized();
   TestImportModelWithGGUFDecodesKQuant();
+  TestImportModelWithGGUFToPool();
 
   if (g_failures == 0) {
     std::printf("tensor_pool_gguf_bridge_test: all checks passed\n");
