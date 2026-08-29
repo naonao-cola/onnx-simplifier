@@ -561,7 +561,8 @@ class ModelInfo:
     Model info contains:
     1. Num of every op
     2. Model size
-    3. MACs / FLOPs of the compute-dominant operators: Conv, ConvTranspose,
+    3. Count of the top-level graph's own initializers (``initializer_count``)
+    4. MACs / FLOPs of the compute-dominant operators: Conv, ConvTranspose,
        Gemm, MatMul, Attention, and the quantized twins (ConvInteger,
        QLinearConv, MatMulInteger, QLinearMatMul). Shapes come from ONNX shape
        inference -- or, when the optional ``onnx-shape-inference`` package
@@ -577,7 +578,7 @@ class ModelInfo:
        functions (and nested ones) are inlined, and schema-registered function
        ops without a bespoke counter fall back to their context-dependent body
        (best-effort).
-    4. Memory metrics, derived statically from the same inferred shapes (no
+    5. Memory metrics, derived statically from the same inferred shapes (no
        runtime execution needed):
        - ``mem_access``: total bytes read and written across a forward pass --
          every node's inputs (weights included) plus its outputs.
@@ -649,6 +650,13 @@ class ModelInfo:
         # whether or not the weights on disk have been loaded).
         op_nums, self.model_size, macs, mem_access, footprint = _cpp_metrics(model)
         self.op_nums = defaultdict(int, op_nums)
+        # The top-level graph's own initializer count -- unlike
+        # ``op_nums["Constant"]``, which folds initializers (recursively,
+        # subgraphs included) together with actual ``Constant`` nodes, this is
+        # reported as its own "Initializers" row so a change there (weights
+        # folded into a fused node, duplicate initializers deduplicated, ...)
+        # is visible on its own.
+        self.initializer_count = len(model.graph.initializer)
         # A function op's compute lives in its body, so recount MACs and the
         # memory metrics on the function-expanded (inlined) graph -- the counters
         # then see the MatMuls, Convs, etc. inside every function instance. The
@@ -862,6 +870,13 @@ def print_simplifying_info(
         opt_info.model_size,
         lambda opt, ori: opt < ori,
         postprocess=human_readable_size,
+    )
+    add_row(
+        table,
+        "Initializers",
+        ori_info.initializer_count,
+        opt_info.initializer_count,
+        lambda opt, ori: opt < ori,
     )
 
     # MACs/FLOPs may be symbolic, for which "<" yields an undecidable sympy
