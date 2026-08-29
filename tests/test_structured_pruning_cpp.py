@@ -1,13 +1,15 @@
 """Tests for ``onnxsim.apply_structured_pruning_cpp`` -- the C++-backed port
 of ``onnxsim.apply_structured_pruning`` (see
-``onnxsim/structured_pruning_entry.cpp``). Scope note: this port covers only
-the two "plain chain" topologies (a MatMul/vanilla-Gemm or Conv producer
-feeding, through shape-preserving elementwise ops, exactly one consumer of
-the same family) -- not the pure-Python implementation's gated-FFN or
-residual/skip-connection chain support. Tests here are adapted from
-``test_pruning.py``'s own ``apply_structured_pruning`` coverage, scoped to
-the topologies this port actually implements, plus a couple of tests
-confirming the unported topologies are left untouched (never guessed at).
+``onnxsim/structured_pruning_entry.cpp``). Scope note: this port covers the
+"plain chain" topologies (a MatMul/vanilla-Gemm or Conv producer feeding,
+through shape-preserving elementwise ops, exactly one consumer of the same
+family) and the gated-FFN (SwiGLU/GeGLU) topology (two producers combined by
+``Mul`` or the native ``SwiGLU`` op, pruned to a shared combined-importance
+channel set) -- not the pure-Python implementation's residual/skip-connection
+chain support. Tests here are adapted from ``test_pruning.py``'s own
+``apply_structured_pruning`` coverage, scoped to the topologies this port
+actually implements, plus a couple of tests confirming the unported
+topologies are left untouched (never guessed at).
 """
 
 import numpy as np
@@ -369,12 +371,19 @@ def test_cpp_structured_pruning_chains_through_a_third_layer():
     np.testing.assert_allclose(y, y_oracle, rtol=1e-5, atol=1e-5)
 
 
-# --- Gated FFN: unsupported by this port, must stay untouched --------------
+# --- Gated FFN (SwiGLU/GeGLU) -----------------------------------------------
 
 
-def test_cpp_structured_pruning_gated_ffn_is_left_untouched():
-    K, H, Out = 8, 16, 4
-    rng = np.random.default_rng(7)
+def _combined_keep_indices(w_gate, w_up, keep_count):
+    importance = np.sqrt(
+        np.square(np.linalg.norm(w_gate.T, axis=1))
+        + np.square(np.linalg.norm(w_up.T, axis=1))
+    )
+    return np.sort(np.argsort(-importance)[:keep_count])
+
+
+def _swiglu_mlp_model(K=8, H=16, Out=4, gate_activation="Sigmoid", seed=0):
+    rng = np.random.default_rng(seed)
     wg = rng.standard_normal((K, H)).astype(np.float32)
     wu = rng.standard_normal((K, H)).astype(np.float32)
     wd = rng.standard_normal((H, Out)).astype(np.float32)
@@ -383,7 +392,7 @@ def test_cpp_structured_pruning_gated_ffn_is_left_untouched():
         g (float[batch,{K}] X) => (float[batch,{Out}] Y)
         {{
           gate = MatMul(X, Wg)
-          gate_act = Sigmoid(gate)
+          gate_act = {gate_activation}(gate)
           up = MatMul(X, Wu)
           h = Mul(gate_act, up)
           Y = MatMul(h, Wd)
@@ -391,11 +400,214 @@ def test_cpp_structured_pruning_gated_ffn_is_left_untouched():
         """,
         initializer=[_f32(wg, "Wg"), _f32(wu, "Wu"), _f32(wd, "Wd")],
     )
+    return model, wg, wu, wd
+
+
+def test_cpp_structured_pruning_gated_ffn_matches_oracle():
+    K, H, Out = 8, 16, 4
+    model, wg, wu, wd = _swiglu_mlp_model(K=K, H=H, Out=Out)
+
+    pruned = onnxsim.apply_structured_pruning_cpp(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    inits = {t.name: t for t in pruned.graph.initializer}
+    assert list(inits["Wg"].dims) == [K, H // 2]
+    assert list(inits["Wu"].dims) == [K, H // 2]
+    assert list(inits["Wd"].dims) == [H // 2, Out]
+
+    keep = _combined_keep_indices(wg, wu, H // 2)
+    rng = np.random.default_rng(10)
+    x = rng.standard_normal((5, K)).astype(np.float32)
+    (y,) = _run(pruned, {"X": x})
+
+    gate = 1.0 / (1.0 + np.exp(-(x @ wg[:, keep])))
+    up = x @ wu[:, keep]
+    y_oracle = (gate * up) @ wd[keep, :]
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-5, atol=1e-5)
+
+
+def test_cpp_structured_pruning_gated_ffn_prunes_both_branches_to_same_channels():
+    # The real bug this pattern risks: gate and up disagreeing on which
+    # channels survive, which would silently break the elementwise
+    # product's alignment. Assert they select the identical index set,
+    # not just that both shrank to the same *count*.
+    K, H, Out = 8, 20, 4
+    model, wg, wu, _ = _swiglu_mlp_model(K=K, H=H, Out=Out, seed=1)
+
+    pruned = onnxsim.apply_structured_pruning_cpp(model, sparsity=0.3)
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    keep = _combined_keep_indices(wg, wu, H - round(H * 0.3))
+
+    np.testing.assert_array_equal(inits["Wg"], wg[:, keep])
+    np.testing.assert_array_equal(inits["Wu"], wu[:, keep])
+
+
+def test_cpp_structured_pruning_gelu_gated_ffn_matches_oracle():
+    # GeGLU: same gated topology, a different (still-unary) gate activation.
+    # Uses Gelu's tanh approximation so the oracle needs no scipy/erf.
+    K, H, Out = 8, 16, 4
+    rng = np.random.default_rng(11)
+    wg = rng.standard_normal((K, H)).astype(np.float32)
+    wu = rng.standard_normal((K, H)).astype(np.float32)
+    wd = rng.standard_normal((H, Out)).astype(np.float32)
+    model = _model(
+        f"""
+        g (float[batch,{K}] X) => (float[batch,{Out}] Y)
+        {{
+          gate = MatMul(X, Wg)
+          gate_act = Gelu<approximate = "tanh">(gate)
+          up = MatMul(X, Wu)
+          h = Mul(gate_act, up)
+          Y = MatMul(h, Wd)
+        }}
+        """,
+        initializer=[_f32(wg, "Wg"), _f32(wu, "Wu"), _f32(wd, "Wd")],
+    )
+
+    pruned = onnxsim.apply_structured_pruning_cpp(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    keep = _combined_keep_indices(wg, wu, H // 2)
+
+    x = rng.standard_normal((5, K)).astype(np.float32)
+    (y,) = _run(pruned, {"X": x})
+
+    g = x @ wg[:, keep]
+    gate = 0.5 * g * (1.0 + np.tanh(np.sqrt(2.0 / np.pi) * (g + 0.044715 * g**3)))
+    up = x @ wu[:, keep]
+    y_oracle = (gate * up) @ wd[keep, :]
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-4, atol=1e-4)
+
+
+def test_cpp_structured_pruning_ungated_mul_of_two_producers_still_matches_oracle():
+    # No activation at all on either branch -- a plain (unactivated) GLU,
+    # both Mul operands are raw producer outputs directly.
+    K, H, Out = 8, 12, 4
+    rng = np.random.default_rng(2)
+    w1 = rng.standard_normal((K, H)).astype(np.float32)
+    w2 = rng.standard_normal((K, H)).astype(np.float32)
+    w3 = rng.standard_normal((H, Out)).astype(np.float32)
+    model = _model(
+        f"""
+        g (float[batch,{K}] X) => (float[batch,{Out}] Y)
+        {{
+          a = MatMul(X, W1)
+          b = MatMul(X, W2)
+          h = Mul(a, b)
+          Y = MatMul(h, W3)
+        }}
+        """,
+        initializer=[_f32(w1, "W1"), _f32(w2, "W2"), _f32(w3, "W3")],
+    )
+
+    pruned = onnxsim.apply_structured_pruning_cpp(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    keep = _combined_keep_indices(w1, w2, H // 2)
+
+    x = rng.standard_normal((5, K)).astype(np.float32)
+    (y,) = _run(pruned, {"X": x})
+    y_oracle = ((x @ w1[:, keep]) * (x @ w2[:, keep])) @ w3[keep, :]
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-5, atol=1e-5)
+
+
+def test_cpp_structured_pruning_gated_mul_against_constant_scale_is_not_a_gate():
+    # Mul(a, constant) is the existing per-channel-scale chain continuation
+    # (already covered elsewhere), not a two-producer gated pair -- the
+    # constant operand must never be mistaken for a second producer.
+    K, H, Out = 8, 12, 4
+    rng = np.random.default_rng(3)
+    w1 = rng.standard_normal((K, H)).astype(np.float32)
+    scale = rng.standard_normal((H,)).astype(np.float32)
+    w2 = rng.standard_normal((H, Out)).astype(np.float32)
+    model = _model(
+        f"""
+        g (float[batch,{K}] X) => (float[batch,{Out}] Y)
+        {{
+          a = MatMul(X, W1)
+          h = Mul(a, Scale)
+          Y = MatMul(h, W2)
+        }}
+        """,
+        initializer=[_f32(w1, "W1"), _f32(scale, "Scale"), _f32(w2, "W2")],
+    )
+
+    pruned = onnxsim.apply_structured_pruning_cpp(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    inits = {t.name: t for t in pruned.graph.initializer}
+    assert list(inits["W1"].dims) == [K, H // 2]
+    assert list(inits["Scale"].dims) == [H // 2]
+    assert list(inits["W2"].dims) == [H // 2, Out]
+
+
+def test_cpp_structured_pruning_gated_ffn_skips_when_a_branch_also_feeds_elsewhere():
+    # "up" also feeding a second consumer directly means pruning its
+    # channels would silently change what that other consumer sees --
+    # must be left completely untouched, same bar as the plain-chain case.
+    K, H, Out = 8, 12, 4
+    rng = np.random.default_rng(4)
+    wg = rng.standard_normal((K, H)).astype(np.float32)
+    wu = rng.standard_normal((K, H)).astype(np.float32)
+    wd = rng.standard_normal((H, Out)).astype(np.float32)
+    wother = rng.standard_normal((H, Out)).astype(np.float32)
+    model = _model(
+        f"""
+        g (float[batch,{K}] X) => (float[batch,{Out}] Y1, float[batch,{Out}] Y2)
+        {{
+          gate = MatMul(X, Wg)
+          gate_act = Sigmoid(gate)
+          up = MatMul(X, Wu)
+          h = Mul(gate_act, up)
+          Y1 = MatMul(h, Wd)
+          Y2 = MatMul(up, Wother)
+        }}
+        """,
+        initializer=[
+            _f32(wg, "Wg"),
+            _f32(wu, "Wu"),
+            _f32(wd, "Wd"),
+            _f32(wother, "Wother"),
+        ],
+    )
+
+    pruned = onnxsim.apply_structured_pruning_cpp(model, sparsity=0.5)
+    inits = {t.name: t for t in pruned.graph.initializer}
+    assert list(inits["Wg"].dims) == [K, H]
+    assert list(inits["Wu"].dims) == [K, H]
+    assert list(inits["Wd"].dims) == [H, Out]
+
+
+def test_cpp_structured_pruning_native_swiglu_node_prunes_both_producers_together():
+    # ONNX's native fused SwiGLU(a, b) = swish(a) * b (opset 28+): the
+    # activation lives entirely inside the op, so a/b must be raw producer
+    # outputs with no separate activation node in between. Not yet
+    # supported by the installed onnx checker/onnxruntime in this
+    # environment (opset 28 is still under development upstream), so this
+    # verifies the graph surgery directly via tensor values rather than
+    # onnx.checker/onnxruntime execution.
+    K, H, Out = 8, 16, 4
+    rng = np.random.default_rng(5)
+    wg = rng.standard_normal((K, H)).astype(np.float32)
+    wu = rng.standard_normal((K, H)).astype(np.float32)
+    wd = rng.standard_normal((H, Out)).astype(np.float32)
+    model = _model(
+        f"""
+        g (float[batch,{K}] X) => (float[batch,{Out}] Y)
+        {{
+          gate = MatMul(X, Wg)
+          up = MatMul(X, Wu)
+          h = SwiGLU(gate, up)
+          Y = MatMul(h, Wd)
+        }}
+        """,
+        initializer=[_f32(wg, "Wg"), _f32(wu, "Wu"), _f32(wd, "Wd")],
+        opset=28,
+    )
+
     pruned = onnxsim.apply_structured_pruning_cpp(model, sparsity=0.5)
     inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
-    np.testing.assert_array_equal(inits["Wg"], wg)
-    np.testing.assert_array_equal(inits["Wu"], wu)
-    np.testing.assert_array_equal(inits["Wd"], wd)
+    keep = _combined_keep_indices(wg, wu, H // 2)
+
+    np.testing.assert_array_equal(inits["Wg"], wg[:, keep])
+    np.testing.assert_array_equal(inits["Wu"], wu[:, keep])
+    np.testing.assert_array_equal(inits["Wd"], wd[keep, :])
 
 
 # --- Conv plain chains -------------------------------------------------------

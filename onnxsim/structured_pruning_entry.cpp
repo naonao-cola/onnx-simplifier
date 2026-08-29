@@ -2,19 +2,23 @@
 //
 // C++ port of pruning.py's own apply_structured_pruning -- see that
 // function's docstring for the full technique description (this is quoted
-// here only where it constrains scope). This port covers the two "plain
-// chain" topologies -- a MatMul/vanilla-Gemm producer -> consumer pair
-// (pruning.py's own _find_chains) and a Conv producer -> consumer pair,
-// including depthwise pass-through hops and general grouped Conv on either
-// side (_find_conv_chains) -- but not (yet) pruning.py's gated-FFN
-// (_find_gated_chains) or residual/skip-connection (_find_conv_residual_chains,
-// _find_matmul_residual_chains) chain finders: those need the same backward-
-// walk/union-find machinery as the forward walk here, layered on top, and
-// are left to the pure-Python implementation for now. A model whose only
-// prunable structure is one of those unported shapes is therefore left
-// completely untouched by this port -- exactly the same "declined, not
-// guessed at" behavior pruning.py's own docstring promises for any topology
-// it doesn't recognize, just a larger set of them.
+// here only where it constrains scope). This port covers three of
+// pruning.py's own five chain finders: a MatMul/vanilla-Gemm producer ->
+// consumer pair (_find_chains), a Conv producer -> consumer pair, including
+// depthwise pass-through hops and general grouped Conv on either side
+// (_find_conv_chains), and the gated-FFN SwiGLU/GeGLU pattern -- two
+// producers combined by Mul (or ONNX opset-28+'s native SwiGLU node) feeding
+// one consumer, both pruned to the same channel indices
+// (_find_gated_chains) -- but not (yet) the residual/skip-connection chain
+// finders (_find_conv_residual_chains, _find_matmul_residual_chains): those
+// need a backward walk plus union-find grouping across merge points, a
+// different (and larger) piece of machinery than the forward-only walk
+// every chain finder here uses, and are left to the pure-Python
+// implementation for now. A model whose only prunable structure is one of
+// those unported residual shapes is therefore left completely untouched by
+// this port -- exactly the same "declined, not guessed at" behavior
+// pruning.py's own docstring promises for any topology it doesn't
+// recognize, just a larger set of them.
 //
 // Implemented directly on onnx::GraphProto (protobuf), not onnxoptimizer's
 // Node/Value IR: pruning.py's own algorithm already works this way (name-
@@ -39,6 +43,7 @@
 #include <tuple>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 #include "dlpack_dtype.h"
@@ -212,6 +217,11 @@ struct Producer {
   std::optional<std::string> bias;
   bool is_conv;
   int64_t group;
+  // Activation nodes between this producer's raw output and the point it
+  // combines with another producer (a gated pair only -- see
+  // FindGatedChains; empty for a plain single-producer chain), in forward
+  // order (raw output -> ... -> the tensor that feeds the combine op).
+  std::vector<onnx::NodeProto*> pre_ops;
 };
 
 struct ConvPassThrough {
@@ -387,6 +397,167 @@ std::vector<Chain> FindChains(onnx::GraphProto* graph) {
     chain.consumer_weight = consumer->weight;
     chain.consumer_weight_transposed = consumer->weight_transposed;
     chain.n_channels = info->n_channels;
+    chains.push_back(std::move(chain));
+  }
+  return chains;
+}
+
+// --- Gated FFN (SwiGLU/GeGLU) chains, mirroring _trace_gate_producer_backward/
+// _find_gated_chains ---------------------------------------------------------
+
+struct FullProducerMatch {
+  onnx::NodeProto* node;
+  std::string weight;
+  bool weight_transposed;
+  std::optional<std::string> bias;
+  int64_t n_channels;
+};
+
+// Walks backward from `tensor_name` through unary activation ops until it
+// resolves to a matmul-like producer's raw output -- the mirror image of
+// WalkToConsumer's forward walk, recognizing a gate branch's own activation
+// (e.g. SwiGLU's silu(gate) exported as a separate Sigmoid/Mul-by-a-second-
+// operand). Returns the resolved producer plus its pre_ops, in forward
+// order (closest to the producer first).
+std::optional<std::pair<FullProducerMatch, std::vector<onnx::NodeProto*>>>
+TraceGateProducerBackward(
+    const std::string& tensor_name,
+    const std::unordered_map<std::string, onnx::NodeProto*>& node_by_output,
+    const std::unordered_map<std::string, FullProducerMatch>& producer_infos,
+    const ConsumerMap& consumers_of,
+    const std::unordered_set<std::string>& graph_outputs, int max_hops) {
+  std::vector<onnx::NodeProto*> pre_ops;  // Backward order; reversed on return.
+  std::string cur = tensor_name;
+  for (int hop = 0; hop < max_hops; ++hop) {
+    if (ConsumerCount(consumers_of, cur) != 1 || graph_outputs.count(cur)) {
+      return std::nullopt;
+    }
+    auto pit = producer_infos.find(cur);
+    if (pit != producer_infos.end()) {
+      std::reverse(pre_ops.begin(), pre_ops.end());
+      return std::make_pair(pit->second, std::move(pre_ops));
+    }
+    auto nit = node_by_output.find(cur);
+    if (nit == node_by_output.end()) {
+      return std::nullopt;
+    }
+    onnx::NodeProto* producer_node = nit->second;
+    if (!(UnaryPassThroughOps().count(producer_node->op_type()) != 0 &&
+          producer_node->input_size() == 1 &&
+          producer_node->output_size() == 1)) {
+      return std::nullopt;
+    }
+    pre_ops.push_back(producer_node);
+    cur = producer_node->input(0);
+  }
+  return std::nullopt;
+}
+
+std::vector<Chain> FindGatedChains(onnx::GraphProto* graph) {
+  InitMap init_map;
+  for (const auto& t : graph->initializer()) {
+    init_map[t.name()] = &t;
+  }
+  ConsumerMap consumers_of = ConsumersOf(graph);
+  std::unordered_set<std::string> graph_outputs;
+  for (const auto& o : graph->output()) {
+    graph_outputs.insert(o.name());
+  }
+  auto is_internal = [&](const std::string& name) {
+    return ConsumerCount(consumers_of, name) == 1 && !graph_outputs.count(name);
+  };
+
+  std::unordered_map<std::string, onnx::NodeProto*> node_by_output;
+  std::unordered_map<std::string, FullProducerMatch> producer_infos;
+  for (int i = 0; i < graph->node_size(); ++i) {
+    onnx::NodeProto* node = graph->mutable_node(i);
+    for (const auto& out : node->output()) {
+      node_by_output[out] = node;
+    }
+    auto info = MatchProducer(*node, init_map);
+    if (info) {
+      producer_infos[node->output(0)] =
+          FullProducerMatch{node, info->weight, info->weight_transposed,
+                            info->bias, info->n_channels};
+    }
+  }
+
+  std::vector<Chain> chains;
+  for (int i = 0; i < graph->node_size(); ++i) {
+    onnx::NodeProto* node = graph->mutable_node(i);
+    std::optional<FullProducerMatch> info_a, info_b;
+    std::vector<onnx::NodeProto*> pre_a, pre_b;
+
+    if (node->op_type() == "Mul" && node->input_size() == 2 &&
+        node->output_size() == 1) {
+      const std::string& a_name = node->input(0);
+      const std::string& b_name = node->input(1);
+      if (a_name == b_name || init_map.count(a_name) ||
+          init_map.count(b_name)) {
+        continue;
+      }
+      auto trace_a =
+          TraceGateProducerBackward(a_name, node_by_output, producer_infos,
+                                    consumers_of, graph_outputs, kMaxChainHops);
+      auto trace_b =
+          TraceGateProducerBackward(b_name, node_by_output, producer_infos,
+                                    consumers_of, graph_outputs, kMaxChainHops);
+      if (!trace_a || !trace_b) {
+        continue;
+      }
+      info_a = trace_a->first;
+      pre_a = std::move(trace_a->second);
+      info_b = trace_b->first;
+      pre_b = std::move(trace_b->second);
+    } else if (node->op_type() == "SwiGLU" && node->input_size() == 2 &&
+               node->output_size() == 1) {
+      const std::string& a_name = node->input(0);
+      const std::string& b_name = node->input(1);
+      if (init_map.count(a_name) || init_map.count(b_name)) {
+        continue;
+      }
+      if (!(is_internal(a_name) && is_internal(b_name))) {
+        continue;
+      }
+      auto ait = producer_infos.find(a_name);
+      auto bit = producer_infos.find(b_name);
+      if (ait == producer_infos.end() || bit == producer_infos.end()) {
+        continue;
+      }
+      info_a = ait->second;
+      info_b = bit->second;
+    } else {
+      continue;
+    }
+
+    if (info_a->node == info_b->node ||
+        info_a->n_channels != info_b->n_channels) {
+      continue;
+    }
+
+    const std::string& out_name = node->output(0);
+    if (!is_internal(out_name)) {
+      continue;
+    }
+    auto [consumer, chain_ops] =
+        WalkToConsumer(out_name, init_map, consumers_of, graph_outputs,
+                       info_a->n_channels, kMaxChainHops);
+    if (!consumer) {
+      continue;
+    }
+
+    Chain chain;
+    chain.producers.push_back(Producer{info_a->node, info_a->weight,
+                                       info_a->weight_transposed, info_a->bias,
+                                       false, 1, std::move(pre_a)});
+    chain.producers.push_back(Producer{info_b->node, info_b->weight,
+                                       info_b->weight_transposed, info_b->bias,
+                                       false, 1, std::move(pre_b)});
+    chain.chain_ops = std::move(chain_ops);
+    chain.consumer_node = consumer->node;
+    chain.consumer_weight = consumer->weight;
+    chain.consumer_weight_transposed = consumer->weight_transposed;
+    chain.n_channels = info_a->n_channels;
     chains.push_back(std::move(chain));
   }
   return chains;
@@ -956,6 +1127,9 @@ void ApplyChains(onnx::GraphProto* graph, std::vector<Chain>& chains,
     }
     for (const auto& p : chain.producers) {
       stale_value_info.insert(p.node->output(0));
+      for (const auto* pre_op : p.pre_ops) {
+        stale_value_info.insert(pre_op->output(0));
+      }
     }
     for (const auto& co : chain.chain_ops) {
       stale_value_info.insert(co.node->output(0));
@@ -989,7 +1163,10 @@ onnx::ModelProto ApplyStructuredPruning(const onnx::ModelProto& model,
   onnx::GraphProto* graph = out.mutable_graph();
 
   std::vector<Chain> chains = FindChains(graph);
+  std::vector<Chain> gated_chains = FindGatedChains(graph);
   std::vector<Chain> conv_chains = FindConvChains(graph);
+  chains.insert(chains.end(), std::make_move_iterator(gated_chains.begin()),
+                std::make_move_iterator(gated_chains.end()));
   chains.insert(chains.end(), std::make_move_iterator(conv_chains.begin()),
                 std::make_move_iterator(conv_chains.end()));
   if (!chains.empty()) {

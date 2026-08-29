@@ -1101,14 +1101,17 @@ def apply_structured_pruning_cpp(
     per-channel constant, and the matching columns/rows from the consumer's
     weight. A general grouped Conv (neither ``group=1`` nor fully depthwise)
     is matched too, as a producer and/or consumer, ranking/pruning each of
-    its ``group`` channel blocks independently.
+    its ``group`` channel blocks independently. The gated-FFN SwiGLU/GeGLU
+    pattern is matched too -- two producers combined by a ``Mul`` (or ONNX
+    opset-28+'s native ``SwiGLU`` node) feeding one consumer, both pruned to
+    the same combined-importance-ranked channel indices.
 
     Unlike the pure-Python :func:`onnxsim.apply_structured_pruning`, this
-    port does not (yet) include the gated-FFN (SwiGLU/GeGLU) pattern or the
-    Conv/MatMul residual-connection (skip-connection) chain support -- a
-    model whose only prunable structure is one of those unported shapes is
-    left completely untouched by this port; :func:`onnxsim.apply_structured_pruning`
-    remains the full-featured reference.
+    port does not (yet) include the Conv/MatMul residual-connection
+    (skip-connection) chain support -- a model whose only prunable structure
+    is one of those unported shapes is left completely untouched by this
+    port; :func:`onnxsim.apply_structured_pruning` remains the full-featured
+    reference.
 
     This is a single, self-contained graph rewrite: unlike :func:`simplify`,
     it does not run shape inference, constant folding, or any other pass.

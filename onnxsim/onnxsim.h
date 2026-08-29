@@ -530,11 +530,14 @@ onnx::ModelProto ApplyQuarot(const onnx::ModelProto& model, uint64_t seed);
 // columns/rows from the consumer's weight. A general grouped Conv (neither
 // ``group=1`` nor fully depthwise) is matched too, as a producer and/or
 // consumer, ranking/pruning each of its ``group`` channel blocks
-// independently -- see ``structured_pruning_entry.cpp`` for the exact
-// algorithm and its scope note (this port does not (yet) include the
-// pure-Python implementation's gated-FFN or residual/skip-connection chain
-// support -- ``onnxsim.apply_structured_pruning`` remains the
-// full-featured reference).
+// independently. The gated-FFN SwiGLU/GeGLU pattern is matched too -- two
+// producers combined by a ``Mul`` (or ONNX opset-28+'s native ``SwiGLU``
+// node) feeding one consumer, both pruned to the same combined-importance-
+// ranked channel indices -- see ``structured_pruning_entry.cpp`` for the
+// exact algorithm and its scope note (this port does not (yet) include the
+// pure-Python implementation's residual/skip-connection chain support --
+// ``onnxsim.apply_structured_pruning`` remains the full-featured
+// reference).
 //
 // Unlike ``Simplify``, this does not run shape inference, constant folding or
 // any other simplification pass -- it applies exactly this rewrite, to every
