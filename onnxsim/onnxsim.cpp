@@ -37,6 +37,7 @@
 #include "onnx/defs/printer.h"
 #include "onnx/inliner/inliner.h"
 #include "onnx/shape_inference/implementation.h"
+#include "onnx/version_converter/convert.h"
 #include "onnxoptimizer/model_util.h"
 #include "onnxoptimizer/optimize.h"
 #include "onnxoptimizer/passes/cse_util.h"
@@ -637,26 +638,40 @@ static onnx::ModelProto SimplifyImpl(
     GraphFn PipelineOnGraph =
         FixedPointFn(OptAndShapeOnGraphChanged, FoldConstantOnGraphChanged,
                      fixed_point_iters, &converged);
-    Pipeline = Profiled("Pipeline", [PipelineOnGraph, &fold_ir_version](
-                                        onnx::ModelProto& model) {
-      std::shared_ptr<onnx::Graph> g(onnx::ImportModelProto(model));
-      if (g.get() == nullptr) {
-        // Same fallback as Optimizer::optimize(): if we can't parse the
-        // model, leave it untouched.
-        return;
-      }
-      fold_ir_version = model.ir_version();
-      PipelineOnGraph(*g);
-      onnx::ModelProto out = onnx::PrepareOutput(model);
-      onnx::ExportModelProto(&out, g, /*consume_tensor_data=*/true);
-      // OptimizeGraphFixed never sees model-local functions (they live on
-      // ModelProto, not Graph), so carry them over unchanged -- mirroring
-      // Optimizer::optimize()'s own AddFunctionsToModel.
-      for (const auto& function_proto : model.functions()) {
-        *out.add_functions() = function_proto;
-      }
-      model = std::move(out);
-    });
+    Pipeline =
+        Profiled("Pipeline", [PipelineOnGraph, &fold_ir_version,
+                              target_opset_version](onnx::ModelProto& model) {
+          std::shared_ptr<onnx::Graph> g(onnx::ImportModelProto(model));
+          if (g.get() == nullptr) {
+            // Same fallback as Optimizer::optimize(): if we can't parse the
+            // model, leave it untouched.
+            return;
+          }
+          // Convert the default ONNX domain's opset first, directly on the
+          // resident graph via ConvertVersionOnGraph -- so the simplification
+          // below can clean up any redundant nodes the version converter
+          // introduces, same rationale as the old ModelProto-level
+          // ConvertOpsetVersion call this replaces -- but without paying a
+          // second Import/Export pair for it (unlike ConvertOpsetVersion, which
+          // always does its own; still used by the `rewriter` branch above,
+          // which has no resident Graph to share this one with).
+          if (target_opset_version) {
+            onnxsim::ProfiledScope opset_scope("ConvertOpsetVersion");
+            onnx::version_conversion::ConvertVersionOnGraph(
+                g, *target_opset_version);
+          }
+          fold_ir_version = model.ir_version();
+          PipelineOnGraph(*g);
+          onnx::ModelProto out = onnx::PrepareOutput(model);
+          onnx::ExportModelProto(&out, g, /*consume_tensor_data=*/true);
+          // OptimizeGraphFixed never sees model-local functions (they live on
+          // ModelProto, not Graph), so carry them over unchanged -- mirroring
+          // Optimizer::optimize()'s own AddFunctionsToModel.
+          for (const auto& function_proto : model.functions()) {
+            *out.add_functions() = function_proto;
+          }
+          model = std::move(out);
+        });
   }
   // The fixed points mutate in place, so make one working copy of the (const)
   // input model and simplify it in place. When the caller has told us
@@ -739,7 +754,13 @@ static onnx::ModelProto SimplifyImpl(
   // sibling to, not nested inside, the "Simplify" root below -- so its cost is
   // visible in the flame graph / profile_pass_phases output instead of showing
   // up as unaccounted time before the first pass.
-  if (target_opset_version) {
+  //
+  // Only needed here for the `rewriter` branch, which is ModelProto-based
+  // throughout (onnxscript's rewriter only understands ModelProto) and so has
+  // no resident Graph to fold this into. The no-rewriter branch does the
+  // equivalent conversion itself, directly on its own resident Graph, inside
+  // Pipeline above -- see its ConvertVersionOnGraph call.
+  if (target_opset_version && rewriter) {
     onnxsim::ProfiledScope opset_scope("ConvertOpsetVersion");
     // std::move: sim_model is about to be overwritten by the result anyway,
     // so let ConvertOpsetVersion's by-value parameter move-construct instead
