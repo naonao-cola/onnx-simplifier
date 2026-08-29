@@ -75,10 +75,10 @@ inline uint8_t NearestMXFP4Code(float normalized) {
 // Returns false (nothing written) when `K` (the reduction axis' size) is not
 // evenly divisible by `block_size`.
 inline bool TryQuantizeWeightBlockwiseMXFP4InPlace(const Tensor& w_t,
-                                                    int64_t channel_axis,
-                                                    int64_t block_size,
-                                                    Tensor& q_out,
-                                                    Tensor& scale_out) {
+                                                   int64_t channel_axis,
+                                                   int64_t block_size,
+                                                   Tensor& q_out,
+                                                   Tensor& scale_out) {
   const auto& sizes = w_t.sizes();
   const int64_t dim0 = sizes[0];
   const int64_t dim1 = sizes[1];

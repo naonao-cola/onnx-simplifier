@@ -24,12 +24,12 @@
 // DequantizeLinear feeding into the original node's own scale input:
 //
 //   Before:
-//     Whatever = DequantizeLinear(Codes, Scale, ...)  -- Scale: float32 constant
+//     Whatever = DequantizeLinear(Codes, Scale, ...)  -- Scale: constant
 //   After:
 //     ScaleCodes: initializer, uint8, same shape as Scale
 //     MetaScale: initializer, float32 scalar, max(|Scale|) / 255
 //     ScaleHat = DequantizeLinear(ScaleCodes, MetaScale)
-//     Whatever = DequantizeLinear(Codes, ScaleHat, ...)  -- same attributes as before
+//     Whatever = DequantizeLinear(Codes, ScaleHat, ...)  -- attrs unchanged
 //
 // This is technique-agnostic (it only looks at the DequantizeLinear node's
 // own scale input, not who produced it), so it composes with every

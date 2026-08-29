@@ -21,12 +21,10 @@
 //   Y = MatMul(X, W)         W constant, 2-D, float32, [K, N]
 // After:
 //   Codes = Cast(Wq, INT64)                     -- Wq: UINT8 codebook indices
-//   Gathered = Gather(Codebook, Codes, axis=0)  -- Codebook: the 16-value E2M1 table
-//   Blocked  = Reshape(Gathered, <blocked shape>)
-//   ScaleB   = Reshape(Ws, <matching blocked shape, block dim singleton>)
-//   Scaled   = Mul(Blocked, ScaleB)
-//   Wdq      = Reshape(Scaled, W's original shape)
-//   Y = MatMul(X, Wdq)
+//   Gathered = Gather(Codebook, Codes, axis=0)  -- Codebook: the 16-value E2M1
+//   table Blocked  = Reshape(Gathered, <blocked shape>) ScaleB   = Reshape(Ws,
+//   <matching blocked shape, block dim singleton>) Scaled   = Mul(Blocked,
+//   ScaleB) Wdq      = Reshape(Scaled, W's original shape) Y = MatMul(X, Wdq)
 //
 // Only the common, unambiguous shape is handled: a MatMul, or a Gemm with
 // transA=0, alpha=1 and beta=1 (transB may be 0 or 1), whose weight (input 1)

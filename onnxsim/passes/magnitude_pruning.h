@@ -77,9 +77,9 @@ inline double& MagnitudePruningSparsity() {
 // exactly-equal importances -- common with exact-zero weights -- may
 // therefore differ from the Python port's own choice of which zero-tied
 // entry to drop; both are equally valid magnitude-pruning outcomes).
-inline std::vector<bool> SparsityMaskRowMajor(const std::vector<float>& importance,
-                                              int64_t rows, int64_t cols,
-                                              double sparsity) {
+inline std::vector<bool> SparsityMaskRowMajor(
+    const std::vector<float>& importance, int64_t rows, int64_t cols,
+    double sparsity) {
   std::vector<bool> mask(importance.size(), true);
   // std::nearbyint (current rounding mode is FE_TONEAREST, i.e.
   // round-half-to-even, by default) rather than std::lround
@@ -98,9 +98,8 @@ inline std::vector<bool> SparsityMaskRowMajor(const std::vector<float>& importan
     for (int64_t c = 0; c < cols; ++c) {
       order[static_cast<size_t>(c)] = c;
     }
-    std::stable_sort(order.begin(), order.end(), [&](int64_t a, int64_t b) {
-      return row[a] < row[b];
-    });
+    std::stable_sort(order.begin(), order.end(),
+                     [&](int64_t a, int64_t b) { return row[a] < row[b]; });
     for (int64_t i = 0; i < drop; ++i) {
       mask[static_cast<size_t>(r * cols + order[static_cast<size_t>(i)])] =
           false;
@@ -151,7 +150,9 @@ struct MagnitudePruningMatMul final : public PredicateBasedPass {
   explicit MagnitudePruningMatMul()
       : PredicateBasedPass(PassType::Other, PassEfficiency::Complete,
                            PassOptimizationType::Compute) {}
-  std::string getPassName() const override { return "magnitude_pruning_matmul"; }
+  std::string getPassName() const override {
+    return "magnitude_pruning_matmul";
+  }
 
   bool patternMatchPredicate(Node* n) override {
     MatMulLikeInfo info;

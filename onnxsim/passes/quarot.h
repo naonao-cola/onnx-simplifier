@@ -121,8 +121,10 @@ struct Quarot final : public PredicateBasedPass {
       return false;
     }
 
-    const int64_t N = info.weight_transposed ? w_t->sizes()[0] : w_t->sizes()[1];
-    const int64_t K = info.weight_transposed ? w_t->sizes()[1] : w_t->sizes()[0];
+    const int64_t N =
+        info.weight_transposed ? w_t->sizes()[0] : w_t->sizes()[1];
+    const int64_t K =
+        info.weight_transposed ? w_t->sizes()[1] : w_t->sizes()[0];
     if (K % kBlockSize != 0) {
       return false;
     }
@@ -132,7 +134,7 @@ struct Quarot final : public PredicateBasedPass {
     const std::vector<float> w_nk = ReadWeightNK(*w_t, info.weight_transposed);
 
     std::mt19937_64 rng(QuarotSeed() ^
-                       (0x9E3779B97F4A7C15ULL * (n->output()->unique() + 1)));
+                        (0x9E3779B97F4A7C15ULL * (n->output()->unique() + 1)));
     const std::vector<float> u = RandomOrthogonalMatrix(K, rng);  // [K, K]
 
     // w_tilde_nk = w_nk @ u  -- [N, K], exact before quantization.
@@ -161,11 +163,12 @@ struct Quarot final : public PredicateBasedPass {
         float max_abs = 0.0f;
         for (int64_t j = 0; j < kBlockSize; ++j) {
           const int64_t c = blk * kBlockSize + j;
-          max_abs = std::max(
-              max_abs,
-              static_cast<float>(std::fabs(w_tilde_nk[static_cast<size_t>(r * K + c)])));
+          max_abs = std::max(max_abs,
+                             static_cast<float>(std::fabs(
+                                 w_tilde_nk[static_cast<size_t>(r * K + c)])));
         }
-        scale_kn[static_cast<size_t>(blk * N + r)] = max_abs > 0.0f ? max_abs / 7.0f : 1.0f;
+        scale_kn[static_cast<size_t>(blk * N + r)] =
+            max_abs > 0.0f ? max_abs / 7.0f : 1.0f;
       }
     }
     std::vector<int8_t> codes_kn(static_cast<size_t>(K * N));
@@ -186,8 +189,10 @@ struct Quarot final : public PredicateBasedPass {
     const int64_t numel = K * N;
     std::string packed(static_cast<size_t>((numel + 1) / 2), '\0');
     for (int64_t i = 0; i < numel; ++i) {
-      const uint8_t nibble = static_cast<uint8_t>(codes_kn[static_cast<size_t>(i)]) & 0x0F;
-      uint8_t& byte = reinterpret_cast<uint8_t&>(packed[static_cast<size_t>(i / 2)]);
+      const uint8_t nibble =
+          static_cast<uint8_t>(codes_kn[static_cast<size_t>(i)]) & 0x0F;
+      uint8_t& byte =
+          reinterpret_cast<uint8_t&>(packed[static_cast<size_t>(i / 2)]);
       if (i % 2 == 0) {
         byte = nibble;
       } else {

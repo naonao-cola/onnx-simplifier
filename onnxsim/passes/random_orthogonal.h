@@ -28,7 +28,8 @@ namespace onnxsim_passes {
 // columns is equivalent (a random Gaussian matrix's transpose is Gaussian
 // too) and needs no transpose afterward: the result already satisfies
 // U @ U^T == I, the property this rotation needs to be lossless on its own.
-inline std::vector<float> RandomOrthogonalMatrix(int64_t k, std::mt19937_64& rng) {
+inline std::vector<float> RandomOrthogonalMatrix(int64_t k,
+                                                 std::mt19937_64& rng) {
   std::normal_distribution<double> normal(0.0, 1.0);
   std::vector<double> rows(static_cast<size_t>(k * k));
   for (double& v : rows) {

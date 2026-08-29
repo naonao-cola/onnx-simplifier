@@ -11,10 +11,12 @@
 #include "onnxoptimizer/optimize.h"
 #include "passes/magnitude_pruning.h"
 
-onnx::ModelProto PruneMagnitude(const onnx::ModelProto& model, double sparsity) {
+onnx::ModelProto PruneMagnitude(const onnx::ModelProto& model,
+                                double sparsity) {
   if (!(sparsity >= 0.0 && sparsity < 1.0)) {
-    throw std::invalid_argument("PruneMagnitude: sparsity must be in [0, 1), got " +
-                                std::to_string(sparsity));
+    throw std::invalid_argument(
+        "PruneMagnitude: sparsity must be in [0, 1), got " +
+        std::to_string(sparsity));
   }
   PrepareSchemasForDebug(model);
   // Registers magnitude_pruning_matmul/_conv (idempotent) into
