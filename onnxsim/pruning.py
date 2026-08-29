@@ -202,11 +202,23 @@ logic (concatenating each branch's own surviving-channel set, shifted by its
 own fixed offset) to stay correct. See :func:`_find_matmul_concat_chains`/
 :func:`_find_conv_concat_chains`'s own section comment for the bounded,
 single-consumer-per-branch shape this reaches (a `Concat` chained
-transitively into another `Concat`, or composed with a gated/residual
-branch, is declined the same conservative way as everything above) and
+transitively into another `Concat`, or composed with a gated branch, is
+declined the same conservative way as everything above) and
 :func:`_apply_concat_chains`'s own docstring for why that per-branch,
 independent-`keep` shape needed a genuinely new sibling to
-`_Chain`/`_apply_chains` rather than fitting into the existing one.
+`_Chain`/`_apply_chains` rather than fitting into the existing one. A branch
+that bottoms out at an `Add`/`SkipLayerNormalization` residual merge instead
+of a real producer *is* composed, in one bounded shape: the merge's own
+whole transitively-connected group (see the residual sections above) is
+resolved exactly as it would be standalone, and -- *only* when that group
+has no consumer anywhere else at all (this one `Concat` branch is its
+sole reason to exist) -- the group's own combined-importance `keep` set
+becomes this one branch's own contribution, its several leaf producers all
+sliced together by it. A group with any other fan-out (an interior tensor
+also read elsewhere, or its sink feeding some other ordinary consumer too)
+is declined outright rather than guessed at -- see
+:func:`_find_matmul_concat_chains`/:func:`_find_conv_concat_chains`'s own
+section comment for exactly why that line is where it's drawn.
 
 General multi-branch dependency-graph pruning remains out of scope --
 a non-`Add`/`SkipLayerNormalization`/`Concat` merge op, and fan-out
@@ -4136,24 +4148,52 @@ def _find_gated_chains(graph: onnx.GraphProto) -> List[_Chain]:
 # activations (plus, for MatMul/Gemm, a per-channel `Add`/`Mul`/
 # `BiasGelu`/`FastGelu` hop; for Conv, a self-consistently-depthwise
 # pass-through hop) a plain single-producer chain's own forward walk
-# recognizes. Only a `"producer"` outcome is accepted here, though: a
+# recognizes. A `"producer"` outcome is accepted directly, as before. A
 # `"add"` outcome -- the branch resolves to an eligible `Add`/
 # `SkipLayerNormalization` residual merge instead of a real producer -- is
-# treated exactly like `"fail"` and declines the *entire* `Concat` group,
-# the same conservative "never partially pruned" bar the residual sections'
-# own union-find grouping holds every member to. Composing a residual merge
-# with a `Concat` merge on the same branch (e.g. a decoder block whose own
-# skip input is itself a residual sum) is a real, plausible topology this
-# module simply hasn't verified yet -- see this module's own docstring for
-# why that's an honest scope boundary rather than an oversight, not a case
-# this finder tries to guess at. Likewise, a `Concat` chained transitively
-# into *another* `Concat` (a "spine" of concatenations) is not walked
-# through either: neither backward walker recognizes `Concat` as a hop at
-# all, so an operand that bottoms out at one simply falls through to
-# `"fail"` the same way an unrecognized producer always does -- no dedicated
-# check was needed to draw that boundary, it falls out for free from what
-# the walkers already do and don't recognize. A gated (SwiGLU/GeGLU) pair
-# feeding a `Concat` operand directly, with no real producer's raw output in
+# now *composed*, but only in one bounded shape (see
+# :func:`_resolve_matmul_residual_group_for_concat`/
+# :func:`_resolve_conv_residual_group_for_concat`): the merge's own whole
+# transitively-connected group is resolved exactly the way the residual
+# sections above resolve it standalone (same union-find-over-eligible-merges
+# walk, same per-member operand resolution, same "any operand fails, the
+# entire group declines" bar) -- except its *sink* is never handed to
+# :func:`_walk_to_consumer`/:func:`_walk_to_conv_consumer` the way the
+# standalone residual finder needs to (that forward walker doesn't
+# recognize `Concat` as a hop at all -- see below -- so a group whose sink
+# feeds a `Concat` is *always* declined by the standalone residual finder,
+# today, independent of anything this finder does; nothing double-resolves
+# it). Instead, the branch's own already-known path from the group's sink
+# to this `Concat` operand (`"add"`'s own `pre_ops`/`edges`, exactly what a
+# plain producer outcome already carries) is checked for fan-out the same
+# way a plain producer branch already is
+# (:func:`_branch_walk_has_fanout`), and :func:`_resolve_matmul_fanout_branches`/
+# :func:`_resolve_conv_fanout_branches` -- the *exact* existing fan-out
+# resolver the standalone residual finder already uses, entirely
+# unmodified -- is reused to confirm the group has no *other* consumer
+# anywhere: every backbone tensor's only accounted consumer is the group's
+# own internal wiring plus this one already-known Concat-ward path, so an
+# empty result (no un-accounted consumer found at all) is this composition's
+# *success* case, the mirror image of what that function's own existing
+# caller treats as "no consumer, decline". Any non-empty result -- real
+# fan-out exists, whether resolvable to an ordinary chain or not -- declines
+# the whole `Concat` group instead of trying to reconcile a `Concat`
+# branch's own fixed-offset slice with an ordinary chain's shared,
+# un-offset one; see this module's own docstring for the worked reasoning.
+# Once resolved, the group's several leaf producers ride together on this
+# one branch (:class:`_ConcatBranch`'s own `producers` is a tuple for
+# exactly this reason, not always length one) and are ranked by the same
+# combined (root-sum-square) importance :func:`_plain_structured_importance`
+# already uses for an ordinary multi-producer chain, not
+# :func:`_plain_branch_importance`'s single-producer norm. Likewise, a
+# `Concat` chained transitively into *another* `Concat` (a "spine" of
+# concatenations) is not walked through: neither backward walker recognizes
+# `Concat` as a hop at all, so an operand that bottoms out at one simply
+# falls through to `"fail"` the same way an unrecognized producer always
+# does -- no dedicated check was needed to draw that boundary, it falls out
+# for free from what the walkers already do and don't recognize. A gated
+# (SwiGLU/GeGLU) pair feeding a `Concat` operand directly, with no real
+# producer's raw output in
 # between, is declined the same way: neither backward walker resolves
 # through a `Mul` of two non-constant operands (see the MatMul residual
 # section's own comment for why), so that shape falls through to `"fail"`
@@ -4304,17 +4344,33 @@ class _ConcatBranch:
     :class:`_Chain` rather than folding into them.
     """
 
-    producer: _Producer  # `pre_ops` always left empty -- see `pre_ops` below
-    # Ops between the producer's own raw output and this branch's own
-    # `Concat` operand: ``(node, const_name_or_None)`` pairs, forward order
-    # -- exactly :class:`_Chain`'s own `chain_ops` shape (needed here rather
-    # than :class:`_Producer`'s own bare-node `pre_ops` tuple, because a
-    # MatMul/Gemm branch can carry a per-channel `Add`/`Mul`/`BiasGelu`/
-    # `FastGelu` constant on this hop, not just a unary activation).
+    # One producer for a plain branch (`_Producer.pre_ops` always left empty
+    # -- see `pre_ops` below); more than one when this branch instead
+    # resolves through a composed residual/merge group -- see this section's
+    # own comment on the `"add"` outcome -- in which case every producer
+    # here shares this one branch's own combined-importance `keep` set,
+    # exactly the way :class:`_Chain`'s own multi-producer `producers` does
+    # for an ordinary residual chain.
+    producers: Tuple[_Producer, ...]
+    # Ops between the producer's own raw output (or, for a composed group,
+    # between every leaf producer/inter-merge hop *and* the group's own
+    # sink merge node, plus the sink's own raw output and this branch's own
+    # `Concat` operand -- the whole group collapses onto this one flat list,
+    # exactly as :func:`_find_matmul_residual_chains`/
+    # :func:`_find_conv_residual_chains` already flatten a standalone
+    # group's own internal wiring into one `_Chain.chain_ops`) and this
+    # branch's own `Concat` operand: ``(node, const_name_or_None)`` pairs,
+    # order-independent -- every entry is sliced by this branch's own single
+    # `keep` set regardless of position, exactly :class:`_Chain`'s own
+    # `chain_ops` shape (needed here rather than :class:`_Producer`'s own
+    # bare-node `pre_ops` tuple, because a MatMul/Gemm branch can carry a
+    # per-channel `Add`/`Mul`/`BiasGelu`/`FastGelu` constant on this hop, not
+    # just a unary activation).
     pre_ops: Tuple[Tuple[onnx.NodeProto, Optional[str]], ...]
     # Depthwise Conv pass-through hops crossed on this branch (Conv branches
     # only; always empty for a MatMul/Gemm branch -- see
-    # :class:`_ConvPassThrough`).
+    # :class:`_ConvPassThrough`), same flattening as `pre_ops` above for a
+    # composed group's own internal depthwise hops.
     conv_pass_through: Tuple[_ConvPassThrough, ...]
     n_channels: int
     # This branch's fixed offset into the merged (pre-pruning) channel
@@ -4322,9 +4378,12 @@ class _ConcatBranch:
     # why this is safe to compute once, up front, from operand order alone.
     offset: int
     # The tensor name actually feeding the `Concat` node at this operand
-    # position (`== producer.node.output[0]` when `pre_ops` is empty) -- the
-    # Wanda activation-probe point for this branch, see
-    # :func:`apply_structured_wanda_pruning`.
+    # position (`== producers[0].node.output[0]` when `pre_ops` is empty and
+    # this is a plain, single-producer branch) -- the Wanda activation-probe
+    # point for this branch, see :func:`apply_structured_wanda_pruning`. For
+    # a composed group branch this is still exactly where the group's own
+    # (possibly-multi-producer) output actually feeds the `Concat` node --
+    # a perfectly well-defined probe point either way.
     operand_name: str
 
 
@@ -4387,6 +4446,237 @@ def _branch_walk_has_fanout(
     return len(consumers) != 1 or consumers[0] is not prev_consumer
 
 
+_ResolvedMatmulResidualGroup = Tuple[
+    Tuple[_Producer, ...],
+    Tuple[Tuple[onnx.NodeProto, Optional[str]], ...],
+    int,
+    List[str],
+    Dict[str, Set[int]],
+]
+
+
+def _resolve_matmul_residual_group_for_concat(
+    root: onnx.NodeProto,
+    node_by_output: Dict[str, onnx.NodeProto],
+    initializer_map: Dict[str, onnx.TensorProto],
+    consumers_of: Dict[str, List[onnx.NodeProto]],
+    graph_outputs: Set[str],
+) -> Optional[_ResolvedMatmulResidualGroup]:
+    """Resolves `root` (an ``Add``/``SkipLayerNormalization`` merge a
+    ``Concat`` branch's own backward walk bottomed out at -- an `"add"`
+    outcome from :func:`_walk_matmul_producer_backward`) and its whole
+    transitively-connected residual/merge group, mirroring
+    :func:`_find_matmul_residual_chains`'s own per-group union-find loop
+    exactly (same per-member operand resolution via
+    :func:`_walk_matmul_producer_backward`, same "any operand fails, the
+    whole group declines" bar, same post-hoc bias/scale-constant
+    re-validation once the group's real channel count is known) but scoped
+    to just `root`'s own component -- reached by a plain worklist walk
+    outward from `root` rather than a global union-find over every merge
+    node in the graph, since `root` is already known to be the group's own
+    sink (see this section's own comment on the `"add"` outcome: nothing
+    else in the group can consume `root`'s own output, since that output's
+    sole consumer was already independently confirmed, by the caller, to be
+    the `Concat`-ward hop chain this branch is being resolved for).
+
+    Returns ``None`` the same way :func:`_find_matmul_residual_chains`
+    declines a whole group: an operand fails to resolve at all, the leaf
+    producers' channel counts disagree, a bias/scale constant doesn't
+    actually match that channel count, `root` turns out not to be the
+    group's own unique sink after all (defensive -- see above for why this
+    shouldn't happen), or the same producer is named twice. On success,
+    returns ``(leaf_producers, pre_chain_ops, n_channels, backbone_tensors,
+    accounted)`` -- the first three exactly mirror what
+    :func:`_find_matmul_residual_chains` would fold into a resolved
+    :class:`_Chain`'s own `producers`/`chain_ops`/`n_channels`; the last two
+    are the group's own internal wiring (every tensor an operand walk
+    crossed, and which specific node already accounts for it), handed to
+    :func:`_resolve_matmul_fanout_branches` by the caller to confirm the
+    group has no consumer anywhere else -- `root`'s own output is
+    deliberately *not* included (unlike that finder's own explicit
+    `sink_out` handling), since the caller already knows, and separately
+    verifies, its own single accounted consumer.
+    """
+    visited: List[onnx.NodeProto] = [root]
+    visited_ids = {id(root)}
+    referenced: Set[int] = set()
+    leaf_producers: List[_Producer] = []
+    n_channels_set: Set[int] = set()
+    pre_chain_ops: List[Tuple[onnx.NodeProto, Optional[str]]] = []
+    backbone_tensors: List[str] = []
+    accounted: Dict[str, Set[int]] = {}
+
+    def _mark_backbone(tensor: str, node: onnx.NodeProto) -> None:
+        if tensor not in accounted:
+            backbone_tensors.append(tensor)
+        accounted.setdefault(tensor, set()).add(id(node))
+
+    i = 0
+    while i < len(visited):
+        merge_node = visited[i]
+        i += 1
+        match = _match_matmul_residual_merge(
+            merge_node, initializer_map, consumers_of, graph_outputs
+        )
+        if match is None:
+            return None  # defensive -- every member here was matched once already
+        operands, extra_ops = match
+        pre_chain_ops.extend(extra_ops)
+        for operand in operands:
+            _mark_backbone(operand, merge_node)
+            kind, payload, ops, edges = _walk_matmul_producer_backward(
+                operand,
+                node_by_output,
+                initializer_map,
+                consumers_of,
+                graph_outputs,
+                _MAX_CHAIN_HOPS,
+            )
+            for tensor, hop_node in edges:
+                _mark_backbone(tensor, hop_node)
+            pre_chain_ops.extend(ops)
+            if kind == "producer":
+                assert payload is not None and not isinstance(payload, onnx.NodeProto)
+                # `producer_infos` is never passed to the walk above, so a
+                # "producer" outcome here is always the plain 2-tuple -- the
+                # 3-tuple "gated" shape (see _walk_matmul_producer_backward's
+                # own docstring) is unreachable from this call site.
+                producer, n_channels = cast(Tuple[_Producer, int], payload)
+                leaf_producers.append(producer)
+                n_channels_set.add(n_channels)
+            elif kind == "add":
+                assert isinstance(payload, onnx.NodeProto)
+                referenced.add(id(payload))
+                if id(payload) not in visited_ids:
+                    visited_ids.add(id(payload))
+                    visited.append(payload)
+            else:
+                return None  # "fail" -- decline the whole group
+
+    if len(n_channels_set) != 1:
+        return None  # branches disagree on channel count -- decline
+    n_channels = next(iter(n_channels_set))
+
+    if any(
+        const_name is not None and initializer_map[const_name].dims[-1] != n_channels
+        for _, const_name in pre_chain_ops
+    ):
+        return None
+
+    sinks = [id(n) for n in visited if id(n) not in referenced]
+    if sinks != [id(root)]:
+        return None  # not a single linear chain rooted at `root` -- decline
+
+    if len({p.weight for p in leaf_producers}) != len(leaf_producers):
+        return None  # degenerate -- the same producer named twice
+
+    return (
+        tuple(leaf_producers),
+        tuple(pre_chain_ops),
+        n_channels,
+        backbone_tensors,
+        accounted,
+    )
+
+
+_ResolvedConvResidualGroup = Tuple[
+    Tuple[_Producer, ...],
+    Tuple[_ConvPassThrough, ...],
+    Tuple[onnx.NodeProto, ...],
+    int,
+    List[str],
+    Dict[str, Set[int]],
+]
+
+
+def _resolve_conv_residual_group_for_concat(
+    root: onnx.NodeProto,
+    node_by_output: Dict[str, onnx.NodeProto],
+    initializer_map: Dict[str, onnx.TensorProto],
+    graph_outputs: Set[str],
+) -> Optional[_ResolvedConvResidualGroup]:
+    """The Conv analogue of :func:`_resolve_matmul_residual_group_for_concat`
+    -- see its own docstring for the shared reasoning this mirrors exactly
+    (only the per-member walker differs: :func:`_walk_conv_producer_backward`
+    instead of :func:`_walk_matmul_producer_backward`, and there is no
+    ``SkipLayerNormalization`` analogue or per-channel bias/scale hop to
+    re-validate on the Conv side, only depthwise pass-through hops -- see
+    :func:`_find_conv_residual_chains`'s own matching re-validation). Returns
+    ``(leaf_producers, pass_through, unary_ops, n_channels, backbone_tensors,
+    accounted)`` on success.
+    """
+    visited: List[onnx.NodeProto] = [root]
+    visited_ids = {id(root)}
+    referenced: Set[int] = set()
+    leaf_producers: List[_Producer] = []
+    n_channels_set: Set[int] = set()
+    pass_through: List[_ConvPassThrough] = []
+    unary_ops: List[onnx.NodeProto] = []
+    backbone_tensors: List[str] = []
+    accounted: Dict[str, Set[int]] = {}
+
+    def _mark_backbone(tensor: str, node: onnx.NodeProto) -> None:
+        if tensor not in accounted:
+            backbone_tensors.append(tensor)
+        accounted.setdefault(tensor, set()).add(id(node))
+
+    i = 0
+    while i < len(visited):
+        add_node = visited[i]
+        i += 1
+        if not _is_eligible_add_merge(add_node, initializer_map):
+            return None  # defensive -- every member here was matched once already
+        for operand in add_node.input:
+            _mark_backbone(operand, add_node)
+            kind, payload, pt, uops, edges = _walk_conv_producer_backward(
+                operand,
+                node_by_output,
+                initializer_map,
+                graph_outputs,
+                _MAX_CHAIN_HOPS,
+            )
+            for tensor, hop_node in edges:
+                _mark_backbone(tensor, hop_node)
+            pass_through.extend(pt)
+            unary_ops.extend(uops)
+            if kind == "producer":
+                assert payload is not None and not isinstance(payload, onnx.NodeProto)
+                producer, n_channels = payload
+                leaf_producers.append(producer)
+                n_channels_set.add(n_channels)
+            elif kind == "add":
+                assert isinstance(payload, onnx.NodeProto)
+                referenced.add(id(payload))
+                if id(payload) not in visited_ids:
+                    visited_ids.add(id(payload))
+                    visited.append(payload)
+            else:
+                return None  # "fail" -- decline the whole group
+
+    if len(n_channels_set) != 1:
+        return None  # branches disagree on channel count -- decline
+    n_channels = next(iter(n_channels_set))
+
+    if any(initializer_map[hop.weight].dims[0] != n_channels for hop in pass_through):
+        return None
+
+    sinks = [id(n) for n in visited if id(n) not in referenced]
+    if sinks != [id(root)]:
+        return None  # not a single linear chain rooted at `root` -- decline
+
+    if len({p.weight for p in leaf_producers}) != len(leaf_producers):
+        return None  # degenerate -- the same producer named twice
+
+    return (
+        tuple(leaf_producers),
+        tuple(pass_through),
+        tuple(unary_ops),
+        n_channels,
+        backbone_tensors,
+        accounted,
+    )
+
+
 def _find_matmul_concat_chains(graph: onnx.GraphProto) -> List[_ConcatChain]:
     """Finds MatMul/Gemm ``Concat``-merged skip connections -- see this
     section's own comment. Every operand of a last-axis `Concat`
@@ -4394,15 +4684,16 @@ def _find_matmul_concat_chains(graph: onnx.GraphProto) -> List[_ConcatChain]:
     `axis` only when the operands' rank is confirmed via `value_info` to
     actually be `rank - 1`) is resolved backward, via
     :func:`_walk_matmul_producer_backward` (reused unchanged from the
-    MatMul/Gemm residual section above), to a real MatMul/vanilla-Gemm
-    producer -- only a `"producer"` outcome is accepted; `"add"` (the
-    operand resolves to an eligible residual/`SkipLayerNormalization` merge
-    instead) is declined exactly like `"fail"`, since composing a residual
-    merge with a `Concat` merge on the same branch isn't verified here (see
-    this section's own comment). If *any* operand fails to resolve to a
-    real producer, or two operands resolve to the very same producer weight
-    (degenerate), the whole `Concat` node is declined -- never partially
-    pruned.
+    MatMul/Gemm residual section above), to either a real MatMul/vanilla-Gemm
+    producer (`"producer"`) or an eligible residual/`SkipLayerNormalization`
+    merge's whole group (`"add"`, composed via
+    :func:`_resolve_matmul_residual_group_for_concat` -- see this section's
+    own comment for exactly what composing that requires and what it
+    declines). If *any* operand fails to resolve either way, or two operands
+    (or two leaf producers of the same composed group, or a leaf producer of
+    one branch against another branch's own) name the very same producer
+    weight (degenerate), the whole `Concat` node is declined -- never
+    partially pruned.
     """
     initializer_map = {t.name: t for t in graph.initializer}
     consumers_of = _consumers_of(graph)
@@ -4435,12 +4726,60 @@ def _find_matmul_concat_chains(graph: onnx.GraphProto) -> List[_ConcatChain]:
                 graph_outputs,
                 _MAX_CHAIN_HOPS,
             )
-            if kind != "producer":
+            if kind == "fail":
                 declined = True
                 break
             if _branch_walk_has_fanout(operand, edges, consumers_of, node):
                 declined = True
                 break
+            if kind == "add":
+                assert isinstance(payload, onnx.NodeProto)
+                resolved = _resolve_matmul_residual_group_for_concat(
+                    payload,
+                    node_by_output,
+                    initializer_map,
+                    consumers_of,
+                    graph_outputs,
+                )
+                if resolved is None:
+                    declined = True
+                    break
+                producers, group_chain_ops, n_channels, backbone, accounted = resolved
+                extra = _resolve_matmul_fanout_branches(
+                    backbone,
+                    accounted,
+                    initializer_map,
+                    consumers_of,
+                    graph_outputs,
+                    n_channels,
+                )
+                # `None` (resolution itself failed) or a non-empty list (real
+                # fan-out found, resolvable or not) both decline here -- only
+                # an exactly-empty list confirms the group has no consumer
+                # anywhere else, safe to compose as this one branch's own
+                # contribution (see this section's own comment on the
+                # `"add"` outcome for why an empty result is *this*
+                # function's success case, the mirror of what its own other
+                # caller, `_find_matmul_residual_chains`, treats it as).
+                if extra is None or extra:
+                    declined = True
+                    break
+                if any(p.weight in seen_weights for p in producers):
+                    declined = True
+                    break
+                seen_weights.update(p.weight for p in producers)
+                branches.append(
+                    _ConcatBranch(
+                        producers,
+                        group_chain_ops + pre_ops,
+                        (),
+                        n_channels,
+                        offset,
+                        operand,
+                    )
+                )
+                offset += n_channels
+                continue
             assert payload is not None and not isinstance(payload, onnx.NodeProto)
             producer, n_channels = cast(Tuple[_Producer, int], payload)
             if producer.weight in seen_weights:
@@ -4448,7 +4787,7 @@ def _find_matmul_concat_chains(graph: onnx.GraphProto) -> List[_ConcatChain]:
                 break
             seen_weights.add(producer.weight)
             branches.append(
-                _ConcatBranch(producer, pre_ops, (), n_channels, offset, operand)
+                _ConcatBranch((producer,), pre_ops, (), n_channels, offset, operand)
             )
             offset += n_channels
         if declined:
@@ -4490,12 +4829,16 @@ def _find_conv_concat_chains(graph: onnx.GraphProto) -> List[_ConcatChain]:
     `[N, C, H, W]` tensor; see this section's own comment for why Conv needs
     no rank ambiguity check the MatMul/Gemm side does) is resolved backward
     via :func:`_walk_conv_producer_backward`, reused unchanged from the Conv
-    residual section above: only a `"producer"` outcome (a real `group=1`
-    Conv, reached through unary activations and/or self-consistently-
-    depthwise pass-through hops) is accepted -- `"add"` and `"fail"` are
-    both declined the same way :func:`_find_matmul_concat_chains` declines
-    `"add"`. The consumer must itself be an ordinary (`group=1`) Conv -- see
-    this section's own comment for why a grouped consumer is declined here.
+    residual section above, to either a real `group=1` Conv producer
+    (`"producer"`, reached through unary activations and/or self-
+    consistently-depthwise pass-through hops) or an eligible `Add` merge's
+    whole group (`"add"`, composed via
+    :func:`_resolve_conv_residual_group_for_concat` -- see
+    :func:`_find_matmul_concat_chains`'s own section comment for exactly
+    what composing that requires and what it declines, identical reasoning
+    on the Conv side) -- `"fail"` is declined outright either way. The
+    consumer must itself be an ordinary (`group=1`) Conv -- see this
+    section's own comment for why a grouped consumer is declined here.
     """
     initializer_map = {t.name: t for t in graph.initializer}
     consumers_of = _consumers_of(graph)
@@ -4528,12 +4871,59 @@ def _find_conv_concat_chains(graph: onnx.GraphProto) -> List[_ConcatChain]:
                     _MAX_CHAIN_HOPS,
                 )
             )
-            if kind != "producer":
+            if kind == "fail":
                 declined = True
                 break
             if _branch_walk_has_fanout(operand, edges, consumers_of, node):
                 declined = True
                 break
+            if kind == "add":
+                assert isinstance(payload, onnx.NodeProto)
+                resolved = _resolve_conv_residual_group_for_concat(
+                    payload, node_by_output, initializer_map, graph_outputs
+                )
+                if resolved is None:
+                    declined = True
+                    break
+                (
+                    producers,
+                    group_pass_through,
+                    group_unary_ops,
+                    n_channels,
+                    backbone,
+                    accounted,
+                ) = resolved
+                extra = _resolve_conv_fanout_branches(
+                    backbone,
+                    accounted,
+                    initializer_map,
+                    consumers_of,
+                    graph_outputs,
+                    n_channels,
+                )
+                # See _find_matmul_concat_chains's own matching comment --
+                # only an exactly-empty result confirms no fan-out anywhere
+                # else in the group.
+                if extra is None or extra:
+                    declined = True
+                    break
+                if any(p.weight in seen_weights for p in producers):
+                    declined = True
+                    break
+                seen_weights.update(p.weight for p in producers)
+                branches.append(
+                    _ConcatBranch(
+                        producers,
+                        tuple((op, None) for op in group_unary_ops)
+                        + tuple((op, None) for op in unary_ops),
+                        group_pass_through + pass_through,
+                        n_channels,
+                        offset,
+                        operand,
+                    )
+                )
+                offset += n_channels
+                continue
             assert payload is not None and not isinstance(payload, onnx.NodeProto)
             producer, n_channels = payload
             if producer.weight in seen_weights:
@@ -4542,7 +4932,7 @@ def _find_conv_concat_chains(graph: onnx.GraphProto) -> List[_ConcatChain]:
             seen_weights.add(producer.weight)
             branches.append(
                 _ConcatBranch(
-                    producer,
+                    (producer,),
                     tuple((op, None) for op in unary_ops),
                     pass_through,
                     n_channels,
@@ -4588,13 +4978,20 @@ def _find_conv_concat_chains(graph: onnx.GraphProto) -> List[_ConcatChain]:
     return chains
 
 
-def _plain_branch_importance(w_nk: np.ndarray) -> np.ndarray:
-    # A Concat branch is always exactly one producer, with no cross-branch
-    # combination the way a gated pair or residual group needs (see this
-    # section's own comment) -- so this is just plain per-row L2 norm,
-    # _plain_structured_importance's own single-producer case, standalone
-    # rather than routed through a _Chain.
-    return np.linalg.norm(w_nk, axis=1)
+def _plain_branch_importance(w_arrays_nk: List[np.ndarray]) -> np.ndarray:
+    # A plain Concat branch is exactly one producer -- with a single array
+    # this is just plain per-row L2 norm, _plain_structured_importance's own
+    # single-producer case, standalone rather than routed through a _Chain.
+    # A branch composed from a residual/merge group's own multiple leaf
+    # producers (see this section's own comment on the `"add"` outcome)
+    # combines every producer's own per-row norm the same root-sum-square
+    # way _plain_structured_importance already does for an ordinary
+    # multi-producer chain, since they're summed elementwise before the
+    # group's own merge point ever combines them.
+    squared_norm = np.zeros(w_arrays_nk[0].shape[0], dtype=np.float64)
+    for w_nk in w_arrays_nk:
+        squared_norm += np.square(np.linalg.norm(w_nk, axis=1))
+    return np.sqrt(squared_norm)
 
 
 def _apply_concat_chains(
@@ -4615,9 +5012,13 @@ def _apply_concat_chains(
     agreement (see this section's own comment): each branch owns its own
     disjoint, fixed-offset slice of the merged channel range, so each is
     ranked and pruned to its *own independent* `keep` set by
-    ``compute_branch_importance(operand_name, w_nk) ->
-    np.ndarray[branch.n_channels]``, and only the shared downstream consumer
-    is sliced once, by one combined index set -- the concatenation of every
+    ``compute_branch_importance(operand_name, w_arrays_nk) ->
+    np.ndarray[branch.n_channels]`` (`w_arrays_nk` one weight matrix per
+    producer in the branch -- length one for a plain branch, more than one
+    for a branch composed from a residual/merge group's own several leaf
+    producers, see this section's own comment on the `"add"` outcome), and
+    only the shared downstream consumer is sliced once, by one combined
+    index set -- the concatenation of every
     branch's own `keep`, each shifted by its own fixed `offset`. Since
     branch offsets strictly increase in `Concat` operand order and each
     branch's own `keep` is itself ascending, that concatenation is
@@ -4631,9 +5032,10 @@ def _apply_concat_chains(
     initializer_map = {t.name: t for t in graph.initializer}
 
     for chain in chains:
-        producer_weights = {b.producer.weight for b in chain.branches}
-        if len(producer_weights) != len(chain.branches):
-            continue  # degenerate -- two branches naming the same weight
+        producer_weights = {p.weight for b in chain.branches for p in b.producers}
+        n_producers = sum(len(b.producers) for b in chain.branches)
+        if len(producer_weights) != n_producers:
+            continue  # degenerate -- two producers (same or different branch) naming the same weight
 
         conv_hop_weights = {
             h.weight for b in chain.branches for h in b.conv_pass_through
@@ -4646,7 +5048,7 @@ def _apply_concat_chains(
             continue  # degenerate -- the same depthwise weight named twice
 
         consts = {
-            b.producer.bias for b in chain.branches if b.producer.bias is not None
+            p.bias for b in chain.branches for p in b.producers if p.bias is not None
         }
         consts.update(
             const_name
@@ -4675,15 +5077,17 @@ def _apply_concat_chains(
                 branch_keeps.append(np.arange(n))
                 continue
             any_pruned = True
-            w = onnx.numpy_helper.to_array(initializer_map[b.producer.weight]).astype(
-                np.float64
-            )
-            w_nk = (
-                w.reshape(w.shape[0], -1)  # [out_channels, in_channels*kH*kW]
-                if b.producer.is_conv
-                else (w if b.producer.weight_transposed else w.T)  # [N, K]
-            )
-            importance = compute_branch_importance(b.operand_name, w_nk)
+            w_arrays_nk = []
+            for p in b.producers:
+                w = onnx.numpy_helper.to_array(initializer_map[p.weight]).astype(
+                    np.float64
+                )
+                w_arrays_nk.append(
+                    w.reshape(w.shape[0], -1)  # [out_channels, in_channels*kH*kW]
+                    if p.is_conv
+                    else (w if p.weight_transposed else w.T)  # [N, K]
+                )
+            importance = compute_branch_importance(b.operand_name, w_arrays_nk)
             branch_keeps.append(np.sort(np.argsort(-importance)[:keep_count]))
 
         if not any_pruned:
@@ -4692,14 +5096,15 @@ def _apply_concat_chains(
         for b, keep in zip(chain.branches, branch_keeps):
             if len(keep) == b.n_channels:
                 continue  # this branch's own sparsity rounded to a no-op
-            _slice_producer_weight(
-                initializer_map[b.producer.weight],
-                b.producer.weight_transposed,
-                keep,
-                is_conv=b.producer.is_conv,
-            )
-            if b.producer.bias is not None:
-                _slice_last_axis(initializer_map[b.producer.bias], keep)
+            for p in b.producers:
+                _slice_producer_weight(
+                    initializer_map[p.weight],
+                    p.weight_transposed,
+                    keep,
+                    is_conv=p.is_conv,
+                )
+                if p.bias is not None:
+                    _slice_last_axis(initializer_map[p.bias], keep)
             for _, const_name in b.pre_ops:
                 if const_name is not None:
                     _slice_last_axis(initializer_map[const_name], keep)
@@ -4742,7 +5147,7 @@ def _apply_concat_chains(
         touched.conv_hop.update(conv_hop_weights)
         touched.stale_value_info.add(chain.concat_node.output[0])
         for b in chain.branches:
-            touched.stale_value_info.add(b.producer.node.output[0])
+            touched.stale_value_info.update(p.node.output[0] for p in b.producers)
             touched.stale_value_info.update(op.output[0] for op, _ in b.pre_ops)
             touched.stale_value_info.update(
                 h.node.output[0] for h in b.conv_pass_through
@@ -5297,7 +5702,7 @@ def apply_structured_pruning(
             graph,
             concat_chains,
             sparsity,
-            lambda _operand_name, w_nk: _plain_branch_importance(w_nk),
+            lambda _operand_name, w_arrays_nk: _plain_branch_importance(w_arrays_nk),
             touched,
         )
     if touched.stale_value_info:
@@ -5412,7 +5817,12 @@ def apply_structured_wanda_pruning(
     }
     for cchain in concat_chains:
         for b in cchain.branches:
-            channel_axis[b.operand_name] = 1 if b.producer.is_conv else -1
+            # Every producer of a given branch is always uniformly Conv or
+            # uniformly MatMul/Gemm (a residual/merge-group-composed branch
+            # is only ever discovered by the one walker family that finder
+            # itself uses -- see this section's own comment) -- so any one
+            # producer's own `is_conv` speaks for the whole branch.
+            channel_axis[b.operand_name] = 1 if b.producers[0].is_conv else -1
     probe_names = sorted(channel_axis)
     probe_model = _add_probe_outputs(out, probe_names)
 
@@ -5447,10 +5857,12 @@ def apply_structured_wanda_pruning(
             return base  # no matching activation observed -- fall back to |W|
         return base * np.maximum(norm, epsilon)
 
-    def _wanda_branch_importance(operand_name: str, w_nk: np.ndarray) -> np.ndarray:
-        base = _plain_branch_importance(w_nk)
+    def _wanda_branch_importance(
+        operand_name: str, w_arrays_nk: List[np.ndarray]
+    ) -> np.ndarray:
+        base = _plain_branch_importance(w_arrays_nk)
         norm = act_norm.get(operand_name)
-        if norm is None or norm.shape[0] != w_nk.shape[0]:
+        if norm is None or norm.shape[0] != base.shape[0]:
             return base  # no matching activation observed -- fall back to |W|
         return base * np.maximum(norm, epsilon)
 
