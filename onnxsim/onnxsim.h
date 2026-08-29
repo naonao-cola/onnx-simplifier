@@ -533,11 +533,24 @@ onnx::ModelProto ApplyQuarot(const onnx::ModelProto& model, uint64_t seed);
 // independently. The gated-FFN SwiGLU/GeGLU pattern is matched too -- two
 // producers combined by a ``Mul`` (or ONNX opset-28+'s native ``SwiGLU``
 // node) feeding one consumer, both pruned to the same combined-importance-
-// ranked channel indices -- see ``structured_pruning_entry.cpp`` for the
-// exact algorithm and its scope note (this port does not (yet) include the
-// pure-Python implementation's residual/skip-connection chain support --
-// ``onnxsim.apply_structured_pruning`` remains the full-featured
-// reference).
+// ranked channel indices. A Conv or MatMul/Gemm residual (skip-connection)
+// chain is matched too -- a channel-preserving ``Add(a, b)`` where both
+// operands are non-constant forces whichever real producer(s) feed ``a``/
+// ``b`` to agree on one shared channel-index set, resolved via a backward
+// walk plus union-find grouping across such merge points that also covers a
+// whole chain of such merges transitively sharing one spine channel count
+// (a lone residual connection, or a linear stack of ``Add``-only merges;
+// an *interior* block of a real deep ResNet/transformer stage, whose own
+// "post-block" tensor is read both by the next block and directly by that
+// block's own ``Add``, is left completely untouched, the same "no
+// branch-following" boundary every other chain kind here already holds) --
+// see ``structured_pruning_entry.cpp`` for the exact algorithm and its
+// scope note (this port does not (yet) recognize a fused
+// ``com.microsoft::SkipLayerNormalization``/``SkipSimplifiedLayerNormalization``
+// node -- what onnxruntime's transformer optimizer collapses a bare
+// residual ``Add`` plus the following LayerNorm into -- as an eligible
+// merge point; ``onnxsim.apply_structured_pruning`` remains the
+// full-featured reference for that case).
 //
 // Unlike ``Simplify``, this does not run shape inference, constant folding or
 // any other simplification pass -- it applies exactly this rewrite, to every
@@ -545,8 +558,8 @@ onnx::ModelProto ApplyQuarot(const onnx::ModelProto& model, uint64_t seed);
 // returns the result. ``sparsity`` must be in [0, 1); throws
 // ``std::invalid_argument`` otherwise. Anything not matching the exact
 // topology above (branching, a non-constant bias, a consumer whose
-// reduction dimension doesn't line up, a gated or residual chain, ...) is
-// left completely untouched.
+// reduction dimension doesn't line up, a fused-SkipLayerNormalization
+// residual, ...) is left completely untouched.
 onnx::ModelProto ApplyStructuredPruning(const onnx::ModelProto& model,
                                         double sparsity);
 

@@ -3,11 +3,14 @@ of ``onnxsim.apply_structured_pruning`` (see
 ``onnxsim/structured_pruning_entry.cpp``). Scope note: this port covers the
 "plain chain" topologies (a MatMul/vanilla-Gemm or Conv producer feeding,
 through shape-preserving elementwise ops, exactly one consumer of the same
-family) and the gated-FFN (SwiGLU/GeGLU) topology (two producers combined by
+family), the gated-FFN (SwiGLU/GeGLU) topology (two producers combined by
 ``Mul`` or the native ``SwiGLU`` op, pruned to a shared combined-importance
-channel set) -- not the pure-Python implementation's residual/skip-connection
-chain support. Tests here are adapted from ``test_pruning.py``'s own
-``apply_structured_pruning`` coverage, scoped to the topologies this port
+channel set), and Conv/MatMul residual (skip-connection) chains (a
+channel-preserving bare ``Add(a, b)`` merge point, resolved via backward walk
+plus union-find grouping) -- but not the pure-Python implementation's fused
+``com.microsoft::SkipLayerNormalization``/``SkipSimplifiedLayerNormalization``
+residual-merge recognition. Tests here are adapted from ``test_pruning.py``'s
+own ``apply_structured_pruning`` coverage, scoped to the topologies this port
 actually implements, plus a couple of tests confirming the unported
 topologies are left untouched (never guessed at).
 """
@@ -963,6 +966,628 @@ def test_cpp_structured_pruning_skips_mismatched_grouped_producer_and_consumer()
     inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
     np.testing.assert_array_equal(inits["W1"], w1)
     np.testing.assert_array_equal(inits["W2"], w2)
+
+
+# --- Conv residual (Add-merged) chains --------------------------------------
+
+
+def _residual_diamond_model(w_f, w_s, w_out, spatial=10):
+    # y = Conv_out(Relu(Add(Conv_f(X), Conv_s(X)))) -- a "projection
+    # shortcut" residual block: two entirely independent Conv producers
+    # merge via Add and must therefore share one surviving channel-index
+    # set, feeding one real consumer.
+    Cin = w_f.shape[1]
+    Cout = w_out.shape[0]
+    out_spatial = spatial - 4  # two chained 3x3 valid convs
+    return _model(
+        f"""
+        g (float[N,{Cin},{spatial},{spatial}] X) => (float[N,{Cout},{out_spatial},{out_spatial}] Y)
+        {{
+          f = Conv<kernel_shape=[3,3]>(X, WF)
+          s = Conv<kernel_shape=[3,3]>(X, WS)
+          addr = Add(f, s)
+          r = Relu(addr)
+          Y = Conv<kernel_shape=[3,3]>(r, WOUT)
+        }}
+        """,
+        initializer=[_f32(w_f, "WF"), _f32(w_s, "WS"), _f32(w_out, "WOUT")],
+    )
+
+
+def _residual_transitive_model(w_f1, w_s1, w_f2, w_out, spatial=10):
+    # Two Add merges chained transitively, sharing one spine channel count,
+    # with no branch anywhere along the chain: add1's own output feeds only
+    # into add2, never reused elsewhere -- the union-find grouping extends
+    # across both Adds into one group of three producers.
+    Cin = w_f1.shape[1]
+    Cz = w_f2.shape[1]
+    Cout = w_out.shape[0]
+    add1_spatial = spatial - 2  # one 3x3 valid conv each, from X
+    out_spatial = add1_spatial - 2  # WOUT's own 3x3 valid conv
+    return _model(
+        f"""
+        g (float[N,{Cin},{spatial},{spatial}] X, float[N,{Cz},{add1_spatial},{add1_spatial}] Z)
+            => (float[N,{Cout},{out_spatial},{out_spatial}] Y)
+        {{
+          f1 = Conv<kernel_shape=[3,3]>(X, WF1)
+          s1 = Conv<kernel_shape=[3,3]>(X, WS1)
+          add1 = Add(f1, s1)
+          f2 = Conv<kernel_shape=[1,1]>(Z, WF2)
+          add2 = Add(f2, add1)
+          r = Relu(add2)
+          Y = Conv<kernel_shape=[3,3]>(r, WOUT)
+        }}
+        """,
+        initializer=[
+            _f32(w_f1, "WF1"),
+            _f32(w_s1, "WS1"),
+            _f32(w_f2, "WF2"),
+            _f32(w_out, "WOUT"),
+        ],
+    )
+
+
+def test_cpp_structured_pruning_conv_residual_add_matches_oracle():
+    Cin, C, Cout = 3, 16, 8
+    rng = np.random.default_rng(80)
+    w_f = rng.standard_normal((C, Cin, 3, 3)).astype(np.float32)
+    w_s = rng.standard_normal((C, Cin, 3, 3)).astype(np.float32)
+    w_out = rng.standard_normal((Cout, C, 3, 3)).astype(np.float32)
+    model = _residual_diamond_model(w_f, w_s, w_out)
+
+    pruned = onnxsim.apply_structured_pruning_cpp(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    inits = {t.name: t for t in pruned.graph.initializer}
+    assert list(inits["WF"].dims) == [C // 2, Cin, 3, 3]
+    assert list(inits["WS"].dims) == [C // 2, Cin, 3, 3]
+    assert list(inits["WOUT"].dims) == [Cout, C // 2, 3, 3]
+
+    importance = np.sqrt(
+        np.square(np.linalg.norm(w_f.reshape(C, -1).astype(np.float64), axis=1))
+        + np.square(np.linalg.norm(w_s.reshape(C, -1).astype(np.float64), axis=1))
+    )
+    keep = np.sort(np.argsort(-importance)[: C // 2])
+    oracle = _residual_diamond_model(w_f[keep], w_s[keep], w_out[:, keep])
+
+    rng_x = np.random.default_rng(81)
+    x = rng_x.standard_normal((2, Cin, 10, 10)).astype(np.float32)
+    (y,) = _run(pruned, {"X": x})
+    (y_oracle,) = _run(oracle, {"X": x})
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-5, atol=1e-5)
+
+
+def test_cpp_structured_pruning_conv_residual_add_transitive_chain_matches_oracle():
+    Cin, C, Cz, Cout = 3, 16, 5, 8
+    rng = np.random.default_rng(82)
+    w_f1 = rng.standard_normal((C, Cin, 3, 3)).astype(np.float32)
+    w_s1 = rng.standard_normal((C, Cin, 3, 3)).astype(np.float32)
+    w_f2 = rng.standard_normal((C, Cz, 1, 1)).astype(np.float32)
+    w_out = rng.standard_normal((Cout, C, 3, 3)).astype(np.float32)
+    model = _residual_transitive_model(w_f1, w_s1, w_f2, w_out)
+
+    pruned = onnxsim.apply_structured_pruning_cpp(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    importance = np.sqrt(
+        np.square(np.linalg.norm(w_f1.reshape(C, -1).astype(np.float64), axis=1))
+        + np.square(np.linalg.norm(w_s1.reshape(C, -1).astype(np.float64), axis=1))
+        + np.square(np.linalg.norm(w_f2.reshape(C, -1).astype(np.float64), axis=1))
+    )
+    keep = np.sort(np.argsort(-importance)[: C // 2])
+    oracle = _residual_transitive_model(
+        w_f1[keep], w_s1[keep], w_f2[keep], w_out[:, keep]
+    )
+
+    rng_x = np.random.default_rng(83)
+    x = rng_x.standard_normal((2, Cin, 10, 10)).astype(np.float32)
+    z = rng_x.standard_normal((2, Cz, 8, 8)).astype(np.float32)
+    (y,) = _run(pruned, {"X": x, "Z": z})
+    (y_oracle,) = _run(oracle, {"X": x, "Z": z})
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-5, atol=1e-5)
+
+
+def test_cpp_structured_pruning_conv_residual_add_declines_on_fan_out_branch():
+    # A realistic multi-block residual stage's interior boundary: `r`
+    # (add1's own post-block tensor) is read twice -- once by the next
+    # block's own first Conv, once unchanged as that next block's own Add
+    # shortcut operand -- exactly the fan-out backward walk's
+    # single-consumer bar declines. Left completely untouched.
+    Cin, C, Cout = 3, 16, 8
+    rng = np.random.default_rng(84)
+    w_f = rng.standard_normal((C, Cin, 3, 3)).astype(np.float32)
+    w_s = rng.standard_normal((C, Cin, 3, 3)).astype(np.float32)
+    w_next = rng.standard_normal((C, C, 1, 1)).astype(np.float32)
+    w_out = rng.standard_normal((Cout, C, 1, 1)).astype(np.float32)
+    model = _model(
+        f"""
+        g (float[N,{Cin},10,10] X) => (float[N,{Cout},8,8] Y)
+        {{
+          f = Conv<kernel_shape=[3,3]>(X, WF)
+          s = Conv<kernel_shape=[3,3]>(X, WS)
+          add1 = Add(f, s)
+          r = Relu(add1)
+          nxt = Conv<kernel_shape=[1,1]>(r, WNEXT)
+          add2 = Add(nxt, r)
+          Y = Conv<kernel_shape=[1,1]>(add2, WOUT)
+        }}
+        """,
+        initializer=[
+            _f32(w_f, "WF"),
+            _f32(w_s, "WS"),
+            _f32(w_next, "WNEXT"),
+            _f32(w_out, "WOUT"),
+        ],
+    )
+    pruned = onnxsim.apply_structured_pruning_cpp(model, sparsity=0.5)
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    np.testing.assert_array_equal(inits["WF"], w_f)
+    np.testing.assert_array_equal(inits["WS"], w_s)
+    np.testing.assert_array_equal(inits["WNEXT"], w_next)
+    np.testing.assert_array_equal(inits["WOUT"], w_out)
+
+
+def test_cpp_structured_pruning_conv_residual_add_declines_on_identity_shortcut():
+    # y = Conv2(Relu(Add(Conv1(X), X))): a classic identity-shortcut
+    # residual block with no Conv on the shortcut path at all. X has no
+    # producer this pass owns (it's a graph input) and is itself read
+    # twice (by Conv1 and directly by Add) -- either alone is enough to
+    # decline.
+    C, Cout = 8, 4
+    rng = np.random.default_rng(85)
+    w1 = rng.standard_normal((C, C, 1, 1)).astype(np.float32)
+    w2 = rng.standard_normal((Cout, C, 1, 1)).astype(np.float32)
+    model = _model(
+        f"""
+        g (float[N,{C},10,10] X) => (float[N,{Cout},10,10] Y)
+        {{
+          f = Conv<kernel_shape=[1,1]>(X, W1)
+          add1 = Add(f, X)
+          r = Relu(add1)
+          Y = Conv<kernel_shape=[1,1]>(r, W2)
+        }}
+        """,
+        initializer=[_f32(w1, "W1"), _f32(w2, "W2")],
+    )
+    pruned = onnxsim.apply_structured_pruning_cpp(model, sparsity=0.5)
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    np.testing.assert_array_equal(inits["W1"], w1)
+    np.testing.assert_array_equal(inits["W2"], w2)
+
+
+def test_cpp_structured_pruning_conv_residual_add_declines_on_grouped_conv_consumer():
+    # Two independent Conv branches merge via Add, but the downstream
+    # consumer is a general grouped Conv (group=2) -- a composition the
+    # residual finder explicitly declines (_chain_group's per-group top-k
+    # assumes each producer feeds the consumer's full channel range, which a
+    # residual group's combined-importance ranking doesn't establish).
+    Cin, C, Cout, group = 3, 16, 8, 2
+    rng = np.random.default_rng(89)
+    w_f = rng.standard_normal((C, Cin, 3, 3)).astype(np.float32)
+    w_s = rng.standard_normal((C, Cin, 3, 3)).astype(np.float32)
+    w_out = rng.standard_normal((Cout, C // group, 1, 1)).astype(np.float32)
+    model = _model(
+        f"""
+        g (float[N,{Cin},10,10] X) => (float[N,{Cout},8,8] Y)
+        {{
+          f = Conv<kernel_shape=[3,3]>(X, WF)
+          s = Conv<kernel_shape=[3,3]>(X, WS)
+          addr = Add(f, s)
+          r = Relu(addr)
+          Y = Conv<kernel_shape=[1,1],group={group}>(r, WOUT)
+        }}
+        """,
+        initializer=[_f32(w_f, "WF"), _f32(w_s, "WS"), _f32(w_out, "WOUT")],
+    )
+    pruned = onnxsim.apply_structured_pruning_cpp(model, sparsity=0.5)
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    np.testing.assert_array_equal(inits["WF"], w_f)
+    np.testing.assert_array_equal(inits["WS"], w_s)
+    np.testing.assert_array_equal(inits["WOUT"], w_out)
+
+
+# --- MatMul/Gemm residual (Add-merged) chains -------------------------------
+
+
+def _matmul_residual_diamond_model(wf, ws, wout):
+    # y = MatMul_out(Relu(Add(MatMul_f(X), MatMul_s(X)))) -- the MatMul/Gemm
+    # analogue of _residual_diamond_model.
+    K, C = wf.shape
+    Out = wout.shape[1]
+    return _model(
+        f"""
+        g (float[batch,{K}] X) => (float[batch,{Out}] Y)
+        {{
+          f = MatMul(X, WF)
+          s = MatMul(X, WS)
+          addr = Add(f, s)
+          r = Relu(addr)
+          Y = MatMul(r, WOUT)
+        }}
+        """,
+        initializer=[_f32(wf, "WF"), _f32(ws, "WS"), _f32(wout, "WOUT")],
+    )
+
+
+def _matmul_residual_transitive_model(wf1, ws1, wf2, wout):
+    # Two Add merges chained transitively, sharing one spine channel count
+    # -- the MatMul/Gemm analogue of _residual_transitive_model.
+    K, C = wf1.shape
+    Kz = wf2.shape[0]
+    Out = wout.shape[1]
+    return _model(
+        f"""
+        g (float[batch,{K}] X, float[batch,{Kz}] Z) => (float[batch,{Out}] Y)
+        {{
+          f1 = MatMul(X, WF1)
+          s1 = MatMul(X, WS1)
+          add1 = Add(f1, s1)
+          f2 = MatMul(Z, WF2)
+          add2 = Add(f2, add1)
+          r = Relu(add2)
+          Y = MatMul(r, WOUT)
+        }}
+        """,
+        initializer=[
+            _f32(wf1, "WF1"),
+            _f32(ws1, "WS1"),
+            _f32(wf2, "WF2"),
+            _f32(wout, "WOUT"),
+        ],
+    )
+
+
+def test_cpp_structured_pruning_matmul_residual_add_matches_oracle():
+    # Weights deliberately built so the two branches disagree about which
+    # channels matter most, so the correct combined-importance keep set is
+    # neither branch's own individual top-k.
+    K, C, Out = 8, 16, 4
+    rng = np.random.default_rng(90)
+    scale_f = np.where(np.arange(C) < C // 2, 3.0, 0.3).astype(np.float32)
+    scale_s = np.where(np.arange(C) < C // 2, 0.3, 3.0).astype(np.float32)
+    wf = rng.standard_normal((K, C)).astype(np.float32) * scale_f
+    ws = rng.standard_normal((K, C)).astype(np.float32) * scale_s
+    wout = rng.standard_normal((C, Out)).astype(np.float32)
+    model = _matmul_residual_diamond_model(wf, ws, wout)
+
+    pruned = onnxsim.apply_structured_pruning_cpp(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    importance = np.sqrt(
+        np.square(np.linalg.norm(wf.astype(np.float64), axis=0))
+        + np.square(np.linalg.norm(ws.astype(np.float64), axis=0))
+    )
+    keep = np.sort(np.argsort(-importance)[: C // 2])
+    assert np.any(keep < C // 2) and np.any(keep >= C // 2)
+    oracle = _matmul_residual_diamond_model(wf[:, keep], ws[:, keep], wout[keep, :])
+
+    rng_x = np.random.default_rng(91)
+    x = rng_x.standard_normal((5, K)).astype(np.float32)
+    (y,) = _run(pruned, {"X": x})
+    (y_oracle,) = _run(oracle, {"X": x})
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-5, atol=1e-5)
+
+
+def test_cpp_structured_pruning_matmul_residual_add_transitive_chain_matches_oracle():
+    K, C, Kz, Out = 8, 16, 5, 4
+    rng = np.random.default_rng(92)
+    wf1 = rng.standard_normal((K, C)).astype(np.float32)
+    ws1 = rng.standard_normal((K, C)).astype(np.float32)
+    wf2 = rng.standard_normal((Kz, C)).astype(np.float32)
+    wout = rng.standard_normal((C, Out)).astype(np.float32)
+    model = _matmul_residual_transitive_model(wf1, ws1, wf2, wout)
+
+    pruned = onnxsim.apply_structured_pruning_cpp(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    importance = np.sqrt(
+        np.square(np.linalg.norm(wf1.astype(np.float64), axis=0))
+        + np.square(np.linalg.norm(ws1.astype(np.float64), axis=0))
+        + np.square(np.linalg.norm(wf2.astype(np.float64), axis=0))
+    )
+    keep = np.sort(np.argsort(-importance)[: C // 2])
+    oracle = _matmul_residual_transitive_model(
+        wf1[:, keep], ws1[:, keep], wf2[:, keep], wout[keep, :]
+    )
+
+    rng_x = np.random.default_rng(93)
+    x = rng_x.standard_normal((5, K)).astype(np.float32)
+    z = rng_x.standard_normal((5, Kz)).astype(np.float32)
+    (y,) = _run(pruned, {"X": x, "Z": z})
+    (y_oracle,) = _run(oracle, {"X": x, "Z": z})
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-5, atol=1e-5)
+
+
+def test_cpp_structured_pruning_matmul_residual_add_declines_on_fan_out_branch():
+    K, C, Out = 8, 16, 4
+    rng = np.random.default_rng(94)
+    wf = rng.standard_normal((K, C)).astype(np.float32)
+    ws = rng.standard_normal((K, C)).astype(np.float32)
+    wnext = rng.standard_normal((C, C)).astype(np.float32)
+    wout = rng.standard_normal((C, Out)).astype(np.float32)
+    model = _model(
+        f"""
+        g (float[batch,{K}] X) => (float[batch,{Out}] Y)
+        {{
+          f = MatMul(X, WF)
+          s = MatMul(X, WS)
+          add1 = Add(f, s)
+          r = Relu(add1)
+          nxt = MatMul(r, WNEXT)
+          add2 = Add(nxt, r)
+          Y = MatMul(add2, WOUT)
+        }}
+        """,
+        initializer=[
+            _f32(wf, "WF"),
+            _f32(ws, "WS"),
+            _f32(wnext, "WNEXT"),
+            _f32(wout, "WOUT"),
+        ],
+    )
+    pruned = onnxsim.apply_structured_pruning_cpp(model, sparsity=0.5)
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    np.testing.assert_array_equal(inits["WF"], wf)
+    np.testing.assert_array_equal(inits["WS"], ws)
+    np.testing.assert_array_equal(inits["WNEXT"], wnext)
+    np.testing.assert_array_equal(inits["WOUT"], wout)
+
+
+def test_cpp_structured_pruning_matmul_residual_add_declines_on_identity_shortcut():
+    # y = MatMul2(Relu(Add(MatMul1(X), X))): the exact x = x + f(x)
+    # transformer-residual identity-shortcut shape, no MatMul on the
+    # shortcut path at all.
+    C, Out = 8, 4
+    rng = np.random.default_rng(95)
+    w1 = rng.standard_normal((C, C)).astype(np.float32)
+    w2 = rng.standard_normal((C, Out)).astype(np.float32)
+    model = _model(
+        f"""
+        g (float[batch,{C}] X) => (float[batch,{Out}] Y)
+        {{
+          f = MatMul(X, W1)
+          add1 = Add(f, X)
+          r = Relu(add1)
+          Y = MatMul(r, W2)
+        }}
+        """,
+        initializer=[_f32(w1, "W1"), _f32(w2, "W2")],
+    )
+    pruned = onnxsim.apply_structured_pruning_cpp(model, sparsity=0.5)
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    np.testing.assert_array_equal(inits["W1"], w1)
+    np.testing.assert_array_equal(inits["W2"], w2)
+
+
+def test_cpp_structured_pruning_matmul_residual_add_with_bias_hop_matches_oracle():
+    # One branch has a per-channel bias Add (a separate node, not Gemm's own
+    # bias input) between its producer and the residual merge -- exercises
+    # the wider MatMul/Gemm-only hop set and the self-consistent-then-
+    # revalidate check that tells this bias Add apart from an eligible
+    # residual-merge Add.
+    K, C, Out = 8, 16, 4
+    rng = np.random.default_rng(96)
+    w1 = rng.standard_normal((K, C)).astype(np.float32)
+    bias = rng.standard_normal((C,)).astype(np.float32)
+    ws = rng.standard_normal((K, C)).astype(np.float32)
+    wout = rng.standard_normal((C, Out)).astype(np.float32)
+    model = _model(
+        f"""
+        g (float[batch,{K}] X) => (float[batch,{Out}] Y)
+        {{
+          h = MatMul(X, W1)
+          hb = Add(h, Bias)
+          f = Relu(hb)
+          s = MatMul(X, WS)
+          addr = Add(f, s)
+          r = Relu(addr)
+          Y = MatMul(r, WOUT)
+        }}
+        """,
+        initializer=[
+            _f32(w1, "W1"),
+            _f32(bias, "Bias"),
+            _f32(ws, "WS"),
+            _f32(wout, "WOUT"),
+        ],
+    )
+
+    pruned = onnxsim.apply_structured_pruning_cpp(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    inits = {t.name: t for t in pruned.graph.initializer}
+    assert list(inits["Bias"].dims) == [C // 2]
+
+    importance = np.sqrt(
+        np.square(np.linalg.norm(w1.astype(np.float64), axis=0))
+        + np.square(np.linalg.norm(ws.astype(np.float64), axis=0))
+    )
+    keep = np.sort(np.argsort(-importance)[: C // 2])
+
+    rng_x = np.random.default_rng(97)
+    x = rng_x.standard_normal((5, K)).astype(np.float32)
+    (y,) = _run(pruned, {"X": x})
+    f = np.maximum(x @ w1[:, keep] + bias[keep], 0)
+    s = x @ ws[:, keep]
+    y_oracle = np.maximum(f + s, 0) @ wout[keep, :]
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-5, atol=1e-5)
+
+
+def test_cpp_structured_pruning_matmul_residual_add_transposed_gemm_producer_matches_oracle():
+    # One branch is a Gemm with transB=1 (weight stored [N, K]) rather than
+    # a plain MatMul's [K, N] -- a regression test for weight_transposed
+    # being carried correctly through the backward walk.
+    K, C, Out = 8, 16, 4
+    rng = np.random.default_rng(98)
+    w1t = rng.standard_normal((C, K)).astype(np.float32)  # [N, K] -- transB=1 layout
+    ws = rng.standard_normal((K, C)).astype(np.float32)
+    wout = rng.standard_normal((C, Out)).astype(np.float32)
+    model = _model(
+        f"""
+        g (float[batch,{K}] X) => (float[batch,{Out}] Y)
+        {{
+          f = Gemm<transB = 1>(X, W1T)
+          s = MatMul(X, WS)
+          addr = Add(f, s)
+          r = Relu(addr)
+          Y = MatMul(r, WOUT)
+        }}
+        """,
+        initializer=[_f32(w1t, "W1T"), _f32(ws, "WS"), _f32(wout, "WOUT")],
+    )
+
+    pruned = onnxsim.apply_structured_pruning_cpp(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    inits = {t.name: t for t in pruned.graph.initializer}
+    assert list(inits["W1T"].dims) == [C // 2, K]
+
+    importance = np.sqrt(
+        np.square(np.linalg.norm(w1t.astype(np.float64), axis=1))
+        + np.square(np.linalg.norm(ws.astype(np.float64), axis=0))
+    )
+    keep = np.sort(np.argsort(-importance)[: C // 2])
+
+    rng_x = np.random.default_rng(99)
+    x = rng_x.standard_normal((5, K)).astype(np.float32)
+    (y,) = _run(pruned, {"X": x})
+    f = x @ w1t[keep, :].T
+    s = x @ ws[:, keep]
+    y_oracle = np.maximum(f + s, 0) @ wout[keep, :]
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-5, atol=1e-5)
+
+
+def test_cpp_structured_pruning_matmul_residual_add_declines_on_gated_branch_with_no_projection():
+    # A gated (SwiGLU-style) combine feeding directly into a residual Add,
+    # with no output-projection MatMul between the Mul and the Add -- the
+    # backward walk has no principled way to pick "the" one branch through a
+    # Mul of two non-constant operands, so this falls straight through to
+    # "fail" and the whole group is declined.
+    K, C, Out = 8, 16, 4
+    rng = np.random.default_rng(100)
+    wg = rng.standard_normal((K, C)).astype(np.float32)
+    wu = rng.standard_normal((K, C)).astype(np.float32)
+    wp = rng.standard_normal((K, C)).astype(np.float32)
+    wout = rng.standard_normal((C, Out)).astype(np.float32)
+    model = _model(
+        f"""
+        g (float[batch,{K}] X) => (float[batch,{Out}] Y)
+        {{
+          gate = MatMul(X, WG)
+          gate_act = Sigmoid(gate)
+          up = MatMul(X, WU)
+          h = Mul(gate_act, up)
+          p = MatMul(X, WP)
+          addr = Add(p, h)
+          r = Relu(addr)
+          Y = MatMul(r, WOUT)
+        }}
+        """,
+        initializer=[
+            _f32(wg, "WG"),
+            _f32(wu, "WU"),
+            _f32(wp, "WP"),
+            _f32(wout, "WOUT"),
+        ],
+    )
+    pruned = onnxsim.apply_structured_pruning_cpp(model, sparsity=0.5)
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    np.testing.assert_array_equal(inits["WG"], wg)
+    np.testing.assert_array_equal(inits["WU"], wu)
+    np.testing.assert_array_equal(inits["WP"], wp)
+    np.testing.assert_array_equal(inits["WOUT"], wout)
+
+
+def test_cpp_structured_pruning_matmul_residual_add_declines_on_bare_gqa_shortcut():
+    # A residual branch whose backward walk would need to cross a fused
+    # self-attention op boundary to reach a real producer -- ctx (a
+    # GroupQueryAttention node's own raw output) feeds directly into the
+    # residual Add, with no output-projection MatMul in between. Neither
+    # GroupQueryAttention nor its Q/K/V MatMul producers can be reached
+    # through it.
+    K, H, D, Out = 8, 4, 4, 6
+    Nqkv = H * D
+    rng = np.random.default_rng(101)
+    wq = rng.standard_normal((K, Nqkv)).astype(np.float32)
+    wk = rng.standard_normal((K, Nqkv)).astype(np.float32)
+    wv = rng.standard_normal((K, Nqkv)).astype(np.float32)
+    wp = rng.standard_normal((K, Nqkv)).astype(np.float32)
+    wout = rng.standard_normal((Nqkv, Out)).astype(np.float32)
+    model = _model(
+        f"""
+        g (float[2,5,{K}] X) => (float[2,5,{Out}] Y)
+        {{
+          q = MatMul(X, Wq)
+          k = MatMul(X, Wk)
+          v = MatMul(X, Wv)
+          ctx, present_k, present_v = com.microsoft.GroupQueryAttention <num_heads={H}, kv_num_heads={H}> (q, k, v)
+          p = MatMul(X, Wp)
+          addr = Add(p, ctx)
+          r = Relu(addr)
+          Y = MatMul(r, Wout)
+        }}
+        """,
+        initializer=[
+            _f32(wq, "Wq"),
+            _f32(wk, "Wk"),
+            _f32(wv, "Wv"),
+            _f32(wp, "Wp"),
+            _f32(wout, "Wout"),
+        ],
+        opset=17,
+    )
+    model.opset_import.append(onnx.helper.make_opsetid("com.microsoft", 1))
+
+    pruned = onnxsim.apply_structured_pruning_cpp(model, sparsity=0.5)
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    np.testing.assert_array_equal(inits["Wq"], wq)
+    np.testing.assert_array_equal(inits["Wk"], wk)
+    np.testing.assert_array_equal(inits["Wv"], wv)
+    np.testing.assert_array_equal(inits["Wp"], wp)
+    np.testing.assert_array_equal(inits["Wout"], wout)
+
+
+# --- Fused SkipLayerNormalization residual merge: unsupported by this port,
+# must stay untouched ---------------------------------------------------
+
+
+def test_cpp_structured_pruning_skip_layer_norm_residual_is_left_untouched():
+    # com.microsoft::SkipLayerNormalization fuses a bare residual Add plus
+    # the following LayerNorm -- what onnxruntime's transformer optimizer
+    # produces at every residual connection of a fully-optimized
+    # transformer. This port does not (yet) recognize it as an eligible
+    # merge point (see structured_pruning_entry.cpp's own scope note), so a
+    # model whose only prunable residual structure takes this fused shape is
+    # left completely untouched.
+    K, C, Out = 8, 16, 4
+    rng = np.random.default_rng(102)
+    wf = rng.standard_normal((K, C)).astype(np.float32)
+    ws = rng.standard_normal((K, C)).astype(np.float32)
+    gamma = rng.standard_normal((C,)).astype(np.float32)
+    wout = rng.standard_normal((C, Out)).astype(np.float32)
+    model = _model(
+        f"""
+        g (float[batch,{K}] X) => (float[batch,{Out}] Y)
+        {{
+          f = MatMul(X, WF)
+          s = MatMul(X, WS)
+          normed = com.microsoft.SkipLayerNormalization <epsilon=1e-5> (f, s, Gamma)
+          Y = MatMul(normed, WOUT)
+        }}
+        """,
+        initializer=[
+            _f32(wf, "WF"),
+            _f32(ws, "WS"),
+            _f32(gamma, "Gamma"),
+            _f32(wout, "WOUT"),
+        ],
+        opset=17,
+    )
+    model.opset_import.append(onnx.helper.make_opsetid("com.microsoft", 1))
+
+    pruned = onnxsim.apply_structured_pruning_cpp(model, sparsity=0.5)
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    np.testing.assert_array_equal(inits["WF"], wf)
+    np.testing.assert_array_equal(inits["WS"], ws)
+    np.testing.assert_array_equal(inits["WOUT"], wout)
 
 
 # --- Cross-check against the pure-Python reference --------------------------

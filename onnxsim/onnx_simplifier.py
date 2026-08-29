@@ -1104,14 +1104,27 @@ def apply_structured_pruning_cpp(
     its ``group`` channel blocks independently. The gated-FFN SwiGLU/GeGLU
     pattern is matched too -- two producers combined by a ``Mul`` (or ONNX
     opset-28+'s native ``SwiGLU`` node) feeding one consumer, both pruned to
-    the same combined-importance-ranked channel indices.
+    the same combined-importance-ranked channel indices. A Conv or
+    MatMul/Gemm residual (skip-connection) chain is matched too -- a
+    channel-preserving ``Add(a, b)`` where both operands are non-constant
+    forces whichever real producer(s) feed ``a``/``b`` to agree on one
+    shared channel-index set, resolved via a backward walk plus union-find
+    grouping across such merge points that also covers a whole chain of
+    such merges transitively sharing one spine channel count (a lone
+    residual connection, or a linear stack of ``Add``-only merges; an
+    *interior* block of a real deep ResNet/transformer stage is left
+    completely untouched, the same "no branch-following" boundary every
+    other chain kind here already holds).
 
     Unlike the pure-Python :func:`onnxsim.apply_structured_pruning`, this
-    port does not (yet) include the Conv/MatMul residual-connection
-    (skip-connection) chain support -- a model whose only prunable structure
-    is one of those unported shapes is left completely untouched by this
-    port; :func:`onnxsim.apply_structured_pruning` remains the full-featured
-    reference.
+    port does not (yet) recognize a fused
+    ``com.microsoft::SkipLayerNormalization``/``SkipSimplifiedLayerNormalization``
+    node -- what onnxruntime's transformer optimizer collapses a bare
+    residual ``Add`` plus the following LayerNorm into -- as an eligible
+    merge point; a model whose residual connections have already been fused
+    that way is left untouched by this port's MatMul residual finder --
+    :func:`onnxsim.apply_structured_pruning` remains the full-featured
+    reference for that case.
 
     This is a single, self-contained graph rewrite: unlike :func:`simplify`,
     it does not run shape inference, constant folding, or any other pass.
@@ -1123,8 +1136,8 @@ def apply_structured_pruning_cpp(
     :returns: ``model`` with every matched chain's tensors resized in place;
             anything not matching the exact topology above (branching, a
             non-constant bias, a consumer whose reduction dimension doesn't
-            line up, a gated or residual chain, ...) is left completely
-            untouched
+            line up, a fused-SkipLayerNormalization residual, ...) is left
+            completely untouched
     """
     if isinstance(model, str):
         model = onnx.load(model, load_external_data=False)
