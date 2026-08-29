@@ -53,8 +53,12 @@ def _f32(array, name):
 
 
 def _moe_weights(rng, num_experts, hidden_size, inter_size):
-    fc1 = _f32(rng.standard_normal((num_experts, inter_size, hidden_size)) * 0.1, "fc1_w")
-    fc2 = _f32(rng.standard_normal((num_experts, hidden_size, inter_size)) * 0.1, "fc2_w")
+    fc1 = _f32(
+        rng.standard_normal((num_experts, inter_size, hidden_size)) * 0.1, "fc1_w"
+    )
+    fc2 = _f32(
+        rng.standard_normal((num_experts, hidden_size, inter_size)) * 0.1, "fc2_w"
+    )
     return [fc1, fc2]
 
 
