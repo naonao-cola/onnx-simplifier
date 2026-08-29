@@ -543,6 +543,15 @@ if (ONNXSIM_TESTS)
   onnxsim_add_ort_rpath(precision_estimator_test)
   add_test(NAME precision_estimator_test COMMAND precision_estimator_test)
 
+  # contrib_schemas.cpp's MoE/QMoE registration needs onnx's schema
+  # registry and function-building API, like precision_estimator_test
+  # above -- links the fully-configured `onnxsim` target rather than
+  # building standalone.
+  add_executable(contrib_schemas_moe_test onnxsim/contrib_schemas_moe_test.cpp)
+  target_link_libraries(contrib_schemas_moe_test onnxsim)
+  onnxsim_add_ort_rpath(contrib_schemas_moe_test)
+  add_test(NAME contrib_schemas_moe_test COMMAND contrib_schemas_moe_test)
+
   # The ONNX<->GGML dtype mapping (gguf_dtype.h), mirroring
   # tensor_pool_dtype_test.cpp above for the same reason.
   add_executable(gguf_dtype_test onnxsim/gguf_dtype_test.cpp)

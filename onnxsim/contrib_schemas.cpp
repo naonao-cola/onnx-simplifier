@@ -4,12 +4,15 @@
 
 #include "contrib_schemas.h"
 
+#include <cstdint>
 #include <mutex>
+#include <sstream>
 #include <string>
 #include <unordered_set>
 #include <vector>
 
 #include "onnx/defs/data_propagators.h"
+#include "onnx/defs/function.h"
 #include "onnx/defs/math/utils.h"
 #include "onnx/defs/schema.h"
 #include "onnx/defs/shape_inference.h"
@@ -21,6 +24,9 @@ namespace {
 constexpr const char* kMSDomain = "com.microsoft";
 
 using onnx::DataPropagationContext;
+using onnx::FunctionBodyBuildContext;
+using onnx::FunctionBuilder;
+using onnx::FunctionProto;
 using onnx::InferenceContext;
 using onnx::OpSchema;
 
@@ -861,6 +867,466 @@ OpSchema MakeMatMulNBitsSchema() {
       .TypeConstraint("T4", {"tensor(int32)"}, "Constrain g_idx to int32.");
 }
 
+// Appends one expert's FFN block (Gemm -> activation -> Gemm, weighted by
+// that expert's dense gate column and accumulated into `acc_prev`) to
+// `text`. `expert` is baked in as a literal index -- the loop that calls
+// this once per expert, in BuildMoEFunctionBody below, is what actually
+// unrolls the op; nothing here is a runtime/ONNX-level loop.
+void AppendMoEExpertBlock(std::ostringstream& text, int64_t expert,
+                          const std::string& acc_prev, bool has_fc1_bias,
+                          bool has_fc2_bias, const std::string& activation) {
+  const std::string e = std::to_string(expert);
+  const std::string e1 = std::to_string(expert + 1);
+  text << "W1Idx" << e << " = Constant <value_ints: ints = [" << e << "]> ()\n"
+       << "W1_3d" << e << " = Gather <axis = 0> (fc1_experts_weights, W1Idx"
+       << e << ")\n"
+       << "W1_" << e << " = Squeeze (W1_3d" << e << ", SqueezeAxis)\n"
+       << "W2Idx" << e << " = Constant <value_ints: ints = [" << e << "]> ()\n"
+       << "W2_3d" << e << " = Gather <axis = 0> (fc2_experts_weights, W2Idx"
+       << e << ")\n"
+       << "W2_" << e << " = Squeeze (W2_3d" << e << ", SqueezeAxis)\n";
+  if (has_fc1_bias) {
+    text << "B1_2d" << e << " = Gather <axis = 0> (fc1_experts_bias, W1Idx"
+         << e << ")\n"
+         << "B1_" << e << " = Squeeze (B1_2d" << e << ", SqueezeAxis)\n"
+         << "H1_" << e << " = Gemm <transB = 1> (FlatInput, W1_" << e
+         << ", B1_" << e << ")\n";
+  } else {
+    text << "H1_" << e << " = Gemm <transB = 1> (FlatInput, W1_" << e
+         << ")\n";
+  }
+  if (activation == "relu") {
+    text << "A1_" << e << " = Relu (H1_" << e << ")\n";
+  } else if (activation == "identity") {
+    text << "A1_" << e << " = Identity (H1_" << e << ")\n";
+  } else if (activation == "silu") {
+    text << "Sig_" << e << " = Sigmoid (H1_" << e << ")\n"
+         << "A1_" << e << " = Mul (H1_" << e << ", Sig_" << e << ")\n";
+  } else {
+    // "gelu" (exact, erf-based -- the same decomposition ONNX's own Gelu
+    // op uses for its default (non-"tanh") approximate mode).
+    text << "Half_" << e << " = Constant <value = float {0.5}> ()\n"
+         << "HalfCast_" << e << " = CastLike (Half_" << e << ", H1_" << e
+         << ")\n"
+         << "One_" << e << " = Constant <value = float {1.0}> ()\n"
+         << "OneCast_" << e << " = CastLike (One_" << e << ", H1_" << e
+         << ")\n"
+         << "Two_" << e << " = Constant <value = float {2.0}> ()\n"
+         << "TwoCast_" << e << " = CastLike (Two_" << e << ", H1_" << e
+         << ")\n"
+         << "SqrtTwo_" << e << " = Sqrt (TwoCast_" << e << ")\n"
+         << "XSqrt_" << e << " = Div (H1_" << e << ", SqrtTwo_" << e << ")\n"
+         << "ErfXSqrt_" << e << " = Erf (XSqrt_" << e << ")\n"
+         << "Phi_" << e << " = Sum (OneCast_" << e << ", ErfXSqrt_" << e
+         << ")\n"
+         << "MultX_" << e << " = Mul (HalfCast_" << e << ", H1_" << e
+         << ")\n"
+         << "A1_" << e << " = Mul (MultX_" << e << ", Phi_" << e << ")\n";
+  }
+  if (has_fc2_bias) {
+    text << "B2_2d" << e << " = Gather <axis = 0> (fc2_experts_bias, W1Idx"
+         << e << ")\n"
+         << "B2_" << e << " = Squeeze (B2_2d" << e << ", SqueezeAxis)\n"
+         << "Out_" << e << " = Gemm <transB = 1> (A1_" << e << ", W2_" << e
+         << ", B2_" << e << ")\n";
+  } else {
+    text << "Out_" << e << " = Gemm <transB = 1> (A1_" << e << ", W2_" << e
+         << ")\n";
+  }
+  text << "GEnd" << e << " = Constant <value_ints: ints = [" << e1
+       << "]> ()\n"
+       << "GateCol" << e
+       << " = Slice (Gates, W1Idx" << e << ", GEnd" << e << ", GAxis)\n"
+       << "Weighted" << e << " = Mul (Out_" << e << ", GateCol" << e
+       << ")\n"
+       << "Acc" << e1 << " = Add (" << acc_prev << ", Weighted" << e
+       << ")\n";
+}
+
+// Context-dependent function body for MoE: builds a "dense" (compute-every-
+// expert, mask-with-a-mostly-zero-gate) decomposition into standard ONNX
+// ops, unrolled once per expert. Declines (returns false, leaving the node
+// opaque but still shape-inferable via the TypeAndShapeInferenceFunction
+// above) whenever the real op's behavior isn't expressible this way:
+//
+//  - swiglu (needs the fused/two-GEMM gated-linear paths and an fc3 input
+//    this decomposition doesn't implement) or a use_sparse_mixer-normalized
+//    router (a different, non-plain-softmax combination rule) -- both
+//    change *which* ops the body would need, not just which literal values
+//    it plugs in.
+//  - num_experts unknown statically. This is the fundamental constraint
+//    discussed for GroupedMatMul-style ops in onnx/onnx#7902: an ONNX
+//    function body is a fixed node list, so "run this block once per
+//    expert" can only be realized by literally emitting that many copies
+//    of the block at function-*build* time -- which requires knowing the
+//    expert count up front, from fc1_experts_weights' shape. It cannot be
+//    left as a runtime-resolved ONNX Loop trip count the way an ordinary
+//    attribute-driven value could be (see the range(NUM_EXPERTS + 1)
+//    experiment: a Loop body's node count never depends on the trip
+//    count, but here the *nodes themselves* -- which weight slice to
+//    gather -- must differ per expert).
+//
+// The generated body is capped at kMaxUnrolledExperts to keep a pathological
+// (very large, statically-shaped) expert count from producing an
+// unreasonably large function body.
+bool BuildMoEFunctionBody(const FunctionBodyBuildContext& ctx,
+                          const OpSchema& schema,
+                          FunctionProto& function_proto) {
+  constexpr int64_t kMaxUnrolledExperts = 512;
+
+  const auto* activation_attr = ctx.getAttribute("activation_type");
+  std::string activation =
+      activation_attr != nullptr && activation_attr->has_s()
+          ? activation_attr->s()
+          : "relu";
+  if (activation != "relu" && activation != "identity" &&
+      activation != "silu" && activation != "gelu") {
+    return false;  // swiglu, or an unrecognized value.
+  }
+
+  const auto* sparse_mixer_attr = ctx.getAttribute("use_sparse_mixer");
+  if (sparse_mixer_attr != nullptr && sparse_mixer_attr->has_i() &&
+      sparse_mixer_attr->i() != 0) {
+    return false;
+  }
+  const auto* swiglu_fusion_attr = ctx.getAttribute("swiglu_fusion");
+  if (swiglu_fusion_attr != nullptr && swiglu_fusion_attr->has_i() &&
+      swiglu_fusion_attr->i() != 0) {
+    return false;
+  }
+  if (ctx.hasInput(6)) {
+    return false;  // fc3_experts_weights: only meaningful for swiglu.
+  }
+
+  const auto* k_attr = ctx.getAttribute("k");
+  if (k_attr == nullptr || !k_attr->has_i() || k_attr->i() <= 0) {
+    return false;
+  }
+  const int64_t k = k_attr->i();
+  const auto* normalize_attr = ctx.getAttribute("normalize_routing_weights");
+  const bool normalize = normalize_attr != nullptr &&
+                          normalize_attr->has_i() && normalize_attr->i() != 0;
+
+  // num_experts and hidden_size both have to be statically known: they are
+  // dims of fc1_experts_weights (input 2), not attributes, so unlike k or
+  // normalize_routing_weights above they can't be read once and compiled
+  // into a choice of which lines to emit -- num_experts *is* how many
+  // times AppendMoEExpertBlock gets called, and hidden_size is baked into
+  // the literal reshape this body uses to flatten a 3D (batch, seq,
+  // hidden) input to 2D before the per-expert Gemms.
+  const auto* fc1_w_type = ctx.getInputType(2);
+  if (fc1_w_type == nullptr || !fc1_w_type->has_tensor_type() ||
+      !fc1_w_type->tensor_type().has_shape()) {
+    return false;
+  }
+  const auto& fc1_w_shape = fc1_w_type->tensor_type().shape();
+  if (fc1_w_shape.dim_size() != 3 || !fc1_w_shape.dim(0).has_dim_value() ||
+      !fc1_w_shape.dim(2).has_dim_value()) {
+    return false;
+  }
+  const int64_t num_experts = fc1_w_shape.dim(0).dim_value();
+  const int64_t hidden_size = fc1_w_shape.dim(2).dim_value();
+  if (num_experts <= 0 || hidden_size <= 0 || k > num_experts ||
+      num_experts > kMaxUnrolledExperts) {
+    return false;
+  }
+
+  const bool has_fc1_bias = ctx.hasInput(3);
+  const bool has_fc2_bias = ctx.hasInput(5);
+
+  std::ostringstream text;
+  text << "FlatShape = Constant <value_ints: ints = [-1, " << hidden_size
+       << "]> ()\n"
+       << "FlatInput = Reshape (input, FlatShape)\n"
+       << "InputShape = Shape (input)\n"
+       // `router_probs` is raw per-expert routing *logits*, not an
+       // already-normalized distribution, despite its name -- confirmed
+       // against ONNX Runtime's own CPU MoE kernel (its output only
+       // matches a plain softmax-over-router_probs reference; feeding it
+       // through unchanged is off by a per-row-constant factor, i.e. the
+       // wrong gate scalar, while everything else -- expert selection,
+       // per-expert Gemm/activation, bias placement -- already matched
+       // exactly). Softmax is unconditional, independent of
+       // normalize_routing_weights (which instead controls whether the
+       // *selected* top-k weights are renormalized to sum to 1 below).
+       << "Probs = Softmax <axis = -1> (router_probs)\n"
+       << "TopKConst = Constant <value_ints: ints = [" << k << "]> ()\n"
+       << "TopVals, TopIdx = TopK <axis = -1, largest = 1> (Probs, "
+          "TopKConst)\n";
+  if (normalize) {
+    // ReduceSum's `axes` moved from an attribute to an (optional) input at
+    // opset 13; this function body targets opset 18, so it must use the
+    // input form.
+    text << "ReduceAxes = Constant <value_ints: ints = [-1]> ()\n"
+         << "Denom = ReduceSum <keepdims = 1> (TopVals, ReduceAxes)\n"
+         << "TopValsNorm = Div (TopVals, Denom)\n";
+  } else {
+    text << "TopValsNorm = Identity (TopVals)\n";
+  }
+  text << "ZeroT = Constant <value = float {0.0}> ()\n"
+       << "ZeroCast = CastLike (ZeroT, input)\n"
+       << "GateZeros = Mul (Probs, ZeroCast)\n"
+       << "Gates = ScatterElements <axis = -1> (GateZeros, TopIdx, "
+          "TopValsNorm)\n"
+       << "GAxis = Constant <value_ints: ints = [1]> ()\n"
+       // Squeeze's `axes` likewise moved from an attribute to an
+       // (optional) input at opset 13; shared by every per-expert Gather
+       // -> Squeeze in AppendMoEExpertBlock below (they all drop the
+       // same, single leading expert-index axis).
+       << "SqueezeAxis = Constant <value_ints: ints = [0]> ()\n"
+       << "Acc0 = Mul (FlatInput, ZeroCast)\n";
+
+  for (int64_t e = 0; e < num_experts; ++e) {
+    AppendMoEExpertBlock(text, e, "Acc" + std::to_string(e), has_fc1_bias,
+                        has_fc2_bias, activation);
+  }
+  text << "FlatOutput = Identity (Acc" << num_experts << ")\n"
+       << "output = Reshape (FlatOutput, InputShape)\n";
+
+  FunctionBuilder builder(function_proto);
+  // Every op the generated text below uses (Softmax, TopK, Gemm, Relu,
+  // Sigmoid, Erf, Sqrt, Div, Sum, Mul, Add, Reshape, Shape, Gather,
+  // Squeeze, Slice, ScatterElements, CastLike, Constant, Identity) has
+  // been available, with the signature used here, since opset 18 --
+  // schema.BuildFunction() below fills in the function's own
+  // (com.microsoft) opset_import entry, but not this one, so it has to be
+  // added explicitly or the function is left referencing an undeclared
+  // "" domain.
+  builder.AddOpset("", 18);
+  builder.Add(text.str().c_str());
+  schema.BuildFunction(function_proto);
+  return true;
+}
+
+// Real ONNX Runtime Mixture-of-Experts op (docs/ContribOperators.md,
+// onnxruntime/core/graph/contrib_ops/contrib_defs.cc). Despite its name,
+// `router_probs` is raw per-expert routing *logits*, not an
+// already-normalized distribution (confirmed empirically against ONNX
+// Runtime's own CPU kernel -- see BuildMoEFunctionBody's Softmax step
+// below); the op applies Softmax over it, then does top-k expert
+// selection, the per-expert two-layer FFN, and the weighted combine. So,
+// unlike Attention/QAttention above, MoE's *reference* semantics are
+// expressible as a plain composition of standard ONNX ops: Softmax
+// normalizes the routing logits, TopK selects the k highest-probability
+// experts per token, ScatterElements turns that into a dense (mostly-zero)
+// per-token gate row, and each expert's FFN is then computed for every
+// token and masked
+// by its gate value before being summed. This computes E/k times more
+// FLOPs than a real sparse-dispatch kernel (it evaluates every expert for
+// every token instead of only the ones it was routed to), but is
+// numerically identical and, unlike the sparse form, has no data-dependent
+// intermediate shapes -- see BuildMoEFunctionBody below for why that's
+// exactly the property a function body needs.
+OpSchema MakeMoESchema() {
+  return OpSchema()
+      .SetName("MoE")
+      .SetDomain(kMSDomain)
+      .SinceVersion(1)
+      .SetDoc(
+          "Mixture of experts. router_probs holds per-token, per-expert "
+          "routing logits (a Softmax is applied internally, despite the "
+          "name); this op selects the top-k experts per token by the "
+          "resulting probability, runs each selected expert's two-layer "
+          "FFN, and combines the results weighted by the (optionally "
+          "renormalized) routing probabilities of the selected experts.")
+      .Attr("activation_type",
+            "Activation function to use. Choose from relu, gelu, silu, "
+            "swiglu and identity. Default is relu",
+            onnx::AttributeProto::STRING, std::string("relu"))
+      .Attr("k", "Number of top experts to select from expert pool.",
+            onnx::AttributeProto::INT, /*required=*/true)
+      .Attr("normalize_routing_weights",
+            "Whether to normalize routing weights.",
+            onnx::AttributeProto::INT, static_cast<int64_t>(0))
+      .Attr("use_sparse_mixer", "Whether to use sparse mixer.",
+            onnx::AttributeProto::INT, static_cast<int64_t>(0))
+      .Attr("swiglu_fusion",
+            "0: not fused, 1: fused and interleaved, 2: fused and not "
+            "interleaved.",
+            onnx::AttributeProto::INT, static_cast<int64_t>(0))
+      .Attr("swiglu_limit",
+            "The limit used to clamp in SwiGLU. No clamp when limit is not "
+            "provided.",
+            onnx::AttributeProto::FLOAT, /*required=*/false)
+      .Attr("activation_alpha", "Alpha parameter used in activation function.",
+            onnx::AttributeProto::FLOAT, /*required=*/false)
+      .Attr("activation_beta", "Beta parameter used in activation function.",
+            onnx::AttributeProto::FLOAT, /*required=*/false)
+      .Input(0, "input",
+             "2D input tensor with shape (num_tokens, hidden_size) or 3D "
+             "input tensor with shape (batch_size, sequence_length, "
+             "hidden_size).",
+             "T")
+      .Input(1, "router_probs",
+             "2D input tensor with shape (num_tokens, num_experts). Despite "
+             "the name, these are raw routing logits -- a Softmax is "
+             "applied internally before top-k expert selection.",
+             "T")
+      .Input(2, "fc1_experts_weights",
+             "3D input tensor with shape (num_experts, fusion_size * "
+             "inter_size, hidden_size), where fusion_size is 2 for fused "
+             "swiglu, and 1 otherwise.",
+             "T")
+      .Input(3, "fc1_experts_bias",
+             "2D optional input tensor with shape (num_experts, "
+             "fusion_size * inter_size).",
+             "T", OpSchema::Optional)
+      .Input(4, "fc2_experts_weights",
+             "3D input tensor with shape (num_experts, hidden_size, "
+             "inter_size).",
+             "T")
+      .Input(5, "fc2_experts_bias",
+             "2D optional input tensor with shape (num_experts, "
+             "hidden_size).",
+             "T", OpSchema::Optional)
+      .Input(6, "fc3_experts_weights",
+             "3D optional input tensor with shape (num_experts, inter_size, "
+             "hidden_size).",
+             "T", OpSchema::Optional)
+      .Input(7, "fc3_experts_bias",
+             "2D optional input tensor with shape (num_experts, "
+             "inter_size).",
+             "T", OpSchema::Optional)
+      .Output(0, "output",
+              "2D output tensor with shape (num_tokens, hidden_size) or 3D "
+              "output tensor with shape (batch_size, sequence_length, "
+              "hidden_size).",
+              "T")
+      .TypeConstraint("T",
+                      {"tensor(float)", "tensor(float16)", "tensor(bfloat16)"},
+                      "Constrain input and output types to float tensors.")
+      .TypeAndShapeInferenceFunction(onnx::propagateShapeAndTypeFromFirstInput)
+      .SetContextDependentFunctionBodyBuilder(
+          [](const FunctionBodyBuildContext& ctx, const OpSchema& schema,
+             FunctionProto& function_proto) {
+            return BuildMoEFunctionBody(ctx, schema, function_proto);
+          });
+}
+
+// ONNX Runtime's quantized counterpart of MoE, above. QMoE's weights are
+// packed/quantized (int2/int4/int8, or one of several block-scaled FP4/FP8
+// layouts selected by `quant_type`) and its inputs consequently balloon to
+// up to 21 tensors (per-fc scales, zero points, global scales, activation
+// scales/block-scales for the FP8-activation modes, an optional
+// `router_weights` for DeepSeek-style select/aggregate-with-different-
+// tensors routing, ...). Registered here for shape/type-inference
+// completeness only, matching Attention/QAttention/MatMulNBits above --
+// unlike MoE, dequantizing each of those layouts correctly is out of scope
+// for a reference decomposition, so no function body is attached; a QMoE
+// node stays an opaque (but now shape-inferable) op as far as onnxsim's own
+// pipeline is concerned.
+OpSchema MakeQMoESchema() {
+  OpSchema schema;
+  schema.SetName("QMoE")
+      .SetDomain(kMSDomain)
+      .SinceVersion(1)
+      .SetDoc(
+          "Quantized mixture of experts (MoE). Weights are quantized "
+          "per-expert; see ONNX Runtime's docs/ContribOperators.md for the "
+          "full set of supported quantization layouts.")
+      .Attr("activation_type",
+            "Activation function to use. Choose from relu, gelu, silu, "
+            "swiglu and identity. Default is relu",
+            onnx::AttributeProto::STRING, std::string("relu"))
+      .Attr("k", "Number of top experts to select from expert pool.",
+            onnx::AttributeProto::INT, /*required=*/true)
+      .Attr("normalize_routing_weights",
+            "Whether to normalize routing weights.",
+            onnx::AttributeProto::INT, static_cast<int64_t>(0))
+      .Attr("use_sparse_mixer", "Whether to use sparse mixer.",
+            onnx::AttributeProto::INT, static_cast<int64_t>(0))
+      .Attr("swiglu_fusion",
+            "0: not fused, 1: fused and interleaved, 2: fused and not "
+            "interleaved.",
+            onnx::AttributeProto::INT, static_cast<int64_t>(0))
+      .Attr("swiglu_limit",
+            "The limit used to clamp inputs in SwiGLU. It is infinite when "
+            "limit is not provided.",
+            onnx::AttributeProto::FLOAT, /*required=*/false)
+      .Attr("expert_weight_bits",
+            "Number of bits used in quantized weights. Supported values "
+            "are 2, 4, and 8. Default is 4 bits.",
+            onnx::AttributeProto::INT, static_cast<int64_t>(4))
+      .Attr("block_size",
+            "Size of each quantization block along the K (input feature) "
+            "dimension.",
+            onnx::AttributeProto::INT, /*required=*/false)
+      .Attr("quant_type",
+            "Quantization type: 'int' (default), 'fp4', 'nvfp4', 'fp8', or "
+            "'wfp4afp8'.",
+            onnx::AttributeProto::STRING, std::string("int"))
+      .Attr("weights_prepacked",
+            "Tri-state control over the layout of the int4/int8 fc1/fc2 "
+            "weight initializers. Defaults to -1.",
+            onnx::AttributeProto::INT, static_cast<int64_t>(-1))
+      .Input(0, "input",
+             "2D tensor with shape (num_tokens, hidden_size), or 3D tensor "
+             "with shape (batch_size, sequence_length, hidden_size).",
+             "T")
+      .Input(1, "router_probs",
+             "2D tensor with shape (num_tokens, num_experts).", "T")
+      .Input(2, "fc1_experts_weights",
+             "3D packed/quantized tensor of FC1 expert weights.", "T1")
+      .Input(3, "fc1_scales", "Optional FC1 weight scales.", "T2",
+             OpSchema::Optional)
+      .Input(4, "fc1_experts_bias", "2D optional FC1 expert bias.", "T",
+             OpSchema::Optional)
+      .Input(5, "fc2_experts_weights",
+             "3D packed/quantized tensor of FC2 expert weights.", "T1")
+      .Input(6, "fc2_scales", "Optional FC2 weight scales.", "T2",
+             OpSchema::Optional)
+      .Input(7, "fc2_experts_bias", "2D optional FC2 expert bias.", "T",
+             OpSchema::Optional)
+      .Input(8, "fc3_experts_weights",
+             "3D optional packed/quantized tensor of FC3 expert weights.",
+             "T1", OpSchema::Optional)
+      .Input(9, "fc3_scales", "Optional FC3 weight scales.", "T2",
+             OpSchema::Optional)
+      .Input(10, "fc3_experts_bias", "2D optional FC3 expert bias.", "T",
+             OpSchema::Optional)
+      .Input(11, "fc1_zero_points", "Optional FC1 quantization zero points.",
+             "T1", OpSchema::Optional)
+      .Input(12, "fc2_zero_points", "Optional FC2 quantization zero points.",
+             "T1", OpSchema::Optional)
+      .Input(13, "fc3_zero_points", "Optional FC3 quantization zero points.",
+             "T1", OpSchema::Optional)
+      .Input(14, "router_weights",
+             "2D optional tensor with shape (num_tokens, num_experts), used "
+             "for DeepSeek-style select/aggregate-with-different-tensors "
+             "routing.",
+             "T", OpSchema::Optional)
+      .Input(15, "fc1_global_scale", "Optional per-expert FC1 global scale.",
+             "T4", OpSchema::Optional)
+      .Input(16, "fc2_global_scale", "Optional per-expert FC2 global scale.",
+             "T4", OpSchema::Optional)
+      .Input(17, "fc1_act_scale", "Optional FC1 FP8 activation scale.", "T4",
+             OpSchema::Optional)
+      .Input(18, "fc2_act_scale", "Optional FC2 FP8 activation scale.", "T4",
+             OpSchema::Optional)
+      .Input(19, "fc1_act_block_scale",
+             "Optional FC1 MXFP activation block-scale tensor.", "T2",
+             OpSchema::Optional)
+      .Input(20, "fc2_act_block_scale",
+             "Optional FC2 MXFP activation block-scale tensor.", "T2",
+             OpSchema::Optional)
+      .Output(0, "output", "Output tensor with the same shape as input.",
+              "T")
+      .TypeConstraint("T",
+                      {"tensor(float)", "tensor(float16)", "tensor(bfloat16)"},
+                      "Constrain input and output types to float tensors.")
+      .TypeConstraint("T1", {"tensor(uint8)", "tensor(float8e4m3fn)"},
+                      "Constrain quantized weight types.")
+      .TypeConstraint("T2",
+                      {"tensor(float)", "tensor(float16)", "tensor(bfloat16)",
+                       "tensor(float8e8m0)", "tensor(float8e4m3fn)"},
+                      "Constrain scale types.")
+      .TypeConstraint("T4", {"tensor(float)"},
+                      "Constrain FP4 global scale type to float32 tensors.")
+      .TypeAndShapeInferenceFunction(
+          onnx::propagateShapeAndTypeFromFirstInput);
+  return schema;
+}
+
 void RegisterAll() {
   // The custom domain must be known to the schema registry before any schema
   // in it can be registered.
@@ -886,6 +1352,8 @@ void RegisterAll() {
   RegisterIfAbsent(MakeAttentionSchema());
   RegisterIfAbsent(MakeQAttentionSchema());
   RegisterIfAbsent(MakeMatMulNBitsSchema());
+  RegisterIfAbsent(MakeMoESchema());
+  RegisterIfAbsent(MakeQMoESchema());
 
   // Augment the standard Reshape schema with a data-propagation function so
   // shape tensors can flow through a Reshape during partial shape evaluation.

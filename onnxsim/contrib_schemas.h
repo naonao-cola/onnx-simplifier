@@ -7,8 +7,8 @@
 namespace onnxsim {
 
 // Import operator schemas for a set of ONNX Runtime "com.microsoft" contrib
-// operators (QLinearAdd and related quantized/QNN ops) into the ONNX operator
-// schema registry.
+// operators (QLinearAdd and related quantized/QNN ops, Attention/QAttention,
+// MatMulNBits, MoE/QMoE) into the ONNX operator schema registry.
 //
 // ONNX's own shape inference only knows about operators that have a schema
 // registered in the ONNX registry. Quantized models produced by ONNX Runtime
