@@ -52,7 +52,11 @@ def test_a_model_not_need_simplification():
     net = ModelNotNeedSimplification()
     dummy_input = torch.randn(2, 3, 4, 5)
     sim_model = export_simplify_and_check_by_python_api(net, dummy_input)
-    assert len(sim_model.graph.node) == 1
+    # The exporter emits the literal `1` as a Constant node; onnxsim now leaves
+    # a genuine Constant node as-is rather than baking it into an initializer
+    # (only a fold's *result* gets that treatment), so it survives alongside
+    # the (unfoldable, `x` being a real input) Add.
+    assert len(sim_model.graph.node) == 2
 
 
 def test_exprimental_simplify_subgraph():
@@ -75,9 +79,14 @@ def test_exprimental_simplify_subgraph():
     sim_model = export_simplify_and_check_by_python_api(
         net, dummy_input, simplify_kwargs={"include_subgraph": True}
     )
-    assert len(sim_model.graph.node) == 3
-    assert len(sim_model.graph.node[2].attribute[0].g.node) == 2
-    assert len(sim_model.graph.node[2].attribute[1].g.node) == 1
+    # The exporter's literal constants (the `1.0` comparison threshold, and the
+    # `3`s / `4` added to `x`) are each a genuine Constant node; onnxsim leaves
+    # them as-is rather than baking them into initializers, so they now show up
+    # as their own nodes (one at the top level, two in then_branch, one in
+    # else_branch) alongside the previously-counted ops.
+    assert len(sim_model.graph.node) == 4
+    assert len(sim_model.graph.node[3].attribute[0].g.node) == 4
+    assert len(sim_model.graph.node[3].attribute[1].g.node) == 2
 
 
 def test_dynamic_batch_size():
@@ -99,7 +108,9 @@ def test_dynamic_batch_size():
         },
         simplify_kwargs={"test_input_shapes": {"input": [2, 3, 4, 5]}},
     )
-    assert len(sim_model.graph.node) == 1
+    # The exporter emits the literal `2` as a Constant node, which onnxsim now
+    # leaves as-is (see test_a_model_not_need_simplification).
+    assert len(sim_model.graph.node) == 2
 
 
 def test_dynamic_axes_preserve_dynamic_dimension():
@@ -241,7 +252,11 @@ def test_unused_output():
         },
         simplify_kwargs={"unused_output": ["output1", "output2"]},
     )
-    assert len(sim_model.graph.node) == 4
+    # The exporter emits one shared Constant node for the literal `2` reused by
+    # all four ops; onnxsim now leaves it as-is (see
+    # test_a_model_not_need_simplification) instead of baking it into an
+    # initializer, so it survives alongside them.
+    assert len(sim_model.graph.node) == 5
 
 
 def test_remove_unused_initializer():
@@ -2112,16 +2127,59 @@ def test_initializers_as_constants_default_folds_initializer():
 
 def test_initializers_as_non_constants_keeps_initializer_node():
     # Treating initializers as non-constant leaves the Mul on the initializer in
-    # the graph; only the Constant node (K) is still folded.
+    # the graph; K is a Constant node already, so folding leaves it untouched.
     model = _mul_init_by_const_model()
     sim_model, ok = onnxsim.simplify(model, initializers_as_constants=False)
     assert ok
     op_types = [n.op_type for n in sim_model.graph.node]
     assert "Mul" in op_types
     assert "Add" in op_types
-    # W stays an initializer, and K has been folded into one too.
+    # W stays an initializer.
     init_names = {i.name for i in sim_model.graph.initializer}
     assert "W" in init_names
+
+
+def test_fold_not_purely_from_initializer_becomes_constant_node():
+    # W * K -- W an initializer, K a Constant node -- is still folded away (both
+    # are constant), but since the fold consumed a Constant node's value rather
+    # than tracing back purely to graph initializers, the result must itself be
+    # materialized as a Constant node rather than baked into a plain
+    # initializer, so a value the graph actually computed stays visually
+    # distinct from literal weight data.
+    model = _mul_init_by_const_model()
+    sim_model, ok = onnxsim.simplify(model)
+    assert ok
+    init_names = {i.name for i in sim_model.graph.initializer}
+    assert "M" not in init_names
+    (m_node,) = [n for n in sim_model.graph.node if "M" in n.output]
+    assert m_node.op_type == "Constant"
+    value = onnx.numpy_helper.to_array(m_node.attribute[0].t)
+    np.testing.assert_array_equal(value, np.array([[2.0, 4.0, 6.0]], dtype=np.float32))
+
+
+def test_fold_purely_from_initializer_stays_initializer():
+    # A * B, where A and B are both plain initializers, is a fold rooted purely
+    # in initializer data (no Constant node anywhere upstream), so it must still
+    # collapse into a plain initializer, exactly as before this behavior was
+    # made to depend on provenance.
+    model = parser.parse_model(
+        """
+        <
+          ir_version: 10,
+          opset_import: ["": 14]
+        >
+        test_fold_purely_from_initializer_stays_initializer () => (float[3] y)
+        <float[3] A = {1.0, 2.0, 3.0}, float[3] B = {4.0, 5.0, 6.0}>
+        {
+          y = Mul(A, B)
+        }
+        """
+    )
+    sim_model, ok = onnxsim.simplify(model)
+    assert ok
+    assert len(sim_model.graph.node) == 0
+    assert len(sim_model.graph.initializer) == 1
+    assert sim_model.graph.initializer[0].name == "y"
 
 
 def _model_with_local_function() -> onnx.ModelProto:
