@@ -1180,8 +1180,13 @@ def test_load_model_hydrates_unnamed_attribute_tensor():
         onnx.save(model, model_path)
 
         loaded, pool = onnxsim.load_model(model_path)
-        assert pool.names() == ["node0/attr0/t"]
+        pool_names = pool.names()
+        # pool's entry mmaps attr.data inside tmpdir -- on Windows an open
+        # mapping blocks deleting the file, so it must not outlive this
+        # block's cleanup (see onnxsim.load_model's docstring).
+        del pool
 
+    assert pool_names == ["node0/attr0/t"]
     loaded_const = [n for n in loaded.graph.node if n.op_type == "Constant"][0]
     (value_attr,) = [a for a in loaded_const.attribute if a.name == "value"]
     assert value_attr.t.data_location == onnx.TensorProto.DEFAULT
