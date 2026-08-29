@@ -1117,6 +1117,77 @@ def test_load_model_hydrates_classic_external_data():
     assert len(pool_hash_a) == 64  # hex-encoded BLAKE3 digest
 
 
+def test_load_model_hydrates_unnamed_attribute_tensor():
+    # hydrate_all=True's Python-side hydration (_hydrate_graph_tensors_from_pool
+    # in onnx_simplifier.py) re-derives each pooled tensor's key the same way
+    # tensor_pool_bridge.h's ForEachTensor does in C++: a tensor's own name, or
+    # -- for an unnamed node-attribute tensor -- a positional fallback
+    # ("node<i>/attr<j>/t"). This only round-trips correctly if the two
+    # independent implementations agree on that key, so exercise it directly
+    # with a Constant node whose `value` tensor has no name of its own.
+    #
+    # onnx.save's external-data converter doesn't externalize attribute
+    # tensors in the onnx version this repo pins (only initializers), so the
+    # text/onnx.parser form can't produce this fixture -- the EXTERNAL
+    # TensorProto has to be hand-built and pointed at a real data file.
+    c = np.random.rand(64, 64).astype(np.float32)
+    c_bytes = c.tobytes()
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        data_path = os.path.join(tmpdir, "attr.data")
+        with open(data_path, "wb") as f:
+            f.write(c_bytes)
+
+        model = onnx.ModelProto()
+        model.ir_version = 9
+        model.opset_import.add(domain="", version=17)
+        graph = model.graph
+        graph.name = "g"
+        graph.input.add(
+            name="x",
+            type=onnx.helper.make_tensor_type_proto(onnx.TensorProto.FLOAT, [64, 64]),
+        )
+        graph.output.add(
+            name="y",
+            type=onnx.helper.make_tensor_type_proto(onnx.TensorProto.FLOAT, [64, 64]),
+        )
+
+        const_node = graph.node.add()
+        const_node.op_type = "Constant"
+        const_node.output.append("cst")
+        attr = const_node.attribute.add()
+        attr.name = "value"
+        attr.type = onnx.AttributeProto.TENSOR
+        attr.t.data_type = onnx.TensorProto.FLOAT
+        attr.t.dims.extend([64, 64])
+        attr.t.data_location = onnx.TensorProto.EXTERNAL
+        # attr.t.name deliberately left empty.
+        for key, value in (
+            ("location", data_path),
+            ("offset", "0"),
+            ("length", str(len(c_bytes))),
+        ):
+            entry = attr.t.external_data.add()
+            entry.key = key
+            entry.value = value
+
+        add_node = graph.node.add()
+        add_node.op_type = "Add"
+        add_node.input.extend(["x", "cst"])
+        add_node.output.append("y")
+
+        model_path = os.path.join(tmpdir, "model.onnx")
+        onnx.save(model, model_path)
+
+        loaded, pool = onnxsim.load_model(model_path)
+        assert pool.names() == ["node0/attr0/t"]
+
+    loaded_const = [n for n in loaded.graph.node if n.op_type == "Constant"][0]
+    (value_attr,) = [a for a in loaded_const.attribute if a.name == "value"]
+    assert value_attr.t.data_location == onnx.TensorProto.DEFAULT
+    np.testing.assert_allclose(onnx.numpy_helper.to_array(value_attr.t), c)
+
+
 def test_load_model_hydrate_all_false_leaves_tensors_external():
     # hydrate_all=False leaves the model's tensors as lazy EXTERNAL
     # references -- the pool already holds their bytes, so nothing is lost,

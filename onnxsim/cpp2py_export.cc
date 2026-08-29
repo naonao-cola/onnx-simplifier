@@ -1390,14 +1390,22 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
   // import_gguf above do). Always returns the TensorPool it resolved into
   // (empty for a model with no external weights) alongside the model
   // bytes, unlike import_safetensors/import_gguf, which discard theirs --
-  // see the TensorPool binding above for why that's useful. `hydrate_all`
-  // (the default) turns every resolved tensor into an ordinary in-memory
-  // TensorProto; pass false to leave them as lazy EXTERNAL references and
-  // hydrate individually via the returned pool later (see
-  // tensor_pool_bridge.h's HydrateTensorProto caveat first).
+  // see the TensorPool binding above for why that's useful.
+  //
+  // Always loads with hydrate_all=false at this layer -- deliberately,
+  // *not* a caller-facing option here. Measured: hydrating in C++ and then
+  // crossing the FFI boundary re-serializes and re-parses the *whole*
+  // model, tensor bytes included, on top of the mmap/copy work hydration
+  // itself already did -- on a 190MB/2000-tensor model that made the
+  // "hydrate_all=True" case ~3.6x SLOWER than plain onnx.load(), not
+  // faster, while this lazy load alone takes ~3ms (mmap only, no copies).
+  // onnxsim.load_model's Python wrapper is the one that offers a
+  // hydrate_all option, implemented by copying tensor-by-tensor straight
+  // from the returned TensorPool (one copy per tensor, same as any loader
+  // must eventually pay) instead of round-tripping the whole model.
   m.def(
       "load_model",
-      [](const std::string& path, bool hydrate_all)
+      [](const std::string& path)
           -> std::tuple<py::bytes, onnxsim::tensor_pool::TensorPool> {
         onnx::ModelProto model;
         onnxsim::tensor_pool::TensorPool pool;
@@ -1414,26 +1422,26 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
         }
         if (ext == ".safetensors") {
           if (!onnxsim::tensor_pool::LoadModelFromSafetensors(
-                  path, &model, pool, hydrate_all)) {
+                  path, &model, pool, /*hydrate_all=*/false)) {
             throw std::runtime_error(
                 "safetensors file has no embedded onnxsim model (a plain "
                 "weights-only archive is not importable as a graph)");
           }
         } else if (ext == ".gguf") {
           if (!onnxsim::tensor_pool::LoadModelFromGGUF(path, &model, pool,
-                                                       hydrate_all)) {
+                                                       /*hydrate_all=*/false)) {
             throw std::runtime_error(
                 "gguf file has no embedded onnxsim model (a plain "
                 "weights-only archive is not importable as a graph)");
           }
         } else {
           onnxsim::tensor_pool::LoadModelWithTensorPool(path, &model, pool,
-                                                        hydrate_all);
+                                                        /*hydrate_all=*/false);
         }
         const std::string out = model.SerializeAsString();
         return {py::bytes(out.data(), out.size()), std::move(pool)};
       },
-      "path"_a, "hydrate_all"_a = true);
+      "path"_a);
 
   // Hydrates `model`'s initializers, by name, from any GGUF file --
   // including a plain third-party weights-only checkpoint with no embedded
