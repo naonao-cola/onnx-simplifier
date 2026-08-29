@@ -2,6 +2,7 @@
 
 #include <onnx/onnx_pb.h>
 
+#include <cstdint>
 #include <memory>
 #include <optional>
 #include <string>
@@ -429,6 +430,89 @@ onnx::ModelProto QuantizeWeightOnlyInt16(const onnx::ModelProto& model);
 // reduction size not divisible by 32, non-default Gemm attributes,
 // non-float32 operands, an opset older than 21) are left as-is.
 onnx::ModelProto QuantizeWeightOnlyInt8Block(const onnx::ModelProto& model);
+
+// OCP Microscaling MXFP4 weight-only quantizes every MatMul and every
+// "vanilla" Gemm (transA=0, alpha=1, beta=1) whose weight is a constant
+// float32 tensor whose reduction dimension K is evenly divisible by 32
+// (the OCP MX spec's own canonical block size). Unlike every other
+// ``QuantizeWeightOnly*`` scheme, MXFP4's per-block scale is constrained to
+// a pure power of two, and its 4-bit codes follow a fixed, non-uniform
+// (E2M1 floating-point) codebook rather than an ordinary affine range --
+// ONNX has no native MX tensor type, so the rewrite builds the
+// dequantization out of ordinary opset-11+ ops (``Gather`` a codebook,
+// ``Mul`` by the per-block scale) instead of a single ``DequantizeLinear``.
+// The weight is quantized from its own static values only -- no calibration
+// data, and (like every ``QuantizeWeightOnly*`` scheme) the activation is
+// never touched. See ``passes/weight_only_quantize_mxfp4_matmul.h`` and
+// ``passes/quantize_mxfp4_common.h`` for the rewrite itself and the
+// format's own definition.
+//
+// Unlike ``Simplify``, this does not run shape inference, constant folding or
+// any other simplification pass -- it applies exactly this rewrite, once, to
+// a copy of ``model`` (which is left untouched) and returns the result. A
+// layer with a non-constant, non-2-D weight, or a reduction dimension not
+// divisible by 32, is left untouched; a model with no matching layer is
+// returned unchanged.
+onnx::ModelProto QuantizeWeightOnlyMXFP4(const onnx::ModelProto& model);
+
+// Applies QLoRA-style double quantization (Dettmers et al., 2023, Section
+// 3.2) to every ``DequantizeLinear`` node already present in ``model`` whose
+// scale input is a constant float32 tensor with at least 64 values (a
+// per-block or per-channel scale -- a single scalar per-tensor scale isn't
+// worth the overhead of a second quantizer around it). Unlike every
+// ``Quantize*`` scheme above, this has no "live weight" of its own to
+// quantize: it is a second pass over an *already-quantized* model, and
+// composes with any of them (or any other model containing
+// ``DequantizeLinear`` nodes) unchanged. See ``passes/double_quantization.h``
+// for the exact rewrite.
+//
+// Unlike ``Simplify``, this does not run shape inference, constant folding or
+// any other simplification pass -- it applies exactly this rewrite, to every
+// matching node, to a copy of ``model`` (which is left untouched) and
+// returns the result. A scale that is not a constant initializer, not
+// float32, or too small, is left untouched; a model with no matching node is
+// returned unchanged.
+onnx::ModelProto ApplyDoubleQuantization(const onnx::ModelProto& model);
+
+// Magnitude pruning (Han et al., 2015) -- the data-free unstructured
+// pruning baseline. Zeros the least-magnitude entries of every
+// MatMul/vanilla-Gemm layer's constant 2-D float32 weight, and every Conv
+// layer's constant 4-D float32 weight (ordinary, depthwise, and general
+// grouped Conv alike), independently per output row/filter: within each
+// row, keeps the max(1, round(cols * (1 - sparsity))) highest-magnitude
+// entries and zeros the rest. Unlike the pure-Python
+// ``apply_magnitude_pruning``, this does not match
+// ``com.microsoft::Attention``'s merged QKV weight, and offers only the
+// sparsity-ratio mode (no N:M semi-structured pruning) -- see
+// ``passes/magnitude_pruning.h`` for the exact rewrite and this scope note.
+//
+// Unlike ``Simplify``, this does not run shape inference, constant folding or
+// any other simplification pass -- it applies exactly this rewrite, to every
+// matching layer, to a copy of ``model`` (which is left untouched) and
+// returns the result. ``sparsity`` must be in [0, 1); throws
+// ``std::invalid_argument`` otherwise. A layer with a non-constant,
+// non-2-D (MatMul/Gemm), or non-4-D (Conv) weight is left untouched.
+onnx::ModelProto PruneMagnitude(const onnx::ModelProto& model, double sparsity);
+
+// QuaRot (Ashkboos et al., 2024) rotation preprocessing plus INT4
+// round-to-nearest quantization of *both* the weight and the activation of
+// every MatMul/vanilla-Gemm layer with a constant 2-D float32 weight whose
+// reduction dimension K is divisible by 32. Rotating the whole residual
+// stream by a random orthogonal matrix removes activation outliers the same
+// way :func:`quantize_weight_only_int4`-style block quantization already
+// tolerates weight outliers, letting both MatMul operands drop to INT4 with
+// no calibration data at all -- see ``passes/quarot.h`` for the exact
+// rewrite and rationale, and its scope note on the per-layer (not fused
+// cross-layer) rotation this port applies.
+//
+// Unlike ``Simplify``, this does not run shape inference, constant folding or
+// any other simplification pass -- it applies exactly this rewrite, to every
+// matching layer, to a copy of ``model`` (which is left untouched) and
+// returns the result. A layer with a non-constant, non-2-D weight, or a
+// reduction dimension not divisible by 32, is left untouched; a model with
+// no matching layer, or an opset older than 21, is returned unchanged.
+// ``seed`` derives a fresh, deterministic random rotation per matched layer.
+onnx::ModelProto ApplyQuarot(const onnx::ModelProto& model, uint64_t seed);
 
 // Lists the activation tensor names that ``QuantizeStatic`` could quantize in
 // ``model`` -- the first input of every MatMul, every "vanilla" Gemm

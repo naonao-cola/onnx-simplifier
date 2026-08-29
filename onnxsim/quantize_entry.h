@@ -8,6 +8,7 @@
 
 #include <onnx/onnx_pb.h>
 
+#include <cstdint>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -20,6 +21,7 @@ onnx::ModelProto QuantizeWeightOnlyInt4(const onnx::ModelProto& model);
 onnx::ModelProto QuantizeWeightOnlyMatMulNBits(const onnx::ModelProto& model);
 onnx::ModelProto QuantizeWeightOnlyInt16(const onnx::ModelProto& model);
 onnx::ModelProto QuantizeWeightOnlyInt8Block(const onnx::ModelProto& model);
+onnx::ModelProto QuantizeWeightOnlyMXFP4(const onnx::ModelProto& model);
 
 std::vector<std::string> ListQuantizableActivations(
     const onnx::ModelProto& model);
@@ -72,3 +74,6 @@ onnx::ModelProto QuantizeBf16(const onnx::ModelProto& model,
                               bool keep_io_types);
 onnx::ModelProto QuantizeFp8(const onnx::ModelProto& model,
                              const std::string& format, bool keep_io_types);
+
+onnx::ModelProto ApplyDoubleQuantization(const onnx::ModelProto& model);
+onnx::ModelProto ApplyQuarot(const onnx::ModelProto& model, uint64_t seed);

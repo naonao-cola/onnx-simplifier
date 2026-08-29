@@ -548,6 +548,78 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
       },
       "model_bytes"_a);
 
+  // OCP Microscaling MXFP4 weight-only quantizes every MatMul/vanilla-Gemm
+  // whose weight is a constant float32 tensor whose reduction dimension is
+  // divisible by 32, via a Gather-a-codebook-then-scale dequant chain (no
+  // native ONNX MX tensor type). Activations are never touched, so no
+  // calibration data is needed. See QuantizeWeightOnlyMXFP4 in onnxsim.h.
+  m.def(
+      "quantize_weight_only_mxfp4",
+      [](const py::bytes& model_proto_bytes) -> py::bytes {
+        InitEnv();
+        ONNX_NAMESPACE::ModelProto model;
+        ParseProtoFromBytes(&model, model_proto_bytes.c_str(),
+                            model_proto_bytes.size());
+        const auto result = QuantizeWeightOnlyMXFP4(model);
+        std::string out;
+        result.SerializeToString(&out);
+        return py::bytes(out.data(), out.size());
+      },
+      "model_bytes"_a);
+
+  // QLoRA-style double quantization: quantizes every already-present
+  // DequantizeLinear node's own (large enough) constant scale tensor to
+  // UINT8 with a per-tensor meta-scale. See ApplyDoubleQuantization in
+  // onnxsim.h.
+  m.def(
+      "apply_double_quantization",
+      [](const py::bytes& model_proto_bytes) -> py::bytes {
+        InitEnv();
+        ONNX_NAMESPACE::ModelProto model;
+        ParseProtoFromBytes(&model, model_proto_bytes.c_str(),
+                            model_proto_bytes.size());
+        const auto result = ApplyDoubleQuantization(model);
+        std::string out;
+        result.SerializeToString(&out);
+        return py::bytes(out.data(), out.size());
+      },
+      "model_bytes"_a);
+
+  // Magnitude pruning (Han et al., 2015): zeros the least-magnitude entries
+  // of every MatMul/vanilla-Gemm/Conv layer's constant weight, independently
+  // per output row/filter. Data-free. See PruneMagnitude in onnxsim.h.
+  m.def(
+      "prune_magnitude",
+      [](const py::bytes& model_proto_bytes, double sparsity) -> py::bytes {
+        InitEnv();
+        ONNX_NAMESPACE::ModelProto model;
+        ParseProtoFromBytes(&model, model_proto_bytes.c_str(),
+                            model_proto_bytes.size());
+        const auto result = PruneMagnitude(model, sparsity);
+        std::string out;
+        result.SerializeToString(&out);
+        return py::bytes(out.data(), out.size());
+      },
+      "model_bytes"_a, "sparsity"_a);
+
+  // QuaRot (Ashkboos et al., 2024): rotation preprocessing plus INT4
+  // round-to-nearest quantization of both the weight and the activation of
+  // every MatMul/vanilla-Gemm layer. Data-free. See ApplyQuarot in
+  // onnxsim.h.
+  m.def(
+      "apply_quarot",
+      [](const py::bytes& model_proto_bytes, uint64_t seed) -> py::bytes {
+        InitEnv();
+        ONNX_NAMESPACE::ModelProto model;
+        ParseProtoFromBytes(&model, model_proto_bytes.c_str(),
+                            model_proto_bytes.size());
+        const auto result = ApplyQuarot(model, seed);
+        std::string out;
+        result.SerializeToString(&out);
+        return py::bytes(out.data(), out.size());
+      },
+      "model_bytes"_a, "seed"_a);
+
   // Lists the activation tensor names quantize_static could quantize --
   // see ListQuantizableActivations in onnxsim.h.
   m.def(
