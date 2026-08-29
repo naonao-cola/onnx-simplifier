@@ -1176,7 +1176,7 @@ def simplify(
     inline_functions: bool = False,
     import_custom_schemas: bool = True,
     input_shapes=None,
-    target_opset_version: Optional[int] = None,
+    target_opset_version: Optional[Union[int, Literal["latest"]]] = None,
     extra_optimizers: Optional[List[str]] = None,
     custom_rewriter: Optional[ModelRewriter] = None,
     function_rewrite_rules: Optional[Sequence[FunctionRewriteRule]] = None,
@@ -1229,7 +1229,11 @@ def simplify(
     :param target_opset_version: Convert the model to this opset version (of the default ONNX domain)
             before simplifying, using onnx's version converter (run inside the C++ core so every
             binding shares the behavior). This can be used to upgrade (or downgrade) the model's
-            opset during simplification. When None (the default), the opset version is left unchanged.
+            opset during simplification. Pass the literal string ``"latest"`` to resolve to the
+            highest default-domain opset version this onnxsim build's compiled-in onnx schema
+            registry supports (note this can differ from the pip-installed ``onnx`` package's own
+            ``onnx.defs.onnx_opset_version()``, since onnxsim vendors its own onnx fork). When None
+            (the default), the opset version is left unchanged.
     :param extra_optimizers: The counterpart to ``skipped_optimizers``: run these named onnx-optimizer
             passes in addition to the default fuse/elimination set, rather than excluding some of it.
             This is how a pass registered as ``PassType::Other`` -- excluded from the default set
@@ -1369,6 +1373,18 @@ def simplify(
     # degrade to no folding. Checking here turns a misconfigured provider (e.g.
     # CUDA requested without the onnxruntime-gpu build) into an immediate error.
     backend.validate_providers(providers)
+
+    # ``target_opset_version="latest"`` resolves against the C++ core's own
+    # compiled-in onnx schema registry (the same one ConvertOpsetVersion uses),
+    # not the pip-installed `onnx` package's `onnx.defs.onnx_opset_version()` --
+    # the two can differ since onnxsim vendors its own onnx fork.
+    if target_opset_version == "latest":
+        target_opset_version = C.max_default_domain_opset_version()
+    elif target_opset_version is not None and not isinstance(target_opset_version, int):
+        raise ValueError(
+            "target_opset_version must be an int, the string 'latest', or None, "
+            f"got {target_opset_version!r}"
+        )
 
     if dynamic_input_shape:
         print(
@@ -2127,8 +2143,8 @@ def main():
     )
     parser.add_argument(
         "--target-opset",
-        help="Convert the model to this opset version (of the default ONNX domain) before simplifying, for example '--target-opset 18'. Can be used to upgrade (or downgrade) the model's opset during simplification.",
-        type=int,
+        help="Convert the model to this opset version (of the default ONNX domain) before simplifying, for example '--target-opset 18'. Can be used to upgrade (or downgrade) the model's opset during simplification. Pass 'latest' to resolve to the highest opset version this onnxsim build supports.",
+        type=lambda s: s if s == "latest" else int(s),
         default=None,
     )
     parser.add_argument(

@@ -735,9 +735,17 @@ static onnx::ModelProto SimplifyImpl(
   }
   // Optionally convert the model to a different opset version (of the default
   // ONNX domain) first, so the simplification below can clean up any redundant
-  // nodes the version converter introduces.
+  // nodes the version converter introduces. Wrapped in its own profiled span --
+  // sibling to, not nested inside, the "Simplify" root below -- so its cost is
+  // visible in the flame graph / profile_pass_phases output instead of showing
+  // up as unaccounted time before the first pass.
   if (target_opset_version) {
-    sim_model = ConvertOpsetVersion(sim_model, *target_opset_version);
+    onnxsim::ProfiledScope opset_scope("ConvertOpsetVersion");
+    // std::move: sim_model is about to be overwritten by the result anyway,
+    // so let ConvertOpsetVersion's by-value parameter move-construct instead
+    // of copying -- required for it to reach ConvertVersion's non-copying
+    // overload (see model_prep.cpp).
+    sim_model = ConvertOpsetVersion(std::move(sim_model), *target_opset_version);
   }
   {
     // A single root span so the profiled fixed points nest under one box in the
