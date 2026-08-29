@@ -323,6 +323,19 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
 
   using namespace py::literals;
 
+  // The maximum default-domain ("" / "ai.onnx") opset version this build's
+  // compiled-in onnx schema registry knows about -- i.e. what
+  // target_opset_version="latest" resolves to. Exposed so the Python side can
+  // resolve "latest" against the same registry ConvertOpsetVersion itself
+  // uses, rather than guessing from the (possibly differently-versioned)
+  // pip-installed `onnx` package.
+  m.def("max_default_domain_opset_version", []() {
+    return onnx::OpSchemaRegistry::DomainToVersionRange::Instance()
+        .Map()
+        .at("")
+        .second;
+  });
+
   // Compute the model metrics (op counts, size, MACs, memory access, peak
   // footprint) in C++ so the Python ``model_info`` can delegate the counting to
   // a single implementation. The symbolic metrics are returned as
