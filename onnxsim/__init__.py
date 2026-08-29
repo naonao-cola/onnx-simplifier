@@ -49,7 +49,13 @@ from onnxsim.mixed_precision import apply_mixed_precision_quantization
 from onnxsim.mx_quantization import MXFP4_CODEBOOK, quantize_weight_only_mxfp4
 from onnxsim.nf4 import NF4_CODEBOOK, quantize_weight_only_nf4
 from onnxsim.omniquant import apply_omniquant
+from onnxsim.optimize_pipeline import (
+    OptimizationPipelineResult,
+    apply_optimization_pipeline,
+)
 from onnxsim.onnx_simplifier import (
+    apply_double_quantization_cpp,
+    apply_quarot_cpp,
     cross_layer_equalize,
     export_gguf,
     export_safetensors,
@@ -59,6 +65,7 @@ from onnxsim.onnx_simplifier import (
     import_safetensors,
     load_model,
     main,
+    prune_magnitude_cpp,
     quantize_attention_dynamic,
     quantize_bf16,
     quantize_dynamic,
@@ -71,6 +78,7 @@ from onnxsim.onnx_simplifier import (
     quantize_weight_only_int8_block,
     quantize_weight_only_int16,
     quantize_weight_only_matmul_nbits,
+    quantize_weight_only_mxfp4_cpp,
     read_gguf_metadata,
     simplify,
 )
@@ -115,6 +123,8 @@ __all__ = [
     "apply_autoround",
     "auto_quantize_int4",
     "AutoQuantResult",
+    "apply_optimization_pipeline",
+    "OptimizationPipelineResult",
     "apply_awq",
     "apply_gptq",
     "apply_smoothquant",
@@ -123,10 +133,12 @@ __all__ = [
     "apply_mixed_precision_quantization",
     "apply_quip_sharp",
     "apply_quarot",
+    "apply_quarot_cpp",
     "apply_duquant",
     "apply_spinquant",
     "apply_omniquant",
     "apply_magnitude_pruning",
+    "prune_magnitude_cpp",
     "apply_wanda_pruning",
     "apply_sparsegpt_pruning",
     "apply_structured_pruning",
@@ -151,12 +163,14 @@ __all__ = [
     "quantize_weight_only_aqlm",
     "quantize_weight_only_spqr",
     "apply_double_quantization",
+    "apply_double_quantization_cpp",
     "quantize_kv_cache",
     "quantize_embedding_binary",
     "quantize_embedding_int8",
     "quantize_weight_only_matmul_nbits",
     "quantize_weight_only_int8_block",
     "quantize_weight_only_int16",
+    "quantize_weight_only_mxfp4_cpp",
     "quantize_static",
     "quantize_static_int16",
     "quantize_qoperator",

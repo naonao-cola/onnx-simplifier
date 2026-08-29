@@ -978,6 +978,148 @@ def quantize_weight_only_int8_block(
     )
 
 
+def quantize_weight_only_mxfp4_cpp(
+    model: Union[str, onnx.ModelProto],
+) -> onnx.ModelProto:
+    """
+    C++-backed port of :func:`onnxsim.quantize_weight_only_mxfp4`: OCP
+    Microscaling MXFP4 weight-only quantizes every MatMul and every
+    "vanilla" Gemm (transA=0, alpha=1, beta=1) whose weight is a constant
+    2-D float32 tensor whose reduction dimension ``K`` is evenly divisible
+    by 32 (the OCP MX spec's own canonical block size).
+
+    Unlike every other ``quantize_weight_only_*`` scheme, MXFP4's per-block
+    scale is constrained to a pure power of two, and its 4-bit codes follow
+    a fixed, non-uniform (E2M1 floating-point) codebook rather than an
+    ordinary affine range -- see :func:`onnxsim.quantize_weight_only_mxfp4`'s
+    own docstring for the format's full definition. Needs no calibration
+    data: both the codebook and the per-block power-of-two scale come from
+    the weight's own values. Unlike the pure-Python implementation, ``Conv``
+    layers are not (yet) handled -- only ``MatMul``/``Gemm``.
+
+    This is a single, self-contained graph rewrite: unlike :func:`simplify`,
+    it does not run shape inference, constant folding, or any other pass.
+    Layers with a non-constant, non-2-D, or non-block-divisible weight are
+    left untouched. Consider calling :func:`simplify` before and/or after to
+    clean up the graph.
+
+    :param model: onnx ModelProto object or file path
+    :returns: the quantized onnx ModelProto
+    """
+    if isinstance(model, str):
+        model = onnx.load(model, load_external_data=False)
+    return onnx.load_from_string(
+        C.quantize_weight_only_mxfp4(model.SerializeToString())
+    )
+
+
+def apply_double_quantization_cpp(
+    model: Union[str, onnx.ModelProto],
+) -> onnx.ModelProto:
+    """
+    C++-backed port of :func:`onnxsim.apply_double_quantization`: applies
+    QLoRA-style double quantization (Dettmers et al., 2023, "QLoRA:
+    Efficient Finetuning of Quantized LLMs", Section 3.2) to every
+    ``DequantizeLinear`` node already present in ``model`` whose scale input
+    is a constant float32 tensor with at least 64 values.
+
+    Every block-wise/per-channel scale (e.g. one float32 value per 32-element
+    INT4 block) is itself quantized to UINT8 with a single per-tensor
+    meta-scale, reconstructed in-graph via a second, nested
+    ``DequantizeLinear`` feeding the original node's own scale input -- see
+    :func:`onnxsim.apply_double_quantization`'s own docstring for the exact
+    rewrite. This is technique-agnostic: it composes with the output of any
+    onnxsim block-wise/per-channel quantizer (or any other model containing
+    ``DequantizeLinear`` nodes) unchanged.
+
+    :param model: an already-quantized onnx ModelProto or file path
+    :returns: ``model`` with every matching ``DequantizeLinear`` node's scale
+            input double-quantized; a scale that is not a constant
+            initializer, not float32, or too small (fewer than 64 values) is
+            left untouched
+    """
+    if isinstance(model, str):
+        model = onnx.load(model, load_external_data=False)
+    return onnx.load_from_string(
+        C.apply_double_quantization(model.SerializeToString())
+    )
+
+
+def prune_magnitude_cpp(
+    model: Union[str, onnx.ModelProto],
+    sparsity: float = 0.5,
+) -> onnx.ModelProto:
+    """
+    C++-backed port of :func:`onnxsim.apply_magnitude_pruning`: zeros the
+    least-magnitude entries of every MatMul/vanilla-Gemm layer's constant
+    2-D float32 weight, and every Conv layer's constant 4-D float32 weight
+    (ordinary, depthwise, and general grouped Conv alike) -- the data-free
+    unstructured pruning baseline (Han et al., 2015).
+
+    Within each output row (or, for Conv, each output filter), keeps the
+    ``max(1, round(cols * (1 - sparsity)))`` highest-magnitude entries and
+    zeros the rest, so a layer with row-dependent weight scale doesn't get
+    some rows pruned to nothing and others left untouched.
+
+    Unlike the pure-Python :func:`onnxsim.apply_magnitude_pruning`, this
+    does not match ``com.microsoft::Attention``'s merged QKV weight, and
+    offers only the sparsity-ratio mode (no N:M semi-structured pruning).
+
+    This is a single, self-contained graph rewrite: unlike :func:`simplify`,
+    it does not run shape inference, constant folding, or any other pass.
+    Layers with a non-constant, non-2-D (MatMul/Gemm), or non-4-D (Conv)
+    weight are left untouched.
+
+    :param model: onnx ModelProto object or file path
+    :param sparsity: target fraction of each row's entries to zero; must be
+            in ``[0, 1)``
+    :returns: ``model`` with every matched layer's weight pruned in place
+    """
+    if isinstance(model, str):
+        model = onnx.load(model, load_external_data=False)
+    return onnx.load_from_string(
+        C.prune_magnitude(model.SerializeToString(), sparsity)
+    )
+
+
+def apply_quarot_cpp(
+    model: Union[str, onnx.ModelProto],
+    seed: int = 0,
+) -> onnx.ModelProto:
+    """
+    C++-backed port of :func:`onnxsim.apply_quarot`: applies QuaRot-style
+    random-rotation preprocessing (Ashkboos et al., 2024, "QuaRot:
+    Outlier-Free 4-Bit Inference in Rotated LLMs") plus INT4
+    round-to-nearest quantization of *both* the weight and the activation to
+    every MatMul/vanilla-Gemm layer with a constant 2-D float32 weight whose
+    reduction dimension ``K`` is divisible by 32.
+
+    Rotating the whole residual stream by a random orthogonal matrix removes
+    activation outliers the same way block quantization already tolerates
+    weight outliers, letting both MatMul operands drop to INT4 with no
+    calibration data at all -- see :func:`onnxsim.apply_quarot`'s own
+    docstring for the full rationale. Unlike that pure-Python
+    implementation, this port derives a fresh rotation per matched layer
+    from ``seed`` independently of graph node order, so results are *not*
+    expected to match the Python port bit-for-bit -- only to be similarly
+    accurate.
+
+    This is a single, self-contained graph rewrite: unlike :func:`simplify`,
+    it does not run shape inference, constant folding, or any other pass.
+    Layers with a non-constant, non-2-D weight, or a reduction dimension not
+    divisible by 32, are left untouched. Consider calling :func:`simplify`
+    before and/or after to clean up the graph.
+
+    :param model: the original (unquantized) onnx ModelProto or file path
+    :param seed: seed for the per-layer random rotation matrices
+    :returns: the rotated-and-quantized onnx ModelProto; a model with no
+            matching layer, or an opset older than 21, is returned unchanged
+    """
+    if isinstance(model, str):
+        model = onnx.load(model, load_external_data=False)
+    return onnx.load_from_string(C.apply_quarot(model.SerializeToString(), seed))
+
+
 def quantize_fp16(
     model: Union[str, onnx.ModelProto], keep_io_types: bool = True
 ) -> onnx.ModelProto:

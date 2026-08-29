@@ -20,6 +20,7 @@
 #include "passes/quantize_fp16.h"
 #include "passes/quantize_fp8.h"
 #include "passes/quantize_matmul_common.h"
+#include "passes/quarot.h"
 #include "passes/static_quantize_matmul.h"
 
 onnx::ModelProto QuantizeDynamic(const onnx::ModelProto& model) {
@@ -108,6 +109,37 @@ onnx::ModelProto QuantizeWeightOnlyInt8Block(const onnx::ModelProto& model) {
   return onnx::optimization::OptimizeFixed(
       model, std::vector<std::string>{"weight_only_quantize_int8_block_matmul",
                                       "weight_only_quantize_int8_block_conv"});
+}
+
+onnx::ModelProto QuantizeWeightOnlyMXFP4(const onnx::ModelProto& model) {
+  PrepareSchemasForDebug(model);
+  // Registers weight_only_quantize_mxfp4_matmul (idempotent) into
+  // onnxoptimizer's registry so OptimizeFixed can find it by name below.
+  onnxsim::RegisterCustomOptimizerPasses();
+  return onnx::optimization::OptimizeFixed(
+      model, std::vector<std::string>{"weight_only_quantize_mxfp4_matmul"});
+}
+
+onnx::ModelProto ApplyDoubleQuantization(const onnx::ModelProto& model) {
+  PrepareSchemasForDebug(model);
+  // Registers double_quantization (idempotent) into onnxoptimizer's registry
+  // so OptimizeFixed can find it by name below.
+  onnxsim::RegisterCustomOptimizerPasses();
+  return onnx::optimization::OptimizeFixed(
+      model, std::vector<std::string>{"double_quantization"});
+}
+
+onnx::ModelProto ApplyQuarot(const onnx::ModelProto& model, uint64_t seed) {
+  PrepareSchemasForDebug(model);
+  // Registers quarot (idempotent) into onnxoptimizer's registry so
+  // OptimizeFixed can find it by name below.
+  onnxsim::RegisterCustomOptimizerPasses();
+  // quarot reads this the same way quantize_fp16 reads
+  // QuantizeFp16KeepIoTypes() -- OptimizeFixed's pass-name list has no way
+  // to carry a parameter directly.
+  onnx::optimization::onnxsim_passes::QuarotSeed() = seed;
+  return onnx::optimization::OptimizeFixed(model,
+                                           std::vector<std::string>{"quarot"});
 }
 
 std::vector<std::string> ListQuantizableActivations(
