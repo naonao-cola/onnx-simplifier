@@ -127,3 +127,64 @@ converting a model with a stale/missing custom-op adapter is worse than the
 **Verified:** `tests/test_python_api.py`'s two `target_opset_version` tests and
 the full `test_python_api.py` module pass; CLI (`--target-opset latest`) and
 Python API (`target_opset_version="latest"`) both smoke-tested end to end.
+
+## Follow-up: folding opset conversion into the resident-Graph pipeline
+
+PR #886 (above) made `ConvertOpsetVersion`'s *own* Import/Export round trip
+cheap, but it was still a *second*, independent round trip: `Pipeline`'s
+`!rewriter` branch already imports `ModelProto` into an `onnx::Graph` once and
+exports once around the entire outer fixed point (shape inference,
+onnx-optimizer passes, constant folding) -- `ConvertOpsetVersion` ran as its
+own separate step *before* that, with its own Import/Export pair, even though
+the version converter's node-adaptation logic (`convert_graph`) already
+operates directly on `onnx::Graph`.
+
+**Fix:** exposed `DefaultVersionConverter::convert_version_on_graph` /
+`ConvertVersionOnGraph(std::shared_ptr<Graph>&, int)` in the onnx fork (branch
+`claude/onnx-version-converter-graph-api`, depends on the PR #886 branch) --
+the same node-adaptation logic, called directly on an already-resident
+`Graph&` instead of wrapped in its own ModelProto<->Graph conversion. Moved
+the `!rewriter` branch's opset conversion to call this directly on the graph
+`Pipeline` already imports, cutting the second Import/Export pair entirely.
+The `rewriter` branch (ModelProto-only; onnxscript's rewriter doesn't
+understand `onnx::Graph`) is unaffected and still uses the ModelProto-level
+`ConvertOpsetVersion`.
+
+**Measured (median of 5 trials, quiet host -- no concurrent test suite; an
+earlier pass run *while* the full test suite was running in the background
+showed a much larger apparent gap, which was CPU-contention noise, not a real
+effect; discarded):**
+
+| model | initializer bytes | before (2 round trips) | after (1 round trip) | change |
+|---|---:|---:|---:|---:|
+| tiny (1 block, 3 nodes) | 0.0 MB | 5.43ms | ~5.5ms | ~none (fixed-cost dominated either way) |
+| medium (20 blocks, 60 nodes) | 3.0 MB | ~15.2ms | ~15.4ms | ~none (too small to separate from noise) |
+| large (40 blocks, 120 nodes) | 13.3 MB | ~45-47ms | ~44-46ms | ~none |
+| xlarge (100 blocks, 300 nodes) | 92.5 MB | ~300.9ms (median, profiled span) | ~278.6ms (median, profiled span) | **~7% less profiled work** |
+
+Total process wall time for xlarge was noisier (before median 0.827s, after
+0.779s) with overlapping min/max ranges across only 5 trials each -- not
+strong enough on its own to call a wall-clock win, but the profiled-span
+numbers (which exclude whole-process OS/Python scheduling noise) show a real,
+consistent, if modest, improvement concentrated in the largest model.
+
+**Why modest, not dramatic:** PR #886 already eliminated the *data-copy* cost
+of the round trip (the dominant cost for large-initializer models) via the
+moving/consuming overloads. What this follow-up removes is reconstructing the
+`onnx::Graph` IR *structure* itself (Node/Value objects, attribute maps) a
+second time -- real, but scales with node count, not tensor bytes, so it only
+shows up clearly once a model has enough nodes (xlarge: 300) to matter. For
+node-count-heavy, weight-light models (e.g. a very deep model with modest
+per-layer weights) this fix would matter more in isolation than the numbers
+above suggest, since PR #886's copy-elimination wouldn't have much to save
+there either.
+
+**Also fixed in passing:** the profiler's text-summary column was too narrow
+(22 chars) for "ConvertOpsetVersion" (19 chars) once it nested one level
+deeper under "Pipeline" instead of sitting at depth 0 -- it printed as the
+truncated "ConvertOpsetVersio". Widened to 28.
+
+**Verified:** the two dedicated `target_opset_version` tests, the `rewriter`
+branch (smoke-tested with a no-op `custom_rewriter`, confirming it still uses
+the ModelProto path and converts correctly), and the full `test_python_api.py`
+suite (60/60, same pre-existing >2GB-class exclusions as before) all pass.
