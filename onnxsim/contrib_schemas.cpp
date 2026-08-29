@@ -903,13 +903,16 @@ void AppendMoEExpertBlock(std::ostringstream& text, int64_t expert,
          << "A1_" << e << " = Mul (H1_" << e << ", Sig_" << e << ")\n";
   } else {
     // "gelu" (exact, erf-based -- the same decomposition ONNX's own Gelu
-    // op uses for its default (non-"tanh") approximate mode).
-    text << "Half_" << e << " = Constant <value = float {0.5}> ()\n"
+    // op uses for its default (non-"tanh") approximate mode). Scalar
+    // constants use `value_float` (a plain float attribute) rather than
+    // `value` (a full TensorProto, potentially carrying a `raw_data` byte
+    // blob) -- see the ZeroT comment below for why.
+    text << "Half_" << e << " = Constant <value_float: float = 0.5> ()\n"
          << "HalfCast_" << e << " = CastLike (Half_" << e << ", H1_" << e
          << ")\n"
-         << "One_" << e << " = Constant <value = float {1.0}> ()\n"
+         << "One_" << e << " = Constant <value_float: float = 1.0> ()\n"
          << "OneCast_" << e << " = CastLike (One_" << e << ", H1_" << e << ")\n"
-         << "Two_" << e << " = Constant <value = float {2.0}> ()\n"
+         << "Two_" << e << " = Constant <value_float: float = 2.0> ()\n"
          << "TwoCast_" << e << " = CastLike (Two_" << e << ", H1_" << e << ")\n"
          << "SqrtTwo_" << e << " = Sqrt (TwoCast_" << e << ")\n"
          << "XSqrt_" << e << " = Div (H1_" << e << ", SqrtTwo_" << e << ")\n"
@@ -1056,7 +1059,17 @@ bool BuildMoEFunctionBody(const FunctionBodyBuildContext& ctx,
   } else {
     text << "TopValsNorm = Identity (TopVals)\n";
   }
-  text << "ZeroT = Constant <value = float {0.0}> ()\n"
+  // A scalar `value_float` attribute, not a `value` TensorProto literal:
+  // the latter can carry its payload as a raw byte blob (`raw_data`)
+  // rather than the typed `float_data` field, and a `raw_data` blob
+  // written on one host's byte order and read back assuming another's is
+  // exactly the class of bug this codebase already works around elsewhere
+  // (see precision_estimator_test.cpp's own byte-swapping comment).
+  // `value_float` sidesteps that -- it's a plain scalar float attribute
+  // field, never serialized as bytes -- matching the style ONNX's own
+  // Swish function body uses for its scalar attribute (`value_float:
+  // float = @alpha`).
+  text << "ZeroT = Constant <value_float: float = 0.0> ()\n"
        << "ZeroCast = CastLike (ZeroT, input)\n"
        << "GateZeros = Mul (Probs, ZeroCast)\n"
        << "Gates = ScatterElements <axis = -1> (GateZeros, TopIdx, "
