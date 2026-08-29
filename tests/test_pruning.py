@@ -3085,10 +3085,13 @@ def test_structured_wanda_pruning_depthwise_pass_through_matches_oracle_exactly(
 # comment for the full reasoning: a bounded slice of general dependency-
 # graph pruning, restricted to Conv chains merged by a channel-preserving
 # `Add(a, b)` with two non-constant operands (every residual connection's
-# shape), still holding every branch to the same single-consumer safety bar
-# as the rest of this pass -- so a real multi-block ResNet's necessary
-# fan-out (the post-block tensor read by both the next block's own first
-# Conv and, unchanged, that block's own Add) is declined, not guessed at.
+# shape), holding every hop *toward* a group's own producers to the same
+# single-consumer safety bar as the rest of this pass, but propagating the
+# group's own established `keep` set *forward* to every extra ordinary
+# consumer a shared tensor has -- so a real multi-block ResNet stage's
+# necessary fan-out (the post-block tensor read by both the next block's
+# own first Conv and, unchanged, that block's own Add) is reached, not
+# declined; what's still declined is covered case by case below.
 
 
 def _residual_diamond_model(w_f, w_s, w_out, spatial=10):
@@ -3121,10 +3124,11 @@ def _residual_transitive_model(w_f1, w_s1, w_f2, w_out, spatial=10):
     # ("many residual blocks share one spine") with *no* branch anywhere
     # along the chain: add1's own output feeds *only* into add2 (as a
     # second, entirely separate producer's merge partner), never reused
-    # elsewhere -- unlike a real ResNet stage's interior block boundary
-    # (see test_structured_pruning_conv_residual_add_declines_on_fan_out_branch
-    # below), so the union-find grouping in _find_conv_residual_chains
-    # extends across both Adds into one group of three producers.
+    # elsewhere -- a *simpler* shape than the interior-block fan-out case
+    # (see test_structured_pruning_conv_residual_add_prunes_interior_block_fan_out
+    # below), which needs no extra-branch resolution at all: the union-find
+    # grouping in _find_conv_residual_chains extends across both Adds into
+    # one group of three producers on its own.
     Cin = w_f1.shape[1]
     Cz = w_f2.shape[1]
     Cout = w_out.shape[0]
@@ -3231,23 +3235,120 @@ def test_structured_pruning_conv_residual_add_transitive_chain_matches_oracle():
     np.testing.assert_allclose(y, y_oracle, rtol=1e-5, atol=1e-5)
 
 
-def test_structured_pruning_conv_residual_add_declines_on_fan_out_branch():
-    # A realistic multi-block residual stage's interior boundary: `r`
-    # (add1's own post-block tensor) is read *twice* -- once by the next
-    # block's own first Conv (`nxt`), once unchanged as that next block's
-    # own Add shortcut operand (`add2`) -- exactly the fan-out
-    # _walk_conv_producer_backward's single-consumer bar declines. Left
-    # completely untouched (no partial/incorrect pruning), the same
-    # guarantee every other branch case in this module holds to.
+def test_structured_pruning_conv_residual_add_prunes_interior_block_fan_out():
+    # The exact "interior ResNet block" shape this module's own docstring
+    # now describes as reached (previously declined -- see this test's own
+    # prior name/body, `..._declines_on_fan_out_branch`): `r` (add1's own
+    # post-block tensor) is read *twice* -- once by the next block's own
+    # first Conv (`nxt`), once unchanged as that next block's own Add
+    # shortcut operand (`add2`) -- but both readers are safe, ordinary
+    # continuations of the *same* already-established group (add1+add2
+    # union transitively, per _find_conv_residual_chains's own union-find),
+    # so the group's shared `keep` set is propagated to both rather than
+    # declined. `WNEXT` ends up playing a genuine dual role within this
+    # *one* chain: a leaf producer of the group (`nxt`'s own output feeds
+    # add2, so its output channels are ranked alongside WF/WS's own),
+    # *and* an ordinary ("extra branch") consumer of the group's spine
+    # (its input channels are pruned to match `r`), exactly the "a weight
+    # legitimately plays both roles" case _apply_chains already supports
+    # across two different chains -- now exercised within a single one.
     Cin, C, Cout = 3, 16, 8
     rng = np.random.default_rng(84)
     w_f = rng.standard_normal((C, Cin, 3, 3)).astype(np.float32)
     w_s = rng.standard_normal((C, Cin, 3, 3)).astype(np.float32)
     w_next = rng.standard_normal((C, C, 1, 1)).astype(np.float32)
     w_out = rng.standard_normal((Cout, C, 1, 1)).astype(np.float32)
+
+    def _interior_block_model(w_f, w_s, w_next, w_out):
+        return _model(
+            f"""
+            g (float[N,{Cin},10,10] X) => (float[N,{Cout},8,8] Y)
+            {{
+              f = Conv<kernel_shape=[3,3]>(X, WF)
+              s = Conv<kernel_shape=[3,3]>(X, WS)
+              add1 = Add(f, s)
+              r = Relu(add1)
+              nxt = Conv<kernel_shape=[1,1]>(r, WNEXT)
+              add2 = Add(nxt, r)
+              Y = Conv<kernel_shape=[1,1]>(add2, WOUT)
+            }}
+            """,
+            initializer=[
+                _f32(w_f, "WF"),
+                _f32(w_s, "WS"),
+                _f32(w_next, "WNEXT"),
+                _f32(w_out, "WOUT"),
+            ],
+        )
+
+    model = _interior_block_model(w_f, w_s, w_next, w_out)
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    # Deliberately conflicting per-channel importance across WF/WS/WNEXT
+    # (independent random weights) means a `keep` recomputed differently at
+    # different points -- e.g. WF/WS's own combined ranking used for the
+    # producer slice, but a *different* one silently used for WNEXT's own
+    # input-axis consumer slice -- would show up immediately as a
+    # dimension/index mismatch (caught by the checker/oracle below), not
+    # just a subtly wrong number: proof the *same* propagated `keep` is
+    # what every branch actually used.
+    importance = np.sqrt(
+        np.square(np.linalg.norm(w_f.reshape(C, -1).astype(np.float64), axis=1))
+        + np.square(np.linalg.norm(w_s.reshape(C, -1).astype(np.float64), axis=1))
+        + np.square(np.linalg.norm(w_next.reshape(C, -1).astype(np.float64), axis=1))
+    )
+    keep = np.sort(np.argsort(-importance)[: C // 2])
+
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    np.testing.assert_array_equal(inits["WF"], w_f[keep])
+    np.testing.assert_array_equal(inits["WS"], w_s[keep])
+    np.testing.assert_array_equal(inits["WNEXT"], w_next[np.ix_(keep, keep)])
+    np.testing.assert_array_equal(inits["WOUT"], w_out[:, keep])
+
+    oracle = _interior_block_model(
+        w_f[keep], w_s[keep], w_next[np.ix_(keep, keep)], w_out[:, keep]
+    )
+    rng_x = np.random.default_rng(841)
+    x = rng_x.standard_normal((2, Cin, 10, 10)).astype(np.float32)
+    (y,) = _run(pruned, {"X": x})
+    (y_oracle,) = _run(oracle, {"X": x})
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-5, atol=1e-5)
+
+
+def test_structured_pruning_conv_residual_add_declines_on_conflicting_shared_weight():
+    # The genuine danger fan-out could introduce: two *different* chains
+    # both wanting to prune the exact same weight's same axis to two
+    # *different*, independently-derived `keep` sets. This can't happen on
+    # a shared *activation* tensor at all (ONNX gives every tensor exactly
+    # one producer, so a tensor can only ever belong to the one chain whose
+    # own walk reaches it) -- so it's engineered here the only way it can
+    # actually arise: a tied/reused *weight*. `WNEXT` is reused as both the
+    # interior-block group's own fan-out consumer (`nxt = Conv(r, WNEXT)`,
+    # wanting the group's own combined-importance `keep`) *and*, completely
+    # independently, an ordinary chain's own consumer (`Q = Conv(p,
+    # WNEXT)`, wanting `WP`'s own unrelated `keep2`). `_find_conv_chains`
+    # runs (and is applied) before `_find_conv_residual_chains` in
+    # `apply_structured_pruning`'s own chain list, so the ordinary P->WNEXT
+    # chain claims `WNEXT` as a consumer first; the interior-block group,
+    # processed second, finds its own `consumer_weights` overlaps
+    # `consumer_touched` and declines *entirely* -- WF/WS/WOUT left
+    # byte-identical to their original values (no partial pruning), and
+    # WNEXT touched *only* by the ordinary chain that actually won the
+    # conflict, on its own axis (input/consumer), never on the axis
+    # (output/producer) the declined group would have used.
+    Cin, C, Cout = 3, 16, 8
+    Cin2 = 5
+    rng = np.random.default_rng(97)
+    w_f = rng.standard_normal((C, Cin, 3, 3)).astype(np.float32)
+    w_s = rng.standard_normal((C, Cin, 3, 3)).astype(np.float32)
+    w_next = rng.standard_normal((C, C, 1, 1)).astype(np.float32)
+    w_out = rng.standard_normal((Cout, C, 1, 1)).astype(np.float32)
+    w_p = rng.standard_normal((C, Cin2, 3, 3)).astype(np.float32)
     model = _model(
         f"""
-        g (float[N,{Cin},10,10] X) => (float[N,{Cout},8,8] Y)
+        g (float[N,{Cin},10,10] X, float[N,{Cin2},10,10] Z)
+            => (float[N,{Cout},8,8] Y, float[N,{C},8,8] Q)
         {{
           f = Conv<kernel_shape=[3,3]>(X, WF)
           s = Conv<kernel_shape=[3,3]>(X, WS)
@@ -3256,6 +3357,8 @@ def test_structured_pruning_conv_residual_add_declines_on_fan_out_branch():
           nxt = Conv<kernel_shape=[1,1]>(r, WNEXT)
           add2 = Add(nxt, r)
           Y = Conv<kernel_shape=[1,1]>(add2, WOUT)
+          p = Conv<kernel_shape=[3,3]>(Z, WP)
+          Q = Conv<kernel_shape=[1,1]>(p, WNEXT)
         }}
         """,
         initializer=[
@@ -3263,24 +3366,38 @@ def test_structured_pruning_conv_residual_add_declines_on_fan_out_branch():
             _f32(w_s, "WS"),
             _f32(w_next, "WNEXT"),
             _f32(w_out, "WOUT"),
+            _f32(w_p, "WP"),
         ],
     )
     pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
     inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
     np.testing.assert_array_equal(inits["WF"], w_f)
     np.testing.assert_array_equal(inits["WS"], w_s)
-    np.testing.assert_array_equal(inits["WNEXT"], w_next)
     np.testing.assert_array_equal(inits["WOUT"], w_out)
+
+    importance2 = np.linalg.norm(w_p.reshape(C, -1).astype(np.float64), axis=1)
+    keep2 = np.sort(np.argsort(-importance2)[: C // 2])
+    np.testing.assert_array_equal(inits["WP"], w_p[keep2])
+    # WNEXT's *input* axis (consumer role) was pruned by the winning
+    # ordinary chain's own keep2 -- its *output* axis (producer role) is
+    # exactly its original, untouched width, since the declined group never
+    # got to slice it.
+    assert inits["WNEXT"].shape == (C, C // 2, 1, 1)
+    np.testing.assert_array_equal(inits["WNEXT"], w_next[:, keep2])
 
 
 def test_structured_pruning_conv_residual_add_declines_on_identity_shortcut():
     # y = Conv2(Relu(Add(Conv1(X), X))): a classic identity-shortcut
     # residual block with *no* Conv on the shortcut path at all. `X` has no
-    # producer this pass owns (it's a graph input) *and* is itself read
-    # twice (by Conv1 and directly by Add) -- either alone is enough to
-    # decline: nothing can slice a graph input's own channel count to match
-    # a pruned Conv1, so the whole block is left untouched rather than
-    # guessed at.
+    # producer this pass owns at all -- it's a graph input, not a tensor any
+    # node in this graph produces -- so the backward walk from `add1`'s `X`
+    # operand fails outright (nothing to slice a graph input's own channel
+    # count to match a pruned Conv1 with) and the whole block is left
+    # untouched rather than guessed at. (`X` is also read twice -- by Conv1
+    # and directly by Add -- but that alone no longer declines anything: see
+    # `test_structured_pruning_conv_residual_add_prunes_interior_block_fan_out`.)
     C, Cout = 8, 4
     rng = np.random.default_rng(85)
     w1 = rng.standard_normal((C, C, 1, 1)).astype(np.float32)
@@ -3393,7 +3510,8 @@ def test_structured_wanda_pruning_conv_residual_add_matches_oracle():
 # onnxsim.pruning's own module docstring and
 # _find_matmul_residual_chains's own section comment for the shared
 # reasoning. Mirrors the Conv residual test suite's own shape (diamond,
-# transitive, fan-out decline, identity-shortcut decline, Wanda-for-free)
+# transitive, interior-block fan-out, identity-shortcut decline,
+# Wanda-for-free)
 # plus the composition-safety cases specific to the wider MatMul/Gemm hop
 # set: a per-channel bias Add hop, a transposed (`transB=1`) Gemm producer,
 # a gated-FFN branch with no downstream projection, and a bare fused
@@ -3538,55 +3656,87 @@ def test_structured_pruning_matmul_residual_add_transitive_chain_matches_oracle(
     np.testing.assert_allclose(y, y_oracle, rtol=1e-5, atol=1e-5)
 
 
-def test_structured_pruning_matmul_residual_add_declines_on_fan_out_branch():
-    # A realistic multi-block residual stack's interior boundary: `r`
-    # (add1's own post-block tensor) is read *twice* -- once by the next
-    # block's own first MatMul (`nxt`), once unchanged as that next block's
-    # own Add shortcut operand (`add2`) -- exactly the fan-out
-    # _walk_matmul_producer_backward's single-consumer bar declines. Left
-    # completely untouched, the same guarantee the Conv version holds to.
+def test_structured_pruning_matmul_residual_add_prunes_interior_block_fan_out():
+    # The MatMul/Gemm analogue of
+    # test_structured_pruning_conv_residual_add_prunes_interior_block_fan_out
+    # -- the exact transformer-stack "interior block" shape: `r` (add1's own
+    # post-block tensor) is read *twice*, by the next block's own first
+    # MatMul (`nxt`) and unchanged by that block's own Add shortcut
+    # (`add2`), both safe continuations of the *same* union-find group, so
+    # the group's shared `keep` set is propagated to both. `WNEXT` again
+    # plays a genuine dual role in this one chain: a leaf producer (its own
+    # output feeds add2, ranked alongside WF/WS) and an ordinary consumer of
+    # the group's spine (its own reduction axis pruned to match `r`).
     K, C, Out = 8, 16, 4
     rng = np.random.default_rng(94)
     wf = rng.standard_normal((K, C)).astype(np.float32)
     ws = rng.standard_normal((K, C)).astype(np.float32)
     wnext = rng.standard_normal((C, C)).astype(np.float32)
     wout = rng.standard_normal((C, Out)).astype(np.float32)
-    model = _model(
-        f"""
-        g (float[batch,{K}] X) => (float[batch,{Out}] Y)
-        {{
-          f = MatMul(X, WF)
-          s = MatMul(X, WS)
-          add1 = Add(f, s)
-          r = Relu(add1)
-          nxt = MatMul(r, WNEXT)
-          add2 = Add(nxt, r)
-          Y = MatMul(add2, WOUT)
-        }}
-        """,
-        initializer=[
-            _f32(wf, "WF"),
-            _f32(ws, "WS"),
-            _f32(wnext, "WNEXT"),
-            _f32(wout, "WOUT"),
-        ],
-    )
+
+    def _interior_block_model(wf, ws, wnext, wout):
+        return _model(
+            f"""
+            g (float[batch,{K}] X) => (float[batch,{Out}] Y)
+            {{
+              f = MatMul(X, WF)
+              s = MatMul(X, WS)
+              add1 = Add(f, s)
+              r = Relu(add1)
+              nxt = MatMul(r, WNEXT)
+              add2 = Add(nxt, r)
+              Y = MatMul(add2, WOUT)
+            }}
+            """,
+            initializer=[
+                _f32(wf, "WF"),
+                _f32(ws, "WS"),
+                _f32(wnext, "WNEXT"),
+                _f32(wout, "WOUT"),
+            ],
+        )
+
+    model = _interior_block_model(wf, ws, wnext, wout)
     pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    # Same deliberately-conflicting-importance argument as the Conv version:
+    # WF/WS/WNEXT are independent random weights, so a `keep` silently
+    # recomputed differently at different points would show up as a
+    # shape/index mismatch, not just a subtly wrong number.
+    importance = np.sqrt(
+        np.square(np.linalg.norm(wf.astype(np.float64), axis=0))
+        + np.square(np.linalg.norm(ws.astype(np.float64), axis=0))
+        + np.square(np.linalg.norm(wnext.astype(np.float64), axis=0))
+    )
+    keep = np.sort(np.argsort(-importance)[: C // 2])
+
     inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
-    np.testing.assert_array_equal(inits["WF"], wf)
-    np.testing.assert_array_equal(inits["WS"], ws)
-    np.testing.assert_array_equal(inits["WNEXT"], wnext)
-    np.testing.assert_array_equal(inits["WOUT"], wout)
+    np.testing.assert_array_equal(inits["WF"], wf[:, keep])
+    np.testing.assert_array_equal(inits["WS"], ws[:, keep])
+    np.testing.assert_array_equal(inits["WNEXT"], wnext[np.ix_(keep, keep)])
+    np.testing.assert_array_equal(inits["WOUT"], wout[keep, :])
+
+    oracle = _interior_block_model(
+        wf[:, keep], ws[:, keep], wnext[np.ix_(keep, keep)], wout[keep, :]
+    )
+    rng_x = np.random.default_rng(941)
+    x = rng_x.standard_normal((2, K)).astype(np.float32)
+    (y,) = _run(pruned, {"X": x})
+    (y_oracle,) = _run(oracle, {"X": x})
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-5, atol=1e-5)
 
 
 def test_structured_pruning_matmul_residual_add_declines_on_identity_shortcut():
     # y = MatMul2(Relu(Add(MatMul1(X), X))): the exact `x = x + f(x)`
     # transformer-residual identity-shortcut shape, no MatMul on the
-    # shortcut path at all. `X` has no producer this pass owns (it's a
-    # graph input) *and* is itself read twice (by MatMul1 and directly by
-    # Add) -- either alone is enough to decline: nothing can slice a graph
-    # input's own channel count to match a pruned MatMul1, so the whole
-    # block is left untouched rather than guessed at.
+    # shortcut path at all. `X` has no producer this pass owns at all --
+    # it's a graph input, not a tensor any node in this graph produces -- so
+    # the backward walk from `add1`'s `X` operand fails outright, and the
+    # whole block is left untouched rather than guessed at. (`X` is also
+    # read twice -- by MatMul1 and directly by Add -- but that alone no
+    # longer declines anything: see
+    # test_structured_pruning_matmul_residual_add_prunes_interior_block_fan_out.)
     C, Out = 8, 4
     rng = np.random.default_rng(95)
     w1 = rng.standard_normal((C, C)).astype(np.float32)

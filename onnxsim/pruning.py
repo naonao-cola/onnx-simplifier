@@ -44,15 +44,30 @@ unary-activation/depthwise-pass-through hops the forward walk already
 allows) to a real ``group=1`` Conv producer -- or, transitively, to
 *another* such `Add` merge point, unioning that one's own group in too (the
 "many residual blocks share one spine" case). This is still bounded, not
-general DepGraph: it holds every hop, on every branch, to the same
-single-consumer safety bar as the rest of this pass, so a real multi-block
-ResNet's shared "post-block" tensor -- read by both the next block's own
-first Conv *and* directly by that block's own `Add` -- is exactly the kind
-of fan-out this still declines rather than guesses at, leaving an
-*interior* block of a deep residual stage untouched; what it does reach is
-a single residual connection whose branches don't fan out elsewhere (e.g. a
-projection-shortcut block, or a stage's last block before something else
-consumes its output) and a genuinely linear stack of `Add`-only merges.
+general DepGraph: every hop that walks *toward* a group's own producers
+still requires a real Conv/`Add` topology it recognizes, and the two
+compositions checked and found unsafe (see :func:`_find_matmul_residual_chains`'s
+own section comment for the MatMul/Gemm ones -- a gated combine or a fused
+attention op sitting directly on a residual branch, with no projection
+MatMul/Conv in between) are still declined outright. What *is* now
+reached, and wasn't originally: a real multi-block ResNet or transformer
+stage's shared "post-block" tensor, read by *both* the next block's own
+first layer *and* directly by that block's own `Add`/`SkipLayerNormalization`
+-- once a group's shared channel-index set is established, propagating it
+forward to more than one independent, ordinary downstream reader of the
+same in-group tensor turns out to need no new tie-break the way resolving
+it backward from multiple *producers* would (see
+:func:`_find_conv_residual_chains`'s own section comment for the exact
+mechanism, :func:`_resolve_conv_fanout_branches`/
+:func:`_resolve_matmul_fanout_branches`, and precisely where the remaining
+boundary sits: an extra reader that itself forks further, reaches a graph
+output, or would need a tie-break between two *conflicting* keep sets on
+the same shared weight, still declines the whole group). What this reaches
+now: a single residual connection (whether its branches fan out elsewhere
+or not), a genuinely linear stack of `Add`-only merges, and a real
+*interior* block of a deep residual stage -- essentially the full shape of
+a real multi-block ResNet/transformer stage, short of the two compositions
+above and a cross-chain conflict on a literally shared weight.
 
 The exact same construction is repeated for MatMul/Gemm chains -- see
 :func:`_find_matmul_residual_chains`'s own section comment for the full
@@ -167,9 +182,15 @@ transitively into another `Concat`, or composed with a gated/residual
 branch, is declined the same conservative way as everything above) and
 :func:`_apply_concat_chains`'s own docstring for why that per-branch,
 independent-`keep` shape needed a genuinely new sibling to
-`_Chain`/`_apply_chains` rather than fitting into the existing one. General
-multi-branch dependency-graph pruning -- arbitrary fan-out, a non-`Add`/
-`Concat` merge op, ... -- remains out of scope. The
+`_Chain`/`_apply_chains` rather than fitting into the existing one.
+
+General multi-branch dependency-graph pruning remains out of scope --
+a non-`Add`/`SkipLayerNormalization`/`Concat` merge op, and fan-out
+anywhere *except* forward from an already-established residual/merge
+group's own shared channel-index set (see above): an ordinary chain's own
+producer output, or any tensor not already inside such a group, is still
+declined outright the moment it has more than one consumer, exactly as
+before. The
 other part of the paper's pipeline -- an architecture *search* over what to prune,
 alternated with knowledge-distillation/RL recovery afterwards -- needs a
 training loop onnxsim does not have and is not in scope here at all; this
@@ -1858,6 +1879,44 @@ class _Chain:
     # :func:`_chain_group`) and the dedicated slicing
     # :func:`_slice_grouped_consumer_conv_weight` performs.
     consumer_group: int = 1
+    # Extra, independent downstream consumer branches beyond the "primary"
+    # one already carried on this chain's own singular `consumer_*` fields
+    # above -- populated only by :func:`_find_conv_residual_chains`/
+    # :func:`_find_matmul_residual_chains` for a residual/merge group whose
+    # own shared spine tensor fans out to more than one safe, ordinary
+    # consumer (see those functions' own "fan-out" section comment). Empty
+    # for every other chain kind, and for a residual/merge group with no
+    # such extra fan-out -- i.e. the exact shape every chain already had
+    # before this field existed. Each entry always resolves to an ordinary
+    # (`group == 1`) consumer, the same restriction the primary consumer
+    # above is already held to for a residual/merge chain.
+    extra_consumers: Tuple[_ConsumerBranch, ...] = ()
+
+
+@dataclass(frozen=True)
+class _ConsumerBranch:
+    """One independent downstream path fed by an already-established
+    residual/merge group's own shared channel-index set, beyond the
+    group's primary consumer (see :class:`_Chain.extra_consumers`'s own
+    comment and :func:`_find_conv_residual_chains`/
+    :func:`_find_matmul_residual_chains`'s "fan-out" section comment).
+    Mirrors exactly the subset of :class:`_Chain`'s own consumer-side
+    fields a branch needs to be sliced by :func:`_apply_chains` -- its own
+    trailing hop constants (`chain_ops`, e.g. an activation or bias/scale
+    hop unique to *this* branch's own path to *its* consumer), its own
+    real consumer, and, for a Conv branch, its own depthwise pass-through
+    hops crossed on the way there. Never carries a `consumer_group` of its
+    own: like the primary consumer, a branch resolving to a general grouped
+    Conv consumer is declined (the whole group, not just this branch) --
+    see this module's own docstring's grouped-Conv-consumer scope note.
+    """
+
+    chain_ops: Tuple[Tuple[onnx.NodeProto, Optional[str]], ...]
+    consumer_node: onnx.NodeProto
+    consumer_weight: str
+    consumer_weight_transposed: bool
+    consumer_is_conv: bool = False
+    conv_pass_through: Tuple[_ConvPassThrough, ...] = ()
 
 
 @dataclass
@@ -1984,6 +2043,7 @@ def _walk_to_consumer(
     graph_outputs: Set[str],
     n_channels: int,
     max_hops: int,
+    forced_first_hop: Optional[onnx.NodeProto] = None,
 ) -> Tuple[Optional[_ConsumerMatch], Tuple[Tuple[onnx.NodeProto, Optional[str]], ...]]:
     """From tensor `start`, walks forward through shape-preserving
     elementwise ops (an activation, an Add/Mul against a constant
@@ -1993,15 +2053,25 @@ def _walk_to_consumer(
     the way, until a MatMul/vanilla-Gemm consumer is found whose reduction
     dimension matches `n_channels`. Returns ``(None, ())`` if the walk
     runs out of hops, hits a branch, or never reaches such a consumer.
+
+    `forced_first_hop`, when given, is used as the walk's very first hop
+    instead of deriving it from `consumers_of[start]` -- see
+    :func:`_walk_to_conv_consumer`'s own matching parameter for why (used
+    only by :func:`_find_matmul_residual_chains`'s "fan-out" post-check);
+    every ordinary caller leaves it ``None`` and gets identical behavior to
+    before this parameter existed.
     """
     chain_ops: List[Tuple[onnx.NodeProto, Optional[str]]] = []
     consumer = None
     cur = start
     for _hop in range(max_hops):
-        candidates = consumers_of.get(cur, [])
-        if len(candidates) != 1:
-            break
-        nxt = candidates[0]
+        if _hop == 0 and forced_first_hop is not None:
+            nxt = forced_first_hop
+        else:
+            candidates = consumers_of.get(cur, [])
+            if len(candidates) != 1:
+                break
+            nxt = candidates[0]
 
         cm = _match_matmul_like(nxt)
         if cm is not None and cm[0] == cur:
@@ -2257,6 +2327,7 @@ def _walk_to_conv_consumer(
     graph_outputs: Set[str],
     n_channels: int,
     max_hops: int,
+    forced_first_hop: Optional[onnx.NodeProto] = None,
 ) -> Tuple[
     Optional[Tuple[onnx.NodeProto, str, int]],
     Tuple[Tuple[onnx.NodeProto, None], ...],
@@ -2278,16 +2349,32 @@ def _walk_to_conv_consumer(
     unmatched topology. Unlike the MatMul/Gemm walk, no per-channel
     ``Add``/``Mul`` op is recognized -- see this module's own docstring for
     why that's out of scope for Conv chains.
+
+    `forced_first_hop`, when given, is used as the walk's very first hop
+    instead of deriving it from `consumers_of[start]` -- every ordinary
+    caller leaves it ``None`` and gets identical behavior to before this
+    parameter existed (`start` must still have exactly one consumer, found
+    the normal way). It exists only for
+    :func:`_find_conv_residual_chains`'s own "fan-out" post-check: `start`
+    having *more than one* consumer is expected there (it's an
+    already-established residual/merge group's own shared spine tensor),
+    and the caller has already picked one specific consumer node to resolve
+    this one branch through -- every hop *after* the first still enforces
+    the ordinary single-consumer bar unchanged, so a branch that itself
+    forks further is still declined exactly as it always was.
     """
     chain_ops: List[Tuple[onnx.NodeProto, None]] = []
     conv_pass_through: List[_ConvPassThrough] = []
     consumer: Optional[Tuple[onnx.NodeProto, str, int]] = None
     cur = start
     for _hop in range(max_hops):
-        candidates = consumers_of.get(cur, [])
-        if len(candidates) != 1:
-            break
-        nxt = candidates[0]
+        if _hop == 0 and forced_first_hop is not None:
+            nxt = forced_first_hop
+        else:
+            candidates = consumers_of.get(cur, [])
+            if len(candidates) != 1:
+                break
+            nxt = candidates[0]
 
         if nxt.op_type == "Conv" and nxt.input[0] == cur:
             depthwise = _match_depthwise_conv_pass_through(
@@ -2421,23 +2508,70 @@ def _find_conv_chains(graph: onnx.GraphProto) -> List[_Chain]:
 # sharing one spine channel count -- "many residual blocks share one
 # spine" -- by walking backward from each `Add` operand and, on hitting
 # *another* eligible `Add`'s raw output, unioning that `Add`'s own group in
-# rather than stopping. What it does **not** do, on purpose, is relax the
-# single-consumer bar every other hop in this module already holds every
-# intermediate tensor to: a real multi-block ResNet stage's post-block
-# tensor is read *twice* (once by the next block's own first Conv, once
-# as-is by that block's own `Add`), and that fan-out is exactly the
-# "more than one ... consumer anywhere along it" case this pass declines
-# rather than guesses at -- so an *interior* block of a real deep ResNet
-# stage is left completely untouched by this mechanism (the same
-# conservative "no branch-following" boundary as everywhere else in this
-# module), while a lone residual connection (a single `Add`, each branch
-# its own uninterrupted Conv/depthwise-pass-through chain back to a real
-# producer -- e.g. a projection-shortcut block, or the very last block of a
-# stage before something else consumes its output) or a genuinely linear
-# stack of `Add`-only combinations (no intervening branch at all) is
-# pruned, with the same oracle-verified numeric guarantee as every other
-# chain kind here. See this module's own docstring for how this changes
-# (without fully retiring) the "left untouched" residual paragraph above.
+# rather than stopping.
+#
+# A real multi-block ResNet stage's post-block tensor is read *twice*
+# (once by the next block's own first Conv, once as-is by that block's own
+# `Add`) -- exactly the "interior block" shape earlier versions of this
+# section declined outright, since every hop here used to require *exactly
+# one* consumer, the same bar every other hop in this module still holds
+# every intermediate tensor to. That fan-out turns out to have its own
+# provably-safe special case, bounded the same way the residual case itself
+# is bounded relative to general dependency-graph pruning: once a group's
+# shared channel-index set is established (by the *existing* backward
+# union-find above -- this doesn't change how a group's own producers are
+# found, or relax anything about *that*), it is a fixed, already-decided
+# quantity everywhere within the group -- so *propagating* it forward to
+# more than one independent downstream reader of the same in-group tensor
+# is a different, narrower problem than *resolving* it from multiple
+# upstream producers in the first place, and doesn't share that problem's
+# ambiguity: there is no tie-break to invent, because every extra reader is
+# either (a) an ordinary Conv consumer -- exactly the shape
+# `_walk_to_conv_consumer` already knows how to slice, just entered at a
+# specific node instead of derived from "the" sole consumer -- or (b)
+# another eligible `Add`, which the *existing* union-find machinery above
+# already absorbs into the very same group for free (it iterates every
+# eligible `Add` in the graph unconditionally, not just ones reached from
+# elsewhere), so two merges racing to claim the same spine either land in
+# one group with one sink (fine) or in one group with *two* sinks -- caught
+# by the pre-existing `len(sinks) != 1` check below, unchanged.
+#
+# `_resolve_conv_fanout_branches` is the actual new mechanism: once a
+# group is otherwise fully resolved (agreeing leaf channel counts, exactly
+# one sink, no degenerate producer), every tensor the group's own backward
+# walk touched -- from a leaf producer's own output through every
+# pass-through/unary hop and every interior `Add`'s own output, to the
+# sink's own output -- is checked for *extra* consumers beyond the ones the
+# group's own union-find already accounts for, and each extra consumer is
+# resolved independently via `_walk_to_conv_consumer` (seeded at that one
+# specific node -- see its own `forced_first_hop` parameter). Any extra
+# consumer that doesn't resolve this way -- forks further itself, reaches a
+# graph output, resolves to a general grouped Conv, or duplicates a weight
+# another branch already claims -- declines the *entire* group, never a
+# partial cut; what survives is one or more independent forward branches
+# (:class:`_Chain.extra_consumers`), every one sliced by the exact same
+# shared `keep` array, so there is no "different derivation" for any branch
+# to disagree with another one about.
+#
+# What this still does **not** reach: two chains (a residual group and
+# anything else, or two different residual groups) that would each prune
+# the *same* weight to a *different* keep set. That can't happen on a
+# shared *activation* tensor at all -- ONNX gives every tensor exactly one
+# producer, so a tensor can only ever belong to the one group whose own
+# backward walk (or extra-branch forward walk) reaches it -- but it can
+# still happen on a shared *weight* two otherwise-independent chains both
+# want to touch (a tied/reused initializer); `_apply_chains`'s own
+# touched-role tracking (`producer_touched`/`consumer_touched`/
+# `const_touched`/`conv_hop_touched`) already declines that case for a
+# single-consumer chain, and is extended here (see its own comment) to
+# check every branch's own consumer weight, not just the primary one, so
+# it keeps catching it for a multi-branch chain too. A lone residual
+# connection whose branches don't fan out elsewhere (e.g. a
+# projection-shortcut block), a genuinely linear stack of `Add`-only
+# combinations, and now a real *interior* multi-block stage, are all
+# reached with the same oracle-verified numeric guarantee as every other
+# chain kind here. See this module's own docstring for the exact boundary
+# of what this still declines.
 
 
 def _is_eligible_add_merge(
@@ -2493,7 +2627,6 @@ def _walk_conv_producer_backward(
     start: str,
     node_by_output: Dict[str, onnx.NodeProto],
     initializer_map: Dict[str, onnx.TensorProto],
-    consumers_of: Dict[str, List[onnx.NodeProto]],
     graph_outputs: Set[str],
     max_hops: int,
 ) -> Tuple[
@@ -2501,43 +2634,58 @@ def _walk_conv_producer_backward(
     Optional[Union[Tuple[_Producer, int], onnx.NodeProto]],
     Tuple[_ConvPassThrough, ...],
     Tuple[onnx.NodeProto, ...],
+    Tuple[Tuple[str, onnx.NodeProto], ...],
 ]:
     """The backward counterpart of :func:`_walk_to_conv_consumer`, used only
     by :func:`_find_conv_residual_chains` to resolve one operand of an
     ``Add`` merge point back to whatever produces it. Walks backward from
     tensor `start` through unary pass-through activations and
     self-consistently-depthwise Conv hops (see
-    :func:`_match_conv_pass_through_self`), requiring every tensor crossed
-    -- `start` itself included -- to have exactly one consumer, the same
-    safety bar every other hop in this module already holds every
-    intermediate tensor to. This is exactly what makes a real multi-block
-    ResNet's shared "post-block" tensor -- read both by the next block's
-    own first Conv and, unchanged, by that block's own ``Add`` -- resolve to
-    ``"fail"`` rather than being silently pruned wrong: whichever of its two
-    readers this walk is approached from finds more than one consumer on
-    the very first hop and stops.
+    :func:`_match_conv_pass_through_self`), declining (only) whenever a
+    tensor crossed -- `start` itself included -- is a graph output (a
+    caller-observed shape this pass never resizes); *how many* other things
+    also read that same tensor is deliberately **not** checked here -- see
+    :func:`_find_conv_residual_chains`'s own "fan-out" section comment for
+    why, and how every such extra reader still gets its own safety check,
+    just later, once the group's real channel count is known.
 
     Returns one of:
 
-    - ``("producer", (producer, n_channels), pass_through, unary_ops)`` --
-      resolved all the way back to a real ``group=1`` Conv producer;
-    - ``("add", add_node, pass_through, unary_ops)`` -- resolved to another
-      eligible ``Add`` merge node's raw output instead (the "many residual
-      blocks share one spine" case: the caller unions this group with that
-      ``Add``'s own rather than treating it as a separate producer);
-    - ``("fail", None, (), ())`` -- a graph input, a non-Conv/non-``Add``
-      producer, a branch, or the hop limit -- the caller declines the whole
-      group this operand belongs to, rather than guessing.
+    - ``("producer", (producer, n_channels), pass_through, unary_ops,
+      edges)`` -- resolved all the way back to a real ``group=1`` Conv
+      producer;
+    - ``("add", add_node, pass_through, unary_ops, edges)`` -- resolved to
+      another eligible ``Add`` merge node's raw output instead (the "many
+      residual blocks share one spine" case: the caller unions this group
+      with that ``Add``'s own rather than treating it as a separate
+      producer);
+    - ``("fail", None, (), (), ())`` -- a graph input, a non-Conv/non-``Add``
+      producer, a graph output crossed mid-walk, or the hop limit -- the
+      caller declines the whole group this operand belongs to, rather than
+      guessing.
+
+    `edges` is, for every hop that actually advanced `cur`, the pair
+    ``(new_cur, node)`` recording that `new_cur`'s own *in-group* forward
+    consumer is `node` -- i.e. the one reader of `new_cur` that this walk
+    itself already accounts for, so :func:`_find_conv_residual_chains`
+    doesn't re-flag it as a stray extra consumer needing its own separate
+    resolution once fan-out is no longer rejected here (`start` itself,
+    plus every tensor named as some `edges` entry's own `new_cur`, is
+    exactly the full set of tensors this walk checked -- nothing else needs
+    tracking separately). `start`'s own in-group forward consumer -- the
+    ``Add`` this walk was launched *from* -- isn't a `node_by_output` hop at
+    all, so the caller records that one edge itself.
     """
     pass_through: List[_ConvPassThrough] = []
     unary_ops: List[onnx.NodeProto] = []
+    edges: List[Tuple[str, onnx.NodeProto]] = []
     cur = start
     for _hop in range(max_hops):
-        if len(consumers_of.get(cur, [])) != 1 or cur in graph_outputs:
-            return "fail", None, (), ()
+        if cur in graph_outputs:
+            return "fail", None, (), (), ()
         node = node_by_output.get(cur)
         if node is None or len(node.output) != 1 or node.output[0] != cur:
-            return "fail", None, (), ()
+            return "fail", None, (), (), ()
 
         prod_info = _match_conv_producer(node, initializer_map)
         if prod_info is not None:
@@ -2548,24 +2696,27 @@ def _walk_conv_producer_backward(
                 # docstring ("a real group=1 Conv producer"). Combining
                 # per-group independent top-k with cross-branch
                 # combined-importance ranking isn't verified here.
-                return "fail", None, (), ()
+                return "fail", None, (), (), ()
             producer = _Producer(node, w_name, False, bias_name, is_conv=True)
             return (
                 "producer",
                 (producer, n_channels),
                 tuple(reversed(pass_through)),
                 tuple(reversed(unary_ops)),
+                tuple(edges),
             )
 
         dw = _match_conv_pass_through_self(node, initializer_map)
         if dw is not None:
             dw_weight, dw_bias = dw
             pass_through.append(_ConvPassThrough(node, dw_weight, dw_bias))
+            edges.append((node.input[0], node))
             cur = node.input[0]
             continue
 
         if node.op_type in _UNARY_PASS_THROUGH and len(node.input) == 1:
             unary_ops.append(node)
+            edges.append((node.input[0], node))
             cur = node.input[0]
             continue
 
@@ -2575,11 +2726,98 @@ def _walk_conv_producer_backward(
                 node,
                 tuple(reversed(pass_through)),
                 tuple(reversed(unary_ops)),
+                tuple(edges),
             )
 
-        return "fail", None, (), ()
+        return "fail", None, (), (), ()
 
-    return "fail", None, (), ()
+    return "fail", None, (), (), ()
+
+
+def _resolve_conv_fanout_branches(
+    backbone_tensors: List[str],
+    accounted: Dict[str, Set[int]],
+    initializer_map: Dict[str, onnx.TensorProto],
+    consumers_of: Dict[str, List[onnx.NodeProto]],
+    graph_outputs: Set[str],
+    n_channels: int,
+) -> Optional[List[_ConsumerBranch]]:
+    """For an already-established Conv residual/merge group -- every tensor
+    in `backbone_tensors` is one :func:`_walk_conv_producer_backward`'s own
+    backward walk already proved carries that group's shared channel-index
+    set, `accounted` marks, per tensor, which specific consumer node(s) are
+    already part of the group's own internal wiring (see that function's
+    own docstring) -- finds every *extra* consumer (one not in `accounted`)
+    of every backbone tensor and resolves each independently via
+    :func:`_walk_to_conv_consumer`, seeded at that one specific node (see
+    its own `forced_first_hop` parameter). This is the actual "fan-out"
+    mechanism: :func:`_find_conv_residual_chains`'s own section comment
+    above explains why propagating one already-established `keep` set
+    forward to several independent, individually-ordinary consumer
+    branches is safe in a way general dependency-graph *merging* isn't.
+
+    Returns ``None`` -- decline the *whole* group, never partially -- if
+    any backbone tensor is itself a graph output (this pass never resizes
+    a directly-observed shape), any extra consumer fails to resolve to a
+    real ordinary (``group=1``) Conv consumer within the usual hop limit,
+    or two different branches would end up naming the same consumer
+    weight (double-slicing it would corrupt it -- the same degenerate case
+    :func:`_apply_chains` already guards a single chain's own producers
+    against). Returns an empty list if the group has no extra fan-out *and*
+    no branch at all (every backbone tensor's consumers, if any, are
+    already accounted for) -- the caller treats that exactly like "no
+    consumer found" and declines, same as before this function existed.
+    Otherwise returns every resolved branch; the caller picks one as this
+    chain's own "primary" consumer (the shape every other chain already
+    has) and carries the rest as `_Chain.extra_consumers` -- an arbitrary
+    choice with no bearing on correctness, since every branch is sliced by
+    the exact same shared `keep` array.
+    """
+    branches: List[_ConsumerBranch] = []
+    seen_weights: Set[str] = set()
+    for tensor in backbone_tensors:
+        if tensor in graph_outputs:
+            return None
+        seen_nodes: Set[int] = set()
+        for consumer_node in consumers_of.get(tensor, []):
+            if id(consumer_node) in seen_nodes:
+                continue
+            seen_nodes.add(id(consumer_node))
+            if id(consumer_node) in accounted.get(tensor, ()):
+                continue  # already part of the group's own established wiring
+            resolved, br_chain_ops, br_pass_through = _walk_to_conv_consumer(
+                tensor,
+                initializer_map,
+                consumers_of,
+                graph_outputs,
+                n_channels,
+                _MAX_CHAIN_HOPS,
+                forced_first_hop=consumer_node,
+            )
+            if resolved is None:
+                return None
+            branch_node, branch_weight, branch_group = resolved
+            if branch_group != 1:
+                # Same restriction as the primary consumer everywhere else
+                # in this section: a general grouped Conv consumer's
+                # per-group top-k assumes every producer feeds its full
+                # (ungrouped) channel range, unverified for a multi-branch
+                # residual group.
+                return None
+            if branch_weight in seen_weights:
+                return None  # two branches naming the same consumer weight
+            seen_weights.add(branch_weight)
+            branches.append(
+                _ConsumerBranch(
+                    chain_ops=br_chain_ops,
+                    consumer_node=branch_node,
+                    consumer_weight=branch_weight,
+                    consumer_weight_transposed=False,
+                    consumer_is_conv=True,
+                    conv_pass_through=br_pass_through,
+                )
+            )
+    return branches
 
 
 def _find_conv_residual_chains(graph: onnx.GraphProto) -> List[_Chain]:
@@ -2591,20 +2829,21 @@ def _find_conv_residual_chains(graph: onnx.GraphProto) -> List[_Chain]:
     group) or another `Add` already in the same group. If *any* operand,
     anywhere in the group, fails to resolve that way, or the leaf
     producers' channel counts don't all agree, the *entire* group is
-    declined -- never partially pruned. A correctly-resolved group must
-    reduce to exactly one "sink" `Add` (the one whose own output isn't
-    itself consumed by another `Add` in the group); the chain walk
-    continues forward from there via the ordinary :func:`_walk_to_conv_consumer`
-    to find the group's one real downstream consumer, exactly as any other
-    Conv chain does.
+    declined -- never partially pruned. Every tensor visited along the way
+    (see :func:`_walk_conv_producer_backward`'s own `edges`) plus the
+    group's own "sink" (the one member whose own output isn't itself
+    consumed by another member) is then handed to
+    :func:`_resolve_conv_fanout_branches`, which finds and resolves every
+    extra (non-backbone) consumer fan-out reaches, in exactly the bounded
+    way this section's own comment above describes -- declining the whole
+    group if any such branch can't be resolved. What survives is one or
+    more independent forward branches, all fed by the exact same shared
+    `keep` set once :func:`_apply_chains` computes it.
     """
     initializer_map = {t.name: t for t in graph.initializer}
     consumers_of = _consumers_of(graph)
     node_by_output = {out: node for node in graph.node for out in node.output}
     graph_outputs = {o.name for o in graph.output}
-
-    def _is_internal(name: str) -> bool:
-        return len(consumers_of.get(name, [])) == 1 and name not in graph_outputs
 
     eligible_adds = [
         node for node in graph.node if _is_eligible_add_merge(node, initializer_map)
@@ -2631,6 +2870,7 @@ def _find_conv_residual_chains(graph: onnx.GraphProto) -> List[_Chain]:
         Optional[Union[Tuple[_Producer, int], onnx.NodeProto]],
         Tuple[_ConvPassThrough, ...],
         Tuple[onnx.NodeProto, ...],
+        Tuple[Tuple[str, onnx.NodeProto], ...],
     ]
     edge_results: Dict[int, List[Edge]] = {}
     poisoned: Set[int] = set()
@@ -2641,7 +2881,6 @@ def _find_conv_residual_chains(graph: onnx.GraphProto) -> List[_Chain]:
                 operand,
                 node_by_output,
                 initializer_map,
-                consumers_of,
                 graph_outputs,
                 _MAX_CHAIN_HOPS,
             )
@@ -2672,9 +2911,30 @@ def _find_conv_residual_chains(graph: onnx.GraphProto) -> List[_Chain]:
         pass_through: List[_ConvPassThrough] = []
         unary_ops: List[onnx.NodeProto] = []
         referenced: Set[int] = set()
+        # Every tensor either walk of every member proved carries this
+        # group's own shared channel-index set (see
+        # _walk_conv_producer_backward's own `edges`), and, for
+        # each, which specific consumer node is already part of the
+        # group's own internal wiring -- fed to _resolve_conv_fanout_branches
+        # below so only genuinely *extra* consumers need their own separate
+        # resolution. A plain list (not a set) preserves first-seen order,
+        # so which resolved branch ends up "primary" is deterministic.
+        backbone_tensors: List[str] = []
+        accounted: Dict[str, Set[int]] = {}
+
+        def _mark_backbone(tensor: str, node: onnx.NodeProto) -> None:
+            if tensor not in accounted:
+                backbone_tensors.append(tensor)
+            accounted.setdefault(tensor, set()).add(id(node))
 
         for idx in members:
-            for kind, payload, pt, uops in edge_results[idx]:
+            add_node = eligible_adds[idx]
+            for operand, (kind, payload, pt, uops, edges) in zip(
+                add_node.input, edge_results[idx]
+            ):
+                _mark_backbone(operand, add_node)
+                for tensor, node in edges:
+                    _mark_backbone(tensor, node)
                 pass_through.extend(pt)
                 unary_ops.extend(uops)
                 if kind == "producer":
@@ -2708,45 +2968,44 @@ def _find_conv_residual_chains(graph: onnx.GraphProto) -> List[_Chain]:
         if len({p.weight for p in leaf_producers}) != len(leaf_producers):
             continue  # degenerate -- the same producer named twice
 
+        # The sink's own output is never `visited` by any member's own
+        # backward walk (nothing in the group walks *through* it -- that's
+        # what makes it the sink), so it needs adding explicitly; it starts
+        # with no accounted-for consumer of its own at all.
         sink_out = sink_add.output[0]
-        if not _is_internal(sink_out):
-            continue
+        if sink_out not in accounted:
+            backbone_tensors.append(sink_out)
+            accounted[sink_out] = set()
 
-        consumer, fwd_chain_ops, fwd_pass_through = _walk_to_conv_consumer(
-            sink_out,
+        branches = _resolve_conv_fanout_branches(
+            backbone_tensors,
+            accounted,
             initializer_map,
             consumers_of,
             graph_outputs,
             n_channels,
-            _MAX_CHAIN_HOPS,
         )
-        if consumer is None:
-            continue
-        consumer_node, consumer_weight, consumer_group = consumer
-        if consumer_group != 1:
-            # As with the producer side above, a general grouped Conv
-            # consumer is out of scope here: _chain_group's per-group
-            # top-k assumes every producer feeds the consumer's full
-            # (ungrouped) channel range, an assumption a multi-producer
-            # residual group doesn't verify against per-group slicing.
+        if not branches:
             continue
 
+        primary, extra_branches = branches[0], tuple(branches[1:])
         chain_ops = (
             tuple((op, None) for op in unary_ops)
             + tuple((eligible_adds[i], None) for i in members)
-            + fwd_chain_ops
+            + primary.chain_ops
         )
 
         chains.append(
             _Chain(
                 producers=tuple(leaf_producers),
                 chain_ops=chain_ops,
-                consumer_node=consumer_node,
-                consumer_weight=consumer_weight,
+                consumer_node=primary.consumer_node,
+                consumer_weight=primary.consumer_weight,
                 consumer_weight_transposed=False,
                 n_channels=n_channels,
                 consumer_is_conv=True,
-                conv_pass_through=tuple(pass_through) + fwd_pass_through,
+                extra_consumers=extra_branches,
+                conv_pass_through=tuple(pass_through) + primary.conv_pass_through,
             )
         )
     return chains
@@ -2758,14 +3017,20 @@ def _find_conv_residual_chains(graph: onnx.GraphProto) -> List[_Chain]:
 # same union-find-over-eligible-`Add`-merge-points construction, same
 # provably-safe special case (`y = Add(a, b)`, two non-constant operands,
 # forces whichever real producer(s) feed `a`/`b` to agree on one shared
-# channel-index set), same single-consumer safety bar on every hop of every
-# branch, and the same reasoning for why an *interior* block of a deep
-# residual stack (its own "post-block" tensor read both by the next block
-# and directly by that block's own `Add`) is declined while a lone residual
-# connection or a linear stack of `Add`-only merges is reached. See
-# `_find_conv_residual_chains`'s own section comment above for the shared
-# half of that reasoning; only what's different for MatMul/Gemm is covered
-# here. `_is_eligible_add_merge` above is reused unchanged -- it was never
+# channel-index set), and the same bounded fan-out mechanism
+# (`_resolve_matmul_fanout_branches`, the direct analogue of
+# `_resolve_conv_fanout_branches`): an *interior* block of a deep residual
+# stack -- its own "post-block" tensor read both by the next block and
+# directly by that block's own `Add`/`SkipLayerNormalization` -- is reached
+# by propagating the group's own already-established `keep` set forward to
+# every extra ordinary consumer such a tensor has, exactly as for Conv; see
+# `_find_conv_residual_chains`'s own section comment above for the full
+# reasoning (why propagation, unlike backward resolution, has no ambiguity
+# to guess at, and precisely what still isn't reached: two chains wanting
+# different keep sets on the same shared *weight* -- never possible on a
+# shared *activation*, since ONNX gives every tensor exactly one producer).
+# Only what's different for MatMul/Gemm from the Conv case is covered here.
+# `_is_eligible_add_merge` above is reused unchanged -- it was never
 # Conv-specific to begin with (it only inspects the `Add` node's own
 # operands against `initializer_map`), so no MatMul-specific variant is
 # needed.
@@ -3077,6 +3342,7 @@ def _walk_matmul_producer_backward(
     str,
     Optional[Union[Tuple[_Producer, int], onnx.NodeProto]],
     Tuple[Tuple[onnx.NodeProto, Optional[str]], ...],
+    Tuple[Tuple[str, onnx.NodeProto], ...],
 ]:
     """The backward counterpart of :func:`_walk_to_consumer`, used only by
     :func:`_find_matmul_residual_chains` to resolve one operand of an
@@ -3085,12 +3351,13 @@ def _walk_matmul_producer_backward(
     :func:`_walk_conv_producer_backward` (see this function's own section
     comment above for how the two differ: a wider hop set mirroring
     `_walk_to_consumer`'s own per-channel bias/scale ``Add``/``Mul`` hop,
-    and no depthwise-pass-through analogue at all). Requires every tensor
-    crossed -- `start` itself included -- to have exactly one consumer, the
-    same safety bar every other hop in this module already holds every
-    intermediate tensor to; this is what makes a shared "post-block" tensor
-    (read by both the next stage and directly by a merge node) resolve to
-    ``"fail"`` rather than being silently pruned wrong. The usual
+    and no depthwise-pass-through analogue at all). Declines (only) whenever
+    a tensor crossed -- `start` itself included -- is a graph output (a
+    caller-observed shape this pass never resizes); *how many* other things
+    also read that same tensor is deliberately **not** checked here -- see
+    :func:`_find_matmul_residual_chains`'s own "fan-out" section comment for
+    why, and how every such extra reader still gets its own safety check,
+    just later, once the group's real channel count is known. The usual
     exactly-one-output check on every node crossed is relaxed to "its own
     *first* output is `cur`" rather than "it has exactly one output" purely
     to let a multi-output ``SkipLayerNormalization``-family node (`mean`/
@@ -3102,40 +3369,50 @@ def _walk_matmul_producer_backward(
 
     Returns one of:
 
-    - ``("producer", (producer, n_channels), chain_ops)`` -- resolved all
-      the way back to a real MatMul/vanilla-Gemm producer;
-    - ``("add", merge_node, chain_ops)`` -- resolved to another eligible
-      merge node's raw output instead -- a bare ``Add`` or a
+    - ``("producer", (producer, n_channels), chain_ops, edges)`` -- resolved
+      all the way back to a real MatMul/vanilla-Gemm producer;
+    - ``("add", merge_node, chain_ops, edges)`` -- resolved to another
+      eligible merge node's raw output instead -- a bare ``Add`` or a
       ``SkipLayerNormalization``-family node alike (the caller unions this
       group with that node's own rather than treating it as a separate
       producer);
-    - ``("fail", None, ())`` -- a graph input, an unrecognized producer
-      (attention-op boundary, gated-Mul combine, ...), a branch, or the hop
-      limit -- the caller declines the whole group this operand belongs to.
+    - ``("fail", None, (), ())`` -- a graph input, an unrecognized producer
+      (attention-op boundary, gated-Mul combine, ...), a graph output crossed
+      mid-walk, or the hop limit -- the caller declines the whole group this
+      operand belongs to.
 
     `chain_ops` mirrors :class:`_Chain`'s own field exactly (each entry a
     ``(node, const_name_or_None)`` pair, in forward -- producer-to-merge --
     order), so it can be concatenated directly into the resolved chain's
     `chain_ops` the same way `_find_chains` builds them for an ordinary
-    single-producer chain.
+    single-producer chain. `edges` mirrors
+    :func:`_walk_conv_producer_backward`'s own field exactly -- see its
+    docstring for what it records and why.
     """
     chain_ops: List[Tuple[onnx.NodeProto, Optional[str]]] = []
+    edges: List[Tuple[str, onnx.NodeProto]] = []
     cur = start
     for _hop in range(max_hops):
-        if len(consumers_of.get(cur, [])) != 1 or cur in graph_outputs:
-            return "fail", None, ()
+        if cur in graph_outputs:
+            return "fail", None, (), ()
         node = node_by_output.get(cur)
         if node is None or not node.output or node.output[0] != cur:
-            return "fail", None, ()
+            return "fail", None, (), ()
 
         prod_info = _match_producer(node, initializer_map)
         if prod_info is not None:
             w_name, weight_transposed, bias_name, n_channels = prod_info
             producer = _Producer(node, w_name, weight_transposed, bias_name)
-            return "producer", (producer, n_channels), tuple(reversed(chain_ops))
+            return (
+                "producer",
+                (producer, n_channels),
+                tuple(reversed(chain_ops)),
+                tuple(edges),
+            )
 
         if node.op_type in _UNARY_PASS_THROUGH and len(node.input) == 1:
             chain_ops.append((node, None))
+            edges.append((node.input[0], node))
             cur = node.input[0]
             continue
 
@@ -3152,9 +3429,10 @@ def _walk_matmul_producer_backward(
                     and int(np.prod(const_init.dims)) == const_init.dims[-1]
                 ):
                     chain_ops.append((node, const_name))
+                    edges.append((other, node))
                     cur = other
                     continue
-                return "fail", None, ()
+                return "fail", None, (), ()
             # Both operands constant (degenerate) or both non-constant: for
             # `Add` the latter is exactly `_is_eligible_add_merge`'s own
             # shape, handled below; for `Mul` it's a gated (SwiGLU/GeGLU)
@@ -3169,19 +3447,74 @@ def _walk_matmul_producer_backward(
             if fused is not None:
                 data_name, bias_name = fused
                 chain_ops.append((node, bias_name))
+                edges.append((data_name, node))
                 cur = data_name
                 continue
-            return "fail", None, ()
+            return "fail", None, (), ()
 
         merge = _match_matmul_residual_merge(
             node, initializer_map, consumers_of, graph_outputs
         )
         if merge is not None:
-            return "add", node, tuple(reversed(chain_ops))
+            return "add", node, tuple(reversed(chain_ops)), tuple(edges)
 
-        return "fail", None, ()
+        return "fail", None, (), ()
 
-    return "fail", None, ()
+    return "fail", None, (), ()
+
+
+def _resolve_matmul_fanout_branches(
+    backbone_tensors: List[str],
+    accounted: Dict[str, Set[int]],
+    initializer_map: Dict[str, onnx.TensorProto],
+    consumers_of: Dict[str, List[onnx.NodeProto]],
+    graph_outputs: Set[str],
+    n_channels: int,
+) -> Optional[List[_ConsumerBranch]]:
+    """The MatMul/Gemm analogue of :func:`_resolve_conv_fanout_branches` --
+    see its own docstring for the shared reasoning this mirrors exactly
+    (only the forward walker differs: :func:`_walk_to_consumer` instead of
+    :func:`_walk_to_conv_consumer`), and there is no Conv-style grouped-
+    consumer or depthwise-pass-through concept to check or carry for a
+    MatMul/Gemm branch at all.
+    """
+    branches: List[_ConsumerBranch] = []
+    seen_weights: Set[str] = set()
+    for tensor in backbone_tensors:
+        if tensor in graph_outputs:
+            return None
+        seen_nodes: Set[int] = set()
+        for consumer_node in consumers_of.get(tensor, []):
+            if id(consumer_node) in seen_nodes:
+                continue
+            seen_nodes.add(id(consumer_node))
+            if id(consumer_node) in accounted.get(tensor, ()):
+                continue  # already part of the group's own established wiring
+            resolved, br_chain_ops = _walk_to_consumer(
+                tensor,
+                initializer_map,
+                consumers_of,
+                graph_outputs,
+                n_channels,
+                _MAX_CHAIN_HOPS,
+                forced_first_hop=consumer_node,
+            )
+            if resolved is None:
+                return None
+            branch_node, branch_weight, branch_weight_transposed = resolved
+            if branch_weight in seen_weights:
+                return None  # two branches naming the same consumer weight
+            seen_weights.add(branch_weight)
+            branches.append(
+                _ConsumerBranch(
+                    chain_ops=br_chain_ops,
+                    consumer_node=branch_node,
+                    consumer_weight=branch_weight,
+                    consumer_weight_transposed=branch_weight_transposed,
+                    consumer_is_conv=False,
+                )
+            )
+    return branches
 
 
 def _find_matmul_residual_chains(graph: onnx.GraphProto) -> List[_Chain]:
@@ -3202,22 +3535,21 @@ def _find_matmul_residual_chains(graph: onnx.GraphProto) -> List[_Chain]:
     group) or another eligible merge node already in the same group. If
     *any* operand, anywhere in the group, fails to resolve that way, or the
     leaf producers' channel counts don't all agree, the *entire* group is
-    declined -- never partially pruned. A correctly-resolved group must
-    reduce to exactly one "sink" merge node (the one whose own output isn't
-    itself consumed by another merge node in the group); the chain walk
-    continues forward from there via the ordinary :func:`_walk_to_consumer`
-    to find the group's one real downstream consumer, exactly as any other
-    MatMul/Gemm chain does -- unaffected by which kind of node the sink
-    happens to be, since it only ever reads the sink's own raw output
-    tensor name.
+    declined -- never partially pruned. Every tensor visited along the way
+    (see :func:`_walk_matmul_producer_backward`'s own `edges`) plus the
+    group's own "sink" (the one member whose own output isn't itself
+    consumed by another member) is then handed to
+    :func:`_resolve_matmul_fanout_branches`, which finds and resolves every
+    extra (non-backbone) consumer fan-out reaches -- declining the whole
+    group if any such branch can't be resolved, exactly as
+    :func:`_find_conv_residual_chains` does. What survives is one or more
+    independent forward branches, all fed by the exact same shared `keep`
+    set once :func:`_apply_chains` computes it.
     """
     initializer_map = {t.name: t for t in graph.initializer}
     consumers_of = _consumers_of(graph)
     node_by_output = {out: node for node in graph.node for out in node.output}
     graph_outputs = {o.name for o in graph.output}
-
-    def _is_internal(name: str) -> bool:
-        return len(consumers_of.get(name, [])) == 1 and name not in graph_outputs
 
     Merge = Tuple[
         onnx.NodeProto,
@@ -3253,6 +3585,7 @@ def _find_matmul_residual_chains(graph: onnx.GraphProto) -> List[_Chain]:
         str,
         Optional[Union[Tuple[_Producer, int], onnx.NodeProto]],
         Tuple[Tuple[onnx.NodeProto, Optional[str]], ...],
+        Tuple[Tuple[str, onnx.NodeProto], ...],
     ]
     edge_results: Dict[int, List[Edge]] = {}
     poisoned: Set[int] = set()
@@ -3293,10 +3626,28 @@ def _find_matmul_residual_chains(graph: onnx.GraphProto) -> List[_Chain]:
         n_channels_set: Set[int] = set()
         pre_chain_ops: List[Tuple[onnx.NodeProto, Optional[str]]] = []
         referenced: Set[int] = set()
+        # See _find_conv_residual_chains's own matching comment: every
+        # tensor either operand walk of every member proved carries this
+        # group's own shared channel-index set, and which specific consumer
+        # node is already part of the group's own internal wiring.
+        backbone_tensors: List[str] = []
+        accounted: Dict[str, Set[int]] = {}
+
+        def _mark_backbone(tensor: str, node: onnx.NodeProto) -> None:
+            if tensor not in accounted:
+                backbone_tensors.append(tensor)
+            accounted.setdefault(tensor, set()).add(id(node))
 
         for idx in members:
+            merge_node = merges[idx][0]
+            operands = merges[idx][1]
             pre_chain_ops.extend(merges[idx][2])  # this merge node's own extra_ops
-            for kind, payload, ops in edge_results[idx]:
+            for operand, (kind, payload, ops, edges) in zip(
+                operands, edge_results[idx]
+            ):
+                _mark_backbone(operand, merge_node)
+                for tensor, node in edges:
+                    _mark_backbone(tensor, node)
                 pre_chain_ops.extend(ops)
                 if kind == "producer":
                     assert payload is not None and not isinstance(
@@ -3336,35 +3687,42 @@ def _find_matmul_residual_chains(graph: onnx.GraphProto) -> List[_Chain]:
         if len({p.weight for p in leaf_producers}) != len(leaf_producers):
             continue  # degenerate -- the same producer named twice
 
+        # The sink's own output is never a backbone tensor via any member's
+        # own operand walk (nothing in the group walks *through* it -- see
+        # _find_conv_residual_chains's own matching comment), so it needs
+        # adding explicitly, with no accounted-for consumer of its own yet.
         sink_out = sink_node.output[0]
-        if not _is_internal(sink_out):
-            continue
+        if sink_out not in accounted:
+            backbone_tensors.append(sink_out)
+            accounted[sink_out] = set()
 
-        consumer, fwd_chain_ops = _walk_to_consumer(
-            sink_out,
+        branches = _resolve_matmul_fanout_branches(
+            backbone_tensors,
+            accounted,
             initializer_map,
             consumers_of,
             graph_outputs,
             n_channels,
-            _MAX_CHAIN_HOPS,
         )
-        if consumer is None:
+        if not branches:
             continue
 
+        primary, extra_branches = branches[0], tuple(branches[1:])
         chain_ops = (
             tuple(pre_chain_ops)
             + tuple((merges[i][0], None) for i in members)
-            + fwd_chain_ops
+            + primary.chain_ops
         )
 
         chains.append(
             _Chain(
                 producers=tuple(leaf_producers),
                 chain_ops=chain_ops,
-                consumer_node=consumer[0],
-                consumer_weight=consumer[1],
-                consumer_weight_transposed=consumer[2],
+                consumer_node=primary.consumer_node,
+                consumer_weight=primary.consumer_weight,
+                consumer_weight_transposed=primary.consumer_weight_transposed,
                 n_channels=n_channels,
+                extra_consumers=extra_branches,
             )
         )
     return chains
@@ -3710,6 +4068,39 @@ class _ConcatChain:
     conv_pass_through: Tuple[_ConvPassThrough, ...] = ()
 
 
+def _branch_walk_has_fanout(
+    start: str,
+    edges: Tuple[Tuple[str, onnx.NodeProto], ...],
+    consumers_of: Dict[str, List[onnx.NodeProto]],
+    forward_node: onnx.NodeProto,
+) -> bool:
+    """True if any tensor a `Concat` branch's own backward walk crossed --
+    `start` (the branch operand) through the real producer's own output --
+    has more than the one in-group forward consumer the walk itself already
+    accounts for. The backward walkers (:func:`_walk_conv_producer_backward`/
+    :func:`_walk_matmul_producer_backward`) no longer reject a multi-consumer
+    tensor mid-walk themselves -- that relaxation exists for the residual/
+    fan-out case, which resolves every extra consumer explicitly afterwards
+    (see :func:`_resolve_conv_fanout_branches`/
+    :func:`_resolve_matmul_fanout_branches`) -- but a `Concat` branch has no
+    such resolution: per this section's own comment, a branch that fans out
+    to another consumer is declined outright, so this replicates that check
+    directly from `edges`, `start`'s own forward consumer being `forward_node`
+    (the `Concat` node itself) and each subsequent tensor's being the hop
+    node recorded alongside it.
+    """
+    prev_consumer = forward_node
+    cur = start
+    for new_cur, node in edges:
+        consumers = consumers_of.get(cur, [])
+        if len(consumers) != 1 or consumers[0] is not prev_consumer:
+            return True
+        prev_consumer = node
+        cur = new_cur
+    consumers = consumers_of.get(cur, [])
+    return len(consumers) != 1 or consumers[0] is not prev_consumer
+
+
 def _find_matmul_concat_chains(graph: onnx.GraphProto) -> List[_ConcatChain]:
     """Finds MatMul/Gemm ``Concat``-merged skip connections -- see this
     section's own comment. Every operand of a last-axis `Concat` (`axis ==
@@ -3748,7 +4139,7 @@ def _find_matmul_concat_chains(graph: onnx.GraphProto) -> List[_ConcatChain]:
         offset = 0
         declined = False
         for operand in node.input:
-            kind, payload, pre_ops = _walk_matmul_producer_backward(
+            kind, payload, pre_ops, edges = _walk_matmul_producer_backward(
                 operand,
                 node_by_output,
                 initializer_map,
@@ -3757,6 +4148,9 @@ def _find_matmul_concat_chains(graph: onnx.GraphProto) -> List[_ConcatChain]:
                 _MAX_CHAIN_HOPS,
             )
             if kind != "producer":
+                declined = True
+                break
+            if _branch_walk_has_fanout(operand, edges, consumers_of, node):
                 declined = True
                 break
             assert payload is not None and not isinstance(payload, onnx.NodeProto)
@@ -3837,15 +4231,19 @@ def _find_conv_concat_chains(graph: onnx.GraphProto) -> List[_ConcatChain]:
         offset = 0
         declined = False
         for operand in node.input:
-            kind, payload, pass_through, unary_ops = _walk_conv_producer_backward(
-                operand,
-                node_by_output,
-                initializer_map,
-                consumers_of,
-                graph_outputs,
-                _MAX_CHAIN_HOPS,
+            kind, payload, pass_through, unary_ops, edges = (
+                _walk_conv_producer_backward(
+                    operand,
+                    node_by_output,
+                    initializer_map,
+                    graph_outputs,
+                    _MAX_CHAIN_HOPS,
+                )
             )
             if kind != "producer":
+                declined = True
+                break
+            if _branch_walk_has_fanout(operand, edges, consumers_of, node):
                 declined = True
                 break
             assert payload is not None and not isinstance(payload, onnx.NodeProto)
@@ -4244,17 +4642,51 @@ def _apply_chains(
         if len(producer_weights) != len(chain.producers):
             continue  # degenerate (a gated pair naming the same weight twice)
 
+        # Every consumer branch this chain touches -- just the one primary
+        # `consumer_*` for every chain kind except a residual/merge group
+        # with extra fan-out (see :class:`_Chain.extra_consumers`'s own
+        # comment), where there are one or more additional independent
+        # branches beyond it. Conflict-checked, touched, and sliced exactly
+        # like the single consumer every other chain already has -- each
+        # branch is its own axis of its own weight, fed by the exact same
+        # shared `keep` this loop computes once, below.
+        branches = (
+            _ConsumerBranch(
+                chain_ops=(),
+                consumer_node=chain.consumer_node,
+                consumer_weight=chain.consumer_weight,
+                consumer_weight_transposed=chain.consumer_weight_transposed,
+                consumer_is_conv=chain.consumer_is_conv,
+            ),
+        ) + chain.extra_consumers
+
+        consumer_weights = {b.consumer_weight for b in branches}
+        if len(consumer_weights) != len(branches):
+            continue  # degenerate (two branches naming the same weight)
+
         conv_hop_weights = {h.weight for h in chain.conv_pass_through}
-        if len(conv_hop_weights) != len(chain.conv_pass_through):
+        conv_hop_weights.update(
+            h.weight for b in chain.extra_consumers for h in b.conv_pass_through
+        )
+        n_conv_hops = len(chain.conv_pass_through) + sum(
+            len(b.conv_pass_through) for b in chain.extra_consumers
+        )
+        if len(conv_hop_weights) != n_conv_hops:
             continue  # degenerate (the same depthwise weight named twice)
 
         consts = {p.bias for p in chain.producers if p.bias is not None}
         consts.update(
             const_name for _, const_name in chain.chain_ops if const_name is not None
         )
+        consts.update(
+            const_name
+            for b in chain.extra_consumers
+            for _, const_name in b.chain_ops
+            if const_name is not None
+        )
         if (
             (producer_weights & producer_touched)
-            or chain.consumer_weight in consumer_touched
+            or (consumer_weights & consumer_touched)
             or (consts & const_touched)
             or (conv_hop_weights & conv_hop_touched)
         ):
@@ -4310,7 +4742,8 @@ def _apply_chains(
         for _, const_name in chain.chain_ops:
             if const_name is not None:
                 _slice_last_axis(initializer_map[const_name], keep)
-        for hop in chain.conv_pass_through:
+
+        def _slice_conv_hop(hop: _ConvPassThrough) -> None:
             # Same `keep` index set as the real producer -- a depthwise
             # Conv's own channel i is exactly upstream channel i, so its
             # weight (output-channel axis 0, like any Conv producer) and
@@ -4323,6 +4756,9 @@ def _apply_chains(
             if hop.bias is not None:
                 _slice_last_axis(initializer_map[hop.bias], keep)
             _set_conv_group_attr(hop.node, keep_count)
+
+        for hop in chain.conv_pass_through:
+            _slice_conv_hop(hop)
         if chain.consumer_is_conv and chain.consumer_group > 1:
             _slice_grouped_consumer_conv_weight(
                 initializer_map[chain.consumer_weight], keep, chain.consumer_group, n
@@ -4334,9 +4770,26 @@ def _apply_chains(
                 keep,
                 is_conv=chain.consumer_is_conv,
             )
+        # Extra fan-out branches (see :class:`_Chain.extra_consumers`'s own
+        # comment): each is always an ordinary (`group == 1`) consumer --
+        # _resolve_conv_fanout_branches/_resolve_matmul_fanout_branches
+        # never resolve a grouped one -- fed by the exact same `keep` just
+        # computed for the group's shared producers above.
+        for branch in chain.extra_consumers:
+            for _, const_name in branch.chain_ops:
+                if const_name is not None:
+                    _slice_last_axis(initializer_map[const_name], keep)
+            for hop in branch.conv_pass_through:
+                _slice_conv_hop(hop)
+            _slice_consumer_weight(
+                initializer_map[branch.consumer_weight],
+                branch.consumer_weight_transposed,
+                keep,
+                is_conv=branch.consumer_is_conv,
+            )
 
         producer_touched.update(producer_weights)
-        consumer_touched.add(chain.consumer_weight)
+        consumer_touched.update(consumer_weights)
         const_touched.update(consts)
         conv_hop_touched.update(conv_hop_weights)
         for p in chain.producers:
@@ -4346,6 +4799,16 @@ def _apply_chains(
             chain_node.output[0] for chain_node, _ in chain.chain_ops
         )
         stale_value_info.update(hop.node.output[0] for hop in chain.conv_pass_through)
+        stale_value_info.update(
+            chain_node.output[0]
+            for b in chain.extra_consumers
+            for chain_node, _ in b.chain_ops
+        )
+        stale_value_info.update(
+            hop.node.output[0]
+            for b in chain.extra_consumers
+            for hop in b.conv_pass_through
+        )
 
 
 def apply_structured_pruning(
@@ -4417,22 +4880,29 @@ def apply_structured_pruning(
     already allows, transitively through any further such `Add` merges
     sharing the same spine) to be pruned to one shared channel-index set,
     ranked the same combined (root-sum-square) way as a gated pair. Bounded,
-    not general DepGraph: every branch is still held to the same
-    single-consumer bar as everywhere else in this pass, so a real
-    multi-block ResNet stage's shared "post-block" tensor -- read by both
-    the next block's own first Conv and, unchanged, that block's own `Add`
-    -- is a fan-out this declines rather than guesses at; a lone residual
-    connection whose branches don't fan out elsewhere, or a linear stack of
-    `Add`-only merges, is what this reaches.
+    not general DepGraph: every hop that walks *toward* a group's own real
+    Conv producers is still held to the same single-consumer bar as
+    everywhere else in this pass. Once a group's shared channel-index set is
+    established, though, it can also fan out *forward* to more than one
+    independent ordinary Conv consumer (see :func:`_resolve_conv_fanout_branches`)
+    -- so a real multi-block ResNet stage's shared "post-block" tensor,
+    read by both the next block's own first Conv *and*, unchanged, that
+    block's own `Add`, is reached rather than declined; what's still
+    declined is a branch that itself forks further, reaches a graph output,
+    or would need a tie-break between two conflicting keep sets on the same
+    shared weight.
 
     The MatMul/Gemm analogue of that same residual/skip-connection case is
     also handled (see :func:`_find_matmul_residual_chains` and this
     module's own docstring) -- the transformer-block residual stream shape
     (``x = x + SelfAttn(LN(x))``, ``x = x + MLP(LN(x))``) that was
     previously declined outright. Same union-find grouping over eligible
-    merge points, same single-consumer bar on every hop of every branch,
-    same combined (root-sum-square) importance ranking; the one real
-    difference is the backward walk mirrors :func:`_walk_to_consumer`'s own
+    merge points, same single-consumer bar on every hop *toward* a group's
+    own producers, same forward fan-out to more than one ordinary consumer
+    once the group's `keep` set is established (see
+    :func:`_resolve_matmul_fanout_branches`), same combined (root-sum-square)
+    importance ranking; the one real difference is the backward walk
+    mirrors :func:`_walk_to_consumer`'s own
     *wider* MatMul/Gemm hop set (unary activations plus a per-channel
     bias/scale ``Add``/``Mul`` against a constant) rather than the Conv
     walk's narrower one, since there is no depthwise-Conv-style pass-through
