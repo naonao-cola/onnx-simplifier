@@ -709,15 +709,16 @@ def test_wanda_pruning_conv_depthwise_matches_manual_group_relative_oracle_exact
     np.testing.assert_allclose(w_pruned.astype(np.float64), expected)
 
 
-def test_sparsegpt_pruning_conv_skips_grouped_conv():
-    # A depthwise Conv (group == in_channels == out_channels) is left
-    # completely untouched -- unlike apply_magnitude_pruning/
-    # apply_wanda_pruning (which now do match depthwise/general grouped
-    # Conv, see test_magnitude_pruning_conv_depthwise_reaches_target_
-    # sparsity_and_matches_oracle and friends above),
-    # apply_sparsegpt_pruning deliberately calls
-    # _candidates(graph, allow_grouped_conv=False) -- its Conv Hessian
-    # machinery is group=1-only, see this module's own docstring.
+def test_sparsegpt_pruning_conv_now_matches_depthwise_conv():
+    # Unlike an earlier version of this module (which declined every
+    # group != 1 Conv outright, the same restriction
+    # test_sparsegpt_pruning_conv_skips_general_grouped_conv below used to
+    # check), apply_sparsegpt_pruning now matches depthwise Conv
+    # (group == in_channels == out_channels) too, via a genuinely per-group
+    # Hessian and column-processing loop -- see the "apply_sparsegpt_
+    # pruning: Conv2D, grouped/depthwise" section below for the full
+    # oracle/reference-transliteration/reconstruction-error verification.
+    # This test only confirms the layer is no longer left untouched.
     C = 8
     rng = np.random.default_rng(76)
     w = rng.standard_normal((C, 1, 3, 3)).astype(np.float32)
@@ -727,14 +728,19 @@ def test_sparsegpt_pruning_conv_skips_grouped_conv():
     pruned = onnxsim.apply_sparsegpt_pruning(
         model, calibration_data=[{"X": x_cal}], sparsity=0.5
     )
-    np.testing.assert_array_equal(_conv_weight(pruned), w)
+    onnx.checker.check_model(pruned)
+    assert not np.array_equal(_conv_weight(pruned), w)
+    # Each depthwise channel's own K = kh*kw = 9 is small enough that the
+    # block-shared quantile's achievable fractions (k/9) land no closer to
+    # 0.5 than 4/9 or 5/9 -- a coarser rounding granularity than the
+    # larger-K cases elsewhere in this file, hence the wider tolerance.
+    assert onnxsim.weight_sparsity(pruned) == pytest.approx(0.5, abs=0.1)
 
 
-def test_sparsegpt_pruning_conv_skips_general_grouped_conv():
-    # Same restriction as the depthwise case above, for a general grouped
-    # Conv (1 < group < in_channels) instead: apply_sparsegpt_pruning's
-    # allow_grouped_conv=False excludes it too, even though
-    # apply_magnitude_pruning/apply_wanda_pruning now match it.
+def test_sparsegpt_pruning_conv_now_matches_general_grouped_conv():
+    # Same shape as the depthwise case above, for a general grouped Conv
+    # (1 < group < in_channels): also now matched and actually pruned,
+    # rather than left untouched.
     Cin, Cout, group = 8, 8, 2
     rng = np.random.default_rng(77)
     w = rng.standard_normal((Cout, Cin // group, 3, 3)).astype(np.float32)
@@ -744,7 +750,9 @@ def test_sparsegpt_pruning_conv_skips_general_grouped_conv():
     pruned = onnxsim.apply_sparsegpt_pruning(
         model, calibration_data=[{"X": x_cal}], sparsity=0.5
     )
-    np.testing.assert_array_equal(_conv_weight(pruned), w)
+    onnx.checker.check_model(pruned)
+    assert not np.array_equal(_conv_weight(pruned), w)
+    assert onnxsim.weight_sparsity(pruned) == pytest.approx(0.5, abs=0.05)
 
 
 # --- apply_sparsegpt_pruning --------------------------------------------
@@ -1196,6 +1204,339 @@ def test_sparsegpt_pruning_conv_reconstructs_better_than_a_same_mask_style_basel
     thresh = np.sort(score.flatten())[int(score.size * 0.5)]
     w_naive = np.where(score <= thresh, 0.0, w64).reshape(Cout, Cin, 3, 3)
     naive_model = _single_conv_model(w_naive.astype(np.float32), spatial=spatial)
+
+    (float_y,) = _run(model, {"X": x_cal})
+    (sparsegpt_y,) = _run(pruned, {"X": x_cal})
+    (naive_y,) = _run(naive_model, {"X": x_cal})
+    err_sparsegpt = np.sum(
+        (float_y.astype(np.float64) - sparsegpt_y.astype(np.float64)) ** 2
+    )
+    err_naive = np.sum((float_y.astype(np.float64) - naive_y.astype(np.float64)) ** 2)
+    assert err_sparsegpt <= err_naive
+
+
+# --- apply_sparsegpt_pruning: Conv2D, grouped/depthwise ------------------
+
+
+def _naive_conv_group_hessian(x, attrs, group, cin_per_group):
+    # Brute-force, per-group Hessian oracle: for each group g, slices x's
+    # own global input-channel range [g*cin_per_group, (g+1)*cin_per_group)
+    # and accumulates that group's own [K, K] Hessian via an explicit
+    # outer-product-per-output-position nested Python loop
+    # (_naive_conv_patch_hessian, already a completely independent
+    # construction from onnxsim.pruning._conv_im2col_patches's vectorized
+    # sliding_window_view unfolding) -- never touching any other group's
+    # channels. Returns a list of `group` [K, K] arrays.
+    return [
+        _naive_conv_patch_hessian(
+            x[:, g * cin_per_group : (g + 1) * cin_per_group, :, :], attrs
+        )[0]
+        for g in range(group)
+    ]
+
+
+def test_sparsegpt_conv_grouped_hessian_matches_naive_nested_loop_oracle():
+    # Verification bar item 1: an independent brute-force nested-loop
+    # oracle for each group's own Hessian, on calibration data engineered
+    # so the two groups' own statistics are genuinely different -- a bug
+    # that shares one Hessian across groups, or mixes up which group's
+    # slice feeds which filters, would silently pass on symmetric data but
+    # must fail here.
+    from onnxsim.pruning import _conv_im2col_patches, _ConvSpatialAttrs
+
+    group, cin_per_group = 2, 2
+    rng = np.random.default_rng(140)
+    x = rng.standard_normal((2, cin_per_group * group, 5, 5))
+    x[:, :cin_per_group, :, :] *= 25.0  # group 0 only: wildly different scale
+
+    attrs = _ConvSpatialAttrs(
+        kh=3,
+        kw=3,
+        pad_top=1,
+        pad_left=1,
+        pad_bottom=1,
+        pad_right=1,
+        stride_h=1,
+        stride_w=2,
+    )
+
+    expected = _naive_conv_group_hessian(x, attrs, group, cin_per_group)
+    for g in range(group):
+        x_g = x[:, g * cin_per_group : (g + 1) * cin_per_group, :, :]
+        patches = _conv_im2col_patches(x_g, attrs)
+        h_vec = patches.T @ patches
+        np.testing.assert_allclose(h_vec, expected[g])
+    # The two groups' own oracle Hessians must actually differ -- proof
+    # this is exercising genuinely different per-group statistics, not two
+    # identical matrices that would both trivially pass elementwise.
+    assert not np.allclose(expected[0], expected[1])
+
+
+def _grouped_sparsegpt_conv_setup(
+    seed_w, seed_x, Cin_per_group, Cout, group, kh=3, kw=3, spatial=8
+):
+    filters_per_group = Cout // group
+    rng_w = np.random.default_rng(seed_w)
+    w = rng_w.standard_normal((Cout, Cin_per_group, kh, kw)).astype(np.float32) * 0.5
+    model = _single_conv_model(w, spatial=spatial, group=group)
+
+    Cin = Cin_per_group * group
+    rng_x = np.random.default_rng(seed_x)
+    x = rng_x.standard_normal((3, Cin, spatial, spatial)).astype(np.float32)
+    # Different per-group activation scale -- a bug mixing up which group's
+    # H feeds which filter rows produces a mismatch here rather than
+    # accidentally agreeing on symmetric calibration data.
+    x[:, :Cin_per_group, :, :] *= 8.0
+    return w, model, x, filters_per_group
+
+
+def _reference_grouped_conv_sparsegpt(
+    w, x, group, cin_per_group, kh, kw, sparsity, n, m, percdamp, blocksize
+):
+    # Second, independent reference oracle: for each group, an independent
+    # nested-loop-style im2col unfold (not onnxsim.pruning's own
+    # _conv_im2col_patches) builds that group's own H, which then feeds
+    # _reference_sparsegpt (the direct fasterprune transliteration, already
+    # validated against the group=1 case above) with that group's own
+    # correctly-sliced weight sub-block -- entirely independent of
+    # onnxsim's own grouped-Conv Hessian/pruning code.
+    cout = w.shape[0]
+    filters_per_group = cout // group
+    spatial = x.shape[2]
+    out_spatial = spatial - kh + 1
+    K = cin_per_group * kh * kw
+    blocks = []
+    for g in range(group):
+        x_g = x[:, g * cin_per_group : (g + 1) * cin_per_group, :, :]
+        patches = np.zeros(
+            (x.shape[0] * out_spatial * out_spatial, K), dtype=np.float64
+        )
+        idx = 0
+        for ni in range(x.shape[0]):
+            for oh in range(out_spatial):
+                for ow in range(out_spatial):
+                    patch = x_g[ni, :, oh : oh + kh, ow : ow + kw].astype(np.float64)
+                    patches[idx] = patch.reshape(-1)
+                    idx += 1
+        h_g = patches.T @ patches
+        w_nk_g = (
+            w[g * filters_per_group : (g + 1) * filters_per_group]
+            .astype(np.float64)
+            .reshape(filters_per_group, K)
+        )
+        expected_nk_g = _reference_sparsegpt(
+            w_nk_g,
+            h_g,
+            sparsity=sparsity,
+            n=n,
+            m=m,
+            percdamp=percdamp,
+            blocksize=blocksize,
+        )
+        blocks.append(expected_nk_g.reshape(filters_per_group, cin_per_group, kh, kw))
+    return np.concatenate(blocks, axis=0)
+
+
+def test_sparsegpt_pruning_conv_grouped_matches_reference_transliteration_exactly():
+    # Verification bar item 2 (unstructured sparsity): a general grouped
+    # Conv (group=2), each group fed through the independent reference
+    # oracle above, must match apply_sparsegpt_pruning's actual output
+    # exactly.
+    Cin_per_group, Cout, group, kh, kw, spatial = 2, 8, 2, 3, 3, 8
+    w, model, x, _ = _grouped_sparsegpt_conv_setup(
+        130, 131, Cin_per_group, Cout, group, kh, kw, spatial
+    )
+
+    pruned = onnxsim.apply_sparsegpt_pruning(
+        model, calibration_data=[{"X": x}], sparsity=0.5, proc_block_size=6
+    )
+    onnx.checker.check_model(pruned)
+
+    expected = _reference_grouped_conv_sparsegpt(
+        w,
+        x,
+        group,
+        Cin_per_group,
+        kh,
+        kw,
+        sparsity=0.5,
+        n=None,
+        m=None,
+        percdamp=0.01,
+        blocksize=6,
+    )
+    np.testing.assert_allclose(
+        _conv_weight(pruned).astype(np.float64), expected, rtol=1e-6, atol=1e-6
+    )
+
+    # And the two groups must have actually ended up differently pruned --
+    # not merely "both correct", but proof neither group silently reused
+    # the other's mask/compensation.
+    filters_per_group = Cout // group
+    w_pruned = _conv_weight(pruned)
+    mask0 = w_pruned[:filters_per_group] != 0
+    mask1 = w_pruned[filters_per_group:] != 0
+    assert not np.array_equal(mask0, mask1)
+
+
+def test_sparsegpt_pruning_conv_grouped_nm_pattern_matches_reference_transliteration():
+    # Verification bar item 2 (N:M sparsity). proc_block_size=12 (a multiple
+    # of m=4, matching test_sparsegpt_pruning_nm_pattern_matches_reference_
+    # transliteration's own choice) keeps every N:M group boundary aligned
+    # to an absolute multiple of 4 within each group's own K=18 columns --
+    # _sparsegpt_prune_columns' own N:M grouping restarts at column 0 of
+    # every proc_block_size-wide block (block-relative, not global), so a
+    # block width that isn't itself a multiple of m would still prune a
+    # mathematically correct (and reference-matching) N:M-per-block
+    # pattern, just not one whose absolute-column groups of 4 each keep
+    # exactly n=2 -- irrelevant to correctness, but this test's own
+    # per-group manual check below assumes clean absolute alignment.
+    Cin_per_group, Cout, group, kh, kw, spatial = 2, 8, 2, 3, 3, 8
+    w, model, x, filters_per_group = _grouped_sparsegpt_conv_setup(
+        132, 133, Cin_per_group, Cout, group, kh, kw, spatial
+    )
+
+    pruned = onnxsim.apply_sparsegpt_pruning(
+        model, calibration_data=[{"X": x}], n=2, m=4, proc_block_size=12
+    )
+    onnx.checker.check_model(pruned)
+
+    expected = _reference_grouped_conv_sparsegpt(
+        w,
+        x,
+        group,
+        Cin_per_group,
+        kh,
+        kw,
+        sparsity=0.0,
+        n=2,
+        m=4,
+        percdamp=0.01,
+        blocksize=12,
+    )
+    np.testing.assert_allclose(
+        _conv_weight(pruned).astype(np.float64), expected, rtol=1e-6, atol=1e-6
+    )
+
+    K = Cin_per_group * kh * kw
+    w_flat = _conv_weight(pruned).reshape(Cout, K)
+    for row in w_flat:
+        for start in range(0, len(row), 4):
+            group_vals = row[start : start + 4]
+            if len(group_vals) == 4:
+                assert np.count_nonzero(group_vals) == 2
+
+
+def test_sparsegpt_pruning_conv_depthwise_matches_reference_transliteration_exactly():
+    # Verification bar item 4: the group == Cin == Cout extreme
+    # (Cin/group == 1) -- confirms the per-group Hessian degenerates
+    # correctly to a [kh*kw, kh*kw] per-channel Hessian, verified against
+    # the same independent reference oracle as the general-grouped case.
+    C, kh, kw, spatial = 6, 3, 3, 8
+    w, model, x, _ = _grouped_sparsegpt_conv_setup(134, 135, 1, C, C, kh, kw, spatial)
+
+    pruned = onnxsim.apply_sparsegpt_pruning(
+        model, calibration_data=[{"X": x}], sparsity=0.5, proc_block_size=4
+    )
+    onnx.checker.check_model(pruned)
+
+    expected = _reference_grouped_conv_sparsegpt(
+        w, x, C, 1, kh, kw, sparsity=0.5, n=None, m=None, percdamp=0.01, blocksize=4
+    )
+    np.testing.assert_allclose(
+        _conv_weight(pruned).astype(np.float64), expected, rtol=1e-6, atol=1e-6
+    )
+
+
+def test_sparsegpt_pruning_conv_grouped_reaches_target_sparsity():
+    Cin_per_group, Cout, group, spatial = 2, 8, 2, 10
+    rng = np.random.default_rng(136)
+    w = rng.standard_normal((Cout, Cin_per_group, 3, 3)).astype(np.float32) * 0.5
+    model = _single_conv_model(w, spatial=spatial, group=group)
+    x_cal = rng.standard_normal((16, Cin_per_group * group, spatial, spatial)).astype(
+        np.float32
+    )
+
+    pruned = onnxsim.apply_sparsegpt_pruning(
+        model, calibration_data=[{"X": x_cal}], sparsity=0.5
+    )
+    onnx.checker.check_model(pruned)
+    assert onnxsim.weight_sparsity(pruned) == pytest.approx(0.5, abs=0.02)
+
+
+def test_sparsegpt_pruning_conv_grouped_declines_auto_pad():
+    # Verification bar item 5: a grouped Conv still gets no data-free
+    # fallback -- auto_pad SAME_UPPER makes _conv_spatial_attrs decline the
+    # node, so the whole layer (every group) is left completely untouched.
+    Cin_per_group, Cout, group, spatial = 2, 8, 2, 10
+    rng = np.random.default_rng(137)
+    w = rng.standard_normal((Cout, Cin_per_group, 3, 3)).astype(np.float32)
+    model = _single_conv_model(
+        w,
+        spatial=spatial,
+        group=group,
+        extra_attrs='auto_pad="SAME_UPPER"',
+        out_spatial=spatial,
+    )
+    x_cal = rng.standard_normal((4, Cin_per_group * group, spatial, spatial)).astype(
+        np.float32
+    )
+
+    pruned = onnxsim.apply_sparsegpt_pruning(
+        model, calibration_data=[{"X": x_cal}], sparsity=0.5
+    )
+    np.testing.assert_array_equal(_conv_weight(pruned), w)
+
+
+def test_sparsegpt_pruning_conv_grouped_reconstructs_better_than_a_same_mask_style_baseline():
+    # Verification bar item 3: end-to-end reconstruction-error property via
+    # onnxruntime, for a grouped Conv -- SparseGPT's Hessian-compensated
+    # result should reconstruct the real (onnxruntime) output at least as
+    # well as naive same-mask zeroing with no compensation, on
+    # well-conditioned calibration data.
+    #
+    # The naive baseline's threshold is computed independently *per group*
+    # here, not globally across both groups' weights combined: since
+    # apply_sparsegpt_pruning itself enforces its target sparsity within
+    # each group's own [filters_per_group, K] sub-block (its own
+    # block-shared threshold, scoped per group -- see this module's own
+    # docstring), a fair same-sparsity-pattern-granularity comparison must
+    # match that scoping. A single global-threshold naive baseline instead
+    # gives naive an extra degree of freedom SparseGPT's own per-group
+    # algorithm doesn't have -- uneven sparsity allocation between the two
+    # groups' weight sub-blocks, favoring whichever group's magnitudes
+    # happen to be more compressible -- which can (and, empirically,
+    # reliably does for this weight distribution) make even a "naive"
+    # baseline outperform SparseGPT's own necessarily-50%-per-group result,
+    # despite SparseGPT correctly beating a same-mask-granularity
+    # (per-group) naive baseline every time; not a difference in
+    # correctness, just an unfair comparison.
+    Cin_per_group, Cout, group, spatial = 2, 8, 2, 10
+    rng = np.random.default_rng(138)
+    w = rng.standard_normal((Cout, Cin_per_group, 3, 3)).astype(np.float32) * 0.5
+    model = _single_conv_model(w, spatial=spatial, group=group)
+    Cin = Cin_per_group * group
+    # Well-conditioned H per group: n_positions = 16*8*8 = 1024 >> K = 18.
+    x_cal = rng.standard_normal((16, Cin, spatial, spatial)).astype(np.float32)
+
+    pruned = onnxsim.apply_sparsegpt_pruning(
+        model, calibration_data=[{"X": x_cal}], sparsity=0.5
+    )
+    onnx.checker.check_model(pruned)
+
+    K = Cin_per_group * 3 * 3
+    w64 = w.astype(np.float64).reshape(Cout, K)
+    filters_per_group = Cout // group
+    w_naive = np.zeros_like(w64)
+    for g in range(group):
+        rows = slice(g * filters_per_group, (g + 1) * filters_per_group)
+        score = np.abs(w64[rows])
+        thresh = np.sort(score.flatten())[int(score.size * 0.5)]
+        w_naive[rows] = np.where(score <= thresh, 0.0, w64[rows])
+    w_naive = w_naive.reshape(Cout, Cin_per_group, 3, 3)
+    naive_model = _single_conv_model(
+        w_naive.astype(np.float32), spatial=spatial, group=group
+    )
 
     (float_y,) = _run(model, {"X": x_cal})
     (sparsegpt_y,) = _run(pruned, {"X": x_cal})

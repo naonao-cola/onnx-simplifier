@@ -237,20 +237,41 @@ statistics from another group's, confirming each filter's resulting mask
 reflects its own group's statistics and not another group's or a global
 average (``test_wanda_pruning_conv_grouped_uses_own_groups_activation_norm``).
 
-:func:`apply_sparsegpt_pruning` also matches Conv layers, but -- unlike
-magnitude and Wanda above -- only ordinary (``group=1``) ones; see its own
-docstring below for the full ``[K, K]`` im2col cross-covariance Hessian
-this needed (a real step up from Wanda's per-offset norm above, not just a
-reuse of it), how it's verified, and why extending it to grouped/depthwise
-Conv was deliberately left undone rather than guessed at: doing so
-correctly needs a *per-group* Hessian (each group's own filters only ever
-see their own group's input-channel patches -- the same channel-slicing
-subtlety Wanda's grouped support above handles, but now for the full
-cross-covariance rather than a per-offset norm, and needing the sequential
-column-processing/error-compensation loop partitioned per group rather
-than run once across the whole weight) -- comparable in scope to the
-original SparseGPT+Conv work this module already did from first
-principles, and not undertaken speculatively here.
+:func:`apply_sparsegpt_pruning` also matches Conv layers -- ordinary
+(``group=1``), depthwise, and general grouped alike, exactly the same three
+`group` shapes magnitude and Wanda above match; see its own docstring below
+for the full ``[K, K]`` im2col cross-covariance Hessian this needed (a real
+step up from Wanda's per-offset norm above, not just a reuse of it), how
+it's verified, and how a grouped/depthwise Conv gets a genuinely *per-group*
+Hessian and its own independent column-processing/error-compensation pass
+rather than one shared across every filter: each group's own filters only
+ever see their own group's input-channel patches -- the same channel-
+slicing subtlety Wanda's grouped support above handles, but now for the
+full cross-covariance rather than a per-offset norm, and needing the
+sequential column-processing/error-compensation loop partitioned per group
+rather than run once across the whole weight. Concretely, filter row ``i``
+(belonging to group ``i // (out_channels/group)``, ONNX's own grouped-Conv
+weight layout) is pruned only against ``H_g``, group ``g``'s own
+``[Cin/group*kh*kw, Cin/group*kh*kw]`` Hessian, built the same way the
+``group=1`` case's single ``H`` already is (:func:`_conv_im2col_patches`,
+``H_g = patches_g.T @ patches_g``) but fed only that group's own global
+input-channel slice ``patches_g`` rather than the full input -- reusing
+:func:`_conv_im2col_patches` and :func:`_sparsegpt_prune_columns` completely
+unchanged, called once per group, rather than needing any dedicated grouped
+Hessian or grouped column-processing machinery of their own (see
+:func:`apply_sparsegpt_pruning`'s own docstring for the exact accumulation).
+This is comparable in scope to the original SparseGPT+Conv work this module
+already did from first principles -- and was verified the same three ways:
+a brute-force nested-loop oracle building each group's own Hessian a
+completely different way (an explicit outer-product accumulation per
+output position, per group, engineered with genuinely different
+per-group calibration statistics so a bug sharing one Hessian across
+groups, or mixing up which group's slice feeds which filter rows, would be
+caught rather than passing on symmetric data), a second, independent
+reference transliteration fed each group's own correctly-sliced weight/
+Hessian, and the same end-to-end reconstruction-error property (against a
+naive same-mask-no-compensation baseline, via onnxruntime) the ordinary
+``group=1`` Conv case is already validated against.
 
 All three unstructured/N:M functions also match the two fused self-
 attention ops the "Attention-head pruning" section below performs
@@ -455,10 +476,11 @@ data-free-baseline fallback rather than changed silently underfoot; a
 future pass that wants Wanda calibration for a rank-3 activation is free to
 generalize this deliberately, as its own decision.
 
-:func:`apply_sparsegpt_pruning` also matches ordinary (``group=1``) 2-D
-``Conv`` layers, using exactly the same producer matching, Cholesky
-machinery, and column-processing loop above -- the only genuinely new
-piece is how ``H`` itself gets built. For a MatMul/Gemm layer
+:func:`apply_sparsegpt_pruning` also matches 2-D ``Conv`` layers -- ordinary
+(``group=1``), depthwise, and general grouped alike -- using exactly the
+same producer matching, Cholesky machinery, and column-processing loop
+above -- the only genuinely new piece is how ``H`` itself gets built. For a
+MatMul/Gemm layer
 ``H = X.T @ X`` is already a full cross-covariance, since each column
 *is* an independent input feature; for Conv, a weight column instead
 indexes one ``(in_channel, kh, kw)`` receptive-field offset (the same
@@ -501,12 +523,57 @@ in the first place, since OPT/BLOOM/Llama have none -- there was no
 correct reference to port here, unlike every other technique this module
 ports from an upstream implementation; this is original, from-first-
 principles machinery, held to the verification bar above precisely
-because of that. Unlike :func:`apply_magnitude_pruning`/
-:func:`apply_wanda_pruning`, this stays ``group=1``-only rather than also
-matching depthwise/general grouped Conv -- see the earlier paragraph above
-(right after Wanda's grouped-Conv support) for why extending this
-specific Hessian to grouped Conv is a materially bigger, declined-for-now
-undertaking rather than a mechanical extension of the matching alone.
+because of that.
+
+For a grouped or depthwise Conv, the same channel-slicing subtlety Wanda's
+own grouped support needs (see :func:`_conv_group_relative_norm`'s
+paragraph above) applies here too, but for the full cross-covariance
+rather than a per-offset norm: filter row ``i`` (belonging to group
+``i // (out_channels/group)``, ONNX's own grouped-Conv weight layout) only
+ever reads its own group's global input-channel slice
+``[g*Cin/group, (g+1)*Cin/group)``, so a shared, whole-input ``H`` would
+silently correlate every filter against every other group's channels too
+-- wrong, not merely imprecise, since ``H``'s off-diagonal entries would
+then encode spurious cross-group covariance no real filter ever sees.
+The fix needs both a genuinely *per-group* Hessian **and** the sequential
+column-processing/error-compensation loop run independently per group (a
+column-masking decision and its downstream error compensation only make
+sense within one group's own consistent Hessian/weight coordinate system,
+not mixed across groups) -- but, unlike that description's own apparent
+scope, turns out to need no new numerical machinery at all: group ``g``'s
+own ``H_g = patches_g.T @ patches_g`` is built by feeding
+:func:`_conv_im2col_patches` -- completely unchanged -- only that group's
+own channel-sliced sub-tensor (``x[:, g*Cin/group:(g+1)*Cin/group, :, :]``)
+rather than the full input, exactly the same function called once per
+group instead of once total; and :func:`_sparsegpt_prune_columns` --
+likewise completely unchanged -- is then simply called once per group on
+that group's own ``[Cout/group, Cin/group*kh*kw]`` weight sub-block against
+that group's own ``H_g``, rather than once across the whole weight against
+one shared ``H``. Total im2col-unfolding work across every group's own
+channel-sliced call sums to exactly one full-input unfold (the groups'
+channel slices partition the input's channel axis with no overlap), so
+this costs no more overall than the ``group=1`` case already did -- see
+:func:`apply_sparsegpt_pruning`'s own docstring for exactly how each
+group's own ``H_g`` accumulates batch by batch. Verified the same three
+ways the ``group=1`` case above was: a brute-force nested-loop oracle
+building each group's own ``[K, K]`` Hessian a completely different way
+(an explicit outer-product accumulation per output position, per group,
+rather than any vectorized unfolding), engineered with genuinely different
+per-group calibration statistics (the same technique
+:func:`_conv_group_relative_norm`'s own grouped-Wanda test uses) so a bug
+sharing one Hessian across groups, or mixing up which group's slice feeds
+which filter rows, is caught rather than accidentally passing on symmetric
+data; a second, independent reference transliteration
+(``_reference_sparsegpt``, already validated against the ``group=1`` case)
+fed each group's own correctly-sliced weight/Hessian, confirmed to match
+:func:`apply_sparsegpt_pruning`'s actual output exactly, for both
+unstructured and N:M sparsity; and the same end-to-end reconstruction-
+error property (against a naive same-mask-no-compensation baseline, via
+onnxruntime) the ``group=1`` case is validated against, including the
+depthwise extreme (``group == Cin == Cout``, ``Cin/group == 1``), where
+each group's own Hessian correctly degenerates to a ``[kh*kw, kh*kw]``
+per-channel Hessian rather than anything degenerate or wrong at that
+boundary.
 """
 
 from __future__ import annotations
@@ -594,22 +661,28 @@ def _match_conv_weight_only(
 
     Unlike :func:`_match_conv_producer`/:func:`_match_conv_consumer`, a
     grouped or depthwise Conv (``group != 1``) is matched here too when
-    `allow_grouped` (the default, used by :func:`apply_magnitude_pruning`/
-    :func:`apply_wanda_pruning`): those two functions' own ``group=1``
-    restriction exists because *structured* pruning's producer/consumer
-    channel-index coupling genuinely doesn't survive grouping (an output
-    or input channel's index meaning depends on which of `group`'s blocks
-    it falls into on each side of a chain -- see this module's own
-    docstring). Nothing here inherits that problem: unstructured/N:M
-    pruning never changes any shape or needs any cross-layer index
-    agreement -- it only zeros individual weight entries within one output
-    filter's own kernel, independently of every other filter -- and
+    `allow_grouped` (the default, used by all three of
+    :func:`apply_magnitude_pruning`/:func:`apply_wanda_pruning`/
+    :func:`apply_sparsegpt_pruning`): those *structured*-pruning functions'
+    own ``group=1`` restriction exists because their producer/consumer
+    channel-index coupling genuinely doesn't survive grouping (an output or
+    input channel's index meaning depends on which of `group`'s blocks it
+    falls into on each side of a chain -- see this module's own docstring).
+    Nothing here inherits that problem: unstructured/N:M pruning never
+    changes any shape or needs any cross-layer index agreement -- it only
+    zeros individual weight entries within one output filter's own kernel,
+    independently of every other filter. For magnitude/Wanda, that's simply
     :func:`_prune_weight`'s ``w.reshape(n, cin*kh*kw)`` (`cin` here already
     being ``in_channels/group`` by ONNX's own grouped-Conv weight layout)
-    ranks and masks each of the `n` output filters' rows exactly the same
-    way regardless of `group`. `allow_grouped=False` (only
-    :func:`apply_sparsegpt_pruning` passes this, see its own docstring for
-    why) restores the ``group=1``-only match. When `allow_grouped` and
+    ranking and masking each of the `n` output filters' rows the same way
+    regardless of `group`; for SparseGPT it needs the materially bigger
+    step of a genuinely *per-group* Hessian and column-processing loop (see
+    :func:`apply_sparsegpt_pruning`'s own docstring), but the matching
+    criterion itself -- whether this Conv is eligible at all -- is
+    identical either way, hence one shared matcher for all three. Passing
+    `allow_grouped=False` restores the ``group=1``-only match (no current
+    caller in this module does; kept as a general-purpose restriction for
+    any future caller that needs it). When `allow_grouped` and
     ``group > 1``, ``out_channels % group`` must still be zero -- the
     standard grouped-Conv well-formedness requirement (`group` equal-sized
     output blocks) that :func:`_conv_group_relative_norm` also relies on to
@@ -682,15 +755,20 @@ def _candidates(
       QKV weight, matched by :func:`_match_attention_weight_only` -- unlike
       GQA's separate projections, this *is* a weight the op itself owns
       (``node.input[1]``), so it needs its own matcher; and
-    - when `include_conv` (the default; :func:`apply_sparsegpt_pruning`
-      passes ``False``, see its own docstring for why) -- every 2-D
-      ``Conv`` node matched by :func:`_match_conv_weight_only`, which by
-      default (`allow_grouped_conv`, also default) includes depthwise and
-      general grouped Conv, not just ordinary (``group=1``) Conv --
-      :func:`apply_sparsegpt_pruning` still matches Conv at all
-      (`include_conv` stays ``True`` there) but passes
-      ``allow_grouped_conv=False``, since its own Conv im2col-Hessian
-      machinery is ``group=1``-only (see its own docstring).
+    - when `include_conv` (the default; no caller in this module passes
+      ``False``, it exists purely as a general-purpose "MatMul/Gemm/
+      Attention only" restriction for any future caller that wants it) --
+      every 2-D ``Conv`` node matched by :func:`_match_conv_weight_only`,
+      which by default (`allow_grouped_conv`, also default) includes
+      depthwise and general grouped Conv, not just ordinary (``group=1``)
+      Conv -- every one of :func:`apply_magnitude_pruning`/
+      :func:`apply_wanda_pruning`/:func:`apply_sparsegpt_pruning` matches
+      all three `group` shapes identically at the `_candidates` level; what
+      differs between them is entirely how each one's own importance/
+      Hessian machinery downstream handles grouping (a per-filter-row
+      reshape for magnitude/Wanda, a genuinely per-group Hessian and
+      column-processing loop for SparseGPT -- see each function's own
+      docstring), never which Conv nodes get matched in the first place.
 
     Returns ``(node, x_name, w_name, weight_transposed, is_conv)`` tuples;
     `weight_transposed` is always ``False`` (meaningless) for a Conv entry,
@@ -698,12 +776,10 @@ def _candidates(
     ``[out_channels, in_channels/group, kH, kW]`` layout, and likewise
     always ``False`` (this time literally correct, not just meaningless --
     see :func:`_match_attention_weight_only`) for an Attention entry.
-    Attention matching is unconditional (not gated by `include_conv`, which
-    -- per its own name and :func:`apply_sparsegpt_pruning`'s own docstring
-    -- concerns only Conv's im2col-Hessian gap): see
+    Attention matching is unconditional (not gated by `include_conv`): see
     :func:`apply_sparsegpt_pruning`'s own docstring for why a merged QKV
-    weight has no analogous problem and is deliberately included in its
-    ``include_conv=False`` candidate list too.
+    weight has no Conv-style gap of its own and is included in every
+    candidate list regardless.
     """
     initializer_map = {t.name: t for t in graph.initializer}
     out = []
@@ -1312,6 +1388,15 @@ def _conv_im2col_patches(
     needed instead. Returns ``None`` on the same "not usable" conditions
     :func:`_conv_patch_sq_sum` declines (not a rank-4 activation, or too
     small once padded for this kernel).
+
+    For a grouped/depthwise Conv, :func:`apply_sparsegpt_pruning` calls
+    this once per group on `x` already sliced to that group's own global
+    input-channel range (``x[:, g*Cin/group:(g+1)*Cin/group, :, :]``) --
+    this function itself carries no notion of `group` at all, and needs
+    none: it only ever reads `x`'s own channel count via ``x.shape[1]``, so
+    a channel-sliced sub-tensor is unfolded exactly the same way a smaller
+    "whole" input would be. See this module's own docstring for why that
+    is the correct per-group Hessian rather than an approximation of one.
     """
     if x.ndim != 4:
         return None
@@ -1373,23 +1458,23 @@ def apply_sparsegpt_pruning(
     output row within each ``proc_block_size``-wide column block (the
     reference implementation's own behavior), not chosen per row.
 
-    Also matches, unlike :func:`apply_magnitude_pruning`/
-    :func:`apply_wanda_pruning`, only *ordinary* (``group=1``) 2-D ``Conv``
-    layers (``_candidates(graph, allow_grouped_conv=False)``) -- see this
-    module's own docstring for the full ``[K, K]`` im2col cross-covariance
-    Hessian this needed (materially more machinery than Wanda's per-offset
-    norm, and -- unlike everything else this function ports from the
-    reference implementation -- with no correct reference to work from at
-    all: the official implementation's own ``add_batch``
-    (https://github.com/IST-DASLab/sparsegpt) never actually unfolds a
-    ``nn.Conv2d`` activation, only reshapes the *weight*, since its own
-    driver scripts never exercise a Conv layer), how it's verified, why --
-    unlike magnitude/Wanda above -- extending it to depthwise/general
-    grouped Conv is deliberately left undone (a per-group Hessian and a
-    per-group column-processing loop, not a mechanical extension of the
-    matching alone), and how ``H`` accumulates batch by batch rather than
-    ever materializing every calibration batch's unfolded patches at once.
-    A Conv layer whose ``auto_pad``/``dilations`` aren't a combination
+    Also matches every 2-D ``Conv`` layer :func:`apply_magnitude_pruning`/
+    :func:`apply_wanda_pruning` do -- ordinary (``group=1``), depthwise, and
+    general grouped Conv alike (``_candidates(graph)``, `allow_grouped_conv`
+    at its own default, ``True``) -- see this module's own docstring for the
+    full ``[K, K]`` im2col cross-covariance Hessian this needed (materially
+    more machinery than Wanda's per-offset norm, and -- unlike everything
+    else this function ports from the reference implementation -- with no
+    correct reference to work from at all: the official implementation's own
+    ``add_batch`` (https://github.com/IST-DASLab/sparsegpt) never actually
+    unfolds a ``nn.Conv2d`` activation, only reshapes the *weight*, since its
+    own driver scripts never exercise a Conv layer), how it's verified, how
+    a grouped/depthwise Conv gets a genuinely *per-group* Hessian and its
+    own independent column-processing/error-compensation pass rather than
+    one shared across every filter, and how each group's own ``H``
+    accumulates batch by batch rather than ever materializing every
+    calibration batch's unfolded patches at once. A Conv layer whose
+    ``auto_pad``/``dilations`` aren't a combination
     :func:`_conv_spatial_attrs` confidently handles is left completely
     untouched, same as a layer with no observed calibration activation at
     all -- there is still no data-free fallback for SparseGPT.
@@ -1442,9 +1527,12 @@ def apply_sparsegpt_pruning(
             activation isn't plain 2-D/higher-rank-with-a-trailing-
             feature-axis), or a Conv layer with no observed usable 4-D
             activation (dead input, or an ``auto_pad``/``dilations``
-            combination :func:`_conv_spatial_attrs` declines), is left
-            completely untouched -- unlike Wanda, there is no data-free
-            fallback for a technique whose entire mechanism is the Hessian
+            combination :func:`_conv_spatial_attrs` declines) *for any one
+            of its groups* (a grouped/depthwise Conv is left completely
+            untouched, not partially pruned, if even one group's own
+            Hessian was never observed), is left completely untouched --
+            unlike Wanda, there is no data-free fallback for a technique
+            whose entire mechanism is the Hessian
     """
     _validate_pattern(sparsity, n, m)
     if isinstance(model, str):
@@ -1459,13 +1547,12 @@ def apply_sparsegpt_pruning(
     graph = out.graph
     initializer_map = {t.name: t for t in graph.initializer}
 
-    # allow_grouped_conv=False: unlike apply_magnitude_pruning/
-    # apply_wanda_pruning, this function's Conv Hessian machinery
-    # (_conv_im2col_patches, H = patches.T @ patches) is only correct for
-    # group=1 -- see this function's own docstring and this module's own
-    # docstring for why extending it to grouped/depthwise Conv needs a real
-    # per-group Hessian this pass does not attempt.
-    candidates = _candidates(graph, allow_grouped_conv=False)
+    # Unlike an earlier version of this function, grouped/depthwise Conv is
+    # matched too (_candidates' own allow_grouped_conv default, True) -- see
+    # this function's own docstring and this module's own docstring for the
+    # per-group Hessian/column-processing-loop partitioning that makes this
+    # correct now.
+    candidates = _candidates(graph)
     if not candidates:
         return out
 
@@ -1481,6 +1568,15 @@ def apply_sparsegpt_pruning(
         for node, _, w_name, _, is_conv in candidates
         if is_conv
     }
+    # `group`/`in_channels_per_group` are fixed per node (read once, not
+    # recomputed per batch) -- `cin_per_group` is exactly the weight's own
+    # axis-1 extent, ONNX's grouped-Conv convention (see this module's own
+    # docstring).
+    conv_group_info: Dict[str, Tuple[int, int]] = {
+        w_name: (_conv_group(node), int(initializer_map[w_name].dims[1]))
+        for node, _, w_name, _, is_conv in candidates
+        if is_conv
+    }
 
     activations: Dict[str, List[np.ndarray]] = {
         x_name: [] for _, x_name, _, _, is_conv in candidates if not is_conv
@@ -1492,7 +1588,23 @@ def apply_sparsegpt_pruning(
     # matrix at a time: a full [n_positions, K] patch matrix can be large,
     # so no batch's patches outlive the H += they fold into. See this
     # module's own docstring.
-    conv_h: Dict[str, np.ndarray] = {}
+    #
+    # conv_h[w_name] is a list of length `group`, one independently
+    # accumulated H per group -- filter row i (belonging to group
+    # i // (out_channels/group), ONNX's own grouped-Conv weight layout)
+    # only ever reads its own group's global input-channel slice
+    # [g*cin_per_group, (g+1)*cin_per_group), so group g's own H is built
+    # by feeding exactly that channel-sliced sub-tensor through the same
+    # per-group-agnostic _conv_im2col_patches used for the group=1 case --
+    # no dedicated grouped-Hessian machinery needed, since im2col-unfolding
+    # a channel slice is exactly what im2col-unfolding a narrower "whole"
+    # input already does. For group=1 this is a length-1 list whose single
+    # entry is built from the full (unsliced) input, identical to this
+    # function's previous group=1-only behavior. Total unfolding work
+    # across every group's own slice equals one full-input unfold (the
+    # slices partition the channel axis), so this costs no more overall
+    # than the group=1 case did.
+    conv_h: Dict[str, List[Optional[np.ndarray]]] = {}
 
     for batch in calibration_data:
         result = backend.run_model(probe_model, batch, providers=providers)
@@ -1507,29 +1619,59 @@ def apply_sparsegpt_pruning(
             attrs = conv_attrs[w_name]
             if attrs is None:
                 continue
+            group, cin_per_group = conv_group_info[w_name]
             x_conv = np.asarray(result[x_name], dtype=np.float64)
-            patches = _conv_im2col_patches(x_conv, attrs)
-            if patches is None:
-                continue
-            h_batch = patches.T @ patches
-            conv_h[w_name] = (
-                h_batch if w_name not in conv_h else conv_h[w_name] + h_batch
-            )
+            if x_conv.ndim != 4 or x_conv.shape[1] != cin_per_group * group:
+                continue  # not this node's own [N, Cin, H, W] input -- skip
+            h_accum = conv_h.setdefault(w_name, [None] * group)
+            for g in range(group):
+                x_group = x_conv[:, g * cin_per_group : (g + 1) * cin_per_group, :, :]
+                patches = _conv_im2col_patches(x_group, attrs)
+                if patches is None:
+                    continue
+                h_batch = patches.T @ patches
+                h_accum[g] = h_batch if h_accum[g] is None else h_accum[g] + h_batch
 
     for _, x_name, w_name, weight_transposed, is_conv in candidates:
         w_init = initializer_map[w_name]
         w = onnx.numpy_helper.to_array(w_init).astype(np.float64)
 
         if is_conv:
-            cout, cin, kh, kw = w.shape
-            h = conv_h.get(w_name)
-            if h is None:
+            cout, cin_per_group, kh, kw = w.shape
+            group, _ = conv_group_info[w_name]
+            h_list = conv_h.get(w_name)
+            # Every group's own H must have been observed -- a layer with
+            # no usable calibration signal for any one group is left
+            # completely untouched, same as the group=1 case's `h is None`
+            # check (there is no data-free fallback, and no meaningful way
+            # to prune some groups' filters but not others.
+            if h_list is None or any(h is None for h in h_list):
                 continue
-            w_nk = w.reshape(cout, cin * kh * kw)
-            w_pruned_nk = _sparsegpt_prune_columns(
-                w_nk, h, sparsity, n, m, percdamp, proc_block_size
-            )
-            w_new = w_pruned_nk.reshape(cout, cin, kh, kw).astype(np.float32)
+            filters_per_group = cout // group
+            w_nk = w.reshape(cout, cin_per_group * kh * kw)
+            # Each group's own [filters_per_group, K] weight sub-block is
+            # pruned independently against its own group's H -- a column-
+            # masking decision and its downstream error compensation only
+            # make sense within one group's own consistent Hessian/weight
+            # coordinate system (see this module's own docstring), so
+            # _sparsegpt_prune_columns (already correct for one full,
+            # ungrouped weight/Hessian pair) is simply called once per
+            # group rather than needing any grouped-specific version of its
+            # own sequential column-processing/error-compensation loop.
+            pruned_groups = [
+                _sparsegpt_prune_columns(
+                    w_nk[g * filters_per_group : (g + 1) * filters_per_group],
+                    h_list[g],
+                    sparsity,
+                    n,
+                    m,
+                    percdamp,
+                    proc_block_size,
+                )
+                for g in range(group)
+            ]
+            w_pruned_nk = np.concatenate(pruned_groups, axis=0)
+            w_new = w_pruned_nk.reshape(cout, cin_per_group, kh, kw).astype(np.float32)
         else:
             acts = activations[x_name]
             if not acts:
