@@ -122,6 +122,57 @@ void SetFloatTensorData(onnx::TensorProto* t, const std::vector<int64_t>& dims,
   t->set_raw_data(std::move(raw));
 }
 
+// The INT64 analogue of ReadFloatTensor, used only by
+// FindAttentionChains/FindSeparateQkvChains's own Reshape-target-shape
+// reading and rewriting (WalkToAttentionConsumer/SetInt64TensorLastDim).
+std::vector<int64_t> ReadInt64Tensor(const onnx::TensorProto& t) {
+  int64_t numel = 1;
+  for (int64_t d : t.dims()) {
+    numel *= d;
+  }
+  std::vector<int64_t> out(static_cast<size_t>(numel));
+  if (t.has_raw_data()) {
+    std::memcpy(out.data(), t.raw_data().data(), out.size() * sizeof(int64_t));
+    if constexpr (!onnxsim::dlpack::kRawDataIsHostOrder) {
+      onnxsim::dlpack::SwapElementBytes(reinterpret_cast<uint8_t*>(out.data()),
+                                        out.size() * sizeof(int64_t),
+                                        sizeof(int64_t));
+    }
+  } else {
+    for (int64_t i = 0; i < numel; ++i) {
+      out[static_cast<size_t>(i)] = t.int64_data(static_cast<int>(i));
+    }
+  }
+  return out;
+}
+
+// Overwrites the last element of an INT64 tensor `t` in place with
+// `new_last`, keeping every other dim -- mirrors pruning.py's own
+// `dims[-1] = ...; shape_init.CopyFrom(from_array(dims))` pattern for a
+// Reshape node's own target-shape constant.
+void SetInt64TensorLastDim(onnx::TensorProto* t, int64_t new_last) {
+  std::vector<int64_t> data = ReadInt64Tensor(*t);
+  if (data.empty()) {
+    return;
+  }
+  data.back() = new_last;
+  const std::string name = t->name();
+  std::vector<int64_t> dims(t->dims().begin(), t->dims().end());
+  t->Clear();
+  t->set_name(name);
+  t->set_data_type(onnx::TensorProto::INT64);
+  for (int64_t d : dims) {
+    t->add_dims(d);
+  }
+  std::string raw(data.size() * sizeof(int64_t), '\0');
+  std::memcpy(raw.data(), data.data(), raw.size());
+  if constexpr (!onnxsim::dlpack::kRawDataIsHostOrder) {
+    onnxsim::dlpack::SwapElementBytes(reinterpret_cast<uint8_t*>(raw.data()),
+                                      raw.size(), sizeof(int64_t));
+  }
+  t->set_raw_data(std::move(raw));
+}
+
 int64_t ConvGroupAttr(const onnx::NodeProto& node) {
   for (const auto& attr : node.attribute()) {
     if (attr.name() == "group") {
@@ -1129,10 +1180,10 @@ std::vector<Chain> FindConvResidualChains(onnx::GraphProto* graph) {
 // (node, const_name) entries -- ApplyChains's existing per-hop constant
 // slicing picks them up with no changes of its own.
 
-constexpr char kSkipLayerNormDomain[] = "com.microsoft";
+constexpr char kComMicrosoftDomain[] = "com.microsoft";
 
 bool IsSkipLayerNormOp(const onnx::NodeProto& node) {
-  return node.domain() == kSkipLayerNormDomain &&
+  return node.domain() == kComMicrosoftDomain &&
          (node.op_type() == "SkipLayerNormalization" ||
           node.op_type() == "SkipSimplifiedLayerNormalization");
 }
@@ -1942,6 +1993,802 @@ void ApplyChains(onnx::GraphProto* graph, std::vector<Chain>& chains,
   }
 }
 
+// --- Attention-head pruning, mirroring pruning.py's own
+// _match_attention_producer/_walk_to_attention_consumer/
+// _find_attention_chains, _match_gqa_producer/_match_onnx_attention_producer/
+// _find_separate_qkv_chains, and _apply_one_plain_attention_chain/
+// _apply_one_gqa_chain/_apply_attention_chains. Data-free (magnitude/
+// Frobenius-norm) only -- pruning.py's own calibration-driven
+// apply_attention_head_wanda_pruning is not ported, matching this codebase's
+// established C++-port scope decision (data-free/closed-form techniques
+// only). Three fused self-attention ops are matched, each at the
+// granularity its own kernel contract allows -- see pruning.py's own
+// "Attention-head pruning" section comment for the full rationale (packed-
+// QKV vs. separate-Q/K/V weight layout, individual-head vs. whole-KV-group
+// pruning unit, and why the plain ai.onnx::Attention op reuses the
+// GroupQueryAttention machinery outright rather than a parallel
+// implementation) -- this comment only covers what's specific to the port:
+//
+// - com.microsoft::Attention: a single merged QKV weight/bias, one
+//   `num_heads` shared by Q/K/V alike -- every head owns an equally-sized,
+//   independent column block, so individual heads drop one at a time
+//   (FindAttentionChains/ApplyOnePlainAttentionChain).
+// - com.microsoft::GroupQueryAttention and the plain ai.onnx::Attention
+//   (opset 24+): separate, un-merged Q/K/V MatMul/vanilla-Gemm producers,
+//   `num_heads`/`kv_num_heads` (or `q_num_heads`/`kv_num_heads` for the
+//   plain op) attributes -- only a whole KV group (that KV head's own K/V
+//   column block, plus every query head mapped to it) is ever removed at
+//   once, since every surviving KV head must keep exactly the same number
+//   of query heads mapped to it after pruning (FindSeparateQkvChains/
+//   ApplyOneGqaChain, shared between the two ops).
+
+// True for a com.microsoft::Attention node with a constant 2-D float32
+// merged QKV weight [K, Nq+Nk+Nv] (and, if present, a constant 1-D float32
+// merged bias). Mirrors pruning.py's own _match_attention_producer.
+struct AttentionProducerMatch {
+  std::string weight;
+  std::optional<std::string> bias;
+  int64_t num_heads;
+  int64_t nq, nk, nv;
+};
+
+std::optional<AttentionProducerMatch> MatchAttentionProducer(
+    const onnx::NodeProto& node, const InitMap& init_map) {
+  if (node.domain() != kComMicrosoftDomain || node.op_type() != "Attention") {
+    return std::nullopt;
+  }
+  if (node.input_size() < 2) {
+    return std::nullopt;
+  }
+  const std::string& w_name = node.input(1);
+  auto wit = init_map.find(w_name);
+  if (wit == init_map.end() ||
+      wit->second->data_type() != onnx::TensorProto::FLOAT ||
+      wit->second->dims_size() != 2) {
+    return std::nullopt;
+  }
+  const int64_t total_n = wit->second->dims(1);
+
+  std::optional<std::string> bias_name;
+  if (node.input_size() >= 3 && !node.input(2).empty()) {
+    bias_name = node.input(2);
+    auto bit = init_map.find(*bias_name);
+    if (bit == init_map.end() ||
+        bit->second->data_type() != onnx::TensorProto::FLOAT ||
+        bit->second->dims_size() != 1 || bit->second->dims(0) != total_n) {
+      return std::nullopt;
+    }
+  }
+
+  int64_t num_heads = 0;
+  bool has_num_heads = false;
+  std::optional<std::vector<int64_t>> qkv_hidden_sizes;
+  for (const auto& attr : node.attribute()) {
+    if (attr.name() == "num_heads") {
+      num_heads = attr.i();
+      has_num_heads = true;
+    } else if (attr.name() == "qkv_hidden_sizes") {
+      qkv_hidden_sizes =
+          std::vector<int64_t>(attr.ints().begin(), attr.ints().end());
+    }
+  }
+  if (!has_num_heads || num_heads <= 0) {
+    return std::nullopt;
+  }
+
+  int64_t nq, nk, nv;
+  if (qkv_hidden_sizes) {
+    if (qkv_hidden_sizes->size() != 3) {
+      return std::nullopt;
+    }
+    nq = (*qkv_hidden_sizes)[0];
+    nk = (*qkv_hidden_sizes)[1];
+    nv = (*qkv_hidden_sizes)[2];
+  } else {  // Schema default: Q/K/V evenly split the merged width.
+    if (total_n % 3 != 0) {
+      return std::nullopt;
+    }
+    nq = nk = nv = total_n / 3;
+  }
+  if (nq <= 0 || nk <= 0 || nv <= 0 || nq + nk + nv != total_n ||
+      nq % num_heads != 0 || nk % num_heads != 0 || nv % num_heads != 0) {
+    return std::nullopt;
+  }
+  return AttentionProducerMatch{w_name, bias_name, num_heads, nq, nk, nv};
+}
+
+// If `node` is a Reshape whose target-shape input is a constant int64
+// tensor, returns its last entry (or nullopt for a wildcard/inferred -1/0
+// entry, or an unreadable shape).
+std::optional<int64_t> ReshapeLastDim(const onnx::NodeProto& node,
+                                      const InitMap& init_map) {
+  if (node.op_type() != "Reshape" || node.input_size() != 2) {
+    return std::nullopt;
+  }
+  auto it = init_map.find(node.input(1));
+  if (it == init_map.end() ||
+      it->second->data_type() != onnx::TensorProto::INT64) {
+    return std::nullopt;
+  }
+  std::vector<int64_t> dims = ReadInt64Tensor(*it->second);
+  if (dims.empty()) {
+    return std::nullopt;
+  }
+  const int64_t last = dims.back();
+  return last > 0 ? std::optional<int64_t>(last) : std::nullopt;
+}
+
+struct AttnChainOp {
+  onnx::NodeProto* node;
+  std::optional<std::string> shape_name;
+};
+
+// From an attention op's raw (V-hidden-size- or Q-hidden-size-wide,
+// depending on caller) output tensor `start`, optionally through a single
+// Reshape hop whose target shape's last entry is provably still `width`,
+// to a MatMul/vanilla-Gemm consumer (the output projection) whose
+// reduction dimension matches `width`. Mirrors pruning.py's own
+// _walk_to_attention_consumer.
+std::pair<std::optional<ConsumerMatch>, std::vector<AttnChainOp>>
+WalkToAttentionConsumer(const std::string& start, const InitMap& init_map,
+                        const ConsumerMap& consumers_of,
+                        const std::unordered_set<std::string>& graph_outputs,
+                        int64_t width) {
+  auto cit = consumers_of.find(start);
+  if (cit == consumers_of.end() || cit->second.size() != 1) {
+    return {std::nullopt, {}};
+  }
+  onnx::NodeProto* node = cit->second[0];
+  std::vector<AttnChainOp> chain_ops;
+  std::string cur = start;
+
+  if (node->op_type() == "Reshape" && node->input_size() >= 1 &&
+      node->input(0) == cur) {
+    auto last_dim = ReshapeLastDim(*node, init_map);
+    if (!last_dim || *last_dim != width) {
+      return {std::nullopt, {}};
+    }
+    const std::string& shape_name = node->input(1);
+    if (ConsumerCount(consumers_of, shape_name) != 1) {
+      return {std::nullopt, {}};  // Shared shape constant -- mutating unsafe.
+    }
+    const std::string& out_name = node->output(0);
+    if (ConsumerCount(consumers_of, out_name) != 1 ||
+        graph_outputs.count(out_name)) {
+      return {std::nullopt, {}};
+    }
+    chain_ops.push_back(AttnChainOp{node, shape_name});
+    cur = out_name;
+    node = consumers_of.at(cur)[0];
+  }
+
+  auto cm = MatchMatMulLikeRaw(*node);
+  if (!cm || cm->x_name != cur) {
+    return {std::nullopt, chain_ops};
+  }
+  auto wit = init_map.find(cm->w_name);
+  if (wit == init_map.end() ||
+      wit->second->data_type() != onnx::TensorProto::FLOAT ||
+      wit->second->dims_size() != 2) {
+    return {std::nullopt, chain_ops};
+  }
+  const int64_t k =
+      cm->weight_transposed ? wit->second->dims(1) : wit->second->dims(0);
+  if (k != width) {
+    return {std::nullopt, chain_ops};
+  }
+  return {ConsumerMatch{node, cm->w_name, cm->weight_transposed}, chain_ops};
+}
+
+enum class AttnChainKind { kPlainAttention, kGqaLike };
+
+// Either kind of matched attention block -- a single tagged struct rather
+// than pruning.py's own _AttnLikeChain union of two dataclasses, since
+// C++ has no direct analogue of Python's runtime isinstance() dispatch;
+// `kind` says which of the two field groups below is populated.
+struct AttnChain {
+  AttnChainKind kind;
+  onnx::NodeProto* node;
+  // kPlainAttention fields (com.microsoft::Attention's merged QKV weight):
+  std::string weight;
+  std::optional<std::string> bias;
+  int64_t num_heads = 0;
+  int64_t nq = 0, nk = 0, nv = 0;
+  // kGqaLike fields (GroupQueryAttention or plain ai.onnx::Attention's
+  // separate Q/K/V producers):
+  std::string q_weight, k_weight, v_weight;
+  bool q_weight_transposed = false;
+  bool k_weight_transposed = false;
+  bool v_weight_transposed = false;
+  std::optional<std::string> q_bias, k_bias, v_bias;
+  int64_t kv_num_heads = 0;
+  int64_t head_size = 0;
+  std::string num_heads_attr = "num_heads";
+  // Shared:
+  std::vector<AttnChainOp> chain_ops;
+  onnx::NodeProto* consumer_node = nullptr;
+  std::string consumer_weight;
+  bool consumer_weight_transposed = false;
+};
+
+std::vector<AttnChain> FindAttentionChains(onnx::GraphProto* graph) {
+  InitMap init_map;
+  for (const auto& t : graph->initializer()) {
+    init_map[t.name()] = &t;
+  }
+  ConsumerMap consumers_of = ConsumersOf(graph);
+  std::unordered_set<std::string> graph_outputs;
+  for (const auto& o : graph->output()) {
+    graph_outputs.insert(o.name());
+  }
+  auto is_internal = [&](const std::string& name) {
+    return ConsumerCount(consumers_of, name) == 1 && !graph_outputs.count(name);
+  };
+
+  std::vector<AttnChain> chains;
+  for (int i = 0; i < graph->node_size(); ++i) {
+    onnx::NodeProto* node = graph->mutable_node(i);
+    auto info = MatchAttentionProducer(*node, init_map);
+    if (!info) {
+      continue;
+    }
+    const std::string& out_name = node->output(0);
+    if (!is_internal(out_name)) {
+      continue;
+    }
+    auto [consumer, chain_ops] = WalkToAttentionConsumer(
+        out_name, init_map, consumers_of, graph_outputs, info->nv);
+    if (!consumer) {
+      continue;
+    }
+
+    AttnChain chain;
+    chain.kind = AttnChainKind::kPlainAttention;
+    chain.node = node;
+    chain.weight = info->weight;
+    chain.bias = info->bias;
+    chain.num_heads = info->num_heads;
+    chain.nq = info->nq;
+    chain.nk = info->nk;
+    chain.nv = info->nv;
+    chain.chain_ops = std::move(chain_ops);
+    chain.consumer_node = consumer->node;
+    chain.consumer_weight = consumer->weight;
+    chain.consumer_weight_transposed = consumer->weight_transposed;
+    chains.push_back(std::move(chain));
+  }
+  return chains;
+}
+
+struct HeadCountsMatch {
+  int64_t num_heads;
+  int64_t kv_num_heads;
+};
+
+// If `node` is a com.microsoft::GroupQueryAttention node this pass can
+// safely act on (separate Q/K/V inputs -- rules out the op's packed-QKV
+// calling convention; no non-empty constant past_key/past_value), returns
+// (num_heads, kv_num_heads). Mirrors pruning.py's own _match_gqa_producer.
+std::optional<HeadCountsMatch> MatchGqaProducer(const onnx::NodeProto& node,
+                                                const InitMap& init_map) {
+  if (node.domain() != kComMicrosoftDomain ||
+      node.op_type() != "GroupQueryAttention") {
+    return std::nullopt;
+  }
+  if (node.input_size() < 7 || node.input(0).empty() || node.input(1).empty() ||
+      node.input(2).empty()) {
+    return std::nullopt;
+  }
+  int64_t num_heads = 0, kv_num_heads = 0;
+  bool has_nh = false, has_kv = false;
+  for (const auto& attr : node.attribute()) {
+    if (attr.name() == "num_heads") {
+      num_heads = attr.i();
+      has_nh = true;
+    } else if (attr.name() == "kv_num_heads") {
+      kv_num_heads = attr.i();
+      has_kv = true;
+    }
+  }
+  if (!has_nh || !has_kv || num_heads <= 0 || kv_num_heads <= 0) {
+    return std::nullopt;
+  }
+  if (num_heads % kv_num_heads != 0) {
+    return std::nullopt;
+  }
+  for (int idx : {3, 4}) {  // past_key, past_value.
+    if (node.input_size() <= idx || node.input(idx).empty()) {
+      continue;
+    }
+    auto it = init_map.find(node.input(idx));
+    if (it != init_map.end()) {
+      int64_t prod = 1;
+      for (int64_t d : it->second->dims()) {
+        prod *= d;
+      }
+      if (prod > 0) {
+        return std::nullopt;  // Non-empty KV-cache constant -- needs slicing.
+      }
+    }
+  }
+  return HeadCountsMatch{num_heads, kv_num_heads};
+}
+
+// If `node` is a plain ai.onnx::Attention node (domain "", opset 24+) this
+// pass can safely act on, returns (q_num_heads, kv_num_heads). Mirrors
+// pruning.py's own _match_onnx_attention_producer.
+std::optional<HeadCountsMatch> MatchOnnxAttentionProducer(
+    const onnx::NodeProto& node, const InitMap& init_map) {
+  if (!node.domain().empty() || node.op_type() != "Attention") {
+    return std::nullopt;
+  }
+  if (node.input_size() < 3 || node.input(0).empty() || node.input(1).empty() ||
+      node.input(2).empty()) {
+    return std::nullopt;
+  }
+  int64_t q_num_heads = 0, kv_num_heads = 0;
+  bool has_q = false, has_kv = false;
+  for (const auto& attr : node.attribute()) {
+    if (attr.name() == "q_num_heads") {
+      q_num_heads = attr.i();
+      has_q = true;
+    } else if (attr.name() == "kv_num_heads") {
+      kv_num_heads = attr.i();
+      has_kv = true;
+    }
+  }
+  if (!has_q || !has_kv || q_num_heads <= 0 || kv_num_heads <= 0) {
+    return std::nullopt;
+  }
+  if (q_num_heads % kv_num_heads != 0) {
+    return std::nullopt;
+  }
+  for (int idx : {3, 4, 5}) {  // attn_mask, past_key, past_value.
+    if (node.input_size() <= idx || node.input(idx).empty()) {
+      continue;
+    }
+    auto it = init_map.find(node.input(idx));
+    if (it != init_map.end()) {
+      int64_t prod = 1;
+      for (int64_t d : it->second->dims()) {
+        prod *= d;
+      }
+      if (prod > 0) {
+        return std::nullopt;  // Non-empty constant -- would need slicing.
+      }
+    }
+  }
+  return HeadCountsMatch{q_num_heads, kv_num_heads};
+}
+
+// Shared body for FindGqaChains/FindOnnxAttentionChains: both match a fused
+// attention node fed by three separate, un-merged Q/K/V MatMul/vanilla-Gemm
+// projections and prune it at whole-KV-group granularity, differing only in
+// `match_producer` and which attribute holds the query head count
+// (`num_heads_attr`). Mirrors pruning.py's own _find_separate_qkv_chains.
+std::vector<AttnChain> FindSeparateQkvChains(
+    onnx::GraphProto* graph,
+    const std::function<std::optional<HeadCountsMatch>(
+        const onnx::NodeProto&, const InitMap&)>& match_producer,
+    const std::string& num_heads_attr) {
+  InitMap init_map;
+  for (const auto& t : graph->initializer()) {
+    init_map[t.name()] = &t;
+  }
+  ConsumerMap consumers_of = ConsumersOf(graph);
+  std::unordered_set<std::string> graph_outputs;
+  for (const auto& o : graph->output()) {
+    graph_outputs.insert(o.name());
+  }
+  std::unordered_map<std::string, onnx::NodeProto*> node_by_output;
+  for (int i = 0; i < graph->node_size(); ++i) {
+    onnx::NodeProto* node = graph->mutable_node(i);
+    for (const auto& out : node->output()) {
+      node_by_output[out] = node;
+    }
+  }
+  auto is_internal = [&](const std::string& name) {
+    return ConsumerCount(consumers_of, name) == 1 && !graph_outputs.count(name);
+  };
+
+  std::vector<AttnChain> chains;
+  for (int i = 0; i < graph->node_size(); ++i) {
+    onnx::NodeProto* node = graph->mutable_node(i);
+    auto info = match_producer(*node, init_map);
+    if (!info) {
+      continue;
+    }
+
+    const std::string& q_name = node->input(0);
+    const std::string& k_name = node->input(1);
+    const std::string& v_name = node->input(2);
+    if (q_name == k_name || q_name == v_name || k_name == v_name) {
+      continue;  // Degenerate -- can't independently slice a shared producer.
+    }
+    if (!is_internal(q_name) || !is_internal(k_name) || !is_internal(v_name)) {
+      continue;
+    }
+    auto qit = node_by_output.find(q_name);
+    auto kit = node_by_output.find(k_name);
+    auto vit = node_by_output.find(v_name);
+    if (qit == node_by_output.end() || kit == node_by_output.end() ||
+        vit == node_by_output.end()) {
+      continue;
+    }
+    auto pq = MatchProducer(*qit->second, init_map);
+    auto pk = MatchProducer(*kit->second, init_map);
+    auto pv = MatchProducer(*vit->second, init_map);
+    if (!pq || !pk || !pv) {
+      continue;
+    }
+    if (pq->weight == pk->weight || pq->weight == pv->weight ||
+        pk->weight == pv->weight || pq->n_channels % info->num_heads != 0 ||
+        pk->n_channels % info->kv_num_heads != 0 ||
+        pv->n_channels % info->kv_num_heads != 0) {
+      continue;
+    }
+    const int64_t head_size = pq->n_channels / info->num_heads;
+    if (head_size <= 0 || pk->n_channels / info->kv_num_heads != head_size ||
+        pv->n_channels / info->kv_num_heads != head_size) {
+      // fuse_gqa.h requires equal Q/K/V head_size; the plain ai.onnx op's
+      // own more permissive schema allows V its own head_size, but this
+      // shared, uniform-head_size body declines that composition rather
+      // than mis-slicing it.
+      continue;
+    }
+
+    const std::string& out_name = node->output(0);
+    if (!is_internal(out_name)) {
+      continue;
+    }
+    // Both matched ops' raw output is Nq-wide (num_heads * head_size),
+    // unlike plain com.microsoft::Attention's V-hidden-size-wide output.
+    auto [consumer, chain_ops] = WalkToAttentionConsumer(
+        out_name, init_map, consumers_of, graph_outputs, pq->n_channels);
+    if (!consumer) {
+      continue;
+    }
+
+    AttnChain chain;
+    chain.kind = AttnChainKind::kGqaLike;
+    chain.node = node;
+    chain.q_weight = pq->weight;
+    chain.q_bias = pq->bias;
+    chain.q_weight_transposed = pq->weight_transposed;
+    chain.k_weight = pk->weight;
+    chain.k_bias = pk->bias;
+    chain.k_weight_transposed = pk->weight_transposed;
+    chain.v_weight = pv->weight;
+    chain.v_bias = pv->bias;
+    chain.v_weight_transposed = pv->weight_transposed;
+    chain.num_heads = info->num_heads;
+    chain.kv_num_heads = info->kv_num_heads;
+    chain.head_size = head_size;
+    chain.chain_ops = std::move(chain_ops);
+    chain.consumer_node = consumer->node;
+    chain.consumer_weight = consumer->weight;
+    chain.consumer_weight_transposed = consumer->weight_transposed;
+    chain.num_heads_attr = num_heads_attr;
+    chains.push_back(std::move(chain));
+  }
+  return chains;
+}
+
+std::vector<AttnChain> FindGqaChains(onnx::GraphProto* graph) {
+  return FindSeparateQkvChains(graph, MatchGqaProducer, "num_heads");
+}
+
+std::vector<AttnChain> FindOnnxAttentionChains(onnx::GraphProto* graph) {
+  return FindSeparateQkvChains(graph, MatchOnnxAttentionProducer,
+                               "q_num_heads");
+}
+
+// Column indices of every kept head's own head_size-wide block, in
+// ascending head order -- mirrors pruning.py's own _head_column_indices.
+std::vector<int64_t> HeadColumnIndices(const std::vector<int64_t>& keep_heads,
+                                       int64_t head_size) {
+  std::vector<int64_t> out;
+  out.reserve(keep_heads.size() * static_cast<size_t>(head_size));
+  for (int64_t h : keep_heads) {
+    for (int64_t i = 0; i < head_size; ++i) {
+      out.push_back(h * head_size + i);
+    }
+  }
+  return out;
+}
+
+struct AppliedAttn {
+  std::unordered_set<std::string> producer_weights;
+  std::string consumer_weight;
+  std::unordered_set<std::string> stale;
+};
+
+// Applies whole-head pruning to one matched com.microsoft::Attention block
+// in place -- mirrors pruning.py's own _apply_one_plain_attention_chain
+// (data-free/magnitude importance only; the Wanda variant's importance
+// callback indirection is not ported, see this section's own scope note).
+std::optional<AppliedAttn> ApplyOnePlainAttentionChain(
+    std::unordered_map<std::string, onnx::TensorProto*>& init_map,
+    AttnChain& chain, double sparsity) {
+  const int64_t h = chain.num_heads;
+  const int64_t keep_count =
+      std::max<int64_t>(1, h - std::llround(static_cast<double>(h) * sparsity));
+  if (keep_count >= h) {
+    return std::nullopt;
+  }
+
+  const int64_t dq = chain.nq / h, dk = chain.nk / h, dv = chain.nv / h;
+  onnx::TensorProto* w_init = init_map.at(chain.weight);
+  const int64_t K = w_init->dims(0);
+  const int64_t total_n = w_init->dims(1);
+  std::vector<float> w = ReadFloatTensor(*w_init);  // [K, total_n] row-major.
+
+  std::vector<double> importance(static_cast<size_t>(h), 0.0);
+  for (int64_t hh = 0; hh < h; ++hh) {
+    double sq = 0.0;
+    for (int64_t r = 0; r < K; ++r) {
+      for (int64_t c = hh * dq; c < (hh + 1) * dq; ++c) {
+        const double v = w[static_cast<size_t>(r * total_n + c)];
+        sq += v * v;
+      }
+      for (int64_t c = chain.nq + hh * dk; c < chain.nq + (hh + 1) * dk; ++c) {
+        const double v = w[static_cast<size_t>(r * total_n + c)];
+        sq += v * v;
+      }
+      for (int64_t c = chain.nq + chain.nk + hh * dv;
+           c < chain.nq + chain.nk + (hh + 1) * dv; ++c) {
+        const double v = w[static_cast<size_t>(r * total_n + c)];
+        sq += v * v;
+      }
+    }
+    importance[static_cast<size_t>(hh)] = std::sqrt(sq);
+  }
+
+  std::vector<int64_t> keep_heads =
+      TopKIndicesAscending(importance, keep_count);
+  std::vector<int64_t> q_idx = HeadColumnIndices(keep_heads, dq);
+  std::vector<int64_t> k_idx = HeadColumnIndices(keep_heads, dk);
+  for (auto& x : k_idx) {
+    x += chain.nq;
+  }
+  std::vector<int64_t> v_idx_local = HeadColumnIndices(keep_heads, dv);
+  std::vector<int64_t> v_idx = v_idx_local;
+  for (auto& x : v_idx) {
+    x += chain.nq + chain.nk;
+  }
+  std::vector<int64_t> all_idx;
+  all_idx.reserve(q_idx.size() + k_idx.size() + v_idx.size());
+  all_idx.insert(all_idx.end(), q_idx.begin(), q_idx.end());
+  all_idx.insert(all_idx.end(), k_idx.begin(), k_idx.end());
+  all_idx.insert(all_idx.end(), v_idx.begin(), v_idx.end());
+
+  std::vector<float> sliced_w = SliceAxis1(w, K, total_n, 1, all_idx);
+  SetFloatTensorData(w_init, {K, static_cast<int64_t>(all_idx.size())},
+                     sliced_w);
+  if (chain.bias) {
+    SliceLastAxis(init_map.at(*chain.bias), all_idx);
+  }
+
+  bool found_qkv = false;
+  for (auto& attr : *chain.node->mutable_attribute()) {
+    if (attr.name() == "num_heads") {
+      attr.set_i(keep_count);
+    } else if (attr.name() == "qkv_hidden_sizes") {
+      found_qkv = true;
+      attr.clear_ints();
+      attr.add_ints(keep_count * dq);
+      attr.add_ints(keep_count * dk);
+      attr.add_ints(keep_count * dv);
+    }
+  }
+  if (!found_qkv) {
+    onnx::AttributeProto* attr = chain.node->add_attribute();
+    attr->set_name("qkv_hidden_sizes");
+    attr->set_type(onnx::AttributeProto::INTS);
+    attr->add_ints(keep_count * dq);
+    attr->add_ints(keep_count * dk);
+    attr->add_ints(keep_count * dv);
+  }
+
+  SliceConsumerWeight(init_map.at(chain.consumer_weight),
+                      chain.consumer_weight_transposed, v_idx_local, false);
+
+  for (const auto& co : chain.chain_ops) {
+    if (co.shape_name) {
+      SetInt64TensorLastDim(init_map.at(*co.shape_name), keep_count * dv);
+    }
+  }
+
+  AppliedAttn out;
+  out.producer_weights = {chain.weight};
+  out.consumer_weight = chain.consumer_weight;
+  out.stale.insert(chain.node->output(0));
+  for (const auto& co : chain.chain_ops) {
+    out.stale.insert(co.node->output(0));
+  }
+  return out;
+}
+
+// Applies whole-KV-group pruning to one matched GroupQueryAttention or
+// plain ai.onnx::Attention block in place -- mirrors pruning.py's own
+// _apply_one_gqa_chain (data-free/magnitude importance only).
+std::optional<AppliedAttn> ApplyOneGqaChain(
+    std::unordered_map<std::string, onnx::TensorProto*>& init_map,
+    AttnChain& chain, double sparsity) {
+  const int64_t h = chain.kv_num_heads;
+  const int64_t keep_count =
+      std::max<int64_t>(1, h - std::llround(static_cast<double>(h) * sparsity));
+  if (keep_count >= h) {
+    return std::nullopt;
+  }
+
+  const int64_t d = chain.head_size;
+  const int64_t group_size = chain.num_heads / chain.kv_num_heads;
+
+  onnx::TensorProto* wq_init = init_map.at(chain.q_weight);
+  onnx::TensorProto* wk_init = init_map.at(chain.k_weight);
+  onnx::TensorProto* wv_init = init_map.at(chain.v_weight);
+  const std::vector<int64_t> wq_dims(wq_init->dims().begin(),
+                                     wq_init->dims().end());
+  const std::vector<int64_t> wk_dims(wk_init->dims().begin(),
+                                     wk_init->dims().end());
+  const std::vector<int64_t> wv_dims(wv_init->dims().begin(),
+                                     wv_init->dims().end());
+  std::vector<float> wq = ReadFloatTensor(*wq_init);
+  std::vector<float> wk = ReadFloatTensor(*wk_init);
+  std::vector<float> wv = ReadFloatTensor(*wv_init);
+
+  // Bring each to [K, N] (reduction dim first, head columns last) -- the
+  // *opposite* of SliceProducerWeight's "output channel first" convention,
+  // matching pruning.py's own comment on this same transpose.
+  const int64_t K = wq_dims[chain.q_weight_transposed ? 1 : 0];
+  const int64_t Nq = wq_dims[chain.q_weight_transposed ? 0 : 1];
+  const int64_t Nk = wk_dims[chain.k_weight_transposed ? 0 : 1];
+  const int64_t Nv = wv_dims[chain.v_weight_transposed ? 0 : 1];
+  std::vector<float> wq_kn = chain.q_weight_transposed
+                                 ? TransposeFlat(wq, wq_dims[0], wq_dims[1])
+                                 : wq;
+  std::vector<float> wk_kn = chain.k_weight_transposed
+                                 ? TransposeFlat(wk, wk_dims[0], wk_dims[1])
+                                 : wk;
+  std::vector<float> wv_kn = chain.v_weight_transposed
+                                 ? TransposeFlat(wv, wv_dims[0], wv_dims[1])
+                                 : wv;
+
+  std::vector<double> importance(static_cast<size_t>(chain.kv_num_heads), 0.0);
+  for (int64_t kv = 0; kv < chain.kv_num_heads; ++kv) {
+    double sq = 0.0;
+    for (int64_t r = 0; r < K; ++r) {
+      for (int64_t g = kv * group_size; g < (kv + 1) * group_size; ++g) {
+        for (int64_t c = g * d; c < (g + 1) * d; ++c) {
+          const double v = wq_kn[static_cast<size_t>(r * Nq + c)];
+          sq += v * v;
+        }
+      }
+      for (int64_t c = kv * d; c < (kv + 1) * d; ++c) {
+        const double v = wk_kn[static_cast<size_t>(r * Nk + c)];
+        sq += v * v;
+      }
+      for (int64_t c = kv * d; c < (kv + 1) * d; ++c) {
+        const double v = wv_kn[static_cast<size_t>(r * Nv + c)];
+        sq += v * v;
+      }
+    }
+    importance[static_cast<size_t>(kv)] = std::sqrt(sq);
+  }
+
+  std::vector<int64_t> keep_groups =
+      TopKIndicesAscending(importance, keep_count);
+  std::vector<int64_t> keep_q_heads;
+  keep_q_heads.reserve(keep_groups.size() * static_cast<size_t>(group_size));
+  for (int64_t g : keep_groups) {
+    for (int64_t hh = g * group_size; hh < (g + 1) * group_size; ++hh) {
+      keep_q_heads.push_back(hh);
+    }
+  }
+  std::vector<int64_t> q_idx = HeadColumnIndices(keep_q_heads, d);
+  std::vector<int64_t> kv_idx = HeadColumnIndices(keep_groups, d);
+
+  SliceProducerWeight(wq_init, chain.q_weight_transposed, q_idx, false);
+  SliceProducerWeight(wk_init, chain.k_weight_transposed, kv_idx, false);
+  SliceProducerWeight(wv_init, chain.v_weight_transposed, kv_idx, false);
+  if (chain.q_bias) {
+    SliceLastAxis(init_map.at(*chain.q_bias), q_idx);
+  }
+  if (chain.k_bias) {
+    SliceLastAxis(init_map.at(*chain.k_bias), kv_idx);
+  }
+  if (chain.v_bias) {
+    SliceLastAxis(init_map.at(*chain.v_bias), kv_idx);
+  }
+
+  const int64_t new_kv_num_heads = keep_count;
+  const int64_t new_num_heads = keep_count * group_size;
+  for (auto& attr : *chain.node->mutable_attribute()) {
+    if (attr.name() == chain.num_heads_attr) {
+      attr.set_i(new_num_heads);
+    } else if (attr.name() == "kv_num_heads") {
+      attr.set_i(new_kv_num_heads);
+    }
+  }
+
+  SliceConsumerWeight(init_map.at(chain.consumer_weight),
+                      chain.consumer_weight_transposed, q_idx, false);
+
+  for (const auto& co : chain.chain_ops) {
+    if (co.shape_name) {
+      SetInt64TensorLastDim(init_map.at(*co.shape_name), new_num_heads * d);
+    }
+  }
+
+  AppliedAttn out;
+  out.producer_weights = {chain.q_weight, chain.k_weight, chain.v_weight};
+  out.consumer_weight = chain.consumer_weight;
+  out.stale.insert(chain.node->output(0));
+  for (const auto& co : chain.chain_ops) {
+    out.stale.insert(co.node->output(0));
+  }
+  return out;
+}
+
+// Shared body dispatching each chain to ApplyOnePlainAttentionChain or
+// ApplyOneGqaChain, mirroring pruning.py's own _apply_attention_chains
+// (cross-chain touched-role bookkeeping, stale value_info cleanup).
+void ApplyAttentionChains(onnx::GraphProto* graph,
+                          std::vector<AttnChain>& chains, double sparsity) {
+  std::unordered_map<std::string, onnx::TensorProto*> init_map;
+  for (int i = 0; i < graph->initializer_size(); ++i) {
+    onnx::TensorProto* t = graph->mutable_initializer(i);
+    init_map[t->name()] = t;
+  }
+  std::unordered_set<std::string> producer_touched, consumer_touched,
+      stale_value_info;
+
+  for (auto& chain : chains) {
+    std::unordered_set<std::string> producer_names =
+        chain.kind == AttnChainKind::kGqaLike
+            ? std::unordered_set<std::string>{chain.q_weight, chain.k_weight,
+                                              chain.v_weight}
+            : std::unordered_set<std::string>{chain.weight};
+
+    bool conflict = consumer_touched.count(chain.consumer_weight) != 0;
+    for (const auto& w : producer_names) {
+      if (producer_touched.count(w)) {
+        conflict = true;
+      }
+    }
+    if (conflict) {
+      continue;
+    }
+
+    std::optional<AppliedAttn> applied =
+        chain.kind == AttnChainKind::kGqaLike
+            ? ApplyOneGqaChain(init_map, chain, sparsity)
+            : ApplyOnePlainAttentionChain(init_map, chain, sparsity);
+    if (!applied) {
+      continue;
+    }
+
+    for (const auto& w : applied->producer_weights) {
+      producer_touched.insert(w);
+    }
+    consumer_touched.insert(applied->consumer_weight);
+    for (const auto& s : applied->stale) {
+      stale_value_info.insert(s);
+    }
+  }
+
+  if (!stale_value_info.empty()) {
+    google::protobuf::RepeatedPtrField<onnx::ValueInfoProto> kept;
+    for (const auto& vi : graph->value_info()) {
+      if (!stale_value_info.count(vi.name())) {
+        *kept.Add() = vi;
+      }
+    }
+    graph->mutable_value_info()->Swap(&kept);
+  }
+}
+
 }  // namespace
 
 onnx::ModelProto ApplyStructuredPruning(const onnx::ModelProto& model,
@@ -1971,6 +2818,29 @@ onnx::ModelProto ApplyStructuredPruning(const onnx::ModelProto& model,
                 std::make_move_iterator(matmul_residual_chains.end()));
   if (!chains.empty()) {
     ApplyChains(graph, chains, sparsity);
+  }
+  return out;
+}
+
+onnx::ModelProto ApplyAttentionHeadPruning(const onnx::ModelProto& model,
+                                           double sparsity) {
+  if (!(sparsity >= 0.0 && sparsity < 1.0)) {
+    throw std::invalid_argument(
+        "ApplyAttentionHeadPruning: sparsity must be in [0, 1), got " +
+        std::to_string(sparsity));
+  }
+  onnx::ModelProto out = model;
+  onnx::GraphProto* graph = out.mutable_graph();
+
+  std::vector<AttnChain> chains = FindAttentionChains(graph);
+  std::vector<AttnChain> gqa_chains = FindGqaChains(graph);
+  std::vector<AttnChain> onnx_attn_chains = FindOnnxAttentionChains(graph);
+  chains.insert(chains.end(), std::make_move_iterator(gqa_chains.begin()),
+                std::make_move_iterator(gqa_chains.end()));
+  chains.insert(chains.end(), std::make_move_iterator(onnx_attn_chains.begin()),
+                std::make_move_iterator(onnx_attn_chains.end()));
+  if (!chains.empty()) {
+    ApplyAttentionChains(graph, chains, sparsity);
   }
   return out;
 }

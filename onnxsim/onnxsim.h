@@ -565,6 +565,53 @@ onnx::ModelProto ApplyQuarot(const onnx::ModelProto& model, uint64_t seed);
 onnx::ModelProto ApplyStructuredPruning(const onnx::ModelProto& model,
                                         double sparsity);
 
+// Attention-head pruning: removes whole attention heads -- or, for
+// grouped-query attention, whole KV groups -- from every matched
+// ``com.microsoft::Attention``, ``com.microsoft::GroupQueryAttention``, or
+// plain ``ai.onnx::Attention`` node whose output feeds, optionally through a
+// single shape-preserving ``Reshape``, exactly one downstream MatMul/
+// vanilla-Gemm's reduction dimension (the output projection) -- the
+// attention analogue of ``ApplyStructuredPruning``, at head (or KV-group)
+// instead of single-channel granularity.
+//
+// For each matched plain ``com.microsoft::Attention`` block (a single merged
+// QKV weight/bias): ranks every head by the combined Frobenius norm of its
+// own Q, K, and V weight columns, drops the lowest-``sparsity``-fraction of
+// heads (at least one head is always kept), and removes the corresponding
+// column blocks from the merged QKV weight (and bias, if present),
+// decrementing ``num_heads``/``qkv_hidden_sizes`` accordingly, and the
+// matching row block from the output projection's weight.
+//
+// For each matched ``GroupQueryAttention`` or plain ``ai.onnx::Attention``
+// block (separate, un-merged Q/K/V producers): ranks every *KV group* (a KV
+// head and the ``num_heads / kv_num_heads`` query heads the kernel maps to
+// it) by the combined Frobenius norm of that group's own Q+K+V weight
+// block, drops the lowest-``sparsity``-fraction of groups (at least one
+// group is always kept), and removes the corresponding column blocks from
+// all three producers (and their biases, if present) together with the
+// matching row block from the output projection's weight, decrementing the
+// query head count and ``kv_num_heads`` by the number of groups dropped --
+// so their ratio (query heads per KV head) is unchanged. An individual
+// query head is never dropped on its own: only a whole group, since neither
+// kernel has a way to keep a KV head alive for some, but not all, of the
+// query heads that shared it.
+//
+// Unlike ``Simplify``, this does not run shape inference, constant folding or
+// any other simplification pass. ``sparsity`` must be in [0, 1); throws
+// ``std::invalid_argument`` otherwise. Anything not matching that exact
+// topology (a non-constant weight, a packed-QKV GroupQueryAttention node, a
+// GroupQueryAttention/plain ai.onnx Attention node with a non-empty constant
+// past-KV-cache or attention-mask input, an ai.onnx Attention node with
+// differing Q/K/V head sizes or without explicit
+// ``q_num_heads``/``kv_num_heads`` attributes, a consumer whose reduction
+// dimension doesn't line up, ...) is left completely untouched. Unlike the
+// pure-Python ``onnxsim.apply_attention_head_pruning``, this port does not
+// include the calibration-driven Wanda variant
+// (``onnxsim.apply_attention_head_wanda_pruning``) -- data-free/magnitude
+// importance only, matching this codebase's C++-port scope decision.
+onnx::ModelProto ApplyAttentionHeadPruning(const onnx::ModelProto& model,
+                                           double sparsity);
+
 // Lists the activation tensor names that ``QuantizeStatic`` could quantize in
 // ``model`` -- the first input of every MatMul, every "vanilla" Gemm
 // (transA=0, alpha=1, beta=1), and every Conv, whose weight is a constant
