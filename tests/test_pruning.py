@@ -7,6 +7,7 @@ import numpy as np
 import onnx
 import onnx.helper
 import onnx.numpy_helper
+import onnx.shape_inference
 import pytest
 from onnx import parser
 
@@ -5086,18 +5087,126 @@ def test_structured_wanda_pruning_matmul_concat_composed_residual_branch_matches
     np.testing.assert_allclose(y, y_oracle, rtol=1e-5, atol=1e-5)
 
 
-def test_structured_pruning_matmul_concat_declines_on_positive_axis():
+def test_structured_pruning_matmul_concat_declines_on_positive_axis_unknown_rank():
     # `axis=1` on a 2-D [batch, C] tensor is numerically the same as
-    # `axis=-1`, but this pass never looks up a tensor's rank (see this
-    # section's own comment), so a positive axis is declined rather than
-    # guessed at -- left completely untouched, even though this particular
-    # instance would in fact have been safe.
+    # `axis=-1`, but this bare hand-built graph carries no value_info at
+    # all for the Concat operands (h0/h1 -- no shape-inference pass ever
+    # ran over it), so their rank can't be confirmed and the positive axis
+    # is declined rather than guessed at -- left completely untouched, even
+    # though this particular instance would in fact have been safe. See
+    # test_structured_pruning_matmul_concat_accepts_positive_last_axis_when_rank_known
+    # for the same topology once the rank *is* confirmable.
     K, Ca, Cb, Out = 8, 6, 4, 3
     rng = np.random.default_rng(210)
     wa = rng.standard_normal((K, Ca)).astype(np.float32)
     wb = rng.standard_normal((K, Cb)).astype(np.float32)
     wout = rng.standard_normal((Ca + Cb, Out)).astype(np.float32)
     model = _matmul_concat_model([wa, wb], wout, axis=1)
+    assert len(model.graph.value_info) == 0  # no rank annotation to piggyback on
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    np.testing.assert_array_equal(inits["W0"], wa)
+    np.testing.assert_array_equal(inits["W1"], wb)
+    np.testing.assert_array_equal(inits["WOUT"], wout)
+
+
+def test_structured_pruning_matmul_concat_declines_on_positive_axis_shape_unknown_rank():
+    # Same as the unknown-rank test above, but this time the operands *do*
+    # carry a value_info entry each (as a partially shape-inferred graph
+    # might, e.g. a symbolic-rank input propagated through) -- just one
+    # with no `shape` field at all, ONNX's own "rank not statically known"
+    # spelling (see CLAUDE.md's own note on this pattern). _tensor_rank must
+    # treat that exactly like no annotation at all, not crash on it or
+    # (worse) treat a present-but-empty shape as rank 0.
+    K, Ca, Cb, Out = 8, 6, 4, 3
+    rng = np.random.default_rng(214)
+    wa = rng.standard_normal((K, Ca)).astype(np.float32)
+    wb = rng.standard_normal((K, Cb)).astype(np.float32)
+    wout = rng.standard_normal((Ca + Cb, Out)).astype(np.float32)
+    model = _matmul_concat_model([wa, wb], wout, axis=1)
+    for name in ("h0", "h1"):
+        vi = onnx.helper.make_tensor_value_info(name, onnx.TensorProto.FLOAT, [1, 1])
+        vi.type.tensor_type.ClearField("shape")
+        model.graph.value_info.append(vi)
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    np.testing.assert_array_equal(inits["W0"], wa)
+    np.testing.assert_array_equal(inits["W1"], wb)
+    np.testing.assert_array_equal(inits["WOUT"], wout)
+
+
+def test_structured_pruning_matmul_concat_accepts_positive_last_axis_when_rank_known():
+    # `axis=1` on 2-D [batch, C] tensors is numerically identical to
+    # `axis=-1`, and once the graph carries value_info confirming each
+    # operand's rank -- as it would after a real shape-inference pass (e.g.
+    # onnxsim's own) ran earlier in the pipeline, the ordinary case
+    # structured pruning is meant to run in -- this pass now recognizes and
+    # prunes it exactly the same as the equivalent `axis=-1` graph: same
+    # kept columns, same values, same runtime output. This is the
+    # "genuinely-safe-but-unconfirmed" case
+    # test_structured_pruning_matmul_concat_declines_on_positive_axis_unknown_rank
+    # documents becoming confirmed once the rank is actually knowable.
+    K, Ca, Cb, Out = 8, 6, 4, 3
+    rng = np.random.default_rng(212)
+    wa = rng.standard_normal((K, Ca)).astype(np.float32)
+    wb = rng.standard_normal((K, Cb)).astype(np.float32)
+    wout = rng.standard_normal((Ca + Cb, Out)).astype(np.float32)
+
+    model_neg = _matmul_concat_model([wa, wb], wout, axis=-1)
+    model_pos = _matmul_concat_model([wa, wb], wout, axis=1)
+    model_pos = onnx.shape_inference.infer_shapes(model_pos)
+    h0_vi = next(vi for vi in model_pos.graph.value_info if vi.name == "h0")
+    assert len(h0_vi.type.tensor_type.shape.dim) == 2  # rank actually confirmed
+
+    pruned_neg = onnxsim.apply_structured_pruning(model_neg, sparsity=0.5)
+    pruned_pos = onnxsim.apply_structured_pruning(model_pos, sparsity=0.5)
+    onnx.checker.check_model(pruned_neg)
+    onnx.checker.check_model(pruned_pos)
+
+    inits_neg = {
+        t.name: onnx.numpy_helper.to_array(t) for t in pruned_neg.graph.initializer
+    }
+    inits_pos = {
+        t.name: onnx.numpy_helper.to_array(t) for t in pruned_pos.graph.initializer
+    }
+    for name in ("W0", "W1", "WOUT"):
+        np.testing.assert_array_equal(inits_pos[name], inits_neg[name])
+    # Confirms it actually pruned (not merely "happened to match because
+    # both were left untouched"): the branch's output channel count shrank.
+    assert inits_pos["W0"].shape[1] < Ca
+
+    rng_x = np.random.default_rng(213)
+    x = rng_x.standard_normal((5, K)).astype(np.float32)
+    (y_neg,) = _run(pruned_neg, {"X": x})
+    (y_pos,) = _run(pruned_pos, {"X": x})
+    np.testing.assert_allclose(y_pos, y_neg, rtol=1e-5, atol=1e-5)
+
+
+def test_structured_pruning_matmul_concat_declines_on_positive_non_last_axis():
+    # `axis=0` on rank-2 [batch, C] operands is confirmably *not* the last
+    # axis (`rank - 1 == 1`) -- proves _concat_axis_is_last actually checks
+    # the axis against the rank rather than accepting any positive axis
+    # once a rank is confirmable. Rank is attached directly (rather than
+    # via a real onnx.shape_inference.infer_shapes() pass, as the sibling
+    # accept/decline tests above do) since `axis=0` here doesn't actually
+    # describe a dimensionally-valid Concat (Ca != Cb along the
+    # non-concat axis) -- irrelevant to what this test isolates, since the
+    # axis check runs, and this whole group is declined, before any
+    # producer/consumer walk ever inspects that.
+    K, Ca, Cb, Out = 8, 6, 4, 3
+    rng = np.random.default_rng(215)
+    wa = rng.standard_normal((K, Ca)).astype(np.float32)
+    wb = rng.standard_normal((K, Cb)).astype(np.float32)
+    wout = rng.standard_normal((Ca + Cb, Out)).astype(np.float32)
+    model = _matmul_concat_model([wa, wb], wout, axis=0)
+    for name in ("h0", "h1"):
+        model.graph.value_info.append(
+            onnx.helper.make_tensor_value_info(
+                name, onnx.TensorProto.FLOAT, [None, None]
+            )
+        )
 
     pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
     inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
