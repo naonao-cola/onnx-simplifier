@@ -543,14 +543,17 @@ onnx::ModelProto ApplyQuarot(const onnx::ModelProto& model, uint64_t seed);
 // an *interior* block of a real deep ResNet/transformer stage, whose own
 // "post-block" tensor is read both by the next block and directly by that
 // block's own ``Add``, is left completely untouched, the same "no
-// branch-following" boundary every other chain kind here already holds) --
-// see ``structured_pruning_entry.cpp`` for the exact algorithm and its
-// scope note (this port does not (yet) recognize a fused
+// branch-following" boundary every other chain kind here already holds). For
+// MatMul/Gemm specifically, a fused
 // ``com.microsoft::SkipLayerNormalization``/``SkipSimplifiedLayerNormalization``
 // node -- what onnxruntime's transformer optimizer collapses a bare
-// residual ``Add`` plus the following LayerNorm into -- as an eligible
-// merge point; ``onnxsim.apply_structured_pruning`` remains the
-// full-featured reference for that case).
+// residual ``Add`` plus the following LayerNorm into, and so what a
+// fully-optimized transformer's own residual connections typically look
+// like -- is recognized as an eligible merge point too, its own
+// ``gamma``/``beta``/``bias`` constants riding along as a per-channel
+// affine hop on the resolved chain; a Conv residual chain only ever sees a
+// bare ``Add`` (there is no Conv analogue of that fused op). See
+// ``structured_pruning_entry.cpp`` for the exact algorithm.
 //
 // Unlike ``Simplify``, this does not run shape inference, constant folding or
 // any other simplification pass -- it applies exactly this rewrite, to every
@@ -558,8 +561,7 @@ onnx::ModelProto ApplyQuarot(const onnx::ModelProto& model, uint64_t seed);
 // returns the result. ``sparsity`` must be in [0, 1); throws
 // ``std::invalid_argument`` otherwise. Anything not matching the exact
 // topology above (branching, a non-constant bias, a consumer whose
-// reduction dimension doesn't line up, a fused-SkipLayerNormalization
-// residual, ...) is left completely untouched.
+// reduction dimension doesn't line up, ...) is left completely untouched.
 onnx::ModelProto ApplyStructuredPruning(const onnx::ModelProto& model,
                                         double sparsity);
 

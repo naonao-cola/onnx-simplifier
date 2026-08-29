@@ -1114,17 +1114,16 @@ def apply_structured_pruning_cpp(
     residual connection, or a linear stack of ``Add``-only merges; an
     *interior* block of a real deep ResNet/transformer stage is left
     completely untouched, the same "no branch-following" boundary every
-    other chain kind here already holds).
-
-    Unlike the pure-Python :func:`onnxsim.apply_structured_pruning`, this
-    port does not (yet) recognize a fused
+    other chain kind here already holds). For MatMul/Gemm specifically, a
+    fused
     ``com.microsoft::SkipLayerNormalization``/``SkipSimplifiedLayerNormalization``
     node -- what onnxruntime's transformer optimizer collapses a bare
-    residual ``Add`` plus the following LayerNorm into -- as an eligible
-    merge point; a model whose residual connections have already been fused
-    that way is left untouched by this port's MatMul residual finder --
-    :func:`onnxsim.apply_structured_pruning` remains the full-featured
-    reference for that case.
+    residual ``Add`` plus the following LayerNorm into, and so what a
+    fully-optimized transformer's own residual connections typically look
+    like -- is recognized as an eligible merge point too, its own
+    ``gamma``/``beta``/``bias`` constants riding along as a per-channel
+    affine hop on the resolved chain; a Conv residual chain only ever sees a
+    bare ``Add`` (there is no Conv analogue of that fused op).
 
     This is a single, self-contained graph rewrite: unlike :func:`simplify`,
     it does not run shape inference, constant folding, or any other pass.
@@ -1136,8 +1135,7 @@ def apply_structured_pruning_cpp(
     :returns: ``model`` with every matched chain's tensors resized in place;
             anything not matching the exact topology above (branching, a
             non-constant bias, a consumer whose reduction dimension doesn't
-            line up, a fused-SkipLayerNormalization residual, ...) is left
-            completely untouched
+            line up, ...) is left completely untouched
     """
     if isinstance(model, str):
         model = onnx.load(model, load_external_data=False)

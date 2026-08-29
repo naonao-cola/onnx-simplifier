@@ -13,24 +13,24 @@
 // general dependency-graph-grouping problem: a channel-preserving
 // `Add(a, b)` where both operands are non-constant forces whichever real
 // producer(s) feed `a`/`b` to be pruned to the same channel-index set. A
-// backward walk plus union-find grouping across such eligible Add merge
-// points (mirroring pruning.py's own _walk_conv_producer_backward/
+// backward walk plus union-find grouping across such eligible merge points
+// (mirroring pruning.py's own _walk_conv_producer_backward/
 // _find_conv_residual_chains and _walk_matmul_producer_backward/
 // _find_matmul_residual_chains) covers not just a single `Add(x, f(x))` but
 // a whole chain of such merges transitively sharing one spine channel
 // count; a group with any branch that fails to resolve, or whose leaf
 // producers disagree on channel count, is declined in its entirety, never
 // partially pruned -- the same conservative "no branch-following" boundary
-// every other chain finder here already holds. One piece of pruning.py's
-// own residual support is *not* ported here: recognizing a fused
-// com.microsoft::SkipLayerNormalization/SkipSimplifiedLayerNormalization
-// node (what onnxruntime's transformer optimizer collapses a bare residual
-// Add plus the following LayerNorm into) as an eligible merge point in its
-// own right -- see _match_matmul_residual_merge's own comment in
-// pruning.py for why that matters for a fully-optimized transformer. A
-// model whose residual connections have already been fused that way is
-// left untouched by this port's MatMul residual finder; the pure-Python
-// implementation remains the full-featured reference for that case.
+// every other chain finder here already holds. For MatMul/Gemm specifically,
+// a fused com.microsoft::SkipLayerNormalization/
+// SkipSimplifiedLayerNormalization node -- what onnxruntime's transformer
+// optimizer collapses a bare residual `Add` plus the following LayerNorm
+// into, and so what a fully-optimized transformer's residual connections
+// typically look like -- is also recognized as an eligible merge point
+// (mirroring pruning.py's own _match_matmul_residual_merge), its own
+// gamma/beta/bias constants riding along as a per-channel affine hop on the
+// resolved chain. Conv residual chains only ever see a bare `Add` -- there
+// is no Conv analogue of that fused op.
 //
 // Implemented directly on onnx::GraphProto (protobuf), not onnxoptimizer's
 // Node/Value IR: pruning.py's own algorithm already works this way (name-
@@ -1118,6 +1118,150 @@ std::vector<Chain> FindConvResidualChains(onnx::GraphProto* graph) {
 
 // --- MatMul/Gemm residual (Add-merged) chains, mirroring
 // _walk_matmul_producer_backward/_find_matmul_residual_chains ---------------
+//
+// A com.microsoft::SkipLayerNormalization/SkipSimplifiedLayerNormalization
+// node -- what onnxruntime's transformer optimizer fuses a bare residual Add
+// plus the following LayerNorm into -- is an eligible merge point too,
+// mirroring pruning.py's own _match_matmul_residual_merge: its first two
+// inputs (input/skip) play exactly the role Add's two operands do, while its
+// constant gamma/beta/bias inputs are a per-channel affine hop riding the
+// same node, folded into the resolved chain's own chain_ops as extra
+// (node, const_name) entries -- ApplyChains's existing per-hop constant
+// slicing picks them up with no changes of its own.
+
+constexpr char kSkipLayerNormDomain[] = "com.microsoft";
+
+bool IsSkipLayerNormOp(const onnx::NodeProto& node) {
+  return node.domain() == kSkipLayerNormDomain &&
+         (node.op_type() == "SkipLayerNormalization" ||
+          node.op_type() == "SkipSimplifiedLayerNormalization");
+}
+
+bool IsConstVec(const InitMap& init_map, const std::string& name) {
+  auto it = init_map.find(name);
+  if (it == init_map.end()) {
+    return false;
+  }
+  const onnx::TensorProto* t = it->second;
+  if (t->data_type() != onnx::TensorProto::FLOAT || t->dims_size() == 0) {
+    return false;
+  }
+  int64_t prod = 1;
+  for (int64_t d : t->dims()) {
+    prod *= d;
+  }
+  return prod == t->dims(t->dims_size() - 1);
+}
+
+struct SkipLayerNormConsts {
+  std::string gamma;
+  std::optional<std::string> beta;
+  std::optional<std::string> bias;
+};
+
+// If every constant input a SkipLayerNormalization/
+// SkipSimplifiedLayerNormalization `node` needs sliced -- gamma (input 2,
+// required), plus beta (input 3, SkipLayerNormalization only) and bias
+// (input 4, or input 3 for the simplified/RMSNorm variant) -- is present
+// exactly as the node's own input list says and, whenever present, a
+// constant float per-channel vector, returns their names. Declines on a
+// non-constant gamma, a present-but-non-constant beta/bias, or the same
+// tensor named for two of gamma/beta/bias at once (double-slicing it in
+// ApplyChains's own per-hop loop would corrupt it).
+std::optional<SkipLayerNormConsts> SkipLayerNormConstNames(
+    const onnx::NodeProto& node, const InitMap& init_map) {
+  const bool simplified = node.op_type() == "SkipSimplifiedLayerNormalization";
+  if (node.input_size() < 3 || node.input(2).empty() ||
+      !IsConstVec(init_map, node.input(2))) {
+    return std::nullopt;  // gamma is required.
+  }
+  const std::string gamma_name = node.input(2);
+
+  std::optional<std::string> beta_name;
+  int bias_idx = 3;
+  if (!simplified) {
+    bias_idx = 4;
+    if (node.input_size() > 3 && !node.input(3).empty()) {
+      if (!IsConstVec(init_map, node.input(3))) {
+        return std::nullopt;
+      }
+      beta_name = node.input(3);
+    }
+  }
+
+  std::optional<std::string> bias_name;
+  if (node.input_size() > bias_idx && !node.input(bias_idx).empty()) {
+    if (!IsConstVec(init_map, node.input(bias_idx))) {
+      return std::nullopt;
+    }
+    bias_name = node.input(bias_idx);
+  }
+
+  std::unordered_set<std::string> seen{gamma_name};
+  if (beta_name && !seen.insert(*beta_name).second) {
+    return std::nullopt;  // Tied gamma/beta -- double-slicing would corrupt it.
+  }
+  if (bias_name && !seen.insert(*bias_name).second) {
+    return std::nullopt;  // Tied gamma/bias or beta/bias.
+  }
+
+  return SkipLayerNormConsts{gamma_name, beta_name, bias_name};
+}
+
+struct ResidualMergeMatch {
+  std::string input_name;
+  std::string skip_name;
+  std::vector<ChainOp> extra_ops;
+};
+
+// The MatMul/Gemm residual finder's own eligible-merge-point check: `node`
+// is either a bare Add (IsEligibleAddMerge, with no extra chain_ops of its
+// own) or a SkipLayerNormalization-family node (see this section's own
+// comment above). Declines whenever any of the SkipLayerNorm-family node's
+// optional secondary outputs (mean/inv_std_var, training-only bookkeeping
+// onnxruntime's own CPU kernel never actually writes, or
+// input_skip_bias_sum, the raw pre-norm sum whose *shape* -- not
+// meaningfulness -- is at risk once input/skip are pruned to a different
+// width) are actually consumed by anything else in the graph.
+std::optional<ResidualMergeMatch> MatchResidualMerge(
+    onnx::NodeProto* node, const InitMap& init_map,
+    const ConsumerMap& consumers_of,
+    const std::unordered_set<std::string>& graph_outputs) {
+  if (IsEligibleAddMerge(*node, init_map)) {
+    return ResidualMergeMatch{node->input(0), node->input(1), {}};
+  }
+  if (!IsSkipLayerNormOp(*node) || node->input_size() < 3) {
+    return std::nullopt;
+  }
+  const std::string& input_name = node->input(0);
+  const std::string& skip_name = node->input(1);
+  if (input_name.empty() || skip_name.empty() || input_name == skip_name ||
+      init_map.count(input_name) || init_map.count(skip_name)) {
+    return std::nullopt;
+  }
+  auto consts = SkipLayerNormConstNames(*node, init_map);
+  if (!consts) {
+    return std::nullopt;
+  }
+  for (int out_idx : {1, 2, 3}) {  // mean, inv_std_var, input_skip_bias_sum.
+    if (node->output_size() > out_idx && !node->output(out_idx).empty()) {
+      const std::string& out_name = node->output(out_idx);
+      if (ConsumerCount(consumers_of, out_name) != 0 ||
+          graph_outputs.count(out_name)) {
+        return std::nullopt;
+      }
+    }
+  }
+  std::vector<ChainOp> extra_ops;
+  extra_ops.push_back(ChainOp{node, consts->gamma});
+  if (consts->beta) {
+    extra_ops.push_back(ChainOp{node, *consts->beta});
+  }
+  if (consts->bias) {
+    extra_ops.push_back(ChainOp{node, *consts->bias});
+  }
+  return ResidualMergeMatch{input_name, skip_name, std::move(extra_ops)};
+}
 
 // The backward counterpart of WalkToConsumer, used only by
 // FindMatmulResidualChains.
@@ -1201,7 +1345,7 @@ MatMulBackwardEdge WalkMatmulProducerBackward(
       // through to the merge check or "fail" is correct.
     }
 
-    if (IsEligibleAddMerge(*node, init_map)) {
+    if (MatchResidualMerge(node, init_map, consumers_of, graph_outputs)) {
       MatMulBackwardEdge edge;
       edge.kind = BackwardEdgeKind::kAdd;
       edge.add_node = node;
@@ -1217,9 +1361,12 @@ MatMulBackwardEdge WalkMatmulProducerBackward(
 
 // Finds MatMul/Gemm residual/skip-connection groups -- the MatMul/Gemm
 // analogue of FindConvResidualChains, over WalkMatmulProducerBackward
-// instead of WalkConvProducerBackward. See this section's own comment
-// above for the scope note (bare Add merge points only, not the fused
-// SkipLayerNormalization case pruning.py also recognizes).
+// instead of WalkConvProducerBackward. Every eligible merge point
+// (MatchResidualMerge -- a bare Add or a SkipLayerNormalization-family
+// node) contributes its own extra_ops (empty for Add; gamma/beta/bias for
+// the normalization-fused case) up front, before any union-find grouping,
+// so every member of a resolved group has its own per-channel constants
+// folded into the final chain the same way.
 std::vector<Chain> FindMatmulResidualChains(onnx::GraphProto* graph) {
   InitMap init_map;
   for (const auto& t : graph->initializer()) {
@@ -1241,11 +1388,21 @@ std::vector<Chain> FindMatmulResidualChains(onnx::GraphProto* graph) {
     }
   }
 
-  std::vector<onnx::NodeProto*> merges;
+  struct MergeInfo {
+    onnx::NodeProto* node;
+    std::string input_name;
+    std::string skip_name;
+    std::vector<ChainOp> extra_ops;
+  };
+  std::vector<MergeInfo> merges;
   for (int i = 0; i < graph->node_size(); ++i) {
     onnx::NodeProto* node = graph->mutable_node(i);
-    if (IsEligibleAddMerge(*node, init_map)) {
-      merges.push_back(node);
+    auto match =
+        MatchResidualMerge(node, init_map, consumers_of, graph_outputs);
+    if (match) {
+      merges.push_back(MergeInfo{node, std::move(match->input_name),
+                                 std::move(match->skip_name),
+                                 std::move(match->extra_ops)});
     }
   }
   if (merges.empty()) {
@@ -1253,7 +1410,7 @@ std::vector<Chain> FindMatmulResidualChains(onnx::GraphProto* graph) {
   }
   std::unordered_map<onnx::NodeProto*, int> merge_index;
   for (size_t i = 0; i < merges.size(); ++i) {
-    merge_index[merges[i]] = static_cast<int>(i);
+    merge_index[merges[i].node] = static_cast<int>(i);
   }
 
   std::vector<int> parent(merges.size());
@@ -1276,7 +1433,8 @@ std::vector<Chain> FindMatmulResidualChains(onnx::GraphProto* graph) {
   std::unordered_set<int> poisoned;
   for (size_t idx = 0; idx < merges.size(); ++idx) {
     std::vector<MatMulBackwardEdge> results;
-    for (const auto& operand : merges[idx]->input()) {
+    for (const auto& operand :
+         {merges[idx].input_name, merges[idx].skip_name}) {
       MatMulBackwardEdge edge = WalkMatmulProducerBackward(
           operand, node_by_output, init_map, consumers_of, graph_outputs,
           kMaxChainHops);
@@ -1321,6 +1479,9 @@ std::vector<Chain> FindMatmulResidualChains(onnx::GraphProto* graph) {
     std::unordered_set<int> referenced;
 
     for (int idx : members) {
+      pre_chain_ops.insert(pre_chain_ops.end(),
+                           merges[static_cast<size_t>(idx)].extra_ops.begin(),
+                           merges[static_cast<size_t>(idx)].extra_ops.end());
       for (auto& edge : edge_results[static_cast<size_t>(idx)]) {
         pre_chain_ops.insert(pre_chain_ops.end(), edge.chain_ops.begin(),
                              edge.chain_ops.end());
@@ -1361,7 +1522,7 @@ std::vector<Chain> FindMatmulResidualChains(onnx::GraphProto* graph) {
     if (sinks.size() != 1) {
       continue;  // Not a single linear chain of merges -- decline.
     }
-    onnx::NodeProto* sink_node = merges[static_cast<size_t>(sinks[0])];
+    onnx::NodeProto* sink_node = merges[static_cast<size_t>(sinks[0])].node;
 
     std::unordered_set<std::string> seen_weights;
     bool degenerate = false;
@@ -1390,7 +1551,7 @@ std::vector<Chain> FindMatmulResidualChains(onnx::GraphProto* graph) {
     std::vector<ChainOp> chain_ops = std::move(pre_chain_ops);
     for (int idx : members) {
       chain_ops.push_back(
-          ChainOp{merges[static_cast<size_t>(idx)], std::nullopt});
+          ChainOp{merges[static_cast<size_t>(idx)].node, std::nullopt});
     }
     for (auto& co : fwd_chain_ops) {
       chain_ops.push_back(std::move(co));
