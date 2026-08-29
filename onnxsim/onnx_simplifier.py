@@ -1078,6 +1078,58 @@ def prune_magnitude_cpp(
     return onnx.load_from_string(C.prune_magnitude(model.SerializeToString(), sparsity))
 
 
+def apply_structured_pruning_cpp(
+    model: Union[str, onnx.ModelProto],
+    sparsity: float = 0.5,
+) -> onnx.ModelProto:
+    """
+    C++-backed port of :func:`onnxsim.apply_structured_pruning`: removes
+    whole output channels from MatMul/vanilla-Gemm and Conv layers -- real
+    structural pruning (smaller weight tensors, smaller matmuls on any
+    runtime), as opposed to :func:`onnxsim.prune_magnitude_cpp`'s value-only
+    zeroing.
+
+    For every MatMul/vanilla-Gemm or 2-D Conv "producer" node whose output
+    feeds, through zero or more shape-preserving elementwise ops (an
+    activation, or -- MatMul/Gemm only -- an Add/Mul against a constant
+    per-channel bias/scale, or -- Conv only -- a depthwise Conv hop) with no
+    other consumer anywhere along that path, into exactly one downstream
+    "consumer" of the same family: ranks the producer's output channels by
+    L2 norm of their own weight row/filter, drops the lowest-``sparsity``-
+    fraction of them, and removes the corresponding rows/columns from the
+    producer's weight (and bias, if constant) and every intermediate
+    per-channel constant, and the matching columns/rows from the consumer's
+    weight. A general grouped Conv (neither ``group=1`` nor fully depthwise)
+    is matched too, as a producer and/or consumer, ranking/pruning each of
+    its ``group`` channel blocks independently.
+
+    Unlike the pure-Python :func:`onnxsim.apply_structured_pruning`, this
+    port does not (yet) include the gated-FFN (SwiGLU/GeGLU) pattern or the
+    Conv/MatMul residual-connection (skip-connection) chain support -- a
+    model whose only prunable structure is one of those unported shapes is
+    left completely untouched by this port; :func:`onnxsim.apply_structured_pruning`
+    remains the full-featured reference.
+
+    This is a single, self-contained graph rewrite: unlike :func:`simplify`,
+    it does not run shape inference, constant folding, or any other pass.
+
+    :param model: the original onnx ModelProto or file path
+    :param sparsity: target fraction of each matched producer's output
+            channels to remove (at least one channel is always kept); must
+            be in ``[0, 1)``
+    :returns: ``model`` with every matched chain's tensors resized in place;
+            anything not matching the exact topology above (branching, a
+            non-constant bias, a consumer whose reduction dimension doesn't
+            line up, a gated or residual chain, ...) is left completely
+            untouched
+    """
+    if isinstance(model, str):
+        model = onnx.load(model, load_external_data=False)
+    return onnx.load_from_string(
+        C.apply_structured_pruning(model.SerializeToString(), sparsity)
+    )
+
+
 def apply_quarot_cpp(
     model: Union[str, onnx.ModelProto],
     seed: int = 0,

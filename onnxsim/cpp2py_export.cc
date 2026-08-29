@@ -589,6 +589,23 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
       },
       "model_bytes"_a, "sparsity"_a);
 
+  // Structured (channel) pruning: removes whole output channels from
+  // MatMul/vanilla-Gemm and Conv layers -- real structural pruning, not
+  // just value-only zeroing. See ApplyStructuredPruning in onnxsim.h.
+  m.def(
+      "apply_structured_pruning",
+      [](const py::bytes& model_proto_bytes, double sparsity) -> py::bytes {
+        InitEnv();
+        ONNX_NAMESPACE::ModelProto model;
+        ParseProtoFromBytes(&model, model_proto_bytes.c_str(),
+                            model_proto_bytes.size());
+        const auto result = ApplyStructuredPruning(model, sparsity);
+        std::string out;
+        result.SerializeToString(&out);
+        return py::bytes(out.data(), out.size());
+      },
+      "model_bytes"_a, "sparsity"_a);
+
   // QuaRot (Ashkboos et al., 2024): rotation preprocessing plus INT4
   // round-to-nearest quantization of both the weight and the activation of
   // every MatMul/vanilla-Gemm layer. Data-free. See ApplyQuarot in
