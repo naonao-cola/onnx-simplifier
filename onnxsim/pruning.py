@@ -147,8 +147,29 @@ own fusion pass to collapse into `BiasGelu`/`FastGelu` in the first place --
 a plain unfused `Gelu`/`Sigmoid` gate (already handled) is the shape that
 survives when there's no bias to fuse to begin with.
 
-General multi-branch dependency-graph pruning -- arbitrary fan-out, non-Add
-merges (`Concat`, ...) -- remains out of scope. The
+A `Concat` merge -- the U-Net-style encoder/decoder skip connection
+(`merged = Concat(a, b, axis=1)`, each branch keeping its own disjoint slice
+of the merged channel range) -- looks at first glance like it needs the same
+general dependency-graph machinery an `Add`/`SkipLayerNormalization` merge
+does, and was long declined outright on that assumption. It turns out not
+to: unlike `Add`, whose operands are summed position-for-position and so
+*must* agree on one shared surviving channel-index set, `Concat`'s branches
+are independent -- branch `a` (`Ca` channels) always owns columns `[0, Ca)`
+of the merged, pre-pruning tensor and branch `b` always owns `[Ca, Ca+Cb)`,
+fixed offsets neither branch's own pruning choice can move -- so each branch
+is ranked and pruned entirely on its own, no cross-branch agreement needed
+at all, and only the shared downstream consumer's weight needs new slicing
+logic (concatenating each branch's own surviving-channel set, shifted by its
+own fixed offset) to stay correct. See :func:`_find_matmul_concat_chains`/
+:func:`_find_conv_concat_chains`'s own section comment for the bounded,
+single-consumer-per-branch shape this reaches (a `Concat` chained
+transitively into another `Concat`, or composed with a gated/residual
+branch, is declined the same conservative way as everything above) and
+:func:`_apply_concat_chains`'s own docstring for why that per-branch,
+independent-`keep` shape needed a genuinely new sibling to
+`_Chain`/`_apply_chains` rather than fitting into the existing one. General
+multi-branch dependency-graph pruning -- arbitrary fan-out, a non-`Add`/
+`Concat` merge op, ... -- remains out of scope. The
 other part of the paper's pipeline -- an architecture *search* over what to prune,
 alternated with knowledge-distillation/RL recovery afterwards -- needs a
 training loop onnxsim does not have and is not in scope here at all; this
@@ -511,7 +532,7 @@ undertaking rather than a mechanical extension of the matching alone.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence, Set, Tuple, Union
 
 import numpy as np
@@ -1695,6 +1716,32 @@ class _Chain:
     # :func:`_chain_group`) and the dedicated slicing
     # :func:`_slice_grouped_consumer_conv_weight` performs.
     consumer_group: int = 1
+
+
+@dataclass
+class _TouchedState:
+    """Cross-chain touched-role bookkeeping, shared (by reference) between
+    :func:`_apply_chains` and :func:`_apply_concat_chains` so a weight one
+    of them resizes can never also be resized a second, conflicting time by
+    the other -- e.g. a Concat branch's own producer weight happening to
+    also be, via a tied/shared initializer, some ordinary chain's producer
+    elsewhere in the graph. See :func:`_apply_chains`'s own docstring for
+    what each per-role set tracks and why roles are kept separate.
+    """
+
+    producer: Set[str] = field(default_factory=set)
+    consumer: Set[str] = field(default_factory=set)
+    const: Set[str] = field(default_factory=set)
+    conv_hop: Set[str] = field(default_factory=set)
+    stale_value_info: Set[str] = field(default_factory=set)
+
+
+def _set_conv_group_attr(node: onnx.NodeProto, group: int) -> None:
+    for attr in node.attribute:
+        if attr.name == "group":
+            attr.i = group
+            return
+    node.attribute.append(onnx.helper.make_attribute("group", group))
 
 
 def _consumers_of(graph: onnx.GraphProto) -> Dict[str, List[onnx.NodeProto]]:
@@ -3348,6 +3395,536 @@ def _find_gated_chains(graph: onnx.GraphProto) -> List[_Chain]:
     return chains
 
 
+# --- Concat-merged (skip-connection) chains ---------------------------------
+#
+# A `Concat` merge -- the U-Net-style encoder/decoder skip connection,
+# `merged = Concat(a, b, ..., axis=C)` -- looks, at first glance, like it
+# needs the same general dependency-graph machinery an `Add`/
+# `SkipLayerNormalization` merge does (see the two residual sections above),
+# and this module long declined it outright on that assumption (see its own
+# docstring's prior "non-Add merges (`Concat`, ...)" phrase). It turns out
+# not to need that: unlike `Add`, whose operands are summed
+# position-for-position and therefore *must* agree on one shared surviving
+# channel-index set (the entire reason the two residual sections above exist
+# at all), `Concat`'s branches are structurally independent. Branch `a`
+# (`Ca` channels) always owns columns `[0, Ca)` of the merged, pre-pruning
+# tensor; branch `b` always owns `[Ca, Ca+Cb)`; and so on for every further
+# operand -- fixed, disjoint offsets into the *original* channel range that
+# neither branch's own pruning choice can move, since ONNX's `Concat`
+# simply lays its inputs out end to end in operand order. So each branch can
+# be ranked and pruned *entirely on its own* -- no cross-branch agreement
+# needed at all, unlike a gated pair or a residual group -- and the only new
+# work is on the *consumer* side: its weight needs slicing at those same
+# fixed block offsets, one independently-chosen `keep` set per block,
+# concatenated back together in branch order (:func:`_apply_concat_chains`).
+#
+# Both node families this module already splits its producer/consumer
+# matching by get their own finder here, exactly mirroring the
+# `_find_chains`/`_find_conv_chains` split: :func:`_find_matmul_concat_chains`
+# (MatMul/vanilla-Gemm) and :func:`_find_conv_concat_chains` (2-D, `group=1`
+# Conv). Both resolve every one of a `Concat` node's operands *backward* to a
+# real producer, reusing the exact same backward walkers the two residual
+# sections above already built and verified --
+# :func:`_walk_matmul_producer_backward`/:func:`_walk_conv_producer_backward`
+# -- rather than writing new ones: those walkers already hold every
+# intermediate tensor to the single-consumer safety bar this pass needs
+# (`start` itself included, so a branch that also fans out anywhere else
+# fails on its very first hop), and already resolve through the same unary
+# activations (plus, for MatMul/Gemm, a per-channel `Add`/`Mul`/
+# `BiasGelu`/`FastGelu` hop; for Conv, a self-consistently-depthwise
+# pass-through hop) a plain single-producer chain's own forward walk
+# recognizes. Only a `"producer"` outcome is accepted here, though: a
+# `"add"` outcome -- the branch resolves to an eligible `Add`/
+# `SkipLayerNormalization` residual merge instead of a real producer -- is
+# treated exactly like `"fail"` and declines the *entire* `Concat` group,
+# the same conservative "never partially pruned" bar the residual sections'
+# own union-find grouping holds every member to. Composing a residual merge
+# with a `Concat` merge on the same branch (e.g. a decoder block whose own
+# skip input is itself a residual sum) is a real, plausible topology this
+# module simply hasn't verified yet -- see this module's own docstring for
+# why that's an honest scope boundary rather than an oversight, not a case
+# this finder tries to guess at. Likewise, a `Concat` chained transitively
+# into *another* `Concat` (a "spine" of concatenations) is not walked
+# through either: neither backward walker recognizes `Concat` as a hop at
+# all, so an operand that bottoms out at one simply falls through to
+# `"fail"` the same way an unrecognized producer always does -- no dedicated
+# check was needed to draw that boundary, it falls out for free from what
+# the walkers already do and don't recognize. A gated (SwiGLU/GeGLU) pair
+# feeding a `Concat` operand directly, with no real producer's raw output in
+# between, is declined the same way: neither backward walker resolves
+# through a `Mul` of two non-constant operands (see the MatMul residual
+# section's own comment for why), so that shape falls through to `"fail"`
+# too.
+#
+# `Concat`'s own `axis` attribute must actually be the channel axis this
+# pass's importance ranking operates on, and the two node families need
+# different, deliberately conservative answers for what that means, since
+# neither this pass nor this module in general ever looks up a tensor's
+# rank from `value_info`/shape inference (every other topology decision in
+# this module is answerable from node attributes and initializer shapes
+# alone, and this keeps that property rather than adding a new,
+# shape-inference-dependent dependency just for `Concat`):
+#
+# - **Conv** branches are always rank-4 (`[N, C, H, W]`) -- every Conv this
+#   whole module ever matches is 2-D, no exception anywhere in this file --
+#   so the channel axis is unambiguously `axis == 1` (or the equivalent
+#   negative form, `axis == -3`); no rank lookup is ever needed.
+# - **MatMul/Gemm** branches have no fixed rank at all (`[batch, C]`,
+#   `[batch, seq, C]`, ...), but the reduction dimension every consumer
+#   match in this module already cares about is always the tensor's *last*
+#   axis regardless of rank (2-D weight, matrix-multiplied against
+#   whatever leading batch dimensions the input happens to carry) -- so only
+#   `axis == -1` is recognized. A model that spells the same last-axis
+#   concat with an explicit *positive* `axis` (e.g. `axis=1` on a 2-D
+#   `[batch, C]` tensor, numerically identical to `axis=-1` there) is
+#   declined rather than guessed at: confirming a positive `axis` actually
+#   equals "rank minus one" would need exactly the shape-inference-dependent
+#   rank lookup this module otherwise never needs, and this pass would
+#   rather decline a genuinely-safe-but-unconfirmed case than add that new
+#   dependency for it. See
+#   `test_structured_pruning_matmul_concat_declines_on_positive_axis`.
+#
+# Once every operand resolves and the branches' fixed offsets are known, the
+# ordinary forward walk (:func:`_walk_to_consumer`/
+# :func:`_walk_to_conv_consumer`) continues from the `Concat` node's own
+# output exactly as it would from any single producer's raw output, with
+# `n_channels` set to the *sum* of every branch's own channel count -- the
+# `Concat` node itself never needs its own attributes changed (its output
+# shape is simply whatever its inputs' shapes are, so pruning each branch's
+# own producer already gives it the right, smaller input on its own). A
+# grouped (`group != 1`) Conv consumer is declined the same way
+# :func:`_find_conv_residual_chains` declines one: its per-group top-k
+# assumes every producer feeds the consumer's full channel range, which a
+# multi-branch group of independently-sized, independently-pruned branches
+# doesn't establish.
+
+
+def _concat_axis(node: onnx.NodeProto) -> Optional[int]:
+    for attr in node.attribute:
+        if attr.name == "axis":
+            return attr.i
+    return None  # required attribute on Concat's own schema -- malformed if absent
+
+
+@dataclass(frozen=True)
+class _ConcatBranch:
+    """One resolved operand of a matched ``Concat`` merge group -- see this
+    section's own comment. Unlike an ``Add``/``SkipLayerNormalization``
+    residual merge's operands (:class:`_Chain`'s `producers`, all pruned to
+    one *shared* `keep` index set, since they're summed elementwise), every
+    `_ConcatBranch` in a :class:`_ConcatChain` is pruned to its *own
+    independent* `keep` set -- see :func:`_apply_concat_chains`'s own
+    docstring for why that needed a new sibling to :class:`_Producer`/
+    :class:`_Chain` rather than folding into them.
+    """
+
+    producer: _Producer  # `pre_ops` always left empty -- see `pre_ops` below
+    # Ops between the producer's own raw output and this branch's own
+    # `Concat` operand: ``(node, const_name_or_None)`` pairs, forward order
+    # -- exactly :class:`_Chain`'s own `chain_ops` shape (needed here rather
+    # than :class:`_Producer`'s own bare-node `pre_ops` tuple, because a
+    # MatMul/Gemm branch can carry a per-channel `Add`/`Mul`/`BiasGelu`/
+    # `FastGelu` constant on this hop, not just a unary activation).
+    pre_ops: Tuple[Tuple[onnx.NodeProto, Optional[str]], ...]
+    # Depthwise Conv pass-through hops crossed on this branch (Conv branches
+    # only; always empty for a MatMul/Gemm branch -- see
+    # :class:`_ConvPassThrough`).
+    conv_pass_through: Tuple[_ConvPassThrough, ...]
+    n_channels: int
+    # This branch's fixed offset into the merged (pre-pruning) channel
+    # range, in `Concat` operand order -- see this section's own comment for
+    # why this is safe to compute once, up front, from operand order alone.
+    offset: int
+    # The tensor name actually feeding the `Concat` node at this operand
+    # position (`== producer.node.output[0]` when `pre_ops` is empty) -- the
+    # Wanda activation-probe point for this branch, see
+    # :func:`apply_structured_wanda_pruning`.
+    operand_name: str
+
+
+@dataclass(frozen=True)
+class _ConcatChain:
+    """A matched ``Concat``-merged skip-connection group -- see this
+    section's own comment. `branches` are pruned independently of one
+    another (see :class:`_ConcatBranch`); the one shared downstream consumer
+    is sliced once, by the concatenation of every branch's own `keep` set,
+    each shifted by its own `offset`.
+    """
+
+    branches: Tuple[_ConcatBranch, ...]
+    concat_node: onnx.NodeProto
+    # Ops between the `Concat` node's own output and the real consumer --
+    # exactly :class:`_Chain`'s own `chain_ops` shape, built by the same
+    # forward walk (:func:`_walk_to_consumer`/:func:`_walk_to_conv_consumer`)
+    # an ordinary single-producer chain uses.
+    chain_ops: Tuple[Tuple[onnx.NodeProto, Optional[str]], ...]
+    consumer_node: onnx.NodeProto
+    consumer_weight: str
+    consumer_weight_transposed: bool
+    consumer_is_conv: bool
+    n_channels: int  # sum of every branch's own n_channels
+    # Depthwise Conv hops crossed between the `Concat` node and the real
+    # consumer (Conv chains only; see :class:`_ConvPassThrough`).
+    conv_pass_through: Tuple[_ConvPassThrough, ...] = ()
+
+
+def _find_matmul_concat_chains(graph: onnx.GraphProto) -> List[_ConcatChain]:
+    """Finds MatMul/Gemm ``Concat``-merged skip connections -- see this
+    section's own comment. Every operand of a last-axis `Concat` (`axis ==
+    -1`; see this section's own comment for why a positive `axis` is
+    declined even when it might numerically equal the tensor's last axis)
+    is resolved backward, via :func:`_walk_matmul_producer_backward` (reused
+    unchanged from the MatMul/Gemm residual section above), to a real
+    MatMul/vanilla-Gemm producer -- only a `"producer"` outcome is accepted;
+    `"add"` (the operand resolves to an eligible residual/
+    `SkipLayerNormalization` merge instead) is declined exactly like
+    `"fail"`, since composing a residual merge with a `Concat` merge on the
+    same branch isn't verified here (see this section's own comment). If
+    *any* operand fails to resolve to a real producer, or two operands
+    resolve to the very same producer weight (degenerate), the whole
+    `Concat` node is declined -- never partially pruned.
+    """
+    initializer_map = {t.name: t for t in graph.initializer}
+    consumers_of = _consumers_of(graph)
+    node_by_output = {out: node for node in graph.node for out in node.output}
+    graph_outputs = {o.name for o in graph.output}
+
+    def _is_internal(name: str) -> bool:
+        return len(consumers_of.get(name, [])) == 1 and name not in graph_outputs
+
+    chains: List[_ConcatChain] = []
+    for node in graph.node:
+        if node.op_type != "Concat" or len(node.input) < 2 or len(node.output) != 1:
+            continue
+        if _concat_axis(node) != -1:
+            continue
+        if len(set(node.input)) != len(node.input):
+            continue  # degenerate -- the same tensor concatenated with itself
+
+        branches: List[_ConcatBranch] = []
+        seen_weights: Set[str] = set()
+        offset = 0
+        declined = False
+        for operand in node.input:
+            kind, payload, pre_ops = _walk_matmul_producer_backward(
+                operand,
+                node_by_output,
+                initializer_map,
+                consumers_of,
+                graph_outputs,
+                _MAX_CHAIN_HOPS,
+            )
+            if kind != "producer":
+                declined = True
+                break
+            assert payload is not None and not isinstance(payload, onnx.NodeProto)
+            producer, n_channels = payload
+            if producer.weight in seen_weights:
+                declined = True
+                break
+            seen_weights.add(producer.weight)
+            branches.append(
+                _ConcatBranch(producer, pre_ops, (), n_channels, offset, operand)
+            )
+            offset += n_channels
+        if declined:
+            continue
+
+        out_name = node.output[0]
+        if not _is_internal(out_name):
+            continue
+        total_n = offset
+        consumer, fwd_chain_ops = _walk_to_consumer(
+            out_name,
+            initializer_map,
+            consumers_of,
+            graph_outputs,
+            total_n,
+            _MAX_CHAIN_HOPS,
+        )
+        if consumer is None:
+            continue
+
+        chains.append(
+            _ConcatChain(
+                branches=tuple(branches),
+                concat_node=node,
+                chain_ops=fwd_chain_ops,
+                consumer_node=consumer[0],
+                consumer_weight=consumer[1],
+                consumer_weight_transposed=consumer[2],
+                consumer_is_conv=False,
+                n_channels=total_n,
+            )
+        )
+    return chains
+
+
+def _find_conv_concat_chains(graph: onnx.GraphProto) -> List[_ConcatChain]:
+    """The Conv analogue of :func:`_find_matmul_concat_chains`: every operand
+    of a channel-axis `Concat` (`axis in (1, -3)` -- the channel axis of a
+    `[N, C, H, W]` tensor; see this section's own comment for why Conv needs
+    no rank ambiguity check the MatMul/Gemm side does) is resolved backward
+    via :func:`_walk_conv_producer_backward`, reused unchanged from the Conv
+    residual section above: only a `"producer"` outcome (a real `group=1`
+    Conv, reached through unary activations and/or self-consistently-
+    depthwise pass-through hops) is accepted -- `"add"` and `"fail"` are
+    both declined the same way :func:`_find_matmul_concat_chains` declines
+    `"add"`. The consumer must itself be an ordinary (`group=1`) Conv -- see
+    this section's own comment for why a grouped consumer is declined here.
+    """
+    initializer_map = {t.name: t for t in graph.initializer}
+    consumers_of = _consumers_of(graph)
+    node_by_output = {out: node for node in graph.node for out in node.output}
+    graph_outputs = {o.name for o in graph.output}
+
+    def _is_internal(name: str) -> bool:
+        return len(consumers_of.get(name, [])) == 1 and name not in graph_outputs
+
+    chains: List[_ConcatChain] = []
+    for node in graph.node:
+        if node.op_type != "Concat" or len(node.input) < 2 or len(node.output) != 1:
+            continue
+        if _concat_axis(node) not in (1, -3):
+            continue
+        if len(set(node.input)) != len(node.input):
+            continue
+
+        branches: List[_ConcatBranch] = []
+        seen_weights: Set[str] = set()
+        offset = 0
+        declined = False
+        for operand in node.input:
+            kind, payload, pass_through, unary_ops = _walk_conv_producer_backward(
+                operand,
+                node_by_output,
+                initializer_map,
+                consumers_of,
+                graph_outputs,
+                _MAX_CHAIN_HOPS,
+            )
+            if kind != "producer":
+                declined = True
+                break
+            assert payload is not None and not isinstance(payload, onnx.NodeProto)
+            producer, n_channels = payload
+            if producer.weight in seen_weights:
+                declined = True
+                break
+            seen_weights.add(producer.weight)
+            branches.append(
+                _ConcatBranch(
+                    producer,
+                    tuple((op, None) for op in unary_ops),
+                    pass_through,
+                    n_channels,
+                    offset,
+                    operand,
+                )
+            )
+            offset += n_channels
+        if declined:
+            continue
+
+        out_name = node.output[0]
+        if not _is_internal(out_name):
+            continue
+        total_n = offset
+        consumer, fwd_chain_ops, fwd_pass_through = _walk_to_conv_consumer(
+            out_name,
+            initializer_map,
+            consumers_of,
+            graph_outputs,
+            total_n,
+            _MAX_CHAIN_HOPS,
+        )
+        if consumer is None:
+            continue
+        consumer_node, consumer_weight, consumer_group = consumer
+        if consumer_group != 1:
+            continue  # see this section's own comment -- grouped consumer declined
+
+        chains.append(
+            _ConcatChain(
+                branches=tuple(branches),
+                concat_node=node,
+                chain_ops=fwd_chain_ops,
+                consumer_node=consumer_node,
+                consumer_weight=consumer_weight,
+                consumer_weight_transposed=False,
+                consumer_is_conv=True,
+                n_channels=total_n,
+                conv_pass_through=fwd_pass_through,
+            )
+        )
+    return chains
+
+
+def _plain_branch_importance(w_nk: np.ndarray) -> np.ndarray:
+    # A Concat branch is always exactly one producer, with no cross-branch
+    # combination the way a gated pair or residual group needs (see this
+    # section's own comment) -- so this is just plain per-row L2 norm,
+    # _plain_structured_importance's own single-producer case, standalone
+    # rather than routed through a _Chain.
+    return np.linalg.norm(w_nk, axis=1)
+
+
+def _apply_concat_chains(
+    graph: onnx.GraphProto,
+    chains: List[_ConcatChain],
+    sparsity: float,
+    compute_branch_importance,
+    touched: _TouchedState,
+) -> None:
+    """The Concat-merged analogue of :func:`_apply_chains` -- deliberately a
+    separate function, not a `_Chain`/`_apply_chains` extension, because the
+    two need genuinely different shapes. `_apply_chains` computes *one*
+    `keep` index set from *one* combined importance ranking and applies it,
+    unchanged, to every producer and the consumer alike -- exactly right for
+    a gated pair or a residual merge, where every branch *must* agree on the
+    same surviving channels since they're summed/multiplied elementwise
+    before the consumer ever sees them. A `Concat` branch never needs that
+    agreement (see this section's own comment): each branch owns its own
+    disjoint, fixed-offset slice of the merged channel range, so each is
+    ranked and pruned to its *own independent* `keep` set by
+    ``compute_branch_importance(operand_name, w_nk) ->
+    np.ndarray[branch.n_channels]``, and only the shared downstream consumer
+    is sliced once, by one combined index set -- the concatenation of every
+    branch's own `keep`, each shifted by its own fixed `offset`. Since
+    branch offsets strictly increase in `Concat` operand order and each
+    branch's own `keep` is itself ascending, that concatenation is
+    automatically ascending overall too, the same `keep` invariant
+    :func:`_apply_chains` maintains. `touched` is the same
+    :class:`_TouchedState` a sibling :func:`_apply_chains` call shares, so
+    the two can never doubly resize the same weight; the caller flushes
+    ``value_info`` once, from `touched.stale_value_info`, after every such
+    call.
+    """
+    initializer_map = {t.name: t for t in graph.initializer}
+
+    for chain in chains:
+        producer_weights = {b.producer.weight for b in chain.branches}
+        if len(producer_weights) != len(chain.branches):
+            continue  # degenerate -- two branches naming the same weight
+
+        conv_hop_weights = {
+            h.weight for b in chain.branches for h in b.conv_pass_through
+        }
+        conv_hop_weights |= {h.weight for h in chain.conv_pass_through}
+        n_conv_hops = sum(len(b.conv_pass_through) for b in chain.branches) + len(
+            chain.conv_pass_through
+        )
+        if len(conv_hop_weights) != n_conv_hops:
+            continue  # degenerate -- the same depthwise weight named twice
+
+        consts = {
+            b.producer.bias for b in chain.branches if b.producer.bias is not None
+        }
+        consts.update(
+            const_name
+            for b in chain.branches
+            for _, const_name in b.pre_ops
+            if const_name is not None
+        )
+        consts.update(
+            const_name for _, const_name in chain.chain_ops if const_name is not None
+        )
+
+        if (
+            (producer_weights & touched.producer)
+            or chain.consumer_weight in touched.consumer
+            or (consts & touched.const)
+            or (conv_hop_weights & touched.conv_hop)
+        ):
+            continue  # a shared/tied initializer another chain already resized
+
+        branch_keeps: List[np.ndarray] = []
+        any_pruned = False
+        for b in chain.branches:
+            n = b.n_channels
+            keep_count = max(1, n - round(n * sparsity))
+            if keep_count >= n:
+                branch_keeps.append(np.arange(n))
+                continue
+            any_pruned = True
+            w = onnx.numpy_helper.to_array(initializer_map[b.producer.weight]).astype(
+                np.float64
+            )
+            w_nk = (
+                w.reshape(w.shape[0], -1)  # [out_channels, in_channels*kH*kW]
+                if b.producer.is_conv
+                else (w if b.producer.weight_transposed else w.T)  # [N, K]
+            )
+            importance = compute_branch_importance(b.operand_name, w_nk)
+            branch_keeps.append(np.sort(np.argsort(-importance)[:keep_count]))
+
+        if not any_pruned:
+            continue  # every branch rounds down to a no-op -- nothing to do
+
+        for b, keep in zip(chain.branches, branch_keeps):
+            if len(keep) == b.n_channels:
+                continue  # this branch's own sparsity rounded to a no-op
+            _slice_producer_weight(
+                initializer_map[b.producer.weight],
+                b.producer.weight_transposed,
+                keep,
+                is_conv=b.producer.is_conv,
+            )
+            if b.producer.bias is not None:
+                _slice_last_axis(initializer_map[b.producer.bias], keep)
+            for _, const_name in b.pre_ops:
+                if const_name is not None:
+                    _slice_last_axis(initializer_map[const_name], keep)
+            for hop in b.conv_pass_through:
+                # Same reasoning as _apply_chains's own depthwise hop
+                # handling: channel i is exactly upstream channel i, so the
+                # hop's own weight/bias slice by this branch's own `keep`.
+                _slice_producer_weight(
+                    initializer_map[hop.weight], False, keep, is_conv=True
+                )
+                if hop.bias is not None:
+                    _slice_last_axis(initializer_map[hop.bias], keep)
+                _set_conv_group_attr(hop.node, len(keep))
+
+        global_keep = np.concatenate(
+            [keep + b.offset for b, keep in zip(chain.branches, branch_keeps)]
+        )
+
+        for _, const_name in chain.chain_ops:
+            if const_name is not None:
+                _slice_last_axis(initializer_map[const_name], global_keep)
+        for hop in chain.conv_pass_through:
+            _slice_producer_weight(
+                initializer_map[hop.weight], False, global_keep, is_conv=True
+            )
+            if hop.bias is not None:
+                _slice_last_axis(initializer_map[hop.bias], global_keep)
+            _set_conv_group_attr(hop.node, len(global_keep))
+
+        _slice_consumer_weight(
+            initializer_map[chain.consumer_weight],
+            chain.consumer_weight_transposed,
+            global_keep,
+            is_conv=chain.consumer_is_conv,
+        )
+
+        touched.producer.update(producer_weights)
+        touched.consumer.add(chain.consumer_weight)
+        touched.const.update(consts)
+        touched.conv_hop.update(conv_hop_weights)
+        touched.stale_value_info.add(chain.concat_node.output[0])
+        for b in chain.branches:
+            touched.stale_value_info.add(b.producer.node.output[0])
+            touched.stale_value_info.update(op.output[0] for op, _ in b.pre_ops)
+            touched.stale_value_info.update(
+                h.node.output[0] for h in b.conv_pass_through
+            )
+        touched.stale_value_info.update(op.output[0] for op, _ in chain.chain_ops)
+        touched.stale_value_info.update(
+            h.node.output[0] for h in chain.conv_pass_through
+        )
+
+
 def _slice_producer_weight(
     w_init: onnx.TensorProto,
     weight_transposed: bool,
@@ -3481,13 +4058,17 @@ def _apply_chains(
     chains: List[_Chain],
     sparsity: float,
     compute_importance,
+    touched: _TouchedState,
 ) -> None:
     """Shared body for :func:`apply_structured_pruning` and
     :func:`apply_structured_wanda_pruning`: resolves cross-chain touched-role
     conflicts, computes each surviving chain's target channel count, calls
     ``compute_importance(chain, w_arrays_nk) -> np.ndarray[n_channels]`` for
-    the ranking, and performs the actual slicing plus stale ``value_info``
-    cleanup. Mutates ``graph`` in place.
+    the ranking, and performs the actual slicing. Mutates ``graph`` in
+    place. `touched` accumulates every touched role and stale ``value_info``
+    name across this call *and* any sibling :func:`_apply_concat_chains`
+    call sharing the same `touched` -- the caller flushes ``value_info``
+    once, after every such call, from `touched.stale_value_info`.
 
     For a chain with :func:`_chain_group` (`group`) > 1 -- a general grouped
     Conv producer or consumer, see this module's own docstring -- `keep` is
@@ -3510,11 +4091,11 @@ def _apply_chains(
     # same tensor. Only collapse when the *same role* is claimed twice (a
     # tied/shared weight), tracked separately per role; bias/scale constants
     # only ever play one role, so a single shared set is enough for those.
-    producer_touched: Set[str] = set()
-    consumer_touched: Set[str] = set()
-    const_touched: Set[str] = set()
-    conv_hop_touched: Set[str] = set()
-    stale_value_info: Set[str] = set()
+    producer_touched = touched.producer
+    consumer_touched = touched.consumer
+    const_touched = touched.const
+    conv_hop_touched = touched.conv_hop
+    stale_value_info = touched.stale_value_info
 
     for chain in chains:
         producer_weights = {p.weight for p in chain.producers}
@@ -3599,16 +4180,7 @@ def _apply_chains(
             )
             if hop.bias is not None:
                 _slice_last_axis(initializer_map[hop.bias], keep)
-            found_group = False
-            for attr in hop.node.attribute:
-                if attr.name == "group":
-                    attr.i = keep_count
-                    found_group = True
-                    break
-            if not found_group:
-                hop.node.attribute.append(
-                    onnx.helper.make_attribute("group", keep_count)
-                )
+            _set_conv_group_attr(hop.node, keep_count)
         if chain.consumer_is_conv and chain.consumer_group > 1:
             _slice_grouped_consumer_conv_weight(
                 initializer_map[chain.consumer_weight], keep, chain.consumer_group, n
@@ -3632,11 +4204,6 @@ def _apply_chains(
             chain_node.output[0] for chain_node, _ in chain.chain_ops
         )
         stale_value_info.update(hop.node.output[0] for hop in chain.conv_pass_through)
-
-    if stale_value_info:
-        kept = [vi for vi in graph.value_info if vi.name not in stale_value_info]
-        del graph.value_info[:]
-        graph.value_info.extend(kept)
 
 
 def apply_structured_pruning(
@@ -3756,6 +4323,27 @@ def apply_structured_pruning(
     ``inv_std_var`` outputs are actually consumed elsewhere, is declined the
     same conservative way.
 
+    Also handles a bounded slice of the ``Concat``-merged skip-connection
+    case -- the U-Net-style encoder/decoder merge (see
+    :func:`_find_matmul_concat_chains`/:func:`_find_conv_concat_chains` and
+    this module's own docstring) -- for both MatMul/Gemm (last-axis
+    ``Concat`` only, ``axis == -1``) and Conv (channel-axis ``Concat``,
+    ``axis in (1, -3)``) branches. Unlike a gated pair or a residual merge,
+    a ``Concat``'s branches need no shared `keep` set at all: each branch
+    owns a fixed, disjoint slice of the merged channel range and is ranked
+    and pruned entirely on its own, by the same L2-norm criterion as a plain
+    single-producer chain; only the shared downstream consumer's weight
+    needs new slicing, at each branch's own fixed offset. Every branch is
+    held to the same single-consumer safety bar as everywhere else in this
+    pass, and must resolve to a real producer of the appropriate family
+    (MatMul/vanilla-Gemm, or a ``group=1`` Conv reached through unary
+    activations and/or depthwise pass-through hops) -- a branch that fans
+    out elsewhere, bottoms out at a graph input, or would need to cross a
+    residual (``Add``/``SkipLayerNormalization``) merge or another
+    ``Concat`` to reach one, declines the *entire* group, never partially
+    pruned. A grouped (``group != 1``) Conv consumer is likewise declined,
+    the same reason a residual group declines one.
+
     :param model: the original onnx ModelProto or file path
     :param sparsity: target fraction of each matched producer's output
             channels to remove (at least one channel is always kept)
@@ -3780,8 +4368,25 @@ def apply_structured_pruning(
         + _find_conv_residual_chains(graph)
         + _find_matmul_residual_chains(graph)
     )
+    concat_chains = _find_matmul_concat_chains(graph) + _find_conv_concat_chains(graph)
+
+    touched = _TouchedState()
     if chains:
-        _apply_chains(graph, chains, sparsity, _plain_structured_importance)
+        _apply_chains(graph, chains, sparsity, _plain_structured_importance, touched)
+    if concat_chains:
+        _apply_concat_chains(
+            graph,
+            concat_chains,
+            sparsity,
+            lambda _operand_name, w_nk: _plain_branch_importance(w_nk),
+            touched,
+        )
+    if touched.stale_value_info:
+        kept = [
+            vi for vi in graph.value_info if vi.name not in touched.stale_value_info
+        ]
+        del graph.value_info[:]
+        graph.value_info.extend(kept)
 
     return out
 
@@ -3820,6 +4425,13 @@ def apply_structured_wanda_pruning(
     transplanted to whole channels: a channel whose weight is individually
     unremarkable but which gates a consistently high-magnitude activation
     is kept over one with a larger weight norm but a near-dead activation.
+    A ``Concat``-merged group (see :func:`apply_structured_pruning`'s own
+    docstring) picks this up too: each branch is ranked by that same
+    ``||W_row||_2 * ||X||_2`` metric independently, with its own activation
+    captured right where it feeds into the ``Concat`` node (reduced the same
+    way, over every axis but the channel one), not at the shared downstream
+    consumer -- consistent with each branch needing no other branch's
+    agreement on anything, unlike a gated pair or residual merge.
 
     :param model: the original onnx ModelProto or file path
     :param calibration_data: representative input batches to measure each
@@ -3863,18 +4475,25 @@ def apply_structured_wanda_pruning(
         + _find_conv_residual_chains(graph)
         + _find_matmul_residual_chains(graph)
     )
-    if not chains:
+    concat_chains = _find_matmul_concat_chains(graph) + _find_conv_concat_chains(graph)
+    if not chains and not concat_chains:
         return out
 
     # The channel axis of the activation feeding each chain's consumer: a
     # MatMul/Gemm's reduction dimension is its input's last axis, while a
     # Conv's input channel dimension is always axis 1 of [N, C, H, W]. Two
     # chains can't disagree on a shared probe name -- a tensor has exactly
-    # one producer node, so it feeds one consumer type.
+    # one producer node, so it feeds one consumer type. A Concat branch's own
+    # probe point is instead wherever it feeds into the Concat node itself
+    # (see this function's own docstring) -- not the shared downstream
+    # consumer every other chain here probes at.
     channel_axis: Dict[str, int] = {
         chain.consumer_node.input[0]: (1 if chain.consumer_is_conv else -1)
         for chain in chains
     }
+    for cchain in concat_chains:
+        for b in cchain.branches:
+            channel_axis[b.operand_name] = 1 if b.producer.is_conv else -1
     probe_names = sorted(channel_axis)
     probe_model = _add_probe_outputs(out, probe_names)
 
@@ -3909,7 +4528,26 @@ def apply_structured_wanda_pruning(
             return base  # no matching activation observed -- fall back to |W|
         return base * np.maximum(norm, epsilon)
 
-    _apply_chains(graph, chains, sparsity, _wanda_structured_importance)
+    def _wanda_branch_importance(operand_name: str, w_nk: np.ndarray) -> np.ndarray:
+        base = _plain_branch_importance(w_nk)
+        norm = act_norm.get(operand_name)
+        if norm is None or norm.shape[0] != w_nk.shape[0]:
+            return base  # no matching activation observed -- fall back to |W|
+        return base * np.maximum(norm, epsilon)
+
+    touched = _TouchedState()
+    if chains:
+        _apply_chains(graph, chains, sparsity, _wanda_structured_importance, touched)
+    if concat_chains:
+        _apply_concat_chains(
+            graph, concat_chains, sparsity, _wanda_branch_importance, touched
+        )
+    if touched.stale_value_info:
+        kept = [
+            vi for vi in graph.value_info if vi.name not in touched.stale_value_info
+        ]
+        del graph.value_info[:]
+        graph.value_info.extend(kept)
     return out
 
 
