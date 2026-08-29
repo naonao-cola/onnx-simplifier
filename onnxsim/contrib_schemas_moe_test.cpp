@@ -53,6 +53,17 @@ void Check(bool cond, const std::string& what) {
   }
 }
 
+// TEMPORARY diagnostic: the s390x (big-endian) CI job reports this test as
+// failing in 0.00 sec with zero captured output (not even the final
+// printf on a normal, non-crashing failure) -- consistent with a crash
+// early enough that nothing was ever flushed. This breadcrumb, printed
+// and flushed before/after each step, is here purely to localize which
+// step doesn't return, and should be removed once that's identified.
+void Breadcrumb(const char* what) {
+  std::fprintf(stderr, "[breadcrumb] %s\n", what);
+  std::fflush(stderr);
+}
+
 TypeProto MakeFloatType(const std::vector<int64_t>& dims,
                         const std::vector<std::string>& dim_params = {}) {
   TypeProto t;
@@ -125,7 +136,9 @@ std::vector<TypeProto> MakeInputTypes(int64_t num_experts, int64_t hidden_size,
 }
 
 void TestMoESchemaIsRegistered() {
+  Breadcrumb("TestMoESchemaIsRegistered: before RegisterContribOpSchemas");
   onnxsim::RegisterContribOpSchemas();
+  Breadcrumb("TestMoESchemaIsRegistered: after RegisterContribOpSchemas");
   const OpSchema* schema = OpSchemaRegistry::Schema("MoE", 1, "com.microsoft");
   Check(schema != nullptr, "MoE schema should be registered");
   Check(schema != nullptr && schema->HasContextDependentFunction(),
@@ -145,7 +158,10 @@ void TestBuildsForPlainReluCase() {
                      /*dynamic_experts=*/false, /*with_fc3=*/false);
   FunctionBodyBuildContextImpl ctx(node, input_types);
   FunctionProto function_proto;
+  Breadcrumb(
+      "TestBuildsForPlainReluCase: before BuildContextDependentFunction");
   bool built = schema->BuildContextDependentFunction(ctx, function_proto);
+  Breadcrumb("TestBuildsForPlainReluCase: after BuildContextDependentFunction");
   Check(built,
         "should build a body for the plain relu/no-bias/static-shape case");
   if (!built) return;
@@ -252,13 +268,22 @@ void TestNodeCountScalesWithExpertCount() {
 }  // namespace
 
 int main() {
+  Breadcrumb("main: start");
+  Breadcrumb("main: before TestMoESchemaIsRegistered");
   TestMoESchemaIsRegistered();
+  Breadcrumb("main: after TestMoESchemaIsRegistered");
   TestBuildsForPlainReluCase();
+  Breadcrumb("main: after TestBuildsForPlainReluCase");
   TestDeclinesForSwiglu();
+  Breadcrumb("main: after TestDeclinesForSwiglu");
   TestDeclinesForSparseMixer();
+  Breadcrumb("main: after TestDeclinesForSparseMixer");
   TestDeclinesForFc3();
+  Breadcrumb("main: after TestDeclinesForFc3");
   TestDeclinesForDynamicExpertCount();
+  Breadcrumb("main: after TestDeclinesForDynamicExpertCount");
   TestNodeCountScalesWithExpertCount();
+  Breadcrumb("main: after TestNodeCountScalesWithExpertCount");
 
   if (g_failures == 0) {
     std::printf("contrib_schemas_moe_test: all checks passed\n");
