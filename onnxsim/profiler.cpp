@@ -658,7 +658,11 @@ void PrintSummary(std::ostream& os, const std::vector<Event>& events) {
   os << "\nonnxsim profiling summary (per fixed-point function)\n";
   os << "-------------------------------------------------------------------"
         "------------------\n";
-  std::snprintf(buf, sizeof(buf), "%-22s %6s %12s %12s %12s %12s\n", "function",
+  // 28, not 22: wide enough for the longest span name ("ConvertOpsetVersion",
+  // 19 chars) plus up to two levels of 2-space indent -- it now nests under
+  // "Pipeline" rather than sitting at depth 0. Widen this again if a future
+  // span name plus its nesting depth would still overflow it.
+  std::snprintf(buf, sizeof(buf), "%-28s %6s %12s %12s %12s %12s\n", "function",
                 "calls", "wall(ms)", "cpu(ms)", "max wall(ms)", "peak(MiB)");
   os << buf;
   os << "-------------------------------------------------------------------"
@@ -667,10 +671,10 @@ void PrintSummary(std::ostream& os, const std::vector<Event>& events) {
     // Indent by nesting depth so the hierarchy is visible in the text summary.
     std::string label(static_cast<size_t>(std::max(0, a.min_depth)) * 2, ' ');
     label += a.name;
-    if (label.size() > 22) {
-      label = label.substr(0, 22);
+    if (label.size() > 28) {
+      label = label.substr(0, 28);
     }
-    std::snprintf(buf, sizeof(buf), "%-22s %6zu %12.2f %12.2f %12.2f %12.2f\n",
+    std::snprintf(buf, sizeof(buf), "%-28s %6zu %12.2f %12.2f %12.2f %12.2f\n",
                   label.c_str(), a.calls, ms(a.wall_us), ms(a.cpu_us),
                   ms(a.max_wall_us), BytesToMiB(a.peak_rss));
     os << buf;
