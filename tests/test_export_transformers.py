@@ -103,5 +103,7 @@ def test_export_transformers_model_save_as_external_data(tmp_path):
         # tiny model would easily fit inline -- save_as_external_data forces
         # it on regardless of size.
         assert os.path.exists(os.path.join(out_dir, name + ".data"))
-        model = onnx.load(os.path.join(out_dir, name))  # resolves external data
+        model, _pool = onnxsim.load_model(
+            os.path.join(out_dir, name)
+        )  # resolves external data
         assert len(model.graph.node) > 0
