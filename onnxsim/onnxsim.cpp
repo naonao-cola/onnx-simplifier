@@ -308,17 +308,24 @@ static onnx::ModelProto SimplifyImpl(
   // redundant here, and it aborts the whole process on graphs where a Gather
   // index cannot be statically resolved to an axis (common in dynamic-shape
   // detection models such as FasterRCNN). Always drop it from the pass list.
-  std::vector<std::string> always_disabled_passes = {"eliminate_shape_gather"};
-  // When initializers are treated as non-constant, keep ``Constant`` nodes in
-  // producer form: ``extract_constant_to_initializer`` would rewrite every
-  // Constant into an initializer, which -- being non-constant now -- would then
-  // block onnxsim's own constant folding of genuinely-constant subgraphs. The
-  // value-baking passes themselves already leave initializer weights alone via
-  // ``IsConstantTensor`` (see the onnx-optimizer changes), so only this
-  // representation-changing pass needs dropping.
-  if (!initializers_as_constants) {
-    always_disabled_passes.push_back("extract_constant_to_initializer");
-  }
+  // Always keep ``Constant`` nodes in producer form: onnxsim's own constant
+  // folder (constant_folding.cpp's GetConstantNodes/GetConstantNodesOnGraph)
+  // now leaves a ``Constant`` node untouched rather than baking it into an
+  // initializer, on the theory that a Constant node's value is not "graph
+  // weight data" the way an initializer is -- and materializes any fold that
+  // is not purely initializer-derived (directly or transitively) as a fresh
+  // Constant node of its own, so that distinction stays visible in the
+  // output model. ``extract_constant_to_initializer`` would erase it right
+  // back by rewriting every Constant into an initializer -- including ones
+  // onnxsim itself just created -- so it is always dropped from the pass
+  // list, not just when initializers are treated as non-constant (where it
+  // additionally has the correctness problem that its output, being
+  // non-constant, would block further folding of genuinely-constant
+  // subgraphs). The value-baking passes themselves already leave initializer
+  // weights alone via ``IsConstantTensor`` (see the onnx-optimizer changes),
+  // so only this representation-changing pass needs dropping.
+  std::vector<std::string> always_disabled_passes = {
+      "eliminate_shape_gather", "extract_constant_to_initializer"};
   auto is_disabled = [](const std::vector<std::string>& list,
                         const std::string& pass) {
     return std::find(list.begin(), list.end(), pass) != list.end();
