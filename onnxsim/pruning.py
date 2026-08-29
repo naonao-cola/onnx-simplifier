@@ -82,6 +82,24 @@ special handling at all, since the backward walk stops at that projection's
 own MatMul/Gemm node without ever looking further upstream at what feeds
 it.
 
+A bare `Add` merge point is, however, the exception rather than the rule
+once a transformer has actually been run through onnxruntime's own
+transformer-optimizer tool: that pass fuses each residual `Add` (plus an
+optional per-channel bias `Add`) together with the *following*
+`LayerNorm`/RMSNorm into one ``com.microsoft::SkipLayerNormalization``/
+``SkipSimplifiedLayerNormalization`` node, so
+:func:`_match_matmul_residual_merge` recognizes that fused node as an
+eligible merge point too -- its `input`/`skip` inputs playing `Add`'s own
+two-operand role -- while also treating it as a per-channel affine hop
+whose `gamma` (required) and, if present, `beta` (``SkipLayerNormalization``
+only, dropped by the RMSNorm variant) and `bias` get sliced by the group's
+own `keep` set alongside everything else. See
+:func:`_find_matmul_residual_chains`'s own section comment for the exact
+fused arithmetic (confirmed against onnxruntime's own kernel source and by
+direct execution) and how a non-constant/tied `gamma`/`beta`/`bias`, or a
+consumed optional `mean`/`inv_std_var` output, is declined the same
+conservative way as everything above.
+
 General multi-branch dependency-graph pruning -- arbitrary fan-out, non-Add
 merges (`Concat`, ...) -- remains out of scope. The
 other part of the paper's pipeline -- an architecture *search* over what to prune,
@@ -2483,6 +2501,218 @@ def _find_conv_residual_chains(graph: onnx.GraphProto) -> List[_Chain]:
 #   MatMul/Gemm producer), never looking any further upstream at what feeds
 #   `Wo`. See
 #   `test_structured_pruning_matmul_residual_add_declines_on_bare_gqa_shortcut`.
+#
+# A bare `Add` is not, in practice, what the realistic target for this whole
+# residual mechanism -- a transformer already run through onnxruntime's own
+# transformer-optimizer tool, the same optimization pass that produces the
+# `com.microsoft::Attention`/`GroupQueryAttention` fused ops this module
+# already targets elsewhere -- actually has at each residual connection: that
+# optimizer fuses `Add(input, skip)` (plus an optional per-channel bias
+# `Add`) and the *following* `LayerNorm`/`SimplifiedLayerNormalization` into
+# one `com.microsoft::SkipLayerNormalization`/`SkipSimplifiedLayerNormalization`
+# node (`skip_layer_norm.cc`'s own `ComputeJob`, confirmed against
+# onnxruntime's schema (`bert_defs.cc`) and by direct execution --
+# `sum = input + skip (+ bias)`; `SkipLayerNormalization` computes ordinary
+# LayerNorm on `sum` (population mean/variance, `* gamma + beta` if `beta`
+# is given); `SkipSimplifiedLayerNormalization` -- the RMSNorm variant
+# LLaMA-style models use -- drops `beta`/mean-centering entirely:
+# `sum / sqrt(mean(sum**2) + epsilon) * gamma`). So a fully-optimized
+# transformer typically has *no* bare `Add` at its residual connections at
+# all, and without also recognizing this fused node the feature above would
+# rarely fire on the models it exists for. `_match_matmul_residual_merge`
+# closes that gap: such a node is simultaneously (1) the residual merge
+# point itself -- its first two inputs, `input`/`skip`, are exactly `Add`'s
+# two operands, walked backward the same way -- *and* (2) a per-channel
+# affine hop on top of that sum, since `gamma` (and `beta`/`bias`, if
+# given) scale/shift each surviving channel independently and so must be
+# sliced by the group's own `keep` set precisely like a bias/scale `Add`/
+# `Mul` hop's own constant already is. Rather than inventing a new shape for
+# that, `_match_matmul_residual_merge` returns those constants as two or
+# three synthetic `(node, const_name)` `chain_ops` entries against the same
+# node -- `_Chain.chain_ops` already tolerates more than one entry per node
+# (nothing about it assumes one entry per distinct node), so
+# `_apply_chains`'s existing per-hop constant-slicing loop, its touched-role
+# conflict tracking, and its stale-`value_info` cleanup all pick every one
+# of them up with no changes of their own. `beta` (`SkipLayerNormalization`
+# only) and `bias` are the op's own optional inputs -- simply absent
+# becomes no slice needed for that term; *present but non-constant* (like
+# `gamma`, required and always checked) declines the node outright, the
+# same as a non-constant bias on a MatMul/Gemm producer. The op's optional
+# `mean`/`inv_std_var` outputs are training-only bookkeeping onnxruntime's
+# own CPU kernel never actually populates (`skip_layer_norm.cc`'s `Compute`
+# only ever writes outputs 0 and 3); a real inference-exported graph should
+# never wire them anywhere, but if one somehow does, this pass has no basis
+# for whether pruning keeps those values meaningful for whatever reads them,
+# so it declines outright rather than guessing, same as everywhere else in
+# this pass. The optional fourth output, `input_skip_bias_sum` (the raw,
+# pre-normalization sum), gets the same "declines if consumed" treatment,
+# for a different reason: this pass never reads it itself, and in the
+# common post-LN transformer shape a later residual connection's own `skip`
+# operand is simply the *previous* `SkipLayerNormalization`'s ordinary
+# (normalized) `output` -- not that raw sum -- so the "resolves to another
+# eligible merge node's raw output" backward-walk case
+# :func:`_walk_matmul_producer_backward` already handles for a chain of
+# bare `Add`s covers a chain of `SkipLayerNormalization` nodes for free.
+# But if *something else* in the graph reads `input_skip_bias_sum`
+# directly, pruning still changes its width -- it's a plain runtime sum of
+# `input`/`skip`, so it naturally comes out however wide those two end up
+# post-pruning, no static array to reslice -- and this pass has no way to
+# confirm that other consumer expects the new width rather than the
+# original one (confirmed concretely: a second graph output reading it
+# directly ends up with a shape mismatch against its own originally
+# declared shape). So it's declined whenever consumed by anything, the
+# same conservative bar `mean`/`inv_std_var` get, just for a shape reason
+# rather than a values-still-meaningful one.
+
+
+_SKIP_LAYER_NORM_OPS = ("SkipLayerNormalization", "SkipSimplifiedLayerNormalization")
+_SKIP_LAYER_NORM_DOMAIN = "com.microsoft"
+
+
+def _skip_layer_norm_const_names(
+    node: onnx.NodeProto, initializer_map: Dict[str, onnx.TensorProto]
+) -> Optional[Tuple[str, Optional[str], Optional[str]]]:
+    """If every constant input a ``com.microsoft::SkipLayerNormalization``/
+    ``SkipSimplifiedLayerNormalization`` `node` needs sliced -- `gamma`
+    (input 2, required), plus `beta` (input 3, ``SkipLayerNormalization``
+    only) and `bias` (input 4, or input 3 for the simplified/RMSNorm
+    variant, which has no `beta`), both optional -- is present exactly as
+    the node's own input list says, and, whenever present, a constant float
+    initializer shaped like a flat per-channel vector (``prod(dims) ==
+    dims[-1]``, the same self-consistency bar
+    :func:`_walk_matmul_producer_backward`'s own bias/scale hop check
+    already uses -- the real ``dims[-1] == n_channels`` check is deferred to
+    :func:`_find_matmul_residual_chains` once the group's real channel
+    count is known, exactly like that hop's own), returns
+    ``(gamma_name, beta_name_or_None, bias_name_or_None)``. `beta`/`bias`
+    simply absent from the node's own input list (as opposed to present but
+    non-constant) becomes ``None`` -- the corresponding term the kernel
+    itself omits, confirmed against onnxruntime's own ``skip_layer_norm.cc``
+    kernel and by direct execution (see this section's own comment).
+    Declines (``None``) on a non-constant `gamma`, a *present* but
+    non-constant `beta`/`bias`, or the same underlying tensor named for two
+    of `gamma`/`beta`/`bias` at once (double-slicing it in
+    :func:`_apply_chains`'s own per-hop loop would corrupt it) -- none of
+    these is guessed at.
+    """
+    simplified = node.op_type == "SkipSimplifiedLayerNormalization"
+
+    def _const_vec(name: str) -> bool:
+        init = initializer_map.get(name)
+        return (
+            init is not None
+            and init.data_type == onnx.TensorProto.FLOAT
+            and bool(list(init.dims))
+            and int(np.prod(init.dims)) == init.dims[-1]
+        )
+
+    if len(node.input) < 3 or not node.input[2] or not _const_vec(node.input[2]):
+        return None  # gamma is required
+    gamma_name = node.input[2]
+
+    beta_name: Optional[str] = None
+    bias_idx = 3
+    if not simplified:
+        bias_idx = 4
+        if len(node.input) > 3 and node.input[3]:
+            if not _const_vec(node.input[3]):
+                return None
+            beta_name = node.input[3]
+
+    bias_name: Optional[str] = None
+    if len(node.input) > bias_idx and node.input[bias_idx]:
+        if not _const_vec(node.input[bias_idx]):
+            return None
+        bias_name = node.input[bias_idx]
+
+    names = [n for n in (gamma_name, beta_name, bias_name) if n is not None]
+    if len(set(names)) != len(names):
+        return None  # tied gamma/beta/bias -- double-slicing would corrupt it
+
+    return gamma_name, beta_name, bias_name
+
+
+def _match_matmul_residual_merge(
+    node: onnx.NodeProto,
+    initializer_map: Dict[str, onnx.TensorProto],
+    consumers_of: Dict[str, List[onnx.NodeProto]],
+    graph_outputs: Set[str],
+) -> Optional[Tuple[Tuple[str, str], Tuple[Tuple[onnx.NodeProto, Optional[str]], ...]]]:
+    """The MatMul/Gemm residual finder's own eligible-merge-point check:
+    `node` is either a bare ``Add`` (:func:`_is_eligible_add_merge`, reused
+    unchanged, with no extra `chain_ops` of its own -- exactly today's
+    behavior) *or* a ``com.microsoft::SkipLayerNormalization``/
+    ``SkipSimplifiedLayerNormalization`` node (see this section's own
+    comment above for the exact fused arithmetic and how it was confirmed).
+    Its first two inputs (`input`, `skip`) play exactly the role `Add`'s two
+    operands do -- same "two independent branches must agree on one
+    channel-index set" merge point, same eligibility bar (distinct, both
+    non-constant) -- while its constant `gamma`/`beta`/`bias` inputs (see
+    :func:`_skip_layer_norm_const_names`) are a per-channel affine hop
+    riding the very same node, so this returns them as extra
+    ``(node, const_name)`` entries for the caller to fold into the resolved
+    chain's own `chain_ops`, reusing :func:`_apply_chains`'s existing
+    per-hop constant slicing verbatim -- the same way a bias/scale
+    ``Add``/``Mul`` hop's own single constant already does, just two or
+    three entries against the same node instead of one.
+
+    Declines (``None``) the same way :func:`_skip_layer_norm_const_names`
+    does for a non-constant/tied `gamma`/`beta`/`bias`, and additionally
+    whenever any of the op's optional secondary outputs -- `mean`/
+    `inv_std_var` (training-only; onnxruntime's own CPU kernel never
+    actually writes them) *or* `input_skip_bias_sum` (the raw pre-norm sum)
+    -- are actually consumed by anything else in the graph. `mean`/
+    `inv_std_var`: this pass has no basis for whether pruning keeps those
+    still meaningful for whatever reads them. `input_skip_bias_sum` is
+    different in kind -- this pass never reads it itself, and its *shape*
+    (not its meaningfulness) is what's at risk: it naturally comes out
+    however wide `input`/`skip` end up post-pruning (a plain runtime sum of
+    two already-consistently-pruned tensors, nothing to reslice), but any
+    *other* consumer of it outside this chain has no idea that width just
+    changed and may expect the original one -- confirmed concretely: a
+    second graph output reading it directly ends up with a shape mismatch
+    against its own originally-declared shape once pruned. So this output
+    is held to the same "not consumed elsewhere" bar as `mean`/
+    `inv_std_var`, not because its value would be wrong, but because
+    nothing here can confirm whatever reads it still expects the resulting
+    shape -- the same "no basis to guess a shape survives" reasoning this
+    module already applies to fan-out generally.
+    """
+    if _is_eligible_add_merge(node, initializer_map):
+        return (node.input[0], node.input[1]), ()
+
+    if (
+        node.domain != _SKIP_LAYER_NORM_DOMAIN
+        or node.op_type not in _SKIP_LAYER_NORM_OPS
+    ):
+        return None
+    if len(node.input) < 3:
+        return None
+    input_name, skip_name = node.input[0], node.input[1]
+    if (
+        not input_name
+        or not skip_name
+        or input_name == skip_name
+        or input_name in initializer_map
+        or skip_name in initializer_map
+    ):
+        return None
+
+    const_names = _skip_layer_norm_const_names(node, initializer_map)
+    if const_names is None:
+        return None
+    gamma_name, beta_name, bias_name = const_names
+
+    for out_idx in (1, 2, 3):  # mean, inv_std_var, input_skip_bias_sum
+        if len(node.output) > out_idx and node.output[out_idx]:
+            out_name = node.output[out_idx]
+            if consumers_of.get(out_name) or out_name in graph_outputs:
+                return None
+
+    extra_ops = tuple(
+        (node, name) for name in (gamma_name, beta_name, bias_name) if name is not None
+    )
+    return (input_name, skip_name), extra_ops
 
 
 def _walk_matmul_producer_backward(
@@ -2498,8 +2728,9 @@ def _walk_matmul_producer_backward(
     Tuple[Tuple[onnx.NodeProto, Optional[str]], ...],
 ]:
     """The backward counterpart of :func:`_walk_to_consumer`, used only by
-    :func:`_find_matmul_residual_chains` to resolve one operand of an ``Add``
-    merge point back to whatever produces it -- the MatMul/Gemm analogue of
+    :func:`_find_matmul_residual_chains` to resolve one operand of an
+    eligible merge node (see :func:`_match_matmul_residual_merge`) back to
+    whatever produces it -- the MatMul/Gemm analogue of
     :func:`_walk_conv_producer_backward` (see this function's own section
     comment above for how the two differ: a wider hop set mirroring
     `_walk_to_consumer`'s own per-channel bias/scale ``Add``/``Mul`` hop,
@@ -2507,16 +2738,25 @@ def _walk_matmul_producer_backward(
     crossed -- `start` itself included -- to have exactly one consumer, the
     same safety bar every other hop in this module already holds every
     intermediate tensor to; this is what makes a shared "post-block" tensor
-    (read by both the next stage and directly by an `Add`) resolve to
-    ``"fail"`` rather than being silently pruned wrong.
+    (read by both the next stage and directly by a merge node) resolve to
+    ``"fail"`` rather than being silently pruned wrong. The usual
+    exactly-one-output check on every node crossed is relaxed to "its own
+    *first* output is `cur`" rather than "it has exactly one output" purely
+    to let a multi-output ``SkipLayerNormalization``-family node (`mean`/
+    `inv_std_var`/`input_skip_bias_sum`, all beyond its primary `output`)
+    through to :func:`_match_matmul_residual_merge`'s own check below --
+    every other node type this walk ever matches (`MatMul`/`Gemm`, a unary
+    activation, `Add`/`Mul`) already has exactly one output per its own
+    ONNX schema, so this is a no-op relaxation for them.
 
     Returns one of:
 
     - ``("producer", (producer, n_channels), chain_ops)`` -- resolved all
       the way back to a real MatMul/vanilla-Gemm producer;
-    - ``("add", add_node, chain_ops)`` -- resolved to another eligible
-      ``Add`` merge node's raw output instead (the caller unions this
-      group with that ``Add``'s own rather than treating it as a separate
+    - ``("add", merge_node, chain_ops)`` -- resolved to another eligible
+      merge node's raw output instead -- a bare ``Add`` or a
+      ``SkipLayerNormalization``-family node alike (the caller unions this
+      group with that node's own rather than treating it as a separate
       producer);
     - ``("fail", None, ())`` -- a graph input, an unrecognized producer
       (attention-op boundary, gated-Mul combine, ...), a branch, or the hop
@@ -2534,7 +2774,7 @@ def _walk_matmul_producer_backward(
         if len(consumers_of.get(cur, [])) != 1 or cur in graph_outputs:
             return "fail", None, ()
         node = node_by_output.get(cur)
-        if node is None or len(node.output) != 1 or node.output[0] != cur:
+        if node is None or not node.output or node.output[0] != cur:
             return "fail", None, ()
 
         prod_info = _match_producer(node, initializer_map)
@@ -2569,10 +2809,14 @@ def _walk_matmul_producer_backward(
             # shape, handled below; for `Mul` it's a gated (SwiGLU/GeGLU)
             # combine point this walk doesn't try to pick a branch through
             # (see this section's own comment) -- either way, falling
-            # through to the `Add`-merge check (which requires `Add`
-            # specifically) or `"fail"` is correct.
+            # through to the merge check (which requires `Add` or a
+            # ``SkipLayerNormalization``-family node specifically) or
+            # `"fail"` is correct.
 
-        if _is_eligible_add_merge(node, initializer_map):
+        merge = _match_matmul_residual_merge(
+            node, initializer_map, consumers_of, graph_outputs
+        )
+        if merge is not None:
             return "add", node, tuple(reversed(chain_ops))
 
         return "fail", None, ()
@@ -2585,18 +2829,27 @@ def _find_matmul_residual_chains(graph: onnx.GraphProto) -> List[_Chain]:
     section's own comment above and :func:`_find_conv_residual_chains`'s
     (this function mirrors that one's union-find structure exactly, over
     :func:`_walk_matmul_producer_backward` instead of
-    :func:`_walk_conv_producer_backward`). For every maximal union-find
-    group of transitively-connected eligible ``Add`` merge points
-    (:func:`_is_eligible_add_merge`), resolves every member's two operands:
-    each must reach either a real MatMul/vanilla-Gemm producer (a "leaf" of
-    the group) or another `Add` already in the same group. If *any* operand,
-    anywhere in the group, fails to resolve that way, or the leaf producers'
-    channel counts don't all agree, the *entire* group is declined -- never
-    partially pruned. A correctly-resolved group must reduce to exactly one
-    "sink" `Add` (the one whose own output isn't itself consumed by another
-    `Add` in the group); the chain walk continues forward from there via the
-    ordinary :func:`_walk_to_consumer` to find the group's one real
-    downstream consumer, exactly as any other MatMul/Gemm chain does.
+    :func:`_walk_conv_producer_backward`). Every eligible merge point
+    (:func:`_match_matmul_residual_merge` -- a bare ``Add`` or a
+    ``SkipLayerNormalization``-family node) contributes its own extra
+    `chain_ops` (empty for `Add`; `gamma`/`beta`/`bias` for the
+    normalization-fused case) up front, before any union-find grouping, so
+    every member of a resolved group -- not just its "sink" -- has its own
+    per-channel constants, if any, folded into the final chain the same
+    way. For every maximal union-find group of transitively-connected
+    eligible merge points, resolves every member's two operands: each must
+    reach either a real MatMul/vanilla-Gemm producer (a "leaf" of the
+    group) or another eligible merge node already in the same group. If
+    *any* operand, anywhere in the group, fails to resolve that way, or the
+    leaf producers' channel counts don't all agree, the *entire* group is
+    declined -- never partially pruned. A correctly-resolved group must
+    reduce to exactly one "sink" merge node (the one whose own output isn't
+    itself consumed by another merge node in the group); the chain walk
+    continues forward from there via the ordinary :func:`_walk_to_consumer`
+    to find the group's one real downstream consumer, exactly as any other
+    MatMul/Gemm chain does -- unaffected by which kind of node the sink
+    happens to be, since it only ever reads the sink's own raw output
+    tensor name.
     """
     initializer_map = {t.name: t for t in graph.initializer}
     consumers_of = _consumers_of(graph)
@@ -2606,14 +2859,24 @@ def _find_matmul_residual_chains(graph: onnx.GraphProto) -> List[_Chain]:
     def _is_internal(name: str) -> bool:
         return len(consumers_of.get(name, [])) == 1 and name not in graph_outputs
 
-    eligible_adds = [
-        node for node in graph.node if _is_eligible_add_merge(node, initializer_map)
+    Merge = Tuple[
+        onnx.NodeProto,
+        Tuple[str, str],
+        Tuple[Tuple[onnx.NodeProto, Optional[str]], ...],
     ]
-    if not eligible_adds:
+    merges: List[Merge] = []
+    for node in graph.node:
+        match = _match_matmul_residual_merge(
+            node, initializer_map, consumers_of, graph_outputs
+        )
+        if match is not None:
+            operands, extra_ops = match
+            merges.append((node, operands, extra_ops))
+    if not merges:
         return []
-    add_index = {id(node): i for i, node in enumerate(eligible_adds)}
+    merge_index = {id(m[0]): i for i, m in enumerate(merges)}
 
-    parent = list(range(len(eligible_adds)))
+    parent = list(range(len(merges)))
 
     def find(i: int) -> int:
         while parent[i] != i:
@@ -2633,9 +2896,9 @@ def _find_matmul_residual_chains(graph: onnx.GraphProto) -> List[_Chain]:
     ]
     edge_results: Dict[int, List[Edge]] = {}
     poisoned: Set[int] = set()
-    for idx, add_node in enumerate(eligible_adds):
+    for idx, (merge_node, operands, _extra_ops) in enumerate(merges):
         results: List[Edge] = []
-        for operand in add_node.input:
+        for operand in operands:
             edge = _walk_matmul_producer_backward(
                 operand,
                 node_by_output,
@@ -2650,7 +2913,7 @@ def _find_matmul_residual_chains(graph: onnx.GraphProto) -> List[_Chain]:
                 poisoned.add(idx)
             elif kind == "add":
                 assert isinstance(payload, onnx.NodeProto)
-                j = add_index.get(id(payload))
+                j = merge_index.get(id(payload))
                 if j is None:
                     poisoned.add(idx)  # defensive -- shouldn't happen
                 else:
@@ -2658,7 +2921,7 @@ def _find_matmul_residual_chains(graph: onnx.GraphProto) -> List[_Chain]:
         edge_results[idx] = results
 
     groups: Dict[int, List[int]] = {}
-    for idx in range(len(eligible_adds)):
+    for idx in range(len(merges)):
         groups.setdefault(find(idx), []).append(idx)
 
     chains: List[_Chain] = []
@@ -2672,6 +2935,7 @@ def _find_matmul_residual_chains(graph: onnx.GraphProto) -> List[_Chain]:
         referenced: Set[int] = set()
 
         for idx in members:
+            pre_chain_ops.extend(merges[idx][2])  # this merge node's own extra_ops
             for kind, payload, ops in edge_results[idx]:
                 pre_chain_ops.extend(ops)
                 if kind == "producer":
@@ -2683,17 +2947,18 @@ def _find_matmul_residual_chains(graph: onnx.GraphProto) -> List[_Chain]:
                     n_channels_set.add(n_channels)
                 elif kind == "add":
                     assert isinstance(payload, onnx.NodeProto)
-                    referenced.add(add_index[id(payload)])
+                    referenced.add(merge_index[id(payload)])
 
         if len(n_channels_set) != 1:
             continue  # branches disagree on channel count -- decline
         n_channels = next(iter(n_channels_set))
 
-        # Every bias/scale hop's constant was only self-consistently checked
-        # when first crossed (see _walk_matmul_producer_backward); now that
-        # the group's real channel count is known, re-validate it actually
-        # matches -- mirroring the depthwise-Conv-hop re-validation in
-        # _find_conv_residual_chains.
+        # Every bias/scale hop's constant, and every SkipLayerNorm-family
+        # merge's own gamma/beta/bias, was only self-consistently checked
+        # when first crossed/matched (see _walk_matmul_producer_backward,
+        # _match_matmul_residual_merge); now that the group's real channel
+        # count is known, re-validate it actually matches -- mirroring the
+        # depthwise-Conv-hop re-validation in _find_conv_residual_chains.
         if any(
             const_name is not None
             and initializer_map[const_name].dims[-1] != n_channels
@@ -2704,12 +2969,12 @@ def _find_matmul_residual_chains(graph: onnx.GraphProto) -> List[_Chain]:
         sinks = [idx for idx in members if idx not in referenced]
         if len(sinks) != 1:
             continue  # not a single linear chain of merges -- decline
-        sink_add = eligible_adds[sinks[0]]
+        sink_node = merges[sinks[0]][0]
 
         if len({p.weight for p in leaf_producers}) != len(leaf_producers):
             continue  # degenerate -- the same producer named twice
 
-        sink_out = sink_add.output[0]
+        sink_out = sink_node.output[0]
         if not _is_internal(sink_out):
             continue
 
@@ -2726,7 +2991,7 @@ def _find_matmul_residual_chains(graph: onnx.GraphProto) -> List[_Chain]:
 
         chain_ops = (
             tuple(pre_chain_ops)
-            + tuple((eligible_adds[i], None) for i in members)
+            + tuple((merges[i][0], None) for i in members)
             + fwd_chain_ops
         )
 
@@ -3283,23 +3548,40 @@ def apply_structured_pruning(
     module's own docstring) -- the transformer-block residual stream shape
     (``x = x + SelfAttn(LN(x))``, ``x = x + MLP(LN(x))``) that was
     previously declined outright. Same union-find grouping over eligible
-    ``Add`` merges, same single-consumer bar on every hop of every branch,
+    merge points, same single-consumer bar on every hop of every branch,
     same combined (root-sum-square) importance ranking; the one real
     difference is the backward walk mirrors :func:`_walk_to_consumer`'s own
     *wider* MatMul/Gemm hop set (unary activations plus a per-channel
     bias/scale ``Add``/``Mul`` against a constant) rather than the Conv
     walk's narrower one, since there is no depthwise-Conv-style pass-through
-    analogue for MatMul/Gemm at all. A gated (SwiGLU/GeGLU) combine feeding
-    a residual branch with no downstream projection in between, and a
-    residual branch that would need to cross a fused self-attention op
-    boundary (``com.microsoft::Attention``/``GroupQueryAttention``/``ai.onnx``
+    analogue for MatMul/Gemm at all. A bare ``Add`` merge point is only one
+    recognized shape -- since onnxruntime's own transformer-optimizer tool
+    typically fuses each residual ``Add`` (plus an optional per-channel bias
+    ``Add``) together with the *following* LayerNorm/RMSNorm into one
+    ``com.microsoft::SkipLayerNormalization``/
+    ``SkipSimplifiedLayerNormalization`` node instead, that fused node is
+    recognized as an eligible merge point too (:func:`_match_matmul_residual_merge`):
+    its ``input``/``skip`` inputs play ``Add``'s own two-operand role, while
+    its ``gamma`` (required) and, if present, ``beta``
+    (``SkipLayerNormalization`` only) and ``bias`` are sliced by the group's
+    own surviving channel indices alongside everything else, confirmed
+    against onnxruntime's own kernel source and by direct execution -- see
+    :func:`_find_matmul_residual_chains`'s own section comment for the exact
+    fused arithmetic. A gated (SwiGLU/GeGLU) combine feeding a residual
+    branch with no downstream projection in between, and a residual branch
+    that would need to cross a fused self-attention op boundary
+    (``com.microsoft::Attention``/``GroupQueryAttention``/``ai.onnx``
     ``Attention``) to reach a real producer, are both declined rather than
     guessed at -- see the section comment above
     :func:`_walk_matmul_producer_backward` for why neither is actually
     reachable by any hop this walk recognizes, and why the far more common
     shapes (a gated FFN's own output projection, or an attention block's own
-    output-projection MatMul, feeding the residual `Add`) need no special
-    handling at all.
+    output-projection MatMul, feeding the residual `Add`/`SkipLayerNormalization`)
+    need no special handling at all. A non-constant (or, for ``beta``/``bias``,
+    present-but-non-constant) ``gamma``/``beta``/``bias``, or a
+    ``SkipLayerNormalization``-family node whose optional ``mean``/
+    ``inv_std_var`` outputs are actually consumed elsewhere, is declined the
+    same conservative way.
 
     :param model: the original onnx ModelProto or file path
     :param sparsity: target fraction of each matched producer's output
@@ -3344,8 +3626,10 @@ def apply_structured_wanda_pruning(
     as :func:`apply_wanda_pruning` is to :func:`apply_magnitude_pruning`:
     same real structural channel removal, same topology matching (a single
     producer, a gated pair, or a bounded Conv *or* MatMul/Gemm
-    residual/``Add``-merge group -> zero or more shape-preserving elementwise
-    ops and, for a Conv chain, depthwise Conv hops -> one consumer,
+    residual/merge group -- an ``Add`` or, for MatMul/Gemm, also a
+    ``SkipLayerNormalization``-family node, see :func:`apply_structured_pruning`'s
+    own docstring) -> zero or more shape-preserving elementwise ops and, for
+    a Conv chain, depthwise Conv hops -> one consumer,
     MatMul/Gemm or Conv, general grouped Conv included on either side, see
     :func:`apply_structured_pruning`'s own docstring) including the same
     depthwise-Conv pass-through sliced by the producer's channel indices

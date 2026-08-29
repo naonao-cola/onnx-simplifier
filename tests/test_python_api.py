@@ -389,6 +389,62 @@ def test_cli_large_model_save_fallback_mutates_in_place():
         assert opt.graph.initializer[0].data_location == onnx.TensorProto.EXTERNAL
 
 
+def test_cli_external_data_threshold_forces_external_data():
+    # --external-data-threshold lets a model below the 2GB protobuf limit (and
+    # below onnxsim's own 100MB default) still be forced to external data
+    # without --save-as-external-data. Weights need to individually clear
+    # onnx.save's own default per-tensor size_threshold (1024 bytes) too, or
+    # onnx keeps them inline regardless (see
+    # test_cli_large_model_save_fallback_mutates_in_place's own note on this).
+    from onnxsim import onnx_simplifier
+
+    a = np.random.rand(64, 64).astype(np.float32)
+    b = np.random.rand(64, 64).astype(np.float32)
+    model = parser.parse_model(
+        """
+        <
+          ir_version: 10,
+          opset_import: ["": 14]
+        >
+        g () => (float[64,64] y)
+        {
+          y = Add(a, b)
+        }
+        """
+    )
+    model.graph.initializer.extend(
+        [onnx.numpy_helper.from_array(a, "a"), onnx.numpy_helper.from_array(b, "b")]
+    )
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        input_path = os.path.join(tmpdir, "in.onnx")
+        output_path = os.path.join(tmpdir, "out.onnx")
+        onnx.save(model, input_path)
+
+        argv = sys.argv
+        try:
+            sys.argv = [
+                "onnxsim",
+                input_path,
+                output_path,
+                "--external-data-threshold",
+                "1KB",
+            ]
+            onnx_simplifier.main()
+        finally:
+            sys.argv = argv
+
+        assert os.path.exists(output_path + ".data")
+        saved = onnx.load(output_path, load_external_data=False)
+        assert saved.graph.initializer[0].data_location == onnx.TensorProto.EXTERNAL
+        hydrated, _pool = onnxsim.load_model(output_path)
+        folded = onnx.numpy_helper.to_array(hydrated.graph.initializer[0])
+        np.testing.assert_allclose(folded, a + b, rtol=1e-5, atol=1e-6)
+        # _pool mmaps output_path + ".data" -- on Windows an open mapping
+        # blocks deleting the file, so it must not outlive this block.
+        del _pool
+
+
 def test_unset_optional_input():
     # A Resize with its unused optional "roi"/"scales" inputs left empty (""),
     # only "sizes" provided.
@@ -991,6 +1047,247 @@ def test_simplify_path_with_external_data():
     np.testing.assert_allclose(folded, a + b, rtol=1e-5, atol=1e-6)
 
 
+def test_load_model_hydrates_classic_external_data():
+    # onnxsim.load_model mmaps a model's classic ONNX external data (through
+    # tensor_pool_bridge.h's LoadModelWithTensorPool) instead of using onnx's
+    # own per-tensor loader -- verify it round-trips a model saved with
+    # save_as_external_data=True back to plain in-memory tensors carrying the
+    # original values, and that the returned TensorPool holds the same bytes.
+    a = np.random.rand(64, 64).astype(np.float32)
+    b = np.random.rand(64, 64).astype(np.float32)
+    model = parser.parse_model(
+        """
+        <
+          ir_version: 10,
+          opset_import: ["": 14]
+        >
+        g () => (float[64,64] y)
+        {
+          y = Add(a, b)
+        }
+        """
+    )
+    model.graph.initializer.extend(
+        [onnx.numpy_helper.from_array(a, "a"), onnx.numpy_helper.from_array(b, "b")]
+    )
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        model_path = os.path.join(tmpdir, "model.onnx")
+        onnx.save(
+            model,
+            model_path,
+            save_as_external_data=True,
+            all_tensors_to_one_file=True,
+            location="model.data",
+        )
+        # All the data really is external -- this exercises the mmap'd path,
+        # not a no-op passthrough.
+        assert os.path.exists(os.path.join(tmpdir, "model.data"))
+
+        loaded, pool = onnxsim.load_model(model_path)
+
+        # Read everything needed from the pool while it's still alive: its
+        # classic-external-data entries mmap model.data, and on Windows an
+        # open mapping blocks deleting the file, so `pool` must not outlive
+        # this block's directory cleanup. The values captured here (ints,
+        # strs, bytes) are plain copies, independent of the mapping.
+        pool_len = len(pool)
+        pool_names = set(pool.names())
+        pool_bytes_a = pool.bytes("a")
+        pool_bytes_b = pool.bytes("b")
+        pool_dtype_a = pool.dtype("a")
+        pool_shape_a = pool.shape("a")
+        pool_hash_a = pool.content_hash("a")
+        del pool
+
+    for init in loaded.graph.initializer:
+        assert init.data_location == onnx.TensorProto.DEFAULT
+    values = {
+        init.name: onnx.numpy_helper.to_array(init) for init in loaded.graph.initializer
+    }
+    np.testing.assert_allclose(values["a"], a)
+    np.testing.assert_allclose(values["b"], b)
+
+    assert pool_len == 2
+    assert pool_names == {"a", "b"}
+    assert pool_bytes_a == a.tobytes()
+    assert pool_bytes_b == b.tobytes()
+    assert pool_dtype_a == onnx.TensorProto.FLOAT
+    assert pool_shape_a == [64, 64]
+    assert len(pool_hash_a) == 64  # hex-encoded BLAKE3 digest
+
+
+def test_load_model_hydrates_unnamed_attribute_tensor():
+    # hydrate_all=True's Python-side hydration (_hydrate_graph_tensors_from_pool
+    # in onnx_simplifier.py) re-derives each pooled tensor's key the same way
+    # tensor_pool_bridge.h's ForEachTensor does in C++: a tensor's own name, or
+    # -- for an unnamed node-attribute tensor -- a positional fallback
+    # ("node<i>/attr<j>/t"). This only round-trips correctly if the two
+    # independent implementations agree on that key, so exercise it directly
+    # with a Constant node whose `value` tensor has no name of its own.
+    #
+    # onnx.save's external-data converter doesn't externalize attribute
+    # tensors in the onnx version this repo pins (only initializers), so the
+    # text/onnx.parser form can't produce this fixture -- the EXTERNAL
+    # TensorProto has to be hand-built and pointed at a real data file.
+    c = np.random.rand(64, 64).astype(np.float32)
+    c_bytes = c.tobytes()
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        data_path = os.path.join(tmpdir, "attr.data")
+        with open(data_path, "wb") as f:
+            f.write(c_bytes)
+
+        model = onnx.ModelProto()
+        model.ir_version = 9
+        model.opset_import.add(domain="", version=17)
+        graph = model.graph
+        graph.name = "g"
+        graph.input.add(
+            name="x",
+            type=onnx.helper.make_tensor_type_proto(onnx.TensorProto.FLOAT, [64, 64]),
+        )
+        graph.output.add(
+            name="y",
+            type=onnx.helper.make_tensor_type_proto(onnx.TensorProto.FLOAT, [64, 64]),
+        )
+
+        const_node = graph.node.add()
+        const_node.op_type = "Constant"
+        const_node.output.append("cst")
+        attr = const_node.attribute.add()
+        attr.name = "value"
+        attr.type = onnx.AttributeProto.TENSOR
+        attr.t.data_type = onnx.TensorProto.FLOAT
+        attr.t.dims.extend([64, 64])
+        attr.t.data_location = onnx.TensorProto.EXTERNAL
+        # attr.t.name deliberately left empty.
+        for key, value in (
+            ("location", data_path),
+            ("offset", "0"),
+            ("length", str(len(c_bytes))),
+        ):
+            entry = attr.t.external_data.add()
+            entry.key = key
+            entry.value = value
+
+        add_node = graph.node.add()
+        add_node.op_type = "Add"
+        add_node.input.extend(["x", "cst"])
+        add_node.output.append("y")
+
+        model_path = os.path.join(tmpdir, "model.onnx")
+        onnx.save(model, model_path)
+
+        loaded, pool = onnxsim.load_model(model_path)
+        pool_names = pool.names()
+        # pool's entry mmaps attr.data inside tmpdir -- on Windows an open
+        # mapping blocks deleting the file, so it must not outlive this
+        # block's cleanup (see onnxsim.load_model's docstring).
+        del pool
+
+    assert pool_names == ["node0/attr0/t"]
+    loaded_const = [n for n in loaded.graph.node if n.op_type == "Constant"][0]
+    (value_attr,) = [a for a in loaded_const.attribute if a.name == "value"]
+    assert value_attr.t.data_location == onnx.TensorProto.DEFAULT
+    np.testing.assert_allclose(onnx.numpy_helper.to_array(value_attr.t), c)
+
+
+def test_load_model_hydrate_all_false_leaves_tensors_external():
+    # hydrate_all=False leaves the model's tensors as lazy EXTERNAL
+    # references -- the pool already holds their bytes, so nothing is lost,
+    # but the model itself needs an explicit hydrate to use those values.
+    a = np.random.rand(64, 64).astype(np.float32)
+    model = parser.parse_model(
+        """
+        <
+          ir_version: 10,
+          opset_import: ["": 14]
+        >
+        g () => (float[64,64] y)
+        {
+          y = Identity(a)
+        }
+        """
+    )
+    model.graph.initializer.append(onnx.numpy_helper.from_array(a, "a"))
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        model_path = os.path.join(tmpdir, "model.onnx")
+        onnx.save(
+            model,
+            model_path,
+            save_as_external_data=True,
+            all_tensors_to_one_file=True,
+            location="model.data",
+        )
+        loaded, pool = onnxsim.load_model(model_path, hydrate_all=False)
+
+        # See test_load_model_hydrates_classic_external_data's comment on
+        # why `pool` must not outlive this block.
+        pool_has_a = "a" in pool
+        pool_bytes_a = pool.bytes("a")
+        del pool
+
+    assert loaded.graph.initializer[0].data_location == onnx.TensorProto.EXTERNAL
+    assert loaded.graph.initializer[0].raw_data == b""
+    assert pool_has_a
+    np.testing.assert_allclose(
+        np.frombuffer(pool_bytes_a, dtype=np.float32).reshape(64, 64), a
+    )
+
+
+def test_load_model_passes_through_inline_model():
+    # A model with no external data at all must still load correctly (no
+    # EXTERNAL tensors for LoadModelWithTensorPool to resolve) and the
+    # returned pool is empty -- nothing needed resolving.
+    model, a, b = _make_add_model()
+    with tempfile.TemporaryDirectory() as tmpdir:
+        model_path = os.path.join(tmpdir, "model.onnx")
+        onnx.save(model, model_path)
+        loaded, pool = onnxsim.load_model(model_path)
+
+    assert loaded.graph.initializer[0].data_location == onnx.TensorProto.DEFAULT
+    np.testing.assert_allclose(
+        onnx.numpy_helper.to_array(loaded.graph.initializer[0]), a
+    )
+    assert len(pool) == 0
+
+
+def test_load_model_dispatches_to_safetensors_archive():
+    # A ".safetensors" path is treated as one of onnxsim's own
+    # self-describing archives (export_safetensors's own format), not a
+    # plain .onnx file with classic external data.
+    model, a, b = _make_add_model()
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        archive_path = os.path.join(tmpdir, "model.safetensors")
+        onnxsim.export_safetensors(model, archive_path)
+
+        loaded, pool = onnxsim.load_model(archive_path)
+
+    np.testing.assert_allclose(
+        onnx.numpy_helper.to_array(loaded.graph.initializer[0]), a
+    )
+    assert set(pool.names()) >= {"a", "b"}
+
+
+def test_load_model_dispatches_to_gguf_archive():
+    # Same dispatch, for onnxsim's own self-describing GGUF archives.
+    model, a, b = _make_add_model()
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        archive_path = os.path.join(tmpdir, "model.gguf")
+        onnxsim.export_gguf(model, archive_path)
+
+        loaded, pool = onnxsim.load_model(archive_path)
+
+    np.testing.assert_allclose(
+        onnx.numpy_helper.to_array(loaded.graph.initializer[0]), a
+    )
+    assert set(pool.names()) >= {"a", "b"}
+
+
 @skip_in_ci()
 @pytest.mark.skipif(sys.platform == "win32", reason="resource.getrusage is POSIX-only")
 def test_simplify_path_peak_memory_stays_near_model_size():
@@ -1140,7 +1437,7 @@ def test_output_path_fast_path_saves_directly_and_skips_reload():
         assert check_ok
         # The result was saved directly to output_path by simplify() itself.
         assert os.path.exists(output_path)
-        saved = onnx.load(output_path)
+        saved, _pool = onnxsim.load_model(output_path)
         assert len(saved.graph.node) == 0
         assert len(saved.graph.initializer) == 1
         folded = onnx.numpy_helper.to_array(saved.graph.initializer[0])
@@ -1181,7 +1478,7 @@ def test_output_path_off_fast_path_still_saves_full_model():
 
         assert check_ok
         assert os.path.exists(output_path)
-        saved = onnx.load(output_path)
+        saved, _pool = onnxsim.load_model(output_path)
         folded = onnx.numpy_helper.to_array(saved.graph.initializer[0])
         np.testing.assert_allclose(folded, a + b, rtol=1e-5, atol=1e-6)
 
@@ -1231,9 +1528,66 @@ def test_output_path_falls_back_to_external_data_past_2gb():
         assert call_count == 2  # the initial (faked-failing) attempt, then the fallback
         assert os.path.exists(output_path)
         assert os.path.exists(output_path + ".data")
-        saved = onnx.load(output_path)
+        saved, _pool = onnxsim.load_model(output_path)
         folded = onnx.numpy_helper.to_array(saved.graph.initializer[0])
         np.testing.assert_allclose(folded, a + b, rtol=1e-5, atol=1e-6)
+        # _pool's classic-external-data entries mmap output_path + ".data";
+        # on Windows an open mapping blocks deleting the file, so it must not
+        # outlive this block's directory cleanup.
+        del _pool
+
+
+def test_output_path_external_data_threshold_default_keeps_small_model_inline():
+    # The default external_data_threshold (100MB) leaves a small model inline
+    # with no extra argument needed, matching pre-existing behavior.
+    model, a, b = _make_add_model()
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        model_path = os.path.join(tmpdir, "model.onnx")
+        output_path = os.path.join(tmpdir, "out.onnx")
+        onnx.save(model, model_path)
+
+        sim_model, check_ok = onnxsim.simplify(
+            model_path, check_n=1, output_path=output_path
+        )
+
+        assert check_ok
+        assert not os.path.exists(output_path + ".data")
+        saved = onnx.load(output_path, load_external_data=False)
+        assert saved.graph.initializer[0].data_location == onnx.TensorProto.DEFAULT
+
+
+def test_output_path_external_data_threshold_forces_external_data():
+    # A low external_data_threshold forces external data even for a model far
+    # below the 2GB protobuf limit and the 100MB default -- exercised at this
+    # scale by passing an explicit threshold. Weights need to individually
+    # clear onnx.save's own default per-tensor size_threshold (1024 bytes)
+    # too, or onnx keeps them inline regardless of save_as_external_data
+    # (_make_add_model's 64x64 float32 initializers, 16KB each, clear it).
+    model, a, b = _make_add_model()
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        model_path = os.path.join(tmpdir, "model.onnx")
+        output_path = os.path.join(tmpdir, "out.onnx")
+        onnx.save(model, model_path)
+
+        sim_model, check_ok = onnxsim.simplify(
+            model_path,
+            check_n=1,
+            output_path=output_path,
+            external_data_threshold="1KB",
+        )
+
+        assert check_ok
+        assert os.path.exists(output_path + ".data")
+        saved = onnx.load(output_path, load_external_data=False)
+        assert saved.graph.initializer[0].data_location == onnx.TensorProto.EXTERNAL
+        hydrated, _pool = onnxsim.load_model(output_path)
+        folded = onnx.numpy_helper.to_array(hydrated.graph.initializer[0])
+        np.testing.assert_allclose(folded, a + b, rtol=1e-5, atol=1e-6)
+        # _pool mmaps output_path + ".data" -- on Windows an open mapping
+        # blocks deleting the file, so it must not outlive this block.
+        del _pool
 
 
 def test_model_info_size_counts_external_data_without_loading():
@@ -1520,7 +1874,7 @@ def test_perform_optimization_false():
         return onnx_file
 
     onnx_model_path = _create_dummy_model()
-    onnx_model = onnx.load(onnx_model_path)
+    onnx_model, _pool = onnxsim.load_model(onnx_model_path)
     simple_model, _ = onnxsim.simplify(
         onnx_model, perform_optimization=False, skip_shape_inference=True
     )

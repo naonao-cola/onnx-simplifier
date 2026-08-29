@@ -82,6 +82,7 @@
 #include <utility>
 #include <vector>
 
+#include "mmap_file.h"
 #include "tensor_pool.h"
 #include "tensor_pool_dtype.h"
 #include "tensor_pool_hash.h"
@@ -136,6 +137,33 @@ void ForEachTensor(onnx::GraphProto& graph, Fn&& fn) {
                           node_path + "/attr" + std::to_string(ai), fn);
     }
   }
+}
+
+// Value of `t`'s external_data record keyed `key` (e.g. "location",
+// "offset", "length" -- https://onnx.ai/onnx/repo-docs/ExternalData.html),
+// or `default_value` if `t` carries no such key.
+inline std::string ExternalDataValue(const onnx::TensorProto& t,
+                                     const std::string& key,
+                                     const std::string& default_value = "") {
+  for (const auto& e : t.external_data()) {
+    if (e.key() == key) return e.value();
+  }
+  return default_value;
+}
+
+// Resolves an external_data "location" value against the directory
+// containing the .onnx file that referenced it, matching onnx's own
+// external-data convention: an absolute location is used as-is, and a
+// relative one is joined to `base_dir`.
+inline std::string ResolveExternalDataPath(const std::string& base_dir,
+                                           const std::string& location) {
+  bool is_absolute =
+      !location.empty() && (location[0] == '/' || location[0] == '\\' ||
+                            (location.size() > 1 && location[1] == ':'));
+  if (is_absolute || base_dir.empty()) return location;
+  char sep = base_dir.back();
+  return (sep == '/' || sep == '\\') ? base_dir + location
+                                     : base_dir + "/" + location;
 }
 
 }  // namespace detail
@@ -258,6 +286,125 @@ inline size_t ImportModelWithSafetensors(onnx::ModelProto& model,
     }
   }
   return matched;
+}
+
+// --- classic ONNX external data, loaded via mmap into a TensorPool --------
+//
+// Unlike ExportModelWithSafetensors/ImportModelWithSafetensors above (which
+// speak onnxsim's own safetensors-backed external-data convention),
+// LoadModelWithTensorPool reads an *ordinary* .onnx file's own external-data
+// mechanism (TensorProto::EXTERNAL plus a "location"/"offset"/"length"
+// external_data record -- https://onnx.ai/onnx/repo-docs/ExternalData.html),
+// the format any exporter (PyTorch, HuggingFace optimum, ...) or plain
+// onnx.save(..., save_as_external_data=True) produces.
+//
+// Motivation: onnx's own external-data loader opens and reads each
+// referenced file once per tensor, even when many initializers share one
+// weights file (the common all_tensors_to_one_file=True case, which is
+// exactly what a model over a few hundred MB tends to use). This mmaps each
+// *distinct* external file exactly once (via mmap_file.h's TryMmapFile) and
+// gives every tensor a zero-copy view into that one mapping -- so loading a
+// large (>100MB) external-data model pays one mmap() per weights file, not
+// one open+seek+read per tensor. A file this process can't mmap (no mapping
+// support on this platform, or the OS call itself fails) falls back to an
+// ordinary seek + read of just that tensor's own byte range, so no tensor is
+// ever left unloaded because of it.
+//
+// `model` is populated by parsing `onnx_path` directly (this is the load,
+// there is no separate "structure-only" step: an EXTERNAL tensor carries no
+// inline bytes to skip in the first place). Returns the number of EXTERNAL
+// tensors resolved into `pool`. As with ImportModelWithSafetensors,
+// `hydrate_all` (the default) turns every resolved tensor into an ordinary
+// in-memory TensorProto ready for any onnxsim pass; pass false to leave
+// them as lazy EXTERNAL references for on-demand HydrateTensorProto, keyed
+// by the same name ForEachTensor assigned (see that function's doc comment
+// for the unnamed-attribute-tensor fallback naming). Throws
+// std::runtime_error if `onnx_path` can't be read or parsed as a
+// ModelProto; a malformed or out-of-range individual external_data record
+// is skipped (that tensor is left as an unresolved EXTERNAL reference)
+// rather than failing the whole load.
+inline size_t LoadModelWithTensorPool(const std::string& onnx_path,
+                                      onnx::ModelProto* model, TensorPool& pool,
+                                      bool hydrate_all = true) {
+  {
+    std::ifstream in(onnx_path, std::ios::binary);
+    if (!in) {
+      throw std::runtime_error("TensorPool: cannot open '" + onnx_path + "'");
+    }
+    if (!model->ParseFromIstream(&in)) {
+      throw std::runtime_error("TensorPool: '" + onnx_path +
+                               "' is not a valid serialized ModelProto");
+    }
+  }
+
+  std::string base_dir;
+  {
+    auto pos = onnx_path.find_last_of("/\\");
+    base_dir =
+        (pos == std::string::npos) ? std::string() : onnx_path.substr(0, pos);
+  }
+
+  // Cache of already-mapped external files, keyed by resolved path -- so a
+  // model with many tensors backed by one shared weights file mmaps that
+  // file exactly once, however many tensors reference it.
+  std::map<std::string, std::pair<std::shared_ptr<const char[]>, uint64_t>>
+      mapped;
+
+  size_t loaded = 0;
+  detail::ForEachTensor(*model->mutable_graph(), [&](const std::string& name,
+                                                     onnx::TensorProto& t) {
+    if (t.data_location() != onnx::TensorProto::EXTERNAL) return;
+    std::string location = detail::ExternalDataValue(t, "location");
+    if (location.empty()) return;  // malformed; leave untouched
+    std::string full_path = detail::ResolveExternalDataPath(base_dir, location);
+
+    auto it = mapped.find(full_path);
+    if (it == mapped.end()) {
+      it = mapped.emplace(full_path, TryMmapFile(full_path)).first;
+    }
+    const std::shared_ptr<const char[]>& owner = it->second.first;
+    const uint64_t file_size = it->second.second;
+
+    uint64_t offset = 0;
+    {
+      std::string offset_str = detail::ExternalDataValue(t, "offset");
+      if (!offset_str.empty()) offset = std::stoull(offset_str);
+    }
+    std::string length_str = detail::ExternalDataValue(t, "length");
+    std::vector<int64_t> shape(t.dims().begin(), t.dims().end());
+
+    if (owner != nullptr) {
+      uint64_t length = length_str.empty()
+                            ? (file_size > offset ? file_size - offset : 0)
+                            : std::stoull(length_str);
+      if (offset + length > file_size) return;  // out-of-range record
+      std::string_view view(owner.get() + offset, length);
+      pool.Add(name, t.data_type(), shape, owner, view);
+    } else {
+      // mmap unavailable/failed for this file -- fall back to reading
+      // just this tensor's own byte range, same as onnx's own
+      // external-data loader.
+      std::ifstream data_in(full_path, std::ios::binary);
+      if (!data_in) return;  // leave this tensor's EXTERNAL ref as-is
+      uint64_t length;
+      if (length_str.empty()) {
+        data_in.seekg(0, std::ios::end);
+        std::streamoff end = data_in.tellg();
+        length = end > static_cast<std::streamoff>(offset)
+                     ? static_cast<uint64_t>(end) - offset
+                     : 0;
+      } else {
+        length = std::stoull(length_str);
+      }
+      data_in.seekg(static_cast<std::streamoff>(offset));
+      std::string bytes(length, '\0');
+      data_in.read(bytes.data(), static_cast<std::streamsize>(length));
+      pool.Add(name, t.data_type(), shape, std::move(bytes));
+    }
+    ++loaded;
+    if (hydrate_all) HydrateTensorProto(name, t, pool);
+  });
+  return loaded;
 }
 
 // Export `pool`'s per-tensor ContentHash (see tensor_pool.h) into
