@@ -440,8 +440,8 @@ std::string FormatSimplifyingInfo(const onnx::ModelProto& model_ori,
 
   std::string init_cell = std::to_string(opt.initializer_count);
   if (opt.initializer_count < ori.initializer_count) init_cell += " *";
-  rows.push_back({"Initializers", std::to_string(ori.initializer_count),
-                  init_cell});
+  rows.push_back(
+      {"Initializers", std::to_string(ori.initializer_count), init_cell});
 
   // Symbolic metric rows: a smaller representative magnitude (every dynamic dim
   // -> 1) counts as the improvement, since "<" on a genuine formula is not
