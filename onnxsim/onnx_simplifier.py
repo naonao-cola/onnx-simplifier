@@ -628,20 +628,36 @@ def import_gguf_weights(
             alone except for a matched K-quant tensor, whose data_type is
             forced to FLOAT (the only meaningful type for a dequantized
             result) regardless of what the initializer previously declared.
+            Never mutated by this call, whether passed in directly or
+            loaded from a path.
     :param gguf_path: path to the GGUF file to pull weight values from
-    :returns: ``(model, skipped)`` -- the hydrated model, and the names of
-            GGUF tensors present in the file but skipped because their
-            quantized format has no decoder here (the legacy ``Q4_0``
-            family, every ``IQ*`` variant, ...). A GGUF tensor with no
-            matching initializer name in ``model`` is simply not brought
-            in -- it does NOT appear in ``skipped``, which reports only
-            unsupported *formats*, not name mismatches.
+    :returns: ``(model, skipped)`` -- the hydrated model (a distinct object
+            from ``model``, if a ``ModelProto`` was passed in), and the
+            names of GGUF tensors present in the file but skipped because
+            their quantized format has no decoder here (the legacy
+            ``Q4_0`` family, every ``IQ*`` variant, ...). A GGUF tensor
+            with no matching initializer name in ``model`` is simply not
+            brought in -- it does NOT appear in ``skipped``, which reports
+            only unsupported *formats*, not name mismatches.
     """
     if isinstance(model, str):
         model = onnx.load(model, load_external_data=False)
-    model_bytes, skipped = C.import_gguf_weights(model.SerializeToString(), gguf_path)
+    # C++ only ever clears/rewrites a *matched* initializer's raw_data --
+    # every unmatched one crosses back out untouched, still carrying
+    # whatever `model` already had -- so the matched ones are the only
+    # ones that need filling in here; a matched tensor's OLD value never
+    # needs to survive the round trip at all, so there's nothing to
+    # extract-and-restore on the way in either (unlike export_gguf, which
+    # strips every tensor's raw_data because ALL of it needs to cross).
+    model_bytes, matched, skipped = C.import_gguf_weights(
+        model.SerializeToString(), gguf_path
+    )
     result = onnx.ModelProto()
     result.ParseFromString(model_bytes)
+    for init in result.graph.initializer:
+        if init.name in matched:
+            init.data_type = matched.dtype(init.name)
+            init.raw_data = matched.bytes(init.name)
     return result, skipped
 
 
