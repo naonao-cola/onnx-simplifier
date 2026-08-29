@@ -260,3 +260,53 @@ def test_import_raw_dtype_passthrough(tmp_path):
     w = next(i for i in result.graph.initializer if i.name == "W")
     got = onnx.numpy_helper.to_array(w)
     np.testing.assert_array_equal(got, values)
+
+
+def test_import_leaves_input_model_unchanged_and_preserves_unmatched(tmp_path):
+    # Regression test for the C.import_gguf_weights binding change: matched
+    # tensors' bytes now come back as a separate TensorPool instead of being
+    # written into a fully re-serialized model (the same double protobuf
+    # round-trip load_model/import_safetensors/import_gguf were fixed for),
+    # so the caller's own `model` object must come back untouched, and an
+    # initializer with NO match in the GGUF file must keep its original
+    # value in `result` -- both are easy to get wrong when the matched and
+    # unmatched tensors take different code paths on the way back.
+    rng = np.random.default_rng(5)
+    raw, expected = _make_q8_0_block(rng)
+    gguf_path = str(tmp_path / "model.gguf")
+    _write_gguf(gguf_path, [("matched", GGML_TYPE_Q8_0, [32], raw)])
+
+    unmatched_value = np.array([9.0, 9.0, 9.0, 9.0], dtype=np.float32)
+    model = _model(
+        """
+        g () => (float[32] Y, float[4] Z)
+        {
+          Y = Identity(matched)
+          Z = Identity(unmatched)
+        }
+        """,
+        initializer=[
+            onnx.numpy_helper.from_array(np.zeros(32, dtype=np.float32), "matched"),
+            onnx.numpy_helper.from_array(unmatched_value, "unmatched"),
+        ],
+    )
+    before = onnx.ModelProto()
+    before.CopyFrom(model)
+
+    result, skipped = onnxsim.import_gguf_weights(model, gguf_path)
+
+    assert model == before, "import_gguf_weights must not mutate its input"
+    assert skipped == []
+
+    matched_init = next(i for i in result.graph.initializer if i.name == "matched")
+    assert matched_init.data_type == onnx.TensorProto.FLOAT
+    np.testing.assert_allclose(
+        onnx.numpy_helper.to_array(matched_init),
+        np.array(expected, dtype=np.float32),
+        rtol=1e-5,
+    )
+
+    unmatched_init = next(i for i in result.graph.initializer if i.name == "unmatched")
+    np.testing.assert_array_equal(
+        onnx.numpy_helper.to_array(unmatched_init), unmatched_value
+    )
