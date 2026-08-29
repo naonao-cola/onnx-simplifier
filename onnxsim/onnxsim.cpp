@@ -745,7 +745,8 @@ static onnx::ModelProto SimplifyImpl(
     // so let ConvertOpsetVersion's by-value parameter move-construct instead
     // of copying -- required for it to reach ConvertVersion's non-copying
     // overload (see model_prep.cpp).
-    sim_model = ConvertOpsetVersion(std::move(sim_model), *target_opset_version);
+    sim_model =
+        ConvertOpsetVersion(std::move(sim_model), *target_opset_version);
   }
   {
     // A single root span so the profiled fixed points nest under one box in the
