@@ -709,15 +709,16 @@ def test_wanda_pruning_conv_depthwise_matches_manual_group_relative_oracle_exact
     np.testing.assert_allclose(w_pruned.astype(np.float64), expected)
 
 
-def test_sparsegpt_pruning_conv_skips_grouped_conv():
-    # A depthwise Conv (group == in_channels == out_channels) is left
-    # completely untouched -- unlike apply_magnitude_pruning/
-    # apply_wanda_pruning (which now do match depthwise/general grouped
-    # Conv, see test_magnitude_pruning_conv_depthwise_reaches_target_
-    # sparsity_and_matches_oracle and friends above),
-    # apply_sparsegpt_pruning deliberately calls
-    # _candidates(graph, allow_grouped_conv=False) -- its Conv Hessian
-    # machinery is group=1-only, see this module's own docstring.
+def test_sparsegpt_pruning_conv_now_matches_depthwise_conv():
+    # Unlike an earlier version of this module (which declined every
+    # group != 1 Conv outright, the same restriction
+    # test_sparsegpt_pruning_conv_skips_general_grouped_conv below used to
+    # check), apply_sparsegpt_pruning now matches depthwise Conv
+    # (group == in_channels == out_channels) too, via a genuinely per-group
+    # Hessian and column-processing loop -- see the "apply_sparsegpt_
+    # pruning: Conv2D, grouped/depthwise" section below for the full
+    # oracle/reference-transliteration/reconstruction-error verification.
+    # This test only confirms the layer is no longer left untouched.
     C = 8
     rng = np.random.default_rng(76)
     w = rng.standard_normal((C, 1, 3, 3)).astype(np.float32)
@@ -727,14 +728,19 @@ def test_sparsegpt_pruning_conv_skips_grouped_conv():
     pruned = onnxsim.apply_sparsegpt_pruning(
         model, calibration_data=[{"X": x_cal}], sparsity=0.5
     )
-    np.testing.assert_array_equal(_conv_weight(pruned), w)
+    onnx.checker.check_model(pruned)
+    assert not np.array_equal(_conv_weight(pruned), w)
+    # Each depthwise channel's own K = kh*kw = 9 is small enough that the
+    # block-shared quantile's achievable fractions (k/9) land no closer to
+    # 0.5 than 4/9 or 5/9 -- a coarser rounding granularity than the
+    # larger-K cases elsewhere in this file, hence the wider tolerance.
+    assert onnxsim.weight_sparsity(pruned) == pytest.approx(0.5, abs=0.1)
 
 
-def test_sparsegpt_pruning_conv_skips_general_grouped_conv():
-    # Same restriction as the depthwise case above, for a general grouped
-    # Conv (1 < group < in_channels) instead: apply_sparsegpt_pruning's
-    # allow_grouped_conv=False excludes it too, even though
-    # apply_magnitude_pruning/apply_wanda_pruning now match it.
+def test_sparsegpt_pruning_conv_now_matches_general_grouped_conv():
+    # Same shape as the depthwise case above, for a general grouped Conv
+    # (1 < group < in_channels): also now matched and actually pruned,
+    # rather than left untouched.
     Cin, Cout, group = 8, 8, 2
     rng = np.random.default_rng(77)
     w = rng.standard_normal((Cout, Cin // group, 3, 3)).astype(np.float32)
@@ -744,7 +750,9 @@ def test_sparsegpt_pruning_conv_skips_general_grouped_conv():
     pruned = onnxsim.apply_sparsegpt_pruning(
         model, calibration_data=[{"X": x_cal}], sparsity=0.5
     )
-    np.testing.assert_array_equal(_conv_weight(pruned), w)
+    onnx.checker.check_model(pruned)
+    assert not np.array_equal(_conv_weight(pruned), w)
+    assert onnxsim.weight_sparsity(pruned) == pytest.approx(0.5, abs=0.05)
 
 
 # --- apply_sparsegpt_pruning --------------------------------------------
@@ -1196,6 +1204,339 @@ def test_sparsegpt_pruning_conv_reconstructs_better_than_a_same_mask_style_basel
     thresh = np.sort(score.flatten())[int(score.size * 0.5)]
     w_naive = np.where(score <= thresh, 0.0, w64).reshape(Cout, Cin, 3, 3)
     naive_model = _single_conv_model(w_naive.astype(np.float32), spatial=spatial)
+
+    (float_y,) = _run(model, {"X": x_cal})
+    (sparsegpt_y,) = _run(pruned, {"X": x_cal})
+    (naive_y,) = _run(naive_model, {"X": x_cal})
+    err_sparsegpt = np.sum(
+        (float_y.astype(np.float64) - sparsegpt_y.astype(np.float64)) ** 2
+    )
+    err_naive = np.sum((float_y.astype(np.float64) - naive_y.astype(np.float64)) ** 2)
+    assert err_sparsegpt <= err_naive
+
+
+# --- apply_sparsegpt_pruning: Conv2D, grouped/depthwise ------------------
+
+
+def _naive_conv_group_hessian(x, attrs, group, cin_per_group):
+    # Brute-force, per-group Hessian oracle: for each group g, slices x's
+    # own global input-channel range [g*cin_per_group, (g+1)*cin_per_group)
+    # and accumulates that group's own [K, K] Hessian via an explicit
+    # outer-product-per-output-position nested Python loop
+    # (_naive_conv_patch_hessian, already a completely independent
+    # construction from onnxsim.pruning._conv_im2col_patches's vectorized
+    # sliding_window_view unfolding) -- never touching any other group's
+    # channels. Returns a list of `group` [K, K] arrays.
+    return [
+        _naive_conv_patch_hessian(
+            x[:, g * cin_per_group : (g + 1) * cin_per_group, :, :], attrs
+        )[0]
+        for g in range(group)
+    ]
+
+
+def test_sparsegpt_conv_grouped_hessian_matches_naive_nested_loop_oracle():
+    # Verification bar item 1: an independent brute-force nested-loop
+    # oracle for each group's own Hessian, on calibration data engineered
+    # so the two groups' own statistics are genuinely different -- a bug
+    # that shares one Hessian across groups, or mixes up which group's
+    # slice feeds which filters, would silently pass on symmetric data but
+    # must fail here.
+    from onnxsim.pruning import _conv_im2col_patches, _ConvSpatialAttrs
+
+    group, cin_per_group = 2, 2
+    rng = np.random.default_rng(140)
+    x = rng.standard_normal((2, cin_per_group * group, 5, 5))
+    x[:, :cin_per_group, :, :] *= 25.0  # group 0 only: wildly different scale
+
+    attrs = _ConvSpatialAttrs(
+        kh=3,
+        kw=3,
+        pad_top=1,
+        pad_left=1,
+        pad_bottom=1,
+        pad_right=1,
+        stride_h=1,
+        stride_w=2,
+    )
+
+    expected = _naive_conv_group_hessian(x, attrs, group, cin_per_group)
+    for g in range(group):
+        x_g = x[:, g * cin_per_group : (g + 1) * cin_per_group, :, :]
+        patches = _conv_im2col_patches(x_g, attrs)
+        h_vec = patches.T @ patches
+        np.testing.assert_allclose(h_vec, expected[g])
+    # The two groups' own oracle Hessians must actually differ -- proof
+    # this is exercising genuinely different per-group statistics, not two
+    # identical matrices that would both trivially pass elementwise.
+    assert not np.allclose(expected[0], expected[1])
+
+
+def _grouped_sparsegpt_conv_setup(
+    seed_w, seed_x, Cin_per_group, Cout, group, kh=3, kw=3, spatial=8
+):
+    filters_per_group = Cout // group
+    rng_w = np.random.default_rng(seed_w)
+    w = rng_w.standard_normal((Cout, Cin_per_group, kh, kw)).astype(np.float32) * 0.5
+    model = _single_conv_model(w, spatial=spatial, group=group)
+
+    Cin = Cin_per_group * group
+    rng_x = np.random.default_rng(seed_x)
+    x = rng_x.standard_normal((3, Cin, spatial, spatial)).astype(np.float32)
+    # Different per-group activation scale -- a bug mixing up which group's
+    # H feeds which filter rows produces a mismatch here rather than
+    # accidentally agreeing on symmetric calibration data.
+    x[:, :Cin_per_group, :, :] *= 8.0
+    return w, model, x, filters_per_group
+
+
+def _reference_grouped_conv_sparsegpt(
+    w, x, group, cin_per_group, kh, kw, sparsity, n, m, percdamp, blocksize
+):
+    # Second, independent reference oracle: for each group, an independent
+    # nested-loop-style im2col unfold (not onnxsim.pruning's own
+    # _conv_im2col_patches) builds that group's own H, which then feeds
+    # _reference_sparsegpt (the direct fasterprune transliteration, already
+    # validated against the group=1 case above) with that group's own
+    # correctly-sliced weight sub-block -- entirely independent of
+    # onnxsim's own grouped-Conv Hessian/pruning code.
+    cout = w.shape[0]
+    filters_per_group = cout // group
+    spatial = x.shape[2]
+    out_spatial = spatial - kh + 1
+    K = cin_per_group * kh * kw
+    blocks = []
+    for g in range(group):
+        x_g = x[:, g * cin_per_group : (g + 1) * cin_per_group, :, :]
+        patches = np.zeros(
+            (x.shape[0] * out_spatial * out_spatial, K), dtype=np.float64
+        )
+        idx = 0
+        for ni in range(x.shape[0]):
+            for oh in range(out_spatial):
+                for ow in range(out_spatial):
+                    patch = x_g[ni, :, oh : oh + kh, ow : ow + kw].astype(np.float64)
+                    patches[idx] = patch.reshape(-1)
+                    idx += 1
+        h_g = patches.T @ patches
+        w_nk_g = (
+            w[g * filters_per_group : (g + 1) * filters_per_group]
+            .astype(np.float64)
+            .reshape(filters_per_group, K)
+        )
+        expected_nk_g = _reference_sparsegpt(
+            w_nk_g,
+            h_g,
+            sparsity=sparsity,
+            n=n,
+            m=m,
+            percdamp=percdamp,
+            blocksize=blocksize,
+        )
+        blocks.append(expected_nk_g.reshape(filters_per_group, cin_per_group, kh, kw))
+    return np.concatenate(blocks, axis=0)
+
+
+def test_sparsegpt_pruning_conv_grouped_matches_reference_transliteration_exactly():
+    # Verification bar item 2 (unstructured sparsity): a general grouped
+    # Conv (group=2), each group fed through the independent reference
+    # oracle above, must match apply_sparsegpt_pruning's actual output
+    # exactly.
+    Cin_per_group, Cout, group, kh, kw, spatial = 2, 8, 2, 3, 3, 8
+    w, model, x, _ = _grouped_sparsegpt_conv_setup(
+        130, 131, Cin_per_group, Cout, group, kh, kw, spatial
+    )
+
+    pruned = onnxsim.apply_sparsegpt_pruning(
+        model, calibration_data=[{"X": x}], sparsity=0.5, proc_block_size=6
+    )
+    onnx.checker.check_model(pruned)
+
+    expected = _reference_grouped_conv_sparsegpt(
+        w,
+        x,
+        group,
+        Cin_per_group,
+        kh,
+        kw,
+        sparsity=0.5,
+        n=None,
+        m=None,
+        percdamp=0.01,
+        blocksize=6,
+    )
+    np.testing.assert_allclose(
+        _conv_weight(pruned).astype(np.float64), expected, rtol=1e-6, atol=1e-6
+    )
+
+    # And the two groups must have actually ended up differently pruned --
+    # not merely "both correct", but proof neither group silently reused
+    # the other's mask/compensation.
+    filters_per_group = Cout // group
+    w_pruned = _conv_weight(pruned)
+    mask0 = w_pruned[:filters_per_group] != 0
+    mask1 = w_pruned[filters_per_group:] != 0
+    assert not np.array_equal(mask0, mask1)
+
+
+def test_sparsegpt_pruning_conv_grouped_nm_pattern_matches_reference_transliteration():
+    # Verification bar item 2 (N:M sparsity). proc_block_size=12 (a multiple
+    # of m=4, matching test_sparsegpt_pruning_nm_pattern_matches_reference_
+    # transliteration's own choice) keeps every N:M group boundary aligned
+    # to an absolute multiple of 4 within each group's own K=18 columns --
+    # _sparsegpt_prune_columns' own N:M grouping restarts at column 0 of
+    # every proc_block_size-wide block (block-relative, not global), so a
+    # block width that isn't itself a multiple of m would still prune a
+    # mathematically correct (and reference-matching) N:M-per-block
+    # pattern, just not one whose absolute-column groups of 4 each keep
+    # exactly n=2 -- irrelevant to correctness, but this test's own
+    # per-group manual check below assumes clean absolute alignment.
+    Cin_per_group, Cout, group, kh, kw, spatial = 2, 8, 2, 3, 3, 8
+    w, model, x, filters_per_group = _grouped_sparsegpt_conv_setup(
+        132, 133, Cin_per_group, Cout, group, kh, kw, spatial
+    )
+
+    pruned = onnxsim.apply_sparsegpt_pruning(
+        model, calibration_data=[{"X": x}], n=2, m=4, proc_block_size=12
+    )
+    onnx.checker.check_model(pruned)
+
+    expected = _reference_grouped_conv_sparsegpt(
+        w,
+        x,
+        group,
+        Cin_per_group,
+        kh,
+        kw,
+        sparsity=0.0,
+        n=2,
+        m=4,
+        percdamp=0.01,
+        blocksize=12,
+    )
+    np.testing.assert_allclose(
+        _conv_weight(pruned).astype(np.float64), expected, rtol=1e-6, atol=1e-6
+    )
+
+    K = Cin_per_group * kh * kw
+    w_flat = _conv_weight(pruned).reshape(Cout, K)
+    for row in w_flat:
+        for start in range(0, len(row), 4):
+            group_vals = row[start : start + 4]
+            if len(group_vals) == 4:
+                assert np.count_nonzero(group_vals) == 2
+
+
+def test_sparsegpt_pruning_conv_depthwise_matches_reference_transliteration_exactly():
+    # Verification bar item 4: the group == Cin == Cout extreme
+    # (Cin/group == 1) -- confirms the per-group Hessian degenerates
+    # correctly to a [kh*kw, kh*kw] per-channel Hessian, verified against
+    # the same independent reference oracle as the general-grouped case.
+    C, kh, kw, spatial = 6, 3, 3, 8
+    w, model, x, _ = _grouped_sparsegpt_conv_setup(134, 135, 1, C, C, kh, kw, spatial)
+
+    pruned = onnxsim.apply_sparsegpt_pruning(
+        model, calibration_data=[{"X": x}], sparsity=0.5, proc_block_size=4
+    )
+    onnx.checker.check_model(pruned)
+
+    expected = _reference_grouped_conv_sparsegpt(
+        w, x, C, 1, kh, kw, sparsity=0.5, n=None, m=None, percdamp=0.01, blocksize=4
+    )
+    np.testing.assert_allclose(
+        _conv_weight(pruned).astype(np.float64), expected, rtol=1e-6, atol=1e-6
+    )
+
+
+def test_sparsegpt_pruning_conv_grouped_reaches_target_sparsity():
+    Cin_per_group, Cout, group, spatial = 2, 8, 2, 10
+    rng = np.random.default_rng(136)
+    w = rng.standard_normal((Cout, Cin_per_group, 3, 3)).astype(np.float32) * 0.5
+    model = _single_conv_model(w, spatial=spatial, group=group)
+    x_cal = rng.standard_normal((16, Cin_per_group * group, spatial, spatial)).astype(
+        np.float32
+    )
+
+    pruned = onnxsim.apply_sparsegpt_pruning(
+        model, calibration_data=[{"X": x_cal}], sparsity=0.5
+    )
+    onnx.checker.check_model(pruned)
+    assert onnxsim.weight_sparsity(pruned) == pytest.approx(0.5, abs=0.02)
+
+
+def test_sparsegpt_pruning_conv_grouped_declines_auto_pad():
+    # Verification bar item 5: a grouped Conv still gets no data-free
+    # fallback -- auto_pad SAME_UPPER makes _conv_spatial_attrs decline the
+    # node, so the whole layer (every group) is left completely untouched.
+    Cin_per_group, Cout, group, spatial = 2, 8, 2, 10
+    rng = np.random.default_rng(137)
+    w = rng.standard_normal((Cout, Cin_per_group, 3, 3)).astype(np.float32)
+    model = _single_conv_model(
+        w,
+        spatial=spatial,
+        group=group,
+        extra_attrs='auto_pad="SAME_UPPER"',
+        out_spatial=spatial,
+    )
+    x_cal = rng.standard_normal((4, Cin_per_group * group, spatial, spatial)).astype(
+        np.float32
+    )
+
+    pruned = onnxsim.apply_sparsegpt_pruning(
+        model, calibration_data=[{"X": x_cal}], sparsity=0.5
+    )
+    np.testing.assert_array_equal(_conv_weight(pruned), w)
+
+
+def test_sparsegpt_pruning_conv_grouped_reconstructs_better_than_a_same_mask_style_baseline():
+    # Verification bar item 3: end-to-end reconstruction-error property via
+    # onnxruntime, for a grouped Conv -- SparseGPT's Hessian-compensated
+    # result should reconstruct the real (onnxruntime) output at least as
+    # well as naive same-mask zeroing with no compensation, on
+    # well-conditioned calibration data.
+    #
+    # The naive baseline's threshold is computed independently *per group*
+    # here, not globally across both groups' weights combined: since
+    # apply_sparsegpt_pruning itself enforces its target sparsity within
+    # each group's own [filters_per_group, K] sub-block (its own
+    # block-shared threshold, scoped per group -- see this module's own
+    # docstring), a fair same-sparsity-pattern-granularity comparison must
+    # match that scoping. A single global-threshold naive baseline instead
+    # gives naive an extra degree of freedom SparseGPT's own per-group
+    # algorithm doesn't have -- uneven sparsity allocation between the two
+    # groups' weight sub-blocks, favoring whichever group's magnitudes
+    # happen to be more compressible -- which can (and, empirically,
+    # reliably does for this weight distribution) make even a "naive"
+    # baseline outperform SparseGPT's own necessarily-50%-per-group result,
+    # despite SparseGPT correctly beating a same-mask-granularity
+    # (per-group) naive baseline every time; not a difference in
+    # correctness, just an unfair comparison.
+    Cin_per_group, Cout, group, spatial = 2, 8, 2, 10
+    rng = np.random.default_rng(138)
+    w = rng.standard_normal((Cout, Cin_per_group, 3, 3)).astype(np.float32) * 0.5
+    model = _single_conv_model(w, spatial=spatial, group=group)
+    Cin = Cin_per_group * group
+    # Well-conditioned H per group: n_positions = 16*8*8 = 1024 >> K = 18.
+    x_cal = rng.standard_normal((16, Cin, spatial, spatial)).astype(np.float32)
+
+    pruned = onnxsim.apply_sparsegpt_pruning(
+        model, calibration_data=[{"X": x_cal}], sparsity=0.5
+    )
+    onnx.checker.check_model(pruned)
+
+    K = Cin_per_group * 3 * 3
+    w64 = w.astype(np.float64).reshape(Cout, K)
+    filters_per_group = Cout // group
+    w_naive = np.zeros_like(w64)
+    for g in range(group):
+        rows = slice(g * filters_per_group, (g + 1) * filters_per_group)
+        score = np.abs(w64[rows])
+        thresh = np.sort(score.flatten())[int(score.size * 0.5)]
+        w_naive[rows] = np.where(score <= thresh, 0.0, w64[rows])
+    w_naive = w_naive.reshape(Cout, Cin_per_group, 3, 3)
+    naive_model = _single_conv_model(
+        w_naive.astype(np.float32), spatial=spatial, group=group
+    )
 
     (float_y,) = _run(model, {"X": x_cal})
     (sparsegpt_y,) = _run(pruned, {"X": x_cal})
@@ -4105,6 +4446,730 @@ def test_structured_pruning_mixed_add_and_skip_layer_norm_spine_matches_oracle()
     np.testing.assert_allclose(y, y_oracle, rtol=1e-5, atol=1e-5)
 
 
+# --- apply_structured_pruning: Concat-merged (skip-connection) chains -------
+#
+# See onnxsim.pruning's own module docstring and the "Concat-merged
+# (skip-connection) chains" section comment above
+# _find_matmul_concat_chains/_find_conv_concat_chains for the full
+# reasoning. Unlike every merge kind tested above (a gated pair, an Add
+# residual, a SkipLayerNormalization-fused residual -- all of which force
+# every branch onto one *shared* keep set), a Concat's branches are
+# independent: each owns a fixed, disjoint slice of the merged channel
+# range and is ranked/pruned entirely on its own. The tests below are
+# deliberately built to catch a "treated it like a residual merge" bug --
+# one branch's weights scaled far larger than another's, or branches with
+# different channel counts -- since a shared-keep-set bug would silently
+# starve or ignore one branch, while independent per-branch selection
+# always keeps each branch's own top fraction regardless of the other
+# branch's scale.
+
+
+def _matmul_concat_model(weights, w_out, axis=-1):
+    # merged = Concat(MatMul(X, W0), MatMul(X, W1), ..., axis=axis);
+    # Y = MatMul(merged, WOUT) -- an arbitrary (2 or more) number of
+    # independent MatMul producers merge via Concat, each keeping its own
+    # disjoint slice of the merged channel range, feeding one real
+    # consumer. `weights[i]` is `[K, Ci]`; `w_out` is `[sum(Ci), Out]`.
+    K = weights[0].shape[0]
+    Out = w_out.shape[1]
+    initializer = []
+    names = []
+    lines = []
+    for i, w in enumerate(weights):
+        wname = f"W{i}"
+        initializer.append(_f32(w, wname))
+        lines.append(f"h{i} = MatMul(X, {wname})")
+        names.append(f"h{i}")
+    lines.append(f"merged = Concat<axis={axis}>({', '.join(names)})")
+    lines.append("Y = MatMul(merged, WOUT)")
+    initializer.append(_f32(w_out, "WOUT"))
+    body = "\n          ".join(lines)
+    return _model(
+        f"""
+        g (float[batch,{K}] X) => (float[batch,{Out}] Y)
+        {{
+          {body}
+        }}
+        """,
+        initializer=initializer,
+    )
+
+
+def _conv_concat_model(weights, w_out, axis=1, spatial=10):
+    # The Conv analogue of _matmul_concat_model -- the U-Net-style
+    # encoder/decoder merge this whole section exists for. `weights[i]` is
+    # `[Ci, Cin, kH, kW]`; `w_out` is `[Cout, sum(Ci), kH, kW]`.
+    Cin = weights[0].shape[1]
+    Cout = w_out.shape[0]
+    initializer = []
+    names = []
+    lines = []
+    for i, w in enumerate(weights):
+        wname = f"W{i}"
+        initializer.append(_f32(w, wname))
+        lines.append(f"h{i} = Conv<kernel_shape=[3,3]>(X, {wname})")
+        names.append(f"h{i}")
+    lines.append(f"merged = Concat<axis={axis}>({', '.join(names)})")
+    lines.append("Y = Conv<kernel_shape=[3,3]>(merged, WOUT)")
+    initializer.append(_f32(w_out, "WOUT"))
+    out_spatial = spatial - 4
+    body = "\n          ".join(lines)
+    return _model(
+        f"""
+        g (float[N,{Cin},{spatial},{spatial}] X) => (float[N,{Cout},{out_spatial},{out_spatial}] Y)
+        {{
+          {body}
+        }}
+        """,
+        initializer=initializer,
+    )
+
+
+def test_structured_pruning_matmul_concat_prunes_each_branch_to_its_own_count():
+    # Ca != Cb, same sparsity fraction -- proves each branch is sized from
+    # its *own* channel count (round(Ca*(1-s)) vs round(Cb*(1-s))), not one
+    # shared count the way a gated/residual merge's shared keep set would
+    # force. keep_a = 10 - round(10*0.5) = 5; keep_b = 6 - round(6*0.5) = 3.
+    K, Ca, Cb, Out = 8, 10, 6, 4
+    rng = np.random.default_rng(200)
+    wa = rng.standard_normal((K, Ca)).astype(np.float32)
+    wb = rng.standard_normal((K, Cb)).astype(np.float32)
+    wout = rng.standard_normal((Ca + Cb, Out)).astype(np.float32)
+    model = _matmul_concat_model([wa, wb], wout)
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    inits = {t.name: t for t in pruned.graph.initializer}
+    assert list(inits["W0"].dims) == [K, 5]
+    assert list(inits["W1"].dims) == [K, 3]
+    assert list(inits["WOUT"].dims) == [8, Out]
+
+
+def test_structured_pruning_matmul_concat_matches_oracle_no_cross_branch_coupling():
+    # Branch a's weights are scaled 10x branch b's -- a bug that (wrongly)
+    # combined both branches into one shared importance ranking, the way
+    # _find_matmul_residual_chains/_find_gated_chains do, would keep every
+    # one of branch a's columns and none of branch b's (a's smallest column
+    # still dwarfs b's largest). Correct independent per-branch ranking
+    # keeps each branch's own top half regardless of the other branch's
+    # scale -- confirmed both by an explicit non-empty/expected-set check on
+    # branch b's own survivors and by the full onnxruntime oracle match.
+    K, C, Out = 8, 8, 4
+    rng = np.random.default_rng(201)
+    wa = rng.standard_normal((K, C)).astype(np.float32) * 10.0
+    wb = rng.standard_normal((K, C)).astype(np.float32)
+    wout = rng.standard_normal((2 * C, Out)).astype(np.float32)
+    model = _matmul_concat_model([wa, wb], wout)
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    keep_a = np.sort(
+        np.argsort(-np.linalg.norm(wa.astype(np.float64), axis=0))[: C // 2]
+    )
+    keep_b = np.sort(
+        np.argsort(-np.linalg.norm(wb.astype(np.float64), axis=0))[: C // 2]
+    )
+    assert len(keep_b) == C // 2  # branch b kept its own top half, not starved to 0
+    global_keep = np.concatenate([keep_a, keep_b + C])
+
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    np.testing.assert_array_equal(inits["W0"], wa[:, keep_a])
+    np.testing.assert_array_equal(inits["W1"], wb[:, keep_b])
+    np.testing.assert_array_equal(inits["WOUT"], wout[global_keep, :])
+
+    oracle = _matmul_concat_model([wa[:, keep_a], wb[:, keep_b]], wout[global_keep, :])
+    rng_x = np.random.default_rng(202)
+    x = rng_x.standard_normal((5, K)).astype(np.float32)
+    (y,) = _run(pruned, {"X": x})
+    (y_oracle,) = _run(oracle, {"X": x})
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-5, atol=1e-5)
+
+
+def test_structured_pruning_matmul_concat_three_branches_matches_oracle():
+    # N-ary Concat (three branches, three different channel counts) -- not
+    # fixed at two operands the way an Add merge is.
+    K, Ca, Cb, Cc, Out = 6, 8, 4, 6, 3
+    rng = np.random.default_rng(203)
+    wa = rng.standard_normal((K, Ca)).astype(np.float32)
+    wb = rng.standard_normal((K, Cb)).astype(np.float32)
+    wc = rng.standard_normal((K, Cc)).astype(np.float32)
+    wout = rng.standard_normal((Ca + Cb + Cc, Out)).astype(np.float32)
+    model = _matmul_concat_model([wa, wb, wc], wout)
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    keep_a = np.sort(np.argsort(-np.linalg.norm(wa.astype(np.float64), axis=0))[:4])
+    keep_b = np.sort(np.argsort(-np.linalg.norm(wb.astype(np.float64), axis=0))[:2])
+    keep_c = np.sort(np.argsort(-np.linalg.norm(wc.astype(np.float64), axis=0))[:3])
+    global_keep = np.concatenate([keep_a, keep_b + Ca, keep_c + Ca + Cb])
+    oracle = _matmul_concat_model(
+        [wa[:, keep_a], wb[:, keep_b], wc[:, keep_c]], wout[global_keep, :]
+    )
+
+    rng_x = np.random.default_rng(204)
+    x = rng_x.standard_normal((5, K)).astype(np.float32)
+    (y,) = _run(pruned, {"X": x})
+    (y_oracle,) = _run(oracle, {"X": x})
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-5, atol=1e-5)
+
+
+def test_structured_pruning_matmul_concat_branch_activation_matches_oracle():
+    # Each branch's own Relu (between its producer's raw output and the
+    # Concat operand) is carried on that branch's own `pre_ops` -- exercised
+    # here alongside a post-Concat Sigmoid (an ordinary _walk_to_consumer
+    # hop, unrelated to the Concat machinery itself) to confirm both compose.
+    K, Ca, Cb, Out = 8, 8, 6, 4
+    rng = np.random.default_rng(205)
+    wa = rng.standard_normal((K, Ca)).astype(np.float32)
+    wb = rng.standard_normal((K, Cb)).astype(np.float32)
+    wout = rng.standard_normal((Ca + Cb, Out)).astype(np.float32)
+    model = _model(
+        f"""
+        g (float[batch,{K}] X) => (float[batch,{Out}] Y)
+        {{
+          ha = MatMul(X, WA)
+          aa = Relu(ha)
+          hb = MatMul(X, WB)
+          ab = Relu(hb)
+          merged = Concat<axis=-1>(aa, ab)
+          s = Sigmoid(merged)
+          Y = MatMul(s, WOUT)
+        }}
+        """,
+        initializer=[_f32(wa, "WA"), _f32(wb, "WB"), _f32(wout, "WOUT")],
+    )
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    keep_a = np.sort(
+        np.argsort(-np.linalg.norm(wa.astype(np.float64), axis=0))[: Ca // 2]
+    )
+    keep_b = np.sort(
+        np.argsort(-np.linalg.norm(wb.astype(np.float64), axis=0))[: Cb // 2]
+    )
+    global_keep = np.concatenate([keep_a, keep_b + Ca])
+    oracle = _model(
+        f"""
+        g (float[batch,{K}] X) => (float[batch,{Out}] Y)
+        {{
+          ha = MatMul(X, WA)
+          aa = Relu(ha)
+          hb = MatMul(X, WB)
+          ab = Relu(hb)
+          merged = Concat<axis=-1>(aa, ab)
+          s = Sigmoid(merged)
+          Y = MatMul(s, WOUT)
+        }}
+        """,
+        initializer=[
+            _f32(wa[:, keep_a], "WA"),
+            _f32(wb[:, keep_b], "WB"),
+            _f32(wout[global_keep, :], "WOUT"),
+        ],
+    )
+
+    rng_x = np.random.default_rng(206)
+    x = rng_x.standard_normal((5, K)).astype(np.float32)
+    (y,) = _run(pruned, {"X": x})
+    (y_oracle,) = _run(oracle, {"X": x})
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-5, atol=1e-5)
+
+
+def test_structured_wanda_pruning_matmul_concat_matches_oracle():
+    # Confirms the exact ||W_row||_2 * ||X||_2 formula and probe point
+    # (each branch's own operand feeding the Concat node, captured
+    # independently -- not the shared downstream consumer, and not mixed
+    # with the other branch's activation): weight columns are deliberately
+    # scaled so the two branches' importances differ, and the pruned
+    # result is checked bit-for-bit against a hand-computed oracle using
+    # the real captured activations, the same correctness bar every other
+    # "matches_oracle" test in this module holds to.
+    K, Ca, Cb, Out = 6, 6, 6, 4
+    rng = np.random.default_rng(207)
+    wa = rng.standard_normal((K, Ca)).astype(np.float32)
+    wb = rng.standard_normal((K, Cb)).astype(np.float32)
+    wa[:, : Ca // 2] *= 3.0  # weight-only ranking favors the first half ...
+    wb[:, : Cb // 2] *= 3.0
+    wout = rng.standard_normal((Ca + Cb, Out)).astype(np.float32)
+    model = _matmul_concat_model([wa, wb], wout)
+
+    probe_model = onnx.ModelProto()
+    probe_model.CopyFrom(model)
+    probe_model.graph.output.append(
+        onnx.helper.make_tensor_value_info("h0", onnx.TensorProto.FLOAT, None)
+    )
+    probe_model.graph.output.append(
+        onnx.helper.make_tensor_value_info("h1", onnx.TensorProto.FLOAT, None)
+    )
+
+    rng_cal = np.random.default_rng(208)
+    x_cal = rng_cal.standard_normal((16, K)).astype(np.float32)
+    calibration_data = [{"X": x_cal}]
+    _, h0_cal, h1_cal = _run(probe_model, {"X": x_cal})
+    norm_a = np.sqrt(np.mean(np.square(h0_cal.astype(np.float64)), axis=0))
+    norm_b = np.sqrt(np.mean(np.square(h1_cal.astype(np.float64)), axis=0))
+
+    pruned = onnxsim.apply_structured_wanda_pruning(
+        model, calibration_data=calibration_data, sparsity=0.5
+    )
+    onnx.checker.check_model(pruned)
+
+    importance_a = np.linalg.norm(wa.astype(np.float64), axis=0) * np.maximum(
+        norm_a, 1e-8
+    )
+    importance_b = np.linalg.norm(wb.astype(np.float64), axis=0) * np.maximum(
+        norm_b, 1e-8
+    )
+    keep_a = np.sort(np.argsort(-importance_a)[: Ca // 2])
+    keep_b = np.sort(np.argsort(-importance_b)[: Cb // 2])
+    global_keep = np.concatenate([keep_a, keep_b + Ca])
+    oracle = _matmul_concat_model([wa[:, keep_a], wb[:, keep_b]], wout[global_keep, :])
+
+    rng_x = np.random.default_rng(209)
+    x = rng_x.standard_normal((5, K)).astype(np.float32)
+    (y,) = _run(pruned, {"X": x})
+    (y_oracle,) = _run(oracle, {"X": x})
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-5, atol=1e-5)
+
+
+def test_structured_wanda_pruning_matmul_concat_protects_low_weight_high_activation_channel_per_branch():
+    # The structured analogue of Wanda's own motivating scenario
+    # (test_structured_wanda_pruning_protects_channels_with_small_weight_but_large_activation
+    # above), replayed independently on *each* branch of a Concat: branch
+    # a's own column 0 has a deliberately tiny weight (so plain L2-norm
+    # pruning drops it) but responds only to input feature k0, which
+    # calibration data makes huge -- and branch b's own column 0 is the
+    # same construction against a *different* feature k1. Both must be
+    # protected independently for this to pass: a bug that captured only
+    # one branch's activation (or swapped the two, or fell back to probing
+    # the shared downstream consumer) would protect at most one of them.
+    K, Ca, Cb = 8, 6, 6
+    k0, k1 = 0, 1
+    small_scale = 0.4  # matches the single-branch test's own scale
+    rng = np.random.default_rng(207)
+    wa = rng.standard_normal((K, Ca)).astype(np.float32) * 0.5
+    wb = rng.standard_normal((K, Cb)).astype(np.float32) * 0.5
+    # Every *non*-salient column, on both branches, is barred from
+    # responding to either amplified feature at all -- otherwise, since
+    # both branches share the same input X, an ordinary column with a
+    # random (uncontrolled) coefficient on k0/k1 would pick up the same
+    # amplification and swamp the deliberately small salient column's own
+    # importance, defeating the decoupling this test depends on. Branch a's
+    # own salient column (0) is then zeroed and given a single small tap on
+    # k0 alone; branch b's mirrors that against k1.
+    wa[k1, :] = 0.0  # branch a never responds to b's own amplified feature
+    wa[k0, 1:] = 0.0  # only branch a's own salient column responds to k0
+    wa[:, 0] = 0.0
+    wa[k0, 0] = small_scale
+    wb[k0, :] = 0.0  # branch b never responds to a's own amplified feature
+    wb[k1, 1:] = 0.0  # only branch b's own salient column responds to k1
+    wb[:, 0] = 0.0
+    wb[k1, 0] = small_scale
+    wout = rng.standard_normal((Ca + Cb, 4)).astype(np.float32)
+    model = _matmul_concat_model([wa, wb], wout)
+
+    x = rng.standard_normal((64, K)).astype(np.float32)
+    x[:, k0] *= 80.0
+    x[:, k1] *= 80.0
+    calibration_data = [{"X": x}]
+
+    plain = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    wanda = onnxsim.apply_structured_wanda_pruning(
+        model, calibration_data=calibration_data, sparsity=0.5
+    )
+    onnx.checker.check_model(plain)
+    onnx.checker.check_model(wanda)
+
+    assert 0 not in _kept_columns(plain, "W0", wa)
+    assert 0 in _kept_columns(wanda, "W0", wa)
+    assert 0 not in _kept_columns(plain, "W1", wb)
+    assert 0 in _kept_columns(wanda, "W1", wb)
+
+
+def test_structured_pruning_matmul_concat_declines_on_positive_axis():
+    # `axis=1` on a 2-D [batch, C] tensor is numerically the same as
+    # `axis=-1`, but this pass never looks up a tensor's rank (see this
+    # section's own comment), so a positive axis is declined rather than
+    # guessed at -- left completely untouched, even though this particular
+    # instance would in fact have been safe.
+    K, Ca, Cb, Out = 8, 6, 4, 3
+    rng = np.random.default_rng(210)
+    wa = rng.standard_normal((K, Ca)).astype(np.float32)
+    wb = rng.standard_normal((K, Cb)).astype(np.float32)
+    wout = rng.standard_normal((Ca + Cb, Out)).astype(np.float32)
+    model = _matmul_concat_model([wa, wb], wout, axis=1)
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    np.testing.assert_array_equal(inits["W0"], wa)
+    np.testing.assert_array_equal(inits["W1"], wb)
+    np.testing.assert_array_equal(inits["WOUT"], wout)
+
+
+def test_structured_pruning_matmul_concat_declines_on_branch_fan_out():
+    # Branch a's own raw output feeds both the Concat node *and* a second
+    # graph output directly -- the same single-consumer safety bar every
+    # other hop in this pass holds every intermediate tensor to. The whole
+    # group is declined, branch b included, never partially pruned.
+    K, Ca, Cb, Out = 8, 6, 4, 3
+    rng = np.random.default_rng(211)
+    wa = rng.standard_normal((K, Ca)).astype(np.float32)
+    wb = rng.standard_normal((K, Cb)).astype(np.float32)
+    wout = rng.standard_normal((Ca + Cb, Out)).astype(np.float32)
+    model = _model(
+        f"""
+        g (float[batch,{K}] X) => (float[batch,{Out}] Y, float[batch,{Ca}] Extra)
+        {{
+          ha = MatMul(X, WA)
+          hb = MatMul(X, WB)
+          merged = Concat<axis=-1>(ha, hb)
+          Y = MatMul(merged, WOUT)
+          Extra = Identity(ha)
+        }}
+        """,
+        initializer=[_f32(wa, "WA"), _f32(wb, "WB"), _f32(wout, "WOUT")],
+    )
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    np.testing.assert_array_equal(inits["WA"], wa)
+    np.testing.assert_array_equal(inits["WB"], wb)
+    np.testing.assert_array_equal(inits["WOUT"], wout)
+
+
+def test_structured_pruning_matmul_concat_declines_on_graph_input_branch():
+    # One Concat operand is a graph input *directly* -- its only consumer is
+    # the Concat node itself (so it passes the single-consumer check), but
+    # it has no producing node at all, so the backward walk fails on that
+    # operand and the whole group (including the *other*, otherwise-
+    # prunable branch) is declined. X2 is a second, unrelated input so this
+    # doesn't also (accidentally) exercise the fan-out decline path above.
+    K, Cb, Out = 6, 4, 3
+    rng = np.random.default_rng(212)
+    wb = rng.standard_normal((K, Cb)).astype(np.float32)
+    wout = rng.standard_normal((K + Cb, Out)).astype(np.float32)
+    model = _model(
+        f"""
+        g (float[batch,{K}] X, float[batch,{K}] X2) => (float[batch,{Out}] Y)
+        {{
+          hb = MatMul(X2, WB)
+          merged = Concat<axis=-1>(X, hb)
+          Y = MatMul(merged, WOUT)
+        }}
+        """,
+        initializer=[_f32(wb, "WB"), _f32(wout, "WOUT")],
+    )
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    np.testing.assert_array_equal(inits["WB"], wb)
+    np.testing.assert_array_equal(inits["WOUT"], wout)
+
+
+def test_structured_pruning_matmul_concat_declines_on_residual_merge_branch():
+    # One Concat operand is itself an eligible Add-residual merge point's
+    # raw output -- composing a residual merge with a Concat merge on the
+    # same branch isn't verified (see this section's own comment): the
+    # backward walk's "add" outcome is declined exactly like "fail", so the
+    # whole group -- both the residual pair and the plain second branch --
+    # is left untouched.
+    K, C, Cb, Out = 8, 6, 4, 3
+    rng = np.random.default_rng(213)
+    wf = rng.standard_normal((K, C)).astype(np.float32)
+    ws = rng.standard_normal((K, C)).astype(np.float32)
+    wb = rng.standard_normal((K, Cb)).astype(np.float32)
+    wout = rng.standard_normal((C + Cb, Out)).astype(np.float32)
+    model = _model(
+        f"""
+        g (float[batch,{K}] X) => (float[batch,{Out}] Y)
+        {{
+          f = MatMul(X, WF)
+          s = MatMul(X, WS)
+          addr = Add(f, s)
+          hb = MatMul(X, WB)
+          merged = Concat<axis=-1>(addr, hb)
+          Y = MatMul(merged, WOUT)
+        }}
+        """,
+        initializer=[
+            _f32(wf, "WF"),
+            _f32(ws, "WS"),
+            _f32(wb, "WB"),
+            _f32(wout, "WOUT"),
+        ],
+    )
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    np.testing.assert_array_equal(inits["WF"], wf)
+    np.testing.assert_array_equal(inits["WS"], ws)
+    np.testing.assert_array_equal(inits["WB"], wb)
+    np.testing.assert_array_equal(inits["WOUT"], wout)
+
+
+def test_structured_pruning_matmul_concat_declines_on_duplicate_operand():
+    # Concat(h, h) -- the same tensor named twice as an operand of the same
+    # Concat node -- is degenerate (not two independent branches at all) and
+    # is declined outright.
+    K, C, Out = 8, 6, 3
+    rng = np.random.default_rng(214)
+    w1 = rng.standard_normal((K, C)).astype(np.float32)
+    wout = rng.standard_normal((2 * C, Out)).astype(np.float32)
+    model = _model(
+        f"""
+        g (float[batch,{K}] X) => (float[batch,{Out}] Y)
+        {{
+          h = MatMul(X, W1)
+          merged = Concat<axis=-1>(h, h)
+          Y = MatMul(merged, WOUT)
+        }}
+        """,
+        initializer=[_f32(w1, "W1"), _f32(wout, "WOUT")],
+    )
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    np.testing.assert_array_equal(inits["W1"], w1)
+    np.testing.assert_array_equal(inits["WOUT"], wout)
+
+
+def test_structured_pruning_conv_concat_prunes_each_branch_to_its_own_count():
+    Cin, Ca, Cb, Cout = 3, 10, 6, 4
+    rng = np.random.default_rng(215)
+    wa = rng.standard_normal((Ca, Cin, 3, 3)).astype(np.float32)
+    wb = rng.standard_normal((Cb, Cin, 3, 3)).astype(np.float32)
+    wout = rng.standard_normal((Cout, Ca + Cb, 3, 3)).astype(np.float32)
+    model = _conv_concat_model([wa, wb], wout)
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    inits = {t.name: t for t in pruned.graph.initializer}
+    assert list(inits["W0"].dims) == [5, Cin, 3, 3]
+    assert list(inits["W1"].dims) == [3, Cin, 3, 3]
+    assert list(inits["WOUT"].dims) == [Cout, 8, 3, 3]
+
+
+def test_structured_pruning_conv_concat_matches_oracle_no_cross_branch_coupling():
+    # The Conv analogue of the MatMul "no cross-branch coupling" test above
+    # -- branch a's filters scaled 10x branch b's; correct independent
+    # per-branch ranking keeps each branch's own top half regardless.
+    Cin, C, Cout = 3, 8, 4
+    rng = np.random.default_rng(216)
+    wa = rng.standard_normal((C, Cin, 3, 3)).astype(np.float32) * 10.0
+    wb = rng.standard_normal((C, Cin, 3, 3)).astype(np.float32)
+    wout = rng.standard_normal((Cout, 2 * C, 3, 3)).astype(np.float32)
+    model = _conv_concat_model([wa, wb], wout)
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    keep_a = _oracle_keep_indices_conv(wa, C // 2)
+    keep_b = _oracle_keep_indices_conv(wb, C // 2)
+    assert len(keep_b) == C // 2  # branch b kept its own top half, not starved to 0
+    global_keep = np.concatenate([keep_a, keep_b + C])
+
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    np.testing.assert_array_equal(inits["W0"], wa[keep_a])
+    np.testing.assert_array_equal(inits["W1"], wb[keep_b])
+    np.testing.assert_array_equal(inits["WOUT"], wout[:, global_keep])
+
+    oracle = _conv_concat_model([wa[keep_a], wb[keep_b]], wout[:, global_keep])
+    rng_x = np.random.default_rng(217)
+    x = rng_x.standard_normal((2, Cin, 10, 10)).astype(np.float32)
+    (y,) = _run(pruned, {"X": x})
+    (y_oracle,) = _run(oracle, {"X": x})
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-5, atol=1e-5)
+
+
+def test_structured_pruning_conv_concat_with_depthwise_pass_through_matches_oracle():
+    # Branch a crosses a depthwise Conv hop (self-consistently matched by
+    # _walk_conv_producer_backward, the exact same mechanism the Conv
+    # residual section already verifies) before reaching the Concat node --
+    # confirming the pass-through hop's own weight/bias/`group` slice by
+    # branch a's own local `keep`, not the global one. The depthwise hop
+    # uses a 1x1 kernel (spatial-preserving) so branch a's own spatial size
+    # after its own two Convs (10 -> 8, unchanged by the 1x1 hop) still
+    # lines up with branch b's single-Conv spatial size (10 -> 8) at the
+    # point they Concat -- a 3x3 depthwise hop would shrink branch a's own
+    # spatial size a second time and the two branches could no longer
+    # Concat at all.
+    Cin, Ca, Cb, Cout = 3, 8, 4, 5
+    rng = np.random.default_rng(218)
+    wa = rng.standard_normal((Ca, Cin, 3, 3)).astype(np.float32)
+    wd = rng.standard_normal((Ca, 1, 1, 1)).astype(np.float32)
+    bd = rng.standard_normal((Ca,)).astype(np.float32)
+    wb = rng.standard_normal((Cb, Cin, 3, 3)).astype(np.float32)
+    wout = rng.standard_normal((Cout, Ca + Cb, 3, 3)).astype(np.float32)
+    model = _model(
+        f"""
+        g (float[N,{Cin},10,10] X) => (float[N,{Cout},6,6] Y)
+        {{
+          ha = Conv<kernel_shape=[3,3]>(X, WA)
+          ra = Relu(ha)
+          da = Conv<kernel_shape=[1,1], group={Ca}>(ra, WD, BD)
+          hb = Conv<kernel_shape=[3,3]>(X, WB)
+          merged = Concat<axis=1>(da, hb)
+          Y = Conv<kernel_shape=[3,3]>(merged, WOUT)
+        }}
+        """,
+        initializer=[
+            _f32(wa, "WA"),
+            _f32(wd, "WD"),
+            _f32(bd, "BD"),
+            _f32(wb, "WB"),
+            _f32(wout, "WOUT"),
+        ],
+    )
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    keep_a = _oracle_keep_indices_conv(wa, Ca // 2)
+    keep_b = _oracle_keep_indices_conv(wb, Cb // 2)
+    global_keep = np.concatenate([keep_a, keep_b + Ca])
+
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    np.testing.assert_array_equal(inits["WD"], wd[keep_a])
+    np.testing.assert_array_equal(inits["BD"], bd[keep_a])
+    dw_node = next(n for n in pruned.graph.node if "WD" in n.input)
+    group_attr = next(a.i for a in dw_node.attribute if a.name == "group")
+    assert group_attr == Ca // 2
+
+    oracle = _model(
+        f"""
+        g (float[N,{Cin},10,10] X) => (float[N,{Cout},6,6] Y)
+        {{
+          ha = Conv<kernel_shape=[3,3]>(X, WA)
+          ra = Relu(ha)
+          da = Conv<kernel_shape=[1,1], group={Ca // 2}>(ra, WD, BD)
+          hb = Conv<kernel_shape=[3,3]>(X, WB)
+          merged = Concat<axis=1>(da, hb)
+          Y = Conv<kernel_shape=[3,3]>(merged, WOUT)
+        }}
+        """,
+        initializer=[
+            _f32(wa[keep_a], "WA"),
+            _f32(wd[keep_a], "WD"),
+            _f32(bd[keep_a], "BD"),
+            _f32(wb[keep_b], "WB"),
+            _f32(wout[:, global_keep], "WOUT"),
+        ],
+    )
+    rng_x = np.random.default_rng(219)
+    x = rng_x.standard_normal((2, Cin, 10, 10)).astype(np.float32)
+    (y,) = _run(pruned, {"X": x})
+    (y_oracle,) = _run(oracle, {"X": x})
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-5, atol=1e-5)
+
+
+def test_structured_wanda_pruning_conv_concat_matches_oracle():
+    Cin, Ca, Cb, Cout = 3, 6, 6, 4
+    rng = np.random.default_rng(220)
+    wa = rng.standard_normal((Ca, Cin, 3, 3)).astype(np.float32)
+    wb = rng.standard_normal((Cb, Cin, 3, 3)).astype(np.float32)
+    wa[: Ca // 2] *= 3.0
+    wb[: Cb // 2] *= 3.0
+    wout = rng.standard_normal((Cout, Ca + Cb, 3, 3)).astype(np.float32)
+    model = _conv_concat_model([wa, wb], wout)
+
+    probe_model = onnx.ModelProto()
+    probe_model.CopyFrom(model)
+    probe_model.graph.output.append(
+        onnx.helper.make_tensor_value_info("h0", onnx.TensorProto.FLOAT, None)
+    )
+    probe_model.graph.output.append(
+        onnx.helper.make_tensor_value_info("h1", onnx.TensorProto.FLOAT, None)
+    )
+
+    rng_cal = np.random.default_rng(221)
+    x_cal = rng_cal.standard_normal((4, Cin, 10, 10)).astype(np.float32)
+    calibration_data = [{"X": x_cal}]
+    _, h0_cal, h1_cal = _run(probe_model, {"X": x_cal})
+    norm_a = np.sqrt(np.mean(np.square(h0_cal.astype(np.float64)), axis=(0, 2, 3)))
+    norm_b = np.sqrt(np.mean(np.square(h1_cal.astype(np.float64)), axis=(0, 2, 3)))
+
+    pruned = onnxsim.apply_structured_wanda_pruning(
+        model, calibration_data=calibration_data, sparsity=0.5
+    )
+    onnx.checker.check_model(pruned)
+
+    imp_a = np.linalg.norm(wa.reshape(Ca, -1).astype(np.float64), axis=1) * np.maximum(
+        norm_a, 1e-8
+    )
+    imp_b = np.linalg.norm(wb.reshape(Cb, -1).astype(np.float64), axis=1) * np.maximum(
+        norm_b, 1e-8
+    )
+    keep_a = np.sort(np.argsort(-imp_a)[: Ca // 2])
+    keep_b = np.sort(np.argsort(-imp_b)[: Cb // 2])
+    global_keep = np.concatenate([keep_a, keep_b + Ca])
+    oracle = _conv_concat_model([wa[keep_a], wb[keep_b]], wout[:, global_keep])
+
+    rng_x = np.random.default_rng(222)
+    x = rng_x.standard_normal((2, Cin, 10, 10)).astype(np.float32)
+    (y,) = _run(pruned, {"X": x})
+    (y_oracle,) = _run(oracle, {"X": x})
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-5, atol=1e-5)
+
+
+def test_structured_pruning_conv_concat_declines_on_wrong_axis():
+    # axis=2 is a spatial axis, not the channel axis of [N, C, H, W] -- left
+    # completely untouched, same conservative decline as a positive-axis
+    # MatMul/Gemm Concat.
+    Cin, Ca, Cb, Cout = 3, 4, 4, 4
+    rng = np.random.default_rng(223)
+    wa = rng.standard_normal((Ca, Cin, 3, 3)).astype(np.float32)
+    wb = rng.standard_normal((Cb, Cin, 3, 3)).astype(np.float32)
+    wout = rng.standard_normal((Cout, Ca, 3, 3)).astype(np.float32)
+    model = _model(
+        f"""
+        g (float[N,{Cin},10,10] X) => (float[N,{Cout},14,6] Y)
+        {{
+          ha = Conv<kernel_shape=[3,3]>(X, WA)
+          hb = Conv<kernel_shape=[3,3]>(X, WB)
+          merged = Concat<axis=2>(ha, hb)
+          Y = Conv<kernel_shape=[3,3]>(merged, WOUT)
+        }}
+        """,
+        initializer=[_f32(wa, "WA"), _f32(wb, "WB"), _f32(wout, "WOUT")],
+    )
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    np.testing.assert_array_equal(inits["WA"], wa)
+    np.testing.assert_array_equal(inits["WB"], wb)
+    np.testing.assert_array_equal(inits["WOUT"], wout)
+
+
+def test_structured_pruning_conv_concat_declines_on_grouped_conv_consumer():
+    # The downstream consumer is a general grouped Conv -- declined the same
+    # way _find_conv_residual_chains declines one (see this section's own
+    # comment): the per-group top-k assumes every producer feeds the
+    # consumer's full channel range, which independently-pruned Concat
+    # branches don't establish.
+    Cin, Ca, Cb, Cout, group = 3, 4, 4, 8, 2
+    rng = np.random.default_rng(224)
+    wa = rng.standard_normal((Ca, Cin, 3, 3)).astype(np.float32)
+    wb = rng.standard_normal((Cb, Cin, 3, 3)).astype(np.float32)
+    wout = rng.standard_normal((Cout, (Ca + Cb) // group, 1, 1)).astype(np.float32)
+    model = _model(
+        f"""
+        g (float[N,{Cin},10,10] X) => (float[N,{Cout},8,8] Y)
+        {{
+          ha = Conv<kernel_shape=[3,3]>(X, WA)
+          hb = Conv<kernel_shape=[3,3]>(X, WB)
+          merged = Concat<axis=1>(ha, hb)
+          Y = Conv<kernel_shape=[1,1], group={group}>(merged, WOUT)
+        }}
+        """,
+        initializer=[_f32(wa, "WA"), _f32(wb, "WB"), _f32(wout, "WOUT")],
+    )
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    np.testing.assert_array_equal(inits["WA"], wa)
+    np.testing.assert_array_equal(inits["WB"], wb)
+    np.testing.assert_array_equal(inits["WOUT"], wout)
+
+
 # --- apply_structured_wanda_pruning ------------------------------------------
 
 
@@ -5069,6 +6134,264 @@ def test_gqa_wanda_pruning_falls_back_to_plain_with_no_calibration_batches():
         np.testing.assert_array_equal(inits_plain[name], inits_wanda[name])
 
 
+# --- apply_attention_head_pruning / _wanda_pruning -- GroupQueryAttention,
+# cross-attention (Q and K/V from genuinely different source tensors) ------
+#
+# See onnxsim/pruning.py's own "Attention-head pruning" section comment for
+# the full investigation this proves: GroupQueryAttention's matchers never
+# tie Q's own producer to K/V's own, so a real encoder/decoder pair (Q from
+# one graph input, K/V from a different one, with its own different feature
+# dimension) matches and prunes correctly -- oracle-verified here exactly
+# like every self-attention GroupQueryAttention test above. Sequence length
+# is kept equal between the two source tensors (a real onnxruntime
+# GroupQueryAttention CPU-kernel restriction confirmed empirically, not a
+# limitation this module's own matching/pruning logic adds -- see that same
+# section comment); the plain ai.onnx Attention cross-attention section
+# further below uses genuinely different sequence lengths too, since that
+# op's own kernel has no such restriction.
+
+
+def _gqa_cross_model(
+    K_dec=8,
+    K_enc=6,
+    H=4,
+    KVH=2,
+    D=8,
+    Out=6,
+    seed=0,
+    batch=2,
+    seq=5,
+    wq=None,
+    wk=None,
+    wv=None,
+    wout=None,
+):
+    rng = np.random.default_rng(seed)
+    Nq, Nkv = H * D, KVH * D
+    if wq is None:
+        wq = rng.standard_normal((K_dec, Nq)).astype(np.float32)
+    if wk is None:
+        wk = rng.standard_normal((K_enc, Nkv)).astype(np.float32)
+    if wv is None:
+        wv = rng.standard_normal((K_enc, Nkv)).astype(np.float32)
+    if wout is None:
+        wout = rng.standard_normal((Nq, Out)).astype(np.float32)
+
+    initializer = [
+        _f32(wq, "Wq"),
+        _f32(wk, "Wk"),
+        _f32(wv, "Wv"),
+        _f32(wout, "Wout"),
+        onnx.numpy_helper.from_array(
+            np.full((batch,), seq - 1, dtype=np.int32), "SeqLensK"
+        ),
+        onnx.numpy_helper.from_array(np.array(seq, dtype=np.int32), "TotalSeq"),
+    ]
+
+    body = f"""
+        g (float[{batch},{seq},{K_dec}] Xdec, float[{batch},{seq},{K_enc}] Xenc) => (float[{batch},{seq},{Out}] Y)
+        {{
+          q = MatMul(Xdec, Wq)
+          k = MatMul(Xenc, Wk)
+          v = MatMul(Xenc, Wv)
+          ctx, pk, pv = com.microsoft.GroupQueryAttention <num_heads={H}, kv_num_heads={KVH}> (q, k, v, , , SeqLensK, TotalSeq)
+          Y = MatMul(ctx, Wout)
+        }}
+        """
+
+    model = parser.parse_model(
+        f"""
+        <
+          ir_version: 10,
+          opset_import: ["": 17, "com.microsoft": 1]
+        >
+        {body}
+        """
+    )
+    model.graph.initializer.extend(initializer)
+    return model, dict(
+        K_dec=K_dec,
+        K_enc=K_enc,
+        H=H,
+        KVH=KVH,
+        D=D,
+        Out=Out,
+        Nq=Nq,
+        Nkv=Nkv,
+        wq=wq,
+        wk=wk,
+        wv=wv,
+        wout=wout,
+        batch=batch,
+        seq=seq,
+    )
+
+
+def _oracle_keep_groups_cross(
+    wq, wk, wv, num_heads, kv_num_heads, head_size, keep_count
+):
+    # Like `_oracle_keep_groups` above, but combines each KV group's Q/K/V
+    # block importance via sqrt(sum of squared per-block Frobenius norms)
+    # rather than norm(concatenate(...)) -- required once wq's own row count
+    # (Q's source tensor's own feature dimension) differs from wk's/wv's own
+    # (K/V's source tensor's own feature dimension), exactly the shape this
+    # helper is for. See `_gqa_group_importance`'s own updated comment in
+    # onnxsim/pruning.py for why the two formulas agree whenever
+    # concatenation is legal, and why only this one stays well-defined when
+    # it isn't.
+    group_size = num_heads // kv_num_heads
+    importance = np.zeros(kv_num_heads)
+    for kv in range(kv_num_heads):
+        q_block = np.concatenate(
+            [
+                wq[:, h * head_size : (h + 1) * head_size]
+                for h in range(kv * group_size, (kv + 1) * group_size)
+            ],
+            axis=1,
+        )
+        k_block = wk[:, kv * head_size : (kv + 1) * head_size]
+        v_block = wv[:, kv * head_size : (kv + 1) * head_size]
+        importance[kv] = np.sqrt(
+            np.linalg.norm(q_block) ** 2
+            + np.linalg.norm(k_block) ** 2
+            + np.linalg.norm(v_block) ** 2
+        )
+    return np.sort(np.argsort(-importance)[:keep_count])
+
+
+def test_gqa_pruning_cross_attention_matches_oracle_exactly():
+    # Without the `_gqa_group_importance` fix (concatenate-then-norm, which
+    # requires wq's row count to equal wk's/wv's own), this raises a bare
+    # numpy ValueError instead of reaching the assertions below -- K_dec=8 !=
+    # K_enc=6 here is deliberate.
+    model, cfg = _gqa_cross_model(K_dec=8, K_enc=6, H=8, KVH=2, D=8, Out=6, seed=20)
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    node = _gqa_node(pruned)
+    num_heads, kv_num_heads = _gqa_attrs(node)
+    group_size = cfg["H"] // cfg["KVH"]
+    assert kv_num_heads == 1  # max(1, 2 - round(2*0.5))
+    assert num_heads == kv_num_heads * group_size
+
+    keep_groups = _oracle_keep_groups_cross(
+        cfg["wq"], cfg["wk"], cfg["wv"], cfg["H"], cfg["KVH"], cfg["D"], kv_num_heads
+    )
+    keep_q_heads = _group_q_heads(keep_groups, group_size)
+    d = cfg["D"]
+    q_idx, kv_idx = _head_idx(keep_q_heads, d), _head_idx(keep_groups, d)
+
+    oracle, _ = _gqa_cross_model(
+        K_dec=cfg["K_dec"],
+        K_enc=cfg["K_enc"],
+        H=num_heads,
+        KVH=kv_num_heads,
+        D=d,
+        Out=cfg["Out"],
+        seed=20,
+        wq=cfg["wq"][:, q_idx],
+        wk=cfg["wk"][:, kv_idx],
+        wv=cfg["wv"][:, kv_idx],
+        wout=cfg["wout"][q_idx, :],
+        batch=cfg["batch"],
+        seq=cfg["seq"],
+    )
+
+    rng = np.random.default_rng(21)
+    xdec = rng.standard_normal((cfg["batch"], cfg["seq"], cfg["K_dec"])).astype(
+        np.float32
+    )
+    xenc = rng.standard_normal((cfg["batch"], cfg["seq"], cfg["K_enc"])).astype(
+        np.float32
+    )
+    (y_pruned,) = _run(pruned, {"Xdec": xdec, "Xenc": xenc})
+    (y_oracle,) = _run(oracle, {"Xdec": xdec, "Xenc": xenc})
+    np.testing.assert_allclose(y_pruned, y_oracle, rtol=1e-4, atol=1e-4)
+
+    # Sanity: Q and K/V really are independently sourced, not accidentally
+    # both reading the same tensor -- perturbing Xenc alone (Xdec held
+    # fixed) must still change the output.
+    (y_pruned2,) = _run(pruned, {"Xdec": xdec, "Xenc": xenc + 1.0})
+    assert not np.allclose(y_pruned, y_pruned2)
+
+
+def test_gqa_wanda_pruning_cross_attention_matches_oracle_exactly():
+    model, cfg = _gqa_cross_model(K_dec=8, K_enc=6, H=8, KVH=2, D=8, Out=6, seed=22)
+
+    rng = np.random.default_rng(23)
+    xdec_cal = rng.standard_normal((cfg["batch"], cfg["seq"], cfg["K_dec"])).astype(
+        np.float32
+    )
+    xenc_cal = rng.standard_normal((cfg["batch"], cfg["seq"], cfg["K_enc"])).astype(
+        np.float32
+    )
+    calibration_data = [{"Xdec": xdec_cal, "Xenc": xenc_cal}]
+
+    pruned = onnxsim.apply_attention_head_wanda_pruning(
+        model, calibration_data=calibration_data, sparsity=0.5
+    )
+    onnx.checker.check_model(pruned)
+
+    probe_model = onnx.ModelProto()
+    probe_model.CopyFrom(model)
+    probe_model.graph.output.append(onnx.ValueInfoProto(name="ctx"))
+    (_, ctx_cal) = _run(probe_model, {"Xdec": xdec_cal, "Xenc": xenc_cal})
+    act_norm = np.sqrt(np.mean(np.square(ctx_cal.astype(np.float64)), axis=(0, 1)))
+
+    d = cfg["D"]
+    group_size = cfg["H"] // cfg["KVH"]
+    importance = np.zeros(cfg["KVH"])
+    for kv in range(cfg["KVH"]):
+        q_block = np.concatenate(
+            [
+                cfg["wq"][:, h * d : (h + 1) * d]
+                for h in range(kv * group_size, (kv + 1) * group_size)
+            ],
+            axis=1,
+        )
+        k_block = cfg["wk"][:, kv * d : (kv + 1) * d]
+        v_block = cfg["wv"][:, kv * d : (kv + 1) * d]
+        base = np.sqrt(
+            np.linalg.norm(q_block) ** 2
+            + np.linalg.norm(k_block) ** 2
+            + np.linalg.norm(v_block) ** 2
+        )
+        act_group = np.linalg.norm(
+            act_norm[kv * group_size * d : (kv + 1) * group_size * d]
+        )
+        importance[kv] = base * max(act_group, 1e-8)
+    keep_groups = np.sort(np.argsort(-importance)[:1])  # max(1, 2 - round(2*0.5)) == 1
+
+    keep_q_heads = _group_q_heads(keep_groups, group_size)
+    q_idx, kv_idx = _head_idx(keep_q_heads, d), _head_idx(keep_groups, d)
+
+    oracle, _ = _gqa_cross_model(
+        K_dec=cfg["K_dec"],
+        K_enc=cfg["K_enc"],
+        H=len(keep_q_heads),
+        KVH=len(keep_groups),
+        D=d,
+        Out=cfg["Out"],
+        seed=22,
+        wq=cfg["wq"][:, q_idx],
+        wk=cfg["wk"][:, kv_idx],
+        wv=cfg["wv"][:, kv_idx],
+        wout=cfg["wout"][q_idx, :],
+        batch=cfg["batch"],
+        seq=cfg["seq"],
+    )
+
+    xdec = rng.standard_normal((cfg["batch"], cfg["seq"], cfg["K_dec"])).astype(
+        np.float32
+    )
+    xenc = rng.standard_normal((cfg["batch"], cfg["seq"], cfg["K_enc"])).astype(
+        np.float32
+    )
+    (y_pruned,) = _run(pruned, {"Xdec": xdec, "Xenc": xenc})
+    (y_oracle,) = _run(oracle, {"Xdec": xdec, "Xenc": xenc})
+    np.testing.assert_allclose(y_pruned, y_oracle, rtol=1e-4, atol=1e-4)
+
+
 def test_attention_head_pruning_handles_attention_and_gqa_in_one_model():
     # Regression check for _apply_attention_chains's per-chain-type
     # dispatch: a plain `Attention` block and a `GroupQueryAttention` block
@@ -5911,6 +7234,229 @@ def test_onnx_attention_wanda_pruning_falls_back_to_plain_with_no_calibration_ba
     }
     for name in inits_plain:
         np.testing.assert_array_equal(inits_plain[name], inits_wanda[name])
+
+
+# --- apply_attention_head_pruning / _wanda_pruning -- plain ai.onnx
+# Attention, cross-attention (Q and K/V from genuinely different source
+# tensors, at genuinely different sequence lengths) ------------------------
+#
+# Unlike GroupQueryAttention's own cross-attention section above (equal
+# sequence length only, an onnxruntime CPU-kernel restriction on that op --
+# see onnxsim/pruning.py's own "Attention-head pruning" section comment),
+# this op's own onnxruntime kernel has no such restriction (confirmed
+# empirically): `seq_q` and `seq_kv` genuinely differ below, exercising this
+# op's own schema doc ("For cross attention, query and key might have
+# different lengths") at full strength, oracle-verified via onnxruntime like
+# every other function in this module.
+
+
+def _onnx_attention_cross_model(
+    K_dec=8,
+    K_enc=6,
+    H=4,
+    KVH=2,
+    D=4,
+    Out=6,
+    seed=0,
+    batch=2,
+    seq_q=5,
+    seq_kv=7,
+    wq=None,
+    wk=None,
+    wv=None,
+    wout=None,
+):
+    rng = np.random.default_rng(seed)
+    Nq, Nkv = H * D, KVH * D
+    if wq is None:
+        wq = rng.standard_normal((K_dec, Nq)).astype(np.float32)
+    if wk is None:
+        wk = rng.standard_normal((K_enc, Nkv)).astype(np.float32)
+    if wv is None:
+        wv = rng.standard_normal((K_enc, Nkv)).astype(np.float32)
+    if wout is None:
+        wout = rng.standard_normal((Nq, Out)).astype(np.float32)
+
+    initializer = [_f32(wq, "Wq"), _f32(wk, "Wk"), _f32(wv, "Wv"), _f32(wout, "Wout")]
+
+    body = f"""
+        g (float[{batch},{seq_q},{K_dec}] Xdec, float[{batch},{seq_kv},{K_enc}] Xenc) => (float[{batch},{seq_q},{Out}] Y)
+        {{
+          q = MatMul(Xdec, Wq)
+          k = MatMul(Xenc, Wk)
+          v = MatMul(Xenc, Wv)
+          ctx = Attention <q_num_heads={H}, kv_num_heads={KVH}> (q, k, v)
+          Y = MatMul(ctx, Wout)
+        }}
+        """
+
+    model = parser.parse_model(
+        f"""
+        <
+          ir_version: 10,
+          opset_import: ["": 24]
+        >
+        {body}
+        """
+    )
+    model.graph.initializer.extend(initializer)
+    return model, dict(
+        K_dec=K_dec,
+        K_enc=K_enc,
+        H=H,
+        KVH=KVH,
+        D=D,
+        Out=Out,
+        Nq=Nq,
+        Nkv=Nkv,
+        wq=wq,
+        wk=wk,
+        wv=wv,
+        wout=wout,
+        batch=batch,
+        seq_q=seq_q,
+        seq_kv=seq_kv,
+    )
+
+
+def test_onnx_attention_pruning_cross_attention_matches_oracle_exactly():
+    # Without the `_gqa_group_importance` fix this shares with the
+    # GroupQueryAttention cross-attention test above, this raises a bare
+    # numpy ValueError instead of reaching the assertions below --
+    # K_dec=8 != K_enc=6 here is deliberate, and (unlike that test)
+    # seq_q=5 != seq_kv=7 too, since this op's own kernel allows it.
+    model, cfg = _onnx_attention_cross_model(
+        K_dec=8, K_enc=6, H=8, KVH=2, D=4, Out=6, seed=24
+    )
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    node = _onnx_attention_node(pruned)
+    q_num_heads, kv_num_heads = _onnx_attention_attrs(node)
+    group_size = cfg["H"] // cfg["KVH"]
+    assert kv_num_heads == 1  # max(1, 2 - round(2*0.5))
+    assert q_num_heads == kv_num_heads * group_size
+
+    keep_groups = _oracle_keep_groups_cross(
+        cfg["wq"], cfg["wk"], cfg["wv"], cfg["H"], cfg["KVH"], cfg["D"], kv_num_heads
+    )
+    keep_q_heads = _group_q_heads(keep_groups, group_size)
+    d = cfg["D"]
+    q_idx, kv_idx = _head_idx(keep_q_heads, d), _head_idx(keep_groups, d)
+
+    oracle, _ = _onnx_attention_cross_model(
+        K_dec=cfg["K_dec"],
+        K_enc=cfg["K_enc"],
+        H=q_num_heads,
+        KVH=kv_num_heads,
+        D=d,
+        Out=cfg["Out"],
+        seed=24,
+        wq=cfg["wq"][:, q_idx],
+        wk=cfg["wk"][:, kv_idx],
+        wv=cfg["wv"][:, kv_idx],
+        wout=cfg["wout"][q_idx, :],
+        batch=cfg["batch"],
+        seq_q=cfg["seq_q"],
+        seq_kv=cfg["seq_kv"],
+    )
+
+    rng = np.random.default_rng(25)
+    xdec = rng.standard_normal((cfg["batch"], cfg["seq_q"], cfg["K_dec"])).astype(
+        np.float32
+    )
+    xenc = rng.standard_normal((cfg["batch"], cfg["seq_kv"], cfg["K_enc"])).astype(
+        np.float32
+    )
+    (y_pruned,) = _run(pruned, {"Xdec": xdec, "Xenc": xenc})
+    (y_oracle,) = _run(oracle, {"Xdec": xdec, "Xenc": xenc})
+    np.testing.assert_allclose(y_pruned, y_oracle, rtol=1e-4, atol=1e-4)
+
+    # Sanity: Q and K/V really are independently sourced, at genuinely
+    # different sequence lengths -- perturbing Xenc alone (Xdec held fixed)
+    # must still change the output.
+    (y_pruned2,) = _run(pruned, {"Xdec": xdec, "Xenc": xenc + 1.0})
+    assert not np.allclose(y_pruned, y_pruned2)
+
+
+def test_onnx_attention_wanda_pruning_cross_attention_matches_oracle_exactly():
+    model, cfg = _onnx_attention_cross_model(
+        K_dec=8, K_enc=6, H=8, KVH=2, D=4, Out=6, seed=26
+    )
+
+    rng = np.random.default_rng(27)
+    xdec_cal = rng.standard_normal((cfg["batch"], cfg["seq_q"], cfg["K_dec"])).astype(
+        np.float32
+    )
+    xenc_cal = rng.standard_normal((cfg["batch"], cfg["seq_kv"], cfg["K_enc"])).astype(
+        np.float32
+    )
+    calibration_data = [{"Xdec": xdec_cal, "Xenc": xenc_cal}]
+
+    pruned = onnxsim.apply_attention_head_wanda_pruning(
+        model, calibration_data=calibration_data, sparsity=0.5
+    )
+    onnx.checker.check_model(pruned)
+
+    probe_model = onnx.ModelProto()
+    probe_model.CopyFrom(model)
+    probe_model.graph.output.append(onnx.ValueInfoProto(name="ctx"))
+    (_, ctx_cal) = _run(probe_model, {"Xdec": xdec_cal, "Xenc": xenc_cal})
+    act_norm = np.sqrt(np.mean(np.square(ctx_cal.astype(np.float64)), axis=(0, 1)))
+
+    d = cfg["D"]
+    group_size = cfg["H"] // cfg["KVH"]
+    importance = np.zeros(cfg["KVH"])
+    for kv in range(cfg["KVH"]):
+        q_block = np.concatenate(
+            [
+                cfg["wq"][:, h * d : (h + 1) * d]
+                for h in range(kv * group_size, (kv + 1) * group_size)
+            ],
+            axis=1,
+        )
+        k_block = cfg["wk"][:, kv * d : (kv + 1) * d]
+        v_block = cfg["wv"][:, kv * d : (kv + 1) * d]
+        base = np.sqrt(
+            np.linalg.norm(q_block) ** 2
+            + np.linalg.norm(k_block) ** 2
+            + np.linalg.norm(v_block) ** 2
+        )
+        act_group = np.linalg.norm(
+            act_norm[kv * group_size * d : (kv + 1) * group_size * d]
+        )
+        importance[kv] = base * max(act_group, 1e-8)
+    keep_groups = np.sort(np.argsort(-importance)[:1])  # max(1, 2 - round(2*0.5)) == 1
+
+    keep_q_heads = _group_q_heads(keep_groups, group_size)
+    q_idx, kv_idx = _head_idx(keep_q_heads, d), _head_idx(keep_groups, d)
+
+    oracle, _ = _onnx_attention_cross_model(
+        K_dec=cfg["K_dec"],
+        K_enc=cfg["K_enc"],
+        H=len(keep_q_heads),
+        KVH=len(keep_groups),
+        D=d,
+        Out=cfg["Out"],
+        seed=26,
+        wq=cfg["wq"][:, q_idx],
+        wk=cfg["wk"][:, kv_idx],
+        wv=cfg["wv"][:, kv_idx],
+        wout=cfg["wout"][q_idx, :],
+        batch=cfg["batch"],
+        seq_q=cfg["seq_q"],
+        seq_kv=cfg["seq_kv"],
+    )
+
+    xdec = rng.standard_normal((cfg["batch"], cfg["seq_q"], cfg["K_dec"])).astype(
+        np.float32
+    )
+    xenc = rng.standard_normal((cfg["batch"], cfg["seq_kv"], cfg["K_enc"])).astype(
+        np.float32
+    )
+    (y_pruned,) = _run(pruned, {"Xdec": xdec, "Xenc": xenc})
+    (y_oracle,) = _run(oracle, {"Xdec": xdec, "Xenc": xenc})
+    np.testing.assert_allclose(y_pruned, y_oracle, rtol=1e-4, atol=1e-4)
 
 
 def test_attention_head_pruning_handles_all_three_attention_op_types_in_one_model():
