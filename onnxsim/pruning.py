@@ -4798,6 +4798,18 @@ def _slice_last_axis(init: onnx.TensorProto, keep: np.ndarray) -> None:
     init.CopyFrom(onnx.numpy_helper.from_array(new, name=init.name))
 
 
+def _slice_axis1(init: onnx.TensorProto, keep: np.ndarray) -> None:
+    """Slices a rank-4 BNSH-format constant (a `past_key`/`past_value`
+    initializer -- see :func:`_past_kv_constants_are_sliceable`) along its
+    `kv_num_heads` axis (axis 1) by `keep`. Unlike :func:`_slice_last_axis`,
+    the axis being sliced here is never the last one -- BNSH's last axis is
+    `head_size`/`v_head_size`, untouched by a KV-group drop.
+    """
+    arr = onnx.numpy_helper.to_array(init)
+    new = np.take(arr, keep, axis=1)
+    init.CopyFrom(onnx.numpy_helper.from_array(new, name=init.name))
+
+
 def _plain_structured_importance(
     chain: _Chain, w_arrays_nk: List[np.ndarray]
 ) -> np.ndarray:
@@ -5445,10 +5457,15 @@ def apply_structured_wanda_pruning(
 #   head's own K/V column block, together with every query head mapped to
 #   it) is ever removed at once, ranked by the combined importance of the
 #   group's whole Q+K+V block -- see :func:`_apply_one_gqa_chain` and
-#   :func:`_gqa_group_importance`. A non-empty constant past-KV-cache input
-#   (which would itself need slicing along the `kv_num_heads` axis) or a
+#   :func:`_gqa_group_importance`. A connected `past_key`/`past_value` that
+#   is a constant of the expected float BNSH shape (see
+#   :func:`_past_kv_constants_are_sliceable`) is sliced along its own
+#   `kv_num_heads` axis by the same `keep_groups` index set used for K's/V's
+#   own producer weights; one of any other shape/dtype (a quantized cache,
+#   most notably -- its own `k_scale`/`v_scale` tensors would need identical
+#   slicing to stay consistent, which this module makes no attempt at), or a
 #   packed-QKV/missing-required-input node this module cannot prove safe to
-#   leave alone is declined outright -- see :func:`_match_gqa_producer`.
+#   leave alone, is declined outright -- see :func:`_match_gqa_producer`.
 # - the plain ``ai.onnx`` `Attention` (opset 24+, domain ``""``, schema
 #   confirmed against this environment's installed ``onnx==1.22.0`` via
 #   ``onnx.defs.get_schema("Attention", domain="")`` -- it is fully defined
@@ -5468,15 +5485,24 @@ def apply_structured_wanda_pruning(
 #   :class:`_GQAChain` carries which attribute name to write back
 #   (`num_heads_attr`); (2) it schema-allows V its own `head_size`
 #   independent of Q/K's (confirmed via the op's own backend test suite,
-#   e.g. ``test_attention_3d_diff_heads_sizes``) -- since
-#   :func:`_apply_one_gqa_chain`'s shared slicing assumes one uniform
-#   `head_size` the way `fuse_gqa.h` itself requires, a node whose V head
-#   size actually differs is declined rather than mis-sliced; (3) its
-#   optional `attn_mask`/`past_key`/`past_value` inputs (a different set
-#   from `GroupQueryAttention`'s own `past_key`/`past_value`/`seqlens_k`/
-#   `total_sequence_length`/`cos_cache`/`sin_cache`) get the same
-#   non-empty-constant-is-declined, dynamic-is-left-alone treatment
-#   :func:`_match_gqa_producer` already applies -- see
+#   e.g. ``test_attention_3d_diff_heads_sizes``), which `GroupQueryAttention`
+#   itself can never have (`fuse_gqa.h` requires equal Q/K/V head_size before
+#   it will even fuse a node) -- :class:`_GQAChain` carries Q's/K's shared
+#   `head_size` and V's own (possibly different) `v_head_size` as two
+#   separate fields, and :func:`_apply_one_gqa_chain`'s shared slicing uses
+#   whichever of the two actually applies to each tensor it touches (see
+#   that function's own docstring and :func:`_find_separate_qkv_chains`'s
+#   own `allow_differing_v_head_size` parameter, `False` for
+#   `GroupQueryAttention`, `True` here); (3) its optional `attn_mask` input
+#   (a mask this pass makes no attempt to slice, since doing so correctly
+#   would require resolving its own broadcast shape against the new
+#   `q_num_heads`) gets the same non-empty-constant-is-declined,
+#   dynamic-is-left-alone treatment as before, while its `past_key`/
+#   `past_value` (a different pair of input indices from
+#   `GroupQueryAttention`'s own `past_key`/`past_value`/`seqlens_k`/
+#   `total_sequence_length`/`cos_cache`/`sin_cache`) share
+#   :func:`_match_gqa_producer`'s own updated treatment via the same
+#   :func:`_past_kv_constants_are_sliceable` -- see
 #   :func:`_match_onnx_attention_producer`. Verified here via actual
 #   execution (``onnx.checker`` plus onnxruntime, both of which handle this
 #   op in this environment -- see ``tests/test_pruning.py``'s own "plain
@@ -5550,14 +5576,18 @@ def apply_structured_wanda_pruning(
 #   onnxruntime (1.29.0) CPU kernel requires Q's and K/V's sequence length
 #   to match unless a non-empty `past_key`/`past_value` is also supplied --
 #   confirmed empirically, not merely read off the schema doc, which
-#   promises cross-attention support without mentioning this -- and a
-#   non-empty constant `past_key`/`past_value` is already a shape
-#   :func:`_match_gqa_producer` declines outright (see its own docstring).
-#   A single-call `GroupQueryAttention` cross-attention model with a
-#   genuinely different K/V sequence length therefore isn't a topology this
-#   module ever has the chance to match in the first place -- an
-#   onnxruntime-kernel-level restriction on the op itself, not a limitation
-#   this module's own matching or pruning logic adds. The plain ``ai.onnx``
+#   promises cross-attention support without mentioning this. A non-empty
+#   constant `past_key`/`past_value` is, since the KV-cache-slicing fix
+#   above, no longer declined outright purely for being non-empty (see
+#   :func:`_past_kv_constants_are_sliceable`) -- but this module's own
+#   cross-attention support was verified only for the ordinary
+#   ``past_key``/``past_value``-omitted case (see the tests referenced
+#   above); a single-call cross-attention model additionally relying on a
+#   non-empty `past_key`/`past_value` specifically to satisfy this
+#   onnxruntime-kernel-level sequence-length restriction was not
+#   separately re-verified and remains untested here -- an
+#   onnxruntime-kernel-level restriction on the op itself either way, not a
+#   limitation this module's own matching or pruning logic adds. The plain ``ai.onnx``
 #   `Attention` op has no such restriction (also confirmed empirically): its
 #   cross-attention test below uses genuinely different Q/K-V sequence
 #   lengths (as well as different source tensors and different feature
@@ -5596,6 +5626,18 @@ class _GQAChain:
     num_heads: int
     kv_num_heads: int
     head_size: int
+    # V's own head_size -- equal to `head_size` for every `GroupQueryAttention`
+    # chain (`fuse_gqa.h` requires `q_head_size == k_head_size == v_head_size`
+    # before it will even fuse the op, confirmed by reading that requirement
+    # directly off `fuse_gqa.h` itself), but can genuinely differ for a plain
+    # ``ai.onnx::Attention`` chain -- that op's own schema gives V an
+    # independent `v_head_size` distinct from Q/K's shared `head_size` (see
+    # :func:`_match_onnx_attention_producer`'s own docstring and this
+    # module's "Attention-head pruning" section comment). Every place that
+    # slices/sizes something on Q's or K's own side (`.head_size`) versus
+    # V's or the output-projection's own side (`.v_head_size`) needs to pick
+    # the right one of these two fields -- see :func:`_apply_one_gqa_chain`.
+    v_head_size: int
     chain_ops: Tuple[Tuple[onnx.NodeProto, Optional[str]], ...]
     consumer_node: onnx.NodeProto
     consumer_weight: str
@@ -5811,6 +5853,63 @@ def _find_attention_chains(graph: onnx.GraphProto) -> List[_AttentionChain]:
     return chains
 
 
+def _past_kv_constants_are_sliceable(
+    node: onnx.NodeProto,
+    initializer_map: Dict[str, onnx.TensorProto],
+    indices: Tuple[int, int],
+    kv_num_heads: int,
+) -> bool:
+    """Shared safety gate for a matched node's optional `past_key`/
+    `past_value` inputs (at `indices`, a `(past_key_idx, past_value_idx)`
+    pair -- ``(3, 4)`` for `GroupQueryAttention`, ``(4, 5)`` for the plain
+    ``ai.onnx::Attention`` op), used by both :func:`_match_gqa_producer` and
+    :func:`_match_onnx_attention_producer`.
+
+    Both ops' own schemas lay a connected `past_key`/`past_value` out in
+    BNSH format -- ``(batch_size, kv_num_heads, past_sequence_length,
+    head_size_or_v_head_size)`` (`GroupQueryAttention`'s own contrib-op
+    schema doc, `onnxruntime.capi.onnxruntime_pybind11_state
+    .get_all_operator_schema()`'s "Cache Format" section: "The past and
+    present KV cache tensors are expected in a BNSH format: (batch_size,
+    num_heads, cache_sequence_length, head_size)"; the plain ai.onnx op's
+    own schema doc, `onnx.defs.get_schema("Attention", domain="")`, names
+    the same axis order for its own `past_key`/`past_value` inputs) -- so
+    the `kv_num_heads` axis sits at axis 1 of a rank-4 tensor, exactly the
+    axis :func:`_apply_one_gqa_chain`'s own `keep_groups` index set already
+    selects along K's/V's own producer weight. A *dynamic* (non-constant)
+    past_key/past_value -- an ordinary graph input or intermediate
+    activation, not a weight -- is always left alone and never blocks a
+    match: it is the caller's own runtime data, not something this rewrite
+    could corrupt by leaving untouched, the same reasoning that already
+    applied before this function existed. A *constant* one is declined
+    (this function returns ``False``, and the caller's whole match fails)
+    only when its shape/dtype isn't confidently this exact layout -- not
+    FLOAT, not rank 4, or its axis-1 length doesn't already match
+    `kv_num_heads` -- rather than guessed at; this also declines a
+    quantized KV cache (`float8e4m3fn`/`uint8`/`int8`, both ops' schemas
+    allow for `past_key`/`past_value` specifically to shrink KV-cache
+    memory) outright, since a quantized cache's own `k_scale`/`v_scale`
+    tensors would need identical per-KV-head-axis slicing to stay
+    consistent and this function makes no attempt to locate or slice them.
+    Otherwise (a constant of the expected float BNSH shape, or none
+    connected at all) returns ``True`` -- :func:`_apply_one_gqa_chain`
+    itself performs the actual axis-1 slice once a match succeeds.
+    """
+    for idx in indices:
+        if len(node.input) <= idx or not node.input[idx]:
+            continue
+        past_init = initializer_map.get(node.input[idx])
+        if past_init is None:
+            continue  # dynamic -- the caller's own runtime data, left alone
+        if (
+            past_init.data_type != onnx.TensorProto.FLOAT
+            or len(past_init.dims) != 4
+            or past_init.dims[1] != kv_num_heads
+        ):
+            return False  # not a shape/dtype this function can safely slice
+    return True
+
+
 def _match_gqa_producer(
     node: onnx.NodeProto, initializer_map: Dict[str, onnx.TensorProto]
 ) -> Optional[Tuple[int, int]]:
@@ -5826,20 +5925,15 @@ def _match_gqa_producer(
     need touching themselves -- their presence is checked only as a sign
     this is a real, complete GQA node rather than a partially-constructed
     one); `num_heads`/`kv_num_heads` attributes with `num_heads` a positive
-    multiple of `kv_num_heads`; and, for each of the optional `past_key`/
-    `past_value` inputs (indices 3/4) that is actually connected, that it
-    is *not* a non-empty constant -- such a tensor holds real per-KV-head
-    cache data laid out along the `kv_num_heads` axis this function would
-    need to slice but doesn't attempt to, so a node with one is declined
-    outright rather than pruned incorrectly. A *dynamic* (non-constant)
-    past_key/past_value -- an ordinary graph input or intermediate
-    activation, not a weight -- is left alone and does not block the match:
-    it is the caller's own runtime data, not something this rewrite could
-    corrupt by leaving untouched. cos_cache/sin_cache (indices 7/8, for
-    rotary position embedding), if present, are also always left alone:
-    both are `[max_sequence_length, rotary_dim/2]`, broadcast identically
-    across every head, so a head/group count change can never invalidate
-    them.
+    multiple of `kv_num_heads`; and a `past_key`/`past_value` (indices 3/4)
+    this module can safely act on, per
+    :func:`_past_kv_constants_are_sliceable` -- a constant one is sliced
+    along its own `kv_num_heads` axis by :func:`_apply_one_gqa_chain`, using
+    exactly the same `keep_groups` index set K's/V's own producer weights
+    are sliced by. cos_cache/sin_cache (indices 7/8, for rotary position
+    embedding), if present, are always left alone regardless: both are
+    `[max_sequence_length, rotary_dim/2]`, broadcast identically across
+    every head, so a head/group count change can never invalidate them.
     """
     if node.domain != _ATTENTION_DOMAIN or node.op_type != "GroupQueryAttention":
         return None
@@ -5857,12 +5951,10 @@ def _match_gqa_producer(
     if num_heads % kv_num_heads != 0:
         return None
 
-    for idx in (3, 4):  # past_key, past_value
-        if len(node.input) <= idx or not node.input[idx]:
-            continue
-        past_init = initializer_map.get(node.input[idx])
-        if past_init is not None and int(np.prod(past_init.dims)) > 0:
-            return None  # non-empty KV-cache constant -- would need slicing
+    if not _past_kv_constants_are_sliceable(
+        node, initializer_map, (3, 4), kv_num_heads
+    ):
+        return None
 
     return num_heads, kv_num_heads
 
@@ -5893,17 +5985,26 @@ def _match_onnx_attention_producer(
     attributes for, so a node relying on rank-4-inferred head counts isn't
     a shape this pass tracks and is declined rather than guessed at.
 
-    The optional `attn_mask`/`past_key`/`past_value` inputs (indices 3/4/5
-    -- a different set from `GroupQueryAttention`'s own, and this op has no
-    `seqlens_k`/`total_sequence_length` equivalent to require) get the same
-    treatment :func:`_match_gqa_producer` gives `past_key`/`past_value`:
-    each is declined outright if it is connected to a non-empty constant
-    (real per-head mask or KV-cache data this function doesn't attempt to
-    slice), but left alone -- and does not block the match -- if dynamic
-    (an ordinary graph input or intermediate activation, the caller's own
-    runtime data). `nonpad_kv_seqlen` (index 6), like `GroupQueryAttention`'s
-    own `seqlens_k`, is `[batch_size]`-shaped and independent of head count,
-    so its presence never blocks a match either.
+    The optional `attn_mask` input (index 3) is declined outright if it is
+    connected to a non-empty constant (real per-head mask data broadcastable
+    to a `q_num_heads`-sized axis -- unlike `past_key`/`past_value` below,
+    slicing this correctly would require resolving its own broadcast shape
+    against the new `q_num_heads`, which this function makes no attempt at),
+    but left alone -- and does not block the match -- if dynamic (an
+    ordinary graph input or intermediate activation, the caller's own
+    runtime data). The optional `past_key`/`past_value` inputs (indices
+    4/5 -- a different pair of indices from `GroupQueryAttention`'s own 3/4,
+    and this op has no `seqlens_k`/`total_sequence_length` equivalent to
+    require) get the same safety gate :func:`_match_gqa_producer` gives its
+    own `past_key`/`past_value`, via the same shared
+    :func:`_past_kv_constants_are_sliceable` -- a constant one of the
+    expected float BNSH shape is sliced along its own `kv_num_heads` axis by
+    :func:`_apply_one_gqa_chain`, using the same `keep_groups` index set
+    K's/V's own producer weights are sliced by; one of any other shape/dtype
+    declines the whole match, and a dynamic one is left alone as always.
+    `nonpad_kv_seqlen` (index 6), like `GroupQueryAttention`'s own
+    `seqlens_k`, is `[batch_size]`-shaped and independent of head count, so
+    its presence never blocks a match either.
     """
     if node.domain != "" or node.op_type != "Attention":
         return None
@@ -5921,12 +6022,15 @@ def _match_onnx_attention_producer(
     if q_num_heads % kv_num_heads != 0:
         return None
 
-    for idx in (3, 4, 5):  # attn_mask, past_key, past_value
-        if len(node.input) <= idx or not node.input[idx]:
-            continue
-        const_init = initializer_map.get(node.input[idx])
-        if const_init is not None and int(np.prod(const_init.dims)) > 0:
-            return None  # non-empty constant -- would need slicing
+    if len(node.input) > 3 and node.input[3]:  # attn_mask
+        mask_init = initializer_map.get(node.input[3])
+        if mask_init is not None and int(np.prod(mask_init.dims)) > 0:
+            return None  # non-empty constant mask -- would need slicing
+
+    if not _past_kv_constants_are_sliceable(
+        node, initializer_map, (4, 5), kv_num_heads
+    ):
+        return None
 
     return q_num_heads, kv_num_heads
 
@@ -5935,6 +6039,7 @@ def _find_separate_qkv_chains(
     graph: onnx.GraphProto,
     match_producer,
     num_heads_attr: str,
+    allow_differing_v_head_size: bool = False,
 ) -> List[_GQAChain]:
     """Shared body for :func:`_find_gqa_chains` and
     :func:`_find_onnx_attention_chains`: both match a fused attention node
@@ -5943,9 +6048,14 @@ def _find_separate_qkv_chains(
     ``com.microsoft::Attention``) and prune it at whole-KV-group granularity
     (see :func:`_apply_one_gqa_chain`/:func:`_gqa_group_importance`),
     differing only in which node/attributes `match_producer` recognizes
-    (:func:`_match_gqa_producer` or :func:`_match_onnx_attention_producer`)
-    and which attribute on the matched node holds the query head count
-    (`num_heads_attr` -- see :class:`_GQAChain`'s own field of that name).
+    (:func:`_match_gqa_producer` or :func:`_match_onnx_attention_producer`),
+    which attribute on the matched node holds the query head count
+    (`num_heads_attr` -- see :class:`_GQAChain`'s own field of that name),
+    and whether V's own head_size is allowed to differ from Q/K's shared one
+    (`allow_differing_v_head_size` -- ``False`` for `GroupQueryAttention`,
+    which `fuse_gqa.h` never emits with anything but equal Q/K/V head_size,
+    ``True`` for the plain ai.onnx op, whose schema genuinely allows it; see
+    :class:`_GQAChain`'s own `v_head_size` field).
     """
     initializer_map = {t.name: t for t in graph.initializer}
     consumers_of = _consumers_of(graph)
@@ -5995,35 +6105,42 @@ def _find_separate_qkv_chains(
         ):
             continue
         head_size = nq // num_heads
-        if (
-            head_size <= 0
-            or nk // kv_num_heads != head_size
-            or nv // kv_num_heads != head_size
-        ):
-            # `fuse_gqa.h` requires equal Q/K/V head_size, and this is the
-            # same restriction :func:`_match_onnx_attention_producer`'s own
-            # docstring narrows the plain ai.onnx op's own, more permissive
-            # schema down to (that op genuinely allows V its own head_size,
-            # see this module's "Attention-head pruning" section comment) --
-            # a node whose V head size actually differs is declined here
-            # rather than mis-sliced by this shared, uniform-head_size body.
+        v_head_size = nv // kv_num_heads
+        if head_size <= 0 or v_head_size <= 0 or nk // kv_num_heads != head_size:
+            # Q's and K's own head_size must always agree -- required by the
+            # QK^T dot product itself (both ops' schemas name a single
+            # shared `head_size` for Q/K, distinct from V's own), not a
+            # restriction this pass adds, so a mismatch here is declined
+            # regardless of `allow_differing_v_head_size`.
+            continue
+        if not allow_differing_v_head_size and v_head_size != head_size:
+            # `fuse_gqa.h` requires equal Q/K/V head_size before it will
+            # even fuse a `GroupQueryAttention` node (confirmed by reading
+            # that requirement directly off `fuse_gqa.h` itself: `q_head_size
+            # != k_head_size || q_head_size != v_head_size` is one of its own
+            # fusion-declining conditions) -- a `GroupQueryAttention` node
+            # whose V head size actually differs is declined here rather
+            # than mis-sliced, since no real GQA node could ever have one.
             continue
 
         out_name = node.output[0]
         if not _is_internal(out_name):
             continue
 
-        # Both matched ops' raw output is Nq (= num_heads * head_size) wide
-        # -- unlike plain `com.microsoft::Attention` (V-hidden-size-wide),
-        # each is head-count-and-size symmetric with the query side (per
-        # fuse_gqa.h's own "Y = GroupQueryAttention(...)" shape comment, and
-        # -- since this function only ever matches the equal-head_size case
-        # above -- the ai.onnx op's own "q_num_heads * head_size_v" output
-        # width, see its reference kernel) -- so
-        # `_walk_to_attention_consumer`'s generic "raw output width"
-        # parameter is passed `nq` here, not an analogue of `nv`.
+        # The raw output is always `num_heads * v_head_size` wide -- unlike
+        # plain `com.microsoft::Attention` (whose own raw-output-width
+        # parameter this same helper takes is named `nv` generically), both
+        # matched ops here size their output per *query* head but with
+        # *V's* own per-head width (`fuse_gqa.h`'s own "Y =
+        # GroupQueryAttention(...)" shape comment; the ai.onnx op's own
+        # "hidden_size = q_num_heads * v_head_size" 3D output shape, see its
+        # schema doc) -- equal to `nq` exactly when `v_head_size ==
+        # head_size` (always true for `GroupQueryAttention`; not required
+        # for the plain ai.onnx op once `allow_differing_v_head_size` lets
+        # it differ).
+        raw_out_width = num_heads * v_head_size
         consumer, chain_ops = _walk_to_attention_consumer(
-            out_name, initializer_map, consumers_of, graph_outputs, nq
+            out_name, initializer_map, consumers_of, graph_outputs, raw_out_width
         )
         if consumer is None:
             continue
@@ -6043,6 +6160,7 @@ def _find_separate_qkv_chains(
                 num_heads=num_heads,
                 kv_num_heads=kv_num_heads,
                 head_size=head_size,
+                v_head_size=v_head_size,
                 chain_ops=chain_ops,
                 consumer_node=consumer[0],
                 consumer_weight=consumer[1],
@@ -6061,10 +6179,16 @@ def _find_onnx_attention_chains(graph: onnx.GraphProto) -> List[_GQAChain]:
     """The plain ``ai.onnx::Attention`` analogue of :func:`_find_gqa_chains`
     -- see :func:`_find_separate_qkv_chains` (the shared body) and
     :func:`_match_onnx_attention_producer` (what's matched and why it's
-    declined otherwise).
+    declined otherwise). Passes ``allow_differing_v_head_size=True``: unlike
+    `GroupQueryAttention`, this op's own schema genuinely allows V its own
+    `v_head_size` independent of Q/K's shared `head_size` (see
+    :class:`_GQAChain`'s own `v_head_size` field).
     """
     return _find_separate_qkv_chains(
-        graph, _match_onnx_attention_producer, "q_num_heads"
+        graph,
+        _match_onnx_attention_producer,
+        "q_num_heads",
+        allow_differing_v_head_size=True,
     )
 
 
@@ -6132,7 +6256,16 @@ def _gqa_group_importance(
     # concatenate-based form would raise a bare ``ValueError`` from numpy
     # the moment it ran on such a model, crashing the whole pruning call
     # instead of ranking it.
+    #
+    # `d`/`dv` similarly needn't agree: `d` (`chain.head_size`) is Q's and
+    # K's own shared per-head column width in their own producer weights,
+    # `dv` (`chain.v_head_size`) is V's own -- equal for every
+    # `GroupQueryAttention` chain, but not necessarily for a plain
+    # ai.onnx `Attention` chain (see :class:`_GQAChain`'s own `v_head_size`
+    # field) -- so `v_block`'s own column stride into `wv` must use `dv`,
+    # not `d`.
     d = chain.head_size
+    dv = chain.v_head_size
     group_size = chain.num_heads // chain.kv_num_heads
     importance = np.zeros(chain.kv_num_heads, dtype=np.float64)
     for kv in range(chain.kv_num_heads):
@@ -6144,7 +6277,7 @@ def _gqa_group_importance(
             axis=1,
         )
         k_block = wk[:, kv * d : (kv + 1) * d]
-        v_block = wv[:, kv * d : (kv + 1) * d]
+        v_block = wv[:, kv * dv : (kv + 1) * dv]
         importance[kv] = np.sqrt(
             np.linalg.norm(q_block) ** 2
             + np.linalg.norm(k_block) ** 2
@@ -6239,14 +6372,23 @@ def _apply_one_gqa_chain(
     or plain ``ai.onnx::Attention`` block (see :class:`_GQAChain`'s own
     `num_heads_attr` field for how the two are told apart when writing the
     new query head count back) in place: every dropped group removes one
-    *contiguous* ``head_size``-wide column block from each of K's and V's
-    own separate weights, together with the ``num_heads / kv_num_heads``
-    query-head-sized blocks mapped to that group from Q's own separate
-    weight (and the matching row block from the consumer) -- never an
-    individual query head in isolation. Returns
-    ``(producer_weight_names, consumer_weight_name, stale_output_names)`` on
-    success, or ``None`` if `sparsity` rounds to no groups dropped for this
-    block (a no-op, left for the caller to skip).
+    *contiguous* ``head_size``-wide column block from K's own separate
+    weight and one *contiguous* ``v_head_size``-wide column block (equal to
+    ``head_size`` for `GroupQueryAttention`, not necessarily for the plain
+    ai.onnx op -- see :class:`_GQAChain`'s own `v_head_size` field) from V's
+    own, together with the ``num_heads / kv_num_heads`` query-head-sized
+    blocks mapped to that group from Q's own separate weight (and the
+    matching ``v_head_size``-wide-per-head row block from the consumer,
+    since the consumer's own reduction axis is the attention output's own
+    hidden dim -- laid out per *query* head at *V's* own per-head width) --
+    never an individual query head in isolation. A connected constant
+    `past_key`/`past_value` (see :func:`_past_kv_constants_are_sliceable`,
+    already confirmed at match time to be a float BNSH-format tensor) is
+    sliced along its own `kv_num_heads` axis (axis 1) by the same
+    `keep_groups` index set. Returns ``(producer_weight_names,
+    consumer_weight_name, stale_output_names)`` on success, or ``None`` if
+    `sparsity` rounds to no groups dropped for this block (a no-op, left for
+    the caller to skip).
     """
     h = chain.kv_num_heads
     keep_count = max(1, h - round(h * sparsity))
@@ -6254,6 +6396,7 @@ def _apply_one_gqa_chain(
         return None
 
     d = chain.head_size
+    dv = chain.v_head_size
     group_size = chain.num_heads // chain.kv_num_heads
 
     # `_gqa_group_importance` (and any caller-supplied Wanda variant of it)
@@ -6282,18 +6425,48 @@ def _apply_one_gqa_chain(
     keep_q_heads = np.concatenate(
         [np.arange(g * group_size, (g + 1) * group_size) for g in keep_groups]
     )
+    # `q_idx`/`k_idx` index Q's/K's own producer weight columns (their
+    # shared per-head width `d`); `v_idx` indexes V's own producer weight
+    # columns at *its* own per-head width `dv`, which can differ. `y_idx`
+    # indexes the *output* side instead -- the consumer's reduction
+    # dimension and the raw output's own trailing axis (the reshape hop's
+    # target shape, if any) -- both laid out per query head at V's own
+    # per-head width `dv`, not Q's/K's `d`: `q_idx` (built with `d`) is only
+    # coincidentally the right index set for those two when `dv == d`, which
+    # is why the two were never distinguished before V could have its own
+    # head_size.
     q_idx = _head_column_indices(keep_q_heads, d)
-    kv_idx = _head_column_indices(keep_groups, d)
+    k_idx = _head_column_indices(keep_groups, d)
+    v_idx = _head_column_indices(keep_groups, dv)
+    y_idx = _head_column_indices(keep_q_heads, dv)
 
     _slice_producer_weight(wq_init, chain.q_weight_transposed, q_idx)
-    _slice_producer_weight(wk_init, chain.k_weight_transposed, kv_idx)
-    _slice_producer_weight(wv_init, chain.v_weight_transposed, kv_idx)
+    _slice_producer_weight(wk_init, chain.k_weight_transposed, k_idx)
+    _slice_producer_weight(wv_init, chain.v_weight_transposed, v_idx)
     if chain.q_bias is not None:
         _slice_last_axis(initializer_map[chain.q_bias], q_idx)
     if chain.k_bias is not None:
-        _slice_last_axis(initializer_map[chain.k_bias], kv_idx)
+        _slice_last_axis(initializer_map[chain.k_bias], k_idx)
     if chain.v_bias is not None:
-        _slice_last_axis(initializer_map[chain.v_bias], kv_idx)
+        _slice_last_axis(initializer_map[chain.v_bias], v_idx)
+
+    # `GroupQueryAttention`'s past_key/past_value live at input indices 3/4,
+    # the plain ai.onnx op's own at 4/5 (see `_match_gqa_producer`'s and
+    # `_match_onnx_attention_producer`'s own docstrings) -- both already
+    # confirmed, at match time, to be either absent/dynamic (nothing to do
+    # here) or a float BNSH-format constant safe to slice along axis 1 by
+    # `keep_groups` (see :func:`_past_kv_constants_are_sliceable`).
+    is_gqa = (
+        chain.node.domain == _ATTENTION_DOMAIN
+        and chain.node.op_type == "GroupQueryAttention"
+    )
+    past_kv_indices = (3, 4) if is_gqa else (4, 5)
+    for idx in past_kv_indices:
+        if len(chain.node.input) <= idx or not chain.node.input[idx]:
+            continue
+        past_init = initializer_map.get(chain.node.input[idx])
+        if past_init is not None:
+            _slice_axis1(past_init, keep_groups)
 
     new_kv_num_heads = keep_count
     new_num_heads = keep_count * group_size
@@ -6306,14 +6479,14 @@ def _apply_one_gqa_chain(
     _slice_consumer_weight(
         initializer_map[chain.consumer_weight],
         chain.consumer_weight_transposed,
-        q_idx,
+        y_idx,
     )
 
     for _, shape_name in chain.chain_ops:
         if shape_name is not None:
             shape_init = initializer_map[shape_name]
             dims = onnx.numpy_helper.to_array(shape_init).copy()
-            dims[-1] = new_num_heads * d
+            dims[-1] = new_num_heads * dv
             shape_init.CopyFrom(
                 onnx.numpy_helper.from_array(dims, name=shape_init.name)
             )
@@ -6428,10 +6601,13 @@ def apply_attention_head_pruning(
     query heads the kernel requires. An individual query head is never
     dropped on its own: only a whole group, since neither kernel has a way
     to keep a KV head alive for some, but not all, of the query heads that
-    shared it. A plain ``ai.onnx::Attention`` node whose V head size
-    genuinely differs from Q/K's own (a shape that op's schema allows but
-    `GroupQueryAttention` never produces) is declined rather than mis-sliced
-    -- see :func:`_match_onnx_attention_producer`.
+    shared it. A connected `past_key`/`past_value` that is a constant of the
+    expected float BNSH shape is sliced along its own `kv_num_heads` axis by
+    the same index set (see :func:`_past_kv_constants_are_sliceable`,
+    :func:`_apply_one_gqa_chain`); a plain ``ai.onnx::Attention`` node's V
+    head size may genuinely differ from Q/K's own (a shape that op's schema
+    allows but `GroupQueryAttention` never produces) and is sliced correctly
+    at its own width -- see :class:`_GQAChain`'s own `v_head_size` field.
 
     :param model: the original onnx ModelProto or file path
     :param sparsity: target fraction of each matched block's heads (or, for
@@ -6441,11 +6617,12 @@ def apply_attention_head_pruning(
             place; anything not matching that exact topology (a
             non-constant weight, a packed-QKV GroupQueryAttention node, a
             GroupQueryAttention/plain ai.onnx Attention node with a
-            non-empty constant past-KV-cache or attention-mask input, an
-            ai.onnx Attention node with differing Q/K/V head sizes or
-            without explicit ``q_num_heads``/``kv_num_heads`` attributes, a
-            consumer whose reduction dimension doesn't line up, ...) is left
-            completely untouched
+            non-empty constant past-KV-cache of unexpected shape/dtype (e.g.
+            a quantized KV cache) or a non-empty constant attention-mask
+            input, an ai.onnx Attention node without explicit
+            ``q_num_heads``/``kv_num_heads`` attributes or with Q's/K's own
+            head sizes mismatched, a consumer whose reduction dimension
+            doesn't line up, ...) is left completely untouched
     """
     if not (0.0 <= sparsity < 1.0):
         raise ValueError(f"sparsity must be in [0, 1), got {sparsity}")
@@ -6583,14 +6760,21 @@ def apply_attention_head_wanda_pruning(
     def _wanda_gqa_group_importance(chain, wq, wk, wv):
         base = _gqa_group_importance(chain, wq, wk, wv)
         norm = act_norm.get(chain.consumer_node.input[0])
-        width = chain.num_heads * chain.head_size
+        # The probed activation is the consumer's own input -- the attention
+        # output, laid out per *query* head at *V's* own per-head width
+        # (`chain.v_head_size`), the same `dv` :func:`_apply_one_gqa_chain`
+        # itself uses for that tensor's own indexing (equal to
+        # `chain.head_size` for `GroupQueryAttention`, not necessarily for
+        # the plain ai.onnx op -- see :class:`_GQAChain`'s own `v_head_size`
+        # field).
+        dv = chain.v_head_size
+        width = chain.num_heads * dv
         if norm is None or norm.shape[0] != width:
             return base  # no matching activation observed -- fall back to plain
-        d = chain.head_size
         group_size = chain.num_heads // chain.kv_num_heads
         act_group = np.array(
             [
-                np.linalg.norm(norm[kv * group_size * d : (kv + 1) * group_size * d])
+                np.linalg.norm(norm[kv * group_size * dv : (kv + 1) * group_size * dv])
                 for kv in range(chain.kv_num_heads)
             ]
         )
