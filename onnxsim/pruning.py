@@ -4454,7 +4454,11 @@ def _resolve_matmul_residual_group_for_concat(
             pre_chain_ops.extend(ops)
             if kind == "producer":
                 assert payload is not None and not isinstance(payload, onnx.NodeProto)
-                producer, n_channels = payload
+                # `producer_infos` is never passed to the walk above, so a
+                # "producer" outcome here is always the plain 2-tuple -- the
+                # 3-tuple "gated" shape (see _walk_matmul_producer_backward's
+                # own docstring) is unreachable from this call site.
+                producer, n_channels = cast(Tuple[_Producer, int], payload)
                 leaf_producers.append(producer)
                 n_channels_set.add(n_channels)
             elif kind == "add":
