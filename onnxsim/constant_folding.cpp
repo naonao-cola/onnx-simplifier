@@ -544,8 +544,8 @@ void RunOpsAndAddInitializers(
     std::unordered_map<std::string, const onnx::NodeProto*>&
         constant_node_producers,
     std::deque<onnx::NodeProto>& new_constant_nodes) {
-  const auto output_tps = RunOps(executor, model, ops, deferred_producers,
-                                 constant_node_producers);
+  const auto output_tps =
+      RunOps(executor, model, ops, deferred_producers, constant_node_producers);
   for (const auto& output_tp : output_tps) {
     if (impure_outputs.count(output_tp.name()) == 0) {
       *model.mutable_graph()->add_initializer() = output_tp;
@@ -961,7 +961,8 @@ onnx::ModelProto _FoldConstant(const ModelExecutor& executor,
   // nodes for impure outputs (see RunOpsAndAddInitializers); new_constant_nodes
   // owns those (a std::deque, not a std::vector, so the pointers this map
   // holds into it stay valid as more are appended).
-  std::unordered_map<std::string, const onnx::NodeProto*> constant_node_producers;
+  std::unordered_map<std::string, const onnx::NodeProto*>
+      constant_node_producers;
   for (const auto& node : model.graph().node()) {
     const bool is_default_domain =
         node.domain().empty() || node.domain() == "ai.onnx";
@@ -1449,9 +1450,9 @@ void FoldGroupOnGraph(
   std::vector<onnx::Node*> ops(const_nodes.begin() + begin,
                                const_nodes.begin() + end);
   try {
-    RunOpsOnGraphResult result = RunOpsOnGraph(
-        executor, g, ops, deferred_producers, constant_node_producers,
-        ir_version);
+    RunOpsOnGraphResult result =
+        RunOpsOnGraph(executor, g, ops, deferred_producers,
+                      constant_node_producers, ir_version);
     // Every op in this batch folded successfully (RunOpsOnGraph throws,
     // rather than partially populating its result, on any failure) -- decode
     // each returned TensorProto (ToTensorProto always emits raw_data, see
@@ -1560,7 +1561,8 @@ bool _FoldConstantOnGraph(const ModelExecutor& executor, onnx::Graph& g,
   // Constant nodes for impure outputs (see FoldGroupOnGraph).
   std::unordered_map<std::string, onnx::Node*> constant_node_producers;
   for (onnx::Node* node : node_ptrs) {
-    const std::string domain = node->has_domain() ? node->domain() : std::string();
+    const std::string domain =
+        node->has_domain() ? node->domain() : std::string();
     const bool is_default_domain = domain.empty() || domain == "ai.onnx";
     if (is_default_domain && node->kind() == onnx::kConstant) {
       for (onnx::Value* out : node->outputs()) {
