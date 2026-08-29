@@ -4161,12 +4161,7 @@ def _find_gated_chains(graph: onnx.GraphProto) -> List[_Chain]:
 #
 # `Concat`'s own `axis` attribute must actually be the channel axis this
 # pass's importance ranking operates on, and the two node families need
-# different, deliberately conservative answers for what that means, since
-# neither this pass nor this module in general ever looks up a tensor's
-# rank from `value_info`/shape inference (every other topology decision in
-# this module is answerable from node attributes and initializer shapes
-# alone, and this keeps that property rather than adding a new,
-# shape-inference-dependent dependency just for `Concat`):
+# different answers for what that means:
 #
 # - **Conv** branches are always rank-4 (`[N, C, H, W]`) -- every Conv this
 #   whole module ever matches is 2-D, no exception anywhere in this file --
@@ -4176,16 +4171,33 @@ def _find_gated_chains(graph: onnx.GraphProto) -> List[_Chain]:
 #   `[batch, seq, C]`, ...), but the reduction dimension every consumer
 #   match in this module already cares about is always the tensor's *last*
 #   axis regardless of rank (2-D weight, matrix-multiplied against
-#   whatever leading batch dimensions the input happens to carry) -- so only
-#   `axis == -1` is recognized. A model that spells the same last-axis
-#   concat with an explicit *positive* `axis` (e.g. `axis=1` on a 2-D
-#   `[batch, C]` tensor, numerically identical to `axis=-1` there) is
-#   declined rather than guessed at: confirming a positive `axis` actually
-#   equals "rank minus one" would need exactly the shape-inference-dependent
-#   rank lookup this module otherwise never needs, and this pass would
-#   rather decline a genuinely-safe-but-unconfirmed case than add that new
-#   dependency for it. See
-#   `test_structured_pruning_matmul_concat_declines_on_positive_axis`.
+#   whatever leading batch dimensions the input happens to carry) -- so
+#   `axis == -1` is always recognized outright (ONNX's own negative-axis
+#   convention already counts from the end, no rank lookup needed). A model
+#   that spells the same last-axis concat with an explicit *positive*
+#   `axis` (e.g. `axis=1` on a 2-D `[batch, C]` tensor, numerically
+#   identical to `axis=-1` there) is only recognized when the operands'
+#   rank can actually be confirmed: unlike every other topology decision in
+#   this module (answerable from node attributes and initializer shapes
+#   alone), this one genuinely needs a rank, and the *only* place this
+#   module ever looks one up is here, from the graph's own
+#   `value_info`/`input`/`output` type annotations (:func:`_tensor_rank`) --
+#   never from running shape inference itself, which this module (like the
+#   rest of onnxsim's `apply_*`/`quantize_*` passes) never does. Those
+#   annotations are reliably present for a graph that already went through
+#   onnxsim's own (or any) shape-inference pass before reaching this one --
+#   the ordinary case, since structured pruning is meant to run as one step
+#   in a larger pipeline -- but are just as reliably *absent* for a bare
+#   hand-built graph (every model in this module's own test suite, for
+#   instance, unless a test opts in with
+#   `onnx.shape_inference.infer_shapes()`). So a positive `axis` is accepted
+#   only when at least one operand's rank is known and every operand with a
+#   known rank agrees this axis is `rank - 1`; if no operand's rank can be
+#   confirmed, or two operands disagree, it's declined exactly as before --
+#   never guessed at. See
+#   `test_structured_pruning_matmul_concat_accepts_positive_last_axis_when_rank_known`,
+#   `test_structured_pruning_matmul_concat_declines_on_positive_non_last_axis`,
+#   and `test_structured_pruning_matmul_concat_declines_on_positive_axis_unknown_rank`.
 #
 # Once every operand resolves and the branches' fixed offsets are known, the
 # ordinary forward walk (:func:`_walk_to_consumer`/
@@ -4207,6 +4219,77 @@ def _concat_axis(node: onnx.NodeProto) -> Optional[int]:
         if attr.name == "axis":
             return attr.i
     return None  # required attribute on Concat's own schema -- malformed if absent
+
+
+def _value_info_by_name(
+    graph: onnx.GraphProto,
+) -> Dict[str, onnx.ValueInfoProto]:
+    """Every ``ValueInfoProto`` the graph carries for its own tensors --
+    `input`, `output`, and interior `value_info` -- keyed by tensor name.
+    The sole use is :func:`_tensor_rank`'s positive-`Concat`-axis rank
+    lookup (see this section's own comment); nothing else in this module
+    ever consults a tensor's declared type/shape.
+    """
+    by_name: Dict[str, onnx.ValueInfoProto] = {}
+    for vi in graph.input:
+        by_name[vi.name] = vi
+    for vi in graph.output:
+        by_name[vi.name] = vi
+    for vi in graph.value_info:
+        by_name[vi.name] = vi
+    return by_name
+
+
+def _tensor_rank(
+    name: str, value_info_by_name: Dict[str, onnx.ValueInfoProto]
+) -> Optional[int]:
+    """The tensor's rank (number of dimensions), if the graph's own
+    `value_info`/`input`/`output` annotations state it -- `None` if the
+    tensor has no such annotation at all, the annotation isn't a tensor
+    type, or it's a tensor type with no `shape` field (ONNX's own "rank not
+    statically known" spelling, distinct from a `shape` field present but
+    with an unknown/symbolic *dimension value*, which this only needs the
+    dimension *count* of and so doesn't care about). Never runs shape
+    inference itself -- see this section's own comment for why that's the
+    deliberate boundary.
+    """
+    vi = value_info_by_name.get(name)
+    if vi is None or not vi.type.HasField("tensor_type"):
+        return None
+    tensor_type = vi.type.tensor_type
+    if not tensor_type.HasField("shape"):
+        return None
+    return len(tensor_type.shape.dim)
+
+
+def _concat_axis_is_last(
+    node: onnx.NodeProto, value_info_by_name: Dict[str, onnx.ValueInfoProto]
+) -> bool:
+    """True if `node`'s own `axis` attribute is confirmed to select the
+    last axis of its operands -- `axis == -1` outright (ONNX's negative-axis
+    convention already counts from the end), or a positive `axis` only when
+    at least one operand's rank is known (:func:`_tensor_rank`) and every
+    operand with a known rank agrees `axis == rank - 1`. See this section's
+    own comment for the full reasoning and why a positive axis is otherwise
+    declined rather than guessed at.
+    """
+    axis = _concat_axis(node)
+    if axis is None:
+        return False
+    if axis < 0:
+        return axis == -1
+    known_rank: Optional[int] = None
+    for operand in node.input:
+        rank = _tensor_rank(operand, value_info_by_name)
+        if rank is None:
+            continue
+        if known_rank is None:
+            known_rank = rank
+        elif rank != known_rank:
+            return False  # operands disagree -- decline rather than guess
+    if known_rank is None:
+        return False  # no operand's rank is known -- decline rather than guess
+    return axis == known_rank - 1
 
 
 @dataclass(frozen=True)
@@ -4306,24 +4389,26 @@ def _branch_walk_has_fanout(
 
 def _find_matmul_concat_chains(graph: onnx.GraphProto) -> List[_ConcatChain]:
     """Finds MatMul/Gemm ``Concat``-merged skip connections -- see this
-    section's own comment. Every operand of a last-axis `Concat` (`axis ==
-    -1`; see this section's own comment for why a positive `axis` is
-    declined even when it might numerically equal the tensor's last axis)
-    is resolved backward, via :func:`_walk_matmul_producer_backward` (reused
-    unchanged from the MatMul/Gemm residual section above), to a real
-    MatMul/vanilla-Gemm producer -- only a `"producer"` outcome is accepted;
-    `"add"` (the operand resolves to an eligible residual/
-    `SkipLayerNormalization` merge instead) is declined exactly like
-    `"fail"`, since composing a residual merge with a `Concat` merge on the
-    same branch isn't verified here (see this section's own comment). If
-    *any* operand fails to resolve to a real producer, or two operands
-    resolve to the very same producer weight (degenerate), the whole
-    `Concat` node is declined -- never partially pruned.
+    section's own comment. Every operand of a last-axis `Concat`
+    (:func:`_concat_axis_is_last` -- `axis == -1` outright, or a positive
+    `axis` only when the operands' rank is confirmed via `value_info` to
+    actually be `rank - 1`) is resolved backward, via
+    :func:`_walk_matmul_producer_backward` (reused unchanged from the
+    MatMul/Gemm residual section above), to a real MatMul/vanilla-Gemm
+    producer -- only a `"producer"` outcome is accepted; `"add"` (the
+    operand resolves to an eligible residual/`SkipLayerNormalization` merge
+    instead) is declined exactly like `"fail"`, since composing a residual
+    merge with a `Concat` merge on the same branch isn't verified here (see
+    this section's own comment). If *any* operand fails to resolve to a
+    real producer, or two operands resolve to the very same producer weight
+    (degenerate), the whole `Concat` node is declined -- never partially
+    pruned.
     """
     initializer_map = {t.name: t for t in graph.initializer}
     consumers_of = _consumers_of(graph)
     node_by_output = {out: node for node in graph.node for out in node.output}
     graph_outputs = {o.name for o in graph.output}
+    value_info_by_name = _value_info_by_name(graph)
 
     def _is_internal(name: str) -> bool:
         return len(consumers_of.get(name, [])) == 1 and name not in graph_outputs
@@ -4332,7 +4417,7 @@ def _find_matmul_concat_chains(graph: onnx.GraphProto) -> List[_ConcatChain]:
     for node in graph.node:
         if node.op_type != "Concat" or len(node.input) < 2 or len(node.output) != 1:
             continue
-        if _concat_axis(node) != -1:
+        if not _concat_axis_is_last(node, value_info_by_name):
             continue
         if len(set(node.input)) != len(node.input):
             continue  # degenerate -- the same tensor concatenated with itself
@@ -5159,7 +5244,9 @@ def apply_structured_pruning(
     case -- the U-Net-style encoder/decoder merge (see
     :func:`_find_matmul_concat_chains`/:func:`_find_conv_concat_chains` and
     this module's own docstring) -- for both MatMul/Gemm (last-axis
-    ``Concat`` only, ``axis == -1``) and Conv (channel-axis ``Concat``,
+    ``Concat`` only -- ``axis == -1`` outright, or a positive `axis`
+    confirmed via `value_info` to equal ``rank - 1``, see
+    :func:`_concat_axis_is_last`) and Conv (channel-axis ``Concat``,
     ``axis in (1, -3)``) branches. Unlike a gated pair or a residual merge,
     a ``Concat``'s branches need no shared `keep` set at all: each branch
     owns a fixed, disjoint slice of the merged channel range and is ranked
