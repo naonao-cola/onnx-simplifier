@@ -3866,24 +3866,17 @@ def test_structured_pruning_matmul_residual_add_transposed_gemm_producer_matches
     np.testing.assert_allclose(y, y_oracle, rtol=1e-5, atol=1e-5)
 
 
-def test_structured_pruning_matmul_residual_add_declines_on_gated_branch_with_no_projection():
-    # A gated (SwiGLU-style) combine feeding directly into a residual Add,
-    # with no output-projection MatMul between the Mul and the Add -- see
-    # _find_matmul_residual_chains's own section comment for why this
-    # composition is declined rather than guessed at (the backward walk
-    # would have no principled way to pick "the" one branch through a Mul
-    # of two non-constant operands without silently dropping the other's
-    # contribution). Left completely untouched; the far more common shape
-    # -- the gated FFN's own down-projection feeding the residual Add --
-    # is exercised by every other test in this section (WD below plays
-    # exactly that role in every oracle-verified case).
-    K, C, Out = 8, 16, 4
-    rng = np.random.default_rng(100)
-    wg = rng.standard_normal((K, C)).astype(np.float32)
-    wu = rng.standard_normal((K, C)).astype(np.float32)
-    wp = rng.standard_normal((K, C)).astype(np.float32)
-    wout = rng.standard_normal((C, Out)).astype(np.float32)
-    model = _model(
+def _gated_residual_no_projection_model(wg, wu, wp, wout):
+    # y = MatMul_out(Relu(Add(MatMul_p(X), Sigmoid(MatMul_g(X)) *
+    # MatMul_u(X)))) -- a gated (SwiGLU-style) combine feeding directly into
+    # a residual Add, with no output-projection MatMul between the Mul and
+    # the Add. WG/WU/WP must all three agree on one shared surviving
+    # channel-index set: WG and WU because their outputs are multiplied
+    # elementwise (the ordinary gated-pair constraint), and WP because it's
+    # `h`'s own merge partner in `addr` (the ordinary residual constraint).
+    K, C = wg.shape
+    Out = wout.shape[1]
+    return _model(
         f"""
         g (float[batch,{K}] X) => (float[batch,{Out}] Y)
         {{
@@ -3903,6 +3896,207 @@ def test_structured_pruning_matmul_residual_add_declines_on_gated_branch_with_no
             _f32(wp, "WP"),
             _f32(wout, "WOUT"),
         ],
+    )
+
+
+def test_structured_pruning_matmul_residual_add_prunes_gated_branch_with_no_projection():
+    # Composition case: a gated (SwiGLU-style) combine feeding directly into
+    # a residual Add, with no output-projection MatMul between the Mul and
+    # the Add, is now resolved -- see _walk_matmul_producer_backward's own
+    # section comment for the composition-safety argument (reusing
+    # _find_gated_chains's own gate-branch tracer to resolve *both* Mul
+    # operands, rather than picking one and dropping the other). Correctness
+    # bar: exact equivalence, via real onnxruntime execution, to hand-slicing
+    # all *three* independent producers (WG, WU, and WP, the Add's other
+    # operand) to the one combined-importance keep set they must all share --
+    # with weights deliberately built so each of the three branches
+    # dominates a different third of the channels, so the correct combined
+    # keep set is neither branch's own individual top-k and a bug that
+    # dropped any one branch's contribution (the exact failure mode this
+    # composition was previously declined to avoid) would be caught.
+    K, C, Out = 9, 18, 4
+    rng = np.random.default_rng(103)
+    third = C // 3
+    scale_g = np.where((np.arange(C) % 3) == 0, 3.0, 0.3).astype(np.float32)
+    scale_u = np.where((np.arange(C) % 3) == 1, 3.0, 0.3).astype(np.float32)
+    scale_p = np.where((np.arange(C) % 3) == 2, 3.0, 0.3).astype(np.float32)
+    wg = rng.standard_normal((K, C)).astype(np.float32) * scale_g
+    wu = rng.standard_normal((K, C)).astype(np.float32) * scale_u
+    wp = rng.standard_normal((K, C)).astype(np.float32) * scale_p
+    wout = rng.standard_normal((C, Out)).astype(np.float32)
+    model = _gated_residual_no_projection_model(wg, wu, wp, wout)
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    inits = {t.name: t for t in pruned.graph.initializer}
+    assert list(inits["WG"].dims) == [K, C // 2]
+    assert list(inits["WU"].dims) == [K, C // 2]
+    assert list(inits["WP"].dims) == [K, C // 2]
+    assert list(inits["WOUT"].dims) == [C // 2, Out]
+
+    importance = np.sqrt(
+        np.square(np.linalg.norm(wg.astype(np.float64), axis=0))
+        + np.square(np.linalg.norm(wu.astype(np.float64), axis=0))
+        + np.square(np.linalg.norm(wp.astype(np.float64), axis=0))
+    )
+    keep = np.sort(np.argsort(-importance)[: C // 2])
+    # The conflicting-importance construction above is only doing its job if
+    # the combined keep set actually straddles all three thirds.
+    assert np.any(keep % 3 == 0) and np.any(keep % 3 == 1) and np.any(keep % 3 == 2)
+    oracle = _gated_residual_no_projection_model(
+        wg[:, keep], wu[:, keep], wp[:, keep], wout[keep, :]
+    )
+
+    rng_x = np.random.default_rng(104)
+    x = rng_x.standard_normal((5, K)).astype(np.float32)
+    (y,) = _run(pruned, {"X": x})
+    (y_oracle,) = _run(oracle, {"X": x})
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-5, atol=1e-5)
+    assert third > 0  # sanity: the construction above assumes >=3 channels/group
+
+
+def test_structured_pruning_matmul_residual_add_declines_on_gated_branch_with_extra_fanout():
+    # A gate branch that fans out to a second, independent consumer besides
+    # the Mul -- `gate_act` (the gate's own activation output) additionally
+    # feeds a second graph output `Z` -- must still decline the *whole*
+    # group, not just skip the gated branch: _trace_gate_producer_backward
+    # (reused unchanged from _find_gated_chains) holds every tensor on a
+    # gate/up path to an exact single-consumer bar, stricter than this
+    # walk's own deferred bias/scale-hop tensors, so embedding it inside the
+    # residual walk doesn't relax that bar. Proves the composition doesn't
+    # silently narrow the existing gated-pair safety check.
+    K, C, Out = 8, 16, 4
+    rng = np.random.default_rng(105)
+    wg = rng.standard_normal((K, C)).astype(np.float32)
+    wu = rng.standard_normal((K, C)).astype(np.float32)
+    wp = rng.standard_normal((K, C)).astype(np.float32)
+    wout = rng.standard_normal((C, Out)).astype(np.float32)
+    model = _model(
+        f"""
+        g (float[batch,{K}] X) => (float[batch,{Out}] Y, float[batch,{C}] Z)
+        {{
+          gate = MatMul(X, WG)
+          gate_act = Sigmoid(gate)
+          up = MatMul(X, WU)
+          h = Mul(gate_act, up)
+          p = MatMul(X, WP)
+          addr = Add(p, h)
+          r = Relu(addr)
+          Y = MatMul(r, WOUT)
+          Z = Identity(gate_act)
+        }}
+        """,
+        initializer=[
+            _f32(wg, "WG"),
+            _f32(wu, "WU"),
+            _f32(wp, "WP"),
+            _f32(wout, "WOUT"),
+        ],
+    )
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    np.testing.assert_array_equal(inits["WG"], wg)
+    np.testing.assert_array_equal(inits["WU"], wu)
+    np.testing.assert_array_equal(inits["WP"], wp)
+    np.testing.assert_array_equal(inits["WOUT"], wout)
+
+
+def test_structured_pruning_matmul_residual_add_declines_on_gated_output_shared_with_second_merge():
+    # The Mul's own combined output (`h`) feeds *two* independent residual
+    # Adds directly -- addr1 and addr2, structurally unrelated merge points
+    # (no shared operand unions them into one union-find group). This is the
+    # gated analogue of a plain shared producer feeding two separate merges;
+    # the existing fan-out machinery already declines that case (see
+    # _resolve_matmul_fanout_branches's own forced_first_hop mechanism and
+    # this module's own docstring on tie-breaks between conflicting keep
+    # sets), and composing it with a gated Mul doesn't weaken that: `h` is
+    # tracked as an ordinary backbone tensor of addr1's own group, so addr2
+    # reading it too is resolved as an extra fan-out branch the same way any
+    # other backbone tensor's extra reader would be -- and fails, since
+    # addr2's own *other* operand (s2) is non-constant, not a valid
+    # ordinary consumer shape -- declining the whole group rather than
+    # silently pruning WG/WU to one group's keep set while the other
+    # merge's own branch stays unpruned (which would corrupt addr2's shape).
+    K, C, Out = 8, 16, 4
+    rng = np.random.default_rng(106)
+    wg = rng.standard_normal((K, C)).astype(np.float32)
+    wu = rng.standard_normal((K, C)).astype(np.float32)
+    wp = rng.standard_normal((K, C)).astype(np.float32)
+    ws2 = rng.standard_normal((K, C)).astype(np.float32)
+    wout = rng.standard_normal((C, Out)).astype(np.float32)
+    wout2 = rng.standard_normal((C, Out)).astype(np.float32)
+    model = _model(
+        f"""
+        g (float[batch,{K}] X) => (float[batch,{Out}] Y, float[batch,{Out}] Y2)
+        {{
+          gate = MatMul(X, WG)
+          gate_act = Sigmoid(gate)
+          up = MatMul(X, WU)
+          h = Mul(gate_act, up)
+          p = MatMul(X, WP)
+          addr1 = Add(p, h)
+          r1 = Relu(addr1)
+          Y = MatMul(r1, WOUT)
+          s2 = MatMul(X, WS2)
+          addr2 = Add(s2, h)
+          r2 = Relu(addr2)
+          Y2 = MatMul(r2, WOUT2)
+        }}
+        """,
+        initializer=[
+            _f32(wg, "WG"),
+            _f32(wu, "WU"),
+            _f32(wp, "WP"),
+            _f32(ws2, "WS2"),
+            _f32(wout, "WOUT"),
+            _f32(wout2, "WOUT2"),
+        ],
+    )
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    np.testing.assert_array_equal(inits["WG"], wg)
+    np.testing.assert_array_equal(inits["WU"], wu)
+    np.testing.assert_array_equal(inits["WP"], wp)
+    np.testing.assert_array_equal(inits["WS2"], ws2)
+    np.testing.assert_array_equal(inits["WOUT"], wout)
+    np.testing.assert_array_equal(inits["WOUT2"], wout2)
+
+
+def test_structured_pruning_matmul_residual_add_declines_on_swiglu_branch_with_no_projection():
+    # The native fused SwiGLU op (opset 28+) feeding directly into a
+    # residual Add is deliberately left out of scope -- a scope choice, not
+    # a safety one (see _walk_matmul_producer_backward's own section
+    # comment above): only a plain `Mul` of two non-constant operands is
+    # resolved this way, mirroring _find_gated_chains's own two recognized
+    # gated shapes exactly. `SwiGLU` isn't in `_BINARY_CHANNEL_OPS` at all,
+    # so this residual branch is simply unrecognized by any hop the walk
+    # knows, the same "fail" outcome as any other unmatched topology.
+    K, C, Out = 8, 16, 4
+    rng = np.random.default_rng(107)
+    wg = rng.standard_normal((K, C)).astype(np.float32)
+    wu = rng.standard_normal((K, C)).astype(np.float32)
+    wp = rng.standard_normal((K, C)).astype(np.float32)
+    wout = rng.standard_normal((C, Out)).astype(np.float32)
+    model = _model(
+        f"""
+        g (float[batch,{K}] X) => (float[batch,{Out}] Y)
+        {{
+          gate = MatMul(X, WG)
+          up = MatMul(X, WU)
+          h = SwiGLU(gate, up)
+          p = MatMul(X, WP)
+          addr = Add(p, h)
+          r = Relu(addr)
+          Y = MatMul(r, WOUT)
+        }}
+        """,
+        initializer=[
+            _f32(wg, "WG"),
+            _f32(wu, "WU"),
+            _f32(wp, "WP"),
+            _f32(wout, "WOUT"),
+        ],
+        opset=28,
     )
     pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
     inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
