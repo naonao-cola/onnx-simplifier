@@ -24,14 +24,14 @@
  * onnxsim -- see CLAUDE.md), which is why it isn't reproduced as a C++ test
  * here.
  */
-#include "contrib_schemas.h"
-
 #include <onnx/defs/function.h>
 #include <onnx/defs/schema.h>
 
 #include <cstdio>
 #include <string>
 #include <vector>
+
+#include "contrib_schemas.h"
 
 using onnx::AttributeProto;
 using onnx::FunctionBodyBuildContextImpl;
@@ -126,22 +126,19 @@ std::vector<TypeProto> MakeInputTypes(int64_t num_experts, int64_t hidden_size,
 
 void TestMoESchemaIsRegistered() {
   onnxsim::RegisterContribOpSchemas();
-  const OpSchema* schema =
-      OpSchemaRegistry::Schema("MoE", 1, "com.microsoft");
+  const OpSchema* schema = OpSchemaRegistry::Schema("MoE", 1, "com.microsoft");
   Check(schema != nullptr, "MoE schema should be registered");
   Check(schema != nullptr && schema->HasContextDependentFunction(),
         "MoE schema should have a context-dependent function body");
 
-  const OpSchema* qmoe =
-      OpSchemaRegistry::Schema("QMoE", 1, "com.microsoft");
+  const OpSchema* qmoe = OpSchemaRegistry::Schema("QMoE", 1, "com.microsoft");
   Check(qmoe != nullptr, "QMoE schema should be registered");
   Check(qmoe != nullptr && !qmoe->HasContextDependentFunction(),
         "QMoE should stay schema-only (no reference decomposition)");
 }
 
 void TestBuildsForPlainReluCase() {
-  const OpSchema* schema =
-      OpSchemaRegistry::Schema("MoE", 1, "com.microsoft");
+  const OpSchema* schema = OpSchemaRegistry::Schema("MoE", 1, "com.microsoft");
   NodeProto node = MakeMoENode(/*k=*/2, "relu", /*normalize=*/1);
   auto input_types =
       MakeInputTypes(/*num_experts=*/4, /*hidden_size=*/6, /*inter_size=*/8,
@@ -149,7 +146,8 @@ void TestBuildsForPlainReluCase() {
   FunctionBodyBuildContextImpl ctx(node, input_types);
   FunctionProto function_proto;
   bool built = schema->BuildContextDependentFunction(ctx, function_proto);
-  Check(built, "should build a body for the plain relu/no-bias/static-shape case");
+  Check(built,
+        "should build a body for the plain relu/no-bias/static-shape case");
   if (!built) return;
 
   Check(function_proto.node_size() > 0, "built function should have nodes");
@@ -181,8 +179,7 @@ void TestBuildsForPlainReluCase() {
 }
 
 void TestDeclinesForSwiglu() {
-  const OpSchema* schema =
-      OpSchemaRegistry::Schema("MoE", 1, "com.microsoft");
+  const OpSchema* schema = OpSchemaRegistry::Schema("MoE", 1, "com.microsoft");
   NodeProto node = MakeMoENode(/*k=*/2, "swiglu", /*normalize=*/0);
   auto input_types =
       MakeInputTypes(4, 6, 8, /*dynamic_experts=*/false, /*with_fc3=*/false);
@@ -193,8 +190,7 @@ void TestDeclinesForSwiglu() {
 }
 
 void TestDeclinesForSparseMixer() {
-  const OpSchema* schema =
-      OpSchemaRegistry::Schema("MoE", 1, "com.microsoft");
+  const OpSchema* schema = OpSchemaRegistry::Schema("MoE", 1, "com.microsoft");
   NodeProto node =
       MakeMoENode(/*k=*/2, "relu", /*normalize=*/0, /*use_sparse_mixer=*/1);
   auto input_types =
@@ -202,13 +198,13 @@ void TestDeclinesForSparseMixer() {
   FunctionBodyBuildContextImpl ctx(node, input_types);
   FunctionProto function_proto;
   bool built = schema->BuildContextDependentFunction(ctx, function_proto);
-  Check(!built, "use_sparse_mixer=1 uses a different combination rule, not "
-                "decomposed here");
+  Check(!built,
+        "use_sparse_mixer=1 uses a different combination rule, not "
+        "decomposed here");
 }
 
 void TestDeclinesForFc3() {
-  const OpSchema* schema =
-      OpSchemaRegistry::Schema("MoE", 1, "com.microsoft");
+  const OpSchema* schema = OpSchemaRegistry::Schema("MoE", 1, "com.microsoft");
   NodeProto node =
       MakeMoENode(/*k=*/2, "relu", /*normalize=*/0, /*use_sparse_mixer=*/0,
                   /*swiglu_fusion=*/0, /*with_fc3=*/true);
@@ -221,8 +217,7 @@ void TestDeclinesForFc3() {
 }
 
 void TestDeclinesForDynamicExpertCount() {
-  const OpSchema* schema =
-      OpSchemaRegistry::Schema("MoE", 1, "com.microsoft");
+  const OpSchema* schema = OpSchemaRegistry::Schema("MoE", 1, "com.microsoft");
   NodeProto node = MakeMoENode(/*k=*/2, "relu", /*normalize=*/0);
   auto input_types =
       MakeInputTypes(4, 6, 8, /*dynamic_experts=*/true, /*with_fc3=*/false);
@@ -234,8 +229,7 @@ void TestDeclinesForDynamicExpertCount() {
 }
 
 void TestNodeCountScalesWithExpertCount() {
-  const OpSchema* schema =
-      OpSchemaRegistry::Schema("MoE", 1, "com.microsoft");
+  const OpSchema* schema = OpSchemaRegistry::Schema("MoE", 1, "com.microsoft");
   int prev_nodes = -1;
   for (int64_t num_experts : {2, 4, 8}) {
     NodeProto node = MakeMoENode(/*k=*/1, "relu", /*normalize=*/0);
@@ -270,7 +264,6 @@ int main() {
     std::printf("contrib_schemas_moe_test: all checks passed\n");
     return 0;
   }
-  std::fprintf(stderr, "contrib_schemas_moe_test: %d failure(s)\n",
-              g_failures);
+  std::fprintf(stderr, "contrib_schemas_moe_test: %d failure(s)\n", g_failures);
   return 1;
 }

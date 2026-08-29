@@ -886,14 +886,13 @@ void AppendMoEExpertBlock(std::ostringstream& text, int64_t expert,
        << e << ")\n"
        << "W2_" << e << " = Squeeze (W2_3d" << e << ", SqueezeAxis)\n";
   if (has_fc1_bias) {
-    text << "B1_2d" << e << " = Gather <axis = 0> (fc1_experts_bias, W1Idx"
-         << e << ")\n"
+    text << "B1_2d" << e << " = Gather <axis = 0> (fc1_experts_bias, W1Idx" << e
+         << ")\n"
          << "B1_" << e << " = Squeeze (B1_2d" << e << ", SqueezeAxis)\n"
-         << "H1_" << e << " = Gemm <transB = 1> (FlatInput, W1_" << e
-         << ", B1_" << e << ")\n";
+         << "H1_" << e << " = Gemm <transB = 1> (FlatInput, W1_" << e << ", B1_"
+         << e << ")\n";
   } else {
-    text << "H1_" << e << " = Gemm <transB = 1> (FlatInput, W1_" << e
-         << ")\n";
+    text << "H1_" << e << " = Gemm <transB = 1> (FlatInput, W1_" << e << ")\n";
   }
   if (activation == "relu") {
     text << "A1_" << e << " = Relu (H1_" << e << ")\n";
@@ -909,23 +908,20 @@ void AppendMoEExpertBlock(std::ostringstream& text, int64_t expert,
          << "HalfCast_" << e << " = CastLike (Half_" << e << ", H1_" << e
          << ")\n"
          << "One_" << e << " = Constant <value = float {1.0}> ()\n"
-         << "OneCast_" << e << " = CastLike (One_" << e << ", H1_" << e
-         << ")\n"
+         << "OneCast_" << e << " = CastLike (One_" << e << ", H1_" << e << ")\n"
          << "Two_" << e << " = Constant <value = float {2.0}> ()\n"
-         << "TwoCast_" << e << " = CastLike (Two_" << e << ", H1_" << e
-         << ")\n"
+         << "TwoCast_" << e << " = CastLike (Two_" << e << ", H1_" << e << ")\n"
          << "SqrtTwo_" << e << " = Sqrt (TwoCast_" << e << ")\n"
          << "XSqrt_" << e << " = Div (H1_" << e << ", SqrtTwo_" << e << ")\n"
          << "ErfXSqrt_" << e << " = Erf (XSqrt_" << e << ")\n"
          << "Phi_" << e << " = Sum (OneCast_" << e << ", ErfXSqrt_" << e
          << ")\n"
-         << "MultX_" << e << " = Mul (HalfCast_" << e << ", H1_" << e
-         << ")\n"
+         << "MultX_" << e << " = Mul (HalfCast_" << e << ", H1_" << e << ")\n"
          << "A1_" << e << " = Mul (MultX_" << e << ", Phi_" << e << ")\n";
   }
   if (has_fc2_bias) {
-    text << "B2_2d" << e << " = Gather <axis = 0> (fc2_experts_bias, W1Idx"
-         << e << ")\n"
+    text << "B2_2d" << e << " = Gather <axis = 0> (fc2_experts_bias, W1Idx" << e
+         << ")\n"
          << "B2_" << e << " = Squeeze (B2_2d" << e << ", SqueezeAxis)\n"
          << "Out_" << e << " = Gemm <transB = 1> (A1_" << e << ", W2_" << e
          << ", B2_" << e << ")\n";
@@ -933,14 +929,11 @@ void AppendMoEExpertBlock(std::ostringstream& text, int64_t expert,
     text << "Out_" << e << " = Gemm <transB = 1> (A1_" << e << ", W2_" << e
          << ")\n";
   }
-  text << "GEnd" << e << " = Constant <value_ints: ints = [" << e1
-       << "]> ()\n"
-       << "GateCol" << e
-       << " = Slice (Gates, W1Idx" << e << ", GEnd" << e << ", GAxis)\n"
-       << "Weighted" << e << " = Mul (Out_" << e << ", GateCol" << e
-       << ")\n"
-       << "Acc" << e1 << " = Add (" << acc_prev << ", Weighted" << e
-       << ")\n";
+  text << "GEnd" << e << " = Constant <value_ints: ints = [" << e1 << "]> ()\n"
+       << "GateCol" << e << " = Slice (Gates, W1Idx" << e << ", GEnd" << e
+       << ", GAxis)\n"
+       << "Weighted" << e << " = Mul (Out_" << e << ", GateCol" << e << ")\n"
+       << "Acc" << e1 << " = Add (" << acc_prev << ", Weighted" << e << ")\n";
 }
 
 // Context-dependent function body for MoE: builds a "dense" (compute-every-
@@ -1004,8 +997,8 @@ bool BuildMoEFunctionBody(const FunctionBodyBuildContext& ctx,
   }
   const int64_t k = k_attr->i();
   const auto* normalize_attr = ctx.getAttribute("normalize_routing_weights");
-  const bool normalize = normalize_attr != nullptr &&
-                          normalize_attr->has_i() && normalize_attr->i() != 0;
+  const bool normalize = normalize_attr != nullptr && normalize_attr->has_i() &&
+                         normalize_attr->i() != 0;
 
   // num_experts and hidden_size both have to be statically known: they are
   // dims of fc1_experts_weights (input 2), not attributes, so unlike k or
@@ -1078,7 +1071,7 @@ bool BuildMoEFunctionBody(const FunctionBodyBuildContext& ctx,
 
   for (int64_t e = 0; e < num_experts; ++e) {
     AppendMoEExpertBlock(text, e, "Acc" + std::to_string(e), has_fc1_bias,
-                        has_fc2_bias, activation);
+                         has_fc2_bias, activation);
   }
   text << "FlatOutput = Identity (Acc" << num_experts << ")\n"
        << "output = Reshape (FlatOutput, InputShape)\n";
@@ -1136,8 +1129,8 @@ OpSchema MakeMoESchema() {
       .Attr("k", "Number of top experts to select from expert pool.",
             onnx::AttributeProto::INT, /*required=*/true)
       .Attr("normalize_routing_weights",
-            "Whether to normalize routing weights.",
-            onnx::AttributeProto::INT, static_cast<int64_t>(0))
+            "Whether to normalize routing weights.", onnx::AttributeProto::INT,
+            static_cast<int64_t>(0))
       .Attr("use_sparse_mixer", "Whether to use sparse mixer.",
             onnx::AttributeProto::INT, static_cast<int64_t>(0))
       .Attr("swiglu_fusion",
@@ -1231,8 +1224,8 @@ OpSchema MakeQMoESchema() {
       .Attr("k", "Number of top experts to select from expert pool.",
             onnx::AttributeProto::INT, /*required=*/true)
       .Attr("normalize_routing_weights",
-            "Whether to normalize routing weights.",
-            onnx::AttributeProto::INT, static_cast<int64_t>(0))
+            "Whether to normalize routing weights.", onnx::AttributeProto::INT,
+            static_cast<int64_t>(0))
       .Attr("use_sparse_mixer", "Whether to use sparse mixer.",
             onnx::AttributeProto::INT, static_cast<int64_t>(0))
       .Attr("swiglu_fusion",
@@ -1278,8 +1271,8 @@ OpSchema MakeQMoESchema() {
       .Input(7, "fc2_experts_bias", "2D optional FC2 expert bias.", "T",
              OpSchema::Optional)
       .Input(8, "fc3_experts_weights",
-             "3D optional packed/quantized tensor of FC3 expert weights.",
-             "T1", OpSchema::Optional)
+             "3D optional packed/quantized tensor of FC3 expert weights.", "T1",
+             OpSchema::Optional)
       .Input(9, "fc3_scales", "Optional FC3 weight scales.", "T2",
              OpSchema::Optional)
       .Input(10, "fc3_experts_bias", "2D optional FC3 expert bias.", "T",
@@ -1309,8 +1302,7 @@ OpSchema MakeQMoESchema() {
       .Input(20, "fc2_act_block_scale",
              "Optional FC2 MXFP activation block-scale tensor.", "T2",
              OpSchema::Optional)
-      .Output(0, "output", "Output tensor with the same shape as input.",
-              "T")
+      .Output(0, "output", "Output tensor with the same shape as input.", "T")
       .TypeConstraint("T",
                       {"tensor(float)", "tensor(float16)", "tensor(bfloat16)"},
                       "Constrain input and output types to float tensors.")
@@ -1322,8 +1314,7 @@ OpSchema MakeQMoESchema() {
                       "Constrain scale types.")
       .TypeConstraint("T4", {"tensor(float)"},
                       "Constrain FP4 global scale type to float32 tensors.")
-      .TypeAndShapeInferenceFunction(
-          onnx::propagateShapeAndTypeFromFirstInput);
+      .TypeAndShapeInferenceFunction(onnx::propagateShapeAndTypeFromFirstInput);
   return schema;
 }
 
