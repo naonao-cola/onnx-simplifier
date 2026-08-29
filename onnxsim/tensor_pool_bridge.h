@@ -585,14 +585,43 @@ inline std::string FixedWidthDecimal(uint64_t v) {
 // each adopted tensor's pool key alongside its TensorProto*, exactly like
 // ExportModelWithSafetensors's internal bookkeeping, so the second half can
 // find and re-patch them without a second graph traversal.
+//
+// `external_tensor_bytes`, when non-null, supplies the adopted bytes
+// directly (keyed the same way ForEachTensor derives pool keys) instead of
+// pulling them out of each TensorProto's own raw_data via
+// AdoptFromTensorProto -- entries are moved out of the map as they're
+// consumed. This is for a caller (see cpp2py_export.cc's
+// export_safetensors/export_gguf) that already has the tensor bytes
+// separately and stripped `model`'s own raw_data fields before crossing it
+// into C++, to avoid paying a full protobuf encode/decode of the
+// (potentially huge) tensor data on top of the copies pool.Add and the
+// eventual archive write already make. A tensor with no raw_data left (or
+// none to begin with, e.g. it already used a typed field) and no matching
+// entry in the map is simply not adopted, same as AdoptFromTensorProto's
+// own "nothing eligible" case.
 inline std::vector<std::pair<std::string, onnx::TensorProto*>>
-AdoptAllWithPlaceholderOffsets(onnx::ModelProto& model,
-                               const std::string& archive_path,
-                               TensorPool& pool) {
+AdoptAllWithPlaceholderOffsets(
+    onnx::ModelProto& model, const std::string& archive_path, TensorPool& pool,
+    std::map<std::string, std::string>* external_tensor_bytes = nullptr) {
   std::vector<std::pair<std::string, onnx::TensorProto*>> adopted;
   detail::ForEachTensor(*model.mutable_graph(), [&](const std::string& name,
                                                     onnx::TensorProto& t) {
-    if (!AdoptFromTensorProto(name, t, pool)) return;
+    bool ok;
+    if (external_tensor_bytes != nullptr) {
+      auto it = external_tensor_bytes->find(name);
+      if (it == external_tensor_bytes->end()) {
+        ok = false;
+      } else {
+        std::vector<int64_t> shape(t.dims().begin(), t.dims().end());
+        pool.Add(name, t.data_type(), std::move(shape), std::move(it->second));
+        external_tensor_bytes->erase(it);
+        t.clear_raw_data();
+        ok = true;
+      }
+    } else {
+      ok = AdoptFromTensorProto(name, t, pool);
+    }
+    if (!ok) return;
     t.set_data_location(onnx::TensorProto::EXTERNAL);
     t.clear_external_data();
     auto set_kv = [&](const std::string& k, const std::string& v) {
@@ -658,10 +687,11 @@ inline void PatchFileBytes(const std::string& path, uint64_t offset,
 // involved. Every weight tensor is written to disk exactly once; the model
 // blob itself is written, then patched in place (same algorithm as
 // SaveModelAsGGUFStandalone) -- see this section's top comment.
-inline void SaveModelAsSafetensorsStandalone(onnx::ModelProto& model,
-                                             const std::string& path,
-                                             TensorPool& pool) {
-  auto adopted = AdoptAllWithPlaceholderOffsets(model, path, pool);
+inline void SaveModelAsSafetensorsStandalone(
+    onnx::ModelProto& model, const std::string& path, TensorPool& pool,
+    std::map<std::string, std::string>* external_tensor_bytes = nullptr) {
+  auto adopted =
+      AdoptAllWithPlaceholderOffsets(model, path, pool, external_tensor_bytes);
   CheckNoEmbeddedModelKeyCollision(pool);
 
   std::string placeholder_bytes;
