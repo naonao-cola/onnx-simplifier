@@ -100,6 +100,53 @@ direct execution) and how a non-constant/tied `gamma`/`beta`/`bias`, or a
 consumed optional `mean`/`inv_std_var` output, is declined the same
 conservative way as everything above.
 
+The same optimizer tool typically fuses an FFN block's own bias-add and
+activation together too, the same way it fuses a residual `Add` into
+`SkipLayerNormalization` above: ``com.microsoft::BiasGelu(A, B) = Gelu(A +
+B)`` (erf-based, the common case) and ``com.microsoft::FastGelu(X[, bias])``
+(the tanh-approximated Gelu, with `bias` optional) both collapse an ordinary
+``MatMul -> Add(bias) -> Gelu`` FFN hop into one node -- confirmed against
+onnxruntime's own schema (`contrib_defs.cc`) and CPU kernel (`bias_gelu.cc`)
+and by direct execution. Without also recognizing these, an FFN chain this
+whole feature exists for (``up = MatMul(x, W1); h = BiasGelu(up, Bias1);
+down = MatMul(h, W2)``) would fail at that one hop and the whole chain would
+go unpruned, the same gap the `SkipLayerNormalization` fix above closed for
+residual connections. :func:`_walk_to_consumer`/
+:func:`_walk_matmul_producer_backward` (the forward and backward MatMul/Gemm
+hop walkers) both recognize a `BiasGelu`/`FastGelu` node the same way they
+already recognize a bias/scale `Add`/`Mul` hop -- see
+:func:`_match_fused_bias_gelu` and `_FUSED_BIAS_GELU_OPS`'s own comment --
+sliced by the same `keep` set alongside everything else; a non-constant bias
+(`BiasGelu`'s own schema requires one; `FastGelu`'s is optional) declines
+the node outright, never guessed at. This is a MatMul/Gemm-chain-only hop,
+deliberately not extended to Conv chains: a real Conv already carries any
+bias in its own third input (see the Conv paragraph below), and neither
+fusion targets Conv graphs in practice. `com.microsoft::QuickGelu(X) = X *
+Sigmoid(alpha * X)` -- the third Gelu-family fusion the same optimizer tool
+emits, used by some model families in place of `BiasGelu`/`FastGelu` -- is a
+simpler case still: it takes no bias operand at all (`alpha` is a node
+*attribute*, not an input), so it is exactly as unary/shape-preserving as
+`Gelu`/`Sigmoid` already in `_UNARY_PASS_THROUGH`, and is matched by simply
+being added to that set -- extending every walker that already consults it
+(both MatMul/Gemm and Conv, forward and backward alike, plus
+:func:`_trace_gate_producer_backward`'s own gated-pair gate-activation
+matcher below) for free, with no dedicated hop machinery needed. A gated
+(SwiGLU/GeGLU) pair's own gate branch fused into `BiasGelu`/`FastGelu`
+specifically (as opposed to plain `Gelu`/`Sigmoid`, or the now-unary
+`QuickGelu`) is *not* recognized by :func:`_trace_gate_producer_backward`,
+and is left out of scope deliberately rather than extended: that tracer only
+ever walks back through single-input unary ops, with nowhere on
+:class:`_Producer` to carry a gate-branch-local bias constant the way
+`_Chain.chain_ops` already does for the shared post-combine chain, so
+supporting it would need new machinery (a `_Producer`-local `chain_ops`
+counterpart), not a one-line addition like `QuickGelu`'s. It is also the
+narrower case in practice: a gated FFN's gate projection commonly carries no
+bias at all (e.g. Llama-family linear layers), and when it does, only a
+*separate* `Add`+`Gelu` on that branch is even eligible for onnxruntime's
+own fusion pass to collapse into `BiasGelu`/`FastGelu` in the first place --
+a plain unfused `Gelu`/`Sigmoid` gate (already handled) is the shape that
+survives when there's no bias to fuse to begin with.
+
 General multi-branch dependency-graph pruning -- arbitrary fan-out, non-Add
 merges (`Concat`, ...) -- remains out of scope. The
 other part of the paper's pipeline -- an architecture *search* over what to prune,
@@ -1525,9 +1572,57 @@ _UNARY_PASS_THROUGH = {
     "Mish",
     "Identity",
     "Cast",
+    # com.microsoft::QuickGelu(X) = X * Sigmoid(alpha * X) (alpha an
+    # attribute, default 1.702, not a second *input* -- confirmed against
+    # onnxruntime's own schema, contrib_defs.cc, and by direct execution,
+    # see this module's own docstring): a single-input, single-output,
+    # purely elementwise activation exactly like every other entry in this
+    # set, just from a different domain -- membership here is by op_type
+    # alone for every entry, never by domain (a same-named op in an
+    # unrelated custom domain has always been a theoretical risk this set
+    # accepts, not one unique to this entry). Being unary, it needs no
+    # dedicated hop machinery at all: adding it here alone already extends
+    # every walker that already consults `_UNARY_PASS_THROUGH` --
+    # `_walk_to_consumer`/`_walk_to_conv_consumer` (forward), their two
+    # backward counterparts, *and* `_trace_gate_producer_backward`'s own
+    # gated-pair gate-activation matcher -- for free.
+    "QuickGelu",
 }
 _BINARY_CHANNEL_OPS = {"Add", "Mul"}
 _MAX_CHAIN_HOPS = 8
+
+# com.microsoft's fused bias-add + Gelu-family activation nodes -- the FFN
+# analogue of the SkipLayerNormalization residual fusion above, done by the
+# same onnxruntime transformer-optimizer tool: `BiasGelu(A, B) = Gelu(A + B)`
+# (erf-based, exactly plain ONNX Gelu's own default `approximate="none"`)
+# and `FastGelu(X[, bias]) = Gelu_tanh(X [+ bias])` (the tanh approximation,
+# `bias` optional) both fuse an FFN's bias-add into its following activation
+# the same way `BiasGelu`'s own name suggests -- confirmed against
+# onnxruntime's own schema (`contrib_defs.cc`) and CPU kernel
+# (`bias_gelu.cc`'s shared `BiasGelu<T, use_approximation>::AddBiasGelu`,
+# which literally computes `value = input[i] + bias[i]` then erf- or
+# tanh-based Gelu on `value`) and by direct execution. Neither fusion
+# changes *which* Gelu variant is being computed -- FastGelu's tanh
+# approximation is a different formula from plain `Gelu`'s erf-based one
+# regardless of fusion, already true before this pass ever mattered to
+# either -- so, exactly like a bias/scale `Add`/`Mul` hop's own constant,
+# what matters here is only that each is a per-channel-independent,
+# shape-preserving elementwise op with one extra constant operand to slice,
+# not its particular activation math. `BiasGelu`'s own schema makes `B`
+# (bias) a *required* second input; `FastGelu`'s marks its own `bias`
+# *optional* -- both handled by :func:`_match_fused_bias_gelu` below. Like
+# the `_BINARY_CHANNEL_OPS` bias/scale hop these sit alongside, this is a
+# MatMul/Gemm-chain-only hop (:func:`_walk_to_consumer`/
+# :func:`_walk_matmul_producer_backward`): Conv chains already decline any
+# per-channel `Add`/`Mul` hop at all (a real Conv's bias already lives in
+# its own third input, see this module's own docstring), and neither
+# optimizer fusion targets Conv graphs in practice, so no Conv-side
+# analogue is added.
+_FUSED_BIAS_GELU_OPS: Dict[str, bool] = {
+    "BiasGelu": True,  # bias (input 1) required by BiasGelu's own schema
+    "FastGelu": False,  # bias (input 1) optional for FastGelu
+}
+_FUSED_BIAS_GELU_DOMAIN = "com.microsoft"
 
 _ConsumerMatch = Tuple[onnx.NodeProto, str, bool]  # (node, weight, weight_transposed)
 
@@ -1638,6 +1733,61 @@ def _match_producer(
     return w_name, weight_transposed, bias_name, n_channels
 
 
+def _match_fused_bias_gelu(
+    node: onnx.NodeProto, initializer_map: Dict[str, onnx.TensorProto]
+) -> Optional[Tuple[str, Optional[str]]]:
+    """If `node` is a ``com.microsoft::BiasGelu``/``FastGelu`` node (see
+    `_FUSED_BIAS_GELU_OPS`'s own comment above for the exact fused
+    arithmetic and how it was confirmed), returns ``(data_name,
+    bias_name_or_None)``: `data_name` is the node's own primary input (`A`/
+    `X`, input 0), and `bias_name` is its per-channel bias operand (input 1)
+    when present and a constant float initializer shaped like a flat
+    per-last-axis vector -- the same self-consistency bar
+    :func:`_walk_matmul_producer_backward`'s own `_BINARY_CHANNEL_OPS` hop
+    check already uses (the real ``dims[-1] == n_channels`` check is
+    deferred to the caller: :func:`_walk_to_consumer` already knows
+    `n_channels` and checks immediately; :func:`_walk_matmul_producer_backward`
+    doesn't yet, and defers to :func:`_find_matmul_residual_chains` once the
+    group's real channel count is known, exactly like that hop's own and
+    `_skip_layer_norm_const_names`'s own deferred check).
+
+    Declines (``None``) when `node` isn't one of these ops/domain at all, or
+    when its bias is required but missing (`BiasGelu`'s own schema makes its
+    `B` input required, unlike `FastGelu`'s optional `bias`) or present but
+    non-constant -- never guessed at, the same conservative bar a
+    non-constant bias/scale on an ordinary `Add`/`Mul` hop already gets.
+    `FastGelu` with its bias genuinely absent (omitted entirely, or present
+    as an empty placeholder) returns ``(data_name, None)`` -- no term to
+    slice, the same shape a `SkipLayerNormalization` node's own absent
+    `beta`/`bias` already gets.
+    """
+    bias_required = _FUSED_BIAS_GELU_OPS.get(node.op_type)
+    if (
+        bias_required is None
+        or node.domain != _FUSED_BIAS_GELU_DOMAIN
+        or not node.input
+        or not node.input[0]
+        or len(node.output) != 1
+    ):
+        return None
+    data_name = node.input[0]
+    has_bias_input = len(node.input) > 1 and bool(node.input[1])
+    if not has_bias_input:
+        if bias_required:
+            return None  # BiasGelu's own schema requires a bias operand
+        return data_name, None  # FastGelu with no bias -- plain tanh-Gelu(x)
+    bias_name = node.input[1]
+    bias_init = initializer_map.get(bias_name)
+    if (
+        bias_init is None
+        or bias_init.data_type != onnx.TensorProto.FLOAT
+        or not list(bias_init.dims)
+        or int(np.prod(bias_init.dims)) != bias_init.dims[-1]
+    ):
+        return None  # non-constant bias -- can't safely slice/prune it
+    return data_name, bias_name
+
+
 def _walk_to_consumer(
     start: str,
     initializer_map: Dict[str, onnx.TensorProto],
@@ -1647,9 +1797,11 @@ def _walk_to_consumer(
     max_hops: int,
 ) -> Tuple[Optional[_ConsumerMatch], Tuple[Tuple[onnx.NodeProto, Optional[str]], ...]]:
     """From tensor `start`, walks forward through shape-preserving
-    elementwise ops (an activation, or an Add/Mul against a constant
-    per-channel bias/scale) with no other consumer anywhere along the way,
-    until a MatMul/vanilla-Gemm consumer is found whose reduction
+    elementwise ops (an activation, an Add/Mul against a constant
+    per-channel bias/scale, or a fused ``com.microsoft::BiasGelu``/
+    ``FastGelu`` node -- see `_FUSED_BIAS_GELU_OPS`'s own comment and
+    :func:`_match_fused_bias_gelu`) with no other consumer anywhere along
+    the way, until a MatMul/vanilla-Gemm consumer is found whose reduction
     dimension matches `n_channels`. Returns ``(None, ())`` if the walk
     runs out of hops, hits a branch, or never reaches such a consumer.
     """
@@ -1701,6 +1853,16 @@ def _walk_to_consumer(
                 const_name = other
             else:
                 break
+        elif nxt.op_type in _FUSED_BIAS_GELU_OPS:
+            fused = _match_fused_bias_gelu(nxt, initializer_map)
+            if fused is None or fused[0] != cur:
+                break
+            _, bias_name = fused
+            if bias_name is not None and (
+                initializer_map[bias_name].dims[-1] != n_channels
+            ):
+                break
+            const_name = bias_name
         else:
             break
 
@@ -2813,6 +2975,15 @@ def _walk_matmul_producer_backward(
             # ``SkipLayerNormalization``-family node specifically) or
             # `"fail"` is correct.
 
+        if node.op_type in _FUSED_BIAS_GELU_OPS:
+            fused = _match_fused_bias_gelu(node, initializer_map)
+            if fused is not None:
+                data_name, bias_name = fused
+                chain_ops.append((node, bias_name))
+                cur = data_name
+                continue
+            return "fail", None, ()
+
         merge = _match_matmul_residual_merge(
             node, initializer_map, consumers_of, graph_outputs
         )
@@ -2953,12 +3124,14 @@ def _find_matmul_residual_chains(graph: onnx.GraphProto) -> List[_Chain]:
             continue  # branches disagree on channel count -- decline
         n_channels = next(iter(n_channels_set))
 
-        # Every bias/scale hop's constant, and every SkipLayerNorm-family
-        # merge's own gamma/beta/bias, was only self-consistently checked
-        # when first crossed/matched (see _walk_matmul_producer_backward,
-        # _match_matmul_residual_merge); now that the group's real channel
-        # count is known, re-validate it actually matches -- mirroring the
-        # depthwise-Conv-hop re-validation in _find_conv_residual_chains.
+        # Every bias/scale hop's constant (an Add/Mul hop's own, or a fused
+        # BiasGelu/FastGelu hop's own bias -- see _match_fused_bias_gelu),
+        # and every SkipLayerNorm-family merge's own gamma/beta/bias, was
+        # only self-consistently checked when first crossed/matched (see
+        # _walk_matmul_producer_backward, _match_matmul_residual_merge); now
+        # that the group's real channel count is known, re-validate it
+        # actually matches -- mirroring the depthwise-Conv-hop re-validation
+        # in _find_conv_residual_chains.
         if any(
             const_name is not None
             and initializer_map[const_name].dims[-1] != n_channels

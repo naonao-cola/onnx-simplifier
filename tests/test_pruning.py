@@ -1428,6 +1428,346 @@ def test_structured_pruning_chains_through_a_third_layer():
     np.testing.assert_allclose(y, y_oracle, rtol=1e-5, atol=1e-5)
 
 
+# --- apply_structured_pruning: fused BiasGelu/FastGelu/QuickGelu hop --------
+#
+# onnxruntime's own transformer-optimizer tool typically fuses an FFN
+# block's bias-add and Gelu-family activation into one node --
+# `com.microsoft::BiasGelu(A, B) = Gelu(A + B)` (erf-based) and
+# `com.microsoft::FastGelu(X[, bias])` (the tanh approximation, bias
+# optional) both collapse `MatMul -> Add(bias) -> Gelu` into a single hop;
+# `com.microsoft::QuickGelu(X) = X * Sigmoid(alpha * X)` is a third,
+# bias-free fusion some model families use instead. Semantics confirmed
+# against onnxruntime's own schema (`contrib_defs.cc`) and CPU kernel
+# (`bias_gelu.cc`'s shared `AddBiasGelu`, `quick_gelu.cc`) and by direct
+# execution before any of this was written -- see this module's own
+# docstring for the exact arithmetic and matching functions.
+
+
+def _erf_gelu(x):
+    # math.erf rather than scipy.special.erf, matching this file's own
+    # "needs no scipy/erf" convention for the tanh-approximated Gelu oracle
+    # above -- math.erf is stdlib, no extra dependency either.
+    import math
+
+    return 0.5 * x * (1.0 + np.vectorize(math.erf)(x / np.sqrt(2.0)))
+
+
+def _tanh_gelu(x):
+    return 0.5 * x * (1.0 + np.tanh(np.sqrt(2.0 / np.pi) * (x + 0.044715 * x**3)))
+
+
+def _quick_gelu(x, alpha=1.702):
+    return x * (1.0 / (1.0 + np.exp(-alpha * x)))
+
+
+def test_structured_pruning_bias_gelu_chain_matches_oracle():
+    # up = MatMul(x, W1); h = BiasGelu(up, Bias1); down = MatMul(h, W2) --
+    # the realistic fused-FFN shape this feature exists for. W1, Bias1, and
+    # W2 must all be sliced to the same combined-importance keep set.
+    K, H, Out = 8, 16, 4
+    rng = np.random.default_rng(120)
+    w1 = rng.standard_normal((K, H)).astype(np.float32)
+    bias1 = rng.standard_normal((H,)).astype(np.float32)
+    w2 = rng.standard_normal((H, Out)).astype(np.float32)
+    model = _model(
+        f"""
+        g (float[batch,{K}] X) => (float[batch,{Out}] Y)
+        {{
+          up = MatMul(X, W1)
+          h = com.microsoft.BiasGelu(up, Bias1)
+          Y = MatMul(h, W2)
+        }}
+        """,
+        initializer=[_f32(w1, "W1"), _f32(bias1, "Bias1"), _f32(w2, "W2")],
+        opset=17,
+    )
+    model.opset_import.append(onnx.helper.make_opsetid("com.microsoft", 1))
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    inits = {t.name: t for t in pruned.graph.initializer}
+    assert list(inits["W1"].dims) == [K, H // 2]
+    assert list(inits["Bias1"].dims) == [H // 2]
+    assert list(inits["W2"].dims) == [H // 2, Out]
+
+    keep = _oracle_keep_indices(w1, H // 2)
+    x = rng.standard_normal((5, K)).astype(np.float32)
+    (y,) = _run(pruned, {"X": x})
+    h = _erf_gelu(x @ w1[:, keep] + bias1[keep])
+    y_oracle = h @ w2[keep, :]
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-4, atol=1e-4)
+
+
+def test_structured_pruning_bias_gelu_declines_on_nonconstant_bias():
+    # BiasGelu's own schema makes its bias operand required, but here it's a
+    # graph input rather than a constant initializer -- can't safely slice
+    # it, so the whole chain is declined and the model is left
+    # byte-identical, the same conservative bar a non-constant Gemm bias
+    # already gets elsewhere in this module.
+    K, H, Out = 8, 16, 4
+    rng = np.random.default_rng(121)
+    w1 = rng.standard_normal((K, H)).astype(np.float32)
+    w2 = rng.standard_normal((H, Out)).astype(np.float32)
+    model = _model(
+        f"""
+        g (float[batch,{K}] X, float[{H}] Bias1) => (float[batch,{Out}] Y)
+        {{
+          up = MatMul(X, W1)
+          h = com.microsoft.BiasGelu(up, Bias1)
+          Y = MatMul(h, W2)
+        }}
+        """,
+        initializer=[_f32(w1, "W1"), _f32(w2, "W2")],
+        opset=17,
+    )
+    model.opset_import.append(onnx.helper.make_opsetid("com.microsoft", 1))
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    assert pruned.SerializeToString() == model.SerializeToString()
+
+
+def test_structured_pruning_fast_gelu_with_bias_chain_matches_oracle():
+    # FastGelu's own bias is optional but present here -- same per-channel
+    # slicing bar as BiasGelu's required one, just via a different schema
+    # path (_match_fused_bias_gelu's own bias_required=False branch),
+    # and the tanh-approximated Gelu formula rather than the erf-based one.
+    K, H, Out = 8, 16, 4
+    rng = np.random.default_rng(122)
+    w1 = rng.standard_normal((K, H)).astype(np.float32)
+    bias1 = rng.standard_normal((H,)).astype(np.float32)
+    w2 = rng.standard_normal((H, Out)).astype(np.float32)
+    model = _model(
+        f"""
+        g (float[batch,{K}] X) => (float[batch,{Out}] Y)
+        {{
+          up = MatMul(X, W1)
+          h = com.microsoft.FastGelu(up, Bias1)
+          Y = MatMul(h, W2)
+        }}
+        """,
+        initializer=[_f32(w1, "W1"), _f32(bias1, "Bias1"), _f32(w2, "W2")],
+        opset=17,
+    )
+    model.opset_import.append(onnx.helper.make_opsetid("com.microsoft", 1))
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    inits = {t.name: t for t in pruned.graph.initializer}
+    assert list(inits["Bias1"].dims) == [H // 2]
+
+    keep = _oracle_keep_indices(w1, H // 2)
+    x = rng.standard_normal((5, K)).astype(np.float32)
+    (y,) = _run(pruned, {"X": x})
+    h = _tanh_gelu(x @ w1[:, keep] + bias1[keep])
+    y_oracle = h @ w2[keep, :]
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-4, atol=1e-4)
+
+
+def test_structured_pruning_fast_gelu_no_bias_chain_matches_oracle():
+    # FastGelu with its own optional bias genuinely absent -- exercises
+    # _match_fused_bias_gelu's own "bias omitted entirely" branch (a plain
+    # tanh-Gelu(x), no per-channel constant to slice at all).
+    K, H, Out = 8, 16, 4
+    rng = np.random.default_rng(123)
+    w1 = rng.standard_normal((K, H)).astype(np.float32)
+    w2 = rng.standard_normal((H, Out)).astype(np.float32)
+    model = _model(
+        f"""
+        g (float[batch,{K}] X) => (float[batch,{Out}] Y)
+        {{
+          up = MatMul(X, W1)
+          h = com.microsoft.FastGelu(up)
+          Y = MatMul(h, W2)
+        }}
+        """,
+        initializer=[_f32(w1, "W1"), _f32(w2, "W2")],
+        opset=17,
+    )
+    model.opset_import.append(onnx.helper.make_opsetid("com.microsoft", 1))
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    inits = {t.name: t for t in pruned.graph.initializer}
+    assert list(inits["W1"].dims) == [K, H // 2]
+    assert list(inits["W2"].dims) == [H // 2, Out]
+
+    keep = _oracle_keep_indices(w1, H // 2)
+    x = rng.standard_normal((5, K)).astype(np.float32)
+    (y,) = _run(pruned, {"X": x})
+    h = _tanh_gelu(x @ w1[:, keep])
+    y_oracle = h @ w2[keep, :]
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-4, atol=1e-4)
+
+
+def test_structured_pruning_quick_gelu_chain_matches_oracle():
+    # QuickGelu(X) = X * Sigmoid(alpha * X) takes no bias operand at all
+    # (alpha is a node attribute, not a second input), so -- unlike
+    # BiasGelu/FastGelu -- it needed no dedicated hop machinery, only
+    # joining `_UNARY_PASS_THROUGH`. Still gets its own oracle-verified
+    # test rather than assuming that "just works" from set membership alone.
+    K, H, Out = 8, 16, 4
+    rng = np.random.default_rng(124)
+    w1 = rng.standard_normal((K, H)).astype(np.float32)
+    w2 = rng.standard_normal((H, Out)).astype(np.float32)
+    model = _model(
+        f"""
+        g (float[batch,{K}] X) => (float[batch,{Out}] Y)
+        {{
+          up = MatMul(X, W1)
+          h = com.microsoft.QuickGelu(up)
+          Y = MatMul(h, W2)
+        }}
+        """,
+        initializer=[_f32(w1, "W1"), _f32(w2, "W2")],
+        opset=17,
+    )
+    model.opset_import.append(onnx.helper.make_opsetid("com.microsoft", 1))
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    inits = {t.name: t for t in pruned.graph.initializer}
+    assert list(inits["W1"].dims) == [K, H // 2]
+    assert list(inits["W2"].dims) == [H // 2, Out]
+
+    keep = _oracle_keep_indices(w1, H // 2)
+    x = rng.standard_normal((5, K)).astype(np.float32)
+    (y,) = _run(pruned, {"X": x})
+    h = _quick_gelu(x @ w1[:, keep])
+    y_oracle = h @ w2[keep, :]
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-4, atol=1e-4)
+
+
+def test_structured_pruning_conv_bias_gelu_hop_is_not_recognized():
+    # This fused-bias-activation hop is deliberately MatMul/Gemm-only (see
+    # this module's own docstring): a real Conv already carries any bias in
+    # its own third input, and neither optimizer fusion targets Conv graphs
+    # in practice. A Conv -> BiasGelu -> Conv chain must therefore be left
+    # completely untouched, the same as any other unrecognized hop.
+    Cin, Cmid, Cout, spatial = 4, 8, 6, 10
+    rng = np.random.default_rng(125)
+    w1 = rng.standard_normal((Cmid, Cin, 3, 3)).astype(np.float32)
+    bias1 = rng.standard_normal((Cmid,)).astype(np.float32)
+    w2 = rng.standard_normal((Cout, Cmid, 3, 3)).astype(np.float32)
+    mid_spatial = spatial - 2
+    out_spatial = mid_spatial - 2
+    model = _model(
+        f"""
+        g (float[N,{Cin},{spatial},{spatial}] X) => (float[N,{Cout},{out_spatial},{out_spatial}] Y)
+        {{
+          up = Conv<kernel_shape=[3,3]>(X, W1)
+          h = com.microsoft.BiasGelu(up, Bias1)
+          Y = Conv<kernel_shape=[3,3]>(h, W2)
+        }}
+        """,
+        initializer=[_f32(w1, "W1"), _f32(bias1, "Bias1"), _f32(w2, "W2")],
+        opset=17,
+    )
+    model.opset_import.append(onnx.helper.make_opsetid("com.microsoft", 1))
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    assert pruned.SerializeToString() == model.SerializeToString()
+
+
+def test_structured_wanda_pruning_bias_gelu_chain_matches_oracle():
+    # apply_structured_wanda_pruning picks up the fused BiasGelu hop for
+    # free (the same _find_chains/_walk_to_consumer chain-finder as plain
+    # apply_structured_pruning) -- oracle-verified with real calibration
+    # data driving the activation-norm-weighted importance ranking.
+    K, H, Out = 8, 16, 4
+    rng = np.random.default_rng(126)
+    w1 = rng.standard_normal((K, H)).astype(np.float32)
+    bias1 = rng.standard_normal((H,)).astype(np.float32)
+    w2 = rng.standard_normal((H, Out)).astype(np.float32)
+    model = _model(
+        f"""
+        g (float[batch,{K}] X) => (float[batch,{Out}] Y)
+        {{
+          up = MatMul(X, W1)
+          h = com.microsoft.BiasGelu(up, Bias1)
+          Y = MatMul(h, W2)
+        }}
+        """,
+        initializer=[_f32(w1, "W1"), _f32(bias1, "Bias1"), _f32(w2, "W2")],
+        opset=17,
+    )
+    model.opset_import.append(onnx.helper.make_opsetid("com.microsoft", 1))
+
+    rng_cal = np.random.default_rng(127)
+    x_cal = rng_cal.standard_normal((32, K)).astype(np.float32)
+    calibration_data = [{"X": x_cal}]
+
+    pruned = onnxsim.apply_structured_wanda_pruning(
+        model, calibration_data=calibration_data, sparsity=0.5
+    )
+    onnx.checker.check_model(pruned)
+
+    # The activation norm is captured where the chain feeds its consumer --
+    # i.e. after BiasGelu, not the producer's raw pre-activation output.
+    h_cal = _erf_gelu(x_cal @ w1 + bias1)
+    act_norm = np.sqrt(np.mean(np.square(h_cal), axis=0))
+    importance = np.linalg.norm(w1.T, axis=1) * np.maximum(act_norm, 1e-8)
+    keep = np.sort(np.argsort(-importance)[: H // 2])
+
+    x = rng_cal.standard_normal((5, K)).astype(np.float32)
+    (y,) = _run(pruned, {"X": x})
+    h = _erf_gelu(x @ w1[:, keep] + bias1[keep])
+    y_oracle = h @ w2[keep, :]
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-4, atol=1e-4)
+
+
+def test_structured_pruning_matmul_residual_add_bias_gelu_hop_matches_oracle():
+    # One residual branch has a fused BiasGelu between its producer and the
+    # merge point -- exercises _walk_matmul_producer_backward's own new
+    # BiasGelu/FastGelu hop (the backward mirror of the forward walk's own
+    # hop tested above), telling it apart from the bare Add residual merge
+    # it sits next to.
+    K, C, Out = 8, 16, 4
+    rng = np.random.default_rng(128)
+    w1 = rng.standard_normal((K, C)).astype(np.float32)
+    bias1 = rng.standard_normal((C,)).astype(np.float32)
+    ws = rng.standard_normal((K, C)).astype(np.float32)
+    wout = rng.standard_normal((C, Out)).astype(np.float32)
+    model = _model(
+        f"""
+        g (float[batch,{K}] X) => (float[batch,{Out}] Y)
+        {{
+          h = MatMul(X, W1)
+          f = com.microsoft.BiasGelu(h, Bias1)
+          s = MatMul(X, WS)
+          addr = Add(f, s)
+          r = Relu(addr)
+          Y = MatMul(r, WOUT)
+        }}
+        """,
+        initializer=[
+            _f32(w1, "W1"),
+            _f32(bias1, "Bias1"),
+            _f32(ws, "WS"),
+            _f32(wout, "WOUT"),
+        ],
+        opset=17,
+    )
+    model.opset_import.append(onnx.helper.make_opsetid("com.microsoft", 1))
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    inits = {t.name: t for t in pruned.graph.initializer}
+    assert list(inits["Bias1"].dims) == [C // 2]
+
+    importance = np.sqrt(
+        np.square(np.linalg.norm(w1.astype(np.float64), axis=0))
+        + np.square(np.linalg.norm(ws.astype(np.float64), axis=0))
+    )
+    keep = np.sort(np.argsort(-importance)[: C // 2])
+
+    x = rng.standard_normal((5, K)).astype(np.float32)
+    (y,) = _run(pruned, {"X": x})
+    f = _erf_gelu(x @ w1[:, keep] + bias1[keep])
+    s = x @ ws[:, keep]
+    y_oracle = np.maximum(f + s, 0) @ wout[keep, :]
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-4, atol=1e-4)
+
+
 # --- apply_structured_pruning: gated FFN (SwiGLU/GeGLU) ----------------------
 
 
@@ -1529,6 +1869,52 @@ def test_structured_pruning_gelu_gated_ffn_matches_oracle():
 
     g = x @ wg[:, keep]
     gate = 0.5 * g * (1.0 + np.tanh(np.sqrt(2.0 / np.pi) * (g + 0.044715 * g**3)))
+    up = x @ wu[:, keep]
+    y_oracle = (gate * up) @ wd[keep, :]
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-4, atol=1e-4)
+
+
+def test_structured_pruning_quick_gelu_gated_ffn_matches_oracle():
+    # A gate branch fused into com.microsoft::QuickGelu -- some real
+    # gated-FFN model families use this in place of a plain Sigmoid/Gelu
+    # gate. QuickGelu is unary (no bias operand at all), so it needed no
+    # dedicated gated-chain machinery -- adding it to _UNARY_PASS_THROUGH
+    # alone already lets _trace_gate_producer_backward's own unary-only
+    # backward trace recognize it, the same way it already recognizes a
+    # plain Sigmoid/Gelu gate above. Confirmed here rather than assumed:
+    # this module's own docstring explicitly declines the *bias-carrying*
+    # BiasGelu/FastGelu fusion on a gate branch (out of scope, see there),
+    # but QuickGelu -- bias-free -- is not that case.
+    K, H, Out = 8, 16, 4
+    rng = np.random.default_rng(129)
+    wg = rng.standard_normal((K, H)).astype(np.float32)
+    wu = rng.standard_normal((K, H)).astype(np.float32)
+    wd = rng.standard_normal((H, Out)).astype(np.float32)
+    model = _model(
+        f"""
+        g (float[batch,{K}] X) => (float[batch,{Out}] Y)
+        {{
+          gate = MatMul(X, Wg)
+          gate_act = com.microsoft.QuickGelu(gate)
+          up = MatMul(X, Wu)
+          h = Mul(gate_act, up)
+          Y = MatMul(h, Wd)
+        }}
+        """,
+        initializer=[_f32(wg, "Wg"), _f32(wu, "Wu"), _f32(wd, "Wd")],
+        opset=17,
+    )
+    model.opset_import.append(onnx.helper.make_opsetid("com.microsoft", 1))
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    keep = _combined_keep_indices(wg, wu, H // 2)
+
+    x = rng.standard_normal((5, K)).astype(np.float32)
+    (y,) = _run(pruned, {"X": x})
+
+    g = x @ wg[:, keep]
+    gate = _quick_gelu(g)
     up = x @ wu[:, keep]
     y_oracle = (gate * up) @ wd[keep, :]
     np.testing.assert_allclose(y, y_oracle, rtol=1e-4, atol=1e-4)
