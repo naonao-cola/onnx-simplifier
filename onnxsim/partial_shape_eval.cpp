@@ -205,7 +205,8 @@ onnxsim::SymNode ToSymNode(const onnx::NodeProto& node) {
 // every dim that happens to be 1, including ones the real, unseen axes list
 // would not have touched). M1 (EvaluateSymbolicValues) does not need this: it
 // evaluates every node in topological order, `Constant` included.
-std::optional<onnxsim::SymTensor> ConstantNodeValue(const onnxsim::SymNode& node) {
+std::optional<onnxsim::SymTensor> ConstantNodeValue(
+    const onnxsim::SymNode& node) {
   if (node.op_type != "Constant") return std::nullopt;
   if (const onnxsim::SymAttr* a = node.attr("value")) {
     if (a->t) return *a->t;
