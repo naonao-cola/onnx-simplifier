@@ -746,51 +746,140 @@ def test_wanda_pruning_conv_protects_high_activation_channel():
     assert wanda_err < magnitude_err
 
 
-def test_wanda_pruning_conv_falls_back_to_magnitude_for_auto_pad():
-    # auto_pad SAME_UPPER's padding depends on the input's own spatial
-    # size, not something fixed per node -- :func:`_conv_spatial_attrs`
-    # declines it, so Wanda must fall back to plain magnitude for this
-    # layer rather than guessing at the padding.
-    Cin, Cout, spatial = 3, 6, 10
-    rng = np.random.default_rng(74)
-    w = rng.standard_normal((Cout, Cin, 3, 3)).astype(np.float32)
+def test_wanda_pruning_conv_auto_pad_matches_manual_im2col_importance_oracle_exactly():
+    # An earlier version of this module declined auto_pad entirely
+    # (_conv_spatial_attrs used to return None for any non-"NOTSET" value)
+    # and fell back to plain magnitude. auto_pad's own padding is now
+    # resolved per calibration batch from the input's own spatial size
+    # (_resolve_conv_pads, per the ONNX Conv operator's own auto_pad
+    # formula) instead. kh=3, stride=2, spatial=8 is deliberately chosen so
+    # SAME_UPPER's own pad_total = 1 is *odd*, making the resolved padding
+    # asymmetric (pad_top=0, pad_bottom=1): a bug putting the extra pixel
+    # on the wrong edge, or splitting it evenly, would silently shift every
+    # captured patch and diverge from this independently-padded oracle.
+    Cin, Cout, kh, kw, spatial, stride = 3, 6, 3, 3, 8, 2
+    rng = np.random.default_rng(101)
+    w = rng.standard_normal((Cout, Cin, kh, kw)).astype(np.float32)
+    out_spatial = 4  # ceil(8 / 2)
     model = _single_conv_model(
-        w, spatial=spatial, extra_attrs='auto_pad="SAME_UPPER"', out_spatial=spatial
+        w,
+        spatial=spatial,
+        extra_attrs=f'auto_pad="SAME_UPPER", strides=[{stride},{stride}]',
+        out_spatial=out_spatial,
     )
-    x = rng.standard_normal((2, Cin, spatial, spatial)).astype(np.float32)
 
-    magnitude_pruned = onnxsim.apply_magnitude_pruning(model, sparsity=0.5)
-    wanda_pruned = onnxsim.apply_wanda_pruning(
+    rng_x = np.random.default_rng(102)
+    x = rng_x.standard_normal((3, Cin, spatial, spatial)).astype(np.float32)
+
+    pruned = onnxsim.apply_wanda_pruning(
         model, calibration_data=[{"X": x}], sparsity=0.5
     )
-    onnx.checker.check_model(wanda_pruned)
-    np.testing.assert_array_equal(
-        _conv_weight(wanda_pruned), _conv_weight(magnitude_pruned)
-    )
+    onnx.checker.check_model(pruned)
+    # End-to-end sanity: the padded/strided pruned model still actually
+    # runs through onnxruntime and produces the shape its own graph
+    # declares.
+    (float_y,) = _run(model, {"X": x})
+    (pruned_y,) = _run(pruned, {"X": x})
+    assert pruned_y.shape == float_y.shape == (3, Cout, out_spatial, out_spatial)
+    assert np.all(np.isfinite(pruned_y))
+
+    # Independent oracle: ONNX's own auto_pad formula
+    # (https://onnx.ai/onnx/operators/onnx__Conv.html), computed fresh here
+    # rather than calling onnxsim.pruning._resolve_conv_pads.
+    pad_total = max(0, (out_spatial - 1) * stride + kh - spatial)
+    pad_lo, pad_hi = pad_total // 2, pad_total - pad_total // 2
+    assert (pad_lo, pad_hi) == (0, 1)  # confirms the deliberately odd split
+    xp = np.pad(x, ((0, 0), (0, 0), (pad_lo, pad_hi), (pad_lo, pad_hi)))
+    K = Cin * kh * kw
+    patches = np.zeros((x.shape[0] * out_spatial * out_spatial, K), dtype=np.float64)
+    idx = 0
+    for ni in range(x.shape[0]):
+        for oh in range(out_spatial):
+            for ow in range(out_spatial):
+                patch = xp[
+                    ni,
+                    :,
+                    oh * stride : oh * stride + kh,
+                    ow * stride : ow * stride + kw,
+                ].astype(np.float64)
+                patches[idx] = patch.reshape(-1)
+                idx += 1
+    act_norm = np.sqrt(np.mean(np.square(patches), axis=0))
+
+    w_flat = w.astype(np.float64).reshape(Cout, K)
+    importance = np.abs(w_flat) * act_norm[np.newaxis, :]
+    keep = round(K * 0.5)
+    order = np.argsort(importance, axis=1)
+    drop = order[:, : K - keep]
+    mask = np.ones((Cout, K), dtype=bool)
+    np.put_along_axis(mask, drop, False, axis=1)
+    expected = np.where(mask, w_flat, 0.0).reshape(Cout, Cin, kh, kw)
+
+    np.testing.assert_allclose(_conv_weight(pruned).astype(np.float64), expected)
 
 
-def test_wanda_pruning_conv_falls_back_to_magnitude_for_dilated_conv():
-    # A dilated receptive field's (kh, kw) offsets aren't evenly spaced in
-    # the padded input the way sliding_window_view assumes --
-    # :func:`_conv_spatial_attrs` declines non-all-ones dilations, so
-    # Wanda must fall back to plain magnitude for this layer too.
-    Cin, Cout, spatial = 3, 6, 10
-    rng = np.random.default_rng(75)
-    w = rng.standard_normal((Cout, Cin, 3, 3)).astype(np.float32)
-    out_spatial = spatial - 2 * (3 - 1)  # dilation=2, kernel=3, no padding
+def test_wanda_pruning_conv_dilated_matches_manual_im2col_importance_oracle_exactly():
+    # An earlier version of this module declined every non-unit dilation
+    # entirely (sliding_window_view's own unit-offset window assumed
+    # unit-spaced taps) and fell back to plain magnitude. Each of the
+    # kh*kw taps is now extracted from its own dilation-offset strided
+    # slice instead. Adversarial by construction: kernel_shape=[3,3],
+    # dilations=[3,3] spaces the 9 taps 3 pixels apart within a 7x7
+    # effective receptive field (spatial=13) -- if onnxsim's own tap
+    # offsetting were off by even one pixel (e.g. silently treating
+    # dilation as if it were 1, the bug the earlier decline specifically
+    # guarded against), every captured patch would read the wrong pixels
+    # and the exact-equality oracle comparison below would fail.
+    Cin, Cout, kh, kw, spatial, dilation = 3, 6, 3, 3, 13, 3
+    rng = np.random.default_rng(103)
+    w = rng.standard_normal((Cout, Cin, kh, kw)).astype(np.float32)
+    eff_k = (kh - 1) * dilation + 1  # 7
+    out_spatial = spatial - eff_k + 1  # 7
     model = _single_conv_model(
-        w, spatial=spatial, extra_attrs="dilations=[2,2]", out_spatial=out_spatial
+        w,
+        spatial=spatial,
+        extra_attrs=f"dilations=[{dilation},{dilation}]",
+        out_spatial=out_spatial,
     )
-    x = rng.standard_normal((2, Cin, spatial, spatial)).astype(np.float32)
 
-    magnitude_pruned = onnxsim.apply_magnitude_pruning(model, sparsity=0.5)
-    wanda_pruned = onnxsim.apply_wanda_pruning(
+    rng_x = np.random.default_rng(104)
+    x = rng_x.standard_normal((3, Cin, spatial, spatial)).astype(np.float32)
+
+    pruned = onnxsim.apply_wanda_pruning(
         model, calibration_data=[{"X": x}], sparsity=0.5
     )
-    onnx.checker.check_model(wanda_pruned)
-    np.testing.assert_array_equal(
-        _conv_weight(wanda_pruned), _conv_weight(magnitude_pruned)
-    )
+    onnx.checker.check_model(pruned)
+    (float_y,) = _run(model, {"X": x})
+    (pruned_y,) = _run(pruned, {"X": x})
+    assert pruned_y.shape == float_y.shape == (3, Cout, out_spatial, out_spatial)
+    assert np.all(np.isfinite(pruned_y))
+
+    K = Cin * kh * kw
+    patches = np.zeros((x.shape[0] * out_spatial * out_spatial, K), dtype=np.float64)
+    idx = 0
+    for ni in range(x.shape[0]):
+        for oh in range(out_spatial):
+            for ow in range(out_spatial):
+                patch = x[
+                    ni,
+                    :,
+                    oh : oh + eff_k : dilation,
+                    ow : ow + eff_k : dilation,
+                ].astype(np.float64)
+                patches[idx] = patch.reshape(-1)
+                idx += 1
+    act_norm = np.sqrt(np.mean(np.square(patches), axis=0))
+
+    w_flat = w.astype(np.float64).reshape(Cout, K)
+    importance = np.abs(w_flat) * act_norm[np.newaxis, :]
+    keep = round(K * 0.5)
+    order = np.argsort(importance, axis=1)
+    drop = order[:, : K - keep]
+    mask = np.ones((Cout, K), dtype=bool)
+    np.put_along_axis(mask, drop, False, axis=1)
+    expected = np.where(mask, w_flat, 0.0).reshape(Cout, Cin, kh, kw)
+
+    np.testing.assert_allclose(_conv_weight(pruned).astype(np.float64), expected)
 
 
 def test_wanda_pruning_conv_grouped_uses_own_groups_activation_norm():
@@ -1349,43 +1438,123 @@ def test_sparsegpt_pruning_conv_no_calibration_batches_leaves_layer_untouched():
     np.testing.assert_array_equal(_conv_weight(pruned), w)
 
 
-def test_sparsegpt_pruning_conv_declines_auto_pad():
-    # auto_pad SAME_UPPER's padding depends on the input's own spatial
-    # size -- _conv_spatial_attrs declines it, so (unlike Wanda, which
-    # falls back to plain magnitude) SparseGPT must leave the layer
-    # completely untouched: there is no data-free fallback here.
-    Cin, Cout, spatial = 3, 6, 10
+def test_sparsegpt_pruning_conv_auto_pad_matches_reference_transliteration():
+    # An earlier version of this module declined auto_pad entirely and left
+    # the layer completely untouched (no data-free fallback for
+    # SparseGPT). auto_pad's own padding is now resolved per calibration
+    # batch from the input's own spatial size (_resolve_conv_pads). Same
+    # deliberately-odd-pad_total setup as the Wanda auto_pad oracle test
+    # above (kh=3, stride=2, spatial=8 -> SAME_UPPER pad_total=1, split
+    # pad_top=0/pad_bottom=1) so a wrong-edge or symmetric-split bug would
+    # be caught, this time via the full im2col Hessian
+    # (_reference_sparsegpt), not just a per-offset norm.
+    Cin, Cout, kh, kw, spatial, stride = 3, 6, 3, 3, 8, 2
     rng = np.random.default_rng(98)
-    w = rng.standard_normal((Cout, Cin, 3, 3)).astype(np.float32)
+    w = rng.standard_normal((Cout, Cin, kh, kw)).astype(np.float32) * 0.5
+    out_spatial = 4  # ceil(8 / 2)
     model = _single_conv_model(
-        w, spatial=spatial, extra_attrs='auto_pad="SAME_UPPER"', out_spatial=spatial
+        w,
+        spatial=spatial,
+        extra_attrs=f'auto_pad="SAME_UPPER", strides=[{stride},{stride}]',
+        out_spatial=out_spatial,
     )
-    x_cal = rng.standard_normal((4, Cin, spatial, spatial)).astype(np.float32)
+    rng_x = np.random.default_rng(198)
+    x = rng_x.standard_normal((3, Cin, spatial, spatial)).astype(np.float32)
 
     pruned = onnxsim.apply_sparsegpt_pruning(
-        model, calibration_data=[{"X": x_cal}], sparsity=0.5
+        model, calibration_data=[{"X": x}], sparsity=0.5, proc_block_size=12
     )
-    np.testing.assert_array_equal(_conv_weight(pruned), w)
+    onnx.checker.check_model(pruned)
+    (float_y,) = _run(model, {"X": x})
+    (pruned_y,) = _run(pruned, {"X": x})
+    assert pruned_y.shape == float_y.shape == (3, Cout, out_spatial, out_spatial)
+    assert np.all(np.isfinite(pruned_y))
+
+    pad_total = max(0, (out_spatial - 1) * stride + kh - spatial)
+    pad_lo, pad_hi = pad_total // 2, pad_total - pad_total // 2
+    assert (pad_lo, pad_hi) == (0, 1)  # confirms the deliberately odd split
+    xp = np.pad(x, ((0, 0), (0, 0), (pad_lo, pad_hi), (pad_lo, pad_hi)))
+    K = Cin * kh * kw
+    patches = np.zeros((x.shape[0] * out_spatial * out_spatial, K), dtype=np.float64)
+    idx = 0
+    for ni in range(x.shape[0]):
+        for oh in range(out_spatial):
+            for ow in range(out_spatial):
+                patch = xp[
+                    ni,
+                    :,
+                    oh * stride : oh * stride + kh,
+                    ow * stride : ow * stride + kw,
+                ].astype(np.float64)
+                patches[idx] = patch.reshape(-1)
+                idx += 1
+    h = patches.T @ patches
+
+    w_nk = w.astype(np.float64).reshape(Cout, K)
+    expected_nk = _reference_sparsegpt(
+        w_nk, h, sparsity=0.5, n=None, m=None, percdamp=0.01, blocksize=12
+    )
+    expected = expected_nk.reshape(Cout, Cin, kh, kw)
+    np.testing.assert_allclose(
+        _conv_weight(pruned).astype(np.float64), expected, rtol=1e-6, atol=1e-6
+    )
 
 
-def test_sparsegpt_pruning_conv_declines_dilated_conv():
-    # A dilated receptive field's (kh, kw) offsets aren't evenly spaced in
-    # the padded input the way sliding_window_view assumes --
-    # _conv_spatial_attrs declines non-all-ones dilations, so this layer
-    # is left completely untouched too.
-    Cin, Cout, spatial = 3, 6, 10
+def test_sparsegpt_pruning_conv_dilated_matches_reference_transliteration():
+    # An earlier version of this module declined every non-unit dilation
+    # entirely and left the layer completely untouched. Same
+    # deliberately-spaced-out adversarial dilation setup as the Wanda
+    # dilation oracle test above (kernel_shape=[3,3], dilations=[3,3],
+    # spatial=13 -> taps 3 pixels apart within a 7x7 effective receptive
+    # field): an off-by-one in tap offsetting would misalign every column
+    # of the Hessian this test's own independent im2col unfold builds.
+    Cin, Cout, kh, kw, spatial, dilation = 3, 6, 3, 3, 13, 3
     rng = np.random.default_rng(99)
-    w = rng.standard_normal((Cout, Cin, 3, 3)).astype(np.float32)
-    out_spatial = spatial - 2 * (3 - 1)  # dilation=2, kernel=3, no padding
+    w = rng.standard_normal((Cout, Cin, kh, kw)).astype(np.float32) * 0.5
+    eff_k = (kh - 1) * dilation + 1  # 7
+    out_spatial = spatial - eff_k + 1  # 7
     model = _single_conv_model(
-        w, spatial=spatial, extra_attrs="dilations=[2,2]", out_spatial=out_spatial
+        w,
+        spatial=spatial,
+        extra_attrs=f"dilations=[{dilation},{dilation}]",
+        out_spatial=out_spatial,
     )
-    x_cal = rng.standard_normal((4, Cin, spatial, spatial)).astype(np.float32)
+    rng_x = np.random.default_rng(199)
+    x = rng_x.standard_normal((3, Cin, spatial, spatial)).astype(np.float32)
 
     pruned = onnxsim.apply_sparsegpt_pruning(
-        model, calibration_data=[{"X": x_cal}], sparsity=0.5
+        model, calibration_data=[{"X": x}], sparsity=0.5, proc_block_size=12
     )
-    np.testing.assert_array_equal(_conv_weight(pruned), w)
+    onnx.checker.check_model(pruned)
+    (float_y,) = _run(model, {"X": x})
+    (pruned_y,) = _run(pruned, {"X": x})
+    assert pruned_y.shape == float_y.shape == (3, Cout, out_spatial, out_spatial)
+    assert np.all(np.isfinite(pruned_y))
+
+    K = Cin * kh * kw
+    patches = np.zeros((x.shape[0] * out_spatial * out_spatial, K), dtype=np.float64)
+    idx = 0
+    for ni in range(x.shape[0]):
+        for oh in range(out_spatial):
+            for ow in range(out_spatial):
+                patch = x[
+                    ni,
+                    :,
+                    oh : oh + eff_k : dilation,
+                    ow : ow + eff_k : dilation,
+                ].astype(np.float64)
+                patches[idx] = patch.reshape(-1)
+                idx += 1
+    h = patches.T @ patches
+
+    w_nk = w.astype(np.float64).reshape(Cout, K)
+    expected_nk = _reference_sparsegpt(
+        w_nk, h, sparsity=0.5, n=None, m=None, percdamp=0.01, blocksize=12
+    )
+    expected = expected_nk.reshape(Cout, Cin, kh, kw)
+    np.testing.assert_allclose(
+        _conv_weight(pruned).astype(np.float64), expected, rtol=1e-6, atol=1e-6
+    )
 
 
 def test_sparsegpt_pruning_conv_reconstructs_better_than_a_same_mask_style_baseline():
@@ -1673,10 +1842,15 @@ def test_sparsegpt_pruning_conv_grouped_reaches_target_sparsity():
     assert onnxsim.weight_sparsity(pruned) == pytest.approx(0.5, abs=0.02)
 
 
-def test_sparsegpt_pruning_conv_grouped_declines_auto_pad():
-    # Verification bar item 5: a grouped Conv still gets no data-free
-    # fallback -- auto_pad SAME_UPPER makes _conv_spatial_attrs decline the
-    # node, so the whole layer (every group) is left completely untouched.
+def test_sparsegpt_pruning_conv_grouped_auto_pad_reaches_target_sparsity():
+    # An earlier version of this module declined auto_pad entirely, so a
+    # grouped Conv with auto_pad got no data-free fallback (every group
+    # left completely untouched). auto_pad is now resolved per calibration
+    # batch (_resolve_conv_pads) before each group's own im2col Hessian is
+    # built, so a grouped auto_pad Conv is pruned like any other -- the
+    # padding/dilation resolution happens once per node, upstream of the
+    # per-group channel-slicing this test's grouped siblings elsewhere in
+    # this file already hold to a stricter (exact-oracle) bar.
     Cin_per_group, Cout, group, spatial = 2, 8, 2, 10
     rng = np.random.default_rng(137)
     w = rng.standard_normal((Cout, Cin_per_group, 3, 3)).astype(np.float32)
@@ -1687,14 +1861,23 @@ def test_sparsegpt_pruning_conv_grouped_declines_auto_pad():
         extra_attrs='auto_pad="SAME_UPPER"',
         out_spatial=spatial,
     )
-    x_cal = rng.standard_normal((4, Cin_per_group * group, spatial, spatial)).astype(
+    x_cal = rng.standard_normal((16, Cin_per_group * group, spatial, spatial)).astype(
         np.float32
     )
 
     pruned = onnxsim.apply_sparsegpt_pruning(
         model, calibration_data=[{"X": x_cal}], sparsity=0.5
     )
-    np.testing.assert_array_equal(_conv_weight(pruned), w)
+    onnx.checker.check_model(pruned)
+    assert not np.array_equal(_conv_weight(pruned), w)  # actually pruned, not skipped
+    assert onnxsim.weight_sparsity(pruned) == pytest.approx(0.5, abs=0.02)
+    x = rng.standard_normal((2, Cin_per_group * group, spatial, spatial)).astype(
+        np.float32
+    )
+    (float_y,) = _run(model, {"X": x})
+    (pruned_y,) = _run(pruned, {"X": x})
+    assert pruned_y.shape == float_y.shape
+    assert np.all(np.isfinite(pruned_y))
 
 
 def test_sparsegpt_pruning_conv_grouped_reconstructs_better_than_a_same_mask_style_baseline():
@@ -3139,6 +3322,123 @@ def test_structured_pruning_conv_chain_matches_manual_channel_deletion_exactly()
     np.testing.assert_allclose(y, y_oracle, rtol=1e-5, atol=1e-5)
 
 
+def _auto_pad_conv_pair_model(w1, w2, spatial=10, activation="Relu"):
+    # The auto_pad analogue of _conv_pair_model: both Convs keep their own
+    # non-default auto_pad="SAME_UPPER" -- neither _match_conv_producer nor
+    # _match_conv_consumer (the matchers apply_structured_pruning/
+    # apply_structured_wanda_pruning's own producer/consumer chain-walk
+    # uses) reads that attribute at all, so this is expected to be matched,
+    # sliced, and re-run exactly like the plain _conv_pair_model chain
+    # above -- see this module's own docstring for why: channel pruning
+    # only ever indexes the weight tensor's own out_channels/in_channels
+    # axes, never the spatial receptive-field math auto_pad changes.
+    # auto_pad="SAME_UPPER" keeps each Conv's own output spatial size equal
+    # to its input's, so the chain composes with no separate out_spatial
+    # bookkeeping.
+    Cin, C2 = w1.shape[1], w2.shape[0]
+    return _model(
+        f"""
+        g (float[N,{Cin},{spatial},{spatial}] X) => (float[N,{C2},{spatial},{spatial}] Y)
+        {{
+          h = Conv<kernel_shape=[3,3], auto_pad="SAME_UPPER">(X, W1)
+          a = {activation}(h)
+          Y = Conv<kernel_shape=[3,3], auto_pad="SAME_UPPER">(a, W2)
+        }}
+        """,
+        initializer=[_f32(w1, "W1"), _f32(w2, "W2")],
+    )
+
+
+def _dilated_conv_pair_model(w1, w2, dilation=3, spatial=19, activation="Relu"):
+    # The dilations analogue of _conv_pair_model, same reasoning as
+    # _auto_pad_conv_pair_model above but for a non-unit dilation instead
+    # (kept in a separate model/test from auto_pad -- not because
+    # apply_structured_pruning/apply_structured_wanda_pruning need it kept
+    # separate, but because onnxruntime's own CPU EP rejects a Conv node
+    # combining a non-unit dilation with auto_pad SAME_UPPER/SAME_LOWER
+    # ("Dilation not supported for AutoPadType::SAME_UPPER or
+    # AutoPadType::SAME_LOWER"), discovered empirically while writing this
+    # test -- an onnxruntime limitation on the *input* model this pass
+    # would be asked to prune, not anything about onnxsim's own pruning
+    # logic, but it means a real onnxruntime-executable adversarial model
+    # can't combine both non-default attributes in one node). No explicit
+    # padding either (`pads` defaults to all-zero, "VALID"-equivalent), so
+    # each Conv's own output spatial size shrinks by the dilated kernel's
+    # own effective extent.
+    Cin, C2 = w1.shape[1], w2.shape[0]
+    eff_k = (3 - 1) * dilation + 1
+    mid_spatial = spatial - eff_k + 1
+    out_spatial = mid_spatial - eff_k + 1
+    d = f"dilations=[{dilation},{dilation}]"
+    return _model(
+        f"""
+        g (float[N,{Cin},{spatial},{spatial}] X) => (float[N,{C2},{out_spatial},{out_spatial}] Y)
+        {{
+          h = Conv<kernel_shape=[3,3], {d}>(X, W1)
+          a = {activation}(h)
+          Y = Conv<kernel_shape=[3,3], {d}>(a, W2)
+        }}
+        """,
+        initializer=[_f32(w1, "W1"), _f32(w2, "W2")],
+    )
+
+
+def test_structured_pruning_conv_chain_with_auto_pad_matches_oracle_exactly():
+    # Confirms empirically (not just "in principle") that a non-default
+    # auto_pad Conv chain is *already* matched and pruned correctly by
+    # apply_structured_pruning -- _match_conv_producer/_match_conv_consumer
+    # never inspect that attribute at all (see this module's own docstring
+    # and _auto_pad_conv_pair_model above), so there is no restriction here
+    # to lift, only this regression test locking the already-correct
+    # behavior in place. Same oracle bar as
+    # test_structured_pruning_conv_chain_matches_manual_channel_deletion_exactly:
+    # exact equivalence, via onnxruntime, to deleting the same output
+    # filters by hand -- auto_pad itself must also survive onto both the
+    # pruned producer and consumer unchanged for this to pass, since the
+    # oracle model carries it too.
+    Cin, C1, C2 = 3, 16, 8
+    rng = np.random.default_rng(230)
+    w1 = rng.standard_normal((C1, Cin, 3, 3)).astype(np.float32)
+    w2 = rng.standard_normal((C2, C1, 3, 3)).astype(np.float32)
+    model = _auto_pad_conv_pair_model(w1, w2)
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    keep = _oracle_keep_indices_conv(w1, C1 // 2)
+    oracle = _auto_pad_conv_pair_model(w1[keep], w2[:, keep])
+
+    rng_x = np.random.default_rng(231)
+    x = rng_x.standard_normal((2, Cin, 10, 10)).astype(np.float32)
+    (y,) = _run(pruned, {"X": x})
+    (y_oracle,) = _run(oracle, {"X": x})
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-5, atol=1e-5)
+
+
+def test_structured_pruning_conv_chain_with_dilation_matches_oracle_exactly():
+    # The dilation analogue of the auto_pad test above -- same "no
+    # restriction to lift, only a regression test locking already-correct
+    # behavior in place" bar, this time for a non-unit dilations Conv
+    # chain.
+    Cin, C1, C2 = 3, 16, 8
+    rng = np.random.default_rng(232)
+    w1 = rng.standard_normal((C1, Cin, 3, 3)).astype(np.float32)
+    w2 = rng.standard_normal((C2, C1, 3, 3)).astype(np.float32)
+    model = _dilated_conv_pair_model(w1, w2)
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    keep = _oracle_keep_indices_conv(w1, C1 // 2)
+    oracle = _dilated_conv_pair_model(w1[keep], w2[:, keep])
+
+    rng_x = np.random.default_rng(233)
+    x = rng_x.standard_normal((2, Cin, 19, 19)).astype(np.float32)
+    (y,) = _run(pruned, {"X": x})
+    (y_oracle,) = _run(oracle, {"X": x})
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-5, atol=1e-5)
+
+
 def test_structured_pruning_conv_only_chain_matches_oracle_no_bias():
     # No Conv bias at all, and a non-Relu activation -- a plain
     # Conv -> Sigmoid -> Conv chain.
@@ -3524,6 +3824,83 @@ def test_structured_wanda_pruning_conv_chain_matches_oracle_exactly():
     (y,) = _run(pruned, {"X": x})
     (y_oracle,) = _run(oracle, {"X": x})
     np.testing.assert_allclose(y, y_oracle, rtol=1e-5, atol=1e-5)
+
+
+def _structured_wanda_conv_chain_attrs_regression(
+    model_fn, spatial, seed_w, seed_cal, seed_x
+):
+    # Shared body for the auto_pad-only and dilation-only structured Wanda
+    # regression tests below: confirms empirically that
+    # apply_structured_wanda_pruning's own calibration-activation capture
+    # is unaffected by a non-default consumer-Conv attribute -- the probe
+    # point is the *raw* activation feeding the chain's consumer (captured
+    # before that consumer ever applies its own padding/dilation to it),
+    # reduced over every axis but the channel one; auto_pad/dilations only
+    # govern how the consumer computes *its own* output from that
+    # already-captured activation, never which values the probe itself
+    # reads or which channel axis they belong to. One input channel is
+    # deliberately scaled far above the rest (the same protects-high-
+    # activation-channel engineering the unstructured Wanda Conv test above
+    # uses) so the resulting keep set is actually activation-driven,
+    # verified below to differ from plain L2-norm-only ranking -- not
+    # merely reproducing it by coincidence, the same "prove the metric is
+    # doing something" bar test_wanda_pruning_conv_protects_high_activation_channel
+    # already holds unstructured Wanda to.
+    Cin, C1, C2 = 3, 16, 8
+    salient_input_channel = 1
+    rng = np.random.default_rng(seed_w)
+    w1 = rng.standard_normal((C1, Cin, 3, 3)).astype(np.float32) * 0.5
+    w2 = rng.standard_normal((C2, C1, 3, 3)).astype(np.float32)
+    model = model_fn(w1, w2)
+
+    probe_model = onnx.ModelProto()
+    probe_model.CopyFrom(model)
+    probe_model.graph.output.append(
+        onnx.helper.make_tensor_value_info("a", onnx.TensorProto.FLOAT, None)
+    )
+
+    rng_cal = np.random.default_rng(seed_cal)
+    x_cal = rng_cal.standard_normal((2, Cin, spatial, spatial)).astype(np.float32)
+    x_cal[:, salient_input_channel, :, :] *= 25.0
+    calibration_data = [{"X": x_cal}]
+
+    _, a_cal = _run(probe_model, {"X": x_cal})
+    act_norm = np.sqrt(np.mean(np.square(a_cal.astype(np.float64)), axis=(0, 2, 3)))
+    importance = np.linalg.norm(
+        w1.reshape(C1, -1).astype(np.float64), axis=1
+    ) * np.maximum(act_norm, 1e-8)
+    keep = np.sort(np.argsort(-importance)[: C1 // 2])
+    plain_keep = np.sort(
+        np.argsort(-np.linalg.norm(w1.reshape(C1, -1).astype(np.float64), axis=1))[
+            : C1 // 2
+        ]
+    )
+    assert not np.array_equal(keep, plain_keep)  # the activation term matters here
+
+    pruned = onnxsim.apply_structured_wanda_pruning(
+        model, calibration_data=calibration_data, sparsity=0.5
+    )
+    onnx.checker.check_model(pruned)
+
+    oracle = model_fn(w1[keep], w2[:, keep])
+    rng_x = np.random.default_rng(seed_x)
+    x = rng_x.standard_normal((2, Cin, spatial, spatial)).astype(np.float32)
+    x[:, salient_input_channel, :, :] *= 25.0
+    (y,) = _run(pruned, {"X": x})
+    (y_oracle,) = _run(oracle, {"X": x})
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-5, atol=1e-5)
+
+
+def test_structured_wanda_pruning_conv_chain_with_auto_pad_matches_oracle_exactly():
+    _structured_wanda_conv_chain_attrs_regression(
+        _auto_pad_conv_pair_model, spatial=10, seed_w=240, seed_cal=241, seed_x=242
+    )
+
+
+def test_structured_wanda_pruning_conv_chain_with_dilation_matches_oracle_exactly():
+    _structured_wanda_conv_chain_attrs_regression(
+        _dilated_conv_pair_model, spatial=19, seed_w=243, seed_cal=244, seed_x=245
+    )
 
 
 def test_structured_wanda_pruning_depthwise_pass_through_matches_oracle_exactly():
