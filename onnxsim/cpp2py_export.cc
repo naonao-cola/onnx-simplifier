@@ -14,6 +14,7 @@
 #include <nanobind/trampoline.h>
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstdint>
 #include <optional>
@@ -322,6 +323,19 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
 
   using namespace py::literals;
 
+  // The maximum default-domain ("" / "ai.onnx") opset version this build's
+  // compiled-in onnx schema registry knows about -- i.e. what
+  // target_opset_version="latest" resolves to. Exposed so the Python side can
+  // resolve "latest" against the same registry ConvertOpsetVersion itself
+  // uses, rather than guessing from the (possibly differently-versioned)
+  // pip-installed `onnx` package.
+  m.def("max_default_domain_opset_version", []() {
+    return onnx::OpSchemaRegistry::DomainToVersionRange::Instance()
+        .Map()
+        .at("")
+        .second;
+  });
+
   // Compute the model metrics (op counts, size, MACs, memory access, peak
   // footprint) in C++ so the Python ``model_info`` can delegate the counting to
   // a single implementation. The symbolic metrics are returned as
@@ -533,6 +547,112 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
         return py::bytes(out.data(), out.size());
       },
       "model_bytes"_a);
+
+  // OCP Microscaling MXFP4 weight-only quantizes every MatMul/vanilla-Gemm
+  // whose weight is a constant float32 tensor whose reduction dimension is
+  // divisible by 32, via a Gather-a-codebook-then-scale dequant chain (no
+  // native ONNX MX tensor type). Activations are never touched, so no
+  // calibration data is needed. See QuantizeWeightOnlyMXFP4 in onnxsim.h.
+  m.def(
+      "quantize_weight_only_mxfp4",
+      [](const py::bytes& model_proto_bytes) -> py::bytes {
+        InitEnv();
+        ONNX_NAMESPACE::ModelProto model;
+        ParseProtoFromBytes(&model, model_proto_bytes.c_str(),
+                            model_proto_bytes.size());
+        const auto result = QuantizeWeightOnlyMXFP4(model);
+        std::string out;
+        result.SerializeToString(&out);
+        return py::bytes(out.data(), out.size());
+      },
+      "model_bytes"_a);
+
+  // QLoRA-style double quantization: quantizes every already-present
+  // DequantizeLinear node's own (large enough) constant scale tensor to
+  // UINT8 with a per-tensor meta-scale. See ApplyDoubleQuantization in
+  // onnxsim.h.
+  m.def(
+      "apply_double_quantization",
+      [](const py::bytes& model_proto_bytes) -> py::bytes {
+        InitEnv();
+        ONNX_NAMESPACE::ModelProto model;
+        ParseProtoFromBytes(&model, model_proto_bytes.c_str(),
+                            model_proto_bytes.size());
+        const auto result = ApplyDoubleQuantization(model);
+        std::string out;
+        result.SerializeToString(&out);
+        return py::bytes(out.data(), out.size());
+      },
+      "model_bytes"_a);
+
+  // Magnitude pruning (Han et al., 2015): zeros the least-magnitude entries
+  // of every MatMul/vanilla-Gemm/Conv layer's constant weight, independently
+  // per output row/filter. Data-free. See PruneMagnitude in onnxsim.h.
+  m.def(
+      "prune_magnitude",
+      [](const py::bytes& model_proto_bytes, double sparsity) -> py::bytes {
+        InitEnv();
+        ONNX_NAMESPACE::ModelProto model;
+        ParseProtoFromBytes(&model, model_proto_bytes.c_str(),
+                            model_proto_bytes.size());
+        const auto result = PruneMagnitude(model, sparsity);
+        std::string out;
+        result.SerializeToString(&out);
+        return py::bytes(out.data(), out.size());
+      },
+      "model_bytes"_a, "sparsity"_a);
+
+  // Structured (channel) pruning: removes whole output channels from
+  // MatMul/vanilla-Gemm and Conv layers -- real structural pruning, not
+  // just value-only zeroing. See ApplyStructuredPruning in onnxsim.h.
+  m.def(
+      "apply_structured_pruning",
+      [](const py::bytes& model_proto_bytes, double sparsity) -> py::bytes {
+        InitEnv();
+        ONNX_NAMESPACE::ModelProto model;
+        ParseProtoFromBytes(&model, model_proto_bytes.c_str(),
+                            model_proto_bytes.size());
+        const auto result = ApplyStructuredPruning(model, sparsity);
+        std::string out;
+        result.SerializeToString(&out);
+        return py::bytes(out.data(), out.size());
+      },
+      "model_bytes"_a, "sparsity"_a);
+
+  // Attention-head pruning: removes whole attention heads (or, for
+  // grouped-query attention, whole KV groups) from every matched fused
+  // self-attention block. See ApplyAttentionHeadPruning in onnxsim.h.
+  m.def(
+      "apply_attention_head_pruning",
+      [](const py::bytes& model_proto_bytes, double sparsity) -> py::bytes {
+        InitEnv();
+        ONNX_NAMESPACE::ModelProto model;
+        ParseProtoFromBytes(&model, model_proto_bytes.c_str(),
+                            model_proto_bytes.size());
+        const auto result = ApplyAttentionHeadPruning(model, sparsity);
+        std::string out;
+        result.SerializeToString(&out);
+        return py::bytes(out.data(), out.size());
+      },
+      "model_bytes"_a, "sparsity"_a);
+
+  // QuaRot (Ashkboos et al., 2024): rotation preprocessing plus INT4
+  // round-to-nearest quantization of both the weight and the activation of
+  // every MatMul/vanilla-Gemm layer. Data-free. See ApplyQuarot in
+  // onnxsim.h.
+  m.def(
+      "apply_quarot",
+      [](const py::bytes& model_proto_bytes, uint64_t seed) -> py::bytes {
+        InitEnv();
+        ONNX_NAMESPACE::ModelProto model;
+        ParseProtoFromBytes(&model, model_proto_bytes.c_str(),
+                            model_proto_bytes.size());
+        const auto result = ApplyQuarot(model, seed);
+        std::string out;
+        result.SerializeToString(&out);
+        return py::bytes(out.data(), out.size());
+      },
+      "model_bytes"_a, "seed"_a);
 
   // Lists the activation tensor names quantize_static could quantize --
   // see ListQuantizableActivations in onnxsim.h.
@@ -1264,63 +1384,211 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
       },
       "rules"_a);
 
+  // Python-facing view of TensorPool (see tensor_pool.h): the named,
+  // ref-counted tensor store that ``load_model`` below populates as it
+  // resolves a model's external weights. Returned alongside the model so a
+  // caller can inspect what was actually loaded -- e.g. verify a tensor's
+  // ContentHash, or hydrate one on demand after a ``hydrate_all=False``
+  // load -- without re-deriving it from the model's own initializers.
+  //
+  // Caveat inherited from mmap_file.h's TryMmapFile (see its own doc
+  // comment): for a classic-external-data load, an entry's bytes may alias
+  // a live memory mapping of the file on disk, so on Windows that file
+  // can't be deleted or moved while this pool object is still alive (POSIX
+  // has no such restriction). `bytes`/`dtype`/`shape`/`content_hash` below
+  // all return independent copies, so extracting what's needed and then
+  // dropping the pool is always safe.
+  py::class_<onnxsim::tensor_pool::TensorPool>(m, "TensorPool")
+      .def("__len__", &onnxsim::tensor_pool::TensorPool::size)
+      .def("__contains__",
+           [](const onnxsim::tensor_pool::TensorPool& pool,
+              const std::string& name) { return pool.Find(name) != nullptr; })
+      .def("names",
+           [](const onnxsim::tensor_pool::TensorPool& pool) {
+             std::vector<std::string> names;
+             names.reserve(pool.size());
+             for (const auto& [name, entry] : pool) names.push_back(name);
+             return names;
+           })
+      .def("dtype",
+           [](const onnxsim::tensor_pool::TensorPool& pool,
+              const std::string& name) -> int32_t {
+             const auto* entry = pool.Find(name);
+             if (entry == nullptr) {
+               throw std::out_of_range("TensorPool: no entry named '" + name +
+                                       "'");
+             }
+             return entry->dtype;
+           })
+      .def("shape",
+           [](const onnxsim::tensor_pool::TensorPool& pool,
+              const std::string& name) -> std::vector<int64_t> {
+             const auto* entry = pool.Find(name);
+             if (entry == nullptr) {
+               throw std::out_of_range("TensorPool: no entry named '" + name +
+                                       "'");
+             }
+             return entry->shape;
+           })
+      .def("bytes",
+           [](const onnxsim::tensor_pool::TensorPool& pool,
+              const std::string& name) -> py::bytes {
+             const auto* entry = pool.Find(name);
+             if (entry == nullptr) {
+               throw std::out_of_range("TensorPool: no entry named '" + name +
+                                       "'");
+             }
+             return py::bytes(entry->data.data(), entry->data.size());
+           })
+      .def("content_hash", &onnxsim::tensor_pool::TensorPool::ContentHash,
+           "name"_a);
+
   // Standalone safetensors/GGUF archive export/import: a model's graph and
   // weights packaged together in one ecosystem-standard file (see
   // onnxsim/tensor_pool_bridge.h and tensor_pool_gguf_bridge.h's *Standalone
   // functions for the real-offset design). Exchanged as bytes for the model
   // (like ``simplify``) and a real path for the archive itself, since the
   // archive is inherently file-based.
+  //
+  // `tensor_bytes` carries each eligible tensor's raw_data separately from
+  // `model_bytes` (whose Python caller has already stripped those same
+  // fields before serializing) -- avoids paying a full protobuf encode
+  // (Python) + decode (here) of the tensor data on top of the copies
+  // AdoptAllWithPlaceholderOffsets/the archive write already make; see that
+  // function's doc comment. Converting each py::bytes to a std::string is
+  // the one necessary copy of that tensor's bytes crossing into C++.
   m.def(
       "export_safetensors",
-      [](const py::bytes& model_bytes, const std::string& out_path) {
+      [](const py::bytes& model_bytes,
+         std::map<std::string, py::bytes>& tensor_bytes,
+         const std::string& out_path) {
         onnx::ModelProto model;
         ParseProtoFromBytes(&model, model_bytes.c_str(), model_bytes.size());
+        std::map<std::string, std::string> external_bytes;
+        for (auto& [name, b] : tensor_bytes) {
+          external_bytes.emplace(name, std::string(b.c_str(), b.size()));
+        }
         onnxsim::tensor_pool::TensorPool pool;
-        onnxsim::tensor_pool::SaveModelAsSafetensorsStandalone(model, out_path,
-                                                               pool);
+        onnxsim::tensor_pool::SaveModelAsSafetensorsStandalone(
+            model, out_path, pool, &external_bytes);
       },
-      "model_bytes"_a, "out_path"_a);
+      "model_bytes"_a, "tensor_bytes"_a, "out_path"_a);
 
+  // Always loads lazily (hydrate_all=false) for the same reason
+  // load_model's binding does -- see that binding's comment. Returns the
+  // TensorPool too so the Python wrapper can hydrate tensor-by-tensor
+  // itself instead of paying a second full-model serialize/parse here.
   m.def(
       "import_safetensors",
-      [](const std::string& in_path) -> py::bytes {
+      [](const std::string& in_path)
+          -> std::tuple<py::bytes, onnxsim::tensor_pool::TensorPool> {
         onnx::ModelProto model;
         onnxsim::tensor_pool::TensorPool pool;
-        if (!onnxsim::tensor_pool::LoadModelFromSafetensors(in_path, &model,
-                                                            pool)) {
+        if (!onnxsim::tensor_pool::LoadModelFromSafetensors(
+                in_path, &model, pool, /*hydrate_all=*/false)) {
           throw std::runtime_error(
               "safetensors file has no embedded onnxsim model (a plain "
               "weights-only archive is not importable as a graph)");
         }
         const std::string out = model.SerializeAsString();
-        return py::bytes(out.data(), out.size());
+        return {py::bytes(out.data(), out.size()), std::move(pool)};
       },
       "in_path"_a);
 
   m.def(
       "export_gguf",
-      [](const py::bytes& model_bytes, const std::string& out_path) {
+      [](const py::bytes& model_bytes,
+         std::map<std::string, py::bytes>& tensor_bytes,
+         const std::string& out_path) {
         onnx::ModelProto model;
         ParseProtoFromBytes(&model, model_bytes.c_str(), model_bytes.size());
+        std::map<std::string, std::string> external_bytes;
+        for (auto& [name, b] : tensor_bytes) {
+          external_bytes.emplace(name, std::string(b.c_str(), b.size()));
+        }
         onnxsim::tensor_pool::TensorPool pool;
-        onnxsim::tensor_pool::SaveModelAsGGUFStandalone(model, out_path, pool);
+        onnxsim::tensor_pool::SaveModelAsGGUFStandalone(
+            model, out_path, pool, /*string_metadata=*/{}, &external_bytes);
       },
-      "model_bytes"_a, "out_path"_a);
+      "model_bytes"_a, "tensor_bytes"_a, "out_path"_a);
 
   m.def(
       "import_gguf",
-      [](const std::string& in_path) -> py::bytes {
+      [](const std::string& in_path)
+          -> std::tuple<py::bytes, onnxsim::tensor_pool::TensorPool> {
         onnx::ModelProto model;
         onnxsim::tensor_pool::TensorPool pool;
-        if (!onnxsim::tensor_pool::LoadModelFromGGUF(in_path, &model, pool)) {
+        if (!onnxsim::tensor_pool::LoadModelFromGGUF(in_path, &model, pool,
+                                                     /*hydrate_all=*/false)) {
           throw std::runtime_error(
               "gguf file has no embedded onnxsim model (a plain weights-only "
               "archive is not importable as a graph)");
         }
         const std::string out = model.SerializeAsString();
-        return py::bytes(out.data(), out.size());
+        return {py::bytes(out.data(), out.size()), std::move(pool)};
       },
       "in_path"_a);
+
+  // Unified model loader: dispatches on `path`'s extension between plain
+  // ONNX (`.onnx`, or anything else -- classic external data resolved via
+  // LoadModelWithTensorPool's mmap'd TensorPool, see that function's doc
+  // comment for the rationale) and onnxsim's own self-describing archives
+  // (`.safetensors` / `.gguf`, resolved the same way import_safetensors/
+  // import_gguf above do). Always returns the TensorPool it resolved into
+  // (empty for a model with no external weights) alongside the model
+  // bytes, unlike import_safetensors/import_gguf, which discard theirs --
+  // see the TensorPool binding above for why that's useful.
+  //
+  // Always loads with hydrate_all=false at this layer -- deliberately,
+  // *not* a caller-facing option here. Measured: hydrating in C++ and then
+  // crossing the FFI boundary re-serializes and re-parses the *whole*
+  // model, tensor bytes included, on top of the mmap/copy work hydration
+  // itself already did -- on a 190MB/2000-tensor model that made the
+  // "hydrate_all=True" case ~3.6x SLOWER than plain onnx.load(), not
+  // faster, while this lazy load alone takes ~3ms (mmap only, no copies).
+  // onnxsim.load_model's Python wrapper is the one that offers a
+  // hydrate_all option, implemented by copying tensor-by-tensor straight
+  // from the returned TensorPool (one copy per tensor, same as any loader
+  // must eventually pay) instead of round-tripping the whole model.
+  m.def(
+      "load_model",
+      [](const std::string& path)
+          -> std::tuple<py::bytes, onnxsim::tensor_pool::TensorPool> {
+        onnx::ModelProto model;
+        onnxsim::tensor_pool::TensorPool pool;
+        std::string ext;
+        {
+          auto pos = path.find_last_of('.');
+          if (pos != std::string::npos) {
+            ext = path.substr(pos);
+            for (char& c : ext) {
+              c = static_cast<char>(
+                  std::tolower(static_cast<unsigned char>(c)));
+            }
+          }
+        }
+        if (ext == ".safetensors") {
+          if (!onnxsim::tensor_pool::LoadModelFromSafetensors(
+                  path, &model, pool, /*hydrate_all=*/false)) {
+            throw std::runtime_error(
+                "safetensors file has no embedded onnxsim model (a plain "
+                "weights-only archive is not importable as a graph)");
+          }
+        } else if (ext == ".gguf") {
+          if (!onnxsim::tensor_pool::LoadModelFromGGUF(path, &model, pool,
+                                                       /*hydrate_all=*/false)) {
+            throw std::runtime_error(
+                "gguf file has no embedded onnxsim model (a plain "
+                "weights-only archive is not importable as a graph)");
+          }
+        } else {
+          onnxsim::tensor_pool::LoadModelWithTensorPool(path, &model, pool,
+                                                        /*hydrate_all=*/false);
+        }
+        const std::string out = model.SerializeAsString();
+        return {py::bytes(out.data(), out.size()), std::move(pool)};
+      },
+      "path"_a);
 
   // Hydrates `model`'s initializers, by name, from any GGUF file --
   // including a plain third-party weights-only checkpoint with no embedded
@@ -1328,25 +1596,32 @@ NB_MODULE(onnxsim_cpp2py_export, m) {
   // tensor (Q4_K/Q5_K/Q6_K/Q8_0 -- what most real quantized checkpoints,
   // e.g. Unsloth's GGUF exports, actually use for the bulk of their
   // weights) is decoded to float32; see
-  // ImportModelWithGGUF/HydrateTensorProtoFromGGUF in
-  // tensor_pool_gguf_bridge.h. Returns (updated model bytes, names of GGUF
-  // tensors present in the file but skipped because their ggml_type has no
+  // ImportModelWithGGUFToPool/HydrateTensorProtoFromGGUF in
+  // tensor_pool_gguf_bridge.h. Returns (byte-free model bytes, the matched
+  // tensors' already-decoded bytes as a TensorPool, names of GGUF tensors
+  // present in the file but skipped because their ggml_type has no
   // representation TensorPool can hold at all, e.g. a legacy Q4_0 or IQ*-
   // family tensor -- NOT tensors simply absent from `model`'s
   // initializers, which this silently leaves alone rather than reporting).
+  // Splitting the matched tensors out into a TensorPool, rather than
+  // writing them into `model` and returning the whole thing serialized,
+  // avoids a full protobuf encode (here) + decode (Python) of the
+  // (potentially huge) newly-hydrated tensor data on top of the copies
+  // ImportModelWithGGUFToPool already makes.
   m.def(
       "import_gguf_weights",
       [](const py::bytes& model_bytes, const std::string& gguf_path)
-          -> std::tuple<py::bytes, std::vector<std::string>> {
+          -> std::tuple<py::bytes, onnxsim::tensor_pool::TensorPool,
+                        std::vector<std::string>> {
         onnx::ModelProto model;
         ParseProtoFromBytes(&model, model_bytes.c_str(), model_bytes.size());
-        onnxsim::tensor_pool::TensorPool pool;
+        onnxsim::tensor_pool::TensorPool matched;
         std::vector<std::string> skipped;
-        onnxsim::tensor_pool::ImportModelWithGGUF(model, gguf_path, pool,
-                                                  /*hydrate_all=*/true,
-                                                  &skipped);
+        onnxsim::tensor_pool::ImportModelWithGGUFToPool(model, gguf_path,
+                                                        matched, &skipped);
         const std::string out = model.SerializeAsString();
-        return {py::bytes(out.data(), out.size()), std::move(skipped)};
+        return {py::bytes(out.data(), out.size()), std::move(matched),
+                std::move(skipped)};
       },
       "model_bytes"_a, "gguf_path"_a);
 

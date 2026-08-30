@@ -7,6 +7,7 @@
 #include <cstring>
 #include <set>
 #include <stdexcept>
+#include <utility>
 
 #include "constant_folding.h"
 #include "contrib_schemas.h"
@@ -497,7 +498,14 @@ void RemoveUnusedOutputs(onnx::ModelProto& model,
 // custom/other-domain opset imports are left untouched. Returns the model
 // unchanged when it is already at the requested version or does not import the
 // default domain.
-onnx::ModelProto ConvertOpsetVersion(const onnx::ModelProto& model,
+//
+// Takes ``model`` by value, and passes it as a mutable lvalue to
+// ConvertVersion below, so the call chain resolves to ConvertVersion's
+// consuming overload -- which moves initializer bytes through the Graph IR
+// round trip instead of copying them -- rather than the copying, const-ref
+// overload. Callers should ``std::move`` in a model they no longer need, so
+// this by-value parameter is itself move-constructed rather than copied.
+onnx::ModelProto ConvertOpsetVersion(onnx::ModelProto model,
                                      int target_version) {
   const auto current = DefaultOpsetVersion(model);
   if (!current || *current == target_version) {

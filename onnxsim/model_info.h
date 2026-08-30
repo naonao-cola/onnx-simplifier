@@ -37,6 +37,13 @@
 struct ModelInfo {
   std::map<std::string, int64_t> op_nums;
   int64_t model_size = 0;
+  // Count of the top-level graph's own initializers -- not the recursive,
+  // subgraph-including tally that ``op_nums["Constant"]`` folds initializers
+  // into. Reported as its own "Initializers" row by ``FormatSimplifyingInfo``
+  // so a change here (e.g. weights folded into a fused node, or duplicate
+  // initializers deduplicated) is visible without it being muddied by actual
+  // ``Constant`` nodes in the same count.
+  int64_t initializer_count = 0;
   onnxsim::SymExpr macs;
   onnxsim::SymExpr mem_access;
   onnxsim::SymExpr memory_footprint;
@@ -71,8 +78,9 @@ void AnnotateModelInfo(onnx::ModelProto& model);
 
 // Render an ASCII table comparing an original and a simplified model, mirroring
 // the layout of the Python ``print_simplifying_info``: one row per op type (the
-// sorted union of both models' ops), then ``Model Size``, ``MACs``, ``FLOPs``,
-// ``Memory Access``, ``Memory Footprint`` and ``Compute Density``, with columns
+// sorted union of both models' ops), then ``Model Size``, ``Initializers``,
+// ``MACs``, ``FLOPs``, ``Memory Access``, ``Memory Footprint`` and
+// ``Compute Density``, with columns
 // for the original and simplified values. A metric that improved (a dropped op
 // count, or a smaller size / MACs / memory figure) is flagged with a trailing
 // ``*``, since these bindings print to plain terminals where the Python

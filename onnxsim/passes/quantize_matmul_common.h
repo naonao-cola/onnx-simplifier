@@ -465,6 +465,32 @@ inline bool TryQuantizeWeightBlockwiseInt4InPlace(const Tensor& w_t,
   return true;
 }
 
+// Reads `w_t` (a 2-D float32 constant, [K, N] or, when `transposed`,
+// [N, K]) into a flat row-major [N, K] (output channel first) buffer --
+// matches TryQuantizeWeightBlockwiseInt4InPlace's own channel_axis
+// convention, used by callers (magnitude_pruning.h, quarot.h) that need the
+// weight in a fixed output-channel-first layout regardless of its own
+// on-disk transposed-or-not storage.
+inline std::vector<float> ReadWeightNK(const Tensor& w_t, bool transposed) {
+  const int64_t dim0 = w_t.sizes()[0];
+  const int64_t dim1 = w_t.sizes()[1];
+  const int64_t rows = transposed ? dim0 : dim1;
+  const int64_t cols = transposed ? dim1 : dim0;
+  const std::vector<float> data = ReadFloatMatrix(w_t);
+  std::vector<float> w_nk(static_cast<size_t>(rows * cols));
+  for (int64_t i = 0; i < dim0; ++i) {
+    for (int64_t j = 0; j < dim1; ++j) {
+      const float v = data[static_cast<size_t>(i * dim1 + j)];
+      if (transposed) {
+        w_nk[static_cast<size_t>(i * cols + j)] = v;
+      } else {
+        w_nk[static_cast<size_t>(j * cols + i)] = v;
+      }
+    }
+  }
+  return w_nk;
+}
+
 // Same block-wise scheme as TryQuantizeWeightBlockwiseInt4InPlace, but INT8
 // (values in [-127, 127], scale = max(|w|) / 127 per block) instead of
 // INT4 -- a middle ground between QuantizeWeightPerChannelInPlace's single

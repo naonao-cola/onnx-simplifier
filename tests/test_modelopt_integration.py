@@ -101,7 +101,8 @@ def _quantize_with_modelopt(tmp_path, quantize_mode: str) -> onnx.ModelProto:
         calibration_eps=["cpu"],
         output_path=out,
     )
-    return onnx.load(out)
+    model, _pool = onnxsim.load_model(out)
+    return model
 
 
 def _qdq_counts(model: onnx.ModelProto):

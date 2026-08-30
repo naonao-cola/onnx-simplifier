@@ -182,6 +182,48 @@ inline size_t ImportModelWithGGUF(
   return matched;
 }
 
+// Like ImportModelWithGGUF(hydrate_all=true), but instead of writing each
+// matched tensor's decoded bytes directly into `model`'s initializer (which
+// a caller crossing an FFI boundary would then have to pay a full
+// protobuf encode/decode of, on top of the copies below already make --
+// see AdoptAllWithPlaceholderOffsets's analogous external_tensor_bytes
+// design for the export direction), stashes them into a fresh `matched`
+// pool instead, keyed by initializer name, and clears the (now-superseded,
+// since it's about to be overwritten) old raw_data from the initializer in
+// `model` -- so a caller only has to serialize/return a byte-free `model`
+// plus `matched`, and fill each matched initializer in on its own side
+// (`matched.dtype(name)`/`matched.bytes(name)`; a K-quant entry decodes to
+// FLOAT here exactly as HydrateTensorProtoFromGGUF would, so the caller
+// never needs to know which matches were K-quant). Reuses
+// HydrateTensorProtoFromGGUF unchanged (via a throwaway `scratch` per
+// matched tensor) rather than duplicating its K-quant-vs-raw-dtype
+// decode logic. Returns the number of tensors matched (== `matched`.size()
+// once this returns); `skipped_out` has the same meaning as
+// ImportModelWithGGUF's.
+inline size_t ImportModelWithGGUFToPool(
+    onnx::ModelProto& model, const std::string& gguf_path, TensorPool& matched,
+    std::vector<std::string>* skipped_out = nullptr) {
+  TensorPool file_pool;
+  std::vector<std::string> skipped = file_pool.LoadGGUF(gguf_path);
+  if (skipped_out != nullptr) *skipped_out = std::move(skipped);
+
+  size_t n = 0;
+  for (auto& init : *model.mutable_graph()->mutable_initializer()) {
+    onnx::TensorProto scratch;
+    scratch.set_data_type(init.data_type());
+    *scratch.mutable_dims() = init.dims();
+    if (!HydrateTensorProtoFromGGUF(init.name(), scratch, file_pool)) continue;
+
+    std::vector<int64_t> shape(scratch.dims().begin(), scratch.dims().end());
+    std::unique_ptr<std::string> bytes(scratch.release_raw_data());
+    matched.Add(init.name(), scratch.data_type(), std::move(shape),
+                std::move(*bytes));
+    init.clear_raw_data();
+    ++n;
+  }
+  return n;
+}
+
 // GGUF counterparts of tensor_pool_bridge.h's SaveModelAsSafetensors /
 // LoadModelFromSafetensors -- see that header's top comment for the
 // self-describing-archive design (EmbedModel/ExtractModel, which these
@@ -217,8 +259,10 @@ inline bool LoadModelFromGGUF(const std::string& path, onnx::ModelProto* model,
 // written to disk exactly once despite the model blob needing two passes.
 inline void SaveModelAsGGUFStandalone(
     onnx::ModelProto& model, const std::string& path, TensorPool& pool,
-    const std::map<std::string, std::string>& string_metadata = {}) {
-  auto adopted = AdoptAllWithPlaceholderOffsets(model, path, pool);
+    const std::map<std::string, std::string>& string_metadata = {},
+    std::map<std::string, std::string>* external_tensor_bytes = nullptr) {
+  auto adopted =
+      AdoptAllWithPlaceholderOffsets(model, path, pool, external_tensor_bytes);
   CheckNoEmbeddedModelKeyCollision(pool);
 
   std::string placeholder_bytes;

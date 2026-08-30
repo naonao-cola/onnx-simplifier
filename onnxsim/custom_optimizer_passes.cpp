@@ -11,6 +11,7 @@
 #include "onnxoptimizer/optimize.h"
 #include "passes/cross_layer_equalization.h"
 #include "passes/defuse_matmul_integer_to_float.h"
+#include "passes/double_quantization.h"
 #include "passes/dynamic_quantize_attention.h"
 #include "passes/dynamic_quantize_matmul.h"
 #include "passes/dynamic_quantize_matmul_integer_to_float.h"
@@ -38,6 +39,7 @@
 #include "passes/fuse_qkv.h"
 #include "passes/fuse_rms_norm.h"
 #include "passes/fuse_rope.h"
+#include "passes/magnitude_pruning.h"
 #include "passes/qoperator_quantize_activation.h"
 #include "passes/qoperator_quantize_concat.h"
 #include "passes/qoperator_quantize_conv.h"
@@ -50,6 +52,7 @@
 #include "passes/quantize_bf16.h"
 #include "passes/quantize_fp16.h"
 #include "passes/quantize_fp8.h"
+#include "passes/quarot.h"
 #include "passes/rewrite_arg_reduce_select_last_index.h"
 #include "passes/static_quantize_conv.h"
 #include "passes/static_quantize_int16_conv.h"
@@ -64,6 +67,7 @@
 #include "passes/weight_only_quantize_int8_block_matmul.h"
 #include "passes/weight_only_quantize_matmul.h"
 #include "passes/weight_only_quantize_matmul_nbits.h"
+#include "passes/weight_only_quantize_mxfp4_matmul.h"
 
 namespace onnxsim {
 
@@ -100,6 +104,7 @@ void RegisterCustomOptimizerPasses() {
     // onnxsim-only rewrites (no built-in of the same name today).
     RegisterOrReplace<p::CrossLayerEqualization>(registry);
     RegisterOrReplace<p::DefuseMatMulIntegerToFloat>(registry);
+    RegisterOrReplace<p::DoubleQuantization>(registry);
     RegisterOrReplace<p::DynamicQuantizeAttention>(registry);
     RegisterOrReplace<p::DynamicQuantizeMatMul>(registry);
     RegisterOrReplace<p::DynamicQuantizeMatMulIntegerToFloat>(registry);
@@ -120,6 +125,8 @@ void RegisterCustomOptimizerPasses() {
     RegisterOrReplace<p::FusePrecedingMulIntoConv>(registry);
     RegisterOrReplace<p::FuseRMSNorm>(registry);
     RegisterOrReplace<p::FuseRope>(registry);
+    RegisterOrReplace<p::MagnitudePruningConv>(registry);
+    RegisterOrReplace<p::MagnitudePruningMatMul>(registry);
     RegisterOrReplace<p::QOperatorQuantizeActivation>(registry);
     RegisterOrReplace<p::QOperatorQuantizeConcat>(registry);
     RegisterOrReplace<p::QOperatorQuantizeConv>(registry);
@@ -132,6 +139,7 @@ void RegisterCustomOptimizerPasses() {
     RegisterOrReplace<p::QuantizeBf16Pass>(registry);
     RegisterOrReplace<p::QuantizeFp16Pass>(registry);
     RegisterOrReplace<p::QuantizeFp8Pass>(registry);
+    RegisterOrReplace<p::Quarot>(registry);
     RegisterOrReplace<p::RewriteArgReduceSelectLastIndex>(registry);
     RegisterOrReplace<p::StaticQuantizeConv>(registry);
     RegisterOrReplace<p::StaticQuantizeInt16Conv>(registry);
@@ -146,6 +154,7 @@ void RegisterCustomOptimizerPasses() {
     RegisterOrReplace<p::WeightOnlyQuantizeInt8BlockMatMul>(registry);
     RegisterOrReplace<p::WeightOnlyQuantizeMatMul>(registry);
     RegisterOrReplace<p::WeightOnlyQuantizeMatMulNBits>(registry);
+    RegisterOrReplace<p::WeightOnlyQuantizeMXFP4MatMul>(registry);
 
     // onnxsim's patched versions of built-in onnxoptimizer passes. These
     // overwrite the registry entries the submodule registers under the same

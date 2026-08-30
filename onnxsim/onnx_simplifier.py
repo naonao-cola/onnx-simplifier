@@ -161,6 +161,12 @@ def check_and_update_input_shapes(
 # A very very large threshold
 DEFAULT_TENSOR_SIZE_THRESHOLDHOLD = "1.5GB"
 
+# Above this serialized size, ``simplify(..., output_path=...)`` and the CLI
+# save the model as external data by default, even without
+# ``--save-as-external-data`` -- see the ``external_data_threshold`` param
+# below and ``main()``'s ``--external-data-threshold`` flag.
+DEFAULT_EXTERNAL_DATA_THRESHOLD = "100MB"
+
 
 # ONNX ``TensorProto`` element types that onnxoptimizer's tensor-value hashing
 # (``cse_util.h``) knows how to hash. Any other type makes those passes raise
@@ -337,6 +343,91 @@ def import_onnx_schemas() -> int:
     return imported
 
 
+def _extract_tensor_to_dict(
+    tensor: onnx.TensorProto, key: str, tensor_bytes: Dict[str, bytes]
+) -> None:
+    if (
+        tensor.data_location == onnx.TensorProto.EXTERNAL
+        or tensor.data_type == onnx.TensorProto.STRING
+        or not tensor.HasField("raw_data")
+    ):
+        return
+    tensor_bytes[key] = tensor.raw_data
+    tensor.ClearField("raw_data")
+
+
+def _extract_attr_tensors_to_dict(
+    attr: onnx.AttributeProto, path: str, tensor_bytes: Dict[str, bytes]
+) -> None:
+    if attr.HasField("t"):
+        _extract_tensor_to_dict(attr.t, attr.t.name or f"{path}/t", tensor_bytes)
+    for i, t in enumerate(attr.tensors):
+        _extract_tensor_to_dict(t, t.name or f"{path}/tensors{i}", tensor_bytes)
+    if attr.HasField("g"):
+        _extract_graph_tensors_to_dict(attr.g, tensor_bytes)
+    for g in attr.graphs:
+        _extract_graph_tensors_to_dict(g, tensor_bytes)
+
+
+def _extract_graph_tensors_to_dict(
+    graph: onnx.GraphProto, tensor_bytes: Dict[str, bytes]
+) -> None:
+    """Reverse of :func:`_hydrate_graph_tensors_from_pool`: pulls every
+    eligible tensor's ``raw_data`` out of ``graph`` (initializers and node
+    attribute tensors, recursing into subgraphs) into ``tensor_bytes`` --
+    keyed the same way tensor_pool_bridge.h's ForEachTensor derives pool
+    keys -- and clears it from the tensor in place, so the ``ModelProto``
+    this graph belongs to can be serialized across the FFI boundary without
+    paying to encode/decode the (potentially huge) tensor bytes a second
+    time; ``AdoptAllWithPlaceholderOffsets``'s C++ side expects exactly this
+    stripped state when given an ``external_tensor_bytes`` map.
+    """
+    for i, init in enumerate(graph.initializer):
+        _extract_tensor_to_dict(init, init.name or f"initializer{i}", tensor_bytes)
+    for ni, node in enumerate(graph.node):
+        node_path = node.name or f"node{ni}"
+        for ai, attr in enumerate(node.attribute):
+            _extract_attr_tensors_to_dict(attr, f"{node_path}/attr{ai}", tensor_bytes)
+
+
+def _restore_tensor_raw_data(
+    tensor: onnx.TensorProto, key: str, tensor_bytes: Dict[str, bytes]
+) -> None:
+    if key in tensor_bytes:
+        tensor.raw_data = tensor_bytes[key]
+
+
+def _restore_attr_tensors_raw_data(
+    attr: onnx.AttributeProto, path: str, tensor_bytes: Dict[str, bytes]
+) -> None:
+    if attr.HasField("t"):
+        _restore_tensor_raw_data(attr.t, attr.t.name or f"{path}/t", tensor_bytes)
+    for i, t in enumerate(attr.tensors):
+        _restore_tensor_raw_data(t, t.name or f"{path}/tensors{i}", tensor_bytes)
+    if attr.HasField("g"):
+        _restore_graph_tensors_raw_data(attr.g, tensor_bytes)
+    for g in attr.graphs:
+        _restore_graph_tensors_raw_data(g, tensor_bytes)
+
+
+def _restore_graph_tensors_raw_data(
+    graph: onnx.GraphProto, tensor_bytes: Dict[str, bytes]
+) -> None:
+    """Undoes :func:`_extract_graph_tensors_to_dict`: puts each extracted
+    tensor's ``raw_data`` back so the caller's ``model`` is left exactly as
+    it was, once the export call that needed it stripped out has returned
+    (or raised). This restore is a plain in-memory field assignment --
+    no serialization, no FFI crossing -- so it doesn't reintroduce the
+    protobuf round-trip cost the extraction was written to avoid.
+    """
+    for i, init in enumerate(graph.initializer):
+        _restore_tensor_raw_data(init, init.name or f"initializer{i}", tensor_bytes)
+    for ni, node in enumerate(graph.node):
+        node_path = node.name or f"node{ni}"
+        for ai, attr in enumerate(node.attribute):
+            _restore_attr_tensors_raw_data(attr, f"{node_path}/attr{ai}", tensor_bytes)
+
+
 def export_safetensors(model: onnx.ModelProto, out_path: str) -> None:
     """Export ``model`` to a standalone safetensors archive at ``out_path``.
 
@@ -345,8 +436,20 @@ def export_safetensors(model: onnx.ModelProto, out_path: str) -> None:
     no onnxsim involved -- and the graph itself is embedded alongside them, so
     ``out_path`` alone is both the model's weights and its graph. Reload it
     with :func:`import_safetensors`.
+
+    ``model`` is left unchanged once this returns (including on error): each
+    tensor's ``raw_data`` is transiently cleared before crossing into C++ (so
+    the accompanying model-structure serialize doesn't also re-encode the
+    -- potentially huge -- tensor bytes a second time) and restored
+    afterwards, a plain in-memory assignment with no serialization or FFI
+    cost of its own.
     """
-    C.export_safetensors(model.SerializeToString(), out_path)
+    tensor_bytes: Dict[str, bytes] = {}
+    _extract_graph_tensors_to_dict(model.graph, tensor_bytes)
+    try:
+        C.export_safetensors(model.SerializeToString(), tensor_bytes, out_path)
+    finally:
+        _restore_graph_tensors_raw_data(model.graph, tensor_bytes)
 
 
 def import_safetensors(in_path: str) -> onnx.ModelProto:
@@ -358,20 +461,146 @@ def import_safetensors(in_path: str) -> onnx.ModelProto:
     ``RuntimeError`` if the archive has no embedded onnxsim model, e.g. a
     plain weights-only safetensors file with no graph to import.
     """
+    model_bytes, pool = C.import_safetensors(in_path)
     model = onnx.ModelProto()
-    model.ParseFromString(C.import_safetensors(in_path))
+    model.ParseFromString(model_bytes)
+    _hydrate_graph_tensors_from_pool(model.graph, pool)
     return model
 
 
+def _hydrate_tensor_from_pool(
+    tensor: onnx.TensorProto, key: str, pool: C.TensorPool
+) -> None:
+    if tensor.data_location != onnx.TensorProto.EXTERNAL or key not in pool:
+        return
+    tensor.raw_data = pool.bytes(key)
+    tensor.data_location = onnx.TensorProto.DEFAULT
+    tensor.ClearField("external_data")
+
+
+def _hydrate_attr_tensors_from_pool(
+    attr: onnx.AttributeProto, path: str, pool: C.TensorPool
+) -> None:
+    if attr.HasField("t"):
+        _hydrate_tensor_from_pool(attr.t, attr.t.name or f"{path}/t", pool)
+    for i, t in enumerate(attr.tensors):
+        _hydrate_tensor_from_pool(t, t.name or f"{path}/tensors{i}", pool)
+    if attr.HasField("g"):
+        _hydrate_graph_tensors_from_pool(attr.g, pool)
+    for g in attr.graphs:
+        _hydrate_graph_tensors_from_pool(g, pool)
+
+
+def _hydrate_graph_tensors_from_pool(
+    graph: onnx.GraphProto, pool: C.TensorPool
+) -> None:
+    """Mirrors tensor_pool_bridge.h's ForEachTensor/HydrateTensorProto in Python:
+    hydrates every EXTERNAL tensor the pool resolved (initializers and node
+    attribute tensors, recursing into subgraphs), keyed the same way the C++
+    side pooled them (a tensor's own name, or -- for an unnamed attribute
+    tensor -- a positional fallback) -- so this must stay in sync with that
+    file's ForEachTensor if its key derivation ever changes.
+    """
+    for i, init in enumerate(graph.initializer):
+        _hydrate_tensor_from_pool(init, init.name or f"initializer{i}", pool)
+    for ni, node in enumerate(graph.node):
+        node_path = node.name or f"node{ni}"
+        for ai, attr in enumerate(node.attribute):
+            _hydrate_attr_tensors_from_pool(attr, f"{node_path}/attr{ai}", pool)
+
+
+def load_model(
+    path: str, hydrate_all: bool = True
+) -> Tuple[onnx.ModelProto, C.TensorPool]:
+    """Load a model file, resolving its external weights through a
+    :class:`onnxsim.onnxsim_cpp2py_export.TensorPool` instead of onnx's own
+    external-data loader, and return that pool alongside the model.
+
+    Dispatches on ``path``'s extension:
+
+    * ``.safetensors`` / ``.gguf`` -- one of onnxsim's own self-describing
+      archives (see :func:`export_safetensors` / :func:`export_gguf`): the
+      graph and weights both live in this one file. Raises ``RuntimeError``
+      if the archive has no embedded onnxsim model (e.g. a plain
+      weights-only file with no graph to import).
+    * anything else -- an ordinary ``.onnx`` file (produced by any exporter,
+      not necessarily onnxsim). Behaves like ``onnx.load(path)`` (structure
+      plus every tensor's values, inline) for any such model, but for one
+      whose weights live in classic ONNX external data
+      (``onnx.save(..., save_as_external_data=True)``, the default this
+      package's own :func:`simplify` and CLI now use once a model's
+      serialized size passes 100MB -- see ``DEFAULT_EXTERNAL_DATA_THRESHOLD``),
+      loading itself (before any hydration) mmaps each *distinct* external
+      file exactly once instead of onnx's own loader's one open+seek+read
+      per tensor. Measured on a 190MB/2000-tensor external-data model
+      (single shared weights file): resolving every tensor's location this
+      way, with no data copied yet, took ~3ms, vs ~93ms for onnx.load to
+      actually read them; hydrating every tensor too (``hydrate_all=True``,
+      the default -- see below) still finished in ~65ms, ~1.4x faster than
+      onnx.load's ~93ms, because the mmap turns each tensor's copy into a
+      plain memory read instead of a seek + read syscall. A relative
+      external-data ``location`` is resolved against this file's own
+      directory, same as onnx's own loader; a tensor whose external file is
+      missing or malformed is left as an unresolved ``EXTERNAL`` reference
+      rather than failing the whole load, matching onnx's own loader's
+      leniency for one bad reference in an otherwise-loadable model.
+
+    :param path: path to the model file to load.
+    :param hydrate_all: when ``True`` (the default), every tensor the pool
+            resolves is also copied into the returned ``ModelProto`` as an
+            ordinary in-memory tensor (one copy per tensor, straight from
+            the mmap'd pool -- unavoidable, since ``onnx.TensorProto`` owns
+            its bytes as a plain ``bytes`` field), ready for any onnxsim
+            pass or onnx tool. Pass ``False`` to skip this copy entirely and
+            leave the model's tensors as lazy ``EXTERNAL`` references
+            instead -- the returned pool already holds their bytes
+            zero-copy (``pool.bytes(name)`` copies out just the ones you
+            ask for), so nothing is lost, but the model itself is not
+            usable by code that doesn't know to hydrate from the pool on
+            demand. See the measurements above for the difference this
+            makes.
+    :returns: ``(model, pool)`` -- the loaded model, and the ``TensorPool``
+            every external tensor was resolved into (empty if ``path`` had
+            no external weights to resolve). The pool supports ``len()``,
+            ``name in pool``, ``pool.names()``, and, per tensor,
+            ``pool.dtype(name)``, ``pool.shape(name)``, ``pool.bytes(name)``
+            and ``pool.content_hash(name)``.
+
+            For an ordinary ``.onnx`` file, the pool's entries may be a
+            zero-copy memory mapping of the external-data file(s) on disk
+            (see above): on Windows (unlike POSIX), the mapped file cannot
+            be deleted or moved while the pool is still alive. Drop the
+            pool (e.g. ``del pool``, or simply let it go out of scope)
+            before deleting or replacing that file -- ``pool.bytes(name)``
+            and friends already return independent copies, so extracting
+            what you need and then dropping the pool is always safe.
+    """
+    model_bytes, pool = C.load_model(path)
+    model = onnx.ModelProto()
+    model.ParseFromString(model_bytes)
+    if hydrate_all:
+        _hydrate_graph_tensors_from_pool(model.graph, pool)
+    return model, pool
+
+
 def export_gguf(model: onnx.ModelProto, out_path: str) -> None:
-    """GGUF counterpart of :func:`export_safetensors`."""
-    C.export_gguf(model.SerializeToString(), out_path)
+    """GGUF counterpart of :func:`export_safetensors`, including its
+    leaves-``model``-unchanged contract.
+    """
+    tensor_bytes: Dict[str, bytes] = {}
+    _extract_graph_tensors_to_dict(model.graph, tensor_bytes)
+    try:
+        C.export_gguf(model.SerializeToString(), tensor_bytes, out_path)
+    finally:
+        _restore_graph_tensors_raw_data(model.graph, tensor_bytes)
 
 
 def import_gguf(in_path: str) -> onnx.ModelProto:
     """GGUF counterpart of :func:`import_safetensors`."""
+    model_bytes, pool = C.import_gguf(in_path)
     model = onnx.ModelProto()
-    model.ParseFromString(C.import_gguf(in_path))
+    model.ParseFromString(model_bytes)
+    _hydrate_graph_tensors_from_pool(model.graph, pool)
     return model
 
 
@@ -399,20 +628,36 @@ def import_gguf_weights(
             alone except for a matched K-quant tensor, whose data_type is
             forced to FLOAT (the only meaningful type for a dequantized
             result) regardless of what the initializer previously declared.
+            Never mutated by this call, whether passed in directly or
+            loaded from a path.
     :param gguf_path: path to the GGUF file to pull weight values from
-    :returns: ``(model, skipped)`` -- the hydrated model, and the names of
-            GGUF tensors present in the file but skipped because their
-            quantized format has no decoder here (the legacy ``Q4_0``
-            family, every ``IQ*`` variant, ...). A GGUF tensor with no
-            matching initializer name in ``model`` is simply not brought
-            in -- it does NOT appear in ``skipped``, which reports only
-            unsupported *formats*, not name mismatches.
+    :returns: ``(model, skipped)`` -- the hydrated model (a distinct object
+            from ``model``, if a ``ModelProto`` was passed in), and the
+            names of GGUF tensors present in the file but skipped because
+            their quantized format has no decoder here (the legacy
+            ``Q4_0`` family, every ``IQ*`` variant, ...). A GGUF tensor
+            with no matching initializer name in ``model`` is simply not
+            brought in -- it does NOT appear in ``skipped``, which reports
+            only unsupported *formats*, not name mismatches.
     """
     if isinstance(model, str):
         model = onnx.load(model, load_external_data=False)
-    model_bytes, skipped = C.import_gguf_weights(model.SerializeToString(), gguf_path)
+    # C++ only ever clears/rewrites a *matched* initializer's raw_data --
+    # every unmatched one crosses back out untouched, still carrying
+    # whatever `model` already had -- so the matched ones are the only
+    # ones that need filling in here; a matched tensor's OLD value never
+    # needs to survive the round trip at all, so there's nothing to
+    # extract-and-restore on the way in either (unlike export_gguf, which
+    # strips every tensor's raw_data because ALL of it needs to cross).
+    model_bytes, matched, skipped = C.import_gguf_weights(
+        model.SerializeToString(), gguf_path
+    )
     result = onnx.ModelProto()
     result.ParseFromString(model_bytes)
+    for init in result.graph.initializer:
+        if init.name in matched:
+            init.data_type = matched.dtype(init.name)
+            init.raw_data = matched.bytes(init.name)
     return result, skipped
 
 
@@ -857,6 +1102,277 @@ def quantize_weight_only_int8_block(
     )
 
 
+def quantize_weight_only_mxfp4_cpp(
+    model: Union[str, onnx.ModelProto],
+) -> onnx.ModelProto:
+    """
+    C++-backed port of :func:`onnxsim.quantize_weight_only_mxfp4`: OCP
+    Microscaling MXFP4 weight-only quantizes every MatMul and every
+    "vanilla" Gemm (transA=0, alpha=1, beta=1) whose weight is a constant
+    2-D float32 tensor whose reduction dimension ``K`` is evenly divisible
+    by 32 (the OCP MX spec's own canonical block size).
+
+    Unlike every other ``quantize_weight_only_*`` scheme, MXFP4's per-block
+    scale is constrained to a pure power of two, and its 4-bit codes follow
+    a fixed, non-uniform (E2M1 floating-point) codebook rather than an
+    ordinary affine range -- see :func:`onnxsim.quantize_weight_only_mxfp4`'s
+    own docstring for the format's full definition. Needs no calibration
+    data: both the codebook and the per-block power-of-two scale come from
+    the weight's own values. Unlike the pure-Python implementation, ``Conv``
+    layers are not (yet) handled -- only ``MatMul``/``Gemm``.
+
+    This is a single, self-contained graph rewrite: unlike :func:`simplify`,
+    it does not run shape inference, constant folding, or any other pass.
+    Layers with a non-constant, non-2-D, or non-block-divisible weight are
+    left untouched. Consider calling :func:`simplify` before and/or after to
+    clean up the graph.
+
+    :param model: onnx ModelProto object or file path
+    :returns: the quantized onnx ModelProto
+    """
+    if isinstance(model, str):
+        model = onnx.load(model, load_external_data=False)
+    return onnx.load_from_string(
+        C.quantize_weight_only_mxfp4(model.SerializeToString())
+    )
+
+
+def apply_double_quantization_cpp(
+    model: Union[str, onnx.ModelProto],
+) -> onnx.ModelProto:
+    """
+    C++-backed port of :func:`onnxsim.apply_double_quantization`: applies
+    QLoRA-style double quantization (Dettmers et al., 2023, "QLoRA:
+    Efficient Finetuning of Quantized LLMs", Section 3.2) to every
+    ``DequantizeLinear`` node already present in ``model`` whose scale input
+    is a constant float32 tensor with at least 64 values.
+
+    Every block-wise/per-channel scale (e.g. one float32 value per 32-element
+    INT4 block) is itself quantized to UINT8 with a single per-tensor
+    meta-scale, reconstructed in-graph via a second, nested
+    ``DequantizeLinear`` feeding the original node's own scale input -- see
+    :func:`onnxsim.apply_double_quantization`'s own docstring for the exact
+    rewrite. This is technique-agnostic: it composes with the output of any
+    onnxsim block-wise/per-channel quantizer (or any other model containing
+    ``DequantizeLinear`` nodes) unchanged.
+
+    :param model: an already-quantized onnx ModelProto or file path
+    :returns: ``model`` with every matching ``DequantizeLinear`` node's scale
+            input double-quantized; a scale that is not a constant
+            initializer, not float32, or too small (fewer than 64 values) is
+            left untouched
+    """
+    if isinstance(model, str):
+        model = onnx.load(model, load_external_data=False)
+    return onnx.load_from_string(C.apply_double_quantization(model.SerializeToString()))
+
+
+def prune_magnitude_cpp(
+    model: Union[str, onnx.ModelProto],
+    sparsity: float = 0.5,
+) -> onnx.ModelProto:
+    """
+    C++-backed port of :func:`onnxsim.apply_magnitude_pruning`: zeros the
+    least-magnitude entries of every MatMul/vanilla-Gemm layer's constant
+    2-D float32 weight, and every Conv layer's constant 4-D float32 weight
+    (ordinary, depthwise, and general grouped Conv alike) -- the data-free
+    unstructured pruning baseline (Han et al., 2015).
+
+    Within each output row (or, for Conv, each output filter), keeps the
+    ``max(1, round(cols * (1 - sparsity)))`` highest-magnitude entries and
+    zeros the rest, so a layer with row-dependent weight scale doesn't get
+    some rows pruned to nothing and others left untouched.
+
+    Unlike the pure-Python :func:`onnxsim.apply_magnitude_pruning`, this
+    does not match ``com.microsoft::Attention``'s merged QKV weight, and
+    offers only the sparsity-ratio mode (no N:M semi-structured pruning).
+
+    This is a single, self-contained graph rewrite: unlike :func:`simplify`,
+    it does not run shape inference, constant folding, or any other pass.
+    Layers with a non-constant, non-2-D (MatMul/Gemm), or non-4-D (Conv)
+    weight are left untouched.
+
+    :param model: onnx ModelProto object or file path
+    :param sparsity: target fraction of each row's entries to zero; must be
+            in ``[0, 1)``
+    :returns: ``model`` with every matched layer's weight pruned in place
+    """
+    if isinstance(model, str):
+        model = onnx.load(model, load_external_data=False)
+    return onnx.load_from_string(C.prune_magnitude(model.SerializeToString(), sparsity))
+
+
+def apply_structured_pruning_cpp(
+    model: Union[str, onnx.ModelProto],
+    sparsity: float = 0.5,
+) -> onnx.ModelProto:
+    """
+    C++-backed port of :func:`onnxsim.apply_structured_pruning`: removes
+    whole output channels from MatMul/vanilla-Gemm and Conv layers -- real
+    structural pruning (smaller weight tensors, smaller matmuls on any
+    runtime), as opposed to :func:`onnxsim.prune_magnitude_cpp`'s value-only
+    zeroing.
+
+    For every MatMul/vanilla-Gemm or 2-D Conv "producer" node whose output
+    feeds, through zero or more shape-preserving elementwise ops (an
+    activation, or -- MatMul/Gemm only -- an Add/Mul against a constant
+    per-channel bias/scale, or -- Conv only -- a depthwise Conv hop) with no
+    other consumer anywhere along that path, into exactly one downstream
+    "consumer" of the same family: ranks the producer's output channels by
+    L2 norm of their own weight row/filter, drops the lowest-``sparsity``-
+    fraction of them, and removes the corresponding rows/columns from the
+    producer's weight (and bias, if constant) and every intermediate
+    per-channel constant, and the matching columns/rows from the consumer's
+    weight. A general grouped Conv (neither ``group=1`` nor fully depthwise)
+    is matched too, as a producer and/or consumer, ranking/pruning each of
+    its ``group`` channel blocks independently. The gated-FFN SwiGLU/GeGLU
+    pattern is matched too -- two producers combined by a ``Mul`` (or ONNX
+    opset-28+'s native ``SwiGLU`` node) feeding one consumer, both pruned to
+    the same combined-importance-ranked channel indices. A Conv or
+    MatMul/Gemm residual (skip-connection) chain is matched too -- a
+    channel-preserving ``Add(a, b)`` where both operands are non-constant
+    forces whichever real producer(s) feed ``a``/``b`` to agree on one
+    shared channel-index set, resolved via a backward walk plus union-find
+    grouping across such merge points that also covers a whole chain of
+    such merges transitively sharing one spine channel count (a lone
+    residual connection, or a linear stack of ``Add``-only merges; an
+    *interior* block of a real deep ResNet/transformer stage is left
+    completely untouched, the same "no branch-following" boundary every
+    other chain kind here already holds). For MatMul/Gemm specifically, a
+    fused
+    ``com.microsoft::SkipLayerNormalization``/``SkipSimplifiedLayerNormalization``
+    node -- what onnxruntime's transformer optimizer collapses a bare
+    residual ``Add`` plus the following LayerNorm into, and so what a
+    fully-optimized transformer's own residual connections typically look
+    like -- is recognized as an eligible merge point too, its own
+    ``gamma``/``beta``/``bias`` constants riding along as a per-channel
+    affine hop on the resolved chain; a Conv residual chain only ever sees a
+    bare ``Add`` (there is no Conv analogue of that fused op).
+
+    This is a single, self-contained graph rewrite: unlike :func:`simplify`,
+    it does not run shape inference, constant folding, or any other pass.
+
+    :param model: the original onnx ModelProto or file path
+    :param sparsity: target fraction of each matched producer's output
+            channels to remove (at least one channel is always kept); must
+            be in ``[0, 1)``
+    :returns: ``model`` with every matched chain's tensors resized in place;
+            anything not matching the exact topology above (branching, a
+            non-constant bias, a consumer whose reduction dimension doesn't
+            line up, ...) is left completely untouched
+    """
+    if isinstance(model, str):
+        model = onnx.load(model, load_external_data=False)
+    return onnx.load_from_string(
+        C.apply_structured_pruning(model.SerializeToString(), sparsity)
+    )
+
+
+def apply_attention_head_pruning_cpp(
+    model: Union[str, onnx.ModelProto],
+    sparsity: float = 0.5,
+) -> onnx.ModelProto:
+    """
+    C++-backed port of :func:`onnxsim.apply_attention_head_pruning`: removes
+    whole attention heads -- or, for grouped-query attention, whole KV
+    groups -- from every matched ``com.microsoft::Attention``,
+    ``com.microsoft::GroupQueryAttention``, or plain ``ai.onnx::Attention``
+    node whose output feeds, optionally through a single shape-preserving
+    ``Reshape``, exactly one downstream MatMul/vanilla-Gemm's reduction
+    dimension (the output projection) -- the attention analogue of
+    :func:`onnxsim.apply_structured_pruning_cpp`, at head (or KV-group)
+    instead of single-channel granularity.
+
+    For each matched plain ``com.microsoft::Attention`` block (a single
+    merged QKV weight/bias): ranks every head by the combined Frobenius norm
+    of its own Q, K, and V weight columns, drops the lowest-``sparsity``-
+    fraction of heads (at least one head is always kept), and removes the
+    corresponding column blocks from the merged QKV weight (and bias, if
+    present), decrementing ``num_heads``/``qkv_hidden_sizes`` accordingly,
+    and the matching row block from the output projection's weight.
+
+    For each matched ``GroupQueryAttention`` or plain ``ai.onnx::Attention``
+    block (separate, un-merged Q/K/V producers): ranks every *KV group* (a
+    KV head and the ``num_heads / kv_num_heads`` query heads the kernel maps
+    to it) by the combined Frobenius norm of that group's own Q+K+V weight
+    block, drops the lowest-``sparsity``-fraction of groups (at least one
+    group is always kept), and removes the corresponding column blocks from
+    all three producers (and their biases, if present) together with the
+    matching row block from the output projection's weight, decrementing the
+    query head count and ``kv_num_heads`` by the number of groups dropped --
+    so their ratio (query heads per KV head) is unchanged. An individual
+    query head is never dropped on its own: only a whole group, since
+    neither kernel has a way to keep a KV head alive for some, but not all,
+    of the query heads that shared it.
+
+    Unlike the pure-Python :func:`onnxsim.apply_attention_head_pruning`,
+    this port does not include the calibration-driven Wanda variant
+    (:func:`onnxsim.apply_attention_head_wanda_pruning`) -- data-free/
+    magnitude importance only, matching this codebase's C++-port scope
+    decision.
+
+    This is a single, self-contained graph rewrite: unlike :func:`simplify`,
+    it does not run shape inference, constant folding, or any other pass.
+
+    :param model: the original onnx ModelProto or file path
+    :param sparsity: target fraction of each matched block's heads (or, for
+            GroupQueryAttention/plain ai.onnx Attention, KV groups) to
+            remove (at least one is always kept); must be in ``[0, 1)``
+    :returns: ``model`` with every matched block's tensors resized in
+            place; anything not matching that exact topology (a
+            non-constant weight, a packed-QKV GroupQueryAttention node, a
+            GroupQueryAttention/plain ai.onnx Attention node with a
+            non-empty constant past-KV-cache or attention-mask input, an
+            ai.onnx Attention node with differing Q/K/V head sizes or
+            without explicit ``q_num_heads``/``kv_num_heads`` attributes, a
+            consumer whose reduction dimension doesn't line up, ...) is
+            left completely untouched
+    """
+    if isinstance(model, str):
+        model = onnx.load(model, load_external_data=False)
+    return onnx.load_from_string(
+        C.apply_attention_head_pruning(model.SerializeToString(), sparsity)
+    )
+
+
+def apply_quarot_cpp(
+    model: Union[str, onnx.ModelProto],
+    seed: int = 0,
+) -> onnx.ModelProto:
+    """
+    C++-backed port of :func:`onnxsim.apply_quarot`: applies QuaRot-style
+    random-rotation preprocessing (Ashkboos et al., 2024, "QuaRot:
+    Outlier-Free 4-Bit Inference in Rotated LLMs") plus INT4
+    round-to-nearest quantization of *both* the weight and the activation to
+    every MatMul/vanilla-Gemm layer with a constant 2-D float32 weight whose
+    reduction dimension ``K`` is divisible by 32.
+
+    Rotating the whole residual stream by a random orthogonal matrix removes
+    activation outliers the same way block quantization already tolerates
+    weight outliers, letting both MatMul operands drop to INT4 with no
+    calibration data at all -- see :func:`onnxsim.apply_quarot`'s own
+    docstring for the full rationale. Unlike that pure-Python
+    implementation, this port derives a fresh rotation per matched layer
+    from ``seed`` independently of graph node order, so results are *not*
+    expected to match the Python port bit-for-bit -- only to be similarly
+    accurate.
+
+    This is a single, self-contained graph rewrite: unlike :func:`simplify`,
+    it does not run shape inference, constant folding, or any other pass.
+    Layers with a non-constant, non-2-D weight, or a reduction dimension not
+    divisible by 32, are left untouched. Consider calling :func:`simplify`
+    before and/or after to clean up the graph.
+
+    :param model: the original (unquantized) onnx ModelProto or file path
+    :param seed: seed for the per-layer random rotation matrices
+    :returns: the rotated-and-quantized onnx ModelProto; a model with no
+            matching layer, or an opset older than 21, is returned unchanged
+    """
+    if isinstance(model, str):
+        model = onnx.load(model, load_external_data=False)
+    return onnx.load_from_string(C.apply_quarot(model.SerializeToString(), seed))
+
+
 def quantize_fp16(
     model: Union[str, onnx.ModelProto], keep_io_types: bool = True
 ) -> onnx.ModelProto:
@@ -1055,7 +1571,7 @@ def simplify(
     inline_functions: bool = False,
     import_custom_schemas: bool = True,
     input_shapes=None,
-    target_opset_version: Optional[int] = None,
+    target_opset_version: Optional[Union[int, Literal["latest"]]] = None,
     extra_optimizers: Optional[List[str]] = None,
     custom_rewriter: Optional[ModelRewriter] = None,
     function_rewrite_rules: Optional[Sequence[FunctionRewriteRule]] = None,
@@ -1068,6 +1584,7 @@ def simplify(
     ort_profile: Optional[str] = None,
     merge_ort_profile: bool = False,
     output_path: Optional[str] = None,
+    external_data_threshold: str = DEFAULT_EXTERNAL_DATA_THRESHOLD,
 ) -> Tuple[onnx.ModelProto, bool]:
     """
     :param model: onnx ModelProto object or file path
@@ -1107,7 +1624,11 @@ def simplify(
     :param target_opset_version: Convert the model to this opset version (of the default ONNX domain)
             before simplifying, using onnx's version converter (run inside the C++ core so every
             binding shares the behavior). This can be used to upgrade (or downgrade) the model's
-            opset during simplification. When None (the default), the opset version is left unchanged.
+            opset during simplification. Pass the literal string ``"latest"`` to resolve to the
+            highest default-domain opset version this onnxsim build's compiled-in onnx schema
+            registry supports (note this can differ from the pip-installed ``onnx`` package's own
+            ``onnx.defs.onnx_opset_version()``, since onnxsim vendors its own onnx fork). When None
+            (the default), the opset version is left unchanged.
     :param extra_optimizers: The counterpart to ``skipped_optimizers``: run these named onnx-optimizer
             passes in addition to the default fuse/elimination set, rather than excluding some of it.
             This is how a pass registered as ``PassType::Other`` -- excluded from the default set
@@ -1229,6 +1750,16 @@ def simplify(
             the model is still saved to ``output_path`` before returning, just without that
             reload-skipping benefit, since the full model has to be materialized anyway to
             run the correctness check.
+    :param external_data_threshold: When saving to ``output_path``, save the model as
+            external data (weights in a sibling ``.data`` file, same as passing
+            ``save_as_external_data=True`` to ``onnx.save``) whenever its serialized size
+            exceeds this threshold -- by default ``"100MB"``, so a model that size or larger
+            gets external data with no extra argument needed. A model over 2GB always saves
+            as external data regardless of this setting (inline serialization is not possible
+            past that size). Accepts the same ``"<number><unit>"`` strings as
+            ``tensor_size_threshold`` (e.g. ``"500MB"``, ``"2GB"``); raise it (e.g. to
+            ``"2GB"``) to keep the pre-existing behavior of only externalizing when inline
+            saving is impossible.
     :return: A tuple (simplified model, success(True) or failed(False))
     """
     # Validate the requested execution providers up front. onnxsim's constant
@@ -1237,6 +1768,18 @@ def simplify(
     # degrade to no folding. Checking here turns a misconfigured provider (e.g.
     # CUDA requested without the onnxruntime-gpu build) into an immediate error.
     backend.validate_providers(providers)
+
+    # ``target_opset_version="latest"`` resolves against the C++ core's own
+    # compiled-in onnx schema registry (the same one ConvertOpsetVersion uses),
+    # not the pip-installed `onnx` package's `onnx.defs.onnx_opset_version()` --
+    # the two can differ since onnxsim vendors its own onnx fork.
+    if target_opset_version == "latest":
+        target_opset_version = C.max_default_domain_opset_version()
+    elif target_opset_version is not None and not isinstance(target_opset_version, int):
+        raise ValueError(
+            "target_opset_version must be an int, the string 'latest', or None, "
+            f"got {target_opset_version!r}"
+        )
 
     if dynamic_input_shape:
         print(
@@ -1707,7 +2250,10 @@ def simplify(
         # materialized anyway to run the correctness check) or fell back from an
         # internal error. Either way ``model_opt`` is already a full ModelProto
         # here, so there is no reload to avoid -- just honor the save request.
+        _external_data_threshold_bytes = parse_size(external_data_threshold)
         try:
+            if model_opt.ByteSize() > _external_data_threshold_bytes:
+                raise ValueError("external_data_threshold")
             onnx.save(model_opt, output_path)
         except (ValueError, EncodeError):
             external_data_path = os.path.basename(output_path) + ".data"
@@ -1980,14 +2526,20 @@ def main():
         action="store_true",
     )
     parser.add_argument(
+        "--external-data-threshold",
+        help="Save parameters as external data whenever the simplified model's serialized size exceeds this, without needing --save-as-external-data. Accepts the same '<number><unit>' syntax as --no-large-tensor, e.g. '500MB' or '2GB'. Defaults to '100MB'; raise it (e.g. to '2GB') to only externalize when inline saving is impossible, matching pre-existing behavior.",
+        type=str,
+        default=DEFAULT_EXTERNAL_DATA_THRESHOLD,
+    )
+    parser.add_argument(
         "--skip-schema-import",
         help="By default onnxsim imports operator schemas registered in the Python 'onnx' module (e.g. via onnx.defs.register_schema) into its own registry so models with custom operators pass validation. Specify this flag to disable that import.",
         action="store_true",
     )
     parser.add_argument(
         "--target-opset",
-        help="Convert the model to this opset version (of the default ONNX domain) before simplifying, for example '--target-opset 18'. Can be used to upgrade (or downgrade) the model's opset during simplification.",
-        type=int,
+        help="Convert the model to this opset version (of the default ONNX domain) before simplifying, for example '--target-opset 18'. Can be used to upgrade (or downgrade) the model's opset during simplification. Pass 'latest' to resolve to the highest opset version this onnxsim build supports.",
+        type=lambda s: s if s == "latest" else int(s),
         default=None,
     )
     parser.add_argument(
@@ -2046,6 +2598,66 @@ def main():
         "span in one unified flame graph. Implies --profile (defaults to "
         "'onnxsim_profile.json').",
         action="store_true",
+    )
+    parser.add_argument(
+        "--emit-mlir",
+        nargs="?",
+        const="",
+        default=None,
+        metavar="PATH",
+        help="Also emit the simplified model as MLIR (see --mlir-target). "
+        "Optionally give an output path; when the flag is passed without one, the "
+        "MLIR is written next to the output model with a '.mlir' extension.",
+    )
+    parser.add_argument(
+        "--mlir-target",
+        choices=["torch", "onnx"],
+        default="torch",
+        help="Which MLIR dialect --emit-mlir produces: 'torch' (Torch dialect, via "
+        "torch-mlir; pip install torch-mlir) or 'onnx' (ONNX dialect, via the "
+        "onnx-mlir compiler binary). Default: torch.",
+    )
+    parser.add_argument(
+        "--onnx-mlir",
+        metavar="PATH",
+        default=None,
+        help="Path to the onnx-mlir compiler binary, used with "
+        "'--mlir-target onnx'. Defaults to $ONNX_MLIR, "
+        "$ONNX_MLIR_HOME/bin/onnx-mlir, then the onnx-mlir on PATH.",
+    )
+    parser.add_argument(
+        "--emit-coreml",
+        nargs="?",
+        const="",
+        default=None,
+        metavar="PATH",
+        help="Also convert the simplified model to Core ML (via coremltools; "
+        "pip install coremltools). Requires fully static input shapes. Optionally "
+        "give an output path (a '.mlpackage' directory, or '.mlmodel' with "
+        "'--coreml-format neuralnetwork'); when the flag is passed without one, it "
+        "is written next to the output model with a '.mlpackage'/'.mlmodel' "
+        "extension.",
+    )
+    parser.add_argument(
+        "--coreml-format",
+        choices=["mlprogram", "neuralnetwork"],
+        default="mlprogram",
+        help="Core ML model type --emit-coreml produces: 'mlprogram' (the modern "
+        "'.mlpackage' format) or 'neuralnetwork' (the legacy '.mlmodel' format). "
+        "Default: mlprogram.",
+    )
+    parser.add_argument(
+        "--coreml-compute-units",
+        choices=["ALL", "CPU_ONLY", "CPU_AND_GPU", "CPU_AND_NE"],
+        default="ALL",
+        help="Which compute devices the --emit-coreml model may run on. Default: ALL.",
+    )
+    parser.add_argument(
+        "--coreml-minimum-deployment-target",
+        default=None,
+        metavar="TARGET",
+        help="Minimum OS version the --emit-coreml model must run on, e.g. 'iOS16' "
+        "or 'macOS13'. Defaults to coremltools' own default.",
     )
     parser.add_argument(
         "--node-reduction-plot",
@@ -2866,14 +3478,18 @@ def main():
             model_opt, calibration_data=calibration_data, method=args.calibration_method
         )
 
+    _external_data_threshold_bytes = parse_size(args.external_data_threshold)
     try:
-        if not args.save_as_external_data:
+        if not args.save_as_external_data and (
+            model_opt.ByteSize() <= _external_data_threshold_bytes
+        ):
             onnx.save(model_opt, args.output_model)
         else:
             raise ValueError("save_as_external_data")
     except (ValueError, EncodeError):
-        # large models (>2GB) which onnx.save doesn't support,
-        # or explicitly specified --save-as-external-data
+        # large models (>2GB) which onnx.save doesn't support, explicitly
+        # specified --save-as-external-data, or the model's serialized size
+        # exceeds --external-data-threshold (100MB by default)
         external_data_path = os.path.basename(args.output_model) + ".data"
         if os.path.exists(external_data_path):
             os.remove(external_data_path)
@@ -2891,6 +3507,49 @@ def main():
             all_tensors_to_one_file=True,
             location=external_data_path,
         )
+
+    if args.emit_mlir is not None:
+        from onnxsim import mlir_export
+
+        if args.emit_mlir:
+            mlir_path = args.emit_mlir
+        else:
+            mlir_path = os.path.splitext(args.output_model)[0] + ".mlir"
+        dialect = "ONNX" if args.mlir_target == "onnx" else "Torch"
+        print(f"Emitting {dialect}-dialect MLIR to {mlir_path} ...")
+        mlir_kwargs = {}
+        if args.mlir_target == "onnx" and args.onnx_mlir:
+            mlir_kwargs["onnx_mlir"] = args.onnx_mlir
+        try:
+            mlir_export.export_mlir(
+                model_opt, mlir_path, target=args.mlir_target, **mlir_kwargs
+            )
+        except RuntimeError as e:
+            print(Text(str(e), style="bold red"))
+            sys.exit(1)
+        print(f"MLIR written to {mlir_path}")
+
+    if args.emit_coreml is not None:
+        from onnxsim import coreml_export
+
+        if args.emit_coreml:
+            coreml_path = args.emit_coreml
+        else:
+            ext = ".mlpackage" if args.coreml_format == "mlprogram" else ".mlmodel"
+            coreml_path = os.path.splitext(args.output_model)[0] + ext
+        print(f"Converting to Core ML ({args.coreml_format}) at {coreml_path} ...")
+        try:
+            coreml_export.export_coreml(
+                model_opt,
+                coreml_path,
+                convert_to=args.coreml_format,
+                compute_units=args.coreml_compute_units,
+                minimum_deployment_target=args.coreml_minimum_deployment_target,
+            )
+        except RuntimeError as e:
+            print(Text(str(e), style="bold red"))
+            sys.exit(1)
+        print(f"Core ML model written to {coreml_path}")
 
     if check_ok:
         print("Finish! Here is the difference:")

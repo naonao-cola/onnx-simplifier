@@ -319,8 +319,8 @@ def test_audio8_quantize_dynamic_matches_published_int8_quality(audio8_model_dir
     # here, under our control -- onnxsim.measure_accuracy_drop/quantize_dynamic
     # both load a bare path with load_external_data=False, which would leave
     # published_int8's weights unresolved.
-    fp32_model = onnx.load(fp32_path)
-    published_int8_model = onnx.load(published_int8_path)
+    fp32_model, _pool = onnxsim.load_model(fp32_path)
+    published_int8_model, _pool = onnxsim.load_model(published_int8_path)
 
     # quantize_dynamic only rewrites a MatMul/Gemm whose weight is *already*
     # a plain 2-D constant initializer (see dynamic-quantization.md); this
@@ -507,7 +507,7 @@ def test_audio8_tts_0_1b_quantize_dynamic_matches_published_int8_quality(
     published_int8_path = _download_quality_file(
         "tts_0.1b_fast_ar_int8.onnx", audio8_model_dir
     )
-    published_int8_model = onnx.load(published_int8_path)
+    published_int8_model, _pool = onnxsim.load_model(published_int8_path)
 
     reconstructed_model = onnx.ModelProto()
     reconstructed_model.CopyFrom(published_int8_model)

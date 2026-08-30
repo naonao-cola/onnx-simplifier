@@ -8,6 +8,7 @@
 #endif
 #include <algorithm>
 #include <cstring>
+#include <deque>
 #include <functional>
 #include <iostream>
 #include <map>
@@ -335,7 +336,9 @@ std::vector<onnx::TensorProto> RunOps(
     const ModelExecutor& executor, const onnx::ModelProto& model,
     const std::vector<const onnx::NodeProto*>& ops,
     const std::unordered_map<std::string, const onnx::NodeProto*>&
-        deferred_producers) {
+        deferred_producers,
+    const std::unordered_map<std::string, const onnx::NodeProto*>&
+        constant_node_producers) {
   std::vector<std::string> input_names;
   // Pointers borrow directly from `model`'s own initializers -- `model` is
   // const and not touched again until every pointer here has been consumed
@@ -413,6 +416,16 @@ std::vector<onnx::TensorProto> RunOps(
             // Produced by a deferred node: inline it rather than treating the
             // (unmaterialized) output as an external constant input.
             include_node(*deferred_iter->second);
+            continue;
+          }
+          auto constant_iter = constant_node_producers.find(input);
+          if (constant_iter != constant_node_producers.end()) {
+            // Produced by a Constant node (pre-existing, or created by an
+            // earlier fold batch/round because that fold was not purely
+            // initializer-derived): its value has no initializer to look up,
+            // so inline the (zero-input, so trivially includable) Constant
+            // node itself instead.
+            include_node(*constant_iter->second);
             continue;
           }
           if (!seen_inputs.insert(input).second) {
@@ -499,14 +512,47 @@ std::vector<onnx::TensorProto> RunOps(
   return output_tps;
 }
 
+// Builds a `Constant` NodeProto whose sole output holds `output_tp` as its
+// `value` attribute (verbatim, raw_data included).
+onnx::NodeProto MakeConstantNode(const onnx::TensorProto& output_tp) {
+  onnx::NodeProto node;
+  node.set_op_type("Constant");
+  node.add_output(output_tp.name());
+  onnx::AttributeProto* attr = node.add_attribute();
+  attr->set_name("value");
+  attr->set_type(onnx::AttributeProto::TENSOR);
+  *attr->mutable_t() = output_tp;
+  return node;
+}
+
+// Materializes a successfully-folded batch's outputs into `model`: an output
+// in `impure_outputs` (see ConstantNodePartition's own doc comment) becomes a
+// fresh `Constant` node instead of a plain initializer. `new_constant_nodes`
+// owns every such node for the rest of this fold pass (stable references,
+// unlike a std::vector, since later batches keep pointers into it via
+// `constant_node_producers`) and collects them for the caller to splice into
+// the model's node list once folding is done (see _FoldConstant's
+// RebuildNodeList step). `constant_node_producers` is grown with each new
+// Constant node's output name so a later batch that consumes it can inline it
+// via RunOps' own lookup, exactly like a pre-existing Constant node.
 void RunOpsAndAddInitializers(
     const ModelExecutor& executor, onnx::ModelProto& model,
     const std::vector<const onnx::NodeProto*>& ops,
     const std::unordered_map<std::string, const onnx::NodeProto*>&
-        deferred_producers) {
-  const auto output_tps = RunOps(executor, model, ops, deferred_producers);
+        deferred_producers,
+    const std::set<std::string>& impure_outputs,
+    std::unordered_map<std::string, const onnx::NodeProto*>&
+        constant_node_producers,
+    std::deque<onnx::NodeProto>& new_constant_nodes) {
+  const auto output_tps =
+      RunOps(executor, model, ops, deferred_producers, constant_node_producers);
   for (const auto& output_tp : output_tps) {
-    *model.mutable_graph()->add_initializer() = output_tp;
+    if (impure_outputs.count(output_tp.name()) == 0) {
+      *model.mutable_graph()->add_initializer() = output_tp;
+      continue;
+    }
+    new_constant_nodes.push_back(MakeConstantNode(output_tp));
+    constant_node_producers[output_tp.name()] = &new_constant_nodes.back();
   }
 }
 
@@ -579,7 +625,8 @@ bool ProduceLargeTensor(const onnx::ModelProto& model,
 
 // The result of partitioning a graph's nodes for constant folding.
 struct ConstantNodePartition {
-  // Nodes whose output is materialized into an initializer by folding.
+  // Nodes whose output is materialized (into an initializer or a fresh
+  // Constant node, see impure_outputs below) by folding.
   std::vector<onnx::NodeProto> const_nodes;
   // Nodes kept in the graph (folded consumers reference their outputs via
   // initializers, or they are genuinely non-constant runtime nodes).
@@ -591,7 +638,25 @@ struct ConstantNodePartition {
   // foldable; RunOps inlines the producing node into the sub-model it executes,
   // so the large intermediate tensor is computed transiently and never stored.
   std::set<std::string> deferred_outputs;
+  // Outputs of const_nodes whose value does not trace back purely to graph
+  // initializers -- transitively, through a chain of other purely-initializer
+  // folds -- because somewhere upstream it consumes a Constant node's embedded
+  // value or a deferred output. These are materialized as a fresh Constant node
+  // rather than an initializer, so a value the graph actually computed stays
+  // visually distinct from literal weight data; see RunOpsAndAddInitializers.
+  std::set<std::string> impure_outputs;
 };
+
+// Whether `node` (assumed op_type "Constant") was marked transient by another
+// onnxsim pass -- see kTransientConstantAttr's own comment.
+bool IsTransientConstant(const onnx::NodeProto& node) {
+  for (const auto& attr : node.attribute()) {
+    if (attr.name() == kTransientConstantAttr) {
+      return true;
+    }
+  }
+  return false;
+}
 
 ConstantNodePartition GetConstantNodes(const onnx::ModelProto& model) {
   // tensor with empty name("") represents the empty value of an optional input
@@ -604,6 +669,11 @@ ConstantNodePartition GetConstantNodes(const onnx::ModelProto& model) {
   // O(constants seen so far) per input, i.e. O(nodes * initializers) overall
   // on a model with many weights; a hash set makes each lookup O(1) average.
   std::unordered_set<std::string> const_names{""};
+  // Subset of const_names whose value traces back purely to graph
+  // initializers -- transitively, through other purely-initializer folds --
+  // as opposed to a Constant node's embedded value or a deferred (large-
+  // tensor) output. See ConstantNodePartition::impure_outputs.
+  std::unordered_set<std::string> pure_names{""};
   ConstantNodePartition partition;
   auto& const_nodes = partition.const_nodes;
   auto& non_const_nodes = partition.non_const_nodes;
@@ -615,6 +685,7 @@ ConstantNodePartition GetConstantNodes(const onnx::ModelProto& model) {
   if (config.initializers_as_constants) {
     for (const auto& x : model.graph().initializer()) {
       const_names.insert(x.name());
+      pure_names.insert(x.name());
     }
   }
   // Map each domain to its imported opset version so the correct operator
@@ -633,6 +704,28 @@ ConstantNodePartition GetConstantNodes(const onnx::ModelProto& model) {
   };
   // node is already topo sorted
   for (const auto& node : model.graph().node()) {
+    // A Constant node's output is already a fully-resolved value -- leave it
+    // exactly as-is (never re-materialize it into an initializer or a new
+    // Constant node) rather than folding it like any other node. This keeps
+    // the pass idempotent: a Constant node this same function created on a
+    // previous round (because a fold was not purely initializer-derived, see
+    // impure_outputs) would otherwise be trivially "foldable" (zero inputs)
+    // and get flattened straight back into an initializer, erasing the
+    // provenance distinction on the very next fixed-point iteration. Its
+    // output still joins const_names so downstream nodes recognize it as a
+    // constant input -- but never pure_names, so any consumer is correctly
+    // treated as not purely initializer-derived either. Exception: a node
+    // marked transient (kTransientConstantAttr) is another onnxsim pass's own
+    // intermediate representation, not a provenance-worthy Constant, so it
+    // falls through to the ordinary foldable path below instead.
+    const bool is_default_domain =
+        node.domain().empty() || node.domain() == "ai.onnx";
+    if (is_default_domain && node.op_type() == "Constant" &&
+        !IsTransientConstant(node)) {
+      const_names.insert(node.output().begin(), node.output().end());
+      non_const_nodes.push_back(node);
+      continue;
+    }
     const bool foldable =
         IsOfficialOp(node.domain(), node.op_type()) &&
         IsDeterministic(node.domain(), node.op_type(),
@@ -646,9 +739,19 @@ ConstantNodePartition GetConstantNodes(const onnx::ModelProto& model) {
       continue;
     }
     if (!ProduceLargeTensor(model, node, config.tensor_size_threshold)) {
-      // Ordinary constant folding: the output is materialized as an
-      // initializer and the node is dropped.
+      // Ordinary constant folding: the output is materialized (as an
+      // initializer, or a Constant node if not purely initializer-derived)
+      // and the node is dropped.
+      const bool pure = std::all_of(
+          node.input().begin(), node.input().end(),
+          [&pure_names](const auto& x) { return pure_names.count(x) > 0; });
       const_names.insert(node.output().begin(), node.output().end());
+      if (pure) {
+        pure_names.insert(node.output().begin(), node.output().end());
+      } else {
+        partition.impure_outputs.insert(node.output().begin(),
+                                        node.output().end());
+      }
       const_nodes.push_back(node);
       continue;
     }
@@ -785,6 +888,10 @@ void FoldGroup(const ModelExecutor& executor, onnx::ModelProto& model,
                size_t end,
                const std::unordered_map<std::string, const onnx::NodeProto*>&
                    deferred_producers,
+               const std::set<std::string>& impure_outputs,
+               std::unordered_map<std::string, const onnx::NodeProto*>&
+                   constant_node_producers,
+               std::deque<onnx::NodeProto>& new_constant_nodes,
                std::set<std::string>& folded_outputs) {
   if (begin >= end) {
     return;
@@ -795,7 +902,9 @@ void FoldGroup(const ModelExecutor& executor, onnx::ModelProto& model,
     ops.push_back(&const_nodes[k]);
   }
   try {
-    RunOpsAndAddInitializers(executor, model, ops, deferred_producers);
+    RunOpsAndAddInitializers(executor, model, ops, deferred_producers,
+                             impure_outputs, constant_node_producers,
+                             new_constant_nodes);
     for (size_t k = begin; k < end; k++) {
       for (const auto& output : const_nodes[k].output()) {
         folded_outputs.insert(output);
@@ -811,8 +920,10 @@ void FoldGroup(const ModelExecutor& executor, onnx::ModelProto& model,
     }
     const size_t mid = begin + (end - begin) / 2;
     FoldGroup(executor, model, const_nodes, begin, mid, deferred_producers,
+              impure_outputs, constant_node_producers, new_constant_nodes,
               folded_outputs);
     FoldGroup(executor, model, const_nodes, mid, end, deferred_producers,
+              impure_outputs, constant_node_producers, new_constant_nodes,
               folded_outputs);
   }
 }
@@ -844,6 +955,33 @@ onnx::ModelProto _FoldConstant(const ModelExecutor& executor,
       }
     }
   }
+  // Map each pre-existing, non-transient Constant node's output to the node
+  // itself, seeding the lookup RunOps uses to inline a Constant node's
+  // embedded value instead of looking it up as an initializer -- including a
+  // transient one (kTransientConstantAttr): unlike a genuine Constant node,
+  // it is not special-cased out of GetConstantNodes and so flows through the
+  // ordinary foldable path, but that fold can still fail and leave it
+  // in place (FoldGroup's catch-and-skip), so a later batch may need to
+  // inline it same as any other Constant. Safe to seed unconditionally here
+  // (unlike the Graph-native counterpart below): this map's pointers alias
+  // `model.graph().node()`, which nothing in this function's batch loop
+  // frees or reallocates -- only RebuildNodeList, strictly after the loop,
+  // drops folded entries. Grown as folding creates new Constant nodes for
+  // impure outputs (see RunOpsAndAddInitializers); new_constant_nodes owns
+  // those (a std::deque, not a std::vector, so the pointers this map holds
+  // into it stay valid as more are appended).
+  std::unordered_map<std::string, const onnx::NodeProto*>
+      constant_node_producers;
+  for (const auto& node : model.graph().node()) {
+    const bool is_default_domain =
+        node.domain().empty() || node.domain() == "ai.onnx";
+    if (is_default_domain && node.op_type() == "Constant") {
+      for (const auto& output : node.output()) {
+        constant_node_producers.emplace(output, &node);
+      }
+    }
+  }
+  std::deque<onnx::NodeProto> new_constant_nodes;
   // Look up each tensor's inferred shape so batches can be capped by the
   // bytes they would materialize (see below). Pointers reference `model`,
   // which is not mutated (only appended to) while the map is in use.
@@ -878,7 +1016,8 @@ onnx::ModelProto _FoldConstant(const ModelExecutor& executor,
   for (size_t i = 0; i < num_const_nodes;) {
     if (consumes_deferred(const_nodes[i])) {
       FoldGroup(executor, model, const_nodes, i, i + 1, deferred_producers,
-                folded_outputs);
+                partition.impure_outputs, constant_node_producers,
+                new_constant_nodes, folded_outputs);
       i++;
       continue;
     }
@@ -894,7 +1033,8 @@ onnx::ModelProto _FoldConstant(const ModelExecutor& executor,
       j++;
     }
     FoldGroup(executor, model, const_nodes, i, j, deferred_producers,
-              folded_outputs);
+              partition.impure_outputs, constant_node_producers,
+              new_constant_nodes, folded_outputs);
     i = j;
   }
   // Rebuild the node list in its original topological order, dropping only
@@ -902,17 +1042,50 @@ onnx::ModelProto _FoldConstant(const ModelExecutor& executor,
   // node that failed to fold must keep its original position: appending it to
   // the end can place it after a non-const consumer (e.g. a Loop reading a
   // SequenceEmpty output), which breaks topological sorting and makes the
-  // resulting model fail onnx's checker (issues #238, #335, #352).
+  // resulting model fail onnx's checker (issues #238, #335, #352). Newly
+  // created Constant nodes (impure folds) are prepended ahead of everything
+  // else: they have no inputs of their own, so any position before their
+  // first use is topologically valid, and the front trivially satisfies that
+  // for every consumer regardless of where it sits in `original_nodes`.
+  //
+  // Every pre-existing Constant node kept as-is (GetConstantNodes' own
+  // passthrough) is prepended alongside them, for the same reason: a
+  // Constant node has no inputs, so moving it earlier is always safe, and a
+  // model can carry one positioned after one of its own uses -- tolerated by
+  // ONNX's checker (this is not the initializer list, whose order genuinely
+  // doesn't matter) but not by the stricter topological-order check the
+  // ModelProto<->Graph round trip inside Optimize() runs. Such a node used
+  // to be silently normalized by extract_constant_to_initializer (which
+  // converted it to an order-independent initializer) before that pass was
+  // always disabled.
   {
     onnxsim::ProfiledScope rebuild_scope("RebuildNodeList");
     google::protobuf::RepeatedPtrField<onnx::NodeProto> original_nodes;
     original_nodes.Swap(model.mutable_graph()->mutable_node());
+    google::protobuf::RepeatedPtrField<onnx::NodeProto> kept_constants;
+    google::protobuf::RepeatedPtrField<onnx::NodeProto> kept_others;
     for (auto& node : original_nodes) {
       const bool folded =
           node.output_size() > 0 && folded_outputs.count(node.output(0)) > 0;
-      if (!folded) {
-        *model.mutable_graph()->add_node() = std::move(node);
+      if (folded) {
+        continue;
       }
+      const bool is_default_domain =
+          node.domain().empty() || node.domain() == "ai.onnx";
+      if (is_default_domain && node.op_type() == "Constant") {
+        *kept_constants.Add() = std::move(node);
+      } else {
+        *kept_others.Add() = std::move(node);
+      }
+    }
+    for (auto& node : new_constant_nodes) {
+      *model.mutable_graph()->add_node() = std::move(node);
+    }
+    for (auto& node : kept_constants) {
+      *model.mutable_graph()->add_node() = std::move(node);
+    }
+    for (auto& node : kept_others) {
+      *model.mutable_graph()->add_node() = std::move(node);
     }
   }
   // Drop initializers left dangling by folding so the intermediate model does
@@ -938,12 +1111,17 @@ onnx::ModelProto _FoldConstant(const ModelExecutor& executor,
 // an initializer folding leaves dangling in that mode.
 
 struct ConstantNodePartitionGraph {
-  // Nodes whose output is materialized into an initializer by folding, in
-  // topological order.
+  // Nodes whose output is materialized (into an initializer or a fresh
+  // Constant node, see impure_outputs below) by folding, in topological
+  // order.
   std::vector<onnx::Node*> const_nodes;
   // Unique names of "deferred" nodes' outputs -- see ConstantNodePartition's
   // own doc comment; same semantics, ported verbatim.
   std::unordered_set<std::string> deferred_outputs;
+  // Outputs of const_nodes that do not trace back purely to graph
+  // initializers -- see ConstantNodePartition::impure_outputs, same
+  // semantics, ported verbatim.
+  std::unordered_set<std::string> impure_outputs;
 };
 
 bool HasSubgraphAttr(onnx::Node* node) {
@@ -1018,14 +1196,29 @@ size_t EstimateOutputBytesOnGraph(onnx::Node* node) {
   return total;
 }
 
+// Graph-native counterpart of IsTransientConstant.
+bool IsTransientConstantOnGraph(onnx::Node* node) {
+  static const onnx::Symbol kTransientAttr(kTransientConstantAttr);
+  return node->hasAttribute(kTransientAttr);
+}
+
 // Graph-native counterpart of GetConstantNodes.
 ConstantNodePartitionGraph GetConstantNodesOnGraph(
     onnx::Graph& g, const std::vector<onnx::Node*>& node_ptrs) {
+  // Reference node every genuine Constant encountered below is moved just
+  // before, in scan order -- see that branch's own comment for why.
+  onnx::Node* const front_anchor =
+      node_ptrs.empty() ? nullptr : node_ptrs.front();
   std::unordered_set<std::string> const_names{""};
+  // Subset of const_names whose value traces back purely to graph
+  // initializers -- see GetConstantNodes' own pure_names for the full
+  // rationale, ported verbatim.
+  std::unordered_set<std::string> pure_names{""};
   ConstantNodePartitionGraph partition;
   if (config.initializers_as_constants) {
     for (const auto& name : g.initializer_names()) {
       const_names.insert(name);
+      pure_names.insert(name);
     }
   }
   std::unordered_map<std::string, int> domain_to_version;
@@ -1046,6 +1239,35 @@ ConstantNodePartitionGraph GetConstantNodesOnGraph(
     const std::string domain =
         node->has_domain() ? node->domain() : std::string();
     const std::string op_type = node->kind().toString();
+    // Leave Constant nodes untouched, transient ones excepted -- see
+    // GetConstantNodes' own comment on its identical special case for the
+    // full rationale (idempotence: a Constant node created by a previous
+    // round for an impure fold must not be trivially re-folded straight back
+    // into an initializer) and kTransientConstantAttr's own comment.
+    const bool is_default_domain = domain.empty() || domain == "ai.onnx";
+    if (is_default_domain && node->kind() == onnx::kConstant &&
+        !IsTransientConstantOnGraph(node)) {
+      // A Constant node has no inputs, so moving it earlier is always safe;
+      // do so unconditionally rather than checking whether it is already
+      // valid. A model can otherwise carry one positioned after one of its
+      // own uses -- tolerated by ONNX's checker (this is not the initializer
+      // list, whose order genuinely doesn't matter) but not by the stricter
+      // topological-order check the ModelProto<->Graph round trip inside
+      // Optimize() runs -- and such a node used to be silently normalized by
+      // extract_constant_to_initializer (which converted it to an
+      // order-independent initializer) before that pass was always disabled.
+      // Moved just before `front_anchor` (in scan order, so relative order
+      // among moved Constants is preserved) rather than the graph's true
+      // first node, which may itself shift as earlier Constants in this same
+      // scan are moved.
+      if (front_anchor != nullptr && node != front_anchor) {
+        node->moveBefore(front_anchor);
+      }
+      for (onnx::Value* out : node->outputs()) {
+        const_names.insert(out->uniqueName());
+      }
+      continue;
+    }
     const bool foldable =
         IsOfficialOp(domain, op_type) &&
         IsDeterministic(domain, op_type, opset_version_of(domain)) &&
@@ -1061,8 +1283,20 @@ ConstantNodePartitionGraph GetConstantNodesOnGraph(
       continue;
     }
     if (!ProduceLargeTensorOnGraph(node, config.tensor_size_threshold)) {
+      const bool pure = std::all_of(
+          node->inputs().begin(), node->inputs().end(),
+          [&pure_names](onnx::Value* v) {
+            const std::string name =
+                v->node()->kind() == onnx::kUndefined ? "" : v->uniqueName();
+            return pure_names.count(name) > 0;
+          });
       for (onnx::Value* out : node->outputs()) {
         const_names.insert(out->uniqueName());
+        if (pure) {
+          pure_names.insert(out->uniqueName());
+        } else {
+          partition.impure_outputs.insert(out->uniqueName());
+        }
       }
       partition.const_nodes.push_back(node);
       continue;
@@ -1094,6 +1328,7 @@ RunOpsOnGraphResult RunOpsOnGraph(
     const ModelExecutor& executor, onnx::Graph& g,
     const std::vector<onnx::Node*>& ops,
     const std::unordered_map<std::string, onnx::Node*>& deferred_producers,
+    const std::unordered_map<std::string, onnx::Node*>& constant_node_producers,
     int64_t ir_version) {
   std::vector<std::string> input_names;
   std::vector<const onnx::Tensor*> input_tensors;
@@ -1139,6 +1374,16 @@ RunOpsOnGraphResult RunOpsOnGraph(
       auto deferred_iter = deferred_producers.find(name);
       if (deferred_iter != deferred_producers.end()) {
         include_node(deferred_iter->second);
+        continue;
+      }
+      auto constant_iter = constant_node_producers.find(name);
+      if (constant_iter != constant_node_producers.end()) {
+        // Produced by a Constant node (pre-existing, or created by an
+        // earlier fold batch/round because that fold was not purely
+        // initializer-derived): its value has no initializer to look up, so
+        // inline the (zero-input, so trivially includable) Constant node
+        // itself instead.
+        include_node(constant_iter->second);
         continue;
       }
       if (!seen_inputs.insert(name).second) {
@@ -1239,13 +1484,20 @@ RunOpsOnGraphResult RunOpsOnGraph(
 }
 
 // Graph-native counterpart of FoldGroup: splices each successfully-folded
-// output directly into `g` as a new initializer (Graph::
-// addInitializerAndCreateValue), rewires the folded node's uses onto it,
-// and removes the folded node -- no NodeProto rebuild needed.
+// output directly into `g` -- as a new initializer (Graph::
+// addInitializerAndCreateValue) when it is in `impure_outputs` (see
+// ConstantNodePartitionGraph's own doc comment), a fresh Constant node
+// otherwise -- rewires the folded node's uses onto it, and removes the
+// folded node -- no NodeProto rebuild needed. `constant_node_producers` is
+// grown with each new Constant node so a later batch/round that consumes it
+// can inline it via RunOpsOnGraph's own lookup, exactly like a pre-existing
+// Constant node.
 void FoldGroupOnGraph(
     const ModelExecutor& executor, onnx::Graph& g,
     const std::vector<onnx::Node*>& const_nodes, size_t begin, size_t end,
     const std::unordered_map<std::string, onnx::Node*>& deferred_producers,
+    const std::unordered_set<std::string>& impure_outputs,
+    std::unordered_map<std::string, onnx::Node*>& constant_node_producers,
     size_t& num_folded, int64_t ir_version) {
   if (begin >= end) {
     return;
@@ -1254,15 +1506,16 @@ void FoldGroupOnGraph(
                                const_nodes.begin() + end);
   try {
     RunOpsOnGraphResult result =
-        RunOpsOnGraph(executor, g, ops, deferred_producers, ir_version);
+        RunOpsOnGraph(executor, g, ops, deferred_producers,
+                      constant_node_producers, ir_version);
     // Every op in this batch folded successfully (RunOpsOnGraph throws,
     // rather than partially populating its result, on any failure) -- decode
     // each returned TensorProto (ToTensorProto always emits raw_data, see
-    // dlpack_bridge.h) into a Tensor, add it as a new initializer, and
-    // rewire the Value it replaces onto it. A multi-output node's outputs
-    // are independent Values here, each replaced on its own; the owning
-    // node is only destroyed (never touched again after) once every one of
-    // its outputs has been replaced.
+    // dlpack_bridge.h) into a Tensor, add it as a new initializer or Constant
+    // node, and rewire the Value it replaces onto it. A multi-output node's
+    // outputs are independent Values here, each replaced on its own; the
+    // owning node is only destroyed (never touched again after) once every
+    // one of its outputs has been replaced.
     std::unordered_map<onnx::Node*, size_t> remaining_outputs;
     for (onnx::Node* node : ops) {
       remaining_outputs[node] = node->outputs().size();
@@ -1278,9 +1531,39 @@ void FoldGroupOnGraph(
       if (tp.has_raw_data()) {
         t.set_raw_data(tp.raw_data());
       }
-      onnx::Value* new_value = g.addInitializerAndCreateValue(t);
+      onnx::Value* new_value;
+      if (impure_outputs.count(tp.name()) == 0) {
+        new_value = g.addInitializerAndCreateValue(t);
+      } else {
+        // Not purely initializer-derived: materialize as a Constant node
+        // instead of an initializer. Prepended at the very front of the
+        // graph (rather than inserted at the folded node's old position):
+        // a Constant node has no inputs of its own, so the front is always
+        // topologically valid regardless of where its consumers -- or, for
+        // a multi-batch fold, nodes not yet visited in this same call --
+        // currently sit.
+        onnx::Node* constant = g.create(onnx::kConstant, 1);
+        constant->t_(onnx::kvalue, t);
+        std::vector<onnx::Dimension> sizes;
+        sizes.reserve(tp.dims_size());
+        for (int64_t d : tp.dims()) {
+          sizes.emplace_back(d);
+        }
+        constant->output()->setSizes(sizes);
+        constant->output()->setElemType(tp.data_type());
+        constant->output()->setUniqueName(tp.name());
+        g.prependNode(constant);
+        constant_node_producers[tp.name()] = constant;
+        new_value = constant->output();
+      }
       old_value->replaceAllUsesWith(new_value);
       if (--remaining_outputs[owner] == 0) {
+        // If `owner` is itself a (transient) Constant node seeded into
+        // constant_node_producers, drop its entry before destroying it --
+        // see the seeding loop's own comment on why transient nodes are
+        // seeded despite being foldable: this is the other half of that,
+        // keeping the map from ever pointing at freed memory.
+        constant_node_producers.erase(tp.name());
         owner->destroy();
       }
     }
@@ -1295,9 +1578,11 @@ void FoldGroupOnGraph(
     }
     const size_t mid = begin + (end - begin) / 2;
     FoldGroupOnGraph(executor, g, const_nodes, begin, mid, deferred_producers,
-                     num_folded, ir_version);
+                     impure_outputs, constant_node_producers, num_folded,
+                     ir_version);
     FoldGroupOnGraph(executor, g, const_nodes, mid, end, deferred_producers,
-                     num_folded, ir_version);
+                     impure_outputs, constant_node_producers, num_folded,
+                     ir_version);
   }
 }
 
@@ -1334,6 +1619,31 @@ bool _FoldConstantOnGraph(const ModelExecutor& executor, onnx::Graph& g,
       }
     }
   }
+  // Map each pre-existing, non-transient Constant node's output to the node
+  // itself, seeding the lookup RunOpsOnGraph uses to inline a Constant node's
+  // embedded value instead of looking it up as an initializer. Grown as
+  // folding creates new Constant nodes for impure outputs (see
+  // FoldGroupOnGraph) -- including a transient one (kTransientConstantAttr):
+  // unlike a genuine Constant node, it is not special-cased out of
+  // GetConstantNodesOnGraph and so flows through the ordinary foldable path,
+  // but that fold can still fail and leave it in place
+  // (FoldGroupOnGraph's catch-and-skip), so a later batch may need to inline
+  // it same as any other Constant. A transient node's fold *succeeding*
+  // destroys it (FoldGroupOnGraph's `owner->destroy()`), which would
+  // otherwise leave this map holding a dangling Node* -- FoldGroupOnGraph
+  // erases the entry itself right before destroying the node, so seeding it
+  // here is safe.
+  std::unordered_map<std::string, onnx::Node*> constant_node_producers;
+  for (onnx::Node* node : node_ptrs) {
+    const std::string domain =
+        node->has_domain() ? node->domain() : std::string();
+    const bool is_default_domain = domain.empty() || domain == "ai.onnx";
+    if (is_default_domain && node->kind() == onnx::kConstant) {
+      for (onnx::Value* out : node->outputs()) {
+        constant_node_producers.emplace(out->uniqueName(), node);
+      }
+    }
+  }
 
   constexpr size_t kBatchByteBudget = size_t(256) << 20;  // 256 MiB
   constexpr size_t kBatchMaxNodes = 1024;
@@ -1354,6 +1664,7 @@ bool _FoldConstantOnGraph(const ModelExecutor& executor, onnx::Graph& g,
   for (size_t i = 0; i < num_const_nodes;) {
     if (consumes_deferred(const_nodes[i])) {
       FoldGroupOnGraph(executor, g, const_nodes, i, i + 1, deferred_producers,
+                       partition.impure_outputs, constant_node_producers,
                        num_folded, ir_version);
       i++;
       continue;
@@ -1370,6 +1681,7 @@ bool _FoldConstantOnGraph(const ModelExecutor& executor, onnx::Graph& g,
       j++;
     }
     FoldGroupOnGraph(executor, g, const_nodes, i, j, deferred_producers,
+                     partition.impure_outputs, constant_node_producers,
                      num_folded, ir_version);
     i = j;
   }

@@ -206,8 +206,10 @@ void RemoveUnusedOutputs(onnx::ModelProto& model,
                          const std::vector<std::string>& unused_output);
 
 // Convert the default ONNX domain of the model to target_version using onnx's
-// own version converter.
-onnx::ModelProto ConvertOpsetVersion(const onnx::ModelProto& model,
+// own version converter. Takes ``model`` by value so a caller who no longer
+// needs their copy can ``std::move`` it in and get a move-only, non-copying
+// conversion; see the .cpp for why.
+onnx::ModelProto ConvertOpsetVersion(onnx::ModelProto model,
                                      int target_version);
 
 // Shared schema setup for the single-pass debug helpers and the quantization

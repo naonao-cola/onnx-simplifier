@@ -37,6 +37,7 @@
 #include "onnx/defs/printer.h"
 #include "onnx/inliner/inliner.h"
 #include "onnx/shape_inference/implementation.h"
+#include "onnx/version_converter/convert.h"
 #include "onnxoptimizer/model_util.h"
 #include "onnxoptimizer/optimize.h"
 #include "onnxoptimizer/passes/cse_util.h"
@@ -307,17 +308,24 @@ static onnx::ModelProto SimplifyImpl(
   // redundant here, and it aborts the whole process on graphs where a Gather
   // index cannot be statically resolved to an axis (common in dynamic-shape
   // detection models such as FasterRCNN). Always drop it from the pass list.
-  std::vector<std::string> always_disabled_passes = {"eliminate_shape_gather"};
-  // When initializers are treated as non-constant, keep ``Constant`` nodes in
-  // producer form: ``extract_constant_to_initializer`` would rewrite every
-  // Constant into an initializer, which -- being non-constant now -- would then
-  // block onnxsim's own constant folding of genuinely-constant subgraphs. The
-  // value-baking passes themselves already leave initializer weights alone via
-  // ``IsConstantTensor`` (see the onnx-optimizer changes), so only this
-  // representation-changing pass needs dropping.
-  if (!initializers_as_constants) {
-    always_disabled_passes.push_back("extract_constant_to_initializer");
-  }
+  // Always keep ``Constant`` nodes in producer form: onnxsim's own constant
+  // folder (constant_folding.cpp's GetConstantNodes/GetConstantNodesOnGraph)
+  // now leaves a ``Constant`` node untouched rather than baking it into an
+  // initializer, on the theory that a Constant node's value is not "graph
+  // weight data" the way an initializer is -- and materializes any fold that
+  // is not purely initializer-derived (directly or transitively) as a fresh
+  // Constant node of its own, so that distinction stays visible in the
+  // output model. ``extract_constant_to_initializer`` would erase it right
+  // back by rewriting every Constant into an initializer -- including ones
+  // onnxsim itself just created -- so it is always dropped from the pass
+  // list, not just when initializers are treated as non-constant (where it
+  // additionally has the correctness problem that its output, being
+  // non-constant, would block further folding of genuinely-constant
+  // subgraphs). The value-baking passes themselves already leave initializer
+  // weights alone via ``IsConstantTensor`` (see the onnx-optimizer changes),
+  // so only this representation-changing pass needs dropping.
+  std::vector<std::string> always_disabled_passes = {
+      "eliminate_shape_gather", "extract_constant_to_initializer"};
   auto is_disabled = [](const std::vector<std::string>& list,
                         const std::string& pass) {
     return std::find(list.begin(), list.end(), pass) != list.end();
@@ -637,26 +645,40 @@ static onnx::ModelProto SimplifyImpl(
     GraphFn PipelineOnGraph =
         FixedPointFn(OptAndShapeOnGraphChanged, FoldConstantOnGraphChanged,
                      fixed_point_iters, &converged);
-    Pipeline = Profiled("Pipeline", [PipelineOnGraph, &fold_ir_version](
-                                        onnx::ModelProto& model) {
-      std::shared_ptr<onnx::Graph> g(onnx::ImportModelProto(model));
-      if (g.get() == nullptr) {
-        // Same fallback as Optimizer::optimize(): if we can't parse the
-        // model, leave it untouched.
-        return;
-      }
-      fold_ir_version = model.ir_version();
-      PipelineOnGraph(*g);
-      onnx::ModelProto out = onnx::PrepareOutput(model);
-      onnx::ExportModelProto(&out, g, /*consume_tensor_data=*/true);
-      // OptimizeGraphFixed never sees model-local functions (they live on
-      // ModelProto, not Graph), so carry them over unchanged -- mirroring
-      // Optimizer::optimize()'s own AddFunctionsToModel.
-      for (const auto& function_proto : model.functions()) {
-        *out.add_functions() = function_proto;
-      }
-      model = std::move(out);
-    });
+    Pipeline =
+        Profiled("Pipeline", [PipelineOnGraph, &fold_ir_version,
+                              target_opset_version](onnx::ModelProto& model) {
+          std::shared_ptr<onnx::Graph> g(onnx::ImportModelProto(model));
+          if (g.get() == nullptr) {
+            // Same fallback as Optimizer::optimize(): if we can't parse the
+            // model, leave it untouched.
+            return;
+          }
+          // Convert the default ONNX domain's opset first, directly on the
+          // resident graph via ConvertVersionOnGraph -- so the simplification
+          // below can clean up any redundant nodes the version converter
+          // introduces, same rationale as the old ModelProto-level
+          // ConvertOpsetVersion call this replaces -- but without paying a
+          // second Import/Export pair for it (unlike ConvertOpsetVersion, which
+          // always does its own; still used by the `rewriter` branch above,
+          // which has no resident Graph to share this one with).
+          if (target_opset_version) {
+            onnxsim::ProfiledScope opset_scope("ConvertOpsetVersion");
+            onnx::version_conversion::ConvertVersionOnGraph(
+                g, *target_opset_version);
+          }
+          fold_ir_version = model.ir_version();
+          PipelineOnGraph(*g);
+          onnx::ModelProto out = onnx::PrepareOutput(model);
+          onnx::ExportModelProto(&out, g, /*consume_tensor_data=*/true);
+          // OptimizeGraphFixed never sees model-local functions (they live on
+          // ModelProto, not Graph), so carry them over unchanged -- mirroring
+          // Optimizer::optimize()'s own AddFunctionsToModel.
+          for (const auto& function_proto : model.functions()) {
+            *out.add_functions() = function_proto;
+          }
+          model = std::move(out);
+        });
   }
   // The fixed points mutate in place, so make one working copy of the (const)
   // input model and simplify it in place. When the caller has told us
@@ -735,9 +757,24 @@ static onnx::ModelProto SimplifyImpl(
   }
   // Optionally convert the model to a different opset version (of the default
   // ONNX domain) first, so the simplification below can clean up any redundant
-  // nodes the version converter introduces.
-  if (target_opset_version) {
-    sim_model = ConvertOpsetVersion(sim_model, *target_opset_version);
+  // nodes the version converter introduces. Wrapped in its own profiled span --
+  // sibling to, not nested inside, the "Simplify" root below -- so its cost is
+  // visible in the flame graph / profile_pass_phases output instead of showing
+  // up as unaccounted time before the first pass.
+  //
+  // Only needed here for the `rewriter` branch, which is ModelProto-based
+  // throughout (onnxscript's rewriter only understands ModelProto) and so has
+  // no resident Graph to fold this into. The no-rewriter branch does the
+  // equivalent conversion itself, directly on its own resident Graph, inside
+  // Pipeline above -- see its ConvertVersionOnGraph call.
+  if (target_opset_version && rewriter) {
+    onnxsim::ProfiledScope opset_scope("ConvertOpsetVersion");
+    // std::move: sim_model is about to be overwritten by the result anyway,
+    // so let ConvertOpsetVersion's by-value parameter move-construct instead
+    // of copying -- required for it to reach ConvertVersion's non-copying
+    // overload (see model_prep.cpp).
+    sim_model =
+        ConvertOpsetVersion(std::move(sim_model), *target_opset_version);
   }
   {
     // A single root span so the profiled fixed points nest under one box in the

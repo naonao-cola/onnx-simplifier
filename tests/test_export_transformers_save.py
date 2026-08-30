@@ -13,6 +13,7 @@ import onnx.numpy_helper
 import pytest
 from onnx import parser
 
+import onnxsim
 from onnxsim.transformers_export import _save
 
 
@@ -52,7 +53,7 @@ def test_save_default_keeps_weights_inline(tmp_path):
     _save(model, path, force_external_data=False)
 
     assert not os.path.exists(path + ".data")
-    reloaded = onnx.load(path)
+    reloaded, _pool = onnxsim.load_model(path)
     w = onnx.numpy_helper.to_array(
         next(i for i in reloaded.graph.initializer if i.name == "W")
     )
@@ -74,7 +75,7 @@ def test_save_force_external_data_writes_companion_file(tmp_path):
     _save(model, path, force_external_data=True)
 
     assert os.path.exists(path + ".data")
-    reloaded = onnx.load(path)  # resolves external data by default
+    reloaded, _pool = onnxsim.load_model(path)  # resolves external data by default
     w = onnx.numpy_helper.to_array(
         next(i for i in reloaded.graph.initializer if i.name == "W")
     )
@@ -102,4 +103,5 @@ def test_save_roundtrips_regardless_of_mode(tmp_path, force_external_data):
 
     _save(model, path, force_external_data=force_external_data)
 
-    onnx.checker.check_model(onnx.load(path), full_check=True)
+    reloaded, _pool = onnxsim.load_model(path)
+    onnx.checker.check_model(reloaded, full_check=True)

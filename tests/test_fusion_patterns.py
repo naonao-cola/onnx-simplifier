@@ -638,8 +638,11 @@ def test_defer_constant_expand_folds_small_consumer():
     # --no-large-tensor the Expand is not materialized, but ReduceSum over it is
     # a small (scalar) foldable output whose value depends on the data (so it is
     # not handled by shape propagation). The executor still folds it by running
-    # Expand+ReduceSum together, and the scalar feeds a runtime Add, so the whole
-    # constant chain collapses without ever storing the expanded tensor.
+    # Expand+ReduceSum together, and the scalar feeds a runtime Add, so the
+    # constant chain collapses without ever storing the expanded tensor. The
+    # folded scalar is materialized as a Constant node rather than an
+    # initializer -- a deferred (large-tensor) output is never treated as
+    # purely initializer-derived, so its consumer isn't either.
     model = _model(
         """
         g (float[4,8] X) => (float[4,8] Y)
@@ -656,11 +659,15 @@ def test_defer_constant_expand_folds_small_consumer():
     sim_model, ops = _simplify_no_large_tensor(model)
     assert ops["Expand"] == 0
     assert ops["ReduceSum"] == 0
-    assert ops["Constant"] == 0
+    assert ops["Constant"] == 1
     assert ops["Add"] == 1
     assert all(
         onnx.numpy_helper.to_array(init).size < 512 * 512
         for init in sim_model.graph.initializer
+    )
+    (s_node,) = [n for n in sim_model.graph.node if n.op_type == "Constant"]
+    np.testing.assert_allclose(
+        onnx.numpy_helper.to_array(s_node.attribute[0].t), 3.0 * 512 * 512
     )
 
 
