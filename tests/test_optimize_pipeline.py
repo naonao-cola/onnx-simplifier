@@ -224,6 +224,46 @@ def test_pipeline_applies_both_pruning_sub_stages_independently():
     onnx.checker.check_model(result.optimized_model)
 
 
+def test_pipeline_with_wanda_pruning_method_applies_structured_wanda_pruning_stage():
+    model = _conv_and_gemm_model(seed=30)
+    rng = np.random.default_rng(31)
+    calibration_data = [{"X": rng.standard_normal((2, 4, 8, 8)).astype(np.float32)}]
+
+    result = onnxsim.apply_optimization_pipeline(
+        model,
+        accuracy_budget=1.0,
+        calibration_data=calibration_data,
+        sparsity=0.25,
+        pruning_method="wanda",
+    )
+    assert result.stages_applied[0] == "structured_wanda_pruning"
+    assert "structured_pruning" not in result.stages_applied
+    onnx.checker.check_model(result.optimized_model)
+
+
+def test_pipeline_with_wanda_pruning_method_applies_attention_head_wanda_pruning_stage():
+    model = _attention_pipeline_model(seed=32)
+    rng = np.random.default_rng(33)
+    calibration_data = [{"X": rng.standard_normal((2, 5, 8)).astype(np.float32)}]
+
+    result = onnxsim.apply_optimization_pipeline(
+        model,
+        accuracy_budget=1.0,
+        calibration_data=calibration_data,
+        attention_sparsity=0.5,
+        pruning_method="wanda",
+    )
+    assert result.stages_applied[0] == "attention_head_wanda_pruning"
+    assert "attention_head_pruning" not in result.stages_applied
+    onnx.checker.check_model(result.optimized_model)
+
+
+def test_pipeline_rejects_invalid_pruning_method():
+    model = _gemm_model(seed=34)
+    with pytest.raises(ValueError):
+        onnxsim.apply_optimization_pipeline(model, sparsity=0.5, pruning_method="bogus")
+
+
 def test_pipeline_mixed_precision_bit_selection():
     model = _gemm_model(seed=15)
     rng = np.random.default_rng(16)
@@ -255,6 +295,65 @@ def test_pipeline_rotation_upgrade_skips_adaround_refinement():
     assert "adaround" not in result.stages_applied
     assert "bias_correction" not in result.stages_applied
     onnx.checker.check_model(result.optimized_model)
+
+
+def test_pipeline_rotation_duquant_method():
+    model = _gemm_model(K=64, N=16, seed=35)
+    rng = np.random.default_rng(36)
+    calibration_data = [{"X": rng.standard_normal((8, 64)).astype(np.float32)}]
+
+    result = onnxsim.apply_optimization_pipeline(
+        model,
+        accuracy_budget=0.0,  # unreachable -- would otherwise trigger refinement
+        calibration_data=calibration_data,
+        use_rotation=True,
+        rotation_method="duquant",
+    )
+    assert "duquant" in result.stages_applied
+    assert "quarot" not in result.stages_applied
+    assert "adaround" not in result.stages_applied
+    onnx.checker.check_model(result.optimized_model)
+
+
+def test_pipeline_rotation_spinquant_method():
+    model = _gemm_model(K=64, N=16, seed=37)
+    rng = np.random.default_rng(38)
+    calibration_data = [{"X": rng.standard_normal((8, 64)).astype(np.float32)}]
+
+    result = onnxsim.apply_optimization_pipeline(
+        model,
+        accuracy_budget=0.0,  # unreachable -- would otherwise trigger refinement
+        calibration_data=calibration_data,
+        use_rotation=True,
+        rotation_method="spinquant",
+    )
+    assert "spinquant" in result.stages_applied
+    assert "quarot" not in result.stages_applied
+    assert "adaround" not in result.stages_applied
+    onnx.checker.check_model(result.optimized_model)
+
+
+def test_pipeline_rotation_method_ignored_without_use_rotation():
+    model = _gemm_model(seed=39)
+    rng = np.random.default_rng(40)
+    calibration_data = [{"X": rng.standard_normal((8, 64)).astype(np.float32)}]
+
+    result = onnxsim.apply_optimization_pipeline(
+        model,
+        accuracy_budget=1.0,
+        calibration_data=calibration_data,
+        rotation_method="duquant",  # use_rotation=False -- should have no effect
+    )
+    assert "duquant" not in result.stages_applied
+    assert "quarot" not in result.stages_applied
+
+
+def test_pipeline_rejects_invalid_rotation_method():
+    model = _gemm_model(seed=41)
+    with pytest.raises(ValueError):
+        onnxsim.apply_optimization_pipeline(
+            model, use_rotation=True, rotation_method="bogus"
+        )
 
 
 def test_pipeline_rejects_invalid_bit_selection():
