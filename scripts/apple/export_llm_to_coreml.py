@@ -54,7 +54,6 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import gc
 import shutil
 import sys
 import tempfile
@@ -116,30 +115,45 @@ def export_llm_to_coreml(
         )
 
         onnx_path = Path(tmpdir) / "model.onnx"
-        model = onnx.load(str(onnx_path))
 
         print(
             "Pinning batch_size=1 (sequence_length/past_sequence_length stay dynamic)...",
             flush=True,
         )
-        _fix_batch_size(model, batch_size=1)
-        onnx.checker.check_model(model)
+        # `_fix_batch_size` only touches declared shape dim fields, never tensor
+        # data, so this whole step never needs the model's weights loaded into
+        # memory -- `load_external_data=False` leaves each initializer as just its
+        # on-disk location, and re-saving keeps those references intact (same
+        # directory, untouched external-data files).
+        fixed_model = onnx.load(str(onnx_path), load_external_data=False)
+        _fix_batch_size(fixed_model, batch_size=1)
+        onnx.save(fixed_model, str(onnx_path))
+        num_nodes_before = len(fixed_model.graph.node)
+        del fixed_model
+
+        # A path-based check (unlike passing a ModelProto) uses onnx's C++
+        # file checker directly, with no in-memory protobuf-serialization size
+        # limit to trip over on a multi-billion-parameter model.
+        onnx.checker.check_model(str(onnx_path))
 
         print("Simplifying with onnxsim...", flush=True)
         import onnxsim
 
-        simplified, ok = onnxsim.simplify(model)
+        simplified_path = Path(tmpdir) / "model_simplified.onnx"
+        # Passing a *path* (not a ModelProto) with check_n=0 engages onnxsim's
+        # C++ path-to-path fast route, which needs only ~1x the model's size in
+        # peak memory (see bench/RESULTS_synthetic_decoder_oom.md) instead of the
+        # 2+x an in-memory ModelProto round trip costs.
+        _, ok = onnxsim.simplify(
+            str(onnx_path), output_path=str(simplified_path), check_n=0
+        )
         if not ok:
             raise RuntimeError("onnxsim.simplify() reported failure")
-        print(
-            f"  {len(model.graph.node)} -> {len(simplified.graph.node)} nodes",
-            flush=True,
-        )
-        # `model` is a full second copy of every weight and is no longer needed --
-        # drop it before Core ML conversion builds a third (a multi-billion-parameter
-        # model can't afford three copies resident at once).
-        del model
-        gc.collect()
+
+        # Only now load real tensor values: Core ML conversion needs them (MIL
+        # constants), everything before this point only needed shapes.
+        simplified = onnx.load(str(simplified_path))
+        print(f"  {num_nodes_before} -> {len(simplified.graph.node)} nodes", flush=True)
 
         print(f"Converting to Core ML ({convert_to}), dynamic KV cache...", flush=True)
         onnxsim.export_coreml(
