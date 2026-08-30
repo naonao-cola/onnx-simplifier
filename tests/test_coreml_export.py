@@ -21,13 +21,14 @@ separately by the coreml-integration workflow's macOS job).
 
 import numpy as np
 import onnx
-import onnxruntime as ort
 import pytest
 from onnx import numpy_helper, parser
 
 pytest.importorskip("coremltools", reason="coremltools is not installed")
 
-import onnxsim  # noqa: E402  (imported after the coremltools availability check)
+import onnxruntime as ort  # noqa: E402  (imported after the coremltools availability check)
+
+import onnxsim  # noqa: E402
 from onnxsim import coreml_export  # noqa: E402
 
 
