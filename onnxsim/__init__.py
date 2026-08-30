@@ -53,8 +53,10 @@ from onnxsim.mx_quantization import MXFP4_CODEBOOK, quantize_weight_only_mxfp4
 from onnxsim.nf4 import NF4_CODEBOOK, quantize_weight_only_nf4
 from onnxsim.omniquant import apply_omniquant
 from onnxsim.onnx_simplifier import (
+    apply_attention_head_pruning_cpp,
     apply_double_quantization_cpp,
     apply_quarot_cpp,
+    apply_structured_pruning_cpp,
     cross_layer_equalize,
     export_gguf,
     export_safetensors,
@@ -146,8 +148,10 @@ __all__ = [
     "apply_wanda_pruning",
     "apply_sparsegpt_pruning",
     "apply_structured_pruning",
+    "apply_structured_pruning_cpp",
     "apply_structured_wanda_pruning",
     "apply_attention_head_pruning",
+    "apply_attention_head_pruning_cpp",
     "apply_attention_head_wanda_pruning",
     "weight_sparsity",
     "convert_matmul_to_gemm",

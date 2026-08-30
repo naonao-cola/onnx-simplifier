@@ -514,6 +514,104 @@ onnx::ModelProto PruneMagnitude(const onnx::ModelProto& model, double sparsity);
 // ``seed`` derives a fresh, deterministic random rotation per matched layer.
 onnx::ModelProto ApplyQuarot(const onnx::ModelProto& model, uint64_t seed);
 
+// Structured (channel) pruning: removes whole output channels from
+// MatMul/vanilla-Gemm and Conv layers -- real structural pruning (smaller
+// weight tensors, smaller matmuls on any runtime), as opposed to
+// ``PruneMagnitude``'s value-only zeroing. For every MatMul/vanilla-Gemm or
+// 2-D Conv "producer" node whose output feeds, through zero or more
+// shape-preserving elementwise ops (an activation, or -- MatMul/Gemm only --
+// an Add/Mul against a constant per-channel bias/scale, or -- Conv only -- a
+// depthwise Conv hop) with no other consumer anywhere along that path, into
+// exactly one downstream "consumer" of the same family: ranks the
+// producer's output channels by L2 norm of their own weight row/filter,
+// drops the lowest-``sparsity``-fraction of them, and removes the
+// corresponding rows/columns from the producer's weight (and bias, if
+// constant) and every intermediate per-channel constant, and the matching
+// columns/rows from the consumer's weight. A general grouped Conv (neither
+// ``group=1`` nor fully depthwise) is matched too, as a producer and/or
+// consumer, ranking/pruning each of its ``group`` channel blocks
+// independently. The gated-FFN SwiGLU/GeGLU pattern is matched too -- two
+// producers combined by a ``Mul`` (or ONNX opset-28+'s native ``SwiGLU``
+// node) feeding one consumer, both pruned to the same combined-importance-
+// ranked channel indices. A Conv or MatMul/Gemm residual (skip-connection)
+// chain is matched too -- a channel-preserving ``Add(a, b)`` where both
+// operands are non-constant forces whichever real producer(s) feed ``a``/
+// ``b`` to agree on one shared channel-index set, resolved via a backward
+// walk plus union-find grouping across such merge points that also covers a
+// whole chain of such merges transitively sharing one spine channel count
+// (a lone residual connection, or a linear stack of ``Add``-only merges;
+// an *interior* block of a real deep ResNet/transformer stage, whose own
+// "post-block" tensor is read both by the next block and directly by that
+// block's own ``Add``, is left completely untouched, the same "no
+// branch-following" boundary every other chain kind here already holds). For
+// MatMul/Gemm specifically, a fused
+// ``com.microsoft::SkipLayerNormalization``/``SkipSimplifiedLayerNormalization``
+// node -- what onnxruntime's transformer optimizer collapses a bare
+// residual ``Add`` plus the following LayerNorm into, and so what a
+// fully-optimized transformer's own residual connections typically look
+// like -- is recognized as an eligible merge point too, its own
+// ``gamma``/``beta``/``bias`` constants riding along as a per-channel
+// affine hop on the resolved chain; a Conv residual chain only ever sees a
+// bare ``Add`` (there is no Conv analogue of that fused op). See
+// ``structured_pruning_entry.cpp`` for the exact algorithm.
+//
+// Unlike ``Simplify``, this does not run shape inference, constant folding or
+// any other simplification pass -- it applies exactly this rewrite, to every
+// matching chain, to a copy of ``model`` (which is left untouched) and
+// returns the result. ``sparsity`` must be in [0, 1); throws
+// ``std::invalid_argument`` otherwise. Anything not matching the exact
+// topology above (branching, a non-constant bias, a consumer whose
+// reduction dimension doesn't line up, ...) is left completely untouched.
+onnx::ModelProto ApplyStructuredPruning(const onnx::ModelProto& model,
+                                        double sparsity);
+
+// Attention-head pruning: removes whole attention heads -- or, for
+// grouped-query attention, whole KV groups -- from every matched
+// ``com.microsoft::Attention``, ``com.microsoft::GroupQueryAttention``, or
+// plain ``ai.onnx::Attention`` node whose output feeds, optionally through a
+// single shape-preserving ``Reshape``, exactly one downstream MatMul/
+// vanilla-Gemm's reduction dimension (the output projection) -- the
+// attention analogue of ``ApplyStructuredPruning``, at head (or KV-group)
+// instead of single-channel granularity.
+//
+// For each matched plain ``com.microsoft::Attention`` block (a single merged
+// QKV weight/bias): ranks every head by the combined Frobenius norm of its
+// own Q, K, and V weight columns, drops the lowest-``sparsity``-fraction of
+// heads (at least one head is always kept), and removes the corresponding
+// column blocks from the merged QKV weight (and bias, if present),
+// decrementing ``num_heads``/``qkv_hidden_sizes`` accordingly, and the
+// matching row block from the output projection's weight.
+//
+// For each matched ``GroupQueryAttention`` or plain ``ai.onnx::Attention``
+// block (separate, un-merged Q/K/V producers): ranks every *KV group* (a KV
+// head and the ``num_heads / kv_num_heads`` query heads the kernel maps to
+// it) by the combined Frobenius norm of that group's own Q+K+V weight
+// block, drops the lowest-``sparsity``-fraction of groups (at least one
+// group is always kept), and removes the corresponding column blocks from
+// all three producers (and their biases, if present) together with the
+// matching row block from the output projection's weight, decrementing the
+// query head count and ``kv_num_heads`` by the number of groups dropped --
+// so their ratio (query heads per KV head) is unchanged. An individual
+// query head is never dropped on its own: only a whole group, since neither
+// kernel has a way to keep a KV head alive for some, but not all, of the
+// query heads that shared it.
+//
+// Unlike ``Simplify``, this does not run shape inference, constant folding or
+// any other simplification pass. ``sparsity`` must be in [0, 1); throws
+// ``std::invalid_argument`` otherwise. Anything not matching that exact
+// topology (a non-constant weight, a packed-QKV GroupQueryAttention node, a
+// GroupQueryAttention/plain ai.onnx Attention node with a non-empty constant
+// past-KV-cache or attention-mask input, an ai.onnx Attention node with
+// differing Q/K/V head sizes or without explicit
+// ``q_num_heads``/``kv_num_heads`` attributes, a consumer whose reduction
+// dimension doesn't line up, ...) is left completely untouched. Unlike the
+// pure-Python ``onnxsim.apply_attention_head_pruning``, this port does not
+// include the calibration-driven Wanda variant
+// (``onnxsim.apply_attention_head_wanda_pruning``) -- data-free/magnitude
+// importance only, matching this codebase's C++-port scope decision.
+onnx::ModelProto ApplyAttentionHeadPruning(const onnx::ModelProto& model,
+                                           double sparsity);
+
 // Lists the activation tensor names that ``QuantizeStatic`` could quantize in
 // ``model`` -- the first input of every MatMul, every "vanilla" Gemm
 // (transA=0, alpha=1, beta=1), and every Conv, whose weight is a constant
