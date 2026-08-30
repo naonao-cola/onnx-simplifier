@@ -67,13 +67,12 @@ jobs:
             # Windows runner (see test_wheels_windows_cross). Skip it here; the
             # same test still runs on the cp311-cp313 jobs (cp311/cp312 on PRs).
             pytest_args: '-k "not test_ext"'
-        # macOS runners are the slowest/most contended in this matrix; a plain
-        # push to main/master (merged commits, not a tagged release) only
-        # needs one macOS build to confirm the platform still works, so drop
-        # it down to the oldest supported version there. PRs already build a
-        # reduced set (above) and releases still need full coverage, so this
-        # only fires for the 'push' trigger.
-        exclude: ${{ github.event_name == 'push' && fromJSON('[{"os":"macos-15","py_ver":"cp312"},{"os":"macos-15","py_ver":"cp313"}]') || fromJSON('[]') }}
+        # macOS runners are the slowest/most contended in this matrix; a pull
+        # request only needs one macOS build to confirm the platform still
+        # works, so drop it down to the oldest supported version there. push
+        # and release still need full coverage, so this only fires for the
+        # 'pull_request' trigger.
+        exclude: ${{ github.event_name == 'pull_request' && fromJSON('[{"os":"macos-15","py_ver":"cp312"}]') || fromJSON('[]') }}
     steps:
     - uses: actions/checkout@v7
       with:
@@ -162,13 +161,12 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # The 3.13 job re-tests the exact cp312-abi3 wheel the 3.12 job already
-        # covers, so drop it on pull_request to cut a CI job; release still
-        # tests all three. A plain push to main/master (merged commits, not a
-        # tagged release) only needs a smoke test that the cross-built wheels
-        # still install and run, so it's cut further to just the oldest
-        # (cp311) artifact.
-        include: ${{ github.event_name == 'pull_request' && fromJSON('[{"py_ver":"3.11","artifact":"cp311"},{"py_ver":"3.12","artifact":"abi3"}]') || github.event_name == 'push' && fromJSON('[{"py_ver":"3.11","artifact":"cp311"}]') || fromJSON('[{"py_ver":"3.11","artifact":"cp311"},{"py_ver":"3.12","artifact":"abi3"},{"py_ver":"3.13","artifact":"abi3"}]') }}
+        # A pull request only needs a smoke test that the cross-built wheels
+        # still install and run, so it's cut down to just the oldest (cp311)
+        # artifact there; push/release still test all three (the 3.13 entry
+        # re-tests the exact cp312-abi3 wheel the 3.12 job already covers, but
+        # that's fine outside PRs where CI job count matters less).
+        include: ${{ github.event_name == 'pull_request' && fromJSON('[{"py_ver":"3.11","artifact":"cp311"}]') || fromJSON('[{"py_ver":"3.11","artifact":"cp311"},{"py_ver":"3.12","artifact":"abi3"},{"py_ver":"3.13","artifact":"abi3"}]') }}
     steps:
       - uses: actions/checkout@v7
         with:
