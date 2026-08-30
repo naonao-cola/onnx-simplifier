@@ -35,7 +35,7 @@ conversion still succeeds off of macOS; pass ``skip_model_load=False`` on macOS 
 model that's ready to run.
 """
 
-from typing import Any, Callable, Dict, List, Optional, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import onnx
@@ -76,10 +76,11 @@ def _import_coremltools():
 def _import_mil():
     try:
         from coremltools.converters.mil import Builder as mb
+        from coremltools.converters.mil.input_types import RangeDim, TensorType
         from coremltools.converters.mil.mil import Function, Program, types
     except ImportError as exc:
         raise RuntimeError(_COREML_INSTALL_HINT) from exc
-    return mb, types, Function, Program
+    return mb, types, Function, Program, RangeDim, TensorType
 
 
 def _as_mil_array(arr: np.ndarray) -> np.ndarray:
@@ -123,22 +124,62 @@ def _onnx_elem_type_to_mil(elem_type: int, types) -> Any:
     return mapping[elem_type]
 
 
-def _make_input_spec(value_info: onnx.ValueInfoProto, mb, types):
+def _make_input_spec(
+    value_info: onnx.ValueInfoProto,
+    mb,
+    types,
+    dynamic_shapes: Dict[str, Tuple[int, int, int]],
+    range_dims: Dict[str, Any],
+    RangeDim,
+    TensorType,
+):
+    """Build this input's MIL ``TensorSpec`` and, if it has a dynamic dim, the
+    matching coremltools ``TensorType`` (for ``ct.convert(inputs=...)``; ``None``
+    otherwise).
+
+    Each *named* dynamic dimension (an ONNX ``dim_param``) present as a key in
+    ``dynamic_shapes`` gets one shared ``RangeDim`` -- reused by name across every
+    input that has it (via ``range_dims``), so e.g. all of a KV cache's
+    ``past_key_values.*.key``/``value`` inputs vary together. A ``dim_param`` not
+    in ``dynamic_shapes`` is still rejected as non-static: this is opt-in, not a
+    blanket "allow anything".
+    """
     tt = value_info.type.tensor_type
-    shape = []
+    mil_shape: List[Any] = []
+    ct_shape: List[Any] = []
+    has_dynamic = False
     for d in tt.shape.dim:
         if d.HasField("dim_value"):
-            shape.append(int(d.dim_value))
-        else:
+            mil_shape.append(int(d.dim_value))
+            ct_shape.append(int(d.dim_value))
+            continue
+        name = d.dim_param
+        bounds = dynamic_shapes.get(name)
+        if bounds is None:
             raise RuntimeError(
                 f"Input '{value_info.name}' has a non-static dimension "
-                f"({d.dim_param or '?'!r}); onnxsim's Core ML exporter requires "
-                "fully static input shapes. Give the model concrete input shapes "
-                "first (e.g. via --overwrite-input-shape or "
-                "onnx.tools.update_model_dims) before exporting."
+                f"({name or '?'!r}); onnxsim's Core ML exporter requires fully "
+                "static input shapes by default. Give the model concrete input "
+                "shapes first (e.g. via --overwrite-input-shape or "
+                "onnx.tools.update_model_dims), or mark this dimension dynamic "
+                "via the `dynamic_shapes` argument, e.g. "
+                f"dynamic_shapes={{{name!r}: (lower_bound, default, upper_bound)}}."
             )
+        if name not in range_dims:
+            lower, default, upper = bounds
+            range_dims[name] = RangeDim(
+                lower_bound=lower, upper_bound=upper, default=default, symbol=name
+            )
+        rd = range_dims[name]
+        mil_shape.append(rd.symbol)
+        ct_shape.append(rd)
+        has_dynamic = True
     dtype = _onnx_elem_type_to_mil(tt.elem_type, types)
-    return mb.TensorSpec(shape=tuple(shape), dtype=dtype)
+    spec = mb.TensorSpec(shape=tuple(mil_shape), dtype=dtype)
+    ct_input = (
+        TensorType(name=value_info.name, shape=tuple(ct_shape)) if has_dynamic else None
+    )
+    return spec, ct_input
 
 
 def _node_attrs(node: onnx.NodeProto) -> Dict[str, Any]:
@@ -327,22 +368,43 @@ def _op_isnan(lowerer, node, ins, attrs):
 def _op_expand(lowerer, node, ins, attrs):
     x = ins[0]
     shape_var = ins[1]
-    if shape_var.val is None:
-        raise RuntimeError(
-            "Expand requires a compile-time-constant target 'shape' input"
+    if shape_var.val is not None:
+        target = [int(v) for v in shape_var.val]
+        x_shape = list(x.shape)
+        pad = len(target) - len(x_shape)
+        if pad > 0:
+            x_shape = [1] * pad + x_shape
+            x = lowerer.mb.reshape(
+                x=x, shape=x_shape, name=lowerer.fresh_name(node, "reshape")
+            )
+        # ONNX Expand's broadcast rule (each axis is either 1 or already equal to
+        # the target) maps directly onto `tile`'s integer repeat-count per axis.
+        reps = [t // s for s, t in zip(x_shape, target)]
+        return [lowerer.mb.tile(x=x, reps=reps, name=lowerer.fresh_name(node))]
+
+    # The target shape is itself only known at runtime (e.g. it depends on a KV
+    # cache's dynamic length) -- `tile` needs concrete integer repeat counts, so
+    # there's no way to pick those at conversion time. Broadcast-add a same-shaped
+    # zero tensor instead: MIL's `fill` accepts a non-constant shape, and adding a
+    # tensor of the target shape forces `x` to broadcast up to it.
+    is_bool = x.dtype == lowerer.types.bool
+    if is_bool:
+        x = lowerer.mb.cast(
+            x=x, dtype="int32", name=lowerer.fresh_name(node, "boolcast")
         )
-    target = [int(v) for v in shape_var.val]
-    x_shape = list(x.shape)
-    pad = len(target) - len(x_shape)
-    if pad > 0:
-        x_shape = [1] * pad + x_shape
-        x = lowerer.mb.reshape(
-            x=x, shape=x_shape, name=lowerer.fresh_name(node, "reshape")
-        )
-    # ONNX Expand's broadcast rule (each axis is either 1 or already equal to the
-    # target) maps directly onto `tile`'s integer repeat-count for that axis.
-    reps = [t // s for s, t in zip(x_shape, target)]
-    return [lowerer.mb.tile(x=x, reps=reps, name=lowerer.fresh_name(node))]
+    # `fill`'s output dtype follows its `value`'s Python type (int -> an integer
+    # MIL type, float -> a float one); match `x`'s (post-bool-cast) dtype so the
+    # `add` below doesn't reject the two operands as mismatched types.
+    fill_value = 0 if x.dtype == lowerer.types.int32 else 0.0
+    zeros = lowerer.mb.fill(
+        shape=shape_var, value=fill_value, name=lowerer.fresh_name(node, "zeros")
+    )
+    out = lowerer.mb.add(
+        x=x, y=zeros, name=lowerer.fresh_name(node, "expand" if is_bool else None)
+    )
+    if is_bool:
+        out = lowerer.mb.cast(x=out, dtype="bool", name=lowerer.fresh_name(node))
+    return [out]
 
 
 @_register("Neg")
@@ -614,11 +676,11 @@ _OP_HANDLERS["ReduceMax"] = _reduce("reduce_max")
 
 @_register("Reshape")
 def _op_reshape(lowerer, node, ins, attrs):
-    shape_var = ins[1]
-    if shape_var.val is None:
-        raise RuntimeError("Reshape requires a compile-time-constant 'shape' input")
-    shape = [int(v) for v in shape_var.val]
-    return [lowerer.mb.reshape(x=ins[0], shape=shape, name=lowerer.fresh_name(node))]
+    # MIL's reshape accepts a non-constant `shape` input directly (unlike most
+    # other shape-consuming ops here), so a `shape` derived from a dynamic Shape
+    # op (e.g. "keep the KV cache's current length, flatten the rest") works with
+    # no special-casing -- pass it straight through either way.
+    return [lowerer.mb.reshape(x=ins[0], shape=ins[1], name=lowerer.fresh_name(node))]
 
 
 @_register("Transpose")
@@ -721,63 +783,189 @@ def _op_pad(lowerer, node, ins, attrs):
     ]
 
 
+def _slice_scalar_element(lowerer, var, index: int, node, suffix: str):
+    """Element ``index`` of 1-D int tensor ``var``, as a length-1 piece: a plain
+    Python ``int`` if statically known, else a shape-``(1,)`` MIL Var."""
+    if var.val is not None:
+        return int(var.val[index])
+    return lowerer.mb.slice_by_index(
+        x=var,
+        begin=[index],
+        end=[index + 1],
+        stride=[1],
+        name=lowerer.fresh_name(node, suffix),
+    )
+
+
+def _axis_size(lowerer, x, axis: int, node, suffix: str):
+    """Size of ``x`` along ``axis``: a plain Python ``int`` if statically known,
+    else a shape-``(1,)`` MIL Var (via MIL's runtime ``shape`` op)."""
+    dim = x.shape[axis]
+    if isinstance(dim, (int, np.integer)):
+        return int(dim)
+    full_shape = lowerer.mb.shape(x=x, name=lowerer.fresh_name(node, suffix + "_shape"))
+    return lowerer.mb.slice_by_index(
+        x=full_shape,
+        begin=[axis],
+        end=[axis + 1],
+        stride=[1],
+        name=lowerer.fresh_name(node, suffix),
+    )
+
+
+def _as_slice_piece(value):
+    """A shape-``(1,)`` int32 array for a Python ``int`` piece; ``value`` itself
+    (already a MIL Var) otherwise. Used to mix static and dynamic Slice
+    begin/end pieces in one ``mb.concat``."""
+    return value if not isinstance(value, int) else np.array([value], dtype=np.int32)
+
+
+def _clamp_nonneg_slice_bound(lowerer, value, dim, node, suffix: str):
+    """Clamp a Slice ``start``/``end`` value into ``[0, dim]`` for a positive
+    stride, wrapping a negative value via ``value + dim`` first (ONNX Slice's own
+    rule). ``value``/``dim`` are each a Python ``int`` or a shape-``(1,)`` MIL Var
+    (see ``_slice_scalar_element``/``_axis_size``); returns a Python ``int`` only
+    when both inputs are, else a MIL Var.
+    """
+    if isinstance(value, int) and isinstance(dim, int):
+        wrapped = value + dim if value < 0 else value
+        return max(0, min(wrapped, dim))
+    value_t, dim_t = _as_slice_piece(value), _as_slice_piece(dim)
+    zero = np.array([0], dtype=np.int32)
+    wrapped = lowerer.mb.select(
+        cond=lowerer.mb.less(
+            x=value_t, y=zero, name=lowerer.fresh_name(node, suffix + "_neg")
+        ),
+        a=lowerer.mb.add(
+            x=value_t, y=dim_t, name=lowerer.fresh_name(node, suffix + "_wrap")
+        ),
+        b=value_t,
+        name=lowerer.fresh_name(node, suffix + "_sel"),
+    )
+    hi_clamped = lowerer.mb.minimum(
+        x=wrapped, y=dim_t, name=lowerer.fresh_name(node, suffix + "_min")
+    )
+    return lowerer.mb.maximum(
+        x=hi_clamped, y=zero, name=lowerer.fresh_name(node, suffix)
+    )
+
+
 @_register("Slice")
 def _op_slice(lowerer, node, ins, attrs):
     x = ins[0]
     rank = x.rank
-    shape = x.shape
-    if any(not isinstance(d, (int, np.integer)) for d in shape):
-        raise RuntimeError("Slice requires a fully static input shape")
+
     if len(ins) > 1:
-        starts = [int(v) for v in ins[1].val]
-        ends = [int(v) for v in ins[2].val]
-        axes = (
-            [int(v) for v in ins[3].val]
-            if len(ins) > 3 and ins[3] is not None
-            else list(range(len(starts)))
-        )
+        starts_var, ends_var = ins[1], ins[2]
+        axes_var = ins[3] if len(ins) > 3 and ins[3] is not None else None
+        steps_var = ins[4] if len(ins) > 4 and ins[4] is not None else None
+        if axes_var is not None and axes_var.val is None:
+            raise RuntimeError("Slice requires a compile-time-constant 'axes' input")
+        if steps_var is not None and steps_var.val is None:
+            raise RuntimeError("Slice requires a compile-time-constant 'steps' input")
+        if axes_var is not None:
+            axes = [int(v) for v in axes_var.val]
+        elif starts_var.val is not None:
+            axes = list(range(len(starts_var.val)))
+        elif ends_var.val is not None:
+            axes = list(range(len(ends_var.val)))
+        else:
+            raise RuntimeError(
+                "Slice needs a compile-time-constant 'axes' input when both "
+                "'starts' and 'ends' are dynamic (there is no way to tell how "
+                "many axes are being sliced)"
+            )
         steps = (
-            [int(v) for v in ins[4].val]
-            if len(ins) > 4 and ins[4] is not None
-            else [1] * len(starts)
+            [int(v) for v in steps_var.val]
+            if steps_var is not None
+            else [1] * len(axes)
         )
+        starts = [
+            _slice_scalar_element(lowerer, starts_var, i, node, "start")
+            for i in range(len(axes))
+        ]
+        ends = [
+            _slice_scalar_element(lowerer, ends_var, i, node, "end")
+            for i in range(len(axes))
+        ]
     else:
+        axes = [int(v) for v in attrs.get("axes", range(len(attrs["starts"])))]
+        steps = [1] * len(axes)
         starts = [int(v) for v in attrs["starts"]]
         ends = [int(v) for v in attrs["ends"]]
-        axes = [int(v) for v in attrs.get("axes", range(len(starts)))]
-        steps = [1] * len(starts)
 
-    # Reproduce ONNX Slice's own clamp algorithm (numpy-style negative-index
-    # wraparound, then clamp) rather than Python's `slice.indices()`: for a
-    # negative stride, a fully-clamped end of -1 means "include index 0", but MIL's
-    # `end` re-wraps a literal -1 to `dim - 1` (numpy indexing semantics), which
-    # would silently turn that into an empty slice. Route that one case through
-    # `end_mask` (MIL's "ignore `end`, go to the natural boundary" flag) instead.
-    begin, end, stride = [0] * rank, list(shape), [1] * rank
-    end_mask = [False] * rank
+    # An axis this node doesn't slice at all is left alone via begin_mask/end_mask,
+    # rather than pre-filled with `shape[a]` -- that axis's size doesn't need to be
+    # known at conversion time then (e.g. a dynamic KV-cache axis untouched by this
+    # particular Slice).
+    begin_list: List[Any] = [0] * rank
+    end_list: List[Any] = [0] * rank
+    stride = [1] * rank
+    begin_mask, end_mask = [True] * rank, [True] * rank
     for s, e, a, st in zip(starts, ends, axes, steps):
         a = a if a >= 0 else a + rank
-        dim = int(shape[a])
-        s = s + dim if s < 0 else s
-        e = e + dim if e < 0 else e
-        if st > 0:
-            s = max(0, min(s, dim))
-            e = max(0, min(e, dim))
-        else:
+        dim = _axis_size(lowerer, x, a, node, f"dim{a}")
+        is_dynamic = not (
+            isinstance(s, int) and isinstance(e, int) and isinstance(dim, int)
+        )
+        if st < 0:
+            if is_dynamic:
+                raise RuntimeError(
+                    f"Slice on axis {a} with a negative stride and a dynamic "
+                    "start/end/axis-size is not supported"
+                )
+            # Reproduce ONNX Slice's own clamp algorithm (numpy-style
+            # negative-index wraparound, then clamp) rather than Python's
+            # `slice.indices()`: for a negative stride, a fully-clamped end of -1
+            # means "include index 0", but MIL's `end` re-wraps a literal -1 to
+            # `dim - 1` (numpy indexing semantics), which would silently turn
+            # that into an empty slice. Route that one case through `end_mask`
+            # (MIL's "ignore `end`, go to the natural boundary" flag) instead.
+            s = s + dim if s < 0 else s
+            e = e + dim if e < 0 else e
             s = max(0, min(s, dim - 1))
             e = max(-1, min(e, dim - 1))
-        begin[a], stride[a] = s, st
-        if e == -1 and st < 0:
-            end_mask[a] = True
-            end[a] = 0  # ignored: end_mask[a] takes over
+            begin_list[a], stride[a] = s, st
+            begin_mask[a] = False
+            if e == -1:
+                end_mask[a] = True  # ignored: end_list[a] below is a don't-care
+            else:
+                end_list[a] = e
+                end_mask[a] = False
         else:
-            end[a] = e
-    kwargs = dict(
-        x=x, begin=begin, end=end, stride=stride, name=lowerer.fresh_name(node)
-    )
-    if any(end_mask):
-        kwargs["end_mask"] = end_mask
-    return [lowerer.mb.slice_by_index(**kwargs)]
+            begin_list[a] = _clamp_nonneg_slice_bound(
+                lowerer, s, dim, node, f"begin{a}"
+            )
+            end_list[a] = _clamp_nonneg_slice_bound(lowerer, e, dim, node, f"end{a}")
+            stride[a] = st
+            begin_mask[a] = False
+            end_mask[a] = False
+
+    if all(isinstance(v, int) for v in begin_list + end_list):
+        begin, end = begin_list, end_list
+    else:
+        begin = lowerer.mb.concat(
+            values=[_as_slice_piece(v) for v in begin_list],
+            axis=0,
+            name=lowerer.fresh_name(node, "begin"),
+        )
+        end = lowerer.mb.concat(
+            values=[_as_slice_piece(v) for v in end_list],
+            axis=0,
+            name=lowerer.fresh_name(node, "end"),
+        )
+
+    return [
+        lowerer.mb.slice_by_index(
+            x=x,
+            begin=begin,
+            end=end,
+            stride=stride,
+            begin_mask=begin_mask,
+            end_mask=end_mask,
+            name=lowerer.fresh_name(node),
+        )
+    ]
 
 
 @_register("Gather")
@@ -819,32 +1007,49 @@ def _op_tile(lowerer, node, ins, attrs):
 def _op_shape(lowerer, node, ins, attrs):
     x = ins[0]
     shape = x.shape
-    if any(not isinstance(d, (int, np.integer)) for d in shape):
-        raise RuntimeError("Shape requires a fully static input shape")
     rank = len(shape)
     start = int(attrs.get("start", 0))
     start = start if start >= 0 else start + rank
     end = int(attrs.get("end", rank))
     end = end if end >= 0 else end + rank
+    sliced = shape[start:end]
+    if all(isinstance(d, (int, np.integer)) for d in sliced):
+        return [lowerer.make_const(node.output[0], np.array(sliced, dtype=np.int64))]
+    # At least one requested dim is only known at runtime (e.g. a KV cache's
+    # dynamic length) -- emit MIL's own runtime `shape` op instead of a constant.
+    whole_range = (start, end) == (0, rank)
+    full = lowerer.mb.shape(
+        x=x, name=lowerer.fresh_name(node, None if whole_range else "full")
+    )
+    if whole_range:
+        return [full]
     return [
-        lowerer.make_const(node.output[0], np.array(shape[start:end], dtype=np.int64))
+        lowerer.mb.slice_by_index(
+            x=full, begin=[start], end=[end], stride=[1], name=lowerer.fresh_name(node)
+        )
     ]
 
 
 @_register("ConstantOfShape")
 def _op_constant_of_shape(lowerer, node, ins, attrs):
     shape_var = ins[0]
-    if shape_var.val is None:
-        raise RuntimeError(
-            "ConstantOfShape requires a compile-time-constant 'shape' input"
-        )
-    shape = [int(v) for v in shape_var.val]
     value = attrs.get("value")
     if value is not None:
         value = np.asarray(value)
         fill_val, dtype = value.reshape(-1)[0], value.dtype
     else:
         fill_val, dtype = 0.0, np.float32
+    if shape_var.val is None:
+        # The target shape is only known at runtime (e.g. derived from a KV
+        # cache's dynamic length) -- MIL's `fill` op takes a non-constant shape,
+        # unlike materializing a numpy array here.
+        fill_val = _as_mil_array(np.array(fill_val, dtype=dtype)).item()
+        return [
+            lowerer.mb.fill(
+                shape=shape_var, value=fill_val, name=lowerer.fresh_name(node)
+            )
+        ]
+    shape = [int(v) for v in shape_var.val]
     return [lowerer.make_const(node.output[0], np.full(shape, fill_val, dtype=dtype))]
 
 
@@ -903,7 +1108,16 @@ def _op_constant(lowerer, node, ins, attrs):
 SUPPORTED_ONNX_OPS = tuple(sorted(_OP_HANDLERS))
 
 
-def _build_mil_program(model: onnx.ModelProto, mb, types, Function, Program):
+def _build_mil_program(
+    model: onnx.ModelProto,
+    mb,
+    types,
+    Function,
+    Program,
+    RangeDim,
+    TensorType,
+    dynamic_shapes: Optional[Dict[str, Tuple[int, int, int]]] = None,
+):
     graph = model.graph
     initializer_names = {t.name for t in graph.initializer}
     opset = 1
@@ -913,11 +1127,19 @@ def _build_mil_program(model: onnx.ModelProto, mb, types, Function, Program):
 
     lowerer = _Lowerer(mb=mb, types=types, opset=opset)
 
+    dynamic_shapes = dynamic_shapes or {}
+    range_dims: Dict[str, Any] = {}
     input_specs = {}
+    flexible_inputs = []
     for inp in graph.input:
         if inp.name in initializer_names:
             continue
-        input_specs[inp.name] = _make_input_spec(inp, mb, types)
+        spec, ct_input = _make_input_spec(
+            inp, mb, types, dynamic_shapes, range_dims, RangeDim, TensorType
+        )
+        input_specs[inp.name] = spec
+        if ct_input is not None:
+            flexible_inputs.append(ct_input)
 
     with Function(input_specs) as func:
         for name, var in func.inputs.items():
@@ -935,7 +1157,7 @@ def _build_mil_program(model: onnx.ModelProto, mb, types, Function, Program):
 
     prog = Program()
     prog.add_function("main", func)
-    return prog
+    return prog, (flexible_inputs or None)
 
 
 def _resolve_compute_units(ct, compute_units: Union[str, Any]):
@@ -967,6 +1189,7 @@ def convert_to_coreml(
     compute_precision: Optional[Any] = None,
     minimum_deployment_target: Optional[Union[str, Any]] = None,
     skip_model_load: bool = True,
+    dynamic_shapes: Optional[Dict[str, Tuple[int, int, int]]] = None,
 ):
     """Convert an ONNX model to an in-memory Core ML model.
 
@@ -974,8 +1197,8 @@ def convert_to_coreml(
     ----------
     model:
         The ONNX model to convert. Typically the output of :func:`onnxsim.simplify`.
-        All graph inputs must have fully static shapes (see ``_make_input_spec``);
-        every node's op must be one of ``SUPPORTED_ONNX_OPS``.
+        Every graph input dimension must be either static or named in
+        ``dynamic_shapes``; every node's op must be one of ``SUPPORTED_ONNX_OPS``.
     convert_to:
         Core ML model type: ``"mlprogram"`` (the modern ``.mlpackage`` format,
         default) or ``"neuralnetwork"`` (the legacy ``.mlmodel`` format).
@@ -994,6 +1217,18 @@ def convert_to_coreml(
         Compiling requires Apple's Core ML toolchain and only succeeds on macOS; leave
         this ``True`` to convert models on any OS, or pass ``False`` on macOS to get a
         model that's ready to call ``.predict()`` on.
+    dynamic_shapes:
+        Opt in specific ONNX input dimensions as dynamic instead of requiring every
+        dimension to be static. Maps an ONNX ``dim_param`` name (e.g.
+        ``"past_sequence_length"``, the dimension that grows as a KV cache fills)
+        to a ``(lower_bound, default, upper_bound)`` tuple of concrete sizes. Every
+        input that shares the same ``dim_param`` name varies together (the common
+        case: a KV cache's ``past_key_values.*.key``/``value`` inputs). A
+        ``dim_param`` an ONNX exporter wrote as a derived expression (e.g.
+        ``"past_sequence_length + sequence_length"``, seen on an attention mask)
+        needs its own entry with that exact string as the key -- it is not
+        automatically inferred from the terms it names. ``None`` (the default)
+        requires every dimension to be static, as before.
 
     Returns
     -------
@@ -1002,13 +1237,16 @@ def convert_to_coreml(
     Raises
     ------
     RuntimeError
-        If coremltools is not installed, an input has a non-static shape, or the graph
-        uses an ONNX op/feature this translator does not support.
+        If coremltools is not installed, an input has a dimension that's neither
+        static nor named in ``dynamic_shapes``, or the graph uses an ONNX
+        op/feature this translator does not support.
     """
     ct = _import_coremltools()
-    mb, types, Function, Program = _import_mil()
+    mb, types, Function, Program, RangeDim, TensorType = _import_mil()
 
-    prog = _build_mil_program(model, mb, types, Function, Program)
+    prog, flexible_inputs = _build_mil_program(
+        model, mb, types, Function, Program, RangeDim, TensorType, dynamic_shapes
+    )
 
     kwargs: Dict[str, Any] = {}
     if compute_precision is not None:
@@ -1017,6 +1255,8 @@ def convert_to_coreml(
         kwargs["minimum_deployment_target"] = _resolve_deployment_target(
             ct, minimum_deployment_target
         )
+    if flexible_inputs is not None:
+        kwargs["inputs"] = flexible_inputs
 
     return ct.convert(
         prog,
