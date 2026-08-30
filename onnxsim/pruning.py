@@ -416,14 +416,21 @@ reached its target (or to measure an already-sparse model).
 :func:`apply_structured_pruning` actually removes channels (real shape
 reduction, real FLOP/parameter reduction on any runtime, no sparse-kernel
 support needed) from every producer -> consumer chain it can prove safe to
-cut, per output-channel L2-norm importance (Li et al., 2017, "Pruning
-Filters for Efficient ConvNets", https://arxiv.org/abs/1608.08710) -- for a
-MatMul/Gemm chain, that criterion is a transplant from Conv filters to
-output channels (the same one :func:`apply_magnitude_pruning`/
+cut, per output-channel L2-norm importance by default (Li et al., 2017,
+"Pruning Filters for Efficient ConvNets", https://arxiv.org/abs/1608.08710)
+-- for a MatMul/Gemm chain, that criterion is a transplant from Conv filters
+to output channels (the same one :func:`apply_magnitude_pruning`/
 :func:`apply_wanda_pruning` already made for Han et al./Wanda's element-wise
 criteria); for a Conv chain it is the paper's own original setting, applied
 directly: each output filter's full ``[in_channels, kH, kW]`` kernel is
-flattened and ranked by its own L2 norm. Conv support is deliberately
+flattened and ranked by its own L2 norm. An ``importance_norm="l1"`` opt-in
+(NNI's own pruning API offers both L1 and L2 filter-pruning criteria as a
+user choice, cited above) ranks by L1 (sum of absolute magnitude) instead --
+see :func:`_plain_structured_importance`'s own comment for exactly how each
+norm's multi-producer combination differs (L2's is root-sum-square across
+producers; L1's is a plain sum, with no square/sqrt involved at all) and
+:func:`apply_structured_pruning`'s own ``importance_norm`` parameter. Conv
+support is deliberately
 narrower than the MatMul/Gemm path in one respect that stays true
 regardless of grouping: producers/consumers are joined by unary activations
 alone -- no per-channel ``Add``/``Mul`` scale-or-bias op, since a real Conv
@@ -681,7 +688,7 @@ boundary.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Sequence, Set, Tuple, Union, cast
+from typing import Dict, List, Literal, Optional, Sequence, Set, Tuple, Union, cast
 
 import numpy as np
 import onnx
@@ -693,6 +700,26 @@ from onnxsim.bias_correction import _add_probe_outputs
 from onnxsim.calibration import Tensors, generate_random_calibration_data
 from onnxsim.gptq import _inverse_hessian_cholesky
 from onnxsim.smoothquant import _match_matmul_like
+
+# Weight-magnitude norm choice for the *structured* (channel/filter/head)
+# importance rankings below (:func:`apply_structured_pruning`,
+# :func:`apply_structured_wanda_pruning`, :func:`apply_attention_head_pruning`,
+# :func:`apply_attention_head_wanda_pruning`) -- "l2" (the default, and this
+# module's only behavior before this parameter existed) is Li et al.'s own
+# criterion; "l1" is NNI's alternative filter-pruning criterion (its pruning
+# API offers both as a user choice). Every one of those functions' own
+# importance helper takes this as a plain ``str`` (not this ``Literal``
+# alias) so a caller-supplied closure/partial can bind it without importing
+# the alias too -- this exists purely to give the four public entry points'
+# own signatures a checked, self-documenting type.
+_ImportanceNorm = Literal["l1", "l2"]
+
+
+def _validate_importance_norm(importance_norm: str) -> None:
+    if importance_norm not in ("l1", "l2"):
+        raise ValueError(
+            f"importance_norm must be 'l1' or 'l2', got {importance_norm!r}"
+        )
 
 
 def _validate_pattern(sparsity: float, n: Optional[int], m: Optional[int]) -> None:
@@ -5268,16 +5295,25 @@ def _find_conv_concat_chains(graph: onnx.GraphProto) -> List[_ConcatChain]:
     return chains
 
 
-def _plain_branch_importance(w_arrays_nk: List[np.ndarray]) -> np.ndarray:
+def _plain_branch_importance(
+    w_arrays_nk: List[np.ndarray], importance_norm: str = "l2"
+) -> np.ndarray:
     # A plain Concat branch is exactly one producer -- with a single array
-    # this is just plain per-row L2 norm, _plain_structured_importance's own
+    # this is just plain per-row norm, _plain_structured_importance's own
     # single-producer case, standalone rather than routed through a _Chain.
     # A branch composed from a residual/merge group's own multiple leaf
     # producers (see this section's own comment on the `"add"` outcome)
-    # combines every producer's own per-row norm the same root-sum-square
-    # way _plain_structured_importance already does for an ordinary
-    # multi-producer chain, since they're summed elementwise before the
-    # group's own merge point ever combines them.
+    # combines every producer's own per-row norm the same way
+    # _plain_structured_importance already does for an ordinary
+    # multi-producer chain (root-sum-square for L2, plain sum for L1 -- see
+    # that function's own comment for why the two combining formulas
+    # differ), since they're summed elementwise before the group's own merge
+    # point ever combines them.
+    if importance_norm == "l1":
+        importance = np.zeros(w_arrays_nk[0].shape[0], dtype=np.float64)
+        for w_nk in w_arrays_nk:
+            importance += np.linalg.norm(w_nk, ord=1, axis=1)
+        return importance
     squared_norm = np.zeros(w_arrays_nk[0].shape[0], dtype=np.float64)
     for w_nk in w_arrays_nk:
         squared_norm += np.square(np.linalg.norm(w_nk, axis=1))
@@ -5546,12 +5582,28 @@ def _slice_axis1(init: onnx.TensorProto, keep: np.ndarray) -> None:
 
 
 def _plain_structured_importance(
-    chain: _Chain, w_arrays_nk: List[np.ndarray]
+    chain: _Chain, w_arrays_nk: List[np.ndarray], importance_norm: str = "l2"
 ) -> np.ndarray:
-    # Combined (root-sum-square) importance across every producer in this
-    # chain: for a plain chain this is just that producer's own L2 norm;
-    # for a gated pair, both branches must agree on which channels survive,
-    # so their per-channel norms are combined first.
+    # Combined importance across every producer in this chain: for a plain
+    # chain this is just that producer's own norm; for a gated pair, both
+    # branches must agree on which channels survive, so their per-channel
+    # norms are combined first -- as though every producer's own channel-c
+    # row were concatenated into one long row before that row's own norm
+    # were taken (each producer generally owns a different reduction width,
+    # so the concatenation itself is never actually materialized, only its
+    # norm's own decomposition into per-producer pieces is used). For L2
+    # that decomposition is root-sum-square of the per-producer L2 norms
+    # (``||concat(a, b)||_2 == sqrt(||a||_2^2 + ||b||_2^2)``, Li et al.'s own
+    # criterion, this module's default); for L1 the analogous identity is a
+    # plain *sum* of the per-producer L1 norms instead
+    # (``||concat(a, b)||_1 == ||a||_1 + ||b||_1``, since L1 is just the sum
+    # of every entry's own absolute value, and concatenation doesn't change
+    # that sum) -- no square/sqrt anywhere, unlike L2's own combination.
+    if importance_norm == "l1":
+        importance = np.zeros(chain.n_channels, dtype=np.float64)
+        for w_nk in w_arrays_nk:
+            importance += np.linalg.norm(w_nk, ord=1, axis=1)
+        return importance
     squared_norm = np.zeros(chain.n_channels, dtype=np.float64)
     for w_nk in w_arrays_nk:
         squared_norm += np.square(np.linalg.norm(w_nk, axis=1))
@@ -5834,6 +5886,7 @@ def _apply_chains(
 def apply_structured_pruning(
     model: Union[str, onnx.ModelProto],
     sparsity: float = 0.5,
+    importance_norm: _ImportanceNorm = "l2",
 ) -> onnx.ModelProto:
     """Removes whole output channels from MatMul/vanilla-Gemm layers --
     real structural pruning (smaller weight tensors, smaller matmuls on any
@@ -5993,6 +6046,13 @@ def apply_structured_pruning(
     :param model: the original onnx ModelProto or file path
     :param sparsity: target fraction of each matched producer's output
             channels to remove (at least one channel is always kept)
+    :param importance_norm: ``"l2"`` (default, unchanged from before this
+            parameter existed) ranks by Li et al.'s own root-sum-square L2
+            criterion; ``"l1"`` ranks by NNI's alternative L1 criterion
+            (sum of absolute weight magnitude) instead -- see this module's
+            own docstring and :func:`_plain_structured_importance`'s own
+            comment for exactly how each combines across a multi-producer
+            chain's several producers
     :returns: ``model`` with every matched chain's tensors resized in
             place; anything not matching that exact topology (branching,
             a non-constant bias, a consumer whose reduction dimension
@@ -6000,6 +6060,7 @@ def apply_structured_pruning(
     """
     if not (0.0 <= sparsity < 1.0):
         raise ValueError(f"sparsity must be in [0, 1), got {sparsity}")
+    _validate_importance_norm(importance_norm)
     if isinstance(model, str):
         model = onnx.load(model, load_external_data=False)
 
@@ -6018,13 +6079,23 @@ def apply_structured_pruning(
 
     touched = _TouchedState()
     if chains:
-        _apply_chains(graph, chains, sparsity, _plain_structured_importance, touched)
+        _apply_chains(
+            graph,
+            chains,
+            sparsity,
+            lambda chain, w_arrays_nk: _plain_structured_importance(
+                chain, w_arrays_nk, importance_norm
+            ),
+            touched,
+        )
     if concat_chains:
         _apply_concat_chains(
             graph,
             concat_chains,
             sparsity,
-            lambda _operand_name, w_arrays_nk: _plain_branch_importance(w_arrays_nk),
+            lambda _operand_name, w_arrays_nk: _plain_branch_importance(
+                w_arrays_nk, importance_norm
+            ),
             touched,
         )
     if touched.stale_value_info:
@@ -6043,6 +6114,7 @@ def apply_structured_wanda_pruning(
     num_samples: int = 8,
     seed: int = 0,
     sparsity: float = 0.5,
+    importance_norm: _ImportanceNorm = "l2",
     epsilon: float = 1e-8,
     providers: Optional[Sequence[str]] = None,
 ) -> onnx.ModelProto:
@@ -6091,6 +6163,13 @@ def apply_structured_wanda_pruning(
             ``calibration_data`` is supplied)
     :param sparsity: target fraction of each matched chain's output
             channels to remove (at least one channel is always kept)
+    :param importance_norm: ``"l2"`` (default) or ``"l1"`` -- selects the
+            *weight*-magnitude term ``||W_row||`` only, exactly as it does
+            for :func:`apply_structured_pruning`; the *activation*-norm term
+            ``||X||_2`` stays L2 unconditionally either way, per Wanda's own
+            ``|W_ij| * ||X_j||_2`` definition (see this module's own
+            docstring) -- nothing in that paper's own metric ties the
+            activation norm to whichever norm ranks weight magnitude
     :param epsilon: floor applied to the accumulated per-channel activation
             norm, avoiding every channel of an all-zero activation tying at
             exactly the weight-only importance
@@ -6103,6 +6182,7 @@ def apply_structured_wanda_pruning(
     """
     if not (0.0 <= sparsity < 1.0):
         raise ValueError(f"sparsity must be in [0, 1), got {sparsity}")
+    _validate_importance_norm(importance_norm)
     if isinstance(model, str):
         model = onnx.load(model, load_external_data=False)
     if calibration_data is None:
@@ -6173,7 +6253,7 @@ def apply_structured_wanda_pruning(
     def _wanda_structured_importance(
         chain: _Chain, w_arrays_nk: List[np.ndarray]
     ) -> np.ndarray:
-        base = _plain_structured_importance(chain, w_arrays_nk)
+        base = _plain_structured_importance(chain, w_arrays_nk, importance_norm)
         norm = act_norm.get(chain.consumer_node.input[0])
         if norm is None or norm.shape[0] != chain.n_channels:
             return base  # no matching activation observed -- fall back to |W|
@@ -6182,7 +6262,7 @@ def apply_structured_wanda_pruning(
     def _wanda_branch_importance(
         operand_name: str, w_arrays_nk: List[np.ndarray]
     ) -> np.ndarray:
-        base = _plain_branch_importance(w_arrays_nk)
+        base = _plain_branch_importance(w_arrays_nk, importance_norm)
         norm = act_norm.get(operand_name)
         if norm is None or norm.shape[0] != base.shape[0]:
             return base  # no matching activation observed -- fall back to |W|
@@ -7053,11 +7133,20 @@ def _plain_attention_head_importance(
     dq: int,
     dk: int,
     dv: int,
+    importance_norm: str = "l2",
 ) -> np.ndarray:
-    # Combined (Frobenius-norm) importance of each head's full Q+K+V
-    # weight block -- the Li et al. filter-norm criterion this module uses
-    # everywhere else, applied to a whole head's block of columns (across
-    # every input row) at once instead of a single output channel/filter.
+    # Combined importance of each head's full Q+K+V weight block -- the Li
+    # et al. filter-norm criterion this module uses everywhere else, applied
+    # to a whole head's block of columns (across every input row) at once
+    # instead of a single output channel/filter. For L2 that's the block's
+    # own Frobenius norm (the L2 norm of every entry, vectorized); the L1
+    # analogue is the L1 norm of that same vectorized block -- the sum of
+    # every entry's own absolute value (``np.abs(block).sum()``) -- rather
+    # than any Frobenius-like construction, exactly as
+    # :func:`_plain_structured_importance`'s own per-row L1 case has no
+    # square/sqrt in it either. wq/wk/wv all share the same row count here
+    # (three column-slices of one merged QKV weight), so the concatenation
+    # this block is built from is always legal for both norms.
     importance = np.zeros(chain.num_heads, dtype=np.float64)
     for h in range(chain.num_heads):
         block = np.concatenate(
@@ -7068,7 +7157,9 @@ def _plain_attention_head_importance(
             ],
             axis=1,
         )
-        importance[h] = np.linalg.norm(block)
+        importance[h] = (
+            np.abs(block).sum() if importance_norm == "l1" else np.linalg.norm(block)
+        )
     return importance
 
 
@@ -7079,7 +7170,11 @@ def _head_column_indices(keep_heads: np.ndarray, head_size: int) -> np.ndarray:
 
 
 def _gqa_group_importance(
-    chain: _GQAChain, wq: np.ndarray, wk: np.ndarray, wv: np.ndarray
+    chain: _GQAChain,
+    wq: np.ndarray,
+    wk: np.ndarray,
+    wv: np.ndarray,
+    importance_norm: str = "l2",
 ) -> np.ndarray:
     # Combined (Frobenius-norm) importance of each *KV group's* whole
     # block: the group's own K/V head columns plus every query head mapped
@@ -7117,6 +7212,14 @@ def _gqa_group_importance(
     # ai.onnx `Attention` chain (see :class:`_GQAChain`'s own `v_head_size`
     # field) -- so `v_block`'s own column stride into `wv` must use `dv`,
     # not `d`.
+    #
+    # For L1 the same per-block, sum-rather-than-concatenate combination is
+    # used, for the same reason: ``||[A B]||_1 == ||A||_1 + ||B||_1``
+    # unconditionally, for any A, B (unlike L2's root-sum-square identity
+    # above, this one doesn't even *need* a shared row count to hold, since
+    # L1 is just a sum over every entry -- but it's the same well-defined
+    # answer either way, and keeping both norms on one code path here avoids
+    # two subtly-different-looking implementations of the same idea).
     d = chain.head_size
     dv = chain.v_head_size
     group_size = chain.num_heads // chain.kv_num_heads
@@ -7131,11 +7234,16 @@ def _gqa_group_importance(
         )
         k_block = wk[:, kv * d : (kv + 1) * d]
         v_block = wv[:, kv * dv : (kv + 1) * dv]
-        importance[kv] = np.sqrt(
-            np.linalg.norm(q_block) ** 2
-            + np.linalg.norm(k_block) ** 2
-            + np.linalg.norm(v_block) ** 2
-        )
+        if importance_norm == "l1":
+            importance[kv] = (
+                np.abs(q_block).sum() + np.abs(k_block).sum() + np.abs(v_block).sum()
+            )
+        else:
+            importance[kv] = np.sqrt(
+                np.linalg.norm(q_block) ** 2
+                + np.linalg.norm(k_block) ** 2
+                + np.linalg.norm(v_block) ** 2
+            )
     return importance
 
 
@@ -7441,6 +7549,7 @@ def _apply_attention_chains(
 def apply_attention_head_pruning(
     model: Union[str, onnx.ModelProto],
     sparsity: float = 0.5,
+    importance_norm: _ImportanceNorm = "l2",
 ) -> onnx.ModelProto:
     """Removes whole attention heads -- or, for grouped-query attention,
     whole KV groups -- from every matched ``com.microsoft::Attention``,
@@ -7494,6 +7603,14 @@ def apply_attention_head_pruning(
     :param sparsity: target fraction of each matched block's heads (or, for
             GroupQueryAttention/plain ai.onnx Attention, KV groups) to
             remove (at least one is always kept)
+    :param importance_norm: ``"l2"`` (default, unchanged from before this
+            parameter existed) ranks by the combined Frobenius (L2) norm of
+            each head's/KV group's own weight block, mirroring
+            :func:`apply_structured_pruning`'s own default; ``"l1"`` ranks
+            by the sum of absolute weight magnitude across that same block
+            instead -- see :func:`_plain_attention_head_importance`'s and
+            :func:`_gqa_group_importance`'s own comments for exactly how
+            each combines across a KV group's several Q/K/V producers
     :returns: ``model`` with every matched block's tensors resized in
             place; anything not matching that exact topology (a
             non-constant weight, a packed-QKV GroupQueryAttention node, a
@@ -7507,6 +7624,7 @@ def apply_attention_head_pruning(
     """
     if not (0.0 <= sparsity < 1.0):
         raise ValueError(f"sparsity must be in [0, 1), got {sparsity}")
+    _validate_importance_norm(importance_norm)
     if isinstance(model, str):
         model = onnx.load(model, load_external_data=False)
 
@@ -7524,8 +7642,12 @@ def apply_attention_head_pruning(
             graph,
             chains,
             sparsity,
-            _plain_attention_head_importance,
-            _gqa_group_importance,
+            lambda chain, wq, wk, wv, dq, dk, dv: _plain_attention_head_importance(
+                chain, wq, wk, wv, dq, dk, dv, importance_norm
+            ),
+            lambda chain, wq, wk, wv: _gqa_group_importance(
+                chain, wq, wk, wv, importance_norm
+            ),
         )
 
     return out
@@ -7537,6 +7659,7 @@ def apply_attention_head_wanda_pruning(
     num_samples: int = 8,
     seed: int = 0,
     sparsity: float = 0.5,
+    importance_norm: _ImportanceNorm = "l2",
     epsilon: float = 1e-8,
     providers: Optional[Sequence[str]] = None,
 ) -> onnx.ModelProto:
@@ -7572,6 +7695,13 @@ def apply_attention_head_wanda_pruning(
     :param sparsity: target fraction of each matched block's heads (or, for
             GroupQueryAttention/plain ai.onnx Attention, KV groups) to
             remove (at least one is always kept)
+    :param importance_norm: ``"l2"`` (default) or ``"l1"`` -- selects the
+            *weight*-magnitude term only, exactly as it does for
+            :func:`apply_attention_head_pruning`; the *activation*-norm term
+            stays L2 unconditionally either way, per Wanda's own
+            ``|W_ij| * ||X_j||_2`` definition (see
+            :func:`apply_structured_wanda_pruning`'s own ``importance_norm``
+            for the same point made there)
     :param epsilon: floor applied to the accumulated per-unit activation
             norm, avoiding every unit of an all-zero activation tying at
             exactly the weight-only importance
@@ -7585,6 +7715,7 @@ def apply_attention_head_wanda_pruning(
     """
     if not (0.0 <= sparsity < 1.0):
         raise ValueError(f"sparsity must be in [0, 1), got {sparsity}")
+    _validate_importance_norm(importance_norm)
     if isinstance(model, str):
         model = onnx.load(model, load_external_data=False)
     if calibration_data is None:
@@ -7626,7 +7757,9 @@ def apply_attention_head_wanda_pruning(
     }
 
     def _wanda_attention_head_importance(chain, wq, wk, wv, dq, dk, dv):
-        base = _plain_attention_head_importance(chain, wq, wk, wv, dq, dk, dv)
+        base = _plain_attention_head_importance(
+            chain, wq, wk, wv, dq, dk, dv, importance_norm
+        )
         norm = act_norm.get(chain.consumer_node.input[0])
         if norm is None or norm.shape[0] != chain.nv:
             return base  # no matching activation observed -- fall back to plain
@@ -7639,7 +7772,7 @@ def apply_attention_head_wanda_pruning(
         return base * np.maximum(act_head, epsilon)
 
     def _wanda_gqa_group_importance(chain, wq, wk, wv):
-        base = _gqa_group_importance(chain, wq, wk, wv)
+        base = _gqa_group_importance(chain, wq, wk, wv, importance_norm)
         norm = act_norm.get(chain.consumer_node.input[0])
         # The probed activation is the consumer's own input -- the attention
         # output, laid out per *query* head at *V's* own per-head width
