@@ -260,6 +260,36 @@ is declined outright rather than guessed at -- see
 :func:`_find_matmul_concat_chains`/:func:`_find_conv_concat_chains`'s own
 section comment for exactly why that line is where it's drawn.
 
+The shared downstream consumer of a Conv `Concat` merge may itself be a
+general grouped (`group != 1`) Conv -- but only when every branch's own
+fixed offset lands exactly on one of the consumer's own `group` block
+boundaries (`block = n_channels / group`), so every block the consumer's
+own per-block top-k needs a uniform survivor count from is owned by exactly
+one branch, never split across two. This is *not* simply inherited from the
+ordinary grouped-producer/grouped-consumer composition above: there, every
+producer's own output already sits in one *shared* index space the
+consumer's blocks partition, all pruned to one shared `keep` set, so one
+global block size settles every block at once. A `Concat` branch, by
+contrast, is pruned *independently*, by its own top-k over its own slice,
+with no visibility into any sibling branch's ranking -- the entire reason
+`Concat` support exists in the first place (see above). When branch
+boundaries are block-aligned, that independence is harmless: each block
+falls wholly inside one branch, which alone can satisfy that block's own
+uniform-count requirement (an internal per-block top-k of its own, mirroring
+:func:`_apply_chains`'s mechanism, just scoped to the blocks it contains).
+When a block instead straddles two branches, satisfying it needs the counts
+each branch independently contributes to that one shared block to sum to
+exactly the required `per_group_keep` -- which two rankings computed with no
+knowledge of each other have no general way to guarantee, and reconciling it
+would need exactly the cross-branch agreement `Concat` support exists to
+avoid. So that case is declined outright, the whole chain, the same
+conservative way as everywhere else in this module -- see
+:func:`_concat_branches_align_to_consumer_group`'s own docstring for the
+exact admission condition, the full argument, and a concrete counter-example
+of the straddling case. (MatMul/Gemm has no grouping concept at all, so this
+paragraph is Conv-only; a MatMul/Gemm `Concat` chain's consumer is always
+ordinary.)
+
 General multi-branch dependency-graph pruning remains out of scope --
 a non-`Add`/`SkipLayerNormalization`/`Concat` merge op, and fan-out
 anywhere *except* forward from an already-established residual/merge
@@ -4767,11 +4797,21 @@ def _find_gated_chains(graph: onnx.GraphProto) -> List[_Chain]:
 # `Concat` node itself never needs its own attributes changed (its output
 # shape is simply whatever its inputs' shapes are, so pruning each branch's
 # own producer already gives it the right, smaller input on its own). A
-# grouped (`group != 1`) Conv consumer is declined the same way
-# :func:`_find_conv_residual_chains` declines one: its per-group top-k
-# assumes every producer feeds the consumer's full channel range, which a
-# multi-branch group of independently-sized, independently-pruned branches
-# doesn't establish.
+# grouped (`group != 1`) Conv consumer (Conv chains only -- MatMul/Gemm has
+# no grouping concept) is admitted, but only when every branch's own fixed
+# offset lands exactly on one of the consumer's own `group` block
+# boundaries (:func:`_concat_branches_align_to_consumer_group`) -- unlike
+# the ordinary grouped-producer/grouped-consumer composition
+# (:func:`_find_conv_chains`), where every producer already shares one
+# combined `keep` set with the consumer's own block partition, a `Concat`
+# branch is pruned *independently* with no visibility into any sibling
+# branch's ranking, so a block owned by more than one branch has no general
+# way to land on that block's own required uniform survivor count without
+# reintroducing exactly the cross-branch agreement `Concat` support exists
+# to avoid -- that case (and only that case) is still declined outright, the
+# same way :func:`_find_conv_residual_chains` declines every grouped
+# consumer. See :func:`_concat_branches_align_to_consumer_group`'s own
+# docstring for the full safety argument and a concrete counter-example.
 
 
 def _concat_axis(node: onnx.NodeProto) -> Optional[int]:
@@ -4931,6 +4971,18 @@ class _ConcatChain:
     # Depthwise Conv hops crossed between the `Concat` node and the real
     # consumer (Conv chains only; see :class:`_ConvPassThrough`).
     conv_pass_through: Tuple[_ConvPassThrough, ...] = ()
+    # 1 for an ordinary consumer (always, for a MatMul/Gemm chain -- MatMul/
+    # Gemm has no grouping concept at all) or a Conv consumer this module
+    # declines to admit as grouped; > 1 for a general grouped Conv consumer
+    # admitted per :func:`_concat_branches_align_to_consumer_group` -- see
+    # that function's own docstring and this section's own comment for
+    # exactly which grouped consumers are safe to admit and why. Mirrors
+    # :class:`_Chain`'s own `consumer_group` field/:func:`_chain_group`, but
+    # unlike that field this one is *not* found by inspecting `producers`
+    # first: a `Concat` branch's own producer is never itself grouped (see
+    # this section's own comment), so the consumer's `group` is always the
+    # one that governs here.
+    consumer_group: int = 1
 
 
 def _branch_walk_has_fanout(
@@ -5409,6 +5461,79 @@ def _find_matmul_concat_chains(graph: onnx.GraphProto) -> List[_ConcatChain]:
     return chains
 
 
+def _concat_branches_align_to_consumer_group(
+    branches: Sequence[_ConcatBranch], n_channels: int, group: int
+) -> bool:
+    """True if a grouped (``group > 1``) Conv consumer's own `group`
+    equal-sized input-channel blocks (``block = n_channels // group``, the
+    same partition :func:`_slice_grouped_consumer_conv_weight` slices
+    against) line up exactly with this `Concat` merge's own branch
+    boundaries -- every branch's fixed `offset` a multiple of `block` -- so
+    that every one of the consumer's `group` blocks is owned by exactly one
+    branch, never split across two. Always ``True`` for ``group <= 1`` (an
+    ordinary consumer has no block partition to line up with at all).
+
+    This is precisely the boundary this composition is safe at, and no
+    wider -- the same block-partition argument :func:`_chain_group`'s own
+    docstring works through for a single grouped producer/consumer, but
+    *not* simply inherited from it, because a `Concat` branch's own pruning
+    is structurally different from that chain's: an ordinary chain's
+    producer(s) are all pruned to one *shared* `keep` set (the entire
+    reason :func:`_chain_group`'s single global `block` size works there --
+    every producer's own output is literally the same index space the
+    consumer's blocks partition), whereas a `Concat` branch is pruned
+    *independently*, by its own top-k over its own disjoint slice, with no
+    visibility into any other branch's ranking or how many channels it
+    plans to keep -- the entire reason `Concat` support exists in the first
+    place (see this module's own docstring and this section's own comment).
+    When every branch boundary is block-aligned, each of the consumer's
+    `group` blocks falls entirely within one branch's own slice, so that
+    branch alone can satisfy the block's own uniform-survivor-count
+    requirement: it simply treats each of its own ``own_width // block``
+    contained blocks exactly the way a single grouped producer already
+    treats its own `group` blocks in :func:`_apply_chains` (an independent
+    per-block top-k, keeping `per_group_keep` channels from each -- the
+    *same* count every other block anywhere in this merge keeps, since
+    `per_group_keep` is computed once from `block` and `sparsity`, and
+    `block` itself depends only on the consumer's own `group` and the
+    merge's total `n_channels`, never on which branch a channel happens to
+    fall in). No cross-branch agreement is ever needed, because no block
+    ever has more than one branch to agree between.
+
+    When a block instead straddles two (or more) branches -- some branch's
+    own boundary falls in the interior of a block rather than at its edge --
+    satisfying that block's own uniform-count requirement needs the counts
+    each of those branches independently contributes *from that one shared
+    block* to sum to exactly `per_group_keep`. A branch's own top-k, ranked
+    with no knowledge of any sibling branch's importance or how many
+    channels that sibling plans to keep, has no general way to land on a
+    matching split; reconciling it would need exactly the cross-branch
+    importance comparison `Concat` support was built to avoid -- silently
+    reintroducing the "must all agree" coupling an `Add`/
+    `SkipLayerNormalization` merge has, and a `Concat` merge deliberately
+    doesn't. Concrete counter-example: ``block=4``, ``per_group_keep=2``,
+    branch `a` owns local columns ``[0, 3)`` of that block (3 channels) and
+    branch `b` owns column ``[3, 4)`` (1 channel) -- if `a`'s own top-3
+    ranking keeps all 3 of its channels (a legitimate outcome of *its own*
+    sparsity target) and `b` keeps its 1, the block ends up with 4
+    survivors, not 2; if `a` keeps only 1 and `b` keeps its 1, the block
+    ends up with 2 survivors but there was no shared signal that told `a`
+    to cut down to 1 rather than the 2 or 3 its own ranking alone would
+    justify. Either way, `a` and `b`'s independent decisions can't be made
+    to reliably land on the one *any* correct grouped-Conv consumer needs
+    without deciding, from *outside* either branch's own ranking, how the
+    budget for that one shared block is split between them -- so this case
+    is declined outright, the same conservative way as everywhere else in
+    this module, whenever any block spans more than one branch (checked by
+    :func:`_find_conv_concat_chains` before a chain with `group > 1` is ever
+    produced).
+    """
+    if group <= 1:
+        return True
+    block = n_channels // group
+    return all(b.offset % block == 0 for b in branches)
+
+
 def _find_conv_concat_chains(graph: onnx.GraphProto) -> List[_ConcatChain]:
     """The Conv analogue of :func:`_find_matmul_concat_chains`: every operand
     of a channel-axis `Concat` (`axis in (1, -3)` -- the channel axis of a
@@ -5423,8 +5548,14 @@ def _find_conv_concat_chains(graph: onnx.GraphProto) -> List[_ConcatChain]:
     :func:`_find_matmul_concat_chains`'s own section comment for exactly
     what composing that requires and what it declines, identical reasoning
     on the Conv side) -- `"fail"` is declined outright either way. The
-    consumer must itself be an ordinary (`group=1`) Conv -- see this
-    section's own comment for why a grouped consumer is declined here.
+    consumer may be an ordinary (`group=1`) Conv, or a general grouped
+    (`group > 1`) Conv whose own block boundaries line up exactly with
+    every branch's own fixed offset -- see
+    :func:`_concat_branches_align_to_consumer_group`'s own docstring for
+    the exact admission condition and the safety argument (and the
+    concrete counter-example) for why a *misaligned* grouped consumer is
+    still declined, the same conservative way a residual/merge group
+    declines one outright regardless of alignment.
     """
     initializer_map = {t.name: t for t in graph.initializer}
     consumers_of = _consumers_of(graph)
@@ -5545,8 +5676,10 @@ def _find_conv_concat_chains(graph: onnx.GraphProto) -> List[_ConcatChain]:
         if consumer is None:
             continue
         consumer_node, consumer_weight, consumer_group = consumer
-        if consumer_group != 1:
-            continue  # see this section's own comment -- grouped consumer declined
+        if not _concat_branches_align_to_consumer_group(
+            branches, total_n, consumer_group
+        ):
+            continue  # see _concat_branches_align_to_consumer_group's own docstring
 
         chains.append(
             _ConcatChain(
@@ -5559,6 +5692,7 @@ def _find_conv_concat_chains(graph: onnx.GraphProto) -> List[_ConcatChain]:
                 consumer_is_conv=True,
                 n_channels=total_n,
                 conv_pass_through=fwd_pass_through,
+                consumer_group=consumer_group,
             )
         )
     return chains
@@ -5623,6 +5757,27 @@ def _apply_concat_chains(
     the two can never doubly resize the same weight; the caller flushes
     ``value_info`` once, from `touched.stale_value_info`, after every such
     call.
+
+    When `chain.consumer_group` (Conv chains only -- always 1 for a MatMul/
+    Gemm chain) is greater than 1, each branch's own independent `keep` is
+    still chosen with no cross-branch coordination -- only *how* it's chosen
+    within one branch changes: rather than one plain top-k of that branch's
+    own `n_channels`, it's chosen as one independent top-k *per
+    `block`-sized block the branch contains* (``block = chain.n_channels //
+    chain.consumer_group``, the exact same global block size and
+    `per_group_keep` target used everywhere else in this merge), exactly
+    mirroring :func:`_apply_chains`'s own per-block mechanism for a single
+    grouped producer/consumer -- safe here specifically because
+    :func:`_concat_branches_align_to_consumer_group` already confirmed every
+    such block falls entirely inside one branch before this chain was ever
+    produced, so a branch's own `n_channels // block` is always a whole
+    number and no block's own uniform-count requirement ever needs
+    contributions from more than one branch. See that function's own
+    docstring for the full safety argument (and the concrete counter-example
+    for why a straddling block is declined instead). The final consumer
+    slice is, correspondingly,
+    :func:`_slice_grouped_consumer_conv_weight` rather than
+    :func:`_slice_consumer_weight` whenever `consumer_group > 1`.
     """
     initializer_map = {t.name: t for t in graph.initializer}
 
@@ -5663,11 +5818,23 @@ def _apply_concat_chains(
         ):
             continue  # a shared/tied initializer another chain already resized
 
+        group = chain.consumer_group
+        if group > 1:
+            block = chain.n_channels // group
+            per_group_keep = max(1, round(block * (1.0 - sparsity)))
+
         branch_keeps: List[np.ndarray] = []
         any_pruned = False
         for b in chain.branches:
             n = b.n_channels
-            keep_count = max(1, n - round(n * sparsity))
+            if group > 1:
+                # Whole number by construction -- see
+                # _concat_branches_align_to_consumer_group's own docstring
+                # and this function's own docstring above.
+                local_blocks = n // block
+                keep_count = per_group_keep * local_blocks
+            else:
+                keep_count = max(1, n - round(n * sparsity))
             if keep_count >= n:
                 branch_keeps.append(np.arange(n))
                 continue
@@ -5683,7 +5850,24 @@ def _apply_concat_chains(
                     else (w if p.weight_transposed else w.T)  # [N, K]
                 )
             importance = compute_branch_importance(b.operand_name, w_arrays_nk)
-            branch_keeps.append(np.sort(np.argsort(-importance)[:keep_count]))
+            if group > 1:
+                # One independent top-k per block contained in this branch --
+                # see this function's own docstring.
+                branch_keeps.append(
+                    np.concatenate(
+                        [
+                            np.sort(
+                                np.argsort(-importance[gi * block : (gi + 1) * block])[
+                                    :per_group_keep
+                                ]
+                            )
+                            + gi * block
+                            for gi in range(local_blocks)
+                        ]
+                    )
+                )
+            else:
+                branch_keeps.append(np.sort(np.argsort(-importance)[:keep_count]))
 
         if not any_pruned:
             continue  # every branch rounds down to a no-op -- nothing to do
@@ -5729,12 +5913,20 @@ def _apply_concat_chains(
                 _slice_last_axis(initializer_map[hop.bias], global_keep)
             _set_conv_group_attr(hop.node, len(global_keep))
 
-        _slice_consumer_weight(
-            initializer_map[chain.consumer_weight],
-            chain.consumer_weight_transposed,
-            global_keep,
-            is_conv=chain.consumer_is_conv,
-        )
+        if chain.consumer_is_conv and group > 1:
+            _slice_grouped_consumer_conv_weight(
+                initializer_map[chain.consumer_weight],
+                global_keep,
+                group,
+                chain.n_channels,
+            )
+        else:
+            _slice_consumer_weight(
+                initializer_map[chain.consumer_weight],
+                chain.consumer_weight_transposed,
+                global_keep,
+                is_conv=chain.consumer_is_conv,
+            )
 
         touched.producer.update(producer_weights)
         touched.consumer.add(chain.consumer_weight)
@@ -5817,6 +6009,17 @@ def _slice_grouped_consumer_conv_weight(
     consumer's own blocks are always the exact same partition of
     `n_channels` -- never a case where one side's block boundaries split a
     count unevenly relative to the other's.
+
+    The other caller, :func:`_apply_concat_chains` (a ``Concat``-merged
+    branch group feeding a grouped consumer), establishes the same
+    uniform-per-block-count guarantee by a different route: there is no
+    single producer whose blocks the consumer's must match, but
+    :func:`_concat_branches_align_to_consumer_group` already confirmed every
+    one of the consumer's own blocks falls entirely inside one branch, and
+    that branch's own per-block top-k (mirroring :func:`_apply_chains`'s
+    mechanism exactly, just scoped to the blocks it contains) keeps the same
+    `per_group_keep` count from each -- see that function's own docstring
+    for the full argument.
     """
     w = onnx.numpy_helper.to_array(w_init)
     out_channels = w.shape[0]
@@ -6503,8 +6706,15 @@ def apply_structured_pruning(
     out elsewhere, bottoms out at a graph input, or would need to cross a
     residual (``Add``/``SkipLayerNormalization``) merge or another
     ``Concat`` to reach one, declines the *entire* group, never partially
-    pruned. A grouped (``group != 1``) Conv consumer is likewise declined,
-    the same reason a residual group declines one.
+    pruned. A grouped (``group != 1``) Conv consumer is admitted, but only
+    when every branch's own fixed offset lands on one of the consumer's own
+    `group` block boundaries, so every block is owned by exactly one branch
+    -- see :func:`_concat_branches_align_to_consumer_group`'s own docstring
+    for the exact condition and why a block straddling two branches is still
+    declined (the same reason a residual group declines any grouped
+    consumer): a `Concat` branch's independent, no-cross-branch-visibility
+    ranking has no general way to land two branches on a matching split of
+    one shared block's required survivor count.
 
     :param model: the original onnx ModelProto or file path
     :param sparsity: target fraction of each matched producer's output

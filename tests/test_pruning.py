@@ -6834,13 +6834,18 @@ def test_structured_pruning_conv_concat_declines_on_wrong_axis():
     np.testing.assert_array_equal(inits["WOUT"], wout)
 
 
-def test_structured_pruning_conv_concat_declines_on_grouped_conv_consumer():
-    # The downstream consumer is a general grouped Conv -- declined the same
-    # way _find_conv_residual_chains declines one (see this section's own
-    # comment): the per-group top-k assumes every producer feeds the
-    # consumer's full channel range, which independently-pruned Concat
-    # branches don't establish.
-    Cin, Ca, Cb, Cout, group = 3, 4, 4, 8, 2
+def test_structured_pruning_conv_concat_declines_on_straddling_grouped_conv_consumer():
+    # The downstream consumer is a general grouped Conv (group=2, so
+    # block=(Ca+Cb)//group=4), but branch B's own fixed offset (Ca=3) is
+    # *not* a multiple of that block size: block 0 is channels [0, 4), and
+    # branch A only owns [0, 3) of it -- column 3 belongs to branch B. That
+    # one block therefore straddles both branches (see
+    # _concat_branches_align_to_consumer_group's own docstring for exactly
+    # this counter-example), so it's still declined outright, the whole
+    # chain untouched -- unlike a block-aligned grouped consumer (see
+    # test_structured_pruning_conv_concat_admits_block_aligned_grouped_conv_consumer
+    # below), which *is* now admitted.
+    Cin, Ca, Cb, Cout, group = 3, 3, 5, 8, 2
     rng = np.random.default_rng(224)
     wa = rng.standard_normal((Ca, Cin, 3, 3)).astype(np.float32)
     wb = rng.standard_normal((Cb, Cin, 3, 3)).astype(np.float32)
@@ -6862,6 +6867,308 @@ def test_structured_pruning_conv_concat_declines_on_grouped_conv_consumer():
     np.testing.assert_array_equal(inits["WA"], wa)
     np.testing.assert_array_equal(inits["WB"], wb)
     np.testing.assert_array_equal(inits["WOUT"], wout)
+
+
+def test_structured_pruning_conv_concat_admits_block_aligned_grouped_conv_consumer():
+    # Ca == Cb == 4 and group=2 give block=(Ca+Cb)//group=4 -- each branch
+    # owns exactly one of the consumer's two blocks (offsets 0 and 4, both
+    # multiples of 4), the simplest block-aligned shape
+    # _concat_branches_align_to_consumer_group admits: every block has
+    # exactly one owning branch, so no cross-branch agreement is ever
+    # needed and each branch's own ordinary top-k (one block == its own
+    # whole n_channels here) already is that block's own per-block top-k.
+    Cin, Ca, Cb, Cout, group = 3, 4, 4, 8, 2
+    rng = np.random.default_rng(224)
+    wa = rng.standard_normal((Ca, Cin, 3, 3)).astype(np.float32)
+    wb = rng.standard_normal((Cb, Cin, 3, 3)).astype(np.float32)
+    wout = rng.standard_normal((Cout, (Ca + Cb) // group, 1, 1)).astype(np.float32)
+    model = _model(
+        f"""
+        g (float[N,{Cin},10,10] X) => (float[N,{Cout},8,8] Y)
+        {{
+          ha = Conv<kernel_shape=[3,3]>(X, WA)
+          hb = Conv<kernel_shape=[3,3]>(X, WB)
+          merged = Concat<axis=1>(ha, hb)
+          Y = Conv<kernel_shape=[1,1], group={group}>(merged, WOUT)
+        }}
+        """,
+        initializer=[_f32(wa, "WA"), _f32(wb, "WB"), _f32(wout, "WOUT")],
+    )
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    # Each branch is exactly one block wide here, so its own per-block
+    # top-k reduces to an ordinary whole-branch top-k -- group=1 passed to
+    # the existing per-group oracle helper below gives exactly that.
+    keep_a = _oracle_keep_indices_conv_grouped(wa, 1, 0.5)
+    keep_b = _oracle_keep_indices_conv_grouped(wb, 1, 0.5)
+    assert len(keep_a) == 2 and len(keep_b) == 2
+    global_keep = np.concatenate([keep_a, keep_b + Ca])
+    wout_sliced = _oracle_slice_grouped_consumer_conv(wout, global_keep, group, Ca + Cb)
+
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    np.testing.assert_array_equal(inits["WA"], wa[keep_a])
+    np.testing.assert_array_equal(inits["WB"], wb[keep_b])
+    np.testing.assert_array_equal(inits["WOUT"], wout_sliced)
+
+    oracle = _model(
+        f"""
+        g (float[N,{Cin},10,10] X) => (float[N,{Cout},8,8] Y)
+        {{
+          ha = Conv<kernel_shape=[3,3]>(X, WA)
+          hb = Conv<kernel_shape=[3,3]>(X, WB)
+          merged = Concat<axis=1>(ha, hb)
+          Y = Conv<kernel_shape=[1,1], group={group}>(merged, WOUT)
+        }}
+        """,
+        initializer=[
+            _f32(wa[keep_a], "WA"),
+            _f32(wb[keep_b], "WB"),
+            _f32(wout_sliced, "WOUT"),
+        ],
+    )
+    rng_x = np.random.default_rng(225)
+    x = rng_x.standard_normal((2, Cin, 10, 10)).astype(np.float32)
+    (y,) = _run(pruned, {"X": x})
+    (y_oracle,) = _run(oracle, {"X": x})
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-5, atol=1e-5)
+
+
+def test_structured_pruning_conv_concat_grouped_consumer_prunes_branches_independently_despite_conflicting_importance():
+    # Deliberately adversarial: branch A's weights are scaled 100x larger
+    # than branch B's, so by *any* cross-branch-comparable ranking branch B
+    # would look catastrophically unimportant next to branch A -- if this
+    # composition secretly needed the branches to agree (the way a
+    # gated pair or residual merge's shared producers must), a buggy
+    # implementation could plausibly starve branch B's own block down to
+    # fewer survivors than its own 50% sparsity target, or even try to
+    # "borrow" extra keep budget for branch A's block from branch B's.
+    # Concat branches need no such agreement (this module's own docstring):
+    # each branch is ranked and pruned purely against *itself*, so branch
+    # B's own block keeps exactly its own per_group_keep=2 channels
+    # regardless of branch A's own weight scale.
+    Cin, Ca, Cb, Cout, group = 3, 4, 4, 8, 2
+    rng = np.random.default_rng(226)
+    wa = rng.standard_normal((Ca, Cin, 3, 3)).astype(np.float32) * 100.0
+    wb = rng.standard_normal((Cb, Cin, 3, 3)).astype(np.float32) * 0.01
+    wout = rng.standard_normal((Cout, (Ca + Cb) // group, 1, 1)).astype(np.float32)
+    model = _model(
+        f"""
+        g (float[N,{Cin},10,10] X) => (float[N,{Cout},8,8] Y)
+        {{
+          ha = Conv<kernel_shape=[3,3]>(X, WA)
+          hb = Conv<kernel_shape=[3,3]>(X, WB)
+          merged = Concat<axis=1>(ha, hb)
+          Y = Conv<kernel_shape=[1,1], group={group}>(merged, WOUT)
+        }}
+        """,
+        initializer=[_f32(wa, "WA"), _f32(wb, "WB"), _f32(wout, "WOUT")],
+    )
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    keep_a = _oracle_keep_indices_conv_grouped(wa, 1, 0.5)
+    keep_b = _oracle_keep_indices_conv_grouped(wb, 1, 0.5)
+    # The crux of this test: branch B keeps exactly `per_group_keep` of its
+    # own channels -- not zero, and not fewer than branch A's own count --
+    # despite being 10,000x smaller in weight magnitude.
+    assert len(keep_a) == 2 and len(keep_b) == 2
+    global_keep = np.concatenate([keep_a, keep_b + Ca])
+    wout_sliced = _oracle_slice_grouped_consumer_conv(wout, global_keep, group, Ca + Cb)
+
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    np.testing.assert_array_equal(inits["WA"], wa[keep_a])
+    np.testing.assert_array_equal(inits["WB"], wb[keep_b])
+    np.testing.assert_array_equal(inits["WOUT"], wout_sliced)
+
+    oracle = _model(
+        f"""
+        g (float[N,{Cin},10,10] X) => (float[N,{Cout},8,8] Y)
+        {{
+          ha = Conv<kernel_shape=[3,3]>(X, WA)
+          hb = Conv<kernel_shape=[3,3]>(X, WB)
+          merged = Concat<axis=1>(ha, hb)
+          Y = Conv<kernel_shape=[1,1], group={group}>(merged, WOUT)
+        }}
+        """,
+        initializer=[
+            _f32(wa[keep_a], "WA"),
+            _f32(wb[keep_b], "WB"),
+            _f32(wout_sliced, "WOUT"),
+        ],
+    )
+    rng_x = np.random.default_rng(227)
+    x = rng_x.standard_normal((2, Cin, 10, 10)).astype(np.float32)
+    (y,) = _run(pruned, {"X": x})
+    (y_oracle,) = _run(oracle, {"X": x})
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-5, atol=1e-5)
+
+
+def test_structured_pruning_conv_concat_grouped_consumer_branch_spanning_multiple_blocks_matches_oracle():
+    # group=3 gives block=(Ca+Cb)//group=4. Branch A (Ca=8) spans *two* of
+    # the consumer's three blocks on its own (offsets 0 and 4, both
+    # multiples of 4); branch B (Cb=4) owns the third block alone (offset
+    # 8). This is the case _concat_branches_align_to_consumer_group's own
+    # docstring singles out: a branch containing more than one block must
+    # keep a *uniform* per_group_keep count from *each* of its own
+    # contained blocks, not just an ordinary flat top-k over its whole
+    # n_channels. Engineered so the two constructions disagree and are
+    # separately checkable: branch A's first four filters (local block 0)
+    # are scaled 100x larger than its last four (local block 1), so a
+    # (wrong) flat top-4-of-8 over the whole branch would keep all of
+    # block 0 and none of block 1 -- violating the grouped consumer's own
+    # per-block-uniform-count requirement outright (and producing an empty
+    # `local_keep` for the WOUT filter group belonging to block 1). The
+    # correct per-block-aware selection keeps exactly 2 from each of
+    # branch A's own two blocks regardless of the magnitude gap.
+    Cin, Ca, Cb, Cout, group = 3, 8, 4, 9, 3
+    n_channels = Ca + Cb
+    block = n_channels // group
+    rng = np.random.default_rng(228)
+    wa = rng.standard_normal((Ca, Cin, 3, 3)).astype(np.float32)
+    wa[:4] *= 100.0  # local block 0 -- overwhelmingly "more important"
+    wa[4:] *= 0.01  # local block 1 -- overwhelmingly "less important"
+    wb = rng.standard_normal((Cb, Cin, 3, 3)).astype(np.float32)
+    wout = rng.standard_normal((Cout, n_channels // group, 1, 1)).astype(np.float32)
+    model = _model(
+        f"""
+        g (float[N,{Cin},10,10] X) => (float[N,{Cout},8,8] Y)
+        {{
+          ha = Conv<kernel_shape=[3,3]>(X, WA)
+          hb = Conv<kernel_shape=[3,3]>(X, WB)
+          merged = Concat<axis=1>(ha, hb)
+          Y = Conv<kernel_shape=[1,1], group={group}>(merged, WOUT)
+        }}
+        """,
+        initializer=[_f32(wa, "WA"), _f32(wb, "WB"), _f32(wout, "WOUT")],
+    )
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    # Branch A spans Ca // block == 2 of the consumer's own blocks.
+    keep_a = _oracle_keep_indices_conv_grouped(wa, Ca // block, 0.5)
+    keep_b = _oracle_keep_indices_conv_grouped(wb, Cb // block, 0.5)
+    # The crux of this test: exactly 2 survivors from *each* of branch A's
+    # own two local blocks, not 4-and-0 (what a flat whole-branch top-k
+    # would produce given the 100x/0.01x magnitude gap above).
+    local_block0 = keep_a[keep_a < 4]
+    local_block1 = keep_a[keep_a >= 4]
+    assert len(local_block0) == 2
+    assert len(local_block1) == 2
+    assert len(keep_b) == 2
+
+    global_keep = np.concatenate([keep_a, keep_b + Ca])
+    wout_sliced = _oracle_slice_grouped_consumer_conv(
+        wout, global_keep, group, n_channels
+    )
+
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    np.testing.assert_array_equal(inits["WA"], wa[keep_a])
+    np.testing.assert_array_equal(inits["WB"], wb[keep_b])
+    np.testing.assert_array_equal(inits["WOUT"], wout_sliced)
+
+    oracle = _model(
+        f"""
+        g (float[N,{Cin},10,10] X) => (float[N,{Cout},8,8] Y)
+        {{
+          ha = Conv<kernel_shape=[3,3]>(X, WA)
+          hb = Conv<kernel_shape=[3,3]>(X, WB)
+          merged = Concat<axis=1>(ha, hb)
+          Y = Conv<kernel_shape=[1,1], group={group}>(merged, WOUT)
+        }}
+        """,
+        initializer=[
+            _f32(wa[keep_a], "WA"),
+            _f32(wb[keep_b], "WB"),
+            _f32(wout_sliced, "WOUT"),
+        ],
+    )
+    rng_x = np.random.default_rng(229)
+    x = rng_x.standard_normal((2, Cin, 10, 10)).astype(np.float32)
+    (y,) = _run(pruned, {"X": x})
+    (y_oracle,) = _run(oracle, {"X": x})
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-5, atol=1e-5)
+
+
+def test_structured_wanda_pruning_conv_concat_admits_block_aligned_grouped_conv_consumer():
+    # The Wanda analogue of
+    # test_structured_pruning_conv_concat_admits_block_aligned_grouped_conv_consumer:
+    # confirms the group-aware per-block branch selection composes
+    # correctly with _wanda_branch_importance's own activation-weighted
+    # metric (captured at each branch's own Concat operand, exactly as an
+    # ungrouped Concat consumer already is), not just the plain L2 path.
+    Cin, Ca, Cb, Cout, group = 3, 4, 4, 8, 2
+    rng = np.random.default_rng(230)
+    wa = rng.standard_normal((Ca, Cin, 3, 3)).astype(np.float32)
+    wb = rng.standard_normal((Cb, Cin, 3, 3)).astype(np.float32)
+    wout = rng.standard_normal((Cout, (Ca + Cb) // group, 1, 1)).astype(np.float32)
+    model = _model(
+        f"""
+        g (float[N,{Cin},10,10] X) => (float[N,{Cout},8,8] Y)
+        {{
+          ha = Conv<kernel_shape=[3,3]>(X, WA)
+          hb = Conv<kernel_shape=[3,3]>(X, WB)
+          merged = Concat<axis=1>(ha, hb)
+          Y = Conv<kernel_shape=[1,1], group={group}>(merged, WOUT)
+        }}
+        """,
+        initializer=[_f32(wa, "WA"), _f32(wb, "WB"), _f32(wout, "WOUT")],
+    )
+
+    probe_model = onnx.ModelProto()
+    probe_model.CopyFrom(model)
+    probe_model.graph.output.append(
+        onnx.helper.make_tensor_value_info("ha", onnx.TensorProto.FLOAT, None)
+    )
+    probe_model.graph.output.append(
+        onnx.helper.make_tensor_value_info("hb", onnx.TensorProto.FLOAT, None)
+    )
+    rng_cal = np.random.default_rng(231)
+    x_cal = rng_cal.standard_normal((4, Cin, 10, 10)).astype(np.float32)
+    calibration_data = [{"X": x_cal}]
+    _, ha_cal, hb_cal = _run(probe_model, {"X": x_cal})
+    norm_a = np.sqrt(np.mean(np.square(ha_cal.astype(np.float64)), axis=(0, 2, 3)))
+    norm_b = np.sqrt(np.mean(np.square(hb_cal.astype(np.float64)), axis=(0, 2, 3)))
+
+    pruned = onnxsim.apply_structured_wanda_pruning(
+        model, calibration_data=calibration_data, sparsity=0.5
+    )
+    onnx.checker.check_model(pruned)
+
+    imp_a = np.linalg.norm(wa.reshape(Ca, -1).astype(np.float64), axis=1) * np.maximum(
+        norm_a, 1e-8
+    )
+    imp_b = np.linalg.norm(wb.reshape(Cb, -1).astype(np.float64), axis=1) * np.maximum(
+        norm_b, 1e-8
+    )
+    # Each branch is exactly one block wide, so its own per-block top-k is
+    # an ordinary whole-branch top-k over this Wanda-weighted importance.
+    keep_a = np.sort(np.argsort(-imp_a)[:2])
+    keep_b = np.sort(np.argsort(-imp_b)[:2])
+    global_keep = np.concatenate([keep_a, keep_b + Ca])
+    wout_sliced = _oracle_slice_grouped_consumer_conv(wout, global_keep, group, Ca + Cb)
+
+    oracle = _model(
+        f"""
+        g (float[N,{Cin},10,10] X) => (float[N,{Cout},8,8] Y)
+        {{
+          ha = Conv<kernel_shape=[3,3]>(X, WA)
+          hb = Conv<kernel_shape=[3,3]>(X, WB)
+          merged = Concat<axis=1>(ha, hb)
+          Y = Conv<kernel_shape=[1,1], group={group}>(merged, WOUT)
+        }}
+        """,
+        initializer=[
+            _f32(wa[keep_a], "WA"),
+            _f32(wb[keep_b], "WB"),
+            _f32(wout_sliced, "WOUT"),
+        ],
+    )
+    rng_x = np.random.default_rng(232)
+    x = rng_x.standard_normal((2, Cin, 10, 10)).astype(np.float32)
+    (y,) = _run(pruned, {"X": x})
+    (y_oracle,) = _run(oracle, {"X": x})
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-5, atol=1e-5)
 
 
 # --- apply_structured_wanda_pruning ------------------------------------------
