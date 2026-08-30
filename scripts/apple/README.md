@@ -161,10 +161,15 @@ a hand-written ONNX-to-MIL mapping where different architectures can exercise
 different op combinations -- see the script's module docstring for which
 entries have actually been run through this pipeline versus which are
 expected to work but not yet exercised (larger models need more RAM/disk than
-a constrained dev sandbox has). Two well-known families in that weight class,
-`meta-llama/Llama-3.2-*-Instruct` and `google/gemma-2-*-it`, are left out of
-the default list because both are gated on Hugging Face (need an accepted
-license + `HF_TOKEN`); pass either as `--only` once you have access.
+a constrained dev sandbox has). `meta-llama/Llama-3.2-*-Instruct` is gated on
+Hugging Face (needs an accepted license + `HF_TOKEN`) but is in the default
+list anyway -- this repo's CI has a read-only `HF_TOKEN` secret, wired into
+the `coreml-integration` workflow's `export-benchmark-models` job (runs on
+`workflow_dispatch`/schedule only, not on every PR, since it's a multi-GB
+download). `google/gemma-2-*-it` -- also gated, and with more architectural
+unknowns (sliding-window attention, logit soft-capping) not yet checked
+against this translator at all -- is left out of the default list; pass it as
+`--only` once you have access, to try it anyway.
 
 ```bash
 python prepare_benchmark_models.py --output-dir benchmark_models

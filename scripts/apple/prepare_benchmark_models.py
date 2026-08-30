@@ -14,12 +14,21 @@ leaderboard tests (https://devicemark.github.io/, roughly 1-4B parameters),
 spanning a few architecture families (Llama-style, Qwen2, Phi-3) rather than
 just one, since `onnxsim/coreml_export.py`'s translator is a hand-written
 ONNX-to-MIL mapping and different architectures exercise different op
-combinations. Two well-known families in that weight class are deliberately
-left out of the default list: `meta-llama/Llama-3.2-*-Instruct` and
-`google/gemma-2-*-it` both require accepting a license on Hugging Face and an
-authenticated `HF_TOKEN` to even download -- pass `--only` with one of those
-model ids (after `huggingface-cli login` or setting `HF_TOKEN`) to include it
-anyway; nothing else about the pipeline is family-specific.
+combinations.
+
+A few model families in that weight class require accepting a license on
+Hugging Face and an authenticated `HF_TOKEN` to even download.
+`meta-llama/Llama-3.2-*-Instruct` is in the default list below anyway: this
+repo's CI has a read-only `HF_TOKEN` secret (see
+`.github/workflows/coreml-integration.yml`'s `export-benchmark-models` job),
+so it downloads there even though it can't in a token-less environment (set
+`HF_TOKEN` yourself, or run `huggingface-cli login`, to download it locally).
+`google/gemma-2-*-it` is left out of the default list even so -- Gemma 2's
+architecture (alternating sliding-window/full attention, logit soft-capping)
+hasn't been checked against this translator at all, unlike Llama-3.2's, which
+only extends already-validated Llama-family op patterns to a gated checkpoint.
+Pass `--only google/gemma-2-2b-it` to try it anyway; nothing about the
+pipeline itself is family-specific, so it may well just work.
 
 Not every model in the default list has actually been run through this
 pipeline in every environment -- each entry's `notes` field says whether it
@@ -102,6 +111,22 @@ BENCHMARK_MODELS: list[BenchmarkModel] = [
         "MatMul + Split, instead of separate q/k/v or gate/up projections) are a "
         "structurally different graph shape from Llama/Qwen2's separate projections, "
         "though built from ops (MatMul, Split) this translator already supports.",
+    ),
+    BenchmarkModel(
+        "meta-llama/Llama-3.2-1B-Instruct",
+        512,
+        "fp16",
+        "Gated -- needs HF_TOKEN (see the module docstring). Not yet exercised in a "
+        "token-less local sandbox; expected to convert, since it's the same Llama "
+        "architecture already validated via SmolLM2 (a gated checkpoint changes what "
+        "you can download, not the graph shape once downloaded).",
+    ),
+    BenchmarkModel(
+        "meta-llama/Llama-3.2-3B-Instruct",
+        512,
+        "fp16",
+        "Gated -- needs HF_TOKEN (see the module docstring). Not yet exercised (same "
+        "reasons as Llama-3.2-1B-Instruct, plus the larger size).",
     ),
 ]
 
