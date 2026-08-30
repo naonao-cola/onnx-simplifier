@@ -79,3 +79,37 @@ uncovered:
 downloads. Real models can be layered on by passing an on-disk path as
 `worker.py`'s second argument, the same way `scripts/qualcomm` and
 `scripts/regression` do.
+
+## LLM decode benchmark (`export_llm_to_coreml.py` / `run_llm_decode_benchmark.py`)
+
+A separate pair of tools for a different question than the compatibility
+check above: not "does Core ML accept this graph", but "how fast does a
+causal LM actually decode through `onnxsim.export_coreml`, on-device" --
+the same two axes (decode tok/s, peak memory) as
+[DeviceMark](https://devicemark.github.io/)'s on-device LLM leaderboard
+methodology.
+
+- `export_llm_to_coreml.py` exports a Hugging Face causal LM (via
+  [`optimum-onnx`](https://github.com/huggingface/optimum-onnx)) to a
+  **fixed-context, empty-KV-cache** ONNX decoder, runs it through
+  `onnxsim.simplify`, and converts it with `onnxsim.export_coreml`. See its
+  module docstring for why the KV cache is pinned empty instead of growing
+  (onnxsim's Core ML exporter currently requires fully static shapes, and a
+  growing cache is a dynamic one) and what that costs: every decode step
+  reprocesses the whole context window instead of reusing previous work, so
+  this is *not* a production KV-cache deployment -- it's the largest
+  transformer graph onnxsim's Core ML exporter has been exercised against.
+  Extending the exporter to support one dynamic axis (so a real growing KV
+  cache becomes possible) is the natural next step here.
+- `run_llm_decode_benchmark.py` loads the resulting `.mlpackage`, greedily
+  decodes a prompt, and reports decode tok/s and peak RSS. Like the rest of
+  this directory, it only *runs* a model on macOS (that's where Core ML's
+  runtime lives); the export step itself needs no Apple hardware.
+
+```bash
+pip install "optimum-onnx" transformers coremltools
+python export_llm_to_coreml.py HuggingFaceTB/SmolLM2-135M-Instruct \
+    --max-length 64 --output smollm2.mlpackage
+python run_llm_decode_benchmark.py smollm2.mlpackage \
+    --prompt "The capital of France is" --max-new-tokens 20
+```
