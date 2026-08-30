@@ -105,7 +105,8 @@ set +e
 chroot "${SYSROOT}" /bin/sh -c "cd /work && GITHUB_STEP_SUMMARY=${CHROOT_SUMMARY} \
   PYTHONPATH=/work/pylibs python3 -m pytest tests -p no:cacheprovider \
   --ignore=tests/test_mnn_llm_export.py --ignore=tests/test_python_api.py --ignore=tests/test_rfdetr.py \
-  --ignore=tests/test_simple.py --ignore=tests/test_timm.py --ignore=tests/test_yolo.py \
+  --ignore=tests/test_simple.py --ignore=tests/test_timm.py \
+  --ignore=tests/test_torch_export_integration.py --ignore=tests/test_yolo.py \
   --ignore=tests/test_gan.py \
   --ignore=tests/test_qnn_compat.py --ignore=tests/test_modelopt_integration.py \
   --ignore=tests/test_coreml_compat.py --ignore=tests/test_migraphx_compat.py \

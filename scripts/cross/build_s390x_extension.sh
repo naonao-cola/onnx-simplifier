@@ -222,17 +222,20 @@ cmake --build "${BUILD_DIR}" --target sym_expr_test model_metrics_test \
   gguf_dtype_test ggml_kquant_test tensor_pool_gguf_test \
   read_gguf_metadata_test -j "${JOBS}"
 # tensor_pool_bridge_test, tensor_pool_gguf_bridge_test,
-# tensor_pool_archive_test, and precision_estimator_test are NOT
-# dependency-free (they exercise onnx::ModelProto / the TensorProto <->
-# TensorPool bridges), but the onnx/onnx-optimizer static libraries they need
-# are already built as a side effect of the onnxsim_cpp2py_export target
-# above, so they cost only their own link step here rather than a second onnx
-# build. precision_estimator_test in particular is exactly the kind of test a
-# big-endian run needs: it exercises the raw_data byte-order handling
-# precision_estimator.cpp's ReadFloatTensorFlat does for real weight tensors.
+# tensor_pool_archive_test, precision_estimator_test, and
+# contrib_schemas_moe_test are NOT dependency-free (they exercise
+# onnx::ModelProto / the TensorProto <-> TensorPool bridges, or in
+# contrib_schemas_moe_test's case onnx::OpSchemaRegistry and
+# FunctionBodyBuildContext), but the onnx/onnx-optimizer static libraries
+# they need are already built as a side effect of the onnxsim_cpp2py_export
+# target above, so they cost only their own link step here rather than a
+# second onnx build. precision_estimator_test in particular is exactly the
+# kind of test a big-endian run needs: it exercises the raw_data byte-order
+# handling precision_estimator.cpp's ReadFloatTensorFlat does for real
+# weight tensors.
 cmake --build "${BUILD_DIR}" --target tensor_pool_bridge_test \
   tensor_pool_gguf_bridge_test tensor_pool_archive_test \
-  precision_estimator_test -j "${JOBS}"
+  precision_estimator_test contrib_schemas_moe_test -j "${JOBS}"
 
 SO="$(find "${BUILD_DIR}" -name 'onnxsim_cpp2py_export*.so' -print -quit)"
 [[ -n "${SO}" ]] || { echo "no extension module produced"; exit 1; }
