@@ -2,10 +2,22 @@
 checkpoint, for a small set of recognized decoder-only transformer
 architectures (currently the Llama family: Llama/Llama2/Llama3, Mistral, and
 Qwen2, which all share the same block shape -- RMSNorm, rotary position
-embeddings, grouped-query attention, SwiGLU FFN -- differing only in things
+embeddings, grouped-query attention, a per-layer feed-forward block that is
+either a plain SwiGLU FFN or, for a Mixtral-style checkpoint, a
+``com.microsoft.MoE`` node -- differing only in things
 :func:`read_gguf_metadata` already reports: head counts, RoPE base, whether
-q/k/v projections carry a bias, and whether the LM head is tied to the token
-embedding).
+q/k/v projections carry a bias, whether the LM head is tied to the token
+embedding, and whether ``expert_count`` marks the checkpoint as MoE).
+
+Mixtral-style MoE: llama.cpp gives a Mixtral checkpoint the same
+``general.architecture`` ("llama") as any dense Llama checkpoint --
+``expert_count`` > 0 is what actually switches its own graph builder
+(``src/models/llama.cpp``) onto the MoE branch, so this module does the
+same, dispatching to :func:`_moe_ffn`'s ``com.microsoft.MoE`` node (the
+reference decomposition registered for that schema in
+``onnxsim/contrib_schemas.cpp``) instead of the plain FFN. See
+:func:`_moe_ffn`'s own docstring for exactly which llama.cpp source
+confirmed this maps onto that decomposition unchanged.
 
 This is deliberately the "known architecture template" approach, not a
 generic GGUF/ggml graph-structure reconstructor: vLLM and SGLang's own GGUF
@@ -224,6 +236,61 @@ def _apply_rope(
     return b.op("Add", [a, c], prefix)
 
 
+def _moe_ffn(
+    b: _Builder,
+    h: str,
+    p: str,
+    n_embd: int,
+    n_ff: int,
+    n_expert: int,
+    n_expert_used: int,
+    declare,
+) -> str:
+    """A Mixtral-style MoE feed-forward block, as one ``com.microsoft.MoE``
+    node -- the reference decomposition registered for that schema in
+    ``onnxsim/contrib_schemas.cpp`` (``fc2(silu(fc1(x)) * fc3(x))``, softmax-
+    over-all-experts routing, top-k, renormalized) is byte-for-byte the same
+    computation llama.cpp's own ``build_moe_ffn`` performs for this exact
+    call shape: gating_op=SOFTMAX, norm_w=true, no expert-selection bias, no
+    expert groups, and no weight scale (validated by the caller) --
+    confirmed by reading ``llama.cpp/src/models/llama.cpp``'s MoE branch and
+    ``llama.cpp/src/llama-graph.cpp``'s ``build_moe_ffn`` directly, not
+    inferred from the schema docs alone. ``fc1``=``ffn_gate_exps`` (gate),
+    ``fc3``=``ffn_up_exps`` (up, no activation), ``fc2``=``ffn_down_exps``
+    (down) -- the same naming ``BuildMoEFunctionBody``'s own comment uses.
+
+    ``ffn_gate_exps``/``ffn_up_exps``/``ffn_down_exps``'s GGML shapes
+    (``{n_embd, n_ff, n_expert}``/``{n_embd, n_ff, n_expert}``/
+    ``{n_ff, n_embd, n_expert}``) reverse -- via ``declare``'s existing,
+    unmodified rule -- directly onto ``com.microsoft.MoE``'s own
+    ``fc1_experts_weights``/``fc3_experts_weights``/``fc2_experts_weights``
+    layouts (``[num_experts, inter_size, hidden_size]``/same/
+    ``[num_experts, hidden_size, inter_size]``); no MoE-specific shape
+    handling is needed here beyond calling ``declare`` with those shapes.
+    """
+    router_w = declare(f"{p}.ffn_gate_inp.weight", [n_expert, n_embd])
+    logits = _linear(b, h, router_w, None, f"{p}.moe_router")
+    router_probs = b.op(
+        "Reshape",
+        [logits, b.shape_const([-1, n_expert])],
+        f"{p}.moe_router_flat",
+    )
+
+    gate_w = declare(f"{p}.ffn_gate_exps.weight", [n_expert, n_ff, n_embd])
+    up_w = declare(f"{p}.ffn_up_exps.weight", [n_expert, n_ff, n_embd])
+    down_w = declare(f"{p}.ffn_down_exps.weight", [n_expert, n_embd, n_ff])
+
+    return b.op(
+        "MoE",
+        [h, router_probs, gate_w, "", down_w, "", up_w],
+        f"{p}.moe",
+        domain="com.microsoft",
+        k=n_expert_used,
+        activation_type="silu",
+        normalize_routing_weights=1,
+    )
+
+
 def _reconstruct_llama_family(
     meta: dict, batch_size: int, seq_len: int
 ) -> onnx.GraphProto:
@@ -246,6 +313,34 @@ def _reconstruct_llama_family(
         )
     )
     freq_base = float(kv.get(key("rope.freq_base"), 10000.0))
+
+    # Mixture-of-experts: llama.cpp doesn't give Mixtral-style checkpoints a
+    # distinct general.architecture value -- a Mixtral GGUF reports
+    # architecture "llama" like any dense Llama checkpoint, and is
+    # distinguished purely by expert_count > 0 (see llama.cpp's
+    # src/models/llama.cpp: `if (model.layers[il].ffn_gate_inp == nullptr)`
+    # selects the plain FFN branch, else the MoE one, both under the same
+    # architecture). expert_weights_scale/expert_used_count are llama.cpp's
+    # own hparim names for k and an optional post-softmax weight multiplier;
+    # only the case matching com.microsoft.MoE's own reference decomposition
+    # (plain softmax-over-all-experts routing, top-k, renormalized, no extra
+    # scale) is implemented -- see _moe_ffn's own comment for exactly how
+    # this was cross-checked against llama.cpp's build_moe_ffn source.
+    n_expert = int(kv.get(key("expert_count"), 0))
+    n_expert_used = int(kv.get(key("expert_used_count"), 0))
+    expert_weights_scale = float(kv.get(key("expert_weights_scale"), 0.0))
+    if n_expert > 0:
+        if n_expert_used <= 0 or n_expert_used > n_expert:
+            raise UnsupportedArchitectureError(
+                f"{key('expert_count')}={n_expert} but "
+                f"{key('expert_used_count')}={n_expert_used} is not a "
+                "positive number <= expert_count"
+            )
+        if expert_weights_scale not in (0.0, 1.0):
+            raise UnsupportedArchitectureError(
+                f"{key('expert_weights_scale')}={expert_weights_scale} is "
+                "not implemented (only the default of no extra scaling is)"
+            )
 
     if n_embd % n_head != 0:
         raise UnsupportedArchitectureError(
@@ -432,31 +527,34 @@ def _reconstruct_llama_family(
         h = _rmsnorm(
             b, x, declare(f"{p}.ffn_norm.weight", [n_embd]), eps, f"{p}.ffn_norm"
         )
-        gate = _linear(
-            b,
-            h,
-            declare(f"{p}.ffn_gate.weight", [n_ff, n_embd]),
-            declare_optional(f"{p}.ffn_gate.bias", [n_ff]),
-            f"{p}.gate_proj",
-        )
-        up = _linear(
-            b,
-            h,
-            declare(f"{p}.ffn_up.weight", [n_ff, n_embd]),
-            declare_optional(f"{p}.ffn_up.bias", [n_ff]),
-            f"{p}.up_proj",
-        )
-        silu = b.op("Sigmoid", [gate], f"{p}.silu_sig")
-        silu = b.op("Mul", [gate, silu], f"{p}.silu")
-        act = b.op("Mul", [silu, up], f"{p}.act")
-        down = _linear(
-            b,
-            act,
-            declare(f"{p}.ffn_down.weight", [n_embd, n_ff]),
-            declare_optional(f"{p}.ffn_down.bias", [n_embd]),
-            f"{p}.down_proj",
-        )
-        x = b.op("Add", [resid, down], f"{p}.ffn_resid")
+        if n_expert > 0:
+            ffn_out = _moe_ffn(b, h, p, n_embd, n_ff, n_expert, n_expert_used, declare)
+        else:
+            gate = _linear(
+                b,
+                h,
+                declare(f"{p}.ffn_gate.weight", [n_ff, n_embd]),
+                declare_optional(f"{p}.ffn_gate.bias", [n_ff]),
+                f"{p}.gate_proj",
+            )
+            up = _linear(
+                b,
+                h,
+                declare(f"{p}.ffn_up.weight", [n_ff, n_embd]),
+                declare_optional(f"{p}.ffn_up.bias", [n_ff]),
+                f"{p}.up_proj",
+            )
+            silu = b.op("Sigmoid", [gate], f"{p}.silu_sig")
+            silu = b.op("Mul", [gate, silu], f"{p}.silu")
+            act = b.op("Mul", [silu, up], f"{p}.act")
+            ffn_out = _linear(
+                b,
+                act,
+                declare(f"{p}.ffn_down.weight", [n_embd, n_ff]),
+                declare_optional(f"{p}.ffn_down.bias", [n_embd]),
+                f"{p}.down_proj",
+            )
+        x = b.op("Add", [resid, ffn_out], f"{p}.ffn_resid")
 
     x = _rmsnorm(b, x, declare("output_norm.weight", [n_embd]), eps, "output_norm")
 
@@ -528,7 +626,14 @@ def reconstruct_gguf_graph(
 
     graph = _reconstruct_llama_family(meta, batch_size, seq_len)
     model = onnx.helper.make_model(
-        graph, opset_imports=[onnx.helper.make_opsetid("", _OPSET)]
+        graph,
+        opset_imports=[
+            onnx.helper.make_opsetid("", _OPSET),
+            # Only ever used when the checkpoint is a MoE architecture (see
+            # _moe_ffn) -- harmless to declare unconditionally otherwise, an
+            # unused opset_import is valid ONNX (checked directly).
+            onnx.helper.make_opsetid("com.microsoft", 1),
+        ],
     )
     model.ir_version = _IR_VERSION
 
