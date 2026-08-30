@@ -109,6 +109,37 @@ methodology.
   the rest of this directory, it only *runs* a model on macOS (that's where
   Core ML's runtime lives); the export step itself needs no Apple hardware.
 
+### Scaling to few-billion-parameter models
+
+DeviceMark's own leaderboard mostly tests models in the 1-4B range, well
+past `HuggingFaceTB/SmolLM2-135M-Instruct`'s 135M. The export pipeline above
+has also been validated end-to-end against `HuggingFaceTB/SmolLM2-1.7B-Instruct`
+(24 layers, ~3.4GB of fp16 weights) -- converting a model at that scale
+needs a couple of extra considerations `export_llm_to_coreml.py` handles for
+you, and one flag worth knowing about:
+
+- `--dtype fp16` traces and exports the ONNX graph in half precision
+  instead of the default float32. Tracing a multi-billion-parameter model in
+  float32 can transiently hold more than one full-size copy of its weights
+  in memory (PyTorch's own model plus the in-progress ONNX graph); `fp16`
+  roughly halves that peak. This is independent of Core ML's own output
+  precision, which defaults to float16 regardless of the ONNX input's dtype.
+- The batch-size fix-up and `onnxsim.simplify` step both operate on the
+  model **by file path**, not as an in-memory `ModelProto` -- passing a
+  `ModelProto` to either serializes the whole model to one protobuf message
+  first, which protobuf itself caps at 2GiB (comfortably cleared by a
+  multi-billion-parameter model's weights). Passing a path instead uses
+  onnx's/onnxsim's own file-based C++ entry points, which need only about
+  1x the model's size in peak memory rather than 2x+ (see
+  `bench/RESULTS_synthetic_decoder_oom.md` in the repo root for the
+  investigation that fixed the `onnxsim.simplify` side of this).
+- `main_export(..., do_validation=False)` skips `optimum`'s own
+  PyTorch-vs-ONNX-Runtime comparison pass, which otherwise keeps a second
+  full copy of the model resident purely to check optimum's own export --
+  a check this pipeline doesn't rely on (onnxsim's `onnx.checker.check_model`
+  and the Core ML conversion actually succeeding are the checks that matter
+  here).
+
 ```bash
 pip install "optimum-onnx" transformers coremltools
 python export_llm_to_coreml.py HuggingFaceTB/SmolLM2-135M-Instruct \

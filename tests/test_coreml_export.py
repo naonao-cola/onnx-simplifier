@@ -219,6 +219,42 @@ def test_gemm_alpha_beta_transb_matches_onnxruntime():
     np.testing.assert_allclose(_mil_const_value(model), expected, rtol=1e-5, atol=1e-5)
 
 
+def test_gemm_alpha_beta_fp16_matches_expected():
+    # Regression test: the alpha/beta scale factors used to be created as a bare
+    # Python float, which MIL infers as fp32 regardless of context -- multiplying
+    # it against an fp16 operand raised a dtype-mismatch error (found while
+    # converting an fp16-exported multi-billion-parameter LLM).
+    rng = np.random.RandomState(0)
+    a = rng.randn(3, 4).astype(np.float16)
+    b = rng.randn(5, 4).astype(np.float16)
+    c = rng.randn(5).astype(np.float16)
+    inits = [
+        numpy_helper.from_array(a, name="a"),
+        numpy_helper.from_array(b, name="b"),
+        numpy_helper.from_array(c, name="c"),
+    ]
+    model = _model(
+        "gemm () => (float16[3,5] out) "
+        "{ out = Gemm <alpha=0.5, beta=2.0, transB=1> (a, b, c) }",
+        initializer=inits,
+    )
+    expected = 0.5 * (a.astype(np.float32) @ b.astype(np.float32).T) + 2.0 * c.astype(
+        np.float32
+    )
+    np.testing.assert_allclose(_mil_const_value(model), expected, rtol=1e-2, atol=1e-2)
+
+
+def test_neg_fp16_matches_expected():
+    # Same class of bug as the Gemm fp16 case above, in Neg's `mul(x, -1)`
+    # lowering.
+    x = np.array([1.5, -2.0, 0.0], dtype=np.float16)
+    model = _model(
+        "neg () => (float16[3] y) { y = Neg (x) }",
+        initializer=[numpy_helper.from_array(x, name="x")],
+    )
+    np.testing.assert_array_equal(_mil_const_value(model), -x.astype(np.float32))
+
+
 def test_pad_reflect_matches_onnxruntime():
     x = np.arange(12, dtype=np.float32).reshape(1, 1, 3, 4)
     pads = np.array([0, 0, 1, 1, 0, 0, 1, 1], np.int64)
@@ -444,6 +480,49 @@ def test_dynamic_shapes_expand_to_runtime_shape():
         }
         """,
     )
+    onnx.checker.check_model(model)
+    mlmodel = onnxsim.export_coreml(model, dynamic_shapes={"N": (1, 2, 8)})
+    (out_desc,) = mlmodel.get_spec().description.output
+    assert out_desc.name == "y"
+
+
+def test_dynamic_shapes_expand_fp16_to_runtime_shape():
+    # Same scenario as test_dynamic_shapes_expand_to_runtime_shape, but fp16:
+    # the fallback's `fill`+`add` used to hardcode an fp32 zero regardless of
+    # `x`'s actual dtype, so this raised a dtype-mismatch error against fp16.
+    model = _model(
+        """
+        expand_dyn (float16[N,4] x) => (float16[N,4] y)
+        {
+            shp = Shape (x)
+            one = Constant <value_float = 1.0> ()
+            one16 = Cast <to = 10> (one)
+            y = Expand (one16, shp)
+        }
+        """,
+    )
+    onnx.checker.check_model(model)
+    mlmodel = onnxsim.export_coreml(model, dynamic_shapes={"N": (1, 2, 8)})
+    (out_desc,) = mlmodel.get_spec().description.output
+    assert out_desc.name == "y"
+
+
+def test_constant_of_shape_dynamic_fp16():
+    # Same class of bug as the Expand case above, in ConstantOfShape's dynamic
+    # `fill` fallback: extracting the fill value via numpy's `.item()` silently
+    # discarded its fp16 dtype, so `fill` produced an fp32 tensor instead. The
+    # text-format parser has no syntax for a node's tensor-valued attribute, so
+    # this one is built with onnx.helper (see CLAUDE.md's note on that exception).
+    x = onnx.helper.make_tensor_value_info("x", onnx.TensorProto.FLOAT16, ["N", 4])
+    y = onnx.helper.make_tensor_value_info("y", onnx.TensorProto.FLOAT16, ["N", 4])
+    shape_node = onnx.helper.make_node("Shape", ["x"], ["shp"])
+    value = numpy_helper.from_array(np.array([2.0], dtype=np.float16))
+    cos_node = onnx.helper.make_node("ConstantOfShape", ["shp"], ["y"], value=value)
+    graph = onnx.helper.make_graph([shape_node, cos_node], "g", [x], [y])
+    model = onnx.helper.make_model(
+        graph, opset_imports=[onnx.helper.make_opsetid("", 17)]
+    )
+    model.ir_version = 8
     onnx.checker.check_model(model)
     mlmodel = onnxsim.export_coreml(model, dynamic_shapes={"N": (1, 2, 8)})
     (out_desc,) = mlmodel.get_spec().description.output
