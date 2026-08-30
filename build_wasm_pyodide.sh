@@ -84,6 +84,21 @@ if [ -z "${PYODIDE_PYTHON_INCLUDE:-}" ]; then
     exit 1
 fi
 PYTHON_EXECUTABLE=${PYTHON_EXECUTABLE:-python3}
+# Resolve to an absolute path before handing it to CMake. A bare name here
+# left CMake's own find_program() to re-resolve "python3", which -- only
+# intermittently, same toolchain/versions, fresh checkout each time -- picked
+# a DIFFERENT, wrong-architecture interpreter (e.g. the runner's native
+# /bin/python) for onnx-optimizer's generic find_package(Python ...) call
+# (see docs/wasm_pyodide.md's "Plumbing target Python headers" section),
+# failing the whole configure with "Wrong architecture for the interpreter".
+# An already-absolute, already-verified-to-exist path removes that
+# re-resolution step entirely: CMake takes it as-is.
+if command -v "$PYTHON_EXECUTABLE" >/dev/null 2>&1; then
+    PYTHON_EXECUTABLE=$(command -v "$PYTHON_EXECUTABLE")
+else
+    echo "error: PYTHON_EXECUTABLE '$PYTHON_EXECUTABLE' not found" >&2
+    exit 1
+fi
 
 # --- Host protoc: identical approach to build_wasm.sh -- reused verbatim so
 # the two scripts don't drift on how a matching host protoc is found/built.

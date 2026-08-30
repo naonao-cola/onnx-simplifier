@@ -101,6 +101,17 @@ to the same target headers, together with:
 - `Python3_FIND_ABI`/`Python_FIND_ABI` set to `ANY;ANY;ANY;ANY`, to avoid a
   strict-ABI mismatch rejection between the host interpreter and the
   target's ABI tag.
+- `Python3_EXECUTABLE`/`Python_EXECUTABLE` must be an **absolute path**, not
+  a bare command name. A bare `python3` left CMake's own `find_program()`
+  free to re-resolve it -- which, only intermittently (same toolchain
+  versions, a fresh checkout/configure each time, no stale `CMakeCache.txt`
+  to blame), picked a different, wrong-architecture interpreter (the CI
+  runner's native `/bin/python`) for onnx-optimizer's generic
+  `find_package(Python ...)` call instead, failing the configure with
+  `Could NOT find Python ... Wrong architecture for the interpreter
+  "/bin/python"`. `build_wasm_pyodide.sh` resolves `PYTHON_EXECUTABLE` via
+  `command -v` before passing it to CMake so there is nothing left for
+  CMake to re-resolve.
 
 ### 3. nanobind 3.0.0's missing `<cstdio>` include
 

@@ -2,15 +2,16 @@
 //
 // C++ port of pruning.py's own apply_structured_pruning -- see that
 // function's docstring for the full technique description (this is quoted
-// here only where it constrains scope). This port covers all five of
+// here only where it constrains scope). This port covers all seven of
 // pruning.py's own chain finders: a MatMul/vanilla-Gemm producer ->
 // consumer pair (_find_chains), a Conv producer -> consumer pair, including
 // depthwise pass-through hops and general grouped Conv on either side
 // (_find_conv_chains), the gated-FFN SwiGLU/GeGLU pattern -- two producers
 // combined by Mul (or ONNX opset-28+'s native SwiGLU node) feeding one
-// consumer, both pruned to the same channel indices (_find_gated_chains) --
-// and Conv/MatMul residual (skip-connection) chains, a bounded slice of the
-// general dependency-graph-grouping problem: a channel-preserving
+// consumer, both pruned to the same channel indices (_find_gated_chains),
+// Conv/MatMul residual (skip-connection) chains, and Conv/MatMul
+// Concat-merged (U-Net-style) skip-connection chains -- a bounded slice of
+// the general dependency-graph-grouping problem: a channel-preserving
 // `Add(a, b)` where both operands are non-constant forces whichever real
 // producer(s) feed `a`/`b` to be pruned to the same channel-index set. A
 // backward walk plus union-find grouping across such eligible merge points
@@ -21,16 +22,42 @@
 // count; a group with any branch that fails to resolve, or whose leaf
 // producers disagree on channel count, is declined in its entirety, never
 // partially pruned -- the same conservative "no branch-following" boundary
-// every other chain finder here already holds. For MatMul/Gemm specifically,
-// a fused com.microsoft::SkipLayerNormalization/
+// every other chain finder here already holds. Once a group's shared
+// channel-index set is established, though, it can also fan out *forward*
+// to more than one independent ordinary consumer (ResolveConvFanoutBranches/
+// ResolveMatmulFanoutBranches) -- so a real multi-block ResNet/transformer
+// stage's shared "post-block" tensor, read by both the next block's own
+// first Conv/MatMul *and*, unchanged, that block's own `Add`, is reached
+// rather than declined; a general grouped Conv may take part in this merge
+// too, as a producer, the primary consumer, and/or an extra fan-out branch,
+// as long as every one of those that is grouped shares the exact same
+// `group` count. For MatMul/Gemm specifically, a fused
+// com.microsoft::SkipLayerNormalization/
 // SkipSimplifiedLayerNormalization node -- what onnxruntime's transformer
 // optimizer collapses a bare residual `Add` plus the following LayerNorm
 // into, and so what a fully-optimized transformer's residual connections
 // typically look like -- is also recognized as an eligible merge point
 // (mirroring pruning.py's own _match_matmul_residual_merge), its own
 // gamma/beta/bias constants riding along as a per-channel affine hop on the
-// resolved chain. Conv residual chains only ever see a bare `Add` -- there
-// is no Conv analogue of that fused op.
+// resolved chain; a gated (SwiGLU/GeGLU) combine feeding a residual branch
+// with no downstream projection in between is resolved the same way a
+// gated pair outside a residual chain already is. Conv residual chains only
+// ever see a bare `Add` -- there is no Conv analogue of that fused op. A
+// fused com.microsoft::BiasGelu/FastGelu node (a bias-add fused into the
+// following Gelu-family activation) is recognized as a per-channel hop too
+// (MatMul/Gemm chains only), and com.microsoft::QuickGelu is a plain unary
+// pass-through hop everywhere a unary activation is already allowed.
+//
+// A Concat-merged skip connection (the U-Net-style encoder/decoder merge)
+// is matched too, for both MatMul/Gemm (last-axis Concat only) and Conv
+// (channel-axis Concat) -- see FindMatmulConcatChains/FindConvConcatChains
+// and this file's own "Concat-merged" section comment below: unlike Add, a
+// Concat's branches are structurally independent (each owns a fixed,
+// disjoint offset range of the merged channel range), so each branch is
+// ranked and pruned entirely on its own, reusing the exact same backward
+// walkers and fan-out resolution the two residual sections above already
+// build; only the shared downstream consumer's weight needs new slicing, at
+// each branch's own fixed offset.
 //
 // Implemented directly on onnx::GraphProto (protobuf), not onnxoptimizer's
 // Node/Value IR: pruning.py's own algorithm already works this way (name-
@@ -70,11 +97,79 @@ constexpr int kMaxChainHops = 8;
 // own _UNARY_PASS_THROUGH exactly.
 const std::unordered_set<std::string>& UnaryPassThroughOps() {
   static const std::unordered_set<std::string> kOps = {
-      "Relu", "LeakyRelu", "Elu",      "Selu", "Sigmoid",
-      "Tanh", "Softplus",  "Softsign", "Gelu", "HardSigmoid",
-      "Mish", "Identity",  "Cast",
+      "Relu",
+      "LeakyRelu",
+      "Elu",
+      "Selu",
+      "Sigmoid",
+      "Tanh",
+      "Softplus",
+      "Softsign",
+      "Gelu",
+      "HardSigmoid",
+      "Mish",
+      "Identity",
+      "Cast",
+      // com.microsoft::QuickGelu(X) = X * Sigmoid(alpha * X) (alpha an
+      // attribute, not a second input) -- purely unary/elementwise, so
+      // membership here alone extends every walker that already consults
+      // this set, mirroring pruning.py's own _UNARY_PASS_THROUGH.
+      "QuickGelu",
   };
   return kOps;
+}
+
+// com.microsoft's fused bias-add + Gelu-family activation nodes, mirroring
+// pruning.py's own _FUSED_BIAS_GELU_OPS/_match_fused_bias_gelu:
+// BiasGelu(A, B) = Gelu(A + B) (bias required) and
+// FastGelu(X[, bias]) = Gelu_tanh(X [+ bias]) (bias optional) both fuse an
+// FFN's bias-add into its following activation. MatMul/Gemm-chain-only, like
+// the per-channel Add/Mul hop these sit alongside -- no Conv-side analogue.
+constexpr char kComMicrosoftDomain[] = "com.microsoft";
+
+struct FusedBiasGeluMatch {
+  std::string data_name;
+  std::optional<std::string> bias_name;
+};
+
+std::optional<FusedBiasGeluMatch> MatchFusedBiasGelu(
+    const onnx::NodeProto& node,
+    const std::unordered_map<std::string, const onnx::TensorProto*>& init_map) {
+  bool bias_required;
+  if (node.op_type() == "BiasGelu") {
+    bias_required = true;
+  } else if (node.op_type() == "FastGelu") {
+    bias_required = false;
+  } else {
+    return std::nullopt;
+  }
+  if (node.domain() != kComMicrosoftDomain || node.input_size() == 0 ||
+      node.input(0).empty() || node.output_size() != 1) {
+    return std::nullopt;
+  }
+  const std::string data_name = node.input(0);
+  const bool has_bias_input = node.input_size() > 1 && !node.input(1).empty();
+  if (!has_bias_input) {
+    if (bias_required) {
+      return std::nullopt;  // BiasGelu's own schema requires a bias operand.
+    }
+    return FusedBiasGeluMatch{data_name, std::nullopt};
+  }
+  const std::string bias_name = node.input(1);
+  auto it = init_map.find(bias_name);
+  if (it == init_map.end() ||
+      it->second->data_type() != onnx::TensorProto::FLOAT ||
+      it->second->dims_size() == 0) {
+    return std::nullopt;  // non-constant bias -- can't safely slice/prune it.
+  }
+  int64_t prod = 1;
+  for (int64_t d : it->second->dims()) {
+    prod *= d;
+  }
+  if (prod != it->second->dims(it->second->dims_size() - 1)) {
+    return std::nullopt;
+  }
+  return FusedBiasGeluMatch{data_name, bias_name};
 }
 
 // --- Tensor <-> flat float buffer, mirroring onnx.numpy_helper -------------
@@ -309,6 +404,20 @@ struct ChainOp {
   std::optional<std::string> const_name;
 };
 
+// One extra, independent forward-consumer branch a residual/merge group's
+// own fan-out resolves to -- mirroring pruning.py's own _ConsumerBranch --
+// fed by the exact same shared `keep` set as a Chain's own primary
+// consumer. See ResolveConvFanoutBranches/ResolveMatmulFanoutBranches.
+struct ConsumerBranch {
+  std::vector<ChainOp> chain_ops;
+  onnx::NodeProto* consumer_node = nullptr;
+  std::string consumer_weight;
+  bool consumer_weight_transposed = false;
+  bool consumer_is_conv = false;
+  std::vector<ConvPassThrough> conv_pass_through;
+  int64_t consumer_group = 1;
+};
+
 struct Chain {
   std::vector<Producer> producers;
   std::vector<ChainOp> chain_ops;
@@ -319,6 +428,10 @@ struct Chain {
   bool consumer_is_conv = false;
   std::vector<ConvPassThrough> conv_pass_through;
   int64_t consumer_group = 1;
+  // Additional independent consumer branches a residual/merge group's own
+  // fan-out resolved -- see pruning.py's own _Chain.extra_consumers. Always
+  // empty for every chain kind except a Conv/MatMul residual/merge group.
+  std::vector<ConsumerBranch> extra_consumers;
 };
 
 // --- MatMul/Gemm plain chains, mirroring _match_producer/_walk_to_consumer/
@@ -365,16 +478,27 @@ std::pair<std::optional<ConsumerMatch>, std::vector<ChainOp>> WalkToConsumer(
     const std::string& start, const InitMap& init_map,
     const ConsumerMap& consumers_of,
     const std::unordered_set<std::string>& graph_outputs, int64_t n_channels,
-    int max_hops) {
+    int max_hops, onnx::NodeProto* forced_first_hop = nullptr) {
   std::vector<ChainOp> chain_ops;
   std::optional<ConsumerMatch> consumer;
   std::string cur = start;
   for (int hop = 0; hop < max_hops; ++hop) {
-    auto cit = consumers_of.find(cur);
-    if (cit == consumers_of.end() || cit->second.size() != 1) {
-      break;
+    onnx::NodeProto* nxt;
+    if (hop == 0 && forced_first_hop != nullptr) {
+      // Used only by ResolveMatmulFanoutBranches: `cur` is an
+      // already-established residual/merge group's own shared spine tensor,
+      // so more than one consumer is expected here -- the caller has
+      // already picked this one specific consumer to resolve this branch
+      // through. Every hop after the first still enforces the ordinary
+      // single-consumer bar unchanged below.
+      nxt = forced_first_hop;
+    } else {
+      auto cit = consumers_of.find(cur);
+      if (cit == consumers_of.end() || cit->second.size() != 1) {
+        break;
+      }
+      nxt = cit->second[0];
     }
-    onnx::NodeProto* nxt = cit->second[0];
 
     auto cm = MatchMatMulLikeRaw(*nxt);
     if (cm && cm->x_name == cur) {
@@ -418,6 +542,18 @@ std::pair<std::optional<ConsumerMatch>, std::vector<ChainOp>> WalkToConsumer(
         break;
       }
       const_name = other;
+    } else if (nxt->op_type() == "BiasGelu" || nxt->op_type() == "FastGelu") {
+      auto fused = MatchFusedBiasGelu(*nxt, init_map);
+      if (!fused || fused->data_name != cur) {
+        break;
+      }
+      if (fused->bias_name) {
+        const onnx::TensorProto* b = init_map.at(*fused->bias_name);
+        if (b->dims(b->dims_size() - 1) != n_channels) {
+          break;
+        }
+      }
+      const_name = fused->bias_name;
     } else {
       break;
     }
@@ -753,17 +889,25 @@ std::tuple<std::optional<ConvConsumerResult>, std::vector<ChainOp>,
 WalkToConvConsumer(const std::string& start, const InitMap& init_map,
                    const ConsumerMap& consumers_of,
                    const std::unordered_set<std::string>& graph_outputs,
-                   int64_t n_channels, int max_hops) {
+                   int64_t n_channels, int max_hops,
+                   onnx::NodeProto* forced_first_hop = nullptr) {
   std::vector<ChainOp> chain_ops;
   std::vector<ConvPassThrough> pass_through;
   std::optional<ConvConsumerResult> consumer;
   std::string cur = start;
   for (int hop = 0; hop < max_hops; ++hop) {
-    auto cit = consumers_of.find(cur);
-    if (cit == consumers_of.end() || cit->second.size() != 1) {
-      break;
+    onnx::NodeProto* nxt;
+    if (hop == 0 && forced_first_hop != nullptr) {
+      // See WalkToConsumer's own matching parameter -- used only by
+      // ResolveConvFanoutBranches.
+      nxt = forced_first_hop;
+    } else {
+      auto cit = consumers_of.find(cur);
+      if (cit == consumers_of.end() || cit->second.size() != 1) {
+        break;
+      }
+      nxt = cit->second[0];
     }
-    onnx::NodeProto* nxt = cit->second[0];
 
     if (nxt->op_type() == "Conv" && nxt->input(0) == cur) {
       auto dw = MatchDepthwiseConvPassThrough(*nxt, init_map, n_channels);
@@ -853,16 +997,18 @@ std::vector<Chain> FindConvChains(onnx::GraphProto* graph) {
 
 // --- Residual (Add-merged) chains, mirroring _is_eligible_add_merge/
 // _walk_conv_producer_backward/_find_conv_residual_chains and
-// _walk_matmul_producer_backward/_find_matmul_residual_chains. Scope note:
-// this only recognizes a bare Add merge point, not pruning.py's own
-// com.microsoft::SkipLayerNormalization/SkipSimplifiedLayerNormalization
-// fusion (see _match_matmul_residual_merge's own comment in pruning.py) --
-// a model whose residual connections have already been fused into that op
-// by onnxruntime's transformer optimizer is left untouched by this port's
-// MatMul residual finder; the pure-Python implementation remains the
-// full-featured reference for that case.
+// _walk_matmul_producer_backward/_find_matmul_residual_chains. The MatMul
+// side also recognizes a fused com.microsoft::SkipLayerNormalization/
+// SkipSimplifiedLayerNormalization merge point (see MatchResidualMerge
+// below), general grouped Conv producers/consumers on the Conv side, and
+// forward "fan-out" to more than one independent ordinary consumer once a
+// group's shared channel-index set is established (see
+// ResolveConvFanoutBranches/ResolveMatmulFanoutBranches) -- mirroring
+// pruning.py's own current _walk_conv_producer_backward/
+// _walk_matmul_producer_backward exactly, not just a bare single-consumer
+// Add(a, b) pair.
 
-enum class BackwardEdgeKind { kFail, kProducer, kAdd };
+enum class BackwardEdgeKind { kFail, kProducer, kAdd, kGated };
 
 // The backward counterpart of WalkToConvConsumer, used only by
 // FindConvResidualChains to resolve one operand of an eligible Add merge
@@ -874,6 +1020,13 @@ struct ConvBackwardEdge {
   onnx::NodeProto* add_node = nullptr;
   std::vector<ConvPassThrough> pass_through;  // Forward order.
   std::vector<onnx::NodeProto*> unary_ops;    // Forward order.
+  // For every hop that actually advanced `cur`, the pair (new_cur, node)
+  // recording that new_cur's own in-group forward consumer is `node` --
+  // mirrors pruning.py's own `edges`, in the same (start-to-producer, not
+  // reversed) order. Used by ResolveConvFanoutBranches to know which
+  // consumer(s) of a backbone tensor are already part of the group's own
+  // wiring, so only genuinely extra ones need their own resolution.
+  std::vector<std::pair<std::string, onnx::NodeProto*>> edges;
 };
 
 // The backward-walk analogue of MatchDepthwiseConvPassThrough: unlike that
@@ -896,16 +1049,27 @@ std::optional<DepthwiseMatch> MatchConvPassThroughSelf(
   return MatchDepthwiseConvPassThrough(node, init_map, it->second->dims(0));
 }
 
+// Walks backward from tensor `start` through unary pass-through activations
+// and self-consistently-depthwise Conv hops, declining (only) whenever a
+// tensor crossed -- `start` itself included -- is a graph output. Unlike the
+// version this superseded, *how many* other things also read that same
+// tensor is deliberately not checked here (mirroring pruning.py's own
+// current _walk_conv_producer_backward): every such extra reader gets its
+// own safety check later, in ResolveConvFanoutBranches, once the group's
+// real channel count is known. A general grouped Conv producer is also now
+// allowed through unconditionally -- the caller (FindConvResidualChains)
+// cross-checks group agreement across the whole group.
 ConvBackwardEdge WalkConvProducerBackward(
     const std::string& start,
     const std::unordered_map<std::string, onnx::NodeProto*>& node_by_output,
-    const InitMap& init_map, const ConsumerMap& consumers_of,
+    const InitMap& init_map,
     const std::unordered_set<std::string>& graph_outputs, int max_hops) {
   std::vector<ConvPassThrough> pass_through;  // Backward order.
   std::vector<onnx::NodeProto*> unary_ops;    // Backward order.
+  std::vector<std::pair<std::string, onnx::NodeProto*>> edges;
   std::string cur = start;
   for (int hop = 0; hop < max_hops; ++hop) {
-    if (ConsumerCount(consumers_of, cur) != 1 || graph_outputs.count(cur)) {
+    if (graph_outputs.count(cur)) {
       return ConvBackwardEdge{};
     }
     auto nit = node_by_output.find(cur);
@@ -917,26 +1081,23 @@ ConvBackwardEdge WalkConvProducerBackward(
 
     auto prod_info = MatchConvProducer(*node, init_map);
     if (prod_info) {
-      if (prod_info->group != 1) {
-        // General grouped Conv is out of scope for the residual/Add-merge
-        // case -- see WalkConvProducerBackward's Python counterpart.
-        return ConvBackwardEdge{};
-      }
       ConvBackwardEdge edge;
       edge.kind = BackwardEdgeKind::kProducer;
-      edge.producer =
-          Producer{node, prod_info->weight, false, prod_info->bias, true, 1};
+      edge.producer = Producer{node, prod_info->weight, false, prod_info->bias,
+                               true, prod_info->group};
       edge.n_channels = prod_info->out_channels;
       std::reverse(pass_through.begin(), pass_through.end());
       std::reverse(unary_ops.begin(), unary_ops.end());
       edge.pass_through = std::move(pass_through);
       edge.unary_ops = std::move(unary_ops);
+      edge.edges = std::move(edges);
       return edge;
     }
 
     auto dw = MatchConvPassThroughSelf(*node, init_map);
     if (dw) {
       pass_through.push_back(ConvPassThrough{node, dw->weight, dw->bias});
+      edges.push_back({node->input(0), node});
       cur = node->input(0);
       continue;
     }
@@ -944,6 +1105,7 @@ ConvBackwardEdge WalkConvProducerBackward(
     if (UnaryPassThroughOps().count(node->op_type()) != 0 &&
         node->input_size() == 1) {
       unary_ops.push_back(node);
+      edges.push_back({node->input(0), node});
       cur = node->input(0);
       continue;
     }
@@ -956,12 +1118,77 @@ ConvBackwardEdge WalkConvProducerBackward(
       std::reverse(unary_ops.begin(), unary_ops.end());
       edge.pass_through = std::move(pass_through);
       edge.unary_ops = std::move(unary_ops);
+      edge.edges = std::move(edges);
       return edge;
     }
 
     return ConvBackwardEdge{};
   }
   return ConvBackwardEdge{};
+}
+
+// For an already-established Conv residual/merge group -- every tensor in
+// `backbone_tensors` is one WalkConvProducerBackward's own backward walk
+// already proved carries that group's shared channel-index set, `accounted`
+// marks, per tensor, which specific consumer node(s) are already part of the
+// group's own internal wiring -- finds every *extra* consumer (one not in
+// `accounted`) of every backbone tensor and resolves each independently via
+// WalkToConvConsumer, seeded at that one specific node (its own
+// `forced_first_hop`). Mirrors pruning.py's own
+// _resolve_conv_fanout_branches exactly, including its three-way return
+// shape: `std::nullopt` -- decline the whole group -- if any backbone tensor
+// is itself a graph output, any extra consumer fails to resolve, or two
+// branches would end up naming the same consumer weight; otherwise every
+// resolved branch (possibly empty, when the group has no extra fan-out at
+// all -- the caller treats that exactly like "no consumer found" and
+// declines, same as pruning.py's own `if not branches: continue`).
+std::optional<std::vector<ConsumerBranch>> ResolveConvFanoutBranches(
+    const std::vector<std::string>& backbone_tensors,
+    const std::unordered_map<std::string, std::unordered_set<onnx::NodeProto*>>&
+        accounted,
+    const InitMap& init_map, const ConsumerMap& consumers_of,
+    const std::unordered_set<std::string>& graph_outputs, int64_t n_channels) {
+  std::vector<ConsumerBranch> branches;
+  std::unordered_set<std::string> seen_weights;
+  for (const auto& tensor : backbone_tensors) {
+    if (graph_outputs.count(tensor)) {
+      return std::nullopt;
+    }
+    auto cit = consumers_of.find(tensor);
+    if (cit == consumers_of.end()) {
+      continue;
+    }
+    auto acc_it = accounted.find(tensor);
+    std::unordered_set<onnx::NodeProto*> seen_nodes;
+    for (onnx::NodeProto* consumer_node : cit->second) {
+      if (!seen_nodes.insert(consumer_node).second) {
+        continue;
+      }
+      if (acc_it != accounted.end() && acc_it->second.count(consumer_node)) {
+        continue;  // Already part of the group's own established wiring.
+      }
+      auto [resolved, br_chain_ops, br_pass_through] =
+          WalkToConvConsumer(tensor, init_map, consumers_of, graph_outputs,
+                             n_channels, kMaxChainHops, consumer_node);
+      if (!resolved) {
+        return std::nullopt;
+      }
+      if (seen_weights.count(resolved->weight)) {
+        return std::nullopt;  // Two branches naming the same consumer weight.
+      }
+      seen_weights.insert(resolved->weight);
+      ConsumerBranch branch;
+      branch.chain_ops = std::move(br_chain_ops);
+      branch.consumer_node = resolved->node;
+      branch.consumer_weight = resolved->weight;
+      branch.consumer_weight_transposed = false;
+      branch.consumer_is_conv = true;
+      branch.conv_pass_through = std::move(br_pass_through);
+      branch.consumer_group = resolved->group;
+      branches.push_back(std::move(branch));
+    }
+  }
+  return branches;
 }
 
 // Finds Conv residual/skip-connection groups: for every maximal union-find
@@ -979,9 +1206,6 @@ std::vector<Chain> FindConvResidualChains(onnx::GraphProto* graph) {
   for (const auto& o : graph->output()) {
     graph_outputs.insert(o.name());
   }
-  auto is_internal = [&](const std::string& name) {
-    return ConsumerCount(consumers_of, name) == 1 && !graph_outputs.count(name);
-  };
   std::unordered_map<std::string, onnx::NodeProto*> node_by_output;
   for (int i = 0; i < graph->node_size(); ++i) {
     onnx::NodeProto* node = graph->mutable_node(i);
@@ -1026,9 +1250,8 @@ std::vector<Chain> FindConvResidualChains(onnx::GraphProto* graph) {
   for (size_t idx = 0; idx < eligible_adds.size(); ++idx) {
     std::vector<ConvBackwardEdge> results;
     for (const auto& operand : eligible_adds[idx]->input()) {
-      ConvBackwardEdge edge =
-          WalkConvProducerBackward(operand, node_by_output, init_map,
-                                   consumers_of, graph_outputs, kMaxChainHops);
+      ConvBackwardEdge edge = WalkConvProducerBackward(
+          operand, node_by_output, init_map, graph_outputs, kMaxChainHops);
       if (edge.kind == BackwardEdgeKind::kFail) {
         poisoned.insert(static_cast<int>(idx));
       } else if (edge.kind == BackwardEdgeKind::kAdd) {
@@ -1069,9 +1292,33 @@ std::vector<Chain> FindConvResidualChains(onnx::GraphProto* graph) {
     std::vector<ConvPassThrough> pass_through;
     std::vector<onnx::NodeProto*> unary_ops;
     std::unordered_set<int> referenced;
+    // Every tensor either walk of every member proved carries this group's
+    // own shared channel-index set, and, for each, which specific consumer
+    // node is already part of the group's own internal wiring -- fed to
+    // ResolveConvFanoutBranches below so only genuinely extra consumers need
+    // their own separate resolution. `backbone_tensors` preserves
+    // first-seen order, so which resolved branch ends up "primary" is
+    // deterministic.
+    std::vector<std::string> backbone_tensors;
+    std::unordered_map<std::string, std::unordered_set<onnx::NodeProto*>>
+        accounted;
+    auto mark_backbone = [&](const std::string& tensor, onnx::NodeProto* node) {
+      if (!accounted.count(tensor)) {
+        backbone_tensors.push_back(tensor);
+      }
+      accounted[tensor].insert(node);
+    };
 
     for (int idx : members) {
-      for (auto& edge : edge_results[static_cast<size_t>(idx)]) {
+      onnx::NodeProto* add_node = eligible_adds[static_cast<size_t>(idx)];
+      const auto& results = edge_results[static_cast<size_t>(idx)];
+      for (int oi = 0; oi < add_node->input_size(); ++oi) {
+        const std::string& operand = add_node->input(oi);
+        const ConvBackwardEdge& edge = results[static_cast<size_t>(oi)];
+        mark_backbone(operand, add_node);
+        for (const auto& e : edge.edges) {
+          mark_backbone(e.first, e.second);
+        }
         pass_through.insert(pass_through.end(), edge.pass_through.begin(),
                             edge.pass_through.end());
         unary_ops.insert(unary_ops.end(), edge.unary_ops.begin(),
@@ -1089,6 +1336,20 @@ std::vector<Chain> FindConvResidualChains(onnx::GraphProto* graph) {
       continue;  // Branches disagree on channel count -- decline.
     }
     const int64_t n_channels = *n_channels_set.begin();
+
+    // Every leaf producer's own `group` (1 for an ordinary Conv, > 1 for a
+    // general grouped one) must agree with every other non-1 value in the
+    // group -- mirrors _find_conv_chains's own "both sides grouped with a
+    // different group count" decline.
+    std::unordered_set<int64_t> producer_groups;
+    for (const auto& p : leaf_producers) {
+      if (p.group > 1) {
+        producer_groups.insert(p.group);
+      }
+    }
+    if (producer_groups.size() > 1) {
+      continue;  // Producers disagree on group count -- decline.
+    }
 
     bool dw_mismatch = false;
     for (const auto& hop : pass_through) {
@@ -1124,20 +1385,40 @@ std::vector<Chain> FindConvResidualChains(onnx::GraphProto* graph) {
       continue;  // The same producer named twice.
     }
 
+    // The sink's own output is never `visited` by any member's own backward
+    // walk, so it needs adding explicitly, with no accounted-for consumer of
+    // its own yet.
     const std::string& sink_out = sink_add->output(0);
-    if (!is_internal(sink_out)) {
-      continue;
+    if (!accounted.count(sink_out)) {
+      backbone_tensors.push_back(sink_out);
+      accounted[sink_out];
     }
 
-    auto [consumer, fwd_chain_ops, fwd_pass_through] =
-        WalkToConvConsumer(sink_out, init_map, consumers_of, graph_outputs,
-                           n_channels, kMaxChainHops);
-    if (!consumer) {
+    auto branches_opt =
+        ResolveConvFanoutBranches(backbone_tensors, accounted, init_map,
+                                  consumers_of, graph_outputs, n_channels);
+    if (!branches_opt || branches_opt->empty()) {
       continue;
     }
-    if (consumer->group != 1) {
-      continue;
+    std::vector<ConsumerBranch>& branches = *branches_opt;
+
+    // Completes the group-count agreement check started above: every
+    // branch's own consumer_group (primary and extra alike) must also agree
+    // with `producer_groups`.
+    std::unordered_set<int64_t> all_groups = producer_groups;
+    for (const auto& b : branches) {
+      if (b.consumer_group > 1) {
+        all_groups.insert(b.consumer_group);
+      }
     }
+    if (all_groups.size() > 1) {
+      continue;  // Producer(s) and/or branch(es) disagree on group count.
+    }
+
+    ConsumerBranch primary = std::move(branches.front());
+    std::vector<ConsumerBranch> extra_branches(
+        std::make_move_iterator(branches.begin() + 1),
+        std::make_move_iterator(branches.end()));
 
     std::vector<ChainOp> chain_ops;
     for (auto* op : unary_ops) {
@@ -1147,21 +1428,23 @@ std::vector<Chain> FindConvResidualChains(onnx::GraphProto* graph) {
       chain_ops.push_back(
           ChainOp{eligible_adds[static_cast<size_t>(idx)], std::nullopt});
     }
-    for (auto& co : fwd_chain_ops) {
+    for (auto& co : primary.chain_ops) {
       chain_ops.push_back(std::move(co));
     }
 
     Chain chain;
     chain.producers = std::move(leaf_producers);
     chain.chain_ops = std::move(chain_ops);
-    chain.consumer_node = consumer->node;
-    chain.consumer_weight = consumer->weight;
+    chain.consumer_node = primary.consumer_node;
+    chain.consumer_weight = primary.consumer_weight;
     chain.consumer_weight_transposed = false;
     chain.n_channels = n_channels;
     chain.consumer_is_conv = true;
-    pass_through.insert(pass_through.end(), fwd_pass_through.begin(),
-                        fwd_pass_through.end());
+    chain.extra_consumers = std::move(extra_branches);
+    pass_through.insert(pass_through.end(), primary.conv_pass_through.begin(),
+                        primary.conv_pass_through.end());
     chain.conv_pass_through = std::move(pass_through);
+    chain.consumer_group = primary.consumer_group;
     chains.push_back(std::move(chain));
   }
   return chains;
@@ -1179,8 +1462,6 @@ std::vector<Chain> FindConvResidualChains(onnx::GraphProto* graph) {
 // same node, folded into the resolved chain's own chain_ops as extra
 // (node, const_name) entries -- ApplyChains's existing per-hop constant
 // slicing picks them up with no changes of its own.
-
-constexpr char kComMicrosoftDomain[] = "com.microsoft";
 
 bool IsSkipLayerNormOp(const onnx::NodeProto& node) {
   return node.domain() == kComMicrosoftDomain &&
@@ -1315,24 +1596,42 @@ std::optional<ResidualMergeMatch> MatchResidualMerge(
 }
 
 // The backward counterpart of WalkToConsumer, used only by
-// FindMatmulResidualChains.
+// FindMatmulResidualChains/FindMatmulConcatChains.
 struct MatMulBackwardEdge {
   BackwardEdgeKind kind = BackwardEdgeKind::kFail;
-  Producer producer;
+  Producer producer;    // kProducer, or the gate/first producer for kGated.
+  Producer producer_b;  // The up/second producer, kGated only.
   int64_t n_channels = 0;
   onnx::NodeProto* add_node = nullptr;
   std::vector<ChainOp> chain_ops;  // Forward order.
+  // Mirrors ConvBackwardEdge's own `edges` exactly -- see its docstring. A
+  // gated Mul/SwiGLU's own two operands are deliberately not added here --
+  // see pruning.py's own _walk_matmul_producer_backward docstring for why
+  // there's no extra fan-out to track on that shape.
+  std::vector<std::pair<std::string, onnx::NodeProto*>> edges;
 };
 
+// Walks backward from tensor `start` -- the MatMul/Gemm analogue of
+// WalkConvProducerBackward, mirroring pruning.py's own current
+// _walk_matmul_producer_backward. `producer_infos`, when given, is
+// FindGatedChains's own producer-lookup map (raw producer output -> match
+// info), needed to resolve a gated Mul hop via TraceGateProducerBackward and
+// a native fused SwiGLU hop via a direct lookup of its own two raw
+// operands; left nullptr, neither is ever resolved as a gated pair, and
+// both simply fall through to kFail, exactly as before this parameter
+// existed.
 MatMulBackwardEdge WalkMatmulProducerBackward(
     const std::string& start,
     const std::unordered_map<std::string, onnx::NodeProto*>& node_by_output,
     const InitMap& init_map, const ConsumerMap& consumers_of,
-    const std::unordered_set<std::string>& graph_outputs, int max_hops) {
+    const std::unordered_set<std::string>& graph_outputs, int max_hops,
+    const std::unordered_map<std::string, FullProducerMatch>* producer_infos =
+        nullptr) {
   std::vector<ChainOp> chain_ops;  // Backward order.
+  std::vector<std::pair<std::string, onnx::NodeProto*>> edges;
   std::string cur = start;
   for (int hop = 0; hop < max_hops; ++hop) {
-    if (ConsumerCount(consumers_of, cur) != 1 || graph_outputs.count(cur)) {
+    if (graph_outputs.count(cur)) {
       return MatMulBackwardEdge{};
     }
     auto nit = node_by_output.find(cur);
@@ -1355,12 +1654,14 @@ MatMulBackwardEdge WalkMatmulProducerBackward(
       edge.n_channels = prod_info->n_channels;
       std::reverse(chain_ops.begin(), chain_ops.end());
       edge.chain_ops = std::move(chain_ops);
+      edge.edges = std::move(edges);
       return edge;
     }
 
     if (UnaryPassThroughOps().count(node->op_type()) != 0 &&
         node->input_size() == 1) {
       chain_ops.push_back(ChainOp{node, std::nullopt});
+      edges.push_back({node->input(0), node});
       cur = node->input(0);
       continue;
     }
@@ -1384,16 +1685,94 @@ MatMulBackwardEdge WalkMatmulProducerBackward(
                            prod == c->dims(c->dims_size() - 1);
         if (valid) {
           chain_ops.push_back(ChainOp{node, const_name});
+          edges.push_back({other, node});
           cur = other;
           continue;
         }
         return MatMulBackwardEdge{};
       }
       // Both operands constant (degenerate) or both non-constant: for `Add`
-      // the latter is exactly IsEligibleAddMerge's own shape, handled
-      // below; for `Mul` it's a gated (SwiGLU/GeGLU) combine point this
-      // walk doesn't try to pick a branch through -- either way, falling
-      // through to the merge check or "fail" is correct.
+      // the latter is exactly IsEligibleAddMerge's own shape, handled by
+      // the merge check below. For `Mul` it's a gated (SwiGLU/GeGLU)
+      // combine point -- resolved by walking *both* non-constant operands
+      // back to their own real producers, reusing FindGatedChains's own
+      // gate-branch tracer unchanged.
+      if (producer_infos != nullptr && node->op_type() == "Mul" && !a_const &&
+          !b_const && a_name != b_name) {
+        auto trace_a =
+            TraceGateProducerBackward(a_name, node_by_output, *producer_infos,
+                                      consumers_of, graph_outputs, max_hops);
+        auto trace_b =
+            TraceGateProducerBackward(b_name, node_by_output, *producer_infos,
+                                      consumers_of, graph_outputs, max_hops);
+        if (trace_a && trace_b) {
+          const FullProducerMatch& info_a = trace_a->first;
+          const FullProducerMatch& info_b = trace_b->first;
+          if (info_a.node != info_b.node &&
+              info_a.n_channels == info_b.n_channels) {
+            MatMulBackwardEdge edge;
+            edge.kind = BackwardEdgeKind::kGated;
+            edge.producer = Producer{
+                info_a.node,    info_a.weight, info_a.weight_transposed,
+                info_a.bias,    false,         1,
+                trace_a->second};
+            edge.producer_b = Producer{
+                info_b.node,    info_b.weight, info_b.weight_transposed,
+                info_b.bias,    false,         1,
+                trace_b->second};
+            edge.n_channels = info_a.n_channels;
+            edge.edges = std::move(edges);
+            return edge;
+          }
+        }
+      }
+      // Not a resolvable gated pair either -- falls through to the merge
+      // check (Add only) or SwiGLU/BiasGelu-FastGelu checks below.
+    }
+
+    if (producer_infos != nullptr && node->op_type() == "SwiGLU" &&
+        node->input_size() == 2 && node->output_size() == 1) {
+      const std::string& a_name = node->input(0);
+      const std::string& b_name = node->input(1);
+      if (!init_map.count(a_name) && !init_map.count(b_name)) {
+        auto ait = producer_infos->find(a_name);
+        auto bit = producer_infos->find(b_name);
+        if (ait != producer_infos->end() && bit != producer_infos->end() &&
+            ConsumerCount(consumers_of, a_name) == 1 &&
+            !graph_outputs.count(a_name) &&
+            ConsumerCount(consumers_of, b_name) == 1 &&
+            !graph_outputs.count(b_name)) {
+          const FullProducerMatch& info_a = ait->second;
+          const FullProducerMatch& info_b = bit->second;
+          if (info_a.node != info_b.node &&
+              info_a.n_channels == info_b.n_channels) {
+            MatMulBackwardEdge edge;
+            edge.kind = BackwardEdgeKind::kGated;
+            edge.producer =
+                Producer{info_a.node, info_a.weight, info_a.weight_transposed,
+                         info_a.bias, false,         1};
+            edge.producer_b =
+                Producer{info_b.node, info_b.weight, info_b.weight_transposed,
+                         info_b.bias, false,         1};
+            edge.n_channels = info_a.n_channels;
+            edge.edges = std::move(edges);
+            return edge;
+          }
+        }
+      }
+      // Not a resolvable gated pair -- SwiGLU is never an eligible merge
+      // node either, so this falls through to kFail below.
+    }
+
+    if (node->op_type() == "BiasGelu" || node->op_type() == "FastGelu") {
+      auto fused = MatchFusedBiasGelu(*node, init_map);
+      if (fused) {
+        chain_ops.push_back(ChainOp{node, fused->bias_name});
+        edges.push_back({fused->data_name, node});
+        cur = fused->data_name;
+        continue;
+      }
+      return MatMulBackwardEdge{};
     }
 
     if (MatchResidualMerge(node, init_map, consumers_of, graph_outputs)) {
@@ -1402,12 +1781,65 @@ MatMulBackwardEdge WalkMatmulProducerBackward(
       edge.add_node = node;
       std::reverse(chain_ops.begin(), chain_ops.end());
       edge.chain_ops = std::move(chain_ops);
+      edge.edges = std::move(edges);
       return edge;
     }
 
     return MatMulBackwardEdge{};
   }
   return MatMulBackwardEdge{};
+}
+
+// The MatMul/Gemm analogue of ResolveConvFanoutBranches -- see its own
+// docstring for the shared reasoning this mirrors exactly (only the forward
+// walker differs: WalkToConsumer instead of WalkToConvConsumer), and there
+// is no Conv-style grouped-consumer or depthwise-pass-through concept to
+// check or carry for a MatMul/Gemm branch at all.
+std::optional<std::vector<ConsumerBranch>> ResolveMatmulFanoutBranches(
+    const std::vector<std::string>& backbone_tensors,
+    const std::unordered_map<std::string, std::unordered_set<onnx::NodeProto*>>&
+        accounted,
+    const InitMap& init_map, const ConsumerMap& consumers_of,
+    const std::unordered_set<std::string>& graph_outputs, int64_t n_channels) {
+  std::vector<ConsumerBranch> branches;
+  std::unordered_set<std::string> seen_weights;
+  for (const auto& tensor : backbone_tensors) {
+    if (graph_outputs.count(tensor)) {
+      return std::nullopt;
+    }
+    auto cit = consumers_of.find(tensor);
+    if (cit == consumers_of.end()) {
+      continue;
+    }
+    auto acc_it = accounted.find(tensor);
+    std::unordered_set<onnx::NodeProto*> seen_nodes;
+    for (onnx::NodeProto* consumer_node : cit->second) {
+      if (!seen_nodes.insert(consumer_node).second) {
+        continue;
+      }
+      if (acc_it != accounted.end() && acc_it->second.count(consumer_node)) {
+        continue;
+      }
+      auto [resolved, br_chain_ops] =
+          WalkToConsumer(tensor, init_map, consumers_of, graph_outputs,
+                         n_channels, kMaxChainHops, consumer_node);
+      if (!resolved) {
+        return std::nullopt;
+      }
+      if (seen_weights.count(resolved->weight)) {
+        return std::nullopt;
+      }
+      seen_weights.insert(resolved->weight);
+      ConsumerBranch branch;
+      branch.chain_ops = std::move(br_chain_ops);
+      branch.consumer_node = resolved->node;
+      branch.consumer_weight = resolved->weight;
+      branch.consumer_weight_transposed = resolved->weight_transposed;
+      branch.consumer_is_conv = false;
+      branches.push_back(std::move(branch));
+    }
+  }
+  return branches;
 }
 
 // Finds MatMul/Gemm residual/skip-connection groups -- the MatMul/Gemm
@@ -1428,14 +1860,25 @@ std::vector<Chain> FindMatmulResidualChains(onnx::GraphProto* graph) {
   for (const auto& o : graph->output()) {
     graph_outputs.insert(o.name());
   }
-  auto is_internal = [&](const std::string& name) {
-    return ConsumerCount(consumers_of, name) == 1 && !graph_outputs.count(name);
-  };
   std::unordered_map<std::string, onnx::NodeProto*> node_by_output;
   for (int i = 0; i < graph->node_size(); ++i) {
     onnx::NodeProto* node = graph->mutable_node(i);
     for (const auto& out : node->output()) {
       node_by_output[out] = node;
+    }
+  }
+
+  // FindGatedChains's own producer-lookup map, built once here and threaded
+  // through every WalkMatmulProducerBackward call below -- needed only to
+  // resolve a gated Mul/SwiGLU hop.
+  std::unordered_map<std::string, FullProducerMatch> producer_infos;
+  for (int i = 0; i < graph->node_size(); ++i) {
+    onnx::NodeProto* node = graph->mutable_node(i);
+    auto info = MatchProducer(*node, init_map);
+    if (info) {
+      producer_infos[node->output(0)] =
+          FullProducerMatch{node, info->weight, info->weight_transposed,
+                            info->bias, info->n_channels};
     }
   }
 
@@ -1488,7 +1931,7 @@ std::vector<Chain> FindMatmulResidualChains(onnx::GraphProto* graph) {
          {merges[idx].input_name, merges[idx].skip_name}) {
       MatMulBackwardEdge edge = WalkMatmulProducerBackward(
           operand, node_by_output, init_map, consumers_of, graph_outputs,
-          kMaxChainHops);
+          kMaxChainHops, &producer_infos);
       if (edge.kind == BackwardEdgeKind::kFail) {
         poisoned.insert(static_cast<int>(idx));
       } else if (edge.kind == BackwardEdgeKind::kAdd) {
@@ -1528,16 +1971,39 @@ std::vector<Chain> FindMatmulResidualChains(onnx::GraphProto* graph) {
     std::unordered_set<int64_t> n_channels_set;
     std::vector<ChainOp> pre_chain_ops;
     std::unordered_set<int> referenced;
+    std::vector<std::string> backbone_tensors;
+    std::unordered_map<std::string, std::unordered_set<onnx::NodeProto*>>
+        accounted;
+    auto mark_backbone = [&](const std::string& tensor, onnx::NodeProto* node) {
+      if (!accounted.count(tensor)) {
+        backbone_tensors.push_back(tensor);
+      }
+      accounted[tensor].insert(node);
+    };
 
     for (int idx : members) {
+      onnx::NodeProto* merge_node = merges[static_cast<size_t>(idx)].node;
       pre_chain_ops.insert(pre_chain_ops.end(),
                            merges[static_cast<size_t>(idx)].extra_ops.begin(),
                            merges[static_cast<size_t>(idx)].extra_ops.end());
-      for (auto& edge : edge_results[static_cast<size_t>(idx)]) {
+      const std::string operands[2] = {
+          merges[static_cast<size_t>(idx)].input_name,
+          merges[static_cast<size_t>(idx)].skip_name};
+      const auto& results = edge_results[static_cast<size_t>(idx)];
+      for (size_t oi = 0; oi < 2; ++oi) {
+        const MatMulBackwardEdge& edge = results[oi];
+        mark_backbone(operands[oi], merge_node);
+        for (const auto& e : edge.edges) {
+          mark_backbone(e.first, e.second);
+        }
         pre_chain_ops.insert(pre_chain_ops.end(), edge.chain_ops.begin(),
                              edge.chain_ops.end());
         if (edge.kind == BackwardEdgeKind::kProducer) {
           leaf_producers.push_back(edge.producer);
+          n_channels_set.insert(edge.n_channels);
+        } else if (edge.kind == BackwardEdgeKind::kGated) {
+          leaf_producers.push_back(edge.producer);
+          leaf_producers.push_back(edge.producer_b);
           n_channels_set.insert(edge.n_channels);
         } else if (edge.kind == BackwardEdgeKind::kAdd) {
           referenced.insert(merge_index[edge.add_node]);
@@ -1588,41 +2054,51 @@ std::vector<Chain> FindMatmulResidualChains(onnx::GraphProto* graph) {
     }
 
     const std::string& sink_out = sink_node->output(0);
-    if (!is_internal(sink_out)) {
-      continue;
+    if (!accounted.count(sink_out)) {
+      backbone_tensors.push_back(sink_out);
+      accounted[sink_out];
     }
 
-    auto [consumer, fwd_chain_ops] =
-        WalkToConsumer(sink_out, init_map, consumers_of, graph_outputs,
-                       n_channels, kMaxChainHops);
-    if (!consumer) {
+    auto branches_opt =
+        ResolveMatmulFanoutBranches(backbone_tensors, accounted, init_map,
+                                    consumers_of, graph_outputs, n_channels);
+    if (!branches_opt || branches_opt->empty()) {
       continue;
     }
+    std::vector<ConsumerBranch>& branches = *branches_opt;
+
+    ConsumerBranch primary = std::move(branches.front());
+    std::vector<ConsumerBranch> extra_branches(
+        std::make_move_iterator(branches.begin() + 1),
+        std::make_move_iterator(branches.end()));
 
     std::vector<ChainOp> chain_ops = std::move(pre_chain_ops);
     for (int idx : members) {
       chain_ops.push_back(
           ChainOp{merges[static_cast<size_t>(idx)].node, std::nullopt});
     }
-    for (auto& co : fwd_chain_ops) {
+    for (auto& co : primary.chain_ops) {
       chain_ops.push_back(std::move(co));
     }
 
     Chain chain;
     chain.producers = std::move(leaf_producers);
     chain.chain_ops = std::move(chain_ops);
-    chain.consumer_node = consumer->node;
-    chain.consumer_weight = consumer->weight;
-    chain.consumer_weight_transposed = consumer->weight_transposed;
+    chain.consumer_node = primary.consumer_node;
+    chain.consumer_weight = primary.consumer_weight;
+    chain.consumer_weight_transposed = primary.consumer_weight_transposed;
     chain.n_channels = n_channels;
+    chain.extra_consumers = std::move(extra_branches);
     chains.push_back(std::move(chain));
   }
   return chains;
 }
 
 int64_t ChainGroup(const Chain& chain) {
-  if (chain.producers.size() == 1 && chain.producers[0].group > 1) {
-    return chain.producers[0].group;
+  for (const auto& p : chain.producers) {
+    if (p.group > 1) {
+      return p.group;
+    }
   }
   return chain.consumer_group;
 }
@@ -1802,16 +2278,35 @@ std::vector<float> TransposeFlat(const std::vector<float>& data, int64_t dim0,
 
 // --- Shared apply body, mirroring _apply_chains -----------------------------
 
+// Every touched initializer role and stale value_info name, shared by a
+// single ApplyChains call *and* any sibling ApplyConcatChains call over the
+// same graph -- mirrors pruning.py's own _TouchedState exactly, so the two
+// can never doubly resize the same weight. The caller flushes value_info
+// once, from `stale_value_info`, after every such call.
+struct TouchedState {
+  std::unordered_set<std::string> producer;
+  std::unordered_set<std::string> consumer;
+  std::unordered_set<std::string> const_names;
+  std::unordered_set<std::string> conv_hop;
+  std::unordered_set<std::string> stale_value_info;
+};
+
 void ApplyChains(onnx::GraphProto* graph, std::vector<Chain>& chains,
-                 double sparsity) {
+                 double sparsity, TouchedState& touched) {
   std::unordered_map<std::string, onnx::TensorProto*> init_map;
   for (int i = 0; i < graph->initializer_size(); ++i) {
     onnx::TensorProto* t = graph->mutable_initializer(i);
     init_map[t->name()] = t;
   }
 
-  std::unordered_set<std::string> producer_touched, consumer_touched,
-      const_touched, conv_hop_touched, stale_value_info;
+  // A weight legitimately plays both roles across two different chains --
+  // tracked separately per role; bias/scale constants only ever play one
+  // role, so a single shared set is enough for those.
+  std::unordered_set<std::string>& producer_touched = touched.producer;
+  std::unordered_set<std::string>& consumer_touched = touched.consumer;
+  std::unordered_set<std::string>& const_touched = touched.const_names;
+  std::unordered_set<std::string>& conv_hop_touched = touched.conv_hop;
+  std::unordered_set<std::string>& stale_value_info = touched.stale_value_info;
 
   for (auto& chain : chains) {
     std::unordered_set<std::string> producer_weights;
@@ -1825,6 +2320,30 @@ void ApplyChains(onnx::GraphProto* graph, std::vector<Chain>& chains,
     if (degenerate) {
       continue;
     }
+
+    // Every consumer branch this chain touches -- just the one primary
+    // consumer_* for every chain kind except a residual/merge group with
+    // extra fan-out (see Chain::extra_consumers), where there are one or
+    // more additional independent branches beyond it. Conflict-checked,
+    // touched, and sliced exactly like the single consumer every other
+    // chain already has -- each branch is its own axis of its own weight,
+    // fed by the exact same shared `keep` this loop computes once, below.
+    std::vector<const ConsumerBranch*> extra_ptrs;
+    extra_ptrs.reserve(chain.extra_consumers.size());
+    for (const auto& b : chain.extra_consumers) {
+      extra_ptrs.push_back(&b);
+    }
+
+    std::unordered_set<std::string> consumer_weights{chain.consumer_weight};
+    size_t n_branches = 1;
+    for (const auto* b : extra_ptrs) {
+      consumer_weights.insert(b->consumer_weight);
+      ++n_branches;
+    }
+    if (consumer_weights.size() != n_branches) {
+      continue;  // Degenerate -- two branches naming the same weight.
+    }
+
     std::unordered_set<std::string> conv_hop_weights;
     for (const auto& h : chain.conv_pass_through) {
       if (!conv_hop_weights.insert(h.weight).second) {
@@ -1832,8 +2351,23 @@ void ApplyChains(onnx::GraphProto* graph, std::vector<Chain>& chains,
         break;
       }
     }
-    if (degenerate) {
-      continue;
+    size_t n_conv_hops = chain.conv_pass_through.size();
+    if (!degenerate) {
+      for (const auto* b : extra_ptrs) {
+        for (const auto& h : b->conv_pass_through) {
+          if (!conv_hop_weights.insert(h.weight).second) {
+            degenerate = true;
+            break;
+          }
+        }
+        n_conv_hops += b->conv_pass_through.size();
+        if (degenerate) {
+          break;
+        }
+      }
+    }
+    if (degenerate || conv_hop_weights.size() != n_conv_hops) {
+      continue;  // Degenerate -- the same depthwise weight named twice.
     }
 
     std::unordered_set<std::string> consts;
@@ -1847,8 +2381,20 @@ void ApplyChains(onnx::GraphProto* graph, std::vector<Chain>& chains,
         consts.insert(*co.const_name);
       }
     }
+    for (const auto* b : extra_ptrs) {
+      for (const auto& co : b->chain_ops) {
+        if (co.const_name) {
+          consts.insert(*co.const_name);
+        }
+      }
+    }
 
-    bool conflict = consumer_touched.count(chain.consumer_weight) != 0;
+    bool conflict = false;
+    for (const auto& w : consumer_weights) {
+      if (consumer_touched.count(w)) {
+        conflict = true;
+      }
+    }
     for (const auto& w : producer_weights) {
       if (producer_touched.count(w)) {
         conflict = true;
@@ -1957,11 +2503,43 @@ void ApplyChains(onnx::GraphProto* graph, std::vector<Chain>& chains,
                           chain.consumer_weight_transposed, keep,
                           chain.consumer_is_conv);
     }
+    // Extra fan-out branches: each is either an ordinary (group == 1)
+    // consumer, or, for a Conv residual/merge chain, a general grouped Conv
+    // consumer whose own group was already confirmed (in
+    // FindConvResidualChains) to agree with `group` above --
+    // ResolveMatmulFanoutBranches never resolves a grouped one, so
+    // consumer_group stays at its default 1 there. Either way, fed by the
+    // exact same `keep` just computed for the group's shared producers
+    // above.
+    for (const auto* b : extra_ptrs) {
+      for (const auto& co : b->chain_ops) {
+        if (co.const_name) {
+          SliceLastAxis(init_map.at(*co.const_name), keep);
+        }
+      }
+      for (const auto& hop : b->conv_pass_through) {
+        SliceProducerWeight(init_map.at(hop.weight), false, keep, true);
+        if (hop.bias) {
+          SliceLastAxis(init_map.at(*hop.bias), keep);
+        }
+        SetOrAddIntAttr(hop.node, "group", static_cast<int64_t>(keep.size()));
+      }
+      if (b->consumer_is_conv && b->consumer_group > 1) {
+        SliceGroupedConsumerConvWeight(init_map.at(b->consumer_weight), keep,
+                                       b->consumer_group, n);
+      } else {
+        SliceConsumerWeight(init_map.at(b->consumer_weight),
+                            b->consumer_weight_transposed, keep,
+                            b->consumer_is_conv);
+      }
+    }
 
     for (const auto& w : producer_weights) {
       producer_touched.insert(w);
     }
-    consumer_touched.insert(chain.consumer_weight);
+    for (const auto& w : consumer_weights) {
+      consumer_touched.insert(w);
+    }
     for (const auto& c : consts) {
       const_touched.insert(c);
     }
@@ -1980,16 +2558,14 @@ void ApplyChains(onnx::GraphProto* graph, std::vector<Chain>& chains,
     for (const auto& hop : chain.conv_pass_through) {
       stale_value_info.insert(hop.node->output(0));
     }
-  }
-
-  if (!stale_value_info.empty()) {
-    google::protobuf::RepeatedPtrField<onnx::ValueInfoProto> kept;
-    for (const auto& vi : graph->value_info()) {
-      if (!stale_value_info.count(vi.name())) {
-        *kept.Add() = vi;
+    for (const auto* b : extra_ptrs) {
+      for (const auto& co : b->chain_ops) {
+        stale_value_info.insert(co.node->output(0));
+      }
+      for (const auto& hop : b->conv_pass_through) {
+        stale_value_info.insert(hop.node->output(0));
       }
     }
-    graph->mutable_value_info()->Swap(&kept);
   }
 }
 
@@ -2789,6 +3365,937 @@ void ApplyAttentionChains(onnx::GraphProto* graph,
   }
 }
 
+// --- Concat-merged (skip-connection) chains, mirroring pruning.py's own
+// section of the same name -- see that section's own comment for the full
+// reasoning: unlike Add, whose operands must agree on one shared surviving
+// channel-index set, Concat's branches are structurally independent (each
+// owns a fixed, disjoint offset range of the merged, pre-pruning tensor),
+// so each branch can be ranked and pruned entirely on its own; only the
+// shared downstream consumer's weight needs new slicing, at each branch's
+// own fixed offset. Reuses the exact same backward walkers
+// (WalkMatmulProducerBackward/WalkConvProducerBackward) the two residual
+// sections above already built, including their fan-out resolution
+// machinery.
+
+std::optional<int64_t> ConcatAxis(const onnx::NodeProto& node) {
+  for (const auto& attr : node.attribute()) {
+    if (attr.name() == "axis") {
+      return attr.i();
+    }
+  }
+  return std::nullopt;  // Required attribute on Concat's own schema.
+}
+
+std::unordered_map<std::string, const onnx::ValueInfoProto*> ValueInfoByName(
+    const onnx::GraphProto& graph) {
+  std::unordered_map<std::string, const onnx::ValueInfoProto*> by_name;
+  for (const auto& vi : graph.input()) {
+    by_name[vi.name()] = &vi;
+  }
+  for (const auto& vi : graph.output()) {
+    by_name[vi.name()] = &vi;
+  }
+  for (const auto& vi : graph.value_info()) {
+    by_name[vi.name()] = &vi;
+  }
+  return by_name;
+}
+
+std::optional<int64_t> TensorRank(
+    const std::string& name,
+    const std::unordered_map<std::string, const onnx::ValueInfoProto*>&
+        value_info_by_name) {
+  auto it = value_info_by_name.find(name);
+  if (it == value_info_by_name.end() || !it->second->type().has_tensor_type()) {
+    return std::nullopt;
+  }
+  const auto& tensor_type = it->second->type().tensor_type();
+  if (!tensor_type.has_shape()) {
+    return std::nullopt;  // ONNX's own "rank not statically known" spelling.
+  }
+  return static_cast<int64_t>(tensor_type.shape().dim_size());
+}
+
+// True if `node`'s own `axis` attribute is confirmed to select the last
+// axis of its operands -- `axis == -1` outright, or a positive `axis` only
+// when at least one operand's rank is known and every operand with a known
+// rank agrees `axis == rank - 1`. Mirrors pruning.py's own
+// _concat_axis_is_last -- declined rather than guessed at otherwise.
+bool ConcatAxisIsLast(
+    const onnx::NodeProto& node,
+    const std::unordered_map<std::string, const onnx::ValueInfoProto*>&
+        value_info_by_name) {
+  auto axis = ConcatAxis(node);
+  if (!axis) {
+    return false;
+  }
+  if (*axis < 0) {
+    return *axis == -1;
+  }
+  std::optional<int64_t> known_rank;
+  for (const auto& operand : node.input()) {
+    auto rank = TensorRank(operand, value_info_by_name);
+    if (!rank) {
+      continue;
+    }
+    if (!known_rank) {
+      known_rank = rank;
+    } else if (*rank != *known_rank) {
+      return false;  // Operands disagree -- decline rather than guess.
+    }
+  }
+  if (!known_rank) {
+    return false;  // No operand's rank is known -- decline rather than guess.
+  }
+  return *axis == *known_rank - 1;
+}
+
+// One resolved operand of a matched Concat merge group -- mirrors
+// pruning.py's own _ConcatBranch. Unlike an Add/SkipLayerNormalization
+// residual merge's operands (Chain::producers, all pruned to one *shared*
+// keep index set), every ConcatBranch in a ConcatChain is pruned to its own
+// *independent* keep set.
+struct ConcatBranch {
+  // One producer for a plain branch; more than one when this branch
+  // instead resolves through a composed residual/merge group or a gated
+  // (SwiGLU/GeGLU) combine -- see this section's own comment on the "add"/
+  // "gated" outcomes.
+  std::vector<Producer> producers;
+  // Ops between the producer's own raw output (or, for a composed group,
+  // the group's own internal wiring) and this branch's own Concat operand.
+  std::vector<ChainOp> pre_ops;
+  // Depthwise Conv pass-through hops crossed on this branch (Conv branches
+  // only; always empty for a MatMul/Gemm branch).
+  std::vector<ConvPassThrough> conv_pass_through;
+  int64_t n_channels = 0;
+  // This branch's fixed offset into the merged (pre-pruning) channel
+  // range, in Concat operand order.
+  int64_t offset = 0;
+  // The tensor name actually feeding the Concat node at this operand
+  // position -- the same probe point apply_structured_wanda_pruning's own
+  // Concat-branch activation capture would use, though that calibrated
+  // variant is out of this port's scope.
+  std::string operand_name;
+};
+
+struct ConcatChain {
+  std::vector<ConcatBranch> branches;
+  onnx::NodeProto* concat_node = nullptr;
+  // Ops between the Concat node's own output and the real consumer.
+  std::vector<ChainOp> chain_ops;
+  onnx::NodeProto* consumer_node = nullptr;
+  std::string consumer_weight;
+  bool consumer_weight_transposed = false;
+  bool consumer_is_conv = false;
+  int64_t n_channels = 0;  // Sum of every branch's own n_channels.
+  // Depthwise Conv hops crossed between the Concat node and the real
+  // consumer (Conv chains only).
+  std::vector<ConvPassThrough> conv_pass_through;
+};
+
+// True if any tensor a Concat branch's own backward walk crossed -- `start`
+// (the branch operand) through the real producer's own output -- has more
+// than the one in-group forward consumer the walk itself already accounts
+// for. Mirrors pruning.py's own _branch_walk_has_fanout: the backward
+// walkers no longer reject a multi-consumer tensor mid-walk themselves
+// (that relaxation exists for the residual/fan-out case, resolved
+// explicitly afterwards), but a Concat branch has no such resolution -- a
+// branch that fans out to another consumer is declined outright.
+bool BranchWalkHasFanout(
+    const std::string& start,
+    const std::vector<std::pair<std::string, onnx::NodeProto*>>& edges,
+    const ConsumerMap& consumers_of, onnx::NodeProto* forward_node) {
+  onnx::NodeProto* prev_consumer = forward_node;
+  std::string cur = start;
+  for (const auto& e : edges) {
+    auto cit = consumers_of.find(cur);
+    if (cit == consumers_of.end() || cit->second.size() != 1 ||
+        cit->second[0] != prev_consumer) {
+      return true;
+    }
+    prev_consumer = e.second;
+    cur = e.first;
+  }
+  auto cit = consumers_of.find(cur);
+  return cit == consumers_of.end() || cit->second.size() != 1 ||
+         cit->second[0] != prev_consumer;
+}
+
+struct ResolvedMatmulResidualGroup {
+  std::vector<Producer> leaf_producers;
+  std::vector<ChainOp> pre_chain_ops;
+  int64_t n_channels = 0;
+  std::vector<std::string> backbone_tensors;
+  std::unordered_map<std::string, std::unordered_set<onnx::NodeProto*>>
+      accounted;
+};
+
+// Resolves `root` (an Add/SkipLayerNormalization merge a Concat branch's
+// own backward walk bottomed out at -- a kAdd outcome from
+// WalkMatmulProducerBackward) and its whole transitively-connected
+// residual/merge group, mirroring FindMatmulResidualChains's own per-group
+// union-find loop exactly (same per-member operand resolution, same "any
+// operand fails, the whole group declines" bar, same post-hoc bias/scale-
+// constant re-validation) but scoped to just `root`'s own component --
+// reached by a plain worklist walk outward from `root` rather than a
+// global union-find, since `root` is already known to be the group's own
+// sink. Mirrors pruning.py's own
+// _resolve_matmul_residual_group_for_concat.
+std::optional<ResolvedMatmulResidualGroup> ResolveMatmulResidualGroupForConcat(
+    onnx::NodeProto* root,
+    const std::unordered_map<std::string, onnx::NodeProto*>& node_by_output,
+    const InitMap& init_map, const ConsumerMap& consumers_of,
+    const std::unordered_set<std::string>& graph_outputs) {
+  std::vector<onnx::NodeProto*> visited{root};
+  std::unordered_set<onnx::NodeProto*> visited_ids{root};
+  std::unordered_set<onnx::NodeProto*> referenced;
+  std::vector<Producer> leaf_producers;
+  std::unordered_set<int64_t> n_channels_set;
+  std::vector<ChainOp> pre_chain_ops;
+  std::vector<std::string> backbone_tensors;
+  std::unordered_map<std::string, std::unordered_set<onnx::NodeProto*>>
+      accounted;
+  auto mark_backbone = [&](const std::string& tensor, onnx::NodeProto* node) {
+    if (!accounted.count(tensor)) {
+      backbone_tensors.push_back(tensor);
+    }
+    accounted[tensor].insert(node);
+  };
+
+  for (size_t i = 0; i < visited.size(); ++i) {
+    onnx::NodeProto* merge_node = visited[i];
+    auto match =
+        MatchResidualMerge(merge_node, init_map, consumers_of, graph_outputs);
+    if (!match) {
+      return std::nullopt;  // Defensive -- every member was matched already.
+    }
+    pre_chain_ops.insert(pre_chain_ops.end(), match->extra_ops.begin(),
+                         match->extra_ops.end());
+    const std::string operands[2] = {match->input_name, match->skip_name};
+    for (const auto& operand : operands) {
+      mark_backbone(operand, merge_node);
+      MatMulBackwardEdge edge = WalkMatmulProducerBackward(
+          operand, node_by_output, init_map, consumers_of, graph_outputs,
+          kMaxChainHops);
+      for (const auto& e : edge.edges) {
+        mark_backbone(e.first, e.second);
+      }
+      pre_chain_ops.insert(pre_chain_ops.end(), edge.chain_ops.begin(),
+                           edge.chain_ops.end());
+      if (edge.kind == BackwardEdgeKind::kProducer) {
+        leaf_producers.push_back(edge.producer);
+        n_channels_set.insert(edge.n_channels);
+      } else if (edge.kind == BackwardEdgeKind::kAdd) {
+        referenced.insert(edge.add_node);
+        if (!visited_ids.count(edge.add_node)) {
+          visited_ids.insert(edge.add_node);
+          visited.push_back(edge.add_node);
+        }
+      } else {
+        return std::nullopt;  // kFail (producer_infos not passed, so kGated
+                              // is unreachable here) -- decline.
+      }
+    }
+  }
+
+  if (n_channels_set.size() != 1) {
+    return std::nullopt;  // Branches disagree on channel count -- decline.
+  }
+  const int64_t n_channels = *n_channels_set.begin();
+
+  for (const auto& co : pre_chain_ops) {
+    if (co.const_name &&
+        init_map.at(*co.const_name)
+                ->dims(init_map.at(*co.const_name)->dims_size() - 1) !=
+            n_channels) {
+      return std::nullopt;
+    }
+  }
+
+  std::vector<onnx::NodeProto*> sinks;
+  for (auto* n : visited) {
+    if (!referenced.count(n)) {
+      sinks.push_back(n);
+    }
+  }
+  if (sinks.size() != 1 || sinks[0] != root) {
+    return std::nullopt;  // Not a single linear chain rooted at root.
+  }
+
+  std::unordered_set<std::string> seen_weights;
+  for (const auto& p : leaf_producers) {
+    if (!seen_weights.insert(p.weight).second) {
+      return std::nullopt;  // Degenerate -- the same producer named twice.
+    }
+  }
+
+  return ResolvedMatmulResidualGroup{
+      std::move(leaf_producers), std::move(pre_chain_ops), n_channels,
+      std::move(backbone_tensors), std::move(accounted)};
+}
+
+struct ResolvedConvResidualGroup {
+  std::vector<Producer> leaf_producers;
+  std::vector<ConvPassThrough> pass_through;
+  std::vector<onnx::NodeProto*> unary_ops;
+  int64_t n_channels = 0;
+  std::vector<std::string> backbone_tensors;
+  std::unordered_map<std::string, std::unordered_set<onnx::NodeProto*>>
+      accounted;
+};
+
+// The Conv analogue of ResolveMatmulResidualGroupForConcat -- see its own
+// docstring for the shared reasoning this mirrors exactly (only the
+// per-member walker differs: WalkConvProducerBackward instead of
+// WalkMatmulProducerBackward, and there is no SkipLayerNormalization
+// analogue or per-channel bias/scale hop to re-validate on the Conv side,
+// only depthwise pass-through hops). Mirrors pruning.py's own
+// _resolve_conv_residual_group_for_concat.
+std::optional<ResolvedConvResidualGroup> ResolveConvResidualGroupForConcat(
+    onnx::NodeProto* root,
+    const std::unordered_map<std::string, onnx::NodeProto*>& node_by_output,
+    const InitMap& init_map,
+    const std::unordered_set<std::string>& graph_outputs) {
+  std::vector<onnx::NodeProto*> visited{root};
+  std::unordered_set<onnx::NodeProto*> visited_ids{root};
+  std::unordered_set<onnx::NodeProto*> referenced;
+  std::vector<Producer> leaf_producers;
+  std::unordered_set<int64_t> n_channels_set;
+  std::vector<ConvPassThrough> pass_through;
+  std::vector<onnx::NodeProto*> unary_ops;
+  std::vector<std::string> backbone_tensors;
+  std::unordered_map<std::string, std::unordered_set<onnx::NodeProto*>>
+      accounted;
+  auto mark_backbone = [&](const std::string& tensor, onnx::NodeProto* node) {
+    if (!accounted.count(tensor)) {
+      backbone_tensors.push_back(tensor);
+    }
+    accounted[tensor].insert(node);
+  };
+
+  for (size_t i = 0; i < visited.size(); ++i) {
+    onnx::NodeProto* add_node = visited[i];
+    if (!IsEligibleAddMerge(*add_node, init_map)) {
+      return std::nullopt;  // Defensive -- every member was matched already.
+    }
+    for (const auto& operand : add_node->input()) {
+      mark_backbone(operand, add_node);
+      ConvBackwardEdge edge = WalkConvProducerBackward(
+          operand, node_by_output, init_map, graph_outputs, kMaxChainHops);
+      for (const auto& e : edge.edges) {
+        mark_backbone(e.first, e.second);
+      }
+      pass_through.insert(pass_through.end(), edge.pass_through.begin(),
+                          edge.pass_through.end());
+      unary_ops.insert(unary_ops.end(), edge.unary_ops.begin(),
+                       edge.unary_ops.end());
+      if (edge.kind == BackwardEdgeKind::kProducer) {
+        leaf_producers.push_back(edge.producer);
+        n_channels_set.insert(edge.n_channels);
+      } else if (edge.kind == BackwardEdgeKind::kAdd) {
+        referenced.insert(edge.add_node);
+        if (!visited_ids.count(edge.add_node)) {
+          visited_ids.insert(edge.add_node);
+          visited.push_back(edge.add_node);
+        }
+      } else {
+        return std::nullopt;  // kFail -- decline the whole group.
+      }
+    }
+  }
+
+  if (n_channels_set.size() != 1) {
+    return std::nullopt;
+  }
+  const int64_t n_channels = *n_channels_set.begin();
+
+  for (const auto& hop : pass_through) {
+    if (init_map.at(hop.weight)->dims(0) != n_channels) {
+      return std::nullopt;
+    }
+  }
+
+  std::vector<onnx::NodeProto*> sinks;
+  for (auto* n : visited) {
+    if (!referenced.count(n)) {
+      sinks.push_back(n);
+    }
+  }
+  if (sinks.size() != 1 || sinks[0] != root) {
+    return std::nullopt;
+  }
+
+  std::unordered_set<std::string> seen_weights;
+  for (const auto& p : leaf_producers) {
+    if (!seen_weights.insert(p.weight).second) {
+      return std::nullopt;
+    }
+  }
+
+  return ResolvedConvResidualGroup{
+      std::move(leaf_producers),   std::move(pass_through),
+      std::move(unary_ops),        n_channels,
+      std::move(backbone_tensors), std::move(accounted)};
+}
+
+// Finds MatMul/Gemm Concat-merged skip connections -- see this section's
+// own comment. Every operand of a last-axis Concat is resolved backward via
+// WalkMatmulProducerBackward to a real producer (kProducer), an eligible
+// residual/SkipLayerNormalization merge's whole group (kAdd, composed via
+// ResolveMatmulResidualGroupForConcat), or a gated (SwiGLU/GeGLU-style) Mul
+// of two non-constant operands feeding this Concat operand directly
+// (kGated, resolved by WalkMatmulProducerBackward itself). If any operand
+// fails to resolve, fans out elsewhere, or two operands/producers name the
+// same weight, the whole Concat node is declined -- never partially pruned.
+// Mirrors pruning.py's own _find_matmul_concat_chains.
+std::vector<ConcatChain> FindMatmulConcatChains(onnx::GraphProto* graph) {
+  InitMap init_map;
+  for (const auto& t : graph->initializer()) {
+    init_map[t.name()] = &t;
+  }
+  ConsumerMap consumers_of = ConsumersOf(graph);
+  std::unordered_map<std::string, onnx::NodeProto*> node_by_output;
+  for (int i = 0; i < graph->node_size(); ++i) {
+    onnx::NodeProto* node = graph->mutable_node(i);
+    for (const auto& out : node->output()) {
+      node_by_output[out] = node;
+    }
+  }
+  std::unordered_set<std::string> graph_outputs;
+  for (const auto& o : graph->output()) {
+    graph_outputs.insert(o.name());
+  }
+  auto value_info_by_name = ValueInfoByName(*graph);
+  auto is_internal = [&](const std::string& name) {
+    return ConsumerCount(consumers_of, name) == 1 && !graph_outputs.count(name);
+  };
+
+  std::unordered_map<std::string, FullProducerMatch> producer_infos;
+  for (int i = 0; i < graph->node_size(); ++i) {
+    onnx::NodeProto* node = graph->mutable_node(i);
+    auto info = MatchProducer(*node, init_map);
+    if (info) {
+      producer_infos[node->output(0)] =
+          FullProducerMatch{node, info->weight, info->weight_transposed,
+                            info->bias, info->n_channels};
+    }
+  }
+
+  std::vector<ConcatChain> chains;
+  for (int ni = 0; ni < graph->node_size(); ++ni) {
+    onnx::NodeProto* node = graph->mutable_node(ni);
+    if (node->op_type() != "Concat" || node->input_size() < 2 ||
+        node->output_size() != 1) {
+      continue;
+    }
+    if (!ConcatAxisIsLast(*node, value_info_by_name)) {
+      continue;
+    }
+    {
+      std::unordered_set<std::string> uniq(node->input().begin(),
+                                           node->input().end());
+      if (static_cast<int>(uniq.size()) != node->input_size()) {
+        continue;  // Degenerate -- the same tensor concatenated with itself.
+      }
+    }
+
+    std::vector<ConcatBranch> branches;
+    std::unordered_set<std::string> seen_weights;
+    int64_t offset = 0;
+    bool declined = false;
+    for (const auto& operand : node->input()) {
+      MatMulBackwardEdge edge = WalkMatmulProducerBackward(
+          operand, node_by_output, init_map, consumers_of, graph_outputs,
+          kMaxChainHops, &producer_infos);
+      if (edge.kind == BackwardEdgeKind::kFail) {
+        declined = true;
+        break;
+      }
+      if (BranchWalkHasFanout(operand, edge.edges, consumers_of, node)) {
+        declined = true;
+        break;
+      }
+      if (edge.kind == BackwardEdgeKind::kGated) {
+        if (edge.producer.weight == edge.producer_b.weight ||
+            seen_weights.count(edge.producer.weight) ||
+            seen_weights.count(edge.producer_b.weight)) {
+          declined = true;
+          break;
+        }
+        seen_weights.insert(edge.producer.weight);
+        seen_weights.insert(edge.producer_b.weight);
+        ConcatBranch branch;
+        branch.producers = {edge.producer, edge.producer_b};
+        branch.pre_ops = edge.chain_ops;
+        branch.n_channels = edge.n_channels;
+        branch.offset = offset;
+        branch.operand_name = operand;
+        offset += edge.n_channels;
+        branches.push_back(std::move(branch));
+        continue;
+      }
+      if (edge.kind == BackwardEdgeKind::kAdd) {
+        auto resolved = ResolveMatmulResidualGroupForConcat(
+            edge.add_node, node_by_output, init_map, consumers_of,
+            graph_outputs);
+        if (!resolved) {
+          declined = true;
+          break;
+        }
+        auto extra = ResolveMatmulFanoutBranches(
+            resolved->backbone_tensors, resolved->accounted, init_map,
+            consumers_of, graph_outputs, resolved->n_channels);
+        // Only an exactly-empty result confirms the group has no consumer
+        // anywhere else -- see this section's own comment.
+        if (!extra || !extra->empty()) {
+          declined = true;
+          break;
+        }
+        bool dup = false;
+        for (const auto& p : resolved->leaf_producers) {
+          if (seen_weights.count(p.weight)) {
+            dup = true;
+            break;
+          }
+        }
+        if (dup) {
+          declined = true;
+          break;
+        }
+        for (const auto& p : resolved->leaf_producers) {
+          seen_weights.insert(p.weight);
+        }
+        ConcatBranch branch;
+        branch.producers = resolved->leaf_producers;
+        branch.pre_ops = resolved->pre_chain_ops;
+        branch.pre_ops.insert(branch.pre_ops.end(), edge.chain_ops.begin(),
+                              edge.chain_ops.end());
+        branch.n_channels = resolved->n_channels;
+        branch.offset = offset;
+        branch.operand_name = operand;
+        offset += resolved->n_channels;
+        branches.push_back(std::move(branch));
+        continue;
+      }
+      // kProducer.
+      if (seen_weights.count(edge.producer.weight)) {
+        declined = true;
+        break;
+      }
+      seen_weights.insert(edge.producer.weight);
+      ConcatBranch branch;
+      branch.producers = {edge.producer};
+      branch.pre_ops = edge.chain_ops;
+      branch.n_channels = edge.n_channels;
+      branch.offset = offset;
+      branch.operand_name = operand;
+      offset += edge.n_channels;
+      branches.push_back(std::move(branch));
+    }
+    if (declined) {
+      continue;
+    }
+
+    const std::string& out_name = node->output(0);
+    if (!is_internal(out_name)) {
+      continue;
+    }
+    const int64_t total_n = offset;
+    auto [consumer, fwd_chain_ops] =
+        WalkToConsumer(out_name, init_map, consumers_of, graph_outputs, total_n,
+                       kMaxChainHops);
+    if (!consumer) {
+      continue;
+    }
+
+    ConcatChain chain;
+    chain.branches = std::move(branches);
+    chain.concat_node = node;
+    chain.chain_ops = std::move(fwd_chain_ops);
+    chain.consumer_node = consumer->node;
+    chain.consumer_weight = consumer->weight;
+    chain.consumer_weight_transposed = consumer->weight_transposed;
+    chain.consumer_is_conv = false;
+    chain.n_channels = total_n;
+    chains.push_back(std::move(chain));
+  }
+  return chains;
+}
+
+// The Conv analogue of FindMatmulConcatChains: every operand of a
+// channel-axis Concat (axis in {1, -3}) is resolved backward via
+// WalkConvProducerBackward to either a real group=1 Conv producer
+// (kProducer) or an eligible Add merge's whole group (kAdd, composed via
+// ResolveConvResidualGroupForConcat). The consumer must itself be an
+// ordinary (group=1) Conv. Mirrors pruning.py's own
+// _find_conv_concat_chains.
+std::vector<ConcatChain> FindConvConcatChains(onnx::GraphProto* graph) {
+  InitMap init_map;
+  for (const auto& t : graph->initializer()) {
+    init_map[t.name()] = &t;
+  }
+  ConsumerMap consumers_of = ConsumersOf(graph);
+  std::unordered_map<std::string, onnx::NodeProto*> node_by_output;
+  for (int i = 0; i < graph->node_size(); ++i) {
+    onnx::NodeProto* node = graph->mutable_node(i);
+    for (const auto& out : node->output()) {
+      node_by_output[out] = node;
+    }
+  }
+  std::unordered_set<std::string> graph_outputs;
+  for (const auto& o : graph->output()) {
+    graph_outputs.insert(o.name());
+  }
+  auto is_internal = [&](const std::string& name) {
+    return ConsumerCount(consumers_of, name) == 1 && !graph_outputs.count(name);
+  };
+
+  std::vector<ConcatChain> chains;
+  for (int ni = 0; ni < graph->node_size(); ++ni) {
+    onnx::NodeProto* node = graph->mutable_node(ni);
+    if (node->op_type() != "Concat" || node->input_size() < 2 ||
+        node->output_size() != 1) {
+      continue;
+    }
+    auto axis = ConcatAxis(*node);
+    if (!axis || (*axis != 1 && *axis != -3)) {
+      continue;
+    }
+    {
+      std::unordered_set<std::string> uniq(node->input().begin(),
+                                           node->input().end());
+      if (static_cast<int>(uniq.size()) != node->input_size()) {
+        continue;
+      }
+    }
+
+    std::vector<ConcatBranch> branches;
+    std::unordered_set<std::string> seen_weights;
+    int64_t offset = 0;
+    bool declined = false;
+    for (const auto& operand : node->input()) {
+      ConvBackwardEdge edge = WalkConvProducerBackward(
+          operand, node_by_output, init_map, graph_outputs, kMaxChainHops);
+      if (edge.kind == BackwardEdgeKind::kFail) {
+        declined = true;
+        break;
+      }
+      if (BranchWalkHasFanout(operand, edge.edges, consumers_of, node)) {
+        declined = true;
+        break;
+      }
+      if (edge.kind == BackwardEdgeKind::kAdd) {
+        auto resolved = ResolveConvResidualGroupForConcat(
+            edge.add_node, node_by_output, init_map, graph_outputs);
+        if (!resolved) {
+          declined = true;
+          break;
+        }
+        auto extra = ResolveConvFanoutBranches(
+            resolved->backbone_tensors, resolved->accounted, init_map,
+            consumers_of, graph_outputs, resolved->n_channels);
+        if (!extra || !extra->empty()) {
+          declined = true;
+          break;
+        }
+        bool dup = false;
+        for (const auto& p : resolved->leaf_producers) {
+          if (seen_weights.count(p.weight)) {
+            dup = true;
+            break;
+          }
+        }
+        if (dup) {
+          declined = true;
+          break;
+        }
+        for (const auto& p : resolved->leaf_producers) {
+          seen_weights.insert(p.weight);
+        }
+        ConcatBranch branch;
+        branch.producers = resolved->leaf_producers;
+        for (auto* op : resolved->unary_ops) {
+          branch.pre_ops.push_back(ChainOp{op, std::nullopt});
+        }
+        for (auto* op : edge.unary_ops) {
+          branch.pre_ops.push_back(ChainOp{op, std::nullopt});
+        }
+        branch.conv_pass_through = resolved->pass_through;
+        branch.conv_pass_through.insert(branch.conv_pass_through.end(),
+                                        edge.pass_through.begin(),
+                                        edge.pass_through.end());
+        branch.n_channels = resolved->n_channels;
+        branch.offset = offset;
+        branch.operand_name = operand;
+        offset += resolved->n_channels;
+        branches.push_back(std::move(branch));
+        continue;
+      }
+      // kProducer.
+      if (seen_weights.count(edge.producer.weight)) {
+        declined = true;
+        break;
+      }
+      seen_weights.insert(edge.producer.weight);
+      ConcatBranch branch;
+      branch.producers = {edge.producer};
+      for (auto* op : edge.unary_ops) {
+        branch.pre_ops.push_back(ChainOp{op, std::nullopt});
+      }
+      branch.conv_pass_through = edge.pass_through;
+      branch.n_channels = edge.n_channels;
+      branch.offset = offset;
+      branch.operand_name = operand;
+      offset += edge.n_channels;
+      branches.push_back(std::move(branch));
+    }
+    if (declined) {
+      continue;
+    }
+
+    const std::string& out_name = node->output(0);
+    if (!is_internal(out_name)) {
+      continue;
+    }
+    const int64_t total_n = offset;
+    auto [consumer, fwd_chain_ops, fwd_pass_through] =
+        WalkToConvConsumer(out_name, init_map, consumers_of, graph_outputs,
+                           total_n, kMaxChainHops);
+    if (!consumer) {
+      continue;
+    }
+    if (consumer->group != 1) {
+      continue;  // See this section's own comment -- grouped consumer declined.
+    }
+
+    ConcatChain chain;
+    chain.branches = std::move(branches);
+    chain.concat_node = node;
+    chain.chain_ops = std::move(fwd_chain_ops);
+    chain.consumer_node = consumer->node;
+    chain.consumer_weight = consumer->weight;
+    chain.consumer_weight_transposed = false;
+    chain.consumer_is_conv = true;
+    chain.n_channels = total_n;
+    chain.conv_pass_through = std::move(fwd_pass_through);
+    chains.push_back(std::move(chain));
+  }
+  return chains;
+}
+
+// The Concat-merged analogue of ApplyChains: computes one *independent*
+// keep index set per branch (a plain branch's own combined-importance L2
+// norm, root-sum-square across every producer in a composed/gated
+// branch), then slices the shared downstream consumer once, by the
+// concatenation of every branch's own keep, each shifted by its own fixed
+// offset. `touched` is the same TouchedState a sibling ApplyChains call
+// shares. Mirrors pruning.py's own _apply_concat_chains.
+void ApplyConcatChains(onnx::GraphProto* graph,
+                       std::vector<ConcatChain>& chains, double sparsity,
+                       TouchedState& touched) {
+  std::unordered_map<std::string, onnx::TensorProto*> init_map;
+  for (int i = 0; i < graph->initializer_size(); ++i) {
+    onnx::TensorProto* t = graph->mutable_initializer(i);
+    init_map[t->name()] = t;
+  }
+
+  for (auto& chain : chains) {
+    std::unordered_set<std::string> producer_weights;
+    size_t n_producers = 0;
+    for (const auto& b : chain.branches) {
+      for (const auto& p : b.producers) {
+        producer_weights.insert(p.weight);
+        ++n_producers;
+      }
+    }
+    if (producer_weights.size() != n_producers) {
+      continue;  // Degenerate -- two producers naming the same weight.
+    }
+
+    std::unordered_set<std::string> conv_hop_weights;
+    size_t n_conv_hops = chain.conv_pass_through.size();
+    for (const auto& h : chain.conv_pass_through) {
+      conv_hop_weights.insert(h.weight);
+    }
+    for (const auto& b : chain.branches) {
+      n_conv_hops += b.conv_pass_through.size();
+      for (const auto& h : b.conv_pass_through) {
+        conv_hop_weights.insert(h.weight);
+      }
+    }
+    if (conv_hop_weights.size() != n_conv_hops) {
+      continue;  // Degenerate -- the same depthwise weight named twice.
+    }
+
+    std::unordered_set<std::string> consts;
+    for (const auto& b : chain.branches) {
+      for (const auto& p : b.producers) {
+        if (p.bias) {
+          consts.insert(*p.bias);
+        }
+      }
+      for (const auto& co : b.pre_ops) {
+        if (co.const_name) {
+          consts.insert(*co.const_name);
+        }
+      }
+    }
+    for (const auto& co : chain.chain_ops) {
+      if (co.const_name) {
+        consts.insert(*co.const_name);
+      }
+    }
+
+    bool conflict = touched.consumer.count(chain.consumer_weight) != 0;
+    for (const auto& w : producer_weights) {
+      if (touched.producer.count(w)) {
+        conflict = true;
+      }
+    }
+    for (const auto& c : consts) {
+      if (touched.const_names.count(c)) {
+        conflict = true;
+      }
+    }
+    for (const auto& w : conv_hop_weights) {
+      if (touched.conv_hop.count(w)) {
+        conflict = true;
+      }
+    }
+    if (conflict) {
+      continue;  // A shared/tied initializer another chain already resized.
+    }
+
+    std::vector<std::vector<int64_t>> branch_keeps;
+    branch_keeps.reserve(chain.branches.size());
+    bool any_pruned = false;
+    for (const auto& b : chain.branches) {
+      const int64_t n = b.n_channels;
+      const int64_t keep_count = std::max<int64_t>(
+          1, n - std::llround(static_cast<double>(n) * sparsity));
+      if (keep_count >= n) {
+        std::vector<int64_t> full(static_cast<size_t>(n));
+        std::iota(full.begin(), full.end(), int64_t{0});
+        branch_keeps.push_back(std::move(full));
+        continue;
+      }
+      any_pruned = true;
+      std::vector<std::vector<float>> w_arrays_nk;
+      for (const auto& p : b.producers) {
+        onnx::TensorProto* wt = init_map.at(p.weight);
+        std::vector<int64_t> dims(wt->dims().begin(), wt->dims().end());
+        std::vector<float> data = ReadFloatTensor(*wt);
+        if (p.is_conv || p.weight_transposed) {
+          w_arrays_nk.push_back(std::move(data));
+        } else {
+          w_arrays_nk.push_back(TransposeFlat(data, dims[0], dims[1]));
+        }
+      }
+      std::vector<double> importance(static_cast<size_t>(n), 0.0);
+      for (const auto& w_nk : w_arrays_nk) {
+        const int64_t k = static_cast<int64_t>(w_nk.size()) / n;
+        for (int64_t c = 0; c < n; ++c) {
+          double sq = 0.0;
+          for (int64_t j = 0; j < k; ++j) {
+            const double v = w_nk[static_cast<size_t>(c * k + j)];
+            sq += v * v;
+          }
+          importance[static_cast<size_t>(c)] += sq;
+        }
+      }
+      for (double& v : importance) {
+        v = std::sqrt(v);
+      }
+      branch_keeps.push_back(TopKIndicesAscending(importance, keep_count));
+    }
+
+    if (!any_pruned) {
+      continue;  // Every branch rounds down to a no-op -- nothing to do.
+    }
+
+    for (size_t bi = 0; bi < chain.branches.size(); ++bi) {
+      const ConcatBranch& b = chain.branches[bi];
+      const std::vector<int64_t>& keep = branch_keeps[bi];
+      if (static_cast<int64_t>(keep.size()) == b.n_channels) {
+        continue;  // This branch's own sparsity rounded to a no-op.
+      }
+      for (const auto& p : b.producers) {
+        SliceProducerWeight(init_map.at(p.weight), p.weight_transposed, keep,
+                            p.is_conv);
+        if (p.bias) {
+          SliceLastAxis(init_map.at(*p.bias), keep);
+        }
+      }
+      for (const auto& co : b.pre_ops) {
+        if (co.const_name) {
+          SliceLastAxis(init_map.at(*co.const_name), keep);
+        }
+      }
+      for (const auto& hop : b.conv_pass_through) {
+        SliceProducerWeight(init_map.at(hop.weight), false, keep, true);
+        if (hop.bias) {
+          SliceLastAxis(init_map.at(*hop.bias), keep);
+        }
+        SetOrAddIntAttr(hop.node, "group", static_cast<int64_t>(keep.size()));
+      }
+    }
+
+    std::vector<int64_t> global_keep;
+    for (size_t bi = 0; bi < chain.branches.size(); ++bi) {
+      for (int64_t k : branch_keeps[bi]) {
+        global_keep.push_back(k + chain.branches[bi].offset);
+      }
+    }
+
+    for (const auto& co : chain.chain_ops) {
+      if (co.const_name) {
+        SliceLastAxis(init_map.at(*co.const_name), global_keep);
+      }
+    }
+    for (const auto& hop : chain.conv_pass_through) {
+      SliceProducerWeight(init_map.at(hop.weight), false, global_keep, true);
+      if (hop.bias) {
+        SliceLastAxis(init_map.at(*hop.bias), global_keep);
+      }
+      SetOrAddIntAttr(hop.node, "group",
+                      static_cast<int64_t>(global_keep.size()));
+    }
+
+    SliceConsumerWeight(init_map.at(chain.consumer_weight),
+                        chain.consumer_weight_transposed, global_keep,
+                        chain.consumer_is_conv);
+
+    for (const auto& w : producer_weights) {
+      touched.producer.insert(w);
+    }
+    touched.consumer.insert(chain.consumer_weight);
+    for (const auto& c : consts) {
+      touched.const_names.insert(c);
+    }
+    for (const auto& w : conv_hop_weights) {
+      touched.conv_hop.insert(w);
+    }
+    touched.stale_value_info.insert(chain.concat_node->output(0));
+    for (const auto& b : chain.branches) {
+      for (const auto& p : b.producers) {
+        touched.stale_value_info.insert(p.node->output(0));
+      }
+      for (const auto& co : b.pre_ops) {
+        touched.stale_value_info.insert(co.node->output(0));
+      }
+      for (const auto& hop : b.conv_pass_through) {
+        touched.stale_value_info.insert(hop.node->output(0));
+      }
+    }
+    for (const auto& co : chain.chain_ops) {
+      touched.stale_value_info.insert(co.node->output(0));
+    }
+    for (const auto& hop : chain.conv_pass_through) {
+      touched.stale_value_info.insert(hop.node->output(0));
+    }
+  }
+}
+
 }  // namespace
 
 onnx::ModelProto ApplyStructuredPruning(const onnx::ModelProto& model,
@@ -2816,8 +4323,27 @@ onnx::ModelProto ApplyStructuredPruning(const onnx::ModelProto& model,
   chains.insert(chains.end(),
                 std::make_move_iterator(matmul_residual_chains.begin()),
                 std::make_move_iterator(matmul_residual_chains.end()));
+  std::vector<ConcatChain> concat_chains = FindMatmulConcatChains(graph);
+  std::vector<ConcatChain> conv_concat_chains = FindConvConcatChains(graph);
+  concat_chains.insert(concat_chains.end(),
+                       std::make_move_iterator(conv_concat_chains.begin()),
+                       std::make_move_iterator(conv_concat_chains.end()));
+
+  TouchedState touched;
   if (!chains.empty()) {
-    ApplyChains(graph, chains, sparsity);
+    ApplyChains(graph, chains, sparsity, touched);
+  }
+  if (!concat_chains.empty()) {
+    ApplyConcatChains(graph, concat_chains, sparsity, touched);
+  }
+  if (!touched.stale_value_info.empty()) {
+    google::protobuf::RepeatedPtrField<onnx::ValueInfoProto> kept;
+    for (const auto& vi : graph->value_info()) {
+      if (!touched.stale_value_info.count(vi.name())) {
+        *kept.Add() = vi;
+      }
+    }
+    graph->mutable_value_info()->Swap(&kept);
   }
   return out;
 }
