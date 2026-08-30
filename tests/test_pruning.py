@@ -5543,6 +5543,117 @@ def test_structured_pruning_matmul_concat_declines_on_residual_merge_group_inter
     np.testing.assert_array_equal(inits["WOUT"], wout)
 
 
+def test_structured_pruning_matmul_concat_composes_with_gated_branch_matches_oracle():
+    # A gated (SwiGLU-style) Mul of two non-constant operands feeds one
+    # Concat operand directly -- no real producer's raw output in between,
+    # and no Add/SkipLayerNormalization merge involved at all, distinct from
+    # both the plain-producer and composed-residual-group Concat branch
+    # shapes already covered above. Composed, not declined (see
+    # _find_matmul_concat_chains's own docstring on the "gated" outcome):
+    # WG and WU's two raw outputs each become this one branch's own
+    # `producers`, ranked together by the same root-sum-square importance a
+    # standalone gated pair already uses. Deliberately adversarial on both
+    # axes at once, mirroring the residual-composition sibling test above:
+    # WG/WU individually disagree about which half of the columns matter
+    # most (so only their *combined* norm, not either producer's own, can be
+    # driving the gated branch's keep set), and WB (the plain second Concat
+    # branch) is scaled 10x larger so a bug that (wrongly) mixed the two
+    # Concat branches' importances into one ranking would starve WB's own
+    # columns entirely.
+    K, C, Cb, Out = 8, 16, 6, 3
+    rng, wg, wu = _conflicting_wf_ws(233, K, C)
+    wb = rng.standard_normal((K, Cb)).astype(np.float32) * 10.0
+    wout = rng.standard_normal((C + Cb, Out)).astype(np.float32)
+
+    def _build(wg_, wu_, wb_, wout_):
+        return _model(
+            f"""
+            g (float[batch,{K}] X) => (float[batch,{Out}] Y)
+            {{
+              gate = MatMul(X, WG)
+              gate_act = Sigmoid(gate)
+              up = MatMul(X, WU)
+              h = Mul(gate_act, up)
+              hb = MatMul(X, WB)
+              merged = Concat<axis=-1>(h, hb)
+              Y = MatMul(merged, WOUT)
+            }}
+            """,
+            initializer=[
+                _f32(wg_, "WG"),
+                _f32(wu_, "WU"),
+                _f32(wb_, "WB"),
+                _f32(wout_, "WOUT"),
+            ],
+        )
+
+    model = _build(wg, wu, wb, wout)
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    keep_g = _skip_layer_norm_keep(wg, wu, C)
+    importance_b = np.linalg.norm(wb.astype(np.float64), axis=0)
+    keep_b = np.sort(np.argsort(-importance_b)[: Cb // 2])
+    assert len(keep_b) == Cb // 2  # branch b kept its own top half, not starved to 0
+    global_keep = np.concatenate([keep_g, keep_b + C])
+
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    np.testing.assert_array_equal(inits["WG"], wg[:, keep_g])
+    np.testing.assert_array_equal(inits["WU"], wu[:, keep_g])
+    np.testing.assert_array_equal(inits["WB"], wb[:, keep_b])
+    np.testing.assert_array_equal(inits["WOUT"], wout[global_keep, :])
+
+    oracle = _build(wg[:, keep_g], wu[:, keep_g], wb[:, keep_b], wout[global_keep, :])
+    rng_x = np.random.default_rng(234)
+    x = rng_x.standard_normal((5, K)).astype(np.float32)
+    (y,) = _run(pruned, {"X": x})
+    (y_oracle,) = _run(oracle, {"X": x})
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-5, atol=1e-5)
+
+
+def test_structured_pruning_matmul_concat_declines_on_gated_branch_with_extra_fanout():
+    # Same gated-Mul-feeds-Concat-directly shape as the composed test above,
+    # except `gate_act` (the gate's own activation output) additionally
+    # feeds a second graph output `Z` -- must still decline the *whole*
+    # Concat group, not just this one branch: _trace_gate_producer_backward
+    # (reused unchanged from _find_gated_chains) holds every tensor on a
+    # gate/up path to an exact single-consumer bar, and embedding it inside
+    # _walk_matmul_producer_backward doesn't relax that bar here either --
+    # mirrors test_structured_pruning_matmul_residual_add_declines_on_gated_branch_with_extra_fanout,
+    # the same regression proven for the residual composition.
+    K, C, Cb, Out = 8, 16, 6, 3
+    rng, wg, wu = _conflicting_wf_ws(235, K, C)
+    wb = rng.standard_normal((K, Cb)).astype(np.float32)
+    wout = rng.standard_normal((C + Cb, Out)).astype(np.float32)
+    model = _model(
+        f"""
+        g (float[batch,{K}] X) => (float[batch,{Out}] Y, float[batch,{C}] Z)
+        {{
+          gate = MatMul(X, WG)
+          gate_act = Sigmoid(gate)
+          up = MatMul(X, WU)
+          h = Mul(gate_act, up)
+          hb = MatMul(X, WB)
+          merged = Concat<axis=-1>(h, hb)
+          Y = MatMul(merged, WOUT)
+          Z = Identity(gate_act)
+        }}
+        """,
+        initializer=[
+            _f32(wg, "WG"),
+            _f32(wu, "WU"),
+            _f32(wb, "WB"),
+            _f32(wout, "WOUT"),
+        ],
+    )
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    np.testing.assert_array_equal(inits["WG"], wg)
+    np.testing.assert_array_equal(inits["WU"], wu)
+    np.testing.assert_array_equal(inits["WB"], wb)
+    np.testing.assert_array_equal(inits["WOUT"], wout)
+
+
 def test_structured_pruning_matmul_concat_declines_on_duplicate_operand():
     # Concat(h, h) -- the same tensor named twice as an operand of the same
     # Concat node -- is degenerate (not two independent branches at all) and
