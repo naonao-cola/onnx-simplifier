@@ -12,17 +12,31 @@
  *
  * This only checks structural properties (does a body get built when it
  * should, does it decline when it shouldn't, is the result a well-formed
- * function referencing the opsets it uses). The actual per-op arithmetic --
- * in particular, that `router_probs` needs an internal Softmax despite its
- * name, which is not obvious from ONNX Runtime's own docs -- was verified
- * out-of-band by running the generated FunctionProto (loaded as a model-
- * level local function) through a real onnxruntime InferenceSession and
- * diffing against a bare `com.microsoft.MoE` node executed by ONNX
- * Runtime's own native kernel, for relu/identity/silu/gelu activations and
- * with/without fc1/fc2 bias, all matching to float32 precision. That
- * cross-check needs onnxruntime (a Python-only, opt-in dependency for
- * onnxsim -- see CLAUDE.md), which is why it isn't reproduced as a C++ test
- * here.
+ * function referencing the opsets it uses, does it use a real Loop instead
+ * of per-expert unrolling). The actual per-op arithmetic -- in particular,
+ * that `router_probs` needs an internal Softmax despite its name, which is
+ * not obvious from ONNX Runtime's own docs -- was verified out-of-band by
+ * running the generated FunctionProto (loaded as a model-level local
+ * function) through a real onnxruntime InferenceSession and diffing
+ * against a bare `com.microsoft.MoE` node executed by ONNX Runtime's own
+ * native kernel: 80 (activation x fc1_bias x fc2_bias x num_experts x k x
+ * normalize_routing_weights) combinations, all matching to float32
+ * precision, including gelu -- which needed correcting from an exact
+ * erf-based formula to the tanh approximation ONNX Runtime's CPU kernel
+ * actually uses (confirmed by isolating the activation with a 1x1
+ * identity-weight MoE node; the two formulas differ by up to ~4e-4
+ * absolute / ~5% relative near their inflection points, which the earlier,
+ * looser numeric check happened not to catch).
+ *
+ * use_sparse_mixer has no CPU kernel to check against at all (confirmed:
+ * ONNX Runtime's CPU MoE kernel never reads that attribute, silently
+ * falling back to plain routing) -- its own routing math is instead
+ * transcribed from ONNX Runtime's CUDA kernel
+ * (onnxruntime/contrib_ops/cuda/moe/qmoe_kernels.cu) and cross-checked
+ * against an independent numpy transliteration of that same source. That
+ * cross-check, like the onnxruntime one above, needs Python dependencies
+ * onnxsim's C++ build doesn't have (see CLAUDE.md), which is why it isn't
+ * reproduced as a C++ test here.
  */
 #include <onnx/defs/function.h>
 #include <onnx/defs/schema.h>
@@ -189,18 +203,25 @@ void TestDeclinesForSwiglu() {
   Check(!built, "swiglu is not decomposed by this reference body");
 }
 
-void TestDeclinesForSparseMixer() {
+void TestBuildsForSparseMixer() {
+  // use_sparse_mixer is forwarded to the fixed body's own runtime `If`
+  // (see generate_moe_function_templates.py), not read/decided here -- so
+  // this now builds the same way the plain case does, just with a
+  // different routing rule (see contrib_schemas_moe_test's numeric
+  // cross-check note above for why that rule's own math is validated out
+  // of band against a numpy transliteration of ONNX Runtime's CUDA kernel
+  // instead of a running onnxruntime session).
   const OpSchema* schema = OpSchemaRegistry::Schema("MoE", 1, "com.microsoft");
   NodeProto node =
       MakeMoENode(/*k=*/2, "relu", /*normalize=*/0, /*use_sparse_mixer=*/1);
   auto input_types =
-      MakeInputTypes(4, 6, 8, /*dynamic_experts=*/false, /*with_fc3=*/false);
+      MakeInputTypes(8, 6, 8, /*dynamic_experts=*/false, /*with_fc3=*/false);
   FunctionBodyBuildContextImpl ctx(node, input_types);
   FunctionProto function_proto;
   bool built = schema->BuildContextDependentFunction(ctx, function_proto);
-  Check(!built,
-        "use_sparse_mixer=1 uses a different combination rule, not "
-        "decomposed here");
+  Check(built,
+        "use_sparse_mixer=1 should build the same fixed body, with "
+        "its routing choice left to the body's own runtime If");
 }
 
 void TestDeclinesForFc3() {
@@ -216,7 +237,12 @@ void TestDeclinesForFc3() {
   Check(!built, "fc3_experts_weights present is only meaningful for swiglu");
 }
 
-void TestDeclinesForDynamicExpertCount() {
+void TestBuildsForDynamicExpertCount() {
+  // num_experts is a real ONNX `Loop` trip count inside the fixed body
+  // (Shape(fc1_experts_weights)[0]), not something baked into a per-node
+  // unrolled copy -- so a node whose fc1_experts_weights shape doesn't
+  // statically know its expert-count dimension builds the exact same way a
+  // statically-shaped one does.
   const OpSchema* schema = OpSchemaRegistry::Schema("MoE", 1, "com.microsoft");
   NodeProto node = MakeMoENode(/*k=*/2, "relu", /*normalize=*/0);
   auto input_types =
@@ -224,13 +250,19 @@ void TestDeclinesForDynamicExpertCount() {
   FunctionBodyBuildContextImpl ctx(node, input_types);
   FunctionProto function_proto;
   bool built = schema->BuildContextDependentFunction(ctx, function_proto);
-  Check(!built,
-        "an unrolled per-expert body needs num_experts known statically");
+  Check(built,
+        "num_experts unknown statically should still build (a real Loop, "
+        "not a per-node unrolled copy, iterates over it)");
 }
 
-void TestNodeCountScalesWithExpertCount() {
+void TestBodyUsesALoopNotPerExpertUnrolling() {
+  // The same fixed body is attached (and is identical) regardless of
+  // num_experts, since it's a real Loop trip count rather than something
+  // that changes the node list -- confirms the design change directly,
+  // where TestNodeCountScalesWithExpertCount used to confirm the opposite
+  // (deliberately per-node unrolled) design.
   const OpSchema* schema = OpSchemaRegistry::Schema("MoE", 1, "com.microsoft");
-  int prev_nodes = -1;
+  int first_nodes = -1;
   for (int64_t num_experts : {2, 4, 8}) {
     NodeProto node = MakeMoENode(/*k=*/1, "relu", /*normalize=*/0);
     auto input_types = MakeInputTypes(num_experts, 6, 8,
@@ -239,13 +271,22 @@ void TestNodeCountScalesWithExpertCount() {
     FunctionBodyBuildContextImpl ctx(node, input_types);
     FunctionProto function_proto;
     bool built = schema->BuildContextDependentFunction(ctx, function_proto);
-    Check(built, "should build for every tested static expert count");
+    Check(built, "should build for every tested expert count");
     if (!built) continue;
-    Check(prev_nodes < 0 || function_proto.node_size() > prev_nodes,
-          "node count should strictly grow with num_experts (confirms the "
-          "body is actually unrolled per expert, not a fixed-size "
-          "approximation)");
-    prev_nodes = function_proto.node_size();
+    bool has_loop = false;
+    for (const auto& n : function_proto.node()) {
+      if (n.op_type() == "Loop") has_loop = true;
+    }
+    Check(has_loop,
+          "body should contain a real Loop op iterating over num_experts");
+    if (first_nodes < 0) {
+      first_nodes = function_proto.node_size();
+    } else {
+      Check(function_proto.node_size() == first_nodes,
+            "node count should be identical across different num_experts "
+            "values (confirms the body is a fixed Loop, not unrolled per "
+            "expert)");
+    }
   }
 }
 
@@ -255,10 +296,10 @@ int main() {
   TestMoESchemaIsRegistered();
   TestBuildsForPlainReluCase();
   TestDeclinesForSwiglu();
-  TestDeclinesForSparseMixer();
+  TestBuildsForSparseMixer();
   TestDeclinesForFc3();
-  TestDeclinesForDynamicExpertCount();
-  TestNodeCountScalesWithExpertCount();
+  TestBuildsForDynamicExpertCount();
+  TestBodyUsesALoopNotPerExpertUnrolling();
 
   if (g_failures == 0) {
     std::printf("contrib_schemas_moe_test: all checks passed\n");
