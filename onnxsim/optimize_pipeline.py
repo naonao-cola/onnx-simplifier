@@ -12,7 +12,9 @@ techniques on top of a single fixed INT4 baseline.
 2. **Prune** (optional, ``sparsity``) -- :func:`onnxsim.apply_structured_pruning`
    (data-free channel pruning): shrinking the model *before* quantizing means
    later stages spend their whole error budget on channels that survive,
-   rather than on ones that will end up zeroed anyway.
+   rather than on ones that will end up zeroed anyway. Uses the pure-Python
+   implementation specifically -- see this module's own "C++ vs. Python"
+   scope note below for why.
 3. **Cross-Layer Equalize** (:func:`onnxsim.cross_layer_equalize`) -- always;
    data-free, changes nothing but weight parameterization (see its own
    docstring), and reduces the error every later quantization stage
@@ -22,18 +24,18 @@ techniques on top of a single fixed INT4 baseline.
      or, if ``calibration_data`` is available, ``bit_selection="mixed_precision"``
      upgrades this to :func:`onnxsim.apply_mixed_precision_quantization`
      (per-layer INT4/INT8 chosen by measured sensitivity).
-   - ``use_rotation=True``: :func:`onnxsim.apply_quarot` instead -- rotates
-     the residual stream so *both* the weight and the activation can drop to
-     INT4 (data-free), a strictly more aggressive alternative to the
-     weight-only scheme above, at the cost of the refinement stage below
-     (AdaRound/Bias Correction only optimize the weight-only scheme's own
-     ``DequantizeLinear`` shape).
+   - ``use_rotation=True``: :func:`onnxsim.apply_quarot_cpp` instead --
+     rotates the residual stream so *both* the weight and the activation
+     can drop to INT4 (data-free), a strictly more aggressive alternative
+     to the weight-only scheme above, at the cost of the refinement stage
+     below (AdaRound/Bias Correction only optimize the weight-only
+     scheme's own ``DequantizeLinear`` shape).
 5. **Refine** (only reached if step 4 didn't meet ``accuracy_budget``, and
    only when ``use_rotation`` is ``False``) -- :func:`onnxsim.apply_adaround`
    then :func:`onnxsim.correct_bias`, reusing :mod:`onnxsim.autoquant`'s own
    escalation order and its reasoning for that order (AdaRound before Bias
    Correction, not after -- see that module's own docstring).
-6. **Compress** (:func:`onnxsim.apply_double_quantization`) -- always
+6. **Compress** (:func:`onnxsim.apply_double_quantization_cpp`) -- always
    attempted last, on whatever stage 4/5 produced: a second-level
    quantization of the scale tensors themselves, essentially free in
    accuracy (QLoRA's own finding) but not free in *risk*, so this pipeline
@@ -56,6 +58,20 @@ onnxsim quantization/pruning algorithm -- :func:`onnxsim.apply_duquant`/
 :func:`onnxsim.apply_gptq`/:func:`onnxsim.apply_smoothquant`/etc., and
 Wanda/SparseGPT-calibrated pruning are all still directly callable on their
 own, just not wired into this particular escalation.
+
+**C++ vs. Python.** The rotation (stage 4b) and compression (stage 6)
+stages use their C++-backed ports (:func:`onnxsim.apply_quarot_cpp`,
+:func:`onnxsim.apply_double_quantization_cpp`) -- both are at full scope
+parity with their pure-Python counterparts for the way this pipeline calls
+them (default ``block_size``/``epsilon``/``min_elements``), so the native
+path is strictly faster with no behavior gap. The pruning stage (2)
+deliberately still uses the pure-Python :func:`onnxsim.apply_structured_pruning`
+rather than :func:`onnxsim.apply_structured_pruning_cpp`: the Python
+implementation has since grown ``Concat``-merged (U-Net-style
+encoder/decoder skip-connection) chain support that the C++ port does not
+(yet) have, so preferring the native path here would silently prune fewer
+channels on any model with that topology -- a real behavior regression,
+not just a speed loss. Revisit this once the C++ port reaches parity.
 """
 
 from __future__ import annotations
@@ -69,15 +85,15 @@ from onnxsim.accuracy import AccuracyDropReport, measure_accuracy_drop
 from onnxsim.adaround import apply_adaround
 from onnxsim.bias_correction import correct_bias
 from onnxsim.calibration import Tensors, generate_random_calibration_data
-from onnxsim.double_quantization import apply_double_quantization
 from onnxsim.mixed_precision import apply_mixed_precision_quantization
 from onnxsim.onnx_simplifier import (
+    apply_double_quantization_cpp,
+    apply_quarot_cpp,
     cross_layer_equalize,
     quantize_weight_only_int4,
     simplify,
 )
 from onnxsim.pruning import apply_structured_pruning
-from onnxsim.quarot import apply_quarot
 
 
 @dataclass
@@ -127,7 +143,7 @@ def apply_optimization_pipeline(
     :param num_samples: random batches to generate when ``calibration_data``
             is omitted
     :param seed: seed for the random calibration data (ignored if
-            ``calibration_data`` is supplied) and for :func:`onnxsim.apply_quarot`'s
+            ``calibration_data`` is supplied) and for :func:`onnxsim.apply_quarot_cpp`'s
             own per-layer rotations
     :param providers: onnxruntime execution providers to calibrate/run on
     :param sparsity: if given, :func:`onnxsim.apply_structured_pruning`'s own
@@ -140,7 +156,7 @@ def apply_optimization_pipeline(
             to pick INT4 or INT8 per layer from calibration-driven
             sensitivity. Ignored when ``use_rotation`` is ``True``.
     :param use_rotation: if ``True``, replaces the weight-only quantization
-            stage with :func:`onnxsim.apply_quarot` (data-free rotation
+            stage with :func:`onnxsim.apply_quarot_cpp` (data-free rotation
             preprocessing, both weight and activation quantized to INT4);
             skips the AdaRound/Bias Correction refinement stage, since those
             only optimize the weight-only scheme's own ``DequantizeLinear``
@@ -195,7 +211,7 @@ def apply_optimization_pipeline(
     stages.append("cross_layer_equalization")
 
     if use_rotation:
-        quantized = apply_quarot(float_model, seed=seed)
+        quantized = apply_quarot_cpp(float_model, seed=seed)
         stages.append("quarot")
     elif bit_selection == "mixed_precision":
         quantized = apply_mixed_precision_quantization(
@@ -248,7 +264,7 @@ def apply_optimization_pipeline(
     # kept only when it doesn't measurably worsen that stage's own accuracy
     # -- see this module's own docstring for why this isn't budget-gated
     # escalation like the stages above.
-    compressed = apply_double_quantization(best.optimized_model)
+    compressed = apply_double_quantization_cpp(best.optimized_model)
     compressed_report = _measure(compressed)
     if compressed_report.all_finite and (
         not best.report.all_finite

@@ -3422,21 +3422,20 @@ def test_structured_pruning_conv_residual_add_declines_on_identity_shortcut():
     np.testing.assert_array_equal(inits["W2"], w2)
 
 
-def test_structured_pruning_conv_residual_add_declines_on_grouped_conv_consumer():
-    # Two independent Conv branches merge via Add, same shape
-    # _residual_diamond_model uses, but the downstream consumer is a
-    # *general grouped* Conv (group=2) -- the composition _find_conv_chains
-    # handles for a single-producer chain (see
-    # test_structured_pruning_grouped_conv_consumer_only, if present) isn't
-    # verified for a multi-producer residual chain: _chain_group's
-    # per-group top-k assumes each producer feeds the consumer's full
-    # channel range, which a residual group's combined-importance ranking
-    # doesn't establish. _walk_to_conv_consumer still matches this grouped
-    # Conv (it's an ordinary forward consumer match, unrelated to the
-    # residual grouping above it), so this exercises
-    # _find_conv_residual_chains's own explicit decline of a non-1
-    # `consumer_group` rather than accidentally exiting earlier for some
-    # unrelated reason.
+def test_structured_pruning_conv_residual_add_prunes_grouped_conv_consumer():
+    # Two independent (ordinary, group=1) Conv branches merge via Add, same
+    # shape _residual_diamond_model uses, but the downstream consumer is a
+    # *general grouped* Conv (group=2). Neither producer has any grouping
+    # constraint of its own (an ordinary producer accepts any subset of
+    # surviving output channels), so this is really the same composition
+    # _find_conv_chains already supports for a single-producer chain
+    # (an ordinary producer + a grouped consumer), just with the combined
+    # (root-sum-square) importance of *two* producers ranked against the
+    # consumer's own per-group block boundaries instead of one producer's.
+    # See _find_conv_residual_chains's own group-count agreement check
+    # (mirroring _find_conv_chains's "both sides grouped with a different
+    # group count" decline, generalized to "no producer disagrees with the
+    # consumer's group") and this module's own docstring.
     Cin, C, Cout, group = 3, 16, 8, 2
     rng = np.random.default_rng(89)
     w_f = rng.standard_normal((C, Cin, 3, 3)).astype(np.float32)
@@ -3456,10 +3455,287 @@ def test_structured_pruning_conv_residual_add_declines_on_grouped_conv_consumer(
         initializer=[_f32(w_f, "WF"), _f32(w_s, "WS"), _f32(w_out, "WOUT")],
     )
     pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    importance = np.sqrt(
+        np.square(np.linalg.norm(w_f.reshape(C, -1).astype(np.float64), axis=1))
+        + np.square(np.linalg.norm(w_s.reshape(C, -1).astype(np.float64), axis=1))
+    )
+    keep = _oracle_keep_indices_combined_grouped(importance, group, 0.5)
+    w_out_sliced = _oracle_slice_grouped_consumer_conv(w_out, keep, group, C)
+
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    np.testing.assert_array_equal(inits["WF"], w_f[keep])
+    np.testing.assert_array_equal(inits["WS"], w_s[keep])
+    np.testing.assert_array_equal(inits["WOUT"], w_out_sliced)
+
+    oracle = _model(
+        f"""
+        g (float[N,{Cin},10,10] X) => (float[N,{Cout},8,8] Y)
+        {{
+          f = Conv<kernel_shape=[3,3]>(X, WF)
+          s = Conv<kernel_shape=[3,3]>(X, WS)
+          addr = Add(f, s)
+          r = Relu(addr)
+          Y = Conv<kernel_shape=[1,1],group={group}>(r, WOUT)
+        }}
+        """,
+        initializer=[
+            _f32(w_f[keep], "WF"),
+            _f32(w_s[keep], "WS"),
+            _f32(w_out_sliced, "WOUT"),
+        ],
+    )
+    rng_x = np.random.default_rng(90)
+    x = rng_x.standard_normal((2, Cin, 10, 10)).astype(np.float32)
+    (y,) = _run(pruned, {"X": x})
+    (y_oracle,) = _run(oracle, {"X": x})
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-5, atol=1e-5)
+
+
+def _oracle_keep_indices_combined_grouped(importance, group, sparsity):
+    """The multi-producer analogue of `_oracle_keep_indices_conv_grouped`:
+    takes an already-combined (root-sum-square) per-channel importance
+    vector directly, rather than computing it from one weight's own L2 norm
+    -- everything else (independent per-`group`-block top-k, same count
+    kept from every block) is identical.
+    """
+    n = importance.shape[0]
+    block = n // group
+    per_group_keep = max(1, round(block * (1.0 - sparsity)))
+    parts = []
+    for gi in range(group):
+        lo, hi = gi * block, (gi + 1) * block
+        local = importance[lo:hi]
+        parts.append(np.sort(np.argsort(-local)[:per_group_keep]) + lo)
+    return np.concatenate(parts)
+
+
+def test_structured_pruning_conv_residual_add_prunes_grouped_producers_and_consumer_per_group():
+    # The full composition: *two* general grouped Conv producers (group=4
+    # each) merge via Add into a general grouped Conv consumer, also
+    # group=4 -- every producer and the consumer share the exact same
+    # `group` count, the one slice of this composition
+    # _find_conv_residual_chains now supports (see this module's own
+    # docstring). Adversarially engineered so a *global* (flat, whole-vector)
+    # top-k over the combined importance would pick an entirely different --
+    # and structurally invalid -- keep set than the correct independent
+    # per-group top-k: block 0/1 (channels 0-7, driven almost entirely by
+    # WF, WS left near-zero there) are given far larger magnitude than
+    # block 2/3 (channels 8-15, driven almost entirely by WS, WF left
+    # near-zero there), so a flat top-8 would keep *all* of blocks 0/1 and
+    # *none* of blocks 2/3 -- violating both producers' own
+    # `out_channels % group == 0` requirement and disagreeing with the
+    # oracle built from the from-scratch, per-block reimplementation this
+    # test uses. Real onnxruntime execution (not just weight-shape/value
+    # comparison) is the actual bar, same as every other oracle test in
+    # this module.
+    Cin, C, Cout, group = 8, 16, 8, 4
+    block = C // group  # 4
+    rng = np.random.default_rng(91)
+    # Tiny baseline everywhere (negligible contribution to the combined
+    # root-sum-square importance -- effectively zero, but nonzero so
+    # onnxruntime never sees an exact-zero row that could tie-break
+    # differently on some backend).
+    w_f = (rng.standard_normal((C, Cin // group, 1, 1)) * 1e-4).astype(np.float32)
+    w_s = (rng.standard_normal((C, Cin // group, 1, 1)) * 1e-4).astype(np.float32)
+    # Block-decreasing magnitude profile, alternating which producer
+    # dominates each block -- see this test's own docstring.
+    block_scale = [100.0, 10.0, 1.0, 0.1]
+    for gi in range(group):
+        lo, hi = gi * block, (gi + 1) * block
+        driver = w_f if gi < 2 else w_s
+        for j in range(block):
+            driver[lo + j, 0, 0, 0] = block_scale[gi] * (block - j)
+    w_out = rng.standard_normal((Cout, C // group, 1, 1)).astype(np.float32)
+
+    def _grouped_residual_model(w_f, w_s, w_out):
+        return _model(
+            f"""
+            g (float[N,{Cin},10,10] X) => (float[N,{Cout},10,10] Y)
+            {{
+              f = Conv<kernel_shape=[1,1],group={group}>(X, WF)
+              s = Conv<kernel_shape=[1,1],group={group}>(X, WS)
+              addr = Add(f, s)
+              r = Relu(addr)
+              Y = Conv<kernel_shape=[1,1],group={group}>(r, WOUT)
+            }}
+            """,
+            initializer=[_f32(w_f, "WF"), _f32(w_s, "WS"), _f32(w_out, "WOUT")],
+        )
+
+    model = _grouped_residual_model(w_f, w_s, w_out)
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    importance = np.sqrt(
+        np.square(np.linalg.norm(w_f.reshape(C, -1).astype(np.float64), axis=1))
+        + np.square(np.linalg.norm(w_s.reshape(C, -1).astype(np.float64), axis=1))
+    )
+    keep = _oracle_keep_indices_combined_grouped(importance, group, 0.5)
+    keep_flat = np.sort(np.argsort(-importance)[:8])
+    assert list(keep) != list(keep_flat)  # sanity: the engineered disparity
+    # really does make per-group and flat/global selection disagree
+    for gi in range(group):
+        lo, hi = gi * block, (gi + 1) * block
+        assert sum(lo <= i < hi for i in keep) == block // 2  # exactly half
+        # of *every* block survives, not just the globally-largest blocks
+
+    w_out_sliced = _oracle_slice_grouped_consumer_conv(w_out, keep, group, C)
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    np.testing.assert_array_equal(inits["WF"], w_f[keep])
+    np.testing.assert_array_equal(inits["WS"], w_s[keep])
+    np.testing.assert_array_equal(inits["WOUT"], w_out_sliced)
+    for name in ("WF", "WS", "WOUT"):
+        node = next(n for n in pruned.graph.node if name in n.input)
+        group_attr = next(a.i for a in node.attribute if a.name == "group")
+        assert group_attr == group  # the group count itself never shrinks
+
+    oracle = _grouped_residual_model(w_f[keep], w_s[keep], w_out_sliced)
+    rng_x = np.random.default_rng(92)
+    x = rng_x.standard_normal((2, Cin, 10, 10)).astype(np.float32)
+    (y,) = _run(pruned, {"X": x})
+    (y_oracle,) = _run(oracle, {"X": x})
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-5, atol=1e-5)
+
+
+def test_structured_pruning_conv_residual_add_declines_on_mismatched_producer_group_counts():
+    # Two grouped-Conv producers merging via Add, but with *different*
+    # group counts (2 vs 4) -- mirrors _find_conv_chains's own "both sides
+    # grouped with a different group count" decline (see
+    # test_structured_pruning_skips_mismatched_grouped_producer_and_consumer),
+    # generalized to two producers instead of a producer/consumer pair: the
+    # two producers' own block partitions of the same shared `n_channels`
+    # don't generally align, so there's no single per-block top-k that
+    # respects both simultaneously. Declined entirely -- every weight left
+    # byte-identical to its original value.
+    Cin, C, Cout, g1, g2 = 8, 16, 8, 2, 4
+    rng = np.random.default_rng(93)
+    w_f = rng.standard_normal((C, Cin // g1, 1, 1)).astype(np.float32)
+    w_s = rng.standard_normal((C, Cin // g2, 1, 1)).astype(np.float32)
+    w_out = rng.standard_normal((Cout, C, 1, 1)).astype(np.float32)
+    model = _model(
+        f"""
+        g (float[N,{Cin},10,10] X) => (float[N,{Cout},10,10] Y)
+        {{
+          f = Conv<kernel_shape=[1,1],group={g1}>(X, WF)
+          s = Conv<kernel_shape=[1,1],group={g2}>(X, WS)
+          addr = Add(f, s)
+          r = Relu(addr)
+          Y = Conv<kernel_shape=[1,1]>(r, WOUT)
+        }}
+        """,
+        initializer=[_f32(w_f, "WF"), _f32(w_s, "WS"), _f32(w_out, "WOUT")],
+    )
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
     inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
     np.testing.assert_array_equal(inits["WF"], w_f)
     np.testing.assert_array_equal(inits["WS"], w_s)
     np.testing.assert_array_equal(inits["WOUT"], w_out)
+
+
+def test_structured_pruning_conv_residual_add_declines_on_mismatched_producer_and_consumer_group_counts():
+    # Both grouped-Conv producers agree with each other (group=2), but the
+    # downstream consumer is grouped with a *different* count (group=4):
+    # the consumer-side half of the same agreement check, still declined
+    # for the same reason -- the producers' own group=2 block boundaries
+    # and the consumer's own group=4 ones don't align.
+    Cin, C, Cout, gp, gc = 8, 16, 8, 2, 4
+    rng = np.random.default_rng(94)
+    w_f = rng.standard_normal((C, Cin // gp, 1, 1)).astype(np.float32)
+    w_s = rng.standard_normal((C, Cin // gp, 1, 1)).astype(np.float32)
+    w_out = rng.standard_normal((Cout, C // gc, 1, 1)).astype(np.float32)
+    model = _model(
+        f"""
+        g (float[N,{Cin},10,10] X) => (float[N,{Cout},10,10] Y)
+        {{
+          f = Conv<kernel_shape=[1,1],group={gp}>(X, WF)
+          s = Conv<kernel_shape=[1,1],group={gp}>(X, WS)
+          addr = Add(f, s)
+          r = Relu(addr)
+          Y = Conv<kernel_shape=[1,1],group={gc}>(r, WOUT)
+        }}
+        """,
+        initializer=[_f32(w_f, "WF"), _f32(w_s, "WS"), _f32(w_out, "WOUT")],
+    )
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    np.testing.assert_array_equal(inits["WF"], w_f)
+    np.testing.assert_array_equal(inits["WS"], w_s)
+    np.testing.assert_array_equal(inits["WOUT"], w_out)
+
+
+def test_structured_pruning_conv_residual_add_prunes_grouped_fan_out_branch():
+    # The interior-block fan-out shape
+    # (test_structured_pruning_conv_residual_add_prunes_interior_block_fan_out)
+    # combined with a general grouped Conv: `r` (add1's own post-block
+    # tensor) fans out to both the next block's own first Conv (`nxt`,
+    # itself a *leaf producer* of the group via `add2`) and, unchanged, an
+    # *extra* independent grouped-Conv consumer branch (`Y2`) -- exercising
+    # _resolve_conv_fanout_branches's own carried `consumer_group` for an
+    # extra branch (not just the primary consumer), still required to
+    # agree with the rest of the group's shared `group` count.
+    Cin, C, Cout, group = 8, 16, 8, 4
+    rng = np.random.default_rng(95)
+    w_f = rng.standard_normal((C, Cin // group, 1, 1)).astype(np.float32)
+    w_s = rng.standard_normal((C, Cin // group, 1, 1)).astype(np.float32)
+    w_next = rng.standard_normal((C, C // group, 1, 1)).astype(np.float32)
+    w_out = rng.standard_normal((Cout, C, 1, 1)).astype(np.float32)
+    w_out2 = rng.standard_normal((Cout, C // group, 1, 1)).astype(np.float32)
+
+    def _model_fn(w_f, w_s, w_next, w_out, w_out2):
+        return _model(
+            f"""
+            g (float[N,{Cin},10,10] X) => (float[N,{Cout},10,10] Y, float[N,{Cout},10,10] Y2)
+            {{
+              f = Conv<kernel_shape=[1,1],group={group}>(X, WF)
+              s = Conv<kernel_shape=[1,1],group={group}>(X, WS)
+              add1 = Add(f, s)
+              r = Relu(add1)
+              nxt = Conv<kernel_shape=[1,1],group={group}>(r, WNEXT)
+              add2 = Add(nxt, r)
+              Y = Conv<kernel_shape=[1,1]>(add2, WOUT)
+              Y2 = Conv<kernel_shape=[1,1],group={group}>(r, WOUT2)
+            }}
+            """,
+            initializer=[
+                _f32(w_f, "WF"),
+                _f32(w_s, "WS"),
+                _f32(w_next, "WNEXT"),
+                _f32(w_out, "WOUT"),
+                _f32(w_out2, "WOUT2"),
+            ],
+        )
+
+    model = _model_fn(w_f, w_s, w_next, w_out, w_out2)
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    importance = np.sqrt(
+        np.square(np.linalg.norm(w_f.reshape(C, -1).astype(np.float64), axis=1))
+        + np.square(np.linalg.norm(w_s.reshape(C, -1).astype(np.float64), axis=1))
+        + np.square(np.linalg.norm(w_next.reshape(C, -1).astype(np.float64), axis=1))
+    )
+    keep = _oracle_keep_indices_combined_grouped(importance, group, 0.5)
+    w_next_sliced = _oracle_slice_grouped_consumer_conv(w_next, keep, group, C)[keep]
+    w_out2_sliced = _oracle_slice_grouped_consumer_conv(w_out2, keep, group, C)
+
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    np.testing.assert_array_equal(inits["WF"], w_f[keep])
+    np.testing.assert_array_equal(inits["WS"], w_s[keep])
+    np.testing.assert_array_equal(inits["WNEXT"], w_next_sliced)
+    np.testing.assert_array_equal(inits["WOUT"], w_out[:, keep])
+    np.testing.assert_array_equal(inits["WOUT2"], w_out2_sliced)
+
+    oracle = _model_fn(
+        w_f[keep], w_s[keep], w_next_sliced, w_out[:, keep], w_out2_sliced
+    )
+    rng_x = np.random.default_rng(96)
+    x = rng_x.standard_normal((2, Cin, 10, 10)).astype(np.float32)
+    y, y2 = _run(pruned, {"X": x})
+    y_oracle, y2_oracle = _run(oracle, {"X": x})
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-5, atol=1e-5)
+    np.testing.assert_allclose(y2, y2_oracle, rtol=1e-5, atol=1e-5)
 
 
 def test_structured_wanda_pruning_conv_residual_add_matches_oracle():
