@@ -7147,6 +7147,7 @@ def _attention_model(
     bqkv=None,
     wout=None,
     num_heads=None,
+    attention_bias=None,  # constant attention_bias array, or None (unconnected)
 ):
     rng = np.random.default_rng(seed)
     Nq = Nk = Nv = H * D
@@ -7159,10 +7160,28 @@ def _attention_model(
     heads = H if num_heads is None else num_heads
 
     initializer = [_f32(wqkv, "Wqkv"), _f32(wout, "Wout")]
-    qkv_inputs = "X, Wqkv"
+    operands = ["X", "Wqkv"]
     if bias:
         initializer.append(_f32(bqkv, "Bqkv"))
-        qkv_inputs = "X, Wqkv, Bqkv"
+        operands.append("Bqkv")
+    else:
+        operands.append("")
+
+    # `attention_bias` (index 5) sits behind `mask_index` (3) and `past`
+    # (4), both always left unconnected here (see this module's own
+    # "Attention-head pruning" section comment for why `mask_index`'s own
+    # several documented shapes never carry a `num_heads` axis at all) --
+    # threaded through as empty positional placeholders to reach index 5.
+    if attention_bias is not None:
+        operands += ["", ""]
+        initializer.append(_f32(np.asarray(attention_bias), "AttentionBias"))
+        operands.append("AttentionBias")
+
+    # Trailing optional inputs may simply be omitted rather than spelled
+    # out as empty placeholders.
+    while operands and operands[-1] == "":
+        operands.pop()
+    qkv_inputs = ", ".join(operands)
 
     if with_reshape:
         shape = np.array([batch, seq, Nv], dtype=np.int64)
@@ -7194,7 +7213,17 @@ def _attention_model(
     )
     model.graph.initializer.extend(initializer)
     return model, dict(
-        K=K, H=H, D=D, Out=Out, Nq=Nq, Nk=Nk, Nv=Nv, wqkv=wqkv, bqkv=bqkv, wout=wout
+        K=K,
+        H=H,
+        D=D,
+        Out=Out,
+        Nq=Nq,
+        Nk=Nk,
+        Nv=Nv,
+        wqkv=wqkv,
+        bqkv=bqkv,
+        wout=wout,
+        attention_bias=attention_bias,
     )
 
 
@@ -7278,6 +7307,110 @@ def test_attention_head_pruning_matches_manual_head_deletion_exactly():
     (y_pruned,) = _run(pruned, {"X": x})
     (y_oracle,) = _run(oracle, {"X": x})
     np.testing.assert_allclose(y_pruned, y_oracle, rtol=1e-4, atol=1e-4)
+
+
+def test_attention_head_pruning_attention_bias_is_sliced_and_matches_oracle():
+    # `com.microsoft::Attention`'s own contrib-op schema gives it a second,
+    # unrelated optional mask-shaped input beyond `mask_index`:
+    # `attention_bias` (index 5), documented shape `(batch_size or 1,
+    # num_heads or 1, sequence_length, total_sequence_length)` -- confirmed
+    # to have a real, non-ignored numeric effect via actual onnxruntime
+    # execution (unlike `mask_index`, whose several documented shapes never
+    # carry a `num_heads` axis at all -- see this module's own
+    # "Attention-head pruning" section comment). An earlier version of this
+    # matcher never inspected `attention_bias` at all, so pruning would
+    # have silently left a now-wrong-head-count bias connected to a
+    # pruned-head-count node -- a genuine correctness bug, not just an
+    # overly conservative decline. This test would fail against that
+    # earlier version: a stale full-width bias raises a broadcast shape
+    # error at `onnxruntime.InferenceSession` run time (neither the new
+    # `num_heads` nor 1), not just a numeric mismatch.
+    rng = np.random.default_rng(30)
+    H, D, seq = 4, 4, 5
+    bias = (rng.standard_normal((1, H, seq, seq)) * 1000.0).astype(np.float32)
+    model, cfg = _attention_model(K=8, H=H, D=D, Out=6, seed=30, attention_bias=bias)
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    node = _attention_node(pruned)
+    num_heads, _ = _attention_attrs(node)
+    assert num_heads == 2  # round(4 - 4*0.5)
+
+    keep = _oracle_keep_heads(cfg["wqkv"], cfg["Nq"], cfg["Nk"], cfg["Nv"], cfg["H"], 2)
+    d = cfg["D"]
+    qi, ki, vi = (
+        _head_idx(keep, d),
+        _head_idx(keep, d) + cfg["Nq"],
+        _head_idx(keep, d) + cfg["Nq"] + cfg["Nk"],
+    )
+    all_idx = np.concatenate([qi, ki, vi])
+
+    pruned_inits = {
+        t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer
+    }
+    np.testing.assert_array_equal(pruned_inits["AttentionBias"], bias[:, keep])
+
+    oracle, _ = _attention_model(
+        K=cfg["K"],
+        H=2,
+        D=d,
+        Out=cfg["Out"],
+        seed=30,
+        wqkv=cfg["wqkv"][:, all_idx],
+        bqkv=cfg["bqkv"][all_idx],
+        wout=cfg["wout"][_head_idx(keep, d), :],
+        num_heads=2,
+        attention_bias=bias[:, keep],
+    )
+
+    rng = np.random.default_rng(31)
+    x = rng.standard_normal((2, 5, cfg["K"])).astype(np.float32)
+    (y_pruned,) = _run(pruned, {"X": x})
+    (y_oracle,) = _run(oracle, {"X": x})
+    np.testing.assert_allclose(y_pruned, y_oracle, rtol=1e-4, atol=1e-4)
+
+
+def test_attention_head_pruning_broadcast_attention_bias_is_left_untouched():
+    # A `(1, 1, seq, seq)` `attention_bias` has its own `num_heads`-aligned
+    # axis (axis 1) present but size 1 -- an ordinary broadcast, no
+    # per-head values at all -- so it needs no slicing and must be left
+    # byte-identical even though the rest of the block is pruned.
+    rng = np.random.default_rng(32)
+    H, D, seq = 4, 4, 5
+    bias = (rng.standard_normal((1, 1, seq, seq)) * 1000.0).astype(np.float32)
+    model, cfg = _attention_model(K=8, H=H, D=D, Out=6, seed=32, attention_bias=bias)
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    node = _attention_node(pruned)
+    num_heads, _ = _attention_attrs(node)
+    assert num_heads == 2
+
+    pruned_inits = {
+        t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer
+    }
+    np.testing.assert_array_equal(pruned_inits["AttentionBias"], bias)
+
+
+def test_attention_head_pruning_ambiguous_attention_bias_shape_is_declined():
+    # A `(1, 3, seq, seq)` `attention_bias` -- axis 1 neither `num_heads`
+    # (4) nor 1 -- doesn't cleanly resolve to either "genuinely per-head" or
+    # "broadcast" against this op's own broadcasting rule, so the whole
+    # match must be declined rather than guessed at.
+    rng = np.random.default_rng(33)
+    H, D, seq = 4, 4, 5
+    bias = (rng.standard_normal((1, 3, seq, seq)) * 1000.0).astype(np.float32)
+    model, cfg = _attention_model(K=8, H=H, D=D, Out=6, seed=33, attention_bias=bias)
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+
+    inits_before = {
+        t.name: onnx.numpy_helper.to_array(t) for t in model.graph.initializer
+    }
+    inits_after = {
+        t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer
+    }
+    for name in inits_before:
+        np.testing.assert_array_equal(inits_before[name], inits_after[name])
 
 
 def test_attention_head_pruning_reshape_hop_is_recognized_and_shape_updated():
@@ -7513,6 +7646,8 @@ def _gqa_model(
     k_quant_type=None,  # GQA node's own k_quant_type attribute, e.g. "PER_TENSOR"
     v_quant_type=None,  # GQA node's own v_quant_type attribute
     kv_cache_bit_width=None,  # GQA node's own kv_cache_bit_width attribute (8 or 4)
+    attention_bias=None,  # constant attention_bias array, or None (unconnected)
+    head_sink=None,  # constant head_sink array (shape (H,)), or None (unconnected)
 ):
     # Real ONNX Runtime CPU kernels for GroupQueryAttention require
     # head_size to be a multiple of 8 (verified empirically -- a smaller
@@ -7607,14 +7742,30 @@ def _gqa_model(
         operands += ["", ""]
     operands += ["SeqLensK", "TotalSeq"]
 
-    # `k_scale`/`v_scale` (GQA input indices 12/13) sit behind five other
-    # optional inputs (cos_cache/sin_cache/position_ids/attention_bias/
-    # head_sink, indices 7-11, all left unconnected here -- none of this
-    # module's own matching/slicing touches them) that must be threaded
-    # through as empty positional placeholders for the text format's
-    # positional-input convention to reach index 12/13 at all.
-    if k_scale is not None or v_scale is not None:
-        operands += [""] * 5
+    # `attention_bias`/`head_sink`/`k_scale`/`v_scale` (GQA input indices
+    # 10/11/12/13) sit behind three other optional inputs
+    # (cos_cache/sin_cache/position_ids, indices 7-9, always left
+    # unconnected here -- none of this module's own matching/slicing
+    # touches them) that must be threaded through as empty positional
+    # placeholders for the text format's positional-input convention to
+    # reach index 10 at all.
+    if (
+        attention_bias is not None
+        or head_sink is not None
+        or k_scale is not None
+        or v_scale is not None
+    ):
+        operands += [""] * 3  # cos_cache, sin_cache, position_ids
+        if attention_bias is not None:
+            initializer.append(_f32(np.asarray(attention_bias), "AttentionBias"))
+            operands.append("AttentionBias")
+        else:
+            operands.append("")
+        if head_sink is not None:
+            initializer.append(_f32(np.asarray(head_sink), "HeadSink"))
+            operands.append("HeadSink")
+        else:
+            operands.append("")
         if k_scale is not None:
             initializer.append(_f32(np.asarray(k_scale), "KScale"))
             operands.append("KScale")
@@ -7683,6 +7834,8 @@ def _gqa_model(
         past_value=past_value,
         k_scale=k_scale,
         v_scale=v_scale,
+        attention_bias=attention_bias,
+        head_sink=head_sink,
     )
 
 
@@ -8360,6 +8513,151 @@ def test_gqa_pruning_quantized_cache_accepts_every_schema_quantized_dtype():
         np.testing.assert_array_equal(inits["VScale"], v_scale)
 
 
+def test_gqa_pruning_attention_bias_and_head_sink_are_sliced_and_match_oracle():
+    # `GroupQueryAttention`'s own schema gives it two more optional inputs
+    # beyond `past_key`/`past_value`/`k_scale`/`v_scale` that carry a
+    # genuine per-*query*-head axis -- `attention_bias` (index 10, shape
+    # `(batch_size or 1, num_heads or 1, sequence_length,
+    # total_sequence_length)`, added after GQA's own internal KV-repeat, so
+    # addressed per query head like Q's own producer weight) and
+    # `head_sink` (index 11, shape `(num_heads,)`, a genuine
+    # one-scalar-per-query-head softmax-smoothing constant) -- both
+    # confirmed to have a real, non-ignored numeric effect via actual
+    # onnxruntime execution, and both previously completely unhandled by
+    # this matcher: an earlier version would have silently left
+    # now-wrong-head-count `attention_bias`/`head_sink` tensors connected
+    # to a pruned-head-count node -- a genuine correctness bug. This test
+    # would fail against that earlier version: a stale full-width
+    # `attention_bias`/`head_sink` raises a broadcast/shape error at
+    # `onnxruntime.InferenceSession` run time, not just a numeric mismatch.
+    K, H, KVH, D, Out = 8, 8, 2, 8, 6
+    rng = np.random.default_rng(55)
+    seq = 5
+    attention_bias = (rng.standard_normal((1, H, seq, seq)) * 1000.0).astype(np.float32)
+    head_sink = (rng.standard_normal((H,)) * 1000.0).astype(np.float32)
+    model, cfg = _gqa_model(
+        K=K,
+        H=H,
+        KVH=KVH,
+        D=D,
+        Out=Out,
+        seed=55,
+        attention_bias=attention_bias,
+        head_sink=head_sink,
+    )
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    node = _gqa_node(pruned)
+    num_heads, kv_num_heads = _gqa_attrs(node)
+    group_size = H // KVH
+    assert kv_num_heads == 1
+    assert num_heads == kv_num_heads * group_size
+
+    keep_groups = _oracle_keep_groups(cfg["wq"], cfg["wk"], cfg["wv"], H, KVH, D, 1)
+    keep_q_heads = _group_q_heads(keep_groups, group_size)
+
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    np.testing.assert_array_equal(
+        inits["AttentionBias"], attention_bias[:, keep_q_heads]
+    )
+    np.testing.assert_array_equal(inits["HeadSink"], head_sink[keep_q_heads])
+
+    d = D
+    q_idx, kv_idx = _head_idx(keep_q_heads, d), _head_idx(keep_groups, d)
+    oracle, _ = _gqa_model(
+        K=K,
+        H=len(keep_q_heads),
+        KVH=len(keep_groups),
+        D=d,
+        Out=Out,
+        seed=55,
+        wq=cfg["wq"][:, q_idx],
+        wk=cfg["wk"][:, kv_idx],
+        wv=cfg["wv"][:, kv_idx],
+        wout=cfg["wout"][q_idx, :],
+        batch=cfg["batch"],
+        seq=seq,
+        attention_bias=attention_bias[:, keep_q_heads],
+        head_sink=head_sink[keep_q_heads],
+    )
+
+    rng2 = np.random.default_rng(56)
+    x = rng2.standard_normal((cfg["batch"], seq, K)).astype(np.float32)
+    (y_pruned,) = _run(pruned, {"X": x})
+    (y_oracle,) = _run(oracle, {"X": x})
+    np.testing.assert_allclose(y_pruned, y_oracle, rtol=1e-4, atol=1e-4)
+
+
+def test_gqa_pruning_broadcast_attention_bias_is_left_untouched():
+    # A `(1, 1, seq, seq)` `attention_bias` has its own `num_heads`-aligned
+    # axis present but size 1 -- a broadcast, no per-head values -- so it
+    # needs no slicing and must be left byte-identical.
+    K, H, KVH, D, Out = 8, 8, 2, 8, 6
+    rng = np.random.default_rng(57)
+    seq = 5
+    attention_bias = (rng.standard_normal((1, 1, seq, seq)) * 1000.0).astype(np.float32)
+    model, cfg = _gqa_model(
+        K=K, H=H, KVH=KVH, D=D, Out=Out, seed=57, attention_bias=attention_bias
+    )
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    node = _gqa_node(pruned)
+    num_heads, kv_num_heads = _gqa_attrs(node)
+    assert kv_num_heads == 1
+    assert num_heads == 4
+
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    np.testing.assert_array_equal(inits["AttentionBias"], attention_bias)
+
+
+def test_gqa_pruning_ambiguous_attention_bias_shape_is_declined():
+    # Axis 1 of this `attention_bias` is neither `num_heads` (8) nor 1 --
+    # doesn't cleanly resolve either way, so the whole match must be
+    # declined rather than guessed at.
+    K, H, KVH, D, Out = 8, 8, 2, 8, 6
+    rng = np.random.default_rng(58)
+    seq = 5
+    attention_bias = (rng.standard_normal((1, 3, seq, seq)) * 1000.0).astype(np.float32)
+    model, cfg = _gqa_model(
+        K=K, H=H, KVH=KVH, D=D, Out=Out, seed=58, attention_bias=attention_bias
+    )
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+
+    inits_before = {
+        t.name: onnx.numpy_helper.to_array(t) for t in model.graph.initializer
+    }
+    inits_after = {
+        t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer
+    }
+    for name in inits_before:
+        np.testing.assert_array_equal(inits_before[name], inits_after[name])
+
+
+def test_gqa_pruning_malformed_head_sink_shape_is_declined():
+    # `head_sink`'s own schema shape is exactly `(num_heads,)` -- any other
+    # constant shape is declined rather than guessed at, the same
+    # conservative treatment an unrecognized `past_key`/`past_value` shape
+    # already gets.
+    K, H, KVH, D, Out = 8, 8, 2, 8, 6
+    rng = np.random.default_rng(59)
+    head_sink = (rng.standard_normal((H + 1,)) * 1000.0).astype(np.float32)
+    model, cfg = _gqa_model(
+        K=K, H=H, KVH=KVH, D=D, Out=Out, seed=59, head_sink=head_sink
+    )
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+
+    inits_before = {
+        t.name: onnx.numpy_helper.to_array(t) for t in model.graph.initializer
+    }
+    inits_after = {
+        t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer
+    }
+    for name in inits_before:
+        np.testing.assert_array_equal(inits_before[name], inits_after[name])
+
+
 def test_gqa_wanda_pruning_matches_oracle_exactly():
     # Calibration and eval data must share the model's own fixed batch/seq
     # here (unlike the plain-Attention wanda test, which uses symbolic
@@ -9015,6 +9313,7 @@ def _onnx_attention_model(
     bv=None,
     wout=None,
     attn_mask=None,  # None (omitted) | "nonempty" (constant) | "dynamic" (graph input)
+    attn_mask_array=None,  # explicit constant array for attn_mask="nonempty" (else zeros((seq, seq)))
     past_kv=None,  # None (omitted) | "nonempty" (constant) | "dynamic" (graph input)
     past_key=None,  # explicit override for past_kv="nonempty" (else random)
     past_value=None,  # explicit override for past_kv="nonempty" (else random)
@@ -9060,7 +9359,11 @@ def _onnx_attention_model(
     extra_graph_inputs = ""
 
     if attn_mask == "nonempty":
-        mask = np.zeros((seq, seq), dtype=np.float32)
+        mask = (
+            np.zeros((seq, seq), dtype=np.float32)
+            if attn_mask_array is None
+            else np.asarray(attn_mask_array, dtype=np.float32)
+        )
         initializer.append(_f32(mask, "AttnMask"))
         operands.append("AttnMask")
     elif attn_mask == "dynamic":
@@ -9147,6 +9450,7 @@ def _onnx_attention_model(
         seq=seq,
         past_key=past_key,
         past_value=past_value,
+        attn_mask=mask if attn_mask == "nonempty" else None,
     )
 
 
@@ -9438,25 +9742,43 @@ def test_onnx_attention_pruning_dynamic_past_kv_input_is_still_pruned():
     assert list(inits["Wv"].dims) == [8, 1 * cfg["D"]]
 
 
-def test_onnx_attention_pruning_nonempty_attn_mask_constant_is_left_untouched():
+def test_onnx_attention_pruning_nonempty_2d_attn_mask_constant_is_pruned():
     # `attn_mask` is an optional input this op has that `GroupQueryAttention`
-    # does not; a non-empty constant one is given the identical
-    # decline-outright treatment `_match_gqa_producer` already applies to
-    # `past_key`/`past_value` (see `_match_onnx_attention_producer`'s own
-    # docstring) -- this exercises that specific input, not just the two
-    # `past_key`/`past_value` inputs the two ops share the same shape of.
+    # does not. A rank-2 `(seq, seq)` constant -- the shape this file's own
+    # `_onnx_attention_model` helper generates for `attn_mask="nonempty"` --
+    # broadcasts against the op's own `(batch, q_num_heads, q_seq, kv_seq)`
+    # attention-score tensor with *no* axis ever landing on the
+    # `q_num_heads` slot at all (rank 2 < 3, see `_head_bias_axis`'s own
+    # docstring for the right-alignment reasoning): it is unconditionally
+    # head-count-independent, so this must now be pruned exactly like the
+    # no-mask case -- an earlier version of this matcher declined *any*
+    # non-empty constant mask here regardless of shape, which was overly
+    # conservative for exactly this common case (see
+    # `test_onnx_attention_pruning_rank4_attn_mask_head_axis_is_sliced_and_matches_oracle`
+    # below for the genuinely-per-head case this matcher still must, and
+    # now does, slice correctly).
     model, cfg = _onnx_attention_model(
         K=8, H=8, KVH=2, D=4, Out=6, seed=15, attn_mask="nonempty"
     )
     pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
-    inits_before = {
-        t.name: onnx.numpy_helper.to_array(t) for t in model.graph.initializer
-    }
-    inits_after = {
-        t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer
-    }
-    for name in inits_before:
-        np.testing.assert_array_equal(inits_before[name], inits_after[name])
+    onnx.checker.check_model(pruned)
+
+    node = _onnx_attention_node(pruned)
+    q_num_heads, kv_num_heads = _onnx_attention_attrs(node)
+    assert kv_num_heads == 1
+    assert q_num_heads == 4
+
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    # The rank-2 mask itself carries no per-head axis at all, so it must
+    # come through completely unchanged even though the rest of the block
+    # was pruned.
+    np.testing.assert_array_equal(inits["AttnMask"], cfg["attn_mask"])
+    assert inits["Wq"].shape == (cfg["K"], q_num_heads * cfg["D"])
+
+    rng = np.random.default_rng(150)
+    x = rng.standard_normal((cfg["batch"], cfg["seq"], cfg["K"])).astype(np.float32)
+    (y_pruned,) = _run(pruned, {"X": x})
+    assert y_pruned.shape == (cfg["batch"], cfg["seq"], cfg["Out"])
 
 
 def test_onnx_attention_pruning_dynamic_attn_mask_input_is_still_pruned():
@@ -9480,6 +9802,188 @@ def test_onnx_attention_pruning_dynamic_attn_mask_input_is_still_pruned():
     mask = np.zeros((cfg["seq"], cfg["seq"]), dtype=np.float32)
     (y,) = _run(pruned, {"X": x, "AttnMaskIn": mask})
     assert y.shape == (cfg["batch"], cfg["seq"], cfg["Out"])
+
+
+def test_onnx_attention_pruning_rank4_attn_mask_head_axis_is_sliced_and_matches_oracle():
+    # A rank-4 `(1, q_num_heads, seq, seq)` constant `attn_mask` genuinely
+    # varies per query head (the op's own doc names this shape explicitly;
+    # `onnx.reference.ops.op_attention` adds it against the
+    # `(batch, q_num_heads, q_seq, kv_seq)` attention-score tensor via a
+    # plain ``+``, i.e. ordinary broadcasting) -- this is the real gap this
+    # matcher used to have: an earlier version declined the whole chain
+    # outright rather than slice it, and *before that check existed at
+    # all* (this op's own `attention_bias`-analogue -- see the
+    # `com.microsoft::Attention`/`GroupQueryAttention` sections above) would
+    # have silently left a now-wrong-head-count mask connected to a
+    # pruned-head-count node. This test would fail against either of those:
+    # a stale full-width mask either blocks the match (wrong shape check)
+    # or raises a broadcast shape error at `onnxruntime.InferenceSession`
+    # run time (neither `q_num_heads` nor 1), not just a numeric mismatch.
+    rng = np.random.default_rng(18)
+    H, KVH, D, seq = 8, 2, 4, 5
+    mask = (rng.standard_normal((1, H, seq, seq)) * 1000.0).astype(np.float32)
+    model, cfg = _onnx_attention_model(
+        K=8,
+        H=H,
+        KVH=KVH,
+        D=D,
+        Out=6,
+        seed=18,
+        attn_mask="nonempty",
+        attn_mask_array=mask,
+    )
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    node = _onnx_attention_node(pruned)
+    q_num_heads, kv_num_heads = _onnx_attention_attrs(node)
+    group_size = cfg["H"] // cfg["KVH"]
+    assert kv_num_heads == 1
+    assert q_num_heads == kv_num_heads * group_size
+
+    keep_groups = _oracle_keep_groups(
+        cfg["wq"], cfg["wk"], cfg["wv"], cfg["H"], cfg["KVH"], cfg["D"], kv_num_heads
+    )
+    keep_q_heads = _group_q_heads(keep_groups, group_size)
+    d = cfg["D"]
+    q_idx, kv_idx = _head_idx(keep_q_heads, d), _head_idx(keep_groups, d)
+
+    # The mask actually connected to the pruned model must be exactly this
+    # slice -- checked directly, not just indirectly through numerics.
+    pruned_inits = {
+        t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer
+    }
+    np.testing.assert_array_equal(pruned_inits["AttnMask"], mask[:, keep_q_heads])
+
+    oracle, _ = _onnx_attention_model(
+        K=cfg["K"],
+        H=len(keep_q_heads),
+        KVH=len(keep_groups),
+        D=d,
+        Out=cfg["Out"],
+        seed=18,
+        wq=cfg["wq"][:, q_idx],
+        wk=cfg["wk"][:, kv_idx],
+        wv=cfg["wv"][:, kv_idx],
+        wout=cfg["wout"][q_idx, :],
+        batch=cfg["batch"],
+        seq=cfg["seq"],
+        attn_mask="nonempty",
+        attn_mask_array=mask[:, keep_q_heads],
+    )
+
+    rng = np.random.default_rng(19)
+    x = rng.standard_normal((cfg["batch"], cfg["seq"], cfg["K"])).astype(np.float32)
+    (y_pruned,) = _run(pruned, {"X": x})
+    (y_oracle,) = _run(oracle, {"X": x})
+    np.testing.assert_allclose(y_pruned, y_oracle, rtol=1e-4, atol=1e-4)
+
+
+def test_onnx_attention_pruning_rank3_attn_mask_head_axis_is_sliced():
+    # A rank-3 `(q_num_heads, seq, seq)` mask -- omitting the batch axis
+    # entirely, relying on broadcast -- lands its own axis *0* on the
+    # `q_num_heads` slot once right-aligned against the op's rank-4
+    # `(batch, q_num_heads, q_seq, kv_seq)` attention-score tensor, not
+    # axis 1 the way a rank-4 mask does (see `_head_bias_axis`'s own
+    # docstring; confirmed directly against onnxruntime, not assumed from
+    # the broadcasting rule alone). This is the case most likely to be
+    # mis-handled by an implementation that only ever checks axis 1.
+    rng = np.random.default_rng(20)
+    H, KVH, D, seq = 8, 2, 4, 5
+    mask = (rng.standard_normal((H, seq, seq)) * 1000.0).astype(np.float32)
+    model, cfg = _onnx_attention_model(
+        K=8,
+        H=H,
+        KVH=KVH,
+        D=D,
+        Out=6,
+        seed=20,
+        attn_mask="nonempty",
+        attn_mask_array=mask,
+    )
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    node = _onnx_attention_node(pruned)
+    q_num_heads, kv_num_heads = _onnx_attention_attrs(node)
+    assert kv_num_heads == 1
+    assert q_num_heads == 4
+    group_size = cfg["H"] // cfg["KVH"]
+
+    keep_groups = _oracle_keep_groups(
+        cfg["wq"], cfg["wk"], cfg["wv"], cfg["H"], cfg["KVH"], cfg["D"], kv_num_heads
+    )
+    keep_q_heads = _group_q_heads(keep_groups, group_size)
+
+    pruned_inits = {
+        t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer
+    }
+    np.testing.assert_array_equal(pruned_inits["AttnMask"], mask[keep_q_heads])
+
+
+def test_onnx_attention_pruning_broadcast_head_axis_attn_mask_is_left_untouched():
+    # A rank-4 `(1, 1, seq, seq)` mask has a `q_num_heads`-aligned axis
+    # (axis 1) present but size 1 -- an ordinary broadcast, no per-head
+    # values at all, so it needs no slicing and must be left byte-identical
+    # even though the rest of the block is pruned (unlike the rank4/rank3
+    # tests above, whose masks *do* carry real per-head data).
+    rng = np.random.default_rng(21)
+    H, KVH, D, seq = 8, 2, 4, 5
+    mask = (rng.standard_normal((1, 1, seq, seq)) * 1000.0).astype(np.float32)
+    model, cfg = _onnx_attention_model(
+        K=8,
+        H=H,
+        KVH=KVH,
+        D=D,
+        Out=6,
+        seed=21,
+        attn_mask="nonempty",
+        attn_mask_array=mask,
+    )
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    node = _onnx_attention_node(pruned)
+    q_num_heads, kv_num_heads = _onnx_attention_attrs(node)
+    assert kv_num_heads == 1
+    assert q_num_heads == 4
+
+    pruned_inits = {
+        t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer
+    }
+    np.testing.assert_array_equal(pruned_inits["AttnMask"], mask)
+
+
+def test_onnx_attention_pruning_ambiguous_attn_mask_shape_is_declined():
+    # A rank-4 mask whose second axis is neither `q_num_heads` (8) nor 1 --
+    # here 3, an arbitrary value that doesn't cleanly resolve to either
+    # "genuinely per-head" or "broadcast" against this op's own
+    # broadcasting rule -- must decline the whole match rather than guess,
+    # exactly like an unrecognized `past_key`/`past_value` shape already
+    # does.
+    rng = np.random.default_rng(22)
+    H, KVH, D, seq = 8, 2, 4, 5
+    mask = (rng.standard_normal((1, 3, seq, seq)) * 1000.0).astype(np.float32)
+    model, cfg = _onnx_attention_model(
+        K=8,
+        H=H,
+        KVH=KVH,
+        D=D,
+        Out=6,
+        seed=22,
+        attn_mask="nonempty",
+        attn_mask_array=mask,
+    )
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+
+    inits_before = {
+        t.name: onnx.numpy_helper.to_array(t) for t in model.graph.initializer
+    }
+    inits_after = {
+        t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer
+    }
+    for name in inits_before:
+        np.testing.assert_array_equal(inits_before[name], inits_after[name])
 
 
 def test_onnx_attention_pruning_missing_kv_num_heads_attribute_is_left_untouched():
