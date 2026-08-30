@@ -69,6 +69,28 @@ or not), a genuinely linear stack of `Add`-only merges, and a real
 a real multi-block ResNet/transformer stage, short of the two compositions
 above and a cross-chain conflict on a literally shared weight.
 
+A general grouped Conv (see :func:`_match_conv_producer`/
+:func:`_match_conv_consumer`) may also take part in a Conv residual/merge
+group, as any producer, the primary consumer, and/or any extra fan-out
+branch -- but only when every one of those roles that *is* grouped shares
+the exact same `group` count. The reasoning is the same block-partition
+argument :func:`_chain_group`'s own docstring works through for an ordinary
+(single-producer, single-consumer) chain, just generalized to however many
+producers/branches a merge group collects: a grouped Conv's own `group`
+output-channel blocks are contiguous ranges of `n_channels / group`
+channels, a partition that depends only on `n_channels` and `group` --
+never on which particular Conv it is -- so as long as every grouped
+participant names the same `group`, one shared per-block top-k (see
+:func:`_apply_chains`) simultaneously respects every one of their own
+block-uniform-count requirements, exactly the same way today's `keep` set
+already respects every ordinary (`group=1`) participant's total lack of one.
+Two different non-1 `group` counts anywhere in the same merge group, by
+contrast, imply two different block partitions of the same shared
+`n_channels` index space with no general way to reconcile them -- so that
+case is declined outright (the whole group, not a partial cut), mirroring
+:func:`_find_conv_chains`'s own "both sides grouped with a different group
+count" decline for the ordinary case.
+
 The exact same construction is repeated for MatMul/Gemm chains -- see
 :func:`_find_matmul_residual_chains`'s own section comment for the full
 reasoning, which mirrors the Conv case's above closely enough that only the
@@ -1988,10 +2010,17 @@ class _ConsumerBranch:
     trailing hop constants (`chain_ops`, e.g. an activation or bias/scale
     hop unique to *this* branch's own path to *its* consumer), its own
     real consumer, and, for a Conv branch, its own depthwise pass-through
-    hops crossed on the way there. Never carries a `consumer_group` of its
-    own: like the primary consumer, a branch resolving to a general grouped
-    Conv consumer is declined (the whole group, not just this branch) --
-    see this module's own docstring's grouped-Conv-consumer scope note.
+    hops crossed on the way there. `consumer_group` mirrors
+    :class:`_Chain`'s own field of the same name -- > 1 when this branch
+    resolves to a general grouped Conv consumer (Conv residual/merge groups
+    only; a MatMul/Gemm branch, from :func:`_resolve_matmul_fanout_branches`,
+    leaves it at the default, there being no MatMul/Gemm-grouped-consumer
+    concept at all). :func:`_find_conv_residual_chains` only ever hands
+    back branches whose non-1 `consumer_group` values (if any), together
+    with every producer's own `group` field, all agree -- see that
+    function's own docstring -- so by the time :func:`_apply_chains` reads
+    it here, it's already established as the one shared block boundary
+    every producer and every branch alike must honor.
     """
 
     chain_ops: Tuple[Tuple[onnx.NodeProto, Optional[str]], ...]
@@ -2000,6 +2029,7 @@ class _ConsumerBranch:
     consumer_weight_transposed: bool
     consumer_is_conv: bool = False
     conv_pass_through: Tuple[_ConvPassThrough, ...] = ()
+    consumer_group: int = 1
 
 
 @dataclass
@@ -2735,8 +2765,11 @@ def _walk_conv_producer_backward(
     Returns one of:
 
     - ``("producer", (producer, n_channels), pass_through, unary_ops,
-      edges)`` -- resolved all the way back to a real ``group=1`` Conv
-      producer;
+      edges)`` -- resolved all the way back to a real Conv producer
+      (``group == 1`` or a general grouped Conv -- see
+      :func:`_match_conv_producer`; the caller, not this function, checks
+      every producer/consumer the group eventually collects agrees on one
+      shared `group` count);
     - ``("add", add_node, pass_through, unary_ops, edges)`` -- resolved to
       another eligible ``Add`` merge node's raw output instead (the "many
       residual blocks share one spine" case: the caller unions this group
@@ -2773,14 +2806,22 @@ def _walk_conv_producer_backward(
         prod_info = _match_conv_producer(node, initializer_map)
         if prod_info is not None:
             w_name, bias_name, n_channels, producer_group = prod_info
-            if producer_group != 1:
-                # General grouped Conv is deliberately out of scope for the
-                # residual/Add-merge case -- see this function's own
-                # docstring ("a real group=1 Conv producer"). Combining
-                # per-group independent top-k with cross-branch
-                # combined-importance ranking isn't verified here.
-                return "fail", None, (), (), ()
-            producer = _Producer(node, w_name, False, bias_name, is_conv=True)
+            # A general grouped Conv producer is allowed through here
+            # unconditionally -- `producer_group` is simply carried on the
+            # returned `_Producer` (its output-channel axis 0 stays
+            # flat/global regardless of grouping, same as the ordinary
+            # `_find_conv_chains` case, see `_Producer.group`'s own
+            # docstring). Whether every producer/consumer this group
+            # eventually collects actually *agrees* on one shared group
+            # count is not decidable per-operand here -- it's a whole-group
+            # property -- so the check is deferred to
+            # :func:`_find_conv_residual_chains`, which declines the entire
+            # group (not just this operand) on a mismatch, mirroring
+            # :func:`_find_conv_chains`'s own "both sides grouped with a
+            # different group count" decline.
+            producer = _Producer(
+                node, w_name, False, bias_name, is_conv=True, group=producer_group
+            )
             return (
                 "producer",
                 (producer, n_channels),
@@ -2842,19 +2883,27 @@ def _resolve_conv_fanout_branches(
     Returns ``None`` -- decline the *whole* group, never partially -- if
     any backbone tensor is itself a graph output (this pass never resizes
     a directly-observed shape), any extra consumer fails to resolve to a
-    real ordinary (``group=1``) Conv consumer within the usual hop limit,
-    or two different branches would end up naming the same consumer
+    real (ordinary *or* general grouped) Conv consumer within the usual hop
+    limit, or two different branches would end up naming the same consumer
     weight (double-slicing it would corrupt it -- the same degenerate case
     :func:`_apply_chains` already guards a single chain's own producers
-    against). Returns an empty list if the group has no extra fan-out *and*
-    no branch at all (every backbone tensor's consumers, if any, are
-    already accounted for) -- the caller treats that exactly like "no
-    consumer found" and declines, same as before this function existed.
-    Otherwise returns every resolved branch; the caller picks one as this
-    chain's own "primary" consumer (the shape every other chain already
-    has) and carries the rest as `_Chain.extra_consumers` -- an arbitrary
-    choice with no bearing on correctness, since every branch is sliced by
-    the exact same shared `keep` array.
+    against). A resolved branch's own `group` (see :func:`_match_conv_consumer`)
+    is carried on its `_ConsumerBranch.consumer_group` unconditionally --
+    this function does *not* itself check it agrees with anything else in
+    the group (it has no view of the group's other producers/branches);
+    :func:`_find_conv_residual_chains`, which does, declines the whole
+    group if any two non-1 `group` values collected from every producer and
+    every branch alike disagree. Returns an empty list if the group has no
+    extra fan-out *and* no branch at all (every backbone tensor's
+    consumers, if any, are already accounted for) -- the caller treats that
+    exactly like "no consumer found" and declines, same as before this
+    function existed. Otherwise returns every resolved branch; the caller
+    picks one as this chain's own "primary" consumer (the shape every other
+    chain already has) and carries the rest as `_Chain.extra_consumers` --
+    an arbitrary choice with no bearing on correctness, since every branch
+    is sliced by the exact same shared `keep` array (and, once every
+    `group` is confirmed to agree, the exact same block boundaries within
+    it).
     """
     branches: List[_ConsumerBranch] = []
     seen_weights: Set[str] = set()
@@ -2880,13 +2929,13 @@ def _resolve_conv_fanout_branches(
             if resolved is None:
                 return None
             branch_node, branch_weight, branch_group = resolved
-            if branch_group != 1:
-                # Same restriction as the primary consumer everywhere else
-                # in this section: a general grouped Conv consumer's
-                # per-group top-k assumes every producer feeds its full
-                # (ungrouped) channel range, unverified for a multi-branch
-                # residual group.
-                return None
+            # A general grouped Conv consumer is allowed through here
+            # unconditionally, same as the primary consumer -- its own
+            # `group` is simply carried on the returned `_ConsumerBranch`
+            # (see its own docstring) and cross-checked against every other
+            # producer/branch by the caller (:func:`_find_conv_residual_chains`),
+            # which declines the whole group on a mismatch rather than any
+            # one branch guessing.
             if branch_weight in seen_weights:
                 return None  # two branches naming the same consumer weight
             seen_weights.add(branch_weight)
@@ -2898,6 +2947,7 @@ def _resolve_conv_fanout_branches(
                     consumer_weight_transposed=False,
                     consumer_is_conv=True,
                     conv_pass_through=br_pass_through,
+                    consumer_group=branch_group,
                 )
             )
     return branches
@@ -2908,20 +2958,26 @@ def _find_conv_residual_chains(graph: onnx.GraphProto) -> List[_Chain]:
     above. For every maximal union-find group of transitively-connected
     eligible ``Add`` merge points (:func:`_is_eligible_add_merge`), resolves
     every member's two operands via :func:`_walk_conv_producer_backward`:
-    each must reach either a real ``group=1`` Conv producer (a "leaf" of the
-    group) or another `Add` already in the same group. If *any* operand,
-    anywhere in the group, fails to resolve that way, or the leaf
-    producers' channel counts don't all agree, the *entire* group is
-    declined -- never partially pruned. Every tensor visited along the way
-    (see :func:`_walk_conv_producer_backward`'s own `edges`) plus the
-    group's own "sink" (the one member whose own output isn't itself
-    consumed by another member) is then handed to
+    each must reach either a real Conv producer (``group == 1`` or a
+    general grouped Conv -- a "leaf" of the group) or another `Add` already
+    in the same group. If *any* operand, anywhere in the group, fails to
+    resolve that way, or the leaf producers' channel counts don't all
+    agree, the *entire* group is declined -- never partially pruned. Every
+    tensor visited along the way (see :func:`_walk_conv_producer_backward`'s
+    own `edges`) plus the group's own "sink" (the one member whose own
+    output isn't itself consumed by another member) is then handed to
     :func:`_resolve_conv_fanout_branches`, which finds and resolves every
     extra (non-backbone) consumer fan-out reaches, in exactly the bounded
     way this section's own comment above describes -- declining the whole
-    group if any such branch can't be resolved. What survives is one or
-    more independent forward branches, all fed by the exact same shared
-    `keep` set once :func:`_apply_chains` computes it.
+    group if any such branch can't be resolved. Once every leaf producer
+    and every resolved branch (primary and extra alike) is known, their
+    `group` values are cross-checked: any two *different* non-1 values
+    anywhere in the group decline it entirely (see this module's own
+    docstring for why only "everyone agrees on one shared `group` count"
+    is a provably-safe slice of the general-grouped-Conv case). What
+    survives is one or more independent forward branches, all fed by the
+    exact same shared `keep` set (itself computed per-`group`-block when
+    that shared count is > 1) once :func:`_apply_chains` computes it.
     """
     initializer_map = {t.name: t for t in graph.initializer}
     consumers_of = _consumers_of(graph)
@@ -3035,6 +3091,23 @@ def _find_conv_residual_chains(graph: onnx.GraphProto) -> List[_Chain]:
             continue  # branches disagree on channel count -- decline
         n_channels = next(iter(n_channels_set))
 
+        # Every leaf producer's own `group` (1 for an ordinary Conv, > 1
+        # for a general grouped one -- see _match_conv_producer) must agree
+        # with every other non-1 value in the group, mirroring
+        # _find_conv_chains's own "both sides grouped with a different
+        # group count" decline: a group's shared `keep` set can only
+        # respect one block partition of `n_channels`, and different
+        # `group` counts imply different block boundaries (see
+        # _chain_group's own docstring for the single-producer case this
+        # generalizes). Checked here, before spending work on fan-out
+        # resolution below, since it only depends on already-known
+        # producer info; the *consumer* side of this same check (primary
+        # and extra branches) can only happen once fan-out is resolved, see
+        # below.
+        producer_groups = {p.group for p in leaf_producers if p.group > 1}
+        if len(producer_groups) > 1:
+            continue  # producers disagree on group count -- decline
+
         # Every depthwise pass-through hop was only self-consistently
         # checked when first crossed (see _match_conv_pass_through_self);
         # now that the group's real channel count is known, re-validate.
@@ -3071,6 +3144,21 @@ def _find_conv_residual_chains(graph: onnx.GraphProto) -> List[_Chain]:
         if not branches:
             continue
 
+        # Completes the group-count agreement check started above: every
+        # branch's own `consumer_group` (primary and extra alike) must also
+        # agree with `producer_groups` -- the *consumer*-side half of
+        # `_find_conv_chains`'s own "both sides grouped with a different
+        # group count" decline, generalized from one consumer to however
+        # many branches this group's fan-out resolved. `producer_groups`
+        # was already checked internally consistent above, so folding in
+        # every branch's own value here and re-checking once more catches
+        # any producer/branch mismatch, in either direction.
+        all_groups = producer_groups | {
+            b.consumer_group for b in branches if b.consumer_group > 1
+        }
+        if len(all_groups) > 1:
+            continue  # producer(s) and/or branch(es) disagree on group count
+
         primary, extra_branches = branches[0], tuple(branches[1:])
         chain_ops = (
             tuple((op, None) for op in unary_ops)
@@ -3089,6 +3177,7 @@ def _find_conv_residual_chains(graph: onnx.GraphProto) -> List[_Chain]:
                 consumer_is_conv=True,
                 extra_consumers=extra_branches,
                 conv_pass_through=tuple(pass_through) + primary.conv_pass_through,
+                consumer_group=primary.consumer_group,
             )
         )
     return chains
@@ -5404,10 +5493,10 @@ def _chain_group(chain: _Chain) -> int:
     (see :func:`_apply_chains`): 1 for every chain this pass already
     supported before general grouped Conv (a MatMul/Gemm chain, a gated
     pair, or an ordinary ``group=1`` Conv producer/consumer -- all leave
-    every `group` field at its default), and > 1 whenever either side of a
-    Conv chain is a general grouped Conv.
+    every `group` field at its default), and > 1 whenever any producer or
+    the (primary) consumer of a Conv chain is a general grouped Conv.
 
-    Worked example for why the producer side takes priority when *only* the
+    Worked example for why the producer side takes priority when *only* a
     producer is grouped: a grouped producer (`group=g`, `g` output-channel
     blocks of `out_channels/g` filters each) feeding an ordinary `group=1`
     consumer needs every one of the producer's own `g` blocks pruned to a
@@ -5420,12 +5509,24 @@ def _chain_group(chain: _Chain) -> int:
     individually a valid producer-side cut -- so it's the *consumer's* `g_c`
     blocks that constrain which subset is safe to choose, making the
     consumer's `group` the one that governs `keep` selection there. When
-    both sides are grouped, :func:`_find_conv_chains` already declined the
-    chain unless `producer_group == consumer_group`, so either field gives
-    the same answer.
+    both a producer and the consumer are grouped, :func:`_find_conv_chains`
+    (an ordinary chain, exactly one producer) already declined the chain
+    unless `producer_group == consumer_group`, so either field gives the
+    same answer.
+
+    A Conv residual/merge chain (:func:`_find_conv_residual_chains`) can
+    have more than one producer, and more than one consumer branch (see
+    `extra_consumers`) -- but exactly the same "must all agree" check is
+    already enforced there (mirroring `_find_conv_chains`'s own check,
+    generalized from one producer/one consumer to however many of each a
+    group collects) before a `_Chain` is ever produced, so every non-1
+    `group` value anywhere on this chain -- any producer's, the primary
+    consumer's, or any extra branch's -- is guaranteed identical by the
+    time this runs; checking the first producer found is enough.
     """
-    if len(chain.producers) == 1 and chain.producers[0].group > 1:
-        return chain.producers[0].group
+    for p in chain.producers:
+        if p.group > 1:
+            return p.group
     return chain.consumer_group
 
 
@@ -5607,9 +5708,14 @@ def _apply_chains(
                 is_conv=chain.consumer_is_conv,
             )
         # Extra fan-out branches (see :class:`_Chain.extra_consumers`'s own
-        # comment): each is always an ordinary (`group == 1`) consumer --
-        # _resolve_conv_fanout_branches/_resolve_matmul_fanout_branches
-        # never resolve a grouped one -- fed by the exact same `keep` just
+        # comment): each is either an ordinary (`group == 1`) consumer, or,
+        # for a Conv residual/merge chain, a general grouped Conv consumer
+        # whose own `group` was already confirmed (in
+        # _find_conv_residual_chains) to agree with `group` above --
+        # _resolve_matmul_fanout_branches never resolves a grouped one (no
+        # such concept for MatMul/Gemm), so `consumer_group` stays at its
+        # default 1 there and this always takes the plain-slice branch for
+        # a MatMul/Gemm chain. Either way, fed by the exact same `keep` just
         # computed for the group's shared producers above.
         for branch in chain.extra_consumers:
             for _, const_name in branch.chain_ops:
@@ -5617,12 +5723,20 @@ def _apply_chains(
                     _slice_last_axis(initializer_map[const_name], keep)
             for hop in branch.conv_pass_through:
                 _slice_conv_hop(hop)
-            _slice_consumer_weight(
-                initializer_map[branch.consumer_weight],
-                branch.consumer_weight_transposed,
-                keep,
-                is_conv=branch.consumer_is_conv,
-            )
+            if branch.consumer_is_conv and branch.consumer_group > 1:
+                _slice_grouped_consumer_conv_weight(
+                    initializer_map[branch.consumer_weight],
+                    keep,
+                    branch.consumer_group,
+                    n,
+                )
+            else:
+                _slice_consumer_weight(
+                    initializer_map[branch.consumer_weight],
+                    branch.consumer_weight_transposed,
+                    keep,
+                    is_conv=branch.consumer_is_conv,
+                )
 
         producer_touched.update(producer_weights)
         consumer_touched.update(consumer_weights)
@@ -5726,7 +5840,14 @@ def apply_structured_pruning(
     block's own `Add`, is reached rather than declined; what's still
     declined is a branch that itself forks further, reaches a graph output,
     or would need a tie-break between two conflicting keep sets on the same
-    shared weight.
+    shared weight. A general grouped Conv may take part in this merge too --
+    as a producer, the primary consumer, and/or an extra fan-out branch --
+    as long as every one of those that is grouped shares the exact same
+    `group` count (see this module's own docstring for why that's the
+    provably-safe slice of it); two different non-1 `group` counts anywhere
+    in the same merge group are declined, the same conservative way
+    :func:`_find_conv_chains` already declines it for the ordinary,
+    single-producer/single-consumer case.
 
     The MatMul/Gemm analogue of that same residual/skip-connection case is
     also handled (see :func:`_find_matmul_residual_chains` and this
