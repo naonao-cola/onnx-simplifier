@@ -96,6 +96,11 @@ constant folding until the model stops changing. Around that it offers:
   [onnx-mlir](https://github.com/onnx/onnx-mlir) (ONNX dialect) with `--emit-mlir`
   (Python: `onnxsim.export_mlir`) — a bridge into MLIR-based compiler stacks
   (torch-mlir, IREE, onnx-mlir). Both backends are optional.
+- **[Core ML export](#exporting-to-core-ml).** Convert the simplified model to a
+  Core ML `.mlpackage`/`.mlmodel` with `--emit-coreml` (Python:
+  `onnxsim.export_coreml`), via a built-in ONNX-to-MIL translator and
+  [coremltools](https://github.com/apple/coremltools)' MIL-to-Core-ML backend.
+  coremltools is optional.
 - **Large-model handling.** Guard against blow-up from ops like `Tile`/
   `ConstantOfShape` (`--no-large-tensor`), read and write external-data models,
   and eliminate unused outputs (`--unused-output`).
@@ -331,6 +336,74 @@ onnxsim.export_mlir(model_simp, "model.mlir", target="onnx",
 prefer recent opsets), `verify=False` (torch) to skip MLIR verification, and
 `emit` / `extra_args` (onnx) to change the onnx-mlir emit flag or pass extra
 compiler options. See `onnxsim/mlir_export.py` for the full signatures.
+
+## Exporting to Core ML
+
+Apple platforms want the graph as a Core ML model instead of ONNX or MLIR.
+coremltools dropped its own ONNX frontend in version 7 (it only converts
+TensorFlow/PyTorch models, or an in-memory MIL program) — there's no
+off-the-shelf "convert this ONNX model" call left to lean on, so onnxsim ships
+its own ONNX-to-MIL translator and hands the result to coremltools'
+MIL-to-Core-ML backend to produce the actual model. It covers a practical
+subset of ONNX ops (conv/pooling/normalization, matmul/gemm, elementwise math,
+reshapes, reductions, and more — see `coreml_export.SUPPORTED_ONNX_OPS`); a
+node whose op isn't supported raises a clear error naming the op, rather than
+silently producing a wrong model. Feeding in a *simplified* model is the point,
+same as with MLIR export: onnxsim's constant folding turns more of the graph
+into plain initializers, so more of it lands on the translator's supported-op
+list.
+
+coremltools is **optional**, just like onnxruntime for constant folding: it
+isn't imported unless you actually export to Core ML.
+
+```
+pip install coremltools
+```
+
+Converting an ONNX model to MIL / Core ML needs no macOS-specific
+functionality (MIL construction and `.mlpackage` serialization are pure
+Python/protobuf), so it runs the same on Linux, macOS, or Windows. Only
+*loading the produced model back for a prediction* needs Core ML's runtime,
+i.e. an Apple OS — pass `skip_model_load=False` (Python) once you're on macOS
+to get a model that's ready to call `.predict()` on; the default
+(`skip_model_load=True`) lets conversion succeed everywhere else too.
+
+Graph inputs must have fully static shapes (dynamic axes aren't supported).
+
+From the CLI, add `--emit-coreml`. Passed without a path it writes the model
+next to the output model with a `.mlpackage`/`.mlmodel` extension; pass a path
+to choose the location:
+
+```
+# writes simplified.onnx and simplified.mlpackage
+onnxsim input.onnx simplified.onnx --emit-coreml
+
+# choose the path and the legacy .mlmodel format explicitly
+onnxsim input.onnx simplified.onnx --emit-coreml model.mlmodel --coreml-format neuralnetwork
+```
+
+From Python, `onnxsim.export_coreml` converts a model (typically the output of
+`simplify`) and returns the `coremltools.models.MLModel`, optionally saving it:
+
+```python
+import onnx
+import onnxsim
+
+model = onnx.load("input.onnx")
+model_simp, ok = onnxsim.simplify(model)
+assert ok
+
+# Return the MLModel...
+mlmodel = onnxsim.export_coreml(model_simp)
+# ...and/or save it to a .mlpackage (or .mlmodel with convert_to="neuralnetwork").
+onnxsim.export_coreml(model_simp, "model.mlpackage")
+```
+
+`export_coreml` accepts a few keyword arguments: `convert_to` (`"mlprogram"`,
+the default, or the legacy `"neuralnetwork"`), `compute_units` (which devices
+the model may run on, e.g. `"CPU_ONLY"`), `compute_precision`,
+`minimum_deployment_target` (e.g. `"iOS16"`), and `skip_model_load` (see
+above). See `onnxsim/coreml_export.py` for the full signature.
 
 ## Constant folding on the GPU (CUDA execution provider)
 

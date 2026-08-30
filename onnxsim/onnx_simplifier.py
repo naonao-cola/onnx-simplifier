@@ -2493,6 +2493,40 @@ def main():
         "$ONNX_MLIR_HOME/bin/onnx-mlir, then the onnx-mlir on PATH.",
     )
     parser.add_argument(
+        "--emit-coreml",
+        nargs="?",
+        const="",
+        default=None,
+        metavar="PATH",
+        help="Also convert the simplified model to Core ML (via coremltools; "
+        "pip install coremltools). Requires fully static input shapes. Optionally "
+        "give an output path (a '.mlpackage' directory, or '.mlmodel' with "
+        "'--coreml-format neuralnetwork'); when the flag is passed without one, it "
+        "is written next to the output model with a '.mlpackage'/'.mlmodel' "
+        "extension.",
+    )
+    parser.add_argument(
+        "--coreml-format",
+        choices=["mlprogram", "neuralnetwork"],
+        default="mlprogram",
+        help="Core ML model type --emit-coreml produces: 'mlprogram' (the modern "
+        "'.mlpackage' format) or 'neuralnetwork' (the legacy '.mlmodel' format). "
+        "Default: mlprogram.",
+    )
+    parser.add_argument(
+        "--coreml-compute-units",
+        choices=["ALL", "CPU_ONLY", "CPU_AND_GPU", "CPU_AND_NE"],
+        default="ALL",
+        help="Which compute devices the --emit-coreml model may run on. Default: ALL.",
+    )
+    parser.add_argument(
+        "--coreml-minimum-deployment-target",
+        default=None,
+        metavar="TARGET",
+        help="Minimum OS version the --emit-coreml model must run on, e.g. 'iOS16' "
+        "or 'macOS13'. Defaults to coremltools' own default.",
+    )
+    parser.add_argument(
         "--node-reduction-plot",
         help="After simplifying, plot node count per round for each "
         "simplification fixed-point loop (from the --profile trace's "
@@ -3361,6 +3395,28 @@ def main():
             print(Text(str(e), style="bold red"))
             sys.exit(1)
         print(f"MLIR written to {mlir_path}")
+
+    if args.emit_coreml is not None:
+        from onnxsim import coreml_export
+
+        if args.emit_coreml:
+            coreml_path = args.emit_coreml
+        else:
+            ext = ".mlpackage" if args.coreml_format == "mlprogram" else ".mlmodel"
+            coreml_path = os.path.splitext(args.output_model)[0] + ext
+        print(f"Converting to Core ML ({args.coreml_format}) at {coreml_path} ...")
+        try:
+            coreml_export.export_coreml(
+                model_opt,
+                coreml_path,
+                convert_to=args.coreml_format,
+                compute_units=args.coreml_compute_units,
+                minimum_deployment_target=args.coreml_minimum_deployment_target,
+            )
+        except RuntimeError as e:
+            print(Text(str(e), style="bold red"))
+            sys.exit(1)
+        print(f"Core ML model written to {coreml_path}")
 
     if check_ok:
         print("Finish! Here is the difference:")

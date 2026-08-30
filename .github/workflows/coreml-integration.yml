@@ -1,0 +1,154 @@
+name: Core ML Integration
+
+# End-to-end tests that convert onnxsim's output to Core ML using onnxsim's own
+# ONNX-to-MIL translator (tests/test_coreml_export.py, exercising
+# onnxsim/coreml_export.py and the --emit-coreml CLI flag). coremltools dropped its
+# own ONNX frontend in version 7 -- there's no off-the-shelf "convert this ONNX model"
+# call to lean on -- so this translator does the ONNX-op-to-MIL-op mapping itself and
+# only hands the result to coremltools' MIL-to-Core-ML backend.
+#
+# coremltools ships large platform-specific wheels and is not part of onnxsim's test
+# requirements, so this runs in its own workflow instead of the build-and-test matrix --
+# the same arrangement as the MLIR and ModelOpt integrations. Runs on PRs that touch the
+# Core ML export path or this harness, on a weekly schedule to catch new coremltools
+# releases, and on demand.
+#
+# Two test jobs, both against the same onnxsim wheel built once from the current tree:
+#
+# * `test-convert` (ubuntu): runs the full test_coreml_export.py suite. Converting an
+#   ONNX model to a MIL program / Core ML model needs no macOS-specific functionality
+#   (MIL construction and .mlpackage serialization are pure Python/protobuf), so this
+#   covers every op mapping and error path on a cheap, fast runner.
+# * `test-predict-macos` (macos-15): a stock macOS GitHub-hosted runner, which ships
+#   Core ML and Metal as part of the OS -- the only thing conversion alone can't cover.
+#   Converts a small model with skip_model_load=False and actually calls .predict() on
+#   it through the real Core ML runtime, then compares the result against onnxruntime,
+#   to catch anything that converts cleanly but Core ML itself rejects or computes
+#   differently.
+
+on:
+  schedule:
+    - cron: "0 9 * * 1" # Weekly, Monday 09:00 UTC
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "onnxsim/coreml_export.py"
+      - "tests/test_coreml_export.py"
+      - ".github/workflows/coreml-integration.yml"
+      - "onnxsim/__init__.py"
+      - "onnxsim/onnx_simplifier.py"
+
+concurrency:
+  group: coreml-integration-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  # Build onnxsim once from the current tree, exactly like the MLIR and ModelOpt
+  # integration workflows, and hand the wheel to the test jobs so they exercise this
+  # branch's code rather than a PyPI release.
+  build:
+    name: Build onnxsim wheel
+    runs-on: ubuntu-24.04
+    env:
+      SCCACHE_GHA_ENABLED: "on"
+      ACTIONS_CACHE_SERVICE_V2: "on"
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+          fetch-depth: 0
+      - uses: mozilla-actions/sccache-action@v0.0.11
+      - name: Build cp311 wheel
+        uses: pypa/cibuildwheel@v4.1.1
+        env:
+          CIBW_BUILD: "cp311-manylinux_x86_64"
+          CIBW_ARCHS: native
+          CIBW_BUILD_FRONTEND: "pip; args: --no-build-isolation"
+          CIBW_MANYLINUX_X86_64_IMAGE: manylinux_2_28
+          CIBW_ENVIRONMENT_PASS_LINUX: CI SCCACHE_GHA_ENABLED ACTIONS_RESULTS_URL ACTIONS_RUNTIME_TOKEN ACTIONS_CACHE_SERVICE_V2
+          CIBW_BEFORE_BUILD: "python3 -m pip install --break-system-packages cmake ninja setuptools sccache nanobind"
+          CIBW_ENVIRONMENT: CMAKE_ARGS="-DONNX_USE_PROTOBUF_SHARED_LIBS=OFF" CMAKE_GENERATOR=Ninja CMAKE_CXX_COMPILER_LAUNCHER=sccache CMAKE_LINKER_TYPE=LLD
+          CIBW_REPAIR_WHEEL_COMMAND_LINUX: "auditwheel repair -w {dest_dir} {wheel} --strip"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: onnxsim-wheel-linux
+          path: ./wheelhouse/*.whl
+
+  build-macos:
+    name: Build onnxsim wheel (macOS arm64)
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+      - name: Build wheel
+        env:
+          CMAKE_ARGS: "-DONNXSIM_BUILTIN_ORT=OFF"
+        run: |
+          python3 -m pip install --upgrade pip build
+          python3 -m pip install cmake ninja setuptools nanobind
+          python3 -m build --wheel --no-isolation -o wheelhouse
+      - uses: actions/upload-artifact@v7
+        with:
+          name: onnxsim-wheel-macos
+          path: ./wheelhouse/*.whl
+
+  test-convert:
+    name: Convert to Core ML (Linux)
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+      - uses: actions/download-artifact@v8
+        with:
+          name: onnxsim-wheel-linux
+          path: wheelhouse
+      - name: Install onnxsim wheel + coremltools
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pytest onnxruntime coremltools
+          python -m pip install wheelhouse/*.whl
+      - name: Verify the installed wheel is used (not the source tree)
+        working-directory: ${{ runner.temp }}
+        run: python -c "import onnxsim, onnxsim.onnxsim_cpp2py_export as m; print(onnxsim.__version__, m.__file__)"
+      # Run from a neutral directory so the repo root's ./onnxsim source package
+      # (without the compiled extension) does not shadow the installed wheel.
+      - name: Run Core ML export tests
+        working-directory: ${{ runner.temp }}
+        run: pytest -v "$GITHUB_WORKSPACE/tests/test_coreml_export.py"
+
+  test-predict-macos:
+    name: Convert + predict with Core ML (macOS)
+    needs: build-macos
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+      - uses: actions/download-artifact@v8
+        with:
+          name: onnxsim-wheel-macos
+          path: wheelhouse
+      - name: Install onnxsim wheel + coremltools
+        run: |
+          python3 -m pip install --upgrade pip
+          python3 -m pip install onnxruntime coremltools numpy
+          python3 -m pip install wheelhouse/*.whl
+      - name: Verify the installed wheel is used (not the source tree)
+        working-directory: ${{ runner.temp }}
+        run: python3 -c "import onnxsim, onnxsim.onnxsim_cpp2py_export as m; print(onnxsim.__version__, m.__file__)"
+      - name: Convert a small model and predict through the real Core ML runtime
+        working-directory: ${{ runner.temp }}
+        run: python3 "$GITHUB_WORKSPACE/scripts/apple/run_coreml_export_predict.py"
