@@ -1,36 +1,46 @@
 #!/usr/bin/env python3
-"""Export a Hugging Face causal LM to a static-shape Core ML decoder.
+"""Export a Hugging Face causal LM to a real KV-cache Core ML decoder.
 
 Bridges a "decoder-with-past" ONNX export (produced by `optimum-onnx`,
-https://github.com/huggingface/optimum-onnx) to `onnxsim.export_coreml`, which
-requires fully static input shapes (see `onnxsim/coreml_export.py`). A real
-KV-cache decode loop needs the `past_sequence_length` axis to grow every step,
-which is dynamic -- there is no way to bake that into one static-shape Core ML
-model without extending the translator to support symbolic shapes.
+https://github.com/huggingface/optimum-onnx) to `onnxsim.export_coreml`. Unlike
+a plain static-shape export, this keeps `sequence_length` and
+`past_sequence_length` as genuinely dynamic axes all the way through to the
+Core ML model (via `onnxsim.export_coreml`'s `dynamic_shapes` argument, see
+`onnxsim/coreml_export.py`), so the resulting `.mlpackage` is one model that
+supports both:
 
-This script sidesteps that with a different (and simpler) decode strategy: a
-single static model with a fixed context window (`--max-length`), an *always
-empty* KV cache (`past_sequence_length` pinned to 0), and the full token
-sequence recomputed from scratch on every step (right-padded up to
-`--max-length`, reading the logits at the last real position). Standard causal
-masking already guarantees padding after the current position can't influence
-earlier positions, so this is exactly as correct as real KV-cache decoding --
-just O(context length) more compute per token instead of O(1), since nothing
-from the previous step's forward pass is reused. `run_llm_decode_benchmark.py`
-is the harness that actually runs this model and measures the resulting
-decode throughput; the numbers it reports describe *this* recompute strategy,
-not a production KV-cache deployment.
+- **prefill**: one forward pass over the whole prompt (`sequence_length` =
+  prompt length, `past_sequence_length` = 0), producing the initial cache.
+- **decode**: one forward pass per new token (`sequence_length` = 1),
+  consuming and extending the growing cache from the previous step.
 
-Pipeline: `optimum.exporters.onnx` (decoder-with-past, static batch/sequence
-length) -> pin `past_sequence_length` to 0 across every input/output ->
-`onnxsim.simplify` (folds the now-constant shape/mask arithmetic -- this is
-what turns most of the graph's `Shape`/`Equal`/`Range`/`ConstantOfShape`
-plumbing into plain constants before the Core ML translator ever sees it) ->
-`onnxsim.export_coreml`.
+This is a real, O(1)-per-decode-step KV cache -- each step only computes the
+new token's attention over the accumulated `present_*` cache from every prior
+step, instead of reprocessing the whole context window every time.
+`run_llm_decode_benchmark.py` is the harness that actually runs this model
+and carries the cache across steps.
+
+Only `batch_size` is pinned to a concrete value (1); `sequence_length`,
+`past_sequence_length`, and the composite `past_sequence_length +
+sequence_length` axis ONNX exporters emit for the attention mask are left
+dynamic, bounded by `--max-context-length` (the largest prompt + generated
+tokens the exported model will accept).
+
+`optimum`'s tracer cannot trace a `sequence_length` of exactly 1 for
+Llama-family models without corrupting the attention mask (see
+`onnx_export_from_model`'s "sequence length of 1" check) -- this only affects
+which shape is used to *trace* the model, not what shapes the exported graph
+accepts at runtime, so this script traces with `sequence_length=2` and lets
+`onnxsim.simplify` + the dynamic Core ML export handle the true dynamic
+range, `sequence_length=1` decode steps included.
+
+Pipeline: `optimum.exporters.onnx` (decoder-with-past, dynamic axes) -> pin
+`batch_size` to 1 -> `onnxsim.simplify` -> `onnxsim.export_coreml` with
+`dynamic_shapes` for `sequence_length` / `past_sequence_length` / their sum.
 
 Usage:
     python export_llm_to_coreml.py HuggingFaceTB/SmolLM2-135M-Instruct \\
-        --max-length 64 --output smollm2.mlpackage
+        --max-context-length 512 --output smollm2.mlpackage
 """
 
 from __future__ import annotations
@@ -44,42 +54,26 @@ from pathlib import Path
 import onnx
 
 
-def _fix_static_shapes(
-    model: onnx.ModelProto, batch_size: int, sequence_length: int
-) -> None:
-    """Replace `optimum`'s symbolic dims with the concrete ones it actually traced.
+def _fix_batch_size(model: onnx.ModelProto, batch_size: int) -> None:
+    """Pin the `batch_size` dim_param to a concrete value everywhere it appears.
 
-    `optimum.exporters.onnx`'s `--no-dynamic-axes`/`--batch_size`/`--sequence_length`
-    flags control the dummy inputs used to *trace* the model, not the dim_param
-    names written into the exported graph's declared input/output shapes -- those
-    stay symbolic regardless. The traced computation is already specialized to the
-    concrete shapes given at export time, so it's safe (and necessary, for
-    onnxsim's Core ML exporter) to overwrite the declared shapes to match.
+    `sequence_length`, `past_sequence_length`, and the composite
+    `past_sequence_length + sequence_length` dim_params are deliberately left
+    alone -- those are the axes this script's whole point is to keep dynamic.
     """
-    dims = {
-        "batch_size": batch_size,
-        "sequence_length": sequence_length,
-        "past_sequence_length": 0,
-        "past_sequence_length + sequence_length": sequence_length,
-    }
     for vi in list(model.graph.input) + list(model.graph.output):
         tt = vi.type.tensor_type
         for d in tt.shape.dim:
-            if d.HasField("dim_param"):
-                if d.dim_param not in dims:
-                    raise ValueError(
-                        f"Unrecognized dynamic dim {d.dim_param!r} on {vi.name!r}"
-                    )
-                value = dims[d.dim_param]
+            if d.HasField("dim_param") and d.dim_param == "batch_size":
                 d.Clear()
-                d.dim_value = value
+                d.dim_value = batch_size
 
 
 def export_llm_to_coreml(
     model_id: str,
     output_path: str,
     *,
-    max_length: int = 64,
+    max_context_length: int = 512,
     opset: int = 17,
     convert_to: str = "mlprogram",
 ) -> None:
@@ -87,7 +81,8 @@ def export_llm_to_coreml(
 
     with tempfile.TemporaryDirectory(prefix="onnxsim_llm_export_") as tmpdir:
         print(
-            f"Exporting {model_id!r} to ONNX (decoder-with-past, opset {opset})...",
+            f"Exporting {model_id!r} to ONNX (decoder-with-past, dynamic shapes, "
+            f"opset {opset})...",
             flush=True,
         )
         main_export(
@@ -95,19 +90,21 @@ def export_llm_to_coreml(
             output=tmpdir,
             task="text-generation-with-past",
             opset=opset,
-            no_dynamic_axes=True,
             batch_size=1,
-            sequence_length=max_length,
+            # Only used to trace the model; the exported graph keeps
+            # sequence_length/past_sequence_length dynamic regardless (see the
+            # module docstring for why 2, not 1).
+            sequence_length=2,
         )
 
         onnx_path = Path(tmpdir) / "model.onnx"
         model = onnx.load(str(onnx_path))
 
         print(
-            f"Pinning shapes to batch=1, sequence_length={max_length}, past_sequence_length=0...",
+            "Pinning batch_size=1 (sequence_length/past_sequence_length stay dynamic)...",
             flush=True,
         )
-        _fix_static_shapes(model, batch_size=1, sequence_length=max_length)
+        _fix_batch_size(model, batch_size=1)
         onnx.checker.check_model(model)
 
         print("Simplifying with onnxsim...", flush=True)
@@ -121,8 +118,17 @@ def export_llm_to_coreml(
             flush=True,
         )
 
-        print(f"Converting to Core ML ({convert_to})...", flush=True)
-        onnxsim.export_coreml(simplified, output_path, convert_to=convert_to)
+        print(f"Converting to Core ML ({convert_to}), dynamic KV cache...", flush=True)
+        onnxsim.export_coreml(
+            simplified,
+            output_path,
+            convert_to=convert_to,
+            dynamic_shapes={
+                "sequence_length": (1, 1, max_context_length),
+                "past_sequence_length": (0, 0, max_context_length - 1),
+                "past_sequence_length + sequence_length": (1, 1, max_context_length),
+            },
+        )
 
         # Carry the tokenizer along so run_llm_decode_benchmark.py can load
         # everything it needs from `output_path`'s sibling files.
@@ -152,12 +158,13 @@ def main() -> int:
         "--output", default="model.mlpackage", help="Output .mlpackage path"
     )
     ap.add_argument(
-        "--max-length",
+        "--max-context-length",
         type=int,
-        default=64,
-        help="Fixed context window: prompt + generated tokens must fit within this many "
-        "tokens (default: 64). Every decode step reprocesses the whole window (see the "
-        "module docstring), so this is also the per-step compute cost -- keep it small.",
+        default=512,
+        help="Upper bound on prompt + generated tokens the exported model will accept "
+        "(default: 512). Unlike a fixed-context recompute model, this only bounds the "
+        "KV cache's Core ML flexible-shape range -- actual per-step compute scales with "
+        "how much of that range is in use, not the bound itself.",
     )
     ap.add_argument("--opset", type=int, default=17)
     ap.add_argument(
@@ -171,7 +178,7 @@ def main() -> int:
     export_llm_to_coreml(
         args.model_id,
         args.output,
-        max_length=args.max_length,
+        max_context_length=args.max_context_length,
         opset=args.opset,
         convert_to=args.convert_to,
     )

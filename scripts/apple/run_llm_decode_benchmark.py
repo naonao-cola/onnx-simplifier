@@ -6,20 +6,21 @@ script produced (plus the tokenizer files it copied alongside it), greedily
 generates tokens, and reports decode tokens/second and peak resident memory --
 the same two axes DeviceMark's methodology measures on-device (see
 https://devicemark.github.io/ and its METHODOLOGY.md), computed the same way
-(wall-clock decode time on the actual runtime, RSS sampled during generation).
+(wall-clock decode time on the actual runtime, RSS sampled during generation,
+prefill excluded from the decode-tok/s window).
 
 This only runs where Core ML actually executes models: macOS (loading the
 model calls into Apple's Core ML framework, which isn't part of coremltools
 itself -- see `onnxsim/coreml_export.py`'s module docstring). It has nothing
 to do with WebGPU or any browser.
 
-Decode strategy: the exported model has no growing KV cache -- every call
-reprocesses the model's whole fixed-size context window from scratch (see
-export_llm_to_coreml.py's docstring for why). So the tok/s this reports is
-this recompute strategy's throughput, not what a real KV-cache-backed
-deployment of the same model would achieve; treat it as a benchmark of this
-pipeline, not a device capability number, until export_llm_to_coreml.py grows
-real KV-cache (dynamic-shape) support.
+Decode strategy: real KV-cache decode. The exported model accepts a growing
+`past_key_values_*` cache (see export_llm_to_coreml.py); a single forward
+pass processes the whole prompt once (prefill, building the initial cache),
+then each new token is generated with its own single-token forward pass that
+reuses the accumulated cache instead of reprocessing earlier tokens. Prefill
+is timed and reported separately (as "prefill"/time-to-first-token) and
+excluded from decode tok/s, matching DeviceMark's decode-only methodology.
 
 Usage:
     python run_llm_decode_benchmark.py smollm2.mlpackage \\
@@ -58,8 +59,13 @@ def _peak_rss_mb() -> float:
 
 
 class CoreMLDecoder:
-    """Wraps a fixed-context, empty-KV-cache Core ML decoder (see
-    export_llm_to_coreml.py) for greedy generation.
+    """Wraps a real growing-KV-cache Core ML decoder (see export_llm_to_coreml.py)
+    for greedy generation.
+
+    `predict()` is called once for the whole prompt (prefill) and then once per
+    generated token (decode), carrying the `present_*` outputs of each call
+    forward as the `past_key_values_*` inputs of the next -- so each decode step
+    only pays for the one new token, not the whole context.
     """
 
     def __init__(self, mlpackage_path: str, compute_units: str = "ALL"):
@@ -67,77 +73,117 @@ class CoreMLDecoder:
             mlpackage_path, compute_units=getattr(ct.ComputeUnit, compute_units)
         )
         spec = self.mlmodel.get_spec()
-        self._input_shapes = {}
+
         self._input_dtypes = {}
+        max_context_length = None
         for inp in spec.description.input:
             arr = inp.type.multiArrayType
-            self._input_shapes[inp.name] = list(arr.shape)
             self._input_dtypes[inp.name] = _DATATYPE_TO_NUMPY.get(
                 arr.dataType, np.float32
             )
+            if inp.name == "attention_mask":
+                max_context_length = arr.shapeRange.sizeRanges[-1].upperBound
+
+        if not max_context_length or max_context_length <= 0:
+            raise RuntimeError(
+                "could not determine a max context length from the model's "
+                "'attention_mask' input -- was this exported without "
+                "dynamic_shapes (see export_llm_to_coreml.py)?"
+            )
+        self.max_context_length = max_context_length
+
+        self._present_names = [
+            o.name for o in spec.description.output if o.name.startswith("present_")
+        ]
         (self._logits_name,) = [
             o.name for o in spec.description.output if o.name.startswith("logits")
         ]
+        self._empty_past_shapes = {}
+        for inp in spec.description.input:
+            if inp.name.startswith("past_key_values_"):
+                shape = list(inp.type.multiArrayType.shape)
+                shape[2] = 0  # past_sequence_length: empty cache
+                self._empty_past_shapes[inp.name] = shape
 
-        self.max_length = self._input_shapes["input_ids"][-1]
-        self._past_kv_feeds = {
+        self.prefill_seconds = 0.0
+        self.reset()
+
+    def reset(self) -> None:
+        """Clear the KV cache. Call before starting a new generation."""
+        self._cache = {
             name: np.zeros(shape, dtype=self._input_dtypes[name])
-            for name, shape in self._input_shapes.items()
-            if name.startswith("past_key_values")
+            for name, shape in self._empty_past_shapes.items()
         }
+        self._cache_len = 0
 
-    def _forward(self, input_ids: np.ndarray, num_real: int) -> np.ndarray:
-        """Run one forward pass over the padded window; return logits at the last
-        real position."""
-        attention_mask = np.zeros(
-            (1, self.max_length), dtype=self._input_dtypes["attention_mask"]
+    def _step(self, token_ids: list[int]) -> np.ndarray:
+        """Run one forward pass over `token_ids` (the whole prompt for prefill, or
+        a single new token for a decode step), extending the cache in place.
+        Returns the logits at the last position.
+        """
+        n = len(token_ids)
+        input_ids = np.array([token_ids], dtype=self._input_dtypes["input_ids"])
+        attention_mask = np.ones(
+            (1, self._cache_len + n), dtype=self._input_dtypes["attention_mask"]
         )
-        attention_mask[0, :num_real] = 1
         position_ids = np.arange(
-            self.max_length, dtype=self._input_dtypes["position_ids"]
+            self._cache_len,
+            self._cache_len + n,
+            dtype=self._input_dtypes["position_ids"],
         )[None, :]
         feeds = {
-            "input_ids": input_ids.astype(self._input_dtypes["input_ids"]),
+            "input_ids": input_ids,
             "attention_mask": attention_mask,
             "position_ids": position_ids,
-            **self._past_kv_feeds,
+            **self._cache,
         }
         out = self.mlmodel.predict(feeds)
-        return out[self._logits_name][0, num_real - 1]
+        self._cache = {
+            name.replace("present_", "past_key_values_", 1): out[name]
+            for name in self._present_names
+        }
+        self._cache_len += n
+        return out[self._logits_name][0, -1]
 
     def generate(
         self, prompt_ids: list[int], max_new_tokens: int, eos_token_id: int | None
     ):
-        """Greedily generate up to `max_new_tokens` tokens after `prompt_ids`.
+        """Prefill on `prompt_ids`, then greedily decode up to `max_new_tokens` more
+        tokens, one at a time, reusing the growing KV cache.
 
-        Yields (token_id, seconds_for_this_step) per generated token. Stops early
-        on `eos_token_id`, or once the fixed context window is full.
+        Yields (token_id, seconds_for_this_step) per generated token. The first
+        yielded token comes from the prefill pass (its cost is reported separately
+        via `self.prefill_seconds`, so its `seconds_for_this_step` is `None`);
+        every following token is a single-token decode step. Stops early on
+        `eos_token_id`, or once the KV cache reaches this model's max context
+        length.
         """
-        if len(prompt_ids) >= self.max_length:
+        self.reset()
+        if len(prompt_ids) > self.max_context_length:
             raise ValueError(
-                f"prompt has {len(prompt_ids)} tokens, but this model's fixed "
-                f"context window is only {self.max_length} (see --max-length in "
-                "export_llm_to_coreml.py)"
+                f"prompt has {len(prompt_ids)} tokens, exceeding this model's max "
+                f"context length of {self.max_context_length} (see "
+                "--max-context-length in export_llm_to_coreml.py)"
             )
-        input_ids = np.zeros((1, self.max_length), dtype=np.int64)
-        input_ids[0, : len(prompt_ids)] = prompt_ids
-        num_real = len(prompt_ids)
 
-        while num_real < self.max_length and (
-            max_new_tokens is None or max_new_tokens > 0
-        ):
-            t0 = time.perf_counter()
-            logits = self._forward(input_ids, num_real)
+        t0 = time.perf_counter()
+        logits = self._step(prompt_ids)
+        self.prefill_seconds = time.perf_counter() - t0
+
+        dt = None
+        generated = 0
+        while max_new_tokens is None or generated < max_new_tokens:
             next_id = int(np.argmax(logits))
-            dt = time.perf_counter() - t0
-
             yield next_id, dt
+            generated += 1
             if eos_token_id is not None and next_id == eos_token_id:
                 return
-            input_ids[0, num_real] = next_id
-            num_real += 1
-            if max_new_tokens is not None:
-                max_new_tokens -= 1
+            if self._cache_len >= self.max_context_length:
+                return
+
+            t0 = time.perf_counter()
+            logits = self._step([next_id])
+            dt = time.perf_counter() - t0
 
 
 def main() -> int:
@@ -166,7 +212,7 @@ def main() -> int:
         f"Loading {args.mlpackage} (compute_units={args.compute_units}) ...", flush=True
     )
     decoder = CoreMLDecoder(args.mlpackage, compute_units=args.compute_units)
-    print(f"Fixed context window: {decoder.max_length} tokens", flush=True)
+    print(f"Max context length: {decoder.max_context_length} tokens", flush=True)
 
     prompt_ids = tokenizer(args.prompt, return_tensors="np")["input_ids"][0].tolist()
     print(f"Prompt: {args.prompt!r} ({len(prompt_ids)} tokens)", flush=True)
@@ -177,15 +223,23 @@ def main() -> int:
         prompt_ids, args.max_new_tokens, tokenizer.eos_token_id
     ):
         generated.append(token_id)
-        step_times.append(dt)
+        if dt is not None:
+            step_times.append(dt)
 
     text = tokenizer.decode(generated, skip_special_tokens=True)
     print(f"\nGenerated ({len(generated)} tokens): {text!r}", flush=True)
 
+    print(
+        f"\nprefill: {1000 * decoder.prefill_seconds:.1f} ms ({len(prompt_ids)} tokens)",
+        flush=True,
+    )
     if step_times:
         total = sum(step_times)
-        print(f"\ndecode tok/s: {len(step_times) / total:.2f}", flush=True)
-        print(f"mean step latency: {1000 * total / len(step_times):.1f} ms", flush=True)
+        print(f"decode tok/s: {len(step_times) / total:.2f}", flush=True)
+        print(
+            f"mean decode step latency: {1000 * total / len(step_times):.1f} ms",
+            flush=True,
+        )
     print(f"peak RSS: {_peak_rss_mb():.1f} MB", flush=True)
     return 0
 

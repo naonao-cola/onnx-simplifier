@@ -111,7 +111,9 @@ def _mil_const_value(model: onnx.ModelProto):
     constant-folding evaluates the op with real numpy code, so the result reflects
     exactly how the translator wired up that op's arguments.
     """
-    prog = coreml_export._build_mil_program(model, *coreml_export._import_mil())
+    prog, _flexible_inputs = coreml_export._build_mil_program(
+        model, *coreml_export._import_mil()
+    )
     return np.asarray(prog.functions["main"].outputs[0].val)
 
 
@@ -326,6 +328,125 @@ def test_zero_length_input_dimension_is_static():
         initializer=[x, numpy_helper.from_array(y, name="y")],
     )
     np.testing.assert_array_equal(_mil_const_value(model), y)
+
+
+# ---------------------------------------------------------------------------
+# Dynamic shapes (opt-in flexible input dimensions, e.g. a growing KV cache)
+# ---------------------------------------------------------------------------
+
+
+def test_dynamic_shapes_declares_flexible_input_range():
+    model = _model(
+        "relu (float[N,3] x) => (float[N,3] y) { y = Relu (x) }",
+    )
+    onnx.checker.check_model(model)
+    mlmodel = onnxsim.export_coreml(model, dynamic_shapes={"N": (1, 2, 8)})
+    (in_desc,) = mlmodel.get_spec().description.input
+    arr = in_desc.type.multiArrayType
+    assert list(arr.shape) == [2, 3]
+    assert [(r.lowerBound, r.upperBound) for r in arr.shapeRange.sizeRanges] == [
+        (1, 8),
+        (3, 3),
+    ]
+
+
+def test_dynamic_shapes_shared_dim_param_varies_together():
+    # Two inputs sharing the same dim_param (like a KV cache's many
+    # past_key_values.*.key/value inputs sharing `past_sequence_length`) must
+    # resolve to the same symbol and flexible range.
+    model = _model(
+        "add (float[N,3] x, float[N,3] y) => (float[N,3] z) { z = Add (x, y) }",
+    )
+    onnx.checker.check_model(model)
+    mlmodel = onnxsim.export_coreml(model, dynamic_shapes={"N": (1, 2, 8)})
+    x_desc, y_desc = mlmodel.get_spec().description.input
+    for desc in (x_desc, y_desc):
+        arr = desc.type.multiArrayType
+        assert [(r.lowerBound, r.upperBound) for r in arr.shapeRange.sizeRanges][0] == (
+            1,
+            8,
+        )
+
+
+def test_dynamic_shapes_composite_dim_param_needs_own_entry():
+    # ONNX exporters sometimes emit a derived dim_param like
+    # "past_sequence_length + sequence_length" as its own literal string (e.g. on
+    # an attention mask) rather than deriving it from its terms -- giving
+    # dynamic_shapes entries for "P" and "Q" alone must not satisfy "P + Q". The
+    # parser can't spell a composite dim_param directly (it only accepts plain
+    # identifiers in a shape), so build the base graph with a placeholder dim and
+    # overwrite it with the literal composite string.
+    #
+    # Uses dim names ("P"/"Q") not reused by any other test in this module: a
+    # RuntimeError raised partway through building the MIL program (as this one
+    # deliberately triggers) leaves that dim's coremltools ``Symbol`` registered
+    # process-wide with no cleanup, so a later test reusing the same name would
+    # spuriously fail with "Symbol ... is used already".
+    model = _model(
+        "add (float[P,3] x, float[Q,3] y, float[K,3] mask) => (float[K,3] z) { z = Identity (mask) }",
+    )
+    for d in (
+        model.graph.input[2].type.tensor_type.shape.dim[0],
+        model.graph.output[0].type.tensor_type.shape.dim[0],
+    ):
+        d.Clear()
+        d.dim_param = "P + Q"
+    onnx.checker.check_model(model)
+
+    with pytest.raises(RuntimeError, match=r"non-static dimension \('P \+ Q'\)"):
+        onnxsim.export_coreml(model, dynamic_shapes={"P": (1, 2, 8), "Q": (1, 2, 8)})
+
+
+def test_dynamic_axis_slice_with_runtime_only_bound():
+    # Regression test for the SmolLM2 KV-cache export bug: a Slice whose `ends`
+    # value is itself only known at runtime (derived from Gather(Shape(x)) of a
+    # dynamically-shaped input, not a compile-time constant) used to crash with
+    # "'NoneType' object is not iterable" because the translator assumed
+    # `ends.val` was always available. Here `n` (fed as `ends`) is exactly such a
+    # runtime-only value, and axis 0 (the sliced axis) is itself the dynamic
+    # dimension.
+    model = _model(
+        """
+        slice_dyn (float[N,8] x) => (float[N,8] y)
+        {
+            zero = Constant <value_ints=[0]> ()
+            axis0 = Constant <value_ints=[0]> ()
+            shp = Shape (x)
+            idx0 = Constant <value_ints=[0]> ()
+            n = Gather <axis=0> (shp, idx0)
+            y = Slice (x, zero, n, axis0)
+        }
+        """,
+    )
+    onnx.checker.check_model(model)
+    mlmodel = onnxsim.export_coreml(model, dynamic_shapes={"N": (1, 2, 8)})
+    (in_desc,) = mlmodel.get_spec().description.input
+    arr = in_desc.type.multiArrayType
+    assert [(r.lowerBound, r.upperBound) for r in arr.shapeRange.sizeRanges][0] == (
+        1,
+        8,
+    )
+
+
+def test_dynamic_shapes_expand_to_runtime_shape():
+    # Regression test: Expand's target shape derived from Shape(x) of a
+    # dynamically-shaped input is not a compile-time constant either -- this
+    # used to raise "Expand requires a compile-time-constant target 'shape'
+    # input" (fixed via a fill+broadcast-add lowering for the dynamic case).
+    model = _model(
+        """
+        expand_dyn (float[N,4] x) => (float[N,4] y)
+        {
+            shp = Shape (x)
+            one = Constant <value_float = 1.0> ()
+            y = Expand (one, shp)
+        }
+        """,
+    )
+    onnx.checker.check_model(model)
+    mlmodel = onnxsim.export_coreml(model, dynamic_shapes={"N": (1, 2, 8)})
+    (out_desc,) = mlmodel.get_spec().description.output
+    assert out_desc.name == "y"
 
 
 # ---------------------------------------------------------------------------
