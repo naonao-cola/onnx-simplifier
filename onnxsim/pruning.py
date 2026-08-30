@@ -6164,14 +6164,20 @@ def apply_structured_wanda_pruning(
 #   it) is ever removed at once, ranked by the combined importance of the
 #   group's whole Q+K+V block -- see :func:`_apply_one_gqa_chain` and
 #   :func:`_gqa_group_importance`. A connected `past_key`/`past_value` that
-#   is a constant of the expected float BNSH shape (see
+#   is a constant of the expected BNSH shape (see
 #   :func:`_past_kv_constants_are_sliceable`) is sliced along its own
 #   `kv_num_heads` axis by the same `keep_groups` index set used for K's/V's
-#   own producer weights; one of any other shape/dtype (a quantized cache,
-#   most notably -- its own `k_scale`/`v_scale` tensors would need identical
-#   slicing to stay consistent, which this module makes no attempt at), or a
-#   packed-QKV/missing-required-input node this module cannot prove safe to
-#   leave alone, is declined outright -- see :func:`_match_gqa_producer`.
+#   own producer weights -- for a plain FLOAT cache unconditionally, and for
+#   a *quantized* one (`float8e4m3fn`/`uint8`/`int8`, which this op's own
+#   schema allows specifically to shrink KV-cache memory) together with its
+#   own `k_scale`/`v_scale` tensor, sliced the identical way when that scale
+#   is itself a constant of the schema's `"PER_CHANNEL"` shape (left alone,
+#   needing no slicing at all, when `"PER_TENSOR"` -- a single broadcast
+#   scalar with no per-head axis); a cache of any other shape/dtype, a
+#   quantized cache with no scale connected or one of an unrecognized shape,
+#   or a packed-QKV/missing-required-input node this module cannot prove
+#   safe to leave alone, is declined outright -- see
+#   :func:`_match_gqa_producer`.
 # - the plain ``ai.onnx`` `Attention` (opset 24+, domain ``""``, schema
 #   confirmed against this environment's installed ``onnx==1.22.0`` via
 #   ``onnx.defs.get_schema("Attention", domain="")`` -- it is fully defined
@@ -6300,6 +6306,20 @@ def apply_structured_wanda_pruning(
 #   dimensions) throughout, oracle-verified via onnxruntime with no
 #   restriction of this pass's own.
 _ATTENTION_DOMAIN = "com.microsoft"
+
+# The three quantized-cache dtypes `GroupQueryAttention`'s own `T_CACHE` type
+# constraint allows for `past_key`/`past_value` beyond plain FLOAT -- see
+# :func:`_past_kv_constants_are_sliceable`'s own docstring for how this was
+# confirmed directly off the installed `onnxruntime` package's schema
+# registry (`float16`/`bfloat16`, `T_CACHE`'s other two members, are *not*
+# quantized dtypes and stay declined by the plain FLOAT-only branch below,
+# same as before this constant existed -- out of scope for this quantized-
+# cache-specific extension).
+_QUANTIZED_KV_CACHE_DTYPES = {
+    onnx.TensorProto.UINT8,
+    onnx.TensorProto.INT8,
+    onnx.TensorProto.FLOAT8E4M3FN,
+}
 
 
 @dataclass(frozen=True)
@@ -6564,6 +6584,7 @@ def _past_kv_constants_are_sliceable(
     initializer_map: Dict[str, onnx.TensorProto],
     indices: Tuple[int, int],
     kv_num_heads: int,
+    scale_indices: Optional[Tuple[int, int]] = None,
 ) -> bool:
     """Shared safety gate for a matched node's optional `past_key`/
     `past_value` inputs (at `indices`, a `(past_key_idx, past_value_idx)`
@@ -6589,30 +6610,72 @@ def _past_kv_constants_are_sliceable(
     could corrupt by leaving untouched, the same reasoning that already
     applied before this function existed. A *constant* one is declined
     (this function returns ``False``, and the caller's whole match fails)
-    only when its shape/dtype isn't confidently this exact layout -- not
-    FLOAT, not rank 4, or its axis-1 length doesn't already match
-    `kv_num_heads` -- rather than guessed at; this also declines a
-    quantized KV cache (`float8e4m3fn`/`uint8`/`int8`, both ops' schemas
-    allow for `past_key`/`past_value` specifically to shrink KV-cache
-    memory) outright, since a quantized cache's own `k_scale`/`v_scale`
-    tensors would need identical per-KV-head-axis slicing to stay
-    consistent and this function makes no attempt to locate or slice them.
-    Otherwise (a constant of the expected float BNSH shape, or none
-    connected at all) returns ``True`` -- :func:`_apply_one_gqa_chain`
-    itself performs the actual axis-1 slice once a match succeeds.
+    when its shape isn't confidently this exact layout -- not rank 4, or its
+    axis-1 length doesn't already match `kv_num_heads` -- rather than
+    guessed at.
+
+    A plain-FLOAT constant of that shape is always accepted (the original,
+    unquantized case). A constant whose dtype is instead one of
+    :data:`_QUANTIZED_KV_CACHE_DTYPES` (`float8e4m3fn`/`uint8`/`int8` --
+    confirmed via `GroupQueryAttention`'s own `T_CACHE` type constraint,
+    `get_all_operator_schema()` again, whose "Quantization" doc section
+    states outright: "When quantization is enabled, `past_key` and
+    `past_value` inputs can be of type `float8e4m3fn`, `uint8` or `int8`.
+    The corresponding `k_scale` and `v_scale` tensors must be provided.")
+    is a *quantized* KV cache, only ever accepted when the caller passes
+    `scale_indices` (a `(k_scale_idx, v_scale_idx)` pair the caller's own op
+    schema defines) -- `GroupQueryAttention` passes ``(12, 13)``
+    (`k_scale`/`v_scale`'s own input positions per that same schema dump);
+    the plain ``ai.onnx::Attention`` op has no `k_scale`/`v_scale` inputs at
+    all (confirmed directly off `onnx.defs.get_schema("Attention",
+    domain="")` on this environment's installed `onnx==1.22.0`: its full
+    input list is `Q, K, V, attn_mask?, past_key?, past_value?,
+    nonpad_kv_seqlen?` -- no scale inputs -- and its `past_key`/`past_value`
+    type constraints `T1`/`T2` are `{float, float16, bfloat16, double}` only,
+    with no quantized dtype in either), so :func:`_match_onnx_attention_producer`
+    never passes `scale_indices` and a quantized cache there is declined
+    outright by the branch below, exactly as it always was. When
+    `scale_indices` *is* given and the cache is quantized, the corresponding
+    scale input is required to be connected (per the schema quote above) and,
+    if it is itself a constant, must be one of the two shapes the schema's
+    own "Quantization Modes" doc section names: `"PER_TENSOR"` (a single
+    scalar, e.g. shape `[1]` -- broadcasts identically regardless of
+    `kv_num_heads`, so it needs no slicing and is left completely alone) or
+    `"PER_CHANNEL"` (`[1, kv_num_heads, 1, head_size]` -- the *same* axis-1
+    `kv_num_heads` layout as the cache tensor itself, so it is safe to slice
+    along axis 1 by the identical `keep_groups` index set, exactly the
+    reasoning that already applied to the cache tensor); any other constant
+    scale shape (not rank 4 with axis-1 length `kv_num_heads`, and not a
+    single-element broadcast) is declined the same conservative way an
+    unrecognized cache shape already is, rather than guessed at, and a
+    *dynamic* (non-constant) scale is left alone exactly like a dynamic
+    cache tensor -- the caller's own runtime data, not a weight this rewrite
+    could silently corrupt by leaving untouched. :func:`_apply_one_gqa_chain`
+    itself performs the actual axis-1 slice(s) once a match succeeds.
     """
-    for idx in indices:
+    for idx, scale_idx in zip(indices, scale_indices or (None, None)):
         if len(node.input) <= idx or not node.input[idx]:
             continue
         past_init = initializer_map.get(node.input[idx])
         if past_init is None:
             continue  # dynamic -- the caller's own runtime data, left alone
-        if (
-            past_init.data_type != onnx.TensorProto.FLOAT
-            or len(past_init.dims) != 4
-            or past_init.dims[1] != kv_num_heads
-        ):
-            return False  # not a shape/dtype this function can safely slice
+        if len(past_init.dims) != 4 or past_init.dims[1] != kv_num_heads:
+            return False  # not a shape this function can safely slice
+        if past_init.data_type == onnx.TensorProto.FLOAT:
+            continue  # unquantized cache -- nothing else to check
+        if scale_idx is None or past_init.data_type not in _QUANTIZED_KV_CACHE_DTYPES:
+            return False  # quantized dtype with nowhere to locate its scale
+        if len(node.input) <= scale_idx or not node.input[scale_idx]:
+            return False  # quantized cache with no k_scale/v_scale connected
+        scale_init = initializer_map.get(node.input[scale_idx])
+        if scale_init is None:
+            continue  # dynamic scale -- the caller's own runtime data
+        if scale_init.data_type != onnx.TensorProto.FLOAT:
+            return False  # not T_KV_SCALE's own float-only constraint
+        if int(np.prod(scale_init.dims)) == 1:
+            continue  # PER_TENSOR: a single broadcast scalar, nothing to slice
+        if len(scale_init.dims) != 4 or scale_init.dims[1] != kv_num_heads:
+            return False  # not the PER_CHANNEL [1, kv_num_heads, 1, head_size] layout
     return True
 
 
@@ -6633,13 +6696,20 @@ def _match_gqa_producer(
     one); `num_heads`/`kv_num_heads` attributes with `num_heads` a positive
     multiple of `kv_num_heads`; and a `past_key`/`past_value` (indices 3/4)
     this module can safely act on, per
-    :func:`_past_kv_constants_are_sliceable` -- a constant one is sliced
-    along its own `kv_num_heads` axis by :func:`_apply_one_gqa_chain`, using
-    exactly the same `keep_groups` index set K's/V's own producer weights
-    are sliced by. cos_cache/sin_cache (indices 7/8, for rotary position
-    embedding), if present, are always left alone regardless: both are
-    `[max_sequence_length, rotary_dim/2]`, broadcast identically across
-    every head, so a head/group count change can never invalidate them.
+    :func:`_past_kv_constants_are_sliceable` (passed `scale_indices=(12,
+    13)`, `k_scale`/`v_scale`'s own input positions on this op's schema) --
+    a constant float BNSH cache is sliced along its own `kv_num_heads` axis
+    by :func:`_apply_one_gqa_chain`, using exactly the same `keep_groups`
+    index set K's/V's own producer weights are sliced by; a constant
+    quantized (`float8e4m3fn`/`uint8`/`int8`) cache is sliced the same way,
+    together with its own `k_scale`/`v_scale` when that scale is itself a
+    constant of the schema's `"PER_CHANNEL"` shape (left alone, needing no
+    slicing, when `"PER_TENSOR"` -- see :func:`_past_kv_constants_are_sliceable`'s
+    own docstring for the full quantized-cache reasoning). cos_cache/sin_cache
+    (indices 7/8, for rotary position embedding), if present, are always left
+    alone regardless: both are `[max_sequence_length, rotary_dim/2]`,
+    broadcast identically across every head, so a head/group count change
+    can never invalidate them.
     """
     if node.domain != _ATTENTION_DOMAIN or node.op_type != "GroupQueryAttention":
         return None
@@ -6658,7 +6728,7 @@ def _match_gqa_producer(
         return None
 
     if not _past_kv_constants_are_sliceable(
-        node, initializer_map, (3, 4), kv_num_heads
+        node, initializer_map, (3, 4), kv_num_heads, scale_indices=(12, 13)
     ):
         return None
 
@@ -6703,14 +6773,21 @@ def _match_onnx_attention_producer(
     and this op has no `seqlens_k`/`total_sequence_length` equivalent to
     require) get the same safety gate :func:`_match_gqa_producer` gives its
     own `past_key`/`past_value`, via the same shared
-    :func:`_past_kv_constants_are_sliceable` -- a constant one of the
-    expected float BNSH shape is sliced along its own `kv_num_heads` axis by
-    :func:`_apply_one_gqa_chain`, using the same `keep_groups` index set
-    K's/V's own producer weights are sliced by; one of any other shape/dtype
-    declines the whole match, and a dynamic one is left alone as always.
-    `nonpad_kv_seqlen` (index 6), like `GroupQueryAttention`'s own
-    `seqlens_k`, is `[batch_size]`-shaped and independent of head count, so
-    its presence never blocks a match either.
+    :func:`_past_kv_constants_are_sliceable` -- but called here with no
+    `scale_indices` (left at that parameter's default, `None`), unlike
+    `GroupQueryAttention`'s own call: this op's schema (confirmed via
+    `onnx.defs.get_schema("Attention", domain="")`) has no `k_scale`/
+    `v_scale` inputs at all, and its `past_key`/`past_value` type
+    constraints (`T1`/`T2`) list only `float`/`float16`/`bfloat16`/`double`
+    -- no quantized dtype -- so a constant `past_key`/`past_value` here is
+    only ever sliced when it is that expected float BNSH shape, along its
+    own `kv_num_heads` axis, by :func:`_apply_one_gqa_chain`, using the same
+    `keep_groups` index set K's/V's own producer weights are sliced by; a
+    quantized cache (off-schema for this particular op) still declines the
+    whole match outright, exactly as before, and a dynamic one is left alone
+    as always. `nonpad_kv_seqlen` (index 6), like `GroupQueryAttention`'s
+    own `seqlens_k`, is `[batch_size]`-shaped and independent of head count,
+    so its presence never blocks a match either.
     """
     if node.domain != "" or node.op_type != "Attention":
         return None
@@ -7089,12 +7166,19 @@ def _apply_one_gqa_chain(
     hidden dim -- laid out per *query* head at *V's* own per-head width) --
     never an individual query head in isolation. A connected constant
     `past_key`/`past_value` (see :func:`_past_kv_constants_are_sliceable`,
-    already confirmed at match time to be a float BNSH-format tensor) is
-    sliced along its own `kv_num_heads` axis (axis 1) by the same
-    `keep_groups` index set. Returns ``(producer_weight_names,
-    consumer_weight_name, stale_output_names)`` on success, or ``None`` if
-    `sparsity` rounds to no groups dropped for this block (a no-op, left for
-    the caller to skip).
+    already confirmed at match time to be a BNSH-format tensor, plain FLOAT
+    or a quantized `float8e4m3fn`/`uint8`/`int8` cache with a
+    schema-conforming `k_scale`/`v_scale`) is sliced along its own
+    `kv_num_heads` axis (axis 1) by the same `keep_groups` index set; for a
+    `GroupQueryAttention` block whose cache is quantized, its own
+    `k_scale`/`v_scale` (only ever present on this op -- see
+    :func:`_match_gqa_producer`'s own docstring) is sliced the identical way
+    when it is itself a constant of the schema's `"PER_CHANNEL"` shape
+    (`[1, kv_num_heads, 1, head_size]`), left alone when `"PER_TENSOR"` (a
+    single broadcast scalar, already confirmed to need no slicing) or
+    dynamic. Returns ``(producer_weight_names, consumer_weight_name,
+    stale_output_names)`` on success, or ``None`` if `sparsity` rounds to no
+    groups dropped for this block (a no-op, left for the caller to skip).
     """
     h = chain.kv_num_heads
     keep_count = max(1, h - round(h * sparsity))
@@ -7160,8 +7244,9 @@ def _apply_one_gqa_chain(
     # the plain ai.onnx op's own at 4/5 (see `_match_gqa_producer`'s and
     # `_match_onnx_attention_producer`'s own docstrings) -- both already
     # confirmed, at match time, to be either absent/dynamic (nothing to do
-    # here) or a float BNSH-format constant safe to slice along axis 1 by
-    # `keep_groups` (see :func:`_past_kv_constants_are_sliceable`).
+    # here) or a BNSH-format constant (plain FLOAT, or quantized with a
+    # schema-conforming scale) safe to slice along axis 1 by `keep_groups`
+    # (see :func:`_past_kv_constants_are_sliceable`).
     is_gqa = (
         chain.node.domain == _ATTENTION_DOMAIN
         and chain.node.op_type == "GroupQueryAttention"
@@ -7173,6 +7258,26 @@ def _apply_one_gqa_chain(
         past_init = initializer_map.get(chain.node.input[idx])
         if past_init is not None:
             _slice_axis1(past_init, keep_groups)
+
+    # `k_scale`/`v_scale` (indices 12/13, `GroupQueryAttention`-only -- the
+    # plain ai.onnx op's schema has no such inputs, see
+    # `_match_onnx_attention_producer`'s own docstring) were already
+    # confirmed at match time to be either absent/dynamic (nothing to do
+    # here), a `"PER_TENSOR"` scalar broadcast (no per-head axis, left as-is
+    # below), or a `"PER_CHANNEL"` `[1, kv_num_heads, 1, head_size]` float
+    # constant -- the same axis-1 `kv_num_heads` layout as the cache tensor
+    # itself -- safe to slice along axis 1 by the identical `keep_groups`
+    # (see :func:`_past_kv_constants_are_sliceable`).
+    if is_gqa:
+        for idx in (12, 13):
+            if len(chain.node.input) <= idx or not chain.node.input[idx]:
+                continue
+            scale_init = initializer_map.get(chain.node.input[idx])
+            if scale_init is None:
+                continue  # dynamic -- caller's own runtime data, left alone
+            if len(scale_init.dims) == 4 and scale_init.dims[1] == h:
+                _slice_axis1(scale_init, keep_groups)
+            # else: PER_TENSOR broadcast scalar -- no per-head axis to slice
 
     new_kv_num_heads = keep_count
     new_num_heads = keep_count * group_size
