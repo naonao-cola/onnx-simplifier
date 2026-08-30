@@ -746,51 +746,140 @@ def test_wanda_pruning_conv_protects_high_activation_channel():
     assert wanda_err < magnitude_err
 
 
-def test_wanda_pruning_conv_falls_back_to_magnitude_for_auto_pad():
-    # auto_pad SAME_UPPER's padding depends on the input's own spatial
-    # size, not something fixed per node -- :func:`_conv_spatial_attrs`
-    # declines it, so Wanda must fall back to plain magnitude for this
-    # layer rather than guessing at the padding.
-    Cin, Cout, spatial = 3, 6, 10
-    rng = np.random.default_rng(74)
-    w = rng.standard_normal((Cout, Cin, 3, 3)).astype(np.float32)
+def test_wanda_pruning_conv_auto_pad_matches_manual_im2col_importance_oracle_exactly():
+    # An earlier version of this module declined auto_pad entirely
+    # (_conv_spatial_attrs used to return None for any non-"NOTSET" value)
+    # and fell back to plain magnitude. auto_pad's own padding is now
+    # resolved per calibration batch from the input's own spatial size
+    # (_resolve_conv_pads, per the ONNX Conv operator's own auto_pad
+    # formula) instead. kh=3, stride=2, spatial=8 is deliberately chosen so
+    # SAME_UPPER's own pad_total = 1 is *odd*, making the resolved padding
+    # asymmetric (pad_top=0, pad_bottom=1): a bug putting the extra pixel
+    # on the wrong edge, or splitting it evenly, would silently shift every
+    # captured patch and diverge from this independently-padded oracle.
+    Cin, Cout, kh, kw, spatial, stride = 3, 6, 3, 3, 8, 2
+    rng = np.random.default_rng(101)
+    w = rng.standard_normal((Cout, Cin, kh, kw)).astype(np.float32)
+    out_spatial = 4  # ceil(8 / 2)
     model = _single_conv_model(
-        w, spatial=spatial, extra_attrs='auto_pad="SAME_UPPER"', out_spatial=spatial
+        w,
+        spatial=spatial,
+        extra_attrs=f'auto_pad="SAME_UPPER", strides=[{stride},{stride}]',
+        out_spatial=out_spatial,
     )
-    x = rng.standard_normal((2, Cin, spatial, spatial)).astype(np.float32)
 
-    magnitude_pruned = onnxsim.apply_magnitude_pruning(model, sparsity=0.5)
-    wanda_pruned = onnxsim.apply_wanda_pruning(
+    rng_x = np.random.default_rng(102)
+    x = rng_x.standard_normal((3, Cin, spatial, spatial)).astype(np.float32)
+
+    pruned = onnxsim.apply_wanda_pruning(
         model, calibration_data=[{"X": x}], sparsity=0.5
     )
-    onnx.checker.check_model(wanda_pruned)
-    np.testing.assert_array_equal(
-        _conv_weight(wanda_pruned), _conv_weight(magnitude_pruned)
-    )
+    onnx.checker.check_model(pruned)
+    # End-to-end sanity: the padded/strided pruned model still actually
+    # runs through onnxruntime and produces the shape its own graph
+    # declares.
+    (float_y,) = _run(model, {"X": x})
+    (pruned_y,) = _run(pruned, {"X": x})
+    assert pruned_y.shape == float_y.shape == (3, Cout, out_spatial, out_spatial)
+    assert np.all(np.isfinite(pruned_y))
+
+    # Independent oracle: ONNX's own auto_pad formula
+    # (https://onnx.ai/onnx/operators/onnx__Conv.html), computed fresh here
+    # rather than calling onnxsim.pruning._resolve_conv_pads.
+    pad_total = max(0, (out_spatial - 1) * stride + kh - spatial)
+    pad_lo, pad_hi = pad_total // 2, pad_total - pad_total // 2
+    assert (pad_lo, pad_hi) == (0, 1)  # confirms the deliberately odd split
+    xp = np.pad(x, ((0, 0), (0, 0), (pad_lo, pad_hi), (pad_lo, pad_hi)))
+    K = Cin * kh * kw
+    patches = np.zeros((x.shape[0] * out_spatial * out_spatial, K), dtype=np.float64)
+    idx = 0
+    for ni in range(x.shape[0]):
+        for oh in range(out_spatial):
+            for ow in range(out_spatial):
+                patch = xp[
+                    ni,
+                    :,
+                    oh * stride : oh * stride + kh,
+                    ow * stride : ow * stride + kw,
+                ].astype(np.float64)
+                patches[idx] = patch.reshape(-1)
+                idx += 1
+    act_norm = np.sqrt(np.mean(np.square(patches), axis=0))
+
+    w_flat = w.astype(np.float64).reshape(Cout, K)
+    importance = np.abs(w_flat) * act_norm[np.newaxis, :]
+    keep = round(K * 0.5)
+    order = np.argsort(importance, axis=1)
+    drop = order[:, : K - keep]
+    mask = np.ones((Cout, K), dtype=bool)
+    np.put_along_axis(mask, drop, False, axis=1)
+    expected = np.where(mask, w_flat, 0.0).reshape(Cout, Cin, kh, kw)
+
+    np.testing.assert_allclose(_conv_weight(pruned).astype(np.float64), expected)
 
 
-def test_wanda_pruning_conv_falls_back_to_magnitude_for_dilated_conv():
-    # A dilated receptive field's (kh, kw) offsets aren't evenly spaced in
-    # the padded input the way sliding_window_view assumes --
-    # :func:`_conv_spatial_attrs` declines non-all-ones dilations, so
-    # Wanda must fall back to plain magnitude for this layer too.
-    Cin, Cout, spatial = 3, 6, 10
-    rng = np.random.default_rng(75)
-    w = rng.standard_normal((Cout, Cin, 3, 3)).astype(np.float32)
-    out_spatial = spatial - 2 * (3 - 1)  # dilation=2, kernel=3, no padding
+def test_wanda_pruning_conv_dilated_matches_manual_im2col_importance_oracle_exactly():
+    # An earlier version of this module declined every non-unit dilation
+    # entirely (sliding_window_view's own unit-offset window assumed
+    # unit-spaced taps) and fell back to plain magnitude. Each of the
+    # kh*kw taps is now extracted from its own dilation-offset strided
+    # slice instead. Adversarial by construction: kernel_shape=[3,3],
+    # dilations=[3,3] spaces the 9 taps 3 pixels apart within a 7x7
+    # effective receptive field (spatial=13) -- if onnxsim's own tap
+    # offsetting were off by even one pixel (e.g. silently treating
+    # dilation as if it were 1, the bug the earlier decline specifically
+    # guarded against), every captured patch would read the wrong pixels
+    # and the exact-equality oracle comparison below would fail.
+    Cin, Cout, kh, kw, spatial, dilation = 3, 6, 3, 3, 13, 3
+    rng = np.random.default_rng(103)
+    w = rng.standard_normal((Cout, Cin, kh, kw)).astype(np.float32)
+    eff_k = (kh - 1) * dilation + 1  # 7
+    out_spatial = spatial - eff_k + 1  # 7
     model = _single_conv_model(
-        w, spatial=spatial, extra_attrs="dilations=[2,2]", out_spatial=out_spatial
+        w,
+        spatial=spatial,
+        extra_attrs=f"dilations=[{dilation},{dilation}]",
+        out_spatial=out_spatial,
     )
-    x = rng.standard_normal((2, Cin, spatial, spatial)).astype(np.float32)
 
-    magnitude_pruned = onnxsim.apply_magnitude_pruning(model, sparsity=0.5)
-    wanda_pruned = onnxsim.apply_wanda_pruning(
+    rng_x = np.random.default_rng(104)
+    x = rng_x.standard_normal((3, Cin, spatial, spatial)).astype(np.float32)
+
+    pruned = onnxsim.apply_wanda_pruning(
         model, calibration_data=[{"X": x}], sparsity=0.5
     )
-    onnx.checker.check_model(wanda_pruned)
-    np.testing.assert_array_equal(
-        _conv_weight(wanda_pruned), _conv_weight(magnitude_pruned)
-    )
+    onnx.checker.check_model(pruned)
+    (float_y,) = _run(model, {"X": x})
+    (pruned_y,) = _run(pruned, {"X": x})
+    assert pruned_y.shape == float_y.shape == (3, Cout, out_spatial, out_spatial)
+    assert np.all(np.isfinite(pruned_y))
+
+    K = Cin * kh * kw
+    patches = np.zeros((x.shape[0] * out_spatial * out_spatial, K), dtype=np.float64)
+    idx = 0
+    for ni in range(x.shape[0]):
+        for oh in range(out_spatial):
+            for ow in range(out_spatial):
+                patch = x[
+                    ni,
+                    :,
+                    oh : oh + eff_k : dilation,
+                    ow : ow + eff_k : dilation,
+                ].astype(np.float64)
+                patches[idx] = patch.reshape(-1)
+                idx += 1
+    act_norm = np.sqrt(np.mean(np.square(patches), axis=0))
+
+    w_flat = w.astype(np.float64).reshape(Cout, K)
+    importance = np.abs(w_flat) * act_norm[np.newaxis, :]
+    keep = round(K * 0.5)
+    order = np.argsort(importance, axis=1)
+    drop = order[:, : K - keep]
+    mask = np.ones((Cout, K), dtype=bool)
+    np.put_along_axis(mask, drop, False, axis=1)
+    expected = np.where(mask, w_flat, 0.0).reshape(Cout, Cin, kh, kw)
+
+    np.testing.assert_allclose(_conv_weight(pruned).astype(np.float64), expected)
 
 
 def test_wanda_pruning_conv_grouped_uses_own_groups_activation_norm():
@@ -1349,43 +1438,123 @@ def test_sparsegpt_pruning_conv_no_calibration_batches_leaves_layer_untouched():
     np.testing.assert_array_equal(_conv_weight(pruned), w)
 
 
-def test_sparsegpt_pruning_conv_declines_auto_pad():
-    # auto_pad SAME_UPPER's padding depends on the input's own spatial
-    # size -- _conv_spatial_attrs declines it, so (unlike Wanda, which
-    # falls back to plain magnitude) SparseGPT must leave the layer
-    # completely untouched: there is no data-free fallback here.
-    Cin, Cout, spatial = 3, 6, 10
+def test_sparsegpt_pruning_conv_auto_pad_matches_reference_transliteration():
+    # An earlier version of this module declined auto_pad entirely and left
+    # the layer completely untouched (no data-free fallback for
+    # SparseGPT). auto_pad's own padding is now resolved per calibration
+    # batch from the input's own spatial size (_resolve_conv_pads). Same
+    # deliberately-odd-pad_total setup as the Wanda auto_pad oracle test
+    # above (kh=3, stride=2, spatial=8 -> SAME_UPPER pad_total=1, split
+    # pad_top=0/pad_bottom=1) so a wrong-edge or symmetric-split bug would
+    # be caught, this time via the full im2col Hessian
+    # (_reference_sparsegpt), not just a per-offset norm.
+    Cin, Cout, kh, kw, spatial, stride = 3, 6, 3, 3, 8, 2
     rng = np.random.default_rng(98)
-    w = rng.standard_normal((Cout, Cin, 3, 3)).astype(np.float32)
+    w = rng.standard_normal((Cout, Cin, kh, kw)).astype(np.float32) * 0.5
+    out_spatial = 4  # ceil(8 / 2)
     model = _single_conv_model(
-        w, spatial=spatial, extra_attrs='auto_pad="SAME_UPPER"', out_spatial=spatial
+        w,
+        spatial=spatial,
+        extra_attrs=f'auto_pad="SAME_UPPER", strides=[{stride},{stride}]',
+        out_spatial=out_spatial,
     )
-    x_cal = rng.standard_normal((4, Cin, spatial, spatial)).astype(np.float32)
+    rng_x = np.random.default_rng(198)
+    x = rng_x.standard_normal((3, Cin, spatial, spatial)).astype(np.float32)
 
     pruned = onnxsim.apply_sparsegpt_pruning(
-        model, calibration_data=[{"X": x_cal}], sparsity=0.5
+        model, calibration_data=[{"X": x}], sparsity=0.5, proc_block_size=12
     )
-    np.testing.assert_array_equal(_conv_weight(pruned), w)
+    onnx.checker.check_model(pruned)
+    (float_y,) = _run(model, {"X": x})
+    (pruned_y,) = _run(pruned, {"X": x})
+    assert pruned_y.shape == float_y.shape == (3, Cout, out_spatial, out_spatial)
+    assert np.all(np.isfinite(pruned_y))
+
+    pad_total = max(0, (out_spatial - 1) * stride + kh - spatial)
+    pad_lo, pad_hi = pad_total // 2, pad_total - pad_total // 2
+    assert (pad_lo, pad_hi) == (0, 1)  # confirms the deliberately odd split
+    xp = np.pad(x, ((0, 0), (0, 0), (pad_lo, pad_hi), (pad_lo, pad_hi)))
+    K = Cin * kh * kw
+    patches = np.zeros((x.shape[0] * out_spatial * out_spatial, K), dtype=np.float64)
+    idx = 0
+    for ni in range(x.shape[0]):
+        for oh in range(out_spatial):
+            for ow in range(out_spatial):
+                patch = xp[
+                    ni,
+                    :,
+                    oh * stride : oh * stride + kh,
+                    ow * stride : ow * stride + kw,
+                ].astype(np.float64)
+                patches[idx] = patch.reshape(-1)
+                idx += 1
+    h = patches.T @ patches
+
+    w_nk = w.astype(np.float64).reshape(Cout, K)
+    expected_nk = _reference_sparsegpt(
+        w_nk, h, sparsity=0.5, n=None, m=None, percdamp=0.01, blocksize=12
+    )
+    expected = expected_nk.reshape(Cout, Cin, kh, kw)
+    np.testing.assert_allclose(
+        _conv_weight(pruned).astype(np.float64), expected, rtol=1e-6, atol=1e-6
+    )
 
 
-def test_sparsegpt_pruning_conv_declines_dilated_conv():
-    # A dilated receptive field's (kh, kw) offsets aren't evenly spaced in
-    # the padded input the way sliding_window_view assumes --
-    # _conv_spatial_attrs declines non-all-ones dilations, so this layer
-    # is left completely untouched too.
-    Cin, Cout, spatial = 3, 6, 10
+def test_sparsegpt_pruning_conv_dilated_matches_reference_transliteration():
+    # An earlier version of this module declined every non-unit dilation
+    # entirely and left the layer completely untouched. Same
+    # deliberately-spaced-out adversarial dilation setup as the Wanda
+    # dilation oracle test above (kernel_shape=[3,3], dilations=[3,3],
+    # spatial=13 -> taps 3 pixels apart within a 7x7 effective receptive
+    # field): an off-by-one in tap offsetting would misalign every column
+    # of the Hessian this test's own independent im2col unfold builds.
+    Cin, Cout, kh, kw, spatial, dilation = 3, 6, 3, 3, 13, 3
     rng = np.random.default_rng(99)
-    w = rng.standard_normal((Cout, Cin, 3, 3)).astype(np.float32)
-    out_spatial = spatial - 2 * (3 - 1)  # dilation=2, kernel=3, no padding
+    w = rng.standard_normal((Cout, Cin, kh, kw)).astype(np.float32) * 0.5
+    eff_k = (kh - 1) * dilation + 1  # 7
+    out_spatial = spatial - eff_k + 1  # 7
     model = _single_conv_model(
-        w, spatial=spatial, extra_attrs="dilations=[2,2]", out_spatial=out_spatial
+        w,
+        spatial=spatial,
+        extra_attrs=f"dilations=[{dilation},{dilation}]",
+        out_spatial=out_spatial,
     )
-    x_cal = rng.standard_normal((4, Cin, spatial, spatial)).astype(np.float32)
+    rng_x = np.random.default_rng(199)
+    x = rng_x.standard_normal((3, Cin, spatial, spatial)).astype(np.float32)
 
     pruned = onnxsim.apply_sparsegpt_pruning(
-        model, calibration_data=[{"X": x_cal}], sparsity=0.5
+        model, calibration_data=[{"X": x}], sparsity=0.5, proc_block_size=12
     )
-    np.testing.assert_array_equal(_conv_weight(pruned), w)
+    onnx.checker.check_model(pruned)
+    (float_y,) = _run(model, {"X": x})
+    (pruned_y,) = _run(pruned, {"X": x})
+    assert pruned_y.shape == float_y.shape == (3, Cout, out_spatial, out_spatial)
+    assert np.all(np.isfinite(pruned_y))
+
+    K = Cin * kh * kw
+    patches = np.zeros((x.shape[0] * out_spatial * out_spatial, K), dtype=np.float64)
+    idx = 0
+    for ni in range(x.shape[0]):
+        for oh in range(out_spatial):
+            for ow in range(out_spatial):
+                patch = x[
+                    ni,
+                    :,
+                    oh : oh + eff_k : dilation,
+                    ow : ow + eff_k : dilation,
+                ].astype(np.float64)
+                patches[idx] = patch.reshape(-1)
+                idx += 1
+    h = patches.T @ patches
+
+    w_nk = w.astype(np.float64).reshape(Cout, K)
+    expected_nk = _reference_sparsegpt(
+        w_nk, h, sparsity=0.5, n=None, m=None, percdamp=0.01, blocksize=12
+    )
+    expected = expected_nk.reshape(Cout, Cin, kh, kw)
+    np.testing.assert_allclose(
+        _conv_weight(pruned).astype(np.float64), expected, rtol=1e-6, atol=1e-6
+    )
 
 
 def test_sparsegpt_pruning_conv_reconstructs_better_than_a_same_mask_style_baseline():
@@ -1673,10 +1842,15 @@ def test_sparsegpt_pruning_conv_grouped_reaches_target_sparsity():
     assert onnxsim.weight_sparsity(pruned) == pytest.approx(0.5, abs=0.02)
 
 
-def test_sparsegpt_pruning_conv_grouped_declines_auto_pad():
-    # Verification bar item 5: a grouped Conv still gets no data-free
-    # fallback -- auto_pad SAME_UPPER makes _conv_spatial_attrs decline the
-    # node, so the whole layer (every group) is left completely untouched.
+def test_sparsegpt_pruning_conv_grouped_auto_pad_reaches_target_sparsity():
+    # An earlier version of this module declined auto_pad entirely, so a
+    # grouped Conv with auto_pad got no data-free fallback (every group
+    # left completely untouched). auto_pad is now resolved per calibration
+    # batch (_resolve_conv_pads) before each group's own im2col Hessian is
+    # built, so a grouped auto_pad Conv is pruned like any other -- the
+    # padding/dilation resolution happens once per node, upstream of the
+    # per-group channel-slicing this test's grouped siblings elsewhere in
+    # this file already hold to a stricter (exact-oracle) bar.
     Cin_per_group, Cout, group, spatial = 2, 8, 2, 10
     rng = np.random.default_rng(137)
     w = rng.standard_normal((Cout, Cin_per_group, 3, 3)).astype(np.float32)
@@ -1687,14 +1861,23 @@ def test_sparsegpt_pruning_conv_grouped_declines_auto_pad():
         extra_attrs='auto_pad="SAME_UPPER"',
         out_spatial=spatial,
     )
-    x_cal = rng.standard_normal((4, Cin_per_group * group, spatial, spatial)).astype(
+    x_cal = rng.standard_normal((16, Cin_per_group * group, spatial, spatial)).astype(
         np.float32
     )
 
     pruned = onnxsim.apply_sparsegpt_pruning(
         model, calibration_data=[{"X": x_cal}], sparsity=0.5
     )
-    np.testing.assert_array_equal(_conv_weight(pruned), w)
+    onnx.checker.check_model(pruned)
+    assert not np.array_equal(_conv_weight(pruned), w)  # actually pruned, not skipped
+    assert onnxsim.weight_sparsity(pruned) == pytest.approx(0.5, abs=0.02)
+    x = rng.standard_normal((2, Cin_per_group * group, spatial, spatial)).astype(
+        np.float32
+    )
+    (float_y,) = _run(model, {"X": x})
+    (pruned_y,) = _run(pruned, {"X": x})
+    assert pruned_y.shape == float_y.shape
+    assert np.all(np.isfinite(pruned_y))
 
 
 def test_sparsegpt_pruning_conv_grouped_reconstructs_better_than_a_same_mask_style_baseline():
@@ -3139,6 +3322,123 @@ def test_structured_pruning_conv_chain_matches_manual_channel_deletion_exactly()
     np.testing.assert_allclose(y, y_oracle, rtol=1e-5, atol=1e-5)
 
 
+def _auto_pad_conv_pair_model(w1, w2, spatial=10, activation="Relu"):
+    # The auto_pad analogue of _conv_pair_model: both Convs keep their own
+    # non-default auto_pad="SAME_UPPER" -- neither _match_conv_producer nor
+    # _match_conv_consumer (the matchers apply_structured_pruning/
+    # apply_structured_wanda_pruning's own producer/consumer chain-walk
+    # uses) reads that attribute at all, so this is expected to be matched,
+    # sliced, and re-run exactly like the plain _conv_pair_model chain
+    # above -- see this module's own docstring for why: channel pruning
+    # only ever indexes the weight tensor's own out_channels/in_channels
+    # axes, never the spatial receptive-field math auto_pad changes.
+    # auto_pad="SAME_UPPER" keeps each Conv's own output spatial size equal
+    # to its input's, so the chain composes with no separate out_spatial
+    # bookkeeping.
+    Cin, C2 = w1.shape[1], w2.shape[0]
+    return _model(
+        f"""
+        g (float[N,{Cin},{spatial},{spatial}] X) => (float[N,{C2},{spatial},{spatial}] Y)
+        {{
+          h = Conv<kernel_shape=[3,3], auto_pad="SAME_UPPER">(X, W1)
+          a = {activation}(h)
+          Y = Conv<kernel_shape=[3,3], auto_pad="SAME_UPPER">(a, W2)
+        }}
+        """,
+        initializer=[_f32(w1, "W1"), _f32(w2, "W2")],
+    )
+
+
+def _dilated_conv_pair_model(w1, w2, dilation=3, spatial=19, activation="Relu"):
+    # The dilations analogue of _conv_pair_model, same reasoning as
+    # _auto_pad_conv_pair_model above but for a non-unit dilation instead
+    # (kept in a separate model/test from auto_pad -- not because
+    # apply_structured_pruning/apply_structured_wanda_pruning need it kept
+    # separate, but because onnxruntime's own CPU EP rejects a Conv node
+    # combining a non-unit dilation with auto_pad SAME_UPPER/SAME_LOWER
+    # ("Dilation not supported for AutoPadType::SAME_UPPER or
+    # AutoPadType::SAME_LOWER"), discovered empirically while writing this
+    # test -- an onnxruntime limitation on the *input* model this pass
+    # would be asked to prune, not anything about onnxsim's own pruning
+    # logic, but it means a real onnxruntime-executable adversarial model
+    # can't combine both non-default attributes in one node). No explicit
+    # padding either (`pads` defaults to all-zero, "VALID"-equivalent), so
+    # each Conv's own output spatial size shrinks by the dilated kernel's
+    # own effective extent.
+    Cin, C2 = w1.shape[1], w2.shape[0]
+    eff_k = (3 - 1) * dilation + 1
+    mid_spatial = spatial - eff_k + 1
+    out_spatial = mid_spatial - eff_k + 1
+    d = f"dilations=[{dilation},{dilation}]"
+    return _model(
+        f"""
+        g (float[N,{Cin},{spatial},{spatial}] X) => (float[N,{C2},{out_spatial},{out_spatial}] Y)
+        {{
+          h = Conv<kernel_shape=[3,3], {d}>(X, W1)
+          a = {activation}(h)
+          Y = Conv<kernel_shape=[3,3], {d}>(a, W2)
+        }}
+        """,
+        initializer=[_f32(w1, "W1"), _f32(w2, "W2")],
+    )
+
+
+def test_structured_pruning_conv_chain_with_auto_pad_matches_oracle_exactly():
+    # Confirms empirically (not just "in principle") that a non-default
+    # auto_pad Conv chain is *already* matched and pruned correctly by
+    # apply_structured_pruning -- _match_conv_producer/_match_conv_consumer
+    # never inspect that attribute at all (see this module's own docstring
+    # and _auto_pad_conv_pair_model above), so there is no restriction here
+    # to lift, only this regression test locking the already-correct
+    # behavior in place. Same oracle bar as
+    # test_structured_pruning_conv_chain_matches_manual_channel_deletion_exactly:
+    # exact equivalence, via onnxruntime, to deleting the same output
+    # filters by hand -- auto_pad itself must also survive onto both the
+    # pruned producer and consumer unchanged for this to pass, since the
+    # oracle model carries it too.
+    Cin, C1, C2 = 3, 16, 8
+    rng = np.random.default_rng(230)
+    w1 = rng.standard_normal((C1, Cin, 3, 3)).astype(np.float32)
+    w2 = rng.standard_normal((C2, C1, 3, 3)).astype(np.float32)
+    model = _auto_pad_conv_pair_model(w1, w2)
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    keep = _oracle_keep_indices_conv(w1, C1 // 2)
+    oracle = _auto_pad_conv_pair_model(w1[keep], w2[:, keep])
+
+    rng_x = np.random.default_rng(231)
+    x = rng_x.standard_normal((2, Cin, 10, 10)).astype(np.float32)
+    (y,) = _run(pruned, {"X": x})
+    (y_oracle,) = _run(oracle, {"X": x})
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-5, atol=1e-5)
+
+
+def test_structured_pruning_conv_chain_with_dilation_matches_oracle_exactly():
+    # The dilation analogue of the auto_pad test above -- same "no
+    # restriction to lift, only a regression test locking already-correct
+    # behavior in place" bar, this time for a non-unit dilations Conv
+    # chain.
+    Cin, C1, C2 = 3, 16, 8
+    rng = np.random.default_rng(232)
+    w1 = rng.standard_normal((C1, Cin, 3, 3)).astype(np.float32)
+    w2 = rng.standard_normal((C2, C1, 3, 3)).astype(np.float32)
+    model = _dilated_conv_pair_model(w1, w2)
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    keep = _oracle_keep_indices_conv(w1, C1 // 2)
+    oracle = _dilated_conv_pair_model(w1[keep], w2[:, keep])
+
+    rng_x = np.random.default_rng(233)
+    x = rng_x.standard_normal((2, Cin, 19, 19)).astype(np.float32)
+    (y,) = _run(pruned, {"X": x})
+    (y_oracle,) = _run(oracle, {"X": x})
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-5, atol=1e-5)
+
+
 def test_structured_pruning_conv_only_chain_matches_oracle_no_bias():
     # No Conv bias at all, and a non-Relu activation -- a plain
     # Conv -> Sigmoid -> Conv chain.
@@ -3524,6 +3824,83 @@ def test_structured_wanda_pruning_conv_chain_matches_oracle_exactly():
     (y,) = _run(pruned, {"X": x})
     (y_oracle,) = _run(oracle, {"X": x})
     np.testing.assert_allclose(y, y_oracle, rtol=1e-5, atol=1e-5)
+
+
+def _structured_wanda_conv_chain_attrs_regression(
+    model_fn, spatial, seed_w, seed_cal, seed_x
+):
+    # Shared body for the auto_pad-only and dilation-only structured Wanda
+    # regression tests below: confirms empirically that
+    # apply_structured_wanda_pruning's own calibration-activation capture
+    # is unaffected by a non-default consumer-Conv attribute -- the probe
+    # point is the *raw* activation feeding the chain's consumer (captured
+    # before that consumer ever applies its own padding/dilation to it),
+    # reduced over every axis but the channel one; auto_pad/dilations only
+    # govern how the consumer computes *its own* output from that
+    # already-captured activation, never which values the probe itself
+    # reads or which channel axis they belong to. One input channel is
+    # deliberately scaled far above the rest (the same protects-high-
+    # activation-channel engineering the unstructured Wanda Conv test above
+    # uses) so the resulting keep set is actually activation-driven,
+    # verified below to differ from plain L2-norm-only ranking -- not
+    # merely reproducing it by coincidence, the same "prove the metric is
+    # doing something" bar test_wanda_pruning_conv_protects_high_activation_channel
+    # already holds unstructured Wanda to.
+    Cin, C1, C2 = 3, 16, 8
+    salient_input_channel = 1
+    rng = np.random.default_rng(seed_w)
+    w1 = rng.standard_normal((C1, Cin, 3, 3)).astype(np.float32) * 0.5
+    w2 = rng.standard_normal((C2, C1, 3, 3)).astype(np.float32)
+    model = model_fn(w1, w2)
+
+    probe_model = onnx.ModelProto()
+    probe_model.CopyFrom(model)
+    probe_model.graph.output.append(
+        onnx.helper.make_tensor_value_info("a", onnx.TensorProto.FLOAT, None)
+    )
+
+    rng_cal = np.random.default_rng(seed_cal)
+    x_cal = rng_cal.standard_normal((2, Cin, spatial, spatial)).astype(np.float32)
+    x_cal[:, salient_input_channel, :, :] *= 25.0
+    calibration_data = [{"X": x_cal}]
+
+    _, a_cal = _run(probe_model, {"X": x_cal})
+    act_norm = np.sqrt(np.mean(np.square(a_cal.astype(np.float64)), axis=(0, 2, 3)))
+    importance = np.linalg.norm(
+        w1.reshape(C1, -1).astype(np.float64), axis=1
+    ) * np.maximum(act_norm, 1e-8)
+    keep = np.sort(np.argsort(-importance)[: C1 // 2])
+    plain_keep = np.sort(
+        np.argsort(-np.linalg.norm(w1.reshape(C1, -1).astype(np.float64), axis=1))[
+            : C1 // 2
+        ]
+    )
+    assert not np.array_equal(keep, plain_keep)  # the activation term matters here
+
+    pruned = onnxsim.apply_structured_wanda_pruning(
+        model, calibration_data=calibration_data, sparsity=0.5
+    )
+    onnx.checker.check_model(pruned)
+
+    oracle = model_fn(w1[keep], w2[:, keep])
+    rng_x = np.random.default_rng(seed_x)
+    x = rng_x.standard_normal((2, Cin, spatial, spatial)).astype(np.float32)
+    x[:, salient_input_channel, :, :] *= 25.0
+    (y,) = _run(pruned, {"X": x})
+    (y_oracle,) = _run(oracle, {"X": x})
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-5, atol=1e-5)
+
+
+def test_structured_wanda_pruning_conv_chain_with_auto_pad_matches_oracle_exactly():
+    _structured_wanda_conv_chain_attrs_regression(
+        _auto_pad_conv_pair_model, spatial=10, seed_w=240, seed_cal=241, seed_x=242
+    )
+
+
+def test_structured_wanda_pruning_conv_chain_with_dilation_matches_oracle_exactly():
+    _structured_wanda_conv_chain_attrs_regression(
+        _dilated_conv_pair_model, spatial=19, seed_w=243, seed_cal=244, seed_x=245
+    )
 
 
 def test_structured_wanda_pruning_depthwise_pass_through_matches_oracle_exactly():
@@ -11279,6 +11656,407 @@ def test_gqa_pruning_l1_norm_favors_total_magnitude():
     (y_oracle_l1,) = _run(oracle_l1, {"X": x})
     np.testing.assert_allclose(y_l2, y_oracle_l2, rtol=1e-4, atol=1e-4)
     np.testing.assert_allclose(y_l1, y_oracle_l1, rtol=1e-4, atol=1e-4)
+
+
+# --- apply_attention_head_pruning / _wanda_pruning -- GroupQueryAttention,
+# packed-QKV-then-Split --
+#
+# A single packed MatMul/Gemm projection feeding a `Split` whose three
+# outputs are wired directly into `GroupQueryAttention`'s own three
+# separate, still non-empty, query/key/value inputs -- confirmed a real
+# onnxruntime-genai model-builder export shape (its fused Q/K-norm GQA
+# path), not merely a hypothetical one -- see
+# :func:`onnxsim.pruning._match_packed_qkv_split`'s own docstring for the
+# exact topology and the export code path that produces it, and this
+# module's "Attention-head pruning" section comment for how it differs from
+# `GroupQueryAttention`'s own unrelated, still-declined, schema-level
+# packed-`query`-input convention.
+
+
+def _gqa_packed_model(
+    K=8,
+    H=4,
+    KVH=2,
+    D=8,
+    Out=6,
+    seed=0,
+    batch=2,
+    seq=5,
+    bias=False,
+    wqkv=None,
+    bqkv=None,
+    wout=None,
+    split_sizes=None,
+    split_axis=-1,
+    split_outputs=("q", "k", "v"),
+    gqa_inputs=None,
+):
+    # Mirrors `_gqa_model`'s own scaffolding (SeqLensK/TotalSeq bookkeeping
+    # inputs; no past_kv/scale support -- not needed by any packed-QKV test
+    # below) but replaces its three independent Wq/Wk/Wv MatMul/Gemm
+    # producers with one packed MatMul/Gemm producer feeding a `Split`
+    # node -- see this section's own comment above.
+    rng = np.random.default_rng(seed)
+    Nq, Nkv = H * D, KVH * D
+    if wqkv is None:
+        wqkv = rng.standard_normal((K, Nq + 2 * Nkv)).astype(np.float32)
+    if wout is None:
+        wout = rng.standard_normal((Nq, Out)).astype(np.float32)
+
+    initializer = [_f32(wqkv, "Wqkv"), _f32(wout, "Wout")]
+    qkv_op = "MatMul(X, Wqkv)"
+    if bias:
+        if bqkv is None:
+            bqkv = rng.standard_normal((Nq + 2 * Nkv,)).astype(np.float32)
+        initializer.append(_f32(bqkv, "Bqkv"))
+        qkv_op = "Gemm(X, Wqkv, Bqkv)"
+
+    if split_sizes is None:
+        split_sizes = [Nq, Nkv, Nkv]
+    initializer.append(
+        onnx.numpy_helper.from_array(
+            np.array(split_sizes, dtype=np.int64), "SplitSizes"
+        )
+    )
+
+    # No past_kv connected here, so `total_seq == seq` -- the same no-cache
+    # case `_gqa_model`'s own default (`past_kv=None`) synthesizes.
+    initializer.append(
+        onnx.numpy_helper.from_array(
+            np.full((batch,), seq - 1, dtype=np.int32), "SeqLensK"
+        )
+    )
+    initializer.append(
+        onnx.numpy_helper.from_array(np.array(seq, dtype=np.int32), "TotalSeq")
+    )
+
+    if gqa_inputs is None:
+        gqa_inputs = split_outputs
+    split_out = ", ".join(split_outputs)
+    gqa_q, gqa_k, gqa_v = gqa_inputs
+
+    body = f"""
+        g (float[{batch},{seq},{K}] X) => (float[{batch},{seq},{Out}] Y)
+        {{
+          qkv = {qkv_op}
+          {split_out} = Split <axis = {split_axis}> (qkv, SplitSizes)
+          ctx, pk, pv = com.microsoft.GroupQueryAttention <num_heads={H}, kv_num_heads={KVH}> ({gqa_q}, {gqa_k}, {gqa_v}, , , SeqLensK, TotalSeq)
+          Y = MatMul(ctx, Wout)
+        }}
+        """
+
+    model = parser.parse_model(
+        f"""
+        <
+          ir_version: 10,
+          opset_import: ["": 17, "com.microsoft": 1]
+        >
+        {body}
+        """
+    )
+    model.graph.initializer.extend(initializer)
+    return model, dict(
+        K=K,
+        H=H,
+        KVH=KVH,
+        D=D,
+        Out=Out,
+        Nq=Nq,
+        Nkv=Nkv,
+        wqkv=wqkv,
+        bqkv=bqkv,
+        wout=wout,
+        batch=batch,
+        seq=seq,
+    )
+
+
+def test_gqa_packed_qkv_split_pruning_matches_oracle_exactly():
+    # Q's/K's/V's "own weight" is really one shared packed tensor here,
+    # sliced once by a combined index set, with the `Split`'s own
+    # split-sizes constant shrunk to match -- verified both directly
+    # against a hand-sliced expectation and end-to-end against a real
+    # onnxruntime execution of an independently-built oracle model (the
+    # ordinary three-separate-producer `_gqa_model`, the same ground truth
+    # `test_gqa_pruning_matches_oracle_exactly` uses above).
+    K, H, KVH, D, Out = 8, 8, 2, 8, 6
+    model, cfg = _gqa_packed_model(K=K, H=H, KVH=KVH, D=D, Out=Out, seed=1)
+    assert len(onnxsim.pruning._find_gqa_chains(model.graph)) == 1
+
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    node = _gqa_node(pruned)
+    num_heads, kv_num_heads = _gqa_attrs(node)
+    group_size = H // KVH
+    assert kv_num_heads == 1  # max(1, 2 - round(2*0.5))
+    assert num_heads == kv_num_heads * group_size
+
+    Nq, Nkv = cfg["Nq"], cfg["Nkv"]
+    wqkv = cfg["wqkv"]
+    wq, wk, wv = wqkv[:, :Nq], wqkv[:, Nq : Nq + Nkv], wqkv[:, Nq + Nkv :]
+
+    keep_groups = _oracle_keep_groups(wq, wk, wv, H, KVH, D, kv_num_heads)
+    keep_q_heads = _group_q_heads(keep_groups, group_size)
+    q_idx, kv_idx = _head_idx(keep_q_heads, D), _head_idx(keep_groups, D)
+
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    expected_wqkv = np.concatenate([wq[:, q_idx], wk[:, kv_idx], wv[:, kv_idx]], axis=1)
+    np.testing.assert_array_equal(inits["Wqkv"], expected_wqkv)
+    np.testing.assert_array_equal(
+        inits["SplitSizes"],
+        np.array([len(q_idx), len(kv_idx), len(kv_idx)], dtype=np.int64),
+    )
+
+    oracle, _ = _gqa_model(
+        K=K,
+        H=num_heads,
+        KVH=kv_num_heads,
+        D=D,
+        Out=Out,
+        seed=1,
+        wq=wq[:, q_idx],
+        wk=wk[:, kv_idx],
+        wv=wv[:, kv_idx],
+        wout=cfg["wout"][q_idx, :],
+        batch=cfg["batch"],
+        seq=cfg["seq"],
+    )
+
+    rng = np.random.default_rng(2)
+    x = rng.standard_normal((cfg["batch"], cfg["seq"], K)).astype(np.float32)
+    (y_pruned,) = _run(pruned, {"X": x})
+    (y_oracle,) = _run(oracle, {"X": x})
+    np.testing.assert_allclose(y_pruned, y_oracle, rtol=1e-4, atol=1e-4)
+
+
+def test_gqa_packed_qkv_split_pruning_zero_sparsity_is_a_no_op():
+    model, cfg = _gqa_packed_model(K=8, H=8, KVH=2, D=8, Out=6, seed=7)
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.0)
+    node = _gqa_node(pruned)
+    num_heads, kv_num_heads = _gqa_attrs(node)
+    assert num_heads == cfg["H"]
+    assert kv_num_heads == cfg["KVH"]
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    np.testing.assert_array_equal(inits["Wqkv"], cfg["wqkv"])
+    np.testing.assert_array_equal(
+        inits["SplitSizes"],
+        np.array([cfg["Nq"], cfg["Nkv"], cfg["Nkv"]], dtype=np.int64),
+    )
+
+
+def test_gqa_packed_qkv_split_pruning_slices_packed_bias():
+    # Same reasoning as `test_gqa_pruning_slices_bias_when_producer_has_one`:
+    # a bias-carrying Gemm producer -- here, the single packed Gemm feeding
+    # the `Split` -- can't sit directly ahead of a rank-3 input in a graph
+    # meant to actually run through onnxruntime (Gemm's own schema requires
+    # a rank-2 `A`), so this exercises the packed-bias-slicing path
+    # directly against the initializers instead.
+    K, H, KVH, D, Out = 8, 4, 2, 8, 6
+    model, cfg = _gqa_packed_model(K=K, H=H, KVH=KVH, D=D, Out=Out, seed=14, bias=True)
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+
+    node = _gqa_node(pruned)
+    num_heads, kv_num_heads = _gqa_attrs(node)
+    group_size = H // KVH
+    assert kv_num_heads == 1
+    assert num_heads == group_size
+
+    Nq, Nkv = cfg["Nq"], cfg["Nkv"]
+    wqkv, bqkv = cfg["wqkv"], cfg["bqkv"]
+    wq, wk, wv = wqkv[:, :Nq], wqkv[:, Nq : Nq + Nkv], wqkv[:, Nq + Nkv :]
+    bq, bk, bv = bqkv[:Nq], bqkv[Nq : Nq + Nkv], bqkv[Nq + Nkv :]
+
+    keep_groups = _oracle_keep_groups(wq, wk, wv, H, KVH, D, kv_num_heads)
+    keep_q_heads = _group_q_heads(keep_groups, group_size)
+    q_idx, kv_idx = _head_idx(keep_q_heads, D), _head_idx(keep_groups, D)
+
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    expected_wqkv = np.concatenate([wq[:, q_idx], wk[:, kv_idx], wv[:, kv_idx]], axis=1)
+    expected_bqkv = np.concatenate([bq[q_idx], bk[kv_idx], bv[kv_idx]])
+    np.testing.assert_array_equal(inits["Wqkv"], expected_wqkv)
+    np.testing.assert_array_equal(inits["Bqkv"], expected_bqkv)
+    np.testing.assert_array_equal(
+        inits["SplitSizes"],
+        np.array([len(q_idx), len(kv_idx), len(kv_idx)], dtype=np.int64),
+    )
+
+
+def test_gqa_wanda_packed_qkv_split_pruning_matches_oracle_exactly():
+    K, H, KVH, D, Out = 8, 8, 2, 8, 6
+    model, cfg = _gqa_packed_model(K=K, H=H, KVH=KVH, D=D, Out=Out, seed=8)
+
+    rng = np.random.default_rng(9)
+    x_cal = rng.standard_normal((cfg["batch"], cfg["seq"], K)).astype(np.float32)
+    calibration_data = [{"X": x_cal}]
+
+    pruned = onnxsim.apply_attention_head_wanda_pruning(
+        model, calibration_data=calibration_data, sparsity=0.5
+    )
+    onnx.checker.check_model(pruned)
+
+    probe_model = onnx.ModelProto()
+    probe_model.CopyFrom(model)
+    probe_model.graph.output.append(onnx.ValueInfoProto(name="ctx"))
+    (_, ctx_cal) = _run(probe_model, {"X": x_cal})
+    act_norm = np.sqrt(np.mean(np.square(ctx_cal.astype(np.float64)), axis=(0, 1)))
+
+    Nq, Nkv = cfg["Nq"], cfg["Nkv"]
+    wqkv = cfg["wqkv"]
+    wq, wk, wv = wqkv[:, :Nq], wqkv[:, Nq : Nq + Nkv], wqkv[:, Nq + Nkv :]
+
+    group_size = H // KVH
+    importance = np.zeros(KVH)
+    for kv in range(KVH):
+        q_block = np.concatenate(
+            [
+                wq[:, h * D : (h + 1) * D]
+                for h in range(kv * group_size, (kv + 1) * group_size)
+            ],
+            axis=1,
+        )
+        k_block = wk[:, kv * D : (kv + 1) * D]
+        v_block = wv[:, kv * D : (kv + 1) * D]
+        base = np.linalg.norm(np.concatenate([q_block, k_block, v_block], axis=1))
+        act_group = np.linalg.norm(
+            act_norm[kv * group_size * D : (kv + 1) * group_size * D]
+        )
+        importance[kv] = base * max(act_group, 1e-8)
+    keep_groups = np.sort(np.argsort(-importance)[:1])  # max(1, 2 - round(2*0.5)) == 1
+
+    keep_q_heads = _group_q_heads(keep_groups, group_size)
+    q_idx, kv_idx = _head_idx(keep_q_heads, D), _head_idx(keep_groups, D)
+
+    oracle, _ = _gqa_model(
+        K=K,
+        H=len(keep_q_heads),
+        KVH=len(keep_groups),
+        D=D,
+        Out=Out,
+        seed=8,
+        wq=wq[:, q_idx],
+        wk=wk[:, kv_idx],
+        wv=wv[:, kv_idx],
+        wout=cfg["wout"][q_idx, :],
+        batch=cfg["batch"],
+        seq=cfg["seq"],
+    )
+
+    x = rng.standard_normal((cfg["batch"], cfg["seq"], K)).astype(np.float32)
+    (y_pruned,) = _run(pruned, {"X": x})
+    (y_oracle,) = _run(oracle, {"X": x})
+    np.testing.assert_allclose(y_pruned, y_oracle, rtol=1e-4, atol=1e-4)
+
+
+def test_gqa_packed_qkv_split_wrong_output_order_is_declined():
+    # Adversarial: a `Split` whose own three OUTPUTS aren't literally in
+    # Q-then-K-then-V order (here: K's own range comes out of the `Split`
+    # first) is declined outright by `_match_packed_qkv_split`'s own
+    # ``list(node.output) == [q_name, k_name, v_name]`` check, rather than
+    # a naive offset-by-position implementation (assume output 0 is always
+    # Q) mis-slicing K's own column range into Q's or vice versa.
+    # `GroupQueryAttention` itself is fed `(q_out, k_out, v_out)` --
+    # `Split`'s own *second* output as `query`, its *first* as `key` -- so
+    # semantically this is a valid (if unusual) GQA graph with Q and K
+    # simply swapped, not a malformed one; this pass just can't safely
+    # rewrite it, and leaves it completely untouched rather than guessing.
+    K, H, KVH, D, Out = 8, 4, 2, 8, 6
+    model, cfg = _gqa_packed_model(
+        K=K,
+        H=H,
+        KVH=KVH,
+        D=D,
+        Out=Out,
+        seed=21,
+        split_outputs=("k_out", "q_out", "v_out"),
+        gqa_inputs=("q_out", "k_out", "v_out"),
+    )
+
+    assert onnxsim.pruning._find_gqa_chains(model.graph) == []
+
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    assert pruned.SerializeToString() == model.SerializeToString()
+
+
+def test_gqa_packed_qkv_split_mismatched_total_width_is_declined():
+    # The `Split`'s own `SplitSizes` sums to one column short of the packed
+    # projection's own real output width -- `_match_packed_qkv_split`'s own
+    # ``n_channels != nq + nk + nv`` check declines this rather than
+    # pruning against a split-sizes total that doesn't actually describe
+    # the packed weight's own shape.
+    K, H, KVH, D, Out = 8, 4, 2, 8, 6
+    model, cfg = _gqa_packed_model(
+        K=K,
+        H=H,
+        KVH=KVH,
+        D=D,
+        Out=Out,
+        seed=23,
+        split_sizes=[H * D, KVH * D, KVH * D - 1],
+    )
+
+    assert onnxsim.pruning._find_gqa_chains(model.graph) == []
+
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    assert pruned.SerializeToString() == model.SerializeToString()
+
+
+def test_gqa_native_packed_query_convention_still_declined():
+    # `GroupQueryAttention`'s own SCHEMA (not this pass) has its own,
+    # different packed-input convention: the whole packed Q/K/V tensor
+    # passed as `query` itself, with `key`/`value` left empty -- confirmed
+    # via live schema introspection
+    # (``onnxruntime.capi.onnxruntime_pybind11_state.get_all_operator_schema()``,
+    # `query`'s own doc string: "Query with shape (batch_size,
+    # sequence_length, hidden_size), or packed QKV with shape (batch_size,
+    # sequence_length, d)"; see this module's own "Attention-head pruning"
+    # section comment). This is a different tensor layout from the
+    # MatMul-then-Split-into-three-separate-inputs shape
+    # `_match_packed_qkv_split` matches above (this model has no `Split`
+    # node at all), and `_match_gqa_producer` has always declined it
+    # outright, via its own ``not (node.input[0] and node.input[1] and
+    # node.input[2])`` check -- confirmed here still holds, unmodified by
+    # this module's new packed-`Split` support.
+    K, H, KVH, D, Out = 8, 4, 2, 8, 6
+    Nq, Nkv = H * D, KVH * D
+    rng = np.random.default_rng(22)
+    wqkv = rng.standard_normal((K, Nq + 2 * Nkv)).astype(np.float32)
+    wout = rng.standard_normal((Nq, Out)).astype(np.float32)
+    batch, seq = 2, 5
+
+    initializer = [_f32(wqkv, "Wqkv"), _f32(wout, "Wout")]
+    initializer.append(
+        onnx.numpy_helper.from_array(
+            np.full((batch,), seq - 1, dtype=np.int32), "SeqLensK"
+        )
+    )
+    initializer.append(
+        onnx.numpy_helper.from_array(np.array(seq, dtype=np.int32), "TotalSeq")
+    )
+
+    body = f"""
+        g (float[{batch},{seq},{K}] X) => (float[{batch},{seq},{Out}] Y)
+        {{
+          qkv = MatMul(X, Wqkv)
+          ctx, pk, pv = com.microsoft.GroupQueryAttention <num_heads={H}, kv_num_heads={KVH}> (qkv, , , , , SeqLensK, TotalSeq)
+          Y = MatMul(ctx, Wout)
+        }}
+        """
+    model = parser.parse_model(
+        f"""
+        <
+          ir_version: 10,
+          opset_import: ["": 17, "com.microsoft": 1]
+        >
+        {body}
+        """
+    )
+    model.graph.initializer.extend(initializer)
+
+    assert onnxsim.pruning._find_gqa_chains(model.graph) == []
+
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    assert pruned.SerializeToString() == model.SerializeToString()
 
 
 def test_structured_pruning_importance_norm_l2_is_the_unchanged_default():

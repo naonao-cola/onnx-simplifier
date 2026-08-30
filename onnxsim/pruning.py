@@ -349,16 +349,24 @@ reshaped weight, mask computed, reshaped back, working unchanged for every
 ``(in_channel, kh, kw)`` offset within the receptive field, so its
 activation statistic is the norm of the *im2col-unfolded* input patch
 value at that specific offset, over every output spatial position and
-calibration sample -- computed via ``numpy.lib.stride_tricks.
-sliding_window_view`` on the zero-padded input (per the Conv node's own
-``pads``/``strides`` attributes) rather than materializing an explicit
-im2col matrix. A Conv whose attributes aren't a combination this
-confidently handles (non-default ``auto_pad``, since ``SAME_*``/``VALID``
-padding depends on input spatial size rather than being fixed per node;
-or non-all-ones ``dilations``, since a dilated receptive field's offsets
-aren't evenly spaced in the padded input the way ``sliding_window_view``
-assumes) falls back to plain magnitude for that layer, the same as any
-other layer whose activation norm was never observed.
+calibration sample -- computed via a dedicated zero-padded, strided slice
+per ``(kh, kw)`` tap (:func:`_conv_patch_sq_sum`) rather than materializing
+an explicit im2col matrix. Every ``pads``/``auto_pad``/``strides``/
+``dilations`` combination the ONNX Conv schema defines is handled: explicit
+``pads`` are fixed per node, while ``auto_pad`` ``SAME_UPPER``/
+``SAME_LOWER``/``VALID`` is resolved fresh from each calibration batch's
+own input spatial size (:func:`_resolve_conv_pads`, per the Conv operator's
+own ``auto_pad`` formula), and a non-unit ``dilations`` is handled by
+offsetting each tap's own slice by ``dilation`` rather than assuming taps
+are one apart. Only a genuinely malformed node (a ``kernel_shape``
+disagreeing with the weight's own shape, an unrecognized ``auto_pad``
+string, or non-positive ``strides``/``dilations``) falls back to plain
+magnitude for that layer, the same as any other layer whose activation
+norm was never observed -- channel pruning's own producer/consumer
+matching above needs no such fallback in the first place, since none of
+``auto_pad``/``dilations``/``pads``/``strides`` bear on which weight-tensor
+axis a whole output filter or input-channel slice lives on (see
+:func:`apply_structured_pruning`'s own docstring).
 
 For a grouped or depthwise Conv, Wanda's per-offset activation norm needs
 one more piece of care beyond the reshape above: that norm is always
@@ -644,16 +652,17 @@ reshape :func:`apply_magnitude_pruning`/:func:`apply_wanda_pruning` and
 the full ``[K, K]`` cross-covariance of every offset against every other
 -- not merely each offset's own norm the way Wanda's diagonal-only
 ``_conv_patch_sq_sum`` needs. :func:`_conv_im2col_patches` builds that:
-the same zero-padded ``numpy.lib.stride_tricks.sliding_window_view``
-unfolding :func:`_conv_patch_sq_sum` already does (reusing
-:func:`_conv_spatial_attrs` for the padding/stride extraction, and
-declining the same ``auto_pad``/non-unit-``dilations`` combinations that
-function does -- in which case the layer is left completely untouched,
-there being no data-free fallback for SparseGPT, Conv included), but
-returning the actual ``[n_positions, K]`` patch matrix rather than
-reducing straight to a per-offset sum of squares, so ``H = patches.T @
-patches`` can be formed from it. Verified two independent ways before
-being trusted here: a brute-force nested-loop oracle that builds the same
+the same zero-padded, per-tap strided-slice unfolding
+:func:`_conv_patch_sq_sum` already does (reusing
+:func:`_conv_spatial_attrs`/:func:`_resolve_conv_pads` for the padding/
+stride/dilation handling, ``auto_pad`` included -- a node still declined
+by :func:`_conv_spatial_attrs` itself, e.g. a malformed `kernel_shape`,
+leaves the layer completely untouched, there being no data-free fallback
+for SparseGPT, Conv included), but returning the actual ``[n_positions,
+K]`` patch matrix rather than reducing straight to a per-offset sum of
+squares, so ``H = patches.T @ patches`` can be formed from it. Verified
+two independent ways before being trusted here: a brute-force nested-loop
+oracle that builds the same
 ``[K, K]`` Hessian a completely different way (one Python triple-loop per
 output position, accumulating an explicit outer product, rather than any
 vectorized unfolding), the same bar
@@ -1122,27 +1131,59 @@ class _ConvSpatialAttrs:
     pad_right: int
     stride_h: int
     stride_w: int
+    # Both default to the ONNX Conv schema's own defaults so every existing
+    # direct construction of this dataclass (this module's own oracle tests,
+    # which only ever exercise the explicit-`pads` case) keeps meaning
+    # exactly what it always did: unit dilation, explicit/fixed padding.
+    dilation_h: int = 1
+    dilation_w: int = 1
+    # "NOTSET" (the schema default): `pad_top`/`pad_left`/`pad_bottom`/
+    # `pad_right` above are used as-is, fixed per node. "SAME_UPPER"/
+    # "SAME_LOWER"/"VALID": those four fields are unused placeholders --
+    # the real padding is resolved fresh per calibration batch by
+    # :func:`_resolve_conv_pads`, from that batch's own input spatial size.
+    auto_pad: str = "NOTSET"
 
 
 def _conv_spatial_attrs(
     node: onnx.NodeProto, w_init: onnx.TensorProto
 ) -> Optional[_ConvSpatialAttrs]:
-    """Extracts the padding/stride a Conv node's calibration input needs to
-    be correctly im2col-unfolded for Wanda's per-``(in_channel, kh, kw)``
-    activation norm (see this module's own docstring). Declines
-    (``None``) on any attribute combination not confidently handled:
+    """Extracts the padding/stride/dilation a Conv node's calibration input
+    needs to be correctly im2col-unfolded for Wanda's per-``(in_channel,
+    kh, kw)`` activation norm (:func:`_conv_patch_sq_sum`) and SparseGPT's
+    full im2col Hessian (:func:`_conv_im2col_patches`) -- see this module's
+    own docstring. Handles every ``auto_pad``/``dilations`` combination the
+    ONNX Conv schema defines, not just the explicit-``pads``/unit-dilation
+    case an earlier version of this function alone confidently handled:
 
-    - non-default ``auto_pad`` -- its ``SAME_*``/``VALID`` padding depends
-      on the input's own spatial size, not something fixed per node the
-      way an explicit ``pads`` (or the schema's all-zero default) is;
-    - a non-all-ones ``dilations`` -- a dilated receptive field's
-      ``(kh, kw)`` offsets aren't evenly spaced in the padded input the
-      way ``numpy.lib.stride_tricks.sliding_window_view`` assumes below.
+    - ``auto_pad`` ``SAME_UPPER``/``SAME_LOWER``/``VALID`` is resolved to
+      concrete padding by :func:`_resolve_conv_pads`, not here -- its own
+      padding amount is a function of the input's own spatial size (via
+      ``ceil(in / stride)``, per the ONNX Conv operator's own ``auto_pad``
+      formula: https://onnx.ai/onnx/operators/onnx__Conv.html), which is
+      known once a calibration batch's actual ``x`` is in hand but is
+      *not* a fixed, per-node quantity the way an explicit ``pads`` is (it
+      can even vary calibration batch to calibration batch, for a
+      dynamic-input-shape model) -- so nothing about it is resolved or
+      cached here, only the raw ``auto_pad`` string itself is kept, on
+      `_ConvSpatialAttrs.auto_pad`;
+    - a non-all-ones ``dilations`` no longer needs decline either:
+      :func:`_conv_patch_sq_sum`/:func:`_conv_im2col_patches` extract each
+      of the ``kh*kw`` receptive-field taps as its own dedicated strided
+      slice of the padded input (offset by ``dilation`` per kernel
+      position, subsampled by ``stride`` the same as always), rather than
+      relying on ``numpy.lib.stride_tricks.sliding_window_view``'s
+      unit-offset window, which is what actually assumed unit dilation
+      before -- `_ConvSpatialAttrs.dilation_h`/`dilation_w` simply carry
+      the real value through.
 
-    Per this module's own docstring, it's better to leave such a layer's
-    activation norm unobserved (falling back to plain magnitude for it,
-    same as any layer whose calibration activation was never a usable
-    shape) than to guess at either.
+    Still declines (``None``, meaning "fall back to plain magnitude", per
+    this module's own docstring) on a `kernel_shape` that disagrees with
+    `w_init`'s own shape (a malformed node -- don't guess), an
+    unrecognized `auto_pad` string, non-positive `strides`/`dilations`, or
+    a malformed explicit `pads` (wrong length, or negative) -- the same
+    "don't guess at a malformed node" bar every other check in this module
+    holds to.
     """
     kh, kw = int(w_init.dims[2]), int(w_init.dims[3])
     auto_pad = "NOTSET"
@@ -1163,29 +1204,79 @@ def _conv_spatial_attrs(
             if len(ks) != 2 or ks[0] != kh or ks[1] != kw:
                 return None  # weight/attribute mismatch -- don't guess
 
-    if auto_pad not in ("NOTSET", ""):
-        return None
-    if dilations is not None and dilations != [1, 1]:
-        return None
-    if pads is None:
-        pads = [0, 0, 0, 0]  # ONNX Conv schema default
-    if len(pads) != 4 or any(p < 0 for p in pads):
-        return None
+    if auto_pad not in ("NOTSET", "", "SAME_UPPER", "SAME_LOWER", "VALID"):
+        return None  # unrecognized -- don't guess
     if strides is None:
         strides = [1, 1]  # ONNX Conv schema default
     if len(strides) != 2 or any(s <= 0 for s in strides):
         return None
+    if dilations is None:
+        dilations = [1, 1]  # ONNX Conv schema default
+    if len(dilations) != 2 or any(d <= 0 for d in dilations):
+        return None
+
+    if auto_pad in ("NOTSET", ""):
+        if pads is None:
+            pads = [0, 0, 0, 0]  # ONNX Conv schema default
+        if len(pads) != 4 or any(p < 0 for p in pads):
+            return None
+        pad_top, pad_left, pad_bottom, pad_right = pads
+    else:
+        # Resolved fresh per calibration batch by _resolve_conv_pads --
+        # these four are unused placeholders in this branch.
+        pad_top = pad_left = pad_bottom = pad_right = 0
 
     return _ConvSpatialAttrs(
         kh=kh,
         kw=kw,
-        pad_top=pads[0],
-        pad_left=pads[1],
-        pad_bottom=pads[2],
-        pad_right=pads[3],
+        pad_top=pad_top,
+        pad_left=pad_left,
+        pad_bottom=pad_bottom,
+        pad_right=pad_right,
         stride_h=strides[0],
         stride_w=strides[1],
+        dilation_h=dilations[0],
+        dilation_w=dilations[1],
+        auto_pad=auto_pad,
     )
+
+
+def _resolve_conv_pads(
+    attrs: _ConvSpatialAttrs, in_h: int, in_w: int
+) -> Tuple[int, int, int, int]:
+    """Resolves one Conv node's actual ``(pad_top, pad_left, pad_bottom,
+    pad_right)`` for one calibration batch's own ``[N, Cin, in_h, in_w]``
+    input, per the ONNX Conv operator's own ``auto_pad`` formula
+    (https://onnx.ai/onnx/operators/onnx__Conv.html). `NOTSET`/``""``
+    (`_ConvSpatialAttrs.auto_pad`) is already a fixed, per-node quantity --
+    `attrs.pad_top`/`pad_left`/`pad_bottom`/`pad_right` themselves, returned
+    unchanged, no `in_h`/`in_w` dependence at all. ``VALID`` is always zero
+    padding, likewise independent of `in_h`/`in_w`. ``SAME_UPPER``/
+    ``SAME_LOWER`` are the only genuinely input-size-dependent cases:
+    ``pad_total`` is chosen so that ``ceil(in / stride)`` output positions
+    exactly cover the (possibly-dilated) kernel, split evenly between the
+    two edges with the extra odd unit going to whichever edge the mode
+    names (``SAME_UPPER`` -> the trailing edge gets the extra unit,
+    ``SAME_LOWER`` -> the leading edge does) -- called fresh for every
+    calibration batch (never cached on `_ConvSpatialAttrs` itself) since a
+    dynamic-input-shape model's own `in_h`/`in_w` can legitimately differ
+    batch to batch, changing `pad_total` (via `ceil`) along with it.
+    """
+    if attrs.auto_pad in ("NOTSET", ""):
+        return attrs.pad_top, attrs.pad_left, attrs.pad_bottom, attrs.pad_right
+    if attrs.auto_pad == "VALID":
+        return 0, 0, 0, 0
+    eff_kh = (attrs.kh - 1) * attrs.dilation_h + 1
+    eff_kw = (attrs.kw - 1) * attrs.dilation_w + 1
+    out_h = -(-in_h // attrs.stride_h)  # ceil division
+    out_w = -(-in_w // attrs.stride_w)
+    pad_h = max(0, (out_h - 1) * attrs.stride_h + eff_kh - in_h)
+    pad_w = max(0, (out_w - 1) * attrs.stride_w + eff_kw - in_w)
+    if attrs.auto_pad == "SAME_UPPER":
+        pad_top, pad_left = pad_h // 2, pad_w // 2
+    else:  # SAME_LOWER
+        pad_top, pad_left = pad_h - pad_h // 2, pad_w - pad_w // 2
+    return pad_top, pad_left, pad_h - pad_top, pad_w - pad_left
 
 
 def _conv_patch_sq_sum(
@@ -1207,38 +1298,53 @@ def _conv_patch_sq_sum(
     :func:`apply_wanda_pruning`'s MatMul/Gemm branch already declines
     with a plain ``x.ndim != 2`` check).
 
-    Uses ``numpy.lib.stride_tricks.sliding_window_view`` on the
-    zero-padded input rather than materializing an explicit im2col
-    matrix: a view of every ``(kh, kw)`` window at every unit-stride
-    position, then subsampled by the Conv's own stride -- exactly the
-    positions the real Conv itself would read from, at zero extra
-    calibration-data copies for the (potentially large) unstrided
-    intermediate.
+    Padding is resolved fresh from `x`'s own spatial size for every call
+    (:func:`_resolve_conv_pads` -- a no-op lookup of `attrs`' own fixed
+    ``pads`` for an explicit/``NOTSET`` Conv, the actual ``auto_pad``
+    formula otherwise). Each of the ``kh*kw`` receptive-field taps is then
+    extracted as its own dedicated strided slice of the zero-padded input
+    -- tap ``(i, j)`` is ``xp[:, :, i*dilation_h :: stride_h, j*dilation_w
+    :: stride_w]`` (bounded to `h_out`/`w_out` positions) -- rather than
+    via ``numpy.lib.stride_tricks.sliding_window_view``'s unit-offset
+    window (correct only for unit dilation): a dilated tap's ``kh``/``kw``
+    offsets aren't evenly spaced by 1 in the padded input, only by
+    `dilation_h`/`dilation_w`, which this per-tap slicing accounts for
+    directly. Collapses to the previous ``sliding_window_view``-based
+    unfolding's exact numeric result when ``dilation_h == dilation_w ==
+    1`` (verified by ``test_conv_patch_sq_sum_matches_naive_nested_loop_oracle``,
+    which never sets a non-default dilation) -- ``kh*kw`` dedicated slices
+    instead of one vectorized window is no more total work asymptotically
+    (`kh*kw` is exactly how many taps a real Conv itself reads too), just
+    reorganized to make the per-tap offset explicit.
     """
     if x.ndim != 4:
         return None, 0
-    n = x.shape[0]
-    xp = np.pad(
-        x,
-        (
-            (0, 0),
-            (0, 0),
-            (attrs.pad_top, attrs.pad_bottom),
-            (attrs.pad_left, attrs.pad_right),
-        ),
-    )
-    if xp.shape[2] < attrs.kh or xp.shape[3] < attrs.kw:
+    n, cin, in_h, in_w = x.shape
+    pad_top, pad_left, pad_bottom, pad_right = _resolve_conv_pads(attrs, in_h, in_w)
+    xp = np.pad(x, ((0, 0), (0, 0), (pad_top, pad_bottom), (pad_left, pad_right)))
+    eff_kh = (attrs.kh - 1) * attrs.dilation_h + 1
+    eff_kw = (attrs.kw - 1) * attrs.dilation_w + 1
+    if xp.shape[2] < eff_kh or xp.shape[3] < eff_kw:
         return None, 0
-    # [N, Cin, Hfull, Wfull, kh, kw], Hfull/Wfull at unit stride.
-    windows = np.lib.stride_tricks.sliding_window_view(
-        xp, (attrs.kh, attrs.kw), axis=(2, 3)
-    )
-    windows = windows[:, :, :: attrs.stride_h, :: attrs.stride_w, :, :]
-    h_out, w_out = windows.shape[2], windows.shape[3]
+    h_out = (xp.shape[2] - eff_kh) // attrs.stride_h + 1
+    w_out = (xp.shape[3] - eff_kw) // attrs.stride_w + 1
     count = n * h_out * w_out
     if count == 0:
         return None, 0
-    sq_sum = np.sum(np.square(windows), axis=(0, 2, 3))  # [Cin, kh, kw]
+    sq_sum = np.zeros((cin, attrs.kh, attrs.kw), dtype=x.dtype)
+    for i in range(attrs.kh):
+        h_start = i * attrs.dilation_h
+        h_stop = h_start + attrs.stride_h * (h_out - 1) + 1
+        for j in range(attrs.kw):
+            w_start = j * attrs.dilation_w
+            w_stop = w_start + attrs.stride_w * (w_out - 1) + 1
+            tap = xp[
+                :,
+                :,
+                h_start : h_stop : attrs.stride_h,
+                w_start : w_stop : attrs.stride_w,
+            ]
+            sq_sum[:, i, j] = np.sum(np.square(tap), axis=(0, 2, 3))
     return sq_sum, count
 
 
@@ -1563,10 +1669,12 @@ def apply_wanda_pruning(
             matched layer whose activation input isn't usable (not a plain
             2-D tensor for MatMul/Gemm; not a rank-2+ tensor for Attention
             (its own ``X`` input is always rank-3 in practice, reduced over
-            every leading axis); not a 4-D NCHW tensor, or a Conv attribute
-            combination :func:`_conv_spatial_attrs` declines, for Conv)
-            falls back to plain magnitude pruning (no activation norm was
-            ever observed)
+            every leading axis); not a 4-D NCHW tensor, or a malformed Conv
+            attribute combination :func:`_conv_spatial_attrs` declines --
+            e.g. a `kernel_shape` disagreeing with the weight's own shape --
+            for Conv; `auto_pad`/non-unit `dilations` are handled, not
+            declined) falls back to plain magnitude pruning (no activation
+            norm was ever observed)
     """
     _validate_pattern(sparsity, n, m)
     if global_sparsity and n is not None:
@@ -1851,16 +1959,17 @@ def _conv_im2col_patches(
     ``test_sparsegpt_conv_hessian_matches_naive_nested_loop_oracle``).
     SparseGPT's Conv Hessian is ``H = patches.T @ patches``, this
     function's own return value being the only new piece: everything else
-    (the zero-padded ``numpy.lib.stride_tricks.sliding_window_view``
-    unfolding, the attribute handling) mirrors
-    :func:`_conv_patch_sq_sum` exactly, reusing the same
-    :class:`_ConvSpatialAttrs`/:func:`_conv_spatial_attrs` Wanda's own
-    Conv support already built -- see this module's own docstring for why
-    a *diagonal-only* per-offset norm (Wanda's ``_conv_patch_sq_sum``) is
-    not enough here and the *full* cross-covariance this returns is
-    needed instead. Returns ``None`` on the same "not usable" conditions
-    :func:`_conv_patch_sq_sum` declines (not a rank-4 activation, or too
-    small once padded for this kernel).
+    (the zero-padded, per-tap strided-slice unfolding that also handles
+    ``auto_pad``/non-unit ``dilations`` -- see :func:`_resolve_conv_pads`
+    -- and the attribute handling) mirrors :func:`_conv_patch_sq_sum`
+    exactly, reusing the same :class:`_ConvSpatialAttrs`/
+    :func:`_conv_spatial_attrs` Wanda's own Conv support already built --
+    see this module's own docstring for why a *diagonal-only* per-offset
+    norm (Wanda's ``_conv_patch_sq_sum``) is not enough here and the
+    *full* cross-covariance this returns is needed instead. Returns
+    ``None`` on the same "not usable" conditions :func:`_conv_patch_sq_sum`
+    declines (not a rank-4 activation, or too small once padded for this
+    kernel).
 
     For a grouped/depthwise Conv, :func:`apply_sparsegpt_pruning` calls
     this once per group on `x` already sliced to that group's own global
@@ -1873,33 +1982,40 @@ def _conv_im2col_patches(
     """
     if x.ndim != 4:
         return None
-    n, cin = x.shape[0], x.shape[1]
-    xp = np.pad(
-        x,
-        (
-            (0, 0),
-            (0, 0),
-            (attrs.pad_top, attrs.pad_bottom),
-            (attrs.pad_left, attrs.pad_right),
-        ),
-    )
-    if xp.shape[2] < attrs.kh or xp.shape[3] < attrs.kw:
+    n, cin, in_h, in_w = x.shape
+    pad_top, pad_left, pad_bottom, pad_right = _resolve_conv_pads(attrs, in_h, in_w)
+    xp = np.pad(x, ((0, 0), (0, 0), (pad_top, pad_bottom), (pad_left, pad_right)))
+    eff_kh = (attrs.kh - 1) * attrs.dilation_h + 1
+    eff_kw = (attrs.kw - 1) * attrs.dilation_w + 1
+    if xp.shape[2] < eff_kh or xp.shape[3] < eff_kw:
         return None
-    # [N, Cin, Hfull, Wfull, kh, kw], Hfull/Wfull at unit stride.
-    windows = np.lib.stride_tricks.sliding_window_view(
-        xp, (attrs.kh, attrs.kw), axis=(2, 3)
-    )
-    windows = windows[:, :, :: attrs.stride_h, :: attrs.stride_w, :, :]
-    h_out, w_out = windows.shape[2], windows.shape[3]
+    h_out = (xp.shape[2] - eff_kh) // attrs.stride_h + 1
+    w_out = (xp.shape[3] - eff_kw) // attrs.stride_w + 1
     n_positions = n * h_out * w_out
     if n_positions == 0:
         return None
-    # [N, Cin, Hout, Wout, kh, kw] -> [N, Hout, Wout, Cin, kh, kw]: moves
-    # every output position to the leading axes and (in_channel, kh, kw)
-    # to the trailing ones, so the final reshape's row-major flatten of
-    # those trailing axes matches w.reshape(n, cin*kh*kw)'s own column
-    # order exactly.
-    patches = np.transpose(windows, (0, 2, 3, 1, 4, 5))
+    # [N, Hout, Wout, Cin, kh, kw]: every output position on the leading
+    # axes, (in_channel, kh, kw) on the trailing ones, so the final
+    # reshape's row-major flatten of those trailing axes matches
+    # w.reshape(n, cin*kh*kw)'s own column order exactly -- filled in one
+    # dedicated strided slice per (kh, kw) tap (see _conv_patch_sq_sum's
+    # own docstring for why: correct under dilation, unlike a single
+    # sliding_window_view call), each tap's own [N, Cin, Hout, Wout] slice
+    # transposed to [N, Hout, Wout, Cin] before it's dropped into place.
+    patches = np.empty((n, h_out, w_out, cin, attrs.kh, attrs.kw), dtype=x.dtype)
+    for i in range(attrs.kh):
+        h_start = i * attrs.dilation_h
+        h_stop = h_start + attrs.stride_h * (h_out - 1) + 1
+        for j in range(attrs.kw):
+            w_start = j * attrs.dilation_w
+            w_stop = w_start + attrs.stride_w * (w_out - 1) + 1
+            tap = xp[
+                :,
+                :,
+                h_start : h_stop : attrs.stride_h,
+                w_start : w_stop : attrs.stride_w,
+            ]
+            patches[:, :, :, :, i, j] = np.transpose(tap, (0, 2, 3, 1))
     return patches.reshape(n_positions, cin * attrs.kh * attrs.kw)
 
 
@@ -1946,11 +2062,13 @@ def apply_sparsegpt_pruning(
     own independent column-processing/error-compensation pass rather than
     one shared across every filter, and how each group's own ``H``
     accumulates batch by batch rather than ever materializing every
-    calibration batch's unfolded patches at once. A Conv layer whose
-    ``auto_pad``/``dilations`` aren't a combination
-    :func:`_conv_spatial_attrs` confidently handles is left completely
-    untouched, same as a layer with no observed calibration activation at
-    all -- there is still no data-free fallback for SparseGPT.
+    calibration batch's unfolded patches at once. Every ``auto_pad``/
+    ``dilations`` combination the ONNX Conv schema defines is handled (see
+    :func:`_conv_spatial_attrs`/:func:`_resolve_conv_pads`); only a
+    genuinely malformed Conv node (e.g. a `kernel_shape` disagreeing with
+    the weight's own shape) is left completely untouched, same as a layer
+    with no observed calibration activation at all -- there is still no
+    data-free fallback for SparseGPT.
 
     ``Attention``'s merged QKV weight has no analogous gap and is
     deliberately matched here too (unconditionally -- see
@@ -1999,8 +2117,9 @@ def apply_sparsegpt_pruning(
             calibration activation (dead input, or every batch's
             activation isn't plain 2-D/higher-rank-with-a-trailing-
             feature-axis), or a Conv layer with no observed usable 4-D
-            activation (dead input, or an ``auto_pad``/``dilations``
-            combination :func:`_conv_spatial_attrs` declines) *for any one
+            activation (dead input, or a malformed attribute combination
+            :func:`_conv_spatial_attrs` declines -- `auto_pad`/non-unit
+            `dilations` are handled, not declined) *for any one
             of its groups* (a grouped/depthwise Conv is left completely
             untouched, not partially pruned, if even one group's own
             Hessian was never observed), is left completely untouched --
@@ -7203,17 +7322,39 @@ def apply_structured_wanda_pruning(
 #   quantized cache with no scale connected or one of an unrecognized shape,
 #   or a packed-QKV/missing-required-input node this module cannot prove
 #   safe to leave alone, is declined outright -- see
-#   :func:`_match_gqa_producer`. Two more optional inputs carry a genuine
-#   per-*query*-head axis and were, like the plain `Attention` op's own
-#   `attention_bias` above, a real unhandled gap this pass now closes:
-#   `attention_bias` (same broadcastable shape/treatment as `Attention`'s
-#   own, but against `num_heads` meaning *query* heads here, added after
-#   GQA's own internal KV-repeat -- sliced by `keep_q_heads`, not
-#   `keep_groups`) and `head_sink` (a genuine `(num_heads,)`
-#   one-scalar-per-query-head softmax-smoothing constant, sliced directly
-#   by `keep_q_heads`) -- both confirmed to have a real, non-ignored
-#   numeric effect via actual onnxruntime execution, not assumed from
-#   either input's own doc string alone.
+#   :func:`_match_gqa_producer`. That "packed-QKV" decline is
+#   `GroupQueryAttention`'s own *schema-level* packed-input convention (the
+#   whole packed tensor passed as `query` itself, `key`/`value` left
+#   empty -- confirmed via live schema introspection,
+#   `onnxruntime.capi.onnxruntime_pybind11_state.get_all_operator_schema()`:
+#   `query`'s own doc string reads "Query with shape (batch_size,
+#   sequence_length, hidden_size), or packed QKV with shape (batch_size,
+#   sequence_length, d)"), a different tensor layout from the *graph-level*
+#   packed-QKV-then-Split pattern this module does support: one packed
+#   MatMul/vanilla-Gemm projection feeding a `Split` whose three outputs
+#   feed `GroupQueryAttention`'s three separate, still non-empty,
+#   query/key/value inputs directly -- confirmed to be a real export
+#   pattern (Microsoft's own onnxruntime-genai model builder's fused
+#   Q/K-norm GQA path, e.g. Qwen3-style models on CUDA/WebGPU) rather than
+#   assumed -- see :func:`_match_packed_qkv_split`'s own docstring for the
+#   exact topology matched, the export code path that produces it, and the
+#   narrower shapes (Q/K-norm without the in-op-fused path, or no Q/K-norm
+#   at all) deliberately left unmatched. Pruning a KV group out of a packed
+#   chain removes that group's own Q/K/V column ranges from the *one*
+#   shared packed weight (and its packed bias, if any) in a single combined
+#   slice, and shrinks the `Split` node's own split-sizes constant to
+#   match -- see :class:`_GQAChain`'s own `packed_split_sizes` field and
+#   :func:`_apply_one_gqa_chain`'s own packed branch. Two more optional
+#   inputs carry a genuine per-*query*-head axis and were, like the plain
+#   `Attention` op's own `attention_bias` above, a real unhandled gap this
+#   pass now closes: `attention_bias` (same broadcastable shape/treatment
+#   as `Attention`'s own, but against `num_heads` meaning *query* heads
+#   here, added after GQA's own internal KV-repeat -- sliced by
+#   `keep_q_heads`, not `keep_groups`) and `head_sink` (a genuine
+#   `(num_heads,)` one-scalar-per-query-head softmax-smoothing constant,
+#   sliced directly by `keep_q_heads`) -- both confirmed to have a real,
+#   non-ignored numeric effect via actual onnxruntime execution, not
+#   assumed from either input's own doc string alone.
 # - the plain ``ai.onnx`` `Attention` (opset 24+, domain ``""``, schema
 #   confirmed against this environment's installed ``onnx==1.22.0`` via
 #   ``onnx.defs.get_schema("Attention", domain="")`` -- it is fully defined
@@ -7419,6 +7560,23 @@ class _GQAChain:
     # :func:`_apply_one_gqa_chain`'s shared write-back to target the right
     # attribute on either op.
     num_heads_attr: str = "num_heads"
+    # Set (to the name of the constant int64 split-sizes tensor feeding a
+    # shared upstream ``Split`` node) when Q/K/V are *not* three independent
+    # producer weights but three column ranges of one *packed* MatMul/Gemm
+    # weight, split into separate tensors by a single ``Split`` node
+    # upstream of this chain's `.node` -- see
+    # :func:`_match_packed_qkv_split` for the exact topology matched and the
+    # real-world export path (onnxruntime-genai's model builder, fused
+    # Q/K-norm GQA path) that produces it. ``None`` for the ordinary
+    # three-independent-producer shape every other chain has. When set,
+    # `.q_weight`, `.k_weight`, and `.v_weight` all name that *same* single
+    # packed initializer (and `.q_bias`/`.k_bias`/`.v_bias`, if not all
+    # ``None``, all name the same single packed bias) -- :func:`_apply_one_gqa_chain`
+    # branches on this field to slice that one shared tensor exactly once
+    # with a combined column-index set, instead of three independent
+    # per-producer slices that would each invalidate the others' column
+    # offsets into the same underlying storage.
+    packed_split_sizes: Optional[str] = None
 
 
 # Either kind of matched attention block, sharing enough of a common shape
@@ -7948,6 +8106,125 @@ def _match_onnx_attention_producer(
     return q_num_heads, kv_num_heads
 
 
+def _match_packed_qkv_split(
+    split_node: onnx.NodeProto,
+    initializer_map: Dict[str, onnx.TensorProto],
+    consumers_of: Dict[str, List[onnx.NodeProto]],
+    node_by_output: Dict[str, onnx.NodeProto],
+) -> Optional[Tuple[str, bool, Optional[str], int, int, int, str]]:
+    """If `split_node` is a ``Split`` node splitting one *packed*
+    MatMul/vanilla-Gemm projection's output into exactly three
+    Q-then-K-then-V column ranges -- the graph-level "packed QKV" upstream
+    of `GroupQueryAttention`'s (or the plain ai.onnx `Attention` op's) own
+    three separate query/key/value *inputs*, as opposed to either op's own
+    schema-level packed-input convention (a single tensor passed as
+    `query` itself, with `key`/`value` left empty -- already handled by
+    :func:`_match_gqa_producer`/:func:`_match_onnx_attention_producer`
+    declining it outright, since it's a different tensor layout neither
+    matcher attempts to slice) -- returns ``(weight_name,
+    weight_transposed, bias_name_or_None, nq, nk, nv, split_sizes_name)``.
+
+    This exact topology -- one packed MatMul/Gemm, optionally biased,
+    feeding a two-input ``Split`` (``axis=-1``, a constant int64
+    ``[nq, nk, nv]`` second input) whose three outputs are Q/K/V in that
+    order -- is confirmed, empirically, to be what Microsoft's own
+    onnxruntime-genai model builder emits for `GroupQueryAttention` on
+    Qwen3-style models (per-head Q/K RMSNorm fused into the op itself, via
+    its own `q_norm_weight`/`k_norm_weight` inputs -- see
+    `onnxruntime_genai/models/builders/base.py`'s own
+    ``make_attention_input_proj``/``is_fused_qk_norm_gqa_supported``: when
+    `use_packed_matmul` and both `q_norm`/`k_norm` are set and the fused
+    in-op norm path is supported (CUDA/WebGPU), a single packed
+    `qkv_proj` MatMul (plus a single packed `Add` bias, if any bias
+    exists) feeds one `Split` whose three raw outputs are wired directly
+    into `GroupQueryAttention`'s own three separate query/key/value
+    inputs -- exactly the shape matched here). The common case with no
+    Q/K norm instead relies on `GroupQueryAttention`'s own native
+    packed-`query`-input convention and emits no `Split` at all, and the
+    case with Q/K norm but *no* fused in-op norm support instead runs
+    per-head `SimplifiedLayerNorm` (and, unless RoPE is itself fused into
+    the op, `RotaryEmbedding`) nodes between the `Split` and the op's own
+    inputs -- a shape this function does not match (its `Split` must feed
+    the consuming op's inputs directly, with nothing declined/matched
+    read here) and :func:`_find_separate_qkv_chains`'s own per-branch
+    :func:`_match_producer` walk declines like any other unrecognized
+    producer, rather than silently mis-slicing a shape this pass hasn't
+    verified.
+
+    Declines (``None``) unless every one of the following holds, checked
+    with the same conservative bar as every other producer match in this
+    module:
+
+    - `split_node` is a plain ``ai.onnx`` (domain ``""``) `Split` with
+      exactly two inputs (the confirmed opset-13+ tensor-input form this
+      real exporter uses -- the older `split`-as-attribute form, still
+      legal on older opsets, is a structurally different rewrite target
+      this function doesn't attempt) and exactly three outputs.
+    - Its `axis` attribute is present and exactly ``-1`` (the confirmed
+      pattern's own value -- other axis values aren't declined as unsafe
+      so much as simply not the one shape this function was verified
+      against; a differently-axised packed-QKV split isn't guessed at).
+    - Its second input is a constant int64 initializer of shape ``[3]``
+      (the split sizes ``[nq, nk, nv]``, all strictly positive) with
+      exactly one consumer (this `Split` node) -- an initializer shared
+      with anything else can't be safely overwritten in place by
+      :func:`_apply_one_gqa_chain`'s own write-back, the same "shared
+      constant, don't mutate" bar :func:`_walk_to_attention_consumer`
+      already holds its own Reshape-shape constant to.
+    - Its first (data) input has exactly one consumer (this `Split`
+      node) and is produced by a node :func:`_match_producer` accepts (a
+      MatMul/vanilla-Gemm with a constant 2-D float32 weight, and, for
+      Gemm, either no bias or a constant one) whose own output width
+      equals ``nq + nk + nv`` exactly -- anything else (a non-constant
+      weight, a shared/branching packed-projection output, an op
+      :func:`_match_producer` doesn't recognize) is declined, never
+      guessed at.
+    """
+    if split_node.domain != "" or split_node.op_type != "Split":
+        return None
+    if len(split_node.output) != 3 or len(split_node.input) != 2:
+        return None
+    if not split_node.input[0] or not split_node.input[1]:
+        return None
+
+    axis = None
+    for attr in split_node.attribute:
+        if attr.name == "axis":
+            axis = attr.i
+    if axis != -1:
+        return None
+
+    sizes_name = split_node.input[1]
+    sizes_init = initializer_map.get(sizes_name)
+    if (
+        sizes_init is None
+        or sizes_init.data_type != onnx.TensorProto.INT64
+        or list(sizes_init.dims) != [3]
+    ):
+        return None
+    if len(consumers_of.get(sizes_name, [])) != 1:
+        return None  # shared split-sizes constant -- mutating it isn't safe
+
+    nq, nk, nv = (int(x) for x in onnx.numpy_helper.to_array(sizes_init))
+    if nq <= 0 or nk <= 0 or nv <= 0:
+        return None
+
+    data_name = split_node.input[0]
+    if len(consumers_of.get(data_name, [])) != 1:
+        return None  # shared packed-projection output -- can't rewrite in isolation
+    prod_node = node_by_output.get(data_name)
+    if prod_node is None:
+        return None
+    pinfo = _match_producer(prod_node, initializer_map)
+    if pinfo is None:
+        return None
+    w_name, w_transposed, bias_name, n_channels = pinfo
+    if n_channels != nq + nk + nv:
+        return None
+
+    return w_name, w_transposed, bias_name, nq, nk, nv, sizes_name
+
+
 def _find_separate_qkv_chains(
     graph: onnx.GraphProto,
     match_producer,
@@ -7989,33 +8266,60 @@ def _find_separate_qkv_chains(
         if q_name == k_name or q_name == v_name or k_name == v_name:
             continue  # degenerate -- can't independently slice a shared producer
 
-        producer_infos = []
-        matched = True
-        for in_name in (q_name, k_name, v_name):
-            if not _is_internal(in_name):
-                matched = False
-                break
-            prod_node = node_by_output.get(in_name)
-            if prod_node is None:
-                matched = False
-                break
-            pinfo = _match_producer(prod_node, initializer_map)
-            if pinfo is None:
-                matched = False
-                break
-            producer_infos.append(pinfo)
-        if not matched:
-            continue
+        # A shared upstream `Split` node producing all three -- the
+        # packed-QKV-then-Split shape (see :func:`_match_packed_qkv_split`)
+        # -- is checked first and handled exclusively: a `Split` node can
+        # never itself match `_match_producer` below (it isn't a
+        # MatMul/vanilla-Gemm), so falling through to the per-branch loop
+        # for it would just decline the same node three times over. Every
+        # other shape (three genuinely independent producers, or anything
+        # this function doesn't recognize) falls to that per-branch loop
+        # unchanged.
+        packed_split_sizes: Optional[str] = None
+        prod_q = node_by_output.get(q_name) if _is_internal(q_name) else None
+        prod_k = node_by_output.get(k_name) if _is_internal(k_name) else None
+        prod_v = node_by_output.get(v_name) if _is_internal(v_name) else None
+        if (
+            prod_q is not None
+            and prod_q is prod_k
+            and prod_q is prod_v
+            and prod_q.op_type == "Split"
+            and list(prod_q.output) == [q_name, k_name, v_name]
+        ):
+            packed = _match_packed_qkv_split(
+                prod_q, initializer_map, consumers_of, node_by_output
+            )
+            if packed is None:
+                continue
+            w_name, w_transposed, bias_name, nq, nk, nv, packed_split_sizes = packed
+            producer_infos = [
+                (w_name, w_transposed, bias_name, nq),
+                (w_name, w_transposed, bias_name, nk),
+                (w_name, w_transposed, bias_name, nv),
+            ]
+        else:
+            producer_infos = []
+            matched = True
+            for in_name in (q_name, k_name, v_name):
+                if not _is_internal(in_name):
+                    matched = False
+                    break
+                prod_node = node_by_output.get(in_name)
+                if prod_node is None:
+                    matched = False
+                    break
+                pinfo = _match_producer(prod_node, initializer_map)
+                if pinfo is None:
+                    matched = False
+                    break
+                producer_infos.append(pinfo)
+            if not matched:
+                continue
 
         (wq, wq_t, bq, nq), (wk, wk_t, bk, nk), (wv, wv_t, bv, nv) = producer_infos
-        if (
-            wq == wk
-            or wq == wv
-            or wk == wv
-            or nq % num_heads
-            or nk % kv_num_heads
-            or nv % kv_num_heads
-        ):
+        if packed_split_sizes is None and (wq == wk or wq == wv or wk == wv):
+            continue  # degenerate -- can't independently slice a shared producer
+        if nq % num_heads or nk % kv_num_heads or nv % kv_num_heads:
             continue
         head_size = nq // num_heads
         v_head_size = nv // kv_num_heads
@@ -8079,6 +8383,7 @@ def _find_separate_qkv_chains(
                 consumer_weight=consumer[1],
                 consumer_weight_transposed=consumer[2],
                 num_heads_attr=num_heads_attr,
+                packed_split_sizes=packed_split_sizes,
             )
         )
     return chains
@@ -8363,10 +8668,19 @@ def _apply_one_gqa_chain(
     analogue on the plain ai.onnx op), a genuine `(num_heads,)` one-scalar-
     per-query-head constant (already confirmed at match time to be exactly
     that shape, or dynamic), is sliced the same way, directly by
-    `keep_q_heads` with no `head_size` expansion. Returns
-    ``(producer_weight_names, consumer_weight_name, stale_output_names)``
-    on success, or ``None`` if `sparsity` rounds to no groups dropped for
-    this block (a no-op, left for the caller to skip).
+    `keep_q_heads` with no `head_size` expansion.
+
+    When `chain.packed_split_sizes` is set (a packed-QKV-then-Split chain,
+    see :func:`_match_packed_qkv_split`), Q's/K's/V's "own separate weight"
+    above is the *same* single packed tensor for all three, sliced exactly
+    once by a combined column-index set instead of three independent
+    per-producer slices, and the upstream `Split` node's own split-sizes
+    constant is rewritten to the three new (post-pruning) column widths in
+    the same Q-then-K-then-V order -- see the branch below.
+
+    Returns ``(producer_weight_names, consumer_weight_name,
+    stale_output_names)`` on success, or ``None`` if `sparsity` rounds to no
+    groups dropped for this block (a no-op, left for the caller to skip).
     """
     h = chain.kv_num_heads
     keep_count = max(1, h - round(h * sparsity))
@@ -8387,15 +8701,35 @@ def _apply_one_gqa_chain(
     wq_init = initializer_map[chain.q_weight]
     wk_init = initializer_map[chain.k_weight]
     wv_init = initializer_map[chain.v_weight]
-    wq_kn = onnx.numpy_helper.to_array(wq_init).astype(np.float64)
-    wk_kn = onnx.numpy_helper.to_array(wk_init).astype(np.float64)
-    wv_kn = onnx.numpy_helper.to_array(wv_init).astype(np.float64)
-    if chain.q_weight_transposed:
-        wq_kn = wq_kn.T  # [K, Nq]
-    if chain.k_weight_transposed:
-        wk_kn = wk_kn.T  # [K, Nkv]
-    if chain.v_weight_transposed:
-        wv_kn = wv_kn.T  # [K, Nkv]
+    if chain.packed_split_sizes is not None:
+        # Packed QKV (see :func:`_match_packed_qkv_split`): `.q_weight`,
+        # `.k_weight`, and `.v_weight` all name the *same* underlying
+        # packed tensor (`wq_init is wk_init is wv_init`), one contiguous
+        # `[K, Nq+Nk+Nv]` (or `[Nq+Nk+Nv, K]`, if `.q_weight_transposed`)
+        # storage split Q-then-K-then-V by column, matching
+        # `_match_packed_qkv_split`'s own confirmed split-sizes order -- so
+        # `wq_kn`/`wk_kn`/`wv_kn` are column-range *views* into that one
+        # ``[K, N]`` array, computed from the chain's own original (before
+        # this call's own pruning) head counts, rather than three
+        # independently-stored arrays.
+        nq_orig = chain.num_heads * d
+        nk_orig = chain.kv_num_heads * d
+        w_kn = onnx.numpy_helper.to_array(wq_init).astype(np.float64)
+        if chain.q_weight_transposed:
+            w_kn = w_kn.T  # [K, Nq+Nk+Nv]
+        wq_kn = w_kn[:, :nq_orig]
+        wk_kn = w_kn[:, nq_orig : nq_orig + nk_orig]
+        wv_kn = w_kn[:, nq_orig + nk_orig :]
+    else:
+        wq_kn = onnx.numpy_helper.to_array(wq_init).astype(np.float64)
+        wk_kn = onnx.numpy_helper.to_array(wk_init).astype(np.float64)
+        wv_kn = onnx.numpy_helper.to_array(wv_init).astype(np.float64)
+        if chain.q_weight_transposed:
+            wq_kn = wq_kn.T  # [K, Nq]
+        if chain.k_weight_transposed:
+            wk_kn = wk_kn.T  # [K, Nkv]
+        if chain.v_weight_transposed:
+            wv_kn = wv_kn.T  # [K, Nkv]
 
     importance = compute_group_importance(chain, wq_kn, wk_kn, wv_kn)
     keep_groups = np.sort(np.argsort(-importance)[:keep_count])
@@ -8418,15 +8752,34 @@ def _apply_one_gqa_chain(
     v_idx = _head_column_indices(keep_groups, dv)
     y_idx = _head_column_indices(keep_q_heads, dv)
 
-    _slice_producer_weight(wq_init, chain.q_weight_transposed, q_idx)
-    _slice_producer_weight(wk_init, chain.k_weight_transposed, k_idx)
-    _slice_producer_weight(wv_init, chain.v_weight_transposed, v_idx)
-    if chain.q_bias is not None:
-        _slice_last_axis(initializer_map[chain.q_bias], q_idx)
-    if chain.k_bias is not None:
-        _slice_last_axis(initializer_map[chain.k_bias], k_idx)
-    if chain.v_bias is not None:
-        _slice_last_axis(initializer_map[chain.v_bias], v_idx)
+    if chain.packed_split_sizes is not None:
+        # One shared tensor: a single combined-column slice (Q's own
+        # range, then K's shifted by the *original* `nq_orig`, then V's
+        # shifted by `nq_orig + nk_orig`) rather than three independent
+        # `_slice_producer_weight` calls, which would each invalidate the
+        # column offsets the other two still need to read from the same
+        # underlying storage.
+        full_idx = np.concatenate([q_idx, k_idx + nq_orig, v_idx + nq_orig + nk_orig])
+        _slice_producer_weight(wq_init, chain.q_weight_transposed, full_idx)
+        if chain.q_bias is not None:
+            _slice_last_axis(initializer_map[chain.q_bias], full_idx)
+        sizes_init = initializer_map[chain.packed_split_sizes]
+        sizes_init.CopyFrom(
+            onnx.numpy_helper.from_array(
+                np.array([len(q_idx), len(k_idx), len(v_idx)], dtype=np.int64),
+                name=sizes_init.name,
+            )
+        )
+    else:
+        _slice_producer_weight(wq_init, chain.q_weight_transposed, q_idx)
+        _slice_producer_weight(wk_init, chain.k_weight_transposed, k_idx)
+        _slice_producer_weight(wv_init, chain.v_weight_transposed, v_idx)
+        if chain.q_bias is not None:
+            _slice_last_axis(initializer_map[chain.q_bias], q_idx)
+        if chain.k_bias is not None:
+            _slice_last_axis(initializer_map[chain.k_bias], k_idx)
+        if chain.v_bias is not None:
+            _slice_last_axis(initializer_map[chain.v_bias], v_idx)
 
     # `GroupQueryAttention`'s past_key/past_value live at input indices 3/4,
     # the plain ai.onnx op's own at 4/5 (see `_match_gqa_producer`'s and
