@@ -85,26 +85,28 @@ to have a provably-safe special case of its own and is now handled, the
 other is still not safe to fold in silently and remains declined the same
 conservative way as everything else in this pass:
 
-- A gated (SwiGLU/GeGLU) `Mul` combine feeding a residual branch directly,
-  with no output-projection MatMul in between, is now resolved rather than
-  declined: the backward walk recognizes a `Mul` of two non-constant
-  operands as *another* kind of hop -- reusing :func:`_find_gated_chains`'s
-  own `_trace_gate_producer_backward` to resolve each operand back to its
-  own real MatMul/Gemm producer -- and folds *both* resulting producers into
-  the group's shared leaf-producer set, exactly like a gated pair's own two
-  producers already are for the non-residual case. Nothing is guessed at or
-  dropped: both branches' importance is combined (root-sum-square, the same
-  metric a gated pair outside a residual chain already uses) and both are
-  pruned to the one shared channel-index set the whole group agrees on --
-  see :func:`_walk_matmul_producer_backward`'s own section comment for the
-  composition-safety argument (why the gate/up path's existing
+- A gated (SwiGLU/GeGLU) combine feeding a residual branch directly, with no
+  output-projection MatMul in between, is now resolved rather than declined:
+  the backward walk recognizes both of :func:`_find_gated_chains`'s own
+  gated shapes as *another* kind of hop -- a `Mul` of two non-constant
+  operands (each operand resolved back to its own real MatMul/Gemm producer
+  via :func:`_find_gated_chains`'s own `_trace_gate_producer_backward`) and
+  the native fused `SwiGLU` op (opset 28+, each operand required to already
+  *be* such a producer's own raw output, reusing that same function's
+  `SwiGLU`-branch extraction) alike -- and folds *both* resulting producers
+  into the group's shared leaf-producer set, exactly like a gated pair's own
+  two producers already are for the non-residual case. Nothing is guessed at
+  or dropped: both branches' importance is combined (root-sum-square, the
+  same metric a gated pair outside a residual chain already uses) and both
+  are pruned to the one shared channel-index set the whole group agrees on
+  -- see :func:`_walk_matmul_producer_backward`'s own section comment for
+  the composition-safety argument (why the gate/up path's existing
   single-consumer bar and the residual walk's own fan-out/tied-weight
-  conflict checks already cover every risk this composition could
-  introduce, with no new machinery needed). This is still narrow, not
-  general: only a plain `Mul`, exactly `_find_gated_chains`'s own shape --
-  the native fused `SwiGLU` op (opset 28+) sitting directly on a residual
-  branch is deliberately left declined, a scope choice rather than a safety
-  one (see that section comment for why).
+  conflict checks already cover every risk either shape's composition could
+  introduce, with no new machinery needed -- `SwiGLU`'s own shape is, if
+  anything, a strictly tighter case than `Mul`'s). This is still narrow, not
+  general: only exactly `_find_gated_chains`'s own two recognized shapes,
+  nothing wider.
 - A residual branch that would need to cross a fused self-attention op
   boundary (`Attention`/`GroupQueryAttention`, see the "Attention-head
   pruning" section far below) to reach a real producer, with no
@@ -3219,18 +3221,38 @@ def _find_conv_residual_chains(graph: onnx.GraphProto) -> List[_Chain]:
 #
 #   So the composition adds no new correctness surface: every hazard it
 #   could in principle introduce is already an instance of a hazard one of
-#   the two mechanisms independently guards against. What remains
-#   deliberately out of scope, a narrower scope choice rather than a safety
-#   one: only a plain `Mul` is recognized this way, mirroring
-#   `_find_gated_chains`'s own two shapes exactly (see its own docstring) --
-#   the native fused `SwiGLU` op (opset 28+) sitting directly on a residual
-#   branch still falls through to `"fail"`, since folding it in too would be
-#   a second, independent reuse of `_find_gated_chains`'s own `SwiGLU`
-#   branch rather than anything this composition's own safety argument
-#   above requires. See
-#   `test_structured_pruning_matmul_residual_add_prunes_gated_branch_with_no_projection`
+#   the two mechanisms independently guards against. Both of
+#   `_find_gated_chains`'s own two recognized shapes (see its own docstring)
+#   are folded in here: a plain `Mul`, as above, *and* the native fused
+#   `SwiGLU(a, b[, alpha])` op (opset 28+) -- a second, independent reuse of
+#   `_find_gated_chains`'s own `SwiGLU`-branch extraction, which differs
+#   from the `Mul` case in one respect the safety argument above has to
+#   re-derive rather than inherit for free: `SwiGLU`'s swish lives entirely
+#   *inside* the op (there's no separate activation node on the gate branch
+#   the way an unfused `Sigmoid`/`Gelu` gate has), so `_find_gated_chains`
+#   itself never calls `_trace_gate_producer_backward` for this shape at
+#   all -- `a`/`b` must already *be* a real producer's own raw output, with
+#   nothing in between, checked with the exact same single-consumer/
+#   not-a-graph-output bar (`_find_gated_chains`'s own `_is_internal`) as
+#   `_trace_gate_producer_backward`'s own bar, just applied directly instead
+#   of after a pre-op walk. That's a strictly *tighter* shape than the `Mul`
+#   case (zero permitted pre-ops rather than a bounded walk through unary
+#   activations), so every part of the safety argument above -- the
+#   single-consumer bar on both operands, the combine node's own output
+#   becoming an ordinary backbone tensor for `_resolve_matmul_fanout_branches`
+#   to police, and the existing tied-weight check -- carries over unchanged;
+#   `alpha`, `SwiGLU`'s only other input, is a node attribute rather than a
+#   tensor, so there is nothing about it for this pass to slice or conflict
+#   over. What remains deliberately out of scope, a narrower scope choice
+#   rather than a safety one: only exactly `_find_gated_chains`'s own two
+#   shapes are recognized -- a gate activation exported as more than one
+#   node (e.g. SiLU as `x * Sigmoid(x)`) is invisible to
+#   `_find_gated_chains` itself already and stays that way here too, no new
+#   gap introduced. See
+#   `test_structured_pruning_matmul_residual_add_prunes_gated_branch_with_no_projection`,
+#   `test_structured_pruning_matmul_residual_add_prunes_swiglu_branch_with_no_projection`,
 #   and
-#   `test_structured_pruning_matmul_residual_add_declines_on_swiglu_branch_with_no_projection`.
+#   `test_structured_pruning_matmul_residual_add_declines_on_swiglu_branch_with_extra_fanout`.
 # - **A residual branch whose backward walk would need to cross a fused
 #   self-attention op boundary** (`com.microsoft::Attention`,
 #   `GroupQueryAttention`, or the plain `ai.onnx` `Attention` -- see the
@@ -3512,13 +3534,15 @@ def _walk_matmul_producer_backward(
 
     `producer_infos` is :func:`_find_gated_chains`'s own producer-lookup map
     (raw producer output -> match info), built once by the caller and passed
-    through unchanged -- needed only to resolve a gated ``Mul`` hop via
-    :func:`_trace_gate_producer_backward` (see this section's own comment
-    above for the composition-safety argument); every other hop ignores it.
-    Left ``None`` (the default), a `Mul` of two non-constant operands is
-    never resolved as a gated pair and simply falls through to `"fail"` the
-    same way it always has -- :func:`_find_matmul_concat_chains` relies on
-    exactly that unchanged behavior for its own (unrelated) reuse of this
+    through unchanged -- needed to resolve a gated ``Mul`` hop via
+    :func:`_trace_gate_producer_backward`, and a native fused ``SwiGLU`` hop
+    via a direct lookup of its own two raw operands (see this section's own
+    comment above for the composition-safety argument, covering both
+    shapes); every other hop ignores it. Left ``None`` (the default),
+    neither a `Mul` of two non-constant operands nor a `SwiGLU` node is ever
+    resolved as a gated pair, and both simply fall through to `"fail"` the
+    same way they always have -- :func:`_find_matmul_concat_chains` relies
+    on exactly that unchanged behavior for its own (unrelated) reuse of this
     same walker, since composing a gated combine with a `Concat` merge on
     the same branch is a separate question this module's own docstring
     already declines and this parameter deliberately doesn't touch.
@@ -3528,21 +3552,23 @@ def _walk_matmul_producer_backward(
     - ``("producer", (producer, n_channels), chain_ops, edges)`` -- resolved
       all the way back to a real MatMul/vanilla-Gemm producer;
     - ``("gated", (producer_a, producer_b, n_channels), chain_ops, edges)``
-      -- resolved to a gated (SwiGLU/GeGLU-style) ``Mul`` of two
-      non-constant operands, each in turn walked back to its own real
-      MatMul/vanilla-Gemm producer via :func:`_trace_gate_producer_backward`
-      -- both producers, not just one, belong to this group's own shared
-      leaf-producer set (see this section's own comment above);
+      -- resolved to a gated (SwiGLU/GeGLU-style) combine of two
+      non-constant operands -- either a plain `Mul`, each operand in turn
+      walked back to its own real MatMul/vanilla-Gemm producer via
+      :func:`_trace_gate_producer_backward`, or the native fused `SwiGLU`
+      node, each operand required to already *be* such a producer's own raw
+      output (see this section's own comment above for why the two shapes
+      differ there) -- both producers, not just one, belong to this group's
+      own shared leaf-producer set;
     - ``("add", merge_node, chain_ops, edges)`` -- resolved to another
       eligible merge node's raw output instead -- a bare ``Add`` or a
       ``SkipLayerNormalization``-family node alike (the caller unions this
       group with that node's own rather than treating it as a separate
       producer);
     - ``("fail", None, (), ())`` -- a graph input, an unrecognized producer
-      (attention-op boundary, a gated ``Mul`` whose operands don't both
-      resolve, the native fused ``SwiGLU`` op, ...), a graph output crossed
-      mid-walk, or the hop limit -- the caller declines the whole group this
-      operand belongs to.
+      (attention-op boundary, a gated ``Mul``/``SwiGLU`` whose operands
+      don't both resolve, ...), a graph output crossed mid-walk, or the hop
+      limit -- the caller declines the whole group this operand belongs to.
 
     `chain_ops` mirrors :class:`_Chain`'s own field exactly (each entry a
     ``(node, const_name_or_None)`` pair, in forward -- producer-to-merge --
@@ -3550,13 +3576,14 @@ def _walk_matmul_producer_backward(
     `chain_ops` the same way `_find_chains` builds them for an ordinary
     single-producer chain. `edges` mirrors
     :func:`_walk_conv_producer_backward`'s own field exactly -- see its
-    docstring for what it records and why. A gated ``Mul``'s own two
-    operands are deliberately *not* added to `edges`: unlike this walk's own
-    deferred bias/scale-hop tensors, `_trace_gate_producer_backward` already
-    holds every tensor on a gate/up branch to an exact single-consumer bar
-    (see this section's own comment above), so there is no extra fan-out for
-    a later pass to resolve and nothing for `edges`/`backbone_tensors` to
-    track there.
+    docstring for what it records and why. A gated ``Mul``/``SwiGLU``'s own
+    two operands are deliberately *not* added to `edges`: unlike this walk's
+    own deferred bias/scale-hop tensors, a `Mul`'s operands (via
+    `_trace_gate_producer_backward`) and a `SwiGLU`'s operands (via the
+    same single-consumer/not-a-graph-output bar, checked directly) are both
+    already held to an exact single-consumer bar (see this section's own
+    comment above), so there is no extra fan-out for a later pass to resolve
+    and nothing for `edges`/`backbone_tensors` to track there.
     """
     chain_ops: List[Tuple[onnx.NodeProto, Optional[str]]] = []
     edges: List[Tuple[str, onnx.NodeProto]] = []
@@ -3654,10 +3681,68 @@ def _walk_matmul_producer_backward(
             # Not a resolvable gated pair either -- falls through to the
             # merge check (which requires `Add` or a
             # ``SkipLayerNormalization``-family node specifically) or
-            # `"fail"`, correct for the native fused `SwiGLU` op too (never
-            # matched by `_BINARY_CHANNEL_OPS`'s `Add`/`Mul` check at all --
-            # see this section's own comment above for why it's left out of
-            # scope).
+            # `"fail"`. `SwiGLU` is never matched here -- it isn't in
+            # `_BINARY_CHANNEL_OPS` at all -- it gets its own check below.
+
+        if (
+            producer_infos is not None
+            and node.op_type == "SwiGLU"
+            and len(node.input) == 2
+            and len(node.output) == 1
+        ):
+            # The native fused SwiGLU(a, b[, alpha]) = swish(a) * b (opset
+            # 28+) op, reusing _find_gated_chains's own SwiGLU-branch
+            # extraction verbatim (see this section's own comment above for
+            # the composition-safety argument, re-derived against this
+            # shape specifically): unlike a plain `Mul`, SwiGLU's swish
+            # lives entirely *inside* the op, so `a`/`b` must be the two
+            # producers' own raw outputs with nothing in between -- no
+            # _trace_gate_producer_backward pre-op walk here, just a direct
+            # producer_infos lookup, each held to the same single-consumer/
+            # not-a-graph-output bar _find_gated_chains's own `_is_internal`
+            # applies (consumers_of/graph_outputs are threaded through
+            # unchanged). `alpha`, if present, is a node attribute, not a
+            # tensor input -- nothing for this pass to slice, so it needs no
+            # attention here.
+            a_name, b_name = node.input
+            if a_name not in initializer_map and b_name not in initializer_map:
+                info_a_lookup = producer_infos.get(a_name)
+                info_b_lookup = producer_infos.get(b_name)
+                if (
+                    info_a_lookup is not None
+                    and info_b_lookup is not None
+                    and len(consumers_of.get(a_name, [])) == 1
+                    and a_name not in graph_outputs
+                    and len(consumers_of.get(b_name, [])) == 1
+                    and b_name not in graph_outputs
+                ):
+                    node_a, n_a = info_a_lookup[0], info_a_lookup[4]
+                    node_b, n_b = info_b_lookup[0], info_b_lookup[4]
+                    if node_a is not node_b and n_a == n_b:
+                        producer_a = _Producer(
+                            info_a_lookup[0],
+                            info_a_lookup[1],
+                            info_a_lookup[2],
+                            info_a_lookup[3],
+                            (),
+                        )
+                        producer_b = _Producer(
+                            info_b_lookup[0],
+                            info_b_lookup[1],
+                            info_b_lookup[2],
+                            info_b_lookup[3],
+                            (),
+                        )
+                        return (
+                            "gated",
+                            (producer_a, producer_b, n_a),
+                            tuple(reversed(chain_ops)),
+                            tuple(edges),
+                        )
+            # Not a resolvable gated pair -- SwiGLU is never an eligible
+            # merge node either (_match_matmul_residual_merge only matches
+            # `Add`/`SkipLayerNormalization`-family nodes), so this falls
+            # through to "fail" below, same as any other unmatched shape.
 
         if node.op_type in _FUSED_BIAS_GELU_OPS:
             fused = _match_fused_bias_gelu(node, initializer_map)
@@ -3896,9 +3981,10 @@ def _find_matmul_residual_chains(graph: onnx.GraphProto) -> List[_Chain]:
                     leaf_producers.append(producer)
                     n_channels_set.add(n_channels)
                 elif kind == "gated":
-                    # A gated (SwiGLU/GeGLU) Mul of two non-constant
-                    # operands, each already walked back to its own real
-                    # producer -- see _walk_matmul_producer_backward's own
+                    # A gated (SwiGLU/GeGLU) combine (a plain Mul, or the
+                    # native fused SwiGLU op) of two non-constant operands,
+                    # each already walked back to its own real producer --
+                    # see _walk_matmul_producer_backward's own
                     # "gated" return-kind docstring and this section's own
                     # comment above. Both producers join this group's shared
                     # leaf-producer set, exactly like an ordinary gated
@@ -5669,18 +5755,18 @@ def apply_structured_pruning(
     own surviving channel indices alongside everything else, confirmed
     against onnxruntime's own kernel source and by direct execution -- see
     :func:`_find_matmul_residual_chains`'s own section comment for the exact
-    fused arithmetic. A gated (SwiGLU/GeGLU) ``Mul`` combine feeding a
-    residual branch with no downstream projection in between is now resolved
-    the same way a gated pair outside a residual chain already is (see
-    :func:`_find_gated_chains`): both the gate and up producers it walks
-    back to are folded into the group's own shared leaf-producer set, ranked
-    and pruned together with everything else. A residual branch that would
-    need to cross a fused self-attention op boundary
-    (``com.microsoft::Attention``/``GroupQueryAttention``/``ai.onnx``
-    ``Attention``) to reach a real producer, or one gated by the native
-    fused ``SwiGLU`` op rather than a plain ``Mul``, is still declined
+    fused arithmetic. A gated (SwiGLU/GeGLU) combine -- a plain ``Mul`` of
+    two non-constant operands, or the native fused ``SwiGLU`` op (opset
+    28+) -- feeding a residual branch with no downstream projection in
+    between is now resolved the same way a gated pair outside a residual
+    chain already is (see :func:`_find_gated_chains`): both the gate and up
+    producers it walks back to are folded into the group's own shared
+    leaf-producer set, ranked and pruned together with everything else. A
+    residual branch that would need to cross a fused self-attention op
+    boundary (``com.microsoft::Attention``/``GroupQueryAttention``/
+    ``ai.onnx`` ``Attention``) to reach a real producer is still declined
     rather than guessed at -- see the section comment above
-    :func:`_walk_matmul_producer_backward` for why neither is actually
+    :func:`_walk_matmul_producer_backward` for why it isn't actually
     reachable by any hop this walk recognizes, and why the far more common
     shapes (a gated FFN's own output projection, or an attention block's own
     output-projection MatMul, feeding the residual `Add`/`SkipLayerNormalization`)
