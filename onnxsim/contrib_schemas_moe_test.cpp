@@ -37,6 +37,14 @@
  * cross-check, like the onnxruntime one above, needs Python dependencies
  * onnxsim's C++ build doesn't have (see CLAUDE.md), which is why it isn't
  * reproduced as a C++ test here.
+ *
+ * fc3 (silu-only, ONNX Runtime's "Mixtral case": fc2(silu(fc1(x)) *
+ * fc3(x))) is in the same disclosed-gap category as use_sparse_mixer:
+ * transcribed from onnxruntime/contrib_ops/cuda/moe/moe.cc's own comment
+ * ("map Mixtral to SwiGLU by packing weights as [FC3, FC1]"), not covered
+ * by the 80-combination onnxruntime session cross-check above, since ORT's
+ * CPU MoE kernel rejects fc3 outright for any activation ("FC3 is not
+ * implemented for CPU MoE") -- there is no CPU oracle to run it against.
  */
 #include <onnx/defs/function.h>
 #include <onnx/defs/schema.h>
@@ -82,6 +90,35 @@ TypeProto MakeFloatType(const std::vector<int64_t>& dims,
     }
   }
   return t;
+}
+
+// fc3_experts_weights (like fc1/fc2's per-expert Gathers) is only ever
+// referenced inside the body's Loop subgraph, not among function_proto's own
+// top-level nodes -- unlike "input"/"router_probs", which the routing logic
+// above the Loop also uses directly. So checking for a reference needs to
+// look inside Loop/If node's nested graph attributes too, not just the
+// top-level node list.
+bool ReferencesValue(const FunctionProto& function_proto,
+                     const std::string& value_name) {
+  std::vector<const onnx::GraphProto*> graphs_to_scan;
+  auto scan_nodes = [&](const auto& nodes) {
+    for (const auto& n : nodes) {
+      for (const auto& in : n.input()) {
+        if (in == value_name) return true;
+      }
+      for (const auto& attr : n.attribute()) {
+        if (attr.has_g()) graphs_to_scan.push_back(&attr.g());
+      }
+    }
+    return false;
+  };
+  if (scan_nodes(function_proto.node())) return true;
+  while (!graphs_to_scan.empty()) {
+    const onnx::GraphProto* g = graphs_to_scan.back();
+    graphs_to_scan.pop_back();
+    if (scan_nodes(g->node())) return true;
+  }
+  return false;
 }
 
 NodeProto MakeMoENode(int64_t k, const std::string& activation_type,
@@ -224,7 +261,11 @@ void TestBuildsForSparseMixer() {
         "its routing choice left to the body's own runtime If");
 }
 
-void TestDeclinesForFc3() {
+void TestDeclinesForFc3WithNonSiluActivation() {
+  // fc3 is only implemented for activation_type == "silu" (ONNX Runtime's
+  // own "Mixtral case" -- see SelectMoESiluFc3FunctionTemplate's comment in
+  // contrib_schemas.cpp); relu (and identity/gelu) + fc3 has no ORT-defined
+  // behavior at all and stays declined.
   const OpSchema* schema = OpSchemaRegistry::Schema("MoE", 1, "com.microsoft");
   NodeProto node =
       MakeMoENode(/*k=*/2, "relu", /*normalize=*/0, /*use_sparse_mixer=*/0,
@@ -234,7 +275,32 @@ void TestDeclinesForFc3() {
   FunctionBodyBuildContextImpl ctx(node, input_types);
   FunctionProto function_proto;
   bool built = schema->BuildContextDependentFunction(ctx, function_proto);
-  Check(!built, "fc3_experts_weights present is only meaningful for swiglu");
+  Check(!built,
+        "fc3_experts_weights with a non-silu activation has no ORT-defined "
+        "behavior and should stay declined");
+}
+
+void TestBuildsForSiluFc3() {
+  // silu + fc3 is ONNX Runtime's own "Mixtral case": fc2(silu(fc1(x)) *
+  // fc3(x)), the standard separate gate/up/down-projection gated MLP (the
+  // shape onnxruntime-genai's Phi-3.5-MoE builder actually exports). Unlike
+  // TestDeclinesForFc3WithNonSiluActivation, this must build successfully.
+  const OpSchema* schema = OpSchemaRegistry::Schema("MoE", 1, "com.microsoft");
+  NodeProto node =
+      MakeMoENode(/*k=*/2, "silu", /*normalize=*/0, /*use_sparse_mixer=*/0,
+                  /*swiglu_fusion=*/0, /*with_fc3=*/true);
+  auto input_types =
+      MakeInputTypes(4, 6, 8, /*dynamic_experts=*/false, /*with_fc3=*/true);
+  FunctionBodyBuildContextImpl ctx(node, input_types);
+  FunctionProto function_proto;
+  bool built = schema->BuildContextDependentFunction(ctx, function_proto);
+  Check(built, "silu + fc3 (the Mixtral case) should build a reference body");
+  if (!built) return;
+
+  Check(ReferencesValue(function_proto, "fc3_experts_weights"),
+        "body should reference the formal 'fc3_experts_weights' parameter "
+        "(inside the Loop subgraph, alongside fc1/fc2's own per-expert "
+        "Gathers)");
 }
 
 void TestBuildsForDynamicExpertCount() {
@@ -297,7 +363,8 @@ int main() {
   TestBuildsForPlainReluCase();
   TestDeclinesForSwiglu();
   TestBuildsForSparseMixer();
-  TestDeclinesForFc3();
+  TestDeclinesForFc3WithNonSiluActivation();
+  TestBuildsForSiluFc3();
   TestBuildsForDynamicExpertCount();
   TestBodyUsesALoopNotPerExpertUnrolling();
 

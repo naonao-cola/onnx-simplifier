@@ -172,6 +172,57 @@ def test_qmoe_output_shape_is_inferred():
     assert dims == [num_tokens, hidden_size]
 
 
+def test_moe_with_fc3_output_shape_is_inferred():
+    # com.microsoft.MoE with a separate fc3 weight and activation_type="silu"
+    # is the real Mixtral-style gate/up/down-projection convention
+    # onnxruntime-genai's Phi-3.5-MoE builder exports (see
+    # generate_moe_function_templates.py's module docstring for the fc3(x) *
+    # silu(fc1(x)) formula and where it's transcribed from). Unlike
+    # test_simplify_round_trips_a_runnable_moe_model below, this can't be
+    # round-tripped through a real onnxruntime CPU session: ONNX Runtime's
+    # own CPU MoE kernel rejects fc3 unconditionally ("FC3 is not
+    # implemented for CPU MoE"), so check_n=0 here only exercises shape
+    # inference -- the same as test_qmoe_output_shape_is_inferred above, and
+    # for the same reason (no CPU-runnable reference to check_n against).
+    num_tokens, hidden_size, inter_size, num_experts, k = 4, 6, 8, 3, 2
+    fc3_w = _f32(
+        np.random.default_rng(4).standard_normal((num_experts, inter_size, hidden_size))
+        * 0.1,
+        "fc3_w",
+    )
+    model = _model(
+        f"""
+        agraph (float[{num_tokens},{hidden_size}] input,
+                float[{num_tokens},{num_experts}] router_probs)
+              => (float[?,?] output)
+        {{
+          moe_out = com.microsoft.MoE
+              <k: int = {k}, activation_type: string = "silu",
+               normalize_routing_weights: int = 0>
+              (input, router_probs, fc1_w, , fc2_w, , fc3_w)
+          output = Identity(moe_out)
+        }}
+        """,
+        initializer=[
+            *_moe_weights(
+                np.random.default_rng(4), num_experts, hidden_size, inter_size
+            ),
+            fc3_w,
+        ],
+    )
+    onnx.checker.check_model(model)
+
+    simplified, ok = onnxsim.simplify(
+        model, check_n=0, perform_optimization=False, skip_constant_folding=True
+    )
+    assert ok
+    out_shape = simplified.graph.output[0].type.tensor_type.shape
+    dims = [
+        d.dim_value if d.HasField("dim_value") else d.dim_param for d in out_shape.dim
+    ]
+    assert dims == [num_tokens, hidden_size]
+
+
 def test_simplify_round_trips_a_runnable_moe_model():
     # onnxsim.simplify's own check_n mechanism runs the model through
     # onnxruntime before and after simplification and compares outputs --

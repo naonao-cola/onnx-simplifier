@@ -915,7 +915,38 @@ const char* SelectMoEFunctionTemplate(const std::string& activation,
                       : kMoEFunctionGeluFc1NoBiasFc2NoBias;
 }
 
-// Context-dependent function body for MoE: attaches one of 16 fixed,
+// Mixtral-style gated MLP -- fc2(silu(fc1(x)) * fc3(x)), a separate
+// ungated fc3 Gemm combined with fc1's activated output before fc2. Only
+// ever selected for activation_type == "silu": this is ONNX Runtime's own
+// "Mixtral case" (onnxruntime/contrib_ops/cuda/moe/moe.cc), which remaps it
+// onto the kernel's SwiGLU path by packing weights as [FC3, FC1] (Linear,
+// Gate) -- "Kernel supports SwiGLU which is Linear * SiLU(Gate)" -- and is
+// gated on that exact activation check, with no analogous defined behavior
+// for relu/identity/gelu (see BuildMoEFunctionBody's own comment for why
+// those stay declined instead of reusing this). fc3_experts_bias is an
+// independent optional input from fc1/fc2's biases (fc3 is its own Gemm),
+// hence the extra has_fc3_bias axis here versus SelectMoEFunctionTemplate
+// above.
+const char* SelectMoESiluFc3FunctionTemplate(bool has_fc1_bias,
+                                             bool has_fc2_bias,
+                                             bool has_fc3_bias) {
+  if (has_fc1_bias) {
+    if (has_fc2_bias) {
+      return has_fc3_bias ? kMoEFunctionSiluFc1BiasFc2BiasFc3Bias
+                          : kMoEFunctionSiluFc1BiasFc2BiasFc3NoBias;
+    }
+    return has_fc3_bias ? kMoEFunctionSiluFc1BiasFc2NoBiasFc3Bias
+                        : kMoEFunctionSiluFc1BiasFc2NoBiasFc3NoBias;
+  }
+  if (has_fc2_bias) {
+    return has_fc3_bias ? kMoEFunctionSiluFc1NoBiasFc2BiasFc3Bias
+                        : kMoEFunctionSiluFc1NoBiasFc2BiasFc3NoBias;
+  }
+  return has_fc3_bias ? kMoEFunctionSiluFc1NoBiasFc2NoBiasFc3Bias
+                      : kMoEFunctionSiluFc1NoBiasFc2NoBiasFc3NoBias;
+}
+
+// Context-dependent function body for MoE: attaches one of 24 fixed,
 // pre-built function bodies (contrib_schemas_moe_templates.gen.h), selected
 // purely by which optional inputs the node has (fc1_experts_bias,
 // fc2_experts_bias) and which of the four implemented activations it uses --
@@ -926,23 +957,35 @@ const char* SelectMoEFunctionTemplate(const std::string& activation,
 // input count to match its formal parameter list, so a function that
 // references an optional input directly cannot also serve a call site that
 // omits it -- the *node list itself*, not just a runtime value, would need
-// to differ. Every one of the 16 bodies is otherwise fully generic: any
+// to differ. Every one of the 24 bodies is otherwise fully generic: any
 // num_experts (a real ONNX `Loop`, not a per-node unrolled copy), and k/
 // normalize_routing_weights/use_sparse_mixer forwarded from the calling
 // node's own attributes and dispatched via runtime `If`s inside the body,
 // rather than read here and compiled into a choice of what to emit.
 //
+// fc3_experts_weights (a Mixtral-style separate gate/up/down projection, as
+// opposed to fc1 alone) is supported for activation_type == "silu" only --
+// see SelectMoESiluFc3FunctionTemplate's comment for exactly why it's silu
+// specifically, straight from ONNX Runtime's own CUDA kernel. This is a
+// real, shipping convention (onnxruntime-genai's Phi-3.5-MoE builder), not
+// a synthetic one, but has no CPU-kernel oracle to check against (ORT's own
+// CPU MoE kernel rejects fc3 outright, for any activation) -- disclosed as
+// the same kind of validation gap as use_sparse_mixer below.
+//
 // Still declines (returns false, leaving the node opaque but still
 // shape-inferable via the TypeAndShapeInferenceFunction above):
 //  - swiglu, or an unrecognized activation_type (also swiglu_fusion != 0,
-//    which is only meaningful for swiglu, and fc3_experts_weights, which is
-//    only meaningful for swiglu or the "silu with a separate fc3" ORT
-//    compatibility case) -- not yet implemented; unlike num_experts/k/
-//    normalize_routing_weights/use_sparse_mixer above, swiglu needs
-//    genuinely different ops (a second per-expert GEMM, a different
-//    activation formula, optionally a fused/interleaved input layout), not
-//    just a different runtime value, so it can't be folded into the same
-//    fixed bodies as a runtime branch the way those were.
+//    which is only meaningful for swiglu) -- not yet implemented; unlike
+//    num_experts/k/normalize_routing_weights/use_sparse_mixer above, swiglu
+//    needs genuinely different ops (a second per-expert GEMM, a different
+//    activation formula, a fused/interleaved input layout), not just a
+//    different runtime value, so it can't be folded into the same fixed
+//    bodies as a runtime branch the way those were.
+//  - fc3_experts_weights with any activation other than silu: real ORT has
+//    no defined behavior for that combination either (its CUDA kernel's
+//    fc3 remapping is itself gated on activation_type == silu), so this
+//    stays declined rather than guessing a formula ORT itself doesn't
+//    implement.
 bool BuildMoEFunctionBody(const FunctionBodyBuildContext& ctx,
                           const OpSchema& schema,
                           FunctionProto& function_proto) {
@@ -960,14 +1003,25 @@ bool BuildMoEFunctionBody(const FunctionBodyBuildContext& ctx,
       swiglu_fusion_attr->i() != 0) {
     return false;
   }
-  if (ctx.hasInput(6)) {
-    return false;  // fc3_experts_weights: only meaningful for swiglu.
+  const bool has_fc3 = ctx.hasInput(6);
+  if (has_fc3 && activation != "silu") {
+    // relu/identity/gelu + fc3 has no ORT-defined behavior at all: real
+    // ORT's CUDA kernel only remaps fc3 into its SwiGLU path when
+    // activation_type is silu specifically (see
+    // SelectMoESiluFc3FunctionTemplate's comment); for any other activation it
+    // would still repack fc1/fc3 into a doubled-width buffer while running that
+    // activation on it unchanged, silently misinterpreting the weights rather
+    // than erroring -- so this stays declined instead of guessing a formula for
+    // it.
+    return false;
   }
 
   const bool has_fc1_bias = ctx.hasInput(3);
   const bool has_fc2_bias = ctx.hasInput(5);
-  const char* text =
-      SelectMoEFunctionTemplate(activation, has_fc1_bias, has_fc2_bias);
+  const char* text = has_fc3 ? SelectMoESiluFc3FunctionTemplate(
+                                   has_fc1_bias, has_fc2_bias, ctx.hasInput(7))
+                             : SelectMoEFunctionTemplate(
+                                   activation, has_fc1_bias, has_fc2_bias);
 
   FunctionBuilder builder(function_proto);
   // Every standard-domain op any of the fixed bodies use (Softmax, TopK,

@@ -14,10 +14,11 @@ not just a runtime value, would need to differ). See BuildMoEFunctionBody's
 own comment in contrib_schemas.cpp for the full picture of what remains
 context-dependent and why.
 
-Beyond that unavoidable bias-presence dispatch, every one of the 16 fixed
-functions built here (4 activations x fc1_bias x fc2_bias) is fully generic
-at the ONNX level, using mechanisms a per-instance C++ codegen pass used to
-paper over:
+Beyond that unavoidable bias-presence dispatch, every one of the 24 fixed
+functions built here (4 activations x fc1_bias x fc2_bias, plus 8 more for
+activation="silu" x fc1_bias x fc2_bias x fc3_bias -- see below) is fully
+generic at the ONNX level, using mechanisms a per-instance C++ codegen pass
+used to paper over:
 
   - num_experts, unknown until a real node is inspected, is now a genuine
     ONNX `Loop` trip count (`Shape(fc1_experts_weights)[0]`) instead of a
@@ -51,6 +52,28 @@ generated here it cannot be numerically checked against a running ONNX
 Runtime session. It was instead cross-checked against an independent numpy
 transliteration of the same CUDA source (see the PR description for the
 comparison) before being transcribed a second time, here, into ONNX ops.
+
+The 8 additional activation="silu" x fc1_bias x fc2_bias x fc3_bias
+functions implement fc3 -- a real, shipping convention: onnxruntime-genai's
+model builder (onnxruntime-genai/src/python/py/models/builders/phi.py,
+`Phi3MoELongRoPEModel`) exports Phi-3.5-MoE-style checkpoints this way, and
+it is the standard Mixtral gated-MLP shape (separate gate/up/down
+projections) generally. `fc2(silu(fc1(x)) * fc3(x))` is transcribed
+straight from onnxruntime's own CUDA kernel comment
+(onnxruntime/contrib_ops/cuda/moe/moe.cc: "Mixtral case: SiLU activation
+with separate FC3 ... Kernel supports SwiGLU which is Linear * SiLU(Gate)
+... map Mixtral to SwiGLU by packing weights as [FC3, FC1] (Linear, Gate)"),
+not guessed from the schema doc comments alone. Like use_sparse_mixer, this
+has no CPU kernel to check against -- onnxruntime's CPU MoE kernel
+(onnxruntime/contrib_ops/cpu/moe/moe_cpu.cc) rejects fc3 unconditionally
+("FC3 is not implemented for CPU MoE"), for any activation -- so this is
+disclosed as the same kind of validation gap as use_sparse_mixer rather than
+claimed as ORT-session-verified. It is also why fc3 is only ever generated
+for activation="silu": the CUDA kernel's own weight-repacking is gated on
+`activation_type_ == ActivationType::Silu` specifically, so relu/identity/
+gelu + fc3 has no ORT-defined behavior at all (real ORT would silently
+misinterpret such a node's weights, not just skip it) and stays declined in
+BuildMoEFunctionBody rather than guessing a formula for it.
 
 Run this script whenever the generated templates need to change:
     python3 scripts/codegen/generate_moe_function_templates.py \
@@ -134,11 +157,19 @@ def _extract_body(func_text: str) -> str:
     return "\n".join(lines) + "\n"
 
 
-def _cpp_ident(activation: str, has_fc1_bias: bool, has_fc2_bias: bool) -> str:
+def _cpp_ident(
+    activation: str,
+    has_fc1_bias: bool,
+    has_fc2_bias: bool,
+    has_fc3_bias: bool | None = None,
+) -> str:
     cap = activation[0].upper() + activation[1:]
     b1 = "Bias" if has_fc1_bias else "NoBias"
     b2 = "Bias" if has_fc2_bias else "NoBias"
-    return f"kMoEFunction{cap}Fc1{b1}Fc2{b2}"
+    if has_fc3_bias is None:
+        return f"kMoEFunction{cap}Fc1{b1}Fc2{b2}"
+    b3 = "Bias" if has_fc3_bias else "NoBias"
+    return f"kMoEFunction{cap}Fc1{b1}Fc2{b2}Fc3{b3}"
 
 
 # --- Per-activation FC1-output -> FC2-input transform. relu/identity/silu
@@ -255,33 +286,56 @@ def _routing_lines() -> str:
     )
 
 
-def _make_moe_function(activation: str, has_fc1_bias: bool, has_fc2_bias: bool):
+def _make_moe_function(
+    activation: str,
+    has_fc1_bias: bool,
+    has_fc2_bias: bool,
+    has_fc3_bias: bool | None = None,
+):
     """Assembles the `@script()` source for one (activation, fc1_bias,
-    fc2_bias) fixed function -- arbitrary num_experts (a real ONNX `Loop`),
-    arbitrary k/normalize_routing_weights/use_sparse_mixer (forwarded
-    attributes and runtime `If`s), a single fixed activation (see module
-    docstring for why that alone stays a build-time choice) -- via `exec`,
-    the same technique contrib_schemas_moe_test.cpp's generator used before
-    for the 16 (activation, bias) expert-block fragments, now producing a
-    complete function per combination instead of a spliced-in fragment.
+    fc2_bias[, fc3_bias]) fixed function -- arbitrary num_experts (a real
+    ONNX `Loop`), arbitrary k/normalize_routing_weights/use_sparse_mixer
+    (forwarded attributes and runtime `If`s), a single fixed activation (see
+    module docstring for why that alone stays a build-time choice) -- via
+    `exec`, the same technique contrib_schemas_moe_test.cpp's generator used
+    before for the 16 (activation, bias) expert-block fragments, now
+    producing a complete function per combination instead of a spliced-in
+    fragment.
+
+    `has_fc3_bias=None` (the default) means fc3 is absent entirely -- the
+    plain per-expert FFN, `fc2(activation(fc1(x)))`. `has_fc3_bias` a bool
+    means fc3 is present as a second, ungated per-expert Gemm combined with
+    fc1's activated output via elementwise Mul before fc2:
+    `fc2(activation(fc1(x)) * fc3(x))`. Only ever called with `activation ==
+    "silu"` for that case -- see BuildMoEFunctionBody's comment in
+    contrib_schemas.cpp for why: this is ONNX Runtime's own "Mixtral case"
+    (onnxruntime/contrib_ops/cuda/moe/moe.cc, `kernel_activation_type =
+    ActivationType::Swiglu` remap + the "[FC3, FC1]" weight-packing comment
+    right above it) -- silu(fc1(x)) is the kernel's "SiLU(Gate)" and fc3(x)
+    its "Linear", with no analogous defined behavior for the other three
+    activations.
     """
-    # Always declare the full, fixed-position 6-parameter signature (matching
-    # com.microsoft.MoE's own schema exactly: input, router_probs,
+    has_fc3 = has_fc3_bias is not None
+    # Always declare the full, fixed-position formal-parameter signature
+    # (matching com.microsoft.MoE's own schema exactly: input, router_probs,
     # fc1_experts_weights, fc1_experts_bias, fc2_experts_weights,
-    # fc2_experts_bias) regardless of has_fc1_bias/has_fc2_bias, even though a
-    # given variant's body below only ever *references* fc1_experts_bias/
-    # fc2_experts_bias when the corresponding flag is set.
+    # fc2_experts_bias[, fc3_experts_weights, fc3_experts_bias]) regardless of
+    # has_fc1_bias/has_fc2_bias/has_fc3_bias, even though a given variant's
+    # body below only ever *references* a bias input when its corresponding
+    # flag is set.
     #
     # fc2_experts_weights/fc2_experts_bias sit *after* fc1_experts_bias in
     # that fixed layout, so a real calling node with fc1_experts_bias absent
     # but fc2_experts_bias present cannot simply supply fewer inputs (ONNX
     # only allows *trailing* optional inputs to be omitted that way) -- it
     # must pass an explicit "" placeholder at fc1_experts_bias's position,
-    # meaning its actual input count is still 6. A function declaring fewer
-    # formal parameters than that (e.g. compacting fc1_experts_bias out of
-    # the signature when has_fc1_bias is False) then fails ONNX's own
-    # "actuals <= formals" inlining rule for exactly that calling pattern --
-    # caught empirically by this generator's own validation below.
+    # meaning its actual input count still reaches through whichever of
+    # fc2_experts_bias/fc3_experts_weights/fc3_experts_bias is the last one
+    # actually present. A function declaring fewer formal parameters than
+    # that (e.g. compacting fc1_experts_bias out of the signature when
+    # has_fc1_bias is False) then fails ONNX's own "actuals <= formals"
+    # inlining rule for exactly that calling pattern -- caught empirically by
+    # this generator's own validation below.
     params = [
         'input: FLOAT["..."]',
         'router_probs: FLOAT["N", "E"]',
@@ -290,6 +344,9 @@ def _make_moe_function(activation: str, has_fc1_bias: bool, has_fc2_bias: bool):
         'fc2_experts_weights: FLOAT["E", "H", "I"]',
         'fc2_experts_bias: FLOAT["E", "H"]',
     ]
+    if has_fc3:
+        params.append('fc3_experts_weights: FLOAT["E", "I", "H"]')
+        params.append('fc3_experts_bias: FLOAT["E", "I"]')
 
     def indent(text: str, prefix: str) -> str:
         return "".join(prefix + line + "\n" for line in text.splitlines())
@@ -304,6 +361,16 @@ def _make_moe_function(activation: str, has_fc1_bias: bool, has_fc2_bias: bool):
     else:
         loop_lines.append("h1 = op.Gemm(flat_input, w1, transB=1)")
     loop_lines.append(_activation_lines(activation).rstrip("\n"))
+    if has_fc3:
+        loop_lines.append("w3_3d = op.Gather(fc3_experts_weights, e_idx, axis=0)")
+        loop_lines.append("w3 = op.Squeeze(w3_3d, op.Constant(value_ints=[0]))")
+        if has_fc3_bias:
+            loop_lines.append("b3_2d = op.Gather(fc3_experts_bias, e_idx, axis=0)")
+            loop_lines.append("b3 = op.Squeeze(b3_2d, op.Constant(value_ints=[0]))")
+            loop_lines.append("h3 = op.Gemm(flat_input, w3, b3, transB=1)")
+        else:
+            loop_lines.append("h3 = op.Gemm(flat_input, w3, transB=1)")
+        loop_lines.append("a1 = op.Mul(a1, h3)")
     loop_lines.append("w2_3d = op.Gather(fc2_experts_weights, e_idx, axis=0)")
     loop_lines.append("w2 = op.Squeeze(w2_3d, op.Constant(value_ints=[0]))")
     if has_fc2_bias:
@@ -347,7 +414,10 @@ def _make_moe_function(activation: str, has_fc1_bias: bool, has_fc2_bias: bool):
         "_SPARSE_MIXER_SENTINEL": _SPARSE_MIXER_SENTINEL,
         "__name__": __name__,
     }
-    filename = f"<moe_function_{activation}_fc1{has_fc1_bias}_fc2{has_fc2_bias}>"
+    fc3_tag = "None" if has_fc3_bias is None else str(has_fc3_bias)
+    filename = (
+        f"<moe_function_{activation}_fc1{has_fc1_bias}_fc2{has_fc2_bias}_fc3{fc3_tag}>"
+    )
     linecache.cache[filename] = (
         len(source),
         None,
@@ -377,6 +447,24 @@ def main() -> None:
                 _bind_attribute(proto, _SPARSE_MIXER_SENTINEL, "use_sparse_mixer")
                 text = _extract_body(onnx.printer.to_text(proto))
                 ident = _cpp_ident(activation, has_fc1_bias, has_fc2_bias)
+                entries.append((ident, text))
+
+    # fc3 (Mixtral-style gated MLP, fc2(silu(fc1(x)) * fc3(x))) is only ever
+    # generated for activation="silu" -- see _make_moe_function's and
+    # BuildMoEFunctionBody's own comments for why relu/identity/gelu + fc3
+    # stays declined instead (no defined ORT semantics for those).
+    for has_fc1_bias in (False, True):
+        for has_fc2_bias in (False, True):
+            for has_fc3_bias in (False, True):
+                fn = _make_moe_function(
+                    "silu", has_fc1_bias, has_fc2_bias, has_fc3_bias
+                )
+                proto = fn.to_function_proto()
+                _bind_attribute(proto, _K_SENTINEL, "k")
+                _bind_attribute(proto, _NORMALIZE_SENTINEL, "normalize_routing_weights")
+                _bind_attribute(proto, _SPARSE_MIXER_SENTINEL, "use_sparse_mixer")
+                text = _extract_body(onnx.printer.to_text(proto))
+                ident = _cpp_ident("silu", has_fc1_bias, has_fc2_bias, has_fc3_bias)
                 entries.append((ident, text))
 
     out = []
