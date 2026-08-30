@@ -957,27 +957,25 @@ onnx::ModelProto _FoldConstant(const ModelExecutor& executor,
   }
   // Map each pre-existing, non-transient Constant node's output to the node
   // itself, seeding the lookup RunOps uses to inline a Constant node's
-  // embedded value instead of looking it up as an initializer. Grown as
-  // folding creates new Constant nodes for impure outputs (see
-  // RunOpsAndAddInitializers); new_constant_nodes owns those (a std::deque,
-  // not a std::vector, so the pointers this map holds into it stay valid as
-  // more are appended).
-  //
-  // Transient Constant nodes (kTransientConstantAttr) are deliberately
-  // excluded: unlike a genuine Constant node -- which GetConstantNodes leaves
-  // untouched for this whole call -- a transient one is *not* special-cased
-  // there and flows through the ordinary foldable path instead, so it may be
-  // folded (and its NodeProto dropped from the model) by RebuildNodeList
-  // before this map is next consulted. Seeding it here would eventually
-  // dangle. It doesn't need to be seeded anyway: once folded, its value is a
-  // plain initializer that FindInitializerByName already resolves.
+  // embedded value instead of looking it up as an initializer -- including a
+  // transient one (kTransientConstantAttr): unlike a genuine Constant node,
+  // it is not special-cased out of GetConstantNodes and so flows through the
+  // ordinary foldable path, but that fold can still fail and leave it
+  // in place (FoldGroup's catch-and-skip), so a later batch may need to
+  // inline it same as any other Constant. Safe to seed unconditionally here
+  // (unlike the Graph-native counterpart below): this map's pointers alias
+  // `model.graph().node()`, which nothing in this function's batch loop
+  // frees or reallocates -- only RebuildNodeList, strictly after the loop,
+  // drops folded entries. Grown as folding creates new Constant nodes for
+  // impure outputs (see RunOpsAndAddInitializers); new_constant_nodes owns
+  // those (a std::deque, not a std::vector, so the pointers this map holds
+  // into it stay valid as more are appended).
   std::unordered_map<std::string, const onnx::NodeProto*>
       constant_node_producers;
   for (const auto& node : model.graph().node()) {
     const bool is_default_domain =
         node.domain().empty() || node.domain() == "ai.onnx";
-    if (is_default_domain && node.op_type() == "Constant" &&
-        !IsTransientConstant(node)) {
+    if (is_default_domain && node.op_type() == "Constant") {
       for (const auto& output : node.output()) {
         constant_node_producers.emplace(output, &node);
       }
@@ -1049,19 +1047,45 @@ onnx::ModelProto _FoldConstant(const ModelExecutor& executor,
   // else: they have no inputs of their own, so any position before their
   // first use is topologically valid, and the front trivially satisfies that
   // for every consumer regardless of where it sits in `original_nodes`.
+  //
+  // Every pre-existing Constant node kept as-is (GetConstantNodes' own
+  // passthrough) is prepended alongside them, for the same reason: a
+  // Constant node has no inputs, so moving it earlier is always safe, and a
+  // model can carry one positioned after one of its own uses -- tolerated by
+  // ONNX's checker (this is not the initializer list, whose order genuinely
+  // doesn't matter) but not by the stricter topological-order check the
+  // ModelProto<->Graph round trip inside Optimize() runs. Such a node used
+  // to be silently normalized by extract_constant_to_initializer (which
+  // converted it to an order-independent initializer) before that pass was
+  // always disabled.
   {
     onnxsim::ProfiledScope rebuild_scope("RebuildNodeList");
     google::protobuf::RepeatedPtrField<onnx::NodeProto> original_nodes;
     original_nodes.Swap(model.mutable_graph()->mutable_node());
-    for (auto& node : new_constant_nodes) {
-      *model.mutable_graph()->add_node() = std::move(node);
-    }
+    google::protobuf::RepeatedPtrField<onnx::NodeProto> kept_constants;
+    google::protobuf::RepeatedPtrField<onnx::NodeProto> kept_others;
     for (auto& node : original_nodes) {
       const bool folded =
           node.output_size() > 0 && folded_outputs.count(node.output(0)) > 0;
-      if (!folded) {
-        *model.mutable_graph()->add_node() = std::move(node);
+      if (folded) {
+        continue;
       }
+      const bool is_default_domain =
+          node.domain().empty() || node.domain() == "ai.onnx";
+      if (is_default_domain && node.op_type() == "Constant") {
+        *kept_constants.Add() = std::move(node);
+      } else {
+        *kept_others.Add() = std::move(node);
+      }
+    }
+    for (auto& node : new_constant_nodes) {
+      *model.mutable_graph()->add_node() = std::move(node);
+    }
+    for (auto& node : kept_constants) {
+      *model.mutable_graph()->add_node() = std::move(node);
+    }
+    for (auto& node : kept_others) {
+      *model.mutable_graph()->add_node() = std::move(node);
     }
   }
   // Drop initializers left dangling by folding so the intermediate model does
@@ -1181,6 +1205,10 @@ bool IsTransientConstantOnGraph(onnx::Node* node) {
 // Graph-native counterpart of GetConstantNodes.
 ConstantNodePartitionGraph GetConstantNodesOnGraph(
     onnx::Graph& g, const std::vector<onnx::Node*>& node_ptrs) {
+  // Reference node every genuine Constant encountered below is moved just
+  // before, in scan order -- see that branch's own comment for why.
+  onnx::Node* const front_anchor =
+      node_ptrs.empty() ? nullptr : node_ptrs.front();
   std::unordered_set<std::string> const_names{""};
   // Subset of const_names whose value traces back purely to graph
   // initializers -- see GetConstantNodes' own pure_names for the full
@@ -1219,6 +1247,22 @@ ConstantNodePartitionGraph GetConstantNodesOnGraph(
     const bool is_default_domain = domain.empty() || domain == "ai.onnx";
     if (is_default_domain && node->kind() == onnx::kConstant &&
         !IsTransientConstantOnGraph(node)) {
+      // A Constant node has no inputs, so moving it earlier is always safe;
+      // do so unconditionally rather than checking whether it is already
+      // valid. A model can otherwise carry one positioned after one of its
+      // own uses -- tolerated by ONNX's checker (this is not the initializer
+      // list, whose order genuinely doesn't matter) but not by the stricter
+      // topological-order check the ModelProto<->Graph round trip inside
+      // Optimize() runs -- and such a node used to be silently normalized by
+      // extract_constant_to_initializer (which converted it to an
+      // order-independent initializer) before that pass was always disabled.
+      // Moved just before `front_anchor` (in scan order, so relative order
+      // among moved Constants is preserved) rather than the graph's true
+      // first node, which may itself shift as earlier Constants in this same
+      // scan are moved.
+      if (front_anchor != nullptr && node != front_anchor) {
+        node->moveBefore(front_anchor);
+      }
       for (onnx::Value* out : node->outputs()) {
         const_names.insert(out->uniqueName());
       }
@@ -1492,9 +1536,12 @@ void FoldGroupOnGraph(
         new_value = g.addInitializerAndCreateValue(t);
       } else {
         // Not purely initializer-derived: materialize as a Constant node
-        // (inserted right where the folded node used to be -- always
-        // topologically valid, since a Constant node has no inputs of its
-        // own to satisfy) instead of an initializer.
+        // instead of an initializer. Prepended at the very front of the
+        // graph (rather than inserted at the folded node's old position):
+        // a Constant node has no inputs of its own, so the front is always
+        // topologically valid regardless of where its consumers -- or, for
+        // a multi-batch fold, nodes not yet visited in this same call --
+        // currently sit.
         onnx::Node* constant = g.create(onnx::kConstant, 1);
         constant->t_(onnx::kvalue, t);
         std::vector<onnx::Dimension> sizes;
@@ -1505,12 +1552,18 @@ void FoldGroupOnGraph(
         constant->output()->setSizes(sizes);
         constant->output()->setElemType(tp.data_type());
         constant->output()->setUniqueName(tp.name());
-        constant->insertBefore(owner);
+        g.prependNode(constant);
         constant_node_producers[tp.name()] = constant;
         new_value = constant->output();
       }
       old_value->replaceAllUsesWith(new_value);
       if (--remaining_outputs[owner] == 0) {
+        // If `owner` is itself a (transient) Constant node seeded into
+        // constant_node_producers, drop its entry before destroying it --
+        // see the seeding loop's own comment on why transient nodes are
+        // seeded despite being foldable: this is the other half of that,
+        // keeping the map from ever pointing at freed memory.
+        constant_node_producers.erase(tp.name());
         owner->destroy();
       }
     }
@@ -1570,24 +1623,22 @@ bool _FoldConstantOnGraph(const ModelExecutor& executor, onnx::Graph& g,
   // itself, seeding the lookup RunOpsOnGraph uses to inline a Constant node's
   // embedded value instead of looking it up as an initializer. Grown as
   // folding creates new Constant nodes for impure outputs (see
-  // FoldGroupOnGraph).
-  //
-  // Transient Constant nodes (kTransientConstantAttr) are deliberately
-  // excluded -- see _FoldConstant's identical seeding loop for the full
-  // rationale. Here it's a use-after-free, not just staleness: a transient
-  // node flows through the ordinary foldable path and gets destroyed
-  // (FoldGroupOnGraph's `owner->destroy()`) once folded, but this map is
-  // seeded once up front and never told, so a later batch's lookup could
-  // dereference the freed Node*. It doesn't need seeding anyway: once
-  // folded, its value is a plain initializer that g.getInitializer already
-  // resolves.
+  // FoldGroupOnGraph) -- including a transient one (kTransientConstantAttr):
+  // unlike a genuine Constant node, it is not special-cased out of
+  // GetConstantNodesOnGraph and so flows through the ordinary foldable path,
+  // but that fold can still fail and leave it in place
+  // (FoldGroupOnGraph's catch-and-skip), so a later batch may need to inline
+  // it same as any other Constant. A transient node's fold *succeeding*
+  // destroys it (FoldGroupOnGraph's `owner->destroy()`), which would
+  // otherwise leave this map holding a dangling Node* -- FoldGroupOnGraph
+  // erases the entry itself right before destroying the node, so seeding it
+  // here is safe.
   std::unordered_map<std::string, onnx::Node*> constant_node_producers;
   for (onnx::Node* node : node_ptrs) {
     const std::string domain =
         node->has_domain() ? node->domain() : std::string();
     const bool is_default_domain = domain.empty() || domain == "ai.onnx";
-    if (is_default_domain && node->kind() == onnx::kConstant &&
-        !IsTransientConstantOnGraph(node)) {
+    if (is_default_domain && node->kind() == onnx::kConstant) {
       for (onnx::Value* out : node->outputs()) {
         constant_node_producers.emplace(out->uniqueName(), node);
       }
