@@ -4413,11 +4413,15 @@ def _find_gated_chains(graph: onnx.GraphProto) -> List[_Chain]:
 # does -- no dedicated check was needed to draw that boundary, it falls out
 # for free from what the walkers already do and don't recognize. A gated
 # (SwiGLU/GeGLU) pair feeding a `Concat` operand directly, with no real
-# producer's raw output in
-# between, is declined the same way: neither backward walker resolves
-# through a `Mul` of two non-constant operands (see the MatMul residual
-# section's own comment for why), so that shape falls through to `"fail"`
-# too.
+# producer's raw output in between and no `Add`/`SkipLayerNormalization`
+# merge involved either, *is* resolved for MatMul/Gemm branches -- see
+# :func:`_find_matmul_concat_chains`'s own docstring for exactly how (a
+# third, `"gated"`, outcome from :func:`_walk_matmul_producer_backward`,
+# distinct from both the plain-producer and composed-residual-group shapes
+# above). Conv has no such combine point in scope at all -- `_BINARY_CHANNEL_OPS`
+# is a MatMul/Gemm-only concept, :func:`_walk_conv_producer_backward` never
+# recognizes a `Mul` hop -- so a Conv `Concat` branch bottoming out at one
+# still falls through to `"fail"` exactly as before.
 #
 # `Concat`'s own `axis` attribute must actually be the channel axis this
 # pass's importance ranking operates on, and the two node families need
@@ -4904,22 +4908,62 @@ def _find_matmul_concat_chains(graph: onnx.GraphProto) -> List[_ConcatChain]:
     `axis` only when the operands' rank is confirmed via `value_info` to
     actually be `rank - 1`) is resolved backward, via
     :func:`_walk_matmul_producer_backward` (reused unchanged from the
-    MatMul/Gemm residual section above), to either a real MatMul/vanilla-Gemm
-    producer (`"producer"`) or an eligible residual/`SkipLayerNormalization`
-    merge's whole group (`"add"`, composed via
+    MatMul/Gemm residual section above, `producer_infos` passed through the
+    same way :func:`_find_matmul_residual_chains` does so a gated ``Mul`` hop
+    can resolve too -- see below), to a real MatMul/vanilla-Gemm producer
+    (`"producer"`), an eligible residual/`SkipLayerNormalization` merge's
+    whole group (`"add"`, composed via
     :func:`_resolve_matmul_residual_group_for_concat` -- see this section's
     own comment for exactly what composing that requires and what it
-    declines). If *any* operand fails to resolve either way, or two operands
-    (or two leaf producers of the same composed group, or a leaf producer of
-    one branch against another branch's own) name the very same producer
-    weight (degenerate), the whole `Concat` node is declined -- never
-    partially pruned.
+    declines), or a gated (SwiGLU/GeGLU-style) ``Mul`` of two non-constant
+    operands feeding this `Concat` operand directly (`"gated"`, resolved by
+    :func:`_walk_matmul_producer_backward` itself via
+    :func:`_trace_gate_producer_backward` -- unlike the `"add"` composition
+    above, there is no whole transitively-connected group to walk out from
+    here: just this one `Mul` node's own two operands, each already resolved
+    to its own real producer by the walker, both becoming this one branch's
+    own `producers` tuple, ranked together by the same root-sum-square
+    importance :func:`_plain_branch_importance` already applies to a
+    multi-producer branch. Safe for exactly the reason the residual section's
+    own "gated" outcome already is: `_trace_gate_producer_backward` holds
+    every tensor on the gate/up branches to an exact single-consumer bar, and
+    :func:`_branch_walk_has_fanout` -- reused unchanged, since the walk's own
+    `edges` deliberately excludes the gated ``Mul``'s own two operands, see
+    :func:`_walk_matmul_producer_backward`'s own docstring -- still confirms
+    the ``Mul``'s own raw output has no consumer but this `Concat`, so no
+    fan-out anywhere on either shape this composition could miss. Strictly
+    disjoint from the `"add"` outcome by construction, not just today's
+    matching: :func:`_match_matmul_residual_merge` only ever matches a bare
+    ``Add`` or a ``SkipLayerNormalization``-family node, never a ``Mul``, so
+    no node can ever resolve as both). If *any* operand fails to resolve at
+    all, or two operands (or two leaf/gate/up producers of the same composed
+    group or gated pair, or a leaf producer of one branch against another
+    branch's own) name the very same producer weight (degenerate), the whole
+    `Concat` node is declined -- never partially pruned.
     """
     initializer_map = {t.name: t for t in graph.initializer}
     consumers_of = _consumers_of(graph)
     node_by_output = {out: node for node in graph.node for out in node.output}
     graph_outputs = {o.name for o in graph.output}
     value_info_by_name = _value_info_by_name(graph)
+
+    # _find_gated_chains's own producer-lookup map, built once here and
+    # threaded through _walk_matmul_producer_backward below -- needed only to
+    # resolve a gated Mul hop via _trace_gate_producer_backward, exactly the
+    # way _find_matmul_residual_chains already builds and passes this same
+    # map (see this function's own docstring above).
+    producer_infos: Dict[str, Tuple[onnx.NodeProto, str, bool, Optional[str], int]] = {}
+    for node in graph.node:
+        info = _match_producer(node, initializer_map)
+        if info is not None:
+            w_name, weight_transposed, bias_name, n_channels = info
+            producer_infos[node.output[0]] = (
+                node,
+                w_name,
+                weight_transposed,
+                bias_name,
+                n_channels,
+            )
 
     def _is_internal(name: str) -> bool:
         return len(consumers_of.get(name, [])) == 1 and name not in graph_outputs
@@ -4945,6 +4989,7 @@ def _find_matmul_concat_chains(graph: onnx.GraphProto) -> List[_ConcatChain]:
                 consumers_of,
                 graph_outputs,
                 _MAX_CHAIN_HOPS,
+                producer_infos,
             )
             if kind == "fail":
                 declined = True
@@ -4952,6 +4997,31 @@ def _find_matmul_concat_chains(graph: onnx.GraphProto) -> List[_ConcatChain]:
             if _branch_walk_has_fanout(operand, edges, consumers_of, node):
                 declined = True
                 break
+            if kind == "gated":
+                producer_a, producer_b, n_channels = cast(
+                    Tuple[_Producer, _Producer, int], payload
+                )
+                if (
+                    producer_a.weight == producer_b.weight
+                    or producer_a.weight in seen_weights
+                    or producer_b.weight in seen_weights
+                ):
+                    declined = True
+                    break
+                seen_weights.add(producer_a.weight)
+                seen_weights.add(producer_b.weight)
+                branches.append(
+                    _ConcatBranch(
+                        (producer_a, producer_b),
+                        pre_ops,
+                        (),
+                        n_channels,
+                        offset,
+                        operand,
+                    )
+                )
+                offset += n_channels
+                continue
             if kind == "add":
                 assert isinstance(payload, onnx.NodeProto)
                 resolved = _resolve_matmul_residual_group_for_concat(
