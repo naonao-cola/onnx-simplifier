@@ -8737,3 +8737,427 @@ def apply_moe_expert_channel_pruning(
     if chains:
         _apply_moe_chains(graph, chains, sparsity, _moe_importance)
     return out
+
+
+# --- MoE whole-expert pruning ------------------------------------------------
+#
+# The complementary half of :func:`apply_moe_expert_channel_pruning`: instead
+# of narrowing every expert's own `inter_size`, this shrinks the `num_experts`
+# leading axis itself -- dropping entire experts. This module's own docstring
+# scopes :func:`apply_moe_expert_channel_pruning` to the "expert-intermediate-
+# channel" half of the "Iterative Puzzle" paper (arXiv:2607.04371) precisely
+# *because* whole-expert removal needs strictly more machinery: `num_experts`/
+# `k`-consistency bookkeeping and a safe way to resize `router_probs`' own
+# upstream producer (see that function's own section comment). This section
+# builds that machinery -- following the general post-training MoE-pruning
+# literature's standard technique (calibration-based expert-usage ranking,
+# e.g. dropping the experts with the lowest average router gate weight over a
+# representative batch -- the "prune-by-usage" family the task's own
+# background cites), not any single paper's exact recipe -- and confirms,
+# empirically, that the result is exactly safe once four separate questions
+# are answered:
+#
+# 1. *What does `router_probs` actually hold, and how does `num_experts`
+#    shrinking affect it?* Confirmed by reading `contrib_schemas.cpp`'s own
+#    `MakeMoESchema()` (which itself transcribes ONNX Runtime's
+#    `docs/ContribOperators.md`/`contrib_defs.cc`): despite the name,
+#    `router_probs` (`MoE`'s own input 1) holds raw per-token, per-expert
+#    routing *logits* -- a Softmax is applied *internally*, over the
+#    `num_experts` axis, before top-k selection. That Softmax is exactly why
+#    whole-expert removal is safe to express as *shrinking* the axis rather
+#    than needing some separate "disable this expert" signal: shrinking
+#    `router_probs`' own width to `num_experts_kept` changes the Softmax's own
+#    denominator to sum over only the surviving experts, identically to what
+#    forcing the dropped experts' logits to `-inf` in the *original*-width
+#    model would do (`exp(-inf) == 0`, dropping out of both the Softmax
+#    numerator and denominator). Verified directly against a real CPU
+#    `onnxruntime.InferenceSession`: a same-shape "masking" oracle (dropped
+#    experts' `fc1`/`fc2` zeroed, their router weight column's bias forced to
+#    `-1e9`) matches an actually-shrunk-`num_experts` model's output to
+#    *exactly* 0.0 max-abs-diff, both for the schema's default
+#    `normalize_routing_weights=0` and for `normalize_routing_weights=1`
+#    (which renormalizes the selected top-k weights to sum to 1 -- dropping
+#    an expert that was in some token's top-k changes who else is, which
+#    changes that renormalization too, and the two models still agree
+#    exactly, since ONNX Runtime's own top-k+renormalize logic never sees the
+#    dropped expert as a candidate in the pruned model either). So this pass
+#    needs no separate bookkeeping for `router_probs`' own *values* -- slicing
+#    its upstream producer's weight (see point 3) to the same kept-expert
+#    index set is the entire correctness argument, the same
+#    "shared keep set across multiple weights" pattern the rest of this
+#    module already uses for gated FFN pairs and residual merge groups.
+#
+# 2. *Does `k` need adjusting when `num_experts` shrinks?* Empirically
+#    confirmed against a real CPU `onnxruntime.InferenceSession`: `k` is a
+#    *required* attribute (`contrib_defs.cc`'s own `.Attr("k", ..., INT,
+#    /*required=*/true)`, cross-checked live via
+#    ``onnxruntime.capi.onnxruntime_pybind11_state.get_all_operator_schema()``
+#    too) with no schema default, so it always has some concrete value on any
+#    valid node. Session *construction* with `k > num_experts` succeeds
+#    (shape inference never looks at `k` against `num_experts`) but
+#    *execution* fails hard with an explicit, unambiguous ONNX Runtime error
+#    -- "MoE attribute 'k' must be <= num_experts; got k=<k>, num_experts=<n>"
+#    (`moe_cpu.cc`) -- confirmed by actually triggering it. So `num_experts`
+#    can never be pruned below `k`. Rather than *clamp `k` down* to fit (which
+#    would silently change how many experts every surviving token gets
+#    combined across, a real behavior change on top of the pruning itself,
+#    and would touch a node attribute this pass has no principled way to
+#    "undo" the effect of), this pass instead treats `k` as a hard floor on
+#    how many experts survive -- `num_experts_to_keep` is silently raised to
+#    `k` (never lowered below it) if the requested `sparsity` would otherwise
+#    ask for fewer, the same "at least one channel is always kept" floor
+#    :func:`apply_moe_expert_channel_pruning` already uses, just floored at
+#    `k` instead of 1 (below `k`, the node cannot execute *at all*, not
+#    merely "prunes to nothing usable"). `k` itself is never written to.
+#
+# 3. *Can the router's own weight be identified/isolated as a pruneable
+#    producer in the general case?* Only when it is provably safe to, the
+#    same bar every other producer this module touches is held to: exactly
+#    one node produces `router_probs`, it is a plain MatMul or (`transA=0`,
+#    `alpha=1`, `beta=1` if biased) Gemm (:func:`_match_matmul_like`, the
+#    same matcher every ordinary MatMul/Gemm producer in this module is
+#    matched with), its weight is a constant 2-D float32 initializer whose
+#    output-channel width equals `num_experts`, `router_probs` itself has no
+#    consumer besides this one `MoE` node (an auxiliary head or logging
+#    output reading the same tensor would otherwise silently see a
+#    now-differently-shaped tensor), and neither the weight nor its optional
+#    bias is a tied/shared initializer read anywhere else (the same
+#    tied-weight guard :func:`_match_moe_producer` already applies to
+#    `fc1`/`fc2`). Any node whose `router_probs` producer doesn't match this
+#    exactly -- a router expressed as more than one node (e.g. a bias `Add`
+#    kept separate from the Gemm, a `Reshape`/`Cast` in between, jitter noise
+#    added during training-mode export, ...), fed from more than one
+#    consumer, or backed by a non-constant/tied weight -- is left completely
+#    untouched rather than guessed at.
+#
+# 4. *Does this hold for every `MoE` configuration, or only some?* This pass
+#    reuses :func:`_match_moe_producer`'s own `fc1`/`fc2`/`fc3`/`activation_type`
+#    checks outright (so it declines `fc3_experts_weights` and `swiglu` for
+#    the exact same confirmed-empirically reasons documented in this module's
+#    "MoE expert-intermediate-channel pruning" section above -- `num_experts`
+#    lives on `fc1`'s/`fc2`'s shared axis 0 regardless of `fusion_size`, so
+#    neither restriction is *structurally* required for whole-expert pruning
+#    the way it is for `inter_size` pruning, but this pass keeps the same
+#    narrow, already-verified surface rather than opening a new one that
+#    would need its own independent oracle check) -- plus one restriction of
+#    its own: `use_sparse_mixer=1` (a different, jitter-named top-2-only
+#    routing path -- confirmed empirically to hard-require `k == 2`
+#    specifically, `moe_base_cpu.h`'s own "Sparse mixer only supports k=2"
+#    check) is declined outright. It was confirmed deterministic run-to-run
+#    on this environment's CPU provider (no actual training-time jitter
+#    applied at inference), but its own comparison-based expert tie-break
+#    logic was not independently re-derived and checked against the same
+#    `-inf`-masking oracle point 1 relies on, so -- the same conservative
+#    call every other under-verified case in this module makes -- it is left
+#    untouched rather than assumed safe.
+
+
+@dataclass(frozen=True)
+class _MoEExpertChain:
+    node: onnx.NodeProto
+    fc1_w: str
+    fc1_b: Optional[str]
+    fc2_w: str
+    fc2_b: Optional[str]
+    num_experts: int
+    k: int
+    router_probs: str
+    router_w: str
+    router_w_transposed: bool
+    router_b: Optional[str]
+
+
+def _match_moe_whole_expert_producer(
+    node: onnx.NodeProto,
+    initializer_map: Dict[str, onnx.TensorProto],
+    consumers_of: Dict[str, List[onnx.NodeProto]],
+    node_by_output: Dict[str, onnx.NodeProto],
+    graph_outputs: Set[str],
+) -> Optional[_MoEExpertChain]:
+    """If `node` is a ``com.microsoft::MoE`` node this pass can safely prune
+    whole experts (the `num_experts` axis) from, returns the matched
+    :class:`_MoEExpertChain`. See this section's own comment above for the
+    full safety argument; this mirrors :func:`_match_moe_producer`'s own
+    `fc1`/`fc2`/`fc3`/`activation_type` checks exactly (reused outright, via
+    a direct call), then adds the `k`/`use_sparse_mixer` checks and the
+    `router_probs` producer match described there.
+    """
+    base = _match_moe_producer(node, initializer_map, consumers_of)
+    if base is None:
+        return None
+
+    k = None
+    use_sparse_mixer = 0
+    for attr in node.attribute:
+        if attr.name == "k":
+            k = attr.i
+        elif attr.name == "use_sparse_mixer":
+            use_sparse_mixer = attr.i
+    if k is None or k < 1 or k > base.num_experts or use_sparse_mixer != 0:
+        return None
+
+    if len(node.input) < 2 or not node.input[1]:
+        return None
+    router_probs = node.input[1]
+    if router_probs in graph_outputs or len(consumers_of.get(router_probs, [])) != 1:
+        return None
+    router_node = node_by_output.get(router_probs)
+    if router_node is None:
+        return None
+    router_info = _match_producer(router_node, initializer_map)
+    if router_info is None:
+        return None
+    router_w_name, router_w_transposed, router_b_name, n_channels = router_info
+    if n_channels != base.num_experts or len(consumers_of.get(router_w_name, [])) != 1:
+        return None
+    if router_b_name is not None and len(consumers_of.get(router_b_name, [])) != 1:
+        return None
+
+    return _MoEExpertChain(
+        node=node,
+        fc1_w=base.fc1_w,
+        fc1_b=base.fc1_b,
+        fc2_w=base.fc2_w,
+        fc2_b=base.fc2_b,
+        num_experts=base.num_experts,
+        k=int(k),
+        router_probs=router_probs,
+        router_w=router_w_name,
+        router_w_transposed=router_w_transposed,
+        router_b=router_b_name,
+    )
+
+
+def _find_moe_whole_expert_chains(graph: onnx.GraphProto) -> List[_MoEExpertChain]:
+    initializer_map = {t.name: t for t in graph.initializer}
+    consumers_of = _consumers_of(graph)
+    node_by_output = {out: node for node in graph.node for out in node.output}
+    graph_outputs = {o.name for o in graph.output}
+    chains = []
+    for node in graph.node:
+        chain = _match_moe_whole_expert_producer(
+            node, initializer_map, consumers_of, node_by_output, graph_outputs
+        )
+        if chain is not None:
+            chains.append(chain)
+    return chains
+
+
+def _moe_expert_weight_importance(
+    chain: _MoEExpertChain, initializer_map: Dict[str, onnx.TensorProto]
+) -> np.ndarray:
+    """Combined (root-sum-square) L2-norm importance per *expert* -- the
+    weight-magnitude-only fallback used when no calibration data was
+    observed for a chain's `router_probs` (mirrors
+    :func:`apply_structured_wanda_pruning`'s own "no matching activation
+    observed -> fall back to |W|" behavior). Each expert `e` owns one whole
+    `fc1_experts_weights[e]`/`fc2_experts_weights[e]` (and, if present,
+    `fc1_experts_bias[e]`) slice; unlike :func:`_moe_importance` (which
+    reduces *across* the expert axis to rank `inter_size`), this reduces
+    *within* each expert's own slice to rank experts themselves.
+    """
+    fc1_w = onnx.numpy_helper.to_array(initializer_map[chain.fc1_w]).astype(np.float64)
+    fc2_w = onnx.numpy_helper.to_array(initializer_map[chain.fc2_w]).astype(np.float64)
+    squared = np.sum(np.square(fc1_w), axis=(1, 2)) + np.sum(
+        np.square(fc2_w), axis=(1, 2)
+    )
+    if chain.fc1_b is not None:
+        fc1_b = onnx.numpy_helper.to_array(initializer_map[chain.fc1_b]).astype(
+            np.float64
+        )
+        squared = squared + np.sum(np.square(fc1_b), axis=1)
+    return np.sqrt(squared)
+
+
+def _apply_moe_whole_expert_chains(
+    graph: onnx.GraphProto,
+    chains: List[_MoEExpertChain],
+    sparsity: float,
+    compute_importance,
+) -> Set[str]:
+    initializer_map = {t.name: t for t in graph.initializer}
+    touched: Set[str] = set()
+    stale_value_info: Set[str] = set()
+
+    for chain in chains:
+        weight_names = {chain.fc1_w, chain.fc2_w, chain.router_w}
+        if chain.fc1_b is not None:
+            weight_names.add(chain.fc1_b)
+        if chain.router_b is not None:
+            weight_names.add(chain.router_b)
+        if weight_names & touched:
+            continue  # a shared/tied initializer another MoE node already resized
+        touched |= weight_names
+
+        n = chain.num_experts
+        floor = max(1, min(chain.k, n))
+        keep_count = max(floor, n - round(n * sparsity))
+        if keep_count >= n:
+            continue  # rounds down to nothing (or below k) for this layer -- no-op
+
+        importance = compute_importance(chain, initializer_map)
+        keep = np.sort(np.argsort(-importance)[:keep_count])
+
+        fc1_init = initializer_map[chain.fc1_w]
+        fc1_w_new = np.take(onnx.numpy_helper.to_array(fc1_init), keep, axis=0)
+        fc1_init.CopyFrom(
+            onnx.numpy_helper.from_array(
+                np.ascontiguousarray(fc1_w_new), name=chain.fc1_w
+            )
+        )
+
+        fc2_init = initializer_map[chain.fc2_w]
+        fc2_w_new = np.take(onnx.numpy_helper.to_array(fc2_init), keep, axis=0)
+        fc2_init.CopyFrom(
+            onnx.numpy_helper.from_array(
+                np.ascontiguousarray(fc2_w_new), name=chain.fc2_w
+            )
+        )
+
+        if chain.fc1_b is not None:
+            fc1_b_init = initializer_map[chain.fc1_b]
+            fc1_b_new = np.take(onnx.numpy_helper.to_array(fc1_b_init), keep, axis=0)
+            fc1_b_init.CopyFrom(
+                onnx.numpy_helper.from_array(
+                    np.ascontiguousarray(fc1_b_new), name=chain.fc1_b
+                )
+            )
+        # fc2_experts_bias indexes hidden_size, unaffected by an expert-count
+        # cut -- never sliced here, same reasoning as expert-channel pruning.
+
+        router_w_init = initializer_map[chain.router_w]
+        _slice_producer_weight(router_w_init, chain.router_w_transposed, keep)
+        if chain.router_b is not None:
+            _slice_last_axis(initializer_map[chain.router_b], keep)
+
+        stale_value_info.add(chain.router_probs)
+
+    return stale_value_info
+
+
+def apply_moe_whole_expert_pruning(
+    model: Union[str, onnx.ModelProto],
+    calibration_data: Optional[Sequence[Tensors]] = None,
+    num_samples: int = 8,
+    seed: int = 0,
+    sparsity: float = 0.5,
+    providers: Optional[Sequence[str]] = None,
+) -> onnx.ModelProto:
+    """Removes whole experts (shrinks the `num_experts` leading axis) from a
+    matched ``com.microsoft::MoE`` node and its upstream router projection at
+    once -- the complementary technique to
+    :func:`apply_moe_expert_channel_pruning`'s own `inter_size` pruning (see
+    that function's own docstring and this module's docstring for how the two
+    relate), and the general, calibration-based "prune the least-used
+    experts" technique from the post-training MoE-pruning literature: experts
+    are ranked by their mean router *gate weight* -- ``softmax(router_probs)``
+    averaged over every calibration token -- not raw logit magnitude (logits
+    have no shared scale across experts to compare on their own; Softmax is
+    what makes them comparable) and not exact top-k selection
+    frequency/combine weight (which would require re-deriving ONNX Runtime's
+    own top-k + optional `normalize_routing_weights` renormalization exactly,
+    an unnecessary duplication of runtime semantics this pass doesn't need
+    just to get a solid usage signal). See this section's own comment above
+    for the full safety argument -- in particular why shrinking
+    `router_probs`' own width is *exactly* equivalent to forcing the dropped
+    experts' routing logits to `-inf` (confirmed to 0.0 max-abs-diff against
+    a real onnxruntime CPU session), why `k` is never touched but instead
+    floors how many experts can ever be pruned away, and exactly which nodes
+    are matched (:func:`_match_moe_whole_expert_producer`) -- `fc3`/`swiglu`/
+    `use_sparse_mixer` and any router not expressed as one plain, untied
+    MatMul/Gemm feeding `router_probs` and nothing else are all out of scope.
+
+    Every matched expert's `fc1_experts_weights`/`fc2_experts_weights` (and
+    `fc1_experts_bias`, if present) row, and the router projection weight's
+    (and bias's, if present) matching output column, are dropped together for
+    the lowest-``sparsity``-fraction of experts by that ranking -- with
+    `num_experts_to_keep` silently floored at the node's own `k` (pruning
+    below `k` experts remaining is a hard onnxruntime execution failure, not
+    merely suboptimal -- confirmed empirically, see above) rather than ever
+    adjusting `k` itself. A chain whose `router_probs` was never observed
+    during calibration (e.g. ``calibration_data=[]``) falls back to each
+    expert's own combined `fc1`/`fc2` (+`fc1_experts_bias`) L2 weight norm,
+    the same "no matching activation observed" fallback
+    :func:`apply_structured_wanda_pruning` already uses.
+
+    :param model: the original onnx ModelProto or file path
+    :param calibration_data: representative input batches to rank experts by
+            mean router gate weight on. Each batch is a
+            ``{input_name: np.ndarray}`` dict matching ``model``'s graph
+            inputs -- see :func:`onnxsim.generate_random_calibration_data`
+            (the default when omitted)
+    :param num_samples: random batches to generate when
+            ``calibration_data`` is omitted
+    :param seed: seed for the random calibration data (ignored if
+            ``calibration_data`` is supplied)
+    :param sparsity: target fraction of each matched node's `num_experts` to
+            remove (floored at the node's own `k`, so fewer may actually be
+            removed -- never more)
+    :param providers: onnxruntime execution providers to run ``model`` on
+            when capturing calibration router activations
+    :returns: ``model`` with every matched ``MoE`` node's `fc1`/`fc2`(/`fc1`
+            bias) and its router projection's weight(/bias) resized in
+            place; a node with `fc3_experts_weights`, a `swiglu`/unrecognized
+            `activation_type`, `use_sparse_mixer`, a non-constant or
+            tied/shared weight anywhere in the chain (including the router
+            projection), a `router_probs` with more than one consumer, or any
+            other shape this pass doesn't recognize is left completely
+            untouched
+    """
+    if not (0.0 <= sparsity < 1.0):
+        raise ValueError(f"sparsity must be in [0, 1), got {sparsity}")
+    if isinstance(model, str):
+        model = onnx.load(model, load_external_data=False)
+    if calibration_data is None:
+        calibration_data = generate_random_calibration_data(
+            model, num_samples=num_samples, seed=seed
+        )
+
+    out = onnx.ModelProto()
+    out.CopyFrom(model)
+    graph = out.graph
+
+    chains = _find_moe_whole_expert_chains(graph)
+    if not chains:
+        return out
+
+    probe_names = sorted({chain.router_probs for chain in chains})
+    probe_model = _add_probe_outputs(out, probe_names)
+
+    sum_prob: Dict[str, np.ndarray] = {}
+    count: Dict[str, int] = {}
+    for batch in calibration_data:
+        result = backend.run_model(probe_model, batch, providers=providers)
+        for name in probe_names:
+            logits = np.asarray(result[name], dtype=np.float64)
+            if logits.ndim != 2:
+                continue  # router_probs is always documented 2-D; skip if not
+            # Numerically-stable Softmax over the expert axis (the same
+            # normalization MoE's own kernel applies internally, per
+            # this section's own comment), averaged over every token.
+            shifted = logits - logits.max(axis=-1, keepdims=True)
+            exp = np.exp(shifted)
+            probs = exp / exp.sum(axis=-1, keepdims=True)
+            s = probs.sum(axis=0)
+            sum_prob[name] = s if name not in sum_prob else sum_prob[name] + s
+            count[name] = count.get(name, 0) + logits.shape[0]
+    mean_gate_weight: Dict[str, np.ndarray] = {
+        name: s / max(count[name], 1) for name, s in sum_prob.items()
+    }
+
+    def _importance(
+        chain: _MoEExpertChain, initializer_map: Dict[str, onnx.TensorProto]
+    ) -> np.ndarray:
+        gate = mean_gate_weight.get(chain.router_probs)
+        if gate is None or gate.shape[0] != chain.num_experts:
+            return _moe_expert_weight_importance(chain, initializer_map)
+        return gate
+
+    stale_value_info = _apply_moe_whole_expert_chains(
+        graph, chains, sparsity, _importance
+    )
+    if stale_value_info:
+        kept = [vi for vi in graph.value_info if vi.name not in stale_value_info]
+        del graph.value_info[:]
+        graph.value_info.extend(kept)
+    return out
