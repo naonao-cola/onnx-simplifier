@@ -6172,6 +6172,76 @@ def _slice_axis1(init: onnx.TensorProto, keep: np.ndarray) -> None:
     init.CopyFrom(onnx.numpy_helper.from_array(new, name=init.name))
 
 
+def _slice_axis(init: onnx.TensorProto, keep: np.ndarray, axis: int) -> None:
+    """The fully general form of :func:`_slice_axis1`/:func:`_slice_last_axis`:
+    slices a constant along an arbitrary `axis` by `keep`. Used for a
+    broadcastable per-head mask/bias constant (`com.microsoft::Attention`'s/
+    `GroupQueryAttention`'s own `attention_bias` input, or the plain
+    ``ai.onnx::Attention`` op's `attn_mask`) whose own head-axis *position*
+    depends on its rank -- see :func:`_head_bias_axis`.
+    """
+    arr = onnx.numpy_helper.to_array(init)
+    new = np.take(arr, keep, axis=axis)
+    init.CopyFrom(onnx.numpy_helper.from_array(new, name=init.name))
+
+
+def _head_bias_axis(dims: Sequence[int], num_heads: int) -> Optional[int]:
+    """Classifies a broadcastable per-head mask/bias constant's shape
+    against the schema-documented rank-4 layout ``(batch_size or 1,
+    num_heads or 1, q_sequence_length, kv_sequence_length)`` -- or any rank
+    up to 4 broadcastable to it (`com.microsoft::Attention`'s and
+    `GroupQueryAttention`'s own `attention_bias` input doc names this shape
+    verbatim; the plain ``ai.onnx::Attention`` op's `attn_mask` is added the
+    same way against the identically-shaped `(batch, q_num_heads, q_seq,
+    kv_seq)` attention-score tensor -- see `onnx.reference.ops.op_attention`,
+    where it is added via a plain ``+`` against that tensor, i.e. ordinary
+    numpy broadcasting).
+
+    A tensor of rank *r* < 4 broadcasts against that rank-4 target the
+    standard numpy/ONNX way: right-aligned, as though `4 - r` size-1 axes
+    were implicitly prepended. The target's own `num_heads` axis sits at
+    position 1 (of 4); once a rank-*r* tensor is right-aligned, that same
+    target position lines up with the tensor's own axis ``r - 3`` -- which
+    only exists at all when ``r >= 3``. This is not a corner case nobody
+    triggers: a mask given at rank 3 with shape ``(num_heads, q_seq,
+    kv_seq)`` (omitting the batch axis entirely, relying on broadcast) is a
+    per-head tensor at axis *0*, not axis 1 -- confirmed by actual
+    onnxruntime execution, perturbing one index along a rank-3 mask's own
+    axis 0 and observing the change land on exactly that one head's own
+    output slice and no other (see ``tests/test_pruning.py``'s own
+    ``test_onnx_attention_pruning_rank3_attn_mask_head_axis_is_sliced``).
+
+    Returns the position within `dims` of that num_heads-aligned axis when
+    its size is exactly `num_heads` (a genuine per-head tensor -- safe to
+    slice along that axis by the same kept-head/kept-group index set
+    applied everywhere else in the matched chain); ``-1`` when no axis of
+    `dims` can ever land on that target position at all (``r < 3`` -- the
+    tensor is unconditionally head-count-independent), or it does land
+    there but is size 1 (an ordinary broadcast -- no real per-head values
+    to slice, and already correct for any head count); or ``None`` when the
+    shape doesn't cleanly resolve to either of those -- rank > 4 (off this
+    op's own broadcast contract entirely), or the axis lands somewhere but
+    is neither 1 nor `num_heads` (which would already make the source model
+    invalid against this same broadcasting rule, but this function still
+    declines rather than assume what a caller might have meant) -- for the
+    caller to decline the whole chain on rather than guess.
+    """
+    rank = len(dims)
+    if rank > 4:
+        return None
+    axis = rank - 3
+    if axis < 0:
+        return (
+            -1
+        )  # no axis of `dims` can ever align with the target's own num_heads slot
+    size = dims[axis]
+    if size == num_heads:
+        return axis
+    if size == 1:
+        return -1
+    return None
+
+
 def _plain_structured_importance(
     chain: _Chain, w_arrays_nk: List[np.ndarray], importance_norm: str = "l2"
 ) -> np.ndarray:
@@ -7202,7 +7272,26 @@ def apply_structured_wanda_pruning(
 #   `num_heads`/`qkv_hidden_sizes` attributes, one `num_heads` shared by
 #   Q/K/V alike. Every head owns an equally-sized, independent column block
 #   of that merged weight, so individual heads can be dropped one at a time
-#   -- see :func:`_apply_one_plain_attention_chain`.
+#   -- see :func:`_apply_one_plain_attention_chain`. This op's own
+#   contrib-op schema also gives it two unrelated optional mask-shaped
+#   inputs: `mask_index`, none of whose several documented shapes ever
+#   carry a `num_heads`-sized axis (confirmed via live schema
+#   introspection -- see :func:`_match_attention_producer`'s own
+#   docstring), so it is always left alone untouched; and `attention_bias`,
+#   which *does* (shape `(batch_size or 1, num_heads or 1, sequence_length,
+#   total_sequence_length)`, confirmed to have a real, non-ignored numeric
+#   effect via actual onnxruntime execution) -- a constant one is sliced
+#   along its own head axis by the same kept-head index set whenever that
+#   axis is genuinely `num_heads`-sized (:func:`_head_bias_axis`), left
+#   alone when it's a broadcast or dynamic, and declines the whole match
+#   when its shape resolves to neither. This was a real gap, not merely an
+#   overly conservative decline: an earlier version of this matcher never
+#   inspected `attention_bias` at all, so a model carrying one would have
+#   been pruned with a now-stale, wrong-head-count bias silently left
+#   behind -- a genuine correctness bug, not just a missed optimization
+#   (see ``tests/test_pruning.py``'s own
+#   ``test_attention_head_pruning_attention_bias_is_sliced_and_matches_oracle``,
+#   which fails against the pre-fix matcher/slicer).
 # - `GroupQueryAttention` (onnxsim/passes/fuse_gqa.h): separate, un-merged
 #   Q/K/V projections (ordinary MatMul/vanilla-Gemm nodes feeding directly
 #   into the op, not weights the op itself owns) plus independent
@@ -7255,7 +7344,17 @@ def apply_structured_wanda_pruning(
 #   shared packed weight (and its packed bias, if any) in a single combined
 #   slice, and shrinks the `Split` node's own split-sizes constant to
 #   match -- see :class:`_GQAChain`'s own `packed_split_sizes` field and
-#   :func:`_apply_one_gqa_chain`'s own packed branch.
+#   :func:`_apply_one_gqa_chain`'s own packed branch. Two more optional
+#   inputs carry a genuine per-*query*-head axis and were, like the plain
+#   `Attention` op's own `attention_bias` above, a real unhandled gap this
+#   pass now closes: `attention_bias` (same broadcastable shape/treatment
+#   as `Attention`'s own, but against `num_heads` meaning *query* heads
+#   here, added after GQA's own internal KV-repeat -- sliced by
+#   `keep_q_heads`, not `keep_groups`) and `head_sink` (a genuine
+#   `(num_heads,)` one-scalar-per-query-head softmax-smoothing constant,
+#   sliced directly by `keep_q_heads`) -- both confirmed to have a real,
+#   non-ignored numeric effect via actual onnxruntime execution, not
+#   assumed from either input's own doc string alone.
 # - the plain ``ai.onnx`` `Attention` (opset 24+, domain ``""``, schema
 #   confirmed against this environment's installed ``onnx==1.22.0`` via
 #   ``onnx.defs.get_schema("Attention", domain="")`` -- it is fully defined
@@ -7284,11 +7383,18 @@ def apply_structured_wanda_pruning(
 #   that function's own docstring and :func:`_find_separate_qkv_chains`'s
 #   own `allow_differing_v_head_size` parameter, `False` for
 #   `GroupQueryAttention`, `True` here); (3) its optional `attn_mask` input
-#   (a mask this pass makes no attempt to slice, since doing so correctly
-#   would require resolving its own broadcast shape against the new
-#   `q_num_heads`) gets the same non-empty-constant-is-declined,
-#   dynamic-is-left-alone treatment as before, while its `past_key`/
-#   `past_value` (a different pair of input indices from
+#   is added against the `(batch, q_num_heads, q_seq, kv_seq)` attention-
+#   score tensor via ordinary broadcasting -- a constant one is sliced by
+#   `keep_q_heads` when its own head axis (resolved by
+#   :func:`_head_bias_axis`, which also accounts for a lower-rank mask's
+#   axis genuinely landing on that same broadcast-target position -- see
+#   its own docstring) is exactly `q_num_heads`-sized, left untouched when
+#   it's a broadcast (absent or size-1), and declines the whole match only
+#   when the shape resolves to neither (narrower than an earlier version of
+#   this pass, which declined any non-empty constant mask outright
+#   regardless of shape); a *dynamic* one is always left alone and never
+#   blocks the match, while its `past_key`/`past_value` (a different pair
+#   of input indices from
 #   `GroupQueryAttention`'s own `past_key`/`past_value`/`seqlens_k`/
 #   `total_sequence_length`/`cos_cache`/`sin_cache`) share
 #   :func:`_match_gqa_producer`'s own updated treatment via the same
@@ -7494,6 +7600,33 @@ def _match_attention_producer(
     float32 merged QKV weight ``[K, Nq+Nk+Nv]`` (and, if present, a
     constant 1-D float32 merged bias), returns
     ``(weight_name, bias_name_or_None, num_heads, Nq, Nk, Nv)``.
+
+    This op's own contrib-op schema (`onnxruntime.capi
+    .onnxruntime_pybind11_state.get_all_operator_schema()`, confirmed live
+    against this environment's installed onnxruntime) gives it two,
+    unrelated optional mask-shaped inputs: `mask_index` (index 3, type
+    `M`/int32) documents five possible shapes -- `(batch_size, 1,
+    max_sequence_length, max_sequence_length)`, `(batch_size,
+    total_sequence_length)`, `(batch_size, sequence_length,
+    total_sequence_length)`, or an index of shape `(batch_size)`, `(2 *
+    batch_size)`, or `(3 * batch_size + 2)` -- *none* of which carry a
+    `num_heads`-sized axis, so it is unconditionally head-count-independent
+    and this function (like this whole matcher) never inspects it at all,
+    match or no match. `attention_bias` (index 5, type `T`, same dtype as
+    the QKV weight) is different: its own doc gives it shape `(batch_size
+    or 1, num_heads or 1, sequence_length, total_sequence_length)` --
+    verified to have a real, functional per-head effect via actual
+    onnxruntime execution, not assumed from the doc string alone (see
+    ``tests/test_pruning.py``'s own "attention_bias" subsection) -- so a
+    constant one is validated the same way :func:`_match_gqa_producer` and
+    :func:`_match_onnx_attention_producer` validate their own analogous
+    inputs, via :func:`_head_bias_axis`: declined outright when its shape
+    doesn't cleanly resolve to either "genuinely per-head, safe to slice"
+    or "broadcast, no per-head values at all" against this op's own
+    (pre-pruning) `num_heads`; left alone (and never blocks the match) when
+    dynamic, absent, or a constant that resolves to the latter --
+    :func:`_apply_one_plain_attention_chain` performs the actual slice once
+    a match succeeds.
     """
     if node.domain != _ATTENTION_DOMAIN or node.op_type != "Attention":
         return None
@@ -7549,6 +7682,12 @@ def _match_attention_producer(
         or nv % num_heads
     ):
         return None
+
+    if len(node.input) > 5 and node.input[5]:  # attention_bias
+        bias_init = initializer_map.get(node.input[5])
+        if bias_init is not None and int(np.prod(bias_init.dims)) > 0:
+            if _head_bias_axis(list(bias_init.dims), num_heads) is None:
+                return None  # doesn't statically resolve -- decline rather than guess
 
     return w_name, bias_name, num_heads, nq, nk, nv
 
@@ -7805,6 +7944,29 @@ def _match_gqa_producer(
     alone regardless: both are `[max_sequence_length, rotary_dim/2]`,
     broadcast identically across every head, so a head/group count change
     can never invalidate them.
+
+    Two more optional inputs *do* carry a genuine per-(query-)head axis,
+    confirmed via actual onnxruntime execution to have a real, non-ignored
+    numeric effect (see ``tests/test_pruning.py``'s own "attention_bias"/
+    "head_sink" subsections under the GroupQueryAttention section) -- both
+    previously unhandled by this matcher entirely, a real gap this function
+    now closes: `attention_bias` (index 10), documented shape `(batch_size
+    or 1, num_heads or 1, sequence_length, total_sequence_length)` -- note
+    "num_heads" here is the *query* head count (this op's own `num_heads`
+    attribute, not `kv_num_heads`): `attention_bias` is added to Q*K'
+    *after* GQA's own internal K/V-repeat-to-query-head-count broadcast, so
+    it is addressed per query head, the same as Q's own producer weight,
+    and gets the identical constant-resolves-cleanly-or-is-declined
+    treatment via :func:`_head_bias_axis` that :func:`_match_attention_producer`
+    gives its own `attention_bias` and :func:`_match_onnx_attention_producer`
+    its own `attn_mask` (all three share that one classifier). `head_sink`
+    (index 11), documented shape `(num_heads,)` -- again the query head
+    count -- is not a broadcastable mask at all but a genuine one-scalar-
+    per-query-head parameter (a per-head softmax-denominator smoothing
+    factor); a constant one is only ever accepted at exactly that shape
+    (declined otherwise, rather than guessed at), a dynamic one left alone
+    as always. :func:`_apply_one_gqa_chain` performs the actual slice(s) of
+    both once a match succeeds.
     """
     if node.domain != _ATTENTION_DOMAIN or node.op_type != "GroupQueryAttention":
         return None
@@ -7826,6 +7988,17 @@ def _match_gqa_producer(
         node, initializer_map, (3, 4), kv_num_heads, scale_indices=(12, 13)
     ):
         return None
+
+    if len(node.input) > 10 and node.input[10]:  # attention_bias
+        bias_init = initializer_map.get(node.input[10])
+        if bias_init is not None and int(np.prod(bias_init.dims)) > 0:
+            if _head_bias_axis(list(bias_init.dims), num_heads) is None:
+                return None  # doesn't statically resolve -- decline rather than guess
+
+    if len(node.input) > 11 and node.input[11]:  # head_sink
+        sink_init = initializer_map.get(node.input[11])
+        if sink_init is not None and list(sink_init.dims) != [num_heads]:
+            return None  # not the schema's own (num_heads,) shape
 
     return num_heads, kv_num_heads
 
@@ -7856,14 +8029,33 @@ def _match_onnx_attention_producer(
     attributes for, so a node relying on rank-4-inferred head counts isn't
     a shape this pass tracks and is declined rather than guessed at.
 
-    The optional `attn_mask` input (index 3) is declined outright if it is
-    connected to a non-empty constant (real per-head mask data broadcastable
-    to a `q_num_heads`-sized axis -- unlike `past_key`/`past_value` below,
-    slicing this correctly would require resolving its own broadcast shape
-    against the new `q_num_heads`, which this function makes no attempt at),
-    but left alone -- and does not block the match -- if dynamic (an
-    ordinary graph input or intermediate activation, the caller's own
-    runtime data). The optional `past_key`/`past_value` inputs (indices
+    The optional `attn_mask` input (index 3) is a boolean-or-float tensor
+    added against the `(batch, q_num_heads, q_seq, kv_seq)` attention-score
+    tensor via ordinary broadcasting (`onnx.reference.ops.op_attention`
+    adds it with a plain ``+``) -- the op's own doc names the full rank-4
+    shape or "a shape broadcastable to it" explicitly, and broadcasting a
+    lower-rank tensor right-aligns it, so a rank-3 mask's own axis 0 lands
+    on the *q_num_heads* slot too, not just a rank-4 mask's axis 1 (see
+    :func:`_head_bias_axis`'s own docstring for the full reasoning, verified
+    via actual onnxruntime execution). A connected constant is declined
+    outright when its shape doesn't cleanly resolve, via
+    :func:`_head_bias_axis`, to either "genuinely per-`q_num_heads`-head,
+    safe to slice" or "broadcast, no per-head values at all" -- unlike
+    `past_key`/`past_value` below, where the one schema-documented shape is
+    either matched outright or declined, this mask's shape space is wider
+    (any rank up to 4, broadcastable), so a shape landing outside both
+    recognized cases is declined rather than guessed at (narrower than an
+    earlier version of this matcher, which declined *any* non-empty
+    constant here regardless of shape -- overly conservative for, e.g., the
+    common ``(seq, seq)``/rank-2 case, which never has a `q_num_heads` axis
+    at all and needs no slicing; see
+    ``test_onnx_attention_pruning_nonempty_2d_attn_mask_constant_is_pruned``).
+    It is left alone -- and does not block the match either way -- if
+    dynamic (an ordinary graph input or intermediate activation, the
+    caller's own runtime data, the same reasoning `past_key`/`past_value`
+    below already gets). :func:`_apply_one_gqa_chain` performs the actual
+    slice, by `keep_q_heads`, of a constant resolving to the per-head case.
+    The optional `past_key`/`past_value` inputs (indices
     4/5 -- a different pair of indices from `GroupQueryAttention`'s own 3/4,
     and this op has no `seqlens_k`/`total_sequence_length` equivalent to
     require) get the same safety gate :func:`_match_gqa_producer` gives its
@@ -7903,7 +8095,8 @@ def _match_onnx_attention_producer(
     if len(node.input) > 3 and node.input[3]:  # attn_mask
         mask_init = initializer_map.get(node.input[3])
         if mask_init is not None and int(np.prod(mask_init.dims)) > 0:
-            return None  # non-empty constant mask -- would need slicing
+            if _head_bias_axis(list(mask_init.dims), q_num_heads) is None:
+                return None  # doesn't statically resolve -- decline rather than guess
 
     if not _past_kv_constants_are_sliceable(
         node, initializer_map, (4, 5), kv_num_heads
@@ -8348,10 +8541,17 @@ def _apply_one_plain_attention_chain(
     """Applies whole-head pruning to one matched ``Attention`` block in
     place: every dropped head removes a *contiguous* ``head_size``-wide
     column block from the single merged QKV weight (and the matching row
-    block from the consumer), not an arbitrary top-k column subset. Returns
-    ``(producer_weight_names, consumer_weight_name, stale_output_names)`` on
-    success, or ``None`` if `sparsity` rounds to no heads dropped for this
-    block (a no-op, left for the caller to skip).
+    block from the consumer), not an arbitrary top-k column subset. A
+    connected constant `attention_bias` (input index 5) already confirmed
+    at match time (see :func:`_match_attention_producer`) to resolve, via
+    :func:`_head_bias_axis`, to either a genuine per-head tensor or a
+    broadcast is sliced along its own head axis by `keep_heads` -- the same
+    (not `head_size`-expanded) index set this function's own `keep_heads`
+    already is, since `attention_bias`'s axis holds one entry per head, not
+    per weight column -- or left untouched when it's a broadcast (or
+    absent/dynamic). Returns ``(producer_weight_names, consumer_weight_name,
+    stale_output_names)`` on success, or ``None`` if `sparsity` rounds to no
+    heads dropped for this block (a no-op, left for the caller to skip).
     """
     h = chain.num_heads
     keep_count = max(1, h - round(h * sparsity))
@@ -8394,6 +8594,13 @@ def _apply_one_plain_attention_chain(
                 [keep_count * dq, keep_count * dk, keep_count * dv],
             )
         )
+
+    if len(chain.node.input) > 5 and chain.node.input[5]:  # attention_bias
+        bias_init = initializer_map.get(chain.node.input[5])
+        if bias_init is not None:
+            axis = _head_bias_axis(list(bias_init.dims), h)
+            if axis is not None and axis >= 0:
+                _slice_axis(bias_init, keep_heads, axis)
 
     _slice_consumer_weight(
         initializer_map[chain.consumer_weight],
@@ -8446,9 +8653,22 @@ def _apply_one_gqa_chain(
     when it is itself a constant of the schema's `"PER_CHANNEL"` shape
     (`[1, kv_num_heads, 1, head_size]`), left alone when `"PER_TENSOR"` (a
     single broadcast scalar, already confirmed to need no slicing) or
-    dynamic. Returns ``(producer_weight_names, consumer_weight_name,
-    stale_output_names)`` on success, or ``None`` if `sparsity` rounds to no
-    groups dropped for this block (a no-op, left for the caller to skip).
+    dynamic.
+
+    A connected constant `attention_bias`/`attn_mask` (`GroupQueryAttention`'s
+    own `attention_bias` at index 10, or the plain ai.onnx op's own
+    `attn_mask` at index 3 -- see :func:`_match_gqa_producer`'s and
+    :func:`_match_onnx_attention_producer`'s own docstrings), already
+    confirmed at match time via :func:`_head_bias_axis` to resolve to
+    either a genuine per-query-head tensor or a broadcast, is sliced along
+    its own head axis by `keep_q_heads` -- *query*-head granularity (this
+    input is added against Q*K' scores, laid out per query head, not per KV
+    group) -- when it's the former, left untouched when it's the latter (or
+    absent/dynamic). `GroupQueryAttention`'s own `head_sink` (index 11, no
+    analogue on the plain ai.onnx op), a genuine `(num_heads,)` one-scalar-
+    per-query-head constant (already confirmed at match time to be exactly
+    that shape, or dynamic), is sliced the same way, directly by
+    `keep_q_heads` with no `head_size` expansion.
 
     When `chain.packed_split_sizes` is set (a packed-QKV-then-Split chain,
     see :func:`_match_packed_qkv_split`), Q's/K's/V's "own separate weight"
@@ -8457,6 +8677,10 @@ def _apply_one_gqa_chain(
     per-producer slices, and the upstream `Split` node's own split-sizes
     constant is rewritten to the three new (post-pruning) column widths in
     the same Q-then-K-then-V order -- see the branch below.
+
+    Returns ``(producer_weight_names, consumer_weight_name,
+    stale_output_names)`` on success, or ``None`` if `sparsity` rounds to no
+    groups dropped for this block (a no-op, left for the caller to skip).
     """
     h = chain.kv_num_heads
     keep_count = max(1, h - round(h * sparsity))
@@ -8595,6 +8819,31 @@ def _apply_one_gqa_chain(
             if len(scale_init.dims) == 4 and scale_init.dims[1] == h:
                 _slice_axis1(scale_init, keep_groups)
             # else: PER_TENSOR broadcast scalar -- no per-head axis to slice
+
+    # `attention_bias`/`attn_mask` (index 10 for `GroupQueryAttention`, 3
+    # for the plain ai.onnx op -- see `_match_gqa_producer`'s and
+    # `_match_onnx_attention_producer`'s own docstrings) is sliced along its
+    # own head axis by `keep_q_heads` -- *query*-head granularity, not
+    # `keep_groups`'s kv-group one -- whenever `_head_bias_axis` resolves it
+    # to a genuine per-head tensor against the pre-pruning `chain.num_heads`;
+    # left untouched when it resolves to a broadcast (or is absent/dynamic,
+    # matched the same "nothing to slice" way here as at match time).
+    mask_idx = 10 if is_gqa else 3
+    if len(chain.node.input) > mask_idx and chain.node.input[mask_idx]:
+        mask_init = initializer_map.get(chain.node.input[mask_idx])
+        if mask_init is not None:
+            axis = _head_bias_axis(list(mask_init.dims), chain.num_heads)
+            if axis is not None and axis >= 0:
+                _slice_axis(mask_init, keep_q_heads, axis)
+
+    # `head_sink` (index 11, `GroupQueryAttention`-only): a genuine
+    # `(num_heads,)` one-scalar-per-query-head constant, already confirmed
+    # at match time to be exactly that shape (or dynamic) -- sliced
+    # directly by `keep_q_heads`, no `head_size` expansion needed.
+    if is_gqa and len(chain.node.input) > 11 and chain.node.input[11]:
+        sink_init = initializer_map.get(chain.node.input[11])
+        if sink_init is not None:
+            _slice_last_axis(sink_init, keep_q_heads)
 
     new_kv_num_heads = keep_count
     new_num_heads = keep_count * group_size
@@ -8751,14 +9000,24 @@ def apply_attention_head_pruning(
             :func:`_gqa_group_importance`'s own comments for exactly how
             each combines across a KV group's several Q/K/V producers
     :returns: ``model`` with every matched block's tensors resized in
-            place; anything not matching that exact topology (a
-            non-constant weight, a packed-QKV GroupQueryAttention node, a
-            GroupQueryAttention/plain ai.onnx Attention node with a
-            non-empty constant past-KV-cache of unexpected shape/dtype (e.g.
-            a quantized KV cache) or a non-empty constant attention-mask
-            input, an ai.onnx Attention node without explicit
-            ``q_num_heads``/``kv_num_heads`` attributes or with Q's/K's own
-            head sizes mismatched, a consumer whose reduction dimension
+            place -- including, when present and a constant of the
+            schema-documented broadcastable shape, `com.microsoft::Attention`'s/
+            `GroupQueryAttention`'s own `attention_bias` input, `GroupQueryAttention`'s
+            own `head_sink`, and the plain ai.onnx op's own `attn_mask`, each
+            sliced along its own genuine per-head axis in lockstep with
+            every other pruned tensor whenever that axis is present and
+            resolves, statically, to the pre-pruning head count (see
+            :func:`_head_bias_axis`); anything not matching that exact
+            topology (a non-constant weight, a packed-QKV
+            GroupQueryAttention node, a GroupQueryAttention/plain ai.onnx
+            Attention node with a non-empty constant past-KV-cache of
+            unexpected shape/dtype (e.g. a quantized KV cache) or a
+            non-empty constant attention-bias/mask/head_sink input whose
+            shape doesn't cleanly resolve to either "genuinely per-head" or
+            "broadcast, head-count-independent", an ai.onnx Attention node
+            without explicit ``q_num_heads``/``kv_num_heads`` attributes or
+            with Q's/K's own head sizes mismatched, a consumer whose
+            reduction dimension
             doesn't line up, ...) is left completely untouched
     """
     if not (0.0 <= sparsity < 1.0):
@@ -8806,8 +9065,11 @@ def apply_attention_head_wanda_pruning(
     exactly as :func:`apply_structured_wanda_pruning` is to
     :func:`apply_structured_pruning`: same real head (or, for
     GroupQueryAttention/plain ai.onnx Attention, whole-KV-group) removal,
-    same topology matching (see :func:`apply_attention_head_pruning`'s own
-    docstring for the three matched op types), but each unit's importance
+    same topology matching, including the identical `attention_bias`/
+    `attn_mask`/`head_sink` per-head-axis slicing treatment (see
+    :func:`apply_attention_head_pruning`'s own docstring for the three
+    matched op types and exactly what each does with those inputs), but
+    each unit's importance
     is ``||W||_F * ||X||_2`` -- the plain Frobenius-norm weight score times
     the combined (root-sum-square) activation norm of that unit's own slice
     of the *output projection's* input, captured over calibration data --
