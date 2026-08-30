@@ -552,6 +552,26 @@ if (ONNXSIM_TESTS)
   onnxsim_add_ort_rpath(contrib_schemas_moe_test)
   add_test(NAME contrib_schemas_moe_test COMMAND contrib_schemas_moe_test)
 
+  # Dev convenience only, never part of any default build target or CI job:
+  # re-runs scripts/codegen/generate_moe_function_templates.py to refresh
+  # onnxsim/contrib_schemas_moe_templates.gen.h in place. That header is
+  # checked into the repository specifically so ordinary builds -- including
+  # every cross-compile matrix (Windows/macOS/ARM, WASM/Pyodide, s390x) --
+  # never need onnxscript, which this script (unlike anything else the C++
+  # build touches) depends on; see that script's own module docstring. Run
+  # explicitly with `cmake --build . --target regenerate_moe_templates` when
+  # iterating on the MoE decomposition itself.
+  find_package(Python3 COMPONENTS Interpreter QUIET)
+  if(Python3_Interpreter_FOUND)
+    add_custom_target(regenerate_moe_templates
+      COMMAND ${Python3_EXECUTABLE}
+              ${CMAKE_CURRENT_SOURCE_DIR}/scripts/codegen/generate_moe_function_templates.py
+              ${CMAKE_CURRENT_SOURCE_DIR}/onnxsim/contrib_schemas_moe_templates.gen.h
+      WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+      COMMENT "Regenerating contrib_schemas_moe_templates.gen.h from onnxscript"
+      VERBATIM)
+  endif()
+
   # The ONNX<->GGML dtype mapping (gguf_dtype.h), mirroring
   # tensor_pool_dtype_test.cpp above for the same reason.
   add_executable(gguf_dtype_test onnxsim/gguf_dtype_test.cpp)
