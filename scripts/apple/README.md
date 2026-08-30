@@ -147,3 +147,28 @@ python export_llm_to_coreml.py HuggingFaceTB/SmolLM2-135M-Instruct \
 python run_llm_decode_benchmark.py smollm2.mlpackage \
     --prompt "The capital of France is" --max-new-tokens 20
 ```
+
+### Benchmarking a real model suite (`prepare_benchmark_models.py`)
+
+A batch wrapper around `export_llm_to_coreml.py`: exports every model in its
+`BENCHMARK_MODELS` list (or a `--only` subset) into its own
+`<output-dir>/<slug>/model.mlpackage`, so the result is a ready-made set of
+models to run `run_llm_decode_benchmark.py` against on macOS -- the actual
+"reproduce a DeviceMark-style benchmark" step. The default list spans a few
+architecture families in DeviceMark's own ~1-4B weight class (Llama-style,
+Qwen2, Phi-3), not just one, since `onnxsim/coreml_export.py`'s translator is
+a hand-written ONNX-to-MIL mapping where different architectures can exercise
+different op combinations -- see the script's module docstring for which
+entries have actually been run through this pipeline versus which are
+expected to work but not yet exercised (larger models need more RAM/disk than
+a constrained dev sandbox has). Two well-known families in that weight class,
+`meta-llama/Llama-3.2-*-Instruct` and `google/gemma-2-*-it`, are left out of
+the default list because both are gated on Hugging Face (need an accepted
+license + `HF_TOKEN`); pass either as `--only` once you have access.
+
+```bash
+python prepare_benchmark_models.py --output-dir benchmark_models
+# then, per model, on macOS:
+python run_llm_decode_benchmark.py benchmark_models/Qwen_Qwen2_5_1_5B_Instruct/model.mlpackage \
+    --prompt "The capital of France is" --max-new-tokens 20
+```
