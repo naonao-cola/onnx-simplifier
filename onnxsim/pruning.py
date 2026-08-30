@@ -18,7 +18,23 @@ NNI's L1/L2 filter pruning, network slimming, or the expert-intermediate-
 channel/Mamba-state pruning inside NVIDIA's "Iterative Puzzle" compression
 pipeline for hybrid MoE LLMs, https://arxiv.org/abs/2607.04371) is a
 fundamentally bigger project than the rest of this module for two separate
-reasons, and this module only takes on one of them. It *does* change tensor
+reasons, and this module only takes on one of them in general -- with one
+narrow, precisely-scoped exception carved out of that paper's own two named
+techniques: :func:`apply_moe_expert_channel_pruning` (see its own "MoE
+expert-intermediate-channel pruning" section comment far below) reaches the
+"expert-intermediate-channel" half, for the one real, bounded ONNX shape
+that turns out to make it tractable (``com.microsoft::MoE``'s own
+``[num_experts, ...]``-leading-dimension weight tensors, needing no
+cross-node dependency-graph walk at all); the paper's other named
+technique, Mamba-state pruning, remains fully out of scope -- checked
+empirically against this environment's own onnxruntime contrib-op schema
+registry, there is no fused Mamba/SSM op with fixed weight tensors this
+module could target the way it targets `MoE`'s own, and an arbitrarily
+decomposed selective-scan subgraph has no single bounded node pattern to
+recognize, the same bar every other declined topology below is held to.
+Every *other* case below -- ordinary MatMul/Conv channel pruning and
+everything this paragraph goes on to describe -- is the one general problem
+this module does take on. It *does* change tensor
 shapes, which ripples through every downstream consumer of the pruned
 dimension -- real graph surgery, not the self-contained per-layer weight
 rewrite every other ``apply_*``/``quantize_*`` pass in onnxsim is. That part
@@ -7668,4 +7684,362 @@ def apply_attention_head_wanda_pruning(
         _wanda_attention_head_importance,
         _wanda_gqa_group_importance,
     )
+    return out
+
+
+# --- MoE expert-intermediate-channel pruning --------------------------------
+#
+# See this module's own docstring for why this is the one narrow slice of
+# NVIDIA's "Iterative Puzzle" hybrid-MoE-LLM pipeline (arXiv:2607.04371) that
+# turns out to be tractable here, and why Mamba-state pruning (the paper's
+# other named technique) is not: empirically, against this environment's own
+# onnxruntime 1.29.0 contrib-op schema registry
+# (``onnxruntime.capi.onnxruntime_pybind11_state.get_all_operator_schema()``),
+# ``MoE``/``QMoE`` are the only two ``*MoE*``-named schemas, and nothing
+# matches ``*amba*``/``*SSM*`` at all (only the unrelated, standard-ONNX
+# ``Scan`` op) -- there is no fused Mamba/SSM op whose weight tensors this
+# pass could target the way it targets `MoE`'s own, and an arbitrarily
+# decomposed selective-scan subgraph has no single bounded node pattern to
+# recognize in the first place, the same bar this module's own docstring
+# already holds every other declined topology to.
+#
+# `com.microsoft::MoE`'s own schema (confirmed both by reading onnxsim's own
+# `contrib_schemas.cpp`, which registers this exact schema from ONNX
+# Runtime's `docs/ContribOperators.md`/`contrib_defs.cc`, and by querying
+# onnxruntime's live schema registry directly in this environment) gives
+# `fc1_experts_weights`/`fc2_experts_weights` (and the optional
+# `fc3_experts_weights`) a clean ``[num_experts, ...]`` leading dimension,
+# with `inter_size` -- the expert FFN's own intermediate width, exactly what
+# the paper's "expert-intermediate-channel" pruning targets -- living on
+# `fc1`'s axis 1 (``[num_experts, inter_size, hidden_size]``) and `fc2`'s
+# axis 2 (``[num_experts, hidden_size, inter_size]``). Unlike *removing
+# whole experts* (which would also need `num_experts`/`k`-consistency
+# bookkeeping and a safe way to resize `router_probs`' own upstream
+# producer -- a second, independent MatMul/Gemm this pass would need to walk
+# to and prove has no other consumer, real but strictly more machinery), or
+# a *plain per-2-D-slice* channel cut (which `_candidates`'s existing
+# MatMul/Gemm matching already doesn't reach, since these weights are 3-D
+# and rank-3-input-shaped, not the op's own reduction dimension), pruning
+# `inter_size` uniformly across every expert at once needs nothing outside
+# the node's own five tensors: no upstream producer, no downstream consumer,
+# no attribute to update (`k`/`num_experts`/`activation_type` are all
+# unaffected -- the node's own *output* shape doesn't change either, since
+# it always equals `input`'s), and no cross-node dependency-graph walk at
+# all. That is what makes this the "narrowest safe slice" of the paper's
+# own technique this module can precisely justify, rather than a fragile
+# stand-in for it: every one of `fc1`/`fc2`(`/fc3`)'s three axes plays
+# exactly one of {expert, in, out} unambiguously, per the schema's own
+# documented shapes, and dropping the same `inter_size` index from all of
+# them together is provably shape-consistent (`fc1`'s and `fc3`'s own output
+# rows, `fc2`'s own input columns) -- the same "remove a row from one
+# producer's weight and the matching column from its one consumer's weight"
+# argument :func:`apply_structured_pruning` already makes for an ordinary
+# 2-D MatMul/Gemm chain, just carried out on three tensors sharing one
+# extra, untouched leading `num_experts` axis instead of two 2-D tensors,
+# with no elementwise hop in between to walk through (the node's own fused
+# semantics already are that hop).
+#
+# `fc3_experts_weights` (the Mixtral-style separate gate/up/down projection
+# `com.microsoft::MoE`'s own docstring, and `contrib_schemas.cpp`'s
+# `BuildMoEFunctionBody`, both already document -- see this module's own
+# docstring for the exact composition) shares `fc1`'s own row-output-channel
+# role along `inter_size`, and would in principle prune identically -- but
+# this pass declines any node with `fc3_experts_weights` present rather than
+# support it: empirically (`onnxruntime.InferenceSession` construction
+# against this environment's own CPU execution provider, opset 18, MoE
+# opset 1), ONNX Runtime's *CPU* MoE kernel raises "FC3 is not implemented
+# for CPU MoE" unconditionally, for every `activation_type` -- exactly the
+# same "disclosed validation gap" `contrib_schemas.cpp`'s own comment names
+# for its `fc3` decomposition. Every other case this pass *does* support was
+# checked, in this same environment, to actually execute end to end on the
+# CPU provider first (`relu`/`identity`/`silu`/`gelu`, no `fc3`) -- so
+# rather than build a code path this environment has no real runtime to
+# validate against, `fc3_experts_weights` stays out of scope, the same
+# conservative call every other declined case in this module makes. The
+# `swiglu` activation is declined for the same reason from the opposite
+# direction: it doubles `fc1_experts_weights`' own row count (`fusion_size`
+# 2, "fused and interleaved" -- and CPU MoE construction fails outright
+# without `swiglu_fusion=1`, confirmed the same empirical way), so its own
+# ``inter_size``-indexed rows are no longer one contiguous, ``inter_size``
+# long per-expert block this pass's own channel-index slicing could safely
+# reach without unpacking the interleaving first; :func:`_match_moe_producer`
+# doesn't even need to special-case this activation explicitly -- the
+# ``fc1_experts_weights.dims[1] == fc2_experts_weights.dims[2]`` shape check
+# it already runs for every candidate fails to hold the moment `fusion_size`
+# is 2, so the doubled-width shape declines itself, the same
+# shape-consistency-not-attribute-value style :func:`_conv_spatial_attrs`'s
+# own ``kernel_shape`` cross-check already uses elsewhere in this module.
+#
+# `router_probs` (the node's own second input) is never touched by this
+# pass at all -- `num_experts` doesn't change, so neither its own shape nor
+# its upstream producer's weight needs to.
+
+
+@dataclass(frozen=True)
+class _MoEChain:
+    node: onnx.NodeProto
+    fc1_w: str
+    fc1_b: Optional[str]
+    fc2_w: str
+    fc2_b: Optional[str]
+    num_experts: int
+    inter_size: int
+    hidden_size: int
+
+
+_MOE_DOMAIN = "com.microsoft"
+_MOE_ACTIVATIONS = {"relu", "identity", "silu", "gelu"}
+
+
+def _match_moe_producer(
+    node: onnx.NodeProto,
+    initializer_map: Dict[str, onnx.TensorProto],
+    consumers_of: Dict[str, List[onnx.NodeProto]],
+) -> Optional[_MoEChain]:
+    """If `node` is a ``com.microsoft::MoE`` node this pass can safely prune
+    the `inter_size` axis of, returns the matched :class:`_MoEChain`. See
+    this section's own comment above for the exact safety argument and why
+    each decline below is drawn where it is; every check here mirrors one
+    piece of that argument, in the same order:
+
+    - `activation_type` (default ``"relu"`` per the op's own schema) must be
+      one of `relu`/`identity`/`silu`/`gelu` -- `swiglu` is declined (see
+      above; caught structurally by the shape check below, not this
+      attribute check, but ruled out here too for a node whose declared
+      activation is unrecognized entirely, e.g. a future value this pass has
+      never seen).
+    - `fc3_experts_weights` (input 6) must be absent -- no CPU execution
+      provider in this environment implements it (see above); a present-but-
+      empty-string placeholder is treated the same as absent.
+    - `fc1_experts_weights`/`fc2_experts_weights` must both be constant
+      float32 initializers, rank 3, with `fc1`'s ``(num_experts, inter_size,
+      hidden_size)`` and `fc2`'s ``(num_experts, hidden_size, inter_size)``
+      agreeing on both `num_experts` and `inter_size` -- the one shape check
+      that also rules out a fused/interleaved `swiglu` `fc1` (whose own row
+      count is ``2 * inter_size``, never equal to `fc2`'s own column count).
+    - each is required to have exactly one consumer (this node) -- a
+      tied/shared weight reused elsewhere would be corrupted by an in-place
+      resize, the same tied-weight guard every other chain-matcher in this
+      module already applies via `consumers_of`.
+    - `fc1_experts_bias`/`fc2_experts_bias` (inputs 3/5), if present, get the
+      same float32/initializer/single-consumer checks, plus an exact
+      ``(num_experts, inter_size)``/``(num_experts, hidden_size)`` shape
+      match -- `fc2`'s own bias indexes `hidden_size` (its *output* axis),
+      not `inter_size`, so it is matched here (to confirm it really is a
+      well-formed MoE node) but is never itself sliced by this pass.
+    """
+    if node.domain != _MOE_DOMAIN or node.op_type != "MoE":
+        return None
+
+    activation = "relu"
+    swiglu_fusion = 0
+    for attr in node.attribute:
+        if attr.name == "activation_type":
+            activation = attr.s.decode("utf-8") if isinstance(attr.s, bytes) else attr.s
+        elif attr.name == "swiglu_fusion":
+            swiglu_fusion = attr.i
+    if activation not in _MOE_ACTIVATIONS or swiglu_fusion != 0:
+        return None
+
+    if len(node.input) > 6 and node.input[6]:
+        return None  # fc3_experts_weights present -- no CPU oracle, see above
+
+    if len(node.input) < 5 or not node.input[2] or not node.input[4]:
+        return None
+    fc1_w_name, fc2_w_name = node.input[2], node.input[4]
+    fc1_w = initializer_map.get(fc1_w_name)
+    fc2_w = initializer_map.get(fc2_w_name)
+    if (
+        fc1_w is None
+        or fc2_w is None
+        or fc1_w.data_type != onnx.TensorProto.FLOAT
+        or fc2_w.data_type != onnx.TensorProto.FLOAT
+        or len(fc1_w.dims) != 3
+        or len(fc2_w.dims) != 3
+        or len(consumers_of.get(fc1_w_name, [])) != 1
+        or len(consumers_of.get(fc2_w_name, [])) != 1
+    ):
+        return None
+    num_experts, inter_size, hidden_size = list(fc1_w.dims)
+    if list(fc2_w.dims) != [num_experts, hidden_size, inter_size]:
+        return None  # also rules out a fused-swiglu fc1 (doubled row count)
+
+    def _optional_bias(
+        index: int, expected_dims: List[int]
+    ) -> Tuple[bool, Optional[str]]:
+        if index >= len(node.input) or not node.input[index]:
+            return True, None
+        name = node.input[index]
+        init = initializer_map.get(name)
+        if (
+            init is None
+            or init.data_type != onnx.TensorProto.FLOAT
+            or list(init.dims) != expected_dims
+            or len(consumers_of.get(name, [])) != 1
+        ):
+            return False, None
+        return True, name
+
+    ok, fc1_b_name = _optional_bias(3, [num_experts, inter_size])
+    if not ok:
+        return None
+    ok, fc2_b_name = _optional_bias(5, [num_experts, hidden_size])
+    if not ok:
+        return None
+
+    return _MoEChain(
+        node=node,
+        fc1_w=fc1_w_name,
+        fc1_b=fc1_b_name,
+        fc2_w=fc2_w_name,
+        fc2_b=fc2_b_name,
+        num_experts=int(num_experts),
+        inter_size=int(inter_size),
+        hidden_size=int(hidden_size),
+    )
+
+
+def _find_moe_chains(graph: onnx.GraphProto) -> List[_MoEChain]:
+    initializer_map = {t.name: t for t in graph.initializer}
+    consumers_of = _consumers_of(graph)
+    chains = []
+    for node in graph.node:
+        chain = _match_moe_producer(node, initializer_map, consumers_of)
+        if chain is not None:
+            chains.append(chain)
+    return chains
+
+
+def _moe_importance(
+    chain: _MoEChain, initializer_map: Dict[str, onnx.TensorProto]
+) -> np.ndarray:
+    """Combined (root-sum-square) L2-norm importance per `inter_size`
+    channel index, accumulating squared norms -- in float64, the same
+    accumulate-then-sqrt-once precision convention
+    :func:`_plain_structured_importance` already uses -- over every expert
+    and the full `hidden_size` axis at once: index `j` is one shared row of
+    `fc1` (and, if present, `fc1_experts_bias`) and one shared column of
+    `fc2`, across *every* expert simultaneously (the node's own
+    ``[num_experts, inter_size, ...]``/``[num_experts, ..., inter_size]``
+    layout gives every expert the identical `inter_size` axis, with no
+    independent per-expert choice possible -- exactly why `keep` is computed
+    once here and applied to every expert's own slice alike, mirroring how
+    :func:`apply_structured_pruning`'s own gated-pair combination ranks both
+    branches by one shared score before picking one shared `keep`).
+    """
+    fc1_w = onnx.numpy_helper.to_array(initializer_map[chain.fc1_w]).astype(np.float64)
+    fc2_w = onnx.numpy_helper.to_array(initializer_map[chain.fc2_w]).astype(np.float64)
+    squared = np.sum(np.square(fc1_w), axis=(0, 2)) + np.sum(
+        np.square(fc2_w), axis=(0, 1)
+    )
+    if chain.fc1_b is not None:
+        fc1_b = onnx.numpy_helper.to_array(initializer_map[chain.fc1_b]).astype(
+            np.float64
+        )
+        squared = squared + np.sum(np.square(fc1_b), axis=0)
+    return np.sqrt(squared)
+
+
+def _apply_moe_chains(
+    graph: onnx.GraphProto,
+    chains: List[_MoEChain],
+    sparsity: float,
+    compute_importance,
+) -> None:
+    initializer_map = {t.name: t for t in graph.initializer}
+    touched: Set[str] = set()
+
+    for chain in chains:
+        weight_names = {chain.fc1_w, chain.fc2_w}
+        if chain.fc1_b is not None:
+            weight_names.add(chain.fc1_b)
+        if weight_names & touched:
+            continue  # a shared/tied initializer another MoE node already resized
+        touched |= weight_names
+
+        n = chain.inter_size
+        keep_count = max(1, n - round(n * sparsity))
+        if keep_count >= n:
+            continue  # rounds down to nothing for this layer -- no-op
+
+        importance = compute_importance(chain, initializer_map)
+        keep = np.sort(np.argsort(-importance)[:keep_count])
+
+        fc1_init = initializer_map[chain.fc1_w]
+        fc1_w_new = onnx.numpy_helper.to_array(fc1_init)[:, keep, :]
+        fc1_init.CopyFrom(
+            onnx.numpy_helper.from_array(
+                np.ascontiguousarray(fc1_w_new), name=chain.fc1_w
+            )
+        )
+
+        fc2_init = initializer_map[chain.fc2_w]
+        fc2_w_new = onnx.numpy_helper.to_array(fc2_init)[:, :, keep]
+        fc2_init.CopyFrom(
+            onnx.numpy_helper.from_array(
+                np.ascontiguousarray(fc2_w_new), name=chain.fc2_w
+            )
+        )
+
+        if chain.fc1_b is not None:
+            fc1_b_init = initializer_map[chain.fc1_b]
+            fc1_b_new = onnx.numpy_helper.to_array(fc1_b_init)[:, keep]
+            fc1_b_init.CopyFrom(
+                onnx.numpy_helper.from_array(
+                    np.ascontiguousarray(fc1_b_new), name=chain.fc1_b
+                )
+            )
+        # fc2_experts_bias indexes hidden_size, fc2's own *output* axis --
+        # unaffected by an inter_size cut, so it is never sliced here.
+
+
+def apply_moe_expert_channel_pruning(
+    model: Union[str, onnx.ModelProto],
+    sparsity: float = 0.5,
+) -> onnx.ModelProto:
+    """Removes intermediate (`inter_size`) channels from every expert of a
+    matched ``com.microsoft::MoE`` node at once -- real structural pruning
+    (smaller `fc1`/`fc2` weight tensors, smaller per-expert matmuls on any
+    runtime) of the one slice of NVIDIA's "Iterative Puzzle" hybrid-MoE-LLM
+    pipeline's (arXiv:2607.04371) "expert-intermediate-channel" pruning this
+    module can precisely prove safe from the graph alone -- see this
+    section's own comment above for the full safety argument, exactly which
+    nodes are matched (:func:`_match_moe_producer`), and why `fc3`/`swiglu`
+    and whole-expert removal are out of scope.
+
+    Ranks every `inter_size` index by combined (root-sum-square) L2 norm of
+    `fc1_experts_weights`' own row (across every expert and `hidden_size`
+    at once) and `fc2_experts_weights`' own column (same reduction), plus
+    `fc1_experts_bias`'s own entry when present -- the same L2-norm
+    importance :func:`apply_structured_pruning` already uses, transplanted
+    from a single 2-D producer/consumer pair to `MoE`'s own batched 3-D
+    ``[num_experts, ...]`` weights -- drops the lowest-``sparsity``-fraction
+    of indices (at least one is always kept), and removes the matching row
+    from `fc1_experts_weights`/`fc1_experts_bias` and column from
+    `fc2_experts_weights`, identically across every expert. `num_experts`,
+    `k`, and every node attribute are untouched -- pruning `inter_size`
+    changes no other tensor's shape anywhere in the graph, including the
+    node's own output (always equal to `input`'s shape).
+
+    :param model: the original onnx ModelProto or file path
+    :param sparsity: target fraction of each matched node's `inter_size`
+            channels to remove (at least one channel is always kept)
+    :returns: ``model`` with every matched ``MoE`` node's `fc1`/`fc2`
+            tensors resized in place; a node with `fc3_experts_weights`, a
+            `swiglu`/unrecognized `activation_type`, a non-constant or
+            tied/shared weight, or any other shape this pass doesn't
+            recognize is left completely untouched
+    """
+    if not (0.0 <= sparsity < 1.0):
+        raise ValueError(f"sparsity must be in [0, 1), got {sparsity}")
+    if isinstance(model, str):
+        model = onnx.load(model, load_external_data=False)
+
+    out = onnx.ModelProto()
+    out.CopyFrom(model)
+    graph = out.graph
+
+    chains = _find_moe_chains(graph)
+    if chains:
+        _apply_moe_chains(graph, chains, sparsity, _moe_importance)
     return out
