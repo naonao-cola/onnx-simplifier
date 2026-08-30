@@ -539,12 +539,16 @@ onnx::ModelProto ApplyQuarot(const onnx::ModelProto& model, uint64_t seed);
 // ``b`` to agree on one shared channel-index set, resolved via a backward
 // walk plus union-find grouping across such merge points that also covers a
 // whole chain of such merges transitively sharing one spine channel count
-// (a lone residual connection, or a linear stack of ``Add``-only merges;
-// an *interior* block of a real deep ResNet/transformer stage, whose own
-// "post-block" tensor is read both by the next block and directly by that
-// block's own ``Add``, is left completely untouched, the same "no
-// branch-following" boundary every other chain kind here already holds). For
-// MatMul/Gemm specifically, a fused
+// (a lone residual connection, or a linear stack of ``Add``-only merges).
+// Once a group's shared channel-index set is established, it can also fan
+// out *forward* to more than one independent ordinary consumer -- so a real
+// multi-block ResNet/transformer stage's shared "post-block" tensor, read by
+// both the next block's own first Conv/MatMul *and*, unchanged, that
+// block's own ``Add``, is now reached rather than declined; a general
+// grouped Conv may take part in this merge too, as a producer, the primary
+// consumer, and/or an extra fan-out branch, as long as every one of those
+// that is grouped shares the exact same ``group`` count. For MatMul/Gemm
+// specifically, a fused
 // ``com.microsoft::SkipLayerNormalization``/``SkipSimplifiedLayerNormalization``
 // node -- what onnxruntime's transformer optimizer collapses a bare
 // residual ``Add`` plus the following LayerNorm into, and so what a
@@ -552,8 +556,25 @@ onnx::ModelProto ApplyQuarot(const onnx::ModelProto& model, uint64_t seed);
 // like -- is recognized as an eligible merge point too, its own
 // ``gamma``/``beta``/``bias`` constants riding along as a per-channel
 // affine hop on the resolved chain; a Conv residual chain only ever sees a
-// bare ``Add`` (there is no Conv analogue of that fused op). See
-// ``structured_pruning_entry.cpp`` for the exact algorithm.
+// bare ``Add`` (there is no Conv analogue of that fused op). A fused
+// ``com.microsoft::BiasGelu``/``FastGelu`` node (a bias-add fused into the
+// following Gelu-family activation) is recognized as a per-channel hop too,
+// MatMul/Gemm chains only, and ``com.microsoft::QuickGelu`` is a plain
+// unary pass-through hop everywhere a unary activation is already allowed.
+//
+// A ``Concat``-merged skip connection (the U-Net-style encoder/decoder
+// merge) is matched too, for both MatMul/Gemm (last-axis ``Concat`` only)
+// and Conv (channel-axis ``Concat``): unlike ``Add``, a ``Concat``'s
+// branches are structurally independent -- each owns a fixed, disjoint
+// offset range of the merged channel range -- so each branch is ranked and
+// pruned entirely on its own, by the same L2-norm/combined-importance
+// criterion as any other chain here; only the shared downstream consumer's
+// weight needs new slicing, at each branch's own fixed offset. A branch may
+// itself resolve through a gated (SwiGLU/GeGLU) combine or a whole
+// Add/SkipLayerNormalization residual group; a branch that fans out
+// elsewhere, or would need to cross another ``Concat`` or a fused
+// self-attention op boundary, declines the *entire* group, never partially
+// pruned. See ``structured_pruning_entry.cpp`` for the exact algorithm.
 //
 // Unlike ``Simplify``, this does not run shape inference, constant folding or
 // any other simplification pass -- it applies exactly this rewrite, to every
