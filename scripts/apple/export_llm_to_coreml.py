@@ -38,6 +38,14 @@ Pipeline: `optimum.exporters.onnx` (decoder-with-past, dynamic axes) -> pin
 `batch_size` to 1 -> `onnxsim.simplify` -> `onnxsim.export_coreml` with
 `dynamic_shapes` for `sequence_length` / `past_sequence_length` / their sum.
 
+`--dtype` (default `fp32`) controls the precision the ONNX graph itself is
+traced and computed in -- separate from Core ML's own output precision,
+which defaults to float16 regardless (coremltools' `compute_precision`).
+For a multi-billion-parameter model, tracing in float32 means PyTorch and
+the in-progress ONNX graph can hold more than one full-size copy of the
+model's weights at once (well over the model's own on-disk size); `--dtype
+fp16` roughly halves that peak.
+
 Usage:
     python export_llm_to_coreml.py HuggingFaceTB/SmolLM2-135M-Instruct \\
         --max-context-length 512 --output smollm2.mlpackage
@@ -77,13 +85,14 @@ def export_llm_to_coreml(
     max_context_length: int = 512,
     opset: int = 17,
     convert_to: str = "mlprogram",
+    dtype: str = "fp32",
 ) -> None:
     from optimum.exporters.onnx import main_export
 
     with tempfile.TemporaryDirectory(prefix="onnxsim_llm_export_") as tmpdir:
         print(
             f"Exporting {model_id!r} to ONNX (decoder-with-past, dynamic shapes, "
-            f"opset {opset})...",
+            f"opset {opset}, dtype {dtype})...",
             flush=True,
         )
         main_export(
@@ -103,6 +112,7 @@ def export_llm_to_coreml(
             # call below and the Core ML conversion that follows are the
             # correctness checks this pipeline actually relies on.
             do_validation=False,
+            dtype=dtype,
         )
 
         onnx_path = Path(tmpdir) / "model.onnx"
@@ -186,6 +196,14 @@ def main() -> int:
         default="mlprogram",
         dest="convert_to",
     )
+    ap.add_argument(
+        "--dtype",
+        choices=["fp32", "fp16", "bf16"],
+        default="fp32",
+        help="Precision to trace and export the ONNX graph in (default: fp32). Use "
+        "fp16 for multi-billion-parameter models where tracing in float32 risks "
+        "running out of memory (see the module docstring).",
+    )
     args = ap.parse_args()
 
     export_llm_to_coreml(
@@ -194,6 +212,7 @@ def main() -> int:
         max_context_length=args.max_context_length,
         opset=args.opset,
         convert_to=args.convert_to,
+        dtype=args.dtype,
     )
     return 0
 
