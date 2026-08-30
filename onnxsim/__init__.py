@@ -31,6 +31,7 @@ from onnxsim.calibration import (
     quantize_static,
     quantize_static_int16,
 )
+from onnxsim.coreml_export import export_coreml
 from onnxsim.double_quantization import apply_double_quantization
 from onnxsim.duquant import apply_duquant
 from onnxsim.embedding_quantization import (
@@ -215,5 +216,6 @@ __all__ = [
     "UnsupportedArchitectureError",
     "export_transformers_model",
     "export_mlir",
+    "export_coreml",
     "__version__",
 ]
