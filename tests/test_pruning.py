@@ -11209,3 +11209,475 @@ def test_moe_expert_channel_pruning_multiple_nodes_pruned_independently():
     inits = _moe_inits(pruned)
     assert inits["FC1W1"].shape == (E1, 3, hidden1)
     assert inits["FC1W2"].shape == (E2, 4, hidden2)
+
+
+# --- MoE whole-expert pruning -------------------------------------------------
+#
+# See ``onnxsim/pruning.py``'s own "MoE whole-expert pruning" section comment
+# for the full safety argument: shrinking `router_probs`' own width is exactly
+# equivalent (confirmed to 0.0 max-abs-diff against a real onnxruntime CPU
+# session) to forcing the dropped experts' routing logits to `-inf` in a
+# same-shape model, which is the oracle every execution test below uses.
+
+
+def _moe_router_model(
+    fc1_w,
+    fc2_w,
+    router_w,
+    router_b=None,
+    fc1_b=None,
+    fc2_b=None,
+    fc3_w=None,
+    activation="relu",
+    swiglu_fusion=0,
+    use_sparse_mixer=0,
+    k=2,
+    tokens=6,
+    extra_router_consumer=False,
+):
+    num_experts, inter, hidden = fc1_w.shape
+    fc1_b_arg = "FC1B" if fc1_b is not None else ""
+    fc2_b_arg = "FC2B" if fc2_b is not None else ""
+    fc3_w_arg = "FC3W" if fc3_w is not None else ""
+    router_call = "Gemm(X, RW, RB)" if router_b is not None else "Gemm(X, RW)"
+    extra_out = f", float[{tokens},{num_experts}] R2" if extra_router_consumer else ""
+    extra_node = "R2 = Identity(R)" if extra_router_consumer else ""
+    model = _model(
+        f"""
+        g (float[{tokens},{hidden}] X) => (float[{tokens},{hidden}] Y{extra_out})
+        {{
+          R = {router_call}
+          Y = com.microsoft.MoE <k={k}, activation_type="{activation}", swiglu_fusion={swiglu_fusion}, use_sparse_mixer={use_sparse_mixer}> (X, R, FC1W, {fc1_b_arg}, FC2W, {fc2_b_arg}, {fc3_w_arg})
+          {extra_node}
+        }}
+        """,
+        opset=18,
+    )
+    inits = [_f32(fc1_w, "FC1W"), _f32(fc2_w, "FC2W"), _f32(router_w, "RW")]
+    if router_b is not None:
+        inits.append(_f32(router_b, "RB"))
+    if fc1_b is not None:
+        inits.append(_f32(fc1_b, "FC1B"))
+    if fc2_b is not None:
+        inits.append(_f32(fc2_b, "FC2B"))
+    if fc3_w is not None:
+        inits.append(_f32(fc3_w, "FC3W"))
+    model.graph.initializer.extend(inits)
+    model.opset_import.append(onnx.helper.make_opsetid("com.microsoft", 1))
+    return model
+
+
+def _moe_router_masking_oracle(
+    fc1_w,
+    fc2_w,
+    router_w,
+    router_b,
+    dropped,
+    k,
+    fc1_b=None,
+    activation="relu",
+    tokens=6,
+):
+    # Same-shape model with every `dropped` expert's routing logit forced to
+    # -1e9 (so Softmax assigns it exactly 0 probability, dropping it from both
+    # top-k selection and any `normalize_routing_weights` renormalization)
+    # and its own fc1/fc2 (+fc1_b) rows zeroed -- see this section's own
+    # comment above.
+    fc1_w_masked = fc1_w.copy()
+    fc2_w_masked = fc2_w.copy()
+    fc1_b_masked = fc1_b.copy() if fc1_b is not None else None
+    router_b_masked = (
+        router_b.copy()
+        if router_b is not None
+        else np.zeros(fc1_w.shape[0], np.float32)
+    )
+    for e in dropped:
+        fc1_w_masked[e] = 0
+        fc2_w_masked[e] = 0
+        if fc1_b_masked is not None:
+            fc1_b_masked[e] = 0
+        router_b_masked[e] = -1e9
+    return _moe_router_model(
+        fc1_w_masked,
+        fc2_w_masked,
+        router_w,
+        router_b=router_b_masked,
+        fc1_b=fc1_b_masked,
+        activation=activation,
+        k=k,
+        tokens=tokens,
+    )
+
+
+def test_moe_whole_expert_pruning_matches_ort_masking_oracle():
+    E, hidden, inter, tokens = 5, 8, 6, 10
+    rng = np.random.default_rng(101)
+    fc1_w = (rng.standard_normal((E, inter, hidden)) * 0.4).astype(np.float32)
+    fc2_w = (rng.standard_normal((E, hidden, inter)) * 0.4).astype(np.float32)
+    fc1_b = rng.standard_normal((E, inter)).astype(np.float32)
+    router_w = (rng.standard_normal((hidden, E)) * 0.2).astype(np.float32)
+    router_b = rng.standard_normal(E).astype(np.float32)
+    k = 2
+    model = _moe_router_model(
+        fc1_w, fc2_w, router_w, router_b=router_b, fc1_b=fc1_b, k=k, tokens=tokens
+    )
+    onnx.checker.check_model(model)
+
+    calib_rng = np.random.default_rng(103)
+    calibration_data = [
+        {"X": calib_rng.standard_normal((tokens, hidden)).astype(np.float32)}
+        for _ in range(4)
+    ]
+    pruned = onnxsim.apply_moe_whole_expert_pruning(
+        model,
+        calibration_data=calibration_data,
+        sparsity=0.4,  # keep 3 of 5
+    )
+    onnx.checker.check_model(pruned)
+    inits = _moe_inits(pruned)
+    assert inits["FC1W"].shape == (3, inter, hidden)
+    assert inits["RW"].shape == (hidden, 3)
+    assert inits["FC1B"].shape == (3, inter)
+
+    kept_router_w = inits["RW"]
+    dropped = [
+        e
+        for e in range(E)
+        if not any(np.allclose(router_w[:, e], kept_router_w[:, i]) for i in range(3))
+    ]
+    assert len(dropped) == 2
+    masked = _moe_router_masking_oracle(
+        fc1_w, fc2_w, router_w, router_b, dropped, k, fc1_b=fc1_b, tokens=tokens
+    )
+
+    feed_rng = np.random.default_rng(107)
+    feeds = {"X": feed_rng.standard_normal((tokens, hidden)).astype(np.float32)}
+    (out_pruned,) = _run(pruned, feeds)
+    (out_masked,) = _run(masked, feeds)
+    np.testing.assert_allclose(out_pruned, out_masked, rtol=1e-4, atol=1e-4)
+
+
+def test_moe_whole_expert_pruning_adversarial_low_usage_expert_dropped():
+    # Deliberately conflicting usage: expert 0's router bias is large and
+    # positive (dominant -- selected with high gate weight on almost every
+    # token), expert (E-1)'s is large and negative (rarely/never selected,
+    # near-zero mean gate weight), the rest are mid-range noise. At
+    # sparsity=1/E (drop exactly one expert), the correct (low-usage) expert
+    # must be the one dropped, not the dominant one -- catches a ranking bug
+    # that inverted the comparison or picked the highest-usage expert instead.
+    E, hidden, inter, tokens = 4, 6, 5, 8
+    rng = np.random.default_rng(109)
+    fc1_w = (rng.standard_normal((E, inter, hidden)) * 0.3).astype(np.float32)
+    fc2_w = (rng.standard_normal((E, hidden, inter)) * 0.3).astype(np.float32)
+    router_w = (rng.standard_normal((hidden, E)) * 0.05).astype(np.float32)
+    router_b = np.zeros(E, dtype=np.float32)
+    router_b[0] = 8.0  # dominant
+    router_b[E - 1] = -8.0  # rarely used -- expected to be dropped
+    k = 1
+    model = _moe_router_model(
+        fc1_w, fc2_w, router_w, router_b=router_b, k=k, tokens=tokens
+    )
+    onnx.checker.check_model(model)
+
+    calib_rng = np.random.default_rng(113)
+    calibration_data = [
+        {"X": calib_rng.standard_normal((tokens, hidden)).astype(np.float32)}
+        for _ in range(4)
+    ]
+    pruned = onnxsim.apply_moe_whole_expert_pruning(
+        model, calibration_data=calibration_data, sparsity=1.0 / E
+    )
+    inits = _moe_inits(pruned)
+    assert inits["FC1W"].shape == (E - 1, inter, hidden)
+    kept_router_w = inits["RW"]
+    dropped = [
+        e
+        for e in range(E)
+        if not any(
+            np.allclose(router_w[:, e], kept_router_w[:, i]) for i in range(E - 1)
+        )
+    ]
+    assert dropped == [E - 1], f"expected the rarely-used expert dropped, got {dropped}"
+
+
+def test_moe_whole_expert_pruning_k_is_floored_not_exceeded():
+    # k=2 must never be pruned below -- confirmed empirically that ONNX
+    # Runtime's own CPU MoE kernel fails execution outright with `k` >
+    # `num_experts` (see this module's own section comment). Requesting
+    # sparsity that would remove more than num_experts - k experts is
+    # silently floored instead.
+    E, hidden, inter, tokens = 5, 6, 4, 6
+    rng = np.random.default_rng(127)
+    fc1_w = rng.standard_normal((E, inter, hidden)).astype(np.float32)
+    fc2_w = rng.standard_normal((E, hidden, inter)).astype(np.float32)
+    router_w = rng.standard_normal((hidden, E)).astype(np.float32)
+    k = 2
+    model = _moe_router_model(fc1_w, fc2_w, router_w, k=k, tokens=tokens)
+    pruned = onnxsim.apply_moe_whole_expert_pruning(
+        model, calibration_data=[], sparsity=0.9
+    )
+    onnx.checker.check_model(pruned)
+    inits = _moe_inits(pruned)
+    assert inits["FC1W"].shape == (k, inter, hidden)
+    assert inits["RW"].shape == (hidden, k)
+    feed_rng = np.random.default_rng(131)
+    feeds = {"X": feed_rng.standard_normal((tokens, hidden)).astype(np.float32)}
+    _run(pruned, feeds)  # must execute without error
+
+
+def test_moe_whole_expert_pruning_zero_sparsity_is_a_no_op():
+    E, hidden, inter, tokens = 4, 6, 5, 6
+    rng = np.random.default_rng(137)
+    fc1_w = rng.standard_normal((E, inter, hidden)).astype(np.float32)
+    fc2_w = rng.standard_normal((E, hidden, inter)).astype(np.float32)
+    router_w = rng.standard_normal((hidden, E)).astype(np.float32)
+    model = _moe_router_model(fc1_w, fc2_w, router_w, tokens=tokens)
+    pruned = onnxsim.apply_moe_whole_expert_pruning(
+        model, calibration_data=[], sparsity=0.0
+    )
+    inits = _moe_inits(pruned)
+    np.testing.assert_array_equal(inits["FC1W"], fc1_w)
+    np.testing.assert_array_equal(inits["FC2W"], fc2_w)
+    np.testing.assert_array_equal(inits["RW"], router_w)
+
+
+def test_moe_whole_expert_pruning_invalid_sparsity_raises():
+    E, hidden, inter, tokens = 3, 4, 3, 4
+    rng = np.random.default_rng(139)
+    fc1_w = rng.standard_normal((E, inter, hidden)).astype(np.float32)
+    fc2_w = rng.standard_normal((E, hidden, inter)).astype(np.float32)
+    router_w = rng.standard_normal((hidden, E)).astype(np.float32)
+    model = _moe_router_model(fc1_w, fc2_w, router_w, tokens=tokens)
+    with pytest.raises(ValueError):
+        onnxsim.apply_moe_whole_expert_pruning(model, sparsity=1.0)
+    with pytest.raises(ValueError):
+        onnxsim.apply_moe_whole_expert_pruning(model, sparsity=-0.1)
+
+
+def test_moe_whole_expert_pruning_empty_calibration_falls_back_to_weight_norm():
+    # No calibration data observed for this chain's router_probs -> falls
+    # back to each expert's own combined fc1/fc2 L2 weight norm (the same
+    # "no matching activation observed" fallback
+    # apply_structured_wanda_pruning already uses). Deliberately conflicting
+    # per-expert weight magnitude: expert 0 tiny on both fc1/fc2 (expected
+    # dropped), the rest large.
+    E, hidden, inter, tokens = 3, 4, 3, 4
+    rng = np.random.default_rng(149)
+    fc1_w = (rng.standard_normal((E, inter, hidden)) * 5.0).astype(np.float32)
+    fc2_w = (rng.standard_normal((E, hidden, inter)) * 5.0).astype(np.float32)
+    fc1_w[0] *= 0.001
+    fc2_w[0] *= 0.001
+    router_w = rng.standard_normal((hidden, E)).astype(np.float32)
+    model = _moe_router_model(fc1_w, fc2_w, router_w, k=1, tokens=tokens)
+    pruned = onnxsim.apply_moe_whole_expert_pruning(
+        model, calibration_data=[], sparsity=1.0 / E
+    )
+    inits = _moe_inits(pruned)
+    assert inits["FC1W"].shape == (E - 1, inter, hidden)
+    kept_router_w = inits["RW"]
+    dropped = [
+        e
+        for e in range(E)
+        if not any(
+            np.allclose(router_w[:, e], kept_router_w[:, i]) for i in range(E - 1)
+        )
+    ]
+    assert dropped == [0]
+
+
+def test_moe_whole_expert_pruning_declines_fc3():
+    E, hidden, inter, tokens = 3, 6, 5, 6
+    rng = np.random.default_rng(151)
+    fc1_w = rng.standard_normal((E, inter, hidden)).astype(np.float32)
+    fc2_w = rng.standard_normal((E, hidden, inter)).astype(np.float32)
+    fc3_w = rng.standard_normal((E, inter, hidden)).astype(np.float32)
+    router_w = rng.standard_normal((hidden, E)).astype(np.float32)
+    model = _moe_router_model(
+        fc1_w, fc2_w, router_w, fc3_w=fc3_w, activation="silu", tokens=tokens
+    )
+    pruned = onnxsim.apply_moe_whole_expert_pruning(
+        model, calibration_data=[], sparsity=0.5
+    )
+    inits = _moe_inits(pruned)
+    np.testing.assert_array_equal(inits["FC1W"], fc1_w)
+    np.testing.assert_array_equal(inits["RW"], router_w)
+
+
+def test_moe_whole_expert_pruning_declines_swiglu_activation():
+    E, hidden, inter, tokens = 3, 6, 5, 6
+    rng = np.random.default_rng(157)
+    fc1_w = rng.standard_normal((E, inter, hidden)).astype(np.float32)
+    fc2_w = rng.standard_normal((E, hidden, inter)).astype(np.float32)
+    router_w = rng.standard_normal((hidden, E)).astype(np.float32)
+    model = _moe_router_model(
+        fc1_w, fc2_w, router_w, activation="swiglu", tokens=tokens
+    )
+    pruned = onnxsim.apply_moe_whole_expert_pruning(
+        model, calibration_data=[], sparsity=0.5
+    )
+    inits = _moe_inits(pruned)
+    np.testing.assert_array_equal(inits["FC1W"], fc1_w)
+    np.testing.assert_array_equal(inits["RW"], router_w)
+
+
+def test_moe_whole_expert_pruning_declines_use_sparse_mixer():
+    # use_sparse_mixer=1 hard-requires k == 2 (confirmed empirically,
+    # moe_base_cpu.h's own "Sparse mixer only supports k=2" check) and
+    # engages a different, jitter-named top-2 routing path this pass's own
+    # `-inf`-masking oracle was never independently re-checked against -- so
+    # it's declined outright rather than assumed safe.
+    E, hidden, inter, tokens = 4, 6, 5, 6
+    rng = np.random.default_rng(163)
+    fc1_w = rng.standard_normal((E, inter, hidden)).astype(np.float32)
+    fc2_w = rng.standard_normal((E, hidden, inter)).astype(np.float32)
+    router_w = rng.standard_normal((hidden, E)).astype(np.float32)
+    model = _moe_router_model(
+        fc1_w, fc2_w, router_w, k=2, use_sparse_mixer=1, tokens=tokens
+    )
+    onnx.checker.check_model(model)
+    pruned = onnxsim.apply_moe_whole_expert_pruning(
+        model, calibration_data=[], sparsity=0.5
+    )
+    inits = _moe_inits(pruned)
+    np.testing.assert_array_equal(inits["FC1W"], fc1_w)
+    np.testing.assert_array_equal(inits["RW"], router_w)
+
+
+def test_moe_whole_expert_pruning_declines_router_with_extra_consumer():
+    # router_probs (the router projection's own output) feeding anything
+    # besides this one MoE node would silently see a now-differently-shaped
+    # tensor if pruned -- declined outright.
+    E, hidden, inter, tokens = 3, 6, 5, 6
+    rng = np.random.default_rng(167)
+    fc1_w = rng.standard_normal((E, inter, hidden)).astype(np.float32)
+    fc2_w = rng.standard_normal((E, hidden, inter)).astype(np.float32)
+    router_w = rng.standard_normal((hidden, E)).astype(np.float32)
+    model = _moe_router_model(
+        fc1_w, fc2_w, router_w, tokens=tokens, extra_router_consumer=True
+    )
+    onnx.checker.check_model(model)
+    pruned = onnxsim.apply_moe_whole_expert_pruning(
+        model, calibration_data=[], sparsity=0.5
+    )
+    inits = _moe_inits(pruned)
+    np.testing.assert_array_equal(inits["FC1W"], fc1_w)
+    np.testing.assert_array_equal(inits["RW"], router_w)
+
+
+def test_moe_whole_expert_pruning_declines_tied_router_weight():
+    # The router weight reused by a second node -- an in-place resize would
+    # corrupt that other consumer, the same tied-weight guard
+    # apply_moe_expert_channel_pruning already applies to fc1/fc2.
+    E, hidden, inter, tokens = 3, 6, 5, 6
+    rng = np.random.default_rng(173)
+    fc1_w = rng.standard_normal((E, inter, hidden)).astype(np.float32)
+    fc2_w = rng.standard_normal((E, hidden, inter)).astype(np.float32)
+    router_w = rng.standard_normal((hidden, E)).astype(np.float32)
+    model = _model(
+        f"""
+        g (float[{tokens},{hidden}] X) => (float[{tokens},{hidden}] Y, float[{hidden},{E}] Z)
+        {{
+          R = MatMul(X, RW)
+          Y = com.microsoft.MoE <k=1, activation_type="relu"> (X, R, FC1W, , FC2W)
+          Z = Identity(RW)
+        }}
+        """,
+        initializer=[_f32(fc1_w, "FC1W"), _f32(fc2_w, "FC2W"), _f32(router_w, "RW")],
+        opset=18,
+    )
+    model.opset_import.append(onnx.helper.make_opsetid("com.microsoft", 1))
+    pruned = onnxsim.apply_moe_whole_expert_pruning(
+        model, calibration_data=[], sparsity=0.5
+    )
+    inits = _moe_inits(pruned)
+    np.testing.assert_array_equal(inits["FC1W"], fc1_w)
+    np.testing.assert_array_equal(inits["RW"], router_w)
+
+
+def test_moe_whole_expert_pruning_declines_non_matmul_router_producer():
+    # router_probs fed directly as a graph input (no producer node at all --
+    # or, equally, any producer that isn't a plain MatMul/Gemm) can't be
+    # safely resized: there's no weight to slice, so the node is left
+    # untouched rather than raising.
+    E, hidden, inter, tokens = 3, 6, 5, 6
+    rng = np.random.default_rng(179)
+    fc1_w = rng.standard_normal((E, inter, hidden)).astype(np.float32)
+    fc2_w = rng.standard_normal((E, hidden, inter)).astype(np.float32)
+    model = _model(
+        f"""
+        g (float[{tokens},{hidden}] X, float[{tokens},{E}] R) => (float[{tokens},{hidden}] Y)
+        {{
+          Y = com.microsoft.MoE <k=1, activation_type="relu"> (X, R, FC1W, , FC2W)
+        }}
+        """,
+        initializer=[_f32(fc1_w, "FC1W"), _f32(fc2_w, "FC2W")],
+        opset=18,
+    )
+    model.opset_import.append(onnx.helper.make_opsetid("com.microsoft", 1))
+    pruned = onnxsim.apply_moe_whole_expert_pruning(
+        model, calibration_data=[], sparsity=0.5
+    )
+    inits = _moe_inits(pruned)
+    np.testing.assert_array_equal(inits["FC1W"], fc1_w)
+    np.testing.assert_array_equal(inits["FC2W"], fc2_w)
+
+
+def test_moe_whole_expert_pruning_declines_k_equals_num_experts():
+    # Nothing can be pruned without violating the k floor -- a no-op, not an
+    # error.
+    E, hidden, inter, tokens = 3, 5, 4, 5
+    rng = np.random.default_rng(181)
+    fc1_w = rng.standard_normal((E, inter, hidden)).astype(np.float32)
+    fc2_w = rng.standard_normal((E, hidden, inter)).astype(np.float32)
+    router_w = rng.standard_normal((hidden, E)).astype(np.float32)
+    model = _moe_router_model(fc1_w, fc2_w, router_w, k=E, tokens=tokens)
+    pruned = onnxsim.apply_moe_whole_expert_pruning(
+        model, calibration_data=[], sparsity=0.9
+    )
+    inits = _moe_inits(pruned)
+    np.testing.assert_array_equal(inits["FC1W"], fc1_w)
+    np.testing.assert_array_equal(inits["RW"], router_w)
+
+
+def test_moe_whole_expert_pruning_multiple_nodes_pruned_independently():
+    E1, hidden1, inter1, tokens = 4, 4, 5, 6
+    E2, hidden2, inter2 = 3, 5, 4
+    rng = np.random.default_rng(191)
+    fc1_w1 = rng.standard_normal((E1, inter1, hidden1)).astype(np.float32)
+    fc2_w1 = rng.standard_normal((E1, hidden1, inter1)).astype(np.float32)
+    router_w1 = rng.standard_normal((hidden1, E1)).astype(np.float32)
+    fc1_w2 = rng.standard_normal((E2, inter2, hidden2)).astype(np.float32)
+    fc2_w2 = rng.standard_normal((E2, hidden2, inter2)).astype(np.float32)
+    router_w2 = rng.standard_normal((hidden2, E2)).astype(np.float32)
+    model = _model(
+        f"""
+        g (float[{tokens},{hidden1}] X1, float[{tokens},{hidden2}] X2)
+            => (float[{tokens},{hidden1}] Y1, float[{tokens},{hidden2}] Y2)
+        {{
+          R1 = MatMul(X1, RW1)
+          Y1 = com.microsoft.MoE <k=1, activation_type="relu"> (X1, R1, FC1W1, , FC2W1)
+          R2 = MatMul(X2, RW2)
+          Y2 = com.microsoft.MoE <k=1, activation_type="relu"> (X2, R2, FC1W2, , FC2W2)
+        }}
+        """,
+        initializer=[
+            _f32(fc1_w1, "FC1W1"),
+            _f32(fc2_w1, "FC2W1"),
+            _f32(router_w1, "RW1"),
+            _f32(fc1_w2, "FC1W2"),
+            _f32(fc2_w2, "FC2W2"),
+            _f32(router_w2, "RW2"),
+        ],
+        opset=18,
+    )
+    model.opset_import.append(onnx.helper.make_opsetid("com.microsoft", 1))
+    onnx.checker.check_model(model)
+    pruned = onnxsim.apply_moe_whole_expert_pruning(
+        model, calibration_data=[], sparsity=0.5
+    )
+    onnx.checker.check_model(pruned)
+    inits = _moe_inits(pruned)
+    assert inits["FC1W1"].shape == (2, inter1, hidden1)  # 4 - round(4*0.5) = 2
+    assert inits["RW1"].shape == (hidden1, 2)
+    assert inits["FC1W2"].shape == (1, inter2, hidden2)  # 3 - round(3*0.5) = 1
+    assert inits["RW2"].shape == (hidden2, 1)
