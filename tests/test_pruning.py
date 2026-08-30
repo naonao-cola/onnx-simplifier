@@ -4339,22 +4339,17 @@ def test_structured_pruning_matmul_residual_add_declines_on_gated_output_shared_
     np.testing.assert_array_equal(inits["WOUT2"], wout2)
 
 
-def test_structured_pruning_matmul_residual_add_declines_on_swiglu_branch_with_no_projection():
-    # The native fused SwiGLU op (opset 28+) feeding directly into a
-    # residual Add is deliberately left out of scope -- a scope choice, not
-    # a safety one (see _walk_matmul_producer_backward's own section
-    # comment above): only a plain `Mul` of two non-constant operands is
-    # resolved this way, mirroring _find_gated_chains's own two recognized
-    # gated shapes exactly. `SwiGLU` isn't in `_BINARY_CHANNEL_OPS` at all,
-    # so this residual branch is simply unrecognized by any hop the walk
-    # knows, the same "fail" outcome as any other unmatched topology.
-    K, C, Out = 8, 16, 4
-    rng = np.random.default_rng(107)
-    wg = rng.standard_normal((K, C)).astype(np.float32)
-    wu = rng.standard_normal((K, C)).astype(np.float32)
-    wp = rng.standard_normal((K, C)).astype(np.float32)
-    wout = rng.standard_normal((C, Out)).astype(np.float32)
-    model = _model(
+def _swiglu_residual_no_projection_model(wg, wu, wp, wout):
+    # y = MatMul_out(Relu(Add(MatMul_p(X), SwiGLU(MatMul_g(X), MatMul_u(X)))))
+    # -- the native fused SwiGLU op (opset 28+) feeding directly into a
+    # residual Add, with no output-projection MatMul between it and the Add.
+    # Mirrors _gated_residual_no_projection_model above exactly, with the
+    # separate Sigmoid/Mul pair collapsed into one SwiGLU node -- SwiGLU's
+    # own swish lives entirely inside the op, so `gate`/`up` are wired
+    # straight into it as its two raw operands.
+    K, C = wg.shape
+    Out = wout.shape[1]
+    return _model(
         f"""
         g (float[batch,{K}] X) => (float[batch,{Out}] Y)
         {{
@@ -4365,6 +4360,105 @@ def test_structured_pruning_matmul_residual_add_declines_on_swiglu_branch_with_n
           addr = Add(p, h)
           r = Relu(addr)
           Y = MatMul(r, WOUT)
+        }}
+        """,
+        initializer=[
+            _f32(wg, "WG"),
+            _f32(wu, "WU"),
+            _f32(wp, "WP"),
+            _f32(wout, "WOUT"),
+        ],
+        opset=28,
+    )
+
+
+def test_structured_pruning_matmul_residual_add_prunes_swiglu_branch_with_no_projection():
+    # Composition case, extended to the native fused SwiGLU op (opset 28+):
+    # the same "resolve every real producer feeding a gated combine on a
+    # residual branch" composition the plain-Mul case above already gets,
+    # now also reached when the combine is SwiGLU rather than Mul (see
+    # _walk_matmul_producer_backward's own section comment for the
+    # composition-safety argument re-derived against SwiGLU's own shape).
+    # opset 28 isn't yet implemented by the onnx/onnxruntime versions
+    # installed in this environment (no registered SwiGLU schema, so
+    # neither onnxruntime nor onnx's own reference evaluator can execute
+    # it, and onnx.checker.check_model would reject the opset too) -- so,
+    # like the module's own existing native-SwiGLU test
+    # (test_structured_pruning_native_swiglu_node_prunes_both_producers_together),
+    # this verifies the graph surgery directly via tensor values rather than
+    # through actual execution. Same conflicting-importance construction as
+    # the plain-Mul composition test above: WG/WU/WP built so each
+    # dominates a different third of the channels, so the correct combined
+    # keep set straddles all three and a bug that dropped any one branch's
+    # contribution would be caught.
+    K, C, Out = 9, 18, 4
+    rng = np.random.default_rng(108)
+    third = C // 3
+    scale_g = np.where((np.arange(C) % 3) == 0, 3.0, 0.3).astype(np.float32)
+    scale_u = np.where((np.arange(C) % 3) == 1, 3.0, 0.3).astype(np.float32)
+    scale_p = np.where((np.arange(C) % 3) == 2, 3.0, 0.3).astype(np.float32)
+    wg = rng.standard_normal((K, C)).astype(np.float32) * scale_g
+    wu = rng.standard_normal((K, C)).astype(np.float32) * scale_u
+    wp = rng.standard_normal((K, C)).astype(np.float32) * scale_p
+    wout = rng.standard_normal((C, Out)).astype(np.float32)
+    model = _swiglu_residual_no_projection_model(wg, wu, wp, wout)
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    assert inits["WG"].shape == (K, C // 2)
+    assert inits["WU"].shape == (K, C // 2)
+    assert inits["WP"].shape == (K, C // 2)
+    assert inits["WOUT"].shape == (C // 2, Out)
+
+    importance = np.sqrt(
+        np.square(np.linalg.norm(wg.astype(np.float64), axis=0))
+        + np.square(np.linalg.norm(wu.astype(np.float64), axis=0))
+        + np.square(np.linalg.norm(wp.astype(np.float64), axis=0))
+    )
+    keep = np.sort(np.argsort(-importance)[: C // 2])
+    # The conflicting-importance construction above is only doing its job if
+    # the combined keep set actually straddles all three thirds.
+    assert np.any(keep % 3 == 0) and np.any(keep % 3 == 1) and np.any(keep % 3 == 2)
+
+    np.testing.assert_array_equal(inits["WG"], wg[:, keep])
+    np.testing.assert_array_equal(inits["WU"], wu[:, keep])
+    np.testing.assert_array_equal(inits["WP"], wp[:, keep])
+    np.testing.assert_array_equal(inits["WOUT"], wout[keep, :])
+    assert third > 0  # sanity: the construction above assumes >=3 channels/group
+
+
+def test_structured_pruning_matmul_residual_add_declines_on_swiglu_branch_with_extra_fanout():
+    # The SwiGLU analogue of
+    # test_structured_pruning_matmul_residual_add_declines_on_gated_branch_with_extra_fanout
+    # above: a gate branch that fans out to a second, independent consumer
+    # besides the SwiGLU node itself (`gate`, the gate producer's own raw
+    # output, additionally feeds a second graph output `Z`) must still
+    # decline the *whole* group. SwiGLU's own operands are held to the exact
+    # same single-consumer/not-a-graph-output bar _find_gated_chains's own
+    # `_is_internal` applies to them for the non-residual case (see
+    # _walk_matmul_producer_backward's own section comment), so embedding
+    # that check inside the residual walk doesn't relax it -- a second
+    # reader of `gate` means SwiGLU's own `a` operand fails that bar, this
+    # branch is never resolved as a gated pair, and the whole group falls
+    # through to "fail" and is left untouched.
+    K, C, Out = 8, 16, 4
+    rng = np.random.default_rng(109)
+    wg = rng.standard_normal((K, C)).astype(np.float32)
+    wu = rng.standard_normal((K, C)).astype(np.float32)
+    wp = rng.standard_normal((K, C)).astype(np.float32)
+    wout = rng.standard_normal((C, Out)).astype(np.float32)
+    model = _model(
+        f"""
+        g (float[batch,{K}] X) => (float[batch,{Out}] Y, float[batch,{C}] Z)
+        {{
+          gate = MatMul(X, WG)
+          up = MatMul(X, WU)
+          h = SwiGLU(gate, up)
+          p = MatMul(X, WP)
+          addr = Add(p, h)
+          r = Relu(addr)
+          Y = MatMul(r, WOUT)
+          Z = Identity(gate)
         }}
         """,
         initializer=[
