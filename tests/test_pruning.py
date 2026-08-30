@@ -9525,6 +9525,449 @@ def test_attention_head_pruning_handles_all_three_attention_op_types_in_one_mode
     assert y3.shape == (batch, seq, Out3)
 
 
+# --- importance_norm ("l1" vs "l2") ---------------------------------------
+#
+# Every importance ranking above defaults to Li et al.'s L2-norm criterion,
+# unchanged from this module's own behavior before `importance_norm`
+# existed at all -- see the explicit "l2 is the unchanged default" checks
+# below (byte-identical serialized output with vs. without the parameter),
+# plus the entire pre-existing suite above this section, which this change
+# leaves passing untouched. What follows instead targets the genuinely new
+# "l1" path: adversarial weight layouts where a channel/head/group with a
+# few large entries (high L2, lower total L1) and one with many medium
+# entries (lower L2, higher total L1) trade rank depending on which norm is
+# asked for -- so a bug that silently keeps computing L2 under the hood
+# even when "l1" is requested shows up as the *wrong unit surviving*, not
+# merely a slightly-different score that happens to keep the same one.
+
+
+def test_structured_pruning_l1_norm_favors_total_magnitude_single_producer():
+    # Column "concentrated": one entry of magnitude 8, the other 15 entries
+    # exactly zero -- L2 == L1 == 8 (a single nonzero entry has no L1/L2 gap
+    # at all). Column "spread": all 16 entries equal to 1 -- L2 = sqrt(16) =
+    # 4, L1 = 16. So L2 ranks "concentrated" (8) above "spread" (4), while
+    # L1 ranks "spread" (16) above "concentrated" (8) -- a genuine
+    # disagreement a correct L1 implementation must reproduce. A
+    # "filler_high"/"filler_low" pair (dominant/negligible under either
+    # norm) pins the other surviving slot so the test turns on only this
+    # one comparison.
+    K, H, Out = 16, 4, 3
+    w1 = np.zeros((K, H), dtype=np.float32)
+    w1[0, 0] = 8.0  # "concentrated"
+    w1[:, 1] = 1.0  # "spread"
+    w1[2, 2] = 1000.0  # "filler_high"
+    w1[3, 3] = 0.001  # "filler_low"
+    rng = np.random.default_rng(90)
+    w2 = rng.standard_normal((H, Out)).astype(np.float32)
+    model = _model(
+        f"""
+        g (float[batch,{K}] X) => (float[batch,{Out}] Y)
+        {{
+          h = MatMul(X, W1)
+          a = Relu(h)
+          Y = MatMul(a, W2)
+        }}
+        """,
+        initializer=[_f32(w1, "W1"), _f32(w2, "W2")],
+    )
+
+    pruned_l2 = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    pruned_l1 = onnxsim.apply_structured_pruning(
+        model, sparsity=0.5, importance_norm="l1"
+    )
+    onnx.checker.check_model(pruned_l2)
+    onnx.checker.check_model(pruned_l1)
+
+    keep_l2 = np.array([0, 2])  # concentrated, filler_high
+    keep_l1 = np.array([1, 2])  # spread, filler_high
+    np.testing.assert_array_equal(_kept_columns(pruned_l2, "W1", w1), keep_l2)
+    np.testing.assert_array_equal(_kept_columns(pruned_l1, "W1", w1), keep_l1)
+
+    rng2 = np.random.default_rng(91)
+    x = rng2.standard_normal((5, K)).astype(np.float32)
+    (y_l2,) = _run(pruned_l2, {"X": x})
+    (y_l1,) = _run(pruned_l1, {"X": x})
+
+    def _oracle(keep):
+        h = np.maximum(x @ w1[:, keep], 0)
+        return h @ w2[keep, :]
+
+    np.testing.assert_allclose(y_l2, _oracle(keep_l2), rtol=1e-5, atol=1e-5)
+    np.testing.assert_allclose(y_l1, _oracle(keep_l1), rtol=1e-5, atol=1e-5)
+
+
+def test_structured_pruning_l1_norm_favors_total_magnitude_conv_residual_merge():
+    # Same L1-vs-L2 disagreement as the single-producer case above, but now
+    # spanning *two* independent Conv producers merged by a residual Add --
+    # exercising the multi-producer combination this module documents as a
+    # plain *sum* of per-producer L1 norms for "l1" (never any square/sqrt),
+    # rather than L2's own root-sum-square. Channel "A" concentrates its
+    # magnitude entirely in producer f (vf=10, vs=0): combined L2 = 10,
+    # combined L1 = 10 (a single nonzero producer has no L1/L2 gap either,
+    # same as the single-entry-column case above). Channel "B" splits evenly
+    # across both producers (vf=vs=7): combined L2 = sqrt(98) ~= 9.9,
+    # combined L1 = 14. So L2 (10 > 9.9) keeps "A", while L1 (14 > 10) keeps
+    # "B" -- exactly the flip a still-secretly-root-sum-square "l1"
+    # implementation would fail to reproduce.
+    Cin, C, Cout = 1, 4, 3
+    w_f = np.zeros((C, Cin, 3, 3), dtype=np.float32)
+    w_s = np.zeros((C, Cin, 3, 3), dtype=np.float32)
+    # index 0: "A" (concentrated in f), 1: "B" (split evenly f/s), 2:
+    # filler_high (dominates either norm), 3: filler_low (negligible either
+    # norm).
+    w_f[0, 0, 0, 0] = 10.0
+    w_f[1, 0, 0, 0] = 7.0
+    w_f[2, 0, 0, 0] = 100.0
+    w_f[3, 0, 0, 0] = 0.001
+    w_s[1, 0, 0, 0] = 7.0
+    w_s[2, 0, 0, 0] = 100.0
+    w_s[3, 0, 0, 0] = 0.001
+    rng = np.random.default_rng(92)
+    w_out = rng.standard_normal((Cout, C, 3, 3)).astype(np.float32)
+    model = _residual_diamond_model(w_f, w_s, w_out)
+
+    pruned_l2 = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    pruned_l1 = onnxsim.apply_structured_pruning(
+        model, sparsity=0.5, importance_norm="l1"
+    )
+    onnx.checker.check_model(pruned_l2)
+    onnx.checker.check_model(pruned_l1)
+
+    keep_l2 = np.array([0, 2])  # A, filler_high
+    keep_l1 = np.array([1, 2])  # B, filler_high
+
+    inits_l2 = {
+        t.name: onnx.numpy_helper.to_array(t) for t in pruned_l2.graph.initializer
+    }
+    inits_l1 = {
+        t.name: onnx.numpy_helper.to_array(t) for t in pruned_l1.graph.initializer
+    }
+    np.testing.assert_array_equal(inits_l2["WF"], w_f[keep_l2])
+    np.testing.assert_array_equal(inits_l2["WS"], w_s[keep_l2])
+    np.testing.assert_array_equal(inits_l1["WF"], w_f[keep_l1])
+    np.testing.assert_array_equal(inits_l1["WS"], w_s[keep_l1])
+
+    oracle_l2 = _residual_diamond_model(w_f[keep_l2], w_s[keep_l2], w_out[:, keep_l2])
+    oracle_l1 = _residual_diamond_model(w_f[keep_l1], w_s[keep_l1], w_out[:, keep_l1])
+
+    rng_x = np.random.default_rng(93)
+    x = rng_x.standard_normal((2, Cin, 10, 10)).astype(np.float32)
+    (y_l2,) = _run(pruned_l2, {"X": x})
+    (y_oracle_l2,) = _run(oracle_l2, {"X": x})
+    (y_l1,) = _run(pruned_l1, {"X": x})
+    (y_oracle_l1,) = _run(oracle_l1, {"X": x})
+    np.testing.assert_allclose(y_l2, y_oracle_l2, rtol=1e-5, atol=1e-5)
+    np.testing.assert_allclose(y_l1, y_oracle_l1, rtol=1e-5, atol=1e-5)
+
+
+def test_structured_wanda_pruning_l1_norm_uses_l1_weight_term_but_l2_activation_term():
+    # Confirms two things at once: (1) importance_norm="l1" changes only the
+    # *weight*-magnitude half of Wanda's ||W_row|| * ||X||_2 metric, not the
+    # activation-norm half, which stays L2 regardless (per Wanda's own
+    # definition, see this module's docstring); (2) the combination is a
+    # plain product of that L1 weight term and the L2 activation term. As in
+    # the plain-L1 test above, column "concentrated" (L2 == L1 == 8) times
+    # its own activation norm (8, engineered via the calibration row below)
+    # gives combined 64 under either norm choice. Column "spread" (L2 = 4,
+    # L1 = 16) times its own activation norm (10) gives combined 40 under L2
+    # (still less than "concentrated"'s 64 -- L2-Wanda keeps
+    # "concentrated") but 160 under L1 (now more than "concentrated"'s 64 --
+    # L1-Wanda keeps "spread" instead).
+    K, H, Out = 16, 4, 3
+    w1 = np.zeros((K, H), dtype=np.float32)
+    w1[0, 0] = 8.0  # "concentrated"
+    w1[:, 1] = 1.0  # "spread"
+    w1[2, 2] = 1000.0  # "filler_high"
+    w1[3, 3] = 0.001  # "filler_low"
+    rng = np.random.default_rng(94)
+    w2 = rng.standard_normal((H, Out)).astype(np.float32)
+    model = _model(
+        f"""
+        g (float[batch,{K}] X) => (float[batch,{Out}] Y)
+        {{
+          h = MatMul(X, W1)
+          a = Relu(h)
+          Y = MatMul(a, W2)
+        }}
+        """,
+        initializer=[_f32(w1, "W1"), _f32(w2, "W2")],
+    )
+
+    # A single calibration row, engineered so the resulting activation norm
+    # (computed identically regardless of `importance_norm` -- rms of `a`
+    # over calibration samples) comes out to 8/10/1000/~0 for the four
+    # columns respectively: only row 0 feeds "concentrated" (act = 8*x0),
+    # *every* row feeds "spread" (act = sum of all 16 entries), only row 2
+    # feeds "filler_high", only row 3 feeds "filler_low".
+    x = np.zeros((1, K), dtype=np.float32)
+    x[0, 0] = 1.0  # concentrated: h = 8*1 = 8
+    x[0, 1] = 8.0  # spread: h = sum(x) = 1(row0) + 8(row1) + 1(row2) = 10
+    x[0, 2] = 1.0  # filler_high: h = 1000*1 = 1000
+    x[0, 3] = 0.0  # filler_low: h = 0.001*0 = 0
+    calibration_data = [{"X": x}]
+
+    pruned_l2 = onnxsim.apply_structured_wanda_pruning(
+        model, calibration_data=calibration_data, sparsity=0.5
+    )
+    pruned_l1 = onnxsim.apply_structured_wanda_pruning(
+        model, calibration_data=calibration_data, sparsity=0.5, importance_norm="l1"
+    )
+    onnx.checker.check_model(pruned_l2)
+    onnx.checker.check_model(pruned_l1)
+
+    keep_l2 = np.array([0, 2])  # concentrated, filler_high
+    keep_l1 = np.array([1, 2])  # spread, filler_high
+    np.testing.assert_array_equal(_kept_columns(pruned_l2, "W1", w1), keep_l2)
+    np.testing.assert_array_equal(_kept_columns(pruned_l1, "W1", w1), keep_l1)
+
+    rng2 = np.random.default_rng(95)
+    x_test = rng2.standard_normal((5, K)).astype(np.float32)
+    (y_l2,) = _run(pruned_l2, {"X": x_test})
+    (y_l1,) = _run(pruned_l1, {"X": x_test})
+
+    def _oracle(keep):
+        h = np.maximum(x_test @ w1[:, keep], 0)
+        return h @ w2[keep, :]
+
+    np.testing.assert_allclose(y_l2, _oracle(keep_l2), rtol=1e-5, atol=1e-5)
+    np.testing.assert_allclose(y_l1, _oracle(keep_l1), rtol=1e-5, atol=1e-5)
+
+
+def test_attention_head_pruning_l1_norm_favors_total_magnitude():
+    # The attention-head analogue of the single-producer test above: each
+    # head's combined Q+K+V weight block is ranked by Frobenius (L2) norm by
+    # default, by that same block's own entrywise abs-sum (L1) norm instead
+    # under `importance_norm="l1"`. Q and K carry small fixed noise, equal
+    # across every head (so it shifts every head's block norm by the same
+    # amount either way -- both `sqrt(c + v^2)` vs. L2 and `c + |v|` vs. L1
+    # are monotonic in `v` for a shared constant `c`, so it can't flip any
+    # ranking, only avoids an all-zero QK^T block); only V's own per-head
+    # column block carries the actual signal. Head "concentrated" (one
+    # nonzero V entry, 16, within its own [K, D] block) has L2 == L1 == 16;
+    # head "spread" (every entry of its own [K, D] block == 1, 64 entries)
+    # has L2 = sqrt(64) = 8, L1 = 64. Two filler heads (single huge/tiny V
+    # entries of their own) pin the other surviving slot the same way as the
+    # plain-L1 test above.
+    K, H, D, Out = 16, 4, 4, 3
+    Nq = Nk = Nv = H * D
+    rng_qk = np.random.default_rng(52)
+    wqkv = np.zeros((K, Nq + Nk + Nv), dtype=np.float32)
+    wqkv[:, :Nq] = rng_qk.standard_normal((K, Nq)).astype(np.float32) * 0.01
+    wqkv[:, Nq : Nq + Nk] = rng_qk.standard_normal((K, Nk)).astype(np.float32) * 0.01
+    v_offset = Nq + Nk
+    wqkv[0, v_offset + 0] = 16.0  # head 0 ("concentrated")
+    wqkv[:, v_offset + D : v_offset + 2 * D] = 1.0  # head 1 ("spread")
+    wqkv[2, v_offset + 2 * D] = 1000.0  # head 2 ("filler_high")
+    wqkv[3, v_offset + 3 * D] = 0.001  # head 3 ("filler_low")
+    # A bias-free `com.microsoft::Attention` node crashes this environment's
+    # onnxruntime CPU kernel outright (confirmed with plain random weights,
+    # unrelated to anything about this test's own values) -- an all-zero
+    # bias is mathematically a no-op and sidesteps that entirely.
+    bqkv = np.zeros((Nq + Nk + Nv,), dtype=np.float32)
+
+    model, cfg = _attention_model(
+        K=K, H=H, D=D, Out=Out, seed=50, bias=True, wqkv=wqkv, bqkv=bqkv
+    )
+
+    pruned_l2 = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    pruned_l1 = onnxsim.apply_attention_head_pruning(
+        model, sparsity=0.5, importance_norm="l1"
+    )
+    onnx.checker.check_model(pruned_l2)
+    onnx.checker.check_model(pruned_l1)
+
+    keep_l2 = np.array([0, 2])  # concentrated, filler_high
+    keep_l1 = np.array([1, 2])  # spread, filler_high
+
+    def _oracle_model(keep):
+        qi, ki, vi = (
+            _head_idx(keep, D),
+            _head_idx(keep, D) + Nq,
+            _head_idx(keep, D) + Nq + Nk,
+        )
+        idx = np.concatenate([qi, ki, vi])
+        return _attention_model(
+            K=K,
+            H=2,
+            D=D,
+            Out=Out,
+            seed=50,
+            bias=True,
+            wqkv=wqkv[:, idx],
+            bqkv=bqkv[idx],
+            wout=cfg["wout"][_head_idx(keep, D), :],
+            num_heads=2,
+        )[0]
+
+    oracle_l2 = _oracle_model(keep_l2)
+    oracle_l1 = _oracle_model(keep_l1)
+
+    rng = np.random.default_rng(51)
+    x = rng.standard_normal((2, 5, K)).astype(np.float32)
+    (y_l2,) = _run(pruned_l2, {"X": x})
+    (y_oracle_l2,) = _run(oracle_l2, {"X": x})
+    (y_l1,) = _run(pruned_l1, {"X": x})
+    (y_oracle_l1,) = _run(oracle_l1, {"X": x})
+    np.testing.assert_allclose(y_l2, y_oracle_l2, rtol=1e-4, atol=1e-4)
+    np.testing.assert_allclose(y_l1, y_oracle_l1, rtol=1e-4, atol=1e-4)
+
+
+def test_gqa_pruning_l1_norm_favors_total_magnitude():
+    # The GQA analogue: each KV group's combined Q+K+V weight block is
+    # ranked by Frobenius norm by default, by entrywise abs-sum (L1) norm
+    # instead under `importance_norm="l1"`. Q and K stay entirely zero (see
+    # the plain-Attention L1 test above for why that's still a valid,
+    # NaN-free block) so only V carries weight: KV group 0's own V slice
+    # ([K, D] = [8, 8], 64 entries) concentrates all its magnitude in a
+    # single entry (16) -- Frobenius == L1 == 16, no gap, same reasoning as
+    # every other single-nonzero-entry case in this file. KV group 1's own V
+    # slice spreads magnitude 1 evenly across all 64 entries -- Frobenius =
+    # sqrt(64) = 8, L1 = 64. With exactly two KV groups and keep_count = 1,
+    # L2 (16 > 8) keeps group 0, L1 (64 > 16) keeps group 1 -- no filler
+    # groups needed at all.
+    K, H, KVH, D, Out = 8, 4, 2, 8, 3
+    Nq, Nkv = H * D, KVH * D
+    wq = np.zeros((K, Nq), dtype=np.float32)
+    wk = np.zeros((K, Nkv), dtype=np.float32)
+    wv = np.zeros((K, Nkv), dtype=np.float32)
+    wv[0, 0] = 16.0  # KV group 0's own V slice (columns 0:D) -- concentrated
+    wv[:, D : 2 * D] = 1.0  # KV group 1's own V slice (columns D:2D) -- spread
+
+    model, cfg = _gqa_model(
+        K=K, H=H, KVH=KVH, D=D, Out=Out, seed=60, wq=wq, wk=wk, wv=wv
+    )
+
+    pruned_l2 = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    pruned_l1 = onnxsim.apply_attention_head_pruning(
+        model, sparsity=0.5, importance_norm="l1"
+    )
+    onnx.checker.check_model(pruned_l2)
+    onnx.checker.check_model(pruned_l1)
+
+    group_size = H // KVH  # 2 query heads per KV group
+
+    def _oracle_model(keep_group):
+        q_idx = np.arange(
+            keep_group * group_size * D, (keep_group + 1) * group_size * D
+        )
+        kv_idx = np.arange(keep_group * D, (keep_group + 1) * D)
+        return _gqa_model(
+            K=K,
+            H=group_size,
+            KVH=1,
+            D=D,
+            Out=Out,
+            seed=60,
+            wq=wq[:, q_idx],
+            wk=wk[:, kv_idx],
+            wv=wv[:, kv_idx],
+            wout=cfg["wout"][q_idx, :],
+        )[0]
+
+    oracle_l2 = _oracle_model(0)
+    oracle_l1 = _oracle_model(1)
+
+    node_l2 = _gqa_node(pruned_l2)
+    node_l1 = _gqa_node(pruned_l1)
+    assert _gqa_attrs(node_l2) == (group_size, 1)
+    assert _gqa_attrs(node_l1) == (group_size, 1)
+
+    rng = np.random.default_rng(61)
+    x = rng.standard_normal((cfg["batch"], cfg["seq"], K)).astype(np.float32)
+    (y_l2,) = _run(pruned_l2, {"X": x})
+    (y_oracle_l2,) = _run(oracle_l2, {"X": x})
+    (y_l1,) = _run(pruned_l1, {"X": x})
+    (y_oracle_l1,) = _run(oracle_l1, {"X": x})
+    np.testing.assert_allclose(y_l2, y_oracle_l2, rtol=1e-4, atol=1e-4)
+    np.testing.assert_allclose(y_l1, y_oracle_l1, rtol=1e-4, atol=1e-4)
+
+
+def test_structured_pruning_importance_norm_l2_is_the_unchanged_default():
+    model, wg, wu, wd = _swiglu_mlp_model(K=8, H=16, Out=4, seed=30)
+    default = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    explicit = onnxsim.apply_structured_pruning(
+        model, sparsity=0.5, importance_norm="l2"
+    )
+    assert default.SerializeToString() == explicit.SerializeToString()
+
+
+def test_structured_wanda_pruning_importance_norm_l2_is_the_unchanged_default():
+    K, H, Out = 8, 24, 4
+    rng = np.random.default_rng(31)
+    w1 = rng.standard_normal((K, H)).astype(np.float32)
+    w2 = rng.standard_normal((H, Out)).astype(np.float32)
+    model = _model(
+        f"""
+        g (float[batch,{K}] X) => (float[batch,{Out}] Y)
+        {{
+          h = MatMul(X, W1)
+          a = Relu(h)
+          Y = MatMul(a, W2)
+        }}
+        """,
+        initializer=[_f32(w1, "W1"), _f32(w2, "W2")],
+    )
+    rng_cal = np.random.default_rng(32)
+    calibration_data = [{"X": rng_cal.standard_normal((4, K)).astype(np.float32)}]
+    default = onnxsim.apply_structured_wanda_pruning(
+        model, calibration_data=calibration_data, sparsity=0.5
+    )
+    explicit = onnxsim.apply_structured_wanda_pruning(
+        model, calibration_data=calibration_data, sparsity=0.5, importance_norm="l2"
+    )
+    assert default.SerializeToString() == explicit.SerializeToString()
+
+
+def test_attention_head_pruning_importance_norm_l2_is_the_unchanged_default():
+    model, _ = _attention_model(K=8, H=4, D=4, Out=6, seed=40)
+    default = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    explicit = onnxsim.apply_attention_head_pruning(
+        model, sparsity=0.5, importance_norm="l2"
+    )
+    assert default.SerializeToString() == explicit.SerializeToString()
+
+
+def test_attention_head_wanda_pruning_importance_norm_l2_is_the_unchanged_default():
+    model, _ = _attention_model(K=8, H=4, D=4, Out=6, seed=41)
+    rng_cal = np.random.default_rng(33)
+    calibration_data = [{"X": rng_cal.standard_normal((2, 5, 8)).astype(np.float32)}]
+    default = onnxsim.apply_attention_head_wanda_pruning(
+        model, calibration_data=calibration_data, sparsity=0.5
+    )
+    explicit = onnxsim.apply_attention_head_wanda_pruning(
+        model, calibration_data=calibration_data, sparsity=0.5, importance_norm="l2"
+    )
+    assert default.SerializeToString() == explicit.SerializeToString()
+
+
+def test_structured_pruning_invalid_importance_norm_raises():
+    model = _mlp_model(K=8, H=16, Out=4)
+    with pytest.raises(ValueError):
+        onnxsim.apply_structured_pruning(model, importance_norm="l3")
+
+
+def test_structured_wanda_pruning_invalid_importance_norm_raises():
+    model = _mlp_model(K=8, H=16, Out=4)
+    with pytest.raises(ValueError):
+        onnxsim.apply_structured_wanda_pruning(
+            model, calibration_data=[], importance_norm="l3"
+        )
+
+
+def test_attention_head_pruning_invalid_importance_norm_raises():
+    model, _ = _attention_model(K=8, H=4, D=4, Out=6)
+    with pytest.raises(ValueError):
+        onnxsim.apply_attention_head_pruning(model, importance_norm="bogus")
+
+
+def test_attention_head_wanda_pruning_invalid_importance_norm_raises():
+    model, _ = _attention_model(K=8, H=4, D=4, Out=6)
+    with pytest.raises(ValueError):
+        onnxsim.apply_attention_head_wanda_pruning(
+            model, calibration_data=[], importance_norm="bogus"
+        )
+
+
 # --- MoE expert-intermediate-channel pruning --------------------------------
 #
 # See ``onnxsim/pruning.py``'s own "MoE expert-intermediate-channel pruning"
