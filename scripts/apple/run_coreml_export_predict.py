@@ -36,7 +36,9 @@ def _cnn_model() -> onnx.ModelProto:
     bn_bias = numpy_helper.from_array(np.zeros(4, np.float32), name="bn_bias")
     mean = numpy_helper.from_array(np.zeros(4, np.float32), name="mean")
     var = numpy_helper.from_array(np.ones(4, np.float32), name="var")
-    gw = numpy_helper.from_array(rng.randn(4, 4 * 4).astype(np.float32), name="gw")
+    # AveragePool(k=2, s=2) on Conv's 8x8 output halves both spatial dims to 4x4,
+    # so Flatten(axis=1) yields 4 (channels) * 4 * 4 = 64 features.
+    gw = numpy_helper.from_array(rng.randn(4, 4 * 4 * 4).astype(np.float32), name="gw")
     gb = numpy_helper.from_array(np.zeros(4, np.float32), name="gb")
 
     x = helper.make_tensor_value_info("x", onnx.TensorProto.FLOAT, [1, 3, 8, 8])
