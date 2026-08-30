@@ -191,6 +191,53 @@ onnxsim::SymNode ToSymNode(const onnx::NodeProto& node) {
   return n;
 }
 
+// A `Constant` node's own embedded value, read directly from its `value` /
+// `value_ints` / `value_int` attribute -- mirrors sym_value_eval.cpp's own
+// EvalConstant. Needed because a genuine (non-transient) Constant node is
+// never folded into a graph initializer any more (constant_folding.cpp
+// deliberately leaves it as a producer node -- see kTransientConstantAttr's
+// own comment), yet M2's shape rules (Squeeze axes, Reshape/Expand shape,
+// Slice starts/ends/axes/steps, Split sizes, ...) only ever consult
+// ShapeGraph::initializer for a data-input's concrete values. Without this, an
+// int-list operand sourced from an unfolded Constant node is invisible to M2:
+// the rule either fails outright, or -- worse, for Squeeze/Unsqueeze's
+// "no axes" fallback -- silently substitutes the wrong heuristic (dropping
+// every dim that happens to be 1, including ones the real, unseen axes list
+// would not have touched). M1 (EvaluateSymbolicValues) does not need this: it
+// evaluates every node in topological order, `Constant` included.
+std::optional<onnxsim::SymTensor> ConstantNodeValue(const onnxsim::SymNode& node) {
+  if (node.op_type != "Constant") return std::nullopt;
+  if (const onnxsim::SymAttr* a = node.attr("value")) {
+    if (a->t) return *a->t;
+  }
+  if (const onnxsim::SymAttr* a = node.attr("value_ints")) {
+    std::vector<onnxsim::SymExpr> v;
+    v.reserve(a->ints.size());
+    for (int64_t x : a->ints) v.emplace_back(x);
+    return onnxsim::SymTensor::Vector(std::move(v));
+  }
+  if (const onnxsim::SymAttr* a = node.attr("value_int")) {
+    if (a->i) return onnxsim::SymTensor::Scalar(onnxsim::SymExpr(*a->i));
+  }
+  return std::nullopt;
+}
+
+// Adds every `Constant` node's own value into `initializers`, so M2's
+// ShapeGraph::initializer-only lookups (see ConstantNodeValue's own comment)
+// see it exactly as if it were a real graph initializer. `nodes` is the
+// already-built SymNode list, so this needs no re-parsing of attributes.
+void AddConstantNodeValues(
+    const std::vector<onnxsim::SymNode>& nodes,
+    std::map<std::string, onnxsim::SymTensor>& initializers) {
+  for (const auto& node : nodes) {
+    if (node.output.size() != 1 || node.output[0].empty()) continue;
+    if (initializers.count(node.output[0])) continue;
+    if (auto t = ConstantNodeValue(node)) {
+      initializers[node.output[0]] = std::move(*t);
+    }
+  }
+}
+
 // Run M2 (symbolic activation-shape inference) then M1 (symbolic value
 // evaluation) over `model`, returning every shape-data tensor the evaluator
 // could resolve as a SymTensor (its entries possibly still symbolic).
@@ -210,6 +257,7 @@ std::map<std::string, onnxsim::SymTensor> EvaluateModelSymbolicValues(
     for (int64_t d : init.dims()) s.emplace_back(d);
     shapes_seed[init.name()] = std::move(s);
   }
+  AddConstantNodeValues(nodes, initializers);
   auto seed = [&](const onnx::ValueInfoProto& vi) {
     if (shapes_seed.count(vi.name()))
       return;  // keep the concrete initializer shape
@@ -355,6 +403,7 @@ std::map<std::string, onnxsim::SymTensor> EvaluateGraphSymbolicValues(
     for (int64_t d : inits[i]->sizes()) s.emplace_back(d);
     shapes_seed[init_names[i]] = std::move(s);
   }
+  AddConstantNodeValues(nodes, initializers);
   auto seed = [&](onnx::Value* v) {
     if (shapes_seed.count(v->uniqueName()))
       return;  // keep the concrete initializer shape
