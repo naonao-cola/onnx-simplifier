@@ -46,6 +46,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import gc
 import shutil
 import sys
 import tempfile
@@ -95,6 +96,13 @@ def export_llm_to_coreml(
             # sequence_length/past_sequence_length dynamic regardless (see the
             # module docstring for why 2, not 1).
             sequence_length=2,
+            # optimum's own PyTorch-vs-ONNX-Runtime validation pass keeps both a
+            # full copy of the model and an onnxruntime session resident at once,
+            # roughly doubling peak memory during export -- prohibitive for a
+            # multi-billion-parameter model. onnxsim's own onnx.checker.check_model
+            # call below and the Core ML conversion that follows are the
+            # correctness checks this pipeline actually relies on.
+            do_validation=False,
         )
 
         onnx_path = Path(tmpdir) / "model.onnx"
@@ -117,6 +125,11 @@ def export_llm_to_coreml(
             f"  {len(model.graph.node)} -> {len(simplified.graph.node)} nodes",
             flush=True,
         )
+        # `model` is a full second copy of every weight and is no longer needed --
+        # drop it before Core ML conversion builds a third (a multi-billion-parameter
+        # model can't afford three copies resident at once).
+        del model
+        gc.collect()
 
         print(f"Converting to Core ML ({convert_to}), dynamic KV cache...", flush=True)
         onnxsim.export_coreml(
