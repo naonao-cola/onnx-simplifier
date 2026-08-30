@@ -913,6 +913,42 @@ def _candidates(
     return out
 
 
+def _weight_to_nk(w: np.ndarray, weight_transposed: bool, is_conv: bool) -> np.ndarray:
+    """``[out_channels, in_channels, kH, kW]`` -> ``[N, K]`` for a Conv
+    weight, or a plain 2-D MatMul/Gemm (or Attention merged-QKV) weight
+    transposed to ``[N, K]`` (output channel first) when it isn't already --
+    the shared reshape/transpose convention every unstructured-pruning
+    importance/masking function in this module works in. Factored out of
+    :func:`_prune_weight` so :func:`_apply_global_unstructured_pruning`
+    (:func:`apply_magnitude_pruning`/:func:`apply_wanda_pruning`'s own
+    ``global_sparsity`` mode) can build the exact same ``[N, K]`` view
+    *before* any masking decision -- unlike :func:`_prune_weight`'s own
+    per-layer callback, global mode needs every candidate's own ``w_nk``
+    gathered up front, to pool their importance before any one of them can
+    be masked.
+    """
+    if is_conv:
+        n, cin, kh, kw = w.shape
+        return w.reshape(n, cin * kh * kw)
+    return w if weight_transposed else w.T
+
+
+def _nk_to_weight(
+    w_nk: np.ndarray,
+    orig_shape: Tuple[int, ...],
+    weight_transposed: bool,
+    is_conv: bool,
+) -> np.ndarray:
+    """Inverse of :func:`_weight_to_nk`: reshapes/transposes an already-
+    masked ``[N, K]`` array back to `orig_shape`, cast to float32, ready
+    for :func:`onnx.numpy_helper.from_array`.
+    """
+    if is_conv:
+        return w_nk.reshape(orig_shape).astype(np.float32)
+    w_new = w_nk if weight_transposed else w_nk.T
+    return w_new.reshape(orig_shape).astype(np.float32)
+
+
 def _prune_weight(
     w_init: onnx.TensorProto,
     weight_transposed: bool,
@@ -920,23 +956,84 @@ def _prune_weight(
     is_conv: bool = False,
 ) -> None:
     w = onnx.numpy_helper.to_array(w_init).astype(np.float64)
-    if is_conv:
-        # [out_channels, in_channels, kH, kW] -> [N, K], the same
-        # output-channel-first, flattened-receptive-field reshape
-        # :func:`_apply_chains` already uses for Conv importance.
-        n, cin, kh, kw = w.shape
-        w_nk = w.reshape(n, cin * kh * kw)
-        mask = importance_of_nk(w_nk)
-        w_pruned_nk = np.where(mask, w_nk, 0.0)
-        w_new = w_pruned_nk.reshape(n, cin, kh, kw).astype(np.float32)
-    else:
-        dim0, dim1 = w.shape
-        w_nk = w if weight_transposed else w.T  # [N, K], output channel first
-        mask = importance_of_nk(w_nk)
-        w_pruned_nk = np.where(mask, w_nk, 0.0)
-        w_new = w_pruned_nk if weight_transposed else w_pruned_nk.T
-        w_new = w_new.reshape(dim0, dim1).astype(np.float32)
+    w_nk = _weight_to_nk(w, weight_transposed, is_conv)
+    mask = importance_of_nk(w_nk)
+    w_pruned_nk = np.where(mask, w_nk, 0.0)
+    w_new = _nk_to_weight(w_pruned_nk, w.shape, weight_transposed, is_conv)
     w_init.CopyFrom(onnx.numpy_helper.from_array(w_new, name=w_init.name))
+
+
+def _apply_global_unstructured_pruning(
+    entries: List[
+        Tuple[onnx.TensorProto, bool, bool, Tuple[int, ...], np.ndarray, np.ndarray]
+    ],
+    sparsity: float,
+) -> None:
+    """Global-sparsity companion to :func:`_prune_weight`'s own per-layer
+    ``importance_of_nk`` masking, shared by :func:`apply_magnitude_pruning`/
+    :func:`apply_wanda_pruning`'s own ``global_sparsity=True`` mode (see
+    each function's own docstring). Instead of every matched layer
+    independently keeping the same *fraction* of its own entries
+    (:func:`_sparsity_mask`'s own per-row rule), this pools every entry's
+    own already-computed `importance` array (plain ``|W|`` for magnitude
+    pruning, Wanda's ``|W_ij| * ||X_j||_2`` for Wanda pruning -- the
+    metric itself is entirely the caller's concern, this function only
+    ever sees the resulting numbers) into one flat array tagged by which
+    layer/position it came from, picks a *single* keep-count from
+    `sparsity`'s fraction of the *total* pooled entry count across every
+    layer combined, and zeros exactly the lowest-scoring ``total -
+    keep_count`` pooled entries wherever they land -- Han et al.'s
+    original "global magnitude pruning" (2015), generalized to any of
+    this module's own per-entry importance metrics.
+
+    Deliberately enforces no per-row/per-layer floor the way
+    :func:`_sparsity_mask` does (``keep = max(1, ...)``): a genuinely
+    global threshold can legitimately zero an entire row, or even an
+    entire layer's weight, when every one of its entries scores below the
+    one shared global cutoff -- exactly the "a layer full of tiny weights
+    ends up pruned harder than one full of large weights" redistribution
+    this mode exists to provide, not a bug to guard against. This is safe
+    here in a way it would not be for :func:`apply_structured_pruning`'s
+    own ``global_sparsity`` mode (:func:`_apply_chains_global`): zeroing
+    every entry of one row/layer still leaves a well-formed tensor of the
+    same shape, unlike collapsing a structural channel count to zero.
+
+    `entries` is ``(w_init, weight_transposed, is_conv, orig_shape, w_nk,
+    importance)`` per matched layer -- `w_nk` and `importance` share one
+    shape, `w_nk` already in :func:`_weight_to_nk`'s own ``[N, K]``
+    convention, ready to reshape back via `orig_shape`
+    (:func:`_nk_to_weight`) once masked. Ties at the cutoff value are
+    broken by a fixed, deterministic pooled order
+    (:func:`numpy.argsort`'s own stable sort over the concatenated array,
+    `entries` order then each entry's own row-major flatten order) rather
+    than by weight name, so the exact `keep_count` this function computes
+    is always met exactly (mirroring every other rounding rule in this
+    module, e.g. :func:`_sparsity_mask`'s own ``round``), rather than left
+    to however many entries happen to tie exactly at whatever cutoff
+    *value* a plain ``>=`` comparison would use instead.
+    """
+    if not entries:
+        return
+    pooled = np.concatenate([importance.reshape(-1) for *_, importance in entries])
+    total = pooled.size
+    if total == 0:
+        return
+    keep_count = min(max(round(total * (1.0 - sparsity)), 0), total)
+    drop_count = total - keep_count
+
+    drop_flat = np.zeros(total, dtype=bool)
+    if drop_count > 0:
+        order = np.argsort(pooled, kind="stable")
+        drop_flat[order[:drop_count]] = True
+
+    offset = 0
+    for w_init, weight_transposed, is_conv, orig_shape, w_nk, _importance in entries:
+        size = w_nk.size
+        drop_here = drop_flat[offset : offset + size].reshape(w_nk.shape)
+        offset += size
+        w_pruned_nk = np.where(drop_here, 0.0, w_nk)
+        w_new = _nk_to_weight(w_pruned_nk, orig_shape, weight_transposed, is_conv)
+        w_init.CopyFrom(onnx.numpy_helper.from_array(w_new, name=w_init.name))
 
 
 # --- Conv im2col-unfolded activation statistics (Wanda only) -----------
@@ -1132,6 +1229,7 @@ def apply_magnitude_pruning(
     sparsity: float = 0.5,
     n: Optional[int] = None,
     m: Optional[int] = None,
+    global_sparsity: bool = False,
 ) -> onnx.ModelProto:
     """Zeros the least-magnitude entries of every MatMul/vanilla-Gemm
     layer's constant 2-D float32 weight (this includes
@@ -1151,17 +1249,51 @@ def apply_magnitude_pruning(
     :param model: the original onnx ModelProto or file path
     :param sparsity: target fraction of each row's (or, for Conv, each
             output filter's) entries to zero, ignored when ``n``/``m`` are
-            given
+            given -- or, when `global_sparsity`, target fraction of every
+            matched layer's entries *combined*
     :param n: keep the ``n`` highest-magnitude entries per group of ``m``
             (semi-structured N:M pruning, e.g. NVIDIA's 2:4). Must be given
-            together with ``m``.
+            together with ``m``; incompatible with `global_sparsity` (see
+            below).
     :param m: group size for N:M pruning; see ``n``
+    :param global_sparsity: the classic "global magnitude pruning" variant
+            (Han et al., 2015) instead of this function's own default
+            per-layer-uniform mode: rather than every matched layer
+            independently zeroing the same *fraction* of its own entries
+            (:func:`_sparsity_mask`'s own per-row rule, applied
+            independently per layer), every matched layer's ``|W|``
+            entries are first pooled into one ranking across the *whole*
+            model, a single keep-count is chosen from `sparsity`'s
+            fraction of that pooled total, and exactly that many
+            lowest-magnitude entries are zeroed -- wherever in the model
+            they land. A layer whose weights are uniformly small relative
+            to the rest of the model ends up pruned harder than one whose
+            weights are uniformly large, rather than every layer being cut
+            by the same fraction regardless of its own weights' scale.
+            Unlike the default mode, no per-row (or even per-layer) floor
+            is enforced -- an entire row, or an entire layer's weight, can
+            legitimately end up all-zero if every one of its entries
+            scores below the one shared global cutoff; this is expected
+            behavior for a genuinely global threshold, not a bug (a
+            structural channel count can't drop to zero the same way, which
+            is why :func:`apply_structured_pruning`'s own `global_sparsity`
+            mode *does* keep a per-chain floor -- see that function's own
+            docstring). Incompatible with ``n``/``m``: N:M's own per-group
+            pattern already fixes a uniform local keep-count within every
+            group of ``m`` columns, leaving no separate global-fraction
+            target for a pooled threshold to redistribute. Default
+            ``False`` -- every pre-existing caller's behavior is unchanged.
     :returns: ``model`` with every matched layer's weight zeroed in place
             to the target pattern; layers with a non-constant weight, a
             non-2-D MatMul/Gemm weight, or a non-4-D Conv weight are left
             untouched
     """
     _validate_pattern(sparsity, n, m)
+    if global_sparsity and n is not None:
+        raise ValueError(
+            "global_sparsity is not supported together with N:M pruning "
+            "(n/m) -- see apply_magnitude_pruning's own docstring"
+        )
     if isinstance(model, str):
         model = onnx.load(model, load_external_data=False)
 
@@ -1169,7 +1301,21 @@ def apply_magnitude_pruning(
     out.CopyFrom(model)
     initializer_map = {t.name: t for t in out.graph.initializer}
 
-    for _, _, w_name, weight_transposed, is_conv in _candidates(out.graph):
+    candidates = _candidates(out.graph)
+
+    if global_sparsity:
+        entries = []
+        for _, _, w_name, weight_transposed, is_conv in candidates:
+            w_init = initializer_map[w_name]
+            w = onnx.numpy_helper.to_array(w_init).astype(np.float64)
+            w_nk = _weight_to_nk(w, weight_transposed, is_conv)
+            entries.append(
+                (w_init, weight_transposed, is_conv, w.shape, w_nk, np.abs(w_nk))
+            )
+        _apply_global_unstructured_pruning(entries, sparsity)
+        return out
+
+    for _, _, w_name, weight_transposed, is_conv in candidates:
         w_init = initializer_map[w_name]
 
         def importance_of_nk(w_nk, n=n, m=m, sparsity=sparsity):
@@ -1185,6 +1331,68 @@ def apply_magnitude_pruning(
     return out
 
 
+def _wanda_norm_for_candidate(
+    node: onnx.NodeProto,
+    x_name: str,
+    w_name: str,
+    is_conv: bool,
+    w_init: onnx.TensorProto,
+    act_norm: Dict[str, np.ndarray],
+    conv_act_norm: Dict[str, np.ndarray],
+    attn_act_norm: Dict[str, np.ndarray],
+) -> Optional[np.ndarray]:
+    """Returns one matched layer's own broadcastable activation-norm array
+    -- shape ``(1, K)`` for MatMul/Gemm/Attention (one shared norm row for
+    every output channel), or ``(out_channels, K)`` for Conv, already
+    expanded per output filter's own group by
+    :func:`_conv_group_relative_norm` -- or ``None`` if no calibration
+    activation was ever observed for it. Factored out of
+    :func:`apply_wanda_pruning`'s own per-layer masking loop so its
+    `global_sparsity` mode (see that function's own docstring) can compute
+    the exact same per-layer norm before pooling every layer's importance
+    into one global threshold, with the actual importance/fallback formula
+    (:func:`_wanda_importance`) applied identically by both modes.
+    """
+    if is_conv:
+        flat_norm = conv_act_norm.get(w_name)
+        if flat_norm is None:
+            return None
+        cout, cin_per_group, kh, kw = (int(d) for d in w_init.dims)
+        return _conv_group_relative_norm(
+            flat_norm, cout, cin_per_group, kh, kw, _conv_group(node)
+        )
+    if node.domain == _ATTENTION_DOMAIN and node.op_type == "Attention":
+        # See `apply_wanda_pruning`'s own `attn_sq_sum` accumulation: this
+        # weight's own activation is the rank-3 `X` reduced over leading
+        # axes, keyed by `w_name` rather than `x_name`.
+        norm_flat = attn_act_norm.get(w_name)
+        return norm_flat[np.newaxis, :] if norm_flat is not None else None
+    norm_flat = act_norm.get(x_name)
+    return norm_flat[np.newaxis, :] if norm_flat is not None else None
+
+
+def _wanda_importance(
+    w_nk: np.ndarray, norm: Optional[np.ndarray], epsilon: float
+) -> np.ndarray:
+    """Wanda's own ``|W_ij| * ||X_j||_2`` importance for one already-``[N,
+    K]``-shaped weight (:func:`_weight_to_nk`), given its own broadcastable
+    activation-norm array (:func:`_wanda_norm_for_candidate`) -- falls back
+    to plain magnitude (:func:`apply_magnitude_pruning`'s own metric) when
+    `norm` is missing or its shape doesn't line up with `w_nk` (no
+    calibration activation was ever observed for this layer, or it was
+    observed at a mismatched width). Shared between
+    :func:`apply_wanda_pruning`'s own per-layer and `global_sparsity`
+    masking paths so both compute exactly the same per-entry importance.
+    """
+    if (
+        norm is None
+        or norm.shape[-1] != w_nk.shape[1]
+        or (norm.shape[0] != 1 and norm.shape[0] != w_nk.shape[0])
+    ):
+        return np.abs(w_nk)  # fall back to plain magnitude
+    return np.abs(w_nk) * np.maximum(norm, epsilon)
+
+
 def apply_wanda_pruning(
     model: Union[str, onnx.ModelProto],
     calibration_data: Optional[Sequence[Tensors]] = None,
@@ -1195,6 +1403,7 @@ def apply_wanda_pruning(
     m: Optional[int] = None,
     epsilon: float = 1e-8,
     providers: Optional[Sequence[str]] = None,
+    global_sparsity: bool = False,
 ) -> onnx.ModelProto:
     """Wanda pruning (Sun et al., 2023): zeros the least-important entries
     of every MatMul/vanilla-Gemm layer's constant 2-D float32 weight (this
@@ -1237,13 +1446,44 @@ def apply_wanda_pruning(
             given
     :param n: keep the ``n`` highest-importance entries per group of ``m``
             (semi-structured N:M pruning, e.g. NVIDIA's 2:4). Must be given
-            together with ``m``.
+            together with ``m``; incompatible with `global_sparsity` (see
+            below).
     :param m: group size for N:M pruning; see ``n``
     :param epsilon: floor applied to the accumulated per-channel activation
             norm, avoiding every entry of an all-zero channel tying at
             exactly-zero importance
     :param providers: onnxruntime execution providers to run ``model`` on
             when capturing calibration activations
+    :param global_sparsity: pools every matched layer's own ``|W_ij| *
+            ||X_j||_2`` importance into one ranking across the *whole*
+            model and picks a single keep-count from `sparsity`'s fraction
+            of that pooled total, mirroring
+            :func:`apply_magnitude_pruning`'s own `global_sparsity` mode
+            (see that function's own docstring for the full mechanism and
+            why no per-row/per-layer floor is enforced). Caveat specific
+            to Wanda's own metric, honestly noted rather than hidden:
+            ``|W_ij| * ||X_j||_2`` is not scale-normalized across layers
+            the way a probability or a fraction would be -- its raw
+            numeric range depends on that layer's own weight-init/training
+            scale *and* on the raw activation magnitude flowing into it
+            (which varies enormously with position in the network: right
+            after an embedding lookup vs. right after a LayerNorm vs. right
+            after a GELU are all different scales, with no relationship to
+            genuine importance). A pooled ranking is still exactly the
+            mechanical "one global threshold" this mode promises -- and,
+            unlike a metric this module has no way to compute at all, this
+            one is at least well-defined and reproducible -- but in
+            practice it can end up dominated by whichever layers happen to
+            see the largest raw activation norms, pruning them harder (or
+            leaving them untouched) for reasons unrelated to how much they
+            actually matter. Callers who want cross-layer redistribution
+            with a metric that *is* scale-comparable should prefer
+            :func:`apply_magnitude_pruning`'s own `global_sparsity` mode
+            (plain ``|W|`` has the same cross-layer weight-scale caveat in
+            principle, but no *additional* activation-scale one on top of
+            it). Incompatible with ``n``/``m``, for the same reason
+            :func:`apply_magnitude_pruning` gives. Default ``False`` --
+            every pre-existing caller's behavior is unchanged.
     :returns: ``model`` with every matched layer's weight zeroed in place
             to the target pattern; a MatMul/Gemm layer with a non-constant
             or non-2-D weight, a Conv layer with a non-4-D weight, or any
@@ -1256,6 +1496,11 @@ def apply_wanda_pruning(
             ever observed)
     """
     _validate_pattern(sparsity, n, m)
+    if global_sparsity and n is not None:
+        raise ValueError(
+            "global_sparsity is not supported together with N:M pruning "
+            "(n/m) -- see apply_wanda_pruning's own docstring"
+        )
     if isinstance(model, str):
         model = onnx.load(model, load_external_data=False)
     if calibration_data is None:
@@ -1355,6 +1600,29 @@ def apply_wanda_pruning(
         name: np.sqrt(s / max(attn_count[name], 1)) for name, s in attn_sq_sum.items()
     }
 
+    if global_sparsity:
+        entries = []
+        for node, x_name, w_name, weight_transposed, is_conv in candidates:
+            w_init = initializer_map[w_name]
+            w = onnx.numpy_helper.to_array(w_init).astype(np.float64)
+            w_nk = _weight_to_nk(w, weight_transposed, is_conv)
+            norm = _wanda_norm_for_candidate(
+                node,
+                x_name,
+                w_name,
+                is_conv,
+                w_init,
+                act_norm,
+                conv_act_norm,
+                attn_act_norm,
+            )
+            importance = _wanda_importance(w_nk, norm, epsilon)
+            entries.append(
+                (w_init, weight_transposed, is_conv, w.shape, w_nk, importance)
+            )
+        _apply_global_unstructured_pruning(entries, sparsity)
+        return out
+
     for node, x_name, w_name, weight_transposed, is_conv in candidates:
         w_init = initializer_map[w_name]
         # `norm` is always kept 2-D here, broadcastable elementwise against
@@ -1367,34 +1635,19 @@ def apply_wanda_pruning(
         # across every row when ``group=1``, genuinely different per group
         # otherwise -- see that function's own docstring for why a single
         # shared row would be wrong for a grouped/depthwise Conv).
-        norm: Optional[np.ndarray]
-        if is_conv:
-            flat_norm = conv_act_norm.get(w_name)
-            norm = None
-            if flat_norm is not None:
-                cout, cin_per_group, kh, kw = (int(d) for d in w_init.dims)
-                norm = _conv_group_relative_norm(
-                    flat_norm, cout, cin_per_group, kh, kw, _conv_group(node)
-                )
-        elif node.domain == _ATTENTION_DOMAIN and node.op_type == "Attention":
-            # See the `attn_sq_sum` accumulation above: this weight's own
-            # activation is the rank-3 `X` reduced over leading axes, keyed
-            # by `w_name` rather than `x_name`.
-            norm_flat = attn_act_norm.get(w_name)
-            norm = norm_flat[np.newaxis, :] if norm_flat is not None else None
-        else:
-            norm_flat = act_norm.get(x_name)
-            norm = norm_flat[np.newaxis, :] if norm_flat is not None else None
+        norm = _wanda_norm_for_candidate(
+            node,
+            x_name,
+            w_name,
+            is_conv,
+            w_init,
+            act_norm,
+            conv_act_norm,
+            attn_act_norm,
+        )
 
         def importance_of_nk(w_nk, norm=norm, n=n, m=m, sparsity=sparsity):
-            if (
-                norm is None
-                or norm.shape[-1] != w_nk.shape[1]
-                or (norm.shape[0] != 1 and norm.shape[0] != w_nk.shape[0])
-            ):
-                importance = np.abs(w_nk)  # fall back to plain magnitude
-            else:
-                importance = np.abs(w_nk) * np.maximum(norm, epsilon)
+            importance = _wanda_importance(w_nk, norm, epsilon)
             return (
                 _nm_mask(importance, n, m)
                 if n is not None
@@ -5600,6 +5853,125 @@ def _chain_group(chain: _Chain) -> int:
     return chain.consumer_group
 
 
+def _chain_is_global_sparsity_eligible(chain: _Chain) -> bool:
+    """Whether `chain` may take part in
+    :func:`apply_structured_pruning`/:func:`apply_structured_wanda_pruning`'s
+    own `global_sparsity` mode (:func:`_apply_chains_global`) -- an
+    ordinary, single-producer chain with no extra fan-out consumer branch
+    and no general grouped Conv on either side. See
+    :func:`apply_structured_pruning`'s own `global_sparsity` docstring for
+    the full reasoning; this is just the predicate it describes.
+    """
+    return (
+        len(chain.producers) == 1
+        and not chain.extra_consumers
+        and _chain_group(chain) == 1
+    )
+
+
+def _slice_chain_channels(
+    initializer_map: Dict[str, onnx.TensorProto],
+    chain: _Chain,
+    keep: np.ndarray,
+    keep_count: int,
+    stale_value_info: Set[str],
+) -> None:
+    """Performs the actual channel-removal slicing for one already-decided
+    (ascending) `keep` index set -- every producer's weight/bias, every
+    chain-op constant, every depthwise pass-through hop, the (possibly
+    grouped) consumer, and every extra fan-out consumer branch -- and
+    records every node this leaves with a stale output shape into
+    `stale_value_info`. Factored out of :func:`_apply_chains` so
+    :func:`_apply_chains_global` (:func:`apply_structured_pruning`'s own
+    `global_sparsity` mode) can reuse the identical slicing mechanics: the
+    two only ever differ in *how* `keep`/`keep_count` are decided (a local
+    per-chain top-k vs. a globally pooled threshold), never in how a
+    decided `keep` set is applied to the graph.
+    """
+    for p in chain.producers:
+        _slice_producer_weight(
+            initializer_map[p.weight], p.weight_transposed, keep, is_conv=p.is_conv
+        )
+        if p.bias is not None:
+            _slice_last_axis(initializer_map[p.bias], keep)
+    for _, const_name in chain.chain_ops:
+        if const_name is not None:
+            _slice_last_axis(initializer_map[const_name], keep)
+
+    def _slice_conv_hop(hop: _ConvPassThrough) -> None:
+        # Same `keep` index set as the real producer -- a depthwise
+        # Conv's own channel i is exactly upstream channel i, so its
+        # weight (output-channel axis 0, like any Conv producer) and
+        # bias slice identically, and `group` (== in_channels ==
+        # out_channels for a depthwise Conv) drops to the new count
+        # right alongside them.
+        _slice_producer_weight(initializer_map[hop.weight], False, keep, is_conv=True)
+        if hop.bias is not None:
+            _slice_last_axis(initializer_map[hop.bias], keep)
+        _set_conv_group_attr(hop.node, keep_count)
+
+    for hop in chain.conv_pass_through:
+        _slice_conv_hop(hop)
+    if chain.consumer_is_conv and chain.consumer_group > 1:
+        _slice_grouped_consumer_conv_weight(
+            initializer_map[chain.consumer_weight],
+            keep,
+            chain.consumer_group,
+            chain.n_channels,
+        )
+    else:
+        _slice_consumer_weight(
+            initializer_map[chain.consumer_weight],
+            chain.consumer_weight_transposed,
+            keep,
+            is_conv=chain.consumer_is_conv,
+        )
+    # Extra fan-out branches (see :class:`_Chain.extra_consumers`'s own
+    # comment): each is either an ordinary (`group == 1`) consumer, or,
+    # for a Conv residual/merge chain, a general grouped Conv consumer
+    # whose own `group` was already confirmed (in
+    # _find_conv_residual_chains) to agree with `group` above --
+    # _resolve_matmul_fanout_branches never resolves a grouped one (no
+    # such concept for MatMul/Gemm), so `consumer_group` stays at its
+    # default 1 there and this always takes the plain-slice branch for
+    # a MatMul/Gemm chain. Either way, fed by the exact same `keep` just
+    # computed for the group's shared producers above.
+    for branch in chain.extra_consumers:
+        for _, const_name in branch.chain_ops:
+            if const_name is not None:
+                _slice_last_axis(initializer_map[const_name], keep)
+        for hop in branch.conv_pass_through:
+            _slice_conv_hop(hop)
+        if branch.consumer_is_conv and branch.consumer_group > 1:
+            _slice_grouped_consumer_conv_weight(
+                initializer_map[branch.consumer_weight],
+                keep,
+                branch.consumer_group,
+                chain.n_channels,
+            )
+        else:
+            _slice_consumer_weight(
+                initializer_map[branch.consumer_weight],
+                branch.consumer_weight_transposed,
+                keep,
+                is_conv=branch.consumer_is_conv,
+            )
+
+    for p in chain.producers:
+        stale_value_info.add(p.node.output[0])
+        stale_value_info.update(pre_op.output[0] for pre_op in p.pre_ops)
+    stale_value_info.update(chain_node.output[0] for chain_node, _ in chain.chain_ops)
+    stale_value_info.update(hop.node.output[0] for hop in chain.conv_pass_through)
+    stale_value_info.update(
+        chain_node.output[0]
+        for b in chain.extra_consumers
+        for chain_node, _ in b.chain_ops
+    )
+    stale_value_info.update(
+        hop.node.output[0] for b in chain.extra_consumers for hop in b.conv_pass_through
+    )
+
+
 def _apply_chains(
     graph: onnx.GraphProto,
     chains: List[_Chain],
@@ -5740,100 +6112,175 @@ def _apply_chains(
         else:
             keep = np.sort(np.argsort(-importance)[:keep_count])
 
-        for p in chain.producers:
-            _slice_producer_weight(
-                initializer_map[p.weight], p.weight_transposed, keep, is_conv=p.is_conv
-            )
-            if p.bias is not None:
-                _slice_last_axis(initializer_map[p.bias], keep)
-        for _, const_name in chain.chain_ops:
-            if const_name is not None:
-                _slice_last_axis(initializer_map[const_name], keep)
-
-        def _slice_conv_hop(hop: _ConvPassThrough) -> None:
-            # Same `keep` index set as the real producer -- a depthwise
-            # Conv's own channel i is exactly upstream channel i, so its
-            # weight (output-channel axis 0, like any Conv producer) and
-            # bias slice identically, and `group` (== in_channels ==
-            # out_channels for a depthwise Conv) drops to the new count
-            # right alongside them.
-            _slice_producer_weight(
-                initializer_map[hop.weight], False, keep, is_conv=True
-            )
-            if hop.bias is not None:
-                _slice_last_axis(initializer_map[hop.bias], keep)
-            _set_conv_group_attr(hop.node, keep_count)
-
-        for hop in chain.conv_pass_through:
-            _slice_conv_hop(hop)
-        if chain.consumer_is_conv and chain.consumer_group > 1:
-            _slice_grouped_consumer_conv_weight(
-                initializer_map[chain.consumer_weight], keep, chain.consumer_group, n
-            )
-        else:
-            _slice_consumer_weight(
-                initializer_map[chain.consumer_weight],
-                chain.consumer_weight_transposed,
-                keep,
-                is_conv=chain.consumer_is_conv,
-            )
-        # Extra fan-out branches (see :class:`_Chain.extra_consumers`'s own
-        # comment): each is either an ordinary (`group == 1`) consumer, or,
-        # for a Conv residual/merge chain, a general grouped Conv consumer
-        # whose own `group` was already confirmed (in
-        # _find_conv_residual_chains) to agree with `group` above --
-        # _resolve_matmul_fanout_branches never resolves a grouped one (no
-        # such concept for MatMul/Gemm), so `consumer_group` stays at its
-        # default 1 there and this always takes the plain-slice branch for
-        # a MatMul/Gemm chain. Either way, fed by the exact same `keep` just
-        # computed for the group's shared producers above.
-        for branch in chain.extra_consumers:
-            for _, const_name in branch.chain_ops:
-                if const_name is not None:
-                    _slice_last_axis(initializer_map[const_name], keep)
-            for hop in branch.conv_pass_through:
-                _slice_conv_hop(hop)
-            if branch.consumer_is_conv and branch.consumer_group > 1:
-                _slice_grouped_consumer_conv_weight(
-                    initializer_map[branch.consumer_weight],
-                    keep,
-                    branch.consumer_group,
-                    n,
-                )
-            else:
-                _slice_consumer_weight(
-                    initializer_map[branch.consumer_weight],
-                    branch.consumer_weight_transposed,
-                    keep,
-                    is_conv=branch.consumer_is_conv,
-                )
+        _slice_chain_channels(
+            initializer_map, chain, keep, keep_count, stale_value_info
+        )
 
         producer_touched.update(producer_weights)
         consumer_touched.update(consumer_weights)
         const_touched.update(consts)
         conv_hop_touched.update(conv_hop_weights)
+
+
+def _apply_chains_global(
+    graph: onnx.GraphProto,
+    chains: List[_Chain],
+    sparsity: float,
+    compute_importance,
+    touched: _TouchedState,
+) -> None:
+    """Global-sparsity companion to :func:`_apply_chains`, used by
+    :func:`apply_structured_pruning`/:func:`apply_structured_wanda_pruning`'s
+    own `global_sparsity` mode. The caller is required to have already
+    filtered `chains` down to ones with exactly one producer and no extra
+    fan-out consumer branch and :func:`_chain_group` ``== 1`` -- see
+    :func:`apply_structured_pruning`'s own docstring for exactly why every
+    other chain kind (a gated pair, a residual/merge group, a
+    ``Concat``-merged branch, or any general grouped Conv on either side)
+    is left completely untouched by this mode rather than approximated;
+    this function itself assumes that filtering already happened and
+    doesn't re-check it.
+
+    Two passes rather than :func:`_apply_chains`'s one: this function has
+    to know *every* admitted chain's own channel importance before any
+    single chain's `keep` can be decided, since the whole point of global
+    sparsity is one shared cutoff picked from every admitted chain's
+    pooled importance -- unlike :func:`_apply_chains`'s per-chain
+    `keep_count`, which only ever needs that one chain's own
+    `n_channels`/`sparsity`.
+
+    Admission -- the same tied-weight conflict/degenerate checks
+    :func:`_apply_chains` already performs, in the same list order --
+    still happens greedily, chain by chain, in one first pass, and an
+    admitted chain's own weights are marked touched immediately, *before*
+    its own final `keep_count` is known. This is the one deliberate
+    behavioral difference from :func:`_apply_chains`: there, a chain whose
+    `keep_count` happens to round up to its full `n_channels` (no channels
+    actually dropped) is left completely unmarked, so a later, conflicting
+    chain sharing the same weight is still free to claim it instead.
+    Here, whether a chain's own `keep_count` will round to a no-op can't
+    be known until every admitted chain's importance has been pooled and
+    the one shared global cutoff is picked -- so admission can't be
+    deferred that way without circularity (which chains are even in the
+    pool depends on admission; the cutoff depends on the pool). An
+    admitted chain that happens to end up keeping every one of its own
+    channels once the global cutoff is applied still claims its weights,
+    exactly as if it had genuinely been pruned.
+
+    Each admitted chain keeps at least one channel -- the same floor
+    :func:`_apply_chains` already enforces per chain (``max(1, n -
+    round(n * sparsity))``) -- unlike
+    :func:`apply_magnitude_pruning`/:func:`apply_wanda_pruning`'s own
+    `global_sparsity` mode (:func:`_apply_global_unstructured_pruning`),
+    which enforces no such floor: an unstructured *entry* can legitimately
+    go to all-zero within an otherwise-unpruned layer and the tensor is
+    still perfectly well-formed, but a *structural* channel count can't
+    drop to zero without leaving a MatMul/Conv with a zero-sized axis --
+    not a valid graph. A chain the global cutoff would otherwise reduce to
+    zero channels keeps its own single highest-importance channel instead,
+    pulled back out of the global drop set after the fact -- the same
+    guarantee :func:`_apply_chains`'s own ``max(1, ...)`` provides per
+    chain, just resolved globally rather than locally. One consequence
+    worth being explicit about: the *realized* aggregate sparsity across
+    every admitted chain can come out slightly below the requested
+    `sparsity` whenever one or more small chains hit this floor -- the
+    same kind of rounding slack :func:`_apply_chains`'s own per-chain
+    ``round`` already introduces at the single-chain level, just visible
+    in aggregate here instead of averaged away across independent chains.
+    """
+    initializer_map = {t.name: t for t in graph.initializer}
+    producer_touched = touched.producer
+    consumer_touched = touched.consumer
+    const_touched = touched.const
+    conv_hop_touched = touched.conv_hop
+    stale_value_info = touched.stale_value_info
+
+    admitted = []
+    for chain in chains:
+        producer_weights = {p.weight for p in chain.producers}
+        if len(producer_weights) != len(chain.producers):
+            continue  # degenerate (shouldn't happen for a single-producer chain)
+
+        consumer_weights = {chain.consumer_weight}
+        conv_hop_weights = {h.weight for h in chain.conv_pass_through}
+        if len(conv_hop_weights) != len(chain.conv_pass_through):
+            continue  # degenerate (the same depthwise weight named twice)
+
+        consts = {p.bias for p in chain.producers if p.bias is not None}
+        consts.update(
+            const_name for _, const_name in chain.chain_ops if const_name is not None
+        )
+        if (
+            (producer_weights & producer_touched)
+            or (consumer_weights & consumer_touched)
+            or (consts & const_touched)
+            or (conv_hop_weights & conv_hop_touched)
+        ):
+            continue  # a shared/tied initializer another chain already resized
+
+        w_arrays_nk = []
         for p in chain.producers:
-            stale_value_info.add(p.node.output[0])
-            stale_value_info.update(pre_op.output[0] for pre_op in p.pre_ops)
-        stale_value_info.update(
-            chain_node.output[0] for chain_node, _ in chain.chain_ops
+            w = onnx.numpy_helper.to_array(initializer_map[p.weight]).astype(np.float64)
+            if p.is_conv:
+                w_nk = w.reshape(w.shape[0], -1)
+            else:
+                w_nk = w if p.weight_transposed else w.T
+            w_arrays_nk.append(w_nk)
+        importance = compute_importance(chain, w_arrays_nk)
+
+        admitted.append(
+            (
+                chain,
+                importance,
+                producer_weights,
+                consumer_weights,
+                consts,
+                conv_hop_weights,
+            )
         )
-        stale_value_info.update(hop.node.output[0] for hop in chain.conv_pass_through)
-        stale_value_info.update(
-            chain_node.output[0]
-            for b in chain.extra_consumers
-            for chain_node, _ in b.chain_ops
-        )
-        stale_value_info.update(
-            hop.node.output[0]
-            for b in chain.extra_consumers
-            for hop in b.conv_pass_through
+        producer_touched.update(producer_weights)
+        consumer_touched.update(consumer_weights)
+        const_touched.update(consts)
+        conv_hop_touched.update(conv_hop_weights)
+
+    if not admitted:
+        return
+
+    total_n = sum(chain.n_channels for chain, *_ in admitted)
+    keep_count_total = min(max(round(total_n * (1.0 - sparsity)), 0), total_n)
+    drop_count_total = total_n - keep_count_total
+
+    pooled = np.concatenate([importance for _, importance, *_ in admitted])
+    drop_flat = np.zeros(total_n, dtype=bool)
+    if drop_count_total > 0:
+        order = np.argsort(pooled, kind="stable")
+        drop_flat[order[:drop_count_total]] = True
+
+    offset = 0
+    for chain, importance, *_ in admitted:
+        n = chain.n_channels
+        drop_here = drop_flat[offset : offset + n]
+        offset += n
+        if drop_here.all():
+            # Per-chain floor: never drop every channel of an admitted
+            # chain -- keep its own single highest-importance channel
+            # instead (see this function's own docstring).
+            drop_here = drop_here.copy()
+            drop_here[np.argmax(importance)] = False
+        keep = np.flatnonzero(~drop_here)  # already ascending
+        keep_count = int(keep.size)
+        if keep_count >= n:
+            continue  # every channel survived -- no-op, nothing to slice
+
+        _slice_chain_channels(
+            initializer_map, chain, keep, keep_count, stale_value_info
         )
 
 
 def apply_structured_pruning(
     model: Union[str, onnx.ModelProto],
     sparsity: float = 0.5,
+    global_sparsity: bool = False,
 ) -> onnx.ModelProto:
     """Removes whole output channels from MatMul/vanilla-Gemm layers --
     real structural pruning (smaller weight tensors, smaller matmuls on any
@@ -5992,7 +6439,68 @@ def apply_structured_pruning(
 
     :param model: the original onnx ModelProto or file path
     :param sparsity: target fraction of each matched producer's output
-            channels to remove (at least one channel is always kept)
+            channels to remove (at least one channel is always kept) -- or,
+            when `global_sparsity`, target fraction of every eligible
+            chain's channels *combined* (see `global_sparsity` below for
+            which chains are eligible)
+    :param global_sparsity: pools every *eligible* matched chain's own
+            per-channel L2-norm importance into one ranking across the
+            *whole* model and picks a single keep-count from `sparsity`'s
+            fraction of that pooled total -- the structural analogue of
+            :func:`apply_magnitude_pruning`'s own `global_sparsity` mode,
+            so a chain whose weights are uniformly small relative to the
+            rest of the model gets pruned harder than one whose weights
+            are uniformly large, rather than every chain being cut by the
+            same fraction regardless of its own weights' scale.
+
+            "Eligible" is deliberately narrower here than this function's
+            own default per-chain mode matches: only an ordinary,
+            single-producer chain with no extra fan-out consumer branch
+            and :func:`_chain_group` ``== 1`` (no general grouped Conv on
+            either side) takes part in the global pool. A gated
+            (SwiGLU/GeGLU) pair, a Conv or MatMul/Gemm residual/merge
+            group, a ``Concat``-merged branch, and any general grouped
+            Conv chain are all left *completely untouched* in this mode --
+            the same "declined outright rather than approximated"
+            treatment this pass already gives any topology it can't prove
+            safe to cut -- rather than folded into the pool or pruned
+            locally alongside it. Three separate reasons converge on that
+            line: (1) a gated pair's or residual group's two-or-more
+            producers must all agree on one *shared* `keep` set already,
+            before any cross-chain pooling is even considered -- a second,
+            *global* layer of index agreement on top of that first one has
+            no established meaning; (2) a general grouped Conv's `keep`
+            selection is already constrained to a uniform count *per
+            group block* (:func:`_apply_chains`'s own per-group top-k) --
+            a single global cutoff picked from a pooled ranking has no
+            general way to land on a block-uniform count for every
+            group of every grouped chain simultaneously; and (3) a
+            ``Concat``-merged branch's importance is computed and applied
+            through an entirely different code path
+            (:func:`_apply_concat_chains`) with its own per-branch
+            floor and no shared `keep` set at all -- extending global
+            pooling to it would need a third, separately-verified
+            mechanism, not a natural extension of the one built for plain
+            chains. Every one of those is a genuine correctness
+            conflict between "one global cutoff" and that chain kind's own
+            structural constraints, not merely an inconvenience -- so
+            rather than force an approximation through, this mode simply
+            declines them, the same conservative way this pass already
+            declines any topology it can't prove safe.
+
+            Every eligible chain still keeps at least one channel (the
+            same floor this function's own default mode already
+            enforces per chain) -- unlike
+            :func:`apply_magnitude_pruning`/:func:`apply_wanda_pruning`'s
+            own `global_sparsity` mode, which enforces no such floor: an
+            unstructured weight *entry* can legitimately go to all-zero
+            and the tensor stays well-formed, but a structural channel
+            count can't drop to zero without producing an ill-formed
+            (zero-sized) tensor axis. This means the *realized* aggregate
+            sparsity across every eligible chain can come out slightly
+            below the requested `sparsity` whenever one or more small
+            chains hit this floor. Default ``False`` -- every pre-existing
+            caller's behavior is unchanged.
     :returns: ``model`` with every matched chain's tensors resized in
             place; anything not matching that exact topology (branching,
             a non-constant bias, a consumer whose reduction dimension
@@ -6017,16 +6525,27 @@ def apply_structured_pruning(
     concat_chains = _find_matmul_concat_chains(graph) + _find_conv_concat_chains(graph)
 
     touched = _TouchedState()
-    if chains:
-        _apply_chains(graph, chains, sparsity, _plain_structured_importance, touched)
-    if concat_chains:
-        _apply_concat_chains(
-            graph,
-            concat_chains,
-            sparsity,
-            lambda _operand_name, w_arrays_nk: _plain_branch_importance(w_arrays_nk),
-            touched,
-        )
+    if global_sparsity:
+        global_chains = [c for c in chains if _chain_is_global_sparsity_eligible(c)]
+        if global_chains:
+            _apply_chains_global(
+                graph, global_chains, sparsity, _plain_structured_importance, touched
+            )
+    else:
+        if chains:
+            _apply_chains(
+                graph, chains, sparsity, _plain_structured_importance, touched
+            )
+        if concat_chains:
+            _apply_concat_chains(
+                graph,
+                concat_chains,
+                sparsity,
+                lambda _operand_name, w_arrays_nk: _plain_branch_importance(
+                    w_arrays_nk
+                ),
+                touched,
+            )
     if touched.stale_value_info:
         kept = [
             vi for vi in graph.value_info if vi.name not in touched.stale_value_info
@@ -6045,6 +6564,7 @@ def apply_structured_wanda_pruning(
     sparsity: float = 0.5,
     epsilon: float = 1e-8,
     providers: Optional[Sequence[str]] = None,
+    global_sparsity: bool = False,
 ) -> onnx.ModelProto:
     """The calibrated upgrade of :func:`apply_structured_pruning`, exactly
     as :func:`apply_wanda_pruning` is to :func:`apply_magnitude_pruning`:
@@ -6090,12 +6610,38 @@ def apply_structured_wanda_pruning(
     :param seed: seed for the random calibration data (ignored if
             ``calibration_data`` is supplied)
     :param sparsity: target fraction of each matched chain's output
-            channels to remove (at least one channel is always kept)
+            channels to remove (at least one channel is always kept) -- or,
+            when `global_sparsity`, target fraction of every eligible
+            chain's channels *combined*
     :param epsilon: floor applied to the accumulated per-channel activation
             norm, avoiding every channel of an all-zero activation tying at
             exactly the weight-only importance
     :param providers: onnxruntime execution providers to run ``model`` on
             when capturing calibration activations
+    :param global_sparsity: the structural analogue of
+            :func:`apply_magnitude_pruning`'s own `global_sparsity` mode,
+            applied to this function's own ``||W_row||_2 * ||X||_2``
+            metric -- see :func:`apply_structured_pruning`'s own
+            `global_sparsity` docstring for the full mechanism, the
+            per-chain floor, and exactly which chains are "eligible" to
+            take part in the pool (an ordinary, single-producer,
+            non-grouped chain with no extra fan-out branch; a gated pair,
+            a residual/merge group, a ``Concat``-merged branch, and any
+            general grouped Conv chain are all left completely untouched
+            in this mode instead). One additional caveat specific to this
+            function's own metric, honestly noted rather than hidden --
+            the same one :func:`apply_wanda_pruning`'s own
+            `global_sparsity` docstring gives for its unstructured Wanda
+            metric: ``||X||_2`` is raw calibration-activation magnitude,
+            not scale-normalized across the network, so a pooled ranking
+            can end up dominated by whichever eligible chains happen to
+            see the largest raw activation norms for reasons unrelated to
+            how much they actually matter -- still a well-defined,
+            reproducible global threshold, just not a scale-comparable one
+            the way plain ``|W|``-based global sparsity
+            (:func:`apply_structured_pruning`'s own `global_sparsity`
+            mode) more nearly is. Default ``False`` -- every pre-existing
+            caller's behavior is unchanged.
     :returns: ``model`` with every matched chain's tensors resized in
             place; anything not matching that exact topology falls back to
             :func:`apply_structured_pruning`'s plain L2-norm ranking if no
@@ -6189,12 +6735,21 @@ def apply_structured_wanda_pruning(
         return base * np.maximum(norm, epsilon)
 
     touched = _TouchedState()
-    if chains:
-        _apply_chains(graph, chains, sparsity, _wanda_structured_importance, touched)
-    if concat_chains:
-        _apply_concat_chains(
-            graph, concat_chains, sparsity, _wanda_branch_importance, touched
-        )
+    if global_sparsity:
+        global_chains = [c for c in chains if _chain_is_global_sparsity_eligible(c)]
+        if global_chains:
+            _apply_chains_global(
+                graph, global_chains, sparsity, _wanda_structured_importance, touched
+            )
+    else:
+        if chains:
+            _apply_chains(
+                graph, chains, sparsity, _wanda_structured_importance, touched
+            )
+        if concat_chains:
+            _apply_concat_chains(
+                graph, concat_chains, sparsity, _wanda_branch_importance, touched
+            )
     if touched.stale_value_info:
         kept = [
             vi for vi in graph.value_info if vi.name not in touched.stale_value_info
