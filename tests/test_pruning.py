@@ -7357,28 +7357,74 @@ def test_magnitude_pruning_attention_merged_weight_nm_pattern():
             assert np.count_nonzero(group) <= 2
 
 
-def test_wanda_pruning_attention_merged_weight_falls_back_to_magnitude():
-    # `Attention`'s own `X` input is rank-3 ([batch, seq, hidden]), not the
-    # plain 2-D tensor Wanda's calibrated metric requires at the probe
-    # point -- the documented fallback every other MatMul/Gemm layer with a
-    # non-2-D activation already gets (see apply_wanda_pruning's own
-    # docstring), not a crash and not an untouched layer.
-    model, cfg = _attention_model(K=8, H=4, D=4, Out=6, seed=23)
+def test_wanda_pruning_attention_merged_weight_uses_calibrated_activation_norm():
+    # Unlike an ordinary MatMul/Gemm layer with a rank-3 activation (see
+    # test_wanda_pruning_falls_back_to_magnitude_without_matching_activation,
+    # just above, which must keep falling back to plain magnitude
+    # unmodified), `Attention`'s merged QKV weight gets its own,
+    # separately-accumulated activation statistic that reduces `X`
+    # ([batch, seq, hidden]) over every leading axis (mirroring
+    # apply_sparsegpt_pruning's own x.reshape(-1, x.shape[-1])) -- see
+    # apply_wanda_pruning's own docstring. A handful of input (K-axis)
+    # features carry deliberately inflated activation magnitude but
+    # otherwise-ordinary weight magnitude -- Wanda's own motivating scenario,
+    # exactly mirroring test_wanda_pruning_protects_high_activation_channels's
+    # plain-MatMul version of this same test.
+    K, H, D, Out = 8, 4, 4, 6
+    salient = (0, 3, 5)
+    model, cfg = _attention_model(K=K, H=H, D=D, Out=Out, seed=23)
     rng = np.random.default_rng(24)
-    x = rng.standard_normal((2, 5, cfg["K"])).astype(np.float32)
+    x = rng.standard_normal((2, 5, K)).astype(np.float32)
+    for c in salient:
+        x[:, :, c] *= 25.0
+    calibration_data = [{"X": x}]
 
     magnitude_pruned = onnxsim.apply_magnitude_pruning(model, sparsity=0.5)
     wanda_pruned = onnxsim.apply_wanda_pruning(
-        model, calibration_data=[{"X": x}], sparsity=0.5
+        model, calibration_data=calibration_data, sparsity=0.5
     )
     onnx.checker.check_model(wanda_pruned)
 
     inits_m = {t.name: t for t in magnitude_pruned.graph.initializer}
     inits_w = {t.name: t for t in wanda_pruned.graph.initializer}
-    np.testing.assert_array_equal(
-        onnx.numpy_helper.to_array(inits_m["Wqkv"]),
-        onnx.numpy_helper.to_array(inits_w["Wqkv"]),
-    )
+    w_magnitude = onnx.numpy_helper.to_array(inits_m["Wqkv"])  # [K, N]
+    w_wanda = onnx.numpy_helper.to_array(inits_w["Wqkv"])
+
+    # The calibration signal must actually be used, not just tolerated
+    # without error -- Wanda's result must differ from plain magnitude
+    # pruning of the same weight under the same skewed activation profile
+    # that left them identical before this fix (see the docstring above).
+    assert not np.array_equal(w_magnitude, w_wanda)
+
+    # The salient K-axis rows must keep strictly more nonzero entries under
+    # Wanda than under plain magnitude -- the same protection
+    # test_wanda_pruning_protects_high_activation_channels checks for a
+    # plain MatMul layer, now proven for Attention's merged weight too.
+    salient_kept_magnitude = np.count_nonzero(w_magnitude[list(salient), :])
+    salient_kept_wanda = np.count_nonzero(w_wanda[list(salient), :])
+    assert salient_kept_wanda > salient_kept_magnitude
+
+    # Cross-check against a hand-rolled oracle that reimplements the exact
+    # documented metric independently of onnxsim's own internals: reduce X
+    # over every leading axis (reshape(-1, K), SparseGPT's own convention),
+    # take the per-feature L2 norm, and per output column (this weight's
+    # per-row Wanda comparison group, one column at [K, N] per output
+    # channel) rank |W_ij| * ||X_j||_2 -- exactly
+    # test_sparsegpt_pruning_attention_merged_weight_matches_reference_transliteration's
+    # own transliteration-oracle style, just for Wanda's own metric instead
+    # of SparseGPT's Hessian-corrected one.
+    x_flat = x.reshape(-1, K).astype(np.float64)
+    act_norm = np.sqrt(np.square(x_flat).sum(axis=0) / x_flat.shape[0])
+    w = cfg["wqkv"].astype(np.float64)  # [K, N]
+    w_nk = w.T  # [N, K], output channel first -- Wanda's own comparison axis
+    importance = np.abs(w_nk) * np.maximum(act_norm[np.newaxis, :], 1e-8)
+    keep = round(K * 0.5)
+    order = np.argsort(importance, axis=1)
+    drop = order[:, : K - keep]
+    mask = np.ones_like(w_nk, dtype=bool)
+    np.put_along_axis(mask, drop, False, axis=1)
+    expected = np.where(mask, w_nk, 0.0).T  # back to [K, N]
+    np.testing.assert_array_equal(expected, w_wanda)
 
 
 def test_sparsegpt_pruning_attention_merged_weight_matches_reference_transliteration():

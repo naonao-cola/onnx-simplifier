@@ -535,24 +535,24 @@ separate Q/K/V MatMuls (already unconditionally in scope, being ordinary
 MatMul/Gemm nodes) while excluding Attention's merged one on some notion of
 "this is an attention weight, treat it specially": neither needs it.
 
-Wanda's calibrated metric, by contrast, still falls back to plain magnitude
-for ``Attention``'s merged weight, the same as it already does for any
-MatMul/Gemm layer whose activation isn't a plain 2-D tensor at the probe
-point (see :func:`apply_wanda_pruning`'s own docstring): the op's own `X`
-input is rank-3 (``[batch, seq, hidden]``), and generalizing that one check
-to reduce over leading axes (mirroring :func:`apply_sparsegpt_pruning`'s
-own ``x.reshape(-1, x.shape[-1])``) would also change the documented,
+Wanda's calibrated metric gets a narrower, Attention-specific version of the
+same treatment: the op's own `X` input is rank-3 (``[batch, seq, hidden]``),
+not the plain 2-D tensor the metric's shared probe requires, so a *generic*
+"is this activation plain 2-D" check spanning every MatMul/Gemm/Attention
+candidate would either always miss this weight (the old behavior) or --
+generalized to reduce over leading axes -- silently change the documented,
 tested fallback behavior of every *existing* MatMul/Gemm layer whose own
-activation happens to be rank 3+ (a batched-sequence input is an entirely
-ordinary shape for a plain linear layer too, not something unique to
-Attention) -- a strictly larger behavior change than this task asked for,
-and not a free one: a per-row Wanda mask computed from a 2-D activation
-reduces over the batch axis alone, while the same computation over a
-reshaped 3-D activation reduces over batch *and* sequence position, a
-different (arguably more correct, but different) statistic. Left as a
-data-free-baseline fallback rather than changed silently underfoot; a
-future pass that wants Wanda calibration for a rank-3 activation is free to
-generalize this deliberately, as its own decision.
+activation happens to be rank 3+ too (a batched-sequence input is an
+entirely ordinary shape for a plain linear layer, not something unique to
+Attention). :func:`apply_wanda_pruning` instead accumulates a *second*,
+Attention-only activation statistic alongside the generic one, gated on the
+node itself (domain + op_type -- exactly :func:`_match_attention_producer`'s
+own check, not activation shape) rather than broadening the generic check,
+and reduces that statistic over every leading axis (mirroring
+:func:`apply_sparsegpt_pruning`'s own ``x.reshape(-1, x.shape[-1])``) purely
+for this one weight. Every other MatMul/Gemm layer's own rank-3+-activation
+fallback is untouched -- the generic probe and its ``x.ndim != 2`` check
+are exactly as before.
 
 :func:`apply_sparsegpt_pruning` also matches 2-D ``Conv`` layers -- ordinary
 (``group=1``), depthwise, and general grouped alike -- using exactly the
@@ -1187,10 +1187,14 @@ def apply_wanda_pruning(
     whole input channel), how a grouped/depthwise Conv's activation norm is
     kept group-relative rather than shared across every filter
     (:func:`_conv_group_relative_norm`), which Conv attribute combinations
-    this confidently handles, and why ``Attention``'s merged weight -- whose
-    own activation input is rank-3, not the plain 2-D tensor this metric
-    requires -- always falls back to plain magnitude here rather than being
-    calibrated too -- and :func:`apply_magnitude_pruning` for the
+    this confidently handles, and how ``Attention``'s merged weight -- whose
+    own activation input is rank-3 (``[batch, seq, hidden]``), not the plain
+    2-D tensor the shared MatMul/Gemm probe requires -- gets its own,
+    separately-accumulated activation statistic (reduced over every leading
+    axis, mirroring :func:`apply_sparsegpt_pruning`'s own
+    ``x.reshape(-1, x.shape[-1])``) so it is calibrated too, without loosening
+    the plain-2-D-only check every other MatMul/Gemm layer's activation still
+    goes through -- and :func:`apply_magnitude_pruning` for the
     calibration-free baseline this upgrades.
 
     :param model: the original onnx ModelProto or file path
@@ -1220,11 +1224,12 @@ def apply_wanda_pruning(
             to the target pattern; a MatMul/Gemm layer with a non-constant
             or non-2-D weight, a Conv layer with a non-4-D weight, or any
             matched layer whose activation input isn't usable (not a plain
-            2-D tensor for MatMul/Gemm or Attention -- Attention's own
-            ``X`` input is always rank-3, so it always falls into this
-            case; not a 4-D NCHW tensor, or a Conv attribute combination
-            :func:`_conv_spatial_attrs` declines, for Conv) falls back to
-            plain magnitude pruning (no activation norm was ever observed)
+            2-D tensor for MatMul/Gemm; not a rank-2+ tensor for Attention
+            (its own ``X`` input is always rank-3 in practice, reduced over
+            every leading axis); not a 4-D NCHW tensor, or a Conv attribute
+            combination :func:`_conv_spatial_attrs` declines, for Conv)
+            falls back to plain magnitude pruning (no activation norm was
+            ever observed)
     """
     _validate_pattern(sparsity, n, m)
     if isinstance(model, str):
@@ -1260,6 +1265,26 @@ def apply_wanda_pruning(
     count: Dict[str, int] = {}
     conv_sq_sum: Dict[str, np.ndarray] = {}
     conv_count: Dict[str, int] = {}
+    # `Attention`'s merged QKV weight is the one candidate whose own `X` is
+    # *always* rank-3 (`[batch, seq, hidden]`), not the plain 2-D tensor the
+    # `sq_sum`/`act_norm` probe above requires -- so on its own it would
+    # always fall into that probe's `x.ndim != 2: continue` and fall back to
+    # plain magnitude (see this function's own docstring history). Rather
+    # than generalizing that check to reduce over leading axes for *every*
+    # candidate -- which would also silently change the already-tested
+    # fallback behavior of any ordinary MatMul/Gemm layer whose activation
+    # happens to be rank 3+ too, a strictly bigger change than this one
+    # layer type needs -- this accumulates a second, Attention-only
+    # statistic, gated on the node itself (domain + op_type, exactly
+    # :func:`_match_attention_producer`'s own check) rather than on activation
+    # shape alone, and keyed by `w_name` (mirroring the per-node Conv
+    # statistic above, and for the same reason: two Attention nodes could in
+    # principle share an `x_name`). Reduces over every leading axis via
+    # `x.reshape(-1, x.shape[-1])`, mirroring
+    # :func:`apply_sparsegpt_pruning`'s own `H` accumulation for this same
+    # weight.
+    attn_sq_sum: Dict[str, np.ndarray] = {}
+    attn_count: Dict[str, int] = {}
     for batch in calibration_data:
         result = backend.run_model(probe_model, batch, providers=providers)
         for name in probe_names:
@@ -1269,20 +1294,31 @@ def apply_wanda_pruning(
             s = np.square(x).sum(axis=0)
             sq_sum[name] = s if name not in sq_sum else sq_sum[name] + s
             count[name] = count.get(name, 0) + x.shape[0]
-        for _, x_name, w_name, _, is_conv in candidates:
-            if not is_conv:
+        for node, x_name, w_name, _, is_conv in candidates:
+            if is_conv:
+                attrs = conv_attrs[w_name]
+                if attrs is None:
+                    continue
+                x = np.asarray(result[x_name], dtype=np.float64)
+                s, cnt = _conv_patch_sq_sum(x, attrs)
+                if s is None:
+                    continue
+                conv_sq_sum[w_name] = (
+                    s if w_name not in conv_sq_sum else conv_sq_sum[w_name] + s
+                )
+                conv_count[w_name] = conv_count.get(w_name, 0) + cnt
                 continue
-            attrs = conv_attrs[w_name]
-            if attrs is None:
+            if node.domain != _ATTENTION_DOMAIN or node.op_type != "Attention":
                 continue
             x = np.asarray(result[x_name], dtype=np.float64)
-            s, cnt = _conv_patch_sq_sum(x, attrs)
-            if s is None:
+            if x.ndim < 2:
                 continue
-            conv_sq_sum[w_name] = (
-                s if w_name not in conv_sq_sum else conv_sq_sum[w_name] + s
+            x_flat = x.reshape(-1, x.shape[-1])
+            s = np.square(x_flat).sum(axis=0)
+            attn_sq_sum[w_name] = (
+                s if w_name not in attn_sq_sum else attn_sq_sum[w_name] + s
             )
-            conv_count[w_name] = conv_count.get(w_name, 0) + cnt
+            attn_count[w_name] = attn_count.get(w_name, 0) + x_flat.shape[0]
 
     act_norm: Dict[str, np.ndarray] = {
         name: np.sqrt(s / max(count[name], 1)) for name, s in sq_sum.items()
@@ -1290,6 +1326,9 @@ def apply_wanda_pruning(
     conv_act_norm: Dict[str, np.ndarray] = {
         name: np.sqrt(s / max(conv_count[name], 1)).reshape(-1)
         for name, s in conv_sq_sum.items()
+    }
+    attn_act_norm: Dict[str, np.ndarray] = {
+        name: np.sqrt(s / max(attn_count[name], 1)) for name, s in attn_sq_sum.items()
     }
 
     for node, x_name, w_name, weight_transposed, is_conv in candidates:
@@ -1313,6 +1352,12 @@ def apply_wanda_pruning(
                 norm = _conv_group_relative_norm(
                     flat_norm, cout, cin_per_group, kh, kw, _conv_group(node)
                 )
+        elif node.domain == _ATTENTION_DOMAIN and node.op_type == "Attention":
+            # See the `attn_sq_sum` accumulation above: this weight's own
+            # activation is the rank-3 `X` reduced over leading axes, keyed
+            # by `w_name` rather than `x_name`.
+            norm_flat = attn_act_norm.get(w_name)
+            norm = norm_flat[np.newaxis, :] if norm_flat is not None else None
         else:
             norm_flat = act_norm.get(x_name)
             norm = norm_flat[np.newaxis, :] if norm_flat is not None else None
