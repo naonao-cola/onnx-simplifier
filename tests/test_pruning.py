@@ -10470,6 +10470,407 @@ def test_gqa_pruning_l1_norm_favors_total_magnitude():
     np.testing.assert_allclose(y_l1, y_oracle_l1, rtol=1e-4, atol=1e-4)
 
 
+# --- apply_attention_head_pruning / _wanda_pruning -- GroupQueryAttention,
+# packed-QKV-then-Split --
+#
+# A single packed MatMul/Gemm projection feeding a `Split` whose three
+# outputs are wired directly into `GroupQueryAttention`'s own three
+# separate, still non-empty, query/key/value inputs -- confirmed a real
+# onnxruntime-genai model-builder export shape (its fused Q/K-norm GQA
+# path), not merely a hypothetical one -- see
+# :func:`onnxsim.pruning._match_packed_qkv_split`'s own docstring for the
+# exact topology and the export code path that produces it, and this
+# module's "Attention-head pruning" section comment for how it differs from
+# `GroupQueryAttention`'s own unrelated, still-declined, schema-level
+# packed-`query`-input convention.
+
+
+def _gqa_packed_model(
+    K=8,
+    H=4,
+    KVH=2,
+    D=8,
+    Out=6,
+    seed=0,
+    batch=2,
+    seq=5,
+    bias=False,
+    wqkv=None,
+    bqkv=None,
+    wout=None,
+    split_sizes=None,
+    split_axis=-1,
+    split_outputs=("q", "k", "v"),
+    gqa_inputs=None,
+):
+    # Mirrors `_gqa_model`'s own scaffolding (SeqLensK/TotalSeq bookkeeping
+    # inputs; no past_kv/scale support -- not needed by any packed-QKV test
+    # below) but replaces its three independent Wq/Wk/Wv MatMul/Gemm
+    # producers with one packed MatMul/Gemm producer feeding a `Split`
+    # node -- see this section's own comment above.
+    rng = np.random.default_rng(seed)
+    Nq, Nkv = H * D, KVH * D
+    if wqkv is None:
+        wqkv = rng.standard_normal((K, Nq + 2 * Nkv)).astype(np.float32)
+    if wout is None:
+        wout = rng.standard_normal((Nq, Out)).astype(np.float32)
+
+    initializer = [_f32(wqkv, "Wqkv"), _f32(wout, "Wout")]
+    qkv_op = "MatMul(X, Wqkv)"
+    if bias:
+        if bqkv is None:
+            bqkv = rng.standard_normal((Nq + 2 * Nkv,)).astype(np.float32)
+        initializer.append(_f32(bqkv, "Bqkv"))
+        qkv_op = "Gemm(X, Wqkv, Bqkv)"
+
+    if split_sizes is None:
+        split_sizes = [Nq, Nkv, Nkv]
+    initializer.append(
+        onnx.numpy_helper.from_array(
+            np.array(split_sizes, dtype=np.int64), "SplitSizes"
+        )
+    )
+
+    # No past_kv connected here, so `total_seq == seq` -- the same no-cache
+    # case `_gqa_model`'s own default (`past_kv=None`) synthesizes.
+    initializer.append(
+        onnx.numpy_helper.from_array(
+            np.full((batch,), seq - 1, dtype=np.int32), "SeqLensK"
+        )
+    )
+    initializer.append(
+        onnx.numpy_helper.from_array(np.array(seq, dtype=np.int32), "TotalSeq")
+    )
+
+    if gqa_inputs is None:
+        gqa_inputs = split_outputs
+    split_out = ", ".join(split_outputs)
+    gqa_q, gqa_k, gqa_v = gqa_inputs
+
+    body = f"""
+        g (float[{batch},{seq},{K}] X) => (float[{batch},{seq},{Out}] Y)
+        {{
+          qkv = {qkv_op}
+          {split_out} = Split <axis = {split_axis}> (qkv, SplitSizes)
+          ctx, pk, pv = com.microsoft.GroupQueryAttention <num_heads={H}, kv_num_heads={KVH}> ({gqa_q}, {gqa_k}, {gqa_v}, , , SeqLensK, TotalSeq)
+          Y = MatMul(ctx, Wout)
+        }}
+        """
+
+    model = parser.parse_model(
+        f"""
+        <
+          ir_version: 10,
+          opset_import: ["": 17, "com.microsoft": 1]
+        >
+        {body}
+        """
+    )
+    model.graph.initializer.extend(initializer)
+    return model, dict(
+        K=K,
+        H=H,
+        KVH=KVH,
+        D=D,
+        Out=Out,
+        Nq=Nq,
+        Nkv=Nkv,
+        wqkv=wqkv,
+        bqkv=bqkv,
+        wout=wout,
+        batch=batch,
+        seq=seq,
+    )
+
+
+def test_gqa_packed_qkv_split_pruning_matches_oracle_exactly():
+    # Q's/K's/V's "own weight" is really one shared packed tensor here,
+    # sliced once by a combined index set, with the `Split`'s own
+    # split-sizes constant shrunk to match -- verified both directly
+    # against a hand-sliced expectation and end-to-end against a real
+    # onnxruntime execution of an independently-built oracle model (the
+    # ordinary three-separate-producer `_gqa_model`, the same ground truth
+    # `test_gqa_pruning_matches_oracle_exactly` uses above).
+    K, H, KVH, D, Out = 8, 8, 2, 8, 6
+    model, cfg = _gqa_packed_model(K=K, H=H, KVH=KVH, D=D, Out=Out, seed=1)
+    assert len(onnxsim.pruning._find_gqa_chains(model.graph)) == 1
+
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    node = _gqa_node(pruned)
+    num_heads, kv_num_heads = _gqa_attrs(node)
+    group_size = H // KVH
+    assert kv_num_heads == 1  # max(1, 2 - round(2*0.5))
+    assert num_heads == kv_num_heads * group_size
+
+    Nq, Nkv = cfg["Nq"], cfg["Nkv"]
+    wqkv = cfg["wqkv"]
+    wq, wk, wv = wqkv[:, :Nq], wqkv[:, Nq : Nq + Nkv], wqkv[:, Nq + Nkv :]
+
+    keep_groups = _oracle_keep_groups(wq, wk, wv, H, KVH, D, kv_num_heads)
+    keep_q_heads = _group_q_heads(keep_groups, group_size)
+    q_idx, kv_idx = _head_idx(keep_q_heads, D), _head_idx(keep_groups, D)
+
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    expected_wqkv = np.concatenate([wq[:, q_idx], wk[:, kv_idx], wv[:, kv_idx]], axis=1)
+    np.testing.assert_array_equal(inits["Wqkv"], expected_wqkv)
+    np.testing.assert_array_equal(
+        inits["SplitSizes"],
+        np.array([len(q_idx), len(kv_idx), len(kv_idx)], dtype=np.int64),
+    )
+
+    oracle, _ = _gqa_model(
+        K=K,
+        H=num_heads,
+        KVH=kv_num_heads,
+        D=D,
+        Out=Out,
+        seed=1,
+        wq=wq[:, q_idx],
+        wk=wk[:, kv_idx],
+        wv=wv[:, kv_idx],
+        wout=cfg["wout"][q_idx, :],
+        batch=cfg["batch"],
+        seq=cfg["seq"],
+    )
+
+    rng = np.random.default_rng(2)
+    x = rng.standard_normal((cfg["batch"], cfg["seq"], K)).astype(np.float32)
+    (y_pruned,) = _run(pruned, {"X": x})
+    (y_oracle,) = _run(oracle, {"X": x})
+    np.testing.assert_allclose(y_pruned, y_oracle, rtol=1e-4, atol=1e-4)
+
+
+def test_gqa_packed_qkv_split_pruning_zero_sparsity_is_a_no_op():
+    model, cfg = _gqa_packed_model(K=8, H=8, KVH=2, D=8, Out=6, seed=7)
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.0)
+    node = _gqa_node(pruned)
+    num_heads, kv_num_heads = _gqa_attrs(node)
+    assert num_heads == cfg["H"]
+    assert kv_num_heads == cfg["KVH"]
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    np.testing.assert_array_equal(inits["Wqkv"], cfg["wqkv"])
+    np.testing.assert_array_equal(
+        inits["SplitSizes"],
+        np.array([cfg["Nq"], cfg["Nkv"], cfg["Nkv"]], dtype=np.int64),
+    )
+
+
+def test_gqa_packed_qkv_split_pruning_slices_packed_bias():
+    # Same reasoning as `test_gqa_pruning_slices_bias_when_producer_has_one`:
+    # a bias-carrying Gemm producer -- here, the single packed Gemm feeding
+    # the `Split` -- can't sit directly ahead of a rank-3 input in a graph
+    # meant to actually run through onnxruntime (Gemm's own schema requires
+    # a rank-2 `A`), so this exercises the packed-bias-slicing path
+    # directly against the initializers instead.
+    K, H, KVH, D, Out = 8, 4, 2, 8, 6
+    model, cfg = _gqa_packed_model(K=K, H=H, KVH=KVH, D=D, Out=Out, seed=14, bias=True)
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+
+    node = _gqa_node(pruned)
+    num_heads, kv_num_heads = _gqa_attrs(node)
+    group_size = H // KVH
+    assert kv_num_heads == 1
+    assert num_heads == group_size
+
+    Nq, Nkv = cfg["Nq"], cfg["Nkv"]
+    wqkv, bqkv = cfg["wqkv"], cfg["bqkv"]
+    wq, wk, wv = wqkv[:, :Nq], wqkv[:, Nq : Nq + Nkv], wqkv[:, Nq + Nkv :]
+    bq, bk, bv = bqkv[:Nq], bqkv[Nq : Nq + Nkv], bqkv[Nq + Nkv :]
+
+    keep_groups = _oracle_keep_groups(wq, wk, wv, H, KVH, D, kv_num_heads)
+    keep_q_heads = _group_q_heads(keep_groups, group_size)
+    q_idx, kv_idx = _head_idx(keep_q_heads, D), _head_idx(keep_groups, D)
+
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    expected_wqkv = np.concatenate([wq[:, q_idx], wk[:, kv_idx], wv[:, kv_idx]], axis=1)
+    expected_bqkv = np.concatenate([bq[q_idx], bk[kv_idx], bv[kv_idx]])
+    np.testing.assert_array_equal(inits["Wqkv"], expected_wqkv)
+    np.testing.assert_array_equal(inits["Bqkv"], expected_bqkv)
+    np.testing.assert_array_equal(
+        inits["SplitSizes"],
+        np.array([len(q_idx), len(kv_idx), len(kv_idx)], dtype=np.int64),
+    )
+
+
+def test_gqa_wanda_packed_qkv_split_pruning_matches_oracle_exactly():
+    K, H, KVH, D, Out = 8, 8, 2, 8, 6
+    model, cfg = _gqa_packed_model(K=K, H=H, KVH=KVH, D=D, Out=Out, seed=8)
+
+    rng = np.random.default_rng(9)
+    x_cal = rng.standard_normal((cfg["batch"], cfg["seq"], K)).astype(np.float32)
+    calibration_data = [{"X": x_cal}]
+
+    pruned = onnxsim.apply_attention_head_wanda_pruning(
+        model, calibration_data=calibration_data, sparsity=0.5
+    )
+    onnx.checker.check_model(pruned)
+
+    probe_model = onnx.ModelProto()
+    probe_model.CopyFrom(model)
+    probe_model.graph.output.append(onnx.ValueInfoProto(name="ctx"))
+    (_, ctx_cal) = _run(probe_model, {"X": x_cal})
+    act_norm = np.sqrt(np.mean(np.square(ctx_cal.astype(np.float64)), axis=(0, 1)))
+
+    Nq, Nkv = cfg["Nq"], cfg["Nkv"]
+    wqkv = cfg["wqkv"]
+    wq, wk, wv = wqkv[:, :Nq], wqkv[:, Nq : Nq + Nkv], wqkv[:, Nq + Nkv :]
+
+    group_size = H // KVH
+    importance = np.zeros(KVH)
+    for kv in range(KVH):
+        q_block = np.concatenate(
+            [
+                wq[:, h * D : (h + 1) * D]
+                for h in range(kv * group_size, (kv + 1) * group_size)
+            ],
+            axis=1,
+        )
+        k_block = wk[:, kv * D : (kv + 1) * D]
+        v_block = wv[:, kv * D : (kv + 1) * D]
+        base = np.linalg.norm(np.concatenate([q_block, k_block, v_block], axis=1))
+        act_group = np.linalg.norm(
+            act_norm[kv * group_size * D : (kv + 1) * group_size * D]
+        )
+        importance[kv] = base * max(act_group, 1e-8)
+    keep_groups = np.sort(np.argsort(-importance)[:1])  # max(1, 2 - round(2*0.5)) == 1
+
+    keep_q_heads = _group_q_heads(keep_groups, group_size)
+    q_idx, kv_idx = _head_idx(keep_q_heads, D), _head_idx(keep_groups, D)
+
+    oracle, _ = _gqa_model(
+        K=K,
+        H=len(keep_q_heads),
+        KVH=len(keep_groups),
+        D=D,
+        Out=Out,
+        seed=8,
+        wq=wq[:, q_idx],
+        wk=wk[:, kv_idx],
+        wv=wv[:, kv_idx],
+        wout=cfg["wout"][q_idx, :],
+        batch=cfg["batch"],
+        seq=cfg["seq"],
+    )
+
+    x = rng.standard_normal((cfg["batch"], cfg["seq"], K)).astype(np.float32)
+    (y_pruned,) = _run(pruned, {"X": x})
+    (y_oracle,) = _run(oracle, {"X": x})
+    np.testing.assert_allclose(y_pruned, y_oracle, rtol=1e-4, atol=1e-4)
+
+
+def test_gqa_packed_qkv_split_wrong_output_order_is_declined():
+    # Adversarial: a `Split` whose own three OUTPUTS aren't literally in
+    # Q-then-K-then-V order (here: K's own range comes out of the `Split`
+    # first) is declined outright by `_match_packed_qkv_split`'s own
+    # ``list(node.output) == [q_name, k_name, v_name]`` check, rather than
+    # a naive offset-by-position implementation (assume output 0 is always
+    # Q) mis-slicing K's own column range into Q's or vice versa.
+    # `GroupQueryAttention` itself is fed `(q_out, k_out, v_out)` --
+    # `Split`'s own *second* output as `query`, its *first* as `key` -- so
+    # semantically this is a valid (if unusual) GQA graph with Q and K
+    # simply swapped, not a malformed one; this pass just can't safely
+    # rewrite it, and leaves it completely untouched rather than guessing.
+    K, H, KVH, D, Out = 8, 4, 2, 8, 6
+    model, cfg = _gqa_packed_model(
+        K=K,
+        H=H,
+        KVH=KVH,
+        D=D,
+        Out=Out,
+        seed=21,
+        split_outputs=("k_out", "q_out", "v_out"),
+        gqa_inputs=("q_out", "k_out", "v_out"),
+    )
+
+    assert onnxsim.pruning._find_gqa_chains(model.graph) == []
+
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    assert pruned.SerializeToString() == model.SerializeToString()
+
+
+def test_gqa_packed_qkv_split_mismatched_total_width_is_declined():
+    # The `Split`'s own `SplitSizes` sums to one column short of the packed
+    # projection's own real output width -- `_match_packed_qkv_split`'s own
+    # ``n_channels != nq + nk + nv`` check declines this rather than
+    # pruning against a split-sizes total that doesn't actually describe
+    # the packed weight's own shape.
+    K, H, KVH, D, Out = 8, 4, 2, 8, 6
+    model, cfg = _gqa_packed_model(
+        K=K,
+        H=H,
+        KVH=KVH,
+        D=D,
+        Out=Out,
+        seed=23,
+        split_sizes=[H * D, KVH * D, KVH * D - 1],
+    )
+
+    assert onnxsim.pruning._find_gqa_chains(model.graph) == []
+
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    assert pruned.SerializeToString() == model.SerializeToString()
+
+
+def test_gqa_native_packed_query_convention_still_declined():
+    # `GroupQueryAttention`'s own SCHEMA (not this pass) has its own,
+    # different packed-input convention: the whole packed Q/K/V tensor
+    # passed as `query` itself, with `key`/`value` left empty -- confirmed
+    # via live schema introspection
+    # (``onnxruntime.capi.onnxruntime_pybind11_state.get_all_operator_schema()``,
+    # `query`'s own doc string: "Query with shape (batch_size,
+    # sequence_length, hidden_size), or packed QKV with shape (batch_size,
+    # sequence_length, d)"; see this module's own "Attention-head pruning"
+    # section comment). This is a different tensor layout from the
+    # MatMul-then-Split-into-three-separate-inputs shape
+    # `_match_packed_qkv_split` matches above (this model has no `Split`
+    # node at all), and `_match_gqa_producer` has always declined it
+    # outright, via its own ``not (node.input[0] and node.input[1] and
+    # node.input[2])`` check -- confirmed here still holds, unmodified by
+    # this module's new packed-`Split` support.
+    K, H, KVH, D, Out = 8, 4, 2, 8, 6
+    Nq, Nkv = H * D, KVH * D
+    rng = np.random.default_rng(22)
+    wqkv = rng.standard_normal((K, Nq + 2 * Nkv)).astype(np.float32)
+    wout = rng.standard_normal((Nq, Out)).astype(np.float32)
+    batch, seq = 2, 5
+
+    initializer = [_f32(wqkv, "Wqkv"), _f32(wout, "Wout")]
+    initializer.append(
+        onnx.numpy_helper.from_array(
+            np.full((batch,), seq - 1, dtype=np.int32), "SeqLensK"
+        )
+    )
+    initializer.append(
+        onnx.numpy_helper.from_array(np.array(seq, dtype=np.int32), "TotalSeq")
+    )
+
+    body = f"""
+        g (float[{batch},{seq},{K}] X) => (float[{batch},{seq},{Out}] Y)
+        {{
+          qkv = MatMul(X, Wqkv)
+          ctx, pk, pv = com.microsoft.GroupQueryAttention <num_heads={H}, kv_num_heads={KVH}> (qkv, , , , , SeqLensK, TotalSeq)
+          Y = MatMul(ctx, Wout)
+        }}
+        """
+    model = parser.parse_model(
+        f"""
+        <
+          ir_version: 10,
+          opset_import: ["": 17, "com.microsoft": 1]
+        >
+        {body}
+        """
+    )
+    model.graph.initializer.extend(initializer)
+
+    assert onnxsim.pruning._find_gqa_chains(model.graph) == []
+
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    assert pruned.SerializeToString() == model.SerializeToString()
+
+
 def test_structured_pruning_importance_norm_l2_is_the_unchanged_default():
     model, wg, wu, wd = _swiglu_mlp_model(K=8, H=16, Out=4, seed=30)
     default = onnxsim.apply_structured_pruning(model, sparsity=0.5)
