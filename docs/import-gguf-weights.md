@@ -27,9 +27,15 @@ model, skipped = onnxsim.import_gguf_weights(model, "model.gguf")
 onnx.save(model, "qwen3_hydrated.onnx")
 ```
 
-`skipped` lists GGUF tensors present in the file whose quantized format has
-no decoder here (see "Scope" below) -- **not** tensors simply absent from
-`model`'s initializers, which are silently left alone.
+`skipped` lists GGUF tensors present in the file that a same-named
+initializer in `model` could not actually be hydrated from -- either the
+GGUF tensor's quantized format has no decoder here (see "Scope" below), or
+the file's tensor decodes to a different byte count than `model`'s
+initializer declares (dtype x dims), e.g. a placeholder built for the wrong
+shape. Either way the initializer keeps its original value rather than
+being overwritten with bytes that don't fit its declared shape. This does
+**not** include tensors simply absent from `model`'s initializers, which
+are silently left alone.
 
 ## GGML "K-quant" support
 
@@ -66,16 +72,57 @@ Only an initializer whose *name* matches a GGUF tensor is ever touched;
 `import_gguf_weights` never adds new initializers or otherwise changes the
 graph's structure.
 
+## Mixture-of-experts (MoE) checkpoints
+
+llama.cpp's own GGUF convention for a MoE model's per-expert feed-forward
+weights lines up with `com.microsoft.MoE`'s layout without any extra work,
+for the three families checked (Mixtral, Qwen3-MoE, gpt-oss): the tensors
+are named `blk.N.ffn_gate_exps.weight` / `blk.N.ffn_up_exps.weight` /
+`blk.N.ffn_down_exps.weight` (gate=`fc1_experts_weights`, up=
+`fc3_experts_weights`, down=`fc2_experts_weights` -- see
+`contrib_schemas.cpp`'s `BuildMoEFunctionBody` comment for that naming) and
+`blk.N.ffn_gate_inp.weight` for the router. Their GGML shapes, reversed by
+this function's existing (rank-agnostic) `ne[]`-order rule, land exactly on
+`com.microsoft.MoE`'s own `fc1_experts_weights`/`fc2_experts_weights`/
+`fc3_experts_weights` shapes -- no additional transpose needed, because
+GGML's per-expert matrix already uses the same `[in, out]` convention as an
+ordinary 2D linear weight (which this function already round-trips
+correctly), just with an extra leading expert axis. K-quant blocks apply to
+the flattened element stream regardless of tensor rank, so the existing
+decoder needs no MoE-specific change either -- see
+`tests/test_import_gguf_weights.py`'s
+`test_import_gguf_weights_hydrates_a_moe_node_with_llama_cpp_names` for an
+end-to-end round trip through a real `com.microsoft.MoE` node.
+
+Two real gaps remain, both reported via `skipped` (or simply absent from
+the model, in the second case) rather than silently mishandled:
+- Official gpt-oss GGUF releases quantize expert weights as **MXFP4**, not
+  one of the K-quant formats this decoder implements.
+- Some newer llama.cpp architectures fuse the gate and up projections into
+  one `ffn_gate_up_exps` tensor instead of two separate ones -- there is no
+  1:1 initializer to hydrate that into (the same fused-layout gap
+  `swiglu_fusion` has in the reference decomposition itself).
+
 ## Why not reconstruct the whole model from the GGUF file?
 
-A `.gguf` LLM checkpoint's metadata (layer count, hidden size, attention/RoPE
+For an arbitrary architecture, this is out of scope: a `.gguf` LLM
+checkpoint's metadata (layer count, hidden size, attention/RoPE
 configuration, ...) describes a llama.cpp-runtime model, not an ONNX
-computation graph -- there is no `Add`/`MatMul`/`Attention` node structure to
-extract. Building one from scratch for an arbitrary architecture is a much
-larger undertaking (closer to a dedicated GGUF-to-ONNX exporter) than
-onnxsim's scope here: `import_gguf_weights` solves the narrower, immediately
-useful problem of getting a checkpoint's *weight values* into a graph you
-already have.
+computation graph, and there is no generic way to recover an `Add`/`MatMul`/
+`Attention` node structure from it for architectures nobody has written a
+template for. `import_gguf_weights` solves the narrower, always-applicable
+problem of getting a checkpoint's *weight values* into a graph you already
+have, regardless of architecture.
+
+`onnxsim.reconstruct_gguf_graph` (see `onnxsim/gguf_reconstruct.py`) takes
+the other approach for a small, curated set of recognized architectures --
+currently the Llama family (`llama`, `qwen2`, `mistral`, which share the
+same RMSNorm/RoPE/GQA/SwiGLU block shape): it builds the graph itself from
+the checkpoint's declared hyperparameters, then calls
+`import_gguf_weights` internally to hydrate it. No MoE architecture has a
+template there yet -- the "MoE checkpoints" section above is about
+`import_gguf_weights` alone, for a MoE graph you already built or exported
+some other way.
 
 ## Tests
 
@@ -85,4 +132,7 @@ files containing hand-encoded `Q8_0`/`Q4_K` blocks with known values
 decoder under test) and checks `import_gguf_weights`' decoded result against
 them, plus coverage for multi-dimensional shapes (GGML's
 innermost-dimension-first `ne[]` vs ONNX's outermost-first shape), the
-unsupported/unmatched skip list, and raw-dtype passthrough.
+unsupported/unmatched skip list, raw-dtype passthrough, a real 3D
+expert-tensor round trip under llama.cpp's own MoE naming convention (see
+the "Mixture-of-experts" section above), and a shape-mismatched tensor
+ending up in `skipped` with its initializer's original value intact.

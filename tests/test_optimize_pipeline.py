@@ -150,6 +150,80 @@ def test_pipeline_without_pruning_skips_structured_pruning_stage():
     assert "structured_pruning" not in result.stages_applied
 
 
+def _attention_pipeline_model(K=8, H=4, D=4, Out=6, seed=0):
+    # A single fused com.microsoft::Attention block (merged QKV weight)
+    # feeding a plain MatMul output projection -- attention_sparsity's own
+    # target topology, distinct from _conv_and_gemm_model/_gemm_model's
+    # plain MatMul/Conv chains that ``sparsity`` targets.
+    rng = np.random.default_rng(seed)
+    nq = nk = nv = H * D
+    wqkv = rng.standard_normal((K, nq + nk + nv)).astype(np.float32) * 0.5
+    bqkv = rng.standard_normal((nq + nk + nv,)).astype(np.float32) * 0.1
+    wout = rng.standard_normal((nv, Out)).astype(np.float32) * 0.5
+    model = parser.parse_model(
+        f"""
+        <
+          ir_version: 10,
+          opset_import: ["": 17, "com.microsoft": 1]
+        >
+        g (float[batch,seq,{K}] X) => (float[batch,seq,{Out}] Y)
+        {{
+          ctx = com.microsoft.Attention <num_heads={H}, qkv_hidden_sizes=[{nq},{nk},{nv}]> (X, Wqkv, Bqkv)
+          Y = MatMul(ctx, Wout)
+        }}
+        """
+    )
+    model.graph.initializer.extend(
+        [_f32(wqkv, "Wqkv"), _f32(bqkv, "Bqkv"), _f32(wout, "Wout")]
+    )
+    return model
+
+
+def test_pipeline_with_attention_sparsity_applies_attention_head_pruning_stage():
+    model = _attention_pipeline_model(seed=24)
+    rng = np.random.default_rng(25)
+    calibration_data = [{"X": rng.standard_normal((2, 5, 8)).astype(np.float32)}]
+
+    result = onnxsim.apply_optimization_pipeline(
+        model,
+        accuracy_budget=1.0,
+        calibration_data=calibration_data,
+        attention_sparsity=0.5,
+    )
+    assert result.stages_applied[0] == "attention_head_pruning"
+    onnx.checker.check_model(result.optimized_model)
+
+
+def test_pipeline_without_attention_sparsity_skips_attention_head_pruning_stage():
+    model = _attention_pipeline_model(seed=26)
+    rng = np.random.default_rng(27)
+    calibration_data = [{"X": rng.standard_normal((2, 5, 8)).astype(np.float32)}]
+
+    result = onnxsim.apply_optimization_pipeline(
+        model, accuracy_budget=1.0, calibration_data=calibration_data
+    )
+    assert "attention_head_pruning" not in result.stages_applied
+
+
+def test_pipeline_applies_both_pruning_sub_stages_independently():
+    model = _attention_pipeline_model(seed=28)
+    rng = np.random.default_rng(29)
+    calibration_data = [{"X": rng.standard_normal((2, 5, 8)).astype(np.float32)}]
+
+    result = onnxsim.apply_optimization_pipeline(
+        model,
+        accuracy_budget=1.0,
+        calibration_data=calibration_data,
+        attention_sparsity=0.5,
+        sparsity=0.25,
+    )
+    assert result.stages_applied[:2] == [
+        "attention_head_pruning",
+        "structured_pruning",
+    ]
+    onnx.checker.check_model(result.optimized_model)
+
+
 def test_pipeline_mixed_precision_bit_selection():
     model = _gemm_model(seed=15)
     rng = np.random.default_rng(16)

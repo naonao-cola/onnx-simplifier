@@ -145,13 +145,16 @@ def _identity_model(name, shape):
     # A minimal single-initializer graph: Identity(W) -> Y, with W the
     # initializer import_gguf_weights should hydrate. Seeded with zeros so a
     # test failing to actually hydrate is caught (not accidentally correct).
+    # `name` is always quoted since a real llama.cpp GGUF tensor name (e.g.
+    # "blk.0.ffn_gate_exps.weight") contains dots the text format's plain
+    # (unquoted) identifier syntax doesn't accept as a node input.
     dims = ",".join(str(d) for d in shape)
     weight = onnx.numpy_helper.from_array(np.zeros(shape, dtype=np.float32), name)
     return _model(
         f"""
         g () => (float[{dims}] Y)
         {{
-          Y = Identity({name})
+          Y = Identity("{name}")
         }}
         """,
         initializer=[weight],
@@ -260,6 +263,188 @@ def test_import_raw_dtype_passthrough(tmp_path):
     w = next(i for i in result.graph.initializer if i.name == "W")
     got = onnx.numpy_helper.to_array(w)
     np.testing.assert_array_equal(got, values)
+
+
+def test_import_skips_shape_mismatched_tensor(tmp_path):
+    # The C++ side decodes/copies purely from the GGUF entry's own shape,
+    # with no awareness of the target initializer's declared dims (see
+    # onnx_simplifier.py's import_gguf_weights, `_tensor_proto_nbytes`) --
+    # so a same-named match whose decoded byte count doesn't fit the
+    # initializer's declared shape (here: the file's "W" is 8 raw floats,
+    # but the graph declares W as shape [32], i.e. 32 floats) must be
+    # reported in `skipped` and leave the initializer untouched, rather
+    # than silently writing a too-short raw_data into a [32]-shaped
+    # initializer.
+    rng = np.random.default_rng(7)
+    values = rng.standard_normal(8).astype(np.float32)
+    gguf_path = str(tmp_path / "model.gguf")
+    _write_gguf(gguf_path, [("W", GGML_TYPE_F32, [8], values.astype("<f4").tobytes())])
+
+    model = _identity_model("W", [32])
+    result, skipped = onnxsim.import_gguf_weights(model, gguf_path)
+
+    assert skipped == ["W"]
+    w = next(i for i in result.graph.initializer if i.name == "W")
+    assert list(w.dims) == [32]
+    got = onnx.numpy_helper.to_array(w)
+    np.testing.assert_array_equal(got, np.zeros(32, dtype=np.float32))
+
+
+def test_import_moe_expert_tensor_3d_matches_llama_cpp_layout(tmp_path):
+    # llama.cpp's own GGUF convention for a MoE model's per-expert gate
+    # projection is a single 3D tensor named "blk.N.ffn_gate_exps.weight"
+    # (fc1 in com.microsoft.MoE's own naming -- see contrib_schemas.cpp),
+    # GGML shape (ne, innermost-first) [hidden, inter, num_experts].
+    # Reversing that (onnxsim's existing, rank-agnostic rule) gives ONNX
+    # shape [num_experts, inter, hidden] -- exactly com.microsoft.MoE's
+    # fc1_experts_weights layout, with no extra transpose needed. This is a
+    # real 3D, multi-block round trip (4 Q8_0 blocks spanning the
+    # expert/intermediate axes), unlike the rank-1/2 cases the rest of this
+    # file covers.
+    num_experts, inter, hidden = 2, 2, 32
+    rng = np.random.default_rng(8)
+    blocks = [_make_q8_0_block(rng) for _ in range(num_experts * inter)]
+    raw = b"".join(b for b, _ in blocks)
+
+    gguf_path = str(tmp_path / "model.gguf")
+    name = "blk.0.ffn_gate_exps.weight"
+    _write_gguf(gguf_path, [(name, GGML_TYPE_Q8_0, [hidden, inter, num_experts], raw)])
+
+    model = _identity_model(name, [num_experts, inter, hidden])
+    result, skipped = onnxsim.import_gguf_weights(model, gguf_path)
+
+    assert skipped == []
+    w = next(i for i in result.graph.initializer if i.name == name)
+    assert list(w.dims) == [num_experts, inter, hidden]
+    got = onnx.numpy_helper.to_array(w)
+
+    # Spot-check real 3D indexing (not just the flattened order): expert e's
+    # block i should land at got[e, i, :], in GGML's flattening order.
+    for e in range(num_experts):
+        for i in range(inter):
+            _, block_expected = blocks[e * inter + i]
+            np.testing.assert_allclose(
+                got[e, i, :], np.array(block_expected, dtype=np.float32), rtol=1e-5
+            )
+
+
+def test_import_gguf_weights_hydrates_a_moe_node_with_llama_cpp_names(tmp_path):
+    # End-to-end: a com.microsoft.MoE node whose fc1/fc2/fc3 initializers
+    # are named exactly the way llama.cpp's own GGUF export names a real
+    # Mixtral/Qwen3-MoE/gpt-oss checkpoint's expert weights (gate=fc1,
+    # up=fc3, down=fc2 -- see contrib_schemas.cpp's BuildMoEFunctionBody
+    # comment) hydrates correctly from a real GGUF file, and the resulting
+    # model still passes onnxsim.simplify()'s shape inference -- tying
+    # import_gguf_weights and the MoE schema registration together, the
+    # concrete case docs/import-gguf-weights.md's compatibility note is
+    # about.
+    num_experts, inter, hidden = 2, 2, 32
+
+    def make_tensor(seed_offset):
+        r = np.random.default_rng(9 + seed_offset)
+        blocks = [_make_q8_0_block(r) for _ in range(num_experts * inter)]
+        raw = b"".join(b for b, _ in blocks)
+        expected = np.array([v for _, vals in blocks for v in vals], dtype=np.float32)
+        return raw, expected
+
+    gate_raw, gate_expected = make_tensor(1)
+    up_raw, up_expected = make_tensor(2)
+    down_raw, down_expected = make_tensor(3)
+
+    gguf_path = str(tmp_path / "model.gguf")
+    _write_gguf(
+        gguf_path,
+        [
+            (
+                "blk.0.ffn_gate_exps.weight",
+                GGML_TYPE_Q8_0,
+                [hidden, inter, num_experts],
+                gate_raw,
+            ),
+            (
+                "blk.0.ffn_up_exps.weight",
+                GGML_TYPE_Q8_0,
+                [hidden, inter, num_experts],
+                up_raw,
+            ),
+            (
+                "blk.0.ffn_down_exps.weight",
+                GGML_TYPE_Q8_0,
+                [inter, hidden, num_experts],
+                down_raw,
+            ),
+        ],
+    )
+
+    num_tokens = 4
+    # com.microsoft.MoE needs its own opset_import entry, which this file's
+    # shared `_model` helper (only "" domain) doesn't provide -- built
+    # directly, the same way tests/test_moe_contrib_schema.py's own `_model`
+    # helper does.
+    model = parser.parse_model(
+        f"""
+        <
+          ir_version: 10,
+          opset_import: ["": 18, "com.microsoft": 1]
+        >
+        agraph (float[{num_tokens},{hidden}] input,
+                float[{num_tokens},{num_experts}] router_probs)
+              => (float[?,?] output)
+        {{
+          output = com.microsoft.MoE
+              <k: int = 1, activation_type: string = "silu",
+               normalize_routing_weights: int = 0>
+              (input, router_probs, "blk.0.ffn_gate_exps.weight", ,
+               "blk.0.ffn_down_exps.weight", , "blk.0.ffn_up_exps.weight")
+        }}
+        """
+    )
+    model.graph.initializer.extend(
+        [
+            onnx.numpy_helper.from_array(
+                np.zeros((num_experts, inter, hidden), dtype=np.float32),
+                "blk.0.ffn_gate_exps.weight",
+            ),
+            onnx.numpy_helper.from_array(
+                np.zeros((num_experts, hidden, inter), dtype=np.float32),
+                "blk.0.ffn_down_exps.weight",
+            ),
+            onnx.numpy_helper.from_array(
+                np.zeros((num_experts, inter, hidden), dtype=np.float32),
+                "blk.0.ffn_up_exps.weight",
+            ),
+        ]
+    )
+
+    result, skipped = onnxsim.import_gguf_weights(model, gguf_path)
+    assert skipped == []
+
+    by_name = {i.name: i for i in result.graph.initializer}
+    np.testing.assert_allclose(
+        onnx.numpy_helper.to_array(by_name["blk.0.ffn_gate_exps.weight"]).reshape(-1),
+        gate_expected,
+        rtol=1e-5,
+    )
+    np.testing.assert_allclose(
+        onnx.numpy_helper.to_array(by_name["blk.0.ffn_up_exps.weight"]).reshape(-1),
+        up_expected,
+        rtol=1e-5,
+    )
+    np.testing.assert_allclose(
+        onnx.numpy_helper.to_array(by_name["blk.0.ffn_down_exps.weight"]).reshape(-1),
+        down_expected,
+        rtol=1e-5,
+    )
+
+    simplified, ok = onnxsim.simplify(
+        result, check_n=0, perform_optimization=False, skip_constant_folding=True
+    )
+    assert ok
+    out_shape = simplified.graph.output[0].type.tensor_type.shape
+    dims = [
+        d.dim_value if d.HasField("dim_value") else d.dim_param for d in out_shape.dim
+    ]
+    assert dims == [num_tokens, hidden]
 
 
 def test_import_leaves_input_model_unchanged_and_preserves_unmatched(tmp_path):

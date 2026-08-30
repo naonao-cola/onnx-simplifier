@@ -604,6 +604,21 @@ def import_gguf(in_path: str) -> onnx.ModelProto:
     return model
 
 
+def _tensor_proto_nbytes(dtype: int, dims: Sequence[int]) -> Optional[int]:
+    """Byte count a ``TensorProto``'s ``raw_data`` must have for `dtype`/`dims`,
+    or ``None`` if `dtype` has no fixed-width numpy equivalent (e.g. STRING --
+    never one of import_gguf_weights' own matched dtypes, so this only ever
+    returns ``None`` defensively)."""
+    try:
+        itemsize = onnx.helper.tensor_dtype_to_np_dtype(dtype).itemsize
+    except (KeyError, TypeError):
+        return None
+    n = itemsize
+    for d in dims:
+        n *= d
+    return n
+
+
 def import_gguf_weights(
     model: Union[str, onnx.ModelProto], gguf_path: str
 ) -> Tuple[onnx.ModelProto, List[str]]:
@@ -634,30 +649,59 @@ def import_gguf_weights(
     :returns: ``(model, skipped)`` -- the hydrated model (a distinct object
             from ``model``, if a ``ModelProto`` was passed in), and the
             names of GGUF tensors present in the file but skipped because
-            their quantized format has no decoder here (the legacy
-            ``Q4_0`` family, every ``IQ*`` variant, ...). A GGUF tensor
-            with no matching initializer name in ``model`` is simply not
-            brought in -- it does NOT appear in ``skipped``, which reports
-            only unsupported *formats*, not name mismatches.
+            either their quantized format has no decoder here (the legacy
+            ``Q4_0`` family, every ``IQ*`` variant, ...) or, for a
+            same-named match, the file's tensor decodes to a different byte
+            count than ``model``'s initializer declares (dtype x dims) --
+            e.g. a placeholder built for the wrong shape, or a checkpoint
+            tensor sized for a different architecture configuration. Either
+            way the initializer is left with its original value rather than
+            overwritten with bytes that don't fit its declared shape. A
+            GGUF tensor with no matching initializer name in ``model`` is
+            simply not brought in -- it does NOT appear in ``skipped``,
+            which reports only tensors the file and the graph both name but
+            this call could not actually hydrate.
     """
     if isinstance(model, str):
         model = onnx.load(model, load_external_data=False)
     # C++ only ever clears/rewrites a *matched* initializer's raw_data --
     # every unmatched one crosses back out untouched, still carrying
-    # whatever `model` already had -- so the matched ones are the only
-    # ones that need filling in here; a matched tensor's OLD value never
-    # needs to survive the round trip at all, so there's nothing to
-    # extract-and-restore on the way in either (unlike export_gguf, which
-    # strips every tensor's raw_data because ALL of it needs to cross).
+    # whatever `model` already had. But "matched" there means only "a
+    # same-named GGUF entry exists": ImportModelWithGGUFToPool clears a
+    # matched initializer's raw_data unconditionally, before this function
+    # ever gets a chance to reject it below on a byte-count mismatch -- so
+    # a rejected tensor's original value does NOT survive in `result` and
+    # must be restored here from `model` (still unmutated, per this
+    # function's own contract) rather than merely left alone.
+    originals = {init.name: init for init in model.graph.initializer}
     model_bytes, matched, skipped = C.import_gguf_weights(
         model.SerializeToString(), gguf_path
     )
     result = onnx.ModelProto()
     result.ParseFromString(model_bytes)
+    skipped = list(skipped)
     for init in result.graph.initializer:
-        if init.name in matched:
-            init.data_type = matched.dtype(init.name)
-            init.raw_data = matched.bytes(init.name)
+        if init.name not in matched:
+            continue
+        dtype = matched.dtype(init.name)
+        data = matched.bytes(init.name)
+        # The C++ side decodes/copies purely from the GGUF entry's own shape
+        # (see tensor_pool_gguf_bridge.h's HydrateTensorProtoFromGGUF), with
+        # no awareness of `init`'s declared dims -- so a name match whose
+        # actual byte count doesn't fit `init`'s shape (e.g. a hand-built
+        # placeholder graph declared with the wrong shape for this
+        # checkpoint) would otherwise leave a corrupt-length raw_data behind
+        # instead of failing clearly. Treat that the same as an unsupported
+        # quantization format: report it in `skipped` and restore the
+        # initializer's original value (see this loop's own note above on
+        # why that needs restoring rather than merely being left alone).
+        expected = _tensor_proto_nbytes(dtype, init.dims)
+        if expected is not None and expected != len(data):
+            skipped.append(init.name)
+            init.CopyFrom(originals[init.name])
+            continue
+        init.data_type = dtype
+        init.raw_data = data
     return result, skipped
 
 
