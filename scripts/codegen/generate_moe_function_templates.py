@@ -14,11 +14,12 @@ not just a runtime value, would need to differ). See BuildMoEFunctionBody's
 own comment in contrib_schemas.cpp for the full picture of what remains
 context-dependent and why.
 
-Beyond that unavoidable bias-presence dispatch, every one of the 24 fixed
+Beyond that unavoidable bias-presence dispatch, every one of the 32 fixed
 functions built here (4 activations x fc1_bias x fc2_bias, plus 8 more for
-activation="silu" x fc1_bias x fc2_bias x fc3_bias -- see below) is fully
-generic at the ONNX level, using mechanisms a per-instance C++ codegen pass
-used to paper over:
+activation="silu" x fc1_bias x fc2_bias x fc3_bias, plus 8 more for
+activation="swiglu" x fc1_bias x fc2_bias x swiglu_limit -- see below) is
+fully generic at the ONNX level, using mechanisms a per-instance C++ codegen
+pass used to paper over:
 
   - num_experts, unknown until a real node is inspected, is now a genuine
     ONNX `Loop` trip count (`Shape(fc1_experts_weights)[0]`) instead of a
@@ -41,8 +42,7 @@ activation_type stays a build-time (per-function) choice rather than a
 runtime branch: it is a *string* attribute, and ONNX's string-typed `Equal`
 needs opset 19 (this targets opset 18, matching every op already in use);
 more importantly it selects genuinely different math/ops, the same kind of
-structural difference bias-presence forces above. See BuildMoEFunctionBody's
-comment for why swiglu itself is not one of the 4 generated here yet.
+structural difference bias-presence forces above.
 
 use_sparse_mixer's own routing math (in `_routing_lines`) is transcribed
 from onnxruntime's actual CUDA kernel
@@ -75,6 +75,37 @@ gelu + fc3 has no ORT-defined behavior at all (real ORT would silently
 misinterpret such a node's weights, not just skip it) and stays declined in
 BuildMoEFunctionBody rather than guessing a formula for it.
 
+The 8 additional activation="swiglu" x fc1_bias x fc2_bias x swiglu_limit
+functions implement the interleaved (fusion_size=2, swiglu_fusion=1) SwiGLU
+layout -- gpt-oss-20b's real, shipping convention
+(activation_alpha=1.702, activation_beta=1.0, swiglu_fusion=1, per
+onnxruntime-genai's gpt-oss builder) and, unlike everything added for fc3/
+use_sparse_mixer above, the ONE case ONNX Runtime's own CPU MoE kernel
+actually implements: its constructor
+(onnxruntime/contrib_ops/cpu/moe/moe_cpu.cc) throws unless
+`swiglu_fusion == 1` for a SwiGLU node, i.e. exactly this layout, so this
+one *is* checked end to end against a real onnxruntime CPU session (see
+`_swiglu_activation_lines`'s own comment for the formula, transcribed from
+that same file's `ApplySwiGLUVectorized`). fc1_experts_weights here is
+`[num_experts, 2*inter_size, hidden_size]` (fusion_size=2, per the schema
+doc) with gate/linear interleaved column-by-column in its own Gemm output
+(`h1[:, 0::2]`/`h1[:, 1::2]`, reproduced with a strided `Slice` since
+onnxscript's Python slicing sugar has no traced-step form) -- swiglu never
+takes fc3 (its own fc1 already carries both projections). activation_alpha
+and activation_beta are forwarded via `ref_attr_name` like k/
+normalize_routing_weights/use_sparse_mixer above (not baked in as 1.0/0.0
+literals), since they can legitimately vary (gpt-oss's own 1.702/1.0
+differ from the schema's own defaults) -- BuildMoEFunctionBody declines the
+swiglu path entirely when either is absent from the calling node, since
+forwarding needs a real attribute value on that node to bind to.
+swiglu_limit is genuinely optional ("no clamp when limit is not provided",
+per the schema doc), so -- unlike alpha/beta, which are unconditionally
+present on every real swiglu node -- its presence is a structural, build-
+time axis instead of always-forwarded: with it, the generated body adds a
+`Min`/clamp pair using the forwarded value; without it, those ops are
+absent entirely rather than forwarding a value that means "no-op" only by
+coincidence of being infinite.
+
 Run this script whenever the generated templates need to change:
     python3 scripts/codegen/generate_moe_function_templates.py \
         onnxsim/contrib_schemas_moe_templates.gen.h
@@ -98,22 +129,37 @@ import onnx
 from onnxscript import FLOAT, script
 from onnxscript import opset18 as op
 
-# Sentinel ints standing in for the values that only become known through
-# `ref_attr_name` forwarding once a real calling node exists -- see
+# Sentinel ints/floats standing in for the values that only become known
+# through `ref_attr_name` forwarding once a real calling node exists -- see
 # `_bind_attribute`. Chosen far outside any literal this code otherwise uses
-# (axes, a leading -1 reshape dim, small loop indices, ...).
+# (axes, a leading -1 reshape dim, small loop indices, ...); the float
+# sentinels are integer-valued so they round-trip exactly through float32
+# equality (`_bind_attribute`'s own lookup), same as any other literal here.
 _K_SENTINEL = 823002
 _NORMALIZE_SENTINEL = 823010
 _SPARSE_MIXER_SENTINEL = 823011
+_ALPHA_SENTINEL = 823020.0
+_BETA_SENTINEL = 823021.0
+_SWIGLU_LIMIT_SENTINEL = 823022.0
 
 _NODE_INDEX_RE = re.compile(r"^\s*\[n\d+\]\s*")
 _WHOLE_NUMBER_FLOAT_RE = re.compile(r"(value_float: float = -?\d+)(?!\.)\b")
 
 
-def _bind_attribute(proto, sentinel: int, attr_name: str) -> None:
-    """Rewrites the `Constant` node holding `sentinel` (as `value_int`) into
-    one that instead forwards the function's own `attr_name` attribute via
-    `ref_attr_name`, and declares that attribute on the function itself.
+def _bind_attribute(
+    proto,
+    sentinel,
+    attr_name: str,
+    value_field: str = "value_int",
+    proto_field: str = "i",
+) -> None:
+    """Rewrites the `Constant` node holding `sentinel` (as `value_field`)
+    into one that instead forwards the function's own `attr_name` attribute
+    via `ref_attr_name`, and declares that attribute on the function itself.
+    `value_field`/`proto_field` default to the int case (`value_int`/`i`);
+    pass `"value_float"`/`"f"` for a FLOAT-typed attribute (activation_alpha/
+    activation_beta/swiglu_limit) -- same mechanism, just a different
+    AttributeProto payload field.
 
     onnxscript's Python surface has no way to spell `ref_attr_name` directly
     (attribute-valued function parameters can only be forwarded into an op's
@@ -122,20 +168,45 @@ def _bind_attribute(proto, sentinel: int, attr_name: str) -> None:
     instead: verified end-to-end (a `Constant`+`Cast`+`If` built this way,
     called through real ONNX Runtime with the bound attribute set to 0 and 1,
     actually branches both ways) before being relied on here.
+
+    Searches every node, including recursively through Loop/If's own nested
+    `body`/`then_branch`/`else_branch` subgraph attributes -- k/
+    normalize_routing_weights/use_sparse_mixer's own sentinels only ever
+    land on a top-level Constant (the routing section runs once, before the
+    per-expert Loop), but activation_alpha/activation_beta/swiglu_limit's
+    land *inside* that Loop's body (they're consumed once per expert), so a
+    top-level-only search would silently find zero matches for those. `
+    ref_attr_name` resolution on a node nested this way was verified end to
+    end the same way as the top-level case (a real onnxruntime session,
+    forwarded value bound and checked against an independent computation --
+    see generate_moe_function_templates.py's own swiglu validation) before
+    being relied on here, rather than assumed from the top-level case alone.
     """
     found = 0
-    for node in proto.node:
-        if node.op_type != "Constant":
-            continue
-        for attr in node.attribute:
-            if attr.name == "value_int" and attr.i == sentinel:
-                attr.ClearField("i")
-                attr.ref_attr_name = attr_name
-                found += 1
+
+    def visit(nodes) -> None:
+        nonlocal found
+        for node in nodes:
+            if node.op_type == "Constant":
+                for attr in node.attribute:
+                    if (
+                        attr.name == value_field
+                        and getattr(attr, proto_field) == sentinel
+                    ):
+                        attr.ClearField(proto_field)
+                        attr.ref_attr_name = attr_name
+                        found += 1
+            for attr in node.attribute:
+                if attr.HasField("g"):
+                    visit(attr.g.node)
+                for g in attr.graphs:
+                    visit(g.node)
+
+    visit(proto.node)
     if found != 1:
         raise AssertionError(
-            f"expected exactly one Constant(value_int={sentinel}) standing in "
-            f"for '{attr_name}', found {found}"
+            f"expected exactly one Constant({value_field}={sentinel}) standing "
+            f"in for '{attr_name}', found {found}"
         )
     proto.attribute.append(attr_name)
 
@@ -162,10 +233,14 @@ def _cpp_ident(
     has_fc1_bias: bool,
     has_fc2_bias: bool,
     has_fc3_bias: bool | None = None,
+    has_swiglu_limit: bool | None = None,
 ) -> str:
     cap = activation[0].upper() + activation[1:]
     b1 = "Bias" if has_fc1_bias else "NoBias"
     b2 = "Bias" if has_fc2_bias else "NoBias"
+    if has_swiglu_limit is not None:
+        limit = "Limit" if has_swiglu_limit else "NoLimit"
+        return f"kMoEFunction{cap}Fc1{b1}Fc2{b2}{limit}"
     if has_fc3_bias is None:
         return f"kMoEFunction{cap}Fc1{b1}Fc2{b2}"
     b3 = "Bias" if has_fc3_bias else "NoBias"
@@ -208,6 +283,55 @@ def _activation_lines(activation: str) -> str:
             "a1 = op.Mul(half_h1, one_plus_tanh)\n"
         )
     raise ValueError(activation)
+
+
+# --- swiglu (fusion_size=2, interleaved): fc1's own Gemm output for each
+# expert is [num_tokens, 2*inter_size], gate/linear interleaved column by
+# column (col 2i = gate_i, col 2i+1 = linear_i) -- transcribed from
+# onnxruntime's actual CPU kernel, ApplySwiGLUVectorized in
+# onnxruntime/contrib_ops/cpu/moe/moe_cpu.cc: `gate = input[2*i]; linear =
+# input[2*i+1]; ... swish_out = gate * sigmoid(activation_alpha * gate);
+# output[i] = swish_out * (linear + activation_beta)` (with gate/linear each
+# optionally clamped to +-swiglu_limit first) -- confirmed end to end
+# against a real onnxruntime CPU session (this is, unlike fc3/sparse_mixer,
+# the one case the CPU MoE kernel actually implements: its own constructor
+# throws unless swiglu_fusion == 1, i.e. exactly this interleaved layout).
+# De-interleaving via a strided Slice (step=2, a large `ends` bound clamped
+# to the real dimension by ONNX's own Slice semantics) reproduces plain
+# numpy `h1[:, 0::2]`/`h1[:, 1::2]` exactly -- verified directly, since
+# onnxscript's Python slicing sugar doesn't expose a runtime (traced) step.
+_SWIGLU_SLICE_END = 2**62
+
+
+def _swiglu_activation_lines(has_swiglu_limit: bool) -> str:
+    lines = [
+        "gate = op.Slice(h1, op.Constant(value_ints=[0]),"
+        f" op.Constant(value_ints=[{_SWIGLU_SLICE_END}]),"
+        " op.Constant(value_ints=[-1]), op.Constant(value_ints=[2]))",
+        "linear = op.Slice(h1, op.Constant(value_ints=[1]),"
+        f" op.Constant(value_ints=[{_SWIGLU_SLICE_END}]),"
+        " op.Constant(value_ints=[-1]), op.Constant(value_ints=[2]))",
+    ]
+    if has_swiglu_limit:
+        lines += [
+            "limit_i = op.Constant(value_float=_SWIGLU_LIMIT_SENTINEL)",
+            "limit_cast = op.CastLike(limit_i, h1)",
+            "neg_limit_cast = op.Neg(limit_cast)",
+            "gate = op.Min(gate, limit_cast)",
+            "linear = op.Max(op.Min(linear, limit_cast), neg_limit_cast)",
+        ]
+    lines += [
+        "alpha_i = op.Constant(value_float=_ALPHA_SENTINEL)",
+        "alpha_cast = op.CastLike(alpha_i, h1)",
+        "beta_i = op.Constant(value_float=_BETA_SENTINEL)",
+        "beta_cast = op.CastLike(beta_i, h1)",
+        "sigmoid_arg = op.Mul(gate, alpha_cast)",
+        "sigmoid_out = op.Sigmoid(sigmoid_arg)",
+        "swish = op.Mul(gate, sigmoid_out)",
+        "linear_plus_beta = op.Add(linear, beta_cast)",
+        "a1 = op.Mul(swish, linear_plus_beta)",
+    ]
+    return "\n".join(lines) + "\n"
 
 
 # --- Routing: dense (mostly-zero) per-token gate row, shape (num_tokens,
@@ -291,16 +415,17 @@ def _make_moe_function(
     has_fc1_bias: bool,
     has_fc2_bias: bool,
     has_fc3_bias: bool | None = None,
+    has_swiglu_limit: bool | None = None,
 ):
     """Assembles the `@script()` source for one (activation, fc1_bias,
-    fc2_bias[, fc3_bias]) fixed function -- arbitrary num_experts (a real
-    ONNX `Loop`), arbitrary k/normalize_routing_weights/use_sparse_mixer
-    (forwarded attributes and runtime `If`s), a single fixed activation (see
-    module docstring for why that alone stays a build-time choice) -- via
-    `exec`, the same technique contrib_schemas_moe_test.cpp's generator used
-    before for the 16 (activation, bias) expert-block fragments, now
-    producing a complete function per combination instead of a spliced-in
-    fragment.
+    fc2_bias[, fc3_bias | swiglu_limit]) fixed function -- arbitrary
+    num_experts (a real ONNX `Loop`), arbitrary k/normalize_routing_weights/
+    use_sparse_mixer (forwarded attributes and runtime `If`s), a single
+    fixed activation (see module docstring for why that alone stays a
+    build-time choice) -- via `exec`, the same technique
+    contrib_schemas_moe_test.cpp's generator used before for the 16
+    (activation, bias) expert-block fragments, now producing a complete
+    function per combination instead of a spliced-in fragment.
 
     `has_fc3_bias=None` (the default) means fc3 is absent entirely -- the
     plain per-expert FFN, `fc2(activation(fc1(x)))`. `has_fc3_bias` a bool
@@ -314,8 +439,17 @@ def _make_moe_function(
     right above it) -- silu(fc1(x)) is the kernel's "SiLU(Gate)" and fc3(x)
     its "Linear", with no analogous defined behavior for the other three
     activations.
+
+    `has_swiglu_limit` (only meaningful, and only ever passed, for
+    `activation == "swiglu"`) selects whether the generated body includes
+    the optional clamp-to-`swiglu_limit` step -- see
+    `_swiglu_activation_lines`'s own comment for the interleaved-layout
+    formula this implements and how it was validated. `has_fc3_bias` and
+    `has_swiglu_limit` are never both set: swiglu never takes fc3 (its own
+    fc1 is already the fused gate+linear pair).
     """
     has_fc3 = has_fc3_bias is not None
+    is_swiglu = has_swiglu_limit is not None
     # Always declare the full, fixed-position formal-parameter signature
     # (matching com.microsoft.MoE's own schema exactly: input, router_probs,
     # fc1_experts_weights, fc1_experts_bias, fc2_experts_weights,
@@ -336,11 +470,18 @@ def _make_moe_function(
     # has_fc1_bias is False) then fails ONNX's own "actuals <= formals"
     # inlining rule for exactly that calling pattern -- caught empirically by
     # this generator's own validation below.
+    #
+    # swiglu's own fc1_experts_weights/fc1_experts_bias are twice as wide
+    # (fusion_size=2, per the schema doc) -- "I2" here is purely a distinct
+    # onnxscript-tracing symbol (never emitted into the compiled body text
+    # at all, see _extract_body), not a declared numeric relationship to
+    # "I"; nothing but this annotation's name changes for swiglu.
+    fc1_dim = "I2" if is_swiglu else "I"
     params = [
         'input: FLOAT["..."]',
         'router_probs: FLOAT["N", "E"]',
-        'fc1_experts_weights: FLOAT["E", "I", "H"]',
-        'fc1_experts_bias: FLOAT["E", "I"]',
+        f'fc1_experts_weights: FLOAT["E", "{fc1_dim}", "H"]',
+        f'fc1_experts_bias: FLOAT["E", "{fc1_dim}"]',
         'fc2_experts_weights: FLOAT["E", "H", "I"]',
         'fc2_experts_bias: FLOAT["E", "H"]',
     ]
@@ -360,7 +501,11 @@ def _make_moe_function(
         loop_lines.append("h1 = op.Gemm(flat_input, w1, b1, transB=1)")
     else:
         loop_lines.append("h1 = op.Gemm(flat_input, w1, transB=1)")
-    loop_lines.append(_activation_lines(activation).rstrip("\n"))
+    if is_swiglu:
+        assert has_swiglu_limit is not None  # is_swiglu already implies this
+        loop_lines.append(_swiglu_activation_lines(has_swiglu_limit).rstrip("\n"))
+    else:
+        loop_lines.append(_activation_lines(activation).rstrip("\n"))
     if has_fc3:
         loop_lines.append("w3_3d = op.Gather(fc3_experts_weights, e_idx, axis=0)")
         loop_lines.append("w3 = op.Squeeze(w3_3d, op.Constant(value_ints=[0]))")
@@ -412,11 +557,16 @@ def _make_moe_function(
         "_K_SENTINEL": _K_SENTINEL,
         "_NORMALIZE_SENTINEL": _NORMALIZE_SENTINEL,
         "_SPARSE_MIXER_SENTINEL": _SPARSE_MIXER_SENTINEL,
+        "_ALPHA_SENTINEL": _ALPHA_SENTINEL,
+        "_BETA_SENTINEL": _BETA_SENTINEL,
+        "_SWIGLU_LIMIT_SENTINEL": _SWIGLU_LIMIT_SENTINEL,
         "__name__": __name__,
     }
     fc3_tag = "None" if has_fc3_bias is None else str(has_fc3_bias)
+    limit_tag = "None" if has_swiglu_limit is None else str(has_swiglu_limit)
     filename = (
-        f"<moe_function_{activation}_fc1{has_fc1_bias}_fc2{has_fc2_bias}_fc3{fc3_tag}>"
+        f"<moe_function_{activation}_fc1{has_fc1_bias}_fc2{has_fc2_bias}"
+        f"_fc3{fc3_tag}_limit{limit_tag}>"
     )
     linecache.cache[filename] = (
         len(source),
@@ -465,6 +615,52 @@ def main() -> None:
                 _bind_attribute(proto, _SPARSE_MIXER_SENTINEL, "use_sparse_mixer")
                 text = _extract_body(onnx.printer.to_text(proto))
                 ident = _cpp_ident("silu", has_fc1_bias, has_fc2_bias, has_fc3_bias)
+                entries.append((ident, text))
+
+    # swiglu (interleaved, fusion_size=2) is the one activation the real
+    # ONNX Runtime CPU MoE kernel actually implements natively -- its own
+    # constructor throws unless swiglu_fusion == 1, i.e. exactly this
+    # layout (see _swiglu_activation_lines's comment) -- and the real
+    # convention onnxruntime-genai's gpt-oss builder exports
+    # (activation_alpha=1.702, activation_beta=1.0, swiglu_fusion=1). Both
+    # activation_alpha and activation_beta are forwarded (not baked in as
+    # 1.0/0.0 literals) since BuildMoEFunctionBody declines the swiglu path
+    # entirely when either is absent from the calling node -- see its own
+    # comment for why forwarding needs a real value to bind to.
+    for has_fc1_bias in (False, True):
+        for has_fc2_bias in (False, True):
+            for has_swiglu_limit in (False, True):
+                fn = _make_moe_function(
+                    "swiglu",
+                    has_fc1_bias,
+                    has_fc2_bias,
+                    has_swiglu_limit=has_swiglu_limit,
+                )
+                proto = fn.to_function_proto()
+                _bind_attribute(proto, _K_SENTINEL, "k")
+                _bind_attribute(proto, _NORMALIZE_SENTINEL, "normalize_routing_weights")
+                _bind_attribute(proto, _SPARSE_MIXER_SENTINEL, "use_sparse_mixer")
+                _bind_attribute(
+                    proto, _ALPHA_SENTINEL, "activation_alpha", "value_float", "f"
+                )
+                _bind_attribute(
+                    proto, _BETA_SENTINEL, "activation_beta", "value_float", "f"
+                )
+                if has_swiglu_limit:
+                    _bind_attribute(
+                        proto,
+                        _SWIGLU_LIMIT_SENTINEL,
+                        "swiglu_limit",
+                        "value_float",
+                        "f",
+                    )
+                text = _extract_body(onnx.printer.to_text(proto))
+                ident = _cpp_ident(
+                    "swiglu",
+                    has_fc1_bias,
+                    has_fc2_bias,
+                    has_swiglu_limit=has_swiglu_limit,
+                )
                 entries.append((ident, text))
 
     out = []

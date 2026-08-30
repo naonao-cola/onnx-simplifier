@@ -263,3 +263,58 @@ def test_simplify_round_trips_a_runnable_moe_model():
     after = _run(simplified, feeds)
     for b, a in zip(before, after):
         np.testing.assert_allclose(b, a, rtol=1e-4, atol=1e-5)
+
+
+def test_simplify_round_trips_a_runnable_swiglu_moe_model():
+    # swiglu (interleaved, swiglu_fusion=1) is gpt-oss-20b's real
+    # convention, and -- unlike fc3/use_sparse_mixer -- the one activation
+    # ONNX Runtime's own CPU MoE kernel actually implements (its
+    # constructor throws unless swiglu_fusion == 1 for a SwiGLU node), so
+    # this can be round-tripped through a real onnxruntime session the same
+    # way test_simplify_round_trips_a_runnable_moe_model does for silu.
+    # fc1_w is twice as wide here (fusion_size=2: gate/linear interleaved
+    # column by column in its own Gemm output).
+    num_tokens, hidden_size, inter_size, num_experts, k = 4, 6, 8, 3, 2
+    fc1_w = _f32(
+        np.random.default_rng(6).standard_normal(
+            (num_experts, 2 * inter_size, hidden_size)
+        )
+        * 0.1,
+        "fc1_w",
+    )
+    fc2_w = _f32(
+        np.random.default_rng(7).standard_normal((num_experts, hidden_size, inter_size))
+        * 0.1,
+        "fc2_w",
+    )
+    model = _model(
+        f"""
+        agraph (float[{num_tokens},{hidden_size}] input,
+                float[{num_tokens},{num_experts}] router_probs)
+              => (float[{num_tokens},{hidden_size}] output)
+        {{
+          output = com.microsoft.MoE
+              <k: int = {k}, activation_type: string = "swiglu",
+               swiglu_fusion: int = 1, activation_alpha: float = 1.702,
+               activation_beta: float = 1.0, normalize_routing_weights: int = 1>
+              (input, router_probs, fc1_w, , fc2_w)
+        }}
+        """,
+        initializer=[fc1_w, fc2_w],
+    )
+    onnx.checker.check_model(model)
+
+    simplified, ok = onnxsim.simplify(model, check_n=3)
+    assert ok
+
+    rng = np.random.default_rng(8)
+    feeds = {
+        "input": rng.standard_normal((num_tokens, hidden_size)).astype(np.float32),
+        "router_probs": rng.standard_normal((num_tokens, num_experts)).astype(
+            np.float32
+        ),
+    }
+    before = _run(model, feeds)
+    after = _run(simplified, feeds)
+    for b, a in zip(before, after):
+        np.testing.assert_allclose(b, a, rtol=1e-4, atol=1e-5)
