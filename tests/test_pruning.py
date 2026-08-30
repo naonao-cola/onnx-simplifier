@@ -204,6 +204,213 @@ def test_weight_sparsity_ignores_non_matching_layers():
     assert onnxsim.weight_sparsity(model) == 0.0
 
 
+# --- magnitude/Wanda pruning: global_sparsity ----------------------------
+
+
+def _two_scale_matmul_model(K=16, N=8, big_scale=100.0, small_scale=1.0, seed=0):
+    # Two independent MatMul layers sharing one input, deliberately built at
+    # very different weight-magnitude scales -- the adversarial case
+    # `global_sparsity` exists for: `apply_magnitude_pruning`'s own
+    # per-layer-uniform mode cuts both to the same *fraction* regardless of
+    # scale, while `global_sparsity` should redistribute toward the
+    # uniformly-smaller layer.
+    rng = np.random.default_rng(seed)
+    w_big = (rng.standard_normal((K, N)) * big_scale).astype(np.float32)
+    w_small = (rng.standard_normal((K, N)) * small_scale).astype(np.float32)
+    model = _model(
+        f"""
+        g (float[batch,{K}] X) => (float[batch,{N}] Y1, float[batch,{N}] Y2)
+        {{
+          Y1 = MatMul(X, Wbig)
+          Y2 = MatMul(X, Wsmall)
+        }}
+        """,
+        initializer=[_f32(w_big, "Wbig"), _f32(w_small, "Wsmall")],
+    )
+    return model, w_big, w_small
+
+
+def test_magnitude_pruning_global_sparsity_redistributes_toward_small_magnitude_layer():
+    K, N = 16, 8
+    model, _, _ = _two_scale_matmul_model(K=K, N=N, big_scale=100.0, small_scale=1.0)
+
+    local_pruned = onnxsim.apply_magnitude_pruning(model, sparsity=0.5)
+    global_pruned = onnxsim.apply_magnitude_pruning(
+        model, sparsity=0.5, global_sparsity=True
+    )
+    onnx.checker.check_model(global_pruned)
+
+    inits_local = {t.name: t for t in local_pruned.graph.initializer}
+    inits_global = {t.name: t for t in global_pruned.graph.initializer}
+
+    def sparsity_of(inits, name):
+        return float(np.mean(onnx.numpy_helper.to_array(inits[name]) == 0))
+
+    # Per-layer-uniform (default) mode: both layers cut to exactly the same
+    # fraction, regardless of scale.
+    assert sparsity_of(inits_local, "Wbig") == pytest.approx(0.5, abs=1e-9)
+    assert sparsity_of(inits_local, "Wsmall") == pytest.approx(0.5, abs=1e-9)
+
+    # global_sparsity mode: the uniformly-100x-larger layer must be pruned
+    # markedly less than the uniformly-small one -- the whole point of
+    # pooling importance across layers instead of treating each layer's own
+    # distribution in isolation.
+    big_sparsity = sparsity_of(inits_global, "Wbig")
+    small_sparsity = sparsity_of(inits_global, "Wsmall")
+    assert big_sparsity < 0.5 < small_sparsity
+
+    # Aggregate sparsity across both matched layers still hits the
+    # requested global target exactly -- no per-row/per-layer floor to
+    # introduce slack in this unstructured mode (see
+    # apply_magnitude_pruning's own `global_sparsity` docstring).
+    assert onnxsim.weight_sparsity(global_pruned) == pytest.approx(0.5, abs=1e-9)
+
+
+def test_magnitude_pruning_global_sparsity_matches_pooled_threshold_oracle():
+    K, N = 12, 6
+    sparsity = 0.6
+    model, w_big, w_small = _two_scale_matmul_model(
+        K=K, N=N, big_scale=50.0, small_scale=0.3, seed=3
+    )
+
+    pruned = onnxsim.apply_magnitude_pruning(
+        model, sparsity=sparsity, global_sparsity=True
+    )
+    inits = {t.name: t for t in pruned.graph.initializer}
+
+    # Hand-built oracle: pool |W| across both layers' own [N, K]
+    # (output-channel-first) entries, in the same node order `_candidates`
+    # matches them in (program order here), rank globally, and zero the
+    # lowest-scoring round(total * sparsity) entries -- a from-scratch
+    # reimplementation of `_apply_global_unstructured_pruning`, not a call
+    # into it.
+    w_big_nk = w_big.T.astype(np.float64)  # [N, K]
+    w_small_nk = w_small.T.astype(np.float64)
+    pooled = np.concatenate(
+        [np.abs(w_big_nk).reshape(-1), np.abs(w_small_nk).reshape(-1)]
+    )
+    total = pooled.size
+    keep_count = round(total * (1.0 - sparsity))
+    drop_count = total - keep_count
+    order = np.argsort(pooled, kind="stable")
+    drop_flat = np.zeros(total, dtype=bool)
+    drop_flat[order[:drop_count]] = True
+
+    big_drop = drop_flat[: w_big_nk.size].reshape(w_big_nk.shape)
+    small_drop = drop_flat[w_big_nk.size :].reshape(w_small_nk.shape)
+    expected_big = np.where(big_drop, 0.0, w_big_nk).T.astype(np.float32)
+    expected_small = np.where(small_drop, 0.0, w_small_nk).T.astype(np.float32)
+
+    np.testing.assert_array_equal(
+        onnx.numpy_helper.to_array(inits["Wbig"]), expected_big
+    )
+    np.testing.assert_array_equal(
+        onnx.numpy_helper.to_array(inits["Wsmall"]), expected_small
+    )
+
+
+def test_magnitude_pruning_global_sparsity_rejects_nm():
+    model = _matmul_model(K=16, N=4)
+    with pytest.raises(ValueError):
+        onnxsim.apply_magnitude_pruning(model, n=2, m=4, global_sparsity=True)
+
+
+def _two_input_matmul_model(K=16, N=8, seed=0):
+    # Two independent MatMul layers fed by *separate* graph inputs (rather
+    # than sharing one, as `_two_scale_matmul_model` does) so calibration
+    # data can give each layer's own activation a different magnitude while
+    # both layers' weights stay the same scale -- isolates Wanda's own
+    # ``||X_j||_2`` half of its importance metric from the plain
+    # weight-magnitude effect `_two_scale_matmul_model` exercises.
+    rng = np.random.default_rng(seed)
+    w1 = rng.standard_normal((K, N)).astype(np.float32)
+    w2 = rng.standard_normal((K, N)).astype(np.float32)
+    model = _model(
+        f"""
+        g (float[batch,{K}] X1, float[batch,{K}] X2) => (float[batch,{N}] Y1, float[batch,{N}] Y2)
+        {{
+          Y1 = MatMul(X1, W1)
+          Y2 = MatMul(X2, W2)
+        }}
+        """,
+        initializer=[_f32(w1, "W1"), _f32(w2, "W2")],
+    )
+    return model, w1, w2
+
+
+def test_wanda_pruning_global_sparsity_redistributes_by_combined_metric():
+    K, N = 16, 8
+    model, _, _ = _two_input_matmul_model(K=K, N=N, seed=5)
+    rng = np.random.default_rng(9)
+    x1 = (rng.standard_normal((32, K)) * 50.0).astype(np.float32)
+    x2 = (rng.standard_normal((32, K)) * 1.0).astype(np.float32)
+    calibration_data = [{"X1": x1, "X2": x2}]
+
+    pruned = onnxsim.apply_wanda_pruning(
+        model, calibration_data=calibration_data, sparsity=0.5, global_sparsity=True
+    )
+    onnx.checker.check_model(pruned)
+    inits = {t.name: t for t in pruned.graph.initializer}
+    sparsity1 = float(np.mean(onnx.numpy_helper.to_array(inits["W1"]) == 0))
+    sparsity2 = float(np.mean(onnx.numpy_helper.to_array(inits["W2"]) == 0))
+
+    # W1 sees a 50x larger activation than W2 despite the same weight
+    # scale -- global Wanda importance must protect it accordingly.
+    assert sparsity1 < 0.5 < sparsity2
+    assert onnxsim.weight_sparsity(pruned) == pytest.approx(0.5, abs=1e-9)
+
+
+def test_wanda_pruning_global_sparsity_matches_pooled_threshold_oracle():
+    K, N = 10, 5
+    sparsity = 0.55
+    model, w1, w2 = _two_input_matmul_model(K=K, N=N, seed=11)
+    rng = np.random.default_rng(13)
+    x1 = (rng.standard_normal((16, K)) * 20.0).astype(np.float32)
+    x2 = (rng.standard_normal((16, K)) * 3.0).astype(np.float32)
+    calibration_data = [{"X1": x1, "X2": x2}]
+
+    pruned = onnxsim.apply_wanda_pruning(
+        model,
+        calibration_data=calibration_data,
+        sparsity=sparsity,
+        global_sparsity=True,
+    )
+    inits = {t.name: t for t in pruned.graph.initializer}
+
+    # Hand-built oracle: the same |W_ij| * ||X_j||_2 formula
+    # apply_wanda_pruning itself uses, computed directly from the fixed
+    # calibration input (MatMul(X, W)'s own probed activation *is* X,
+    # unchanged by any op upstream of it -- no need to re-run onnxruntime),
+    # pooled the same way _apply_global_unstructured_pruning pools any
+    # per-entry importance metric.
+    norm1 = np.sqrt(np.mean(np.square(x1.astype(np.float64)), axis=0))  # [K]
+    norm2 = np.sqrt(np.mean(np.square(x2.astype(np.float64)), axis=0))
+    w1_nk = w1.T.astype(np.float64)  # [N, K]
+    w2_nk = w2.T.astype(np.float64)
+    importance1 = np.abs(w1_nk) * np.maximum(norm1[np.newaxis, :], 1e-8)
+    importance2 = np.abs(w2_nk) * np.maximum(norm2[np.newaxis, :], 1e-8)
+    pooled = np.concatenate([importance1.reshape(-1), importance2.reshape(-1)])
+    total = pooled.size
+    keep_count = round(total * (1.0 - sparsity))
+    drop_count = total - keep_count
+    order = np.argsort(pooled, kind="stable")
+    drop_flat = np.zeros(total, dtype=bool)
+    drop_flat[order[:drop_count]] = True
+    drop1 = drop_flat[: importance1.size].reshape(importance1.shape)
+    drop2 = drop_flat[importance1.size :].reshape(importance2.shape)
+    expected1 = np.where(drop1, 0.0, w1_nk).T.astype(np.float32)
+    expected2 = np.where(drop2, 0.0, w2_nk).T.astype(np.float32)
+
+    np.testing.assert_array_equal(onnx.numpy_helper.to_array(inits["W1"]), expected1)
+    np.testing.assert_array_equal(onnx.numpy_helper.to_array(inits["W2"]), expected2)
+
+
+def test_wanda_pruning_global_sparsity_rejects_nm():
+    model = _matmul_model(K=16, N=4)
+    with pytest.raises(ValueError):
+        onnxsim.apply_wanda_pruning(model, n=2, m=4, global_sparsity=True)
+
+
 # --- magnitude/Wanda pruning: Conv2D -------------------------------------
 
 
@@ -1769,6 +1976,287 @@ def test_structured_pruning_chains_through_a_third_layer():
     a2 = np.maximum(a1 @ w2[np.ix_(keep1, keep2)], 0)
     y_oracle = a2 @ w3[keep2, :]
     np.testing.assert_allclose(y, y_oracle, rtol=1e-5, atol=1e-5)
+
+
+# --- apply_structured_pruning: global_sparsity ---------------------------
+
+
+def _two_scale_mlp_model(K=8, H=16, Out=4, big_scale=50.0, small_scale=1.0, seed=0):
+    # Two independent, ordinary (single-producer, group=1) MLP chains
+    # sharing one input, deliberately built at very different weight-
+    # magnitude scales -- the adversarial case `global_sparsity` exists
+    # for: the default per-chain-uniform mode cuts both to the same output-
+    # channel *count* regardless of scale, while `global_sparsity` should
+    # redistribute toward the uniformly-smaller chain.
+    rng = np.random.default_rng(seed)
+    w1_big = (rng.standard_normal((K, H)) * big_scale).astype(np.float32)
+    w2_big = rng.standard_normal((H, Out)).astype(np.float32)
+    w1_small = (rng.standard_normal((K, H)) * small_scale).astype(np.float32)
+    w2_small = rng.standard_normal((H, Out)).astype(np.float32)
+    model = _model(
+        f"""
+        g (float[batch,{K}] X) => (float[batch,{Out}] Ybig, float[batch,{Out}] Ysmall)
+        {{
+          hbig = MatMul(X, W1big)
+          abig = Relu(hbig)
+          Ybig = MatMul(abig, W2big)
+          hsmall = MatMul(X, W1small)
+          asmall = Relu(hsmall)
+          Ysmall = MatMul(asmall, W2small)
+        }}
+        """,
+        initializer=[
+            _f32(w1_big, "W1big"),
+            _f32(w2_big, "W2big"),
+            _f32(w1_small, "W1small"),
+            _f32(w2_small, "W2small"),
+        ],
+    )
+    return model, w1_big, w2_big, w1_small, w2_small
+
+
+def _oracle_global_structured_keep(importances, sparsity):
+    """From-scratch reimplementation of `_apply_chains_global`'s own
+    selection algorithm (ascending pooled sort, drop the lowest-scoring
+    round(total * sparsity) entries, then a per-chain floor of at least
+    one kept channel), for exact-match testing -- not a call into
+    production code. `importances` is a list of 1-D per-chain importance
+    arrays (pooled in that order, matching `_candidates`'/`_find_chains`'
+    own node-encounter order); returns a same-length list of 1-D boolean
+    keep masks.
+    """
+    sizes = [imp.size for imp in importances]
+    total = sum(sizes)
+    pooled = np.concatenate(importances)
+    keep_count_total = min(max(round(total * (1.0 - sparsity)), 0), total)
+    drop_count_total = total - keep_count_total
+    drop_flat = np.zeros(total, dtype=bool)
+    if drop_count_total > 0:
+        order = np.argsort(pooled, kind="stable")
+        drop_flat[order[:drop_count_total]] = True
+    masks = []
+    offset = 0
+    for imp, size in zip(importances, sizes):
+        drop_here = drop_flat[offset : offset + size]
+        offset += size
+        if drop_here.all():
+            drop_here = drop_here.copy()
+            drop_here[np.argmax(imp)] = False
+        masks.append(~drop_here)
+    return masks
+
+
+def test_structured_pruning_global_sparsity_redistributes_across_chains_and_matches_oracle():
+    K, H, Out = 8, 16, 4
+    sparsity = 0.5
+    model, w1_big, w2_big, w1_small, w2_small = _two_scale_mlp_model(
+        K=K, H=H, Out=Out, big_scale=50.0, small_scale=0.5, seed=7
+    )
+
+    local_pruned = onnxsim.apply_structured_pruning(model, sparsity=sparsity)
+    global_pruned = onnxsim.apply_structured_pruning(
+        model, sparsity=sparsity, global_sparsity=True
+    )
+    onnx.checker.check_model(global_pruned)
+
+    inits_local = {t.name: t for t in local_pruned.graph.initializer}
+    inits_global = {t.name: t for t in global_pruned.graph.initializer}
+
+    # Per-chain-uniform (default) mode: both chains cut to exactly the same
+    # channel count, regardless of scale.
+    assert inits_local["W1big"].dims[1] == H // 2
+    assert inits_local["W1small"].dims[1] == H // 2
+
+    # global_sparsity mode: the uniformly-100x-larger chain must keep
+    # strictly more channels than the uniformly-small one.
+    big_kept = inits_global["W1big"].dims[1]
+    small_kept = inits_global["W1small"].dims[1]
+    assert big_kept > H // 2 > small_kept
+
+    # Hand-built oracle: pool both chains' own per-channel L2-norm
+    # importance and select via the same algorithm _apply_chains_global
+    # itself implements, reimplemented from scratch.
+    importance_big = np.linalg.norm(w1_big.T, axis=1)
+    importance_small = np.linalg.norm(w1_small.T, axis=1)
+    keep_big_mask, keep_small_mask = _oracle_global_structured_keep(
+        [importance_big, importance_small], sparsity
+    )
+    keep_big = np.flatnonzero(keep_big_mask)
+    keep_small = np.flatnonzero(keep_small_mask)
+    assert big_kept == keep_big.size
+    assert small_kept == keep_small.size
+
+    # And the actual pruned model reproduces exactly what deleting those
+    # same channels by hand in numpy would -- real equivalence, not just a
+    # matching channel count.
+    rng = np.random.default_rng(21)
+    x = rng.standard_normal((6, K)).astype(np.float32)
+    y_big, y_small = _run(global_pruned, {"X": x})
+
+    ab = np.maximum(x @ w1_big[:, keep_big], 0)
+    yb_oracle = ab @ w2_big[keep_big, :]
+    as_ = np.maximum(x @ w1_small[:, keep_small], 0)
+    ys_oracle = as_ @ w2_small[keep_small, :]
+
+    np.testing.assert_allclose(y_big, yb_oracle, rtol=1e-4, atol=1e-4)
+    np.testing.assert_allclose(y_small, ys_oracle, rtol=1e-4, atol=1e-4)
+
+
+def test_structured_pruning_global_sparsity_enforces_per_chain_floor():
+    # A 2-channel chain with tiny weights alongside a 32-channel chain with
+    # huge weights, at a high global sparsity that would naively want to
+    # drop every one of the tiny chain's channels -- the floor must keep
+    # exactly one instead of collapsing it to a zero-sized axis.
+    K, Out = 8, 4
+    H_tiny, H_big = 2, 32
+    sparsity = 0.9
+    rng = np.random.default_rng(41)
+    w1_tiny = (rng.standard_normal((K, H_tiny)) * 0.01).astype(np.float32)
+    w2_tiny = rng.standard_normal((H_tiny, Out)).astype(np.float32)
+    w1_big = (rng.standard_normal((K, H_big)) * 100.0).astype(np.float32)
+    w2_big = rng.standard_normal((H_big, Out)).astype(np.float32)
+    model = _model(
+        f"""
+        g (float[batch,{K}] X) => (float[batch,{Out}] Ytiny, float[batch,{Out}] Ybig)
+        {{
+          ht = MatMul(X, W1tiny)
+          at = Relu(ht)
+          Ytiny = MatMul(at, W2tiny)
+          hb = MatMul(X, W1big)
+          ab = Relu(hb)
+          Ybig = MatMul(ab, W2big)
+        }}
+        """,
+        initializer=[
+            _f32(w1_tiny, "W1tiny"),
+            _f32(w2_tiny, "W2tiny"),
+            _f32(w1_big, "W1big"),
+            _f32(w2_big, "W2big"),
+        ],
+    )
+
+    pruned = onnxsim.apply_structured_pruning(
+        model, sparsity=sparsity, global_sparsity=True
+    )
+    onnx.checker.check_model(pruned)
+    inits = {t.name: t for t in pruned.graph.initializer}
+    tiny_kept = inits["W1tiny"].dims[1]
+    big_kept = inits["W1big"].dims[1]
+
+    importance_tiny = np.linalg.norm(w1_tiny.T, axis=1)
+    importance_big = np.linalg.norm(w1_big.T, axis=1)
+    keep_tiny_mask, keep_big_mask = _oracle_global_structured_keep(
+        [importance_tiny, importance_big], sparsity
+    )
+    assert tiny_kept == int(keep_tiny_mask.sum()) == 1
+    assert big_kept == int(keep_big_mask.sum())
+
+
+def test_structured_pruning_global_sparsity_leaves_gated_ffn_chain_untouched():
+    # A gated (SwiGLU-style) pair must agree on one *shared* keep set
+    # already (both branches ranked together, pruned to the same surviving
+    # indices) -- global_sparsity declines to layer a second, global
+    # agreement on top of that rather than guess at one (see
+    # apply_structured_pruning's own `global_sparsity` docstring). Its own
+    # weights are made uniformly tiny here, so a naive pooled ranking would
+    # otherwise be very eager to prune it hard.
+    K, H, Out = 8, 16, 4
+    rng = np.random.default_rng(31)
+    w1 = (rng.standard_normal((K, H)) * 50.0).astype(np.float32)
+    w2 = rng.standard_normal((H, Out)).astype(np.float32)
+    wg = (rng.standard_normal((K, H)) * 0.01).astype(np.float32)
+    wu = (rng.standard_normal((K, H)) * 0.01).astype(np.float32)
+    wd = rng.standard_normal((H, Out)).astype(np.float32)
+    model = _model(
+        f"""
+        g (float[batch,{K}] X) => (float[batch,{Out}] Yplain, float[batch,{Out}] Ygated)
+        {{
+          h = MatMul(X, W1)
+          a = Relu(h)
+          Yplain = MatMul(a, W2)
+          gate = MatMul(X, Wg)
+          gate_act = Sigmoid(gate)
+          up = MatMul(X, Wu)
+          hg = Mul(gate_act, up)
+          Ygated = MatMul(hg, Wd)
+        }}
+        """,
+        initializer=[
+            _f32(w1, "W1"),
+            _f32(w2, "W2"),
+            _f32(wg, "Wg"),
+            _f32(wu, "Wu"),
+            _f32(wd, "Wd"),
+        ],
+    )
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5, global_sparsity=True)
+    onnx.checker.check_model(pruned)
+    inits = {t.name: t for t in pruned.graph.initializer}
+
+    # The gated pair is left completely untouched by global_sparsity mode.
+    assert list(inits["Wg"].dims) == [K, H]
+    assert list(inits["Wu"].dims) == [K, H]
+    assert list(inits["Wd"].dims) == [H, Out]
+    # The eligible plain chain is still pruned.
+    assert inits["W1"].dims[1] < H
+
+
+def test_structured_pruning_global_sparsity_leaves_grouped_conv_chain_untouched():
+    # A general grouped Conv's own `keep` selection is already constrained
+    # to a uniform count *per group block* -- global_sparsity declines to
+    # fold it into a single pooled ranking that has no general way to land
+    # on a block-uniform count for it (see apply_structured_pruning's own
+    # `global_sparsity` docstring). Its own weights are made uniformly tiny
+    # here, so a naive pooled ranking would otherwise be very eager to
+    # prune it hard.
+    K, H, Out = 8, 16, 4
+    C, spatial, group = 8, 10, 2
+    rng = np.random.default_rng(37)
+    w1 = (rng.standard_normal((K, H)) * 50.0).astype(np.float32)
+    w2 = rng.standard_normal((H, Out)).astype(np.float32)
+    wc1 = (rng.standard_normal((C, C // group, 3, 3)) * 0.01).astype(np.float32)
+    wc2 = rng.standard_normal((C, C, 3, 3)).astype(np.float32)
+    out_spatial = spatial - 4  # two valid (no-pad) 3x3 convs
+    model = _model(
+        f"""
+        g (float[batch,{K}] X, float[N,{C},{spatial},{spatial}] Xc)
+            => (float[batch,{Out}] Yplain, float[N,{C},{out_spatial},{out_spatial}] Yconv)
+        {{
+          h = MatMul(X, W1)
+          a = Relu(h)
+          Yplain = MatMul(a, W2)
+          hc = Conv<kernel_shape=[3,3], group={group}>(Xc, Wc1)
+          ac = Relu(hc)
+          Yconv = Conv<kernel_shape=[3,3]>(ac, Wc2)
+        }}
+        """,
+        initializer=[
+            _f32(w1, "W1"),
+            _f32(w2, "W2"),
+            _f32(wc1, "Wc1"),
+            _f32(wc2, "Wc2"),
+        ],
+    )
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5, global_sparsity=True)
+    onnx.checker.check_model(pruned)
+    inits = {t.name: t for t in pruned.graph.initializer}
+
+    # The grouped-Conv chain is left completely untouched by
+    # global_sparsity mode.
+    assert list(inits["Wc1"].dims) == list(wc1.shape)
+    assert list(inits["Wc2"].dims) == list(wc2.shape)
+    # The eligible plain chain is still pruned.
+    assert inits["W1"].dims[1] < H
+
+
+def test_structured_pruning_global_sparsity_invalid_sparsity_raises():
+    model = _mlp_model(K=8, H=16, Out=4)
+    with pytest.raises(ValueError):
+        onnxsim.apply_structured_pruning(model, sparsity=1.0, global_sparsity=True)
+    with pytest.raises(ValueError):
+        onnxsim.apply_structured_pruning(model, sparsity=-0.1, global_sparsity=True)
 
 
 # --- apply_structured_pruning: fused BiasGelu/FastGelu/QuickGelu hop --------
@@ -6540,6 +7028,106 @@ def test_structured_wanda_pruning_invalid_sparsity_raises():
         onnxsim.apply_structured_wanda_pruning(model, sparsity=1.0)
     with pytest.raises(ValueError):
         onnxsim.apply_structured_wanda_pruning(model, sparsity=-0.1)
+
+
+# --- apply_structured_wanda_pruning: global_sparsity ---------------------
+
+
+def _two_input_mlp_model(K=8, H=16, Out=4, seed=0):
+    # Two independent, ordinary MLP chains fed by *separate* graph inputs
+    # (mirroring `_two_input_matmul_model`'s unstructured analogue) so
+    # calibration data can give each chain's own consumer-side activation a
+    # different magnitude while both chains' weights stay the same scale.
+    rng = np.random.default_rng(seed)
+    w1a = rng.standard_normal((K, H)).astype(np.float32)
+    w2a = rng.standard_normal((H, Out)).astype(np.float32)
+    w1b = rng.standard_normal((K, H)).astype(np.float32)
+    w2b = rng.standard_normal((H, Out)).astype(np.float32)
+    model = _model(
+        f"""
+        g (float[batch,{K}] Xa, float[batch,{K}] Xb) => (float[batch,{Out}] Ya, float[batch,{Out}] Yb)
+        {{
+          ha = MatMul(Xa, W1a)
+          aa = Relu(ha)
+          Ya = MatMul(aa, W2a)
+          hb = MatMul(Xb, W1b)
+          ab = Relu(hb)
+          Yb = MatMul(ab, W2b)
+        }}
+        """,
+        initializer=[
+            _f32(w1a, "W1a"),
+            _f32(w2a, "W2a"),
+            _f32(w1b, "W1b"),
+            _f32(w2b, "W2b"),
+        ],
+    )
+    return model, w1a, w2a, w1b, w2b
+
+
+def test_structured_wanda_pruning_global_sparsity_redistributes_and_matches_oracle():
+    K, H, Out = 8, 16, 4
+    sparsity = 0.5
+    model, w1a, w2a, w1b, w2b = _two_input_mlp_model(K=K, H=H, Out=Out, seed=17)
+    rng = np.random.default_rng(19)
+    xa_cal = (rng.standard_normal((32, K)) * 40.0).astype(np.float32)
+    xb_cal = (rng.standard_normal((32, K)) * 1.0).astype(np.float32)
+    calibration_data = [{"Xa": xa_cal, "Xb": xb_cal}]
+
+    pruned = onnxsim.apply_structured_wanda_pruning(
+        model,
+        calibration_data=calibration_data,
+        sparsity=sparsity,
+        global_sparsity=True,
+    )
+    onnx.checker.check_model(pruned)
+    inits = {t.name: t for t in pruned.graph.initializer}
+
+    # Chain "a" sees a 40x larger activation despite the same weight scale
+    # -- global Wanda structured importance must protect it accordingly.
+    a_kept = inits["W1a"].dims[1]
+    b_kept = inits["W1b"].dims[1]
+    assert a_kept > H // 2 > b_kept
+
+    # Hand-built oracle: the activation norm captured right where each
+    # chain feeds its consumer (post-Relu, computed directly in numpy --
+    # deterministic and exactly what the internal onnxruntime probe would
+    # see for a plain MatMul->Relu->MatMul chain), combined with each
+    # chain's own L2-norm weight importance, then pooled and selected via
+    # the same algorithm _apply_chains_global implements.
+    aa_cal = np.maximum(xa_cal @ w1a, 0)
+    ab_cal = np.maximum(xb_cal @ w1b, 0)
+    norm_a = np.sqrt(np.mean(np.square(aa_cal), axis=0))
+    norm_b = np.sqrt(np.mean(np.square(ab_cal), axis=0))
+    importance_a = np.linalg.norm(w1a.T, axis=1) * np.maximum(norm_a, 1e-8)
+    importance_b = np.linalg.norm(w1b.T, axis=1) * np.maximum(norm_b, 1e-8)
+    keep_a_mask, keep_b_mask = _oracle_global_structured_keep(
+        [importance_a, importance_b], sparsity
+    )
+    keep_a = np.flatnonzero(keep_a_mask)
+    keep_b = np.flatnonzero(keep_b_mask)
+    assert a_kept == keep_a.size
+    assert b_kept == keep_b.size
+
+    x_a = rng.standard_normal((5, K)).astype(np.float32)
+    x_b = rng.standard_normal((5, K)).astype(np.float32)
+    y_a, y_b = _run(pruned, {"Xa": x_a, "Xb": x_b})
+    ya_oracle = np.maximum(x_a @ w1a[:, keep_a], 0) @ w2a[keep_a, :]
+    yb_oracle = np.maximum(x_b @ w1b[:, keep_b], 0) @ w2b[keep_b, :]
+    np.testing.assert_allclose(y_a, ya_oracle, rtol=1e-4, atol=1e-4)
+    np.testing.assert_allclose(y_b, yb_oracle, rtol=1e-4, atol=1e-4)
+
+
+def test_structured_wanda_pruning_global_sparsity_invalid_sparsity_raises():
+    model = _mlp_model(K=8, H=16, Out=4)
+    with pytest.raises(ValueError):
+        onnxsim.apply_structured_wanda_pruning(
+            model, sparsity=1.0, global_sparsity=True
+        )
+    with pytest.raises(ValueError):
+        onnxsim.apply_structured_wanda_pruning(
+            model, sparsity=-0.1, global_sparsity=True
+        )
 
 
 # --- apply_attention_head_pruning ---------------------------------------
