@@ -946,10 +946,44 @@ const char* SelectMoESiluFc3FunctionTemplate(bool has_fc1_bias,
                       : kMoEFunctionSiluFc1NoBiasFc2NoBiasFc3NoBias;
 }
 
-// Context-dependent function body for MoE: attaches one of 24 fixed,
+// Interleaved (fusion_size=2, swiglu_fusion=1) SwiGLU -- the one activation
+// ONNX Runtime's own CPU MoE kernel actually implements natively: its
+// constructor (onnxruntime/contrib_ops/cpu/moe/moe_cpu.cc) throws unless
+// swiglu_fusion == 1 for a SwiGLU node, i.e. exactly this layout. fc1's own
+// Gemm output holds gate/linear interleaved column by column
+// (`ApplySwiGLUVectorized`: `gate = input[2*i]; linear = input[2*i+1]`),
+// de-interleaved here via a strided Slice -- see
+// generate_moe_function_templates.py's own comment for the formula and how
+// it was validated against a real onnxruntime session (both this schema's
+// own decomposition under a private domain, and the real native
+// com.microsoft.MoE kernel directly). has_swiglu_limit is its own axis
+// (not just another forwarded value like activation_alpha/beta) because
+// swiglu_limit is genuinely optional -- "no clamp when limit is not
+// provided" -- so its presence changes which ops the body contains, not
+// just what runtime value they see.
+const char* SelectMoESwigluFunctionTemplate(bool has_fc1_bias,
+                                            bool has_fc2_bias,
+                                            bool has_swiglu_limit) {
+  if (has_fc1_bias) {
+    if (has_fc2_bias) {
+      return has_swiglu_limit ? kMoEFunctionSwigluFc1BiasFc2BiasLimit
+                              : kMoEFunctionSwigluFc1BiasFc2BiasNoLimit;
+    }
+    return has_swiglu_limit ? kMoEFunctionSwigluFc1BiasFc2NoBiasLimit
+                            : kMoEFunctionSwigluFc1BiasFc2NoBiasNoLimit;
+  }
+  if (has_fc2_bias) {
+    return has_swiglu_limit ? kMoEFunctionSwigluFc1NoBiasFc2BiasLimit
+                            : kMoEFunctionSwigluFc1NoBiasFc2BiasNoLimit;
+  }
+  return has_swiglu_limit ? kMoEFunctionSwigluFc1NoBiasFc2NoBiasLimit
+                          : kMoEFunctionSwigluFc1NoBiasFc2NoBiasNoLimit;
+}
+
+// Context-dependent function body for MoE: attaches one of 32 fixed,
 // pre-built function bodies (contrib_schemas_moe_templates.gen.h), selected
 // purely by which optional inputs the node has (fc1_experts_bias,
-// fc2_experts_bias) and which of the four implemented activations it uses --
+// fc2_experts_bias) and which of the five implemented activations it uses --
 // no per-node codegen happens here anymore. That selection is the one piece
 // of context-dependence ONNX genuinely requires and can't be designed away:
 // confirmed empirically (see generate_moe_function_templates.py's module
@@ -957,7 +991,7 @@ const char* SelectMoESiluFc3FunctionTemplate(bool has_fc1_bias,
 // input count to match its formal parameter list, so a function that
 // references an optional input directly cannot also serve a call site that
 // omits it -- the *node list itself*, not just a runtime value, would need
-// to differ. Every one of the 24 bodies is otherwise fully generic: any
+// to differ. Every one of the 32 bodies is otherwise fully generic: any
 // num_experts (a real ONNX `Loop`, not a per-node unrolled copy), and k/
 // normalize_routing_weights/use_sparse_mixer forwarded from the calling
 // node's own attributes and dispatched via runtime `If`s inside the body,
@@ -972,15 +1006,32 @@ const char* SelectMoESiluFc3FunctionTemplate(bool has_fc1_bias,
 // CPU MoE kernel rejects fc3 outright, for any activation) -- disclosed as
 // the same kind of validation gap as use_sparse_mixer below.
 //
+// activation_type == "swiglu" with swiglu_fusion == 1 (the interleaved
+// layout) is supported too -- see SelectMoESwigluFunctionTemplate's comment
+// for the formula. Unlike fc3/use_sparse_mixer, this one IS checked end to
+// end against a real onnxruntime CPU session (both the native
+// com.microsoft.MoE kernel directly and this schema's own decomposition):
+// it is the one activation ORT's own CPU MoE kernel actually implements.
+// activation_alpha/activation_beta must both be present on the calling
+// node to build this: unlike k/normalize_routing_weights/use_sparse_mixer,
+// which forward through a value the routing math treats uniformly whether
+// present or not, a genuinely absent alpha/beta has nothing valid to
+// forward via ref_attr_name (there is no "sentinel means missing" case for
+// a FLOAT attribute the way an If-branch handles an absent flag) --
+// in practice this is not a real restriction, since onnxruntime-genai's own
+// builder always sets both explicitly regardless of activation_type.
+//
 // Still declines (returns false, leaving the node opaque but still
 // shape-inferable via the TypeAndShapeInferenceFunction above):
-//  - swiglu, or an unrecognized activation_type (also swiglu_fusion != 0,
-//    which is only meaningful for swiglu) -- not yet implemented; unlike
-//    num_experts/k/normalize_routing_weights/use_sparse_mixer above, swiglu
-//    needs genuinely different ops (a second per-expert GEMM, a different
-//    activation formula, a fused/interleaved input layout), not just a
-//    different runtime value, so it can't be folded into the same fixed
-//    bodies as a runtime branch the way those were.
+//  - swiglu with swiglu_fusion != 1 (the non-interleaved layouts), or an
+//    unrecognized activation_type -- not yet implemented; swiglu_fusion 0
+//    (separate, non-interleaved) or 2 (fused, non-interleaved) needs a
+//    genuinely different input layout, not just a different runtime value.
+//  - swiglu with fc3_experts_weights present: swiglu's own fc1 is already
+//    the fused gate+linear pair, so a separate fc3 has no defined meaning
+//    here (real ORT has none either).
+//  - swiglu_fusion != 0 for any non-swiglu activation (only meaningful for
+//    swiglu).
 //  - fc3_experts_weights with any activation other than silu: real ORT has
 //    no defined behavior for that combination either (its CUDA kernel's
 //    fc3 remapping is itself gated on activation_type == silu), so this
@@ -995,33 +1046,52 @@ bool BuildMoEFunctionBody(const FunctionBodyBuildContext& ctx,
           ? activation_attr->s()
           : "relu";
   if (activation != "relu" && activation != "identity" &&
-      activation != "silu" && activation != "gelu") {
-    return false;  // swiglu, or an unrecognized value.
+      activation != "silu" && activation != "gelu" && activation != "swiglu") {
+    return false;  // an unrecognized value.
   }
   const auto* swiglu_fusion_attr = ctx.getAttribute("swiglu_fusion");
-  if (swiglu_fusion_attr != nullptr && swiglu_fusion_attr->has_i() &&
-      swiglu_fusion_attr->i() != 0) {
-    return false;
-  }
-  const bool has_fc3 = ctx.hasInput(6);
-  if (has_fc3 && activation != "silu") {
-    // relu/identity/gelu + fc3 has no ORT-defined behavior at all: real
-    // ORT's CUDA kernel only remaps fc3 into its SwiGLU path when
-    // activation_type is silu specifically (see
-    // SelectMoESiluFc3FunctionTemplate's comment); for any other activation it
-    // would still repack fc1/fc3 into a doubled-width buffer while running that
-    // activation on it unchanged, silently misinterpreting the weights rather
-    // than erroring -- so this stays declined instead of guessing a formula for
-    // it.
-    return false;
-  }
-
+  const int64_t swiglu_fusion =
+      (swiglu_fusion_attr != nullptr && swiglu_fusion_attr->has_i())
+          ? swiglu_fusion_attr->i()
+          : 0;
   const bool has_fc1_bias = ctx.hasInput(3);
   const bool has_fc2_bias = ctx.hasInput(5);
-  const char* text = has_fc3 ? SelectMoESiluFc3FunctionTemplate(
-                                   has_fc1_bias, has_fc2_bias, ctx.hasInput(7))
-                             : SelectMoEFunctionTemplate(
-                                   activation, has_fc1_bias, has_fc2_bias);
+  const bool has_fc3 = ctx.hasInput(6);
+
+  const char* text;
+  if (activation == "swiglu") {
+    if (swiglu_fusion != 1 || has_fc3) {
+      return false;  // non-interleaved layout, or fc3 alongside swiglu.
+    }
+    const auto* alpha_attr = ctx.getAttribute("activation_alpha");
+    const auto* beta_attr = ctx.getAttribute("activation_beta");
+    if (alpha_attr == nullptr || !alpha_attr->has_f() || beta_attr == nullptr ||
+        !beta_attr->has_f()) {
+      return false;  // nothing valid to forward via ref_attr_name.
+    }
+    const bool has_swiglu_limit = ctx.getAttribute("swiglu_limit") != nullptr;
+    text = SelectMoESwigluFunctionTemplate(has_fc1_bias, has_fc2_bias,
+                                           has_swiglu_limit);
+  } else {
+    if (swiglu_fusion != 0) {
+      return false;  // only meaningful for swiglu.
+    }
+    if (has_fc3 && activation != "silu") {
+      // relu/identity/gelu + fc3 has no ORT-defined behavior at all: real
+      // ORT's CUDA kernel only remaps fc3 into its SwiGLU path when
+      // activation_type is silu specifically (see
+      // SelectMoESiluFc3FunctionTemplate's comment); for any other activation
+      // it would still repack fc1/fc3 into a doubled-width buffer while running
+      // that activation on it unchanged, silently misinterpreting the weights
+      // rather than erroring -- so this stays declined instead of guessing a
+      // formula for it.
+      return false;
+    }
+    text = has_fc3 ? SelectMoESiluFc3FunctionTemplate(
+                         has_fc1_bias, has_fc2_bias, ctx.hasInput(7))
+                   : SelectMoEFunctionTemplate(activation, has_fc1_bias,
+                                               has_fc2_bias);
+  }
 
   FunctionBuilder builder(function_proto);
   // Every standard-domain op any of the fixed bodies use (Softmax, TopK,

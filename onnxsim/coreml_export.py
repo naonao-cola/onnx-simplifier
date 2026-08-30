@@ -392,10 +392,13 @@ def _op_expand(lowerer, node, ins, attrs):
         x = lowerer.mb.cast(
             x=x, dtype="int32", name=lowerer.fresh_name(node, "boolcast")
         )
-    # `fill`'s output dtype follows its `value`'s Python type (int -> an integer
-    # MIL type, float -> a float one); match `x`'s (post-bool-cast) dtype so the
-    # `add` below doesn't reject the two operands as mismatched types.
-    fill_value = 0 if x.dtype == lowerer.types.int32 else 0.0
+    # `fill`'s output dtype follows its `value`'s Python type (`int` always
+    # becomes MIL's int32, a bare `float` always becomes fp32 regardless of
+    # context); match `x`'s (post-bool-cast) dtype explicitly via a numpy
+    # scalar so the `add` below doesn't reject the two operands as mismatched
+    # types -- e.g. an fp16 model's `x` next to fp32 `zeros`.
+    np_dtype = lowerer.types.nptype_from_builtin(x.dtype)
+    fill_value = np_dtype(0)
     zeros = lowerer.mb.fill(
         shape=shape_var, value=fill_value, name=lowerer.fresh_name(node, "zeros")
     )
@@ -409,7 +412,8 @@ def _op_expand(lowerer, node, ins, attrs):
 
 @_register("Neg")
 def _op_neg(lowerer, node, ins, attrs):
-    return [lowerer.mb.mul(x=ins[0], y=np.float32(-1.0), name=lowerer.fresh_name(node))]
+    np_dtype = lowerer.types.nptype_from_builtin(ins[0].dtype)
+    return [lowerer.mb.mul(x=ins[0], y=np_dtype(-1.0), name=lowerer.fresh_name(node))]
 
 
 @_register("LeakyRelu")
@@ -486,17 +490,18 @@ def _op_gemm(lowerer, node, ins, attrs):
         name=lowerer.fresh_name(node, "matmul"),
     )
     if alpha != 1.0:
+        np_dtype = lowerer.types.nptype_from_builtin(y.dtype)
         y = lowerer.mb.mul(
-            x=y, y=np.float32(alpha), name=lowerer.fresh_name(node, "alpha")
+            x=y, y=np_dtype(alpha), name=lowerer.fresh_name(node, "alpha")
         )
     if c is not None:
-        term = (
-            c
-            if beta == 1.0
-            else lowerer.mb.mul(
-                x=c, y=np.float32(beta), name=lowerer.fresh_name(node, "beta")
+        if beta == 1.0:
+            term = c
+        else:
+            np_dtype = lowerer.types.nptype_from_builtin(c.dtype)
+            term = lowerer.mb.mul(
+                x=c, y=np_dtype(beta), name=lowerer.fresh_name(node, "beta")
             )
-        )
         y = lowerer.mb.add(x=y, y=term, name=lowerer.fresh_name(node))
     return [y]
 
@@ -1042,8 +1047,12 @@ def _op_constant_of_shape(lowerer, node, ins, attrs):
     if shape_var.val is None:
         # The target shape is only known at runtime (e.g. derived from a KV
         # cache's dynamic length) -- MIL's `fill` op takes a non-constant shape,
-        # unlike materializing a numpy array here.
-        fill_val = _as_mil_array(np.array(fill_val, dtype=dtype)).item()
+        # unlike materializing a numpy array here. Keep `fill_val` as a numpy
+        # scalar (not a bare Python `int`/`float` via `.item()`): MIL infers a
+        # bare Python float as fp32 regardless of `dtype` here, which would
+        # produce e.g. an fp32 fill for an fp16 model.
+        mil_arr = _as_mil_array(np.array(fill_val, dtype=dtype))
+        fill_val = mil_arr.dtype.type(mil_arr.reshape(-1)[0])
         return [
             lowerer.mb.fill(
                 shape=shape_var, value=fill_val, name=lowerer.fresh_name(node)
