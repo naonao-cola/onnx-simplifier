@@ -38,6 +38,14 @@ Pipeline: `optimum.exporters.onnx` (decoder-with-past, dynamic axes) -> pin
 `batch_size` to 1 -> `onnxsim.simplify` -> `onnxsim.export_coreml` with
 `dynamic_shapes` for `sequence_length` / `past_sequence_length` / their sum.
 
+`--dtype` (default `fp32`) controls the precision the ONNX graph itself is
+traced and computed in -- separate from Core ML's own output precision,
+which defaults to float16 regardless (coremltools' `compute_precision`).
+For a multi-billion-parameter model, tracing in float32 means PyTorch and
+the in-progress ONNX graph can hold more than one full-size copy of the
+model's weights at once (well over the model's own on-disk size); `--dtype
+fp16` roughly halves that peak.
+
 Usage:
     python export_llm_to_coreml.py HuggingFaceTB/SmolLM2-135M-Instruct \\
         --max-context-length 512 --output smollm2.mlpackage
@@ -76,13 +84,14 @@ def export_llm_to_coreml(
     max_context_length: int = 512,
     opset: int = 17,
     convert_to: str = "mlprogram",
+    dtype: str = "fp32",
 ) -> None:
     from optimum.exporters.onnx import main_export
 
     with tempfile.TemporaryDirectory(prefix="onnxsim_llm_export_") as tmpdir:
         print(
             f"Exporting {model_id!r} to ONNX (decoder-with-past, dynamic shapes, "
-            f"opset {opset})...",
+            f"opset {opset}, dtype {dtype})...",
             flush=True,
         )
         main_export(
@@ -95,28 +104,56 @@ def export_llm_to_coreml(
             # sequence_length/past_sequence_length dynamic regardless (see the
             # module docstring for why 2, not 1).
             sequence_length=2,
+            # optimum's own PyTorch-vs-ONNX-Runtime validation pass keeps both a
+            # full copy of the model and an onnxruntime session resident at once,
+            # roughly doubling peak memory during export -- prohibitive for a
+            # multi-billion-parameter model. onnxsim's own onnx.checker.check_model
+            # call below and the Core ML conversion that follows are the
+            # correctness checks this pipeline actually relies on.
+            do_validation=False,
+            dtype=dtype,
         )
 
         onnx_path = Path(tmpdir) / "model.onnx"
-        model = onnx.load(str(onnx_path))
 
         print(
             "Pinning batch_size=1 (sequence_length/past_sequence_length stay dynamic)...",
             flush=True,
         )
-        _fix_batch_size(model, batch_size=1)
-        onnx.checker.check_model(model)
+        # `_fix_batch_size` only touches declared shape dim fields, never tensor
+        # data, so this whole step never needs the model's weights loaded into
+        # memory -- `load_external_data=False` leaves each initializer as just its
+        # on-disk location, and re-saving keeps those references intact (same
+        # directory, untouched external-data files).
+        fixed_model = onnx.load(str(onnx_path), load_external_data=False)
+        _fix_batch_size(fixed_model, batch_size=1)
+        onnx.save(fixed_model, str(onnx_path))
+        num_nodes_before = len(fixed_model.graph.node)
+        del fixed_model
+
+        # A path-based check (unlike passing a ModelProto) uses onnx's C++
+        # file checker directly, with no in-memory protobuf-serialization size
+        # limit to trip over on a multi-billion-parameter model.
+        onnx.checker.check_model(str(onnx_path))
 
         print("Simplifying with onnxsim...", flush=True)
         import onnxsim
 
-        simplified, ok = onnxsim.simplify(model)
+        simplified_path = Path(tmpdir) / "model_simplified.onnx"
+        # Passing a *path* (not a ModelProto) with check_n=0 engages onnxsim's
+        # C++ path-to-path fast route, which needs only ~1x the model's size in
+        # peak memory (see bench/RESULTS_synthetic_decoder_oom.md) instead of the
+        # 2+x an in-memory ModelProto round trip costs.
+        _, ok = onnxsim.simplify(
+            str(onnx_path), output_path=str(simplified_path), check_n=0
+        )
         if not ok:
             raise RuntimeError("onnxsim.simplify() reported failure")
-        print(
-            f"  {len(model.graph.node)} -> {len(simplified.graph.node)} nodes",
-            flush=True,
-        )
+
+        # Only now load real tensor values: Core ML conversion needs them (MIL
+        # constants), everything before this point only needed shapes.
+        simplified = onnx.load(str(simplified_path))
+        print(f"  {num_nodes_before} -> {len(simplified.graph.node)} nodes", flush=True)
 
         print(f"Converting to Core ML ({convert_to}), dynamic KV cache...", flush=True)
         onnxsim.export_coreml(
@@ -173,6 +210,14 @@ def main() -> int:
         default="mlprogram",
         dest="convert_to",
     )
+    ap.add_argument(
+        "--dtype",
+        choices=["fp32", "fp16", "bf16"],
+        default="fp32",
+        help="Precision to trace and export the ONNX graph in (default: fp32). Use "
+        "fp16 for multi-billion-parameter models where tracing in float32 risks "
+        "running out of memory (see the module docstring).",
+    )
     args = ap.parse_args()
 
     export_llm_to_coreml(
@@ -181,6 +226,7 @@ def main() -> int:
         max_context_length=args.max_context_length,
         opset=args.opset,
         convert_to=args.convert_to,
+        dtype=args.dtype,
     )
     return 0
 
