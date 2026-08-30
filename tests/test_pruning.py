@@ -3,6 +3,7 @@ Wanda pruning (calibrated on activation norms), and structured (channel)
 pruning, see ``onnxsim/pruning.py``.
 """
 
+import ml_dtypes
 import numpy as np
 import onnx
 import onnx.helper
@@ -6437,6 +6438,12 @@ def _gqa_model(
     past_kv=None,  # None (empty) | "nonempty" (constant) | "dynamic" (graph input)
     past_key=None,  # explicit override for past_kv="nonempty" (else random)
     past_value=None,  # explicit override for past_kv="nonempty" (else random)
+    past_kv_dtype=np.float32,  # dtype of PastKey/PastValue -- quantized when non-float
+    k_scale=None,  # constant k_scale (PER_TENSOR/PER_CHANNEL array) or None (unconnected)
+    v_scale=None,  # constant v_scale, same convention as k_scale
+    k_quant_type=None,  # GQA node's own k_quant_type attribute, e.g. "PER_TENSOR"
+    v_quant_type=None,  # GQA node's own v_quant_type attribute
+    kv_cache_bit_width=None,  # GQA node's own kv_cache_bit_width attribute (8 or 4)
 ):
     # Real ONNX Runtime CPU kernels for GroupQueryAttention require
     # head_size to be a multiple of 8 (verified empirically -- a smaller
@@ -6485,14 +6492,41 @@ def _gqa_model(
         onnx.numpy_helper.from_array(np.array(total_seq, dtype=np.int32), "TotalSeq")
     )
 
+    def _random_past_kv_default():
+        # `np.iinfo` covers `int8`/`uint8`; `float8e4m3fn` is neither
+        # `np.floating` nor an integer dtype `np.iinfo` recognizes (its
+        # numpy `kind` is opaque, `'V'`), so it gets its own small-range
+        # float draw instead -- well inside e4m3's own representable range
+        # (~448 magnitude) with plenty of margin for its coarser mantissa.
+        if np.issubdtype(past_kv_dtype, np.floating):
+            return rng.standard_normal((batch, KVH, 1, D))
+        try:
+            info = np.iinfo(past_kv_dtype)
+        except (ValueError, TypeError):
+            return rng.uniform(-2.0, 2.0, size=(batch, KVH, 1, D))
+        return rng.integers(
+            max(info.min, -64), min(info.max, 64) + 1, size=(batch, KVH, 1, D)
+        )
+
     operands = ["q", "k", "v"]
     extra_graph_inputs = ""
     if past_kv == "nonempty":
         if past_key is None:
-            past_key = rng.standard_normal((batch, KVH, 1, D)).astype(np.float32)
+            past_key = _random_past_kv_default()
         if past_value is None:
-            past_value = rng.standard_normal((batch, KVH, 1, D)).astype(np.float32)
-        initializer += [_f32(past_key, "PastKey"), _f32(past_value, "PastValue")]
+            past_value = _random_past_kv_default()
+        # Cast once and reuse the *quantized* (post-cast) array both for the
+        # initializer and the returned `cfg` -- `past_kv_dtype`'s own cast
+        # can be lossy (`float8e4m3fn`'s coarse mantissa, most notably), so
+        # a caller comparing `cfg["past_key"]` against the model's own
+        # initializer (e.g. after slicing) needs the already-quantized
+        # values, not the pre-cast ones.
+        past_key = np.asarray(past_key).astype(past_kv_dtype)
+        past_value = np.asarray(past_value).astype(past_kv_dtype)
+        initializer += [
+            onnx.numpy_helper.from_array(past_key, "PastKey"),
+            onnx.numpy_helper.from_array(past_value, "PastValue"),
+        ]
         operands += ["PastKey", "PastValue"]
     elif past_kv == "dynamic":
         operands += ["PastKeyIn", "PastValueIn"]
@@ -6504,6 +6538,25 @@ def _gqa_model(
         operands += ["", ""]
     operands += ["SeqLensK", "TotalSeq"]
 
+    # `k_scale`/`v_scale` (GQA input indices 12/13) sit behind five other
+    # optional inputs (cos_cache/sin_cache/position_ids/attention_bias/
+    # head_sink, indices 7-11, all left unconnected here -- none of this
+    # module's own matching/slicing touches them) that must be threaded
+    # through as empty positional placeholders for the text format's
+    # positional-input convention to reach index 12/13 at all.
+    if k_scale is not None or v_scale is not None:
+        operands += [""] * 5
+        if k_scale is not None:
+            initializer.append(_f32(np.asarray(k_scale), "KScale"))
+            operands.append("KScale")
+        else:
+            operands.append("")
+        if v_scale is not None:
+            initializer.append(_f32(np.asarray(v_scale), "VScale"))
+            operands.append("VScale")
+        else:
+            operands.append("")
+
     if with_reshape:
         shape = np.array([batch, seq, Nq], dtype=np.int64)
         initializer.append(onnx.numpy_helper.from_array(shape, "Shape"))
@@ -6511,13 +6564,21 @@ def _gqa_model(
     else:
         tail = "Y = MatMul(ctx, Wout)"
 
+    attrs = f"num_heads={H}, kv_num_heads={KVH}"
+    if k_quant_type is not None:
+        attrs += f', k_quant_type = "{k_quant_type}"'
+    if v_quant_type is not None:
+        attrs += f', v_quant_type = "{v_quant_type}"'
+    if kv_cache_bit_width is not None:
+        attrs += f", kv_cache_bit_width={kv_cache_bit_width}"
+
     body = f"""
         g (float[{batch},{seq},{K}] X{extra_graph_inputs}) => (float[{batch},{seq},{Out}] Y)
         {{
           q = {q_op}
           k = {k_op}
           v = {v_op}
-          ctx, pk, pv = com.microsoft.GroupQueryAttention <num_heads={H}, kv_num_heads={KVH}> ({", ".join(operands)})
+          ctx, pk, pv = com.microsoft.GroupQueryAttention <{attrs}> ({", ".join(operands)})
           {tail}
         }}
         """
@@ -6551,6 +6612,8 @@ def _gqa_model(
         seq=seq,
         past_key=past_key,
         past_value=past_value,
+        k_scale=k_scale,
+        v_scale=v_scale,
     )
 
 
@@ -6842,17 +6905,21 @@ def test_gqa_pruning_dynamic_past_kv_input_is_still_pruned():
     assert list(inits["Wv"].dims) == [8, 1 * cfg["D"]]
 
 
-def test_gqa_pruning_quantized_past_kv_constant_is_left_untouched():
+def test_gqa_pruning_quantized_past_kv_constant_with_no_scale_is_left_untouched():
     # A non-FLOAT constant past_key/past_value (standing in for a quantized
     # KV cache -- GroupQueryAttention's own schema allows `past_key`/
     # `past_value` to be `float8e4m3fn`/`uint8`/`int8` when quantized, per
     # `onnxruntime.capi.onnxruntime_pybind11_state.get_all_operator_schema()`'s
-    # own "Quantization" section) is declined outright by
-    # `_past_kv_constants_are_sliceable` rather than sliced as if it were an
-    # ordinary float BNSH tensor: a quantized cache's own `k_scale`/
-    # `v_scale` tensors would need identical per-KV-head-axis slicing to
-    # stay consistent, which this module makes no attempt to locate or
-    # slice, so guessing here would silently corrupt the cache.
+    # own "Quantization" section) with *no* `k_scale`/`v_scale` wired up at
+    # all is declined outright by `_past_kv_constants_are_sliceable` rather
+    # than sliced as if it were an ordinary float BNSH tensor: that schema
+    # section states the corresponding scale "must be provided" whenever
+    # quantization is enabled, so a quantized cache with no scale connected
+    # is off-schema and not a shape this module can prove safe to touch --
+    # unlike the case with a real, schema-conforming scale connected (see
+    # `test_gqa_pruning_quantized_int8_per_tensor_scale_matches_oracle_exactly`
+    # and `test_gqa_pruning_quantized_int8_per_channel_scale_matches_oracle_exactly`
+    # below), which this module *does* now slice consistently.
     model, cfg = _gqa_model(K=8, H=8, KVH=2, D=8, Out=6, seed=25, past_kv="nonempty")
     inits_map = {t.name: t for t in model.graph.initializer}
     quantized_past_key = onnx.numpy_helper.from_array(
@@ -6871,6 +6938,357 @@ def test_gqa_pruning_quantized_past_kv_constant_is_left_untouched():
     }
     for name in inits_before:
         np.testing.assert_array_equal(inits_before[name], inits_after[name])
+
+
+def test_gqa_pruning_quantized_int8_per_tensor_scale_matches_oracle_exactly():
+    # A quantized (`int8`) constant past_key/past_value with a real,
+    # schema-conforming `"PER_TENSOR"` `k_scale`/`v_scale` (a single
+    # broadcast scalar, shape `[1]` -- GroupQueryAttention's own
+    # "Quantization Modes" doc section) is now matched and pruned: the cache
+    # is sliced along its `kv_num_heads` axis by the same `keep_groups` used
+    # for K's/V's own producer weights, exactly like an unquantized cache,
+    # while the scale -- having no per-head axis at all -- is left
+    # completely untouched. Verified by *actual execution*: real
+    # onnxruntime (confirmed in this environment to run a quantized
+    # `GroupQueryAttention` node on CPU, `int8` cache, unlike `uint8` which
+    # this environment's onnxruntime CPU kernel errors on for any input --
+    # a pre-existing runtime limitation unrelated to this module, not
+    # exercised via execution here) on the pruned model matches a
+    # from-scratch oracle model built with every tensor (weights, cache,
+    # scale) pre-sliced by hand to the identical indices.
+    K, H, KVH, D, Out = 8, 8, 2, 8, 6
+    rng = np.random.default_rng(50)
+    k_scale = np.array([0.05], dtype=np.float32)
+    v_scale = np.array([0.03], dtype=np.float32)
+    model, cfg = _gqa_model(
+        K=K,
+        H=H,
+        KVH=KVH,
+        D=D,
+        Out=Out,
+        seed=50,
+        batch=1,
+        past_kv="nonempty",
+        past_kv_dtype=np.int8,
+        k_scale=k_scale,
+        v_scale=v_scale,
+        k_quant_type="PER_TENSOR",
+        v_quant_type="PER_TENSOR",
+        kv_cache_bit_width=8,
+    )
+    onnx.checker.check_model(model)
+    assert len(onnxsim.pruning._find_gqa_chains(model.graph)) == 1
+
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    node = _gqa_node(pruned)
+    num_heads, kv_num_heads = _gqa_attrs(node)
+    assert kv_num_heads == 1  # max(1, 2 - round(2*0.5))
+    group_size = H // KVH
+
+    keep_groups = _oracle_keep_groups(
+        cfg["wq"], cfg["wk"], cfg["wv"], H, KVH, D, kv_num_heads
+    )
+    keep_q_heads = _group_q_heads(keep_groups, group_size)
+    q_idx, kv_idx = _head_idx(keep_q_heads, D), _head_idx(keep_groups, D)
+
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    np.testing.assert_array_equal(
+        inits["PastKey"], cfg["past_key"][:, keep_groups, :, :]
+    )
+    np.testing.assert_array_equal(
+        inits["PastValue"], cfg["past_value"][:, keep_groups, :, :]
+    )
+    # PER_TENSOR: no per-head axis -- the scale is untouched, byte-for-byte.
+    np.testing.assert_array_equal(inits["KScale"], k_scale)
+    np.testing.assert_array_equal(inits["VScale"], v_scale)
+
+    oracle, _ = _gqa_model(
+        K=K,
+        H=num_heads,
+        KVH=kv_num_heads,
+        D=D,
+        Out=Out,
+        seed=50,
+        batch=cfg["batch"],
+        seq=cfg["seq"],
+        wq=cfg["wq"][:, q_idx],
+        wk=cfg["wk"][:, kv_idx],
+        wv=cfg["wv"][:, kv_idx],
+        wout=cfg["wout"][q_idx, :],
+        past_kv="nonempty",
+        past_key=cfg["past_key"][:, keep_groups, :, :],
+        past_value=cfg["past_value"][:, keep_groups, :, :],
+        past_kv_dtype=np.int8,
+        k_scale=k_scale,
+        v_scale=v_scale,
+        k_quant_type="PER_TENSOR",
+        v_quant_type="PER_TENSOR",
+        kv_cache_bit_width=8,
+    )
+    onnx.checker.check_model(oracle)
+
+    x = rng.standard_normal((cfg["batch"], cfg["seq"], K)).astype(np.float32)
+    (y_pruned,) = _run(pruned, {"X": x})
+    (y_oracle,) = _run(oracle, {"X": x})
+    np.testing.assert_allclose(y_pruned, y_oracle, rtol=1e-4, atol=1e-4)
+
+
+def test_gqa_pruning_quantized_int8_per_channel_scale_matches_oracle_exactly():
+    # Same as the `"PER_TENSOR"` case above, but with a real
+    # `"PER_CHANNEL"` `k_scale`/`v_scale` (`[1, kv_num_heads, 1, head_size]`
+    # -- the *same* axis-1 `kv_num_heads` layout as the cache tensor itself,
+    # per the schema's own doc section) holding per-KV-head scale data: the
+    # scale is now sliced along axis 1 by the identical `keep_groups` index
+    # set the cache tensor and K's/V's own producer weights are sliced by,
+    # not merely left alone. Verified the same way, via real onnxruntime
+    # execution against a from-scratch, hand-sliced oracle model.
+    K, H, KVH, D, Out = 8, 8, 2, 8, 6
+    rng = np.random.default_rng(51)
+    k_scale = rng.uniform(0.01, 0.1, size=(1, KVH, 1, D)).astype(np.float32)
+    v_scale = rng.uniform(0.01, 0.1, size=(1, KVH, 1, D)).astype(np.float32)
+    model, cfg = _gqa_model(
+        K=K,
+        H=H,
+        KVH=KVH,
+        D=D,
+        Out=Out,
+        seed=51,
+        batch=1,
+        past_kv="nonempty",
+        past_kv_dtype=np.int8,
+        k_scale=k_scale,
+        v_scale=v_scale,
+        k_quant_type="PER_CHANNEL",
+        v_quant_type="PER_CHANNEL",
+        kv_cache_bit_width=8,
+    )
+    onnx.checker.check_model(model)
+    assert len(onnxsim.pruning._find_gqa_chains(model.graph)) == 1
+
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    node = _gqa_node(pruned)
+    num_heads, kv_num_heads = _gqa_attrs(node)
+    assert kv_num_heads == 1
+    group_size = H // KVH
+
+    keep_groups = _oracle_keep_groups(
+        cfg["wq"], cfg["wk"], cfg["wv"], H, KVH, D, kv_num_heads
+    )
+    keep_q_heads = _group_q_heads(keep_groups, group_size)
+    q_idx, kv_idx = _head_idx(keep_q_heads, D), _head_idx(keep_groups, D)
+
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    np.testing.assert_array_equal(
+        inits["PastKey"], cfg["past_key"][:, keep_groups, :, :]
+    )
+    np.testing.assert_array_equal(
+        inits["PastValue"], cfg["past_value"][:, keep_groups, :, :]
+    )
+    # PER_CHANNEL: sliced along axis 1 by the identical `keep_groups`.
+    np.testing.assert_array_equal(inits["KScale"], k_scale[:, keep_groups, :, :])
+    np.testing.assert_array_equal(inits["VScale"], v_scale[:, keep_groups, :, :])
+
+    oracle, _ = _gqa_model(
+        K=K,
+        H=num_heads,
+        KVH=kv_num_heads,
+        D=D,
+        Out=Out,
+        seed=51,
+        batch=cfg["batch"],
+        seq=cfg["seq"],
+        wq=cfg["wq"][:, q_idx],
+        wk=cfg["wk"][:, kv_idx],
+        wv=cfg["wv"][:, kv_idx],
+        wout=cfg["wout"][q_idx, :],
+        past_kv="nonempty",
+        past_key=cfg["past_key"][:, keep_groups, :, :],
+        past_value=cfg["past_value"][:, keep_groups, :, :],
+        past_kv_dtype=np.int8,
+        k_scale=k_scale[:, keep_groups, :, :],
+        v_scale=v_scale[:, keep_groups, :, :],
+        k_quant_type="PER_CHANNEL",
+        v_quant_type="PER_CHANNEL",
+        kv_cache_bit_width=8,
+    )
+    onnx.checker.check_model(oracle)
+
+    x = rng.standard_normal((cfg["batch"], cfg["seq"], K)).astype(np.float32)
+    (y_pruned,) = _run(pruned, {"X": x})
+    (y_oracle,) = _run(oracle, {"X": x})
+    np.testing.assert_allclose(y_pruned, y_oracle, rtol=1e-4, atol=1e-4)
+
+
+def test_gqa_pruning_quantized_cache_malformed_scale_shape_is_declined():
+    # A `k_scale`/`v_scale` constant that is neither the `"PER_TENSOR"`
+    # single-broadcast-scalar shape nor the `"PER_CHANNEL"`
+    # `[1, kv_num_heads, 1, head_size]` layout (here: a plain rank-2
+    # `[kv_num_heads, head_size]` tensor, a shape neither this module nor
+    # the schema's own two named quantization modes account for) declines
+    # the whole match outright -- guessing at a slicing axis for a shape the
+    # schema itself doesn't document would risk silently producing a
+    # mismatched scale.
+    K, H, KVH, D, Out = 8, 8, 2, 8, 6
+    bad_scale = (
+        np.random.default_rng(52).uniform(0.01, 0.1, size=(KVH, D)).astype(np.float32)
+    )
+    model, cfg = _gqa_model(
+        K=K,
+        H=H,
+        KVH=KVH,
+        D=D,
+        Out=Out,
+        seed=52,
+        batch=1,
+        past_kv="nonempty",
+        past_kv_dtype=np.int8,
+        k_scale=bad_scale,
+        v_scale=bad_scale,
+        k_quant_type="PER_CHANNEL",
+        v_quant_type="PER_CHANNEL",
+        kv_cache_bit_width=8,
+    )
+    assert onnxsim.pruning._find_gqa_chains(model.graph) == []
+
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    inits_before = {
+        t.name: onnx.numpy_helper.to_array(t) for t in model.graph.initializer
+    }
+    inits_after = {
+        t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer
+    }
+    for name in inits_before:
+        np.testing.assert_array_equal(inits_before[name], inits_after[name])
+
+
+def test_gqa_pruning_quantized_cache_dynamic_scale_does_not_block_match():
+    # A *dynamic* (non-constant, an ordinary graph input) `k_scale`/`v_scale`
+    # -- even one shaped like a real `"PER_CHANNEL"` scale -- is left alone
+    # exactly like a dynamic past_key/past_value: it is the caller's own
+    # runtime data, not a weight this rewrite could corrupt by leaving
+    # untouched, so it must not block the match. The quantized cache itself
+    # is still sliced along its own `kv_num_heads` axis as usual.
+    K, H, KVH, D, Out = 8, 8, 2, 8, 6
+    rng = np.random.default_rng(53)
+    wq = rng.standard_normal((K, H * D)).astype(np.float32)
+    wk = rng.standard_normal((K, KVH * D)).astype(np.float32)
+    wv = rng.standard_normal((K, KVH * D)).astype(np.float32)
+    wout = rng.standard_normal((H * D, Out)).astype(np.float32)
+    past_key = rng.integers(-64, 64, size=(1, KVH, 1, D)).astype(np.int8)
+    past_value = rng.integers(-64, 64, size=(1, KVH, 1, D)).astype(np.int8)
+
+    model = parser.parse_model(
+        f"""
+        <
+          ir_version: 10,
+          opset_import: ["": 17, "com.microsoft": 1]
+        >
+        g (float[1,1,{K}] X, float[1,{KVH},1,{D}] KScaleIn, float[1,{KVH},1,{D}] VScaleIn)
+        => (float[1,1,{Out}] Y)
+        {{
+          q = MatMul(X, Wq)
+          k = MatMul(X, Wk)
+          v = MatMul(X, Wv)
+          ctx, pk, pv = com.microsoft.GroupQueryAttention
+              <num_heads={H}, kv_num_heads={KVH}, k_quant_type = "PER_CHANNEL",
+               v_quant_type = "PER_CHANNEL", kv_cache_bit_width=8>
+              (q, k, v, PastKey, PastValue, SeqLensK, TotalSeq,
+               "", "", "", "", "", KScaleIn, VScaleIn)
+          Y = MatMul(ctx, Wout)
+        }}
+        """
+    )
+    model.graph.initializer.extend(
+        [
+            _f32(wq, "Wq"),
+            _f32(wk, "Wk"),
+            _f32(wv, "Wv"),
+            _f32(wout, "Wout"),
+            onnx.numpy_helper.from_array(past_key, "PastKey"),
+            onnx.numpy_helper.from_array(past_value, "PastValue"),
+            onnx.numpy_helper.from_array(np.array([0], dtype=np.int32), "SeqLensK"),
+            onnx.numpy_helper.from_array(np.array(1, dtype=np.int32), "TotalSeq"),
+        ]
+    )
+    onnx.checker.check_model(model)
+    assert len(onnxsim.pruning._find_gqa_chains(model.graph)) == 1
+
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    node = _gqa_node(pruned)
+    num_heads, kv_num_heads = _gqa_attrs(node)
+    assert kv_num_heads == 1
+    # The scale inputs stay wired to the same (untouched) graph inputs.
+    assert list(node.input[12:14]) == ["KScaleIn", "VScaleIn"]
+
+    keep_groups = _oracle_keep_groups(wq, wk, wv, H, KVH, D, kv_num_heads)
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    np.testing.assert_array_equal(inits["PastKey"], past_key[:, keep_groups, :, :])
+    np.testing.assert_array_equal(inits["PastValue"], past_value[:, keep_groups, :, :])
+
+
+def test_gqa_pruning_quantized_cache_accepts_every_schema_quantized_dtype():
+    # `GroupQueryAttention`'s own `T_CACHE` type constraint allows exactly
+    # three quantized dtypes for `past_key`/`past_value`:
+    # `float8e4m3fn`/`uint8`/`int8` (confirmed via
+    # `onnxruntime.capi.onnxruntime_pybind11_state.get_all_operator_schema()`).
+    # `int8` is exercised end-to-end via real onnxruntime execution in
+    # `test_gqa_pruning_quantized_int8_per_tensor_scale_matches_oracle_exactly`/
+    # `..._per_channel_scale_matches_oracle_exactly` above; `uint8` cannot be
+    # (this environment's onnxruntime CPU `GroupQueryAttention` kernel
+    # errors -- "Tensor type mismatch" -- on *any* `uint8` cache, even an
+    # unpruned, un-modified one, a pre-existing runtime limitation unrelated
+    # to this module) and `float8e4m3fn` is not attempted via execution
+    # either, so both are instead verified structurally here: the match
+    # succeeds and the cache/scale tensors are sliced to the exact expected
+    # values (direct tensor inspection), the fallback this task's own
+    # instructions call for when execution isn't available.
+    K, H, KVH, D, Out = 8, 8, 2, 8, 6
+    for dtype in (np.uint8, ml_dtypes.float8_e4m3fn):
+        k_scale = np.array([0.05], dtype=np.float32)
+        v_scale = np.array([0.03], dtype=np.float32)
+        model, cfg = _gqa_model(
+            K=K,
+            H=H,
+            KVH=KVH,
+            D=D,
+            Out=Out,
+            seed=54,
+            batch=1,
+            past_kv="nonempty",
+            past_kv_dtype=dtype,
+            k_scale=k_scale,
+            v_scale=v_scale,
+            k_quant_type="PER_TENSOR",
+            v_quant_type="PER_TENSOR",
+            kv_cache_bit_width=8,
+        )
+        onnx.checker.check_model(model)
+        assert len(onnxsim.pruning._find_gqa_chains(model.graph)) == 1, dtype
+
+        pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+        onnx.checker.check_model(pruned)
+        node = _gqa_node(pruned)
+        _, kv_num_heads = _gqa_attrs(node)
+        keep_groups = _oracle_keep_groups(
+            cfg["wq"], cfg["wk"], cfg["wv"], H, KVH, D, kv_num_heads
+        )
+        inits = {
+            t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer
+        }
+        np.testing.assert_array_equal(
+            inits["PastKey"], cfg["past_key"][:, keep_groups, :, :]
+        )
+        np.testing.assert_array_equal(
+            inits["PastValue"], cfg["past_value"][:, keep_groups, :, :]
+        )
+        np.testing.assert_array_equal(inits["KScale"], k_scale)
+        np.testing.assert_array_equal(inits["VScale"], v_scale)
 
 
 def test_gqa_wanda_pruning_matches_oracle_exactly():
