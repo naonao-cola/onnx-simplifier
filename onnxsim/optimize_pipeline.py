@@ -9,10 +9,16 @@ techniques on top of a single fixed INT4 baseline.
 
 1. **Simplify** (:func:`onnxsim.simplify`) -- always, as a fusion/cleanup
    baseline every later stage builds on.
-2. **Prune** (optional, ``sparsity``) -- :func:`onnxsim.apply_structured_pruning_cpp`
-   (data-free channel pruning): shrinking the model *before* quantizing means
-   later stages spend their whole error budget on channels that survive,
-   rather than on ones that will end up zeroed anyway.
+2. **Prune** -- shrinking the model *before* quantizing means later stages
+   spend their whole error budget on weights that survive, rather than on
+   ones that will end up zeroed/removed anyway. Two independent, data-free
+   sub-stages, each optional and order-independent (they target disjoint
+   node sets -- see this module's own "C++ vs. Python" note below):
+   - (optional, ``attention_sparsity``) :func:`onnxsim.apply_attention_head_pruning_cpp`
+     -- drops whole attention heads (or, for grouped-query attention, whole
+     KV groups) from every matched fused self-attention block.
+   - (optional, ``sparsity``) :func:`onnxsim.apply_structured_pruning_cpp`
+     -- channel/filter pruning of the remaining MatMul/Gemm/Conv layers.
 3. **Cross-Layer Equalize** (:func:`onnxsim.cross_layer_equalize`) -- always;
    data-free, changes nothing but weight parameterization (see its own
    docstring), and reduces the error every later quantization stage
@@ -57,17 +63,24 @@ onnxsim quantization/pruning algorithm -- :func:`onnxsim.apply_duquant`/
 Wanda/SparseGPT-calibrated pruning are all still directly callable on their
 own, just not wired into this particular escalation.
 
-**C++ vs. Python.** The rotation (stage 4b), pruning (stage 2), and
-compression (stage 6) stages all use their C++-backed ports
-(:func:`onnxsim.apply_quarot_cpp`, :func:`onnxsim.apply_structured_pruning_cpp`,
-:func:`onnxsim.apply_double_quantization_cpp`) -- all three are at full scope
+**C++ vs. Python.** The rotation (stage 4b), both pruning sub-stages
+(stage 2), and compression (stage 6) all use their C++-backed ports
+(:func:`onnxsim.apply_quarot_cpp`, :func:`onnxsim.apply_attention_head_pruning_cpp`,
+:func:`onnxsim.apply_structured_pruning_cpp`,
+:func:`onnxsim.apply_double_quantization_cpp`) -- all four are at full scope
 parity with their pure-Python counterparts for the way this pipeline calls
 them (default ``block_size``/``epsilon``/``min_elements``/``sparsity``,
-magnitude-based channel importance rather than the calibrated Wanda
+magnitude-based channel/head importance rather than the calibrated Wanda
 variant), so the native path is strictly faster with no behavior gap. As
-with the other two, this needs revisiting if ``pruning.py``'s own
-data-free ``apply_structured_pruning`` grows a new chain topology the C++
-port (``structured_pruning_entry.cpp``) hasn't caught up to yet.
+with the others, this needs revisiting if ``pruning.py``'s own data-free
+``apply_structured_pruning``/``apply_attention_head_pruning`` grows a new
+topology the C++ ports (``structured_pruning_entry.cpp``) haven't caught up
+to yet. The two pruning sub-stages target disjoint node sets by
+construction -- :func:`onnxsim.apply_structured_pruning_cpp`'s own chain
+finders require a MatMul/Gemm/Conv *consumer*, which a fused self-attention
+op is never matched as, so it never touches the Q/K/V/output-projection
+weights :func:`onnxsim.apply_attention_head_pruning_cpp` prunes -- so
+running both, in either order, is safe.
 """
 
 from __future__ import annotations
@@ -83,6 +96,7 @@ from onnxsim.bias_correction import correct_bias
 from onnxsim.calibration import Tensors, generate_random_calibration_data
 from onnxsim.mixed_precision import apply_mixed_precision_quantization
 from onnxsim.onnx_simplifier import (
+    apply_attention_head_pruning_cpp,
     apply_double_quantization_cpp,
     apply_quarot_cpp,
     apply_structured_pruning_cpp,
@@ -96,11 +110,12 @@ from onnxsim.onnx_simplifier import (
 class OptimizationPipelineResult:
     """One :func:`apply_optimization_pipeline` result: the optimized model
     reached, which stages were applied to reach it (in application order,
-    a prefix of ``["structured_pruning", "cross_layer_equalization",
-    "quantize_weight_only_int4" | "apply_mixed_precision_quantization" |
-    "quarot", "adaround", "bias_correction", "double_quantization"]``), its
-    measured accuracy drop against the original float model, and whether it
-    met ``accuracy_budget``.
+    a prefix of ``["attention_head_pruning", "structured_pruning",
+    "cross_layer_equalization", "quantize_weight_only_int4" |
+    "apply_mixed_precision_quantization" | "quarot", "adaround",
+    "bias_correction", "double_quantization"]``), its measured accuracy
+    drop against the original float model, and whether it met
+    ``accuracy_budget``.
     """
 
     optimized_model: onnx.ModelProto
@@ -117,6 +132,7 @@ def apply_optimization_pipeline(
     seed: int = 0,
     providers: Optional[Sequence[str]] = None,
     sparsity: Optional[float] = None,
+    attention_sparsity: Optional[float] = None,
     bit_selection: str = "uniform",
     use_rotation: bool = False,
     num_adaround_iterations: int = 300,
@@ -146,6 +162,13 @@ def apply_optimization_pipeline(
             own target fraction of output channels to remove, applied to the
             float model before quantizing; ``None`` (the default) skips
             pruning entirely
+    :param attention_sparsity: if given, :func:`onnxsim.apply_attention_head_pruning_cpp`'s
+            own target fraction of attention heads (or, for grouped-query
+            attention, whole KV groups) to remove, applied to the float
+            model before quantizing (and before ``sparsity``'s own channel
+            pruning); ``None`` (the default) skips attention-head pruning
+            entirely. Independent of ``sparsity`` -- either, both, or
+            neither may be given
     :param bit_selection: ``"uniform"`` (the default) quantizes every layer
             to :func:`onnxsim.quantize_weight_only_int4`; ``"mixed_precision"``
             instead uses :func:`onnxsim.apply_mixed_precision_quantization`
@@ -199,6 +222,11 @@ def apply_optimization_pipeline(
 
     stages: List[str] = []
     float_model = model
+    if attention_sparsity is not None:
+        float_model = apply_attention_head_pruning_cpp(
+            float_model, sparsity=attention_sparsity
+        )
+        stages.append("attention_head_pruning")
     if sparsity is not None:
         float_model = apply_structured_pruning_cpp(float_model, sparsity=sparsity)
         stages.append("structured_pruning")
