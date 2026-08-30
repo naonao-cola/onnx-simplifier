@@ -85,6 +85,12 @@ def _import_mil():
 def _as_mil_array(arr: np.ndarray) -> np.ndarray:
     """Downcast ``arr`` to a dtype Core ML/MIL supports, or raise."""
     arr = np.asarray(arr)
+    if arr.dtype == np.int64:
+        # Saturate rather than wrap: ONNX graphs routinely use INT64_MAX/MIN as
+        # "unbounded" sentinels (e.g. a Slice `ends` meaning "to the end of this
+        # axis"), and a plain .astype(int32) wraps those around to -1/0 instead of
+        # a large in-range number, silently corrupting the sentinel.
+        arr = np.clip(arr, np.iinfo(np.int32).min, np.iinfo(np.int32).max)
     target = _NP_DOWNCAST.get(arr.dtype)
     if target is not None:
         arr = arr.astype(target)
@@ -121,7 +127,7 @@ def _make_input_spec(value_info: onnx.ValueInfoProto, mb, types):
     tt = value_info.type.tensor_type
     shape = []
     for d in tt.shape.dim:
-        if d.HasField("dim_value") and d.dim_value > 0:
+        if d.HasField("dim_value"):
             shape.append(int(d.dim_value))
         else:
             raise RuntimeError(
@@ -287,6 +293,8 @@ for _onnx_op, _mil_op in [
     ("Sqrt", "sqrt"),
     ("Erf", "erf"),
     ("Identity", "identity"),
+    ("Sin", "sin"),
+    ("Cos", "cos"),
 ]:
     _OP_HANDLERS[_onnx_op] = _simple_unary(_mil_op)
 
@@ -296,8 +304,45 @@ for _onnx_op, _mil_op in [
     ("Mul", "mul"),
     ("Div", "real_div"),
     ("Pow", "pow"),
+    ("Equal", "equal"),
+    ("LessOrEqual", "less_equal"),
+    ("And", "logical_and"),
 ]:
     _OP_HANDLERS[_onnx_op] = _simple_binary(_mil_op)
+
+
+@_register("Where")
+def _op_where(lowerer, node, ins, attrs):
+    cond, a, b = ins
+    return [lowerer.mb.select(cond=cond, a=a, b=b, name=lowerer.fresh_name(node))]
+
+
+@_register("IsNaN")
+def _op_isnan(lowerer, node, ins, attrs):
+    x = ins[0]
+    return [lowerer.mb.not_equal(x=x, y=x, name=lowerer.fresh_name(node))]
+
+
+@_register("Expand")
+def _op_expand(lowerer, node, ins, attrs):
+    x = ins[0]
+    shape_var = ins[1]
+    if shape_var.val is None:
+        raise RuntimeError(
+            "Expand requires a compile-time-constant target 'shape' input"
+        )
+    target = [int(v) for v in shape_var.val]
+    x_shape = list(x.shape)
+    pad = len(target) - len(x_shape)
+    if pad > 0:
+        x_shape = [1] * pad + x_shape
+        x = lowerer.mb.reshape(
+            x=x, shape=x_shape, name=lowerer.fresh_name(node, "reshape")
+        )
+    # ONNX Expand's broadcast rule (each axis is either 1 or already equal to the
+    # target) maps directly onto `tile`'s integer repeat-count for that axis.
+    reps = [t // s for s, t in zip(x_shape, target)]
+    return [lowerer.mb.tile(x=x, reps=reps, name=lowerer.fresh_name(node))]
 
 
 @_register("Neg")
@@ -740,11 +785,22 @@ def _op_gather(lowerer, node, ins, attrs):
     x, indices = ins[0], ins[1]
     axis = int(attrs.get("axis", 0))
     axis = axis if axis >= 0 else axis + x.rank
-    return [
-        lowerer.mb.gather(
-            x=x, indices=indices, axis=axis, name=lowerer.fresh_name(node)
+    # MIL's gather has no bool overload (unlike most other ops here); round-trip
+    # through int32 for a bool `x` (e.g. gathering rows out of a boolean mask).
+    is_bool = x.dtype == lowerer.types.bool
+    if is_bool:
+        x = lowerer.mb.cast(
+            x=x, dtype="int32", name=lowerer.fresh_name(node, "boolcast")
         )
-    ]
+    out = lowerer.mb.gather(
+        x=x,
+        indices=indices,
+        axis=axis,
+        name=lowerer.fresh_name(node, "gather" if is_bool else None),
+    )
+    if is_bool:
+        out = lowerer.mb.cast(x=out, dtype="bool", name=lowerer.fresh_name(node))
+    return [out]
 
 
 @_register("Tile")
@@ -755,6 +811,49 @@ def _op_tile(lowerer, node, ins, attrs):
     return [
         lowerer.mb.tile(
             x=ins[0], reps=[int(v) for v in reps.val], name=lowerer.fresh_name(node)
+        )
+    ]
+
+
+@_register("Shape")
+def _op_shape(lowerer, node, ins, attrs):
+    x = ins[0]
+    shape = x.shape
+    if any(not isinstance(d, (int, np.integer)) for d in shape):
+        raise RuntimeError("Shape requires a fully static input shape")
+    rank = len(shape)
+    start = int(attrs.get("start", 0))
+    start = start if start >= 0 else start + rank
+    end = int(attrs.get("end", rank))
+    end = end if end >= 0 else end + rank
+    return [
+        lowerer.make_const(node.output[0], np.array(shape[start:end], dtype=np.int64))
+    ]
+
+
+@_register("ConstantOfShape")
+def _op_constant_of_shape(lowerer, node, ins, attrs):
+    shape_var = ins[0]
+    if shape_var.val is None:
+        raise RuntimeError(
+            "ConstantOfShape requires a compile-time-constant 'shape' input"
+        )
+    shape = [int(v) for v in shape_var.val]
+    value = attrs.get("value")
+    if value is not None:
+        value = np.asarray(value)
+        fill_val, dtype = value.reshape(-1)[0], value.dtype
+    else:
+        fill_val, dtype = 0.0, np.float32
+    return [lowerer.make_const(node.output[0], np.full(shape, fill_val, dtype=dtype))]
+
+
+@_register("Range")
+def _op_range(lowerer, node, ins, attrs):
+    start, limit, delta = ins
+    return [
+        lowerer.mb.range_1d(
+            start=start, end=limit, step=delta, name=lowerer.fresh_name(node)
         )
     ]
 

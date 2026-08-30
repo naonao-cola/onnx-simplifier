@@ -250,6 +250,84 @@ def test_pad_reflect_matches_onnxruntime():
     np.testing.assert_array_equal(_mil_const_value(model_const), expected)
 
 
+def test_slice_end_sentinel_survives_int64_downcast():
+    # ONNX graphs routinely use INT64_MAX as a Slice `ends` sentinel meaning "to
+    # the end of this axis" (e.g. torch.onnx's export of `x[..., 32:]`). MIL has
+    # no int64 tensor type, so this translator downcasts int64 initializers to
+    # int32 -- a plain `.astype(int32)` wraps INT64_MAX around to -1 instead of
+    # saturating, which Slice's clamp logic would then read as "one before the
+    # end", silently dropping the last element. Regression test for that.
+    x = numpy_helper.from_array(np.arange(8, dtype=np.float32), name="x")
+    starts = numpy_helper.from_array(np.array([3], np.int64), name="starts")
+    ends = numpy_helper.from_array(
+        np.array([9223372036854775807], np.int64), name="ends"
+    )
+    model = _model(
+        "slicesentinel () => (float[5] out) { out = Slice (x, starts, ends) }",
+        initializer=[x, starts, ends],
+    )
+    np.testing.assert_array_equal(_mil_const_value(model), [3, 4, 5, 6, 7])
+
+
+def test_rope_ops_match_onnxruntime():
+    # Sin/Cos/Where/Expand/And/IsNaN/Shape/ConstantOfShape/Range and a bool-typed
+    # Gather all round out the op set a transformer decoder (RoPE + causal
+    # masking) needs; onnxsim/coreml_export.py was built against
+    # HuggingFaceTB/SmolLM2-135M-Instruct's exported decoder graph, which uses
+    # every one of them. Exercise the trig/select/broadcast/logical trio that
+    # decomposed op-by-op checks don't cover as a combination.
+    angle = np.array([0.0, np.pi / 2, np.pi, 3 * np.pi / 2], dtype=np.float32)
+    cond = np.array([True, False, True, False])
+    a = np.array([1.0, 2.0, 3.0, 4.0], dtype=np.float32)
+    b = np.array([-1.0, -2.0, -3.0, -4.0], dtype=np.float32)
+    inits = [
+        numpy_helper.from_array(angle, name="angle"),
+        numpy_helper.from_array(cond, name="cond"),
+        numpy_helper.from_array(a, name="a"),
+        numpy_helper.from_array(b, name="b"),
+    ]
+    model = _model(
+        """
+        rope () => (float[4] out)
+        {
+            s = Sin (angle)
+            c = Cos (angle)
+            sc = Mul (s, c)
+            picked = Where (cond, a, b)
+            out = Add (sc, picked)
+        }
+        """,
+        initializer=inits,
+    )
+    expected = np.sin(angle) * np.cos(angle) + np.where(cond, a, b)
+    np.testing.assert_allclose(_mil_const_value(model), expected, rtol=1e-5, atol=1e-5)
+
+
+def test_gather_on_bool_tensor():
+    mask = numpy_helper.from_array(
+        np.array([True, False, True, False, True]), name="mask"
+    )
+    idx = numpy_helper.from_array(np.array([0, 2, 4], np.int64), name="idx")
+    model = _model(
+        "gatherbool () => (bool[3] out) { out = Gather <axis=0> (mask, idx) }",
+        initializer=[mask, idx],
+    )
+    np.testing.assert_array_equal(_mil_const_value(model), [True, True, True])
+
+
+def test_zero_length_input_dimension_is_static():
+    # A concrete 0-length dimension (e.g. an empty KV cache) is fully static --
+    # just empty -- and must not be rejected as if it were a dynamic/symbolic
+    # dimension.
+    x = numpy_helper.from_array(np.zeros((1, 0, 4), np.float32), name="x")
+    y = np.arange(8, dtype=np.float32).reshape(1, 2, 4)
+    model = _model(
+        "emptycat () => (float[1,2,4] out) { out = Concat <axis=1> (x, y) }",
+        initializer=[x, numpy_helper.from_array(y, name="y")],
+    )
+    np.testing.assert_array_equal(_mil_const_value(model), y)
+
+
 # ---------------------------------------------------------------------------
 # Errors
 # ---------------------------------------------------------------------------
