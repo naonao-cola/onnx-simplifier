@@ -80,20 +80,26 @@ jobs:
   build-macos:
     name: Build onnxsim wheel (macOS arm64)
     runs-on: macos-15
+    env:
+      SCCACHE_GHA_ENABLED: "on"
+      ACTIONS_CACHE_SERVICE_V2: "on"
     steps:
       - uses: actions/checkout@v7
         with:
           submodules: recursive
-      - uses: actions/setup-python@v7
-        with:
-          python-version: "3.11"
-      - name: Build wheel
+          fetch-depth: 0
+      - uses: mozilla-actions/sccache-action@v0.0.11
+      - name: Build cp311 wheel
+        uses: pypa/cibuildwheel@v4.2.0
         env:
-          CMAKE_ARGS: "-DONNXSIM_BUILTIN_ORT=OFF"
-        run: |
-          python3 -m pip install --upgrade pip build
-          python3 -m pip install cmake ninja setuptools nanobind
-          python3 -m build --wheel --no-isolation -o wheelhouse
+          CIBW_BUILD: "cp311-macosx_arm64"
+          CIBW_ARCHS: native
+          CIBW_BUILD_FRONTEND: "pip; args: --no-build-isolation"
+          CIBW_BEFORE_BUILD: "python3 -m pip install --break-system-packages cmake ninja setuptools sccache nanobind"
+          # Matches build-and-test.yml's macOS build: onnx 1.23+ uses std::to_chars
+          # in its text printer, which libc++ only exposes from macOS 13.3, so pin
+          # the same deployment target onnx itself ships its wheels with.
+          CIBW_ENVIRONMENT: MACOSX_DEPLOYMENT_TARGET=13.3 CMAKE_ARGS="-DONNX_USE_PROTOBUF_SHARED_LIBS=OFF" CMAKE_GENERATOR=Ninja CMAKE_CXX_COMPILER_LAUNCHER=sccache CMAKE_LINKER_TYPE=LLD
       - uses: actions/upload-artifact@v7
         with:
           name: onnxsim-wheel-macos
