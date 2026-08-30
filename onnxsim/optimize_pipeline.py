@@ -9,12 +9,10 @@ techniques on top of a single fixed INT4 baseline.
 
 1. **Simplify** (:func:`onnxsim.simplify`) -- always, as a fusion/cleanup
    baseline every later stage builds on.
-2. **Prune** (optional, ``sparsity``) -- :func:`onnxsim.apply_structured_pruning`
+2. **Prune** (optional, ``sparsity``) -- :func:`onnxsim.apply_structured_pruning_cpp`
    (data-free channel pruning): shrinking the model *before* quantizing means
    later stages spend their whole error budget on channels that survive,
-   rather than on ones that will end up zeroed anyway. Uses the pure-Python
-   implementation specifically -- see this module's own "C++ vs. Python"
-   scope note below for why.
+   rather than on ones that will end up zeroed anyway.
 3. **Cross-Layer Equalize** (:func:`onnxsim.cross_layer_equalize`) -- always;
    data-free, changes nothing but weight parameterization (see its own
    docstring), and reduces the error every later quantization stage
@@ -59,19 +57,17 @@ onnxsim quantization/pruning algorithm -- :func:`onnxsim.apply_duquant`/
 Wanda/SparseGPT-calibrated pruning are all still directly callable on their
 own, just not wired into this particular escalation.
 
-**C++ vs. Python.** The rotation (stage 4b) and compression (stage 6)
-stages use their C++-backed ports (:func:`onnxsim.apply_quarot_cpp`,
-:func:`onnxsim.apply_double_quantization_cpp`) -- both are at full scope
+**C++ vs. Python.** The rotation (stage 4b), pruning (stage 2), and
+compression (stage 6) stages all use their C++-backed ports
+(:func:`onnxsim.apply_quarot_cpp`, :func:`onnxsim.apply_structured_pruning_cpp`,
+:func:`onnxsim.apply_double_quantization_cpp`) -- all three are at full scope
 parity with their pure-Python counterparts for the way this pipeline calls
-them (default ``block_size``/``epsilon``/``min_elements``), so the native
-path is strictly faster with no behavior gap. The pruning stage (2)
-deliberately still uses the pure-Python :func:`onnxsim.apply_structured_pruning`
-rather than :func:`onnxsim.apply_structured_pruning_cpp`: the Python
-implementation has since grown ``Concat``-merged (U-Net-style
-encoder/decoder skip-connection) chain support that the C++ port does not
-(yet) have, so preferring the native path here would silently prune fewer
-channels on any model with that topology -- a real behavior regression,
-not just a speed loss. Revisit this once the C++ port reaches parity.
+them (default ``block_size``/``epsilon``/``min_elements``/``sparsity``,
+magnitude-based channel importance rather than the calibrated Wanda
+variant), so the native path is strictly faster with no behavior gap. As
+with the other two, this needs revisiting if ``pruning.py``'s own
+data-free ``apply_structured_pruning`` grows a new chain topology the C++
+port (``structured_pruning_entry.cpp``) hasn't caught up to yet.
 """
 
 from __future__ import annotations
@@ -89,11 +85,11 @@ from onnxsim.mixed_precision import apply_mixed_precision_quantization
 from onnxsim.onnx_simplifier import (
     apply_double_quantization_cpp,
     apply_quarot_cpp,
+    apply_structured_pruning_cpp,
     cross_layer_equalize,
     quantize_weight_only_int4,
     simplify,
 )
-from onnxsim.pruning import apply_structured_pruning
 
 
 @dataclass
@@ -146,8 +142,8 @@ def apply_optimization_pipeline(
             ``calibration_data`` is supplied) and for :func:`onnxsim.apply_quarot_cpp`'s
             own per-layer rotations
     :param providers: onnxruntime execution providers to calibrate/run on
-    :param sparsity: if given, :func:`onnxsim.apply_structured_pruning`'s own
-            target fraction of output channels to remove, applied to the
+    :param sparsity: if given, :func:`onnxsim.apply_structured_pruning_cpp`'s
+            own target fraction of output channels to remove, applied to the
             float model before quantizing; ``None`` (the default) skips
             pruning entirely
     :param bit_selection: ``"uniform"`` (the default) quantizes every layer
@@ -204,7 +200,7 @@ def apply_optimization_pipeline(
     stages: List[str] = []
     float_model = model
     if sparsity is not None:
-        float_model = apply_structured_pruning(float_model, sparsity=sparsity)
+        float_model = apply_structured_pruning_cpp(float_model, sparsity=sparsity)
         stages.append("structured_pruning")
 
     float_model = cross_layer_equalize(float_model)
