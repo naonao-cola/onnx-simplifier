@@ -260,6 +260,36 @@ is declined outright rather than guessed at -- see
 :func:`_find_matmul_concat_chains`/:func:`_find_conv_concat_chains`'s own
 section comment for exactly why that line is where it's drawn.
 
+The shared downstream consumer of a Conv `Concat` merge may itself be a
+general grouped (`group != 1`) Conv -- but only when every branch's own
+fixed offset lands exactly on one of the consumer's own `group` block
+boundaries (`block = n_channels / group`), so every block the consumer's
+own per-block top-k needs a uniform survivor count from is owned by exactly
+one branch, never split across two. This is *not* simply inherited from the
+ordinary grouped-producer/grouped-consumer composition above: there, every
+producer's own output already sits in one *shared* index space the
+consumer's blocks partition, all pruned to one shared `keep` set, so one
+global block size settles every block at once. A `Concat` branch, by
+contrast, is pruned *independently*, by its own top-k over its own slice,
+with no visibility into any sibling branch's ranking -- the entire reason
+`Concat` support exists in the first place (see above). When branch
+boundaries are block-aligned, that independence is harmless: each block
+falls wholly inside one branch, which alone can satisfy that block's own
+uniform-count requirement (an internal per-block top-k of its own, mirroring
+:func:`_apply_chains`'s mechanism, just scoped to the blocks it contains).
+When a block instead straddles two branches, satisfying it needs the counts
+each branch independently contributes to that one shared block to sum to
+exactly the required `per_group_keep` -- which two rankings computed with no
+knowledge of each other have no general way to guarantee, and reconciling it
+would need exactly the cross-branch agreement `Concat` support exists to
+avoid. So that case is declined outright, the whole chain, the same
+conservative way as everywhere else in this module -- see
+:func:`_concat_branches_align_to_consumer_group`'s own docstring for the
+exact admission condition, the full argument, and a concrete counter-example
+of the straddling case. (MatMul/Gemm has no grouping concept at all, so this
+paragraph is Conv-only; a MatMul/Gemm `Concat` chain's consumer is always
+ordinary.)
+
 General multi-branch dependency-graph pruning remains out of scope --
 a non-`Add`/`SkipLayerNormalization`/`Concat` merge op, and fan-out
 anywhere *except* forward from an already-established residual/merge
@@ -4886,11 +4916,21 @@ def _find_gated_chains(graph: onnx.GraphProto) -> List[_Chain]:
 # `Concat` node itself never needs its own attributes changed (its output
 # shape is simply whatever its inputs' shapes are, so pruning each branch's
 # own producer already gives it the right, smaller input on its own). A
-# grouped (`group != 1`) Conv consumer is declined the same way
-# :func:`_find_conv_residual_chains` declines one: its per-group top-k
-# assumes every producer feeds the consumer's full channel range, which a
-# multi-branch group of independently-sized, independently-pruned branches
-# doesn't establish.
+# grouped (`group != 1`) Conv consumer (Conv chains only -- MatMul/Gemm has
+# no grouping concept) is admitted, but only when every branch's own fixed
+# offset lands exactly on one of the consumer's own `group` block
+# boundaries (:func:`_concat_branches_align_to_consumer_group`) -- unlike
+# the ordinary grouped-producer/grouped-consumer composition
+# (:func:`_find_conv_chains`), where every producer already shares one
+# combined `keep` set with the consumer's own block partition, a `Concat`
+# branch is pruned *independently* with no visibility into any sibling
+# branch's ranking, so a block owned by more than one branch has no general
+# way to land on that block's own required uniform survivor count without
+# reintroducing exactly the cross-branch agreement `Concat` support exists
+# to avoid -- that case (and only that case) is still declined outright, the
+# same way :func:`_find_conv_residual_chains` declines every grouped
+# consumer. See :func:`_concat_branches_align_to_consumer_group`'s own
+# docstring for the full safety argument and a concrete counter-example.
 
 
 def _concat_axis(node: onnx.NodeProto) -> Optional[int]:
@@ -5050,6 +5090,18 @@ class _ConcatChain:
     # Depthwise Conv hops crossed between the `Concat` node and the real
     # consumer (Conv chains only; see :class:`_ConvPassThrough`).
     conv_pass_through: Tuple[_ConvPassThrough, ...] = ()
+    # 1 for an ordinary consumer (always, for a MatMul/Gemm chain -- MatMul/
+    # Gemm has no grouping concept at all) or a Conv consumer this module
+    # declines to admit as grouped; > 1 for a general grouped Conv consumer
+    # admitted per :func:`_concat_branches_align_to_consumer_group` -- see
+    # that function's own docstring and this section's own comment for
+    # exactly which grouped consumers are safe to admit and why. Mirrors
+    # :class:`_Chain`'s own `consumer_group` field/:func:`_chain_group`, but
+    # unlike that field this one is *not* found by inspecting `producers`
+    # first: a `Concat` branch's own producer is never itself grouped (see
+    # this section's own comment), so the consumer's `group` is always the
+    # one that governs here.
+    consumer_group: int = 1
 
 
 def _branch_walk_has_fanout(
@@ -5528,6 +5580,79 @@ def _find_matmul_concat_chains(graph: onnx.GraphProto) -> List[_ConcatChain]:
     return chains
 
 
+def _concat_branches_align_to_consumer_group(
+    branches: Sequence[_ConcatBranch], n_channels: int, group: int
+) -> bool:
+    """True if a grouped (``group > 1``) Conv consumer's own `group`
+    equal-sized input-channel blocks (``block = n_channels // group``, the
+    same partition :func:`_slice_grouped_consumer_conv_weight` slices
+    against) line up exactly with this `Concat` merge's own branch
+    boundaries -- every branch's fixed `offset` a multiple of `block` -- so
+    that every one of the consumer's `group` blocks is owned by exactly one
+    branch, never split across two. Always ``True`` for ``group <= 1`` (an
+    ordinary consumer has no block partition to line up with at all).
+
+    This is precisely the boundary this composition is safe at, and no
+    wider -- the same block-partition argument :func:`_chain_group`'s own
+    docstring works through for a single grouped producer/consumer, but
+    *not* simply inherited from it, because a `Concat` branch's own pruning
+    is structurally different from that chain's: an ordinary chain's
+    producer(s) are all pruned to one *shared* `keep` set (the entire
+    reason :func:`_chain_group`'s single global `block` size works there --
+    every producer's own output is literally the same index space the
+    consumer's blocks partition), whereas a `Concat` branch is pruned
+    *independently*, by its own top-k over its own disjoint slice, with no
+    visibility into any other branch's ranking or how many channels it
+    plans to keep -- the entire reason `Concat` support exists in the first
+    place (see this module's own docstring and this section's own comment).
+    When every branch boundary is block-aligned, each of the consumer's
+    `group` blocks falls entirely within one branch's own slice, so that
+    branch alone can satisfy the block's own uniform-survivor-count
+    requirement: it simply treats each of its own ``own_width // block``
+    contained blocks exactly the way a single grouped producer already
+    treats its own `group` blocks in :func:`_apply_chains` (an independent
+    per-block top-k, keeping `per_group_keep` channels from each -- the
+    *same* count every other block anywhere in this merge keeps, since
+    `per_group_keep` is computed once from `block` and `sparsity`, and
+    `block` itself depends only on the consumer's own `group` and the
+    merge's total `n_channels`, never on which branch a channel happens to
+    fall in). No cross-branch agreement is ever needed, because no block
+    ever has more than one branch to agree between.
+
+    When a block instead straddles two (or more) branches -- some branch's
+    own boundary falls in the interior of a block rather than at its edge --
+    satisfying that block's own uniform-count requirement needs the counts
+    each of those branches independently contributes *from that one shared
+    block* to sum to exactly `per_group_keep`. A branch's own top-k, ranked
+    with no knowledge of any sibling branch's importance or how many
+    channels that sibling plans to keep, has no general way to land on a
+    matching split; reconciling it would need exactly the cross-branch
+    importance comparison `Concat` support was built to avoid -- silently
+    reintroducing the "must all agree" coupling an `Add`/
+    `SkipLayerNormalization` merge has, and a `Concat` merge deliberately
+    doesn't. Concrete counter-example: ``block=4``, ``per_group_keep=2``,
+    branch `a` owns local columns ``[0, 3)`` of that block (3 channels) and
+    branch `b` owns column ``[3, 4)`` (1 channel) -- if `a`'s own top-3
+    ranking keeps all 3 of its channels (a legitimate outcome of *its own*
+    sparsity target) and `b` keeps its 1, the block ends up with 4
+    survivors, not 2; if `a` keeps only 1 and `b` keeps its 1, the block
+    ends up with 2 survivors but there was no shared signal that told `a`
+    to cut down to 1 rather than the 2 or 3 its own ranking alone would
+    justify. Either way, `a` and `b`'s independent decisions can't be made
+    to reliably land on the one *any* correct grouped-Conv consumer needs
+    without deciding, from *outside* either branch's own ranking, how the
+    budget for that one shared block is split between them -- so this case
+    is declined outright, the same conservative way as everywhere else in
+    this module, whenever any block spans more than one branch (checked by
+    :func:`_find_conv_concat_chains` before a chain with `group > 1` is ever
+    produced).
+    """
+    if group <= 1:
+        return True
+    block = n_channels // group
+    return all(b.offset % block == 0 for b in branches)
+
+
 def _find_conv_concat_chains(graph: onnx.GraphProto) -> List[_ConcatChain]:
     """The Conv analogue of :func:`_find_matmul_concat_chains`: every operand
     of a channel-axis `Concat` (`axis in (1, -3)` -- the channel axis of a
@@ -5542,8 +5667,14 @@ def _find_conv_concat_chains(graph: onnx.GraphProto) -> List[_ConcatChain]:
     :func:`_find_matmul_concat_chains`'s own section comment for exactly
     what composing that requires and what it declines, identical reasoning
     on the Conv side) -- `"fail"` is declined outright either way. The
-    consumer must itself be an ordinary (`group=1`) Conv -- see this
-    section's own comment for why a grouped consumer is declined here.
+    consumer may be an ordinary (`group=1`) Conv, or a general grouped
+    (`group > 1`) Conv whose own block boundaries line up exactly with
+    every branch's own fixed offset -- see
+    :func:`_concat_branches_align_to_consumer_group`'s own docstring for
+    the exact admission condition and the safety argument (and the
+    concrete counter-example) for why a *misaligned* grouped consumer is
+    still declined, the same conservative way a residual/merge group
+    declines one outright regardless of alignment.
     """
     initializer_map = {t.name: t for t in graph.initializer}
     consumers_of = _consumers_of(graph)
@@ -5664,8 +5795,10 @@ def _find_conv_concat_chains(graph: onnx.GraphProto) -> List[_ConcatChain]:
         if consumer is None:
             continue
         consumer_node, consumer_weight, consumer_group = consumer
-        if consumer_group != 1:
-            continue  # see this section's own comment -- grouped consumer declined
+        if not _concat_branches_align_to_consumer_group(
+            branches, total_n, consumer_group
+        ):
+            continue  # see _concat_branches_align_to_consumer_group's own docstring
 
         chains.append(
             _ConcatChain(
@@ -5678,6 +5811,7 @@ def _find_conv_concat_chains(graph: onnx.GraphProto) -> List[_ConcatChain]:
                 consumer_is_conv=True,
                 n_channels=total_n,
                 conv_pass_through=fwd_pass_through,
+                consumer_group=consumer_group,
             )
         )
     return chains
@@ -5742,6 +5876,27 @@ def _apply_concat_chains(
     the two can never doubly resize the same weight; the caller flushes
     ``value_info`` once, from `touched.stale_value_info`, after every such
     call.
+
+    When `chain.consumer_group` (Conv chains only -- always 1 for a MatMul/
+    Gemm chain) is greater than 1, each branch's own independent `keep` is
+    still chosen with no cross-branch coordination -- only *how* it's chosen
+    within one branch changes: rather than one plain top-k of that branch's
+    own `n_channels`, it's chosen as one independent top-k *per
+    `block`-sized block the branch contains* (``block = chain.n_channels //
+    chain.consumer_group``, the exact same global block size and
+    `per_group_keep` target used everywhere else in this merge), exactly
+    mirroring :func:`_apply_chains`'s own per-block mechanism for a single
+    grouped producer/consumer -- safe here specifically because
+    :func:`_concat_branches_align_to_consumer_group` already confirmed every
+    such block falls entirely inside one branch before this chain was ever
+    produced, so a branch's own `n_channels // block` is always a whole
+    number and no block's own uniform-count requirement ever needs
+    contributions from more than one branch. See that function's own
+    docstring for the full safety argument (and the concrete counter-example
+    for why a straddling block is declined instead). The final consumer
+    slice is, correspondingly,
+    :func:`_slice_grouped_consumer_conv_weight` rather than
+    :func:`_slice_consumer_weight` whenever `consumer_group > 1`.
     """
     initializer_map = {t.name: t for t in graph.initializer}
 
@@ -5782,11 +5937,23 @@ def _apply_concat_chains(
         ):
             continue  # a shared/tied initializer another chain already resized
 
+        group = chain.consumer_group
+        if group > 1:
+            block = chain.n_channels // group
+            per_group_keep = max(1, round(block * (1.0 - sparsity)))
+
         branch_keeps: List[np.ndarray] = []
         any_pruned = False
         for b in chain.branches:
             n = b.n_channels
-            keep_count = max(1, n - round(n * sparsity))
+            if group > 1:
+                # Whole number by construction -- see
+                # _concat_branches_align_to_consumer_group's own docstring
+                # and this function's own docstring above.
+                local_blocks = n // block
+                keep_count = per_group_keep * local_blocks
+            else:
+                keep_count = max(1, n - round(n * sparsity))
             if keep_count >= n:
                 branch_keeps.append(np.arange(n))
                 continue
@@ -5802,7 +5969,24 @@ def _apply_concat_chains(
                     else (w if p.weight_transposed else w.T)  # [N, K]
                 )
             importance = compute_branch_importance(b.operand_name, w_arrays_nk)
-            branch_keeps.append(np.sort(np.argsort(-importance)[:keep_count]))
+            if group > 1:
+                # One independent top-k per block contained in this branch --
+                # see this function's own docstring.
+                branch_keeps.append(
+                    np.concatenate(
+                        [
+                            np.sort(
+                                np.argsort(-importance[gi * block : (gi + 1) * block])[
+                                    :per_group_keep
+                                ]
+                            )
+                            + gi * block
+                            for gi in range(local_blocks)
+                        ]
+                    )
+                )
+            else:
+                branch_keeps.append(np.sort(np.argsort(-importance)[:keep_count]))
 
         if not any_pruned:
             continue  # every branch rounds down to a no-op -- nothing to do
@@ -5848,12 +6032,20 @@ def _apply_concat_chains(
                 _slice_last_axis(initializer_map[hop.bias], global_keep)
             _set_conv_group_attr(hop.node, len(global_keep))
 
-        _slice_consumer_weight(
-            initializer_map[chain.consumer_weight],
-            chain.consumer_weight_transposed,
-            global_keep,
-            is_conv=chain.consumer_is_conv,
-        )
+        if chain.consumer_is_conv and group > 1:
+            _slice_grouped_consumer_conv_weight(
+                initializer_map[chain.consumer_weight],
+                global_keep,
+                group,
+                chain.n_channels,
+            )
+        else:
+            _slice_consumer_weight(
+                initializer_map[chain.consumer_weight],
+                chain.consumer_weight_transposed,
+                global_keep,
+                is_conv=chain.consumer_is_conv,
+            )
 
         touched.producer.update(producer_weights)
         touched.consumer.add(chain.consumer_weight)
@@ -5936,6 +6128,17 @@ def _slice_grouped_consumer_conv_weight(
     consumer's own blocks are always the exact same partition of
     `n_channels` -- never a case where one side's block boundaries split a
     count unevenly relative to the other's.
+
+    The other caller, :func:`_apply_concat_chains` (a ``Concat``-merged
+    branch group feeding a grouped consumer), establishes the same
+    uniform-per-block-count guarantee by a different route: there is no
+    single producer whose blocks the consumer's must match, but
+    :func:`_concat_branches_align_to_consumer_group` already confirmed every
+    one of the consumer's own blocks falls entirely inside one branch, and
+    that branch's own per-block top-k (mirroring :func:`_apply_chains`'s
+    mechanism exactly, just scoped to the blocks it contains) keeps the same
+    `per_group_keep` count from each -- see that function's own docstring
+    for the full argument.
     """
     w = onnx.numpy_helper.to_array(w_init)
     out_channels = w.shape[0]
@@ -6622,8 +6825,15 @@ def apply_structured_pruning(
     out elsewhere, bottoms out at a graph input, or would need to cross a
     residual (``Add``/``SkipLayerNormalization``) merge or another
     ``Concat`` to reach one, declines the *entire* group, never partially
-    pruned. A grouped (``group != 1``) Conv consumer is likewise declined,
-    the same reason a residual group declines one.
+    pruned. A grouped (``group != 1``) Conv consumer is admitted, but only
+    when every branch's own fixed offset lands on one of the consumer's own
+    `group` block boundaries, so every block is owned by exactly one branch
+    -- see :func:`_concat_branches_align_to_consumer_group`'s own docstring
+    for the exact condition and why a block straddling two branches is still
+    declined (the same reason a residual group declines any grouped
+    consumer): a `Concat` branch's independent, no-cross-branch-visibility
+    ranking has no general way to land two branches on a matching split of
+    one shared block's required survivor count.
 
     :param model: the original onnx ModelProto or file path
     :param sparsity: target fraction of each matched producer's output
@@ -8855,4 +9065,428 @@ def apply_moe_expert_channel_pruning(
     chains = _find_moe_chains(graph)
     if chains:
         _apply_moe_chains(graph, chains, sparsity, _moe_importance)
+    return out
+
+
+# --- MoE whole-expert pruning ------------------------------------------------
+#
+# The complementary half of :func:`apply_moe_expert_channel_pruning`: instead
+# of narrowing every expert's own `inter_size`, this shrinks the `num_experts`
+# leading axis itself -- dropping entire experts. This module's own docstring
+# scopes :func:`apply_moe_expert_channel_pruning` to the "expert-intermediate-
+# channel" half of the "Iterative Puzzle" paper (arXiv:2607.04371) precisely
+# *because* whole-expert removal needs strictly more machinery: `num_experts`/
+# `k`-consistency bookkeeping and a safe way to resize `router_probs`' own
+# upstream producer (see that function's own section comment). This section
+# builds that machinery -- following the general post-training MoE-pruning
+# literature's standard technique (calibration-based expert-usage ranking,
+# e.g. dropping the experts with the lowest average router gate weight over a
+# representative batch -- the "prune-by-usage" family the task's own
+# background cites), not any single paper's exact recipe -- and confirms,
+# empirically, that the result is exactly safe once four separate questions
+# are answered:
+#
+# 1. *What does `router_probs` actually hold, and how does `num_experts`
+#    shrinking affect it?* Confirmed by reading `contrib_schemas.cpp`'s own
+#    `MakeMoESchema()` (which itself transcribes ONNX Runtime's
+#    `docs/ContribOperators.md`/`contrib_defs.cc`): despite the name,
+#    `router_probs` (`MoE`'s own input 1) holds raw per-token, per-expert
+#    routing *logits* -- a Softmax is applied *internally*, over the
+#    `num_experts` axis, before top-k selection. That Softmax is exactly why
+#    whole-expert removal is safe to express as *shrinking* the axis rather
+#    than needing some separate "disable this expert" signal: shrinking
+#    `router_probs`' own width to `num_experts_kept` changes the Softmax's own
+#    denominator to sum over only the surviving experts, identically to what
+#    forcing the dropped experts' logits to `-inf` in the *original*-width
+#    model would do (`exp(-inf) == 0`, dropping out of both the Softmax
+#    numerator and denominator). Verified directly against a real CPU
+#    `onnxruntime.InferenceSession`: a same-shape "masking" oracle (dropped
+#    experts' `fc1`/`fc2` zeroed, their router weight column's bias forced to
+#    `-1e9`) matches an actually-shrunk-`num_experts` model's output to
+#    *exactly* 0.0 max-abs-diff, both for the schema's default
+#    `normalize_routing_weights=0` and for `normalize_routing_weights=1`
+#    (which renormalizes the selected top-k weights to sum to 1 -- dropping
+#    an expert that was in some token's top-k changes who else is, which
+#    changes that renormalization too, and the two models still agree
+#    exactly, since ONNX Runtime's own top-k+renormalize logic never sees the
+#    dropped expert as a candidate in the pruned model either). So this pass
+#    needs no separate bookkeeping for `router_probs`' own *values* -- slicing
+#    its upstream producer's weight (see point 3) to the same kept-expert
+#    index set is the entire correctness argument, the same
+#    "shared keep set across multiple weights" pattern the rest of this
+#    module already uses for gated FFN pairs and residual merge groups.
+#
+# 2. *Does `k` need adjusting when `num_experts` shrinks?* Empirically
+#    confirmed against a real CPU `onnxruntime.InferenceSession`: `k` is a
+#    *required* attribute (`contrib_defs.cc`'s own `.Attr("k", ..., INT,
+#    /*required=*/true)`, cross-checked live via
+#    ``onnxruntime.capi.onnxruntime_pybind11_state.get_all_operator_schema()``
+#    too) with no schema default, so it always has some concrete value on any
+#    valid node. Session *construction* with `k > num_experts` succeeds
+#    (shape inference never looks at `k` against `num_experts`) but
+#    *execution* fails hard with an explicit, unambiguous ONNX Runtime error
+#    -- "MoE attribute 'k' must be <= num_experts; got k=<k>, num_experts=<n>"
+#    (`moe_cpu.cc`) -- confirmed by actually triggering it. So `num_experts`
+#    can never be pruned below `k`. Rather than *clamp `k` down* to fit (which
+#    would silently change how many experts every surviving token gets
+#    combined across, a real behavior change on top of the pruning itself,
+#    and would touch a node attribute this pass has no principled way to
+#    "undo" the effect of), this pass instead treats `k` as a hard floor on
+#    how many experts survive -- `num_experts_to_keep` is silently raised to
+#    `k` (never lowered below it) if the requested `sparsity` would otherwise
+#    ask for fewer, the same "at least one channel is always kept" floor
+#    :func:`apply_moe_expert_channel_pruning` already uses, just floored at
+#    `k` instead of 1 (below `k`, the node cannot execute *at all*, not
+#    merely "prunes to nothing usable"). `k` itself is never written to.
+#
+# 3. *Can the router's own weight be identified/isolated as a pruneable
+#    producer in the general case?* Only when it is provably safe to, the
+#    same bar every other producer this module touches is held to: exactly
+#    one node produces `router_probs`, it is a plain MatMul or (`transA=0`,
+#    `alpha=1`, `beta=1` if biased) Gemm (:func:`_match_matmul_like`, the
+#    same matcher every ordinary MatMul/Gemm producer in this module is
+#    matched with), its weight is a constant 2-D float32 initializer whose
+#    output-channel width equals `num_experts`, `router_probs` itself has no
+#    consumer besides this one `MoE` node (an auxiliary head or logging
+#    output reading the same tensor would otherwise silently see a
+#    now-differently-shaped tensor), and neither the weight nor its optional
+#    bias is a tied/shared initializer read anywhere else (the same
+#    tied-weight guard :func:`_match_moe_producer` already applies to
+#    `fc1`/`fc2`). Any node whose `router_probs` producer doesn't match this
+#    exactly -- a router expressed as more than one node (e.g. a bias `Add`
+#    kept separate from the Gemm, a `Reshape`/`Cast` in between, jitter noise
+#    added during training-mode export, ...), fed from more than one
+#    consumer, or backed by a non-constant/tied weight -- is left completely
+#    untouched rather than guessed at.
+#
+# 4. *Does this hold for every `MoE` configuration, or only some?* This pass
+#    reuses :func:`_match_moe_producer`'s own `fc1`/`fc2`/`fc3`/`activation_type`
+#    checks outright (so it declines `fc3_experts_weights` and `swiglu` for
+#    the exact same confirmed-empirically reasons documented in this module's
+#    "MoE expert-intermediate-channel pruning" section above -- `num_experts`
+#    lives on `fc1`'s/`fc2`'s shared axis 0 regardless of `fusion_size`, so
+#    neither restriction is *structurally* required for whole-expert pruning
+#    the way it is for `inter_size` pruning, but this pass keeps the same
+#    narrow, already-verified surface rather than opening a new one that
+#    would need its own independent oracle check) -- plus one restriction of
+#    its own: `use_sparse_mixer=1` (a different, jitter-named top-2-only
+#    routing path -- confirmed empirically to hard-require `k == 2`
+#    specifically, `moe_base_cpu.h`'s own "Sparse mixer only supports k=2"
+#    check) is declined outright. It was confirmed deterministic run-to-run
+#    on this environment's CPU provider (no actual training-time jitter
+#    applied at inference), but its own comparison-based expert tie-break
+#    logic was not independently re-derived and checked against the same
+#    `-inf`-masking oracle point 1 relies on, so -- the same conservative
+#    call every other under-verified case in this module makes -- it is left
+#    untouched rather than assumed safe.
+
+
+@dataclass(frozen=True)
+class _MoEExpertChain:
+    node: onnx.NodeProto
+    fc1_w: str
+    fc1_b: Optional[str]
+    fc2_w: str
+    fc2_b: Optional[str]
+    num_experts: int
+    k: int
+    router_probs: str
+    router_w: str
+    router_w_transposed: bool
+    router_b: Optional[str]
+
+
+def _match_moe_whole_expert_producer(
+    node: onnx.NodeProto,
+    initializer_map: Dict[str, onnx.TensorProto],
+    consumers_of: Dict[str, List[onnx.NodeProto]],
+    node_by_output: Dict[str, onnx.NodeProto],
+    graph_outputs: Set[str],
+) -> Optional[_MoEExpertChain]:
+    """If `node` is a ``com.microsoft::MoE`` node this pass can safely prune
+    whole experts (the `num_experts` axis) from, returns the matched
+    :class:`_MoEExpertChain`. See this section's own comment above for the
+    full safety argument; this mirrors :func:`_match_moe_producer`'s own
+    `fc1`/`fc2`/`fc3`/`activation_type` checks exactly (reused outright, via
+    a direct call), then adds the `k`/`use_sparse_mixer` checks and the
+    `router_probs` producer match described there.
+    """
+    base = _match_moe_producer(node, initializer_map, consumers_of)
+    if base is None:
+        return None
+
+    k = None
+    use_sparse_mixer = 0
+    for attr in node.attribute:
+        if attr.name == "k":
+            k = attr.i
+        elif attr.name == "use_sparse_mixer":
+            use_sparse_mixer = attr.i
+    if k is None or k < 1 or k > base.num_experts or use_sparse_mixer != 0:
+        return None
+
+    if len(node.input) < 2 or not node.input[1]:
+        return None
+    router_probs = node.input[1]
+    if router_probs in graph_outputs or len(consumers_of.get(router_probs, [])) != 1:
+        return None
+    router_node = node_by_output.get(router_probs)
+    if router_node is None:
+        return None
+    router_info = _match_producer(router_node, initializer_map)
+    if router_info is None:
+        return None
+    router_w_name, router_w_transposed, router_b_name, n_channels = router_info
+    if n_channels != base.num_experts or len(consumers_of.get(router_w_name, [])) != 1:
+        return None
+    if router_b_name is not None and len(consumers_of.get(router_b_name, [])) != 1:
+        return None
+
+    return _MoEExpertChain(
+        node=node,
+        fc1_w=base.fc1_w,
+        fc1_b=base.fc1_b,
+        fc2_w=base.fc2_w,
+        fc2_b=base.fc2_b,
+        num_experts=base.num_experts,
+        k=int(k),
+        router_probs=router_probs,
+        router_w=router_w_name,
+        router_w_transposed=router_w_transposed,
+        router_b=router_b_name,
+    )
+
+
+def _find_moe_whole_expert_chains(graph: onnx.GraphProto) -> List[_MoEExpertChain]:
+    initializer_map = {t.name: t for t in graph.initializer}
+    consumers_of = _consumers_of(graph)
+    node_by_output = {out: node for node in graph.node for out in node.output}
+    graph_outputs = {o.name for o in graph.output}
+    chains = []
+    for node in graph.node:
+        chain = _match_moe_whole_expert_producer(
+            node, initializer_map, consumers_of, node_by_output, graph_outputs
+        )
+        if chain is not None:
+            chains.append(chain)
+    return chains
+
+
+def _moe_expert_weight_importance(
+    chain: _MoEExpertChain, initializer_map: Dict[str, onnx.TensorProto]
+) -> np.ndarray:
+    """Combined (root-sum-square) L2-norm importance per *expert* -- the
+    weight-magnitude-only fallback used when no calibration data was
+    observed for a chain's `router_probs` (mirrors
+    :func:`apply_structured_wanda_pruning`'s own "no matching activation
+    observed -> fall back to |W|" behavior). Each expert `e` owns one whole
+    `fc1_experts_weights[e]`/`fc2_experts_weights[e]` (and, if present,
+    `fc1_experts_bias[e]`) slice; unlike :func:`_moe_importance` (which
+    reduces *across* the expert axis to rank `inter_size`), this reduces
+    *within* each expert's own slice to rank experts themselves.
+    """
+    fc1_w = onnx.numpy_helper.to_array(initializer_map[chain.fc1_w]).astype(np.float64)
+    fc2_w = onnx.numpy_helper.to_array(initializer_map[chain.fc2_w]).astype(np.float64)
+    squared = np.sum(np.square(fc1_w), axis=(1, 2)) + np.sum(
+        np.square(fc2_w), axis=(1, 2)
+    )
+    if chain.fc1_b is not None:
+        fc1_b = onnx.numpy_helper.to_array(initializer_map[chain.fc1_b]).astype(
+            np.float64
+        )
+        squared = squared + np.sum(np.square(fc1_b), axis=1)
+    return np.sqrt(squared)
+
+
+def _apply_moe_whole_expert_chains(
+    graph: onnx.GraphProto,
+    chains: List[_MoEExpertChain],
+    sparsity: float,
+    compute_importance,
+) -> Set[str]:
+    initializer_map = {t.name: t for t in graph.initializer}
+    touched: Set[str] = set()
+    stale_value_info: Set[str] = set()
+
+    for chain in chains:
+        weight_names = {chain.fc1_w, chain.fc2_w, chain.router_w}
+        if chain.fc1_b is not None:
+            weight_names.add(chain.fc1_b)
+        if chain.router_b is not None:
+            weight_names.add(chain.router_b)
+        if weight_names & touched:
+            continue  # a shared/tied initializer another MoE node already resized
+        touched |= weight_names
+
+        n = chain.num_experts
+        floor = max(1, min(chain.k, n))
+        keep_count = max(floor, n - round(n * sparsity))
+        if keep_count >= n:
+            continue  # rounds down to nothing (or below k) for this layer -- no-op
+
+        importance = compute_importance(chain, initializer_map)
+        keep = np.sort(np.argsort(-importance)[:keep_count])
+
+        fc1_init = initializer_map[chain.fc1_w]
+        fc1_w_new = np.take(onnx.numpy_helper.to_array(fc1_init), keep, axis=0)
+        fc1_init.CopyFrom(
+            onnx.numpy_helper.from_array(
+                np.ascontiguousarray(fc1_w_new), name=chain.fc1_w
+            )
+        )
+
+        fc2_init = initializer_map[chain.fc2_w]
+        fc2_w_new = np.take(onnx.numpy_helper.to_array(fc2_init), keep, axis=0)
+        fc2_init.CopyFrom(
+            onnx.numpy_helper.from_array(
+                np.ascontiguousarray(fc2_w_new), name=chain.fc2_w
+            )
+        )
+
+        if chain.fc1_b is not None:
+            fc1_b_init = initializer_map[chain.fc1_b]
+            fc1_b_new = np.take(onnx.numpy_helper.to_array(fc1_b_init), keep, axis=0)
+            fc1_b_init.CopyFrom(
+                onnx.numpy_helper.from_array(
+                    np.ascontiguousarray(fc1_b_new), name=chain.fc1_b
+                )
+            )
+        # fc2_experts_bias indexes hidden_size, unaffected by an expert-count
+        # cut -- never sliced here, same reasoning as expert-channel pruning.
+
+        router_w_init = initializer_map[chain.router_w]
+        _slice_producer_weight(router_w_init, chain.router_w_transposed, keep)
+        if chain.router_b is not None:
+            _slice_last_axis(initializer_map[chain.router_b], keep)
+
+        stale_value_info.add(chain.router_probs)
+
+    return stale_value_info
+
+
+def apply_moe_whole_expert_pruning(
+    model: Union[str, onnx.ModelProto],
+    calibration_data: Optional[Sequence[Tensors]] = None,
+    num_samples: int = 8,
+    seed: int = 0,
+    sparsity: float = 0.5,
+    providers: Optional[Sequence[str]] = None,
+) -> onnx.ModelProto:
+    """Removes whole experts (shrinks the `num_experts` leading axis) from a
+    matched ``com.microsoft::MoE`` node and its upstream router projection at
+    once -- the complementary technique to
+    :func:`apply_moe_expert_channel_pruning`'s own `inter_size` pruning (see
+    that function's own docstring and this module's docstring for how the two
+    relate), and the general, calibration-based "prune the least-used
+    experts" technique from the post-training MoE-pruning literature: experts
+    are ranked by their mean router *gate weight* -- ``softmax(router_probs)``
+    averaged over every calibration token -- not raw logit magnitude (logits
+    have no shared scale across experts to compare on their own; Softmax is
+    what makes them comparable) and not exact top-k selection
+    frequency/combine weight (which would require re-deriving ONNX Runtime's
+    own top-k + optional `normalize_routing_weights` renormalization exactly,
+    an unnecessary duplication of runtime semantics this pass doesn't need
+    just to get a solid usage signal). See this section's own comment above
+    for the full safety argument -- in particular why shrinking
+    `router_probs`' own width is *exactly* equivalent to forcing the dropped
+    experts' routing logits to `-inf` (confirmed to 0.0 max-abs-diff against
+    a real onnxruntime CPU session), why `k` is never touched but instead
+    floors how many experts can ever be pruned away, and exactly which nodes
+    are matched (:func:`_match_moe_whole_expert_producer`) -- `fc3`/`swiglu`/
+    `use_sparse_mixer` and any router not expressed as one plain, untied
+    MatMul/Gemm feeding `router_probs` and nothing else are all out of scope.
+
+    Every matched expert's `fc1_experts_weights`/`fc2_experts_weights` (and
+    `fc1_experts_bias`, if present) row, and the router projection weight's
+    (and bias's, if present) matching output column, are dropped together for
+    the lowest-``sparsity``-fraction of experts by that ranking -- with
+    `num_experts_to_keep` silently floored at the node's own `k` (pruning
+    below `k` experts remaining is a hard onnxruntime execution failure, not
+    merely suboptimal -- confirmed empirically, see above) rather than ever
+    adjusting `k` itself. A chain whose `router_probs` was never observed
+    during calibration (e.g. ``calibration_data=[]``) falls back to each
+    expert's own combined `fc1`/`fc2` (+`fc1_experts_bias`) L2 weight norm,
+    the same "no matching activation observed" fallback
+    :func:`apply_structured_wanda_pruning` already uses.
+
+    :param model: the original onnx ModelProto or file path
+    :param calibration_data: representative input batches to rank experts by
+            mean router gate weight on. Each batch is a
+            ``{input_name: np.ndarray}`` dict matching ``model``'s graph
+            inputs -- see :func:`onnxsim.generate_random_calibration_data`
+            (the default when omitted)
+    :param num_samples: random batches to generate when
+            ``calibration_data`` is omitted
+    :param seed: seed for the random calibration data (ignored if
+            ``calibration_data`` is supplied)
+    :param sparsity: target fraction of each matched node's `num_experts` to
+            remove (floored at the node's own `k`, so fewer may actually be
+            removed -- never more)
+    :param providers: onnxruntime execution providers to run ``model`` on
+            when capturing calibration router activations
+    :returns: ``model`` with every matched ``MoE`` node's `fc1`/`fc2`(/`fc1`
+            bias) and its router projection's weight(/bias) resized in
+            place; a node with `fc3_experts_weights`, a `swiglu`/unrecognized
+            `activation_type`, `use_sparse_mixer`, a non-constant or
+            tied/shared weight anywhere in the chain (including the router
+            projection), a `router_probs` with more than one consumer, or any
+            other shape this pass doesn't recognize is left completely
+            untouched
+    """
+    if not (0.0 <= sparsity < 1.0):
+        raise ValueError(f"sparsity must be in [0, 1), got {sparsity}")
+    if isinstance(model, str):
+        model = onnx.load(model, load_external_data=False)
+    if calibration_data is None:
+        calibration_data = generate_random_calibration_data(
+            model, num_samples=num_samples, seed=seed
+        )
+
+    out = onnx.ModelProto()
+    out.CopyFrom(model)
+    graph = out.graph
+
+    chains = _find_moe_whole_expert_chains(graph)
+    if not chains:
+        return out
+
+    probe_names = sorted({chain.router_probs for chain in chains})
+    probe_model = _add_probe_outputs(out, probe_names)
+
+    sum_prob: Dict[str, np.ndarray] = {}
+    count: Dict[str, int] = {}
+    for batch in calibration_data:
+        result = backend.run_model(probe_model, batch, providers=providers)
+        for name in probe_names:
+            logits = np.asarray(result[name], dtype=np.float64)
+            if logits.ndim != 2:
+                continue  # router_probs is always documented 2-D; skip if not
+            # Numerically-stable Softmax over the expert axis (the same
+            # normalization MoE's own kernel applies internally, per
+            # this section's own comment), averaged over every token.
+            shifted = logits - logits.max(axis=-1, keepdims=True)
+            exp = np.exp(shifted)
+            probs = exp / exp.sum(axis=-1, keepdims=True)
+            s = probs.sum(axis=0)
+            sum_prob[name] = s if name not in sum_prob else sum_prob[name] + s
+            count[name] = count.get(name, 0) + logits.shape[0]
+    mean_gate_weight: Dict[str, np.ndarray] = {
+        name: s / max(count[name], 1) for name, s in sum_prob.items()
+    }
+
+    def _importance(
+        chain: _MoEExpertChain, initializer_map: Dict[str, onnx.TensorProto]
+    ) -> np.ndarray:
+        gate = mean_gate_weight.get(chain.router_probs)
+        if gate is None or gate.shape[0] != chain.num_experts:
+            return _moe_expert_weight_importance(chain, initializer_map)
+        return gate
+
+    stale_value_info = _apply_moe_whole_expert_chains(
+        graph, chains, sparsity, _importance
+    )
+    if stale_value_info:
+        kept = [vi for vi in graph.value_info if vi.name not in stale_value_info]
+        del graph.value_info[:]
+        graph.value_info.extend(kept)
     return out

@@ -45,11 +45,25 @@
  * by the 80-combination onnxruntime session cross-check above, since ORT's
  * CPU MoE kernel rejects fc3 outright for any activation ("FC3 is not
  * implemented for CPU MoE") -- there is no CPU oracle to run it against.
+ *
+ * swiglu (interleaved, swiglu_fusion=1 -- gpt-oss-20b's real convention) is
+ * the exception to that pattern: it IS the one activation ONNX Runtime's
+ * own CPU MoE kernel actually implements (its constructor throws unless
+ * swiglu_fusion == 1 for a SwiGLU node), and was cross-checked end to end
+ * against a real onnxruntime session -- both this schema's own
+ * decomposition under a private domain and the real native com.microsoft.MoE
+ * kernel directly, with and without swiglu_limit -- the same rigor as the
+ * original 80-combination check, not a disclosed gap. See
+ * generate_moe_function_templates.py's own comment for the formula
+ * (transcribed from onnxruntime/contrib_ops/cpu/moe/moe_cpu.cc's
+ * ApplySwiGLUVectorized) and why activation_alpha/activation_beta must both
+ * be present on the calling node for this to build at all.
  */
 #include <onnx/defs/function.h>
 #include <onnx/defs/schema.h>
 
 #include <cstdio>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -123,7 +137,10 @@ bool ReferencesValue(const FunctionProto& function_proto,
 
 NodeProto MakeMoENode(int64_t k, const std::string& activation_type,
                       int64_t normalize, int64_t use_sparse_mixer = 0,
-                      int64_t swiglu_fusion = 0, bool with_fc3 = false) {
+                      int64_t swiglu_fusion = 0, bool with_fc3 = false,
+                      std::optional<double> activation_alpha = std::nullopt,
+                      std::optional<double> activation_beta = std::nullopt,
+                      std::optional<double> swiglu_limit = std::nullopt) {
   NodeProto node;
   node.set_op_type("MoE");
   node.set_domain("com.microsoft");
@@ -143,6 +160,12 @@ NodeProto MakeMoENode(int64_t k, const std::string& activation_type,
     attr->set_type(AttributeProto::INT);
     attr->set_i(value);
   };
+  auto add_float_attr = [&](const char* name, double value) {
+    auto* attr = node.add_attribute();
+    attr->set_name(name);
+    attr->set_type(AttributeProto::FLOAT);
+    attr->set_f(static_cast<float>(value));
+  };
   auto* act = node.add_attribute();
   act->set_name("activation_type");
   act->set_type(AttributeProto::STRING);
@@ -151,6 +174,11 @@ NodeProto MakeMoENode(int64_t k, const std::string& activation_type,
   add_int_attr("normalize_routing_weights", normalize);
   add_int_attr("use_sparse_mixer", use_sparse_mixer);
   add_int_attr("swiglu_fusion", swiglu_fusion);
+  if (activation_alpha.has_value())
+    add_float_attr("activation_alpha", *activation_alpha);
+  if (activation_beta.has_value())
+    add_float_attr("activation_beta", *activation_beta);
+  if (swiglu_limit.has_value()) add_float_attr("swiglu_limit", *swiglu_limit);
   return node;
 }
 
@@ -229,7 +257,10 @@ void TestBuildsForPlainReluCase() {
         "body should reference the formal 'router_probs' parameter");
 }
 
-void TestDeclinesForSwiglu() {
+void TestDeclinesForSwigluWithoutFusion() {
+  // swiglu_fusion defaults to 0 (not fused) here -- ONNX Runtime's own CPU
+  // MoE kernel only implements the interleaved swiglu_fusion=1 layout (its
+  // constructor throws for anything else), so this stays declined.
   const OpSchema* schema = OpSchemaRegistry::Schema("MoE", 1, "com.microsoft");
   NodeProto node = MakeMoENode(/*k=*/2, "swiglu", /*normalize=*/0);
   auto input_types =
@@ -237,7 +268,88 @@ void TestDeclinesForSwiglu() {
   FunctionBodyBuildContextImpl ctx(node, input_types);
   FunctionProto function_proto;
   bool built = schema->BuildContextDependentFunction(ctx, function_proto);
-  Check(!built, "swiglu is not decomposed by this reference body");
+  Check(!built, "swiglu with swiglu_fusion != 1 should stay declined");
+}
+
+void TestDeclinesForSwigluWithFusionButNoAlphaBeta() {
+  // swiglu_fusion=1 alone isn't enough: activation_alpha/activation_beta
+  // must both be present too, since there is nothing valid to forward via
+  // ref_attr_name for an absent FLOAT attribute.
+  const OpSchema* schema = OpSchemaRegistry::Schema("MoE", 1, "com.microsoft");
+  NodeProto node = MakeMoENode(/*k=*/2, "swiglu", /*normalize=*/0,
+                               /*use_sparse_mixer=*/0, /*swiglu_fusion=*/1);
+  auto input_types =
+      MakeInputTypes(4, 6, 8, /*dynamic_experts=*/false, /*with_fc3=*/false);
+  FunctionBodyBuildContextImpl ctx(node, input_types);
+  FunctionProto function_proto;
+  bool built = schema->BuildContextDependentFunction(ctx, function_proto);
+  Check(!built,
+        "swiglu_fusion=1 without activation_alpha/activation_beta should "
+        "stay declined");
+}
+
+void TestDeclinesForSwigluWithFc3() {
+  // swiglu's own fc1 is already the fused gate+linear pair -- a separate
+  // fc3 alongside it has no defined meaning (real ORT has none either).
+  const OpSchema* schema = OpSchemaRegistry::Schema("MoE", 1, "com.microsoft");
+  NodeProto node =
+      MakeMoENode(/*k=*/2, "swiglu", /*normalize=*/0, /*use_sparse_mixer=*/0,
+                  /*swiglu_fusion=*/1, /*with_fc3=*/true,
+                  /*activation_alpha=*/1.702, /*activation_beta=*/1.0);
+  auto input_types =
+      MakeInputTypes(4, 6, 8, /*dynamic_experts=*/false, /*with_fc3=*/true);
+  FunctionBodyBuildContextImpl ctx(node, input_types);
+  FunctionProto function_proto;
+  bool built = schema->BuildContextDependentFunction(ctx, function_proto);
+  Check(!built, "swiglu with fc3_experts_weights present should stay declined");
+}
+
+void TestBuildsForSwiglu() {
+  // swiglu_fusion=1 with both activation_alpha/activation_beta present is
+  // ONNX Runtime's own "Mixtral case" for gpt-oss-20b -- the one activation
+  // its CPU MoE kernel actually implements. Confirmed end to end against a
+  // real onnxruntime session (see generate_moe_function_templates.py's own
+  // comment), unlike fc3/use_sparse_mixer above.
+  const OpSchema* schema = OpSchemaRegistry::Schema("MoE", 1, "com.microsoft");
+  NodeProto node =
+      MakeMoENode(/*k=*/2, "swiglu", /*normalize=*/1, /*use_sparse_mixer=*/0,
+                  /*swiglu_fusion=*/1, /*with_fc3=*/false,
+                  /*activation_alpha=*/1.702, /*activation_beta=*/1.0);
+  auto input_types =
+      MakeInputTypes(4, 6, 8, /*dynamic_experts=*/false, /*with_fc3=*/false);
+  FunctionBodyBuildContextImpl ctx(node, input_types);
+  FunctionProto function_proto;
+  bool built = schema->BuildContextDependentFunction(ctx, function_proto);
+  Check(built, "swiglu_fusion=1 with activation_alpha/beta should build");
+  if (!built) return;
+
+  Check(ReferencesValue(function_proto, "fc1_experts_weights"),
+        "body should reference the formal 'fc1_experts_weights' parameter");
+  bool has_loop = false;
+  for (const auto& n : function_proto.node()) {
+    if (n.op_type() == "Loop") has_loop = true;
+  }
+  Check(has_loop,
+        "body should contain a real Loop op iterating over num_experts");
+}
+
+void TestBuildsForSwigluWithLimit() {
+  // swiglu_limit is genuinely optional ("no clamp when limit is not
+  // provided") -- its presence is its own axis (not just a forwarded
+  // value), so a node that sets it should still build, with a structurally
+  // different (larger) body than TestBuildsForSwiglu's.
+  const OpSchema* schema = OpSchemaRegistry::Schema("MoE", 1, "com.microsoft");
+  NodeProto node =
+      MakeMoENode(/*k=*/2, "swiglu", /*normalize=*/1, /*use_sparse_mixer=*/0,
+                  /*swiglu_fusion=*/1, /*with_fc3=*/false,
+                  /*activation_alpha=*/1.702, /*activation_beta=*/1.0,
+                  /*swiglu_limit=*/7.0);
+  auto input_types =
+      MakeInputTypes(4, 6, 8, /*dynamic_experts=*/false, /*with_fc3=*/false);
+  FunctionBodyBuildContextImpl ctx(node, input_types);
+  FunctionProto function_proto;
+  bool built = schema->BuildContextDependentFunction(ctx, function_proto);
+  Check(built, "swiglu_fusion=1 with swiglu_limit should build");
 }
 
 void TestBuildsForSparseMixer() {
@@ -361,7 +473,11 @@ void TestBodyUsesALoopNotPerExpertUnrolling() {
 int main() {
   TestMoESchemaIsRegistered();
   TestBuildsForPlainReluCase();
-  TestDeclinesForSwiglu();
+  TestDeclinesForSwigluWithoutFusion();
+  TestDeclinesForSwigluWithFusionButNoAlphaBeta();
+  TestDeclinesForSwigluWithFc3();
+  TestBuildsForSwiglu();
+  TestBuildsForSwigluWithLimit();
   TestBuildsForSparseMixer();
   TestDeclinesForFc3WithNonSiluActivation();
   TestBuildsForSiluFc3();
