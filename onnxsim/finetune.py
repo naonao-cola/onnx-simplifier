@@ -261,8 +261,7 @@ def _ridge_fit(
     scaled relative to ``x``'s own Gram matrix so it needs no per-model
     tuning. Returns the new ``(w, b)`` (``b`` is ``None`` iff ``b0`` is).
     """
-    has_bias = b0 is not None
-    if has_bias:
+    if b0 is not None:
         x_aug = np.concatenate([x, np.ones((x.shape[0], 1))], axis=1)
         w0_aug = np.concatenate([w0, b0[:, None]], axis=1)
     else:
@@ -275,7 +274,7 @@ def _ridge_fit(
     rhs = x_aug.T @ y + lam * w0_aug.T
     w_aug_t = np.linalg.solve(a, rhs)  # [K(+1), N]
 
-    if has_bias:
+    if b0 is not None:
         return w_aug_t[:-1, :].T, w_aug_t[-1, :]
     return w_aug_t.T, None
 
@@ -389,7 +388,7 @@ def apply_pruning_finetune(
 
         w_write = w_new_nk if c.weight_transposed else w_new_nk.T
         optimized_w[c.w_pruned.name] = w_write.astype(np.float32)
-        if b_new is not None:
+        if b_new is not None and c.b_pruned is not None:
             optimized_b[c.b_pruned.name] = b_new.astype(np.float32)
 
     if not optimized_w:
