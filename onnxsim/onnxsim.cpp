@@ -195,15 +195,46 @@ size_t CountGraphNodes(const onnx::Graph& graph) {
       std::distance(graph.nodes().begin(), graph.nodes().end()));
 }
 
+// Builds the map InferShapesOnGraph (via OptAndShapeOnGraph/
+// _EvalPartialShapeOnGraph below) needs to infer through a model-local
+// function call: onnx::Graph carries no notion of model.functions() itself
+// (see graph_shape_inference.h's own doc comment), so any caller with a
+// ModelProto in hand builds this once, the same way
+// shape_inference::InferShapes(ModelProto&, ...) does internally for the
+// protobuf-based path. Key format (domain:name, or domain:name:overload for
+// an IR>=10 function overload) matches what every ONNX helper expects --
+// see graph_shape_inference.h's own doc comment.
+onnx::shape_inference::ModelLocalFunctionsMap BuildModelLocalFunctionsMap(
+    const onnx::ModelProto& model) {
+  onnx::shape_inference::ModelLocalFunctionsMap functions;
+  functions.reserve(static_cast<size_t>(model.functions_size()));
+  for (const auto& fn : model.functions()) {
+    std::string id = fn.domain() + ":" + fn.name();
+    if (!fn.overload().empty()) {
+      id += ":" + fn.overload();
+    }
+    functions.emplace(std::move(id), &fn);
+  }
+  return functions;
+}
+
 // Runs InferShapesOnGraph + OptimizeGraphFixed to their own inner fixed
 // point directly on `g`, with no ModelProto conversion at either end -- the
 // Graph-resident core shared by OptAndShape's ModelFn (which wraps this in
 // one Import before and one Export after, see below) and the fully
 // Graph-native outer Pipeline (which shares one Import/Export across the
 // *whole* outer fixed point instead, see Simplify's !rewriter branch).
+// `model_local_functions` is forwarded unchanged to InferShapesOnGraph (see
+// that function's own doc comment) -- Graph carries no notion of
+// model-local functions itself, so a caller whose model has any must build
+// this map from its own ModelProto.functions() and pass it in; omitted
+// (the default, empty), a model-local function call's output is left
+// untouched, exactly as if the op had no registered schema.
 // Returns whether anything changed.
-bool OptAndShapeOnGraph(onnx::Graph& g, bool optimize, bool shape_inference,
-                        size_t fixed_point_iters) {
+bool OptAndShapeOnGraph(
+    onnx::Graph& g, bool optimize, bool shape_inference,
+    size_t fixed_point_iters,
+    const onnx::shape_inference::ModelLocalFunctionsMap& model_local_functions = {}) {
   // See OptAndShape's own doc comment for why these caches are scoped to
   // one call of this function rather than cleared every round underneath.
   onnx::optimization::ClearTensorContentDigestCache();
@@ -211,9 +242,10 @@ bool OptAndShapeOnGraph(onnx::Graph& g, bool optimize, bool shape_inference,
   using GraphFnChanged = std::function<bool(onnx::Graph&)>;
   bool any_changed = false;
   GraphFnChanged InferShapesOnGraphChanged =
-      shape_inference ? GraphFnChanged([&any_changed](onnx::Graph& graph) {
+      shape_inference ? GraphFnChanged([&any_changed, &model_local_functions](onnx::Graph& graph) {
         onnxsim::ProfiledScope scope("InferShapes");
-        const bool c = onnx::InferShapesOnGraph(graph);
+        const bool c = onnx::InferShapesOnGraph(
+            graph, onnx::ShapeInferenceOptions(), nullptr, model_local_functions);
         any_changed |= c;
         return c;
       })
@@ -554,7 +586,8 @@ static onnx::ModelProto SimplifyImpl(
         // are raw_data-heavy, and measured 98%+ of those hash calls were
         // otherwise recomputing a value already seen earlier in the same
         // run (see onnxsim issue #633).
-        OptAndShapeOnGraph(*g, optimize, shape_inference, fixed_point_iters);
+        OptAndShapeOnGraph(*g, optimize, shape_inference, fixed_point_iters,
+                          BuildModelLocalFunctionsMap(model));
         onnx::ModelProto out = onnx::PrepareOutput(model);
         onnx::ExportModelProto(&out, g, /*consume_tensor_data=*/true);
         // OptimizeGraphFixed never sees model-local functions (they live
@@ -618,11 +651,24 @@ static onnx::ModelProto SimplifyImpl(
     // ModelProto-based OptAndShape/FoldConstant path.
     using GraphFn = std::function<void(onnx::Graph&)>;
     using GraphFnChanged = std::function<bool(onnx::Graph&)>;
+    // Built once from the outer, pre-simplification `model` (SimplifyImpl's
+    // own parameter, not `sim_model` or any later ModelFn's own `model`
+    // parameter) and captured by value into both closures below: neither
+    // OptAndShapeOnGraph nor _EvalPartialShapeOnGraph's own InferShapesOnGraph
+    // call otherwise has any way to reach model.functions(), and this map
+    // needs to outlive every round of the fixed point these two closures
+    // drive. Still correct when include_inline_functions has already
+    // inlined `sim_model`'s own function calls away by the time this runs
+    // (see that option's own doc comment) -- the map is simply unreferenced
+    // by any node in that case, not wrong.
+    const onnx::shape_inference::ModelLocalFunctionsMap model_local_functions =
+        BuildModelLocalFunctionsMap(model);
     GraphFnChanged OptAndShapeOnGraphChanged =
-        [optimize, shape_inference, fixed_point_iters](onnx::Graph& graph) {
+        [optimize, shape_inference, fixed_point_iters,
+         model_local_functions](onnx::Graph& graph) {
           onnxsim::ProfiledScope scope("OptAndShape");
           return OptAndShapeOnGraph(graph, optimize, shape_inference,
-                                    fixed_point_iters);
+                                    fixed_point_iters, model_local_functions);
         };
     // `fold_ir_version` is declared above, alongside `converged`: see its own
     // comment for why it cannot live in this block despite only being read
@@ -630,9 +676,10 @@ static onnx::ModelProto SimplifyImpl(
     // below.
     GraphFnChanged FoldConstantOnGraphChanged =
         constant_folding
-            ? GraphFnChanged([&executor, &fold_ir_version](onnx::Graph& graph) {
+            ? GraphFnChanged([&executor, &fold_ir_version,
+                              model_local_functions](onnx::Graph& graph) {
                 onnxsim::ProfiledScope scope("FoldConstant");
-                const bool a = _EvalPartialShapeOnGraph(graph);
+                const bool a = _EvalPartialShapeOnGraph(graph, model_local_functions);
                 const bool b =
                     _FoldConstantOnGraph(executor, graph, fold_ir_version);
                 if (onnxsim::Profiler::Instance().enabled()) {

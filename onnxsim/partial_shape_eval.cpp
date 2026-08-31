@@ -852,7 +852,9 @@ void _EvalPartialShape(onnx::ModelProto& model) {
 // onnx/common/graph_shape_inference.h) instead of onnx's protobuf-based
 // InferShapes. Returns whether anything changed, so the fully Graph-native
 // outer pipeline can use it as a GraphFnChanged step.
-bool _EvalPartialShapeOnGraph(onnx::Graph& g) {
+bool _EvalPartialShapeOnGraph(
+    onnx::Graph& g,
+    const onnx::shape_inference::ModelLocalFunctionsMap& model_local_functions) {
   // Mirrors _EvalPartialShape's own snapshot/restore of value_info/output:
   // this pass's own data-propagation inference call must not leave its
   // (lenient, check_type=false) shape/type conclusions on the graph --
@@ -891,7 +893,7 @@ bool _EvalPartialShapeOnGraph(onnx::Graph& g) {
                                               /*error_mode=*/0,
                                               /*enable_data_propagation=*/true);
     try {
-      onnx::InferShapesOnGraph(g, options, &data_map);
+      onnx::InferShapesOnGraph(g, options, &data_map, model_local_functions);
     } catch (const std::exception&) {
       restore();
       return false;
