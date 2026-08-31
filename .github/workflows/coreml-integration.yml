@@ -34,14 +34,22 @@ name: Core ML Integration
 # heavy, so it runs on workflow_dispatch/schedule only, never on pull_request.
 #
 # A fourth job -- `benchmark-decode-macos` -- closes the loop those two only prepare
-# for: it exports a small model and actually runs scripts/apple/run_llm_decode_benchmark.py
-# against it through the real Core ML runtime on the macOS runner, the same two axes
-# (decode tok/s, peak RSS) DeviceMark's (https://devicemark.github.io/) on-device LLM
-# leaderboard measures. Every other job in this workflow only checks that a graph
-# *converts*; this is the one place the decode benchmark harness itself actually
-# executes anywhere, since no environment developing this repo has a macOS/Core ML
-# runtime to run it in locally. Also workflow_dispatch/schedule-only, matching the
-# other real-model jobs.
+# for: it exports each model in a small matrix and actually runs
+# scripts/apple/run_llm_decode_benchmark.py against it through the real Core ML
+# runtime on the macOS runner, the same two axes (decode tok/s, peak RSS)
+# DeviceMark's (https://devicemark.github.io/) on-device LLM leaderboard measures --
+# plus scripts/apple/check_decode_parity.py, which greedily generates the same
+# prompt through the original Hugging Face model (CPU) and reports how well the
+# two token sequences agree, to catch a translator bug that produces a model
+# Core ML happily runs but computes something wrong (see that script's module
+# docstring for why this is an agreement-rate check, not bit-exact). Every other
+# job in this workflow only checks that a graph *converts*; this is the one place
+# the decode benchmark and parity harnesses themselves actually execute anywhere,
+# since no environment developing this repo has a macOS/Core ML runtime to run
+# them in locally. The matrix spans two already-validated architecture families
+# (Llama-style via SmolLM2, Qwen2) so a translator regression specific to one
+# doesn't hide behind the other passing. Also workflow_dispatch/schedule-only,
+# matching the other real-model jobs.
 
 on:
   schedule:
@@ -216,7 +224,19 @@ jobs:
     needs: build-macos
     if: github.event_name != 'pull_request'
     runs-on: macos-15
-    timeout-minutes: 30
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - model_id: HuggingFaceTB/SmolLM2-135M-Instruct
+            slug: smollm2-135m
+            max_context_length: 512
+            dtype: fp32
+          - model_id: Qwen/Qwen2.5-1.5B-Instruct
+            slug: qwen2.5-1.5b
+            max_context_length: 512
+            dtype: fp16
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
@@ -234,19 +254,32 @@ jobs:
       - name: Verify the installed wheel is used (not the source tree)
         working-directory: ${{ runner.temp }}
         run: python3 -c "import onnxsim, onnxsim.onnxsim_cpp2py_export as m; print(onnxsim.__version__, m.__file__)"
-      - name: Export HuggingFaceTB/SmolLM2-135M-Instruct
+      - name: Export ${{ matrix.model_id }}
         working-directory: ${{ runner.temp }}
         run: |
           python3 "$GITHUB_WORKSPACE/scripts/apple/export_llm_to_coreml.py" \
-            HuggingFaceTB/SmolLM2-135M-Instruct \
-            --max-context-length 512 --output smollm2.mlpackage
+            ${{ matrix.model_id }} --dtype ${{ matrix.dtype }} \
+            --max-context-length ${{ matrix.max_context_length }} \
+            --output ${{ matrix.slug }}.mlpackage
       - name: Run the decode benchmark through the real Core ML runtime
         working-directory: ${{ runner.temp }}
         run: |
           {
-            echo "### Decode benchmark: HuggingFaceTB/SmolLM2-135M-Instruct"
+            echo "### Decode benchmark: ${{ matrix.model_id }}"
             echo '```'
             python3 "$GITHUB_WORKSPACE/scripts/apple/run_llm_decode_benchmark.py" \
-              smollm2.mlpackage --prompt "The capital of France is" --max-new-tokens 20
+              ${{ matrix.slug }}.mlpackage --prompt "The capital of France is" \
+              --max-new-tokens 20
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Check decode parity against the Hugging Face reference model
+        working-directory: ${{ runner.temp }}
+        run: |
+          {
+            echo "### Decode parity: ${{ matrix.model_id }}"
+            echo '```'
+            python3 "$GITHUB_WORKSPACE/scripts/apple/check_decode_parity.py" \
+              ${{ matrix.model_id }} ${{ matrix.slug }}.mlpackage \
+              --prompt "The capital of France is" --max-new-tokens 20
             echo '```'
           } | tee -a "$GITHUB_STEP_SUMMARY"
