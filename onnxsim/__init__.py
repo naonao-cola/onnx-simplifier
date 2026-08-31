@@ -95,6 +95,9 @@ from onnxsim.precision_estimator import (
     estimate_quantization_precision,
 )
 from onnxsim.pruning import (
+    PruningLayerSensitivity,
+    PruningSensitivityReport,
+    analyze_pruning_sensitivity,
     apply_attention_head_pruning,
     apply_attention_head_wanda_pruning,
     apply_magnitude_pruning,
@@ -159,6 +162,9 @@ __all__ = [
     "apply_moe_expert_channel_pruning",
     "apply_moe_whole_expert_pruning",
     "weight_sparsity",
+    "analyze_pruning_sensitivity",
+    "PruningSensitivityReport",
+    "PruningLayerSensitivity",
     "convert_matmul_to_gemm",
     "workaround_ort_matmul_nbits_axis0_bug",
     "quantize_attention_dynamic",
