@@ -121,17 +121,20 @@ BENCHMARK_MODELS: list[BenchmarkModel] = [
         "meta-llama/Llama-3.2-1B-Instruct",
         512,
         "fp16",
-        "Gated -- needs HF_TOKEN (see the module docstring). Not yet exercised in a "
-        "token-less local sandbox; expected to convert, since it's the same Llama "
-        "architecture already validated via SmolLM2 (a gated checkpoint changes what "
-        "you can download, not the graph shape once downloaded).",
+        "Gated -- needs HF_TOKEN (see the module docstring). Validated end-to-end "
+        "(export + convert) via the export-benchmark-models CI job once access was "
+        "granted; on-device predict not yet run. Confirms the gate only blocked the "
+        "download -- the graph converts exactly like the already-validated Llama "
+        "architecture (SmolLM2) once fetched.",
     ),
     BenchmarkModel(
         "meta-llama/Llama-3.2-3B-Instruct",
         512,
         "fp16",
-        "Gated -- needs HF_TOKEN (see the module docstring). Not yet exercised (same "
-        "reasons as Llama-3.2-1B-Instruct, plus the larger size).",
+        "Gated -- needs HF_TOKEN (see the module docstring). Not yet exercised -- at "
+        "~3B params, expected to hit the same export-time memory ceiling "
+        "Qwen2.5-3B-Instruct did in a 15GB-RAM sandbox (see its entry above); the "
+        "gate itself is no longer a blocker (Llama-3.2-1B-Instruct is validated).",
     ),
 ]
 
