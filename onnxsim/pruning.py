@@ -7466,6 +7466,803 @@ def apply_structured_wanda_pruning(
     return out
 
 
+# --- QDQ (quantized-weight) structured pruning ------------------------------
+#
+# Every matcher above this point requires a Conv/MatMul/Gemm weight to be a
+# *direct* constant float/fp16/bf16 initializer input to the consuming node
+# (``initializer_map.get(w_name)``). A statically-quantized (QDQ) ONNX graph
+# doesn't look like that: the weight is an int8/uint8 initializer feeding a
+# ``DequantizeLinear`` node (scale, and optionally zero_point, themselves
+# constant), and it is *that node's output* -- not an initializer name at all
+# -- that reaches the MatMul/Conv/Gemm. Every matcher above already declines
+# this shape today, silently and by construction (``initializer_map.get(...)``
+# on a ``DequantizeLinear`` output name simply returns ``None``) -- confirmed
+# empirically (see ``test_qdq_weight_left_untouched_by_unstructured_pruning``)
+# rather than assumed. This section adds a *new*, separate matcher +
+# ``apply_structured_pruning_qdq`` specifically for the QDQ case, rather than
+# reusing/extending the existing float-only matchers or ``_Chain``/
+# ``_apply_chains`` machinery above -- deliberately: every one of those is
+# already extensively tested against float32/float16/bfloat16 weights only,
+# and retrofitting int8 QDQ handling into their shared slicing/touched-role
+# bookkeeping would risk regressing that surface for no compensating benefit
+# (a QDQ weight and a plain float weight never alias the same tensor).
+#
+# What this repo's own QDQ tooling emits, and this section leans on directly
+# (:func:`onnxsim.calibration.quantize_static`, via
+# ``passes/static_quantize_matmul.h``/``static_quantize_conv.h`` -- read
+# directly, not assumed): every quantized weight is INT8, *symmetric*
+# (``zero_point`` entirely omitted from the ``DequantizeLinear`` call -- 2
+# inputs, not 3) and *per output channel* (``Ws`` shaped ``[out_channels]``,
+# ``axis`` set explicitly: 0 for Conv, 0 or 1 for MatMul/Gemm depending on
+# ``transB``) -- never per-tensor for a weight. Cross-checked against the
+# live ONNX opset-25 ``DequantizeLinear`` schema
+# (``onnx.defs.get_schema("DequantizeLinear", domain="")``): ``x_zero_point``
+# is genuinely optional (absent means zero -- exactly this repo's own
+# symmetric convention), and ``x_scale``/``x_zero_point`` "must have the same
+# shape, determining the quantization's granularity: a scalar for
+# per-tensor/per-layer quantization, a 1-D tensor for per-axis quantization,
+# or have a rank identical to the input for blocked quantization" -- this
+# section's own matcher (:func:`_match_dequantize_linear_weight`) accepts
+# exactly the first two (scalar and 1-D/``axis``) and declines blocked
+# quantization outright (see its own docstring), and, since nothing in the
+# schema *requires* symmetric/per-channel, also accepts an asymmetric
+# (nonzero ``zero_point``) and/or per-tensor weight when actually
+# encountered -- broader than what this repo's own tooling emits, because
+# nothing about *slicing* (as opposed to *unstructured* pruning, see below)
+# cares whether zero_point is zero or which axis granularity was chosen, as
+# long as it's consistently one of the two shapes above.
+#
+# Structured (channel) pruning of a QDQ weight turns out to split cleanly
+# into two very differently-shaped problems depending on which axis is being
+# cut, mirroring this module's own established "slice, don't recompute"
+# principle for FP16/BFloat16 weights (see that section's own comment far
+# above) -- extended here from a *dtype* metadata pair (never touched by any
+# purely structural rewrite) to a *quantization* metadata pair (touched only
+# when, and exactly how, the channel axis it's indexed by is touched):
+#
+#   * Pruning a QDQ weight's OWN output channels (the "producer" role, e.g.
+#     the first layer of a two-layer MLP): a per-channel weight's ``Wq``
+#     (int8) AND its own ``Ws``/``Wzp`` (each ``[out_channels]``) are all
+#     indexed by that exact axis, so all three must be sliced together, by
+#     the same ``keep`` index set, in lockstep -- exactly the "slice, don't
+#     recompute" pattern the FP16/BFloat16 section already established, just
+#     for three co-indexed tensors instead of one. A *per-tensor* weight
+#     (scalar ``Ws``/``Wzp``) is simpler still, as the task anticipated:
+#     the scale/zero-point don't change at all (a single scalar isn't shaped
+#     by channel count), only ``Wq`` itself is sliced.
+#   * Pruning a QDQ weight's INPUT channels (the "consumer" role, e.g. that
+#     same MLP's second layer): ``Wq`` is sliced along its *reduction* axis
+#     -- the axis ``Ws``/``Wzp`` are never indexed by, per-channel or
+#     per-tensor alike -- so ``Ws``/``Wzp`` are simply left completely
+#     untouched. This is genuinely simpler than the producer side, not just
+#     differently shaped: it needs no co-slicing of anything beyond ``Wq``
+#     itself, identical in spirit to how an ordinary *float* consumer weight
+#     is already sliced along its own input axis with no other tensor
+#     involved.
+#
+# Both is-QDQ combinations are supported for either role (a QDQ producer
+# feeding a plain float consumer, or vice versa, or QDQ on both sides) --
+# :func:`_resolve_weight_ref` treats a direct float initializer and a QDQ
+# ``DequantizeLinear``-fed one as two resolutions of the same "weight
+# reference" concept, so a producer/consumer pair is only skipped by
+# :func:`apply_structured_pruning_qdq` when *neither* side is QDQ (that
+# plain float/float pair is exactly :func:`apply_structured_pruning`'s own
+# job, left untouched here rather than pruned twice by two different
+# passes).
+#
+# What's declined, deliberately, rather than guessed at:
+#
+#   * *Unstructured* (magnitude-style) pruning of a QDQ weight. Zeroing an
+#     individual int8 code only zeroes the *dequantized* value when
+#     ``zero_point`` happens to be exactly that code (``(q - zp) * scale ==
+#     0`` iff ``q == zp``) -- for this repo's own symmetric weights that's
+#     ``q == 0``, so it would coincidentally work there, but the general QDQ
+#     schema (see above) allows a nonzero, per-channel ``zero_point``, for
+#     which "which int8 code represents zero" varies channel by channel and
+#     picking the *smallest-magnitude dequantized values* to zero (this
+#     module's existing magnitude/Wanda/N:M criteria) would require
+#     recomputing and rewriting every kept ``Wq`` entry against the new
+#     mask's own statistics, not just dropping some -- a fundamentally
+#     different, much more invasive operation than this module's existing
+#     unstructured pruning (which only ever *sets entries to 0*, never
+#     changes any other entry) and outside this module's own "never
+#     recompute a kept value" principle used everywhere else. Rather than
+#     force a dubious answer, this is left declined -- and, as noted above,
+#     already is: every unstructured matcher's ``initializer_map.get(w_name)``
+#     already returns ``None`` for a ``DequantizeLinear``-fed weight name, so
+#     no code change was needed to establish this; it is simply documented
+#     and empirically confirmed here, per the module's own convention of
+#     explicitly discussing every topology boundary.
+#   * A *general grouped* or depthwise Conv (``group != 1``) on either side
+#     of a QDQ chain, and a gated (SwiGLU/GeGLU) pair, a residual/skip-
+#     connection merge, or a Concat-merged branch group anywhere in a QDQ
+#     chain. Every one of these is already a materially bigger project for
+#     the *plain float* case above (see this module's own top-of-file
+#     docstring) even before QDQ enters the picture; composing either with a
+#     QDQ weight's extra scale/zero-point bookkeeping is well beyond this
+#     section's scope. Only the plain single producer -> [zero or more
+#     shape-preserving unary activations, see `_UNARY_PASS_THROUGH`] ->
+#     single consumer topology (an ordinary, ``group=1`` Conv or MatMul/
+#     vanilla-Gemm on both ends) is matched -- no per-channel Add/Mul
+#     bias/scale hop either, unlike the plain float MatMul/Gemm chain walk
+#     above (:func:`_walk_to_consumer`), unnecessary complexity for this
+#     section's own deliberately narrow first cut.
+#   * Blocked quantization (opset 21+'s ``block_size`` attribute, scale/
+#     zero-point ranked like the input rather than a scalar or 1-D vector),
+#     a non-default ``output_dtype`` override, INT4/FLOAT8 quantized codes,
+#     and any DequantizeLinear whose ``x``/``x_scale``/(if present)
+#     ``x_zero_point`` initializer is read by more than one node (a
+#     shared/tied quantized weight -- slicing it here would silently corrupt
+#     whatever else reads it) or whose own output feeds more than one
+#     consumer. All declined by :func:`_match_dequantize_linear_weight`
+#     itself, the same conservative "decline anything ambiguous" bar every
+#     matcher elsewhere in this module is held to.
+#
+# Finding for the reverse composition -- pruning a still-*float* model with
+# :func:`apply_structured_pruning`/:func:`apply_structured_wanda_pruning` and
+# only *afterwards* running this repo's own
+# :func:`onnxsim.calibration.quantize_static` on the pruned result -- rather
+# than something this section needs to build: confirmed empirically (see
+# ``test_prune_then_quantize_static_composes_correctly``) to already work
+# correctly with no code changes anywhere. Pruning operates entirely on
+# float initializers and produces an ordinary (smaller) float graph;
+# ``quantize_static`` has no notion of "this graph was pruned" to get wrong.
+# The one practical prerequisite -- and it is exactly that, a prerequisite,
+# not a pruning-caused defect -- is that ``quantize_static`` (like
+# ``list_quantizable_activations``, which it calls internally) reads each
+# candidate activation's *declared* element type off the graph's own
+# ``value_info`` (``Value::elemType()`` in the C++ IR), which a hand-built
+# or ``onnx.parser``-parsed graph never populates for its own intermediate
+# tensors, and which :func:`apply_structured_pruning` does not itself run or
+# preserve; ``onnx.shape_inference.infer_shapes()`` on the pruned model
+# before quantizing (a standard step before handing a graph to *any*
+# onnxsim/onnxruntime tooling that inspects intermediate shapes/dtypes, not
+# a special QDQ- or pruning-specific one) resolves it, and the two compose
+# correctly from there -- verified end to end through onnxruntime, matching
+# a hand-computed reconstruction-error expectation (small, from
+# quantization, not from pruning).
+
+
+@dataclass(frozen=True)
+class _QDQWeight:
+    """A Conv/MatMul/Gemm weight fed through a ``DequantizeLinear`` node from
+    a constant int8/uint8 initializer, matched by
+    :func:`_match_dequantize_linear_weight` -- see this section's own
+    top-of-section comment for the exact pattern accepted and declined.
+    `axis` is this weight's own output-channel axis (0 for Conv; 0 or 1 for
+    MatMul/Gemm depending on ``transB``) -- meaningful only when
+    `per_channel`; a per-tensor (`per_channel=False`) weight's `scale_init`/
+    `zero_point_init` are scalars, unaffected by any axis.
+    """
+
+    dq_node: onnx.NodeProto
+    q_init: onnx.TensorProto
+    scale_init: onnx.TensorProto
+    zero_point_init: Optional[onnx.TensorProto]
+    axis: int
+    per_channel: bool
+
+
+def _match_dequantize_linear_weight(
+    weight_name: str,
+    rank: int,
+    expected_axis: int,
+    initializer_map: Dict[str, onnx.TensorProto],
+    dq_of: Dict[str, onnx.NodeProto],
+    consumers_of: Dict[str, List[onnx.NodeProto]],
+) -> Optional[_QDQWeight]:
+    """If `weight_name` is fed by a ``DequantizeLinear`` node from a constant
+    int8/uint8 initializer, with a constant float32 scale that is either a
+    scalar (per-tensor) or a 1-D vector of length ``dims[expected_axis]``
+    (per-channel, on exactly `expected_axis` -- the weight's own output-
+    channel axis, regardless of which role, producer or consumer, it plays
+    in the chain this weight sits in) with a matching `axis` attribute,
+    returns the match. `rank` is the expected weight rank (4 for Conv, 2 for
+    MatMul/Gemm).
+
+    Declines (``None``) whenever anything is ambiguous rather than guessing,
+    per this section's own top-of-section comment: a non-constant ``x``/
+    ``x_scale``/``x_zero_point``, a dtype other than INT8/UINT8 for the
+    weight (or a ``zero_point`` not matching it), a rank mismatch, a scale
+    shaped for blocked quantization (rank equal to `rank`) or any shape
+    other than scalar/1-D, a per-channel scale on any axis other than
+    `expected_axis`, a non-default ``block_size``/``output_dtype``
+    attribute, a ``DequantizeLinear`` output read by more than one
+    consumer, or any of ``x``/``x_scale``/``x_zero_point`` read by more than
+    one node (a shared/tied quantized tensor this weight's own slicing would
+    otherwise silently corrupt for that other reader).
+    """
+    dq = dq_of.get(weight_name)
+    if dq is None or dq.op_type != "DequantizeLinear" or len(dq.output) != 1:
+        return None
+    if len(consumers_of.get(weight_name, [])) != 1:
+        return None  # DQ output must feed only this one weight use
+    if len(dq.input) not in (2, 3):
+        return None
+    q_name, scale_name = dq.input[0], dq.input[1]
+    zp_name = dq.input[2] if len(dq.input) == 3 and dq.input[2] else None
+    if not q_name or not scale_name:
+        return None
+
+    q_init = initializer_map.get(q_name)
+    scale_init = initializer_map.get(scale_name)
+    if q_init is None or scale_init is None:
+        return None  # non-constant q/scale -- can't safely slice it
+    if q_init.data_type not in (onnx.TensorProto.INT8, onnx.TensorProto.UINT8):
+        return None  # the two 8-bit codes this repo's own QDQ tooling (and
+        # the ecosystem's standard QDQ pattern) emits; INT4 (nibble-packed)
+        # and FLOAT8 need entirely different unpacking/range handling this
+        # matcher doesn't attempt -- see this section's own comment.
+    if scale_init.data_type != onnx.TensorProto.FLOAT:
+        return None
+    if len(q_init.dims) != rank:
+        return None
+
+    zp_init = None
+    if zp_name is not None:
+        zp_init = initializer_map.get(zp_name)
+        if zp_init is None or zp_init.data_type != q_init.data_type:
+            return None  # schema: x_zero_point and x must have the same type
+        if list(zp_init.dims) != list(scale_init.dims):
+            return None  # schema: x_scale and x_zero_point must have the
+            # same shape
+
+    for nm in (q_name, scale_name) + ((zp_name,) if zp_name else ()):
+        if len(consumers_of.get(nm, [])) != 1:
+            return None  # shared/tied quantized tensor -- another node
+            # reads it too, so it can't be sliced only for this one
+
+    for attr in dq.attribute:
+        if attr.name == "block_size" and attr.i != 0:
+            return None  # blocked quantization -- a different scale shape/
+            # granularity than either case this matcher handles
+        if attr.name == "output_dtype" and attr.i != 0:
+            return None  # non-default output dtype -- out of scope
+
+    axis = 1  # DequantizeLinear's own schema default
+    for attr in dq.attribute:
+        if attr.name == "axis":
+            axis = attr.i
+            break
+    if axis < 0:
+        axis += rank
+
+    scale_dims = list(scale_init.dims)
+    numel = int(np.prod(scale_dims)) if scale_dims else 1
+    if numel == 1:
+        per_channel = False  # per-tensor: axis is immaterial (a scalar
+        # broadcasts to every channel identically regardless)
+    elif len(scale_dims) == 1:
+        if axis != expected_axis:
+            return None  # per-channel scale on an axis other than this
+            # weight's own output-channel axis -- not the shape this pass
+            # prunes, decline rather than guess
+        if scale_dims[0] != q_init.dims[expected_axis]:
+            return None  # scale length must match the channel count
+        per_channel = True
+    else:
+        return None  # anything else (blocked quantization's rank == `rank`
+        # scale, or any other shape) -- out of scope, see this section's own
+        # top-of-section comment
+
+    return _QDQWeight(
+        dq_node=dq,
+        q_init=q_init,
+        scale_init=scale_init,
+        zero_point_init=zp_init,
+        axis=expected_axis,
+        per_channel=per_channel,
+    )
+
+
+@dataclass(frozen=True)
+class _WeightRef:
+    """A Conv/MatMul/Gemm weight resolved from either of the two sources
+    :func:`_resolve_weight_ref` distinguishes: a direct float32/float16/
+    bfloat16 initializer (`float_init`, exactly what every matcher earlier
+    in this module already requires), or a QDQ ``DequantizeLinear``-fed
+    int8/uint8 one (`qdq`, matched by
+    :func:`_match_dequantize_linear_weight`). Exactly one of the two is set.
+    """
+
+    float_init: Optional[onnx.TensorProto] = None
+    qdq: Optional[_QDQWeight] = None
+
+    @property
+    def is_qdq(self) -> bool:
+        return self.qdq is not None
+
+
+def _resolve_weight_ref(
+    weight_name: str,
+    rank: int,
+    expected_axis: int,
+    initializer_map: Dict[str, onnx.TensorProto],
+    dq_of: Dict[str, onnx.NodeProto],
+    consumers_of: Dict[str, List[onnx.NodeProto]],
+) -> Optional[_WeightRef]:
+    """Resolves `weight_name` to a :class:`_WeightRef`, trying a direct
+    float32/float16/bfloat16 initializer first (the common, cheap check),
+    then a QDQ ``DequantizeLinear``-fed one (see
+    :func:`_match_dequantize_linear_weight`). ``None`` when neither matches.
+    """
+    w_init = initializer_map.get(weight_name)
+    if w_init is not None:
+        if _is_supported_float_dtype(w_init.data_type) and len(w_init.dims) == rank:
+            return _WeightRef(float_init=w_init)
+        return None
+    qdq = _match_dequantize_linear_weight(
+        weight_name, rank, expected_axis, initializer_map, dq_of, consumers_of
+    )
+    if qdq is None:
+        return None
+    return _WeightRef(qdq=qdq)
+
+
+def _weight_ref_dims(ref: _WeightRef) -> Tuple[int, ...]:
+    if ref.float_init is not None:
+        return tuple(ref.float_init.dims)
+    assert ref.qdq is not None
+    return tuple(ref.qdq.q_init.dims)
+
+
+def _weight_ref_key(ref: _WeightRef) -> str:
+    """A name uniquely identifying the underlying tensor `ref` resolves to
+    -- the int8 ``q_init`` for a QDQ weight (which, per
+    :func:`_match_dequantize_linear_weight`'s own single-consumer check, is
+    read by exactly the one ``DequantizeLinear`` feeding exactly this one
+    weight use, so it is as safe a per-weight identity key as a plain float
+    initializer's own name already is elsewhere in this module) or the
+    float initializer's own name otherwise. Used by
+    :func:`apply_structured_pruning_qdq` to detect a shared/tied weight
+    playing the same role (producer or consumer) in more than one chain.
+    """
+    if ref.float_init is not None:
+        return ref.float_init.name
+    assert ref.qdq is not None
+    return ref.qdq.q_init.name
+
+
+def _weight_ref_dequantized(ref: _WeightRef) -> np.ndarray:
+    """The full float64 array `ref` refers to, for IMPORTANCE RANKING ONLY
+    -- never written back to the graph. The actual mutation always slices
+    the int8 codes/scale/zero-point directly (:func:`_slice_producer_weight_qdq`/
+    :func:`_slice_consumer_weight_qdq`), exactly the "slice, don't recompute"
+    principle this section's own top-of-section comment describes; this
+    helper exists purely so a QDQ producer's output channels can be ranked
+    by the same L1/L2-norm-of-dequantized-row criterion a plain float
+    producer's already are (:func:`_qdq_channel_importance`), without that
+    ranking caring which source it came from.
+    """
+    if ref.float_init is not None:
+        return _to_f64(ref.float_init)
+    qdq = ref.qdq
+    assert qdq is not None
+    q = onnx.numpy_helper.to_array(qdq.q_init).astype(np.float64)
+    scale = onnx.numpy_helper.to_array(qdq.scale_init).astype(np.float64)
+    if qdq.zero_point_init is not None:
+        zp = onnx.numpy_helper.to_array(qdq.zero_point_init).astype(np.float64)
+    else:
+        zp = np.float64(0.0)
+    if qdq.per_channel:
+        shape = [1] * q.ndim
+        shape[qdq.axis] = -1
+        scale = scale.reshape(shape)
+        if qdq.zero_point_init is not None:
+            zp = zp.reshape(shape)
+    return (q - zp) * scale
+
+
+def _qdq_channel_importance(w_nk: np.ndarray, importance_norm: str) -> np.ndarray:
+    """L1 or L2 norm of each output channel's own (dequantized) weight row
+    -- the same criterion :func:`_plain_structured_importance` uses for a
+    plain float chain, just for the single-producer case this section's own
+    narrower QDQ chains are always restricted to (no gated pair to combine).
+    """
+    if importance_norm == "l1":
+        return np.linalg.norm(w_nk, ord=1, axis=1)
+    return np.linalg.norm(w_nk, axis=1)
+
+
+def _slice_producer_weight_qdq(
+    ref: _WeightRef, weight_transposed: bool, keep: np.ndarray, is_conv: bool
+) -> None:
+    """Slices `ref`'s own output channels to `keep` (ascending indices) --
+    the producer role. For a QDQ weight this means the int8 ``Wq`` AND (when
+    `per_channel`) its own ``Ws``/``Wzp`` are all sliced together by the same
+    `keep`, in lockstep (see this section's own top-of-section comment); a
+    per-tensor QDQ weight only slices ``Wq`` -- its scalar ``Ws``/``Wzp``
+    apply uniformly to every channel regardless of how many survive, so
+    there is nothing else to touch. Mirrors :func:`_slice_producer_weight`
+    exactly for the float case (delegated to it directly).
+    """
+    if ref.float_init is not None:
+        _slice_producer_weight(ref.float_init, weight_transposed, keep, is_conv=is_conv)
+        return
+    qdq = ref.qdq
+    assert qdq is not None
+    q = onnx.numpy_helper.to_array(qdq.q_init)
+    if is_conv:
+        q_new = q[keep, ...]
+    else:
+        q_new = q[keep, :] if weight_transposed else q[:, keep]
+    qdq.q_init.CopyFrom(onnx.numpy_helper.from_array(q_new, name=qdq.q_init.name))
+    if qdq.per_channel:
+        scale = onnx.numpy_helper.to_array(qdq.scale_init)
+        qdq.scale_init.CopyFrom(
+            onnx.numpy_helper.from_array(scale[keep], name=qdq.scale_init.name)
+        )
+        if qdq.zero_point_init is not None:
+            zp = onnx.numpy_helper.to_array(qdq.zero_point_init)
+            qdq.zero_point_init.CopyFrom(
+                onnx.numpy_helper.from_array(zp[keep], name=qdq.zero_point_init.name)
+            )
+
+
+def _slice_consumer_weight_qdq(
+    ref: _WeightRef, weight_transposed: bool, keep: np.ndarray, is_conv: bool
+) -> None:
+    """Slices `ref`'s own input (reduction) channels to `keep` -- the
+    consumer role. For a QDQ weight this only ever slices the int8 ``Wq``
+    itself: ``Ws``/``Wzp`` are indexed by this weight's own OUTPUT channel
+    axis (per-channel) or are a scalar (per-tensor), never by the
+    input/reduction axis sliced here, so they are always left completely
+    untouched -- genuinely simpler than the producer role, not just
+    differently shaped (see this section's own top-of-section comment).
+    Mirrors :func:`_slice_consumer_weight` exactly for the float case
+    (delegated to it directly).
+    """
+    if ref.float_init is not None:
+        _slice_consumer_weight(ref.float_init, weight_transposed, keep, is_conv=is_conv)
+        return
+    qdq = ref.qdq
+    assert qdq is not None
+    q = onnx.numpy_helper.to_array(qdq.q_init)
+    if is_conv:
+        q_new = q[:, keep, ...]
+    else:
+        q_new = q[:, keep] if weight_transposed else q[keep, :]
+    qdq.q_init.CopyFrom(onnx.numpy_helper.from_array(q_new, name=qdq.q_init.name))
+
+
+@dataclass(frozen=True)
+class _QDQProducer:
+    node: onnx.NodeProto
+    ref: _WeightRef
+    bias: Optional[str]
+    weight_transposed: bool
+    is_conv: bool
+
+
+@dataclass(frozen=True)
+class _QDQConsumer:
+    node: onnx.NodeProto
+    ref: _WeightRef
+    weight_transposed: bool
+    is_conv: bool
+
+
+@dataclass(frozen=True)
+class _QDQChain:
+    producer: _QDQProducer
+    chain_ops: Tuple[onnx.NodeProto, ...]
+    consumer: _QDQConsumer
+    n_channels: int
+
+
+def _match_conv_qdq(
+    node: onnx.NodeProto,
+    initializer_map: Dict[str, onnx.TensorProto],
+    dq_of: Dict[str, onnx.NodeProto],
+    consumers_of: Dict[str, List[onnx.NodeProto]],
+) -> Optional[Tuple[_WeightRef, Optional[str], int, int]]:
+    """If `node` is an ordinary (``group=1``) 2-D ``Conv`` whose weight
+    resolves (:func:`_resolve_weight_ref`) to either a direct float
+    initializer or a QDQ one, returns ``(ref, bias_name_or_None,
+    out_channels, in_channels)``. A grouped or depthwise Conv is never
+    matched here -- see this section's own top-of-section comment for why
+    that composition is out of scope.
+    """
+    if node.op_type != "Conv" or len(node.input) < 2:
+        return None
+    if _conv_group(node) != 1:
+        return None
+    w_name = node.input[1]
+    ref = _resolve_weight_ref(w_name, 4, 0, initializer_map, dq_of, consumers_of)
+    if ref is None:
+        return None
+    dims = _weight_ref_dims(ref)
+    out_channels, in_channels = dims[0], dims[1]
+    bias_name = None
+    if len(node.input) == 3 and node.input[2]:
+        bias_name = node.input[2]
+        b_init = initializer_map.get(bias_name)
+        if b_init is None or not _is_supported_float_dtype(b_init.data_type):
+            return None  # non-constant bias -- can't safely slice it
+    return ref, bias_name, out_channels, in_channels
+
+
+def _match_matmul_qdq(
+    node: onnx.NodeProto,
+    initializer_map: Dict[str, onnx.TensorProto],
+    dq_of: Dict[str, onnx.NodeProto],
+    consumers_of: Dict[str, List[onnx.NodeProto]],
+) -> Optional[Tuple[str, _WeightRef, bool, Optional[str], int, int]]:
+    """If `node` is a MatMul/vanilla-Gemm whose weight resolves
+    (:func:`_resolve_weight_ref`) to either a direct float initializer or a
+    QDQ one, returns ``(x_name, ref, weight_transposed, bias_name_or_None,
+    out_channels, in_channels)``.
+    """
+    match = _match_matmul_like(node)
+    if match is None:
+        return None
+    x_name, w_name, weight_transposed = match
+    axis = 0 if weight_transposed else 1
+    ref = _resolve_weight_ref(w_name, 2, axis, initializer_map, dq_of, consumers_of)
+    if ref is None:
+        return None
+    dims = _weight_ref_dims(ref)
+    out_channels, in_channels = dims[axis], dims[1 - axis]
+    bias_name = None
+    if node.op_type == "Gemm" and len(node.input) == 3 and node.input[2]:
+        bias_name = node.input[2]
+        b_init = initializer_map.get(bias_name)
+        if b_init is None or not _is_supported_float_dtype(b_init.data_type):
+            return None  # non-constant bias -- can't safely slice it
+    return x_name, ref, weight_transposed, bias_name, out_channels, in_channels
+
+
+def _walk_to_consumer_qdq(
+    start: str,
+    is_conv: bool,
+    initializer_map: Dict[str, onnx.TensorProto],
+    dq_of: Dict[str, onnx.NodeProto],
+    consumers_of: Dict[str, List[onnx.NodeProto]],
+    graph_outputs: Set[str],
+    n_channels: int,
+    max_hops: int,
+) -> Optional[Tuple[_QDQConsumer, Tuple[onnx.NodeProto, ...]]]:
+    """From tensor `start`, walks forward through shape-preserving unary
+    activations (`_UNARY_PASS_THROUGH`) with no other consumer anywhere
+    along the way, until a same-family (Conv-only or MatMul/Gemm-only,
+    matching `is_conv`) consumer is found whose input-channel count matches
+    `n_channels`. No per-channel Add/Mul bias/scale hop, no depthwise Conv
+    pass-through, no branch -- narrower than :func:`_walk_to_consumer`/
+    :func:`_walk_to_conv_consumer` by design, see this section's own
+    top-of-section comment. Returns ``None`` if the walk runs out of hops,
+    hits a branch, or never reaches such a consumer.
+    """
+    chain_ops: List[onnx.NodeProto] = []
+    cur = start
+    for _hop in range(max_hops):
+        candidates = consumers_of.get(cur, [])
+        if len(candidates) != 1:
+            return None
+        nxt = candidates[0]
+
+        if is_conv:
+            if nxt.op_type == "Conv" and nxt.input[0] == cur:
+                m = _match_conv_qdq(nxt, initializer_map, dq_of, consumers_of)
+                if m is None or m[3] != n_channels:
+                    return None
+                ref, _bias, _out, _in = m
+                return _QDQConsumer(nxt, ref, False, True), tuple(chain_ops)
+        else:
+            mm = _match_matmul_qdq(nxt, initializer_map, dq_of, consumers_of)
+            if mm is not None and mm[0] == cur:
+                if mm[5] != n_channels:
+                    return None
+                _x, ref, weight_transposed, _bias, _out, _in = mm
+                return _QDQConsumer(nxt, ref, weight_transposed, False), tuple(
+                    chain_ops
+                )
+
+        if not (
+            nxt.op_type in _UNARY_PASS_THROUGH
+            and list(nxt.input) == [cur]
+            and len(nxt.output) == 1
+        ):
+            return None
+        out2 = nxt.output[0]
+        if len(consumers_of.get(out2, [])) != 1 or out2 in graph_outputs:
+            return None
+        chain_ops.append(nxt)
+        cur = out2
+    return None
+
+
+def _find_qdq_chains(graph: onnx.GraphProto) -> List[_QDQChain]:
+    """The QDQ analogue of :func:`_find_chains`/:func:`_find_conv_chains`,
+    restricted to the single-producer/single-consumer/unary-hops-only
+    topology :func:`_walk_to_consumer_qdq` matches, and requiring at least
+    one side of the pair to actually be QDQ (a plain float/float pair is
+    :func:`apply_structured_pruning`'s own job, not duplicated here).
+    """
+    initializer_map = {t.name: t for t in graph.initializer}
+    consumers_of = _consumers_of(graph)
+    dq_of = {
+        n.output[0]: n
+        for n in graph.node
+        if n.op_type == "DequantizeLinear" and len(n.output) == 1
+    }
+    graph_outputs = {o.name for o in graph.output}
+
+    def _is_internal(name: str) -> bool:
+        return len(consumers_of.get(name, [])) == 1 and name not in graph_outputs
+
+    chains: List[_QDQChain] = []
+    for node in graph.node:
+        if node.op_type == "Conv":
+            m = _match_conv_qdq(node, initializer_map, dq_of, consumers_of)
+            if m is None:
+                continue
+            ref, bias_name, out_channels, _in_channels = m
+            weight_transposed = False
+            is_conv = True
+        else:
+            mm = _match_matmul_qdq(node, initializer_map, dq_of, consumers_of)
+            if mm is None:
+                continue
+            _x_name, ref, weight_transposed, bias_name, out_channels, _in_channels = mm
+            is_conv = False
+
+        out_name = node.output[0]
+        if not _is_internal(out_name):
+            continue
+
+        found = _walk_to_consumer_qdq(
+            out_name,
+            is_conv,
+            initializer_map,
+            dq_of,
+            consumers_of,
+            graph_outputs,
+            out_channels,
+            _MAX_CHAIN_HOPS,
+        )
+        if found is None:
+            continue
+        consumer, chain_ops = found
+        if not (ref.is_qdq or consumer.ref.is_qdq):
+            continue  # both plain float -- apply_structured_pruning's job
+
+        chains.append(
+            _QDQChain(
+                producer=_QDQProducer(node, ref, bias_name, weight_transposed, is_conv),
+                chain_ops=chain_ops,
+                consumer=consumer,
+                n_channels=out_channels,
+            )
+        )
+    return chains
+
+
+def apply_structured_pruning_qdq(
+    model: Union[str, onnx.ModelProto],
+    sparsity: float = 0.5,
+    importance_norm: _ImportanceNorm = "l2",
+) -> onnx.ModelProto:
+    """Removes whole output channels from a Conv or MatMul/vanilla-Gemm
+    layer whose weight -- on either side of the producer/consumer pair, or
+    both -- is statically quantized in the QDQ format (a constant int8/
+    uint8 initializer fed through a ``DequantizeLinear`` node), the way
+    :func:`onnxsim.calibration.quantize_static` (and the wider ONNX
+    ecosystem's own standard static-quantization tooling) produces one. See
+    this module's "QDQ (quantized-weight) structured pruning" section
+    comment for the full investigation this scope was reached from: what
+    this repo's own QDQ tooling emits (cross-checked against the live
+    ``DequantizeLinear`` schema), why structural pruning of a per-channel
+    quantized weight reduces to the same "slice, don't recompute" principle
+    the FP16/BFloat16 weight support above already established (co-slicing
+    the int8 codes with their own per-channel scale/zero-point on the
+    producer side; touching only the int8 codes, never the scale/zero-point,
+    on the consumer side), why *unstructured* pruning of a QDQ weight is a
+    fundamentally harder, declined-rather-than-guessed-at problem (already
+    naturally excluded by every existing unstructured matcher, confirmed
+    empirically), and why the *opposite* composition -- pruning a float
+    model, then quantizing the result -- already works with no code changes
+    here at all.
+
+    For every Conv (``group=1``) or MatMul/vanilla-Gemm node (the
+    "producer") whose output feeds, through zero or more shape-preserving
+    unary activations (`_UNARY_PASS_THROUGH`) with no other consumer
+    anywhere along that path, into exactly one downstream same-family node
+    (the "consumer") whose input/reduction dimension matches -- and where at
+    least one of the two is QDQ-quantized (a plain float/float pair is
+    :func:`apply_structured_pruning`'s own job, not duplicated here): ranks
+    the producer's output channels by L1/L2 norm of their own dequantized
+    weight row (:func:`_qdq_channel_importance` -- dequantized for ranking
+    only, never for the actual rewrite), drops the lowest-``sparsity``-
+    fraction of them, and slices the producer's weight (its int8 codes and,
+    for a per-channel-quantized one, its own scale/zero-point together, in
+    lockstep; a per-tensor-quantized one leaves scale/zero-point untouched)
+    and bias (if it has a constant float one -- bias is never itself
+    quantized by this repo's own QDQ tooling), and the matching input
+    channels from the consumer's weight (its int8 codes only -- QDQ or not,
+    a consumer's own scale/zero-point are indexed by its OUTPUT channel
+    axis, never touched by slicing its input axis).
+
+    No general grouped/depthwise Conv, gated (SwiGLU/GeGLU) pair, residual/
+    skip-connection merge, or Concat-merged branch group is matched for a
+    QDQ chain -- every one of those is already a materially bigger project
+    for the plain float case (:func:`apply_structured_pruning`'s own
+    docstring); composing any of them with QDQ's extra scale/zero-point
+    bookkeeping is out of scope here (see this module's "QDQ" section
+    comment for the full reasoning). Call :func:`apply_structured_pruning`/
+    :func:`apply_structured_wanda_pruning` for those topologies on an
+    all-float graph, and this function for the narrower QDQ-aware slice
+    above; the two never touch the same tensor (a QDQ chain requires at
+    least one QDQ-quantized side, which the float-only passes above can
+    never match in the first place, their own weight matchers requiring a
+    *direct* float initializer).
+
+    :param model: onnx ModelProto object or file path
+    :param sparsity: fraction of each eligible producer's output channels to
+            drop (rounded, at least one channel is always kept)
+    :param importance_norm: ``"l2"`` (default, Li et al.'s original
+            filter-pruning criterion) or ``"l1"``
+    :returns: the pruned onnx ModelProto
+    """
+    if not (0.0 <= sparsity < 1.0):
+        raise ValueError(f"sparsity must be in [0, 1), got {sparsity}")
+    _validate_importance_norm(importance_norm)
+    if isinstance(model, str):
+        model = onnx.load(model, load_external_data=False)
+    out = onnx.ModelProto()
+    out.CopyFrom(model)
+    graph = out.graph
+
+    chains = _find_qdq_chains(graph)
+    if not chains:
+        return out
+
+    initializer_map = {t.name: t for t in graph.initializer}
+    producer_touched: Set[str] = set()
+    consumer_touched: Set[str] = set()
+    stale_value_info: Set[str] = set()
+
+    for chain in chains:
+        p, c = chain.producer, chain.consumer
+        p_key = _weight_ref_key(p.ref)
+        c_key = _weight_ref_key(c.ref)
+        if p_key == c_key:
+            continue  # degenerate (the same weight in both roles)
+        if p_key in producer_touched or c_key in consumer_touched:
+            continue  # a shared/tied weight another chain already resized
+
+        n = chain.n_channels
+        keep_count = max(1, n - round(n * sparsity))
+        if keep_count >= n:
+            continue  # rounds down to nothing for this layer -- no-op
+
+        w = _weight_ref_dequantized(p.ref)
+        w_nk = _weight_to_nk(w, p.weight_transposed, p.is_conv)
+        importance = _qdq_channel_importance(w_nk, importance_norm)
+        keep = np.sort(np.argsort(-importance)[:keep_count])
+
+        _slice_producer_weight_qdq(p.ref, p.weight_transposed, keep, p.is_conv)
+        if p.bias is not None:
+            _slice_last_axis(initializer_map[p.bias], keep)
+        _slice_consumer_weight_qdq(c.ref, c.weight_transposed, keep, c.is_conv)
+
+        producer_touched.add(p_key)
+        consumer_touched.add(c_key)
+        stale_value_info.add(p.node.output[0])
+        stale_value_info.update(op.output[0] for op in chain.chain_ops)
+        if p.ref.is_qdq:
+            assert p.ref.qdq is not None
+            stale_value_info.add(p.ref.qdq.dq_node.output[0])
+        if c.ref.is_qdq:
+            assert c.ref.qdq is not None
+            stale_value_info.add(c.ref.qdq.dq_node.output[0])
+
+    if stale_value_info:
+        kept = [vi for vi in graph.value_info if vi.name not in stale_value_info]
+        del graph.value_info[:]
+        graph.value_info.extend(kept)
+    return out
+
+
 # --- Attention-head pruning -----------------------------------------------
 
 # Three fused self-attention ops are matched here -- two from the
