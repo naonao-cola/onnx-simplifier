@@ -216,10 +216,14 @@ cmake --build "${BUILD_DIR}" --target onnx_cpp2py_export -j "${JOBS}"
 # this list, so omitting one here doesn't skip its test, it makes ctest try
 # to exec a binary that was never built: an instant, silent "Failed 0.00
 # sec" with no output, indistinguishable at a glance from a real crash.
+# ggml_mxfp4_test (the GGML MXFP4 dequantization ggml_mxfp4.h implements --
+# same rationale as ggml_kquant_test above: decoded values are real numeric
+# output, not just copied bytes) is dependency-free too and belongs here for
+# the same reason.
 cmake --build "${BUILD_DIR}" --target sym_expr_test model_metrics_test \
   sym_value_eval_test sym_shape_infer_test dlpack_dtype_test \
   tensor_pool_dtype_test tensor_pool_test tensor_pool_hash_test \
-  gguf_dtype_test ggml_kquant_test tensor_pool_gguf_test \
+  gguf_dtype_test ggml_kquant_test ggml_mxfp4_test tensor_pool_gguf_test \
   read_gguf_metadata_test -j "${JOBS}"
 # tensor_pool_bridge_test, tensor_pool_gguf_bridge_test,
 # tensor_pool_archive_test, precision_estimator_test, and

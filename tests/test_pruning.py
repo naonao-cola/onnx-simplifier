@@ -14126,3 +14126,634 @@ def test_analyze_moe_whole_expert_pruning_margin_reflects_router_usage_distribut
     assert margin_b == 0.0  # every expert's router logit exactly tied
     assert margin_a is not None and margin_a > 0.9  # wide, unambiguous gap
     assert margin_a != margin_b
+
+
+# --- apply_transformer_block_pruning ---------------------------------------
+#
+# See ``onnxsim/pruning.py``'s own "Transformer block (depth) pruning"
+# section comment for the exact pattern matched, the two scope decisions
+# (bare-``Add`` merges and a plain, unfused entry norm only -- no
+# ``SkipLayerNormalization``-family node in either role; attention and
+# MLP/FFN blocks matched independently, never only as a paired "whole
+# layer"), and why a KV-cache-bearing attention block always declines
+# itself with no dedicated detection.
+
+
+def test_transformer_block_pruning_drops_near_identity_mlp_block_and_matches_manual_removal_oracle():
+    # Two stacked pre-norm MLP residual blocks. Block 0's own down-
+    # projection weight is scaled to ~1e-6 -- F_0(LN(x0)) is numerically
+    # negligible, so x1 = x0 + F_0(...) is almost exactly x0 -- the
+    # canonical "redundant block" case the ranking metric (mean cosine
+    # similarity between a candidate's own x_in/x_out) should flag as the
+    # one to drop. Block 1's own weight is ordinary-scale, a real
+    # transformation that must survive.
+    H = 8
+    rng = np.random.default_rng(0)
+    ln0_scale = np.ones(H, dtype=np.float32)
+    ln0_bias = np.zeros(H, dtype=np.float32)
+    w0 = (rng.standard_normal((H, H)) * 1e-6).astype(np.float32)
+    ln1_scale = np.ones(H, dtype=np.float32)
+    ln1_bias = np.zeros(H, dtype=np.float32)
+    w1 = rng.standard_normal((H, H)).astype(np.float32)
+
+    model = _model(
+        f"""
+        g (float[1,4,{H}] x0) => (float[1,4,{H}] y)
+        {{
+          ln0 = LayerNormalization<axis=-1>(x0, Ln0Scale, Ln0Bias)
+          h0 = MatMul(ln0, W0)
+          x1 = Add(x0, h0)
+
+          ln1 = LayerNormalization<axis=-1>(x1, Ln1Scale, Ln1Bias)
+          h1 = MatMul(ln1, W1)
+          x2 = Add(x1, h1)
+
+          y = Identity(x2)
+        }}
+        """,
+        initializer=[
+            _f32(ln0_scale, "Ln0Scale"),
+            _f32(ln0_bias, "Ln0Bias"),
+            _f32(w0, "W0"),
+            _f32(ln1_scale, "Ln1Scale"),
+            _f32(ln1_bias, "Ln1Bias"),
+            _f32(w1, "W1"),
+        ],
+    )
+    onnx.checker.check_model(model)
+
+    # The independently hand-built reference: block 0 already manually
+    # excised, x0 feeding block 1 directly in place of x1.
+    ref = _model(
+        f"""
+        g (float[1,4,{H}] x0) => (float[1,4,{H}] y)
+        {{
+          ln1 = LayerNormalization<axis=-1>(x0, Ln1Scale, Ln1Bias)
+          h1 = MatMul(ln1, W1)
+          x2 = Add(x0, h1)
+          y = Identity(x2)
+        }}
+        """,
+        initializer=[
+            _f32(ln1_scale, "Ln1Scale"),
+            _f32(ln1_bias, "Ln1Bias"),
+            _f32(w1, "W1"),
+        ],
+    )
+    onnx.checker.check_model(ref)
+
+    pruned = onnxsim.apply_transformer_block_pruning(
+        model, num_blocks_to_drop=1, seed=0, num_samples=4
+    )
+    onnx.checker.check_model(pruned)
+
+    # Exactly block 0's own nodes (ln0, h0, x1's own Add) are gone; block 1
+    # survives untouched, in its original relative order.
+    assert [n.op_type for n in pruned.graph.node] == [
+        "LayerNormalization",
+        "MatMul",
+        "Add",
+        "Identity",
+    ]
+
+    x = np.random.default_rng(42).standard_normal((1, 4, H)).astype(np.float32)
+    (pruned_y,) = _run(pruned, {"x0": x})
+    (ref_y,) = _run(ref, {"x0": x})
+    # Exact match to the independently hand-built, block-already-removed
+    # reference -- not merely "close to the original" -- proves the graph
+    # surgery/rewiring itself is correct, independent of whether dropping
+    # this particular block was numerically a good idea.
+    np.testing.assert_array_equal(pruned_y, ref_y)
+
+
+def test_transformer_block_pruning_adversarial_ranking_prefers_more_redundant_block_regardless_of_position():
+    # The redundant block is placed *second*, not first -- proving
+    # selection follows the calibrated cosine-similarity ranking, not
+    # simply "whichever candidate the forward scan finds first". Block 0
+    # is a real transformation (large weight); block 1 is engineered
+    # near-identity (tiny weight).
+    H = 8
+    rng = np.random.default_rng(7)
+    ln0_scale = np.ones(H, dtype=np.float32)
+    ln0_bias = np.zeros(H, dtype=np.float32)
+    w0 = rng.standard_normal((H, H)).astype(np.float32)
+    ln1_scale = np.ones(H, dtype=np.float32)
+    ln1_bias = np.zeros(H, dtype=np.float32)
+    w1 = (rng.standard_normal((H, H)) * 1e-6).astype(np.float32)
+
+    model = _model(
+        f"""
+        g (float[1,4,{H}] x0) => (float[1,4,{H}] y)
+        {{
+          ln0 = LayerNormalization<axis=-1>(x0, Ln0Scale, Ln0Bias)
+          h0 = MatMul(ln0, W0)
+          x1 = Add(x0, h0)
+
+          ln1 = LayerNormalization<axis=-1>(x1, Ln1Scale, Ln1Bias)
+          h1 = MatMul(ln1, W1)
+          x2 = Add(x1, h1)
+
+          y = Identity(x2)
+        }}
+        """,
+        initializer=[
+            _f32(ln0_scale, "Ln0Scale"),
+            _f32(ln0_bias, "Ln0Bias"),
+            _f32(w0, "W0"),
+            _f32(ln1_scale, "Ln1Scale"),
+            _f32(ln1_bias, "Ln1Bias"),
+            _f32(w1, "W1"),
+        ],
+    )
+
+    # Reference: block 1 (the redundant one) excised, block 0 kept.
+    ref = _model(
+        f"""
+        g (float[1,4,{H}] x0) => (float[1,4,{H}] y)
+        {{
+          ln0 = LayerNormalization<axis=-1>(x0, Ln0Scale, Ln0Bias)
+          h0 = MatMul(ln0, W0)
+          y = Add(x0, h0)
+        }}
+        """,
+        initializer=[
+            _f32(ln0_scale, "Ln0Scale"),
+            _f32(ln0_bias, "Ln0Bias"),
+            _f32(w0, "W0"),
+        ],
+    )
+
+    pruned = onnxsim.apply_transformer_block_pruning(
+        model, num_blocks_to_drop=1, seed=1, num_samples=4
+    )
+    onnx.checker.check_model(pruned)
+    assert [n.op_type for n in pruned.graph.node] == [
+        "LayerNormalization",
+        "MatMul",
+        "Add",
+        "Identity",
+    ]
+    # Only block 0's own LayerNormalization survives -- confirmed it's
+    # block 0 (not block 1) that remains by checking its own weight.
+    survivor = next(n for n in pruned.graph.node if n.op_type == "MatMul")
+    w_name = survivor.input[1]
+    inits = {t.name: t for t in pruned.graph.initializer}
+    np.testing.assert_array_equal(onnx.numpy_helper.to_array(inits[w_name]), w0)
+
+    x = np.random.default_rng(99).standard_normal((1, 4, H)).astype(np.float32)
+    (pruned_y,) = _run(pruned, {"x0": x})
+    (ref_y,) = _run(ref, {"x0": x})
+    np.testing.assert_array_equal(pruned_y, ref_y)
+
+
+def test_transformer_block_pruning_sparsity_selects_fraction_of_matched_candidates():
+    # Three stacked blocks, 0 and 2 engineered near-identity, block 1 a
+    # real transform. sparsity=2/3 of 3 matched candidates rounds to 2 --
+    # both near-identity blocks should be dropped, leaving only block 1,
+    # correctly rewired straight from x0 to the graph output.
+    H = 8
+    rng = np.random.default_rng(3)
+    scale = np.ones(H, dtype=np.float32)
+    bias = np.zeros(H, dtype=np.float32)
+    w0 = (rng.standard_normal((H, H)) * 1e-6).astype(np.float32)
+    w1 = rng.standard_normal((H, H)).astype(np.float32)
+    w2 = (rng.standard_normal((H, H)) * 1e-6).astype(np.float32)
+
+    model = _model(
+        f"""
+        g (float[1,4,{H}] x0) => (float[1,4,{H}] y)
+        {{
+          ln0 = LayerNormalization<axis=-1>(x0, Scale, Bias)
+          h0 = MatMul(ln0, W0)
+          x1 = Add(x0, h0)
+
+          ln1 = LayerNormalization<axis=-1>(x1, Scale, Bias)
+          h1 = MatMul(ln1, W1)
+          x2 = Add(x1, h1)
+
+          ln2 = LayerNormalization<axis=-1>(x2, Scale, Bias)
+          h2 = MatMul(ln2, W2)
+          x3 = Add(x2, h2)
+
+          y = Identity(x3)
+        }}
+        """,
+        initializer=[
+            _f32(scale, "Scale"),
+            _f32(bias, "Bias"),
+            _f32(w0, "W0"),
+            _f32(w1, "W1"),
+            _f32(w2, "W2"),
+        ],
+    )
+
+    ref = _model(
+        f"""
+        g (float[1,4,{H}] x0) => (float[1,4,{H}] y)
+        {{
+          ln1 = LayerNormalization<axis=-1>(x0, Scale, Bias)
+          h1 = MatMul(ln1, W1)
+          y = Add(x0, h1)
+        }}
+        """,
+        initializer=[_f32(scale, "Scale"), _f32(bias, "Bias"), _f32(w1, "W1")],
+    )
+
+    pruned = onnxsim.apply_transformer_block_pruning(
+        model, sparsity=2 / 3, seed=0, num_samples=4
+    )
+    onnx.checker.check_model(pruned)
+    assert [n.op_type for n in pruned.graph.node].count("LayerNormalization") == 1
+
+    x = np.random.default_rng(11).standard_normal((1, 4, H)).astype(np.float32)
+    (pruned_y,) = _run(pruned, {"x0": x})
+    (ref_y,) = _run(ref, {"x0": x})
+    # Confirms the "self-correcting live rewrite" chain
+    # (:func:`_apply_transformer_block_pruning`'s own docstring) handles
+    # two *non-adjacent* committed drops (0 and 2, sandwiching a kept
+    # block) correctly -- block 2's own x_in (x2) is itself downstream of
+    # block 0's own now-deleted merge, not a graph input.
+    np.testing.assert_array_equal(pruned_y, ref_y)
+
+
+def test_transformer_block_pruning_drops_attention_block_and_matches_manual_removal_oracle():
+    # A single self-attention residual block (Q/K/V projections feeding a
+    # real com.microsoft::GroupQueryAttention node, not a plain MLP) --
+    # confirms F need not be an MLP at all. Q/K/V/output-projection
+    # weights are all scaled tiny, so the whole block is near-identity and
+    # is the only candidate, dropped outright regardless of ranking.
+    K, NH, D = 16, 2, 8
+    Nqkv = NH * D
+    rng = np.random.default_rng(5)
+    scale = np.ones(K, dtype=np.float32)
+    bias = np.zeros(K, dtype=np.float32)
+    wq = (rng.standard_normal((K, Nqkv)) * 1e-6).astype(np.float32)
+    wk = (rng.standard_normal((K, Nqkv)) * 1e-6).astype(np.float32)
+    wv = (rng.standard_normal((K, Nqkv)) * 1e-6).astype(np.float32)
+    wout = (rng.standard_normal((Nqkv, K)) * 1e-6).astype(np.float32)
+    seq = 5
+    seqlens_k = np.full((2,), seq - 1, dtype=np.int32)
+    total_seq = np.array(seq, dtype=np.int32)
+
+    model = _model(
+        f"""
+        g (float[2,{seq},{K}] x0) => (float[2,{seq},{K}] y)
+        {{
+          ln = LayerNormalization<axis=-1>(x0, Scale, Bias)
+          q = MatMul(ln, Wq)
+          k = MatMul(ln, Wk)
+          v = MatMul(ln, Wv)
+          ctx, present_k, present_v = com.microsoft.GroupQueryAttention <num_heads={NH}, kv_num_heads={NH}> (q, k, v, , , SeqLensK, TotalSeq)
+          fout = MatMul(ctx, Wout)
+          y = Add(x0, fout)
+        }}
+        """,
+        initializer=[
+            _f32(scale, "Scale"),
+            _f32(bias, "Bias"),
+            _f32(wq, "Wq"),
+            _f32(wk, "Wk"),
+            _f32(wv, "Wv"),
+            _f32(wout, "Wout"),
+            onnx.numpy_helper.from_array(seqlens_k, "SeqLensK"),
+            onnx.numpy_helper.from_array(total_seq, "TotalSeq"),
+        ],
+    )
+    model.opset_import.append(onnx.helper.make_opsetid("com.microsoft", 1))
+    onnx.checker.check_model(model)
+
+    pruned = onnxsim.apply_transformer_block_pruning(
+        model, num_blocks_to_drop=1, seed=0, num_samples=4
+    )
+    onnx.checker.check_model(pruned)
+
+    # The whole attention block is gone -- only the inserted Identity(x0)
+    # feeding the graph's own declared output name remains.
+    assert [n.op_type for n in pruned.graph.node] == ["Identity"]
+    assert list(pruned.graph.node[0].input) == ["x0"]
+    assert list(pruned.graph.node[0].output) == ["y"]
+
+    x = np.random.default_rng(17).standard_normal((2, 5, K)).astype(np.float32)
+    (pruned_y,) = _run(pruned, {"x0": x})
+    # y == x0 exactly -- this is the "whole block removed" reference by
+    # construction (no separate reference model needed: an entirely
+    # removed single block's own oracle output is trivially its own
+    # input).
+    np.testing.assert_array_equal(pruned_y, x)
+
+
+def test_transformer_block_pruning_matches_rmsnormalization_entry():
+    # RMSNormalization (plain ONNX, opset 23+) as the entry norm, not
+    # LayerNormalization -- confirms the block-boundary walk isn't
+    # LayerNormalization-specific.
+    H = 8
+    rng = np.random.default_rng(9)
+    ln_scale = np.ones(H, dtype=np.float32)
+    w = (rng.standard_normal((H, H)) * 1e-6).astype(np.float32)
+
+    model = _model(
+        f"""
+        g (float[1,4,{H}] x0) => (float[1,4,{H}] y)
+        {{
+          ln = RMSNormalization<axis=-1>(x0, LnScale)
+          h = MatMul(ln, W)
+          y = Add(x0, h)
+        }}
+        """,
+        initializer=[_f32(ln_scale, "LnScale"), _f32(w, "W")],
+        opset=23,
+    )
+    onnx.checker.check_model(model)
+
+    pruned = onnxsim.apply_transformer_block_pruning(
+        model, num_blocks_to_drop=1, seed=0, num_samples=4
+    )
+    onnx.checker.check_model(pruned)
+    assert [n.op_type for n in pruned.graph.node] == ["Identity"]
+
+    x = np.random.default_rng(23).standard_normal((1, 4, H)).astype(np.float32)
+    (pruned_y,) = _run(pruned, {"x0": x})
+    np.testing.assert_array_equal(pruned_y, x)
+
+
+def test_transformer_block_pruning_matches_simplified_layer_normalization_entry():
+    # ``SimplifiedLayerNormalization`` (onnxruntime's own RMSNorm
+    # equivalent) as the entry norm -- confirmed, empirically (see this
+    # module's own section comment), to register under the *default*
+    # ("") domain, not ``com.microsoft`` -- this is what
+    # :func:`_is_entry_ln_node` actually checks against.
+    H = 8
+    rng = np.random.default_rng(13)
+    ln_scale = np.ones(H, dtype=np.float32)
+    w = (rng.standard_normal((H, H)) * 1e-6).astype(np.float32)
+
+    model = _model(
+        f"""
+        g (float[1,4,{H}] x0) => (float[1,4,{H}] y)
+        {{
+          ln = SimplifiedLayerNormalization<axis=-1,epsilon=1e-5>(x0, LnScale)
+          h = MatMul(ln, W)
+          y = Add(x0, h)
+        }}
+        """,
+        initializer=[_f32(ln_scale, "LnScale"), _f32(w, "W")],
+    )
+
+    pruned = onnxsim.apply_transformer_block_pruning(
+        model, num_blocks_to_drop=1, seed=0, num_samples=4
+    )
+    onnx.checker.check_model(pruned)
+    assert [n.op_type for n in pruned.graph.node] == ["Identity"]
+
+    x = np.random.default_rng(29).standard_normal((1, 4, H)).astype(np.float32)
+    (pruned_y,) = _run(pruned, {"x0": x})
+    np.testing.assert_array_equal(pruned_y, x)
+
+
+def test_transformer_block_pruning_declines_when_intermediate_tensor_has_external_consumer():
+    # LN's own output also feeds a second graph output directly -- an
+    # intermediate tensor read outside the block, exactly the topology
+    # this pass must decline rather than guess at. Left completely
+    # untouched.
+    H = 8
+    rng = np.random.default_rng(15)
+    scale = np.ones(H, dtype=np.float32)
+    bias = np.zeros(H, dtype=np.float32)
+    w = rng.standard_normal((H, H)).astype(np.float32)
+
+    model = _model(
+        f"""
+        g (float[1,4,{H}] x0) => (float[1,4,{H}] y, float[1,4,{H}] ln_out)
+        {{
+          ln = LayerNormalization<axis=-1>(x0, Scale, Bias)
+          h = MatMul(ln, W)
+          y = Add(x0, h)
+          ln_out = Identity(ln)
+        }}
+        """,
+        initializer=[_f32(scale, "Scale"), _f32(bias, "Bias"), _f32(w, "W")],
+    )
+    onnx.checker.check_model(model)
+
+    pruned = onnxsim.apply_transformer_block_pruning(
+        model, num_blocks_to_drop=1, seed=0, num_samples=4
+    )
+    assert pruned.SerializeToString() == model.SerializeToString()
+
+
+def test_transformer_block_pruning_declines_kv_cache_bearing_attention_block():
+    # present_k/present_v (a real com.microsoft::GroupQueryAttention
+    # node's own KV-cache outputs) are declared as graph outputs -- the
+    # same generic "no block-internal node's own output may leak outside
+    # the block" check that catches any other stray consumer also catches
+    # this, with no KV-cache-specific detection at all (see this module's
+    # own section comment for why). Left completely untouched.
+    K, NH, D = 8, 2, 4
+    Nqkv = NH * D
+    rng = np.random.default_rng(19)
+    scale = np.ones(K, dtype=np.float32)
+    bias = np.zeros(K, dtype=np.float32)
+    wq = rng.standard_normal((K, Nqkv)).astype(np.float32)
+    wk = rng.standard_normal((K, Nqkv)).astype(np.float32)
+    wv = rng.standard_normal((K, Nqkv)).astype(np.float32)
+    wout = rng.standard_normal((Nqkv, K)).astype(np.float32)
+
+    model = _model(
+        f"""
+        g (float[2,5,{K}] x0) => (float[2,5,{K}] y, float[2,5,{Nqkv}] present_k, float[2,5,{Nqkv}] present_v)
+        {{
+          ln = LayerNormalization<axis=-1>(x0, Scale, Bias)
+          q = MatMul(ln, Wq)
+          k = MatMul(ln, Wk)
+          v = MatMul(ln, Wv)
+          ctx, present_k, present_v = com.microsoft.GroupQueryAttention <num_heads={NH}, kv_num_heads={NH}> (q, k, v)
+          fout = MatMul(ctx, Wout)
+          y = Add(x0, fout)
+        }}
+        """,
+        initializer=[
+            _f32(scale, "Scale"),
+            _f32(bias, "Bias"),
+            _f32(wq, "Wq"),
+            _f32(wk, "Wk"),
+            _f32(wv, "Wv"),
+            _f32(wout, "Wout"),
+        ],
+    )
+    model.opset_import.append(onnx.helper.make_opsetid("com.microsoft", 1))
+    onnx.checker.check_model(model)
+
+    pruned = onnxsim.apply_transformer_block_pruning(
+        model, num_blocks_to_drop=1, seed=0, num_samples=4
+    )
+    assert pruned.SerializeToString() == model.SerializeToString()
+
+
+def test_transformer_block_pruning_declines_shape_broadcasting_merge():
+    # F's own final output is deliberately tiled to a *wider* batch
+    # dimension than x_in's own -- the residual Add would silently
+    # broadcast x_in up to match, so replacing every x_out consumer with
+    # (narrower) x_in directly would be shape-unsafe. Declined outright
+    # via :func:`_shapes_match`, not guessed at. Left completely
+    # untouched.
+    H = 8
+    rng = np.random.default_rng(21)
+    scale = np.ones(H, dtype=np.float32)
+    bias = np.zeros(H, dtype=np.float32)
+    w = rng.standard_normal((H, H)).astype(np.float32)
+    repeats = np.array([3, 1, 1], dtype=np.int64)
+
+    model = _model(
+        f"""
+        g (float[1,4,{H}] x0) => (float[3,4,{H}] y)
+        {{
+          ln = LayerNormalization<axis=-1>(x0, Scale, Bias)
+          h = MatMul(ln, W)
+          h_tiled = Tile(h, Repeats)
+          y = Add(x0, h_tiled)
+        }}
+        """,
+        initializer=[
+            _f32(scale, "Scale"),
+            _f32(bias, "Bias"),
+            _f32(w, "W"),
+            onnx.numpy_helper.from_array(repeats, "Repeats"),
+        ],
+    )
+    onnx.checker.check_model(model)
+
+    pruned = onnxsim.apply_transformer_block_pruning(
+        model, num_blocks_to_drop=1, seed=0, num_samples=4
+    )
+    assert pruned.SerializeToString() == model.SerializeToString()
+
+
+def test_transformer_block_pruning_declines_when_f_reads_x_in_directly():
+    # No LayerNorm/RMSNorm at all -- F reads x0 raw. Not the pattern this
+    # pass targets (:func:`_try_resolve_droppable_block` requires x_in to
+    # be reached only through a recognized entry-norm boundary), so no
+    # candidate is even found. Left completely untouched.
+    H = 8
+    rng = np.random.default_rng(25)
+    w = rng.standard_normal((H, H)).astype(np.float32)
+
+    model = _model(
+        f"""
+        g (float[1,4,{H}] x0) => (float[1,4,{H}] y)
+        {{
+          h = MatMul(x0, W)
+          y = Add(x0, h)
+        }}
+        """,
+        initializer=[_f32(w, "W")],
+    )
+    onnx.checker.check_model(model)
+
+    pruned = onnxsim.apply_transformer_block_pruning(
+        model, num_blocks_to_drop=1, seed=0, num_samples=4
+    )
+    assert pruned.SerializeToString() == model.SerializeToString()
+
+
+def test_transformer_block_pruning_num_blocks_to_drop_caps_at_matched_candidate_count():
+    # Only 2 candidates exist (both engineered near-identity);
+    # `num_blocks_to_drop=10` is silently capped rather than erroring --
+    # both get dropped, and the model collapses to a straight identity
+    # from x0 to y.
+    H = 8
+    rng = np.random.default_rng(31)
+    scale = np.ones(H, dtype=np.float32)
+    bias = np.zeros(H, dtype=np.float32)
+    w0 = (rng.standard_normal((H, H)) * 1e-6).astype(np.float32)
+    w1 = (rng.standard_normal((H, H)) * 1e-6).astype(np.float32)
+
+    model = _model(
+        f"""
+        g (float[1,4,{H}] x0) => (float[1,4,{H}] y)
+        {{
+          ln0 = LayerNormalization<axis=-1>(x0, Scale, Bias)
+          h0 = MatMul(ln0, W0)
+          x1 = Add(x0, h0)
+
+          ln1 = LayerNormalization<axis=-1>(x1, Scale, Bias)
+          h1 = MatMul(ln1, W1)
+          y = Add(x1, h1)
+        }}
+        """,
+        initializer=[
+            _f32(scale, "Scale"),
+            _f32(bias, "Bias"),
+            _f32(w0, "W0"),
+            _f32(w1, "W1"),
+        ],
+    )
+
+    pruned = onnxsim.apply_transformer_block_pruning(
+        model, num_blocks_to_drop=10, seed=0, num_samples=4
+    )
+    onnx.checker.check_model(pruned)
+    assert [n.op_type for n in pruned.graph.node] == ["Identity"]
+
+    x = np.random.default_rng(33).standard_normal((1, 4, H)).astype(np.float32)
+    (pruned_y,) = _run(pruned, {"x0": x})
+    np.testing.assert_array_equal(pruned_y, x)
+
+
+def test_transformer_block_pruning_no_candidates_returns_unchanged_copy():
+    # A model with no residual/entry-norm pattern at all -- nothing for
+    # this pass to even consider. Returns an unchanged copy.
+    H = 8
+    rng = np.random.default_rng(35)
+    w = rng.standard_normal((H, H)).astype(np.float32)
+    model = _model(
+        f"""
+        g (float[1,4,{H}] x0) => (float[1,4,{H}] y)
+        {{
+          y = MatMul(x0, W)
+        }}
+        """,
+        initializer=[_f32(w, "W")],
+    )
+
+    pruned = onnxsim.apply_transformer_block_pruning(model, num_blocks_to_drop=1)
+    assert pruned.SerializeToString() == model.SerializeToString()
+
+
+def test_transformer_block_pruning_zero_sparsity_leaves_model_untouched():
+    H = 8
+    rng = np.random.default_rng(37)
+    scale = np.ones(H, dtype=np.float32)
+    bias = np.zeros(H, dtype=np.float32)
+    w = (rng.standard_normal((H, H)) * 1e-6).astype(np.float32)
+    model = _model(
+        f"""
+        g (float[1,4,{H}] x0) => (float[1,4,{H}] y)
+        {{
+          ln = LayerNormalization<axis=-1>(x0, Scale, Bias)
+          h = MatMul(ln, W)
+          y = Add(x0, h)
+        }}
+        """,
+        initializer=[_f32(scale, "Scale"), _f32(bias, "Bias"), _f32(w, "W")],
+    )
+
+    pruned = onnxsim.apply_transformer_block_pruning(model, sparsity=0.0)
+    assert pruned.SerializeToString() == model.SerializeToString()
+
+
+def test_transformer_block_pruning_invalid_arguments_raise():
+    H = 8
+    model = _model(
+        f"""
+        g (float[1,4,{H}] x0) => (float[1,4,{H}] y)
+        {{
+          y = Identity(x0)
+        }}
+        """
+    )
+    with pytest.raises(ValueError):
+        onnxsim.apply_transformer_block_pruning(model, num_blocks_to_drop=-1)
+    with pytest.raises(ValueError):
+        onnxsim.apply_transformer_block_pruning(model, sparsity=1.5)
+    with pytest.raises(ValueError):
+        onnxsim.apply_transformer_block_pruning(model, sparsity=-0.1)

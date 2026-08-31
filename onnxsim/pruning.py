@@ -761,6 +761,7 @@ import numpy as np
 import onnx
 import onnx.helper
 import onnx.numpy_helper
+import onnx.shape_inference
 
 from onnxsim import backend
 from onnxsim.bias_correction import _add_probe_outputs
@@ -10267,6 +10268,634 @@ def apply_moe_whole_expert_pruning(
         kept = [vi for vi in graph.value_info if vi.name not in stale_value_info]
         del graph.value_info[:]
         graph.value_info.extend(kept)
+    return out
+
+
+# --- Transformer block (depth) pruning --------------------------------------
+#
+# Every technique above prunes *within* a layer -- channels, heads, experts,
+# individual weight entries -- never whether a whole residual sub-block
+# (an entire ``x = x + SelfAttn(LN(x))`` or ``x = x + MLP(LN(x))``) is worth
+# keeping at all. That is a different axis of the literature entirely --
+# "depth pruning"/LayerDrop (Fan et al., 2019)/ShortGPT (Men et al., 2024)/
+# Sheared-LLaMA (Xia et al., 2023)/ShortenedLLaMA (Kim et al., 2024): drop
+# whole transformer sub-blocks wholesale, rather than shrinking every block
+# a little. Unlike everything above, this changes the graph's own
+# *topology* -- nodes are deleted and edges rewired, not just tensors
+# resized in place -- so it is held to an extra bar of caution the rest of
+# this module doesn't need: a candidate is identified, safety-checked, and
+# *independently* shape-verified before a single node is ever touched, and
+# an entire candidate is declined outright the moment any one of its own
+# checks doesn't hold -- never partially applied.
+#
+# The canonical pattern (pre-norm, the standard shape for every current
+# transformer family): ``x_out = Add(x_in, F_out)``, where `F_out` is
+# `F`'s own final node's output (`F` -- self-attention or an MLP/FFN --
+# fed by ``LN(x_in)``, `LN` one of `LayerNormalization` (plain ONNX,
+# opset 17+), `RMSNormalization` (plain ONNX, opset 23+), or
+# `SimplifiedLayerNormalization` (onnxruntime's own RMSNorm-equivalent --
+# confirmed, empirically, against a real onnxruntime CPU session, to only
+# actually register under the *default* (empty/``""``) domain despite
+# living in onnxruntime's own contrib-op source tree, not under
+# ``com.microsoft`` the way `SkipLayerNormalization`/
+# `SkipSimplifiedLayerNormalization` do -- see :func:`_is_entry_ln_node`).
+# Dropping the block means: every consumer of `x_out` (including a graph
+# output) instead reads `x_in` directly, and every node strictly between
+# `x_in` and `x_out` -- `LN`, every one of `F`'s own internal nodes, and the
+# merge `Add` itself -- is deleted, provided none of them has any consumer
+# outside the block. See :func:`_try_resolve_droppable_block` for the exact
+# backward graph walk and every one of its own decline conditions.
+#
+# Two scope decisions, each investigated against this module's own existing
+# residual machinery and this environment's real onnxruntime schemas rather
+# than assumed, and each worth stating plainly:
+#
+# 1. Both the merge point *and* the entry norm matched here are the
+#    unfused shapes only: the merge is *only* a bare `Add`
+#    (:func:`_is_eligible_add_merge`, reused unchanged from the residual
+#    *channel*-pruning machinery above -- exactly the same "two distinct,
+#    non-constant operands" eligibility bar), and `LN` is only a plain,
+#    single-input `LayerNormalization`/`RMSNormalization`/
+#    `SimplifiedLayerNormalization` node (:func:`_is_entry_ln_node`) --
+#    never a fused `SkipLayerNormalization`/`SkipSimplifiedLayerNormalization`
+#    node in *either* role, the way :func:`_match_matmul_residual_merge`
+#    accepts it as the merge for channel pruning. That is a deliberate,
+#    real narrowing versus this module's own existing residual machinery,
+#    not an oversight, and it costs real coverage on a model that has
+#    actually been run through onnxruntime's transformer optimizer (which
+#    fuses nearly every residual `Add` immediately followed by a
+#    `LayerNorm` into exactly this fused node) -- worth being honest about
+#    rather than glossing over:
+#
+#    - As the merge, a `SkipLayerNormalization`-family node's own
+#      *primary* output is always the *normalized* sum (`LN(x_in +
+#      F_out)`), never the raw sum -- so it can never stand in for `x_out`
+#      the way a bare `Add`'s output can (there is no tensor this pass
+#      could safely repoint every consumer to that is both already
+#      present in the graph *and* means "`x_in`, unnormalized" the way a
+#      bare `Add`'s own `x_in` operand already, directly, does).
+#    - As the entry norm, `LN(x_in)` is only recognized when `x_in` is
+#      *literally* some node's own single data input
+#      (:func:`_is_entry_ln_node`'s own `node.input[0] == x_in` check) --
+#      exactly what a plain `LayerNormalization`/`RMSNormalization`/
+#      `SimplifiedLayerNormalization` node's own first input already is,
+#      but *not* what a `SkipLayerNormalization`-family node's own first
+#      input is: that node normalizes `input + skip`, a *sum* of two
+#      separate tensors, and the block's own true `x_in` (the previous
+#      block's own raw, unnormalized residual value) only exists as a
+#      *named* tensor at all when that sum is separately materialized as
+#      the node's own optional fourth output, `input_skip_bias_sum` --
+#      which onnxruntime's optimizer only ever emits when something
+#      downstream actually still needs it, not unconditionally. Matching
+#      this shape too is a real, tractable extension (recognize
+#      `node.output[3]`, when present, as an *alternative* `x_in` source
+#      for a `SkipLayerNormalization`-family node feeding `F`), but it is
+#      a genuinely different check from the single-input-only one
+#      :func:`_is_entry_ln_node` performs today, not a free extension of
+#      it -- left out of this initial version's scope rather than rushed
+#      in, so it is not implemented here.
+#
+#    A raw, not-yet-optimizer-fused export (the common case for a model
+#    straight out of a training framework's own ONNX exporter) still
+#    matches fully -- it has no `SkipLayerNormalization` nodes to begin
+#    with, only plain `Add`/`LayerNormalization`-family nodes throughout.
+# 2. Attention and MLP/FFN blocks are matched -- and dropped -- fully
+#    independently of each other, never only as a paired "whole
+#    transformer layer". Nothing in the graph structure requires pairing:
+#    each block is its own self-contained ``x_out = x_in + F(LN(x_in))``
+#    unit with its own merge point, and the backward walk below never
+#    needs to know or care whether `F` is self-attention, an MLP, or
+#    anything else -- it only ever asks "does everything between this
+#    `Add` and its own `LN(x_in)` stay wholly inside the block". Forcing
+#    pairing would need extra machinery (recognizing which attention
+#    block's own `x_out` feeds which MLP block's own `x_in`, and declining
+#    otherwise) to enforce a constraint the safety argument itself never
+#    needed -- narrower for no safety benefit, so it is not done.
+#
+# KV-cache-bearing attention blocks need no special-case handling, and are
+# never separately detected by name/shape -- they decline themselves for
+# free, via the same generic "no block-internal node's own output may be
+# read outside the block, or be a graph output" check every candidate is
+# already held to (see :func:`_try_resolve_droppable_block`): a real
+# `past_key`/`past_value`-consuming attention op invariably exposes its own
+# `present_key`/`present_value` as a *second* graph output on the very same
+# node that reads `LN(x_in)` -- a block-internal node's own extra output
+# read nowhere else in the block, tripping that check outright. No
+# `layer_idx`-attribute renumbering or cache-input/output splicing is
+# needed because no such block is ever accepted as droppable in the first
+# place, not because it is handled -- a case honestly declined, not one
+# quietly made to work.
+#
+# Selection uses this module's own established calibration-probe
+# infrastructure (:func:`_add_probe_outputs`, reused unchanged, the same
+# way :func:`apply_wanda_pruning`/:func:`apply_moe_whole_expert_pruning`
+# already do) to capture each candidate's own `x_in`/`x_out` over real
+# calibration data, then ranks by mean cosine similarity between the two --
+# the literature-standard depth-pruning signal (ShortGPT's own "Block
+# Influence" metric is exactly ``1 - cosine_similarity(x_in, x_out)``
+# averaged per token; this uses the same quantity, just not inverted, so
+# higher means more redundant): a block whose own output is nearly
+# *identical* to its input, over real data the model is meant to run on,
+# contributes almost nothing beyond the identity function and is the
+# safest to drop first. This is deliberately not a weight-magnitude
+# metric -- unlike a single MatMul/Conv layer's own weight row, a whole
+# nonlinear sub-network's importance has no meaningful summary in its own
+# weights alone, only in what it actually *does* to real activations. See
+# :func:`_transformer_block_similarity` for the exact per-token reduction.
+
+
+_ENTRY_LN_OPS = (
+    "LayerNormalization",
+    "RMSNormalization",
+    "SimplifiedLayerNormalization",
+)
+
+
+def _is_entry_ln_node(node: onnx.NodeProto, x_in: str) -> bool:
+    """True if `node` is one of :data:`_ENTRY_LN_OPS` (all three confirmed,
+    empirically, to run under the default/empty ONNX domain, not
+    ``com.microsoft`` -- see this section's own comment above) applied
+    directly to `x_in` -- exactly the `LN(x_in)` boundary
+    :func:`_try_resolve_droppable_block`'s own backward walk stops at.
+    """
+    return (
+        node.domain == ""
+        and node.op_type in _ENTRY_LN_OPS
+        and len(node.input) >= 1
+        and node.input[0] == x_in
+    )
+
+
+@dataclass(frozen=True)
+class _DroppableBlock:
+    merge_node: onnx.NodeProto
+    x_in: str
+    x_out: str
+    # Every node strictly between `x_in` and `x_out` -- `LN`, every one of
+    # `F`'s own internal nodes, and `merge_node` itself -- already confirmed
+    # to have no consumer outside this set (see
+    # :func:`_try_resolve_droppable_block`). Deleting exactly this set and
+    # rewiring every `x_out` consumer to `x_in` is the whole graph-surgery
+    # operation :func:`_apply_transformer_block_pruning` performs.
+    block_nodes: Tuple[onnx.NodeProto, ...]
+
+
+def _try_resolve_droppable_block(
+    merge_node: onnx.NodeProto,
+    x_in: str,
+    other: str,
+    node_by_output: Dict[str, onnx.NodeProto],
+    consumers_of: Dict[str, List[onnx.NodeProto]],
+    graph_outputs: Set[str],
+) -> Optional[_DroppableBlock]:
+    """Attempts to resolve `merge_node` (an eligible `Add`,
+    :func:`_is_eligible_add_merge`) as a droppable block boundary with
+    `x_in` as its own identity/entry operand and `other` (`merge_node`'s
+    *other* operand) as `F`'s own final output -- `None` if any of the
+    following isn't confirmed, exactly the module's own "decline outright,
+    never guess" bar:
+
+    - Walking backward from `other` (through every node's own inputs, in
+      the ordinary graph-dependency sense -- no special-cased op set,
+      unlike every chain walk elsewhere in this module, since nothing here
+      needs to recognize any *particular* shape of `F`, only that
+      everything inside it stays inside it) must reach `x_in` *only* via
+      one or more :func:`_is_entry_ln_node` boundaries (`LN(x_in)`,
+      not recursed past) -- reaching `x_in` directly, bypassing every such
+      boundary, means `F` reads `x_in` raw rather than only its own norm,
+      not the pattern this pass targets, and declines the whole candidate;
+      finding *no* such boundary at all (`F`'s own backward walk never
+      touches `x_in`) declines it the same way -- some other tensor
+      entirely feeds the merge's `other` operand, not `F(LN(x_in))`.
+    - Every node the walk collects (the block's own interior, plus
+      `merge_node` itself) must have every one of its own output tensors
+      read by nothing outside that same set, and never be a graph output
+      -- except `merge_node`'s own primary output (`x_out`), which is
+      *expected* to have outside consumers: that is exactly what gets
+      rewired to `x_in`. A KV-cache-bearing attention op's own
+      `present_key`/`present_value` output, or any other tensor the block
+      computes and something else in the graph still needs, trips this
+      and declines the block -- see this section's own comment above for
+      why this one general check is also exactly what makes a
+      KV-cache-bearing block decline itself, with no dedicated detection.
+
+    A graph input reached mid-walk (an attention mask, position ids, a
+    KV-cache input, or any other tensor `F` reads that isn't produced by
+    any node) is not itself a problem -- it simply terminates that branch
+    of the walk, contributing nothing to the block's own interior node set
+    (there is no producer node to collect). Only an actual node whose own
+    output leaks outside the block is a decline condition.
+    """
+    block_node_ids: Set[int] = {id(merge_node)}
+    block_nodes: List[onnx.NodeProto] = [merge_node]
+    found_entry_ln = False
+    visited: Set[str] = set()
+    frontier: List[str] = [other]
+    while frontier:
+        t = frontier.pop()
+        if t in visited:
+            continue
+        visited.add(t)
+        if t == x_in:
+            return None  # F reads x_in raw, bypassing every LN boundary
+        node = node_by_output.get(t)
+        if node is None:
+            continue  # graph input or initializer -- a leaf, not a problem
+        if _is_entry_ln_node(node, x_in):
+            found_entry_ln = True
+            if id(node) not in block_node_ids:
+                block_node_ids.add(id(node))
+                block_nodes.append(node)
+            continue  # boundary -- LN's own input (x_in) is not recursed into
+        if id(node) not in block_node_ids:
+            block_node_ids.add(id(node))
+            block_nodes.append(node)
+        for inp in node.input:
+            if inp:
+                frontier.append(inp)
+    if not found_entry_ln:
+        return None
+
+    x_out = merge_node.output[0]
+    for node in block_nodes:
+        for out_name in node.output:
+            if not out_name:
+                continue
+            if node is merge_node and out_name == x_out:
+                continue  # x_out itself -- every consumer gets rewired below
+            if out_name in graph_outputs:
+                return None
+            if any(id(c) not in block_node_ids for c in consumers_of.get(out_name, ())):
+                return None
+
+    return _DroppableBlock(
+        merge_node=merge_node, x_in=x_in, x_out=x_out, block_nodes=tuple(block_nodes)
+    )
+
+
+def _tensor_shape_dims(
+    name: str, value_info_by_name: Dict[str, onnx.ValueInfoProto]
+) -> Optional[Tuple[Union[int, str], ...]]:
+    """The tensor's own fully-known shape -- one entry per dimension, each
+    either a concrete `dim_value` or a named `dim_param` -- or `None` if
+    the graph's own annotations don't state every dimension (rank not
+    statically known, or any one dimension neither a fixed value nor a
+    named symbolic one). Unlike :func:`_tensor_rank`'s own deliberately
+    inference-free design elsewhere in this module (a low-stakes heuristic
+    that only ever *narrows* which `Concat` axis is accepted, never *what*
+    gets pruned), :func:`_shapes_match`'s own correctness -- whether
+    replacing `x_out` with `x_in` is shape-safe at all -- depends on this
+    being right, so its caller runs real `onnx.shape_inference` first (see
+    :func:`apply_transformer_block_pruning`) to populate as much of
+    `value_info_by_name` as it safely can before this ever gets called,
+    rather than relying only on whatever the graph already happened to
+    declare.
+    """
+    vi = value_info_by_name.get(name)
+    if vi is None or not vi.type.HasField("tensor_type"):
+        return None
+    tensor_type = vi.type.tensor_type
+    if not tensor_type.HasField("shape"):
+        return None
+    dims: List[Union[int, str]] = []
+    for d in tensor_type.shape.dim:
+        if d.HasField("dim_value"):
+            dims.append(d.dim_value)
+        elif d.HasField("dim_param") and d.dim_param:
+            dims.append(d.dim_param)
+        else:
+            return None
+    return tuple(dims)
+
+
+def _shapes_match(
+    a: str, b: str, value_info_by_name: Dict[str, onnx.ValueInfoProto]
+) -> bool:
+    """True only when both `a` and `b` have a fully-known shape
+    (:func:`_tensor_shape_dims`) and the two are identical, dimension for
+    dimension. This is what actually guards against `merge_node`'s own
+    `Add` having silently broadcast `x_in` up to a wider `x_out` -- the one
+    way replacing every `x_out` consumer with `x_in` directly could change
+    a downstream shape rather than simply removing a redundant
+    computation. An unknown shape on either side declines rather than
+    assumes equality, the same bar every other safety check in this
+    section holds to.
+    """
+    dims_a = _tensor_shape_dims(a, value_info_by_name)
+    dims_b = _tensor_shape_dims(b, value_info_by_name)
+    return dims_a is not None and dims_a == dims_b
+
+
+def _find_transformer_block_candidates(
+    graph: onnx.GraphProto,
+    value_info_by_name: Dict[str, onnx.ValueInfoProto],
+) -> List[_DroppableBlock]:
+    """Every droppable-block candidate in `graph`: one per eligible `Add`
+    merge (:func:`_is_eligible_add_merge`) that :func:`_try_resolve_droppable_block`
+    confirms for exactly one operand ordering (a DAG can never confirm
+    both -- confirming operand `p` as `x_in` requires `q` to be backward-
+    reachable from it, and vice versa, which is impossible for both
+    directions on an acyclic graph at once, so this never needs a tie-break
+    between the two), and whose `x_in`/`x_out` shapes
+    :func:`_shapes_match` independently confirms identical.
+    """
+    initializer_map = {t.name: t for t in graph.initializer}
+    node_by_output: Dict[str, onnx.NodeProto] = {}
+    for node in graph.node:
+        for out_name in node.output:
+            if out_name:
+                node_by_output[out_name] = node
+    consumers_of = _consumers_of(graph)
+    graph_outputs = {o.name for o in graph.output}
+
+    candidates: List[_DroppableBlock] = []
+    for node in graph.node:
+        if not _is_eligible_add_merge(node, initializer_map):
+            continue
+        p, q = node.input[0], node.input[1]
+        for x_in, other in ((p, q), (q, p)):
+            block = _try_resolve_droppable_block(
+                node, x_in, other, node_by_output, consumers_of, graph_outputs
+            )
+            if block is not None:
+                if _shapes_match(block.x_in, block.x_out, value_info_by_name):
+                    candidates.append(block)
+                break
+    return candidates
+
+
+def _transformer_block_similarity(
+    out: onnx.ModelProto,
+    candidates: Sequence[_DroppableBlock],
+    calibration_data: Sequence[Tensors],
+    providers: Optional[Sequence[str]],
+) -> Dict[int, float]:
+    """Mean cosine similarity between each candidate's own `x_in` and
+    `x_out`, over every token of every calibration batch -- the ranking
+    signal :func:`apply_transformer_block_pruning` drops the *highest*-
+    scoring (most redundant -- `x_out` nearly identical to `x_in` already,
+    over real data) candidates by. See this section's own comment above
+    for why this, not a weight-magnitude metric, is this pass's own
+    importance signal.
+
+    Both tensors are probed in one shared `onnxruntime` pass (reusing
+    :func:`_add_probe_outputs`), reshaped to `[-1, hidden]` (mirroring
+    every other calibration reduction in this module -- e.g.
+    :func:`apply_wanda_pruning`'s own `Attention` statistic, or
+    `apply_sparsegpt_pruning`'s own `x.reshape(-1, x.shape[-1])`) so this
+    works regardless of the model's own batch/sequence-axis layout, cast
+    to float64 the same way every calibration statistic in this module
+    already is (real activations, not the model's own possibly-narrower
+    declared dtype). A token whose own `x_in` or `x_out` norm is (numerically)
+    zero is skipped for that token rather than dividing by (near-)zero -- a
+    candidate with no valid token across all of `calibration_data` returns
+    ``float("-inf")`` (never the most-redundant pick; there is no evidence
+    either way, so it is conservatively kept rather than guessed to be
+    droppable).
+    """
+    keyed = list(enumerate(candidates))
+    probe_names = sorted({name for _, c in keyed for name in (c.x_in, c.x_out)})
+    if not probe_names:
+        return {}
+    probe_model = _add_probe_outputs(out, probe_names)
+
+    sim_sum: Dict[int, float] = {}
+    sim_count: Dict[int, int] = {}
+    for batch in calibration_data:
+        result = backend.run_model(probe_model, batch, providers=providers)
+        for idx, c in keyed:
+            x_in = np.asarray(result[c.x_in], dtype=np.float64)
+            x_out = np.asarray(result[c.x_out], dtype=np.float64)
+            if x_in.shape != x_out.shape or x_in.ndim == 0 or x_in.shape[-1] == 0:
+                continue
+            a = x_in.reshape(-1, x_in.shape[-1])
+            b = x_out.reshape(-1, x_out.shape[-1])
+            norm_a = np.linalg.norm(a, axis=-1)
+            norm_b = np.linalg.norm(b, axis=-1)
+            denom = norm_a * norm_b
+            valid = denom > 1e-12
+            if not np.any(valid):
+                continue
+            cos = np.sum(a[valid] * b[valid], axis=-1) / denom[valid]
+            sim_sum[idx] = sim_sum.get(idx, 0.0) + float(np.sum(cos))
+            sim_count[idx] = sim_count.get(idx, 0) + int(np.sum(valid))
+
+    return {
+        idx: (sim_sum[idx] / sim_count[idx]) if sim_count.get(idx) else float("-inf")
+        for idx in range(len(candidates))
+    }
+
+
+def _apply_transformer_block_pruning(
+    graph: onnx.GraphProto, ranked: Sequence[_DroppableBlock], target: int
+) -> int:
+    """Greedily commits `ranked` (already sorted most- to least-redundant)
+    in order, skipping any candidate whose own `block_nodes` overlaps an
+    already-committed one's (a candidate whose own backward walk happened
+    to reach into another candidate's own interior -- unusual, but not
+    impossible in principle -- can only ever have *one* of the two safely
+    dropped), until `target` blocks are committed or `ranked` is
+    exhausted, then applies every commit at once. Returns the number of
+    blocks actually dropped.
+
+    Each commit rewrites every current reference to its own `x_out` --
+    every node's own input, in place, plus (via a small inserted
+    `Identity` node, so the model's own declared output name never
+    changes) any graph output -- to its own `x_in`, *resolved* through
+    every earlier commit's own alias first (`resolve`, below): a chain of
+    two directly-adjacent committed blocks (the second's own `x_in` being
+    the first's own `x_out`) needs this regardless of commit order --
+    committing the *upstream* block first leaves the downstream block's
+    own recorded `x_in` referring to a name nothing produces anymore (the
+    upstream block's own now-deleted merge node's output), so its own
+    rewrite target has to be resolved through the upstream commit's own
+    alias rather than used as recorded; committing the *downstream* block
+    first instead leaves a stale reference (its own inserted `Identity`,
+    or its own entry `LN`, if the block itself doesn't survive to
+    deletion first) for the upstream commit's own plain graph-wide
+    node-input rewrite to catch and correct directly, no resolution
+    needed for that direction. `resolve` handles both by construction,
+    with no dependency on which order `committed` happens to process
+    them in. Every one of a committed block's own `block_nodes` is then
+    deleted in one final pass, preserving every surviving node's own
+    relative order -- already topologically valid before deletion, and
+    deleting nodes (never reordering or inserting anything ahead of what
+    it depends on) can't break that.
+    """
+    committed: List[_DroppableBlock] = []
+    committed_ids: Set[int] = set()
+    for block in ranked:
+        if len(committed) >= target:
+            break
+        ids = {id(n) for n in block.block_nodes}
+        if ids & committed_ids:
+            continue
+        committed.append(block)
+        committed_ids |= ids
+
+    alias: Dict[str, str] = {}
+
+    def resolve(name: str) -> str:
+        seen: Set[str] = set()
+        while name in alias and name not in seen:
+            seen.add(name)
+            name = alias[name]
+        return name
+
+    for block in committed:
+        target_name = resolve(block.x_in)
+        for node in graph.node:
+            for i, inp in enumerate(node.input):
+                if inp == block.x_out:
+                    node.input[i] = target_name
+        for output in graph.output:
+            if output.name == block.x_out:
+                graph.node.append(
+                    onnx.helper.make_node(
+                        "Identity",
+                        [target_name],
+                        [block.x_out],
+                        name=f"{block.x_out}/transformer_block_pruning_identity",
+                    )
+                )
+        alias[block.x_out] = target_name
+
+    if committed_ids:
+        kept_nodes = [n for n in graph.node if id(n) not in committed_ids]
+        del graph.node[:]
+        graph.node.extend(kept_nodes)
+        removed_names = {
+            out_name
+            for block in committed
+            for n in block.block_nodes
+            for out_name in n.output
+            if out_name
+        }
+        kept_value_info = [
+            vi for vi in graph.value_info if vi.name not in removed_names
+        ]
+        del graph.value_info[:]
+        graph.value_info.extend(kept_value_info)
+
+    return len(committed)
+
+
+def apply_transformer_block_pruning(
+    model: Union[str, onnx.ModelProto],
+    calibration_data: Optional[Sequence[Tensors]] = None,
+    num_samples: int = 8,
+    seed: int = 0,
+    sparsity: float = 0.25,
+    num_blocks_to_drop: Optional[int] = None,
+    providers: Optional[Sequence[str]] = None,
+) -> onnx.ModelProto:
+    """Depth/block-level pruning: drops whole redundant pre-norm
+    transformer residual sub-blocks (``x = x + SelfAttn(LN(x))`` or
+    ``x = x + MLP(LN(x))``) wholesale, rather than shrinking every block a
+    little the way every other `apply_*` function in this module does --
+    see this section's own comment above for the exact pattern matched,
+    the two scope decisions this narrows to (bare-`Add` merges and a
+    plain, unfused entry norm only -- a `SkipLayerNormalization`-family
+    node is not recognized in either role, so a model already run through
+    onnxruntime's own transformer optimizer needs its own follow-up
+    coverage this initial version doesn't take on; attention and MLP/FFN
+    blocks matched and dropped fully independently, never only as a
+    "whole layer" pair) and why a KV-cache-bearing attention block needs
+    no dedicated handling to always decline safely on its own.
+
+    Every candidate is found by :func:`_find_transformer_block_candidates`
+    and confirmed shape-safe (:func:`_shapes_match`, using real
+    `onnx.shape_inference` output, not just whatever `value_info` `model`
+    already happened to carry) before ranking ever runs. Candidates are
+    ranked by mean cosine similarity between their own `x_in` and `x_out`
+    over `calibration_data` (:func:`_transformer_block_similarity`) --
+    the literature-standard ("Block Influence"/ShortGPT-style)
+    redundancy signal: a block whose output is already nearly identical to
+    its input, over data the model is meant to actually run on, changes
+    almost nothing and is safest to drop -- and the highest-similarity
+    ones are dropped first, up to the target count, skipping (not
+    failing) any candidate whose own interior overlaps an
+    already-committed one's (see :func:`_apply_transformer_block_pruning`'s
+    own docstring for why this can happen and why skipping, not declining
+    the whole call, is the right response).
+
+    :param model: the original onnx ModelProto or file path
+    :param calibration_data: representative input batches to measure each
+            candidate block's own input/output similarity on. Each batch
+            is a ``{input_name: np.ndarray}`` dict matching ``model``'s
+            graph inputs -- see :func:`onnxsim.generate_random_calibration_data`
+            (the default when omitted)
+    :param num_samples: random batches to generate when
+            ``calibration_data`` is omitted
+    :param seed: seed for the random calibration data (ignored if
+            ``calibration_data`` is supplied)
+    :param sparsity: fraction of *matched candidate* blocks to drop
+            (rounded to the nearest whole block), ignored when
+            ``num_blocks_to_drop`` is given. Note this is a fraction of
+            however many blocks this pass actually matched, not of the
+            model's total layer count -- the same "fraction of what was
+            actually found eligible" meaning
+            :func:`apply_moe_whole_expert_pruning`'s own `sparsity` already
+            has for experts.
+    :param num_blocks_to_drop: an explicit number of blocks to drop
+            instead of a fraction, silently capped at however many
+            candidates were actually matched
+    :param providers: onnxruntime execution providers to run ``model`` on
+            when capturing calibration activations
+    :returns: ``model`` with the target number of matched candidate blocks
+            -- whichever ones ranked most redundant -- deleted and their
+            own consumers rewired to read straight through to their own
+            block's own input; unchanged (a byte-for-byte copy) if no
+            candidate was matched, ``sparsity``/``num_blocks_to_drop``
+            rounds to zero blocks, or ``calibration_data`` never gives any
+            candidate a valid (non-degenerate) token to rank on
+    """
+    if num_blocks_to_drop is not None:
+        if num_blocks_to_drop < 0:
+            raise ValueError(
+                f"num_blocks_to_drop must be >= 0, got {num_blocks_to_drop}"
+            )
+    elif not (0.0 <= sparsity <= 1.0):
+        raise ValueError(f"sparsity must be in [0, 1], got {sparsity}")
+
+    if isinstance(model, str):
+        model = onnx.load(model, load_external_data=False)
+    if calibration_data is None:
+        calibration_data = generate_random_calibration_data(
+            model, num_samples=num_samples, seed=seed
+        )
+
+    out = onnx.ModelProto()
+    out.CopyFrom(model)
+    graph = out.graph
+
+    try:
+        inferred = onnx.shape_inference.infer_shapes(out, strict_mode=False)
+        value_info_by_name = _value_info_by_name(inferred.graph)
+    except Exception:
+        value_info_by_name = _value_info_by_name(graph)
+
+    candidates = _find_transformer_block_candidates(graph, value_info_by_name)
+    if not candidates:
+        return out
+
+    if num_blocks_to_drop is not None:
+        target = min(num_blocks_to_drop, len(candidates))
+    else:
+        target = int(round(sparsity * len(candidates)))
+    if target <= 0:
+        return out
+
+    similarity = _transformer_block_similarity(
+        out, candidates, calibration_data, providers
+    )
+    ranked = [
+        c
+        for _, c in sorted(
+            enumerate(candidates), key=lambda item: similarity[item[0]], reverse=True
+        )
+    ]
+    _apply_transformer_block_pruning(graph, ranked, target)
     return out
 
 
