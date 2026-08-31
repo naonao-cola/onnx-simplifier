@@ -140,10 +140,11 @@ void TestAlignmentPadding() {
 }
 
 // Writes a minimal, hand-built GGUF v3 file with one raw F32 tensor and one
-// tensor of a made-up "quantized" ggml_type (id 2 == GGML_TYPE_Q4_0) this
-// pool cannot represent, to exercise LoadGGUF's skip-and-report path -- the
-// case that matters most in practice, since a real quantized LLM's .gguf is
-// mostly tensors like this.
+// tensor of a quantized ggml_type this pool cannot represent (id 11 ==
+// GGML_TYPE_Q3_K -- a real GGML type, deliberately NOT one of IsKQuant/
+// IsLegacyQuant/IsMxfp4's covered types), to exercise LoadGGUF's
+// skip-and-report path -- the case that matters most in practice, since a
+// real quantized LLM's .gguf is mostly tensors like this.
 void TestSkipsUnsupportedDtype() {
   std::string path = TempPath("_quantized.gguf");
   {
@@ -165,13 +166,13 @@ void TestSkipsUnsupportedDtype() {
     WriteLE<uint32_t>(out, GGML_TYPE_F32);  // type
     WriteLE<uint64_t>(out, 0);              // offset
 
-    // Tensor 1: "quant", ggml_type 2 (Q4_0), ne=[32] -- offset chosen past
+    // Tensor 1: "quant", ggml_type 11 (Q3_K), ne=[32] -- offset chosen past
     // 'raw's aligned 32-byte slot. This test never decodes its bytes (can't
     // -- that's the whole point), so the payload content doesn't matter.
     write_string("quant");
     WriteLE<uint32_t>(out, 1);                  // n_dimensions
     WriteLE<uint64_t>(out, 32);                 // ne[0]
-    WriteLE<uint32_t>(out, 2);                  // GGML_TYPE_Q4_0
+    WriteLE<uint32_t>(out, 11);                 // GGML_TYPE_Q3_K
     WriteLE<uint64_t>(out, kDefaultAlignment);  // offset (aligned)
 
     // Pad to the data section (header ends right here; align up to 32).
@@ -187,8 +188,9 @@ void TestSkipsUnsupportedDtype() {
     // data_start).
     uint64_t cur = static_cast<uint64_t>(out.tellp()) - data_start;
     for (uint64_t i = cur; i < kDefaultAlignment; ++i) out.put('\0');
-    // 'quant' tensor's Q4_0 block data: 18 bytes/block * 1 block for 32
-    // elements (block size 32) -- exact bytes don't matter, just presence.
+    // 'quant' tensor's (unsupported, never decoded) block data -- exact
+    // byte count doesn't matter, just presence, since this is the last
+    // tensor in the file and nothing after it needs to be located.
     for (int i = 0; i < 18; ++i) out.put('\xAB');
   }
 
@@ -268,7 +270,7 @@ void TestLoadGGUFMmapRoundTrip() {
 
 void TestLoadGGUFMmapSkipsUnsupportedDtype() {
   // Same hand-built file as TestSkipsUnsupportedDtype (one raw F32 tensor,
-  // one made-up quantized type this pool can't represent), loaded through
+  // one quantized type this pool can't represent), loaded through
   // LoadGGUFMmap -- confirms the mapped path skips-and-reports exactly like
   // the seek+read path rather than e.g. faulting trying to decode it.
   std::string path = TempPath("_mmap_quantized.gguf");
@@ -293,7 +295,7 @@ void TestLoadGGUFMmapSkipsUnsupportedDtype() {
     write_string("quant");
     WriteLE<uint32_t>(out, 1);
     WriteLE<uint64_t>(out, 32);
-    WriteLE<uint32_t>(out, 2);  // GGML_TYPE_Q4_0
+    WriteLE<uint32_t>(out, 11);  // GGML_TYPE_Q3_K
     WriteLE<uint64_t>(out, kDefaultAlignment);
 
     uint64_t header_end = static_cast<uint64_t>(out.tellp());
@@ -538,6 +540,49 @@ void TestMxfp4RoundTripAndDecode() {
   std::remove(path.c_str());
 }
 
+void TestLegacyQuantRoundTripAndDecode() {
+  // A Q4_0 block: d = 2.0 (fp16 0x4000), qs[i] = i -- the same hand-verified
+  // vector ggml_legacy_quant_test.cpp hand-verifies, reused here to check
+  // TensorPool's own plumbing (pooling, SaveGGUF/LoadGGUF byte-exact round
+  // trip, DequantizeToFloat), not the decode math itself.
+  const uint16_t d_bits = 0x4000;
+  std::string block(18, '\0');
+  block[0] = static_cast<char>(d_bits & 0xFF);
+  block[1] = static_cast<char>((d_bits >> 8) & 0xFF);
+  for (int i = 0; i < 16; ++i) {
+    block[2 + i] = static_cast<char>(static_cast<uint8_t>(i));
+  }
+
+  TensorPool pool;
+  pool.Add("w", ONNXSIM_GGML_Q4_0, {32}, std::string(block));
+
+  std::string path = TempPath("_legacy_quant.gguf");
+  pool.SaveGGUF(path);
+
+  TensorPool loaded;
+  auto skipped = loaded.LoadGGUF(path);
+  Check(skipped.empty(), "Q4_0 tensor is not skipped");
+  const Entry* w = loaded.Find("w");
+  Check(w != nullptr, "Q4_0 tensor is present");
+  if (w != nullptr) {
+    Check(w->dtype == ONNXSIM_GGML_Q4_0, "Q4_0 dtype round-trips");
+    Check(w->shape == std::vector<int64_t>({32}), "Q4_0 shape round-trips");
+    Check(w->data == block, "Q4_0 native block bytes round-trip bit-exact");
+
+    std::vector<float> decoded;
+    Check(loaded.DequantizeToFloat("w", &decoded),
+          "DequantizeToFloat succeeds for a Q4_0 entry");
+    Check(decoded.size() == 32, "DequantizeToFloat output size");
+    if (decoded.size() == 32) {
+      Check(std::fabs(decoded[0] - (-16.0f)) < 1e-4f, "Q4_0 element 0");
+      Check(std::fabs(decoded[15] - 14.0f) < 1e-4f, "Q4_0 element 15");
+      Check(std::fabs(decoded[31] - (-16.0f)) < 1e-4f, "Q4_0 element 31");
+    }
+  }
+
+  std::remove(path.c_str());
+}
+
 }  // namespace
 
 int main() {
@@ -554,6 +599,7 @@ int main() {
   TestKQuantRoundTripAndDecode();
   TestLoadGGUFRejectsMisalignedKQuantTensor();
   TestMxfp4RoundTripAndDecode();
+  TestLegacyQuantRoundTripAndDecode();
 
   if (g_failures == 0) {
     std::printf("tensor_pool_gguf_test: all checks passed\n");

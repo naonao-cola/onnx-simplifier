@@ -11,13 +11,17 @@
  * representation during Simplify().
  *
  * The GGUF-specific thing worth calling out here is gguf_dtype.h's scope:
- * most of GGML's block-quantized types (Q4_0, every IQ*_ variant, ...) have
- * no ONNX raw-data equivalent at all, so ImportModelWithGGUF's
+ * most of GGML's block-quantized types (Q2_K, Q3_K, every IQ*_ variant, ...)
+ * have no ONNX raw-data equivalent at all, so ImportModelWithGGUF's
  * `skipped_out` matters more here than ImportModelWithSafetensors's
- * equivalent ever would in practice. The K-quant family this mapping DOES
- * cover (Q4_K/Q5_K/Q6_K/Q8_0 -- what a real quantized checkpoint, e.g.
- * Unsloth's GGUF exports, actually uses for the bulk of its weights) is
- * hydrated as ordinary float32, via HydrateTensorProtoFromGGUF's decode --
+ * equivalent ever would in practice. The families this mapping DOES cover
+ * -- K-quant (Q4_K/Q5_K/Q6_K/Q8_0, what a real quantized checkpoint, e.g.
+ * Unsloth's GGUF exports, actually uses for the bulk of its weights),
+ * legacy (Q4_0/Q4_1/Q5_0/Q5_1, which llama.cpp's own mixed-precision
+ * quantizers still pick for particular tensor roles even in an otherwise
+ * K-quant checkpoint), and MXFP4 (gpt-oss's native MoE-expert
+ * quantization) -- are hydrated as ordinary float32, via
+ * HydrateTensorProtoFromGGUF's decode --
  * ImportModelWithGGUF is the intended way to pull a third-party GGUF
  * checkpoint's weight *values* into an ONNX graph you already have, by
  * initializer name (it needs no embedded onnxsim model, unlike
@@ -51,10 +55,11 @@ namespace tensor_pool {
 
 // GGUF counterpart of tensor_pool_bridge.h's HydrateTensorProto: same
 // contract (returns false, leaving `tensor` untouched, if `name` isn't
-// pooled) EXCEPT a K-quant-native or MXFP4-native entry (Q4_K/Q5_K/Q6_K/
-// Q8_0/MXFP4 -- see gguf_dtype.h's IsKQuant/IsMxfp4) is decoded to plain
-// float32 raw_data instead of copied verbatim, and `tensor`'s data_type is
-// forced to FLOAT to match --
+// pooled) EXCEPT a K-quant-native, MXFP4-native, or legacy-quant-native
+// entry (Q4_K/Q5_K/Q6_K/Q8_0/MXFP4/Q4_0/Q4_1/Q5_0/Q5_1 -- see gguf_dtype.h's
+// IsKQuant/IsMxfp4/IsLegacyQuant) is decoded to plain float32 raw_data
+// instead of copied verbatim, and `tensor`'s data_type is forced to FLOAT
+// to match --
 // overriding whatever data_type the caller's initializer previously
 // declared, since the decoded values are only meaningful as float32 (the
 // caller's own declared dtype reflects whatever *their* graph expects,
@@ -70,10 +75,12 @@ inline bool HydrateTensorProtoFromGGUF(const std::string& name,
 
   uint32_t ggml_type;
   if (gguf::FromOnnx(entry->dtype, &ggml_type) &&
-      (gguf::IsKQuant(ggml_type) || gguf::IsMxfp4(ggml_type))) {
+      (gguf::IsKQuant(ggml_type) || gguf::IsMxfp4(ggml_type) ||
+       gguf::IsLegacyQuant(ggml_type))) {
     std::vector<float> floats;
     if (!pool.DequantizeToFloat(name, &floats)) {
-      // Unreachable: FromOnnx+IsKQuant/IsMxfp4 already validated dtype.
+      // Unreachable: FromOnnx+IsKQuant/IsMxfp4/IsLegacyQuant already
+      // validated dtype.
       return false;
     }
     tensor.set_data_location(onnx::TensorProto::DEFAULT);
@@ -136,12 +143,12 @@ inline size_t ExportModelWithGGUF(
 }
 
 // Load `gguf_path` into `pool` and, for every graph initializer whose name
-// matches a pooled tensor -- a raw-dtype tensor, or a K-quant/MXFP4 one (see
-// gguf_dtype.h's IsKQuant/IsMxfp4), either hydrate it in place (hydrate_all,
-// the default -- a K-quant/MXFP4 match is decoded to float32, see
-// HydrateTensorProtoFromGGUF) or leave it as a lazy EXTERNAL reference
-// (hydrate_all=false; see tensor_pool_bridge.h's caveat on this mode --
-// note a K-quant/MXFP4 match left lazy this way still needs
+// matches a pooled tensor -- a raw-dtype tensor, or a K-quant/MXFP4/legacy-
+// quant one (see gguf_dtype.h's IsKQuant/IsMxfp4/IsLegacyQuant), either
+// hydrate it in place (hydrate_all, the default -- such a match is decoded
+// to float32, see HydrateTensorProtoFromGGUF) or leave it as a lazy
+// EXTERNAL reference (hydrate_all=false; see tensor_pool_bridge.h's caveat
+// on this mode -- note a match left lazy this way still needs
 // HydrateTensorProtoFromGGUF, not the plain HydrateTensorProto that caveat
 // points to, when it's eventually hydrated on demand).
 // Returns the number of initializers matched (hydrated or marked lazy).

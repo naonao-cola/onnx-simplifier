@@ -12,6 +12,7 @@
 #include <streambuf>
 
 #include "ggml_kquant.h"
+#include "ggml_legacy_quant.h"
 #include "ggml_mxfp4.h"
 #include "gguf_dtype.h"
 #include "mmap_file.h"
@@ -689,6 +690,10 @@ bool TensorPool::DequantizeToFloat(const std::string& name,
   }
   if (IsMxfp4(ggml_type)) {
     return DequantizeGgmlMxfp4(data, entry->data.size(), ggml_type, numel, out);
+  }
+  if (IsLegacyQuant(ggml_type)) {
+    return DequantizeGgmlLegacyQuant(data, entry->data.size(), ggml_type, numel,
+                                     out);
   }
   return false;
 }

@@ -590,6 +590,14 @@ if (ONNXSIM_TESTS)
   target_include_directories(ggml_mxfp4_test PRIVATE onnxsim)
   add_test(NAME ggml_mxfp4_test COMMAND ggml_mxfp4_test)
 
+  # GGML legacy quant (Q4_0/Q4_1/Q5_0/Q5_1) dequantization
+  # (ggml_legacy_quant.h) -- same standalone-buildable dependency footprint
+  # as ggml_kquant_test above (it reuses that header's fp16 conversion, but
+  # still needs only gguf_dtype.h/ggml_kquant.h, no protobuf/onnx).
+  add_executable(ggml_legacy_quant_test onnxsim/ggml_legacy_quant_test.cpp)
+  target_include_directories(ggml_legacy_quant_test PRIVATE onnxsim)
+  add_test(NAME ggml_legacy_quant_test COMMAND ggml_legacy_quant_test)
+
   # TensorPool's GGUF read/write (tensor_pool_gguf.cpp) depends only on
   # tensor_pool.{h,cpp} and gguf_dtype.h, so it too builds and runs
   # standalone without ONNX / ONNX Runtime configured.

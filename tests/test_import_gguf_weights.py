@@ -6,14 +6,19 @@ already have.
 
 Covers the GGML "K-quant" block formats (Q8_0, Q4_K, Q5_K, Q6_K) real
 quantized checkpoints (e.g. Unsloth's GGUF exports) actually use for the
-bulk of their weights, plus MXFP4 (the OCP Microscaling FP4 format official
-gpt-oss GGUF releases use natively for their MoE expert weights): this
-module writes real, byte-accurate GGUF v3 files containing hand-encoded
-blocks with known values, computing each expected dequantized float
-independently (a from-scratch transcription of GGML's published block
-layout/dequant formula, not a reuse of the C++ decoder under test -- see
-ggml_kquant.h/ggml_mxfp4.h) and checking onnxsim's decoded result against
-it.
+bulk of their weights; the legacy family (Q4_0, Q4_1, Q5_0, Q5_1) llama.cpp's
+own mixed-precision quantizers still pick for particular tensor roles even
+in an otherwise K-quant checkpoint (confirmed empirically against several
+real, official gpt-oss-20b GGUF releases -- several of the most popular
+size-optimized quantizations, e.g. Q4_K_S/Q4_0/UD-Q4_K_XL, use these for
+their embedding/attention tensors); and MXFP4 (the OCP Microscaling FP4
+format official gpt-oss GGUF releases use natively for their MoE expert
+weights): this module writes real, byte-accurate GGUF v3 files containing
+hand-encoded blocks with known values, computing each expected dequantized
+float independently (a from-scratch transcription of GGML's published
+block layout/dequant formula, not a reuse of the C++ decoder under test --
+see ggml_kquant.h/ggml_legacy_quant.h/ggml_mxfp4.h) and checking onnxsim's
+decoded result against it.
 """
 
 import struct
@@ -35,7 +40,11 @@ GGML_TYPE_Q4_K = 12
 GGML_TYPE_Q5_K = 13
 GGML_TYPE_Q6_K = 14
 GGML_TYPE_MXFP4 = 39
-GGML_TYPE_Q4_0 = 2  # legacy family onnxsim does NOT decode -- must be skipped
+GGML_TYPE_Q4_0 = 2
+GGML_TYPE_Q4_1 = 3
+GGML_TYPE_Q5_0 = 6
+GGML_TYPE_Q5_1 = 7
+GGML_TYPE_Q3_K = 11  # NOT decoded by onnxsim -- must be skipped
 
 
 def _align_up(n, align=32):
@@ -160,6 +169,89 @@ def _make_mxfp4_block(rng):
     return raw, expected
 
 
+def _make_q4_0_block(rng):
+    # One 32-element Q4_0 block: a single fp16 scale plus 16 bytes of packed
+    # 4-bit codes (unsigned 0..15, representing signed -8..7 via a fixed -8
+    # bias, no separate min value).
+    d = round(float(rng.uniform(0.01, 5.0)), 4)
+    d_bits = _f16_bits(d)
+    codes = [int(rng.integers(0, 16)) for _ in range(32)]
+    qs = bytes((codes[i] & 0xF) | ((codes[i + 16] & 0xF) << 4) for i in range(16))
+    raw = struct.pack("<H", d_bits) + qs
+    d_f = _f16_to_f32(d_bits)
+    expected = [(c - 8) * d_f for c in codes]
+    return raw, expected
+
+
+def _make_q4_1_block(rng):
+    # Like Q4_0, but with an explicit fp16 min added after scaling instead
+    # of a fixed bias (codes are used unsigned, 0..15).
+    d = round(float(rng.uniform(0.01, 2.0)), 4)
+    m = round(float(rng.uniform(-1.0, 1.0)), 4)
+    d_bits, m_bits = _f16_bits(d), _f16_bits(m)
+    codes = [int(rng.integers(0, 16)) for _ in range(32)]
+    qs = bytes((codes[i] & 0xF) | ((codes[i + 16] & 0xF) << 4) for i in range(16))
+    raw = struct.pack("<HH", d_bits, m_bits) + qs
+    d_f, m_f = _f16_to_f32(d_bits), _f16_to_f32(m_bits)
+    expected = [c * d_f + m_f for c in codes]
+    return raw, expected
+
+
+def _make_q5_0_block(rng):
+    # Like Q4_0, but each element's 5th (high) bit lives in a separate
+    # 4-byte `qh` bitfield (one bit per element) rather than packed
+    # alongside the other 4 bits -- the resulting 5-bit unsigned code
+    # (0..31) is biased by -16 before scaling.
+    d = round(float(rng.uniform(0.01, 5.0)), 4)
+    d_bits = _f16_bits(d)
+    codes = [int(rng.integers(0, 32)) for _ in range(32)]
+    low_nibbles = [c & 0xF for c in codes]
+    high_bits = [(c >> 4) & 0x1 for c in codes]
+    qs = bytes(
+        (low_nibbles[i] & 0xF) | ((low_nibbles[i + 16] & 0xF) << 4) for i in range(16)
+    )
+    # GGML's qh packing: element j's high bit lives at bit j (j < 16) or bit
+    # (j - 16) + 16 (j >= 16) of the 32-bit qh word -- i.e. bit j directly
+    # for the low half, bit j+16 for the high half (see
+    # dequantize_row_q5_0's xh_0/xh_1 extraction, which this mirrors in the
+    # opposite direction).
+    qh = 0
+    for j in range(16):
+        if high_bits[j]:
+            qh |= 1 << j
+        if high_bits[j + 16]:
+            qh |= 1 << (j + 16)
+    raw = struct.pack("<H", d_bits) + struct.pack("<I", qh) + qs
+    d_f = _f16_to_f32(d_bits)
+    expected = [(c - 16) * d_f for c in codes]
+    return raw, expected
+
+
+def _make_q5_1_block(rng):
+    # Like Q5_0, but with an explicit fp16 min added after scaling instead
+    # of a fixed bias (the 5-bit code is used unsigned, 0..31), matching
+    # Q4_1's own relationship to Q4_0.
+    d = round(float(rng.uniform(0.01, 2.0)), 4)
+    m = round(float(rng.uniform(-1.0, 1.0)), 4)
+    d_bits, m_bits = _f16_bits(d), _f16_bits(m)
+    codes = [int(rng.integers(0, 32)) for _ in range(32)]
+    low_nibbles = [c & 0xF for c in codes]
+    high_bits = [(c >> 4) & 0x1 for c in codes]
+    qs = bytes(
+        (low_nibbles[i] & 0xF) | ((low_nibbles[i + 16] & 0xF) << 4) for i in range(16)
+    )
+    qh = 0
+    for j in range(16):
+        if high_bits[j]:
+            qh |= 1 << j
+        if high_bits[j + 16]:
+            qh |= 1 << (j + 16)
+    raw = struct.pack("<HH", d_bits, m_bits) + struct.pack("<I", qh) + qs
+    d_f, m_f = _f16_to_f32(d_bits), _f16_to_f32(m_bits)
+    expected = [c * d_f + m_f for c in codes]
+    return raw, expected
+
+
 def _model(body, initializer=(), opset=13, ir_version=10):
     model = parser.parse_model(
         f"""
@@ -243,6 +335,70 @@ def test_import_mxfp4_weights(tmp_path):
     np.testing.assert_allclose(got, np.array(expected, dtype=np.float32), rtol=1e-5)
 
 
+def test_import_q4_0_weights(tmp_path):
+    rng = np.random.default_rng(11)
+    raw, expected = _make_q4_0_block(rng)
+    gguf_path = str(tmp_path / "model.gguf")
+    _write_gguf(gguf_path, [("W", GGML_TYPE_Q4_0, [32], raw)])
+
+    model = _identity_model("W", [32])
+    result, skipped = onnxsim.import_gguf_weights(model, gguf_path)
+
+    assert skipped == []
+    w = next(i for i in result.graph.initializer if i.name == "W")
+    assert w.data_type == onnx.TensorProto.FLOAT
+    got = onnx.numpy_helper.to_array(w)
+    np.testing.assert_allclose(got, np.array(expected, dtype=np.float32), rtol=1e-5)
+
+
+def test_import_q4_1_weights(tmp_path):
+    rng = np.random.default_rng(12)
+    raw, expected = _make_q4_1_block(rng)
+    gguf_path = str(tmp_path / "model.gguf")
+    _write_gguf(gguf_path, [("W", GGML_TYPE_Q4_1, [32], raw)])
+
+    model = _identity_model("W", [32])
+    result, skipped = onnxsim.import_gguf_weights(model, gguf_path)
+
+    assert skipped == []
+    w = next(i for i in result.graph.initializer if i.name == "W")
+    assert w.data_type == onnx.TensorProto.FLOAT
+    got = onnx.numpy_helper.to_array(w)
+    np.testing.assert_allclose(got, np.array(expected, dtype=np.float32), rtol=1e-5)
+
+
+def test_import_q5_0_weights(tmp_path):
+    rng = np.random.default_rng(13)
+    raw, expected = _make_q5_0_block(rng)
+    gguf_path = str(tmp_path / "model.gguf")
+    _write_gguf(gguf_path, [("W", GGML_TYPE_Q5_0, [32], raw)])
+
+    model = _identity_model("W", [32])
+    result, skipped = onnxsim.import_gguf_weights(model, gguf_path)
+
+    assert skipped == []
+    w = next(i for i in result.graph.initializer if i.name == "W")
+    assert w.data_type == onnx.TensorProto.FLOAT
+    got = onnx.numpy_helper.to_array(w)
+    np.testing.assert_allclose(got, np.array(expected, dtype=np.float32), rtol=1e-5)
+
+
+def test_import_q5_1_weights(tmp_path):
+    rng = np.random.default_rng(14)
+    raw, expected = _make_q5_1_block(rng)
+    gguf_path = str(tmp_path / "model.gguf")
+    _write_gguf(gguf_path, [("W", GGML_TYPE_Q5_1, [32], raw)])
+
+    model = _identity_model("W", [32])
+    result, skipped = onnxsim.import_gguf_weights(model, gguf_path)
+
+    assert skipped == []
+    w = next(i for i in result.graph.initializer if i.name == "W")
+    assert w.data_type == onnx.TensorProto.FLOAT
+    got = onnx.numpy_helper.to_array(w)
+    np.testing.assert_allclose(got, np.array(expected, dtype=np.float32), rtol=1e-5)
+
+
 def test_import_multiple_tensors_two_dims(tmp_path):
     # Exercises the ne[]-order reversal (GGML innermost-first vs ONNX
     # outermost-first) with a non-square shape, and multiple Q8_0 blocks
@@ -271,13 +427,16 @@ def test_import_skips_unmatched_and_unsupported(tmp_path):
     rng = np.random.default_rng(3)
     raw, _ = _make_q8_0_block(rng)
     gguf_path = str(tmp_path / "model.gguf")
-    legacy_raw = b"\x00" * 18  # Q4_0 block: 2 (d) + 16 (packed nibbles).
+    # Q3_K is not decoded by onnxsim at all, so its exact byte count doesn't
+    # matter here (this tensor's bytes are never read) -- picked because
+    # it's the last tensor in this file, so nothing after it needs locating.
+    unsupported_raw = b"\x00" * 110
     _write_gguf(
         gguf_path,
         [
             ("W", GGML_TYPE_Q8_0, [32], raw),
             ("not_in_graph", GGML_TYPE_Q8_0, [32], raw),
-            ("legacy", GGML_TYPE_Q4_0, [32], legacy_raw),
+            ("unsupported", GGML_TYPE_Q3_K, [256], unsupported_raw),
         ],
     )
 
@@ -289,7 +448,7 @@ def test_import_skips_unmatched_and_unsupported(tmp_path):
     # level skip list (unsupported ggml_type), not a name-matching report.
     # It also never becomes a `model` initializer (this call only hydrates
     # initializers the graph already has, never adds new ones).
-    assert set(skipped) == {"legacy"}
+    assert set(skipped) == {"unsupported"}
     names = {i.name for i in result.graph.initializer}
     assert names == {"W"}
     w = next(i for i in result.graph.initializer if i.name == "W")

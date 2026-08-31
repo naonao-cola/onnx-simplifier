@@ -54,12 +54,13 @@ int main() {
           "ToOnnx(FromOnnx(" + std::to_string(row.onnx) + "))) round-trips");
   }
 
-  // Quantized types this mapping does NOT decode (legacy Q4_0/Q4_1/Q5_0/
-  // Q5_1/Q8_1, Q2_K/Q3_K, Q8_K, IQ*_XXS/BF16-adjacent codes, NVFP4, ...) or
-  // unrecognized types are rejected, not guessed at. Deliberately excludes
-  // 8/12/13/14 (Q8_0/Q4_K/Q5_K/Q6_K) and 39 (MXFP4), which ARE supported --
-  // see the k_quant_rows loop and the MXFP4 checks below.
-  const uint32_t quantized[] = {2, 3, 6, 7, 9, 10, 11, 15, 16, 20, 29, 9999};
+  // Quantized types this mapping does NOT decode (Q8_1, Q2_K/Q3_K, Q8_K,
+  // IQ*_XXS/BF16-adjacent codes, NVFP4, ...) or unrecognized types are
+  // rejected, not guessed at. Deliberately excludes 2/3/6/7 (Q4_0/Q4_1/
+  // Q5_0/Q5_1), 8/12/13/14 (Q8_0/Q4_K/Q5_K/Q6_K), and 39 (MXFP4), which ARE
+  // supported -- see the legacy_quant_rows/k_quant_rows loops and the
+  // MXFP4 checks below.
+  const uint32_t quantized[] = {9, 10, 11, 15, 16, 20, 29, 9999};
   for (uint32_t q : quantized) {
     int32_t onnx = -1;
     Check(!ToOnnx(q, &onnx),
@@ -70,6 +71,8 @@ int main() {
           "IsKQuant is false for unsupported type " + std::to_string(q));
     Check(!IsMxfp4(q),
           "IsMxfp4 is false for unsupported type " + std::to_string(q));
+    Check(!IsLegacyQuant(q),
+          "IsLegacyQuant is false for unsupported type " + std::to_string(q));
     Check(ElementSize(q) == 0,
           "ElementSize is 0 for quantized/unknown type " + std::to_string(q));
     uint64_t nbytes = 0xFFFFFFFFFFFFFFFFull;
@@ -99,6 +102,8 @@ int main() {
   for (const auto& row : k_quant_rows) {
     Check(IsKQuant(row.ggml), "IsKQuant(" + std::to_string(row.ggml) + ")");
     Check(!IsMxfp4(row.ggml), "!IsMxfp4(" + std::to_string(row.ggml) + ")");
+    Check(!IsLegacyQuant(row.ggml),
+          "!IsLegacyQuant(" + std::to_string(row.ggml) + ")");
     Check(!IsRaw(row.ggml), "!IsRaw(" + std::to_string(row.ggml) + ")");
     Check(ElementSize(row.ggml) == 0,
           "ElementSize is 0 for K-quant type " + std::to_string(row.ggml));
@@ -135,6 +140,7 @@ int main() {
   // math.
   Check(IsMxfp4(GGML_TYPE_MXFP4), "IsMxfp4(GGML_TYPE_MXFP4)");
   Check(!IsKQuant(GGML_TYPE_MXFP4), "!IsKQuant(GGML_TYPE_MXFP4)");
+  Check(!IsLegacyQuant(GGML_TYPE_MXFP4), "!IsLegacyQuant(GGML_TYPE_MXFP4)");
   Check(!IsRaw(GGML_TYPE_MXFP4), "!IsRaw(GGML_TYPE_MXFP4)");
   Check(ElementSize(GGML_TYPE_MXFP4) == 0, "ElementSize(MXFP4) == 0");
   Check(Mxfp4BlockElements(GGML_TYPE_MXFP4) == 32, "Mxfp4BlockElements == 32");
@@ -152,6 +158,52 @@ int main() {
           "TryTotalBytes(MXFP4, 3 blocks)");
     Check(!TryTotalBytes(GGML_TYPE_MXFP4, 33, &nbytes),
           "TryTotalBytes rejects non-block-aligned nelems for MXFP4");
+  }
+
+  // The four legacy types this mapping DOES decode -- Q4_0/Q4_1/Q5_0/Q5_1,
+  // all plain 32-element blocks (no super-block scale/min table, unlike
+  // K-quant). Each round-trips through ToOnnx/FromOnnx to its own private
+  // ONNXSIM_GGML_* code, is not IsRaw/IsKQuant/IsMxfp4, and TryTotalBytes
+  // agrees with LegacyQuantBlockElements/LegacyQuantBlockBytes's block math.
+  struct LegacyQuantRow {
+    uint32_t ggml;
+    int32_t onnx;
+    size_t block_bytes;
+  };
+  const LegacyQuantRow legacy_quant_rows[] = {
+      {GGML_TYPE_Q4_0, ONNXSIM_GGML_Q4_0, 18},
+      {GGML_TYPE_Q4_1, ONNXSIM_GGML_Q4_1, 20},
+      {GGML_TYPE_Q5_0, ONNXSIM_GGML_Q5_0, 22},
+      {GGML_TYPE_Q5_1, ONNXSIM_GGML_Q5_1, 24},
+  };
+  for (const auto& row : legacy_quant_rows) {
+    Check(IsLegacyQuant(row.ggml),
+          "IsLegacyQuant(" + std::to_string(row.ggml) + ")");
+    Check(!IsKQuant(row.ggml), "!IsKQuant(" + std::to_string(row.ggml) + ")");
+    Check(!IsMxfp4(row.ggml), "!IsMxfp4(" + std::to_string(row.ggml) + ")");
+    Check(!IsRaw(row.ggml), "!IsRaw(" + std::to_string(row.ggml) + ")");
+    Check(ElementSize(row.ggml) == 0,
+          "ElementSize is 0 for legacy-quant type " + std::to_string(row.ggml));
+    Check(LegacyQuantBlockElements(row.ggml) == 32,
+          "LegacyQuantBlockElements(" + std::to_string(row.ggml) + ") == 32");
+    Check(LegacyQuantBlockBytes(row.ggml) == row.block_bytes,
+          "LegacyQuantBlockBytes(" + std::to_string(row.ggml) + ")");
+
+    int32_t onnx = -1;
+    Check(ToOnnx(row.ggml, &onnx) && onnx == row.onnx,
+          "ToOnnx(" + std::to_string(row.ggml) +
+              ") == " + std::to_string(row.onnx));
+    uint32_t ggml_back = 0;
+    Check(FromOnnx(row.onnx, &ggml_back) && ggml_back == row.ggml,
+          "FromOnnx(ToOnnx(" + std::to_string(row.ggml) + "))) round-trips");
+
+    uint64_t nbytes = 0;
+    Check(TryTotalBytes(row.ggml, 32 * 3, &nbytes) &&
+              nbytes == row.block_bytes * 3,
+          "TryTotalBytes(" + std::to_string(row.ggml) + ", 3 blocks)");
+    Check(!TryTotalBytes(row.ggml, 33, &nbytes),
+          "TryTotalBytes rejects non-block-aligned nelems for " +
+              std::to_string(row.ggml));
   }
 
   // ONNX dtypes with no raw ggml counterpart (unsigned ints, BOOL, STRING,

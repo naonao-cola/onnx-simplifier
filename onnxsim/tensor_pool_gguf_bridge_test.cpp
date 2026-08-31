@@ -253,10 +253,11 @@ void TestImportModelWithGGUFLazy() {
   std::remove(path.c_str());
 }
 
-// Hand-builds a GGUF file with one raw F32 tensor ("w1") and one Q4_0
-// (quantized) tensor ("w2"), then imports it against a model declaring both
-// as initializers -- the scenario a real quantized-LLM checkpoint puts a
-// caller in for nearly every weight.
+// Hand-builds a GGUF file with one raw F32 tensor ("w1") and one Q3_K
+// (quantized, unsupported -- deliberately NOT one of IsKQuant/IsLegacyQuant/
+// IsMxfp4's covered types) tensor ("w2"), then imports it against a model
+// declaring both as initializers -- the scenario a real quantized-LLM
+// checkpoint puts a caller in for nearly every weight.
 void TestImportModelWithGGUFSkipsQuantized() {
   std::string path = TempPath("_quantized.gguf");
   {
@@ -279,7 +280,7 @@ void TestImportModelWithGGUFSkipsQuantized() {
     write_string("w2");
     WriteLE<uint32_t>(out, 1);
     WriteLE<uint64_t>(out, 32);  // ne[0]
-    WriteLE<uint32_t>(out, 2);   // GGML_TYPE_Q4_0
+    WriteLE<uint32_t>(out, 11);  // GGML_TYPE_Q3_K
     WriteLE<uint64_t>(out, kDefaultAlignment);
 
     uint64_t header_end = static_cast<uint64_t>(out.tellp());
@@ -474,6 +475,81 @@ void TestImportModelWithGGUFDecodesMxfp4() {
   std::remove(path.c_str());
 }
 
+// Same shape as TestImportModelWithGGUFDecodesMxfp4, but for the legacy
+// Q4_0 format -- confirms HydrateTensorProtoFromGGUF's IsKQuant-or-IsMxfp4-
+// or-IsLegacyQuant branch actually reaches the decode path when called
+// through the full ImportModelWithGGUF bridge, not just
+// TensorPool::DequantizeToFloat directly (see tensor_pool_gguf_test.cpp's
+// TestLegacyQuantRoundTripAndDecode for that narrower check). d = 2.0
+// (fp16 0x4000), qs[i] = i -- the same hand-verified vector
+// ggml_legacy_quant_test.cpp hand-verifies.
+void TestImportModelWithGGUFDecodesLegacyQuant() {
+  std::string path = TempPath("_legacy_quant_import.gguf");
+  {
+    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    auto write_string = [&](const std::string& s) {
+      WriteLE<uint64_t>(out, s.size());
+      out.write(s.data(), static_cast<std::streamsize>(s.size()));
+    };
+    WriteLE<uint32_t>(out, kMagic);
+    WriteLE<uint32_t>(out, kSupportedVersion);
+    WriteLE<uint64_t>(out, 1);  // tensor_count
+    WriteLE<uint64_t>(out, 0);  // metadata_kv_count
+
+    write_string("w");
+    WriteLE<uint32_t>(out, 1);
+    WriteLE<uint64_t>(out, 32);  // ne[0]
+    WriteLE<uint32_t>(out, GGML_TYPE_Q4_0);
+    WriteLE<uint64_t>(out, 0);  // offset
+
+    uint64_t header_end = static_cast<uint64_t>(out.tellp());
+    uint64_t data_start = (header_end + kDefaultAlignment - 1) /
+                          kDefaultAlignment * kDefaultAlignment;
+    for (uint64_t i = header_end; i < data_start; ++i) out.put('\0');
+    WriteLE<uint16_t>(out, 0x4000);  // d = 2.0 (fp16)
+    for (int i = 0; i < 16; ++i) {
+      out.put(static_cast<char>(static_cast<uint8_t>(i)));  // qs[i]
+    }
+  }
+
+  onnx::ModelProto model;
+  auto* w = model.mutable_graph()->add_initializer();
+  w->set_name("w");
+  w->set_data_type(onnx::TensorProto::INT32);  // deliberately wrong
+  w->add_dims(32);
+
+  TensorPool pool;
+  std::vector<std::string> skipped;
+  size_t matched = ImportModelWithGGUF(model, path, pool, true, &skipped);
+  Check(matched == 1, "the Q4_0 tensor is matched");
+  Check(skipped.empty(), "nothing skipped -- Q4_0 is now supported");
+
+  const auto& hydrated = model.graph().initializer(0);
+  Check(hydrated.data_type() == onnx::TensorProto::FLOAT,
+        "Q4_0 hydration forces data_type to FLOAT, overriding the caller's "
+        "(wrong) declared INT32");
+  Check(hydrated.has_raw_data() &&
+            hydrated.raw_data().size() == 32 * sizeof(float),
+        "hydrated raw_data is 32 float32 values");
+  bool values_ok = hydrated.raw_data().size() == 32 * sizeof(float);
+  if (values_ok) {
+    std::string bytes = hydrated.raw_data();
+    if constexpr (!onnxsim::dlpack::kRawDataIsHostOrder) {
+      onnxsim::dlpack::SwapElementBytes(
+          reinterpret_cast<uint8_t*>(bytes.data()), bytes.size(),
+          sizeof(float));
+    }
+    float floats[32];
+    std::memcpy(floats, bytes.data(), sizeof(floats));
+    values_ok = std::fabs(floats[0] - (-16.0f)) < 1e-4f &&
+                std::fabs(floats[15] - 14.0f) < 1e-4f &&
+                std::fabs(floats[31] - (-16.0f)) < 1e-4f;
+  }
+  Check(values_ok, "hydrated values decode as expected");
+
+  std::remove(path.c_str());
+}
+
 // ImportModelWithGGUFToPool is import_gguf_weights's FFI-friendly sibling of
 // ImportModelWithGGUF(hydrate_all=true): same K-quant decode
 // (HydrateTensorProtoFromGGUF, reused unchanged), but the matched tensor's
@@ -576,6 +652,7 @@ int main() {
   TestImportModelWithGGUFSkipsQuantized();
   TestImportModelWithGGUFDecodesKQuant();
   TestImportModelWithGGUFDecodesMxfp4();
+  TestImportModelWithGGUFDecodesLegacyQuant();
   TestImportModelWithGGUFToPool();
 
   if (g_failures == 0) {
