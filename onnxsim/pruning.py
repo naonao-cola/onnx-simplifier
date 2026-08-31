@@ -761,6 +761,7 @@ import numpy as np
 import onnx
 import onnx.helper
 import onnx.numpy_helper
+import onnx.shape_inference
 
 from onnxsim import backend
 from onnxsim.bias_correction import _add_probe_outputs
@@ -975,6 +976,29 @@ def _match_conv_weight_only(
     standard grouped-Conv well-formedness requirement (`group` equal-sized
     output blocks) that :func:`_conv_group_relative_norm` also relies on to
     line up each output filter with its own group's input-channel slice.
+
+    Deliberately still 2-D-only (``len(w_init.dims) != 4``, not the ``>= 3``
+    :func:`_match_conv_producer`/:func:`_match_conv_consumer` now accept for
+    *structural* channel pruning): this module's calibration machinery for
+    Wanda (:func:`_conv_spatial_attrs`/:func:`_conv_patch_sq_sum`) and
+    SparseGPT (:func:`_conv_im2col_patches`, plus an unconditional
+    ``cout, cin_per_group, kh, kw = w.shape`` unpack in
+    :func:`apply_sparsegpt_pruning`'s own body) hard-codes exactly two
+    spatial dims throughout its own im2col-style patch unfolding -- padding
+    fields (`pad_top`/`pad_left`/`pad_bottom`/`pad_right`),
+    stride/dilation pairs, and per-tap loops all assume `n=2`. Generalizing
+    that to N spatial dims is a materially bigger, more invasive rewrite
+    than the structural side's own "the slicing never touches spatial axes
+    at all" generalization, and risks silently changing already-verified
+    2-D numeric behavior in the process -- so it is explicitly left out of
+    scope here (a Conv1d/Conv3d weight is declined, `None`, not silently
+    mismatched or crashed on) rather than attempted alongside the
+    structural generalization above. Plain :func:`apply_magnitude_pruning`
+    itself needs no im2col calibration at all (its own metric is `|W|`,
+    computed the same way regardless of spatial rank) and *could* be
+    generalized cheaply on its own, but is kept at this same 2-D-only bar
+    for consistency -- one matcher, one scope boundary, shared by all three
+    calibration-based callers -- rather than silently diverging per-caller.
     """
     if node.op_type != "Conv" or len(node.input) < 2:
         return None
@@ -2549,6 +2573,22 @@ class _Producer:
     # axis), so this only changes how :func:`_apply_chains` picks `keep`,
     # never how the producer's own weight is sliced.
     group: int = 1
+    # True for a ``ConvTranspose`` producer (see
+    # :func:`_match_conv_transpose_producer`) -- `is_conv` is *also* True
+    # then (still Conv-style ellipsis slicing, not a MatMul/Gemm 2-D one),
+    # this just further selects *which* axis is the output-channel one.
+    # ``ConvTranspose``'s own weight layout is ``[in_channels, out_channels
+    # /group, k1, ..., kn]`` -- confirmed live via
+    # ``onnx.defs.get_schema("ConvTranspose")`` -- the reverse of ``Conv``'s
+    # ``[out_channels, in_channels/group, ...]``: output channels live on
+    # axis 1, not axis 0. Every caller that slices/reshapes this producer's
+    # own weight by its output-channel axis (:func:`_slice_producer_weight`,
+    # :func:`_producer_weight_nk`) consults this flag to use axis 1 instead
+    # of axis 0. Only an ordinary (``group == 1``) ``ConvTranspose`` is ever
+    # matched as a producer (see :func:`_match_conv_transpose_producer`'s
+    # own docstring for why a grouped one is declined) -- `group` above is
+    # therefore always 1 whenever this is True.
+    is_conv_transpose: bool = False
 
 
 @dataclass(frozen=True)
@@ -2596,6 +2636,23 @@ class _Chain:
     # :func:`_chain_group`) and the dedicated slicing
     # :func:`_slice_grouped_consumer_conv_weight` performs.
     consumer_group: int = 1
+    # True for a ``ConvTranspose`` consumer (see
+    # :func:`_match_conv_transpose_consumer`, only ever set by
+    # :func:`_find_conv_chains` -- every other Conv-chain finder in this
+    # module (residual/merge groups, Concat-branch merges) still declines a
+    # ``ConvTranspose`` consumer outright, see
+    # :func:`_walk_to_conv_consumer`'s own `allow_conv_transpose_consumer`
+    # parameter). `consumer_is_conv` is *also* True then; this just further
+    # selects which axis is the input-channel one. Unlike ``Conv``'s
+    # grouped consumer (axis 1, per-group-relative), a ``ConvTranspose``
+    # consumer's own input-channel axis is axis 0, which spans the *full*
+    # `in_channels` regardless of `consumer_group` (grouping only ever
+    # splits axis 1 -- the *output* side -- for ``ConvTranspose``, the
+    # mirror image of ``Conv``): see :func:`_match_conv_transpose_consumer`'s
+    # own docstring for why this makes a plain, flat ``w[keep, ...]`` (not
+    # :func:`_slice_grouped_consumer_conv_weight`) correct here even when
+    # `consumer_group` is > 1.
+    consumer_is_conv_transpose: bool = False
     # Extra, independent downstream consumer branches beyond the "primary"
     # one already carried on this chain's own singular `consumer_*` fields
     # above -- populated only by :func:`_find_conv_residual_chains`/
@@ -2916,10 +2973,20 @@ def _match_conv_producer(
 ) -> Optional[Tuple[str, Optional[str], int, int]]:
     """If `node` is an ordinary (``group=1``) *or* a general grouped
     (``1 < group < in_channels``, ``group != out_channels`` -- see this
-    module's own docstring) 2-D ``Conv`` with a constant 4-D float32
-    ``[out_channels, in_channels/group, kH, kW]`` weight (and, if present, a
-    constant bias), returns
-    ``(weight_name, bias_name_or_None, out_channels, group)``. A depthwise
+    module's own docstring) ``Conv`` -- 1-D, 2-D, or 3-D alike, i.e. any
+    spatial rank ``n >= 1`` -- with a constant ``[out_channels,
+    in_channels/group, k1, ..., kn]`` float32/float16/bfloat16 weight (and,
+    if present, a constant bias), returns
+    ``(weight_name, bias_name_or_None, out_channels, group)``. Only the
+    weight's own *rank* (``>= 3``: one output-channel axis, one
+    input-channel axis, at least one spatial axis) is checked here --
+    exactly the same schema-documented ``[M, C/group, k1, ..., kn]`` layout
+    for any ``n`` (confirmed live via ``onnx.defs.get_schema("Conv")``), not
+    a 2-D-specific one -- since every slicing/importance computation this
+    producer role ever drives (:func:`_slice_producer_weight`,
+    :func:`_producer_weight_nk`) already only ever touches axis 0 and
+    leaves every remaining axis (spatial or not) alone via ``...``/``-1``,
+    with no assumption about how many of them there are. A depthwise
     Conv (``group == in_channels == out_channels``) never matches: even
     though it *is* given a narrower exception elsewhere in this pass, as a
     transparent pass-through hop the chain walk may cross between two real
@@ -2941,7 +3008,7 @@ def _match_conv_producer(
     if (
         w_init is None
         or not _is_supported_float_dtype(w_init.data_type)
-        or len(w_init.dims) != 4
+        or len(w_init.dims) < 3
     ):
         return None
     group = _conv_group(node)
@@ -2964,12 +3031,71 @@ def _match_conv_producer(
     return w_name, bias_name, out_channels, group
 
 
+def _match_conv_transpose_producer(
+    node: onnx.NodeProto, initializer_map: Dict[str, onnx.TensorProto]
+) -> Optional[Tuple[str, Optional[str], int, int]]:
+    """The ``ConvTranspose`` analogue of :func:`_match_conv_producer`. If
+    `node` is an ordinary (``group == 1``) ``ConvTranspose`` with a constant
+    ``[in_channels, out_channels/group, k1, ..., kn]`` (``n >= 1``)
+    float32/float16/bfloat16 weight (and, if present, a constant bias),
+    returns ``(weight_name, bias_name_or_None, out_channels, group=1)``.
+
+    ``ConvTranspose``'s own weight layout is the schema-documented
+    ``[C, M/group, k1, ..., kn]`` -- confirmed live via
+    ``onnx.defs.get_schema("ConvTranspose")`` -- the *reverse* of ``Conv``'s
+    ``[M, C/group, ...]``: input channels (``C``) come first, this node's
+    own *output* channels (``M``, what "producer" means here -- the count
+    downstream layers' input-channel dimension must match) live on axis 1,
+    not axis 0. Every caller that slices/reshapes this producer's weight by
+    its own output-channel axis (:func:`_slice_producer_weight`,
+    :func:`_producer_weight_nk`) is told this via the returned `_Producer`'s
+    own ``is_conv_transpose=True`` flag (set by :func:`_find_conv_chains`,
+    the only caller of this function), and uses axis 1 instead of axis 0.
+
+    Deliberately restricted to ``group == 1`` -- declined (``None``)
+    otherwise -- unlike :func:`_match_conv_producer`'s support for a
+    *general* grouped Conv: a grouped ``ConvTranspose`` producer's own
+    output-channel axis (1) *is* per-group-relative (weight column ``j`` on
+    input-row block ``g`` means global output channel ``g * (out_channels /
+    group) + j``, mirroring ``Conv``'s own grouped *consumer* axis, see
+    :func:`_match_conv_consumer`'s docstring) -- pruning it needs the
+    equivalent of :func:`_slice_grouped_consumer_conv_weight` but for axis 1
+    instead of axis 0, which this module does not implement. A scope
+    decision, not an oversight: get ordinary ``ConvTranspose`` right first
+    (see this module's own docstring for a Conv1d/Conv3d/ConvTranspose
+    generalization's full scope), leaving grouped ``ConvTranspose`` as a
+    clean, explicit decline for a future pass to pick up.
+    """
+    if node.op_type != "ConvTranspose" or len(node.input) < 2:
+        return None
+    w_name = node.input[1]
+    w_init = initializer_map.get(w_name)
+    if (
+        w_init is None
+        or not _is_supported_float_dtype(w_init.data_type)
+        or len(w_init.dims) < 3
+    ):
+        return None
+    group = _conv_group(node)
+    if group != 1:
+        return None  # grouped ConvTranspose producer -- declined, see above
+    out_channels = w_init.dims[1]
+    bias_name = None
+    if len(node.input) == 3 and node.input[2]:
+        bias_name = node.input[2]
+        if bias_name not in initializer_map:
+            return None  # non-constant bias -- can't safely prune it
+    return w_name, bias_name, out_channels, group
+
+
 def _match_conv_consumer(
     node: onnx.NodeProto, initializer_map: Dict[str, onnx.TensorProto]
 ) -> Optional[Tuple[str, int, int]]:
     """If `node` is an ordinary (``group=1``) *or* a general grouped Conv
-    (see :func:`_match_conv_producer`) with a constant 4-D float32 weight,
-    returns ``(weight_name, in_channels, group)``. Like
+    (see :func:`_match_conv_producer`) -- any spatial rank ``n >= 1``, same
+    as that function -- with a constant ``[out_channels, in_channels/group,
+    k1, ..., kn]`` float32/float16/bfloat16 weight, returns
+    ``(weight_name, in_channels, group)``. Like
     :func:`_match_conv_producer`, a depthwise Conv never matches here
     either -- it's only ever a transparent pass-through hop the chain walk
     crosses en route to a *real* consumer, never a consumer itself (see
@@ -2989,7 +3115,7 @@ def _match_conv_consumer(
     if (
         w_init is None
         or not _is_supported_float_dtype(w_init.data_type)
-        or len(w_init.dims) != 4
+        or len(w_init.dims) < 3
     ):
         return None
     group = _conv_group(node)
@@ -3004,24 +3130,75 @@ def _match_conv_consumer(
     return w_name, in_channels, group
 
 
+def _match_conv_transpose_consumer(
+    node: onnx.NodeProto, initializer_map: Dict[str, onnx.TensorProto]
+) -> Optional[Tuple[str, int, int]]:
+    """The ``ConvTranspose`` analogue of :func:`_match_conv_consumer`. If
+    `node` is a ``ConvTranspose`` (any ``group >= 1`` -- see below) with a
+    constant ``[in_channels, out_channels/group, k1, ..., kn]`` weight,
+    returns ``(weight_name, in_channels, group)``.
+
+    Unlike :func:`_match_conv_transpose_producer`'s ``group == 1``
+    restriction, a grouped ``ConvTranspose`` *consumer* is matched for any
+    `group`: this node's own input-channel axis is axis 0 of its
+    ``[C, M/group, ...]`` weight, which -- unlike ``Conv``'s grouped
+    consumer axis (1, per-group-relative) -- already spans the *full*,
+    global ``C`` regardless of `group` (grouping only ever splits axis 1,
+    the *output* side, for ``ConvTranspose`` -- the mirror image of
+    ``Conv``, whose grouping only ever splits axis 1, the *input* side).
+    Pruning it is therefore a plain, flat ``w[keep, ...]``
+    (:func:`_slice_consumer_weight` with ``is_conv_transpose=True``) for any
+    `group`, identical in form to an *ordinary* Conv producer's own axis-0
+    slicing -- no per-group block-relative index translation needed the way
+    :func:`_slice_grouped_consumer_conv_weight` provides for a grouped Conv
+    consumer. `keep_count` still needs to land as a uniform count per
+    `group`-sized block of axis 0 for the pruned node's own `group`
+    attribute to stay well-formed (``new_in_channels % group == 0``,
+    ``ConvTranspose``'s own well-formedness requirement) -- exactly what
+    :func:`_apply_chains`'s existing `group > 1` branch (driven by
+    :func:`_chain_group`, keyed on this `group`) already guarantees for any
+    grouped consumer, Conv or ``ConvTranspose`` alike, with no
+    `ConvTranspose`-specific change needed there.
+    """
+    if node.op_type != "ConvTranspose" or len(node.input) < 2:
+        return None
+    w_name = node.input[1]
+    w_init = initializer_map.get(w_name)
+    if (
+        w_init is None
+        or not _is_supported_float_dtype(w_init.data_type)
+        or len(w_init.dims) < 3
+    ):
+        return None
+    group = _conv_group(node)
+    if group < 1:
+        return None
+    in_channels = w_init.dims[0]
+    if group > 1 and in_channels % group != 0:
+        return None  # groups must stay equal-sized
+    return w_name, in_channels, group
+
+
 def _match_depthwise_conv_pass_through(
     node: onnx.NodeProto,
     initializer_map: Dict[str, onnx.TensorProto],
     n_channels: int,
 ) -> Optional[Tuple[str, Optional[str]]]:
-    """If `node` is a depthwise 2-D ``Conv`` (``group == in_channels ==
-    out_channels == n_channels``) with a constant ``[n_channels, 1, kH,
-    kW]`` float32 weight (and, if present, a constant bias), returns
-    ``(weight_name, bias_name_or_None)``. A depthwise Conv mixes no channels
-    at all -- output channel ``i`` depends only on input channel ``i`` --
-    unlike a general grouped Conv (``group`` neither 1 nor `n_channels`),
-    which is not matched here and stays out of scope for this pass entirely
-    (see :func:`_match_conv_producer`/:func:`_match_conv_consumer`'s own
-    docstrings): only in the depthwise case is every output channel tied
-    1:1 to the same-index input channel, which is what lets the chain walk
-    (:func:`_walk_to_conv_consumer`) treat it as a transparent pass-through
-    hop -- carrying whatever channel-index set survives upstream straight
-    through, unchanged -- rather than a producer or consumer of its own.
+    """If `node` is a depthwise ``Conv`` (``group == in_channels ==
+    out_channels == n_channels``, any spatial rank ``n >= 1`` -- see
+    :func:`_match_conv_producer`) with a constant ``[n_channels, 1, k1, ...,
+    kn]`` float32/float16/bfloat16 weight (and, if present, a constant
+    bias), returns ``(weight_name, bias_name_or_None)``. A depthwise Conv
+    mixes no channels at all -- output channel ``i`` depends only on input
+    channel ``i`` -- unlike a general grouped Conv (``group`` neither 1 nor
+    `n_channels`), which is not matched here and stays out of scope for
+    this pass entirely (see :func:`_match_conv_producer`/
+    :func:`_match_conv_consumer`'s own docstrings): only in the depthwise
+    case is every output channel tied 1:1 to the same-index input channel,
+    which is what lets the chain walk (:func:`_walk_to_conv_consumer`) treat
+    it as a transparent pass-through hop -- carrying whatever channel-index
+    set survives upstream straight through, unchanged -- rather than a
+    producer or consumer of its own.
     """
     if node.op_type != "Conv" or len(node.input) < 2:
         return None
@@ -3030,7 +3207,7 @@ def _match_depthwise_conv_pass_through(
     if (
         w_init is None
         or not _is_supported_float_dtype(w_init.data_type)
-        or len(w_init.dims) != 4
+        or len(w_init.dims) < 3
         or w_init.dims[0] != n_channels
         or w_init.dims[1] != 1
         or _conv_group(node) != n_channels
@@ -3053,8 +3230,9 @@ def _walk_to_conv_consumer(
     n_channels: int,
     max_hops: int,
     forced_first_hop: Optional[onnx.NodeProto] = None,
+    allow_conv_transpose_consumer: bool = False,
 ) -> Tuple[
-    Optional[Tuple[onnx.NodeProto, str, int]],
+    Optional[Tuple[onnx.NodeProto, str, int, bool]],
     Tuple[Tuple[onnx.NodeProto, None], ...],
     Tuple[_ConvPassThrough, ...],
 ]:
@@ -3067,13 +3245,32 @@ def _walk_to_conv_consumer(
     `conv_pass_through` rather than folded into `chain_ops`) with no other
     consumer anywhere along the way, until an ordinary (``group=1``) *or*
     general grouped Conv consumer is found whose input channel count
-    matches `n_channels` (see :func:`_match_conv_consumer`). A depthwise
-    Conv is only ever a transparent hop, never a match for the consumer
-    role itself -- one sitting last before a graph output or a branch
-    simply ends the walk with no consumer found, same as any other
+    matches `n_channels` (see :func:`_match_conv_consumer`), or --
+    when `allow_conv_transpose_consumer` -- a ``ConvTranspose`` consumer
+    (see :func:`_match_conv_transpose_consumer`) is found instead. A
+    depthwise Conv is only ever a transparent hop, never a match for the
+    consumer role itself -- one sitting last before a graph output or a
+    branch simply ends the walk with no consumer found, same as any other
     unmatched topology. Unlike the MatMul/Gemm walk, no per-channel
     ``Add``/``Mul`` op is recognized -- see this module's own docstring for
     why that's out of scope for Conv chains.
+
+    The returned consumer tuple's own 4th element is `is_conv_transpose`
+    (see :class:`_Chain`'s own field of the same name) -- always ``False``
+    for a Conv consumer, so every existing caller that only ever saw a
+    3-tuple here before `is_conv_transpose` existed keeps identical
+    behavior once it drops the extra element.
+
+    `allow_conv_transpose_consumer` defaults ``False`` -- a ``ConvTranspose``
+    node hit mid-walk then simply ends the walk with no consumer found
+    (exactly like any other unmatched topology), *not* an error. Only
+    :func:`_find_conv_chains` -- the plain single-producer/single-consumer
+    chain finder this generalization was scoped to (see this module's own
+    docstring) -- passes ``True``. Every other caller (the residual/merge
+    "fan-out" branch resolution below, and the Concat-branch-merge consumer
+    walk) leaves it at the default, deliberately excluding ``ConvTranspose``
+    from those more elaborate topologies for now -- a scope decision, not
+    an oversight (see this module's own docstring).
 
     `forced_first_hop`, when given, is used as the walk's very first hop
     instead of deriving it from `consumers_of[start]` -- every ordinary
@@ -3090,7 +3287,7 @@ def _walk_to_conv_consumer(
     """
     chain_ops: List[Tuple[onnx.NodeProto, None]] = []
     conv_pass_through: List[_ConvPassThrough] = []
-    consumer: Optional[Tuple[onnx.NodeProto, str, int]] = None
+    consumer: Optional[Tuple[onnx.NodeProto, str, int, bool]] = None
     cur = start
     for _hop in range(max_hops):
         if _hop == 0 and forced_first_hop is not None:
@@ -3116,7 +3313,17 @@ def _walk_to_conv_consumer(
 
             match = _match_conv_consumer(nxt, initializer_map)
             if match is not None and match[1] == n_channels:
-                consumer = (nxt, match[0], match[2])
+                consumer = (nxt, match[0], match[2], False)
+            break
+
+        if (
+            allow_conv_transpose_consumer
+            and nxt.op_type == "ConvTranspose"
+            and nxt.input[0] == cur
+        ):
+            ct_match = _match_conv_transpose_consumer(nxt, initializer_map)
+            if ct_match is not None and ct_match[1] == n_channels:
+                consumer = (nxt, ct_match[0], ct_match[2], True)
             break
 
         if not (
@@ -3145,7 +3352,16 @@ def _find_conv_chains(graph: onnx.GraphProto) -> List[_Chain]:
 
     chains = []
     for node in graph.node:
+        # Try an ordinary/grouped Conv producer first, then (only if that
+        # declines -- the two matchers' own op_type checks are mutually
+        # exclusive, so this is never ambiguous) a ConvTranspose producer
+        # (group == 1 only -- see _match_conv_transpose_producer's own
+        # docstring for why grouped ConvTranspose stays out of scope).
         info = _match_conv_producer(node, initializer_map)
+        is_producer_conv_transpose = False
+        if info is None:
+            info = _match_conv_transpose_producer(node, initializer_map)
+            is_producer_conv_transpose = True
         if info is None:
             continue
         w_name, bias_name, n_channels, producer_group = info
@@ -3161,10 +3377,13 @@ def _find_conv_chains(graph: onnx.GraphProto) -> List[_Chain]:
             graph_outputs,
             n_channels,
             _MAX_CHAIN_HOPS,
+            allow_conv_transpose_consumer=True,
         )
         if consumer is None:
             continue
-        consumer_node, consumer_weight, consumer_group = consumer
+        consumer_node, consumer_weight, consumer_group, consumer_is_conv_transpose = (
+            consumer
+        )
 
         if (
             producer_group > 1
@@ -3191,6 +3410,7 @@ def _find_conv_chains(graph: onnx.GraphProto) -> List[_Chain]:
                         bias_name,
                         is_conv=True,
                         group=producer_group,
+                        is_conv_transpose=is_producer_conv_transpose,
                     ),
                 ),
                 chain_ops=chain_ops,
@@ -3201,6 +3421,7 @@ def _find_conv_chains(graph: onnx.GraphProto) -> List[_Chain]:
                 consumer_is_conv=True,
                 conv_pass_through=conv_pass_through,
                 consumer_group=consumer_group,
+                consumer_is_conv_transpose=consumer_is_conv_transpose,
             )
         )
     return chains
@@ -3342,7 +3563,7 @@ def _match_conv_pass_through_self(
     if (
         w_init is None
         or not _is_supported_float_dtype(w_init.data_type)
-        or len(w_init.dims) != 4
+        or len(w_init.dims) < 3
     ):
         return None
     return _match_depthwise_conv_pass_through(node, initializer_map, w_init.dims[0])
@@ -3540,7 +3761,11 @@ def _resolve_conv_fanout_branches(
             )
             if resolved is None:
                 return None
-            branch_node, branch_weight, branch_group = resolved
+            # `allow_conv_transpose_consumer` was left at its default
+            # (False) above, so `_` here is always False -- ConvTranspose
+            # is deliberately out of scope for a residual/merge group's own
+            # fan-out branches (see _walk_to_conv_consumer's own docstring).
+            branch_node, branch_weight, branch_group, _ = resolved
             # A general grouped Conv consumer is allowed through here
             # unconditionally, same as the primary consumer -- its own
             # `group` is simply carried on the returned `_ConsumerBranch`
@@ -5961,7 +6186,11 @@ def _find_conv_concat_chains(graph: onnx.GraphProto) -> List[_ConcatChain]:
         )
         if consumer is None:
             continue
-        consumer_node, consumer_weight, consumer_group = consumer
+        # `allow_conv_transpose_consumer` was left at its default (False)
+        # above, so `_` here is always False -- ConvTranspose is
+        # deliberately out of scope for a Concat-branch-merge chain's own
+        # consumer (see _walk_to_conv_consumer's own docstring).
+        consumer_node, consumer_weight, consumer_group, _ = consumer
         if not _concat_branches_align_to_consumer_group(
             branches, total_n, consumer_group
         ):
@@ -6234,11 +6463,21 @@ def _slice_producer_weight(
     weight_transposed: bool,
     keep: np.ndarray,
     is_conv: bool = False,
+    is_conv_transpose: bool = False,
 ) -> None:
     w = onnx.numpy_helper.to_array(w_init)
     if is_conv:
-        # [out_channels, in_channels, kH, kW]: output channel is always axis 0.
-        w_new = w[keep, ...]
+        if is_conv_transpose:
+            # ConvTranspose: [in_channels, out_channels/group, k1, ...] --
+            # output channel lives on axis 1, not axis 0 (see
+            # _match_conv_transpose_producer's own docstring; only ever
+            # called here for a group == 1 ConvTranspose, so this is a
+            # plain, ungrouped axis-1 slice).
+            w_new = w[:, keep, ...]
+        else:
+            # Conv: [out_channels, in_channels/group, k1, ...]: output
+            # channel is always axis 0, for any spatial rank.
+            w_new = w[keep, ...]
     else:
         # [N, K] storage (transB=1): output channel is axis 0. [K, N]
         # storage (the common case): output channel is axis 1.
@@ -6251,11 +6490,21 @@ def _slice_consumer_weight(
     weight_transposed: bool,
     keep: np.ndarray,
     is_conv: bool = False,
+    is_conv_transpose: bool = False,
 ) -> None:
     w = onnx.numpy_helper.to_array(w_init)
     if is_conv:
-        # [out_channels, in_channels, kH, kW]: input channel is always axis 1.
-        w_new = w[:, keep, ...]
+        if is_conv_transpose:
+            # ConvTranspose: [in_channels, out_channels/group, k1, ...] --
+            # input channel lives on axis 0, and (unlike Conv's grouped
+            # consumer axis 1) spans the *full* in_channels regardless of
+            # group, so a plain, flat slice is correct for any group (see
+            # _match_conv_transpose_consumer's own docstring).
+            w_new = w[keep, ...]
+        else:
+            # Conv: [out_channels, in_channels/group, k1, ...]: input
+            # channel is always axis 1, for any spatial rank.
+            w_new = w[:, keep, ...]
     else:
         # [N, K] storage (transB=1): reduction dim is axis 1. [K, N] storage:
         # reduction dim is axis 0.
@@ -6407,6 +6656,33 @@ def _head_bias_axis(dims: Sequence[int], num_heads: int) -> Optional[int]:
     return None
 
 
+def _producer_weight_nk(w: np.ndarray, p: "_Producer") -> np.ndarray:
+    """``[N, K]`` view of one chain producer's own (already-float64) weight
+    `w`, for structured-pruning importance ranking -- `N` being that
+    producer's own output-channel count, `K` everything else flattened.
+    Shared by every place that needs this view before slicing (
+    :func:`_apply_chains`, :func:`_apply_chains_global`,
+    :func:`analyze_pruning_sensitivity`'s own dry-run report) so all three
+    stay in exact agreement.
+
+    For an ordinary Conv producer (`p.is_conv`, ``p.is_conv_transpose ==
+    False``) output channels are axis 0, for any spatial rank (see
+    :func:`_match_conv_producer`'s own docstring) -- a plain
+    ``w.reshape(w.shape[0], -1)``. For a ``ConvTranspose`` producer
+    (`p.is_conv_transpose`) output channels are axis 1 instead (see
+    :func:`_match_conv_transpose_producer`'s own docstring) -- axis 1 is
+    moved to the front before the same flatten, so row `i` of the returned
+    array is still that producer's own `i`-th output channel's full
+    weight, regardless of which axis it started on. For a MatMul/Gemm
+    producer, mirrors :func:`_weight_to_nk`'s own transpose convention.
+    """
+    if p.is_conv:
+        if p.is_conv_transpose:
+            return np.moveaxis(w, 1, 0).reshape(w.shape[1], -1)
+        return w.reshape(w.shape[0], -1)
+    return w if p.weight_transposed else w.T
+
+
 def _plain_structured_importance(
     chain: _Chain, w_arrays_nk: List[np.ndarray], importance_norm: str = "l2"
 ) -> np.ndarray:
@@ -6515,7 +6791,11 @@ def _slice_chain_channels(
     """
     for p in chain.producers:
         _slice_producer_weight(
-            initializer_map[p.weight], p.weight_transposed, keep, is_conv=p.is_conv
+            initializer_map[p.weight],
+            p.weight_transposed,
+            keep,
+            is_conv=p.is_conv,
+            is_conv_transpose=p.is_conv_transpose,
         )
         if p.bias is not None:
             _slice_last_axis(initializer_map[p.bias], keep)
@@ -6537,7 +6817,11 @@ def _slice_chain_channels(
 
     for hop in chain.conv_pass_through:
         _slice_conv_hop(hop)
-    if chain.consumer_is_conv and chain.consumer_group > 1:
+    if (
+        chain.consumer_is_conv
+        and not chain.consumer_is_conv_transpose
+        and chain.consumer_group > 1
+    ):
         _slice_grouped_consumer_conv_weight(
             initializer_map[chain.consumer_weight],
             keep,
@@ -6545,11 +6829,17 @@ def _slice_chain_channels(
             chain.n_channels,
         )
     else:
+        # A grouped ConvTranspose consumer (consumer_is_conv_transpose,
+        # consumer_group > 1) also lands here, not in the branch above --
+        # its own input-channel axis (0) is flat/global regardless of
+        # group, so the plain slice below is already correct; see
+        # _match_conv_transpose_consumer's own docstring.
         _slice_consumer_weight(
             initializer_map[chain.consumer_weight],
             chain.consumer_weight_transposed,
             keep,
             is_conv=chain.consumer_is_conv,
+            is_conv_transpose=chain.consumer_is_conv_transpose,
         )
     # Extra fan-out branches (see :class:`_Chain.extra_consumers`'s own
     # comment): each is either an ordinary (`group == 1`) consumer, or,
@@ -6710,11 +7000,7 @@ def _apply_chains(
         w_arrays_nk = []
         for p in chain.producers:
             w = _to_f64(initializer_map[p.weight])
-            if p.is_conv:
-                w_nk = w.reshape(w.shape[0], -1)  # [out_channels, in_channels*kH*kW]
-            else:
-                w_nk = w if p.weight_transposed else w.T  # [N, K]
-            w_arrays_nk.append(w_nk)
+            w_arrays_nk.append(_producer_weight_nk(w, p))
         importance = compute_importance(chain, w_arrays_nk)
         if group > 1:
             # One independent top-k per block -- see _chain_group and this
@@ -6846,11 +7132,7 @@ def _apply_chains_global(
         w_arrays_nk = []
         for p in chain.producers:
             w = _to_f64(initializer_map[p.weight])
-            if p.is_conv:
-                w_nk = w.reshape(w.shape[0], -1)
-            else:
-                w_nk = w if p.weight_transposed else w.T
-            w_arrays_nk.append(w_nk)
+            w_arrays_nk.append(_producer_weight_nk(w, p))
         importance = compute_importance(chain, w_arrays_nk)
 
         admitted.append(
@@ -6932,18 +7214,35 @@ def apply_structured_pruning(
     the two layers' composition mathematically unaffected for every
     surviving channel.
 
-    The same cut applies to 2-D ``Conv`` producer -> consumer pairs -- each
-    output filter's whole ``[in_channels/group, kH, kW]`` kernel ranked by
-    its own L2 norm, exactly Li et al.'s original filter-pruning criterion
-    -- joined by unary activations and/or depthwise Conv hops (``group ==
-    in_channels == out_channels``: one filter per channel, no cross-channel
-    mixing, so it's crossed transparently -- its own weight/bias sliced by
-    the producer's channel indices and its ``group`` attribute shrunk to
-    match, but it contributes no importance of its own and can't itself be
-    the producer or consumer -- see this module's own docstring). No
-    per-channel Add/Mul between two Convs (a Conv already carries its own
-    bias, and ``BatchNormalization`` is expected to already be fused into
-    the preceding Conv by the time this pass runs).
+    The same cut applies to ``Conv`` producer -> consumer pairs -- any
+    spatial rank (1-D/2-D/3-D alike, i.e. any ``[in_channels/group, k1, ...,
+    kn]`` kernel, not just 2-D's ``[in_channels/group, kH, kW]`` -- see
+    :func:`_match_conv_producer`'s own docstring): each output filter's
+    whole kernel ranked by its own L2 norm, exactly Li et al.'s original
+    filter-pruning criterion -- joined by unary activations and/or
+    depthwise Conv hops (``group == in_channels == out_channels``: one
+    filter per channel, no cross-channel mixing, so it's crossed
+    transparently -- its own weight/bias sliced by the producer's channel
+    indices and its ``group`` attribute shrunk to match, but it contributes
+    no importance of its own and can't itself be the producer or consumer
+    -- see this module's own docstring). No per-channel Add/Mul between two
+    Convs (a Conv already carries its own bias, and ``BatchNormalization``
+    is expected to already be fused into the preceding Conv by the time
+    this pass runs).
+
+    ``ConvTranspose`` is also matched, as a producer and/or an ordinary
+    (single, non-residual/Concat) consumer -- its own weight layout is the
+    *reverse* of ``Conv``'s (``[in_channels, out_channels/group, k1, ...,
+    kn]``, confirmed live via ``onnx.defs.get_schema("ConvTranspose")``), so
+    its own output channels are pruned off axis 1 (as a producer) and its
+    own input channels off axis 0 (as a consumer, correct for any `group`)
+    -- see :func:`_match_conv_transpose_producer`/
+    :func:`_match_conv_transpose_consumer`'s own docstrings for the full
+    reasoning, including why a *grouped* ``ConvTranspose`` producer is
+    deliberately left declined (a scope decision, not an oversight), and
+    why ``ConvTranspose`` stays out of scope for a residual/merge group's
+    own fan-out branches and a ``Concat``-merged group's own consumer for
+    now.
 
     A *general* grouped Conv (``group`` neither 1 nor its channel count) is
     also matched, as a producer and/or a consumer, ranking/pruning each of
@@ -11014,6 +11313,634 @@ def apply_moe_whole_expert_pruning(
     return out
 
 
+# --- Transformer block (depth) pruning --------------------------------------
+#
+# Every technique above prunes *within* a layer -- channels, heads, experts,
+# individual weight entries -- never whether a whole residual sub-block
+# (an entire ``x = x + SelfAttn(LN(x))`` or ``x = x + MLP(LN(x))``) is worth
+# keeping at all. That is a different axis of the literature entirely --
+# "depth pruning"/LayerDrop (Fan et al., 2019)/ShortGPT (Men et al., 2024)/
+# Sheared-LLaMA (Xia et al., 2023)/ShortenedLLaMA (Kim et al., 2024): drop
+# whole transformer sub-blocks wholesale, rather than shrinking every block
+# a little. Unlike everything above, this changes the graph's own
+# *topology* -- nodes are deleted and edges rewired, not just tensors
+# resized in place -- so it is held to an extra bar of caution the rest of
+# this module doesn't need: a candidate is identified, safety-checked, and
+# *independently* shape-verified before a single node is ever touched, and
+# an entire candidate is declined outright the moment any one of its own
+# checks doesn't hold -- never partially applied.
+#
+# The canonical pattern (pre-norm, the standard shape for every current
+# transformer family): ``x_out = Add(x_in, F_out)``, where `F_out` is
+# `F`'s own final node's output (`F` -- self-attention or an MLP/FFN --
+# fed by ``LN(x_in)``, `LN` one of `LayerNormalization` (plain ONNX,
+# opset 17+), `RMSNormalization` (plain ONNX, opset 23+), or
+# `SimplifiedLayerNormalization` (onnxruntime's own RMSNorm-equivalent --
+# confirmed, empirically, against a real onnxruntime CPU session, to only
+# actually register under the *default* (empty/``""``) domain despite
+# living in onnxruntime's own contrib-op source tree, not under
+# ``com.microsoft`` the way `SkipLayerNormalization`/
+# `SkipSimplifiedLayerNormalization` do -- see :func:`_is_entry_ln_node`).
+# Dropping the block means: every consumer of `x_out` (including a graph
+# output) instead reads `x_in` directly, and every node strictly between
+# `x_in` and `x_out` -- `LN`, every one of `F`'s own internal nodes, and the
+# merge `Add` itself -- is deleted, provided none of them has any consumer
+# outside the block. See :func:`_try_resolve_droppable_block` for the exact
+# backward graph walk and every one of its own decline conditions.
+#
+# Two scope decisions, each investigated against this module's own existing
+# residual machinery and this environment's real onnxruntime schemas rather
+# than assumed, and each worth stating plainly:
+#
+# 1. Both the merge point *and* the entry norm matched here are the
+#    unfused shapes only: the merge is *only* a bare `Add`
+#    (:func:`_is_eligible_add_merge`, reused unchanged from the residual
+#    *channel*-pruning machinery above -- exactly the same "two distinct,
+#    non-constant operands" eligibility bar), and `LN` is only a plain,
+#    single-input `LayerNormalization`/`RMSNormalization`/
+#    `SimplifiedLayerNormalization` node (:func:`_is_entry_ln_node`) --
+#    never a fused `SkipLayerNormalization`/`SkipSimplifiedLayerNormalization`
+#    node in *either* role, the way :func:`_match_matmul_residual_merge`
+#    accepts it as the merge for channel pruning. That is a deliberate,
+#    real narrowing versus this module's own existing residual machinery,
+#    not an oversight, and it costs real coverage on a model that has
+#    actually been run through onnxruntime's transformer optimizer (which
+#    fuses nearly every residual `Add` immediately followed by a
+#    `LayerNorm` into exactly this fused node) -- worth being honest about
+#    rather than glossing over:
+#
+#    - As the merge, a `SkipLayerNormalization`-family node's own
+#      *primary* output is always the *normalized* sum (`LN(x_in +
+#      F_out)`), never the raw sum -- so it can never stand in for `x_out`
+#      the way a bare `Add`'s output can (there is no tensor this pass
+#      could safely repoint every consumer to that is both already
+#      present in the graph *and* means "`x_in`, unnormalized" the way a
+#      bare `Add`'s own `x_in` operand already, directly, does).
+#    - As the entry norm, `LN(x_in)` is only recognized when `x_in` is
+#      *literally* some node's own single data input
+#      (:func:`_is_entry_ln_node`'s own `node.input[0] == x_in` check) --
+#      exactly what a plain `LayerNormalization`/`RMSNormalization`/
+#      `SimplifiedLayerNormalization` node's own first input already is,
+#      but *not* what a `SkipLayerNormalization`-family node's own first
+#      input is: that node normalizes `input + skip`, a *sum* of two
+#      separate tensors, and the block's own true `x_in` (the previous
+#      block's own raw, unnormalized residual value) only exists as a
+#      *named* tensor at all when that sum is separately materialized as
+#      the node's own optional fourth output, `input_skip_bias_sum` --
+#      which onnxruntime's optimizer only ever emits when something
+#      downstream actually still needs it, not unconditionally. Matching
+#      this shape too is a real, tractable extension (recognize
+#      `node.output[3]`, when present, as an *alternative* `x_in` source
+#      for a `SkipLayerNormalization`-family node feeding `F`), but it is
+#      a genuinely different check from the single-input-only one
+#      :func:`_is_entry_ln_node` performs today, not a free extension of
+#      it -- left out of this initial version's scope rather than rushed
+#      in, so it is not implemented here.
+#
+#    A raw, not-yet-optimizer-fused export (the common case for a model
+#    straight out of a training framework's own ONNX exporter) still
+#    matches fully -- it has no `SkipLayerNormalization` nodes to begin
+#    with, only plain `Add`/`LayerNormalization`-family nodes throughout.
+# 2. Attention and MLP/FFN blocks are matched -- and dropped -- fully
+#    independently of each other, never only as a paired "whole
+#    transformer layer". Nothing in the graph structure requires pairing:
+#    each block is its own self-contained ``x_out = x_in + F(LN(x_in))``
+#    unit with its own merge point, and the backward walk below never
+#    needs to know or care whether `F` is self-attention, an MLP, or
+#    anything else -- it only ever asks "does everything between this
+#    `Add` and its own `LN(x_in)` stay wholly inside the block". Forcing
+#    pairing would need extra machinery (recognizing which attention
+#    block's own `x_out` feeds which MLP block's own `x_in`, and declining
+#    otherwise) to enforce a constraint the safety argument itself never
+#    needed -- narrower for no safety benefit, so it is not done.
+#
+# KV-cache-bearing attention blocks need no special-case handling, and are
+# never separately detected by name/shape -- they decline themselves for
+# free, via the same generic "no block-internal node's own output may be
+# read outside the block, or be a graph output" check every candidate is
+# already held to (see :func:`_try_resolve_droppable_block`): a real
+# `past_key`/`past_value`-consuming attention op invariably exposes its own
+# `present_key`/`present_value` as a *second* graph output on the very same
+# node that reads `LN(x_in)` -- a block-internal node's own extra output
+# read nowhere else in the block, tripping that check outright. No
+# `layer_idx`-attribute renumbering or cache-input/output splicing is
+# needed because no such block is ever accepted as droppable in the first
+# place, not because it is handled -- a case honestly declined, not one
+# quietly made to work.
+#
+# Selection uses this module's own established calibration-probe
+# infrastructure (:func:`_add_probe_outputs`, reused unchanged, the same
+# way :func:`apply_wanda_pruning`/:func:`apply_moe_whole_expert_pruning`
+# already do) to capture each candidate's own `x_in`/`x_out` over real
+# calibration data, then ranks by mean cosine similarity between the two --
+# the literature-standard depth-pruning signal (ShortGPT's own "Block
+# Influence" metric is exactly ``1 - cosine_similarity(x_in, x_out)``
+# averaged per token; this uses the same quantity, just not inverted, so
+# higher means more redundant): a block whose own output is nearly
+# *identical* to its input, over real data the model is meant to run on,
+# contributes almost nothing beyond the identity function and is the
+# safest to drop first. This is deliberately not a weight-magnitude
+# metric -- unlike a single MatMul/Conv layer's own weight row, a whole
+# nonlinear sub-network's importance has no meaningful summary in its own
+# weights alone, only in what it actually *does* to real activations. See
+# :func:`_transformer_block_similarity` for the exact per-token reduction.
+
+
+_ENTRY_LN_OPS = (
+    "LayerNormalization",
+    "RMSNormalization",
+    "SimplifiedLayerNormalization",
+)
+
+
+def _is_entry_ln_node(node: onnx.NodeProto, x_in: str) -> bool:
+    """True if `node` is one of :data:`_ENTRY_LN_OPS` (all three confirmed,
+    empirically, to run under the default/empty ONNX domain, not
+    ``com.microsoft`` -- see this section's own comment above) applied
+    directly to `x_in` -- exactly the `LN(x_in)` boundary
+    :func:`_try_resolve_droppable_block`'s own backward walk stops at.
+    """
+    return (
+        node.domain == ""
+        and node.op_type in _ENTRY_LN_OPS
+        and len(node.input) >= 1
+        and node.input[0] == x_in
+    )
+
+
+@dataclass(frozen=True)
+class _DroppableBlock:
+    merge_node: onnx.NodeProto
+    x_in: str
+    x_out: str
+    # Every node strictly between `x_in` and `x_out` -- `LN`, every one of
+    # `F`'s own internal nodes, and `merge_node` itself -- already confirmed
+    # to have no consumer outside this set (see
+    # :func:`_try_resolve_droppable_block`). Deleting exactly this set and
+    # rewiring every `x_out` consumer to `x_in` is the whole graph-surgery
+    # operation :func:`_apply_transformer_block_pruning` performs.
+    block_nodes: Tuple[onnx.NodeProto, ...]
+
+
+def _try_resolve_droppable_block(
+    merge_node: onnx.NodeProto,
+    x_in: str,
+    other: str,
+    node_by_output: Dict[str, onnx.NodeProto],
+    consumers_of: Dict[str, List[onnx.NodeProto]],
+    graph_outputs: Set[str],
+) -> Optional[_DroppableBlock]:
+    """Attempts to resolve `merge_node` (an eligible `Add`,
+    :func:`_is_eligible_add_merge`) as a droppable block boundary with
+    `x_in` as its own identity/entry operand and `other` (`merge_node`'s
+    *other* operand) as `F`'s own final output -- `None` if any of the
+    following isn't confirmed, exactly the module's own "decline outright,
+    never guess" bar:
+
+    - Walking backward from `other` (through every node's own inputs, in
+      the ordinary graph-dependency sense -- no special-cased op set,
+      unlike every chain walk elsewhere in this module, since nothing here
+      needs to recognize any *particular* shape of `F`, only that
+      everything inside it stays inside it) must reach `x_in` *only* via
+      one or more :func:`_is_entry_ln_node` boundaries (`LN(x_in)`,
+      not recursed past) -- reaching `x_in` directly, bypassing every such
+      boundary, means `F` reads `x_in` raw rather than only its own norm,
+      not the pattern this pass targets, and declines the whole candidate;
+      finding *no* such boundary at all (`F`'s own backward walk never
+      touches `x_in`) declines it the same way -- some other tensor
+      entirely feeds the merge's `other` operand, not `F(LN(x_in))`.
+    - Every node the walk collects (the block's own interior, plus
+      `merge_node` itself) must have every one of its own output tensors
+      read by nothing outside that same set, and never be a graph output
+      -- except `merge_node`'s own primary output (`x_out`), which is
+      *expected* to have outside consumers: that is exactly what gets
+      rewired to `x_in`. A KV-cache-bearing attention op's own
+      `present_key`/`present_value` output, or any other tensor the block
+      computes and something else in the graph still needs, trips this
+      and declines the block -- see this section's own comment above for
+      why this one general check is also exactly what makes a
+      KV-cache-bearing block decline itself, with no dedicated detection.
+
+    A graph input reached mid-walk (an attention mask, position ids, a
+    KV-cache input, or any other tensor `F` reads that isn't produced by
+    any node) is not itself a problem -- it simply terminates that branch
+    of the walk, contributing nothing to the block's own interior node set
+    (there is no producer node to collect). Only an actual node whose own
+    output leaks outside the block is a decline condition.
+    """
+    block_node_ids: Set[int] = {id(merge_node)}
+    block_nodes: List[onnx.NodeProto] = [merge_node]
+    found_entry_ln = False
+    visited: Set[str] = set()
+    frontier: List[str] = [other]
+    while frontier:
+        t = frontier.pop()
+        if t in visited:
+            continue
+        visited.add(t)
+        if t == x_in:
+            return None  # F reads x_in raw, bypassing every LN boundary
+        node = node_by_output.get(t)
+        if node is None:
+            continue  # graph input or initializer -- a leaf, not a problem
+        if _is_entry_ln_node(node, x_in):
+            found_entry_ln = True
+            if id(node) not in block_node_ids:
+                block_node_ids.add(id(node))
+                block_nodes.append(node)
+            continue  # boundary -- LN's own input (x_in) is not recursed into
+        if id(node) not in block_node_ids:
+            block_node_ids.add(id(node))
+            block_nodes.append(node)
+        for inp in node.input:
+            if inp:
+                frontier.append(inp)
+    if not found_entry_ln:
+        return None
+
+    x_out = merge_node.output[0]
+    for node in block_nodes:
+        for out_name in node.output:
+            if not out_name:
+                continue
+            if node is merge_node and out_name == x_out:
+                continue  # x_out itself -- every consumer gets rewired below
+            if out_name in graph_outputs:
+                return None
+            if any(id(c) not in block_node_ids for c in consumers_of.get(out_name, ())):
+                return None
+
+    return _DroppableBlock(
+        merge_node=merge_node, x_in=x_in, x_out=x_out, block_nodes=tuple(block_nodes)
+    )
+
+
+def _tensor_shape_dims(
+    name: str, value_info_by_name: Dict[str, onnx.ValueInfoProto]
+) -> Optional[Tuple[Union[int, str], ...]]:
+    """The tensor's own fully-known shape -- one entry per dimension, each
+    either a concrete `dim_value` or a named `dim_param` -- or `None` if
+    the graph's own annotations don't state every dimension (rank not
+    statically known, or any one dimension neither a fixed value nor a
+    named symbolic one). Unlike :func:`_tensor_rank`'s own deliberately
+    inference-free design elsewhere in this module (a low-stakes heuristic
+    that only ever *narrows* which `Concat` axis is accepted, never *what*
+    gets pruned), :func:`_shapes_match`'s own correctness -- whether
+    replacing `x_out` with `x_in` is shape-safe at all -- depends on this
+    being right, so its caller runs real `onnx.shape_inference` first (see
+    :func:`apply_transformer_block_pruning`) to populate as much of
+    `value_info_by_name` as it safely can before this ever gets called,
+    rather than relying only on whatever the graph already happened to
+    declare.
+    """
+    vi = value_info_by_name.get(name)
+    if vi is None or not vi.type.HasField("tensor_type"):
+        return None
+    tensor_type = vi.type.tensor_type
+    if not tensor_type.HasField("shape"):
+        return None
+    dims: List[Union[int, str]] = []
+    for d in tensor_type.shape.dim:
+        if d.HasField("dim_value"):
+            dims.append(d.dim_value)
+        elif d.HasField("dim_param") and d.dim_param:
+            dims.append(d.dim_param)
+        else:
+            return None
+    return tuple(dims)
+
+
+def _shapes_match(
+    a: str, b: str, value_info_by_name: Dict[str, onnx.ValueInfoProto]
+) -> bool:
+    """True only when both `a` and `b` have a fully-known shape
+    (:func:`_tensor_shape_dims`) and the two are identical, dimension for
+    dimension. This is what actually guards against `merge_node`'s own
+    `Add` having silently broadcast `x_in` up to a wider `x_out` -- the one
+    way replacing every `x_out` consumer with `x_in` directly could change
+    a downstream shape rather than simply removing a redundant
+    computation. An unknown shape on either side declines rather than
+    assumes equality, the same bar every other safety check in this
+    section holds to.
+    """
+    dims_a = _tensor_shape_dims(a, value_info_by_name)
+    dims_b = _tensor_shape_dims(b, value_info_by_name)
+    return dims_a is not None and dims_a == dims_b
+
+
+def _find_transformer_block_candidates(
+    graph: onnx.GraphProto,
+    value_info_by_name: Dict[str, onnx.ValueInfoProto],
+) -> List[_DroppableBlock]:
+    """Every droppable-block candidate in `graph`: one per eligible `Add`
+    merge (:func:`_is_eligible_add_merge`) that :func:`_try_resolve_droppable_block`
+    confirms for exactly one operand ordering (a DAG can never confirm
+    both -- confirming operand `p` as `x_in` requires `q` to be backward-
+    reachable from it, and vice versa, which is impossible for both
+    directions on an acyclic graph at once, so this never needs a tie-break
+    between the two), and whose `x_in`/`x_out` shapes
+    :func:`_shapes_match` independently confirms identical.
+    """
+    initializer_map = {t.name: t for t in graph.initializer}
+    node_by_output: Dict[str, onnx.NodeProto] = {}
+    for node in graph.node:
+        for out_name in node.output:
+            if out_name:
+                node_by_output[out_name] = node
+    consumers_of = _consumers_of(graph)
+    graph_outputs = {o.name for o in graph.output}
+
+    candidates: List[_DroppableBlock] = []
+    for node in graph.node:
+        if not _is_eligible_add_merge(node, initializer_map):
+            continue
+        p, q = node.input[0], node.input[1]
+        for x_in, other in ((p, q), (q, p)):
+            block = _try_resolve_droppable_block(
+                node, x_in, other, node_by_output, consumers_of, graph_outputs
+            )
+            if block is not None:
+                if _shapes_match(block.x_in, block.x_out, value_info_by_name):
+                    candidates.append(block)
+                break
+    return candidates
+
+
+def _transformer_block_similarity(
+    out: onnx.ModelProto,
+    candidates: Sequence[_DroppableBlock],
+    calibration_data: Sequence[Tensors],
+    providers: Optional[Sequence[str]],
+) -> Dict[int, float]:
+    """Mean cosine similarity between each candidate's own `x_in` and
+    `x_out`, over every token of every calibration batch -- the ranking
+    signal :func:`apply_transformer_block_pruning` drops the *highest*-
+    scoring (most redundant -- `x_out` nearly identical to `x_in` already,
+    over real data) candidates by. See this section's own comment above
+    for why this, not a weight-magnitude metric, is this pass's own
+    importance signal.
+
+    Both tensors are probed in one shared `onnxruntime` pass (reusing
+    :func:`_add_probe_outputs`), reshaped to `[-1, hidden]` (mirroring
+    every other calibration reduction in this module -- e.g.
+    :func:`apply_wanda_pruning`'s own `Attention` statistic, or
+    `apply_sparsegpt_pruning`'s own `x.reshape(-1, x.shape[-1])`) so this
+    works regardless of the model's own batch/sequence-axis layout, cast
+    to float64 the same way every calibration statistic in this module
+    already is (real activations, not the model's own possibly-narrower
+    declared dtype). A token whose own `x_in` or `x_out` norm is (numerically)
+    zero is skipped for that token rather than dividing by (near-)zero -- a
+    candidate with no valid token across all of `calibration_data` returns
+    ``float("-inf")`` (never the most-redundant pick; there is no evidence
+    either way, so it is conservatively kept rather than guessed to be
+    droppable).
+    """
+    keyed = list(enumerate(candidates))
+    probe_names = sorted({name for _, c in keyed for name in (c.x_in, c.x_out)})
+    if not probe_names:
+        return {}
+    probe_model = _add_probe_outputs(out, probe_names)
+
+    sim_sum: Dict[int, float] = {}
+    sim_count: Dict[int, int] = {}
+    for batch in calibration_data:
+        result = backend.run_model(probe_model, batch, providers=providers)
+        for idx, c in keyed:
+            x_in = np.asarray(result[c.x_in], dtype=np.float64)
+            x_out = np.asarray(result[c.x_out], dtype=np.float64)
+            if x_in.shape != x_out.shape or x_in.ndim == 0 or x_in.shape[-1] == 0:
+                continue
+            a = x_in.reshape(-1, x_in.shape[-1])
+            b = x_out.reshape(-1, x_out.shape[-1])
+            norm_a = np.linalg.norm(a, axis=-1)
+            norm_b = np.linalg.norm(b, axis=-1)
+            denom = norm_a * norm_b
+            valid = denom > 1e-12
+            if not np.any(valid):
+                continue
+            cos = np.sum(a[valid] * b[valid], axis=-1) / denom[valid]
+            sim_sum[idx] = sim_sum.get(idx, 0.0) + float(np.sum(cos))
+            sim_count[idx] = sim_count.get(idx, 0) + int(np.sum(valid))
+
+    return {
+        idx: (sim_sum[idx] / sim_count[idx]) if sim_count.get(idx) else float("-inf")
+        for idx in range(len(candidates))
+    }
+
+
+def _apply_transformer_block_pruning(
+    graph: onnx.GraphProto, ranked: Sequence[_DroppableBlock], target: int
+) -> int:
+    """Greedily commits `ranked` (already sorted most- to least-redundant)
+    in order, skipping any candidate whose own `block_nodes` overlaps an
+    already-committed one's (a candidate whose own backward walk happened
+    to reach into another candidate's own interior -- unusual, but not
+    impossible in principle -- can only ever have *one* of the two safely
+    dropped), until `target` blocks are committed or `ranked` is
+    exhausted, then applies every commit at once. Returns the number of
+    blocks actually dropped.
+
+    Each commit rewrites every current reference to its own `x_out` --
+    every node's own input, in place, plus (via a small inserted
+    `Identity` node, so the model's own declared output name never
+    changes) any graph output -- to its own `x_in`, *resolved* through
+    every earlier commit's own alias first (`resolve`, below): a chain of
+    two directly-adjacent committed blocks (the second's own `x_in` being
+    the first's own `x_out`) needs this regardless of commit order --
+    committing the *upstream* block first leaves the downstream block's
+    own recorded `x_in` referring to a name nothing produces anymore (the
+    upstream block's own now-deleted merge node's output), so its own
+    rewrite target has to be resolved through the upstream commit's own
+    alias rather than used as recorded; committing the *downstream* block
+    first instead leaves a stale reference (its own inserted `Identity`,
+    or its own entry `LN`, if the block itself doesn't survive to
+    deletion first) for the upstream commit's own plain graph-wide
+    node-input rewrite to catch and correct directly, no resolution
+    needed for that direction. `resolve` handles both by construction,
+    with no dependency on which order `committed` happens to process
+    them in. Every one of a committed block's own `block_nodes` is then
+    deleted in one final pass, preserving every surviving node's own
+    relative order -- already topologically valid before deletion, and
+    deleting nodes (never reordering or inserting anything ahead of what
+    it depends on) can't break that.
+    """
+    committed: List[_DroppableBlock] = []
+    committed_ids: Set[int] = set()
+    for block in ranked:
+        if len(committed) >= target:
+            break
+        ids = {id(n) for n in block.block_nodes}
+        if ids & committed_ids:
+            continue
+        committed.append(block)
+        committed_ids |= ids
+
+    alias: Dict[str, str] = {}
+
+    def resolve(name: str) -> str:
+        seen: Set[str] = set()
+        while name in alias and name not in seen:
+            seen.add(name)
+            name = alias[name]
+        return name
+
+    for block in committed:
+        target_name = resolve(block.x_in)
+        for node in graph.node:
+            for i, inp in enumerate(node.input):
+                if inp == block.x_out:
+                    node.input[i] = target_name
+        for output in graph.output:
+            if output.name == block.x_out:
+                graph.node.append(
+                    onnx.helper.make_node(
+                        "Identity",
+                        [target_name],
+                        [block.x_out],
+                        name=f"{block.x_out}/transformer_block_pruning_identity",
+                    )
+                )
+        alias[block.x_out] = target_name
+
+    if committed_ids:
+        kept_nodes = [n for n in graph.node if id(n) not in committed_ids]
+        del graph.node[:]
+        graph.node.extend(kept_nodes)
+        removed_names = {
+            out_name
+            for block in committed
+            for n in block.block_nodes
+            for out_name in n.output
+            if out_name
+        }
+        kept_value_info = [
+            vi for vi in graph.value_info if vi.name not in removed_names
+        ]
+        del graph.value_info[:]
+        graph.value_info.extend(kept_value_info)
+
+    return len(committed)
+
+
+def apply_transformer_block_pruning(
+    model: Union[str, onnx.ModelProto],
+    calibration_data: Optional[Sequence[Tensors]] = None,
+    num_samples: int = 8,
+    seed: int = 0,
+    sparsity: float = 0.25,
+    num_blocks_to_drop: Optional[int] = None,
+    providers: Optional[Sequence[str]] = None,
+) -> onnx.ModelProto:
+    """Depth/block-level pruning: drops whole redundant pre-norm
+    transformer residual sub-blocks (``x = x + SelfAttn(LN(x))`` or
+    ``x = x + MLP(LN(x))``) wholesale, rather than shrinking every block a
+    little the way every other `apply_*` function in this module does --
+    see this section's own comment above for the exact pattern matched,
+    the two scope decisions this narrows to (bare-`Add` merges and a
+    plain, unfused entry norm only -- a `SkipLayerNormalization`-family
+    node is not recognized in either role, so a model already run through
+    onnxruntime's own transformer optimizer needs its own follow-up
+    coverage this initial version doesn't take on; attention and MLP/FFN
+    blocks matched and dropped fully independently, never only as a
+    "whole layer" pair) and why a KV-cache-bearing attention block needs
+    no dedicated handling to always decline safely on its own.
+
+    Every candidate is found by :func:`_find_transformer_block_candidates`
+    and confirmed shape-safe (:func:`_shapes_match`, using real
+    `onnx.shape_inference` output, not just whatever `value_info` `model`
+    already happened to carry) before ranking ever runs. Candidates are
+    ranked by mean cosine similarity between their own `x_in` and `x_out`
+    over `calibration_data` (:func:`_transformer_block_similarity`) --
+    the literature-standard ("Block Influence"/ShortGPT-style)
+    redundancy signal: a block whose output is already nearly identical to
+    its input, over data the model is meant to actually run on, changes
+    almost nothing and is safest to drop -- and the highest-similarity
+    ones are dropped first, up to the target count, skipping (not
+    failing) any candidate whose own interior overlaps an
+    already-committed one's (see :func:`_apply_transformer_block_pruning`'s
+    own docstring for why this can happen and why skipping, not declining
+    the whole call, is the right response).
+
+    :param model: the original onnx ModelProto or file path
+    :param calibration_data: representative input batches to measure each
+            candidate block's own input/output similarity on. Each batch
+            is a ``{input_name: np.ndarray}`` dict matching ``model``'s
+            graph inputs -- see :func:`onnxsim.generate_random_calibration_data`
+            (the default when omitted)
+    :param num_samples: random batches to generate when
+            ``calibration_data`` is omitted
+    :param seed: seed for the random calibration data (ignored if
+            ``calibration_data`` is supplied)
+    :param sparsity: fraction of *matched candidate* blocks to drop
+            (rounded to the nearest whole block), ignored when
+            ``num_blocks_to_drop`` is given. Note this is a fraction of
+            however many blocks this pass actually matched, not of the
+            model's total layer count -- the same "fraction of what was
+            actually found eligible" meaning
+            :func:`apply_moe_whole_expert_pruning`'s own `sparsity` already
+            has for experts.
+    :param num_blocks_to_drop: an explicit number of blocks to drop
+            instead of a fraction, silently capped at however many
+            candidates were actually matched
+    :param providers: onnxruntime execution providers to run ``model`` on
+            when capturing calibration activations
+    :returns: ``model`` with the target number of matched candidate blocks
+            -- whichever ones ranked most redundant -- deleted and their
+            own consumers rewired to read straight through to their own
+            block's own input; unchanged (a byte-for-byte copy) if no
+            candidate was matched, ``sparsity``/``num_blocks_to_drop``
+            rounds to zero blocks, or ``calibration_data`` never gives any
+            candidate a valid (non-degenerate) token to rank on
+    """
+    if num_blocks_to_drop is not None:
+        if num_blocks_to_drop < 0:
+            raise ValueError(
+                f"num_blocks_to_drop must be >= 0, got {num_blocks_to_drop}"
+            )
+    elif not (0.0 <= sparsity <= 1.0):
+        raise ValueError(f"sparsity must be in [0, 1], got {sparsity}")
+
+    if isinstance(model, str):
+        model = onnx.load(model, load_external_data=False)
+    if calibration_data is None:
+        calibration_data = generate_random_calibration_data(
+            model, num_samples=num_samples, seed=seed
+        )
+
+    out = onnx.ModelProto()
+    out.CopyFrom(model)
+    graph = out.graph
+
+    try:
+        inferred = onnx.shape_inference.infer_shapes(out, strict_mode=False)
+        value_info_by_name = _value_info_by_name(inferred.graph)
+    except Exception:
+        value_info_by_name = _value_info_by_name(graph)
+
+    candidates = _find_transformer_block_candidates(graph, value_info_by_name)
+    if not candidates:
+        return out
+
+    if num_blocks_to_drop is not None:
+        target = min(num_blocks_to_drop, len(candidates))
+    else:
+        target = int(round(sparsity * len(candidates)))
+    if target <= 0:
+        return out
+
+    similarity = _transformer_block_similarity(
+        out, candidates, calibration_data, providers
+    )
+    ranked = [
+        c
+        for _, c in sorted(
+            enumerate(candidates), key=lambda item: similarity[item[0]], reverse=True
+        )
+    ]
+    _apply_transformer_block_pruning(graph, ranked, target)
+    return out
+
+
 # --- Dry-run pruning sensitivity analysis ---------------------------------
 #
 # Every `apply_*_pruning` function above has to actually commit to one
@@ -11651,11 +12578,7 @@ def _analyze_chains(
                 w = onnx.numpy_helper.to_array(initializer_map[p.weight]).astype(
                     np.float64
                 )
-                if p.is_conv:
-                    w_nk = w.reshape(w.shape[0], -1)
-                else:
-                    w_nk = w if p.weight_transposed else w.T
-                w_arrays_nk.append(w_nk)
+                w_arrays_nk.append(_producer_weight_nk(w, p))
             importance = compute_importance(chain, w_arrays_nk)
 
             if group > 1:

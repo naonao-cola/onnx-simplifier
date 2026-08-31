@@ -6,12 +6,14 @@ already have.
 
 Covers the GGML "K-quant" block formats (Q8_0, Q4_K, Q5_K, Q6_K) real
 quantized checkpoints (e.g. Unsloth's GGUF exports) actually use for the
-bulk of their weights: this module writes real, byte-accurate GGUF v3 files
-containing hand-encoded K-quant blocks with known values, computing each
-expected dequantized float independently (a from-scratch transcription of
-GGML's published block layout/dequant formula, not a reuse of the C++
-decoder under test -- see ggml_kquant.h) and checking onnxsim's decoded
-result against it.
+bulk of their weights, plus MXFP4 (the OCP Microscaling FP4 format official
+gpt-oss GGUF releases use natively for their MoE expert weights): this
+module writes real, byte-accurate GGUF v3 files containing hand-encoded
+blocks with known values, computing each expected dequantized float
+independently (a from-scratch transcription of GGML's published block
+layout/dequant formula, not a reuse of the C++ decoder under test -- see
+ggml_kquant.h/ggml_mxfp4.h) and checking onnxsim's decoded result against
+it.
 """
 
 import struct
@@ -32,6 +34,7 @@ GGML_TYPE_Q8_0 = 8
 GGML_TYPE_Q4_K = 12
 GGML_TYPE_Q5_K = 13
 GGML_TYPE_Q6_K = 14
+GGML_TYPE_MXFP4 = 39
 GGML_TYPE_Q4_0 = 2  # legacy family onnxsim does NOT decode -- must be skipped
 
 
@@ -127,6 +130,36 @@ def _make_q4_k_block(rng):
     return raw, expected
 
 
+# GGML's kvalues_fp4/kvalues_mxfp4 table (e2m1-style magnitudes, doubled):
+# code 0-7 are the non-negative magnitudes {0, 0.5, 1, 1.5, 2, 3, 4, 6} times
+# 2, codes 8-15 their negated counterparts -- transcribed directly from the
+# OCP Microscaling FP4 spec table GGML itself uses (ggml-common.h's
+# kvalues_fp4), same as onnxsim/ggml_mxfp4.h's kMxfp4Values.
+_MXFP4_VALUES = [0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12]
+
+
+def _e8m0_to_f32_half(e):
+    # Independent (pure floating-point, not bit-pattern-construction like
+    # ggml_mxfp4.h's GgmlE8m0ToFloat32Half) computation of the same value:
+    # an E8M0 byte `e` nominally encodes 2**(e-127), and GGML's own
+    # ggml_e8m0_to_fp32_half halves that (since _MXFP4_VALUES above is
+    # already doubled) -- 2**(e-128).
+    return 2.0 ** (e - 128)
+
+
+def _make_mxfp4_block(rng):
+    # One 32-element MXFP4 block: 1 byte E8M0 exponent + 16 bytes of packed
+    # 4-bit codes, element i and i+16 sharing byte i's low/high nibble (NOT
+    # the consecutive-pair packing K-quant uses).
+    e = int(rng.integers(0, 255))  # 255 is GGML's only NaN encoding
+    codes = [int(rng.integers(0, 16)) for _ in range(32)]
+    qs = bytes((codes[i] & 0xF) | ((codes[i + 16] & 0xF) << 4) for i in range(16))
+    raw = struct.pack("<B", e) + qs
+    d = _e8m0_to_f32_half(e)
+    expected = [_MXFP4_VALUES[c] * d for c in codes]
+    return raw, expected
+
+
 def _model(body, initializer=(), opset=13, ir_version=10):
     model = parser.parse_model(
         f"""
@@ -185,6 +218,22 @@ def test_import_q4_k_weights(tmp_path):
     _write_gguf(gguf_path, [("W", GGML_TYPE_Q4_K, [256], raw)])
 
     model = _identity_model("W", [256])
+    result, skipped = onnxsim.import_gguf_weights(model, gguf_path)
+
+    assert skipped == []
+    w = next(i for i in result.graph.initializer if i.name == "W")
+    assert w.data_type == onnx.TensorProto.FLOAT
+    got = onnx.numpy_helper.to_array(w)
+    np.testing.assert_allclose(got, np.array(expected, dtype=np.float32), rtol=1e-5)
+
+
+def test_import_mxfp4_weights(tmp_path):
+    rng = np.random.default_rng(10)
+    raw, expected = _make_mxfp4_block(rng)
+    gguf_path = str(tmp_path / "model.gguf")
+    _write_gguf(gguf_path, [("W", GGML_TYPE_MXFP4, [32], raw)])
+
+    model = _identity_model("W", [32])
     result, skipped = onnxsim.import_gguf_weights(model, gguf_path)
 
     assert skipped == []

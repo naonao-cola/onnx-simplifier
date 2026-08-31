@@ -211,10 +211,11 @@ class TensorPool {
   // ONNX raw-data equivalent and are never pooled -- LoadGGUF skips and
   // reports them rather than writing garbage. The K-quant family
   // (Q4_K/Q5_K/Q6_K/Q8_0) -- what a real quantized checkpoint (e.g.
-  // Unsloth's GGUF exports) actually uses for the bulk of its weights -- IS
-  // pooled, holding its native, still-packed block bytes (see
-  // gguf_dtype.h's IsKQuant); DequantizeToFloat below decodes an entry like
-  // that to plain float32 values.
+  // Unsloth's GGUF exports) actually uses for the bulk of its weights -- and
+  // MXFP4 (gpt-oss-20b's own native MoE-expert quantization) ARE pooled,
+  // holding their native, still-packed block bytes (see gguf_dtype.h's
+  // IsKQuant/IsMxfp4); DequantizeToFloat below decodes an entry like that to
+  // plain float32 values.
 
   // Write every entry to a GGUF file at `path`. Every dtype TensorPool can
   // hold has a raw ggml_type counterpart (see gguf_dtype.h), so -- unlike
@@ -240,21 +241,22 @@ class TensorPool {
 
   // Replace this pool's contents with every tensor in the GGUF file at
   // `path` whose ggml_type this pool can represent -- either a *raw*,
-  // unquantized type (stored as-is) or one of the four K-quant types
-  // gguf_dtype.h's IsKQuant covers (stored as its native, still-packed
-  // block bytes -- see DequantizeToFloat to decode one). Every other
-  // quantized type (Q4_0, every IQ*_ variant, ...) has no representation
-  // this pool can hold at all. Unlike LoadSafetensors, this does NOT read
-  // the whole file into memory: only the (small) header/metadata/tensor-
-  // info section is read up front, and each *included* tensor's bytes are
-  // read with their own targeted seek + read -- loading a large quantized
-  // checkpoint this way costs only the bytes of the tensors this pool can
-  // actually use, not the whole file. Returns the names of tensors that
-  // were present in the file but skipped because their ggml_type has no
-  // representation this pool can hold (empty if every tensor was loaded).
-  // Throws std::runtime_error on I/O failure, an unrecognized magic/
-  // version, a malformed header, or a K-quant tensor whose element count
-  // is not a multiple of its quantization block size.
+  // unquantized type (stored as-is) or one of the four K-quant types or the
+  // MXFP4 type gguf_dtype.h's IsKQuant/IsMxfp4 cover (stored as its native,
+  // still-packed block bytes -- see DequantizeToFloat to decode one). Every
+  // other quantized type (Q4_0, every IQ*_ variant, ...) has no
+  // representation this pool can hold at all. Unlike LoadSafetensors, this
+  // does NOT read the whole file into memory: only the (small) header/
+  // metadata/tensor-info section is read up front, and each *included*
+  // tensor's bytes are read with their own targeted seek + read -- loading a
+  // large quantized checkpoint this way costs only the bytes of the tensors
+  // this pool can actually use, not the whole file. Returns the names of
+  // tensors that were present in the file but skipped because their
+  // ggml_type has no representation this pool can hold (empty if every
+  // tensor was loaded). Throws std::runtime_error on I/O failure, an
+  // unrecognized magic/version, a malformed header, or a block-quantized
+  // tensor whose element count is not a multiple of its quantization block
+  // size.
   std::vector<std::string> LoadGGUF(const std::string& path);
 
   // Like LoadGGUF, but memory-maps `path` (mmap() on POSIX, MapViewOfFile()
@@ -286,11 +288,11 @@ class TensorPool {
   // Decodes `name`'s entry to plain float32 values, appended to `out` (not
   // cleared first) -- the only way to get usable numeric values out of an
   // entry LoadGGUF/LoadGGUFMmap pooled from a K-quant (Q4_K/Q5_K/Q6_K/Q8_0)
-  // source, since its `data` otherwise holds native, still-packed GGML
-  // block bytes, not per-element values (see gguf_dtype.h's IsKQuant).
-  // Returns false, leaving `out` untouched, if `name` isn't in the pool or
-  // its dtype is not one of those four K-quant codes (including an
-  // ordinary raw dtype, e.g. FLOAT/FLOAT16 -- those need no decoding at
+  // or MXFP4 source, since its `data` otherwise holds native, still-packed
+  // GGML block bytes, not per-element values (see gguf_dtype.h's
+  // IsKQuant/IsMxfp4). Returns false, leaving `out` untouched, if `name`
+  // isn't in the pool or its dtype is not one of those five codes (including
+  // an ordinary raw dtype, e.g. FLOAT/FLOAT16 -- those need no decoding at
   // all; read Entry::data directly, the same way every other TensorPool
   // consumer already does).
   bool DequantizeToFloat(const std::string& name,
