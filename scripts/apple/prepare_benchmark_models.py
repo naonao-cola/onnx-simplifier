@@ -99,18 +99,23 @@ BENCHMARK_MODELS: list[BenchmarkModel] = [
         "Qwen/Qwen2.5-3B-Instruct",
         512,
         "fp16",
-        "Not yet exercised (needs more RAM/disk than a constrained dev sandbox has); "
-        "expected to convert given Qwen2.5-1.5B-Instruct's success -- same architecture, "
-        "more layers.",
+        "Attempted but OOM-killed (~13.9GB anon-rss) during the ONNX export/trace step "
+        "itself, even with --dtype fp16, in a 15GB-RAM dev sandbox -- one tier up from "
+        "Qwen2.5-1.5B-Instruct's ~1.5x smaller weights, which fit comfortably. Not a "
+        "translator issue (never reached Core ML conversion); needs a machine with more "
+        "headroom than that sandbox had. Same architecture as the validated 1.5B model, "
+        "so expected to convert given enough memory.",
     ),
     BenchmarkModel(
         "microsoft/Phi-3.5-mini-instruct",
         512,
         "fp16",
-        "Not yet exercised. Phi-3's fused qkv_proj/gate_up_proj projections (one big "
-        "MatMul + Split, instead of separate q/k/v or gate/up projections) are a "
-        "structurally different graph shape from Llama/Qwen2's separate projections, "
-        "though built from ops (MatMul, Split) this translator already supports.",
+        "Not yet exercised -- at 3.8B params, larger than Qwen2.5-3B-Instruct (which "
+        "already OOM'd during export in a 15GB-RAM sandbox, see its entry above), so "
+        "expected to hit the same memory ceiling there. Phi-3's fused qkv_proj/gate_up_proj "
+        "projections (one big MatMul + Split, instead of separate q/k/v or gate/up "
+        "projections) are a structurally different graph shape from Llama/Qwen2's separate "
+        "projections, though built from ops (MatMul, Split) this translator already supports.",
     ),
     BenchmarkModel(
         "meta-llama/Llama-3.2-1B-Instruct",
