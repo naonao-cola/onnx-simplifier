@@ -3439,6 +3439,379 @@ def test_structured_pruning_conv_chain_with_dilation_matches_oracle_exactly():
     np.testing.assert_allclose(y, y_oracle, rtol=1e-5, atol=1e-5)
 
 
+# --- Conv1d / Conv3d / ConvTranspose structural pruning ------------------
+#
+# _match_conv_producer/_match_conv_consumer/_match_depthwise_conv_pass_through
+# only ever check the matched weight's own *rank* (>= 3: one output-channel
+# axis, one input-channel axis, at least one spatial axis) -- never a
+# fixed spatial rank of 2 -- and every slicing/importance computation they
+# feed (_slice_producer_weight/_slice_consumer_weight/_producer_weight_nk)
+# already only ever touches the channel axis via `...`/`-1`, leaving
+# whatever spatial axes are there alone. So a 1-D Conv (`[out, in, k]`) or
+# a 3-D Conv (`[out, in, kd, kh, kw]`) is matched, sliced, and re-run by
+# exactly the same code path as every 2-D Conv chain test above -- these
+# are regression tests locking that already-general behavior in place, the
+# same bar test_structured_pruning_conv_chain_with_auto_pad_matches_oracle_exactly/
+# test_structured_pruning_conv_chain_with_dilation_matches_oracle_exactly
+# hold for auto_pad/dilations.
+#
+# ConvTranspose support is new machinery, not a side effect of the rank
+# relaxation above: its own weight layout is `[in_channels,
+# out_channels/group, k1, ..., kn]` -- confirmed live via
+# `onnx.defs.get_schema("ConvTranspose")` -- the reverse of Conv's
+# `[out_channels, in_channels/group, ...]`, so a ConvTranspose producer's
+# own output channels live on axis 1 (not axis 0) and a ConvTranspose
+# consumer's own input channels live on axis 0 (not axis 1). Only ordinary
+# (`group == 1`) ConvTranspose is matched as a *producer* (see
+# _match_conv_transpose_producer's own docstring for why grouped stays
+# declined); any `group >= 1` is matched as a *consumer* (see
+# _match_conv_transpose_consumer's own docstring for why that side is safe
+# unconditionally). Both roles are exercised below, each with deliberately
+# distinct channel counts on every axis (`Cin`, `M`, `keep_count` all
+# different) so a channel-role-reversal bug -- slicing axis 0 instead of 1,
+# or vice versa -- would produce a detectably wrong shape (onnxruntime
+# itself would refuse to run the mismatched graph) or wrong numeric values,
+# never a silent no-op.
+
+
+def _conv1d_pair_model(w1, w2, b1=None, spatial=20, activation="Relu"):
+    Cin, C2 = w1.shape[1], w2.shape[0]
+    initializer = [_f32(w1, "W1"), _f32(w2, "W2")]
+    if b1 is not None:
+        conv1 = "h = Conv<kernel_shape=[3]>(X, W1, B1)"
+        initializer.append(_f32(b1, "B1"))
+    else:
+        conv1 = "h = Conv<kernel_shape=[3]>(X, W1)"
+    out_spatial = spatial - 4  # two valid (no-pad) size-3 convs
+    return _model(
+        f"""
+        g (float[N,{Cin},{spatial}] X) => (float[N,{C2},{out_spatial}] Y)
+        {{
+          {conv1}
+          a = {activation}(h)
+          Y = Conv<kernel_shape=[3]>(a, W2)
+        }}
+        """,
+        initializer=initializer,
+    )
+
+
+def test_structured_pruning_conv1d_chain_matches_oracle_exactly():
+    Cin, C1, C2 = 3, 16, 8
+    rng = np.random.default_rng(340)
+    w1 = rng.standard_normal((C1, Cin, 3)).astype(np.float32)
+    b1 = rng.standard_normal((C1,)).astype(np.float32)
+    w2 = rng.standard_normal((C2, C1, 3)).astype(np.float32)
+    model = _conv1d_pair_model(w1, w2, b1=b1)
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    inits = {t.name: t for t in pruned.graph.initializer}
+    assert list(inits["W1"].dims) == [C1 // 2, Cin, 3]
+    assert list(inits["W2"].dims) == [C2, C1 // 2, 3]
+
+    keep = _oracle_keep_indices_conv(w1, C1 // 2)
+    oracle = _conv1d_pair_model(w1[keep], w2[:, keep], b1=b1[keep])
+
+    rng_x = np.random.default_rng(341)
+    x = rng_x.standard_normal((2, Cin, 20)).astype(np.float32)
+    (y,) = _run(pruned, {"X": x})
+    (y_oracle,) = _run(oracle, {"X": x})
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-5, atol=1e-5)
+
+
+def _conv3d_pair_model(w1, w2, spatial=10, activation="Relu"):
+    Cin, C2 = w1.shape[1], w2.shape[0]
+    out_spatial = spatial - 4  # two valid (no-pad) 3x3x3 convs
+    return _model(
+        f"""
+        g (float[N,{Cin},{spatial},{spatial},{spatial}] X)
+            => (float[N,{C2},{out_spatial},{out_spatial},{out_spatial}] Y)
+        {{
+          h = Conv<kernel_shape=[3,3,3]>(X, W1)
+          a = {activation}(h)
+          Y = Conv<kernel_shape=[3,3,3]>(a, W2)
+        }}
+        """,
+        initializer=[_f32(w1, "W1"), _f32(w2, "W2")],
+    )
+
+
+def test_structured_pruning_conv3d_chain_matches_oracle_exactly():
+    Cin, C1, C2 = 2, 8, 4
+    rng = np.random.default_rng(342)
+    w1 = rng.standard_normal((C1, Cin, 3, 3, 3)).astype(np.float32)
+    w2 = rng.standard_normal((C2, C1, 3, 3, 3)).astype(np.float32)
+    model = _conv3d_pair_model(w1, w2)
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    inits = {t.name: t for t in pruned.graph.initializer}
+    assert list(inits["W1"].dims) == [C1 // 2, Cin, 3, 3, 3]
+    assert list(inits["W2"].dims) == [C2, C1 // 2, 3, 3, 3]
+
+    keep = _oracle_keep_indices_conv(w1, C1 // 2)
+    oracle = _conv3d_pair_model(w1[keep], w2[:, keep])
+
+    rng_x = np.random.default_rng(343)
+    x = rng_x.standard_normal((2, Cin, 10, 10, 10)).astype(np.float32)
+    (y,) = _run(pruned, {"X": x})
+    (y_oracle,) = _run(oracle, {"X": x})
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-5, atol=1e-5)
+
+
+def _conv_transpose_then_conv_model(w_ct, w2, spatial=10):
+    # ConvTranspose *producer* -> Conv consumer: w_ct is [Cin, M, kH, kW]
+    # (ConvTranspose's own reversed layout), M -- axis 1 -- is what gets
+    # pruned. w2 is an ordinary Conv's [Cout, M, kH, kW] weight, consuming
+    # M on its own (ordinary) axis 1.
+    Cin = w_ct.shape[0]
+    Cout = w2.shape[0]
+    mid_spatial = spatial + 2  # ConvTranspose, unit stride, valid: in - 1 + k
+    out_spatial = mid_spatial - 2  # following Conv, valid 3x3
+    return _model(
+        f"""
+        g (float[N,{Cin},{spatial},{spatial}] X) => (float[N,{Cout},{out_spatial},{out_spatial}] Y)
+        {{
+          h = ConvTranspose<kernel_shape=[3,3]>(X, WCT)
+          a = Relu(h)
+          Y = Conv<kernel_shape=[3,3]>(a, W2)
+        }}
+        """,
+        initializer=[_f32(w_ct, "WCT"), _f32(w2, "W2")],
+    )
+
+
+def test_structured_pruning_conv_transpose_producer_matches_oracle_exactly():
+    # ConvTranspose acting as a *producer*: its own output channels (M,
+    # axis 1 of its [Cin, M, kH, kW] weight -- the reverse of an ordinary
+    # Conv producer's axis 0) are pruned and must be sliced off axis 1, not
+    # axis 0. Cin, M, and keep_count are all deliberately distinct (5, 8,
+    # 4) so a reversed-axis bug -- slicing the wrong, wrongly-sized axis --
+    # would produce a shape onnxruntime itself refuses to run the pruned
+    # graph with, not a silently-plausible wrong answer.
+    Cin, M, Cout = 5, 8, 6
+    rng = np.random.default_rng(344)
+    w_ct = rng.standard_normal((Cin, M, 3, 3)).astype(np.float32)
+    w2 = rng.standard_normal((Cout, M, 3, 3)).astype(np.float32)
+    model = _conv_transpose_then_conv_model(w_ct, w2)
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    keep_count = M - round(M * 0.5)
+    inits = {t.name: t for t in pruned.graph.initializer}
+    assert list(inits["WCT"].dims) == [Cin, keep_count, 3, 3]
+    assert list(inits["W2"].dims) == [Cout, keep_count, 3, 3]
+
+    # Oracle keep-set: ConvTranspose's own "N,K" importance view moves its
+    # output-channel axis (1) to the front before ranking, mirroring
+    # _producer_weight_nk's own convention.
+    w_ct_nk = np.moveaxis(w_ct, 1, 0).reshape(M, -1).astype(np.float64)
+    importance = np.linalg.norm(w_ct_nk, axis=1)
+    keep = np.sort(np.argsort(-importance)[:keep_count])
+    oracle = _conv_transpose_then_conv_model(w_ct[:, keep], w2[:, keep])
+
+    rng_x = np.random.default_rng(345)
+    x = rng_x.standard_normal((2, Cin, 10, 10)).astype(np.float32)
+    (y,) = _run(pruned, {"X": x})
+    (y_oracle,) = _run(oracle, {"X": x})
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-5, atol=1e-5)
+
+
+def _conv_then_conv_transpose_model(w1, w_ct, spatial=10):
+    # Conv producer -> ConvTranspose *consumer*: w1 is an ordinary Conv's
+    # [C1, Cin, kH, kW] weight (C1, axis 0, pruned as always); w_ct is
+    # ConvTranspose's own reversed [C1, Cout, kH, kW] weight, consuming C1
+    # on its own axis 0 -- the reverse of an ordinary Conv consumer's
+    # axis 1.
+    Cin = w1.shape[1]
+    Cout = w_ct.shape[1]
+    mid_spatial = spatial - 2  # producer Conv, valid 3x3
+    out_spatial = mid_spatial + 2  # ConvTranspose, unit stride, valid
+    return _model(
+        f"""
+        g (float[N,{Cin},{spatial},{spatial}] X) => (float[N,{Cout},{out_spatial},{out_spatial}] Y)
+        {{
+          h = Conv<kernel_shape=[3,3]>(X, W1)
+          a = Relu(h)
+          Y = ConvTranspose<kernel_shape=[3,3]>(a, WCT)
+        }}
+        """,
+        initializer=[_f32(w1, "W1"), _f32(w_ct, "WCT")],
+    )
+
+
+def test_structured_pruning_conv_transpose_consumer_matches_oracle_exactly():
+    # ConvTranspose acting as a *consumer*: its own input channels (axis 0
+    # of its [C1, Cout, kH, kW] weight -- the reverse of an ordinary Conv
+    # consumer's axis 1) must be sliced to match the upstream Conv
+    # producer's own kept output channels. Cin, C1, Cout, and keep_count
+    # are all deliberately distinct (3, 8, 6, 4) for the same
+    # reversed-axis-detectability reason as the producer test above.
+    Cin, C1, Cout = 3, 8, 6
+    rng = np.random.default_rng(346)
+    w1 = rng.standard_normal((C1, Cin, 3, 3)).astype(np.float32)
+    w_ct = rng.standard_normal((C1, Cout, 3, 3)).astype(np.float32)
+    model = _conv_then_conv_transpose_model(w1, w_ct)
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    keep_count = C1 - round(C1 * 0.5)
+    inits = {t.name: t for t in pruned.graph.initializer}
+    assert list(inits["W1"].dims) == [keep_count, Cin, 3, 3]
+    assert list(inits["WCT"].dims) == [keep_count, Cout, 3, 3]
+
+    keep = _oracle_keep_indices_conv(w1, keep_count)
+    oracle = _conv_then_conv_transpose_model(w1[keep], w_ct[keep])
+
+    rng_x = np.random.default_rng(347)
+    x = rng_x.standard_normal((2, Cin, 10, 10)).astype(np.float32)
+    (y,) = _run(pruned, {"X": x})
+    (y_oracle,) = _run(oracle, {"X": x})
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-5, atol=1e-5)
+
+
+def test_structured_pruning_grouped_conv_transpose_consumer_matches_oracle_exactly():
+    # A grouped (group > 1) ConvTranspose consumer is matched for any
+    # group (unlike the producer side, restricted to group == 1 -- see
+    # _match_conv_transpose_consumer's own docstring): its own
+    # input-channel axis (0) already spans the *full* in_channels
+    # regardless of group, so pruning it is the same flat `w[keep, ...]`
+    # slice as the group == 1 case, with `_apply_chains`'s existing
+    # per-group-block top-k (driven by _chain_group, keyed on this
+    # ConvTranspose's own `group` attribute) choosing a uniform keep count
+    # per block so the pruned node's own `in_channels % group == 0`
+    # invariant survives.
+    Cin, C1, Cout, group = 3, 8, 6, 2
+    rng = np.random.default_rng(348)
+    w1 = rng.standard_normal((C1, Cin, 3, 3)).astype(np.float32)
+    w_ct = rng.standard_normal((C1, Cout // group, 3, 3)).astype(np.float32)
+    model = _model(
+        f"""
+        g (float[N,{Cin},10,10] X) => (float[N,{Cout},10,10] Y)
+        {{
+          h = Conv<kernel_shape=[3,3]>(X, W1)
+          a = Relu(h)
+          Y = ConvTranspose<kernel_shape=[3,3], group={group}>(a, WCT)
+        }}
+        """,
+        initializer=[_f32(w1, "W1"), _f32(w_ct, "WCT")],
+    )
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    block = C1 // group
+    per_group_keep = max(1, round(block * 0.5))
+    keep_count = per_group_keep * group
+    inits = {t.name: t for t in pruned.graph.initializer}
+    assert list(inits["W1"].dims) == [keep_count, Cin, 3, 3]
+    assert list(inits["WCT"].dims) == [keep_count, Cout // group, 3, 3]
+    ct_node = next(n for n in pruned.graph.node if "WCT" in n.input)
+    group_attr = next(a for a in ct_node.attribute if a.name == "group")
+    assert group_attr.i == group  # group itself is unchanged by consumer pruning
+
+    importance = np.linalg.norm(w1.reshape(C1, -1).astype(np.float64), axis=1)
+    keep = np.sort(
+        np.concatenate(
+            [
+                np.argsort(-importance[g * block : (g + 1) * block])[:per_group_keep]
+                + g * block
+                for g in range(group)
+            ]
+        )
+    )
+    oracle = _model(
+        f"""
+        g (float[N,{Cin},10,10] X) => (float[N,{Cout},10,10] Y)
+        {{
+          h = Conv<kernel_shape=[3,3]>(X, W1)
+          a = Relu(h)
+          Y = ConvTranspose<kernel_shape=[3,3], group={group}>(a, WCT)
+        }}
+        """,
+        initializer=[_f32(w1[keep], "W1"), _f32(w_ct[keep], "WCT")],
+    )
+
+    rng_x = np.random.default_rng(349)
+    x = rng_x.standard_normal((2, Cin, 10, 10)).astype(np.float32)
+    (y,) = _run(pruned, {"X": x})
+    (y_oracle,) = _run(oracle, {"X": x})
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-5, atol=1e-5)
+
+
+def test_structured_pruning_grouped_conv_transpose_producer_is_left_untouched():
+    # The mirror image of test_structured_pruning_skips_grouped_producer_conv:
+    # a grouped (group > 1) ConvTranspose is never matched as a *producer*
+    # (see _match_conv_transpose_producer's own docstring for why -- a
+    # scope decision, not an oversight), so a chain that would otherwise
+    # look matchable is left completely untouched rather than guessed at.
+    Cin, M, group, Cout = 4, 8, 2, 6
+    rng = np.random.default_rng(350)
+    w_ct = rng.standard_normal((Cin, M // group, 3, 3)).astype(np.float32)
+    w2 = rng.standard_normal((Cout, M, 3, 3)).astype(np.float32)
+    model = _model(
+        f"""
+        g (float[N,{Cin},10,10] X) => (float[N,{Cout},6,6] Y)
+        {{
+          h = ConvTranspose<kernel_shape=[3,3], group={group}>(X, WCT)
+          a = Relu(h)
+          Y = Conv<kernel_shape=[3,3]>(a, W2)
+        }}
+        """,
+        initializer=[_f32(w_ct, "WCT"), _f32(w2, "W2")],
+    )
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    np.testing.assert_array_equal(inits["WCT"], w_ct)
+    np.testing.assert_array_equal(inits["W2"], w2)
+
+
+def test_structured_wanda_pruning_conv_transpose_producer_matches_oracle_exactly():
+    # apply_structured_wanda_pruning shares _apply_chains/_apply_chains_global
+    # (and _producer_weight_nk's own is_conv_transpose-aware axis-1 view)
+    # with apply_structured_pruning -- this locks in that a ConvTranspose
+    # producer chain is ranked and pruned correctly by the calibrated
+    # ||W_row||_2 * ||X||_2 metric too, not just plain L2 weight norm.
+    Cin, M, Cout = 5, 8, 6
+    rng = np.random.default_rng(351)
+    w_ct = rng.standard_normal((Cin, M, 3, 3)).astype(np.float32)
+    w2 = rng.standard_normal((Cout, M, 3, 3)).astype(np.float32)
+    model = _conv_transpose_then_conv_model(w_ct, w2)
+
+    probe_model = onnx.ModelProto()
+    probe_model.CopyFrom(model)
+    probe_model.graph.output.append(
+        onnx.helper.make_tensor_value_info("a", onnx.TensorProto.FLOAT, None)
+    )
+    rng_cal = np.random.default_rng(352)
+    x_cal = rng_cal.standard_normal((2, Cin, 10, 10)).astype(np.float32)
+    calibration_data = [{"X": x_cal}]
+
+    _, a_cal = _run(probe_model, {"X": x_cal})
+    act_norm = np.sqrt(np.mean(np.square(a_cal.astype(np.float64)), axis=(0, 2, 3)))
+    w_ct_nk = np.moveaxis(w_ct, 1, 0).reshape(M, -1).astype(np.float64)
+    importance = np.linalg.norm(w_ct_nk, axis=1) * np.maximum(act_norm, 1e-8)
+    keep_count = M - round(M * 0.5)
+    keep = np.sort(np.argsort(-importance)[:keep_count])
+
+    pruned = onnxsim.apply_structured_wanda_pruning(
+        model, calibration_data=calibration_data, sparsity=0.5
+    )
+    onnx.checker.check_model(pruned)
+
+    oracle = _conv_transpose_then_conv_model(w_ct[:, keep], w2[:, keep])
+    rng_x = np.random.default_rng(353)
+    x = rng_x.standard_normal((2, Cin, 10, 10)).astype(np.float32)
+    (y,) = _run(pruned, {"X": x})
+    (y_oracle,) = _run(oracle, {"X": x})
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-5, atol=1e-5)
+
+
 def test_structured_pruning_conv_only_chain_matches_oracle_no_bias():
     # No Conv bias at all, and a non-Relu activation -- a plain
     # Conv -> Sigmoid -> Conv chain.

@@ -110,10 +110,46 @@ methodology.
   Core ML's runtime lives); the export step itself needs no Apple hardware.
 
 `coreml-integration.yml`'s `benchmark-decode-macos` job runs this exact pair
-end-to-end (export `HuggingFaceTB/SmolLM2-135M-Instruct`, then the decode
-benchmark) on a macOS GitHub-hosted runner, posting the numbers to that run's
-job summary -- `workflow_dispatch`/schedule-only, like the other real-model
-jobs in that workflow, not on every PR.
+end-to-end on a macOS GitHub-hosted runner, over a small matrix
+(`HuggingFaceTB/SmolLM2-135M-Instruct` and `Qwen/Qwen2.5-1.5B-Instruct` --
+the two architecture families already validated by
+`prepare_benchmark_models.py`, so a translator regression specific to one
+doesn't hide behind the other passing), posting each model's numbers to that
+run's job summary -- `workflow_dispatch`/schedule-only, like the other
+real-model jobs in that workflow, not on every PR.
+
+### Decode parity (`check_decode_parity.py`)
+
+The decode benchmark above measures speed, not correctness -- a model that
+runs fast but computes the wrong thing would still produce a number.
+`check_decode_parity.py` closes that gap: it greedily generates the same
+prompt through **both** the exported `.mlpackage` (via `CoreMLDecoder`, real
+Core ML runtime) and the original Hugging Face model (`transformers`,
+CPU-only, no macOS needed for that half), then reports the token-level
+agreement rate and the index of the first divergence between the two
+sequences.
+
+This is deliberately not a bit-exact check: Core ML runs at fp16 internally
+regardless of the ONNX graph's own dtype, while the `transformers` reference
+here runs at fp32 on CPU, so a close-logit token can legitimately flip the
+greedy argmax on one side and not the other -- and once one token diverges,
+every later token's context differs too, so agreement is expected to trail
+off after that point rather than resume. What the check actually watches for
+is *how much* the two disagree (`--min-agreement`, default 80%) and *how
+early* the first mismatch happens -- either one being far off is the signal
+that something in the export/conversion pipeline is wrong, not just fp16
+rounding.
+
+```bash
+python check_decode_parity.py HuggingFaceTB/SmolLM2-135M-Instruct \
+    smollm2.mlpackage --prompt "The capital of France is" --max-new-tokens 20
+```
+
+`coreml-integration.yml`'s `benchmark-decode-macos` job runs this after the
+decode benchmark, once per matrix entry, also posting to the job summary.
+The pure comparison logic (`compare_token_sequences`) has no coremltools/
+torch/transformers dependency and is unit-tested directly in
+`tests/test_check_decode_parity.py`.
 
 ### Scaling to few-billion-parameter models
 
