@@ -37,36 +37,41 @@ being overwritten with bytes that don't fit its declared shape. This does
 **not** include tensors simply absent from `model`'s initializers, which
 are silently left alone.
 
-## GGML "K-quant" support
+## GGML "K-quant" and MXFP4 support
 
 Real quantized checkpoints store most of their weights as one of GGML's
 block-quantized formats, not plain float. This function decodes the
 **K-quant** family -- `Q4_K`, `Q5_K`, `Q6_K` (256-element super-blocks, each
 with its own packed 6-bit per-sub-block scale/min pair) and `Q8_0`
 (32-element blocks, one fp16 scale each) -- which is what Unsloth's `*_K_M`/
-`*_K_S`/`Q8_0` GGUF exports actually use for the bulk of their tensors. Every
-block layout and dequantization formula is transcribed directly from GGML's
-own reference implementation
+`*_K_S`/`Q8_0` GGUF exports actually use for the bulk of their tensors, plus
+**MXFP4** (32-element blocks, one shared power-of-two E8M0 exponent byte and
+16 bytes of packed 4-bit e2m1-style codes) -- the OCP Microscaling FP4 format
+official gpt-oss GGUF releases use natively for their MoE expert weights.
+Every block layout and dequantization formula is transcribed directly from
+GGML's own reference implementation
 (https://github.com/ggml-org/ggml -- `ggml-common.h`'s block structs,
-`ggml-quants.c`'s `dequantize_row_q*` functions) and cross-checked against an
+`ggml-quants.c`'s `dequantize_row_q*`/`dequantize_row_mxfp4` functions,
+`ggml-impl.h`'s `ggml_e8m0_to_fp32_half`) and cross-checked against an
 independent from-scratch re-implementation over full random blocks before
-being committed (see `onnxsim/ggml_kquant.h`'s file comment).
+being committed (see `onnxsim/ggml_kquant.h`'s and `onnxsim/ggml_mxfp4.h`'s
+file comments).
 
-A matched K-quant tensor's initializer has its `data_type` forced to
-`FLOAT` regardless of what `model` previously declared for it -- the
+A matched K-quant or MXFP4 tensor's initializer has its `data_type` forced
+to `FLOAT` regardless of what `model` previously declared for it -- the
 decoded values are only meaningful as float32.
 
 ## Scope
 
 Handled:
-- `Q4_K`, `Q5_K`, `Q6_K`, `Q8_0` -- decoded to float32.
+- `Q4_K`, `Q5_K`, `Q6_K`, `Q8_0`, `MXFP4` -- decoded to float32.
 - Any raw (already-unquantized) GGML type (`F32`, `F16`, `BF16`, `F64`,
   `I8`/`I16`/`I32`/`I64`) -- copied through unchanged, same as `import_gguf`.
 
 Not handled (reported in `skipped`, left untouched):
 - The legacy `Q4_0`/`Q4_1`/`Q5_0`/`Q5_1`/`Q8_1` family, `Q2_K`/`Q3_K`/`Q8_K`,
-  and every `IQ*` importance-matrix variant -- these have real, different
-  block layouts this decoder does not implement.
+  `NVFP4`, and every `IQ*` importance-matrix variant -- these have real,
+  different block layouts this decoder does not implement.
 
 Only an initializer whose *name* matches a GGUF tensor is ever touched;
 `import_gguf_weights` never adds new initializers or otherwise changes the
@@ -94,14 +99,19 @@ decoder needs no MoE-specific change either -- see
 `test_import_gguf_weights_hydrates_a_moe_node_with_llama_cpp_names` for an
 end-to-end round trip through a real `com.microsoft.MoE` node.
 
-Two real gaps remain, both reported via `skipped` (or simply absent from
-the model, in the second case) rather than silently mishandled:
-- Official gpt-oss GGUF releases quantize expert weights as **MXFP4**, not
-  one of the K-quant formats this decoder implements.
-- Some newer llama.cpp architectures fuse the gate and up projections into
-  one `ffn_gate_up_exps` tensor instead of two separate ones -- there is no
-  1:1 initializer to hydrate that into (the same fused-layout gap
-  `swiglu_fusion` has in the reference decomposition itself).
+One real gap remains, reported by simple absence from the model (there is
+no matching initializer for `import_gguf_weights` to report as `skipped`
+in the first place) rather than silently mishandled: some newer llama.cpp
+architectures, including official gpt-oss releases, fuse the gate and up
+projections into one `ffn_gate_up_exps` tensor instead of two separate ones
+-- there is no 1:1 initializer to hydrate that into (the same fused-layout
+gap `swiglu_fusion` has in the reference decomposition itself). Bridging a
+real gpt-oss checkpoint (which keeps gate/up as the two separate
+`ffn_gate_exps`/`ffn_up_exps` tensors, each MXFP4-quantized and individually
+decodable by this function) into `com.microsoft.MoE`'s single interleaved
+`swiglu_fusion=1` buffer needs an explicit cross-tensor fusion step beyond
+`import_gguf_weights`' simple 1:1 name-matching contract -- not implemented
+here.
 
 ## Why not reconstruct the whole model from the GGUF file?
 

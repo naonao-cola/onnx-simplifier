@@ -51,9 +51,10 @@ namespace tensor_pool {
 
 // GGUF counterpart of tensor_pool_bridge.h's HydrateTensorProto: same
 // contract (returns false, leaving `tensor` untouched, if `name` isn't
-// pooled) EXCEPT a K-quant-native entry (Q4_K/Q5_K/Q6_K/Q8_0 -- see
-// gguf_dtype.h's IsKQuant) is decoded to plain float32 raw_data instead of
-// copied verbatim, and `tensor`'s data_type is forced to FLOAT to match --
+// pooled) EXCEPT a K-quant-native or MXFP4-native entry (Q4_K/Q5_K/Q6_K/
+// Q8_0/MXFP4 -- see gguf_dtype.h's IsKQuant/IsMxfp4) is decoded to plain
+// float32 raw_data instead of copied verbatim, and `tensor`'s data_type is
+// forced to FLOAT to match --
 // overriding whatever data_type the caller's initializer previously
 // declared, since the decoded values are only meaningful as float32 (the
 // caller's own declared dtype reflects whatever *their* graph expects,
@@ -68,10 +69,12 @@ inline bool HydrateTensorProtoFromGGUF(const std::string& name,
   if (entry == nullptr) return false;
 
   uint32_t ggml_type;
-  if (gguf::FromOnnx(entry->dtype, &ggml_type) && gguf::IsKQuant(ggml_type)) {
+  if (gguf::FromOnnx(entry->dtype, &ggml_type) &&
+      (gguf::IsKQuant(ggml_type) || gguf::IsMxfp4(ggml_type))) {
     std::vector<float> floats;
     if (!pool.DequantizeToFloat(name, &floats)) {
-      return false;  // Unreachable: FromOnnx+IsKQuant already validated dtype.
+      // Unreachable: FromOnnx+IsKQuant/IsMxfp4 already validated dtype.
+      return false;
     }
     tensor.set_data_location(onnx::TensorProto::DEFAULT);
     tensor.clear_external_data();
@@ -133,12 +136,12 @@ inline size_t ExportModelWithGGUF(
 }
 
 // Load `gguf_path` into `pool` and, for every graph initializer whose name
-// matches a pooled tensor -- a raw-dtype tensor, or a K-quant one (see
-// gguf_dtype.h's IsKQuant), either hydrate it in place (hydrate_all, the
-// default -- a K-quant match is decoded to float32, see
+// matches a pooled tensor -- a raw-dtype tensor, or a K-quant/MXFP4 one (see
+// gguf_dtype.h's IsKQuant/IsMxfp4), either hydrate it in place (hydrate_all,
+// the default -- a K-quant/MXFP4 match is decoded to float32, see
 // HydrateTensorProtoFromGGUF) or leave it as a lazy EXTERNAL reference
 // (hydrate_all=false; see tensor_pool_bridge.h's caveat on this mode --
-// note a K-quant match left lazy this way still needs
+// note a K-quant/MXFP4 match left lazy this way still needs
 // HydrateTensorProtoFromGGUF, not the plain HydrateTensorProto that caveat
 // points to, when it's eventually hydrated on demand).
 // Returns the number of initializers matched (hydrated or marked lazy).

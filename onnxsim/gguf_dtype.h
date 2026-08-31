@@ -40,6 +40,15 @@
  * DequantizeGgmlKQuant, wired into tensor_pool_bridge.h's
  * HydrateTensorProto, always decodes to ONNX_FLOAT before a pooled K-quant
  * entry reaches a TensorProto a caller can observe.
+ *
+ * SECOND EXCEPTION -- MXFP4 (see IsMxfp4/ggml_mxfp4.h): gpt-oss-20b's own
+ * native GGUF quantization for its MoE expert weights. Structurally
+ * unrelated to the K-quant family above (a different, OCP-Microscaling-
+ * derived block layout and code table, not a scale/min affine
+ * reconstruction), so it gets its own predicate and block-size helpers
+ * rather than folding into IsKQuant, but is otherwise handled the same way:
+ * its own ONNXSIM_GGML_MXFP4 private dtype code, native block bytes carried
+ * verbatim until ggml_mxfp4.h's DequantizeGgmlMxfp4 decodes it to float32.
  */
 #ifndef ONNXSIM_GGUF_DTYPE_H_
 #define ONNXSIM_GGUF_DTYPE_H_
@@ -101,6 +110,7 @@ enum GgmlType : uint32_t {
   GGML_TYPE_I64 = 27,
   GGML_TYPE_F64 = 28,
   GGML_TYPE_BF16 = 30,
+  GGML_TYPE_MXFP4 = 39,
 };
 
 // --- ONNX dtype <-> ggml_type (raw types only; see the file comment) ------
@@ -123,15 +133,16 @@ enum OnnxDtype : int32_t {
 
 // Private, onnxsim-fork-only dtype codes an Entry::dtype (or a TensorProto
 // this loader briefly produces before HydrateTensorProto decodes it away --
-// see the file comment) may hold for a still-packed GGML K-quant tensor.
-// Chosen from a range (10000+) with no plausible collision against ONNX's
-// own DataType enum (defined up to 26 as of this writing -- see
-// onnx.in.proto); never reassign or reuse one of these four values.
+// see the file comment) may hold for a still-packed GGML K-quant or MXFP4
+// tensor. Chosen from a range (10000+) with no plausible collision against
+// ONNX's own DataType enum (defined up to 26 as of this writing -- see
+// onnx.in.proto); never reassign or reuse one of these five values.
 enum OnnxsimPrivateDtype : int32_t {
   ONNXSIM_GGML_Q4_K = 10001,
   ONNXSIM_GGML_Q5_K = 10002,
   ONNXSIM_GGML_Q6_K = 10003,
   ONNXSIM_GGML_Q8_0 = 10004,
+  ONNXSIM_GGML_MXFP4 = 10005,
 };
 
 // Bytes of one element. 0 for a ggml_type this mapping doesn't cover
@@ -216,6 +227,28 @@ inline size_t KQuantBlockBytes(uint32_t ggml_type) {
   }
 }
 
+// True for GGML's MXFP4 block format (the OCP Microscaling FP4 spec) --
+// gpt-oss-20b's own native GGUF quantization for its MoE expert weights.
+// Structurally unrelated to the K-quant family IsKQuant covers: a 32-element
+// block sharing one power-of-two E8M0 exponent byte plus 16 bytes of packed
+// 4-bit codes indexing a small fixed e2m1-style magnitude table, with
+// element j and j+16 of the block packed into the low/high nibble of byte j
+// (not element 2j/2j+1, as K-quant's consecutive-pair packing does) -- see
+// ggml_mxfp4.h's DequantizeMxfp4Block for the exact formula.
+inline bool IsMxfp4(uint32_t ggml_type) { return ggml_type == GGML_TYPE_MXFP4; }
+
+// Elements per block for an IsMxfp4 ggml_type. 0 for anything else.
+inline size_t Mxfp4BlockElements(uint32_t ggml_type) {
+  return IsMxfp4(ggml_type) ? 32 : 0;
+}
+
+// Bytes per block for an IsMxfp4 ggml_type -- 1 (the shared E8M0 exponent
+// byte) + 16 (32 packed 4-bit codes) -- see block_mxfp4 in ggml's
+// ggml-common.h. 0 for anything else.
+inline size_t Mxfp4BlockBytes(uint32_t ggml_type) {
+  return IsMxfp4(ggml_type) ? 17 : 0;
+}
+
 // Map a ggml_type to its ONNX dtype code -- ONNXSIM_GGML_* (see that enum's
 // doc comment) for one of the four IsKQuant types, an ordinary ONNX_* code
 // for a raw type. Returns false (leaving `*out` untouched) for a quantized
@@ -259,20 +292,23 @@ inline bool ToOnnx(uint32_t ggml_type, int32_t* out) {
     case GGML_TYPE_Q8_0:
       *out = ONNXSIM_GGML_Q8_0;
       return true;
+    case GGML_TYPE_MXFP4:
+      *out = ONNXSIM_GGML_MXFP4;
+      return true;
     default:
       return false;
   }
 }
 
-// The exact byte length of an IsRaw or IsKQuant ggml_type tensor holding
-// `nelems` total elements -- generalizes the simple `nelems *
+// The exact byte length of an IsRaw, IsKQuant, or IsMxfp4 ggml_type tensor
+// holding `nelems` total elements -- generalizes the simple `nelems *
 // ElementSize(ggml_type)` a raw type alone would need, to also cover a
-// K-quant type's block-based sizing (`nelems / KQuantBlockElements *
-// KQuantBlockBytes`). Returns false (leaving `*out_nbytes` untouched) for a
-// ggml_type this mapping doesn't cover at all, or a K-quant type whose
-// `nelems` is not an exact multiple of its block size (a malformed or
-// truncated tensor -- every real K-quant tensor's element count is block-
-// aligned, since GGML itself requires each row to be).
+// block-quantized type's block-based sizing (`nelems / block_elems *
+// block_bytes`). Returns false (leaving `*out_nbytes` untouched) for a
+// ggml_type this mapping doesn't cover at all, or a block-quantized type
+// whose `nelems` is not an exact multiple of its block size (a malformed or
+// truncated tensor -- every real block-quantized tensor's element count is
+// block-aligned, since GGML itself requires each row to be).
 inline bool TryTotalBytes(uint32_t ggml_type, uint64_t nelems,
                           uint64_t* out_nbytes) {
   if (IsRaw(ggml_type)) {
@@ -289,17 +325,27 @@ inline bool TryTotalBytes(uint32_t ggml_type, uint64_t nelems,
                   static_cast<uint64_t>(KQuantBlockBytes(ggml_type));
     return true;
   }
+  if (IsMxfp4(ggml_type)) {
+    const uint64_t block_elems =
+        static_cast<uint64_t>(Mxfp4BlockElements(ggml_type));
+    if (nelems % block_elems != 0) {
+      return false;
+    }
+    *out_nbytes = (nelems / block_elems) *
+                  static_cast<uint64_t>(Mxfp4BlockBytes(ggml_type));
+    return true;
+  }
   return false;
 }
 
 // Inverse of ToOnnx. Returns false for an ONNX dtype with no raw ggml_type
 // counterpart (STRING, COMPLEX64/128, UNDEFINED, the unsigned int family --
 // ggml has no unsigned integer types at all, quantized or otherwise -- or
-// one of onnxsim's own custom dtypes this mapping doesn't cover). The four
+// one of onnxsim's own custom dtypes this mapping doesn't cover). The five
 // ONNXSIM_GGML_* codes DO round-trip here (unlike every other private dtype
-// a caller might construct): a pooled K-quant entry that still holds its
-// native, un-decoded block bytes (see the file comment) can always be
-// written back out to a real GGUF file bit-for-bit, the same as any other
+// a caller might construct): a pooled K-quant or MXFP4 entry that still
+// holds its native, un-decoded block bytes (see the file comment) can always
+// be written back out to a real GGUF file bit-for-bit, the same as any other
 // pooled dtype -- TensorPool::SaveGGUF relies on that.
 inline bool FromOnnx(int32_t onnx_dtype, uint32_t* out) {
   switch (onnx_dtype) {
@@ -338,6 +384,9 @@ inline bool FromOnnx(int32_t onnx_dtype, uint32_t* out) {
       return true;
     case ONNXSIM_GGML_Q8_0:
       *out = GGML_TYPE_Q8_0;
+      return true;
+    case ONNXSIM_GGML_MXFP4:
+      *out = GGML_TYPE_MXFP4;
       return true;
     default:
       return false;

@@ -584,6 +584,12 @@ if (ONNXSIM_TESTS)
   target_include_directories(ggml_kquant_test PRIVATE onnxsim)
   add_test(NAME ggml_kquant_test COMMAND ggml_kquant_test)
 
+  # GGML MXFP4 dequantization (ggml_mxfp4.h) -- same standalone-buildable
+  # dependency footprint as ggml_kquant_test above.
+  add_executable(ggml_mxfp4_test onnxsim/ggml_mxfp4_test.cpp)
+  target_include_directories(ggml_mxfp4_test PRIVATE onnxsim)
+  add_test(NAME ggml_mxfp4_test COMMAND ggml_mxfp4_test)
+
   # TensorPool's GGUF read/write (tensor_pool_gguf.cpp) depends only on
   # tensor_pool.{h,cpp} and gguf_dtype.h, so it too builds and runs
   # standalone without ONNX / ONNX Runtime configured.

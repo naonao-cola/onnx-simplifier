@@ -71,11 +71,11 @@ _OPSET = 17
 # with e.g. a cross-compiled wheel's smoke test) then refuse to load at all.
 _IR_VERSION = 8
 
-# Mirrors onnxsim/gguf_dtype.h's GgmlType enum and ToOnnx/IsKQuant mapping --
-# duplicated here rather than exposed through a new C++ binding, the same
-# choice tests/test_import_gguf_weights.py already made for its own small,
-# stable GGML_TYPE_* constants. See gguf_dtype.h's file comment: GGML never
-# reassigns an existing type ID, so this mapping does not drift.
+# Mirrors onnxsim/gguf_dtype.h's GgmlType enum and ToOnnx/IsKQuant/IsMxfp4
+# mapping -- duplicated here rather than exposed through a new C++ binding,
+# the same choice tests/test_import_gguf_weights.py already made for its own
+# small, stable GGML_TYPE_* constants. See gguf_dtype.h's file comment: GGML
+# never reassigns an existing type ID, so this mapping does not drift.
 _GGML_RAW_TO_ONNX = {
     0: onnx.TensorProto.FLOAT,  # F32
     1: onnx.TensorProto.FLOAT16,  # F16
@@ -86,11 +86,11 @@ _GGML_RAW_TO_ONNX = {
     28: onnx.TensorProto.DOUBLE,  # F64
     30: onnx.TensorProto.BFLOAT16,  # BF16
 }
-# Q8_0, Q4_K, Q5_K, Q6_K -- import_gguf_weights forces these to FLOAT
+# Q8_0, Q4_K, Q5_K, Q6_K, MXFP4 -- import_gguf_weights forces these to FLOAT
 # regardless of what the initializer previously declared (see
 # tensor_pool_gguf_bridge.h's HydrateTensorProtoFromGGUF), so that is what
 # must be declared here too.
-_GGML_KQUANT_TYPES = {8, 12, 13, 14}
+_GGML_KQUANT_TYPES = {8, 12, 13, 14, 39}
 
 _ONNX_DTYPE_ITEMSIZE = {
     onnx.TensorProto.FLOAT: 4,
@@ -395,8 +395,8 @@ def _reconstruct_llama_family(
             raise UnsupportedArchitectureError(
                 f"tensor '{name}' uses ggml_type {ggml_type}, which "
                 "import_gguf_weights cannot decode (only F32/F16/BF16/F64/"
-                "I8/I16/I32/I64 and the Q4_K/Q5_K/Q6_K/Q8_0 K-quant family "
-                "are supported)"
+                "I8/I16/I32/I64, the Q4_K/Q5_K/Q6_K/Q8_0 K-quant family, and "
+                "MXFP4 are supported)"
             )
         b.placeholder_weight(name, expected_shape, onnx_dtype)
         return name
