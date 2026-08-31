@@ -29,7 +29,11 @@ def _clear_output_type(model, name, rank):
     # body, not from the original model.
     for vi in model.graph.output:
         if vi.name == name:
-            vi.CopyFrom(onnx.helper.make_tensor_value_info(name, onnx.TensorProto.UNDEFINED, [None] * rank))
+            vi.CopyFrom(
+                onnx.helper.make_tensor_value_info(
+                    name, onnx.TensorProto.UNDEFINED, [None] * rank
+                )
+            )
             return
     raise AssertionError(f"no such graph output: {name}")
 
