@@ -11313,6 +11313,860 @@ def apply_moe_whole_expert_pruning(
     return out
 
 
+# --- Embedding / lm_head vocabulary pruning --------------------------------
+#
+# Every other pass in this module changes a graph's *internal* channel/
+# head/entry counts while leaving what counts as a valid *input* untouched.
+# This one is different in kind: it targets the ``vocab_size`` axis of a
+# token-embedding table (and, where identifiable, the tied/untied output
+# projection back to vocab logits, "lm_head") -- for an LLM this is very
+# often the single largest weight tensor in the whole model, so a
+# deployment restricted to a known, narrower vocabulary (one language, one
+# task's token set, ...) can genuinely drop a large fraction of it. But
+# dropping vocabulary row `i` doesn't just shrink a tensor the way dropping
+# a MatMul/Conv channel does -- it means token id `i` can never again be
+# fed as an `input_ids` value without producing an out-of-bounds `Gather`
+# index at runtime. That is a real correctness hazard, not a cosmetic one,
+# and it is fundamentally different from every other technique here: no
+# other `apply_*` function in this module changes what a valid model input
+# looks like. See :func:`apply_embedding_vocab_pruning`'s own docstring for
+# how that contract change is surfaced (its own :class:`EmbeddingPruningResult`
+# return type, not a bare `ModelProto` the way every other pass returns, and
+# an `id_map` the caller must apply to every `input_ids` value going
+# forward).
+#
+# Graph pattern (confirmed via live `onnx.defs.get_schema("Gather", domain="")`
+# introspection, not assumed): an exported `torch.nn.Embedding` is
+# universally a plain ``Gather(data=embedding_table, indices=input_ids,
+# axis=0)`` -- `Gather`'s own schema has exactly two inputs (`data`,
+# `indices`) and one optional `axis` attribute (default ``0``, not
+# required), matching that pattern exactly with nothing exporter-specific
+# about it. `lm_head` (the output projection producing per-token vocab
+# logits) is a plain MatMul/vanilla-Gemm whose *weight tensor* is either:
+#
+# - **tied** to the embedding table -- literally the same initializer,
+#   consumed a second time either directly (a `Gemm` with `transB=1`,
+#   whose ``[N, K]`` convention already matches the embedding table's own
+#   ``[vocab_size, hidden_size]`` layout with no reshape needed -- the
+#   pattern e.g. GPT-2's ONNX export uses) or through one interposed
+#   `Transpose` (`perm=[1, 0]`) feeding a plain `MatMul`/`Gemm` with
+#   `transB=0` -- the pattern a 3-D-hidden-state model (`Gemm` has no
+#   batch-dim support, so a real `[batch, seq, hidden]` lm_head has to be a
+#   `MatMul`, which needs the weight pre-transposed to ``[hidden,
+#   vocab]``); or
+# - **untied**: a fully independent ``[hidden_size, vocab_size]`` (or
+#   ``[vocab_size, hidden_size]``, Gemm ``transB=1``) weight with no
+#   relation to the embedding table at all.
+#
+# Both are handled, and handled *distinctly* -- see
+# :func:`_match_tied_lm_head`/:func:`_match_untied_lm_head`'s own
+# docstrings for exactly how each is recognized and, in particular, how
+# the tied case's shared initializer is sliced exactly once (never twice,
+# never two different ways) regardless of which of the two tied sub-shapes
+# matched it.
+#
+# Matching/safety bar, held to the same conservative standard as every
+# other pass in this module -- decline outright, model left completely
+# untouched, rather than guess, for anything not confidently recognized:
+#
+# - the `Gather`'s own `axis` must be exactly `0`;
+# - its `indices` operand must itself be one of the graph's own declared
+#   inputs, or (the one bounded hop allowed, since it is extremely common
+#   in real exports -- an integer dtype cast between the tokenizer's own
+#   output dtype and whatever `Gather` needs) the output of a `Cast` node
+#   whose own input is a declared graph input -- never a computed/constant
+#   indices tensor this pass would need to also rewrite;
+# - the embedding weight must be a constant float (FLOAT/FLOAT16/BFLOAT16
+#   -- :func:`_is_supported_float_dtype`, this module's own established
+#   FP16/BFloat16 support) 2-D initializer;
+# - the embedding weight must have *exactly* one consumer (the `Gather`
+#   alone -- the ordinary untied case) or *exactly* two, where the second
+#   is a structurally-confirmed tied `lm_head` consumer
+#   (:func:`_match_tied_lm_head`). A second consumer that doesn't resolve
+#   to one of the two recognized tied shapes declines the *whole* match --
+#   not "prune the embedding and ignore the unexplained second reader",
+#   which would silently corrupt whatever that reader actually does;
+# - a candidate untied `lm_head` is only ever auto-identified
+#   (:func:`_match_untied_lm_head`) when its own weight has exactly one
+#   consumer *and* its output is itself a genuine graph output -- the one
+#   structural signal (short of the caller naming it explicitly) that
+#   reliably distinguishes "the" vocab-logits projection from some other,
+#   unrelated MatMul/Gemm that happens to share the same output width by
+#   coincidence. More than one such candidate is ambiguity, not evidence --
+#   declined the same as zero;
+# - a `lm_head` bias is handled in exactly two recognized shapes -- a
+#   `Gemm` node's own built-in (constant, ``(vocab_size,)``/``(1,
+#   vocab_size)``-shaped) `C` input, or a plain `MatMul` (no built-in bias)
+#   whose sole consumer is one `Add` against a constant of that same shape
+#   (:func:`_match_lm_head_tail`) -- the common real-export shape for a
+#   biased linear layer sitting on a 3-D hidden state, where `Gemm`'s lack
+#   of batch-dim support already forces `MatMul` in the first place. Any
+#   other bias-looking shape (more than one consumer of the projection's
+#   own output, an `Add` operand of the wrong width, ...) declines that
+#   `lm_head` match outright, rather than silently leaving an unrecognized
+#   bias at the old, now-mismatched width;
+# - when more than one qualifying `Gather` pattern exists in the graph and
+#   the caller hasn't named which one via `input_name`, the whole call
+#   declines -- there is no reliable structural way to tell "the" token
+#   embedding apart from e.g. a positional embedding that also happens to
+#   read a genuine graph input (`position_ids`) through the identical
+#   `Gather(data, indices, axis=0)` shape.
+#
+# Which vocabulary rows are safe to keep is fundamentally a question this
+# pass cannot answer from the graph alone -- calibration data can show a
+# token id *was* used in some sample, never that it is safe to drop
+# (absence of evidence isn't evidence of absence). So the primary, default-
+# recommended entry point, :func:`apply_embedding_vocab_pruning`, requires
+# the caller to supply the keep-set explicitly (`keep_token_ids`/
+# `drop_token_ids`) -- mirroring how a real restricted-vocabulary
+# deployment actually works: the caller (who owns the tokenizer/deployment
+# surface) already knows the exact keep-set; this pass's only job is to
+# slice every consumer to match it, correctly. A second, explicitly weaker
+# entry point, :func:`apply_embedding_vocab_magnitude_pruning`, is also
+# offered -- the same "rank by weight magnitude" spirit as
+# :func:`apply_magnitude_pruning`'s own unstructured technique -- but its
+# own docstring is explicit that a row's L2 norm is a much weaker safety
+# signal than a caller-supplied keep-set (a rarely-used but still
+# legitimate token can have a small norm) and must not be used without
+# validating the result against the deployment's actual expected input
+# distribution.
+#
+# Whichever indices survive, they are renumbered contiguously (kept token
+# id `i`'s new id is its rank among the sorted kept ids) -- so both public
+# entry points here return an :class:`EmbeddingPruningResult`, not a bare
+# `ModelProto` the way every other `apply_*` function does: `result.model`
+# is the pruned graph, and `result.id_map` is the old-token-id ->
+# new-token-id mapping every caller of the pruned model must now apply to
+# its own `input_ids` before feeding them in. See that class's own
+# docstring for the full contract.
+
+
+@dataclass(frozen=True)
+class _LMHeadMatch:
+    """A recognized vocab-logits projection paired with a matched embedding
+    Gather. `node` is the *final* node whose output is the (pre-rename)
+    ``[..., vocab_size]`` logits tensor -- the matched MatMul/Gemm itself,
+    or, when :func:`_match_lm_head_tail` recognized a `MatMul`-then-
+    `Add(bias)` tail, the `Add` (its output, not the raw MatMul's, is the
+    tensor whose shape/graph-output status actually matters downstream).
+    `tied` is True when the underlying MatMul/Gemm's *weight* is the
+    embedding table itself (already sliced once, as part of the embedding
+    weight itself -- `weight_name`/`weight_transposed` are then
+    meaningless and left `None`); False means `weight_name` is a fully
+    independent initializer this match's own caller must slice separately,
+    using `weight_transposed` (the same MatMul/Gemm ``[N, K]``-vs-``[K,
+    N]`` convention :func:`_match_producer`/:func:`_slice_producer_weight`
+    already use). `bias` is the projection's own constant vocab-width bias
+    (`Gemm`'s built-in `C`, or a following `Add`'s operand), when present
+    and safely matched -- see :func:`_match_lm_head_tail`'s own docstring
+    for exactly which shapes qualify. `via_transpose` is the interposed
+    `Transpose` node for the tied "`Transpose` then `MatMul`" sub-shape,
+    else `None` -- it owns no weight of its own to slice (its output shape
+    simply follows the already-resized embedding table it transposes), but
+    its own now-stale output shape still needs invalidating after pruning.
+    """
+
+    node: onnx.NodeProto
+    tied: bool
+    weight_name: Optional[str]
+    weight_transposed: Optional[bool]
+    bias: Optional[str]
+    via_transpose: Optional[onnx.NodeProto]
+
+
+@dataclass(frozen=True)
+class _EmbeddingChain:
+    gather: onnx.NodeProto
+    weight_name: str
+    indices_name: str
+    vocab_size: int
+    hidden_size: int
+    lm_head: Optional[_LMHeadMatch]
+
+
+# Sentinel distinguishing "no bias" (fine, proceed) from "a bias exists but
+# this pass doesn't confidently recognize how to keep it in sync" (decline
+# the whole lm_head match) -- `None` alone can't carry that distinction.
+_LM_HEAD_BIAS_INVALID = object()
+
+
+def _match_embedding_gather(
+    node: onnx.NodeProto,
+    initializer_map: Dict[str, onnx.TensorProto],
+    consumers_of: Dict[str, List[onnx.NodeProto]],
+    graph_input_names: Set[str],
+    node_by_output: Dict[str, onnx.NodeProto],
+) -> Optional[Tuple[str, str, str]]:
+    """If `node` is a well-formed embedding-table `Gather` (this section's
+    own comment above has the full matching criteria), returns
+    ``(weight_name, indices_name, underlying_input_name)`` --
+    `indices_name` is `node`'s own literal `indices` operand,
+    `underlying_input_name` is that same tensor with one `Cast` hop
+    unwrapped when present (identical to `indices_name` otherwise); both
+    are returned only for :func:`_match_embedding_chain`'s own
+    `input_name` disambiguation, never used to mutate anything -- this
+    pass never touches the indices tensor itself.
+    """
+    if node.op_type != "Gather" or len(node.input) != 2:
+        return None
+    axis = 0
+    for attr in node.attribute:
+        if attr.name == "axis":
+            axis = attr.i
+    if axis != 0:
+        return None
+    w_name, indices_name = node.input[0], node.input[1]
+    w_init = initializer_map.get(w_name)
+    if (
+        w_init is None
+        or not _is_supported_float_dtype(w_init.data_type)
+        or len(w_init.dims) != 2
+    ):
+        return None
+
+    underlying = indices_name
+    if underlying not in graph_input_names:
+        cast_node = node_by_output.get(underlying)
+        if (
+            cast_node is not None
+            and cast_node.op_type == "Cast"
+            and len(cast_node.input) == 1
+            and cast_node.input[0] in graph_input_names
+        ):
+            underlying = cast_node.input[0]
+        else:
+            return None  # not a graph input, nor a Cast of one
+
+    consumers = consumers_of.get(w_name, [])
+    if node not in consumers or not (1 <= len(consumers) <= 2):
+        return None  # unexpected consumer count -- decline, don't guess
+
+    return w_name, indices_name, underlying
+
+
+def _match_lm_head_tail(
+    node: onnx.NodeProto,
+    initializer_map: Dict[str, onnx.TensorProto],
+    consumers_of: Dict[str, List[onnx.NodeProto]],
+    vocab_size: int,
+) -> Any:
+    """Resolves `node` (an already-matched MatMul/Gemm producing
+    `vocab_size`-wide output) to its own bias, if any, and the node whose
+    *output* is the real, final logits tensor -- returns
+    ``(bias_name_or_None, output_node)``, or the `_LM_HEAD_BIAS_INVALID`
+    sentinel when a bias exists but not in a shape this pass safely
+    handles. Two shapes are recognized: a `Gemm` node's own built-in
+    (constant, vocab-width) `C` input needs no extra hop at all
+    (`output_node` is `node` itself); a plain `MatMul` (which has no
+    built-in bias) followed by exactly one `Add` against a constant
+    vocab-width operand, with no other consumer of `node`'s own output, is
+    also recognized -- an extremely common real export shape (`nn.Linear`
+    with `bias=True` exported as `MatMul` + `Add` rather than `Gemm`, e.g.
+    whenever the surrounding hidden state is 3-D and `Gemm`'s lack of
+    batch-dim support already forced `MatMul` in the first place) --
+    `output_node` is then the `Add`, since *its* output is the tensor a
+    graph-output/shape-staleness check must actually look at, not the raw
+    `MatMul`'s own. Anything else that still looks bias-shaped (more than
+    one consumer of `node`'s output, an `Add` whose other operand isn't a
+    constant vocab-width tensor, ...) returns the sentinel -- declined
+    rather than silently left stale, since this pass has no broader
+    mechanism to keep an unrecognized bias hop in sync with the new
+    (smaller) vocab width.
+    """
+
+    def _valid_bias(name: str) -> bool:
+        b_init = initializer_map.get(name)
+        return (
+            b_init is not None
+            and _is_supported_float_dtype(b_init.data_type)
+            and list(b_init.dims) in ([vocab_size], [1, vocab_size])
+        )
+
+    if node.op_type == "Gemm" and len(node.input) == 3 and node.input[2]:
+        bias_name = node.input[2]
+        if not _valid_bias(bias_name):
+            return _LM_HEAD_BIAS_INVALID
+        return bias_name, node
+
+    out_name = node.output[0]
+    out_consumers = consumers_of.get(out_name, [])
+    if not out_consumers:
+        return None, node  # no bias, nothing downstream -- node is final
+    if any(c.op_type == "Add" for c in out_consumers):
+        if len(out_consumers) != 1 or len(out_consumers[0].input) != 2:
+            return _LM_HEAD_BIAS_INVALID  # ambiguous fan-out -- decline
+        add_node = out_consumers[0]
+        other = (
+            add_node.input[0] if add_node.input[1] == out_name else add_node.input[1]
+        )
+        if not _valid_bias(other):
+            return _LM_HEAD_BIAS_INVALID
+        return other, add_node
+    return None, node  # output feeds something else entirely -- no bias here
+
+
+def _match_tied_lm_head(
+    weight_name: str,
+    vocab_size: int,
+    gather_node: onnx.NodeProto,
+    consumers_of: Dict[str, List[onnx.NodeProto]],
+    initializer_map: Dict[str, onnx.TensorProto],
+) -> Optional[_LMHeadMatch]:
+    """If the embedding table `weight_name` has a second consumer besides
+    `gather_node`, and that second consumer resolves to one of the two
+    tied `lm_head` sub-shapes this section's own comment describes
+    (direct `Gemm(transB=1)`, or one `Transpose` then a plain
+    `MatMul`/`Gemm(transB=0)`), returns the matched :class:`_LMHeadMatch`
+    (`tied=True`, `weight_name`/`weight_transposed` left `None` -- the
+    shared initializer is already fully accounted for by the embedding
+    weight's own slice, nothing more to do for it here). Returns `None`
+    both when there is no second consumer at all (an ordinary untied
+    embedding -- the caller falls back to :func:`_match_untied_lm_head`)
+    and when there *is* one but it doesn't resolve to either recognized
+    shape (an unexplained second reader -- the caller must then decline
+    the whole chain, not just skip lm_head detection, since slicing the
+    shared weight would silently corrupt that unrecognized consumer too).
+    """
+    others = [c for c in consumers_of.get(weight_name, []) if c is not gather_node]
+    if len(others) != 1:
+        return None
+    other = others[0]
+
+    match = _match_matmul_like(other)
+    if match is not None:
+        _, w2, weight_transposed = match
+        if w2 == weight_name and weight_transposed:
+            tail = _match_lm_head_tail(other, initializer_map, consumers_of, vocab_size)
+            if tail is _LM_HEAD_BIAS_INVALID:
+                return None
+            bias, output_node = tail
+            return _LMHeadMatch(
+                node=output_node,
+                tied=True,
+                weight_name=None,
+                weight_transposed=None,
+                bias=bias,
+                via_transpose=None,
+            )
+        return None
+
+    if other.op_type == "Transpose" and list(other.input) == [weight_name]:
+        perm = None
+        for attr in other.attribute:
+            if attr.name == "perm":
+                perm = list(attr.ints)
+        if perm is not None and perm != [1, 0]:
+            return None
+        t_out = other.output[0]
+        t_consumers = consumers_of.get(t_out, [])
+        if len(t_consumers) != 1:
+            return None
+        node2 = t_consumers[0]
+        match2 = _match_matmul_like(node2)
+        if match2 is None:
+            return None
+        _, w3, weight_transposed2 = match2
+        if w3 != t_out or weight_transposed2:
+            return (
+                None  # must consume the transposed [hidden, vocab] tensor untransposed
+            )
+        tail = _match_lm_head_tail(node2, initializer_map, consumers_of, vocab_size)
+        if tail is _LM_HEAD_BIAS_INVALID:
+            return None
+        bias, output_node = tail
+        return _LMHeadMatch(
+            node=output_node,
+            tied=True,
+            weight_name=None,
+            weight_transposed=None,
+            bias=bias,
+            via_transpose=other,
+        )
+
+    return None
+
+
+def _match_untied_lm_head(
+    graph: onnx.GraphProto,
+    embedding_weight_name: str,
+    vocab_size: int,
+    consumers_of: Dict[str, List[onnx.NodeProto]],
+    initializer_map: Dict[str, onnx.TensorProto],
+    graph_outputs: Set[str],
+) -> Optional[_LMHeadMatch]:
+    """Auto-detects a fully independent `lm_head` weight: exactly one
+    MatMul/vanilla-Gemm node in the whole graph whose constant 2-D weight
+    is distinct from `embedding_weight_name`, has exactly one consumer,
+    produces `vocab_size`-wide output, and -- the one structural signal
+    that reliably distinguishes "the" vocab-logits projection from some
+    unrelated layer of the same output width -- whose *final* output
+    (:func:`_match_lm_head_tail`'s own `output_node`, which is the node
+    itself or, for a recognized `MatMul`-then-`Add(bias)` tail, the `Add`)
+    is itself a genuine graph output. Zero or more than one such candidate
+    is declined (`None`) rather than guessed at; only ever called when
+    :func:`_match_tied_lm_head` already found no tied lm_head to prefer.
+    """
+    candidates = []
+    for node in graph.node:
+        match = _match_matmul_like(node)
+        if match is None:
+            continue
+        _, w_name, weight_transposed = match
+        if w_name == embedding_weight_name:
+            continue  # handled by the tied path, not here
+        w_init = initializer_map.get(w_name)
+        if (
+            w_init is None
+            or not _is_supported_float_dtype(w_init.data_type)
+            or len(w_init.dims) != 2
+        ):
+            continue
+        n_channels = w_init.dims[0] if weight_transposed else w_init.dims[1]
+        if n_channels != vocab_size or len(consumers_of.get(w_name, [])) != 1:
+            continue
+        tail = _match_lm_head_tail(node, initializer_map, consumers_of, vocab_size)
+        if tail is _LM_HEAD_BIAS_INVALID:
+            continue  # not a confident candidate -- skip, don't guess
+        bias, output_node = tail
+        if output_node.output[0] not in graph_outputs:
+            continue
+        candidates.append((w_name, weight_transposed, bias, output_node))
+
+    if len(candidates) != 1:
+        return None
+    w_name, weight_transposed, bias, output_node = candidates[0]
+    return _LMHeadMatch(
+        node=output_node,
+        tied=False,
+        weight_name=w_name,
+        weight_transposed=weight_transposed,
+        bias=bias,
+        via_transpose=None,
+    )
+
+
+def _match_embedding_chain(
+    graph: onnx.GraphProto, input_name: Optional[str]
+) -> Optional[_EmbeddingChain]:
+    """Finds the one token-embedding `Gather` this pass should act on
+    (plus its tied/untied `lm_head`, if any) -- see this section's own
+    comment above for the full matching/safety bar. When `input_name` is
+    given, only a `Gather` whose indices resolve to that exact graph
+    input is considered, and it is an error (`ValueError` -- a caller
+    mistake, not an ambiguous topology) if none does. When `input_name`
+    is omitted, exactly one qualifying `Gather` must exist in the whole
+    graph -- zero or more than one (with no way to tell which is "the"
+    token embedding, e.g. a `position_ids`-driven positional embedding
+    matches the identical structural shape) declines the whole call
+    (`None`), the model left completely untouched.
+    """
+    initializer_map = {t.name: t for t in graph.initializer}
+    consumers_of = _consumers_of(graph)
+    node_by_output = {out: n for n in graph.node for out in n.output}
+    graph_outputs = {o.name for o in graph.output}
+    graph_input_names = {i.name for i in graph.input}
+
+    matches = []
+    for node in graph.node:
+        m = _match_embedding_gather(
+            node, initializer_map, consumers_of, graph_input_names, node_by_output
+        )
+        if m is None:
+            continue
+        w_name, indices_name, underlying = m
+        if input_name is not None and input_name not in (indices_name, underlying):
+            continue
+        matches.append((node, w_name))
+
+    if input_name is not None and not matches:
+        raise ValueError(
+            f"no embedding Gather found reading graph input {input_name!r}"
+        )
+    if len(matches) != 1:
+        return None  # zero, or ambiguous with no input_name to disambiguate
+
+    gather_node, w_name = matches[0]
+    w_init = initializer_map[w_name]
+    vocab_size, hidden_size = int(w_init.dims[0]), int(w_init.dims[1])
+    indices_name = gather_node.input[1]
+
+    consumers = consumers_of.get(w_name, [])
+    if len(consumers) == 2:
+        lm_head = _match_tied_lm_head(
+            w_name, vocab_size, gather_node, consumers_of, initializer_map
+        )
+        if lm_head is None:
+            return None  # unexplained second consumer -- decline, don't guess
+    else:
+        lm_head = _match_untied_lm_head(
+            graph, w_name, vocab_size, consumers_of, initializer_map, graph_outputs
+        )
+
+    return _EmbeddingChain(
+        gather=gather_node,
+        weight_name=w_name,
+        indices_name=indices_name,
+        vocab_size=vocab_size,
+        hidden_size=hidden_size,
+        lm_head=lm_head,
+    )
+
+
+def _drop_value_info(graph: onnx.GraphProto, name: str) -> None:
+    kept = [vi for vi in graph.value_info if vi.name != name]
+    if len(kept) != len(graph.value_info):
+        del graph.value_info[:]
+        graph.value_info.extend(kept)
+
+
+def _update_vocab_output_shape(
+    graph: onnx.GraphProto, name: str, old_v: int, new_v: int
+) -> bool:
+    """If `name` is a declared graph output with a fixed (`dim_value`) last
+    shape dimension equal to `old_v`, updates it to `new_v` in place and
+    returns True. Every other pass in this module forbids the dimension it
+    resizes from ever reaching a graph output at all (see this module's own
+    docstring); this pass is the first that can't make that same
+    restriction (an `lm_head`'s vocab-logits output routinely *is* the
+    model's own output), so unlike every other pass's `stale_value_info`
+    handling (which only ever needs to drop an internal `value_info`
+    entry -- see :func:`_drop_value_info`), a stale *graph output* shape
+    needs to be actively corrected, not just dropped -- an output entry
+    can't be removed the way an internal one can. A symbolic (dim_param)
+    or altogether absent last dimension is left alone -- nothing there
+    could have gone stale.
+    """
+    for o in graph.output:
+        if o.name != name:
+            continue
+        dims = o.type.tensor_type.shape.dim
+        if (
+            len(dims) >= 1
+            and dims[-1].HasField("dim_value")
+            and dims[-1].dim_value == old_v
+        ):
+            dims[-1].dim_value = new_v
+        return True
+    return False
+
+
+def _finalize_embedding_shapes(
+    graph: onnx.GraphProto, chain: _EmbeddingChain, new_v: int
+) -> None:
+    """Invalidates/corrects every downstream shape this pass's slicing
+    makes stale. The `Gather` node's own output shape never needs
+    touching -- gathering along `axis=0` doesn't change `hidden_size`, the
+    only dimension its own output shape carries from the embedding table.
+    An `lm_head`'s output (and, for the tied "Transpose then MatMul"
+    sub-shape, the `Transpose`'s own output) *does* change width
+    (`vocab_size` -> `new_v`) and is handled here.
+    """
+    if chain.lm_head is None:
+        return
+    out_name = chain.lm_head.node.output[0]
+    if not _update_vocab_output_shape(graph, out_name, chain.vocab_size, new_v):
+        _drop_value_info(graph, out_name)
+    if chain.lm_head.via_transpose is not None:
+        t_out = chain.lm_head.via_transpose.output[0]
+        if not _update_vocab_output_shape(graph, t_out, chain.vocab_size, new_v):
+            _drop_value_info(graph, t_out)
+
+
+def _apply_embedding_vocab_prune(
+    model: onnx.ModelProto, chain: _EmbeddingChain, keep_ids: List[int]
+) -> onnx.ModelProto:
+    """Performs the actual slicing for an already-decided (ascending)
+    `keep_ids` set: the embedding table's own `vocab_size` axis (axis 0,
+    always -- the Gather's own `axis=0` requirement), and, for an untied
+    `lm_head`, its own independent weight/bias. A tied `lm_head`'s weight
+    needs no separate slicing call at all: it *is* the embedding table
+    (the exact same initializer object), already fully accounted for by
+    the one slice below.
+    """
+    out = onnx.ModelProto()
+    out.CopyFrom(model)
+    graph = out.graph
+    initializer_map = {t.name: t for t in graph.initializer}
+    keep = np.asarray(keep_ids, dtype=np.int64)
+    new_v = len(keep_ids)
+
+    _slice_axis(initializer_map[chain.weight_name], keep, axis=0)
+
+    if chain.lm_head is not None and not chain.lm_head.tied:
+        assert chain.lm_head.weight_name is not None
+        assert chain.lm_head.weight_transposed is not None
+        _slice_producer_weight(
+            initializer_map[chain.lm_head.weight_name],
+            chain.lm_head.weight_transposed,
+            keep,
+            is_conv=False,
+        )
+    if chain.lm_head is not None and chain.lm_head.bias is not None:
+        _slice_last_axis(initializer_map[chain.lm_head.bias], keep)
+
+    _finalize_embedding_shapes(graph, chain, new_v)
+    return out
+
+
+@dataclass(frozen=True)
+class EmbeddingPruningResult:
+    """Return type of :func:`apply_embedding_vocab_pruning`/
+    :func:`apply_embedding_vocab_magnitude_pruning` -- deliberately *not*
+    a bare `onnx.ModelProto` the way every other `apply_*` function in
+    this module returns, precisely because this pass changes what counts
+    as a valid model *input* (see this section's own comment above), and a
+    caller silently treating `result` as if it were a plain pruned model
+    (e.g. chaining it straight into another `apply_*` call, or feeding
+    original-vocabulary `input_ids` straight to `result.model`) is exactly
+    the mistake this shape exists to make hard to make by accident.
+
+    :ivar model: the pruned `onnx.ModelProto` -- unchanged from the input
+            model when `matched` is False.
+    :ivar matched: False when no eligible embedding `Gather` was found (see
+            :func:`_match_embedding_chain`'s own docstring for every reason
+            that can happen) -- `model` is then a plain, untouched copy of
+            the original, and `kept_token_ids`/`id_map` are both `None`.
+    :ivar kept_token_ids: the original (pre-pruning) token ids that survive,
+            **sorted ascending** -- row `i` of the pruned embedding table
+            (and, if `lm_head_pruned`, column `i` of the pruned logits
+            output) corresponds to ``kept_token_ids[i]`` in the *original*
+            vocabulary. `None` iff `matched` is False.
+    :ivar id_map: ``{old_token_id: new_token_id}`` for every kept id --
+            exactly ``{tok: i for i, tok in enumerate(kept_token_ids)}``,
+            provided directly so a caller doesn't have to reconstruct it.
+            **Every caller of `model` must remap its own `input_ids`
+            through this mapping before running the model** -- a dropped
+            token id (any id not present as a key) can no longer be fed to
+            `model` at all; `id_map` has no entry for it. `None` iff
+            `matched` is False.
+    :ivar lm_head_pruned: whether a tied or untied `lm_head` was also
+            resized (its output logits then have `len(kept_token_ids)`
+            columns, ordered the same way `kept_token_ids` orders the
+            embedding table's rows). When False and `matched` is True, any
+            `lm_head` in the model -- untied and not confidently
+            auto-identified, or none present -- was left completely
+            untouched: still safe to run (it simply still produces
+            full-original-vocabulary-width logits, unaffected by the
+            embedding-side renumbering, so no output-side remapping is
+            needed in that case).
+    """
+
+    model: onnx.ModelProto
+    matched: bool
+    kept_token_ids: Optional[List[int]] = None
+    id_map: Optional[Dict[int, int]] = None
+    lm_head_pruned: bool = False
+
+
+def apply_embedding_vocab_pruning(
+    model: Union[str, onnx.ModelProto],
+    keep_token_ids: Optional[Sequence[int]] = None,
+    drop_token_ids: Optional[Sequence[int]] = None,
+    input_name: Optional[str] = None,
+) -> EmbeddingPruningResult:
+    """Shrinks a matched token-embedding `Gather`'s vocabulary axis (and,
+    where a tied or confidently-auto-identified untied `lm_head` exists,
+    its own vocab-logits projection too) down to a caller-supplied,
+    explicit keep-set. This is the primary, default-recommended entry
+    point in this section -- see this module's own "Embedding / lm_head
+    vocabulary pruning" section comment for why: calibration data can show
+    a token id *was* used, never that it is safe to drop in general, so
+    (unlike every other technique in this module) there is no defensible
+    way to *infer* a safe keep-set from data alone. The caller -- who
+    controls the tokenizer/deployment's own restricted vocabulary -- is
+    expected to already know it; this function's only job is to slice
+    every matched consumer to agree with it, correctly.
+
+    **Contract change, unmissable on purpose**: unlike every other
+    `apply_*` function in this module, the pruned model this returns does
+    **not** accept the same `input_ids` values the original model did.
+    Token id `i` is only ever a valid input going forward if
+    ``i in result.id_map`` -- feed `result.id_map[i]` in its place,
+    for every input id, before running `result.model`. A dropped id (any
+    id not in `keep_token_ids`, or in `drop_token_ids`) can never be fed
+    to the pruned model again at all. See :class:`EmbeddingPruningResult`'s
+    own docstring for the full return-value contract this enforces.
+
+    :param model: the original onnx ModelProto or file path
+    :param keep_token_ids: the exact set of original token ids to keep,
+            in any order/with any duplicates (deduplicated internally,
+            then sorted ascending to decide the new row/column order --
+            see :class:`EmbeddingPruningResult`). Give exactly one of
+            `keep_token_ids`/`drop_token_ids`.
+    :param drop_token_ids: the exact set of original token ids to drop;
+            every other id in ``range(vocab_size)`` is kept. Give exactly
+            one of `keep_token_ids`/`drop_token_ids`.
+    :param input_name: when the graph has more than one structurally-
+            eligible embedding `Gather` (e.g. a positional embedding also
+            reading a genuine graph input), names which one to target by
+            its `indices` operand's graph input name (e.g. ``"input_ids"``).
+            Required in that case -- omitted, an ambiguous graph declines
+            the whole call rather than guessing. A name that matches no
+            eligible `Gather` raises `ValueError` (a caller mistake, not an
+            ambiguous topology).
+    :returns: an :class:`EmbeddingPruningResult` -- see its own docstring.
+            `matched` is False (model left completely untouched) for any
+            topology this pass doesn't confidently recognize: a non-zero
+            `Gather` axis, indices that aren't a graph input (or a `Cast`
+            of one), a non-constant/wrong-dtype/non-2-D embedding weight,
+            an embedding weight with more than the expected one-or-two
+            consumers (or a second consumer that isn't one of the two
+            recognized tied `lm_head` shapes), or an ambiguous/absent
+            match for `input_name` (or no `input_name` given, more than
+            one eligible `Gather`).
+    """
+    if (keep_token_ids is None) == (drop_token_ids is None):
+        raise ValueError(
+            "give exactly one of keep_token_ids or drop_token_ids, not both/neither"
+        )
+    if isinstance(model, str):
+        model = onnx.load(model, load_external_data=False)
+
+    chain = _match_embedding_chain(model.graph, input_name)
+    if chain is None:
+        out = onnx.ModelProto()
+        out.CopyFrom(model)
+        return EmbeddingPruningResult(model=out, matched=False)
+
+    vocab_size = chain.vocab_size
+    if keep_token_ids is not None:
+        keep_set = {int(i) for i in keep_token_ids}
+    else:
+        assert drop_token_ids is not None
+        drop_set = {int(i) for i in drop_token_ids}
+        bad_drop = sorted(i for i in drop_set if not (0 <= i < vocab_size))
+        if bad_drop:
+            raise ValueError(
+                f"drop_token_ids out of range [0, {vocab_size}): {bad_drop[:5]}"
+            )
+        keep_set = set(range(vocab_size)) - drop_set
+    bad_keep = sorted(i for i in keep_set if not (0 <= i < vocab_size))
+    if bad_keep:
+        raise ValueError(
+            f"keep_token_ids out of range [0, {vocab_size}): {bad_keep[:5]}"
+        )
+    if not keep_set:
+        raise ValueError("keep_token_ids resolves to an empty vocabulary")
+    keep_ids = sorted(keep_set)
+
+    out = _apply_embedding_vocab_prune(model, chain, keep_ids)
+    id_map = {old: new for new, old in enumerate(keep_ids)}
+    return EmbeddingPruningResult(
+        model=out,
+        matched=True,
+        kept_token_ids=keep_ids,
+        id_map=id_map,
+        lm_head_pruned=chain.lm_head is not None,
+    )
+
+
+def apply_embedding_vocab_magnitude_pruning(
+    model: Union[str, onnx.ModelProto],
+    sparsity: float = 0.5,
+    protect_token_ids: Optional[Sequence[int]] = None,
+    input_name: Optional[str] = None,
+) -> EmbeddingPruningResult:
+    """The importance-ranked variant of :func:`apply_embedding_vocab_pruning`:
+    drops the lowest-L2-norm ``sparsity`` fraction of vocabulary rows
+    (combined, root-sum-square, with the matched untied `lm_head`'s own
+    per-row weight norm when one is identified -- the tied case needs no
+    such combination, the embedding table's own row norm already *is*
+    the tied `lm_head`'s row norm) -- the same magnitude-based spirit as
+    this module's own :func:`apply_magnitude_pruning`, and, like that
+    function, needs no calibration data at all.
+
+    **This mode's safety bar is meaningfully weaker than
+    :func:`apply_embedding_vocab_pruning`'s own explicit keep-set, and
+    that must stay in view for anyone using it**: a small embedding-row
+    norm means a token was *initialized/trained with small weights*, not
+    that it is safe to drop from a real deployment's input space -- a
+    rare-but-still-legitimate token (a domain-specific term, a rare
+    Unicode codepoint, a special/control token used only in some request
+    paths) can easily have a small norm despite being load-bearing for
+    those requests. Using this function without validating the *actual*
+    resulting model against the deployment's real expected input
+    distribution risks silently breaking real inputs the same way any
+    other unvalidated pruning would -- except here "breaking" specifically
+    means a token id that used to work now raises an out-of-bounds
+    `Gather` index at runtime (not present in `result.id_map` at all), not
+    merely a small accuracy regression. `protect_token_ids` (below) covers
+    the common, cheap case of guaranteeing a known-important set (special
+    tokens, an explicit small always-needed set) never gets ranked away by
+    norm alone, but does not by itself make norm-based ranking a safe
+    substitute for the explicit-keep-set entry point in general.
+
+    Same contract change as :func:`apply_embedding_vocab_pruning` -- see
+    its own docstring and :class:`EmbeddingPruningResult`'s.
+
+    :param model: the original onnx ModelProto or file path
+    :param sparsity: target fraction of `vocab_size` to drop (floored so at
+            least one row, and every `protect_token_ids` row, always
+            survives)
+    :param protect_token_ids: token ids to always keep regardless of their
+            own norm ranking -- folded into the keep-set before ranking
+            fills any remaining budget from the rest
+    :param input_name: identical to :func:`apply_embedding_vocab_pruning`'s
+            own `input_name` -- disambiguates which `Gather` to target when
+            more than one structurally-eligible one exists
+    :returns: an :class:`EmbeddingPruningResult` -- see
+            :func:`apply_embedding_vocab_pruning`'s own docstring for
+            exactly which topologies decline (`matched=False`)
+    """
+    if not (0.0 <= sparsity < 1.0):
+        raise ValueError(f"sparsity must be in [0, 1), got {sparsity}")
+    if isinstance(model, str):
+        model = onnx.load(model, load_external_data=False)
+
+    chain = _match_embedding_chain(model.graph, input_name)
+    if chain is None:
+        out = onnx.ModelProto()
+        out.CopyFrom(model)
+        return EmbeddingPruningResult(model=out, matched=False)
+
+    vocab_size = chain.vocab_size
+    initializer_map = {t.name: t for t in model.graph.initializer}
+    emb = _to_f64(initializer_map[chain.weight_name])
+    importance = np.sum(np.square(emb), axis=1)
+    if (
+        chain.lm_head is not None
+        and not chain.lm_head.tied
+        and chain.lm_head.weight_name is not None
+    ):
+        lw = _to_f64(initializer_map[chain.lm_head.weight_name])
+        lw_nk = (
+            lw if chain.lm_head.weight_transposed else lw.T
+        )  # -> [vocab_size, hidden]
+        importance = importance + np.sum(np.square(lw_nk), axis=1)
+    importance = np.sqrt(importance)
+
+    protect = {int(i) for i in (protect_token_ids or ())}
+    bad_protect = sorted(i for i in protect if not (0 <= i < vocab_size))
+    if bad_protect:
+        raise ValueError(
+            f"protect_token_ids out of range [0, {vocab_size}): {bad_protect[:5]}"
+        )
+
+    keep_count = max(1, min(vocab_size, round(vocab_size * (1.0 - sparsity))))
+    keep_count = max(keep_count, len(protect))
+    order = np.argsort(-importance)
+    keep_set = set(protect)
+    for idx in order:
+        if len(keep_set) >= keep_count:
+            break
+        keep_set.add(int(idx))
+    keep_ids = sorted(keep_set)
+
+    out = _apply_embedding_vocab_prune(model, chain, keep_ids)
+    id_map = {old: new for new, old in enumerate(keep_ids)}
+    return EmbeddingPruningResult(
+        model=out,
+        matched=True,
+        kept_token_ids=keep_ids,
+        id_map=id_map,
+        lm_head_pruned=chain.lm_head is not None,
+    )
+
+
 # --- Transformer block (depth) pruning --------------------------------------
 #
 # Every technique above prunes *within* a layer -- channels, heads, experts,
