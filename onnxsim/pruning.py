@@ -8562,6 +8562,718 @@ def apply_structured_pruning_qdq(
     return out
 
 
+# --- MatMulNBits (block-quantized weight) structured pruning ---------------
+#
+# ``com.microsoft::MatMulNBits`` is the weight-only block quantization op
+# ONNX Runtime GenAI's Model Builder emits for essentially every Linear
+# layer in current (2024-2026) ONNX exports of Llama/Phi/Mistral/Qwen/Gemma-
+# family models -- distinct from, and today probably more common for LLM
+# deployment specifically than, the QDQ (``DequantizeLinear``-fed int8/
+# uint8) pattern the section above handles. Unlike QDQ, the quantized
+# weight here is never a separate initializer feeding a generic MatMul/Gemm
+# through a dequantize node -- ``MatMulNBits`` IS the compute node itself,
+# owning its packed weight/scale/zero-point/bias operands directly. This
+# section is therefore a new, self-contained matcher + pass (mirroring the
+# QDQ section's own *shape* -- producer/consumer chain walk, "slice, don't
+# recompute", rank-by-dequantized-row-norm importance -- but not literally
+# extending :class:`_WeightRef`/:func:`_resolve_weight_ref`, for the same
+# reason the QDQ section itself gave for not retrofitting the plain-float
+# machinery: this op's operand shapes/packing are unrelated enough that
+# sharing code would risk both, for no compensating benefit).
+#
+# Every fact this section depends on was confirmed empirically, not
+# assumed, against this environment's live onnxruntime (1.29.0) install --
+# via ``onnxruntime.capi.onnxruntime_pybind11_state.get_all_operator_schema()``
+# for the schema itself, and a real ``onnxruntime.InferenceSession`` run
+# for the packing layout and dequantization formula (see this section's own
+# tests, e.g. ``test_matmul_nbits_pruning_producer_axis_oracle``, for the
+# same round-trip re-run as an executable check rather than a comment-only
+# claim):
+#
+#   * Inputs, in order: ``A`` (T1: float32/float16/bfloat16, unquantized
+#     activation), ``B`` (T2: uint8 -- the packed/quantized weight),
+#     ``scales`` (T1), ``zero_points`` (optional; T3: uint8 OR T1),
+#     ``g_idx`` (optional; T4: int32 -- "group_idx. This input is
+#     deprecated", per the live schema's own doc string), ``bias``
+#     (optional, T1). A naive guess of "4 inputs" would have been wrong --
+#     there are up to 6, and ``g_idx`` in particular is real, present in
+#     the live 1.29.0 schema, not a hypothetical.
+#   * Attributes: ``K``/``N`` (required ints -- input/output feature
+#     counts of the logical, unquantized ``[N, K]`` weight matrix),
+#     ``block_size`` (required int; "must be a power of two and not
+#     smaller than 16"), ``bits`` (optional, default 4 -- confirmed from
+#     the schema's own serialized default-value proto, not guessed;
+#     "supported values: 2, 4, 8"), ``accuracy_level`` (optional, doesn't
+#     affect layout, ignored here), ``weight_prepacked`` (optional,
+#     default 0; "If set, input B is already prepacked into an EP-specific
+#     layout" -- a nonzero value means ``B``'s bytes are in an opaque,
+#     hardware-specific layout this section's slicing logic does not
+#     understand, so it is always declined).
+#   * ``B``'s packing layout -- confirmed by hand-packing a known float
+#     weight matrix, building a real ``MatMulNBits`` node from the packed
+#     bytes, running it through a real CPU ``InferenceSession``, and
+#     checking the output matches an independently computed dequantize-
+#     then-matmul reference to float rounding error (~2e-7), not just
+#     "roughly the right ballpark": shape ``(N, k_blocks, blob_size)`` with
+#     ``k_blocks = ceil(K / block_size)`` and ``blob_size = block_size *
+#     bits / 8``, i.e. ``B``'s *leading* dimension is ``N`` (output
+#     channels) -- never sub-block-packed -- so producer-side (N-axis)
+#     pruning is a uniform row-slice exactly as a plausible a-priori guess
+#     would expect. Within each ``(n, k_block)`` blob, K-values are
+#     nibble-packed 2-per-byte, **low nibble first** (lower K index in the
+#     low nibble, matching the schema doc's own "the first 4 bits are
+#     stored in the lower 4 bits of a byte, and the second 4 bits are
+#     stored in the higher 4 bits" -- confirmed, not assumed, by the same
+#     InferenceSession round-trip).
+#   * ``scales``: shape exactly ``(N, k_blocks)``, same float dtype as
+#     ``A``. This section requires that exact rank-2 shape and declines
+#     anything else (e.g. a flattened ``(N * k_blocks,)`` 1-D tensor) --
+#     the live schema's own doc string states the 2-D shape and this
+#     section has only empirically verified that one, not any flattened
+#     alternative some export tool might in principle emit; broadening
+#     this is a follow-up, not a silent guess.
+#   * ``zero_points`` (optional): the live schema documents *two* valid
+#     encodings, and this section supports both, dispatching on
+#     ``zero_points``'s own dtype (never guessed, always read off the
+#     tensor itself): **packed** (``uint8``, shape ``(N, ceil(k_blocks *
+#     bits / 8))``, "same bit-packing method as Input B" -- confirmed by
+#     the same InferenceSession round-trip, substituting a packed
+#     ``zero_points`` tensor for the schema's documented default and
+#     checking the output changes exactly as the explicit zero-point
+#     would predict) or **unpacked** (same float dtype as ``A``, shape
+#     ``(N, k_blocks)``, one zero-point value per block, no packing at
+#     all -- confirmed by building the *same* logical model with an
+#     unpacked float ``zero_points`` tensor instead of a packed uint8 one
+#     and checking both real ``InferenceSession`` runs agree to float
+#     rounding error). When absent, the schema's own documented default
+#     applies: ``2 ** (bits - 1)`` for every block (8, for ``bits=4``).
+#   * ``bias`` (optional): shape ``[N]``, same float dtype as ``A`` --
+#     ordinary per-output-channel bias, added after the matmul.
+#
+# Scope boundaries this section lands on, deliberately, mirroring the QDQ
+# section's own conservative-decline posture (broadening any of these is a
+# safe follow-up; silently mishandling one is not):
+#
+#   * Only ``bits == 4`` is matched. The live schema allows 2/4/8, but this
+#     section's empirical round-trip above only exercised 4-bit packing
+#     (by far the dominant real-world case for the LLMs this op targets);
+#     2-bit and 8-bit packing use different nibble/byte-per-code ratios
+#     this section has not verified and therefore does not attempt.
+#   * ``weight_prepacked != 0`` is always declined (see above -- an
+#     opaque, EP-specific ``B`` layout).
+#   * ``g_idx`` present (non-empty) is always declined: a GPTQ-style
+#     column permutation index changes which *logical* K-column each
+#     block covers, so "prune this contiguous range of K" and "drop this
+#     block" no longer coincide the way the rest of this section assumes;
+#     correctly composing pruning with an arbitrary permutation is a
+#     materially harder, separate problem, out of scope here.
+#   * ``K`` not an exact multiple of ``block_size`` (a padded, partial
+#     final block) is declined: this section has not verified how ORT's
+#     own kernel treats the padding region of a partial final block (e.g.
+#     whether it's read at all), and getting that wrong would silently
+#     corrupt exactly the case this module's own test philosophy exists to
+#     catch. Every ``block_size`` this section accepts is additionally
+#     required to be a power of two, >= 16 -- the live schema's own stated
+#     constraint (also the set of sizes this environment's onnxruntime
+#     kernel actually accepts at runtime, confirmed empirically: a
+#     block_size of 8 raises "Only block sizes 16, 32, 64, 128, and 256
+#     are supported").
+#   * Both sides of a chain must themselves be ``MatMulNBits`` nodes: a
+#     ``MatMulNBits`` producer feeding a plain-float or QDQ consumer (or
+#     vice versa) is declined outright, unlike the QDQ section's own
+#     mix-and-match support for plain-float/QDQ pairs. ``MatMulNBits``-to-
+#     ``MatMulNBits`` chains (an activation between two Linear layers, both
+#     int4-quantized) are the overwhelmingly common real shape for the
+#     LLM graphs this op targets (Model Builder quantizes every Linear
+#     layer uniformly); a mixed-quantization-scheme chain is a real but
+#     narrower case, left to a follow-up rather than adding a third
+#     cross-product of slicing paths to this already safety-critical
+#     section.
+#   * No grouped/depthwise structure (there is none to speak of --
+#     ``MatMulNBits`` has no ``group`` attribute), gated (SwiGLU/GeGLU)
+#     pair, residual/skip-connection merge, or Concat-merged branch group
+#     is matched -- only the plain single producer -> [zero or more
+#     shape-preserving unary activations, `_UNARY_PASS_THROUGH`] -> single
+#     consumer topology, identical in spirit to the QDQ section's own
+#     ``_walk_to_consumer_qdq``.
+#   * A shared/tied ``B``/``scales``/``zero_points``/``bias`` tensor (read
+#     by more than one node) is declined by the matcher itself, the same
+#     bar every other matcher in this module is held to.
+#
+# The two pruning axes turn out just as asymmetric as the task investigating
+# this op predicted, for exactly the reason the packing layout above
+# implies:
+#
+#   * Producer-side (N-axis, output channels): ``B``'s, ``scales``'s, and
+#     (if present) ``bias``'s leading dimension IS ``N`` -- an ordinary,
+#     un-blocked row-slice for any subset of rows, in any count, the same
+#     "slice, don't recompute" pattern used everywhere else in this module.
+#     ``zero_points``, when present and **packed** (uint8, nibble-per-
+#     block), needs more care: it is nibble-packed along the *block* axis
+#     (one nibble per ``(n, k_block)`` pair), not the axis being sliced
+#     here, so a row-slice alone is safe (each row's own bytes are
+#     self-contained -- slicing whole rows never touches a byte shared
+#     with a different row). What genuinely does need care -- and is
+#     covered by a dedicated adversarial test
+#     (``test_matmul_nbits_pruning_producer_odd_row_count_zero_points``)
+#     -- is that a *consumer's* zero_points slicing along the *block* axis
+#     (below) drops individual per-block nibbles from the *middle* of each
+#     row's own packed bytes, which does shift byte alignment whenever the
+#     kept block count is odd; producer-side pruning has no such hazard
+#     (whole rows, whole bytes) but its own zero_points must still be
+#     unpacked/resliced/repacked correctly to avoid a much simpler but
+#     equally silent bug: forgetting this and naively byte-slicing
+#     ``zero_points`` along its own row axis together with a *smaller*
+#     ``zp_bytes`` width miscomputed from the wrong ``k_blocks`` would
+#     silently write back a wrong-width tensor.
+#   * Consumer-side (K-axis, input channels): each block of ``block_size``
+#     K-values shares one scale/zero-point and is nibble-packed together
+#     within ``B``, so an individual K-column cannot be dropped without
+#     re-quantizing its whole block -- out of scope (this module never
+#     invents new quantized values, only drops/keeps existing ones
+#     intact, exactly the QDQ section's own principle). This section
+#     therefore only supports dropping *entire* blocks: given the
+#     candidate keep-set computed the same way as everywhere else in this
+#     module (top-``keep_count`` producer output channels by dequantized
+#     L1/L2 row norm), :func:`_matmul_nbits_block_aligned_keep_blocks`
+#     checks whether that keep-set happens to already align to the
+#     consumer's own block boundaries (every block either wholly kept or
+#     wholly dropped) -- if so, the aligned whole blocks are dropped from
+#     ``B``/``scales``/``zero_points`` along the block axis (again a
+#     re-pack, not a raw byte-slice, for packed ``zero_points`` -- the
+#     block axis is exactly the nibble-packed axis here, unlike the
+#     producer-side row-slice above); if not, this chain's consumer-side
+#     (and therefore its paired producer-side) pruning is declined
+#     entirely, left completely untouched, rather than forcing either a
+#     partial-block re-quantization or a different, disagreeing keep-set
+#     between the two paired weights. See
+#     ``test_matmul_nbits_pruning_consumer_declines_non_block_aligned``
+#     for this decline path exercised directly.
+
+
+def _matmul_nbits_int_attr(
+    node: onnx.NodeProto, name: str, default: Optional[int] = None
+) -> Optional[int]:
+    for attr in node.attribute:
+        if attr.name == name:
+            return attr.i
+    return default
+
+
+def _set_matmul_nbits_int_attr(node: onnx.NodeProto, name: str, value: int) -> None:
+    for attr in node.attribute:
+        if attr.name == name:
+            attr.i = value
+            return
+    node.attribute.append(onnx.helper.make_attribute(name, value))
+
+
+@dataclass(frozen=True)
+class _MatMulNBitsWeight:
+    """A ``com.microsoft::MatMulNBits`` node's block-quantized weight
+    operands, matched by :func:`_match_matmul_nbits` -- see this section's
+    own top comment for the schema facts and packing layout this depends
+    on (empirically confirmed, not assumed). ``zero_points_packed``
+    distinguishes the two encodings the live schema allows: ``True`` for
+    nibble-packed ``uint8`` (same layout as `b_init`, along the block
+    axis), ``False`` for one unpacked float value per block (same dtype as
+    `scales_init`). Meaningless when `zero_points_init` is ``None``
+    (absent -- the schema's own documented default, ``2 ** (bits - 1)``,
+    applies).
+    """
+
+    node: onnx.NodeProto
+    b_init: onnx.TensorProto
+    scales_init: onnx.TensorProto
+    zero_points_init: Optional[onnx.TensorProto]
+    zero_points_packed: bool
+    bias_init: Optional[onnx.TensorProto]
+    N: int
+    K: int
+    bits: int
+    block_size: int
+    k_blocks: int
+
+
+_MATMUL_NBITS_VALID_BLOCK_SIZES = {16, 32, 64, 128, 256}
+
+
+def _match_matmul_nbits(
+    node: onnx.NodeProto,
+    initializer_map: Dict[str, onnx.TensorProto],
+    consumers_of: Dict[str, List[onnx.NodeProto]],
+) -> Optional[_MatMulNBitsWeight]:
+    """If `node` is a ``com.microsoft::MatMulNBits`` node matching every
+    scope boundary this section's own top comment documents, returns the
+    match. ``None`` whenever anything is ambiguous or out of the
+    empirically-verified scope, rather than guessing -- see that comment
+    for the exhaustive list of what's declined and why.
+    """
+    if node.op_type != "MatMulNBits" or node.domain != "com.microsoft":
+        return None
+    if len(node.input) < 3 or len(node.output) != 1:
+        return None
+    a_name, b_name, scales_name = node.input[0], node.input[1], node.input[2]
+    if not a_name or not b_name or not scales_name:
+        return None
+    zp_name = node.input[3] if len(node.input) > 3 and node.input[3] else None
+    g_idx_name = node.input[4] if len(node.input) > 4 and node.input[4] else None
+    bias_name = node.input[5] if len(node.input) > 5 and node.input[5] else None
+    if g_idx_name is not None:
+        return None  # GPTQ-style permutation -- declined, see section comment
+
+    block_size = _matmul_nbits_int_attr(node, "block_size")
+    N = _matmul_nbits_int_attr(node, "N")
+    K = _matmul_nbits_int_attr(node, "K")
+    if block_size is None or N is None or K is None or N <= 0 or K <= 0:
+        return None
+    if block_size not in _MATMUL_NBITS_VALID_BLOCK_SIZES:
+        return None
+    if K % block_size != 0:
+        return None  # padded/partial final block -- declined, see section comment
+    bits = _matmul_nbits_int_attr(node, "bits", 4)  # schema default: 4
+    if bits != 4:
+        return None  # only 4-bit packing empirically verified -- see section comment
+    weight_prepacked = _matmul_nbits_int_attr(node, "weight_prepacked", 0)
+    if weight_prepacked != 0:
+        return None  # EP-specific opaque prepacked layout -- see section comment
+
+    k_blocks = K // block_size
+    blob_size = block_size * bits // 8
+
+    b_init = initializer_map.get(b_name)
+    scales_init = initializer_map.get(scales_name)
+    if b_init is None or scales_init is None:
+        return None  # non-constant B/scales -- can't safely slice them
+    if b_init.data_type != onnx.TensorProto.UINT8:
+        return None
+    if list(b_init.dims) != [N, k_blocks, blob_size]:
+        return None
+    if scales_init.data_type not in (
+        onnx.TensorProto.FLOAT,
+        onnx.TensorProto.FLOAT16,
+        onnx.TensorProto.BFLOAT16,
+    ):
+        return None
+    if list(scales_init.dims) != [N, k_blocks]:
+        return None
+
+    zp_init = None
+    zp_packed = False
+    if zp_name is not None:
+        zp_init = initializer_map.get(zp_name)
+        if zp_init is None:
+            return None  # non-constant zero_points -- can't safely slice it
+        zp_bytes = (k_blocks * bits + 7) // 8
+        if zp_init.data_type == onnx.TensorProto.UINT8:
+            if list(zp_init.dims) != [N, zp_bytes]:
+                return None
+            zp_packed = True
+        elif zp_init.data_type == scales_init.data_type:
+            if list(zp_init.dims) != [N, k_blocks]:
+                return None
+            zp_packed = False
+        else:
+            return None
+
+    bias_init = None
+    if bias_name is not None:
+        bias_init = initializer_map.get(bias_name)
+        if bias_init is None or bias_init.data_type != scales_init.data_type:
+            return None  # non-constant, or dtype-mismatched, bias
+        if list(bias_init.dims) != [N]:
+            return None
+
+    for nm in (
+        (b_name, scales_name)
+        + ((zp_name,) if zp_name else ())
+        + ((bias_name,) if bias_name else ())
+    ):
+        if len(consumers_of.get(nm, [])) != 1:
+            return None  # shared/tied tensor -- another node reads it too
+
+    return _MatMulNBitsWeight(
+        node=node,
+        b_init=b_init,
+        scales_init=scales_init,
+        zero_points_init=zp_init,
+        zero_points_packed=zp_packed,
+        bias_init=bias_init,
+        N=N,
+        K=K,
+        bits=bits,
+        block_size=block_size,
+        k_blocks=k_blocks,
+    )
+
+
+def _unpack_nbits_nibbles(packed: np.ndarray, count: int) -> np.ndarray:
+    """Unpacks the last axis of `packed` (``uint8``, 2 4-bit values per
+    byte, **low nibble first** -- confirmed empirically, see this
+    section's own top comment) into `count` ``uint8`` values in [0, 15]
+    (dropping the last, padding, half-byte when `count` is odd).
+    """
+    nbytes = packed.shape[-1]
+    out = np.zeros(packed.shape[:-1] + (2 * nbytes,), dtype=np.uint8)
+    out[..., 0::2] = packed & 0x0F
+    out[..., 1::2] = (packed >> 4) & 0x0F
+    return out[..., :count]
+
+
+def _pack_nbits_nibbles(vals: np.ndarray) -> np.ndarray:
+    """Inverse of :func:`_unpack_nbits_nibbles`: packs the last axis
+    (``uint8`` values in [0, 15]) 2-per-byte, low nibble first, padding an
+    odd trailing count with a zero high nibble. This -- rather than a raw
+    byte-slice of the original packed tensor -- is exactly why this
+    section re-packs instead of slicing bytes directly: dropping an ODD
+    number of rows/blocks from the *middle* of a nibble-packed axis shifts
+    every subsequent kept value's nibble parity, silently corrupting the
+    result if not accounted for (see this section's own top comment and
+    ``test_matmul_nbits_pruning_producer_odd_row_count_zero_points``).
+    """
+    count = vals.shape[-1]
+    padded = vals
+    if count % 2:
+        pad_shape = vals.shape[:-1] + (1,)
+        padded = np.concatenate([vals, np.zeros(pad_shape, dtype=vals.dtype)], axis=-1)
+    lo = padded[..., 0::2].astype(np.uint8)
+    hi = padded[..., 1::2].astype(np.uint8)
+    return (lo & 0x0F) | ((hi & 0x0F) << 4)
+
+
+def _matmul_nbits_dequantized(w: _MatMulNBitsWeight) -> np.ndarray:
+    """The full float64 ``(N, K)`` dequantized weight matrix `w` refers to,
+    for IMPORTANCE RANKING ONLY -- never written back to the graph (this
+    module's own "slice, don't recompute" principle, exactly as the QDQ
+    section's :func:`_weight_ref_dequantized`). Formula and packing per
+    this section's own top comment, empirically confirmed against a real
+    ``InferenceSession``: ``dequantized[n, k] = (code[n, k] -
+    zero_point[n, k // block_size]) * scale[n, k // block_size]``.
+    """
+    b = onnx.numpy_helper.to_array(w.b_init)  # (N, k_blocks, blob_size) uint8
+    codes = _unpack_nbits_nibbles(b, w.block_size).astype(np.float64)
+    scales = onnx.numpy_helper.to_array(w.scales_init).astype(np.float64)
+    if w.zero_points_init is not None:
+        zp_raw = onnx.numpy_helper.to_array(w.zero_points_init)
+        if w.zero_points_packed:
+            zp = _unpack_nbits_nibbles(zp_raw, w.k_blocks).astype(np.float64)
+        else:
+            zp = zp_raw.astype(np.float64)
+    else:
+        zp = np.full((w.N, w.k_blocks), float(1 << (w.bits - 1)), dtype=np.float64)
+    dequant = (codes - zp[:, :, None]) * scales[:, :, None]  # (N, k_blocks, block_size)
+    return dequant.reshape(w.N, w.k_blocks * w.block_size)
+
+
+def _slice_matmul_nbits_producer_rows(w: _MatMulNBitsWeight, keep: np.ndarray) -> None:
+    """Slices `w`'s own N (output-channel) axis to `keep` (ascending
+    indices) -- the producer role. ``B``/``scales``/``bias`` (if present)
+    are all row-sliced directly (their leading dim IS ``N``, per this
+    section's own top comment); ``zero_points`` (if present) is also
+    row-sliced directly when unpacked, or unpacked/row-sliced/re-packed
+    when packed (whole-row-safe, no nibble-parity hazard for THIS axis --
+    see this section's own top comment -- but still requires re-deriving
+    the packed width from the correct row count, not a raw byte-slice).
+    Updates the node's own ``N`` attribute to ``len(keep)`` to keep it
+    consistent with the now-smaller tensors.
+    """
+    b = onnx.numpy_helper.to_array(w.b_init)
+    w.b_init.CopyFrom(onnx.numpy_helper.from_array(b[keep], name=w.b_init.name))
+
+    scales = onnx.numpy_helper.to_array(w.scales_init)
+    w.scales_init.CopyFrom(
+        onnx.numpy_helper.from_array(scales[keep], name=w.scales_init.name)
+    )
+
+    if w.zero_points_init is not None:
+        zp = onnx.numpy_helper.to_array(w.zero_points_init)
+        if w.zero_points_packed:
+            unpacked = _unpack_nbits_nibbles(zp, w.k_blocks)[keep]
+            repacked = _pack_nbits_nibbles(unpacked)
+            w.zero_points_init.CopyFrom(
+                onnx.numpy_helper.from_array(repacked, name=w.zero_points_init.name)
+            )
+        else:
+            w.zero_points_init.CopyFrom(
+                onnx.numpy_helper.from_array(zp[keep], name=w.zero_points_init.name)
+            )
+
+    if w.bias_init is not None:
+        bias = onnx.numpy_helper.to_array(w.bias_init)
+        w.bias_init.CopyFrom(
+            onnx.numpy_helper.from_array(bias[keep], name=w.bias_init.name)
+        )
+
+    _set_matmul_nbits_int_attr(w.node, "N", len(keep))
+
+
+def _matmul_nbits_block_aligned_keep_blocks(
+    keep: np.ndarray, k_blocks: int, block_size: int
+) -> Optional[np.ndarray]:
+    """Returns the ascending block indices (into the consumer's own
+    ``k_blocks``-sized block axis) that `keep` (ascending element indices
+    into its ``K``-length input axis) corresponds to when every
+    `block_size`-sized block is either wholly present in `keep` or wholly
+    absent -- or ``None`` when some block is only partially kept, meaning
+    this consumer cannot be safely pruned to this exact `keep` set at all
+    (see this section's own top comment: an individual K-column can't be
+    dropped without re-quantizing its whole block, out of scope). Since
+    :func:`_match_matmul_nbits` already declines any ``K`` not an exact
+    multiple of `block_size`, every block here is full-width -- there is
+    no partial *final* block to special-case.
+    """
+    keep_set = set(int(k) for k in keep)
+    keep_blocks = []
+    for kb in range(k_blocks):
+        k0 = kb * block_size
+        block_positions = set(range(k0, k0 + block_size))
+        overlap = block_positions & keep_set
+        if overlap == block_positions:
+            keep_blocks.append(kb)
+        elif overlap:
+            return None  # partial block -- not block-aligned, decline
+    return np.array(keep_blocks, dtype=np.int64)
+
+
+def _slice_matmul_nbits_consumer_blocks(
+    w: _MatMulNBitsWeight, keep_blocks: np.ndarray
+) -> None:
+    """Drops entire ``k_blocks``-axis blocks NOT in `keep_blocks`
+    (ascending block indices) from `w`'s own ``B``/``scales``/
+    ``zero_points`` -- the consumer role. Never invoked with a
+    non-block-aligned `keep_blocks`; see
+    :func:`_matmul_nbits_block_aligned_keep_blocks`, which computes and
+    validates it before this is called. Unlike the producer-side row-slice
+    above, a packed ``zero_points`` genuinely must be unpacked/re-sliced/
+    re-packed here (never a raw byte-slice): the block axis IS the
+    nibble-packed axis for `zero_points` (unlike `B`, whose nibble-packing
+    is along `block_size`, an entirely different, untouched-by-this-slice
+    axis), so dropping an odd number of blocks from the middle shifts
+    every subsequent kept block's nibble parity exactly the way the
+    producer-side row-slice's own docstring describes for its axis.
+    Updates the node's own ``K`` attribute to ``len(keep_blocks) *
+    block_size``.
+    """
+    b = onnx.numpy_helper.to_array(w.b_init)
+    w.b_init.CopyFrom(
+        onnx.numpy_helper.from_array(b[:, keep_blocks, :], name=w.b_init.name)
+    )
+
+    scales = onnx.numpy_helper.to_array(w.scales_init)
+    w.scales_init.CopyFrom(
+        onnx.numpy_helper.from_array(scales[:, keep_blocks], name=w.scales_init.name)
+    )
+
+    if w.zero_points_init is not None:
+        zp = onnx.numpy_helper.to_array(w.zero_points_init)
+        if w.zero_points_packed:
+            unpacked = _unpack_nbits_nibbles(zp, w.k_blocks)[:, keep_blocks]
+            repacked = _pack_nbits_nibbles(unpacked)
+            w.zero_points_init.CopyFrom(
+                onnx.numpy_helper.from_array(repacked, name=w.zero_points_init.name)
+            )
+        else:
+            w.zero_points_init.CopyFrom(
+                onnx.numpy_helper.from_array(
+                    zp[:, keep_blocks], name=w.zero_points_init.name
+                )
+            )
+
+    _set_matmul_nbits_int_attr(w.node, "K", len(keep_blocks) * w.block_size)
+
+
+@dataclass(frozen=True)
+class _MatMulNBitsChain:
+    producer: _MatMulNBitsWeight
+    chain_ops: Tuple[onnx.NodeProto, ...]
+    consumer: _MatMulNBitsWeight
+    n_channels: int
+
+
+def _walk_to_matmul_nbits_consumer(
+    start: str,
+    initializer_map: Dict[str, onnx.TensorProto],
+    consumers_of: Dict[str, List[onnx.NodeProto]],
+    graph_outputs: Set[str],
+    n_channels: int,
+    max_hops: int,
+) -> Optional[Tuple[_MatMulNBitsWeight, Tuple[onnx.NodeProto, ...]]]:
+    """From tensor `start` (a ``MatMulNBits`` producer's own output), walks
+    forward through shape-preserving unary activations (`_UNARY_PASS_THROUGH`)
+    with no other consumer anywhere along the way, until a ``MatMulNBits``
+    consumer is found whose input-channel count (``K``) matches
+    `n_channels`. No plain-float/QDQ consumer, no gated pair, no branch --
+    mirrors :func:`_walk_to_consumer_qdq` exactly, restricted to
+    ``MatMulNBits``-to-``MatMulNBits`` chains only (see this section's own
+    top comment for why). Returns ``None`` if the walk runs out of hops,
+    hits a branch, or never reaches such a consumer.
+    """
+    chain_ops: List[onnx.NodeProto] = []
+    cur = start
+    for _hop in range(max_hops):
+        candidates = consumers_of.get(cur, [])
+        if len(candidates) != 1:
+            return None
+        nxt = candidates[0]
+
+        if nxt.op_type == "MatMulNBits" and nxt.input[0] == cur:
+            w = _match_matmul_nbits(nxt, initializer_map, consumers_of)
+            if w is None or w.K != n_channels:
+                return None
+            return w, tuple(chain_ops)
+
+        if not (
+            nxt.op_type in _UNARY_PASS_THROUGH
+            and list(nxt.input) == [cur]
+            and len(nxt.output) == 1
+        ):
+            return None
+        out2 = nxt.output[0]
+        if len(consumers_of.get(out2, [])) != 1 or out2 in graph_outputs:
+            return None
+        chain_ops.append(nxt)
+        cur = out2
+    return None
+
+
+def _find_matmul_nbits_chains(graph: onnx.GraphProto) -> List[_MatMulNBitsChain]:
+    """The ``MatMulNBits`` analogue of :func:`_find_qdq_chains`, restricted
+    to ``MatMulNBits``-to-``MatMulNBits`` chains only (see this section's
+    own top comment).
+    """
+    initializer_map = {t.name: t for t in graph.initializer}
+    consumers_of = _consumers_of(graph)
+    graph_outputs = {o.name for o in graph.output}
+
+    def _is_internal(name: str) -> bool:
+        return len(consumers_of.get(name, [])) == 1 and name not in graph_outputs
+
+    chains: List[_MatMulNBitsChain] = []
+    for node in graph.node:
+        if node.op_type != "MatMulNBits":
+            continue
+        w = _match_matmul_nbits(node, initializer_map, consumers_of)
+        if w is None:
+            continue
+        out_name = node.output[0]
+        if not _is_internal(out_name):
+            continue
+        found = _walk_to_matmul_nbits_consumer(
+            out_name, initializer_map, consumers_of, graph_outputs, w.N, _MAX_CHAIN_HOPS
+        )
+        if found is None:
+            continue
+        consumer, chain_ops = found
+        chains.append(_MatMulNBitsChain(w, chain_ops, consumer, w.N))
+    return chains
+
+
+def apply_structured_pruning_matmul_nbits(
+    model: Union[str, onnx.ModelProto],
+    sparsity: float = 0.5,
+    importance_norm: _ImportanceNorm = "l2",
+) -> onnx.ModelProto:
+    """Removes whole output channels from a ``com.microsoft::MatMulNBits``
+    node (ONNX Runtime GenAI Model Builder's block-quantized, weight-only
+    int4 Linear-layer op -- see this module's "MatMulNBits (block-quantized
+    weight) structured pruning" section comment for the full empirical
+    schema/packing investigation this scope was reached from) whose output
+    feeds, through zero or more shape-preserving unary activations
+    (`_UNARY_PASS_THROUGH`) with no other consumer anywhere along that
+    path, into exactly one downstream ``MatMulNBits`` consumer whose input
+    (``K``) dimension matches.
+
+    Ranks the producer's output channels by L1/L2 norm of their own
+    dequantized weight row (:func:`_matmul_nbits_dequantized` --
+    dequantized for ranking only, per this module's "slice, don't
+    recompute" principle; the actual rewrite always slices the int4 codes/
+    scale/zero-point directly), drops the lowest-``sparsity``-fraction of
+    them, and checks whether that keep-set happens to align to the
+    consumer's own ``block_size`` boundaries (every block wholly kept or
+    wholly dropped, since a block's own K-values are quantized together
+    and can't be partially dropped without re-quantizing -- out of scope,
+    this module never invents new quantized values). When aligned, slices
+    the producer's ``B``/``scales``/``zero_points``/``bias`` (N-axis, any
+    row subset) and the consumer's ``B``/``scales``/``zero_points``
+    (K-axis, whole aligned blocks only) together, in lockstep, updating
+    both nodes' own ``N``/``K`` attributes to match. When NOT aligned for
+    a given chain, that chain (both producer and consumer) is left
+    completely untouched rather than forcing a partial-block
+    re-quantization or a disagreeing keep-set between the two.
+
+    Only ``MatMulNBits``-to-``MatMulNBits`` chains are matched (a
+    ``MatMulNBits`` producer/consumer paired with a plain-float or QDQ
+    weight on the other side is declined, unlike
+    :func:`apply_structured_pruning_qdq`'s own mix-and-match support) --
+    see this module's section comment for the full list of scope
+    boundaries (``bits`` restricted to 4, ``weight_prepacked`` and
+    ``g_idx`` always declined, no grouped/gated/residual/Concat-merge
+    topology, a padded partial final block declined, a shared/tied operand
+    declined).
+
+    :param model: onnx ModelProto object or file path
+    :param sparsity: fraction of each eligible producer's output channels to
+            drop (rounded, at least one channel is always kept)
+    :param importance_norm: ``"l2"`` (default, Li et al.'s original
+            filter-pruning criterion) or ``"l1"``
+    :returns: the pruned onnx ModelProto
+    """
+    if not (0.0 <= sparsity < 1.0):
+        raise ValueError(f"sparsity must be in [0, 1), got {sparsity}")
+    _validate_importance_norm(importance_norm)
+    if isinstance(model, str):
+        model = onnx.load(model, load_external_data=False)
+    out = onnx.ModelProto()
+    out.CopyFrom(model)
+    graph = out.graph
+
+    chains = _find_matmul_nbits_chains(graph)
+    if not chains:
+        return out
+
+    producer_touched: Set[str] = set()
+    consumer_touched: Set[str] = set()
+    stale_value_info: Set[str] = set()
+
+    for chain in chains:
+        p, c = chain.producer, chain.consumer
+        p_key, c_key = p.b_init.name, c.b_init.name
+        if p_key == c_key:
+            continue  # degenerate (the same weight in both roles)
+        if p_key in producer_touched or c_key in consumer_touched:
+            continue  # a shared/tied weight another chain already resized
+
+        n = chain.n_channels
+        keep_count = max(1, n - round(n * sparsity))
+        if keep_count >= n:
+            continue  # rounds down to nothing for this layer -- no-op
+
+        w_nk = _matmul_nbits_dequantized(p)
+        importance = _qdq_channel_importance(w_nk, importance_norm)
+        keep = np.sort(np.argsort(-importance)[:keep_count])
+
+        keep_blocks = _matmul_nbits_block_aligned_keep_blocks(
+            keep, c.k_blocks, c.block_size
+        )
+        if keep_blocks is None:
+            continue  # non-block-aligned request for this consumer --
+            # decline, see this section's own top comment
+
+        _slice_matmul_nbits_producer_rows(p, keep)
+        _slice_matmul_nbits_consumer_blocks(c, keep_blocks)
+
+        producer_touched.add(p_key)
+        consumer_touched.add(c_key)
+        stale_value_info.add(p.node.output[0])
+        stale_value_info.update(op.output[0] for op in chain.chain_ops)
+
+    if stale_value_info:
+        kept = [vi for vi in graph.value_info if vi.name not in stale_value_info]
+        del graph.value_info[:]
+        graph.value_info.extend(kept)
+    return out
+
+
 # --- Attention-head pruning -----------------------------------------------
 
 # Three fused self-attention ops are matched here -- two from the
