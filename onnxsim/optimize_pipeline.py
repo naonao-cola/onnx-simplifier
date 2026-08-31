@@ -11,14 +11,21 @@ techniques on top of a single fixed INT4 baseline.
    baseline every later stage builds on.
 2. **Prune** -- shrinking the model *before* quantizing means later stages
    spend their whole error budget on weights that survive, rather than on
-   ones that will end up zeroed/removed anyway. Two independent, data-free
+   ones that will end up zeroed/removed anyway. Two independent
    sub-stages, each optional and order-independent (they target disjoint
    node sets -- see this module's own "C++ vs. Python" note below):
-   - (optional, ``attention_sparsity``) :func:`onnxsim.apply_attention_head_pruning_cpp`
-     -- drops whole attention heads (or, for grouped-query attention, whole
-     KV groups) from every matched fused self-attention block.
-   - (optional, ``sparsity``) :func:`onnxsim.apply_structured_pruning_cpp`
-     -- channel/filter pruning of the remaining MatMul/Gemm/Conv layers.
+   - (optional, ``attention_sparsity``) drops whole attention heads (or,
+     for grouped-query attention, whole KV groups) from every matched
+     fused self-attention block --
+     :func:`onnxsim.apply_attention_head_pruning_cpp` (data-free,
+     magnitude-ranked, the default) or, with ``pruning_method="wanda"``,
+     :func:`onnxsim.apply_attention_head_wanda_pruning` (calibrated,
+     ranked by weight norm times the real activation norm flowing through
+     each unit).
+   - (optional, ``sparsity``) channel/filter pruning of the remaining
+     MatMul/Gemm/Conv layers -- :func:`onnxsim.apply_structured_pruning_cpp`
+     (data-free, the default) or, with ``pruning_method="wanda"``,
+     :func:`onnxsim.apply_structured_wanda_pruning` (calibrated).
 3. **Cross-Layer Equalize** (:func:`onnxsim.cross_layer_equalize`) -- always;
    data-free, changes nothing but weight parameterization (see its own
    docstring), and reduces the error every later quantization stage
@@ -28,12 +35,20 @@ techniques on top of a single fixed INT4 baseline.
      or, if ``calibration_data`` is available, ``bit_selection="mixed_precision"``
      upgrades this to :func:`onnxsim.apply_mixed_precision_quantization`
      (per-layer INT4/INT8 chosen by measured sensitivity).
-   - ``use_rotation=True``: :func:`onnxsim.apply_quarot_cpp` instead --
-     rotates the residual stream so *both* the weight and the activation
-     can drop to INT4 (data-free), a strictly more aggressive alternative
-     to the weight-only scheme above, at the cost of the refinement stage
-     below (AdaRound/Bias Correction only optimize the weight-only
-     scheme's own ``DequantizeLinear`` shape).
+   - ``use_rotation=True``: rotates the residual stream so *both* the
+     weight and the activation can drop to INT4, a strictly more
+     aggressive alternative to the weight-only scheme above, at the cost
+     of the refinement stage below (AdaRound/Bias Correction only
+     optimize the weight-only scheme's own ``DequantizeLinear`` shape).
+     ``rotation_method`` picks which rotation: ``"quarot"`` (the default)
+     -- :func:`onnxsim.apply_quarot_cpp`, data-free, a random orthogonal
+     rotation; ``"duquant"`` -- :func:`onnxsim.apply_duquant`, calibrated
+     permutation plus block-local random rotation, targeting the channels
+     the real activation distribution concentrates outliers in;
+     ``"spinquant"`` -- :func:`onnxsim.apply_spinquant`, a calibrated
+     learned rotation fit in closed form. The two calibrated options need
+     ``calibration_data`` (or its random-data fallback) the same way
+     ``bit_selection="mixed_precision"`` does.
 5. **Refine** (only reached if step 4 didn't meet ``accuracy_budget``, and
    only when ``use_rotation`` is ``False``) -- :func:`onnxsim.apply_adaround`
    then :func:`onnxsim.correct_bias`, reusing :mod:`onnxsim.autoquant`'s own
@@ -56,31 +71,45 @@ reached is returned (``meets_budget=False``), the same fallback
 already use.
 
 **Scope note.** This targets the pipeline's own six stages above, not every
-onnxsim quantization/pruning algorithm -- :func:`onnxsim.apply_duquant`/
-:func:`onnxsim.apply_spinquant` (calibrated rotation alternatives to
-:func:`onnxsim.apply_quarot`), :func:`onnxsim.apply_awq`/
+onnxsim quantization/pruning algorithm -- :func:`onnxsim.apply_awq`/
 :func:`onnxsim.apply_gptq`/:func:`onnxsim.apply_smoothquant`/etc., and
-Wanda/SparseGPT-calibrated pruning are all still directly callable on their
-own, just not wired into this particular escalation.
+SparseGPT-calibrated pruning are all still directly callable on their own,
+just not wired into this particular escalation. Likewise, ``sparsity``/
+``attention_sparsity`` always target the *default* topology each pruning
+function matches -- ``pruning.py``'s own newer options on top of that
+(``global_sparsity``, ``importance_norm``, MoE expert pruning, ...) stay
+directly callable on their own too, not exposed as pipeline parameters
+here.
 
-**C++ vs. Python.** The rotation (stage 4b), both pruning sub-stages
-(stage 2), and compression (stage 6) all use their C++-backed ports
-(:func:`onnxsim.apply_quarot_cpp`, :func:`onnxsim.apply_attention_head_pruning_cpp`,
-:func:`onnxsim.apply_structured_pruning_cpp`,
+**C++ vs. Python.** The magnitude-based pruning sub-stages (stage 2's own
+default), rotation (stage 4b's own ``rotation_method="quarot"`` default),
+and compression (stage 6) use C++-backed ports
+(:func:`onnxsim.apply_attention_head_pruning_cpp`,
+:func:`onnxsim.apply_structured_pruning_cpp`, :func:`onnxsim.apply_quarot_cpp`,
 :func:`onnxsim.apply_double_quantization_cpp`) -- all four are at full scope
 parity with their pure-Python counterparts for the way this pipeline calls
-them (default ``block_size``/``epsilon``/``min_elements``/``sparsity``,
-magnitude-based channel/head importance rather than the calibrated Wanda
-variant), so the native path is strictly faster with no behavior gap. As
-with the others, this needs revisiting if ``pruning.py``'s own data-free
-``apply_structured_pruning``/``apply_attention_head_pruning`` grows a new
-topology the C++ ports (``structured_pruning_entry.cpp``) haven't caught up
-to yet. The two pruning sub-stages target disjoint node sets by
-construction -- :func:`onnxsim.apply_structured_pruning_cpp`'s own chain
-finders require a MatMul/Gemm/Conv *consumer*, which a fused self-attention
-op is never matched as, so it never touches the Q/K/V/output-projection
-weights :func:`onnxsim.apply_attention_head_pruning_cpp` prunes -- so
-running both, in either order, is safe.
+them (default ``block_size``/``epsilon``/``min_elements``/``sparsity``), so
+the native path is strictly faster with no behavior gap. This needs
+revisiting if ``pruning.py``'s own data-free ``apply_structured_pruning``/
+``apply_attention_head_pruning`` grows a new *default-topology* capability
+the C++ ports (``structured_pruning_entry.cpp``) haven't caught up to yet
+-- ``pruning.py`` has, in fact, grown several since this port last reached
+parity (packed-QKV-then-Split GroupQueryAttention, attention-mask/bias
+slicing during head pruning, block-aligned grouped-Conv Concat-chain
+consumers, MoE pruning), so this default path may already be behind; the
+pure-Python functions remain the always-current reference regardless.
+``rotation_method="duquant"``/``"spinquant"`` and ``pruning_method="wanda"``
+are pure-Python only -- no C++ port exists for either (calibrated
+techniques are out of this codebase's established C++-port scope, data-free/
+closed-form only).
+
+The two pruning sub-stages target disjoint node sets by construction --
+:func:`onnxsim.apply_structured_pruning_cpp`'s own chain finders require a
+MatMul/Gemm/Conv *consumer*, which a fused self-attention op is never
+matched as, so it never touches the Q/K/V/output-projection weights
+:func:`onnxsim.apply_attention_head_pruning_cpp` prunes -- so running both,
+in either order, is safe. This holds for the Wanda-calibrated pair too,
+same topology matching, calibrated ranking only.
 """
 
 from __future__ import annotations
@@ -94,6 +123,7 @@ from onnxsim.accuracy import AccuracyDropReport, measure_accuracy_drop
 from onnxsim.adaround import apply_adaround
 from onnxsim.bias_correction import correct_bias
 from onnxsim.calibration import Tensors, generate_random_calibration_data
+from onnxsim.duquant import apply_duquant
 from onnxsim.mixed_precision import apply_mixed_precision_quantization
 from onnxsim.onnx_simplifier import (
     apply_attention_head_pruning_cpp,
@@ -104,18 +134,24 @@ from onnxsim.onnx_simplifier import (
     quantize_weight_only_int4,
     simplify,
 )
+from onnxsim.pruning import (
+    apply_attention_head_wanda_pruning,
+    apply_structured_wanda_pruning,
+)
+from onnxsim.spinquant import apply_spinquant
 
 
 @dataclass
 class OptimizationPipelineResult:
     """One :func:`apply_optimization_pipeline` result: the optimized model
     reached, which stages were applied to reach it (in application order,
-    a prefix of ``["attention_head_pruning", "structured_pruning",
+    a prefix of ``["attention_head_pruning" | "attention_head_wanda_pruning",
+    "structured_pruning" | "structured_wanda_pruning",
     "cross_layer_equalization", "quantize_weight_only_int4" |
-    "apply_mixed_precision_quantization" | "quarot", "adaround",
-    "bias_correction", "double_quantization"]``), its measured accuracy
-    drop against the original float model, and whether it met
-    ``accuracy_budget``.
+    "apply_mixed_precision_quantization" | "quarot" | "duquant" |
+    "spinquant", "adaround", "bias_correction", "double_quantization"]``),
+    its measured accuracy drop against the original float model, and
+    whether it met ``accuracy_budget``.
     """
 
     optimized_model: onnx.ModelProto
@@ -133,8 +169,10 @@ def apply_optimization_pipeline(
     providers: Optional[Sequence[str]] = None,
     sparsity: Optional[float] = None,
     attention_sparsity: Optional[float] = None,
+    pruning_method: str = "magnitude",
     bit_selection: str = "uniform",
     use_rotation: bool = False,
+    rotation_method: str = "quarot",
     num_adaround_iterations: int = 300,
 ) -> OptimizationPipelineResult:
     """Runs ``model`` through the escalating pipeline described in this
@@ -162,24 +200,41 @@ def apply_optimization_pipeline(
             own target fraction of output channels to remove, applied to the
             float model before quantizing; ``None`` (the default) skips
             pruning entirely
-    :param attention_sparsity: if given, :func:`onnxsim.apply_attention_head_pruning_cpp`'s
-            own target fraction of attention heads (or, for grouped-query
-            attention, whole KV groups) to remove, applied to the float
-            model before quantizing (and before ``sparsity``'s own channel
-            pruning); ``None`` (the default) skips attention-head pruning
-            entirely. Independent of ``sparsity`` -- either, both, or
-            neither may be given
+    :param attention_sparsity: if given, the target fraction of attention
+            heads (or, for grouped-query attention, whole KV groups) to
+            remove, applied to the float model before quantizing (and
+            before ``sparsity``'s own channel pruning); ``None`` (the
+            default) skips attention-head pruning entirely. Independent of
+            ``sparsity`` -- either, both, or neither may be given
+    :param pruning_method: ``"magnitude"`` (the default) uses the data-free,
+            C++-backed :func:`onnxsim.apply_structured_pruning_cpp`/
+            :func:`onnxsim.apply_attention_head_pruning_cpp`; ``"wanda"``
+            instead uses the calibrated, pure-Python
+            :func:`onnxsim.apply_structured_wanda_pruning`/
+            :func:`onnxsim.apply_attention_head_wanda_pruning` (ranked by
+            weight norm times the real activation norm over
+            ``calibration_data``, no C++ port -- see this module's own
+            "C++ vs. Python" note). Applies to both pruning sub-stages
+            alike; has no effect when neither ``sparsity`` nor
+            ``attention_sparsity`` is given
     :param bit_selection: ``"uniform"`` (the default) quantizes every layer
             to :func:`onnxsim.quantize_weight_only_int4`; ``"mixed_precision"``
             instead uses :func:`onnxsim.apply_mixed_precision_quantization`
             to pick INT4 or INT8 per layer from calibration-driven
             sensitivity. Ignored when ``use_rotation`` is ``True``.
     :param use_rotation: if ``True``, replaces the weight-only quantization
-            stage with :func:`onnxsim.apply_quarot_cpp` (data-free rotation
-            preprocessing, both weight and activation quantized to INT4);
-            skips the AdaRound/Bias Correction refinement stage, since those
-            only optimize the weight-only scheme's own ``DequantizeLinear``
+            stage with ``rotation_method``'s own rotation preprocessing
+            (both weight and activation quantized to INT4); skips the
+            AdaRound/Bias Correction refinement stage, since those only
+            optimize the weight-only scheme's own ``DequantizeLinear``
             shape
+    :param rotation_method: which rotation ``use_rotation=True`` applies --
+            ``"quarot"`` (the default): :func:`onnxsim.apply_quarot_cpp`,
+            data-free, no ``calibration_data`` needed; ``"duquant"``:
+            :func:`onnxsim.apply_duquant`, calibrated permutation plus
+            block-local random rotation; ``"spinquant"``:
+            :func:`onnxsim.apply_spinquant`, a calibrated learned rotation.
+            Ignored when ``use_rotation`` is ``False``
     :param num_adaround_iterations: ``num_iterations`` forwarded to
             :func:`onnxsim.apply_adaround`, only reached if quantization
             alone misses ``accuracy_budget`` and ``use_rotation`` is
@@ -191,6 +246,15 @@ def apply_optimization_pipeline(
     if bit_selection not in ("uniform", "mixed_precision"):
         raise ValueError(
             f'bit_selection must be "uniform" or "mixed_precision", got {bit_selection!r}'
+        )
+    if pruning_method not in ("magnitude", "wanda"):
+        raise ValueError(
+            f'pruning_method must be "magnitude" or "wanda", got {pruning_method!r}'
+        )
+    if rotation_method not in ("quarot", "duquant", "spinquant"):
+        raise ValueError(
+            'rotation_method must be "quarot", "duquant", or "spinquant", '
+            f"got {rotation_method!r}"
         )
     if isinstance(model, str):
         model = onnx.load(model, load_external_data=False)
@@ -223,20 +287,61 @@ def apply_optimization_pipeline(
     stages: List[str] = []
     float_model = model
     if attention_sparsity is not None:
-        float_model = apply_attention_head_pruning_cpp(
-            float_model, sparsity=attention_sparsity
-        )
-        stages.append("attention_head_pruning")
+        if pruning_method == "wanda":
+            float_model = apply_attention_head_wanda_pruning(
+                float_model,
+                calibration_data=calibration_data,
+                num_samples=num_samples,
+                seed=seed,
+                sparsity=attention_sparsity,
+                providers=providers,
+            )
+            stages.append("attention_head_wanda_pruning")
+        else:
+            float_model = apply_attention_head_pruning_cpp(
+                float_model, sparsity=attention_sparsity
+            )
+            stages.append("attention_head_pruning")
     if sparsity is not None:
-        float_model = apply_structured_pruning_cpp(float_model, sparsity=sparsity)
-        stages.append("structured_pruning")
+        if pruning_method == "wanda":
+            float_model = apply_structured_wanda_pruning(
+                float_model,
+                calibration_data=calibration_data,
+                num_samples=num_samples,
+                seed=seed,
+                sparsity=sparsity,
+                providers=providers,
+            )
+            stages.append("structured_wanda_pruning")
+        else:
+            float_model = apply_structured_pruning_cpp(float_model, sparsity=sparsity)
+            stages.append("structured_pruning")
 
     float_model = cross_layer_equalize(float_model)
     stages.append("cross_layer_equalization")
 
     if use_rotation:
-        quantized = apply_quarot_cpp(float_model, seed=seed)
-        stages.append("quarot")
+        if rotation_method == "duquant":
+            quantized = apply_duquant(
+                float_model,
+                calibration_data=calibration_data,
+                num_samples=num_samples,
+                seed=seed,
+                providers=providers,
+            )
+            stages.append("duquant")
+        elif rotation_method == "spinquant":
+            quantized = apply_spinquant(
+                float_model,
+                calibration_data=calibration_data,
+                num_samples=num_samples,
+                seed=seed,
+                providers=providers,
+            )
+            stages.append("spinquant")
+        else:
+            quantized = apply_quarot_cpp(float_model, seed=seed)
+            stages.append("quarot")
     elif bit_selection == "mixed_precision":
         quantized = apply_mixed_precision_quantization(
             float_model,
