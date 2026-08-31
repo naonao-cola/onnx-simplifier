@@ -141,9 +141,39 @@ you, and one flag worth knowing about:
   here).
 
 ```bash
-pip install "optimum-onnx" transformers coremltools
+pip install "optimum-onnx" transformers coremltools onnxruntime
 python export_llm_to_coreml.py HuggingFaceTB/SmolLM2-135M-Instruct \
     --max-context-length 512 --output smollm2.mlpackage
 python run_llm_decode_benchmark.py smollm2.mlpackage \
+    --prompt "The capital of France is" --max-new-tokens 20
+```
+
+### Benchmarking a real model suite (`prepare_benchmark_models.py`)
+
+A batch wrapper around `export_llm_to_coreml.py`: exports every model in its
+`BENCHMARK_MODELS` list (or a `--only` subset) into its own
+`<output-dir>/<slug>/model.mlpackage`, so the result is a ready-made set of
+models to run `run_llm_decode_benchmark.py` against on macOS -- the actual
+"reproduce a DeviceMark-style benchmark" step. The default list spans a few
+architecture families in DeviceMark's own ~1-4B weight class (Llama-style,
+Qwen2, Phi-3), not just one, since `onnxsim/coreml_export.py`'s translator is
+a hand-written ONNX-to-MIL mapping where different architectures can exercise
+different op combinations -- see the script's module docstring for which
+entries have actually been run through this pipeline versus which are
+expected to work but not yet exercised (larger models need more RAM/disk than
+a constrained dev sandbox has). `meta-llama/Llama-3.2-*-Instruct` is gated on
+Hugging Face (needs an accepted license + `HF_TOKEN`) but is in the default
+list anyway -- this repo's CI has a read-only `HF_TOKEN` secret, wired into
+the `coreml-integration` workflow's `export-benchmark-models` job (runs on
+`workflow_dispatch`/schedule only, not on every PR, since it's a multi-GB
+download). `google/gemma-2-*-it` -- also gated, and with more architectural
+unknowns (sliding-window attention, logit soft-capping) not yet checked
+against this translator at all -- is left out of the default list; pass it as
+`--only` once you have access, to try it anyway.
+
+```bash
+python prepare_benchmark_models.py --output-dir benchmark_models
+# then, per model, on macOS:
+python run_llm_decode_benchmark.py benchmark_models/Qwen_Qwen2_5_1_5B_Instruct/model.mlpackage \
     --prompt "The capital of France is" --max-new-tokens 20
 ```

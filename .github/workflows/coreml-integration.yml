@@ -25,6 +25,13 @@ name: Core ML Integration
 #   it through the real Core ML runtime, then compares the result against onnxruntime,
 #   to catch anything that converts cleanly but Core ML itself rejects or computes
 #   differently.
+#
+# A third, separate job -- `export-benchmark-models` -- exercises
+# scripts/apple/prepare_benchmark_models.py against one real, multi-billion-parameter
+# gated model (meta-llama/Llama-3.2-1B-Instruct) using this repo's read-only HF_TOKEN
+# secret, the one thing a token-less local sandbox can't do (see that script's module
+# docstring). Like model-regression.yml's real-model sweep, this is multi-GB-download
+# heavy, so it runs on workflow_dispatch/schedule only, never on pull_request.
 
 on:
   schedule:
@@ -158,3 +165,38 @@ jobs:
       - name: Convert a small model and predict through the real Core ML runtime
         working-directory: ${{ runner.temp }}
         run: python3 "$GITHUB_WORKSPACE/scripts/apple/run_coreml_export_predict.py"
+
+  export-benchmark-models:
+    name: Export benchmark model suite (gated models via HF_TOKEN)
+    needs: build
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      # Read-only secret; lets scripts/apple/prepare_benchmark_models.py download
+      # meta-llama/Llama-3.2-*-Instruct, which needs an accepted license + an
+      # authenticated token even to fetch (see that script's module docstring).
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+      - uses: actions/download-artifact@v8
+        with:
+          name: onnxsim-wheel-linux
+          path: wheelhouse
+      - name: Install onnxsim wheel + LLM export deps
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install "optimum-onnx" transformers coremltools onnxruntime
+          python -m pip install wheelhouse/*.whl
+      - name: Verify the installed wheel is used (not the source tree)
+        working-directory: ${{ runner.temp }}
+        run: python -c "import onnxsim, onnxsim.onnxsim_cpp2py_export as m; print(onnxsim.__version__, m.__file__)"
+      - name: Export Llama-3.2-1B-Instruct (the smallest gated model in BENCHMARK_MODELS)
+        working-directory: ${{ runner.temp }}
+        run: |
+          python "$GITHUB_WORKSPACE/scripts/apple/prepare_benchmark_models.py" \
+            --only meta-llama/Llama-3.2-1B-Instruct \
+            --output-dir benchmark_models
