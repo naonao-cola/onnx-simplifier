@@ -11370,8 +11370,6 @@ def apply_embedding_vocab_magnitude_pruning(
     )
 
 
-
-
 # --- Transformer block (depth) pruning --------------------------------------
 #
 # Every technique above prunes *within* a layer -- channels, heads, experts,
