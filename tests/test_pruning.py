@@ -13948,6 +13948,15 @@ def test_analyze_pruning_sensitivity_never_mutates_input_model():
     moe_whole_expert_model = _moe_router_model(moe_fc1_w, moe_fc2_w, moe_router_w, k=1)
     moe_calibration_data = [{"X": moe_rng.standard_normal((6, 4)).astype(np.float32)}]
 
+    qdq_model, _, _, _, _ = _matmul_qdq_producer_model(K=8, H=16, Out=4, seed=9)
+    embedding_model = _embedding_model(
+        np.random.default_rng(2).standard_normal((10, 4)).astype(np.float32)
+    )
+    transformer_block_model = _stacked_mlp_block_model(H=8, seed=3)
+    tb_calibration_data = [
+        {"x0": np.random.default_rng(3).standard_normal((1, 4, 8)).astype(np.float32)}
+    ]
+
     for model, apply_fn, kwargs in [
         (_matmul_model(K=64, N=16), onnxsim.apply_magnitude_pruning, {}),
         (
@@ -13978,6 +13987,13 @@ def test_analyze_pruning_sensitivity_never_mutates_input_model():
             moe_whole_expert_model,
             onnxsim.apply_moe_whole_expert_pruning,
             {"calibration_data": moe_calibration_data},
+        ),
+        (qdq_model, onnxsim.apply_structured_pruning_qdq, {}),
+        (embedding_model, onnxsim.apply_embedding_vocab_magnitude_pruning, {}),
+        (
+            transformer_block_model,
+            onnxsim.apply_transformer_block_pruning,
+            {"calibration_data": tb_calibration_data},
         ),
     ]:
         before_bytes = model.SerializeToString()
@@ -14498,6 +14514,395 @@ def test_analyze_moe_whole_expert_pruning_margin_reflects_router_usage_distribut
     margin_b = by_label["Yb"].margin
 
     assert margin_b == 0.0  # every expert's router logit exactly tied
+    assert margin_a is not None and margin_a > 0.9  # wide, unambiguous gap
+    assert margin_a != margin_b
+
+
+# --- analyze_pruning_sensitivity: QDQ / embedding-magnitude /
+#     transformer-block families ----------------------------------------
+#
+# These three model families are defined much later in this file (the QDQ
+# structured, embedding-vocabulary, and transformer-block-depth pruning
+# sections below) -- the helpers referenced here (`_matmul_qdq_producer_model`,
+# `_i8`, `_ambiguous_embedding_model`, ...) are module-level functions, so
+# their *definition* order doesn't matter for these tests to run correctly
+# (only that the whole module has finished loading before any test body
+# executes, which pytest already guarantees) -- but keeping every
+# `test_analyze_*` test in this one dedicated section, alongside the eight
+# above, does.
+
+
+def test_analyze_structured_pruning_qdq_matches_real_call():
+    K, H, Out = 8, 16, 4
+    model, _Wq, _Wscale, _Wzp, _W2 = _matmul_qdq_producer_model(K, H, Out, seed=3)
+
+    report = onnxsim.analyze_pruning_sensitivity(
+        model, onnxsim.apply_structured_pruning_qdq, sparsity=0.5
+    )
+    assert len(report.layers) == 1
+    layer = report.layers[0]
+    assert layer.family == "qdq_matmul"
+    assert layer.total == H
+    assert report.not_eligible == []
+
+    pruned = onnxsim.apply_structured_pruning_qdq(model, sparsity=0.5)
+    inits = {t.name: t for t in pruned.graph.initializer}
+    kept = H - layer.would_drop
+    assert inits["Wq"].dims[1] == kept
+    assert inits["W2"].dims[0] == kept
+
+
+def test_analyze_structured_pruning_qdq_not_eligible_lists_unmatched_nodes():
+    # Mirrors test_analyze_pruning_sensitivity_not_eligible_lists_unmatched_nodes
+    # for the QDQ family: a second MatMul whose weight is a graph input,
+    # not a constant, can never resolve via _resolve_weight_ref -- it must
+    # show up in not_eligible, not silently be dropped from the report.
+    K, H, Out = 8, 16, 4
+    rng = np.random.default_rng(4)
+    Wq = rng.integers(-100, 100, size=(K, H)).astype(np.int8)
+    Wscale = np.abs(rng.standard_normal(H)).astype(np.float32) * 0.02 + 0.001
+    W2 = rng.standard_normal((H, Out)).astype(np.float32)
+    model = _model(
+        f"""
+        g (float[batch,{K}] X, float[{Out},{Out}] Wdyn) => (float[batch,{Out}] Z)
+        {{
+          Wdq = DequantizeLinear<axis=1>(Wq, Wscale)
+          h = MatMul(X, Wdq)
+          Y = MatMul(h, W2)
+          Z = MatMul(Y, Wdyn)
+        }}
+        """,
+        initializer=[_i8(Wq, "Wq"), _f32(Wscale, "Wscale"), _f32(W2, "W2")],
+    )
+    report = onnxsim.analyze_pruning_sensitivity(
+        model, onnxsim.apply_structured_pruning_qdq, sparsity=0.5
+    )
+    assert len(report.layers) == 1  # only the Wq->W2 chain is matched
+    assert report.not_eligible == ["MatMul 'Z'"]
+
+
+def test_analyze_structured_pruning_qdq_margin_reflects_dequantized_weight_distribution():
+    # Same adversarial shape as
+    # test_analyze_pruning_sensitivity_margin_reflects_importance_distribution,
+    # for the QDQ family: branch "a"'s producer has a huge, unambiguous gap
+    # between its "big" and "small" *dequantized* output-channel rows
+    # (margin should be strongly positive); branch "b"'s dequantized rows
+    # are all exactly equal (margin must come out exactly 0.0). Ranking
+    # must be computed on the dequantized weight
+    # (`_qdq_channel_importance`, the exact same helper
+    # `apply_structured_pruning_qdq` itself uses to rank) -- a bug that
+    # ranked the raw int8 codes instead, ignoring per-channel scale, would
+    # give a different, wrong split here (every raw code in branch "a" is
+    # either 100 or 1, never tied, but the *dequantized* value is what
+    # actually needs the wide/tied split).
+    K, H, Out = 8, 8, 4
+    big_code = np.full((K, H // 2), 100, dtype=np.int8)
+    small_code = np.full((K, H // 2), 1, dtype=np.int8)
+    wq_a = np.concatenate([big_code, small_code], axis=1)
+    wscale_a = np.concatenate(
+        [
+            np.full(H // 2, 1.0, dtype=np.float32),
+            np.full(H // 2, 1e-6, dtype=np.float32),
+        ]
+    )
+    wq_b = np.full((K, H), 50, dtype=np.int8)
+    wscale_b = np.full(H, 0.01, dtype=np.float32)
+    w2 = np.random.default_rng(5).standard_normal((H, Out)).astype(np.float32)
+
+    model = _model(
+        f"""
+        g (float[batch,{K}] Xa, float[batch,{K}] Xb)
+            => (float[batch,{Out}] Ya, float[batch,{Out}] Yb)
+        {{
+          Wdqa = DequantizeLinear<axis=1>(Wqa, WScaleA)
+          ha = MatMul(Xa, Wdqa)
+          Ya = MatMul(ha, W2a)
+
+          Wdqb = DequantizeLinear<axis=1>(Wqb, WScaleB)
+          hb = MatMul(Xb, Wdqb)
+          Yb = MatMul(hb, W2b)
+        }}
+        """,
+        initializer=[
+            _i8(wq_a, "Wqa"),
+            _f32(wscale_a, "WScaleA"),
+            _f32(w2, "W2a"),
+            _i8(wq_b, "Wqb"),
+            _f32(wscale_b, "WScaleB"),
+            _f32(w2, "W2b"),
+        ],
+    )
+    onnx.checker.check_model(model)
+
+    report = onnxsim.analyze_pruning_sensitivity(
+        model, onnxsim.apply_structured_pruning_qdq, sparsity=0.5
+    )
+    by_label = {layer.label: layer for layer in report.layers}
+    margin_a = by_label["ha"].margin
+    margin_b = by_label["hb"].margin
+
+    assert margin_b == 0.0  # every dequantized channel row exactly tied
+    assert margin_a is not None and margin_a > 0.9  # wide, unambiguous gap
+    assert margin_a != margin_b
+
+
+def _embedding_model(w):
+    H = w.shape[1]
+    return _model(
+        f"""
+        g (int64[M] input_ids) => (float[M,{H}] hidden)
+        {{
+          hidden = Gather<axis=0>(W_emb, input_ids)
+        }}
+        """,
+        initializer=[_f32(w, "W_emb")],
+    )
+
+
+def test_analyze_embedding_vocab_magnitude_pruning_matches_real_call():
+    V, H = 10, 4
+    rng = np.random.default_rng(23)
+    w = (rng.standard_normal((V, H)) * np.linspace(3.0, 0.1, V)[:, None]).astype(
+        np.float32
+    )
+    model = _embedding_model(w)
+
+    report = onnxsim.analyze_pruning_sensitivity(
+        model, onnxsim.apply_embedding_vocab_magnitude_pruning, sparsity=0.3
+    )
+    assert len(report.layers) == 1
+    layer = report.layers[0]
+    assert layer.family == "embedding_vocab_magnitude"
+    assert layer.total == V
+    assert report.not_eligible == []
+
+    result = onnxsim.apply_embedding_vocab_magnitude_pruning(model, sparsity=0.3)
+    assert layer.would_drop == V - len(result.kept_token_ids)
+
+
+def test_analyze_embedding_vocab_magnitude_pruning_ambiguous_model_reports_not_eligible():
+    # Two structurally-identical Gather-embedding candidates (a token
+    # embedding and a positional embedding), no input_name to
+    # disambiguate -- _match_embedding_chain declines the whole call
+    # (matched=False for the real function); the dry-run mirror must
+    # report an empty layers list, with both structurally-matching Gathers
+    # surfaced via not_eligible rather than silently omitted.
+    model = _ambiguous_embedding_model()
+    report = onnxsim.analyze_pruning_sensitivity(
+        model, onnxsim.apply_embedding_vocab_magnitude_pruning, sparsity=0.3
+    )
+    assert report.layers == []
+    assert sorted(report.not_eligible) == ["Gather 'pos'", "Gather 'tok'"]
+
+
+def test_analyze_pruning_sensitivity_rejects_embedding_vocab_pruning():
+    # apply_embedding_vocab_pruning -- the explicit keep_token_ids/
+    # drop_token_ids entry point -- deliberately has no _analyze_*
+    # counterpart at all; see onnxsim/pruning.py's own "Embedding /
+    # lm_head vocabulary family" dry-run section comment for why (in
+    # short: it has no data-driven importance ranking of its own to
+    # report a margin for -- the caller already supplies the exact
+    # keep-set).
+    model = _matmul_model(K=16, N=8)
+    with pytest.raises(ValueError, match="apply_embedding_vocab_pruning"):
+        onnxsim.analyze_pruning_sensitivity(
+            model, onnxsim.apply_embedding_vocab_pruning, keep_token_ids=[0, 1]
+        )
+
+
+def test_analyze_embedding_vocab_magnitude_pruning_margin_reflects_row_norm_distribution():
+    # Same adversarial shape as the structured/MoE margin tests above, but
+    # across two separate models/reports rather than two rows of one
+    # report: _match_embedding_chain matches at most one embedding table
+    # per graph by construction (see this module's own "Embedding /
+    # lm_head vocabulary family" dry-run section comment), so there is
+    # only ever one PruningLayerSensitivity to report per model here.
+    # Model "a"'s rows have a huge, unambiguous norm gap (margin should be
+    # strongly positive); model "b"'s rows are all exactly equal in norm
+    # (margin must come out exactly 0.0).
+    V, H = 8, 4
+    big = np.full((V // 2, H), 5.0, dtype=np.float32)
+    small = np.full((V // 2, H), 1e-4, dtype=np.float32)
+    w_a = np.concatenate([big, small], axis=0)
+    w_b = np.full((V, H), 3.0, dtype=np.float32)
+
+    report_a = onnxsim.analyze_pruning_sensitivity(
+        _embedding_model(w_a),
+        onnxsim.apply_embedding_vocab_magnitude_pruning,
+        sparsity=0.5,
+    )
+    report_b = onnxsim.analyze_pruning_sensitivity(
+        _embedding_model(w_b),
+        onnxsim.apply_embedding_vocab_magnitude_pruning,
+        sparsity=0.5,
+    )
+    margin_a = report_a.layers[0].margin
+    margin_b = report_b.layers[0].margin
+
+    assert margin_b == 0.0  # every row's own norm exactly tied
+    assert margin_a is not None and margin_a > 0.9  # wide, unambiguous gap
+    assert margin_a != margin_b
+
+
+def _stacked_mlp_block_model(H=8, seed=0):
+    # Two stacked pre-norm MLP residual blocks -- the same shape
+    # test_transformer_block_pruning_drops_near_identity_mlp_block_and_matches_manual_removal_oracle
+    # below builds inline; factored out here purely so the analyze_*
+    # tests can reuse it without duplicating the model text. Block 0's own
+    # down-projection weight is scaled to ~1e-6 -- a near-identity,
+    # safest-to-drop block; block 1's is ordinary-scale, a real
+    # transformation that must survive.
+    rng = np.random.default_rng(seed)
+    ln0_scale = np.ones(H, dtype=np.float32)
+    ln0_bias = np.zeros(H, dtype=np.float32)
+    w0 = (rng.standard_normal((H, H)) * 1e-6).astype(np.float32)
+    ln1_scale = np.ones(H, dtype=np.float32)
+    ln1_bias = np.zeros(H, dtype=np.float32)
+    w1 = rng.standard_normal((H, H)).astype(np.float32)
+    model = _model(
+        f"""
+        g (float[1,4,{H}] x0) => (float[1,4,{H}] y)
+        {{
+          ln0 = LayerNormalization<axis=-1>(x0, Ln0Scale, Ln0Bias)
+          h0 = MatMul(ln0, W0)
+          x1 = Add(x0, h0)
+
+          ln1 = LayerNormalization<axis=-1>(x1, Ln1Scale, Ln1Bias)
+          h1 = MatMul(ln1, W1)
+          x2 = Add(x1, h1)
+
+          y = Identity(x2)
+        }}
+        """,
+        initializer=[
+            _f32(ln0_scale, "Ln0Scale"),
+            _f32(ln0_bias, "Ln0Bias"),
+            _f32(w0, "W0"),
+            _f32(ln1_scale, "Ln1Scale"),
+            _f32(ln1_bias, "Ln1Bias"),
+            _f32(w1, "W1"),
+        ],
+    )
+    onnx.checker.check_model(model)
+    return model
+
+
+def test_analyze_transformer_block_pruning_matches_real_call():
+    model = _stacked_mlp_block_model(H=8, seed=0)
+
+    report = onnxsim.analyze_pruning_sensitivity(
+        model,
+        onnxsim.apply_transformer_block_pruning,
+        num_blocks_to_drop=1,
+        seed=0,
+        num_samples=4,
+    )
+    assert len(report.layers) == 1
+    layer = report.layers[0]
+    assert layer.family == "transformer_block"
+    assert layer.total == 2
+    assert report.not_eligible == []
+
+    pruned = onnxsim.apply_transformer_block_pruning(
+        model, num_blocks_to_drop=1, seed=0, num_samples=4
+    )
+    # Exactly one block's own 3 nodes (LN, MatMul, Add) are gone -- the
+    # surviving node-count delta directly reflects how many blocks the
+    # real call actually dropped.
+    dropped_node_count = len(model.graph.node) - len(pruned.graph.node)
+    assert dropped_node_count == 3 * layer.would_drop
+
+
+def test_analyze_transformer_block_pruning_zero_target_reports_no_drop():
+    # sparsity/num_blocks_to_drop rounding to zero blocks is its own early
+    # return in both the real function and its dry-run mirror -- matched
+    # candidates are still reported (total=2), just with would_drop=0 and
+    # no boundary to measure (margin=None), and no calibration probe is
+    # ever run (there's nothing to rank).
+    model = _stacked_mlp_block_model(H=8, seed=1)
+
+    report = onnxsim.analyze_pruning_sensitivity(
+        model, onnxsim.apply_transformer_block_pruning, num_blocks_to_drop=0
+    )
+    assert len(report.layers) == 1
+    layer = report.layers[0]
+    assert layer.total == 2
+    assert layer.would_drop == 0
+    assert layer.margin is None
+
+    pruned = onnxsim.apply_transformer_block_pruning(model, num_blocks_to_drop=0)
+    assert pruned.SerializeToString() == model.SerializeToString()
+
+
+def test_analyze_transformer_block_pruning_margin_reflects_similarity_distribution():
+    # Same two-model adversarial shape as the embedding-magnitude margin
+    # test above, and for the same structural reason: unlike a MoE node,
+    # no node "owns" the set of candidate transformer blocks, so this
+    # family reports at most one aggregate PruningLayerSensitivity per
+    # model (see onnxsim/pruning.py's own "Transformer block (depth)
+    # family" dry-run section comment) -- comparing two rows of one report
+    # isn't available the way it is for the structured/MoE/QDQ families
+    # above, so this compares two separate models' own single row instead.
+    #
+    # Model "a" is the stacked two-block model above: block 0 is
+    # near-identity (x_out almost exactly x_in, cosine similarity near 1),
+    # block 1 is a real transformation (similarity well below 1) -- a
+    # wide, unambiguous gap (margin should be strongly positive). Model
+    # "b" instead has two *parallel*, structurally identical blocks (same
+    # LayerNormalization scale/bias, same weight, both reading the exact
+    # same x0) feeding two independent outputs -- both see identical
+    # calibration data through an identical computation, so their own
+    # mean cosine similarity comes out exactly tied (margin must come out
+    # exactly 0.0).
+    model_a = _stacked_mlp_block_model(H=8, seed=2)
+
+    H = 8
+    rng = np.random.default_rng(2)
+    scale = np.ones(H, dtype=np.float32)
+    bias = np.zeros(H, dtype=np.float32)
+    w = rng.standard_normal((H, H)).astype(np.float32)
+    model_b = _model(
+        f"""
+        g (float[1,4,{H}] x0) => (float[1,4,{H}] ya, float[1,4,{H}] yb)
+        {{
+          lna = LayerNormalization<axis=-1>(x0, ScaleA, BiasA)
+          ha = MatMul(lna, Wa)
+          ya = Add(x0, ha)
+
+          lnb = LayerNormalization<axis=-1>(x0, ScaleB, BiasB)
+          hb = MatMul(lnb, Wb)
+          yb = Add(x0, hb)
+        }}
+        """,
+        initializer=[
+            _f32(scale, "ScaleA"),
+            _f32(bias, "BiasA"),
+            _f32(w, "Wa"),
+            _f32(scale, "ScaleB"),
+            _f32(bias, "BiasB"),
+            _f32(w, "Wb"),
+        ],
+    )
+    onnx.checker.check_model(model_b)
+
+    report_a = onnxsim.analyze_pruning_sensitivity(
+        model_a,
+        onnxsim.apply_transformer_block_pruning,
+        num_blocks_to_drop=1,
+        seed=0,
+        num_samples=4,
+    )
+    report_b = onnxsim.analyze_pruning_sensitivity(
+        model_b,
+        onnxsim.apply_transformer_block_pruning,
+        num_blocks_to_drop=1,
+        seed=0,
+        num_samples=4,
+    )
+    margin_a = report_a.layers[0].margin
+    margin_b = report_b.layers[0].margin
+
+    assert margin_b == 0.0  # two parallel, structurally identical blocks
     assert margin_a is not None and margin_a > 0.9  # wide, unambiguous gap
     assert margin_a != margin_b
 

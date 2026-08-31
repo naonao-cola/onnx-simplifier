@@ -12635,17 +12635,48 @@ def _transformer_block_similarity(
     }
 
 
+def _select_droppable_blocks(
+    ranked: Sequence[_DroppableBlock], target: int
+) -> List[_DroppableBlock]:
+    """Greedily selects from `ranked` (already sorted most- to least-
+    redundant) in order, skipping any candidate whose own `block_nodes`
+    overlaps an already-selected one's (a candidate whose own backward
+    walk happened to reach into another candidate's own interior --
+    unusual, but not impossible in principle -- can only ever have *one*
+    of the two safely dropped), until `target` blocks are selected or
+    `ranked` is exhausted. Returns the selected blocks, in `ranked` order.
+
+    Extracted, behavior-preserving, from
+    :func:`_apply_transformer_block_pruning`'s own former inline commit
+    loop -- :func:`_analyze_transformer_block_pruning` needs the exact
+    same selection (which candidates a real call would actually drop,
+    respecting the same overlap-skip rule) to report an honest
+    `would_drop` count without duplicating this logic, the same factor-
+    out-first approach this module's own Wanda-attention/MoE calibration
+    helpers already established (see this module's own "Dry-run pruning
+    sensitivity analysis" section comment).
+    """
+    committed: List[_DroppableBlock] = []
+    committed_ids: Set[int] = set()
+    for block in ranked:
+        if len(committed) >= target:
+            break
+        ids = {id(n) for n in block.block_nodes}
+        if ids & committed_ids:
+            continue
+        committed.append(block)
+        committed_ids |= ids
+    return committed
+
+
 def _apply_transformer_block_pruning(
     graph: onnx.GraphProto, ranked: Sequence[_DroppableBlock], target: int
 ) -> int:
-    """Greedily commits `ranked` (already sorted most- to least-redundant)
-    in order, skipping any candidate whose own `block_nodes` overlaps an
-    already-committed one's (a candidate whose own backward walk happened
-    to reach into another candidate's own interior -- unusual, but not
-    impossible in principle -- can only ever have *one* of the two safely
-    dropped), until `target` blocks are committed or `ranked` is
-    exhausted, then applies every commit at once. Returns the number of
-    blocks actually dropped.
+    """Commits :func:`_select_droppable_blocks`'s own selection from
+    `ranked` (already sorted most- to least-redundant) -- up to `target`
+    blocks, skipping any candidate whose own `block_nodes` overlaps an
+    already-committed one's -- then applies every commit at once. Returns
+    the number of blocks actually dropped.
 
     Each commit rewrites every current reference to its own `x_out` --
     every node's own input, in place, plus (via a small inserted
@@ -12671,16 +12702,8 @@ def _apply_transformer_block_pruning(
     deleting nodes (never reordering or inserting anything ahead of what
     it depends on) can't break that.
     """
-    committed: List[_DroppableBlock] = []
-    committed_ids: Set[int] = set()
-    for block in ranked:
-        if len(committed) >= target:
-            break
-        ids = {id(n) for n in block.block_nodes}
-        if ids & committed_ids:
-            continue
-        committed.append(block)
-        committed_ids |= ids
+    committed = _select_droppable_blocks(ranked, target)
+    committed_ids: Set[int] = {id(n) for block in committed for n in block.block_nodes}
 
     alias: Dict[str, str] = {}
 
@@ -12885,12 +12908,22 @@ def apply_transformer_block_pruning(
 # (`apply_attention_head_wanda_pruning`), and
 # `_moe_router_gate_calibration_stats` (`apply_moe_whole_expert_pruning`'s
 # own router-usage ranking, not Wanda-style but the exact same
-# probe-then-reduce shape).
+# probe-then-reduce shape). `apply_transformer_block_pruning`'s own
+# calibration probe (`_transformer_block_similarity`) was already its own
+# standalone helper before this change and needed no extraction of its
+# own -- but its *selection* logic (which ranked candidates a real call
+# actually commits, respecting its own overlap-skip rule) was still
+# inline in `_apply_transformer_block_pruning` and duplication-prone the
+# same way an un-extracted calibration loop would have been, so it was
+# factored out the identical way: `_select_droppable_blocks`, now called
+# by both the real mutating function and `_analyze_transformer_block_pruning`.
 #
 # Supported families -- covering every shape this module's own
 # `_apply_chains`/`_apply_attention_chains`/`_apply_moe_chains`/
-# `_apply_moe_whole_expert_chains` cover *except* the two deliberately
-# out-of-scope cases noted below:
+# `_apply_moe_whole_expert_chains`/`_apply_transformer_block_pruning` cover,
+# plus the QDQ-quantized structured family and the magnitude-ranked half of
+# the embedding/lm_head family, *except* the deliberately out-of-scope
+# cases noted below:
 #
 # - `apply_magnitude_pruning`/`apply_wanda_pruning` (unstructured, per-
 #   weight-entry): every mode both support -- per-layer sparsity, N:M, and
@@ -12938,6 +12971,45 @@ def apply_transformer_block_pruning(
 #   reflects the real router-usage ranking whenever calibration data
 #   produces one, the same fidelity every other calibrated family here
 #   already has.
+# - `apply_structured_pruning_qdq` (QDQ-quantized channel pruning): the
+#   same single-producer/single-consumer/unary-hops-only topology
+#   `_find_qdq_chains` matches (requiring at least one side to actually be
+#   QDQ-quantized), ranked by `_qdq_channel_importance` on the producer's
+#   own *dequantized* weight row -- the exact same helper the real
+#   function uses to rank, never for the actual (still-quantized) rewrite.
+#   No grouped/depthwise Conv, gated pair, residual merge, or Concat
+#   branch group is matched for a QDQ chain by the real function either,
+#   so none is reported as a matched unit here (they fall out via
+#   `not_eligible` exactly like any other unmatched Conv/MatMul/Gemm node,
+#   same as the plain float structured family above).
+# - `apply_embedding_vocab_magnitude_pruning` (embedding/lm_head vocabulary,
+#   magnitude-ranked): `_match_embedding_chain`'s own single matched-or-not
+#   embedding table, ranked by combined embedding-row/untied-lm_head-row L2
+#   norm -- the exact computation the real function performs. Reports at
+#   most one :class:`PruningLayerSensitivity` per model (there is only ever
+#   one token-embedding `Gather` this pass can act on at all -- see
+#   `_analyze_embedding_vocab_magnitude_pruning`'s own docstring).
+#   `apply_embedding_vocab_pruning` -- the sibling, explicit-`keep_token_ids`
+#   entry point -- deliberately has **no** `_analyze_*` counterpart at all;
+#   see this module's own "Embedding / lm_head vocabulary family" dry-run
+#   section comment for the full reasoning (in short: it has no data-driven
+#   importance ranking of its own to report a `margin` for at all -- the
+#   caller already supplies the exact keep-set).
+# - `apply_transformer_block_pruning` (whole-transformer-block depth
+#   pruning): every candidate `_find_transformer_block_candidates` matches,
+#   ranked by the exact same mean-cosine-similarity "Block Influence"
+#   signal (`_transformer_block_similarity`) and committed via the exact
+#   same greedy overlap-skip selection (`_select_droppable_blocks`, shared
+#   with the real mutating function -- see this section's own comment
+#   above) the real function uses. Unlike every other family, there is no
+#   node that "owns" the set of candidate blocks the way a MoE node owns
+#   its own experts, so this reports at most one aggregate
+#   :class:`PruningLayerSensitivity` per model (`total` the number of
+#   matched candidates) rather than one per matched node -- see
+#   `_analyze_transformer_block_pruning`'s own docstring for the full
+#   shape and why its own `importance`/`margin` are expressed as *negated*
+#   similarity (restoring the "higher importance is kept" convention every
+#   other family's own `margin` already assumes).
 #
 # Not supported at all: `apply_sparsegpt_pruning`. Its own per-column
 # sequential/compensated Hessian-update loop (see that function's own
@@ -12953,6 +13025,10 @@ def apply_transformer_block_pruning(
 # gap between, only a sequential process whose own intermediate state has
 # no per-entry-comparable analogue -- reporting a margin anyway would be
 # noise dressed up as a number, so it's left out rather than faked.
+# `apply_embedding_vocab_pruning` is not supported either, for a different
+# reason -- see the `apply_embedding_vocab_magnitude_pruning` bullet above
+# and this module's own "Embedding / lm_head vocabulary family" dry-run
+# section comment.
 
 
 @dataclass(frozen=True)
@@ -12973,7 +13049,13 @@ class PruningLayerSensitivity:
             ``"matmul"``/``"conv"``/``"attention_qkv"`` for unstructured
             pruning; ``"matmul_plain"``/``"matmul_gated"``/
             ``"matmul_residual"``/``"conv_plain"``/``"conv_residual"`` for
-            structured pruning; ``"attention_head"``/
+            structured pruning; ``"qdq_conv"``/``"qdq_matmul"`` for
+            :func:`apply_structured_pruning_qdq` (split by whether the
+            matched producer is a Conv or a MatMul/vanilla-Gemm --
+            `_find_qdq_chains` matches both through one unified walk,
+            unlike the plain float structured family's five separate
+            finders, so this is the one family-string split available for
+            it); ``"attention_head"``/
             ``"attention_gqa_group"`` for attention pruning (shared by
             :func:`apply_attention_head_pruning` and its Wanda-calibrated
             counterpart :func:`apply_attention_head_wanda_pruning` alike --
@@ -12982,7 +13064,11 @@ class PruningLayerSensitivity:
             structured pruning's own plain-vs-Wanda variants already share
             their family strings above); ``"moe_expert_channel"`` for
             :func:`apply_moe_expert_channel_pruning`; ``"moe_whole_expert"``
-            for :func:`apply_moe_whole_expert_pruning` -- see
+            for :func:`apply_moe_whole_expert_pruning`;
+            ``"embedding_vocab_magnitude"`` for
+            :func:`apply_embedding_vocab_magnitude_pruning`;
+            ``"transformer_block"`` for
+            :func:`apply_transformer_block_pruning` -- see
             :func:`analyze_pruning_sensitivity`'s own docstring for exactly
             which topologies each maps to
     :param total: how many independently-ranked elements this unit owns --
@@ -13659,6 +13745,146 @@ def _analyze_structured_wanda_pruning(
     )
 
 
+# --- QDQ (quantized-weight) structured family -------------------------------
+
+
+def _qdq_not_eligible(graph: onnx.GraphProto, chains: List[_QDQChain]) -> List[str]:
+    matched_ids: Set[int] = set()
+    for chain in chains:
+        matched_ids.add(id(chain.producer.node))
+        matched_ids.add(id(chain.consumer.node))
+    not_eligible = []
+    for node in graph.node:
+        if node.op_type not in ("Conv", "MatMul", "Gemm"):
+            continue
+        if id(node) in matched_ids:
+            continue
+        not_eligible.append(f"{node.op_type} '{_node_label(node)}'")
+    return not_eligible
+
+
+def _analyze_structured_pruning_qdq(
+    model: Union[str, onnx.ModelProto],
+    sparsity: float = 0.5,
+    importance_norm: _ImportanceNorm = "l2",
+) -> PruningSensitivityReport:
+    """Dry-run mirror of :func:`apply_structured_pruning_qdq` -- same
+    matching (:func:`_find_qdq_chains`, the single-producer/single-
+    consumer/unary-hops-only topology this family's own docstring
+    describes, requiring at least one side to actually be QDQ-quantized),
+    touched-role bookkeeping (a chain sharing a weight -- on either side
+    -- with an earlier one in `_find_qdq_chains`'s own return order is
+    reported `would_drop=0`/`margin=None`, exactly the "left completely
+    untouched" outcome the real call gives it too, not folded into
+    `not_eligible`), keep-count, and importance
+    (:func:`_qdq_channel_importance`, ranking the producer's own
+    *dequantized* weight row -- :func:`_weight_ref_dequantized`, the exact
+    same helper :func:`apply_structured_pruning_qdq` itself calls, never
+    for the actual rewrite) logic, reused directly, but `model` is never
+    mutated. `family` is ``"qdq_conv"``/``"qdq_matmul"`` depending on
+    whether the matched producer is a Conv or a MatMul/vanilla-Gemm --
+    :func:`_find_qdq_chains` matches both shapes through one unified
+    walk, unlike the plain float structured family's five separate
+    finders, so this is the one family-string split available to tell
+    the two apart.
+
+    A degenerate chain naming the exact same weight in both the producer
+    and consumer role gets no report row at all (mirroring
+    :func:`_analyze_chains`'s own identical treatment of a gated pair
+    naming the same weight twice) -- not a meaningful "would touch
+    nothing" outcome, an internally malformed match.
+
+    No general grouped/depthwise Conv, gated pair, residual/skip-
+    connection merge, or Concat-merged branch group is ever matched here
+    at all (see :func:`apply_structured_pruning_qdq`'s own docstring) --
+    such a node simply never enters `_find_qdq_chains`'s own return value
+    in the first place, so it is reported via `not_eligible` exactly like
+    any other unmatched Conv/MatMul/Gemm node, with no QDQ-specific label
+    of its own distinguishing *why* it was declined (the real function
+    itself gives none either -- these topologies are out of scope, not
+    individually diagnosed).
+    """
+    if not (0.0 <= sparsity < 1.0):
+        raise ValueError(f"sparsity must be in [0, 1), got {sparsity}")
+    _validate_importance_norm(importance_norm)
+    if isinstance(model, str):
+        model = onnx.load(model, load_external_data=False)
+    graph = model.graph
+
+    chains = _find_qdq_chains(graph)
+    not_eligible = _qdq_not_eligible(graph, chains)
+    if not chains:
+        return PruningSensitivityReport(layers=[], not_eligible=not_eligible)
+
+    producer_touched: Set[str] = set()
+    consumer_touched: Set[str] = set()
+    layers: List[PruningLayerSensitivity] = []
+
+    for chain in chains:
+        p, c = chain.producer, chain.consumer
+        p_key = _weight_ref_key(p.ref)
+        c_key = _weight_ref_key(c.ref)
+        if p_key == c_key:
+            continue  # degenerate (the same weight in both roles) -- no report row
+
+        label = _node_label(p.node)
+        family = "qdq_conv" if p.is_conv else "qdq_matmul"
+        n = chain.n_channels
+
+        if p_key in producer_touched or c_key in consumer_touched:
+            layers.append(
+                PruningLayerSensitivity(
+                    label=label,
+                    family=family,
+                    total=n,
+                    would_drop=0,
+                    margin=None,
+                    importance_min=0.0,
+                    importance_max=0.0,
+                )
+            )
+            continue  # a shared/tied weight another chain already claimed
+
+        keep_count = max(1, n - round(n * sparsity))
+        if keep_count >= n:
+            layers.append(
+                PruningLayerSensitivity(
+                    label=label,
+                    family=family,
+                    total=n,
+                    would_drop=0,
+                    margin=None,
+                    importance_min=0.0,
+                    importance_max=0.0,
+                )
+            )
+            continue  # rounds down to nothing for this chain -- no-op
+
+        w = _weight_ref_dequantized(p.ref)
+        w_nk = _weight_to_nk(w, p.weight_transposed, p.is_conv)
+        importance = _qdq_channel_importance(w_nk, importance_norm)
+        keep = np.sort(np.argsort(-importance)[:keep_count])
+        keep_mask = np.zeros(n, dtype=bool)
+        keep_mask[keep] = True
+
+        layers.append(
+            PruningLayerSensitivity(
+                label=label,
+                family=family,
+                total=n,
+                would_drop=int(n - keep_count),
+                margin=_normalized_margin(importance, keep_mask),
+                importance_min=float(importance.min()),
+                importance_max=float(importance.max()),
+            )
+        )
+
+        producer_touched.add(p_key)
+        consumer_touched.add(c_key)
+
+    return PruningSensitivityReport(layers=layers, not_eligible=not_eligible)
+
+
 # --- Attention-head family ---------------------------------------------
 
 
@@ -14191,6 +14417,307 @@ def _analyze_moe_whole_expert_pruning(
     )
 
 
+# --- Embedding / lm_head vocabulary family ----------------------------------
+#
+# Only :func:`apply_embedding_vocab_magnitude_pruning` gets a `_analyze_*`
+# counterpart here -- :func:`apply_embedding_vocab_pruning` deliberately
+# does not, and that is a considered scope decision, not an oversight:
+# every other family this module's dry-run analysis covers has its own
+# *data-driven* importance ranking (weight magnitude, a Wanda-style
+# calibrated norm, router-gate usage, ...) that a `sparsity` argument
+# turns into a keep/drop boundary -- exactly the boundary a `margin`
+# means anything for. `apply_embedding_vocab_pruning` has no such ranking
+# at all: its `keep_token_ids`/`drop_token_ids` argument *is* the answer,
+# supplied directly by the caller, not derived from anything this pass
+# could report a "would keep/would drop, how safe" verdict on. Given an
+# explicit keep-set, dry-running it would only ever be able to echo the
+# caller's own input straight back (`total=vocab_size`,
+# `would_drop=vocab_size - len(keep_token_ids)`, verbatim) with no
+# `importance`/`margin` signal behind it at all -- not a "what would this
+# call do that I don't already know" report, just a restatement of the
+# call's own arguments. That isn't the shape
+# :class:`PruningLayerSensitivity` exists to carry (see its own `margin`
+# field docstring), so it is left unregistered rather than forced into a
+# shape that would carry no real information.
+
+
+def _embedding_not_eligible(
+    graph: onnx.GraphProto,
+    chain: Optional[_EmbeddingChain],
+    input_name: Optional[str],
+) -> List[str]:
+    """Every `Gather` node :func:`_match_embedding_gather` (the exact same
+    per-node matcher :func:`_match_embedding_chain` itself calls) confirms
+    structurally embedding-shaped, but that the whole call still declines
+    to touch -- every one of them when `chain` is `None` (whether because
+    none exist, more than one does and the call can't disambiguate
+    without `input_name`, or the sole match's own second-consumer/
+    `lm_head` shape wasn't confidently recognized --
+    :func:`_match_embedding_chain` returns `None` for all three), or none
+    at all when `chain` is not `None` (:func:`_match_embedding_chain`'s
+    own ``len(matches) != 1`` check guarantees the chosen `chain.gather`
+    is the *only* structurally-matching node reachable under this same
+    `input_name` in that case). Mirrors :func:`_match_embedding_chain`'s
+    own `input_name` filter exactly, so a structurally-matching `Gather`
+    reading a *different* graph input than a given `input_name` is still
+    reported here -- this call would never touch it either.
+    """
+    initializer_map = {t.name: t for t in graph.initializer}
+    consumers_of = _consumers_of(graph)
+    node_by_output = {out: n for n in graph.node for out in n.output}
+    graph_input_names = {i.name for i in graph.input}
+
+    not_eligible = []
+    for node in graph.node:
+        m = _match_embedding_gather(
+            node, initializer_map, consumers_of, graph_input_names, node_by_output
+        )
+        if m is None:
+            continue
+        _w_name, indices_name, underlying = m
+        if input_name is not None and input_name not in (indices_name, underlying):
+            continue
+        if chain is not None and node is chain.gather:
+            continue
+        not_eligible.append(f"{node.op_type} '{_node_label(node)}'")
+    return not_eligible
+
+
+def _analyze_embedding_vocab_magnitude_pruning(
+    model: Union[str, onnx.ModelProto],
+    sparsity: float = 0.5,
+    protect_token_ids: Optional[Sequence[int]] = None,
+    input_name: Optional[str] = None,
+) -> PruningSensitivityReport:
+    """Dry-run mirror of :func:`apply_embedding_vocab_magnitude_pruning` --
+    same matching (:func:`_match_embedding_chain`), `protect_token_ids`
+    validation, keep-count, and importance (combined embedding-row/
+    untied-`lm_head`-row L2 norm -- the exact same computation
+    :func:`apply_embedding_vocab_magnitude_pruning` itself performs) logic,
+    reused directly, but `model` is never mutated.
+
+    Reports at most a *single* :class:`PruningLayerSensitivity`
+    (`family` ``"embedding_vocab_magnitude"``, `label` the matched
+    `Gather` node's own label, `total=vocab_size`) -- unlike every
+    channel/head/expert family above, :func:`_match_embedding_chain`
+    matches at most one embedding table per graph by construction (an
+    ambiguous multi-`Gather` graph declines the whole call outright
+    rather than guessing which one is "the" token embedding, see its own
+    docstring), so there is only ever one independently-ranked unit for
+    this family to report at all -- never zero-or-more the way a chain/
+    head/expert-matching family's own `_find_*` can return.
+    """
+    if not (0.0 <= sparsity < 1.0):
+        raise ValueError(f"sparsity must be in [0, 1), got {sparsity}")
+    if isinstance(model, str):
+        model = onnx.load(model, load_external_data=False)
+    graph = model.graph
+
+    chain = _match_embedding_chain(graph, input_name)
+    not_eligible = _embedding_not_eligible(graph, chain, input_name)
+    if chain is None:
+        return PruningSensitivityReport(layers=[], not_eligible=not_eligible)
+
+    vocab_size = chain.vocab_size
+    initializer_map = {t.name: t for t in graph.initializer}
+    emb = _to_f64(initializer_map[chain.weight_name])
+    importance = np.sum(np.square(emb), axis=1)
+    if (
+        chain.lm_head is not None
+        and not chain.lm_head.tied
+        and chain.lm_head.weight_name is not None
+    ):
+        lw = _to_f64(initializer_map[chain.lm_head.weight_name])
+        lw_nk = (
+            lw if chain.lm_head.weight_transposed else lw.T
+        )  # -> [vocab_size, hidden]
+        importance = importance + np.sum(np.square(lw_nk), axis=1)
+    importance = np.sqrt(importance)
+
+    protect = {int(i) for i in (protect_token_ids or ())}
+    bad_protect = sorted(i for i in protect if not (0 <= i < vocab_size))
+    if bad_protect:
+        raise ValueError(
+            f"protect_token_ids out of range [0, {vocab_size}): {bad_protect[:5]}"
+        )
+
+    keep_count = max(1, min(vocab_size, round(vocab_size * (1.0 - sparsity))))
+    keep_count = max(keep_count, len(protect))
+    order = np.argsort(-importance)
+    keep_set = set(protect)
+    for idx in order:
+        if len(keep_set) >= keep_count:
+            break
+        keep_set.add(int(idx))
+
+    keep_mask = np.zeros(vocab_size, dtype=bool)
+    keep_mask[sorted(keep_set)] = True
+
+    return PruningSensitivityReport(
+        layers=[
+            PruningLayerSensitivity(
+                label=_node_label(chain.gather),
+                family="embedding_vocab_magnitude",
+                total=vocab_size,
+                would_drop=int(vocab_size - len(keep_set)),
+                margin=_normalized_margin(importance, keep_mask),
+                importance_min=float(importance.min()),
+                importance_max=float(importance.max()),
+            )
+        ],
+        not_eligible=not_eligible,
+    )
+
+
+# --- Transformer block (depth) family ---------------------------------------
+
+
+def _transformer_block_not_eligible(
+    graph: onnx.GraphProto, candidates: List[_DroppableBlock]
+) -> List[str]:
+    initializer_map = {t.name: t for t in graph.initializer}
+    matched_ids = {id(c.merge_node) for c in candidates}
+    not_eligible = []
+    for node in graph.node:
+        if not _is_eligible_add_merge(node, initializer_map):
+            continue
+        if id(node) in matched_ids:
+            continue
+        not_eligible.append(f"{node.op_type} '{_node_label(node)}'")
+    return not_eligible
+
+
+def _analyze_transformer_block_pruning(
+    model: Union[str, onnx.ModelProto],
+    calibration_data: Optional[Sequence[Tensors]] = None,
+    num_samples: int = 8,
+    seed: int = 0,
+    sparsity: float = 0.25,
+    num_blocks_to_drop: Optional[int] = None,
+    providers: Optional[Sequence[str]] = None,
+) -> PruningSensitivityReport:
+    """Dry-run mirror of :func:`apply_transformer_block_pruning` -- same
+    matching (:func:`_find_transformer_block_candidates`, using real
+    `onnx.shape_inference` output exactly as the real call does),
+    calibration (:func:`_transformer_block_similarity`, the exact same
+    helper :func:`apply_transformer_block_pruning` itself calls), ranking,
+    and greedy overlap-skip commit selection
+    (:func:`_select_droppable_blocks`, likewise the exact same helper the
+    real call uses -- extracted from its own former inline loop
+    specifically so this analyzer could reuse it verbatim, see that
+    function's own docstring) logic, reused directly, but no node is ever
+    deleted or rewired.
+
+    Unlike every other family here, a matched candidate is a whole
+    residual sub-block with no further per-block internal channel/head/
+    entry count to subdivide -- a block is dropped whole or kept whole,
+    never partially -- and, unlike the embedding family just above, there
+    can be many independent candidates spread anywhere across the graph
+    with no common owning node to group them under (a MoE node owns its
+    own experts; no node "owns" the set of transformer blocks). The
+    natural unit this reports is therefore the *whole matched-candidate
+    set*, exactly the same "one precomputed importance vector, then
+    top-k/greedy-selected" shape :func:`apply_moe_whole_expert_pruning`'s
+    own dry-run mirror already reports as a single row per MoE node, just
+    with the whole model standing in for that one node: a single
+    :class:`PruningLayerSensitivity` (`family` ``"transformer_block"``,
+    `label` every candidate's own merge-`Add` label joined by ``" + "``,
+    mirroring :func:`_chain_label`'s own multi-producer convention,
+    `total` the number of matched candidates) whenever at least one
+    candidate is matched, none at all otherwise.
+
+    The ranking signal is mean cosine similarity between each candidate's
+    own `x_in`/`x_out` -- *higher* means more redundant (safer to drop),
+    the opposite sense every other family's own importance has (there,
+    higher means safer to *keep*). So the `importance` this reports
+    (and `margin` is computed from) is the *negated* similarity score,
+    restoring the same "higher importance is kept, lower is dropped"
+    convention :func:`_normalized_margin` itself assumes -- a monotonic
+    negation changes neither which candidates rank above which others nor
+    the greedy selection itself (only :func:`_transformer_block_similarity`'s
+    own raw, un-negated score, ranked descending, drives that -- see
+    :func:`apply_transformer_block_pruning`'s own docstring), only the
+    sign convention this report's own `importance_min`/`importance_max`/
+    `margin` fields are expressed in.
+    """
+    if num_blocks_to_drop is not None:
+        if num_blocks_to_drop < 0:
+            raise ValueError(
+                f"num_blocks_to_drop must be >= 0, got {num_blocks_to_drop}"
+            )
+    elif not (0.0 <= sparsity <= 1.0):
+        raise ValueError(f"sparsity must be in [0, 1], got {sparsity}")
+
+    if isinstance(model, str):
+        model = onnx.load(model, load_external_data=False)
+    graph = model.graph
+
+    try:
+        inferred = onnx.shape_inference.infer_shapes(model, strict_mode=False)
+        value_info_by_name = _value_info_by_name(inferred.graph)
+    except Exception:
+        value_info_by_name = _value_info_by_name(graph)
+
+    candidates = _find_transformer_block_candidates(graph, value_info_by_name)
+    not_eligible = _transformer_block_not_eligible(graph, candidates)
+    if not candidates:
+        return PruningSensitivityReport(layers=[], not_eligible=not_eligible)
+
+    label = " + ".join(_node_label(c.merge_node) for c in candidates)
+    total = len(candidates)
+
+    if num_blocks_to_drop is not None:
+        target = min(num_blocks_to_drop, total)
+    else:
+        target = int(round(sparsity * total))
+
+    if target <= 0:
+        return PruningSensitivityReport(
+            layers=[
+                PruningLayerSensitivity(
+                    label=label,
+                    family="transformer_block",
+                    total=total,
+                    would_drop=0,
+                    margin=None,
+                    importance_min=0.0,
+                    importance_max=0.0,
+                )
+            ],
+            not_eligible=not_eligible,
+        )
+
+    if calibration_data is None:
+        calibration_data = generate_random_calibration_data(
+            model, num_samples=num_samples, seed=seed
+        )
+
+    similarity = _transformer_block_similarity(
+        model, candidates, calibration_data, providers
+    )
+    ranked_idx = sorted(range(total), key=lambda i: similarity[i], reverse=True)
+    ranked = [candidates[i] for i in ranked_idx]
+    committed_ids = {id(c.merge_node) for c in _select_droppable_blocks(ranked, target)}
+
+    importance = np.array([-similarity[i] for i in range(total)])
+    keep_mask = np.array([id(c.merge_node) not in committed_ids for c in candidates])
+
+    return PruningSensitivityReport(
+        layers=[
+            PruningLayerSensitivity(
+                label=label,
+                family="transformer_block",
+                total=total,
+                would_drop=int((~keep_mask).sum()),
+                margin=_normalized_margin(importance, keep_mask),
+                importance_min=float(importance.min()),
+                importance_max=float(importance.max()),
+            )
+        ],
+        not_eligible=not_eligible,
+    )
+
+
 # --- Public entry point -----------------------------------------------------
 
 # The exact set of `apply_*` functions `analyze_pruning_sensitivity` can
@@ -14199,21 +14726,26 @@ def _analyze_moe_whole_expert_pruning(
 # for why dispatch-by-identity to a dedicated `_analyze_*` per family, not a
 # single generic function that introspects an arbitrary `apply_fn`, or a
 # family of separately-named public functions.
-_SENSITIVITY_ANALYZERS: Dict[Callable[..., onnx.ModelProto], Callable[..., Any]] = {
+_SENSITIVITY_ANALYZERS: Dict[
+    Callable[..., Union[onnx.ModelProto, EmbeddingPruningResult]], Callable[..., Any]
+] = {
     apply_magnitude_pruning: _analyze_magnitude_pruning,
     apply_wanda_pruning: _analyze_wanda_pruning,
     apply_structured_pruning: _analyze_structured_pruning,
     apply_structured_wanda_pruning: _analyze_structured_wanda_pruning,
+    apply_structured_pruning_qdq: _analyze_structured_pruning_qdq,
     apply_attention_head_pruning: _analyze_attention_head_pruning,
     apply_attention_head_wanda_pruning: _analyze_attention_head_wanda_pruning,
     apply_moe_expert_channel_pruning: _analyze_moe_expert_channel_pruning,
     apply_moe_whole_expert_pruning: _analyze_moe_whole_expert_pruning,
+    apply_embedding_vocab_magnitude_pruning: _analyze_embedding_vocab_magnitude_pruning,
+    apply_transformer_block_pruning: _analyze_transformer_block_pruning,
 }
 
 
 def analyze_pruning_sensitivity(
     model: Union[str, onnx.ModelProto],
-    apply_fn: Callable[..., onnx.ModelProto],
+    apply_fn: Callable[..., Union[onnx.ModelProto, EmbeddingPruningResult]],
     **kwargs: Any,
 ) -> PruningSensitivityReport:
     """Dry-run sensitivity/"what would happen" report for one of this
@@ -14221,39 +14753,45 @@ def analyze_pruning_sensitivity(
     the exact same arguments a real call to `apply_fn` would take
     (`**kwargs` -- `sparsity`, `calibration_data`, `importance_norm`,
     `global_sparsity`, whichever subset `apply_fn` itself accepts), reports
-    which layers/chains/heads that call would actually touch, how many of
-    each one's channels/heads/weight-entries it would drop, and a
-    normalized "margin" proxy for how safe or risky that cut is -- all
-    without ever mutating `model`. See :func:`weight_sparsity` for the
-    complementary *after-the-fact* measurement this module already had
-    (actual zero-fraction of an already-pruned model); this is the
-    *before* half that was missing.
+    which layers/chains/heads/blocks/vocabulary rows that call would
+    actually touch, how many of each one's channels/heads/weight-entries/
+    blocks/rows it would drop, and a normalized "margin" proxy for how
+    safe or risky that cut is -- all without ever mutating `model`. See
+    :func:`weight_sparsity` for the complementary *after-the-fact*
+    measurement this module already had (actual zero-fraction of an
+    already-pruned model); this is the *before* half that was missing.
 
-    `apply_fn` must be one of the eight functions this module itself
+    `apply_fn` must be one of the eleven functions this module itself
     exports: :func:`apply_magnitude_pruning`, :func:`apply_wanda_pruning`,
     :func:`apply_structured_pruning`, :func:`apply_structured_wanda_pruning`,
+    :func:`apply_structured_pruning_qdq`,
     :func:`apply_attention_head_pruning`,
     :func:`apply_attention_head_wanda_pruning`,
-    :func:`apply_moe_expert_channel_pruning`, or
-    :func:`apply_moe_whole_expert_pruning` -- passed by reference (e.g.
+    :func:`apply_moe_expert_channel_pruning`,
+    :func:`apply_moe_whole_expert_pruning`,
+    :func:`apply_embedding_vocab_magnitude_pruning`, or
+    :func:`apply_transformer_block_pruning` -- passed by reference (e.g.
     ``analyze_pruning_sensitivity(model, apply_wanda_pruning, sparsity=0.6)``),
     not by name. Each dispatches to its own dedicated `_analyze_*`
     implementation, which directly reuses that same family's own real
-    matching (`_candidates`/`_find_*_chains`) and importance-computation
-    helpers -- never a duplicated or reimplemented copy of either -- so the
-    report's own numbers are computed the exact same way the mutating call
-    itself would compute them, up to (but never actually calling) the final
-    slice/zero step. :func:`apply_sparsegpt_pruning` is not supported (a
-    `ValueError` naming the eight functions that are); neither is
+    matching (`_candidates`/`_find_*_chains`/`_match_embedding_chain`) and
+    importance-computation helpers -- never a duplicated or reimplemented
+    copy of either -- so the report's own numbers are computed the exact
+    same way the mutating call itself would compute them, up to (but never
+    actually calling) the final slice/zero/delete step. :func:`apply_sparsegpt_pruning`
+    is not supported, and neither is :func:`apply_embedding_vocab_pruning`
+    (a `ValueError` naming the eleven functions that are supported); nor is
     `apply_structured_pruning`/`apply_structured_wanda_pruning`'s own
     `global_sparsity=True` mode or a model containing any `Concat`-merged
     skip-connection chain (both a `NotImplementedError`, from within the
     structured family's own dispatch) -- see this module's own "Dry-run
     pruning sensitivity analysis" section comment for the full reasoning
-    behind every one of these scope decisions.
+    behind every one of these scope decisions, `apply_embedding_vocab_pruning`
+    included (see this module's own "Embedding / lm_head vocabulary family"
+    dry-run section comment specifically for that one).
 
     :param model: the onnx ModelProto or file path `apply_fn` would take
-    :param apply_fn: one of this module's own eight supported `apply_*`
+    :param apply_fn: one of this module's own eleven supported `apply_*`
             functions, passed by reference
     :param kwargs: forwarded to `apply_fn`'s own dedicated `_analyze_*`
             counterpart, which accepts the same parameters `apply_fn`
