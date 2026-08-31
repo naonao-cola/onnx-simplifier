@@ -13534,3 +13534,368 @@ def test_structured_pruning_bfloat16_matches_array_oracle():
     np.testing.assert_array_equal(
         w2_pruned.view(np.uint16), w2[keep, :].view(np.uint16)
     )
+
+
+# --- analyze_pruning_sensitivity (dry-run sensitivity report) -------------
+#
+# The correctness bar here is different from the rest of this file: rather
+# than an independent from-scratch oracle, the report's own predicted
+# would-drop counts and matched chains are checked directly against what
+# the corresponding *real*, mutating `apply_*` call actually does when
+# given the exact same arguments -- see this section's own
+# ``_report_matches_real_call`` docstring for why that's a strong,
+# mechanical check despite not being a second independent implementation.
+
+
+def _initializer_dims(model):
+    return {t.name: tuple(t.dims) for t in model.graph.initializer}
+
+
+def test_analyze_pruning_sensitivity_never_mutates_input_model():
+    # The entire point of this tool: building the report must not touch
+    # `model` at all, for every supported family -- checked here via exact
+    # byte-for-byte serialization equality, not just "the values I later
+    # read still look right".
+    mlp, _, _, _ = _swiglu_mlp_model(K=8, H=16, Out=4)
+    attention, _ = _attention_model(K=8, H=4, D=4, Out=6)
+    gqa, _ = _gqa_model()
+    x = np.random.default_rng(0).standard_normal((4, 8)).astype(np.float32)
+    calibration_data = [{"X": x}]
+
+    for model, apply_fn, kwargs in [
+        (_matmul_model(K=64, N=16), onnxsim.apply_magnitude_pruning, {}),
+        (
+            _matmul_model(K=64, N=16),
+            onnxsim.apply_wanda_pruning,
+            {"calibration_data": [{"X": np.zeros((1, 64), dtype=np.float32)}]},
+        ),
+        (mlp, onnxsim.apply_structured_pruning, {}),
+        (
+            mlp,
+            onnxsim.apply_structured_wanda_pruning,
+            {"calibration_data": calibration_data},
+        ),
+        (attention, onnxsim.apply_attention_head_pruning, {}),
+        (gqa, onnxsim.apply_attention_head_pruning, {}),
+    ]:
+        before_bytes = model.SerializeToString()
+        report = onnxsim.analyze_pruning_sensitivity(
+            model, apply_fn, sparsity=0.5, **kwargs
+        )
+        assert model.SerializeToString() == before_bytes, (
+            f"{apply_fn.__name__} dry run mutated the input model"
+        )
+        assert isinstance(report, onnxsim.PruningSensitivityReport)
+
+
+def test_analyze_magnitude_pruning_matches_real_call():
+    K, N = 64, 16
+    model = _matmul_model(K=K, N=N)
+    report = onnxsim.analyze_pruning_sensitivity(
+        model, onnxsim.apply_magnitude_pruning, sparsity=0.5
+    )
+    assert len(report.layers) == 1
+    layer = report.layers[0]
+    assert layer.family == "matmul"
+    assert layer.total == K * N
+    assert report.not_eligible == []
+
+    pruned = onnxsim.apply_magnitude_pruning(model, sparsity=0.5)
+    w = onnx.numpy_helper.to_array(pruned.graph.initializer[0])
+    assert layer.would_drop == int((w == 0).sum())
+    assert layer.would_drop == pytest.approx(K * N * 0.5, abs=N)  # per-row rounding
+
+
+def test_analyze_magnitude_pruning_nm_pattern_matches_real_call():
+    K, N = 32, 8
+    model = _matmul_model(K=K, N=N)
+    report = onnxsim.analyze_pruning_sensitivity(
+        model, onnxsim.apply_magnitude_pruning, n=2, m=4
+    )
+    pruned = onnxsim.apply_magnitude_pruning(model, n=2, m=4)
+    w = onnx.numpy_helper.to_array(pruned.graph.initializer[0])
+    assert report.layers[0].would_drop == int((w == 0).sum())
+    assert report.layers[0].would_drop == K * N // 2  # exactly half for 2:4
+
+
+def test_analyze_magnitude_pruning_global_sparsity_matches_real_call():
+    model, _, _ = _two_scale_matmul_model()
+    report = onnxsim.analyze_pruning_sensitivity(
+        model,
+        onnxsim.apply_magnitude_pruning,
+        sparsity=0.5,
+        global_sparsity=True,
+    )
+    pruned = onnxsim.apply_magnitude_pruning(model, sparsity=0.5, global_sparsity=True)
+    inits = {t.name: t for t in pruned.graph.initializer}
+    # `report.layers`' own `label` is each producer node's own output name
+    # (MatMul nodes here are unnamed in the parsed text) -- "Y1"/"Y2" --
+    # not the weight initializer's own name ("Wbig"/"Wsmall"); map between
+    # them via each node's own single weight input.
+    weight_by_output = {node.output[0]: node.input[1] for node in model.graph.node}
+    by_weight = {weight_by_output[layer.label]: layer for layer in report.layers}
+    assert set(by_weight) == set(inits)
+    for name, init in inits.items():
+        w = onnx.numpy_helper.to_array(init)
+        assert by_weight[name].would_drop == int((w == 0).sum())
+
+
+def test_analyze_wanda_pruning_matches_real_call():
+    K, N = 64, 16
+    salient = (3, 7, 40)
+    rng = np.random.default_rng(0)
+    weight = rng.standard_normal((K, N)).astype(np.float32) * 0.5
+    model = _model(
+        f"""
+        g (float[batch,{K}] X) => (float[batch,{N}] Y)
+        {{
+          Y = MatMul(X, W)
+        }}
+        """,
+        initializer=[_f32(weight, "W")],
+    )
+    x = rng.standard_normal((32, K)).astype(np.float32)
+    for c in salient:
+        x[:, c] *= 20.0
+    calibration_data = [{"X": x}]
+
+    report = onnxsim.analyze_pruning_sensitivity(
+        model,
+        onnxsim.apply_wanda_pruning,
+        calibration_data=calibration_data,
+        sparsity=0.5,
+    )
+    pruned = onnxsim.apply_wanda_pruning(
+        model, calibration_data=calibration_data, sparsity=0.5
+    )
+    w = onnx.numpy_helper.to_array(pruned.graph.initializer[0])
+    assert report.layers[0].would_drop == int((w == 0).sum())
+    assert report.layers[0].family == "matmul"
+
+
+def test_analyze_structured_pruning_plain_chain_matches_real_call():
+    K, H, Out = 8, 32, 4
+    model = _mlp_model(K=K, H=H, Out=Out)
+    report = onnxsim.analyze_pruning_sensitivity(
+        model, onnxsim.apply_structured_pruning, sparsity=0.5
+    )
+    assert len(report.layers) == 1
+    layer = report.layers[0]
+    assert layer.family == "matmul_plain"
+    assert layer.total == H
+    assert report.not_eligible == []
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    dims_after = _initializer_dims(pruned)
+    assert dims_after["W1"][1] == H - layer.would_drop
+    assert dims_after["W2"][0] == H - layer.would_drop
+
+
+def test_analyze_structured_pruning_gated_pair_matches_real_call():
+    K, H, Out = 8, 16, 4
+    model, wg, wu, wd = _swiglu_mlp_model(K=K, H=H, Out=Out)
+    report = onnxsim.analyze_pruning_sensitivity(
+        model, onnxsim.apply_structured_pruning, sparsity=0.5
+    )
+    assert len(report.layers) == 1
+    layer = report.layers[0]
+    assert layer.family == "matmul_gated"
+    assert layer.total == H
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    dims_after = _initializer_dims(pruned)
+    kept = H - layer.would_drop
+    assert dims_after["Wg"][1] == kept
+    assert dims_after["Wu"][1] == kept
+    assert dims_after["Wd"][0] == kept
+
+
+def test_analyze_structured_pruning_grouped_conv_matches_real_call():
+    Cin, C1, C2, group1 = 4, 8, 6, 2
+    rng = np.random.default_rng(0)
+    w1 = rng.standard_normal((C1, Cin // group1, 3, 3)).astype(np.float32)
+    w2 = rng.standard_normal((C2, C1, 3, 3)).astype(np.float32)
+    model = _grouped_conv_pair_model(w1, w2, group1=group1, group2=1)
+
+    report = onnxsim.analyze_pruning_sensitivity(
+        model, onnxsim.apply_structured_pruning, sparsity=0.5
+    )
+    assert len(report.layers) == 1
+    layer = report.layers[0]
+    assert layer.family == "conv_plain"
+    assert layer.total == C1
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    dims_after = _initializer_dims(pruned)
+    kept = C1 - layer.would_drop
+    assert dims_after["W1"][0] == kept
+    assert dims_after["W2"][1] == kept
+
+
+def test_analyze_structured_wanda_pruning_matches_real_call():
+    K, H, Out = 8, 32, 4
+    model = _mlp_model(K=K, H=H, Out=Out, bias=False)
+    rng = np.random.default_rng(1)
+    x = rng.standard_normal((16, K)).astype(np.float32)
+    calibration_data = [{"X": x}]
+
+    report = onnxsim.analyze_pruning_sensitivity(
+        model,
+        onnxsim.apply_structured_wanda_pruning,
+        calibration_data=calibration_data,
+        sparsity=0.5,
+    )
+    assert len(report.layers) == 1
+    layer = report.layers[0]
+    assert layer.family == "matmul_plain"
+
+    pruned = onnxsim.apply_structured_wanda_pruning(
+        model, calibration_data=calibration_data, sparsity=0.5
+    )
+    dims_after = _initializer_dims(pruned)
+    kept = H - layer.would_drop
+    assert dims_after["W1"][1] == kept
+    assert dims_after["W2"][0] == kept
+
+
+def test_analyze_attention_head_pruning_plain_attention_matches_real_call():
+    K, H, D, Out = 8, 4, 4, 6
+    model, info = _attention_model(K=K, H=H, D=D, Out=Out)
+    report = onnxsim.analyze_pruning_sensitivity(
+        model, onnxsim.apply_attention_head_pruning, sparsity=0.5
+    )
+    assert len(report.layers) == 1
+    layer = report.layers[0]
+    assert layer.family == "attention_head"
+    assert layer.total == H
+    assert report.not_eligible == []
+
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    dims_after = _initializer_dims(pruned)
+    kept = H - layer.would_drop
+    assert dims_after["Wqkv"][1] == kept * 3 * D  # Nq==Nk==Nv==H*D here
+
+
+def test_analyze_attention_head_pruning_gqa_matches_real_call():
+    H, KVH, D = 4, 2, 8
+    model, info = _gqa_model(H=H, KVH=KVH, D=D)
+    report = onnxsim.analyze_pruning_sensitivity(
+        model, onnxsim.apply_attention_head_pruning, sparsity=0.5
+    )
+    assert len(report.layers) == 1
+    layer = report.layers[0]
+    assert layer.family == "attention_gqa_group"
+    assert layer.total == KVH
+
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    dims_after = _initializer_dims(pruned)
+    kept_groups = KVH - layer.would_drop
+    group_size = H // KVH
+    assert dims_after["Wq"][1] == kept_groups * group_size * D
+    assert dims_after["Wk"][1] == kept_groups * D
+    assert dims_after["Wv"][1] == kept_groups * D
+
+
+def test_analyze_pruning_sensitivity_not_eligible_lists_unmatched_nodes():
+    # A second MatMul whose weight is a graph input, not a constant
+    # initializer, can never be matched by any of this module's own
+    # structured-pruning finders -- it must show up in `not_eligible`, not
+    # silently be dropped from the report entirely.
+    K, H, Out = 8, 16, 4
+    mlp = _mlp_model(K=K, H=H, Out=Out, bias=False)
+    model = _model(
+        f"""
+        g (float[batch,{K}] X, float[{Out},{Out}] Wdyn) => (float[batch,{Out}] Z)
+        {{
+          h = MatMul(X, W1)
+          a = Relu(h)
+          Y = MatMul(a, W2)
+          Z = MatMul(Y, Wdyn)
+        }}
+        """,
+        initializer=list(mlp.graph.initializer),
+    )
+    report = onnxsim.analyze_pruning_sensitivity(
+        model, onnxsim.apply_structured_pruning, sparsity=0.5
+    )
+    assert len(report.layers) == 1  # only the W1->W2 chain is matched
+    assert report.not_eligible == ["MatMul 'Z'"]
+    matched_labels = {layer.label for layer in report.layers}
+    assert "Z" not in matched_labels
+
+
+def test_analyze_pruning_sensitivity_rejects_unsupported_apply_fn():
+    model = _matmul_model(K=16, N=8)
+    with pytest.raises(ValueError, match="apply_sparsegpt_pruning"):
+        onnxsim.analyze_pruning_sensitivity(
+            model, onnxsim.apply_sparsegpt_pruning, sparsity=0.5
+        )
+
+
+def test_analyze_structured_pruning_rejects_global_sparsity():
+    model = _mlp_model(K=8, H=16, Out=4)
+    with pytest.raises(NotImplementedError, match="global_sparsity"):
+        onnxsim.analyze_pruning_sensitivity(
+            model,
+            onnxsim.apply_structured_pruning,
+            sparsity=0.5,
+            global_sparsity=True,
+        )
+
+
+def test_analyze_structured_pruning_rejects_concat_merged_models():
+    rng = np.random.default_rng(0)
+    weights = [
+        rng.standard_normal((8, 3)).astype(np.float32),
+        rng.standard_normal((8, 5)).astype(np.float32),
+    ]
+    w_out = rng.standard_normal((8, 4)).astype(np.float32)
+    model = _matmul_concat_model(weights, w_out)
+    with pytest.raises(NotImplementedError, match="Concat"):
+        onnxsim.analyze_pruning_sensitivity(
+            model, onnxsim.apply_structured_pruning, sparsity=0.5
+        )
+
+
+def test_analyze_pruning_sensitivity_margin_reflects_importance_distribution():
+    # Adversarial check that `margin` is a real, distribution-sensitive
+    # signal, not a constant regardless of what's actually being ranked:
+    # layer A has a huge, unambiguous gap between its "big" and "small"
+    # column blocks (margin should be strongly positive, near the top of
+    # its possible range); layer B's entries are all *exactly* equal (no
+    # meaningful cut exists at all -- margin must come out exactly 0.0).
+    # A normalization bug that always reports ~0, or always reports the
+    # same value regardless of the underlying weights, would fail this.
+    # `_sparsity_mask` ranks each output channel's own row of `w_nk`
+    # ([N, K], `_weight_to_nk`'s own convention) independently -- so the
+    # big/small split has to be *within* every row (along `K`), not across
+    # rows, for a plain (non-transposed) MatMul weight of shape [K, N]:
+    # `w_nk == W.T`, so `W` itself is built as this test's own desired
+    # `w_nk` array, transposed.
+    N, K = 4, 8
+    big = np.full((N, K // 2), 10.0, dtype=np.float32)
+    small = np.full((N, K // 2), 1e-3, dtype=np.float32)
+    w_nk_a = np.concatenate([big, small], axis=1)  # [N, K]: every row big|small
+    w_nk_b = np.full((N, K), 3.0, dtype=np.float32)  # [N, K]: every entry tied
+
+    model = _model(
+        f"""
+        g (float[batch,{K}] X) => (float[batch,{N}] Ya, float[batch,{N}] Yb)
+        {{
+          Ya = MatMul(X, Wa)
+          Yb = MatMul(X, Wb)
+        }}
+        """,
+        initializer=[_f32(w_nk_a.T, "Wa"), _f32(w_nk_b.T, "Wb")],
+    )
+
+    report = onnxsim.analyze_pruning_sensitivity(
+        model, onnxsim.apply_magnitude_pruning, sparsity=0.5
+    )
+    by_label = {layer.label: layer for layer in report.layers}
+    margin_a = by_label["Ya"].margin
+    margin_b = by_label["Yb"].margin
+
+    assert margin_b == 0.0  # every entry exactly tied -- no meaningful cut
+    assert margin_a is not None and margin_a > 0.9  # wide, unambiguous gap
+    assert margin_a != margin_b
