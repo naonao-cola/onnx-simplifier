@@ -26,6 +26,16 @@ techniques on top of a single fixed INT4 baseline.
      MatMul/Gemm/Conv layers -- :func:`onnxsim.apply_structured_pruning_cpp`
      (data-free, the default) or, with ``pruning_method="wanda"``,
      :func:`onnxsim.apply_structured_wanda_pruning` (calibrated).
+   If either sub-stage actually ran, :func:`onnxsim.apply_pruning_finetune`
+   is then tried against them: a closed-form, layer-wise ridge-regression
+   refit of every surviving MatMul/Gemm weight against the *original*
+   (pre-pruning) model's own real activations, recovering some of the
+   accuracy pruning's own plain channel deletion gives up -- see that
+   module's own docstring for the full technique. Measured and kept only
+   if it doesn't measurably worsen the post-pruning float model's own
+   accuracy (the same "try it, keep only if not worse" gate stage 6's own
+   compression uses), since ridge-regression fine-tuning on scarce
+   calibration data carries real overfitting risk of its own.
 3. **Cross-Layer Equalize** (:func:`onnxsim.cross_layer_equalize`) -- always;
    data-free, changes nothing but weight parameterization (see its own
    docstring), and reduces the error every later quantization stage
@@ -81,6 +91,10 @@ function matches -- ``pruning.py``'s own newer options on top of that
 directly callable on their own too, not exposed as pipeline parameters
 here.
 
+:func:`onnxsim.apply_pruning_finetune` is pure-Python only, same as
+``pruning_method="wanda"`` and ``rotation_method="duquant"``/``"spinquant"``
+-- see this module's own "C++ vs. Python" note below.
+
 **C++ vs. Python.** The magnitude-based pruning sub-stages (stage 2's own
 default), rotation (stage 4b's own ``rotation_method="quarot"`` default),
 and compression (stage 6) use C++-backed ports
@@ -124,6 +138,7 @@ from onnxsim.adaround import apply_adaround
 from onnxsim.bias_correction import correct_bias
 from onnxsim.calibration import Tensors, generate_random_calibration_data
 from onnxsim.duquant import apply_duquant
+from onnxsim.finetune import apply_pruning_finetune
 from onnxsim.mixed_precision import apply_mixed_precision_quantization
 from onnxsim.onnx_simplifier import (
     apply_attention_head_pruning_cpp,
@@ -146,7 +161,7 @@ class OptimizationPipelineResult:
     """One :func:`apply_optimization_pipeline` result: the optimized model
     reached, which stages were applied to reach it (in application order,
     a prefix of ``["attention_head_pruning" | "attention_head_wanda_pruning",
-    "structured_pruning" | "structured_wanda_pruning",
+    "structured_pruning" | "structured_wanda_pruning", "pruning_finetune",
     "cross_layer_equalization", "quantize_weight_only_int4" |
     "apply_mixed_precision_quantization" | "quarot" | "duquant" |
     "spinquant", "adaround", "bias_correction", "double_quantization"]``),
@@ -205,7 +220,10 @@ def apply_optimization_pipeline(
             remove, applied to the float model before quantizing (and
             before ``sparsity``'s own channel pruning); ``None`` (the
             default) skips attention-head pruning entirely. Independent of
-            ``sparsity`` -- either, both, or neither may be given
+            ``sparsity`` -- either, both, or neither may be given. If either
+            is given, :func:`onnxsim.apply_pruning_finetune` is also tried
+            against the resulting pruned float model (see this module's own
+            docstring), using the same ``calibration_data``
     :param pruning_method: ``"magnitude"`` (the default) uses the data-free,
             C++-backed :func:`onnxsim.apply_structured_pruning_cpp`/
             :func:`onnxsim.apply_attention_head_pruning_cpp`; ``"wanda"``
@@ -316,6 +334,30 @@ def apply_optimization_pipeline(
         else:
             float_model = apply_structured_pruning_cpp(float_model, sparsity=sparsity)
             stages.append("structured_pruning")
+
+    if len(stages) > 0:
+        # Something was actually pruned -- try recovering some of the
+        # accuracy plain channel deletion gave up, kept only if it doesn't
+        # measurably worsen the post-pruning float model's own accuracy
+        # (mirrors stage 6's own "try it, keep only if not worse" gate for
+        # compression, since ridge-regression fine-tuning on scarce
+        # calibration data carries real overfitting risk of its own).
+        finetuned = apply_pruning_finetune(
+            model,
+            float_model,
+            calibration_data=calibration_data,
+            num_samples=num_samples,
+            seed=seed,
+            providers=providers,
+        )
+        pruned_report = _measure(float_model)
+        finetuned_report = _measure(finetuned)
+        if finetuned_report.all_finite and (
+            not pruned_report.all_finite
+            or finetuned_report.worst_relative_l2 <= pruned_report.worst_relative_l2
+        ):
+            float_model = finetuned
+            stages.append("pruning_finetune")
 
     float_model = cross_layer_equalize(float_model)
     stages.append("cross_layer_equalization")

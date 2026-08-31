@@ -224,6 +224,54 @@ def test_pipeline_applies_both_pruning_sub_stages_independently():
     onnx.checker.check_model(result.optimized_model)
 
 
+def _mlp_pipeline_model(K=8, H=32, Out=4, seed=0):
+    # A plain Gemm -> Relu -> MatMul chain -- apply_structured_pruning's own
+    # simplest target topology (no Conv im2col bookkeeping), and one of
+    # apply_pruning_finetune's own matched MatMul/Gemm consumer layers
+    # (see tests/test_finetune.py's own identically-shaped model).
+    rng = np.random.default_rng(seed)
+    w1 = rng.standard_normal((K, H)).astype(np.float32)
+    b1 = rng.standard_normal((H,)).astype(np.float32)
+    w2 = rng.standard_normal((H, Out)).astype(np.float32)
+    return _model(
+        f"""
+        g (float[batch,{K}] X) => (float[batch,{Out}] Y)
+        {{
+          h = Gemm(X, W1, B1)
+          a = Relu(h)
+          Y = MatMul(a, W2)
+        }}
+        """,
+        initializer=[_f32(w1, "W1"), _f32(b1, "B1"), _f32(w2, "W2")],
+    )
+
+
+def test_pipeline_applies_pruning_finetune_stage_after_structured_pruning():
+    model = _mlp_pipeline_model(K=8, H=32, Out=4, seed=40)
+    rng = np.random.default_rng(41)
+    calibration_data = [{"X": rng.standard_normal((256, 8)).astype(np.float32)}]
+
+    result = onnxsim.apply_optimization_pipeline(
+        model,
+        accuracy_budget=1.0,
+        calibration_data=calibration_data,
+        sparsity=0.5,
+    )
+    assert result.stages_applied[:2] == ["structured_pruning", "pruning_finetune"]
+    onnx.checker.check_model(result.optimized_model)
+
+
+def test_pipeline_without_pruning_skips_pruning_finetune_stage():
+    model = _gemm_model(seed=42)
+    rng = np.random.default_rng(43)
+    calibration_data = [{"X": rng.standard_normal((8, 64)).astype(np.float32)}]
+
+    result = onnxsim.apply_optimization_pipeline(
+        model, accuracy_budget=1.0, calibration_data=calibration_data
+    )
+    assert "pruning_finetune" not in result.stages_applied
+
+
 def test_pipeline_with_wanda_pruning_method_applies_structured_wanda_pruning_stage():
     model = _conv_and_gemm_model(seed=30)
     rng = np.random.default_rng(31)
