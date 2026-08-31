@@ -12,6 +12,7 @@
 #include <streambuf>
 
 #include "ggml_kquant.h"
+#include "ggml_mxfp4.h"
 #include "gguf_dtype.h"
 #include "mmap_file.h"
 #include "tensor_pool.h"
@@ -676,14 +677,20 @@ bool TensorPool::DequantizeToFloat(const std::string& name,
     return false;
   }
   uint32_t ggml_type;
-  if (!FromOnnx(entry->dtype, &ggml_type) || !IsKQuant(ggml_type)) {
+  if (!FromOnnx(entry->dtype, &ggml_type)) {
     return false;
   }
   int64_t numel = 1;
   for (int64_t d : entry->shape) numel *= d;
-  return DequantizeGgmlKQuant(
-      reinterpret_cast<const uint8_t*>(entry->data.data()), entry->data.size(),
-      ggml_type, numel, out);
+  const auto* data = reinterpret_cast<const uint8_t*>(entry->data.data());
+  if (IsKQuant(ggml_type)) {
+    return DequantizeGgmlKQuant(data, entry->data.size(), ggml_type, numel,
+                                out);
+  }
+  if (IsMxfp4(ggml_type)) {
+    return DequantizeGgmlMxfp4(data, entry->data.size(), ggml_type, numel, out);
+  }
+  return false;
 }
 
 // Mirrors LoadGGUF's header-parsing loop (magic/version check, then the
