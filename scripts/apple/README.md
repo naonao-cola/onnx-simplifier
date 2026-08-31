@@ -109,6 +109,12 @@ methodology.
   the rest of this directory, it only *runs* a model on macOS (that's where
   Core ML's runtime lives); the export step itself needs no Apple hardware.
 
+`coreml-integration.yml`'s `benchmark-decode-macos` job runs this exact pair
+end-to-end (export `HuggingFaceTB/SmolLM2-135M-Instruct`, then the decode
+benchmark) on a macOS GitHub-hosted runner, posting the numbers to that run's
+job summary -- `workflow_dispatch`/schedule-only, like the other real-model
+jobs in that workflow, not on every PR.
+
 ### Scaling to few-billion-parameter models
 
 DeviceMark's own leaderboard mostly tests models in the 1-4B range, well
