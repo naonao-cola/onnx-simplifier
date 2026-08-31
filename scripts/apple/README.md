@@ -151,6 +151,69 @@ The pure comparison logic (`compare_token_sequences`) has no coremltools/
 torch/transformers dependency and is unit-tested directly in
 `tests/test_check_decode_parity.py`.
 
+### Quality and retention eval (`run_quality_eval.py` / `compute_retention.py`)
+
+The decode benchmark and parity check above measure speed and short-generation
+correctness; they say nothing about actual model *quality* -- DeviceMark's
+third axis (alongside decode speed and memory), scored via IFEval, MMLU-Pro,
+and MATH-500, plus **retention**: how much of the float model's benchmark
+score survives quantization (`quantized_score / float_score`). See
+`bench/TODO_quality_retention_eval.md` for the full plan; this is the first
+implemented slice of it.
+
+Rather than reimplementing any benchmark's prompt formatting or answer
+scoring, these two scripts lean on
+[`lm-evaluation-harness`](https://github.com/EleutherAI/lm-evaluation-harness)
+(`pip install "lm-eval[ifeval]"`), which already has all three as task
+definitions:
+
+- `lm_eval_coreml_adapter.py` registers a `coreml` model backend wrapping
+  `CoreMLDecoder` so the harness can score an exported `.mlpackage` the same
+  way it scores any other model. It only implements `generate_until` --
+  IFEval, MMLU-Pro, and `hendrycks_math500` (MATH-500) are all
+  `generate_until` tasks in this harness version (free-form generation,
+  scored by a verifier or answer extraction), never `loglikelihood`-based
+  multiple choice, so `CoreMLDecoder`'s existing greedy `generate()` is
+  already the right primitive -- no teacher-forced-logprob code path needed.
+- `run_quality_eval.py` is a thin CLI over `lm_eval.simple_evaluate`,
+  supporting both `--model hf` (the float side -- CPU-only, no macOS needed)
+  and `--model coreml` (the quantized side -- macOS/real Core ML only) against
+  the same task/subset, writing a small JSON summary.
+- `compute_retention.py` takes one JSON from each side and reports the
+  per-task, per-metric retention ratio.
+
+```bash
+pip install "optimum-onnx" transformers coremltools onnxruntime "lm-eval[ifeval]"
+python export_llm_to_coreml.py HuggingFaceTB/SmolLM2-135M-Instruct \
+    --max-context-length 512 --output model.mlpackage
+python run_quality_eval.py --model hf \
+    --model-args pretrained=HuggingFaceTB/SmolLM2-135M-Instruct,dtype=float32 \
+    --tasks ifeval --limit 10 --max-gen-toks 128 --apply-chat-template \
+    --output float_ifeval.json
+python run_quality_eval.py --model coreml --model-args pretrained=model.mlpackage \
+    --tasks ifeval --limit 10 --max-gen-toks 128 --apply-chat-template \
+    --output coreml_ifeval.json
+python compute_retention.py float_ifeval.json coreml_ifeval.json
+```
+
+A `--limit`-restricted run like the one above is explicitly **not**
+benchmark-grade (`lm_eval` itself warns about this) -- treat it as "did this
+get meaningfully worse", not as a score comparable to a published
+leaderboard entry. `--max-gen-toks` matters more here than on a typical
+batched GPU eval: each generated token is its own single-token forward pass
+on an unbatched decoder (HF on CPU, or a real Core ML `.mlpackage`), so a
+benchmark's default generation budget (MMLU-Pro's is 2048 tokens) directly
+sets wall-clock cost. A prototype run of even a single MMLU-Pro example
+against `HuggingFaceTB/SmolLM2-135M-Instruct` on CPU took well over a
+minute at that default -- `coreml-integration.yml`'s `quality-eval-macos`
+job (workflow_dispatch/schedule-only) therefore only runs IFEval for now,
+with both `--limit` and `--max-gen-toks` capped; MMLU-Pro and MATH-500 stay
+future work until that cost is addressed (see the plan doc's "Next steps").
+
+The retention-ratio logic (`compute_retention`) has no lm-evaluation-harness/
+torch/coremltools dependency and is unit-tested directly in
+`tests/test_compute_retention.py`.
+
 ### Scaling to few-billion-parameter models
 
 DeviceMark's own leaderboard mostly tests models in the 1-4B range, well
