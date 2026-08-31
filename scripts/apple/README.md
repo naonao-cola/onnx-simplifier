@@ -141,7 +141,7 @@ you, and one flag worth knowing about:
   here).
 
 ```bash
-pip install "optimum-onnx" transformers coremltools
+pip install "optimum-onnx" transformers coremltools onnxruntime
 python export_llm_to_coreml.py HuggingFaceTB/SmolLM2-135M-Instruct \
     --max-context-length 512 --output smollm2.mlpackage
 python run_llm_decode_benchmark.py smollm2.mlpackage \
