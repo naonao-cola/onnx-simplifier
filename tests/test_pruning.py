@@ -8,6 +8,7 @@ import numpy as np
 import onnx
 import onnx.helper
 import onnx.numpy_helper
+import onnx.reference
 import onnx.shape_inference
 import pytest
 from onnx import parser
@@ -15657,3 +15658,553 @@ def test_embedding_vocab_pruning_declines_when_no_embedding_pattern_exists():
     result = onnxsim.apply_embedding_vocab_pruning(model, keep_token_ids=[0])
     assert result.matched is False
     assert result.model.SerializeToString() == model.SerializeToString()
+
+
+# --- apply_structured_pruning_qdq --------------------------------------------
+#
+# See ``onnxsim/pruning.py``'s own "QDQ (quantized-weight) structured
+# pruning" section comment for the pattern this targets (this repo's own
+# ``quantize_static`` output: symmetric, per-output-channel INT8, zero_point
+# omitted -- but the matcher accepts the wider standard schema too, so these
+# tests also cover asymmetric/per-tensor QDQ weights and topologies this
+# repo's own tooling never itself emits).
+#
+# Numeric-oracle tests below run the pruned QDQ graph through onnxruntime
+# with graph optimizations disabled (:func:`_run_unfused`), not the
+# `_run`/default-optimization-level session every other test in this file
+# uses -- confirmed empirically: with default optimizations, onnxruntime's
+# own QDQ-aware graph optimizer recognizes the DequantizeLinear->MatMul
+# pattern and fuses it into an internal quantized kernel whose accumulation
+# order differs from naive float dequantize-then-matmul, changing the
+# result by more than float32 rounding (~0.7% relative, observed) -- an
+# onnxruntime *optimization* artifact orthogonal to this pass's own
+# correctness (this repo's own ``static_quantize_matmul.h`` doc comment
+# describes exactly this: "a QDQ-aware runtime recognizes the bracketing
+# Q/DQ pair and fuses it into a true integer kernel at load time"). With
+# optimizations disabled, the actual output matches a hand-computed
+# float64 dequantize-then-matmul oracle to ~2e-6 -- confirmed empirically
+# before relying on it here -- which is what these tests hold the pass's
+# own tensor-slicing correctness to.
+
+
+def _i8(array, name):
+    return onnx.numpy_helper.from_array(array.astype(np.int8), name)
+
+
+def _run_unfused(model, feeds):
+    so = ort.SessionOptions()
+    so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
+    sess = ort.InferenceSession(
+        model.SerializeToString(), sess_options=so, providers=["CPUExecutionProvider"]
+    )
+    return sess.run(None, feeds)
+
+
+def _qdq_dequant(q, scale, zero_point, axis):
+    # Independent reference dequantization -- mirrors the ONNX
+    # DequantizeLinear formula `y = (x - x_zero_point) * x_scale` directly,
+    # not anything from onnxsim.pruning itself.
+    q = q.astype(np.float64)
+    scale = scale.astype(np.float64)
+    if scale.ndim == 1:
+        shape = [1] * q.ndim
+        shape[axis] = -1
+        scale = scale.reshape(shape)
+    if zero_point is not None:
+        zp = zero_point.astype(np.float64)
+        if zp.ndim == 1:
+            shape = [1] * q.ndim
+            shape[axis] = -1
+            zp = zp.reshape(shape)
+        q = q - zp
+    return q * scale
+
+
+def _matmul_qdq_producer_model(K=8, H=16, Out=4, seed=0, zero_point=False):
+    # QDQ (per-channel INT8) MatMul producer (Wq/Wscale[/Wzp]) feeding a
+    # plain float MatMul consumer (W2) -- the "producer" role, exercising
+    # co-sliced weight+scale(+zero_point).
+    rng = np.random.default_rng(seed)
+    Wq = rng.integers(-100, 100, size=(K, H)).astype(np.int8)
+    Wscale = np.abs(rng.standard_normal(H)).astype(np.float32) * 0.02 + 0.001
+    W2 = rng.standard_normal((H, Out)).astype(np.float32)
+    initializer = [_i8(Wq, "Wq"), _f32(Wscale, "Wscale"), _f32(W2, "W2")]
+    zp_input = ""
+    Wzp = None
+    if zero_point:
+        Wzp = rng.integers(-20, 20, size=H).astype(np.int8)
+        initializer.append(_i8(Wzp, "Wzp"))
+        zp_input = ", Wzp"
+    model = _model(
+        f"""
+        g (float[batch,{K}] X) => (float[batch,{Out}] Y)
+        {{
+          Wdq = DequantizeLinear<axis=1>(Wq, Wscale{zp_input})
+          h = MatMul(X, Wdq)
+          Y = MatMul(h, W2)
+        }}
+        """,
+        initializer=initializer,
+    )
+    return model, Wq, Wscale, Wzp, W2
+
+
+def test_qdq_structured_pruning_matmul_producer_matches_oracle():
+    K, H, Out = 8, 16, 4
+    model, Wq, Wscale, _Wzp, W2 = _matmul_qdq_producer_model(K, H, Out, seed=0)
+    onnx.checker.check_model(model)
+
+    pruned = onnxsim.apply_structured_pruning_qdq(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    inits = {t.name: t for t in pruned.graph.initializer}
+    assert list(inits["Wq"].dims) == [K, H // 2]
+    assert list(inits["Wscale"].dims) == [H // 2]
+    assert list(inits["W2"].dims) == [H // 2, Out]
+
+    w_dequant = _qdq_dequant(Wq, Wscale, None, axis=1)
+    keep = _oracle_keep_indices(w_dequant, H // 2)
+
+    rng = np.random.default_rng(9)
+    x = rng.standard_normal((5, K)).astype(np.float32)
+    (y,) = _run_unfused(pruned, {"X": x})
+
+    h = x @ w_dequant[:, keep]
+    y_oracle = h @ W2[keep, :]
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-4, atol=1e-4)
+
+    # And the pruned graph's own Wq/Wscale, dequantized, reproduce exactly
+    # the hand-sliced reference -- confirms the lockstep co-slice itself,
+    # not just the end-to-end numeric output.
+    wq_pruned = onnx.numpy_helper.to_array(inits["Wq"])
+    wscale_pruned = onnx.numpy_helper.to_array(inits["Wscale"])
+    np.testing.assert_array_equal(wq_pruned, Wq[:, keep])
+    np.testing.assert_allclose(wscale_pruned, Wscale[keep])
+
+
+def test_qdq_structured_pruning_matmul_producer_asymmetric_zero_point_matches_oracle():
+    # Nonzero, per-channel zero_point -- the general QDQ schema allows it
+    # even though this repo's own quantize_static never emits it (always
+    # omits zero_point, symmetric). Exercises the zero_point co-slice.
+    K, H, Out = 8, 16, 4
+    model, Wq, Wscale, Wzp, W2 = _matmul_qdq_producer_model(
+        K, H, Out, seed=1, zero_point=True
+    )
+    onnx.checker.check_model(model)
+    assert Wzp is not None
+    assert np.any(Wzp != 0)  # genuinely asymmetric, not a degenerate case
+
+    pruned = onnxsim.apply_structured_pruning_qdq(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    inits = {t.name: t for t in pruned.graph.initializer}
+    assert list(inits["Wzp"].dims) == [H // 2]
+
+    w_dequant = _qdq_dequant(Wq, Wscale, Wzp, axis=1)
+    keep = _oracle_keep_indices(w_dequant, H // 2)
+
+    rng = np.random.default_rng(10)
+    x = rng.standard_normal((5, K)).astype(np.float32)
+    (y,) = _run_unfused(pruned, {"X": x})
+    h = x @ w_dequant[:, keep]
+    y_oracle = h @ W2[keep, :]
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-4, atol=1e-4)
+
+    wzp_pruned = onnx.numpy_helper.to_array(inits["Wzp"])
+    np.testing.assert_array_equal(wzp_pruned, Wzp[keep])
+
+
+def test_qdq_structured_pruning_per_channel_scale_mismatch_is_detected_adversarially():
+    # Adversarially engineered per this task's own verification bar: scale
+    # values span three orders of magnitude, strictly increasing by channel
+    # (Wscale[i] = (i + 1) * base), and the weight itself is built so the
+    # surviving `keep` set is NOT the first H//2 channels in order (the
+    # highest-index channels -- also the largest-scale ones -- are the
+    # important/kept ones). A buggy slice that kept Wq's own selected
+    # columns but left Wscale un-sliced (or sliced by position 0..keep_count
+    # rather than by the actual `keep` index set) would misapply a
+    # wildly-wrong-magnitude scale to a kept channel -- detectably wrong by
+    # orders of magnitude, not mere floating-point noise.
+    K, H, Out = 4, 8, 2
+    rng = np.random.default_rng(2)
+    # Small, roughly-equal-magnitude codes: importance is then driven by the
+    # per-channel scale itself (large-scale channels rank as most important
+    # and survive), not incidentally by Wq's own values.
+    Wq = rng.integers(-5, 6, size=(K, H)).astype(np.int8)
+    Wscale = (np.arange(1, H + 1, dtype=np.float64) * 0.001).astype(np.float32)
+    W2 = rng.standard_normal((H, Out)).astype(np.float32)
+    model = _model(
+        f"""
+        g (float[batch,{K}] X) => (float[batch,{Out}] Y)
+        {{
+          Wdq = DequantizeLinear<axis=1>(Wq, Wscale)
+          h = MatMul(X, Wdq)
+          Y = MatMul(h, W2)
+        }}
+        """,
+        initializer=[_i8(Wq, "Wq"), _f32(Wscale, "Wscale"), _f32(W2, "W2")],
+    )
+    onnx.checker.check_model(model)
+
+    w_dequant = _qdq_dequant(Wq, Wscale, None, axis=1)
+    keep_count = H // 2
+    keep = _oracle_keep_indices(w_dequant, keep_count)
+    # Confirm this test data actually is adversarial: the kept set must not
+    # be the trivial "first keep_count indices" a positional-slice bug would
+    # silently produce.
+    assert not np.array_equal(keep, np.arange(keep_count))
+
+    pruned = onnxsim.apply_structured_pruning_qdq(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    rng2 = np.random.default_rng(3)
+    x = rng2.standard_normal((6, K)).astype(np.float32)
+    (y,) = _run_unfused(pruned, {"X": x})
+
+    y_correct = (x @ w_dequant[:, keep]) @ W2[keep, :]
+    np.testing.assert_allclose(y, y_correct, rtol=1e-4, atol=1e-4)
+
+    # The "wrong" oracle a positional (not index-matched) scale slice would
+    # produce -- wildly different, since the buggy scale would be off by up
+    # to 8x on some channels.
+    wrong_scale = Wscale[:keep_count]
+    wrong_dequant = Wq[:, keep].astype(np.float64) * wrong_scale.reshape(1, -1)
+    y_wrong = (x @ wrong_dequant) @ W2[keep, :]
+    assert np.max(np.abs(y - y_wrong)) > 1e-2 * max(1.0, np.max(np.abs(y_correct)))
+
+
+def test_qdq_structured_pruning_matmul_consumer_matches_oracle_and_leaves_scale_untouched():
+    # Plain float producer (W1) feeding a QDQ (per-channel) MatMul consumer
+    # (Wq/Wscale) -- the "consumer" role: only Wq's own input/reduction axis
+    # is sliced, Wscale (indexed by the consumer's own OUTPUT channel, not
+    # touched by an input-axis slice) must come out byte-identical.
+    K, H, Out = 8, 16, 4
+    rng = np.random.default_rng(4)
+    W1 = rng.standard_normal((K, H)).astype(np.float32)
+    Wq = rng.integers(-100, 100, size=(H, Out)).astype(np.int8)
+    Wscale = np.abs(rng.standard_normal(Out)).astype(np.float32) * 0.03 + 0.001
+    model = _model(
+        f"""
+        g (float[batch,{K}] X) => (float[batch,{Out}] Y)
+        {{
+          h = MatMul(X, W1)
+          Wdq = DequantizeLinear<axis=1>(Wq, Wscale)
+          Y = MatMul(h, Wdq)
+        }}
+        """,
+        initializer=[_f32(W1, "W1"), _i8(Wq, "Wq"), _f32(Wscale, "Wscale")],
+    )
+    onnx.checker.check_model(model)
+
+    pruned = onnxsim.apply_structured_pruning_qdq(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    inits = {t.name: t for t in pruned.graph.initializer}
+    assert list(inits["Wq"].dims) == [H // 2, Out]
+    # Consumer-side slicing never touches the consumer's own scale.
+    np.testing.assert_array_equal(onnx.numpy_helper.to_array(inits["Wscale"]), Wscale)
+
+    keep = _oracle_keep_indices(W1, H // 2)
+    w_dequant = _qdq_dequant(Wq, Wscale, None, axis=1)
+
+    rng2 = np.random.default_rng(5)
+    x = rng2.standard_normal((5, K)).astype(np.float32)
+    (y,) = _run_unfused(pruned, {"X": x})
+    h = x @ W1[:, keep]
+    y_oracle = h @ w_dequant[keep, :]
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-4, atol=1e-4)
+
+
+def test_qdq_structured_pruning_per_tensor_scale_left_untouched():
+    # Per-tensor (scalar) QDQ weight on the producer side: only Wq is
+    # sliced -- the scalar Wscale applies uniformly regardless of channel
+    # count, so it comes out byte-identical.
+    K, H, Out = 8, 16, 4
+    rng = np.random.default_rng(6)
+    Wq = rng.integers(-100, 100, size=(K, H)).astype(np.int8)
+    Wscale = np.array(0.05, dtype=np.float32)
+    W2 = rng.standard_normal((H, Out)).astype(np.float32)
+    model = _model(
+        f"""
+        g (float[batch,{K}] X) => (float[batch,{Out}] Y)
+        {{
+          Wdq = DequantizeLinear(Wq, Wscale)
+          h = MatMul(X, Wdq)
+          Y = MatMul(h, W2)
+        }}
+        """,
+        initializer=[_i8(Wq, "Wq"), _f32(Wscale, "Wscale"), _f32(W2, "W2")],
+    )
+    onnx.checker.check_model(model)
+
+    pruned = onnxsim.apply_structured_pruning_qdq(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    inits = {t.name: t for t in pruned.graph.initializer}
+    assert list(inits["Wq"].dims) == [K, H // 2]
+    assert onnx.numpy_helper.to_array(inits["Wscale"]) == pytest.approx(0.05)
+
+    w_dequant = Wq.astype(np.float64) * 0.05
+    keep = _oracle_keep_indices(w_dequant, H // 2)
+    rng2 = np.random.default_rng(7)
+    x = rng2.standard_normal((5, K)).astype(np.float32)
+    (y,) = _run_unfused(pruned, {"X": x})
+    y_oracle = (x @ w_dequant[:, keep]) @ W2[keep, :]
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-4, atol=1e-4)
+
+
+def test_qdq_structured_pruning_conv_both_sides_qdq_matches_oracle():
+    Cin, Cmid, Cout = 4, 8, 4
+    rng = np.random.default_rng(8)
+    Wq1 = rng.integers(-100, 100, size=(Cmid, Cin, 1, 1)).astype(np.int8)
+    Wscale1 = np.abs(rng.standard_normal(Cmid)).astype(np.float32) * 0.02 + 0.001
+    Wq2 = rng.integers(-100, 100, size=(Cout, Cmid, 1, 1)).astype(np.int8)
+    Wscale2 = np.abs(rng.standard_normal(Cout)).astype(np.float32) * 0.02 + 0.001
+    model = _model(
+        f"""
+        g (float[1,{Cin},4,4] X) => (float[1,{Cout},4,4] Y)
+        {{
+          W1dq = DequantizeLinear<axis=0>(Wq1, Wscale1)
+          h = Conv(X, W1dq)
+          W2dq = DequantizeLinear<axis=0>(Wq2, Wscale2)
+          Y = Conv(h, W2dq)
+        }}
+        """,
+        initializer=[
+            _i8(Wq1, "Wq1"),
+            _f32(Wscale1, "Wscale1"),
+            _i8(Wq2, "Wq2"),
+            _f32(Wscale2, "Wscale2"),
+        ],
+    )
+    onnx.checker.check_model(model)
+
+    pruned = onnxsim.apply_structured_pruning_qdq(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    inits = {t.name: t for t in pruned.graph.initializer}
+    assert list(inits["Wq1"].dims) == [Cmid // 2, Cin, 1, 1]
+    assert list(inits["Wscale1"].dims) == [Cmid // 2]
+    assert list(inits["Wq2"].dims) == [Cout, Cmid // 2, 1, 1]
+    assert list(inits["Wscale2"].dims) == [Cout]  # consumer's own scale untouched
+
+    w1_dequant = _qdq_dequant(Wq1, Wscale1, None, axis=0)
+    w2_dequant = _qdq_dequant(Wq2, Wscale2, None, axis=0)
+    w1_nk = w1_dequant.reshape(Cmid, -1)
+    keep = _oracle_keep_indices(w1_nk.T, Cmid // 2)
+
+    rng2 = np.random.default_rng(11)
+    x = rng2.standard_normal((1, Cin, 4, 4)).astype(np.float32)
+    (y,) = _run_unfused(pruned, {"X": x})
+
+    ref_model = onnx.helper.make_model(
+        onnx.helper.make_graph(
+            [
+                onnx.helper.make_node("Conv", ["X", "W1"], ["h"]),
+                onnx.helper.make_node("Conv", ["h", "W2"], ["Y"]),
+            ],
+            "oracle",
+            [onnx.helper.make_tensor_value_info("X", onnx.TensorProto.FLOAT, None)],
+            [onnx.helper.make_tensor_value_info("Y", onnx.TensorProto.FLOAT, None)],
+            initializer=[
+                onnx.numpy_helper.from_array(
+                    w1_dequant[keep].astype(np.float32), name="W1"
+                ),
+                onnx.numpy_helper.from_array(
+                    w2_dequant[:, keep].astype(np.float32), name="W2"
+                ),
+            ],
+        ),
+        opset_imports=[onnx.helper.make_opsetid("", 21)],
+        ir_version=10,
+    )
+    (y_oracle,) = onnx.reference.ReferenceEvaluator(ref_model).run(None, {"X": x})
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-4, atol=1e-4)
+
+
+def test_qdq_structured_pruning_declines_blocked_quantization():
+    # opset-21 blocked quantization (block_size set, scale rank == weight
+    # rank) -- a materially different granularity this matcher explicitly
+    # declines rather than mishandles.
+    K, H, Out = 8, 16, 4
+    block_size = 4
+    rng = np.random.default_rng(12)
+    Wq = rng.integers(-7, 8, size=(K, H)).astype(np.int8)
+    Wscale = (
+        np.abs(rng.standard_normal((K // block_size, H))).astype(np.float32) + 0.1
+    ) * 0.01
+    W2 = rng.standard_normal((H, Out)).astype(np.float32)
+    model = _model(
+        f"""
+        g (float[batch,{K}] X) => (float[batch,{Out}] Y)
+        {{
+          Wdq = DequantizeLinear<axis=0, block_size={block_size}>(Wq, Wscale)
+          h = MatMul(X, Wdq)
+          Y = MatMul(h, W2)
+        }}
+        """,
+        initializer=[_i8(Wq, "Wq"), _f32(Wscale, "Wscale"), _f32(W2, "W2")],
+    )
+    onnx.checker.check_model(model)
+    pruned = onnxsim.apply_structured_pruning_qdq(model, sparsity=0.5)
+    inits = {t.name: t for t in pruned.graph.initializer}
+    assert list(inits["Wq"].dims) == [K, H]  # left completely untouched
+    assert list(inits["W2"].dims) == [H, Out]
+
+
+def test_qdq_structured_pruning_declines_grouped_conv():
+    Cin, Cout, group = 8, 8, 4
+    rng = np.random.default_rng(13)
+    Wq = rng.integers(-100, 100, size=(Cout, Cin // group, 1, 1)).astype(np.int8)
+    Wscale = np.abs(rng.standard_normal(Cout)).astype(np.float32) * 0.02 + 0.001
+    model = _model(
+        f"""
+        g (float[1,{Cin},2,2] X) => (float[1,{Cout},2,2] Y)
+        {{
+          Wdq = DequantizeLinear<axis=0>(Wq, Wscale)
+          Y = Conv<group={group}>(X, Wdq)
+        }}
+        """,
+        initializer=[_i8(Wq, "Wq"), _f32(Wscale, "Wscale")],
+    )
+    onnx.checker.check_model(model)
+    pruned = onnxsim.apply_structured_pruning_qdq(model, sparsity=0.5)
+    inits = {t.name: t for t in pruned.graph.initializer}
+    assert list(inits["Wq"].dims) == list(Wq.shape)  # untouched -- see this
+    # module's own "QDQ" section comment: a general grouped/depthwise Conv
+    # is out of scope for a QDQ chain.
+
+
+def test_qdq_structured_pruning_declines_shared_quantized_weight():
+    # The same int8 initializer feeding two independent DequantizeLinear
+    # consumers -- slicing it for one chain would silently corrupt the
+    # other's own use of the identical tensor, so it must be declined.
+    K, H, Out = 8, 16, 4
+    model, Wq, Wscale, _Wzp, W2 = _matmul_qdq_producer_model(K, H, Out, seed=14)
+    extra_dq = onnx.helper.make_node(
+        "DequantizeLinear", ["Wq", "Wscale"], ["Wdq2"], axis=1
+    )
+    extra_identity = onnx.helper.make_node("Identity", ["Wdq2"], ["Wdq2_out"])
+    model.graph.node.extend([extra_dq, extra_identity])
+    model.graph.output.append(
+        onnx.helper.make_tensor_value_info("Wdq2_out", onnx.TensorProto.FLOAT, [K, H])
+    )
+    onnx.checker.check_model(model)
+
+    pruned = onnxsim.apply_structured_pruning_qdq(model, sparsity=0.5)
+    inits = {t.name: t for t in pruned.graph.initializer}
+    assert list(inits["Wq"].dims) == [K, H]  # untouched -- Wq is shared
+
+
+def test_qdq_structured_pruning_both_sides_float_is_a_no_op():
+    # A plain float/float chain is apply_structured_pruning's own job, never
+    # matched here (no QDQ side at all).
+    model = _mlp_model(K=8, H=16, Out=4)
+    pruned = onnxsim.apply_structured_pruning_qdq(model, sparsity=0.5)
+    inits = {t.name: t for t in pruned.graph.initializer}
+    assert list(inits["W1"].dims) == [8, 16]
+    assert list(inits["W2"].dims) == [16, 4]
+
+
+def test_qdq_structured_pruning_zero_sparsity_is_a_no_op():
+    model, *_ = _matmul_qdq_producer_model(8, 16, 4, seed=15)
+    pruned = onnxsim.apply_structured_pruning_qdq(model, sparsity=0.0)
+    inits = {t.name: t for t in pruned.graph.initializer}
+    assert list(inits["Wq"].dims) == [8, 16]
+
+
+def test_qdq_structured_pruning_invalid_sparsity_raises():
+    model, *_ = _matmul_qdq_producer_model(8, 16, 4, seed=16)
+    with pytest.raises(ValueError):
+        onnxsim.apply_structured_pruning_qdq(model, sparsity=1.0)
+    with pytest.raises(ValueError):
+        onnxsim.apply_structured_pruning_qdq(model, sparsity=-0.1)
+
+
+def test_qdq_weight_left_untouched_by_unstructured_pruning():
+    # Direction (a)'s declined case: unstructured (magnitude) pruning of a
+    # QDQ weight is a fundamentally different, much harder problem (see this
+    # module's own "QDQ" section comment) -- and, empirically, every
+    # existing unstructured matcher already declines a QDQ-fed weight
+    # (its own name resolves to the DequantizeLinear's *output*, not an
+    # initializer, so `initializer_map.get(w_name)` is already None) with no
+    # code change needed. Confirmed here rather than merely asserted.
+    #
+    # A minimal, self-contained model -- just the QDQ-fed MatMul itself, no
+    # second plain-float layer -- so overall `weight_sparsity` unambiguously
+    # reflects only whether this one QDQ weight got touched.
+    K, H = 8, 16
+    rng = np.random.default_rng(17)
+    Wq = rng.integers(-100, 100, size=(K, H)).astype(np.int8)
+    Wscale = np.abs(rng.standard_normal(H)).astype(np.float32) * 0.02 + 0.001
+    model = _model(
+        f"""
+        g (float[batch,{K}] X) => (float[batch,{H}] Y)
+        {{
+          Wdq = DequantizeLinear<axis=1>(Wq, Wscale)
+          Y = MatMul(X, Wdq)
+        }}
+        """,
+        initializer=[_i8(Wq, "Wq"), _f32(Wscale, "Wscale")],
+    )
+    onnx.checker.check_model(model)
+
+    before = Wq.copy()
+    pruned = onnxsim.apply_magnitude_pruning(model, sparsity=0.9)
+    inits = {t.name: t for t in pruned.graph.initializer}
+    after = onnx.numpy_helper.to_array(inits["Wq"])
+    np.testing.assert_array_equal(before, after)
+    assert onnxsim.weight_sparsity(pruned) == pytest.approx(0.0, abs=1e-9)
+
+
+def test_prune_then_quantize_static_composes_correctly():
+    # Direction (b): pruning a still-float model, then running this repo's
+    # own quantize_static on the *pruned* result. Confirmed to already work
+    # correctly with no code changes anywhere -- pruning operates entirely
+    # on float initializers and produces an ordinary (smaller) float graph;
+    # quantize_static has no notion of "this graph was pruned" to get
+    # wrong. The one real prerequisite is running shape inference on the
+    # pruned model first (quantize_static reads each candidate activation's
+    # declared element type off the graph's own value_info, which pruning
+    # doesn't itself populate for a hand-built/parsed graph's intermediate
+    # tensors) -- a standard step before handing any graph to onnxsim/
+    # onnxruntime tooling that inspects intermediate shapes/dtypes, not a
+    # pruning- or QDQ-specific one.
+    K, H1, H2, Out = 8, 16, 16, 4
+    rng = np.random.default_rng(18)
+    model = _model(
+        f"""
+        g (float[1,{K}] X) => (float[1,{Out}] Y)
+        {{
+          h0 = Relu(X)
+          h1 = MatMul(h0, W1)
+          h2 = Relu(h1)
+          h3 = MatMul(h2, W2)
+          h4 = Relu(h3)
+          Y = MatMul(h4, W3)
+        }}
+        """,
+        initializer=[
+            _f32(rng.standard_normal((K, H1)), "W1"),
+            _f32(rng.standard_normal((H1, H2)), "W2"),
+            _f32(rng.standard_normal((H2, Out)), "W3"),
+        ],
+    )
+    onnx.checker.check_model(model)
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    inits = {t.name: t for t in pruned.graph.initializer}
+    assert list(inits["W1"].dims) == [K, H1 // 2]
+    assert list(inits["W2"].dims) == [H1 // 2, H2 // 2]
+    assert list(inits["W3"].dims) == [H2 // 2, Out]
+
+    pruned_with_shapes = onnx.shape_inference.infer_shapes(pruned)
+    quantized = onnxsim.quantize_static(pruned_with_shapes)
+    onnx.checker.check_model(quantized)
+
+    op_types = [n.op_type for n in quantized.graph.node]
+    assert op_types.count("DequantizeLinear") == 6  # 3 layers x (X, W) each
+    assert op_types.count("QuantizeLinear") == 3
+
+    x = rng.standard_normal((1, K)).astype(np.float32)
+    (y_float,) = _run(pruned, {"X": x})
+    (y_quant,) = _run(quantized, {"X": x})
+    rel = np.linalg.norm(y_float - y_quant) / max(np.linalg.norm(y_float), 1e-6)
+    assert rel < 0.05  # ordinary INT8 quantization error, not a correctness bug
