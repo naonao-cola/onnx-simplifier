@@ -231,10 +231,10 @@ onnx::shape_inference::ModelLocalFunctionsMap BuildModelLocalFunctionsMap(
 // (the default, empty), a model-local function call's output is left
 // untouched, exactly as if the op had no registered schema.
 // Returns whether anything changed.
-bool OptAndShapeOnGraph(
-    onnx::Graph& g, bool optimize, bool shape_inference,
-    size_t fixed_point_iters,
-    const onnx::shape_inference::ModelLocalFunctionsMap& model_local_functions = {}) {
+bool OptAndShapeOnGraph(onnx::Graph& g, bool optimize, bool shape_inference,
+                        size_t fixed_point_iters,
+                        const onnx::shape_inference::ModelLocalFunctionsMap&
+                            model_local_functions = {}) {
   // See OptAndShape's own doc comment for why these caches are scoped to
   // one call of this function rather than cleared every round underneath.
   onnx::optimization::ClearTensorContentDigestCache();
@@ -242,10 +242,12 @@ bool OptAndShapeOnGraph(
   using GraphFnChanged = std::function<bool(onnx::Graph&)>;
   bool any_changed = false;
   GraphFnChanged InferShapesOnGraphChanged =
-      shape_inference ? GraphFnChanged([&any_changed, &model_local_functions](onnx::Graph& graph) {
+      shape_inference ? GraphFnChanged([&any_changed, &model_local_functions](
+                                           onnx::Graph& graph) {
         onnxsim::ProfiledScope scope("InferShapes");
-        const bool c = onnx::InferShapesOnGraph(
-            graph, onnx::ShapeInferenceOptions(), nullptr, model_local_functions);
+        const bool c =
+            onnx::InferShapesOnGraph(graph, onnx::ShapeInferenceOptions(),
+                                     nullptr, model_local_functions);
         any_changed |= c;
         return c;
       })
@@ -587,7 +589,7 @@ static onnx::ModelProto SimplifyImpl(
         // otherwise recomputing a value already seen earlier in the same
         // run (see onnxsim issue #633).
         OptAndShapeOnGraph(*g, optimize, shape_inference, fixed_point_iters,
-                          BuildModelLocalFunctionsMap(model));
+                           BuildModelLocalFunctionsMap(model));
         onnx::ModelProto out = onnx::PrepareOutput(model);
         onnx::ExportModelProto(&out, g, /*consume_tensor_data=*/true);
         // OptimizeGraphFixed never sees model-local functions (they live
@@ -675,20 +677,19 @@ static onnx::ModelProto SimplifyImpl(
     // here and set (from `model.ir_version()`) in the `Pipeline` lambda
     // below.
     GraphFnChanged FoldConstantOnGraphChanged =
-        constant_folding
-            ? GraphFnChanged([&executor, &fold_ir_version,
-                              model_local_functions](onnx::Graph& graph) {
-                onnxsim::ProfiledScope scope("FoldConstant");
-                const bool a = _EvalPartialShapeOnGraph(graph, model_local_functions);
-                const bool b =
-                    _FoldConstantOnGraph(executor, graph, fold_ir_version);
-                if (onnxsim::Profiler::Instance().enabled()) {
-                  onnxsim::Profiler::Instance().RecordNodeCount(
-                      "FoldConstant", CountGraphNodes(graph));
-                }
-                return a || b;
-              })
-            : GraphFnChanged([](onnx::Graph&) { return false; });
+        constant_folding ? GraphFnChanged([&executor, &fold_ir_version,
+                                           model_local_functions](
+                                              onnx::Graph& graph) {
+          onnxsim::ProfiledScope scope("FoldConstant");
+          const bool a = _EvalPartialShapeOnGraph(graph, model_local_functions);
+          const bool b = _FoldConstantOnGraph(executor, graph, fold_ir_version);
+          if (onnxsim::Profiler::Instance().enabled()) {
+            onnxsim::Profiler::Instance().RecordNodeCount(
+                "FoldConstant", CountGraphNodes(graph));
+          }
+          return a || b;
+        })
+                         : GraphFnChanged([](onnx::Graph&) { return false; });
     GraphFn PipelineOnGraph =
         FixedPointFn(OptAndShapeOnGraphChanged, FoldConstantOnGraphChanged,
                      fixed_point_iters, &converged);

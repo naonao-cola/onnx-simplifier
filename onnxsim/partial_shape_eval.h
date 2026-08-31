@@ -31,8 +31,8 @@ void _EvalPartialShape(onnx::ModelProto& model);
 // model-local functions, or the caller doesn't have them on hand. Returns
 // whether anything changed.
 bool _EvalPartialShapeOnGraph(
-    onnx::Graph& g,
-    const onnx::shape_inference::ModelLocalFunctionsMap& model_local_functions = {});
+    onnx::Graph& g, const onnx::shape_inference::ModelLocalFunctionsMap&
+                        model_local_functions = {});
 
 // Unset the recurrent initial states of RNN/GRU/LSTM nodes in `graph` (and
 // its nested subgraphs) that are provably all zeros (issue #314), so the
