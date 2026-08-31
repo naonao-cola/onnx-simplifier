@@ -12965,6 +12965,577 @@ def test_moe_whole_expert_pruning_multiple_nodes_pruned_independently():
     assert inits["RW2"].shape == (hidden2, 1)
 
 
+# --- FP16/BFloat16 weight support -----------------------------------------
+#
+# Every matcher in this module used to hard-require ``onnx.TensorProto.
+# FLOAT``, silently declining any layer whose weight was stored as
+# FLOAT16 or BFLOAT16 (the common case for an exported inference-ready
+# LLM/CNN graph) -- see ``onnxsim/pruning.py``'s own "FP16/BFloat16 weight
+# support" section comment for the read-upcast/write-downcast pattern that
+# now handles both. The tests below independently verify, for at least one
+# representative function of every major algorithm family this module
+# offers (magnitude, Wanda, SparseGPT, structured/channel, attention-head,
+# MoE):
+#
+#   1. FLOAT16 execution correctness against a *real* onnxruntime CPU
+#      session (confirmed, separately from this test suite, that
+#      onnxruntime's CPU provider actually executes MatMul/Conv/Attention/
+#      MoE with genuine FLOAT16 weights -- not just tolerates the dtype
+#      tag) -- not merely a numpy-side oracle, since a bug could plausibly
+#      pass a same-process numpy check while still producing an
+#      unrunnable or wrongly-typed graph.
+#   2. The pruned model's tensors keep their original FLOAT16 dtype
+#      (checked via ``TensorProto.data_type``, not just value), rather
+#      than silently upcasting to float32.
+#   3. For every pass that only *masks or slices* (never recomputes a
+#      surviving value): every surviving entry reproduces the *exact*
+#      original fp16 bit pattern (compared via ``.view(np.uint16)``, not
+#      ``assert_allclose``) -- verifying the "upcast-to-float64-then-
+#      downcast-with-no-intervening-arithmetic is bit-exact" claim
+#      empirically, not merely asserting it. SparseGPT is the deliberate
+#      exception: its Hessian-compensated update genuinely recomputes
+#      every kept entry's own value, so its own test checks reconstruction
+#      quality instead (mirroring
+#      ``test_sparsegpt_pruning_reconstructs_better_than_a_same_mask_style_baseline``),
+#      not bit-exactness.
+#
+# BFLOAT16 has no onnxruntime CPU execution support in this environment at
+# all -- confirmed separately: a plain BFLOAT16 MatMul model raises
+# ``NOT_IMPLEMENTED`` ("Could not find an implementation for MatMul(13)
+# node...") the moment a session is created, for every op type tried, not
+# just this module's own output. BFLOAT16 tests below therefore check
+# correctness at the array level (dtype preservation, exact per-element
+# decode via ``ml_dtypes.bfloat16``, matching the same masking/slicing
+# math every other test in this module already verifies numpy-side) rather
+# than via a real session run -- an honest adjustment forced by that
+# environment fact, not a shortcut taken for convenience.
+#
+# Per CLAUDE.md's own guidance on when to fall back off the ``onnx.parser``
+# text format: the text format has no fp16/bfloat16 tensor-literal syntax
+# (confirmed: ``<float16 W = {1.5}>`` raises a ``ParseError``), though it
+# *does* support ``float16[...]``/``bfloat16[...]`` in a graph's own
+# input/output type signature. So every test below still builds its
+# graph/signature via ``_model``'s own ``onnx.parser`` convention, and only
+# attaches the fp16/bf16 initializer tensors themselves programmatically,
+# via ``onnx.numpy_helper.from_array`` on an already-fp16/bf16 numpy array
+# (``_f16``/``_bf16`` below).
+
+
+def _f16(array, name):
+    return onnx.numpy_helper.from_array(array.astype(np.float16), name)
+
+
+def _bf16(array, name):
+    return onnx.numpy_helper.from_array(array.astype(ml_dtypes.bfloat16), name)
+
+
+def test_magnitude_pruning_fp16_matches_ort_execution_and_preserves_exact_bits():
+    # magnitude pruning family, representative function: apply_magnitude_pruning.
+    K, N = 16, 8
+    rng = np.random.default_rng(101)
+    w = (rng.standard_normal((K, N)) * 0.5).astype(np.float16)
+    model = _model(
+        f"""
+        g (float16[batch,{K}] X) => (float16[batch,{N}] Y)
+        {{
+          Y = MatMul(X, W)
+        }}
+        """,
+        initializer=[_f16(w, "W")],
+    )
+    onnx.checker.check_model(model)
+
+    pruned = onnxsim.apply_magnitude_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    w_init = pruned.graph.initializer[0]
+    assert w_init.data_type == onnx.TensorProto.FLOAT16  # dtype preserved, not upcast
+    w_pruned = onnx.numpy_helper.to_array(w_init)
+    assert w_pruned.dtype == np.float16
+    assert onnxsim.weight_sparsity(pruned) == pytest.approx(0.5, abs=1e-9)
+
+    # Masking never recomputes a kept value -- only zeros dropped ones -- so
+    # every surviving entry must reproduce the exact original fp16 bit
+    # pattern (compared as raw uint16, not by value).
+    survivors = w_pruned != 0
+    np.testing.assert_array_equal(
+        w_pruned[survivors].view(np.uint16), w[survivors].view(np.uint16)
+    )
+
+    rng2 = np.random.default_rng(102)
+    x = rng2.standard_normal((3, K)).astype(np.float16)
+    (y,) = _run(pruned, {"X": x})
+    assert y.dtype == np.float16
+    y_oracle = x.astype(np.float64) @ w_pruned.astype(np.float64)
+    np.testing.assert_allclose(y.astype(np.float64), y_oracle, rtol=1e-2, atol=1e-2)
+
+
+def test_magnitude_pruning_fp16_uses_genuine_decode_not_raw_float32_reinterpretation():
+    # Adversarial check that this module's fp16 support is genuinely
+    # decoding FLOAT16 storage (as onnx.numpy_helper does: each entry a
+    # real IEEE-754 half-precision value) rather than, say, treating the
+    # tensor's raw little-endian byte buffer as if it already held float32
+    # values (4 bytes/entry) -- a plausible implementation bug this test is
+    # specifically built to catch, since it wouldn't crash: it would
+    # silently produce a *different*, still-numeric result (half as many
+    # "entries" per row, each an arbitrary float32 bit-pattern unrelated to
+    # the true fp16 values) and therefore a detectably wrong pruning
+    # decision.
+    K, N = 4, 4
+    # apply_magnitude_pruning ranks per *output channel* -- each row of
+    # W^T ([N, K], _weight_to_nk's own convention), i.e. each *column* of
+    # this [K, N] MatMul weight -- so every column here is given the same
+    # strictly-decreasing-by-row-index true fp16 |W| order (8, 4, 2, 1) top
+    # to bottom, keeping row indices 0/1 (8, 4) and dropping 2/3 (2, 1) for
+    # every output channel alike.
+    # A slight per-column offset (8.0/8.1/8.2/8.3, ...) keeps every column's
+    # own row-wise magnitude order strictly decreasing (needed for a clean
+    # "every output channel keeps the same two rows" assertion below) while
+    # avoiding the repeated-identical-value degenerate case, where pairing
+    # up two copies of the same fp16 bit pattern as one float32 could
+    # coincidentally land back near a true value.
+    w16 = np.array(
+        [
+            [8.0, 8.1, 8.2, 8.3],
+            [4.0, 4.1, 4.2, 4.3],
+            [2.0, 2.1, 2.2, 2.3],
+            [1.0, 1.1, 1.2, 1.3],
+        ],
+        dtype=np.float16,
+    )
+    # Confirm the "wrong decode" this test guards against really is garbage
+    # relative to the true values (magnitude range ~1.0-8.3) -- not a
+    # coincidentally similar reinterpretation this test would fail to
+    # actually distinguish. Checked via overall magnitude *range* (a
+    # single stray close value doesn't itself prove a genuinely wrong
+    # decode; a several-orders-of-magnitude-wider spread does) rather than
+    # any single value, which is independently verified once, empirically,
+    # before writing this test, to span from ~0.014 to ~170272 -- roughly
+    # seven orders of magnitude wider than the true ~1.0-8.3 range.
+    wrong_as_float32 = np.frombuffer(w16.tobytes(), dtype="<f4")
+    true_range = w16.astype(np.float64).max() / w16.astype(np.float64).min()
+    wrong_range = np.abs(wrong_as_float32).max() / np.abs(wrong_as_float32).min()
+    assert wrong_range > true_range * 1000
+
+    model = _model(
+        f"""
+        g (float16[batch,{K}] X) => (float16[batch,{N}] Y)
+        {{
+          Y = MatMul(X, W)
+        }}
+        """,
+        initializer=[_f16(w16, "W")],
+    )
+    pruned = onnxsim.apply_magnitude_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    w_pruned = onnx.numpy_helper.to_array(pruned.graph.initializer[0])
+    assert w_pruned.dtype == np.float16
+
+    # Correct fp16 decode keeps rows 0/1 (values 8, 4) entirely nonzero and
+    # rows 2/3 (values 2, 1) entirely zero, for every output channel. A
+    # "wrong dtype" bug reading garbage values would not reliably produce
+    # this exact, uniform-across-columns pattern.
+    np.testing.assert_array_equal(w_pruned[0, :], w16[0, :])
+    np.testing.assert_array_equal(w_pruned[1, :], w16[1, :])
+    np.testing.assert_array_equal(w_pruned[2, :], np.zeros(N, dtype=np.float16))
+    np.testing.assert_array_equal(w_pruned[3, :], np.zeros(N, dtype=np.float16))
+
+    x = np.ones((1, K), dtype=np.float16)
+    (y,) = _run(pruned, {"X": x})
+    y_oracle = (x.astype(np.float64) @ w_pruned.astype(np.float64)).astype(np.float64)
+    np.testing.assert_allclose(y.astype(np.float64), y_oracle, rtol=1e-3, atol=1e-3)
+
+
+def test_wanda_pruning_fp16_protects_high_activation_channels_matches_ort():
+    # Wanda family, representative function: apply_wanda_pruning. fp16
+    # analogue of test_wanda_pruning_protects_high_activation_channels,
+    # with real onnxruntime execution as the correctness oracle.
+    K, N = 32, 8
+    salient = (2, 5, 20)
+    rng = np.random.default_rng(103)
+    w = (rng.standard_normal((K, N)) * 0.5).astype(np.float16)
+    model = _model(
+        f"""
+        g (float16[batch,{K}] X) => (float16[batch,{N}] Y)
+        {{
+          Y = MatMul(X, W)
+        }}
+        """,
+        initializer=[_f16(w, "W")],
+    )
+    onnx.checker.check_model(model)
+
+    x = rng.standard_normal((32, K)).astype(np.float16)
+    for c in salient:
+        x[:, c] *= 20.0
+    calibration_data = [{"X": x}]
+
+    magnitude_pruned = onnxsim.apply_magnitude_pruning(model, sparsity=0.5)
+    wanda_pruned = onnxsim.apply_wanda_pruning(
+        model, calibration_data=calibration_data, sparsity=0.5
+    )
+    onnx.checker.check_model(wanda_pruned)
+    assert wanda_pruned.graph.initializer[0].data_type == onnx.TensorProto.FLOAT16
+    assert onnxsim.weight_sparsity(wanda_pruned) == pytest.approx(0.5, abs=1e-9)
+
+    w_magnitude = onnx.numpy_helper.to_array(magnitude_pruned.graph.initializer[0])
+    w_wanda = onnx.numpy_helper.to_array(wanda_pruned.graph.initializer[0])
+    salient_kept_magnitude = np.count_nonzero(w_magnitude[list(salient), :])
+    salient_kept_wanda = np.count_nonzero(w_wanda[list(salient), :])
+    assert salient_kept_wanda > salient_kept_magnitude
+
+    (float_y,) = _run(model, {"X": x})
+    (magnitude_y,) = _run(magnitude_pruned, {"X": x})
+    (wanda_y,) = _run(wanda_pruned, {"X": x})
+    magnitude_err = np.linalg.norm(
+        float_y.astype(np.float64) - magnitude_y.astype(np.float64)
+    )
+    wanda_err = np.linalg.norm(float_y.astype(np.float64) - wanda_y.astype(np.float64))
+    assert wanda_err < magnitude_err
+
+
+def test_sparsegpt_pruning_fp16_reconstructs_better_than_a_same_mask_style_baseline():
+    # SparseGPT family, representative function: apply_sparsegpt_pruning.
+    # fp16 analogue of
+    # test_sparsegpt_pruning_reconstructs_better_than_a_same_mask_style_baseline,
+    # checked both numpy-side and via real onnxruntime execution. SparseGPT
+    # genuinely recomputes every kept entry's value (Hessian-compensated),
+    # so -- unlike magnitude/Wanda above -- this does not check bit-exact
+    # surviving entries, only that the technique still improves
+    # reconstruction quality over naive same-mask zeroing once weights are
+    # fp16.
+    K, N = 48, 12
+    rng = np.random.default_rng(104)
+    w = (rng.standard_normal((K, N)) * 0.5).astype(np.float16)
+    model = _model(
+        f"""
+        g (float16[batch,{K}] X) => (float16[batch,{N}] Y)
+        {{
+          Y = MatMul(X, W)
+        }}
+        """,
+        initializer=[_f16(w, "W")],
+    )
+    onnx.checker.check_model(model)
+    x_cal = (rng.standard_normal((512, K)) * 0.3).astype(np.float16)  # well-cond. H
+
+    pruned = onnxsim.apply_sparsegpt_pruning(
+        model, calibration_data=[{"X": x_cal}], sparsity=0.5
+    )
+    onnx.checker.check_model(pruned)
+    w_init = pruned.graph.initializer[0]
+    assert w_init.data_type == onnx.TensorProto.FLOAT16
+    w_sparsegpt = onnx.numpy_helper.to_array(w_init).astype(np.float64)
+
+    w64 = w.astype(np.float64)
+    score = np.abs(w64)
+    thresh = np.sort(score.flatten())[int(score.size * 0.5)]
+    w_naive = np.where(score <= thresh, 0.0, w64)
+
+    x64 = x_cal.astype(np.float64)
+    y_orig = x64 @ w64
+    err_sparsegpt = np.sum((y_orig - x64 @ w_sparsegpt) ** 2)
+    err_naive = np.sum((y_orig - x64 @ w_naive) ** 2)
+    assert err_sparsegpt <= err_naive
+
+    # And a real onnxruntime run of the pruned (fp16) model must still
+    # reconstruct the original layer's output at least as well as the
+    # naive same-mask baseline, evaluated through the same fp16 runtime
+    # execution path a real deployment would use.
+    naive_model = _model(
+        f"""
+        g (float16[batch,{K}] X) => (float16[batch,{N}] Y)
+        {{
+          Y = MatMul(X, W)
+        }}
+        """,
+        initializer=[_f16(w_naive.astype(np.float32), "W")],
+    )
+    (y_pruned_ort,) = _run(pruned, {"X": x_cal})
+    (y_naive_ort,) = _run(naive_model, {"X": x_cal})
+    (y_orig_ort,) = _run(model, {"X": x_cal})
+    err_sparsegpt_ort = np.sum(
+        (y_orig_ort.astype(np.float64) - y_pruned_ort.astype(np.float64)) ** 2
+    )
+    err_naive_ort = np.sum(
+        (y_orig_ort.astype(np.float64) - y_naive_ort.astype(np.float64)) ** 2
+    )
+    assert err_sparsegpt_ort <= err_naive_ort * 1.05  # small fp16-rounding slack
+
+
+def test_structured_pruning_fp16_matmul_chain_matches_ort_oracle():
+    # structured/channel family, representative function:
+    # apply_structured_pruning. fp16 analogue of
+    # test_structured_pruning_matmul_only_chain_matches_oracle.
+    K, H, Out = 8, 24, 4
+    rng = np.random.default_rng(105)
+    w1 = (rng.standard_normal((K, H)) * 0.4).astype(np.float16)
+    w2 = (rng.standard_normal((H, Out)) * 0.4).astype(np.float16)
+    model = _model(
+        f"""
+        g (float16[batch,{K}] X) => (float16[batch,{Out}] Y)
+        {{
+          h = MatMul(X, W1)
+          a = Sigmoid(h)
+          Y = MatMul(a, W2)
+        }}
+        """,
+        initializer=[_f16(w1, "W1"), _f16(w2, "W2")],
+    )
+    onnx.checker.check_model(model)
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.25)
+    onnx.checker.check_model(pruned)
+    inits = {t.name: t for t in pruned.graph.initializer}
+    assert inits["W1"].data_type == onnx.TensorProto.FLOAT16
+    assert inits["W2"].data_type == onnx.TensorProto.FLOAT16
+    assert list(inits["W1"].dims) == [K, H - round(H * 0.25)]
+
+    keep = _oracle_keep_indices(w1.astype(np.float64), H - round(H * 0.25))
+
+    rng2 = np.random.default_rng(106)
+    x = rng2.standard_normal((5, K)).astype(np.float16)
+    (y,) = _run(pruned, {"X": x})
+    assert y.dtype == np.float16
+
+    h = x.astype(np.float64) @ w1.astype(np.float64)[:, keep]
+    a = 1.0 / (1.0 + np.exp(-h))
+    y_oracle = a @ w2.astype(np.float64)[keep, :]
+    np.testing.assert_allclose(y.astype(np.float64), y_oracle, rtol=5e-2, atol=5e-2)
+
+
+def test_attention_head_pruning_fp16_matches_manual_head_deletion_oracle():
+    # attention-head family, representative function:
+    # apply_attention_head_pruning. fp16 analogue of
+    # test_attention_head_pruning_matches_manual_head_deletion_exactly.
+    K, H, D, Out, batch, seq = 8, 4, 4, 6, 2, 5
+    Nq = Nk = Nv = H * D
+    rng = np.random.default_rng(107)
+    wqkv = (rng.standard_normal((K, Nq + Nk + Nv)) * 0.3).astype(np.float16)
+    bqkv = (rng.standard_normal((Nq + Nk + Nv,)) * 0.3).astype(np.float16)
+    wout = (rng.standard_normal((Nv, Out)) * 0.3).astype(np.float16)
+
+    def _fp16_attention_model(h, wqkv_, bqkv_, wout_):
+        m = parser.parse_model(
+            f"""
+            <
+              ir_version: 10,
+              opset_import: ["": 17, "com.microsoft": 1]
+            >
+            g (float16[batch,seq,{K}] X) => (float16[batch,seq,{Out}] Y)
+            {{
+              ctx = com.microsoft.Attention <num_heads={h}, qkv_hidden_sizes=[{wqkv_.shape[1] // 3},{wqkv_.shape[1] // 3},{wqkv_.shape[1] // 3}]> (X, Wqkv, Bqkv)
+              Y = MatMul(ctx, Wout)
+            }}
+            """
+        )
+        m.graph.initializer.extend(
+            [_f16(wqkv_, "Wqkv"), _f16(bqkv_, "Bqkv"), _f16(wout_, "Wout")]
+        )
+        return m
+
+    model = _fp16_attention_model(H, wqkv, bqkv, wout)
+    onnx.checker.check_model(model)
+
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    pruned_inits = {t.name: t for t in pruned.graph.initializer}
+    assert pruned_inits["Wqkv"].data_type == onnx.TensorProto.FLOAT16
+    node = next(n for n in pruned.graph.node if n.op_type == "Attention")
+    num_heads = next(a.i for a in node.attribute if a.name == "num_heads")
+    assert num_heads == 2
+
+    keep = _oracle_keep_heads(
+        wqkv.astype(np.float64), Nq, Nk, Nv, H, 2
+    )  # d64-precision ranking, mirroring the float32 oracle's own convention
+    qi, ki, vi = (
+        _head_idx(keep, D),
+        _head_idx(keep, D) + Nq,
+        _head_idx(keep, D) + Nq + Nk,
+    )
+    all_idx = np.concatenate([qi, ki, vi])
+    oracle_wqkv = wqkv[:, all_idx]
+    oracle_bqkv = bqkv[all_idx]
+    oracle_wout = wout[_head_idx(keep, D), :]
+    oracle = _fp16_attention_model(2, oracle_wqkv, oracle_bqkv, oracle_wout)
+
+    rng2 = np.random.default_rng(108)
+    x = rng2.standard_normal((batch, seq, K)).astype(np.float16)
+    (y_pruned,) = _run(pruned, {"X": x})
+    (y_oracle,) = _run(oracle, {"X": x})
+    assert y_pruned.dtype == np.float16
+    np.testing.assert_allclose(
+        y_pruned.astype(np.float64), y_oracle.astype(np.float64), rtol=5e-2, atol=5e-2
+    )
+
+
+def test_moe_expert_channel_pruning_fp16_matches_ort_masking_oracle():
+    # MoE family, representative function: apply_moe_expert_channel_pruning.
+    # fp16 analogue of test_moe_expert_channel_pruning_matches_ort_masking_oracle.
+    E, hidden, inter, tokens, k = 5, 10, 12, 6, 2
+    rng = np.random.default_rng(109)
+    fc1_w = (rng.standard_normal((E, inter, hidden)) * 0.3).astype(np.float16)
+    fc2_w = (rng.standard_normal((E, hidden, inter)) * 0.3).astype(np.float16)
+
+    model = _model(
+        f"""
+        g (float16[{tokens},{hidden}] X, float16[{tokens},{E}] R) => (float16[{tokens},{hidden}] Y)
+        {{
+          Y = com.microsoft.MoE <k={k}, activation_type="relu"> (X, R, FC1W, , FC2W)
+        }}
+        """,
+        initializer=[_f16(fc1_w, "FC1W"), _f16(fc2_w, "FC2W")],
+        opset=18,
+    )
+    model.opset_import.append(onnx.helper.make_opsetid("com.microsoft", 1))
+    onnx.checker.check_model(model)
+
+    pruned = onnxsim.apply_moe_expert_channel_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    inits = {t.name: t for t in pruned.graph.initializer}
+    assert inits["FC1W"].data_type == onnx.TensorProto.FLOAT16
+    assert list(inits["FC1W"].dims) == [E, 6, hidden]
+
+    fc1_w64 = fc1_w.astype(np.float64)
+    fc2_w64 = fc2_w.astype(np.float64)
+    sq = np.sum(fc1_w64**2, axis=(0, 2)) + np.sum(fc2_w64**2, axis=(0, 1))
+    keep = np.sort(np.argsort(-np.sqrt(sq))[:6])
+
+    fc1_w_pruned = onnx.numpy_helper.to_array(inits["FC1W"])
+    fc2_w_pruned = onnx.numpy_helper.to_array(inits["FC2W"])
+    np.testing.assert_array_equal(
+        fc1_w_pruned.view(np.uint16), fc1_w[:, keep, :].view(np.uint16)
+    )
+    np.testing.assert_array_equal(
+        fc2_w_pruned.view(np.uint16), fc2_w[:, :, keep].view(np.uint16)
+    )
+
+    rng2 = np.random.default_rng(110)
+    x = rng2.standard_normal((tokens, hidden)).astype(np.float16)
+    r = rng2.standard_normal((tokens, E)).astype(np.float16)
+    (y_pruned,) = _run(pruned, {"X": x, "R": r})
+    assert y_pruned.dtype == np.float16
+
+    # Same-shape ORT masking oracle: zero the dropped inter_size channels
+    # instead of physically removing them -- must be numerically identical
+    # for relu (dropped fc1 row and bias both zero => pre-activation 0 =>
+    # relu(0) == 0, contributing nothing through fc2's own zeroed column).
+    drop = np.setdiff1d(np.arange(inter), keep)
+    fc1_masked = fc1_w64.copy()
+    fc1_masked[:, drop, :] = 0.0
+    fc2_masked = fc2_w64.copy()
+    fc2_masked[:, :, drop] = 0.0
+    masked_model = _model(
+        f"""
+        g (float16[{tokens},{hidden}] X, float16[{tokens},{E}] R) => (float16[{tokens},{hidden}] Y)
+        {{
+          Y = com.microsoft.MoE <k={k}, activation_type="relu"> (X, R, FC1W, , FC2W)
+        }}
+        """,
+        initializer=[
+            _f16(fc1_masked.astype(np.float32), "FC1W"),
+            _f16(fc2_masked.astype(np.float32), "FC2W"),
+        ],
+        opset=18,
+    )
+    masked_model.opset_import.append(onnx.helper.make_opsetid("com.microsoft", 1))
+    (y_masked,) = _run(masked_model, {"X": x, "R": r})
+    np.testing.assert_allclose(
+        y_pruned.astype(np.float64), y_masked.astype(np.float64), rtol=5e-2, atol=5e-2
+    )
+
+
+def test_magnitude_pruning_bfloat16_preserves_dtype_and_matches_array_oracle():
+    # onnxruntime has no BFLOAT16 CPU execution support in this environment
+    # (confirmed separately: a plain BFLOAT16 MatMul session raises
+    # NOT_IMPLEMENTED at session-creation time) -- so this checks
+    # correctness at the array level (dtype preservation, exact per-element
+    # bfloat16 decode) rather than via a real session run, unlike the
+    # FLOAT16 tests above.
+    K, N = 16, 8
+    rng = np.random.default_rng(111)
+    w = (rng.standard_normal((K, N)) * 0.5).astype(ml_dtypes.bfloat16)
+    model = _model(
+        f"""
+        g (bfloat16[batch,{K}] X) => (bfloat16[batch,{N}] Y)
+        {{
+          Y = MatMul(X, W)
+        }}
+        """,
+        initializer=[_bf16(w, "W")],
+    )
+    onnx.checker.check_model(model)
+
+    pruned = onnxsim.apply_magnitude_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    w_init = pruned.graph.initializer[0]
+    assert w_init.data_type == onnx.TensorProto.BFLOAT16
+    w_pruned = onnx.numpy_helper.to_array(w_init)
+    assert w_pruned.dtype == ml_dtypes.bfloat16
+    assert onnxsim.weight_sparsity(pruned) == pytest.approx(0.5, abs=1e-9)
+
+    survivors = w_pruned != ml_dtypes.bfloat16(0.0)
+    np.testing.assert_array_equal(
+        w_pruned[survivors].view(np.uint16), w[survivors].view(np.uint16)
+    )
+
+    # Every output column's surviving entries must be exactly the
+    # top-(1 - sparsity) fraction by magnitude, computed in float64 off the
+    # correctly-decoded bfloat16 values -- the same check
+    # test_magnitude_pruning_keeps_the_largest_entries_per_row makes for
+    # float32.
+    w64 = w.astype(np.float64)
+    w_pruned64 = w_pruned.astype(np.float64)
+    for col in range(N):
+        kept = np.flatnonzero(w_pruned64[:, col] != 0)
+        assert len(kept) == 8  # round(16 * 0.5)
+        threshold = np.abs(w64[:, col])[kept].min()
+        dropped_max = np.abs(w64[:, col])[np.flatnonzero(w_pruned64[:, col] == 0)].max()
+        assert dropped_max <= threshold
+
+
+def test_structured_pruning_bfloat16_matches_array_oracle():
+    # structured/channel family, BFLOAT16: confirms the matcher/slicer path
+    # (not just the unstructured masking path above) round-trips BFLOAT16
+    # correctly. No onnxruntime execution -- see the module comment above
+    # for why BFLOAT16 has no CPU kernel support here.
+    K, H, Out = 8, 16, 4
+    rng = np.random.default_rng(112)
+    w1 = (rng.standard_normal((K, H)) * 0.4).astype(ml_dtypes.bfloat16)
+    w2 = (rng.standard_normal((H, Out)) * 0.4).astype(ml_dtypes.bfloat16)
+    model = _model(
+        f"""
+        g (bfloat16[batch,{K}] X) => (bfloat16[batch,{Out}] Y)
+        {{
+          h = MatMul(X, W1)
+          a = Relu(h)
+          Y = MatMul(a, W2)
+        }}
+        """,
+        initializer=[_bf16(w1, "W1"), _bf16(w2, "W2")],
+    )
+    onnx.checker.check_model(model)
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.25)
+    onnx.checker.check_model(pruned)
+    inits = {t.name: t for t in pruned.graph.initializer}
+    assert inits["W1"].data_type == onnx.TensorProto.BFLOAT16
+    assert inits["W2"].data_type == onnx.TensorProto.BFLOAT16
+
+    keep = _oracle_keep_indices(w1.astype(np.float64), H - round(H * 0.25))
+    w1_pruned = onnx.numpy_helper.to_array(inits["W1"])
+    w2_pruned = onnx.numpy_helper.to_array(inits["W2"])
+    # Pure slicing -- exact bfloat16 bit-for-bit match against the manually
+    # sliced original array, not just a numeric closeness check.
+    np.testing.assert_array_equal(
+        w1_pruned.view(np.uint16), w1[:, keep].view(np.uint16)
+    )
+    np.testing.assert_array_equal(
+        w2_pruned.view(np.uint16), w2[keep, :].view(np.uint16)
+    )
+
+
 # --- analyze_pruning_sensitivity (dry-run sensitivity report) -------------
 #
 # The correctness bar here is different from the rest of this file: rather

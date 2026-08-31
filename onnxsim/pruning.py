@@ -843,13 +843,105 @@ def _nm_mask(importance: np.ndarray, n: int, m: int) -> np.ndarray:
     return mask
 
 
+# --- FP16/BFloat16 weight support ---------------------------------------
+#
+# Every matcher below that used to hard-require ``onnx.TensorProto.FLOAT``
+# now accepts float32, float16, and bfloat16 via the two helpers just
+# below: read a matched weight/bias out as float64 (:func:`_to_f64`,
+# losslessly -- float64 has strictly more mantissa bits than either half-
+# precision format, so this upcast never itself rounds), do every existing
+# float32-native computation in that widened precision exactly as before,
+# then cast the result back down to the tensor's own original dtype
+# (:func:`_from_f64`) before writing it into the graph -- so a fp16/bf16
+# model's own declared dtypes round-trip unchanged, rather than silently
+# widening to float32 on every pruning pass. No existing float32 math,
+# importance formula, or numeric behavior changes: float32 in, float32 out
+# is exactly ``.astype(np.float64)`` then ``.astype(np.float32)``, the same
+# no-op-in-precision round trip this module's float32 code paths already
+# performed before this support was added.
+#
+# BFLOAT16 support leans on ``onnx>=1.22``'s own hard dependency on
+# ``ml_dtypes`` (confirmed present transitively -- see this module's own
+# test suite) rather than adding a new one: ``onnx.numpy_helper.to_array``
+# already decodes a BFLOAT16 tensor to a numpy array of
+# ``ml_dtypes.bfloat16`` (a real registered numpy dtype, not a raw
+# ``uint16`` view), and ``.astype(np.float64)``/``.astype(bfloat16)`` both
+# work on it directly with no manual bit-reinterpretation needed -- verified
+# empirically against a real BFLOAT16 tensor, see the test suite's
+# ``test_bfloat16_*`` cases.
+#
+# The structured/attention/MoE pruning sections below need *no*
+# :func:`_to_f64`/:func:`_from_f64` calls at all in most of their own
+# ``_slice_*``/``_apply_*`` helpers, and that is deliberate, not an
+# oversight: those helpers only ever reorder or drop whole
+# rows/columns/experts/heads (``w[keep, ...]``, ``np.take(w, keep,
+# axis=...)``, ``np.concatenate`` of such slices) -- never recompute a
+# surviving value -- and both numpy fancy-indexing/``np.take`` and
+# ``onnx.numpy_helper.from_array`` already preserve whatever dtype the
+# array they're given carries, FLOAT16/BFLOAT16 included (verified
+# empirically). So once a chain's own matcher accepts FLOAT16/BFLOAT16 (the
+# actual fix, applied at every matcher above), every downstream slice call
+# already round-trips that same dtype correctly with zero source changes.
+# The exceptions -- a function that genuinely computes a new value from a
+# weight's own contents (an importance/norm score, an averaged/merged
+# replacement value) rather than just permuting existing ones -- upcast via
+# :func:`_to_f64` for that computation same as every other pass in this
+# module, and are called out individually where they occur.
+_SUPPORTED_WEIGHT_DTYPES = (
+    onnx.TensorProto.FLOAT,
+    onnx.TensorProto.FLOAT16,
+    onnx.TensorProto.BFLOAT16,
+)
+
+
+def _is_supported_float_dtype(data_type: int) -> bool:
+    """True for FLOAT, FLOAT16, and BFLOAT16 -- every element dtype this
+    module's matchers accept for a weight/bias initializer. See the
+    "FP16/BFloat16 weight support" section comment above for how a matched
+    tensor of any of these three dtypes is handled uniformly by every
+    downstream ``apply_*`` function.
+    """
+    return data_type in _SUPPORTED_WEIGHT_DTYPES
+
+
+def _to_f64(t: onnx.TensorProto) -> np.ndarray:
+    """Reads tensor `t` (must be FLOAT, FLOAT16, or BFLOAT16 --
+    :func:`_is_supported_float_dtype`) out of the graph as a ``float64``
+    numpy array, ready for this module's existing float32/float64 math
+    unchanged. Lossless for every input dtype: float64 can represent every
+    value either half-precision format can exactly, so this upcast alone
+    never rounds -- only whatever pruning math runs afterwards chooses its
+    own working/output precision.
+    """
+    return onnx.numpy_helper.to_array(t).astype(np.float64)
+
+
+def _from_f64(arr: np.ndarray, data_type: int, name: str) -> onnx.TensorProto:
+    """Inverse of :func:`_to_f64`: downcasts a float64 array back to
+    `data_type` (the original tensor's own dtype) and wraps it as a new
+    ``TensorProto`` named `name`, ready for ``w_init.CopyFrom(...)``. For a
+    purely structural rewrite -- masking entries to zero, or slicing
+    rows/columns out -- every *surviving* entry's value is untouched all
+    the way through (only removed/zeroed), so round-tripping it through
+    float64 with no arithmetic in between reproduces the exact original
+    fp16/bf16 bit pattern (verified empirically -- see this module's own
+    test suite); a technique whose math actually *recomputes* a kept
+    value's magnitude (e.g. SparseGPT's Hessian-compensated update) can of
+    course still produce a different value there, but that's the
+    algorithm's own float64 rounding decision, not an artifact of this
+    downcast.
+    """
+    np_dtype = onnx.helper.tensor_dtype_to_np_dtype(data_type)
+    return onnx.numpy_helper.from_array(np.asarray(arr).astype(np_dtype), name=name)
+
+
 def _match_conv_weight_only(
     node: onnx.NodeProto,
     initializer_map: Dict[str, onnx.TensorProto],
     allow_grouped: bool = True,
 ) -> Optional[Tuple[str, str]]:
-    """If `node` is a 2-D ``Conv`` with a constant 4-D float32
-    ``[out_channels, in_channels/group, kH, kW]`` weight, returns
+    """If `node` is a 2-D ``Conv`` with a constant 4-D float32/float16/
+    bfloat16 ``[out_channels, in_channels/group, kH, kW]`` weight, returns
     ``(x_name, weight_name)``. Mirrors the "Conv2D structured pruning"
     section's own :func:`_match_conv_producer` matching criteria, minus
     that function's bias handling -- magnitude/Wanda/SparseGPT never touch
@@ -890,7 +982,7 @@ def _match_conv_weight_only(
     w_init = initializer_map.get(w_name)
     if (
         w_init is None
-        or w_init.data_type != onnx.TensorProto.FLOAT
+        or not _is_supported_float_dtype(w_init.data_type)
         or len(w_init.dims) != 4
     ):
         return None
@@ -986,7 +1078,7 @@ def _candidates(
             w_init = initializer_map.get(w_name)
             if (
                 w_init is None
-                or w_init.data_type != onnx.TensorProto.FLOAT
+                or not _is_supported_float_dtype(w_init.data_type)
                 or len(w_init.dims) != 2
             ):
                 continue
@@ -1034,13 +1126,16 @@ def _nk_to_weight(
     is_conv: bool,
 ) -> np.ndarray:
     """Inverse of :func:`_weight_to_nk`: reshapes/transposes an already-
-    masked ``[N, K]`` array back to `orig_shape`, cast to float32, ready
-    for :func:`onnx.numpy_helper.from_array`.
+    masked ``[N, K]`` array back to `orig_shape`, still ``float64`` --
+    callers downcast to the tensor's own original dtype (FLOAT/FLOAT16/
+    BFLOAT16, via :func:`_from_f64`) right before
+    :func:`onnx.numpy_helper.from_array`, not here, so this stays a pure
+    reshape/transpose with no dtype opinion of its own.
     """
     if is_conv:
-        return w_nk.reshape(orig_shape).astype(np.float32)
+        return w_nk.reshape(orig_shape)
     w_new = w_nk if weight_transposed else w_nk.T
-    return w_new.reshape(orig_shape).astype(np.float32)
+    return w_new.reshape(orig_shape)
 
 
 def _prune_weight(
@@ -1049,12 +1144,12 @@ def _prune_weight(
     importance_of_nk,
     is_conv: bool = False,
 ) -> None:
-    w = onnx.numpy_helper.to_array(w_init).astype(np.float64)
+    w = _to_f64(w_init)
     w_nk = _weight_to_nk(w, weight_transposed, is_conv)
     mask = importance_of_nk(w_nk)
     w_pruned_nk = np.where(mask, w_nk, 0.0)
     w_new = _nk_to_weight(w_pruned_nk, w.shape, weight_transposed, is_conv)
-    w_init.CopyFrom(onnx.numpy_helper.from_array(w_new, name=w_init.name))
+    w_init.CopyFrom(_from_f64(w_new, w_init.data_type, w_init.name))
 
 
 def _apply_global_unstructured_pruning(
@@ -1127,7 +1222,7 @@ def _apply_global_unstructured_pruning(
         offset += size
         w_pruned_nk = np.where(drop_here, 0.0, w_nk)
         w_new = _nk_to_weight(w_pruned_nk, orig_shape, weight_transposed, is_conv)
-        w_init.CopyFrom(onnx.numpy_helper.from_array(w_new, name=w_init.name))
+        w_init.CopyFrom(_from_f64(w_new, w_init.data_type, w_init.name))
 
 
 # --- Conv im2col-unfolded activation statistics (Wanda only) -----------
@@ -1423,15 +1518,23 @@ def apply_magnitude_pruning(
     global_sparsity: bool = False,
 ) -> onnx.ModelProto:
     """Zeros the least-magnitude entries of every MatMul/vanilla-Gemm
-    layer's constant 2-D float32 weight (this includes
+    layer's constant 2-D float32/float16/bfloat16 weight (this includes
     ``com.microsoft::GroupQueryAttention``'s separate Q/K/V projections,
     ordinary MatMul/Gemm nodes in their own right), every 2-D ``Conv``
-    layer's constant 4-D float32 weight -- ordinary (``group=1``),
-    depthwise, and general grouped Conv alike, see this module's own
-    docstring for why grouping needs no special-casing for this technique
-    -- and every ``com.microsoft::Attention`` node's constant 2-D float32
-    merged QKV weight -- the data-free pruning baseline (Han et al., 2015).
-    See this module's own docstring for how importance is grouped
+    layer's constant 4-D float32/float16/bfloat16 weight -- ordinary
+    (``group=1``), depthwise, and general grouped Conv alike, see this
+    module's own docstring for why grouping needs no special-casing for
+    this technique -- and every ``com.microsoft::Attention`` node's
+    constant 2-D float32/float16/bfloat16 merged QKV weight -- the
+    data-free pruning baseline (Han et al., 2015). A matched layer's
+    weight is read out upcast to float64 for the importance/masking math
+    below and the result cast back down to that layer's own original
+    dtype before being written back (see the "FP16/BFloat16 weight
+    support" section comment above :func:`_match_conv_weight_only`), so a
+    fp16/bf16 model's declared dtypes are preserved exactly -- masking
+    never changes a surviving entry's own value, only zeros dropped ones,
+    so this round trip reproduces every kept entry's exact original bit
+    pattern. See this module's own docstring for how importance is grouped
     (including the Conv reshape convention), why the merged QKV weight
     needs no special handling here beyond matching it (:func:`_candidates`,
     via :func:`_match_attention_weight_only`), and why structured
@@ -1498,7 +1601,7 @@ def apply_magnitude_pruning(
         entries = []
         for _, _, w_name, weight_transposed, is_conv in candidates:
             w_init = initializer_map[w_name]
-            w = onnx.numpy_helper.to_array(w_init).astype(np.float64)
+            w = _to_f64(w_init)
             w_nk = _weight_to_nk(w, weight_transposed, is_conv)
             entries.append(
                 (w_init, weight_transposed, is_conv, w.shape, w_nk, np.abs(w_nk))
@@ -1708,13 +1811,20 @@ def apply_wanda_pruning(
     global_sparsity: bool = False,
 ) -> onnx.ModelProto:
     """Wanda pruning (Sun et al., 2023): zeros the least-important entries
-    of every MatMul/vanilla-Gemm layer's constant 2-D float32 weight (this
-    includes ``com.microsoft::GroupQueryAttention``'s separate Q/K/V
-    projections, ordinary MatMul/Gemm nodes in their own right), every 2-D
-    ``Conv`` layer's constant 4-D float32 weight -- ordinary (``group=1``),
-    depthwise, and general grouped Conv alike -- and every
-    ``com.microsoft::Attention`` node's constant 2-D float32 merged QKV
-    weight, using ``|W_ij| * ||X_j||_2`` (weight magnitude times its
+    of every MatMul/vanilla-Gemm layer's constant 2-D float32/float16/
+    bfloat16 weight (this includes ``com.microsoft::GroupQueryAttention``'s
+    separate Q/K/V projections, ordinary MatMul/Gemm nodes in their own
+    right), every 2-D ``Conv`` layer's constant 4-D float32/float16/
+    bfloat16 weight -- ordinary (``group=1``), depthwise, and general
+    grouped Conv alike -- and every ``com.microsoft::Attention`` node's
+    constant 2-D float32/float16/bfloat16 merged QKV weight (see the
+    "FP16/BFloat16 weight support" section comment above
+    :func:`_match_conv_weight_only` for the read-upcast/write-downcast
+    pattern this applies at every matched weight; calibration activations
+    are captured via a real ``onnxruntime`` run and were already cast to
+    float64 regardless of the graph's own declared dtype, so they need no
+    separate handling here), using ``|W_ij| * ||X_j||_2`` (weight magnitude
+    times its
     reduction-dimension entry's activation norm over calibration data) as
     the importance metric instead of plain ``|W|``. See this module's own
     docstring for the technique -- including what ``X_j`` means for a Conv
@@ -1829,7 +1939,7 @@ def apply_wanda_pruning(
         entries = []
         for node, x_name, w_name, weight_transposed, is_conv in candidates:
             w_init = initializer_map[w_name]
-            w = onnx.numpy_helper.to_array(w_init).astype(np.float64)
+            w = _to_f64(w_init)
             w_nk = _weight_to_nk(w, weight_transposed, is_conv)
             norm = _wanda_norm_for_candidate(
                 node,
@@ -1894,7 +2004,10 @@ def weight_sparsity(model: Union[str, onnx.ModelProto]) -> float:
     pruning call reached its target, or to measure an already-sparse model.
     Shares :func:`_candidates` with every ``apply_*_pruning`` function
     above, so it automatically reports across whatever layer types they
-    match, with no separate list to keep in sync.
+    match (including FLOAT16/BFLOAT16 weights, needing no dtype-specific
+    handling here: an exact-zero comparison and ``.size`` mean the same
+    thing regardless of float precision), with no separate list to keep in
+    sync.
     Returns ``0.0`` if no matching layer is present.
     """
     if isinstance(model, str):
@@ -2076,11 +2189,21 @@ def apply_sparsegpt_pruning(
     providers: Optional[Sequence[str]] = None,
 ) -> onnx.ModelProto:
     """SparseGPT (Frantar & Alistarh, 2023): zeros the least-important
-    entries of every MatMul/vanilla-Gemm layer's constant 2-D float32
-    weight (this includes ``com.microsoft::GroupQueryAttention``'s separate
-    Q/K/V projections, ordinary MatMul/Gemm nodes in their own right) and
-    every ``com.microsoft::Attention`` node's constant 2-D float32 merged
-    QKV weight, the same unstructured-or-N:M patterns
+    entries of every MatMul/vanilla-Gemm layer's constant 2-D float32/
+    float16/bfloat16 weight (this includes
+    ``com.microsoft::GroupQueryAttention``'s separate Q/K/V projections,
+    ordinary MatMul/Gemm nodes in their own right) and every
+    ``com.microsoft::Attention`` node's constant 2-D float32/float16/
+    bfloat16 merged QKV weight (read upcast to float64, written back down
+    to that weight's own original dtype -- see the "FP16/BFloat16 weight
+    support" section comment above :func:`_match_conv_weight_only` --
+    though note SparseGPT's Hessian-compensated update, unlike plain
+    masking, *recomputes* every kept entry's own value, so a fp16/bf16
+    weight's surviving entries do not reproduce their pre-pruning bit
+    pattern the way magnitude/Wanda pruning's pure zero-masking does; the
+    float64 accumulation this function already used for numerical
+    stability is unchanged either way), the same unstructured-or-N:M
+    patterns
     :func:`apply_magnitude_pruning`/:func:`apply_wanda_pruning` offer, but
     -- unlike either -- using a sequential, Hessian-error-compensating
     algorithm ported from GPTQ (:mod:`onnxsim.gptq`, same authors, same
@@ -2270,7 +2393,7 @@ def apply_sparsegpt_pruning(
 
     for _, x_name, w_name, weight_transposed, is_conv in candidates:
         w_init = initializer_map[w_name]
-        w = onnx.numpy_helper.to_array(w_init).astype(np.float64)
+        w = _to_f64(w_init)
 
         if is_conv:
             cout, cin_per_group, kh, kw = w.shape
@@ -2307,7 +2430,7 @@ def apply_sparsegpt_pruning(
                 for g in range(group)
             ]
             w_pruned_nk = np.concatenate(pruned_groups, axis=0)
-            w_new = w_pruned_nk.reshape(cout, cin_per_group, kh, kw).astype(np.float32)
+            w_new = w_pruned_nk.reshape(cout, cin_per_group, kh, kw)
         else:
             acts = activations[x_name]
             if not acts:
@@ -2323,9 +2446,9 @@ def apply_sparsegpt_pruning(
                 w_nk, h, sparsity, n, m, percdamp, proc_block_size
             )
             w_new = w_pruned_nk if weight_transposed else w_pruned_nk.T
-            w_new = w_new.reshape(dim0, dim1).astype(np.float32)
+            w_new = w_new.reshape(dim0, dim1)
 
-        w_init.CopyFrom(onnx.numpy_helper.from_array(w_new, name=w_init.name))
+        w_init.CopyFrom(_from_f64(w_new, w_init.data_type, w_init.name))
 
     return out
 
@@ -2570,7 +2693,7 @@ def _match_producer(
     w_init = initializer_map.get(w_name)
     if (
         w_init is None
-        or w_init.data_type != onnx.TensorProto.FLOAT
+        or not _is_supported_float_dtype(w_init.data_type)
         or len(w_init.dims) != 2
     ):
         return None
@@ -2630,7 +2753,7 @@ def _match_fused_bias_gelu(
     bias_init = initializer_map.get(bias_name)
     if (
         bias_init is None
-        or bias_init.data_type != onnx.TensorProto.FLOAT
+        or not _is_supported_float_dtype(bias_init.data_type)
         or not list(bias_init.dims)
         or int(np.prod(bias_init.dims)) != bias_init.dims[-1]
     ):
@@ -2681,7 +2804,7 @@ def _walk_to_consumer(
             cw_init = initializer_map.get(cw_name)
             if (
                 cw_init is not None
-                and cw_init.data_type == onnx.TensorProto.FLOAT
+                and _is_supported_float_dtype(cw_init.data_type)
                 and len(cw_init.dims) == 2
             ):
                 k = cw_init.dims[1] if c_weight_transposed else cw_init.dims[0]
@@ -2706,7 +2829,7 @@ def _walk_to_consumer(
             const_init = initializer_map.get(other)
             if (
                 const_init is not None
-                and const_init.data_type == onnx.TensorProto.FLOAT
+                and _is_supported_float_dtype(const_init.data_type)
                 and list(const_init.dims)
                 and const_init.dims[-1] == n_channels
                 and int(np.prod(const_init.dims)) == n_channels
@@ -2817,7 +2940,7 @@ def _match_conv_producer(
     w_init = initializer_map.get(w_name)
     if (
         w_init is None
-        or w_init.data_type != onnx.TensorProto.FLOAT
+        or not _is_supported_float_dtype(w_init.data_type)
         or len(w_init.dims) != 4
     ):
         return None
@@ -2865,7 +2988,7 @@ def _match_conv_consumer(
     w_init = initializer_map.get(w_name)
     if (
         w_init is None
-        or w_init.data_type != onnx.TensorProto.FLOAT
+        or not _is_supported_float_dtype(w_init.data_type)
         or len(w_init.dims) != 4
     ):
         return None
@@ -2906,7 +3029,7 @@ def _match_depthwise_conv_pass_through(
     w_init = initializer_map.get(w_name)
     if (
         w_init is None
-        or w_init.data_type != onnx.TensorProto.FLOAT
+        or not _is_supported_float_dtype(w_init.data_type)
         or len(w_init.dims) != 4
         or w_init.dims[0] != n_channels
         or w_init.dims[1] != 1
@@ -2917,7 +3040,7 @@ def _match_depthwise_conv_pass_through(
     if len(node.input) == 3 and node.input[2]:
         bias_name = node.input[2]
         b_init = initializer_map.get(bias_name)
-        if b_init is None or b_init.data_type != onnx.TensorProto.FLOAT:
+        if b_init is None or not _is_supported_float_dtype(b_init.data_type):
             return None  # non-constant bias -- can't safely prune it
     return w_name, bias_name
 
@@ -3218,7 +3341,7 @@ def _match_conv_pass_through_self(
     w_init = initializer_map.get(node.input[1])
     if (
         w_init is None
-        or w_init.data_type != onnx.TensorProto.FLOAT
+        or not _is_supported_float_dtype(w_init.data_type)
         or len(w_init.dims) != 4
     ):
         return None
@@ -3955,7 +4078,7 @@ def _skip_layer_norm_const_names(
         init = initializer_map.get(name)
         return (
             init is not None
-            and init.data_type == onnx.TensorProto.FLOAT
+            and _is_supported_float_dtype(init.data_type)
             and bool(list(init.dims))
             and int(np.prod(init.dims)) == init.dims[-1]
         )
@@ -4198,7 +4321,7 @@ def _walk_matmul_producer_backward(
                 const_name, other = (a_name, b_name) if a_const else (b_name, a_name)
                 const_init = initializer_map[const_name]
                 if (
-                    const_init.data_type == onnx.TensorProto.FLOAT
+                    _is_supported_float_dtype(const_init.data_type)
                     and list(const_init.dims)
                     and int(np.prod(const_init.dims)) == const_init.dims[-1]
                 ):
@@ -6004,9 +6127,7 @@ def _apply_concat_chains(
             any_pruned = True
             w_arrays_nk = []
             for p in b.producers:
-                w = onnx.numpy_helper.to_array(initializer_map[p.weight]).astype(
-                    np.float64
-                )
+                w = _to_f64(initializer_map[p.weight])
                 w_arrays_nk.append(
                     w.reshape(w.shape[0], -1)  # [out_channels, in_channels*kH*kW]
                     if p.is_conv
@@ -6588,7 +6709,7 @@ def _apply_chains(
 
         w_arrays_nk = []
         for p in chain.producers:
-            w = onnx.numpy_helper.to_array(initializer_map[p.weight]).astype(np.float64)
+            w = _to_f64(initializer_map[p.weight])
             if p.is_conv:
                 w_nk = w.reshape(w.shape[0], -1)  # [out_channels, in_channels*kH*kW]
             else:
@@ -6724,7 +6845,7 @@ def _apply_chains_global(
 
         w_arrays_nk = []
         for p in chain.producers:
-            w = onnx.numpy_helper.to_array(initializer_map[p.weight]).astype(np.float64)
+            w = _to_f64(initializer_map[p.weight])
             if p.is_conv:
                 w_nk = w.reshape(w.shape[0], -1)
             else:
@@ -7027,6 +7148,16 @@ def apply_structured_pruning(
             place; anything not matching that exact topology (branching,
             a non-constant bias, a consumer whose reduction dimension
             doesn't line up, ...) is left completely untouched
+
+    Every matched producer/consumer weight (and bias, and per-channel
+    constant) may be FLOAT, FLOAT16, or BFLOAT16 -- not necessarily the
+    same dtype on both sides of a chain. Importance ranking reads each
+    producer's own weight upcast to float64 (:func:`_to_f64`); the actual
+    channel removal is pure index slicing (``w[keep, ...]``), which
+    preserves every tensor's own original dtype with no cast at all -- see
+    the "FP16/BFloat16 weight support" section comment above
+    :func:`_match_conv_weight_only` for why that needs no separate
+    downcast step.
     """
     if not (0.0 <= sparsity < 1.0):
         raise ValueError(f"sparsity must be in [0, 1), got {sparsity}")
@@ -7256,6 +7387,12 @@ def apply_structured_wanda_pruning(
             place; anything not matching that exact topology falls back to
             :func:`apply_structured_pruning`'s plain L2-norm ranking if no
             matching activation was ever observed for that chain's consumer
+
+    Weight dtype support is identical to :func:`apply_structured_pruning`
+    (FLOAT/FLOAT16/BFLOAT16, see that function's own closing note);
+    calibration activations are captured via a real ``onnxruntime`` run and
+    cast to float64 on read regardless of the graph's own declared dtype,
+    so they need no separate handling here either.
     """
     if not (0.0 <= sparsity < 1.0):
         raise ValueError(f"sparsity must be in [0, 1), got {sparsity}")
@@ -7705,7 +7842,7 @@ def _match_attention_producer(
     w_init = initializer_map.get(w_name)
     if (
         w_init is None
-        or w_init.data_type != onnx.TensorProto.FLOAT
+        or not _is_supported_float_dtype(w_init.data_type)
         or len(w_init.dims) != 2
     ):
         return None
@@ -7717,7 +7854,7 @@ def _match_attention_producer(
         b_init = initializer_map.get(bias_name)
         if (
             b_init is None
-            or b_init.data_type != onnx.TensorProto.FLOAT
+            or not _is_supported_float_dtype(b_init.data_type)
             or list(b_init.dims) != [total_n]
         ):
             return None
@@ -7829,7 +7966,7 @@ def _walk_to_attention_consumer(
     cw_init = initializer_map.get(cw_name)
     if (
         cw_init is None
-        or cw_init.data_type != onnx.TensorProto.FLOAT
+        or not _is_supported_float_dtype(cw_init.data_type)
         or len(cw_init.dims) != 2
     ):
         return None, chain_ops
@@ -7964,7 +8101,7 @@ def _past_kv_constants_are_sliceable(
             continue  # dynamic -- the caller's own runtime data, left alone
         if len(past_init.dims) != 4 or past_init.dims[1] != kv_num_heads:
             return False  # not a shape this function can safely slice
-        if past_init.data_type == onnx.TensorProto.FLOAT:
+        if _is_supported_float_dtype(past_init.data_type):
             continue  # unquantized cache -- nothing else to check
         if scale_idx is None or past_init.data_type not in _QUANTIZED_KV_CACHE_DTYPES:
             return False  # quantized dtype with nowhere to locate its scale
@@ -8629,7 +8766,7 @@ def _apply_one_plain_attention_chain(
 
     dq, dk, dv = chain.nq // h, chain.nk // h, chain.nv // h
     w_init = initializer_map[chain.weight]
-    w = onnx.numpy_helper.to_array(w_init).astype(np.float64)  # [K, Nq+Nk+Nv]
+    w = _to_f64(w_init)  # [K, Nq+Nk+Nv]
     wq = w[:, : chain.nq]
     wk = w[:, chain.nq : chain.nq + chain.nk]
     wv = w[:, chain.nq + chain.nk :]
@@ -8783,16 +8920,16 @@ def _apply_one_gqa_chain(
         # independently-stored arrays.
         nq_orig = chain.num_heads * d
         nk_orig = chain.kv_num_heads * d
-        w_kn = onnx.numpy_helper.to_array(wq_init).astype(np.float64)
+        w_kn = _to_f64(wq_init)
         if chain.q_weight_transposed:
             w_kn = w_kn.T  # [K, Nq+Nk+Nv]
         wq_kn = w_kn[:, :nq_orig]
         wk_kn = w_kn[:, nq_orig : nq_orig + nk_orig]
         wv_kn = w_kn[:, nq_orig + nk_orig :]
     else:
-        wq_kn = onnx.numpy_helper.to_array(wq_init).astype(np.float64)
-        wk_kn = onnx.numpy_helper.to_array(wk_init).astype(np.float64)
-        wv_kn = onnx.numpy_helper.to_array(wv_init).astype(np.float64)
+        wq_kn = _to_f64(wq_init)
+        wk_kn = _to_f64(wk_init)
+        wv_kn = _to_f64(wv_init)
         if chain.q_weight_transposed:
             wq_kn = wq_kn.T  # [K, Nq]
         if chain.k_weight_transposed:
@@ -9088,6 +9225,14 @@ def apply_attention_head_pruning(
             with Q's/K's own head sizes mismatched, a consumer whose
             reduction dimension
             doesn't line up, ...) is left completely untouched
+
+    Every matched weight (merged QKV, or separate Q/K/V), bias, and
+    per-head constant (`attention_bias`/`attn_mask`/`head_sink`) may be
+    FLOAT, FLOAT16, or BFLOAT16, independently: importance ranking reads a
+    matched weight upcast to float64 (:func:`_to_f64`), while every actual
+    removal is pure index slicing that preserves each tensor's own original
+    dtype untouched -- see the "FP16/BFloat16 weight support" section
+    comment above :func:`_match_conv_weight_only`.
     """
     if not (0.0 <= sparsity < 1.0):
         raise ValueError(f"sparsity must be in [0, 1), got {sparsity}")
@@ -9182,6 +9327,12 @@ def apply_attention_head_wanda_pruning(
             :func:`apply_attention_head_pruning`'s plain Frobenius-norm
             ranking if no matching activation was ever observed for that
             block's consumer
+
+    Weight dtype support is identical to
+    :func:`apply_attention_head_pruning` (FLOAT/FLOAT16/BFLOAT16); the
+    calibration activations captured here are, like every other Wanda-style
+    pass in this module, read via a real ``onnxruntime`` run and cast to
+    float64 on capture regardless of the graph's own declared dtype.
     """
     if not (0.0 <= sparsity < 1.0):
         raise ValueError(f"sparsity must be in [0, 1), got {sparsity}")
@@ -9439,8 +9590,8 @@ def _match_moe_producer(
     if (
         fc1_w is None
         or fc2_w is None
-        or fc1_w.data_type != onnx.TensorProto.FLOAT
-        or fc2_w.data_type != onnx.TensorProto.FLOAT
+        or not _is_supported_float_dtype(fc1_w.data_type)
+        or not _is_supported_float_dtype(fc2_w.data_type)
         or len(fc1_w.dims) != 3
         or len(fc2_w.dims) != 3
         or len(consumers_of.get(fc1_w_name, [])) != 1
@@ -9460,7 +9611,7 @@ def _match_moe_producer(
         init = initializer_map.get(name)
         if (
             init is None
-            or init.data_type != onnx.TensorProto.FLOAT
+            or not _is_supported_float_dtype(init.data_type)
             or list(init.dims) != expected_dims
             or len(consumers_of.get(name, [])) != 1
         ):
@@ -9514,15 +9665,13 @@ def _moe_importance(
     :func:`apply_structured_pruning`'s own gated-pair combination ranks both
     branches by one shared score before picking one shared `keep`).
     """
-    fc1_w = onnx.numpy_helper.to_array(initializer_map[chain.fc1_w]).astype(np.float64)
-    fc2_w = onnx.numpy_helper.to_array(initializer_map[chain.fc2_w]).astype(np.float64)
+    fc1_w = _to_f64(initializer_map[chain.fc1_w])
+    fc2_w = _to_f64(initializer_map[chain.fc2_w])
     squared = np.sum(np.square(fc1_w), axis=(0, 2)) + np.sum(
         np.square(fc2_w), axis=(0, 1)
     )
     if chain.fc1_b is not None:
-        fc1_b = onnx.numpy_helper.to_array(initializer_map[chain.fc1_b]).astype(
-            np.float64
-        )
+        fc1_b = _to_f64(initializer_map[chain.fc1_b])
         squared = squared + np.sum(np.square(fc1_b), axis=0)
     return np.sqrt(squared)
 
@@ -9616,6 +9765,14 @@ def apply_moe_expert_channel_pruning(
             `swiglu`/unrecognized `activation_type`, a non-constant or
             tied/shared weight, or any other shape this pass doesn't
             recognize is left completely untouched
+
+    `fc1_experts_weights`/`fc2_experts_weights`/`fc1_experts_bias` may be
+    FLOAT, FLOAT16, or BFLOAT16 (:func:`_moe_importance` reads them upcast
+    to float64 for the norm computation above; the actual channel removal
+    in :func:`_apply_moe_chains` is pure index slicing, which preserves
+    each tensor's own original dtype with no separate downcast needed --
+    see the "FP16/BFloat16 weight support" section comment above
+    :func:`_match_conv_weight_only`).
     """
     if not (0.0 <= sparsity < 1.0):
         raise ValueError(f"sparsity must be in [0, 1), got {sparsity}")
@@ -9849,15 +10006,13 @@ def _moe_expert_weight_importance(
     reduces *across* the expert axis to rank `inter_size`), this reduces
     *within* each expert's own slice to rank experts themselves.
     """
-    fc1_w = onnx.numpy_helper.to_array(initializer_map[chain.fc1_w]).astype(np.float64)
-    fc2_w = onnx.numpy_helper.to_array(initializer_map[chain.fc2_w]).astype(np.float64)
+    fc1_w = _to_f64(initializer_map[chain.fc1_w])
+    fc2_w = _to_f64(initializer_map[chain.fc2_w])
     squared = np.sum(np.square(fc1_w), axis=(1, 2)) + np.sum(
         np.square(fc2_w), axis=(1, 2)
     )
     if chain.fc1_b is not None:
-        fc1_b = onnx.numpy_helper.to_array(initializer_map[chain.fc1_b]).astype(
-            np.float64
-        )
+        fc1_b = _to_f64(initializer_map[chain.fc1_b])
         squared = squared + np.sum(np.square(fc1_b), axis=1)
     return np.sqrt(squared)
 
@@ -9996,6 +10151,12 @@ def apply_moe_whole_expert_pruning(
             projection), a `router_probs` with more than one consumer, or any
             other shape this pass doesn't recognize is left completely
             untouched
+
+    Weight dtype support mirrors :func:`apply_moe_expert_channel_pruning`
+    (FLOAT/FLOAT16/BFLOAT16 for `fc1`/`fc2`/biases, and the router
+    projection weight); the router-gate calibration activations here are
+    likewise captured via a real ``onnxruntime`` run and cast to float64
+    on capture regardless of the graph's own declared dtype.
     """
     if not (0.0 <= sparsity < 1.0):
         raise ValueError(f"sparsity must be in [0, 1), got {sparsity}")
