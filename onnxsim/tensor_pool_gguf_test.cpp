@@ -495,6 +495,49 @@ void TestLoadGGUFRejectsMisalignedKQuantTensor() {
   std::remove(path.c_str());
 }
 
+void TestMxfp4RoundTripAndDecode() {
+  // An MXFP4 block: e = 128 (E8M0 exponent byte -> scale d = 1.0 exactly,
+  // see ggml_mxfp4_test.cpp's TestGgmlE8m0ToFloat32Half), qs[0] = 0x21 and
+  // qs[1] = 0x9A -- the same hand-verified vector ggml_mxfp4_test.cpp
+  // hand-verifies, reused here to check TensorPool's own plumbing (pooling,
+  // SaveGGUF/LoadGGUF byte-exact round trip, DequantizeToFloat), not the
+  // decode math itself.
+  std::string block(17, '\0');
+  block[0] = static_cast<char>(128);
+  block[1] = static_cast<char>(0x21);
+  block[2] = static_cast<char>(0x9A);
+
+  TensorPool pool;
+  pool.Add("w", ONNXSIM_GGML_MXFP4, {32}, std::string(block));
+
+  std::string path = TempPath("_mxfp4.gguf");
+  pool.SaveGGUF(path);
+
+  TensorPool loaded;
+  auto skipped = loaded.LoadGGUF(path);
+  Check(skipped.empty(), "MXFP4 tensor is not skipped");
+  const Entry* w = loaded.Find("w");
+  Check(w != nullptr, "MXFP4 tensor is present");
+  if (w != nullptr) {
+    Check(w->dtype == ONNXSIM_GGML_MXFP4, "MXFP4 dtype round-trips");
+    Check(w->shape == std::vector<int64_t>({32}), "MXFP4 shape round-trips");
+    Check(w->data == block, "MXFP4 native block bytes round-trip bit-exact");
+
+    std::vector<float> decoded;
+    Check(loaded.DequantizeToFloat("w", &decoded),
+          "DequantizeToFloat succeeds for an MXFP4 entry");
+    Check(decoded.size() == 32, "DequantizeToFloat output size");
+    if (decoded.size() == 32) {
+      Check(std::fabs(decoded[0] - 1.0f) < 1e-6f, "MXFP4 element 0");
+      Check(std::fabs(decoded[16] - 2.0f) < 1e-6f, "MXFP4 element 16");
+      Check(std::fabs(decoded[1] - (-2.0f)) < 1e-6f, "MXFP4 element 1");
+      Check(std::fabs(decoded[17] - (-1.0f)) < 1e-6f, "MXFP4 element 17");
+    }
+  }
+
+  std::remove(path.c_str());
+}
+
 }  // namespace
 
 int main() {
@@ -510,6 +553,7 @@ int main() {
   TestLoadGGUFMmapMissingFileFallsBackAndThrows();
   TestKQuantRoundTripAndDecode();
   TestLoadGGUFRejectsMisalignedKQuantTensor();
+  TestMxfp4RoundTripAndDecode();
 
   if (g_failures == 0) {
     std::printf("tensor_pool_gguf_test: all checks passed\n");

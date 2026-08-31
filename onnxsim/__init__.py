@@ -110,6 +110,7 @@ from onnxsim.pruning import (
     apply_sparsegpt_pruning,
     apply_structured_pruning,
     apply_structured_wanda_pruning,
+    apply_transformer_block_pruning,
     apply_wanda_pruning,
     weight_sparsity,
 )
@@ -169,6 +170,7 @@ __all__ = [
     "apply_embedding_vocab_pruning",
     "apply_embedding_vocab_magnitude_pruning",
     "EmbeddingPruningResult",
+    "apply_transformer_block_pruning",
     "weight_sparsity",
     "analyze_pruning_sensitivity",
     "PruningSensitivityReport",
