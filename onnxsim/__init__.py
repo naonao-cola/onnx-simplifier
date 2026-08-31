@@ -38,6 +38,7 @@ from onnxsim.embedding_quantization import (
     quantize_embedding_binary,
     quantize_embedding_int8,
 )
+from onnxsim.finetune import apply_pruning_finetune
 from onnxsim.gguf_reconstruct import (
     UnsupportedArchitectureError,
     reconstruct_gguf_graph,
@@ -128,6 +129,7 @@ __all__ = [
     "cross_layer_equalize",
     "correct_bias",
     "apply_adaround",
+    "apply_pruning_finetune",
     "apply_autoround",
     "auto_quantize_int4",
     "AutoQuantResult",
