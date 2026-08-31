@@ -13339,6 +13339,1213 @@ def test_moe_whole_expert_pruning_multiple_nodes_pruned_independently():
     assert inits["RW2"].shape == (hidden2, 1)
 
 
+# --- QMoE (quantized-weight MoE) pruning ------------------------------------
+#
+# See onnxsim/pruning.py's own "QMoE (quantized-weight MoE) pruning" section
+# comment for the full schema/packing verification and exactly which
+# com.microsoft::QMoE shapes onnxsim.apply_qmoe_expert_channel_pruning/
+# apply_qmoe_whole_expert_pruning match. QMoE has no onnx.reference fallback
+# (a custom-domain op with no decomposition attached), so every test below
+# that actually prunes something runs the result through a real onnxruntime
+# CPU session -- the only real oracle available for this op in this
+# environment. QMoE also can't be built via onnx.parser's text format at all
+# (a custom-domain op whose fc1/fc2 weights are packed uint8 tensors -- the
+# parser's own tensor-literal syntax encodes float_data, not raw_data, and
+# has no uint8 literal syntax either), so every QMoE model below is built via
+# onnx.helper.make_node/make_tensor directly, per CLAUDE.md's own documented
+# fallback for exactly this kind of case.
+
+
+def _qmoe_quantize_channel(w, bits, zero_point=None):
+    """Reference (onnxsim-code-free) per-channel symmetric QMoE quantizer:
+    `w` is one expert's own ``[N, K]`` float weight. Returns ``(packed
+    [N, K/pack] uint8, scale [N] float32, dequant [N, K] float32)`` -- packed
+    low-index-in-low-bits, ``8 // bits`` values per byte, matching this op's
+    own confirmed-live raw storage convention (see onnxsim/pruning.py's own
+    section comment). `zero_point`, when given, is a per-channel ``[N]`` int
+    array; otherwise every channel uses the schema's own documented default,
+    ``2 ** (bits - 1)``.
+    """
+    n, k = w.shape
+    pack = 8 // bits
+    qmin, qmax = -(1 << (bits - 1)), (1 << (bits - 1)) - 1
+    default_zp = 1 << (bits - 1)
+    zp = (
+        np.full(n, default_zp, dtype=np.int64)
+        if zero_point is None
+        else np.asarray(zero_point, dtype=np.int64)
+    )
+    scale = np.abs(w).max(axis=1) / float(-qmin)
+    scale = np.maximum(scale, np.finfo(np.float32).eps).astype(np.float32)
+    q = np.clip(np.round(w / scale[:, None]), qmin, qmax).astype(np.int64) + zp[:, None]
+    # A non-default zero_point can push q outside the byte's own valid
+    # storage range ([0, 2**bits)) even after the pre-zero-point clip above
+    # -- clamp to that range too, the same final safety a real quantizer
+    # implementation has to apply.
+    q = np.clip(q, 0, (1 << bits) - 1).astype(np.uint8)
+    parts = [(q[:, i::pack] & ((1 << bits) - 1)) for i in range(pack)]
+    packed = np.zeros_like(parts[0])
+    for i, p in enumerate(parts):
+        packed = packed | (p << (bits * i))
+    packed = packed.astype(np.uint8)
+    dequant = (q.astype(np.float32) - zp[:, None].astype(np.float32)) * scale[:, None]
+    return packed, scale, dequant
+
+
+def _qmoe_quantize(w, bits, zero_point=None):
+    """Batched (per-expert) :func:`_qmoe_quantize_channel`: `w` is
+    ``[E, N, K]``. Returns ``(packed [E, N, K/pack], scale [E, N], dequant
+    [E, N, K])``.
+    """
+    e, n, k = w.shape
+    pack = 8 // bits
+    packed = np.zeros((e, n, k // pack), dtype=np.uint8)
+    scale = np.zeros((e, n), dtype=np.float32)
+    dequant = np.zeros_like(w)
+    for ei in range(e):
+        packed[ei], scale[ei], dequant[ei] = _qmoe_quantize_channel(
+            w[ei], bits, zero_point=None if zero_point is None else zero_point[ei]
+        )
+    return packed, scale, dequant
+
+
+def _pack_vals(vals, bits):
+    """Independent sub-byte packer for a generic array of already-quantized
+    ``uint8`` values in ``[0, 2**bits)`` on its own last axis -- used to
+    build `fc1_zero_points`/`fc2_zero_points` test tensors directly (not
+    through :func:`_qmoe_quantize_channel`, which packs scale-derived `q`
+    values, not the `zero_point` operand itself).
+    """
+    pack = 8 // bits
+    vals = np.asarray(vals, dtype=np.uint8)
+    n = vals.shape[-1]
+    pad = (-n) % pack
+    if pad:
+        vals = np.pad(vals, [(0, 0)] * (vals.ndim - 1) + [(0, pad)])
+    reshaped = vals.reshape(*vals.shape[:-1], -1, pack)
+    out = np.zeros(reshaped.shape[:-1], dtype=np.uint8)
+    for i in range(pack):
+        out = out | (reshaped[..., i] << (bits * i))
+    return out.astype(np.uint8)
+
+
+def _unpack_vals(packed, bits, logical_len):
+    """Independent unpacker, inverse of :func:`_pack_vals`."""
+    pack = 8 // bits
+    mask = (1 << bits) - 1
+    parts = [(packed >> (bits * i)) & mask for i in range(pack)]
+    unpacked = np.stack(parts, axis=-1).reshape(
+        *packed.shape[:-1], packed.shape[-1] * pack
+    )
+    return unpacked[..., :logical_len]
+
+
+def _u8(array, name):
+    return onnx.numpy_helper.from_array(array.astype(np.uint8), name)
+
+
+def _qmoe_model(
+    fc1_q,
+    fc1_scale,
+    fc2_q,
+    fc2_scale,
+    bits,
+    fc1_bias=None,
+    fc2_bias=None,
+    fc1_zp=None,
+    fc2_zp=None,
+    fc3_q=None,
+    fc3_scale=None,
+    activation="relu",
+    swiglu_fusion=0,
+    k=2,
+    tokens=6,
+    quant_type="int",
+    block_size=0,
+    weights_prepacked=None,
+    router_weights=False,
+    fc1_q_as_input=False,
+    extra_nodes=(),
+    extra_outputs=(),
+):
+    # Mirrors this file's own _moe_model, but built via onnx.helper directly
+    # (a router-logit input R feeds a real com.microsoft::QMoE node) -- see
+    # this section's own top comment for why the onnx.parser text format
+    # can't express QMoE's packed uint8 operands.
+    num_experts, inter, hidden_packed = fc1_q.shape
+    hidden = hidden_packed * (8 // bits)
+    inputs = [
+        onnx.helper.make_tensor_value_info(
+            "X", onnx.TensorProto.FLOAT, [tokens, hidden]
+        ),
+        onnx.helper.make_tensor_value_info(
+            "R", onnx.TensorProto.FLOAT, [tokens, num_experts]
+        ),
+    ]
+    outputs = [
+        onnx.helper.make_tensor_value_info(
+            "Y", onnx.TensorProto.FLOAT, [tokens, hidden]
+        )
+    ]
+    inits = []
+    if fc1_q_as_input:
+        inputs.append(
+            onnx.helper.make_tensor_value_info(
+                "FC1Q", onnx.TensorProto.UINT8, list(fc1_q.shape)
+            )
+        )
+    else:
+        inits.append(_u8(fc1_q, "FC1Q"))
+    inits += [_f32(fc1_scale, "FC1S"), _u8(fc2_q, "FC2Q"), _f32(fc2_scale, "FC2S")]
+    node_inputs = ["X", "R", "FC1Q", "FC1S", "", "FC2Q", "FC2S", ""]
+    if fc1_bias is not None:
+        node_inputs[4] = "FC1B"
+        inits.append(_f32(fc1_bias, "FC1B"))
+    if fc2_bias is not None:
+        node_inputs[7] = "FC2B"
+        inits.append(_f32(fc2_bias, "FC2B"))
+    while len(node_inputs) < 13:
+        node_inputs.append("")
+    if fc3_q is not None:
+        node_inputs[8] = "FC3Q"
+        node_inputs[9] = "FC3S"
+        inits += [_u8(fc3_q, "FC3Q"), _f32(fc3_scale, "FC3S")]
+    if fc1_zp is not None:
+        node_inputs[11] = "FC1ZP"
+        inits.append(_u8(fc1_zp, "FC1ZP"))
+    if fc2_zp is not None:
+        node_inputs[12] = "FC2ZP"
+        inits.append(_u8(fc2_zp, "FC2ZP"))
+    if router_weights:
+        while len(node_inputs) < 15:
+            node_inputs.append("")
+        node_inputs[14] = "RWEIGHTS"
+        inits.append(_f32(np.ones((tokens, num_experts), np.float32), "RWEIGHTS"))
+
+    kwargs = dict(
+        k=k,
+        activation_type=activation,
+        swiglu_fusion=swiglu_fusion,
+        expert_weight_bits=bits,
+        quant_type=quant_type,
+    )
+    if block_size:
+        kwargs["block_size"] = block_size
+    if weights_prepacked is not None:
+        kwargs["weights_prepacked"] = weights_prepacked
+    node = onnx.helper.make_node(
+        "QMoE", node_inputs, ["Y"], domain="com.microsoft", name="qmoe", **kwargs
+    )
+    graph = onnx.helper.make_graph(
+        [node, *extra_nodes],
+        "g",
+        inputs,
+        [*outputs, *extra_outputs],
+        initializer=inits,
+    )
+    model = onnx.helper.make_model(
+        graph,
+        opset_imports=[
+            onnx.helper.make_opsetid("", 18),
+            onnx.helper.make_opsetid("com.microsoft", 1),
+        ],
+    )
+    model.ir_version = 10
+    return model
+
+
+def _qmoe_router_model(
+    fc1_q,
+    fc1_scale,
+    fc2_q,
+    fc2_scale,
+    bits,
+    router_w,
+    router_b=None,
+    fc1_bias=None,
+    fc2_bias=None,
+    fc1_zp=None,
+    fc2_zp=None,
+    activation="relu",
+    k=2,
+    tokens=6,
+    use_sparse_mixer=0,
+    extra_router_consumer=False,
+    tied_router_weight_elsewhere=False,
+):
+    # Mirrors this file's own _moe_router_model -- the router expressed as
+    # an explicit MatMul/Gemm producer feeding R, needed for whole-expert
+    # pruning tests.
+    num_experts, inter, hidden_packed = fc1_q.shape
+    hidden = hidden_packed * (8 // bits)
+    inputs = [
+        onnx.helper.make_tensor_value_info(
+            "X", onnx.TensorProto.FLOAT, [tokens, hidden]
+        )
+    ]
+    outputs = [
+        onnx.helper.make_tensor_value_info(
+            "Y", onnx.TensorProto.FLOAT, [tokens, hidden]
+        )
+    ]
+    inits = [
+        _u8(fc1_q, "FC1Q"),
+        _f32(fc1_scale, "FC1S"),
+        _u8(fc2_q, "FC2Q"),
+        _f32(fc2_scale, "FC2S"),
+        _f32(router_w, "RW"),
+    ]
+    if router_b is not None:
+        router_node = onnx.helper.make_node(
+            "Gemm", ["X", "RW", "RB"], ["R"], name="router"
+        )
+        inits.append(_f32(router_b, "RB"))
+    else:
+        router_node = onnx.helper.make_node("MatMul", ["X", "RW"], ["R"], name="router")
+
+    node_inputs = ["X", "R", "FC1Q", "FC1S", "", "FC2Q", "FC2S", ""]
+    if fc1_bias is not None:
+        node_inputs[4] = "FC1B"
+        inits.append(_f32(fc1_bias, "FC1B"))
+    if fc2_bias is not None:
+        node_inputs[7] = "FC2B"
+        inits.append(_f32(fc2_bias, "FC2B"))
+    while len(node_inputs) < 13:
+        node_inputs.append("")
+    if fc1_zp is not None:
+        node_inputs[11] = "FC1ZP"
+        inits.append(_u8(fc1_zp, "FC1ZP"))
+    if fc2_zp is not None:
+        node_inputs[12] = "FC2ZP"
+        inits.append(_u8(fc2_zp, "FC2ZP"))
+
+    qmoe_node = onnx.helper.make_node(
+        "QMoE",
+        node_inputs,
+        ["Y"],
+        domain="com.microsoft",
+        name="qmoe",
+        k=k,
+        activation_type=activation,
+        expert_weight_bits=bits,
+        quant_type="int",
+        use_sparse_mixer=use_sparse_mixer,
+    )
+    nodes = [router_node, qmoe_node]
+    outs = list(outputs)
+    if extra_router_consumer:
+        nodes.append(onnx.helper.make_node("Identity", ["R"], ["R2"], name="extra"))
+        outs.append(
+            onnx.helper.make_tensor_value_info(
+                "R2", onnx.TensorProto.FLOAT, [tokens, num_experts]
+            )
+        )
+    if tied_router_weight_elsewhere:
+        nodes.append(onnx.helper.make_node("Identity", ["RW"], ["RW2"], name="tied"))
+        outs.append(
+            onnx.helper.make_tensor_value_info(
+                "RW2", onnx.TensorProto.FLOAT, list(router_w.shape)
+            )
+        )
+
+    graph = onnx.helper.make_graph(nodes, "g", inputs, outs, initializer=inits)
+    model = onnx.helper.make_model(
+        graph,
+        opset_imports=[
+            onnx.helper.make_opsetid("", 18),
+            onnx.helper.make_opsetid("com.microsoft", 1),
+        ],
+    )
+    model.ir_version = 10
+    return model
+
+
+def _qmoe_router_masking_oracle(
+    fc1_q,
+    fc1_scale,
+    fc2_q,
+    fc2_scale,
+    bits,
+    router_w,
+    router_b,
+    dropped,
+    k,
+    fc1_bias=None,
+    activation="relu",
+    tokens=6,
+):
+    # Same-shape model with every `dropped` expert's routing logit forced to
+    # -1e9 (Softmax assigns it exactly 0 probability) and its own fc1/fc2
+    # (+fc1_bias) rows zeroed -- mirrors this file's own
+    # _moe_router_masking_oracle, re-verified against a real QMoE node in
+    # test_qmoe_whole_expert_pruning_matches_ort_masking_oracle below (see
+    # onnxsim/pruning.py's own section comment, point 6-7, for why this
+    # can't simply be assumed to transfer from MoE's own already-verified
+    # version).
+    fc1_q_m = fc1_q.copy()
+    fc2_q_m = fc2_q.copy()
+    fc1_bias_m = fc1_bias.copy() if fc1_bias is not None else None
+    router_b_m = (
+        router_b.copy()
+        if router_b is not None
+        else np.zeros(fc1_q.shape[0], np.float32)
+    )
+    for e in dropped:
+        fc1_q_m[e] = 0
+        fc2_q_m[e] = 0
+        if fc1_bias_m is not None:
+            fc1_bias_m[e] = 0
+        router_b_m[e] = -1e9
+    return _qmoe_router_model(
+        fc1_q_m,
+        fc1_scale,
+        fc2_q_m,
+        fc2_scale,
+        bits,
+        router_w,
+        router_b=router_b_m,
+        fc1_bias=fc1_bias_m,
+        activation=activation,
+        k=k,
+        tokens=tokens,
+    )
+
+
+def _qmoe_inits(model):
+    return {t.name: onnx.numpy_helper.to_array(t) for t in model.graph.initializer}
+
+
+def test_qmoe_expert_channel_pruning_matches_hand_built_presliced_reference():
+    # A dedicated, independently hand-built "already pruned" reference QMoE
+    # node -- fc1/fc2 re-quantized from scratch from the *sliced* float
+    # weights (never touching onnxsim's own pruned bytes), including a
+    # non-default per-channel fc1_zero_points operand, so this exercises the
+    # packed zero_point slicing path too, not just the default-omitted case.
+    E, hidden, inter, bits, tokens = 3, 8, 12, 4, 6
+    rng = np.random.default_rng(211)
+    fc1_w = (rng.standard_normal((E, inter, hidden)) * 0.3).astype(np.float32)
+    fc2_w = (rng.standard_normal((E, hidden, inter)) * 0.3).astype(np.float32)
+    fc1_b = rng.standard_normal((E, inter)).astype(np.float32)
+    fc1_zp_vals = rng.integers(4, 12, size=(E, inter))
+
+    fc1_q, fc1_s, fc1_dq = _qmoe_quantize(fc1_w, bits, zero_point=fc1_zp_vals)
+    fc2_q, fc2_s, fc2_dq = _qmoe_quantize(fc2_w, bits)
+    fc1_zp = _pack_vals(fc1_zp_vals, bits)
+
+    model = _qmoe_model(
+        fc1_q,
+        fc1_s,
+        fc2_q,
+        fc2_s,
+        bits,
+        fc1_bias=fc1_b,
+        fc1_zp=fc1_zp,
+        k=2,
+        tokens=tokens,
+    )
+    onnx.checker.check_model(model)
+
+    pruned = onnxsim.apply_qmoe_expert_channel_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    sq = (
+        np.sum(fc1_dq**2, axis=(0, 2))
+        + np.sum(fc2_dq**2, axis=(0, 1))
+        + np.sum(fc1_b**2, axis=0)
+    )
+    keep = np.sort(np.argsort(-np.sqrt(sq))[:6])  # 12 - round(12*0.5) = 6, already a
+    # multiple of pack=2, so no flooring kicks in here (see the dedicated
+    # flooring test below).
+
+    inits = _qmoe_inits(pruned)
+    np.testing.assert_array_equal(inits["FC1Q"], fc1_q[:, keep, :])
+    np.testing.assert_array_equal(inits["FC1S"], fc1_s[:, keep])
+    np.testing.assert_array_equal(inits["FC1B"], fc1_b[:, keep])
+    np.testing.assert_array_equal(
+        inits["FC1ZP"], _pack_vals(fc1_zp_vals[:, keep], bits)
+    )
+    expected_fc2_q = _pack_vals(_unpack_vals(fc2_q, bits, inter)[:, :, keep], bits)
+    np.testing.assert_array_equal(inits["FC2Q"], expected_fc2_q)
+
+    # fc1's pruned axis (N) is a plain row drop, so re-quantizing the
+    # *sliced* float rows from scratch reproduces the exact same per-row
+    # scale (each row's own scale depends only on that row's own values).
+    # fc2's pruned axis (K = inter_size) is the *reduction* axis its own
+    # per-row scale is computed over -- re-quantizing a K-sliced fc2 would
+    # recompute a *different*, generally smaller, max-abs-derived scale
+    # than the original (dropped columns may have held that row's own max),
+    # which is *not* what this pass actually does (fc2_scales is indexed by
+    # hidden_size, untouched by an inter_size cut -- see this file's own
+    # section comment). So fc2's own reference operands are built the same
+    # way `expected_fc2_q` above was -- slicing the *already-quantized*
+    # bytes/scale, not re-deriving them -- to match production exactly.
+    fc1_q_ref, fc1_s_ref, _ = _qmoe_quantize(
+        fc1_w[:, keep, :], bits, zero_point=fc1_zp_vals[:, keep]
+    )
+    reference = _qmoe_model(
+        fc1_q_ref,
+        fc1_s_ref,
+        expected_fc2_q,
+        fc2_s,
+        bits,
+        fc1_bias=fc1_b[:, keep],
+        fc1_zp=_pack_vals(fc1_zp_vals[:, keep], bits),
+        k=2,
+        tokens=tokens,
+    )
+    onnx.checker.check_model(reference)
+
+    feed_rng = np.random.default_rng(213)
+    feeds = {
+        "X": (feed_rng.standard_normal((tokens, hidden)) * 0.2).astype(np.float32),
+        "R": feed_rng.standard_normal((tokens, E)).astype(np.float32),
+    }
+    (out_pruned,) = _run(pruned, feeds)
+    (out_ref,) = _run(reference, feeds)
+    np.testing.assert_allclose(out_pruned, out_ref, rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.parametrize("bits", [2, 8])
+def test_qmoe_expert_channel_pruning_matches_hand_built_reference_other_bit_widths(
+    bits,
+):
+    # Same hand-built-reference oracle as above, for the two other supported
+    # expert_weight_bits values (4 is covered above): bits=8 has no packing
+    # at all (pack=1, a plain index-select on both fc1/fc2), bits=2 packs
+    # four values per byte -- both go through the exact same production code
+    # path (:func:`_unpack_subbyte`/:func:`_pack_subbyte`, parametrized on
+    # `bits`), so this confirms it generalizes correctly, not just for 4.
+    E, hidden, inter, tokens = 2, 8, 8, 5
+    rng = np.random.default_rng(220 + bits)
+    fc1_w = (rng.standard_normal((E, inter, hidden)) * 0.3).astype(np.float32)
+    fc2_w = (rng.standard_normal((E, hidden, inter)) * 0.3).astype(np.float32)
+    fc1_q, fc1_s, fc1_dq = _qmoe_quantize(fc1_w, bits)
+    fc2_q, fc2_s, fc2_dq = _qmoe_quantize(fc2_w, bits)
+    model = _qmoe_model(fc1_q, fc1_s, fc2_q, fc2_s, bits, k=1, tokens=tokens)
+    onnx.checker.check_model(model)
+
+    pruned = onnxsim.apply_qmoe_expert_channel_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    sq = np.sum(fc1_dq**2, axis=(0, 2)) + np.sum(fc2_dq**2, axis=(0, 1))
+    keep = np.sort(np.argsort(-np.sqrt(sq))[:4])  # 8 - round(8*0.5) = 4
+
+    inits = _qmoe_inits(pruned)
+    np.testing.assert_array_equal(inits["FC1Q"], fc1_q[:, keep, :])
+    expected_fc2_q = _pack_vals(_unpack_vals(fc2_q, bits, inter)[:, :, keep], bits)
+    np.testing.assert_array_equal(inits["FC2Q"], expected_fc2_q)
+
+    # fc2's own scale is computed over the *full* K row -- re-quantizing a
+    # K-sliced fc2 would recompute a different scale than production ever
+    # produces (fc2_scales is untouched by this pass); see the sibling test
+    # above's own comment for the full reasoning. So fc2's reference operands
+    # reuse the already-quantized-and-sliced `expected_fc2_q`/`fc2_s` here
+    # too, not a fresh re-quantization.
+    fc1_q_ref, fc1_s_ref, _ = _qmoe_quantize(fc1_w[:, keep, :], bits)
+    reference = _qmoe_model(
+        fc1_q_ref, fc1_s_ref, expected_fc2_q, fc2_s, bits, k=1, tokens=tokens
+    )
+    onnx.checker.check_model(reference)
+
+    feed_rng = np.random.default_rng(223)
+    feeds = {
+        "X": (feed_rng.standard_normal((tokens, hidden)) * 0.2).astype(np.float32),
+        "R": feed_rng.standard_normal((tokens, E)).astype(np.float32),
+    }
+    (out_pruned,) = _run(pruned, feeds)
+    (out_ref,) = _run(reference, feeds)
+    np.testing.assert_allclose(out_pruned, out_ref, rtol=1e-5, atol=1e-5)
+
+
+def test_qmoe_expert_channel_pruning_survivor_count_floored_to_pack_multiple():
+    # inter_size=10 at bits=4 (2 values/byte, pack=2): sparsity=0.7 would
+    # naively ask for 10 - round(10*0.7) = 3 survivors -- not a multiple of
+    # pack. Confirmed empirically (see onnxsim/pruning.py's own
+    # _apply_qmoe_channel_chains comment) that a real QMoE CPU kernel has no
+    # way to represent that (it derives inter_size from fc2_experts_weights'
+    # own packed byte count alone, with no "last nibble is padding" signal),
+    # so this pass must round the survivor count *down* to the nearest
+    # multiple of pack (here, 2) rather than ever handing the kernel a
+    # partial-byte shape.
+    E, hidden, inter, bits, tokens = 2, 6, 10, 4, 5
+    rng = np.random.default_rng(229)
+    fc1_w = (rng.standard_normal((E, inter, hidden)) * 0.3).astype(np.float32)
+    fc2_w = (rng.standard_normal((E, hidden, inter)) * 0.3).astype(np.float32)
+    fc1_q, fc1_s, fc1_dq = _qmoe_quantize(fc1_w, bits)
+    fc2_q, fc2_s, fc2_dq = _qmoe_quantize(fc2_w, bits)
+    model = _qmoe_model(fc1_q, fc1_s, fc2_q, fc2_s, bits, k=1, tokens=tokens)
+    onnx.checker.check_model(model)
+
+    pruned = onnxsim.apply_qmoe_expert_channel_pruning(model, sparsity=0.7)
+    onnx.checker.check_model(pruned)  # would fail a real ORT session below if
+    # the survivor count weren't pack-aligned -- see the shape asserts too.
+
+    inits = _qmoe_inits(pruned)
+    assert inits["FC1Q"].shape == (E, 2, hidden // 2)  # floored 3 -> 2, not 3
+    assert inits["FC2Q"].shape == (E, hidden, 1)  # 2 / pack(2) == 1, exact
+
+    sq = np.sum(fc1_dq**2, axis=(0, 2)) + np.sum(fc2_dq**2, axis=(0, 1))
+    keep = np.sort(np.argsort(-np.sqrt(sq))[:2])
+    np.testing.assert_array_equal(inits["FC1Q"], fc1_q[:, keep, :])
+
+    feed_rng = np.random.default_rng(233)
+    feeds = {
+        "X": (feed_rng.standard_normal((tokens, hidden)) * 0.2).astype(np.float32),
+        "R": feed_rng.standard_normal((tokens, E)).astype(np.float32),
+    }
+    (out_pruned,) = _run(pruned, feeds)  # must not raise / must not be NaN
+    assert not np.isnan(out_pruned).any()
+
+
+def test_qmoe_expert_channel_pruning_zero_sparsity_is_a_no_op():
+    E, hidden, inter, bits = 2, 6, 8, 4
+    rng = np.random.default_rng(239)
+    fc1_w = (rng.standard_normal((E, inter, hidden)) * 0.3).astype(np.float32)
+    fc2_w = (rng.standard_normal((E, hidden, inter)) * 0.3).astype(np.float32)
+    fc1_q, fc1_s, _ = _qmoe_quantize(fc1_w, bits)
+    fc2_q, fc2_s, _ = _qmoe_quantize(fc2_w, bits)
+    model = _qmoe_model(fc1_q, fc1_s, fc2_q, fc2_s, bits)
+    pruned = onnxsim.apply_qmoe_expert_channel_pruning(model, sparsity=0.0)
+    inits = _qmoe_inits(pruned)
+    np.testing.assert_array_equal(inits["FC1Q"], fc1_q)
+    np.testing.assert_array_equal(inits["FC2Q"], fc2_q)
+
+
+def test_qmoe_expert_channel_pruning_invalid_sparsity_raises():
+    E, hidden, inter, bits = 2, 6, 8, 4
+    rng = np.random.default_rng(241)
+    fc1_w = (rng.standard_normal((E, inter, hidden)) * 0.3).astype(np.float32)
+    fc2_w = (rng.standard_normal((E, hidden, inter)) * 0.3).astype(np.float32)
+    fc1_q, fc1_s, _ = _qmoe_quantize(fc1_w, bits)
+    fc2_q, fc2_s, _ = _qmoe_quantize(fc2_w, bits)
+    model = _qmoe_model(fc1_q, fc1_s, fc2_q, fc2_s, bits)
+    with pytest.raises(ValueError):
+        onnxsim.apply_qmoe_expert_channel_pruning(model, sparsity=1.0)
+    with pytest.raises(ValueError):
+        onnxsim.apply_qmoe_expert_channel_pruning(model, sparsity=-0.1)
+
+
+def test_qmoe_expert_channel_pruning_declines_fc3():
+    # Confirmed empirically: CPU QMoE raises "FC3 gating is not yet
+    # implemented on CPU for QMoE" -- independently re-verified for QMoE,
+    # not merely inherited from plain MoE's own already-documented "FC3 is
+    # not implemented for CPU MoE" limitation.
+    E, hidden, inter, bits = 3, 6, 6, 4
+    rng = np.random.default_rng(251)
+    fc1_w = (rng.standard_normal((E, inter, hidden)) * 0.3).astype(np.float32)
+    fc2_w = (rng.standard_normal((E, hidden, inter)) * 0.3).astype(np.float32)
+    fc3_w = (rng.standard_normal((E, inter, hidden)) * 0.3).astype(np.float32)
+    fc1_q, fc1_s, _ = _qmoe_quantize(fc1_w, bits)
+    fc2_q, fc2_s, _ = _qmoe_quantize(fc2_w, bits)
+    fc3_q, fc3_s, _ = _qmoe_quantize(fc3_w, bits)
+    model = _qmoe_model(fc1_q, fc1_s, fc2_q, fc2_s, bits, fc3_q=fc3_q, fc3_scale=fc3_s)
+    onnx.checker.check_model(model)
+    pruned = onnxsim.apply_qmoe_expert_channel_pruning(model, sparsity=0.5)
+    inits = _qmoe_inits(pruned)
+    np.testing.assert_array_equal(inits["FC1Q"], fc1_q)
+    np.testing.assert_array_equal(inits["FC2Q"], fc2_q)
+
+
+def test_qmoe_expert_channel_pruning_declines_swiglu_activation():
+    E, hidden, inter, bits = 3, 6, 6, 4
+    rng = np.random.default_rng(257)
+    fc1_w = (rng.standard_normal((E, inter, hidden)) * 0.3).astype(np.float32)
+    fc2_w = (rng.standard_normal((E, hidden, inter)) * 0.3).astype(np.float32)
+    fc1_q, fc1_s, _ = _qmoe_quantize(fc1_w, bits)
+    fc2_q, fc2_s, _ = _qmoe_quantize(fc2_w, bits)
+    model = _qmoe_model(fc1_q, fc1_s, fc2_q, fc2_s, bits, activation="swiglu")
+    pruned = onnxsim.apply_qmoe_expert_channel_pruning(model, sparsity=0.5)
+    inits = _qmoe_inits(pruned)
+    np.testing.assert_array_equal(inits["FC1Q"], fc1_q)
+
+
+def test_qmoe_expert_channel_pruning_declines_nonzero_swiglu_fusion():
+    E, hidden, inter, bits = 3, 6, 6, 4
+    rng = np.random.default_rng(263)
+    fc1_w = (rng.standard_normal((E, inter, hidden)) * 0.3).astype(np.float32)
+    fc2_w = (rng.standard_normal((E, hidden, inter)) * 0.3).astype(np.float32)
+    fc1_q, fc1_s, _ = _qmoe_quantize(fc1_w, bits)
+    fc2_q, fc2_s, _ = _qmoe_quantize(fc2_w, bits)
+    model = _qmoe_model(fc1_q, fc1_s, fc2_q, fc2_s, bits, swiglu_fusion=1)
+    pruned = onnxsim.apply_qmoe_expert_channel_pruning(model, sparsity=0.5)
+    inits = _qmoe_inits(pruned)
+    np.testing.assert_array_equal(inits["FC1Q"], fc1_q)
+
+
+def test_qmoe_expert_channel_pruning_declines_block_size():
+    # block_size present (even a schema-valid value, >= 16) selects a
+    # different scale/zero_point rank this pass's own packed-slicing was
+    # never verified against -- declined outright regardless of value.
+    E, hidden, inter, bits = 2, 32, 8, 4
+    rng = np.random.default_rng(269)
+    fc1_w = (rng.standard_normal((E, inter, hidden)) * 0.3).astype(np.float32)
+    fc2_w = (rng.standard_normal((E, hidden, inter)) * 0.3).astype(np.float32)
+    fc1_q, fc1_s, _ = _qmoe_quantize(fc1_w, bits)
+    fc2_q, fc2_s, _ = _qmoe_quantize(fc2_w, bits)
+    model = _qmoe_model(fc1_q, fc1_s, fc2_q, fc2_s, bits, block_size=16)
+    pruned = onnxsim.apply_qmoe_expert_channel_pruning(model, sparsity=0.5)
+    inits = _qmoe_inits(pruned)
+    np.testing.assert_array_equal(inits["FC1Q"], fc1_q)
+
+
+def test_qmoe_expert_channel_pruning_declines_weights_prepacked_nonraw():
+    # weights_prepacked=1 selects a CUTLASS mixed-GEMM prepacked byte layout,
+    # not the raw [N, K/pack] storage this pass slices -- declined outright.
+    E, hidden, inter, bits = 2, 8, 8, 4
+    rng = np.random.default_rng(271)
+    fc1_w = (rng.standard_normal((E, inter, hidden)) * 0.3).astype(np.float32)
+    fc2_w = (rng.standard_normal((E, hidden, inter)) * 0.3).astype(np.float32)
+    fc1_q, fc1_s, _ = _qmoe_quantize(fc1_w, bits)
+    fc2_q, fc2_s, _ = _qmoe_quantize(fc2_w, bits)
+    model = _qmoe_model(fc1_q, fc1_s, fc2_q, fc2_s, bits, weights_prepacked=1)
+    pruned = onnxsim.apply_qmoe_expert_channel_pruning(model, sparsity=0.5)
+    inits = _qmoe_inits(pruned)
+    np.testing.assert_array_equal(inits["FC1Q"], fc1_q)
+
+
+def test_qmoe_expert_channel_pruning_declines_non_int_quant_type():
+    E, hidden, inter, bits = 2, 8, 8, 4
+    rng = np.random.default_rng(277)
+    fc1_w = (rng.standard_normal((E, inter, hidden)) * 0.3).astype(np.float32)
+    fc2_w = (rng.standard_normal((E, hidden, inter)) * 0.3).astype(np.float32)
+    fc1_q, fc1_s, _ = _qmoe_quantize(fc1_w, bits)
+    fc2_q, fc2_s, _ = _qmoe_quantize(fc2_w, bits)
+    model = _qmoe_model(fc1_q, fc1_s, fc2_q, fc2_s, bits, quant_type="fp8")
+    pruned = onnxsim.apply_qmoe_expert_channel_pruning(model, sparsity=0.5)
+    inits = _qmoe_inits(pruned)
+    np.testing.assert_array_equal(inits["FC1Q"], fc1_q)
+
+
+def test_qmoe_expert_channel_pruning_declines_router_weights_present():
+    E, hidden, inter, bits = 2, 8, 8, 4
+    rng = np.random.default_rng(281)
+    fc1_w = (rng.standard_normal((E, inter, hidden)) * 0.3).astype(np.float32)
+    fc2_w = (rng.standard_normal((E, hidden, inter)) * 0.3).astype(np.float32)
+    fc1_q, fc1_s, _ = _qmoe_quantize(fc1_w, bits)
+    fc2_q, fc2_s, _ = _qmoe_quantize(fc2_w, bits)
+    model = _qmoe_model(fc1_q, fc1_s, fc2_q, fc2_s, bits, router_weights=True)
+    pruned = onnxsim.apply_qmoe_expert_channel_pruning(model, sparsity=0.5)
+    inits = _qmoe_inits(pruned)
+    np.testing.assert_array_equal(inits["FC1Q"], fc1_q)
+
+
+def test_qmoe_expert_channel_pruning_declines_tied_fc1_weight():
+    E, hidden, inter, bits = 3, 6, 6, 4
+    rng = np.random.default_rng(283)
+    fc1_w = (rng.standard_normal((E, inter, hidden)) * 0.3).astype(np.float32)
+    fc2_w = (rng.standard_normal((E, hidden, inter)) * 0.3).astype(np.float32)
+    fc1_q, fc1_s, _ = _qmoe_quantize(fc1_w, bits)
+    fc2_q, fc2_s, _ = _qmoe_quantize(fc2_w, bits)
+    model = _qmoe_model(
+        fc1_q,
+        fc1_s,
+        fc2_q,
+        fc2_s,
+        bits,
+        extra_nodes=[onnx.helper.make_node("Identity", ["FC1Q"], ["Z"], name="tied")],
+        extra_outputs=[
+            onnx.helper.make_tensor_value_info(
+                "Z", onnx.TensorProto.UINT8, list(fc1_q.shape)
+            )
+        ],
+    )
+    pruned = onnxsim.apply_qmoe_expert_channel_pruning(model, sparsity=0.5)
+    inits = _qmoe_inits(pruned)
+    np.testing.assert_array_equal(inits["FC1Q"], fc1_q)
+
+
+def test_qmoe_expert_channel_pruning_declines_non_constant_weight():
+    E, hidden, inter, bits = 3, 6, 6, 4
+    rng = np.random.default_rng(293)
+    fc2_w = (rng.standard_normal((E, hidden, inter)) * 0.3).astype(np.float32)
+    fc1_q_shape = (E, inter, hidden // 2)
+    fc1_q_dummy = np.zeros(fc1_q_shape, dtype=np.uint8)
+    fc1_s_dummy = np.ones((E, inter), dtype=np.float32)
+    fc2_q, fc2_s, _ = _qmoe_quantize(fc2_w, bits)
+    model = _qmoe_model(
+        fc1_q_dummy, fc1_s_dummy, fc2_q, fc2_s, bits, fc1_q_as_input=True
+    )
+    pruned = onnxsim.apply_qmoe_expert_channel_pruning(model, sparsity=0.5)
+    inits = _qmoe_inits(pruned)
+    np.testing.assert_array_equal(inits["FC2Q"], fc2_q)
+
+
+def test_qmoe_expert_channel_pruning_multiple_nodes_pruned_independently():
+    E1, hidden1, inter1, bits = 3, 8, 6, 4
+    E2, hidden2, inter2 = 2, 8, 8
+    rng = np.random.default_rng(307)
+    fc1_w1 = (rng.standard_normal((E1, inter1, hidden1)) * 0.3).astype(np.float32)
+    fc2_w1 = (rng.standard_normal((E1, hidden1, inter1)) * 0.3).astype(np.float32)
+    fc1_w2 = (rng.standard_normal((E2, inter2, hidden2)) * 0.3).astype(np.float32)
+    fc2_w2 = (rng.standard_normal((E2, hidden2, inter2)) * 0.3).astype(np.float32)
+    fc1_q1, fc1_s1, _ = _qmoe_quantize(fc1_w1, bits)
+    fc2_q1, fc2_s1, _ = _qmoe_quantize(fc2_w1, bits)
+    fc1_q2, fc1_s2, _ = _qmoe_quantize(fc1_w2, bits)
+    fc2_q2, fc2_s2, _ = _qmoe_quantize(fc2_w2, bits)
+
+    inputs = [
+        onnx.helper.make_tensor_value_info("X1", onnx.TensorProto.FLOAT, [6, hidden1]),
+        onnx.helper.make_tensor_value_info("R1", onnx.TensorProto.FLOAT, [6, E1]),
+        onnx.helper.make_tensor_value_info("X2", onnx.TensorProto.FLOAT, [6, hidden2]),
+        onnx.helper.make_tensor_value_info("R2", onnx.TensorProto.FLOAT, [6, E2]),
+    ]
+    outputs = [
+        onnx.helper.make_tensor_value_info("Y1", onnx.TensorProto.FLOAT, [6, hidden1]),
+        onnx.helper.make_tensor_value_info("Y2", onnx.TensorProto.FLOAT, [6, hidden2]),
+    ]
+    nodes = [
+        onnx.helper.make_node(
+            "QMoE",
+            ["X1", "R1", "FC1Q1", "FC1S1", "", "FC2Q1", "FC2S1", ""],
+            ["Y1"],
+            domain="com.microsoft",
+            name="qmoe1",
+            k=1,
+            activation_type="relu",
+            expert_weight_bits=bits,
+            quant_type="int",
+        ),
+        onnx.helper.make_node(
+            "QMoE",
+            ["X2", "R2", "FC1Q2", "FC1S2", "", "FC2Q2", "FC2S2", ""],
+            ["Y2"],
+            domain="com.microsoft",
+            name="qmoe2",
+            k=1,
+            activation_type="relu",
+            expert_weight_bits=bits,
+            quant_type="int",
+        ),
+    ]
+    inits = [
+        _u8(fc1_q1, "FC1Q1"),
+        _f32(fc1_s1, "FC1S1"),
+        _u8(fc2_q1, "FC2Q1"),
+        _f32(fc2_s1, "FC2S1"),
+        _u8(fc1_q2, "FC1Q2"),
+        _f32(fc1_s2, "FC1S2"),
+        _u8(fc2_q2, "FC2Q2"),
+        _f32(fc2_s2, "FC2S2"),
+    ]
+    graph = onnx.helper.make_graph(nodes, "g", inputs, outputs, initializer=inits)
+    model = onnx.helper.make_model(
+        graph,
+        opset_imports=[
+            onnx.helper.make_opsetid("", 18),
+            onnx.helper.make_opsetid("com.microsoft", 1),
+        ],
+    )
+    model.ir_version = 10
+    onnx.checker.check_model(model)
+
+    pruned = onnxsim.apply_qmoe_expert_channel_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    inits_out = _qmoe_inits(pruned)
+    # inter1=6, sparsity=0.5 -> 6 - round(6*0.5) = 3, floored to the nearest
+    # multiple of pack=2 -> 2. inter2=8 -> 8 - round(8*0.5) = 4, already a
+    # multiple of 2 -> stays 4.
+    assert inits_out["FC1Q1"].shape == (E1, 2, hidden1 // 2)
+    assert inits_out["FC1Q2"].shape == (E2, 4, hidden2 // 2)
+
+
+def test_qmoe_whole_expert_pruning_matches_ort_masking_oracle():
+    E, hidden, inter, bits, tokens = 5, 8, 6, 4, 10
+    rng = np.random.default_rng(101)
+    fc1_w = (rng.standard_normal((E, inter, hidden)) * 0.3).astype(np.float32)
+    fc2_w = (rng.standard_normal((E, hidden, inter)) * 0.3).astype(np.float32)
+    fc1_b = rng.standard_normal((E, inter)).astype(np.float32)
+    router_w = (rng.standard_normal((hidden, E)) * 0.2).astype(np.float32)
+    router_b = rng.standard_normal(E).astype(np.float32)
+    k = 2
+    fc1_q, fc1_s, _ = _qmoe_quantize(fc1_w, bits)
+    fc2_q, fc2_s, _ = _qmoe_quantize(fc2_w, bits)
+    model = _qmoe_router_model(
+        fc1_q,
+        fc1_s,
+        fc2_q,
+        fc2_s,
+        bits,
+        router_w,
+        router_b=router_b,
+        fc1_bias=fc1_b,
+        k=k,
+        tokens=tokens,
+    )
+    onnx.checker.check_model(model)
+
+    calib_rng = np.random.default_rng(103)
+    calibration_data = [
+        {"X": calib_rng.standard_normal((tokens, hidden)).astype(np.float32)}
+        for _ in range(4)
+    ]
+    pruned = onnxsim.apply_qmoe_whole_expert_pruning(
+        model, calibration_data=calibration_data, sparsity=0.4
+    )
+    onnx.checker.check_model(pruned)
+    inits = _qmoe_inits(pruned)
+    assert inits["FC1Q"].shape == (3, inter, hidden // 2)
+    assert inits["RW"].shape == (hidden, 3)
+    assert inits["FC1B"].shape == (3, inter)
+
+    kept_router_w = inits["RW"]
+    dropped = [
+        e
+        for e in range(E)
+        if not any(np.allclose(router_w[:, e], kept_router_w[:, i]) for i in range(3))
+    ]
+    assert len(dropped) == 2
+    masked = _qmoe_router_masking_oracle(
+        fc1_q,
+        fc1_s,
+        fc2_q,
+        fc2_s,
+        bits,
+        router_w,
+        router_b,
+        dropped,
+        k,
+        fc1_bias=fc1_b,
+        tokens=tokens,
+    )
+    onnx.checker.check_model(masked)
+
+    feed_rng = np.random.default_rng(107)
+    feeds = {"X": feed_rng.standard_normal((tokens, hidden)).astype(np.float32) * 0.3}
+    (out_pruned,) = _run(pruned, feeds)
+    (out_masked,) = _run(masked, feeds)
+    np.testing.assert_allclose(out_pruned, out_masked, rtol=1e-4, atol=1e-4)
+
+
+def test_qmoe_whole_expert_pruning_normalize_routing_weights_is_a_noop_on_cpu():
+    # Regression test for the surprising finding documented in
+    # onnxsim/pruning.py's own section comment (point 6): QMoE's
+    # normalize_routing_weights attribute is a no-op on this environment's
+    # CPU kernel (it always renormalizes top-k gate weights), unlike plain
+    # MoE where the attribute genuinely switches gating behavior. Confirms
+    # the masking-equivalence oracle still holds exactly regardless of what
+    # normalize_routing_weights says on the *original* (pre-pruning) node --
+    # 0 and 1 must both match the same masking oracle to the same tight
+    # tolerance.
+    E, hidden, inter, bits, tokens = 4, 6, 4, 4, 6
+    rng = np.random.default_rng(311)
+    fc1_w = (rng.standard_normal((E, inter, hidden)) * 0.3).astype(np.float32)
+    fc2_w = (rng.standard_normal((E, hidden, inter)) * 0.3).astype(np.float32)
+    router_w = (rng.standard_normal((hidden, E)) * 0.2).astype(np.float32)
+    router_b = rng.standard_normal(E).astype(np.float32)
+    k = 2
+    fc1_q, fc1_s, _ = _qmoe_quantize(fc1_w, bits)
+    fc2_q, fc2_s, _ = _qmoe_quantize(fc2_w, bits)
+
+    feed_rng = np.random.default_rng(313)
+    feeds = {"X": feed_rng.standard_normal((tokens, hidden)).astype(np.float32) * 0.3}
+
+    outputs = {}
+    for normalize in (0, 1):
+        model = _qmoe_router_model(
+            fc1_q,
+            fc1_s,
+            fc2_q,
+            fc2_s,
+            bits,
+            router_w,
+            router_b=router_b,
+            k=k,
+            tokens=tokens,
+        )
+        # normalize_routing_weights isn't one of _qmoe_router_model's own
+        # parameters (this pass never reads it -- see the section comment)
+        # so it's patched onto the node directly here, deliberately, to
+        # probe the *raw op*'s own behavior independent of this pass.
+        for node in model.graph.node:
+            if node.op_type == "QMoE":
+                node.attribute.append(
+                    onnx.helper.make_attribute("normalize_routing_weights", normalize)
+                )
+        outputs[normalize] = _run(model, feeds)[0]
+
+    np.testing.assert_array_equal(outputs[0], outputs[1])
+
+
+def test_qmoe_whole_expert_pruning_adversarial_low_usage_expert_dropped():
+    # Conflicting router-usage profiles: expert 0's router bias is large and
+    # positive (dominant -- high gate weight on nearly every token), expert
+    # (E-1)'s is large and negative (near-zero mean gate weight). At
+    # sparsity=1/E (drop exactly one), the low-usage expert must be dropped,
+    # not the dominant one -- catches an inverted-comparison ranking bug.
+    E, hidden, inter, bits, tokens = 4, 6, 6, 4, 8
+    rng = np.random.default_rng(317)
+    fc1_w = (rng.standard_normal((E, inter, hidden)) * 0.3).astype(np.float32)
+    fc2_w = (rng.standard_normal((E, hidden, inter)) * 0.3).astype(np.float32)
+    router_w = (rng.standard_normal((hidden, E)) * 0.05).astype(np.float32)
+    router_b = rng.standard_normal(E).astype(np.float32) * 0.1
+    router_b[0] = 20.0
+    router_b[E - 1] = -20.0
+    fc1_q, fc1_s, _ = _qmoe_quantize(fc1_w, bits)
+    fc2_q, fc2_s, _ = _qmoe_quantize(fc2_w, bits)
+    model = _qmoe_router_model(
+        fc1_q,
+        fc1_s,
+        fc2_q,
+        fc2_s,
+        bits,
+        router_w,
+        router_b=router_b,
+        k=2,
+        tokens=tokens,
+    )
+    onnx.checker.check_model(model)
+
+    calib_rng = np.random.default_rng(319)
+    calibration_data = [
+        {"X": calib_rng.standard_normal((tokens, hidden)).astype(np.float32)}
+        for _ in range(6)
+    ]
+    pruned = onnxsim.apply_qmoe_whole_expert_pruning(
+        model, calibration_data=calibration_data, sparsity=1.0 / E
+    )
+    inits = _qmoe_inits(pruned)
+    assert inits["FC1Q"].shape[0] == E - 1
+    kept_router_w = inits["RW"]
+    survivors = [
+        e
+        for e in range(E)
+        if any(np.allclose(router_w[:, e], kept_router_w[:, i]) for i in range(E - 1))
+    ]
+    assert (E - 1) not in survivors
+    assert 0 in survivors
+
+
+def test_qmoe_whole_expert_pruning_k_is_floored_not_exceeded():
+    E, hidden, inter, bits, tokens = 5, 6, 4, 4, 6
+    rng = np.random.default_rng(331)
+    fc1_w = (rng.standard_normal((E, inter, hidden)) * 0.3).astype(np.float32)
+    fc2_w = (rng.standard_normal((E, hidden, inter)) * 0.3).astype(np.float32)
+    router_w = (rng.standard_normal((hidden, E)) * 0.2).astype(np.float32)
+    fc1_q, fc1_s, _ = _qmoe_quantize(fc1_w, bits)
+    fc2_q, fc2_s, _ = _qmoe_quantize(fc2_w, bits)
+    k = 3
+    model = _qmoe_router_model(
+        fc1_q, fc1_s, fc2_q, fc2_s, bits, router_w, k=k, tokens=tokens
+    )
+    onnx.checker.check_model(model)
+    pruned = onnxsim.apply_qmoe_whole_expert_pruning(
+        model,
+        calibration_data=[],
+        sparsity=0.9,  # would ask for 0 or 1 survivors
+    )
+    inits = _qmoe_inits(pruned)
+    assert inits["FC1Q"].shape[0] == k  # floored at k=3, not 0 or 1
+
+
+def test_qmoe_whole_expert_pruning_zero_sparsity_is_a_no_op():
+    E, hidden, inter, bits = 3, 6, 4, 4
+    rng = np.random.default_rng(337)
+    fc1_w = (rng.standard_normal((E, inter, hidden)) * 0.3).astype(np.float32)
+    fc2_w = (rng.standard_normal((E, hidden, inter)) * 0.3).astype(np.float32)
+    router_w = (rng.standard_normal((hidden, E)) * 0.2).astype(np.float32)
+    fc1_q, fc1_s, _ = _qmoe_quantize(fc1_w, bits)
+    fc2_q, fc2_s, _ = _qmoe_quantize(fc2_w, bits)
+    model = _qmoe_router_model(fc1_q, fc1_s, fc2_q, fc2_s, bits, router_w)
+    pruned = onnxsim.apply_qmoe_whole_expert_pruning(
+        model, calibration_data=[], sparsity=0.0
+    )
+    inits = _qmoe_inits(pruned)
+    np.testing.assert_array_equal(inits["FC1Q"], fc1_q)
+    np.testing.assert_array_equal(inits["RW"], router_w)
+
+
+def test_qmoe_whole_expert_pruning_invalid_sparsity_raises():
+    E, hidden, inter, bits = 3, 6, 4, 4
+    rng = np.random.default_rng(347)
+    fc1_w = (rng.standard_normal((E, inter, hidden)) * 0.3).astype(np.float32)
+    fc2_w = (rng.standard_normal((E, hidden, inter)) * 0.3).astype(np.float32)
+    router_w = (rng.standard_normal((hidden, E)) * 0.2).astype(np.float32)
+    fc1_q, fc1_s, _ = _qmoe_quantize(fc1_w, bits)
+    fc2_q, fc2_s, _ = _qmoe_quantize(fc2_w, bits)
+    model = _qmoe_router_model(fc1_q, fc1_s, fc2_q, fc2_s, bits, router_w)
+    with pytest.raises(ValueError):
+        onnxsim.apply_qmoe_whole_expert_pruning(
+            model, calibration_data=[], sparsity=1.0
+        )
+    with pytest.raises(ValueError):
+        onnxsim.apply_qmoe_whole_expert_pruning(
+            model, calibration_data=[], sparsity=-0.1
+        )
+
+
+def test_qmoe_whole_expert_pruning_empty_calibration_falls_back_to_weight_norm():
+    E, hidden, inter, bits = 4, 6, 4, 4
+    rng = np.random.default_rng(353)
+    fc1_w = (rng.standard_normal((E, inter, hidden)) * 0.05).astype(np.float32)
+    fc2_w = (rng.standard_normal((E, hidden, inter)) * 0.05).astype(np.float32)
+    fc1_w[0] *= 20.0  # dominant weight norm
+    fc2_w[0] *= 20.0
+    fc1_w[E - 1] *= 0.01  # tiny weight norm
+    fc2_w[E - 1] *= 0.01
+    router_w = (rng.standard_normal((hidden, E)) * 0.2).astype(np.float32)
+    fc1_q, fc1_s, _ = _qmoe_quantize(fc1_w, bits)
+    fc2_q, fc2_s, _ = _qmoe_quantize(fc2_w, bits)
+    model = _qmoe_router_model(fc1_q, fc1_s, fc2_q, fc2_s, bits, router_w, k=2)
+    pruned = onnxsim.apply_qmoe_whole_expert_pruning(
+        model, calibration_data=[], sparsity=1.0 / E
+    )
+    inits = _qmoe_inits(pruned)
+    kept_router_w = inits["RW"]
+    survivors = [
+        e
+        for e in range(E)
+        if any(np.allclose(router_w[:, e], kept_router_w[:, i]) for i in range(E - 1))
+    ]
+    assert (E - 1) not in survivors  # smallest weight norm -- dropped
+    assert 0 in survivors  # largest weight norm -- kept
+
+
+def test_qmoe_whole_expert_pruning_declines_use_sparse_mixer():
+    E, hidden, inter, bits = 4, 6, 4, 4
+    rng = np.random.default_rng(359)
+    fc1_w = (rng.standard_normal((E, inter, hidden)) * 0.3).astype(np.float32)
+    fc2_w = (rng.standard_normal((E, hidden, inter)) * 0.3).astype(np.float32)
+    router_w = (rng.standard_normal((hidden, E)) * 0.2).astype(np.float32)
+    fc1_q, fc1_s, _ = _qmoe_quantize(fc1_w, bits)
+    fc2_q, fc2_s, _ = _qmoe_quantize(fc2_w, bits)
+    model = _qmoe_router_model(
+        fc1_q, fc1_s, fc2_q, fc2_s, bits, router_w, k=2, use_sparse_mixer=1
+    )
+    onnx.checker.check_model(model)
+    pruned = onnxsim.apply_qmoe_whole_expert_pruning(
+        model, calibration_data=[], sparsity=0.5
+    )
+    inits = _qmoe_inits(pruned)
+    np.testing.assert_array_equal(inits["FC1Q"], fc1_q)
+
+
+def test_qmoe_whole_expert_pruning_declines_router_with_extra_consumer():
+    E, hidden, inter, bits = 4, 6, 4, 4
+    rng = np.random.default_rng(367)
+    fc1_w = (rng.standard_normal((E, inter, hidden)) * 0.3).astype(np.float32)
+    fc2_w = (rng.standard_normal((E, hidden, inter)) * 0.3).astype(np.float32)
+    router_w = (rng.standard_normal((hidden, E)) * 0.2).astype(np.float32)
+    fc1_q, fc1_s, _ = _qmoe_quantize(fc1_w, bits)
+    fc2_q, fc2_s, _ = _qmoe_quantize(fc2_w, bits)
+    model = _qmoe_router_model(
+        fc1_q, fc1_s, fc2_q, fc2_s, bits, router_w, k=2, extra_router_consumer=True
+    )
+    onnx.checker.check_model(model)
+    pruned = onnxsim.apply_qmoe_whole_expert_pruning(
+        model, calibration_data=[], sparsity=0.5
+    )
+    inits = _qmoe_inits(pruned)
+    np.testing.assert_array_equal(inits["FC1Q"], fc1_q)
+
+
+def test_qmoe_whole_expert_pruning_declines_tied_router_weight():
+    E, hidden, inter, bits = 4, 6, 4, 4
+    rng = np.random.default_rng(373)
+    fc1_w = (rng.standard_normal((E, inter, hidden)) * 0.3).astype(np.float32)
+    fc2_w = (rng.standard_normal((E, hidden, inter)) * 0.3).astype(np.float32)
+    router_w = (rng.standard_normal((hidden, E)) * 0.2).astype(np.float32)
+    fc1_q, fc1_s, _ = _qmoe_quantize(fc1_w, bits)
+    fc2_q, fc2_s, _ = _qmoe_quantize(fc2_w, bits)
+    model = _qmoe_router_model(
+        fc1_q,
+        fc1_s,
+        fc2_q,
+        fc2_s,
+        bits,
+        router_w,
+        k=2,
+        tied_router_weight_elsewhere=True,
+    )
+    onnx.checker.check_model(model)
+    pruned = onnxsim.apply_qmoe_whole_expert_pruning(
+        model, calibration_data=[], sparsity=0.5
+    )
+    inits = _qmoe_inits(pruned)
+    np.testing.assert_array_equal(inits["FC1Q"], fc1_q)
+
+
+def test_qmoe_whole_expert_pruning_multiple_nodes_pruned_independently():
+    E1, hidden1, inter1, bits = 4, 4, 6, 4
+    E2, hidden2, inter2 = 3, 6, 4
+    rng = np.random.default_rng(191)
+    fc1_w1 = (rng.standard_normal((E1, inter1, hidden1)) * 0.3).astype(np.float32)
+    fc2_w1 = (rng.standard_normal((E1, hidden1, inter1)) * 0.3).astype(np.float32)
+    router_w1 = (rng.standard_normal((hidden1, E1)) * 0.2).astype(np.float32)
+    fc1_w2 = (rng.standard_normal((E2, inter2, hidden2)) * 0.3).astype(np.float32)
+    fc2_w2 = (rng.standard_normal((E2, hidden2, inter2)) * 0.3).astype(np.float32)
+    router_w2 = (rng.standard_normal((hidden2, E2)) * 0.2).astype(np.float32)
+    fc1_q1, fc1_s1, _ = _qmoe_quantize(fc1_w1, bits)
+    fc2_q1, fc2_s1, _ = _qmoe_quantize(fc2_w1, bits)
+    fc1_q2, fc1_s2, _ = _qmoe_quantize(fc1_w2, bits)
+    fc2_q2, fc2_s2, _ = _qmoe_quantize(fc2_w2, bits)
+
+    inputs = [
+        onnx.helper.make_tensor_value_info("X1", onnx.TensorProto.FLOAT, [6, hidden1]),
+        onnx.helper.make_tensor_value_info("X2", onnx.TensorProto.FLOAT, [6, hidden2]),
+    ]
+    outputs = [
+        onnx.helper.make_tensor_value_info("Y1", onnx.TensorProto.FLOAT, [6, hidden1]),
+        onnx.helper.make_tensor_value_info("Y2", onnx.TensorProto.FLOAT, [6, hidden2]),
+    ]
+    nodes = [
+        onnx.helper.make_node("MatMul", ["X1", "RW1"], ["R1"], name="router1"),
+        onnx.helper.make_node(
+            "QMoE",
+            ["X1", "R1", "FC1Q1", "FC1S1", "", "FC2Q1", "FC2S1", ""],
+            ["Y1"],
+            domain="com.microsoft",
+            name="qmoe1",
+            k=1,
+            activation_type="relu",
+            expert_weight_bits=bits,
+            quant_type="int",
+        ),
+        onnx.helper.make_node("MatMul", ["X2", "RW2"], ["R2"], name="router2"),
+        onnx.helper.make_node(
+            "QMoE",
+            ["X2", "R2", "FC1Q2", "FC1S2", "", "FC2Q2", "FC2S2", ""],
+            ["Y2"],
+            domain="com.microsoft",
+            name="qmoe2",
+            k=1,
+            activation_type="relu",
+            expert_weight_bits=bits,
+            quant_type="int",
+        ),
+    ]
+    inits = [
+        _u8(fc1_q1, "FC1Q1"),
+        _f32(fc1_s1, "FC1S1"),
+        _u8(fc2_q1, "FC2Q1"),
+        _f32(fc2_s1, "FC2S1"),
+        _f32(router_w1, "RW1"),
+        _u8(fc1_q2, "FC1Q2"),
+        _f32(fc1_s2, "FC1S2"),
+        _u8(fc2_q2, "FC2Q2"),
+        _f32(fc2_s2, "FC2S2"),
+        _f32(router_w2, "RW2"),
+    ]
+    graph = onnx.helper.make_graph(nodes, "g", inputs, outputs, initializer=inits)
+    model = onnx.helper.make_model(
+        graph,
+        opset_imports=[
+            onnx.helper.make_opsetid("", 18),
+            onnx.helper.make_opsetid("com.microsoft", 1),
+        ],
+    )
+    model.ir_version = 10
+    onnx.checker.check_model(model)
+    pruned = onnxsim.apply_qmoe_whole_expert_pruning(
+        model, calibration_data=[], sparsity=0.5
+    )
+    onnx.checker.check_model(pruned)
+    inits_out = _qmoe_inits(pruned)
+    assert inits_out["FC1Q1"].shape == (2, inter1, hidden1 // 2)  # 4 - round(4*0.5) = 2
+    assert inits_out["RW1"].shape == (hidden1, 2)
+    assert inits_out["FC1Q2"].shape == (1, inter2, hidden2 // 2)  # 3 - round(3*0.5) = 1
+    assert inits_out["RW2"].shape == (hidden2, 1)
+
+
 # --- FP16/BFloat16 weight support -----------------------------------------
 #
 # Every matcher in this module used to hard-require ``onnx.TensorProto.
