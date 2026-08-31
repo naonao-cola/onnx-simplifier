@@ -975,6 +975,29 @@ def _match_conv_weight_only(
     standard grouped-Conv well-formedness requirement (`group` equal-sized
     output blocks) that :func:`_conv_group_relative_norm` also relies on to
     line up each output filter with its own group's input-channel slice.
+
+    Deliberately still 2-D-only (``len(w_init.dims) != 4``, not the ``>= 3``
+    :func:`_match_conv_producer`/:func:`_match_conv_consumer` now accept for
+    *structural* channel pruning): this module's calibration machinery for
+    Wanda (:func:`_conv_spatial_attrs`/:func:`_conv_patch_sq_sum`) and
+    SparseGPT (:func:`_conv_im2col_patches`, plus an unconditional
+    ``cout, cin_per_group, kh, kw = w.shape`` unpack in
+    :func:`apply_sparsegpt_pruning`'s own body) hard-codes exactly two
+    spatial dims throughout its own im2col-style patch unfolding -- padding
+    fields (`pad_top`/`pad_left`/`pad_bottom`/`pad_right`),
+    stride/dilation pairs, and per-tap loops all assume `n=2`. Generalizing
+    that to N spatial dims is a materially bigger, more invasive rewrite
+    than the structural side's own "the slicing never touches spatial axes
+    at all" generalization, and risks silently changing already-verified
+    2-D numeric behavior in the process -- so it is explicitly left out of
+    scope here (a Conv1d/Conv3d weight is declined, `None`, not silently
+    mismatched or crashed on) rather than attempted alongside the
+    structural generalization above. Plain :func:`apply_magnitude_pruning`
+    itself needs no im2col calibration at all (its own metric is `|W|`,
+    computed the same way regardless of spatial rank) and *could* be
+    generalized cheaply on its own, but is kept at this same 2-D-only bar
+    for consistency -- one matcher, one scope boundary, shared by all three
+    calibration-based callers -- rather than silently diverging per-caller.
     """
     if node.op_type != "Conv" or len(node.input) < 2:
         return None
@@ -2549,6 +2572,22 @@ class _Producer:
     # axis), so this only changes how :func:`_apply_chains` picks `keep`,
     # never how the producer's own weight is sliced.
     group: int = 1
+    # True for a ``ConvTranspose`` producer (see
+    # :func:`_match_conv_transpose_producer`) -- `is_conv` is *also* True
+    # then (still Conv-style ellipsis slicing, not a MatMul/Gemm 2-D one),
+    # this just further selects *which* axis is the output-channel one.
+    # ``ConvTranspose``'s own weight layout is ``[in_channels, out_channels
+    # /group, k1, ..., kn]`` -- confirmed live via
+    # ``onnx.defs.get_schema("ConvTranspose")`` -- the reverse of ``Conv``'s
+    # ``[out_channels, in_channels/group, ...]``: output channels live on
+    # axis 1, not axis 0. Every caller that slices/reshapes this producer's
+    # own weight by its output-channel axis (:func:`_slice_producer_weight`,
+    # :func:`_producer_weight_nk`) consults this flag to use axis 1 instead
+    # of axis 0. Only an ordinary (``group == 1``) ``ConvTranspose`` is ever
+    # matched as a producer (see :func:`_match_conv_transpose_producer`'s
+    # own docstring for why a grouped one is declined) -- `group` above is
+    # therefore always 1 whenever this is True.
+    is_conv_transpose: bool = False
 
 
 @dataclass(frozen=True)
@@ -2596,6 +2635,23 @@ class _Chain:
     # :func:`_chain_group`) and the dedicated slicing
     # :func:`_slice_grouped_consumer_conv_weight` performs.
     consumer_group: int = 1
+    # True for a ``ConvTranspose`` consumer (see
+    # :func:`_match_conv_transpose_consumer`, only ever set by
+    # :func:`_find_conv_chains` -- every other Conv-chain finder in this
+    # module (residual/merge groups, Concat-branch merges) still declines a
+    # ``ConvTranspose`` consumer outright, see
+    # :func:`_walk_to_conv_consumer`'s own `allow_conv_transpose_consumer`
+    # parameter). `consumer_is_conv` is *also* True then; this just further
+    # selects which axis is the input-channel one. Unlike ``Conv``'s
+    # grouped consumer (axis 1, per-group-relative), a ``ConvTranspose``
+    # consumer's own input-channel axis is axis 0, which spans the *full*
+    # `in_channels` regardless of `consumer_group` (grouping only ever
+    # splits axis 1 -- the *output* side -- for ``ConvTranspose``, the
+    # mirror image of ``Conv``): see :func:`_match_conv_transpose_consumer`'s
+    # own docstring for why this makes a plain, flat ``w[keep, ...]`` (not
+    # :func:`_slice_grouped_consumer_conv_weight`) correct here even when
+    # `consumer_group` is > 1.
+    consumer_is_conv_transpose: bool = False
     # Extra, independent downstream consumer branches beyond the "primary"
     # one already carried on this chain's own singular `consumer_*` fields
     # above -- populated only by :func:`_find_conv_residual_chains`/
@@ -2916,10 +2972,20 @@ def _match_conv_producer(
 ) -> Optional[Tuple[str, Optional[str], int, int]]:
     """If `node` is an ordinary (``group=1``) *or* a general grouped
     (``1 < group < in_channels``, ``group != out_channels`` -- see this
-    module's own docstring) 2-D ``Conv`` with a constant 4-D float32
-    ``[out_channels, in_channels/group, kH, kW]`` weight (and, if present, a
-    constant bias), returns
-    ``(weight_name, bias_name_or_None, out_channels, group)``. A depthwise
+    module's own docstring) ``Conv`` -- 1-D, 2-D, or 3-D alike, i.e. any
+    spatial rank ``n >= 1`` -- with a constant ``[out_channels,
+    in_channels/group, k1, ..., kn]`` float32/float16/bfloat16 weight (and,
+    if present, a constant bias), returns
+    ``(weight_name, bias_name_or_None, out_channels, group)``. Only the
+    weight's own *rank* (``>= 3``: one output-channel axis, one
+    input-channel axis, at least one spatial axis) is checked here --
+    exactly the same schema-documented ``[M, C/group, k1, ..., kn]`` layout
+    for any ``n`` (confirmed live via ``onnx.defs.get_schema("Conv")``), not
+    a 2-D-specific one -- since every slicing/importance computation this
+    producer role ever drives (:func:`_slice_producer_weight`,
+    :func:`_producer_weight_nk`) already only ever touches axis 0 and
+    leaves every remaining axis (spatial or not) alone via ``...``/``-1``,
+    with no assumption about how many of them there are. A depthwise
     Conv (``group == in_channels == out_channels``) never matches: even
     though it *is* given a narrower exception elsewhere in this pass, as a
     transparent pass-through hop the chain walk may cross between two real
@@ -2941,7 +3007,7 @@ def _match_conv_producer(
     if (
         w_init is None
         or not _is_supported_float_dtype(w_init.data_type)
-        or len(w_init.dims) != 4
+        or len(w_init.dims) < 3
     ):
         return None
     group = _conv_group(node)
@@ -2964,12 +3030,71 @@ def _match_conv_producer(
     return w_name, bias_name, out_channels, group
 
 
+def _match_conv_transpose_producer(
+    node: onnx.NodeProto, initializer_map: Dict[str, onnx.TensorProto]
+) -> Optional[Tuple[str, Optional[str], int, int]]:
+    """The ``ConvTranspose`` analogue of :func:`_match_conv_producer`. If
+    `node` is an ordinary (``group == 1``) ``ConvTranspose`` with a constant
+    ``[in_channels, out_channels/group, k1, ..., kn]`` (``n >= 1``)
+    float32/float16/bfloat16 weight (and, if present, a constant bias),
+    returns ``(weight_name, bias_name_or_None, out_channels, group=1)``.
+
+    ``ConvTranspose``'s own weight layout is the schema-documented
+    ``[C, M/group, k1, ..., kn]`` -- confirmed live via
+    ``onnx.defs.get_schema("ConvTranspose")`` -- the *reverse* of ``Conv``'s
+    ``[M, C/group, ...]``: input channels (``C``) come first, this node's
+    own *output* channels (``M``, what "producer" means here -- the count
+    downstream layers' input-channel dimension must match) live on axis 1,
+    not axis 0. Every caller that slices/reshapes this producer's weight by
+    its own output-channel axis (:func:`_slice_producer_weight`,
+    :func:`_producer_weight_nk`) is told this via the returned `_Producer`'s
+    own ``is_conv_transpose=True`` flag (set by :func:`_find_conv_chains`,
+    the only caller of this function), and uses axis 1 instead of axis 0.
+
+    Deliberately restricted to ``group == 1`` -- declined (``None``)
+    otherwise -- unlike :func:`_match_conv_producer`'s support for a
+    *general* grouped Conv: a grouped ``ConvTranspose`` producer's own
+    output-channel axis (1) *is* per-group-relative (weight column ``j`` on
+    input-row block ``g`` means global output channel ``g * (out_channels /
+    group) + j``, mirroring ``Conv``'s own grouped *consumer* axis, see
+    :func:`_match_conv_consumer`'s docstring) -- pruning it needs the
+    equivalent of :func:`_slice_grouped_consumer_conv_weight` but for axis 1
+    instead of axis 0, which this module does not implement. A scope
+    decision, not an oversight: get ordinary ``ConvTranspose`` right first
+    (see this module's own docstring for a Conv1d/Conv3d/ConvTranspose
+    generalization's full scope), leaving grouped ``ConvTranspose`` as a
+    clean, explicit decline for a future pass to pick up.
+    """
+    if node.op_type != "ConvTranspose" or len(node.input) < 2:
+        return None
+    w_name = node.input[1]
+    w_init = initializer_map.get(w_name)
+    if (
+        w_init is None
+        or not _is_supported_float_dtype(w_init.data_type)
+        or len(w_init.dims) < 3
+    ):
+        return None
+    group = _conv_group(node)
+    if group != 1:
+        return None  # grouped ConvTranspose producer -- declined, see above
+    out_channels = w_init.dims[1]
+    bias_name = None
+    if len(node.input) == 3 and node.input[2]:
+        bias_name = node.input[2]
+        if bias_name not in initializer_map:
+            return None  # non-constant bias -- can't safely prune it
+    return w_name, bias_name, out_channels, group
+
+
 def _match_conv_consumer(
     node: onnx.NodeProto, initializer_map: Dict[str, onnx.TensorProto]
 ) -> Optional[Tuple[str, int, int]]:
     """If `node` is an ordinary (``group=1``) *or* a general grouped Conv
-    (see :func:`_match_conv_producer`) with a constant 4-D float32 weight,
-    returns ``(weight_name, in_channels, group)``. Like
+    (see :func:`_match_conv_producer`) -- any spatial rank ``n >= 1``, same
+    as that function -- with a constant ``[out_channels, in_channels/group,
+    k1, ..., kn]`` float32/float16/bfloat16 weight, returns
+    ``(weight_name, in_channels, group)``. Like
     :func:`_match_conv_producer`, a depthwise Conv never matches here
     either -- it's only ever a transparent pass-through hop the chain walk
     crosses en route to a *real* consumer, never a consumer itself (see
@@ -2989,7 +3114,7 @@ def _match_conv_consumer(
     if (
         w_init is None
         or not _is_supported_float_dtype(w_init.data_type)
-        or len(w_init.dims) != 4
+        or len(w_init.dims) < 3
     ):
         return None
     group = _conv_group(node)
@@ -3004,24 +3129,75 @@ def _match_conv_consumer(
     return w_name, in_channels, group
 
 
+def _match_conv_transpose_consumer(
+    node: onnx.NodeProto, initializer_map: Dict[str, onnx.TensorProto]
+) -> Optional[Tuple[str, int, int]]:
+    """The ``ConvTranspose`` analogue of :func:`_match_conv_consumer`. If
+    `node` is a ``ConvTranspose`` (any ``group >= 1`` -- see below) with a
+    constant ``[in_channels, out_channels/group, k1, ..., kn]`` weight,
+    returns ``(weight_name, in_channels, group)``.
+
+    Unlike :func:`_match_conv_transpose_producer`'s ``group == 1``
+    restriction, a grouped ``ConvTranspose`` *consumer* is matched for any
+    `group`: this node's own input-channel axis is axis 0 of its
+    ``[C, M/group, ...]`` weight, which -- unlike ``Conv``'s grouped
+    consumer axis (1, per-group-relative) -- already spans the *full*,
+    global ``C`` regardless of `group` (grouping only ever splits axis 1,
+    the *output* side, for ``ConvTranspose`` -- the mirror image of
+    ``Conv``, whose grouping only ever splits axis 1, the *input* side).
+    Pruning it is therefore a plain, flat ``w[keep, ...]``
+    (:func:`_slice_consumer_weight` with ``is_conv_transpose=True``) for any
+    `group`, identical in form to an *ordinary* Conv producer's own axis-0
+    slicing -- no per-group block-relative index translation needed the way
+    :func:`_slice_grouped_consumer_conv_weight` provides for a grouped Conv
+    consumer. `keep_count` still needs to land as a uniform count per
+    `group`-sized block of axis 0 for the pruned node's own `group`
+    attribute to stay well-formed (``new_in_channels % group == 0``,
+    ``ConvTranspose``'s own well-formedness requirement) -- exactly what
+    :func:`_apply_chains`'s existing `group > 1` branch (driven by
+    :func:`_chain_group`, keyed on this `group`) already guarantees for any
+    grouped consumer, Conv or ``ConvTranspose`` alike, with no
+    `ConvTranspose`-specific change needed there.
+    """
+    if node.op_type != "ConvTranspose" or len(node.input) < 2:
+        return None
+    w_name = node.input[1]
+    w_init = initializer_map.get(w_name)
+    if (
+        w_init is None
+        or not _is_supported_float_dtype(w_init.data_type)
+        or len(w_init.dims) < 3
+    ):
+        return None
+    group = _conv_group(node)
+    if group < 1:
+        return None
+    in_channels = w_init.dims[0]
+    if group > 1 and in_channels % group != 0:
+        return None  # groups must stay equal-sized
+    return w_name, in_channels, group
+
+
 def _match_depthwise_conv_pass_through(
     node: onnx.NodeProto,
     initializer_map: Dict[str, onnx.TensorProto],
     n_channels: int,
 ) -> Optional[Tuple[str, Optional[str]]]:
-    """If `node` is a depthwise 2-D ``Conv`` (``group == in_channels ==
-    out_channels == n_channels``) with a constant ``[n_channels, 1, kH,
-    kW]`` float32 weight (and, if present, a constant bias), returns
-    ``(weight_name, bias_name_or_None)``. A depthwise Conv mixes no channels
-    at all -- output channel ``i`` depends only on input channel ``i`` --
-    unlike a general grouped Conv (``group`` neither 1 nor `n_channels`),
-    which is not matched here and stays out of scope for this pass entirely
-    (see :func:`_match_conv_producer`/:func:`_match_conv_consumer`'s own
-    docstrings): only in the depthwise case is every output channel tied
-    1:1 to the same-index input channel, which is what lets the chain walk
-    (:func:`_walk_to_conv_consumer`) treat it as a transparent pass-through
-    hop -- carrying whatever channel-index set survives upstream straight
-    through, unchanged -- rather than a producer or consumer of its own.
+    """If `node` is a depthwise ``Conv`` (``group == in_channels ==
+    out_channels == n_channels``, any spatial rank ``n >= 1`` -- see
+    :func:`_match_conv_producer`) with a constant ``[n_channels, 1, k1, ...,
+    kn]`` float32/float16/bfloat16 weight (and, if present, a constant
+    bias), returns ``(weight_name, bias_name_or_None)``. A depthwise Conv
+    mixes no channels at all -- output channel ``i`` depends only on input
+    channel ``i`` -- unlike a general grouped Conv (``group`` neither 1 nor
+    `n_channels`), which is not matched here and stays out of scope for
+    this pass entirely (see :func:`_match_conv_producer`/
+    :func:`_match_conv_consumer`'s own docstrings): only in the depthwise
+    case is every output channel tied 1:1 to the same-index input channel,
+    which is what lets the chain walk (:func:`_walk_to_conv_consumer`) treat
+    it as a transparent pass-through hop -- carrying whatever channel-index
+    set survives upstream straight through, unchanged -- rather than a
+    producer or consumer of its own.
     """
     if node.op_type != "Conv" or len(node.input) < 2:
         return None
@@ -3030,7 +3206,7 @@ def _match_depthwise_conv_pass_through(
     if (
         w_init is None
         or not _is_supported_float_dtype(w_init.data_type)
-        or len(w_init.dims) != 4
+        or len(w_init.dims) < 3
         or w_init.dims[0] != n_channels
         or w_init.dims[1] != 1
         or _conv_group(node) != n_channels
@@ -3053,8 +3229,9 @@ def _walk_to_conv_consumer(
     n_channels: int,
     max_hops: int,
     forced_first_hop: Optional[onnx.NodeProto] = None,
+    allow_conv_transpose_consumer: bool = False,
 ) -> Tuple[
-    Optional[Tuple[onnx.NodeProto, str, int]],
+    Optional[Tuple[onnx.NodeProto, str, int, bool]],
     Tuple[Tuple[onnx.NodeProto, None], ...],
     Tuple[_ConvPassThrough, ...],
 ]:
@@ -3067,13 +3244,32 @@ def _walk_to_conv_consumer(
     `conv_pass_through` rather than folded into `chain_ops`) with no other
     consumer anywhere along the way, until an ordinary (``group=1``) *or*
     general grouped Conv consumer is found whose input channel count
-    matches `n_channels` (see :func:`_match_conv_consumer`). A depthwise
-    Conv is only ever a transparent hop, never a match for the consumer
-    role itself -- one sitting last before a graph output or a branch
-    simply ends the walk with no consumer found, same as any other
+    matches `n_channels` (see :func:`_match_conv_consumer`), or --
+    when `allow_conv_transpose_consumer` -- a ``ConvTranspose`` consumer
+    (see :func:`_match_conv_transpose_consumer`) is found instead. A
+    depthwise Conv is only ever a transparent hop, never a match for the
+    consumer role itself -- one sitting last before a graph output or a
+    branch simply ends the walk with no consumer found, same as any other
     unmatched topology. Unlike the MatMul/Gemm walk, no per-channel
     ``Add``/``Mul`` op is recognized -- see this module's own docstring for
     why that's out of scope for Conv chains.
+
+    The returned consumer tuple's own 4th element is `is_conv_transpose`
+    (see :class:`_Chain`'s own field of the same name) -- always ``False``
+    for a Conv consumer, so every existing caller that only ever saw a
+    3-tuple here before `is_conv_transpose` existed keeps identical
+    behavior once it drops the extra element.
+
+    `allow_conv_transpose_consumer` defaults ``False`` -- a ``ConvTranspose``
+    node hit mid-walk then simply ends the walk with no consumer found
+    (exactly like any other unmatched topology), *not* an error. Only
+    :func:`_find_conv_chains` -- the plain single-producer/single-consumer
+    chain finder this generalization was scoped to (see this module's own
+    docstring) -- passes ``True``. Every other caller (the residual/merge
+    "fan-out" branch resolution below, and the Concat-branch-merge consumer
+    walk) leaves it at the default, deliberately excluding ``ConvTranspose``
+    from those more elaborate topologies for now -- a scope decision, not
+    an oversight (see this module's own docstring).
 
     `forced_first_hop`, when given, is used as the walk's very first hop
     instead of deriving it from `consumers_of[start]` -- every ordinary
@@ -3090,7 +3286,7 @@ def _walk_to_conv_consumer(
     """
     chain_ops: List[Tuple[onnx.NodeProto, None]] = []
     conv_pass_through: List[_ConvPassThrough] = []
-    consumer: Optional[Tuple[onnx.NodeProto, str, int]] = None
+    consumer: Optional[Tuple[onnx.NodeProto, str, int, bool]] = None
     cur = start
     for _hop in range(max_hops):
         if _hop == 0 and forced_first_hop is not None:
@@ -3116,7 +3312,17 @@ def _walk_to_conv_consumer(
 
             match = _match_conv_consumer(nxt, initializer_map)
             if match is not None and match[1] == n_channels:
-                consumer = (nxt, match[0], match[2])
+                consumer = (nxt, match[0], match[2], False)
+            break
+
+        if (
+            allow_conv_transpose_consumer
+            and nxt.op_type == "ConvTranspose"
+            and nxt.input[0] == cur
+        ):
+            ct_match = _match_conv_transpose_consumer(nxt, initializer_map)
+            if ct_match is not None and ct_match[1] == n_channels:
+                consumer = (nxt, ct_match[0], ct_match[2], True)
             break
 
         if not (
@@ -3145,7 +3351,16 @@ def _find_conv_chains(graph: onnx.GraphProto) -> List[_Chain]:
 
     chains = []
     for node in graph.node:
+        # Try an ordinary/grouped Conv producer first, then (only if that
+        # declines -- the two matchers' own op_type checks are mutually
+        # exclusive, so this is never ambiguous) a ConvTranspose producer
+        # (group == 1 only -- see _match_conv_transpose_producer's own
+        # docstring for why grouped ConvTranspose stays out of scope).
         info = _match_conv_producer(node, initializer_map)
+        is_producer_conv_transpose = False
+        if info is None:
+            info = _match_conv_transpose_producer(node, initializer_map)
+            is_producer_conv_transpose = True
         if info is None:
             continue
         w_name, bias_name, n_channels, producer_group = info
@@ -3161,10 +3376,13 @@ def _find_conv_chains(graph: onnx.GraphProto) -> List[_Chain]:
             graph_outputs,
             n_channels,
             _MAX_CHAIN_HOPS,
+            allow_conv_transpose_consumer=True,
         )
         if consumer is None:
             continue
-        consumer_node, consumer_weight, consumer_group = consumer
+        consumer_node, consumer_weight, consumer_group, consumer_is_conv_transpose = (
+            consumer
+        )
 
         if (
             producer_group > 1
@@ -3191,6 +3409,7 @@ def _find_conv_chains(graph: onnx.GraphProto) -> List[_Chain]:
                         bias_name,
                         is_conv=True,
                         group=producer_group,
+                        is_conv_transpose=is_producer_conv_transpose,
                     ),
                 ),
                 chain_ops=chain_ops,
@@ -3201,6 +3420,7 @@ def _find_conv_chains(graph: onnx.GraphProto) -> List[_Chain]:
                 consumer_is_conv=True,
                 conv_pass_through=conv_pass_through,
                 consumer_group=consumer_group,
+                consumer_is_conv_transpose=consumer_is_conv_transpose,
             )
         )
     return chains
@@ -3342,7 +3562,7 @@ def _match_conv_pass_through_self(
     if (
         w_init is None
         or not _is_supported_float_dtype(w_init.data_type)
-        or len(w_init.dims) != 4
+        or len(w_init.dims) < 3
     ):
         return None
     return _match_depthwise_conv_pass_through(node, initializer_map, w_init.dims[0])
@@ -3540,7 +3760,11 @@ def _resolve_conv_fanout_branches(
             )
             if resolved is None:
                 return None
-            branch_node, branch_weight, branch_group = resolved
+            # `allow_conv_transpose_consumer` was left at its default
+            # (False) above, so `_` here is always False -- ConvTranspose
+            # is deliberately out of scope for a residual/merge group's own
+            # fan-out branches (see _walk_to_conv_consumer's own docstring).
+            branch_node, branch_weight, branch_group, _ = resolved
             # A general grouped Conv consumer is allowed through here
             # unconditionally, same as the primary consumer -- its own
             # `group` is simply carried on the returned `_ConsumerBranch`
@@ -5961,7 +6185,11 @@ def _find_conv_concat_chains(graph: onnx.GraphProto) -> List[_ConcatChain]:
         )
         if consumer is None:
             continue
-        consumer_node, consumer_weight, consumer_group = consumer
+        # `allow_conv_transpose_consumer` was left at its default (False)
+        # above, so `_` here is always False -- ConvTranspose is
+        # deliberately out of scope for a Concat-branch-merge chain's own
+        # consumer (see _walk_to_conv_consumer's own docstring).
+        consumer_node, consumer_weight, consumer_group, _ = consumer
         if not _concat_branches_align_to_consumer_group(
             branches, total_n, consumer_group
         ):
@@ -6234,11 +6462,21 @@ def _slice_producer_weight(
     weight_transposed: bool,
     keep: np.ndarray,
     is_conv: bool = False,
+    is_conv_transpose: bool = False,
 ) -> None:
     w = onnx.numpy_helper.to_array(w_init)
     if is_conv:
-        # [out_channels, in_channels, kH, kW]: output channel is always axis 0.
-        w_new = w[keep, ...]
+        if is_conv_transpose:
+            # ConvTranspose: [in_channels, out_channels/group, k1, ...] --
+            # output channel lives on axis 1, not axis 0 (see
+            # _match_conv_transpose_producer's own docstring; only ever
+            # called here for a group == 1 ConvTranspose, so this is a
+            # plain, ungrouped axis-1 slice).
+            w_new = w[:, keep, ...]
+        else:
+            # Conv: [out_channels, in_channels/group, k1, ...]: output
+            # channel is always axis 0, for any spatial rank.
+            w_new = w[keep, ...]
     else:
         # [N, K] storage (transB=1): output channel is axis 0. [K, N]
         # storage (the common case): output channel is axis 1.
@@ -6251,11 +6489,21 @@ def _slice_consumer_weight(
     weight_transposed: bool,
     keep: np.ndarray,
     is_conv: bool = False,
+    is_conv_transpose: bool = False,
 ) -> None:
     w = onnx.numpy_helper.to_array(w_init)
     if is_conv:
-        # [out_channels, in_channels, kH, kW]: input channel is always axis 1.
-        w_new = w[:, keep, ...]
+        if is_conv_transpose:
+            # ConvTranspose: [in_channels, out_channels/group, k1, ...] --
+            # input channel lives on axis 0, and (unlike Conv's grouped
+            # consumer axis 1) spans the *full* in_channels regardless of
+            # group, so a plain, flat slice is correct for any group (see
+            # _match_conv_transpose_consumer's own docstring).
+            w_new = w[keep, ...]
+        else:
+            # Conv: [out_channels, in_channels/group, k1, ...]: input
+            # channel is always axis 1, for any spatial rank.
+            w_new = w[:, keep, ...]
     else:
         # [N, K] storage (transB=1): reduction dim is axis 1. [K, N] storage:
         # reduction dim is axis 0.
@@ -6407,6 +6655,33 @@ def _head_bias_axis(dims: Sequence[int], num_heads: int) -> Optional[int]:
     return None
 
 
+def _producer_weight_nk(w: np.ndarray, p: "_Producer") -> np.ndarray:
+    """``[N, K]`` view of one chain producer's own (already-float64) weight
+    `w`, for structured-pruning importance ranking -- `N` being that
+    producer's own output-channel count, `K` everything else flattened.
+    Shared by every place that needs this view before slicing (
+    :func:`_apply_chains`, :func:`_apply_chains_global`,
+    :func:`analyze_pruning_sensitivity`'s own dry-run report) so all three
+    stay in exact agreement.
+
+    For an ordinary Conv producer (`p.is_conv`, ``p.is_conv_transpose ==
+    False``) output channels are axis 0, for any spatial rank (see
+    :func:`_match_conv_producer`'s own docstring) -- a plain
+    ``w.reshape(w.shape[0], -1)``. For a ``ConvTranspose`` producer
+    (`p.is_conv_transpose`) output channels are axis 1 instead (see
+    :func:`_match_conv_transpose_producer`'s own docstring) -- axis 1 is
+    moved to the front before the same flatten, so row `i` of the returned
+    array is still that producer's own `i`-th output channel's full
+    weight, regardless of which axis it started on. For a MatMul/Gemm
+    producer, mirrors :func:`_weight_to_nk`'s own transpose convention.
+    """
+    if p.is_conv:
+        if p.is_conv_transpose:
+            return np.moveaxis(w, 1, 0).reshape(w.shape[1], -1)
+        return w.reshape(w.shape[0], -1)
+    return w if p.weight_transposed else w.T
+
+
 def _plain_structured_importance(
     chain: _Chain, w_arrays_nk: List[np.ndarray], importance_norm: str = "l2"
 ) -> np.ndarray:
@@ -6515,7 +6790,11 @@ def _slice_chain_channels(
     """
     for p in chain.producers:
         _slice_producer_weight(
-            initializer_map[p.weight], p.weight_transposed, keep, is_conv=p.is_conv
+            initializer_map[p.weight],
+            p.weight_transposed,
+            keep,
+            is_conv=p.is_conv,
+            is_conv_transpose=p.is_conv_transpose,
         )
         if p.bias is not None:
             _slice_last_axis(initializer_map[p.bias], keep)
@@ -6537,7 +6816,11 @@ def _slice_chain_channels(
 
     for hop in chain.conv_pass_through:
         _slice_conv_hop(hop)
-    if chain.consumer_is_conv and chain.consumer_group > 1:
+    if (
+        chain.consumer_is_conv
+        and not chain.consumer_is_conv_transpose
+        and chain.consumer_group > 1
+    ):
         _slice_grouped_consumer_conv_weight(
             initializer_map[chain.consumer_weight],
             keep,
@@ -6545,11 +6828,17 @@ def _slice_chain_channels(
             chain.n_channels,
         )
     else:
+        # A grouped ConvTranspose consumer (consumer_is_conv_transpose,
+        # consumer_group > 1) also lands here, not in the branch above --
+        # its own input-channel axis (0) is flat/global regardless of
+        # group, so the plain slice below is already correct; see
+        # _match_conv_transpose_consumer's own docstring.
         _slice_consumer_weight(
             initializer_map[chain.consumer_weight],
             chain.consumer_weight_transposed,
             keep,
             is_conv=chain.consumer_is_conv,
+            is_conv_transpose=chain.consumer_is_conv_transpose,
         )
     # Extra fan-out branches (see :class:`_Chain.extra_consumers`'s own
     # comment): each is either an ordinary (`group == 1`) consumer, or,
@@ -6710,11 +6999,7 @@ def _apply_chains(
         w_arrays_nk = []
         for p in chain.producers:
             w = _to_f64(initializer_map[p.weight])
-            if p.is_conv:
-                w_nk = w.reshape(w.shape[0], -1)  # [out_channels, in_channels*kH*kW]
-            else:
-                w_nk = w if p.weight_transposed else w.T  # [N, K]
-            w_arrays_nk.append(w_nk)
+            w_arrays_nk.append(_producer_weight_nk(w, p))
         importance = compute_importance(chain, w_arrays_nk)
         if group > 1:
             # One independent top-k per block -- see _chain_group and this
@@ -6846,11 +7131,7 @@ def _apply_chains_global(
         w_arrays_nk = []
         for p in chain.producers:
             w = _to_f64(initializer_map[p.weight])
-            if p.is_conv:
-                w_nk = w.reshape(w.shape[0], -1)
-            else:
-                w_nk = w if p.weight_transposed else w.T
-            w_arrays_nk.append(w_nk)
+            w_arrays_nk.append(_producer_weight_nk(w, p))
         importance = compute_importance(chain, w_arrays_nk)
 
         admitted.append(
@@ -6932,18 +7213,35 @@ def apply_structured_pruning(
     the two layers' composition mathematically unaffected for every
     surviving channel.
 
-    The same cut applies to 2-D ``Conv`` producer -> consumer pairs -- each
-    output filter's whole ``[in_channels/group, kH, kW]`` kernel ranked by
-    its own L2 norm, exactly Li et al.'s original filter-pruning criterion
-    -- joined by unary activations and/or depthwise Conv hops (``group ==
-    in_channels == out_channels``: one filter per channel, no cross-channel
-    mixing, so it's crossed transparently -- its own weight/bias sliced by
-    the producer's channel indices and its ``group`` attribute shrunk to
-    match, but it contributes no importance of its own and can't itself be
-    the producer or consumer -- see this module's own docstring). No
-    per-channel Add/Mul between two Convs (a Conv already carries its own
-    bias, and ``BatchNormalization`` is expected to already be fused into
-    the preceding Conv by the time this pass runs).
+    The same cut applies to ``Conv`` producer -> consumer pairs -- any
+    spatial rank (1-D/2-D/3-D alike, i.e. any ``[in_channels/group, k1, ...,
+    kn]`` kernel, not just 2-D's ``[in_channels/group, kH, kW]`` -- see
+    :func:`_match_conv_producer`'s own docstring): each output filter's
+    whole kernel ranked by its own L2 norm, exactly Li et al.'s original
+    filter-pruning criterion -- joined by unary activations and/or
+    depthwise Conv hops (``group == in_channels == out_channels``: one
+    filter per channel, no cross-channel mixing, so it's crossed
+    transparently -- its own weight/bias sliced by the producer's channel
+    indices and its ``group`` attribute shrunk to match, but it contributes
+    no importance of its own and can't itself be the producer or consumer
+    -- see this module's own docstring). No per-channel Add/Mul between two
+    Convs (a Conv already carries its own bias, and ``BatchNormalization``
+    is expected to already be fused into the preceding Conv by the time
+    this pass runs).
+
+    ``ConvTranspose`` is also matched, as a producer and/or an ordinary
+    (single, non-residual/Concat) consumer -- its own weight layout is the
+    *reverse* of ``Conv``'s (``[in_channels, out_channels/group, k1, ...,
+    kn]``, confirmed live via ``onnx.defs.get_schema("ConvTranspose")``), so
+    its own output channels are pruned off axis 1 (as a producer) and its
+    own input channels off axis 0 (as a consumer, correct for any `group`)
+    -- see :func:`_match_conv_transpose_producer`/
+    :func:`_match_conv_transpose_consumer`'s own docstrings for the full
+    reasoning, including why a *grouped* ``ConvTranspose`` producer is
+    deliberately left declined (a scope decision, not an oversight), and
+    why ``ConvTranspose`` stays out of scope for a residual/merge group's
+    own fan-out branches and a ``Concat``-merged group's own consumer for
+    now.
 
     A *general* grouped Conv (``group`` neither 1 nor its channel count) is
     also matched, as a producer and/or a consumer, ranking/pruning each of
@@ -10854,11 +11152,7 @@ def _analyze_chains(
                 w = onnx.numpy_helper.to_array(initializer_map[p.weight]).astype(
                     np.float64
                 )
-                if p.is_conv:
-                    w_nk = w.reshape(w.shape[0], -1)
-                else:
-                    w_nk = w if p.weight_transposed else w.T
-                w_arrays_nk.append(w_nk)
+                w_arrays_nk.append(_producer_weight_nk(w, p))
             importance = compute_importance(chain, w_arrays_nk)
 
             if group > 1:
