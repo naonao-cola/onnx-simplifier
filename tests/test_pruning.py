@@ -14274,6 +14274,533 @@ def test_analyze_pruning_sensitivity_margin_reflects_importance_distribution():
     assert margin_a != margin_b
 
 
+# --- Embedding / lm_head vocabulary pruning --------------------------------
+#
+# See ``onnxsim/pruning.py``'s own "Embedding / lm_head vocabulary pruning"
+# section comment for the full matching/safety bar and the id-remapping
+# contract these tests exercise. Every positive-match test below runs the
+# pruned model through a real onnxruntime session and compares against an
+# independently-constructed oracle: the *original* (unpruned) model's own
+# onnxruntime output, sliced down to the kept-vocabulary columns -- never a
+# hand-computed expected array, and never just a shape/structural check.
+
+
+def test_embedding_vocab_pruning_untied_matches_oracle_and_renumbers_contiguously():
+    # (a) untied embedding + lm_head: both weights sliced to the same kept
+    # set, model still executes correctly for every kept token id, and the
+    # output column ordering matches the new contiguous renumbering.
+    V, H = 12, 8
+    rng = np.random.default_rng(1)
+    w_emb = rng.standard_normal((V, H)).astype(np.float32)
+    w_lm = rng.standard_normal((H, V)).astype(np.float32)
+    model = _model(
+        f"""
+        g (int64[batch,seq] input_ids) => (float[batch,seq,{V}] logits)
+        {{
+          hidden = Gather<axis=0>(W_emb, input_ids)
+          logits = MatMul(hidden, W_lm)
+        }}
+        """,
+        initializer=[_f32(w_emb, "W_emb"), _f32(w_lm, "W_lm")],
+    )
+    onnx.checker.check_model(model)
+
+    keep_token_ids = [9, 1, 4, 7, 3, 11]  # deliberately unsorted, with dups below
+    result = onnxsim.apply_embedding_vocab_pruning(
+        model, keep_token_ids=keep_token_ids + [4, 9]
+    )
+    onnx.checker.check_model(result.model)
+
+    assert result.matched
+    assert result.lm_head_pruned
+    assert result.kept_token_ids == sorted(set(keep_token_ids))
+    assert result.id_map == {tok: i for i, tok in enumerate(result.kept_token_ids)}
+
+    emb_init = {t.name: t for t in result.model.graph.initializer}["W_emb"]
+    lm_init = {t.name: t for t in result.model.graph.initializer}["W_lm"]
+    assert list(emb_init.dims) == [len(result.kept_token_ids), H]
+    assert list(lm_init.dims) == [H, len(result.kept_token_ids)]
+
+    input_ids = np.array([[9, 4, 1, 7], [3, 11, 9, 1]], dtype=np.int64)
+    remapped = np.vectorize(result.id_map.get)(input_ids).astype(np.int64)
+
+    orig_out = _run(model, {"input_ids": input_ids})[0]
+    pruned_out = _run(result.model, {"input_ids": remapped})[0]
+
+    expected = orig_out[..., result.kept_token_ids]
+    assert pruned_out.shape[-1] == len(result.kept_token_ids)
+    np.testing.assert_allclose(pruned_out, expected, atol=1e-5, rtol=1e-5)
+
+
+def test_embedding_vocab_pruning_untied_lm_head_gemm_bias_is_sliced():
+    V, H = 10, 6
+    rng = np.random.default_rng(2)
+    w_emb = rng.standard_normal((V, H)).astype(np.float32)
+    w_lm = rng.standard_normal((V, H)).astype(np.float32)  # [N, K], transB=1
+    b_lm = rng.standard_normal(V).astype(np.float32)
+    model = _model(
+        f"""
+        g (int64[M] input_ids) => (float[M,{V}] logits)
+        {{
+          hidden = Gather<axis=0>(W_emb, input_ids)
+          logits = Gemm<transB=1>(hidden, W_lm, B_lm)
+        }}
+        """,
+        initializer=[_f32(w_emb, "W_emb"), _f32(w_lm, "W_lm"), _f32(b_lm, "B_lm")],
+    )
+    onnx.checker.check_model(model)
+
+    keep_token_ids = [0, 2, 3, 5, 8, 9]
+    result = onnxsim.apply_embedding_vocab_pruning(model, keep_token_ids=keep_token_ids)
+    onnx.checker.check_model(result.model)
+    assert result.matched and result.lm_head_pruned
+
+    input_ids = np.array([0, 5, 9, 2, 8], dtype=np.int64)
+    remapped = np.array([result.id_map[i] for i in input_ids], dtype=np.int64)
+
+    orig_out = _run(model, {"input_ids": input_ids})[0]
+    pruned_out = _run(result.model, {"input_ids": remapped})[0]
+    expected = orig_out[..., result.kept_token_ids]
+    np.testing.assert_allclose(pruned_out, expected, atol=1e-5, rtol=1e-5)
+
+
+def test_embedding_vocab_pruning_tied_via_transpose_matches_oracle():
+    # (b) tied (weight-shared) embedding/lm_head, the "Transpose then
+    # MatMul" sub-shape (the realistic pattern for a 3-D hidden-state
+    # model, since Gemm has no batch-dim support): confirms the pass
+    # recognizes the sharing and doesn't corrupt it -- the single shared
+    # initializer is sliced exactly once, never independently twice.
+    V, H = 12, 8
+    rng = np.random.default_rng(3)
+    w_emb = rng.standard_normal((V, H)).astype(np.float32)
+    model = _model(
+        f"""
+        g (int64[batch,seq] input_ids) => (float[batch,seq,{V}] logits)
+        {{
+          hidden = Gather<axis=0>(W_emb, input_ids)
+          W_t = Transpose<perm=[1,0]>(W_emb)
+          logits = MatMul(hidden, W_t)
+        }}
+        """,
+        initializer=[_f32(w_emb, "W_emb")],
+    )
+    onnx.checker.check_model(model)
+    assert len(model.graph.initializer) == 1  # the one shared weight
+
+    keep_token_ids = [1, 2, 4, 6, 8, 10, 11]
+    result = onnxsim.apply_embedding_vocab_pruning(model, keep_token_ids=keep_token_ids)
+    onnx.checker.check_model(result.model)
+
+    assert result.matched
+    assert result.lm_head_pruned
+    # Still exactly one weight initializer -- the tied weight was sliced
+    # once, not duplicated into two independently-sliced copies.
+    assert len(result.model.graph.initializer) == 1
+    emb_init = result.model.graph.initializer[0]
+    assert list(emb_init.dims) == [len(keep_token_ids), H]
+
+    input_ids = np.array([[1, 4, 8], [10, 2, 11]], dtype=np.int64)
+    remapped = np.vectorize(result.id_map.get)(input_ids).astype(np.int64)
+
+    orig_out = _run(model, {"input_ids": input_ids})[0]
+    pruned_out = _run(result.model, {"input_ids": remapped})[0]
+    expected = orig_out[..., result.kept_token_ids]
+    np.testing.assert_allclose(pruned_out, expected, atol=1e-5, rtol=1e-5)
+
+
+def test_embedding_vocab_pruning_tied_direct_gemm_matches_oracle():
+    # The other tied sub-shape: a direct Gemm(transB=1) reusing the
+    # embedding table as its own [vocab, hidden] weight with no Transpose
+    # node at all (e.g. GPT-2's own ONNX export pattern).
+    V, H = 9, 5
+    rng = np.random.default_rng(4)
+    w_emb = rng.standard_normal((V, H)).astype(np.float32)
+    model = _model(
+        f"""
+        g (int64[M] input_ids) => (float[M,{V}] logits)
+        {{
+          hidden = Gather<axis=0>(W_emb, input_ids)
+          logits = Gemm<transB=1>(hidden, W_emb)
+        }}
+        """,
+        initializer=[_f32(w_emb, "W_emb")],
+    )
+    onnx.checker.check_model(model)
+    assert len(model.graph.initializer) == 1
+
+    keep_token_ids = [0, 1, 3, 5, 6, 8]
+    result = onnxsim.apply_embedding_vocab_pruning(model, drop_token_ids=[2, 4, 7])
+    onnx.checker.check_model(result.model)
+    assert result.matched and result.lm_head_pruned
+    assert result.kept_token_ids == keep_token_ids
+    assert len(result.model.graph.initializer) == 1
+
+    input_ids = np.array([0, 3, 6, 8, 1], dtype=np.int64)
+    remapped = np.array([result.id_map[i] for i in input_ids], dtype=np.int64)
+    orig_out = _run(model, {"input_ids": input_ids})[0]
+    pruned_out = _run(result.model, {"input_ids": remapped})[0]
+    expected = orig_out[..., result.kept_token_ids]
+    np.testing.assert_allclose(pruned_out, expected, atol=1e-5, rtol=1e-5)
+
+
+def test_embedding_vocab_pruning_cast_hop_indices_still_matched():
+    # A `Cast` between the raw graph input and `Gather`'s own `indices`
+    # operand (a common real-export dtype-conversion hop) is the one
+    # bounded pass-through this matcher allows.
+    V, H = 8, 4
+    rng = np.random.default_rng(5)
+    w_emb = rng.standard_normal((V, H)).astype(np.float32)
+    model = _model(
+        f"""
+        g (int32[M] input_ids) => (float[M,{H}] hidden)
+        {{
+          ids64 = Cast<to=7>(input_ids)
+          hidden = Gather<axis=0>(W_emb, ids64)
+        }}
+        """,
+        initializer=[_f32(w_emb, "W_emb")],
+    )
+    onnx.checker.check_model(model)
+
+    keep_token_ids = [0, 2, 3, 5, 7]
+    result = onnxsim.apply_embedding_vocab_pruning(model, keep_token_ids=keep_token_ids)
+    onnx.checker.check_model(result.model)
+    assert result.matched
+    assert not result.lm_head_pruned  # no lm_head in this graph at all
+
+    input_ids = np.array([0, 5, 2, 7], dtype=np.int32)
+    remapped = np.array([result.id_map[i] for i in input_ids], dtype=np.int32)
+    orig_out = _run(model, {"input_ids": input_ids})[0]
+    pruned_out = _run(result.model, {"input_ids": remapped})[0]
+    np.testing.assert_allclose(pruned_out, orig_out, atol=1e-6, rtol=1e-6)
+
+
+def _ambiguous_embedding_model(V_tok=10, V_pos=6, H=4, seed=6):
+    rng = np.random.default_rng(seed)
+    w_tok = rng.standard_normal((V_tok, H)).astype(np.float32)
+    w_pos = rng.standard_normal((V_pos, H)).astype(np.float32)
+    model = _model(
+        f"""
+        g (int64[M] input_ids, int64[M] position_ids) => (float[M,{H}] out)
+        {{
+          tok = Gather<axis=0>(W_tok, input_ids)
+          pos = Gather<axis=0>(W_pos, position_ids)
+          out = Add(tok, pos)
+        }}
+        """,
+        initializer=[_f32(w_tok, "W_tok"), _f32(w_pos, "W_pos")],
+    )
+    onnx.checker.check_model(model)
+    return model
+
+
+def test_embedding_vocab_pruning_declines_when_gather_is_ambiguous():
+    # (c) decline path: two structurally-identical Gather-embedding
+    # candidates (a token embedding and a positional embedding, both
+    # reading a genuine graph input) with no `input_name` to disambiguate
+    # -- the whole call must decline, model left byte-for-byte untouched.
+    model = _ambiguous_embedding_model()
+    result = onnxsim.apply_embedding_vocab_pruning(model, keep_token_ids=[0, 1, 2])
+    assert result.matched is False
+    assert result.kept_token_ids is None
+    assert result.id_map is None
+    assert result.model.SerializeToString() == model.SerializeToString()
+
+
+def test_embedding_vocab_pruning_input_name_disambiguates_correctly():
+    model = _ambiguous_embedding_model(V_tok=10, V_pos=6)
+    result = onnxsim.apply_embedding_vocab_pruning(
+        model, drop_token_ids=[4, 5], input_name="input_ids"
+    )
+    assert result.matched
+    assert result.kept_token_ids == [0, 1, 2, 3, 6, 7, 8, 9]
+    # The positional-embedding table must be left completely untouched.
+    w_pos = {t.name: t for t in result.model.graph.initializer}["W_pos"]
+    assert list(w_pos.dims) == [6, 4]
+
+
+def test_embedding_vocab_pruning_unknown_input_name_raises():
+    model = _ambiguous_embedding_model()
+    with pytest.raises(ValueError, match="not_a_real_input"):
+        onnxsim.apply_embedding_vocab_pruning(
+            model, keep_token_ids=[0, 1], input_name="not_a_real_input"
+        )
+
+
+def test_embedding_vocab_pruning_declines_non_zero_gather_axis():
+    V, H, M = 10, 6, 3
+    rng = np.random.default_rng(7)
+    w_emb = rng.standard_normal((V, H)).astype(np.float32)
+    model = _model(
+        f"""
+        g (int64[{M}] input_ids) => (float[{V},{M}] out)
+        {{
+          out = Gather<axis=1>(W_emb, input_ids)
+        }}
+        """,
+        initializer=[_f32(w_emb, "W_emb")],
+    )
+    onnx.checker.check_model(model)
+    result = onnxsim.apply_embedding_vocab_pruning(model, keep_token_ids=[0, 1])
+    assert result.matched is False
+    assert result.model.SerializeToString() == model.SerializeToString()
+
+
+def test_embedding_vocab_pruning_declines_unexpected_shared_consumer():
+    # (c) decline path: the embedding weight is read by a second consumer
+    # that isn't one of the two recognized tied `lm_head` shapes -- the
+    # whole chain must decline rather than prune the embedding and
+    # silently corrupt that unexplained second reader.
+    V, H, M = 10, 6, 3
+    rng = np.random.default_rng(8)
+    w_emb = rng.standard_normal((V, H)).astype(np.float32)
+    bias = rng.standard_normal((V, H)).astype(np.float32)
+    model = _model(
+        f"""
+        g (int64[{M}] input_ids) => (float[{M},{H}] hidden, float[{V},{H}] extra)
+        {{
+          hidden = Gather<axis=0>(W_emb, input_ids)
+          extra = Add(W_emb, Bias)
+        }}
+        """,
+        initializer=[_f32(w_emb, "W_emb"), _f32(bias, "Bias")],
+    )
+    onnx.checker.check_model(model)
+    result = onnxsim.apply_embedding_vocab_pruning(model, keep_token_ids=[0, 1, 2])
+    assert result.matched is False
+    assert result.model.SerializeToString() == model.SerializeToString()
+
+
+def test_embedding_vocab_pruning_untied_lm_head_matmul_add_bias_hop_matches_oracle():
+    # An untied MatMul lm_head whose output feeds exactly one following
+    # per-channel bias Add (rather than a Gemm's own built-in bias) is the
+    # common real-export shape for a biased linear layer on a 3-D hidden
+    # state (Gemm has no batch-dim support). Confirms it is correctly
+    # identified as the lm_head and its bias sliced right alongside the
+    # weight.
+    V, H, M = 10, 6, 4
+    rng = np.random.default_rng(9)
+    w_emb = rng.standard_normal((V, H)).astype(np.float32)
+    w_lm = rng.standard_normal((H, V)).astype(np.float32)
+    b_lm = rng.standard_normal(V).astype(np.float32)
+    model = _model(
+        f"""
+        g (int64[{M}] input_ids) => (float[{M},{V}] logits)
+        {{
+          hidden = Gather<axis=0>(W_emb, input_ids)
+          raw = MatMul(hidden, W_lm)
+          logits = Add(raw, B_lm)
+        }}
+        """,
+        initializer=[_f32(w_emb, "W_emb"), _f32(w_lm, "W_lm"), _f32(b_lm, "B_lm")],
+    )
+    onnx.checker.check_model(model)
+
+    keep_token_ids = [0, 1, 2, 3, 4, 5]
+    result = onnxsim.apply_embedding_vocab_pruning(model, keep_token_ids=keep_token_ids)
+    onnx.checker.check_model(result.model)
+    assert result.matched
+    assert result.lm_head_pruned
+
+    inits = {t.name: t for t in result.model.graph.initializer}
+    assert list(inits["W_lm"].dims) == [H, len(keep_token_ids)]
+    assert list(inits["B_lm"].dims) == [len(keep_token_ids)]
+
+    input_ids = np.array([0, 3, 5, 1], dtype=np.int64)
+    remapped = np.array([result.id_map[i] for i in input_ids], dtype=np.int64)
+    orig_out = _run(model, {"input_ids": input_ids})[0]
+    pruned_out = _run(result.model, {"input_ids": remapped})[0]
+    expected = orig_out[..., result.kept_token_ids]
+    np.testing.assert_allclose(pruned_out, expected, atol=1e-5, rtol=1e-5)
+
+
+def test_embedding_vocab_pruning_declines_lm_head_with_mismatched_bias_shape():
+    # The Add's other operand doesn't look like a per-channel vocab-width
+    # bias at all (wrong trailing width) -- this pass must decline that
+    # lm_head match outright rather than slice the MatMul weight and leave
+    # a now-mismatched bias in place. The embedding itself is still safe
+    # to prune on its own.
+    V, H, M = 10, 6, 4
+    rng = np.random.default_rng(90)
+    w_emb = rng.standard_normal((V, H)).astype(np.float32)
+    w_lm = rng.standard_normal((H, V)).astype(np.float32)
+    bogus_bias = rng.standard_normal(H).astype(np.float32)  # wrong width -- not V
+    model = _model(
+        f"""
+        g (int64[{M}] input_ids) => (float[{M},{V}] logits)
+        {{
+          hidden = Gather<axis=0>(W_emb, input_ids)
+          raw = MatMul(hidden, W_lm)
+          logits = Add(raw, Bogus)
+        }}
+        """,
+        initializer=[
+            _f32(w_emb, "W_emb"),
+            _f32(w_lm, "W_lm"),
+            _f32(bogus_bias, "Bogus"),
+        ],
+    )
+
+    keep_token_ids = [0, 1, 2, 3, 4, 5]
+    result = onnxsim.apply_embedding_vocab_pruning(model, keep_token_ids=keep_token_ids)
+    assert result.matched
+    assert not result.lm_head_pruned  # declined -- lm_head left fully untouched
+    w_lm_out = {t.name: t for t in result.model.graph.initializer}["W_lm"]
+    assert list(w_lm_out.dims) == [H, V]  # unchanged width
+
+
+def test_embedding_vocab_pruning_fp16_matches_ort_execution():
+    V, H = 10, 6
+    rng = np.random.default_rng(10)
+    w_emb = (rng.standard_normal((V, H)) * 0.5).astype(np.float16)
+    w_lm = (rng.standard_normal((H, V)) * 0.5).astype(np.float16)
+    model = _model(
+        f"""
+        g (int64[M] input_ids) => (float16[M,{V}] logits)
+        {{
+          hidden = Gather<axis=0>(W_emb, input_ids)
+          logits = MatMul(hidden, W_lm)
+        }}
+        """,
+        initializer=[_f16(w_emb, "W_emb"), _f16(w_lm, "W_lm")],
+    )
+    onnx.checker.check_model(model)
+
+    keep_token_ids = [0, 2, 4, 6, 8, 9]
+    result = onnxsim.apply_embedding_vocab_pruning(model, keep_token_ids=keep_token_ids)
+    onnx.checker.check_model(result.model)
+    assert result.matched and result.lm_head_pruned
+
+    emb_init = {t.name: t for t in result.model.graph.initializer}["W_emb"]
+    lm_init = {t.name: t for t in result.model.graph.initializer}["W_lm"]
+    assert emb_init.data_type == onnx.TensorProto.FLOAT16
+    assert lm_init.data_type == onnx.TensorProto.FLOAT16
+    # Value-preserving slice -- every surviving row/column must reproduce
+    # the exact original fp16 bit pattern, not a re-rounded one.
+    emb_new = onnx.numpy_helper.to_array(emb_init)
+    np.testing.assert_array_equal(
+        emb_new.view(np.uint16), w_emb[keep_token_ids].view(np.uint16)
+    )
+
+    input_ids = np.array([0, 8, 4, 9], dtype=np.int64)
+    remapped = np.array([result.id_map[i] for i in input_ids], dtype=np.int64)
+    orig_out = _run(model, {"input_ids": input_ids})[0]
+    pruned_out = _run(result.model, {"input_ids": remapped})[0]
+    expected = orig_out[..., result.kept_token_ids]
+    np.testing.assert_allclose(
+        pruned_out.astype(np.float32), expected.astype(np.float32), atol=1e-2, rtol=1e-2
+    )
+
+
+def test_embedding_vocab_pruning_validates_keep_and_drop_arguments():
+    model = _matmul_model(K=4, N=4)  # any model -- validation runs before matching
+    with pytest.raises(ValueError, match="exactly one"):
+        onnxsim.apply_embedding_vocab_pruning(model)
+    with pytest.raises(ValueError, match="exactly one"):
+        onnxsim.apply_embedding_vocab_pruning(
+            model, keep_token_ids=[0], drop_token_ids=[1]
+        )
+
+
+def test_embedding_vocab_pruning_rejects_out_of_range_ids():
+    V, H = 8, 4
+    rng = np.random.default_rng(11)
+    w_emb = rng.standard_normal((V, H)).astype(np.float32)
+    model = _model(
+        f"""
+        g (int64[M] input_ids) => (float[M,{H}] hidden)
+        {{
+          hidden = Gather<axis=0>(W_emb, input_ids)
+        }}
+        """,
+        initializer=[_f32(w_emb, "W_emb")],
+    )
+    with pytest.raises(ValueError, match="out of range"):
+        onnxsim.apply_embedding_vocab_pruning(model, keep_token_ids=[0, 100])
+    with pytest.raises(ValueError, match="out of range"):
+        onnxsim.apply_embedding_vocab_pruning(model, drop_token_ids=[0, -1])
+    with pytest.raises(ValueError, match="empty"):
+        onnxsim.apply_embedding_vocab_pruning(model, drop_token_ids=list(range(V)))
+
+
+def test_embedding_vocab_magnitude_pruning_drops_lowest_norm_rows_and_protects():
+    V, H = 10, 4
+    w = np.full((V, H), 5.0, dtype=np.float32)
+    w[2] *= 0.001  # deliberately tiny-norm rows -- should be dropped first
+    w[7] *= 0.001
+    model = _model(
+        f"""
+        g (int64[M] input_ids) => (float[M,{H}] hidden)
+        {{
+          hidden = Gather<axis=0>(W_emb, input_ids)
+        }}
+        """,
+        initializer=[_f32(w, "W_emb")],
+    )
+    onnx.checker.check_model(model)
+
+    result = onnxsim.apply_embedding_vocab_magnitude_pruning(model, sparsity=0.3)
+    onnx.checker.check_model(result.model)
+    assert result.matched
+    assert not result.lm_head_pruned
+    assert len(result.kept_token_ids) == round(V * 0.7) == 7
+    assert 2 not in result.kept_token_ids
+    assert 7 not in result.kept_token_ids
+
+    protected = onnxsim.apply_embedding_vocab_magnitude_pruning(
+        model, sparsity=0.3, protect_token_ids=[2]
+    )
+    assert 2 in protected.kept_token_ids
+
+
+def test_embedding_vocab_magnitude_pruning_matches_oracle_for_kept_ids():
+    V, H = 12, 8
+    rng = np.random.default_rng(12)
+    w_emb = (rng.standard_normal((V, H)) * np.linspace(2.0, 0.05, V)[:, None]).astype(
+        np.float32
+    )
+    w_lm = rng.standard_normal((H, V)).astype(np.float32)
+    model = _model(
+        f"""
+        g (int64[M] input_ids) => (float[M,{V}] logits)
+        {{
+          hidden = Gather<axis=0>(W_emb, input_ids)
+          logits = MatMul(hidden, W_lm)
+        }}
+        """,
+        initializer=[_f32(w_emb, "W_emb"), _f32(w_lm, "W_lm")],
+    )
+    onnx.checker.check_model(model)
+
+    result = onnxsim.apply_embedding_vocab_magnitude_pruning(model, sparsity=0.4)
+    onnx.checker.check_model(result.model)
+    assert result.matched and result.lm_head_pruned
+    assert len(result.kept_token_ids) == round(V * 0.6)
+    # Rows were scaled by a strictly decreasing factor -- the kept set
+    # must be exactly the lowest-index (highest-norm) rows.
+    assert result.kept_token_ids == list(range(len(result.kept_token_ids)))
+
+    input_ids = np.array([0, 1, 2, 3], dtype=np.int64)
+    remapped = np.array([result.id_map[i] for i in input_ids], dtype=np.int64)
+    orig_out = _run(model, {"input_ids": input_ids})[0]
+    pruned_out = _run(result.model, {"input_ids": remapped})[0]
+    expected = orig_out[..., result.kept_token_ids]
+    np.testing.assert_allclose(pruned_out, expected, atol=1e-5, rtol=1e-5)
+
+
+def test_embedding_vocab_magnitude_pruning_rejects_bad_sparsity():
+    model = _matmul_model(K=4, N=4)
+    with pytest.raises(ValueError, match="sparsity"):
+        onnxsim.apply_embedding_vocab_magnitude_pruning(model, sparsity=1.0)
+
+
+def test_embedding_vocab_pruning_declines_when_no_embedding_pattern_exists():
+    model = _matmul_model(K=8, N=4)
+    result = onnxsim.apply_embedding_vocab_pruning(model, keep_token_ids=[0])
+    assert result.matched is False
+    assert result.model.SerializeToString() == model.SerializeToString()
+
+
 # --- apply_transformer_block_pruning ---------------------------------------
 #
 # See ``onnxsim/pruning.py``'s own "Transformer block (depth) pruning"
