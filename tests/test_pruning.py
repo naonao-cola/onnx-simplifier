@@ -13561,6 +13561,18 @@ def test_analyze_pruning_sensitivity_never_mutates_input_model():
     gqa, _ = _gqa_model()
     x = np.random.default_rng(0).standard_normal((4, 8)).astype(np.float32)
     calibration_data = [{"X": x}]
+    # attention/gqa's own default X shape ([batch=2, seq=5, K=8], both
+    # models) -- reused for both attention_head_wanda entries below.
+    x3 = np.random.default_rng(0).standard_normal((2, 5, 8)).astype(np.float32)
+    attn_calibration_data = [{"X": x3}]
+
+    moe_rng = np.random.default_rng(1)
+    moe_fc1_w = moe_rng.standard_normal((3, 5, 4)).astype(np.float32)
+    moe_fc2_w = moe_rng.standard_normal((3, 4, 5)).astype(np.float32)
+    moe_router_w = moe_rng.standard_normal((4, 3)).astype(np.float32)
+    moe_channel_model = _moe_model(moe_fc1_w, moe_fc2_w)
+    moe_whole_expert_model = _moe_router_model(moe_fc1_w, moe_fc2_w, moe_router_w, k=1)
+    moe_calibration_data = [{"X": moe_rng.standard_normal((6, 4)).astype(np.float32)}]
 
     for model, apply_fn, kwargs in [
         (_matmul_model(K=64, N=16), onnxsim.apply_magnitude_pruning, {}),
@@ -13577,6 +13589,22 @@ def test_analyze_pruning_sensitivity_never_mutates_input_model():
         ),
         (attention, onnxsim.apply_attention_head_pruning, {}),
         (gqa, onnxsim.apply_attention_head_pruning, {}),
+        (
+            attention,
+            onnxsim.apply_attention_head_wanda_pruning,
+            {"calibration_data": attn_calibration_data},
+        ),
+        (
+            gqa,
+            onnxsim.apply_attention_head_wanda_pruning,
+            {"calibration_data": attn_calibration_data},
+        ),
+        (moe_channel_model, onnxsim.apply_moe_expert_channel_pruning, {}),
+        (
+            moe_whole_expert_model,
+            onnxsim.apply_moe_whole_expert_pruning,
+            {"calibration_data": moe_calibration_data},
+        ),
     ]:
         before_bytes = model.SerializeToString()
         report = onnxsim.analyze_pruning_sensitivity(
@@ -13796,6 +13824,132 @@ def test_analyze_attention_head_pruning_gqa_matches_real_call():
     assert dims_after["Wv"][1] == kept_groups * D
 
 
+def test_analyze_attention_head_wanda_pruning_plain_matches_real_call():
+    K, H, D, Out = 8, 4, 4, 6
+    model, info = _attention_model(K=K, H=H, D=D, Out=Out, seed=51)
+    rng = np.random.default_rng(53)
+    x_cal = rng.standard_normal((3, 6, K)).astype(np.float32)
+    calibration_data = [{"X": x_cal}]
+
+    report = onnxsim.analyze_pruning_sensitivity(
+        model,
+        onnxsim.apply_attention_head_wanda_pruning,
+        calibration_data=calibration_data,
+        sparsity=0.5,
+    )
+    assert len(report.layers) == 1
+    layer = report.layers[0]
+    # family names the topology, not the calibration method -- shared with
+    # the plain apply_attention_head_pruning dry run, exactly as the
+    # unstructured/structured families already share family strings between
+    # their own plain/Wanda variants.
+    assert layer.family == "attention_head"
+    assert layer.total == H
+    assert report.not_eligible == []
+
+    pruned = onnxsim.apply_attention_head_wanda_pruning(
+        model, calibration_data=calibration_data, sparsity=0.5
+    )
+    dims_after = _initializer_dims(pruned)
+    kept = H - layer.would_drop
+    assert dims_after["Wqkv"][1] == kept * 3 * D  # Nq==Nk==Nv==H*D here
+
+
+def test_analyze_attention_head_wanda_pruning_gqa_matches_real_call():
+    H, KVH, D = 4, 2, 8
+    model, info = _gqa_model(H=H, KVH=KVH, D=D, seed=57)
+    rng = np.random.default_rng(59)
+    x_cal = rng.standard_normal((info["batch"], info["seq"], info["K"])).astype(
+        np.float32
+    )
+    calibration_data = [{"X": x_cal}]
+
+    report = onnxsim.analyze_pruning_sensitivity(
+        model,
+        onnxsim.apply_attention_head_wanda_pruning,
+        calibration_data=calibration_data,
+        sparsity=0.5,
+    )
+    assert len(report.layers) == 1
+    layer = report.layers[0]
+    assert layer.family == "attention_gqa_group"
+    assert layer.total == KVH
+
+    pruned = onnxsim.apply_attention_head_wanda_pruning(
+        model, calibration_data=calibration_data, sparsity=0.5
+    )
+    dims_after = _initializer_dims(pruned)
+    kept_groups = KVH - layer.would_drop
+    group_size = H // KVH
+    assert dims_after["Wq"][1] == kept_groups * group_size * D
+    assert dims_after["Wk"][1] == kept_groups * D
+    assert dims_after["Wv"][1] == kept_groups * D
+
+
+def test_analyze_moe_expert_channel_pruning_matches_real_call():
+    E, hidden, inter = 5, 10, 12
+    rng = np.random.default_rng(61)
+    fc1_w = (rng.standard_normal((E, inter, hidden)) * 0.5).astype(np.float32)
+    fc2_w = (rng.standard_normal((E, hidden, inter)) * 0.5).astype(np.float32)
+    fc1_b = rng.standard_normal((E, inter)).astype(np.float32)
+    fc2_b = rng.standard_normal((E, hidden)).astype(np.float32)
+    model = _moe_model(fc1_w, fc2_w, fc1_b=fc1_b, fc2_b=fc2_b)
+
+    report = onnxsim.analyze_pruning_sensitivity(
+        model, onnxsim.apply_moe_expert_channel_pruning, sparsity=0.5
+    )
+    assert len(report.layers) == 1
+    layer = report.layers[0]
+    assert layer.family == "moe_expert_channel"
+    assert layer.total == inter
+    assert report.not_eligible == []
+
+    pruned = onnxsim.apply_moe_expert_channel_pruning(model, sparsity=0.5)
+    inits = _moe_inits(pruned)
+    kept = inter - layer.would_drop
+    assert inits["FC1W"].shape == (E, kept, hidden)
+    assert inits["FC2W"].shape == (E, hidden, kept)
+
+
+def test_analyze_moe_whole_expert_pruning_matches_real_call():
+    E, hidden, inter, tokens = 5, 8, 6, 10
+    rng = np.random.default_rng(67)
+    fc1_w = (rng.standard_normal((E, inter, hidden)) * 0.4).astype(np.float32)
+    fc2_w = (rng.standard_normal((E, hidden, inter)) * 0.4).astype(np.float32)
+    fc1_b = rng.standard_normal((E, inter)).astype(np.float32)
+    router_w = (rng.standard_normal((hidden, E)) * 0.2).astype(np.float32)
+    router_b = rng.standard_normal(E).astype(np.float32)
+    k = 2
+    model = _moe_router_model(
+        fc1_w, fc2_w, router_w, router_b=router_b, fc1_b=fc1_b, k=k, tokens=tokens
+    )
+
+    calib_rng = np.random.default_rng(71)
+    calibration_data = [
+        {"X": calib_rng.standard_normal((tokens, hidden)).astype(np.float32)}
+        for _ in range(4)
+    ]
+    report = onnxsim.analyze_pruning_sensitivity(
+        model,
+        onnxsim.apply_moe_whole_expert_pruning,
+        calibration_data=calibration_data,
+        sparsity=0.4,  # keep 3 of 5
+    )
+    assert len(report.layers) == 1
+    layer = report.layers[0]
+    assert layer.family == "moe_whole_expert"
+    assert layer.total == E
+    assert report.not_eligible == []
+
+    pruned = onnxsim.apply_moe_whole_expert_pruning(
+        model, calibration_data=calibration_data, sparsity=0.4
+    )
+    inits = _moe_inits(pruned)
+    kept = E - layer.would_drop
+    assert inits["FC1W"].shape == (kept, inter, hidden)
+    assert inits["RW"].shape == (hidden, kept)
+
+
 def test_analyze_pruning_sensitivity_not_eligible_lists_unmatched_nodes():
     # A second MatMul whose weight is a graph input, not a constant
     # initializer, can never be matched by any of this module's own
@@ -13897,5 +14051,78 @@ def test_analyze_pruning_sensitivity_margin_reflects_importance_distribution():
     margin_b = by_label["Yb"].margin
 
     assert margin_b == 0.0  # every entry exactly tied -- no meaningful cut
+    assert margin_a is not None and margin_a > 0.9  # wide, unambiguous gap
+    assert margin_a != margin_b
+
+
+def test_analyze_moe_whole_expert_pruning_margin_reflects_router_usage_distribution():
+    # Same adversarial shape as
+    # test_analyze_pruning_sensitivity_margin_reflects_importance_distribution,
+    # for the MoE whole-expert family: node A's router has a zero weight
+    # matrix and a heavily lopsided bias, so every token's routing logits
+    # are identical and one expert's usage is unambiguously near-zero next
+    # to the rest (margin should be strongly positive); node B's router
+    # weight and bias are both all-zero, so every expert's mean gate weight
+    # comes out *exactly* tied (margin must come out exactly 0.0). A bug
+    # that used the plain weight-norm fallback instead of the real
+    # calibrated router-gate ranking, or that mis-normalized the margin,
+    # would fail this.
+    E, hidden, inter, tokens = 4, 3, 2, 5
+    rng = np.random.default_rng(211)
+    fc1_w_a = rng.standard_normal((E, inter, hidden)).astype(np.float32)
+    fc2_w_a = rng.standard_normal((E, hidden, inter)).astype(np.float32)
+    fc1_w_b = rng.standard_normal((E, inter, hidden)).astype(np.float32)
+    fc2_w_b = rng.standard_normal((E, hidden, inter)).astype(np.float32)
+    router_w_zero = np.zeros((hidden, E), dtype=np.float32)
+    router_b_a = np.array(
+        [0.0, 0.0, 0.0, -8.0], dtype=np.float32
+    )  # expert 3: near-0 usage
+    router_b_b = np.zeros(E, dtype=np.float32)
+
+    model = _model(
+        f"""
+        g (float[{tokens},{hidden}] Xa, float[{tokens},{hidden}] Xb)
+            => (float[{tokens},{hidden}] Ya, float[{tokens},{hidden}] Yb)
+        {{
+          Ra = Gemm(Xa, RWa, RBa)
+          Ya = com.microsoft.MoE <k=1, activation_type="relu"> (Xa, Ra, FC1Wa, , FC2Wa)
+          Rb = Gemm(Xb, RWb, RBb)
+          Yb = com.microsoft.MoE <k=1, activation_type="relu"> (Xb, Rb, FC1Wb, , FC2Wb)
+        }}
+        """,
+        initializer=[
+            _f32(fc1_w_a, "FC1Wa"),
+            _f32(fc2_w_a, "FC2Wa"),
+            _f32(router_w_zero, "RWa"),
+            _f32(router_b_a, "RBa"),
+            _f32(fc1_w_b, "FC1Wb"),
+            _f32(fc2_w_b, "FC2Wb"),
+            _f32(router_w_zero, "RWb"),
+            _f32(router_b_b, "RBb"),
+        ],
+        opset=18,
+    )
+    model.opset_import.append(onnx.helper.make_opsetid("com.microsoft", 1))
+    onnx.checker.check_model(model)
+
+    calib_rng = np.random.default_rng(213)
+    calibration_data = [
+        {
+            "Xa": calib_rng.standard_normal((tokens, hidden)).astype(np.float32),
+            "Xb": calib_rng.standard_normal((tokens, hidden)).astype(np.float32),
+        }
+        for _ in range(3)
+    ]
+    report = onnxsim.analyze_pruning_sensitivity(
+        model,
+        onnxsim.apply_moe_whole_expert_pruning,
+        calibration_data=calibration_data,
+        sparsity=0.25,  # keep 3 of 4
+    )
+    by_label = {layer.label: layer for layer in report.layers}
+    margin_a = by_label["Ya"].margin
+    margin_b = by_label["Yb"].margin
+
+    assert margin_b == 0.0  # every expert's router logit exactly tied
     assert margin_a is not None and margin_a > 0.9  # wide, unambiguous gap
     assert margin_a != margin_b

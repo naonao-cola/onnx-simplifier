@@ -9265,6 +9265,50 @@ def apply_attention_head_pruning(
     return out
 
 
+def _wanda_attention_calibration_stats(
+    out: onnx.ModelProto,
+    chains: List[_AttnLikeChain],
+    calibration_data: Sequence[Tensors],
+    providers: Optional[Sequence[str]],
+) -> Dict[str, np.ndarray]:
+    """Runs `out` over `calibration_data` and returns the per-probe-point
+    `act_norm` dict :func:`apply_attention_head_wanda_pruning`'s own
+    `_wanda_attention_head_importance`/`_wanda_gqa_group_importance`
+    closures look up by `chain.consumer_node.input[0]` -- the same
+    computation :func:`apply_attention_head_wanda_pruning`'s own body used
+    to perform inline before this function existed. Factored out,
+    read-only (never mutates `out`), so
+    :func:`analyze_pruning_sensitivity`'s own dry-run report can compute
+    the *exact* same activation norms :func:`apply_attention_head_wanda_pruning`
+    would, from one single shared implementation -- the same
+    "one place real duplication would have crept in" extraction this
+    module's own "Dry-run pruning sensitivity analysis" section comment
+    documents for :func:`_wanda_unstructured_calibration_stats`/
+    :func:`_wanda_structured_calibration_stats`.
+
+    `out` is expected to already be the caller's own working copy, exactly
+    as :func:`_wanda_unstructured_calibration_stats` expects.
+    """
+    probe_names = sorted({chain.consumer_node.input[0] for chain in chains})
+    probe_model = _add_probe_outputs(out, probe_names)
+
+    sq_sum: Dict[str, np.ndarray] = {}
+    count: Dict[str, int] = {}
+    for batch in calibration_data:
+        result = backend.run_model(probe_model, batch, providers=providers)
+        for name in probe_names:
+            x = np.asarray(result[name], dtype=np.float64)
+            if x.ndim < 1:
+                continue
+            reduce_axes = tuple(range(x.ndim - 1))
+            s = np.square(x).sum(axis=reduce_axes) if reduce_axes else np.square(x)
+            cnt = int(np.prod(x.shape[:-1], dtype=np.int64)) if x.ndim > 1 else 1
+            sq_sum[name] = s if name not in sq_sum else sq_sum[name] + s
+            count[name] = count.get(name, 0) + cnt
+
+    return {name: np.sqrt(s / max(count[name], 1)) for name, s in sq_sum.items()}
+
+
 def apply_attention_head_wanda_pruning(
     model: Union[str, onnx.ModelProto],
     calibration_data: Optional[Sequence[Tensors]] = None,
@@ -9356,26 +9400,9 @@ def apply_attention_head_wanda_pruning(
     if not chains:
         return out
 
-    probe_names = sorted({chain.consumer_node.input[0] for chain in chains})
-    probe_model = _add_probe_outputs(out, probe_names)
-
-    sq_sum: Dict[str, np.ndarray] = {}
-    count: Dict[str, int] = {}
-    for batch in calibration_data:
-        result = backend.run_model(probe_model, batch, providers=providers)
-        for name in probe_names:
-            x = np.asarray(result[name], dtype=np.float64)
-            if x.ndim < 1:
-                continue
-            reduce_axes = tuple(range(x.ndim - 1))
-            s = np.square(x).sum(axis=reduce_axes) if reduce_axes else np.square(x)
-            cnt = int(np.prod(x.shape[:-1], dtype=np.int64)) if x.ndim > 1 else 1
-            sq_sum[name] = s if name not in sq_sum else sq_sum[name] + s
-            count[name] = count.get(name, 0) + cnt
-
-    act_norm: Dict[str, np.ndarray] = {
-        name: np.sqrt(s / max(count[name], 1)) for name, s in sq_sum.items()
-    }
+    act_norm = _wanda_attention_calibration_stats(
+        out, chains, calibration_data, providers
+    )
 
     def _wanda_attention_head_importance(chain, wq, wk, wv, dq, dk, dv):
         base = _plain_attention_head_importance(
@@ -10083,6 +10110,52 @@ def _apply_moe_whole_expert_chains(
     return stale_value_info
 
 
+def _moe_router_gate_calibration_stats(
+    out: onnx.ModelProto,
+    chains: List[_MoEExpertChain],
+    calibration_data: Sequence[Tensors],
+    providers: Optional[Sequence[str]],
+) -> Dict[str, np.ndarray]:
+    """Runs `out` over `calibration_data` and returns the per-`router_probs`
+    mean gate weight (post-Softmax over the expert axis, averaged over every
+    calibration token) that :func:`apply_moe_whole_expert_pruning`'s own
+    body used to compute inline before this function existed -- keyed by
+    each chain's own `router_probs` tensor name. Factored out, read-only
+    (never mutates `out`), so :func:`analyze_pruning_sensitivity`'s own
+    dry-run report can compute the *exact* same per-expert usage ranking
+    :func:`apply_moe_whole_expert_pruning` would, from one single shared
+    implementation -- the same "one place real duplication would have
+    crept in" extraction this module's own "Dry-run pruning sensitivity
+    analysis" section comment documents for
+    :func:`_wanda_unstructured_calibration_stats`/
+    :func:`_wanda_structured_calibration_stats`.
+
+    `out` is expected to already be the caller's own working copy, exactly
+    as :func:`_wanda_unstructured_calibration_stats` expects.
+    """
+    probe_names = sorted({chain.router_probs for chain in chains})
+    probe_model = _add_probe_outputs(out, probe_names)
+
+    sum_prob: Dict[str, np.ndarray] = {}
+    count: Dict[str, int] = {}
+    for batch in calibration_data:
+        result = backend.run_model(probe_model, batch, providers=providers)
+        for name in probe_names:
+            logits = np.asarray(result[name], dtype=np.float64)
+            if logits.ndim != 2:
+                continue  # router_probs is always documented 2-D; skip if not
+            # Numerically-stable Softmax over the expert axis (the same
+            # normalization MoE's own kernel applies internally, per this
+            # section's own comment), averaged over every token.
+            shifted = logits - logits.max(axis=-1, keepdims=True)
+            exp = np.exp(shifted)
+            probs = exp / exp.sum(axis=-1, keepdims=True)
+            s = probs.sum(axis=0)
+            sum_prob[name] = s if name not in sum_prob else sum_prob[name] + s
+            count[name] = count.get(name, 0) + logits.shape[0]
+    return {name: s / max(count[name], 1) for name, s in sum_prob.items()}
+
+
 def apply_moe_whole_expert_pruning(
     model: Union[str, onnx.ModelProto],
     calibration_data: Optional[Sequence[Tensors]] = None,
@@ -10175,29 +10248,9 @@ def apply_moe_whole_expert_pruning(
     if not chains:
         return out
 
-    probe_names = sorted({chain.router_probs for chain in chains})
-    probe_model = _add_probe_outputs(out, probe_names)
-
-    sum_prob: Dict[str, np.ndarray] = {}
-    count: Dict[str, int] = {}
-    for batch in calibration_data:
-        result = backend.run_model(probe_model, batch, providers=providers)
-        for name in probe_names:
-            logits = np.asarray(result[name], dtype=np.float64)
-            if logits.ndim != 2:
-                continue  # router_probs is always documented 2-D; skip if not
-            # Numerically-stable Softmax over the expert axis (the same
-            # normalization MoE's own kernel applies internally, per
-            # this section's own comment), averaged over every token.
-            shifted = logits - logits.max(axis=-1, keepdims=True)
-            exp = np.exp(shifted)
-            probs = exp / exp.sum(axis=-1, keepdims=True)
-            s = probs.sum(axis=0)
-            sum_prob[name] = s if name not in sum_prob else sum_prob[name] + s
-            count[name] = count.get(name, 0) + logits.shape[0]
-    mean_gate_weight: Dict[str, np.ndarray] = {
-        name: s / max(count[name], 1) for name, s in sum_prob.items()
-    }
+    mean_gate_weight = _moe_router_gate_calibration_stats(
+        out, chains, calibration_data, providers
+    )
 
     def _importance(
         chain: _MoEExpertChain, initializer_map: Dict[str, onnx.TensorProto]
@@ -10238,20 +10291,28 @@ def apply_moe_whole_expert_pruning(
 # own dedicated implementation reuses that family's own real matching/
 # importance helpers directly (`_candidates`, `_wanda_norm_for_candidate`/
 # `_wanda_importance`, `_plain_structured_importance`, `_chain_group`,
-# `_plain_attention_head_importance`/`_gqa_group_importance`, ...) rather
-# than a duplicated or reimplemented copy of any of them. The one place real
-# duplication would otherwise have crept in -- Wanda's own calibration-
-# activation-probing loop, needed by both the mutating `apply_wanda_pruning`/
-# `apply_structured_wanda_pruning` and this module's own dry-run analyzers
-# -- was factored out into `_wanda_unstructured_calibration_stats`/
-# `_wanda_structured_calibration_stats` instead, which the real functions
-# now call too (a pure, behavior-preserving extraction, not a new code
-# path): one implementation of "what does calibration measure", shared by
-# both the mutating and the dry-run caller, rather than two.
+# `_plain_attention_head_importance`/`_gqa_group_importance`,
+# `_moe_importance`/`_moe_expert_weight_importance`, ...) rather than a
+# duplicated or reimplemented copy of any of them. The one place real
+# duplication would otherwise have crept in -- calibration-activation-
+# probing loops needed by both a mutating `apply_*` function and this
+# module's own dry-run analyzers -- was factored out into shared helpers
+# instead, which the real functions now call too (a pure,
+# behavior-preserving extraction each time, not a new code path): one
+# implementation of "what does calibration measure" per family, shared by
+# both the mutating and the dry-run caller, rather than two. This covers
+# every Wanda-calibrated family here: `_wanda_unstructured_calibration_stats`
+# (`apply_wanda_pruning`), `_wanda_structured_calibration_stats`
+# (`apply_structured_wanda_pruning`), `_wanda_attention_calibration_stats`
+# (`apply_attention_head_wanda_pruning`), and
+# `_moe_router_gate_calibration_stats` (`apply_moe_whole_expert_pruning`'s
+# own router-usage ranking, not Wanda-style but the exact same
+# probe-then-reduce shape).
 #
 # Supported families -- covering every shape this module's own
-# `_apply_chains`/`_apply_attention_chains` cover *except* the two
-# deliberately out-of-scope cases noted below:
+# `_apply_chains`/`_apply_attention_chains`/`_apply_moe_chains`/
+# `_apply_moe_whole_expert_chains` cover *except* the two deliberately
+# out-of-scope cases noted below:
 #
 # - `apply_magnitude_pruning`/`apply_wanda_pruning` (unstructured, per-
 #   weight-entry): every mode both support -- per-layer sparsity, N:M, and
@@ -10278,37 +10339,42 @@ def apply_moe_whole_expert_pruning(
 #       being a much more local, per-entry pooling with no cross-chain
 #       topology bookkeeping to replicate -- was judged not to earn its own
 #       separately-verified mirror within this change's own scope.
-# - `apply_attention_head_pruning` (heads/KV-groups): every chain kind it
-#   matches -- plain `Attention` (per-head), `GroupQueryAttention`/plain
-#   `ai.onnx::Attention` (per-KV-group, packed-QKV included) -- is covered.
-#   The Wanda-calibrated attention variant
-#   (`apply_attention_head_wanda_pruning`) is not -- a reasonable follow-on
-#   extension (its own calibration probe is a single, simple per-chain
-#   activation norm, much like the structured family's own), but left out
-#   of this change's own scope alongside `apply_sparsegpt_pruning` and the
-#   MoE family below.
+# - `apply_attention_head_pruning`/`apply_attention_head_wanda_pruning`
+#   (heads/KV-groups): every chain kind either matches -- plain `Attention`
+#   (per-head), `GroupQueryAttention`/plain `ai.onnx::Attention`
+#   (per-KV-group, packed-QKV included) -- is covered, both plain and
+#   Wanda-calibrated, sharing one `_analyze_attention_chains` loop
+#   (mirroring `_apply_attention_chains`'s own shared loop) parametrized by
+#   which importance callback to rank with -- exactly the same
+#   shared-loop-plus-importance-callback shape `_analyze_chains` already
+#   gives the structured family.
+# - `apply_moe_expert_channel_pruning`/`apply_moe_whole_expert_pruning`
+#   (MoE): both are covered, sharing the same "precomputed importance
+#   vector, then top-k" shape every other family here already has --
+#   `_moe_importance` for channel pruning (pure weight magnitude, no
+#   calibration), and, for whole-expert pruning, the exact same
+#   calibration-ranked-by-mean-router-gate-weight-with-weight-norm-fallback
+#   importance `apply_moe_whole_expert_pruning` itself uses (via the shared
+#   `_moe_router_gate_calibration_stats`/`_moe_expert_weight_importance`
+#   pair), not just the fallback alone -- so the dry run's own `margin`
+#   reflects the real router-usage ranking whenever calibration data
+#   produces one, the same fidelity every other calibrated family here
+#   already has.
 #
-# Not supported at all: `apply_sparsegpt_pruning` and the MoE family
-# (`apply_moe_expert_channel_pruning`/`apply_moe_whole_expert_pruning`).
-# SparseGPT's own per-column sequential/compensated Hessian-update loop
-# (see that function's own docstring, and its own `global_sparsity`-decline
-# reasoning) has no single upfront "here is the importance vector, here is
-# the cut" moment the way every other family here does -- an entry's own
-# effective importance depends on every *other* entry processed before it
-# in the same column-elimination order, via the running Hessian-inverse
-# update, not on a fixed score computed once before pruning starts. A dry
-# run could still *run* the full column-elimination loop and report which
-# entries ended up zeroed, but the "margin" this report exists to surface
-# would have no honest meaning: there is no single per-entry importance
-# score to report a gap between, only a sequential process whose own
-# intermediate state has no per-entry-comparable analogue -- reporting a
-# margin anyway would be noise dressed up as a number, so it's left out
-# rather than faked. MoE pruning was left out purely for scope/time, not
-# for any structural reason -- `_moe_importance`/
-# `_moe_expert_weight_importance` are already exactly the same
-# "precomputed importance vector, then top-k" shape every supported family
-# above is, so a `_analyze_moe_*` pair would be a straightforward follow-on
-# extension of the same pattern, not a new design.
+# Not supported at all: `apply_sparsegpt_pruning`. Its own per-column
+# sequential/compensated Hessian-update loop (see that function's own
+# docstring, and its own `global_sparsity`-decline reasoning) has no single
+# upfront "here is the importance vector, here is the cut" moment the way
+# every other family here does -- an entry's own effective importance
+# depends on every *other* entry processed before it in the same
+# column-elimination order, via the running Hessian-inverse update, not on
+# a fixed score computed once before pruning starts. A dry run could still
+# *run* the full column-elimination loop and report which entries ended up
+# zeroed, but the "margin" this report exists to surface would have no
+# honest meaning: there is no single per-entry importance score to report a
+# gap between, only a sequential process whose own intermediate state has
+# no per-entry-comparable analogue -- reporting a margin anyway would be
+# noise dressed up as a number, so it's left out rather than faked.
 
 
 @dataclass(frozen=True)
@@ -10330,7 +10396,15 @@ class PruningLayerSensitivity:
             pruning; ``"matmul_plain"``/``"matmul_gated"``/
             ``"matmul_residual"``/``"conv_plain"``/``"conv_residual"`` for
             structured pruning; ``"attention_head"``/
-            ``"attention_gqa_group"`` for attention pruning -- see
+            ``"attention_gqa_group"`` for attention pruning (shared by
+            :func:`apply_attention_head_pruning` and its Wanda-calibrated
+            counterpart :func:`apply_attention_head_wanda_pruning` alike --
+            `family` names the topology a unit was matched by, not the
+            calibration method used to rank it, exactly as unstructured/
+            structured pruning's own plain-vs-Wanda variants already share
+            their family strings above); ``"moe_expert_channel"`` for
+            :func:`apply_moe_expert_channel_pruning`; ``"moe_whole_expert"``
+            for :func:`apply_moe_whole_expert_pruning` -- see
             :func:`analyze_pruning_sensitivity`'s own docstring for exactly
             which topologies each maps to
     :param total: how many independently-ranked elements this unit owns --
@@ -11031,32 +11105,28 @@ def _attention_not_eligible(
     return not_eligible
 
 
-def _analyze_attention_head_pruning(
-    model: Union[str, onnx.ModelProto],
-    sparsity: float = 0.5,
-    importance_norm: _ImportanceNorm = "l2",
-) -> PruningSensitivityReport:
-    """Dry-run mirror of :func:`apply_attention_head_pruning`: same
-    matching (:func:`_find_attention_chains`/:func:`_find_gqa_chains`/
-    :func:`_find_onnx_attention_chains`), touched-role bookkeeping (see
-    :func:`_apply_attention_chains`), keep-count
-    (``max(1, h - round(h * sparsity))``, :func:`_apply_one_plain_attention_chain`/
-    :func:`_apply_one_gqa_chain`'s own formula), and importance
-    (:func:`_plain_attention_head_importance`/:func:`_gqa_group_importance`)
-    logic, reused directly, but `model` is never mutated.
+def _analyze_attention_chains(
+    graph: onnx.GraphProto,
+    chains: List[_AttnLikeChain],
+    sparsity: float,
+    compute_importance: Callable[..., np.ndarray],
+    compute_group_importance: Callable[..., np.ndarray],
+) -> List[PruningLayerSensitivity]:
+    """Dry-run mirror of :func:`_apply_attention_chains`'s own per-chain
+    loop -- shared body for :func:`_analyze_attention_head_pruning`/
+    :func:`_analyze_attention_head_wanda_pruning`, mirroring its touched-role
+    bookkeeping and keep-count (``max(1, h - round(h * sparsity))``,
+    :func:`_apply_one_plain_attention_chain`'s/:func:`_apply_one_gqa_chain`'s
+    own formula) exactly, but never actually slicing anything.
+    `compute_importance`/`compute_group_importance` take the exact same
+    arguments :func:`_apply_one_plain_attention_chain`'s/
+    :func:`_apply_one_gqa_chain`'s own callback parameter does --
+    ``(chain, wq, wk, wv, dq, dk, dv)``/``(chain, wq, wk, wv)`` -- so a
+    caller can pass :func:`_plain_attention_head_importance`/
+    :func:`_gqa_group_importance` (optionally wrapped, as
+    :func:`_analyze_attention_head_wanda_pruning` does, to fold in a
+    calibrated activation norm) unmodified.
     """
-    if not (0.0 <= sparsity < 1.0):
-        raise ValueError(f"sparsity must be in [0, 1), got {sparsity}")
-    _validate_importance_norm(importance_norm)
-    if isinstance(model, str):
-        model = onnx.load(model, load_external_data=False)
-    graph = model.graph
-
-    chains: List[_AttnLikeChain] = [
-        *_find_attention_chains(graph),
-        *_find_gqa_chains(graph),
-        *_find_onnx_attention_chains(graph),
-    ]
     initializer_map = {t.name: t for t in graph.initializer}
     producer_touched: Set[str] = set()
     consumer_touched: Set[str] = set()
@@ -11129,9 +11199,7 @@ def _analyze_attention_head_pruning(
                     wk_kn = wk_kn.T
                 if chain.v_weight_transposed:
                     wv_kn = wv_kn.T
-            importance = _gqa_group_importance(
-                chain, wq_kn, wk_kn, wv_kn, importance_norm
-            )
+            importance = compute_group_importance(chain, wq_kn, wk_kn, wv_kn)
         else:
             dq = chain.nq // h
             dk = chain.nk // h
@@ -11142,9 +11210,7 @@ def _analyze_attention_head_pruning(
             wq = w[:, : chain.nq]
             wk = w[:, chain.nq : chain.nq + chain.nk]
             wv = w[:, chain.nq + chain.nk :]
-            importance = _plain_attention_head_importance(
-                chain, wq, wk, wv, dq, dk, dv2, importance_norm
-            )
+            importance = compute_importance(chain, wq, wk, wv, dq, dk, dv2)
 
         keep_heads = np.sort(np.argsort(-importance)[:keep_count])
         keep_mask = np.zeros(h, dtype=bool)
@@ -11164,8 +11230,390 @@ def _analyze_attention_head_pruning(
         producer_touched.update(producer_names)
         consumer_touched.add(chain.consumer_weight)
 
+    return layers
+
+
+def _analyze_attention_head_pruning(
+    model: Union[str, onnx.ModelProto],
+    sparsity: float = 0.5,
+    importance_norm: _ImportanceNorm = "l2",
+) -> PruningSensitivityReport:
+    """Dry-run mirror of :func:`apply_attention_head_pruning`: same
+    matching (:func:`_find_attention_chains`/:func:`_find_gqa_chains`/
+    :func:`_find_onnx_attention_chains`) and per-chain loop
+    (:func:`_analyze_attention_chains`, the same shared body
+    :func:`_analyze_attention_head_wanda_pruning` uses), with plain
+    (:func:`_plain_attention_head_importance`/:func:`_gqa_group_importance`)
+    importance, reused directly, but `model` is never mutated.
+    """
+    if not (0.0 <= sparsity < 1.0):
+        raise ValueError(f"sparsity must be in [0, 1), got {sparsity}")
+    _validate_importance_norm(importance_norm)
+    if isinstance(model, str):
+        model = onnx.load(model, load_external_data=False)
+    graph = model.graph
+
+    chains: List[_AttnLikeChain] = [
+        *_find_attention_chains(graph),
+        *_find_gqa_chains(graph),
+        *_find_onnx_attention_chains(graph),
+    ]
+    layers = _analyze_attention_chains(
+        graph,
+        chains,
+        sparsity,
+        lambda chain, wq, wk, wv, dq, dk, dv: _plain_attention_head_importance(
+            chain, wq, wk, wv, dq, dk, dv, importance_norm
+        ),
+        lambda chain, wq, wk, wv: _gqa_group_importance(
+            chain, wq, wk, wv, importance_norm
+        ),
+    )
     return PruningSensitivityReport(
         layers=layers, not_eligible=_attention_not_eligible(graph, chains)
+    )
+
+
+def _analyze_attention_head_wanda_pruning(
+    model: Union[str, onnx.ModelProto],
+    calibration_data: Optional[Sequence[Tensors]] = None,
+    num_samples: int = 8,
+    seed: int = 0,
+    sparsity: float = 0.5,
+    importance_norm: _ImportanceNorm = "l2",
+    epsilon: float = 1e-8,
+    providers: Optional[Sequence[str]] = None,
+) -> PruningSensitivityReport:
+    """Dry-run mirror of :func:`apply_attention_head_wanda_pruning` -- same
+    matching (:func:`_find_attention_chains`/:func:`_find_gqa_chains`/
+    :func:`_find_onnx_attention_chains`), calibration
+    (:func:`_wanda_attention_calibration_stats`, the exact same helper
+    :func:`apply_attention_head_wanda_pruning` itself calls), per-chain loop
+    (:func:`_analyze_attention_chains`), and importance
+    (:func:`_plain_attention_head_importance`/:func:`_gqa_group_importance`,
+    scaled by the calibrated activation norm exactly as
+    :func:`apply_attention_head_wanda_pruning`'s own
+    `_wanda_attention_head_importance`/`_wanda_gqa_group_importance`
+    closures do) logic, reused directly, but `model` is never mutated.
+    """
+    if not (0.0 <= sparsity < 1.0):
+        raise ValueError(f"sparsity must be in [0, 1), got {sparsity}")
+    _validate_importance_norm(importance_norm)
+    if isinstance(model, str):
+        model = onnx.load(model, load_external_data=False)
+    if calibration_data is None:
+        calibration_data = generate_random_calibration_data(
+            model, num_samples=num_samples, seed=seed
+        )
+    graph = model.graph
+
+    chains: List[_AttnLikeChain] = [
+        *_find_attention_chains(graph),
+        *_find_gqa_chains(graph),
+        *_find_onnx_attention_chains(graph),
+    ]
+    if not chains:
+        return PruningSensitivityReport(
+            layers=[], not_eligible=_attention_not_eligible(graph, chains)
+        )
+
+    act_norm = _wanda_attention_calibration_stats(
+        model, chains, calibration_data, providers
+    )
+
+    def _wanda_attention_head_importance(chain, wq, wk, wv, dq, dk, dv):
+        base = _plain_attention_head_importance(
+            chain, wq, wk, wv, dq, dk, dv, importance_norm
+        )
+        norm = act_norm.get(chain.consumer_node.input[0])
+        if norm is None or norm.shape[0] != chain.nv:
+            return base  # no matching activation observed -- fall back to plain
+        act_head = np.array(
+            [
+                np.linalg.norm(norm[h * dv : (h + 1) * dv])
+                for h in range(chain.num_heads)
+            ]
+        )
+        return base * np.maximum(act_head, epsilon)
+
+    def _wanda_gqa_group_importance(chain, wq, wk, wv):
+        base = _gqa_group_importance(chain, wq, wk, wv, importance_norm)
+        norm = act_norm.get(chain.consumer_node.input[0])
+        dv = chain.v_head_size
+        width = chain.num_heads * dv
+        if norm is None or norm.shape[0] != width:
+            return base  # no matching activation observed -- fall back to plain
+        group_size = chain.num_heads // chain.kv_num_heads
+        act_group = np.array(
+            [
+                np.linalg.norm(norm[kv * group_size * dv : (kv + 1) * group_size * dv])
+                for kv in range(chain.kv_num_heads)
+            ]
+        )
+        return base * np.maximum(act_group, epsilon)
+
+    layers = _analyze_attention_chains(
+        graph,
+        chains,
+        sparsity,
+        _wanda_attention_head_importance,
+        _wanda_gqa_group_importance,
+    )
+    return PruningSensitivityReport(
+        layers=layers, not_eligible=_attention_not_eligible(graph, chains)
+    )
+
+
+# --- MoE expert-intermediate-channel family --------------------------------
+
+
+def _moe_not_eligible(
+    graph: onnx.GraphProto, chains: Union[List[_MoEChain], List[_MoEExpertChain]]
+) -> List[str]:
+    """Shared `not_eligible` for both MoE families
+    (:func:`_analyze_moe_expert_channel_pruning`/
+    :func:`_analyze_moe_whole_expert_pruning`) -- every unmatched
+    ``com.microsoft::MoE`` node, regardless of which of the two matchers
+    (:func:`_find_moe_chains`/:func:`_find_moe_whole_expert_chains`)
+    declined it; both `_MoEChain` and `_MoEExpertChain` name the same node
+    via their own `node` field, so one shared implementation suffices.
+    """
+    matched_ids = {id(c.node) for c in chains}
+    not_eligible = []
+    for node in graph.node:
+        if node.domain != _MOE_DOMAIN or node.op_type != "MoE":
+            continue
+        if id(node) in matched_ids:
+            continue
+        not_eligible.append(f"{node.op_type} '{_node_label(node)}'")
+    return not_eligible
+
+
+def _analyze_moe_chains(
+    graph: onnx.GraphProto,
+    chains: List[_MoEChain],
+    sparsity: float,
+    compute_importance: Callable[[_MoEChain, Dict[str, onnx.TensorProto]], np.ndarray],
+) -> List[PruningLayerSensitivity]:
+    """Dry-run mirror of :func:`_apply_moe_chains`'s own per-node loop --
+    the shared body :func:`_analyze_moe_expert_channel_pruning` uses,
+    mirroring its touched-role bookkeeping and keep-count
+    (``max(1, n - round(n * sparsity))``, :func:`_apply_moe_chains`'s own
+    formula) exactly, but never actually slicing `fc1`/`fc2`(`/fc1_experts_bias`).
+    """
+    initializer_map = {t.name: t for t in graph.initializer}
+    touched: Set[str] = set()
+    layers: List[PruningLayerSensitivity] = []
+
+    for chain in chains:
+        weight_names = {chain.fc1_w, chain.fc2_w}
+        if chain.fc1_b is not None:
+            weight_names.add(chain.fc1_b)
+        label = _node_label(chain.node)
+
+        if weight_names & touched:
+            layers.append(
+                PruningLayerSensitivity(
+                    label=label,
+                    family="moe_expert_channel",
+                    total=chain.inter_size,
+                    would_drop=0,
+                    margin=None,
+                    importance_min=0.0,
+                    importance_max=0.0,
+                )
+            )
+            continue
+        touched |= weight_names
+
+        n = chain.inter_size
+        keep_count = max(1, n - round(n * sparsity))
+        if keep_count >= n:
+            layers.append(
+                PruningLayerSensitivity(
+                    label=label,
+                    family="moe_expert_channel",
+                    total=n,
+                    would_drop=0,
+                    margin=None,
+                    importance_min=0.0,
+                    importance_max=0.0,
+                )
+            )
+            continue
+
+        importance = compute_importance(chain, initializer_map)
+        keep = np.sort(np.argsort(-importance)[:keep_count])
+        keep_mask = np.zeros(n, dtype=bool)
+        keep_mask[keep] = True
+        layers.append(
+            PruningLayerSensitivity(
+                label=label,
+                family="moe_expert_channel",
+                total=n,
+                would_drop=int(n - keep_count),
+                margin=_normalized_margin(importance, keep_mask),
+                importance_min=float(importance.min()),
+                importance_max=float(importance.max()),
+            )
+        )
+
+    return layers
+
+
+def _analyze_moe_expert_channel_pruning(
+    model: Union[str, onnx.ModelProto],
+    sparsity: float = 0.5,
+) -> PruningSensitivityReport:
+    """Dry-run mirror of :func:`apply_moe_expert_channel_pruning` -- same
+    matching (:func:`_find_moe_chains`), keep-count, and importance
+    (:func:`_moe_importance`) logic, reused directly, but `model` is never
+    mutated.
+    """
+    if not (0.0 <= sparsity < 1.0):
+        raise ValueError(f"sparsity must be in [0, 1), got {sparsity}")
+    if isinstance(model, str):
+        model = onnx.load(model, load_external_data=False)
+    graph = model.graph
+
+    chains = _find_moe_chains(graph)
+    layers = _analyze_moe_chains(graph, chains, sparsity, _moe_importance)
+    return PruningSensitivityReport(
+        layers=layers, not_eligible=_moe_not_eligible(graph, chains)
+    )
+
+
+# --- MoE whole-expert family -------------------------------------------
+
+
+def _analyze_moe_whole_expert_chains(
+    graph: onnx.GraphProto,
+    chains: List[_MoEExpertChain],
+    sparsity: float,
+    compute_importance: Callable[
+        [_MoEExpertChain, Dict[str, onnx.TensorProto]], np.ndarray
+    ],
+) -> List[PruningLayerSensitivity]:
+    """Dry-run mirror of :func:`_apply_moe_whole_expert_chains`'s own
+    per-node loop -- the shared body
+    :func:`_analyze_moe_whole_expert_pruning` uses, mirroring its
+    touched-role bookkeeping and `k`-floored keep-count
+    (``max(max(1, min(chain.k, n)), n - round(n * sparsity))``,
+    :func:`_apply_moe_whole_expert_chains`'s own formula) exactly, but never
+    actually slicing `fc1`/`fc2`/the router projection.
+    """
+    initializer_map = {t.name: t for t in graph.initializer}
+    touched: Set[str] = set()
+    layers: List[PruningLayerSensitivity] = []
+
+    for chain in chains:
+        weight_names = {chain.fc1_w, chain.fc2_w, chain.router_w}
+        if chain.fc1_b is not None:
+            weight_names.add(chain.fc1_b)
+        if chain.router_b is not None:
+            weight_names.add(chain.router_b)
+        label = _node_label(chain.node)
+
+        if weight_names & touched:
+            layers.append(
+                PruningLayerSensitivity(
+                    label=label,
+                    family="moe_whole_expert",
+                    total=chain.num_experts,
+                    would_drop=0,
+                    margin=None,
+                    importance_min=0.0,
+                    importance_max=0.0,
+                )
+            )
+            continue
+        touched |= weight_names
+
+        n = chain.num_experts
+        floor = max(1, min(chain.k, n))
+        keep_count = max(floor, n - round(n * sparsity))
+        if keep_count >= n:
+            layers.append(
+                PruningLayerSensitivity(
+                    label=label,
+                    family="moe_whole_expert",
+                    total=n,
+                    would_drop=0,
+                    margin=None,
+                    importance_min=0.0,
+                    importance_max=0.0,
+                )
+            )
+            continue
+
+        importance = compute_importance(chain, initializer_map)
+        keep = np.sort(np.argsort(-importance)[:keep_count])
+        keep_mask = np.zeros(n, dtype=bool)
+        keep_mask[keep] = True
+        layers.append(
+            PruningLayerSensitivity(
+                label=label,
+                family="moe_whole_expert",
+                total=n,
+                would_drop=int(n - keep_count),
+                margin=_normalized_margin(importance, keep_mask),
+                importance_min=float(importance.min()),
+                importance_max=float(importance.max()),
+            )
+        )
+
+    return layers
+
+
+def _analyze_moe_whole_expert_pruning(
+    model: Union[str, onnx.ModelProto],
+    calibration_data: Optional[Sequence[Tensors]] = None,
+    num_samples: int = 8,
+    seed: int = 0,
+    sparsity: float = 0.5,
+    providers: Optional[Sequence[str]] = None,
+) -> PruningSensitivityReport:
+    """Dry-run mirror of :func:`apply_moe_whole_expert_pruning` -- same
+    matching (:func:`_find_moe_whole_expert_chains`), calibration
+    (:func:`_moe_router_gate_calibration_stats`, the exact same helper
+    :func:`apply_moe_whole_expert_pruning` itself calls), `k`-floored
+    keep-count, and importance (mean router gate weight, falling back to
+    :func:`_moe_expert_weight_importance` when no matching calibration
+    activation was observed for a chain's `router_probs` -- exactly
+    :func:`apply_moe_whole_expert_pruning`'s own `_importance` closure)
+    logic, reused directly, but `model` is never mutated.
+    """
+    if not (0.0 <= sparsity < 1.0):
+        raise ValueError(f"sparsity must be in [0, 1), got {sparsity}")
+    if isinstance(model, str):
+        model = onnx.load(model, load_external_data=False)
+    if calibration_data is None:
+        calibration_data = generate_random_calibration_data(
+            model, num_samples=num_samples, seed=seed
+        )
+    graph = model.graph
+
+    chains = _find_moe_whole_expert_chains(graph)
+    if not chains:
+        return PruningSensitivityReport(
+            layers=[], not_eligible=_moe_not_eligible(graph, chains)
+        )
+
+    mean_gate_weight = _moe_router_gate_calibration_stats(
+        model, chains, calibration_data, providers
+    )
+
+    def _importance(
+        chain: _MoEExpertChain, initializer_map: Dict[str, onnx.TensorProto]
+    ) -> np.ndarray:
+        gate = mean_gate_weight.get(chain.router_probs)
+        if gate is None or gate.shape[0] != chain.num_experts:
+            return _moe_expert_weight_importance(chain, initializer_map)
+        return gate
+
+    layers = _analyze_moe_whole_expert_chains(graph, chains, sparsity, _importance)
+    return PruningSensitivityReport(
+        layers=layers, not_eligible=_moe_not_eligible(graph, chains)
     )
 
 
@@ -11183,6 +11631,9 @@ _SENSITIVITY_ANALYZERS: Dict[Callable[..., onnx.ModelProto], Callable[..., Any]]
     apply_structured_pruning: _analyze_structured_pruning,
     apply_structured_wanda_pruning: _analyze_structured_wanda_pruning,
     apply_attention_head_pruning: _analyze_attention_head_pruning,
+    apply_attention_head_wanda_pruning: _analyze_attention_head_wanda_pruning,
+    apply_moe_expert_channel_pruning: _analyze_moe_expert_channel_pruning,
+    apply_moe_whole_expert_pruning: _analyze_moe_whole_expert_pruning,
 }
 
 
@@ -11204,10 +11655,13 @@ def analyze_pruning_sensitivity(
     (actual zero-fraction of an already-pruned model); this is the
     *before* half that was missing.
 
-    `apply_fn` must be one of the five functions this module itself
+    `apply_fn` must be one of the eight functions this module itself
     exports: :func:`apply_magnitude_pruning`, :func:`apply_wanda_pruning`,
     :func:`apply_structured_pruning`, :func:`apply_structured_wanda_pruning`,
-    or :func:`apply_attention_head_pruning` -- passed by reference (e.g.
+    :func:`apply_attention_head_pruning`,
+    :func:`apply_attention_head_wanda_pruning`,
+    :func:`apply_moe_expert_channel_pruning`, or
+    :func:`apply_moe_whole_expert_pruning` -- passed by reference (e.g.
     ``analyze_pruning_sensitivity(model, apply_wanda_pruning, sparsity=0.6)``),
     not by name. Each dispatches to its own dedicated `_analyze_*`
     implementation, which directly reuses that same family's own real
@@ -11215,10 +11669,8 @@ def analyze_pruning_sensitivity(
     helpers -- never a duplicated or reimplemented copy of either -- so the
     report's own numbers are computed the exact same way the mutating call
     itself would compute them, up to (but never actually calling) the final
-    slice/zero step. :func:`apply_sparsegpt_pruning` and the MoE family
-    (:func:`apply_moe_expert_channel_pruning`/
-    :func:`apply_moe_whole_expert_pruning`) are not supported (a
-    `ValueError` naming the five functions that are); neither is
+    slice/zero step. :func:`apply_sparsegpt_pruning` is not supported (a
+    `ValueError` naming the eight functions that are); neither is
     `apply_structured_pruning`/`apply_structured_wanda_pruning`'s own
     `global_sparsity=True` mode or a model containing any `Concat`-merged
     skip-connection chain (both a `NotImplementedError`, from within the
@@ -11227,7 +11679,7 @@ def analyze_pruning_sensitivity(
     behind every one of these scope decisions.
 
     :param model: the onnx ModelProto or file path `apply_fn` would take
-    :param apply_fn: one of this module's own five supported `apply_*`
+    :param apply_fn: one of this module's own eight supported `apply_*`
             functions, passed by reference
     :param kwargs: forwarded to `apply_fn`'s own dedicated `_analyze_*`
             counterpart, which accepts the same parameters `apply_fn`
