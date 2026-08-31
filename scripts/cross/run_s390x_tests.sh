@@ -68,6 +68,17 @@ rm -rf "${SYSROOT}/work/tests"
 cp -r "${REPO_ROOT}/tests" "${SYSROOT}/work/tests"
 cp "${REPO_ROOT}/pyproject.toml" "${SYSROOT}/work/"
 
+# tests/test_check_decode_parity.py imports check_decode_parity from
+# scripts/apple/ at module scope (see that test file's sys.path.insert).
+# Copy just that one module in, not the rest of scripts/apple/ -- its
+# siblings (export_llm_to_coreml.py, coreml_backend.py, ...) pull in
+# coremltools/torch/transformers, which have no s390x build.
+# check_decode_parity.py itself only imports argparse/sys/pathlib, so it's
+# safe to run standalone here.
+rm -rf "${SYSROOT}/work/scripts"
+mkdir -p "${SYSROOT}/work/scripts/apple"
+cp "${REPO_ROOT}/scripts/apple/check_decode_parity.py" "${SYSROOT}/work/scripts/apple/"
+
 echo "== environment =="
 chroot "${SYSROOT}" /bin/sh -c 'cd /work && PYTHONPATH=/work/pylibs python3 -c "
 import sys, numpy, onnx, onnxsim
