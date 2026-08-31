@@ -32,6 +32,16 @@ name: Core ML Integration
 # secret, the one thing a token-less local sandbox can't do (see that script's module
 # docstring). Like model-regression.yml's real-model sweep, this is multi-GB-download
 # heavy, so it runs on workflow_dispatch/schedule only, never on pull_request.
+#
+# A fourth job -- `benchmark-decode-macos` -- closes the loop those two only prepare
+# for: it exports a small model and actually runs scripts/apple/run_llm_decode_benchmark.py
+# against it through the real Core ML runtime on the macOS runner, the same two axes
+# (decode tok/s, peak RSS) DeviceMark's (https://devicemark.github.io/) on-device LLM
+# leaderboard measures. Every other job in this workflow only checks that a graph
+# *converts*; this is the one place the decode benchmark harness itself actually
+# executes anywhere, since no environment developing this repo has a macOS/Core ML
+# runtime to run it in locally. Also workflow_dispatch/schedule-only, matching the
+# other real-model jobs.
 
 on:
   schedule:
@@ -200,3 +210,43 @@ jobs:
           python "$GITHUB_WORKSPACE/scripts/apple/prepare_benchmark_models.py" \
             --only meta-llama/Llama-3.2-1B-Instruct \
             --output-dir benchmark_models
+
+  benchmark-decode-macos:
+    name: Run LLM decode benchmark (macOS, real Core ML)
+    needs: build-macos
+    if: github.event_name != 'pull_request'
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+      - uses: actions/download-artifact@v8
+        with:
+          name: onnxsim-wheel-macos
+          path: wheelhouse
+      - name: Install onnxsim wheel + LLM export/benchmark deps
+        run: |
+          python3 -m pip install --upgrade pip
+          python3 -m pip install "optimum-onnx" transformers coremltools onnxruntime
+          python3 -m pip install wheelhouse/*.whl
+      - name: Verify the installed wheel is used (not the source tree)
+        working-directory: ${{ runner.temp }}
+        run: python3 -c "import onnxsim, onnxsim.onnxsim_cpp2py_export as m; print(onnxsim.__version__, m.__file__)"
+      - name: Export HuggingFaceTB/SmolLM2-135M-Instruct
+        working-directory: ${{ runner.temp }}
+        run: |
+          python3 "$GITHUB_WORKSPACE/scripts/apple/export_llm_to_coreml.py" \
+            HuggingFaceTB/SmolLM2-135M-Instruct \
+            --max-context-length 512 --output smollm2.mlpackage
+      - name: Run the decode benchmark through the real Core ML runtime
+        working-directory: ${{ runner.temp }}
+        run: |
+          {
+            echo "### Decode benchmark: HuggingFaceTB/SmolLM2-135M-Instruct"
+            echo '```'
+            python3 "$GITHUB_WORKSPACE/scripts/apple/run_llm_decode_benchmark.py" \
+              smollm2.mlpackage --prompt "The capital of France is" --max-new-tokens 20
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
