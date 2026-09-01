@@ -48,7 +48,10 @@ name: Core ML Integration
 # since no environment developing this repo has a macOS/Core ML runtime to run
 # them in locally. The matrix spans two already-validated architecture families
 # (Llama-style via SmolLM2, Qwen2) so a translator regression specific to one
-# doesn't hide behind the other passing. Also workflow_dispatch/schedule-only,
+# doesn't hide behind the other passing, plus a third entry re-running SmolLM2
+# with --quantize-weights int8 (scripts/apple/export_llm_to_coreml.py) so the
+# weight-only-quantization decode speedup and decode parity are both measured
+# on real hardware, not just asserted. Also workflow_dispatch/schedule-only,
 # matching the other real-model jobs.
 
 on:
@@ -233,10 +236,23 @@ jobs:
             slug: smollm2-135m
             max_context_length: 512
             dtype: fp32
+            quantize_weights: none
           - model_id: Qwen/Qwen2.5-1.5B-Instruct
             slug: qwen2.5-1.5b
             max_context_length: 512
             dtype: fp16
+            quantize_weights: none
+          # Same model/dtype as the first entry, weight-only int8 quantized --
+          # see scripts/apple/README.md's "Theoretical ceiling" section for why
+          # this is expected to raise decode tok/s (roughly halves DRAM bytes
+          # read per token, the bandwidth-bound bottleneck for decode) without
+          # touching compute precision. Runs decode parity too, so a quality
+          # regression from quantization shows up here, not just a speed number.
+          - model_id: HuggingFaceTB/SmolLM2-135M-Instruct
+            slug: smollm2-135m-int8
+            max_context_length: 512
+            dtype: fp32
+            quantize_weights: int8
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
@@ -260,6 +276,7 @@ jobs:
           python3 "$GITHUB_WORKSPACE/scripts/apple/export_llm_to_coreml.py" \
             ${{ matrix.model_id }} --dtype ${{ matrix.dtype }} \
             --max-context-length ${{ matrix.max_context_length }} \
+            --quantize-weights ${{ matrix.quantize_weights }} \
             --output ${{ matrix.slug }}.mlpackage
       - name: Run the decode benchmark through the real Core ML runtime
         working-directory: ${{ runner.temp }}

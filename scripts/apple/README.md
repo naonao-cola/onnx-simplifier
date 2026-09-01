@@ -118,6 +118,77 @@ doesn't hide behind the other passing), posting each model's numbers to that
 run's job summary -- `workflow_dispatch`/schedule-only, like the other
 real-model jobs in that workflow, not on every PR.
 
+### Theoretical ceiling
+
+`run_llm_decode_benchmark.py` reports a decode tok/s number, but not what to
+expect from it. This section gives a back-of-envelope ceiling to compare a
+measured number against, sourced from Manjeet Singh's reverse-engineering of
+the M4 Neural Engine ("Inside the M4 ANE, Part 4: The Complete Machine",
+[maderix.github.io](https://maderix.github.io/articles/inside-the-m4-ane-part-4/),
+Aug 2026) -- the only public source we're aware of with hardware-level,
+measured (not marketing) numbers for this chip.
+
+**M4 ANE (H16G, 16 cores), measured:**
+
+| | |
+| --- | --- |
+| fp16 peak | 19 TFLOPS (18.77 TFLOPS / 98.8% of ceiling measured on a 64-layer conv1x1 chain -- a single isolated matmul only reaches ~30%) |
+| W8A8 (packed int8) peak | 38 TOPS (36.01 TOPS measured) |
+| Power at fp16 peak | 4.57 W (4.1 TFLOPS/W); 0 mW idle |
+| Unified DRAM bandwidth | 120 GB/s, shared with the CPU and GPU |
+| Dispatch floor | ~90 µs of host-side (XPC) overhead per ANE program submission, independent of the work submitted |
+
+**Why decode is bandwidth-bound, not compute-bound.** A single greedy decode
+step (this benchmark's shape: batch 1, one new token, reusing the KV cache)
+does roughly `2 x parameter_count` FLOPs of *compute* -- for
+`Qwen/Qwen2.5-1.5B-Instruct`, about 3 GFLOP, ~160 µs at the ANE's 19 TFLOPS
+ceiling. But producing that token requires reading essentially the entire
+weight set once (nothing amortizes a weight read across tokens at batch
+size 1, unlike prefill's one-pass-over-the-whole-prompt or a
+multi-sequence-batched server), and moving those bytes is the actual
+constraint:
+
+```
+decode tok/s ceiling ≈ DRAM bandwidth / weight bytes read per token
+                      ≈ 120 GB/s / (model parameter count x bytes per weight)
+```
+
+| Model | Params | fp16 weights | fp16 ceiling | int8-weight ceiling |
+| --- | --- | --- | --- | --- |
+| `HuggingFaceTB/SmolLM2-135M-Instruct` | 135M | 270 MB | ~444 tok/s | ~889 tok/s |
+| `Qwen/Qwen2.5-1.5B-Instruct` | 1.5B | 3.0 GB | ~40 tok/s | ~80 tok/s |
+| `HuggingFaceTB/SmolLM2-1.7B-Instruct` | 1.7B | 3.4 GB | ~35 tok/s | ~71 tok/s |
+
+For every model in this table, the bandwidth-bound time per token (µs to
+low-ms) is well past both the ~90 µs ANE dispatch floor and the sub-200 µs
+compute time -- so at these sizes, dispatch overhead and raw FLOPs are noise
+next to weight-streaming time, and the lever that actually moves decode tok/s
+is **bytes per weight**, not compute throughput. (The article's own explicit
+finding backs the general shape of this: *"For LLM inference, prefill
+provides the large matrix operations that suit the ANE. Token-by-token
+decode contains smaller operations for which the 90 µs submission cost can
+dominate, making CPU/SME execution more suitable"* -- true for a
+small-enough model or a system where the ANE isn't reading gigabytes of
+weights per step, but bandwidth dominates first at the model sizes in this
+suite.)
+
+This is also why W8A8 (packed int8 *compute*, up to 1.95x the fp16 rate per
+the article's own measurements) isn't the right lever here: it speeds up the
+compute time we've just shown is already negligible, and per the same
+article, weight-only int8 with fp16 activations "stays on the fp16 compute
+path" -- no compute speedup at all. What halving weight bytes *does* help,
+regardless of compute path, is the number in the denominator above:
+`--quantize-weights` (below) is aimed squarely at that, not at compute
+throughput.
+
+**Caveats:** this ceiling assumes the full 120 GB/s is available to weight
+streaming alone (no contention from the KV-cache read/write, other
+processes, or `MLComputeUnits=ALL` routing some ops to the GPU/CPU instead,
+each with their own bandwidth share); it is an optimistic upper bound, not a
+number `run_llm_decode_benchmark.py` should be expected to hit. It is also
+specific to the M4 -- later chips (see "The M6: Dual ANE" in the source
+article) change these constants.
+
 ### Decode parity (`check_decode_parity.py`)
 
 The decode benchmark above measures speed, not correctness -- a model that
@@ -150,6 +221,41 @@ decode benchmark, once per matrix entry, also posting to the job summary.
 The pure comparison logic (`compare_token_sequences`) has no coremltools/
 torch/transformers dependency and is unit-tested directly in
 `tests/test_check_decode_parity.py`.
+
+### Weight-only quantization (`--quantize-weights`)
+
+The "Theoretical ceiling" section above works out that a decode step is
+bandwidth-bound, not compute-bound, at every model size this suite has
+tested -- the whole weight set has to be read from DRAM once per token
+regardless of how little arithmetic that token needs, since nothing
+amortizes a weight read across tokens at batch size 1. `--quantize-weights
+{int8,int4}` pulls the lever that actually follows from that: it applies
+`coremltools.optimize.coreml.linear_quantize_weights` to the *converted*
+Core ML model (`constexpr_affine_dequantize`, per-channel, symmetric),
+replacing full-precision weight constants with int8/int4 ones that get
+dequantized back to float on the fly at compute time.
+
+```bash
+python export_llm_to_coreml.py HuggingFaceTB/SmolLM2-135M-Instruct \
+    --max-context-length 512 --quantize-weights int8 --output smollm2-int8.mlpackage
+```
+
+Deliberately **not** the same thing as Core ML's packed W8A8 mode (int8
+weights *and* activations, which the M4 ANE can run at up to ~2x the fp16
+*compute* rate): this flag only quantizes weights, leaving activations and
+the actual compute in float, so it doesn't touch the ANE's compute
+throughput at all -- appropriately, since compute isn't the bottleneck here
+per the ceiling analysis. What it does do is roughly halve (int8) or
+quarter (int4) the bytes moved from DRAM per decode step, which is the side
+of the ceiling that's actually binding. `run_llm_decode_benchmark.py` and
+`check_decode_parity.py` both work unchanged against a quantized
+`.mlpackage` -- shapes and dtypes at the model's I/O boundary don't change,
+only the weight constants' on-disk/in-graph representation does.
+
+`coreml-integration.yml`'s `benchmark-decode-macos` job includes a
+`quantize_weights: int8` matrix entry (same model as the unquantized
+baseline) so both the decode-tok/s effect and decode parity are measured on
+real hardware, not just argued for from the theoretical ceiling.
 
 ### Scaling to few-billion-parameter models
 
