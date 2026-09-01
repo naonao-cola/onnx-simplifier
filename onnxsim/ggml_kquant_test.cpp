@@ -4,15 +4,20 @@
  * Standalone: g++ -std=c++20 ggml_kquant_test.cpp -o t && ./t
  *
  * Dependency-free unit test for ggml_kquant.h's GGML K-quant dequantization
- * (Q8_0, Q4_K, Q5_K, Q6_K), mirroring gguf_dtype_test.cpp's style.
+ * (Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q8_0), mirroring gguf_dtype_test.cpp's
+ * style.
  *
  * Every block layout/formula this decodes was cross-checked against an
  * independent from-scratch Python transcription of GGML's own reference
- * (ggml-quants.c's dequantize_row_q8_0/q4_K/q5_K/q6_K) over full random
- * blocks -- 0 error. The cases here are smaller, hand-verifiable vectors
- * (chosen so most of a block's bytes are zero and its non-zero bytes'
- * contribution can be checked by hand), meant to catch a regression in this
- * file specifically, not to re-derive GGML's spec from scratch.
+ * (ggml-quants.c's dequantize_row_q2_K/q3_K/q4_K/q5_K/q6_K/q8_0) over full
+ * random blocks -- 0 error; Q3_K's UnpackQ3KScales specifically was fuzzed
+ * against the reference's own memcpy-onto-uint32_t bit-twiddling over 2000
+ * random 12-byte scale tables (see ggml_kquant.h's file comment for why that
+ * needed its own verification pass). The cases here are smaller, hand-
+ * verifiable vectors (chosen so most of a block's bytes are zero and its
+ * non-zero bytes' contribution can be checked by hand), meant to catch a
+ * regression in this file specifically, not to re-derive GGML's spec from
+ * scratch.
  */
 #include "ggml_kquant.h"
 
@@ -208,6 +213,84 @@ void TestQ6_K() {
   CheckNear(out[0], -290.0f, "Q6_K element 0");
 }
 
+// Same zeroed-sub-block trick as TestQ4_K/TestQ5_K: only the first (scale,
+// min) pair (scales[0]) is non-trivial, everything else stays 0.
+void TestQ2_K() {
+  std::vector<uint8_t> block(KQuantBlockBytes(GGML_TYPE_Q2_K), 0);
+  uint8_t* scales = block.data();   // 16 bytes
+  uint8_t* qs = block.data() + 16;  // 64 bytes
+  const uint16_t d_bits = EncodeF16(1.0f);
+  const uint16_t dmin_bits = EncodeF16(0.5f);
+  block[16 + 64] = static_cast<uint8_t>(d_bits & 0xFF);
+  block[16 + 64 + 1] = static_cast<uint8_t>((d_bits >> 8) & 0xFF);
+  block[16 + 64 + 2] = static_cast<uint8_t>(dmin_bits & 0xFF);
+  block[16 + 64 + 3] = static_cast<uint8_t>((dmin_bits >> 8) & 0xFF);
+  scales[0] = 0x31;  // low nibble (scale) = 1, high nibble (min) = 3
+  qs[0] = 0x01;      // element 0: 2-bit code (qs[0] >> 0) & 3 = 1
+  // qs[1] left 0 -> element 1's 2-bit code is 0.
+
+  // dl = d * 1 = 1.0; ml = dmin * 3 = 1.5.
+  // expected[0] = dl * 1 - ml = 1.0 - 1.5 = -0.5.
+  // expected[1] = dl * 0 - ml = -1.5.
+  float out[256];
+  DequantizeQ2_KBlock(block.data(), out);
+  CheckNear(out[0], -0.5f, "Q2_K sub-block 0 element 0");
+  CheckNear(out[1], -1.5f, "Q2_K sub-block 0 element 1 (qs[1]=0)");
+  CheckNear(out[16], 0.0f, "Q2_K sub-block 1 (zeroed scale/min) is 0");
+}
+
+// Q3_K's -32 scale bias means (unlike Q4_K/Q5_K/Q6_K) a zeroed scale byte
+// does NOT give a trivially-zero output -- no zeroed-sub-block shortcut, so
+// this checks a single fully-determined element instead (same approach as
+// TestQ6_K). scales12 has only its first byte set, chosen so
+// UnpackQ3KScales's bit-spreading from the other two words contributes
+// nothing and scales[0] reduces to exactly that byte's low nibble (verified
+// separately in TestUnpackQ3KScales below and against the Python reference
+// -- see this file's header comment).
+void TestQ3_K() {
+  std::vector<uint8_t> block(KQuantBlockBytes(GGML_TYPE_Q3_K), 0);
+  // hmask (block.data(), 32 bytes) is left all 0.
+  uint8_t* qs = block.data() + 32;             // 64 bytes
+  uint8_t* scales12 = block.data() + 32 + 64;  // 12 bytes
+  const uint16_t d_bits = EncodeF16(1.0f);
+  block[32 + 64 + 12] = static_cast<uint8_t>(d_bits & 0xFF);
+  block[32 + 64 + 12 + 1] = static_cast<uint8_t>((d_bits >> 8) & 0xFF);
+  scales12[0] = 0x1F;  // -> unpacked scales[0] == 15 (see TestUnpackQ3KScales)
+  qs[0] = 0x01;        // element 0's 2-bit low code: (qs[0] >> 0) & 3 = 1
+
+  // dl = d_all * (15 - 32) = -17. hmask[0] == 0 -> bit m=1 clear -> subtract
+  // 4: value = 1 - 4 = -3. expected[0] = dl * -3 = 51.0.
+  float out[256];
+  DequantizeQ3_KBlock(block.data(), out);
+  CheckNear(out[0], 51.0f, "Q3_K element 0");
+}
+
+void TestUnpackQ3KScales() {
+  // scales12 with only byte 0 set: the two other 32-bit words (and the
+  // `tmp`-derived high-bit spreading) contribute nothing, so scales[0]
+  // reduces to exactly (scales12[0] & 0x0F) -- 0x1F & 0x0F == 15.
+  uint8_t scales12[12] = {0x1F, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+  int8_t out[16];
+  UnpackQ3KScales(scales12, out);
+  Check(out[0] == 15, "UnpackQ3KScales single-byte input");
+  Check(out[1] == 0, "UnpackQ3KScales untouched slot stays 0");
+
+  // A fully mixed input, independently cross-checked against a from-scratch
+  // Python re-implementation of the reference's memcpy-onto-uint32_t
+  // bit-twiddling (see ggml_kquant.h's file comment) -- not hand-derivable,
+  // but pinned here as a regression check once verified externally.
+  uint8_t mixed[12] = {0x01, 0x23, 0x45, 0x67, 0x89, 0xAB,
+                       0xCD, 0xEF, 0x10, 0x32, 0x54, 0x76};
+  const int8_t want[16] = {1,  35, 5,  39, 9, 11, 29, 31,
+                           16, 50, 20, 54, 8, 10, 28, 30};
+  UnpackQ3KScales(mixed, out);
+  bool ok = true;
+  for (int i = 0; i < 16; ++i) {
+    if (out[i] != want[i]) ok = false;
+  }
+  Check(ok, "UnpackQ3KScales mixed input matches Python reference");
+}
+
 void TestDequantizeGgmlKQuantRejectsBadInput() {
   std::vector<uint8_t> q8_block(KQuantBlockBytes(GGML_TYPE_Q8_0), 0);
   std::vector<float> out;
@@ -240,6 +323,9 @@ void TestDequantizeGgmlKQuantRejectsBadInput() {
 int main() {
   TestFloat16BitsToFloat32();
   TestQ8_0();
+  TestQ2_K();
+  TestQ3_K();
+  TestUnpackQ3KScales();
   TestQ4_K();
   TestQ5_K();
   TestQ6_K();
