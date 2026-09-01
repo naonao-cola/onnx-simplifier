@@ -140,8 +140,8 @@ void TestAlignmentPadding() {
 }
 
 // Writes a minimal, hand-built GGUF v3 file with one raw F32 tensor and one
-// tensor of a quantized ggml_type this pool cannot represent (id 11 ==
-// GGML_TYPE_Q3_K -- a real GGML type, deliberately NOT one of IsKQuant/
+// tensor of a quantized ggml_type this pool cannot represent (id 15 ==
+// GGML_TYPE_Q8_K -- a real GGML type, deliberately NOT one of IsKQuant/
 // IsLegacyQuant/IsMxfp4's covered types), to exercise LoadGGUF's
 // skip-and-report path -- the case that matters most in practice, since a
 // real quantized LLM's .gguf is mostly tensors like this.
@@ -166,13 +166,13 @@ void TestSkipsUnsupportedDtype() {
     WriteLE<uint32_t>(out, GGML_TYPE_F32);  // type
     WriteLE<uint64_t>(out, 0);              // offset
 
-    // Tensor 1: "quant", ggml_type 11 (Q3_K), ne=[32] -- offset chosen past
+    // Tensor 1: "quant", ggml_type 15 (Q8_K), ne=[32] -- offset chosen past
     // 'raw's aligned 32-byte slot. This test never decodes its bytes (can't
     // -- that's the whole point), so the payload content doesn't matter.
     write_string("quant");
     WriteLE<uint32_t>(out, 1);                  // n_dimensions
     WriteLE<uint64_t>(out, 32);                 // ne[0]
-    WriteLE<uint32_t>(out, 11);                 // GGML_TYPE_Q3_K
+    WriteLE<uint32_t>(out, 15);                 // GGML_TYPE_Q8_K
     WriteLE<uint64_t>(out, kDefaultAlignment);  // offset (aligned)
 
     // Pad to the data section (header ends right here; align up to 32).
@@ -295,7 +295,7 @@ void TestLoadGGUFMmapSkipsUnsupportedDtype() {
     write_string("quant");
     WriteLE<uint32_t>(out, 1);
     WriteLE<uint64_t>(out, 32);
-    WriteLE<uint32_t>(out, 11);  // GGML_TYPE_Q3_K
+    WriteLE<uint32_t>(out, 15);  // GGML_TYPE_Q8_K
     WriteLE<uint64_t>(out, kDefaultAlignment);
 
     uint64_t header_end = static_cast<uint64_t>(out.tellp());

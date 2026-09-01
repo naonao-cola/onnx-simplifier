@@ -253,7 +253,7 @@ void TestImportModelWithGGUFLazy() {
   std::remove(path.c_str());
 }
 
-// Hand-builds a GGUF file with one raw F32 tensor ("w1") and one Q3_K
+// Hand-builds a GGUF file with one raw F32 tensor ("w1") and one Q8_K
 // (quantized, unsupported -- deliberately NOT one of IsKQuant/IsLegacyQuant/
 // IsMxfp4's covered types) tensor ("w2"), then imports it against a model
 // declaring both as initializers -- the scenario a real quantized-LLM
@@ -280,7 +280,7 @@ void TestImportModelWithGGUFSkipsQuantized() {
     write_string("w2");
     WriteLE<uint32_t>(out, 1);
     WriteLE<uint64_t>(out, 32);  // ne[0]
-    WriteLE<uint32_t>(out, 11);  // GGML_TYPE_Q3_K
+    WriteLE<uint32_t>(out, 15);  // GGML_TYPE_Q8_K
     WriteLE<uint64_t>(out, kDefaultAlignment);
 
     uint64_t header_end = static_cast<uint64_t>(out.tellp());

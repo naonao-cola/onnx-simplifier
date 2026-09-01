@@ -41,39 +41,49 @@ are silently left alone.
 
 Real quantized checkpoints store most of their weights as one of GGML's
 block-quantized formats, not plain float. This function decodes the
-**K-quant** family -- `Q4_K`, `Q5_K`, `Q6_K` (256-element super-blocks, each
-with its own packed 6-bit per-sub-block scale/min pair) and `Q8_0`
-(32-element blocks, one fp16 scale each) -- which is what Unsloth's `*_K_M`/
-`*_K_S`/`Q8_0` GGUF exports actually use for the bulk of their tensors; the
-**legacy** family -- `Q4_0`, `Q4_1`, `Q5_0`, `Q5_1` (plain 32-element blocks,
-no super-block scale/min table) -- which llama.cpp's own mixed-precision
-quantizers still pick for particular tensor roles (embeddings, attention
-projections) even in an otherwise K-quant checkpoint; and **MXFP4**
-(32-element blocks, one shared power-of-two E8M0 exponent byte and 16 bytes
-of packed 4-bit e2m1-style codes) -- the OCP Microscaling FP4 format
-official gpt-oss GGUF releases use natively for their MoE expert weights.
-Every block layout and dequantization formula is transcribed directly from
-GGML's own reference implementation
+**K-quant** family -- `Q2_K`, `Q3_K`, `Q4_K`, `Q5_K`, `Q6_K` (256-element
+super-blocks, each with its own packed sub-block scale/min or scale table)
+and `Q8_0` (32-element blocks, one fp16 scale each) -- which is what
+Unsloth's `*_K_M`/`*_K_S`/`Q8_0` GGUF exports actually use for the bulk of
+their tensors; the **legacy** family -- `Q4_0`, `Q4_1`, `Q5_0`, `Q5_1`
+(plain 32-element blocks, no super-block scale/min table) -- which
+llama.cpp's own mixed-precision quantizers still pick for particular tensor
+roles (embeddings, attention projections) even in an otherwise K-quant
+checkpoint; and **MXFP4** (32-element blocks, one shared power-of-two E8M0
+exponent byte and 16 bytes of packed 4-bit e2m1-style codes) -- the OCP
+Microscaling FP4 format official gpt-oss GGUF releases use natively for
+their MoE expert weights. Every block layout and dequantization formula is
+transcribed directly from GGML's own reference implementation
 (https://github.com/ggml-org/ggml -- `ggml-common.h`'s block structs,
 `ggml-quants.c`'s `dequantize_row_q*`/`dequantize_row_mxfp4` functions,
 `ggml-impl.h`'s `ggml_e8m0_to_fp32_half`) and cross-checked against an
 independent from-scratch re-implementation over full random blocks before
 being committed (see `onnxsim/ggml_kquant.h`'s, `onnxsim/
-ggml_legacy_quant.h`'s, and `onnxsim/ggml_mxfp4.h`'s file comments).
+ggml_legacy_quant.h`'s, and `onnxsim/ggml_mxfp4.h`'s file comments). `Q3_K`
+needed one extra layer of care: GGML's own reference unpacks its 12-byte
+packed-6-bit scale table by `memcpy`-ing it onto a native `uint32_t[3]` and
+bit-twiddling those words directly, which only reproduces little-endian byte
+order -- `ggml_kquant.h`'s `UnpackQ3KScales` does the identical bit-twiddling
+arithmetic but starting from explicit little-endian word reads, so it
+decodes correctly on a big-endian host too (this repo tests on s390x).
 
-The legacy family's real-world importance was confirmed empirically, not
-assumed: fetching the real header of several official
+The legacy and K-quant-completion (`Q2_K`/`Q3_K`) families' real-world
+importance were both confirmed empirically, not assumed: fetching the real
+header of several official
 [`unsloth/gpt-oss-20b-GGUF`](https://huggingface.co/unsloth/gpt-oss-20b-GGUF)
 quantizations (via an HTTP range request for just the header bytes, no need
 to download the multi-gigabyte weight data) showed that most of the
 popular, size-optimized ones -- `Q4_K_M`, `Q4_K_S`, `Q5_K_M`, `Q4_0`,
 `UD-Q4_K_XL` -- mix in one or more legacy-family tensors for `token_embd`/
-`attn_q`/`attn_k`/`attn_v`, and would fail to import at all without this.
+`attn_q`/`attn_k`/`attn_v`, and would fail to import at all without that
+family; and that the two smallest variants, `Q2_K` and `Q3_K_M`, mix in
+`Q2_K`/`Q3_K` tensors themselves (unsurprising, given their names) for the
+same tensor roles. With both families added, every one of these
+quantizations' non-`IQ4_NL` tensors now decodes; only their `IQ4_NL`
+tensors (an importance-matrix format, see "Scope" below) remain unsupported
+-- confirmed by re-fetching and re-checking each header after implementing.
 Only the largest variants (`F16`, `Q8_0`, `Q6_K`, `UD-Q8_K_XL`) used
-exclusively K-quant/MXFP4/raw types before this family was added. The
-smallest variants (`Q2_K`, `Q3_K_M`) still fail: they additionally need
-`Q3_K` and an `IQ*`/`Q2_K`-family type, which remain out of scope (see
-"Scope" below).
+exclusively K-quant/MXFP4/raw types from the start.
 
 A matched K-quant, legacy-quant, or MXFP4 tensor's initializer has its
 `data_type` forced to `FLOAT` regardless of what `model` previously
@@ -82,15 +92,16 @@ declared for it -- the decoded values are only meaningful as float32.
 ## Scope
 
 Handled:
-- `Q4_K`, `Q5_K`, `Q6_K`, `Q8_0` (K-quant), `Q4_0`, `Q4_1`, `Q5_0`, `Q5_1`
-  (legacy), `MXFP4` -- decoded to float32.
+- `Q2_K`, `Q3_K`, `Q4_K`, `Q5_K`, `Q6_K`, `Q8_0` (K-quant), `Q4_0`, `Q4_1`,
+  `Q5_0`, `Q5_1` (legacy), `MXFP4` -- decoded to float32.
 - Any raw (already-unquantized) GGML type (`F32`, `F16`, `BF16`, `F64`,
   `I8`/`I16`/`I32`/`I64`) -- copied through unchanged, same as `import_gguf`.
 
 Not handled (reported in `skipped`, left untouched):
-- `Q8_1`, `Q2_K`/`Q3_K`/`Q8_K`, `NVFP4`, and every `IQ*` importance-matrix
-  variant -- these have real, different block layouts this decoder does not
-  implement.
+- `Q8_1`, `Q8_K`, `NVFP4`, and every `IQ*` importance-matrix variant (e.g.
+  `IQ4_NL`, used by several real gpt-oss-20b quantizations for a handful of
+  tensors even alongside K-quant/legacy/MXFP4 for the rest) -- these have
+  real, different block layouts this decoder does not implement.
 
 Only an initializer whose *name* matches a GGUF tensor is ever touched;
 `import_gguf_weights` never adds new initializers or otherwise changes the
@@ -182,9 +193,10 @@ alone, for a MoE graph you already built or exported some other way.
 ## Tests
 
 `tests/test_import_gguf_weights.py` writes real, byte-accurate GGUF v3
-files containing hand-encoded `Q8_0`/`Q4_K` (K-quant), `Q4_0`/`Q4_1`/`Q5_0`/
-`Q5_1` (legacy, see `test_import_q4_0_weights` and friends), and MXFP4
-blocks with known values (computing each expected float independently, not
+files containing hand-encoded `Q2_K`/`Q3_K`/`Q4_K`/`Q8_0` (K-quant, see
+`test_import_q2_k_weights` and friends), `Q4_0`/`Q4_1`/`Q5_0`/`Q5_1`
+(legacy, see `test_import_q4_0_weights` and friends), and MXFP4 blocks with
+known values (computing each expected float independently, not
 by reusing the C++ decoder under test) and checks `import_gguf_weights`'
 decoded result against them, plus coverage for multi-dimensional shapes
 (GGML's innermost-dimension-first `ne[]` vs ONNX's outermost-first shape),

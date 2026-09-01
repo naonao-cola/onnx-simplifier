@@ -4,8 +4,8 @@ Unlike ``import_gguf``, this needs no embedded onnxsim model, and is the
 intended way to bring a third-party GGUF's weight *values* into a graph you
 already have.
 
-Covers the GGML "K-quant" block formats (Q8_0, Q4_K, Q5_K, Q6_K) real
-quantized checkpoints (e.g. Unsloth's GGUF exports) actually use for the
+Covers the GGML "K-quant" block formats (Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q8_0)
+real quantized checkpoints (e.g. Unsloth's GGUF exports) actually use for the
 bulk of their weights; the legacy family (Q4_0, Q4_1, Q5_0, Q5_1) llama.cpp's
 own mixed-precision quantizers still pick for particular tensor roles even
 in an otherwise K-quant checkpoint (confirmed empirically against several
@@ -36,6 +36,8 @@ GGUF_VERSION = 3
 # ggml_type codes this suite constructs (see onnxsim/gguf_dtype.h).
 GGML_TYPE_F32 = 0
 GGML_TYPE_Q8_0 = 8
+GGML_TYPE_Q2_K = 10
+GGML_TYPE_Q3_K = 11
 GGML_TYPE_Q4_K = 12
 GGML_TYPE_Q5_K = 13
 GGML_TYPE_Q6_K = 14
@@ -44,7 +46,7 @@ GGML_TYPE_Q4_0 = 2
 GGML_TYPE_Q4_1 = 3
 GGML_TYPE_Q5_0 = 6
 GGML_TYPE_Q5_1 = 7
-GGML_TYPE_Q3_K = 11  # NOT decoded by onnxsim -- must be skipped
+GGML_TYPE_Q8_K = 15  # NOT decoded by onnxsim -- must be skipped
 
 
 def _align_up(n, align=32):
@@ -101,6 +103,107 @@ def _make_q8_0_block(rng):
     d_bits = _f16_bits(d)
     raw = struct.pack("<H", d_bits) + bytes(q & 0xFF for q in qs)
     expected = [q * _f16_to_f32(d_bits) for q in qs]
+    return raw, expected
+
+
+def _make_q2_k_block(rng):
+    # One 256-element Q2_K super-block: 16 bytes of packed 4-bit (scale, min)
+    # pairs (one pair per 16-element sub-block), 64 bytes of packed 2-bit
+    # quant codes, then two fp16 super-block scales (d, dmin) -- transcribed
+    # directly from ggml-quants.c's dequantize_row_q2_K.
+    d = round(float(rng.uniform(0.01, 2.0)), 4)
+    dmin = round(float(rng.uniform(0.01, 1.0)), 4)
+    d_bits, dmin_bits = _f16_bits(d), _f16_bits(dmin)
+    scales = [int(rng.integers(0, 256)) for _ in range(16)]
+    qs = [int(rng.integers(0, 256)) for _ in range(64)]
+    raw = bytes(scales) + bytes(qs) + struct.pack("<HH", d_bits, dmin_bits)
+
+    d_f, dmin_f = _f16_to_f32(d_bits), _f16_to_f32(dmin_bits)
+    expected = [0.0] * 256
+    is_, y = 0, 0
+    q_off = 0
+    for _n in range(0, 256, 128):
+        shift = 0
+        for _j in range(4):
+            sc = scales[is_]
+            is_ += 1
+            dl, ml = d_f * (sc & 0xF), dmin_f * (sc >> 4)
+            for idx in range(16):
+                expected[y] = dl * ((qs[q_off + idx] >> shift) & 3) - ml
+                y += 1
+            sc = scales[is_]
+            is_ += 1
+            dl, ml = d_f * (sc & 0xF), dmin_f * (sc >> 4)
+            for idx in range(16):
+                expected[y] = dl * ((qs[q_off + 16 + idx] >> shift) & 3) - ml
+                y += 1
+            shift += 2
+        q_off += 32
+    return raw, expected
+
+
+def _unpack_q3k_scales(scales12):
+    # Unpacks Q3_K's 12-byte packed-6-bit scale table into 16 signed values
+    # (still offset by +32, matching GGML's own `scales[is++] - 32` step) --
+    # transcribed directly from ggml-quants.c's dequantize_row_q3_K, reading
+    # each 4-byte word explicitly little-endian rather than via GGML's own
+    # (little-endian-host-only) `memcpy` onto a native `uint32_t[3]` -- see
+    # onnxsim/ggml_kquant.h's file comment for why that distinction matters.
+    def le32(b):
+        return b[0] | (b[1] << 8) | (b[2] << 16) | (b[3] << 24)
+
+    aux = [le32(scales12[0:4]), le32(scales12[4:8]), le32(scales12[8:12]), 0]
+    kmask1, kmask2 = 0x03030303, 0x0F0F0F0F
+    tmp = aux[2]
+    new0 = (aux[0] & kmask2) | (((tmp >> 0) & kmask1) << 4)
+    new1 = (aux[1] & kmask2) | (((tmp >> 2) & kmask1) << 4)
+    new2 = ((aux[0] >> 4) & kmask2) | (((tmp >> 4) & kmask1) << 4)
+    new3 = ((aux[1] >> 4) & kmask2) | (((tmp >> 6) & kmask1) << 4)
+    aux = [new0 & 0xFFFFFFFF, new1 & 0xFFFFFFFF, new2 & 0xFFFFFFFF, new3 & 0xFFFFFFFF]
+    out = []
+    for k in range(16):
+        byte = (aux[k // 4] >> (8 * (k % 4))) & 0xFF
+        out.append(byte - 256 if byte >= 128 else byte)
+    return out
+
+
+def _make_q3_k_block(rng):
+    # One 256-element Q3_K super-block: a 32-byte high-bit mask, 64 bytes of
+    # packed 2-bit low quant codes, a 12-byte packed-6-bit scale table, then
+    # one fp16 super-block scale -- transcribed directly from
+    # ggml-quants.c's dequantize_row_q3_K.
+    d = round(float(rng.uniform(0.01, 2.0)), 4)
+    d_bits = _f16_bits(d)
+    hmask = [int(rng.integers(0, 256)) for _ in range(32)]
+    qs = [int(rng.integers(0, 256)) for _ in range(64)]
+    scales12 = bytes(int(rng.integers(0, 256)) for _ in range(12))
+    raw = bytes(hmask) + bytes(qs) + scales12 + struct.pack("<H", d_bits)
+
+    d_f = _f16_to_f32(d_bits)
+    scales = _unpack_q3k_scales(scales12)
+    expected = [0.0] * 256
+    is_, y, m = 0, 0, 1
+    q_off = 0
+    for _n in range(0, 256, 128):
+        shift = 0
+        for _j in range(4):
+            dl = d_f * (scales[is_] - 32)
+            is_ += 1
+            for idx in range(16):
+                low = (qs[q_off + idx] >> shift) & 3
+                bit = hmask[idx] & m
+                expected[y] = dl * (low - (0 if bit else 4))
+                y += 1
+            dl = d_f * (scales[is_] - 32)
+            is_ += 1
+            for idx in range(16):
+                low = (qs[q_off + 16 + idx] >> shift) & 3
+                bit = hmask[idx + 16] & m
+                expected[y] = dl * (low - (0 if bit else 4))
+                y += 1
+            shift += 2
+            m = (m << 1) & 0xFF
+        q_off += 32
     return raw, expected
 
 
@@ -303,6 +406,38 @@ def test_import_q8_0_weights(tmp_path):
     np.testing.assert_allclose(got, np.array(expected, dtype=np.float32), rtol=1e-5)
 
 
+def test_import_q2_k_weights(tmp_path):
+    rng = np.random.default_rng(11)
+    raw, expected = _make_q2_k_block(rng)
+    gguf_path = str(tmp_path / "model.gguf")
+    _write_gguf(gguf_path, [("W", GGML_TYPE_Q2_K, [256], raw)])
+
+    model = _identity_model("W", [256])
+    result, skipped = onnxsim.import_gguf_weights(model, gguf_path)
+
+    assert skipped == []
+    w = next(i for i in result.graph.initializer if i.name == "W")
+    assert w.data_type == onnx.TensorProto.FLOAT
+    got = onnx.numpy_helper.to_array(w)
+    np.testing.assert_allclose(got, np.array(expected, dtype=np.float32), rtol=1e-5)
+
+
+def test_import_q3_k_weights(tmp_path):
+    rng = np.random.default_rng(12)
+    raw, expected = _make_q3_k_block(rng)
+    gguf_path = str(tmp_path / "model.gguf")
+    _write_gguf(gguf_path, [("W", GGML_TYPE_Q3_K, [256], raw)])
+
+    model = _identity_model("W", [256])
+    result, skipped = onnxsim.import_gguf_weights(model, gguf_path)
+
+    assert skipped == []
+    w = next(i for i in result.graph.initializer if i.name == "W")
+    assert w.data_type == onnx.TensorProto.FLOAT
+    got = onnx.numpy_helper.to_array(w)
+    np.testing.assert_allclose(got, np.array(expected, dtype=np.float32), rtol=1e-5)
+
+
 def test_import_q4_k_weights(tmp_path):
     rng = np.random.default_rng(1)
     raw, expected = _make_q4_k_block(rng)
@@ -427,7 +562,7 @@ def test_import_skips_unmatched_and_unsupported(tmp_path):
     rng = np.random.default_rng(3)
     raw, _ = _make_q8_0_block(rng)
     gguf_path = str(tmp_path / "model.gguf")
-    # Q3_K is not decoded by onnxsim at all, so its exact byte count doesn't
+    # Q8_K is not decoded by onnxsim at all, so its exact byte count doesn't
     # matter here (this tensor's bytes are never read) -- picked because
     # it's the last tensor in this file, so nothing after it needs locating.
     unsupported_raw = b"\x00" * 110
@@ -436,7 +571,7 @@ def test_import_skips_unmatched_and_unsupported(tmp_path):
         [
             ("W", GGML_TYPE_Q8_0, [32], raw),
             ("not_in_graph", GGML_TYPE_Q8_0, [32], raw),
-            ("unsupported", GGML_TYPE_Q3_K, [256], unsupported_raw),
+            ("unsupported", GGML_TYPE_Q8_K, [256], unsupported_raw),
         ],
     )
 

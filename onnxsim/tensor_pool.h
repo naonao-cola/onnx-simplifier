@@ -207,10 +207,10 @@ class TensorPool {
   // translation unit from the safetensors codec above, since the two file
   // formats share nothing but the TensorPool storage they read into/from.
   // See gguf_dtype.h's file comment for an important scope note: most of
-  // GGML's block-quantized types (Q2_K, Q3_K, every IQ*_ variant, ...) have
+  // GGML's block-quantized types (every IQ*_ variant, Q8_1, Q8_K, ...) have
   // no ONNX raw-data equivalent and are never pooled -- LoadGGUF skips and
   // reports them rather than writing garbage. The K-quant family
-  // (Q4_K/Q5_K/Q6_K/Q8_0) -- what a real quantized checkpoint (e.g.
+  // (Q2_K/Q3_K/Q4_K/Q5_K/Q6_K/Q8_0) -- what a real quantized checkpoint (e.g.
   // Unsloth's GGUF exports) actually uses for the bulk of its weights --
   // the legacy family (Q4_0/Q4_1/Q5_0/Q5_1, which llama.cpp's own mixed-
   // precision quantizers still pick for particular tensor roles even in an
@@ -247,7 +247,7 @@ class TensorPool {
   // unquantized type (stored as-is) or one of the block-quantized types
   // gguf_dtype.h's IsKQuant/IsLegacyQuant/IsMxfp4 cover (stored as its
   // native, still-packed block bytes -- see DequantizeToFloat to decode
-  // one). Every other quantized type (Q2_K, Q3_K, every IQ*_ variant, ...)
+  // one). Every other quantized type (every IQ*_ variant, Q8_1, Q8_K, ...)
   // has no representation this pool can hold at all. Unlike LoadSafetensors,
   // this does NOT read the whole file into memory: only the (small) header/
   // metadata/tensor-info section is read up front, and each *included*

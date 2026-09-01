@@ -54,13 +54,13 @@ int main() {
           "ToOnnx(FromOnnx(" + std::to_string(row.onnx) + "))) round-trips");
   }
 
-  // Quantized types this mapping does NOT decode (Q8_1, Q2_K/Q3_K, Q8_K,
-  // IQ*_XXS/BF16-adjacent codes, NVFP4, ...) or unrecognized types are
-  // rejected, not guessed at. Deliberately excludes 2/3/6/7 (Q4_0/Q4_1/
-  // Q5_0/Q5_1), 8/12/13/14 (Q8_0/Q4_K/Q5_K/Q6_K), and 39 (MXFP4), which ARE
-  // supported -- see the legacy_quant_rows/k_quant_rows loops and the
+  // Quantized types this mapping does NOT decode (Q8_1, Q8_K, IQ*_XXS/
+  // BF16-adjacent codes, NVFP4, ...) or unrecognized types are rejected,
+  // not guessed at. Deliberately excludes 2/3/6/7 (Q4_0/Q4_1/Q5_0/Q5_1),
+  // 8/10/11/12/13/14 (Q8_0/Q2_K/Q3_K/Q4_K/Q5_K/Q6_K), and 39 (MXFP4), which
+  // ARE supported -- see the legacy_quant_rows/k_quant_rows loops and the
   // MXFP4 checks below.
-  const uint32_t quantized[] = {9, 10, 11, 15, 16, 20, 29, 9999};
+  const uint32_t quantized[] = {9, 15, 16, 20, 29, 9999};
   for (uint32_t q : quantized) {
     int32_t onnx = -1;
     Check(!ToOnnx(q, &onnx),
@@ -80,13 +80,14 @@ int main() {
           "TryTotalBytes rejects unsupported type " + std::to_string(q));
   }
 
-  // The four K-quant types this mapping DOES decode -- Q4_K/Q5_K/Q6_K
-  // (super-blocks of 256 elements) and Q8_0 (blocks of 32). Each round-trips
-  // through ToOnnx/FromOnnx to its private ONNXSIM_GGML_* code (unlike every
-  // OTHER private dtype a caller might construct, which FromOnnx correctly
-  // rejects -- see the unsupported_onnx loop below), is NOT IsRaw (its
-  // sizing is block-based, not per-element), and TryTotalBytes agrees with
-  // KQuantBlockElements/KQuantBlockBytes's block math.
+  // The six K-quant types this mapping DOES decode -- Q2_K/Q3_K/Q4_K/Q5_K/
+  // Q6_K (super-blocks of 256 elements) and Q8_0 (blocks of 32). Each
+  // round-trips through ToOnnx/FromOnnx to its private ONNXSIM_GGML_* code
+  // (unlike every OTHER private dtype a caller might construct, which
+  // FromOnnx correctly rejects -- see the unsupported_onnx loop below), is
+  // NOT IsRaw (its sizing is block-based, not per-element), and
+  // TryTotalBytes agrees with KQuantBlockElements/KQuantBlockBytes's block
+  // math.
   struct KQuantRow {
     uint32_t ggml;
     int32_t onnx;
@@ -95,6 +96,8 @@ int main() {
   };
   const KQuantRow k_quant_rows[] = {
       {GGML_TYPE_Q8_0, ONNXSIM_GGML_Q8_0, 32, 34},
+      {GGML_TYPE_Q2_K, ONNXSIM_GGML_Q2_K, 256, 84},
+      {GGML_TYPE_Q3_K, ONNXSIM_GGML_Q3_K, 256, 110},
       {GGML_TYPE_Q4_K, ONNXSIM_GGML_Q4_K, 256, 144},
       {GGML_TYPE_Q5_K, ONNXSIM_GGML_Q5_K, 256, 176},
       {GGML_TYPE_Q6_K, ONNXSIM_GGML_Q6_K, 256, 210},
