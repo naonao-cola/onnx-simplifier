@@ -2783,6 +2783,359 @@ def test_structured_pruning_matmul_residual_add_bias_gelu_hop_matches_oracle():
     np.testing.assert_allclose(y, y_oracle, rtol=1e-4, atol=1e-4)
 
 
+# --- apply_structured_pruning: mid-chain LayerNorm/RMSNorm pass-through -----
+#
+# A raw, not-yet-optimizer-fused export -- straight out of a training
+# framework's own ONNX exporter -- has no `SkipLayerNormalization` fusion at
+# all: ``up = MatMul(X, W1); h = LayerNormalization(up, Gamma, Beta,
+# axis=-1); Y = MatMul(h, W2)``, `LayerNormalization` sitting directly
+# mid-chain between an ordinary producer and consumer, never on a residual
+# merge. `_walk_to_consumer` recognizes this (and the same shape for
+# `RMSNormalization`/`SimplifiedLayerNormalization`) as one more hop kind,
+# co-slicing `Gamma`/`Beta` by the chain's shared `keep` set -- but only when
+# the node's own `axis` is confirmed to normalize *exactly* the one trailing
+# channel axis being pruned (`axis == -1`, or a positive axis confirmed
+# against a known rank). Schema facts confirmed live: `onnx.defs.get_schema`
+# for `LayerNormalization` (opset 17+: `X`, `Scale` required, `B` optional)
+# and `RMSNormalization` (opset 23+: `X`, `scale` required, no bias input at
+# all), and onnxruntime's own
+# `onnxruntime.capi.onnxruntime_pybind11_state.get_all_operator_schema()` for
+# `SimplifiedLayerNormalization` (registers under the *default* ONNX domain
+# despite being an onnxruntime contrib op -- `X`, `scale` required, no bias,
+# same as `RMSNormalization`).
+
+
+def _norm_pass_through_model(op_type, w1, scale, bias, w2, axis=-1, opset=21):
+    K, C = w1.shape
+    Out = w2.shape[1]
+    if bias is None:
+        norm_call = f"{op_type}<axis={axis}>(up, Gamma)"
+        initializer = [_f32(w1, "W1"), _f32(scale, "Gamma"), _f32(w2, "W2")]
+    else:
+        norm_call = f"{op_type}<axis={axis}>(up, Gamma, Beta)"
+        initializer = [
+            _f32(w1, "W1"),
+            _f32(scale, "Gamma"),
+            _f32(bias, "Beta"),
+            _f32(w2, "W2"),
+        ]
+    return _model(
+        f"""
+        g (float[batch,{K}] X) => (float[batch,{Out}] Y)
+        {{
+          up = MatMul(X, W1)
+          h = {norm_call}
+          Y = MatMul(h, W2)
+        }}
+        """,
+        initializer=initializer,
+        opset=opset,
+    )
+
+
+def test_structured_pruning_layer_norm_pass_through_shrinks_matched_layers():
+    K, C, Out = 8, 16, 4
+    rng = np.random.default_rng(140)
+    w1 = rng.standard_normal((K, C)).astype(np.float32)
+    gamma = rng.standard_normal((C,)).astype(np.float32)
+    beta = rng.standard_normal((C,)).astype(np.float32)
+    w2 = rng.standard_normal((C, Out)).astype(np.float32)
+    model = _norm_pass_through_model("LayerNormalization", w1, gamma, beta, w2)
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    inits = {t.name: t for t in pruned.graph.initializer}
+    assert list(inits["W1"].dims) == [K, C // 2]
+    assert list(inits["Gamma"].dims) == [C // 2]
+    assert list(inits["Beta"].dims) == [C // 2]
+    assert list(inits["W2"].dims) == [C // 2, Out]
+
+
+def test_structured_pruning_layer_norm_pass_through_matches_oracle_adversarially():
+    # Adversarially engineered per this task's own verification bar (mirrors
+    # test_qdq_structured_pruning_per_channel_scale_mismatch_is_detected_adversarially):
+    # W1 is built so the surviving `keep` set is deliberately NOT the first
+    # C//2 channels, and Gamma/Beta span three orders of magnitude, strictly
+    # increasing by channel index -- a positional (rather than index-set)
+    # slice of Gamma/Beta would misapply a wildly-wrong-magnitude affine term
+    # to a kept channel, detectably wrong by orders of magnitude, not mere
+    # floating-point noise.
+    K, C, Out = 4, 8, 2
+    rng = np.random.default_rng(141)
+    # High-index channels are the important ones (largest column norm), so
+    # the survivors land on the *back* half -- not the trivial first-C//2.
+    col_scale = np.linspace(0.1, 2.0, C).astype(np.float32)
+    w1 = (rng.standard_normal((K, C)) * col_scale).astype(np.float32)
+    gamma = (np.arange(1, C + 1, dtype=np.float64) * 0.001).astype(np.float32)
+    beta = (np.arange(1, C + 1, dtype=np.float64) * 1000.0).astype(np.float32)
+    w2 = rng.standard_normal((C, Out)).astype(np.float32)
+    model = _norm_pass_through_model("LayerNormalization", w1, gamma, beta, w2)
+    onnx.checker.check_model(model)
+
+    keep_count = C // 2
+    keep = _oracle_keep_indices(w1, keep_count)
+    assert not np.array_equal(keep, np.arange(keep_count))  # confirm adversarial
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    x = rng.standard_normal((5, K)).astype(np.float32)
+    (y,) = _run(pruned, {"X": x})
+
+    def _layer_norm(v, g, b, eps=1e-5):
+        mean = v.mean(axis=-1, keepdims=True)
+        var = v.var(axis=-1, keepdims=True)
+        return (v - mean) / np.sqrt(var + eps) * g + b
+
+    h_correct = _layer_norm(x @ w1[:, keep], gamma[keep], beta[keep])
+    y_correct = h_correct @ w2[keep, :]
+    # LayerNorm involves a genuine floating-point reduction (mean/variance),
+    # unlike the pure-slicing hops elsewhere in this file -- a tight but
+    # realistic (not exact-bitwise) tolerance is used here deliberately.
+    np.testing.assert_allclose(y, y_correct, rtol=1e-4, atol=1e-4)
+
+    # The "wrong" oracle a positional (not index-matched) Gamma/Beta slice
+    # would produce -- orders of magnitude off on some channels.
+    wrong_gamma = gamma[:keep_count]
+    wrong_beta = beta[:keep_count]
+    h_wrong = _layer_norm(x @ w1[:, keep], wrong_gamma, wrong_beta)
+    y_wrong = h_wrong @ w2[keep, :]
+    assert np.max(np.abs(y - y_wrong)) > 1e-2 * max(1.0, np.max(np.abs(y_correct)))
+
+
+def test_structured_pruning_rms_normalization_pass_through_matches_oracle():
+    # RMSNormalization (opset 23+) has no bias input at all -- confirmed live
+    # via onnx.defs.get_schema -- and skips mean-centering (pure RMS
+    # scaling). Still a per-example reduction over the same trailing channel
+    # axis being pruned, so the same co-slice-by-keep-index correctness
+    # argument applies unchanged.
+    K, C, Out = 6, 12, 3
+    rng = np.random.default_rng(142)
+    w1 = rng.standard_normal((K, C)).astype(np.float32)
+    scale = (rng.standard_normal((C,)).astype(np.float32)) * 2.0 + 1.0
+    w2 = rng.standard_normal((C, Out)).astype(np.float32)
+    model = _norm_pass_through_model("RMSNormalization", w1, scale, None, w2, opset=23)
+    onnx.checker.check_model(model)
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    inits = {t.name: t for t in pruned.graph.initializer}
+    keep_count = C // 2
+    assert list(inits["Gamma"].dims) == [keep_count]
+
+    keep = _oracle_keep_indices(w1, keep_count)
+    x = rng.standard_normal((5, K)).astype(np.float32)
+    (y,) = _run(pruned, {"X": x})
+
+    v = x @ w1[:, keep]
+    rms = np.sqrt(np.mean(np.square(v), axis=-1, keepdims=True) + 1e-5)
+    h_correct = (v / rms) * scale[keep]
+    y_correct = h_correct @ w2[keep, :]
+    np.testing.assert_allclose(y, y_correct, rtol=1e-4, atol=1e-4)
+
+
+def test_structured_pruning_simplified_layer_norm_pass_through_matches_oracle():
+    # com.microsoft::SimplifiedLayerNormalization -- onnxruntime's own
+    # RMSNorm-equivalent contrib op -- confirmed live (via onnxruntime's own
+    # get_all_operator_schema()) to register under the *default* ("") ONNX
+    # domain, not "com.microsoft", despite living in onnxruntime's own
+    # contrib-op source tree; like RMSNormalization it has no bias input.
+    # onnx.checker's own schema database doesn't know this op under the
+    # default domain at all (it's an onnxruntime-only registration, not a
+    # plain-ONNX one) -- confirmed live, checker is skipped for this model
+    # specifically; onnxruntime itself still runs it fine, which is what the
+    # oracle comparison below actually exercises.
+    K, C, Out = 6, 12, 3
+    rng = np.random.default_rng(143)
+    w1 = rng.standard_normal((K, C)).astype(np.float32)
+    scale = (rng.standard_normal((C,)).astype(np.float32)) * 2.0 + 1.0
+    w2 = rng.standard_normal((C, Out)).astype(np.float32)
+    model = _norm_pass_through_model(
+        "SimplifiedLayerNormalization", w1, scale, None, w2, opset=17
+    )
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    inits = {t.name: t for t in pruned.graph.initializer}
+    keep_count = C // 2
+    assert list(inits["Gamma"].dims) == [keep_count]
+
+    keep = _oracle_keep_indices(w1, keep_count)
+    x = rng.standard_normal((5, K)).astype(np.float32)
+    (y,) = _run(pruned, {"X": x})
+
+    v = x @ w1[:, keep]
+    rms = np.sqrt(np.mean(np.square(v), axis=-1, keepdims=True) + 1e-5)
+    h_correct = (v / rms) * scale[keep]
+    y_correct = h_correct @ w2[keep, :]
+    np.testing.assert_allclose(y, y_correct, rtol=1e-4, atol=1e-4)
+
+
+def test_structured_pruning_layer_norm_multi_axis_normalization_is_declined():
+    # axis=-2 on a rank-2 [batch, C] tensor normalizes over *both* dims, not
+    # just the trailing channel axis being pruned -- out of this hop's own
+    # declared scope (single, full trailing channel axis only). The chain
+    # must be left completely untouched, not partially matched.
+    K, C, Out = 8, 16, 4
+    rng = np.random.default_rng(144)
+    w1 = rng.standard_normal((K, C)).astype(np.float32)
+    gamma = rng.standard_normal((C,)).astype(np.float32)
+    beta = rng.standard_normal((C,)).astype(np.float32)
+    w2 = rng.standard_normal((C, Out)).astype(np.float32)
+    model = _norm_pass_through_model("LayerNormalization", w1, gamma, beta, w2, axis=-2)
+    onnx.checker.check_model(model)
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    assert pruned.SerializeToString() == model.SerializeToString()
+
+
+def test_structured_pruning_layer_norm_positive_axis_needs_known_rank():
+    # A positive axis (here axis=1, the last axis of a rank-2 tensor) is
+    # only recognized when the tensor's own rank is confirmed via the
+    # graph's value_info -- declined (chain left untouched) otherwise, never
+    # guessed at.
+    K, C, Out = 8, 16, 4
+    rng = np.random.default_rng(145)
+    w1 = rng.standard_normal((K, C)).astype(np.float32)
+    gamma = rng.standard_normal((C,)).astype(np.float32)
+    beta = rng.standard_normal((C,)).astype(np.float32)
+    w2 = rng.standard_normal((C, Out)).astype(np.float32)
+    model = _norm_pass_through_model("LayerNormalization", w1, gamma, beta, w2, axis=1)
+    onnx.checker.check_model(model)
+
+    # No value_info for "up" (the LayerNormalization's own data input) in
+    # this parser-built model -- rank unknown, positive axis declined.
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    assert pruned.SerializeToString() == model.SerializeToString()
+
+    # Declaring "up"'s rank (2) via value_info lets the very same positive
+    # axis=1 be confirmed as the last dimension and recognized.
+    model.graph.value_info.append(
+        onnx.helper.make_tensor_value_info("up", onnx.TensorProto.FLOAT, [None, C])
+    )
+    pruned2 = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    inits = {t.name: t for t in pruned2.graph.initializer}
+    assert list(inits["Gamma"].dims) == [C // 2]
+
+
+def test_structured_pruning_gated_ffn_layer_norm_pass_through_matches_oracle():
+    # Composition check: a gated (SwiGLU-style) combine feeding a plain
+    # LayerNormalization before the down-projection -- confirms the hop
+    # composes correctly through _find_gated_chains's own reuse of
+    # _walk_to_consumer, with no crash or mis-slice.
+    K, C, Out = 8, 16, 4
+    rng = np.random.default_rng(146)
+    wg = rng.standard_normal((K, C)).astype(np.float32)
+    wu = rng.standard_normal((K, C)).astype(np.float32)
+    gamma = (rng.standard_normal((C,)).astype(np.float32)) * 2.0 + 1.0
+    beta = rng.standard_normal((C,)).astype(np.float32)
+    wd = rng.standard_normal((C, Out)).astype(np.float32)
+    model = _model(
+        f"""
+        g (float[batch,{K}] X) => (float[batch,{Out}] Y)
+        {{
+          gate = MatMul(X, Wg)
+          up = MatMul(X, Wu)
+          combined = Mul(gate, up)
+          h = LayerNormalization<axis=-1>(combined, Gamma, Beta)
+          Y = MatMul(h, Wd)
+        }}
+        """,
+        initializer=[
+            _f32(wg, "Wg"),
+            _f32(wu, "Wu"),
+            _f32(gamma, "Gamma"),
+            _f32(beta, "Beta"),
+            _f32(wd, "Wd"),
+        ],
+    )
+    onnx.checker.check_model(model)
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    inits = {t.name: t for t in pruned.graph.initializer}
+    keep_count = C // 2
+    assert list(inits["Gamma"].dims) == [keep_count]
+
+    importance = np.sqrt(
+        np.square(np.linalg.norm(wg.astype(np.float64), axis=0))
+        + np.square(np.linalg.norm(wu.astype(np.float64), axis=0))
+    )
+    keep = np.sort(np.argsort(-importance)[:keep_count])
+
+    x = rng.standard_normal((5, K)).astype(np.float32)
+    (y,) = _run(pruned, {"X": x})
+
+    def _layer_norm(v, g, b, eps=1e-5):
+        mean = v.mean(axis=-1, keepdims=True)
+        var = v.var(axis=-1, keepdims=True)
+        return (v - mean) / np.sqrt(var + eps) * g + b
+
+    combined = (x @ wg[:, keep]) * (x @ wu[:, keep])
+    h_correct = _layer_norm(combined, gamma[keep], beta[keep])
+    y_correct = h_correct @ wd[keep, :]
+    np.testing.assert_allclose(y, y_correct, rtol=1e-4, atol=1e-4)
+
+
+def test_structured_pruning_residual_add_layer_norm_pass_through_matches_oracle():
+    # Composition check: a bare-Add residual merge feeding a plain
+    # LayerNormalization before the next projection -- confirms the hop
+    # composes correctly through _find_matmul_residual_chains's own reuse of
+    # _walk_to_consumer (via _resolve_matmul_fanout_branches), with no crash
+    # or mis-slice.
+    K, C, Out = 8, 16, 4
+    rng = np.random.default_rng(147)
+    wf = rng.standard_normal((K, C)).astype(np.float32)
+    ws = rng.standard_normal((K, C)).astype(np.float32)
+    gamma = (rng.standard_normal((C,)).astype(np.float32)) * 2.0 + 1.0
+    beta = rng.standard_normal((C,)).astype(np.float32)
+    wd = rng.standard_normal((C, Out)).astype(np.float32)
+    model = _model(
+        f"""
+        g (float[batch,{K}] X) => (float[batch,{Out}] Y)
+        {{
+          f = MatMul(X, WF)
+          s = MatMul(X, WS)
+          combined = Add(f, s)
+          h = LayerNormalization<axis=-1>(combined, Gamma, Beta)
+          Y = MatMul(h, WD)
+        }}
+        """,
+        initializer=[
+            _f32(wf, "WF"),
+            _f32(ws, "WS"),
+            _f32(gamma, "Gamma"),
+            _f32(beta, "Beta"),
+            _f32(wd, "WD"),
+        ],
+    )
+    onnx.checker.check_model(model)
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    inits = {t.name: t for t in pruned.graph.initializer}
+    keep_count = C // 2
+    assert list(inits["Gamma"].dims) == [keep_count]
+
+    importance = np.sqrt(
+        np.square(np.linalg.norm(wf.astype(np.float64), axis=0))
+        + np.square(np.linalg.norm(ws.astype(np.float64), axis=0))
+    )
+    keep = np.sort(np.argsort(-importance)[:keep_count])
+
+    x = rng.standard_normal((5, K)).astype(np.float32)
+    (y,) = _run(pruned, {"X": x})
+
+    def _layer_norm(v, g, b, eps=1e-5):
+        mean = v.mean(axis=-1, keepdims=True)
+        var = v.var(axis=-1, keepdims=True)
+        return (v - mean) / np.sqrt(var + eps) * g + b
+
+    combined = (x @ wf[:, keep]) + (x @ ws[:, keep])
+    h_correct = _layer_norm(combined, gamma[keep], beta[keep])
+    y_correct = h_correct @ wd[keep, :]
+    np.testing.assert_allclose(y, y_correct, rtol=1e-4, atol=1e-4)
+
+
 # --- apply_structured_pruning: gated FFN (SwiGLU/GeGLU) ----------------------
 
 
