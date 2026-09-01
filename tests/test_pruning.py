@@ -14884,6 +14884,360 @@ def test_transformer_block_pruning_matches_simplified_layer_normalization_entry(
     np.testing.assert_array_equal(pruned_y, x)
 
 
+def test_transformer_block_pruning_matches_fused_skip_layer_normalization_entry():
+    # A fused ``com.microsoft::SkipLayerNormalization`` node as the block's
+    # own *entry* norm -- exactly what onnxruntime's transformer optimizer
+    # produces by fusing the *previous* residual `Add` with the following
+    # `LayerNormalization`. Built directly with `onnx.helper.make_node`,
+    # not `onnx.parser` (CLAUDE.md's documented exception): the text
+    # format can't express a custom-domain op with this multi-output
+    # fusion shape (a `com.microsoft` node with skipped middle outputs).
+    #
+    # `input`/`skip` stand in for whatever fed the *previous* block's own
+    # (now-fused-away) residual Add; this block's own merge itself stays
+    # an ordinary, unfused `Add` (this pass's own merge-side scope, see
+    # this module's own section comment) -- realistic for e.g. the last
+    # block before a final, non-fused `LayerNormalization`.
+    H = 8
+    rng = np.random.default_rng(41)
+    gamma = rng.standard_normal(H).astype(np.float32)
+    beta = rng.standard_normal(H).astype(np.float32)
+    w = (rng.standard_normal((H, H)) * 1e-6).astype(np.float32)
+
+    def _skip_ln_node(sum_output_name):
+        return onnx.helper.make_node(
+            "SkipLayerNormalization",
+            ["input", "skip", "Gamma", "Beta"],
+            ["ln_out", "", "", sum_output_name],
+            domain="com.microsoft",
+            epsilon=1e-5,
+        )
+
+    initializer = [_f32(gamma, "Gamma"), _f32(beta, "Beta")]
+    inputs = [
+        onnx.helper.make_tensor_value_info("input", onnx.TensorProto.FLOAT, [1, 4, H]),
+        onnx.helper.make_tensor_value_info("skip", onnx.TensorProto.FLOAT, [1, 4, H]),
+    ]
+
+    skip_ln = _skip_ln_node("sum_out")
+    h = onnx.helper.make_node("MatMul", ["ln_out", "W"], ["h"])
+    y = onnx.helper.make_node("Add", ["sum_out", "h"], ["y"])
+    graph = onnx.helper.make_graph(
+        [skip_ln, h, y],
+        "g",
+        inputs,
+        [onnx.helper.make_tensor_value_info("y", onnx.TensorProto.FLOAT, [1, 4, H])],
+        initializer=initializer + [_f32(w, "W")],
+        # A real onnxruntime-optimized export carries a declared shape for
+        # every named intermediate tensor (the whole graph was shape-
+        # inferred and saved that way by the optimizer tool). Declaring it
+        # here too matters concretely: plain `onnx.shape_inference` has no
+        # inference function for a `com.microsoft` op, so without this,
+        # `sum_out`'s shape would come out unknown and
+        # :func:`onnxsim.pruning._shapes_match` would (correctly, safely)
+        # decline the match rather than assume the shapes line up --
+        # confirmed empirically while building this test.
+        value_info=[
+            onnx.helper.make_tensor_value_info(
+                "sum_out", onnx.TensorProto.FLOAT, [1, 4, H]
+            )
+        ],
+    )
+    model = onnx.helper.make_model(
+        graph,
+        opset_imports=[
+            onnx.helper.make_opsetid("", 17),
+            onnx.helper.make_opsetid("com.microsoft", 1),
+        ],
+        ir_version=10,
+    )
+    onnx.checker.check_model(model)
+
+    # The independently hand-built reference: the block already manually
+    # excised, `y` wired straight to the fused node's own raw
+    # `input + skip (+ bias)` sum -- computed by the *same* op/kernel (not
+    # a hand-derived float formula), so the comparison below is bit-exact
+    # by construction, not merely numerically close.
+    ref_skip_ln = _skip_ln_node("y")
+    ref_graph = onnx.helper.make_graph(
+        [ref_skip_ln],
+        "g",
+        inputs,
+        [onnx.helper.make_tensor_value_info("y", onnx.TensorProto.FLOAT, [1, 4, H])],
+        initializer=initializer,
+    )
+    ref = onnx.helper.make_model(
+        ref_graph,
+        opset_imports=[
+            onnx.helper.make_opsetid("", 17),
+            onnx.helper.make_opsetid("com.microsoft", 1),
+        ],
+        ir_version=10,
+    )
+    onnx.checker.check_model(ref)
+
+    pruned = onnxsim.apply_transformer_block_pruning(
+        model, num_blocks_to_drop=1, seed=0, num_samples=4
+    )
+    onnx.checker.check_model(pruned)
+
+    # The fused SkipLayerNormalization node itself survives, unchanged --
+    # deleting it would delete the very tensor (`sum_out`) every rewired
+    # `x_out` consumer now reads (see this module's own section comment)
+    # -- its own primary (`ln_out`) output now unread. `MatMul`/`Add` (the
+    # rest of the block, plus the merge) are gone, replaced by the
+    # rewiring `Identity` that preserves the graph's own declared output
+    # name.
+    assert [n.op_type for n in pruned.graph.node] == [
+        "SkipLayerNormalization",
+        "Identity",
+    ]
+
+    x_in = np.random.default_rng(42).standard_normal((1, 4, H)).astype(np.float32)
+    x_skip = np.random.default_rng(43).standard_normal((1, 4, H)).astype(np.float32)
+    (pruned_y,) = _run(pruned, {"input": x_in, "skip": x_skip})
+    (ref_y,) = _run(ref, {"input": x_in, "skip": x_skip})
+    np.testing.assert_array_equal(pruned_y, ref_y)
+
+
+def test_transformer_block_pruning_matches_fused_skip_simplified_layer_normalization_entry():
+    # ``SkipSimplifiedLayerNormalization`` (the RMSNorm-equivalent fused
+    # variant, no `beta`) as the entry norm -- confirms the fused-entry
+    # match isn't specific to the (non-simplified) `SkipLayerNormalization`
+    # schema. Built with `onnx.helper` for the same reason as the sibling
+    # test above.
+    H = 8
+    rng = np.random.default_rng(45)
+    gamma = rng.standard_normal(H).astype(np.float32)
+    w = (rng.standard_normal((H, H)) * 1e-6).astype(np.float32)
+
+    def _skip_ln_node(sum_output_name):
+        return onnx.helper.make_node(
+            "SkipSimplifiedLayerNormalization",
+            ["input", "skip", "Gamma"],
+            ["ln_out", "", "", sum_output_name],
+            domain="com.microsoft",
+            epsilon=1e-5,
+        )
+
+    initializer = [_f32(gamma, "Gamma")]
+    inputs = [
+        onnx.helper.make_tensor_value_info("input", onnx.TensorProto.FLOAT, [1, 4, H]),
+        onnx.helper.make_tensor_value_info("skip", onnx.TensorProto.FLOAT, [1, 4, H]),
+    ]
+
+    skip_ln = _skip_ln_node("sum_out")
+    h = onnx.helper.make_node("MatMul", ["ln_out", "W"], ["h"])
+    y = onnx.helper.make_node("Add", ["sum_out", "h"], ["y"])
+    graph = onnx.helper.make_graph(
+        [skip_ln, h, y],
+        "g",
+        inputs,
+        [onnx.helper.make_tensor_value_info("y", onnx.TensorProto.FLOAT, [1, 4, H])],
+        initializer=initializer + [_f32(w, "W")],
+        # See the sibling `SkipLayerNormalization` test above for why this
+        # declared shape (mirroring a real ORT-optimized export) matters.
+        value_info=[
+            onnx.helper.make_tensor_value_info(
+                "sum_out", onnx.TensorProto.FLOAT, [1, 4, H]
+            )
+        ],
+    )
+    model = onnx.helper.make_model(
+        graph,
+        opset_imports=[
+            onnx.helper.make_opsetid("", 17),
+            onnx.helper.make_opsetid("com.microsoft", 1),
+        ],
+        ir_version=10,
+    )
+    onnx.checker.check_model(model)
+
+    ref_skip_ln = _skip_ln_node("y")
+    ref_graph = onnx.helper.make_graph(
+        [ref_skip_ln],
+        "g",
+        inputs,
+        [onnx.helper.make_tensor_value_info("y", onnx.TensorProto.FLOAT, [1, 4, H])],
+        initializer=initializer,
+    )
+    ref = onnx.helper.make_model(
+        ref_graph,
+        opset_imports=[
+            onnx.helper.make_opsetid("", 17),
+            onnx.helper.make_opsetid("com.microsoft", 1),
+        ],
+        ir_version=10,
+    )
+    onnx.checker.check_model(ref)
+
+    pruned = onnxsim.apply_transformer_block_pruning(
+        model, num_blocks_to_drop=1, seed=0, num_samples=4
+    )
+    onnx.checker.check_model(pruned)
+    assert [n.op_type for n in pruned.graph.node] == [
+        "SkipSimplifiedLayerNormalization",
+        "Identity",
+    ]
+
+    x_in = np.random.default_rng(46).standard_normal((1, 4, H)).astype(np.float32)
+    x_skip = np.random.default_rng(47).standard_normal((1, 4, H)).astype(np.float32)
+    (pruned_y,) = _run(pruned, {"input": x_in, "skip": x_skip})
+    (ref_y,) = _run(ref, {"input": x_in, "skip": x_skip})
+    np.testing.assert_array_equal(pruned_y, ref_y)
+
+
+def test_transformer_block_pruning_declines_fused_entry_when_sum_output_absent():
+    # The fused node's own optional fourth output (`input_skip_bias_sum`)
+    # is never declared at all -- confirmed empirically (see this
+    # module's own section comment) to mean onnxruntime never computes or
+    # exposes it, so there is no tensor this pass could safely treat as
+    # `x_in`. The merge's own identity operand is `input` (the fused
+    # node's own *first* input) directly instead -- structurally close to
+    # a real fused-entry block, but not the pattern this pass targets: it
+    # must decline outright rather than mismatch onto some other tensor
+    # (e.g. `input`, which is not `x_in` -- the true `x_in` doesn't exist
+    # as a named tensor in this graph at all). Left completely untouched.
+    H = 8
+    rng = np.random.default_rng(49)
+    gamma = rng.standard_normal(H).astype(np.float32)
+    beta = rng.standard_normal(H).astype(np.float32)
+    w = rng.standard_normal((H, H)).astype(np.float32)
+
+    skip_ln = onnx.helper.make_node(
+        "SkipLayerNormalization",
+        ["input", "skip", "Gamma", "Beta"],
+        ["ln_out"],  # no fourth output declared at all
+        domain="com.microsoft",
+        epsilon=1e-5,
+    )
+    h = onnx.helper.make_node("MatMul", ["ln_out", "W"], ["h"])
+    y = onnx.helper.make_node("Add", ["input", "h"], ["y"])
+    graph = onnx.helper.make_graph(
+        [skip_ln, h, y],
+        "g",
+        [
+            onnx.helper.make_tensor_value_info(
+                "input", onnx.TensorProto.FLOAT, [1, 4, H]
+            ),
+            onnx.helper.make_tensor_value_info(
+                "skip", onnx.TensorProto.FLOAT, [1, 4, H]
+            ),
+        ],
+        [onnx.helper.make_tensor_value_info("y", onnx.TensorProto.FLOAT, [1, 4, H])],
+        initializer=[_f32(gamma, "Gamma"), _f32(beta, "Beta"), _f32(w, "W")],
+    )
+    model = onnx.helper.make_model(
+        graph,
+        opset_imports=[
+            onnx.helper.make_opsetid("", 17),
+            onnx.helper.make_opsetid("com.microsoft", 1),
+        ],
+        ir_version=10,
+    )
+    onnx.checker.check_model(model)
+
+    pruned = onnxsim.apply_transformer_block_pruning(
+        model, num_blocks_to_drop=1, seed=0, num_samples=4
+    )
+    assert pruned.SerializeToString() == model.SerializeToString()
+
+
+def test_transformer_block_pruning_declines_kv_cache_bearing_attention_block_with_fused_entry():
+    # The same KV-cache decline as
+    # `test_transformer_block_pruning_declines_kv_cache_bearing_attention_block`
+    # above, but reached through the new fused-`SkipLayerNormalization`
+    # entry path instead of a plain `LayerNormalization` -- confirms the
+    # existing generic "no block-internal output may leak outside the
+    # block" safety check applies identically regardless of which entry
+    # shape found the candidate. Left completely untouched.
+    K, NH, D = 8, 2, 4
+    Nqkv = NH * D
+    rng = np.random.default_rng(51)
+    gamma = rng.standard_normal(K).astype(np.float32)
+    beta = rng.standard_normal(K).astype(np.float32)
+    wq = rng.standard_normal((K, Nqkv)).astype(np.float32)
+    wk = rng.standard_normal((K, Nqkv)).astype(np.float32)
+    wv = rng.standard_normal((K, Nqkv)).astype(np.float32)
+    wout = rng.standard_normal((Nqkv, K)).astype(np.float32)
+
+    skip_ln = onnx.helper.make_node(
+        "SkipLayerNormalization",
+        ["input", "skip", "Gamma", "Beta"],
+        ["ln_out", "", "", "sum_out"],
+        domain="com.microsoft",
+        epsilon=1e-5,
+    )
+    q = onnx.helper.make_node("MatMul", ["ln_out", "Wq"], ["q"])
+    k = onnx.helper.make_node("MatMul", ["ln_out", "Wk"], ["k"])
+    v = onnx.helper.make_node("MatMul", ["ln_out", "Wv"], ["v"])
+    attn = onnx.helper.make_node(
+        "GroupQueryAttention",
+        ["q", "k", "v"],
+        ["ctx", "present_k", "present_v"],
+        domain="com.microsoft",
+        num_heads=NH,
+        kv_num_heads=NH,
+    )
+    fout = onnx.helper.make_node("MatMul", ["ctx", "Wout"], ["fout"])
+    y = onnx.helper.make_node("Add", ["sum_out", "fout"], ["y"])
+
+    graph = onnx.helper.make_graph(
+        [skip_ln, q, k, v, attn, fout, y],
+        "g",
+        [
+            onnx.helper.make_tensor_value_info(
+                "input", onnx.TensorProto.FLOAT, [2, 5, K]
+            ),
+            onnx.helper.make_tensor_value_info(
+                "skip", onnx.TensorProto.FLOAT, [2, 5, K]
+            ),
+        ],
+        [
+            onnx.helper.make_tensor_value_info("y", onnx.TensorProto.FLOAT, [2, 5, K]),
+            onnx.helper.make_tensor_value_info(
+                "present_k", onnx.TensorProto.FLOAT, [2, 5, Nqkv]
+            ),
+            onnx.helper.make_tensor_value_info(
+                "present_v", onnx.TensorProto.FLOAT, [2, 5, Nqkv]
+            ),
+        ],
+        initializer=[
+            _f32(gamma, "Gamma"),
+            _f32(beta, "Beta"),
+            _f32(wq, "Wq"),
+            _f32(wk, "Wk"),
+            _f32(wv, "Wv"),
+            _f32(wout, "Wout"),
+        ],
+        # Declared, matching a real ORT-optimized export, so the fused
+        # entry is actually resolved into a full candidate (and only then
+        # correctly declined on the KV-cache leak below) rather than
+        # separately declining on an unrelated unknown-shape gap in plain
+        # `onnx.shape_inference` -- see the positive fused-entry tests
+        # above for why this is needed.
+        value_info=[
+            onnx.helper.make_tensor_value_info(
+                "sum_out", onnx.TensorProto.FLOAT, [2, 5, K]
+            )
+        ],
+    )
+    model = onnx.helper.make_model(
+        graph,
+        opset_imports=[
+            onnx.helper.make_opsetid("", 17),
+            onnx.helper.make_opsetid("com.microsoft", 1),
+        ],
+        ir_version=10,
+    )
+    onnx.checker.check_model(model)
+
+    pruned = onnxsim.apply_transformer_block_pruning(
+        model, num_blocks_to_drop=1, seed=0, num_samples=4
+    )
+    assert pruned.SerializeToString() == model.SerializeToString()
+
+
 def test_transformer_block_pruning_declines_when_intermediate_tensor_has_external_consumer():
     # LN's own output also feeds a second graph output directly -- an
     # intermediate tensor read outside the block, exactly the topology

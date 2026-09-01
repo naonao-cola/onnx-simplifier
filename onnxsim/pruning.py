@@ -12259,22 +12259,14 @@ def apply_embedding_vocab_magnitude_pruning(
 # residual machinery and this environment's real onnxruntime schemas rather
 # than assumed, and each worth stating plainly:
 #
-# 1. Both the merge point *and* the entry norm matched here are the
-#    unfused shapes only: the merge is *only* a bare `Add`
-#    (:func:`_is_eligible_add_merge`, reused unchanged from the residual
-#    *channel*-pruning machinery above -- exactly the same "two distinct,
-#    non-constant operands" eligibility bar), and `LN` is only a plain,
-#    single-input `LayerNormalization`/`RMSNormalization`/
-#    `SimplifiedLayerNormalization` node (:func:`_is_entry_ln_node`) --
-#    never a fused `SkipLayerNormalization`/`SkipSimplifiedLayerNormalization`
-#    node in *either* role, the way :func:`_match_matmul_residual_merge`
-#    accepts it as the merge for channel pruning. That is a deliberate,
-#    real narrowing versus this module's own existing residual machinery,
-#    not an oversight, and it costs real coverage on a model that has
-#    actually been run through onnxruntime's transformer optimizer (which
-#    fuses nearly every residual `Add` immediately followed by a
-#    `LayerNorm` into exactly this fused node) -- worth being honest about
-#    rather than glossing over:
+# 1. The merge point matched here is the unfused shape only: it is *only*
+#    a bare `Add` (:func:`_is_eligible_add_merge`, reused unchanged from
+#    the residual *channel*-pruning machinery above -- exactly the same
+#    "two distinct, non-constant operands" eligibility bar), never a fused
+#    `SkipLayerNormalization`/`SkipSimplifiedLayerNormalization` node the
+#    way :func:`_match_matmul_residual_merge` accepts it as the merge for
+#    channel pruning. That is a deliberate, real narrowing, not an
+#    oversight:
 #
 #    - As the merge, a `SkipLayerNormalization`-family node's own
 #      *primary* output is always the *normalized* sum (`LN(x_in +
@@ -12283,31 +12275,51 @@ def apply_embedding_vocab_magnitude_pruning(
 #      could safely repoint every consumer to that is both already
 #      present in the graph *and* means "`x_in`, unnormalized" the way a
 #      bare `Add`'s own `x_in` operand already, directly, does).
-#    - As the entry norm, `LN(x_in)` is only recognized when `x_in` is
-#      *literally* some node's own single data input
-#      (:func:`_is_entry_ln_node`'s own `node.input[0] == x_in` check) --
-#      exactly what a plain `LayerNormalization`/`RMSNormalization`/
-#      `SimplifiedLayerNormalization` node's own first input already is,
-#      but *not* what a `SkipLayerNormalization`-family node's own first
-#      input is: that node normalizes `input + skip`, a *sum* of two
-#      separate tensors, and the block's own true `x_in` (the previous
-#      block's own raw, unnormalized residual value) only exists as a
-#      *named* tensor at all when that sum is separately materialized as
-#      the node's own optional fourth output, `input_skip_bias_sum` --
-#      which onnxruntime's optimizer only ever emits when something
-#      downstream actually still needs it, not unconditionally. Matching
-#      this shape too is a real, tractable extension (recognize
-#      `node.output[3]`, when present, as an *alternative* `x_in` source
-#      for a `SkipLayerNormalization`-family node feeding `F`), but it is
-#      a genuinely different check from the single-input-only one
-#      :func:`_is_entry_ln_node` performs today, not a free extension of
-#      it -- left out of this initial version's scope rather than rushed
-#      in, so it is not implemented here.
+#
+#    The *entry* norm, `LN(x_in)`, is recognized in both shapes: a plain,
+#    single-input `LayerNormalization`/`RMSNormalization`/
+#    `SimplifiedLayerNormalization` node (:func:`_is_entry_ln_node`,
+#    `node.input[0] == x_in`), *or* a fused `SkipLayerNormalization`/
+#    `SkipSimplifiedLayerNormalization` node (:func:`_is_fused_entry_ln_node`)
+#    reached via its own *primary* (normalized) output, whose optional
+#    fourth output -- `input_skip_bias_sum`, confirmed (against
+#    onnxruntime's real `com.microsoft` schema via
+#    `get_all_operator_schema()`, and by direct execution -- see this
+#    section's own comment near :func:`_is_fused_entry_ln_node`) to be the
+#    raw, pre-normalization `input + skip (+ bias)` sum, bit-exact -- when
+#    *present* stands in for `x_in`: it names, as an ordinary graph
+#    tensor, exactly the same "previous block's own raw, unnormalized
+#    residual value" a bare `Add`'s own `x_in` operand already, directly,
+#    is. onnxruntime's transformer optimizer only ever emits this fourth
+#    output when something downstream still needs it (confirmed
+#    empirically: omitted from the node's own `output` list, it simply
+#    isn't computed or exposed at all -- no error, no silent
+#    materialization), so the match declines cleanly whenever it's absent,
+#    exactly the "decline outright, never guess" bar every other check in
+#    this section holds to. Unlike the merge case, this fused node is
+#    never added to the block's own `block_nodes` (never deleted) when
+#    matched this way: unlike a plain `LN` node (whose own *input* is
+#    `x_in`, produced entirely outside the block), this node's own
+#    *output* (`input_skip_bias_sum`) *is* `x_in` -- deleting the node that
+#    produces the very tensor every rewired `x_out` consumer needs to keep
+#    reading would corrupt the graph. It is left in place, computing
+#    exactly what it always did; its own primary (normalized) output
+#    simply loses its only consumer (`F`, deleted along with the rest of
+#    the block) and goes unread, which is harmless -- a later
+#    simplification pass is free to notice and remove it, this pass has no
+#    need to. The merge itself is untouched by any of this -- still
+#    matched, `x_out`-side, only as a bare `Add`; see point above.
 #
 #    A raw, not-yet-optimizer-fused export (the common case for a model
 #    straight out of a training framework's own ONNX exporter) still
 #    matches fully -- it has no `SkipLayerNormalization` nodes to begin
 #    with, only plain `Add`/`LayerNormalization`-family nodes throughout.
+#    A fully optimizer-fused export -- where the residual `Add` immediately
+#    preceding block `N`'s own entry `LN` got fused into block `N-1`'s own
+#    merge, producing exactly this `SkipLayerNormalization`-family node --
+#    is now matched too, provided block `N`'s own *merge* (its `x_out`)
+#    remains a bare `Add` (e.g. the last block before a final, non-fused
+#    `LayerNormalization`) -- the realistic shape this extension targets.
 # 2. Attention and MLP/FFN blocks are matched -- and dropped -- fully
 #    independently of each other, never only as a paired "whole
 #    transformer layer". Nothing in the graph structure requires pairing:
@@ -12375,6 +12387,48 @@ def _is_entry_ln_node(node: onnx.NodeProto, x_in: str) -> bool:
     )
 
 
+def _is_fused_entry_ln_node(node: onnx.NodeProto, x_in: str, t: str) -> bool:
+    """True if `node` is a ``com.microsoft::SkipLayerNormalization``/
+    ``SkipSimplifiedLayerNormalization`` node (:data:`_SKIP_LAYER_NORM_OPS`/
+    :data:`_SKIP_LAYER_NORM_DOMAIN`, the same constants
+    :func:`_skip_layer_norm_const_names` uses for the unrelated channel-
+    pruning residual merge above) reached, during the backward walk, via
+    its own *primary* output `t` -- i.e. `t == node.output[0]`, the
+    normalized `LN(input + skip (+ bias))` value `F` actually reads -- and
+    whose own optional fourth output, `input_skip_bias_sum`, is both
+    present (``len(node.output) > 3`` and non-empty -- onnxruntime only
+    ever materializes it when something downstream still needs it;
+    confirmed empirically, see this section's own comment above) and
+    textually equal to `x_in`.
+
+    This is the fused analogue of :func:`_is_entry_ln_node`'s own
+    `node.input[0] == x_in` check -- confirmed, via
+    `onnxruntime.capi.onnxruntime_pybind11_state.get_all_operator_schema()`
+    against both ops' real ``com.microsoft`` schemas, and independently by
+    running a real node through a real `onnxruntime.InferenceSession` and
+    comparing bit-exact (not merely close) against an independently
+    hand-computed `input + skip (+ bias)`, that `input_skip_bias_sum` is
+    exactly the raw, pre-normalization sum -- i.e. exactly what a bare
+    `Add`'s own `x_in` operand would already, directly, be, standing in
+    for it here since the fused node's own first *input* (unlike a plain
+    `LN` node's) is not `x_in` itself but a sum of two separate tensors.
+    Requiring `t == node.output[0]` specifically (rather than accepting a
+    match reached via `mean`/`inv_std_var`, the op's other two optional
+    outputs) mirrors :func:`_is_entry_ln_node`'s own single-input
+    specificity, and keeps this from ever misfiring on a node reached only
+    through those training-only, in-practice-never-wired outputs.
+    """
+    return (
+        node.domain == _SKIP_LAYER_NORM_DOMAIN
+        and node.op_type in _SKIP_LAYER_NORM_OPS
+        and len(node.output) >= 1
+        and node.output[0] == t
+        and len(node.output) > 3
+        and node.output[3] != ""
+        and node.output[3] == x_in
+    )
+
+
 @dataclass(frozen=True)
 class _DroppableBlock:
     merge_node: onnx.NodeProto
@@ -12409,13 +12463,18 @@ def _try_resolve_droppable_block(
       unlike every chain walk elsewhere in this module, since nothing here
       needs to recognize any *particular* shape of `F`, only that
       everything inside it stays inside it) must reach `x_in` *only* via
-      one or more :func:`_is_entry_ln_node` boundaries (`LN(x_in)`,
-      not recursed past) -- reaching `x_in` directly, bypassing every such
-      boundary, means `F` reads `x_in` raw rather than only its own norm,
-      not the pattern this pass targets, and declines the whole candidate;
-      finding *no* such boundary at all (`F`'s own backward walk never
-      touches `x_in`) declines it the same way -- some other tensor
-      entirely feeds the merge's `other` operand, not `F(LN(x_in))`.
+      one or more entry-norm boundaries, not recursed past: either a plain
+      `LN(x_in)` node (:func:`_is_entry_ln_node`), or a fused
+      `SkipLayerNormalization`/`SkipSimplifiedLayerNormalization` node
+      reached via its own primary output whose optional fourth output
+      equals `x_in` (:func:`_is_fused_entry_ln_node` -- see this section's
+      own comment above for why the fourth output is the correct `x_in`
+      stand-in). Reaching `x_in` directly, bypassing every such boundary,
+      means `F` reads `x_in` raw rather than only its own norm, not the
+      pattern this pass targets, and declines the whole candidate; finding
+      *no* such boundary at all (`F`'s own backward walk never touches
+      `x_in`) declines it the same way -- some other tensor entirely feeds
+      the merge's `other` operand, not `F(LN(x_in))`.
     - Every node the walk collects (the block's own interior, plus
       `merge_node` itself) must have every one of its own output tensors
       read by nothing outside that same set, and never be a graph output
@@ -12427,6 +12486,10 @@ def _try_resolve_droppable_block(
       and declines the block -- see this section's own comment above for
       why this one general check is also exactly what makes a
       KV-cache-bearing block decline itself, with no dedicated detection.
+      A fused entry-norm node matched via :func:`_is_fused_entry_ln_node`
+      is deliberately *not* added to this set -- see that function's own
+      docstring and this section's own comment for why it is preserved
+      (never deleted) rather than collected as ordinary block interior.
 
     A graph input reached mid-walk (an attention mask, position ids, a
     KV-cache input, or any other tensor `F` reads that isn't produced by
@@ -12437,6 +12500,15 @@ def _try_resolve_droppable_block(
     """
     block_node_ids: Set[int] = {id(merge_node)}
     block_nodes: List[onnx.NodeProto] = [merge_node]
+    # Fused entry-norm nodes matched via `_is_fused_entry_ln_node`: kept
+    # out of `block_node_ids`/`block_nodes` (never deleted -- their own
+    # fourth output *is* `x_in`; see this function's own docstring and
+    # this section's own comment). Tracked separately so a *second* visit
+    # to the same node, via one of its other outputs (`mean`/
+    # `inv_std_var`, in practice never wired to anything -- see this
+    # section's own comment), can neither re-add it to `block_nodes` nor
+    # be silently accepted as some other, contradictory role.
+    fused_boundary_ids: Set[int] = set()
     found_entry_ln = False
     visited: Set[str] = set()
     frontier: List[str] = [other]
@@ -12450,12 +12522,26 @@ def _try_resolve_droppable_block(
         node = node_by_output.get(t)
         if node is None:
             continue  # graph input or initializer -- a leaf, not a problem
+        if id(node) in fused_boundary_ids:
+            continue  # already resolved as this block's own fused boundary
         if _is_entry_ln_node(node, x_in):
             found_entry_ln = True
             if id(node) not in block_node_ids:
                 block_node_ids.add(id(node))
                 block_nodes.append(node)
             continue  # boundary -- LN's own input (x_in) is not recursed into
+        if _is_fused_entry_ln_node(node, x_in, t):
+            if id(node) in block_node_ids:
+                # Already collected as ordinary block interior via one of
+                # this same node's *other* outputs, before this visit
+                # discovered it's actually this block's own fused
+                # boundary -- irreconcilable (its own `x_in`-bearing
+                # output can't be both deleted and preserved), so decline
+                # rather than guess which role is right.
+                return None
+            found_entry_ln = True
+            fused_boundary_ids.add(id(node))
+            continue  # boundary -- preserved, not deleted, not recursed into
         if id(node) not in block_node_ids:
             block_node_ids.add(id(node))
             block_nodes.append(node)
@@ -12743,11 +12829,14 @@ def apply_transformer_block_pruning(
     ``x = x + MLP(LN(x))``) wholesale, rather than shrinking every block a
     little the way every other `apply_*` function in this module does --
     see this section's own comment above for the exact pattern matched,
-    the two scope decisions this narrows to (bare-`Add` merges and a
-    plain, unfused entry norm only -- a `SkipLayerNormalization`-family
-    node is not recognized in either role, so a model already run through
-    onnxruntime's own transformer optimizer needs its own follow-up
-    coverage this initial version doesn't take on; attention and MLP/FFN
+    the two scope decisions this narrows to (the merge is a bare `Add`
+    only -- a `SkipLayerNormalization`-family node is never recognized in
+    that role; the entry norm accepts either a plain, unfused `LN(x_in)`
+    node *or* a fused `SkipLayerNormalization`/
+    `SkipSimplifiedLayerNormalization` node, via its own optional fourth
+    output, standing in for `x_in` -- so a model already run through
+    onnxruntime's own transformer optimizer is matched too, provided each
+    block's own merge itself is still a bare `Add`; attention and MLP/FFN
     blocks matched and dropped fully independently, never only as a
     "whole layer" pair) and why a KV-cache-bearing attention block needs
     no dedicated handling to always decline safely on its own.
