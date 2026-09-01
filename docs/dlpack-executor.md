@@ -209,6 +209,15 @@ Consequences for the design:
   it still imports, compiles, and computes the same result. Every op the test
   models use is drawn from nncase's supported-ops list
   (<https://github.com/kendryte/nncase/blob/master/docs/onnx_ops.md>).
+- `tests/test_tinygrad_integration.py` (+ `.github/workflows/backend-integration.yml`) —
+  the same embeddability claim exercised against
+  [tinygrad](https://github.com/tinygrad/tinygrad)'s own `OnnxRunner`
+  (`tinygrad.nn.onnx.OnnxRunner`), which imports and eagerly executes an ONNX
+  `ModelProto` directly -- no separate compile step, and no vendor hardware
+  needed (it runs on tinygrad's own default backend, typically CPU/CLANG on an
+  ordinary CI runner). Like the nncase test, this feeds onnxsim's simplified
+  output straight into the target's native ONNX frontend and checks it still
+  runs and computes the same result.
 
 ## Rust binding
 
