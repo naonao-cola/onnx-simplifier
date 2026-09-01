@@ -226,6 +226,61 @@ own fusion pass to collapse into `BiasGelu`/`FastGelu` in the first place --
 a plain unfused `Gelu`/`Sigmoid` gate (already handled) is the shape that
 survives when there's no bias to fuse to begin with.
 
+A raw, not-yet-optimizer-fused export -- straight out of a training
+framework's own ONNX exporter, before onnxruntime's transformer-optimizer
+ever runs -- has no `SkipLayerNormalization`/`BiasGelu` fusions at all, just
+plain unfused nodes throughout: ``x1 = MatMul(x, W1); x2 =
+LayerNormalization(x1, gamma, beta, axis=-1); x3 = MatMul(x2, W2)``. Unlike
+the `SkipLayerNormalization` shape above, this `LayerNorm`/RMSNorm sits
+*mid-chain* -- between an ordinary producer and consumer, not fused onto a
+residual merge point -- so it is recognized directly by
+:func:`_walk_to_consumer` as one more hop kind, alongside its existing
+bias/scale `Add`/`Mul` and `BiasGelu`/`FastGelu` hops: a plain
+`LayerNormalization` (opset 17+)/`RMSNormalization` (opset 23+)/
+`SimplifiedLayerNormalization` (onnxruntime's own RMSNorm-equivalent,
+confirmed to run under the default ONNX domain -- see
+`_NORM_PASS_THROUGH_OPS`'s own comment) node, its own `scale` (required) and,
+for `LayerNormalization` only, `bias` (optional; the other two ops have no
+such input at all) sliced by the chain's shared `keep` set exactly like a
+`SkipLayerNormalization` node's own `gamma`/`beta`/`bias` already are (see
+:func:`_norm_pass_through_const_names`, which factors out and reuses
+:func:`_flat_channel_const`, the very same per-tensor validity check
+:func:`_skip_layer_norm_const_names` uses). Recognized *only* when the node's
+own `axis` attribute is confirmed to normalize exactly the one trailing
+channel axis being pruned -- `axis == -1` outright, or a positive `axis`
+confirmed against a known tensor rank (:func:`_norm_axis_is_last`) -- since
+that is also the axis LayerNorm's own mean/variance reduction runs over:
+slicing channels *before* that reduction runs (which is exactly what pruning
+this producer's own output does) genuinely changes what gets normalized
+over, so the reduction on the pruned graph is mathematically a different
+(smaller) computation than the reduction on the original graph would have
+been -- not a bug, simply what happens whenever channels are removed ahead
+of any op that reduces over them, no different in kind from how a channel
+pruned ahead of a global-average-pool or another norm changes what that op
+reduces over too. The correctness bar this hop is held to is therefore the
+same one every other hop in this pass already is: the pruned graph must
+match an *independently, already-pruned* reference model (weights, and this
+norm's own `scale`/`bias`, sliced to the same kept indices from the start),
+not a hypothetical "run the original norm, then slice its output" post-hoc
+reference, which is not what pruning ever actually computes once the norm's
+own producer has fewer channels. A norm whose secondary, training-only
+outputs (`Mean`/`InvStdDev` on `LayerNormalization`, `inv_std_var` on
+`SimplifiedLayerNormalization`) are actually consumed by anything is
+declined the same conservative way a `SkipLayerNormalization` node's own
+consumed `mean`/`inv_std_var` already is -- their *values*, not their shape,
+depend on exactly which channels survive, and nothing here has a basis for
+whether whatever reads them still expects the original ones. Multi-axis
+normalization (`axis` short of the last dimension, e.g. `-2`) is declined
+outright, never partially matched -- out of scope by this section's own
+"single, full trailing channel axis" bar. This is a MatMul/Gemm-chain-only
+hop, the same as the bias/scale `Add`/`Mul` and `BiasGelu`/`FastGelu` hops it
+sits alongside: Conv's own channel axis is axis 1 (NCHW), never the *last*
+axis a `LayerNormalization`-family node's default `axis=-1` actually
+normalizes, so no Conv-side analogue is added. Composes for free with the
+residual/gated/`Concat` machinery described below, since all three reuse
+this same :func:`_walk_to_consumer` for their own forward continuation, with
+no composition-specific code of its own.
+
 A `Concat` merge -- the U-Net-style encoder/decoder skip connection
 (`merged = Concat(a, b, axis=1)`, each branch keeping its own disjoint slice
 of the merged channel range) -- looks at first glance like it needs the same
@@ -2550,6 +2605,141 @@ _FUSED_BIAS_GELU_OPS: Dict[str, bool] = {
 }
 _FUSED_BIAS_GELU_DOMAIN = "com.microsoft"
 
+# LayerNormalization (plain ONNX, opset 17+)/RMSNormalization (plain ONNX,
+# opset 23+)/SimplifiedLayerNormalization (onnxruntime's own RMSNorm
+# equivalent -- confirmed, empirically, to run under the *default* (empty)
+# ONNX domain despite living in onnxruntime's own contrib-op source tree, not
+# under ``com.microsoft`` the way ``SkipLayerNormalization``/
+# ``SkipSimplifiedLayerNormalization`` do -- via ``onnx.defs.get_schema`` for
+# the first two and
+# ``onnxruntime.capi.onnxruntime_pybind11_state.get_all_operator_schema()``
+# for the third), recognized as a mid-chain pass-through hop here -- distinct
+# from `_ENTRY_LN_OPS`'s own, unrelated use of the very same three op types
+# far below, purely as a transformer-block *entry* marker (never pruned
+# themselves there): here a norm genuinely sits *between* a producer and a
+# consumer, with its own affine `scale`/`bias` co-sliced right along with
+# them, exactly like a per-channel `Add`/`Mul` bias/scale hop's own operand
+# already is. Only ever a MatMul/Gemm-chain hop (:func:`_walk_to_consumer`),
+# the same as the `_BINARY_CHANNEL_OPS`/`_FUSED_BIAS_GELU_OPS` hops it sits
+# alongside -- no Conv-side analogue: Conv's own channel axis is axis 1
+# (NCHW), never the *last* axis a `_NORM_PASS_THROUGH_OPS` node's default
+# ``axis=-1`` actually normalizes, so the shape this hop targets never arises
+# on a Conv chain in practice.
+_NORM_PASS_THROUGH_OPS = (
+    "LayerNormalization",
+    "RMSNormalization",
+    "SimplifiedLayerNormalization",
+)
+
+
+def _flat_channel_const(
+    name: str, initializer_map: Dict[str, onnx.TensorProto]
+) -> bool:
+    """True if `name` names a constant float initializer shaped like a flat
+    per-channel vector (``prod(dims) == dims[-1]``) -- the self-consistency
+    bar every per-channel affine/bias/scale hop in this module checks before
+    ever accepting a tensor as a slice target (the real ``dims[-1] ==
+    n_channels`` check, once the chain's real channel count is known, is
+    always left to the caller). Shared by :func:`_skip_layer_norm_const_names`
+    (a ``SkipLayerNormalization``-family residual-merge node's own `gamma`/
+    `beta`/`bias`) and :func:`_norm_pass_through_const_names` (a plain
+    `_NORM_PASS_THROUGH_OPS` node's own `scale`/`bias`) -- same schema fact (a
+    per-channel affine operand must broadcast against exactly the channel
+    axis, nothing else), same check, regardless of which op reads it.
+    """
+    init = initializer_map.get(name)
+    return (
+        init is not None
+        and _is_supported_float_dtype(init.data_type)
+        and bool(list(init.dims))
+        and int(np.prod(init.dims)) == init.dims[-1]
+    )
+
+
+def _norm_axis(node: onnx.NodeProto) -> int:
+    for attr in node.attribute:
+        if attr.name == "axis":
+            return attr.i
+    return -1  # schema default for every _NORM_PASS_THROUGH_OPS op
+
+
+def _norm_axis_is_last(
+    node: onnx.NodeProto,
+    x_name: str,
+    value_info_by_name: Optional[Dict[str, onnx.ValueInfoProto]],
+) -> bool:
+    """True if `node`'s own ``axis`` attribute is confirmed to normalize
+    *only* the last axis of `x_name` -- ``axis == -1`` outright (every one of
+    these ops' own schema already normalizes from `axis` through the last
+    dimension, so ``-1`` unambiguously means exactly one axis, the last,
+    regardless of rank), or a positive `axis` only when `x_name`'s own rank
+    is known (:func:`_tensor_rank`) and equals ``axis == rank - 1`` -- the
+    same reasoning, and the same "decline rather than guess" bar on an
+    unknown rank, as :func:`_concat_axis_is_last`'s own positive-axis case
+    (`value_info_by_name` left ``None`` simply narrows this to the `axis ==
+    -1` case, never guesses -- every :func:`_walk_to_consumer` caller today
+    threads its own graph's `value_info_by_name` through, so this only
+    matters for a hypothetical future caller that doesn't). Any other axis
+    (e.g. ``-2``, or a positive axis short of ``rank - 1``) spans more than
+    this one trailing channel axis --
+    multi-axis normalization this hop is deliberately out of scope for (see
+    this section's own comment above) -- and is declined here, never guessed
+    at.
+    """
+    axis = _norm_axis(node)
+    if axis == -1:
+        return True
+    if axis < 0 or value_info_by_name is None:
+        return False
+    rank = _tensor_rank(x_name, value_info_by_name)
+    return rank is not None and axis == rank - 1
+
+
+def _norm_pass_through_const_names(
+    node: onnx.NodeProto, initializer_map: Dict[str, onnx.TensorProto]
+) -> Optional[Tuple[str, Optional[str]]]:
+    """If every constant input a mid-chain `_NORM_PASS_THROUGH_OPS` `node`
+    needs sliced -- `scale`/`Scale` (input 1, required by all three ops' own
+    schema) and, for ``LayerNormalization`` only (``RMSNormalization``/
+    ``SimplifiedLayerNormalization`` have no `bias`/`B` input at all --
+    confirmed live via each op's own schema, see this section's own comment
+    above), `B` (input 2, optional) -- is present exactly as the node's own
+    input list says, and, whenever present, a constant float initializer
+    shaped like a flat per-channel vector (:func:`_flat_channel_const`, the
+    same bar :func:`_skip_layer_norm_const_names`'s own `gamma`/`beta`/`bias`
+    check already uses), returns ``(scale_name, bias_name_or_None)``. The
+    real ``dims[-1] == n_channels`` check, and confirming this node's own
+    ``axis`` genuinely normalizes only the axis being pruned
+    (:func:`_norm_axis_is_last`), are both left to the caller
+    (:func:`_walk_to_consumer`) -- exactly like
+    :func:`_skip_layer_norm_const_names`'s own deferred channel-count check.
+    Declines (``None``) on a missing/non-constant `scale`, a *present* but
+    non-constant `B`, or `scale`/`B` naming the same tensor (double-slicing
+    it in :func:`_apply_chains`'s own per-hop loop would corrupt it) -- none
+    of these is guessed at.
+    """
+    if node.op_type not in _NORM_PASS_THROUGH_OPS:
+        return None
+    if (
+        len(node.input) < 2
+        or not node.input[1]
+        or not _flat_channel_const(node.input[1], initializer_map)
+    ):
+        return None
+    scale_name = node.input[1]
+
+    bias_name: Optional[str] = None
+    if node.op_type == "LayerNormalization" and len(node.input) > 2 and node.input[2]:
+        if not _flat_channel_const(node.input[2], initializer_map):
+            return None
+        bias_name = node.input[2]
+
+    if scale_name == bias_name:
+        return None  # tied scale/bias -- double-slicing would corrupt it
+
+    return scale_name, bias_name
+
+
 _ConsumerMatch = Tuple[onnx.NodeProto, str, bool]  # (node, weight, weight_transposed)
 
 
@@ -2827,15 +3017,19 @@ def _walk_to_consumer(
     n_channels: int,
     max_hops: int,
     forced_first_hop: Optional[onnx.NodeProto] = None,
+    value_info_by_name: Optional[Dict[str, onnx.ValueInfoProto]] = None,
 ) -> Tuple[Optional[_ConsumerMatch], Tuple[Tuple[onnx.NodeProto, Optional[str]], ...]]:
     """From tensor `start`, walks forward through shape-preserving
     elementwise ops (an activation, an Add/Mul against a constant
-    per-channel bias/scale, or a fused ``com.microsoft::BiasGelu``/
+    per-channel bias/scale, a fused ``com.microsoft::BiasGelu``/
     ``FastGelu`` node -- see `_FUSED_BIAS_GELU_OPS`'s own comment and
-    :func:`_match_fused_bias_gelu`) with no other consumer anywhere along
-    the way, until a MatMul/vanilla-Gemm consumer is found whose reduction
-    dimension matches `n_channels`. Returns ``(None, ())`` if the walk
-    runs out of hops, hits a branch, or never reaches such a consumer.
+    :func:`_match_fused_bias_gelu` -- or a plain `_NORM_PASS_THROUGH_OPS`
+    node whose own ``axis`` normalizes exactly `cur`'s last axis -- see that
+    constant's own comment, :func:`_norm_axis_is_last`, and
+    :func:`_norm_pass_through_const_names`) with no other consumer anywhere
+    along the way, until a MatMul/vanilla-Gemm consumer is found whose
+    reduction dimension matches `n_channels`. Returns ``(None, ())`` if the
+    walk runs out of hops, hits a branch, or never reaches such a consumer.
 
     `forced_first_hop`, when given, is used as the walk's very first hop
     instead of deriving it from `consumers_of[start]` -- see
@@ -2843,6 +3037,16 @@ def _walk_to_consumer(
     only by :func:`_find_matmul_residual_chains`'s "fan-out" post-check);
     every ordinary caller leaves it ``None`` and gets identical behavior to
     before this parameter existed.
+
+    `value_info_by_name`, when given, lets a positive-`axis`
+    `_NORM_PASS_THROUGH_OPS` hop confirm that axis against the tensor's own
+    known rank (:func:`_norm_axis_is_last`); every finder function that calls
+    this (:func:`_find_chains`, :func:`_find_matmul_residual_chains` and
+    :func:`_find_matmul_concat_chains` via :func:`_resolve_matmul_fanout_branches`,
+    and :func:`_find_gated_chains`) builds and threads its own graph's copy
+    through today. Left ``None``, only the unambiguous ``axis == -1`` case of
+    that hop is still recognized -- never a correctness gap, just narrower
+    coverage where rank isn't threaded through.
     """
     chain_ops: List[Tuple[onnx.NodeProto, Optional[str]]] = []
     consumer = None
@@ -2871,6 +3075,7 @@ def _walk_to_consumer(
             break
 
         const_name: Optional[str] = None
+        extra_const_name: Optional[str] = None
         if (
             nxt.op_type in _UNARY_PASS_THROUGH
             and list(nxt.input) == [cur]
@@ -2905,6 +3110,39 @@ def _walk_to_consumer(
             ):
                 break
             const_name = bias_name
+        elif nxt.op_type in _NORM_PASS_THROUGH_OPS and nxt.domain == "":
+            if not nxt.input or nxt.input[0] != cur:
+                break
+            if not _norm_axis_is_last(nxt, cur, value_info_by_name):
+                break
+            names = _norm_pass_through_const_names(nxt, initializer_map)
+            if names is None:
+                break
+            scale_name, bias_name = names
+            if initializer_map[scale_name].dims[-1] != n_channels:
+                break
+            if (
+                bias_name is not None
+                and initializer_map[bias_name].dims[-1] != n_channels
+            ):
+                break
+            # Training-only secondary outputs (LayerNormalization's own
+            # Mean/InvStdDev; SimplifiedLayerNormalization's own
+            # inv_std_var; RMSNormalization has no secondary output at all)
+            # would silently go stale (their *values*, not their shape,
+            # depend on exactly which channels survive) if consumed by
+            # anything -- declined here the same conservative way
+            # :func:`_match_matmul_residual_merge` already declines a
+            # consumed `mean`/`inv_std_var` on a `SkipLayerNormalization`
+            # -family node.
+            if any(
+                nxt.output[i]
+                and (consumers_of.get(nxt.output[i]) or nxt.output[i] in graph_outputs)
+                for i in range(1, len(nxt.output))
+            ):
+                break
+            const_name = scale_name
+            extra_const_name = bias_name
         else:
             break
 
@@ -2912,6 +3150,8 @@ def _walk_to_consumer(
         if len(consumers_of.get(out2, [])) != 1 or out2 in graph_outputs:
             break
         chain_ops.append((nxt, const_name))
+        if extra_const_name is not None:
+            chain_ops.append((nxt, extra_const_name))
         cur = out2
 
     return consumer, tuple(chain_ops)
@@ -2921,6 +3161,7 @@ def _find_chains(graph: onnx.GraphProto) -> List[_Chain]:
     initializer_map = {t.name: t for t in graph.initializer}
     consumers_of = _consumers_of(graph)
     graph_outputs = {o.name for o in graph.output}
+    value_info_by_name = _value_info_by_name(graph)
 
     def _is_internal(name: str) -> bool:
         # Safe to reshape only if exactly one node reads it and it isn't
@@ -2945,6 +3186,7 @@ def _find_chains(graph: onnx.GraphProto) -> List[_Chain]:
             graph_outputs,
             n_channels,
             _MAX_CHAIN_HOPS,
+            value_info_by_name=value_info_by_name,
         )
         if consumer is None:
             continue
@@ -4296,20 +4538,19 @@ def _skip_layer_norm_const_names(
     non-constant `beta`/`bias`, or the same underlying tensor named for two
     of `gamma`/`beta`/`bias` at once (double-slicing it in
     :func:`_apply_chains`'s own per-hop loop would corrupt it) -- none of
-    these is guessed at.
+    these is guessed at. The per-tensor validity check itself is
+    :func:`_flat_channel_const`, shared verbatim with
+    :func:`_norm_pass_through_const_names`'s own plain-`LayerNormalization`
+    -family `scale`/`bias` check -- same schema fact, same check, regardless
+    of which op reads it.
     """
     simplified = node.op_type == "SkipSimplifiedLayerNormalization"
 
-    def _const_vec(name: str) -> bool:
-        init = initializer_map.get(name)
-        return (
-            init is not None
-            and _is_supported_float_dtype(init.data_type)
-            and bool(list(init.dims))
-            and int(np.prod(init.dims)) == init.dims[-1]
-        )
-
-    if len(node.input) < 3 or not node.input[2] or not _const_vec(node.input[2]):
+    if (
+        len(node.input) < 3
+        or not node.input[2]
+        or not _flat_channel_const(node.input[2], initializer_map)
+    ):
         return None  # gamma is required
     gamma_name = node.input[2]
 
@@ -4318,13 +4559,13 @@ def _skip_layer_norm_const_names(
     if not simplified:
         bias_idx = 4
         if len(node.input) > 3 and node.input[3]:
-            if not _const_vec(node.input[3]):
+            if not _flat_channel_const(node.input[3], initializer_map):
                 return None
             beta_name = node.input[3]
 
     bias_name: Optional[str] = None
     if len(node.input) > bias_idx and node.input[bias_idx]:
-        if not _const_vec(node.input[bias_idx]):
+        if not _flat_channel_const(node.input[bias_idx], initializer_map):
             return None
         bias_name = node.input[bias_idx]
 
@@ -4699,13 +4940,16 @@ def _resolve_matmul_fanout_branches(
     consumers_of: Dict[str, List[onnx.NodeProto]],
     graph_outputs: Set[str],
     n_channels: int,
+    value_info_by_name: Optional[Dict[str, onnx.ValueInfoProto]] = None,
 ) -> Optional[List[_ConsumerBranch]]:
     """The MatMul/Gemm analogue of :func:`_resolve_conv_fanout_branches` --
     see its own docstring for the shared reasoning this mirrors exactly
     (only the forward walker differs: :func:`_walk_to_consumer` instead of
     :func:`_walk_to_conv_consumer`), and there is no Conv-style grouped-
     consumer or depthwise-pass-through concept to check or carry for a
-    MatMul/Gemm branch at all.
+    MatMul/Gemm branch at all. `value_info_by_name`, when given, is threaded
+    straight through to :func:`_walk_to_consumer`'s own same-named parameter
+    -- see there for what it enables.
     """
     branches: List[_ConsumerBranch] = []
     seen_weights: Set[str] = set()
@@ -4727,6 +4971,7 @@ def _resolve_matmul_fanout_branches(
                 n_channels,
                 _MAX_CHAIN_HOPS,
                 forced_first_hop=consumer_node,
+                value_info_by_name=value_info_by_name,
             )
             if resolved is None:
                 return None
@@ -4779,6 +5024,7 @@ def _find_matmul_residual_chains(graph: onnx.GraphProto) -> List[_Chain]:
     consumers_of = _consumers_of(graph)
     node_by_output = {out: node for node in graph.node for out in node.output}
     graph_outputs = {o.name for o in graph.output}
+    value_info_by_name = _value_info_by_name(graph)
 
     # _find_gated_chains's own producer-lookup map, built once here and
     # threaded through every _walk_matmul_producer_backward call below --
@@ -4976,6 +5222,7 @@ def _find_matmul_residual_chains(graph: onnx.GraphProto) -> List[_Chain]:
             consumers_of,
             graph_outputs,
             n_channels,
+            value_info_by_name=value_info_by_name,
         )
         if not branches:
             continue
@@ -5072,6 +5319,7 @@ def _find_gated_chains(graph: onnx.GraphProto) -> List[_Chain]:
     consumers_of = _consumers_of(graph)
     graph_outputs = {o.name for o in graph.output}
     node_by_output = {out: node for node in graph.node for out in node.output}
+    value_info_by_name = _value_info_by_name(graph)
 
     def _is_internal(name: str) -> bool:
         return len(consumers_of.get(name, [])) == 1 and name not in graph_outputs
@@ -5150,7 +5398,13 @@ def _find_gated_chains(graph: onnx.GraphProto) -> List[_Chain]:
             continue
 
         consumer, chain_ops = _walk_to_consumer(
-            out_name, initializer_map, consumers_of, graph_outputs, n_a, _MAX_CHAIN_HOPS
+            out_name,
+            initializer_map,
+            consumers_of,
+            graph_outputs,
+            n_a,
+            _MAX_CHAIN_HOPS,
+            value_info_by_name=value_info_by_name,
         )
         if consumer is None:
             continue
@@ -5338,9 +5592,11 @@ def _value_info_by_name(
 ) -> Dict[str, onnx.ValueInfoProto]:
     """Every ``ValueInfoProto`` the graph carries for its own tensors --
     `input`, `output`, and interior `value_info` -- keyed by tensor name.
-    The sole use is :func:`_tensor_rank`'s positive-`Concat`-axis rank
-    lookup (see this section's own comment); nothing else in this module
-    ever consults a tensor's declared type/shape.
+    Feeds :func:`_tensor_rank`'s positive-axis rank lookup, used by both a
+    `Concat`'s own positive `axis` (this section's own comment) and a
+    `_NORM_PASS_THROUGH_OPS` node's own positive `axis`
+    (:func:`_norm_axis_is_last`); nothing else in this module ever consults
+    a tensor's declared type/shape.
     """
     by_name: Dict[str, onnx.ValueInfoProto] = {}
     for vi in graph.input:
@@ -5902,6 +6158,7 @@ def _find_matmul_concat_chains(graph: onnx.GraphProto) -> List[_ConcatChain]:
                     consumers_of,
                     graph_outputs,
                     n_channels,
+                    value_info_by_name=value_info_by_name,
                 )
                 # `None` (resolution itself failed) or a non-empty list (real
                 # fan-out found, resolvable or not) both decline here -- only
@@ -5954,6 +6211,7 @@ def _find_matmul_concat_chains(graph: onnx.GraphProto) -> List[_ConcatChain]:
             graph_outputs,
             total_n,
             _MAX_CHAIN_HOPS,
+            value_info_by_name=value_info_by_name,
         )
         if consumer is None:
             continue
