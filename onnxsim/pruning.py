@@ -750,6 +750,7 @@ from typing import (
     List,
     Literal,
     Optional,
+    Protocol,
     Sequence,
     Set,
     Tuple,
@@ -11918,9 +11919,32 @@ def _apply_moe_whole_expert_chains(
     return stale_value_info
 
 
+class _HasRouterProbs(Protocol):
+    """Structural type for `_moe_router_gate_calibration_stats`'s own
+    `chains` parameter: any per-node chain record with a `router_probs`
+    tensor name -- :class:`_MoEExpertChain` (plain ``MoE``) and
+    :class:`_QMoEExpertChain` (``QMoE``, see this module's own "QMoE
+    (quantized-weight MoE) pruning" section below) both satisfy this
+    structurally, with no shared base class needed, so this one
+    calibration implementation serves both whole-expert-pruning families
+    -- router-gate calibration only ever reads `router_probs` (the
+    router's own *output*, upstream of either node's own MoE/QMoE-specific
+    machinery), so it is genuinely oblivious to which family produced it.
+    Declared as a read-only property, not a plain attribute -- mypy treats
+    a Protocol's own mutable-attribute members invariantly (a plain
+    ``router_probs: str`` would then reject ``List[_MoEExpertChain]``/
+    ``List[_QMoEExpertChain]`` here, since neither is *literally*
+    ``_HasRouterProbs``), while a read-only property is covariant, which is
+    all this function ever needs (it only ever reads `router_probs`).
+    """
+
+    @property
+    def router_probs(self) -> str: ...
+
+
 def _moe_router_gate_calibration_stats(
     out: onnx.ModelProto,
-    chains: List[_MoEExpertChain],
+    chains: Sequence[_HasRouterProbs],
     calibration_data: Sequence[Tensors],
     providers: Optional[Sequence[str]],
 ) -> Dict[str, np.ndarray]:
@@ -11936,7 +11960,9 @@ def _moe_router_gate_calibration_stats(
     crept in" extraction this module's own "Dry-run pruning sensitivity
     analysis" section comment documents for
     :func:`_wanda_unstructured_calibration_stats`/
-    :func:`_wanda_structured_calibration_stats`.
+    :func:`_wanda_structured_calibration_stats`. Also reused, unchanged, by
+    :func:`apply_qmoe_whole_expert_pruning` (see :class:`_HasRouterProbs`
+    above).
 
     `out` is expected to already be the caller's own working copy, exactly
     as :func:`_wanda_unstructured_calibration_stats` expects.
@@ -12069,6 +12095,998 @@ def apply_moe_whole_expert_pruning(
         return gate
 
     stale_value_info = _apply_moe_whole_expert_chains(
+        graph, chains, sparsity, _importance
+    )
+    if stale_value_info:
+        kept = [vi for vi in graph.value_info if vi.name not in stale_value_info]
+        del graph.value_info[:]
+        graph.value_info.extend(kept)
+    return out
+
+
+# --- QMoE (quantized-weight MoE) pruning -------------------------------------
+#
+# This section's own comment above (the plain-``MoE`` "expert-intermediate-
+# channel pruning" section) already names ``QMoE`` as the *other* ``*MoE*``-
+# named ``com.microsoft`` schema this environment's own live schema registry
+# returns -- confirmed there, empirically, that until this section existed
+# nothing in this module's matching code ever checked for ``op_type ==
+# "QMoE"`` at all. This section closes that gap: both of :func:`_match_moe_producer`'s
+# own two techniques (per-expert intermediate-channel pruning and
+# whole-expert removal), retargeted at ``QMoE``'s own packed/quantized
+# ``fc1``/``fc2`` weights instead of plain ``MoE``'s float ones.
+#
+# Every fact below was re-derived from ``QMoE``'s own *live* schema
+# (``onnxruntime.capi.onnxruntime_pybind11_state.get_all_operator_schema()``,
+# onnxruntime 1.29.0 in this environment) and, for anything the schema's own
+# prose doesn't pin down byte-for-byte, from real ``onnxruntime.InferenceSession``
+# runs on the CPU execution provider -- never assumed from ``QMoE``'s name
+# alone or from how a superficially similar op (``MatMulNBits``, or this
+# module's own int8 QDQ pattern -- see the "QDQ (quantized-weight) structured
+# pruning" section above) happens to work:
+#
+# 1. *Schema shape, ``MoE`` vs ``QMoE``.* ``QMoE`` shares `MoE`'s own
+#    `input`/`router_probs`/`fc1_experts_bias`/`fc2_experts_bias` inputs and
+#    `activation_type`/`swiglu_fusion`/`k`/`use_sparse_mixer`/
+#    `normalize_routing_weights` attributes verbatim, but balloons to 21
+#    inputs total: `fc1_experts_weights`/`fc2_experts_weights`/(optional)
+#    `fc3_experts_weights` become packed ``uint8`` (or, for the FP4/FP8
+#    modes below, ``float8e4m3fn``) tensors instead of float ones, each
+#    gains an optional per-fc `scales` and `zero_points` operand, and eight
+#    more FP4/FP8-quantization-specific inputs (`router_weights`,
+#    `fc{1,2}_global_scale`, `fc{1,2}_act_scale`, `fc{1,2}_act_block_scale`)
+#    appear that plain `MoE` has no equivalent of at all. `QMoE` also adds
+#    three of its own attributes: `quant_type` (``'int'`` (the schema's own
+#    default), ``'fp4'``, ``'nvfp4'``, ``'fp8'``, or ``'wfp4afp8'``),
+#    `expert_weight_bits` (2, 4, or 8 -- `quant_type='int'` only), and
+#    `block_size`/`weights_prepacked` (both -- see points 3 and 5 below).
+#    This pass targets exactly one corner of that surface -- `quant_type ==
+#    'int'` with no `block_size` -- and declines everything else outright
+#    (point 6); the FP4/FP8 modes are a genuinely different tensor format
+#    (MXFP block-scaled, `float8e4m3fn`-packed weights, separate activation
+#    scale operands) this pass was never built or verified against.
+#
+# 2. *Packing/dequantization ("column-wise", `quant_type='int'`, no
+#    `block_size`).* The op's own doc text says weights are "stored in
+#    column major order per expert" and gives the dequantization formula
+#    ``dequantized_weight = (quantized_weight - zero_point) * scale``, with
+#    `zero_point` defaulting to ``2**(bits - 1)`` when absent -- but neither
+#    of those alone pins down the *byte-level* packing order, so this was
+#    verified against a real, independent reference: `onnxruntime`'s own
+#    ``onnxruntime.quantization.cuda_quantizer.CudaQuantizer`` ships a pure-
+#    Python re-derivation of this exact "raw QMoE storage" contract
+#    (`qmoe_symmetric_per_channel_quantize`, used to build real QMoE test
+#    models, not this module's own code) -- confirming: `fc1_experts_weights`/
+#    `fc2_experts_weights` keep the same ``[num_experts, N, K]`` axis
+#    *meaning* as plain `MoE`'s own (`N` = `fc1`'s `inter_size`/`fc2`'s
+#    `hidden_size`, `K` = `fc1`'s `hidden_size`/`fc2`'s `inter_size`) --
+#    "column major" describes the *scale* granularity (one scale per output
+#    row/channel `N`, over the *whole* `K` row at once -- what the op's own
+#    doc calls "column wise quantization" when `block_size` is absent, i.e.
+#    exactly `MatMulNBits`' own per-channel case with one block spanning all
+#    of `K`), not a transposed tensor -- while the *last* axis (`K`) is
+#    packed `8 // bits` logical values per byte, low-index-in-low-bits first
+#    (byte ``= v[0] | v[1] << bits | ...``). This was independently
+#    confirmed to be the *exact* convention this environment's own CPU
+#    `QMoE` kernel expects too (not merely what the CUDA-side Python
+#    reference happens to produce): a hand-built `QMoE` node, quantized this
+#    exact way and unpacked/dequantized back with :func:`_unpack_subbyte`/
+#    the ``(q - zero_point) * scale`` formula, matches a real
+#    ``onnxruntime.InferenceSession`` run of that same node's own output to
+#    *exactly* 0.0 max-abs-diff -- for `bits` in ``{2, 4, 8}`` each, for a
+#    single-expert/single-selected-expert node (isolating the dequantization
+#    formula from any routing/gating effects), and again with a deliberately
+#    *non-default*, per-channel `zero_point` operand (confirming
+#    `zero_points`, when present, packs with the identical
+#    low-index-in-low-bits convention along its own channel axis, not merely
+#    that the *default* zero point is honored). `fc1_zero_points`'/
+#    `fc2_zero_points`'s own channel axis is `N` (`inter_size`/`hidden_size`
+#    respectively, the *same* axis as `fc1_scales`/`fc2_scales`, per the
+#    schema's own shape doc) -- **not** `MatMulNBits`' own block-relative
+#    layout, so this pass's own packed-slicing helpers were written fresh
+#    from this confirmed-independently layout rather than reused from (or
+#    force-fit to) any `MatMulNBits` pruning code, even where one exists
+#    elsewhere in this session -- see point 4.
+#
+# 3. *`block_size` (blocked quantization).* When present, `scale`/
+#    `zero_points` gain a third, `K`-block-indexed axis instead of one
+#    scalar per output channel -- a materially different shape this pass's
+#    own matcher never reaches (a schema doc detail, not independently
+#    re-derived byte-for-byte the way point 2's default "no `block_size`"
+#    case was) -- so any `block_size` attribute value other than absent/0 is
+#    declined outright, confirmed live to actually matter too: the CPU
+#    kernel itself additionally *rejects* any provided `block_size` below
+#    16 (``"block_size must be >= 16 when provided"``), a real, separate
+#    validity constraint this pass sidesteps entirely by declining the
+#    attribute's presence altogether rather than trying to also replicate
+#    that floor.
+#
+# 4. *`weights_prepacked`.* A tri-state attribute (default ``-1``) that
+#    selects between this pass's own assumed raw ``[N, K/pack]`` storage (0,
+#    or -1 -- confirmed live to produce byte-identical CPU output to an
+#    explicit 0, i.e. -1 means "raw" on this environment's CPU execution
+#    provider, not "some other layout") and a CUTLASS mixed-GEMM prepacked
+#    byte layout (1) built for CUDA kernels -- an entirely different,
+#    GPU-specific byte shuffle (row permutation, sub-byte transpose, column
+#    interleaving; see `onnxruntime.quantization.cuda_quantizer`'s own
+#    `_preprocess_weights_for_mixed_gemm_torch`) this pass makes no attempt
+#    to slice correctly. `weights_prepacked` values other than ``-1``/``0``
+#    are declined outright.
+#
+# 5. *Activation/`fc3` support -- verified independently for `QMoE`, not
+#    assumed from `MoE`'s own already-confirmed set.* Every one of
+#    `relu`/`gelu`/`silu`/`identity` was independently run end-to-end
+#    against this environment's real CPU `onnxruntime.InferenceSession`,
+#    for `expert_weight_bits` in ``{2, 4, 8}`` each -- all execute cleanly,
+#    the same activation set plain `MoE` already supports (`swiglu` requires
+#    `swiglu_fusion=1` on CPU here too, "CPU QMoE only supports interleaved
+#    SwiGLU format", the identical restriction/decline plain `MoE` already
+#    documents, for the identical reason -- the doubled/interleaved
+#    `fc1_experts_weights` row count this pass's own shape check already
+#    rules out structurally). `fc3_experts_weights` presence was also
+#    independently re-confirmed to fail on this environment's real CPU
+#    kernel -- ``"FC3 gating is not yet implemented on CPU for QMoE"`` --
+#    not merely assumed to inherit plain `MoE`'s own already-documented
+#    ``"FC3 is not implemented for CPU MoE"`` limitation; both are declined
+#    for the same "no CPU oracle to validate against" reasoning.
+#
+# 6. *A genuinely surprising finding, independent of every point above:
+#    `QMoE`'s `normalize_routing_weights` attribute is a no-op on this
+#    environment's CPU kernel.* Plain `MoE` genuinely switches gating
+#    behavior on this attribute (confirmed live: with it unset/0, `MoE`'s
+#    own gate weight is the *raw* Softmax-over-*every*-expert probability of
+#    each selected expert -- summing to well under 1 whenever ``k <
+#    num_experts``; with it set to 1, `MoE` *renormalizes* the selected
+#    top-`k` probabilities to sum to exactly 1). `QMoE`, on this same
+#    environment's real CPU kernel, gives *byte-identical* output whether
+#    `normalize_routing_weights` is left unset, explicitly 0, or explicitly
+#    1 -- confirmed by fitting each selected expert's own implied gate
+#    weight (least-squares against each expert's own real, independently
+#    computed output slice) back out of a real multi-expert `QMoE` run:
+#    `QMoE` *always* renormalizes to top-`k`-sums-to-1, unconditionally,
+#    regardless of what the attribute says. This does not weaken point 7's
+#    own whole-expert-pruning safety argument below (a real masking-oracle
+#    run against `QMoE` itself, not inherited from `MoE`'s own already-
+#    verified equivalence, still matches a truly-shrunk-`num_experts` `QMoE`
+#    node to *exactly* 0.0 max-abs-diff) -- but it does mean neither this
+#    pass's matcher nor its `apply_*` body reads or conditions on this
+#    attribute's value for `QMoE` at all (any value has the identical real
+#    effect), unlike an a-priori assumption that `QMoE` would simply inherit
+#    `MoE`'s own two-mode behavior verbatim.
+#
+# 7. *Whole-expert removal's own safety argument, re-verified for `QMoE`
+#    specifically.* The plain-`MoE` whole-expert-pruning section above
+#    already lays out the full "shrinking `router_probs`' own width is
+#    exactly equivalent to `-inf`-masking the dropped experts' logits"
+#    argument (points 1-4 of that section's own comment) and why `k` floors
+#    rather than adjusts. Every one of those points -- `router_probs` still
+#    holds raw per-token/per-expert logits with an *internal* Softmax
+#    (unaffected by `QMoE`'s own weight quantization, which only touches
+#    `fc1`/`fc2`/`fc3`), `k` is still a required attribute with an identical
+#    ``"k must be <= num_experts"`` execution-time failure (confirmed live
+#    against `QMoE` directly), `use_sparse_mixer=1` still hard-requires
+#    ``k == 2`` (confirmed live against `QMoE` directly, same "Sparse mixer
+#    only supports k=2" message plain `MoE` gives) -- transfers unchanged,
+#    since none of it depends on how `fc1`/`fc2`'s own *weights* are
+#    represented. The one piece worth re-deriving independently rather than
+#    assuming transfers is the masking-equivalence oracle itself (point 6
+#    above is exactly why it can't be assumed to transfer unmodified from
+#    `MoE`'s own already-verified version) -- confirmed: a same-shape
+#    ``QMoE`` "masking" oracle (dropped experts' `fc1`/`fc2` (quantized, any
+#    values -- never selected, so never read) and router weight column/bias
+#    forced so those experts are never in any token's top-`k`) matches a
+#    genuinely-`num_experts`-shrunk `QMoE` node's own real output to exactly
+#    0.0 max-abs-diff.
+#
+# `router_weights` (input 14, a *separate* DeepSeek-style
+# select/aggregate-with-different-tensors combine-weight operand) and every
+# one of the eight FP4/FP8/global-scale/activation-scale inputs (15-20) are
+# required absent by this pass's own matcher -- naturally so for any real
+# `quant_type='int'` export, but checked explicitly rather than assumed,
+# since none of their effects on the masking-equivalence argument above (or
+# on `fc1`/`fc2`'s own packed-channel semantics) were independently
+# verified.
+
+
+def _unpack_subbyte(packed: np.ndarray, bits: int, logical_len: int) -> np.ndarray:
+    """Unpacks `packed`'s last axis -- ``uint8`` bytes, each holding
+    ``8 // bits`` sub-byte values of `bits` bits apiece -- into ``uint8``
+    values in ``[0, 2**bits)``, one per logical index, trimmed to
+    `logical_len` (a byte's own top slot goes unused, and is dropped here,
+    whenever the *logical* axis length isn't itself a multiple of
+    ``8 // bits``). Low index in a byte's own low bits, increasing index in
+    increasingly high bits -- ``com.microsoft::QMoE``'s own raw
+    (``weights_prepacked`` in ``{-1, 0}``), ``quant_type='int'`` storage
+    convention for both `fc1_experts_weights`/`fc2_experts_weights` and
+    `fc1_zero_points`/`fc2_zero_points` alike -- confirmed empirically
+    against a real CPU ``onnxruntime.InferenceSession``, not assumed from
+    the schema's own prose; see this section's own top comment (point 2)
+    for the full verification.
+    """
+    pack = 8 // bits
+    mask = (1 << bits) - 1
+    parts = [(packed >> (bits * i)) & mask for i in range(pack)]
+    unpacked = np.stack(parts, axis=-1).reshape(
+        *packed.shape[:-1], packed.shape[-1] * pack
+    )
+    return unpacked[..., :logical_len].astype(np.uint8)
+
+
+def _pack_subbyte(unpacked: np.ndarray, bits: int) -> np.ndarray:
+    """Inverse of :func:`_unpack_subbyte`: packs `unpacked`'s last axis
+    (``uint8`` values in ``[0, 2**bits)``) back into bytes, ``8 // bits``
+    logical values per byte, the same low-index/low-bits convention. Pads
+    the logical axis up to a whole number of ``8 // bits`` first (with
+    zeros) when it doesn't already divide evenly -- the exact same "one
+    wasted slot" case :func:`_unpack_subbyte` trims away, so a
+    slice-then-repack round trip through both is exact for any survivor
+    count, not just ones divisible by the pack width (the "genuinely
+    bit-packed odd-count" edge case this module's own int4 packing
+    elsewhere already has to handle).
+    """
+    pack = 8 // bits
+    n = unpacked.shape[-1]
+    pad = (-n) % pack
+    if pad:
+        pad_width = [(0, 0)] * (unpacked.ndim - 1) + [(0, pad)]
+        unpacked = np.pad(unpacked, pad_width)
+    reshaped = unpacked.reshape(*unpacked.shape[:-1], -1, pack).astype(np.uint8)
+    out = np.zeros(reshaped.shape[:-1], dtype=np.uint8)
+    for i in range(pack):
+        out = out | (
+            (reshaped[..., i] & np.uint8((1 << bits) - 1)) << np.uint8(bits * i)
+        )
+    return out
+
+
+def _qmoe_default_zero_point(bits: int) -> int:
+    """``2 ** (bits - 1)`` -- the schema's own documented default
+    `zero_point` for whichever of `fc1_zero_points`/`fc2_zero_points`/
+    `fc3_zero_points` is absent from a given `QMoE` node.
+    """
+    return 1 << (bits - 1)
+
+
+def _qmoe_dequantize(
+    packed: onnx.TensorProto,
+    scale: onnx.TensorProto,
+    zero_points: Optional[onnx.TensorProto],
+    bits: int,
+    k: int,
+) -> np.ndarray:
+    """Dequantizes one `QMoE` `fc1_experts_weights`/`fc2_experts_weights`
+    tensor (raw ``[num_experts, N, K/pack]`` storage, `N` output channels by
+    `K` input features) to a ``float64`` ``[num_experts, N, K]`` array,
+    ``(quantized - zero_point) * scale`` per output channel `N` -- this
+    pass's own matched shape never has `block_size`, so `scale`/
+    `zero_points` are always one entry per `N` channel, never per `K`-block
+    (see this section's own top comment, point 2). `zero_points`, when
+    absent, defaults to :func:`_qmoe_default_zero_point` for every channel,
+    exactly as the op's own schema documents.
+    """
+    packed_arr = onnx.numpy_helper.to_array(packed)  # [E, N, K/pack]
+    q = _unpack_subbyte(packed_arr, bits, k).astype(np.float64)  # [E, N, K]
+    scale_arr = _to_f64(scale)  # [E, N]
+    if zero_points is not None:
+        zp_packed = onnx.numpy_helper.to_array(zero_points)  # [E, N/pack]
+        zp = _unpack_subbyte(zp_packed, bits, packed_arr.shape[1]).astype(
+            np.float64
+        )  # [E, N]
+    else:
+        zp = np.full(scale_arr.shape, float(_qmoe_default_zero_point(bits)))
+    return (q - zp[:, :, None]) * scale_arr[:, :, None]
+
+
+@dataclass(frozen=True)
+class _QMoEChannelChain:
+    node: onnx.NodeProto
+    fc1_w: str
+    fc1_scale: str
+    fc1_bias: Optional[str]
+    fc1_zp: Optional[str]
+    fc2_w: str
+    fc2_scale: str
+    fc2_bias: Optional[str]
+    fc2_zp: Optional[str]
+    num_experts: int
+    inter_size: int
+    hidden_size: int
+    bits: int
+
+
+def _match_qmoe_producer(
+    node: onnx.NodeProto,
+    initializer_map: Dict[str, onnx.TensorProto],
+    consumers_of: Dict[str, List[onnx.NodeProto]],
+) -> Optional[_QMoEChannelChain]:
+    """If `node` is a ``com.microsoft::QMoE`` node this pass can safely
+    prune the `inter_size` axis of, returns the matched
+    :class:`_QMoEChannelChain`. Mirrors :func:`_match_moe_producer`'s own
+    `activation_type`/`swiglu_fusion`/`fc3` checks exactly, then adds the
+    quantization-specific checks this section's own top comment derives
+    (points 1-5): `quant_type` must be (or default to) ``'int'``,
+    `expert_weight_bits` one of ``{2, 4, 8}``, `block_size` absent/0,
+    `weights_prepacked` absent/``-1``/``0``, `router_weights` and every
+    FP4/FP8-only input (15-20) absent, `fc1_experts_weights`/
+    `fc2_experts_weights` constant ``uint8`` rank-3 initializers with a
+    single consumer, `fc1_scales`/`fc2_scales` constant float rank-2
+    initializers (single consumer) matching shape, and
+    `fc1_experts_bias`/`fc2_experts_bias`/`fc1_zero_points`/
+    `fc2_zero_points`, when present, the same single-consumer/shape checks.
+    """
+    if node.domain != _MOE_DOMAIN or node.op_type != "QMoE":
+        return None
+
+    activation = "relu"
+    swiglu_fusion = 0
+    quant_type = "int"
+    bits = 4
+    block_size = 0
+    weights_prepacked = -1
+    for attr in node.attribute:
+        if attr.name == "activation_type":
+            activation = attr.s.decode("utf-8") if isinstance(attr.s, bytes) else attr.s
+        elif attr.name == "swiglu_fusion":
+            swiglu_fusion = attr.i
+        elif attr.name == "quant_type":
+            quant_type = attr.s.decode("utf-8") if isinstance(attr.s, bytes) else attr.s
+        elif attr.name == "expert_weight_bits":
+            bits = attr.i
+        elif attr.name == "block_size":
+            block_size = attr.i
+        elif attr.name == "weights_prepacked":
+            weights_prepacked = attr.i
+
+    if activation not in _MOE_ACTIVATIONS or swiglu_fusion != 0:
+        return None
+    if quant_type != "int":
+        return None  # fp4/nvfp4/fp8/wfp4afp8 -- a different tensor format
+        # entirely (MXFP block-scaled or float8e4m3fn-packed weights,
+        # separate activation-scale operands); out of scope, see this
+        # section's own top comment (point 1).
+    if bits not in (2, 4, 8):
+        return None
+    if block_size != 0:
+        return None  # blocked quantization -- a different scale/zero_point
+        # rank this pass's own packed-slicing was never verified against;
+        # see this section's own top comment (point 3).
+    if weights_prepacked not in (-1, 0):
+        return None  # a CUTLASS mixed-GEMM prepacked byte layout, not the
+        # raw [N, K/pack] storage this pass slices; see point 4.
+
+    if len(node.input) > 8 and node.input[8]:
+        return None  # fc3_experts_weights present -- CPU QMoE errors "FC3
+        # gating is not yet implemented on CPU for QMoE" (confirmed
+        # empirically); see point 5.
+    if len(node.input) > 14 and node.input[14]:
+        return None  # router_weights (DeepSeek-style select/aggregate with
+        # a separate combine-weight tensor) -- a topology this pass's own
+        # masking-equivalence argument (see the whole-expert section below)
+        # was never verified against.
+    for idx in range(15, 21):
+        # fc1/fc2_global_scale, fc1/fc2_act_scale, fc1/fc2_act_block_scale
+        # -- FP4/FP8-activation-only inputs, naturally absent for
+        # quant_type='int' in every real export but checked explicitly.
+        if len(node.input) > idx and node.input[idx]:
+            return None
+
+    if len(node.input) < 7 or not node.input[2] or not node.input[5]:
+        return None
+    fc1_w_name, fc2_w_name = node.input[2], node.input[5]
+    fc1_w = initializer_map.get(fc1_w_name)
+    fc2_w = initializer_map.get(fc2_w_name)
+    if (
+        fc1_w is None
+        or fc2_w is None
+        or fc1_w.data_type != onnx.TensorProto.UINT8
+        or fc2_w.data_type != onnx.TensorProto.UINT8
+        or len(fc1_w.dims) != 3
+        or len(fc2_w.dims) != 3
+        or len(consumers_of.get(fc1_w_name, [])) != 1
+        or len(consumers_of.get(fc2_w_name, [])) != 1
+    ):
+        return None
+
+    pack = 8 // bits
+    num_experts, inter_size, fc1_k_packed = (int(d) for d in fc1_w.dims)
+    fc2_num_experts, hidden_size, fc2_k_packed = (int(d) for d in fc2_w.dims)
+    if (
+        fc2_num_experts != num_experts
+        or fc1_k_packed * pack != hidden_size
+        or fc2_k_packed * pack != inter_size
+    ):
+        return None  # also rules out a fused-swiglu fc1 (doubled row count)
+
+    if not node.input[3] or not node.input[6]:
+        return None  # fc1_scales/fc2_scales required by this pass, even
+        # though the schema itself marks them optional -- without a scale
+        # this pass has nothing to dequantize with for importance ranking.
+    fc1_scale_name, fc2_scale_name = node.input[3], node.input[6]
+    fc1_scale = initializer_map.get(fc1_scale_name)
+    fc2_scale = initializer_map.get(fc2_scale_name)
+    if (
+        fc1_scale is None
+        or fc2_scale is None
+        or not _is_supported_float_dtype(fc1_scale.data_type)
+        or not _is_supported_float_dtype(fc2_scale.data_type)
+        or list(fc1_scale.dims) != [num_experts, inter_size]
+        or list(fc2_scale.dims) != [num_experts, hidden_size]
+        or len(consumers_of.get(fc1_scale_name, [])) != 1
+        or len(consumers_of.get(fc2_scale_name, [])) != 1
+    ):
+        return None
+
+    def _optional_float(
+        index: int, expected_dims: List[int]
+    ) -> Tuple[bool, Optional[str]]:
+        if index >= len(node.input) or not node.input[index]:
+            return True, None
+        name = node.input[index]
+        init = initializer_map.get(name)
+        if (
+            init is None
+            or not _is_supported_float_dtype(init.data_type)
+            or list(init.dims) != expected_dims
+            or len(consumers_of.get(name, [])) != 1
+        ):
+            return False, None
+        return True, name
+
+    def _optional_uint8(
+        index: int, expected_dims: List[int]
+    ) -> Tuple[bool, Optional[str]]:
+        if index >= len(node.input) or not node.input[index]:
+            return True, None
+        name = node.input[index]
+        init = initializer_map.get(name)
+        if (
+            init is None
+            or init.data_type != onnx.TensorProto.UINT8
+            or list(init.dims) != expected_dims
+            or len(consumers_of.get(name, [])) != 1
+        ):
+            return False, None
+        return True, name
+
+    ok, fc1_bias_name = _optional_float(4, [num_experts, inter_size])
+    if not ok:
+        return None
+    ok, fc2_bias_name = _optional_float(7, [num_experts, hidden_size])
+    if not ok:
+        return None
+    ok, fc1_zp_name = _optional_uint8(11, [num_experts, inter_size // pack])
+    if not ok:
+        return None
+    ok, fc2_zp_name = _optional_uint8(12, [num_experts, hidden_size // pack])
+    if not ok:
+        return None
+
+    return _QMoEChannelChain(
+        node=node,
+        fc1_w=fc1_w_name,
+        fc1_scale=fc1_scale_name,
+        fc1_bias=fc1_bias_name,
+        fc1_zp=fc1_zp_name,
+        fc2_w=fc2_w_name,
+        fc2_scale=fc2_scale_name,
+        fc2_bias=fc2_bias_name,
+        fc2_zp=fc2_zp_name,
+        num_experts=num_experts,
+        inter_size=inter_size,
+        hidden_size=hidden_size,
+        bits=bits,
+    )
+
+
+def _find_qmoe_chains(graph: onnx.GraphProto) -> List[_QMoEChannelChain]:
+    initializer_map = {t.name: t for t in graph.initializer}
+    consumers_of = _consumers_of(graph)
+    chains = []
+    for node in graph.node:
+        chain = _match_qmoe_producer(node, initializer_map, consumers_of)
+        if chain is not None:
+            chains.append(chain)
+    return chains
+
+
+def _qmoe_channel_importance(
+    chain: _QMoEChannelChain, initializer_map: Dict[str, onnx.TensorProto]
+) -> np.ndarray:
+    """Combined (root-sum-square) L2-norm importance per `inter_size`
+    channel index, mirroring :func:`_moe_importance` exactly but computed
+    over each weight's own *dequantized* value (:func:`_qmoe_dequantize`)
+    rather than a plain float initializer -- the packed ``uint8`` bytes
+    themselves carry no usable magnitude information on their own.
+    """
+    fc1_dq = _qmoe_dequantize(
+        initializer_map[chain.fc1_w],
+        initializer_map[chain.fc1_scale],
+        initializer_map[chain.fc1_zp] if chain.fc1_zp is not None else None,
+        chain.bits,
+        chain.hidden_size,
+    )  # [E, inter_size, hidden_size]
+    fc2_dq = _qmoe_dequantize(
+        initializer_map[chain.fc2_w],
+        initializer_map[chain.fc2_scale],
+        initializer_map[chain.fc2_zp] if chain.fc2_zp is not None else None,
+        chain.bits,
+        chain.inter_size,
+    )  # [E, hidden_size, inter_size]
+    squared = np.sum(np.square(fc1_dq), axis=(0, 2)) + np.sum(
+        np.square(fc2_dq), axis=(0, 1)
+    )
+    if chain.fc1_bias is not None:
+        fc1_b = _to_f64(initializer_map[chain.fc1_bias])
+        squared = squared + np.sum(np.square(fc1_b), axis=0)
+    return np.sqrt(squared)
+
+
+def _apply_qmoe_channel_chains(
+    graph: onnx.GraphProto,
+    chains: List[_QMoEChannelChain],
+    sparsity: float,
+    compute_importance,
+) -> None:
+    initializer_map = {t.name: t for t in graph.initializer}
+    touched: Set[str] = set()
+
+    for chain in chains:
+        weight_names = {chain.fc1_w, chain.fc2_w, chain.fc1_scale}
+        if chain.fc1_bias is not None:
+            weight_names.add(chain.fc1_bias)
+        if chain.fc1_zp is not None:
+            weight_names.add(chain.fc1_zp)
+        if weight_names & touched:
+            continue  # a shared/tied initializer another MoE/QMoE node
+            # already resized
+        touched |= weight_names
+
+        n = chain.inter_size
+        pack = 8 // chain.bits
+        keep_count = max(1, n - round(n * sparsity))
+        # The survivor count must itself stay an exact multiple of `pack`:
+        # confirmed empirically (a real CPU onnxruntime.InferenceSession
+        # rejects a mismatched-shape node) that this environment's own
+        # QMoE kernel derives `inter_size` purely from
+        # `fc2_experts_weights`' own packed last axis length times `pack`
+        # -- it has no way to represent "the last packed byte's own high
+        # nibble is unused padding, not a real channel" the way
+        # :func:`_pack_subbyte` alone (a general, correct-for-any-length
+        # helper) can round-trip internally. So a survivor count that
+        # isn't itself a multiple of `pack` is rounded *down* to the
+        # nearest one here (floored at `pack`, never below it) rather than
+        # ever handed to :func:`_pack_subbyte` as the pruned channel
+        # count -- the "genuinely bit-packed odd-count" hazard this
+        # section's own top comment flags is resolved by never producing
+        # such a shape in the first place, not by attempting to represent
+        # one.
+        keep_count = max(pack, (keep_count // pack) * pack)
+        if keep_count >= n:
+            continue  # rounds down to nothing for this layer -- no-op
+
+        importance = compute_importance(chain, initializer_map)
+        keep = np.sort(np.argsort(-importance)[:keep_count])
+
+        # fc1_experts_weights: [E, inter_size, hidden_size/pack] -- the
+        # pruned axis (1) is the *unpacked* one (packing lives on axis 2,
+        # untouched), so this is a plain index-select, no unpack/repack
+        # needed at all.
+        fc1_w_init = initializer_map[chain.fc1_w]
+        fc1_new = onnx.numpy_helper.to_array(fc1_w_init)[:, keep, :]
+        fc1_w_init.CopyFrom(
+            onnx.numpy_helper.from_array(
+                np.ascontiguousarray(fc1_new), name=chain.fc1_w
+            )
+        )
+
+        fc1_scale_init = initializer_map[chain.fc1_scale]
+        fc1_scale_new = onnx.numpy_helper.to_array(fc1_scale_init)[:, keep]
+        fc1_scale_init.CopyFrom(
+            onnx.numpy_helper.from_array(
+                np.ascontiguousarray(fc1_scale_new), name=chain.fc1_scale
+            )
+        )
+
+        if chain.fc1_bias is not None:
+            fc1_bias_init = initializer_map[chain.fc1_bias]
+            fc1_bias_new = onnx.numpy_helper.to_array(fc1_bias_init)[:, keep]
+            fc1_bias_init.CopyFrom(
+                onnx.numpy_helper.from_array(
+                    np.ascontiguousarray(fc1_bias_new), name=chain.fc1_bias
+                )
+            )
+
+        if chain.fc1_zp is not None:
+            # fc1_zero_points: [E, inter_size/pack] -- packed along the same
+            # axis being pruned, so this one genuinely needs unpack/select/
+            # repack (see this section's own top comment, point 2).
+            fc1_zp_init = initializer_map[chain.fc1_zp]
+            zp_unpacked = _unpack_subbyte(
+                onnx.numpy_helper.to_array(fc1_zp_init), chain.bits, n
+            )
+            zp_new = _pack_subbyte(zp_unpacked[:, keep], chain.bits)
+            fc1_zp_init.CopyFrom(
+                onnx.numpy_helper.from_array(
+                    np.ascontiguousarray(zp_new), name=chain.fc1_zp
+                )
+            )
+
+        # fc2_experts_weights: [E, hidden_size, inter_size/pack] -- the
+        # pruned axis (inter_size) *is* the packed one here, so this needs
+        # a real unpack/select/repack round trip.
+        fc2_w_init = initializer_map[chain.fc2_w]
+        fc2_unpacked = _unpack_subbyte(
+            onnx.numpy_helper.to_array(fc2_w_init), chain.bits, n
+        )  # [E, hidden_size, inter_size]
+        fc2_new = _pack_subbyte(fc2_unpacked[:, :, keep], chain.bits)
+        fc2_w_init.CopyFrom(
+            onnx.numpy_helper.from_array(
+                np.ascontiguousarray(fc2_new), name=chain.fc2_w
+            )
+        )
+        # fc2_scales/fc2_experts_bias/fc2_zero_points all index hidden_size,
+        # fc2's own *output* axis -- unaffected by an inter_size cut, the
+        # same reasoning plain MoE's own fc2 bias already gets -- never
+        # sliced here.
+
+
+def apply_qmoe_expert_channel_pruning(
+    model: Union[str, onnx.ModelProto],
+    sparsity: float = 0.5,
+) -> onnx.ModelProto:
+    """Removes intermediate (`inter_size`) channels from every expert of a
+    matched ``com.microsoft::QMoE`` node at once -- the quantized-weight
+    counterpart of :func:`apply_moe_expert_channel_pruning`, targeting
+    `QMoE`'s own packed ``uint8`` `fc1`/`fc2` weights (plus their
+    `scales`/`zero_points`, co-sliced in lockstep) instead of plain `MoE`'s
+    float ones. See this section's own comment above
+    (:func:`_match_qmoe_producer`) for the exact matched shape and every
+    empirically-confirmed decline (`quant_type` other than ``'int'``,
+    `block_size`, a prepacked layout, `fc3`, `router_weights`,
+    FP4/FP8-only inputs, an unrecognized/`swiglu` activation).
+
+    Ranks every `inter_size` index by combined (root-sum-square) L2 norm of
+    `fc1_experts_weights`'/`fc2_experts_weights`' own *dequantized* row/
+    column (:func:`_qmoe_dequantize`, across every expert and `hidden_size`
+    at once) plus `fc1_experts_bias`'s own entry when present -- the same
+    criterion :func:`apply_moe_expert_channel_pruning` uses, just computed
+    over dequantized rather than already-float values -- drops the
+    lowest-``sparsity``-fraction of indices, and removes the matching row
+    from `fc1_experts_weights`/`fc1_scales`/`fc1_experts_bias`/
+    `fc1_zero_points` and column from `fc2_experts_weights`, identically
+    across every expert. `fc1_experts_weights`' pruned axis is never the
+    packed one (a plain index-select); `fc2_experts_weights`'/
+    `fc1_zero_points`' own pruned axis *is* the packed one, so both go
+    through a real unpack/select/repack round trip
+    (:func:`_unpack_subbyte`/:func:`_pack_subbyte`). The *survivor* count is
+    always rounded down to a multiple of ``8 // expert_weight_bits`` (never
+    below it) before that repack -- confirmed empirically that this
+    environment's own CPU `QMoE` kernel derives `inter_size` from
+    `fc2_experts_weights`' own packed byte count alone, with no way to
+    represent a partial/padded trailing byte, so this pass never asks
+    :func:`_pack_subbyte` to produce one (see :func:`_apply_qmoe_channel_chains`'s
+    own comment). `num_experts`, `k`, and every node attribute are
+    untouched.
+
+    :param model: the original onnx ModelProto or file path
+    :param sparsity: target fraction of each matched node's `inter_size`
+            channels to remove (rounded down to a multiple of
+            ``8 // expert_weight_bits``, floored at that same value -- never
+            zero -- so the result stays a shape the real `QMoE` CPU kernel
+            can execute)
+    :returns: ``model`` with every matched ``QMoE`` node's `fc1`/`fc2`
+            tensors (and `fc1`'s own `scales`/`bias`/`zero_points`) resized
+            in place; any node this pass doesn't recognize is left
+            completely untouched
+    """
+    if not (0.0 <= sparsity < 1.0):
+        raise ValueError(f"sparsity must be in [0, 1), got {sparsity}")
+    if isinstance(model, str):
+        model = onnx.load(model, load_external_data=False)
+
+    out = onnx.ModelProto()
+    out.CopyFrom(model)
+    graph = out.graph
+
+    chains = _find_qmoe_chains(graph)
+    if chains:
+        _apply_qmoe_channel_chains(graph, chains, sparsity, _qmoe_channel_importance)
+    return out
+
+
+@dataclass(frozen=True)
+class _QMoEExpertChain:
+    node: onnx.NodeProto
+    fc1_w: str
+    fc1_scale: str
+    fc1_bias: Optional[str]
+    fc1_zp: Optional[str]
+    fc2_w: str
+    fc2_scale: str
+    fc2_bias: Optional[str]
+    fc2_zp: Optional[str]
+    num_experts: int
+    inter_size: int
+    hidden_size: int
+    bits: int
+    k: int
+    router_probs: str
+    router_w: str
+    router_w_transposed: bool
+    router_b: Optional[str]
+
+
+def _match_qmoe_whole_expert_producer(
+    node: onnx.NodeProto,
+    initializer_map: Dict[str, onnx.TensorProto],
+    consumers_of: Dict[str, List[onnx.NodeProto]],
+    node_by_output: Dict[str, onnx.NodeProto],
+    graph_outputs: Set[str],
+) -> Optional[_QMoEExpertChain]:
+    """If `node` is a ``com.microsoft::QMoE`` node this pass can safely
+    prune whole experts (the `num_experts` axis) from, returns the matched
+    :class:`_QMoEExpertChain`. Mirrors :func:`_match_moe_whole_expert_producer`
+    exactly: reuses :func:`_match_qmoe_producer`'s own checks outright, then
+    adds the identical `k`/`use_sparse_mixer` checks and `router_probs`
+    producer match -- see this section's own top comment (point 7) for why
+    every one of those transfers unchanged from plain `MoE` to `QMoE`.
+    """
+    base = _match_qmoe_producer(node, initializer_map, consumers_of)
+    if base is None:
+        return None
+
+    k = None
+    use_sparse_mixer = 0
+    for attr in node.attribute:
+        if attr.name == "k":
+            k = attr.i
+        elif attr.name == "use_sparse_mixer":
+            use_sparse_mixer = attr.i
+    if k is None or k < 1 or k > base.num_experts or use_sparse_mixer != 0:
+        return None
+
+    if len(node.input) < 2 or not node.input[1]:
+        return None
+    router_probs = node.input[1]
+    if router_probs in graph_outputs or len(consumers_of.get(router_probs, [])) != 1:
+        return None
+    router_node = node_by_output.get(router_probs)
+    if router_node is None:
+        return None
+    router_info = _match_producer(router_node, initializer_map)
+    if router_info is None:
+        return None
+    router_w_name, router_w_transposed, router_b_name, n_channels = router_info
+    if n_channels != base.num_experts or len(consumers_of.get(router_w_name, [])) != 1:
+        return None
+    if router_b_name is not None and len(consumers_of.get(router_b_name, [])) != 1:
+        return None
+
+    return _QMoEExpertChain(
+        node=node,
+        fc1_w=base.fc1_w,
+        fc1_scale=base.fc1_scale,
+        fc1_bias=base.fc1_bias,
+        fc1_zp=base.fc1_zp,
+        fc2_w=base.fc2_w,
+        fc2_scale=base.fc2_scale,
+        fc2_bias=base.fc2_bias,
+        fc2_zp=base.fc2_zp,
+        num_experts=base.num_experts,
+        inter_size=base.inter_size,
+        hidden_size=base.hidden_size,
+        bits=base.bits,
+        k=int(k),
+        router_probs=router_probs,
+        router_w=router_w_name,
+        router_w_transposed=router_w_transposed,
+        router_b=router_b_name,
+    )
+
+
+def _find_qmoe_whole_expert_chains(graph: onnx.GraphProto) -> List[_QMoEExpertChain]:
+    initializer_map = {t.name: t for t in graph.initializer}
+    consumers_of = _consumers_of(graph)
+    node_by_output = {out: node for node in graph.node for out in node.output}
+    graph_outputs = {o.name for o in graph.output}
+    chains = []
+    for node in graph.node:
+        chain = _match_qmoe_whole_expert_producer(
+            node, initializer_map, consumers_of, node_by_output, graph_outputs
+        )
+        if chain is not None:
+            chains.append(chain)
+    return chains
+
+
+def _qmoe_expert_weight_importance(
+    chain: _QMoEExpertChain, initializer_map: Dict[str, onnx.TensorProto]
+) -> np.ndarray:
+    """Combined (root-sum-square) L2-norm importance per *expert*, mirroring
+    :func:`_moe_expert_weight_importance` -- the weight-magnitude-only
+    fallback used when no calibration data was observed for a chain's
+    `router_probs` -- computed over each weight's own dequantized value
+    (:func:`_qmoe_dequantize`) the same way :func:`_qmoe_channel_importance`
+    is, just reduced *within* each expert's own slice instead of *across*
+    experts.
+    """
+    fc1_dq = _qmoe_dequantize(
+        initializer_map[chain.fc1_w],
+        initializer_map[chain.fc1_scale],
+        initializer_map[chain.fc1_zp] if chain.fc1_zp is not None else None,
+        chain.bits,
+        chain.hidden_size,
+    )  # [E, inter_size, hidden_size]
+    fc2_dq = _qmoe_dequantize(
+        initializer_map[chain.fc2_w],
+        initializer_map[chain.fc2_scale],
+        initializer_map[chain.fc2_zp] if chain.fc2_zp is not None else None,
+        chain.bits,
+        chain.inter_size,
+    )  # [E, hidden_size, inter_size]
+    squared = np.sum(np.square(fc1_dq), axis=(1, 2)) + np.sum(
+        np.square(fc2_dq), axis=(1, 2)
+    )
+    if chain.fc1_bias is not None:
+        fc1_b = _to_f64(initializer_map[chain.fc1_bias])
+        squared = squared + np.sum(np.square(fc1_b), axis=1)
+    return np.sqrt(squared)
+
+
+def _apply_qmoe_whole_expert_chains(
+    graph: onnx.GraphProto,
+    chains: List[_QMoEExpertChain],
+    sparsity: float,
+    compute_importance,
+) -> Set[str]:
+    """Drops whole experts from every matched `QMoE` chain -- unlike
+    :func:`_apply_qmoe_channel_chains`, `num_experts` is *every* per-expert
+    tensor's own leading axis (confirmed from the schema: packing always
+    lives on a *later* axis, never axis 0), so every one of
+    `fc1`/`fc2`'s weights/scales/biases/zero_points, plus the router
+    projection's own weight/bias, is a plain leading-axis index-select --
+    no unpack/repack needed anywhere, the "comparatively simpler" half of
+    this section's own two techniques.
+    """
+    initializer_map = {t.name: t for t in graph.initializer}
+    touched: Set[str] = set()
+    stale_value_info: Set[str] = set()
+
+    for chain in chains:
+        weight_names = {
+            chain.fc1_w,
+            chain.fc2_w,
+            chain.fc1_scale,
+            chain.fc2_scale,
+            chain.router_w,
+        }
+        if chain.fc1_bias is not None:
+            weight_names.add(chain.fc1_bias)
+        if chain.fc2_bias is not None:
+            weight_names.add(chain.fc2_bias)
+        if chain.fc1_zp is not None:
+            weight_names.add(chain.fc1_zp)
+        if chain.fc2_zp is not None:
+            weight_names.add(chain.fc2_zp)
+        if chain.router_b is not None:
+            weight_names.add(chain.router_b)
+        if weight_names & touched:
+            continue  # a shared/tied initializer another MoE/QMoE node
+            # already resized
+        touched |= weight_names
+
+        n = chain.num_experts
+        floor = max(1, min(chain.k, n))
+        keep_count = max(floor, n - round(n * sparsity))
+        if keep_count >= n:
+            continue  # rounds down to nothing (or below k) for this layer
+
+        importance = compute_importance(chain, initializer_map)
+        keep = np.sort(np.argsort(-importance)[:keep_count])
+
+        for name in (chain.fc1_w, chain.fc2_w, chain.fc1_scale, chain.fc2_scale):
+            _slice_axis(initializer_map[name], keep, axis=0)
+        for opt_name in (chain.fc1_bias, chain.fc2_bias, chain.fc1_zp, chain.fc2_zp):
+            if opt_name is not None:
+                _slice_axis(initializer_map[opt_name], keep, axis=0)
+
+        router_w_init = initializer_map[chain.router_w]
+        _slice_producer_weight(router_w_init, chain.router_w_transposed, keep)
+        if chain.router_b is not None:
+            _slice_last_axis(initializer_map[chain.router_b], keep)
+
+        stale_value_info.add(chain.router_probs)
+
+    return stale_value_info
+
+
+def apply_qmoe_whole_expert_pruning(
+    model: Union[str, onnx.ModelProto],
+    calibration_data: Optional[Sequence[Tensors]] = None,
+    num_samples: int = 8,
+    seed: int = 0,
+    sparsity: float = 0.5,
+    providers: Optional[Sequence[str]] = None,
+) -> onnx.ModelProto:
+    """Removes whole experts (shrinks the `num_experts` leading axis) from a
+    matched ``com.microsoft::QMoE`` node and its upstream router projection
+    at once -- the quantized-weight counterpart of
+    :func:`apply_moe_whole_expert_pruning`, ranking experts by the exact
+    same calibration-based mean router gate weight
+    (:func:`_moe_router_gate_calibration_stats`, reused unchanged --
+    `router_probs` is `QMoE`'s own second input, upstream of and oblivious
+    to its quantized `fc1`/`fc2`, so this needs no `QMoE`-specific version
+    at all). See this section's own top comment (point 7) for the full
+    masking-equivalence safety argument, re-derived and re-verified
+    specifically against a real `QMoE` node -- in particular why point 6's
+    own finding (`QMoE` always renormalizes top-`k` gate weights regardless
+    of `normalize_routing_weights`) does not change that argument's own
+    conclusion, only how it had to be re-checked.
+
+    Every matched expert's `fc1_experts_weights`/`fc2_experts_weights`/
+    `fc1_scales`/`fc2_scales` (and `fc1_experts_bias`/`fc2_experts_bias`/
+    `fc1_zero_points`/`fc2_zero_points`, if present) row, and the router
+    projection weight's (and bias's, if present) matching output column,
+    are dropped together for the lowest-``sparsity``-fraction of experts by
+    that ranking -- with `num_experts_to_keep` silently floored at the
+    node's own `k`, never adjusting `k` itself, the same floor
+    :func:`apply_moe_whole_expert_pruning` uses. A chain whose
+    `router_probs` was never observed during calibration falls back to each
+    expert's own dequantized `fc1`/`fc2` (+`fc1_experts_bias`) combined L2
+    weight norm (:func:`_qmoe_expert_weight_importance`), the same
+    "no matching activation observed" fallback
+    :func:`apply_structured_wanda_pruning` already uses.
+
+    :param model: the original onnx ModelProto or file path
+    :param calibration_data: representative input batches to rank experts by
+            mean router gate weight on. Each batch is a
+            ``{input_name: np.ndarray}`` dict matching ``model``'s graph
+            inputs -- see :func:`onnxsim.generate_random_calibration_data`
+            (the default when omitted)
+    :param num_samples: random batches to generate when
+            ``calibration_data`` is omitted
+    :param seed: seed for the random calibration data (ignored if
+            ``calibration_data`` is supplied)
+    :param sparsity: target fraction of each matched node's `num_experts` to
+            remove (floored at the node's own `k`, so fewer may actually be
+            removed -- never more)
+    :param providers: onnxruntime execution providers to run ``model`` on
+            when capturing calibration router activations
+    :returns: ``model`` with every matched ``QMoE`` node's per-expert
+            tensors and its router projection's weight(/bias) resized in
+            place; any node this pass doesn't recognize is left completely
+            untouched
+    """
+    if not (0.0 <= sparsity < 1.0):
+        raise ValueError(f"sparsity must be in [0, 1), got {sparsity}")
+    if isinstance(model, str):
+        model = onnx.load(model, load_external_data=False)
+    if calibration_data is None:
+        calibration_data = generate_random_calibration_data(
+            model, num_samples=num_samples, seed=seed
+        )
+
+    out = onnx.ModelProto()
+    out.CopyFrom(model)
+    graph = out.graph
+
+    chains = _find_qmoe_whole_expert_chains(graph)
+    if not chains:
+        return out
+
+    mean_gate_weight = _moe_router_gate_calibration_stats(
+        out, chains, calibration_data, providers
+    )
+
+    def _importance(
+        chain: _QMoEExpertChain, initializer_map: Dict[str, onnx.TensorProto]
+    ) -> np.ndarray:
+        gate = mean_gate_weight.get(chain.router_probs)
+        if gate is None or gate.shape[0] != chain.num_experts:
+            return _qmoe_expert_weight_importance(chain, initializer_map)
+        return gate
+
+    stale_value_info = _apply_qmoe_whole_expert_chains(
         graph, chains, sparsity, _importance
     )
     if stale_value_info:
@@ -12971,22 +13989,14 @@ def apply_embedding_vocab_magnitude_pruning(
 # residual machinery and this environment's real onnxruntime schemas rather
 # than assumed, and each worth stating plainly:
 #
-# 1. Both the merge point *and* the entry norm matched here are the
-#    unfused shapes only: the merge is *only* a bare `Add`
-#    (:func:`_is_eligible_add_merge`, reused unchanged from the residual
-#    *channel*-pruning machinery above -- exactly the same "two distinct,
-#    non-constant operands" eligibility bar), and `LN` is only a plain,
-#    single-input `LayerNormalization`/`RMSNormalization`/
-#    `SimplifiedLayerNormalization` node (:func:`_is_entry_ln_node`) --
-#    never a fused `SkipLayerNormalization`/`SkipSimplifiedLayerNormalization`
-#    node in *either* role, the way :func:`_match_matmul_residual_merge`
-#    accepts it as the merge for channel pruning. That is a deliberate,
-#    real narrowing versus this module's own existing residual machinery,
-#    not an oversight, and it costs real coverage on a model that has
-#    actually been run through onnxruntime's transformer optimizer (which
-#    fuses nearly every residual `Add` immediately followed by a
-#    `LayerNorm` into exactly this fused node) -- worth being honest about
-#    rather than glossing over:
+# 1. The merge point matched here is the unfused shape only: it is *only*
+#    a bare `Add` (:func:`_is_eligible_add_merge`, reused unchanged from
+#    the residual *channel*-pruning machinery above -- exactly the same
+#    "two distinct, non-constant operands" eligibility bar), never a fused
+#    `SkipLayerNormalization`/`SkipSimplifiedLayerNormalization` node the
+#    way :func:`_match_matmul_residual_merge` accepts it as the merge for
+#    channel pruning. That is a deliberate, real narrowing, not an
+#    oversight:
 #
 #    - As the merge, a `SkipLayerNormalization`-family node's own
 #      *primary* output is always the *normalized* sum (`LN(x_in +
@@ -12995,31 +14005,51 @@ def apply_embedding_vocab_magnitude_pruning(
 #      could safely repoint every consumer to that is both already
 #      present in the graph *and* means "`x_in`, unnormalized" the way a
 #      bare `Add`'s own `x_in` operand already, directly, does).
-#    - As the entry norm, `LN(x_in)` is only recognized when `x_in` is
-#      *literally* some node's own single data input
-#      (:func:`_is_entry_ln_node`'s own `node.input[0] == x_in` check) --
-#      exactly what a plain `LayerNormalization`/`RMSNormalization`/
-#      `SimplifiedLayerNormalization` node's own first input already is,
-#      but *not* what a `SkipLayerNormalization`-family node's own first
-#      input is: that node normalizes `input + skip`, a *sum* of two
-#      separate tensors, and the block's own true `x_in` (the previous
-#      block's own raw, unnormalized residual value) only exists as a
-#      *named* tensor at all when that sum is separately materialized as
-#      the node's own optional fourth output, `input_skip_bias_sum` --
-#      which onnxruntime's optimizer only ever emits when something
-#      downstream actually still needs it, not unconditionally. Matching
-#      this shape too is a real, tractable extension (recognize
-#      `node.output[3]`, when present, as an *alternative* `x_in` source
-#      for a `SkipLayerNormalization`-family node feeding `F`), but it is
-#      a genuinely different check from the single-input-only one
-#      :func:`_is_entry_ln_node` performs today, not a free extension of
-#      it -- left out of this initial version's scope rather than rushed
-#      in, so it is not implemented here.
+#
+#    The *entry* norm, `LN(x_in)`, is recognized in both shapes: a plain,
+#    single-input `LayerNormalization`/`RMSNormalization`/
+#    `SimplifiedLayerNormalization` node (:func:`_is_entry_ln_node`,
+#    `node.input[0] == x_in`), *or* a fused `SkipLayerNormalization`/
+#    `SkipSimplifiedLayerNormalization` node (:func:`_is_fused_entry_ln_node`)
+#    reached via its own *primary* (normalized) output, whose optional
+#    fourth output -- `input_skip_bias_sum`, confirmed (against
+#    onnxruntime's real `com.microsoft` schema via
+#    `get_all_operator_schema()`, and by direct execution -- see this
+#    section's own comment near :func:`_is_fused_entry_ln_node`) to be the
+#    raw, pre-normalization `input + skip (+ bias)` sum, bit-exact -- when
+#    *present* stands in for `x_in`: it names, as an ordinary graph
+#    tensor, exactly the same "previous block's own raw, unnormalized
+#    residual value" a bare `Add`'s own `x_in` operand already, directly,
+#    is. onnxruntime's transformer optimizer only ever emits this fourth
+#    output when something downstream still needs it (confirmed
+#    empirically: omitted from the node's own `output` list, it simply
+#    isn't computed or exposed at all -- no error, no silent
+#    materialization), so the match declines cleanly whenever it's absent,
+#    exactly the "decline outright, never guess" bar every other check in
+#    this section holds to. Unlike the merge case, this fused node is
+#    never added to the block's own `block_nodes` (never deleted) when
+#    matched this way: unlike a plain `LN` node (whose own *input* is
+#    `x_in`, produced entirely outside the block), this node's own
+#    *output* (`input_skip_bias_sum`) *is* `x_in` -- deleting the node that
+#    produces the very tensor every rewired `x_out` consumer needs to keep
+#    reading would corrupt the graph. It is left in place, computing
+#    exactly what it always did; its own primary (normalized) output
+#    simply loses its only consumer (`F`, deleted along with the rest of
+#    the block) and goes unread, which is harmless -- a later
+#    simplification pass is free to notice and remove it, this pass has no
+#    need to. The merge itself is untouched by any of this -- still
+#    matched, `x_out`-side, only as a bare `Add`; see point above.
 #
 #    A raw, not-yet-optimizer-fused export (the common case for a model
 #    straight out of a training framework's own ONNX exporter) still
 #    matches fully -- it has no `SkipLayerNormalization` nodes to begin
 #    with, only plain `Add`/`LayerNormalization`-family nodes throughout.
+#    A fully optimizer-fused export -- where the residual `Add` immediately
+#    preceding block `N`'s own entry `LN` got fused into block `N-1`'s own
+#    merge, producing exactly this `SkipLayerNormalization`-family node --
+#    is now matched too, provided block `N`'s own *merge* (its `x_out`)
+#    remains a bare `Add` (e.g. the last block before a final, non-fused
+#    `LayerNormalization`) -- the realistic shape this extension targets.
 # 2. Attention and MLP/FFN blocks are matched -- and dropped -- fully
 #    independently of each other, never only as a paired "whole
 #    transformer layer". Nothing in the graph structure requires pairing:
@@ -13087,6 +14117,48 @@ def _is_entry_ln_node(node: onnx.NodeProto, x_in: str) -> bool:
     )
 
 
+def _is_fused_entry_ln_node(node: onnx.NodeProto, x_in: str, t: str) -> bool:
+    """True if `node` is a ``com.microsoft::SkipLayerNormalization``/
+    ``SkipSimplifiedLayerNormalization`` node (:data:`_SKIP_LAYER_NORM_OPS`/
+    :data:`_SKIP_LAYER_NORM_DOMAIN`, the same constants
+    :func:`_skip_layer_norm_const_names` uses for the unrelated channel-
+    pruning residual merge above) reached, during the backward walk, via
+    its own *primary* output `t` -- i.e. `t == node.output[0]`, the
+    normalized `LN(input + skip (+ bias))` value `F` actually reads -- and
+    whose own optional fourth output, `input_skip_bias_sum`, is both
+    present (``len(node.output) > 3`` and non-empty -- onnxruntime only
+    ever materializes it when something downstream still needs it;
+    confirmed empirically, see this section's own comment above) and
+    textually equal to `x_in`.
+
+    This is the fused analogue of :func:`_is_entry_ln_node`'s own
+    `node.input[0] == x_in` check -- confirmed, via
+    `onnxruntime.capi.onnxruntime_pybind11_state.get_all_operator_schema()`
+    against both ops' real ``com.microsoft`` schemas, and independently by
+    running a real node through a real `onnxruntime.InferenceSession` and
+    comparing bit-exact (not merely close) against an independently
+    hand-computed `input + skip (+ bias)`, that `input_skip_bias_sum` is
+    exactly the raw, pre-normalization sum -- i.e. exactly what a bare
+    `Add`'s own `x_in` operand would already, directly, be, standing in
+    for it here since the fused node's own first *input* (unlike a plain
+    `LN` node's) is not `x_in` itself but a sum of two separate tensors.
+    Requiring `t == node.output[0]` specifically (rather than accepting a
+    match reached via `mean`/`inv_std_var`, the op's other two optional
+    outputs) mirrors :func:`_is_entry_ln_node`'s own single-input
+    specificity, and keeps this from ever misfiring on a node reached only
+    through those training-only, in-practice-never-wired outputs.
+    """
+    return (
+        node.domain == _SKIP_LAYER_NORM_DOMAIN
+        and node.op_type in _SKIP_LAYER_NORM_OPS
+        and len(node.output) >= 1
+        and node.output[0] == t
+        and len(node.output) > 3
+        and node.output[3] != ""
+        and node.output[3] == x_in
+    )
+
+
 @dataclass(frozen=True)
 class _DroppableBlock:
     merge_node: onnx.NodeProto
@@ -13121,13 +14193,18 @@ def _try_resolve_droppable_block(
       unlike every chain walk elsewhere in this module, since nothing here
       needs to recognize any *particular* shape of `F`, only that
       everything inside it stays inside it) must reach `x_in` *only* via
-      one or more :func:`_is_entry_ln_node` boundaries (`LN(x_in)`,
-      not recursed past) -- reaching `x_in` directly, bypassing every such
-      boundary, means `F` reads `x_in` raw rather than only its own norm,
-      not the pattern this pass targets, and declines the whole candidate;
-      finding *no* such boundary at all (`F`'s own backward walk never
-      touches `x_in`) declines it the same way -- some other tensor
-      entirely feeds the merge's `other` operand, not `F(LN(x_in))`.
+      one or more entry-norm boundaries, not recursed past: either a plain
+      `LN(x_in)` node (:func:`_is_entry_ln_node`), or a fused
+      `SkipLayerNormalization`/`SkipSimplifiedLayerNormalization` node
+      reached via its own primary output whose optional fourth output
+      equals `x_in` (:func:`_is_fused_entry_ln_node` -- see this section's
+      own comment above for why the fourth output is the correct `x_in`
+      stand-in). Reaching `x_in` directly, bypassing every such boundary,
+      means `F` reads `x_in` raw rather than only its own norm, not the
+      pattern this pass targets, and declines the whole candidate; finding
+      *no* such boundary at all (`F`'s own backward walk never touches
+      `x_in`) declines it the same way -- some other tensor entirely feeds
+      the merge's `other` operand, not `F(LN(x_in))`.
     - Every node the walk collects (the block's own interior, plus
       `merge_node` itself) must have every one of its own output tensors
       read by nothing outside that same set, and never be a graph output
@@ -13139,6 +14216,10 @@ def _try_resolve_droppable_block(
       and declines the block -- see this section's own comment above for
       why this one general check is also exactly what makes a
       KV-cache-bearing block decline itself, with no dedicated detection.
+      A fused entry-norm node matched via :func:`_is_fused_entry_ln_node`
+      is deliberately *not* added to this set -- see that function's own
+      docstring and this section's own comment for why it is preserved
+      (never deleted) rather than collected as ordinary block interior.
 
     A graph input reached mid-walk (an attention mask, position ids, a
     KV-cache input, or any other tensor `F` reads that isn't produced by
@@ -13149,6 +14230,15 @@ def _try_resolve_droppable_block(
     """
     block_node_ids: Set[int] = {id(merge_node)}
     block_nodes: List[onnx.NodeProto] = [merge_node]
+    # Fused entry-norm nodes matched via `_is_fused_entry_ln_node`: kept
+    # out of `block_node_ids`/`block_nodes` (never deleted -- their own
+    # fourth output *is* `x_in`; see this function's own docstring and
+    # this section's own comment). Tracked separately so a *second* visit
+    # to the same node, via one of its other outputs (`mean`/
+    # `inv_std_var`, in practice never wired to anything -- see this
+    # section's own comment), can neither re-add it to `block_nodes` nor
+    # be silently accepted as some other, contradictory role.
+    fused_boundary_ids: Set[int] = set()
     found_entry_ln = False
     visited: Set[str] = set()
     frontier: List[str] = [other]
@@ -13162,12 +14252,26 @@ def _try_resolve_droppable_block(
         node = node_by_output.get(t)
         if node is None:
             continue  # graph input or initializer -- a leaf, not a problem
+        if id(node) in fused_boundary_ids:
+            continue  # already resolved as this block's own fused boundary
         if _is_entry_ln_node(node, x_in):
             found_entry_ln = True
             if id(node) not in block_node_ids:
                 block_node_ids.add(id(node))
                 block_nodes.append(node)
             continue  # boundary -- LN's own input (x_in) is not recursed into
+        if _is_fused_entry_ln_node(node, x_in, t):
+            if id(node) in block_node_ids:
+                # Already collected as ordinary block interior via one of
+                # this same node's *other* outputs, before this visit
+                # discovered it's actually this block's own fused
+                # boundary -- irreconcilable (its own `x_in`-bearing
+                # output can't be both deleted and preserved), so decline
+                # rather than guess which role is right.
+                return None
+            found_entry_ln = True
+            fused_boundary_ids.add(id(node))
+            continue  # boundary -- preserved, not deleted, not recursed into
         if id(node) not in block_node_ids:
             block_node_ids.add(id(node))
             block_nodes.append(node)
@@ -13455,11 +14559,14 @@ def apply_transformer_block_pruning(
     ``x = x + MLP(LN(x))``) wholesale, rather than shrinking every block a
     little the way every other `apply_*` function in this module does --
     see this section's own comment above for the exact pattern matched,
-    the two scope decisions this narrows to (bare-`Add` merges and a
-    plain, unfused entry norm only -- a `SkipLayerNormalization`-family
-    node is not recognized in either role, so a model already run through
-    onnxruntime's own transformer optimizer needs its own follow-up
-    coverage this initial version doesn't take on; attention and MLP/FFN
+    the two scope decisions this narrows to (the merge is a bare `Add`
+    only -- a `SkipLayerNormalization`-family node is never recognized in
+    that role; the entry norm accepts either a plain, unfused `LN(x_in)`
+    node *or* a fused `SkipLayerNormalization`/
+    `SkipSimplifiedLayerNormalization` node, via its own optional fourth
+    output, standing in for `x_in` -- so a model already run through
+    onnxruntime's own transformer optimizer is matched too, provided each
+    block's own merge itself is still a bare `Add`; attention and MLP/FFN
     blocks matched and dropped fully independently, never only as a
     "whole layer" pair) and why a KV-cache-bearing attention block needs
     no dedicated handling to always decline safely on its own.
