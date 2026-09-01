@@ -260,8 +260,8 @@ struct FuseMatMulIntoConv final : public PredicateBasedPass {
     // X2 = Reshape(X, [-1, K, 1])
     Node* pre = graph.create(kReshape, 1);
     pre->addInput(match.x);
-    pre->addInput(MakeInt64Constant(graph, {-1, match.k, 1},
-                                    nextReservedName(graph)));
+    pre->addInput(
+        MakeInt64Constant(graph, {-1, match.k, 1}, nextReservedName(graph)));
     pre->insertBefore(n);
 
     // W2 = [N, K, 1], built from W by Transpose (if laid out [K, N]) then
