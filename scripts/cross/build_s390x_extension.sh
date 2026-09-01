@@ -219,12 +219,14 @@ cmake --build "${BUILD_DIR}" --target onnx_cpp2py_export -j "${JOBS}"
 # ggml_mxfp4_test (the GGML MXFP4 dequantization ggml_mxfp4.h implements --
 # same rationale as ggml_kquant_test above: decoded values are real numeric
 # output, not just copied bytes) is dependency-free too and belongs here for
-# the same reason.
+# the same reason. ggml_legacy_quant_test (the GGML Q4_0/Q4_1/Q5_0/Q5_1
+# dequantization ggml_legacy_quant.h implements) is dependency-free for the
+# same reason too.
 cmake --build "${BUILD_DIR}" --target sym_expr_test model_metrics_test \
   sym_value_eval_test sym_shape_infer_test dlpack_dtype_test \
   tensor_pool_dtype_test tensor_pool_test tensor_pool_hash_test \
-  gguf_dtype_test ggml_kquant_test ggml_mxfp4_test tensor_pool_gguf_test \
-  read_gguf_metadata_test -j "${JOBS}"
+  gguf_dtype_test ggml_kquant_test ggml_mxfp4_test ggml_legacy_quant_test \
+  tensor_pool_gguf_test read_gguf_metadata_test -j "${JOBS}"
 # tensor_pool_bridge_test, tensor_pool_gguf_bridge_test,
 # tensor_pool_archive_test, precision_estimator_test, and
 # contrib_schemas_moe_test are NOT dependency-free (they exercise

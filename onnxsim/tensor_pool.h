@@ -207,15 +207,18 @@ class TensorPool {
   // translation unit from the safetensors codec above, since the two file
   // formats share nothing but the TensorPool storage they read into/from.
   // See gguf_dtype.h's file comment for an important scope note: most of
-  // GGML's block-quantized types (Q4_0, every IQ*_ variant, ...) have no
-  // ONNX raw-data equivalent and are never pooled -- LoadGGUF skips and
+  // GGML's block-quantized types (Q2_K, Q3_K, every IQ*_ variant, ...) have
+  // no ONNX raw-data equivalent and are never pooled -- LoadGGUF skips and
   // reports them rather than writing garbage. The K-quant family
   // (Q4_K/Q5_K/Q6_K/Q8_0) -- what a real quantized checkpoint (e.g.
-  // Unsloth's GGUF exports) actually uses for the bulk of its weights -- and
-  // MXFP4 (gpt-oss-20b's own native MoE-expert quantization) ARE pooled,
-  // holding their native, still-packed block bytes (see gguf_dtype.h's
-  // IsKQuant/IsMxfp4); DequantizeToFloat below decodes an entry like that to
-  // plain float32 values.
+  // Unsloth's GGUF exports) actually uses for the bulk of its weights --
+  // the legacy family (Q4_0/Q4_1/Q5_0/Q5_1, which llama.cpp's own mixed-
+  // precision quantizers still pick for particular tensor roles even in an
+  // otherwise K-quant checkpoint) -- and MXFP4 (gpt-oss-20b's own native
+  // MoE-expert quantization) ARE pooled, holding their native, still-packed
+  // block bytes (see gguf_dtype.h's IsKQuant/IsLegacyQuant/IsMxfp4);
+  // DequantizeToFloat below decodes an entry like that to plain float32
+  // values.
 
   // Write every entry to a GGUF file at `path`. Every dtype TensorPool can
   // hold has a raw ggml_type counterpart (see gguf_dtype.h), so -- unlike
@@ -241,12 +244,12 @@ class TensorPool {
 
   // Replace this pool's contents with every tensor in the GGUF file at
   // `path` whose ggml_type this pool can represent -- either a *raw*,
-  // unquantized type (stored as-is) or one of the four K-quant types or the
-  // MXFP4 type gguf_dtype.h's IsKQuant/IsMxfp4 cover (stored as its native,
-  // still-packed block bytes -- see DequantizeToFloat to decode one). Every
-  // other quantized type (Q4_0, every IQ*_ variant, ...) has no
-  // representation this pool can hold at all. Unlike LoadSafetensors, this
-  // does NOT read the whole file into memory: only the (small) header/
+  // unquantized type (stored as-is) or one of the block-quantized types
+  // gguf_dtype.h's IsKQuant/IsLegacyQuant/IsMxfp4 cover (stored as its
+  // native, still-packed block bytes -- see DequantizeToFloat to decode
+  // one). Every other quantized type (Q2_K, Q3_K, every IQ*_ variant, ...)
+  // has no representation this pool can hold at all. Unlike LoadSafetensors,
+  // this does NOT read the whole file into memory: only the (small) header/
   // metadata/tensor-info section is read up front, and each *included*
   // tensor's bytes are read with their own targeted seek + read -- loading a
   // large quantized checkpoint this way costs only the bytes of the tensors
@@ -287,14 +290,14 @@ class TensorPool {
 
   // Decodes `name`'s entry to plain float32 values, appended to `out` (not
   // cleared first) -- the only way to get usable numeric values out of an
-  // entry LoadGGUF/LoadGGUFMmap pooled from a K-quant (Q4_K/Q5_K/Q6_K/Q8_0)
-  // or MXFP4 source, since its `data` otherwise holds native, still-packed
-  // GGML block bytes, not per-element values (see gguf_dtype.h's
-  // IsKQuant/IsMxfp4). Returns false, leaving `out` untouched, if `name`
-  // isn't in the pool or its dtype is not one of those five codes (including
-  // an ordinary raw dtype, e.g. FLOAT/FLOAT16 -- those need no decoding at
-  // all; read Entry::data directly, the same way every other TensorPool
-  // consumer already does).
+  // entry LoadGGUF/LoadGGUFMmap pooled from a K-quant (Q4_K/Q5_K/Q6_K/Q8_0),
+  // legacy (Q4_0/Q4_1/Q5_0/Q5_1), or MXFP4 source, since its `data`
+  // otherwise holds native, still-packed GGML block bytes, not per-element
+  // values (see gguf_dtype.h's IsKQuant/IsLegacyQuant/IsMxfp4). Returns
+  // false, leaving `out` untouched, if `name` isn't in the pool or its
+  // dtype is not one of those nine codes (including an ordinary raw dtype,
+  // e.g. FLOAT/FLOAT16 -- those need no decoding at all; read Entry::data
+  // directly, the same way every other TensorPool consumer already does).
   bool DequantizeToFloat(const std::string& name,
                          std::vector<float>* out) const;
 

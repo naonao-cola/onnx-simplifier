@@ -54,7 +54,7 @@ worse tradeoff than a curated, explicit template per architecture family.
 architecture, its hyperparameters, and its tensors' names/shapes -- without
 reading any tensor byte data; :func:`import_gguf_weights` (reused here
 unmodified) supplies the actual values, including its existing K-quant
-(Q4_K/Q5_K/Q6_K/Q8_0) decode.
+(Q4_K/Q5_K/Q6_K/Q8_0), legacy (Q4_0/Q4_1/Q5_0/Q5_1), and MXFP4 decode.
 
 Scope note on shapes: the returned graph's ``batch_size``/``seq_len`` are
 concrete, caller-chosen static dimensions, not dynamic axes. Real llama.cpp
@@ -107,11 +107,11 @@ _GGML_RAW_TO_ONNX = {
     28: onnx.TensorProto.DOUBLE,  # F64
     30: onnx.TensorProto.BFLOAT16,  # BF16
 }
-# Q8_0, Q4_K, Q5_K, Q6_K, MXFP4 -- import_gguf_weights forces these to FLOAT
-# regardless of what the initializer previously declared (see
-# tensor_pool_gguf_bridge.h's HydrateTensorProtoFromGGUF), so that is what
-# must be declared here too.
-_GGML_KQUANT_TYPES = {8, 12, 13, 14, 39}
+# Q8_0, Q4_K, Q5_K, Q6_K (K-quant), Q4_0, Q4_1, Q5_0, Q5_1 (legacy), MXFP4 --
+# import_gguf_weights forces these to FLOAT regardless of what the
+# initializer previously declared (see tensor_pool_gguf_bridge.h's
+# HydrateTensorProtoFromGGUF), so that is what must be declared here too.
+_GGML_KQUANT_TYPES = {2, 3, 6, 7, 8, 12, 13, 14, 39}
 
 _ONNX_DTYPE_ITEMSIZE = {
     onnx.TensorProto.FLOAT: 4,
@@ -1048,8 +1048,8 @@ def _reconstruct_llama_family(
             raise UnsupportedArchitectureError(
                 f"tensor '{name}' uses ggml_type {ggml_type}, which "
                 "import_gguf_weights cannot decode (only F32/F16/BF16/F64/"
-                "I8/I16/I32/I64, the Q4_K/Q5_K/Q6_K/Q8_0 K-quant family, and "
-                "MXFP4 are supported)"
+                "I8/I16/I32/I64, the Q4_K/Q5_K/Q6_K/Q8_0 K-quant family, the "
+                "Q4_0/Q4_1/Q5_0/Q5_1 legacy family, and MXFP4 are supported)"
             )
         b.placeholder_weight(name, expected_shape, onnx_dtype)
         return name
@@ -1400,8 +1400,8 @@ def _reconstruct_gpt_oss(meta: dict, batch_size: int, seq_len: int) -> onnx.Grap
             raise UnsupportedArchitectureError(
                 f"tensor '{name}' uses ggml_type {ggml_type}, which "
                 "import_gguf_weights cannot decode (only F32/F16/BF16/F64/"
-                "I8/I16/I32/I64, the Q4_K/Q5_K/Q6_K/Q8_0 K-quant family, and "
-                "MXFP4 are supported)"
+                "I8/I16/I32/I64, the Q4_K/Q5_K/Q6_K/Q8_0 K-quant family, the "
+                "Q4_0/Q4_1/Q5_0/Q5_1 legacy family, and MXFP4 are supported)"
             )
         b.placeholder_weight(name, expected_shape, onnx_dtype)
         return name
@@ -1520,7 +1520,8 @@ def reconstruct_gguf_graph(
     itself from the checkpoint's own declared hyperparameters
     (:func:`read_gguf_metadata`), then calls ``import_gguf_weights``
     internally to hydrate it -- so it reuses that function's existing
-    K-quant (Q4_K/Q5_K/Q6_K/Q8_0) decode unchanged.
+    K-quant (Q4_K/Q5_K/Q6_K/Q8_0), legacy (Q4_0/Q4_1/Q5_0/Q5_1), and MXFP4
+    decode unchanged.
 
     :param gguf_path: path to the GGUF checkpoint
     :param batch_size: static batch dimension baked into the returned
