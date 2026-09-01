@@ -280,9 +280,9 @@ struct FuseMatMulIntoConv final : public PredicateBasedPass {
       Node* unsqueeze = graph.create(kUnsqueeze, 1);
       unsqueeze->addInput(w2);
       const int opset = getOpsetVersion(graph);
-      const std::vector<int64_t> axes{2};
+      std::vector<int64_t> axes{2};
       if (opset < 13 && opset != 0) {
-        unsqueeze->is_(kaxes, axes);
+        unsqueeze->is_(kaxes, std::move(axes));
       } else {
         unsqueeze->addInput(
             MakeInt64Constant(graph, axes, nextReservedName(graph)));
