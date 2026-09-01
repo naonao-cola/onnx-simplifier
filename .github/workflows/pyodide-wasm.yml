@@ -236,7 +236,7 @@ jobs:
       # needing the wasm toolchain locally. See docs/wasm_pyodide.md's Demo
       # section for the exact steps.
       - name: Upload the built module as a workflow artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: onnxsim_cpp2py_export-wasm32-pyodide-${{ env.PYODIDE_VERSION }}
           path: ${{ env.SO_PATH }}

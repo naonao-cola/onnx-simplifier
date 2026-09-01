@@ -7,6 +7,7 @@
 // .cpp for the two entry points' shared design note.
 
 #include <onnx/onnx_pb.h>
+#include <onnx/shape_inference/implementation.h>  // for shape_inference::ModelLocalFunctionsMap
 
 namespace onnx {
 class Graph;
@@ -23,8 +24,15 @@ void _InferShapes(onnx::ModelProto& model);
 void _EvalPartialShape(onnx::ModelProto& model);
 
 // Graph-native counterpart of _EvalPartialShape, reached without a
-// ModelProto <-> Graph round trip. Returns whether anything changed.
-bool _EvalPartialShapeOnGraph(onnx::Graph& g);
+// ModelProto <-> Graph round trip. `model_local_functions` is forwarded
+// unchanged to the InferShapesOnGraph call this makes internally (see that
+// function's own doc comment, onnx/common/graph_shape_inference.h) --
+// omitted (the default, empty) if the graph's owning model has no
+// model-local functions, or the caller doesn't have them on hand. Returns
+// whether anything changed.
+bool _EvalPartialShapeOnGraph(
+    onnx::Graph& g, const onnx::shape_inference::ModelLocalFunctionsMap&
+                        model_local_functions = {});
 
 // Unset the recurrent initial states of RNN/GRU/LSTM nodes in `graph` (and
 // its nested subgraphs) that are provably all zeros (issue #314), so the
