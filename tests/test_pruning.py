@@ -18122,3 +18122,886 @@ def test_prune_then_quantize_static_composes_correctly():
     (y_quant,) = _run(quantized, {"X": x})
     rel = np.linalg.norm(y_float - y_quant) / max(np.linalg.norm(y_float), 1e-6)
     assert rel < 0.05  # ordinary INT8 quantization error, not a correctness bug
+
+
+# --- apply_structured_pruning_matmul_nbits -----------------------------------
+#
+# See ``onnxsim/pruning.py``'s own "MatMulNBits (block-quantized weight)
+# structured pruning" section comment for the full empirical schema/packing
+# investigation (live ``onnxruntime`` schema introspection + a real
+# ``InferenceSession`` packing round-trip) this pass's scope was reached
+# from. Every helper below is an INDEPENDENT reference implementation of the
+# schema's own documented block-quantization/nibble-packing scheme -- not a
+# call into any of ``onnxsim.pruning``'s own private packing helpers -- so
+# that a bug shared between the pass and its own test oracle can't hide.
+#
+# Nodes are built via ``onnx.helper.make_node`` rather than
+# ``onnx.parser.parse_model`` -- the CLAUDE.md-documented fallback for a
+# custom-domain op the text format cannot express cleanly here (optional
+# trailing inputs interleaved with present ones, e.g. a present
+# ``zero_points`` with an absent ``g_idx`` before a present ``bias``).
+# Weight/scale/zero-point/bias tensors are still attached as ordinary
+# numpy-built ``onnx.numpy_helper.from_array`` initializers, exactly the
+# established pattern this file already uses for every other weight.
+
+
+def _nbits_quantize_block(W, block_size, bits=4):
+    """Independent reference block quantizer for a ``[N, K]`` float weight
+    matrix -- standard asymmetric affine quantization per ``(n, k_block)``,
+    zero-inclusive range (``vmin``/``vmax`` widened to include 0 so the
+    zero-point is always representable, exactly the affine-quantization
+    regime this op's own zero-point scheme assumes -- see
+    ``onnxsim/pruning.py``'s own section comment). Returns ``(qcodes uint8
+    [N, K], scales float32 [N, k_blocks], zero_points uint8 [N, k_blocks]
+    UNPACKED, k_blocks)``.
+    """
+    N, K = W.shape
+    assert K % block_size == 0
+    k_blocks = K // block_size
+    qmax = (1 << bits) - 1
+    scales = np.zeros((N, k_blocks), dtype=np.float32)
+    zero_points = np.zeros((N, k_blocks), dtype=np.uint8)
+    qcodes = np.zeros((N, K), dtype=np.uint8)
+    for n in range(N):
+        for kb in range(k_blocks):
+            k0, k1 = kb * block_size, (kb + 1) * block_size
+            block = W[n, k0:k1]
+            vmin = min(float(block.min()), 0.0)
+            vmax = max(float(block.max()), 0.0)
+            scale = (vmax - vmin) / qmax if vmax > vmin else 1.0
+            zp = int(np.clip(round(-vmin / scale), 0, qmax))
+            scales[n, kb] = scale
+            zero_points[n, kb] = zp
+            qcodes[n, k0:k1] = (
+                np.round(block / scale + zp).clip(0, qmax).astype(np.uint8)
+            )
+    return qcodes, scales, zero_points, k_blocks
+
+
+def _nbits_pack_nibbles(vals):
+    """Independent reference nibble packer: last axis (uint8 in [0, 15]),
+    2-per-byte, LOW nibble first -- the schema's own documented layout
+    ("the first 4 bits are stored in the lower 4 bits of a byte"),
+    empirically confirmed via a real ``InferenceSession`` round-trip (see
+    ``onnxsim/pruning.py``'s own section comment).
+    """
+    count = vals.shape[-1]
+    nbytes = (count + 1) // 2
+    out = np.zeros(vals.shape[:-1] + (nbytes,), dtype=np.uint8)
+    for j in range(nbytes):
+        lo = vals[..., 2 * j]
+        hi = vals[..., 2 * j + 1] if 2 * j + 1 < count else np.zeros_like(lo)
+        out[..., j] = (lo & 0xF) | ((hi & 0xF) << 4)
+    return out
+
+
+def _nbits_unpack_nibbles(packed, count):
+    """Inverse of :func:`_nbits_pack_nibbles`."""
+    nbytes = packed.shape[-1]
+    out = np.zeros(packed.shape[:-1] + (2 * nbytes,), dtype=np.uint8)
+    out[..., 0::2] = packed & 0x0F
+    out[..., 1::2] = (packed >> 4) & 0x0F
+    return out[..., :count]
+
+
+def _nbits_pack_B(qcodes, N, k_blocks, block_size, bits=4):
+    blob_size = block_size * bits // 8
+    B = np.zeros((N, k_blocks, blob_size), dtype=np.uint8)
+    for kb in range(k_blocks):
+        k0 = kb * block_size
+        B[:, kb, :] = _nbits_pack_nibbles(qcodes[:, k0 : k0 + block_size])
+    return B
+
+
+def _nbits_dequant(qcodes, scales, zero_points, block_size, bits=4):
+    """Independent reference dequantizer -- ``zero_points=None`` uses the
+    schema's own documented default, ``2 ** (bits - 1)``.
+    """
+    N, K = qcodes.shape
+    k_blocks = K // block_size
+    out = np.zeros((N, K), dtype=np.float64)
+    default_zp = float(1 << (bits - 1))
+    for n in range(N):
+        for kb in range(k_blocks):
+            k0, k1 = kb * block_size, (kb + 1) * block_size
+            zp = float(zero_points[n, kb]) if zero_points is not None else default_zp
+            out[n, k0:k1] = (qcodes[n, k0:k1].astype(np.float64) - zp) * scales[n, kb]
+    return out
+
+
+def _nbits_node(
+    name,
+    a_input,
+    out_name,
+    b_name,
+    scales_name,
+    zp_name,
+    bias_name,
+    N,
+    K,
+    block_size,
+    bits=4,
+    **extra_attrs,
+):
+    inputs = [a_input, b_name, scales_name, zp_name or "", "", bias_name or ""]
+    while inputs and not inputs[-1]:
+        inputs.pop()  # trim trailing empty optional inputs
+    kwargs = dict(K=K, N=N, bits=bits, block_size=block_size)
+    kwargs.update(extra_attrs)
+    return onnx.helper.make_node(
+        "MatMulNBits",
+        inputs=inputs,
+        outputs=[out_name],
+        domain="com.microsoft",
+        name=name,
+        **kwargs,
+    )
+
+
+def _nbits_chain_model(
+    N1,
+    K1,
+    N2,
+    block_size,
+    W1,
+    W2,
+    bits=4,
+    zp1_mode="packed",
+    zp2_mode="packed",
+    bias1=None,
+    bias2=None,
+    activation="Relu",
+    g_idx1=False,
+):
+    """Builds ``A -> MatMulNBits(mm1) -> activation -> MatMulNBits(mm2) ->
+    Y``, both nodes real, bit-packed int4-quantized ``com.microsoft::
+    MatMulNBits`` nodes. ``zp*_mode``: ``"packed"`` (uint8 nibble-packed),
+    ``"unpacked"`` (float32, same dtype as ``A``), or ``"absent"`` (no
+    ``zero_points`` input -- schema default applies). ``g_idx1=True``
+    attaches a (dummy) ``g_idx`` input to ``mm1``, for the decline test.
+    Returns ``(model, info)`` where `info` carries every independently
+    computed quantization artifact (`qcodes1`, `scales1`, `zp1`
+    UNPACKED, `k_blocks1`, ... same for 2, `K2`) needed to hand-build an
+    oracle.
+    """
+    K2 = N1
+    assert K2 % block_size == 0  # else the consumer would never match
+    qcodes1, scales1, zp1, kb1 = _nbits_quantize_block(W1, block_size, bits)
+    qcodes2, scales2, zp2, kb2 = _nbits_quantize_block(W2, block_size, bits)
+    B1 = _nbits_pack_B(qcodes1, N1, kb1, block_size, bits)
+    B2 = _nbits_pack_B(qcodes2, N2, kb2, block_size, bits)
+
+    initializer = [
+        onnx.numpy_helper.from_array(B1, name="B1"),
+        onnx.numpy_helper.from_array(scales1, name="scales1"),
+        onnx.numpy_helper.from_array(B2, name="B2"),
+        onnx.numpy_helper.from_array(scales2, name="scales2"),
+    ]
+
+    def _attach_zp(mode, zp, name):
+        if mode == "packed":
+            initializer.append(
+                onnx.numpy_helper.from_array(_nbits_pack_nibbles(zp), name=name)
+            )
+            return name
+        if mode == "unpacked":
+            initializer.append(
+                onnx.numpy_helper.from_array(zp.astype(np.float32), name=name)
+            )
+            return name
+        assert mode == "absent"
+        return None
+
+    zp1_name = _attach_zp(zp1_mode, zp1, "zp1")
+    zp2_name = _attach_zp(zp2_mode, zp2, "zp2")
+
+    bias1_name = None
+    if bias1 is not None:
+        initializer.append(onnx.numpy_helper.from_array(bias1, name="bias1"))
+        bias1_name = "bias1"
+    bias2_name = None
+    if bias2 is not None:
+        initializer.append(onnx.numpy_helper.from_array(bias2, name="bias2"))
+        bias2_name = "bias2"
+
+    node1_inputs = ["A", "B1", "scales1", zp1_name or ""]
+    if g_idx1:
+        g_idx = np.arange(kb1, dtype=np.int32)  # dummy, contents irrelevant
+        initializer.append(onnx.numpy_helper.from_array(g_idx, name="g_idx1"))
+        node1_inputs.append("g_idx1")
+    else:
+        node1_inputs.append("")
+    node1_inputs.append(bias1_name or "")
+    while node1_inputs and not node1_inputs[-1]:
+        node1_inputs.pop()
+    node1 = onnx.helper.make_node(
+        "MatMulNBits",
+        inputs=node1_inputs,
+        outputs=["h1"],
+        domain="com.microsoft",
+        name="mm1",
+        K=K1,
+        N=N1,
+        bits=bits,
+        block_size=block_size,
+    )
+    act = onnx.helper.make_node(activation, ["h1"], ["h1_act"])
+    node2 = _nbits_node(
+        "mm2",
+        "h1_act",
+        "Y",
+        "B2",
+        "scales2",
+        zp2_name,
+        bias2_name,
+        N2,
+        K2,
+        block_size,
+        bits,
+    )
+
+    M = 3
+    graph = onnx.helper.make_graph(
+        [node1, act, node2],
+        "g",
+        inputs=[
+            onnx.helper.make_tensor_value_info("A", onnx.TensorProto.FLOAT, [M, K1])
+        ],
+        outputs=[
+            onnx.helper.make_tensor_value_info("Y", onnx.TensorProto.FLOAT, [M, N2])
+        ],
+        initializer=initializer,
+    )
+    model = onnx.helper.make_model(
+        graph,
+        opset_imports=[
+            onnx.helper.make_opsetid("", 21),
+            onnx.helper.make_opsetid("com.microsoft", 1),
+        ],
+    )
+    model.ir_version = 10
+    return model, dict(
+        qcodes1=qcodes1,
+        scales1=scales1,
+        zp1=zp1,
+        kb1=kb1,
+        qcodes2=qcodes2,
+        scales2=scales2,
+        zp2=zp2,
+        kb2=kb2,
+        bias1=bias1,
+        bias2=bias2,
+        K2=K2,
+    )
+
+
+def test_matmul_nbits_pruning_producer_and_consumer_match_independent_reference_oracle():
+    # N1=32 output channels, block_size=16 -> the consumer's own K2=N1=32
+    # axis is exactly 2 blocks. W1's rows are engineered so the pass's own
+    # L2-norm importance ranking keeps EXACTLY rows 0-15 (block 0) and drops
+    # 16-31 (block 1) -- a real, non-trivial keep-set the pass has to derive
+    # on its own, that also happens to land on a whole-block boundary.
+    N1, K1, N2, block_size = 32, 64, 8, 16
+    rng = np.random.default_rng(100)
+    W1 = rng.standard_normal((N1, K1)).astype(np.float32) * 0.2
+    W1[:16] *= 6.0  # rows 0-15: large magnitude (kept); 16-31: small (dropped)
+    W2 = rng.standard_normal((N2, N1)).astype(np.float32) * 0.2
+    bias1 = (rng.standard_normal(N1) * 0.05).astype(np.float32)
+    bias2 = (rng.standard_normal(N2) * 0.05).astype(np.float32)
+
+    model, info = _nbits_chain_model(
+        N1, K1, N2, block_size, W1, W2, bias1=bias1, bias2=bias2
+    )
+    onnx.checker.check_model(model)
+
+    pruned = onnxsim.apply_structured_pruning_matmul_nbits(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    keep = np.arange(16)  # expected keep-set: rows 0-15
+    keep_blocks = np.array([0])  # consumer's block 0 (positions 0-15) survives
+
+    inits = {t.name: t for t in pruned.graph.initializer}
+    assert list(inits["B1"].dims) == [16, info["kb1"], block_size * 4 // 8]
+    assert list(inits["scales1"].dims) == [16, info["kb1"]]
+    assert list(inits["bias1"].dims) == [16]
+    assert list(inits["B2"].dims) == [N2, 1, block_size * 4 // 8]
+    assert list(inits["scales2"].dims) == [N2, 1]
+    mm1 = next(n for n in pruned.graph.node if n.name == "mm1")
+    mm2 = next(n for n in pruned.graph.node if n.name == "mm2")
+    assert next(a.i for a in mm1.attribute if a.name == "N") == 16
+    assert next(a.i for a in mm2.attribute if a.name == "K") == 16
+
+    # Exact (byte-level, not merely close) "slice, don't recompute" checks:
+    # the pruned graph's own tensors must equal a HAND-SLICE of the
+    # ORIGINAL quantized codes -- never a re-quantization of the sliced
+    # float weight (which would introduce different rounding).
+    np.testing.assert_array_equal(
+        onnx.numpy_helper.to_array(inits["B1"]),
+        _nbits_pack_B(info["qcodes1"][keep], 16, info["kb1"], block_size),
+    )
+    np.testing.assert_allclose(
+        onnx.numpy_helper.to_array(inits["scales1"]), info["scales1"][keep]
+    )
+    np.testing.assert_array_equal(
+        onnx.numpy_helper.to_array(inits["zp1"]),
+        _nbits_pack_nibbles(info["zp1"][keep]),
+    )
+    np.testing.assert_allclose(onnx.numpy_helper.to_array(inits["bias1"]), bias1[keep])
+    np.testing.assert_array_equal(
+        onnx.numpy_helper.to_array(inits["B2"]),
+        _nbits_pack_B(info["qcodes2"][:, keep], N2, 1, block_size),
+    )
+    np.testing.assert_array_equal(
+        onnx.numpy_helper.to_array(inits["zp2"]),
+        _nbits_pack_nibbles(info["zp2"][:, keep_blocks]),
+    )
+
+    # Independently-constructed, ALREADY-PRUNED reference model -- built
+    # from scratch by hand-slicing the ORIGINAL qcodes/scales/zero_points
+    # (never calling onnxsim.pruning) and re-packing via this test's own
+    # (separate) packing helpers, then run through a real onnxruntime
+    # InferenceSession. Its output must match the actual pass's own pruned
+    # model's real onnxruntime output.
+    ref_model, _ = _nbits_chain_model(
+        16, K1, N2, block_size, W1[keep], W2[:, keep], bias1=bias1[keep], bias2=bias2
+    )
+    # ^ NOTE: re-quantizes W1[keep]/W2[:, keep] from float -- a DIFFERENT
+    # code path than the pass's own slice-of-existing-codes, so this is a
+    # genuine independent construction, not a restatement of the pass's own
+    # logic; the two should still agree to within ordinary int4
+    # quantization rounding (not pruning-introduced error).
+    onnx.checker.check_model(ref_model)
+
+    rng2 = np.random.default_rng(101)
+    x = rng2.standard_normal((3, K1)).astype(np.float32)
+    (y_pruned,) = _run(pruned, {"A": x})
+    (y_ref,) = _run(ref_model, {"A": x})
+    np.testing.assert_allclose(y_pruned, y_ref, rtol=1e-2, atol=1e-2)
+
+    # And matches a pure-float64 dequantize-then-matmul oracle built
+    # directly from the pass's own (unmodified) quantized codes, sliced by
+    # hand -- the tightest oracle, at float rounding error only.
+    w1_dequant = _nbits_dequant(
+        info["qcodes1"], info["scales1"], info["zp1"], block_size
+    )
+    w2_dequant = _nbits_dequant(
+        info["qcodes2"], info["scales2"], info["zp2"], block_size
+    )
+    h1 = np.maximum(x.astype(np.float64) @ w1_dequant[keep].T + bias1[keep], 0.0)
+    y_oracle = h1 @ w2_dequant[:, keep].T + bias2
+    np.testing.assert_allclose(y_pruned, y_oracle, rtol=1e-3, atol=1e-3)
+
+
+def test_matmul_nbits_pruning_producer_odd_kept_row_count_zero_points_has_no_repack_hazard():
+    # This directly tests :func:`onnxsim.pruning._slice_matmul_nbits_producer_rows`
+    # (rather than the public ``apply_structured_pruning_matmul_nbits``,
+    # mirroring this file's own established pattern of unit-testing a
+    # private helper directly when the public API structurally cannot reach
+    # the state under test -- see e.g. ``onnxsim.pruning._find_gqa_chains``
+    # used the same way elsewhere in this file): a genuinely ODD kept-ROW
+    # count on the PRODUCER (N) axis is UNREACHABLE through the public pass
+    # when paired with a real (block-aligned) consumer, because every
+    # ``block_size`` this module accepts is >= 16 (always even), so any
+    # block-aligned keep-count is necessarily a multiple of an even number
+    # -- always even. Testing it here in isolation is what actually lets
+    # this adversarial case be exercised at all.
+    #
+    # EMPIRICAL FINDING (see onnxsim/pruning.py's own section comment): the
+    # live schema's ``zero_points`` PACKED format has shape ``(N, ceil(k_blocks
+    # * bits / 8))`` -- ``N`` is a plain, unpacked LEADING dimension; only
+    # the ``k_blocks`` axis is nibble-packed, per-row, independently. This
+    # means an odd KEPT-ROW count on the N axis carries NO cross-row
+    # nibble-parity hazard at all (unlike an odd kept-BLOCK count on the K
+    # axis, which IS hazardous -- see
+    # ``test_matmul_nbits_pruning_consumer_odd_kept_block_count_...`` below):
+    # each row is an independent, whole number of bytes regardless of which
+    # OTHER rows are kept. This test both exercises the (odd-row-count)
+    # scenario the task's own working hypothesis anticipated, AND confirms
+    # -- rather than assumes -- that hypothesis was wrong for this specific
+    # axis by checking the real function's output against a NAIVE raw
+    # byte-level row slice (no unpack/re-pack at all): the two must be
+    # identical, proving no repacking was ever actually necessary here.
+    from onnxsim.pruning import (
+        _consumers_of,
+        _match_matmul_nbits,
+        _slice_matmul_nbits_producer_rows,
+    )
+
+    N, K, block_size = 8, 32, 16
+    rng = np.random.default_rng(102)
+    W = rng.standard_normal((N, K)).astype(np.float32) * 0.3
+    qcodes, scales, zp, kb = _nbits_quantize_block(W, block_size)
+    B = _nbits_pack_B(qcodes, N, kb, block_size)
+    ZP = _nbits_pack_nibbles(zp)  # shape (8, 1): kb=2 -> ceil(2*4/8)=1 byte/row
+    bias = (rng.standard_normal(N) * 0.05).astype(np.float32)
+
+    node = _nbits_node("mm", "A", "Y", "B", "scales", "zp", "bias", N, K, block_size)
+    graph = onnx.helper.make_graph(
+        [node],
+        "g",
+        inputs=[
+            onnx.helper.make_tensor_value_info("A", onnx.TensorProto.FLOAT, [2, K])
+        ],
+        outputs=[
+            onnx.helper.make_tensor_value_info("Y", onnx.TensorProto.FLOAT, [2, None])
+        ],
+        initializer=[
+            onnx.numpy_helper.from_array(B, name="B"),
+            onnx.numpy_helper.from_array(scales, name="scales"),
+            onnx.numpy_helper.from_array(ZP, name="zp"),
+            onnx.numpy_helper.from_array(bias, name="bias"),
+        ],
+    )
+    model = onnx.helper.make_model(
+        graph,
+        opset_imports=[
+            onnx.helper.make_opsetid("", 21),
+            onnx.helper.make_opsetid("com.microsoft", 1),
+        ],
+    )
+    model.ir_version = 10
+    onnx.checker.check_model(model)
+
+    mgraph = model.graph  # helper.make_model copies -- operate on model.graph
+    mnode = mgraph.node[0]
+    initializer_map = {t.name: t for t in mgraph.initializer}
+    w = _match_matmul_nbits(mnode, initializer_map, _consumers_of(mgraph))
+    assert w is not None
+
+    keep = np.array([0, 1, 3, 5, 7])  # ODD count (5), non-contiguous
+    _slice_matmul_nbits_producer_rows(w, keep)
+
+    new_N = next(a.i for a in mnode.attribute if a.name == "N")
+    assert new_N == 5
+
+    zp_after = onnx.numpy_helper.to_array(w.zero_points_init)
+    naive_byte_slice = ZP[keep]  # no unpack/repack at all -- just row-index the bytes
+    np.testing.assert_array_equal(zp_after, naive_byte_slice)
+
+    sess = ort.InferenceSession(
+        model.SerializeToString(), providers=["CPUExecutionProvider"]
+    )
+    rng2 = np.random.default_rng(103)
+    x = rng2.standard_normal((2, K)).astype(np.float32)
+    (y,) = sess.run(None, {"A": x})
+
+    w_dequant = _nbits_dequant(qcodes, scales, zp, block_size)
+    y_oracle = x.astype(np.float64) @ w_dequant[keep].T + bias[keep]
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-3, atol=1e-3)
+
+
+def test_matmul_nbits_pruning_consumer_odd_kept_block_count_zero_points_repack():
+    # The GENUINE nibble-repack hazard: the consumer's own ``zero_points``
+    # block axis IS nibble-packed per-row (unlike the producer's row axis,
+    # see the test above), so dropping some blocks from the MIDDLE of that
+    # axis shifts every subsequent kept block's nibble parity unless
+    # correctly unpacked/resliced/repacked. block_size=16, N1=80 ->
+    # k_blocks2=5 for the consumer; W1's rows are engineered so blocks 0, 2,
+    # 4 (odd COUNT: 3 of 5, and non-contiguous) survive and 1, 3 are
+    # dropped -- exactly the adversarial "wrong nibble unpack order would
+    # silently misalign everything past the first dropped block" shape.
+    N1, K1, N2, block_size = 80, 32, 4, 16
+    rng = np.random.default_rng(104)
+    W1 = rng.standard_normal((N1, K1)).astype(np.float32) * 0.2
+    for kb in (0, 2, 4):
+        W1[kb * 16 : (kb + 1) * 16] *= 8.0  # large -- kept
+    for kb in (1, 3):
+        W1[kb * 16 : (kb + 1) * 16] *= 0.05  # small -- dropped
+    W2 = rng.standard_normal((N2, N1)).astype(np.float32) * 0.2
+
+    model, info = _nbits_chain_model(N1, K1, N2, block_size, W1, W2)
+    onnx.checker.check_model(model)
+
+    # keep_count = 48 (3 of 5 blocks x 16) -> sparsity = 1 - 48/80 = 0.4
+    pruned = onnxsim.apply_structured_pruning_matmul_nbits(model, sparsity=0.4)
+    onnx.checker.check_model(pruned)
+
+    keep = np.concatenate([np.arange(0, 16), np.arange(32, 48), np.arange(64, 80)])
+    keep_blocks = np.array([0, 2, 4])
+
+    inits = {t.name: t for t in pruned.graph.initializer}
+    mm2 = next(n for n in pruned.graph.node if n.name == "mm2")
+    assert next(a.i for a in mm2.attribute if a.name == "K") == 48
+    assert list(inits["B2"].dims) == [N2, 3, block_size * 4 // 8]
+
+    np.testing.assert_array_equal(
+        onnx.numpy_helper.to_array(inits["B2"]),
+        _nbits_pack_B(info["qcodes2"][:, keep], N2, 3, block_size),
+    )
+    np.testing.assert_array_equal(
+        onnx.numpy_helper.to_array(inits["zp2"]),
+        _nbits_pack_nibbles(info["zp2"][:, keep_blocks]),
+    )
+    # The wrong result a buggy repack (e.g. naive byte-slice of the packed
+    # zero_points bytes at the wrong granularity, or unpack-without-repack)
+    # would produce -- included so a coincidentally-passing tensor-shape
+    # check can't mask a nibble-order bug: this is what the ACTUAL
+    # (buggy-if-broken) packed bytes would look like if blocks 0,2,4 were
+    # taken from the unpacked values but written back at the WRONG nibble
+    # positions (e.g. as if only blocks 0,1,2 of 3 were being packed from a
+    # stale unpack). This wrong array must differ from the real result.
+    wrong_repack = _nbits_pack_nibbles(info["zp2"][:, np.array([0, 1, 2])])
+    real_repack = onnx.numpy_helper.to_array(inits["zp2"])
+    if not np.array_equal(info["zp2"][:, keep_blocks], info["zp2"][:, [0, 1, 2]]):
+        assert not np.array_equal(real_repack, wrong_repack)
+
+    rng2 = np.random.default_rng(105)
+    x = rng2.standard_normal((3, K1)).astype(np.float32)
+    (y_pruned,) = _run(pruned, {"A": x})
+
+    w1_dequant = _nbits_dequant(
+        info["qcodes1"], info["scales1"], info["zp1"], block_size
+    )
+    w2_dequant = _nbits_dequant(
+        info["qcodes2"], info["scales2"], info["zp2"], block_size
+    )
+    h1 = np.maximum(x.astype(np.float64) @ w1_dequant.T, 0.0)  # no bias here
+    y_oracle = h1[:, keep] @ w2_dequant[:, keep].T
+    np.testing.assert_allclose(y_pruned, y_oracle, rtol=1e-3, atol=1e-3)
+
+
+def test_matmul_nbits_pruning_consumer_declines_non_block_aligned():
+    # Interleaved importance (even rows large, odd rows small) makes the
+    # top-keep_count-by-norm set straddle every block boundary -- the pass
+    # must decline this chain entirely (both nodes' B/scales/zero_points/
+    # bias/attributes left byte-for-byte unchanged), never force a
+    # partial-block re-quantization or a mismatched producer/consumer
+    # keep-set.
+    N1, K1, N2, block_size = 32, 64, 8, 16
+    rng = np.random.default_rng(106)
+    W1 = rng.standard_normal((N1, K1)).astype(np.float32) * 0.2
+    W1[0::2] *= 8.0  # even rows large ("important"), odd rows small
+    W2 = rng.standard_normal((N2, N1)).astype(np.float32) * 0.2
+
+    model, _info = _nbits_chain_model(N1, K1, N2, block_size, W1, W2)
+    onnx.checker.check_model(model)
+
+    pruned = onnxsim.apply_structured_pruning_matmul_nbits(model, sparsity=0.5)
+
+    before = {n.name: n.SerializeToString() for n in model.graph.node}
+    after = {n.name: n.SerializeToString() for n in pruned.graph.node}
+    assert before == after
+    before_inits = {t.name: t.SerializeToString() for t in model.graph.initializer}
+    after_inits = {t.name: t.SerializeToString() for t in pruned.graph.initializer}
+    assert before_inits == after_inits
+
+
+def test_matmul_nbits_pruning_unpacked_float_zero_points_matches_oracle():
+    # zero_points as an UNPACKED float tensor (same dtype as A, shape
+    # (N, k_blocks)) -- the live schema's OTHER documented encoding,
+    # confirmed to compose correctly (not just the packed-uint8 case every
+    # other test here otherwise exercises).
+    N1, K1, N2, block_size = 32, 64, 8, 16
+    rng = np.random.default_rng(107)
+    W1 = rng.standard_normal((N1, K1)).astype(np.float32) * 0.2
+    W1[:16] *= 6.0
+    W2 = rng.standard_normal((N2, N1)).astype(np.float32) * 0.2
+
+    model, info = _nbits_chain_model(
+        N1, K1, N2, block_size, W1, W2, zp1_mode="unpacked", zp2_mode="unpacked"
+    )
+    onnx.checker.check_model(model)
+
+    pruned = onnxsim.apply_structured_pruning_matmul_nbits(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    keep = np.arange(16)
+    inits = {t.name: t for t in pruned.graph.initializer}
+    assert list(inits["zp1"].dims) == [16, info["kb1"]]
+    np.testing.assert_allclose(
+        onnx.numpy_helper.to_array(inits["zp1"]), info["zp1"][keep].astype(np.float32)
+    )
+
+    rng2 = np.random.default_rng(108)
+    x = rng2.standard_normal((3, K1)).astype(np.float32)
+    (y_pruned,) = _run(pruned, {"A": x})
+    w1_dequant = _nbits_dequant(
+        info["qcodes1"], info["scales1"], info["zp1"], block_size
+    )
+    w2_dequant = _nbits_dequant(
+        info["qcodes2"], info["scales2"], info["zp2"], block_size
+    )
+    h1 = np.maximum(x.astype(np.float64) @ w1_dequant[keep].T, 0.0)
+    y_oracle = h1 @ w2_dequant[:, keep].T
+    np.testing.assert_allclose(y_pruned, y_oracle, rtol=1e-3, atol=1e-3)
+
+
+def test_matmul_nbits_pruning_absent_zero_points_uses_schema_default():
+    # No zero_points input at all -- the schema's own documented default
+    # (2 ** (bits - 1), i.e. 8 for bits=4) applies; slicing must still work
+    # correctly with nothing to co-slice on that operand.
+    N1, K1, N2, block_size = 32, 64, 8, 16
+    rng = np.random.default_rng(109)
+    W1 = rng.standard_normal((N1, K1)).astype(np.float32) * 0.2
+    W1[:16] *= 6.0
+    W2 = rng.standard_normal((N2, N1)).astype(np.float32) * 0.2
+
+    model, info = _nbits_chain_model(
+        N1, K1, N2, block_size, W1, W2, zp1_mode="absent", zp2_mode="absent"
+    )
+    onnx.checker.check_model(model)
+    assert "zp1" not in {t.name for t in model.graph.initializer}
+
+    pruned = onnxsim.apply_structured_pruning_matmul_nbits(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    mm1 = next(n for n in pruned.graph.node if n.name == "mm1")
+    assert len(mm1.input) <= 3 or not mm1.input[3]  # still no zero_points
+
+    keep = np.arange(16)
+    rng2 = np.random.default_rng(110)
+    x = rng2.standard_normal((3, K1)).astype(np.float32)
+    (y_pruned,) = _run(pruned, {"A": x})
+    w1_dequant = _nbits_dequant(info["qcodes1"], info["scales1"], None, block_size)
+    w2_dequant = _nbits_dequant(info["qcodes2"], info["scales2"], None, block_size)
+    h1 = np.maximum(x.astype(np.float64) @ w1_dequant[keep].T, 0.0)
+    y_oracle = h1 @ w2_dequant[:, keep].T
+    np.testing.assert_allclose(y_pruned, y_oracle, rtol=1e-3, atol=1e-3)
+
+
+def test_matmul_nbits_pruning_declines_g_idx():
+    # A GPTQ-style g_idx column-permutation index present on the producer --
+    # declined outright, see this module's own section comment.
+    N1, K1, N2, block_size = 32, 64, 8, 16
+    rng = np.random.default_rng(111)
+    W1 = rng.standard_normal((N1, K1)).astype(np.float32) * 0.2
+    W1[:16] *= 6.0
+    W2 = rng.standard_normal((N2, N1)).astype(np.float32) * 0.2
+    model, _info = _nbits_chain_model(N1, K1, N2, block_size, W1, W2, g_idx1=True)
+    onnx.checker.check_model(model)
+
+    pruned = onnxsim.apply_structured_pruning_matmul_nbits(model, sparsity=0.5)
+    before = {n.name: n.SerializeToString() for n in model.graph.node}
+    after = {n.name: n.SerializeToString() for n in pruned.graph.node}
+    assert before == after
+
+
+def test_matmul_nbits_pruning_declines_bits_other_than_4():
+    # bits=8 -- the live schema allows 2/4/8, but only 4-bit packing has
+    # been empirically verified here (see this module's own section
+    # comment); declined outright rather than guessing at the 8-bit ratio.
+    N, K, block_size, bits = 4, 32, 16, 8
+    rng = np.random.default_rng(112)
+    W = rng.standard_normal((N, K)).astype(np.float32) * 0.2
+    qcodes, scales, zp, kb = _nbits_quantize_block(W, block_size, bits=bits)
+    blob_size = block_size * bits // 8
+    B = np.zeros((N, kb, blob_size), dtype=np.uint8)
+    for k in range(kb):
+        B[:, k, :] = qcodes[
+            :, k * block_size : (k + 1) * block_size
+        ]  # 8-bit: 1 byte/code
+    node = onnx.helper.make_node(
+        "MatMulNBits",
+        inputs=["A", "B", "scales"],
+        outputs=["Y"],
+        domain="com.microsoft",
+        name="mm",
+        K=K,
+        N=N,
+        bits=bits,
+        block_size=block_size,
+    )
+    graph = onnx.helper.make_graph(
+        [node],
+        "g",
+        inputs=[
+            onnx.helper.make_tensor_value_info("A", onnx.TensorProto.FLOAT, [2, K])
+        ],
+        outputs=[
+            onnx.helper.make_tensor_value_info("Y", onnx.TensorProto.FLOAT, [2, N])
+        ],
+        initializer=[
+            onnx.numpy_helper.from_array(B, name="B"),
+            onnx.numpy_helper.from_array(scales, name="scales"),
+        ],
+    )
+    model = onnx.helper.make_model(
+        graph,
+        opset_imports=[
+            onnx.helper.make_opsetid("", 21),
+            onnx.helper.make_opsetid("com.microsoft", 1),
+        ],
+    )
+    model.ir_version = 10
+
+    from onnxsim.pruning import _consumers_of, _match_matmul_nbits
+
+    initializer_map = {t.name: t for t in model.graph.initializer}
+    m = _match_matmul_nbits(
+        model.graph.node[0], initializer_map, _consumers_of(model.graph)
+    )
+    assert m is None
+
+
+def test_matmul_nbits_pruning_declines_weight_prepacked():
+    N1, K1, N2, block_size = 32, 64, 8, 16
+    rng = np.random.default_rng(113)
+    W1 = rng.standard_normal((N1, K1)).astype(np.float32) * 0.2
+    W1[:16] *= 6.0
+    W2 = rng.standard_normal((N2, N1)).astype(np.float32) * 0.2
+    model, _info = _nbits_chain_model(N1, K1, N2, block_size, W1, W2)
+    mm1 = next(n for n in model.graph.node if n.name == "mm1")
+    mm1.attribute.append(onnx.helper.make_attribute("weight_prepacked", 1))
+
+    pruned = onnxsim.apply_structured_pruning_matmul_nbits(model, sparsity=0.5)
+    before = {n.name: n.SerializeToString() for n in model.graph.node}
+    after = {n.name: n.SerializeToString() for n in pruned.graph.node}
+    assert before == after
+
+
+def test_matmul_nbits_pruning_declines_k_not_multiple_of_block_size():
+    # A padded/partial final block (K not an exact multiple of block_size)
+    # -- declined, see this module's own section comment (padding-region
+    # kernel semantics not empirically verified).
+    from onnxsim.pruning import _consumers_of, _match_matmul_nbits
+
+    N, K, block_size = 4, 40, 16  # 40 % 16 == 8 != 0
+    k_blocks = 3  # ceil(40 / 16)
+    blob_size = block_size * 4 // 8
+    B = np.zeros((N, k_blocks, blob_size), dtype=np.uint8)
+    scales = np.ones((N, k_blocks), dtype=np.float32)
+    node = onnx.helper.make_node(
+        "MatMulNBits",
+        inputs=["A", "B", "scales"],
+        outputs=["Y"],
+        domain="com.microsoft",
+        name="mm",
+        K=K,
+        N=N,
+        bits=4,
+        block_size=block_size,
+    )
+    graph = onnx.helper.make_graph(
+        [node],
+        "g",
+        inputs=[
+            onnx.helper.make_tensor_value_info("A", onnx.TensorProto.FLOAT, [2, K])
+        ],
+        outputs=[
+            onnx.helper.make_tensor_value_info("Y", onnx.TensorProto.FLOAT, [2, N])
+        ],
+        initializer=[
+            onnx.numpy_helper.from_array(B, name="B"),
+            onnx.numpy_helper.from_array(scales, name="scales"),
+        ],
+    )
+    model = onnx.helper.make_model(
+        graph,
+        opset_imports=[
+            onnx.helper.make_opsetid("", 21),
+            onnx.helper.make_opsetid("com.microsoft", 1),
+        ],
+    )
+    model.ir_version = 10
+    initializer_map = {t.name: t for t in model.graph.initializer}
+    m = _match_matmul_nbits(
+        model.graph.node[0], initializer_map, _consumers_of(model.graph)
+    )
+    assert m is None
+
+
+def test_matmul_nbits_pruning_declines_shared_weight():
+    # The same B tensor read by two different MatMulNBits nodes -- slicing
+    # it for one chain would silently corrupt the other reader.
+    N1, K1, N2, block_size = 32, 64, 8, 16
+    rng = np.random.default_rng(114)
+    W1 = rng.standard_normal((N1, K1)).astype(np.float32) * 0.2
+    W1[:16] *= 6.0
+    W2 = rng.standard_normal((N2, N1)).astype(np.float32) * 0.2
+    model, _info = _nbits_chain_model(N1, K1, N2, block_size, W1, W2)
+
+    # A second, unrelated node that also reads mm1's own B1 initializer.
+    extra = onnx.helper.make_node(
+        "MatMulNBits",
+        inputs=["A", "B1", "scales1"],
+        outputs=["Y2"],
+        domain="com.microsoft",
+        name="mm_extra",
+        K=K1,
+        N=N1,
+        bits=4,
+        block_size=block_size,
+    )
+    model.graph.node.append(extra)
+    model.graph.output.append(
+        onnx.helper.make_tensor_value_info("Y2", onnx.TensorProto.FLOAT, [3, N1])
+    )
+    onnx.checker.check_model(model)
+
+    pruned = onnxsim.apply_structured_pruning_matmul_nbits(model, sparsity=0.5)
+    before = {t.name: t.SerializeToString() for t in model.graph.initializer}
+    after = {t.name: t.SerializeToString() for t in pruned.graph.initializer}
+    assert before == after
+
+
+def test_matmul_nbits_pruning_declines_mixed_plain_float_chain():
+    # A MatMulNBits producer feeding a plain-float MatMul consumer (or vice
+    # versa) is out of this pass's scope -- only MatMulNBits-to-MatMulNBits
+    # chains are matched (see this module's own section comment).
+    N1, K1, Out = 32, 64, 8
+    block_size = 16
+    rng = np.random.default_rng(115)
+    W1 = rng.standard_normal((N1, K1)).astype(np.float32) * 0.2
+    W1[:16] *= 6.0
+    qcodes1, scales1, zp1, kb1 = _nbits_quantize_block(W1, block_size)
+    B1 = _nbits_pack_B(qcodes1, N1, kb1, block_size)
+    ZP1 = _nbits_pack_nibbles(zp1)
+    W2 = rng.standard_normal((N1, Out)).astype(np.float32)
+
+    node1 = _nbits_node(
+        "mm1", "A", "h1", "B1", "scales1", "zp1", None, N1, K1, block_size
+    )
+    graph = onnx.helper.make_graph(
+        [node1, onnx.helper.make_node("MatMul", ["h1", "W2"], ["Y"])],
+        "g",
+        inputs=[
+            onnx.helper.make_tensor_value_info("A", onnx.TensorProto.FLOAT, [3, K1])
+        ],
+        outputs=[
+            onnx.helper.make_tensor_value_info("Y", onnx.TensorProto.FLOAT, [3, Out])
+        ],
+        initializer=[
+            onnx.numpy_helper.from_array(B1, name="B1"),
+            onnx.numpy_helper.from_array(scales1, name="scales1"),
+            onnx.numpy_helper.from_array(ZP1, name="zp1"),
+            onnx.numpy_helper.from_array(W2, name="W2"),
+        ],
+    )
+    model = onnx.helper.make_model(
+        graph,
+        opset_imports=[
+            onnx.helper.make_opsetid("", 21),
+            onnx.helper.make_opsetid("com.microsoft", 1),
+        ],
+    )
+    model.ir_version = 10
+    onnx.checker.check_model(model)
+
+    pruned = onnxsim.apply_structured_pruning_matmul_nbits(model, sparsity=0.5)
+    inits_before = {t.name: t.SerializeToString() for t in model.graph.initializer}
+    inits_after = {t.name: t.SerializeToString() for t in pruned.graph.initializer}
+    assert inits_before == inits_after
+
+
+def test_matmul_nbits_pruning_zero_sparsity_is_a_no_op():
+    N1, K1, N2, block_size = 32, 64, 8, 16
+    rng = np.random.default_rng(116)
+    W1 = rng.standard_normal((N1, K1)).astype(np.float32) * 0.2
+    W2 = rng.standard_normal((N2, N1)).astype(np.float32) * 0.2
+    model, _info = _nbits_chain_model(N1, K1, N2, block_size, W1, W2)
+
+    pruned = onnxsim.apply_structured_pruning_matmul_nbits(model, sparsity=0.0)
+    inits_before = {t.name: t.SerializeToString() for t in model.graph.initializer}
+    inits_after = {t.name: t.SerializeToString() for t in pruned.graph.initializer}
+    assert inits_before == inits_after
+
+
+def test_matmul_nbits_pruning_invalid_sparsity_raises():
+    N1, K1, N2, block_size = 32, 64, 8, 16
+    rng = np.random.default_rng(117)
+    W1 = rng.standard_normal((N1, K1)).astype(np.float32) * 0.2
+    W2 = rng.standard_normal((N2, N1)).astype(np.float32) * 0.2
+    model, _info = _nbits_chain_model(N1, K1, N2, block_size, W1, W2)
+    with pytest.raises(ValueError):
+        onnxsim.apply_structured_pruning_matmul_nbits(model, sparsity=1.0)
+    with pytest.raises(ValueError):
+        onnxsim.apply_structured_pruning_matmul_nbits(model, sparsity=-0.1)
