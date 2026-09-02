@@ -214,9 +214,7 @@ def test_gather_at_ios18_target_serializes_validate_indices():
     # inputs. Fixed by building the MIL program directly at the resolved
     # target's opset (_build_mil_program's new `opset_version` parameter), so
     # MIL's own builder synthesizes each op's version-appropriate defaults.
-    mlmodel = onnxsim.export_coreml(
-        _gather_model(), minimum_deployment_target="iOS18"
-    )
+    mlmodel = onnxsim.export_coreml(_gather_model(), minimum_deployment_target="iOS18")
     ops = _spec_ops(mlmodel)
     (gather_inputs,) = (inputs for op_type, inputs in ops if op_type == "gather")
     assert "validate_indices" in gather_inputs
