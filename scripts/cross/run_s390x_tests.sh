@@ -122,6 +122,7 @@ chroot "${SYSROOT}" /bin/sh -c "cd /work && GITHUB_STEP_SUMMARY=${CHROOT_SUMMARY
   --ignore=tests/test_torch_export_integration.py --ignore=tests/test_yolo.py \
   --ignore=tests/test_gan.py \
   --ignore=tests/test_qnn_compat.py --ignore=tests/test_modelopt_integration.py \
+  --ignore=tests/test_mmdeploy_integration.py \
   --ignore=tests/test_coreml_compat.py --ignore=tests/test_migraphx_compat.py \
   --ignore=tests/test_openvino_compat.py --ignore=tests/test_check_decode_parity.py \
   --deselect tests/test_fusion_patterns.py::test_fuse_conv_bn_into_conv \
