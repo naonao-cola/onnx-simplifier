@@ -51,8 +51,12 @@ name: Core ML Integration
 # doesn't hide behind the other passing, plus a third entry re-running SmolLM2
 # with --quantize-weights int8 (scripts/apple/export_llm_to_coreml.py) so the
 # weight-only-quantization decode speedup and decode parity are both measured
-# on real hardware, not just asserted. Also workflow_dispatch/schedule-only,
-# matching the other real-model jobs.
+# on real hardware, not just asserted -- plus a fourth entry with
+# --matmul-to-conv instead, targeting the compute (not bandwidth) side of the
+# same theoretical-ceiling analysis (see scripts/apple/README.md). This is the
+# only place either flag's actual effect on decode tok/s gets measured, since
+# no environment developing this repo has real Core ML to run it on. Also
+# workflow_dispatch/schedule-only, matching the other real-model jobs.
 
 on:
   schedule:
@@ -237,11 +241,13 @@ jobs:
             max_context_length: 512
             dtype: fp32
             quantize_weights: none
+            matmul_to_conv: "false"
           - model_id: Qwen/Qwen2.5-1.5B-Instruct
             slug: qwen2.5-1.5b
             max_context_length: 512
             dtype: fp16
             quantize_weights: none
+            matmul_to_conv: "false"
           # Same model/dtype as the first entry, weight-only int8 quantized --
           # see scripts/apple/README.md's "Theoretical ceiling" section for why
           # this is expected to raise decode tok/s (roughly halves DRAM bytes
@@ -253,6 +259,20 @@ jobs:
             max_context_length: 512
             dtype: fp32
             quantize_weights: int8
+            matmul_to_conv: "false"
+          # Same model/dtype as the first entry, --matmul-to-conv enabled --
+          # unlike the int8 entry above, this targets compute (not bandwidth):
+          # the M4 ANE's native matmul path measures well below its conv1x1
+          # path on the same hardware (see the README's "Theoretical ceiling"
+          # section). Untested against this pipeline's actual shapes (mostly
+          # single-token decode) until this job runs it -- this entry is that
+          # measurement, not a claim it helps.
+          - model_id: HuggingFaceTB/SmolLM2-135M-Instruct
+            slug: smollm2-135m-conv
+            max_context_length: 512
+            dtype: fp32
+            quantize_weights: none
+            matmul_to_conv: "true"
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
@@ -277,6 +297,7 @@ jobs:
             ${{ matrix.model_id }} --dtype ${{ matrix.dtype }} \
             --max-context-length ${{ matrix.max_context_length }} \
             --quantize-weights ${{ matrix.quantize_weights }} \
+            ${{ matrix.matmul_to_conv == 'true' && '--matmul-to-conv' || '' }} \
             --output ${{ matrix.slug }}.mlpackage
       - name: Run the decode benchmark through the real Core ML runtime
         working-directory: ${{ runner.temp }}

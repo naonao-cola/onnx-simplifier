@@ -257,6 +257,52 @@ only the weight constants' on-disk/in-graph representation does.
 baseline) so both the decode-tok/s effect and decode parity are measured on
 real hardware, not just argued for from the theoretical ceiling.
 
+### matmul-to-conv1x1 (`--matmul-to-conv`)
+
+Where `--quantize-weights` targets the bandwidth side of the ceiling,
+`--matmul-to-conv` targets the *compute* side -- the M4 ANE's compute array
+parallelizes over convolution output channels, and its native `matmul` path
+measures well below conv1x1's throughput on the same hardware (see
+"Theoretical ceiling" above: a single matmul reaches ~30% of the fp16
+ceiling; a conv1x1 chain reaches ~99%). `onnxsim/coreml_export.py`'s
+translator normally lowers every ONNX `MatMul` straight to MIL's `matmul`;
+this flag makes it lower a **linear-projection** `MatMul` -- `x [batch,
+sequence, C_in] @ w [C_in, C_out]` with a compile-time-constant 2-D `w`,
+exactly the shape every attention/MLP projection in a transformer decoder
+takes -- to a 1x1/pointwise `conv` instead (transpose to conv1d's `[n, C_in,
+L]` layout, `conv` with a reshaped/transposed weight, transpose back; see
+`convert_to_coreml`'s docstring for exactly which shapes qualify). Any
+`MatMul` that doesn't match that shape (a non-constant or non-2-D weight, or
+`x` of any rank other than 3 -- the real, non-linear-projection attention
+score/context matmuls in every decoder layer, which multiply two activations
+together) is left on the native `matmul` path.
+
+```bash
+python export_llm_to_coreml.py HuggingFaceTB/SmolLM2-135M-Instruct \
+    --max-context-length 512 --matmul-to-conv --output smollm2-conv.mlpackage
+```
+
+Validated so far only at the level this dev sandbox can reach: the rewrite
+is unit-tested for numeric correctness via MIL constant-folding
+(`tests/test_coreml_export.py`, since `conv` itself has no
+`value_inference` to fold through directly, the tests instead pull its
+already-foldable `transpose`/`const` inputs and apply conv1x1's documented
+semantics in plain numpy against the same `MatMul` reference), and a full
+real-model export (`HuggingFaceTB/SmolLM2-135M-Instruct`) converts cleanly
+with an unchanged I/O signature and file size, replacing all 168
+linear-projection matmuls with `conv` while correctly leaving the ~60
+genuine attention-score/context matmuls alone. What that validation
+*cannot* show, lacking macOS/real Core ML in this environment, is whether
+it actually helps decode tok/s at this pipeline's shapes -- the measurements
+this flag is based on come from deep, wide conv1x1 chains (32-64 layers,
+512-1024 channels), not the single-token decode steps this suite mostly
+runs, and per-token sequence length here is far smaller than what those
+measurements used. `coreml-integration.yml`'s `benchmark-decode-macos` job
+includes a `matmul_to_conv: "true"` matrix entry (same model as the
+unquantized baseline, decode parity included) specifically to get that
+answer on real hardware; default it on only once that comparison actually
+shows an improvement.
+
 ### Scaling to few-billion-parameter models
 
 DeviceMark's own leaderboard mostly tests models in the 1-4B range, well

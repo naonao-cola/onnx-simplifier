@@ -368,6 +368,148 @@ def test_zero_length_input_dimension_is_static():
 
 
 # ---------------------------------------------------------------------------
+# matmul_to_conv (opt-in: lower a linear-projection MatMul to conv1x1 -- see
+# convert_to_coreml's docstring and scripts/apple/README.md's "Theoretical
+# ceiling" section for why). MIL's `conv` has no `value_inference`, unlike
+# `matmul`/`transpose`/`const`, so `_mil_const_value` (which needs the whole
+# graph to constant-fold to a single value) can't check a conv1x1 output
+# directly. Instead these tests pull the `conv` op's own (constant-folded)
+# *inputs* -- which do fold, since they're `transpose`/`const` outputs -- and
+# apply conv1x1's documented semantics (K=1, stride=1, pad=valid: a per-position
+# linear map) in plain numpy, checked against the same MatMul reference the
+# rewrite is replacing.
+# ---------------------------------------------------------------------------
+
+
+def _build_ops(model: onnx.ModelProto, dynamic_shapes=None, matmul_to_conv=False):
+    """Like ``_mil_const_value``, but returns the built MIL function itself
+    (not just a folded output value) -- for inspecting *which* ops got
+    emitted, or reading an intermediate (not just the final output) value.
+    """
+    prog, flexible_inputs = coreml_export._build_mil_program(
+        model,
+        *coreml_export._import_mil(),
+        dynamic_shapes,
+        matmul_to_conv,
+    )
+    return prog.functions["main"], flexible_inputs
+
+
+def _matmul_projection_model(a: np.ndarray, w: np.ndarray) -> onnx.ModelProto:
+    """``out = a @ w`` with both as initializers -- the shape every
+    attention/MLP projection in a transformer decoder takes: ``a`` is
+    ``[batch, sequence, C_in]`` (rank 3), ``w`` is a constant ``[C_in, C_out]``.
+    """
+    n, s, c_in = a.shape
+    c_out = w.shape[1]
+    inits = [numpy_helper.from_array(a, name="a"), numpy_helper.from_array(w, name="w")]
+    model = _model(
+        f"mm () => (float[{n},{s},{c_out}] out) {{ out = MatMul (a, w) }}",
+        initializer=inits,
+    )
+    onnx.checker.check_model(model)
+    return model
+
+
+def test_matmul_to_conv_disabled_by_default():
+    a = np.random.RandomState(0).randn(1, 3, 4).astype(np.float32)
+    w = np.random.RandomState(1).randn(4, 5).astype(np.float32)
+    model = _matmul_projection_model(a, w)
+
+    func, _ = _build_ops(model)  # matmul_to_conv defaults to False
+    op_types = [op.op_type for op in func.operations]
+    assert "matmul" in op_types
+    assert "conv" not in op_types
+    np.testing.assert_allclose(np.asarray(func.outputs[0].val), a @ w, atol=1e-5)
+
+
+def test_matmul_to_conv_rewrites_rank3_constant_projection():
+    a = np.random.RandomState(0).randn(1, 3, 4).astype(np.float32)
+    w = np.random.RandomState(1).randn(4, 5).astype(np.float32)
+    model = _matmul_projection_model(a, w)
+
+    func, _ = _build_ops(model, matmul_to_conv=True)
+    op_types = [op.op_type for op in func.operations]
+    assert "conv" in op_types
+    assert "matmul" not in op_types
+
+    (conv_op,) = [op for op in func.operations if op.op_type == "conv"]
+    x_in, w_in = conv_op.inputs["x"], conv_op.inputs["weight"]
+    # x transposed to conv1d's [n, C_in, L] layout; weight reshaped from
+    # MatMul's [C_in, C_out] to conv's [C_out, C_in, K=1].
+    np.testing.assert_allclose(x_in.val, a.transpose(0, 2, 1))
+    np.testing.assert_allclose(w_in.val, w.T[:, :, None])
+
+    # conv1x1 (K=1, stride=1, pad=valid) is, by definition, a per-position
+    # linear map -- apply that directly and check it lines up with the plain
+    # MatMul it's replacing.
+    manual_conv_out = np.einsum("ncl,oc->nol", x_in.val, w_in.val[:, :, 0])
+    np.testing.assert_allclose(manual_conv_out.transpose(0, 2, 1), a @ w, atol=1e-5)
+
+
+def test_matmul_to_conv_falls_back_for_non_constant_weight():
+    # Same shapes as the rewritten case above, but `w` is a declared graph
+    # input (not an initializer) -- not compile-time-constant, so the
+    # translator must leave this on the matmul path even with
+    # matmul_to_conv=True.
+    a = numpy_helper.from_array(
+        np.random.RandomState(0).randn(1, 3, 4).astype(np.float32), name="a"
+    )
+    model = _model(
+        "mm (float[4,5] w) => (float[1,3,5] out) { out = MatMul (a, w) }",
+        initializer=[a],
+    )
+    onnx.checker.check_model(model)
+
+    func, _ = _build_ops(model, matmul_to_conv=True)
+    op_types = [op.op_type for op in func.operations]
+    assert "matmul" in op_types
+    assert "conv" not in op_types
+
+
+def test_matmul_to_conv_falls_back_for_rank2_input():
+    # Same constant-weight shape as the rewritten case, but `a` is rank 2 (no
+    # separate batch/sequence axes) -- only rank-3 x is handled (see
+    # _matmul_as_conv1x1's docstring), so this must still use matmul.
+    a = np.random.RandomState(0).randn(3, 4).astype(np.float32)
+    w = np.random.RandomState(1).randn(4, 5).astype(np.float32)
+    inits = [numpy_helper.from_array(a, name="a"), numpy_helper.from_array(w, name="w")]
+    model = _model(
+        "mm () => (float[3,5] out) { out = MatMul (a, w) }", initializer=inits
+    )
+    onnx.checker.check_model(model)
+
+    func, _ = _build_ops(model, matmul_to_conv=True)
+    op_types = [op.op_type for op in func.operations]
+    assert "matmul" in op_types
+    assert "conv" not in op_types
+    np.testing.assert_allclose(np.asarray(func.outputs[0].val), a @ w, atol=1e-5)
+
+
+def test_matmul_to_conv_composes_with_dynamic_sequence_length():
+    # The actual target shape this rewrite exists for: a rank-3 input whose
+    # middle (sequence) axis is dynamic, exactly like export_llm_to_coreml.py's
+    # KV-cache decoder graphs. `a` can't be an initializer here (dynamic_shapes
+    # only applies to declared graph inputs), so this only checks the program
+    # builds and emits `conv` -- not a folded numeric value.
+    w = numpy_helper.from_array(
+        np.random.RandomState(1).randn(4, 5).astype(np.float32), name="w"
+    )
+    model = _model(
+        "mm (float[1,seq,4] a) => (float[1,seq,5] out) { out = MatMul (a, w) }",
+        initializer=[w],
+    )
+    onnx.checker.check_model(model)
+
+    func, flexible_inputs = _build_ops(
+        model, dynamic_shapes={"seq": (1, 4, 16)}, matmul_to_conv=True
+    )
+    op_types = [op.op_type for op in func.operations]
+    assert "conv" in op_types
+    assert flexible_inputs is not None and len(flexible_inputs) == 1
+
+
+# ---------------------------------------------------------------------------
 # Dynamic shapes (opt-in flexible input dimensions, e.g. a growing KV cache)
 # ---------------------------------------------------------------------------
 

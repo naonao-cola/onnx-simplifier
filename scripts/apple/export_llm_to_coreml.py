@@ -69,6 +69,24 @@ targets for 4-bit weights); this script sets that automatically only for
 `int4`, since `int8`/`none` already work at whatever target
 `onnxsim.export_coreml` otherwise picks.
 
+`--matmul-to-conv` (default off) targets the *other* side of the ceiling --
+compute, not bandwidth -- for the cases where compute still matters (e.g.
+prefill's whole-prompt forward pass, or a bigger batch than this pipeline
+currently does). It lowers each attention/MLP projection's `MatMul` to a
+1x1/pointwise `conv` (`onnxsim.coreml_export`'s `matmul_to_conv`, see
+`onnxsim.export_coreml`'s docstring for exactly which shapes qualify): the
+Apple Neural Engine's compute array parallelizes over convolution output
+channels and its native matmul path measures well below conv1x1's throughput
+on the same hardware -- see README.md's "Theoretical ceiling" section for the
+measurements. This flag is a translator-level structural change (unlike
+`--quantize-weights`, it can in principle affect numeric behavior through a
+different-but-equivalent op sequence, though the underlying math is
+identical), and it has not been measured on real Core ML yet -- it exists so
+`coreml-integration.yml`'s `benchmark-decode-macos` job can actually measure
+whether it helps *this* pipeline's shapes (mostly single-token decode, unlike
+the deep/wide conv1x1 chains the cited measurements used) before anyone
+enables it by default.
+
 Usage:
     python export_llm_to_coreml.py HuggingFaceTB/SmolLM2-135M-Instruct \\
         --max-context-length 512 --output smollm2.mlpackage
@@ -109,6 +127,7 @@ def export_llm_to_coreml(
     convert_to: str = "mlprogram",
     dtype: str = "fp32",
     quantize_weights: str = "none",
+    matmul_to_conv: bool = False,
 ) -> None:
     from optimum.exporters.onnx import main_export
 
@@ -191,6 +210,7 @@ def export_llm_to_coreml(
                 "past_sequence_length": (0, 0, max_context_length - 1),
                 "past_sequence_length + sequence_length": (1, 1, max_context_length),
             },
+            "matmul_to_conv": matmul_to_conv,
         }
         if quantize_weights == "int4":
             # coremltools' linear_quantize_weights refuses int4 below iOS18
@@ -278,6 +298,15 @@ def main() -> int:
         "decode throughput at these model sizes, not compute precision. See the "
         "module docstring and README.md's 'Theoretical ceiling' section.",
     )
+    ap.add_argument(
+        "--matmul-to-conv",
+        action="store_true",
+        help="Lower each attention/MLP projection's MatMul to a 1x1/pointwise conv "
+        "instead of MIL's native matmul (default: off). The M4 ANE's compute array "
+        "parallelizes over convolution output channels; see README.md's 'Theoretical "
+        "ceiling' section for the measurements this is based on. Opt-in and "
+        "unvalidated on real hardware -- benchmark before trusting it.",
+    )
     args = ap.parse_args()
 
     export_llm_to_coreml(
@@ -288,6 +317,7 @@ def main() -> int:
         convert_to=args.convert_to,
         dtype=args.dtype,
         quantize_weights=args.quantize_weights,
+        matmul_to_conv=args.matmul_to_conv,
     )
     return 0
 
