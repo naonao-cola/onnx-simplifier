@@ -9274,7 +9274,21 @@ def apply_structured_pruning_qdq(
         w = _weight_ref_dequantized(p.ref)
         w_nk = _weight_to_nk(w, p.weight_transposed, p.is_conv)
         importance = _qdq_channel_importance(w_nk, importance_norm)
-        keep = np.sort(np.argsort(-importance)[:keep_count])
+        # `kind="stable"` matters here specifically (unlike most other
+        # argsort call sites in this module, which never feed into a
+        # block-alignment check): with an exactly-tied `importance` vector,
+        # an unstable sort's tie-break order is platform-dependent, and a
+        # reordered tie can select a keep-set that no longer aligns to a
+        # blockwise consumer's own block boundaries below -- flipping a
+        # would-have-been-aligned chain to "declined" nondeterministically
+        # (the same hazard confirmed empirically, on a real ARM CI runner,
+        # for the MatMulNBits family's own identical block-alignment
+        # pattern -- see that function's own comment on this same line). A
+        # stable sort preserves input (channel index) order for ties, so an
+        # all-tied producer's top-`keep_count` channels are always its
+        # first `keep_count` indices, deterministic across platforms, and
+        # matching this function's own `_analyze_*` dry-run mirror exactly.
+        keep = np.sort(np.argsort(-importance, kind="stable")[:keep_count])
 
         keep_blocks = None
         if c.ref.qdq_block is not None:
@@ -16444,7 +16458,12 @@ def _analyze_structured_pruning_qdq(
         w = _weight_ref_dequantized(p.ref)
         w_nk = _weight_to_nk(w, p.weight_transposed, p.is_conv)
         importance = _qdq_channel_importance(w_nk, importance_norm)
-        keep = np.sort(np.argsort(-importance)[:keep_count])
+        # `kind="stable"` to match `apply_structured_pruning_qdq`'s own
+        # tie-break exactly (see that function's own comment on this same
+        # line) -- otherwise an exactly-tied `importance` vector could make
+        # this dry-run mirror's block-alignment decision diverge from the
+        # real call's, platform-dependently.
+        keep = np.sort(np.argsort(-importance, kind="stable")[:keep_count])
 
         if c.ref.qdq_block is not None:
             keep_blocks = _qdq_block_aligned_keep_blocks(
