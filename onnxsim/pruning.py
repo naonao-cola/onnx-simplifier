@@ -16741,10 +16741,10 @@ class PruningLayerSensitivity:
             :func:`apply_qmoe_expert_channel_pruning`/
             :func:`apply_qmoe_whole_expert_pruning`; ``"matmul_nbits"`` for
             :func:`apply_structured_pruning_matmul_nbits` (a single string,
-            unlike the QDQ family's Conv/MatMul split --
-            `_find_matmul_nbits_chains` only ever matches
-            ``MatMulNBits``-to-``MatMulNBits`` chains, so there is no second
-            topology to distinguish);
+            unlike the QDQ family's Conv/MatMul split -- every matched chain
+            has at least one ``MatMulNBits`` side (the other optionally a
+            plain-float peer, see :class:`_PlainMatMulNBitsPeer`), but that
+            distinction isn't split into its own family string);
             ``"embedding_vocab_magnitude"`` for
             :func:`apply_embedding_vocab_magnitude_pruning`;
             ``"transformer_block"`` for
@@ -17626,21 +17626,26 @@ def _analyze_structured_pruning_matmul_nbits(
     importance_norm: _ImportanceNorm = "l2",
 ) -> PruningSensitivityReport:
     """Dry-run mirror of :func:`apply_structured_pruning_matmul_nbits` --
-    same matching (:func:`_find_matmul_nbits_chains`, which also accepts a
-    MIXED ``MatMulNBits``/plain-float chain as long as at least one side is
-    ``MatMulNBits``, per that function's own docstring), touched-role
-    bookkeeping (a chain sharing a weight -- on either side -- with an
-    earlier one in :func:`_find_matmul_nbits_chains`'s own return order is
-    reported `would_drop=0`/`margin=None`, exactly the "left completely
-    untouched" outcome the real call gives it too, not folded into
-    `not_eligible`), keep-count, and importance (:func:`_qdq_channel_importance`,
-    ranking the producer's own *dequantized* weight row --
+    same matching (:func:`_find_matmul_nbits_chains`, the
+    ``MatMulNBits``-to-``MatMulNBits``-only topology this family's own
+    section comment describes), touched-role bookkeeping (a chain sharing a
+    `B` weight -- on either side -- with an earlier one in
+    :func:`_find_matmul_nbits_chains`'s own return order is reported
+    `would_drop=0`/`margin=None`, exactly the "left completely untouched"
+    outcome the real call gives it too, not folded into `not_eligible`),
+    keep-count, and importance (:func:`_qdq_channel_importance`, ranking the
+    producer's own *dequantized-or-plain* weight row --
     :func:`_matmul_nbits_chain_producer_weight_nk`, the exact same helper
-    :func:`apply_structured_pruning_matmul_nbits` itself calls, never for the
-    actual int4-code rewrite) logic, reused directly, but `model` is never
-    mutated. `family` is always ``"matmul_nbits"`` -- unlike the QDQ
-    family's own Conv/MatMul split, :func:`_find_matmul_nbits_chains` has no
-    second topology to distinguish.
+    :func:`apply_structured_pruning_matmul_nbits` itself calls, never for
+    the actual int4-code rewrite) logic, reused directly, but `model` is
+    never mutated. Every matched chain has at least one ``MatMulNBits``
+    side; the other side may instead be a plain-float peer (see
+    :class:`_PlainMatMulNBitsPeer`) -- :func:`_matmul_nbits_chain_side_key`
+    dispatches on which, and a plain-float consumer skips the block-
+    alignment check below entirely (no block structure to align to,
+    mirroring the real call's own `isinstance` branch). `family` is always
+    ``"matmul_nbits"`` regardless -- unlike the QDQ family's own Conv/MatMul
+    split, that distinction isn't split into its own family string.
 
     A chain whose consumer is ``MatMulNBits`` and whose keep-set doesn't
     happen to align to that consumer's own `block_size` boundaries
@@ -17748,9 +17753,12 @@ def _analyze_structured_pruning_matmul_nbits(
                         importance_max=0.0,
                     )
                 )
-                continue  # non-block-aligned keep-set for this consumer -- the
-                # real call declines this chain entirely too, see this
+                continue  # non-block-aligned keep-set for this consumer --
+                # the real call declines this chain entirely too, see this
                 # function's own docstring
+        # else: a plain-float consumer has no block structure -- the real
+        # call applies any keep-set directly, see this function's own
+        # docstring.
 
         keep_mask = np.zeros(n, dtype=bool)
         keep_mask[keep] = True
