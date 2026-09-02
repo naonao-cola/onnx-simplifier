@@ -229,11 +229,14 @@ jobs:
       - name: Install onnxsim wheel + torch + onnx2torch
         run: |
           python -m pip install --upgrade pip
-          # --index-url replaces the default PyPI index rather than adding to
-          # it, so pytest/onnx2torch (not hosted on PyTorch's CPU wheel index)
-          # must be installed separately, not on the same command line.
-          python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
-          python -m pip install pytest onnx2torch
+          # torch and torchvision must be installed together from the CPU-only
+          # wheel index so they're a matched build (mismatched ABIs raise
+          # "operator torchvision::nms does not exist" on import). onnx2torch
+          # depends on both; --no-deps keeps its install from re-resolving
+          # torchvision off the default index and clobbering that pairing.
+          python -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install pytest onnx
+          python -m pip install --no-deps onnx2torch
           python -m pip install wheelhouse/*.whl
       - name: Verify the installed wheel is used (not the source tree)
         working-directory: ${{ runner.temp }}
