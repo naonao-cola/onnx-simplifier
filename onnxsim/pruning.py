@@ -9509,7 +9509,21 @@ def apply_structured_pruning_matmul_nbits(
 
         w_nk = _matmul_nbits_dequantized(p)
         importance = _qdq_channel_importance(w_nk, importance_norm)
-        keep = np.sort(np.argsort(-importance)[:keep_count])
+        # `kind="stable"` matters here specifically (unlike most other
+        # argsort call sites in this module, which never feed into a
+        # block-alignment check): with an exactly-tied `importance` vector,
+        # an unstable sort's tie-break order is platform-dependent
+        # (confirmed: reordered on an ARM CI runner vs. x86_64), and a
+        # reordered tie can select a keep-set that no longer aligns to the
+        # consumer's own block boundaries below -- flipping a
+        # would-have-been-aligned chain to "declined" nondeterministically,
+        # and diverging from this section's own `_analyze_*` dry-run mirror
+        # (which must make the identical selection for its predictions to
+        # stay trustworthy). A stable sort preserves input (channel index)
+        # order for ties, so an all-tied producer's top-`keep_count`
+        # channels are always its first `keep_count` indices, deterministic
+        # across platforms.
+        keep = np.sort(np.argsort(-importance, kind="stable")[:keep_count])
 
         keep_blocks = _matmul_nbits_block_aligned_keep_blocks(
             keep, c.k_blocks, c.block_size
@@ -16122,7 +16136,12 @@ def _analyze_structured_pruning_matmul_nbits(
 
         w_nk = _matmul_nbits_dequantized(p)
         importance = _qdq_channel_importance(w_nk, importance_norm)
-        keep = np.sort(np.argsort(-importance)[:keep_count])
+        # `kind="stable"` to match `apply_structured_pruning_matmul_nbits`'s
+        # own tie-break exactly (see that function's own comment on this
+        # same line) -- otherwise an exactly-tied `importance` vector could
+        # make this dry-run mirror's block-alignment decision diverge from
+        # the real call's, platform-dependently.
+        keep = np.sort(np.argsort(-importance, kind="stable")[:keep_count])
 
         keep_blocks = _matmul_nbits_block_aligned_keep_blocks(
             keep, c.k_blocks, c.block_size
