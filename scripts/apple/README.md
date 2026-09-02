@@ -351,6 +351,59 @@ quantized, rather than the two costs just adding. Reinforces the same
 conclusion from the solo measurement above: `--matmul-to-conv` isn't worth
 enabling for this pipeline's shapes, combined with int8 or otherwise.
 
+### Compute-unit device placement (`coreml_compute_plan_trace.m`)
+
+`--matmul-to-conv`'s standalone measurement above raised an obvious
+follow-up: was the slowdown because `matmul` and `conv` land on different
+Core ML compute units (CPU/GPU/ANE), or is something else going on?
+`run_llm_decode_benchmark.py`/`coreml_backend.py` only ever call
+`.predict()` with `MLComputeUnits=ALL` and report aggregate tok/s + RSS --
+no per-op visibility into which unit actually ran anything.
+
+`coreml_compute_plan_trace.m` closes that gap using `MLComputePlan`
+(macOS 14+), the Core ML framework's own static analysis API: given a
+*compiled* model (`xcrun coremlcompiler compile model.mlpackage <dir>`
+first -- `MLComputePlan` doesn't load `.mlpackage` directly), it walks
+every operation in the ML Program (`onnxsim/coreml_export.py`'s
+`convert_to="mlprogram"` default -- the only format this tool supports)
+and asks the framework for each op's preferred compute device and
+estimated relative cost, **without running the model**. Output is Chrome
+Trace Event Format JSON (openable at `chrome://tracing` or
+https://ui.perfetto.dev) -- one timeline lane per device, so which ops
+landed where is visible at a glance instead of read off a text dump.
+
+**This is a static estimate, not a measurement**: `dur` in the emitted
+trace is `MLComputePlanCost`'s `weight` (a relative-cost fraction) scaled
+by 1e6 purely so a trace viewer renders something legible, not
+microseconds from an actual `.predict()` call. Real per-op wall-clock
+timing would need Instruments' Core ML template
+(`xcrun xctrace record --template "Core ML"`) attached to a live
+prediction run instead -- a far less tractable trace format to parse than
+`MLComputePlan`'s structured API, so out of scope here. What this tool
+answers is narrower and cheaper: which compute unit does Core ML's own
+placement logic *prefer* for each op, before spending any time actually
+running it.
+
+```bash
+clang -O2 -o coreml_compute_plan_trace coreml_compute_plan_trace.m \
+    -framework CoreML -framework Foundation
+xcrun coremlcompiler compile model.mlpackage compiled
+./coreml_compute_plan_trace compiled/model.mlmodelc out.json
+```
+
+Plain C/Objective-C compiled with plain `clang` (matching the pattern in
+[freedomtan/coreml_modelc_profling](https://github.com/freedomtan/coreml_modelc_profling),
+whose `MLComputePlan` API calls this file's traversal is adapted from) --
+no Xcode project, no Swift toolchain. Unlike everything else in
+`scripts/apple`, this file couldn't be validated at all before landing in
+CI (no macOS/Core ML in any environment developing this repo, and no way
+to even syntax-check Objective-C against the real `CoreML.framework`
+headers) -- `coreml-integration.yml`'s `benchmark-decode-macos` job is the
+first place it actually compiles and runs, specifically against the
+`smollm2-135m` / `smollm2-135m-conv` matrix entries (the plain-matmul vs.
+matmul-to-conv comparison this tool exists to explain), uploading each
+trace as a workflow artifact.
+
 ### Quality and retention eval (`run_quality_eval.py` / `compute_retention.py`)
 
 The decode benchmark and parity check above measure speed and short-generation
@@ -452,6 +505,39 @@ python export_llm_to_coreml.py HuggingFaceTB/SmolLM2-135M-Instruct \
 python run_llm_decode_benchmark.py smollm2.mlpackage \
     --prompt "The capital of France is" --max-new-tokens 20
 ```
+
+**Measured on real Core ML** (`benchmark-decode-macos`'s widened matrix,
+5-token prompt, macOS GitHub-hosted runner -- see
+`prepare_benchmark_models.py`'s `BENCHMARK_MODELS` for the full notes per
+model):
+
+| Model | Params | decode tok/s | prefill | peak RSS | parity |
+|---|---|---|---|---|---|
+| SmolLM2-135M-Instruct | 0.1B | 3.6 | 1.0s | 0.8GB | 20% (fp16-vs-fp32, see "Decode parity" above) |
+| Llama-3.2-1B-Instruct | 1B | 1.76 | 11.3s | 3.1GB | 100% OK |
+| Qwen2.5-1.5B-Instruct | 1.5B | 1.76 | 9.5s | 3.9GB | 30% FAIL |
+| SmolLM2-1.7B-Instruct | 1.7B | 2.11 | 7.5s | 4.0GB | 66.7% FAIL |
+| Qwen2.5-3B-Instruct | 3B | 0.04 | 30.2s | 5.6GB | not measured |
+| Llama-3.2-3B-Instruct | 3B | export fails (disk space, see `BENCHMARK_MODELS`) | | | |
+| Phi-3.5-mini-instruct | 3.8B | export fixed, not yet re-benchmarked | | | |
+
+Decode tok/s does **not** scale smoothly with parameter count on this
+runner class: Qwen2.5-3B-Instruct's 0.04 tok/s is a ~50x cliff from the
+1.7B model's 2.11, not the ~2x the weight-size ratio alone would predict
+(bandwidth-bound reasoning per the "Theoretical ceiling" section above
+would suggest roughly linear scaling with weight bytes) -- peak RSS
+approaching the runner's likely memory ceiling at that tier is the leading
+suspect, but this wasn't isolated; treat it as a real, measured number and
+not yet a fully explained one. `SmolLM2-135M-Instruct`'s parity failure is
+the fp16-Core-ML-vs-fp32-HF-reference divergence the "Decode parity"
+section above already explains (different generated content after the
+first mismatch, not a stopping-point difference). `SmolLM2-1.7B-Instruct`'s
+is a different failure mode: the tokens it generated *agree* with the HF
+reference everywhere the reference has tokens to compare -- Core ML just
+kept generating past where the 3-token HF reference stopped
+(`'Paris.\nThe capital of France is Paris...'` looping), a
+greedy-decoding/EOS-handling difference at this size, not yet root-caused,
+rather than a translator correctness bug.
 
 ### Benchmarking a real model suite (`prepare_benchmark_models.py`)
 

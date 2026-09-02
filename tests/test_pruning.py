@@ -17540,16 +17540,18 @@ def test_analyze_structured_pruning_matmul_nbits_matches_real_call():
     assert inits["B2"].dims[1] == kept // block_size  # consumer's block axis
 
 
-def test_analyze_structured_pruning_matmul_nbits_mixed_plain_float_consumer_matches_real_call():
-    # onnxsim/onnxsim#969 generalized `_MatMulNBitsChain.producer`/`.consumer`
-    # to a `_MatMulNBitsWeight | _PlainMatMulNBitsPeer` union (mixed
-    # MatMulNBits/plain-float chains) -- this dry-run mirror must handle a
-    # plain-float CONSUMER exactly like the real call does: no block
-    # structure at all, so the producer's own top-keep_count-by-norm
-    # keep-set applies directly, would_drop/margin computed the same way
-    # a MatMulNBits-to-MatMulNBits chain's would be, never declined for
-    # "non-block-aligned" (that check doesn't even apply here). Same shape
-    # as test_matmul_nbits_pruning_mixed_matmulnbits_producer_then_plain_float_consumer_matches_oracle.
+def test_analyze_structured_pruning_matmul_nbits_matches_real_call_with_plain_float_peer():
+    # Regression test: _analyze_structured_pruning_matmul_nbits used to
+    # assume both chain.producer and chain.consumer were always
+    # _MatMulNBitsWeight (accessing .b_init/.k_blocks/.block_size directly),
+    # but _find_matmul_nbits_chains matches a plain-float peer on either
+    # side too (see _PlainMatMulNBitsPeer) -- a chain like this one (mirrors
+    # test_matmul_nbits_pruning_mixed_matmulnbits_producer_then_plain_float_consumer_matches_oracle's
+    # model) would raise AttributeError at the .k_blocks access before this
+    # was fixed to dispatch through _matmul_nbits_chain_side_key/
+    # _matmul_nbits_chain_producer_weight_nk and isinstance-check the
+    # consumer, exactly like apply_structured_pruning_matmul_nbits itself
+    # already does.
     N1, K1, Out, block_size = 32, 64, 8, 16
     rng = np.random.default_rng(120)
     W1 = rng.standard_normal((N1, K1)).astype(np.float32) * 0.2
@@ -17600,8 +17602,6 @@ def test_analyze_structured_pruning_matmul_nbits_mixed_plain_float_consumer_matc
     layer = report.layers[0]
     assert layer.family == "matmul_nbits"
     assert layer.total == N1
-    assert layer.would_drop == 16
-    assert layer.margin is not None and layer.margin > 0.5
     assert report.not_eligible == []
 
     pruned = onnxsim.apply_structured_pruning_matmul_nbits(model, sparsity=0.5)

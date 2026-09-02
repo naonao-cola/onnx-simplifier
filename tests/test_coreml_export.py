@@ -200,6 +200,22 @@ def test_slice_negative_step_reverses_full_axis():
     np.testing.assert_array_equal(_mil_const_value(model), [4, 3, 2, 1, 0])
 
 
+def test_greater_matches_numpy():
+    # Found via microsoft/Phi-3.5-mini-instruct: its rotary embedding's
+    # long/short rope_theta scaling selection uses ONNX Greater, which had no
+    # handler (Equal and LessOrEqual were already supported, Greater wasn't).
+    a = np.array([1.0, 2.0, 3.0], np.float32)
+    b = np.array([2.0, 2.0, 2.0], np.float32)
+    model = _model(
+        "greater () => (bool[3] out) { out = Greater (a, b) }",
+        initializer=[
+            numpy_helper.from_array(a, name="a"),
+            numpy_helper.from_array(b, name="b"),
+        ],
+    )
+    np.testing.assert_array_equal(_mil_const_value(model), a > b)
+
+
 def test_gemm_alpha_beta_transb_matches_onnxruntime():
     rng = np.random.RandomState(0)
     a = rng.randn(3, 4).astype(np.float32)
