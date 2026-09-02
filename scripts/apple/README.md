@@ -110,12 +110,23 @@ methodology.
   Core ML's runtime lives); the export step itself needs no Apple hardware.
 
 `coreml-integration.yml`'s `benchmark-decode-macos` job runs this exact pair
-end-to-end on a macOS GitHub-hosted runner, over a small matrix
-(`HuggingFaceTB/SmolLM2-135M-Instruct` and `Qwen/Qwen2.5-1.5B-Instruct` --
-the two architecture families already validated by
-`prepare_benchmark_models.py`, so a translator regression specific to one
-doesn't hide behind the other passing), posting each model's numbers to that
-run's job summary -- `workflow_dispatch`/schedule-only, like the other
+end-to-end on a macOS GitHub-hosted runner, over a matrix spanning the
+smoke-test tier (`HuggingFaceTB/SmolLM2-135M-Instruct`, plus its
+`--quantize-weights`/`--matmul-to-conv` variants -- see below) and the
+few-billion-parameter tier DeviceMark's own leaderboard actually tests
+(`HuggingFaceTB/SmolLM2-1.7B-Instruct`, `Qwen/Qwen2.5-1.5B-Instruct`,
+`Qwen/Qwen2.5-3B-Instruct`, `meta-llama/Llama-3.2-1B-Instruct`,
+`meta-llama/Llama-3.2-3B-Instruct`, `microsoft/Phi-3.5-mini-instruct`) --
+multiple architecture families (Llama-style, Qwen2, Phi-3's fused
+`qkv_proj`/`gate_up_proj` projections) so a translator regression specific
+to one doesn't hide behind another passing. The `Llama-3.2-*` entries are
+gated (need `HF_TOKEN`, same read-only CI secret
+`prepare_benchmark_models.py` already uses); `Qwen2.5-3B-Instruct` and
+`Llama-3.2-3B-Instruct` previously OOM'd during ONNX export/trace in a
+15GB-RAM dev sandbox (see `prepare_benchmark_models.py`'s `BENCHMARK_MODELS`
+notes) -- not a translator issue, but untested on the CI runner's own
+memory until this matrix actually runs them. Posts each model's numbers to
+that run's job summary -- `workflow_dispatch`/schedule-only, like the other
 real-model jobs in that workflow, not on every PR.
 
 ### Theoretical ceiling

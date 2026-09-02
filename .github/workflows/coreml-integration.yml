@@ -46,16 +46,18 @@ name: Core ML Integration
 # job in this workflow only checks that a graph *converts*; this is the one place
 # the decode benchmark and parity harnesses themselves actually execute anywhere,
 # since no environment developing this repo has a macOS/Core ML runtime to run
-# them in locally. The matrix spans two already-validated architecture families
-# (Llama-style via SmolLM2, Qwen2) so a translator regression specific to one
-# doesn't hide behind the other passing, plus a third entry re-running SmolLM2
-# with --quantize-weights int8 (scripts/apple/export_llm_to_coreml.py) so the
-# weight-only-quantization decode speedup and decode parity are both measured
-# on real hardware, not just asserted -- plus a fourth entry with
-# --matmul-to-conv instead, targeting the compute (not bandwidth) side of the
-# same theoretical-ceiling analysis (see scripts/apple/README.md). This is the
-# only place either flag's actual effect on decode tok/s gets measured, since
-# no environment developing this repo has real Core ML to run it on. Also
+# them in locally. The matrix spans multiple architecture families (Llama-style
+# via SmolLM2/Llama-3.2, Qwen2, Phi-3's fused qkv_proj/gate_up_proj) so a
+# translator regression specific to one doesn't hide behind another passing,
+# across both the smoke-test tier (SmolLM2-135M, plus --quantize-weights int8
+# and --matmul-to-conv variants of it -- see scripts/apple/README.md's
+# "Theoretical ceiling" and "matmul-to-conv1x1" sections for what those
+# measured; --matmul-to-conv stays off by default, measured slower not
+# faster here) and the few-billion-parameter tier DeviceMark's own
+# leaderboard actually tests (https://devicemark.github.io/, roughly 1-4B --
+# SmolLM2-1.7B, Qwen2.5-3B, Llama-3.2-1B/3B, Phi-3.5-mini). This is the one
+# place any of this actually executes anywhere, since no environment
+# developing this repo has real Core ML to run it on. Also
 # workflow_dispatch/schedule-only, matching the other real-model jobs.
 #
 # A fifth job -- `quality-eval-macos` -- is the first slice of
@@ -302,6 +304,55 @@ jobs:
             dtype: fp32
             quantize_weights: int8
             matmul_to_conv: "true"
+          # Few-billion-parameter tier -- DeviceMark's own leaderboard weight
+          # class (https://devicemark.github.io/, roughly 1-4B), and the
+          # entries prepare_benchmark_models.py's BENCHMARK_MODELS already
+          # lists but this job didn't yet run real decode benchmark/parity
+          # against. SmolLM2-1.7B and Llama-3.2-1B are already validated for
+          # export+convert; Qwen2.5-3B and Llama-3.2-3B previously OOM'd
+          # during ONNX export/trace in a 15GB-RAM dev sandbox (not a
+          # translator issue -- see BENCHMARK_MODELS' notes), so this is
+          # also the first real test of whether this runner's memory clears
+          # that bar. Phi-3.5-mini is a structurally different graph shape
+          # (fused qkv_proj/gate_up_proj projections) than the Llama/Qwen2
+          # entries above, so it's new translator coverage regardless of the
+          # speed number. The Llama-3.2 entries are gated -- HF_TOKEN below,
+          # same read-only secret export-benchmark-models already uses.
+          - model_id: HuggingFaceTB/SmolLM2-1.7B-Instruct
+            slug: smollm2-1.7b
+            max_context_length: 512
+            dtype: fp16
+            quantize_weights: none
+            matmul_to_conv: "false"
+          - model_id: meta-llama/Llama-3.2-1B-Instruct
+            slug: llama-3.2-1b
+            max_context_length: 512
+            dtype: fp16
+            quantize_weights: none
+            matmul_to_conv: "false"
+          - model_id: meta-llama/Llama-3.2-3B-Instruct
+            slug: llama-3.2-3b
+            max_context_length: 512
+            dtype: fp16
+            quantize_weights: none
+            matmul_to_conv: "false"
+          - model_id: Qwen/Qwen2.5-3B-Instruct
+            slug: qwen2.5-3b
+            max_context_length: 512
+            dtype: fp16
+            quantize_weights: none
+            matmul_to_conv: "false"
+          - model_id: microsoft/Phi-3.5-mini-instruct
+            slug: phi-3.5-mini
+            max_context_length: 512
+            dtype: fp16
+            quantize_weights: none
+            matmul_to_conv: "false"
+    env:
+      # Read-only secret; only meta-llama/Llama-3.2-*-Instruct entries above
+      # need it (gated -- see prepare_benchmark_models.py's module
+      # docstring). Harmless to set for every matrix entry.
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
