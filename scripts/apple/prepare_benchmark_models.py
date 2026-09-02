@@ -85,56 +85,80 @@ BENCHMARK_MODELS: list[BenchmarkModel] = [
         "HuggingFaceTB/SmolLM2-1.7B-Instruct",
         512,
         "fp16",
-        "Validated end-to-end (export + convert; on-device predict not yet run in CI).",
+        "Validated end-to-end incl. real on-device predict (coreml-integration's "
+        "benchmark-decode-macos): 2.11 decode tok/s, 7.5s prefill (5 tokens), 4.0GB peak "
+        "RSS. Decode parity FAILed (66.7% agreement) -- Core ML kept repeating the answer "
+        "('Paris.\\nThe capital of France is Paris...') past where the HF reference "
+        "stopped after 3 tokens; looks like an EOS/stopping-condition difference at this "
+        "size rather than a translator correctness bug (the tokens generated do match "
+        "where they overlap), not yet root-caused.",
     ),
     BenchmarkModel(
         "Qwen/Qwen2.5-1.5B-Instruct",
         512,
         "fp16",
-        "Validated end-to-end (export + convert; on-device predict not yet run in CI). "
-        "First Qwen2-architecture model exercised -- confirms the translator isn't "
-        "Llama-specific (QKV projection bias, different rope_theta, GQA).",
+        "Validated end-to-end incl. real on-device predict (coreml-integration's "
+        "benchmark-decode-macos, part of the default matrix): 1.76 decode tok/s, 9.5s "
+        "prefill (5 tokens), 3.9GB peak RSS. Decode parity FAILed (30% agreement, "
+        "diverging after the shared 'Paris.' opening) -- same "
+        "fp16-Core-ML-vs-fp32-HF-reference divergence class the 'Decode parity' section "
+        "above describes for SmolLM2-135M, not yet confirmed but the most likely "
+        "explanation given the failure looks the same shape. First Qwen2-architecture "
+        "model exercised -- confirms the translator isn't Llama-specific (QKV projection "
+        "bias, different rope_theta, GQA).",
     ),
     BenchmarkModel(
         "Qwen/Qwen2.5-3B-Instruct",
         512,
         "fp16",
-        "Attempted but OOM-killed (~13.9GB anon-rss) during the ONNX export/trace step "
-        "itself, even with --dtype fp16, in a 15GB-RAM dev sandbox -- one tier up from "
-        "Qwen2.5-1.5B-Instruct's ~1.5x smaller weights, which fit comfortably. Not a "
-        "translator issue (never reached Core ML conversion); needs a machine with more "
-        "headroom than that sandbox had. Same architecture as the validated 1.5B model, "
-        "so expected to convert given enough memory.",
+        "Export/convert succeeds on a macOS CI runner (the ~13.9GB anon-rss OOM this "
+        "note used to describe was specific to a 15GB-RAM dev sandbox, not this "
+        "architecture/size in general). Real on-device predict measured: 0.04 decode "
+        "tok/s (~23.6s/token), 30.2s prefill (5 tokens), 5.6GB peak RSS -- a roughly "
+        "50x cliff from the 1.5B model's throughput, not just the ~2x weight-size ratio "
+        "would suggest, and decode parity didn't finish measuring (the CI run that "
+        "produced this was cancelled by a concurrent push mid-parity-check, after the "
+        "decode benchmark itself completed) -- unclear yet whether this tier is "
+        "genuinely unusable on this runner class or something else is going wrong; "
+        "worth a dedicated re-run before drawing conclusions.",
     ),
     BenchmarkModel(
         "microsoft/Phi-3.5-mini-instruct",
         512,
         "fp16",
-        "Not yet exercised -- at 3.8B params, larger than Qwen2.5-3B-Instruct (which "
-        "already OOM'd during export in a 15GB-RAM sandbox, see its entry above), so "
-        "expected to hit the same memory ceiling there. Phi-3's fused qkv_proj/gate_up_proj "
-        "projections (one big MatMul + Split, instead of separate q/k/v or gate/up "
-        "projections) are a structurally different graph shape from Llama/Qwen2's separate "
-        "projections, though built from ops (MatMul, Split) this translator already supports.",
+        "Export previously failed -- not memory, but a genuine translator gap: its "
+        "rotary embedding's long/short rope_theta scaling selection uses ONNX Greater, "
+        "which onnxsim/coreml_export.py had no handler for (Equal/LessOrEqual were "
+        "already supported, Greater wasn't). Fixed (see coreml_export.py's Greater "
+        "entry and test_greater_matches_numpy) -- not yet re-run against real Core ML "
+        "to get decode numbers. Phi-3's fused qkv_proj/gate_up_proj projections (one "
+        "big MatMul + Split, instead of separate q/k/v or gate/up projections) are a "
+        "structurally different graph shape from Llama/Qwen2's separate projections, "
+        "now confirmed to convert once the missing op was added.",
     ),
     BenchmarkModel(
         "meta-llama/Llama-3.2-1B-Instruct",
         512,
         "fp16",
-        "Gated -- needs HF_TOKEN (see the module docstring). Validated end-to-end "
-        "(export + convert) via the export-benchmark-models CI job once access was "
-        "granted; on-device predict not yet run. Confirms the gate only blocked the "
-        "download -- the graph converts exactly like the already-validated Llama "
-        "architecture (SmolLM2) once fetched.",
+        "Gated -- needs HF_TOKEN (see the module docstring). Validated end-to-end incl. "
+        "real on-device predict: 1.76 decode tok/s, 11.3s prefill (6 tokens), 3.1GB peak "
+        "RSS, 100% decode parity agreement with the HF reference. Confirms the gate only "
+        "blocked the download -- the graph converts and runs exactly like the "
+        "already-validated Llama architecture (SmolLM2) once fetched.",
     ),
     BenchmarkModel(
         "meta-llama/Llama-3.2-3B-Instruct",
         512,
         "fp16",
-        "Gated -- needs HF_TOKEN (see the module docstring). Not yet exercised -- at "
-        "~3B params, expected to hit the same export-time memory ceiling "
-        "Qwen2.5-3B-Instruct did in a 15GB-RAM sandbox (see its entry above); the "
-        "gate itself is no longer a blocker (Llama-3.2-1B-Instruct is validated).",
+        "Gated -- needs HF_TOKEN (see the module docstring). Export/convert fails on a "
+        "macOS CI runner, but not from memory as this note used to predict -- disk "
+        "space: 'No space left on device' writing the final .mlpackage's weights, mid "
+        "Core ML packaging. At this size, the HF checkpoint download, the ONNX export's "
+        "external-data file, the final .mlpackage, and a transient copy Core ML's own "
+        "packaging step makes can together exceed a standard hosted macOS runner's disk "
+        "budget even though each individually would fit. Not a code bug in this "
+        "pipeline; not yet addressed (would need aggressive intermediate cleanup between "
+        "export stages, unvalidated without macOS to test it against).",
     ),
 ]
 

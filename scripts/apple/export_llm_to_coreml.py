@@ -46,6 +46,47 @@ the in-progress ONNX graph can hold more than one full-size copy of the
 model's weights at once (well over the model's own on-disk size); `--dtype
 fp16` roughly halves that peak.
 
+`--quantize-weights` (default `none`) applies
+`coremltools.optimize.coreml.linear_quantize_weights` to the *converted*
+Core ML model, replacing each weight `const` with
+`constexpr_affine_dequantize`/`constexpr_blockwise_shift_scale` (int8 or
+int4, per-channel, dequantized to float on the fly at compute time). See
+README.md's "Theoretical ceiling" section for why this is the lever worth
+pulling for *decode* specifically: a single-token decode step is
+memory-bandwidth-bound (the compute per token is tiny; the entire weight
+set has to be read from DRAM once per token regardless, since nothing
+amortizes that read across tokens at batch size 1), so halving weight
+bytes is a direct, roughly-proportional lever on decode tok/s -- unlike
+Core ML's packed W8A8 *compute* path (int8 weights **and** activations, up
+to ~2x compute throughput on the M4 ANE), which this flag does not use:
+weight-only quantization keeps activations and compute in float, so it
+doesn't touch the compute-bound side of the ceiling at all, only the
+bandwidth-bound side that actually matters for decode at these model
+sizes. Applied after conversion (not baked into the ONNX graph), so it's
+independent of `--dtype`, which only controls tracing/export precision.
+`int4` needs `minimum_deployment_target=iOS18` (coremltools refuses lower
+targets for 4-bit weights); this script sets that automatically only for
+`int4`, since `int8`/`none` already work at whatever target
+`onnxsim.export_coreml` otherwise picks.
+
+`--matmul-to-conv` (default off) targets the *other* side of the ceiling --
+compute, not bandwidth -- for the cases where compute still matters (e.g.
+prefill's whole-prompt forward pass, or a bigger batch than this pipeline
+currently does). It lowers each attention/MLP projection's `MatMul` to a
+1x1/pointwise `conv` (`onnxsim.coreml_export`'s `matmul_to_conv`, see
+`onnxsim.export_coreml`'s docstring for exactly which shapes qualify): the
+Apple Neural Engine's compute array parallelizes over convolution output
+channels and its native matmul path measures well below conv1x1's throughput
+on the same hardware -- see README.md's "Theoretical ceiling" section for the
+measurements. This flag is a translator-level structural change (unlike
+`--quantize-weights`, it can in principle affect numeric behavior through a
+different-but-equivalent op sequence, though the underlying math is
+identical), and it has not been measured on real Core ML yet -- it exists so
+`coreml-integration.yml`'s `benchmark-decode-macos` job can actually measure
+whether it helps *this* pipeline's shapes (mostly single-token decode, unlike
+the deep/wide conv1x1 chains the cited measurements used) before anyone
+enables it by default.
+
 Usage:
     python export_llm_to_coreml.py HuggingFaceTB/SmolLM2-135M-Instruct \\
         --max-context-length 512 --output smollm2.mlpackage
@@ -85,6 +126,8 @@ def export_llm_to_coreml(
     opset: int = 17,
     convert_to: str = "mlprogram",
     dtype: str = "fp32",
+    quantize_weights: str = "none",
+    matmul_to_conv: bool = False,
 ) -> None:
     from optimum.exporters.onnx import main_export
 
@@ -156,16 +199,44 @@ def export_llm_to_coreml(
         print(f"  {num_nodes_before} -> {len(simplified.graph.node)} nodes", flush=True)
 
         print(f"Converting to Core ML ({convert_to}), dynamic KV cache...", flush=True)
-        onnxsim.export_coreml(
-            simplified,
-            output_path,
-            convert_to=convert_to,
-            dynamic_shapes={
+        # Captured (not saved directly to output_path) so --quantize-weights can
+        # compress it in place first; export_coreml() returns the MLModel either
+        # way (see its docstring), so this doesn't change behavior when
+        # quantize_weights="none".
+        convert_kwargs = {
+            "convert_to": convert_to,
+            "dynamic_shapes": {
                 "sequence_length": (1, 1, max_context_length),
                 "past_sequence_length": (0, 0, max_context_length - 1),
                 "past_sequence_length + sequence_length": (1, 1, max_context_length),
             },
-        )
+            "matmul_to_conv": matmul_to_conv,
+        }
+        if quantize_weights == "int4":
+            # coremltools' linear_quantize_weights refuses int4 below iOS18
+            # ("The 4-bit quantization is supported since iOS18") -- int8 and
+            # "none" work fine at whatever target onnxsim.export_coreml picks by
+            # default (already high enough for the dynamic-shape RangeDim inputs
+            # this export needs), so this bump is scoped to int4 only.
+            convert_kwargs["minimum_deployment_target"] = "iOS18"
+        mlmodel = onnxsim.export_coreml(simplified, **convert_kwargs)
+
+        if quantize_weights != "none":
+            print(
+                f"Quantizing weights ({quantize_weights}, per-channel)...", flush=True
+            )
+            import coremltools.optimize.coreml as cto
+
+            config = cto.OptimizationConfig(
+                global_config=cto.OpLinearQuantizerConfig(
+                    mode="linear_symmetric",
+                    dtype=quantize_weights,
+                    granularity="per_channel",
+                )
+            )
+            mlmodel = cto.linear_quantize_weights(mlmodel, config)
+
+        mlmodel.save(output_path)
 
         # Carry the tokenizer along so run_llm_decode_benchmark.py can load
         # everything it needs from `output_path`'s sibling files.
@@ -176,6 +247,17 @@ def export_llm_to_coreml(
             "special_tokens_map.json",
             "vocab.json",
             "merges.txt",
+            # Recent transformers releases store a chat model's chat template
+            # as this standalone file rather than (or in addition to)
+            # tokenizer_config.json's own inline "chat_template" key --
+            # dropping it here left AutoTokenizer.from_pretrained(out_dir)
+            # loading successfully but with no chat template at all, only
+            # surfacing later as "tokenizer.chat_template is not set" from
+            # lm_eval_coreml_adapter.py's apply_chat_template (used by
+            # run_quality_eval.py --apply-chat-template, not by
+            # run_llm_decode_benchmark.py/check_decode_parity.py, which
+            # build prompts without a chat template).
+            "chat_template.jinja",
         ):
             src = Path(tmpdir) / name
             if src.is_file():
@@ -218,6 +300,24 @@ def main() -> int:
         "fp16 for multi-billion-parameter models where tracing in float32 risks "
         "running out of memory (see the module docstring).",
     )
+    ap.add_argument(
+        "--quantize-weights",
+        choices=["none", "int8", "int4"],
+        default="none",
+        help="Weight-only post-conversion quantization (default: none). Reduces "
+        "weight bytes read from DRAM per decode step -- the lever that matters for "
+        "decode throughput at these model sizes, not compute precision. See the "
+        "module docstring and README.md's 'Theoretical ceiling' section.",
+    )
+    ap.add_argument(
+        "--matmul-to-conv",
+        action="store_true",
+        help="Lower each attention/MLP projection's MatMul to a 1x1/pointwise conv "
+        "instead of MIL's native matmul (default: off). The M4 ANE's compute array "
+        "parallelizes over convolution output channels; see README.md's 'Theoretical "
+        "ceiling' section for the measurements this is based on. Opt-in and "
+        "unvalidated on real hardware -- benchmark before trusting it.",
+    )
     args = ap.parse_args()
 
     export_llm_to_coreml(
@@ -227,6 +327,8 @@ def main() -> int:
         opset=args.opset,
         convert_to=args.convert_to,
         dtype=args.dtype,
+        quantize_weights=args.quantize_weights,
+        matmul_to_conv=args.matmul_to_conv,
     )
     return 0
 

@@ -66,6 +66,24 @@ class CoreMLLM(LM):
         self.decoder = CoreMLDecoder(pretrained, compute_units=compute_units)
         self.default_max_gen_toks = max_gen_toks
 
+    @property
+    def tokenizer_name(self) -> str:
+        """Fingerprint for lm_eval's request cache, used only with --apply-chat-template."""
+        return self.tokenizer.name_or_path.replace("/", "__")
+
+    def apply_chat_template(
+        self, chat_history: list[dict[str, str]], add_generation_prompt: bool = True
+    ) -> str:
+        """Format few-shot chat history via the HF tokenizer's own chat template.
+
+        Same job export_llm_to_coreml.py's tokenizer performs at export time --
+        reused here since --apply-chat-template needs it before generation, not
+        baked into the exported graph.
+        """
+        return self.tokenizer.apply_chat_template(
+            chat_history, tokenize=False, add_generation_prompt=add_generation_prompt
+        )
+
     def _generate_one(self, context: str, gen_kwargs: dict) -> str:
         until = gen_kwargs.get("until") or []
         if isinstance(until, str):

@@ -2,12 +2,13 @@ name: Backend Integration
 
 # End-to-end regression tests that feed onnxsim's simplified output into other
 # ONNX-consuming compiler/runtime stacks (Apache TVM, nncase, Halide, tinygrad,
-# PyTorch via onnx2torch) or quantize-then-simplify pipelines (NVIDIA ModelOpt) —
+# PyTorch via onnx2torch), quantize-then-simplify pipelines (NVIDIA ModelOpt),
+# or a deployment toolbox's own backend runtime wrapper (OpenMMLab mmdeploy) —
 # tests/test_tvm_integration.py, tests/test_nncase_integration.py,
 # tests/test_halide_integration.py, tests/test_tinygrad_integration.py,
-# tests/test_torch_integration.py, tests/test_modelopt_integration.py. See
-# docs/dlpack-executor.md, which frames the DLPack executor boundary as an
-# "embeddability" seam for stacks like these.
+# tests/test_torch_integration.py, tests/test_modelopt_integration.py,
+# tests/test_mmdeploy_integration.py. See docs/dlpack-executor.md, which frames
+# the DLPack executor boundary as an "embeddability" seam for stacks like these.
 #
 # These checks used to live in their own workflow files (tvm-integration.yml,
 # nncase-integration.yml, halide-integration.yml, modelopt-integration.yml),
@@ -19,11 +20,12 @@ name: Backend Integration
 # for its shards.
 #
 # None of apache-tvm / nncase / halide / tinygrad / torch+onnx2torch /
-# nvidia-modelopt are part of onnxsim's test requirements (nncase needs the
-# .NET runtime; modelopt and the torch job drag in torch + CUDA wheels), so
-# this runs in its own workflow instead of the build-and-test matrix. Runs on
-# PRs that touch the harness or the simplifier, on a daily schedule to catch
-# new releases of the downstream tools, and on demand.
+# nvidia-modelopt / mmdeploy are part of onnxsim's test requirements (nncase
+# needs the .NET runtime; modelopt, the torch job, and mmdeploy all drag in
+# torch + CUDA wheels), so this runs in its own workflow instead of the
+# build-and-test matrix. Runs on PRs that touch the harness or the simplifier,
+# on a daily schedule to catch new releases of the downstream tools, and on
+# demand.
 
 on:
   schedule:
@@ -37,6 +39,7 @@ on:
       - "tests/test_tinygrad_integration.py"
       - "tests/test_torch_integration.py"
       - "tests/test_modelopt_integration.py"
+      - "tests/test_mmdeploy_integration.py"
       - ".github/workflows/backend-integration.yml"
       - "onnxsim/onnx_simplifier.py"
       - "onnxsim/onnxsim.cpp"
@@ -267,3 +270,51 @@ jobs:
       - name: Run ModelOpt integration tests
         working-directory: ${{ runner.temp }}
         run: pytest -v "$GITHUB_WORKSPACE/tests/test_modelopt_integration.py"
+
+  mmdeploy:
+    name: Simplify and run on mmdeploy's ONNXRuntime wrapper
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - uses: actions/download-artifact@v8
+        with:
+          name: onnxsim-wheel-backend
+          path: wheelhouse
+      # mmdeploy's PyPI release (1.3.1) still imports `mmcv.Config`, which
+      # `mmcv` dropped as of its 2.0 GA (it was only ever an mmcv 2.0.0rc-era
+      # back-compat alias for `mmengine.Config`) -- so it can't be imported
+      # next to any installable mmcv>=2.0. Install mmdeploy from its `main`
+      # branch instead, which has since moved to `mmengine.Config` directly.
+      # Its old-style setup.py also needs `pkg_resources` (removed from
+      # current setuptools) and, if torch is already importable while it
+      # builds, tries to compile its optional TorchScript custom-op
+      # extension (irrelevant to the plain ONNXRuntime backend used here, and
+      # not worth dragging a C++ toolchain into this job for) -- so install
+      # it with an older setuptools and *before* torch is even installed,
+      # which makes its setup.py skip that extension on its own.
+      - name: Install mmdeploy (from source, ahead of torch)
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install "setuptools<81"
+          python -m pip install --no-build-isolation "git+https://github.com/open-mmlab/mmdeploy.git"
+      - name: Install onnxsim wheel + torch + mmdeploy's own runtime deps
+        run: |
+          python -m pip install pytest
+          python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install mmcv-lite mmengine onnxruntime onnxscript
+          python -m pip install wheelhouse/*.whl
+      - name: Verify the installed wheel is used (not the source tree)
+        working-directory: ${{ runner.temp }}
+        run: |
+          python -c "import onnxsim, onnxsim.onnxsim_cpp2py_export as m; print(onnxsim.__version__, m.__file__)"
+          python -c "import mmdeploy; print('mmdeploy', mmdeploy.__version__)"
+      # Run from a neutral directory so the repo root's ./onnxsim source package
+      # (without the compiled extension) does not shadow the installed wheel.
+      - name: Run mmdeploy integration tests
+        working-directory: ${{ runner.temp }}
+        run: pytest -v "$GITHUB_WORKSPACE/tests/test_mmdeploy_integration.py"

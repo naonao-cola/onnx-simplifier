@@ -233,10 +233,11 @@ def _const_scalar(var) -> float:
 class _Lowerer:
     """Walks an ONNX graph once, building the equivalent MIL ops as it goes."""
 
-    def __init__(self, mb, types, opset: int):
+    def __init__(self, mb, types, opset: int, matmul_to_conv: bool = False):
         self.mb = mb
         self.types = types
         self.opset = opset
+        self.matmul_to_conv = matmul_to_conv
         self._values: Dict[str, Any] = {}
         self._counter = 0
 
@@ -347,6 +348,7 @@ for _onnx_op, _mil_op in [
     ("Pow", "pow"),
     ("Equal", "equal"),
     ("LessOrEqual", "less_equal"),
+    ("Greater", "greater"),
     ("And", "logical_and"),
 ]:
     _OP_HANDLERS[_onnx_op] = _simple_binary(_mil_op)
@@ -469,8 +471,65 @@ def _op_softmax(lowerer, node, ins, attrs):
     return [lowerer.mb.reshape(x=sm, shape=list(shape), name=lowerer.fresh_name(node))]
 
 
+def _matmul_as_conv1x1(lowerer, node, x, w):
+    """If ``lowerer.matmul_to_conv`` is set and this MatMul is a linear
+    projection (``x [B, S, C_in] @ w [C_in, C_out]`` with a compile-time-constant
+    2-D ``w`` -- the shape every attention/MLP projection in a transformer
+    decoder takes), lower it to a 1x1/pointwise ``conv`` instead of MIL's native
+    ``matmul``. Returns the output ``Var``, or ``None`` if the shapes don't
+    qualify (the caller falls back to ``matmul`` in that case).
+
+    Why: per the M4 Neural Engine's own reverse-engineered behavior (see
+    scripts/apple/README.md's "Theoretical ceiling" section), the ANE's compute
+    array parallelizes over *convolution* output channels -- its native ``matmul``
+    path only reaches ~30% of peak throughput on a single op, where a
+    channel-parallel conv1x1 chain reaches ~99%. Only ``x``'s rank-3
+    ``[batch, sequence, features]`` shape (this pipeline's actual shape, since
+    ``export_llm_to_coreml.py`` always pins ``batch_size=1``) is handled; any
+    other rank falls back to ``matmul`` rather than risk a shape bug on an
+    untested case.
+
+    The rewrite is a pure transpose/conv/transpose (MIL's ``conv`` accepts
+    ``[n, C_in, *d_in]`` for ``1 <= len(d_in) <= 3``, so 1-D conv's ``[n, C_in,
+    L]`` is exactly ``x`` transposed) -- no shape needs to be known or computed
+    ahead of time, so this is as dynamic-shape-safe as the matmul it replaces.
+    The weight transpose/reshape happens once, in Python, on the constant
+    array itself (never as graph ops), so it costs nothing at runtime.
+    """
+    if not lowerer.matmul_to_conv:
+        return None
+    if w.val is None or w.rank != 2:
+        return None
+    if x.rank != 3:
+        return None
+
+    # ONNX MatMul convention: w is [C_in, C_out]. MIL conv wants weight
+    # [C_out, C_in, K]; K=1 here (pointwise/1x1-equivalent).
+    conv_w = lowerer.make_const(
+        node.input[1], np.ascontiguousarray(w.val.T)[:, :, None]
+    )
+    xt = lowerer.mb.transpose(
+        x=x, perm=[0, 2, 1], name=lowerer.fresh_name(node, "conv_in")
+    )
+    conv_out = lowerer.mb.conv(
+        x=xt,
+        weight=conv_w,
+        strides=[1],
+        pad_type="valid",
+        dilations=[1],
+        groups=1,
+        name=lowerer.fresh_name(node, "conv"),
+    )
+    return lowerer.mb.transpose(
+        x=conv_out, perm=[0, 2, 1], name=lowerer.fresh_name(node)
+    )
+
+
 @_register("MatMul")
 def _op_matmul(lowerer, node, ins, attrs):
+    conv_out = _matmul_as_conv1x1(lowerer, node, ins[0], ins[1])
+    if conv_out is not None:
+        return [conv_out]
     return [lowerer.mb.matmul(x=ins[0], y=ins[1], name=lowerer.fresh_name(node))]
 
 
@@ -1126,6 +1185,7 @@ def _build_mil_program(
     RangeDim,
     TensorType,
     dynamic_shapes: Optional[Dict[str, Tuple[int, int, int]]] = None,
+    matmul_to_conv: bool = False,
 ):
     graph = model.graph
     initializer_names = {t.name for t in graph.initializer}
@@ -1134,7 +1194,7 @@ def _build_mil_program(
         if imp.domain in ("", "ai.onnx"):
             opset = imp.version
 
-    lowerer = _Lowerer(mb=mb, types=types, opset=opset)
+    lowerer = _Lowerer(mb=mb, types=types, opset=opset, matmul_to_conv=matmul_to_conv)
 
     dynamic_shapes = dynamic_shapes or {}
     range_dims: Dict[str, Any] = {}
@@ -1199,6 +1259,7 @@ def convert_to_coreml(
     minimum_deployment_target: Optional[Union[str, Any]] = None,
     skip_model_load: bool = True,
     dynamic_shapes: Optional[Dict[str, Tuple[int, int, int]]] = None,
+    matmul_to_conv: bool = False,
 ):
     """Convert an ONNX model to an in-memory Core ML model.
 
@@ -1238,6 +1299,21 @@ def convert_to_coreml(
         needs its own entry with that exact string as the key -- it is not
         automatically inferred from the terms it names. ``None`` (the default)
         requires every dimension to be static, as before.
+    matmul_to_conv:
+        Lower a linear-projection ``MatMul`` (``x [batch, sequence, C_in] @ w
+        [C_in, C_out]`` with compile-time-constant ``w``, rank-3 ``x`` -- the
+        shape every attention/MLP projection in a transformer decoder takes)
+        to a 1x1/pointwise ``conv`` instead of MIL's native ``matmul``
+        (default ``False``). The Apple Neural Engine's compute array
+        parallelizes over convolution output channels; its native matmul path
+        measures well below conv1x1's throughput on the same hardware -- see
+        `scripts/apple/README.md <../scripts/apple/README.md>`_'s "Theoretical
+        ceiling" section for the measurements this is based on and whether it
+        actually helps *this* pipeline's shapes (mostly single-token decode
+        steps, unlike the deep, wide chains that finding was measured on).
+        Any ``MatMul`` that doesn't match that exact shape (a non-constant or
+        non-2-D weight, or ``x`` of any rank other than 3) is left on the
+        ``matmul`` path unchanged.
 
     Returns
     -------
@@ -1254,7 +1330,15 @@ def convert_to_coreml(
     mb, types, Function, Program, RangeDim, TensorType = _import_mil()
 
     prog, flexible_inputs = _build_mil_program(
-        model, mb, types, Function, Program, RangeDim, TensorType, dynamic_shapes
+        model,
+        mb,
+        types,
+        Function,
+        Program,
+        RangeDim,
+        TensorType,
+        dynamic_shapes,
+        matmul_to_conv,
     )
 
     kwargs: Dict[str, Any] = {}
