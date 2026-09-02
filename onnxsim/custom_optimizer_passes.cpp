@@ -33,6 +33,7 @@
 #include "passes/fuse_layer_norm.h"
 #include "passes/fuse_matmul_add_bias_into_gemm.h"
 #include "passes/fuse_matmul_add_bias_into_gemm_batched.h"
+#include "passes/fuse_matmul_into_conv.h"
 #include "passes/fuse_mul_into_conv.h"
 #include "passes/fuse_pad_into_pool.h"
 #include "passes/fuse_preceding_mul_into_conv.h"
@@ -121,6 +122,7 @@ void RegisterCustomOptimizerPasses() {
     RegisterOrReplace<p::FuseGQA>(registry);
     RegisterOrReplace<p::FuseLayerNorm>(registry);
     RegisterOrReplace<p::FuseMatMulAddBiasIntoGemmBatched>(registry);
+    RegisterOrReplace<p::FuseMatMulIntoConv>(registry);
     RegisterOrReplace<p::FuseMulIntoConv>(registry);
     RegisterOrReplace<p::FusePrecedingMulIntoConv>(registry);
     RegisterOrReplace<p::FuseRMSNorm>(registry);

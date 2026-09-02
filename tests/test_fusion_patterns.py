@@ -37,6 +37,23 @@ def _simplify(model):
     return sim_model, collections.Counter(n.op_type for n in sim_model.graph.node)
 
 
+def _simplify_extra(model, extra_optimizers, skipped_optimizers=None):
+    # Like _simplify, but for a PassType::Other pass that is not part of the
+    # default fuse/elimination set (see extra_optimizers' own doc comment in
+    # onnxsim.h) -- e.g. fuse_matmul_into_conv, which must be opted into by
+    # name. skipped_optimizers additionally excludes named default passes
+    # that would otherwise race the opted-in one for the same node (see
+    # fuse_matmul_into_conv.h's own file comment).
+    sim_model, check_ok = onnxsim.simplify(
+        model,
+        check_n=3,
+        extra_optimizers=extra_optimizers,
+        skipped_optimizers=skipped_optimizers,
+    )
+    assert check_ok, "simplified model failed onnxsim's equivalence check"
+    return sim_model, collections.Counter(n.op_type for n in sim_model.graph.node)
+
+
 def _model(body, initializer=(), opset=13, ir_version=10):
     # Pin a low IR version by default so the model loads under the older
     # onnxruntime bundled with some CI wheels (which cap at IR version 11);
@@ -225,6 +242,144 @@ def test_batched_matmul_add_into_gemm():
     _, ops = _simplify(model)
     assert ops["Gemm"] == 1
     assert ops["MatMul"] == 0
+
+
+def test_fuse_matmul_into_conv_2d():
+    # A bare 2-D MatMul against a constant weight (e.g. a CNN's classifier
+    # head after global pooling + Flatten) is a Linear layer in disguise, and
+    # rewrites to a 1x1 Conv -- fuse_matmul_into_conv, opted in via
+    # extra_optimizers for accelerators whose Conv datapath is far better
+    # optimized than their generic MatMul one.
+    W = np.random.randn(16, 8)
+    model = _model(
+        """
+        g (float[4,16] X) => (float[4,8] Y)
+        {
+          Y = MatMul(X, W)
+        }
+        """,
+        initializer=[_f32(W, "W")],
+    )
+    _, ops = _simplify_extra(model, extra_optimizers=["fuse_matmul_into_conv"])
+    assert ops["Conv"] == 1
+    assert ops["MatMul"] == 0
+
+
+def test_fuse_matmul_into_conv_2d_with_bias():
+    # The default fuse set would otherwise fuse this MatMul+Add into a Gemm
+    # first (fuse_matmul_add_bias_into_gemm), so it's skipped here to isolate
+    # fuse_matmul_into_conv's own MatMul+Add(bias) -> Conv(bias) fusion.
+    W = np.random.randn(16, 8)
+    B = np.random.randn(8)
+    model = _model(
+        """
+        g (float[4,16] X) => (float[4,8] Y)
+        {
+          mm = MatMul(X, W)
+          Y = Add(mm, B)
+        }
+        """,
+        initializer=[_f32(W, "W"), _f32(B, "B")],
+    )
+    _, ops = _simplify_extra(
+        model,
+        extra_optimizers=["fuse_matmul_into_conv"],
+        skipped_optimizers=["fuse_matmul_add_bias_into_gemm"],
+    )
+    assert ops["Conv"] == 1
+    assert ops["MatMul"] == 0 and ops["Add"] == 0 and ops["Gemm"] == 0
+
+
+def test_fuse_batched_matmul_into_conv_with_bias():
+    # Same rank-3, bias-first (HuggingFace-style) Linear layer as
+    # test_batched_matmul_add_into_gemm, but targeting fuse_matmul_into_conv
+    # instead -- fuse_matmul_add_bias_into_gemm_batched is skipped since it is
+    # otherwise unconditionally in the default set and would race this one
+    # for the same Add(MatMul) node.
+    W = np.random.randn(8, 16)
+    b = np.random.randn(16)
+    model = _model(
+        """
+        g (float[2,4,8] X) => (float[2,4,16] Y)
+        {
+          mm = MatMul(X, W)
+          Y = Add(b, mm)
+        }
+        """,
+        initializer=[_f32(W, "W"), _f32(b, "b")],
+    )
+    _, ops = _simplify_extra(
+        model,
+        extra_optimizers=["fuse_matmul_into_conv"],
+        skipped_optimizers=["fuse_matmul_add_bias_into_gemm_batched"],
+    )
+    assert ops["Conv"] == 1
+    assert ops["MatMul"] == 0 and ops["Add"] == 0 and ops["Gemm"] == 0
+
+
+def test_fuse_gemm_into_conv_transb():
+    # A plain nn.Linear typically exports as Gemm(X, W, B, transB=1) (W kept
+    # in its natural [out, in] layout). fuse_matmul_into_conv also rewrites
+    # this shape, not just MatMul -- no default pass turns Gemm back into
+    # MatMul, so no skipped_optimizers is needed here. fuse_matmul_into_conv
+    # itself never special-cases transB=1 to skip inserting a Transpose for
+    # W (it always builds the Conv weight the same way regardless of
+    # layout); the default fuse set's own fuse_consecutive_transposes +
+    # eliminate_nop_transpose cancel the resulting Transpose<perm=[1,0]>
+    # pair, so no Transpose survives either.
+    W = np.random.randn(8, 16)  # [N, K], transB=1
+    B = np.random.randn(8)
+    model = _model(
+        """
+        g (float[4,16] X) => (float[4,8] Y)
+        {
+          Y = Gemm<transB = 1>(X, W, B)
+        }
+        """,
+        initializer=[_f32(W, "W"), _f32(B, "B")],
+    )
+    _, ops = _simplify_extra(model, extra_optimizers=["fuse_matmul_into_conv"])
+    assert ops["Conv"] == 1
+    assert ops["Gemm"] == 0
+    assert ops["Transpose"] == 0
+
+
+def test_fuse_gemm_into_conv_transa():
+    # transA=1 has no counterpart anywhere else in the rewrite to cancel
+    # against, so -- unlike transB above -- the Transpose(X) this pass
+    # inserts for it is genuine work and survives in the final graph.
+    W = np.random.randn(16, 8)
+    model = _model(
+        """
+        g (float[16,4] X) => (float[4,8] Y)
+        {
+          Y = Gemm<transA = 1>(X, W)
+        }
+        """,
+        initializer=[_f32(W, "W")],
+    )
+    _, ops = _simplify_extra(model, extra_optimizers=["fuse_matmul_into_conv"])
+    assert ops["Conv"] == 1
+    assert ops["Gemm"] == 0
+    assert ops["Transpose"] == 1
+
+
+def test_fuse_matmul_into_conv_declines_non_default_alpha():
+    # alpha != 1 would need the folded weight rescaled; fuse_matmul_into_conv
+    # doesn't do that and leaves this Gemm untouched.
+    W = np.random.randn(16, 8)
+    model = _model(
+        """
+        g (float[4,16] X) => (float[4,8] Y)
+        {
+          Y = Gemm<alpha = 2.0>(X, W)
+        }
+        """,
+        initializer=[_f32(W, "W")],
+    )
+    _, ops = _simplify_extra(model, extra_optimizers=["fuse_matmul_into_conv"])
+    assert ops["Gemm"] == 1
+    assert ops["Conv"] == 0
 
 
 def test_fuse_pad_into_conv():
