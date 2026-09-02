@@ -371,7 +371,7 @@ jobs:
       - name: Install onnxsim wheel + LLM export/eval deps
         run: |
           python3 -m pip install --upgrade pip
-          python3 -m pip install "optimum-onnx" transformers coremltools onnxruntime "lm-eval[ifeval]"
+          python3 -m pip install "optimum-onnx" transformers accelerate coremltools onnxruntime "lm-eval[ifeval]"
           python3 -m pip install wheelhouse/*.whl
       - name: Verify the installed wheel is used (not the source tree)
         working-directory: ${{ runner.temp }}
