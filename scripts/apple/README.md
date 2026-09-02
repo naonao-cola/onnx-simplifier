@@ -351,6 +351,59 @@ quantized, rather than the two costs just adding. Reinforces the same
 conclusion from the solo measurement above: `--matmul-to-conv` isn't worth
 enabling for this pipeline's shapes, combined with int8 or otherwise.
 
+### Compute-unit device placement (`coreml_compute_plan_trace.m`)
+
+`--matmul-to-conv`'s standalone measurement above raised an obvious
+follow-up: was the slowdown because `matmul` and `conv` land on different
+Core ML compute units (CPU/GPU/ANE), or is something else going on?
+`run_llm_decode_benchmark.py`/`coreml_backend.py` only ever call
+`.predict()` with `MLComputeUnits=ALL` and report aggregate tok/s + RSS --
+no per-op visibility into which unit actually ran anything.
+
+`coreml_compute_plan_trace.m` closes that gap using `MLComputePlan`
+(macOS 14+), the Core ML framework's own static analysis API: given a
+*compiled* model (`xcrun coremlcompiler compile model.mlpackage <dir>`
+first -- `MLComputePlan` doesn't load `.mlpackage` directly), it walks
+every operation in the ML Program (`onnxsim/coreml_export.py`'s
+`convert_to="mlprogram"` default -- the only format this tool supports)
+and asks the framework for each op's preferred compute device and
+estimated relative cost, **without running the model**. Output is Chrome
+Trace Event Format JSON (openable at `chrome://tracing` or
+https://ui.perfetto.dev) -- one timeline lane per device, so which ops
+landed where is visible at a glance instead of read off a text dump.
+
+**This is a static estimate, not a measurement**: `dur` in the emitted
+trace is `MLComputePlanCost`'s `weight` (a relative-cost fraction) scaled
+by 1e6 purely so a trace viewer renders something legible, not
+microseconds from an actual `.predict()` call. Real per-op wall-clock
+timing would need Instruments' Core ML template
+(`xcrun xctrace record --template "Core ML"`) attached to a live
+prediction run instead -- a far less tractable trace format to parse than
+`MLComputePlan`'s structured API, so out of scope here. What this tool
+answers is narrower and cheaper: which compute unit does Core ML's own
+placement logic *prefer* for each op, before spending any time actually
+running it.
+
+```bash
+clang -O2 -o coreml_compute_plan_trace coreml_compute_plan_trace.m \
+    -framework CoreML -framework Foundation
+xcrun coremlcompiler compile model.mlpackage compiled
+./coreml_compute_plan_trace compiled/model.mlmodelc out.json
+```
+
+Plain C/Objective-C compiled with plain `clang` (matching the pattern in
+[freedomtan/coreml_modelc_profling](https://github.com/freedomtan/coreml_modelc_profling),
+whose `MLComputePlan` API calls this file's traversal is adapted from) --
+no Xcode project, no Swift toolchain. Unlike everything else in
+`scripts/apple`, this file couldn't be validated at all before landing in
+CI (no macOS/Core ML in any environment developing this repo, and no way
+to even syntax-check Objective-C against the real `CoreML.framework`
+headers) -- `coreml-integration.yml`'s `benchmark-decode-macos` job is the
+first place it actually compiles and runs, specifically against the
+`smollm2-135m` / `smollm2-135m-conv` matrix entries (the plain-matmul vs.
+matmul-to-conv comparison this tool exists to explain), uploading each
+trace as a workflow artifact.
+
 ### Quality and retention eval (`run_quality_eval.py` / `compute_retention.py`)
 
 The decode benchmark and parity check above measure speed and short-generation
