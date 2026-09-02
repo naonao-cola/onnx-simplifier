@@ -318,6 +318,15 @@ the same baseline.) Stays opt-in and off by default; not revisiting unless a
 different model size/shape or a cheaper way to express the rewrite changes
 this result.
 
+`coreml-integration.yml`'s `benchmark-decode-macos` job also includes a
+`quantize_weights: int8` + `matmul_to_conv: "true"` matrix entry
+(`smollm2-135m-int8-conv`), checking the two flags together directly rather
+than assuming they compose from the two isolated results above -- int8 only
+changes how the weight constants are stored/dequantized before an op runs,
+matmul-to-conv only changes which op the dequantized weight feeds into, so
+they shouldn't interact, but that's an assumption worth checking rather than
+trusting.
+
 ### Quality and retention eval (`run_quality_eval.py` / `compute_retention.py`)
 
 The decode benchmark and parity check above measure speed and short-generation

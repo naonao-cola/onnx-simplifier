@@ -289,6 +289,19 @@ jobs:
             dtype: fp32
             quantize_weights: none
             matmul_to_conv: "true"
+          # Both flags together -- int8 targets bandwidth, matmul-to-conv
+          # targets compute, and nothing about them should interact (int8
+          # only changes how the weight constants are stored/dequantized
+          # before the op runs; matmul-to-conv only changes which op the
+          # dequantized weight feeds into), but that's an assumption, not a
+          # measurement. This entry checks it directly rather than inferring
+          # it from the two isolated entries above.
+          - model_id: HuggingFaceTB/SmolLM2-135M-Instruct
+            slug: smollm2-135m-int8-conv
+            max_context_length: 512
+            dtype: fp32
+            quantize_weights: int8
+            matmul_to_conv: "true"
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
