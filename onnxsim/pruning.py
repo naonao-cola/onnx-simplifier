@@ -16741,10 +16741,10 @@ class PruningLayerSensitivity:
             :func:`apply_qmoe_expert_channel_pruning`/
             :func:`apply_qmoe_whole_expert_pruning`; ``"matmul_nbits"`` for
             :func:`apply_structured_pruning_matmul_nbits` (a single string,
-            unlike the QDQ family's Conv/MatMul split --
-            `_find_matmul_nbits_chains` only ever matches
-            ``MatMulNBits``-to-``MatMulNBits`` chains, so there is no second
-            topology to distinguish);
+            unlike the QDQ family's Conv/MatMul split -- every matched chain
+            has at least one ``MatMulNBits`` side (the other optionally a
+            plain-float peer, see :class:`_PlainMatMulNBitsPeer`), but that
+            distinction isn't split into its own family string);
             ``"embedding_vocab_magnitude"`` for
             :func:`apply_embedding_vocab_magnitude_pruning`;
             ``"transformer_block"`` for
@@ -17634,14 +17634,18 @@ def _analyze_structured_pruning_matmul_nbits(
     `would_drop=0`/`margin=None`, exactly the "left completely untouched"
     outcome the real call gives it too, not folded into `not_eligible`),
     keep-count, and importance (:func:`_qdq_channel_importance`, ranking the
-    producer's own *dequantized* weight row -- :func:`_matmul_nbits_dequantized`,
-    the exact same helper :func:`apply_structured_pruning_matmul_nbits`
-    itself calls, never for the actual int4-code rewrite) logic, reused
-    directly, but `model` is never mutated. `family` is always
-    ``"matmul_nbits"`` -- unlike the QDQ family's own Conv/MatMul split,
-    :func:`_find_matmul_nbits_chains` only ever matches
-    ``MatMulNBits``-to-``MatMulNBits`` chains, so there is no second
-    topology to distinguish.
+    producer's own *dequantized-or-plain* weight row --
+    :func:`_matmul_nbits_chain_producer_weight_nk`, the exact same helper
+    :func:`apply_structured_pruning_matmul_nbits` itself calls, never for
+    the actual int4-code rewrite) logic, reused directly, but `model` is
+    never mutated. Every matched chain has at least one ``MatMulNBits``
+    side; the other side may instead be a plain-float peer (see
+    :class:`_PlainMatMulNBitsPeer`) -- :func:`_matmul_nbits_chain_side_key`
+    dispatches on which, and a plain-float consumer skips the block-
+    alignment check below entirely (no block structure to align to,
+    mirroring the real call's own `isinstance` branch). `family` is always
+    ``"matmul_nbits"`` regardless -- unlike the QDQ family's own Conv/MatMul
+    split, that distinction isn't split into its own family string.
 
     A chain whose keep-set doesn't happen to align to the consumer's own
     `block_size` boundaries (:func:`_matmul_nbits_block_aligned_keep_blocks`
@@ -17684,7 +17688,8 @@ def _analyze_structured_pruning_matmul_nbits(
 
     for chain in chains:
         p, c = chain.producer, chain.consumer
-        p_key, c_key = p.b_init.name, c.b_init.name
+        p_key = _matmul_nbits_chain_side_key(p)
+        c_key = _matmul_nbits_chain_side_key(c)
         if p_key == c_key:
             continue  # degenerate (the same weight in both roles) -- no report row
 
@@ -17721,7 +17726,7 @@ def _analyze_structured_pruning_matmul_nbits(
             )
             continue  # rounds down to nothing for this chain -- no-op
 
-        w_nk = _matmul_nbits_dequantized(p)
+        w_nk = _matmul_nbits_chain_producer_weight_nk(p)
         importance = _qdq_channel_importance(w_nk, importance_norm)
         # `kind="stable"` to match `apply_structured_pruning_matmul_nbits`'s
         # own tie-break exactly (see that function's own comment on this
@@ -17730,24 +17735,28 @@ def _analyze_structured_pruning_matmul_nbits(
         # the real call's, platform-dependently.
         keep = np.sort(np.argsort(-importance, kind="stable")[:keep_count])
 
-        keep_blocks = _matmul_nbits_block_aligned_keep_blocks(
-            keep, c.k_blocks, c.block_size
-        )
-        if keep_blocks is None:
-            layers.append(
-                PruningLayerSensitivity(
-                    label=label,
-                    family=family,
-                    total=n,
-                    would_drop=0,
-                    margin=None,
-                    importance_min=0.0,
-                    importance_max=0.0,
-                )
+        if isinstance(c, _MatMulNBitsWeight):
+            keep_blocks = _matmul_nbits_block_aligned_keep_blocks(
+                keep, c.k_blocks, c.block_size
             )
-            continue  # non-block-aligned keep-set for this consumer -- the
-            # real call declines this chain entirely too, see this
-            # function's own docstring
+            if keep_blocks is None:
+                layers.append(
+                    PruningLayerSensitivity(
+                        label=label,
+                        family=family,
+                        total=n,
+                        would_drop=0,
+                        margin=None,
+                        importance_min=0.0,
+                        importance_max=0.0,
+                    )
+                )
+                continue  # non-block-aligned keep-set for this consumer --
+                # the real call declines this chain entirely too, see this
+                # function's own docstring
+        # else: a plain-float consumer has no block structure -- the real
+        # call applies any keep-set directly, see this function's own
+        # docstring.
 
         keep_mask = np.zeros(n, dtype=bool)
         keep_mask[keep] = True
