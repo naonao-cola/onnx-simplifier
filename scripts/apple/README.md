@@ -303,6 +303,21 @@ unquantized baseline, decode parity included) specifically to get that
 answer on real hardware; default it on only once that comparison actually
 shows an improvement.
 
+**Measured on real hardware** (`HuggingFaceTB/SmolLM2-135M-Instruct`,
+`benchmark-decode-macos`, same runner/run as the unquantized baseline): this
+flag made decode *slower*, not faster -- 2.82 tok/s vs. the matmul
+baseline's 3.62 tok/s (-22%), with prefill roughly 50% slower too (1538ms
+vs. 1025ms for 5 tokens). The opposite of what the raw ANE conv1x1-vs-matmul
+throughput numbers suggested: those come from long, wide conv1x1 chains, not
+this pipeline's short, mostly-single-token sequences, where the extra
+transpose/conv/transpose bookkeeping this rewrite adds around every
+projection apparently costs more than the ANE's per-op throughput gains
+recover. (For reference, `--quantize-weights int8` on the same model/run
+*did* help, as the bandwidth-bound theory predicted: 4.29 tok/s, +18.5% over
+the same baseline.) Stays opt-in and off by default; not revisiting unless a
+different model size/shape or a cheaper way to express the rewrite changes
+this result.
+
 ### Quality and retention eval (`run_quality_eval.py` / `compute_retention.py`)
 
 The decode benchmark and parity check above measure speed and short-generation

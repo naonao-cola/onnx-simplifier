@@ -277,9 +277,12 @@ jobs:
           # unlike the int8 entry above, this targets compute (not bandwidth):
           # the M4 ANE's native matmul path measures well below its conv1x1
           # path on the same hardware (see the README's "Theoretical ceiling"
-          # section). Untested against this pipeline's actual shapes (mostly
-          # single-token decode) until this job runs it -- this entry is that
-          # measurement, not a claim it helps.
+          # section). Measured on this pipeline's actual shapes (mostly
+          # single-token decode) as slower, not faster, than the matmul
+          # baseline (see the README's "matmul-to-conv1x1" section) -- kept
+          # here, and the flag stays opt-in/off by default, so a future
+          # change to the rewrite or a different model size can be checked
+          # against the same baseline without re-deriving this result.
           - model_id: HuggingFaceTB/SmolLM2-135M-Instruct
             slug: smollm2-135m-conv
             max_context_length: 512
