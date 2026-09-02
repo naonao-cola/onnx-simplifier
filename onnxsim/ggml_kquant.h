@@ -1,10 +1,10 @@
 /*
  * SPDX-License-Identifier: Apache-2.0
  *
- * Dequantization for the four GGML "K-quant" block formats gguf_dtype.h's
- * IsKQuant covers (Q4_K, Q5_K, Q6_K, Q8_0): decodes a tensor's native, still-
- * packed GGML block bytes (see gguf_dtype.h's KQuantBlockBytes) into plain
- * host-order float32 values.
+ * Dequantization for the six GGML "K-quant" block formats gguf_dtype.h's
+ * IsKQuant covers (Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q8_0): decodes a tensor's
+ * native, still-packed GGML block bytes (see gguf_dtype.h's KQuantBlockBytes)
+ * into plain host-order float32 values.
  *
  * Pure, dependency-free (no protobuf, no onnx headers) like gguf_dtype.h
  * itself -- operates on raw bytes and the same integer ggml_type codes, so
@@ -23,6 +23,18 @@
  * big-endian host too (this repo tests on s390x). A block's single-byte
  * fields (the packed quant codes, the int8 Q6_K scales) need no such care --
  * one byte has no endianness.
+ *
+ * Q3_K is the one exception needing extra care: GGML's own reference
+ * unpacks its 12-byte packed 6-bit scale table by `memcpy`-ing it onto a
+ * `uint32_t[3]` and bit-twiddling those words directly (see
+ * dequantize_row_q3_K) -- correct only when `memcpy` onto a native
+ * `uint32_t` happens to reproduce little-endian byte order, i.e. only on a
+ * little-endian host; GGML itself has no big-endian handling for this at
+ * all. UnpackQ3KScales below reproduces the exact same bit-twiddling
+ * arithmetic (verified bit-for-bit equivalent to the reference over 2000
+ * random scale tables via an independent Python re-implementation) but
+ * starting from explicit little-endian word reads/writes (ReadLE32Word/
+ * ByteOfLE32), so the result is identical on any host byte order.
  */
 #ifndef ONNXSIM_GGML_KQUANT_H_
 #define ONNXSIM_GGML_KQUANT_H_
@@ -92,6 +104,114 @@ inline void GetScaleMinK4(int j, const uint8_t* q, uint8_t* d, uint8_t* m) {
   } else {
     *d = static_cast<uint8_t>((q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4));
     *m = static_cast<uint8_t>((q[j + 4] >> 4) | ((q[j - 0] >> 6) << 4));
+  }
+}
+
+// Reconstructs a little-endian uint32_t from four bytes, regardless of host
+// byte order -- ReadLE16's 32-bit counterpart, needed by UnpackQ3KScales.
+inline uint32_t ReadLE32Word(const uint8_t* p) {
+  return static_cast<uint32_t>(p[0]) | (static_cast<uint32_t>(p[1]) << 8) |
+         (static_cast<uint32_t>(p[2]) << 16) |
+         (static_cast<uint32_t>(p[3]) << 24);
+}
+
+// Extracts byte `byte_index` (0 = least significant) of `word` as if `word`
+// were stored little-endian -- the write-side counterpart to ReadLE32Word,
+// used to pull individual bytes back out of the words UnpackQ3KScales
+// computes, independent of host byte order.
+inline uint8_t ByteOfLE32(uint32_t word, int byte_index) {
+  return static_cast<uint8_t>((word >> (8 * byte_index)) & 0xFFu);
+}
+
+// Unpacks Q3_K's 12-byte packed-6-bit scale table into 16 signed values in
+// `out` (still offset by +32, matching GGML's own `scales[is++] - 32` step,
+// left to the caller). Mirrors ggml-quants.c's dequantize_row_q3_K bit-
+// twiddling exactly, but built from explicit little-endian word reads
+// (ReadLE32Word) and byte extraction (ByteOfLE32) instead of the
+// reference's `memcpy` onto a native `uint32_t[3]` -- see this file's
+// comment for why the reference's version only works on a little-endian
+// host, and why this one doesn't need to care.
+inline void UnpackQ3KScales(const uint8_t* scales12, int8_t out[16]) {
+  const uint32_t kmask1 = 0x03030303u;
+  const uint32_t kmask2 = 0x0f0f0f0fu;
+  uint32_t aux[4];
+  aux[0] = ReadLE32Word(scales12 + 0);
+  aux[1] = ReadLE32Word(scales12 + 4);
+  aux[2] = ReadLE32Word(scales12 + 8);
+  const uint32_t tmp = aux[2];
+  const uint32_t new0 = (aux[0] & kmask2) | (((tmp >> 0) & kmask1) << 4);
+  const uint32_t new1 = (aux[1] & kmask2) | (((tmp >> 2) & kmask1) << 4);
+  const uint32_t new2 = ((aux[0] >> 4) & kmask2) | (((tmp >> 4) & kmask1) << 4);
+  const uint32_t new3 = ((aux[1] >> 4) & kmask2) | (((tmp >> 6) & kmask1) << 4);
+  aux[0] = new0;
+  aux[1] = new1;
+  aux[2] = new2;
+  aux[3] = new3;
+  for (int k = 0; k < 16; ++k) {
+    out[k] = static_cast<int8_t>(ByteOfLE32(aux[k / 4], k % 4));
+  }
+}
+
+// Decodes one 84-byte Q2_K block (256 elements) into `out`.
+inline void DequantizeQ2_KBlock(const uint8_t* block, float* out) {
+  const uint8_t* scales = block;  // 16 bytes
+  const uint8_t* q = block + 16;  // 64 bytes
+  const float d = Float16BitsToFloat32(ReadLE16(block + 16 + 64));
+  const float dmin = Float16BitsToFloat32(ReadLE16(block + 16 + 64 + 2));
+
+  float* y = out;
+  int is = 0;
+  for (int n = 0; n < 256; n += 128) {
+    int shift = 0;
+    for (int j = 0; j < 4; ++j) {
+      uint8_t sc = scales[is++];
+      float dl = d * (sc & 0xF);
+      float ml = dmin * (sc >> 4);
+      for (int l = 0; l < 16; ++l) {
+        *y++ = dl * static_cast<float>((q[l] >> shift) & 3) - ml;
+      }
+      sc = scales[is++];
+      dl = d * (sc & 0xF);
+      ml = dmin * (sc >> 4);
+      for (int l = 0; l < 16; ++l) {
+        *y++ = dl * static_cast<float>((q[l + 16] >> shift) & 3) - ml;
+      }
+      shift += 2;
+    }
+    q += 32;
+  }
+}
+
+// Decodes one 110-byte Q3_K block (256 elements) into `out`.
+inline void DequantizeQ3_KBlock(const uint8_t* block, float* out) {
+  const uint8_t* hmask = block;                 // 32 bytes
+  const uint8_t* q = block + 32;                // 64 bytes
+  const uint8_t* scales_raw = block + 32 + 64;  // 12 bytes
+  const float d_all = Float16BitsToFloat32(ReadLE16(block + 32 + 64 + 12));
+
+  int8_t scales[16];
+  UnpackQ3KScales(scales_raw, scales);
+
+  float* y = out;
+  int is = 0;
+  uint8_t m = 1;
+  for (int n = 0; n < 256; n += 128) {
+    int shift = 0;
+    for (int j = 0; j < 4; ++j) {
+      float dl = d_all * static_cast<float>(scales[is++] - 32);
+      for (int l = 0; l < 16; ++l) {
+        const int low = (q[l] >> shift) & 3;
+        *y++ = dl * static_cast<float>(low - ((hmask[l] & m) ? 0 : 4));
+      }
+      dl = d_all * static_cast<float>(scales[is++] - 32);
+      for (int l = 0; l < 16; ++l) {
+        const int low = (q[l + 16] >> shift) & 3;
+        *y++ = dl * static_cast<float>(low - ((hmask[l + 16] & m) ? 0 : 4));
+      }
+      shift += 2;
+      m = static_cast<uint8_t>(m << 1);
+    }
+    q += 32;
   }
 }
 
@@ -200,7 +320,7 @@ inline void DequantizeQ6_KBlock(const uint8_t* block, float* out) {
 // `numel / KQuantBlockElements(ggml_type) * KQuantBlockBytes(ggml_type)`
 // bytes long) into `numel` host-order float32 values, appended to `out`
 // (not cleared first). Returns false, leaving `out` untouched, if
-// `ggml_type` is not one of the four IsKQuant types, `numel` is not a
+// `ggml_type` is not one of the six IsKQuant types, `numel` is not a
 // multiple of its block size, or `raw_size` does not match the expected
 // byte length for `numel` elements (a corrupt/truncated buffer).
 inline bool DequantizeGgmlKQuant(const uint8_t* raw, size_t raw_size,
@@ -228,6 +348,12 @@ inline bool DequantizeGgmlKQuant(const uint8_t* raw, size_t raw_size,
     switch (ggml_type) {
       case GGML_TYPE_Q8_0:
         DequantizeQ8_0Block(src, dst);
+        break;
+      case GGML_TYPE_Q2_K:
+        DequantizeQ2_KBlock(src, dst);
+        break;
+      case GGML_TYPE_Q3_K:
+        DequantizeQ3_KBlock(src, dst);
         break;
       case GGML_TYPE_Q4_K:
         DequantizeQ4_KBlock(src, dst);

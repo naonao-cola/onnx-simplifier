@@ -11,15 +11,15 @@
  * representation during Simplify().
  *
  * The GGUF-specific thing worth calling out here is gguf_dtype.h's scope:
- * most of GGML's block-quantized types (Q2_K, Q3_K, every IQ*_ variant, ...)
+ * most of GGML's block-quantized types (every IQ*_ variant, Q8_1, Q8_K, ...)
  * have no ONNX raw-data equivalent at all, so ImportModelWithGGUF's
  * `skipped_out` matters more here than ImportModelWithSafetensors's
  * equivalent ever would in practice. The families this mapping DOES cover
- * -- K-quant (Q4_K/Q5_K/Q6_K/Q8_0, what a real quantized checkpoint, e.g.
- * Unsloth's GGUF exports, actually uses for the bulk of its weights),
- * legacy (Q4_0/Q4_1/Q5_0/Q5_1, which llama.cpp's own mixed-precision
- * quantizers still pick for particular tensor roles even in an otherwise
- * K-quant checkpoint), and MXFP4 (gpt-oss's native MoE-expert
+ * -- K-quant (Q2_K/Q3_K/Q4_K/Q5_K/Q6_K/Q8_0, what a real quantized
+ * checkpoint, e.g. Unsloth's GGUF exports, actually uses for the bulk of
+ * its weights), legacy (Q4_0/Q4_1/Q5_0/Q5_1, which llama.cpp's own mixed-
+ * precision quantizers still pick for particular tensor roles even in an
+ * otherwise K-quant checkpoint), and MXFP4 (gpt-oss's native MoE-expert
  * quantization) -- are hydrated as ordinary float32, via
  * HydrateTensorProtoFromGGUF's decode --
  * ImportModelWithGGUF is the intended way to pull a third-party GGUF

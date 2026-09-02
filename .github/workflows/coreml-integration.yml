@@ -57,6 +57,19 @@ name: Core ML Integration
 # only place either flag's actual effect on decode tok/s gets measured, since
 # no environment developing this repo has real Core ML to run it on. Also
 # workflow_dispatch/schedule-only, matching the other real-model jobs.
+#
+# A fifth job -- `quality-eval-macos` -- is the first slice of
+# bench/TODO_quality_retention_eval.md's quality/retention plan: it runs a small
+# IFEval subset (scripts/apple/run_quality_eval.py, an lm-evaluation-harness wrapper)
+# against both the float Hugging Face model (CPU, no macOS needed for that half) and
+# the exported Core ML model (scripts/apple/lm_eval_coreml_adapter.py, real Core ML
+# runtime), then scripts/apple/compute_retention.py reports the quantized/float score
+# ratio -- the third DeviceMark axis (https://devicemark.github.io/) alongside decode
+# speed and parity. Deliberately small (--limit, --max-gen-toks) and IFEval-only for
+# now: a prototype run of even a single MMLU-Pro example against this suite's
+# unbatched single-sequence decode took minutes on a small model on CPU (see that
+# plan doc's "Proposed scope" section) -- MMLU-Pro and MATH-500 stay future work until
+# that cost is addressed. Also workflow_dispatch/schedule-only.
 
 on:
   schedule:
@@ -319,5 +332,60 @@ jobs:
             python3 "$GITHUB_WORKSPACE/scripts/apple/check_decode_parity.py" \
               ${{ matrix.model_id }} ${{ matrix.slug }}.mlpackage \
               --prompt "The capital of France is" --max-new-tokens 20
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+  quality-eval-macos:
+    name: Run quality/retention eval (macOS, real Core ML)
+    needs: build-macos
+    if: github.event_name != 'pull_request'
+    runs-on: macos-15
+    timeout-minutes: 30
+    env:
+      MODEL_ID: HuggingFaceTB/SmolLM2-135M-Instruct
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+      - uses: actions/download-artifact@v8
+        with:
+          name: onnxsim-wheel-macos
+          path: wheelhouse
+      - name: Install onnxsim wheel + LLM export/eval deps
+        run: |
+          python3 -m pip install --upgrade pip
+          python3 -m pip install "optimum-onnx" transformers coremltools onnxruntime "lm-eval[ifeval]"
+          python3 -m pip install wheelhouse/*.whl
+      - name: Verify the installed wheel is used (not the source tree)
+        working-directory: ${{ runner.temp }}
+        run: python3 -c "import onnxsim, onnxsim.onnxsim_cpp2py_export as m; print(onnxsim.__version__, m.__file__)"
+      - name: Export ${{ env.MODEL_ID }}
+        working-directory: ${{ runner.temp }}
+        run: |
+          python3 "$GITHUB_WORKSPACE/scripts/apple/export_llm_to_coreml.py" \
+            "$MODEL_ID" --max-context-length 512 --output model.mlpackage
+      - name: Evaluate the float (Hugging Face) model on a small IFEval subset
+        working-directory: ${{ runner.temp }}
+        run: |
+          python3 "$GITHUB_WORKSPACE/scripts/apple/run_quality_eval.py" \
+            --model hf --model-args "pretrained=$MODEL_ID,dtype=float32" \
+            --tasks ifeval --limit 10 --max-gen-toks 128 --apply-chat-template \
+            --output float_ifeval.json
+      - name: Evaluate the quantized (Core ML) model on the same subset
+        working-directory: ${{ runner.temp }}
+        run: |
+          python3 "$GITHUB_WORKSPACE/scripts/apple/run_quality_eval.py" \
+            --model coreml --model-args "pretrained=model.mlpackage" \
+            --tasks ifeval --limit 10 --max-gen-toks 128 --apply-chat-template \
+            --output coreml_ifeval.json
+      - name: Compute quantized/float retention
+        working-directory: ${{ runner.temp }}
+        run: |
+          {
+            echo "### Quality/retention: $MODEL_ID (IFEval, --limit 10 -- not benchmark-grade)"
+            echo '```'
+            python3 "$GITHUB_WORKSPACE/scripts/apple/compute_retention.py" \
+              float_ifeval.json coreml_ifeval.json
             echo '```'
           } | tee -a "$GITHUB_STEP_SUMMARY"
