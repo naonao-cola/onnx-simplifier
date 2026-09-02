@@ -9,22 +9,20 @@
 //   Y = MatMul(X, W)                        // W: constant 2-D [K, N]
 //   Z = MatMul(X, W) + B                    // B: constant, broadcastable
 //                                            //    over the N axis
-//   Z = Gemm(X, W[, B], transA=0, alpha=1[, beta=1])
-//                                            // W: constant 2-D, [K, N]
-//                                            //    (transB=0) or [N, K]
-//                                            //    (transB=1)
+//   Z = Gemm(X, W[, B], transA, transB, alpha=1[, beta=1])
+//                                            // W: constant 2-D
 // After:
-//   X2 = Reshape(X, [-1, K, 1])
-//   W2 = Transpose/Unsqueeze(W) -> [N, K, 1]
+//   X2 = Reshape(Transpose(X) if transA, [-1, K, 1])
+//   W2 = Transpose(Transpose(W) if transB) -> [N, K, 1] (+ Unsqueeze)
 //   C  = Conv(X2, W2[, B'])                 // a 1-D, 1x1-kernel convolution
 //   Z  = Reshape(C, [d0, ..., d_{r-2}, N])
 //
-// X may have any rank >= 2; only its last (contracted) axis needs a static
-// size K. Every leading dim collapses into Conv's batch axis and is restored
-// by the trailing Reshape -- the same leading-dims-to-a-single-axis
-// scaffolding ``fuse_matmul_add_bias_into_gemm_batched`` uses to turn a
-// batched MatMul into a 2-D Gemm, except the target here is a 1x1 Conv, not
-// a Gemm.
+// X may have any rank >= 2 (Gemm's is always exactly 2); only its last
+// (contracted, or first if transA) axis needs a static size K. Every leading
+// dim collapses into Conv's batch axis and is restored by the trailing
+// Reshape -- the same leading-dims-to-a-single-axis scaffolding
+// ``fuse_matmul_add_bias_into_gemm_batched`` uses to turn a batched MatMul
+// into a 2-D Gemm, except the target here is a 1x1 Conv, not a Gemm.
 //
 // Rationale: some accelerators (embedded/mobile NPUs and DSPs among them)
 // ship a heavily tuned, general-purpose Conv datapath but a much weaker (or
@@ -42,8 +40,24 @@
 // PassType::Other (opt-in only, via ``extra_optimizers``), not part of the
 // default fuse set.
 //
-// Only ``transA=0`` and ``alpha=1``/``beta=1`` Gemm is handled -- the shape a
-// plain ``nn.Linear`` export (or onnxsim's own
+// A non-default transA/transB is handled by literally inserting a Transpose
+// node for it -- rather than pattern-matching the attribute to decide which
+// of two hand-written weight/activation layouts to build -- and leaning on
+// onnx-optimizer's own eliminate_nop_transpose/fuse_consecutive_transposes
+// (already part of the default fuse/elimination set this pass's own
+// extra_optimizers caller runs alongside) to cancel whatever that Transpose
+// turns out not to need in the final graph: transB's normalizing Transpose
+// composes with the Conv-layout Transpose this pass always inserts for W
+// into a no-op perm, which eliminate_nop_transpose then deletes outright,
+// so a transB=1 Gemm (nn.Linear's own native export shape, W kept as
+// [out, in]) ends up with zero leftover Transpose nodes despite this pass
+// never special-casing that layout. transA's Transpose(X), by contrast, is
+// real work with no inverse anywhere else in the pattern, so it survives --
+// there is no way to avoid physically reordering X's elements once its
+// contracted axis is not already the layout Conv needs.
+//
+// Only ``alpha=1``/``beta=1`` Gemm is handled -- the scaling a plain
+// ``nn.Linear`` export (or onnxsim's own
 // ``fuse_matmul_add_bias_into_gemm``/``_batched``) always produces. Any
 // other Gemm is left untouched rather than taught to rescale the folded
 // weight/bias for an alpha/beta that essentially never occurs in practice.
@@ -53,6 +67,7 @@
 // Add the rewritten (rank >= 3) Conv output can no longer broadcast against
 // in the usual per-channel way.
 
+#include <algorithm>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -97,15 +112,35 @@ struct FuseMatMulIntoConv final : public PredicateBasedPass {
     return graph.addInitializerAndCreateValue(std::move(t));
   }
 
-  // The pieces of a MatMul/Gemm-shaped Linear layer this pass rewrites.
+  // ``physical``'s shape as it will read once transposed (its two-or-more
+  // axes reversed) if ``transposed``, else unchanged. Reversing (rather than
+  // swapping just the last two axes) matches what a Transpose<perm=[1,0]>
+  // node -- the only shape this pass ever inserts one for, since Gemm's
+  // transA/transB apply to a strictly 2-D operand -- actually does.
+  static std::vector<Dimension> LogicalShape(Value* physical, bool transposed) {
+    std::vector<Dimension> shape(physical->sizes().begin(),
+                                 physical->sizes().end());
+    if (transposed) {
+      std::reverse(shape.begin(), shape.end());
+    }
+    return shape;
+  }
+
+  // The pieces of a MatMul/Gemm-shaped Linear layer this pass rewrites. `x`
+  // and `w` are always the *physical* (as-written-in-the-graph) values;
+  // `transpose_x`/`transpose_w` record whether runTransform still needs to
+  // insert a Transpose node to reach the logical [..., K] / [K, N] shape the
+  // rest of this pass's own math (`k`, `n`, and every use of LogicalShape)
+  // already assumes.
   struct Match {
     bool ok = false;
-    Value* x = nullptr;     // activation, rank >= 2, static last dim K
-    Value* w = nullptr;     // constant weight, 2-D
-    bool w_is_n_k = false;  // true: w is laid out [N, K] (Gemm transB=1);
-                            // false: w is laid out [K, N] (MatMul, or Gemm
-                            // transB=0)
-    Value* bias = nullptr;  // constant, rank <= 1, may be null
+    Value* x = nullptr;        // activation; LogicalShape(x, transpose_x)
+                               // has rank >= 2 and a static last dim K
+    bool transpose_x = false;  // Gemm transA != 0
+    Value* w = nullptr;        // constant weight; LogicalShape(w,
+                               // transpose_w) is 2-D [K, N]
+    bool transpose_w = false;  // Gemm transB != 0
+    Value* bias = nullptr;     // constant, rank <= 1, may be null
     int64_t k = 0;
     int64_t n = 0;
   };
@@ -114,6 +149,8 @@ struct FuseMatMulIntoConv final : public PredicateBasedPass {
     Match m;
     Node* mm = nullptr;
     Value* bias = nullptr;
+    bool transpose_x = false;
+    bool transpose_w = false;
 
     if (node->kind() == kAdd && node->inputs().size() == 2) {
       // Add is commutative, so the MatMul may be either operand. Exporters
@@ -147,12 +184,12 @@ struct FuseMatMulIntoConv final : public PredicateBasedPass {
       }
       mm = node;
     } else if (node->kind() == kGemm) {
-      const int64_t trans_a =
-          GetValueFromAttrWithDefault(node, ktransA, int64_t(0));
       const double alpha = GetValueFromAttrWithDefault(node, kalpha, 1.0);
-      if (trans_a != 0 || alpha != 1.0) {
+      if (alpha != 1.0) {
         return m;
       }
+      transpose_x = GetValueFromAttrWithDefault(node, ktransA, int64_t(0)) != 0;
+      transpose_w = GetValueFromAttrWithDefault(node, ktransB, int64_t(0)) != 0;
       mm = node;
     } else {
       return m;
@@ -160,11 +197,12 @@ struct FuseMatMulIntoConv final : public PredicateBasedPass {
 
     Value* x = mm->input(0);
     Value* w = mm->input(1);
-    bool w_is_n_k = false;
     if (mm->kind() == kGemm) {
-      const int64_t trans_b =
-          GetValueFromAttrWithDefault(mm, ktransB, int64_t(0));
-      w_is_n_k = trans_b != 0;
+      // Gemm's A/B are strictly 2-D; a Transpose<perm=[1,0]> only implements
+      // transA/transB for that rank.
+      if (!x->has_sizes() || x->sizes().size() != 2) {
+        return m;
+      }
       if (mm->inputs().size() == 3) {
         const double beta = GetValueFromAttrWithDefault(mm, kbeta, 1.0);
         if (beta != 1.0) {
@@ -177,7 +215,7 @@ struct FuseMatMulIntoConv final : public PredicateBasedPass {
     if (!x->has_sizes()) {
       return m;
     }
-    const auto& x_shape = x->sizes();
+    const std::vector<Dimension> x_shape = LogicalShape(x, transpose_x);
     if (x_shape.size() < 2 || !x_shape.back().is_int) {
       return m;
     }
@@ -186,22 +224,14 @@ struct FuseMatMulIntoConv final : public PredicateBasedPass {
     if (!IsConstantTensor(w) || !w->has_sizes()) {
       return m;
     }
-    const auto& w_shape = w->sizes();
+    const std::vector<Dimension> w_shape = LogicalShape(w, transpose_w);
     if (w_shape.size() != 2 || !w_shape[0].is_int || !w_shape[1].is_int) {
       return m;
     }
-    int64_t n_out;
-    if (w_is_n_k) {
-      if (w_shape[1].dim != k) {
-        return m;
-      }
-      n_out = w_shape[0].dim;
-    } else {
-      if (w_shape[0].dim != k) {
-        return m;
-      }
-      n_out = w_shape[1].dim;
+    if (w_shape[0].dim != k) {
+      return m;
     }
+    const int64_t n_out = w_shape[1].dim;
 
     if (bias != nullptr) {
       if (!IsConstantTensor(bias) || !bias->has_sizes()) {
@@ -236,8 +266,9 @@ struct FuseMatMulIntoConv final : public PredicateBasedPass {
 
     m.ok = true;
     m.x = x;
+    m.transpose_x = transpose_x;
     m.w = w;
-    m.w_is_n_k = w_is_n_k;
+    m.transpose_w = transpose_w;
     m.bias = bias;
     m.k = k;
     m.n = n_out;
@@ -245,6 +276,19 @@ struct FuseMatMulIntoConv final : public PredicateBasedPass {
   }
 
   bool patternMatchPredicate(Node* n) override { return MatchNode(n).ok; }
+
+  // Inserts a Transpose<perm=[1,0]> of ``v`` right before ``anchor`` and
+  // returns its output, unconditionally -- callers decide whether the
+  // transpose is needed (``Match::transpose_x``/``transpose_w``) and skip
+  // calling this when it is not; this never itself pattern-matches the
+  // shape to decide whether to skip emitting the node.
+  static Value* InsertTranspose(Graph& graph, Value* v, Node* anchor) {
+    Node* transpose = graph.create(kTranspose, 1);
+    transpose->addInput(v);
+    transpose->is_(kperm, std::vector<int64_t>{1, 0});
+    transpose->insertBefore(anchor);
+    return transpose->output();
+  }
 
   bool runTransform(Node* n, Graph& graph,
                     NodeDestroyType& destroy_current) override {
@@ -254,28 +298,36 @@ struct FuseMatMulIntoConv final : public PredicateBasedPass {
       return false;
     }
 
-    const auto& x_shape = match.x->sizes();
+    // X, transposed into logical [..., K] form if Gemm's transA asked for it.
+    // A real Gemm transA=1 has no inverse anywhere else in this rewrite, so
+    // this Transpose is genuine work and stays in the final graph -- unlike
+    // W's transpose_w handling below, there is nothing for
+    // eliminate_nop_transpose/fuse_consecutive_transposes to cancel it with.
+    Value* x_logical =
+        match.transpose_x ? InsertTranspose(graph, match.x, n) : match.x;
+    const std::vector<Dimension> x_shape =
+        LogicalShape(match.x, match.transpose_x);
     const int64_t rank = static_cast<int64_t>(x_shape.size());
 
     // X2 = Reshape(X, [-1, K, 1])
     Node* pre = graph.create(kReshape, 1);
-    pre->addInput(match.x);
+    pre->addInput(x_logical);
     pre->addInput(
         MakeInt64Constant(graph, {-1, match.k, 1}, nextReservedName(graph)));
     pre->insertBefore(n);
 
-    // W2 = [N, K, 1], built from W by Transpose (if laid out [K, N]) then
-    // Unsqueeze. Both operate on a constant, so the constant folder
-    // materializes W2 as a plain initializer (fuse_mul_into_conv's own
-    // weight-folding convention).
-    Value* w2 = match.w;
-    if (!match.w_is_n_k) {
-      Node* transpose = graph.create(kTranspose, 1);
-      transpose->addInput(w2);
-      transpose->is_(kperm, std::vector<int64_t>{1, 0});
-      transpose->insertBefore(n);
-      w2 = transpose->output();
-    }
+    // W2 = [N, K, 1]: normalize W to logical [K, N] (inserting a Transpose
+    // for Gemm's transB, same as X above) and then -- always, never
+    // conditionally skipped -- Transpose again into Conv's own [N, K]
+    // weight-axis order plus a trailing Unsqueeze for the 1-D spatial dim.
+    // When transB already put W in that same [N, K] layout, the two
+    // Transpose<perm=[1,0]> nodes compose to a no-op that
+    // fuse_consecutive_transposes/eliminate_nop_transpose (both already in
+    // the default fuse/elimination set this opt-in pass runs alongside)
+    // delete outright -- see this file's own top comment.
+    Value* w_logical =
+        match.transpose_w ? InsertTranspose(graph, match.w, n) : match.w;
+    Value* w2 = InsertTranspose(graph, w_logical, n);
     {
       Node* unsqueeze = graph.create(kUnsqueeze, 1);
       unsqueeze->addInput(w2);
@@ -346,9 +398,11 @@ struct FuseMatMulIntoConv final : public PredicateBasedPass {
       post->addInput(MakeInt64Constant(graph, std::move(out_shape),
                                        nextReservedName(graph)));
     } else {
-      // shape(X) -> slice off the last dim -> concat with [N]
+      // shape(X) -> slice off the last dim -> concat with [N]. X here is
+      // x_logical (already transposed if transpose_x), so "the last dim" is
+      // K in logical order, matching x_shape/leading_dims above.
       Node* shape = graph.create(Symbol("Shape"), 1);
-      shape->addInput(match.x);
+      shape->addInput(x_logical);
       shape->insertBefore(n);
 
       Node* slice = graph.create(kSlice, 1);

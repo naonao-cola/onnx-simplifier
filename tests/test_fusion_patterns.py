@@ -321,7 +321,12 @@ def test_fuse_gemm_into_conv_transb():
     # A plain nn.Linear typically exports as Gemm(X, W, B, transB=1) (W kept
     # in its natural [out, in] layout). fuse_matmul_into_conv also rewrites
     # this shape, not just MatMul -- no default pass turns Gemm back into
-    # MatMul, so no skipped_optimizers is needed here.
+    # MatMul, so no skipped_optimizers is needed here. fuse_matmul_into_conv
+    # itself never special-cases transB=1 to skip inserting a Transpose for
+    # W (it always builds the Conv weight the same way regardless of
+    # layout); the default fuse set's own fuse_consecutive_transposes +
+    # eliminate_nop_transpose cancel the resulting Transpose<perm=[1,0]>
+    # pair, so no Transpose survives either.
     W = np.random.randn(8, 16)  # [N, K], transB=1
     B = np.random.randn(8)
     model = _model(
@@ -336,17 +341,38 @@ def test_fuse_gemm_into_conv_transb():
     _, ops = _simplify_extra(model, extra_optimizers=["fuse_matmul_into_conv"])
     assert ops["Conv"] == 1
     assert ops["Gemm"] == 0
+    assert ops["Transpose"] == 0
 
 
-def test_fuse_matmul_into_conv_declines_non_default_gemm():
-    # transA=1 rescales which axis of X is contracted; fuse_matmul_into_conv
-    # only handles the plain transA=0 shape and leaves this Gemm untouched.
+def test_fuse_gemm_into_conv_transa():
+    # transA=1 has no counterpart anywhere else in the rewrite to cancel
+    # against, so -- unlike transB above -- the Transpose(X) this pass
+    # inserts for it is genuine work and survives in the final graph.
     W = np.random.randn(16, 8)
     model = _model(
         """
         g (float[16,4] X) => (float[4,8] Y)
         {
           Y = Gemm<transA = 1>(X, W)
+        }
+        """,
+        initializer=[_f32(W, "W")],
+    )
+    _, ops = _simplify_extra(model, extra_optimizers=["fuse_matmul_into_conv"])
+    assert ops["Conv"] == 1
+    assert ops["Gemm"] == 0
+    assert ops["Transpose"] == 1
+
+
+def test_fuse_matmul_into_conv_declines_non_default_alpha():
+    # alpha != 1 would need the folded weight rescaled; fuse_matmul_into_conv
+    # doesn't do that and leaves this Gemm untouched.
+    W = np.random.randn(16, 8)
+    model = _model(
+        """
+        g (float[4,16] X) => (float[4,8] Y)
+        {
+          Y = Gemm<alpha = 2.0>(X, W)
         }
         """,
         initializer=[_f32(W, "W")],
