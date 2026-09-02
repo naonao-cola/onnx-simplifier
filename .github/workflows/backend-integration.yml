@@ -1,10 +1,11 @@
 name: Backend Integration
 
 # End-to-end regression tests that feed onnxsim's simplified output into other
-# ONNX-consuming compiler/runtime stacks (Apache TVM, nncase, Halide, tinygrad) or
-# quantize-then-simplify pipelines (NVIDIA ModelOpt) — tests/test_tvm_integration.py,
-# tests/test_nncase_integration.py, tests/test_halide_integration.py,
-# tests/test_tinygrad_integration.py, tests/test_modelopt_integration.py. See
+# ONNX-consuming compiler/runtime stacks (Apache TVM, nncase, Halide, tinygrad,
+# PyTorch via onnx2torch) or quantize-then-simplify pipelines (NVIDIA ModelOpt) —
+# tests/test_tvm_integration.py, tests/test_nncase_integration.py,
+# tests/test_halide_integration.py, tests/test_tinygrad_integration.py,
+# tests/test_torch_integration.py, tests/test_modelopt_integration.py. See
 # docs/dlpack-executor.md, which frames the DLPack executor boundary as an
 # "embeddability" seam for stacks like these.
 #
@@ -17,12 +18,12 @@ name: Backend Integration
 # shared with every test job, exactly like model-regression.yml already does
 # for its shards.
 #
-# None of apache-tvm / nncase / halide / tinygrad / nvidia-modelopt are part
-# of onnxsim's test requirements (nncase needs the .NET runtime; modelopt
-# drags in torch + CUDA wheels), so this runs in its own workflow instead of
-# the build-and-test matrix. Runs on PRs that touch the harness or the
-# simplifier, on a daily schedule to catch new releases of the downstream
-# tools, and on demand.
+# None of apache-tvm / nncase / halide / tinygrad / torch+onnx2torch /
+# nvidia-modelopt are part of onnxsim's test requirements (nncase needs the
+# .NET runtime; modelopt and the torch job drag in torch + CUDA wheels), so
+# this runs in its own workflow instead of the build-and-test matrix. Runs on
+# PRs that touch the harness or the simplifier, on a daily schedule to catch
+# new releases of the downstream tools, and on demand.
 
 on:
   schedule:
@@ -34,6 +35,7 @@ on:
       - "tests/test_nncase_integration.py"
       - "tests/test_halide_integration.py"
       - "tests/test_tinygrad_integration.py"
+      - "tests/test_torch_integration.py"
       - "tests/test_modelopt_integration.py"
       - ".github/workflows/backend-integration.yml"
       - "onnxsim/onnx_simplifier.py"
@@ -206,6 +208,37 @@ jobs:
       - name: Run tinygrad integration tests
         working-directory: ${{ runner.temp }}
         run: pytest -v "$GITHUB_WORKSPACE/tests/test_tinygrad_integration.py"
+
+  torch:
+    name: Simplify and run on PyTorch (onnx2torch)
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - uses: actions/download-artifact@v8
+        with:
+          name: onnxsim-wheel-backend
+          path: wheelhouse
+      - name: Install onnxsim wheel + torch + onnx2torch
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pytest torch --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install pytest onnx2torch
+          python -m pip install wheelhouse/*.whl
+      - name: Verify the installed wheel is used (not the source tree)
+        working-directory: ${{ runner.temp }}
+        run: |
+          python -c "import onnxsim, onnxsim.onnxsim_cpp2py_export as m; print(onnxsim.__version__, m.__file__)"
+          python -c "import torch, onnx2torch; print('torch', torch.__version__, 'onnx2torch', onnx2torch.__file__)"
+      # Run from a neutral directory so the repo root's ./onnxsim source package
+      # (without the compiled extension) does not shadow the installed wheel.
+      - name: Run torch integration tests
+        working-directory: ${{ runner.temp }}
+        run: pytest -v "$GITHUB_WORKSPACE/tests/test_torch_integration.py"
 
   modelopt:
     name: Quantize with ModelOpt and simplify
