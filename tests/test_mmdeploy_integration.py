@@ -53,7 +53,9 @@ import onnx.numpy_helper
 import pytest
 from onnx import parser
 
-torch = pytest.importorskip("torch", reason="mmdeploy needs torch, which is not installed")
+torch = pytest.importorskip(
+    "torch", reason="mmdeploy needs torch, which is not installed"
+)
 ort_wrapper_mod = pytest.importorskip(
     "mmdeploy.backend.onnxruntime.wrapper",
     reason="mmdeploy is not installed",
@@ -189,9 +191,7 @@ def test_mmdeploy_ortwrapper_shape_reshape_chain(tmp_path):
     sim_out = _run_with_ort_wrapper(sim_model, feeds, tmp_path, "sim_reshape")
 
     for name in orig_out:
-        torch.testing.assert_close(
-            orig_out[name], sim_out[name], rtol=1e-5, atol=1e-6
-        )
+        torch.testing.assert_close(orig_out[name], sim_out[name], rtol=1e-5, atol=1e-6)
 
 
 def test_mmdeploy_ortwrapper_output_matches_onnx_reference(tmp_path):
@@ -213,6 +213,4 @@ def test_mmdeploy_ortwrapper_output_matches_onnx_reference(tmp_path):
     reference_out = evaluator.run(output_names, np_feeds)
 
     for name, ref in zip(output_names, reference_out):
-        np.testing.assert_allclose(
-            wrapped_out[name].numpy(), ref, rtol=1e-4, atol=1e-5
-        )
+        np.testing.assert_allclose(wrapped_out[name].numpy(), ref, rtol=1e-4, atol=1e-5)
