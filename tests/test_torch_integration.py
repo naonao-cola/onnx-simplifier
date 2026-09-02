@@ -165,6 +165,12 @@ def _run_with_torch(model: onnx.ModelProto, feeds):
     when there is more than one output.
     """
     torch_model = onnx2torch.convert(model)
+    # onnx2torch.convert returns an nn.Module in the default training mode;
+    # some converters (e.g. BatchNormalization, when its scale/bias/mean/var
+    # are all initializers) build a plain nn.BatchNormNd internally, which
+    # uses batch statistics instead of the supplied running mean/var while
+    # training. eval() switches it to ONNX's (always inference-mode) BN math.
+    torch_model.eval()
     initializer_names = {init.name for init in model.graph.initializer}
     args = [
         torch.from_numpy(feeds[inp.name])
