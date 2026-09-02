@@ -348,6 +348,7 @@ for _onnx_op, _mil_op in [
     ("Pow", "pow"),
     ("Equal", "equal"),
     ("LessOrEqual", "less_equal"),
+    ("Greater", "greater"),
     ("And", "logical_and"),
 ]:
     _OP_HANDLERS[_onnx_op] = _simple_binary(_mil_op)

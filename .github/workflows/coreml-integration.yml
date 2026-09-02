@@ -401,6 +401,34 @@ jobs:
               --prompt "The capital of France is" --max-new-tokens 20
             echo '```'
           } | tee -a "$GITHUB_STEP_SUMMARY"
+      # Only the plain-matmul vs. matmul-to-conv baseline pair -- this step
+      # exists to answer one specific question (does --matmul-to-conv
+      # actually move ops onto a different Core ML compute unit, or did its
+      # measured slowdown happen on the same unit as the matmul baseline --
+      # see scripts/apple/README.md's "matmul-to-conv1x1" section), not to
+      # profile every matrix entry.
+      - name: Compute-unit device placement (MLComputePlan)
+        if: matrix.slug == 'smollm2-135m' || matrix.slug == 'smollm2-135m-conv'
+        working-directory: ${{ runner.temp }}
+        run: |
+          clang -O2 -o coreml_compute_plan_trace \
+            "$GITHUB_WORKSPACE/scripts/apple/coreml_compute_plan_trace.m" \
+            -framework CoreML -framework Foundation
+          mkdir -p compiled
+          xcrun coremlcompiler compile ${{ matrix.slug }}.mlpackage compiled
+          mlmodelc=$(find compiled -maxdepth 1 -name '*.mlmodelc')
+          {
+            echo "### Compute-unit placement: ${{ matrix.model_id }} (${{ matrix.slug }})"
+            echo '```'
+            ./coreml_compute_plan_trace "$mlmodelc" ${{ matrix.slug }}-compute-plan.json
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Upload compute-plan trace
+        if: matrix.slug == 'smollm2-135m' || matrix.slug == 'smollm2-135m-conv'
+        uses: actions/upload-artifact@v7
+        with:
+          name: compute-plan-${{ matrix.slug }}
+          path: ${{ runner.temp }}/${{ matrix.slug }}-compute-plan.json
 
   quality-eval-macos:
     name: Run quality/retention eval (macOS, real Core ML)
