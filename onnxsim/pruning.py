@@ -17647,17 +17647,19 @@ def _analyze_structured_pruning_matmul_nbits(
     ``"matmul_nbits"`` regardless -- unlike the QDQ family's own Conv/MatMul
     split, that distinction isn't split into its own family string.
 
-    A chain whose keep-set doesn't happen to align to the consumer's own
-    `block_size` boundaries (:func:`_matmul_nbits_block_aligned_keep_blocks`
-    returning ``None`` -- an individual K-column can't be dropped without
-    re-quantizing its whole block, out of scope) is also reported
-    `would_drop=0`/`margin=None`, mirroring the real function's own decline
-    of that chain entirely (both producer and consumer left completely
-    untouched, rather than a partial-block re-quantization or a
-    disagreeing keep-set between the two) -- this is a genuinely matched
-    unit the real call still declines to touch, so it gets a report row
-    here too, unlike `not_eligible` (reserved for topology
-    :func:`_find_matmul_nbits_chains` never recognized at all).
+    A chain whose consumer is ``MatMulNBits`` and whose keep-set doesn't
+    happen to align to that consumer's own `block_size` boundaries
+    (:func:`_matmul_nbits_block_aligned_keep_blocks` returning ``None`` -- an
+    individual K-column can't be dropped without re-quantizing its whole
+    block, out of scope) is also reported `would_drop=0`/`margin=None`,
+    mirroring the real function's own decline of that chain entirely (both
+    producer and consumer left completely untouched, rather than a
+    partial-block re-quantization or a disagreeing keep-set between the
+    two) -- this is a genuinely matched unit the real call still declines to
+    touch, so it gets a report row here too, unlike `not_eligible` (reserved
+    for topology :func:`_find_matmul_nbits_chains` never recognized at all).
+    A plain-float consumer has no block structure, so this check never
+    applies to it -- mirrors the real call's own `isinstance` dispatch.
 
     A degenerate chain naming the exact same weight in both the producer
     and consumer role gets no report row at all (mirroring

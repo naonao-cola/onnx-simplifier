@@ -22386,6 +22386,117 @@ def test_matmul_nbits_pruning_declines_mixed_qdq_chain():
     assert inits_before == inits_after
 
 
+def test_analyze_structured_pruning_matmul_nbits_mixed_chain_does_not_crash():
+    # _analyze_structured_pruning_matmul_nbits (the dry-run sensitivity
+    # mirror) must handle a MIXED MatMulNBits/plain-float chain exactly like
+    # apply_structured_pruning_matmul_nbits itself does -- neither side of
+    # _MatMulNBitsChainSide is guaranteed to be a _MatMulNBitsWeight (see
+    # _find_matmul_nbits_chains's own docstring), so code that reaches for a
+    # _MatMulNBitsWeight-only attribute (``b_init``, ``k_blocks``,
+    # ``block_size``) unconditionally on either side would raise
+    # AttributeError the first time a chain's producer or consumer turns out
+    # to be the plain-float _PlainMatMulNBitsPeer instead. Reuses both mixed
+    # models the apply()-side oracle tests above already built (the plain
+    # producer here has no block structure of its own, so this only
+    # exercises the ``b_init``/producer-key half of that bug; the
+    # MatMulNBits-producer model exercises the ``k_blocks``/``block_size``
+    # consumer half), and cross-checks the sensitivity report's `would_drop`
+    # against what the real apply() call actually prunes.
+    N1, K1, Out, block_size = 32, 64, 8, 16
+    rng = np.random.default_rng(120)
+    W1 = rng.standard_normal((N1, K1)).astype(np.float32) * 0.2
+    W1[:16] *= 6.0
+    bias1 = (rng.standard_normal(N1) * 0.05).astype(np.float32)
+    qcodes1, scales1, zp1, kb1 = _nbits_quantize_block(W1, block_size)
+    B1 = _nbits_pack_B(qcodes1, N1, kb1, block_size)
+    ZP1 = _nbits_pack_codes(zp1, 4)
+    W2 = rng.standard_normal((N1, Out)).astype(np.float32) * 0.3
+
+    node1 = _nbits_node(
+        "mm1", "A", "h1", "B1", "scales1", "zp1", "bias1", N1, K1, block_size
+    )
+    act = onnx.helper.make_node("Relu", ["h1"], ["h1_act"])
+    node2 = onnx.helper.make_node("MatMul", ["h1_act", "W2"], ["Y"], name="mm2")
+    graph = onnx.helper.make_graph(
+        [node1, act, node2],
+        "g",
+        inputs=[
+            onnx.helper.make_tensor_value_info("A", onnx.TensorProto.FLOAT, [3, K1])
+        ],
+        outputs=[
+            onnx.helper.make_tensor_value_info("Y", onnx.TensorProto.FLOAT, [3, Out])
+        ],
+        initializer=[
+            onnx.numpy_helper.from_array(B1, name="B1"),
+            onnx.numpy_helper.from_array(scales1, name="scales1"),
+            onnx.numpy_helper.from_array(ZP1, name="zp1"),
+            onnx.numpy_helper.from_array(bias1, name="bias1"),
+            onnx.numpy_helper.from_array(W2, name="W2"),
+        ],
+    )
+    model_nbits_producer = onnx.helper.make_model(
+        graph,
+        opset_imports=[
+            onnx.helper.make_opsetid("", 21),
+            onnx.helper.make_opsetid("com.microsoft", 1),
+        ],
+    )
+    model_nbits_producer.ir_version = 10
+    onnx.checker.check_model(model_nbits_producer)
+
+    N1b, K1b, N2b, block_sizeb = 32, 64, 8, 16
+    rngb = np.random.default_rng(122)
+    W1b = rngb.standard_normal((K1b, N1b)).astype(np.float32) * 0.2
+    W1b[:, :16] *= 6.0
+    W2b = rngb.standard_normal((N2b, N1b)).astype(np.float32) * 0.2
+    qcodes2b, scales2b, zp2b, kb2b = _nbits_quantize_block(W2b, block_sizeb)
+    B2b = _nbits_pack_B(qcodes2b, N2b, kb2b, block_sizeb)
+    ZP2b = _nbits_pack_codes(zp2b, 4)
+
+    node1b = onnx.helper.make_node("MatMul", ["A", "W1"], ["h1"], name="mm1")
+    actb = onnx.helper.make_node("Relu", ["h1"], ["h1_act"])
+    node2b = _nbits_node(
+        "mm2", "h1_act", "Y", "B2", "scales2", "zp2", None, N2b, N1b, block_sizeb
+    )
+    graphb = onnx.helper.make_graph(
+        [node1b, actb, node2b],
+        "g",
+        inputs=[
+            onnx.helper.make_tensor_value_info("A", onnx.TensorProto.FLOAT, [3, K1b])
+        ],
+        outputs=[
+            onnx.helper.make_tensor_value_info("Y", onnx.TensorProto.FLOAT, [3, N2b])
+        ],
+        initializer=[
+            onnx.numpy_helper.from_array(W1b, name="W1"),
+            onnx.numpy_helper.from_array(B2b, name="B2"),
+            onnx.numpy_helper.from_array(scales2b, name="scales2"),
+            onnx.numpy_helper.from_array(ZP2b, name="zp2"),
+        ],
+    )
+    model_plain_producer = onnx.helper.make_model(
+        graphb,
+        opset_imports=[
+            onnx.helper.make_opsetid("", 21),
+            onnx.helper.make_opsetid("com.microsoft", 1),
+        ],
+    )
+    model_plain_producer.ir_version = 10
+    onnx.checker.check_model(model_plain_producer)
+
+    for model in (model_nbits_producer, model_plain_producer):
+        report = onnxsim.analyze_pruning_sensitivity(
+            model, onnxsim.apply_structured_pruning_matmul_nbits, sparsity=0.5
+        )
+        assert report.not_eligible == []
+        assert len(report.layers) == 1
+        layer = report.layers[0]
+        pruned = onnxsim.apply_structured_pruning_matmul_nbits(model, sparsity=0.5)
+        pruned_n1 = next(t for t in pruned.graph.initializer if t.name in ("B1", "W1"))
+        real_n1 = pruned_n1.dims[0] if pruned_n1.name == "B1" else pruned_n1.dims[1]
+        assert layer.would_drop == layer.total - real_n1
+
+
 def test_matmul_nbits_pruning_zero_sparsity_is_a_no_op():
     N1, K1, N2, block_size = 32, 64, 8, 16
     rng = np.random.default_rng(116)
