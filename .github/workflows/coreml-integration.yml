@@ -289,13 +289,13 @@ jobs:
             dtype: fp32
             quantize_weights: none
             matmul_to_conv: "true"
-          # Both flags together -- int8 targets bandwidth, matmul-to-conv
-          # targets compute, and nothing about them should interact (int8
-          # only changes how the weight constants are stored/dequantized
-          # before the op runs; matmul-to-conv only changes which op the
-          # dequantized weight feeds into), but that's an assumption, not a
-          # measurement. This entry checks it directly rather than inferring
-          # it from the two isolated entries above.
+          # Both flags together -- measured worse than either alone: 2.26
+          # tok/s vs. 3.61 baseline, 4.64 int8-only, 3.04 conv-only (see the
+          # README's "matmul-to-conv1x1" section). Not the neutral
+          # composition the two flags' independent scopes (weight storage
+          # vs. which op consumes it) would suggest. Kept here as a
+          # regression check now that this is known, not because either
+          # flag is expected to be enabled together in practice.
           - model_id: HuggingFaceTB/SmolLM2-135M-Instruct
             slug: smollm2-135m-int8-conv
             max_context_length: 512

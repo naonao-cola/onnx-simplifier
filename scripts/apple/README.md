@@ -327,6 +327,19 @@ matmul-to-conv only changes which op the dequantized weight feeds into, so
 they shouldn't interact, but that's an assumption worth checking rather than
 trusting.
 
+**Measured, and they don't compose neutrally.** Same run, same runner, same
+model as the table above: baseline 3.61 tok/s, `--quantize-weights int8`
+alone 4.64 (+28.5%), `--matmul-to-conv` alone 3.04 (-16%), **both together
+2.26 (-37% vs. baseline, worse than either flag alone and worse than
+picking just int8)**. Mean decode step latency follows the same pattern
+(441.6ms combined vs. 215.5ms int8-only). Whatever's behind
+`--matmul-to-conv`'s standalone slowdown -- the added transpose/conv/
+transpose bookkeeping around every projection, most likely -- evidently
+gets worse, not better, once the weights it operates on are also
+quantized, rather than the two costs just adding. Reinforces the same
+conclusion from the solo measurement above: `--matmul-to-conv` isn't worth
+enabling for this pipeline's shapes, combined with int8 or otherwise.
+
 ### Quality and retention eval (`run_quality_eval.py` / `compute_retention.py`)
 
 The decode benchmark and parity check above measure speed and short-generation
