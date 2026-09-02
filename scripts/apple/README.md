@@ -110,13 +110,95 @@ methodology.
   Core ML's runtime lives); the export step itself needs no Apple hardware.
 
 `coreml-integration.yml`'s `benchmark-decode-macos` job runs this exact pair
-end-to-end on a macOS GitHub-hosted runner, over a small matrix
-(`HuggingFaceTB/SmolLM2-135M-Instruct` and `Qwen/Qwen2.5-1.5B-Instruct` --
-the two architecture families already validated by
-`prepare_benchmark_models.py`, so a translator regression specific to one
-doesn't hide behind the other passing), posting each model's numbers to that
-run's job summary -- `workflow_dispatch`/schedule-only, like the other
+end-to-end on a macOS GitHub-hosted runner, over a matrix spanning the
+smoke-test tier (`HuggingFaceTB/SmolLM2-135M-Instruct`, plus its
+`--quantize-weights`/`--matmul-to-conv` variants -- see below) and the
+few-billion-parameter tier DeviceMark's own leaderboard actually tests
+(`HuggingFaceTB/SmolLM2-1.7B-Instruct`, `Qwen/Qwen2.5-1.5B-Instruct`,
+`Qwen/Qwen2.5-3B-Instruct`, `meta-llama/Llama-3.2-1B-Instruct`,
+`meta-llama/Llama-3.2-3B-Instruct`, `microsoft/Phi-3.5-mini-instruct`) --
+multiple architecture families (Llama-style, Qwen2, Phi-3's fused
+`qkv_proj`/`gate_up_proj` projections) so a translator regression specific
+to one doesn't hide behind another passing. The `Llama-3.2-*` entries are
+gated (need `HF_TOKEN`, same read-only CI secret
+`prepare_benchmark_models.py` already uses); `Qwen2.5-3B-Instruct` and
+`Llama-3.2-3B-Instruct` previously OOM'd during ONNX export/trace in a
+15GB-RAM dev sandbox (see `prepare_benchmark_models.py`'s `BENCHMARK_MODELS`
+notes) -- not a translator issue, but untested on the CI runner's own
+memory until this matrix actually runs them. Posts each model's numbers to
+that run's job summary -- `workflow_dispatch`/schedule-only, like the other
 real-model jobs in that workflow, not on every PR.
+
+### Theoretical ceiling
+
+`run_llm_decode_benchmark.py` reports a decode tok/s number, but not what to
+expect from it. This section gives a back-of-envelope ceiling to compare a
+measured number against, sourced from Manjeet Singh's reverse-engineering of
+the M4 Neural Engine ("Inside the M4 ANE, Part 4: The Complete Machine",
+[maderix.github.io](https://maderix.github.io/articles/inside-the-m4-ane-part-4/),
+Aug 2026) -- the only public source we're aware of with hardware-level,
+measured (not marketing) numbers for this chip.
+
+**M4 ANE (H16G, 16 cores), measured:**
+
+| | |
+| --- | --- |
+| fp16 peak | 19 TFLOPS (18.77 TFLOPS / 98.8% of ceiling measured on a 64-layer conv1x1 chain -- a single isolated matmul only reaches ~30%) |
+| W8A8 (packed int8) peak | 38 TOPS (36.01 TOPS measured) |
+| Power at fp16 peak | 4.57 W (4.1 TFLOPS/W); 0 mW idle |
+| Unified DRAM bandwidth | 120 GB/s, shared with the CPU and GPU |
+| Dispatch floor | ~90 µs of host-side (XPC) overhead per ANE program submission, independent of the work submitted |
+
+**Why decode is bandwidth-bound, not compute-bound.** A single greedy decode
+step (this benchmark's shape: batch 1, one new token, reusing the KV cache)
+does roughly `2 x parameter_count` FLOPs of *compute* -- for
+`Qwen/Qwen2.5-1.5B-Instruct`, about 3 GFLOP, ~160 µs at the ANE's 19 TFLOPS
+ceiling. But producing that token requires reading essentially the entire
+weight set once (nothing amortizes a weight read across tokens at batch
+size 1, unlike prefill's one-pass-over-the-whole-prompt or a
+multi-sequence-batched server), and moving those bytes is the actual
+constraint:
+
+```
+decode tok/s ceiling ≈ DRAM bandwidth / weight bytes read per token
+                      ≈ 120 GB/s / (model parameter count x bytes per weight)
+```
+
+| Model | Params | fp16 weights | fp16 ceiling | int8-weight ceiling |
+| --- | --- | --- | --- | --- |
+| `HuggingFaceTB/SmolLM2-135M-Instruct` | 135M | 270 MB | ~444 tok/s | ~889 tok/s |
+| `Qwen/Qwen2.5-1.5B-Instruct` | 1.5B | 3.0 GB | ~40 tok/s | ~80 tok/s |
+| `HuggingFaceTB/SmolLM2-1.7B-Instruct` | 1.7B | 3.4 GB | ~35 tok/s | ~71 tok/s |
+
+For every model in this table, the bandwidth-bound time per token (µs to
+low-ms) is well past both the ~90 µs ANE dispatch floor and the sub-200 µs
+compute time -- so at these sizes, dispatch overhead and raw FLOPs are noise
+next to weight-streaming time, and the lever that actually moves decode tok/s
+is **bytes per weight**, not compute throughput. (The article's own explicit
+finding backs the general shape of this: *"For LLM inference, prefill
+provides the large matrix operations that suit the ANE. Token-by-token
+decode contains smaller operations for which the 90 µs submission cost can
+dominate, making CPU/SME execution more suitable"* -- true for a
+small-enough model or a system where the ANE isn't reading gigabytes of
+weights per step, but bandwidth dominates first at the model sizes in this
+suite.)
+
+This is also why W8A8 (packed int8 *compute*, up to 1.95x the fp16 rate per
+the article's own measurements) isn't the right lever here: it speeds up the
+compute time we've just shown is already negligible, and per the same
+article, weight-only int8 with fp16 activations "stays on the fp16 compute
+path" -- no compute speedup at all. What halving weight bytes *does* help,
+regardless of compute path, is the number in the denominator above:
+`--quantize-weights` (below) is aimed squarely at that, not at compute
+throughput.
+
+**Caveats:** this ceiling assumes the full 120 GB/s is available to weight
+streaming alone (no contention from the KV-cache read/write, other
+processes, or `MLComputeUnits=ALL` routing some ops to the GPU/CPU instead,
+each with their own bandwidth share); it is an optimistic upper bound, not a
+number `run_llm_decode_benchmark.py` should be expected to hit. It is also
+specific to the M4 -- later chips (see "The M6: Dual ANE" in the source
+article) change these constants.
 
 ### Decode parity (`check_decode_parity.py`)
 
@@ -150,6 +232,124 @@ decode benchmark, once per matrix entry, also posting to the job summary.
 The pure comparison logic (`compare_token_sequences`) has no coremltools/
 torch/transformers dependency and is unit-tested directly in
 `tests/test_check_decode_parity.py`.
+
+### Weight-only quantization (`--quantize-weights`)
+
+The "Theoretical ceiling" section above works out that a decode step is
+bandwidth-bound, not compute-bound, at every model size this suite has
+tested -- the whole weight set has to be read from DRAM once per token
+regardless of how little arithmetic that token needs, since nothing
+amortizes a weight read across tokens at batch size 1. `--quantize-weights
+{int8,int4}` pulls the lever that actually follows from that: it applies
+`coremltools.optimize.coreml.linear_quantize_weights` to the *converted*
+Core ML model (`constexpr_affine_dequantize`, per-channel, symmetric),
+replacing full-precision weight constants with int8/int4 ones that get
+dequantized back to float on the fly at compute time.
+
+```bash
+python export_llm_to_coreml.py HuggingFaceTB/SmolLM2-135M-Instruct \
+    --max-context-length 512 --quantize-weights int8 --output smollm2-int8.mlpackage
+```
+
+Deliberately **not** the same thing as Core ML's packed W8A8 mode (int8
+weights *and* activations, which the M4 ANE can run at up to ~2x the fp16
+*compute* rate): this flag only quantizes weights, leaving activations and
+the actual compute in float, so it doesn't touch the ANE's compute
+throughput at all -- appropriately, since compute isn't the bottleneck here
+per the ceiling analysis. What it does do is roughly halve (int8) or
+quarter (int4) the bytes moved from DRAM per decode step, which is the side
+of the ceiling that's actually binding. `run_llm_decode_benchmark.py` and
+`check_decode_parity.py` both work unchanged against a quantized
+`.mlpackage` -- shapes and dtypes at the model's I/O boundary don't change,
+only the weight constants' on-disk/in-graph representation does.
+
+`coreml-integration.yml`'s `benchmark-decode-macos` job includes a
+`quantize_weights: int8` matrix entry (same model as the unquantized
+baseline) so both the decode-tok/s effect and decode parity are measured on
+real hardware, not just argued for from the theoretical ceiling.
+
+### matmul-to-conv1x1 (`--matmul-to-conv`)
+
+Where `--quantize-weights` targets the bandwidth side of the ceiling,
+`--matmul-to-conv` targets the *compute* side -- the M4 ANE's compute array
+parallelizes over convolution output channels, and its native `matmul` path
+measures well below conv1x1's throughput on the same hardware (see
+"Theoretical ceiling" above: a single matmul reaches ~30% of the fp16
+ceiling; a conv1x1 chain reaches ~99%). `onnxsim/coreml_export.py`'s
+translator normally lowers every ONNX `MatMul` straight to MIL's `matmul`;
+this flag makes it lower a **linear-projection** `MatMul` -- `x [batch,
+sequence, C_in] @ w [C_in, C_out]` with a compile-time-constant 2-D `w`,
+exactly the shape every attention/MLP projection in a transformer decoder
+takes -- to a 1x1/pointwise `conv` instead (transpose to conv1d's `[n, C_in,
+L]` layout, `conv` with a reshaped/transposed weight, transpose back; see
+`convert_to_coreml`'s docstring for exactly which shapes qualify). Any
+`MatMul` that doesn't match that shape (a non-constant or non-2-D weight, or
+`x` of any rank other than 3 -- the real, non-linear-projection attention
+score/context matmuls in every decoder layer, which multiply two activations
+together) is left on the native `matmul` path.
+
+```bash
+python export_llm_to_coreml.py HuggingFaceTB/SmolLM2-135M-Instruct \
+    --max-context-length 512 --matmul-to-conv --output smollm2-conv.mlpackage
+```
+
+Validated so far only at the level this dev sandbox can reach: the rewrite
+is unit-tested for numeric correctness via MIL constant-folding
+(`tests/test_coreml_export.py`, since `conv` itself has no
+`value_inference` to fold through directly, the tests instead pull its
+already-foldable `transpose`/`const` inputs and apply conv1x1's documented
+semantics in plain numpy against the same `MatMul` reference), and a full
+real-model export (`HuggingFaceTB/SmolLM2-135M-Instruct`) converts cleanly
+with an unchanged I/O signature and file size, replacing all 168
+linear-projection matmuls with `conv` while correctly leaving the ~60
+genuine attention-score/context matmuls alone. What that validation
+*cannot* show, lacking macOS/real Core ML in this environment, is whether
+it actually helps decode tok/s at this pipeline's shapes -- the measurements
+this flag is based on come from deep, wide conv1x1 chains (32-64 layers,
+512-1024 channels), not the single-token decode steps this suite mostly
+runs, and per-token sequence length here is far smaller than what those
+measurements used. `coreml-integration.yml`'s `benchmark-decode-macos` job
+includes a `matmul_to_conv: "true"` matrix entry (same model as the
+unquantized baseline, decode parity included) specifically to get that
+answer on real hardware; default it on only once that comparison actually
+shows an improvement.
+
+**Measured on real hardware** (`HuggingFaceTB/SmolLM2-135M-Instruct`,
+`benchmark-decode-macos`, same runner/run as the unquantized baseline): this
+flag made decode *slower*, not faster -- 2.82 tok/s vs. the matmul
+baseline's 3.62 tok/s (-22%), with prefill roughly 50% slower too (1538ms
+vs. 1025ms for 5 tokens). The opposite of what the raw ANE conv1x1-vs-matmul
+throughput numbers suggested: those come from long, wide conv1x1 chains, not
+this pipeline's short, mostly-single-token sequences, where the extra
+transpose/conv/transpose bookkeeping this rewrite adds around every
+projection apparently costs more than the ANE's per-op throughput gains
+recover. (For reference, `--quantize-weights int8` on the same model/run
+*did* help, as the bandwidth-bound theory predicted: 4.29 tok/s, +18.5% over
+the same baseline.) Stays opt-in and off by default; not revisiting unless a
+different model size/shape or a cheaper way to express the rewrite changes
+this result.
+
+`coreml-integration.yml`'s `benchmark-decode-macos` job also includes a
+`quantize_weights: int8` + `matmul_to_conv: "true"` matrix entry
+(`smollm2-135m-int8-conv`), checking the two flags together directly rather
+than assuming they compose from the two isolated results above -- int8 only
+changes how the weight constants are stored/dequantized before an op runs,
+matmul-to-conv only changes which op the dequantized weight feeds into, so
+they shouldn't interact, but that's an assumption worth checking rather than
+trusting.
+
+**Measured, and they don't compose neutrally.** Same run, same runner, same
+model as the table above: baseline 3.61 tok/s, `--quantize-weights int8`
+alone 4.64 (+28.5%), `--matmul-to-conv` alone 3.04 (-16%), **both together
+2.26 (-37% vs. baseline, worse than either flag alone and worse than
+picking just int8)**. Mean decode step latency follows the same pattern
+(441.6ms combined vs. 215.5ms int8-only). Whatever's behind
+`--matmul-to-conv`'s standalone slowdown -- the added transpose/conv/
+transpose bookkeeping around every projection, most likely -- evidently
+gets worse, not better, once the weights it operates on are also
+quantized, rather than the two costs just adding. Reinforces the same
+conclusion from the solo measurement above: `--matmul-to-conv` isn't worth
+enabling for this pipeline's shapes, combined with int8 or otherwise.
 
 ### Quality and retention eval (`run_quality_eval.py` / `compute_retention.py`)
 

@@ -12786,6 +12786,751 @@ def test_gqa_native_packed_query_convention_still_declined():
     assert pruned.SerializeToString() == model.SerializeToString()
 
 
+# --- apply_attention_head_pruning / _wanda_pruning -- GroupQueryAttention,
+# packed-QKV-then-Split, CPU/DirectML Q/K-norm + RoPE pass-through --
+#
+# The shape `_match_packed_qkv_split`'s own docstring names as deliberately
+# left unmatched by that function alone: onnxruntime-genai's model builder,
+# when Q/K-norm is requested but the fused in-op norm path isn't supported
+# (CPU/DirectML -- `is_fused_qk_norm_gqa_supported` only allows it on
+# CUDA/WebGPU), emits a per-head `Reshape` -> `SimplifiedLayerNormalization`
+# -> `Reshape` sandwich (`make_qk_norm`) and, unless RoPE is fused into the
+# op itself, a `com.microsoft::RotaryEmbedding` node (`make_rotary_embedding_op`)
+# between the packed-QKV `Split`'s own Q/K outputs and `GroupQueryAttention`'s
+# own Q/K inputs, norm before RoPE (`make_attention_qk_rope_and_norm`'s own
+# "Base order: norm first, then RoPE" comment) -- see
+# :func:`onnxsim.pruning._walk_back_through_qk_norm_rope`'s own docstring
+# for the exact topology and this module's own "Attention-head pruning"
+# section comment for the empirically-confirmed head-independence facts
+# (a `SimplifiedLayerNormalization`'s own `scale` and a `RotaryEmbedding`'s
+# own `cos_cache`/`sin_cache` never need slicing at all) that make this
+# pass-through safe -- the two direct tests immediately below are the
+# empirical confirmation that comment refers to; every other test in this
+# section builds on top of them via the full matcher/pruning path.
+
+
+def test_simplified_layer_norm_is_head_independent_for_pruning():
+    # Direct confirmation of this section's own head-independence claim for
+    # `SimplifiedLayerNormalization`, isolated from the rest of the pruning
+    # machinery: a `(batch, seq, num_heads * head_size)` tensor, reshaped to
+    # expose `head_size` as the last axis (`make_qk_norm`'s own subgraph
+    # shape), normalized with a `[head_size]` `scale` shared identically
+    # across every head, reshaped back. Dropping an arbitrary, non-contiguous
+    # subset of heads *before* running this norm must give bit-identical
+    # results, for the surviving heads, to running it on the full tensor
+    # first and dropping those same heads *after* -- exactly the property
+    # that makes slicing whole heads out of the packed weight upstream of
+    # this norm safe without touching the norm's own `scale` at all.
+    def _norm_model(batch, seq, num_heads, head_size, scale):
+        hidden = num_heads * head_size
+        body = f"""
+            g (float[{batch},{seq},{hidden}] X) => (float[{batch},{seq},{hidden}] Y)
+            {{
+              r1 = Reshape(X, Shape1)
+              ln = SimplifiedLayerNormalization <axis=-1, epsilon=1e-6> (r1, Scale)
+              Y = Reshape(ln, Shape2)
+            }}
+            """
+        return _model(
+            body,
+            initializer=[
+                onnx.numpy_helper.from_array(
+                    np.array([0, -1, head_size], dtype=np.int64), "Shape1"
+                ),
+                onnx.numpy_helper.from_array(
+                    np.array([0, -1, hidden], dtype=np.int64), "Shape2"
+                ),
+                _f32(scale, "Scale"),
+            ],
+            opset=17,
+        )
+
+    batch, seq, num_heads, head_size = 2, 5, 6, 8
+    rng = np.random.default_rng(101)
+    scale = rng.standard_normal((head_size,)).astype(np.float32)
+    x = rng.standard_normal((batch, seq, num_heads * head_size)).astype(np.float32)
+
+    full_model = _norm_model(batch, seq, num_heads, head_size, scale)
+    (y_full,) = _run(full_model, {"X": x})
+    y_full_heads = y_full.reshape(batch, seq, num_heads, head_size)
+
+    keep = [0, 2, 3, 5]  # arbitrary, non-contiguous
+    x_heads = x.reshape(batch, seq, num_heads, head_size)
+    x_sub = x_heads[:, :, keep, :].reshape(batch, seq, len(keep) * head_size)
+
+    sub_model = _norm_model(batch, seq, len(keep), head_size, scale)
+    (y_sub,) = _run(sub_model, {"X": x_sub})
+    y_sub_heads = y_sub.reshape(batch, seq, len(keep), head_size)
+
+    np.testing.assert_array_equal(y_sub_heads, y_full_heads[:, :, keep, :])
+
+
+def test_rotary_embedding_is_head_independent_for_pruning():
+    # Direct confirmation of this section's own head-independence claim for
+    # `com.microsoft::RotaryEmbedding`, isolated from the rest of the
+    # pruning machinery, across every `interleaved`/`rotary_embedding_dim`
+    # combination this pass supports: dropping an arbitrary,
+    # non-contiguous subset of heads before or after this op gives
+    # bit-identical results for the surviving heads either way, since
+    # `cos_cache`/`sin_cache` are looked up purely by position, never by
+    # head index.
+    def _rope_model(
+        batch, seq, num_heads, head_size, cos, sin, interleaved, rotary_embedding_dim
+    ):
+        hidden = num_heads * head_size
+        body = f"""
+            g (float[{batch},{seq},{hidden}] X, int64[{batch},{seq}] PosIds)
+              => (float[{batch},{seq},{hidden}] Y)
+            {{
+              Y = com.microsoft.RotaryEmbedding
+                <num_heads={num_heads}, interleaved={interleaved}, rotary_embedding_dim={rotary_embedding_dim}>
+                (X, PosIds, Cos, Sin)
+            }}
+            """
+        return _model(
+            body,
+            initializer=[_f32(cos, "Cos"), _f32(sin, "Sin")],
+            opset=17,
+        )
+
+    batch, seq, num_heads, head_size = 2, 5, 6, 8
+    rng = np.random.default_rng(102)
+    max_pos = 16
+    keep = [0, 2, 3, 5]  # arbitrary, non-contiguous
+
+    for interleaved, rotary_embedding_dim in ((0, 0), (1, 0), (0, head_size // 2)):
+        rot_dim = rotary_embedding_dim if rotary_embedding_dim > 0 else head_size
+        half = rot_dim // 2
+        cos = rng.standard_normal((max_pos, half)).astype(np.float32)
+        sin = rng.standard_normal((max_pos, half)).astype(np.float32)
+        x = rng.standard_normal((batch, seq, num_heads * head_size)).astype(np.float32)
+        position_ids = rng.integers(0, max_pos, size=(batch, seq)).astype(np.int64)
+
+        full_model = _rope_model(
+            batch,
+            seq,
+            num_heads,
+            head_size,
+            cos,
+            sin,
+            interleaved,
+            rotary_embedding_dim,
+        )
+        (y_full,) = _run(full_model, {"X": x, "PosIds": position_ids})
+        y_full_heads = y_full.reshape(batch, seq, num_heads, head_size)
+
+        x_heads = x.reshape(batch, seq, num_heads, head_size)
+        x_sub = x_heads[:, :, keep, :].reshape(batch, seq, len(keep) * head_size)
+        sub_model = _rope_model(
+            batch,
+            seq,
+            len(keep),
+            head_size,
+            cos,
+            sin,
+            interleaved,
+            rotary_embedding_dim,
+        )
+        (y_sub,) = _run(sub_model, {"X": x_sub, "PosIds": position_ids})
+        y_sub_heads = y_sub.reshape(batch, seq, len(keep), head_size)
+
+        np.testing.assert_array_equal(y_sub_heads, y_full_heads[:, :, keep, :])
+
+
+def _qk_norm_rope_body(
+    prefix,
+    raw_name,
+    gamma_name,
+    reshape1_shape_name,
+    reshape2_shape_name,
+    with_norm,
+    with_rope,
+    cos_name="CosCache",
+    sin_name="SinCache",
+    pos_name="PosIds",
+    interleaved=0,
+    rotary_embedding_dim=0,
+    rotary_num_heads=None,
+):
+    # Returns a text fragment (per CLAUDE.md's own guidance for a reusable
+    # node sequence) plus the name of the final tensor it leaves behind --
+    # `raw_name` itself, unchanged, when both `with_norm`/`with_rope` are
+    # False.
+    lines = []
+    cur = raw_name
+    if with_norm:
+        lines.append(f"{prefix}_r1 = Reshape({cur}, {reshape1_shape_name})")
+        lines.append(
+            f"{prefix}_ln = SimplifiedLayerNormalization <axis=-1, epsilon=1e-6> "
+            f"({prefix}_r1, {gamma_name})"
+        )
+        lines.append(f"{prefix}_normed = Reshape({prefix}_ln, {reshape2_shape_name})")
+        cur = f"{prefix}_normed"
+    if with_rope:
+        nh = rotary_num_heads if rotary_num_heads is not None else 0
+        lines.append(
+            f"{prefix}_rot = com.microsoft.RotaryEmbedding "
+            f"<num_heads={nh}, interleaved={interleaved}, "
+            f"rotary_embedding_dim={rotary_embedding_dim}> "
+            f"({cur}, {pos_name}, {cos_name}, {sin_name})"
+        )
+        cur = f"{prefix}_rot"
+    return "\n          ".join(lines), cur
+
+
+def _gqa_qk_norm_rope_model(
+    K=8,
+    H=8,
+    KVH=2,
+    D=8,
+    Out=6,
+    seed=0,
+    batch=2,
+    seq=5,
+    packed=True,
+    with_norm=True,
+    with_rope=True,
+    interleaved=0,
+    rotary_embedding_dim=0,
+    q_rotary_num_heads=None,
+    k_rotary_num_heads=None,
+    wqkv=None,
+    wq=None,
+    wk=None,
+    wv=None,
+    wout=None,
+    q_gamma=None,
+    k_gamma=None,
+    cos=None,
+    sin=None,
+    position_ids=None,
+    max_pos=32,
+    rope_before_norm=False,
+):
+    # Mirrors `_gqa_packed_model`'s (`packed=True`) and `_gqa_model`'s
+    # (`packed=False`) own scaffolding, with an optional per-head norm +
+    # RoPE pass-through -- see this section's own comment above -- spliced
+    # in between the raw Q/K branches and `GroupQueryAttention`'s own
+    # inputs. `packed=False` builds the ordinary three-independent-producer
+    # shape (used here as an *independently*-constructed oracle, the same
+    # role `_gqa_model` already plays for the packed tests above), still
+    # with the same optional norm/RoPE hop on each of its own Q/K branches.
+    rng = np.random.default_rng(seed)
+    Nq, Nkv = H * D, KVH * D
+    if wout is None:
+        wout = rng.standard_normal((Nq, Out)).astype(np.float32)
+    initializer = [_f32(wout, "Wout")]
+
+    if packed:
+        if wqkv is None:
+            wqkv = rng.standard_normal((K, Nq + 2 * Nkv)).astype(np.float32)
+        initializer.append(_f32(wqkv, "Wqkv"))
+        split_sizes = np.array([Nq, Nkv, Nkv], dtype=np.int64)
+        initializer.append(onnx.numpy_helper.from_array(split_sizes, "SplitSizes"))
+        producer_body = (
+            "qkv = MatMul(X, Wqkv)\n"
+            "          q_raw, k_raw, v = Split <axis = -1> (qkv, SplitSizes)"
+        )
+    else:
+        if wq is None:
+            wq = rng.standard_normal((K, Nq)).astype(np.float32)
+        if wk is None:
+            wk = rng.standard_normal((K, Nkv)).astype(np.float32)
+        if wv is None:
+            wv = rng.standard_normal((K, Nkv)).astype(np.float32)
+        initializer += [_f32(wq, "Wq"), _f32(wk, "Wk"), _f32(wv, "Wv")]
+        producer_body = (
+            "q_raw = MatMul(X, Wq)\n"
+            "          k_raw = MatMul(X, Wk)\n"
+            "          v = MatMul(X, Wv)"
+        )
+
+    initializer.append(
+        onnx.numpy_helper.from_array(
+            np.full((batch,), seq - 1, dtype=np.int32), "SeqLensK"
+        )
+    )
+    initializer.append(
+        onnx.numpy_helper.from_array(np.array(seq, dtype=np.int32), "TotalSeq")
+    )
+
+    q_body, k_body, hop_body = "q_raw", "k_raw", ""
+    if with_norm or with_rope:
+        half = D // 2
+        if cos is None:
+            cos = rng.standard_normal((max_pos, half)).astype(np.float32)
+        if sin is None:
+            sin = rng.standard_normal((max_pos, half)).astype(np.float32)
+        if position_ids is None:
+            position_ids = np.tile(np.arange(seq, dtype=np.int64), (batch, 1))
+        initializer += [_f32(cos, "CosCache"), _f32(sin, "SinCache")]
+        initializer.append(onnx.numpy_helper.from_array(position_ids, "PosIds"))
+
+        if q_gamma is None:
+            q_gamma = rng.standard_normal((D,)).astype(np.float32)
+        if k_gamma is None:
+            k_gamma = rng.standard_normal((D,)).astype(np.float32)
+        initializer += [_f32(q_gamma, "QGamma"), _f32(k_gamma, "KGamma")]
+        initializer.append(
+            onnx.numpy_helper.from_array(
+                np.array([0, -1, D], dtype=np.int64), "QReshape1Shape"
+            )
+        )
+        initializer.append(
+            onnx.numpy_helper.from_array(
+                np.array([0, -1, Nq], dtype=np.int64), "QReshape2Shape"
+            )
+        )
+        initializer.append(
+            onnx.numpy_helper.from_array(
+                np.array([0, -1, D], dtype=np.int64), "KReshape1Shape"
+            )
+        )
+        initializer.append(
+            onnx.numpy_helper.from_array(
+                np.array([0, -1, Nkv], dtype=np.int64), "KReshape2Shape"
+            )
+        )
+
+        rope_kwargs = dict(
+            interleaved=interleaved, rotary_embedding_dim=rotary_embedding_dim
+        )
+        if not rope_before_norm:
+            q_text, q_body = _qk_norm_rope_body(
+                "q",
+                "q_raw",
+                "QGamma",
+                "QReshape1Shape",
+                "QReshape2Shape",
+                with_norm,
+                with_rope,
+                rotary_num_heads=q_rotary_num_heads,
+                **rope_kwargs,
+            )
+            k_text, k_body = _qk_norm_rope_body(
+                "k",
+                "k_raw",
+                "KGamma",
+                "KReshape1Shape",
+                "KReshape2Shape",
+                with_norm,
+                with_rope,
+                rotary_num_heads=k_rotary_num_heads,
+                **rope_kwargs,
+            )
+            hop_body = q_text + "\n          " + k_text
+        else:
+            # Adversarial (see `test_gqa_packed_qkv_rope_before_norm_is_declined`):
+            # RoPE applied *before* the norm sandwich -- the reverse of the
+            # real exporter's own order -- a shape
+            # `_walk_back_through_qk_norm_rope` doesn't recognize (it only
+            # ever crosses `RotaryEmbedding` as the *outermost* hop).
+            q_rope_text, q_rot = _qk_norm_rope_body(
+                "q",
+                "q_raw",
+                "QGamma",
+                "QReshape1Shape",
+                "QReshape2Shape",
+                False,
+                True,
+                rotary_num_heads=q_rotary_num_heads,
+                **rope_kwargs,
+            )
+            q_norm_text, q_body = _qk_norm_rope_body(
+                "qn",
+                q_rot,
+                "QGamma",
+                "QReshape1Shape",
+                "QReshape2Shape",
+                True,
+                False,
+            )
+            k_rope_text, k_rot = _qk_norm_rope_body(
+                "k",
+                "k_raw",
+                "KGamma",
+                "KReshape1Shape",
+                "KReshape2Shape",
+                False,
+                True,
+                rotary_num_heads=k_rotary_num_heads,
+                **rope_kwargs,
+            )
+            k_norm_text, k_body = _qk_norm_rope_body(
+                "kn",
+                k_rot,
+                "KGamma",
+                "KReshape1Shape",
+                "KReshape2Shape",
+                True,
+                False,
+            )
+            hop_body = "\n          ".join(
+                [q_rope_text, q_norm_text, k_rope_text, k_norm_text]
+            )
+
+    body = f"""
+        g (float[{batch},{seq},{K}] X) => (float[{batch},{seq},{Out}] Y)
+        {{
+          {producer_body}
+          {hop_body}
+          ctx, pk, pv = com.microsoft.GroupQueryAttention <num_heads={H}, kv_num_heads={KVH}> ({q_body}, {k_body}, v, , , SeqLensK, TotalSeq)
+          Y = MatMul(ctx, Wout)
+        }}
+        """
+    model = parser.parse_model(
+        f"""
+        <
+          ir_version: 10,
+          opset_import: ["": 17, "com.microsoft": 1]
+        >
+        {body}
+        """
+    )
+    model.graph.initializer.extend(initializer)
+    return model, dict(
+        K=K,
+        H=H,
+        KVH=KVH,
+        D=D,
+        Out=Out,
+        Nq=Nq,
+        Nkv=Nkv,
+        wqkv=wqkv,
+        wq=wq,
+        wk=wk,
+        wv=wv,
+        wout=wout,
+        q_gamma=q_gamma,
+        k_gamma=k_gamma,
+        cos=cos,
+        sin=sin,
+        position_ids=position_ids,
+        batch=batch,
+        seq=seq,
+    )
+
+
+def _qk_norm_rope_oracle_and_pruned(
+    K, H, KVH, D, Out, seed, sparsity, with_norm, with_rope, **extra
+):
+    # Shared body for every oracle-comparison test below: builds the packed
+    # (to-be-pruned) model, prunes it, and builds an *independently*
+    # constructed (`packed=False`) already-correctly-reduced oracle model
+    # from the exact same pre-pruning weights/gamma/cos/sin/position_ids --
+    # `q_gamma`/`k_gamma`/`cos`/`sin`/`position_ids` reused *verbatim*,
+    # unsliced, since none of them has any per-head axis to begin with (the
+    # whole point of this section's own head-independence facts) -- mirrors
+    # `test_gqa_packed_qkv_split_pruning_matches_oracle_exactly`'s own
+    # pattern one section above.
+    model, cfg = _gqa_qk_norm_rope_model(
+        K=K,
+        H=H,
+        KVH=KVH,
+        D=D,
+        Out=Out,
+        seed=seed,
+        with_norm=with_norm,
+        with_rope=with_rope,
+        **extra,
+    )
+    assert len(onnxsim.pruning._find_gqa_chains(model.graph)) == 1
+
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=sparsity)
+
+    Nq, Nkv = cfg["Nq"], cfg["Nkv"]
+    wqkv = cfg["wqkv"]
+    wq, wk, wv = wqkv[:, :Nq], wqkv[:, Nq : Nq + Nkv], wqkv[:, Nq + Nkv :]
+
+    group_size = H // KVH
+    keep_count = max(1, KVH - round(KVH * sparsity))
+    keep_groups = _oracle_keep_groups(wq, wk, wv, H, KVH, D, keep_count)
+    keep_q_heads = _group_q_heads(keep_groups, group_size)
+    q_idx, kv_idx = _head_idx(keep_q_heads, D), _head_idx(keep_groups, D)
+
+    oracle_extra = dict(extra)
+    oracle_extra.pop("q_rotary_num_heads", None)
+    oracle_extra.pop("k_rotary_num_heads", None)
+    q_rotary_num_heads = extra.get("q_rotary_num_heads")
+    k_rotary_num_heads = extra.get("k_rotary_num_heads")
+
+    oracle, _ = _gqa_qk_norm_rope_model(
+        K=K,
+        H=len(keep_q_heads),
+        KVH=len(keep_groups),
+        D=D,
+        Out=Out,
+        seed=seed,
+        packed=False,
+        with_norm=with_norm,
+        with_rope=with_rope,
+        wq=wq[:, q_idx],
+        wk=wk[:, kv_idx],
+        wv=wv[:, kv_idx],
+        wout=cfg["wout"][q_idx, :],
+        q_gamma=cfg["q_gamma"],
+        k_gamma=cfg["k_gamma"],
+        cos=cfg["cos"],
+        sin=cfg["sin"],
+        position_ids=cfg["position_ids"],
+        q_rotary_num_heads=(
+            None
+            if q_rotary_num_heads is None or q_rotary_num_heads == 0
+            else len(keep_q_heads)
+        ),
+        k_rotary_num_heads=(
+            None
+            if k_rotary_num_heads is None or k_rotary_num_heads == 0
+            else len(keep_groups)
+        ),
+        **oracle_extra,
+    )
+
+    rng = np.random.default_rng(seed + 1000)
+    x = rng.standard_normal((cfg["batch"], cfg["seq"], K)).astype(np.float32)
+    (y_pruned,) = _run(pruned, {"X": x})
+    (y_oracle,) = _run(oracle, {"X": x})
+    return pruned, oracle, y_pruned, y_oracle, keep_groups, keep_q_heads
+
+
+def test_gqa_packed_qkv_qk_norm_rope_pruning_matches_oracle_exactly():
+    # The common export shape (see this section's own comment above): both
+    # Q's and K's own branch get a per-head `SimplifiedLayerNorm` sandwich
+    # *and* `RotaryEmbedding`, `RotaryEmbedding`'s own `num_heads` left at
+    # the schema's `0` ("infer from shape") -- confirmed, empirically, to
+    # self-adjust to the new post-pruning head count with no attribute
+    # rewrite needed at all -- and `interleaved=1` for a bit of extra
+    # coverage beyond the default rotate-half layout, both already
+    # confirmed head-independent for every combination tried.
+    K, H, KVH, D, Out = 8, 8, 2, 8, 6
+    pruned, oracle, y_pruned, y_oracle, keep_groups, keep_q_heads = (
+        _qk_norm_rope_oracle_and_pruned(
+            K,
+            H,
+            KVH,
+            D,
+            Out,
+            seed=1,
+            sparsity=0.5,
+            with_norm=True,
+            with_rope=True,
+            interleaved=1,
+        )
+    )
+    node = _gqa_node(pruned)
+    num_heads, kv_num_heads = _gqa_attrs(node)
+    assert kv_num_heads == len(keep_groups) == 1
+    assert num_heads == len(keep_q_heads) == 4
+
+    rotary_nodes = [n for n in pruned.graph.node if n.op_type == "RotaryEmbedding"]
+    assert len(rotary_nodes) == 2
+    for n in rotary_nodes:
+        nh = next(a.i for a in n.attribute if a.name == "num_heads")
+        assert nh == 0  # left at the self-adjusting schema default, unchanged
+
+    np.testing.assert_allclose(y_pruned, y_oracle, rtol=1e-5, atol=1e-5)
+
+
+def test_gqa_packed_qkv_qk_norm_rope_pruning_updates_explicit_rotary_num_heads():
+    # The partial-rotary case (`onnxruntime_genai`'s own
+    # `make_rotary_embedding`: "num_heads=0 if partial_rotary_factor == 1.0
+    # else num_heads") leaves `RotaryEmbedding`'s own `num_heads` attribute
+    # *non*-zero -- the one crossed-hop constant that genuinely does need
+    # rewriting post-pruning (see this section's own comment above) --
+    # exercised here together with a partial `rotary_embedding_dim` (half
+    # of `head_size`), both already confirmed head-independent.
+    K, H, KVH, D, Out = 8, 8, 2, 8, 6
+    pruned, oracle, y_pruned, y_oracle, keep_groups, keep_q_heads = (
+        _qk_norm_rope_oracle_and_pruned(
+            K,
+            H,
+            KVH,
+            D,
+            Out,
+            seed=2,
+            sparsity=0.5,
+            with_norm=True,
+            with_rope=True,
+            rotary_embedding_dim=D // 2,
+            q_rotary_num_heads=H,
+            k_rotary_num_heads=KVH,
+        )
+    )
+    q_rot = next(
+        n
+        for n in pruned.graph.node
+        if n.op_type == "RotaryEmbedding" and n.input[0].startswith("q_")
+    )
+    k_rot = next(
+        n
+        for n in pruned.graph.node
+        if n.op_type == "RotaryEmbedding" and n.input[0].startswith("k_")
+    )
+    assert next(a.i for a in q_rot.attribute if a.name == "num_heads") == len(
+        keep_q_heads
+    )
+    assert next(a.i for a in k_rot.attribute if a.name == "num_heads") == len(
+        keep_groups
+    )
+
+    np.testing.assert_allclose(y_pruned, y_oracle, rtol=1e-5, atol=1e-5)
+
+
+def test_gqa_packed_qkv_norm_only_pruning_matches_oracle_exactly():
+    # Q/K-norm without RoPE (RoPE fused into the attention op itself, or
+    # simply absent) -- only the `Reshape` -> `SimplifiedLayerNormalization`
+    # -> `Reshape` sandwich is crossed on each of Q's/K's own branch, no
+    # `RotaryEmbedding` hop at all.
+    K, H, KVH, D, Out = 8, 8, 2, 8, 6
+    pruned, oracle, y_pruned, y_oracle, keep_groups, keep_q_heads = (
+        _qk_norm_rope_oracle_and_pruned(
+            K,
+            H,
+            KVH,
+            D,
+            Out,
+            seed=3,
+            sparsity=0.5,
+            with_norm=True,
+            with_rope=False,
+        )
+    )
+    assert not any(n.op_type == "RotaryEmbedding" for n in pruned.graph.node)
+    assert (
+        sum(n.op_type == "SimplifiedLayerNormalization" for n in pruned.graph.node) == 2
+    )
+    np.testing.assert_allclose(y_pruned, y_oracle, rtol=1e-5, atol=1e-5)
+
+
+def test_gqa_packed_qkv_rope_only_pruning_matches_oracle_exactly():
+    # RoPE without Q/K-norm (no norm requested at all) -- only the
+    # `RotaryEmbedding` hop is crossed, applied directly to the `Split`'s
+    # own raw Q/K outputs.
+    K, H, KVH, D, Out = 8, 8, 2, 8, 6
+    pruned, oracle, y_pruned, y_oracle, keep_groups, keep_q_heads = (
+        _qk_norm_rope_oracle_and_pruned(
+            K,
+            H,
+            KVH,
+            D,
+            Out,
+            seed=4,
+            sparsity=0.5,
+            with_norm=False,
+            with_rope=True,
+        )
+    )
+    assert not any(
+        n.op_type == "SimplifiedLayerNormalization" for n in pruned.graph.node
+    )
+    assert sum(n.op_type == "RotaryEmbedding" for n in pruned.graph.node) == 2
+    np.testing.assert_allclose(y_pruned, y_oracle, rtol=1e-5, atol=1e-5)
+
+
+def test_gqa_wanda_packed_qkv_qk_norm_rope_pruning_matches_oracle_exactly():
+    # The Wanda-calibrated variant shares :func:`_apply_one_gqa_chain` with
+    # the data-free path above -- only `compute_group_importance` differs
+    # (see `_gqa_group_importance`) -- so this exercises that the new
+    # `q_norm_rope`/`k_norm_rope` handling works unchanged under that
+    # shared apply path too, not just the data-free default.
+    K, H, KVH, D, Out = 8, 8, 2, 8, 6
+    model, cfg = _gqa_qk_norm_rope_model(
+        K=K, H=H, KVH=KVH, D=D, Out=Out, seed=5, with_norm=True, with_rope=True
+    )
+    rng = np.random.default_rng(6)
+    x_cal = rng.standard_normal((cfg["batch"], cfg["seq"], K)).astype(np.float32)
+    calibration_data = [{"X": x_cal}]
+
+    pruned = onnxsim.apply_attention_head_wanda_pruning(
+        model, calibration_data=calibration_data, sparsity=0.5
+    )
+
+    probe_model = onnx.ModelProto()
+    probe_model.CopyFrom(model)
+    probe_model.graph.output.append(onnx.ValueInfoProto(name="ctx"))
+    (_, ctx_cal) = _run(probe_model, {"X": x_cal})
+    act_norm = np.sqrt(np.mean(np.square(ctx_cal.astype(np.float64)), axis=(0, 1)))
+
+    Nq, Nkv = cfg["Nq"], cfg["Nkv"]
+    wqkv = cfg["wqkv"]
+    wq, wk, wv = wqkv[:, :Nq], wqkv[:, Nq : Nq + Nkv], wqkv[:, Nq + Nkv :]
+
+    group_size = H // KVH
+    importance = np.zeros(KVH)
+    for kv in range(KVH):
+        q_block = np.concatenate(
+            [
+                wq[:, h * D : (h + 1) * D]
+                for h in range(kv * group_size, (kv + 1) * group_size)
+            ],
+            axis=1,
+        )
+        k_block = wk[:, kv * D : (kv + 1) * D]
+        v_block = wv[:, kv * D : (kv + 1) * D]
+        base = np.linalg.norm(np.concatenate([q_block, k_block, v_block], axis=1))
+        act_group = np.linalg.norm(
+            act_norm[kv * group_size * D : (kv + 1) * group_size * D]
+        )
+        importance[kv] = base * max(act_group, 1e-8)
+    keep_groups = np.sort(np.argsort(-importance)[:1])  # max(1, 2 - round(2*0.5)) == 1
+    keep_q_heads = _group_q_heads(keep_groups, group_size)
+    q_idx, kv_idx = _head_idx(keep_q_heads, D), _head_idx(keep_groups, D)
+
+    oracle, _ = _gqa_qk_norm_rope_model(
+        K=K,
+        H=len(keep_q_heads),
+        KVH=len(keep_groups),
+        D=D,
+        Out=Out,
+        seed=5,
+        packed=False,
+        with_norm=True,
+        with_rope=True,
+        wq=wq[:, q_idx],
+        wk=wk[:, kv_idx],
+        wv=wv[:, kv_idx],
+        wout=cfg["wout"][q_idx, :],
+        q_gamma=cfg["q_gamma"],
+        k_gamma=cfg["k_gamma"],
+        cos=cfg["cos"],
+        sin=cfg["sin"],
+        position_ids=cfg["position_ids"],
+    )
+
+    x = rng.standard_normal((cfg["batch"], cfg["seq"], K)).astype(np.float32)
+    (y_pruned,) = _run(pruned, {"X": x})
+    (y_oracle,) = _run(oracle, {"X": x})
+    np.testing.assert_allclose(y_pruned, y_oracle, rtol=1e-5, atol=1e-5)
+
+
+def test_gqa_packed_qkv_rope_before_norm_is_declined():
+    # Adversarial: RoPE applied *before* the norm sandwich instead of after
+    # -- the reverse of onnxruntime-genai's own confirmed order
+    # (`make_attention_qk_rope_and_norm`'s own "Base order: norm first,
+    # then RoPE" comment) -- is a shape `_walk_back_through_qk_norm_rope`
+    # doesn't recognize (it only ever crosses a `RotaryEmbedding` as the
+    # *outermost* hop, nearest the attention op's own input): neither Q's
+    # nor K's own branch ends up tracing back to the shared `Split`, so the
+    # whole chain is declined -- left completely untouched -- rather than
+    # silently mis-slicing a shape this pass hasn't verified.
+    K, H, KVH, D, Out = 8, 4, 2, 8, 6
+    model, cfg = _gqa_qk_norm_rope_model(
+        K=K,
+        H=H,
+        KVH=KVH,
+        D=D,
+        Out=Out,
+        seed=21,
+        with_norm=True,
+        with_rope=True,
+        rope_before_norm=True,
+    )
+    assert onnxsim.pruning._find_gqa_chains(model.graph) == []
+
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    assert pruned.SerializeToString() == model.SerializeToString()
+
+
 def test_structured_pruning_importance_norm_l2_is_the_unchanged_default():
     model, wg, wu, wd = _swiglu_mlp_model(K=8, H=16, Out=4, seed=30)
     default = onnxsim.apply_structured_pruning(model, sparsity=0.5)
@@ -13762,6 +14507,72 @@ def _qmoe_quantize(w, bits, zero_point=None):
     return packed, scale, dequant
 
 
+def _qmoe_quantize_channel_blockwise(w, bits, block_size, zero_point=None):
+    """Reference (onnxsim-code-free) per-``block_size``-group symmetric QMoE
+    quantizer for `block_size` set: `w` is one expert's own ``[N, K]`` float
+    weight, quantized independently per ``block_size``-sized group along `K`
+    -- mirrors :func:`_qmoe_quantize_channel`'s whole-row case one level
+    finer-grained (each group is its own independent "whole row"). Returns
+    ``(packed [N, K/pack] uint8, scale [N, K // block_size] float32, dequant
+    [N, K] float32)`` -- weight packing is still the flat,
+    block-boundary-oblivious low-index-in-low-bits convention (confirmed
+    empirically, see onnxsim/pruning.py's own section comment, point 3),
+    not restarted at each block. `zero_point`, when given, is a per-``(N,
+    K-block)`` ``[N, K // block_size]`` int array; otherwise every group
+    uses the schema's own documented default, ``2 ** (bits - 1)``.
+    """
+    n, k = w.shape
+    pack = 8 // bits
+    kb = k // block_size
+    qmin, qmax = -(1 << (bits - 1)), (1 << (bits - 1)) - 1
+    default_zp = 1 << (bits - 1)
+    zp = (
+        np.full((n, kb), default_zp, dtype=np.int64)
+        if zero_point is None
+        else np.asarray(zero_point, dtype=np.int64)
+    )
+    w_blocks = w.reshape(n, kb, block_size)
+    scale = np.abs(w_blocks).max(axis=-1) / float(-qmin)
+    scale = np.maximum(scale, np.finfo(np.float32).eps).astype(np.float32)
+    q = (
+        np.clip(np.round(w_blocks / scale[..., None]), qmin, qmax).astype(np.int64)
+        + zp[..., None]
+    )
+    q = np.clip(q, 0, (1 << bits) - 1).astype(np.uint8)
+    q_flat = q.reshape(n, k)
+    parts = [(q_flat[:, i::pack] & ((1 << bits) - 1)) for i in range(pack)]
+    packed = np.zeros_like(parts[0])
+    for i, p in enumerate(parts):
+        packed = packed | (p << (bits * i))
+    packed = packed.astype(np.uint8)
+    dequant = (q.astype(np.float32) - zp[..., None].astype(np.float32)) * scale[
+        ..., None
+    ]
+    dequant = dequant.reshape(n, k)
+    return packed, scale, dequant
+
+
+def _qmoe_quantize_blockwise(w, bits, block_size, zero_point=None):
+    """Batched (per-expert) :func:`_qmoe_quantize_channel_blockwise`: `w` is
+    ``[E, N, K]``. Returns ``(packed [E, N, K/pack], scale [E, N, K //
+    block_size], dequant [E, N, K])``.
+    """
+    e, n, k = w.shape
+    pack = 8 // bits
+    kb = k // block_size
+    packed = np.zeros((e, n, k // pack), dtype=np.uint8)
+    scale = np.zeros((e, n, kb), dtype=np.float32)
+    dequant = np.zeros_like(w)
+    for ei in range(e):
+        packed[ei], scale[ei], dequant[ei] = _qmoe_quantize_channel_blockwise(
+            w[ei],
+            bits,
+            block_size,
+            zero_point=None if zero_point is None else zero_point[ei],
+        )
+    return packed, scale, dequant
+
+
 def _pack_vals(vals, bits):
     """Independent sub-byte packer for a generic array of already-quantized
     ``uint8`` values in ``[0, 2**bits)`` on its own last axis -- used to
@@ -13923,6 +14734,7 @@ def _qmoe_router_model(
     k=2,
     tokens=6,
     use_sparse_mixer=0,
+    block_size=0,
     extra_router_consumer=False,
     tied_router_weight_elsewhere=False,
 ):
@@ -13972,17 +14784,22 @@ def _qmoe_router_model(
         node_inputs[12] = "FC2ZP"
         inits.append(_u8(fc2_zp, "FC2ZP"))
 
+    qmoe_kwargs = dict(
+        k=k,
+        activation_type=activation,
+        expert_weight_bits=bits,
+        quant_type="int",
+        use_sparse_mixer=use_sparse_mixer,
+    )
+    if block_size:
+        qmoe_kwargs["block_size"] = block_size
     qmoe_node = onnx.helper.make_node(
         "QMoE",
         node_inputs,
         ["Y"],
         domain="com.microsoft",
         name="qmoe",
-        k=k,
-        activation_type=activation,
-        expert_weight_bits=bits,
-        quant_type="int",
-        use_sparse_mixer=use_sparse_mixer,
+        **qmoe_kwargs,
     )
     nodes = [router_node, qmoe_node]
     outs = list(outputs)
@@ -14026,6 +14843,7 @@ def _qmoe_router_masking_oracle(
     fc1_bias=None,
     activation="relu",
     tokens=6,
+    block_size=0,
 ):
     # Same-shape model with every `dropped` expert's routing logit forced to
     # -1e9 (Softmax assigns it exactly 0 probability) and its own fc1/fc2
@@ -14061,6 +14879,7 @@ def _qmoe_router_masking_oracle(
         activation=activation,
         k=k,
         tokens=tokens,
+        block_size=block_size,
     )
 
 
@@ -14250,6 +15069,306 @@ def test_qmoe_expert_channel_pruning_survivor_count_floored_to_pack_multiple():
     assert not np.isnan(out_pruned).any()
 
 
+def _qmoe_block_keep_reference(importance, n, block_size, sparsity):
+    # Independent (onnxsim-code-free) re-derivation of
+    # :func:`_qmoe_block_aligned_keep`'s own algorithm, used by the tests
+    # below to compute the *expected* keep-set without calling into
+    # production code at all.
+    num_blocks = n // block_size
+    block_importance = np.sqrt(
+        np.sum(importance.reshape(num_blocks, block_size) ** 2, axis=1)
+    )
+    keep_blocks_count = max(1, num_blocks - round(num_blocks * sparsity))
+    keep_block_idx = np.sort(np.argsort(-block_importance)[:keep_blocks_count])
+    keep = np.arange(n).reshape(num_blocks, block_size)[keep_block_idx].reshape(-1)
+    return keep, keep_block_idx
+
+
+def test_qmoe_expert_channel_pruning_blockwise_int_matches_hand_built_presliced_reference():
+    # Blockwise counterpart of
+    # test_qmoe_expert_channel_pruning_matches_hand_built_presliced_reference:
+    # a dedicated, independently hand-built "already pruned" reference QMoE
+    # node, including non-default per-(N, K-block) fc1_zero_points AND
+    # fc2_zero_points operands (exercising both packed-zero_points slicing
+    # paths this section's own top comment describes for the blockwise case
+    # -- fc1's is now a plain N-axis row-slice since blocking moved its own
+    # packed axis off of N, fc2's is a block-index unpack/select/repack).
+    E, hidden, inter, bits, block_size, tokens = 3, 32, 64, 4, 16, 6
+    hidden_blocks, inter_blocks = hidden // block_size, inter // block_size
+    rng = np.random.default_rng(311)
+    fc1_w = (rng.standard_normal((E, inter, hidden)) * 0.3).astype(np.float32)
+    fc2_w = (rng.standard_normal((E, hidden, inter)) * 0.3).astype(np.float32)
+    fc1_b = rng.standard_normal((E, inter)).astype(np.float32)
+    fc1_zp_vals = rng.integers(4, 12, size=(E, inter, hidden_blocks))
+    fc2_zp_vals = rng.integers(4, 12, size=(E, hidden, inter_blocks))
+
+    fc1_q, fc1_s, fc1_dq = _qmoe_quantize_blockwise(
+        fc1_w, bits, block_size, zero_point=fc1_zp_vals
+    )
+    fc2_q, fc2_s, fc2_dq = _qmoe_quantize_blockwise(
+        fc2_w, bits, block_size, zero_point=fc2_zp_vals
+    )
+    fc1_zp = _pack_vals(fc1_zp_vals, bits)
+    fc2_zp = _pack_vals(fc2_zp_vals, bits)
+
+    model = _qmoe_model(
+        fc1_q,
+        fc1_s,
+        fc2_q,
+        fc2_s,
+        bits,
+        fc1_bias=fc1_b,
+        fc1_zp=fc1_zp,
+        fc2_zp=fc2_zp,
+        block_size=block_size,
+        k=2,
+        tokens=tokens,
+    )
+    onnx.checker.check_model(model)
+
+    pruned = onnxsim.apply_qmoe_expert_channel_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    importance = np.sqrt(
+        np.sum(fc1_dq**2, axis=(0, 2))
+        + np.sum(fc2_dq**2, axis=(0, 1))
+        + np.sum(fc1_b**2, axis=0)
+    )
+    # inter=64, block_size=16 -> 4 blocks; sparsity=0.5 -> keep 4-round(4*0.5)=2
+    keep, keep_block_idx = _qmoe_block_keep_reference(
+        importance, inter, block_size, 0.5
+    )
+    assert len(keep) == 32  # block-aligned: an exact multiple of block_size
+    assert set(keep_block_idx.tolist()).issubset(range(inter_blocks))
+
+    inits = _qmoe_inits(pruned)
+    np.testing.assert_array_equal(inits["FC1Q"], fc1_q[:, keep, :])
+    np.testing.assert_array_equal(inits["FC1S"], fc1_s[:, keep, :])
+    np.testing.assert_array_equal(inits["FC1B"], fc1_b[:, keep])
+    # fc1_zero_points' own packed axis is the trailing hidden_blocks one
+    # (unaffected by an N/inter_size slice) -- a plain row-slice of the
+    # already-packed bytes, cross-checked against an independent re-pack of
+    # the sliced *unpacked* values too.
+    np.testing.assert_array_equal(inits["FC1ZP"], fc1_zp[:, keep, :])
+    np.testing.assert_array_equal(
+        inits["FC1ZP"], _pack_vals(fc1_zp_vals[:, keep, :], bits)
+    )
+
+    expected_fc2_q = _pack_vals(_unpack_vals(fc2_q, bits, inter)[:, :, keep], bits)
+    np.testing.assert_array_equal(inits["FC2Q"], expected_fc2_q)
+    np.testing.assert_array_equal(inits["FC2S"], fc2_s[:, :, keep_block_idx])
+    expected_fc2_zp = _pack_vals(
+        _unpack_vals(fc2_zp, bits, inter_blocks)[:, :, keep_block_idx], bits
+    )
+    np.testing.assert_array_equal(inits["FC2ZP"], expected_fc2_zp)
+
+    # Unlike the whole-row case, a block-aligned keep-set means every
+    # SURVIVING block's own values (and therefore its own scale/zero_point)
+    # are completely untouched by dropping other blocks -- so, unlike fc2's
+    # own whole-row scale in the no-block_size case, freshly re-quantizing
+    # the *sliced float* fc2 weights from scratch (one block at a time)
+    # reproduces byte-identical packed/scale/zero_point tensors to slicing
+    # the already-quantized ones above. Confirmed directly here (not just
+    # asserted) before it's relied on to build the ORT reference below.
+    fc2_q_fresh, fc2_s_fresh, _ = _qmoe_quantize_blockwise(
+        fc2_w[:, :, keep],
+        bits,
+        block_size,
+        zero_point=fc2_zp_vals[:, :, keep_block_idx],
+    )
+    np.testing.assert_array_equal(fc2_q_fresh, expected_fc2_q)
+    np.testing.assert_array_equal(fc2_s_fresh, fc2_s[:, :, keep_block_idx])
+
+    fc1_q_ref, fc1_s_ref, _ = _qmoe_quantize_blockwise(
+        fc1_w[:, keep, :], bits, block_size, zero_point=fc1_zp_vals[:, keep, :]
+    )
+    reference = _qmoe_model(
+        fc1_q_ref,
+        fc1_s_ref,
+        fc2_q_fresh,
+        fc2_s_fresh,
+        bits,
+        fc1_bias=fc1_b[:, keep],
+        fc1_zp=_pack_vals(fc1_zp_vals[:, keep, :], bits),
+        fc2_zp=_pack_vals(fc2_zp_vals[:, :, keep_block_idx], bits),
+        block_size=block_size,
+        k=2,
+        tokens=tokens,
+    )
+    onnx.checker.check_model(reference)
+
+    feed_rng = np.random.default_rng(313)
+    feeds = {
+        "X": (feed_rng.standard_normal((tokens, hidden)) * 0.2).astype(np.float32),
+        "R": feed_rng.standard_normal((tokens, E)).astype(np.float32),
+    }
+    (out_pruned,) = _run(pruned, feeds)
+    (out_ref,) = _run(reference, feeds)
+    np.testing.assert_allclose(out_pruned, out_ref, rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.parametrize("bits", [2, 8])
+def test_qmoe_expert_channel_pruning_blockwise_int_matches_hand_built_reference_other_bit_widths(
+    bits,
+):
+    # Same blockwise oracle as above, for the two other supported
+    # expert_weight_bits values (4 is covered above) -- confirms
+    # block_size % pack == 0 (this pass's own required alignment) holds and
+    # the same production code path generalizes correctly for pack in
+    # {4, 1} too (block_size=16 is a multiple of both).
+    E, hidden, inter, block_size, tokens = 2, 32, 32, 16, 5
+    rng = np.random.default_rng(320 + bits)
+    fc1_w = (rng.standard_normal((E, inter, hidden)) * 0.3).astype(np.float32)
+    fc2_w = (rng.standard_normal((E, hidden, inter)) * 0.3).astype(np.float32)
+    fc1_q, fc1_s, fc1_dq = _qmoe_quantize_blockwise(fc1_w, bits, block_size)
+    fc2_q, fc2_s, fc2_dq = _qmoe_quantize_blockwise(fc2_w, bits, block_size)
+    model = _qmoe_model(
+        fc1_q, fc1_s, fc2_q, fc2_s, bits, block_size=block_size, k=1, tokens=tokens
+    )
+    onnx.checker.check_model(model)
+
+    pruned = onnxsim.apply_qmoe_expert_channel_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    importance = np.sqrt(
+        np.sum(fc1_dq**2, axis=(0, 2)) + np.sum(fc2_dq**2, axis=(0, 1))
+    )
+    # inter=32, block_size=16 -> 2 blocks; sparsity=0.5 -> keep 2-round(2*0.5)=1
+    keep, keep_block_idx = _qmoe_block_keep_reference(
+        importance, inter, block_size, 0.5
+    )
+    assert len(keep) == 16
+
+    inits = _qmoe_inits(pruned)
+    np.testing.assert_array_equal(inits["FC1Q"], fc1_q[:, keep, :])
+    expected_fc2_q = _pack_vals(_unpack_vals(fc2_q, bits, inter)[:, :, keep], bits)
+    np.testing.assert_array_equal(inits["FC2Q"], expected_fc2_q)
+    np.testing.assert_array_equal(inits["FC2S"], fc2_s[:, :, keep_block_idx])
+
+    fc1_q_ref, fc1_s_ref, _ = _qmoe_quantize_blockwise(
+        fc1_w[:, keep, :], bits, block_size
+    )
+    fc2_q_ref, fc2_s_ref, _ = _qmoe_quantize_blockwise(
+        fc2_w[:, :, keep], bits, block_size
+    )
+    np.testing.assert_array_equal(fc2_q_ref, expected_fc2_q)
+    reference = _qmoe_model(
+        fc1_q_ref,
+        fc1_s_ref,
+        fc2_q_ref,
+        fc2_s_ref,
+        bits,
+        block_size=block_size,
+        k=1,
+        tokens=tokens,
+    )
+    onnx.checker.check_model(reference)
+
+    feed_rng = np.random.default_rng(323 + bits)
+    feeds = {
+        "X": (feed_rng.standard_normal((tokens, hidden)) * 0.2).astype(np.float32),
+        "R": feed_rng.standard_normal((tokens, E)).astype(np.float32),
+    }
+    (out_pruned,) = _run(pruned, feeds)
+    (out_ref,) = _run(reference, feeds)
+    np.testing.assert_allclose(out_pruned, out_ref, rtol=1e-5, atol=1e-5)
+
+
+def test_qmoe_expert_channel_pruning_blockwise_int_keep_set_floored_to_block_multiple():
+    # The naive, channel-granularity target this pass's own no-block_size
+    # path would compute -- n - round(n * sparsity) -- need NOT itself be a
+    # multiple of block_size, even after flooring to a multiple of pack:
+    # inter=48, block_size=16 (3 blocks), sparsity=0.4 -> naive channel-level
+    # target = 48 - round(48*0.4) = 29, floored to pack=2 multiple -> 28 --
+    # not a multiple of block_size (16). The actual block-granularity
+    # computation this pass uses instead -- 3 - round(3*0.4) = 2 blocks kept
+    # -- correctly resolves to 32 survivors (a clean multiple of
+    # block_size), never 28 or any other non-block-aligned count. This is
+    # confirmed both by the resulting shape below AND by a real ORT run
+    # matching an independently hand-built reference (not merely inferred
+    # from the shape alone).
+    # hidden is deliberately >= 2*block_size (hidden_blocks >= 2): a real CPU
+    # QMoE kernel bug (confirmed empirically, independent of pruning
+    # entirely -- reproduced against a hand-built, never-pruned node too)
+    # makes fc2_scales' own expected block-axis size collapse to 1
+    # regardless of inter_size's own block count whenever hidden_size ==
+    # block_size (hidden_blocks == 1) -- irrelevant to this pass's own
+    # correctness (an already-broken-for-this-kernel model stays broken the
+    # same way whether pruned or not), but avoided here so this test's own
+    # real ORT run below exercises the flooring logic, not that unrelated
+    # kernel quirk.
+    E, hidden, inter, bits, block_size, tokens = 2, 32, 48, 4, 16, 5
+    rng = np.random.default_rng(331)
+    fc1_w = (rng.standard_normal((E, inter, hidden)) * 0.3).astype(np.float32)
+    fc2_w = (rng.standard_normal((E, hidden, inter)) * 0.3).astype(np.float32)
+    fc1_q, fc1_s, fc1_dq = _qmoe_quantize_blockwise(fc1_w, bits, block_size)
+    fc2_q, fc2_s, fc2_dq = _qmoe_quantize_blockwise(fc2_w, bits, block_size)
+    model = _qmoe_model(
+        fc1_q, fc1_s, fc2_q, fc2_s, bits, block_size=block_size, k=1, tokens=tokens
+    )
+    onnx.checker.check_model(model)
+
+    naive_channel_target = inter - round(inter * 0.4)
+    naive_floored_to_pack = (naive_channel_target // (8 // bits)) * (8 // bits)
+    assert naive_floored_to_pack % block_size != 0  # the hazard this test guards
+
+    pruned = onnxsim.apply_qmoe_expert_channel_pruning(model, sparsity=0.4)
+    onnx.checker.check_model(pruned)
+
+    inits = _qmoe_inits(pruned)
+    new_inter = inits["FC1Q"].shape[1]
+    assert new_inter == 32  # 3 blocks -> keep 3-round(3*0.4)=2 -> 32, not 28
+    assert new_inter % block_size == 0
+
+    importance = np.sqrt(
+        np.sum(fc1_dq**2, axis=(0, 2)) + np.sum(fc2_dq**2, axis=(0, 1))
+    )
+    keep, keep_block_idx = _qmoe_block_keep_reference(
+        importance, inter, block_size, 0.4
+    )
+    np.testing.assert_array_equal(inits["FC1Q"], fc1_q[:, keep, :])
+
+    fc1_q_ref, fc1_s_ref, _ = _qmoe_quantize_blockwise(
+        fc1_w[:, keep, :], bits, block_size
+    )
+    fc2_q_ref, fc2_s_ref, _ = _qmoe_quantize_blockwise(
+        fc2_w[:, :, keep], bits, block_size
+    )
+    reference = _qmoe_model(
+        fc1_q_ref,
+        fc1_s_ref,
+        fc2_q_ref,
+        fc2_s_ref,
+        bits,
+        block_size=block_size,
+        k=1,
+        tokens=tokens,
+    )
+    onnx.checker.check_model(reference)
+
+    feed_rng = np.random.default_rng(337)
+    feeds = {
+        "X": (feed_rng.standard_normal((tokens, hidden)) * 0.2).astype(np.float32),
+        "R": feed_rng.standard_normal((tokens, E)).astype(np.float32),
+    }
+    (out_pruned,) = _run(pruned, feeds)
+    (out_ref,) = _run(reference, feeds)
+    np.testing.assert_allclose(out_pruned, out_ref, rtol=1e-5, atol=1e-5)
+
+
+def test_qmoe_expert_channel_pruning_blockwise_int_zero_sparsity_is_a_no_op():
+    E, hidden, inter, bits, block_size = 2, 16, 32, 4, 16
+    rng = np.random.default_rng(341)
+    fc1_w = (rng.standard_normal((E, inter, hidden)) * 0.3).astype(np.float32)
+    fc2_w = (rng.standard_normal((E, hidden, inter)) * 0.3).astype(np.float32)
+    fc1_q, fc1_s, _ = _qmoe_quantize_blockwise(fc1_w, bits, block_size)
+    fc2_q, fc2_s, _ = _qmoe_quantize_blockwise(fc2_w, bits, block_size)
+    model = _qmoe_model(fc1_q, fc1_s, fc2_q, fc2_s, bits, block_size=block_size)
+    pruned = onnxsim.apply_qmoe_expert_channel_pruning(model, sparsity=0.0)
+    inits = _qmoe_inits(pruned)
+    np.testing.assert_array_equal(inits["FC1Q"], fc1_q)
+
+
 def test_qmoe_expert_channel_pruning_zero_sparsity_is_a_no_op():
     E, hidden, inter, bits = 2, 6, 8, 4
     rng = np.random.default_rng(239)
@@ -14325,17 +15444,78 @@ def test_qmoe_expert_channel_pruning_declines_nonzero_swiglu_fusion():
     np.testing.assert_array_equal(inits["FC1Q"], fc1_q)
 
 
-def test_qmoe_expert_channel_pruning_declines_block_size():
-    # block_size present (even a schema-valid value, >= 16) selects a
-    # different scale/zero_point rank this pass's own packed-slicing was
-    # never verified against -- declined outright regardless of value.
-    E, hidden, inter, bits = 2, 32, 8, 4
+def test_qmoe_expert_channel_pruning_declines_block_size_below_kernel_floor():
+    # block_size=8 is below the CPU kernel's own floor -- "block_size must
+    # be >= 16 when provided" (re-confirmed live, see onnxsim/pruning.py's
+    # own section comment, point 3) -- declined outright before this pass
+    # even looks at fc1_scales'/fc2_scales' own (blockwise-shaped) rank.
+    E, hidden, inter, bits = 2, 32, 16, 4
     rng = np.random.default_rng(269)
     fc1_w = (rng.standard_normal((E, inter, hidden)) * 0.3).astype(np.float32)
     fc2_w = (rng.standard_normal((E, hidden, inter)) * 0.3).astype(np.float32)
-    fc1_q, fc1_s, _ = _qmoe_quantize(fc1_w, bits)
+    block_size = 8
+    fc1_q, fc1_s, _ = _qmoe_quantize_blockwise(fc1_w, bits, block_size)
+    fc2_q, fc2_s, _ = _qmoe_quantize_blockwise(fc2_w, bits, block_size)
+    model = _qmoe_model(fc1_q, fc1_s, fc2_q, fc2_s, bits, block_size=block_size)
+    pruned = onnxsim.apply_qmoe_expert_channel_pruning(model, sparsity=0.5)
+    inits = _qmoe_inits(pruned)
+    np.testing.assert_array_equal(inits["FC1Q"], fc1_q)
+
+
+def test_qmoe_expert_channel_pruning_declines_block_size_not_pack_aligned():
+    # block_size=17 is >= 16 and divides hidden_size/inter_size evenly, but
+    # isn't a multiple of pack (8 // expert_weight_bits == 2 for bits=4) --
+    # this pass's own deliberately narrowed scope (every real block_size a
+    # real export would use -- 16/32/64/128 -- already is a multiple of
+    # pack; see onnxsim/pruning.py's own section comment, point 3), so this
+    # is declined defensively rather than assumed to also work.
+    E, hidden, inter, bits, block_size = 2, 34, 34, 4, 17
+    rng = np.random.default_rng(270)
+    fc1_w = (rng.standard_normal((E, inter, hidden)) * 0.3).astype(np.float32)
+    fc2_w = (rng.standard_normal((E, hidden, inter)) * 0.3).astype(np.float32)
+    fc1_q, fc1_s, _ = _qmoe_quantize_blockwise(fc1_w, bits, block_size)
+    fc2_q, fc2_s, _ = _qmoe_quantize_blockwise(fc2_w, bits, block_size)
+    model = _qmoe_model(fc1_q, fc1_s, fc2_q, fc2_s, bits, block_size=block_size)
+    pruned = onnxsim.apply_qmoe_expert_channel_pruning(model, sparsity=0.5)
+    inits = _qmoe_inits(pruned)
+    np.testing.assert_array_equal(inits["FC1Q"], fc1_q)
+
+
+def test_qmoe_expert_channel_pruning_declines_block_size_not_dividing_evenly():
+    # block_size=16 doesn't divide inter_size=24 evenly (a partial/padded
+    # final block) -- declined the same way every other shape mismatch in
+    # this section is (fc2_scales'/fc2_zero_points' own expected block-axis
+    # shape never matches).
+    E, hidden, inter, bits, block_size = 2, 32, 24, 4, 16
+    rng = np.random.default_rng(271)
+    fc1_w = (rng.standard_normal((E, inter, hidden)) * 0.3).astype(np.float32)
+    fc2_w = (rng.standard_normal((E, hidden, inter)) * 0.3).astype(np.float32)
+    fc1_q, fc1_s, _ = _qmoe_quantize(fc1_w, bits)  # whole-row -- inter=24 doesn't
+    # divide by block_size=16, so a genuinely blockwise fc1_scale can't even be
+    # built for this shape; the whole-row quantizer stands in fine here since
+    # the matcher declines before ever inspecting fc1_scales' own shape.
     fc2_q, fc2_s, _ = _qmoe_quantize(fc2_w, bits)
-    model = _qmoe_model(fc1_q, fc1_s, fc2_q, fc2_s, bits, block_size=16)
+    model = _qmoe_model(fc1_q, fc1_s, fc2_q, fc2_s, bits, block_size=block_size)
+    pruned = onnxsim.apply_qmoe_expert_channel_pruning(model, sparsity=0.5)
+    inits = _qmoe_inits(pruned)
+    np.testing.assert_array_equal(inits["FC1Q"], fc1_q)
+
+
+def test_qmoe_expert_channel_pruning_declines_fp4_with_block_size():
+    # quant_type='fp4' remains explicitly out of scope regardless of
+    # block_size (a materially different MXFP block-scaled tensor format,
+    # not this pass's own int block_size handling at all -- see
+    # onnxsim/pruning.py's own section comment, points 1 and 3) -- declined
+    # before block_size is even inspected.
+    E, hidden, inter, bits, block_size = 2, 32, 32, 4, 16
+    rng = np.random.default_rng(272)
+    fc1_w = (rng.standard_normal((E, inter, hidden)) * 0.3).astype(np.float32)
+    fc2_w = (rng.standard_normal((E, hidden, inter)) * 0.3).astype(np.float32)
+    fc1_q, fc1_s, _ = _qmoe_quantize_blockwise(fc1_w, bits, block_size)
+    fc2_q, fc2_s, _ = _qmoe_quantize_blockwise(fc2_w, bits, block_size)
+    model = _qmoe_model(
+        fc1_q, fc1_s, fc2_q, fc2_s, bits, block_size=block_size, quant_type="fp4"
+    )
     pruned = onnxsim.apply_qmoe_expert_channel_pruning(model, sparsity=0.5)
     inits = _qmoe_inits(pruned)
     np.testing.assert_array_equal(inits["FC1Q"], fc1_q)
@@ -14563,6 +15743,85 @@ def test_qmoe_whole_expert_pruning_matches_ort_masking_oracle():
     onnx.checker.check_model(masked)
 
     feed_rng = np.random.default_rng(107)
+    feeds = {"X": feed_rng.standard_normal((tokens, hidden)).astype(np.float32) * 0.3}
+    (out_pruned,) = _run(pruned, feeds)
+    (out_masked,) = _run(masked, feeds)
+    np.testing.assert_allclose(out_pruned, out_masked, rtol=1e-4, atol=1e-4)
+
+
+def test_qmoe_whole_expert_pruning_blockwise_int_matches_hand_built_reference():
+    # Confirms this section's own top comment, point 8: whole-expert pruning
+    # needs no block_size-specific handling at all -- every per-expert
+    # tensor keeps num_experts as its own leading axis regardless of
+    # block_size, so the exact same generic leading-axis slice this pass
+    # already uses for the no-block_size case works unmodified here too.
+    # hidden/inter are both >= 2*block_size (hidden_blocks/inter_blocks >=
+    # 2) to steer clear of the unrelated real-kernel quirk documented in
+    # onnxsim/pruning.py's own section comment (point 3).
+    E, hidden, inter, bits, block_size, tokens = 5, 32, 32, 4, 16, 10
+    rng = np.random.default_rng(111)
+    fc1_w = (rng.standard_normal((E, inter, hidden)) * 0.3).astype(np.float32)
+    fc2_w = (rng.standard_normal((E, hidden, inter)) * 0.3).astype(np.float32)
+    fc1_b = rng.standard_normal((E, inter)).astype(np.float32)
+    router_w = (rng.standard_normal((hidden, E)) * 0.2).astype(np.float32)
+    router_b = rng.standard_normal(E).astype(np.float32)
+    k = 2
+    fc1_q, fc1_s, _ = _qmoe_quantize_blockwise(fc1_w, bits, block_size)
+    fc2_q, fc2_s, _ = _qmoe_quantize_blockwise(fc2_w, bits, block_size)
+    model = _qmoe_router_model(
+        fc1_q,
+        fc1_s,
+        fc2_q,
+        fc2_s,
+        bits,
+        router_w,
+        router_b=router_b,
+        fc1_bias=fc1_b,
+        k=k,
+        tokens=tokens,
+        block_size=block_size,
+    )
+    onnx.checker.check_model(model)
+
+    calib_rng = np.random.default_rng(113)
+    calibration_data = [
+        {"X": calib_rng.standard_normal((tokens, hidden)).astype(np.float32)}
+        for _ in range(4)
+    ]
+    pruned = onnxsim.apply_qmoe_whole_expert_pruning(
+        model, calibration_data=calibration_data, sparsity=0.4
+    )
+    onnx.checker.check_model(pruned)
+    inits = _qmoe_inits(pruned)
+    assert inits["FC1Q"].shape == (3, inter, hidden // 2)
+    assert inits["FC1S"].shape == (3, inter, hidden // block_size)
+    assert inits["RW"].shape == (hidden, 3)
+    assert inits["FC1B"].shape == (3, inter)
+
+    kept_router_w = inits["RW"]
+    dropped = [
+        e
+        for e in range(E)
+        if not any(np.allclose(router_w[:, e], kept_router_w[:, i]) for i in range(3))
+    ]
+    assert len(dropped) == 2
+    masked = _qmoe_router_masking_oracle(
+        fc1_q,
+        fc1_s,
+        fc2_q,
+        fc2_s,
+        bits,
+        router_w,
+        router_b,
+        dropped,
+        k,
+        fc1_bias=fc1_b,
+        tokens=tokens,
+        block_size=block_size,
+    )
+    onnx.checker.check_model(masked)
+
+    feed_rng = np.random.default_rng(117)
     feeds = {"X": feed_rng.standard_normal((tokens, hidden)).astype(np.float32) * 0.3}
     (out_pruned,) = _run(pruned, feeds)
     (out_masked,) = _run(masked, feeds)
@@ -15509,6 +16768,38 @@ def test_analyze_pruning_sensitivity_never_mutates_input_model():
     moe_calibration_data = [{"X": moe_rng.standard_normal((6, 4)).astype(np.float32)}]
 
     qdq_model, _, _, _, _ = _matmul_qdq_producer_model(K=8, H=16, Out=4, seed=9)
+
+    nbits_rng = np.random.default_rng(4)
+    matmul_nbits_model, _ = _nbits_chain_model(
+        N1=16,
+        K1=32,
+        N2=4,
+        block_size=16,
+        W1=nbits_rng.standard_normal((16, 32)).astype(np.float32) * 0.2,
+        W2=nbits_rng.standard_normal((4, 16)).astype(np.float32) * 0.2,
+    )
+
+    qmoe_rng = np.random.default_rng(5)
+    qmoe_fc1_w = (qmoe_rng.standard_normal((2, 4, 6)) * 0.3).astype(np.float32)
+    qmoe_fc2_w = (qmoe_rng.standard_normal((2, 6, 4)) * 0.3).astype(np.float32)
+    qmoe_fc1_q, qmoe_fc1_s, _ = _qmoe_quantize(qmoe_fc1_w, bits=4)
+    qmoe_fc2_q, qmoe_fc2_s, _ = _qmoe_quantize(qmoe_fc2_w, bits=4)
+    qmoe_channel_model = _qmoe_model(
+        qmoe_fc1_q, qmoe_fc1_s, qmoe_fc2_q, qmoe_fc2_s, bits=4, k=1, tokens=5
+    )
+    qmoe_router_w = qmoe_rng.standard_normal((6, 2)).astype(np.float32)
+    qmoe_whole_expert_model = _qmoe_router_model(
+        qmoe_fc1_q,
+        qmoe_fc1_s,
+        qmoe_fc2_q,
+        qmoe_fc2_s,
+        bits=4,
+        router_w=qmoe_router_w,
+        k=1,
+        tokens=5,
+    )
+    qmoe_calibration_data = [{"X": qmoe_rng.standard_normal((5, 6)).astype(np.float32)}]
+
     embedding_model = _embedding_model(
         np.random.default_rng(2).standard_normal((10, 4)).astype(np.float32)
     )
@@ -15549,6 +16840,13 @@ def test_analyze_pruning_sensitivity_never_mutates_input_model():
             {"calibration_data": moe_calibration_data},
         ),
         (qdq_model, onnxsim.apply_structured_pruning_qdq, {}),
+        (matmul_nbits_model, onnxsim.apply_structured_pruning_matmul_nbits, {}),
+        (qmoe_channel_model, onnxsim.apply_qmoe_expert_channel_pruning, {}),
+        (
+            qmoe_whole_expert_model,
+            onnxsim.apply_qmoe_whole_expert_pruning,
+            {"calibration_data": qmoe_calibration_data},
+        ),
         (embedding_model, onnxsim.apply_embedding_vocab_magnitude_pruning, {}),
         (
             transformer_block_model,
@@ -16078,16 +17376,17 @@ def test_analyze_moe_whole_expert_pruning_margin_reflects_router_usage_distribut
     assert margin_a != margin_b
 
 
-# --- analyze_pruning_sensitivity: QDQ / embedding-magnitude /
-#     transformer-block families ----------------------------------------
+# --- analyze_pruning_sensitivity: QDQ / MatMulNBits / QMoE /
+#     embedding-magnitude / transformer-block families -------------------
 #
-# These three model families are defined much later in this file (the QDQ
-# structured, embedding-vocabulary, and transformer-block-depth pruning
-# sections below) -- the helpers referenced here (`_matmul_qdq_producer_model`,
-# `_i8`, `_ambiguous_embedding_model`, ...) are module-level functions, so
-# their *definition* order doesn't matter for these tests to run correctly
-# (only that the whole module has finished loading before any test body
-# executes, which pytest already guarantees) -- but keeping every
+# These model families are all defined much later in this file (the QDQ
+# structured, MatMulNBits structured, QMoE, embedding-vocabulary, and
+# transformer-block-depth pruning sections below) -- the helpers referenced
+# here (`_matmul_qdq_producer_model`, `_i8`, `_nbits_chain_model`,
+# `_qmoe_model`, `_ambiguous_embedding_model`, ...) are module-level
+# functions, so their *definition* order doesn't matter for these tests to
+# run correctly (only that the whole module has finished loading before any
+# test body executes, which pytest already guarantees) -- but keeping every
 # `test_analyze_*` test in this one dedicated section, alongside the eight
 # above, does.
 
@@ -16202,6 +17501,493 @@ def test_analyze_structured_pruning_qdq_margin_reflects_dequantized_weight_distr
     margin_b = by_label["hb"].margin
 
     assert margin_b == 0.0  # every dequantized channel row exactly tied
+    assert margin_a is not None and margin_a > 0.9  # wide, unambiguous gap
+    assert margin_a != margin_b
+
+
+def test_analyze_structured_pruning_matmul_nbits_matches_real_call():
+    # Same shape as
+    # test_matmul_nbits_pruning_producer_and_consumer_match_independent_reference_oracle:
+    # W1's rows 0-15 are large magnitude (kept), 16-31 small (dropped) --
+    # block-aligned at block_size=16, so the real call actually prunes this
+    # chain rather than declining it.
+    N1, K1, N2, block_size = 32, 64, 8, 16
+    rng = np.random.default_rng(100)
+    W1 = rng.standard_normal((N1, K1)).astype(np.float32) * 0.2
+    W1[:16] *= 6.0
+    W2 = rng.standard_normal((N2, N1)).astype(np.float32) * 0.2
+    bias1 = (rng.standard_normal(N1) * 0.05).astype(np.float32)
+    bias2 = (rng.standard_normal(N2) * 0.05).astype(np.float32)
+
+    model, _info = _nbits_chain_model(
+        N1, K1, N2, block_size, W1, W2, bias1=bias1, bias2=bias2
+    )
+    onnx.checker.check_model(model)
+
+    report = onnxsim.analyze_pruning_sensitivity(
+        model, onnxsim.apply_structured_pruning_matmul_nbits, sparsity=0.5
+    )
+    assert len(report.layers) == 1
+    layer = report.layers[0]
+    assert layer.family == "matmul_nbits"
+    assert layer.total == N1
+    assert report.not_eligible == []
+
+    pruned = onnxsim.apply_structured_pruning_matmul_nbits(model, sparsity=0.5)
+    inits = {t.name: t for t in pruned.graph.initializer}
+    kept = N1 - layer.would_drop
+    assert inits["B1"].dims[0] == kept
+    assert inits["B2"].dims[1] == kept // block_size  # consumer's block axis
+
+
+def test_analyze_structured_pruning_matmul_nbits_not_eligible_lists_unmatched_nodes():
+    # Mirrors test_analyze_structured_pruning_qdq_not_eligible_lists_unmatched_nodes
+    # for the MatMulNBits family: a third, orphan MatMulNBits node reading
+    # the same activation input but feeding a graph output directly -- no
+    # downstream MatMulNBits consumer at all, so
+    # _find_matmul_nbits_chains can never match it into a chain.
+    N1, K1, N2, block_size = 32, 64, 8, 16
+    rng = np.random.default_rng(101)
+    W1 = rng.standard_normal((N1, K1)).astype(np.float32) * 0.2
+    W2 = rng.standard_normal((N2, N1)).astype(np.float32) * 0.2
+    model, _info = _nbits_chain_model(N1, K1, N2, block_size, W1, W2)
+
+    W3 = rng.standard_normal((4, K1)).astype(np.float32) * 0.2
+    qcodes3, scales3, _zp3, kb3 = _nbits_quantize_block(W3, block_size)
+    B3 = _nbits_pack_B(qcodes3, 4, kb3, block_size)
+    orphan = _nbits_node(
+        "mm_orphan", "A", "Y2", "B3", "scales3", None, None, 4, K1, block_size
+    )
+    model.graph.node.append(orphan)
+    model.graph.initializer.append(onnx.numpy_helper.from_array(B3, name="B3"))
+    model.graph.initializer.append(
+        onnx.numpy_helper.from_array(scales3, name="scales3")
+    )
+    model.graph.output.append(
+        onnx.helper.make_tensor_value_info("Y2", onnx.TensorProto.FLOAT, [3, 4])
+    )
+    onnx.checker.check_model(model)
+
+    report = onnxsim.analyze_pruning_sensitivity(
+        model, onnxsim.apply_structured_pruning_matmul_nbits, sparsity=0.5
+    )
+    assert len(report.layers) == 1  # only the mm1->mm2 chain is matched
+    assert report.not_eligible == ["MatMulNBits 'mm_orphan'"]
+
+
+def test_analyze_structured_pruning_matmul_nbits_non_block_aligned_reported_as_would_drop_zero():
+    # Same interleaved-importance shape as
+    # test_matmul_nbits_pruning_consumer_declines_non_block_aligned: the
+    # top-keep_count-by-norm set straddles every block boundary, so the real
+    # apply() call declines this chain entirely (both nodes left
+    # byte-for-byte unchanged) -- this genuinely matched unit must be
+    # reported would_drop=0/margin=None, not folded into not_eligible (see
+    # _analyze_structured_pruning_matmul_nbits's own docstring).
+    N1, K1, N2, block_size = 32, 64, 8, 16
+    rng = np.random.default_rng(106)
+    W1 = rng.standard_normal((N1, K1)).astype(np.float32) * 0.2
+    W1[0::2] *= 8.0  # even rows large ("important"), odd rows small -- interleaved
+    W2 = rng.standard_normal((N2, N1)).astype(np.float32) * 0.2
+
+    model, _info = _nbits_chain_model(N1, K1, N2, block_size, W1, W2)
+    onnx.checker.check_model(model)
+
+    report = onnxsim.analyze_pruning_sensitivity(
+        model, onnxsim.apply_structured_pruning_matmul_nbits, sparsity=0.5
+    )
+    assert len(report.layers) == 1
+    layer = report.layers[0]
+    assert layer.would_drop == 0
+    assert layer.margin is None
+    assert report.not_eligible == []
+
+    pruned = onnxsim.apply_structured_pruning_matmul_nbits(model, sparsity=0.5)
+    assert pruned.SerializeToString() == model.SerializeToString()
+
+
+def test_analyze_structured_pruning_matmul_nbits_margin_reflects_dequantized_weight_distribution():
+    # Same adversarial shape as
+    # test_analyze_structured_pruning_qdq_margin_reflects_dequantized_weight_distribution,
+    # for the MatMulNBits family: chain "a"'s producer has an unambiguous,
+    # block-aligned gap between its "big" and "small" dequantized
+    # output-channel rows (margin should be strongly positive); chain "b"'s
+    # dequantized rows are all exactly equal (margin must come out exactly
+    # 0.0). Two independent chains, sharing no tensors, built directly (not
+    # via _nbits_chain_model, which only builds one chain per model) and
+    # combined into a single graph.
+    N1, K1, N2, block_size = 32, 64, 8, 16
+    rng = np.random.default_rng(109)
+
+    def _chain(prefix, W1, W2, a_name):
+        qcodes1, scales1, _zp1, kb1 = _nbits_quantize_block(W1, block_size)
+        qcodes2, scales2, _zp2, kb2 = _nbits_quantize_block(W2, block_size)
+        B1 = _nbits_pack_B(qcodes1, N1, kb1, block_size)
+        B2 = _nbits_pack_B(qcodes2, N2, kb2, block_size)
+        node1 = _nbits_node(
+            f"mm1_{prefix}",
+            a_name,
+            f"h_{prefix}",
+            f"B1_{prefix}",
+            f"scales1_{prefix}",
+            None,
+            None,
+            N1,
+            K1,
+            block_size,
+        )
+        node2 = _nbits_node(
+            f"mm2_{prefix}",
+            f"h_{prefix}",
+            f"Y_{prefix}",
+            f"B2_{prefix}",
+            f"scales2_{prefix}",
+            None,
+            None,
+            N2,
+            N1,
+            block_size,
+        )
+        inits = [
+            onnx.numpy_helper.from_array(B1, name=f"B1_{prefix}"),
+            onnx.numpy_helper.from_array(scales1, name=f"scales1_{prefix}"),
+            onnx.numpy_helper.from_array(B2, name=f"B2_{prefix}"),
+            onnx.numpy_helper.from_array(scales2, name=f"scales2_{prefix}"),
+        ]
+        return [node1, node2], inits
+
+    # Deterministic (not random) big/small clusters -- as with the QDQ
+    # margin test's own big_code/small_code, a uniform value per cluster
+    # collapses within-cluster spread to (near) zero, so the entire gap
+    # between clusters shows up in `margin` instead of being partly eaten
+    # by intra-cluster noise.
+    W1_a = np.zeros((N1, K1), dtype=np.float32)
+    W1_a[:16, :] = 50.0  # rows 0-15 big (kept) -- block-aligned
+    W2_a = np.zeros((N2, N1), dtype=np.float32)
+    W1_b = np.full((N1, K1), 3.0, dtype=np.float32)  # every dequantized row tied
+    W2_b = rng.standard_normal((N2, N1)).astype(np.float32) * 0.2
+
+    nodes_a, inits_a = _chain("a", W1_a, W2_a, "Xa")
+    nodes_b, inits_b = _chain("b", W1_b, W2_b, "Xb")
+
+    M = 3
+    graph = onnx.helper.make_graph(
+        [*nodes_a, *nodes_b],
+        "g",
+        inputs=[
+            onnx.helper.make_tensor_value_info("Xa", onnx.TensorProto.FLOAT, [M, K1]),
+            onnx.helper.make_tensor_value_info("Xb", onnx.TensorProto.FLOAT, [M, K1]),
+        ],
+        outputs=[
+            onnx.helper.make_tensor_value_info("Y_a", onnx.TensorProto.FLOAT, [M, N2]),
+            onnx.helper.make_tensor_value_info("Y_b", onnx.TensorProto.FLOAT, [M, N2]),
+        ],
+        initializer=[*inits_a, *inits_b],
+    )
+    model = onnx.helper.make_model(
+        graph,
+        opset_imports=[
+            onnx.helper.make_opsetid("", 21),
+            onnx.helper.make_opsetid("com.microsoft", 1),
+        ],
+    )
+    model.ir_version = 10
+    onnx.checker.check_model(model)
+
+    report = onnxsim.analyze_pruning_sensitivity(
+        model, onnxsim.apply_structured_pruning_matmul_nbits, sparsity=0.5
+    )
+    by_label = {layer.label: layer for layer in report.layers}
+    margin_a = by_label["mm1_a"].margin
+    margin_b = by_label["mm1_b"].margin
+
+    assert margin_b == 0.0  # every dequantized channel row exactly tied
+    assert margin_a is not None and margin_a > 0.9  # wide, unambiguous gap
+    assert margin_a != margin_b
+
+
+def test_analyze_qmoe_expert_channel_pruning_matches_real_call():
+    # Same hand-built shape as
+    # test_qmoe_expert_channel_pruning_matches_hand_built_presliced_reference,
+    # minus the fc1_zero_points wrinkle -- just enough to cross-check
+    # would_drop/family against the real, mutating call.
+    E, hidden, inter, bits, tokens = 3, 8, 12, 4, 6
+    rng = np.random.default_rng(211)
+    fc1_w = (rng.standard_normal((E, inter, hidden)) * 0.3).astype(np.float32)
+    fc2_w = (rng.standard_normal((E, hidden, inter)) * 0.3).astype(np.float32)
+    fc1_b = rng.standard_normal((E, inter)).astype(np.float32)
+
+    fc1_q, fc1_s, _fc1_dq = _qmoe_quantize(fc1_w, bits)
+    fc2_q, fc2_s, _fc2_dq = _qmoe_quantize(fc2_w, bits)
+
+    model = _qmoe_model(
+        fc1_q, fc1_s, fc2_q, fc2_s, bits, fc1_bias=fc1_b, k=2, tokens=tokens
+    )
+    onnx.checker.check_model(model)
+
+    report = onnxsim.analyze_pruning_sensitivity(
+        model, onnxsim.apply_qmoe_expert_channel_pruning, sparsity=0.5
+    )
+    assert len(report.layers) == 1
+    layer = report.layers[0]
+    assert layer.family == "qmoe_expert_channel"
+    assert layer.total == inter
+    assert report.not_eligible == []
+
+    pruned = onnxsim.apply_qmoe_expert_channel_pruning(model, sparsity=0.5)
+    inits = _qmoe_inits(pruned)
+    kept = inter - layer.would_drop
+    assert inits["FC1Q"].shape[1] == kept
+    assert inits["FC1B"].shape[1] == kept
+
+
+def test_analyze_qmoe_expert_channel_pruning_survivor_count_floored_to_pack_multiple():
+    # Mirrors test_qmoe_expert_channel_pruning_survivor_count_floored_to_pack_multiple:
+    # inter_size=10 at bits=4 (pack=2), sparsity=0.7 naively asks for
+    # 10 - round(10*0.7) = 3 survivors -- not a multiple of pack, so both
+    # the real call and the dry-run analyzer must floor it down to 2.
+    E, hidden, inter, bits, tokens = 2, 6, 10, 4, 5
+    rng = np.random.default_rng(212)
+    fc1_w = (rng.standard_normal((E, inter, hidden)) * 0.3).astype(np.float32)
+    fc2_w = (rng.standard_normal((E, hidden, inter)) * 0.3).astype(np.float32)
+    fc1_q, fc1_s, _fc1_dq = _qmoe_quantize(fc1_w, bits)
+    fc2_q, fc2_s, _fc2_dq = _qmoe_quantize(fc2_w, bits)
+    model = _qmoe_model(fc1_q, fc1_s, fc2_q, fc2_s, bits, k=1, tokens=tokens)
+    onnx.checker.check_model(model)
+
+    report = onnxsim.analyze_pruning_sensitivity(
+        model, onnxsim.apply_qmoe_expert_channel_pruning, sparsity=0.7
+    )
+    assert len(report.layers) == 1
+    layer = report.layers[0]
+    assert layer.would_drop == inter - 2  # floored to nearest multiple of pack=2
+
+    pruned = onnxsim.apply_qmoe_expert_channel_pruning(model, sparsity=0.7)
+    inits = _qmoe_inits(pruned)
+    assert inits["FC1Q"].shape[1] == 2
+
+
+def test_analyze_qmoe_expert_channel_pruning_not_eligible_lists_unmatched_nodes():
+    # A QMoE node whose fc1_experts_weights is a graph input rather than a
+    # constant initializer can never be resolved for slicing -- it must
+    # show up in not_eligible, not silently be dropped from the report
+    # (mirrors this section's own QDQ/MatMulNBits not_eligible tests).
+    E, hidden, inter, bits, tokens = 2, 6, 4, 4, 5
+    rng = np.random.default_rng(213)
+    fc1_w = (rng.standard_normal((E, inter, hidden)) * 0.3).astype(np.float32)
+    fc2_w = (rng.standard_normal((E, hidden, inter)) * 0.3).astype(np.float32)
+    fc1_q, fc1_s, _fc1_dq = _qmoe_quantize(fc1_w, bits)
+    fc2_q, fc2_s, _fc2_dq = _qmoe_quantize(fc2_w, bits)
+    model = _qmoe_model(
+        fc1_q, fc1_s, fc2_q, fc2_s, bits, k=1, tokens=tokens, fc1_q_as_input=True
+    )
+    onnx.checker.check_model(model)
+
+    report = onnxsim.analyze_pruning_sensitivity(
+        model, onnxsim.apply_qmoe_expert_channel_pruning, sparsity=0.5
+    )
+    assert report.layers == []
+    assert report.not_eligible == ["QMoE 'qmoe'"]
+
+
+def test_analyze_qmoe_expert_channel_pruning_margin_reflects_dequantized_weight_distribution():
+    # Same adversarial shape as
+    # test_analyze_structured_pruning_qdq_margin_reflects_dequantized_weight_distribution,
+    # for the QMoE expert-channel family: model "a"'s fc1/fc2 rows/columns
+    # have an unambiguous, pack-aligned gap between "big" and "small"
+    # dequantized channel importance (margin should be strongly positive);
+    # model "b"'s are all exactly equal (margin must come out exactly 0.0).
+    # Built as two SEPARATE single-node models rather than one combined
+    # graph (unlike this file's own MatMul/MoE margin tests) -- QMoE's own
+    # test-model builder (`_qmoe_model`) only ever builds one node per
+    # graph, and combining two would mean re-deriving its own tensor-naming
+    # scheme by hand for no added rigor over two independent
+    # analyze_pruning_sensitivity calls compared on the same normalized
+    # `margin` scale.
+    E, hidden, inter, bits, tokens = 2, 8, 8, 4, 5
+
+    # Deterministic (not random) big/tiny clusters -- as with the
+    # MatMulNBits margin test above, a uniform value per cluster (and a
+    # zeroed-out fc2, which would otherwise contribute independent noise to
+    # every channel alike) collapses within-cluster spread to (near) zero,
+    # so the entire gap between clusters shows up in `margin`.
+    fc1_w_a = np.zeros((E, inter, hidden), dtype=np.float32)
+    fc1_w_a[:, :4, :] = 50.0  # channels 0-3 big (kept), 4-7 zero (dropped)
+    fc2_w_a = np.zeros((E, hidden, inter), dtype=np.float32)
+    fc1_q_a, fc1_s_a, _ = _qmoe_quantize(fc1_w_a, bits)
+    fc2_q_a, fc2_s_a, _ = _qmoe_quantize(fc2_w_a, bits)
+    model_a = _qmoe_model(fc1_q_a, fc1_s_a, fc2_q_a, fc2_s_a, bits, k=1, tokens=tokens)
+    onnx.checker.check_model(model_a)
+
+    fc1_w_b = np.full((E, inter, hidden), 3.0, dtype=np.float32)
+    fc2_w_b = np.full((E, hidden, inter), 3.0, dtype=np.float32)
+    fc1_q_b, fc1_s_b, _ = _qmoe_quantize(fc1_w_b, bits)
+    fc2_q_b, fc2_s_b, _ = _qmoe_quantize(fc2_w_b, bits)
+    model_b = _qmoe_model(fc1_q_b, fc1_s_b, fc2_q_b, fc2_s_b, bits, k=1, tokens=tokens)
+    onnx.checker.check_model(model_b)
+
+    report_a = onnxsim.analyze_pruning_sensitivity(
+        model_a, onnxsim.apply_qmoe_expert_channel_pruning, sparsity=0.5
+    )
+    report_b = onnxsim.analyze_pruning_sensitivity(
+        model_b, onnxsim.apply_qmoe_expert_channel_pruning, sparsity=0.5
+    )
+    margin_a = report_a.layers[0].margin
+    margin_b = report_b.layers[0].margin
+
+    assert margin_b == 0.0  # every dequantized channel exactly tied
+    assert margin_a is not None and margin_a > 0.9  # wide, unambiguous gap
+    assert margin_a != margin_b
+
+
+def test_analyze_qmoe_whole_expert_pruning_matches_real_call():
+    # Same hand-built shape as this file's own QMoE whole-expert
+    # calibration tests -- a router-usage-ranked cross-check against the
+    # real, mutating call.
+    E, hidden, inter, bits, tokens = 4, 6, 4, 4, 8
+    rng = np.random.default_rng(215)
+    fc1_w = (rng.standard_normal((E, inter, hidden)) * 0.3).astype(np.float32)
+    fc2_w = (rng.standard_normal((E, hidden, inter)) * 0.3).astype(np.float32)
+    router_w = rng.standard_normal((hidden, E)).astype(np.float32)
+    fc1_q, fc1_s, _ = _qmoe_quantize(fc1_w, bits)
+    fc2_q, fc2_s, _ = _qmoe_quantize(fc2_w, bits)
+
+    model = _qmoe_router_model(
+        fc1_q, fc1_s, fc2_q, fc2_s, bits, router_w, k=1, tokens=tokens
+    )
+    onnx.checker.check_model(model)
+
+    calib_rng = np.random.default_rng(216)
+    calibration_data = [
+        {"X": calib_rng.standard_normal((tokens, hidden)).astype(np.float32)}
+        for _ in range(3)
+    ]
+
+    report = onnxsim.analyze_pruning_sensitivity(
+        model,
+        onnxsim.apply_qmoe_whole_expert_pruning,
+        calibration_data=calibration_data,
+        sparsity=0.5,
+    )
+    assert len(report.layers) == 1
+    layer = report.layers[0]
+    assert layer.family == "qmoe_whole_expert"
+    assert layer.total == E
+    assert report.not_eligible == []
+
+    pruned = onnxsim.apply_qmoe_whole_expert_pruning(
+        model, calibration_data=calibration_data, sparsity=0.5
+    )
+    inits = _qmoe_inits(pruned)
+    kept = E - layer.would_drop
+    assert inits["FC1Q"].shape[0] == kept
+    assert inits["RW"].shape[1] == kept
+
+
+def test_analyze_qmoe_whole_expert_pruning_not_eligible_lists_unmatched_nodes():
+    # use_sparse_mixer=1 is always declined by the real function (see
+    # _match_qmoe_whole_expert_producer) -- must show up in not_eligible.
+    E, hidden, inter, bits, tokens = 2, 6, 4, 4, 5
+    rng = np.random.default_rng(217)
+    fc1_w = (rng.standard_normal((E, inter, hidden)) * 0.3).astype(np.float32)
+    fc2_w = (rng.standard_normal((E, hidden, inter)) * 0.3).astype(np.float32)
+    router_w = rng.standard_normal((hidden, E)).astype(np.float32)
+    fc1_q, fc1_s, _ = _qmoe_quantize(fc1_w, bits)
+    fc2_q, fc2_s, _ = _qmoe_quantize(fc2_w, bits)
+    model = _qmoe_router_model(
+        fc1_q,
+        fc1_s,
+        fc2_q,
+        fc2_s,
+        bits,
+        router_w,
+        k=2,
+        tokens=tokens,
+        use_sparse_mixer=1,
+    )
+    onnx.checker.check_model(model)
+
+    report = onnxsim.analyze_pruning_sensitivity(
+        model,
+        onnxsim.apply_qmoe_whole_expert_pruning,
+        calibration_data=[],
+        sparsity=0.5,
+    )
+    assert report.layers == []
+    assert report.not_eligible == ["QMoE 'qmoe'"]
+
+
+def test_analyze_qmoe_whole_expert_pruning_margin_reflects_router_usage_distribution():
+    # Same adversarial shape as
+    # test_analyze_moe_whole_expert_pruning_margin_reflects_router_usage_distribution,
+    # for the QMoE whole-expert family: model "a"'s router has a zero
+    # weight matrix and a heavily lopsided bias, so every token's routing
+    # logits are identical and one expert's usage is unambiguously near-zero
+    # next to the rest (margin should be strongly positive); model "b"'s
+    # router weight and bias are both all-zero, so every expert's mean gate
+    # weight comes out *exactly* tied (margin must come out exactly 0.0).
+    # Built as two separate single-node models -- see this section's own
+    # QMoE expert-channel margin test comment for why.
+    # hidden/inter must each be a multiple of the pack width (8 // bits ==
+    # 2 here) -- QMoE's own packed-uint8 K axis, unlike plain MoE's float
+    # tensors, has no way to represent a partial trailing packed byte.
+    E, hidden, inter, bits, tokens = 4, 4, 2, 4, 5
+    rng = np.random.default_rng(218)
+    fc1_w = (rng.standard_normal((E, inter, hidden)) * 0.3).astype(np.float32)
+    fc2_w = (rng.standard_normal((E, hidden, inter)) * 0.3).astype(np.float32)
+    fc1_q, fc1_s, _ = _qmoe_quantize(fc1_w, bits)
+    fc2_q, fc2_s, _ = _qmoe_quantize(fc2_w, bits)
+
+    router_w_zero = np.zeros((hidden, E), dtype=np.float32)
+    router_b_a = np.array([0.0, 0.0, 0.0, -8.0], dtype=np.float32)  # expert 3: ~0 usage
+    router_b_b = np.zeros(E, dtype=np.float32)
+
+    model_a = _qmoe_router_model(
+        fc1_q,
+        fc1_s,
+        fc2_q,
+        fc2_s,
+        bits,
+        router_w_zero,
+        router_b=router_b_a,
+        k=1,
+        tokens=tokens,
+    )
+    model_b = _qmoe_router_model(
+        fc1_q,
+        fc1_s,
+        fc2_q,
+        fc2_s,
+        bits,
+        router_w_zero,
+        router_b=router_b_b,
+        k=1,
+        tokens=tokens,
+    )
+    onnx.checker.check_model(model_a)
+    onnx.checker.check_model(model_b)
+
+    calib_rng = np.random.default_rng(219)
+    calibration_data = [
+        {"X": calib_rng.standard_normal((tokens, hidden)).astype(np.float32)}
+        for _ in range(3)
+    ]
+
+    report_a = onnxsim.analyze_pruning_sensitivity(
+        model_a,
+        onnxsim.apply_qmoe_whole_expert_pruning,
+        calibration_data=calibration_data,
+        sparsity=0.25,  # keep 3 of 4
+    )
+    report_b = onnxsim.analyze_pruning_sensitivity(
+        model_b,
+        onnxsim.apply_qmoe_whole_expert_pruning,
+        calibration_data=calibration_data,
+        sparsity=0.25,
+    )
+    margin_a = report_a.layers[0].margin
+    margin_b = report_b.layers[0].margin
+
+    assert margin_b == 0.0  # every expert's router logit exactly tied
     assert margin_a is not None and margin_a > 0.9  # wide, unambiguous gap
     assert margin_a != margin_b
 
@@ -18529,16 +20315,672 @@ def test_prune_then_quantize_static_composes_correctly():
     assert rel < 0.05  # ordinary INT8 quantization error, not a correctness bug
 
 
+# --- apply_structured_pruning_qdq: blockwise INT4/UINT4 --------------------
+#
+# See ``onnxsim/pruning.py``'s own "QDQ (quantized-weight) structured
+# pruning" section top comment for the full empirical investigation
+# (``onnx``/``onnxruntime`` schema introspection, a real
+# ``onnxruntime.InferenceSession`` run cross-checked against
+# ``onnx.reference.ReferenceEvaluator``, and ``onnx.numpy_helper``'s own
+# INT4/UINT4 pack/unpack helpers) this support's scope was reached from.
+# ``_qdq_block_dequant`` below is an INDEPENDENT reference implementation of
+# opset 21's own blockwise ``DequantizeLinear`` formula -- not a call into
+# any of ``onnxsim.pruning``'s own private dequantization helpers -- so a
+# bug shared between the pass and its own test oracle can't hide.
+#
+# INT4/UINT4 initializers are built via ``onnx.numpy_helper.from_array`` on
+# an ``ml_dtypes.int4``/``uint4`` array (`_int4`/`_uint4` below), never as
+# ``onnx.parser`` text literals -- per this repo's own CLAUDE.md, the text
+# format's tensor literals are encoded as ``float_data``, not the packed
+# ``raw_data`` a real INT4/UINT4 ``TensorProto`` (and this pass's own
+# ``onnx.numpy_helper.to_array``/``from_array`` round-trip) requires.
+
+
+def _int4(array, name):
+    return onnx.numpy_helper.from_array(
+        array.astype(np.int8).astype(ml_dtypes.int4), name
+    )
+
+
+def _uint4(array, name):
+    return onnx.numpy_helper.from_array(
+        array.astype(np.uint8).astype(ml_dtypes.uint4), name
+    )
+
+
+def _qdq_block_dequant(q, scale, zero_point, axis, block_size):
+    # Independent reference for BLOCKWISE dequantization -- mirrors opset
+    # 21's own `DequantizeLinear` formula with a `block_size` attribute:
+    # `scale`/`zero_point` have the SAME RANK as `q`, full-size on every
+    # axis except `axis` (blocked), where they are `ceil(dim_size(axis) /
+    # block_size)`-sized; each block's own scalar broadcasts to every
+    # element of its own `block_size`-sized span along `axis`. Not anything
+    # from ``onnxsim.pruning`` itself.
+    q = q.astype(np.float64)
+    scale = np.repeat(scale.astype(np.float64), block_size, axis=axis)
+    slicer = [slice(None)] * q.ndim
+    slicer[axis] = slice(0, q.shape[axis])
+    scale = scale[tuple(slicer)]
+    if zero_point is not None:
+        zp = np.repeat(zero_point.astype(np.float64), block_size, axis=axis)
+        zp = zp[tuple(slicer)]
+        q = q - zp
+    return q * scale
+
+
+def _matmul_qdq_blockwise_producer_model(
+    K=8, H=16, Out=4, block_size=4, seed=0, zero_point=False, uint4=False
+):
+    # Blockwise INT4/UINT4 QDQ MatMul producer (Wq/Wscale[/Wzp], `axis=0`
+    # block-quantized -- this weight's own REDUCTION/input axis, `K`, since
+    # a plain (non-transposed) MatMul weight's own output-channel axis is
+    # `axis=1` -- see this module's own top comment for why blockwise
+    # quantization always blocks the axis *other* than the output-channel
+    # one) feeding a plain float MatMul consumer (W2) -- the "producer"
+    # role, exercising co-sliced weight+scale(+zero_point) with NO
+    # block-alignment concern (block_size never applies to the axis being
+    # sliced here).
+    rng = np.random.default_rng(seed)
+    k_blocks = K // block_size
+    lo, hi = (0, 16) if uint4 else (-8, 8)
+    pack = _uint4 if uint4 else _int4
+    Wq = rng.integers(lo, hi, size=(K, H)).astype(np.int8)
+    Wscale = (
+        np.abs(rng.standard_normal((k_blocks, H))).astype(np.float32) * 0.02 + 0.001
+    )
+    W2 = rng.standard_normal((H, Out)).astype(np.float32)
+    initializer = [pack(Wq, "Wq"), _f32(Wscale, "Wscale"), _f32(W2, "W2")]
+    zp_input = ""
+    Wzp = None
+    if zero_point:
+        Wzp = rng.integers(lo, hi, size=(k_blocks, H)).astype(np.int8)
+        initializer.append(pack(Wzp, "Wzp"))
+        zp_input = ", Wzp"
+    model = _model(
+        f"""
+        g (float[batch,{K}] X) => (float[batch,{Out}] Y)
+        {{
+          Wdq = DequantizeLinear<axis=0, block_size={block_size}>(Wq, Wscale{zp_input})
+          h = MatMul(X, Wdq)
+          Y = MatMul(h, W2)
+        }}
+        """,
+        initializer=initializer,
+    )
+    return model, Wq, Wscale, Wzp, W2
+
+
+def test_qdq_blockwise_int4_producer_matches_oracle():
+    K, H, Out, block_size = 8, 16, 4, 4
+    model, Wq, Wscale, _Wzp, W2 = _matmul_qdq_blockwise_producer_model(
+        K, H, Out, block_size, seed=100
+    )
+    onnx.checker.check_model(model)
+
+    pruned = onnxsim.apply_structured_pruning_qdq(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    inits = {t.name: t for t in pruned.graph.initializer}
+    assert list(inits["Wq"].dims) == [K, H // 2]
+    assert list(inits["Wscale"].dims) == [K // block_size, H // 2]
+    assert list(inits["W2"].dims) == [H // 2, Out]
+
+    w_dequant = _qdq_block_dequant(Wq, Wscale, None, axis=0, block_size=block_size)
+    keep = _oracle_keep_indices(w_dequant, H // 2)
+
+    rng = np.random.default_rng(101)
+    x = rng.standard_normal((5, K)).astype(np.float32)
+    (y,) = _run_unfused(pruned, {"X": x})
+
+    h = x @ w_dequant[:, keep]
+    y_oracle = h @ W2[keep, :]
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-4, atol=1e-4)
+
+    # And the pruned graph's own Wq/Wscale, dequantized, reproduce exactly
+    # the hand-sliced reference -- confirms the lockstep co-slice, not just
+    # the end-to-end numeric output.
+    wq_pruned = onnx.numpy_helper.to_array(inits["Wq"]).astype(np.int8)
+    wscale_pruned = onnx.numpy_helper.to_array(inits["Wscale"])
+    np.testing.assert_array_equal(wq_pruned, Wq[:, keep])
+    np.testing.assert_allclose(wscale_pruned, Wscale[:, keep])
+
+
+def test_qdq_blockwise_uint4_producer_with_zero_point_matches_oracle():
+    # UINT4 codes (unsigned range) AND a genuine (nonzero) blockwise
+    # zero_point present -- exercises both the UINT4 packing path and the
+    # zero_point co-slice together.
+    K, H, Out, block_size = 8, 16, 4, 4
+    model, Wq, Wscale, Wzp, W2 = _matmul_qdq_blockwise_producer_model(
+        K, H, Out, block_size, seed=102, zero_point=True, uint4=True
+    )
+    onnx.checker.check_model(model)
+    assert Wzp is not None
+    assert np.any(Wzp != 0)
+
+    pruned = onnxsim.apply_structured_pruning_qdq(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    inits = {t.name: t for t in pruned.graph.initializer}
+    assert list(inits["Wzp"].dims) == [K // block_size, H // 2]
+
+    w_dequant = _qdq_block_dequant(Wq, Wscale, Wzp, axis=0, block_size=block_size)
+    keep = _oracle_keep_indices(w_dequant, H // 2)
+
+    rng = np.random.default_rng(103)
+    x = rng.standard_normal((5, K)).astype(np.float32)
+    (y,) = _run_unfused(pruned, {"X": x})
+    h = x @ w_dequant[:, keep]
+    y_oracle = h @ W2[keep, :]
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-4, atol=1e-4)
+
+    wzp_pruned = onnx.numpy_helper.to_array(inits["Wzp"]).astype(np.uint8)
+    np.testing.assert_array_equal(wzp_pruned, Wzp[:, keep])
+
+
+def _block_grouped_column_weight(
+    rng, rows, n_blocks, block_size, high_block_idx, lo=1.0, hi=6.0
+):
+    # A float weight whose column magnitude is constant WITHIN each
+    # `block_size`-sized group of columns (large for every block index in
+    # `high_block_idx`, small otherwise) -- so the top-L2-norm importance
+    # ranking this module's own structured pruning uses always drops/keeps
+    # whole blocks together, letting a "consumer block-aligned" test be
+    # deterministic rather than relying on chance alignment.
+    cols = n_blocks * block_size
+    base = rng.standard_normal((rows, cols)).astype(np.float64) * 0.1
+    for b in range(n_blocks):
+        mag = hi if b in high_block_idx else lo
+        base[:, b * block_size : (b + 1) * block_size] += mag * np.sign(
+            rng.standard_normal((rows, block_size))
+        )
+    return base.astype(np.float32)
+
+
+def _matmul_qdq_blockwise_consumer_model(
+    K, H, Out, block_size, seed=0, zero_point=False, uint4=False, W1=None
+):
+    # Plain float producer (W1) feeding a blockwise INT4/UINT4 QDQ MatMul
+    # consumer (Wq/Wscale[/Wzp]) -- `axis=0` block-quantized (this weight's
+    # own reduction/input axis, `H`; output-channel axis is `axis=1=Out`)
+    # -- the "consumer" role.
+    rng = np.random.default_rng(seed)
+    h_blocks = H // block_size
+    lo, hi = (0, 16) if uint4 else (-8, 8)
+    pack = _uint4 if uint4 else _int4
+    if W1 is None:
+        W1 = rng.standard_normal((K, H)).astype(np.float32)
+    Wq = rng.integers(lo, hi, size=(H, Out)).astype(np.int8)
+    Wscale = (
+        np.abs(rng.standard_normal((h_blocks, Out))).astype(np.float32) * 0.02 + 0.001
+    )
+    initializer = [_f32(W1, "W1"), pack(Wq, "Wq"), _f32(Wscale, "Wscale")]
+    zp_input = ""
+    Wzp = None
+    if zero_point:
+        Wzp = rng.integers(lo, hi, size=(h_blocks, Out)).astype(np.int8)
+        initializer.append(pack(Wzp, "Wzp"))
+        zp_input = ", Wzp"
+    model = _model(
+        f"""
+        g (float[batch,{K}] X) => (float[batch,{Out}] Y)
+        {{
+          h = MatMul(X, W1)
+          Wdq = DequantizeLinear<axis=0, block_size={block_size}>(Wq, Wscale{zp_input})
+          Y = MatMul(h, Wdq)
+        }}
+        """,
+        initializer=initializer,
+    )
+    return model, W1, Wq, Wscale, Wzp
+
+
+def test_qdq_blockwise_consumer_block_aligned_matches_oracle():
+    K, H, Out, block_size = 4, 16, 4, 4
+    n_blocks = H // block_size
+    rng = np.random.default_rng(104)
+    # Blocks 0 and 2 large-magnitude (kept), blocks 1 and 3 small (dropped)
+    # -- a deterministic, block-aligned 50% keep set.
+    W1 = _block_grouped_column_weight(
+        rng, K, n_blocks, block_size, high_block_idx={0, 2}
+    )
+    model, W1, Wq, Wscale, _Wzp = _matmul_qdq_blockwise_consumer_model(
+        K, H, Out, block_size, seed=105, W1=W1
+    )
+    onnx.checker.check_model(model)
+
+    keep = _oracle_keep_indices(W1, H // 2)
+    keep_blocks = sorted({int(k) // block_size for k in keep})
+    assert keep_blocks == [0, 2]  # confirms the engineered data is genuinely
+    # block-aligned, not merely lucky
+
+    pruned = onnxsim.apply_structured_pruning_qdq(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    inits = {t.name: t for t in pruned.graph.initializer}
+    assert list(inits["Wq"].dims) == [H // 2, Out]
+    assert list(inits["Wscale"].dims) == [n_blocks // 2, Out]
+
+    w_dequant = _qdq_block_dequant(Wq, Wscale, None, axis=0, block_size=block_size)
+    rng2 = np.random.default_rng(106)
+    x = rng2.standard_normal((5, K)).astype(np.float32)
+    (y,) = _run_unfused(pruned, {"X": x})
+    h = x @ W1[:, keep]
+    y_oracle = h @ w_dequant[keep, :]
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-4, atol=1e-4)
+
+    # The pruned Wscale itself, indexed by BLOCK (not element), must be
+    # exactly the kept blocks' own rows -- confirms the block-index (not
+    # positional) co-slice.
+    wscale_pruned = onnx.numpy_helper.to_array(inits["Wscale"])
+    np.testing.assert_array_equal(wscale_pruned, Wscale[keep_blocks, :])
+
+
+def test_qdq_blockwise_consumer_non_block_aligned_declines():
+    # `keep_count` (6) is not a multiple of `block_size` (4) -- no whole-
+    # block partition of a 16-element axis can ever produce exactly 6 kept
+    # elements (only 0/4/8/12/16 are achievable), so this chain's consumer
+    # is UNCONDITIONALLY non-block-aligned regardless of which particular
+    # channels rank highest; the real call must decline the whole chain
+    # (both producer and consumer left untouched) rather than corrupt it.
+    K, H, Out, block_size = 4, 16, 4, 4
+    model, W1, Wq, Wscale, _Wzp = _matmul_qdq_blockwise_consumer_model(
+        K, H, Out, block_size, seed=107
+    )
+    onnx.checker.check_model(model)
+
+    pruned = onnxsim.apply_structured_pruning_qdq(model, sparsity=0.625)  # keep 6 of 16
+    inits = {t.name: t for t in pruned.graph.initializer}
+    assert list(inits["W1"].dims) == [K, H]  # left completely untouched
+    assert list(inits["Wq"].dims) == [H, Out]
+    assert list(inits["Wscale"].dims) == [H // block_size, Out]
+    np.testing.assert_array_equal(onnx.numpy_helper.to_array(inits["W1"]), W1)
+    np.testing.assert_array_equal(
+        onnx.numpy_helper.to_array(inits["Wq"]).astype(np.int8), Wq
+    )
+
+
+def test_qdq_blockwise_chain_two_layers_matches_oracle():
+    # Both producer AND consumer are blockwise INT4 QDQ -- the same
+    # single-`keep` set must be block-aligned for the CONSUMER side only
+    # (the producer side never needs alignment, see this module's own top
+    # comment); engineered so it genuinely is.
+    N1, K1, N2, block_size = 8, 4, 5, 4
+    n_blocks = N1 // block_size
+    rng = np.random.default_rng(108)
+    lo, hi = -8, 8
+
+    Wq1 = rng.integers(lo, hi, size=(K1, N1)).astype(np.int8)
+    # Blocks of N1: make block 0's dequantized column norm large, block 1's
+    # small, via the scale (codes stay modest/uniform) -- deterministic
+    # block-aligned 50% keep set on the producer's OWN output axis (axis=1
+    # here), which does not itself need alignment, but controls WHICH
+    # columns survive to feed the consumer's block axis.
+    Wscale1 = np.ones((K1 // block_size, N1), dtype=np.float32) * 0.01
+    Wscale1[:, :block_size] *= 50.0  # block 0 columns -- large, kept
+    Wq2 = rng.integers(lo, hi, size=(N2, N1)).astype(np.int8)
+    # W2's own scale (`Wscale2`) is generated inside
+    # `_gemm_transb_blockwise_chain_model` from the same `seed` below and
+    # read back afterwards (`Wscale2_actual`) -- it blocks W2's own K axis
+    # (== N1), laid out as `(N2, n_blocks)` since this weight is
+    # transB=1-shaped (`axis=1` is N1's own position in a `[N2, N1]` weight).
+    model = _gemm_transb_blockwise_chain_model(
+        K1, N1, N2, block_size, Wq1, Wscale1, Wq2, seed=108
+    )
+    onnx.checker.check_model(model)
+
+    g = model.graph
+    init_map = {t.name: t for t in g.initializer}
+    Wscale2_actual = onnx.numpy_helper.to_array(init_map["W2s"])
+
+    w1_dequant = _qdq_block_dequant(Wq1, Wscale1, None, axis=0, block_size=block_size)
+    keep = _oracle_keep_indices(w1_dequant, N1 // 2)
+    keep_blocks = sorted({int(k) // block_size for k in keep})
+    assert keep_blocks == [0]  # confirms the engineered scale genuinely
+    # produces a block-aligned keep set
+
+    pruned = onnxsim.apply_structured_pruning_qdq(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    pinits = {t.name: t for t in pruned.graph.initializer}
+    assert list(pinits["W1q"].dims) == [K1, N1 // 2]
+    assert list(pinits["W2q"].dims) == [N2, N1 // 2]
+    assert list(pinits["W2s"].dims) == [N2, n_blocks // 2]
+
+    w2_dequant = _qdq_block_dequant(
+        Wq2, Wscale2_actual, None, axis=1, block_size=block_size
+    )
+    rng2 = np.random.default_rng(109)
+    x = rng2.standard_normal((3, K1)).astype(np.float32)
+    (y,) = _run_unfused(pruned, {"X": x})
+    h = x @ w1_dequant[:, keep]
+    y_oracle = h @ w2_dequant[:, keep].T
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-4, atol=1e-4)
+
+
+def _gemm_transb_blockwise_chain_model(K1, N1, N2, block_size, Wq1, Wscale1, Wq2, seed):
+    # W1 (plain MatMul, axis=0 blockwise, shape [K1, N1]) -> W2 (Gemm
+    # transB=1, axis=1 blockwise since W2's own shape is [N2, N1] and its
+    # output-channel axis is 0, so its reduction/block axis is 1) -- built
+    # via ``onnx.parser`` text for the node graph (`_model`), with weight/
+    # scale tensors attached programmatically per this file's own
+    # established pattern.
+    rng = np.random.default_rng(seed)
+    n_blocks = N1 // block_size
+    Wscale2 = (
+        np.abs(rng.standard_normal((N2, n_blocks))).astype(np.float32) * 0.02 + 0.001
+    )
+    model = _model(
+        f"""
+        g (float[batch,{K1}] X) => (float[batch,{N2}] Y)
+        {{
+          W1w = DequantizeLinear<axis=0, block_size={block_size}>(W1q, W1s)
+          h = MatMul(X, W1w)
+          W2w = DequantizeLinear<axis=1, block_size={block_size}>(W2q, W2s)
+          Y = Gemm<transB=1>(h, W2w)
+        }}
+        """,
+        initializer=[
+            _int4(Wq1, "W1q"),
+            _f32(Wscale1, "W1s"),
+            _int4(Wq2, "W2q"),
+            _f32(Wscale2, "W2s"),
+        ],
+    )
+    return model
+
+
+def test_qdq_blockwise_mixed_with_per_channel_int8_producer_matches_oracle():
+    # Mixed-quantization-scheme chain: a per-tensor/per-channel INT8 QDQ
+    # producer (the section above's own existing support) feeding a
+    # blockwise INT4 QDQ consumer (this section's own new support) -- both
+    # resolve through the same :func:`_resolve_weight_ref`
+    # three-way abstraction, so they must compose exactly like a float/QDQ
+    # mix already does.
+    K, H, Out, block_size = 4, 16, 4, 4
+    n_blocks = H // block_size
+    rng = np.random.default_rng(110)
+    # Constant-magnitude codes (only sign varies) so each column's
+    # dequantized L2 norm is driven purely by its own per-channel scale --
+    # a deterministic ranking, not one that depends on which random codes
+    # happened to land where.
+    Wq1 = (50 * np.sign(rng.standard_normal((K, H)))).astype(np.int8)
+    # Per-channel scale engineered so blocks 0/2 (of the consumer's own
+    # block axis) rank highest -- a block-aligned 50% keep set.
+    Wscale1 = np.array(
+        [
+            3.0,
+            3.0,
+            3.0,
+            3.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            3.0,
+            3.0,
+            3.0,
+            3.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+        ],
+        dtype=np.float32,
+    )
+    Wq2 = rng.integers(-8, 8, size=(H, Out)).astype(np.int8)
+    Wscale2 = (
+        np.abs(rng.standard_normal((n_blocks, Out))).astype(np.float32) * 0.02 + 0.001
+    )
+    model = _model(
+        f"""
+        g (float[batch,{K}] X) => (float[batch,{Out}] Y)
+        {{
+          W1dq = DequantizeLinear<axis=1>(W1q, W1s)
+          h = MatMul(X, W1dq)
+          W2dq = DequantizeLinear<axis=0, block_size={block_size}>(W2q, W2s)
+          Y = MatMul(h, W2dq)
+        }}
+        """,
+        initializer=[
+            _i8(Wq1, "W1q"),
+            _f32(Wscale1, "W1s"),
+            _int4(Wq2, "W2q"),
+            _f32(Wscale2, "W2s"),
+        ],
+    )
+    onnx.checker.check_model(model)
+
+    w1_dequant = _qdq_dequant(Wq1, Wscale1, None, axis=1)
+    keep = _oracle_keep_indices(w1_dequant, H // 2)
+    keep_blocks = sorted({int(k) // block_size for k in keep})
+    assert keep_blocks == [0, 2]  # engineered, block-aligned
+
+    pruned = onnxsim.apply_structured_pruning_qdq(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    pinits = {t.name: t for t in pruned.graph.initializer}
+    assert list(pinits["W1q"].dims) == [K, H // 2]
+    assert list(pinits["W2q"].dims) == [H // 2, Out]
+    assert list(pinits["W2s"].dims) == [n_blocks // 2, Out]
+
+    w2_dequant = _qdq_block_dequant(Wq2, Wscale2, None, axis=0, block_size=block_size)
+    rng2 = np.random.default_rng(111)
+    x = rng2.standard_normal((5, K)).astype(np.float32)
+    (y,) = _run_unfused(pruned, {"X": x})
+    h = x @ w1_dequant[:, keep]
+    y_oracle = h @ w2_dequant[keep, :]
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-4, atol=1e-4)
+
+
+def test_qdq_blockwise_conv_producer_matches_oracle():
+    # Blockwise INT4 quantization on a Conv weight: `axis=0` is the Conv
+    # weight's own output-channel axis (`Cmid`), so `block_size` blocks
+    # `axis=1`, the in_channels axis -- exercised here as the producer's
+    # OWN reduction axis (this Conv is itself fed by plain float `X`, and
+    # its own OUTPUT channels, `Cmid`, are what gets pruned, unaffected by
+    # its own input-channel blocking).
+    Cin, Cmid, Cout, block_size = 8, 8, 4, 4
+    cin_blocks = Cin // block_size
+    rng = np.random.default_rng(112)
+    Wq1 = rng.integers(-8, 8, size=(Cmid, Cin, 1, 1)).astype(np.int8)
+    Wscale1 = (
+        np.abs(rng.standard_normal((Cmid, cin_blocks, 1, 1))).astype(np.float32) * 0.02
+        + 0.001
+    )
+    Wq2 = rng.integers(-100, 100, size=(Cout, Cmid, 1, 1)).astype(np.int8)
+    Wscale2 = np.abs(rng.standard_normal(Cout)).astype(np.float32) * 0.02 + 0.001
+    model = _model(
+        f"""
+        g (float[1,{Cin},4,4] X) => (float[1,{Cout},4,4] Y)
+        {{
+          W1dq = DequantizeLinear<axis=1, block_size={block_size}>(W1q, W1s)
+          h = Conv(X, W1dq)
+          W2dq = DequantizeLinear<axis=0>(W2q, W2s)
+          Y = Conv(h, W2dq)
+        }}
+        """,
+        initializer=[
+            _int4(Wq1, "W1q"),
+            _f32(Wscale1, "W1s"),
+            _i8(Wq2, "W2q"),
+            _f32(Wscale2, "W2s"),
+        ],
+    )
+    onnx.checker.check_model(model)
+
+    pruned = onnxsim.apply_structured_pruning_qdq(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    inits = {t.name: t for t in pruned.graph.initializer}
+    assert list(inits["W1q"].dims) == [Cmid // 2, Cin, 1, 1]
+    assert list(inits["W1s"].dims) == [Cmid // 2, cin_blocks, 1, 1]
+    assert list(inits["W2q"].dims) == [Cout, Cmid // 2, 1, 1]
+
+    w1_dequant = _qdq_block_dequant(Wq1, Wscale1, None, axis=1, block_size=block_size)
+    w2_dequant = _qdq_dequant(Wq2, Wscale2, None, axis=0)
+    w1_nk = w1_dequant.reshape(Cmid, -1)
+    keep = _oracle_keep_indices(w1_nk.T, Cmid // 2)
+
+    rng2 = np.random.default_rng(113)
+    x = rng2.standard_normal((1, Cin, 4, 4)).astype(np.float32)
+    (y,) = _run_unfused(pruned, {"X": x})
+
+    ref_model = onnx.helper.make_model(
+        onnx.helper.make_graph(
+            [
+                onnx.helper.make_node("Conv", ["X", "W1"], ["h"]),
+                onnx.helper.make_node("Conv", ["h", "W2"], ["Y"]),
+            ],
+            "oracle",
+            [onnx.helper.make_tensor_value_info("X", onnx.TensorProto.FLOAT, None)],
+            [onnx.helper.make_tensor_value_info("Y", onnx.TensorProto.FLOAT, None)],
+            initializer=[
+                onnx.numpy_helper.from_array(
+                    w1_dequant[keep].astype(np.float32), name="W1"
+                ),
+                onnx.numpy_helper.from_array(
+                    w2_dequant[:, keep].astype(np.float32), name="W2"
+                ),
+            ],
+        ),
+        opset_imports=[onnx.helper.make_opsetid("", 21)],
+        ir_version=10,
+    )
+    (y_oracle,) = onnx.reference.ReferenceEvaluator(ref_model).run(None, {"X": x})
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-4, atol=1e-4)
+
+
+def test_qdq_blockwise_declines_block_size_on_output_axis():
+    # `block_size` set on the weight's own OUTPUT-channel axis (`axis=1`
+    # here, matching a plain-MatMul weight's own `expected_axis`) rather
+    # than its reduction axis -- neither the per-tensor/per-channel matcher
+    # (which declines any nonzero `block_size` outright) nor the blockwise
+    # one (which requires `axis == 1 - expected_axis`) matches this, so the
+    # weight resolves to neither and the whole chain is left untouched.
+    K, H, Out, block_size = 8, 16, 4, 4
+    rng = np.random.default_rng(114)
+    Wq = rng.integers(-8, 8, size=(K, H)).astype(np.int8)
+    Wscale = np.abs(rng.standard_normal((K, H // block_size))).astype(np.float32) * 0.01
+    W2 = rng.standard_normal((H, Out)).astype(np.float32)
+    model = _model(
+        f"""
+        g (float[batch,{K}] X) => (float[batch,{Out}] Y)
+        {{
+          Wdq = DequantizeLinear<axis=1, block_size={block_size}>(Wq, Wscale)
+          h = MatMul(X, Wdq)
+          Y = MatMul(h, W2)
+        }}
+        """,
+        initializer=[_int4(Wq, "Wq"), _f32(Wscale, "Wscale"), _f32(W2, "W2")],
+    )
+    onnx.checker.check_model(model)
+    pruned = onnxsim.apply_structured_pruning_qdq(model, sparsity=0.5)
+    inits = {t.name: t for t in pruned.graph.initializer}
+    assert list(inits["Wq"].dims) == [K, H]  # left completely untouched
+
+
+def test_qdq_blockwise_declines_non_exact_multiple_block_dim():
+    # The reduction axis (`K=10`) is not an exact multiple of `block_size`
+    # (4) -- a padded/partial final block this section's own matcher
+    # declines outright (mirrors `MatMulNBits`'s own identical decision).
+    K, H, Out, block_size = 10, 16, 4, 4
+    rng = np.random.default_rng(115)
+    Wq = rng.integers(-8, 8, size=(K, H)).astype(np.int8)
+    Wscale = (
+        np.abs(rng.standard_normal((3, H))).astype(np.float32) * 0.01
+    )  # ceil(10/4)=3
+    W2 = rng.standard_normal((H, Out)).astype(np.float32)
+    model = _model(
+        f"""
+        g (float[batch,{K}] X) => (float[batch,{Out}] Y)
+        {{
+          Wdq = DequantizeLinear<axis=0, block_size={block_size}>(Wq, Wscale)
+          h = MatMul(X, Wdq)
+          Y = MatMul(h, W2)
+        }}
+        """,
+        initializer=[_int4(Wq, "Wq"), _f32(Wscale, "Wscale"), _f32(W2, "W2")],
+    )
+    onnx.checker.check_model(model)
+    pruned = onnxsim.apply_structured_pruning_qdq(model, sparsity=0.5)
+    inits = {t.name: t for t in pruned.graph.initializer}
+    assert list(inits["Wq"].dims) == [K, H]  # left completely untouched
+
+
+def test_qdq_blockwise_declines_shared_quantized_weight():
+    # The same INT4 initializer feeding two independent DequantizeLinear
+    # consumers -- slicing it for one chain would silently corrupt the
+    # other's own use of the identical tensor, so it must be declined, the
+    # exact analogue of the existing per-channel INT8 test above.
+    K, H, Out, block_size = 8, 16, 4, 4
+    model, Wq, Wscale, _Wzp, W2 = _matmul_qdq_blockwise_producer_model(
+        K, H, Out, block_size, seed=116
+    )
+    extra_dq = onnx.helper.make_node(
+        "DequantizeLinear", ["Wq", "Wscale"], ["Wdq2"], axis=0, block_size=block_size
+    )
+    extra_identity = onnx.helper.make_node("Identity", ["Wdq2"], ["Wdq2_out"])
+    model.graph.node.extend([extra_dq, extra_identity])
+    model.graph.output.append(
+        onnx.helper.make_tensor_value_info("Wdq2_out", onnx.TensorProto.FLOAT, [K, H])
+    )
+    onnx.checker.check_model(model)
+
+    pruned = onnxsim.apply_structured_pruning_qdq(model, sparsity=0.5)
+    inits = {t.name: t for t in pruned.graph.initializer}
+    assert list(inits["Wq"].dims) == [K, H]  # untouched -- Wq is shared
+
+
+def test_analyze_structured_pruning_qdq_blockwise_matches_real_call():
+    # Dry-run mirror consistency for a blockwise chain: aligned case reports
+    # a real would-be drop, non-aligned case reports would_drop=0/margin=None
+    # exactly mirroring the real call's own decline -- see
+    # `_analyze_structured_pruning_qdq`'s own docstring.
+    K, H, Out, block_size = 4, 16, 4, 4
+    n_blocks = H // block_size
+    rng = np.random.default_rng(117)
+    W1_aligned = _block_grouped_column_weight(
+        rng, K, n_blocks, block_size, high_block_idx={0, 2}
+    )
+    aligned_model, *_ = _matmul_qdq_blockwise_consumer_model(
+        K, H, Out, block_size, seed=118, W1=W1_aligned
+    )
+    report = onnxsim.analyze_pruning_sensitivity(
+        aligned_model, onnxsim.apply_structured_pruning_qdq, sparsity=0.5
+    )
+    pruned = onnxsim.apply_structured_pruning_qdq(aligned_model, sparsity=0.5)
+    p_inits = {t.name: t for t in pruned.graph.initializer}
+    assert len(report.layers) == 1
+    layer = report.layers[0]
+    real_would_drop = H - onnx.numpy_helper.to_array(p_inits["Wq"]).shape[0]
+    assert layer.would_drop == real_would_drop
+    assert real_would_drop > 0  # confirms this case is genuinely the
+    # aligned, would-actually-prune branch
+
+    non_aligned_model, *_ = _matmul_qdq_blockwise_consumer_model(
+        K, H, Out, block_size, seed=119
+    )
+    report2 = onnxsim.analyze_pruning_sensitivity(
+        non_aligned_model, onnxsim.apply_structured_pruning_qdq, sparsity=0.625
+    )
+    pruned2 = onnxsim.apply_structured_pruning_qdq(non_aligned_model, sparsity=0.625)
+    p_inits2 = {t.name: t for t in pruned2.graph.initializer}
+    assert len(report2.layers) == 1
+    layer2 = report2.layers[0]
+    real_would_drop2 = H - onnx.numpy_helper.to_array(p_inits2["Wq"]).shape[0]
+    assert layer2.would_drop == real_would_drop2 == 0
+    assert layer2.margin is None
+
+
 # --- apply_structured_pruning_matmul_nbits -----------------------------------
 #
 # See ``onnxsim/pruning.py``'s own "MatMulNBits (block-quantized weight)
 # structured pruning" section comment for the full empirical schema/packing
 # investigation (live ``onnxruntime`` schema introspection + a real
-# ``InferenceSession`` packing round-trip) this pass's scope was reached
-# from. Every helper below is an INDEPENDENT reference implementation of the
-# schema's own documented block-quantization/nibble-packing scheme -- not a
-# call into any of ``onnxsim.pruning``'s own private packing helpers -- so
-# that a bug shared between the pass and its own test oracle can't hide.
+# ``InferenceSession`` packing round-trip, for BOTH ``bits=4`` and
+# ``bits=8``) this pass's scope was reached from. Every helper below is an
+# INDEPENDENT reference implementation of the schema's own documented
+# block-quantization/packing scheme (nibble-packed for ``bits=4``, one full
+# byte per code for ``bits=8`` -- also independently confirmed, see
+# ``test_matmul_nbits_pruning_bits8_producer_and_consumer_match_independent_reference_oracle``
+# below) -- not a call into any of ``onnxsim.pruning``'s own private packing
+# helpers -- so that a bug shared between the pass and its own test oracle
+# can't hide.
 #
 # Nodes are built via ``onnx.helper.make_node`` rather than
 # ``onnx.parser.parse_model`` -- the CLAUDE.md-documented fallback for a
@@ -18609,12 +21051,33 @@ def _nbits_unpack_nibbles(packed, count):
     return out[..., :count]
 
 
+def _nbits_pack_codes(vals, bits):
+    """Independent reference `bits`-aware packer: ``bits=4`` delegates to
+    :func:`_nbits_pack_nibbles` (2-per-byte, unchanged); ``bits=8`` is a
+    plain dtype cast -- one full byte per code, no packing at all (the
+    empirically-confirmed fact this file's own tests establish, see
+    ``test_matmul_nbits_pruning_bits8_producer_and_consumer_match_independent_reference_oracle``).
+    """
+    if bits == 8:
+        return vals.astype(np.uint8)
+    assert bits == 4, bits
+    return _nbits_pack_nibbles(vals)
+
+
+def _nbits_unpack_codes(packed, count, bits):
+    """Inverse of :func:`_nbits_pack_codes`."""
+    if bits == 8:
+        return packed[..., :count]
+    assert bits == 4, bits
+    return _nbits_unpack_nibbles(packed, count)
+
+
 def _nbits_pack_B(qcodes, N, k_blocks, block_size, bits=4):
     blob_size = block_size * bits // 8
     B = np.zeros((N, k_blocks, blob_size), dtype=np.uint8)
     for kb in range(k_blocks):
         k0 = kb * block_size
-        B[:, kb, :] = _nbits_pack_nibbles(qcodes[:, k0 : k0 + block_size])
+        B[:, kb, :] = _nbits_pack_codes(qcodes[:, k0 : k0 + block_size], bits)
     return B
 
 
@@ -18706,7 +21169,7 @@ def _nbits_chain_model(
     def _attach_zp(mode, zp, name):
         if mode == "packed":
             initializer.append(
-                onnx.numpy_helper.from_array(_nbits_pack_nibbles(zp), name=name)
+                onnx.numpy_helper.from_array(_nbits_pack_codes(zp, bits), name=name)
             )
             return name
         if mode == "unpacked":
@@ -19163,6 +21626,245 @@ def test_matmul_nbits_pruning_absent_zero_points_uses_schema_default():
     np.testing.assert_allclose(y_pruned, y_oracle, rtol=1e-3, atol=1e-3)
 
 
+def test_matmul_nbits_pruning_bits8_producer_and_consumer_match_independent_reference_oracle():
+    # The bits=8 analogue of
+    # test_matmul_nbits_pruning_producer_and_consumer_match_independent_reference_oracle
+    # above: same engineered keep-set (rows 0-15 of N1=32 survive, block 0
+    # of the consumer's own K2=N1=32 axis), but bits=8 throughout -- both
+    # nodes' own B/scales/zero_points now use the empirically-confirmed
+    # byte-per-code (no nibble packing) layout this module's own section
+    # comment documents.
+    N1, K1, N2, block_size, bits = 32, 64, 8, 16, 8
+    rng = np.random.default_rng(200)
+    W1 = rng.standard_normal((N1, K1)).astype(np.float32) * 0.2
+    W1[:16] *= 6.0  # rows 0-15: large magnitude (kept); 16-31: small (dropped)
+    W2 = rng.standard_normal((N2, N1)).astype(np.float32) * 0.2
+    bias1 = (rng.standard_normal(N1) * 0.05).astype(np.float32)
+    bias2 = (rng.standard_normal(N2) * 0.05).astype(np.float32)
+
+    model, info = _nbits_chain_model(
+        N1, K1, N2, block_size, W1, W2, bits=bits, bias1=bias1, bias2=bias2
+    )
+    onnx.checker.check_model(model)
+
+    pruned = onnxsim.apply_structured_pruning_matmul_nbits(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    keep = np.arange(16)
+    keep_blocks = np.array([0])
+
+    inits = {t.name: t for t in pruned.graph.initializer}
+    assert list(inits["B1"].dims) == [16, info["kb1"], block_size * bits // 8]
+    assert list(inits["scales1"].dims) == [16, info["kb1"]]
+    assert list(inits["bias1"].dims) == [16]
+    assert list(inits["B2"].dims) == [N2, 1, block_size * bits // 8]
+    assert list(inits["scales2"].dims) == [N2, 1]
+    mm1 = next(n for n in pruned.graph.node if n.name == "mm1")
+    mm2 = next(n for n in pruned.graph.node if n.name == "mm2")
+    assert next(a.i for a in mm1.attribute if a.name == "N") == 16
+    assert next(a.i for a in mm2.attribute if a.name == "K") == 16
+
+    # Exact (byte-level) "slice, don't recompute" checks -- same bar as the
+    # bits=4 flagship test, now against the bits=8 byte-per-code packing.
+    np.testing.assert_array_equal(
+        onnx.numpy_helper.to_array(inits["B1"]),
+        _nbits_pack_B(info["qcodes1"][keep], 16, info["kb1"], block_size, bits),
+    )
+    np.testing.assert_allclose(
+        onnx.numpy_helper.to_array(inits["scales1"]), info["scales1"][keep]
+    )
+    np.testing.assert_array_equal(
+        onnx.numpy_helper.to_array(inits["zp1"]),
+        _nbits_pack_codes(info["zp1"][keep], bits),
+    )
+    np.testing.assert_allclose(onnx.numpy_helper.to_array(inits["bias1"]), bias1[keep])
+    np.testing.assert_array_equal(
+        onnx.numpy_helper.to_array(inits["B2"]),
+        _nbits_pack_B(info["qcodes2"][:, keep], N2, 1, block_size, bits),
+    )
+    np.testing.assert_array_equal(
+        onnx.numpy_helper.to_array(inits["zp2"]),
+        _nbits_pack_codes(info["zp2"][:, keep_blocks], bits),
+    )
+
+    # Real InferenceSession output vs. a pure-float64 dequantize-then-matmul
+    # oracle built directly from the pass's own (unmodified) quantized
+    # codes, sliced by hand -- TIGHT tolerance (float32 rounding only, no
+    # re-quantization anywhere in this comparison): this is the ~1e-6
+    # relative-error-scale check confirming bits=8 structured pruning is
+    # numerically correct, not merely "runs without error". (The looser
+    # 1e-3 rtol used elsewhere in this file is for chains compared against
+    # an INDEPENDENTLY RE-QUANTIZED reference model instead -- see the
+    # bits=4 flagship test above -- a different, and inherently looser,
+    # comparison than this one.)
+    rng2 = np.random.default_rng(201)
+    x = rng2.standard_normal((3, K1)).astype(np.float32)
+    (y_pruned,) = _run(pruned, {"A": x})
+    w1_dequant = _nbits_dequant(
+        info["qcodes1"], info["scales1"], info["zp1"], block_size, bits
+    )
+    w2_dequant = _nbits_dequant(
+        info["qcodes2"], info["scales2"], info["zp2"], block_size, bits
+    )
+    h1 = np.maximum(x.astype(np.float64) @ w1_dequant[keep].T + bias1[keep], 0.0)
+    y_oracle = h1 @ w2_dequant[:, keep].T + bias2
+    np.testing.assert_allclose(y_pruned, y_oracle, rtol=1e-5, atol=1e-5)
+
+
+def test_matmul_nbits_pruning_bits8_producer_odd_kept_row_count_matches_tight_oracle():
+    # The bits=8 analogue of
+    # test_matmul_nbits_pruning_producer_odd_kept_row_count_zero_points_has_no_repack_hazard:
+    # an ODD, non-contiguous kept-row count on the producer (N) axis.
+    # Unlike bits=4, bits=8's own zero_points packing is a byte-per-code
+    # identity (no nibble packing at all -- see this module's own section
+    # comment), so there is genuinely no repack hazard on ANY axis for
+    # bits=8; this test confirms that directly by checking the real
+    # function's output against a NAIVE raw byte-level row slice of
+    # zero_points (no unpack/repack machinery at all) -- the two must be
+    # identical -- AND against a tight-tolerance real-InferenceSession
+    # oracle (float32 rounding only), covering both the "packing edge case"
+    # and "structured pruning correctness" angles for this axis at once.
+    from onnxsim.pruning import (
+        _consumers_of,
+        _match_matmul_nbits,
+        _slice_matmul_nbits_producer_rows,
+    )
+
+    N, K, block_size, bits = 8, 32, 16, 8
+    rng = np.random.default_rng(202)
+    W = rng.standard_normal((N, K)).astype(np.float32) * 0.3
+    qcodes, scales, zp, kb = _nbits_quantize_block(W, block_size, bits=bits)
+    B = _nbits_pack_B(qcodes, N, kb, block_size, bits)
+    ZP = _nbits_pack_codes(zp, bits)  # shape (8, 2): kb=2, 1 byte/block, no packing
+    bias = (rng.standard_normal(N) * 0.05).astype(np.float32)
+
+    node = _nbits_node(
+        "mm", "A", "Y", "B", "scales", "zp", "bias", N, K, block_size, bits=bits
+    )
+    graph = onnx.helper.make_graph(
+        [node],
+        "g",
+        inputs=[
+            onnx.helper.make_tensor_value_info("A", onnx.TensorProto.FLOAT, [2, K])
+        ],
+        outputs=[
+            onnx.helper.make_tensor_value_info("Y", onnx.TensorProto.FLOAT, [2, None])
+        ],
+        initializer=[
+            onnx.numpy_helper.from_array(B, name="B"),
+            onnx.numpy_helper.from_array(scales, name="scales"),
+            onnx.numpy_helper.from_array(ZP, name="zp"),
+            onnx.numpy_helper.from_array(bias, name="bias"),
+        ],
+    )
+    model = onnx.helper.make_model(
+        graph,
+        opset_imports=[
+            onnx.helper.make_opsetid("", 21),
+            onnx.helper.make_opsetid("com.microsoft", 1),
+        ],
+    )
+    model.ir_version = 10
+    onnx.checker.check_model(model)
+
+    mgraph = model.graph  # helper.make_model copies -- operate on model.graph
+    mnode = mgraph.node[0]
+    initializer_map = {t.name: t for t in mgraph.initializer}
+    w = _match_matmul_nbits(mnode, initializer_map, _consumers_of(mgraph))
+    assert w is not None
+    assert w.bits == 8
+
+    keep = np.array([0, 1, 3, 5, 7])  # ODD count (5), non-contiguous
+    _slice_matmul_nbits_producer_rows(w, keep)
+
+    new_N = next(a.i for a in mnode.attribute if a.name == "N")
+    assert new_N == 5
+
+    zp_after = onnx.numpy_helper.to_array(w.zero_points_init)
+    naive_byte_slice = ZP[keep]  # no unpack/repack at all -- just row-index the bytes
+    np.testing.assert_array_equal(zp_after, naive_byte_slice)
+
+    sess = ort.InferenceSession(
+        model.SerializeToString(), providers=["CPUExecutionProvider"]
+    )
+    rng2 = np.random.default_rng(203)
+    x = rng2.standard_normal((2, K)).astype(np.float32)
+    (y,) = sess.run(None, {"A": x})
+
+    w_dequant = _nbits_dequant(qcodes, scales, zp, block_size, bits)
+    y_oracle = x.astype(np.float64) @ w_dequant[keep].T + bias[keep]
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-5, atol=1e-5)
+
+
+def test_matmul_nbits_pruning_bits8_consumer_odd_kept_block_count_zero_points_repack():
+    # The bits=8 analogue of
+    # test_matmul_nbits_pruning_consumer_odd_kept_block_count_zero_points_repack:
+    # an ODD, non-contiguous kept-BLOCK count (3 of 5) on the consumer's own
+    # block axis. For bits=4 this is the genuine nibble-repack hazard; for
+    # bits=8 the "repack" is a byte identity (see this module's own section
+    # comment), so this test's main job is confirming the generalized
+    # :func:`_pack_nbits_codes`/:func:`_unpack_nbits_codes` dispatch still
+    # produces the exact right bytes (not merely the right SHAPE) for this
+    # axis when bits=8, exercised through the full public pass.
+    N1, K1, N2, block_size, bits = 80, 32, 4, 16, 8
+    rng = np.random.default_rng(204)
+    W1 = rng.standard_normal((N1, K1)).astype(np.float32) * 0.2
+    for kb in (0, 2, 4):
+        W1[kb * 16 : (kb + 1) * 16] *= 8.0  # large -- kept
+    for kb in (1, 3):
+        W1[kb * 16 : (kb + 1) * 16] *= 0.05  # small -- dropped
+    W2 = rng.standard_normal((N2, N1)).astype(np.float32) * 0.2
+
+    model, info = _nbits_chain_model(N1, K1, N2, block_size, W1, W2, bits=bits)
+    onnx.checker.check_model(model)
+
+    # keep_count = 48 (3 of 5 blocks x 16) -> sparsity = 1 - 48/80 = 0.4
+    pruned = onnxsim.apply_structured_pruning_matmul_nbits(model, sparsity=0.4)
+    onnx.checker.check_model(pruned)
+
+    keep = np.concatenate([np.arange(0, 16), np.arange(32, 48), np.arange(64, 80)])
+    keep_blocks = np.array([0, 2, 4])
+
+    inits = {t.name: t for t in pruned.graph.initializer}
+    mm2 = next(n for n in pruned.graph.node if n.name == "mm2")
+    assert next(a.i for a in mm2.attribute if a.name == "K") == 48
+    assert list(inits["B2"].dims) == [N2, 3, block_size * bits // 8]
+
+    np.testing.assert_array_equal(
+        onnx.numpy_helper.to_array(inits["B2"]),
+        _nbits_pack_B(info["qcodes2"][:, keep], N2, 3, block_size, bits),
+    )
+    np.testing.assert_array_equal(
+        onnx.numpy_helper.to_array(inits["zp2"]),
+        _nbits_pack_codes(info["zp2"][:, keep_blocks], bits),
+    )
+    # For bits=4 a wrong-arity repack produces a visibly different byte
+    # array (see the bits=4 test above) -- for bits=8 a byte-per-block
+    # identity means ANY correct SUBSET selection already produces the
+    # right bytes regardless of packing order, so the meaningful check
+    # here is against a naive raw slice of the UNPACKED zero_points array
+    # (there is no packed-vs-unpacked distinction left to get wrong at
+    # bits=8): the packed zp2 must equal info["zp2"][:, keep_blocks]
+    # directly, byte for byte, with no repack transformation at all.
+    np.testing.assert_array_equal(
+        onnx.numpy_helper.to_array(inits["zp2"]), info["zp2"][:, keep_blocks]
+    )
+
+    rng2 = np.random.default_rng(205)
+    x = rng2.standard_normal((3, K1)).astype(np.float32)
+    (y_pruned,) = _run(pruned, {"A": x})
+
+    w1_dequant = _nbits_dequant(
+        info["qcodes1"], info["scales1"], info["zp1"], block_size, bits
+    )
+    w2_dequant = _nbits_dequant(
+        info["qcodes2"], info["scales2"], info["zp2"], block_size, bits
+    )
+    h1 = np.maximum(x.astype(np.float64) @ w1_dequant.T, 0.0)  # no bias here
+    y_oracle = h1[:, keep] @ w2_dequant[:, keep].T
+    np.testing.assert_allclose(y_pruned, y_oracle, rtol=1e-3, atol=1e-3)
+
+
 def test_matmul_nbits_pruning_declines_g_idx():
     # A GPTQ-style g_idx column-permutation index present on the producer --
     # declined outright, see this module's own section comment.
@@ -19180,20 +21882,20 @@ def test_matmul_nbits_pruning_declines_g_idx():
     assert before == after
 
 
-def test_matmul_nbits_pruning_declines_bits_other_than_4():
-    # bits=8 -- the live schema allows 2/4/8, but only 4-bit packing has
-    # been empirically verified here (see this module's own section
-    # comment); declined outright rather than guessing at the 8-bit ratio.
-    N, K, block_size, bits = 4, 32, 16, 8
+def test_matmul_nbits_pruning_declines_bits_2():
+    # bits=2 -- the live schema allows 2/4/8, but only 4-bit and 8-bit
+    # packing have been empirically verified here (see this module's own
+    # section comment); bits=2 is declined outright rather than guessing at
+    # its own packing/zero_points ratio (this section's B shape isn't even
+    # inspected for a declined bits value, so its contents are irrelevant --
+    # only the shape needs to look plausible enough to not fail earlier
+    # attribute checks).
+    N, K, block_size, bits = 4, 32, 16, 2
     rng = np.random.default_rng(112)
     W = rng.standard_normal((N, K)).astype(np.float32) * 0.2
-    qcodes, scales, zp, kb = _nbits_quantize_block(W, block_size, bits=bits)
-    blob_size = block_size * bits // 8
+    _qcodes, scales, _zp, kb = _nbits_quantize_block(W, block_size, bits=4)
+    blob_size = block_size * bits // 8  # hypothetical 2-bit ratio, unverified
     B = np.zeros((N, kb, blob_size), dtype=np.uint8)
-    for k in range(kb):
-        B[:, k, :] = qcodes[
-            :, k * block_size : (k + 1) * block_size
-        ]  # 8-bit: 1 byte/code
     node = onnx.helper.make_node(
         "MatMulNBits",
         inputs=["A", "B", "scales"],
@@ -19338,25 +22040,31 @@ def test_matmul_nbits_pruning_declines_shared_weight():
     assert before == after
 
 
-def test_matmul_nbits_pruning_declines_mixed_plain_float_chain():
-    # A MatMulNBits producer feeding a plain-float MatMul consumer (or vice
-    # versa) is out of this pass's scope -- only MatMulNBits-to-MatMulNBits
-    # chains are matched (see this module's own section comment).
-    N1, K1, Out = 32, 64, 8
-    block_size = 16
-    rng = np.random.default_rng(115)
+def test_matmul_nbits_pruning_mixed_matmulnbits_producer_then_plain_float_consumer_matches_oracle():
+    # MatMulNBits producer -> Relu -> plain-float MatMul consumer: the
+    # "quantized transformer-block layer feeding an unquantized lm_head"
+    # export shape this module's own section comment describes. A
+    # plain-float CONSUMER has no block structure at all, so the producer's
+    # own top-keep_count-by-norm keep-set (rows 0-15 here) applies directly
+    # -- no block-alignment check needed on this side.
+    N1, K1, Out, block_size = 32, 64, 8, 16
+    rng = np.random.default_rng(120)
     W1 = rng.standard_normal((N1, K1)).astype(np.float32) * 0.2
-    W1[:16] *= 6.0
+    W1[:16] *= 6.0  # rows 0-15: large magnitude (kept); 16-31: small (dropped)
+    bias1 = (rng.standard_normal(N1) * 0.05).astype(np.float32)
     qcodes1, scales1, zp1, kb1 = _nbits_quantize_block(W1, block_size)
     B1 = _nbits_pack_B(qcodes1, N1, kb1, block_size)
-    ZP1 = _nbits_pack_nibbles(zp1)
-    W2 = rng.standard_normal((N1, Out)).astype(np.float32)
+    ZP1 = _nbits_pack_codes(zp1, 4)
+
+    W2 = rng.standard_normal((N1, Out)).astype(np.float32) * 0.3  # [K, N] storage
 
     node1 = _nbits_node(
-        "mm1", "A", "h1", "B1", "scales1", "zp1", None, N1, K1, block_size
+        "mm1", "A", "h1", "B1", "scales1", "zp1", "bias1", N1, K1, block_size
     )
+    act = onnx.helper.make_node("Relu", ["h1"], ["h1_act"])
+    node2 = onnx.helper.make_node("MatMul", ["h1_act", "W2"], ["Y"], name="mm2")
     graph = onnx.helper.make_graph(
-        [node1, onnx.helper.make_node("MatMul", ["h1", "W2"], ["Y"])],
+        [node1, act, node2],
         "g",
         inputs=[
             onnx.helper.make_tensor_value_info("A", onnx.TensorProto.FLOAT, [3, K1])
@@ -19368,7 +22076,227 @@ def test_matmul_nbits_pruning_declines_mixed_plain_float_chain():
             onnx.numpy_helper.from_array(B1, name="B1"),
             onnx.numpy_helper.from_array(scales1, name="scales1"),
             onnx.numpy_helper.from_array(ZP1, name="zp1"),
+            onnx.numpy_helper.from_array(bias1, name="bias1"),
             onnx.numpy_helper.from_array(W2, name="W2"),
+        ],
+    )
+    model = onnx.helper.make_model(
+        graph,
+        opset_imports=[
+            onnx.helper.make_opsetid("", 21),
+            onnx.helper.make_opsetid("com.microsoft", 1),
+        ],
+    )
+    model.ir_version = 10
+    onnx.checker.check_model(model)
+
+    pruned = onnxsim.apply_structured_pruning_matmul_nbits(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    keep = np.arange(16)
+    inits = {t.name: t for t in pruned.graph.initializer}
+    assert list(inits["B1"].dims) == [16, kb1, block_size * 4 // 8]
+    assert list(inits["bias1"].dims) == [16]
+    # Consumer-role slice of the plain-float W2 ([K, N] storage, K=N1): the
+    # reduction axis is axis 0, an ordinary row-slice by the SAME keep-set
+    # the MatMulNBits producer computed -- not a block-aligned subset.
+    assert list(inits["W2"].dims) == [16, Out]
+    np.testing.assert_array_equal(onnx.numpy_helper.to_array(inits["W2"]), W2[keep])
+    mm1 = next(n for n in pruned.graph.node if n.name == "mm1")
+    assert next(a.i for a in mm1.attribute if a.name == "N") == 16
+
+    rng2 = np.random.default_rng(121)
+    x = rng2.standard_normal((3, K1)).astype(np.float32)
+    (y_pruned,) = _run(pruned, {"A": x})
+
+    w1_dequant = _nbits_dequant(qcodes1, scales1, zp1, block_size)
+    h1 = np.maximum(x.astype(np.float64) @ w1_dequant[keep].T + bias1[keep], 0.0)
+    y_oracle = h1 @ W2[keep].astype(np.float64)
+    np.testing.assert_allclose(y_pruned, y_oracle, rtol=1e-3, atol=1e-3)
+
+
+def test_matmul_nbits_pruning_mixed_plain_float_producer_then_matmulnbits_consumer_matches_oracle():
+    # The OTHER direction: a plain-float MatMul producer -> Relu ->
+    # MatMulNBits consumer -- the "unquantized embedding feeding the first
+    # quantized transformer block" export shape. Here the CONSUMER is the
+    # MatMulNBits side, so the block-alignment requirement still applies
+    # exactly as it would for a MatMulNBits-to-MatMulNBits chain -- W1's
+    # own output channels are engineered so the top-keep_count-by-norm
+    # selection lands on the consumer's own block 0 (positions 0-15).
+    N1, K1, N2, block_size = 32, 64, 8, 16
+    rng = np.random.default_rng(122)
+    W1 = rng.standard_normal((K1, N1)).astype(np.float32) * 0.2
+    W1[:, :16] *= 6.0  # output channels 0-15: large (kept); 16-31: small (dropped)
+
+    W2 = rng.standard_normal((N2, N1)).astype(np.float32) * 0.2
+    qcodes2, scales2, zp2, kb2 = _nbits_quantize_block(W2, block_size)
+    B2 = _nbits_pack_B(qcodes2, N2, kb2, block_size)
+    ZP2 = _nbits_pack_codes(zp2, 4)
+
+    node1 = onnx.helper.make_node("MatMul", ["A", "W1"], ["h1"], name="mm1")
+    act = onnx.helper.make_node("Relu", ["h1"], ["h1_act"])
+    node2 = _nbits_node(
+        "mm2", "h1_act", "Y", "B2", "scales2", "zp2", None, N2, N1, block_size
+    )
+    graph = onnx.helper.make_graph(
+        [node1, act, node2],
+        "g",
+        inputs=[
+            onnx.helper.make_tensor_value_info("A", onnx.TensorProto.FLOAT, [3, K1])
+        ],
+        outputs=[
+            onnx.helper.make_tensor_value_info("Y", onnx.TensorProto.FLOAT, [3, N2])
+        ],
+        initializer=[
+            onnx.numpy_helper.from_array(W1, name="W1"),
+            onnx.numpy_helper.from_array(B2, name="B2"),
+            onnx.numpy_helper.from_array(scales2, name="scales2"),
+            onnx.numpy_helper.from_array(ZP2, name="zp2"),
+        ],
+    )
+    model = onnx.helper.make_model(
+        graph,
+        opset_imports=[
+            onnx.helper.make_opsetid("", 21),
+            onnx.helper.make_opsetid("com.microsoft", 1),
+        ],
+    )
+    model.ir_version = 10
+    onnx.checker.check_model(model)
+
+    pruned = onnxsim.apply_structured_pruning_matmul_nbits(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    keep = np.arange(16)
+    inits = {t.name: t for t in pruned.graph.initializer}
+    # Producer-role slice of the plain-float W1 ([K, N] storage): output
+    # channels are axis 1, an ordinary column-slice.
+    assert list(inits["W1"].dims) == [K1, 16]
+    np.testing.assert_array_equal(onnx.numpy_helper.to_array(inits["W1"]), W1[:, keep])
+    mm2 = next(n for n in pruned.graph.node if n.name == "mm2")
+    assert next(a.i for a in mm2.attribute if a.name == "K") == 16
+    np.testing.assert_array_equal(
+        onnx.numpy_helper.to_array(inits["B2"]),
+        _nbits_pack_B(qcodes2[:, keep], N2, 1, block_size),
+    )
+
+    rng2 = np.random.default_rng(123)
+    x = rng2.standard_normal((3, K1)).astype(np.float32)
+    (y_pruned,) = _run(pruned, {"A": x})
+
+    h1 = np.maximum(x.astype(np.float64) @ W1[:, keep].astype(np.float64), 0.0)
+    w2_dequant = _nbits_dequant(qcodes2, scales2, zp2, block_size)
+    y_oracle = h1 @ w2_dequant[:, keep].T
+    np.testing.assert_allclose(y_pruned, y_oracle, rtol=1e-3, atol=1e-3)
+
+
+def test_matmul_nbits_pruning_mixed_plain_float_producer_declines_non_block_aligned():
+    # The mixed-chain analogue of
+    # test_matmul_nbits_pruning_consumer_declines_non_block_aligned: a
+    # plain-float producer whose interleaved importance (even output
+    # channels large, odd small) makes the top-keep_count-by-norm set
+    # straddle every one of the MatMulNBits consumer's own block
+    # boundaries. Even though the PRODUCER side has no block structure of
+    # its own, the CONSUMER's block-alignment requirement still applies to
+    # a mixed chain exactly as it does to a MatMulNBits-to-MatMulNBits one
+    # -- the pass must decline this chain entirely (both nodes' own
+    # tensors/attributes left byte-for-byte unchanged), never force a
+    # partial-block re-quantization or a mismatched producer/consumer
+    # keep-set.
+    N1, K1, N2, block_size = 32, 64, 8, 16
+    rng = np.random.default_rng(124)
+    W1 = rng.standard_normal((K1, N1)).astype(np.float32) * 0.2
+    W1[:, 0::2] *= 8.0  # even output channels large ("important"), odd small
+
+    W2 = rng.standard_normal((N2, N1)).astype(np.float32) * 0.2
+    qcodes2, scales2, zp2, kb2 = _nbits_quantize_block(W2, block_size)
+    B2 = _nbits_pack_B(qcodes2, N2, kb2, block_size)
+    ZP2 = _nbits_pack_codes(zp2, 4)
+
+    node1 = onnx.helper.make_node("MatMul", ["A", "W1"], ["h1"], name="mm1")
+    act = onnx.helper.make_node("Relu", ["h1"], ["h1_act"])
+    node2 = _nbits_node(
+        "mm2", "h1_act", "Y", "B2", "scales2", "zp2", None, N2, N1, block_size
+    )
+    graph = onnx.helper.make_graph(
+        [node1, act, node2],
+        "g",
+        inputs=[
+            onnx.helper.make_tensor_value_info("A", onnx.TensorProto.FLOAT, [3, K1])
+        ],
+        outputs=[
+            onnx.helper.make_tensor_value_info("Y", onnx.TensorProto.FLOAT, [3, N2])
+        ],
+        initializer=[
+            onnx.numpy_helper.from_array(W1, name="W1"),
+            onnx.numpy_helper.from_array(B2, name="B2"),
+            onnx.numpy_helper.from_array(scales2, name="scales2"),
+            onnx.numpy_helper.from_array(ZP2, name="zp2"),
+        ],
+    )
+    model = onnx.helper.make_model(
+        graph,
+        opset_imports=[
+            onnx.helper.make_opsetid("", 21),
+            onnx.helper.make_opsetid("com.microsoft", 1),
+        ],
+    )
+    model.ir_version = 10
+    onnx.checker.check_model(model)
+
+    pruned = onnxsim.apply_structured_pruning_matmul_nbits(model, sparsity=0.5)
+    before_nodes = {n.name: n.SerializeToString() for n in model.graph.node}
+    after_nodes = {n.name: n.SerializeToString() for n in pruned.graph.node}
+    assert before_nodes == after_nodes
+    before_inits = {t.name: t.SerializeToString() for t in model.graph.initializer}
+    after_inits = {t.name: t.SerializeToString() for t in pruned.graph.initializer}
+    assert before_inits == after_inits
+
+
+def test_matmul_nbits_pruning_declines_mixed_qdq_chain():
+    # A MatMulNBits producer feeding a QDQ-quantized (DequantizeLinear-fed)
+    # MatMul consumer remains out of scope: this section mixes MatMulNBits
+    # with PLAIN FLOAT only (see this module's own section comment), never
+    # QDQ -- the consumer's own weight name resolves to the
+    # DequantizeLinear node's OUTPUT, never a directly-constant
+    # initializer, so :func:`_match_plain_matmul_nbits_peer` never matches
+    # it and the chain is never even found (mm1 left completely
+    # untouched), unlike the two mixed-with-PLAIN-FLOAT tests above.
+    N1, K1, Out, block_size = 32, 64, 8, 16
+    rng = np.random.default_rng(125)
+    W1 = rng.standard_normal((N1, K1)).astype(np.float32) * 0.2
+    W1[:16] *= 6.0
+    qcodes1, scales1, zp1, kb1 = _nbits_quantize_block(W1, block_size)
+    B1 = _nbits_pack_B(qcodes1, N1, kb1, block_size)
+    ZP1 = _nbits_pack_codes(zp1, 4)
+
+    W2q = rng.integers(-100, 100, size=(N1, Out)).astype(np.int8)
+    w2_scale = np.array(0.01, dtype=np.float32)
+    w2_zp = np.array(0, dtype=np.int8)
+
+    node1 = _nbits_node(
+        "mm1", "A", "h1", "B1", "scales1", "zp1", None, N1, K1, block_size
+    )
+    dq = onnx.helper.make_node(
+        "DequantizeLinear", ["W2q", "w2_scale", "w2_zp"], ["W2_dq"], name="dq"
+    )
+    node2 = onnx.helper.make_node("MatMul", ["h1", "W2_dq"], ["Y"], name="mm2")
+    graph = onnx.helper.make_graph(
+        [node1, dq, node2],
+        "g",
+        inputs=[
+            onnx.helper.make_tensor_value_info("A", onnx.TensorProto.FLOAT, [3, K1])
+        ],
+        outputs=[
+            onnx.helper.make_tensor_value_info("Y", onnx.TensorProto.FLOAT, [3, Out])
+        ],
+        initializer=[
+            onnx.numpy_helper.from_array(B1, name="B1"),
+            onnx.numpy_helper.from_array(scales1, name="scales1"),
+            onnx.numpy_helper.from_array(ZP1, name="zp1"),
+            onnx.numpy_helper.from_array(W2q, name="W2q"),
+            onnx.numpy_helper.from_array(w2_scale, name="w2_scale"),
+            onnx.numpy_helper.from_array(w2_zp, name="w2_zp"),
         ],
     )
     model = onnx.helper.make_model(
