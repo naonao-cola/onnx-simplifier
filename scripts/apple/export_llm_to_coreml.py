@@ -247,6 +247,17 @@ def export_llm_to_coreml(
             "special_tokens_map.json",
             "vocab.json",
             "merges.txt",
+            # Recent transformers releases store a chat model's chat template
+            # as this standalone file rather than (or in addition to)
+            # tokenizer_config.json's own inline "chat_template" key --
+            # dropping it here left AutoTokenizer.from_pretrained(out_dir)
+            # loading successfully but with no chat template at all, only
+            # surfacing later as "tokenizer.chat_template is not set" from
+            # lm_eval_coreml_adapter.py's apply_chat_template (used by
+            # run_quality_eval.py --apply-chat-template, not by
+            # run_llm_decode_benchmark.py/check_decode_parity.py, which
+            # build prompts without a chat template).
+            "chat_template.jinja",
         ):
             src = Path(tmpdir) / name
             if src.is_file():
