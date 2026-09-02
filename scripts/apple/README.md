@@ -438,6 +438,28 @@ version-appropriate default inputs itself instead of upgrading after the
 fact -- see `test_gather_at_ios18_target_serializes_validate_indices` in
 `tests/test_coreml_export.py`.
 
+With both of those fixed, the first real trace against real CI (a macOS-15
+GitHub-hosted runner) surfaced a third finding, not a bug this time: real
+per-op data, but only half the picture. `main function has 6865
+operation(s)` / `recorded 0/6865 op(s) (3668 missing deviceUsage, 6865
+missing estimatedCost)` -- `computeDeviceUsageForMLProgramOperation:` now
+returns real placement data for ~45% of ops, but
+`estimatedCostOfMLProgramOperation:` returns `nil` for *every* op, on both
+`smollm2-135m` and `smollm2-135m-conv`. The tool previously required both to
+be non-nil before recording an event, so it kept producing an empty trace
+even with real device-placement data sitting right there. Fixed by
+decoupling the two: an event is now recorded whenever `deviceUsage` alone is
+non-nil, with `cost_available: false` and a 0 weight in `args` when
+`estimatedCost` isn't -- the per-lane summary switches from a "% of total
+estimated cost" line to a plain op count whenever no op in the whole run got
+real cost data, so the output doesn't paper over a real gap with a
+misleading 0.00%. Whether `estimatedCost`'s unavailability is a further
+SDK-version gap or a standing limitation of on-device compute-plan cost
+analysis (as opposed to Xcode's own Model Performance Report) is
+unconfirmed -- device *placement* (the actual question this tool exists to
+answer: does `--matmul-to-conv` move ops to a different compute unit) is
+unaffected by it.
+
 ### Quality and retention eval (`run_quality_eval.py` / `compute_retention.py`)
 
 The decode benchmark and parity check above measure speed and short-generation
