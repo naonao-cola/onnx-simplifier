@@ -15048,6 +15048,21 @@ def apply_transformer_block_pruning(
 #   reflects the real router-usage ranking whenever calibration data
 #   produces one, the same fidelity every other calibrated family here
 #   already has.
+# - `apply_qmoe_expert_channel_pruning`/`apply_qmoe_whole_expert_pruning`
+#   (QMoE, the quantized-weight counterpart of the plain-`MoE` bullet just
+#   above): both covered by the exact same shape, retargeted at `QMoE`'s
+#   own packed ``uint8`` `fc1`/`fc2` weights -- `_qmoe_channel_importance`/
+#   `_qmoe_expert_weight_importance` rank each weight's own *dequantized*
+#   row/column/slice (`_qmoe_dequantize`, never the packed bytes
+#   themselves), and whole-expert pruning reuses
+#   `_moe_router_gate_calibration_stats` unchanged (via `_HasRouterProbs`
+#   -- `router_probs` is upstream of and oblivious to either node's own
+#   quantization). Expert-channel pruning's own keep-count is additionally
+#   floored down to a multiple of ``8 // expert_weight_bits`` before
+#   ranking (`_apply_qmoe_channel_chains`'s own pack-alignment requirement
+#   -- the real CPU `QMoE` kernel has no way to represent a partial
+#   trailing packed byte), mirrored here exactly so `would_drop` never
+#   reports a count the real call wouldn't actually produce.
 # - `apply_structured_pruning_qdq` (QDQ-quantized channel pruning): the
 #   same single-producer/single-consumer/unary-hops-only topology
 #   `_find_qdq_chains` matches (requiring at least one side to actually be
@@ -15059,6 +15074,19 @@ def apply_transformer_block_pruning(
 #   so none is reported as a matched unit here (they fall out via
 #   `not_eligible` exactly like any other unmatched Conv/MatMul/Gemm node,
 #   same as the plain float structured family above).
+# - `apply_structured_pruning_matmul_nbits` (``MatMulNBits``-quantized
+#   channel pruning): the ``MatMulNBits``-to-``MatMulNBits``-only topology
+#   `_find_matmul_nbits_chains` matches, ranked by `_qdq_channel_importance`
+#   on the producer's own *dequantized* weight row
+#   (`_matmul_nbits_dequantized`, the same helper the real function uses to
+#   rank, never for the actual int4-code rewrite). A chain whose keep-set
+#   doesn't happen to land on the consumer's own `block_size` boundaries
+#   (`_matmul_nbits_block_aligned_keep_blocks` returning `None`) is reported
+#   `would_drop=0`/`margin=None` -- a genuinely matched unit the real call
+#   still declines to touch, mirroring that outcome exactly rather than
+#   folding it into `not_eligible`. No grouped, gated, residual, or
+#   Concat-merged topology is matched here either, for the same reason the
+#   QDQ family above has none.
 # - `apply_embedding_vocab_magnitude_pruning` (embedding/lm_head vocabulary,
 #   magnitude-ranked): `_match_embedding_chain`'s own single matched-or-not
 #   embedding table, ranked by combined embedding-row/untied-lm_head-row L2
@@ -15142,6 +15170,15 @@ class PruningLayerSensitivity:
             their family strings above); ``"moe_expert_channel"`` for
             :func:`apply_moe_expert_channel_pruning`; ``"moe_whole_expert"``
             for :func:`apply_moe_whole_expert_pruning`;
+            ``"qmoe_expert_channel"``/``"qmoe_whole_expert"`` for their
+            quantized-weight ``QMoE`` counterparts,
+            :func:`apply_qmoe_expert_channel_pruning`/
+            :func:`apply_qmoe_whole_expert_pruning`; ``"matmul_nbits"`` for
+            :func:`apply_structured_pruning_matmul_nbits` (a single string,
+            unlike the QDQ family's Conv/MatMul split --
+            `_find_matmul_nbits_chains` only ever matches
+            ``MatMulNBits``-to-``MatMulNBits`` chains, so there is no second
+            topology to distinguish);
             ``"embedding_vocab_magnitude"`` for
             :func:`apply_embedding_vocab_magnitude_pruning`;
             ``"transformer_block"`` for
@@ -15962,6 +15999,171 @@ def _analyze_structured_pruning_qdq(
     return PruningSensitivityReport(layers=layers, not_eligible=not_eligible)
 
 
+# --- MatMulNBits (block-quantized weight) structured family -----------------
+
+
+def _matmul_nbits_not_eligible(
+    graph: onnx.GraphProto, chains: List[_MatMulNBitsChain]
+) -> List[str]:
+    matched_ids: Set[int] = set()
+    for chain in chains:
+        matched_ids.add(id(chain.producer.node))
+        matched_ids.add(id(chain.consumer.node))
+    not_eligible = []
+    for node in graph.node:
+        if node.op_type != "MatMulNBits" or node.domain != "com.microsoft":
+            continue
+        if id(node) in matched_ids:
+            continue
+        not_eligible.append(f"{node.op_type} '{_node_label(node)}'")
+    return not_eligible
+
+
+def _analyze_structured_pruning_matmul_nbits(
+    model: Union[str, onnx.ModelProto],
+    sparsity: float = 0.5,
+    importance_norm: _ImportanceNorm = "l2",
+) -> PruningSensitivityReport:
+    """Dry-run mirror of :func:`apply_structured_pruning_matmul_nbits` --
+    same matching (:func:`_find_matmul_nbits_chains`, the
+    ``MatMulNBits``-to-``MatMulNBits``-only topology this family's own
+    section comment describes), touched-role bookkeeping (a chain sharing a
+    `B` weight -- on either side -- with an earlier one in
+    :func:`_find_matmul_nbits_chains`'s own return order is reported
+    `would_drop=0`/`margin=None`, exactly the "left completely untouched"
+    outcome the real call gives it too, not folded into `not_eligible`),
+    keep-count, and importance (:func:`_qdq_channel_importance`, ranking the
+    producer's own *dequantized* weight row -- :func:`_matmul_nbits_dequantized`,
+    the exact same helper :func:`apply_structured_pruning_matmul_nbits`
+    itself calls, never for the actual int4-code rewrite) logic, reused
+    directly, but `model` is never mutated. `family` is always
+    ``"matmul_nbits"`` -- unlike the QDQ family's own Conv/MatMul split,
+    :func:`_find_matmul_nbits_chains` only ever matches
+    ``MatMulNBits``-to-``MatMulNBits`` chains, so there is no second
+    topology to distinguish.
+
+    A chain whose keep-set doesn't happen to align to the consumer's own
+    `block_size` boundaries (:func:`_matmul_nbits_block_aligned_keep_blocks`
+    returning ``None`` -- an individual K-column can't be dropped without
+    re-quantizing its whole block, out of scope) is also reported
+    `would_drop=0`/`margin=None`, mirroring the real function's own decline
+    of that chain entirely (both producer and consumer left completely
+    untouched, rather than a partial-block re-quantization or a
+    disagreeing keep-set between the two) -- this is a genuinely matched
+    unit the real call still declines to touch, so it gets a report row
+    here too, unlike `not_eligible` (reserved for topology
+    :func:`_find_matmul_nbits_chains` never recognized at all).
+
+    A degenerate chain naming the exact same weight in both the producer
+    and consumer role gets no report row at all (mirroring
+    :func:`_analyze_structured_pruning_qdq`'s own identical treatment).
+
+    No grouped/depthwise structure, gated pair, residual/skip-connection
+    merge, or Concat-merged branch group is ever matched here at all (see
+    :func:`apply_structured_pruning_matmul_nbits`'s own docstring) -- such a
+    node simply never enters :func:`_find_matmul_nbits_chains`'s own return
+    value in the first place, so it is reported via `not_eligible` exactly
+    like any other unmatched ``MatMulNBits`` node.
+    """
+    if not (0.0 <= sparsity < 1.0):
+        raise ValueError(f"sparsity must be in [0, 1), got {sparsity}")
+    _validate_importance_norm(importance_norm)
+    if isinstance(model, str):
+        model = onnx.load(model, load_external_data=False)
+    graph = model.graph
+
+    chains = _find_matmul_nbits_chains(graph)
+    not_eligible = _matmul_nbits_not_eligible(graph, chains)
+    if not chains:
+        return PruningSensitivityReport(layers=[], not_eligible=not_eligible)
+
+    producer_touched: Set[str] = set()
+    consumer_touched: Set[str] = set()
+    layers: List[PruningLayerSensitivity] = []
+
+    for chain in chains:
+        p, c = chain.producer, chain.consumer
+        p_key, c_key = p.b_init.name, c.b_init.name
+        if p_key == c_key:
+            continue  # degenerate (the same weight in both roles) -- no report row
+
+        label = _node_label(p.node)
+        family = "matmul_nbits"
+        n = chain.n_channels
+
+        if p_key in producer_touched or c_key in consumer_touched:
+            layers.append(
+                PruningLayerSensitivity(
+                    label=label,
+                    family=family,
+                    total=n,
+                    would_drop=0,
+                    margin=None,
+                    importance_min=0.0,
+                    importance_max=0.0,
+                )
+            )
+            continue  # a shared/tied weight another chain already claimed
+
+        keep_count = max(1, n - round(n * sparsity))
+        if keep_count >= n:
+            layers.append(
+                PruningLayerSensitivity(
+                    label=label,
+                    family=family,
+                    total=n,
+                    would_drop=0,
+                    margin=None,
+                    importance_min=0.0,
+                    importance_max=0.0,
+                )
+            )
+            continue  # rounds down to nothing for this chain -- no-op
+
+        w_nk = _matmul_nbits_dequantized(p)
+        importance = _qdq_channel_importance(w_nk, importance_norm)
+        keep = np.sort(np.argsort(-importance)[:keep_count])
+
+        keep_blocks = _matmul_nbits_block_aligned_keep_blocks(
+            keep, c.k_blocks, c.block_size
+        )
+        if keep_blocks is None:
+            layers.append(
+                PruningLayerSensitivity(
+                    label=label,
+                    family=family,
+                    total=n,
+                    would_drop=0,
+                    margin=None,
+                    importance_min=0.0,
+                    importance_max=0.0,
+                )
+            )
+            continue  # non-block-aligned keep-set for this consumer -- the
+            # real call declines this chain entirely too, see this
+            # function's own docstring
+
+        keep_mask = np.zeros(n, dtype=bool)
+        keep_mask[keep] = True
+
+        layers.append(
+            PruningLayerSensitivity(
+                label=label,
+                family=family,
+                total=n,
+                would_drop=int(n - keep_count),
+                margin=_normalized_margin(importance, keep_mask),
+                importance_min=float(importance.min()),
+                importance_max=float(importance.max()),
+            )
+        )
+
+        producer_touched.add(p_key)
+        consumer_touched.add(c_key)
+
+    return PruningSensitivityReport(layers=layers, not_eligible=not_eligible)
+
+
 # --- Attention-head family ---------------------------------------------
 
 
@@ -16494,6 +16696,290 @@ def _analyze_moe_whole_expert_pruning(
     )
 
 
+# --- QMoE (quantized-weight MoE) family --------------------------------
+
+
+def _qmoe_not_eligible(
+    graph: onnx.GraphProto,
+    chains: Union[List[_QMoEChannelChain], List[_QMoEExpertChain]],
+) -> List[str]:
+    """Shared `not_eligible` for both QMoE families
+    (:func:`_analyze_qmoe_expert_channel_pruning`/
+    :func:`_analyze_qmoe_whole_expert_pruning`) -- mirrors
+    :func:`_moe_not_eligible`'s own shape, just for ``QMoE`` nodes instead
+    of plain ``MoE`` (both `_QMoEChannelChain` and `_QMoEExpertChain` name
+    the matched node via their own `node` field, the same way
+    `_MoEChain`/`_MoEExpertChain` do).
+    """
+    matched_ids = {id(c.node) for c in chains}
+    not_eligible = []
+    for node in graph.node:
+        if node.domain != _MOE_DOMAIN or node.op_type != "QMoE":
+            continue
+        if id(node) in matched_ids:
+            continue
+        not_eligible.append(f"{node.op_type} '{_node_label(node)}'")
+    return not_eligible
+
+
+def _analyze_qmoe_channel_chains(
+    graph: onnx.GraphProto,
+    chains: List[_QMoEChannelChain],
+    sparsity: float,
+    compute_importance: Callable[
+        [_QMoEChannelChain, Dict[str, onnx.TensorProto]], np.ndarray
+    ],
+) -> List[PruningLayerSensitivity]:
+    """Dry-run mirror of :func:`_apply_qmoe_channel_chains`'s own per-node
+    loop -- the shared body :func:`_analyze_qmoe_expert_channel_pruning`
+    uses, mirroring its touched-role bookkeeping (`fc1_w`/`fc2_w`/
+    `fc1_scale`(/`fc1_bias`/`fc1_zp`), :func:`_apply_qmoe_channel_chains`'s
+    own set) and pack-rounded keep-count (``max(1, n - round(n *
+    sparsity))``, then floored down to the nearest multiple of ``8 //
+    bits`` -- :func:`_apply_qmoe_channel_chains`'s own formula, since the
+    real CPU `QMoE` kernel derives `inter_size` purely from
+    `fc2_experts_weights`' own packed byte count, with no way to represent
+    a partial trailing packed byte) exactly, but never actually slicing
+    `fc1`/`fc2`(/`scales`/`bias`/`zero_points`).
+    """
+    initializer_map = {t.name: t for t in graph.initializer}
+    touched: Set[str] = set()
+    layers: List[PruningLayerSensitivity] = []
+
+    for chain in chains:
+        weight_names = {chain.fc1_w, chain.fc2_w, chain.fc1_scale}
+        if chain.fc1_bias is not None:
+            weight_names.add(chain.fc1_bias)
+        if chain.fc1_zp is not None:
+            weight_names.add(chain.fc1_zp)
+        label = _node_label(chain.node)
+
+        if weight_names & touched:
+            layers.append(
+                PruningLayerSensitivity(
+                    label=label,
+                    family="qmoe_expert_channel",
+                    total=chain.inter_size,
+                    would_drop=0,
+                    margin=None,
+                    importance_min=0.0,
+                    importance_max=0.0,
+                )
+            )
+            continue
+        touched |= weight_names
+
+        n = chain.inter_size
+        pack = 8 // chain.bits
+        keep_count = max(1, n - round(n * sparsity))
+        keep_count = max(pack, (keep_count // pack) * pack)
+        if keep_count >= n:
+            layers.append(
+                PruningLayerSensitivity(
+                    label=label,
+                    family="qmoe_expert_channel",
+                    total=n,
+                    would_drop=0,
+                    margin=None,
+                    importance_min=0.0,
+                    importance_max=0.0,
+                )
+            )
+            continue
+
+        importance = compute_importance(chain, initializer_map)
+        keep = np.sort(np.argsort(-importance)[:keep_count])
+        keep_mask = np.zeros(n, dtype=bool)
+        keep_mask[keep] = True
+        layers.append(
+            PruningLayerSensitivity(
+                label=label,
+                family="qmoe_expert_channel",
+                total=n,
+                would_drop=int(n - keep_count),
+                margin=_normalized_margin(importance, keep_mask),
+                importance_min=float(importance.min()),
+                importance_max=float(importance.max()),
+            )
+        )
+
+    return layers
+
+
+def _analyze_qmoe_expert_channel_pruning(
+    model: Union[str, onnx.ModelProto],
+    sparsity: float = 0.5,
+) -> PruningSensitivityReport:
+    """Dry-run mirror of :func:`apply_qmoe_expert_channel_pruning` -- same
+    matching (:func:`_find_qmoe_chains`), pack-rounded keep-count, and
+    importance (:func:`_qmoe_channel_importance`, ranking each weight's own
+    *dequantized* row/column -- :func:`_qmoe_dequantize`, the exact same
+    helper the real function uses to rank, never for the actual packed-byte
+    rewrite) logic, reused directly, but `model` is never mutated.
+    """
+    if not (0.0 <= sparsity < 1.0):
+        raise ValueError(f"sparsity must be in [0, 1), got {sparsity}")
+    if isinstance(model, str):
+        model = onnx.load(model, load_external_data=False)
+    graph = model.graph
+
+    chains = _find_qmoe_chains(graph)
+    layers = _analyze_qmoe_channel_chains(
+        graph, chains, sparsity, _qmoe_channel_importance
+    )
+    return PruningSensitivityReport(
+        layers=layers, not_eligible=_qmoe_not_eligible(graph, chains)
+    )
+
+
+def _analyze_qmoe_whole_expert_chains(
+    graph: onnx.GraphProto,
+    chains: List[_QMoEExpertChain],
+    sparsity: float,
+    compute_importance: Callable[
+        [_QMoEExpertChain, Dict[str, onnx.TensorProto]], np.ndarray
+    ],
+) -> List[PruningLayerSensitivity]:
+    """Dry-run mirror of :func:`_apply_qmoe_whole_expert_chains`'s own
+    per-node loop -- the shared body
+    :func:`_analyze_qmoe_whole_expert_pruning` uses, mirroring its
+    touched-role bookkeeping (every one of `fc1_w`/`fc2_w`/`fc1_scale`/
+    `fc2_scale`/`router_w`(/`fc1_bias`/`fc2_bias`/`fc1_zp`/`fc2_zp`/
+    `router_b`), :func:`_apply_qmoe_whole_expert_chains`'s own set) and
+    `k`-floored keep-count (``max(max(1, min(chain.k, n)), n - round(n *
+    sparsity))``, :func:`_apply_qmoe_whole_expert_chains`'s own formula)
+    exactly, but never actually slicing `fc1`/`fc2`/the router projection.
+    """
+    initializer_map = {t.name: t for t in graph.initializer}
+    touched: Set[str] = set()
+    layers: List[PruningLayerSensitivity] = []
+
+    for chain in chains:
+        weight_names = {
+            chain.fc1_w,
+            chain.fc2_w,
+            chain.fc1_scale,
+            chain.fc2_scale,
+            chain.router_w,
+        }
+        if chain.fc1_bias is not None:
+            weight_names.add(chain.fc1_bias)
+        if chain.fc2_bias is not None:
+            weight_names.add(chain.fc2_bias)
+        if chain.fc1_zp is not None:
+            weight_names.add(chain.fc1_zp)
+        if chain.fc2_zp is not None:
+            weight_names.add(chain.fc2_zp)
+        if chain.router_b is not None:
+            weight_names.add(chain.router_b)
+        label = _node_label(chain.node)
+
+        if weight_names & touched:
+            layers.append(
+                PruningLayerSensitivity(
+                    label=label,
+                    family="qmoe_whole_expert",
+                    total=chain.num_experts,
+                    would_drop=0,
+                    margin=None,
+                    importance_min=0.0,
+                    importance_max=0.0,
+                )
+            )
+            continue
+        touched |= weight_names
+
+        n = chain.num_experts
+        floor = max(1, min(chain.k, n))
+        keep_count = max(floor, n - round(n * sparsity))
+        if keep_count >= n:
+            layers.append(
+                PruningLayerSensitivity(
+                    label=label,
+                    family="qmoe_whole_expert",
+                    total=n,
+                    would_drop=0,
+                    margin=None,
+                    importance_min=0.0,
+                    importance_max=0.0,
+                )
+            )
+            continue
+
+        importance = compute_importance(chain, initializer_map)
+        keep = np.sort(np.argsort(-importance)[:keep_count])
+        keep_mask = np.zeros(n, dtype=bool)
+        keep_mask[keep] = True
+        layers.append(
+            PruningLayerSensitivity(
+                label=label,
+                family="qmoe_whole_expert",
+                total=n,
+                would_drop=int(n - keep_count),
+                margin=_normalized_margin(importance, keep_mask),
+                importance_min=float(importance.min()),
+                importance_max=float(importance.max()),
+            )
+        )
+
+    return layers
+
+
+def _analyze_qmoe_whole_expert_pruning(
+    model: Union[str, onnx.ModelProto],
+    calibration_data: Optional[Sequence[Tensors]] = None,
+    num_samples: int = 8,
+    seed: int = 0,
+    sparsity: float = 0.5,
+    providers: Optional[Sequence[str]] = None,
+) -> PruningSensitivityReport:
+    """Dry-run mirror of :func:`apply_qmoe_whole_expert_pruning` -- same
+    matching (:func:`_find_qmoe_whole_expert_chains`), calibration
+    (:func:`_moe_router_gate_calibration_stats`, the exact same helper
+    :func:`apply_qmoe_whole_expert_pruning` itself calls -- see
+    :class:`_HasRouterProbs`, which both `_QMoEExpertChain` and
+    `_MoEExpertChain` satisfy structurally, needing no `QMoE`-specific
+    calibration implementation at all), `k`-floored keep-count, and
+    importance (mean router gate weight, falling back to
+    :func:`_qmoe_expert_weight_importance` when no matching calibration
+    activation was observed for a chain's `router_probs` -- exactly
+    :func:`apply_qmoe_whole_expert_pruning`'s own `_importance` closure)
+    logic, reused directly, but `model` is never mutated.
+    """
+    if not (0.0 <= sparsity < 1.0):
+        raise ValueError(f"sparsity must be in [0, 1), got {sparsity}")
+    if isinstance(model, str):
+        model = onnx.load(model, load_external_data=False)
+    if calibration_data is None:
+        calibration_data = generate_random_calibration_data(
+            model, num_samples=num_samples, seed=seed
+        )
+    graph = model.graph
+
+    chains = _find_qmoe_whole_expert_chains(graph)
+    if not chains:
+        return PruningSensitivityReport(
+            layers=[], not_eligible=_qmoe_not_eligible(graph, chains)
+        )
+
+    mean_gate_weight = _moe_router_gate_calibration_stats(
+        model, chains, calibration_data, providers
+    )
+
+    def _importance(
+        chain: _QMoEExpertChain, initializer_map: Dict[str, onnx.TensorProto]
+    ) -> np.ndarray:
+        gate = mean_gate_weight.get(chain.router_probs)
+        if gate is None or gate.shape[0] != chain.num_experts:
+            return _qmoe_expert_weight_importance(chain, initializer_map)
+        return gate
+
+    layers = _analyze_qmoe_whole_expert_chains(graph, chains, sparsity, _importance)
+    return PruningSensitivityReport(
+        layers=layers, not_eligible=_qmoe_not_eligible(graph, chains)
+    )
+
+
 # --- Embedding / lm_head vocabulary family ----------------------------------
 #
 # Only :func:`apply_embedding_vocab_magnitude_pruning` gets a `_analyze_*`
@@ -16811,10 +17297,13 @@ _SENSITIVITY_ANALYZERS: Dict[
     apply_structured_pruning: _analyze_structured_pruning,
     apply_structured_wanda_pruning: _analyze_structured_wanda_pruning,
     apply_structured_pruning_qdq: _analyze_structured_pruning_qdq,
+    apply_structured_pruning_matmul_nbits: _analyze_structured_pruning_matmul_nbits,
     apply_attention_head_pruning: _analyze_attention_head_pruning,
     apply_attention_head_wanda_pruning: _analyze_attention_head_wanda_pruning,
     apply_moe_expert_channel_pruning: _analyze_moe_expert_channel_pruning,
     apply_moe_whole_expert_pruning: _analyze_moe_whole_expert_pruning,
+    apply_qmoe_expert_channel_pruning: _analyze_qmoe_expert_channel_pruning,
+    apply_qmoe_whole_expert_pruning: _analyze_qmoe_whole_expert_pruning,
     apply_embedding_vocab_magnitude_pruning: _analyze_embedding_vocab_magnitude_pruning,
     apply_transformer_block_pruning: _analyze_transformer_block_pruning,
 }
@@ -16838,14 +17327,17 @@ def analyze_pruning_sensitivity(
     measurement this module already had (actual zero-fraction of an
     already-pruned model); this is the *before* half that was missing.
 
-    `apply_fn` must be one of the eleven functions this module itself
+    `apply_fn` must be one of the fourteen functions this module itself
     exports: :func:`apply_magnitude_pruning`, :func:`apply_wanda_pruning`,
     :func:`apply_structured_pruning`, :func:`apply_structured_wanda_pruning`,
     :func:`apply_structured_pruning_qdq`,
+    :func:`apply_structured_pruning_matmul_nbits`,
     :func:`apply_attention_head_pruning`,
     :func:`apply_attention_head_wanda_pruning`,
     :func:`apply_moe_expert_channel_pruning`,
     :func:`apply_moe_whole_expert_pruning`,
+    :func:`apply_qmoe_expert_channel_pruning`,
+    :func:`apply_qmoe_whole_expert_pruning`,
     :func:`apply_embedding_vocab_magnitude_pruning`, or
     :func:`apply_transformer_block_pruning` -- passed by reference (e.g.
     ``analyze_pruning_sensitivity(model, apply_wanda_pruning, sparsity=0.6)``),
@@ -16857,7 +17349,7 @@ def analyze_pruning_sensitivity(
     same way the mutating call itself would compute them, up to (but never
     actually calling) the final slice/zero/delete step. :func:`apply_sparsegpt_pruning`
     is not supported, and neither is :func:`apply_embedding_vocab_pruning`
-    (a `ValueError` naming the eleven functions that are supported); nor is
+    (a `ValueError` naming the fourteen functions that are supported); nor is
     `apply_structured_pruning`/`apply_structured_wanda_pruning`'s own
     `global_sparsity=True` mode or a model containing any `Concat`-merged
     skip-connection chain (both a `NotImplementedError`, from within the
@@ -16868,7 +17360,7 @@ def analyze_pruning_sensitivity(
     dry-run section comment specifically for that one).
 
     :param model: the onnx ModelProto or file path `apply_fn` would take
-    :param apply_fn: one of this module's own eleven supported `apply_*`
+    :param apply_fn: one of this module's own fourteen supported `apply_*`
             functions, passed by reference
     :param kwargs: forwarded to `apply_fn`'s own dedicated `_analyze_*`
             counterpart, which accepts the same parameters `apply_fn`
