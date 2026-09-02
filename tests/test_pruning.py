@@ -16768,6 +16768,38 @@ def test_analyze_pruning_sensitivity_never_mutates_input_model():
     moe_calibration_data = [{"X": moe_rng.standard_normal((6, 4)).astype(np.float32)}]
 
     qdq_model, _, _, _, _ = _matmul_qdq_producer_model(K=8, H=16, Out=4, seed=9)
+
+    nbits_rng = np.random.default_rng(4)
+    matmul_nbits_model, _ = _nbits_chain_model(
+        N1=16,
+        K1=32,
+        N2=4,
+        block_size=16,
+        W1=nbits_rng.standard_normal((16, 32)).astype(np.float32) * 0.2,
+        W2=nbits_rng.standard_normal((4, 16)).astype(np.float32) * 0.2,
+    )
+
+    qmoe_rng = np.random.default_rng(5)
+    qmoe_fc1_w = (qmoe_rng.standard_normal((2, 4, 6)) * 0.3).astype(np.float32)
+    qmoe_fc2_w = (qmoe_rng.standard_normal((2, 6, 4)) * 0.3).astype(np.float32)
+    qmoe_fc1_q, qmoe_fc1_s, _ = _qmoe_quantize(qmoe_fc1_w, bits=4)
+    qmoe_fc2_q, qmoe_fc2_s, _ = _qmoe_quantize(qmoe_fc2_w, bits=4)
+    qmoe_channel_model = _qmoe_model(
+        qmoe_fc1_q, qmoe_fc1_s, qmoe_fc2_q, qmoe_fc2_s, bits=4, k=1, tokens=5
+    )
+    qmoe_router_w = qmoe_rng.standard_normal((6, 2)).astype(np.float32)
+    qmoe_whole_expert_model = _qmoe_router_model(
+        qmoe_fc1_q,
+        qmoe_fc1_s,
+        qmoe_fc2_q,
+        qmoe_fc2_s,
+        bits=4,
+        router_w=qmoe_router_w,
+        k=1,
+        tokens=5,
+    )
+    qmoe_calibration_data = [{"X": qmoe_rng.standard_normal((5, 6)).astype(np.float32)}]
+
     embedding_model = _embedding_model(
         np.random.default_rng(2).standard_normal((10, 4)).astype(np.float32)
     )
@@ -16808,6 +16840,13 @@ def test_analyze_pruning_sensitivity_never_mutates_input_model():
             {"calibration_data": moe_calibration_data},
         ),
         (qdq_model, onnxsim.apply_structured_pruning_qdq, {}),
+        (matmul_nbits_model, onnxsim.apply_structured_pruning_matmul_nbits, {}),
+        (qmoe_channel_model, onnxsim.apply_qmoe_expert_channel_pruning, {}),
+        (
+            qmoe_whole_expert_model,
+            onnxsim.apply_qmoe_whole_expert_pruning,
+            {"calibration_data": qmoe_calibration_data},
+        ),
         (embedding_model, onnxsim.apply_embedding_vocab_magnitude_pruning, {}),
         (
             transformer_block_model,
@@ -17337,16 +17376,17 @@ def test_analyze_moe_whole_expert_pruning_margin_reflects_router_usage_distribut
     assert margin_a != margin_b
 
 
-# --- analyze_pruning_sensitivity: QDQ / embedding-magnitude /
-#     transformer-block families ----------------------------------------
+# --- analyze_pruning_sensitivity: QDQ / MatMulNBits / QMoE /
+#     embedding-magnitude / transformer-block families -------------------
 #
-# These three model families are defined much later in this file (the QDQ
-# structured, embedding-vocabulary, and transformer-block-depth pruning
-# sections below) -- the helpers referenced here (`_matmul_qdq_producer_model`,
-# `_i8`, `_ambiguous_embedding_model`, ...) are module-level functions, so
-# their *definition* order doesn't matter for these tests to run correctly
-# (only that the whole module has finished loading before any test body
-# executes, which pytest already guarantees) -- but keeping every
+# These model families are all defined much later in this file (the QDQ
+# structured, MatMulNBits structured, QMoE, embedding-vocabulary, and
+# transformer-block-depth pruning sections below) -- the helpers referenced
+# here (`_matmul_qdq_producer_model`, `_i8`, `_nbits_chain_model`,
+# `_qmoe_model`, `_ambiguous_embedding_model`, ...) are module-level
+# functions, so their *definition* order doesn't matter for these tests to
+# run correctly (only that the whole module has finished loading before any
+# test body executes, which pytest already guarantees) -- but keeping every
 # `test_analyze_*` test in this one dedicated section, alongside the eight
 # above, does.
 
@@ -17461,6 +17501,493 @@ def test_analyze_structured_pruning_qdq_margin_reflects_dequantized_weight_distr
     margin_b = by_label["hb"].margin
 
     assert margin_b == 0.0  # every dequantized channel row exactly tied
+    assert margin_a is not None and margin_a > 0.9  # wide, unambiguous gap
+    assert margin_a != margin_b
+
+
+def test_analyze_structured_pruning_matmul_nbits_matches_real_call():
+    # Same shape as
+    # test_matmul_nbits_pruning_producer_and_consumer_match_independent_reference_oracle:
+    # W1's rows 0-15 are large magnitude (kept), 16-31 small (dropped) --
+    # block-aligned at block_size=16, so the real call actually prunes this
+    # chain rather than declining it.
+    N1, K1, N2, block_size = 32, 64, 8, 16
+    rng = np.random.default_rng(100)
+    W1 = rng.standard_normal((N1, K1)).astype(np.float32) * 0.2
+    W1[:16] *= 6.0
+    W2 = rng.standard_normal((N2, N1)).astype(np.float32) * 0.2
+    bias1 = (rng.standard_normal(N1) * 0.05).astype(np.float32)
+    bias2 = (rng.standard_normal(N2) * 0.05).astype(np.float32)
+
+    model, _info = _nbits_chain_model(
+        N1, K1, N2, block_size, W1, W2, bias1=bias1, bias2=bias2
+    )
+    onnx.checker.check_model(model)
+
+    report = onnxsim.analyze_pruning_sensitivity(
+        model, onnxsim.apply_structured_pruning_matmul_nbits, sparsity=0.5
+    )
+    assert len(report.layers) == 1
+    layer = report.layers[0]
+    assert layer.family == "matmul_nbits"
+    assert layer.total == N1
+    assert report.not_eligible == []
+
+    pruned = onnxsim.apply_structured_pruning_matmul_nbits(model, sparsity=0.5)
+    inits = {t.name: t for t in pruned.graph.initializer}
+    kept = N1 - layer.would_drop
+    assert inits["B1"].dims[0] == kept
+    assert inits["B2"].dims[1] == kept // block_size  # consumer's block axis
+
+
+def test_analyze_structured_pruning_matmul_nbits_not_eligible_lists_unmatched_nodes():
+    # Mirrors test_analyze_structured_pruning_qdq_not_eligible_lists_unmatched_nodes
+    # for the MatMulNBits family: a third, orphan MatMulNBits node reading
+    # the same activation input but feeding a graph output directly -- no
+    # downstream MatMulNBits consumer at all, so
+    # _find_matmul_nbits_chains can never match it into a chain.
+    N1, K1, N2, block_size = 32, 64, 8, 16
+    rng = np.random.default_rng(101)
+    W1 = rng.standard_normal((N1, K1)).astype(np.float32) * 0.2
+    W2 = rng.standard_normal((N2, N1)).astype(np.float32) * 0.2
+    model, _info = _nbits_chain_model(N1, K1, N2, block_size, W1, W2)
+
+    W3 = rng.standard_normal((4, K1)).astype(np.float32) * 0.2
+    qcodes3, scales3, _zp3, kb3 = _nbits_quantize_block(W3, block_size)
+    B3 = _nbits_pack_B(qcodes3, 4, kb3, block_size)
+    orphan = _nbits_node(
+        "mm_orphan", "A", "Y2", "B3", "scales3", None, None, 4, K1, block_size
+    )
+    model.graph.node.append(orphan)
+    model.graph.initializer.append(onnx.numpy_helper.from_array(B3, name="B3"))
+    model.graph.initializer.append(
+        onnx.numpy_helper.from_array(scales3, name="scales3")
+    )
+    model.graph.output.append(
+        onnx.helper.make_tensor_value_info("Y2", onnx.TensorProto.FLOAT, [3, 4])
+    )
+    onnx.checker.check_model(model)
+
+    report = onnxsim.analyze_pruning_sensitivity(
+        model, onnxsim.apply_structured_pruning_matmul_nbits, sparsity=0.5
+    )
+    assert len(report.layers) == 1  # only the mm1->mm2 chain is matched
+    assert report.not_eligible == ["MatMulNBits 'mm_orphan'"]
+
+
+def test_analyze_structured_pruning_matmul_nbits_non_block_aligned_reported_as_would_drop_zero():
+    # Same interleaved-importance shape as
+    # test_matmul_nbits_pruning_consumer_declines_non_block_aligned: the
+    # top-keep_count-by-norm set straddles every block boundary, so the real
+    # apply() call declines this chain entirely (both nodes left
+    # byte-for-byte unchanged) -- this genuinely matched unit must be
+    # reported would_drop=0/margin=None, not folded into not_eligible (see
+    # _analyze_structured_pruning_matmul_nbits's own docstring).
+    N1, K1, N2, block_size = 32, 64, 8, 16
+    rng = np.random.default_rng(106)
+    W1 = rng.standard_normal((N1, K1)).astype(np.float32) * 0.2
+    W1[0::2] *= 8.0  # even rows large ("important"), odd rows small -- interleaved
+    W2 = rng.standard_normal((N2, N1)).astype(np.float32) * 0.2
+
+    model, _info = _nbits_chain_model(N1, K1, N2, block_size, W1, W2)
+    onnx.checker.check_model(model)
+
+    report = onnxsim.analyze_pruning_sensitivity(
+        model, onnxsim.apply_structured_pruning_matmul_nbits, sparsity=0.5
+    )
+    assert len(report.layers) == 1
+    layer = report.layers[0]
+    assert layer.would_drop == 0
+    assert layer.margin is None
+    assert report.not_eligible == []
+
+    pruned = onnxsim.apply_structured_pruning_matmul_nbits(model, sparsity=0.5)
+    assert pruned.SerializeToString() == model.SerializeToString()
+
+
+def test_analyze_structured_pruning_matmul_nbits_margin_reflects_dequantized_weight_distribution():
+    # Same adversarial shape as
+    # test_analyze_structured_pruning_qdq_margin_reflects_dequantized_weight_distribution,
+    # for the MatMulNBits family: chain "a"'s producer has an unambiguous,
+    # block-aligned gap between its "big" and "small" dequantized
+    # output-channel rows (margin should be strongly positive); chain "b"'s
+    # dequantized rows are all exactly equal (margin must come out exactly
+    # 0.0). Two independent chains, sharing no tensors, built directly (not
+    # via _nbits_chain_model, which only builds one chain per model) and
+    # combined into a single graph.
+    N1, K1, N2, block_size = 32, 64, 8, 16
+    rng = np.random.default_rng(109)
+
+    def _chain(prefix, W1, W2, a_name):
+        qcodes1, scales1, _zp1, kb1 = _nbits_quantize_block(W1, block_size)
+        qcodes2, scales2, _zp2, kb2 = _nbits_quantize_block(W2, block_size)
+        B1 = _nbits_pack_B(qcodes1, N1, kb1, block_size)
+        B2 = _nbits_pack_B(qcodes2, N2, kb2, block_size)
+        node1 = _nbits_node(
+            f"mm1_{prefix}",
+            a_name,
+            f"h_{prefix}",
+            f"B1_{prefix}",
+            f"scales1_{prefix}",
+            None,
+            None,
+            N1,
+            K1,
+            block_size,
+        )
+        node2 = _nbits_node(
+            f"mm2_{prefix}",
+            f"h_{prefix}",
+            f"Y_{prefix}",
+            f"B2_{prefix}",
+            f"scales2_{prefix}",
+            None,
+            None,
+            N2,
+            N1,
+            block_size,
+        )
+        inits = [
+            onnx.numpy_helper.from_array(B1, name=f"B1_{prefix}"),
+            onnx.numpy_helper.from_array(scales1, name=f"scales1_{prefix}"),
+            onnx.numpy_helper.from_array(B2, name=f"B2_{prefix}"),
+            onnx.numpy_helper.from_array(scales2, name=f"scales2_{prefix}"),
+        ]
+        return [node1, node2], inits
+
+    # Deterministic (not random) big/small clusters -- as with the QDQ
+    # margin test's own big_code/small_code, a uniform value per cluster
+    # collapses within-cluster spread to (near) zero, so the entire gap
+    # between clusters shows up in `margin` instead of being partly eaten
+    # by intra-cluster noise.
+    W1_a = np.zeros((N1, K1), dtype=np.float32)
+    W1_a[:16, :] = 50.0  # rows 0-15 big (kept) -- block-aligned
+    W2_a = np.zeros((N2, N1), dtype=np.float32)
+    W1_b = np.full((N1, K1), 3.0, dtype=np.float32)  # every dequantized row tied
+    W2_b = rng.standard_normal((N2, N1)).astype(np.float32) * 0.2
+
+    nodes_a, inits_a = _chain("a", W1_a, W2_a, "Xa")
+    nodes_b, inits_b = _chain("b", W1_b, W2_b, "Xb")
+
+    M = 3
+    graph = onnx.helper.make_graph(
+        [*nodes_a, *nodes_b],
+        "g",
+        inputs=[
+            onnx.helper.make_tensor_value_info("Xa", onnx.TensorProto.FLOAT, [M, K1]),
+            onnx.helper.make_tensor_value_info("Xb", onnx.TensorProto.FLOAT, [M, K1]),
+        ],
+        outputs=[
+            onnx.helper.make_tensor_value_info("Y_a", onnx.TensorProto.FLOAT, [M, N2]),
+            onnx.helper.make_tensor_value_info("Y_b", onnx.TensorProto.FLOAT, [M, N2]),
+        ],
+        initializer=[*inits_a, *inits_b],
+    )
+    model = onnx.helper.make_model(
+        graph,
+        opset_imports=[
+            onnx.helper.make_opsetid("", 21),
+            onnx.helper.make_opsetid("com.microsoft", 1),
+        ],
+    )
+    model.ir_version = 10
+    onnx.checker.check_model(model)
+
+    report = onnxsim.analyze_pruning_sensitivity(
+        model, onnxsim.apply_structured_pruning_matmul_nbits, sparsity=0.5
+    )
+    by_label = {layer.label: layer for layer in report.layers}
+    margin_a = by_label["mm1_a"].margin
+    margin_b = by_label["mm1_b"].margin
+
+    assert margin_b == 0.0  # every dequantized channel row exactly tied
+    assert margin_a is not None and margin_a > 0.9  # wide, unambiguous gap
+    assert margin_a != margin_b
+
+
+def test_analyze_qmoe_expert_channel_pruning_matches_real_call():
+    # Same hand-built shape as
+    # test_qmoe_expert_channel_pruning_matches_hand_built_presliced_reference,
+    # minus the fc1_zero_points wrinkle -- just enough to cross-check
+    # would_drop/family against the real, mutating call.
+    E, hidden, inter, bits, tokens = 3, 8, 12, 4, 6
+    rng = np.random.default_rng(211)
+    fc1_w = (rng.standard_normal((E, inter, hidden)) * 0.3).astype(np.float32)
+    fc2_w = (rng.standard_normal((E, hidden, inter)) * 0.3).astype(np.float32)
+    fc1_b = rng.standard_normal((E, inter)).astype(np.float32)
+
+    fc1_q, fc1_s, _fc1_dq = _qmoe_quantize(fc1_w, bits)
+    fc2_q, fc2_s, _fc2_dq = _qmoe_quantize(fc2_w, bits)
+
+    model = _qmoe_model(
+        fc1_q, fc1_s, fc2_q, fc2_s, bits, fc1_bias=fc1_b, k=2, tokens=tokens
+    )
+    onnx.checker.check_model(model)
+
+    report = onnxsim.analyze_pruning_sensitivity(
+        model, onnxsim.apply_qmoe_expert_channel_pruning, sparsity=0.5
+    )
+    assert len(report.layers) == 1
+    layer = report.layers[0]
+    assert layer.family == "qmoe_expert_channel"
+    assert layer.total == inter
+    assert report.not_eligible == []
+
+    pruned = onnxsim.apply_qmoe_expert_channel_pruning(model, sparsity=0.5)
+    inits = _qmoe_inits(pruned)
+    kept = inter - layer.would_drop
+    assert inits["FC1Q"].shape[1] == kept
+    assert inits["FC1B"].shape[1] == kept
+
+
+def test_analyze_qmoe_expert_channel_pruning_survivor_count_floored_to_pack_multiple():
+    # Mirrors test_qmoe_expert_channel_pruning_survivor_count_floored_to_pack_multiple:
+    # inter_size=10 at bits=4 (pack=2), sparsity=0.7 naively asks for
+    # 10 - round(10*0.7) = 3 survivors -- not a multiple of pack, so both
+    # the real call and the dry-run analyzer must floor it down to 2.
+    E, hidden, inter, bits, tokens = 2, 6, 10, 4, 5
+    rng = np.random.default_rng(212)
+    fc1_w = (rng.standard_normal((E, inter, hidden)) * 0.3).astype(np.float32)
+    fc2_w = (rng.standard_normal((E, hidden, inter)) * 0.3).astype(np.float32)
+    fc1_q, fc1_s, _fc1_dq = _qmoe_quantize(fc1_w, bits)
+    fc2_q, fc2_s, _fc2_dq = _qmoe_quantize(fc2_w, bits)
+    model = _qmoe_model(fc1_q, fc1_s, fc2_q, fc2_s, bits, k=1, tokens=tokens)
+    onnx.checker.check_model(model)
+
+    report = onnxsim.analyze_pruning_sensitivity(
+        model, onnxsim.apply_qmoe_expert_channel_pruning, sparsity=0.7
+    )
+    assert len(report.layers) == 1
+    layer = report.layers[0]
+    assert layer.would_drop == inter - 2  # floored to nearest multiple of pack=2
+
+    pruned = onnxsim.apply_qmoe_expert_channel_pruning(model, sparsity=0.7)
+    inits = _qmoe_inits(pruned)
+    assert inits["FC1Q"].shape[1] == 2
+
+
+def test_analyze_qmoe_expert_channel_pruning_not_eligible_lists_unmatched_nodes():
+    # A QMoE node whose fc1_experts_weights is a graph input rather than a
+    # constant initializer can never be resolved for slicing -- it must
+    # show up in not_eligible, not silently be dropped from the report
+    # (mirrors this section's own QDQ/MatMulNBits not_eligible tests).
+    E, hidden, inter, bits, tokens = 2, 6, 4, 4, 5
+    rng = np.random.default_rng(213)
+    fc1_w = (rng.standard_normal((E, inter, hidden)) * 0.3).astype(np.float32)
+    fc2_w = (rng.standard_normal((E, hidden, inter)) * 0.3).astype(np.float32)
+    fc1_q, fc1_s, _fc1_dq = _qmoe_quantize(fc1_w, bits)
+    fc2_q, fc2_s, _fc2_dq = _qmoe_quantize(fc2_w, bits)
+    model = _qmoe_model(
+        fc1_q, fc1_s, fc2_q, fc2_s, bits, k=1, tokens=tokens, fc1_q_as_input=True
+    )
+    onnx.checker.check_model(model)
+
+    report = onnxsim.analyze_pruning_sensitivity(
+        model, onnxsim.apply_qmoe_expert_channel_pruning, sparsity=0.5
+    )
+    assert report.layers == []
+    assert report.not_eligible == ["QMoE 'qmoe'"]
+
+
+def test_analyze_qmoe_expert_channel_pruning_margin_reflects_dequantized_weight_distribution():
+    # Same adversarial shape as
+    # test_analyze_structured_pruning_qdq_margin_reflects_dequantized_weight_distribution,
+    # for the QMoE expert-channel family: model "a"'s fc1/fc2 rows/columns
+    # have an unambiguous, pack-aligned gap between "big" and "small"
+    # dequantized channel importance (margin should be strongly positive);
+    # model "b"'s are all exactly equal (margin must come out exactly 0.0).
+    # Built as two SEPARATE single-node models rather than one combined
+    # graph (unlike this file's own MatMul/MoE margin tests) -- QMoE's own
+    # test-model builder (`_qmoe_model`) only ever builds one node per
+    # graph, and combining two would mean re-deriving its own tensor-naming
+    # scheme by hand for no added rigor over two independent
+    # analyze_pruning_sensitivity calls compared on the same normalized
+    # `margin` scale.
+    E, hidden, inter, bits, tokens = 2, 8, 8, 4, 5
+
+    # Deterministic (not random) big/tiny clusters -- as with the
+    # MatMulNBits margin test above, a uniform value per cluster (and a
+    # zeroed-out fc2, which would otherwise contribute independent noise to
+    # every channel alike) collapses within-cluster spread to (near) zero,
+    # so the entire gap between clusters shows up in `margin`.
+    fc1_w_a = np.zeros((E, inter, hidden), dtype=np.float32)
+    fc1_w_a[:, :4, :] = 50.0  # channels 0-3 big (kept), 4-7 zero (dropped)
+    fc2_w_a = np.zeros((E, hidden, inter), dtype=np.float32)
+    fc1_q_a, fc1_s_a, _ = _qmoe_quantize(fc1_w_a, bits)
+    fc2_q_a, fc2_s_a, _ = _qmoe_quantize(fc2_w_a, bits)
+    model_a = _qmoe_model(fc1_q_a, fc1_s_a, fc2_q_a, fc2_s_a, bits, k=1, tokens=tokens)
+    onnx.checker.check_model(model_a)
+
+    fc1_w_b = np.full((E, inter, hidden), 3.0, dtype=np.float32)
+    fc2_w_b = np.full((E, hidden, inter), 3.0, dtype=np.float32)
+    fc1_q_b, fc1_s_b, _ = _qmoe_quantize(fc1_w_b, bits)
+    fc2_q_b, fc2_s_b, _ = _qmoe_quantize(fc2_w_b, bits)
+    model_b = _qmoe_model(fc1_q_b, fc1_s_b, fc2_q_b, fc2_s_b, bits, k=1, tokens=tokens)
+    onnx.checker.check_model(model_b)
+
+    report_a = onnxsim.analyze_pruning_sensitivity(
+        model_a, onnxsim.apply_qmoe_expert_channel_pruning, sparsity=0.5
+    )
+    report_b = onnxsim.analyze_pruning_sensitivity(
+        model_b, onnxsim.apply_qmoe_expert_channel_pruning, sparsity=0.5
+    )
+    margin_a = report_a.layers[0].margin
+    margin_b = report_b.layers[0].margin
+
+    assert margin_b == 0.0  # every dequantized channel exactly tied
+    assert margin_a is not None and margin_a > 0.9  # wide, unambiguous gap
+    assert margin_a != margin_b
+
+
+def test_analyze_qmoe_whole_expert_pruning_matches_real_call():
+    # Same hand-built shape as this file's own QMoE whole-expert
+    # calibration tests -- a router-usage-ranked cross-check against the
+    # real, mutating call.
+    E, hidden, inter, bits, tokens = 4, 6, 4, 4, 8
+    rng = np.random.default_rng(215)
+    fc1_w = (rng.standard_normal((E, inter, hidden)) * 0.3).astype(np.float32)
+    fc2_w = (rng.standard_normal((E, hidden, inter)) * 0.3).astype(np.float32)
+    router_w = rng.standard_normal((hidden, E)).astype(np.float32)
+    fc1_q, fc1_s, _ = _qmoe_quantize(fc1_w, bits)
+    fc2_q, fc2_s, _ = _qmoe_quantize(fc2_w, bits)
+
+    model = _qmoe_router_model(
+        fc1_q, fc1_s, fc2_q, fc2_s, bits, router_w, k=1, tokens=tokens
+    )
+    onnx.checker.check_model(model)
+
+    calib_rng = np.random.default_rng(216)
+    calibration_data = [
+        {"X": calib_rng.standard_normal((tokens, hidden)).astype(np.float32)}
+        for _ in range(3)
+    ]
+
+    report = onnxsim.analyze_pruning_sensitivity(
+        model,
+        onnxsim.apply_qmoe_whole_expert_pruning,
+        calibration_data=calibration_data,
+        sparsity=0.5,
+    )
+    assert len(report.layers) == 1
+    layer = report.layers[0]
+    assert layer.family == "qmoe_whole_expert"
+    assert layer.total == E
+    assert report.not_eligible == []
+
+    pruned = onnxsim.apply_qmoe_whole_expert_pruning(
+        model, calibration_data=calibration_data, sparsity=0.5
+    )
+    inits = _qmoe_inits(pruned)
+    kept = E - layer.would_drop
+    assert inits["FC1Q"].shape[0] == kept
+    assert inits["RW"].shape[1] == kept
+
+
+def test_analyze_qmoe_whole_expert_pruning_not_eligible_lists_unmatched_nodes():
+    # use_sparse_mixer=1 is always declined by the real function (see
+    # _match_qmoe_whole_expert_producer) -- must show up in not_eligible.
+    E, hidden, inter, bits, tokens = 2, 6, 4, 4, 5
+    rng = np.random.default_rng(217)
+    fc1_w = (rng.standard_normal((E, inter, hidden)) * 0.3).astype(np.float32)
+    fc2_w = (rng.standard_normal((E, hidden, inter)) * 0.3).astype(np.float32)
+    router_w = rng.standard_normal((hidden, E)).astype(np.float32)
+    fc1_q, fc1_s, _ = _qmoe_quantize(fc1_w, bits)
+    fc2_q, fc2_s, _ = _qmoe_quantize(fc2_w, bits)
+    model = _qmoe_router_model(
+        fc1_q,
+        fc1_s,
+        fc2_q,
+        fc2_s,
+        bits,
+        router_w,
+        k=2,
+        tokens=tokens,
+        use_sparse_mixer=1,
+    )
+    onnx.checker.check_model(model)
+
+    report = onnxsim.analyze_pruning_sensitivity(
+        model,
+        onnxsim.apply_qmoe_whole_expert_pruning,
+        calibration_data=[],
+        sparsity=0.5,
+    )
+    assert report.layers == []
+    assert report.not_eligible == ["QMoE 'qmoe'"]
+
+
+def test_analyze_qmoe_whole_expert_pruning_margin_reflects_router_usage_distribution():
+    # Same adversarial shape as
+    # test_analyze_moe_whole_expert_pruning_margin_reflects_router_usage_distribution,
+    # for the QMoE whole-expert family: model "a"'s router has a zero
+    # weight matrix and a heavily lopsided bias, so every token's routing
+    # logits are identical and one expert's usage is unambiguously near-zero
+    # next to the rest (margin should be strongly positive); model "b"'s
+    # router weight and bias are both all-zero, so every expert's mean gate
+    # weight comes out *exactly* tied (margin must come out exactly 0.0).
+    # Built as two separate single-node models -- see this section's own
+    # QMoE expert-channel margin test comment for why.
+    # hidden/inter must each be a multiple of the pack width (8 // bits ==
+    # 2 here) -- QMoE's own packed-uint8 K axis, unlike plain MoE's float
+    # tensors, has no way to represent a partial trailing packed byte.
+    E, hidden, inter, bits, tokens = 4, 4, 2, 4, 5
+    rng = np.random.default_rng(218)
+    fc1_w = (rng.standard_normal((E, inter, hidden)) * 0.3).astype(np.float32)
+    fc2_w = (rng.standard_normal((E, hidden, inter)) * 0.3).astype(np.float32)
+    fc1_q, fc1_s, _ = _qmoe_quantize(fc1_w, bits)
+    fc2_q, fc2_s, _ = _qmoe_quantize(fc2_w, bits)
+
+    router_w_zero = np.zeros((hidden, E), dtype=np.float32)
+    router_b_a = np.array([0.0, 0.0, 0.0, -8.0], dtype=np.float32)  # expert 3: ~0 usage
+    router_b_b = np.zeros(E, dtype=np.float32)
+
+    model_a = _qmoe_router_model(
+        fc1_q,
+        fc1_s,
+        fc2_q,
+        fc2_s,
+        bits,
+        router_w_zero,
+        router_b=router_b_a,
+        k=1,
+        tokens=tokens,
+    )
+    model_b = _qmoe_router_model(
+        fc1_q,
+        fc1_s,
+        fc2_q,
+        fc2_s,
+        bits,
+        router_w_zero,
+        router_b=router_b_b,
+        k=1,
+        tokens=tokens,
+    )
+    onnx.checker.check_model(model_a)
+    onnx.checker.check_model(model_b)
+
+    calib_rng = np.random.default_rng(219)
+    calibration_data = [
+        {"X": calib_rng.standard_normal((tokens, hidden)).astype(np.float32)}
+        for _ in range(3)
+    ]
+
+    report_a = onnxsim.analyze_pruning_sensitivity(
+        model_a,
+        onnxsim.apply_qmoe_whole_expert_pruning,
+        calibration_data=calibration_data,
+        sparsity=0.25,  # keep 3 of 4
+    )
+    report_b = onnxsim.analyze_pruning_sensitivity(
+        model_b,
+        onnxsim.apply_qmoe_whole_expert_pruning,
+        calibration_data=calibration_data,
+        sparsity=0.25,
+    )
+    margin_a = report_a.layers[0].margin
+    margin_b = report_b.layers[0].margin
+
+    assert margin_b == 0.0  # every expert's router logit exactly tied
     assert margin_a is not None and margin_a > 0.9  # wide, unambiguous gap
     assert margin_a != margin_b
 
