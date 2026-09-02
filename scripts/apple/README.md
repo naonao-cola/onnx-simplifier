@@ -404,6 +404,22 @@ first place it actually compiles and runs, specifically against the
 matmul-to-conv comparison this tool exists to explain), uploading each
 trace as a workflow artifact.
 
+The first real run built and executed cleanly but produced an **empty**
+trace -- `computeDeviceUsageForMLProgramOperation:`/
+`estimatedCostOfMLProgramOperation:` returned `nil` for every operation in
+the model. Root cause: those two `MLComputePlan` methods need the *traced
+model's own* `minimum_deployment_target` to be at or above roughly the
+iOS17.4/macOS15.4 SDK generation -- unrelated to which OS/Xcode the machine
+running this tool has. `smollm2-135m`/`smollm2-135m-conv` don't quantize
+weights, so they got whatever (lower) target `onnxsim.export_coreml` picks
+by default. Fixed by giving `export_llm_to_coreml.py` a
+`--minimum-deployment-target` flag and having `coreml-integration.yml` pass
+`iOS18` (the highest target coremltools exposes) for just those two matrix
+entries. The tool itself also now prints `operations.count` and per-op
+nil/non-nil `deviceUsage`/`estimatedCost` status for the first few
+unanalyzable ops, so a still-empty trace after this fix would point at the
+real cause immediately instead of requiring another blind guess.
+
 ### Quality and retention eval (`run_quality_eval.py` / `compute_retention.py`)
 
 The decode benchmark and parity check above measure speed and short-generation

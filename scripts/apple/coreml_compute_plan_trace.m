@@ -40,6 +40,20 @@
 // of falling back to "unknown" instead of failing to build if Apple ever
 // renames them.
 //
+// computeDeviceUsageForMLProgramOperation:/estimatedCostOfMLProgramOperation:
+// return nil for ops the compute plan "couldn't analyze" -- this has been
+// observed to mean *every* op, i.e. an empty trace, when the traced model's
+// own `minimum_deployment_target` is below the iOS17.4/macOS15.4-class SDK
+// floor these two methods need (independent of what OS/Xcode the machine
+// running this tool has -- it's the model's declared target that matters).
+// export_llm_to_coreml.py's `--minimum-deployment-target` flag (passed as
+// iOS18, the highest coremltools exposes, by coreml-integration.yml's
+// compute-plan-trace matrix entries) works around this; if a trace still
+// comes back empty after that, check this tool's own stdout/stderr first
+// (see WalkProgram below) -- it now prints operations.count and per-op
+// nil/non-nil status for the first few ops that have no data, rather than
+// silently producing an empty JSON file.
+//
 // Build (matches https://github.com/freedomtan/coreml_modelc_profling's
 // Makefile -- plain clang, no Xcode project needed):
 //   clang -O2 -o coreml_compute_plan_trace coreml_compute_plan_trace.m \
@@ -122,10 +136,27 @@ static int WalkProgram(MLComputePlan *computePlan, MLModelStructureProgram *prog
   }
 
   NSArray<MLModelStructureProgramOperation *> *operations = mainFunction.block.operations;
+  // Diagnostic, not just cosmetic: this tool has previously produced an
+  // empty trace in CI with no indication of why (an empty `operations`
+  // array vs. every op's deviceUsage/estimatedCost coming back nil are very
+  // different bugs -- see the module comment's SDK-floor note). Printing
+  // this unconditionally means the next run that comes back empty still
+  // tells us which case it was, instead of requiring another guess-and-push
+  // round trip.
+  printf("main function has %lu operation(s)\n", (unsigned long)operations.count);
+  NSUInteger noDeviceUsage = 0, noCost = 0, recorded = 0, diagnosedOps = 0;
   for (MLModelStructureProgramOperation *operation in operations) {
     MLComputePlanDeviceUsage *deviceUsage =
         [computePlan computeDeviceUsageForMLProgramOperation:operation];
     MLComputePlanCost *estimatedCost = [computePlan estimatedCostOfMLProgramOperation:operation];
+    if (!deviceUsage) noDeviceUsage++;
+    if (!estimatedCost) noCost++;
+    if ((!deviceUsage || !estimatedCost) && diagnosedOps < 5) {
+      fprintf(stderr, "  no compute-plan data for op %s: deviceUsage=%s estimatedCost=%s\n",
+              [([operation operatorName] ?: @"?") UTF8String], deviceUsage ? "present" : "nil",
+              estimatedCost ? "present" : "nil");
+      diagnosedOps++;
+    }
     if (!deviceUsage || !estimatedCost) {
       // MLComputePlan returns nil for ops it couldn't analyze (e.g. pure
       // metadata/const ops with no runtime cost) -- skip rather than
@@ -136,7 +167,11 @@ static int WalkProgram(MLComputePlan *computePlan, MLModelStructureProgram *prog
     NSString *lane = ClassifyDevice(preferredDevice);
     RecordOperation(state, lane, [operation operatorName], [estimatedCost weight],
                     [preferredDevice description]);
+    recorded++;
   }
+  printf("recorded %lu/%lu op(s) (%lu missing deviceUsage, %lu missing estimatedCost)\n",
+         (unsigned long)recorded, (unsigned long)operations.count, (unsigned long)noDeviceUsage,
+         (unsigned long)noCost);
   return 0;
 }
 
