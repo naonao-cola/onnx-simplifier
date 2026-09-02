@@ -9610,9 +9610,21 @@ def apply_structured_pruning_matmul_nbits(
 #   pattern (Microsoft's own onnxruntime-genai model builder's fused
 #   Q/K-norm GQA path, e.g. Qwen3-style models on CUDA/WebGPU) rather than
 #   assumed -- see :func:`_match_packed_qkv_split`'s own docstring for the
-#   exact topology matched, the export code path that produces it, and the
-#   narrower shapes (Q/K-norm without the in-op-fused path, or no Q/K-norm
-#   at all) deliberately left unmatched. Pruning a KV group out of a packed
+#   exact topology matched and the export code path that produces it. The
+#   CPU/DirectML variant of that same export path -- Q/K-norm requested but
+#   the fused in-op norm path unsupported there, so a per-head
+#   `SimplifiedLayerNorm` (and, unless RoPE is fused into the op itself, a
+#   `RotaryEmbedding`) sits between the `Split` and the op's own Q/K
+#   inputs -- is *also* matched, via :func:`_walk_back_through_qk_norm_rope`
+#   (see that function's own docstring for the exact topology and its own
+#   confirmed head-independence: neither the norm's own `scale` nor
+#   `RotaryEmbedding`'s `cos_cache`/`sin_cache` ever needs slicing, only a
+#   crossed `RotaryEmbedding`'s own `num_heads` attribute and a crossed
+#   `Reshape`'s own target width, both handled by
+#   :func:`_apply_one_gqa_chain`). Only a shape genuinely outside both of
+#   these -- an unrecognized op in the way, RoPE applied *before* norm, or
+#   no `Split` at all upstream of Q/K -- is still deliberately left
+#   unmatched. Pruning a KV group out of a packed
 #   chain removes that group's own Q/K/V column ranges from the *one*
 #   shared packed weight (and its packed bias, if any) in a single combined
 #   slice, and shrinks the `Split` node's own split-sizes constant to
@@ -9850,6 +9862,18 @@ class _GQAChain:
     # per-producer slices that would each invalidate the others' column
     # offsets into the same underlying storage.
     packed_split_sizes: Optional[str] = None
+    # Set only alongside `packed_split_sizes`, and only when a per-head
+    # Q/K-norm + RoPE "pass-through" (see :class:`_QKNormRopePassThrough`
+    # and :func:`_walk_back_through_qk_norm_rope`) was crossed walking back
+    # from `.node`'s own Q (`.q_norm_rope`) or K (`.k_norm_rope`) input to
+    # the shared `Split` -- the CPU/DirectML Q/K-norm GQA export shape
+    # `_match_packed_qkv_split`'s own docstring names as *not* matched by
+    # that function alone. ``None`` (the default) whenever that particular
+    # branch feeds `.node` directly from the `Split` with no hop in
+    # between -- every ordinary packed-QKV chain, matched before this
+    # pass-through existed, gets ``None`` on both exactly as before.
+    q_norm_rope: Optional["_QKNormRopePassThrough"] = None
+    k_norm_rope: Optional["_QKNormRopePassThrough"] = None
 
 
 # Either kind of matched attention block, sharing enough of a common shape
@@ -10414,15 +10438,35 @@ def _match_packed_qkv_split(
     inputs -- exactly the shape matched here). The common case with no
     Q/K norm instead relies on `GroupQueryAttention`'s own native
     packed-`query`-input convention and emits no `Split` at all, and the
-    case with Q/K norm but *no* fused in-op norm support instead runs
-    per-head `SimplifiedLayerNorm` (and, unless RoPE is itself fused into
-    the op, `RotaryEmbedding`) nodes between the `Split` and the op's own
-    inputs -- a shape this function does not match (its `Split` must feed
-    the consuming op's inputs directly, with nothing declined/matched
-    read here) and :func:`_find_separate_qkv_chains`'s own per-branch
-    :func:`_match_producer` walk declines like any other unrecognized
-    producer, rather than silently mis-slicing a shape this pass hasn't
-    verified.
+    case with Q/K norm but *no* fused in-op norm support (CPU/DirectML --
+    `is_fused_qk_norm_gqa_supported` only allows the in-op path on
+    CUDA/WebGPU) instead runs per-head `SimplifiedLayerNorm` (via a
+    `Reshape` -> `SimplifiedLayerNormalization` -> `Reshape` sandwich --
+    `make_qk_norm`'s own subgraph, confirmed by reading it directly) and,
+    unless RoPE is itself fused into the op, a `com.microsoft::RotaryEmbedding`
+    node between the `Split` and the op's own Q/K inputs (`make_qk_norm`
+    then `make_rotary_embedding_op`, in that order, per
+    `make_attention_qk_rope_and_norm`'s own comment "Base order: norm
+    first, then RoPE"). This function itself still requires `split_node`'s
+    own three outputs to feed *something* directly -- it never looks past
+    `split_node` itself -- but its caller,
+    :func:`_find_separate_qkv_chains`, no longer requires that something to
+    be the attention op's own Q/K inputs verbatim: it first walks *back*
+    from those inputs, via :func:`_walk_back_through_qk_norm_rope`, through
+    exactly this Reshape/Norm/Reshape-then-RotaryEmbedding shape (each hop
+    optional, independently, on Q's and K's own branch) to find the real
+    `Split` outputs this function is given, so the two together now cover
+    this CPU/DirectML shape too -- see that function's own docstring for
+    the exact topology and how its own head-independence (no gamma
+    slicing, no `RotaryEmbedding` weight/cache slicing -- only its own
+    `num_heads` attribute, when nonzero, and a crossed `Reshape`'s own
+    target-width entry ever need updating) was confirmed. Only a `Split`
+    output feeding neither the attention op directly nor one of these
+    exact hops -- an unrecognized intermediate op, a branch, RoPE before
+    norm, or a shape this pass hasn't otherwise verified -- still falls
+    through to :func:`_find_separate_qkv_chains`'s own per-branch
+    :func:`_match_producer` walk, which declines it like any other
+    unrecognized producer rather than silently mis-slicing it.
 
     Declines (``None``) unless every one of the following holds, checked
     with the same conservative bar as every other producer match in this
@@ -10498,6 +10542,299 @@ def _match_packed_qkv_split(
     return w_name, w_transposed, bias_name, nq, nk, nv, sizes_name
 
 
+# Scope boundaries this section lands on, deliberately: the CPU/DirectML
+# Q/K-norm GQA export shape (see :func:`_match_packed_qkv_split`'s own
+# docstring) inserts, between a packed-QKV `Split`'s own Q/K outputs and
+# `GroupQueryAttention`'s (or the plain ai.onnx `Attention` op's) own Q/K
+# inputs, an optional per-head norm sandwich (a `Reshape` collapsing
+# `(batch, seq, hidden)` to `(batch, seq * num_heads, head_size)`, a
+# `SimplifiedLayerNormalization` with its default `axis=-1` and a
+# `[head_size]` `scale` -- `make_qk_norm`'s own subgraph, read directly off
+# `onnxruntime_genai/models/builders/base.py`) and, unless RoPE is fused
+# into the attention op itself, an optional `com.microsoft::RotaryEmbedding`
+# node applied directly to the flat `(batch, seq, hidden)` tensor
+# (`make_rotary_embedding_op`), norm before RoPE when both are present
+# (`make_attention_qk_rope_and_norm`'s own comment: "Base order: norm
+# first, then RoPE"). :func:`_walk_back_through_qk_norm_rope` below walks
+# *backward* from the attention op's own Q or K input through this exact
+# optional-hop sequence to find the `Split` output feeding it, the same
+# direction :func:`_walk_matmul_producer_backward` already walks in this
+# module for an unrelated reason (residual-chain producers), and for the
+# same reason: the *forward* direction (`_walk_to_consumer`'s own style)
+# would need to start from the `Split`'s own output, guessing which
+# consumer among possibly several to follow, before it's known whether the
+# far end is even this attention op's own Q/K input at all.
+#
+# Two head-independence facts make every hop here safe to prune through
+# with **no slicing of the hop's own constants at all** -- confirmed
+# empirically (real `onnxruntime.InferenceSession` runs, not the schema
+# doc alone; see ``tests/test_pruning.py``'s own
+# ``test_simplified_layer_norm_is_head_independent_for_pruning``/
+# ``test_rotary_embedding_is_head_independent_for_pruning`` for the exact
+# models and numbers), not assumed:
+#
+# - `SimplifiedLayerNormalization`'s own `scale` (`[head_size]`, confirmed
+#   live via `onnxruntime.capi.onnxruntime_pybind11_state
+#   .get_all_operator_schema()` -- this op isn't in onnx's own schema
+#   registry at all despite registering under the default ("") domain, see
+#   this module's own `_NORM_PASS_THROUGH_OPS` comment far above -- on this
+#   environment's installed `onnx==1.22.0`/`onnxruntime==1.29.0` -- no
+#   `bias`/`B` input at all, unlike plain `LayerNormalization`) broadcasts
+#   *identically* to every head's own row regardless of how many heads
+#   exist: reducing over exactly the trailing `head_size` axis per
+#   `(batch, seq, head)` triple, with the *same* `scale` array applied to
+#   every head, dropping whole heads before or after this norm gives
+#   bit-identical results for the surviving heads either way (confirmed
+#   with a hand-built `Reshape` -> `SimplifiedLayerNormalization` ->
+#   `Reshape` model, keeping an arbitrary, non-contiguous subset of heads,
+#   `max abs diff == 0.0` both before and after). So, unlike every other
+#   per-channel affine operand this module tracks (`_NORM_PASS_THROUGH_OPS`'s
+#   own `scale`/`bias`, `_skip_layer_norm_const_names`'s own `gamma`/`beta`),
+#   this norm's own `scale` is *never* sliced here -- there is nothing
+#   head-shaped about it to slice.
+# - `com.microsoft::RotaryEmbedding` (confirmed live via
+#   `onnxruntime.capi.onnxruntime_pybind11_state.get_all_operator_schema()`
+#   to be a real op under that domain, inputs `[input, position_ids,
+#   cos_cache, sin_cache]`, attributes `num_heads`/`rotary_embedding_dim`/
+#   `interleaved`/`is_packed_batching`/`scale`) rotates each head's own
+#   `head_size` (or `rotary_embedding_dim`-wide prefix of it) slice using
+#   only that head's own data and a position-dependent (never head-
+#   dependent) `cos_cache`/`sin_cache` lookup -- confirmed head-independent,
+#   again bit-identical, across every `interleaved` (0 and 1) and
+#   full-vs-partial `rotary_embedding_dim` combination tried. Its own
+#   `num_heads` attribute is the *one* constant here that does need
+#   updating post-pruning -- unless it's already the schema's `0`
+#   ("infer `num_heads` from the input's own trailing width divided by
+#   `cos_cache`'s/`rotary_embedding_dim`'s own implied `head_size`",
+#   confirmed to self-adjust correctly to a smaller post-pruning head count
+#   with *no* attribute change needed at all) -- to the new post-pruning
+#   head count for whichever branch (Q's `num_heads`, K's `kv_num_heads`)
+#   it sits on; neither `cos_cache` nor `sin_cache` themselves ever need
+#   touching, having no head axis at all.
+#
+# A `Reshape`'s own two target-shape entries are `head_size` (never
+# changes) and this branch's flat width (`num_heads * head_size` or
+# `kv_num_heads * head_size`, which *does* shrink) -- only the second
+# `Reshape` (the one reconstructing the flat `(batch, seq, hidden)` shape
+# right after the norm) ever encodes the latter as a literal, and only
+# when it does (a resolvable, single-consumer constant -- see
+# :func:`_reshape_last_dim`) is that hop even crossed; otherwise the walk
+# simply doesn't cross it, and the match declines further up the call
+# chain the same way any other unrecognized shape does.
+#
+# Neither the `Reshape` collapsing to `(batch, seq * num_heads, head_size)`
+# ahead of the norm nor the norm's own training-only `inv_std_var` second
+# output (already declined, the same way, by `_walk_to_consumer`'s own
+# `_NORM_PASS_THROUGH_OPS` hop, whenever it's actually consumed) needs any
+# constant update at all -- neither depends on how many heads survive.
+@dataclass(frozen=True)
+class _QKNormRopePassThrough:
+    """One resolved Q- or K-branch "per-head norm + RoPE" pass-through a
+    packed-QKV chain walk crossed between a `_GQAChain`'s own `Split` (see
+    `_GQAChain.packed_split_sizes`) and the attention op's own Q or K
+    input -- see :func:`_walk_back_through_qk_norm_rope` (which builds
+    this) for the exact topology and how its head-independence was
+    confirmed. Unlike :class:`_ConvPassThrough`'s own `weight`/`bias`
+    fields, nothing here names a tensor :func:`_apply_one_gqa_chain` needs
+    to *slice* -- this section's own comment above covers why neither a
+    crossed norm's `scale` nor a crossed `RotaryEmbedding`'s `cos_cache`/
+    `sin_cache` ever needs touching. Two things still do:
+
+    - `rotary_node`: the crossed `RotaryEmbedding` node, or ``None`` when
+      RoPE wasn't crossed (norm-only, or neither). When present, its own
+      `num_heads` attribute -- whenever it isn't already the schema's `0`
+      -- is rewritten to this branch's new post-pruning head count.
+    - `reshape_shape`: the crossed post-norm `Reshape`'s own target-shape
+      constant name, or ``None`` when that `Reshape`/norm sandwich wasn't
+      crossed (RoPE-only, or neither). When present, its own last entry
+      (this branch's flat width) is rewritten to the new post-pruning
+      value, mirroring how :func:`_apply_one_gqa_chain`'s existing
+      `chain.chain_ops` loop already rewrites a *post*-attention-output
+      Reshape's own target width.
+
+    `nodes` lists every node actually crossed (any of `RotaryEmbedding`,
+    the post-norm `Reshape`, the `SimplifiedLayerNormalization`, and the
+    pre-norm `Reshape`, in that order, whichever were present) purely for
+    :func:`_apply_attention_chains`'s own stale-`value_info` bookkeeping --
+    every one of their own output tensors is narrower after pruning even
+    though, per the two fields above, only two of them ever need editing.
+    Never empty when this class is actually constructed --
+    :func:`_walk_back_through_qk_norm_rope` returns ``None`` instead of an
+    empty-`nodes` instance when nothing was crossed.
+    """
+
+    nodes: Tuple[onnx.NodeProto, ...]
+    rotary_node: Optional[onnx.NodeProto] = None
+    reshape_shape: Optional[str] = None
+
+
+def _walk_back_through_qk_norm_rope(
+    name: str,
+    initializer_map: Dict[str, onnx.TensorProto],
+    consumers_of: Dict[str, List[onnx.NodeProto]],
+    graph_outputs: Set[str],
+    node_by_output: Dict[str, onnx.NodeProto],
+) -> Tuple[str, Optional[_QKNormRopePassThrough]]:
+    """Walks *backward* from `name` -- `GroupQueryAttention`'s (or the
+    plain ai.onnx `Attention` op's) own Q or K input, already confirmed by
+    the caller to have exactly one consumer -- through an optional
+    `com.microsoft::RotaryEmbedding` node and, further back, an optional
+    `Reshape` -> `SimplifiedLayerNormalization` -> `Reshape` "per-head norm"
+    sandwich, stopping at the first tensor not produced by one of these two
+    recognized hops (each independently optional; the whole point of this
+    walk is that `name` may sit directly on a packed-QKV `Split`'s own
+    output with *neither* hop present at all, exactly as before this
+    pass-through existed). See this section's own comment above for the
+    exact topology (confirmed against onnxruntime-genai's own model
+    builder source) and the head-independence facts that make every hop
+    here safe with no constant slicing beyond what :class:`_QKNormRopePassThrough`
+    already names.
+
+    Every hop crossed is additionally required to have exactly one
+    consumer at each internal edge (the next hop inward, or `name`'s own
+    eventual attention-op input) and not itself be a graph output -- the
+    same "no other consumer along the way" bar every forward chain walk in
+    this module already holds (:func:`_walk_to_consumer`) -- so a norm/RoPE
+    tensor secretly reused elsewhere (a residual branch, a second attention
+    op) safely stops the walk there rather than risking a corrupting slice.
+    A crossed norm's own `inv_std_var` second output, when itself consumed
+    by anything, likewise stops the walk at that node -- the same
+    training-only-secondary-output bar :func:`_walk_to_consumer`'s own
+    `_NORM_PASS_THROUGH_OPS` hop already holds. A crossed post-norm
+    `Reshape`'s own target-shape input must be a constant whose last entry
+    is statically resolvable (:func:`_reshape_last_dim`) and single-consumer
+    (safe to overwrite in place) -- the same bar
+    :func:`_walk_to_attention_consumer`'s own Reshape hop already holds its
+    shape constant to -- or that `Reshape` (and, transitively, the norm
+    sandwich behind it) simply isn't crossed.
+
+    The norm's own `scale` is only confirmed here to be a flat
+    per-channel-shaped float constant (:func:`_flat_channel_const`) -- the
+    real ``dims == [head_size]`` check, only possible once `head_size` is
+    itself known (only after the packed producer this walk is feeding into
+    is resolved, which needs this walk's own result first), is left to the
+    caller (:func:`_qk_norm_rope_hop_is_consistent`), the same
+    deferred-check idiom :func:`_norm_pass_through_const_names` already
+    uses for its own `_NORM_PASS_THROUGH_OPS` hop.
+
+    Returns ``(root_name, hop)``: `root_name` is `name` itself and `hop` is
+    ``None`` when neither hop was crossed (the pre-existing, still-most-common
+    "Split feeds the attention op directly" shape); otherwise `root_name` is
+    the tensor immediately upstream of every hop crossed (expected, by the
+    caller, to be one of the shared `Split`'s own raw outputs) and `hop`
+    describes what was crossed.
+    """
+
+    def _is_internal(n: str) -> bool:
+        return len(consumers_of.get(n, [])) == 1 and n not in graph_outputs
+
+    nodes: List[onnx.NodeProto] = []
+    rotary_node: Optional[onnx.NodeProto] = None
+    reshape_shape: Optional[str] = None
+    cur = name
+
+    rope = node_by_output.get(cur)
+    if (
+        rope is not None
+        and rope.domain == _ATTENTION_DOMAIN
+        and rope.op_type == "RotaryEmbedding"
+        and len(rope.input) >= 1
+        and rope.input[0]
+        and len(rope.output) == 1
+        and rope.output[0] == cur
+        and _is_internal(rope.input[0])
+    ):
+        rotary_node = rope
+        nodes.append(rope)
+        cur = rope.input[0]
+
+    reshape2 = node_by_output.get(cur)
+    if (
+        reshape2 is not None
+        and reshape2.domain == ""
+        and reshape2.op_type == "Reshape"
+        and len(reshape2.input) == 2
+        and reshape2.input[0]
+        and len(reshape2.output) == 1
+        and reshape2.output[0] == cur
+        and _is_internal(reshape2.input[0])
+        and _reshape_last_dim(reshape2, initializer_map) is not None
+        and len(consumers_of.get(reshape2.input[1], [])) == 1
+    ):
+        norm_out = reshape2.input[0]
+        norm_node = node_by_output.get(norm_out)
+        if (
+            norm_node is not None
+            and norm_node.domain == ""
+            and norm_node.op_type == "SimplifiedLayerNormalization"
+            and len(norm_node.output) >= 1
+            and norm_node.output[0] == norm_out
+            and len(norm_node.input) == 2
+            and norm_node.input[1]
+            and _flat_channel_const(norm_node.input[1], initializer_map)
+            and _norm_axis_is_last(norm_node, norm_node.input[0], None)
+            and not (
+                len(norm_node.output) > 1
+                and norm_node.output[1]
+                and (
+                    consumers_of.get(norm_node.output[1])
+                    or norm_node.output[1] in graph_outputs
+                )
+            )
+            and norm_node.input[0]
+            and _is_internal(norm_node.input[0])
+        ):
+            reshape1 = node_by_output.get(norm_node.input[0])
+            if (
+                reshape1 is not None
+                and reshape1.domain == ""
+                and reshape1.op_type == "Reshape"
+                and len(reshape1.input) == 2
+                and reshape1.input[0]
+                and len(reshape1.output) == 1
+                and reshape1.output[0] == norm_node.input[0]
+                and _is_internal(reshape1.input[0])
+            ):
+                nodes.extend([reshape2, norm_node, reshape1])
+                reshape_shape = reshape2.input[1]
+                cur = reshape1.input[0]
+
+    if not nodes:
+        return name, None
+    return cur, _QKNormRopePassThrough(tuple(nodes), rotary_node, reshape_shape)
+
+
+def _qk_norm_rope_hop_is_consistent(
+    hop: Optional[_QKNormRopePassThrough],
+    initializer_map: Dict[str, onnx.TensorProto],
+    branch_width: int,
+    head_size: int,
+) -> bool:
+    """Deferred correctness check for a :func:`_walk_back_through_qk_norm_rope`
+    result, run only once `branch_width` (this branch's own pre-pruning
+    `nq`/`nk`) and `head_size` are themselves known -- see that function's
+    own docstring for why this can't be checked any earlier. `True`
+    (nothing to check) when `hop` is ``None`` (no pass-through crossed for
+    this branch). Otherwise: any crossed `SimplifiedLayerNormalization`'s
+    own `scale` must be exactly `[head_size]`-shaped (not just flat -- the
+    real per-head-width fact the walk itself deferred), and, when a post-norm
+    `Reshape` was crossed, its own target-shape constant's last entry must
+    exactly equal `branch_width` -- both declined (``False``), never
+    guessed at, on any mismatch.
+    """
+    if hop is None:
+        return True
+    for node in hop.nodes:
+        if node.op_type == "SimplifiedLayerNormalization":
+            if list(initializer_map[node.input[1]].dims) != [head_size]:
+                return False
+    if hop.reshape_shape is not None:
+        dims = onnx.numpy_helper.to_array(initializer_map[hop.reshape_shape])
+        if dims.size == 0 or int(dims[-1]) != branch_width:
+            return False
+    return True
+
+
 def _find_separate_qkv_chains(
     graph: onnx.GraphProto,
     match_producer,
@@ -10548,16 +10885,45 @@ def _find_separate_qkv_chains(
         # other shape (three genuinely independent producers, or anything
         # this function doesn't recognize) falls to that per-branch loop
         # unchanged.
+        #
+        # `root_q`/`root_k` walk *backward* from Q's/K's own attention-op
+        # input through an optional per-head norm + RoPE pass-through (see
+        # :func:`_walk_back_through_qk_norm_rope` and this section's own
+        # comment above) before checking for the shared `Split` -- `q_name`/
+        # `k_name` unchanged (and `q_hop`/`k_hop` both `None`) whenever
+        # neither hop is present, so this is a strict superset of the
+        # pre-existing "`Split` feeds the attention op directly" check, not
+        # a behavior change for any graph that already matched. V never
+        # gets this treatment -- `make_qk_norm`/`make_rotary_embedding_op`
+        # never touch V's own branch (see this section's own comment above)
+        # -- so `v_name` is still compared against `prod_q.output[2]`
+        # verbatim, exactly as before.
         packed_split_sizes: Optional[str] = None
-        prod_q = node_by_output.get(q_name) if _is_internal(q_name) else None
-        prod_k = node_by_output.get(k_name) if _is_internal(k_name) else None
+        q_norm_rope: Optional[_QKNormRopePassThrough] = None
+        k_norm_rope: Optional[_QKNormRopePassThrough] = None
+        root_q, q_hop = (
+            _walk_back_through_qk_norm_rope(
+                q_name, initializer_map, consumers_of, graph_outputs, node_by_output
+            )
+            if _is_internal(q_name)
+            else (q_name, None)
+        )
+        root_k, k_hop = (
+            _walk_back_through_qk_norm_rope(
+                k_name, initializer_map, consumers_of, graph_outputs, node_by_output
+            )
+            if _is_internal(k_name)
+            else (k_name, None)
+        )
+        prod_q = node_by_output.get(root_q) if _is_internal(root_q) else None
+        prod_k = node_by_output.get(root_k) if _is_internal(root_k) else None
         prod_v = node_by_output.get(v_name) if _is_internal(v_name) else None
         if (
             prod_q is not None
             and prod_q is prod_k
             and prod_q is prod_v
             and prod_q.op_type == "Split"
-            and list(prod_q.output) == [q_name, k_name, v_name]
+            and list(prod_q.output) == [root_q, root_k, v_name]
         ):
             packed = _match_packed_qkv_split(
                 prod_q, initializer_map, consumers_of, node_by_output
@@ -10570,6 +10936,8 @@ def _find_separate_qkv_chains(
                 (w_name, w_transposed, bias_name, nk),
                 (w_name, w_transposed, bias_name, nv),
             ]
+            q_norm_rope = q_hop
+            k_norm_rope = k_hop
         else:
             producer_infos = []
             matched = True
@@ -10611,6 +10979,23 @@ def _find_separate_qkv_chains(
             # fusion-declining conditions) -- a `GroupQueryAttention` node
             # whose V head size actually differs is declined here rather
             # than mis-sliced, since no real GQA node could ever have one.
+            continue
+
+        # Deferred correctness check for any Q/K-norm + RoPE pass-through
+        # crossed above (see :func:`_qk_norm_rope_hop_is_consistent`'s own
+        # docstring for why this can't run any earlier): a crossed norm's
+        # own `scale` must genuinely be `[head_size]`-wide, and a crossed
+        # post-norm `Reshape`'s own target width must genuinely be this
+        # branch's own pre-pruning flat width -- anything else means this
+        # walk crossed a shape it only structurally resembles, not the real
+        # Q/K-norm GQA export shape, and the whole match is declined here
+        # rather than mis-slicing it.
+        if not (
+            _qk_norm_rope_hop_is_consistent(q_norm_rope, initializer_map, nq, head_size)
+            and _qk_norm_rope_hop_is_consistent(
+                k_norm_rope, initializer_map, nk, head_size
+            )
+        ):
             continue
 
         out_name = node.output[0]
@@ -10657,6 +11042,8 @@ def _find_separate_qkv_chains(
                 consumer_weight_transposed=consumer[2],
                 num_heads_attr=num_heads_attr,
                 packed_split_sizes=packed_split_sizes,
+                q_norm_rope=q_norm_rope,
+                k_norm_rope=k_norm_rope,
             )
         )
     return chains
@@ -10949,7 +11336,16 @@ def _apply_one_gqa_chain(
     once by a combined column-index set instead of three independent
     per-producer slices, and the upstream `Split` node's own split-sizes
     constant is rewritten to the three new (post-pruning) column widths in
-    the same Q-then-K-then-V order -- see the branch below.
+    the same Q-then-K-then-V order -- see the branch below. When
+    `chain.q_norm_rope`/`chain.k_norm_rope` are additionally set (the
+    CPU/DirectML Q/K-norm GQA export shape -- see
+    :func:`_walk_back_through_qk_norm_rope`, :class:`_QKNormRopePassThrough`),
+    each crossed hop's own `RotaryEmbedding` `num_heads` attribute (when
+    nonzero) and post-norm `Reshape` target-width constant are rewritten to
+    that branch's new post-pruning head count/flat width -- neither a
+    crossed norm's own `scale` nor a `RotaryEmbedding`'s `cos_cache`/
+    `sin_cache` ever needs touching (both confirmed head-independent -- see
+    this module's own "Attention-head pruning" section comment).
 
     Returns ``(producer_weight_names, consumer_weight_name,
     stale_output_names)`` on success, or ``None`` if `sparsity` rounds to no
@@ -11141,8 +11537,38 @@ def _apply_one_gqa_chain(
                 onnx.numpy_helper.from_array(dims, name=shape_init.name)
             )
 
+    # Q's/K's own per-head norm + RoPE pass-through, if either branch
+    # crossed one (see :class:`_QKNormRopePassThrough`'s own docstring for
+    # why neither a crossed norm's own `scale` nor a crossed
+    # `RotaryEmbedding`'s `cos_cache`/`sin_cache` ever needs touching --
+    # only these two constants do): `new_branch_width`/`new_branch_heads`
+    # are Q's own post-pruning `num_heads`/flat width for `.q_norm_rope`,
+    # K's own post-pruning `kv_num_heads`/flat width (K's own head_size
+    # equals Q's/K's shared `d`, already confirmed at match time) for
+    # `.k_norm_rope`.
+    for hop, new_branch_heads, new_branch_width in (
+        (chain.q_norm_rope, new_num_heads, new_num_heads * d),
+        (chain.k_norm_rope, new_kv_num_heads, new_kv_num_heads * d),
+    ):
+        if hop is None:
+            continue
+        if hop.rotary_node is not None:
+            for attr in hop.rotary_node.attribute:
+                if attr.name == "num_heads" and attr.i != 0:
+                    attr.i = new_branch_heads
+        if hop.reshape_shape is not None:
+            shape_init = initializer_map[hop.reshape_shape]
+            dims = onnx.numpy_helper.to_array(shape_init).copy()
+            dims[-1] = new_branch_width
+            shape_init.CopyFrom(
+                onnx.numpy_helper.from_array(dims, name=shape_init.name)
+            )
+
     stale = {chain.node.output[0]}
     stale.update(op.output[0] for op, _ in chain.chain_ops)
+    for hop in (chain.q_norm_rope, chain.k_norm_rope):
+        if hop is not None:
+            stale.update(n.output[0] for n in hop.nodes if n.output and n.output[0])
     return (
         {chain.q_weight, chain.k_weight, chain.v_weight},
         chain.consumer_weight,
