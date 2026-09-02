@@ -13762,6 +13762,72 @@ def _qmoe_quantize(w, bits, zero_point=None):
     return packed, scale, dequant
 
 
+def _qmoe_quantize_channel_blockwise(w, bits, block_size, zero_point=None):
+    """Reference (onnxsim-code-free) per-``block_size``-group symmetric QMoE
+    quantizer for `block_size` set: `w` is one expert's own ``[N, K]`` float
+    weight, quantized independently per ``block_size``-sized group along `K`
+    -- mirrors :func:`_qmoe_quantize_channel`'s whole-row case one level
+    finer-grained (each group is its own independent "whole row"). Returns
+    ``(packed [N, K/pack] uint8, scale [N, K // block_size] float32, dequant
+    [N, K] float32)`` -- weight packing is still the flat,
+    block-boundary-oblivious low-index-in-low-bits convention (confirmed
+    empirically, see onnxsim/pruning.py's own section comment, point 3),
+    not restarted at each block. `zero_point`, when given, is a per-``(N,
+    K-block)`` ``[N, K // block_size]`` int array; otherwise every group
+    uses the schema's own documented default, ``2 ** (bits - 1)``.
+    """
+    n, k = w.shape
+    pack = 8 // bits
+    kb = k // block_size
+    qmin, qmax = -(1 << (bits - 1)), (1 << (bits - 1)) - 1
+    default_zp = 1 << (bits - 1)
+    zp = (
+        np.full((n, kb), default_zp, dtype=np.int64)
+        if zero_point is None
+        else np.asarray(zero_point, dtype=np.int64)
+    )
+    w_blocks = w.reshape(n, kb, block_size)
+    scale = np.abs(w_blocks).max(axis=-1) / float(-qmin)
+    scale = np.maximum(scale, np.finfo(np.float32).eps).astype(np.float32)
+    q = (
+        np.clip(np.round(w_blocks / scale[..., None]), qmin, qmax).astype(np.int64)
+        + zp[..., None]
+    )
+    q = np.clip(q, 0, (1 << bits) - 1).astype(np.uint8)
+    q_flat = q.reshape(n, k)
+    parts = [(q_flat[:, i::pack] & ((1 << bits) - 1)) for i in range(pack)]
+    packed = np.zeros_like(parts[0])
+    for i, p in enumerate(parts):
+        packed = packed | (p << (bits * i))
+    packed = packed.astype(np.uint8)
+    dequant = (q.astype(np.float32) - zp[..., None].astype(np.float32)) * scale[
+        ..., None
+    ]
+    dequant = dequant.reshape(n, k)
+    return packed, scale, dequant
+
+
+def _qmoe_quantize_blockwise(w, bits, block_size, zero_point=None):
+    """Batched (per-expert) :func:`_qmoe_quantize_channel_blockwise`: `w` is
+    ``[E, N, K]``. Returns ``(packed [E, N, K/pack], scale [E, N, K //
+    block_size], dequant [E, N, K])``.
+    """
+    e, n, k = w.shape
+    pack = 8 // bits
+    kb = k // block_size
+    packed = np.zeros((e, n, k // pack), dtype=np.uint8)
+    scale = np.zeros((e, n, kb), dtype=np.float32)
+    dequant = np.zeros_like(w)
+    for ei in range(e):
+        packed[ei], scale[ei], dequant[ei] = _qmoe_quantize_channel_blockwise(
+            w[ei],
+            bits,
+            block_size,
+            zero_point=None if zero_point is None else zero_point[ei],
+        )
+    return packed, scale, dequant
+
+
 def _pack_vals(vals, bits):
     """Independent sub-byte packer for a generic array of already-quantized
     ``uint8`` values in ``[0, 2**bits)`` on its own last axis -- used to
@@ -13923,6 +13989,7 @@ def _qmoe_router_model(
     k=2,
     tokens=6,
     use_sparse_mixer=0,
+    block_size=0,
     extra_router_consumer=False,
     tied_router_weight_elsewhere=False,
 ):
@@ -13972,17 +14039,22 @@ def _qmoe_router_model(
         node_inputs[12] = "FC2ZP"
         inits.append(_u8(fc2_zp, "FC2ZP"))
 
+    qmoe_kwargs = dict(
+        k=k,
+        activation_type=activation,
+        expert_weight_bits=bits,
+        quant_type="int",
+        use_sparse_mixer=use_sparse_mixer,
+    )
+    if block_size:
+        qmoe_kwargs["block_size"] = block_size
     qmoe_node = onnx.helper.make_node(
         "QMoE",
         node_inputs,
         ["Y"],
         domain="com.microsoft",
         name="qmoe",
-        k=k,
-        activation_type=activation,
-        expert_weight_bits=bits,
-        quant_type="int",
-        use_sparse_mixer=use_sparse_mixer,
+        **qmoe_kwargs,
     )
     nodes = [router_node, qmoe_node]
     outs = list(outputs)
@@ -14026,6 +14098,7 @@ def _qmoe_router_masking_oracle(
     fc1_bias=None,
     activation="relu",
     tokens=6,
+    block_size=0,
 ):
     # Same-shape model with every `dropped` expert's routing logit forced to
     # -1e9 (Softmax assigns it exactly 0 probability) and its own fc1/fc2
@@ -14061,6 +14134,7 @@ def _qmoe_router_masking_oracle(
         activation=activation,
         k=k,
         tokens=tokens,
+        block_size=block_size,
     )
 
 
@@ -14250,6 +14324,306 @@ def test_qmoe_expert_channel_pruning_survivor_count_floored_to_pack_multiple():
     assert not np.isnan(out_pruned).any()
 
 
+def _qmoe_block_keep_reference(importance, n, block_size, sparsity):
+    # Independent (onnxsim-code-free) re-derivation of
+    # :func:`_qmoe_block_aligned_keep`'s own algorithm, used by the tests
+    # below to compute the *expected* keep-set without calling into
+    # production code at all.
+    num_blocks = n // block_size
+    block_importance = np.sqrt(
+        np.sum(importance.reshape(num_blocks, block_size) ** 2, axis=1)
+    )
+    keep_blocks_count = max(1, num_blocks - round(num_blocks * sparsity))
+    keep_block_idx = np.sort(np.argsort(-block_importance)[:keep_blocks_count])
+    keep = np.arange(n).reshape(num_blocks, block_size)[keep_block_idx].reshape(-1)
+    return keep, keep_block_idx
+
+
+def test_qmoe_expert_channel_pruning_blockwise_int_matches_hand_built_presliced_reference():
+    # Blockwise counterpart of
+    # test_qmoe_expert_channel_pruning_matches_hand_built_presliced_reference:
+    # a dedicated, independently hand-built "already pruned" reference QMoE
+    # node, including non-default per-(N, K-block) fc1_zero_points AND
+    # fc2_zero_points operands (exercising both packed-zero_points slicing
+    # paths this section's own top comment describes for the blockwise case
+    # -- fc1's is now a plain N-axis row-slice since blocking moved its own
+    # packed axis off of N, fc2's is a block-index unpack/select/repack).
+    E, hidden, inter, bits, block_size, tokens = 3, 32, 64, 4, 16, 6
+    hidden_blocks, inter_blocks = hidden // block_size, inter // block_size
+    rng = np.random.default_rng(311)
+    fc1_w = (rng.standard_normal((E, inter, hidden)) * 0.3).astype(np.float32)
+    fc2_w = (rng.standard_normal((E, hidden, inter)) * 0.3).astype(np.float32)
+    fc1_b = rng.standard_normal((E, inter)).astype(np.float32)
+    fc1_zp_vals = rng.integers(4, 12, size=(E, inter, hidden_blocks))
+    fc2_zp_vals = rng.integers(4, 12, size=(E, hidden, inter_blocks))
+
+    fc1_q, fc1_s, fc1_dq = _qmoe_quantize_blockwise(
+        fc1_w, bits, block_size, zero_point=fc1_zp_vals
+    )
+    fc2_q, fc2_s, fc2_dq = _qmoe_quantize_blockwise(
+        fc2_w, bits, block_size, zero_point=fc2_zp_vals
+    )
+    fc1_zp = _pack_vals(fc1_zp_vals, bits)
+    fc2_zp = _pack_vals(fc2_zp_vals, bits)
+
+    model = _qmoe_model(
+        fc1_q,
+        fc1_s,
+        fc2_q,
+        fc2_s,
+        bits,
+        fc1_bias=fc1_b,
+        fc1_zp=fc1_zp,
+        fc2_zp=fc2_zp,
+        block_size=block_size,
+        k=2,
+        tokens=tokens,
+    )
+    onnx.checker.check_model(model)
+
+    pruned = onnxsim.apply_qmoe_expert_channel_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    importance = np.sqrt(
+        np.sum(fc1_dq**2, axis=(0, 2))
+        + np.sum(fc2_dq**2, axis=(0, 1))
+        + np.sum(fc1_b**2, axis=0)
+    )
+    # inter=64, block_size=16 -> 4 blocks; sparsity=0.5 -> keep 4-round(4*0.5)=2
+    keep, keep_block_idx = _qmoe_block_keep_reference(
+        importance, inter, block_size, 0.5
+    )
+    assert len(keep) == 32  # block-aligned: an exact multiple of block_size
+    assert set(keep_block_idx.tolist()).issubset(range(inter_blocks))
+
+    inits = _qmoe_inits(pruned)
+    np.testing.assert_array_equal(inits["FC1Q"], fc1_q[:, keep, :])
+    np.testing.assert_array_equal(inits["FC1S"], fc1_s[:, keep, :])
+    np.testing.assert_array_equal(inits["FC1B"], fc1_b[:, keep])
+    # fc1_zero_points' own packed axis is the trailing hidden_blocks one
+    # (unaffected by an N/inter_size slice) -- a plain row-slice of the
+    # already-packed bytes, cross-checked against an independent re-pack of
+    # the sliced *unpacked* values too.
+    np.testing.assert_array_equal(inits["FC1ZP"], fc1_zp[:, keep, :])
+    np.testing.assert_array_equal(
+        inits["FC1ZP"], _pack_vals(fc1_zp_vals[:, keep, :], bits)
+    )
+
+    expected_fc2_q = _pack_vals(_unpack_vals(fc2_q, bits, inter)[:, :, keep], bits)
+    np.testing.assert_array_equal(inits["FC2Q"], expected_fc2_q)
+    np.testing.assert_array_equal(inits["FC2S"], fc2_s[:, :, keep_block_idx])
+    expected_fc2_zp = _pack_vals(
+        _unpack_vals(fc2_zp, bits, inter_blocks)[:, :, keep_block_idx], bits
+    )
+    np.testing.assert_array_equal(inits["FC2ZP"], expected_fc2_zp)
+
+    # Unlike the whole-row case, a block-aligned keep-set means every
+    # SURVIVING block's own values (and therefore its own scale/zero_point)
+    # are completely untouched by dropping other blocks -- so, unlike fc2's
+    # own whole-row scale in the no-block_size case, freshly re-quantizing
+    # the *sliced float* fc2 weights from scratch (one block at a time)
+    # reproduces byte-identical packed/scale/zero_point tensors to slicing
+    # the already-quantized ones above. Confirmed directly here (not just
+    # asserted) before it's relied on to build the ORT reference below.
+    fc2_q_fresh, fc2_s_fresh, _ = _qmoe_quantize_blockwise(
+        fc2_w[:, :, keep],
+        bits,
+        block_size,
+        zero_point=fc2_zp_vals[:, :, keep_block_idx],
+    )
+    np.testing.assert_array_equal(fc2_q_fresh, expected_fc2_q)
+    np.testing.assert_array_equal(fc2_s_fresh, fc2_s[:, :, keep_block_idx])
+
+    fc1_q_ref, fc1_s_ref, _ = _qmoe_quantize_blockwise(
+        fc1_w[:, keep, :], bits, block_size, zero_point=fc1_zp_vals[:, keep, :]
+    )
+    reference = _qmoe_model(
+        fc1_q_ref,
+        fc1_s_ref,
+        fc2_q_fresh,
+        fc2_s_fresh,
+        bits,
+        fc1_bias=fc1_b[:, keep],
+        fc1_zp=_pack_vals(fc1_zp_vals[:, keep, :], bits),
+        fc2_zp=_pack_vals(fc2_zp_vals[:, :, keep_block_idx], bits),
+        block_size=block_size,
+        k=2,
+        tokens=tokens,
+    )
+    onnx.checker.check_model(reference)
+
+    feed_rng = np.random.default_rng(313)
+    feeds = {
+        "X": (feed_rng.standard_normal((tokens, hidden)) * 0.2).astype(np.float32),
+        "R": feed_rng.standard_normal((tokens, E)).astype(np.float32),
+    }
+    (out_pruned,) = _run(pruned, feeds)
+    (out_ref,) = _run(reference, feeds)
+    np.testing.assert_allclose(out_pruned, out_ref, rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.parametrize("bits", [2, 8])
+def test_qmoe_expert_channel_pruning_blockwise_int_matches_hand_built_reference_other_bit_widths(
+    bits,
+):
+    # Same blockwise oracle as above, for the two other supported
+    # expert_weight_bits values (4 is covered above) -- confirms
+    # block_size % pack == 0 (this pass's own required alignment) holds and
+    # the same production code path generalizes correctly for pack in
+    # {4, 1} too (block_size=16 is a multiple of both).
+    E, hidden, inter, block_size, tokens = 2, 32, 32, 16, 5
+    rng = np.random.default_rng(320 + bits)
+    fc1_w = (rng.standard_normal((E, inter, hidden)) * 0.3).astype(np.float32)
+    fc2_w = (rng.standard_normal((E, hidden, inter)) * 0.3).astype(np.float32)
+    fc1_q, fc1_s, fc1_dq = _qmoe_quantize_blockwise(fc1_w, bits, block_size)
+    fc2_q, fc2_s, fc2_dq = _qmoe_quantize_blockwise(fc2_w, bits, block_size)
+    model = _qmoe_model(
+        fc1_q, fc1_s, fc2_q, fc2_s, bits, block_size=block_size, k=1, tokens=tokens
+    )
+    onnx.checker.check_model(model)
+
+    pruned = onnxsim.apply_qmoe_expert_channel_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    importance = np.sqrt(
+        np.sum(fc1_dq**2, axis=(0, 2)) + np.sum(fc2_dq**2, axis=(0, 1))
+    )
+    # inter=32, block_size=16 -> 2 blocks; sparsity=0.5 -> keep 2-round(2*0.5)=1
+    keep, keep_block_idx = _qmoe_block_keep_reference(
+        importance, inter, block_size, 0.5
+    )
+    assert len(keep) == 16
+
+    inits = _qmoe_inits(pruned)
+    np.testing.assert_array_equal(inits["FC1Q"], fc1_q[:, keep, :])
+    expected_fc2_q = _pack_vals(_unpack_vals(fc2_q, bits, inter)[:, :, keep], bits)
+    np.testing.assert_array_equal(inits["FC2Q"], expected_fc2_q)
+    np.testing.assert_array_equal(inits["FC2S"], fc2_s[:, :, keep_block_idx])
+
+    fc1_q_ref, fc1_s_ref, _ = _qmoe_quantize_blockwise(
+        fc1_w[:, keep, :], bits, block_size
+    )
+    fc2_q_ref, fc2_s_ref, _ = _qmoe_quantize_blockwise(
+        fc2_w[:, :, keep], bits, block_size
+    )
+    np.testing.assert_array_equal(fc2_q_ref, expected_fc2_q)
+    reference = _qmoe_model(
+        fc1_q_ref,
+        fc1_s_ref,
+        fc2_q_ref,
+        fc2_s_ref,
+        bits,
+        block_size=block_size,
+        k=1,
+        tokens=tokens,
+    )
+    onnx.checker.check_model(reference)
+
+    feed_rng = np.random.default_rng(323 + bits)
+    feeds = {
+        "X": (feed_rng.standard_normal((tokens, hidden)) * 0.2).astype(np.float32),
+        "R": feed_rng.standard_normal((tokens, E)).astype(np.float32),
+    }
+    (out_pruned,) = _run(pruned, feeds)
+    (out_ref,) = _run(reference, feeds)
+    np.testing.assert_allclose(out_pruned, out_ref, rtol=1e-5, atol=1e-5)
+
+
+def test_qmoe_expert_channel_pruning_blockwise_int_keep_set_floored_to_block_multiple():
+    # The naive, channel-granularity target this pass's own no-block_size
+    # path would compute -- n - round(n * sparsity) -- need NOT itself be a
+    # multiple of block_size, even after flooring to a multiple of pack:
+    # inter=48, block_size=16 (3 blocks), sparsity=0.4 -> naive channel-level
+    # target = 48 - round(48*0.4) = 29, floored to pack=2 multiple -> 28 --
+    # not a multiple of block_size (16). The actual block-granularity
+    # computation this pass uses instead -- 3 - round(3*0.4) = 2 blocks kept
+    # -- correctly resolves to 32 survivors (a clean multiple of
+    # block_size), never 28 or any other non-block-aligned count. This is
+    # confirmed both by the resulting shape below AND by a real ORT run
+    # matching an independently hand-built reference (not merely inferred
+    # from the shape alone).
+    # hidden is deliberately >= 2*block_size (hidden_blocks >= 2): a real CPU
+    # QMoE kernel bug (confirmed empirically, independent of pruning
+    # entirely -- reproduced against a hand-built, never-pruned node too)
+    # makes fc2_scales' own expected block-axis size collapse to 1
+    # regardless of inter_size's own block count whenever hidden_size ==
+    # block_size (hidden_blocks == 1) -- irrelevant to this pass's own
+    # correctness (an already-broken-for-this-kernel model stays broken the
+    # same way whether pruned or not), but avoided here so this test's own
+    # real ORT run below exercises the flooring logic, not that unrelated
+    # kernel quirk.
+    E, hidden, inter, bits, block_size, tokens = 2, 32, 48, 4, 16, 5
+    rng = np.random.default_rng(331)
+    fc1_w = (rng.standard_normal((E, inter, hidden)) * 0.3).astype(np.float32)
+    fc2_w = (rng.standard_normal((E, hidden, inter)) * 0.3).astype(np.float32)
+    fc1_q, fc1_s, fc1_dq = _qmoe_quantize_blockwise(fc1_w, bits, block_size)
+    fc2_q, fc2_s, fc2_dq = _qmoe_quantize_blockwise(fc2_w, bits, block_size)
+    model = _qmoe_model(
+        fc1_q, fc1_s, fc2_q, fc2_s, bits, block_size=block_size, k=1, tokens=tokens
+    )
+    onnx.checker.check_model(model)
+
+    naive_channel_target = inter - round(inter * 0.4)
+    naive_floored_to_pack = (naive_channel_target // (8 // bits)) * (8 // bits)
+    assert naive_floored_to_pack % block_size != 0  # the hazard this test guards
+
+    pruned = onnxsim.apply_qmoe_expert_channel_pruning(model, sparsity=0.4)
+    onnx.checker.check_model(pruned)
+
+    inits = _qmoe_inits(pruned)
+    new_inter = inits["FC1Q"].shape[1]
+    assert new_inter == 32  # 3 blocks -> keep 3-round(3*0.4)=2 -> 32, not 28
+    assert new_inter % block_size == 0
+
+    importance = np.sqrt(
+        np.sum(fc1_dq**2, axis=(0, 2)) + np.sum(fc2_dq**2, axis=(0, 1))
+    )
+    keep, keep_block_idx = _qmoe_block_keep_reference(
+        importance, inter, block_size, 0.4
+    )
+    np.testing.assert_array_equal(inits["FC1Q"], fc1_q[:, keep, :])
+
+    fc1_q_ref, fc1_s_ref, _ = _qmoe_quantize_blockwise(
+        fc1_w[:, keep, :], bits, block_size
+    )
+    fc2_q_ref, fc2_s_ref, _ = _qmoe_quantize_blockwise(
+        fc2_w[:, :, keep], bits, block_size
+    )
+    reference = _qmoe_model(
+        fc1_q_ref,
+        fc1_s_ref,
+        fc2_q_ref,
+        fc2_s_ref,
+        bits,
+        block_size=block_size,
+        k=1,
+        tokens=tokens,
+    )
+    onnx.checker.check_model(reference)
+
+    feed_rng = np.random.default_rng(337)
+    feeds = {
+        "X": (feed_rng.standard_normal((tokens, hidden)) * 0.2).astype(np.float32),
+        "R": feed_rng.standard_normal((tokens, E)).astype(np.float32),
+    }
+    (out_pruned,) = _run(pruned, feeds)
+    (out_ref,) = _run(reference, feeds)
+    np.testing.assert_allclose(out_pruned, out_ref, rtol=1e-5, atol=1e-5)
+
+
+def test_qmoe_expert_channel_pruning_blockwise_int_zero_sparsity_is_a_no_op():
+    E, hidden, inter, bits, block_size = 2, 16, 32, 4, 16
+    rng = np.random.default_rng(341)
+    fc1_w = (rng.standard_normal((E, inter, hidden)) * 0.3).astype(np.float32)
+    fc2_w = (rng.standard_normal((E, hidden, inter)) * 0.3).astype(np.float32)
+    fc1_q, fc1_s, _ = _qmoe_quantize_blockwise(fc1_w, bits, block_size)
+    fc2_q, fc2_s, _ = _qmoe_quantize_blockwise(fc2_w, bits, block_size)
+    model = _qmoe_model(fc1_q, fc1_s, fc2_q, fc2_s, bits, block_size=block_size)
+    pruned = onnxsim.apply_qmoe_expert_channel_pruning(model, sparsity=0.0)
+    inits = _qmoe_inits(pruned)
+    np.testing.assert_array_equal(inits["FC1Q"], fc1_q)
+
+
 def test_qmoe_expert_channel_pruning_zero_sparsity_is_a_no_op():
     E, hidden, inter, bits = 2, 6, 8, 4
     rng = np.random.default_rng(239)
@@ -14325,17 +14699,78 @@ def test_qmoe_expert_channel_pruning_declines_nonzero_swiglu_fusion():
     np.testing.assert_array_equal(inits["FC1Q"], fc1_q)
 
 
-def test_qmoe_expert_channel_pruning_declines_block_size():
-    # block_size present (even a schema-valid value, >= 16) selects a
-    # different scale/zero_point rank this pass's own packed-slicing was
-    # never verified against -- declined outright regardless of value.
-    E, hidden, inter, bits = 2, 32, 8, 4
+def test_qmoe_expert_channel_pruning_declines_block_size_below_kernel_floor():
+    # block_size=8 is below the CPU kernel's own floor -- "block_size must
+    # be >= 16 when provided" (re-confirmed live, see onnxsim/pruning.py's
+    # own section comment, point 3) -- declined outright before this pass
+    # even looks at fc1_scales'/fc2_scales' own (blockwise-shaped) rank.
+    E, hidden, inter, bits = 2, 32, 16, 4
     rng = np.random.default_rng(269)
     fc1_w = (rng.standard_normal((E, inter, hidden)) * 0.3).astype(np.float32)
     fc2_w = (rng.standard_normal((E, hidden, inter)) * 0.3).astype(np.float32)
-    fc1_q, fc1_s, _ = _qmoe_quantize(fc1_w, bits)
+    block_size = 8
+    fc1_q, fc1_s, _ = _qmoe_quantize_blockwise(fc1_w, bits, block_size)
+    fc2_q, fc2_s, _ = _qmoe_quantize_blockwise(fc2_w, bits, block_size)
+    model = _qmoe_model(fc1_q, fc1_s, fc2_q, fc2_s, bits, block_size=block_size)
+    pruned = onnxsim.apply_qmoe_expert_channel_pruning(model, sparsity=0.5)
+    inits = _qmoe_inits(pruned)
+    np.testing.assert_array_equal(inits["FC1Q"], fc1_q)
+
+
+def test_qmoe_expert_channel_pruning_declines_block_size_not_pack_aligned():
+    # block_size=17 is >= 16 and divides hidden_size/inter_size evenly, but
+    # isn't a multiple of pack (8 // expert_weight_bits == 2 for bits=4) --
+    # this pass's own deliberately narrowed scope (every real block_size a
+    # real export would use -- 16/32/64/128 -- already is a multiple of
+    # pack; see onnxsim/pruning.py's own section comment, point 3), so this
+    # is declined defensively rather than assumed to also work.
+    E, hidden, inter, bits, block_size = 2, 34, 34, 4, 17
+    rng = np.random.default_rng(270)
+    fc1_w = (rng.standard_normal((E, inter, hidden)) * 0.3).astype(np.float32)
+    fc2_w = (rng.standard_normal((E, hidden, inter)) * 0.3).astype(np.float32)
+    fc1_q, fc1_s, _ = _qmoe_quantize_blockwise(fc1_w, bits, block_size)
+    fc2_q, fc2_s, _ = _qmoe_quantize_blockwise(fc2_w, bits, block_size)
+    model = _qmoe_model(fc1_q, fc1_s, fc2_q, fc2_s, bits, block_size=block_size)
+    pruned = onnxsim.apply_qmoe_expert_channel_pruning(model, sparsity=0.5)
+    inits = _qmoe_inits(pruned)
+    np.testing.assert_array_equal(inits["FC1Q"], fc1_q)
+
+
+def test_qmoe_expert_channel_pruning_declines_block_size_not_dividing_evenly():
+    # block_size=16 doesn't divide inter_size=24 evenly (a partial/padded
+    # final block) -- declined the same way every other shape mismatch in
+    # this section is (fc2_scales'/fc2_zero_points' own expected block-axis
+    # shape never matches).
+    E, hidden, inter, bits, block_size = 2, 32, 24, 4, 16
+    rng = np.random.default_rng(271)
+    fc1_w = (rng.standard_normal((E, inter, hidden)) * 0.3).astype(np.float32)
+    fc2_w = (rng.standard_normal((E, hidden, inter)) * 0.3).astype(np.float32)
+    fc1_q, fc1_s, _ = _qmoe_quantize(fc1_w, bits)  # whole-row -- inter=24 doesn't
+    # divide by block_size=16, so a genuinely blockwise fc1_scale can't even be
+    # built for this shape; the whole-row quantizer stands in fine here since
+    # the matcher declines before ever inspecting fc1_scales' own shape.
     fc2_q, fc2_s, _ = _qmoe_quantize(fc2_w, bits)
-    model = _qmoe_model(fc1_q, fc1_s, fc2_q, fc2_s, bits, block_size=16)
+    model = _qmoe_model(fc1_q, fc1_s, fc2_q, fc2_s, bits, block_size=block_size)
+    pruned = onnxsim.apply_qmoe_expert_channel_pruning(model, sparsity=0.5)
+    inits = _qmoe_inits(pruned)
+    np.testing.assert_array_equal(inits["FC1Q"], fc1_q)
+
+
+def test_qmoe_expert_channel_pruning_declines_fp4_with_block_size():
+    # quant_type='fp4' remains explicitly out of scope regardless of
+    # block_size (a materially different MXFP block-scaled tensor format,
+    # not this pass's own int block_size handling at all -- see
+    # onnxsim/pruning.py's own section comment, points 1 and 3) -- declined
+    # before block_size is even inspected.
+    E, hidden, inter, bits, block_size = 2, 32, 32, 4, 16
+    rng = np.random.default_rng(272)
+    fc1_w = (rng.standard_normal((E, inter, hidden)) * 0.3).astype(np.float32)
+    fc2_w = (rng.standard_normal((E, hidden, inter)) * 0.3).astype(np.float32)
+    fc1_q, fc1_s, _ = _qmoe_quantize_blockwise(fc1_w, bits, block_size)
+    fc2_q, fc2_s, _ = _qmoe_quantize_blockwise(fc2_w, bits, block_size)
+    model = _qmoe_model(
+        fc1_q, fc1_s, fc2_q, fc2_s, bits, block_size=block_size, quant_type="fp4"
+    )
     pruned = onnxsim.apply_qmoe_expert_channel_pruning(model, sparsity=0.5)
     inits = _qmoe_inits(pruned)
     np.testing.assert_array_equal(inits["FC1Q"], fc1_q)
@@ -14563,6 +14998,85 @@ def test_qmoe_whole_expert_pruning_matches_ort_masking_oracle():
     onnx.checker.check_model(masked)
 
     feed_rng = np.random.default_rng(107)
+    feeds = {"X": feed_rng.standard_normal((tokens, hidden)).astype(np.float32) * 0.3}
+    (out_pruned,) = _run(pruned, feeds)
+    (out_masked,) = _run(masked, feeds)
+    np.testing.assert_allclose(out_pruned, out_masked, rtol=1e-4, atol=1e-4)
+
+
+def test_qmoe_whole_expert_pruning_blockwise_int_matches_hand_built_reference():
+    # Confirms this section's own top comment, point 8: whole-expert pruning
+    # needs no block_size-specific handling at all -- every per-expert
+    # tensor keeps num_experts as its own leading axis regardless of
+    # block_size, so the exact same generic leading-axis slice this pass
+    # already uses for the no-block_size case works unmodified here too.
+    # hidden/inter are both >= 2*block_size (hidden_blocks/inter_blocks >=
+    # 2) to steer clear of the unrelated real-kernel quirk documented in
+    # onnxsim/pruning.py's own section comment (point 3).
+    E, hidden, inter, bits, block_size, tokens = 5, 32, 32, 4, 16, 10
+    rng = np.random.default_rng(111)
+    fc1_w = (rng.standard_normal((E, inter, hidden)) * 0.3).astype(np.float32)
+    fc2_w = (rng.standard_normal((E, hidden, inter)) * 0.3).astype(np.float32)
+    fc1_b = rng.standard_normal((E, inter)).astype(np.float32)
+    router_w = (rng.standard_normal((hidden, E)) * 0.2).astype(np.float32)
+    router_b = rng.standard_normal(E).astype(np.float32)
+    k = 2
+    fc1_q, fc1_s, _ = _qmoe_quantize_blockwise(fc1_w, bits, block_size)
+    fc2_q, fc2_s, _ = _qmoe_quantize_blockwise(fc2_w, bits, block_size)
+    model = _qmoe_router_model(
+        fc1_q,
+        fc1_s,
+        fc2_q,
+        fc2_s,
+        bits,
+        router_w,
+        router_b=router_b,
+        fc1_bias=fc1_b,
+        k=k,
+        tokens=tokens,
+        block_size=block_size,
+    )
+    onnx.checker.check_model(model)
+
+    calib_rng = np.random.default_rng(113)
+    calibration_data = [
+        {"X": calib_rng.standard_normal((tokens, hidden)).astype(np.float32)}
+        for _ in range(4)
+    ]
+    pruned = onnxsim.apply_qmoe_whole_expert_pruning(
+        model, calibration_data=calibration_data, sparsity=0.4
+    )
+    onnx.checker.check_model(pruned)
+    inits = _qmoe_inits(pruned)
+    assert inits["FC1Q"].shape == (3, inter, hidden // 2)
+    assert inits["FC1S"].shape == (3, inter, hidden // block_size)
+    assert inits["RW"].shape == (hidden, 3)
+    assert inits["FC1B"].shape == (3, inter)
+
+    kept_router_w = inits["RW"]
+    dropped = [
+        e
+        for e in range(E)
+        if not any(np.allclose(router_w[:, e], kept_router_w[:, i]) for i in range(3))
+    ]
+    assert len(dropped) == 2
+    masked = _qmoe_router_masking_oracle(
+        fc1_q,
+        fc1_s,
+        fc2_q,
+        fc2_s,
+        bits,
+        router_w,
+        router_b,
+        dropped,
+        k,
+        fc1_bias=fc1_b,
+        tokens=tokens,
+        block_size=block_size,
+    )
+    onnx.checker.check_model(masked)
+
+    feed_rng = np.random.default_rng(117)
     feeds = {"X": feed_rng.standard_normal((tokens, hidden)).astype(np.float32) * 0.3}
     (out_pruned,) = _run(pruned, feeds)
     (out_masked,) = _run(masked, feeds)
