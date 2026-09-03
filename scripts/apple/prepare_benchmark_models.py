@@ -9,12 +9,14 @@ produce the actual decode tok/s and peak-RSS numbers this whole `scripts/apple`
 directory exists to measure (see that script's and `export_llm_to_coreml.py`'s
 docstrings for what those numbers do and don't mean).
 
-`BENCHMARK_MODELS` targets the same weight class DeviceMark's own on-device LLM
-leaderboard tests (https://devicemark.github.io/, roughly 1-4B parameters),
-spanning a few architecture families (Llama-style, Qwen2, Phi-3) rather than
-just one, since `onnxsim/coreml_export.py`'s translator is a hand-written
-ONNX-to-MIL mapping and different architectures exercise different op
-combinations.
+`BENCHMARK_MODELS` targets the same rough weight class DeviceMark's own
+on-device LLM leaderboard tests (https://devicemark.github.io/, roughly
+0.8-5B parameters; its own current roster -- Qwen3.5, LFM2.5, Granite-4.0-H,
+and others, none of them below -- runs on a private on-device engine, not
+Core ML; see `bench/TODO_quality_retention_eval.md`), spanning a few
+architecture families (Llama-style, Qwen2, Phi-3) rather than just one, since
+`onnxsim/coreml_export.py`'s translator is a hand-written ONNX-to-MIL mapping
+and different architectures exercise different op combinations.
 
 A few model families in that weight class require accepting a license on
 Hugging Face and an authenticated `HF_TOKEN` to even download.

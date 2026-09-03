@@ -5,9 +5,15 @@ The counterpart to `export_llm_to_coreml.py`: loads the `.mlpackage` that
 script produced (plus the tokenizer files it copied alongside it), greedily
 generates tokens, and reports decode tokens/second and peak resident memory --
 the same two axes DeviceMark's methodology measures on-device (see
-https://devicemark.github.io/ and its METHODOLOGY.md), computed the same way
-(wall-clock decode time on the actual runtime, RSS sampled during generation,
-prefill excluded from the decode-tok/s window).
+https://devicemark.github.io/methodology.html): wall-clock decode time on the
+actual runtime, RSS sampled during generation, prefill excluded from the
+decode-tok/s window. Not the same *protocol*, though: DeviceMark measures
+warm-state (post-specialization) decode over a 128-token prompt / 256-token
+decode, two trials on a settled device, on its own private on-device engine
+(not Core ML -- see bench/TODO_quality_retention_eval.md); this script runs a
+single short prompt/trial with no disclosed thermal settle, against a real
+Core ML `.mlpackage` -- good enough to catch this exporter's own regressions,
+not a number comparable to a DeviceMark board row.
 
 This only runs where Core ML actually executes models: macOS (loading the
 model calls into Apple's Core ML framework, which isn't part of coremltools

@@ -8,8 +8,11 @@ comparing the exported model to itself run twice. That is the "device"
 (here: real Core ML, exercised the same way the benchmark does -- prefill
 once, then one single-token forward pass per step reusing the growing KV
 cache) side of DeviceMark's device-vs-reference parity idea
-(https://devicemark.github.io/); the "HF" side is exactly what this script
-loads for the reference.
+(https://devicemark.github.io/methodology.html); the "HF" side is exactly
+what this script loads for the reference. DeviceMark's own parity gate is
+greedy **token-exact** (device text == Mac engine text == HF reference text,
+verbatim) before a row's speed number is trusted at all -- this script is
+deliberately looser than that, for a real reason:
 
 This is deliberately **not** a bit-exact/token-exact check. Core ML's
 `.mlpackage` runs in fp16 internally regardless of the ONNX graph's own
