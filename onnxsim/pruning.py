@@ -12807,6 +12807,589 @@ def apply_structured_pruning_matmul_nbits(
     return out
 
 
+# --- MatMulBnb4 (bitsandbytes FP4/NF4 block-quantized weight) structured ---
+# --- pruning -----------------------------------------------------------
+
+# ``com.microsoft::MatMulBnb4`` is ONNX Runtime's op for porting
+# bitsandbytes/QLoRA FP4- or NF4-quantized ``nn.Linear`` weights (Dettmers
+# et al., https://arxiv.org/pdf/2305.14314.pdf) directly into an ONNX graph
+# -- a real, shipped op (``onnxruntime.quantization.matmul_bnb4_quantizer``
+# is its own first-party quantizer), distinct from, and NOT the same packing
+# convention as, this module's own ``MatMulNBits`` section above. Every fact
+# below was confirmed empirically against this environment's live
+# onnxruntime (1.29.0) install, never assumed from the schema doc string or
+# extrapolated from ``MatMulNBits``'s own packing -- via
+# ``onnxruntime.capi.onnxruntime_pybind11_state.get_all_operator_schema()``
+# for the schema itself, reading ``onnxruntime.quantization.matmul_bnb4_quantizer``'s
+# own source for how a real model is produced, and a real
+# ``onnxruntime.InferenceSession`` identity-matrix round-trip (``A =
+# np.eye(K)``, which with the schema's own default ``transB=1`` recovers the
+# dequantized weight directly in its original ``[K, N]`` orientation) for
+# the packing layout and every one of the two ``quant_type`` dequantization
+# tables below -- see ``tests/test_pruning.py``'s own
+# ``test_matmul_bnb4_dequantized_matches_real_inference_session``
+# for the same round-trip re-run as an executable check:
+#
+#   * Inputs, in order, all required: ``A`` (T1: float32/float16/bfloat16,
+#     unquantized activation), ``B`` (T2: uint8 -- the packed weight),
+#     ``absmax`` (T1 -- one float scale per block). No ``bias``, no
+#     ``zero_points``, no ``g_idx`` -- unlike ``MatMulNBits``, this op has
+#     exactly three inputs, always.
+#   * Attributes: ``K``/``N`` (required ints, the logical unquantized
+#     weight's input/output feature counts -- same meaning as
+#     ``MatMulNBits``'s own), ``block_size`` (required int; live schema doc:
+#     "must be a power of 2 and not smaller than 16" -- and, exactly like
+#     ``MatMulNBits``, this environment's live CPU kernel additionally
+#     REJECTS anything outside ``{16, 32, 64, 128, 256}`` at run time with
+#     the identical error string ("only block size 16, 32, 64, 128, 256 are
+#     supported"), confirmed by attempting ``block_size=8``/``512`` and
+#     catching the real failure -- reuses
+#     :data:`_MATMUL_NBITS_VALID_BLOCK_SIZES` directly rather than
+#     duplicating that now-twice-confirmed set), ``quant_type`` (required
+#     int; 0 = FP4, 1 = NF4, per the live schema attribute doc), ``transB``
+#     (optional, default 1 per the schema's own serialized default-value
+#     proto -- ``transB=1`` is the "forward pass" orientation this section
+#     supports; ``transB=0`` is a distinct "backward pass" orientation where
+#     ``A``'s own trailing axis is ``N`` instead of ``K`` and the output is
+#     ``K``-wide instead of ``N``-wide, a training-time weight-gradient
+#     shape this module has no reason to ever see in an inference graph and
+#     has not verified -- always declined), ``training_mode`` (optional,
+#     default 0 -- always required to be 0/absent here for the same
+#     not-verified reason).
+#   * ``B``'s packing layout -- confirmed via ``matmul_bnb4_quantizer.py``'s
+#     own source (``bnb4_block_quant``: the ``[K, N]`` MatMul weight is
+#     transposed to ``[N, K]`` -- "aligned with how PyTorch defined the
+#     linear weight, e.g. [out_features, in_features]" -- then the WHOLE
+#     ``[N, K]`` array is flattened row-major and cut into fixed-size
+#     ``block_size`` chunks with NO row-boundary awareness at all) and
+#     independently re-derived from a real ``InferenceSession`` run rather
+#     than trusted from the source comment alone: ``B`` is a flat 1-D
+#     ``uint8`` tensor of shape ``[(N * K + 1) // 2]`` (two 4-bit codes per
+#     byte), and -- the one packing fact that genuinely differs from
+#     ``MatMulNBits``'s own -- nibbles are packed **HIGH nibble first**:
+#     flattened element ``2*i`` is byte ``i``'s HIGH nibble (``(byte >> 4) &
+#     0xF``) and flattened element ``2*i + 1`` is its LOW nibble (``byte &
+#     0xF``), the opposite of ``MatMulNBits``'s own confirmed "low nibble
+#     first" convention -- confirmed by hand-quantizing a monotonic ramp of
+#     16 known float values into one block, feeding it through a real
+#     ``MatMulBnb4`` node/``InferenceSession``, and checking which of the
+#     two nibble-order hypotheses actually produces a code sequence
+#     consistent with the observed dequantized output (only "high nibble
+#     first" does; "low nibble first" does not, ruling the other hypothesis
+#     out rather than assuming the answer). This was the one place the
+#     earlier survey's own packing-convention guess was checked against a
+#     hypothesis it could have gotten wrong, and it did differ from
+#     ``MatMulNBits`` in exactly this one respect.
+#   * ``absmax``: shape ``[(N * K + block_size - 1) // block_size]`` (one
+#     ``T1``-dtype scale per flattened block, ``ceil(N * K / block_size)``
+#     of them total) -- confirmed the same way.
+#   * The two ``quant_type`` dequantization tables (16 codes each, code ->
+#     float64 value) were fully, individually confirmed -- all 16 codes for
+#     BOTH ``quant_type`` values, each one isolated and read back through a
+#     real ``InferenceSession`` (never all 16 in one naive linear ramp,
+#     which does NOT hit every code for a non-uniformly-spaced table like
+#     NF4's own -- confirmed the hard way, then fixed by targeting specific
+#     value ranges per missing code) -- see
+#     :data:`_MATMUL_BNB4_FP4_CODES`/:data:`_MATMUL_BNB4_NF4_CODES` and
+#     ``tests/test_pruning.py``'s own
+#     ``test_matmul_bnb4_dequantized_matches_real_inference_session`` for the
+#     executable re-derivation. NF4's own 16 values matched the widely-
+#     published bitsandbytes ``create_normal_map()`` table exactly, to every
+#     printed digit; FP4's own matched a plain sign(MSB)/magnitude
+#     (3-bit e2m1-with-bias-3) structure (code XOR 8 negates the value;
+#     codes 0 and 8 both dequantize to 0.0) once all 16 were actually
+#     checked, not merely the dozen or so a naive ramp happens to hit. These
+#     tables are used ONLY for producer-side importance ranking
+#     (:func:`_matmul_bnb4_dequantized`) -- exactly ``MatMulNBits``'s own
+#     "slice, don't recompute" principle -- never written back to the graph;
+#     the actual apply-time rewrite always moves existing packed bytes
+#     verbatim, so an inaccurate ranking table could at worst yield a
+#     suboptimal keep-set, never a corrupted output.
+#
+# The row-alignment safety question the investigation set out to answer:
+# because ``B``/``absmax`` are packed by flattening the ENTIRE ``[N, K]``
+# array with no row-boundary awareness (unlike ``MatMulNBits``, whose own
+# ``B`` shape ``(N, k_blocks, blob_size)`` already keeps ``N`` as an
+# explicit, never-packed-across leading axis), a ``block_size``-sized block
+# stays entirely inside ONE output row's own ``K`` values -- and is
+# therefore safe to keep or drop as a whole unit when N-axis-pruning -- if
+# and only if ``block_size`` evenly divides ``K``: confirmed both
+# mathematically (row ``n`` occupies flat positions ``[n*K, (n+1)*K)``; a
+# block at ``[b*block_size, (b+1)*block_size)`` can only ever fall entirely
+# within one row's own range for every ``b`` when ``K`` is itself a
+# multiple of ``block_size``) and empirically (``K=24``, ``block_size=16``:
+# block 1, ``[16, 32)``, straddles the row-0/row-1 boundary at flat position
+# 24, verified directly against the real quantizer's own packed output --
+# see ``test_matmul_bnb4_pruning_declines_k_not_multiple_of_block_size``).
+# **This confirms the earlier survey's row-alignment hypothesis was
+# correct** -- it is exactly the safety condition this section gates N-axis
+# pruning on, matching this module's own "decline rather than mis-slice"
+# convention wherever an analogous alignment fails elsewhere (see
+# ``MatMulNBits``'s own ``K % block_size != 0`` decline, and the ``QDQ``/
+# ``GatherBlockQuantized`` families' own analogous block-alignment declines).
+#
+# When ``K % block_size == 0`` DOES hold, N-axis pruning turns out even
+# SIMPLER than ``MatMulNBits``'s own producer-side row-slice: because every
+# valid ``block_size`` is even (>= 16, a power of two) and ``K`` is
+# therefore always even too, row ``n``'s own packed bytes occupy EXACTLY
+# ``[n * (K // 2), (n + 1) * (K // 2))`` of ``B`` -- a whole number of bytes,
+# always -- so keeping/dropping whole rows is a plain byte-range slice with
+# NO nibble-level unpack/repack needed at all (unlike ``MatMulNBits``'s own
+# ``zero_points`` handling, which does need one for its own reasons). The
+# same holds for ``absmax``: row ``n`` owns exactly ``blocks_per_row = K //
+# block_size`` contiguous scale entries. :func:`_slice_matmul_bnb4_producer_rows`
+# is therefore a direct ``reshape(N, row_bytes)``/``reshape(N,
+# blocks_per_row)`` fancy-index-by-row, no bit manipulation at all.
+#
+# Scope boundaries this section lands on, deliberately (broadening any of
+# these is a safe follow-up; silently mishandling one is not):
+#
+#   * Only the PRODUCER (N-axis, output-channel) role is supported here --
+#     unlike ``MatMulNBits``'s own bidirectional producer/consumer matching,
+#     a ``MatMulBnb4`` node is never matched as a chain's CONSUMER. Pruning
+#     a ``MatMulBnb4`` weight's own ``K`` axis (input channels) would face
+#     the SAME whole-flattened-array packing this section's own top comment
+#     describes, but on the far harder axis: a block that stays inside one
+#     row for ANY row (when ``K % block_size == 0``) still spans every row's
+#     own identical relative column range at once, so dropping columns
+#     safely would require re-slicing every one of the consumer's own ``N``
+#     rows in lockstep -- a real, structurally different problem left to a
+#     follow-up, not attempted here.
+#   * The chain's CONSUMER (the other side of the chain, receiving this
+#     producer's output as its own input) is always a plain-float
+#     (directly-constant float32/float16/bfloat16 weight, no QDQ, no
+#     ``MatMulNBits``, no ``MatMulBnb4``) ``MatMul``/vanilla-``Gemm`` --
+#     :func:`_match_plain_matmul_nbits_peer`/:class:`_PlainMatMulNBitsPeer`,
+#     reused directly, unmodified, from the ``MatMulNBits`` section above
+#     (fully generic despite its name: nothing about it is
+#     ``MatMulNBits``-specific). Mixing a ``MatMulBnb4`` producer with a
+#     ``MatMulNBits`` OR another ``MatMulBnb4`` consumer remains out of
+#     scope for the same reason ``MatMulNBits`` itself never mixes with QDQ
+#     in one chain: composing two different quantization schemes' own
+#     re-slicing rules in one chain is a real but separate extension.
+#   * ``transB=0`` (the "backward pass" orientation) and ``training_mode !=
+#     0`` are always declined -- unverified semantics, see the schema-facts
+#     comment above.
+#   * ``quant_type`` outside ``{0, 1}`` (FP4/NF4) is declined -- the live
+#     schema documents only these two.
+#   * ``block_size`` outside ``{16, 32, 64, 128, 256}`` is declined -- the
+#     live CPU kernel rejects anything else at run time (see above).
+#   * ``K % block_size != 0`` (a block would straddle two output rows) is
+#     always declined -- the whole producer chain (this node, and its
+#     paired consumer) is left completely untouched, mirroring
+#     ``MatMulNBits``'s own identical-shaped decline for its own analogous
+#     alignment failure. See
+#     ``test_matmul_bnb4_pruning_declines_k_not_multiple_of_block_size``.
+#   * No grouped/gated (SwiGLU/GeGLU) pair, residual/skip-connection merge,
+#     or Concat-merged branch group is matched -- only the plain single
+#     producer -> [zero or more shape-preserving unary activations,
+#     `_UNARY_PASS_THROUGH`] -> single plain-float consumer topology,
+#     mirroring ``MatMulNBits``'s own identical scope decision (and, in
+#     turn, the QDQ section's own ``_walk_to_consumer_qdq``) for the same
+#     reason: this module's existing gated-MLP detection
+#     (:func:`_find_gated_chains`) is plain-float-chain machinery that does
+#     not apply to a block-quantized producer's own packed operands without
+#     the same kind of dedicated extension ``MatMulNBits`` itself never
+#     attempted either.
+#   * A shared/tied ``B``/``absmax`` tensor (read by more than one node) is
+#     declined by the matcher itself, the same bar every other matcher in
+#     this module is held to.
+
+
+_MATMUL_BNB4_FP4 = 0
+_MATMUL_BNB4_NF4 = 1
+_MATMUL_BNB4_VALID_QUANT_TYPES = {_MATMUL_BNB4_FP4, _MATMUL_BNB4_NF4}
+
+# Empirically confirmed (see this section's own top comment) 16-level
+# dequantization code tables, code (0-15) -> float64 value, for each
+# ``quant_type``. Used ONLY for producer-side importance ranking
+# (:func:`_matmul_bnb4_dequantized`) -- never written back to the graph.
+_MATMUL_BNB4_FP4_CODES = np.array(
+    [
+        0.0,
+        0.005208333333333333,
+        0.6666666666666666,
+        1.0,
+        0.3333333333333333,
+        0.5,
+        0.16666666666666666,
+        0.25,
+        -0.0,
+        -0.005208333333333333,
+        -0.6666666666666666,
+        -1.0,
+        -0.3333333333333333,
+        -0.5,
+        -0.16666666666666666,
+        -0.25,
+    ],
+    dtype=np.float64,
+)
+_MATMUL_BNB4_NF4_CODES = np.array(
+    [
+        -1.0,
+        -0.6961928009986877,
+        -0.5250730514526367,
+        -0.39491748809814453,
+        -0.28444138169288635,
+        -0.18477343022823334,
+        -0.09105003625154495,
+        0.0,
+        0.07958029955625534,
+        0.16093020141124725,
+        0.24611230194568634,
+        0.33791524171829224,
+        0.44070982933044434,
+        0.5626170039176941,
+        0.7229568362236023,
+        1.0,
+    ],
+    dtype=np.float64,
+)
+_MATMUL_BNB4_CODE_TABLES = {
+    _MATMUL_BNB4_FP4: _MATMUL_BNB4_FP4_CODES,
+    _MATMUL_BNB4_NF4: _MATMUL_BNB4_NF4_CODES,
+}
+
+
+@dataclass(frozen=True)
+class _MatMulBnb4Weight:
+    """A ``com.microsoft::MatMulBnb4`` node's block-quantized weight
+    operands, matched by :func:`_match_matmul_bnb4_producer` -- see this
+    section's own top comment for the schema facts and packing layout this
+    depends on (empirically confirmed, not assumed). ``blocks_per_row``
+    (``K // block_size``) and ``row_bytes`` (``K // 2``) are precomputed here
+    since every producer-side slice needs both and :func:`_match_matmul_bnb4_producer`
+    has already verified ``K % block_size == 0`` (so both divide evenly) by
+    the time this is constructed.
+    """
+
+    node: onnx.NodeProto
+    b_init: onnx.TensorProto
+    absmax_init: onnx.TensorProto
+    N: int
+    K: int
+    block_size: int
+    quant_type: int
+    blocks_per_row: int
+    row_bytes: int
+
+
+def _match_matmul_bnb4_producer(
+    node: onnx.NodeProto,
+    initializer_map: Dict[str, onnx.TensorProto],
+    consumers_of: Dict[str, List[onnx.NodeProto]],
+) -> Optional[_MatMulBnb4Weight]:
+    """If `node` is a ``com.microsoft::MatMulBnb4`` node matching every scope
+    boundary this section's own top comment documents, returns the match.
+    ``None`` whenever anything is ambiguous or out of the empirically-
+    verified scope, rather than guessing -- see that comment for the
+    exhaustive list of what's declined and why.
+    """
+    if node.op_type != "MatMulBnb4" or node.domain != "com.microsoft":
+        return None
+    if len(node.input) != 3 or len(node.output) != 1:
+        return None
+    a_name, b_name, absmax_name = node.input
+    if not a_name or not b_name or not absmax_name:
+        return None
+
+    trans_b = _matmul_nbits_int_attr(node, "transB", 1)
+    if trans_b != 1:
+        return None  # "backward pass" orientation -- unverified, see section comment
+    training_mode = _matmul_nbits_int_attr(node, "training_mode", 0)
+    if training_mode != 0:
+        return None  # training-mode semantics unverified -- declined
+
+    quant_type = _matmul_nbits_int_attr(node, "quant_type")
+    N = _matmul_nbits_int_attr(node, "N")
+    K = _matmul_nbits_int_attr(node, "K")
+    block_size = _matmul_nbits_int_attr(node, "block_size")
+    if quant_type is None or N is None or K is None or block_size is None:
+        return None
+    if quant_type not in _MATMUL_BNB4_VALID_QUANT_TYPES:
+        return None
+    if N <= 0 or K <= 0:
+        return None
+    if block_size not in _MATMUL_NBITS_VALID_BLOCK_SIZES:
+        return None
+    if K % block_size != 0:
+        return None  # a block would straddle two output rows -- declined, see section comment
+
+    blocks_per_row = K // block_size
+    row_bytes = K // 2  # K is always even here: a multiple of block_size >= 16
+
+    b_init = initializer_map.get(b_name)
+    absmax_init = initializer_map.get(absmax_name)
+    if b_init is None or absmax_init is None:
+        return None  # non-constant B/absmax -- can't safely slice them
+    if b_init.data_type != onnx.TensorProto.UINT8:
+        return None
+    if list(b_init.dims) != [N * row_bytes]:
+        return None
+    if absmax_init.data_type not in (
+        onnx.TensorProto.FLOAT,
+        onnx.TensorProto.FLOAT16,
+        onnx.TensorProto.BFLOAT16,
+    ):
+        return None
+    if list(absmax_init.dims) != [N * blocks_per_row]:
+        return None
+
+    for nm in (b_name, absmax_name):
+        if len(consumers_of.get(nm, [])) != 1:
+            return None  # shared/tied tensor -- another node reads it too
+
+    return _MatMulBnb4Weight(
+        node=node,
+        b_init=b_init,
+        absmax_init=absmax_init,
+        N=N,
+        K=K,
+        block_size=block_size,
+        quant_type=quant_type,
+        blocks_per_row=blocks_per_row,
+        row_bytes=row_bytes,
+    )
+
+
+def _matmul_bnb4_dequantized(w: _MatMulBnb4Weight) -> np.ndarray:
+    """The full float64 ``(N, K)`` dequantized weight matrix `w` refers to,
+    for IMPORTANCE RANKING ONLY -- never written back to the graph (this
+    module's own "slice, don't recompute" principle). Unpacks high-nibble-
+    first (see this section's own top comment), looks each 4-bit code up in
+    the ``quant_type``-appropriate table
+    (:data:`_MATMUL_BNB4_FP4_CODES`/:data:`_MATMUL_BNB4_NF4_CODES`), and
+    scales by the code's own block's ``absmax`` entry:
+    ``dequantized[n, k] = table[code[n, k]] * absmax[n, k // block_size]``.
+    """
+    packed = onnx.numpy_helper.to_array(w.b_init)  # (N * row_bytes,) uint8
+    hi = (packed >> 4) & 0x0F
+    lo = packed & 0x0F
+    codes = np.empty(packed.size * 2, dtype=np.uint8)
+    codes[0::2] = hi
+    codes[1::2] = lo
+    codes = codes.reshape(w.N, w.K)
+
+    absmax = onnx.numpy_helper.to_array(w.absmax_init).astype(np.float64)
+    absmax = absmax.reshape(w.N, w.blocks_per_row)
+
+    table = _MATMUL_BNB4_CODE_TABLES[w.quant_type]
+    values = table[codes]  # (N, K) float64
+    scale = np.repeat(absmax, w.block_size, axis=1)  # (N, K)
+    return values * scale
+
+
+def _slice_matmul_bnb4_producer_rows(w: _MatMulBnb4Weight, keep: np.ndarray) -> None:
+    """Slices `w`'s own N (output-channel) axis to `keep` (ascending
+    indices) -- a plain byte-range/scale-range row-slice, no nibble-level
+    unpack/repack at all (see this section's own top comment for why every
+    row's own bytes/scales are already whole-byte/whole-block aligned once
+    :func:`_match_matmul_bnb4_producer` has confirmed ``K % block_size ==
+    0``). Updates the node's own ``N`` attribute to ``len(keep)``.
+    """
+    packed = onnx.numpy_helper.to_array(w.b_init).reshape(w.N, w.row_bytes)
+    w.b_init.CopyFrom(
+        onnx.numpy_helper.from_array(packed[keep].reshape(-1), name=w.b_init.name)
+    )
+
+    absmax = onnx.numpy_helper.to_array(w.absmax_init).reshape(w.N, w.blocks_per_row)
+    w.absmax_init.CopyFrom(
+        onnx.numpy_helper.from_array(absmax[keep].reshape(-1), name=w.absmax_init.name)
+    )
+
+    _set_matmul_nbits_int_attr(w.node, "N", len(keep))
+
+
+@dataclass(frozen=True)
+class _MatMulBnb4Chain:
+    producer: _MatMulBnb4Weight
+    chain_ops: Tuple[onnx.NodeProto, ...]
+    consumer: _PlainMatMulNBitsPeer
+    n_channels: int
+
+
+def _walk_to_matmul_bnb4_consumer(
+    start: str,
+    initializer_map: Dict[str, onnx.TensorProto],
+    consumers_of: Dict[str, List[onnx.NodeProto]],
+    graph_outputs: Set[str],
+    n_channels: int,
+    max_hops: int,
+) -> Optional[Tuple[_PlainMatMulNBitsPeer, Tuple[onnx.NodeProto, ...]]]:
+    """From tensor `start` (a ``MatMulBnb4`` producer's own output), walks
+    forward through shape-preserving unary activations (`_UNARY_PASS_THROUGH`)
+    with no other consumer anywhere along the way, until a plain-float
+    (directly-constant weight) ``MatMul``/vanilla-``Gemm`` consumer
+    (:func:`_match_plain_matmul_nbits_peer` -- reused directly here, fully
+    generic despite its name) is found whose input-channel count matches
+    `n_channels`. Unlike :func:`_walk_to_matmul_nbits_consumer`'s own
+    ``MatMulNBits``/plain-float union, a ``MatMulBnb4`` CONSUMER is never
+    matched here at all -- see this section's own top comment for why
+    K-axis pruning of a ``MatMulBnb4`` weight remains out of scope. Returns
+    ``None`` if the walk runs out of hops, hits a branch, or never reaches
+    such a consumer.
+    """
+    chain_ops: List[onnx.NodeProto] = []
+    cur = start
+    for _hop in range(max_hops):
+        candidates = consumers_of.get(cur, [])
+        if len(candidates) != 1:
+            return None
+        nxt = candidates[0]
+
+        mm = _match_matmul_like(nxt)
+        if mm is not None and mm[0] == cur:
+            peer = _match_plain_matmul_nbits_peer(nxt, initializer_map, consumers_of)
+            if peer is None or peer.in_channels != n_channels:
+                return None
+            return peer, tuple(chain_ops)
+
+        if not (
+            nxt.op_type in _UNARY_PASS_THROUGH
+            and list(nxt.input) == [cur]
+            and len(nxt.output) == 1
+        ):
+            return None
+        out2 = nxt.output[0]
+        if len(consumers_of.get(out2, [])) != 1 or out2 in graph_outputs:
+            return None
+        chain_ops.append(nxt)
+        cur = out2
+    return None
+
+
+def _find_matmul_bnb4_chains(graph: onnx.GraphProto) -> List[_MatMulBnb4Chain]:
+    """Every ``MatMulBnb4`` producer -> [unary hops] -> plain-float consumer
+    pair :func:`_walk_to_matmul_bnb4_consumer` connects -- see this section's
+    own top comment for why the consumer side is always plain-float (never
+    another ``MatMulBnb4``/``MatMulNBits`` node).
+    """
+    initializer_map = {t.name: t for t in graph.initializer}
+    consumers_of = _consumers_of(graph)
+    graph_outputs = {o.name for o in graph.output}
+
+    def _is_internal(name: str) -> bool:
+        return len(consumers_of.get(name, [])) == 1 and name not in graph_outputs
+
+    chains: List[_MatMulBnb4Chain] = []
+    for node in graph.node:
+        producer = _match_matmul_bnb4_producer(node, initializer_map, consumers_of)
+        if producer is None:
+            continue
+        out_name = node.output[0]
+        if not _is_internal(out_name):
+            continue
+        found = _walk_to_matmul_bnb4_consumer(
+            out_name,
+            initializer_map,
+            consumers_of,
+            graph_outputs,
+            producer.N,
+            _MAX_CHAIN_HOPS,
+        )
+        if found is None:
+            continue
+        consumer, chain_ops = found
+        chains.append(_MatMulBnb4Chain(producer, chain_ops, consumer, producer.N))
+    return chains
+
+
+def apply_structured_pruning_matmul_bnb4(
+    model: Union[str, onnx.ModelProto],
+    sparsity: float = 0.5,
+    importance_norm: _ImportanceNorm = "l2",
+) -> onnx.ModelProto:
+    """Removes whole output channels from a ``com.microsoft::MatMulBnb4``
+    node (ONNX Runtime's op for porting bitsandbytes/QLoRA FP4/NF4-quantized
+    ``nn.Linear`` weights into ONNX -- see this module's "MatMulBnb4
+    (bitsandbytes FP4/NF4 block-quantized weight) structured pruning"
+    section comment for the full empirical schema/packing investigation
+    this scope was reached from) whose output feeds, through zero or more
+    shape-preserving unary activations (`_UNARY_PASS_THROUGH`) with no other
+    consumer anywhere along that path, into exactly one downstream plain-
+    float (directly-constant weight) ``MatMul``/vanilla-``Gemm`` consumer
+    whose input-channel count matches. Unlike :func:`apply_structured_pruning_matmul_nbits`,
+    a ``MatMulBnb4`` node is only ever matched as the PRODUCER side of a
+    chain -- see this module's own section comment for why K-axis
+    (consumer-side) pruning of this op remains out of scope.
+
+    Ranks the producer's own output channels by L1/L2 norm of their own
+    dequantized weight row (:func:`_matmul_bnb4_dequantized`/
+    :func:`_qdq_channel_importance` -- dequantized for ranking only; the
+    actual rewrite always slices the existing packed bytes/scales directly,
+    never re-quantizes), drops the lowest-``sparsity``-fraction of them, and
+    slices the producer's own ``N``-axis and the plain-float consumer's own
+    input-channel axis together, in lockstep.
+
+    A node whose ``K`` is not an exact multiple of its own ``block_size`` is
+    declined entirely and left byte-unchanged: because ``B``/``absmax`` are
+    packed by flattening the FULL ``[N, K]`` weight with no row-boundary
+    awareness, a block can straddle two adjacent output rows whenever
+    ``block_size`` does not evenly divide ``K`` -- see this module's own
+    section comment for the full empirical argument (mathematical and a
+    real quantizer round-trip both) and
+    ``test_matmul_bnb4_pruning_declines_k_not_multiple_of_block_size``.
+
+    :param model: onnx ModelProto object or file path
+    :param sparsity: fraction of each eligible producer's output channels to
+            drop (rounded, at least one channel is always kept)
+    :param importance_norm: ``"l2"`` (default, Li et al.'s original
+            filter-pruning criterion) or ``"l1"``
+    :returns: the pruned onnx ModelProto
+    """
+    if not (0.0 <= sparsity < 1.0):
+        raise ValueError(f"sparsity must be in [0, 1), got {sparsity}")
+    _validate_importance_norm(importance_norm)
+    if isinstance(model, str):
+        model = onnx.load(model, load_external_data=False)
+    out = onnx.ModelProto()
+    out.CopyFrom(model)
+    graph = out.graph
+
+    chains = _find_matmul_bnb4_chains(graph)
+    if not chains:
+        return out
+
+    producer_touched: Set[str] = set()
+    consumer_touched: Set[str] = set()
+    stale_value_info: Set[str] = set()
+
+    for chain in chains:
+        p, c = chain.producer, chain.consumer
+        p_key, c_key = p.b_init.name, c.w_init.name
+        if p_key in producer_touched or c_key in consumer_touched:
+            continue  # a shared/tied weight another chain already resized
+
+        n = chain.n_channels
+        keep_count = max(1, n - round(n * sparsity))
+        if keep_count >= n:
+            continue  # rounds down to nothing for this layer -- no-op
+
+        w_nk = _matmul_bnb4_dequantized(p)
+        importance = _qdq_channel_importance(w_nk, importance_norm)
+        # `kind="stable"` for the same cross-platform-determinism reason
+        # :func:`apply_structured_pruning_matmul_nbits`'s own identical line
+        # documents (this section's own `_analyze_*` dry-run mirror must
+        # make the identical selection for its predictions to stay
+        # trustworthy).
+        keep = np.sort(np.argsort(-importance, kind="stable")[:keep_count])
+
+        _slice_matmul_bnb4_producer_rows(p, keep)
+        _slice_consumer_weight(c.w_init, c.weight_transposed, keep, is_conv=False)
+
+        producer_touched.add(p_key)
+        consumer_touched.add(c_key)
+        stale_value_info.add(p.node.output[0])
+        stale_value_info.update(op.output[0] for op in chain.chain_ops)
+
+    if stale_value_info:
+        kept = [vi for vi in graph.value_info if vi.name not in stale_value_info]
+        del graph.value_info[:]
+        graph.value_info.extend(kept)
+    return out
+
+
 # --- Attention-head pruning -----------------------------------------------
 
 # Five fused self-/cross-attention ops are matched here -- four from the
@@ -27438,6 +28021,132 @@ def _analyze_structured_pruning_matmul_nbits(
     return PruningSensitivityReport(layers=layers, not_eligible=not_eligible)
 
 
+# --- MatMulBnb4 (bitsandbytes FP4/NF4 block-quantized weight) structured ---
+# --- family --------------------------------------------------------------
+
+
+def _matmul_bnb4_not_eligible(
+    graph: onnx.GraphProto, chains: List[_MatMulBnb4Chain]
+) -> List[str]:
+    matched_ids: Set[int] = {id(chain.producer.node) for chain in chains}
+    not_eligible = []
+    for node in graph.node:
+        if node.op_type != "MatMulBnb4" or node.domain != "com.microsoft":
+            continue
+        if id(node) in matched_ids:
+            continue
+        not_eligible.append(f"{node.op_type} '{_node_label(node)}'")
+    return not_eligible
+
+
+def _analyze_structured_pruning_matmul_bnb4(
+    model: Union[str, onnx.ModelProto],
+    sparsity: float = 0.5,
+    importance_norm: _ImportanceNorm = "l2",
+) -> PruningSensitivityReport:
+    """Dry-run mirror of :func:`apply_structured_pruning_matmul_bnb4` -- same
+    matching (:func:`_find_matmul_bnb4_chains`, always a ``MatMulBnb4``
+    producer paired with a plain-float consumer, see this module's own
+    "MatMulBnb4" section comment), touched-role bookkeeping (a chain sharing
+    a ``B``/consumer weight with an earlier one is reported
+    ``would_drop=0``/``margin=None``, exactly the "left completely
+    untouched" outcome the real call gives it too), keep-count, and
+    importance (:func:`_qdq_channel_importance`, ranking the producer's own
+    *dequantized* weight row -- :func:`_matmul_bnb4_dequantized`, the exact
+    same helper :func:`apply_structured_pruning_matmul_bnb4` itself calls,
+    never for the actual byte-level rewrite) logic, reused directly, but
+    `model` is never mutated. `family` is always ``"matmul_bnb4"``.
+
+    Unlike :func:`_analyze_structured_pruning_matmul_nbits`'s own consumer-
+    side block-alignment decline, there is no analogous per-chain decline
+    here to mirror: a chain either matches :func:`_find_matmul_bnb4_chains`
+    at all (in which case :func:`_match_matmul_bnb4_producer` has already
+    confirmed ``K % block_size == 0`` for the producer's OWN axis before the
+    chain exists) or it doesn't, and an unmatched node is reported via
+    `not_eligible` instead -- there is no extra alignment condition still to
+    check against the CONSUMER once a chain is already found, since the
+    consumer here is always plain-float and has no block structure at all.
+    """
+    if not (0.0 <= sparsity < 1.0):
+        raise ValueError(f"sparsity must be in [0, 1), got {sparsity}")
+    _validate_importance_norm(importance_norm)
+    if isinstance(model, str):
+        model = onnx.load(model, load_external_data=False)
+    graph = model.graph
+
+    chains = _find_matmul_bnb4_chains(graph)
+    not_eligible = _matmul_bnb4_not_eligible(graph, chains)
+    if not chains:
+        return PruningSensitivityReport(layers=[], not_eligible=not_eligible)
+
+    producer_touched: Set[str] = set()
+    consumer_touched: Set[str] = set()
+    layers: List[PruningLayerSensitivity] = []
+
+    for chain in chains:
+        p, c = chain.producer, chain.consumer
+        p_key, c_key = p.b_init.name, c.w_init.name
+        label = _node_label(p.node)
+        family = "matmul_bnb4"
+        n = chain.n_channels
+
+        if p_key in producer_touched or c_key in consumer_touched:
+            layers.append(
+                PruningLayerSensitivity(
+                    label=label,
+                    family=family,
+                    total=n,
+                    would_drop=0,
+                    margin=None,
+                    importance_min=0.0,
+                    importance_max=0.0,
+                )
+            )
+            continue  # a shared/tied weight another chain already claimed
+
+        keep_count = max(1, n - round(n * sparsity))
+        if keep_count >= n:
+            layers.append(
+                PruningLayerSensitivity(
+                    label=label,
+                    family=family,
+                    total=n,
+                    would_drop=0,
+                    margin=None,
+                    importance_min=0.0,
+                    importance_max=0.0,
+                )
+            )
+            continue  # rounds down to nothing for this chain -- no-op
+
+        w_nk = _matmul_bnb4_dequantized(p)
+        importance = _qdq_channel_importance(w_nk, importance_norm)
+        # `kind="stable"` to match :func:`apply_structured_pruning_matmul_bnb4`'s
+        # own tie-break exactly, for the same cross-platform-determinism
+        # reason :func:`_analyze_structured_pruning_matmul_nbits`'s own
+        # identical line documents.
+        keep = np.sort(np.argsort(-importance, kind="stable")[:keep_count])
+        keep_mask = np.zeros(n, dtype=bool)
+        keep_mask[keep] = True
+
+        layers.append(
+            PruningLayerSensitivity(
+                label=label,
+                family=family,
+                total=n,
+                would_drop=int(n - keep_count),
+                margin=_normalized_margin(importance, keep_mask),
+                importance_min=float(importance.min()),
+                importance_max=float(importance.max()),
+            )
+        )
+
+        producer_touched.add(p_key)
+        consumer_touched.add(c_key)
+
+    return PruningSensitivityReport(layers=layers, not_eligible=not_eligible)
+
+
 # --- Attention-head family ---------------------------------------------
 
 
@@ -29301,6 +30010,7 @@ _SENSITIVITY_ANALYZERS: Dict[
     apply_structured_pruning_qdq: _analyze_structured_pruning_qdq,
     apply_structured_pruning_qoperator: _analyze_structured_pruning_qoperator,
     apply_structured_pruning_matmul_nbits: _analyze_structured_pruning_matmul_nbits,
+    apply_structured_pruning_matmul_bnb4: _analyze_structured_pruning_matmul_bnb4,
     apply_structured_pruning_matmul_block_quantized_fp8: (
         _analyze_structured_pruning_matmul_block_quantized_fp8
     ),
@@ -29336,12 +30046,13 @@ def analyze_pruning_sensitivity(
     measurement this module already had (actual zero-fraction of an
     already-pruned model); this is the *before* half that was missing.
 
-    `apply_fn` must be one of the seventeen functions this module itself
+    `apply_fn` must be one of the eighteen functions this module itself
     exports: :func:`apply_magnitude_pruning`, :func:`apply_wanda_pruning`,
     :func:`apply_structured_pruning`, :func:`apply_structured_wanda_pruning`,
     :func:`apply_structured_pruning_qdq`,
     :func:`apply_structured_pruning_qoperator`,
     :func:`apply_structured_pruning_matmul_nbits`,
+    :func:`apply_structured_pruning_matmul_bnb4`,
     :func:`apply_structured_pruning_matmul_block_quantized_fp8`,
     :func:`apply_structured_pruning_matmul_block_quantized_fp4`,
     :func:`apply_attention_head_pruning`,
@@ -29361,7 +30072,7 @@ def analyze_pruning_sensitivity(
     same way the mutating call itself would compute them, up to (but never
     actually calling) the final slice/zero/delete step. :func:`apply_sparsegpt_pruning`
     is not supported, and neither is :func:`apply_embedding_vocab_pruning`
-    (a `ValueError` naming the seventeen functions that are supported); nor is
+    (a `ValueError` naming the eighteen functions that are supported); nor is
     `apply_structured_pruning`/`apply_structured_wanda_pruning`'s own
     `global_sparsity=True` mode or a model containing any `Concat`-merged
     skip-connection chain (both a `NotImplementedError`, from within the
@@ -29372,7 +30083,7 @@ def analyze_pruning_sensitivity(
     dry-run section comment specifically for that one).
 
     :param model: the onnx ModelProto or file path `apply_fn` would take
-    :param apply_fn: one of this module's own fourteen supported `apply_*`
+    :param apply_fn: one of this module's own eighteen supported `apply_*`
             functions, passed by reference
     :param kwargs: forwarded to `apply_fn`'s own dedicated `_analyze_*`
             counterpart, which accepts the same parameters `apply_fn`
