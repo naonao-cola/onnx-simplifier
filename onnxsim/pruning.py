@@ -3029,21 +3029,41 @@ class _Producer:
 
 @dataclass(frozen=True)
 class _ConvPassThrough:
-    """A depthwise Conv (``group == in_channels == out_channels``) the chain
-    walk crossed transparently between a Conv chain's real producer and real
-    consumer. A depthwise Conv mixes no channels at all -- output channel
-    ``i`` depends only on input channel ``i`` -- so it needs no independent
-    importance of its own the way a producer/consumer boundary does; it is
-    carried on the matched :class:`_Chain` purely so :func:`_apply_chains`
-    can slice its own ``[C, 1, kH, kW]`` weight (and bias, if present) by
-    the *same* `keep` index set as the chain's real producer, and update its
-    ``group`` attribute to the new channel count. See
-    :func:`_walk_to_conv_consumer`.
+    """A depthwise Conv (``group == in_channels == out_channels``) -- or a
+    plain ``ai.onnx::CausalConvWithState`` node, the same "one weight row
+    per channel, no cross-channel mixing" shape (see
+    :func:`_match_causal_conv_with_state_pass_through` and this module's own
+    "Conv/pooling/Resize/Pad pass-through" section comment) -- the chain walk
+    crossed transparently between a Conv chain's real producer and real
+    consumer. Neither mixes channels at all -- output channel ``i`` depends
+    only on input channel ``i`` -- so neither needs any independent
+    importance of its own the way a producer/consumer boundary does; each is
+    carried on the matched :class:`_Chain` purely so
+    :func:`_apply_conv_pass_through_hop` can slice its own ``[C, 1, k1, ...,
+    kn]`` weight (and bias, if present) by the *same* `keep` index set as the
+    chain's real producer. A depthwise Conv additionally gets its own
+    ``group`` attribute updated to the new channel count;
+    ``CausalConvWithState`` has no such attribute at all (its channel count
+    is implied purely by its weight's own axis-0 size), so nothing is
+    rewritten there for it. See :func:`_walk_to_conv_consumer`.
     """
 
     node: onnx.NodeProto
     weight: str
     bias: Optional[str]
+    # Set only for a ``CausalConvWithState`` hop whose own `past_state`
+    # input (index 3) is itself a *constant* initializer -- a degenerate,
+    # unlikely-in-practice shape no real export produces (every real export
+    # feeds it as an ordinary graph input/runtime KV-cache-style buffer,
+    # needing no slicing at all -- the caller's own runtime data, exactly
+    # how a dynamic `past_key`/`past_value` is already treated elsewhere in
+    # this module), but not one :func:`_match_causal_conv_with_state_pass_through`
+    # assumes away: when set, :func:`_apply_conv_pass_through_hop` slices
+    # its own channel axis (axis 1) by the same `keep` index set, mirroring
+    # `_past_kv_constants_are_sliceable`'s own "slice if constant, leave
+    # alone if dynamic" treatment for `GroupQueryAttention`'s analogous
+    # `past_key`/`past_value`. Always ``None`` for a depthwise Conv hop.
+    past_state: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -3196,6 +3216,45 @@ def _set_conv_group_attr(node: onnx.NodeProto, group: int) -> None:
             attr.i = group
             return
     node.attribute.append(onnx.helper.make_attribute("group", group))
+
+
+def _apply_conv_pass_through_hop(
+    hop: _ConvPassThrough,
+    initializer_map: Dict[str, onnx.TensorProto],
+    keep: np.ndarray,
+    keep_count: int,
+) -> None:
+    """Slices one crossed :class:`_ConvPassThrough` hop's own weight/bias
+    (and, for a ``CausalConvWithState`` hop with a *constant* `past_state`,
+    that too -- see :class:`_ConvPassThrough`'s own `past_state` field) by
+    `keep`/`keep_count`, then rewrites whichever attribute (if any) the
+    node's own op type needs to stay consistent with its new channel count.
+    Shared by every one of this module's own conv-chain "apply" call sites
+    (:func:`_slice_chain_channels`'s own `_slice_conv_hop` closure, and
+    :func:`_apply_conv_concat_chains`'s own two, per-branch and chain-level,
+    slicing points) so this op-type-dispatch logic lives in exactly one
+    place rather than three near-identical copies of it.
+
+    A depthwise ``Conv`` hop's own `group` attribute (`== in_channels ==
+    out_channels`) drops to the new channel count right alongside its
+    weight/bias, via :func:`_set_conv_group_attr` -- `CausalConvWithState`
+    has no such attribute at all (confirmed via live schema introspection,
+    ``onnx.defs.get_schema("CausalConvWithState", domain="")``: its own
+    channel count is implied purely by its weight's own axis-0 size, no
+    `group`/channel-count attribute exists on it to rewrite), so nothing is
+    rewritten there for it -- dispatched purely on `hop.node.op_type`, since
+    only these two op types ever reach this function (see
+    :func:`_match_depthwise_conv_pass_through`/
+    :func:`_match_causal_conv_with_state_pass_through`, the only two
+    matchers that ever construct a :class:`_ConvPassThrough`).
+    """
+    _slice_producer_weight(initializer_map[hop.weight], False, keep, is_conv=True)
+    if hop.bias is not None:
+        _slice_last_axis(initializer_map[hop.bias], keep)
+    if hop.past_state is not None:
+        _slice_axis1(initializer_map[hop.past_state], keep)
+    if hop.node.op_type == "Conv":
+        _set_conv_group_attr(hop.node, keep_count)
 
 
 def _consumers_of(graph: onnx.GraphProto) -> Dict[str, List[onnx.NodeProto]]:
@@ -3745,6 +3804,168 @@ def _match_depthwise_conv_pass_through(
     return w_name, bias_name
 
 
+# ``CausalConvWithState`` (plain ``ai.onnx``, ``since_version=27`` --
+# confirmed live via ``onnx.defs.get_schema("CausalConvWithState",
+# domain="")`` against this environment's installed onnx==1.22.0: genuinely
+# new to the ONNX *standard* at that opset, NOT a ``com.microsoft`` contrib
+# op, despite the "state"/KV-cache-carry framing that might suggest one --
+# double-checked by also querying ``domain="com.microsoft"``, which raises
+# "No schema registered") as a Conv-chain pass-through hop. Per its own
+# schema doc: "Stateful causal 1D depthwise convolution. Used by Gated
+# DeltaNet (Qwen3.5) and Mamba (Jamba, FalconMamba) as a preprocessing step.
+# Replaces the 3-op pattern (Concat + Conv + Slice) with a single fused
+# operation." Exact schema, read off live rather than guessed at:
+#
+# - `input`/`weight`/`past_state`/`output`/`present_state` are all rank-3
+#   ``(batch_size, channels, length)`` (`past_state`/`present_state`:
+#   ``(batch_size, channels, k - 1)``); `bias` is rank-1 `(channels,)`.
+#   `weight` is `(channels, 1, k)` -- the schema's own doc spells out that
+#   the middle size-1 dim deliberately "follows the ONNX `Conv` weight
+#   layout `(M, C/group, k1, ..., kn)`... since this op is always depthwise,
+#   `group = channels`... Keeping this layout makes the weight tensor a
+#   drop-in for a depthwise `Conv(group=channels)` weight" -- i.e. the exact
+#   same "one weight row per channel, no cross-channel mixing" shape
+#   :func:`_match_depthwise_conv_pass_through` already recognizes, just with
+#   no `group` *attribute* at all (the op has none) since depthwise-ness is
+#   the *only* mode this op supports, not a configurable choice. `input`,
+#   `weight`, `bias` (optional), and `past_state` (optional) are input
+#   indices 0/1/2/3 respectively; `output`/`present_state` are always both
+#   present outputs (indices 0/1, per the schema's own `FormalParameterOption
+#   .Single` on each -- not one required, one optional).
+# - `activation` (string attribute, default `"none"`, one of
+#   `"silu"`/`"swish"`/`"none"`): a fused activation applied after the
+#   convolution -- exactly the same "doesn't change which channel maps to
+#   which, needs no operand of its own sliced" shape as any other unary
+#   activation `_UNARY_PASS_THROUGH` already treats as free -- not even read
+#   here (a chain crossing this hop leaves it completely untouched,
+#   correctly, since its own value never depends on the channel count).
+# - `past_state`/`present_state` ("Carry state from previous step"/"Updated
+#   carry state") are the actual KV-cache-style recurrent state a stateful
+#   decode loop threads through repeated calls to this op across steps --
+#   structurally the closest analogue in this module is `GroupQueryAttention`'s
+#   own `past_key`/`past_value`: every real export feeds `past_state` as an
+#   ordinary graph input/runtime buffer (needing no slicing at all -- the
+#   caller's own runtime data), while `present_state` is always this node's
+#   own *output*, never a weight this pass slices. A `past_state` that
+#   happens to be a *constant* initializer (degenerate, no real export
+#   produces one, but not assumed away) is sliced along its own channel axis
+#   (axis 1) by the identical `keep` index set, the same "slice if constant,
+#   leave alone if dynamic" rule `_past_kv_constants_are_sliceable` already
+#   applies to `past_key`/`past_value` -- see :class:`_ConvPassThrough`'s own
+#   `past_state` field and :func:`_apply_conv_pass_through_hop`.
+# - **No CPU kernel gap here** -- unlike `PagedAttention`'s own section
+#   comment above, this op's CPU kernel genuinely exists and runs correctly
+#   in this environment's installed onnxruntime 1.29.0: a minimal
+#   `onnx.checker`-valid `CausalConvWithState` node, run through a real
+#   `onnxruntime.InferenceSession` (constructed with the
+#   `ALLOW_RELEASED_ONNX_OPSET_ONLY=0` environment variable set -- opset 27
+#   is, as of this writing, still "under development" per onnxruntime's own
+#   `ValidateOpsetForDomain` guard, which otherwise refuses to even load a
+#   graph stamped with it; this only relaxes that *load-time* opset-vintage
+#   check, it does not disable or stub out the kernel itself), matches an
+#   independent numpy oracle (manual causal depthwise convolution, zero- or
+#   `past_state`-padded on the left) to exactly `0.0` max-abs-diff, and its
+#   own `present_state` output matches the oracle's own "last k-1 values of
+#   the padded/concatenated sequence" exactly too -- see
+#   ``tests/test_pruning.py``'s own "CausalConvWithState" section, which
+#   runs the real fused op end to end rather than a decomposed-proxy
+#   fallback.
+# - **Scope boundary: this hop is recognized only by the plain forward walk**
+#   (:func:`_walk_to_conv_consumer`, used by :func:`_find_conv_chains`'s
+#   single-producer/single-consumer topology, and -- since that same forward
+#   walk is also what resolves each fan-out branch's own consumer for a
+#   residual/merge or `Concat`-merge group -- also reachable from those two
+#   topologies' own branch-consumer resolution) -- **never** by the backward
+#   walk (:func:`_walk_conv_producer_backward`, used by
+#   :func:`_find_conv_residual_chains`/:func:`_find_conv_concat_chains` to
+#   resolve a branch back to its own real *producer*). That backward walk's
+#   own per-hop loop unconditionally declines (`return "fail", ...`) any
+#   node with `len(node.output) != 1` -- a hard structural bar that predates
+#   this feature and exists for reasons unrelated to it (see that function's
+#   own docstring) -- and `CausalConvWithState` always has *two* outputs
+#   (`output`, `present_state`), so it can never satisfy that check.
+#   Extending the backward walk to tolerate a hop with an extra, untouched
+#   output was judged out of scope for this feature (a genuinely new
+#   relaxation of a bar several other call sites also rely on, not "adding
+#   one more entry to an existing set" the way this hop's forward-walk
+#   integration is) -- declined outright rather than guessed at, the same
+#   "decline, don't guess" bar this module holds everywhere else. In
+#   practice: a `CausalConvWithState` node sitting between a real Conv
+#   producer and a real Conv/ConvTranspose consumer, with no residual `Add`
+#   or channel-axis `Concat` merge anywhere in between, is pruned; one
+#   sitting on a residual/skip-connection branch (a shape no real Mamba/
+#   Gated-DeltaNet export actually produces in practice -- this op is
+#   documented as a *preprocessing* step immediately after the block's own
+#   input projection, not a residual-branch component) simply ends that
+#   branch's backward walk with no producer found, exactly like any other
+#   topology this module doesn't (yet) resolve -- not a silent
+#   correctness gap, the same "unmatched topology" outcome every other
+#   backward-walk decline already produces.
+def _match_causal_conv_with_state_pass_through(
+    node: onnx.NodeProto,
+    initializer_map: Dict[str, onnx.TensorProto],
+    n_channels: int,
+) -> Optional[Tuple[str, Optional[str], Optional[str]]]:
+    """If `node` is a plain ``ai.onnx::CausalConvWithState`` node (opset 27+,
+    domain ``""``) whose constant ``weight`` is exactly the depthwise-Conv
+    shape :func:`_match_depthwise_conv_pass_through` already recognizes
+    (``[n_channels, 1, k]``, `n_channels` matching the chain walk's own
+    count), returns ``(weight_name, bias_name_or_None,
+    past_state_name_or_None)``. See this section's own comment above for the
+    full empirical schema findings; in short, this op mixes no channels at
+    all, identically to a depthwise Conv, except it carries two extra
+    per-channel-shaped operands a depthwise Conv doesn't: an optional `bias`
+    (identical treatment to a depthwise Conv's own) and an optional
+    `past_state` carry tensor, returned here (as `past_state_name`) only
+    when it is itself a constant of the expected `(*, n_channels, *)` rank-3
+    shape -- left ``None`` (needing no slicing at all) when dynamic/absent,
+    and this whole match declined when it's a constant of any *other* shape
+    (never guessed at). This op's own second output, `present_state`, is
+    never a tensor this function slices (a runtime *output*, not a weight);
+    the caller (:func:`_walk_to_conv_consumer`) is responsible for treating
+    it as stale alongside `output`.
+    """
+    if node.op_type != "CausalConvWithState" or node.domain != "":
+        return None
+    if len(node.input) < 2:
+        return None
+    w_name = node.input[1]
+    w_init = initializer_map.get(w_name)
+    if (
+        w_init is None
+        or not _is_supported_float_dtype(w_init.data_type)
+        or len(w_init.dims) != 3
+        or w_init.dims[0] != n_channels
+        or w_init.dims[1] != 1
+    ):
+        return None
+    bias_name = None
+    if len(node.input) > 2 and node.input[2]:
+        bias_name = node.input[2]
+        b_init = initializer_map.get(bias_name)
+        if b_init is None or not _is_supported_float_dtype(b_init.data_type):
+            return None  # non-constant bias -- can't safely prune it
+    past_state_name = None
+    if len(node.input) > 3 and node.input[3]:
+        ps_init = initializer_map.get(node.input[3])
+        if ps_init is not None:
+            # A constant past_state -- degenerate, but if present it must be
+            # the documented rank-3 (batch, channels, k-1) shape with axis 1
+            # == n_channels to be safely sliceable; anything else declines
+            # the whole hop rather than guessing which axis (if any) is
+            # really the channel one.
+            if (
+                not _is_supported_float_dtype(ps_init.data_type)
+                or len(ps_init.dims) != 3
+                or ps_init.dims[1] != n_channels
+            ):
+                return None
+            past_state_name = node.input[3]
+        # else: dynamic (an ordinary graph input/runtime buffer) -- the
+        # caller's own runtime data, needs no slicing, not tracked here.
+    return w_name, bias_name, past_state_name
+
+
 def _match_group_norm_pass_through(
     node: onnx.NodeProto,
     initializer_map: Dict[str, onnx.TensorProto],
@@ -4001,7 +4222,16 @@ def _walk_to_conv_consumer(
     Conv hops (see :func:`_match_depthwise_conv_pass_through` -- transparent
     to the channel-index mapping, but each still needs its own weight/bias
     sliced and its ``group`` attribute updated, so they're returned separately
-    as `conv_pass_through` rather than folded into `chain_ops`), and -- when
+    as `conv_pass_through` rather than folded into `chain_ops`), plain
+    ``ai.onnx::CausalConvWithState`` hops (see
+    :func:`_match_causal_conv_with_state_pass_through` and this module's own
+    "Conv/pooling/Resize/Pad pass-through" section comment -- the same
+    "one weight row per channel" shape as a depthwise Conv, also returned via
+    `conv_pass_through`, but with no `group` attribute to update; this
+    forward walk is the *only* one of the two Conv-chain walkers that
+    recognizes it -- see that section comment's own scope-boundary note for
+    why the backward walk, :func:`_walk_conv_producer_backward`, cannot),
+    and -- when
     `recognize_group_norm` -- at most one mid-chain ``GroupNormalization``
     hop (see :func:`_match_group_norm_pass_through` and
     `_GROUP_NORM_PASS_THROUGH_OP`'s own comment for why only one, and why
@@ -4097,6 +4327,33 @@ def _walk_to_conv_consumer(
             match = _match_conv_consumer(nxt, initializer_map)
             if match is not None and match[1] == n_channels:
                 consumer = (nxt, match[0], match[2], False)
+            break
+
+        if (
+            nxt.op_type == "CausalConvWithState"
+            and nxt.domain == ""
+            and nxt.input
+            and nxt.input[0] == cur
+        ):
+            # See this module's own "Conv/pooling/Resize/Pad pass-through"
+            # section comment (just above :func:`_match_causal_conv_with_state_pass_through`)
+            # for the full empirical schema findings -- this op is never a
+            # consumer in its own right (unlike `Conv` above, which falls
+            # through to `_match_conv_consumer` on a depthwise-match miss),
+            # so a failed match here simply ends the walk.
+            causal_conv = _match_causal_conv_with_state_pass_through(
+                nxt, initializer_map, n_channels
+            )
+            if causal_conv is not None:
+                out2 = nxt.output[0]
+                if len(consumers_of.get(out2, [])) != 1 or out2 in graph_outputs:
+                    break
+                cc_weight, cc_bias, cc_past_state = causal_conv
+                conv_pass_through.append(
+                    _ConvPassThrough(nxt, cc_weight, cc_bias, cc_past_state)
+                )
+                cur = out2
+                continue
             break
 
         if (
@@ -7323,13 +7580,17 @@ def _apply_concat_chains(
             for hop in b.conv_pass_through:
                 # Same reasoning as _apply_chains's own depthwise hop
                 # handling: channel i is exactly upstream channel i, so the
-                # hop's own weight/bias slice by this branch's own `keep`.
-                _slice_producer_weight(
-                    initializer_map[hop.weight], False, keep, is_conv=True
-                )
-                if hop.bias is not None:
-                    _slice_last_axis(initializer_map[hop.bias], keep)
-                _set_conv_group_attr(hop.node, len(keep))
+                # hop's own weight/bias slice by this branch's own `keep`
+                # -- see :func:`_apply_conv_pass_through_hop`. (In practice
+                # this is always a depthwise `Conv` hop here, never a
+                # `CausalConvWithState` one -- see that op's own "Conv/
+                # pooling/Resize/Pad pass-through" section-comment scope
+                # note: it's only ever recognized by the forward walk, and
+                # this `b.conv_pass_through` is populated by the *backward*
+                # one -- but routing through the shared helper regardless
+                # keeps this branch correct even if that ever changes,
+                # rather than duplicating its op-type dispatch here too.)
+                _apply_conv_pass_through_hop(hop, initializer_map, keep, len(keep))
 
         global_keep = np.concatenate(
             [keep + b.offset for b, keep in zip(chain.branches, branch_keeps)]
@@ -7339,12 +7600,9 @@ def _apply_concat_chains(
             if const_name is not None:
                 _slice_last_axis(initializer_map[const_name], global_keep)
         for hop in chain.conv_pass_through:
-            _slice_producer_weight(
-                initializer_map[hop.weight], False, global_keep, is_conv=True
+            _apply_conv_pass_through_hop(
+                hop, initializer_map, global_keep, len(global_keep)
             )
-            if hop.bias is not None:
-                _slice_last_axis(initializer_map[hop.bias], global_keep)
-            _set_conv_group_attr(hop.node, len(global_keep))
 
         if chain.consumer_is_conv and group > 1:
             _slice_grouped_consumer_conv_weight(
@@ -7369,12 +7627,15 @@ def _apply_concat_chains(
         for b in chain.branches:
             touched.stale_value_info.update(p.node.output[0] for p in b.producers)
             touched.stale_value_info.update(op.output[0] for op, _ in b.pre_ops)
+            # Every output, not just [0] -- a hop node can have more than
+            # one (e.g. `CausalConvWithState`'s own `present_state`); see
+            # :class:`_ConvPassThrough`'s own docstring.
             touched.stale_value_info.update(
-                h.node.output[0] for h in b.conv_pass_through
+                out for h in b.conv_pass_through for out in h.node.output
             )
         touched.stale_value_info.update(op.output[0] for op, _ in chain.chain_ops)
         touched.stale_value_info.update(
-            h.node.output[0] for h in chain.conv_pass_through
+            out for h in chain.conv_pass_through for out in h.node.output
         )
 
 
@@ -7757,16 +8018,11 @@ def _slice_chain_channels(
             _slice_last_axis(initializer_map[const_name], keep)
 
     def _slice_conv_hop(hop: _ConvPassThrough) -> None:
-        # Same `keep` index set as the real producer -- a depthwise
-        # Conv's own channel i is exactly upstream channel i, so its
-        # weight (output-channel axis 0, like any Conv producer) and
-        # bias slice identically, and `group` (== in_channels ==
-        # out_channels for a depthwise Conv) drops to the new count
-        # right alongside them.
-        _slice_producer_weight(initializer_map[hop.weight], False, keep, is_conv=True)
-        if hop.bias is not None:
-            _slice_last_axis(initializer_map[hop.bias], keep)
-        _set_conv_group_attr(hop.node, keep_count)
+        # Same `keep`/`keep_count` as the real producer -- see
+        # :func:`_apply_conv_pass_through_hop`'s own docstring for exactly
+        # what gets sliced/rewritten for each of the two hop kinds it
+        # dispatches on (depthwise `Conv` vs. `CausalConvWithState`).
+        _apply_conv_pass_through_hop(hop, initializer_map, keep, keep_count)
 
     for hop in chain.conv_pass_through:
         _slice_conv_hop(hop)
@@ -7835,7 +8091,12 @@ def _slice_chain_channels(
         stale_value_info.add(p.node.output[0])
         stale_value_info.update(pre_op.output[0] for pre_op in p.pre_ops)
     stale_value_info.update(chain_node.output[0] for chain_node, _ in chain.chain_ops)
-    stale_value_info.update(hop.node.output[0] for hop in chain.conv_pass_through)
+    # Every output, not just [0] -- a hop node can have more than one (e.g.
+    # `CausalConvWithState`'s own `present_state`); see
+    # :class:`_ConvPassThrough`'s own docstring.
+    stale_value_info.update(
+        out for hop in chain.conv_pass_through for out in hop.node.output
+    )
     if chain.group_norm is not None:
         stale_value_info.add(chain.group_norm.node.output[0])
     stale_value_info.update(
@@ -7844,7 +8105,10 @@ def _slice_chain_channels(
         for chain_node, _ in b.chain_ops
     )
     stale_value_info.update(
-        hop.node.output[0] for b in chain.extra_consumers for hop in b.conv_pass_through
+        out
+        for b in chain.extra_consumers
+        for hop in b.conv_pass_through
+        for out in hop.node.output
     )
 
 
@@ -13545,6 +13809,209 @@ def _match_paged_attention_producer(
     return num_heads, kv_num_heads
 
 
+# ``LinearAttention`` (plain ``ai.onnx``, ``since_version=27`` -- confirmed
+# live via ``onnx.defs.get_schema("LinearAttention", domain="")`` against
+# this environment's installed onnx==1.22.0, and, like `CausalConvWithState`
+# above, double-checked to raise "No schema registered" under
+# ``domain="com.microsoft"`` -- genuinely new to the ONNX *standard*, not a
+# contrib op). Per its own schema doc: "Unified linear attention operator for
+# autoregressive decoding (T=1) and prefill (T>1)... used by GLA/RWKV-6/
+# DeltaNet/RetNet." Exact schema, read off live rather than guessed at:
+#
+# - `query`/`key`/`value` (indices 0/1/2, all required) are already-projected
+#   3D *packed* activation tensors -- ``(B, T, H_q * d_k)``/``(B, T, H_kv *
+#   d_k)``/``(B, T, H_kv * d_v)`` -- exactly `GroupQueryAttention`'s/the plain
+#   `ai.onnx::Attention` op's own calling convention (Q's/K's/V's own
+#   separate MatMul/vanilla-Gemm producers are what gets pruned, not a weight
+#   this op owns itself), so this op reuses :func:`_find_separate_qkv_chains`,
+#   :class:`_GQAChain`, :func:`_apply_one_gqa_chain`, and
+#   :func:`_gqa_group_importance` outright, via a sixth matcher,
+#   :func:`_match_linear_attention_producer` -- the same "close enough a
+#   cousin" reuse the plain ai.onnx `Attention` op and `PagedAttention`
+#   already get. `q_num_heads`/`kv_num_heads` (both required attributes,
+#   `q_num_heads` a positive multiple of `kv_num_heads`) support the
+#   identical GQA/MQA taxonomy, confirmed live, exactly as for every other op
+#   in this family -- `q_num_heads` is this op's own name for the query-head
+#   attribute (:class:`_GQAChain`'s own `num_heads_attr`, same as the plain
+#   `ai.onnx::Attention` op's own). `d_k`/`d_v` are genuinely independent
+#   here too (`value`'s own packed width is `H_kv * d_v`, `key`'s is `H_kv *
+#   d_k`, with no schema requirement tying the two together, unlike
+#   `GroupQueryAttention`/`PagedAttention`'s `SEPARATE` layout) --
+#   :func:`_find_linear_attention_chains` passes `allow_differing_v_head_size
+#   =True`, the same as the plain ai.onnx op/`MultiHeadAttention`.
+# - `past_state` (index 3, optional, 4D ``(B, kv_num_heads, d_k, d_v)`` --
+#   "Recurrent state from previous step... Always 4D") is the closest
+#   analogue of `GroupQueryAttention`'s own `past_key`/`past_value`, just a
+#   single combined tensor rather than a pair, and at a *different* per-head
+#   axis meaning (a genuine outer-product accumulator, not a per-token KV
+#   cache) -- but structurally the same "axis 1 is the `kv_num_heads` axis"
+#   layout, so it gets the identical "slice if constant (axis 1, by
+#   `keep_groups`), leave alone if dynamic (the caller's own runtime data)"
+#   treatment via :func:`_slice_axis1`, checked at match time by
+#   :func:`_match_linear_attention_producer` and applied by
+#   :func:`_apply_one_gqa_chain`.
+# - `decay`/`beta` (indices 4/5, optional, "Required for 'gated'/'gated_delta'
+#   modes" and "'delta'/'gated_delta' modes" respectively) are genuinely new
+#   shapes nothing else in this family has: per-*KV*-head (not per-query-head
+#   the way `attention_bias`/`head_sink` are) recurrence-gating tensors, fed
+#   into the op alongside Q/K/V rather than added to an attention-score
+#   matrix. `decay`'s own doc gives it *two* possible packed shapes -- ``(B,
+#   T, kv_num_heads * d_k)`` (GLA/RWKV-6, "per-key-dimension decay") or ``(B,
+#   T, kv_num_heads)`` (DeltaNet/RetNet, "per-head scalar decay") -- which
+#   cannot be told apart from `kv_num_heads` alone (`d_k` isn't known until
+#   `head_size` is resolved, later, from Q's own producer weight) -- deferred
+#   to :func:`_find_linear_attention_chains`, exactly the same "defer until
+#   the fact needed to check it exists" idiom `PagedAttention`'s own
+#   `q_norm_weight`/`k_norm_weight` deferred check already uses. `beta`'s own
+#   doc gives it shape ``(B, T, kv_num_heads)`` or ``(B, T, 1)`` (a
+#   broadcast, needing no slicing at all -- the same "PER_TENSOR, left alone"
+#   reasoning this section already applies to a broadcast `k_scale`/`v_scale`
+#   or `attn_mask`).
+#
+#   **Scope boundary, declined rather than guessed at: a *dynamic*
+#   `decay`/`beta` declines the whole match outright**, unlike
+#   `GroupQueryAttention`'s own dynamic `past_key`/`past_value`/`attention_bias`
+#   (left alone, matched anyway) -- a deliberately narrower bar than the rest
+#   of this family, for a reason specific to these two inputs: `past_key`/
+#   `past_value`/`attention_bias`, when dynamic, are either an ordinary graph
+#   input (a caller free to supply a differently-sized tensor after this
+#   pass shrinks `kv_num_heads`) or, in an unrolled autoregressive loop,
+#   loop-carried from that *same op's own* `present_key`/`present_value`
+#   output -- which this pass's own `kv_num_heads` rewrite already narrows in
+#   step. `decay`/`beta` have no such self-consistent path: `LinearAttention`
+#   has no `decay`/`beta` *output* at all (only `output`/`present_state`), so
+#   a dynamic one can only come from a genuine graph input (in which case the
+#   "caller supplies a narrower tensor" reasoning above would still hold) or
+#   -- the realistic, common shape for every actual gated/delta/gated_delta
+#   export -- an internal node's own computation (e.g. `com.microsoft::
+#   LinearAttentionGate`, this op's own documented companion, projecting from
+#   a `dt_bias`/`decay_scale` weight sized `(kv_num_heads,)`) that this pass
+#   never traces into or adjusts. Nothing here can tell those two cases
+#   apart from the tensor name alone, and leaving a genuinely internally-
+#   computed, still-old-width `decay`/`beta` connected to a node whose own
+#   `kv_num_heads` this pass just shrank is a real, silent correctness risk
+#   (a shape mismatch at best, a wrong-axis silent miscompute at worst) --
+#   not a risk this pass is willing to take on an unconfirmed guess. The
+#   practical consequence: this pass only ever prunes a `LinearAttention`
+#   chain whose `update_rule` is `"linear"` (needs neither `decay` nor
+#   `beta` at all) or one whose `decay`/`beta` happen to be genuine constants
+#   (a degenerate shape no real dynamic-decode export produces, but handled
+#   correctly rather than assumed away) -- a `gated`/`delta`/`gated_delta`
+#   chain fed by a real `LinearAttentionGate` (or equivalent) node is left
+#   completely unmatched, exactly the same "unmatched topology, not a silent
+#   gap" outcome this module holds everywhere else. Recognizing
+#   `LinearAttentionGate` as its own pass-through hop (slicing its own
+#   `dt_bias`/`decay_scale` per-head weights by `keep_groups`, mirroring how
+#   `_walk_back_through_qk_norm_rope` already recognizes a per-head Q/K-norm
+#   sandwich) would close this gap, but is genuinely new machinery beyond
+#   this feature's own scope -- left for a future pass, exactly like
+#   `GroupQueryAttention`'s own in-op `q_norm_weight`/`k_norm_weight` gap
+#   this module's own comment already names as future work.
+# - `scale` (float, default 0.0 -- "derives d_k... and uses 1/sqrt(d_k)")
+#   and `chunk_size` (int, "tuning hint; does not affect output correctness")
+#   are both entirely head-count-independent -- neither is ever read or
+#   rewritten here, the same treatment `PagedAttention`'s own tuning-only
+#   attributes already get.
+# - `com.microsoft::GatedRMSNorm`/`LinearAttentionGate` (schema confirmed
+#   live via ``onnxruntime.capi.onnxruntime_pybind11_state.get_all_operator_schema()``
+#   against this environment's installed onnxruntime 1.29.0, ``since_version``
+#   1 each -- contrib ops, NOT yet promoted to the ONNX standard the way
+#   `CausalConvWithState`/`LinearAttention` themselves already have been):
+#   `GatedRMSNorm` ("Gated RMS normalization as used by Mamba2/gated DeltaNet
+#   attention outputs") would, if recognized as a pass-through hop after a
+#   pruned `LinearAttention`'s raw `output`, let a chain whose consumer sits
+#   on the *other* side of one propagate the new, smaller `H_q * d_v` width
+#   through it (its own `scale` input is `(C,)`-shaped, `C` the per-head
+#   normalization group width -- `d_v` here -- so slicing would need to
+#   reduce *which* `H_q` groups of `C` survive, not `C` itself, a genuinely
+#   different axis-selection shape from every other per-channel hop this
+#   module already recognizes). **Deliberately out of scope for this
+#   feature**: a chain whose `LinearAttention` output feeds a consumer
+#   directly, or through the plain shape-preserving `Reshape` hop
+#   :func:`_walk_to_attention_consumer` already recognizes, is pruned; one
+#   that must additionally cross a `GatedRMSNorm` node is left completely
+#   unmatched (the same "unmatched topology" outcome, not a silent gap) --
+#   see this feature's own top-level scope note for why this was judged not
+#   worth the additional new per-head-group-selection machinery within this
+#   task's own time budget. `LinearAttentionGate` is discussed above
+#   (`decay`/`beta`'s own scope boundary); `GatedAdd` (`com.microsoft`,
+#   `since_version=1`, "Adds one tensor to another tensor scaled by a
+#   per-row gate") is unrelated to this op's own head/KV-group axis
+#   entirely (its own `gate` is per-*row* -- shape ``(..., 1)`` -- broadcasting
+#   over the full channel width, not a per-head one) and was investigated
+#   only to confirm it plays no role here, not because any chain in this
+#   module could cross it meaningfully.
+def _match_linear_attention_producer(
+    node: onnx.NodeProto, initializer_map: Dict[str, onnx.TensorProto]
+) -> Optional[Tuple[int, int]]:
+    """If `node` is a plain ``ai.onnx::LinearAttention`` node (opset 27+,
+    domain ``""``) this module can safely act on, returns ``(q_num_heads,
+    kv_num_heads)`` -- the same shape :func:`_match_gqa_producer`/
+    :func:`_match_paged_attention_producer` return, reusing the identical
+    :class:`_GQAChain`/:func:`_apply_one_gqa_chain`/:func:`_gqa_group_importance`
+    whole-KV-group machinery this whole family shares. See this section's
+    own comment above for the full empirical schema findings; in short,
+    `query`/`key`/`value` (indices 0/1/2) are already-projected activation
+    tensors (Q's/K's/V's own separate producers are what gets pruned), a
+    constant `past_state` (index 3) is validated here to be the documented
+    rank-4 `(*, kv_num_heads, *, *)` shape (dynamic needs no check, left
+    alone entirely -- the caller's own runtime data), and `decay`/`beta`
+    (indices 4/5) -- see this section's own comment for the full reasoning
+    -- decline the whole match outright whenever either is connected but
+    *not* a constant, since nothing here can confirm a dynamic one's own
+    producer will still emit the correct post-pruning width. `beta`'s own
+    exact-shape check (its two documented shapes don't need `head_size` to
+    tell apart) runs here; `decay`'s own (which does) is deferred to
+    :func:`_find_linear_attention_chains`.
+    """
+    if node.domain != "" or node.op_type != "LinearAttention":
+        return None
+    if len(node.input) < 3:
+        return None
+    if not (node.input[0] and node.input[1] and node.input[2]):
+        return None
+
+    q_num_heads = kv_num_heads = None
+    for attr in node.attribute:
+        if attr.name == "q_num_heads":
+            q_num_heads = attr.i
+        elif attr.name == "kv_num_heads":
+            kv_num_heads = attr.i
+    if not q_num_heads or not kv_num_heads or q_num_heads <= 0 or kv_num_heads <= 0:
+        return None
+    if q_num_heads % kv_num_heads != 0:
+        return None
+
+    if len(node.input) > 3 and node.input[3]:
+        ps_init = initializer_map.get(node.input[3])
+        if ps_init is not None and (
+            not _is_supported_float_dtype(ps_init.data_type)
+            or len(ps_init.dims) != 4
+            or ps_init.dims[1] != kv_num_heads
+        ):
+            return None  # not the schema's own (B, kv_num_heads, d_k, d_v) shape
+
+    for idx in (4, 5):
+        if len(node.input) > idx and node.input[idx]:
+            extra_init = initializer_map.get(node.input[idx])
+            if extra_init is None:
+                return (
+                    None  # dynamic decay/beta -- declined, see this section's comment
+                )
+            if (
+                not _is_supported_float_dtype(extra_init.data_type)
+                or len(extra_init.dims) != 3
+            ):
+                return None
+
+    if len(node.input) > 5 and node.input[5]:
+        beta_init = initializer_map.get(node.input[5])
+        if beta_init is not None and beta_init.dims[-1] not in (kv_num_heads, 1):
+            return None  # neither of beta's own two documented shapes
+
+    return q_num_heads, kv_num_heads
+
+
 def _match_packed_qkv_split(
     split_node: onnx.NodeProto,
     initializer_map: Dict[str, onnx.TensorProto],
@@ -14345,6 +14812,56 @@ def _find_paged_attention_chains(graph: onnx.GraphProto) -> List[_GQAChain]:
     )
 
 
+def _find_linear_attention_chains(graph: onnx.GraphProto) -> List[_GQAChain]:
+    """The plain ``ai.onnx::LinearAttention`` analogue of
+    :func:`_find_gqa_chains`/:func:`_find_onnx_attention_chains` -- see
+    :func:`_find_separate_qkv_chains` (the shared body) and
+    :func:`_match_linear_attention_producer` (what's matched and why it's
+    declined otherwise, including the full empirical schema dump this whole
+    function was built from). Passes ``allow_differing_v_head_size=True``:
+    this op's own schema keeps `d_k`/`d_v` fully independent (`value`'s own
+    packed width is `H_kv * d_v`, `key`'s is `H_kv * d_k`, with no
+    requirement the two agree), the same as the plain ai.onnx `Attention`
+    op/`MultiHeadAttention`.
+
+    Performs the one deferred check :func:`_match_linear_attention_producer`
+    itself cannot -- it doesn't yet know `head_size` (resolved only here,
+    from Q's own producer weight, by :func:`_find_separate_qkv_chains`
+    itself): a connected constant `decay` (index 4) must be exactly one of
+    its own two documented shapes -- ``(*, *, kv_num_heads)`` (DeltaNet/
+    RetNet, per-head scalar decay) or ``(*, *, kv_num_heads * head_size)``
+    (GLA/RWKV-6, per-key-dimension decay, `head_size` being Q's/K's shared
+    per-head width -- *not* V's own, independent `v_head_size`) -- anything
+    else declines the whole chain here, the same "don't guess" bar every
+    other deferred shape check in this section already holds (mirroring
+    `PagedAttention`'s own deferred `q_norm_weight`/`k_norm_weight`
+    exact-shape check). A *dynamic* `decay`/`beta` was already declined
+    outright at match time (see :func:`_match_linear_attention_producer`'s
+    own docstring for why) -- nothing here is reachable for that case.
+    """
+    chains = _find_separate_qkv_chains(
+        graph,
+        _match_linear_attention_producer,
+        "q_num_heads",
+        allow_differing_v_head_size=True,
+    )
+    initializer_map = {t.name: t for t in graph.initializer}
+    out = []
+    for chain in chains:
+        decay_name = chain.node.input[4] if len(chain.node.input) > 4 else ""
+        if decay_name:
+            decay_init = initializer_map.get(decay_name)
+            if decay_init is not None:
+                last = decay_init.dims[-1] if len(decay_init.dims) else -1
+                if last not in (
+                    chain.kv_num_heads,
+                    chain.kv_num_heads * chain.head_size,
+                ):
+                    continue  # neither of decay's own two documented shapes
+        out.append(chain)
+    return out
+
+
 def _plain_attention_head_importance(
     chain: _AttentionChain,
     wq: np.ndarray,
@@ -14791,8 +15308,24 @@ def _apply_one_gqa_chain(
         chain.node.domain == _ATTENTION_DOMAIN
         and chain.node.op_type == "PagedAttention"
     )
+    # `LinearAttention`'s own `past_state` (index 3) is a single combined
+    # tensor, not a `past_key`/`past_value` *pair* the way every other op
+    # in this family has -- handled in its own dedicated block below, not
+    # via `past_kv_indices` (whose own per-index `_slice_axis1` call
+    # assumes a pair; `chain.node.input[4]`/`[5]` are this op's own
+    # `decay`/`beta`, not a second cache tensor, so it must be excluded
+    # from the `else` branch below too).
+    is_linear_attention = chain.node.domain == "" and chain.node.op_type == (
+        "LinearAttention"
+    )
     past_kv_indices = (
-        (3, 4) if is_gqa else (6, 7) if is_mha else () if is_paged else (4, 5)
+        (3, 4)
+        if is_gqa
+        else (6, 7)
+        if is_mha
+        else ()
+        if is_paged or is_linear_attention
+        else (4, 5)
     )
     for idx in past_kv_indices:
         if len(chain.node.input) <= idx or not chain.node.input[idx]:
@@ -14841,6 +15374,44 @@ def _apply_one_gqa_chain(
                 _slice_axis(scale_init, keep_groups, 0)
             # else: PER_TENSOR broadcast scalar -- no per-head axis to slice
 
+    # `LinearAttention`'s own `past_state`/`decay`/`beta` (indices 3/4/5 --
+    # see this module's own "Attention-head pruning" section comment, the
+    # `LinearAttention` bullet, for the full empirical schema findings and
+    # why a *dynamic* `decay`/`beta` already declined the whole match at
+    # :func:`_match_linear_attention_producer` time -- nothing reaches this
+    # block for that case). `past_state` (rank-4 `(B, kv_num_heads, d_k,
+    # d_v)`) is the closest analogue of `GroupQueryAttention`'s own
+    # `past_key`/`past_value`, sliced the identical axis-1 way when
+    # constant. `decay` (rank-3) is either `kv_num_heads`-wide (DeltaNet/
+    # RetNet, per-head scalar -- sliced directly by `keep_groups`, no
+    # `head_size` expansion) or `kv_num_heads * d`-wide (GLA/RWKV-6,
+    # per-key-dimension -- sliced by the same per-head *column* expansion
+    # K's own producer weight gets, :func:`_head_column_indices`); already
+    # confirmed to be exactly one of these two shapes, or dynamic, by
+    # :func:`_find_linear_attention_chains`'s own deferred check, so no
+    # `else` branch here needs to guess at a third shape. `beta` (rank-3,
+    # `kv_num_heads`-wide or a size-1 broadcast) is sliced only in the
+    # former case -- the latter needs no per-head slicing at all, the same
+    # "PER_TENSOR broadcast, left alone" reasoning as `k_scale`/`v_scale`
+    # above.
+    if is_linear_attention:
+        if len(chain.node.input) > 3 and chain.node.input[3]:
+            past_state_init = initializer_map.get(chain.node.input[3])
+            if past_state_init is not None:
+                _slice_axis1(past_state_init, keep_groups)
+        if len(chain.node.input) > 4 and chain.node.input[4]:
+            decay_init = initializer_map.get(chain.node.input[4])
+            if decay_init is not None:
+                last = decay_init.dims[-1]
+                if last == h:
+                    _slice_last_axis(decay_init, keep_groups)
+                elif last == h * d:
+                    _slice_last_axis(decay_init, _head_column_indices(keep_groups, d))
+        if len(chain.node.input) > 5 and chain.node.input[5]:
+            beta_init = initializer_map.get(chain.node.input[5])
+            if beta_init is not None and beta_init.dims[-1] == h:
+                _slice_last_axis(beta_init, keep_groups)
+
     # `attention_bias`/`attn_mask` (index 10 for `GroupQueryAttention`, 3
     # for the plain ai.onnx op, 5 for `MultiHeadAttention` -- see
     # `_match_gqa_producer`'s, `_match_onnx_attention_producer`'s, and
@@ -14854,8 +15425,19 @@ def _apply_one_gqa_chain(
     # equivalent input on its own schema at all (confirmed off the same live
     # schema dump this whole family was built from), so this whole block is
     # skipped for it outright -- `chain.node.input[3]` (`key_cache` for
-    # `PagedAttention`) must never be mistaken for one.
-    mask_idx = 10 if is_gqa else 5 if is_mha else None if is_paged else 3
+    # `PagedAttention`, `past_state` for `LinearAttention`) must never be
+    # mistaken for one. `LinearAttention` has no `attention_bias`/`attn_mask`-
+    # equivalent input on its own schema either (confirmed off the same live
+    # schema dump), so it is excluded here the same way `PagedAttention` is.
+    mask_idx = (
+        10
+        if is_gqa
+        else 5
+        if is_mha
+        else None
+        if is_paged or is_linear_attention
+        else 3
+    )
     if (
         mask_idx is not None
         and len(chain.node.input) > mask_idx
@@ -14929,7 +15511,12 @@ def _apply_one_gqa_chain(
                 onnx.numpy_helper.from_array(dims, name=shape_init.name)
             )
 
-    stale = {chain.node.output[0]}
+    # Every output, not just [0] -- `LinearAttention`'s own second output,
+    # `present_state`, is never sliced (a runtime output, not a weight --
+    # see this module's own "Attention-head pruning" section comment) but
+    # still needs marking stale; every other op in this family has exactly
+    # one output, so `set(chain.node.output)` is unchanged behavior for them.
+    stale = set(chain.node.output)
     stale.update(op.output[0] for op, _ in chain.chain_ops)
     for hop in (chain.q_norm_rope, chain.k_norm_rope):
         if hop is not None:
@@ -15125,6 +15712,7 @@ def apply_attention_head_pruning(
         *_find_onnx_attention_chains(graph),
         *_find_mha_chains(graph),
         *_find_paged_attention_chains(graph),
+        *_find_linear_attention_chains(graph),
     ]
     if chains:
         _apply_attention_chains(
@@ -15276,6 +15864,7 @@ def apply_attention_head_wanda_pruning(
         *_find_onnx_attention_chains(graph),
         *_find_mha_chains(graph),
         *_find_paged_attention_chains(graph),
+        *_find_linear_attention_chains(graph),
     ]
     if not chains:
         return out
@@ -23501,11 +24090,13 @@ def _attention_not_eligible(
     not_eligible = []
     for node in graph.node:
         is_attn_like = (
-            node.op_type == "Attention" and node.domain in (_ATTENTION_DOMAIN, "")
-        ) or (
-            node.op_type
-            in ("GroupQueryAttention", "MultiHeadAttention", "PagedAttention")
-            and node.domain == _ATTENTION_DOMAIN
+            (node.op_type == "Attention" and node.domain in (_ATTENTION_DOMAIN, ""))
+            or (
+                node.op_type
+                in ("GroupQueryAttention", "MultiHeadAttention", "PagedAttention")
+                and node.domain == _ATTENTION_DOMAIN
+            )
+            or (node.op_type == "LinearAttention" and node.domain == "")
         )
         if not is_attn_like or id(node) in matched_ids:
             continue
@@ -23563,6 +24154,14 @@ def _analyze_attention_chains(
                 family = "attention_mha_head"
             elif chain.node.op_type == "PagedAttention":
                 family = "attention_paged_group"
+            elif chain.node.op_type == "LinearAttention" and chain.node.domain == "":
+                # Plain ai.onnx domain, unlike every other op this shared
+                # machinery reports here -- its own dedicated family string
+                # keeps it distinguishable in a sensitivity report the same
+                # way `attention_paged_group` does for `PagedAttention` --
+                # see this module's own "Attention-head pruning" section
+                # comment, the `LinearAttention` bullet.
+                family = "linear_attention_group"
             else:
                 family = "attention_gqa_group"
         else:
@@ -23687,6 +24286,7 @@ def _analyze_attention_head_pruning(
         *_find_onnx_attention_chains(graph),
         *_find_mha_chains(graph),
         *_find_paged_attention_chains(graph),
+        *_find_linear_attention_chains(graph),
     ]
     layers = _analyze_attention_chains(
         graph,
@@ -23744,6 +24344,7 @@ def _analyze_attention_head_wanda_pruning(
         *_find_onnx_attention_chains(graph),
         *_find_mha_chains(graph),
         *_find_paged_attention_chains(graph),
+        *_find_linear_attention_chains(graph),
     ]
     if not chains:
         return PruningSensitivityReport(

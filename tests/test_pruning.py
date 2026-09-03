@@ -3,6 +3,8 @@ Wanda pruning (calibrated on activation norms), and structured (channel)
 pruning, see ``onnxsim/pruning.py``.
 """
 
+import os
+
 import ml_dtypes
 import numpy as np
 import onnx
@@ -40,6 +42,24 @@ def _f32(array, name):
 
 
 def _run(model, feeds):
+    sess = ort.InferenceSession(
+        model.SerializeToString(), providers=["CPUExecutionProvider"]
+    )
+    return sess.run(None, feeds)
+
+
+def _run27(model, feeds):
+    # `CausalConvWithState`/`LinearAttention` are plain ai.onnx opset 27,
+    # which this environment's onnxruntime treats as "under development"
+    # (`ValidateOpsetForDomain` otherwise refuses to even load the graph --
+    # see onnxsim/pruning.py's own "Conv/pooling/Resize/Pad pass-through"/
+    # "Attention-head pruning" section comments for the empirical finding).
+    # Setting this env var only relaxes that load-time opset-vintage check;
+    # it does not stub out or change either op's own real CPU kernel. Scoped
+    # to just this helper (not a module-level mutation) since only these two
+    # ops' own tests ever need it -- every other test in this file keeps
+    # using plain `_run` against a released opset unaffected either way.
+    os.environ["ALLOW_RELEASED_ONNX_OPSET_ONLY"] = "0"
     sess = ort.InferenceSession(
         model.SerializeToString(), providers=["CPUExecutionProvider"]
     )
@@ -28236,3 +28256,539 @@ def test_paged_attention_not_eligible_lists_unmatched_node():
     )
     assert report.layers == []
     assert report.not_eligible == ["PagedAttention 'paged_orphan'"]
+
+
+# --- CausalConvWithState pass-through (plain ai.onnx, opset 27) ------------
+#
+# Unlike `PagedAttention` above, this op has a real CPU kernel in this
+# environment's onnxruntime 1.29.0 -- see onnxsim/pruning.py's own "Conv/
+# pooling/Resize/Pad pass-through" section comment -- so every test here runs
+# the real fused op end to end (via `_run27`, since opset 27 is still "under
+# development" per onnxruntime's own load-time guard) rather than a
+# decomposed-proxy fallback, and every correctness check compares against an
+# *independently* pruned oracle model/tensor (never the full, unpruned model
+# -- the wrong invariant for pruning).
+
+
+def _causal_conv_model(C=8, K=6, L=5, kernel=3, seed=0, past_state=None, bias=True):
+    # Conv(K -> C, kernel=3) -> CausalConvWithState(C, depthwise, kernel) ->
+    # Conv(C -> Out, kernel=1). `past_state`, if given, is a constant
+    # ``(1, C, kernel - 1)`` array wired as the op's own 4th input; ``None``
+    # leaves it unconnected (needs no slicing at all).
+    rng = np.random.default_rng(seed)
+    w0 = rng.standard_normal((C, K, 3)).astype(np.float32) * 0.5
+    b0 = rng.standard_normal((C,)).astype(np.float32) * 0.1
+    w1 = rng.standard_normal((C, 1, kernel)).astype(np.float32) * 0.5
+    b1 = rng.standard_normal((C,)).astype(np.float32) * 0.1
+    Out = 5
+    w2 = rng.standard_normal((Out, C, 1)).astype(np.float32) * 0.5
+    b2 = rng.standard_normal((Out,)).astype(np.float32) * 0.1
+
+    initializer = [
+        _f32(w0, "W0"),
+        _f32(b0, "B0"),
+        _f32(w1, "W1"),
+        _f32(w2, "W2"),
+        _f32(b2, "B2"),
+    ]
+    cc_inputs = "h0, W1"
+    if bias:
+        initializer.append(_f32(b1, "B1"))
+        cc_inputs += ", B1"
+    else:
+        cc_inputs += ", "
+    if past_state is not None:
+        initializer.append(_f32(np.asarray(past_state), "PastState"))
+        cc_inputs += ", PastState"
+
+    body = f"""
+        g (float[1,{K},{L}] X) => (float[1,{Out},{L}] Y)
+        {{
+          h0 = Conv<kernel_shape=[3], pads=[1,1]>(X, W0, B0)
+          h1, ps = CausalConvWithState<activation="none">({cc_inputs})
+          Y = Conv<kernel_shape=[1]>(h1, W2, B2)
+        }}
+        """
+    model = _model(body, opset=27)
+    model.graph.initializer.extend(initializer)
+    return model, dict(
+        C=C,
+        K=K,
+        L=L,
+        kernel=kernel,
+        Out=Out,
+        w0=w0,
+        b0=b0,
+        w1=w1,
+        b1=b1 if bias else None,
+        w2=w2,
+        b2=b2,
+    )
+
+
+def _causal_conv_node(model):
+    return next(n for n in model.graph.node if n.op_type == "CausalConvWithState")
+
+
+def test_causal_conv_with_state_pass_through_shrinks_matched_chain_matches_oracle():
+    model, cfg = _causal_conv_model(C=8, K=6, L=5, kernel=3, seed=0)
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    # No `group` attribute is ever added to a non-Conv hop node.
+    node = _causal_conv_node(pruned)
+    assert [a.name for a in node.attribute] == ["activation"]
+
+    dims = _initializer_dims(pruned)
+    assert dims["W0"][0] == 4  # C halved
+    assert dims["W1"][0] == 4  # depthwise weight follows the same keep set
+    assert dims["W2"][1] == 4  # consumer's in_channels axis
+
+    # Independently reconstruct the keep set (L2-norm-of-output-filter
+    # ranking, the same criterion apply_structured_pruning documents).
+    imp = np.linalg.norm(cfg["w0"].reshape(cfg["C"], -1), axis=1)
+    keep = np.sort(np.argsort(-imp)[: cfg["C"] // 2])
+
+    rng = np.random.default_rng(123)
+    x = rng.standard_normal((1, cfg["K"], cfg["L"])).astype(np.float32)
+    y_pruned = _run27(pruned, {"X": x})[0]
+
+    oracle, _ = _causal_conv_model(
+        C=len(keep), K=cfg["K"], L=cfg["L"], kernel=cfg["kernel"]
+    )
+    oracle_inits = {
+        "W0": cfg["w0"][keep],
+        "B0": cfg["b0"][keep],
+        "W1": cfg["w1"][keep],
+        "B1": cfg["b1"][keep],
+        "W2": cfg["w2"][:, keep, :],
+        "B2": cfg["b2"],
+    }
+    for init in oracle.graph.initializer:
+        init.CopyFrom(onnx.numpy_helper.from_array(oracle_inits[init.name], init.name))
+    y_oracle = _run27(oracle, {"X": x})[0]
+    np.testing.assert_array_equal(y_pruned, y_oracle)
+
+
+def test_causal_conv_with_state_pass_through_zero_sparsity_is_a_no_op():
+    model, cfg = _causal_conv_model(C=8, K=6, L=5, kernel=3, seed=1)
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.0)
+    dims = _initializer_dims(pruned)
+    assert dims["W0"][0] == cfg["C"]
+    assert dims["W1"][0] == cfg["C"]
+
+
+def test_causal_conv_with_state_pass_through_constant_past_state_sliced():
+    C, kernel = 8, 3
+    rng = np.random.default_rng(2)
+    past = rng.standard_normal((1, C, kernel - 1)).astype(np.float32)
+    model, cfg = _causal_conv_model(
+        C=C, K=6, L=5, kernel=kernel, seed=2, past_state=past
+    )
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    imp = np.linalg.norm(cfg["w0"].reshape(C, -1), axis=1)
+    keep = np.sort(np.argsort(-imp)[: C // 2])
+
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    np.testing.assert_array_equal(inits["PastState"], past[:, keep, :])
+
+
+def test_causal_conv_with_state_pass_through_dynamic_past_state_left_as_graph_input():
+    # A `past_state` fed by an ordinary graph input (dynamic -- the caller's
+    # own runtime data) needs no slicing at all, and never blocks the match.
+    C, K, L, kernel = 8, 6, 5, 3
+    rng = np.random.default_rng(3)
+    w0 = rng.standard_normal((C, K, 3)).astype(np.float32) * 0.5
+    b0 = rng.standard_normal((C,)).astype(np.float32) * 0.1
+    w1 = rng.standard_normal((C, 1, kernel)).astype(np.float32) * 0.5
+    Out = 5
+    w2 = rng.standard_normal((Out, C, 1)).astype(np.float32) * 0.5
+    b2 = rng.standard_normal((Out,)).astype(np.float32) * 0.1
+    body = f"""
+        g (float[1,{K},{L}] X, float[1,{C},{kernel - 1}] PastIn) => (float[1,{Out},{L}] Y)
+        {{
+          h0 = Conv<kernel_shape=[3], pads=[1,1]>(X, W0, B0)
+          h1, ps = CausalConvWithState<activation="none">(h0, W1, , PastIn)
+          Y = Conv<kernel_shape=[1]>(h1, W2, B2)
+        }}
+        """
+    model = _model(body, opset=27)
+    model.graph.initializer.extend(
+        [_f32(w0, "W0"), _f32(b0, "B0"), _f32(w1, "W1"), _f32(w2, "W2"), _f32(b2, "B2")]
+    )
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    dims = _initializer_dims(pruned)
+    assert dims["W0"][0] == C // 2
+    assert dims["W1"][0] == C // 2
+    # `PastIn` is a graph input, not an initializer -- nothing to check for
+    # slicing; the checker above already confirms the graph is still valid
+    # (the op's own `channels` count is inferred purely from `W1`'s shape).
+
+
+def test_causal_conv_with_state_pass_through_no_spurious_group_attribute():
+    model, _ = _causal_conv_model(C=8, K=6, L=5, kernel=3, seed=4)
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    node = _causal_conv_node(pruned)
+    assert not any(a.name == "group" for a in node.attribute)
+
+
+def test_analyze_structured_pruning_causal_conv_matches_real_call():
+    model, cfg = _causal_conv_model(C=8, K=6, L=5, kernel=3, seed=5)
+    report = onnxsim.analyze_pruning_sensitivity(
+        model, onnxsim.apply_structured_pruning, sparsity=0.5
+    )
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    dims = _initializer_dims(pruned)
+    matched = [layer for layer in report.layers if layer.total == cfg["C"]]
+    assert len(matched) == 1
+    assert matched[0].would_drop == cfg["C"] - dims["W1"][0]
+
+
+# --- LinearAttention head pruning (plain ai.onnx, opset 27) -----------------
+#
+# Reuses the `GroupQueryAttention`-family's own whole-KV-group machinery
+# (`_GQAChain`/`_apply_one_gqa_chain`/`_gqa_group_importance`) -- see
+# onnxsim/pruning.py's own "Attention-head pruning" section comment, the
+# `LinearAttention` bullet, for the full empirical schema findings and scope
+# boundary (a *dynamic* `decay`/`beta` declines the whole match outright).
+# This op, like `CausalConvWithState` above, has a real CPU kernel in this
+# environment's onnxruntime, so every test runs the real fused op end to end.
+
+
+def _linear_attention_model(
+    Hq=4,
+    Hkv=2,
+    Dk=4,
+    Dv=4,
+    K=16,
+    update_rule="linear",
+    past_state=None,
+    decay=None,
+    beta=None,
+    seed=0,
+):
+    rng = np.random.default_rng(seed)
+    Nq, Nkv_k, Nkv_v = Hq * Dk, Hkv * Dk, Hkv * Dv
+    wq = rng.standard_normal((K, Nq)).astype(np.float32) * 0.3
+    wk = rng.standard_normal((K, Nkv_k)).astype(np.float32) * 0.3
+    wv = rng.standard_normal((K, Nkv_v)).astype(np.float32) * 0.3
+    wo = rng.standard_normal((Nq, K)).astype(np.float32) * 0.3
+
+    initializer = [_f32(wq, "Wq"), _f32(wk, "Wk"), _f32(wv, "Wv"), _f32(wo, "Wo")]
+    operands = ["q", "k", "v"]
+    if past_state is not None or decay is not None or beta is not None:
+        if past_state is not None:
+            initializer.append(_f32(np.asarray(past_state), "PastState"))
+            operands.append("PastState")
+        else:
+            operands.append("")
+    if decay is not None or beta is not None:
+        if decay is not None:
+            initializer.append(_f32(np.asarray(decay), "Decay"))
+            operands.append("Decay")
+        else:
+            operands.append("")
+    if beta is not None:
+        initializer.append(_f32(np.asarray(beta), "Beta"))
+        operands.append("Beta")
+
+    body = f"""
+        g (float[1,3,{K}] X) => (float[1,3,{K}] Y)
+        {{
+          q = MatMul(X, Wq)
+          k = MatMul(X, Wk)
+          v = MatMul(X, Wv)
+          attn_out, ps = LinearAttention<q_num_heads={Hq}, kv_num_heads={Hkv}, update_rule="{update_rule}">({", ".join(operands)})
+          Y = MatMul(attn_out, Wo)
+        }}
+        """
+    model = _model(body, opset=27)
+    model.graph.initializer.extend(initializer)
+    return model, dict(Hq=Hq, Hkv=Hkv, Dk=Dk, Dv=Dv, K=K, wq=wq, wk=wk, wv=wv, wo=wo)
+
+
+def _linear_attention_node(model):
+    return next(n for n in model.graph.node if n.op_type == "LinearAttention")
+
+
+def _linear_attention_keep_groups(cfg, sparsity):
+    Hq, Hkv, Dk = cfg["Hq"], cfg["Hkv"], cfg["Dk"]
+    group_size = Hq // Hkv
+    importance = np.zeros(Hkv)
+    for g in range(Hkv):
+        qc = cfg["wq"][:, g * group_size * Dk : (g + 1) * group_size * Dk]
+        kc = cfg["wk"][:, g * Dk : (g + 1) * Dk]
+        vc = cfg["wv"][:, g * cfg["Dv"] : (g + 1) * cfg["Dv"]]
+        importance[g] = np.sqrt(
+            np.linalg.norm(qc) ** 2 + np.linalg.norm(kc) ** 2 + np.linalg.norm(vc) ** 2
+        )
+    keep_count = max(1, Hkv - round(Hkv * sparsity))
+    return np.sort(np.argsort(-importance)[:keep_count])
+
+
+def _linear_attention_oracle(cfg, keep_groups, update_rule, past_state, decay, beta):
+    Hq, Hkv, Dk, Dv, K = cfg["Hq"], cfg["Hkv"], cfg["Dk"], cfg["Dv"], cfg["K"]
+    group_size = Hq // Hkv
+    keep_q_heads = np.concatenate(
+        [np.arange(g * group_size, (g + 1) * group_size) for g in keep_groups]
+    )
+
+    def col_idx(heads, width):
+        return np.concatenate([np.arange(h * width, (h + 1) * width) for h in heads])
+
+    q_idx = col_idx(keep_q_heads, Dk)
+    k_idx = col_idx(keep_groups, Dk)
+    v_idx = col_idx(keep_groups, Dv)
+    y_idx = col_idx(keep_q_heads, Dv)
+
+    new_ps = (
+        None if past_state is None else np.asarray(past_state)[:, keep_groups, :, :]
+    )
+    new_decay = None
+    if decay is not None:
+        decay_arr = np.asarray(decay)
+        if decay_arr.shape[-1] == Hkv:
+            new_decay = decay_arr[:, :, keep_groups]
+        else:
+            new_decay = decay_arr[:, :, col_idx(keep_groups, Dk)]
+    new_beta = None
+    if beta is not None:
+        beta_arr = np.asarray(beta)
+        new_beta = (
+            beta_arr[:, :, keep_groups] if beta_arr.shape[-1] == Hkv else beta_arr
+        )
+
+    oracle, _ = _linear_attention_model(
+        Hq=len(keep_q_heads),
+        Hkv=len(keep_groups),
+        Dk=Dk,
+        Dv=Dv,
+        K=K,
+        update_rule=update_rule,
+        past_state=new_ps,
+        decay=new_decay,
+        beta=new_beta,
+    )
+    oracle_vals = {
+        "Wq": cfg["wq"][:, q_idx],
+        "Wk": cfg["wk"][:, k_idx],
+        "Wv": cfg["wv"][:, v_idx],
+        "Wo": cfg["wo"][y_idx, :],
+    }
+    if new_ps is not None:
+        oracle_vals["PastState"] = new_ps
+    if new_decay is not None:
+        oracle_vals["Decay"] = new_decay
+    if new_beta is not None:
+        oracle_vals["Beta"] = new_beta
+    for init in oracle.graph.initializer:
+        init.CopyFrom(
+            onnx.numpy_helper.from_array(
+                np.ascontiguousarray(oracle_vals[init.name]), init.name
+            )
+        )
+    return oracle, (new_ps, new_decay, new_beta)
+
+
+def test_linear_attention_pruning_linear_mode_shrinks_matched_block_matches_oracle():
+    model, cfg = _linear_attention_model(Hq=4, Hkv=2, Dk=4, Dv=4, K=16, seed=0)
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    keep_groups = _linear_attention_keep_groups(cfg, sparsity=0.5)
+    node = _linear_attention_node(pruned)
+    q_attr = next(a.i for a in node.attribute if a.name == "q_num_heads")
+    kv_attr = next(a.i for a in node.attribute if a.name == "kv_num_heads")
+    assert kv_attr == len(keep_groups)
+    assert q_attr == len(keep_groups) * (cfg["Hq"] // cfg["Hkv"])
+
+    oracle, _ = _linear_attention_oracle(cfg, keep_groups, "linear", None, None, None)
+    onnx.checker.check_model(oracle)
+    rng = np.random.default_rng(42)
+    x = rng.standard_normal((1, 3, cfg["K"])).astype(np.float32)
+    y_pruned = _run27(pruned, {"X": x})[0]
+    y_oracle = _run27(oracle, {"X": x})[0]
+    np.testing.assert_array_equal(y_pruned, y_oracle)
+
+
+def test_linear_attention_pruning_zero_sparsity_is_a_no_op():
+    model, cfg = _linear_attention_model(Hq=4, Hkv=2, Dk=4, Dv=4, K=16, seed=1)
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.0)
+    dims = _initializer_dims(pruned)
+    assert dims["Wq"][1] == cfg["Hq"] * cfg["Dk"]
+
+
+def test_linear_attention_pruning_delta_mode_slices_past_state_and_beta_matches_oracle():
+    Hq, Hkv, Dk, Dv, K = 4, 2, 4, 4, 16
+    rng = np.random.default_rng(2)
+    past_state = rng.standard_normal((1, Hkv, Dk, Dv)).astype(np.float32)
+    beta = (np.abs(rng.standard_normal((1, 3, Hkv))) * 0.1).astype(np.float32)
+    model, cfg = _linear_attention_model(
+        Hq=Hq,
+        Hkv=Hkv,
+        Dk=Dk,
+        Dv=Dv,
+        K=K,
+        update_rule="delta",
+        past_state=past_state,
+        beta=beta,
+        seed=2,
+    )
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    keep_groups = _linear_attention_keep_groups(cfg, sparsity=0.5)
+    oracle, (new_ps, _, new_beta) = _linear_attention_oracle(
+        cfg, keep_groups, "delta", past_state, None, beta
+    )
+    onnx.checker.check_model(oracle)
+
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    np.testing.assert_array_equal(inits["PastState"], new_ps)
+    np.testing.assert_array_equal(inits["Beta"], new_beta)
+
+    rng2 = np.random.default_rng(43)
+    x = rng2.standard_normal((1, 3, K)).astype(np.float32)
+    y_pruned = _run27(pruned, {"X": x})[0]
+    y_oracle = _run27(oracle, {"X": x})[0]
+    np.testing.assert_array_equal(y_pruned, y_oracle)
+
+
+def test_linear_attention_pruning_gated_mode_slices_gla_decay_matches_oracle():
+    # GLA/RWKV-6 mode: decay is per-key-dimension, width kv_num_heads * d_k
+    # -- distinct from DeltaNet/RetNet's own per-head-scalar width, and must
+    # NOT be conflated with it (see onnxsim/pruning.py's own docstring).
+    Hq, Hkv, Dk, Dv, K = 4, 2, 4, 4, 16
+    rng = np.random.default_rng(3)
+    decay = (-np.abs(rng.standard_normal((1, 3, Hkv * Dk))) * 0.1).astype(np.float32)
+    model, cfg = _linear_attention_model(
+        Hq=Hq, Hkv=Hkv, Dk=Dk, Dv=Dv, K=K, update_rule="gated", decay=decay, seed=3
+    )
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    keep_groups = _linear_attention_keep_groups(cfg, sparsity=0.5)
+    oracle, (_, new_decay, _) = _linear_attention_oracle(
+        cfg, keep_groups, "gated", None, decay, None
+    )
+    onnx.checker.check_model(oracle)
+
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    np.testing.assert_array_equal(inits["Decay"], new_decay)
+    assert inits["Decay"].shape[-1] == len(keep_groups) * Dk
+
+    rng2 = np.random.default_rng(44)
+    x = rng2.standard_normal((1, 3, K)).astype(np.float32)
+    y_pruned = _run27(pruned, {"X": x})[0]
+    y_oracle = _run27(oracle, {"X": x})[0]
+    np.testing.assert_array_equal(y_pruned, y_oracle)
+
+
+def test_linear_attention_pruning_dynamic_decay_is_declined():
+    # A `decay` fed by anything other than a constant initializer (the
+    # realistic shape for a real GLA/DeltaNet export -- e.g. a
+    # `LinearAttentionGate` node) declines the whole match outright -- see
+    # onnxsim/pruning.py's own docstring for why this is the safe, deliberate
+    # scope boundary rather than a guess.
+    Hq, Hkv, Dk, Dv, K = 4, 2, 4, 4, 16
+    body = f"""
+        g (float[1,3,{K}] X, float[1,3,{Hkv}] DecayIn) => (float[1,3,{K}] Y)
+        {{
+          q = MatMul(X, Wq)
+          k = MatMul(X, Wk)
+          v = MatMul(X, Wv)
+          attn_out, ps = LinearAttention<q_num_heads={Hq}, kv_num_heads={Hkv}, update_rule="gated">(q, k, v, , DecayIn)
+          Y = MatMul(attn_out, Wo)
+        }}
+        """
+    rng = np.random.default_rng(4)
+    wq = rng.standard_normal((K, Hq * Dk)).astype(np.float32) * 0.3
+    wk = rng.standard_normal((K, Hkv * Dk)).astype(np.float32) * 0.3
+    wv = rng.standard_normal((K, Hkv * Dv)).astype(np.float32) * 0.3
+    wo = rng.standard_normal((Hq * Dk, K)).astype(np.float32) * 0.3
+    model = _model(body, opset=27)
+    model.graph.initializer.extend(
+        [_f32(wq, "Wq"), _f32(wk, "Wk"), _f32(wv, "Wv"), _f32(wo, "Wo")]
+    )
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    dims = _initializer_dims(pruned)
+    assert dims["Wq"] == (K, Hq * Dk)  # completely untouched -- no match
+
+
+def test_linear_attention_pruning_dynamic_beta_is_declined():
+    Hq, Hkv, Dk, Dv, K = 4, 2, 4, 4, 16
+    body = f"""
+        g (float[1,3,{K}] X, float[1,3,{Hkv}] BetaIn) => (float[1,3,{K}] Y)
+        {{
+          q = MatMul(X, Wq)
+          k = MatMul(X, Wk)
+          v = MatMul(X, Wv)
+          attn_out, ps = LinearAttention<q_num_heads={Hq}, kv_num_heads={Hkv}, update_rule="delta">(q, k, v, , , BetaIn)
+          Y = MatMul(attn_out, Wo)
+        }}
+        """
+    rng = np.random.default_rng(5)
+    wq = rng.standard_normal((K, Hq * Dk)).astype(np.float32) * 0.3
+    wk = rng.standard_normal((K, Hkv * Dk)).astype(np.float32) * 0.3
+    wv = rng.standard_normal((K, Hkv * Dv)).astype(np.float32) * 0.3
+    wo = rng.standard_normal((Hq * Dk, K)).astype(np.float32) * 0.3
+    model = _model(body, opset=27)
+    model.graph.initializer.extend(
+        [_f32(wq, "Wq"), _f32(wk, "Wk"), _f32(wv, "Wv"), _f32(wo, "Wo")]
+    )
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    dims = _initializer_dims(pruned)
+    assert dims["Wq"] == (K, Hq * Dk)  # completely untouched -- no match
+
+
+def test_linear_attention_not_eligible_lists_unmatched_node():
+    Hq, Hkv, Dk, Dv, K = 4, 2, 4, 4, 16
+    body = f"""
+        g (float[1,3,{K}] X, float[1,3,{Hkv}] DecayIn) => (float[1,3,{K}] Y)
+        {{
+          q = MatMul(X, Wq)
+          k = MatMul(X, Wk)
+          v = MatMul(X, Wv)
+          attn_out, ps = LinearAttention<q_num_heads={Hq}, kv_num_heads={Hkv}, update_rule="gated">(q, k, v, , DecayIn)
+          Y = MatMul(attn_out, Wo)
+        }}
+        """
+    rng = np.random.default_rng(6)
+    wq = rng.standard_normal((K, Hq * Dk)).astype(np.float32) * 0.3
+    wk = rng.standard_normal((K, Hkv * Dk)).astype(np.float32) * 0.3
+    wv = rng.standard_normal((K, Hkv * Dv)).astype(np.float32) * 0.3
+    wo = rng.standard_normal((Hq * Dk, K)).astype(np.float32) * 0.3
+    model = _model(body, opset=27)
+    model.graph.initializer.extend(
+        [_f32(wq, "Wq"), _f32(wk, "Wk"), _f32(wv, "Wv"), _f32(wo, "Wo")]
+    )
+    node = _linear_attention_node(model)
+    node.name = "la_orphan"
+    report = onnxsim.analyze_pruning_sensitivity(
+        model, onnxsim.apply_attention_head_pruning, sparsity=0.5
+    )
+    assert report.layers == []
+    assert report.not_eligible == ["LinearAttention 'la_orphan'"]
+
+
+def test_analyze_attention_head_pruning_linear_attention_matches_real_call():
+    model, cfg = _linear_attention_model(Hq=4, Hkv=2, Dk=4, Dv=4, K=16, seed=7)
+    report = onnxsim.analyze_pruning_sensitivity(
+        model, onnxsim.apply_attention_head_pruning, sparsity=0.5
+    )
+    assert len(report.layers) == 1
+    layer = report.layers[0]
+    assert layer.family == "linear_attention_group"
+    assert layer.total == cfg["Hkv"]
+    assert report.not_eligible == []
+
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    dims_after = _initializer_dims(pruned)
+    kept_groups = cfg["Hkv"] - layer.would_drop
+    group_size = cfg["Hq"] // cfg["Hkv"]
+    assert dims_after["Wq"][1] == kept_groups * group_size * cfg["Dk"]
+    assert dims_after["Wk"][1] == kept_groups * cfg["Dk"]
+    assert dims_after["Wv"][1] == kept_groups * cfg["Dv"]
