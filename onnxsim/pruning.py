@@ -14940,13 +14940,18 @@ def apply_moe_whole_expert_pruning(
 #    default), ``'fp4'``, ``'nvfp4'``, ``'fp8'``, or ``'wfp4afp8'``),
 #    `expert_weight_bits` (2, 4, or 8 -- `quant_type='int'` only), and
 #    `block_size`/`weights_prepacked` (both -- see points 3 and 5 below).
-#    This pass targets `quant_type == 'int'` only, both with no `block_size`
-#    (whole-row per-channel scale, point 2) and with `block_size` set to a
-#    groupwise value (point 3) -- and declines everything else outright
-#    (point 6); the FP4/FP8 modes are a genuinely different tensor format
-#    (MXFP block-scaled, `float8e4m3fn`-packed weights, separate activation
-#    scale operands) this pass was never built or verified against, and
-#    remains explicitly out of scope.
+#    This pass targets `quant_type == 'int'` (both with no `block_size` --
+#    whole-row per-channel scale, point 2 -- and with `block_size` set to a
+#    groupwise value, point 3) and `quant_type == 'nvfp4'` (point 9 below,
+#    the E2M1-packed, block-scaled format OpenAI's gpt-oss family ships in
+#    for ONNX Runtime GenAI) -- and declines everything else outright
+#    (point 6 for `'int'`-specific attribute quirks, point 9 for why only
+#    `'nvfp4'` of the three remaining FP4/FP8 modes is covered); `'fp4'`,
+#    `'fp8'`, and `'wfp4afp8'` are each a genuinely different tensor format
+#    (different block size/scale dtype, or `float8e4m3fn`-element rather
+#    than E2M1-packed weights, or FP8 activation-scale operands nvfp4 has
+#    no equivalent of) this pass was never built or verified against, and
+#    remain explicitly out of scope.
 #
 # 2. *Packing/dequantization ("column-wise", `quant_type='int'`, no
 #    `block_size`).* The op's own doc text says weights are "stored in
@@ -15180,14 +15185,152 @@ def apply_moe_whole_expert_pruning(
 #    this module is held to -- see
 #    ``test_qmoe_whole_expert_pruning_blockwise_int_matches_hand_built_reference``.
 #
+# 9. *`quant_type='nvfp4'` -- added, but on a fundamentally different
+#    verification footing than every point above.* This environment's own
+#    onnxruntime 1.29.0 CPU execution provider has **no kernel at all** for
+#    `quant_type` in ``{'fp4', 'nvfp4', 'fp8', 'wfp4afp8'}`` -- confirmed
+#    directly: a hand-built, otherwise schema-valid `QMoE` node in each of
+#    those four modes fails identically at
+#    ``onnxruntime.InferenceSession(...)`` construction with
+#    ``NOT_IMPLEMENTED : Could not find an implementation for QMoE(1) node
+#    with name ''`` (the FP4/FP8 CUTLASS/TensorRT-LLM-style kernels these
+#    modes need are GPU-only builds; ``onnxruntime.get_available_providers()``
+#    returns only `CPUExecutionProvider`/`AzureExecutionProvider` here). So
+#    unlike every fact above -- each re-derived from a real CPU kernel run,
+#    per this section's own opening paragraph -- nothing below could be
+#    cross-checked against a real `QMoE` execution in this environment at
+#    all; every fact instead comes directly from the *live* schema's own
+#    per-input/per-attribute doc strings (the same `get_all_operator_schema()`
+#    registry every point above already cites), quoted rather than
+#    paraphrased below to keep this honest about schema fact versus this
+#    pass's own inference.
+#
+#    Of the four kernel-less-here modes, this pass adds support for
+#    `'nvfp4'` only -- chosen because it is the exact packed weight format
+#    OpenAI's gpt-oss family ships in for ONNX Runtime GenAI (block_size 16,
+#    `Float8E4M3FN` per-block scales, see below), not because it is any
+#    easier to verify than the other three (it isn't -- all four are
+#    equally unrunnable here). `'fp4'`, `'fp8'`, and `'wfp4afp8'` remain
+#    explicitly out of scope, declined exactly like every other
+#    `quant_type` that isn't `'int'` or `'nvfp4'`, never attempted
+#    "partway" or assumed to share nvfp4's own shape.
+#
+#    The live `quant_type` attribute doc (quoted verbatim): *"'fp4' for
+#    MXFP4 quantization, 'nvfp4' for NVFP4 quantization... When quant_type
+#    is 'fp4' or 'nvfp4', weights are stored in E2M1 FP4 format (2 values
+#    per byte), fc*_scales inputs contain the FP4 block scales, and
+#    fc*_global_scale inputs must be provided. 'fp4' uses Float8E8M0 block
+#    scales with block_size 32; 'nvfp4' uses Float8E4M3FN block scales with
+#    block_size 16."* Combined with the live `fc1_scales`/`fc2_scales`
+#    input doc ("For quant_type='nvfp4', this is a float8e4m3fn NVFP4
+#    block-scale tensor with shape (num_experts, fusion_size * inter_size,
+#    hidden_size / 16)") and the live `block_size` attribute doc ("NVFP4
+#    ('nvfp4') [is normalized] to block_size 16, even when block_size is
+#    omitted"), this pass:
+#      - requires `fc1_experts_weights`/`fc2_experts_weights` still
+#        ``uint8`` (`T1`'s *other* allowed dtype, `float8e4m3fn`, is
+#        `'fp8'`'s own unpacked one-byte-per-weight convention, not
+#        nvfp4's packed one, and stays out of scope) -- packed exactly
+#        like `quant_type='int'`'s own `bits=4` case (2 E2M1 codes per
+#        byte). Reuses :func:`_unpack_subbyte`/:func:`_pack_subbyte` with
+#        `bits=4` unchanged, on the working assumption that ORT's sub-byte
+#        packing convention ("low-index-in-low-bits") is a *shared*,
+#        op-wide storage contract rather than something `quant_type='int'`
+#        alone established (`onnxruntime.quantization.cuda_quantizer`'s
+#        own module doc frames "raw MatMulNBits blockwise storage" and
+#        QMoE's own as the same storage family, consistent with this) --
+#        but, unlike point 2's int4/int8 byte order (pinned down by a real
+#        kernel run), this exact byte order for E2M1 codes specifically
+#        was **never independently confirmed against a real kernel**
+#        (there is none to run here). This pass's own tests confirm only
+#        *internal* consistency -- dequantizing a pruned chain reproduces
+#        exactly what slicing a full dequantized reference would give, the
+#        "slice, don't recompute" property every other pass in this module
+#        is held to -- never agreement with what a real GPU kernel would
+#        actually compute.
+#      - always treats `block_size` as 16 regardless of whether the
+#        attribute is present (the schema's own "normalized... even when
+#        omitted" text above) -- declines an explicit value other than
+#        0/absent/16 defensively, the same posture point 3 takes for
+#        `block_size` values this pass can't independently verify.
+#      - requires `fc1_scales`/`fc2_scales` to be rank-3 `float8e4m3fn`
+#        tensors shaped `(num_experts, N, K / 16)` (the schema's own
+#        nvfp4-specific shape, quoted above), decoded via the OCP
+#        Microscaling (MX) spec's own E2M1 lookup table
+#        (:func:`_e2m1_decode`: magnitude ``{0, 0.5, 1, 1.5, 2, 3, 4, 6}``,
+#        signed by the code's own top bit -- a standard, publicly
+#        documented 4-bit float element format, not something this pass
+#        invented), and requires `fc1_global_scale`/`fc2_global_scale`
+#        present, `float32` (`T4`'s only allowed dtype), shape
+#        `(num_experts,)` -- the schema's own "must be provided" language
+#        for this quant_type. Dequantization
+#        (:func:`_qmoe_dequantize_nvfp4`) is `_e2m1_decode(code) *
+#        block_scale * global_scale`, the standard two-level NVFP4 scale
+#        structure and a direct reading of the schema's own "block scales"
+#        + "global weight scale" language -- but, again, schema-derived,
+#        not kernel-cross-checked.
+#      - requires `fc1_zero_points`/`fc2_zero_points` absent (a
+#        signed/symmetric E2M1 code has no zero-point concept; the
+#        schema's own `zero_point` formula, `(quantized_weight -
+#        zero_point) * scale`, is `quant_type='int'`-specific prose, never
+#        mentioned for the FP4 modes) and `fc1_act_scale`/`fc2_act_scale`/
+#        `fc1_act_block_scale`/`fc2_act_block_scale` absent (the schema's
+#        own doc ties all four explicitly to "FP8 activation modes" --
+#        `'fp8'`/`'wfp4afp8'` -- never `'nvfp4'`, which keeps
+#        float/fp16/bf16 activations).
+#      - still declines `weights_prepacked` values other than -1/0, `fc3`,
+#        and `router_weights` exactly like the `'int'` path (the live
+#        `weights_prepacked` doc says it's "only meaningful when
+#        quant_type='int'", which taken literally would make nvfp4 immune
+#        to this attribute entirely -- declined defensively anyway rather
+#        than trusting that prose over an unrunnable kernel).
+#
+#    Channel pruning's own two weights sit the same way relative to
+#    nvfp4's fixed `block_size=16` as they do for a `block_size=16`
+#    `quant_type='int'` chain (point 3): `fc1`'s blocks group along
+#    `hidden_size` (untouched by an `inter_size` cut), `fc2`'s group along
+#    `inter_size` itself (this pass's own pruned axis), so `fc2_scales`
+#    needs the same block-aligned keep-set resolution
+#    (:func:`_qmoe_block_aligned_keep`, reused entirely unchanged -- it
+#    never depended on `quant_type` to begin with) before ever slicing.
+#    `fc1_global_scale`/`fc2_global_scale` are per-*expert*, not
+#    per-channel -- untouched by an `inter_size`/channel cut, the same
+#    "doesn't depend on this axis" reasoning `fc2_experts_bias` already
+#    gets -- so expert-*channel* pruning never slices them at all; only
+#    whole-*expert* pruning does (point 10).
+#
+# 10. *Whole-expert removal, `quant_type='nvfp4'`.* Point 8's own finding --
+#     every per-expert tensor keeps `num_experts` as its own leading axis
+#     regardless of `block_size`, so a plain leading-axis index-select
+#     slices it correctly with no unpack/repack -- holds unchanged for
+#     nvfp4's own `fc1`/`fc2` weights/scales too (same shape family,
+#     `block_size` only ever a *trailing* axis). The one genuinely new
+#     per-expert tensor this quant_type introduces,
+#     `fc1_global_scale`/`fc2_global_scale` (`(num_experts,)`, absent
+#     entirely for `quant_type='int'`), needs that same leading-axis slice
+#     too -- so :func:`_apply_qmoe_whole_expert_chains` gains one new
+#     (conditionally-present) tensor pair to slice, the only change
+#     whole-expert pruning needed for this quant_type at all. The
+#     masking-equivalence safety argument itself (points 6-7) is
+#     unaffected: `fc1_global_scale`/`fc2_global_scale`, like `fc1`/`fc2`
+#     themselves, are only ever read for an expert actually selected by
+#     top-`k` routing, so a dropped expert's own value -- whatever it is --
+#     is provably never read either way.
+#
 # `router_weights` (input 14, a *separate* DeepSeek-style
-# select/aggregate-with-different-tensors combine-weight operand) and every
-# one of the eight FP4/FP8/global-scale/activation-scale inputs (15-20) are
-# required absent by this pass's own matcher -- naturally so for any real
-# `quant_type='int'` export, but checked explicitly rather than assumed,
+# select/aggregate-with-different-tensors combine-weight operand) is
+# required absent by this pass's own matcher regardless of `quant_type`.
+# For `quant_type='int'`, every one of the eight FP4/FP8/global-scale/
+# activation-scale inputs (15-20) is required absent too -- naturally so
+# for any real `'int'` export, but checked explicitly rather than assumed,
 # since none of their effects on the masking-equivalence argument above (or
 # on `fc1`/`fc2`'s own packed-channel semantics) were independently
-# verified.
+# verified. For `quant_type='nvfp4'` (point 9), `fc1_global_scale`/
+# `fc2_global_scale` (15/16) are instead required *present* (the schema's
+# own "must be provided" language) while `fc1_zero_points`/
+# `fc2_zero_points`/`fc3_zero_points` (11-13) and `fc1_act_scale`/
+# `fc2_act_scale`/`fc1_act_block_scale`/`fc2_act_block_scale` (17-20)
+# remain required absent, per point 9's own reasoning.
 
 
 def _unpack_subbyte(packed: np.ndarray, bits: int, logical_len: int) -> np.ndarray:
@@ -15305,6 +15448,70 @@ def _qmoe_dequantize(
     return (q - zp[:, :, None]) * scale_arr[:, :, None]
 
 
+# E2M1 (1 sign + 2 exponent + 1 mantissa bit) magnitude table, indexed by the
+# code's own low 3 bits -- the OCP Microscaling (MX) spec's own FP4 element
+# format, and the exact one `QMoE`'s live schema names for `quant_type` in
+# ``{'fp4', 'nvfp4'}`` ("weights are stored in E2M1 FP4 format"). A standard,
+# publicly documented 4-bit float format, not something this module invented
+# -- see this section's own top comment, point 9, for why it could only be
+# read off the schema/spec here rather than independently confirmed against
+# a real kernel run (this environment's CPU `QMoE` kernel implements neither
+# `'fp4'` nor `'nvfp4'` at all).
+_E2M1_MAGNITUDE = np.array([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], dtype=np.float64)
+
+
+def _e2m1_decode(codes: np.ndarray) -> np.ndarray:
+    """Decodes 4-bit E2M1 codes (``uint8`` values in ``[0, 16)``, already
+    unpacked -- e.g. via :func:`_unpack_subbyte` with ``bits=4``) to their
+    float64 values: the code's own top bit is the sign, the low 3 select a
+    magnitude from :data:`_E2M1_MAGNITUDE`.
+    """
+    codes = codes.astype(np.int64)
+    sign = np.where((codes & 0x8) != 0, -1.0, 1.0)
+    return sign * _E2M1_MAGNITUDE[codes & 0x7]
+
+
+def _qmoe_dequantize_nvfp4(
+    packed: onnx.TensorProto,
+    block_scale: onnx.TensorProto,
+    global_scale: onnx.TensorProto,
+    k: int,
+) -> np.ndarray:
+    """Dequantizes one `QMoE` `quant_type='nvfp4'` `fc1_experts_weights`/
+    `fc2_experts_weights` tensor (packed ``[num_experts, N, K/2]`` E2M1
+    codes, 2 per byte, the same low-index-in-low-bits convention as
+    :func:`_unpack_subbyte`/`_qmoe_dequantize` -- see this section's own top
+    comment, point 9, for why this exact byte order for E2M1 codes
+    specifically was never independently kernel-confirmed) to a ``float64``
+    ``[num_experts, N, K]`` array: ``dequantized[e, n, k] =
+    e2m1_decode(code[e, n, k]) * block_scale[e, n, k // 16] *
+    global_scale[e]`` -- NVFP4's own two-level scale, `block_size` fixed at
+    16 (the live schema's own documented NVFP4 constant; see point 9).
+    Formula only, read directly off the live schema's own doc strings, not
+    independently confirmed against a real kernel run in this environment
+    (no CPU `'nvfp4'` kernel exists here to validate against -- see point 9).
+    """
+    block_size = 16
+    packed_arr = onnx.numpy_helper.to_array(packed)  # [E, N, K/2]
+    codes = _unpack_subbyte(packed_arr, 4, k)  # [E, N, K] uint8 in [0, 16)
+    mag = _e2m1_decode(codes)  # [E, N, K] float64
+    num_experts, n = packed_arr.shape[0], packed_arr.shape[1]
+    k_blocks = k // block_size
+    block_scale_arr = onnx.numpy_helper.to_array(block_scale).astype(
+        np.float64
+    )  # [E, N, k_blocks]
+    global_scale_arr = onnx.numpy_helper.to_array(global_scale).astype(
+        np.float64
+    )  # [E]
+    mag_blocks = mag.reshape(num_experts, n, k_blocks, block_size)
+    dequant = (
+        mag_blocks
+        * block_scale_arr[:, :, :, None]
+        * global_scale_arr[:, None, None, None]
+    )
+    return dequant.reshape(num_experts, n, k)
+
+
 @dataclass(frozen=True)
 class _QMoEChannelChain:
     node: onnx.NodeProto
@@ -15321,6 +15528,9 @@ class _QMoEChannelChain:
     hidden_size: int
     bits: int
     block_size: int
+    quant_type: str = "int"
+    fc1_global_scale: Optional[str] = None
+    fc2_global_scale: Optional[str] = None
 
 
 def _match_qmoe_producer(
@@ -15333,21 +15543,37 @@ def _match_qmoe_producer(
     :class:`_QMoEChannelChain`. Mirrors :func:`_match_moe_producer`'s own
     `activation_type`/`swiglu_fusion`/`fc3` checks exactly, then adds the
     quantization-specific checks this section's own top comment derives
-    (points 1-5): `quant_type` must be (or default to) ``'int'``,
-    `expert_weight_bits` one of ``{2, 4, 8}``, `block_size` either absent/0
-    (whole-row scale) or a groupwise value the CPU kernel itself accepts
-    (``>= 16``, a multiple of ``8 // expert_weight_bits``, and dividing both
-    `hidden_size` and `inter_size` evenly), `weights_prepacked` absent/
-    ``-1``/``0``, `router_weights` and every FP4/FP8-only input (15-20)
-    absent, `fc1_experts_weights`/`fc2_experts_weights` constant ``uint8``
-    rank-3 initializers with a single consumer, `fc1_scales`/`fc2_scales`
-    constant float initializers (single consumer) matching shape -- rank-2
-    when `block_size` is absent/0, rank-3 (gaining a trailing `K`-block
-    axis) when set -- and `fc1_experts_bias`/`fc2_experts_bias`/
-    `fc1_zero_points`/`fc2_zero_points`, when present, the same
-    single-consumer/shape checks (`zero_points`' own packed axis moves from
+    (points 1-5 for `quant_type='int'`, point 9 for `quant_type='nvfp4'`):
+    `quant_type` must be (or default to) ``'int'`` or be ``'nvfp4'``
+    (everything else -- `'fp4'`/`'fp8'`/`'wfp4afp8'` -- declined outright).
+
+    For `quant_type='int'`: `expert_weight_bits` one of ``{2, 4, 8}``,
+    `block_size` either absent/0 (whole-row scale) or a groupwise value the
+    CPU kernel itself accepts (``>= 16``, a multiple of ``8 //
+    expert_weight_bits``, and dividing both `hidden_size` and `inter_size`
+    evenly), `weights_prepacked` absent/``-1``/``0``, `router_weights` and
+    every FP4/FP8-only input (15-20) absent, `fc1_experts_weights`/
+    `fc2_experts_weights` constant ``uint8`` rank-3 initializers with a
+    single consumer, `fc1_scales`/`fc2_scales` constant float initializers
+    (single consumer) matching shape -- rank-2 when `block_size` is
+    absent/0, rank-3 (gaining a trailing `K`-block axis) when set -- and
+    `fc1_experts_bias`/`fc2_experts_bias`/`fc1_zero_points`/
+    `fc2_zero_points`, when present, the same single-consumer/shape checks
+    (`zero_points`' own packed axis moves from
     `N` to the trailing `K`-block axis when `block_size` is set -- see this
     section's own top comment, point 3).
+
+    For `quant_type='nvfp4'` (point 9): `expert_weight_bits` must be (or
+    default to) 4 (E2M1 is inherently 4-bit), `block_size` either absent/0
+    or exactly 16 (the schema's own fixed NVFP4 constant), `fc1_zero_points`/
+    `fc2_zero_points`/`fc3_zero_points` and every FP8-activation-only input
+    (17-20) absent, `fc1_experts_weights`/`fc2_experts_weights` constant
+    ``uint8`` rank-3 initializers (single consumer, packed 2 E2M1 codes/byte
+    -- same convention as `bits=4` `quant_type='int'`), `fc1_scales`/
+    `fc2_scales` constant rank-3 ``float8e4m3fn`` initializers (single
+    consumer) shaped `(num_experts, N, K / 16)`, and `fc1_global_scale`/
+    `fc2_global_scale` constant rank-1 ``float`` initializers (single
+    consumer, required present) shaped `(num_experts,)`.
     """
     if node.domain != _MOE_DOMAIN or node.op_type != "QMoE":
         return None
@@ -15374,103 +15600,28 @@ def _match_qmoe_producer(
 
     if activation not in _MOE_ACTIVATIONS or swiglu_fusion != 0:
         return None
-    if quant_type != "int":
-        return None  # fp4/nvfp4/fp8/wfp4afp8 -- a different tensor format
-        # entirely (MXFP block-scaled or float8e4m3fn-packed weights,
-        # separate activation-scale operands); out of scope, see this
-        # section's own top comment (point 1).
-    if bits not in (2, 4, 8):
-        return None
-    pack = 8 // bits
-    if block_size != 0:
-        if block_size < 16:
-            return None  # the CPU kernel's own floor -- "block_size must be
-            # >= 16 when provided"; see point 3.
-        if block_size % pack != 0:
-            return None  # not byte-aligned to the sub-byte packing width --
-            # every real block_size this op's kernel accepts already is, so
-            # this excludes no genuine configuration; see point 3.
+    if quant_type not in ("int", "nvfp4"):
+        return None  # fp4/fp8/wfp4afp8 -- each a genuinely different tensor
+        # format (different block size/scale dtype, float8e4m3fn-element
+        # rather than E2M1-packed weights, or FP8 activation-scale operands
+        # nvfp4 has no equivalent of); out of scope, see this section's own
+        # top comment, points 1 and 9.
     if weights_prepacked not in (-1, 0):
         return None  # a CUTLASS mixed-GEMM prepacked byte layout, not the
-        # raw [N, K/pack] storage this pass slices; see point 4.
+        # raw [N, K/pack] storage this pass slices; see point 4 (declined
+        # for 'nvfp4' too, defensively -- see point 9).
 
     if len(node.input) > 8 and node.input[8]:
         return None  # fc3_experts_weights present -- CPU QMoE errors "FC3
         # gating is not yet implemented on CPU for QMoE" (confirmed
-        # empirically); see point 5.
+        # empirically for quant_type='int'); see point 5. Declined for
+        # 'nvfp4' too, since there's no CPU kernel to re-confirm this
+        # against for that quant_type either -- see point 9.
     if len(node.input) > 14 and node.input[14]:
         return None  # router_weights (DeepSeek-style select/aggregate with
         # a separate combine-weight tensor) -- a topology this pass's own
         # masking-equivalence argument (see the whole-expert section below)
         # was never verified against.
-    for idx in range(15, 21):
-        # fc1/fc2_global_scale, fc1/fc2_act_scale, fc1/fc2_act_block_scale
-        # -- FP4/FP8-activation-only inputs, naturally absent for
-        # quant_type='int' in every real export but checked explicitly.
-        if len(node.input) > idx and node.input[idx]:
-            return None
-
-    if len(node.input) < 7 or not node.input[2] or not node.input[5]:
-        return None
-    fc1_w_name, fc2_w_name = node.input[2], node.input[5]
-    fc1_w = initializer_map.get(fc1_w_name)
-    fc2_w = initializer_map.get(fc2_w_name)
-    if (
-        fc1_w is None
-        or fc2_w is None
-        or fc1_w.data_type != onnx.TensorProto.UINT8
-        or fc2_w.data_type != onnx.TensorProto.UINT8
-        or len(fc1_w.dims) != 3
-        or len(fc2_w.dims) != 3
-        or len(consumers_of.get(fc1_w_name, [])) != 1
-        or len(consumers_of.get(fc2_w_name, [])) != 1
-    ):
-        return None
-
-    num_experts, inter_size, fc1_k_packed = (int(d) for d in fc1_w.dims)
-    fc2_num_experts, hidden_size, fc2_k_packed = (int(d) for d in fc2_w.dims)
-    if (
-        fc2_num_experts != num_experts
-        or fc1_k_packed * pack != hidden_size
-        or fc2_k_packed * pack != inter_size
-    ):
-        return None  # also rules out a fused-swiglu fc1 (doubled row count)
-    if block_size != 0 and (
-        hidden_size % block_size != 0 or inter_size % block_size != 0
-    ):
-        return None  # partial/padded final block -- declined, see point 3;
-        # also transitively enforces the schema doc's own extra
-        # "hidden_size/inter_size divisible by block_size * pack_size" rule
-        # for whichever of fc1/fc2 has zero_points present, via the
-        # fc1_zp/fc2_zp expected-shape checks below.
-
-    if not node.input[3] or not node.input[6]:
-        return None  # fc1_scales/fc2_scales required by this pass, even
-        # though the schema itself marks them optional -- without a scale
-        # this pass has nothing to dequantize with for importance ranking.
-    fc1_scale_name, fc2_scale_name = node.input[3], node.input[6]
-    fc1_scale = initializer_map.get(fc1_scale_name)
-    fc2_scale = initializer_map.get(fc2_scale_name)
-    if block_size:
-        hidden_blocks = hidden_size // block_size
-        inter_blocks = inter_size // block_size
-        fc1_scale_dims = [num_experts, inter_size, hidden_blocks]
-        fc2_scale_dims = [num_experts, hidden_size, inter_blocks]
-    else:
-        hidden_blocks = inter_blocks = 0  # unused (no block axis)
-        fc1_scale_dims = [num_experts, inter_size]
-        fc2_scale_dims = [num_experts, hidden_size]
-    if (
-        fc1_scale is None
-        or fc2_scale is None
-        or not _is_supported_float_dtype(fc1_scale.data_type)
-        or not _is_supported_float_dtype(fc2_scale.data_type)
-        or list(fc1_scale.dims) != fc1_scale_dims
-        or list(fc2_scale.dims) != fc2_scale_dims
-        or len(consumers_of.get(fc1_scale_name, [])) != 1
-        or len(consumers_of.get(fc2_scale_name, [])) != 1
-    ):
-        return None
 
     def _optional_float(
         index: int, expected_dims: List[int]
@@ -15504,25 +15655,229 @@ def _match_qmoe_producer(
             return False, None
         return True, name
 
+    if quant_type == "int":
+        for idx in range(15, 21):
+            # fc1/fc2_global_scale, fc1/fc2_act_scale, fc1/fc2_act_block_scale
+            # -- FP4/FP8-activation-only inputs, naturally absent for
+            # quant_type='int' in every real export but checked explicitly.
+            if len(node.input) > idx and node.input[idx]:
+                return None
+
+        if bits not in (2, 4, 8):
+            return None
+        pack = 8 // bits
+        if block_size != 0:
+            if block_size < 16:
+                return None  # the CPU kernel's own floor -- "block_size
+                # must be >= 16 when provided"; see point 3.
+            if block_size % pack != 0:
+                return None  # not byte-aligned to the sub-byte packing
+                # width -- every real block_size this op's kernel accepts
+                # already is, so this excludes no genuine configuration;
+                # see point 3.
+
+        if len(node.input) < 7 or not node.input[2] or not node.input[5]:
+            return None
+        fc1_w_name, fc2_w_name = node.input[2], node.input[5]
+        fc1_w = initializer_map.get(fc1_w_name)
+        fc2_w = initializer_map.get(fc2_w_name)
+        if (
+            fc1_w is None
+            or fc2_w is None
+            or fc1_w.data_type != onnx.TensorProto.UINT8
+            or fc2_w.data_type != onnx.TensorProto.UINT8
+            or len(fc1_w.dims) != 3
+            or len(fc2_w.dims) != 3
+            or len(consumers_of.get(fc1_w_name, [])) != 1
+            or len(consumers_of.get(fc2_w_name, [])) != 1
+        ):
+            return None
+
+        num_experts, inter_size, fc1_k_packed = (int(d) for d in fc1_w.dims)
+        fc2_num_experts, hidden_size, fc2_k_packed = (int(d) for d in fc2_w.dims)
+        if (
+            fc2_num_experts != num_experts
+            or fc1_k_packed * pack != hidden_size
+            or fc2_k_packed * pack != inter_size
+        ):
+            return None  # also rules out a fused-swiglu fc1 (doubled row count)
+        if block_size != 0 and (
+            hidden_size % block_size != 0 or inter_size % block_size != 0
+        ):
+            return None  # partial/padded final block -- declined, see point 3;
+            # also transitively enforces the schema doc's own extra
+            # "hidden_size/inter_size divisible by block_size * pack_size" rule
+            # for whichever of fc1/fc2 has zero_points present, via the
+            # fc1_zp/fc2_zp expected-shape checks below.
+
+        if not node.input[3] or not node.input[6]:
+            return None  # fc1_scales/fc2_scales required by this pass, even
+            # though the schema itself marks them optional -- without a scale
+            # this pass has nothing to dequantize with for importance ranking.
+        fc1_scale_name, fc2_scale_name = node.input[3], node.input[6]
+        fc1_scale = initializer_map.get(fc1_scale_name)
+        fc2_scale = initializer_map.get(fc2_scale_name)
+        if block_size:
+            hidden_blocks = hidden_size // block_size
+            inter_blocks = inter_size // block_size
+            fc1_scale_dims = [num_experts, inter_size, hidden_blocks]
+            fc2_scale_dims = [num_experts, hidden_size, inter_blocks]
+        else:
+            hidden_blocks = inter_blocks = 0  # unused (no block axis)
+            fc1_scale_dims = [num_experts, inter_size]
+            fc2_scale_dims = [num_experts, hidden_size]
+        if (
+            fc1_scale is None
+            or fc2_scale is None
+            or not _is_supported_float_dtype(fc1_scale.data_type)
+            or not _is_supported_float_dtype(fc2_scale.data_type)
+            or list(fc1_scale.dims) != fc1_scale_dims
+            or list(fc2_scale.dims) != fc2_scale_dims
+            or len(consumers_of.get(fc1_scale_name, [])) != 1
+            or len(consumers_of.get(fc2_scale_name, [])) != 1
+        ):
+            return None
+
+        ok, fc1_bias_name = _optional_float(4, [num_experts, inter_size])
+        if not ok:
+            return None
+        ok, fc2_bias_name = _optional_float(7, [num_experts, hidden_size])
+        if not ok:
+            return None
+        # zero_points' own packed axis moves from N (whole-row case) to the
+        # trailing K-block axis (blockwise case) -- see this section's own top
+        # comment, point 3.
+        if block_size:
+            fc1_zp_dims = [num_experts, inter_size, hidden_blocks // pack]
+            fc2_zp_dims = [num_experts, hidden_size, inter_blocks // pack]
+        else:
+            fc1_zp_dims = [num_experts, inter_size // pack]
+            fc2_zp_dims = [num_experts, hidden_size // pack]
+        ok, fc1_zp_name = _optional_uint8(11, fc1_zp_dims)
+        if not ok:
+            return None
+        ok, fc2_zp_name = _optional_uint8(12, fc2_zp_dims)
+        if not ok:
+            return None
+
+        return _QMoEChannelChain(
+            node=node,
+            fc1_w=fc1_w_name,
+            fc1_scale=fc1_scale_name,
+            fc1_bias=fc1_bias_name,
+            fc1_zp=fc1_zp_name,
+            fc2_w=fc2_w_name,
+            fc2_scale=fc2_scale_name,
+            fc2_bias=fc2_bias_name,
+            fc2_zp=fc2_zp_name,
+            num_experts=num_experts,
+            inter_size=inter_size,
+            hidden_size=hidden_size,
+            block_size=block_size,
+            bits=bits,
+            quant_type="int",
+        )
+
+    # quant_type == "nvfp4" -- see this section's own top comment, point 9,
+    # for the full schema-derived (never real-kernel-confirmed -- there is
+    # none to run here) reasoning behind every check below.
+    if bits != 4:
+        return None  # E2M1 is inherently 4-bit; expert_weight_bits must
+        # agree (or default) for pack_size=2 to match the schema's own "2
+        # values per byte" -- any other value declined as inconsistent.
+    pack = 2
+    if block_size not in (0, 16):
+        return None  # nvfp4 is normalized to block_size=16 regardless of
+        # the attribute (live schema doc); declined defensively for any
+        # other explicit value.
+    block_size = 16  # the effective value the kernel always uses for
+    # nvfp4, per the schema's own doc, even when the attribute itself is
+    # 0/absent.
+
+    for idx in (11, 12, 13):  # fc1/fc2/fc3_zero_points -- no zero-point
+        # concept for a signed E2M1 code; declined if present.
+        if len(node.input) > idx and node.input[idx]:
+            return None
+    for idx in (17, 18, 19, 20):  # fc1/fc2_act_scale, fc1/fc2_act_block_scale
+        # -- FP8-activation-only inputs; nvfp4 keeps float/fp16/bf16
+        # activations (that's 'wfp4afp8', out of scope), so declined if
+        # present.
+        if len(node.input) > idx and node.input[idx]:
+            return None
+
+    if len(node.input) < 7 or not node.input[2] or not node.input[5]:
+        return None
+    fc1_w_name, fc2_w_name = node.input[2], node.input[5]
+    fc1_w = initializer_map.get(fc1_w_name)
+    fc2_w = initializer_map.get(fc2_w_name)
+    if (
+        fc1_w is None
+        or fc2_w is None
+        or fc1_w.data_type != onnx.TensorProto.UINT8
+        or fc2_w.data_type != onnx.TensorProto.UINT8
+        or len(fc1_w.dims) != 3
+        or len(fc2_w.dims) != 3
+        or len(consumers_of.get(fc1_w_name, [])) != 1
+        or len(consumers_of.get(fc2_w_name, [])) != 1
+    ):
+        return None
+
+    num_experts, inter_size, fc1_k_packed = (int(d) for d in fc1_w.dims)
+    fc2_num_experts, hidden_size, fc2_k_packed = (int(d) for d in fc2_w.dims)
+    if (
+        fc2_num_experts != num_experts
+        or fc1_k_packed * pack != hidden_size
+        or fc2_k_packed * pack != inter_size
+    ):
+        return None  # also rules out a fused-swiglu fc1 (doubled row count)
+    if hidden_size % block_size != 0 or inter_size % block_size != 0:
+        return None  # partial/padded final block -- declined, mirroring
+        # the int blockwise case (point 3).
+
+    if not node.input[3] or not node.input[6]:
+        return None  # fc1_scales/fc2_scales required by this pass, same as
+        # the int path.
+    fc1_scale_name, fc2_scale_name = node.input[3], node.input[6]
+    fc1_scale = initializer_map.get(fc1_scale_name)
+    fc2_scale = initializer_map.get(fc2_scale_name)
+    hidden_blocks = hidden_size // block_size
+    inter_blocks = inter_size // block_size
+    fc1_scale_dims = [num_experts, inter_size, hidden_blocks]
+    fc2_scale_dims = [num_experts, hidden_size, inter_blocks]
+    if (
+        fc1_scale is None
+        or fc2_scale is None
+        or fc1_scale.data_type != onnx.TensorProto.FLOAT8E4M3FN
+        or fc2_scale.data_type != onnx.TensorProto.FLOAT8E4M3FN
+        or list(fc1_scale.dims) != fc1_scale_dims
+        or list(fc2_scale.dims) != fc2_scale_dims
+        or len(consumers_of.get(fc1_scale_name, [])) != 1
+        or len(consumers_of.get(fc2_scale_name, [])) != 1
+    ):
+        return None
+
+    if len(node.input) <= 16 or not node.input[15] or not node.input[16]:
+        return None  # fc1_global_scale/fc2_global_scale -- required for
+        # nvfp4 per the live schema's own input doc.
+    fc1_gs_name, fc2_gs_name = node.input[15], node.input[16]
+    fc1_gs = initializer_map.get(fc1_gs_name)
+    fc2_gs = initializer_map.get(fc2_gs_name)
+    if (
+        fc1_gs is None
+        or fc2_gs is None
+        or fc1_gs.data_type != onnx.TensorProto.FLOAT
+        or fc2_gs.data_type != onnx.TensorProto.FLOAT
+        or list(fc1_gs.dims) != [num_experts]
+        or list(fc2_gs.dims) != [num_experts]
+        or len(consumers_of.get(fc1_gs_name, [])) != 1
+        or len(consumers_of.get(fc2_gs_name, [])) != 1
+    ):
+        return None
+
     ok, fc1_bias_name = _optional_float(4, [num_experts, inter_size])
     if not ok:
         return None
     ok, fc2_bias_name = _optional_float(7, [num_experts, hidden_size])
-    if not ok:
-        return None
-    # zero_points' own packed axis moves from N (whole-row case) to the
-    # trailing K-block axis (blockwise case) -- see this section's own top
-    # comment, point 3.
-    if block_size:
-        fc1_zp_dims = [num_experts, inter_size, hidden_blocks // pack]
-        fc2_zp_dims = [num_experts, hidden_size, inter_blocks // pack]
-    else:
-        fc1_zp_dims = [num_experts, inter_size // pack]
-        fc2_zp_dims = [num_experts, hidden_size // pack]
-    ok, fc1_zp_name = _optional_uint8(11, fc1_zp_dims)
-    if not ok:
-        return None
-    ok, fc2_zp_name = _optional_uint8(12, fc2_zp_dims)
     if not ok:
         return None
 
@@ -15531,16 +15886,19 @@ def _match_qmoe_producer(
         fc1_w=fc1_w_name,
         fc1_scale=fc1_scale_name,
         fc1_bias=fc1_bias_name,
-        fc1_zp=fc1_zp_name,
+        fc1_zp=None,
         fc2_w=fc2_w_name,
         fc2_scale=fc2_scale_name,
         fc2_bias=fc2_bias_name,
-        fc2_zp=fc2_zp_name,
+        fc2_zp=None,
         num_experts=num_experts,
         inter_size=inter_size,
         hidden_size=hidden_size,
         block_size=block_size,
-        bits=bits,
+        bits=4,
+        quant_type="nvfp4",
+        fc1_global_scale=fc1_gs_name,
+        fc2_global_scale=fc2_gs_name,
     )
 
 
@@ -15555,30 +15913,44 @@ def _find_qmoe_chains(graph: onnx.GraphProto) -> List[_QMoEChannelChain]:
     return chains
 
 
+def _qmoe_dequantize_fc(
+    chain: Union["_QMoEChannelChain", "_QMoEExpertChain"],
+    initializer_map: Dict[str, onnx.TensorProto],
+    which: str,
+) -> np.ndarray:
+    """Dispatches to :func:`_qmoe_dequantize` (`quant_type='int'`) or
+    :func:`_qmoe_dequantize_nvfp4` (`quant_type='nvfp4'`) for `which` in
+    ``{'fc1', 'fc2'}`` of `chain` -- the one piece of dequantization logic
+    :func:`_qmoe_channel_importance`/:func:`_qmoe_expert_weight_importance`
+    share, since both `_QMoEChannelChain` and `_QMoEExpertChain` carry the
+    identical fc1/fc2/quant_type field names (see this section's own top
+    comment, point 9).
+    """
+    w = initializer_map[getattr(chain, f"{which}_w")]
+    scale = initializer_map[getattr(chain, f"{which}_scale")]
+    k = chain.hidden_size if which == "fc1" else chain.inter_size
+    if chain.quant_type == "nvfp4":
+        global_scale = initializer_map[getattr(chain, f"{which}_global_scale")]
+        return _qmoe_dequantize_nvfp4(w, scale, global_scale, k)
+    zp_name = getattr(chain, f"{which}_zp")
+    zp = initializer_map[zp_name] if zp_name is not None else None
+    return _qmoe_dequantize(w, scale, zp, chain.bits, k, chain.block_size)
+
+
 def _qmoe_channel_importance(
     chain: _QMoEChannelChain, initializer_map: Dict[str, onnx.TensorProto]
 ) -> np.ndarray:
     """Combined (root-sum-square) L2-norm importance per `inter_size`
     channel index, mirroring :func:`_moe_importance` exactly but computed
-    over each weight's own *dequantized* value (:func:`_qmoe_dequantize`)
+    over each weight's own *dequantized* value (:func:`_qmoe_dequantize_fc`)
     rather than a plain float initializer -- the packed ``uint8`` bytes
     themselves carry no usable magnitude information on their own.
     """
-    fc1_dq = _qmoe_dequantize(
-        initializer_map[chain.fc1_w],
-        initializer_map[chain.fc1_scale],
-        initializer_map[chain.fc1_zp] if chain.fc1_zp is not None else None,
-        chain.bits,
-        chain.hidden_size,
-        chain.block_size,
+    fc1_dq = _qmoe_dequantize_fc(
+        chain, initializer_map, "fc1"
     )  # [E, inter_size, hidden_size]
-    fc2_dq = _qmoe_dequantize(
-        initializer_map[chain.fc2_w],
-        initializer_map[chain.fc2_scale],
-        initializer_map[chain.fc2_zp] if chain.fc2_zp is not None else None,
-        chain.bits,
-        chain.inter_size,
-        chain.block_size,
+    fc2_dq = _qmoe_dequantize_fc(
+        chain, initializer_map, "fc2"
     )  # [E, hidden_size, inter_size]
     squared = np.sum(np.square(fc1_dq), axis=(0, 2)) + np.sum(
         np.square(fc2_dq), axis=(0, 1)
@@ -15812,15 +16184,18 @@ def apply_qmoe_expert_channel_pruning(
     counterpart of :func:`apply_moe_expert_channel_pruning`, targeting
     `QMoE`'s own packed ``uint8`` `fc1`/`fc2` weights (plus their
     `scales`/`zero_points`, co-sliced in lockstep) instead of plain `MoE`'s
-    float ones. Supports both `quant_type='int'` with no `block_size`
-    (whole-row per-channel scale) and with a groupwise `block_size` set
-    (see this section's own comment above, :func:`_match_qmoe_producer`,
-    for the exact matched shape either way and every empirically-confirmed
-    decline: `quant_type` other than ``'int'``, a prepacked layout, `fc3`,
-    `router_weights`, FP4/FP8-only inputs, an unrecognized/`swiglu`
-    activation, or a `block_size` this pass's own scope boundary excludes
-    -- below 16, not a multiple of ``8 // expert_weight_bits``, or not
-    dividing `hidden_size`/`inter_size` evenly).
+    float ones. Supports `quant_type='int'` with no `block_size` (whole-row
+    per-channel scale), with a groupwise `block_size` set, and
+    `quant_type='nvfp4'` (E2M1-packed weights, ``float8e4m3fn`` per-block
+    scales, a required per-expert ``float32`` global scale, `block_size`
+    fixed at 16 -- schema-derived only, not real-kernel-verified; see this
+    section's own top comment, point 9, for exactly why and what remains
+    out of scope) -- see this section's own comment above,
+    :func:`_match_qmoe_producer`, for the exact matched shape either way
+    and every empirically-confirmed decline: `quant_type` other than
+    ``'int'``/``'nvfp4'``, a prepacked layout, `fc3`, `router_weights`, an
+    unrecognized/`swiglu` activation, or a `block_size` this pass's own
+    scope boundary excludes.
 
     Ranks every `inter_size` index by combined (root-sum-square) L2 norm of
     `fc1_experts_weights`'/`fc2_experts_weights`' own *dequantized* row/
@@ -15910,6 +16285,9 @@ class _QMoEExpertChain:
     router_w: str
     router_w_transposed: bool
     router_b: Optional[str]
+    quant_type: str = "int"
+    fc1_global_scale: Optional[str] = None
+    fc2_global_scale: Optional[str] = None
 
 
 def _match_qmoe_whole_expert_producer(
@@ -15982,6 +16360,9 @@ def _match_qmoe_whole_expert_producer(
         router_w=router_w_name,
         router_w_transposed=router_w_transposed,
         router_b=router_b_name,
+        quant_type=base.quant_type,
+        fc1_global_scale=base.fc1_global_scale,
+        fc2_global_scale=base.fc2_global_scale,
     )
 
 
@@ -16007,25 +16388,15 @@ def _qmoe_expert_weight_importance(
     :func:`_moe_expert_weight_importance` -- the weight-magnitude-only
     fallback used when no calibration data was observed for a chain's
     `router_probs` -- computed over each weight's own dequantized value
-    (:func:`_qmoe_dequantize`) the same way :func:`_qmoe_channel_importance`
-    is, just reduced *within* each expert's own slice instead of *across*
-    experts.
+    (:func:`_qmoe_dequantize_fc`) the same way
+    :func:`_qmoe_channel_importance` is, just reduced *within* each expert's
+    own slice instead of *across* experts.
     """
-    fc1_dq = _qmoe_dequantize(
-        initializer_map[chain.fc1_w],
-        initializer_map[chain.fc1_scale],
-        initializer_map[chain.fc1_zp] if chain.fc1_zp is not None else None,
-        chain.bits,
-        chain.hidden_size,
-        chain.block_size,
+    fc1_dq = _qmoe_dequantize_fc(
+        chain, initializer_map, "fc1"
     )  # [E, inter_size, hidden_size]
-    fc2_dq = _qmoe_dequantize(
-        initializer_map[chain.fc2_w],
-        initializer_map[chain.fc2_scale],
-        initializer_map[chain.fc2_zp] if chain.fc2_zp is not None else None,
-        chain.bits,
-        chain.inter_size,
-        chain.block_size,
+    fc2_dq = _qmoe_dequantize_fc(
+        chain, initializer_map, "fc2"
     )  # [E, hidden_size, inter_size]
     squared = np.sum(np.square(fc1_dq), axis=(1, 2)) + np.sum(
         np.square(fc2_dq), axis=(1, 2)
@@ -16046,10 +16417,13 @@ def _apply_qmoe_whole_expert_chains(
     :func:`_apply_qmoe_channel_chains`, `num_experts` is *every* per-expert
     tensor's own leading axis (confirmed from the schema: packing always
     lives on a *later* axis, never axis 0), so every one of
-    `fc1`/`fc2`'s weights/scales/biases/zero_points, plus the router
-    projection's own weight/bias, is a plain leading-axis index-select --
-    no unpack/repack needed anywhere, the "comparatively simpler" half of
-    this section's own two techniques.
+    `fc1`/`fc2`'s weights/scales/biases/zero_points (plus, for
+    `quant_type='nvfp4'`, `fc1`/`fc2`'s own `global_scale` -- also
+    per-expert, absent entirely for `quant_type='int'`; see this section's
+    own top comment, point 10), plus the router projection's own
+    weight/bias, is a plain leading-axis index-select -- no unpack/repack
+    needed anywhere, the "comparatively simpler" half of this section's own
+    two techniques.
     """
     initializer_map = {t.name: t for t in graph.initializer}
     touched: Set[str] = set()
@@ -16071,6 +16445,10 @@ def _apply_qmoe_whole_expert_chains(
             weight_names.add(chain.fc1_zp)
         if chain.fc2_zp is not None:
             weight_names.add(chain.fc2_zp)
+        if chain.fc1_global_scale is not None:
+            weight_names.add(chain.fc1_global_scale)
+        if chain.fc2_global_scale is not None:
+            weight_names.add(chain.fc2_global_scale)
         if chain.router_b is not None:
             weight_names.add(chain.router_b)
         if weight_names & touched:
@@ -16089,7 +16467,14 @@ def _apply_qmoe_whole_expert_chains(
 
         for name in (chain.fc1_w, chain.fc2_w, chain.fc1_scale, chain.fc2_scale):
             _slice_axis(initializer_map[name], keep, axis=0)
-        for opt_name in (chain.fc1_bias, chain.fc2_bias, chain.fc1_zp, chain.fc2_zp):
+        for opt_name in (
+            chain.fc1_bias,
+            chain.fc2_bias,
+            chain.fc1_zp,
+            chain.fc2_zp,
+            chain.fc1_global_scale,
+            chain.fc2_global_scale,
+        ):
             if opt_name is not None:
                 _slice_axis(initializer_map[opt_name], keep, axis=0)
 
@@ -16130,12 +16515,17 @@ def apply_qmoe_whole_expert_pruning(
     own top comment, point 8: every per-expert tensor keeps `num_experts`
     as its own leading axis regardless of `block_size`, so no
     `block_size`-specific handling is needed anywhere in this function.
+    Also works for a matched `quant_type='nvfp4'` chain -- point 10: the
+    only change this quant_type needed at all was slicing its own two new
+    per-expert `fc1_global_scale`/`fc2_global_scale` tensors (absent for
+    `quant_type='int'`) the same leading-axis way as everything else.
 
     Every matched expert's `fc1_experts_weights`/`fc2_experts_weights`/
     `fc1_scales`/`fc2_scales` (and `fc1_experts_bias`/`fc2_experts_bias`/
-    `fc1_zero_points`/`fc2_zero_points`, if present) row, and the router
-    projection weight's (and bias's, if present) matching output column,
-    are dropped together for the lowest-``sparsity``-fraction of experts by
+    `fc1_zero_points`/`fc2_zero_points`/`fc1_global_scale`/
+    `fc2_global_scale`, if present) row, and the router projection weight's
+    (and bias's, if present) matching output column, are dropped together
+    for the lowest-``sparsity``-fraction of experts by
     that ranking -- with `num_experts_to_keep` silently floored at the
     node's own `k`, never adjusting `k` itself, the same floor
     :func:`apply_moe_whole_expert_pruning` uses. A chain whose
@@ -19881,14 +20271,21 @@ def _analyze_qmoe_channel_chains(
     """Dry-run mirror of :func:`_apply_qmoe_channel_chains`'s own per-node
     loop -- the shared body :func:`_analyze_qmoe_expert_channel_pruning`
     uses, mirroring its touched-role bookkeeping (`fc1_w`/`fc2_w`/
-    `fc1_scale`(/`fc1_bias`/`fc1_zp`), :func:`_apply_qmoe_channel_chains`'s
-    own set) and pack-rounded keep-count (``max(1, n - round(n *
-    sparsity))``, then floored down to the nearest multiple of ``8 //
-    bits`` -- :func:`_apply_qmoe_channel_chains`'s own formula, since the
-    real CPU `QMoE` kernel derives `inter_size` purely from
-    `fc2_experts_weights`' own packed byte count, with no way to represent
-    a partial trailing packed byte) exactly, but never actually slicing
-    `fc1`/`fc2`(/`scales`/`bias`/`zero_points`).
+    `fc1_scale`(/`fc1_bias`/`fc1_zp`/`fc2_scale`/`fc2_zp`, the last two only
+    when `block_size` is set -- :func:`_apply_qmoe_channel_chains`'s own
+    set) and keep-count logic exactly, but never actually slicing
+    `fc1`/`fc2`(/`scales`/`bias`/`zero_points`). With no `block_size`,
+    ``max(1, n - round(n * sparsity))``, floored down to the nearest
+    multiple of ``8 // bits`` (:func:`_apply_qmoe_channel_chains`'s own
+    formula, since the real CPU `QMoE` kernel derives `inter_size` purely
+    from `fc2_experts_weights`' own packed byte count, with no way to
+    represent a partial trailing packed byte). With `block_size` set
+    (every `quant_type='nvfp4'` chain, always -- point 9 -- or a
+    groupwise-`block_size` `quant_type='int'` one), the block-granularity
+    keep-set :func:`_qmoe_block_aligned_keep` computes instead -- reused
+    unchanged, the exact same call :func:`_apply_qmoe_channel_chains` makes
+    -- so `would_drop`/`margin` here can never diverge from what the real
+    mutating call actually does, for either quant_type.
     """
     initializer_map = {t.name: t for t in graph.initializer}
     touched: Set[str] = set()
@@ -19900,6 +20297,10 @@ def _analyze_qmoe_channel_chains(
             weight_names.add(chain.fc1_bias)
         if chain.fc1_zp is not None:
             weight_names.add(chain.fc1_zp)
+        if chain.block_size:
+            weight_names.add(chain.fc2_scale)
+            if chain.fc2_zp is not None:
+                weight_names.add(chain.fc2_zp)
         label = _node_label(chain.node)
 
         if weight_names & touched:
@@ -19919,24 +20320,44 @@ def _analyze_qmoe_channel_chains(
 
         n = chain.inter_size
         pack = 8 // chain.bits
-        keep_count = max(1, n - round(n * sparsity))
-        keep_count = max(pack, (keep_count // pack) * pack)
-        if keep_count >= n:
-            layers.append(
-                PruningLayerSensitivity(
-                    label=label,
-                    family="qmoe_expert_channel",
-                    total=n,
-                    would_drop=0,
-                    margin=None,
-                    importance_min=0.0,
-                    importance_max=0.0,
-                )
-            )
-            continue
+        block_size = chain.block_size
 
-        importance = compute_importance(chain, initializer_map)
-        keep = np.sort(np.argsort(-importance)[:keep_count])
+        if block_size:
+            importance = compute_importance(chain, initializer_map)
+            keep = _qmoe_block_aligned_keep(importance, n, block_size, sparsity)
+            if keep is None:
+                layers.append(
+                    PruningLayerSensitivity(
+                        label=label,
+                        family="qmoe_expert_channel",
+                        total=n,
+                        would_drop=0,
+                        margin=None,
+                        importance_min=0.0,
+                        importance_max=0.0,
+                    )
+                )
+                continue
+            keep_count = len(keep)
+        else:
+            keep_count = max(1, n - round(n * sparsity))
+            keep_count = max(pack, (keep_count // pack) * pack)
+            if keep_count >= n:
+                layers.append(
+                    PruningLayerSensitivity(
+                        label=label,
+                        family="qmoe_expert_channel",
+                        total=n,
+                        would_drop=0,
+                        margin=None,
+                        importance_min=0.0,
+                        importance_max=0.0,
+                    )
+                )
+                continue
+            importance = compute_importance(chain, initializer_map)
+            keep = np.sort(np.argsort(-importance)[:keep_count])
+
         keep_mask = np.zeros(n, dtype=bool)
         keep_mask[keep] = True
         layers.append(
@@ -19959,11 +20380,14 @@ def _analyze_qmoe_expert_channel_pruning(
     sparsity: float = 0.5,
 ) -> PruningSensitivityReport:
     """Dry-run mirror of :func:`apply_qmoe_expert_channel_pruning` -- same
-    matching (:func:`_find_qmoe_chains`), pack-rounded keep-count, and
-    importance (:func:`_qmoe_channel_importance`, ranking each weight's own
-    *dequantized* row/column -- :func:`_qmoe_dequantize`, the exact same
-    helper the real function uses to rank, never for the actual packed-byte
-    rewrite) logic, reused directly, but `model` is never mutated.
+    matching (:func:`_find_qmoe_chains`, covering both `quant_type='int'`
+    and `'nvfp4'`), keep-count (pack-rounded or, when `block_size` is set,
+    block-aligned via :func:`_qmoe_block_aligned_keep`), and importance
+    (:func:`_qmoe_channel_importance`, ranking each weight's own
+    *dequantized* row/column -- :func:`_qmoe_dequantize_fc`, the exact same
+    dispatcher the real function uses to rank, never for the actual
+    packed-byte rewrite) logic, reused directly, but `model` is never
+    mutated.
     """
     if not (0.0 <= sparsity < 1.0):
         raise ValueError(f"sparsity must be in [0, 1), got {sparsity}")
@@ -19993,10 +20417,11 @@ def _analyze_qmoe_whole_expert_chains(
     :func:`_analyze_qmoe_whole_expert_pruning` uses, mirroring its
     touched-role bookkeeping (every one of `fc1_w`/`fc2_w`/`fc1_scale`/
     `fc2_scale`/`router_w`(/`fc1_bias`/`fc2_bias`/`fc1_zp`/`fc2_zp`/
-    `router_b`), :func:`_apply_qmoe_whole_expert_chains`'s own set) and
-    `k`-floored keep-count (``max(max(1, min(chain.k, n)), n - round(n *
-    sparsity))``, :func:`_apply_qmoe_whole_expert_chains`'s own formula)
-    exactly, but never actually slicing `fc1`/`fc2`/the router projection.
+    `fc1_global_scale`/`fc2_global_scale`/`router_b`),
+    :func:`_apply_qmoe_whole_expert_chains`'s own set) and `k`-floored
+    keep-count (``max(max(1, min(chain.k, n)), n - round(n * sparsity))``,
+    :func:`_apply_qmoe_whole_expert_chains`'s own formula) exactly, but
+    never actually slicing `fc1`/`fc2`/the router projection.
     """
     initializer_map = {t.name: t for t in graph.initializer}
     touched: Set[str] = set()
@@ -20018,6 +20443,10 @@ def _analyze_qmoe_whole_expert_chains(
             weight_names.add(chain.fc1_zp)
         if chain.fc2_zp is not None:
             weight_names.add(chain.fc2_zp)
+        if chain.fc1_global_scale is not None:
+            weight_names.add(chain.fc1_global_scale)
+        if chain.fc2_global_scale is not None:
+            weight_names.add(chain.fc2_global_scale)
         if chain.router_b is not None:
             weight_names.add(chain.router_b)
         label = _node_label(chain.node)
