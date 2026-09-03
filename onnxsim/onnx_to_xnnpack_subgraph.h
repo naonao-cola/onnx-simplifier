@@ -6,12 +6,22 @@
  * `xnn_subgraph_t` -- the "ONNX to XNNPACK's Subgraph API" translation.
  *
  * This is deliberately NOT a general ONNX importer: it supports a small,
- * explicit set of fp32 ops (see kSupportedOps below) and throws
+ * explicit set of ops (see kSupportedOps below) and throws
  * std::runtime_error with a specific reason for anything else -- an
- * unsupported op, a non-fp32 tensor, a shape it cannot resolve statically, an
- * attribute combination it does not implement. onnxsim/xnnpack_executor.h is
- * the ModelExecutor adapter that calls this, creates a runtime from the
- * result, and is the piece that actually invokes XNNPACK.
+ * unsupported op, an unsupported tensor dtype, a shape it cannot resolve
+ * statically, an attribute combination it does not implement.
+ * onnxsim/xnnpack_executor.h is the ModelExecutor adapter that calls this,
+ * creates a runtime from the result, and is the piece that actually invokes
+ * XNNPACK.
+ *
+ * Dtypes: graph inputs/outputs and most ops are fp32 only. QuantizeLinear,
+ * DequantizeLinear, and QLinearMatMul additionally support standard ONNX
+ * int8/uint8 quantization (XNNPACK's qint8/quint8/qcint8 datatypes) --
+ * QuantizeLinear/DequantizeLinear per-tensor only, QLinearMatMul's "b"
+ * operand per-tensor or per-column (matching how int8 weights are commonly
+ * quantized). There is no support for ONNX Runtime's `com.microsoft`
+ * contrib quantized ops (QGemm, QLinearConv, QLinearAdd, ...) -- only
+ * standard ONNX ops, matching this lowering's fp32 op set.
  *
  * Shapes: unlike ONNX Runtime (which re-derives shapes from the model itself),
  * XNNPACK's `xnn_define_tensor_value` requires every Value's shape up front,
@@ -42,7 +52,18 @@ namespace xnnpack_backend {
 // Op types this lowering understands. Anything else in the fold-group graph
 // makes Lower() throw std::runtime_error naming the unsupported op.
 inline constexpr const char* kSupportedOps[] = {
-    "Add", "Sub", "Mul", "Div", "Relu", "Sigmoid", "Gemm", "MatMul", "Reshape",
+    "Add",
+    "Sub",
+    "Mul",
+    "Div",
+    "Relu",
+    "Sigmoid",
+    "Gemm",
+    "MatMul",
+    "Reshape",
+    "QuantizeLinear",
+    "DequantizeLinear",
+    "QLinearMatMul",
 };
 
 // Owns an xnn_subgraph_t plus everything it borrows: `subgraph` holds
@@ -60,12 +81,28 @@ struct LoweredSubgraph {
   // implementation.
   std::vector<uint32_t> input_value_ids;
   std::vector<uint32_t> output_value_ids;
+  // DLPack dtype of each output_value_ids[i] -- always fp32 before this
+  // lowering supported QuantizeLinear/QLinearMatMul, but a quantized op can
+  // now make a graph output int8/uint8, so the ModelExecutor adapter
+  // (xnnpack_executor.cpp) needs this to allocate the right kind of output
+  // buffer and set the right dtype on the DLManagedTensor it returns; it
+  // cannot recover this from xnn_get_external_value_shape (shape only).
+  std::vector<DLDataType> output_dtypes;
 
   // Backing storage for any tensor materialized during lowering (currently:
   // only a big-endian host's byte-swapped copy of an initializer -- see
   // dlpack_bridge.h's kRawDataIsHostOrder). Must outlive `subgraph` and any
   // xnn_runtime_t created from it.
   std::vector<DLManagedTensorPtr> owned_tensors;
+
+  // Backing storage for per-channel quantization scale arrays.
+  // xnn_define_channelwise_quantized_tensor_value stores the `scale`
+  // pointer it is given as-is (xnn_value.quantization.channelwise_scale) --
+  // it does not copy the array -- and that pointer is read again whenever a
+  // runtime is created from this subgraph, so it needs the same "outlive
+  // `subgraph` and any runtime built from it" lifetime `owned_tensors`
+  // above documents, just for float scale arrays instead of tensor data.
+  std::vector<std::vector<float>> owned_scale_arrays;
 
   LoweredSubgraph() = default;
   // Not = default: a defaulted move would shallow-copy `subgraph` without
@@ -75,7 +112,9 @@ struct LoweredSubgraph {
       : subgraph(other.subgraph),
         input_value_ids(std::move(other.input_value_ids)),
         output_value_ids(std::move(other.output_value_ids)),
-        owned_tensors(std::move(other.owned_tensors)) {
+        output_dtypes(std::move(other.output_dtypes)),
+        owned_tensors(std::move(other.owned_tensors)),
+        owned_scale_arrays(std::move(other.owned_scale_arrays)) {
     other.subgraph = nullptr;
   }
   LoweredSubgraph& operator=(LoweredSubgraph&& other) noexcept {
@@ -84,7 +123,9 @@ struct LoweredSubgraph {
       subgraph = other.subgraph;
       input_value_ids = std::move(other.input_value_ids);
       output_value_ids = std::move(other.output_value_ids);
+      output_dtypes = std::move(other.output_dtypes);
       owned_tensors = std::move(other.owned_tensors);
+      owned_scale_arrays = std::move(other.owned_scale_arrays);
       other.subgraph = nullptr;
     }
     return *this;

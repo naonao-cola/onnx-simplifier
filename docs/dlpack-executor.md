@@ -125,18 +125,44 @@ it the call's `inputs`, invokes it, and wraps the outputs as
 `DLManagedTensor`s.
 
 Unlike `CppModelExecutor`, which delegates to ORT and so handles essentially
-any ONNX op, this lowering supports only a small, explicit fp32 op set —
-`Add`/`Sub`/`Mul`/`Div`, `Relu`, `Sigmoid`, `Gemm`/`MatMul` (2D operands only),
-and `Reshape` (static target shape only) — see
+any ONNX op, this lowering supports only a small, explicit op set — see
 `onnx_to_xnnpack_subgraph.h`'s `kSupportedOps`. `Lower()` throws
 `std::runtime_error` naming the reason for anything outside that: an
-unsupported op, a non-fp32 tensor, `Gemm` with `alpha != 1` or `transA != 0`,
-a `Reshape` target shape that is itself produced by another node in the fold
-group rather than being a constant or a feed, and so on. Notably absent is
-`Conv`: XNNPACK's convolution Node is NHWC-native while ONNX's is NCHW, and
-getting that layout conversion (activations *and* the OIHW→OHWI weight
-transpose) right needs more verification than this first cut has had — left
-as follow-up work rather than shipped un-verified.
+unsupported op, an unsupported tensor dtype, `Gemm` with `alpha != 1` or
+`transA != 0`, a `Reshape` target shape that is itself produced by another
+node in the fold group rather than being a constant or a feed, and so on.
+Notably absent is `Conv`: XNNPACK's convolution Node is NHWC-native while
+ONNX's is NCHW, and getting that layout conversion (activations *and* the
+OIHW→OHWI weight transpose) right needs more verification than this first
+cut has had — left as follow-up work rather than shipped un-verified.
+
+Most of the op set is fp32 only: `Add`/`Sub`/`Mul`/`Div`, `Relu`, `Sigmoid`,
+`Gemm`/`MatMul` (2D operands only), `Reshape` (static target shape only).
+`QuantizeLinear`, `DequantizeLinear`, and `QLinearMatMul` additionally
+support standard ONNX int8/uint8 quantization, mapped onto XNNPACK's own
+quantized datatypes (`qint8`/`quint8`/`qcint8`) — `QuantizeLinear`/
+`DequantizeLinear` lower to an `xnn_unary_convert` Node bridging an fp32
+Value and a quantized one; `QLinearMatMul` (no float in between; a's/b's/
+y's own quantized Values feed `xnn_define_fully_connected` directly, the
+same Node Gemm/MatMul use) supports `b` quantized per-tensor or per-column.
+Scope is deliberately narrower here too: per-tensor only for
+`QuantizeLinear`/`DequantizeLinear` and `QLinearMatMul`'s output, symmetric
+(`zero_point == 0`) only for per-channel quantization (XNNPACK's per-channel
+datatypes don't have a per-channel zero-point parameter at the API surface
+this lowering uses), and no `com.microsoft` contrib ops (`QGemm`,
+`QLinearConv`, `QLinearAdd`, ...) — only standard ONNX.
+
+One correctness trap worth flagging for anyone extending this further:
+`xnn_define_channelwise_quantized_tensor_value` stores its `scale` array as
+a bare pointer (read again whenever a runtime is created from the
+subgraph), not a copy — unlike `dims`, which it does copy. A per-channel
+scale array therefore needs the same "outlive the subgraph and any runtime
+built from it" lifetime as tensor data does (see
+`LoweredSubgraph::owned_scale_arrays`, parallel to `owned_tensors`); get
+this wrong and the failure mode is not a crash, it's silent all-zero
+output, caught only by an actual numeric test
+(`xnnpack_executor_test.cpp`'s per-channel `QLinearMatMul` case), not a
+build or a null-pointer check.
 
 This makes `GetXnnpackModelExecutor()` an explicitly opt-in *alternative*
 executor (pass it to `Simplify` instead of `GetBuiltinModelExecutor()` when
@@ -145,8 +171,9 @@ way `tests/test_tinygrad_integration.py` / `test_nncase_integration.py` test
 those backends), not a general-purpose replacement: swapping it in for a
 model using an unsupported op fails constant folding outright rather than
 falling back. `onnxsim/xnnpack_executor_test.cpp` exercises it end to end
-(each supported op, a two-node chain, and the unsupported-op error path)
-against independently-computed expected values.
+(each supported op, a two-node chain, quantize/dequantize round trips,
+per-tensor and per-channel `QLinearMatMul`, and the unsupported-op error
+path) against independently-computed expected values.
 
 Build it with `-DONNXSIM_BUILTIN_XNNPACK=ON` (see `cmake/build_xnnpack.cmake`,
 which `FetchContent`s XNNPACK — pinned by commit, since XNNPACK has no tagged

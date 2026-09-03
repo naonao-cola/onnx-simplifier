@@ -23,6 +23,7 @@
 #include <vector>
 
 #include "dlpack/dlpack.h"
+#include "dlpack_dtype.h"
 #include "onnx_to_xnnpack_subgraph.h"
 #include "onnxsim.h"
 
@@ -48,9 +49,15 @@ void EnsureXnnpackInitialized() {
 // outputs into caller-supplied memory rather than handing back its own
 // buffer, so Run() below allocates `data` itself and this struct is what the
 // returned DLManagedTensor's deleter frees.
+//
+// `data` is raw bytes rather than a typed vector: most outputs are fp32, but
+// a quantized op (QuantizeLinear, QLinearMatMul) can make a graph output
+// int8/uint8 -- see LoweredSubgraph::output_dtypes, which is where `dtype`
+// below comes from.
 struct XnnpackOutputBuffer {
-  std::vector<float> data;
+  std::vector<uint8_t> data;
   std::vector<int64_t> shape;
+  DLDataType dtype;
 };
 
 DLManagedTensor* WrapOutputBuffer(std::unique_ptr<XnnpackOutputBuffer> ctx) {
@@ -58,7 +65,7 @@ DLManagedTensor* WrapOutputBuffer(std::unique_ptr<XnnpackOutputBuffer> ctx) {
   managed->dl_tensor.data = ctx->data.data();
   managed->dl_tensor.device = DLDevice{kDLCPU, 0};
   managed->dl_tensor.ndim = static_cast<int32_t>(ctx->shape.size());
-  managed->dl_tensor.dtype = DLDataType{kDLFloat, 32, 1};
+  managed->dl_tensor.dtype = ctx->dtype;
   managed->dl_tensor.shape = ctx->shape.data();
   managed->dl_tensor.strides = nullptr;
   managed->dl_tensor.byte_offset = 0;
@@ -117,7 +124,8 @@ struct XnnpackModelExecutor : public ModelExecutor {
     // shapes are returned by xnn_get_external_value_shape").
     std::vector<std::unique_ptr<XnnpackOutputBuffer>> out_bufs;
     out_bufs.reserve(lowered.output_value_ids.size());
-    for (uint32_t out_id : lowered.output_value_ids) {
+    for (size_t i = 0; i < lowered.output_value_ids.size(); ++i) {
+      const uint32_t out_id = lowered.output_value_ids[i];
       size_t ndim = 0;
       size_t dims[XNN_MAX_TENSOR_DIMS];
       CheckXnnStatus(
@@ -125,9 +133,10 @@ struct XnnpackModelExecutor : public ModelExecutor {
           "xnn_get_external_value_shape");
       auto buf = std::make_unique<XnnpackOutputBuffer>();
       buf->shape.assign(dims, dims + ndim);
+      buf->dtype = lowered.output_dtypes[i];
       size_t nelem = 1;
       for (size_t d : buf->shape) nelem *= d;
-      buf->data.assign(nelem, 0.0f);
+      buf->data.assign(nelem * onnxsim::dlpack::SizeOf(buf->dtype), 0);
       external_values.push_back(xnn_external_value{out_id, buf->data.data()});
       out_bufs.push_back(std::move(buf));
     }
