@@ -200,10 +200,23 @@ design on paper:
   `max_gen_toks`) against a 135M-parameter model on CPU. This is the finding that added
   `--max-gen-toks` to `run_quality_eval.py`: a benchmark's default generation budget
   directly sets wall-clock cost at this suite's unbatched-decode scale, and MMLU-Pro's
-  default is an order of magnitude larger than the other two. Whether capping
-  `--max-gen-toks` low enough to make MMLU-Pro CI-feasible also lets the model actually
-  finish its "think step by step, then answer (X)" reasoning before being cut off (and
-  so still score meaningfully) is untested -- see "Next steps".
+  default is an order of magnitude larger than the other two.
+  Follow-up (2026-09-03): capping `--max-gen-toks` **does** fix the cost --
+  `--max-gen-toks 256` against `HuggingFaceTB/SmolLM2-135M-Instruct` (the exact model
+  `quality-eval-macos` uses) brought `mmlu_pro_biology` down to **~14s/example**
+  (`--limit 10` took ~2m38s wall-clock including model load, vs. the ~20min the 2048
+  default would extrapolate to), an 8x+ speedup, comparable in order of magnitude to
+  MATH-500's ~7s/example. But `--limit 10 --max-gen-toks 256` (and separately, `512`)
+  both scored **`exact_match: 0.0` -- 0/10** for this model. Checked with
+  `log_samples=True` whether that's the truncation artifact this doc originally
+  worried about ("an aggressively truncated response might just always score 0"): it
+  is not -- every sampled generation finished well under either cap (150-1355 chars,
+  nowhere near 256 or 512 tokens) with a complete "The answer is (X)" pattern (or, for
+  3/10 at the 256 cap, a repetition loop that never produced one, correctly scored
+  `[invalid]`/wrong by the harness's own extractor); the model just doesn't answer
+  10-way MCQ biology correctly at 135M params, matched by 512-token responses showing
+  the same coherent-but-wrong reasoning. So the fix works, but exposes a *different*
+  blocker for wiring this into CI -- see "Next steps".
 - **Not yet run at all against the quantized (Core ML) side** -- everything above only
   exercised `--model hf`; `--model coreml` (`lm_eval_coreml_adapter.py`) has only been
   import/registration-checked (confirms `@register_model("coreml")` resolves and the
@@ -269,17 +282,35 @@ trend-plotting script exists) -- that's the next piece if this is picked up furt
    prototype) before wiring it in; `sympy` (its answer-equivalence checker's direct
    import, not one of `lm-eval`'s own declared dependencies) added explicitly to the
    job's pip install line rather than relying on it arriving transitively via
-   `optimum-onnx`'s torch dependency. MMLU-Pro remains future work:
-   - Its ~2-minutes-per-example cost (see "What's been prototyped") needs either a
-     much lower `--max-gen-toks` (with a check that a still-useful score comes out --
-     an aggressively truncated "think step by step" response might just always score
-     0, which would be worse than not running it at all) or accepting a very small
-     `--limit` (1-3 examples) purely as a smoke test rather than a real quality
-     signal.
+   `optimum-onnx`'s torch dependency. MMLU-Pro remains future work, now for a
+   different reason than originally thought:
+   - ~~Its ~2-minutes-per-example cost needs a much lower `--max-gen-toks`~~ -- tried
+     (2026-09-03): `--max-gen-toks 256` against `HuggingFaceTB/SmolLM2-135M-Instruct`
+     (the exact model `quality-eval-macos` runs) cuts `mmlu_pro_biology` to
+     ~14s/example (`--limit 10` in ~2m38s wall-clock incl. model load), a similar
+     order of magnitude to MATH-500 -- solves the cost problem, and verified (via
+     `log_samples=True` on the raw generations) that this isn't just cutting
+     responses off mid-answer: every sample finished naturally well under the cap.
+   - **New blocker found instead:** at that same `--limit 10`, this model's *float*
+     score on `mmlu_pro_biology` is **0/10** (also 0/10 at `--max-gen-toks 512`,
+     ruling out the cap as the cause -- the raw generations are complete, coherent,
+     and simply wrong, or end in a repetition loop with no answer). A float score of
+     exactly 0 makes `compute_retention.py`'s `quantized / float` ratio undefined by
+     design (reported as `None`/"N/A (float score was 0)", not `inf`) -- so wiring
+     MMLU-Pro into `quality-eval-macos` as currently configured (same tiny model, same
+     `--limit`) would spend CI time every run for a retention number that's *always*
+     "N/A", not a useful signal. Options, untried: (a) a noticeably more capable model
+     in the CI matrix for this one benchmark (135M params may just be under the floor
+     for 10-way MCQ MMLU-Pro -- harder than plain MMLU by design), (b) a much larger
+     `--limit` to reduce the chance of an all-zero small sample (works against the
+     CI-budget rationale for `--limit` in the first place, and untested whether it
+     actually gets off zero for this model), or (c) picking a different, possibly
+     easier MMLU-Pro subject than biology (untested -- MMLU-Pro's difficulty is
+     fairly uniform by design, so this is a low-confidence option).
    - The full `mmlu_pro` group (14 subjects) was never attempted even structurally;
-     only one subject (`mmlu_pro_biology`) has been run. Even after solving the
-     per-example cost, decide whether CI should sample across all 14 subjects or just a
-     couple of representative ones.
+     only one subject (`mmlu_pro_biology`) has been run. Moot until the zero-float-score
+     blocker above is resolved -- no point deciding CI subject coverage for a benchmark
+     that can't yet produce a non-`None` retention number.
 5. ~~Re-read DeviceMark's actual methodology page~~ -- done, see "What DeviceMark
    measures" above (subset sizes, 0-shot not 5-shot, cap=4096, `acc_completed`-based
    retention, and the bigger finding that DeviceMark's own on-device runtime is a

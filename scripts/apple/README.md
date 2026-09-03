@@ -533,8 +533,13 @@ minute at that default -- `coreml-integration.yml`'s `quality-eval-macos`
 job (workflow_dispatch/schedule-only) therefore runs IFEval and MATH-500
 (`hendrycks_math500`, cheap at this suite's scale -- no large default
 generation budget in its task YAML, ~7s/example prototyped on CPU) with both
-`--limit` and `--max-gen-toks` capped; MMLU-Pro stays future work until its
-per-example cost is addressed (see the plan doc's "Next steps").
+`--limit` and `--max-gen-toks` capped. `--max-gen-toks 256` does fix MMLU-Pro's
+cost too (~14s/example against that same model, verified not to be cutting
+answers off mid-generation), but at `--limit 10` that model's float-side score
+on `mmlu_pro_biology` is 0/10 regardless of the cap -- a zero float score makes
+`compute_retention.py`'s ratio undefined (`None`) by design, so MMLU-Pro stays
+future work until that's addressed rather than the cost itself (see the plan
+doc's "Next steps").
 
 The retention-ratio logic (`compute_retention`) has no lm-evaluation-harness/
 torch/coremltools dependency and is unit-tested directly in
