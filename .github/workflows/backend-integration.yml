@@ -2,11 +2,12 @@ name: Backend Integration
 
 # End-to-end regression tests that feed onnxsim's simplified output into other
 # ONNX-consuming compiler/runtime stacks (Apache TVM, nncase, Halide, tinygrad,
-# PyTorch via onnx2torch), quantize-then-simplify pipelines (NVIDIA ModelOpt),
-# or a deployment toolbox's own backend runtime wrapper (OpenMMLab mmdeploy) —
-# tests/test_tvm_integration.py, tests/test_nncase_integration.py,
-# tests/test_halide_integration.py, tests/test_tinygrad_integration.py,
-# tests/test_torch_integration.py, tests/test_modelopt_integration.py,
+# PyTorch via onnx2torch, Apple's MLX), quantize-then-simplify pipelines
+# (NVIDIA ModelOpt), or a deployment toolbox's own backend runtime wrapper
+# (OpenMMLab mmdeploy) — tests/test_tvm_integration.py,
+# tests/test_nncase_integration.py, tests/test_halide_integration.py,
+# tests/test_tinygrad_integration.py, tests/test_torch_integration.py,
+# tests/test_mlx_integration.py, tests/test_modelopt_integration.py,
 # tests/test_mmdeploy_integration.py. See docs/dlpack-executor.md, which frames
 # the DLPack executor boundary as an "embeddability" seam for stacks like these.
 #
@@ -19,7 +20,7 @@ name: Backend Integration
 # shared with every test job, exactly like model-regression.yml already does
 # for its shards.
 #
-# None of apache-tvm / nncase / halide / tinygrad / torch+onnx2torch /
+# None of apache-tvm / nncase / halide / tinygrad / torch+onnx2torch / mlx /
 # nvidia-modelopt / mmdeploy are part of onnxsim's test requirements (nncase
 # needs the .NET runtime; modelopt, the torch job, and mmdeploy all drag in
 # torch + CUDA wheels), so this runs in its own workflow instead of the
@@ -38,6 +39,7 @@ on:
       - "tests/test_halide_integration.py"
       - "tests/test_tinygrad_integration.py"
       - "tests/test_torch_integration.py"
+      - "tests/test_mlx_integration.py"
       - "tests/test_modelopt_integration.py"
       - "tests/test_mmdeploy_integration.py"
       - ".github/workflows/backend-integration.yml"
@@ -248,6 +250,41 @@ jobs:
       - name: Run torch integration tests
         working-directory: ${{ runner.temp }}
         run: pytest -v "$GITHUB_WORKSPACE/tests/test_torch_integration.py"
+
+  mlx:
+    name: Simplify and run on MLX
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - uses: actions/download-artifact@v8
+        with:
+          name: onnxsim-wheel-backend
+          path: wheelhouse
+      - name: Install onnxsim wheel + mlx
+        run: |
+          python -m pip install --upgrade pip
+          # MLX's Linux wheel is a thin binding: the native backend (libmlx.so)
+          # is a separate package selected via extra, not bundled in bare
+          # `mlx` -- bare `mlx` fails to import ("libmlx.so: cannot open
+          # shared object file"). `[cpu]` pulls in the CPU backend, which runs
+          # on an ordinary runner with no GPU.
+          python -m pip install pytest "mlx[cpu]"
+          python -m pip install wheelhouse/*.whl
+      - name: Verify the installed wheel is used (not the source tree)
+        working-directory: ${{ runner.temp }}
+        run: |
+          python -c "import onnxsim, onnxsim.onnxsim_cpp2py_export as m; print(onnxsim.__version__, m.__file__)"
+          python -c "import mlx.core as mx; print('mlx', mx.__file__, mx.default_device())"
+      # Run from a neutral directory so the repo root's ./onnxsim source package
+      # (without the compiled extension) does not shadow the installed wheel.
+      - name: Run MLX integration tests
+        working-directory: ${{ runner.temp }}
+        run: pytest -v "$GITHUB_WORKSPACE/tests/test_mlx_integration.py"
 
   modelopt:
     name: Quantize with ModelOpt and simplify
