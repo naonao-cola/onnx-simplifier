@@ -178,6 +178,59 @@ def test_neuralnetwork_format():
 
 
 # ---------------------------------------------------------------------------
+# minimum_deployment_target
+# ---------------------------------------------------------------------------
+
+
+def _gather_model() -> onnx.ModelProto:
+    # x/idx are declared graph inputs (not initializers) so MIL's
+    # constant-folding pass can't fold the Gather away -- the whole point of
+    # this model is to keep a real `gather` op instance in the spec to check.
+    return _model(
+        "gathermodel (float[5,3] x, int64[2] idx) => (float[2,3] y) "
+        "{ y = Gather <axis=0> (x, idx) }"
+    )
+
+
+def _spec_ops(mlmodel):
+    """Every MIL op instance's ``(type, set(input names))`` in an mlprogram spec."""
+    spec = mlmodel.get_spec()
+    prog = spec.mlProgram
+    (block,) = prog.functions["main"].block_specializations.values()
+    return [(op.type, set(op.inputs.keys())) for op in block.operations]
+
+
+def test_gather_at_ios18_target_serializes_validate_indices():
+    # Regression test: raising minimum_deployment_target used to leave newer
+    # optional MIL op inputs -- e.g. Gather's `validate_indices`, added at the
+    # iOS17 op version -- unset in the serialized spec, which coremlcompiler
+    # then rejected at load time with "Required param 'validate_indices' is
+    # missing" (found via coreml-integration.yml's compute-plan-trace matrix
+    # entries, which force minimum_deployment_target=iOS18 -- see
+    # coreml_compute_plan_trace.m). Root cause: convert_to_coreml built its
+    # MIL program at coremltools' lowest default opset regardless of the
+    # requested target, relying on ct.convert's own op-version-upgrade pass to
+    # bridge the gap -- a pass that doesn't backfill newly-applicable optional
+    # inputs. Fixed by building the MIL program directly at the resolved
+    # target's opset (_build_mil_program's new `opset_version` parameter), so
+    # MIL's own builder synthesizes each op's version-appropriate defaults.
+    mlmodel = onnxsim.export_coreml(_gather_model(), minimum_deployment_target="iOS18")
+    ops = _spec_ops(mlmodel)
+    (gather_inputs,) = (inputs for op_type, inputs in ops if op_type == "gather")
+    assert "validate_indices" in gather_inputs
+
+
+def test_gather_at_default_target_still_converts():
+    # Same model, no minimum_deployment_target override -- must keep working
+    # exactly as before (the lowest-opset gather has no validate_indices input
+    # at all, so it must not be forced in unconditionally). Numeric coverage
+    # for Gather itself lives in test_gather_on_bool_tensor below; this only
+    # checks the target-resolution path doesn't regress.
+    mlmodel = onnxsim.export_coreml(_gather_model())
+    assert [o.name for o in mlmodel.get_spec().description.output] == ["y"]
+
+
+# ---------------------------------------------------------------------------
 # Numeric regression coverage for the trickier translations
 # ---------------------------------------------------------------------------
 

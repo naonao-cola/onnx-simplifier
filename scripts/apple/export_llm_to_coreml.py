@@ -67,7 +67,11 @@ independent of `--dtype`, which only controls tracing/export precision.
 `int4` needs `minimum_deployment_target=iOS18` (coremltools refuses lower
 targets for 4-bit weights); this script sets that automatically only for
 `int4`, since `int8`/`none` already work at whatever target
-`onnxsim.export_coreml` otherwise picks.
+`onnxsim.export_coreml` otherwise picks. `--minimum-deployment-target` lets a
+caller force a higher target regardless of `--quantize-weights` -- needed by
+`coreml-integration.yml`'s compute-plan-trace step, since `MLComputePlan`'s
+per-operation device/cost APIs return no data for a model built below their
+own SDK floor (see `coreml_compute_plan_trace.m`).
 
 `--matmul-to-conv` (default off) targets the *other* side of the ceiling --
 compute, not bandwidth -- for the cases where compute still matters (e.g.
@@ -128,6 +132,7 @@ def export_llm_to_coreml(
     dtype: str = "fp32",
     quantize_weights: str = "none",
     matmul_to_conv: bool = False,
+    minimum_deployment_target: str | None = None,
 ) -> None:
     from optimum.exporters.onnx import main_export
 
@@ -212,7 +217,9 @@ def export_llm_to_coreml(
             },
             "matmul_to_conv": matmul_to_conv,
         }
-        if quantize_weights == "int4":
+        if minimum_deployment_target is not None:
+            convert_kwargs["minimum_deployment_target"] = minimum_deployment_target
+        elif quantize_weights == "int4":
             # coremltools' linear_quantize_weights refuses int4 below iOS18
             # ("The 4-bit quantization is supported since iOS18") -- int8 and
             # "none" work fine at whatever target onnxsim.export_coreml picks by
@@ -318,6 +325,15 @@ def main() -> int:
         "ceiling' section for the measurements this is based on. Opt-in and "
         "unvalidated on real hardware -- benchmark before trusting it.",
     )
+    ap.add_argument(
+        "--minimum-deployment-target",
+        default=None,
+        help="Force a minimum Core ML deployment target (e.g. 'iOS18'), overriding "
+        "whatever onnxsim.export_coreml would otherwise pick (or the automatic iOS18 "
+        "bump --quantize-weights int4 applies). Needed for e.g. MLComputePlan's "
+        "per-operation compute-device/cost APIs, which return no data for models "
+        "built below their SDK floor -- see coreml_compute_plan_trace.m.",
+    )
     args = ap.parse_args()
 
     export_llm_to_coreml(
@@ -329,6 +345,7 @@ def main() -> int:
         dtype=args.dtype,
         quantize_weights=args.quantize_weights,
         matmul_to_conv=args.matmul_to_conv,
+        minimum_deployment_target=args.minimum_deployment_target,
     )
     return 0
 

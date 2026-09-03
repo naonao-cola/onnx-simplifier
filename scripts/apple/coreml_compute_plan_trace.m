@@ -40,6 +40,33 @@
 // of falling back to "unknown" instead of failing to build if Apple ever
 // renames them.
 //
+// computeDeviceUsageForMLProgramOperation:/estimatedCostOfMLProgramOperation:
+// return nil for ops the compute plan "couldn't analyze" -- this has been
+// observed to mean *every* op, i.e. an empty trace, when the traced model's
+// own `minimum_deployment_target` is below the iOS17.4/macOS15.4-class SDK
+// floor these two methods need (independent of what OS/Xcode the machine
+// running this tool has -- it's the model's declared target that matters).
+// export_llm_to_coreml.py's `--minimum-deployment-target` flag (passed as
+// iOS18, the highest coremltools exposes, by coreml-integration.yml's
+// compute-plan-trace matrix entries) works around this; if a trace still
+// comes back empty after that, check this tool's own stdout/stderr first
+// (see WalkProgram below) -- it now prints operations.count and per-op
+// nil/non-nil status for the first few ops that have no data, rather than
+// silently producing an empty JSON file.
+//
+// Even at iOS18, estimatedCostOfMLProgramOperation: has been observed to
+// return nil for every single op on real CI (an M4 macOS-15 GitHub-hosted
+// runner) while computeDeviceUsageForMLProgramOperation: returns real
+// placement data for a real fraction of them (~45% on SmolLM2-135M) -- i.e.
+// device *placement* and *cost estimation* are independently gated, and only
+// the latter is still unavailable there. This tool only requires deviceUsage
+// to record an event, so a trace with real per-op device placement but
+// `cost_available: false` (and 0-weight/near-zero `dur`) in every event's
+// `args` is the expected shape on such a toolchain, not a bug -- see
+// RecordOperation/WalkProgram below. Whether this is a further SDK-version
+// gap or a permanent limitation of estimatedCost for on-device (as opposed
+// to Xcode's own Model Performance Report) analysis is unconfirmed.
+//
 // Build (matches https://github.com/freedomtan/coreml_modelc_profling's
 // Makefile -- plain clang, no Xcode project needed):
 //   clang -O2 -o coreml_compute_plan_trace coreml_compute_plan_trace.m \
@@ -62,6 +89,7 @@ typedef struct {
   NSMutableDictionary<NSString *, NSNumber *> *cursorByLane;
   NSMutableDictionary<NSString *, NSNumber *> *opCountByLane;
   NSMutableDictionary<NSString *, NSNumber *> *weightSumByLane;
+  NSUInteger costAvailableCount;
 } TraceState;
 
 static NSDictionary<NSString *, NSNumber *> *LaneTids(void) {
@@ -84,11 +112,15 @@ static NSString *ClassifyDevice(id device) {
 }
 
 static void RecordOperation(TraceState *state, NSString *lane, NSString *opName, double weight,
-                            NSString *deviceDescription) {
+                            BOOL costAvailable, NSString *deviceDescription) {
   NSNumber *tid = LaneTids()[lane] ?: @3;
   double cursor = [state->cursorByLane[lane] ?: @0 doubleValue];
   // Scaled purely for a legible timeline -- see the module comment: this is
-  // not measured wall-clock time.
+  // not measured wall-clock time. When estimatedCost is unavailable (see the
+  // module comment's estimatedCost-vs-deviceUsage note), weight is 0 and this
+  // floors to a minimal 1us box purely so the op still renders as a visible
+  // event -- cost_available:false in args is the actual signal that its
+  // width carries no meaning.
   double dur = MAX(weight * 1e6, 1.0);
 
   [state->events addObject:@{
@@ -101,12 +133,16 @@ static void RecordOperation(TraceState *state, NSString *lane, NSString *opName,
     @"tid" : tid,
     @"args" : @{
       @"estimated_cost_weight" : @(weight),
+      @"cost_available" : @(costAvailable),
       @"preferred_device" : deviceDescription ?: @"?",
     },
   }];
   state->cursorByLane[lane] = @(cursor + dur);
   state->opCountByLane[lane] = @([state->opCountByLane[lane] ?: @0 intValue] + 1);
-  state->weightSumByLane[lane] = @([state->weightSumByLane[lane] ?: @0 doubleValue] + weight);
+  if (costAvailable) {
+    state->weightSumByLane[lane] = @([state->weightSumByLane[lane] ?: @0 doubleValue] + weight);
+    state->costAvailableCount += 1;
+  }
 }
 
 static int WalkProgram(MLComputePlan *computePlan, MLModelStructureProgram *program,
@@ -122,21 +158,47 @@ static int WalkProgram(MLComputePlan *computePlan, MLModelStructureProgram *prog
   }
 
   NSArray<MLModelStructureProgramOperation *> *operations = mainFunction.block.operations;
+  // Diagnostic, not just cosmetic: this tool has previously produced an
+  // empty trace in CI with no indication of why (an empty `operations`
+  // array vs. every op's deviceUsage/estimatedCost coming back nil are very
+  // different bugs -- see the module comment's SDK-floor note). Printing
+  // this unconditionally means the next run that comes back empty still
+  // tells us which case it was, instead of requiring another guess-and-push
+  // round trip.
+  printf("main function has %lu operation(s)\n", (unsigned long)operations.count);
+  NSUInteger noDeviceUsage = 0, noCost = 0, recorded = 0, diagnosedOps = 0;
   for (MLModelStructureProgramOperation *operation in operations) {
     MLComputePlanDeviceUsage *deviceUsage =
         [computePlan computeDeviceUsageForMLProgramOperation:operation];
     MLComputePlanCost *estimatedCost = [computePlan estimatedCostOfMLProgramOperation:operation];
-    if (!deviceUsage || !estimatedCost) {
-      // MLComputePlan returns nil for ops it couldn't analyze (e.g. pure
-      // metadata/const ops with no runtime cost) -- skip rather than
-      // recording a misleading zero-cost/unknown-device entry.
+    if (!deviceUsage) noDeviceUsage++;
+    if (!estimatedCost) noCost++;
+    if ((!deviceUsage || !estimatedCost) && diagnosedOps < 5) {
+      fprintf(stderr, "  no compute-plan data for op %s: deviceUsage=%s estimatedCost=%s\n",
+              [([operation operatorName] ?: @"?") UTF8String], deviceUsage ? "present" : "nil",
+              estimatedCost ? "present" : "nil");
+      diagnosedOps++;
+    }
+    if (!deviceUsage) {
+      // MLComputePlan returns nil deviceUsage for ops it couldn't place at
+      // all (e.g. pure metadata/const ops that never run on any device) --
+      // skip those; there is nothing meaningful to record. estimatedCost is
+      // handled independently below (see the module comment): it has been
+      // observed nil for every op on some toolchains even when deviceUsage
+      // is real, so requiring both here would silently throw away good
+      // device-placement data whenever cost estimation isn't available.
       continue;
     }
     id preferredDevice = [deviceUsage preferredComputeDevice];
     NSString *lane = ClassifyDevice(preferredDevice);
-    RecordOperation(state, lane, [operation operatorName], [estimatedCost weight],
+    RecordOperation(state, lane, [operation operatorName],
+                    estimatedCost ? [estimatedCost weight] : 0.0, estimatedCost != nil,
                     [preferredDevice description]);
+    recorded++;
   }
+  printf("recorded %lu/%lu op(s) (%lu missing deviceUsage, %lu missing estimatedCost)\n",
+         (unsigned long)recorded, (unsigned long)operations.count, (unsigned long)noDeviceUsage,
+         (unsigned long)noCost);
   return 0;
 }
 
@@ -233,12 +295,24 @@ int main(int argc, char *argv[]) {
       return 1;
     }
 
+    // estimatedCostOfMLProgramOperation: has been observed to return nil for
+    // every op on some toolchains even when computeDeviceUsageForMLProgramOperation:
+    // returns real placement data (see the module comment) -- when that's
+    // happened this run (costAvailableCount == 0), the weight/cost percentage
+    // is meaningless for every lane, so print op counts alone instead of a
+    // misleading "0.00%" for lanes that plainly aren't empty.
+    BOOL haveCostData = state.costAvailableCount > 0;
     for (NSString *lane in @[ @"ane", @"gpu", @"cpu", @"unknown" ]) {
       int count = [state.opCountByLane[lane] ?: @0 intValue];
       if (count == 0) continue;
-      double weightSum = [state.weightSumByLane[lane] ?: @0 doubleValue];
-      printf("%-8s %4d ops, %6.2f%% of total estimated cost\n", [lane UTF8String], count,
-             weightSum * 100.0);
+      if (haveCostData) {
+        double weightSum = [state.weightSumByLane[lane] ?: @0 doubleValue];
+        printf("%-8s %4d ops, %6.2f%% of total estimated cost\n", [lane UTF8String], count,
+               weightSum * 100.0);
+      } else {
+        printf("%-8s %4d ops (no estimated-cost data available this run)\n", [lane UTF8String],
+               count);
+      }
     }
     printf("wrote %s\n", [outPath UTF8String]);
     return 0;

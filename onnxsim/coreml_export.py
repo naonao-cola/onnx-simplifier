@@ -1186,6 +1186,7 @@ def _build_mil_program(
     TensorType,
     dynamic_shapes: Optional[Dict[str, Tuple[int, int, int]]] = None,
     matmul_to_conv: bool = False,
+    opset_version: Optional[Any] = None,
 ):
     graph = model.graph
     initializer_names = {t.name for t in graph.initializer}
@@ -1210,7 +1211,7 @@ def _build_mil_program(
         if ct_input is not None:
             flexible_inputs.append(ct_input)
 
-    with Function(input_specs) as func:
+    with Function(input_specs, opset_version=opset_version) as func:
         for name, var in func.inputs.items():
             lowerer.bind(name, var)
         for init in graph.initializer:
@@ -1329,6 +1330,23 @@ def convert_to_coreml(
     ct = _import_coremltools()
     mb, types, Function, Program, RangeDim, TensorType = _import_mil()
 
+    # Resolved once and threaded into both _build_mil_program (as the MIL
+    # program's own opset_version) and ct.convert's minimum_deployment_target
+    # below -- building the program directly at the requested target's opset
+    # (rather than always at coremltools' lowest default and relying on
+    # ct.convert's own op-version-upgrade pass to bridge the gap) is required
+    # for correctness: that upgrade pass has been observed to leave newly-
+    # applicable optional inputs (e.g. Gather's `validate_indices`, added at
+    # the iOS17 op version) unset in the serialized spec, which coremlcompiler
+    # then rejects at load time ("Required param 'validate_indices' is
+    # missing") -- building at the real target from the start lets MIL's own
+    # builder synthesize each op's version-appropriate default inputs itself.
+    resolved_target = (
+        _resolve_deployment_target(ct, minimum_deployment_target)
+        if minimum_deployment_target is not None
+        else None
+    )
+
     prog, flexible_inputs = _build_mil_program(
         model,
         mb,
@@ -1339,15 +1357,14 @@ def convert_to_coreml(
         TensorType,
         dynamic_shapes,
         matmul_to_conv,
+        opset_version=resolved_target,
     )
 
     kwargs: Dict[str, Any] = {}
     if compute_precision is not None:
         kwargs["compute_precision"] = compute_precision
-    if minimum_deployment_target is not None:
-        kwargs["minimum_deployment_target"] = _resolve_deployment_target(
-            ct, minimum_deployment_target
-        )
+    if resolved_target is not None:
+        kwargs["minimum_deployment_target"] = resolved_target
     if flexible_inputs is not None:
         kwargs["inputs"] = flexible_inputs
 

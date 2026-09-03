@@ -251,18 +251,31 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # min_deployment_target is only forced for the two entries the
+          # "Compute-unit device placement" step below traces --
+          # MLComputePlan's per-operation computeDeviceUsage/estimatedCost
+          # APIs returned no data at all (every op) when the traced model
+          # was built at coremltools' own default target; iOS18 is the
+          # highest target coremltools exposes and comfortably clears the
+          # iOS17.4/macOS15.4 floor those APIs are documented to need. Left
+          # unset for every other entry -- it's irrelevant off this one
+          # tracing step, and int8/none already convert fine at whatever
+          # target onnxsim.export_coreml otherwise picks (see
+          # export_llm_to_coreml.py's module docstring).
           - model_id: HuggingFaceTB/SmolLM2-135M-Instruct
             slug: smollm2-135m
             max_context_length: 512
             dtype: fp32
             quantize_weights: none
             matmul_to_conv: "false"
+            min_deployment_target: iOS18
           - model_id: Qwen/Qwen2.5-1.5B-Instruct
             slug: qwen2.5-1.5b
             max_context_length: 512
             dtype: fp16
             quantize_weights: none
             matmul_to_conv: "false"
+            min_deployment_target: ""
           # Same model/dtype as the first entry, weight-only int8 quantized --
           # see scripts/apple/README.md's "Theoretical ceiling" section for why
           # this is expected to raise decode tok/s (roughly halves DRAM bytes
@@ -275,6 +288,7 @@ jobs:
             dtype: fp32
             quantize_weights: int8
             matmul_to_conv: "false"
+            min_deployment_target: ""
           # Same model/dtype as the first entry, --matmul-to-conv enabled --
           # unlike the int8 entry above, this targets compute (not bandwidth):
           # the M4 ANE's native matmul path measures well below its conv1x1
@@ -291,6 +305,7 @@ jobs:
             dtype: fp32
             quantize_weights: none
             matmul_to_conv: "true"
+            min_deployment_target: iOS18
           # Both flags together -- measured worse than either alone: 2.26
           # tok/s vs. 3.61 baseline, 4.64 int8-only, 3.04 conv-only (see the
           # README's "matmul-to-conv1x1" section). Not the neutral
@@ -304,6 +319,7 @@ jobs:
             dtype: fp32
             quantize_weights: int8
             matmul_to_conv: "true"
+            min_deployment_target: ""
           # Few-billion-parameter tier -- DeviceMark's own leaderboard weight
           # class (https://devicemark.github.io/, roughly 1-4B), and the
           # entries prepare_benchmark_models.py's BENCHMARK_MODELS already
@@ -324,30 +340,35 @@ jobs:
             dtype: fp16
             quantize_weights: none
             matmul_to_conv: "false"
+            min_deployment_target: ""
           - model_id: meta-llama/Llama-3.2-1B-Instruct
             slug: llama-3.2-1b
             max_context_length: 512
             dtype: fp16
             quantize_weights: none
             matmul_to_conv: "false"
+            min_deployment_target: ""
           - model_id: meta-llama/Llama-3.2-3B-Instruct
             slug: llama-3.2-3b
             max_context_length: 512
             dtype: fp16
             quantize_weights: none
             matmul_to_conv: "false"
+            min_deployment_target: ""
           - model_id: Qwen/Qwen2.5-3B-Instruct
             slug: qwen2.5-3b
             max_context_length: 512
             dtype: fp16
             quantize_weights: none
             matmul_to_conv: "false"
+            min_deployment_target: ""
           - model_id: microsoft/Phi-3.5-mini-instruct
             slug: phi-3.5-mini
             max_context_length: 512
             dtype: fp16
             quantize_weights: none
             matmul_to_conv: "false"
+            min_deployment_target: ""
     env:
       # Read-only secret; only meta-llama/Llama-3.2-*-Instruct entries above
       # need it (gated -- see prepare_benchmark_models.py's module
@@ -378,6 +399,7 @@ jobs:
             --max-context-length ${{ matrix.max_context_length }} \
             --quantize-weights ${{ matrix.quantize_weights }} \
             ${{ matrix.matmul_to_conv == 'true' && '--matmul-to-conv' || '' }} \
+            ${{ matrix.min_deployment_target != '' && format('--minimum-deployment-target {0}', matrix.min_deployment_target) || '' }} \
             --output ${{ matrix.slug }}.mlpackage
       - name: Run the decode benchmark through the real Core ML runtime
         working-directory: ${{ runner.temp }}
