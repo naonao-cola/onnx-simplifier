@@ -24298,6 +24298,454 @@ def test_embedding_vocab_pruning_embed_layer_norm_mask_index_and_embedding_sum_c
         np.testing.assert_allclose(p, r, atol=1e-5, rtol=1e-5)
 
 
+# --- Embedding / lm_head vocabulary pruning: GatherBlockQuantized ---------
+#
+# See ``onnxsim/pruning.py``'s own section-top comment directly above
+# ``_match_gather_block_quantized_producer`` for the full empirical schema/
+# packing facts and real-exporter evidence these tests exercise. Every
+# positive-match test below runs the pruned model through a real
+# onnxruntime session (this op has a real CPU kernel -- no decomposed-proxy
+# fallback needed) and compares against an INDEPENDENTLY built reference
+# model -- constructed from scratch directly from the ORIGINAL, pre-slice
+# logical (unpacked) integer codes/scales/zero-points, never by calling
+# any of onnxsim.pruning's own matching/slicing code -- so these are
+# genuine "slice, don't recompute" checks, not restatements of the pass's
+# own logic.
+
+
+def _gbq_pack_codes(vals, bits):
+    """Independent reference packer for GatherBlockQuantized's own
+    manually-packed-``uint8`` convention (``bits`` in ``{2, 4}``): last
+    axis packed low-order-value-first, ``8 // bits`` codes per byte,
+    padding any trailing partial byte with zero. ``bits == 8`` is a plain
+    dtype cast, no packing at all. Both conventions confirmed against a
+    real ``InferenceSession`` round-trip -- see ``onnxsim/pruning.py``'s
+    own section-top comment.
+    """
+    if bits == 8:
+        return vals.astype(np.uint8)
+    per_byte = 8 // bits
+    count = vals.shape[-1]
+    nbytes = (count + per_byte - 1) // per_byte
+    out = np.zeros(vals.shape[:-1] + (nbytes,), dtype=np.uint8)
+    for j in range(nbytes):
+        for k in range(per_byte):
+            idx = j * per_byte + k
+            if idx < count:
+                out[..., j] |= (
+                    vals[..., idx].astype(np.uint8) & ((1 << bits) - 1)
+                ) << (k * bits)
+    return out
+
+
+def _gbq_dequant(data, scales, zero_points, block_size):
+    """Independent float64 dequantize oracle from LOGICAL (unpacked)
+    integer `data`/`zero_points` arrays: ``(data[v, h] - zero_point[v, h //
+    block_size]) * scale[v, h // block_size]``.
+    """
+    n_blocks = scales.shape[1]
+    col_block = np.minimum(np.arange(data.shape[1]) // block_size, n_blocks - 1)
+    return (data.astype(np.float64) - zero_points.astype(np.float64)[:, col_block]) * (
+        scales.astype(np.float64)[:, col_block]
+    )
+
+
+def _gbq_data_tensor(vals, name, bits, native):
+    """Builds the `data`/`zero_points` `TensorProto` for a
+    GatherBlockQuantized test model from LOGICAL uint8 codes `vals` --
+    either ONNX's own native ``tensor(uint4)`` sub-byte type
+    (``native=True``, ``bits == 4`` only, packed per ONNX's own spec-defined
+    whole-tensor flat convention) or manually packed into a plain
+    ``tensor(uint8)`` (``native=False``, the only option for ``bits`` in
+    ``{2, 8}``, and also exercised for ``bits == 4``) via
+    :func:`_gbq_pack_codes`.
+    """
+    if native:
+        assert bits == 4, bits
+        return onnx.numpy_helper.from_array(vals.astype(ml_dtypes.uint4), name)
+    return onnx.numpy_helper.from_array(_gbq_pack_codes(vals, bits), name)
+
+
+def _gbq_model(
+    data_vals,
+    scales,
+    zero_points,
+    bits,
+    block_size,
+    native=False,
+    gather_axis=0,
+    quantize_axis=1,
+    name_prefix="",
+):
+    """Builds a minimal single-node ``com.microsoft::GatherBlockQuantized``
+    model directly from LOGICAL (unpacked) integer `data_vals` (shape
+    ``(vocab_size, hidden_size)``) and `zero_points` (``None`` to omit the
+    optional input entirely, relying on the schema's own documented
+    default). `native` selects the packing convention for both `data` and
+    `zero_points` (:func:`_gbq_data_tensor`).
+    """
+    v, h = data_vals.shape
+    data_t = _gbq_data_tensor(data_vals, name_prefix + "data", bits, native)
+    scales_t = onnx.numpy_helper.from_array(
+        scales.astype(np.float32), name_prefix + "scales"
+    )
+    inputs = [data_t.name, "input_ids", scales_t.name]
+    initializer = [data_t, scales_t]
+    if zero_points is not None:
+        zp_t = _gbq_data_tensor(zero_points, name_prefix + "zero_points", bits, native)
+        inputs.append(zp_t.name)
+        initializer.append(zp_t)
+    out_name = name_prefix + "output"
+    node = onnx.helper.make_node(
+        "GatherBlockQuantized",
+        inputs,
+        [out_name],
+        domain="com.microsoft",
+        bits=bits,
+        block_size=block_size,
+        quantize_axis=quantize_axis,
+        gather_axis=gather_axis,
+    )
+    out_shape = [h] if gather_axis == 0 else [v]
+    graph = onnx.helper.make_graph(
+        [node],
+        "g",
+        [
+            onnx.helper.make_tensor_value_info(
+                "input_ids", onnx.TensorProto.INT64, ["n"]
+            )
+        ],
+        [
+            onnx.helper.make_tensor_value_info(
+                out_name, onnx.TensorProto.FLOAT, ["n"] + out_shape
+            )
+        ],
+        initializer=initializer,
+    )
+    model = onnx.helper.make_model(
+        graph,
+        opset_imports=[
+            onnx.helper.make_opsetid("", 21),
+            onnx.helper.make_opsetid("com.microsoft", 1),
+        ],
+    )
+    model.ir_version = 10
+    return model
+
+
+def test_gather_block_quantized_pruning_bits4_native_matches_real_inference_session_oracle():
+    # bits=4, ONNX's own native uint4 packing for both `data`/`zero_points`
+    # -- the exact convention onnxruntime.quantization's own
+    # DefaultWeightOnlyQuantizer.quantize_gather emits (see this pass's own
+    # section-top comment for that real-tooling evidence).
+    V, H, block_size = 9, 20, 16  # H not a multiple of block_size -> 2 blocks
+    rng = np.random.default_rng(200)
+    n_blocks = -(-H // block_size)
+    data_vals = rng.integers(0, 16, size=(V, H)).astype(np.uint8)
+    scales = rng.random((V, n_blocks)).astype(np.float32) * 0.1 + 0.01
+    zero_points = rng.integers(0, 16, size=(V, n_blocks)).astype(np.uint8)
+
+    model = _gbq_model(
+        data_vals, scales, zero_points, bits=4, block_size=block_size, native=True
+    )
+    onnx.checker.check_model(model)
+
+    chain = onnxsim.pruning._match_embedding_chain(model.graph, None)
+    assert chain is not None
+    assert chain.quantized is not None
+    assert chain.vocab_size == V
+    assert chain.hidden_size == H
+
+    keep_token_ids = [0, 2, 3, 5, 8]
+    result = onnxsim.apply_embedding_vocab_pruning(model, keep_token_ids=keep_token_ids)
+    onnx.checker.check_model(result.model)
+    assert result.matched
+    assert not result.lm_head_pruned
+    assert result.kept_token_ids == keep_token_ids
+
+    inits = {t.name: t for t in result.model.graph.initializer}
+    # "Slice, don't recompute": the pruned data/scales/zero_points must
+    # equal an exact row-selection of the ORIGINAL logical codes -- never a
+    # re-quantization -- confirmed via a byte-exact roundtrip.
+    np.testing.assert_array_equal(
+        onnx.numpy_helper.to_array(inits["data"]).astype(np.uint8),
+        data_vals[keep_token_ids],
+    )
+    np.testing.assert_array_equal(
+        onnx.numpy_helper.to_array(inits["zero_points"]).astype(np.uint8),
+        zero_points[keep_token_ids],
+    )
+    np.testing.assert_allclose(
+        onnx.numpy_helper.to_array(inits["scales"]), scales[keep_token_ids]
+    )
+
+    ref_model = _gbq_model(
+        data_vals[keep_token_ids],
+        scales[keep_token_ids],
+        zero_points[keep_token_ids],
+        bits=4,
+        block_size=block_size,
+        native=True,
+    )
+    onnx.checker.check_model(ref_model)
+
+    new_ids = np.arange(len(keep_token_ids), dtype=np.int64)
+    (pruned_out,) = _run(result.model, {"input_ids": new_ids})
+    (ref_out,) = _run(ref_model, {"input_ids": new_ids})
+    np.testing.assert_allclose(pruned_out, ref_out, atol=1e-6, rtol=1e-6)
+
+    # Tightest oracle: pure float64 dequantize, from-scratch, of the
+    # ORIGINAL (unsliced) codes, sliced by hand.
+    oracle = _gbq_dequant(data_vals, scales, zero_points, block_size)[keep_token_ids]
+    np.testing.assert_allclose(pruned_out, oracle, atol=1e-4, rtol=1e-4)
+
+
+def test_gather_block_quantized_pruning_bits8_matches_real_inference_session_oracle():
+    V, H, block_size = 7, 32, 16
+    rng = np.random.default_rng(201)
+    n_blocks = H // block_size
+    data_vals = rng.integers(0, 256, size=(V, H)).astype(np.uint8)
+    scales = rng.random((V, n_blocks)).astype(np.float32) * 0.1 + 0.01
+    zero_points = rng.integers(0, 256, size=(V, n_blocks)).astype(np.uint8)
+
+    model = _gbq_model(data_vals, scales, zero_points, bits=8, block_size=block_size)
+    onnx.checker.check_model(model)
+
+    keep_token_ids = [1, 2, 4, 6]
+    result = onnxsim.apply_embedding_vocab_pruning(model, keep_token_ids=keep_token_ids)
+    onnx.checker.check_model(result.model)
+    assert result.matched
+
+    inits = {t.name: t for t in result.model.graph.initializer}
+    np.testing.assert_array_equal(
+        onnx.numpy_helper.to_array(inits["data"]), data_vals[keep_token_ids]
+    )
+    np.testing.assert_array_equal(
+        onnx.numpy_helper.to_array(inits["zero_points"]), zero_points[keep_token_ids]
+    )
+
+    new_ids = np.arange(len(keep_token_ids), dtype=np.int64)
+    (pruned_out,) = _run(result.model, {"input_ids": new_ids})
+    oracle = _gbq_dequant(data_vals, scales, zero_points, block_size)[keep_token_ids]
+    np.testing.assert_allclose(pruned_out, oracle, atol=1e-4, rtol=1e-4)
+
+
+def test_gather_block_quantized_pruning_bits2_packed_matches_real_inference_session_oracle():
+    # bits=2, manually-packed uint8 (4 codes/byte, low-order first) -- the
+    # convention only schema-legal, never emitted by the one real tool this
+    # module found evidence of (which only ever emits bits=4/native-int4).
+    V, H, block_size = 5, 16, 16
+    rng = np.random.default_rng(202)
+    data_vals = rng.integers(0, 4, size=(V, H)).astype(np.uint8)
+    scales = rng.random((V, 1)).astype(np.float32) * 0.1 + 0.01
+    zero_points = rng.integers(0, 4, size=(V, 1)).astype(np.uint8)
+
+    model = _gbq_model(data_vals, scales, zero_points, bits=2, block_size=block_size)
+    onnx.checker.check_model(model)
+
+    keep_token_ids = [0, 1, 3, 4]
+    result = onnxsim.apply_embedding_vocab_pruning(model, keep_token_ids=keep_token_ids)
+    onnx.checker.check_model(result.model)
+    assert result.matched
+
+    new_ids = np.arange(len(keep_token_ids), dtype=np.int64)
+    (pruned_out,) = _run(result.model, {"input_ids": new_ids})
+    oracle = _gbq_dequant(data_vals, scales, zero_points, block_size)[keep_token_ids]
+    np.testing.assert_allclose(pruned_out, oracle, atol=1e-4, rtol=1e-4)
+
+
+def test_gather_block_quantized_pruning_absent_zero_points_uses_schema_default_uint8():
+    # data dtype uint8 -> schema default zero point is 2 ** (bits - 1).
+    V, H, block_size, bits = 6, 16, 16, 8
+    rng = np.random.default_rng(203)
+    data_vals = rng.integers(0, 256, size=(V, H)).astype(np.uint8)
+    scales = rng.random((V, 1)).astype(np.float32) * 0.1 + 0.01
+
+    model = _gbq_model(data_vals, scales, None, bits=bits, block_size=block_size)
+    onnx.checker.check_model(model)
+
+    keep_token_ids = [0, 2, 5]
+    result = onnxsim.apply_embedding_vocab_pruning(model, keep_token_ids=keep_token_ids)
+    assert result.matched
+    inits = {t.name: t for t in result.model.graph.initializer}
+    assert "zero_points" not in inits  # still absent post-prune, not invented
+
+    new_ids = np.arange(len(keep_token_ids), dtype=np.int64)
+    (pruned_out,) = _run(result.model, {"input_ids": new_ids})
+    default_zp = np.full((V, 1), float(1 << (bits - 1)))
+    oracle = _gbq_dequant(data_vals, scales, default_zp, block_size)[keep_token_ids]
+    np.testing.assert_allclose(pruned_out, oracle, atol=1e-4, rtol=1e-4)
+
+
+def test_gather_block_quantized_pruning_absent_zero_points_uses_schema_default_native_uint4():
+    # data dtype native uint4 -> schema default zero point is 0 (NOT
+    # 2 ** (bits - 1), a genuinely different default from the uint8 case
+    # above -- both confirmed empirically, see this pass's own section-top
+    # comment).
+    V, H, block_size, bits = 6, 16, 16, 4
+    rng = np.random.default_rng(204)
+    data_vals = rng.integers(0, 16, size=(V, H)).astype(np.uint8)
+    scales = rng.random((V, 1)).astype(np.float32) * 0.1 + 0.01
+
+    model = _gbq_model(
+        data_vals, scales, None, bits=bits, block_size=block_size, native=True
+    )
+    onnx.checker.check_model(model)
+
+    keep_token_ids = [1, 3, 4]
+    result = onnxsim.apply_embedding_vocab_pruning(model, keep_token_ids=keep_token_ids)
+    assert result.matched
+
+    new_ids = np.arange(len(keep_token_ids), dtype=np.int64)
+    (pruned_out,) = _run(result.model, {"input_ids": new_ids})
+    default_zp = np.zeros((V, 1))
+    oracle = _gbq_dequant(data_vals, scales, default_zp, block_size)[keep_token_ids]
+    np.testing.assert_allclose(pruned_out, oracle, atol=1e-4, rtol=1e-4)
+
+
+def test_gather_block_quantized_pruning_declines_degenerate_gather_axis_equals_quantize_axis():
+    V, H, block_size = 8, 16, 16
+    rng = np.random.default_rng(205)
+    data_vals = rng.integers(0, 256, size=(V, H)).astype(np.uint8)
+    scales = rng.random((V, 1)).astype(np.float32) * 0.1 + 0.01
+
+    model = _gbq_model(
+        data_vals,
+        scales,
+        None,
+        bits=8,
+        block_size=block_size,
+        gather_axis=1,
+        quantize_axis=1,
+    )
+    result = onnxsim.apply_embedding_vocab_pruning(model, keep_token_ids=[0, 1])
+    assert result.matched is False
+    assert result.model.SerializeToString() == model.SerializeToString()
+
+
+def test_gather_block_quantized_pruning_declines_tied_second_consumer():
+    # A tied lm_head sharing the packed `data` tensor directly is always
+    # declined for this producer shape (see this pass's own section-top
+    # comment) -- the whole call must decline, not silently prune the
+    # embedding while leaving the unexplained second reader stale.
+    V, H, block_size = 8, 16, 16
+    rng = np.random.default_rng(206)
+    data_vals = rng.integers(0, 256, size=(V, H)).astype(np.uint8)
+    scales = rng.random((V, 1)).astype(np.float32) * 0.1 + 0.01
+
+    model = _gbq_model(data_vals, scales, None, bits=8, block_size=block_size)
+    other_ids = onnx.helper.make_tensor_value_info(
+        "other_ids", onnx.TensorProto.INT64, ["m"]
+    )
+    other_out = onnx.helper.make_tensor_value_info(
+        "other_out", onnx.TensorProto.FLOAT, ["m", H]
+    )
+    second_node = onnx.helper.make_node(
+        "GatherBlockQuantized",
+        ["data", "other_ids", "scales"],
+        ["other_out"],
+        domain="com.microsoft",
+        bits=8,
+        block_size=block_size,
+        quantize_axis=1,
+        gather_axis=0,
+    )
+    model.graph.node.append(second_node)
+    model.graph.input.append(other_ids)
+    model.graph.output.append(other_out)
+
+    result = onnxsim.apply_embedding_vocab_pruning(model, keep_token_ids=[0, 1])
+    assert result.matched is False
+    assert result.model.SerializeToString() == model.SerializeToString()
+
+
+def test_gather_block_quantized_pruning_untied_plain_float_lm_head_still_matches_oracle():
+    # An UNTIED, fully independent plain-float lm_head is still
+    # auto-detected exactly as it is for the two plain-float producer
+    # shapes -- only a TIED lm_head sharing `data` itself is out of scope.
+    V, H, block_size = 10, 16, 16
+    rng = np.random.default_rng(207)
+    data_vals = rng.integers(0, 256, size=(V, H)).astype(np.uint8)
+    scales = rng.random((V, 1)).astype(np.float32) * 0.1 + 0.01
+    w_lm = rng.standard_normal((H, V)).astype(np.float32)
+
+    model = _gbq_model(data_vals, scales, None, bits=8, block_size=block_size)
+    model.graph.node.append(
+        onnx.helper.make_node("MatMul", ["output", "W_lm"], ["logits"])
+    )
+    model.graph.initializer.append(_f32(w_lm, "W_lm"))
+    del model.graph.output[:]
+    model.graph.output.append(
+        onnx.helper.make_tensor_value_info("logits", onnx.TensorProto.FLOAT, ["n", V])
+    )
+    onnx.checker.check_model(model)
+
+    keep_token_ids = [0, 2, 4, 6, 9]
+    result = onnxsim.apply_embedding_vocab_pruning(model, keep_token_ids=keep_token_ids)
+    onnx.checker.check_model(result.model)
+    assert result.matched
+    assert result.lm_head_pruned
+
+    inits = {t.name: t for t in result.model.graph.initializer}
+    np.testing.assert_allclose(
+        onnx.numpy_helper.to_array(inits["W_lm"]), w_lm[:, keep_token_ids]
+    )
+
+    new_ids = np.arange(len(keep_token_ids), dtype=np.int64)
+    (pruned_out,) = _run(result.model, {"input_ids": new_ids})
+    hidden_oracle = _gbq_dequant(data_vals, scales, np.full((V, 1), 128.0), block_size)[
+        keep_token_ids
+    ]
+    oracle = hidden_oracle @ w_lm[:, keep_token_ids]
+    np.testing.assert_allclose(pruned_out, oracle, atol=1e-3, rtol=1e-3)
+
+
+def test_gather_block_quantized_magnitude_pruning_matches_oracle_ranking():
+    V, H, block_size = 10, 16, 16
+    rng = np.random.default_rng(208)
+    data_vals = rng.integers(120, 136, size=(V, H)).astype(np.uint8)  # near mid-range
+    data_vals[:5] = 200  # rows 0-4: large deviation from default zp -> kept
+    scales = np.full((V, 1), 0.05, dtype=np.float32)
+
+    model = _gbq_model(data_vals, scales, None, bits=8, block_size=block_size)
+    onnx.checker.check_model(model)
+
+    result = onnxsim.apply_embedding_vocab_magnitude_pruning(model, sparsity=0.5)
+    assert result.matched
+    assert result.kept_token_ids == [0, 1, 2, 3, 4]  # the 5 large-deviation rows
+
+    report = onnxsim.pruning._analyze_embedding_vocab_magnitude_pruning(
+        model, sparsity=0.5
+    )
+    assert len(report.layers) == 1
+    layer = report.layers[0]
+    assert layer.family == "embedding_vocab_magnitude"
+    assert layer.total == V
+    assert layer.would_drop == V - len(result.kept_token_ids)
+
+    new_ids = np.arange(len(result.kept_token_ids), dtype=np.int64)
+    (pruned_out,) = _run(result.model, {"input_ids": new_ids})
+    oracle = _gbq_dequant(data_vals, scales, np.full((V, 1), 128.0), block_size)[
+        result.kept_token_ids
+    ]
+    np.testing.assert_allclose(pruned_out, oracle, atol=1e-4, rtol=1e-4)
+
+
+def test_gather_block_quantized_pruning_declines_when_no_pattern_exists():
+    V, H = 6, 8
+    model = _model(
+        f"""
+        g (float[{V},{H}] x) => (float[{V},{H}] y)
+        {{
+          y = Identity(x)
+        }}
+        """,
+    )
+    result = onnxsim.apply_embedding_vocab_pruning(model, keep_token_ids=[0, 1])
+    assert result.matched is False
+    assert result.model.SerializeToString() == model.SerializeToString()
+
+
 # --- apply_structured_pruning_qdq --------------------------------------------
 #
 # See ``onnxsim/pruning.py``'s own "QDQ (quantized-weight) structured
@@ -30853,3 +31301,803 @@ def test_analyze_attention_head_pruning_linear_attention_matches_real_call():
     assert dims_after["Wq"][1] == kept_groups * group_size * cfg["Dk"]
     assert dims_after["Wk"][1] == kept_groups * cfg["Dk"]
     assert dims_after["Wv"][1] == kept_groups * cfg["Dv"]
+
+
+# --- QOperator (QLinearConv/QLinearMatMul/QGemm) structured pruning tests --
+#
+# QLinearConv/QLinearMatMul/QGemm carry their own quantized weight/scale/
+# zero-point/bias directly as node inputs -- there is no DequantizeLinear
+# node to build through parser text the way the QDQ tests above do, and the
+# scale/zero-point/int32-bias tensors need real int8/uint8/int32 array data
+# a parser text literal can't spell out (the parser only encodes float
+# literals as `float_data`) -- so, mirroring this file's own established
+# fallback for exactly this reason (see the MatMulNBits/QDQ/
+# MatMulBlockQuantizedFp4Weight/Fp8Weight test helpers above), these models
+# are built directly via `onnx.helper`, with real numpy-quantized tensors
+# attached as initializers.
+
+
+def _i32(array, name):
+    return onnx.numpy_helper.from_array(array.astype(np.int32), name)
+
+
+def _qop_quantize_per_channel_i8(w, axis, seed=0):
+    """Independent (onnxsim-code-free) symmetric per-channel INT8
+    quantizer -- `axis` is the output-channel axis. Returns
+    ``(q, scale, zero_point)`` with `zero_point` all-zero (symmetric),
+    matching this repo's own `quantize_qoperator`/`quantize_qoperator_gemm`
+    convention confirmed empirically (see onnxsim/pruning.py's own "
+    QOperator" section comment).
+    """
+    absmax = np.max(np.abs(w), axis=tuple(i for i in range(w.ndim) if i != axis))
+    absmax = np.maximum(absmax, 1e-6)
+    scale = (absmax / 127.0).astype(np.float32)
+    shp = [1] * w.ndim
+    shp[axis] = -1
+    q = np.clip(np.round(w / scale.reshape(shp)), -127, 127).astype(np.int8)
+    zp = np.zeros_like(scale, dtype=np.int8)
+    return q, scale, zp
+
+
+def _qop_quantize_per_tensor_u8(x):
+    """Independent per-tensor asymmetric UINT8 quantizer -- the common
+    activation-quantization convention every real exporter this
+    investigation found actually emits (see section comment).
+    """
+    lo, hi = float(x.min()), float(x.max())
+    if hi <= lo:
+        hi = lo + 1.0
+    scale = np.float32((hi - lo) / 255.0)
+    zp = np.uint8(np.clip(round(-lo / scale), 0, 255))
+    q = np.clip(np.round(x / scale + zp), 0, 255).astype(np.uint8)
+    return q, scale, zp
+
+
+def _qop_dequant(q, scale, zero_point, axis):
+    q = q.astype(np.float64)
+    scale = scale.astype(np.float64)
+    zp = zero_point.astype(np.float64)
+    if scale.ndim >= 1 and scale.size > 1:
+        shape = [1] * q.ndim
+        shape[axis] = -1
+        scale = scale.reshape(shape)
+        zp = zp.reshape(shape)
+    return (q - zp) * scale
+
+
+def _qlinearconv_node(
+    name,
+    x,
+    y,
+    w,
+    w_scale,
+    w_zp,
+    y_scale,
+    y_zp,
+    bias,
+    x_scale="x_scale",
+    x_zp="x_zp",
+    **attrs,
+):
+    inputs = [x, x_scale, x_zp, w, w_scale, w_zp, y_scale, y_zp]
+    if bias is not None:
+        inputs.append(bias)
+    return onnx.helper.make_node("QLinearConv", inputs, [y], name=name, **attrs)
+
+
+def _qlinearconv_chain_model(
+    N1=6, C1=3, N2=4, kh=3, kw=3, bias=True, per_channel=True, seed=0
+):
+    """Builds ``QLinearConv(n1) -> QLinearConv(n2)`` -- a same-family
+    QOperator chain -- with real, independently-quantized weights. Returns
+    ``(model, info)`` where `info` carries every float/quantized array
+    needed to hand-build an "already pruned" oracle.
+    """
+    rng = np.random.default_rng(seed)
+    W1 = rng.standard_normal((N1, C1, kh, kw)).astype(np.float32) * 0.3
+    W2 = rng.standard_normal((N2, N1, 1, 1)).astype(np.float32) * 0.3
+    B1f = (rng.standard_normal(N1).astype(np.float32) * 0.05) if bias else None
+    B2f = (rng.standard_normal(N2).astype(np.float32) * 0.05) if bias else None
+
+    x_scale = np.float32(0.02)
+    x_zp = np.uint8(120)
+
+    if per_channel:
+        W1q, W1s, W1zp = _qop_quantize_per_channel_i8(W1, axis=0)
+        W2q, W2s, W2zp = _qop_quantize_per_channel_i8(W2, axis=0)
+    else:
+        w1q_flat, w1s_flat, w1zp_flat = _qop_quantize_per_channel_i8(
+            W1.reshape(1, -1), axis=0
+        )
+        W1q, W1s, W1zp = w1q_flat.reshape(W1.shape), w1s_flat[0], w1zp_flat[0]
+        w2q_flat, w2s_flat, w2zp_flat = _qop_quantize_per_channel_i8(
+            W2.reshape(1, -1), axis=0
+        )
+        W2q, W2s, W2zp = w2q_flat.reshape(W2.shape), w2s_flat[0], w2zp_flat[0]
+
+    y1_scale = np.float32(0.03)
+    y1_zp = np.uint8(120)
+    y2_scale = np.float32(0.04)
+    y2_zp = np.uint8(120)
+
+    B1q = None
+    if B1f is not None:
+        b1_dequant_scale = x_scale.astype(np.float64) * W1s.astype(np.float64)
+        B1q = np.round(B1f.astype(np.float64) / b1_dequant_scale).astype(np.int32)
+    B2q = None
+    if B2f is not None:
+        b2_dequant_scale = y1_scale.astype(np.float64) * W2s.astype(np.float64)
+        B2q = np.round(B2f.astype(np.float64) / b2_dequant_scale).astype(np.int32)
+
+    inits = [
+        _f32(np.array(x_scale), "x_scale"),
+        _u8(np.array(x_zp), "x_zp"),
+        onnx.numpy_helper.from_array(W1q, "W1"),
+        _f32(np.atleast_1d(W1s) if per_channel else np.array(W1s), "W1_scale"),
+        _i8(np.atleast_1d(W1zp) if per_channel else np.array(W1zp), "W1_zp"),
+        _f32(np.array(y1_scale), "y1_scale"),
+        _u8(np.array(y1_zp), "y1_zp"),
+        onnx.numpy_helper.from_array(W2q, "W2"),
+        _f32(np.atleast_1d(W2s) if per_channel else np.array(W2s), "W2_scale"),
+        _i8(np.atleast_1d(W2zp) if per_channel else np.array(W2zp), "W2_zp"),
+        _f32(np.array(y2_scale), "y2_scale"),
+        _u8(np.array(y2_zp), "y2_zp"),
+    ]
+    if B1q is not None:
+        inits.append(_i32(B1q, "B1"))
+    if B2q is not None:
+        inits.append(_i32(B2q, "B2"))
+
+    n1 = _qlinearconv_node(
+        "n1",
+        "x_q",
+        "y1_q",
+        "W1",
+        "W1_scale",
+        "W1_zp",
+        "y1_scale",
+        "y1_zp",
+        "B1" if B1q is not None else None,
+        kernel_shape=[kh, kw],
+        pads=[0, 0, 0, 0],
+    )
+    n2 = _qlinearconv_node(
+        "n2",
+        "y1_q",
+        "y2_q",
+        "W2",
+        "W2_scale",
+        "W2_zp",
+        "y2_scale",
+        "y2_zp",
+        "B2" if B2q is not None else None,
+        x_scale="y1_scale",
+        x_zp="y1_zp",
+        kernel_shape=[1, 1],
+        pads=[0, 0, 0, 0],
+    )
+    spatial = 8
+    out_spatial = spatial - kh + 1
+    graph = onnx.helper.make_graph(
+        [n1, n2],
+        "g",
+        [
+            onnx.helper.make_tensor_value_info(
+                "x_q", onnx.TensorProto.UINT8, [1, C1, spatial, spatial]
+            )
+        ],
+        [
+            onnx.helper.make_tensor_value_info(
+                "y2_q", onnx.TensorProto.UINT8, [1, N2, out_spatial, out_spatial]
+            )
+        ],
+        initializer=inits,
+    )
+    model = onnx.helper.make_model(
+        graph, opset_imports=[onnx.helper.make_opsetid("", 17)]
+    )
+    model.ir_version = 10
+    return model, {
+        "W1": W1q,
+        "W1_scale": W1s,
+        "W1_zp": W1zp,
+        "B1": B1q,
+        "W2": W2q,
+        "W2_scale": W2s,
+        "W2_zp": W2zp,
+        "B2": B2q,
+        "x_scale": x_scale,
+        "x_zp": x_zp,
+        "y1_scale": y1_scale,
+        "y1_zp": y1_zp,
+        "spatial": spatial,
+        "C1": C1,
+    }
+
+
+def test_qlinearconv_chain_is_matched_and_prunes():
+    model, info = _qlinearconv_chain_model(N1=6, C1=3, N2=4, seed=1)
+    onnx.checker.check_model(model)
+    chains = onnxsim.pruning._find_qop_chains(model.graph)
+    assert len(chains) == 1
+    assert chains[0].n_channels == 6
+
+    pruned = onnxsim.apply_structured_pruning_qoperator(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    inits = {t.name: t for t in pruned.graph.initializer}
+    assert list(inits["W1"].dims) == [3, info["C1"], 3, 3]
+    assert list(inits["W1_scale"].dims) == [3]
+    assert list(inits["W1_zp"].dims) == [3]
+    assert list(inits["B1"].dims) == [3]
+    assert list(inits["W2"].dims) == [4, 3, 1, 1]
+
+
+def test_qlinearconv_producer_matches_independent_oracle_via_real_inference_session():
+    N1, C1, N2 = 6, 3, 4
+    model, info = _qlinearconv_chain_model(N1=N1, C1=C1, N2=N2, seed=2)
+
+    w1_dequant = _qop_dequant(info["W1"], info["W1_scale"], info["W1_zp"], axis=0)
+    w1_nk = w1_dequant.reshape(N1, -1)
+    keep = np.sort(np.argsort(-np.linalg.norm(w1_nk, axis=1))[: N1 // 2])
+
+    pruned = onnxsim.apply_structured_pruning_qoperator(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    inits = {t.name: t for t in pruned.graph.initializer}
+
+    # byte-identity: the pruned graph's own quantized codes/scale/zero_point/
+    # bias are EXACTLY a hand-slice of the original ones -- "slice, don't
+    # recompute" -- never a re-quantization.
+    np.testing.assert_array_equal(
+        onnx.numpy_helper.to_array(inits["W1"]), info["W1"][keep]
+    )
+    np.testing.assert_array_equal(
+        onnx.numpy_helper.to_array(inits["W1_scale"]), info["W1_scale"][keep]
+    )
+    np.testing.assert_array_equal(
+        onnx.numpy_helper.to_array(inits["W1_zp"]), info["W1_zp"][keep]
+    )
+    np.testing.assert_array_equal(
+        onnx.numpy_helper.to_array(inits["B1"]), info["B1"][keep]
+    )
+    np.testing.assert_array_equal(
+        onnx.numpy_helper.to_array(inits["W2"]), info["W2"][:, keep]
+    )
+
+    # Independently reconstructed "already pruned" reference model (its own
+    # smaller tensors built directly, not a post-hoc slice of the unpruned
+    # model's own output) -- both run through a real onnxruntime
+    # InferenceSession, per this task's own correctness bar.
+    ref_model, _ = _qlinearconv_chain_model(N1=len(keep), C1=C1, N2=N2, seed=1234567)
+    ref_inits = {t.name: t for t in ref_model.graph.initializer}
+    ref_inits["W1"].CopyFrom(onnx.numpy_helper.from_array(info["W1"][keep], "W1"))
+    ref_inits["W1_scale"].CopyFrom(
+        onnx.numpy_helper.from_array(info["W1_scale"][keep], "W1_scale")
+    )
+    ref_inits["W1_zp"].CopyFrom(
+        onnx.numpy_helper.from_array(info["W1_zp"][keep], "W1_zp")
+    )
+    ref_inits["B1"].CopyFrom(onnx.numpy_helper.from_array(info["B1"][keep], "B1"))
+    ref_inits["W2"].CopyFrom(onnx.numpy_helper.from_array(info["W2"][:, keep], "W2"))
+    ref_inits["W2_scale"].CopyFrom(
+        onnx.numpy_helper.from_array(info["W2_scale"], "W2_scale")
+    )
+    ref_inits["W2_zp"].CopyFrom(onnx.numpy_helper.from_array(info["W2_zp"], "W2_zp"))
+    ref_inits["B2"].CopyFrom(onnx.numpy_helper.from_array(info["B2"], "B2"))
+
+    rng = np.random.default_rng(11)
+    spatial = info["spatial"]
+    xq = rng.integers(0, 255, size=(1, C1, spatial, spatial)).astype(np.uint8)
+
+    (y_pruned,) = _run(pruned, {"x_q": xq})
+    (y_ref,) = _run(ref_model, {"x_q": xq})
+    np.testing.assert_array_equal(y_pruned, y_ref)
+
+
+def test_qlinearconv_per_tensor_scale_left_untouched():
+    model, info = _qlinearconv_chain_model(N1=6, C1=3, N2=4, per_channel=False, seed=3)
+    onnx.checker.check_model(model)
+    pruned = onnxsim.apply_structured_pruning_qoperator(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    inits = {t.name: t for t in pruned.graph.initializer}
+    # per-tensor scale/zero-point are scalars -- never sliced, regardless of
+    # channel count
+    assert list(inits["W1_scale"].dims) == []
+    assert list(inits["W1_zp"].dims) == []
+    assert list(inits["W1"].dims) == [3, 3, 3, 3]
+    assert list(inits["B1"].dims) == [3]  # bias always co-sliced regardless
+
+
+def test_qlinearconv_grouped_is_declined():
+    model, _info = _qlinearconv_chain_model(N1=6, C1=3, N2=4, seed=4)
+    for node in model.graph.node:
+        if node.name == "n1":
+            node.attribute.append(onnx.helper.make_attribute("group", 3))
+    chains = onnxsim.pruning._find_qop_chains(model.graph)
+    assert chains == []
+    report = onnxsim.analyze_pruning_sensitivity(
+        model, onnxsim.apply_structured_pruning_qoperator, sparsity=0.5
+    )
+    assert report.layers == []
+    assert any("n1" in ne for ne in report.not_eligible)
+
+
+def test_qlinearconv_non_scalar_activation_scale_is_declined():
+    model, _info = _qlinearconv_chain_model(N1=6, C1=3, N2=4, seed=5)
+    inits = {t.name: t for t in model.graph.initializer}
+    inits["y1_scale"].CopyFrom(
+        _f32(np.array([0.03, 0.03, 0.03, 0.03, 0.03, 0.03]), "y1_scale")
+    )
+    chains = onnxsim.pruning._find_qop_chains(model.graph)
+    assert chains == []
+
+
+def test_qlinearconv_tied_weight_is_declined():
+    model, _info = _qlinearconv_chain_model(N1=6, C1=3, N2=4, seed=6)
+    # a second, unrelated node also reads W1 -- shared/tied, can't be sliced
+    extra = onnx.helper.make_node("Identity", ["W1"], ["W1_alias"], name="alias")
+    model.graph.node.append(extra)
+    model.graph.output.append(
+        onnx.helper.make_tensor_value_info(
+            "W1_alias", onnx.TensorProto.INT8, [6, 3, 3, 3]
+        )
+    )
+    chains = onnxsim.pruning._find_qop_chains(model.graph)
+    assert chains == []
+
+
+# --- QLinearMatMul --------------------------------------------------------
+
+
+def _qlinearmatmul_node(
+    name, a, y, b, b_scale, b_zp, y_scale, y_zp, a_scale="a_scale", a_zp="a_zp"
+):
+    return onnx.helper.make_node(
+        "QLinearMatMul",
+        [a, a_scale, a_zp, b, b_scale, b_zp, y_scale, y_zp],
+        [y],
+        name=name,
+    )
+
+
+def _qlinearmatmul_chain_model(K=8, H=6, Out=4, seed=0):
+    """Builds ``QLinearMatMul(n1) -> QLinearMatMul(n2)`` -- both real,
+    per-channel INT8 weights, matching this repo's own
+    ``quantize_qoperator`` convention (`b` stored ``[K, N]``, `b_scale`/
+    `b_zero_point` per-column).
+    """
+    rng = np.random.default_rng(seed)
+    W1 = rng.standard_normal((K, H)).astype(np.float32) * 0.3
+    W2 = rng.standard_normal((H, Out)).astype(np.float32) * 0.3
+    W1q, W1s, W1zp = _qop_quantize_per_channel_i8(W1, axis=1)
+    W2q, W2s, W2zp = _qop_quantize_per_channel_i8(W2, axis=1)
+
+    a_scale = np.float32(0.02)
+    a_zp = np.uint8(120)
+    y1_scale = np.float32(0.03)
+    y1_zp = np.uint8(120)
+    y2_scale = np.float32(0.04)
+    y2_zp = np.uint8(120)
+
+    inits = [
+        _f32(np.array(a_scale), "a_scale"),
+        _u8(np.array(a_zp), "a_zp"),
+        onnx.numpy_helper.from_array(W1q, "W1"),
+        _f32(W1s, "W1_scale"),
+        _i8(W1zp, "W1_zp"),
+        _f32(np.array(y1_scale), "y1_scale"),
+        _u8(np.array(y1_zp), "y1_zp"),
+        onnx.numpy_helper.from_array(W2q, "W2"),
+        _f32(W2s, "W2_scale"),
+        _i8(W2zp, "W2_zp"),
+        _f32(np.array(y2_scale), "y2_scale"),
+        _u8(np.array(y2_zp), "y2_zp"),
+    ]
+    n1 = _qlinearmatmul_node(
+        "n1", "x_q", "y1_q", "W1", "W1_scale", "W1_zp", "y1_scale", "y1_zp"
+    )
+    n2 = _qlinearmatmul_node(
+        "n2",
+        "y1_q",
+        "y2_q",
+        "W2",
+        "W2_scale",
+        "W2_zp",
+        "y2_scale",
+        "y2_zp",
+        a_scale="y1_scale",
+        a_zp="y1_zp",
+    )
+    graph = onnx.helper.make_graph(
+        [n1, n2],
+        "g",
+        [onnx.helper.make_tensor_value_info("x_q", onnx.TensorProto.UINT8, [2, K])],
+        [onnx.helper.make_tensor_value_info("y2_q", onnx.TensorProto.UINT8, [2, Out])],
+        initializer=inits,
+    )
+    model = onnx.helper.make_model(
+        graph, opset_imports=[onnx.helper.make_opsetid("", 21)]
+    )
+    model.ir_version = 10
+    return model, {
+        "W1": W1q,
+        "W1_scale": W1s,
+        "W1_zp": W1zp,
+        "W2": W2q,
+        "W2_scale": W2s,
+        "W2_zp": W2zp,
+    }
+
+
+def test_qlinearmatmul_producer_matches_independent_oracle():
+    K, H, Out = 8, 6, 4
+    model, info = _qlinearmatmul_chain_model(K, H, Out, seed=10)
+    onnx.checker.check_model(model)
+
+    w1_dequant = _qop_dequant(info["W1"], info["W1_scale"], info["W1_zp"], axis=1)
+    keep = np.sort(np.argsort(-np.linalg.norm(w1_dequant.T, axis=1))[: H // 2])
+
+    pruned = onnxsim.apply_structured_pruning_qoperator(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    inits = {t.name: t for t in pruned.graph.initializer}
+    np.testing.assert_array_equal(
+        onnx.numpy_helper.to_array(inits["W1"]), info["W1"][:, keep]
+    )
+    np.testing.assert_array_equal(
+        onnx.numpy_helper.to_array(inits["W1_scale"]), info["W1_scale"][keep]
+    )
+    np.testing.assert_array_equal(
+        onnx.numpy_helper.to_array(inits["W2"]), info["W2"][keep, :]
+    )
+
+    ref_model, _ = _qlinearmatmul_chain_model(K, len(keep), Out, seed=999)
+    ref_inits = {t.name: t for t in ref_model.graph.initializer}
+    ref_inits["W1"].CopyFrom(onnx.numpy_helper.from_array(info["W1"][:, keep], "W1"))
+    ref_inits["W1_scale"].CopyFrom(
+        onnx.numpy_helper.from_array(info["W1_scale"][keep], "W1_scale")
+    )
+    ref_inits["W1_zp"].CopyFrom(
+        onnx.numpy_helper.from_array(info["W1_zp"][keep], "W1_zp")
+    )
+    ref_inits["W2"].CopyFrom(onnx.numpy_helper.from_array(info["W2"][keep, :], "W2"))
+    ref_inits["W2_scale"].CopyFrom(
+        onnx.numpy_helper.from_array(info["W2_scale"], "W2_scale")
+    )
+    ref_inits["W2_zp"].CopyFrom(onnx.numpy_helper.from_array(info["W2_zp"], "W2_zp"))
+
+    rng = np.random.default_rng(12)
+    xq = rng.integers(0, 255, size=(2, K)).astype(np.uint8)
+    (y_pruned,) = _run(pruned, {"x_q": xq})
+    (y_ref,) = _run(ref_model, {"x_q": xq})
+    np.testing.assert_array_equal(y_pruned, y_ref)
+
+
+def test_qlinearmatmul_no_flatten_crossing_conv_producer_is_declined():
+    # The real onnxruntime.quantization.quantize_static(quant_format=
+    # QOperator) round trip this section's own top comment reproduces
+    # emits exactly QLinearConv -> Flatten -> QLinearMatMul -- confirmed
+    # NOT matched here (same-family-only walk, mirroring the QDQ section's
+    # own identical, pre-existing gap for Flatten-crossing chains).
+    conv_model, conv_info = _qlinearconv_chain_model(N1=6, C1=3, N2=4, seed=20)
+    # Reuse just the first QLinearConv node/initializers, then Flatten into
+    # a QLinearMatMul consumer.
+    n1 = [n for n in conv_model.graph.node if n.name == "n1"][0]
+    keep_inits = [
+        t
+        for t in conv_model.graph.initializer
+        if t.name
+        in ("x_scale", "x_zp", "W1", "W1_scale", "W1_zp", "y1_scale", "y1_zp", "B1")
+    ]
+    spatial = conv_info["spatial"]
+    out_spatial = spatial - 3 + 1
+    flat_dim = 6 * out_spatial * out_spatial
+    Kmm, Out = flat_dim, 4
+    rng = np.random.default_rng(21)
+    Wmm = rng.standard_normal((Kmm, Out)).astype(np.float32) * 0.3
+    Wmmq, Wmms, Wmmzp = _qop_quantize_per_channel_i8(Wmm, axis=1)
+    flatten = onnx.helper.make_node("Flatten", ["y1_q"], ["flat_q"], axis=1)
+    mm = _qlinearmatmul_node(
+        "mm",
+        "flat_q",
+        "y_q",
+        "Wmm",
+        "Wmm_scale",
+        "Wmm_zp",
+        "y2_scale",
+        "y2_zp",
+        a_scale="y1_scale",
+        a_zp="y1_zp",
+    )
+    inits = list(keep_inits) + [
+        onnx.numpy_helper.from_array(Wmmq, "Wmm"),
+        _f32(Wmms, "Wmm_scale"),
+        _i8(Wmmzp, "Wmm_zp"),
+        _f32(np.array(0.05, dtype=np.float32), "y2_scale"),
+        _u8(np.array(120, dtype=np.uint8), "y2_zp"),
+    ]
+    graph = onnx.helper.make_graph(
+        [n1, flatten, mm],
+        "g",
+        [
+            onnx.helper.make_tensor_value_info(
+                "x_q", onnx.TensorProto.UINT8, [1, 3, spatial, spatial]
+            )
+        ],
+        [onnx.helper.make_tensor_value_info("y_q", onnx.TensorProto.UINT8, [1, Out])],
+        initializer=inits,
+    )
+    model = onnx.helper.make_model(
+        graph, opset_imports=[onnx.helper.make_opsetid("", 17)]
+    )
+    model.ir_version = 10
+    onnx.checker.check_model(model)
+
+    chains = onnxsim.pruning._find_qop_chains(model.graph)
+    assert chains == []  # declined -- see this test's own comment above
+    pruned = onnxsim.apply_structured_pruning_qoperator(model, sparsity=0.5)
+    # nothing changes -- no matched chain to prune
+    assert list([t for t in pruned.graph.initializer if t.name == "W1"][0].dims) == [
+        6,
+        3,
+        3,
+        3,
+    ]
+
+
+# --- QGemm ------------------------------------------------------------
+
+
+def _qgemm_node(name, a, y, b, b_scale, b_zp, c, y_scale, y_zp, **attrs):
+    inputs = [a, "a_scale", "a_zp", b, b_scale, b_zp]
+    inputs.append(c or "")
+    inputs.append(y_scale or "")
+    inputs.append(y_zp or "")
+    while inputs and not inputs[-1]:
+        inputs.pop()
+    return onnx.helper.make_node(
+        "QGemm", inputs, [y], domain="com.microsoft", name=name, **attrs
+    )
+
+
+def _qgemm_chain_model(K=8, H=6, Out=4, transB1=0, transB2=0, bias=True, seed=0):
+    rng = np.random.default_rng(seed)
+    W1f = rng.standard_normal((H, K) if transB1 else (K, H)).astype(np.float32) * 0.3
+    W2f = (
+        rng.standard_normal((Out, H) if transB2 else (H, Out)).astype(np.float32) * 0.3
+    )
+    axis1 = 0 if transB1 else 1
+    axis2 = 0 if transB2 else 1
+    W1q, W1s, W1zp = _qop_quantize_per_channel_i8(W1f, axis=axis1)
+    W2q, W2s, W2zp = _qop_quantize_per_channel_i8(W2f, axis=axis2)
+
+    a_scale = np.float32(0.02)
+    a_zp = np.uint8(120)
+    y1_scale = np.float32(0.03)
+    y1_zp = np.uint8(120)
+    y2_scale = np.float32(0.04)
+    y2_zp = np.uint8(120)
+
+    C1f = (rng.standard_normal(H).astype(np.float32) * 0.05) if bias else None
+    C2f = (rng.standard_normal(Out).astype(np.float32) * 0.05) if bias else None
+    C1q = None
+    if C1f is not None:
+        c1_scale = a_scale.astype(np.float64) * W1s.astype(np.float64)
+        C1q = np.round(C1f.astype(np.float64) / c1_scale).astype(np.int32)
+    C2q = None
+    if C2f is not None:
+        c2_scale = y1_scale.astype(np.float64) * W2s.astype(np.float64)
+        C2q = np.round(C2f.astype(np.float64) / c2_scale).astype(np.int32)
+
+    inits = [
+        _f32(np.array(a_scale), "a_scale"),
+        _u8(np.array(a_zp), "a_zp"),
+        onnx.numpy_helper.from_array(W1q, "W1"),
+        _f32(W1s, "W1_scale"),
+        _i8(W1zp, "W1_zp"),
+        _f32(np.array(y1_scale), "y1_scale"),
+        _u8(np.array(y1_zp), "y1_zp"),
+        onnx.numpy_helper.from_array(W2q, "W2"),
+        _f32(W2s, "W2_scale"),
+        _i8(W2zp, "W2_zp"),
+        _f32(np.array(y2_scale), "y2_scale"),
+        _u8(np.array(y2_zp), "y2_zp"),
+    ]
+    if C1q is not None:
+        inits.append(_i32(C1q, "C1"))
+    if C2q is not None:
+        inits.append(_i32(C2q, "C2"))
+
+    n1 = _qgemm_node(
+        "n1",
+        "x_q",
+        "y1_q",
+        "W1",
+        "W1_scale",
+        "W1_zp",
+        "C1" if C1q is not None else None,
+        "y1_scale",
+        "y1_zp",
+        transB=transB1,
+    )
+    n2 = _qgemm_node(
+        "n2",
+        "y1_q",
+        "y2_q",
+        "W2",
+        "W2_scale",
+        "W2_zp",
+        "C2" if C2q is not None else None,
+        "y2_scale",
+        "y2_zp",
+        transB=transB2,
+    )
+    n2.input[1] = "y1_scale"
+    n2.input[2] = "y1_zp"
+    graph = onnx.helper.make_graph(
+        [n1, n2],
+        "g",
+        [onnx.helper.make_tensor_value_info("x_q", onnx.TensorProto.UINT8, [2, K])],
+        [onnx.helper.make_tensor_value_info("y2_q", onnx.TensorProto.UINT8, [2, Out])],
+        initializer=inits,
+    )
+    model = onnx.helper.make_model(
+        graph,
+        opset_imports=[
+            onnx.helper.make_opsetid("", 17),
+            onnx.helper.make_opsetid("com.microsoft", 1),
+        ],
+    )
+    model.ir_version = 10
+    return model, {
+        "W1": W1q,
+        "W1_scale": W1s,
+        "W1_zp": W1zp,
+        "C1": C1q,
+        "W2": W2q,
+        "W2_scale": W2s,
+        "W2_zp": W2zp,
+        "C2": C2q,
+        "transB1": transB1,
+        "transB2": transB2,
+    }
+
+
+@pytest.mark.parametrize("transB1,transB2", [(0, 0), (1, 0), (0, 1), (1, 1)])
+def test_qgemm_producer_consumer_transb_matches_independent_oracle(transB1, transB2):
+    K, H, Out = 8, 6, 4
+    model, info = _qgemm_chain_model(
+        K, H, Out, transB1=transB1, transB2=transB2, seed=30
+    )
+    onnx.checker.check_model(model)
+
+    axis1 = 0 if transB1 else 1
+    w1_dequant = _qop_dequant(info["W1"], info["W1_scale"], info["W1_zp"], axis=axis1)
+    w1_nk = w1_dequant if transB1 else w1_dequant.T
+    keep = np.sort(np.argsort(-np.linalg.norm(w1_nk, axis=1))[: H // 2])
+
+    pruned = onnxsim.apply_structured_pruning_qoperator(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    inits = {t.name: t for t in pruned.graph.initializer}
+
+    w1_expected = info["W1"][keep, :] if transB1 else info["W1"][:, keep]
+    w2_expected = info["W2"][:, keep] if transB2 else info["W2"][keep, :]
+    np.testing.assert_array_equal(onnx.numpy_helper.to_array(inits["W1"]), w1_expected)
+    np.testing.assert_array_equal(
+        onnx.numpy_helper.to_array(inits["W1_scale"]), info["W1_scale"][keep]
+    )
+    np.testing.assert_array_equal(
+        onnx.numpy_helper.to_array(inits["C1"]), info["C1"][keep]
+    )
+    np.testing.assert_array_equal(onnx.numpy_helper.to_array(inits["W2"]), w2_expected)
+
+    ref_model, _ = _qgemm_chain_model(
+        K, len(keep), Out, transB1=transB1, transB2=transB2, seed=555
+    )
+    ref_inits = {t.name: t for t in ref_model.graph.initializer}
+    ref_inits["W1"].CopyFrom(onnx.numpy_helper.from_array(w1_expected, "W1"))
+    ref_inits["W1_scale"].CopyFrom(
+        onnx.numpy_helper.from_array(info["W1_scale"][keep], "W1_scale")
+    )
+    ref_inits["W1_zp"].CopyFrom(
+        onnx.numpy_helper.from_array(info["W1_zp"][keep], "W1_zp")
+    )
+    ref_inits["C1"].CopyFrom(onnx.numpy_helper.from_array(info["C1"][keep], "C1"))
+    ref_inits["W2"].CopyFrom(onnx.numpy_helper.from_array(w2_expected, "W2"))
+    ref_inits["W2_scale"].CopyFrom(
+        onnx.numpy_helper.from_array(info["W2_scale"], "W2_scale")
+    )
+    ref_inits["W2_zp"].CopyFrom(onnx.numpy_helper.from_array(info["W2_zp"], "W2_zp"))
+    ref_inits["C2"].CopyFrom(onnx.numpy_helper.from_array(info["C2"], "C2"))
+
+    rng = np.random.default_rng(31)
+    xq = rng.integers(0, 255, size=(2, K)).astype(np.uint8)
+    (y_pruned,) = _run(pruned, {"x_q": xq})
+    (y_ref,) = _run(ref_model, {"x_q": xq})
+    np.testing.assert_array_equal(y_pruned, y_ref)
+
+
+def test_qgemm_trans_a_nonzero_is_declined():
+    model, _info = _qgemm_chain_model(seed=40)
+    for node in model.graph.node:
+        if node.name == "n1":
+            node.attribute.append(onnx.helper.make_attribute("transA", 1))
+    chains = onnxsim.pruning._find_qop_chains(model.graph)
+    assert chains == []
+
+
+def test_qgemm_alpha_nonone_is_declined():
+    model, _info = _qgemm_chain_model(seed=41)
+    for node in model.graph.node:
+        if node.name == "n1":
+            node.attribute.append(onnx.helper.make_attribute("alpha", 2.0))
+    chains = onnxsim.pruning._find_qop_chains(model.graph)
+    assert chains == []
+
+
+def test_qgemm_scalar_bias_is_left_untouched():
+    K, H, Out = 8, 6, 4
+    model, _info = _qgemm_chain_model(K, H, Out, bias=True, seed=42)
+    inits = {t.name: t for t in model.graph.initializer}
+    inits["C1"].CopyFrom(_i32(np.array([7]), "C1"))
+    onnx.checker.check_model(model)
+    pruned = onnxsim.apply_structured_pruning_qoperator(model, sparsity=0.5)
+    pruned_inits = {t.name: t for t in pruned.graph.initializer}
+    assert list(pruned_inits["C1"].dims) == [1]
+    np.testing.assert_array_equal(onnx.numpy_helper.to_array(pruned_inits["C1"]), [7])
+    assert list(pruned_inits["W1"].dims) == [K, H // 2]
+
+
+def test_qgemm_ambiguous_bias_shape_is_declined():
+    K, H, Out = 8, 6, 4
+    model, _info = _qgemm_chain_model(K, H, Out, bias=True, seed=43)
+    inits = {t.name: t for t in model.graph.initializer}
+    inits["C1"].CopyFrom(_i32(np.zeros((1, H)), "C1"))
+    chains = onnxsim.pruning._find_qop_chains(model.graph)
+    assert chains == []
+
+
+# --- Dry-run parity / registry --------------------------------------------
+
+
+def test_analyze_structured_pruning_qoperator_matches_real_call():
+    model, info = _qlinearconv_chain_model(N1=6, C1=3, N2=4, seed=50)
+    report = onnxsim.analyze_pruning_sensitivity(
+        model, onnxsim.apply_structured_pruning_qoperator, sparsity=0.5
+    )
+    assert len(report.layers) == 1
+    layer = report.layers[0]
+    assert layer.family == "qoperator_conv"
+    assert layer.total == 6
+    assert layer.would_drop == 3
+    assert report.not_eligible == []
+
+    pruned = onnxsim.apply_structured_pruning_qoperator(model, sparsity=0.5)
+    dims_after = {t.name: list(t.dims) for t in pruned.graph.initializer}
+    assert dims_after["W1"][0] == 6 - layer.would_drop
+
+
+def test_analyze_structured_pruning_qoperator_matmul_family():
+    model, _info = _qlinearmatmul_chain_model(K=8, H=6, Out=4, seed=51)
+    report = onnxsim.analyze_pruning_sensitivity(
+        model, onnxsim.apply_structured_pruning_qoperator, sparsity=0.5
+    )
+    assert len(report.layers) == 1
+    assert report.layers[0].family == "qoperator_matmul"
+
+
+def test_analyze_structured_pruning_qoperator_reports_not_eligible():
+    model, _info = _qlinearconv_chain_model(N1=6, C1=3, N2=4, seed=52)
+    for node in model.graph.node:
+        if node.name == "n1":
+            node.attribute.append(onnx.helper.make_attribute("group", 3))
+    report = onnxsim.analyze_pruning_sensitivity(
+        model, onnxsim.apply_structured_pruning_qoperator, sparsity=0.5
+    )
+    assert report.layers == []
+    assert any("QLinearConv" in ne for ne in report.not_eligible)
+
+
+def test_apply_structured_pruning_qoperator_registered_in_sensitivity_analyzers():
+    assert (
+        onnxsim.apply_structured_pruning_qoperator
+        in onnxsim.pruning._SENSITIVITY_ANALYZERS
+    )

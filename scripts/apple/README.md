@@ -512,6 +512,19 @@ definitions:
   alongside the nested summary -- `coreml-integration.yml` uploads these as
   the `quality-retention-results` CI artifact, so a run's numbers don't have
   to be re-parsed out of `$GITHUB_STEP_SUMMARY` text.
+- `aggregate_quality_trend.py` reads several `compute_retention.py --output`
+  files (e.g. downloaded from a handful of past `quality-eval-macos` runs)
+  and groups their `"records"` by `(model_id, benchmark, metric)`, so a
+  model's retention/accuracy can be read as a trend across runs instead of
+  one isolated data point per run:
+  ```bash
+  python aggregate_quality_trend.py retention_ifeval_run1.json \
+      retention_ifeval_run2.json --output trend.json
+  ```
+  Not wired into CI -- `quality-eval-macos` runs a single fixed model with no
+  run-history persistence today, so this is meant to be run by hand against
+  artifacts fetched from past runs (`gh run download` or the Actions UI), not
+  something the workflow calls itself yet.
 
 ```bash
 pip install "optimum-onnx" transformers coremltools onnxruntime "lm-eval[ifeval]"
