@@ -14887,6 +14887,309 @@ def _qmoe_inits(model):
     return {t.name: onnx.numpy_helper.to_array(t) for t in model.graph.initializer}
 
 
+# --- QMoE quant_type='nvfp4' test helpers -----------------------------------
+#
+# See onnxsim/pruning.py's own "QMoE (quantized-weight MoE) pruning" section
+# comment, point 9, for the full derivation: this environment's onnxruntime
+# 1.29.0 CPU execution provider has NO kernel at all for quant_type='nvfp4'
+# (confirmed directly -- a hand-built, otherwise schema-valid QMoE('nvfp4')
+# node fails identically at onnxruntime.InferenceSession(...) construction
+# with "NOT_IMPLEMENTED : Could not find an implementation for QMoE(1) node
+# with name ''"). So, unlike every quant_type='int' test above (each run
+# through a real ORT CPU session via _run), every nvfp4 test below instead
+# checks (a) that this pass's own output is byte-exact-identical to slicing
+# the already-quantized reference tensors directly (never re-derived), the
+# same "slice, don't recompute" bar every other test in this file is held
+# to, and (b) that dequantizing the pruned tensors reproduces exactly what
+# slicing the full dequantized reference would give -- the "slice commutes
+# with dequant" property this quant_type's own packed/block-scaled format
+# needs to hold for pruning to be safe at all. No test below claims to
+# match a real QMoE('nvfp4') kernel's own numerical output, because none
+# was available to check against in this environment.
+
+_E2M1_LUT = np.array(
+    [
+        0.0,
+        0.5,
+        1.0,
+        1.5,
+        2.0,
+        3.0,
+        4.0,
+        6.0,
+        -0.0,
+        -0.5,
+        -1.0,
+        -1.5,
+        -2.0,
+        -3.0,
+        -4.0,
+        -6.0,
+    ],
+    dtype=np.float64,
+)
+
+
+def _e2m1_encode_nearest(values):
+    """Independent (onnxsim-code-free) E2M1 4-bit float encoder: rounds
+    each value to the nearest of the 16 representable E2M1 codes
+    (brute-force nearest-code search -- fine for the small test tensors
+    built below, not meant to be fast).
+    """
+    values = np.asarray(values, dtype=np.float64)
+    flat = values.reshape(-1)
+    codes = np.argmin(np.abs(_E2M1_LUT[None, :] - flat[:, None]), axis=1)
+    return codes.reshape(values.shape).astype(np.uint8)
+
+
+def _e2m1_decode(codes):
+    """Independent inverse of :func:`_e2m1_encode_nearest`."""
+    return _E2M1_LUT[np.asarray(codes).astype(np.int64)]
+
+
+def _qmoe_nvfp4_quantize_channel_blockwise(w, global_scale, block_size=16):
+    """Independent (onnxsim-code-free) NVFP4 quantizer for one expert's own
+    ``[N, K]`` float weight: per-`block_size`-sized group along `K`, an
+    E2M1 magnitude/sign code plus a ``float8e4m3fn`` block scale, combined
+    with a caller-supplied scalar `global_scale` (this test file never
+    needs to *choose* a global scale -- only to exercise how it's
+    stored/sliced). Returns ``(packed [N, K/2] uint8, block_scale [N, K //
+    block_size] float8e4m3fn, dequant [N, K] float64)`` -- packed
+    low-index-in-low-bits, the same convention :func:`_pack_vals` already
+    uses for the int path (see onnxsim/pruning.py's own section comment,
+    point 9, for why this exact byte order for E2M1 codes specifically was
+    never independently kernel-verified, unlike the int path's own).
+    """
+    n, k = w.shape
+    kb = k // block_size
+    w_blocks = w.reshape(n, kb, block_size).astype(np.float64)
+    amax = np.maximum(np.abs(w_blocks).max(axis=-1), 1e-12)
+    block_scale_f64 = amax / (6.0 * global_scale)  # 6.0 == E2M1's own max magnitude
+    block_scale_f8 = block_scale_f64.astype(ml_dtypes.float8_e4m3fn)
+    block_scale_rt = block_scale_f8.astype(
+        np.float64
+    )  # what's actually stored/read back
+    codes = _e2m1_encode_nearest(w_blocks / (block_scale_rt[..., None] * global_scale))
+    packed = _pack_vals(codes.reshape(n, k), 4)
+    dequant = (_e2m1_decode(codes) * block_scale_rt[..., None] * global_scale).reshape(
+        n, k
+    )
+    return packed, block_scale_f8, dequant
+
+
+def _qmoe_nvfp4_quantize_blockwise(w, global_scale, block_size=16):
+    """Batched (per-expert) :func:`_qmoe_nvfp4_quantize_channel_blockwise`:
+    `w` is ``[E, N, K]``, `global_scale` ``[E]``.
+    """
+    e, n, k = w.shape
+    kb = k // block_size
+    packed = np.zeros((e, n, k // 2), dtype=np.uint8)
+    block_scale = np.zeros((e, n, kb), dtype=ml_dtypes.float8_e4m3fn)
+    dequant = np.zeros((e, n, k), dtype=np.float64)
+    for ei in range(e):
+        packed[ei], block_scale[ei], dequant[ei] = (
+            _qmoe_nvfp4_quantize_channel_blockwise(
+                w[ei], float(global_scale[ei]), block_size
+            )
+        )
+    return packed, block_scale, dequant
+
+
+def _qmoe_nvfp4_dequantize(packed, block_scale, global_scale, block_size=16):
+    """Independent (onnxsim-code-free) NVFP4 dequantizer -- the same
+    formula onnxsim/pruning.py's own `_qmoe_dequantize_nvfp4` implements,
+    re-derived fresh here (never imported) so a test comparing against it
+    is a genuine cross-check, not tautological.
+    """
+    e, n, k_packed = packed.shape
+    k = k_packed * 2
+    codes = _unpack_vals(packed, 4, k).astype(np.int64)
+    mag = _e2m1_decode(codes)
+    kb = k // block_size
+    bs = block_scale.astype(np.float64)
+    gs = np.asarray(global_scale, dtype=np.float64)
+    mag_blocks = mag.reshape(e, n, kb, block_size)
+    dequant = mag_blocks * bs[:, :, :, None] * gs[:, None, None, None]
+    return dequant.reshape(e, n, k)
+
+
+def _f8e4m3(array, name):
+    return onnx.numpy_helper.from_array(array.astype(ml_dtypes.float8_e4m3fn), name)
+
+
+def _qmoe_nvfp4_model(
+    fc1_q,
+    fc1_scale,
+    fc2_q,
+    fc2_scale,
+    fc1_global_scale,
+    fc2_global_scale,
+    fc1_bias=None,
+    fc2_bias=None,
+    activation="relu",
+    k=2,
+    tokens=6,
+    block_size=16,
+    quant_type="nvfp4",
+    fc1_zp=None,
+):
+    """`quant_type='nvfp4'` counterpart of :func:`_qmoe_model` -- see this
+    file's own QMoE top-of-section comment for why QMoE models are always
+    built via onnx.helper, never onnx.parser. `fc1_zp`, when given, is only
+    ever used by a decline test (nvfp4 has no zero_points concept at all).
+    """
+    num_experts, inter, hidden_packed = fc1_q.shape
+    hidden = hidden_packed * 2
+    inputs = [
+        onnx.helper.make_tensor_value_info(
+            "X", onnx.TensorProto.FLOAT, [tokens, hidden]
+        ),
+        onnx.helper.make_tensor_value_info(
+            "R", onnx.TensorProto.FLOAT, [tokens, num_experts]
+        ),
+    ]
+    outputs = [
+        onnx.helper.make_tensor_value_info(
+            "Y", onnx.TensorProto.FLOAT, [tokens, hidden]
+        )
+    ]
+    inits = [
+        _u8(fc1_q, "FC1Q"),
+        _f8e4m3(fc1_scale, "FC1S"),
+        _u8(fc2_q, "FC2Q"),
+        _f8e4m3(fc2_scale, "FC2S"),
+    ]
+    node_inputs = ["X", "R", "FC1Q", "FC1S", "", "FC2Q", "FC2S", ""]
+    if fc1_bias is not None:
+        node_inputs[4] = "FC1B"
+        inits.append(_f32(fc1_bias, "FC1B"))
+    if fc2_bias is not None:
+        node_inputs[7] = "FC2B"
+        inits.append(_f32(fc2_bias, "FC2B"))
+    while len(node_inputs) < 12:
+        node_inputs.append("")
+    if fc1_zp is not None:
+        node_inputs[11] = "FC1ZP"
+        inits.append(_u8(fc1_zp, "FC1ZP"))
+    while len(node_inputs) < 16:
+        node_inputs.append("")
+    if fc1_global_scale is not None:
+        node_inputs[15] = "FC1GS"
+        inits.append(_f32(fc1_global_scale, "FC1GS"))
+    node_inputs.append("FC2GS" if fc2_global_scale is not None else "")
+    if fc2_global_scale is not None:
+        inits.append(_f32(fc2_global_scale, "FC2GS"))
+    node = onnx.helper.make_node(
+        "QMoE",
+        node_inputs,
+        ["Y"],
+        domain="com.microsoft",
+        name="qmoe",
+        k=k,
+        activation_type=activation,
+        expert_weight_bits=4,
+        quant_type=quant_type,
+        block_size=block_size,
+    )
+    graph = onnx.helper.make_graph([node], "g", inputs, outputs, initializer=inits)
+    model = onnx.helper.make_model(
+        graph,
+        opset_imports=[
+            onnx.helper.make_opsetid("", 18),
+            onnx.helper.make_opsetid("com.microsoft", 1),
+        ],
+    )
+    model.ir_version = 10
+    return model
+
+
+def _qmoe_nvfp4_router_model(
+    fc1_q,
+    fc1_scale,
+    fc2_q,
+    fc2_scale,
+    fc1_global_scale,
+    fc2_global_scale,
+    router_w,
+    router_b=None,
+    fc1_bias=None,
+    fc2_bias=None,
+    activation="relu",
+    k=2,
+    tokens=6,
+    block_size=16,
+):
+    """`quant_type='nvfp4'` counterpart of :func:`_qmoe_router_model`,
+    needed for whole-expert pruning tests (an explicit MatMul/Gemm router
+    producer feeding `R`).
+    """
+    num_experts, inter, hidden_packed = fc1_q.shape
+    hidden = hidden_packed * 2
+    inputs = [
+        onnx.helper.make_tensor_value_info(
+            "X", onnx.TensorProto.FLOAT, [tokens, hidden]
+        )
+    ]
+    outputs = [
+        onnx.helper.make_tensor_value_info(
+            "Y", onnx.TensorProto.FLOAT, [tokens, hidden]
+        )
+    ]
+    inits = [
+        _u8(fc1_q, "FC1Q"),
+        _f8e4m3(fc1_scale, "FC1S"),
+        _u8(fc2_q, "FC2Q"),
+        _f8e4m3(fc2_scale, "FC2S"),
+        _f32(fc1_global_scale, "FC1GS"),
+        _f32(fc2_global_scale, "FC2GS"),
+        _f32(router_w, "RW"),
+    ]
+    if router_b is not None:
+        router_node = onnx.helper.make_node(
+            "Gemm", ["X", "RW", "RB"], ["R"], name="router"
+        )
+        inits.append(_f32(router_b, "RB"))
+    else:
+        router_node = onnx.helper.make_node("MatMul", ["X", "RW"], ["R"], name="router")
+
+    node_inputs = ["X", "R", "FC1Q", "FC1S", "", "FC2Q", "FC2S", ""]
+    if fc1_bias is not None:
+        node_inputs[4] = "FC1B"
+        inits.append(_f32(fc1_bias, "FC1B"))
+    if fc2_bias is not None:
+        node_inputs[7] = "FC2B"
+        inits.append(_f32(fc2_bias, "FC2B"))
+    while len(node_inputs) < 16:
+        node_inputs.append("")
+    node_inputs[15] = "FC1GS"
+    node_inputs.append("FC2GS")
+
+    qmoe_node = onnx.helper.make_node(
+        "QMoE",
+        node_inputs,
+        ["Y"],
+        domain="com.microsoft",
+        name="qmoe",
+        k=k,
+        activation_type=activation,
+        expert_weight_bits=4,
+        quant_type="nvfp4",
+        block_size=block_size,
+    )
+    graph = onnx.helper.make_graph(
+        [router_node, qmoe_node], "g", inputs, outputs, initializer=inits
+    )
+    model = onnx.helper.make_model(
+        graph,
+        opset_imports=[
+            onnx.helper.make_opsetid("", 18),
+            onnx.helper.make_opsetid("com.microsoft", 1),
+        ],
+    )
+    model.ir_version = 10
+    return model
+
+
 def test_qmoe_expert_channel_pruning_matches_hand_built_presliced_reference():
     # A dedicated, independently hand-built "already pruned" reference QMoE
     # node -- fc1/fc2 re-quantized from scratch from the *sliced* float
@@ -16156,6 +16459,343 @@ def test_qmoe_whole_expert_pruning_multiple_nodes_pruned_independently():
     assert inits_out["RW1"].shape == (hidden1, 2)
     assert inits_out["FC1Q2"].shape == (1, inter2, hidden2 // 2)  # 3 - round(3*0.5) = 1
     assert inits_out["RW2"].shape == (hidden2, 1)
+
+
+# --- QMoE quant_type='nvfp4' pruning ----------------------------------------
+#
+# See onnxsim/pruning.py's own section comment, point 9-10, and this file's
+# own "QMoE quant_type='nvfp4' test helpers" comment above for the full
+# schema-derived-not-kernel-verified caveat these tests are held to.
+
+
+def test_qmoe_nvfp4_expert_channel_pruning_matches_hand_built_presliced_reference():
+    # nvfp4 counterpart of
+    # test_qmoe_expert_channel_pruning_blockwise_int_matches_hand_built_presliced_reference:
+    # confirms production's own packed-bytes/block-scale slice is
+    # byte-exact-identical to slicing the already-quantized reference
+    # directly (never re-derived), AND that dequantizing the pruned tensors
+    # reproduces exactly what slicing the full dequantized reference gives
+    # -- the "slice commutes with dequant" property this format needs to
+    # hold for pruning to be safe (see onnxsim/pruning.py's own section
+    # comment, point 9). fc1_global_scale/fc2_global_scale are per-expert,
+    # not per-channel, so must come back completely untouched.
+    E, hidden, inter, block_size, tokens = 3, 32, 64, 16, 6
+    rng = np.random.default_rng(411)
+    fc1_w = (rng.standard_normal((E, inter, hidden)) * 0.3).astype(np.float64)
+    fc2_w = (rng.standard_normal((E, hidden, inter)) * 0.3).astype(np.float64)
+    fc1_b = rng.standard_normal((E, inter)).astype(np.float32)
+    fc1_gs = np.array([1.0, 0.5, 2.0], dtype=np.float32)
+    fc2_gs = np.array([1.5, 1.0, 0.8], dtype=np.float32)
+
+    fc1_q, fc1_s, fc1_dq = _qmoe_nvfp4_quantize_blockwise(fc1_w, fc1_gs, block_size)
+    fc2_q, fc2_s, fc2_dq = _qmoe_nvfp4_quantize_blockwise(fc2_w, fc2_gs, block_size)
+
+    model = _qmoe_nvfp4_model(
+        fc1_q,
+        fc1_s,
+        fc2_q,
+        fc2_s,
+        fc1_gs,
+        fc2_gs,
+        fc1_bias=fc1_b,
+        block_size=block_size,
+        k=2,
+        tokens=tokens,
+    )
+    onnx.checker.check_model(model)
+
+    pruned = onnxsim.apply_qmoe_expert_channel_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    importance = np.sqrt(
+        np.sum(fc1_dq**2, axis=(0, 2))
+        + np.sum(fc2_dq**2, axis=(0, 1))
+        + np.sum(fc1_b.astype(np.float64) ** 2, axis=0)
+    )
+    # inter=64, block_size=16 -> 4 blocks; sparsity=0.5 -> keep 4-round(4*0.5)=2
+    keep, keep_block_idx = _qmoe_block_keep_reference(
+        importance, inter, block_size, 0.5
+    )
+    assert len(keep) == 32  # block-aligned: an exact multiple of block_size
+
+    inits = _qmoe_inits(pruned)
+    np.testing.assert_array_equal(inits["FC1Q"], fc1_q[:, keep, :])
+    np.testing.assert_array_equal(inits["FC1S"], fc1_s[:, keep, :])
+    np.testing.assert_array_equal(inits["FC1B"], fc1_b[:, keep])
+    expected_fc2_q = _pack_vals(_unpack_vals(fc2_q, 4, inter)[:, :, keep], 4)
+    np.testing.assert_array_equal(inits["FC2Q"], expected_fc2_q)
+    np.testing.assert_array_equal(inits["FC2S"], fc2_s[:, :, keep_block_idx])
+    # Per-expert, not per-channel -- expert-channel pruning never touches
+    # these at all (see this section's own top comment, point 9).
+    np.testing.assert_array_equal(inits["FC1GS"], fc1_gs)
+    np.testing.assert_array_equal(inits["FC2GS"], fc2_gs)
+
+    # "Slice commutes with dequant": dequantizing the pruned tensors must
+    # reproduce exactly what slicing the FULL dequantized reference gives
+    # -- not merely close, since no value is ever recomputed, only sliced.
+    full_fc1_dequant = _qmoe_nvfp4_dequantize(fc1_q, fc1_s, fc1_gs, block_size)
+    pruned_fc1_dequant = _qmoe_nvfp4_dequantize(
+        inits["FC1Q"], inits["FC1S"], inits["FC1GS"], block_size
+    )
+    np.testing.assert_array_equal(pruned_fc1_dequant, full_fc1_dequant[:, keep, :])
+
+    full_fc2_dequant = _qmoe_nvfp4_dequantize(fc2_q, fc2_s, fc2_gs, block_size)
+    pruned_fc2_dequant = _qmoe_nvfp4_dequantize(
+        inits["FC2Q"], inits["FC2S"], inits["FC2GS"], block_size
+    )
+    np.testing.assert_array_equal(pruned_fc2_dequant, full_fc2_dequant[:, :, keep])
+
+
+def test_qmoe_nvfp4_expert_channel_pruning_keep_set_floored_to_block_multiple():
+    # nvfp4 counterpart of
+    # test_qmoe_expert_channel_pruning_blockwise_int_keep_set_floored_to_block_multiple:
+    # inter=48, block_size=16 (3 blocks), sparsity=0.4 -> naive channel-level
+    # target = 48 - round(48*0.4) = 29 -- not a multiple of block_size (16).
+    # The actual block-granularity computation this pass uses instead -- 3 -
+    # round(3*0.4) = 2 blocks kept -- correctly resolves to 32 survivors (a
+    # clean multiple of block_size), never 29 or any other non-block-aligned
+    # count.
+    E, hidden, inter, block_size, tokens = 2, 32, 48, 16, 5
+    rng = np.random.default_rng(419)
+    fc1_w = (rng.standard_normal((E, inter, hidden)) * 0.3).astype(np.float64)
+    fc2_w = (rng.standard_normal((E, hidden, inter)) * 0.3).astype(np.float64)
+    fc1_gs = np.array([1.0, 0.7], dtype=np.float32)
+    fc2_gs = np.array([1.2, 0.9], dtype=np.float32)
+    fc1_q, fc1_s, fc1_dq = _qmoe_nvfp4_quantize_blockwise(fc1_w, fc1_gs, block_size)
+    fc2_q, fc2_s, fc2_dq = _qmoe_nvfp4_quantize_blockwise(fc2_w, fc2_gs, block_size)
+    model = _qmoe_nvfp4_model(
+        fc1_q,
+        fc1_s,
+        fc2_q,
+        fc2_s,
+        fc1_gs,
+        fc2_gs,
+        block_size=block_size,
+        k=1,
+        tokens=tokens,
+    )
+    onnx.checker.check_model(model)
+
+    naive_channel_target = inter - round(inter * 0.4)
+    assert naive_channel_target % block_size != 0  # the hazard this test guards
+
+    pruned = onnxsim.apply_qmoe_expert_channel_pruning(model, sparsity=0.4)
+    onnx.checker.check_model(pruned)
+
+    inits = _qmoe_inits(pruned)
+    new_inter = inits["FC1Q"].shape[1]
+    assert new_inter == 32  # 3 blocks -> keep 3-round(3*0.4)=2 -> 32, not 29
+    assert new_inter % block_size == 0
+
+    importance = np.sqrt(
+        np.sum(fc1_dq**2, axis=(0, 2)) + np.sum(fc2_dq**2, axis=(0, 1))
+    )
+    keep, keep_block_idx = _qmoe_block_keep_reference(
+        importance, inter, block_size, 0.4
+    )
+    np.testing.assert_array_equal(inits["FC1Q"], fc1_q[:, keep, :])
+    expected_fc2_q = _pack_vals(_unpack_vals(fc2_q, 4, inter)[:, :, keep], 4)
+    np.testing.assert_array_equal(inits["FC2Q"], expected_fc2_q)
+    np.testing.assert_array_equal(inits["FC2S"], fc2_s[:, :, keep_block_idx])
+
+
+def test_qmoe_expert_channel_pruning_declines_fp8_quant_type_with_nvfp4_shape():
+    # quant_type='fp8' remains explicitly out of scope even when every other
+    # input is shaped exactly like a valid nvfp4 chain (global_scale
+    # present, float8e4m3fn block scales) -- the matcher's own quant_type
+    # check runs before any of those shapes are even inspected, so this is
+    # declined for the *right* reason, not incidentally because 'fp8'
+    # itself would need a materially different shape (unpacked
+    # float8e4m3fn weights, no block scale at all -- see this section's own
+    # top comment, point 9).
+    E, hidden, inter, block_size = 2, 32, 32, 16
+    rng = np.random.default_rng(421)
+    fc1_w = (rng.standard_normal((E, inter, hidden)) * 0.3).astype(np.float64)
+    fc2_w = (rng.standard_normal((E, hidden, inter)) * 0.3).astype(np.float64)
+    fc1_gs = np.array([1.0, 1.0], dtype=np.float32)
+    fc2_gs = np.array([1.0, 1.0], dtype=np.float32)
+    fc1_q, fc1_s, _ = _qmoe_nvfp4_quantize_blockwise(fc1_w, fc1_gs, block_size)
+    fc2_q, fc2_s, _ = _qmoe_nvfp4_quantize_blockwise(fc2_w, fc2_gs, block_size)
+    model = _qmoe_nvfp4_model(
+        fc1_q,
+        fc1_s,
+        fc2_q,
+        fc2_s,
+        fc1_gs,
+        fc2_gs,
+        block_size=block_size,
+        quant_type="fp8",
+    )
+    pruned = onnxsim.apply_qmoe_expert_channel_pruning(model, sparsity=0.5)
+    inits = _qmoe_inits(pruned)
+    np.testing.assert_array_equal(inits["FC1Q"], fc1_q)  # completely untouched
+
+
+def test_qmoe_expert_channel_pruning_declines_nvfp4_zero_points_present():
+    # A signed/symmetric E2M1 code has no zero-point concept -- fc1_zero_points
+    # present on an otherwise-valid nvfp4 chain is declined outright (see
+    # this section's own top comment, point 9).
+    E, hidden, inter, block_size = 2, 16, 16, 16
+    rng = np.random.default_rng(431)
+    fc1_w = (rng.standard_normal((E, inter, hidden)) * 0.3).astype(np.float64)
+    fc2_w = (rng.standard_normal((E, hidden, inter)) * 0.3).astype(np.float64)
+    fc1_gs = np.array([1.0, 1.0], dtype=np.float32)
+    fc2_gs = np.array([1.0, 1.0], dtype=np.float32)
+    fc1_q, fc1_s, _ = _qmoe_nvfp4_quantize_blockwise(fc1_w, fc1_gs, block_size)
+    fc2_q, fc2_s, _ = _qmoe_nvfp4_quantize_blockwise(fc2_w, fc2_gs, block_size)
+    fc1_zp = np.zeros(
+        (E, inter // 2), dtype=np.uint8
+    )  # any value -- presence alone declines
+    model = _qmoe_nvfp4_model(
+        fc1_q, fc1_s, fc2_q, fc2_s, fc1_gs, fc2_gs, block_size=block_size, fc1_zp=fc1_zp
+    )
+    pruned = onnxsim.apply_qmoe_expert_channel_pruning(model, sparsity=0.5)
+    inits = _qmoe_inits(pruned)
+    np.testing.assert_array_equal(inits["FC1Q"], fc1_q)  # completely untouched
+
+
+def test_qmoe_expert_channel_pruning_declines_nvfp4_missing_global_scale():
+    # fc1_global_scale/fc2_global_scale are required *present* for nvfp4
+    # (the live schema's own "must be provided" language) -- an otherwise
+    # schema-valid chain missing them is declined, not silently treated as
+    # global_scale=1.
+    E, hidden, inter, block_size = 2, 16, 16, 16
+    rng = np.random.default_rng(433)
+    fc1_w = (rng.standard_normal((E, inter, hidden)) * 0.3).astype(np.float64)
+    fc2_w = (rng.standard_normal((E, hidden, inter)) * 0.3).astype(np.float64)
+    fc1_gs = np.array([1.0, 1.0], dtype=np.float32)
+    fc2_gs = np.array([1.0, 1.0], dtype=np.float32)
+    fc1_q, fc1_s, _ = _qmoe_nvfp4_quantize_blockwise(fc1_w, fc1_gs, block_size)
+    fc2_q, fc2_s, _ = _qmoe_nvfp4_quantize_blockwise(fc2_w, fc2_gs, block_size)
+    model = _qmoe_nvfp4_model(
+        fc1_q, fc1_s, fc2_q, fc2_s, None, None, block_size=block_size
+    )
+    pruned = onnxsim.apply_qmoe_expert_channel_pruning(model, sparsity=0.5)
+    inits = _qmoe_inits(pruned)
+    np.testing.assert_array_equal(inits["FC1Q"], fc1_q)  # completely untouched
+
+
+def test_qmoe_nvfp4_whole_expert_pruning_slices_global_scale():
+    # Proves this section's own top comment, point 10's own finding: whole-
+    # expert pruning needed exactly ONE change for quant_type='nvfp4' --
+    # slicing the two new per-expert fc1_global_scale/fc2_global_scale
+    # tensors (absent entirely for quant_type='int') the same leading-axis
+    # way as everything else. calibration_data=[] (never real calibration
+    # batches -- see this file's own "QMoE quant_type='nvfp4' test helpers"
+    # comment: onnxruntime.InferenceSession(...) itself fails to even
+    # *construct* for a graph containing an nvfp4 QMoE node in this
+    # environment, so real calibration is unavailable here regardless of
+    # sparsity/model shape) forces the dequantized-weight-norm fallback
+    # (_qmoe_expert_weight_importance), itself exercising
+    # _qmoe_dequantize_fc's own nvfp4 dispatch.
+    E, hidden, inter, block_size, tokens = 4, 16, 16, 16, 6
+    rng = np.random.default_rng(441)
+    fc1_w = (rng.standard_normal((E, inter, hidden)) * 0.3).astype(np.float64)
+    fc2_w = (rng.standard_normal((E, hidden, inter)) * 0.3).astype(np.float64)
+    fc1_gs = np.array([1.0, 0.5, 2.0, 0.3], dtype=np.float32)
+    fc2_gs = np.array([1.5, 1.0, 0.8, 2.5], dtype=np.float32)
+    router_w = (rng.standard_normal((hidden, E)) * 0.2).astype(np.float32)
+    router_b = rng.standard_normal(E).astype(np.float32)
+
+    fc1_q, fc1_s, _ = _qmoe_nvfp4_quantize_blockwise(fc1_w, fc1_gs, block_size)
+    fc2_q, fc2_s, _ = _qmoe_nvfp4_quantize_blockwise(fc2_w, fc2_gs, block_size)
+    model = _qmoe_nvfp4_router_model(
+        fc1_q,
+        fc1_s,
+        fc2_q,
+        fc2_s,
+        fc1_gs,
+        fc2_gs,
+        router_w,
+        router_b=router_b,
+        k=2,
+        tokens=tokens,
+        block_size=block_size,
+    )
+    onnx.checker.check_model(model)
+
+    chains = onnxsim.pruning._find_qmoe_whole_expert_chains(model.graph)
+    assert len(chains) == 1
+    assert chains[0].fc1_global_scale == "FC1GS"
+    assert chains[0].fc2_global_scale == "FC2GS"
+
+    pruned = onnxsim.apply_qmoe_whole_expert_pruning(
+        model, calibration_data=[], sparsity=0.5
+    )
+    onnx.checker.check_model(pruned)
+    inits = _qmoe_inits(pruned)
+    assert inits["FC1GS"].shape == (2,)  # 4 - round(4*0.5) = 2
+    assert inits["FC2GS"].shape == (2,)
+    assert inits["FC1Q"].shape[0] == 2
+    assert inits["RW"].shape == (hidden, 2)
+
+    # Every surviving global_scale value is exactly one of the originals
+    # (a leading-axis slice, never recomputed) -- and fc1's/fc2's kept
+    # experts agree with each other (both dropped the same two experts).
+    kept_fc1_gs = inits["FC1GS"]
+    kept_fc2_gs = inits["FC2GS"]
+    assert set(kept_fc1_gs.tolist()).issubset(set(fc1_gs.tolist()))
+    assert set(kept_fc2_gs.tolist()).issubset(set(fc2_gs.tolist()))
+    kept_indices_fc1 = [i for i, v in enumerate(fc1_gs) if v in kept_fc1_gs.tolist()]
+    kept_indices_fc2 = [i for i, v in enumerate(fc2_gs) if v in kept_fc2_gs.tolist()]
+    assert kept_indices_fc1 == kept_indices_fc2
+
+
+def test_analyze_qmoe_nvfp4_expert_channel_pruning_matches_real_call():
+    # nvfp4 counterpart of test_analyze_qmoe_expert_channel_pruning_matches_real_call
+    # -- also a regression test for a genuine pre-existing gap this same
+    # change fixed: _analyze_qmoe_channel_chains never branched on
+    # block_size at all before this change (always used the flat,
+    # pack-floored keep-count formula), silently diverging from
+    # _apply_qmoe_channel_chains's own block-aligned keep-set for ANY
+    # blockwise chain -- int or nvfp4 -- whenever the naive flat floor
+    # didn't happen to already land on a block boundary. sparsity=0.4 below
+    # is deliberately chosen to trigger exactly that divergence (see the
+    # inline asserts).
+    E, hidden, inter, block_size, tokens = 2, 32, 64, 16, 5
+    rng = np.random.default_rng(443)
+    fc1_w = (rng.standard_normal((E, inter, hidden)) * 0.3).astype(np.float64)
+    fc2_w = (rng.standard_normal((E, hidden, inter)) * 0.3).astype(np.float64)
+    fc1_gs = np.array([1.0, 0.6], dtype=np.float32)
+    fc2_gs = np.array([1.1, 0.9], dtype=np.float32)
+    fc1_q, fc1_s, _ = _qmoe_nvfp4_quantize_blockwise(fc1_w, fc1_gs, block_size)
+    fc2_q, fc2_s, _ = _qmoe_nvfp4_quantize_blockwise(fc2_w, fc2_gs, block_size)
+    model = _qmoe_nvfp4_model(
+        fc1_q,
+        fc1_s,
+        fc2_q,
+        fc2_s,
+        fc1_gs,
+        fc2_gs,
+        block_size=block_size,
+        k=1,
+        tokens=tokens,
+    )
+    onnx.checker.check_model(model)
+
+    # The naive flat-channel floor this section's own top comment warns
+    # about, for contrast with the actual block-aligned result below.
+    pack = 2
+    naive_flat = inter - round(inter * 0.4)
+    naive_flat_floored = (naive_flat // pack) * pack
+    assert naive_flat_floored % block_size != 0  # confirms the hazard is real here
+
+    report = onnxsim.analyze_pruning_sensitivity(
+        model, onnxsim.apply_qmoe_expert_channel_pruning, sparsity=0.4
+    )
+    assert len(report.layers) == 1
+    layer = report.layers[0]
+    assert layer.family == "qmoe_expert_channel"
+    assert layer.total == inter
+    assert report.not_eligible == []
+
+    pruned = onnxsim.apply_qmoe_expert_channel_pruning(model, sparsity=0.4)
+    inits = _qmoe_inits(pruned)
+    real_kept = inits["FC1Q"].shape[1]
+    predicted_kept = inter - layer.would_drop
+    assert predicted_kept == real_kept  # the dry-run must never diverge
+    assert real_kept % block_size == 0  # block-aligned, not the naive floor
+    assert real_kept != naive_flat_floored  # the divergence this test guards
 
 
 # --- FP16/BFloat16 weight support -----------------------------------------
