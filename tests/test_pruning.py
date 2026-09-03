@@ -13276,6 +13276,891 @@ def test_mha_wanda_pruning_matches_oracle_exactly():
     np.testing.assert_allclose(y_pruned, y_oracle, rtol=1e-4, atol=1e-4)
 
 
+# --- apply_attention_head_pruning / _wanda_pruning -- DecoderMaskedSelfAttention --
+#
+# ONNX Runtime's own in-place decode-time rewrite target for
+# `com.microsoft::Attention` (`onnxruntime.transformers.convert_generation
+# .update_decoder_subgraph_use_decoder_masked_attention`'s own
+# `switch_attention` branch literally reassigns an `Attention` node's own
+# `op_type` to this) -- see onnxsim/pruning.py's own "Attention-head
+# pruning" section comment for the full empirical schema/execution
+# investigation this section's tests continue.
+#
+# **No CPU kernel exists for this op in this environment's onnxruntime at
+# all** (confirmed empirically: a minimal, `onnx.checker`-valid
+# `DecoderMaskedSelfAttention` node fails `onnxruntime.InferenceSession`
+# construction outright with ``NOT_IMPLEMENTED : ... Could not find an
+# implementation for DecoderMaskedSelfAttention``) -- so, following this
+# module's own `MatMulNBitsMlp`/`MatMulNBitsQkv`/`PagedAttention` precedent
+# for a matched op with no executable kernel (see onnxsim/pruning.py's own
+# section comments for those), every correctness test below decomposes a
+# pruned node's own sliced `weights`/`bias` into an equivalent, genuinely
+# executable plain `com.microsoft::Attention` node (same merged-QKV layout,
+# `do_rotary=0` -- the only value this pass ever matches for this op
+# anyway) and runs *that* through a real CPU-kernel `InferenceSession`,
+# compared against a numpy-oracle-equivalent independently-built smaller
+# `Attention` model using only the correctly-selected kept heads' own
+# original (pre-pruning) weight columns -- never the pruned
+# `DecoderMaskedSelfAttention` node itself, and never a comparison against
+# the *full, unpruned* model's own output.
+
+
+def _dmsa_model(
+    K=8,
+    H=4,
+    D=4,
+    Out=6,
+    seed=0,
+    batch=2,
+    bias=True,
+    wqkv=None,
+    bqkv=None,
+    wout=None,
+    do_rotary=0,
+    past="",  # "" (omitted) | "dynamic" | "constant"
+):
+    rng = np.random.default_rng(seed)
+    Nq = Nk = Nv = H * D
+    if wqkv is None:
+        wqkv = rng.standard_normal((K, Nq + Nk + Nv)).astype(np.float32)
+    if wout is None:
+        wout = rng.standard_normal((Nv, Out)).astype(np.float32)
+    if bias and bqkv is None:
+        bqkv = rng.standard_normal((Nq + Nk + Nv,)).astype(np.float32)
+
+    initializer = [_f32(wqkv, "Wqkv"), _f32(wout, "Wout")]
+    operands = ["X", "Wqkv"]
+    if bias:
+        initializer.append(_f32(bqkv, "Bqkv"))
+        operands.append("Bqkv")
+    else:
+        operands.append("")
+
+    extra_graph_inputs = ""
+    if past == "constant":
+        past_init = rng.standard_normal((2, batch, H, 1, D)).astype(np.float32)
+        initializer.append(_f32(past_init, "Past"))
+        operands += ["", "Past"]  # mask_index="", past="Past"
+    elif past == "dynamic":
+        operands += ["", "PastIn"]
+        extra_graph_inputs = f", float[2,{batch},{H},1,{D}] PastIn"
+
+    while operands and operands[-1] == "":
+        operands.pop()
+    qkv_inputs = ", ".join(operands)
+
+    attrs = f"num_heads={H}"
+    if do_rotary:
+        attrs += f", do_rotary={do_rotary}"
+
+    body = f"""
+        g (float[{batch},1,{K}] X{extra_graph_inputs}) => (float[{batch},1,{Out}] Y)
+        {{
+          ctx = com.microsoft.DecoderMaskedSelfAttention <{attrs}> ({qkv_inputs})
+          Y = MatMul(ctx, Wout)
+        }}
+        """
+
+    model = parser.parse_model(
+        f"""
+        <
+          ir_version: 10,
+          opset_import: ["": 17, "com.microsoft": 1]
+        >
+        {body}
+        """
+    )
+    model.graph.initializer.extend(initializer)
+    return model, dict(
+        K=K,
+        H=H,
+        D=D,
+        Out=Out,
+        Nq=Nq,
+        Nk=Nk,
+        Nv=Nv,
+        wqkv=wqkv,
+        bqkv=bqkv,
+        wout=wout,
+        batch=batch,
+    )
+
+
+def _dmsa_node(model):
+    return next(
+        n for n in model.graph.node if n.op_type == "DecoderMaskedSelfAttention"
+    )
+
+
+def _dmsa_num_heads(node):
+    return next(a.i for a in node.attribute if a.name == "num_heads")
+
+
+def _dmsa_has_qkv_hidden_sizes(node):
+    return any(a.name == "qkv_hidden_sizes" for a in node.attribute)
+
+
+def test_dmsa_pruning_shrinks_matched_block():
+    model, cfg = _dmsa_model(K=8, H=4, D=4, Out=6)
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+
+    node = _dmsa_node(pruned)
+    assert _dmsa_num_heads(node) == 2  # max(1, 4 - round(4*0.5))
+    # No `qkv_hidden_sizes` attribute is ever written back for this op --
+    # it doesn't exist on the op's own real schema at all (see
+    # onnxsim/pruning.py's own "Attention-head pruning" section comment).
+    assert not _dmsa_has_qkv_hidden_sizes(node)
+
+    inits = {t.name: t for t in pruned.graph.initializer}
+    assert list(inits["Wqkv"].dims) == [8, 24]  # 2 heads * (4+4+4)
+    assert list(inits["Bqkv"].dims) == [24]
+    assert list(inits["Wout"].dims) == [8, 6]
+
+
+def test_dmsa_pruning_zero_sparsity_is_a_no_op():
+    model, cfg = _dmsa_model(K=8, H=8, D=4, Out=6, seed=7)
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.0)
+    node = _dmsa_node(pruned)
+    assert _dmsa_num_heads(node) == cfg["H"]
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    np.testing.assert_array_equal(inits["Wqkv"], cfg["wqkv"])
+
+
+def test_dmsa_pruning_matches_oracle_via_attention_proxy():
+    # Even split -- `dq == dk == dv` -- is the *only* shape this matcher
+    # ever accepts for this op (no `qkv_hidden_sizes` attribute exists on
+    # its own real schema at all, see onnxsim/pruning.py's own
+    # "Attention-head pruning" section comment) -- confirmed here by
+    # slicing manually and checking the pruned weight's own head-block
+    # structure is exactly what a plain `Attention` proxy of the same
+    # (now-smaller) head count would expect.
+    model, cfg = _dmsa_model(K=8, H=8, D=4, Out=6, seed=1)
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+
+    node = _dmsa_node(pruned)
+    num_heads = _dmsa_num_heads(node)
+    assert num_heads == 4  # max(1, 8 - round(8*0.5))
+
+    d = cfg["D"]
+    keep_heads = _oracle_keep_heads(
+        cfg["wqkv"], cfg["Nq"], cfg["Nk"], cfg["Nv"], cfg["H"], num_heads
+    )
+    idx = _head_idx(keep_heads, d)
+
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    q_idx = idx
+    k_idx = idx + cfg["Nq"]
+    v_idx = idx + cfg["Nq"] + cfg["Nk"]
+    all_idx = np.concatenate([q_idx, k_idx, v_idx])
+    np.testing.assert_array_equal(inits["Wqkv"], cfg["wqkv"][:, all_idx])
+
+    # Decompose the pruned node's own sliced tensors into a genuinely
+    # executable plain `Attention` proxy (see this section's own comment
+    # above for why) and compare against an independently-built smaller
+    # `Attention` oracle sliced straight from the *original* (pre-pruning)
+    # weights -- never against the full unpruned model's own output.
+    proxy, _ = _attention_model(
+        K=cfg["K"],
+        H=num_heads,
+        D=d,
+        Out=cfg["Out"],
+        wqkv=inits["Wqkv"],
+        bqkv=inits["Bqkv"],
+        wout=inits["Wout"],
+    )
+    oracle, _ = _attention_model(
+        K=cfg["K"],
+        H=num_heads,
+        D=d,
+        Out=cfg["Out"],
+        wqkv=cfg["wqkv"][:, all_idx],
+        bqkv=cfg["bqkv"][all_idx],
+        wout=cfg["wout"][idx, :],
+    )
+    rng = np.random.default_rng(2)
+    x = rng.standard_normal((cfg["batch"], 1, cfg["K"])).astype(np.float32)
+    (y_proxy,) = _run(proxy, {"X": x})
+    (y_oracle,) = _run(oracle, {"X": x})
+    np.testing.assert_allclose(y_proxy, y_oracle, rtol=1e-4, atol=1e-4)
+
+
+def test_dmsa_pruning_declines_do_rotary():
+    # Fused rotary (computed inside the op, no external cos_cache/sin_cache
+    # input on this op's own schema at all) is declined outright: no CPU
+    # kernel exists for this op at all in this environment, and the closely
+    # related, CPU-kernel-backed `Attention` op's own `do_rotary=1` path is
+    # itself confirmed unimplemented in this environment's CPU kernel
+    # ("Rotary embedding is not supported in Attention CPU kernel...") --
+    # see onnxsim/pruning.py's own "Attention-head pruning" section comment
+    # for the full reasoning. `do_rotary=0` (the default) matches fine, see
+    # every other test in this section.
+    model, cfg = _dmsa_model(K=8, H=4, D=4, Out=6, seed=3, do_rotary=1)
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    node = _dmsa_node(pruned)
+    assert _dmsa_num_heads(node) == cfg["H"]  # left completely untouched
+
+    report = onnxsim.analyze_pruning_sensitivity(
+        model, onnxsim.apply_attention_head_pruning, sparsity=0.5
+    )
+    assert report.not_eligible == ["DecoderMaskedSelfAttention 'ctx'"]
+    assert report.layers == []
+
+
+def test_dmsa_pruning_declines_constant_past():
+    # `past` is *required* by this op's own schema (unlike `Attention`'s
+    # own optional one) and real step-of-1 decode exports always leave it
+    # dynamic -- but a hand-built graph could in principle bind a constant
+    # there, which this pass has no established slicing path for (unlike
+    # the `past_key`/`past_value` *pair* every separate-Q/K/V op in this
+    # section already handles) -- so it conservatively declines the whole
+    # match rather than leaving a stale-shaped constant behind.
+    model, cfg = _dmsa_model(K=8, H=4, D=4, Out=6, seed=4, past="constant")
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    node = _dmsa_node(pruned)
+    assert _dmsa_num_heads(node) == cfg["H"]  # left completely untouched
+
+    report = onnxsim.analyze_pruning_sensitivity(
+        model, onnxsim.apply_attention_head_pruning, sparsity=0.5
+    )
+    assert report.not_eligible == ["DecoderMaskedSelfAttention 'ctx'"]
+
+
+def test_dmsa_pruning_dynamic_past_is_pruned_normally():
+    # A *dynamic* `past` (an ordinary graph input, the realistic step-of-1
+    # decode shape) is the caller's own runtime state, not a weight this
+    # pass could corrupt by leaving untouched -- matches and prunes
+    # normally, unlike the constant case above.
+    model, cfg = _dmsa_model(K=8, H=4, D=4, Out=6, seed=5, past="dynamic")
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    node = _dmsa_node(pruned)
+    assert _dmsa_num_heads(node) == 2  # max(1, 4 - round(4*0.5))
+
+
+def test_dmsa_pruning_dry_run_matches_real_call():
+    model, cfg = _dmsa_model(K=8, H=8, D=4, Out=6, seed=6)
+    report = onnxsim.analyze_pruning_sensitivity(
+        model, onnxsim.apply_attention_head_pruning, sparsity=0.5
+    )
+    assert len(report.layers) == 1
+    layer = report.layers[0]
+    assert layer.family == "attention_head"
+    assert layer.total == 8
+    assert layer.would_drop == 4  # round(8*0.5)
+
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    node = _dmsa_node(pruned)
+    assert cfg["H"] - _dmsa_num_heads(node) == layer.would_drop
+
+
+# --- apply_attention_head_pruning / _wanda_pruning -- DecoderMaskedMultiHeadAttention --
+#
+# ONNX Runtime's own in-place decode-time rewrite target for
+# `com.microsoft::MultiHeadAttention` (`onnxruntime.transformers
+# .convert_generation.replace_mha_with_dmmha`'s own literal node
+# construction) -- see onnxsim/pruning.py's own "Attention-head pruning"
+# section comment for the full empirical schema/execution investigation
+# this section's tests continue, including exactly why every input beyond
+# `query`/`key`/`value` sits at a different index than `MultiHeadAttention`'s
+# own (`mask_index`@3, `attention_bias`@4, `past_key`/`past_value`@5/6,
+# `past_sequence_length`/`beam_width`/`cache_indirection`@7/8/9, and a
+# combined `bias` moved all the way to index 10).
+#
+# Unlike `DecoderMaskedSelfAttention` above, a real CPU kernel *does* exist
+# for this op in this environment -- every correctness test below runs the
+# actual pruned `DecoderMaskedMultiHeadAttention` node through a real
+# `onnxruntime.InferenceSession`, matched against a numpy-oracle-equivalent
+# independently-built smaller `DecoderMaskedMultiHeadAttention` model using
+# only the correctly-selected kept heads' own original (pre-pruning)
+# weights -- never against the full unpruned model's own output. This
+# environment's own CPU kernel requires query/key/value sequence length to
+# be exactly 1 (``"Input sequence length should be 1 to use
+# DecoderMaskedMultiHeadAttention"`` otherwise) -- a purely runtime-shape
+# constraint invisible to this pass's own static graph matching, but every
+# model built below uses `seq_len=1` throughout so it can actually run.
+
+
+def _dmmha_model(
+    K=8,
+    H=4,
+    D=4,
+    Out=6,
+    seed=0,
+    batch=2,
+    combined_bias=False,
+    producer_bias=False,
+    wq=None,
+    wk=None,
+    wv=None,
+    bq=None,
+    bk=None,
+    bv=None,
+    wout=None,
+    attention_bias=None,
+    past_kv=None,  # None | "nonempty" | "dynamic"
+    past_key=None,
+    past_value=None,
+    past_seq=3,
+    max_seq=8,
+):
+    rng = np.random.default_rng(seed)
+    Nq = Nk = Nv = H * D
+    if wq is None:
+        wq = rng.standard_normal((K, Nq)).astype(np.float32)
+    if wk is None:
+        wk = rng.standard_normal((K, Nk)).astype(np.float32)
+    if wv is None:
+        wv = rng.standard_normal((K, Nv)).astype(np.float32)
+    if wout is None:
+        wout = rng.standard_normal((Nv, Out)).astype(np.float32)
+
+    initializer = [_f32(wq, "Wq"), _f32(wk, "Wk"), _f32(wv, "Wv"), _f32(wout, "Wout")]
+    q_op, k_op, v_op = "MatMul(X, Wq)", "MatMul(X, Wk)", "MatMul(X, Wv)"
+    if producer_bias:
+        if bq is None:
+            bq = rng.standard_normal((Nq,)).astype(np.float32)
+        if bk is None:
+            bk = rng.standard_normal((Nk,)).astype(np.float32)
+        if bv is None:
+            bv = rng.standard_normal((Nv,)).astype(np.float32)
+        initializer += [_f32(bq, "Bq"), _f32(bk, "Bk"), _f32(bv, "Bv")]
+        q_op, k_op, v_op = "Gemm(X, Wq, Bq)", "Gemm(X, Wk, Bk)", "Gemm(X, Wv, Bv)"
+
+    # Fixed-index layout: query, key, value, mask_index, attention_bias,
+    # past_key, past_value, past_sequence_length, beam_width,
+    # cache_indirection, bias -- see this section's own comment above for
+    # why this differs from `MultiHeadAttention`'s own layout.
+    operands = ["q", "k", "v", "", "", "", "", "", "", "", ""]
+    extra_graph_inputs = ""
+    present_outputs = ""
+    attrs = f"num_heads={H}"
+
+    if attention_bias is not None:
+        initializer.append(_f32(np.asarray(attention_bias), "AttentionBias"))
+        operands[4] = "AttentionBias"
+
+    if past_kv == "nonempty":
+        if past_key is None:
+            past_key = rng.standard_normal((batch, H, past_seq, D)).astype(np.float32)
+        if past_value is None:
+            past_value = rng.standard_normal((batch, H, past_seq, D)).astype(np.float32)
+        pk_buf = np.zeros((batch, H, max_seq, D), dtype=np.float32)
+        pv_buf = np.zeros((batch, H, max_seq, D), dtype=np.float32)
+        pk_buf[:, :, :past_seq, :] = past_key
+        pv_buf[:, :, :past_seq, :] = past_value
+        initializer += [_f32(pk_buf, "PastKey"), _f32(pv_buf, "PastValue")]
+        initializer.append(
+            onnx.numpy_helper.from_array(
+                np.array([past_seq], dtype=np.int32), "PastSeqLen"
+            )
+        )
+        operands[5] = "PastKey"
+        operands[6] = "PastValue"
+        operands[7] = "PastSeqLen"
+        present_outputs = ", present_key, present_value"
+        attrs += ", past_present_share_buffer=1"
+    elif past_kv == "dynamic":
+        operands[5] = "PastKeyIn"
+        operands[6] = "PastValueIn"
+        extra_graph_inputs += (
+            f", float[{batch},{H},{past_seq},{D}] PastKeyIn"
+            f", float[{batch},{H},{past_seq},{D}] PastValueIn"
+        )
+
+    if combined_bias:
+        if bq is None:
+            bq = rng.standard_normal((Nq,)).astype(np.float32)
+        if bk is None:
+            bk = rng.standard_normal((Nk,)).astype(np.float32)
+        if bv is None:
+            bv = rng.standard_normal((Nv,)).astype(np.float32)
+        combined = np.concatenate([bq, bk, bv]).astype(np.float32)
+        initializer.append(_f32(combined, "Bias"))
+        operands[10] = "Bias"
+
+    while operands and operands[-1] == "":
+        operands.pop()
+
+    ctx_outputs = "ctx" + present_outputs
+    body = f"""
+        g (float[{batch},1,{K}] X{extra_graph_inputs}) => (float[{batch},1,{Out}] Y)
+        {{
+          q = {q_op}
+          k = {k_op}
+          v = {v_op}
+          {ctx_outputs} = com.microsoft.DecoderMaskedMultiHeadAttention <{attrs}> ({", ".join(operands)})
+          Y = MatMul(ctx, Wout)
+        }}
+        """
+
+    model = parser.parse_model(
+        f"""
+        <
+          ir_version: 10,
+          opset_import: ["": 17, "com.microsoft": 1]
+        >
+        {body}
+        """
+    )
+    model.graph.initializer.extend(initializer)
+    return model, dict(
+        K=K,
+        H=H,
+        D=D,
+        Out=Out,
+        Nq=Nq,
+        Nk=Nk,
+        Nv=Nv,
+        wq=wq,
+        wk=wk,
+        wv=wv,
+        bq=bq,
+        bk=bk,
+        bv=bv,
+        wout=wout,
+        batch=batch,
+        past_key=past_key,
+        past_value=past_value,
+    )
+
+
+def _dmmha_node(model):
+    return next(
+        n for n in model.graph.node if n.op_type == "DecoderMaskedMultiHeadAttention"
+    )
+
+
+def _dmmha_num_heads(node):
+    return next(a.i for a in node.attribute if a.name == "num_heads")
+
+
+def test_dmmha_pruning_shrinks_matched_block():
+    model, cfg = _dmmha_model(K=8, H=4, D=4, Out=6)
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    node = _dmmha_node(pruned)
+    assert _dmmha_num_heads(node) == 2  # max(1, 4 - round(4*0.5))
+
+    inits = {t.name: t for t in pruned.graph.initializer}
+    assert list(inits["Wq"].dims) == [8, 8]
+    assert list(inits["Wk"].dims) == [8, 8]
+    assert list(inits["Wv"].dims) == [8, 8]
+    assert list(inits["Wout"].dims) == [8, 6]
+
+    rng = np.random.default_rng(1)
+    x = rng.standard_normal((cfg["batch"], 1, cfg["K"])).astype(np.float32)
+    (y,) = _run(pruned, {"X": x})
+    assert y.shape == (cfg["batch"], 1, cfg["Out"])
+
+
+def test_dmmha_pruning_zero_sparsity_is_a_no_op():
+    model, cfg = _dmmha_model(K=8, H=8, D=4, Out=6, seed=7)
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.0)
+    node = _dmmha_node(pruned)
+    assert _dmmha_num_heads(node) == cfg["H"]
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    np.testing.assert_array_equal(inits["Wq"], cfg["wq"])
+    np.testing.assert_array_equal(inits["Wk"], cfg["wk"])
+    np.testing.assert_array_equal(inits["Wv"], cfg["wv"])
+
+
+def test_dmmha_pruning_matches_oracle_exactly():
+    model, cfg = _dmmha_model(K=8, H=8, D=4, Out=6, seed=1, combined_bias=True)
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    node = _dmmha_node(pruned)
+    num_heads = _dmmha_num_heads(node)
+    assert num_heads == 4  # max(1, 8 - round(8*0.5))
+
+    d = cfg["D"]
+    keep_heads = _oracle_keep_groups(
+        cfg["wq"], cfg["wk"], cfg["wv"], cfg["H"], cfg["H"], d, num_heads
+    )
+    idx = _head_idx(keep_heads, d)
+
+    oracle, _ = _dmmha_model(
+        K=cfg["K"],
+        H=len(keep_heads),
+        D=d,
+        Out=cfg["Out"],
+        seed=1,
+        combined_bias=True,
+        wq=cfg["wq"][:, idx],
+        wk=cfg["wk"][:, idx],
+        wv=cfg["wv"][:, idx],
+        bq=cfg["bq"][idx],
+        bk=cfg["bk"][idx],
+        bv=cfg["bv"][idx],
+        wout=cfg["wout"][idx, :],
+        batch=cfg["batch"],
+    )
+
+    rng = np.random.default_rng(2)
+    x = rng.standard_normal((cfg["batch"], 1, cfg["K"])).astype(np.float32)
+    (y_pruned,) = _run(pruned, {"X": x})
+    (y_oracle,) = _run(oracle, {"X": x})
+    np.testing.assert_allclose(y_pruned, y_oracle, rtol=1e-4, atol=1e-4)
+
+
+def test_dmmha_pruning_slices_combined_bias_exactly():
+    model, cfg = _dmmha_model(K=8, H=4, D=4, Out=6, seed=3, combined_bias=True)
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+
+    node = _dmmha_node(pruned)
+    num_heads = _dmmha_num_heads(node)
+    d = cfg["D"]
+    keep_heads = _oracle_keep_groups(
+        cfg["wq"], cfg["wk"], cfg["wv"], cfg["H"], cfg["H"], d, num_heads
+    )
+    idx = _head_idx(keep_heads, d)
+
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    expected = np.concatenate([cfg["bq"][idx], cfg["bk"][idx], cfg["bv"][idx]])
+    np.testing.assert_array_equal(inits["Bias"], expected)
+    # Confirms the combined bias really is read off input index 10 (the
+    # node's own *last* input), not index 3 (`MultiHeadAttention`'s own).
+    assert node.input[10] == "Bias"
+
+
+def test_dmmha_pruning_attention_bias_is_sliced_and_matches_oracle():
+    # This environment's own CPU kernel additionally requires a connected
+    # `attention_bias` to run in the (cached) self-attention mode -- with no
+    # `past_key`/`past_value` connected at all it errors outright
+    # ("DecoderMaskedMultiHeadAttention does not support attention bias for
+    # cross-attention") -- so this test connects a past cache too, and
+    # sizes `attention_bias`'s own last axis to `total_sequence_length`
+    # (`past_seq + 1`), per this op's own kernel-level shape requirement.
+    H, D = 4, 4
+    past_seq = 3
+    total_seq = past_seq + 1
+    rng = np.random.default_rng(16)
+    attention_bias = rng.standard_normal((1, H, 1, total_seq)).astype(np.float32)
+    model, cfg = _dmmha_model(
+        K=8,
+        H=H,
+        D=D,
+        Out=6,
+        seed=16,
+        attention_bias=attention_bias,
+        past_kv="nonempty",
+        past_seq=past_seq,
+    )
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    node = _dmmha_node(pruned)
+    num_heads = _dmmha_num_heads(node)
+    keep_heads = _oracle_keep_groups(
+        cfg["wq"], cfg["wk"], cfg["wv"], H, H, D, num_heads
+    )
+    idx = _head_idx(keep_heads, D)
+
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    np.testing.assert_array_equal(inits["AttentionBias"], attention_bias[:, keep_heads])
+    # Confirms the bias really is read off input index 4 (not 5, the
+    # position `MultiHeadAttention`'s own analogous input sits at).
+    assert node.input[4] == "AttentionBias"
+
+    oracle, _ = _dmmha_model(
+        K=cfg["K"],
+        H=len(keep_heads),
+        D=D,
+        Out=cfg["Out"],
+        seed=16,
+        attention_bias=attention_bias[:, keep_heads],
+        past_kv="nonempty",
+        past_seq=past_seq,
+        past_key=cfg["past_key"][:, keep_heads],
+        past_value=cfg["past_value"][:, keep_heads],
+        wq=cfg["wq"][:, idx],
+        wk=cfg["wk"][:, idx],
+        wv=cfg["wv"][:, idx],
+        wout=cfg["wout"][idx, :],
+        batch=cfg["batch"],
+    )
+    rng2 = np.random.default_rng(17)
+    x = rng2.standard_normal((cfg["batch"], 1, cfg["K"])).astype(np.float32)
+    (y_pruned,) = _run(pruned, {"X": x})
+    (y_oracle,) = _run(oracle, {"X": x})
+    np.testing.assert_allclose(y_pruned, y_oracle, rtol=1e-4, atol=1e-4)
+
+
+def test_dmmha_pruning_nonempty_past_kv_constant_matches_oracle_exactly():
+    past_seq = 3
+    model, cfg = _dmmha_model(
+        K=8, H=4, D=4, Out=6, seed=18, past_kv="nonempty", past_seq=past_seq
+    )
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    node = _dmmha_node(pruned)
+    num_heads = _dmmha_num_heads(node)
+    d = cfg["D"]
+    keep_heads = _oracle_keep_groups(
+        cfg["wq"], cfg["wk"], cfg["wv"], cfg["H"], cfg["H"], d, num_heads
+    )
+    idx = _head_idx(keep_heads, d)
+
+    # `inits["PastKey"]`/`["PastValue"]` are already the post-pruning
+    # buffer (axis 1 already sliced down to `num_heads`) -- compare its own
+    # real (non-padding) `:past_seq` slice against the *original* cache
+    # sliced the same way, not re-index it a second time.
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    np.testing.assert_array_equal(
+        inits["PastKey"][:, :, :past_seq, :], cfg["past_key"][:, keep_heads]
+    )
+    np.testing.assert_array_equal(
+        inits["PastValue"][:, :, :past_seq, :], cfg["past_value"][:, keep_heads]
+    )
+    # Confirms past_key/past_value really are read off indices 5/6 (not
+    # 6/7, `MultiHeadAttention`'s own).
+    assert node.input[5] == "PastKey"
+    assert node.input[6] == "PastValue"
+
+    oracle, _ = _dmmha_model(
+        K=cfg["K"],
+        H=len(keep_heads),
+        D=d,
+        Out=cfg["Out"],
+        seed=18,
+        past_kv="nonempty",
+        past_seq=past_seq,
+        past_key=cfg["past_key"][:, keep_heads],
+        past_value=cfg["past_value"][:, keep_heads],
+        wq=cfg["wq"][:, idx],
+        wk=cfg["wk"][:, idx],
+        wv=cfg["wv"][:, idx],
+        wout=cfg["wout"][idx, :],
+        batch=cfg["batch"],
+    )
+    rng = np.random.default_rng(19)
+    x = rng.standard_normal((cfg["batch"], 1, cfg["K"])).astype(np.float32)
+    (y_pruned,) = _run(pruned, {"X": x})
+    (y_oracle,) = _run(oracle, {"X": x})
+    np.testing.assert_allclose(y_pruned, y_oracle, rtol=1e-4, atol=1e-4)
+
+
+def test_dmmha_pruning_dynamic_past_kv_is_left_untouched():
+    model, cfg = _dmmha_model(K=8, H=4, D=4, Out=6, seed=21, past_kv="dynamic")
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    node = _dmmha_node(pruned)
+    assert _dmmha_num_heads(node) == 2  # still prunes the producer weights
+    # The dynamic past_key/past_value graph inputs themselves are the
+    # caller's own runtime data -- left completely alone, same names/shapes.
+    input_names = {i.name for i in pruned.graph.input}
+    assert "PastKeyIn" in input_names
+    assert "PastValueIn" in input_names
+
+
+def test_dmmha_pruning_diff_v_head_size_is_declined():
+    # Unlike `MultiHeadAttention` (which genuinely allows V its own
+    # head_size), this op's own CPU kernel hard-requires equal Q/K/V
+    # head_size -- confirmed empirically ("QK head size should be same as V
+    # head size to use DecoderMaskedMultiHeadAttention") -- so
+    # `_find_decoder_masked_mha_chains` passes
+    # `allow_differing_v_head_size=False` and a node whose V width
+    # genuinely differs declines the whole match rather than being pruned
+    # into a shape that could never execute anyway.
+    K, H, D, Dv, Out = 8, 2, 4, 3, 5
+    model, cfg = _dmmha_model(K=K, H=H, D=D, Out=Out, seed=22)
+    # Hand-widen V's own weight/Wout to a genuinely different per-head width.
+    rng = np.random.default_rng(23)
+    wv2 = rng.standard_normal((K, H * Dv)).astype(np.float32)
+    wout2 = rng.standard_normal((H * Dv, Out)).astype(np.float32)
+    inits = {t.name: t for t in model.graph.initializer}
+    inits["Wv"].CopyFrom(_f32(wv2, "Wv"))
+    inits["Wout"].CopyFrom(_f32(wout2, "Wout"))
+
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    node = _dmmha_node(pruned)
+    assert _dmmha_num_heads(node) == H  # left completely untouched
+
+    report = onnxsim.analyze_pruning_sensitivity(
+        model, onnxsim.apply_attention_head_pruning, sparsity=0.5
+    )
+    assert report.not_eligible == ["DecoderMaskedMultiHeadAttention 'ctx'"]
+
+
+def test_dmmha_pruning_cross_attention_4d_kv_is_not_matched():
+    # The real cross-attention calling convention for this op feeds `key`/
+    # `value` as a pre-projected rank-4 `(batch, num_heads, kv_seq,
+    # head_size)` tensor directly (confirmed empirically -- see
+    # onnxsim/pruning.py's own "Attention-head pruning" section comment),
+    # not `MultiHeadAttention`'s own rank-3 MatMul-producer-fed convention.
+    # That rank-4 tensor is never fed by a MatMul/vanilla-Gemm producer
+    # with a 2-D weight at all, so `_find_separate_qkv_chains`'s own
+    # `_match_producer` naturally declines it -- confirmed here structurally
+    # (this test never claims the resulting model is numerically valid to
+    # actually run this way; only that this pass correctly leaves it alone
+    # rather than mis-slicing it).
+    H, D, K, Out = 4, 8, 8, 6
+    kv_seq = 7
+    rng = np.random.default_rng(24)
+    wq = rng.standard_normal((K, H * D)).astype(np.float32)
+    wout = rng.standard_normal((H * D, Out)).astype(np.float32)
+    model = parser.parse_model(
+        f"""
+        <
+          ir_version: 10,
+          opset_import: ["": 17, "com.microsoft": 1]
+        >
+        g (float[batch,1,{K}] X, float[batch,{H},{kv_seq},{D}] KeyIn, float[batch,{H},{kv_seq},{D}] ValueIn) => (float[batch,1,{Out}] Y)
+        {{
+          q = MatMul(X, Wq)
+          ctx = com.microsoft.DecoderMaskedMultiHeadAttention <num_heads={H}> (q, KeyIn, ValueIn)
+          Y = MatMul(ctx, Wout)
+        }}
+        """
+    )
+    model.graph.initializer.extend([_f32(wq, "Wq"), _f32(wout, "Wout")])
+
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    node = _dmmha_node(pruned)
+    assert _dmmha_num_heads(node) == H  # left completely untouched
+
+    report = onnxsim.analyze_pruning_sensitivity(
+        model, onnxsim.apply_attention_head_pruning, sparsity=0.5
+    )
+    assert report.not_eligible == ["DecoderMaskedMultiHeadAttention 'ctx'"]
+
+
+def test_dmmha_pruning_runtime_only_inputs_left_untouched():
+    # `mask_index`, `past_sequence_length`, `beam_width`, and
+    # `cache_indirection` never carry a `num_heads`-sized axis on their own
+    # schema docs (confirmed live -- see onnxsim/pruning.py's own
+    # "Attention-head pruning" section comment) -- connected as ordinary
+    # dynamic graph inputs, they are never inspected or touched by this
+    # pass at all.
+    K, H, D, Out, batch = 8, 4, 4, 6, 2
+    rng = np.random.default_rng(25)
+    wq = rng.standard_normal((K, H * D)).astype(np.float32)
+    wk = rng.standard_normal((K, H * D)).astype(np.float32)
+    wv = rng.standard_normal((K, H * D)).astype(np.float32)
+    wout = rng.standard_normal((H * D, Out)).astype(np.float32)
+    model = parser.parse_model(
+        f"""
+        <
+          ir_version: 10,
+          opset_import: ["": 17, "com.microsoft": 1]
+        >
+        g (float[{batch},1,{K}] X,
+           int32[{batch},1] MaskIndex,
+           int32[1] PastSeqLen,
+           int32[1] BeamWidth,
+           int32[{batch},1,1] CacheIndirection)
+          => (float[{batch},1,{Out}] Y)
+        {{
+          q = MatMul(X, Wq)
+          k = MatMul(X, Wk)
+          v = MatMul(X, Wv)
+          ctx = com.microsoft.DecoderMaskedMultiHeadAttention <num_heads={H}> (q, k, v, MaskIndex, "", "", "", PastSeqLen, BeamWidth, CacheIndirection)
+          Y = MatMul(ctx, Wout)
+        }}
+        """
+    )
+    model.graph.initializer.extend(
+        [_f32(wq, "Wq"), _f32(wk, "Wk"), _f32(wv, "Wv"), _f32(wout, "Wout")]
+    )
+
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    node = _dmmha_node(pruned)
+    assert _dmmha_num_heads(node) == 2  # matched/pruned normally
+    # The four runtime-only inputs are untouched -- same names, still
+    # present as graph inputs, unchanged.
+    assert list(node.input[3:4]) == ["MaskIndex"]
+    assert node.input[7:10] == ["PastSeqLen", "BeamWidth", "CacheIndirection"]
+    input_names = {i.name for i in pruned.graph.input}
+    assert {"MaskIndex", "PastSeqLen", "BeamWidth", "CacheIndirection"} <= input_names
+
+
+def test_dmmha_pruning_family_string_matches_mha():
+    # Reporting reuses `MultiHeadAttention`'s own family string rather than
+    # a distinct one -- the granularity is genuinely identical (no separate
+    # `kv_num_heads` on this op's own schema either), see
+    # onnxsim/pruning.py's own "Attention-head pruning" section comment.
+    model, cfg = _dmmha_model(K=8, H=8, D=4, Out=6, seed=26)
+    report = onnxsim.analyze_pruning_sensitivity(
+        model, onnxsim.apply_attention_head_pruning, sparsity=0.5
+    )
+    assert len(report.layers) == 1
+    assert report.layers[0].family == "attention_mha_head"
+
+
+def test_dmmha_pruning_dry_run_matches_real_call():
+    model, cfg = _dmmha_model(K=8, H=8, D=4, Out=6, seed=27, combined_bias=True)
+    report = onnxsim.analyze_pruning_sensitivity(
+        model, onnxsim.apply_attention_head_pruning, sparsity=0.5
+    )
+    assert len(report.layers) == 1
+    layer = report.layers[0]
+    assert layer.total == 8
+    assert layer.would_drop == 4  # round(8*0.5)
+
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    node = _dmmha_node(pruned)
+    assert cfg["H"] - _dmmha_num_heads(node) == layer.would_drop
+
+
+def test_dmmha_wanda_pruning_matches_oracle_exactly():
+    model, cfg = _dmmha_model(K=8, H=8, D=4, Out=6, seed=28, combined_bias=True)
+
+    rng = np.random.default_rng(29)
+    x_cal = rng.standard_normal((cfg["batch"], 1, cfg["K"])).astype(np.float32)
+    calibration_data = [{"X": x_cal}]
+
+    pruned = onnxsim.apply_attention_head_wanda_pruning(
+        model, calibration_data=calibration_data, sparsity=0.5
+    )
+    onnx.checker.check_model(pruned)
+
+    probe_model = onnx.ModelProto()
+    probe_model.CopyFrom(model)
+    probe_model.graph.output.append(onnx.ValueInfoProto(name="ctx"))
+    (_, ctx_cal) = _run(probe_model, {"X": x_cal})
+    act_norm = np.sqrt(np.mean(np.square(ctx_cal.astype(np.float64)), axis=(0, 1)))
+
+    d = cfg["D"]
+    importance = np.zeros(cfg["H"])
+    for h in range(cfg["H"]):
+        block = np.concatenate(
+            [
+                cfg["wq"][:, h * d : (h + 1) * d],
+                cfg["wk"][:, h * d : (h + 1) * d],
+                cfg["wv"][:, h * d : (h + 1) * d],
+            ],
+            axis=1,
+        )
+        base = np.linalg.norm(block)
+        act_head = np.linalg.norm(act_norm[h * d : (h + 1) * d])
+        importance[h] = base * max(act_head, 1e-8)
+    keep_heads = np.sort(np.argsort(-importance)[:4])  # max(1, 8 - round(8*0.5))
+    idx = _head_idx(keep_heads, d)
+
+    oracle, _ = _dmmha_model(
+        K=cfg["K"],
+        H=len(keep_heads),
+        D=d,
+        Out=cfg["Out"],
+        seed=28,
+        combined_bias=True,
+        wq=cfg["wq"][:, idx],
+        wk=cfg["wk"][:, idx],
+        wv=cfg["wv"][:, idx],
+        bq=cfg["bq"][idx],
+        bk=cfg["bk"][idx],
+        bv=cfg["bv"][idx],
+        wout=cfg["wout"][idx, :],
+        batch=cfg["batch"],
+    )
+
+    rng2 = np.random.default_rng(30)
+    x = rng2.standard_normal((cfg["batch"], 1, cfg["K"])).astype(np.float32)
+    (y_pruned,) = _run(pruned, {"X": x})
+    (y_oracle,) = _run(oracle, {"X": x})
+    np.testing.assert_allclose(y_pruned, y_oracle, rtol=1e-4, atol=1e-4)
+
+
 def test_attention_head_pruning_handles_all_three_attention_op_types_in_one_model():
     # Regression check for `_apply_attention_chains`'s per-chain-type
     # dispatch once a third node type shares it: a plain
@@ -14881,6 +15766,788 @@ def test_gqa_packed_qkv_rope_before_norm_is_declined():
 
     pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
     assert pruned.SerializeToString() == model.SerializeToString()
+
+
+# --- apply_attention_head_pruning -- MRotaryEmbedding/GemmaRotaryEmbedding
+#     QK-norm+RoPE pass-through hop --------------------------------------
+#
+# `com.microsoft::MRotaryEmbedding` ("M-RoPE", the Qwen-VL family's own
+# multimodal rotary embedding) and `com.microsoft::GemmaRotaryEmbedding`
+# (the Gemma family's own RoPE variant) -- see
+# `onnxsim.pruning._walk_back_through_qk_norm_rope`'s own section comment
+# for the exact schema facts (pulled live via
+# `onnxruntime.capi.onnxruntime_pybind11_state.get_all_operator_schema()`,
+# same as every other empirical claim there) and safety arguments for both.
+
+
+def test_mrotary_embedding_is_head_independent_for_pruning():
+    # Direct confirmation of `MRotaryEmbedding`'s own head-independence,
+    # isolated from the rest of the pruning machinery, mirroring
+    # `test_rotary_embedding_is_head_independent_for_pruning` -- across both
+    # `mrope_layout` values this module's own matcher accepts (0 "Sectioned/
+    # Chunked", 1 "Interleaved") and a deliberately non-uniform
+    # `mrope_section` split: dropping an arbitrary, non-contiguous subset of
+    # heads before or after this op must give bit-identical results for the
+    # surviving heads either way, since `mrope_section`/`mrope_layout`
+    # partition the cos/sin cache's own `half_rotary_embedding_dim` axis --
+    # a property of `head_size`, never of head count at all.
+    def _mrope_model(batch, seq, num_heads, head_size, cos, sin, section, layout):
+        hidden = num_heads * head_size
+        section_str = "[" + ", ".join(str(s) for s in section) + "]"
+        body = f"""
+            g (float[{batch},{seq},{hidden}] X, int64[3,{batch},{seq}] PosIds)
+              => (float[{batch},{seq},{hidden}] Y)
+            {{
+              Y = com.microsoft.MRotaryEmbedding
+                <num_heads={num_heads}, mrope_section={section_str}, mrope_layout={layout}>
+                (X, PosIds, Cos, Sin)
+            }}
+            """
+        return _model(
+            body,
+            initializer=[_f32(cos, "Cos"), _f32(sin, "Sin")],
+            opset=17,
+        )
+
+    batch, seq, num_heads, head_size = 2, 5, 6, 8
+    rng = np.random.default_rng(103)
+    max_pos = 16
+    half = head_size // 2
+    section = [2, 1, 1]  # deliberately non-uniform, sums to `half`
+    keep = [0, 2, 3, 5]  # arbitrary, non-contiguous
+
+    for layout in (0, 1):
+        cos = rng.standard_normal((max_pos, half)).astype(np.float32)
+        sin = rng.standard_normal((max_pos, half)).astype(np.float32)
+        x = rng.standard_normal((batch, seq, num_heads * head_size)).astype(np.float32)
+        posT = rng.integers(0, max_pos, size=(batch, seq)).astype(np.int64)
+        posH = rng.integers(0, max_pos, size=(batch, seq)).astype(np.int64)
+        posW = rng.integers(0, max_pos, size=(batch, seq)).astype(np.int64)
+        position_ids = np.stack([posT, posH, posW], axis=0)
+
+        full_model = _mrope_model(
+            batch, seq, num_heads, head_size, cos, sin, section, layout
+        )
+        (y_full,) = _run(full_model, {"X": x, "PosIds": position_ids})
+        y_full_heads = y_full.reshape(batch, seq, num_heads, head_size)
+
+        x_heads = x.reshape(batch, seq, num_heads, head_size)
+        x_sub = x_heads[:, :, keep, :].reshape(batch, seq, len(keep) * head_size)
+        sub_model = _mrope_model(
+            batch, seq, len(keep), head_size, cos, sin, section, layout
+        )
+        (y_sub,) = _run(sub_model, {"X": x_sub, "PosIds": position_ids})
+        y_sub_heads = y_sub.reshape(batch, seq, len(keep), head_size)
+
+        np.testing.assert_array_equal(y_sub_heads, y_full_heads[:, :, keep, :])
+
+
+def _gqa_mrope_model(
+    K=8,
+    H=8,
+    KVH=2,
+    D=8,
+    Out=6,
+    seed=0,
+    batch=2,
+    seq=5,
+    packed=True,
+    mrope_section=(2, 1, 1),
+    mrope_layout=0,
+    wqkv=None,
+    wq=None,
+    wk=None,
+    wv=None,
+    wout=None,
+    cos=None,
+    sin=None,
+    position_ids=None,
+    max_pos=32,
+    q_rotary_num_heads=None,
+    k_rotary_num_heads=None,
+):
+    # `MRotaryEmbedding` analogue of `_gqa_qk_norm_rope_model` (RoPE-only,
+    # no Q/K-norm sandwich -- "basic" coverage per this section's own scope,
+    # the norm sandwich's own composition with a rotary hop is already
+    # covered for plain `RotaryEmbedding` above and shares the identical
+    # `_walk_back_through_qk_norm` code path for every rotary op).
+    rng = np.random.default_rng(seed)
+    Nq, Nkv = H * D, KVH * D
+    half = D // 2
+    if wout is None:
+        wout = rng.standard_normal((Nq, Out)).astype(np.float32)
+    initializer = [_f32(wout, "Wout")]
+
+    if packed:
+        if wqkv is None:
+            wqkv = rng.standard_normal((K, Nq + 2 * Nkv)).astype(np.float32)
+        initializer.append(_f32(wqkv, "Wqkv"))
+        split_sizes = np.array([Nq, Nkv, Nkv], dtype=np.int64)
+        initializer.append(onnx.numpy_helper.from_array(split_sizes, "SplitSizes"))
+        producer_body = (
+            "qkv = MatMul(X, Wqkv)\n"
+            "          q_raw, k_raw, v = Split <axis = -1> (qkv, SplitSizes)"
+        )
+    else:
+        if wq is None:
+            wq = rng.standard_normal((K, Nq)).astype(np.float32)
+        if wk is None:
+            wk = rng.standard_normal((K, Nkv)).astype(np.float32)
+        if wv is None:
+            wv = rng.standard_normal((K, Nkv)).astype(np.float32)
+        initializer += [_f32(wq, "Wq"), _f32(wk, "Wk"), _f32(wv, "Wv")]
+        producer_body = (
+            "q_raw = MatMul(X, Wq)\n"
+            "          k_raw = MatMul(X, Wk)\n"
+            "          v = MatMul(X, Wv)"
+        )
+
+    if cos is None:
+        cos = rng.standard_normal((max_pos, half)).astype(np.float32)
+    if sin is None:
+        sin = rng.standard_normal((max_pos, half)).astype(np.float32)
+    if position_ids is None:
+        p = np.tile(np.arange(seq, dtype=np.int64), (batch, 1))
+        position_ids = np.stack([p, p, p], axis=0)
+    initializer += [_f32(cos, "Cos"), _f32(sin, "Sin")]
+    initializer.append(onnx.numpy_helper.from_array(position_ids, "PosIds"))
+    initializer.append(
+        onnx.numpy_helper.from_array(
+            np.full((batch,), seq - 1, dtype=np.int32), "SeqLensK"
+        )
+    )
+    initializer.append(
+        onnx.numpy_helper.from_array(np.array(seq, dtype=np.int32), "TotalSeq")
+    )
+
+    # Unlike plain `RotaryEmbedding`, `MRotaryEmbedding`'s own real CPU
+    # kernel requires an explicit, nonzero `num_heads` for rank-3 (flat)
+    # input -- confirmed empirically ("MRotaryEmbedding: num_heads must be
+    # greater than 0 for rank-3 input") -- so `q_rotary_num_heads`/
+    # `k_rotary_num_heads` default to this branch's own actual head count
+    # rather than the schema's own documented `0` default (which plain
+    # `RotaryEmbedding` self-adjusts from but this op's own kernel rejects
+    # outright for this input rank).
+    q_nh = q_rotary_num_heads if q_rotary_num_heads is not None else H
+    k_nh = k_rotary_num_heads if k_rotary_num_heads is not None else KVH
+    section_str = "[" + ", ".join(str(s) for s in mrope_section) + "]"
+    body = f"""
+        g (float[{batch},{seq},{K}] X) => (float[{batch},{seq},{Out}] Y)
+        {{
+          {producer_body}
+          q_rot = com.microsoft.MRotaryEmbedding
+            <num_heads={q_nh}, mrope_section={section_str}, mrope_layout={mrope_layout}>
+            (q_raw, PosIds, Cos, Sin)
+          k_rot = com.microsoft.MRotaryEmbedding
+            <num_heads={k_nh}, mrope_section={section_str}, mrope_layout={mrope_layout}>
+            (k_raw, PosIds, Cos, Sin)
+          ctx, pk, pv = com.microsoft.GroupQueryAttention <num_heads={H}, kv_num_heads={KVH}> (q_rot, k_rot, v, , , SeqLensK, TotalSeq)
+          Y = MatMul(ctx, Wout)
+        }}
+        """
+    model = parser.parse_model(
+        f"""
+        <
+          ir_version: 10,
+          opset_import: ["": 17, "com.microsoft": 1]
+        >
+        {body}
+        """
+    )
+    model.graph.initializer.extend(initializer)
+    return model, dict(
+        K=K,
+        H=H,
+        KVH=KVH,
+        D=D,
+        Out=Out,
+        Nq=Nq,
+        Nkv=Nkv,
+        wqkv=wqkv,
+        wq=wq,
+        wk=wk,
+        wv=wv,
+        wout=wout,
+        cos=cos,
+        sin=sin,
+        position_ids=position_ids,
+        batch=batch,
+        seq=seq,
+    )
+
+
+def _mrope_oracle_and_pruned(K, H, KVH, D, Out, seed, sparsity, **extra):
+    # Mirrors `_qk_norm_rope_oracle_and_pruned`'s own pattern: builds the
+    # packed (to-be-pruned) model, prunes it, and builds an *independently*
+    # constructed (`packed=False`) already-correctly-reduced oracle model
+    # from the exact same pre-pruning weights/cos/sin/position_ids.
+    model, cfg = _gqa_mrope_model(K=K, H=H, KVH=KVH, D=D, Out=Out, seed=seed, **extra)
+    assert len(onnxsim.pruning._find_gqa_chains(model.graph)) == 1
+
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=sparsity)
+
+    Nq, Nkv = cfg["Nq"], cfg["Nkv"]
+    wqkv = cfg["wqkv"]
+    wq, wk, wv = wqkv[:, :Nq], wqkv[:, Nq : Nq + Nkv], wqkv[:, Nq + Nkv :]
+
+    group_size = H // KVH
+    keep_count = max(1, KVH - round(KVH * sparsity))
+    keep_groups = _oracle_keep_groups(wq, wk, wv, H, KVH, D, keep_count)
+    keep_q_heads = _group_q_heads(keep_groups, group_size)
+    q_idx, kv_idx = _head_idx(keep_q_heads, D), _head_idx(keep_groups, D)
+
+    oracle_extra = dict(extra)
+    q_rotary_num_heads = extra.get("q_rotary_num_heads")
+    k_rotary_num_heads = extra.get("k_rotary_num_heads")
+    oracle_extra["q_rotary_num_heads"] = (
+        None
+        if q_rotary_num_heads is None or q_rotary_num_heads == 0
+        else len(keep_q_heads)
+    )
+    oracle_extra["k_rotary_num_heads"] = (
+        None
+        if k_rotary_num_heads is None or k_rotary_num_heads == 0
+        else len(keep_groups)
+    )
+
+    oracle, _ = _gqa_mrope_model(
+        K=K,
+        H=len(keep_q_heads),
+        KVH=len(keep_groups),
+        D=D,
+        Out=Out,
+        seed=seed,
+        packed=False,
+        wq=wq[:, q_idx],
+        wk=wk[:, kv_idx],
+        wv=wv[:, kv_idx],
+        wout=cfg["wout"][q_idx, :],
+        cos=cfg["cos"],
+        sin=cfg["sin"],
+        position_ids=cfg["position_ids"],
+        **oracle_extra,
+    )
+
+    rng = np.random.default_rng(seed + 1000)
+    x = rng.standard_normal((cfg["batch"], cfg["seq"], K)).astype(np.float32)
+    (y_pruned,) = _run(pruned, {"X": x})
+    (y_oracle,) = _run(oracle, {"X": x})
+    return pruned, oracle, y_pruned, y_oracle, keep_groups, keep_q_heads
+
+
+def test_gqa_packed_qkv_mrope_pruning_matches_oracle_exactly():
+    # Real end-to-end `InferenceSession` correctness check -- `MRotaryEmbedding`
+    # has a genuine CPU kernel in this environment (confirmed empirically,
+    # unlike `GemmaRotaryEmbedding` below) -- comparing the pruned model's
+    # own output against an *independently* rebuilt, already-reduced oracle
+    # model (never the wrong "pruned vs. full unpruned" invariant).
+    K, H, KVH, D, Out = 8, 8, 2, 8, 6
+    pruned, oracle, y_pruned, y_oracle, keep_groups, keep_q_heads = (
+        _mrope_oracle_and_pruned(
+            K, H, KVH, D, Out, seed=201, sparsity=0.5, mrope_layout=1
+        )
+    )
+    node = _gqa_node(pruned)
+    num_heads, kv_num_heads = _gqa_attrs(node)
+    assert kv_num_heads == len(keep_groups) == 1
+    assert num_heads == len(keep_q_heads) == 4
+
+    # `_gqa_mrope_model` always gives `MRotaryEmbedding` an explicit,
+    # nonzero `num_heads` (its own real CPU kernel rejects the schema's
+    # documented `0` "self-adjust" default outright for rank-3 input --
+    # confirmed empirically: "MRotaryEmbedding: num_heads must be greater
+    # than 0 for rank-3 input", unlike plain `RotaryEmbedding` -- see
+    # `_gqa_mrope_model`'s own comment), so this branch's own `num_heads`
+    # attribute IS one of the two constants
+    # :func:`onnxsim.pruning._walk_back_through_qk_norm_rope` rewrites post-
+    # pruning, checked here to be the new post-pruning head/group count on
+    # both the Q-side and K-side node.
+    q_rot = next(
+        n
+        for n in pruned.graph.node
+        if n.op_type == "MRotaryEmbedding" and n.input[0] == "q_raw"
+    )
+    k_rot = next(
+        n
+        for n in pruned.graph.node
+        if n.op_type == "MRotaryEmbedding" and n.input[0] == "k_raw"
+    )
+    for n, expect_heads in ((q_rot, len(keep_q_heads)), (k_rot, len(keep_groups))):
+        nh = next(a.i for a in n.attribute if a.name == "num_heads")
+        assert nh == expect_heads
+        section = next(a.ints for a in n.attribute if a.name == "mrope_section")
+        assert list(section) == [2, 1, 1]  # never touched -- head_size-only axis
+        layout = next(a.i for a in n.attribute if a.name == "mrope_layout")
+        assert layout == 1  # never touched
+
+    np.testing.assert_allclose(y_pruned, y_oracle, rtol=1e-5, atol=1e-5)
+
+
+def test_gqa_packed_qkv_mrope_pruning_updates_explicit_rotary_num_heads():
+    # Mirrors `test_gqa_packed_qkv_qk_norm_rope_pruning_updates_explicit_rotary_num_heads`
+    # for `MRotaryEmbedding`'s own identically-named/-semantic `num_heads`
+    # attribute (see `_walk_back_through_qk_norm_rope`'s own docstring for
+    # why one rewrite site already covers both ops).
+    K, H, KVH, D, Out = 8, 8, 2, 8, 6
+    pruned, oracle, y_pruned, y_oracle, keep_groups, keep_q_heads = (
+        _mrope_oracle_and_pruned(
+            K,
+            H,
+            KVH,
+            D,
+            Out,
+            seed=202,
+            sparsity=0.5,
+            q_rotary_num_heads=H,
+            k_rotary_num_heads=KVH,
+        )
+    )
+    q_rot = next(
+        n
+        for n in pruned.graph.node
+        if n.op_type == "MRotaryEmbedding" and n.input[0] == "q_raw"
+    )
+    k_rot = next(
+        n
+        for n in pruned.graph.node
+        if n.op_type == "MRotaryEmbedding" and n.input[0] == "k_raw"
+    )
+    assert next(a.i for a in q_rot.attribute if a.name == "num_heads") == len(
+        keep_q_heads
+    )
+    assert next(a.i for a in k_rot.attribute if a.name == "num_heads") == len(
+        keep_groups
+    )
+
+    np.testing.assert_allclose(y_pruned, y_oracle, rtol=1e-5, atol=1e-5)
+
+
+def test_gqa_packed_qkv_mrope_pruning_declines_unsupported_mrope_layout():
+    # `mrope_layout` values other than the two the live schema documents (0
+    # "Sectioned/Chunked", 1 "Interleaved") have no confirmed semantics --
+    # this module doesn't guess at whether they're still head-independent,
+    # so the whole chain is declined (left completely untouched) rather
+    # than silently mis-slicing a shape/attribute value this pass hasn't
+    # verified -- mirrors `test_gqa_packed_qkv_rope_before_norm_is_declined`'s
+    # own "whole chain declines" assertion style.
+    K, H, KVH, D, Out = 8, 8, 2, 8, 6
+    model, cfg = _gqa_mrope_model(
+        K=K, H=H, KVH=KVH, D=D, Out=Out, seed=203, mrope_layout=2
+    )
+    assert onnxsim.pruning._find_gqa_chains(model.graph) == []
+
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    assert pruned.SerializeToString() == model.SerializeToString()
+
+
+def test_analyze_attention_head_pruning_gqa_mrope_matches_real_call():
+    # Dry-run (`analyze_pruning_sensitivity`) vs. real-call parity: both
+    # share the identical `_find_gqa_chains` matcher this section extends,
+    # so the analysis-only preview must predict the exact same post-pruning
+    # head/group counts the real call actually produces.
+    K, H, KVH, D, Out = 8, 8, 2, 8, 6
+    model, cfg = _gqa_mrope_model(K=K, H=H, KVH=KVH, D=D, Out=Out, seed=204)
+    report = onnxsim.analyze_pruning_sensitivity(
+        model, onnxsim.apply_attention_head_pruning, sparsity=0.5
+    )
+    assert len(report.layers) == 1
+    layer = report.layers[0]
+    assert layer.family == "attention_gqa_group"
+    assert layer.total == KVH
+
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    node = _gqa_node(pruned)
+    _, kv_num_heads = _gqa_attrs(node)
+    assert kv_num_heads == KVH - layer.would_drop
+
+
+def _decompose_gemma_rotary_nodes(model):
+    # Test-only helper: replaces every `com.microsoft::GemmaRotaryEmbedding`
+    # node in `model` with the literal decomposition its own live schema doc
+    # string gives (the "onnxscript that was tested" reference -- see
+    # `onnxsim.pruning._walk_back_through_gemma_rope_pair`'s own docstring),
+    # minus the fp16-mixed-precision `Cast`s (this helper stays in float32
+    # throughout, since it exists to check the PRUNING TRANSFORM's own
+    # correctness, not to reproduce the real op's fp16 numerics) --
+    # `sin_val = Sin(emb); cos_val = Cos(emb)`, unsqueezed at axis 1, then
+    # `q_embed = q * cos + q_rot * sin`, `k_embed = k * cos + k_rot * sin`.
+    # Needed because `GemmaRotaryEmbedding` itself has no usable CPU kernel
+    # in this environment at all (confirmed empirically -- see this
+    # section's own comment above for the exact `CastFloat16Transformer`
+    # failure) -- every ops this decomposes into (`Sin`/`Cos`/`Unsqueeze`/
+    # `Mul`/`Add`) has a real ai.onnx CPU kernel, so the RESULT is directly
+    # executable via a real `InferenceSession`, the same
+    # decomposed-proxy-topology methodology this module's own
+    # `MatMulNBitsMlp`/`MatMulNBitsQkv`/`PagedAttention` sections already
+    # established (search `onnxsim/pruning.py` for "decompose a (pruned)
+    # fused node's own tensors back into equivalent").
+    out = onnx.ModelProto()
+    out.CopyFrom(model)
+    new_nodes = []
+    counter = 0
+    for node in out.graph.node:
+        if node.op_type != "GemmaRotaryEmbedding" or node.domain != "com.microsoft":
+            new_nodes.append(node)
+            continue
+        counter += 1
+        p = f"_gemma_decomp_{counter}"
+        emb, q, q_rot, k, k_rot = node.input
+        q_embed, k_embed = node.output
+        sin_val, cos_val = f"{p}_sin", f"{p}_cos"
+        sin_u, cos_u = f"{p}_sin_u", f"{p}_cos_u"
+        axes = f"{p}_axes"
+        q_cos, q_sin, k_cos, k_sin = (
+            f"{p}_q_cos",
+            f"{p}_q_sin",
+            f"{p}_k_cos",
+            f"{p}_k_sin",
+        )
+        out.graph.initializer.append(
+            onnx.numpy_helper.from_array(np.array([1], dtype=np.int64), axes)
+        )
+        new_nodes.extend(
+            [
+                onnx.helper.make_node("Sin", [emb], [sin_val], name=f"{p}/Sin"),
+                onnx.helper.make_node("Cos", [emb], [cos_val], name=f"{p}/Cos"),
+                onnx.helper.make_node(
+                    "Unsqueeze", [sin_val, axes], [sin_u], name=f"{p}/UnsqueezeSin"
+                ),
+                onnx.helper.make_node(
+                    "Unsqueeze", [cos_val, axes], [cos_u], name=f"{p}/UnsqueezeCos"
+                ),
+                onnx.helper.make_node("Mul", [q, cos_u], [q_cos], name=f"{p}/QCos"),
+                onnx.helper.make_node("Mul", [q_rot, sin_u], [q_sin], name=f"{p}/QSin"),
+                onnx.helper.make_node(
+                    "Add", [q_cos, q_sin], [q_embed], name=f"{p}/QEmbed"
+                ),
+                onnx.helper.make_node("Mul", [k, cos_u], [k_cos], name=f"{p}/KCos"),
+                onnx.helper.make_node("Mul", [k_rot, sin_u], [k_sin], name=f"{p}/KSin"),
+                onnx.helper.make_node(
+                    "Add", [k_cos, k_sin], [k_embed], name=f"{p}/KEmbed"
+                ),
+            ]
+        )
+    del out.graph.node[:]
+    out.graph.node.extend(new_nodes)
+    del out.graph.value_info[:]  # every shape downstream of the fused node is stale
+    return out
+
+
+def test_gemma_rotary_embedding_decomposition_is_head_independent_for_pruning():
+    # Direct confirmation of `GemmaRotaryEmbedding`'s own head-independence
+    # via its decomposed equivalent (`_decompose_gemma_rotary_nodes`),
+    # executed through a real `InferenceSession` against no other oracle --
+    # the fused op itself has no usable CPU kernel here at all (see this
+    # section's own comment above), so this IS the empirical confirmation,
+    # mirroring `test_rotary_embedding_is_head_independent_for_pruning`'s
+    # own role for plain `RotaryEmbedding`: dropping an arbitrary,
+    # non-contiguous subset of heads before or after this op must give
+    # bit-identical results for the surviving heads either way, since
+    # neither the `Sin`/`Cos` angle (`emb`, no head axis) nor the
+    # elementwise `q`/`q_rot`/`k`/`k_rot` combination ever mixes across
+    # heads.
+    def _gemma_model(batch, seq, num_heads, head_size):
+        # `Emb`'s own last axis is `head_size` -- broadcasting directly
+        # against `Q`/`QRot`'s own trailing axis (the onnxscript reference's
+        # `Unsqueeze`d `cos`/`sin` multiplies `Q`/`QRot` elementwise, full
+        # width -- confirmed empirically: a `head_size // 2`-wide `Emb`
+        # fails real `Mul` shape inference outright), unlike plain
+        # `RotaryEmbedding`'s own half-width `cos_cache`/`sin_cache`.
+        body = f"""
+            g (float[{batch},{seq},{head_size}] Emb,
+               float[{batch},{num_heads},{seq},{head_size}] Q,
+               float[{batch},{num_heads},{seq},{head_size}] QRot,
+               float[{batch},{num_heads},{seq},{head_size}] K,
+               float[{batch},{num_heads},{seq},{head_size}] KRot)
+              => (float[{batch},{num_heads},{seq},{head_size}] QEmbed,
+                  float[{batch},{num_heads},{seq},{head_size}] KEmbed)
+            {{
+              QEmbed, KEmbed = com.microsoft.GemmaRotaryEmbedding (Emb, Q, QRot, K, KRot)
+            }}
+            """
+        return _model(body, opset=17)
+
+    batch, seq, num_heads, head_size = 2, 5, 6, 8
+    rng = np.random.default_rng(104)
+    keep = [0, 2, 3, 5]  # arbitrary, non-contiguous
+
+    emb = rng.standard_normal((batch, seq, head_size)).astype(np.float32)
+    q = rng.standard_normal((batch, num_heads, seq, head_size)).astype(np.float32)
+    q_rot = rng.standard_normal((batch, num_heads, seq, head_size)).astype(np.float32)
+    k = rng.standard_normal((batch, num_heads, seq, head_size)).astype(np.float32)
+    k_rot = rng.standard_normal((batch, num_heads, seq, head_size)).astype(np.float32)
+
+    full_model = _decompose_gemma_rotary_nodes(
+        _gemma_model(batch, seq, num_heads, head_size)
+    )
+    q_embed_full, k_embed_full = _run(
+        full_model,
+        {"Emb": emb, "Q": q, "QRot": q_rot, "K": k, "KRot": k_rot},
+    )
+
+    sub_model = _decompose_gemma_rotary_nodes(
+        _gemma_model(batch, seq, len(keep), head_size)
+    )
+    q_embed_sub, k_embed_sub = _run(
+        sub_model,
+        {
+            "Emb": emb,
+            "Q": q[:, keep, :, :],
+            "QRot": q_rot[:, keep, :, :],
+            "K": k[:, keep, :, :],
+            "KRot": k_rot[:, keep, :, :],
+        },
+    )
+
+    np.testing.assert_array_equal(q_embed_sub, q_embed_full[:, keep, :, :])
+    np.testing.assert_array_equal(k_embed_sub, k_embed_full[:, keep, :, :])
+
+
+def _gqa_gemma_rope_model(
+    K=8,
+    H=8,
+    KVH=2,
+    D=8,
+    Out=6,
+    seed=0,
+    batch=2,
+    seq=5,
+    packed=True,
+    wqkv=None,
+    wq=None,
+    wk=None,
+    wv=None,
+    wout=None,
+    emb=None,
+):
+    # `GemmaRotaryEmbedding` analogue of `_gqa_mrope_model`: packed-QKV (or
+    # separate producers) -> `Reshape`+`Transpose` to 4D BNSH
+    # (`_match_bnsh_reshape`) -> `rotate_half` (`_match_rotate_half`) ->
+    # `GemmaRotaryEmbedding` -> `Transpose`+`Reshape` back to flat 3D
+    # (`_match_reverse_bnsh_reshape`, required for `GroupQueryAttention`'s
+    # own 3D-only Q/K input, confirmed empirically -- see
+    # `onnxsim.pruning._match_reverse_bnsh_reshape`'s own docstring) ->
+    # `GroupQueryAttention`.
+    rng = np.random.default_rng(seed)
+    Nq, Nkv = H * D, KVH * D
+    if wout is None:
+        wout = rng.standard_normal((Nq, Out)).astype(np.float32)
+    initializer = [_f32(wout, "Wout")]
+
+    if packed:
+        if wqkv is None:
+            wqkv = rng.standard_normal((K, Nq + 2 * Nkv)).astype(np.float32)
+        initializer.append(_f32(wqkv, "Wqkv"))
+        split_sizes = np.array([Nq, Nkv, Nkv], dtype=np.int64)
+        initializer.append(onnx.numpy_helper.from_array(split_sizes, "SplitSizes"))
+        producer_body = (
+            "qkv = MatMul(X, Wqkv)\n"
+            "          q_raw, k_raw, v = Split <axis = -1> (qkv, SplitSizes)"
+        )
+    else:
+        if wq is None:
+            wq = rng.standard_normal((K, Nq)).astype(np.float32)
+        if wk is None:
+            wk = rng.standard_normal((K, Nkv)).astype(np.float32)
+        if wv is None:
+            wv = rng.standard_normal((K, Nkv)).astype(np.float32)
+        initializer += [_f32(wq, "Wq"), _f32(wk, "Wk"), _f32(wv, "Wv")]
+        producer_body = (
+            "q_raw = MatMul(X, Wq)\n"
+            "          k_raw = MatMul(X, Wk)\n"
+            "          v = MatMul(X, Wv)"
+        )
+
+    if emb is None:
+        # `emb`'s own last axis broadcasts directly against `q`'s/`k`'s own
+        # full `head_size` (the onnxscript reference's `Unsqueeze`d
+        # `cos`/`sin` multiplies `q`/`q_rot` elementwise) -- `D`, not `D //
+        # 2` (that would only broadcast against a half-width cache the way
+        # plain `RotaryEmbedding`'s own `cos_cache`/`sin_cache` do, which
+        # isn't this op's own shape at all).
+        emb = rng.standard_normal((batch, seq, D)).astype(np.float32)
+    initializer.append(_f32(emb, "Emb"))
+    initializer.append(
+        onnx.numpy_helper.from_array(
+            np.array([D // 2, D // 2], dtype=np.int64), "HalfSizes"
+        )
+    )
+    initializer.append(
+        onnx.numpy_helper.from_array(
+            np.array([0, -1, H, D], dtype=np.int64), "QReshapeA"
+        )
+    )
+    initializer.append(
+        onnx.numpy_helper.from_array(
+            np.array([0, -1, KVH, D], dtype=np.int64), "KReshapeA"
+        )
+    )
+    initializer.append(
+        onnx.numpy_helper.from_array(np.array([0, -1, Nq], dtype=np.int64), "QReshapeB")
+    )
+    initializer.append(
+        onnx.numpy_helper.from_array(
+            np.array([0, -1, Nkv], dtype=np.int64), "KReshapeB"
+        )
+    )
+    initializer.append(
+        onnx.numpy_helper.from_array(
+            np.full((batch,), seq - 1, dtype=np.int32), "SeqLensK"
+        )
+    )
+    initializer.append(
+        onnx.numpy_helper.from_array(np.array(seq, dtype=np.int32), "TotalSeq")
+    )
+
+    body = f"""
+        g (float[{batch},{seq},{K}] X) => (float[{batch},{seq},{Out}] Y)
+        {{
+          {producer_body}
+          q_bnsh_in = Reshape(q_raw, QReshapeA)
+          q_bnsh = Transpose <perm=[0,2,1,3]> (q_bnsh_in)
+          q_x1, q_x2 = Split <axis=-1> (q_bnsh, HalfSizes)
+          q_x2n = Neg(q_x2)
+          q_rot_in = Concat <axis=-1> (q_x2n, q_x1)
+          k_bnsh_in = Reshape(k_raw, KReshapeA)
+          k_bnsh = Transpose <perm=[0,2,1,3]> (k_bnsh_in)
+          k_x1, k_x2 = Split <axis=-1> (k_bnsh, HalfSizes)
+          k_x2n = Neg(k_x2)
+          k_rot_in = Concat <axis=-1> (k_x2n, k_x1)
+          q_embed, k_embed = com.microsoft.GemmaRotaryEmbedding (Emb, q_bnsh, q_rot_in, k_bnsh, k_rot_in)
+          q_flat_bnsh = Transpose <perm=[0,2,1,3]> (q_embed)
+          q_flat = Reshape(q_flat_bnsh, QReshapeB)
+          k_flat_bnsh = Transpose <perm=[0,2,1,3]> (k_embed)
+          k_flat = Reshape(k_flat_bnsh, KReshapeB)
+          ctx, pk, pv = com.microsoft.GroupQueryAttention <num_heads={H}, kv_num_heads={KVH}> (q_flat, k_flat, v, , , SeqLensK, TotalSeq)
+          Y = MatMul(ctx, Wout)
+        }}
+        """
+    model = parser.parse_model(
+        f"""
+        <
+          ir_version: 10,
+          opset_import: ["": 17, "com.microsoft": 1]
+        >
+        {body}
+        """
+    )
+    model.graph.initializer.extend(initializer)
+    return model, dict(
+        K=K,
+        H=H,
+        KVH=KVH,
+        D=D,
+        Out=Out,
+        Nq=Nq,
+        Nkv=Nkv,
+        wqkv=wqkv,
+        wq=wq,
+        wk=wk,
+        wv=wv,
+        wout=wout,
+        emb=emb,
+        batch=batch,
+        seq=seq,
+    )
+
+
+def test_gqa_packed_qkv_gemma_rope_pruning_matches_decomposed_oracle():
+    # `GemmaRotaryEmbedding` itself can't be run end to end here (no usable
+    # CPU kernel -- confirmed empirically, see this section's own comment
+    # above), so, per this module's own `MatMulNBitsMlp`/`MatMulNBitsQkv`/
+    # `PagedAttention` precedent, BOTH the pruned model and an
+    # *independently* rebuilt, already-reduced oracle model are decomposed
+    # (`_decompose_gemma_rotary_nodes`) into an equivalent, genuinely
+    # executable topology before being run through a real `InferenceSession`
+    # -- never comparing the pruned model against the full unpruned one.
+    K, H, KVH, D, Out = 8, 8, 2, 8, 6
+    model, cfg = _gqa_gemma_rope_model(K=K, H=H, KVH=KVH, D=D, Out=Out, seed=205)
+    assert len(onnxsim.pruning._find_gqa_chains(model.graph)) == 1
+
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+
+    node = _gqa_node(pruned)
+    num_heads, kv_num_heads = _gqa_attrs(node)
+
+    Nq, Nkv = cfg["Nq"], cfg["Nkv"]
+    wqkv = cfg["wqkv"]
+    wq, wk, wv = wqkv[:, :Nq], wqkv[:, Nq : Nq + Nkv], wqkv[:, Nq + Nkv :]
+
+    group_size = H // KVH
+    keep_count = max(1, KVH - round(KVH * 0.5))
+    keep_groups = _oracle_keep_groups(wq, wk, wv, H, KVH, D, keep_count)
+    keep_q_heads = _group_q_heads(keep_groups, group_size)
+    q_idx, kv_idx = _head_idx(keep_q_heads, D), _head_idx(keep_groups, D)
+
+    assert kv_num_heads == len(keep_groups)
+    assert num_heads == len(keep_q_heads)
+
+    # The BNSH `Reshape`s' own `num_heads` entries (index -2) and the
+    # reverse-hop `Reshape`s' own flat-width entries (index -1) must both
+    # have been rewritten to the new post-pruning counts -- structural
+    # confirmation alongside the numeric one below.
+    for out_name, expect_heads in (
+        ("q_bnsh_in", len(keep_q_heads)),
+        ("k_bnsh_in", len(keep_groups)),
+    ):
+        n = next(n for n in pruned.graph.node if n.output and n.output[0] == out_name)
+        dims = onnx.numpy_helper.to_array(
+            next(i for i in pruned.graph.initializer if i.name == n.input[1])
+        )
+        assert int(dims[-2]) == expect_heads
+    for out_name, expect_width in (
+        ("q_flat", len(keep_q_heads) * D),
+        ("k_flat", len(keep_groups) * D),
+    ):
+        n = next(n for n in pruned.graph.node if n.output and n.output[0] == out_name)
+        dims = onnx.numpy_helper.to_array(
+            next(i for i in pruned.graph.initializer if i.name == n.input[1])
+        )
+        assert int(dims[-1]) == expect_width
+
+    oracle, _ = _gqa_gemma_rope_model(
+        K=K,
+        H=len(keep_q_heads),
+        KVH=len(keep_groups),
+        D=D,
+        Out=Out,
+        seed=205,
+        packed=False,
+        wq=wq[:, q_idx],
+        wk=wk[:, kv_idx],
+        wv=wv[:, kv_idx],
+        wout=cfg["wout"][q_idx, :],
+        emb=cfg["emb"],
+    )
+
+    pruned_decomposed = _decompose_gemma_rotary_nodes(pruned)
+    oracle_decomposed = _decompose_gemma_rotary_nodes(oracle)
+
+    rng = np.random.default_rng(seed=1205)
+    x = rng.standard_normal((cfg["batch"], cfg["seq"], K)).astype(np.float32)
+    (y_pruned,) = _run(pruned_decomposed, {"X": x})
+    (y_oracle,) = _run(oracle_decomposed, {"X": x})
+    np.testing.assert_allclose(y_pruned, y_oracle, rtol=1e-5, atol=1e-5)
+
+
+def test_analyze_attention_head_pruning_gqa_gemma_rope_matches_real_call():
+    # Dry-run (`analyze_pruning_sensitivity`) vs. real-call parity for the
+    # `GemmaRotaryEmbedding` hop, mirroring
+    # `test_analyze_attention_head_pruning_gqa_mrope_matches_real_call`.
+    K, H, KVH, D, Out = 8, 8, 2, 8, 6
+    model, cfg = _gqa_gemma_rope_model(K=K, H=H, KVH=KVH, D=D, Out=Out, seed=206)
+    report = onnxsim.analyze_pruning_sensitivity(
+        model, onnxsim.apply_attention_head_pruning, sparsity=0.5
+    )
+    assert len(report.layers) == 1
+    layer = report.layers[0]
+    assert layer.family == "attention_gqa_group"
+    assert layer.total == KVH
+
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    node = _gqa_node(pruned)
+    _, kv_num_heads = _gqa_attrs(node)
+    assert kv_num_heads == KVH - layer.would_drop
 
 
 def test_structured_pruning_importance_norm_l2_is_the_unchanged_default():

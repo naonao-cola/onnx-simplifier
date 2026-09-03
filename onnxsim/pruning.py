@@ -12854,6 +12854,254 @@ def apply_structured_pruning_matmul_nbits(
 #   lengths (as well as different source tensors and different feature
 #   dimensions) throughout, oracle-verified via onnxruntime with no
 #   restriction of this pass's own.
+#
+# `com.microsoft::DecoderMaskedSelfAttention`/`com.microsoft
+# ::DecoderMaskedMultiHeadAttention` -- ONNX Runtime's own step-of-1
+# decode-time IN-PLACE REWRITE TARGETS for `Attention`/`MultiHeadAttention`,
+# not merely two more independently-exported op types. This is real,
+# shipped code, not a schema definition nobody exercises -- confirmed by
+# reading `onnxruntime.transformers.convert_generation`, installed in this
+# environment (``python3 -c "import onnxruntime.transformers
+# .convert_generation as m; print(m.__file__)"`` -- note this module itself
+# imports `torch` at module scope and fails to import in a torch-less
+# environment like this one, so it was read directly off disk rather than
+# imported):
+# `update_decoder_subgraph_use_decoder_masked_attention` (its own
+# `switch_attention` branch) literally reassigns an existing `Attention`
+# node's `op_type` to `"DecoderMaskedSelfAttention"` in place, and
+# `replace_mha_with_dmmha` does the same for `MultiHeadAttention` ->
+# `"DecoderMaskedMultiHeadAttention"`, both called from
+# `convert_generation.py`'s own T5/GPT2/Whisper beam-search/greedy-search
+# export path (`main()`'s own `--use_decoder_masked_attention` CLI flag).
+# Concretely, for a real BERT/ViT/CLIP/T5/Whisper-style export already
+# matched by this section's own `Attention`/`MultiHeadAttention` bullets
+# above, running that export a second time through ORT's own beam-search
+# chaining tool can turn either into one of these two -- so a model this
+# section already prunes correctly today can arrive already rewritten, and
+# would previously have gone entirely unmatched (`grep -c
+# "DecoderMasked.*Attention" onnxsim/pruning.py` returned ``0`` before this
+# change).
+#
+# Both ops' full live schemas were pulled directly, not assumed from name
+# similarity to `Attention`/`MultiHeadAttention`, via
+# ``onnxruntime.capi.onnxruntime_pybind11_state.get_all_operator_schema()``
+# filtered for ``name in ("DecoderMaskedSelfAttention",
+# "DecoderMaskedMultiHeadAttention")`` against this environment's installed
+# onnxruntime 1.29.0 -- every input (name/type/required-optional/position),
+# output, attribute (required/default), and doc string, cross-checked
+# against `update_decoder_subgraph_use_decoder_masked_attention`'s/
+# `replace_mha_with_dmmha`'s own literal node-construction code above:
+#
+# - `DecoderMaskedSelfAttention`: merged QKV `weights`
+#   ``(input_hidden_size, hidden_size + hidden_size + v_hidden_size)`` --
+#   the *same* layout `com.microsoft::Attention` already has -- confirmed
+#   to share `Attention`'s own input *positions* too for everything this
+#   section touches (`weights`/`bias`/`mask_index`/`attention_bias` at
+#   1/2/3/5, unchanged), so :func:`_match_attention_producer`'s own op_type
+#   check was simply widened to accept it, degenerating cleanly into the
+#   same code path `Attention` already uses. Two schema differences from
+#   `Attention`, both confirmed directly off the live attribute dump
+#   (`do_rotary`, `mask_filter_value`, `scale`,
+#   `past_present_share_buffer`, `num_heads` -- five attributes total, no
+#   more), not assumed from the name:
+#   * **No `qkv_hidden_sizes` attribute at all** -- confirmed by its
+#     absence from that five-attribute list, despite the op's own doc
+#     *string* mentioning the phrase verbatim (evidently copy-pasted from
+#     `Attention`'s own doc and never edited to match the real schema).
+#     This traces through cleanly: `_match_attention_producer` already has
+#     a "schema default: Q/K/V evenly split the merged width" branch for
+#     whenever `Attention`'s own (there, schema-*optional*)
+#     `qkv_hidden_sizes` attribute is absent -- confirmed, by tracing that
+#     branch directly, to be exactly the code path this op needs
+#     unconditionally, so no new branch was needed, only extending the
+#     existing absent-attribute one to also cover "never has one at all."
+#     Since the matcher only ever accepts this op's own always-even split,
+#     `dq == dk == dv` is guaranteed, so `keep_count * dq == keep_count *
+#     dk == keep_count * dv` remains true after pruning too --
+#     :func:`_apply_one_plain_attention_chain` skips writing a
+#     `qkv_hidden_sizes` attribute back for this op type at all (it would
+#     be a dead, schema-unrecognized attribute the real kernel never
+#     reads), rather than writing one unconditionally the way it already
+#     does for plain `Attention`.
+#   * A required (not `Attention`'s own schema-optional) `past` input
+#     (index 4, unchanged position) -- real step-of-1 decode exports always
+#     leave this dynamic (the caller's own growing KV-cache state), so
+#     nothing needs slicing in the realistic case; a *constant* one (no
+#     established, tested slicing path here, unlike the `past_key`/
+#     `past_value` *pair* every separate-Q/K/V op in this section already
+#     handles) conservatively declines the whole match rather than being
+#     left silently stale -- see :func:`_match_attention_producer`'s own
+#     docstring.
+#   * `do_rotary` (fused rotary embedding computed *inside* the op, no
+#     external `cos_cache`/`sin_cache` input on this op's own schema at
+#     all -- confirmed by its full input list having none) is declined
+#     outright when set. This needed its own correctness check before
+#     being trusted, per this module's own established
+#     :func:`_walk_back_through_qk_norm_rope` precedent for *external*,
+#     graph-level `RotaryEmbedding` composing safely with head pruning
+#     (per-head rotation using only that head's own `head_size` slice and
+#     a position-dependent, never head-dependent, `cos`/`sin` lookup) --
+#     but that precedent's own safety argument rests on being able to
+#     *run* the rotation and confirm bit-identical results before/after
+#     pruning a subset of heads, and no CPU kernel exists for
+#     `DecoderMaskedSelfAttention` in this environment at all (confirmed
+#     empirically -- see below), so there is nothing here to run. Reaching
+#     for the next-best evidence -- the closely related, CPU-kernel-backed
+#     `com.microsoft::Attention` op's own `do_rotary=1` path (identical
+#     "fused, no external cache" shape) -- turned up a real, confirming
+#     signal rather than one: a minimal `onnx.checker`-valid `Attention`
+#     node with `do_rotary=1` fails at `InferenceSession.run` with
+#     ``"Rotary embedding is not supported in Attention CPU kernel...
+#     Please fuse the model with MHA + RotaryEmbedding"`` -- i.e. fused
+#     do_rotary is unimplemented in *this* op's CPU kernel too, in this
+#     environment. With neither op's own fused-rotary path executable here,
+#     no solid, execution-confirmed safety argument can be built for
+#     `DecoderMaskedSelfAttention`'s `do_rotary=1` specifically -- so, per
+#     this module's own conservative precedent elsewhere, it is declined
+#     outright (`do_rotary=1` in `node.attribute` makes
+#     :func:`_match_attention_producer` return ``None``) rather than
+#     guessed at. `do_rotary=0` (the schema default) matches unconditionally.
+# - `DecoderMaskedMultiHeadAttention`: same pre-projected-Q/K/V shape
+#   family as `MultiHeadAttention` (`query`/`key`/`value` already-projected
+#   activation tensors, no projection weight owned by the node itself), a
+#   real CPU kernel exists for it in this environment (confirmed by
+#   successfully constructing and running an `InferenceSession` -- unlike
+#   `DecoderMaskedSelfAttention` above, which fails
+#   `InferenceSession` construction outright with
+#   ``NOT_IMPLEMENTED : ... Could not find an implementation for
+#   DecoderMaskedSelfAttention``), so every claim below was verified via
+#   real execution against a from-scratch numpy oracle, not schema-doc-only.
+#   Given by :func:`_match_decoder_masked_multi_head_attention_producer`, a
+#   genuinely *separate* matcher function from
+#   :func:`_match_multi_head_attention_producer` (see that function's own
+#   docstring for exactly why a single shared function accepting both
+#   op-types was judged the *less* safe shape here, unlike the merged-QKV
+#   `Attention`/`DecoderMaskedSelfAttention` pair above) -- but reusing
+#   every bit of shared :class:`_GQAChain`/:func:`_apply_one_gqa_chain`/
+#   :func:`_find_separate_qkv_chains` machinery `MultiHeadAttention` itself
+#   already uses, via a new :func:`_find_decoder_masked_mha_chains` wrapper.
+#   Confirmed schema/behavior differences from `MultiHeadAttention`, none
+#   assumed from the name:
+#   * Every input beyond `query`/`key`/`value` sits at a **different
+#     index** from `MultiHeadAttention`'s own: `mask_index` at 3 (was
+#     `key_padding_mask` at 4), `attention_bias` at 4 (was 5), `past_key`/
+#     `past_value` at 5/6 (was 6/7), three new optional inputs
+#     (`past_sequence_length`/`beam_width`/`cache_indirection` at 7/8/9 --
+#     confirmed genuinely runtime-only: none has a `num_heads`-sized axis
+#     on its own schema doc, the identical "ignored, not sliced" treatment
+#     `mask_index` already gets, cross-checked against
+#     `update_decoder_subgraph_use_decoder_masked_attention`'s own literal
+#     construction, which threads `beam_width`/`cache_indirection` through
+#     as plain pass-through graph inputs with no per-head shape at all),
+#     and -- the one difference a single shared matcher could too easily
+#     get wrong -- a combined `bias` moved from index 3 all the way to
+#     index **10**, the *last* input, not merely appended after the new
+#     ones (confirmed both off the live schema dump and independently off
+#     `replace_mha_with_dmmha`'s own literal ``inputs=[...]`` list, which
+#     builds exactly this reordering by hand: `query, key, value,
+#     mask_index="", relative_position_bias="", past_key, past_value,
+#     past_sequence_length, beam_width, cache_indirection, bias`). The
+#     combined bias's own *shape* is unchanged -- still exactly `[nq + nk +
+#     nv]`, per this op's own doc ("Bias tensor with shape (hidden_size +
+#     hidden_size + v_hidden_size) from input projection") -- only its
+#     input *position* differs, so :class:`_GQAChain`'s existing
+#     `mha_bias` field/slicing needed no changes at all, only a different
+#     `combined_bias_input_index` passed to
+#     :func:`_find_separate_qkv_chains` (``10``, not ``3``).
+#   * `allow_differing_v_head_size` is **`False`** here -- *not* the same
+#     value `MultiHeadAttention` itself gets (`True`) -- confirmed by a
+#     real `InferenceSession` run: a node whose V projection is a
+#     genuinely different width than Q's/K's shared one fails outright with
+#     ``"QK head size should be same as V head size to use
+#     DecoderMaskedMultiHeadAttention"``. The same hard equal-head-size
+#     requirement `GroupQueryAttention`/`PagedAttention` already have, for
+#     the identical reason (neither's own fusion path ever produces a
+#     mismatched one) -- a real, confirmed behavioral difference from
+#     `MultiHeadAttention` this module's own naming convention could
+#     otherwise suggest doesn't exist.
+#   * This environment's CPU kernel additionally *requires*
+#     `past_present_share_buffer=1` whenever `past_key`/`past_value` are
+#     connected at all (a `false`/absent attribute fails outright,
+#     ``"past_present_share_buffer_ was false"``) -- an implementation
+#     requirement beyond what the schema's own optional-attribute framing
+#     alone suggests. Doesn't change anything this pass matches or slices
+#     (the attribute is passed through untouched regardless of its value,
+#     like every other op-level attribute this section doesn't rewrite),
+#     but shapes how `tests/test_pruning.py`'s own past-KV-cache tests for
+#     this op are actually constructed.
+#   * `past_key`/`past_value` share the identical BNSH layout (`(batch,
+#     num_heads, seq, head_size)`, `num_heads` at axis 1) as every other op
+#     in this section's own analogous inputs -- reuses
+#     :func:`_past_kv_constants_are_sliceable` unchanged, just at this op's
+#     own indices (5/6) and with no `scale_indices` (no `k_scale`/`v_scale`
+#     inputs on this op's own schema at all). `attention_bias` (index 4)
+#     confirmed to have the identical real, per-head numeric effect
+#     `MultiHeadAttention`'s own already has (perturbing one head's own
+#     slice of a connected constant, through a real end-to-end run, changed
+#     only that head's own output slice and nothing else) -- gets the
+#     identical :func:`_head_bias_axis`-mediated treatment.
+#   * Reporting reuses `MultiHeadAttention`'s own `family="attention_mha_head"`
+#     string rather than a new one: the granularity is genuinely identical
+#     (no separate `kv_num_heads` attribute on this op's own schema either,
+#     confirmed off the same live dump -- `chain.kv_num_heads ==
+#     chain.num_heads` always, exactly as for `MultiHeadAttention`), so a
+#     distinct family string would report a structurally identical thing
+#     under a different name for no reason -- unlike `PagedAttention`'s own
+#     genuinely different (real GQA-style) grouping, which does get its own.
+#   * **Cross-attention was investigated and found NOT to compose the way
+#     it does for `MultiHeadAttention`** -- confirmed, not assumed, and
+#     left deliberately unmatched. `MultiHeadAttention`'s own cross-
+#     attention shape (Q from one MatMul-fed rank-3 source, K/V from a
+#     genuinely different one, also rank-3) is already fully supported here
+#     (see the `MultiHeadAttention` bullet above) via the same generic
+#     :func:`_find_separate_qkv_chains` machinery -- but
+#     `DecoderMaskedMultiHeadAttention`'s own `key`/`value` inputs, per
+#     their own schema doc, take a genuinely *different shape* for cross
+#     attention than for self-attention: "Key with shape (batch_size, 1,
+#     hidden_size) for self attention **or past_key with shape
+#     (batch_size, num_heads, kv_sequence_length, head_size) for cross
+#     attention**" -- a pre-projected, already-BNSH-transposed rank-4
+#     tensor fed directly into `key`/`value`, not a rank-3
+#     `(batch_size, kv_sequence_length, hidden_size)` tensor from an
+#     ordinary MatMul producer the way `MultiHeadAttention`'s own
+#     cross-attention convention (and this whole section's `_match_producer`
+#     machinery) expects. Confirmed via two real `InferenceSession` runs,
+#     not doc-string-only: passing a rank-3 `key`/`value` pair with
+#     `kv_sequence_length != 1` (the shape a naive port of the
+#     `MultiHeadAttention` cross-attention test would use) runs to
+#     completion but produces silently **wrong** numbers (no error raised
+#     at all -- max-abs-diff ~1.1 against the numpy oracle, versus the
+#     rank-4 form's ~1.2e-7); the documented rank-4
+#     `(batch_size, num_heads, kv_sequence_length, head_size)` form matches
+#     the same oracle to ~1.2e-7. `_find_separate_qkv_chains`'s own
+#     `_match_producer`/`_match_matmul_like` machinery already declines
+#     that rank-4 shape by construction -- it isn't fed by a MatMul/
+#     vanilla-Gemm producer with a 2-D weight at all, so the per-branch
+#     "must be internal, must resolve via `_match_producer`" loop simply
+#     never matches it -- so no additional check was needed to keep this
+#     op's own cross-attention shape out of scope, but this is a genuine,
+#     confirmed scope boundary worth being explicit about, not an accident
+#     of some other unrelated check. (Separately: this op's own kernel also
+#     hard-requires `query`'s -- and, for the *self*-attention rank-3
+#     `key`/`value` form, their own -- sequence length to be exactly 1
+#     ("Input sequence length should be 1 to use
+#     DecoderMaskedMultiHeadAttention. Actual length is N" otherwise); this
+#     is a purely runtime-shape constraint on the graph's own actual batch/
+#     seq dimensions, invisible to this pass's static graph matching and
+#     unaffected by anything this pass slices, so it needed no code of its
+#     own -- noted here only because it explains why every
+#     `DecoderMaskedMultiHeadAttention` correctness test in
+#     `tests/test_pruning.py` below uses `seq_len=1` throughout.)
+#
+# Both ops' own dry-run mirrors (`_analyze_attention_head_pruning`/
+# `_analyze_attention_head_wanda_pruning`, via the shared
+# `_analyze_attention_chains`) and `_attention_not_eligible`'s own
+# "recognized but declined" reporting were updated identically -- a
+# `DecoderMaskedSelfAttention`/`DecoderMaskedMultiHeadAttention` node that
+# fails to match (the `do_rotary=1`/non-empty-constant-`past`/cross-
+# attention/mismatched-V-head-size cases above) is reported by name in
+# `not_eligible`, exactly like every other declined op-type in this
+# section, rather than silently vanishing from the report.
 _ATTENTION_DOMAIN = "com.microsoft"
 
 # The three quantized-cache dtypes `GroupQueryAttention`'s own `T_CACHE` type
@@ -12987,7 +13235,8 @@ _AttnLikeChain = Union[_AttentionChain, _GQAChain]
 def _match_attention_producer(
     node: onnx.NodeProto, initializer_map: Dict[str, onnx.TensorProto]
 ) -> Optional[Tuple[str, Optional[str], int, int, int, int]]:
-    """If `node` is a ``com.microsoft::Attention`` node with a constant 2-D
+    """If `node` is a ``com.microsoft::Attention`` *or*
+    ``com.microsoft::DecoderMaskedSelfAttention`` node with a constant 2-D
     float32 merged QKV weight ``[K, Nq+Nk+Nv]`` (and, if present, a
     constant 1-D float32 merged bias), returns
     ``(weight_name, bias_name_or_None, num_heads, Nq, Nk, Nv)``.
@@ -13018,9 +13267,75 @@ def _match_attention_producer(
     dynamic, absent, or a constant that resolves to the latter --
     :func:`_apply_one_plain_attention_chain` performs the actual slice once
     a match succeeds.
+
+    ``DecoderMaskedSelfAttention`` (schema confirmed live the same way,
+    ``since_version`` 1) is ONNX Runtime's own in-place rewrite target for a
+    step-of-1 decoder ``Attention`` node -- see this module's own
+    "Attention-head pruning" section comment for the full empirical
+    investigation (the real, shipped
+    `onnxruntime.transformers.convert_generation
+    .update_decoder_subgraph_use_decoder_masked_attention` rewrite this was
+    confirmed against). Its own schema shares `Attention`'s exact input
+    *positions* for everything this matcher/its caller touch --
+    `weights`/`bias`/`mask_index`/`attention_bias` sit at the identical
+    indices 1/2/3/5 -- so this function degenerates cleanly to the same
+    code path for it, with three differences this function accounts for:
+
+    - `past` (index 4) is *required* by this op's own schema (``Single``,
+      not `Attention`'s own ``Optional``) and, per its own doc, holds
+      combined key+value state shaped ``(2, batch_size, num_heads,
+      past_sequence_length, head_size)`` -- the same combined layout
+      `Attention`'s own (schema-optional, and never populated by any real
+      export this module has confirmed, so never validated here at all)
+      `past` input would have. A real step-of-1 decode export always
+      leaves this dynamic (an ordinary graph input threaded through every
+      decode call, updated in place) -- the caller's own runtime state, not
+      a weight this pass could safely reslice -- but a hand-built or
+      unusual graph could in principle bind a *constant* here; since this
+      function has no established, tested slicing path for it (unlike the
+      `past_key`/`past_value` pair every separate-Q/K/V op in this section
+      already handles via :func:`_past_kv_constants_are_sliceable`), a
+      constant `past` conservatively declines the whole match rather than
+      being left silently stale.
+    - `qkv_hidden_sizes` does not exist on this op's own schema at all
+      (confirmed by enumerating every attribute the live schema dump
+      reports for it: `do_rotary`, `mask_filter_value`, `scale`,
+      `past_present_share_buffer`, `num_heads` -- no `qkv_hidden_sizes`
+      member, despite this op's own doc *string* mentioning the phrase
+      verbatim, evidently copy-pasted from `Attention`'s own doc and never
+      edited) -- so this op always takes the "Schema default: Q/K/V evenly
+      split the merged width" branch below unconditionally, the exact
+      branch `Attention` itself already falls into whenever *its own*
+      (schema-optional, for `Attention`) `qkv_hidden_sizes` attribute is
+      absent. A node of this op type carrying an attribute of that name
+      anyway (a malformed or hand-edited graph -- this attribute has no
+      meaning to the real kernel, which never reads it) still declines the
+      match outright here, conservatively, rather than guessing whether
+      whatever produced it intended an uneven split this op's own kernel
+      could never actually honor.
+    - `do_rotary` (fused rotary position embedding computed inside the op
+      itself, no external `cos_cache`/`sin_cache` input on this op's own
+      schema at all) is declined outright when set (`!= 0`): see this
+      module's own "Attention-head pruning" section comment for the full
+      reasoning -- in short, this environment's CPU kernel for the closely
+      related `Attention` op explicitly does *not* implement `do_rotary` at
+      all ("Rotary embedding is not supported in Attention CPU kernel...",
+      confirmed via a real `onnxruntime.InferenceSession` run), and
+      `DecoderMaskedSelfAttention` itself has no CPU kernel in this
+      environment either (confirmed the same way -- `NOT_IMPLEMENTED`), so
+      there is no way to execute *either* op's own fused-rotary path here
+      to confirm per-head independence the way this module's own
+      :func:`_walk_back_through_qk_norm_rope` precedent (external,
+      graph-level `RotaryEmbedding`) was confirmed. `do_rotary=0` (the
+      schema default, and the only value ever actually exercised here)
+      matches unconditionally, same as `Attention` itself.
     """
-    if node.domain != _ATTENTION_DOMAIN or node.op_type != "Attention":
+    if node.domain != _ATTENTION_DOMAIN or node.op_type not in (
+        "Attention",
+        "DecoderMaskedSelfAttention",
+    ):
         return None
+    is_dmsa = node.op_type == "DecoderMaskedSelfAttention"
     if len(node.input) < 2:
         return None
     w_name = node.input[1]
@@ -13044,15 +13359,27 @@ def _match_attention_producer(
         ):
             return None
 
+    if is_dmsa and len(node.input) > 4 and node.input[4]:  # past
+        if node.input[4] in initializer_map:
+            return None  # no established/tested slicing path -- decline
+
     num_heads = None
     qkv_hidden_sizes: Optional[List[int]] = None
+    do_rotary = 0
     for attr in node.attribute:
         if attr.name == "num_heads":
             num_heads = attr.i
         elif attr.name == "qkv_hidden_sizes":
             qkv_hidden_sizes = list(attr.ints)
+        elif attr.name == "do_rotary":
+            do_rotary = attr.i
     if not num_heads or num_heads <= 0:
         return None
+    if is_dmsa:
+        if do_rotary:
+            return None  # fused RoPE -- no confirmed per-head-safe execution path here
+        if qkv_hidden_sizes is not None:
+            return None  # not a real attribute on this op's own schema -- decline
 
     if qkv_hidden_sizes is not None:
         if len(qkv_hidden_sizes) != 3:
@@ -13100,6 +13427,32 @@ def _reshape_last_dim(
         return None
     last = int(dims[-1])
     return last if last > 0 else None
+
+
+def _reshape_second_to_last_dim(
+    node: onnx.NodeProto, initializer_map: Dict[str, onnx.TensorProto]
+) -> Optional[int]:
+    """The :func:`_reshape_last_dim` analogue for the SECOND-to-last entry
+    of a 4-entry ``Reshape`` target shape -- used only by
+    :func:`_match_bnsh_reshape` below, whose own `[batch, seq, num_heads,
+    head_size]` target shape needs its `num_heads` entry (index `-2`, not
+    `-1` -- `head_size`, the actual last entry, never changes under head
+    pruning and is never touched) read the same deferred, wildcard-aware
+    way. Requires exactly 4 entries (this helper's one caller only ever
+    matches a reshape feeding a rank-4 BNSH `Transpose`, so a different
+    rank is never this shape at all) -- returns ``None`` for anything else,
+    including a wildcard/inferred ``-1``/``0`` entry.
+    """
+    if node.op_type != "Reshape" or len(node.input) != 2:
+        return None
+    shape_init = initializer_map.get(node.input[1])
+    if shape_init is None or shape_init.data_type != onnx.TensorProto.INT64:
+        return None
+    dims = onnx.numpy_helper.to_array(shape_init)
+    if dims.size != 4:
+        return None
+    second_to_last = int(dims[-2])
+    return second_to_last if second_to_last > 0 else None
 
 
 def _walk_to_attention_consumer(
@@ -13582,6 +13935,144 @@ def _match_multi_head_attention_producer(
                 return None  # doesn't statically resolve -- decline rather than guess
 
     if not _past_kv_constants_are_sliceable(node, initializer_map, (6, 7), num_heads):
+        return None
+
+    return num_heads, num_heads
+
+
+def _match_decoder_masked_multi_head_attention_producer(
+    node: onnx.NodeProto, initializer_map: Dict[str, onnx.TensorProto]
+) -> Optional[Tuple[int, int]]:
+    """If `node` is a ``com.microsoft::DecoderMaskedMultiHeadAttention`` node
+    this module can safely act on, returns ``(num_heads, num_heads)`` -- the
+    same shape :func:`_match_multi_head_attention_producer` returns for
+    `MultiHeadAttention`, `kv_num_heads` always equal to `num_heads` (this
+    op's own schema, confirmed live the same way, has exactly one head-count
+    attribute, `num_heads` -- no `kv_num_heads`).
+
+    This is ONNX Runtime's own in-place rewrite target for a step-of-1
+    decoder `MultiHeadAttention` node -- see this module's own
+    "Attention-head pruning" section comment for the full empirical
+    investigation (the real, shipped
+    `onnxruntime.transformers.convert_generation.replace_mha_with_dmmha`
+    rewrite this was confirmed against) and exactly why this gets its own
+    matcher function rather than widening
+    :func:`_match_multi_head_attention_producer`'s own op_type check the way
+    :func:`_match_attention_producer` does for `DecoderMaskedSelfAttention`:
+    unlike that merged-QKV pair, this op's own input *positions* genuinely
+    differ from `MultiHeadAttention`'s own at almost every index beyond
+    `query`/`key`/`value` (confirmed live, not assumed from the name
+    alone) -- `mask_index` at 3 (was `key_padding_mask` at 4),
+    `attention_bias` at 4 (was 5), `past_key`/`past_value` at 5/6 (was
+    6/7), three new optional inputs (`past_sequence_length`/`beam_width`/
+    `cache_indirection` at 7/8/9, all confirmed head-count-independent, see
+    below), and -- the one a single shared matcher accepting both op types
+    could too easily get wrong -- its own combined `bias` moves from index
+    3 to index **10**, the *last* input, not merely appended after new ones
+    (confirmed both off the live schema dump and independently off
+    `replace_mha_with_dmmha`'s own literal ``inputs=[...]`` list, which
+    builds exactly this reordering by hand). A single shared function
+    threading a per-op-type index table through every one of these would
+    have five different index tables to keep in sync instead of one; two
+    small, independently-readable matcher functions (mirroring this
+    section's own existing `GroupQueryAttention`-vs-`PagedAttention` /
+    plain-ai.onnx-`Attention` split, already four matcher functions deep
+    before this one) was judged the safer shape.
+
+    Confirmed, via actual onnxruntime execution (a real CPU kernel exists
+    for this op in this environment, unlike `DecoderMaskedSelfAttention`
+    below -- see this module's own "Attention-head pruning" section
+    comment), to differ from `MultiHeadAttention` in three ways this
+    function accounts for:
+
+    - `mask_index` (index 3), per its own doc, is one of the same several
+      shapes `MultiHeadAttention`'s own `key_padding_mask` documents --
+      none with a `num_heads`-sized axis -- so, like that input, it is
+      unconditionally head-count-independent and never inspected here.
+    - `attention_bias` (index 4, **not** 5) is confirmed to have the exact
+      same real, per-head numeric effect `MultiHeadAttention`'s own
+      analogous input already has (a hand-built model perturbing one
+      head's own slice of a connected constant changed only that head's
+      own output slice and no other, run end to end through a real
+      `onnxruntime.InferenceSession`) -- gets the identical
+      constant-resolves-cleanly-or-is-declined treatment via
+      :func:`_head_bias_axis`.
+    - `past_key`/`past_value` (indices 5/6, **not** 6/7) are laid out in
+      the identical BNSH format (`(batch_size, num_heads,
+      past_sequence_length, head_size)`, axis 1 the `num_heads` axis) as
+      every other op in this section's own `past_key`/`past_value`, so
+      reuse the same :func:`_past_kv_constants_are_sliceable` gate with no
+      `scale_indices` (this op's own schema has no `k_scale`/`v_scale`
+      inputs at all, confirmed off the same live schema dump). Empirically
+      confirmed further: this environment's CPU kernel additionally
+      *requires* `past_present_share_buffer=1` whenever `past_key`/
+      `past_value` are connected at all (a `false`-valued or absent
+      attribute fails outright, ``"past_present_share_buffer_ was
+      false"``) -- an implementation requirement beyond what the schema's
+      own optional-attribute framing alone would suggest, noted here since
+      it shapes how this op is actually exercised in
+      ``tests/test_pruning.py``, but not something this matcher itself
+      needs to check: `past_present_share_buffer` is passed through
+      untouched regardless of its value, the same as every other
+      op-level attribute this whole section doesn't rewrite.
+
+    `past_sequence_length` (index 7), `beam_width` (index 8), and
+    `cache_indirection` (index 9) are, per their own schema docs, a scalar
+    decode-position counter, a `[1]`-shaped beam-count scalar, and a
+    `[batch_size, beam_width, max_output_length]` buffer respectively --
+    none with a `num_heads`-sized axis anywhere -- so all three are
+    unconditionally left alone (never inspected here, never touched by
+    :func:`_apply_one_gqa_chain`), the same "ignored, not sliced" treatment
+    `mask_index` already gets. `output_qk` (an attribute, not an input --
+    "Need output the cross attention MatMul(Q, K)", producing an optional
+    4th node *output*) needs no handling either: an output's own shape is
+    whatever the runtime kernel produces for the node's own (already
+    correctly rewritten) `num_heads` attribute -- there is no static tensor
+    here to slice, the same reasoning every other matched op's own
+    `output`/`present`/`present_key`/`present_value` outputs already get
+    (never touched, never even named on :class:`_GQAChain`).
+
+    Cross-attention was investigated explicitly and found **not** to
+    compose the way it does for `MultiHeadAttention` -- deliberately left
+    unmatched here rather than assumed to work, see this module's own
+    "Attention-head pruning" section comment for the full empirical
+    finding (this op's own `key`/`value` inputs, per their own doc, take a
+    *different* shape for cross-attention than for self-attention -- a
+    pre-projected rank-4 `(batch_size, num_heads, kv_sequence_length,
+    head_size)` tensor fed directly, not `MultiHeadAttention`'s own rank-3
+    `(batch_size, kv_sequence_length, hidden_size)` MatMul-producer-fed
+    convention -- confirmed via real onnxruntime execution: a rank-3
+    `key`/`value` pair with `kv_sequence_length != 1` runs but produces
+    silently *wrong* numbers, no error at all, while the rank-4 form
+    matches a numpy oracle to ~1.2e-7). :func:`_find_separate_qkv_chains`'s
+    own `_match_producer`/`_match_matmul_like` machinery already declines
+    that rank-4 shape by construction (it isn't fed by a MatMul/vanilla-Gemm
+    producer with a 2-D weight at all), so no extra check is needed *here*
+    to keep it unmatched -- but this is a genuine, confirmed scope boundary
+    worth being explicit about, not an accident of some other check.
+    """
+    if (
+        node.domain != _ATTENTION_DOMAIN
+        or node.op_type != "DecoderMaskedMultiHeadAttention"
+    ):
+        return None
+    if len(node.input) < 3 or not (node.input[0] and node.input[1] and node.input[2]):
+        return None
+
+    num_heads = None
+    for attr in node.attribute:
+        if attr.name == "num_heads":
+            num_heads = attr.i
+    if not num_heads or num_heads <= 0:
+        return None
+
+    if len(node.input) > 4 and node.input[4]:  # attention_bias
+        bias_init = initializer_map.get(node.input[4])
+        if bias_init is not None and int(np.prod(bias_init.dims)) > 0:
+            if _head_bias_axis(list(bias_init.dims), num_heads) is None:
+                return None  # doesn't statically resolve -- decline rather than guess
+
+    if not _past_kv_constants_are_sliceable(node, initializer_map, (5, 6), num_heads):
         return None
 
     return num_heads, num_heads
@@ -14220,6 +14711,104 @@ def _match_packed_qkv_split(
 #   head count for whichever branch (Q's `num_heads`, K's `kv_num_heads`)
 #   it sits on; neither `cos_cache` nor `sin_cache` themselves ever need
 #   touching, having no head axis at all.
+# - `com.microsoft::MRotaryEmbedding` ("M-RoPE" -- the Qwen-VL family's own
+#   multimodal rotary embedding: Qwen2-VL, Qwen2.5-VL, Qwen3-VL,
+#   Qwen3-VL-MoE, Qwen3.5, Qwen3.5-MoE per the live schema's own doc string)
+#   shares plain `RotaryEmbedding`'s exact single-tensor-in/single-tensor-out
+#   shape (`input`/`position_ids`/`cos_cache`/`sin_cache` -> `output`,
+#   `position_ids` merely widened with a leading size-3 T/H/W axis) and its
+#   own `num_heads`/`rotary_embedding_dim`/`interleaved`/`is_packed_batching`
+#   attributes verbatim, plus two more: `mrope_section` (required, `INTS`,
+#   exactly 3 non-negative entries `[section_t, section_h, section_w]`
+#   summing to `rotary_embedding_dim / 2` or `head_size / 2`) and
+#   `mrope_layout` (optional `INT`, default `0`) selecting how the three
+#   sections are combined -- `0` "Sectioned/Chunked" (`[T]*section[0] +
+#   [H]*section[1] + [W]*section[2]`, used by Qwen2-VL/Qwen2.5-VL) or `1`
+#   "Interleaved" (T fills every position, H/W overwrite every 3rd position
+#   within their own `section[i]*3`-wide prefix, used by Qwen3-VL and
+#   later). Critically, both attributes partition only the cos/sin cache's
+#   own `half_rotary_embedding_dim` axis -- a property of `head_size`/
+#   `rotary_embedding_dim` and POSITION, never of head index or head count
+#   at all -- so this op is head-independent for ANY valid `mrope_section`/
+#   `mrope_layout` combination, not merely the common one, confirmed
+#   empirically (bit-identical results dropping an arbitrary,
+#   non-contiguous head subset before or after, for both `mrope_layout`
+#   values and a deliberately non-uniform `mrope_section` split -- see
+#   `tests/test_pruning.py`'s own
+#   `test_mrotary_embedding_is_head_independent_for_pruning`). The one
+#   `mrope_layout` value not matched here is anything other than the two
+#   the live schema itself documents (`0`/`1`) -- undocumented semantics
+#   this module doesn't guess are still head-independent, declined the same
+#   "unrecognized attribute value" way as everywhere else in this module
+#   (see `test_gqa_packed_qkv_mrope_pruning_declines_unsupported_mrope_layout`).
+#   One more real finding, orthogonal to safety but load-bearing for
+#   testing: unlike plain `RotaryEmbedding`, this op's own real CPU kernel
+#   REJECTS the schema's documented `num_heads=0` "infer from shape" default
+#   for rank-3 (flat) input outright (confirmed empirically: "MRotaryEmbedding:
+#   num_heads must be greater than 0 for rank-3 input") -- so in practice
+#   `num_heads` is always the *other* branch of this section's own rewrite
+#   rule (a genuine nonzero value, always rewritten to the new post-pruning
+#   head count), never the self-adjusting `0` case plain `RotaryEmbedding`
+#   can also take.
+# - `com.microsoft::GemmaRotaryEmbedding` (the Gemma family's own RoPE,
+#   confirmed live to implement the literal function its own doc string
+#   names -- HF's `modeling_gemma.py`) is a genuinely different SHAPE, not
+#   just a different op_type: five inputs `emb` (U -- float32 only,
+#   `(batch, seq_len, head_size)` -- confirmed empirically, not merely by
+#   the schema's own symbolic doc string: broadcasts directly against
+#   `q`'s/`q_rot`'s own full trailing `head_size` axis after `Unsqueeze`,
+#   unlike plain `RotaryEmbedding`'s own HALF-width `cos_cache`/`sin_cache`
+#   -- no head axis at all either way),
+#   `q`/`q_rot`/`k`/`k_rot` (T -- confirmed float16-ONLY in the live
+#   schema's own type constraint, no float32 entry at all), each
+#   `(batch, num_heads-or-kv_num_heads, seq_len, head_size)`; two outputs
+#   `output1`/`output2` (T), same shape as `q`/`k`. So ONE node call
+#   rotates BOTH Q's and K's own branch together (unlike `RotaryEmbedding`/
+#   `MRotaryEmbedding`, one call per branch) -- matched by a structurally
+#   different function, :func:`_walk_back_through_gemma_rope_pair`, called
+#   once with BOTH the attention op's own Q and K input names, rather than
+#   :func:`_walk_back_through_qk_norm_rope` being called once per branch
+#   (see that function's own docstring for the exact matched topology: its
+#   own `q_rot`/`k_rot` inputs must be the textbook `rotate_half` of the
+#   SAME tensor as `q`/`k` -- :func:`_match_rotate_half` -- and, because
+#   this op's own 4D BNSH input/output shape needs a `Reshape`+`Transpose`
+#   hop to/from the 3D shape every other root in this section recognizes
+#   (required on the input side always, confirmed necessary by the schema
+#   itself; required on the output side whenever the attention consumer
+#   itself only accepts 3D, e.g. `GroupQueryAttention` -- confirmed
+#   empirically: a 4D query against its own real CPU kernel fails with
+#   "Inputs 0 (query) shall be 3 dimensions", not merely undocumented; NOT
+#   required for the plain ai.onnx `Attention` op, whose own schema accepts
+#   a 4D `(batch, num_heads, seq, head_size)` Q/K input directly) --
+#   :func:`_match_bnsh_reshape`/:func:`_match_reverse_bnsh_reshape`).
+#   Nothing about this op's own arithmetic (`Sin`/`Cos` of `emb`, elementwise
+#   combined with `q`/`q_rot` or `k`/`k_rot`) or its `rotate_half` inputs
+#   (`Split`/`Neg`/`Concat`, confirmed to only ever touch the trailing
+#   `head_size` axis) mixes across heads, so this hop, like the other two,
+#   needs no slicing of any of its own constants either -- but its own
+#   `Reshape`+`Transpose` hops DO encode this branch's own head count as a
+#   literal in one place each (:class:`_QKNormRopePassThrough`'s own
+#   `bnsh_reshape_shape`/`output_reshape_shape` fields), which
+#   :func:`_apply_one_gqa_chain` rewrites the same deferred, wildcard-aware
+#   way `reshape_shape` already is. **This op has NO usable CPU kernel in
+#   this environment at all** -- confirmed empirically: even with graph
+#   optimization fully disabled (`ORT_DISABLE_ALL`), session creation still
+#   fails via the mandatory (always-on, not gated by optimization level)
+#   `CastFloat16Transformer` graph transformer inserting an
+#   `InsertedPrecisionFreeCast_q` node that itself violates the op's own
+#   float16-only type constraint ("Type 'tensor(float)' ... is invalid"),
+#   meaning there is no float32 fallback kernel either -- so, per this
+#   module's own `MatMulNBitsMlp`/`MatMulNBitsQkv`/`PagedAttention`
+#   precedent (search this file for "decompose a (pruned) fused node's own
+#   tensors back into equivalent"), this section's own tests instead
+#   decompose a (pruned) `GemmaRotaryEmbedding` node's own tensors into the
+#   literal onnxscript reference the schema's own doc string gives (`Sin`/
+#   `Cos`/`Unsqueeze`/`Mul`/`Add`, every one with a real ai.onnx CPU kernel)
+#   and run THAT through a real `InferenceSession` against an independently
+#   rebuilt, already-reduced oracle model, decomposed the same way -- see
+#   `tests/test_pruning.py`'s own
+#   `test_gemma_rotary_embedding_decomposition_is_head_independent_for_pruning`/
+#   `test_gqa_packed_qkv_gemma_rope_pruning_matches_decomposed_oracle`.
 #
 # A `Reshape`'s own two target-shape entries are `head_size` (never
 # changes) and this branch's flat width (`num_heads * head_size` or
@@ -14249,10 +14838,14 @@ class _QKNormRopePassThrough:
     crossed norm's `scale` nor a crossed `RotaryEmbedding`'s `cos_cache`/
     `sin_cache` ever needs touching. Two things still do:
 
-    - `rotary_node`: the crossed `RotaryEmbedding` node, or ``None`` when
-      RoPE wasn't crossed (norm-only, or neither). When present, its own
-      `num_heads` attribute -- whenever it isn't already the schema's `0`
-      -- is rewritten to this branch's new post-pruning head count.
+    - `rotary_node`: the crossed `RotaryEmbedding`/`MRotaryEmbedding` node,
+      or ``None`` when neither was crossed (norm-only, `GemmaRotaryEmbedding`
+      -- see below --, or neither). When present, its own `num_heads`
+      attribute -- whenever it isn't already the schema's `0` -- is
+      rewritten to this branch's new post-pruning head count (both ops
+      share this attribute's exact name/semantics, confirmed live -- see
+      this section's own comment above -- so one rewrite site already
+      covers both).
     - `reshape_shape`: the crossed post-norm `Reshape`'s own target-shape
       constant name, or ``None`` when that `Reshape`/norm sandwich wasn't
       crossed (RoPE-only, or neither). When present, its own last entry
@@ -14260,13 +14853,50 @@ class _QKNormRopePassThrough:
       value, mirroring how :func:`_apply_one_gqa_chain`'s existing
       `chain.chain_ops` loop already rewrites a *post*-attention-output
       Reshape's own target width.
+    - `extra_stale_outputs`: extra tensor names (beyond `nodes`'s own
+      `output[0]`s) whose `value_info` should also be treated as stale --
+      only ever populated by :func:`_walk_back_through_gemma_rope_pair`
+      for the *other* branch's own output of a single, jointly-consumed
+      `GemmaRotaryEmbedding` node (`q_embed`/`k_embed` are two outputs of
+      the *same* node -- see that function's own docstring -- so only one
+      of the Q/K hop's own `nodes` can hold that node object without
+      double-counting it; the branch that doesn't lists its own output
+      name here instead).
+    - `bnsh_reshape_shape`: only ever populated by
+      :func:`_walk_back_through_gemma_rope_pair`, for the ``Reshape``
+      immediately behind the ``Transpose(perm=[0, 2, 1, 3])`` that shapes a
+      3D root into the 4D BNSH tensor `GemmaRotaryEmbedding`'s own `q`/`k`
+      input requires (see :func:`_match_bnsh_reshape`'s own docstring for
+      why this hop, unlike every other one here, is structurally
+      *required* rather than optional for that op) -- its own SECOND-TO-LAST
+      target-shape entry (`num_heads`; the last entry, `head_size`, never
+      changes) is rewritten to this branch's new post-pruning head count,
+      the one other constant (besides `reshape_shape`/`rotary_node`'s own
+      `num_heads` attribute) this class ever names for
+      :func:`_apply_one_gqa_chain` to edit.
+    - `output_reshape_shape`: only ever populated by
+      :func:`_walk_back_through_gemma_rope_pair`, for the ``Reshape``
+      completing the MIRROR-IMAGE hop on `GemmaRotaryEmbedding`'s own
+      OUTPUT side -- back from 4D BNSH to flat 3D, required whenever the
+      attention consumer itself only accepts 3D (`GroupQueryAttention`;
+      see :func:`_match_reverse_bnsh_reshape`'s own docstring) -- rewritten
+      exactly like `reshape_shape`'s own last entry (this branch's flat
+      width); kept as its own field, distinct from `reshape_shape`, purely
+      because BOTH can be crossed on the same branch at once (a norm
+      sandwich ahead of `GemmaRotaryEmbedding` AND this reverse hop behind
+      it), and a single `Optional[str]` can't hold two names.
 
-    `nodes` lists every node actually crossed (any of `RotaryEmbedding`,
-    the post-norm `Reshape`, the `SimplifiedLayerNormalization`, and the
-    pre-norm `Reshape`, in that order, whichever were present) purely for
+    `nodes` lists every node actually crossed (any of `RotaryEmbedding`/
+    `MRotaryEmbedding`/`GemmaRotaryEmbedding` plus, for the latter, its own
+    `rotate_half` subgraph -- see :func:`_match_rotate_half` --, its own
+    required BNSH `Transpose`+`Reshape` -- see :func:`_match_bnsh_reshape`
+    --, and its own optional reverse `Reshape`+`Transpose` -- see
+    :func:`_match_reverse_bnsh_reshape` --, the post-norm `Reshape`, the
+    `SimplifiedLayerNormalization`, and the pre-norm `Reshape`, in that
+    order, whichever were present) purely for
     :func:`_apply_attention_chains`'s own stale-`value_info` bookkeeping --
     every one of their own output tensors is narrower after pruning even
-    though, per the two fields above, only two of them ever need editing.
+    though, per the fields above, only four of them ever need editing.
     Never empty when this class is actually constructed --
     :func:`_walk_back_through_qk_norm_rope` returns ``None`` instead of an
     empty-`nodes` instance when nothing was crossed.
@@ -14275,6 +14905,9 @@ class _QKNormRopePassThrough:
     nodes: Tuple[onnx.NodeProto, ...]
     rotary_node: Optional[onnx.NodeProto] = None
     reshape_shape: Optional[str] = None
+    extra_stale_outputs: Tuple[str, ...] = ()
+    bnsh_reshape_shape: Optional[str] = None
+    output_reshape_shape: Optional[str] = None
 
 
 def _walk_back_through_qk_norm_rope(
@@ -14334,29 +14967,60 @@ def _walk_back_through_qk_norm_rope(
     describes what was crossed.
     """
 
-    def _is_internal(n: str) -> bool:
-        return len(consumers_of.get(n, [])) == 1 and n not in graph_outputs
-
     nodes: List[onnx.NodeProto] = []
     rotary_node: Optional[onnx.NodeProto] = None
-    reshape_shape: Optional[str] = None
     cur = name
 
     rope = node_by_output.get(cur)
     if (
         rope is not None
         and rope.domain == _ATTENTION_DOMAIN
-        and rope.op_type == "RotaryEmbedding"
+        and rope.op_type in _ROTARY_SINGLE_TENSOR_OPS
         and len(rope.input) >= 1
         and rope.input[0]
         and len(rope.output) == 1
         and rope.output[0] == cur
-        and _is_internal(rope.input[0])
+        and len(consumers_of.get(rope.input[0], [])) == 1
+        and rope.input[0] not in graph_outputs
+        and _rotary_op_attrs_are_supported(rope)
     ):
         rotary_node = rope
         nodes.append(rope)
         cur = rope.input[0]
 
+    cur, norm_nodes, reshape_shape = _walk_back_through_qk_norm(
+        cur, initializer_map, consumers_of, graph_outputs, node_by_output
+    )
+    nodes.extend(norm_nodes)
+
+    if not nodes:
+        return name, None
+    return cur, _QKNormRopePassThrough(tuple(nodes), rotary_node, reshape_shape)
+
+
+def _walk_back_through_qk_norm(
+    name: str,
+    initializer_map: Dict[str, onnx.TensorProto],
+    consumers_of: Dict[str, List[onnx.NodeProto]],
+    graph_outputs: Set[str],
+    node_by_output: Dict[str, onnx.NodeProto],
+) -> Tuple[str, List[onnx.NodeProto], Optional[str]]:
+    """The `Reshape` -> `SimplifiedLayerNormalization` -> `Reshape` "per-head
+    norm" sandwich half of :func:`_walk_back_through_qk_norm_rope`'s own
+    walk, factored out so :func:`_walk_back_through_gemma_rope_pair` can
+    cross the identical sandwich (with the identical validation rigor)
+    behind a ``com.microsoft::GemmaRotaryEmbedding`` node's own `q`/`k`
+    inputs -- see that function's own docstring for why. Returns
+    `(root_name, nodes, reshape_shape)`: `nodes`/`reshape_shape` are empty/
+    ``None`` when the sandwich wasn't crossed (`root_name` is `name` itself
+    then), exactly mirroring :func:`_walk_back_through_qk_norm_rope`'s own
+    return-value shape for this half.
+    """
+
+    def _is_internal(n: str) -> bool:
+        return len(consumers_of.get(n, [])) == 1 and n not in graph_outputs
+
+    cur = name
     reshape2 = node_by_output.get(cur)
     if (
         reshape2 is not None
@@ -14404,13 +15068,575 @@ def _walk_back_through_qk_norm_rope(
                 and reshape1.output[0] == norm_node.input[0]
                 and _is_internal(reshape1.input[0])
             ):
-                nodes.extend([reshape2, norm_node, reshape1])
-                reshape_shape = reshape2.input[1]
-                cur = reshape1.input[0]
+                return (
+                    reshape1.input[0],
+                    [reshape2, norm_node, reshape1],
+                    reshape2.input[1],
+                )
 
-    if not nodes:
-        return name, None
-    return cur, _QKNormRopePassThrough(tuple(nodes), rotary_node, reshape_shape)
+    return name, [], None
+
+
+# `com.microsoft::MRotaryEmbedding`'s own schema (confirmed live, the same
+# way -- see this section's own comment above) shares `RotaryEmbedding`'s
+# exact single-tensor-in/single-tensor-out shape (`input`/`position_ids`/
+# `cos_cache`/`sin_cache` -> `output`, `position_ids` merely widened with a
+# leading size-3 T/H/W axis RotaryEmbedding's own doesn't have) and its own
+# `num_heads` attribute (identical name/semantics -- "0 means infer from the
+# input's own trailing width", confirmed by the schema's own doc string) --
+# so it's matched by the exact same single-tensor hop check
+# :func:`_walk_back_through_qk_norm_rope` already applies to plain
+# `RotaryEmbedding`, just widened to accept either op_type.
+_ROTARY_SINGLE_TENSOR_OPS = frozenset({"RotaryEmbedding", "MRotaryEmbedding"})
+
+# `MRotaryEmbedding`'s own `mrope_section`/`mrope_layout` partition the
+# cos/sin cache's own `half_rotary_embedding_dim` axis among three position
+# streams (T/H/W) -- confirmed, by the schema's own doc string (see this
+# section's own comment above), to be an axis of the *cache*, indexed only
+# by `rotary_embedding_dim`/`head_size` and position, never by head index or
+# head count at all. Empirically confirmed head-independent for both
+# `mrope_layout` values the schema documents (0 "Sectioned/Chunked", 1
+# "Interleaved") and for an arbitrary, non-uniform `mrope_section` split --
+# dropping an arbitrary, non-contiguous subset of heads before or after this
+# op gives bit-identical results for the surviving heads either way, exactly
+# `test_rotary_embedding_is_head_independent_for_pruning`'s own confirmation
+# for plain `RotaryEmbedding`, mirrored for this op by
+# `test_mrotary_embedding_is_head_independent_for_pruning`. So, unlike
+# `GemmaRotaryEmbedding` below, no `mrope_section`/`mrope_layout` VALUE ever
+# needs declining on safety grounds -- the one thing this module still
+# declines is a `mrope_layout` value OTHER than the two the schema itself
+# documents (its own doc string only defines 0 and 1; anything else has no
+# confirmed semantics at all, so this module doesn't guess at whether it's
+# still head-independent) -- never guessed at, the same "unrecognized
+# attribute value, decline" bar this module holds everywhere else.
+_MROPE_VALID_LAYOUTS = frozenset({0, 1})
+
+
+def _rotary_op_attrs_are_supported(node: onnx.NodeProto) -> bool:
+    """`True` for a plain `RotaryEmbedding` node (no attribute of its own
+    this walk needs to gate on) or an `MRotaryEmbedding` node whose own
+    `mrope_layout` attribute -- when present at all; its schema default is
+    the documented `0` -- is one of the two values
+    `_MROPE_VALID_LAYOUTS` names. `False` (decline) for anything else,
+    including a genuinely malformed node this function's caller wouldn't
+    otherwise have rejected."""
+    if node.op_type != "MRotaryEmbedding":
+        return True
+    for attr in node.attribute:
+        if attr.name == "mrope_layout":
+            return attr.i in _MROPE_VALID_LAYOUTS
+    return True  # attribute absent -- schema default (0), always supported
+
+
+def _match_rotate_half(
+    name: str,
+    expected_root: str,
+    initializer_map: Dict[str, onnx.TensorProto],
+    consumers_of: Dict[str, List[onnx.NodeProto]],
+    graph_outputs: Set[str],
+    node_by_output: Dict[str, onnx.NodeProto],
+) -> Optional[List[onnx.NodeProto]]:
+    """Confirms `name` is produced by the textbook "rotate_half" subgraph --
+    `x1, x2 = x.chunk(2, dim=-1); return cat((-x2, x1), dim=-1)` -- rooted
+    at `expected_root`, the exact function `com.microsoft::GemmaRotaryEmbedding`'s
+    own doc string names ("It implements ... from modeling_gemma.py") and the
+    same convention shared by essentially every popular decoder LLM's own
+    rotary embedding (`transformers`' own `modeling_llama.py`/
+    `modeling_gemma.py`/etc. all define and reuse the identical helper) --
+    used here to confirm `GemmaRotaryEmbedding`'s own `q_rot`/`k_rot` input
+    is a deterministic, per-head-local (never cross-head-mixing) function of
+    the *same* tensor as its own `q`/`k` input, the property that makes
+    crossing this node safe under head pruning at all (see
+    :func:`_walk_back_through_gemma_rope_pair`'s own docstring): `Split`
+    (opset-13+ tensor-input form or the plain attribute form -- both,
+    per the op's own schema, defaulting to an even split across
+    `num_outputs=2` when no explicit sizes are given) and `Concat`/`Neg`
+    only ever operate along the trailing (`head_size`) axis here, never
+    touching the head-count axis at all -- exactly the same "safe by
+    construction, nothing head-shaped to mis-slice" argument already
+    established for a crossed norm's own `scale` and a crossed
+    `RotaryEmbedding`'s own `cos_cache`/`sin_cache`.
+
+    Returns the three matched nodes (`Concat`, `Neg`, `Split`, in that
+    order) on a match, so the caller can fold them into its own
+    :class:`_QKNormRopePassThrough` -- `nodes` for stale-`value_info`
+    bookkeeping (every one of their own outputs is narrower after pruning,
+    same as every other hop node in this section); ``None`` (decline)
+    otherwise, including whenever `name`/`expected_root` isn't exactly this
+    shape -- a `Slice`-based half-split, a `Split` whose sizes aren't
+    exactly even, or a `Concat` order other than `(-x2, x1)` isn't guessed
+    at, only this one confirmed, textbook shape is matched.
+    """
+
+    def _is_internal(n: str) -> bool:
+        return len(consumers_of.get(n, [])) == 1 and n not in graph_outputs
+
+    concat = node_by_output.get(name)
+    if (
+        concat is None
+        or concat.domain != ""
+        or concat.op_type != "Concat"
+        or len(concat.input) != 2
+        or not concat.input[0]
+        or not concat.input[1]
+        or len(concat.output) != 1
+        or concat.output[0] != name
+    ):
+        return None
+    concat_axis = None
+    for attr in concat.attribute:
+        if attr.name == "axis":
+            concat_axis = attr.i
+    if concat_axis != -1:
+        return None
+
+    neg_out, x1_out = concat.input
+    if not _is_internal(neg_out):
+        return None
+    neg = node_by_output.get(neg_out)
+    if (
+        neg is None
+        or neg.domain != ""
+        or neg.op_type != "Neg"
+        or len(neg.input) != 1
+        or not neg.input[0]
+        or len(neg.output) != 1
+        or neg.output[0] != neg_out
+    ):
+        return None
+    x2_out = neg.input[0]
+    if not x2_out or not _is_internal(x2_out):
+        return None
+
+    split = node_by_output.get(x1_out)
+    if (
+        split is None
+        or split.domain != ""
+        or split.op_type != "Split"
+        or len(split.output) != 2
+        or split.output[0] != x1_out
+        or split.output[1] != x2_out
+        or not split.input
+        or split.input[0] != expected_root
+    ):
+        return None
+    split_axis = 0  # `Split`'s own schema default when `axis` is absent
+    for attr in split.attribute:
+        if attr.name == "axis":
+            split_axis = attr.i
+    if split_axis != -1:
+        return None
+    if len(split.input) >= 2 and split.input[1]:
+        # The opset-13+ tensor-sizes form: only accepted when the sizes are
+        # a resolvable constant splitting the axis into two exactly equal,
+        # strictly positive halves. Unlike every other constant this module
+        # tracks a single-consumer requirement for (e.g.
+        # :func:`_match_packed_qkv_split`'s own split-sizes, which DOES get
+        # overwritten in place post-pruning), this constant is never
+        # written to at all: it splits the `head_size` axis exactly in
+        # half, and `head_size` itself never changes under whole-head
+        # pruning -- so it's left completely alone, safe to be a shared
+        # constant reused by both Q's and K's own `rotate_half` (the common
+        # shape, confirmed by construction: nothing else in this module
+        # would ever need to slice it either).
+        sizes_init = initializer_map.get(split.input[1])
+        if sizes_init is None or sizes_init.data_type != onnx.TensorProto.INT64:
+            return None
+        if list(sizes_init.dims) != [2]:
+            return None
+        sizes = onnx.numpy_helper.to_array(sizes_init)
+        if sizes[0] <= 0 or sizes[0] != sizes[1]:
+            return None
+    return [concat, neg, split]
+
+
+def _match_bnsh_reshape(
+    name: str,
+    initializer_map: Dict[str, onnx.TensorProto],
+    consumers_of: Dict[str, List[onnx.NodeProto]],
+    graph_outputs: Set[str],
+    node_by_output: Dict[str, onnx.NodeProto],
+) -> Optional[Tuple[str, List[onnx.NodeProto], Optional[str]]]:
+    """Matches the textbook ``.view(batch, seq, num_heads, head_size)
+    .transpose(1, 2)`` idiom -- near-universal across PyTorch-based
+    attention implementations for turning a projection's own flat
+    ``(batch, seq, num_heads * head_size)`` output into the per-head-major
+    "BNSH" ``(batch, num_heads, seq, head_size)`` layout -- rooted at
+    `name`. Needed because every 3D root this section otherwise recognizes
+    (a packed-QKV `Split`'s own raw output, or the CPU/DirectML Q/K-norm
+    sandwich's own final `Reshape` output -- see this section's own comment
+    above) is 3D, while `com.microsoft::GemmaRotaryEmbedding`'s own schema
+    requires a 4D BNSH `q`/`k` input (confirmed live -- see this section's
+    own comment above): SOME shape-only hop -- never touching which value
+    belongs to which head, only reorganizing/reordering axes -- must always
+    sit between the two, in any schema-valid graph using this op, so this
+    function recognizes the one confirmed, universally standard shape
+    (never a `Slice`-based or differently-permuted variant, which isn't
+    guessed at).
+
+    - `Transpose` (`name`'s own producer): exactly one input, `perm ==
+      [0, 2, 1, 3]` exactly (swap the seq/head axes, nothing else).
+    - Its own input, in turn, produced by a `Reshape` with a constant
+      int64 4-entry target shape (`[batch_dim, seq_dim, num_heads,
+      head_size]`) -- `head_size` (the actual last entry) is never
+      inspected/touched (a property of `d`, which head pruning never
+      changes); `num_heads` (the second-to-last entry, read via
+      :func:`_reshape_second_to_last_dim`'s own deferred, wildcard-aware
+      check) is the one entry that DOES need rewriting post-pruning, same
+      "only when it's a resolvable literal, never guessed at" bar
+      :func:`_reshape_last_dim`'s own callers already hold their own
+      target-shape entries to.
+
+    Every edge crossed must be internal (single consumer, not a graph
+    output) -- the same bar every other hop in this section already holds.
+    Returns `(root, nodes, reshape_shape)` -- `nodes` is `[transpose,
+    reshape]`, `reshape_shape` is the `Reshape`'s own target-shape constant
+    name (``None`` only when that entry isn't itself a resolvable literal,
+    i.e. this branch's `num_heads` was already 0/dynamic and self-adjusts,
+    mirroring `RotaryEmbedding`'s own `num_heads=0` "infer from shape" case)
+    -- on a match; ``None`` entirely on no match.
+    """
+
+    def _is_internal(n: str) -> bool:
+        return len(consumers_of.get(n, [])) == 1 and n not in graph_outputs
+
+    transpose = node_by_output.get(name)
+    if (
+        transpose is None
+        or transpose.domain != ""
+        or transpose.op_type != "Transpose"
+        or len(transpose.input) != 1
+        or not transpose.input[0]
+        or len(transpose.output) != 1
+        or transpose.output[0] != name
+        or not _is_internal(transpose.input[0])
+    ):
+        return None
+    perm = None
+    for attr in transpose.attribute:
+        if attr.name == "perm":
+            perm = list(attr.ints)
+    if perm != [0, 2, 1, 3]:
+        return None
+
+    reshape = node_by_output.get(transpose.input[0])
+    if (
+        reshape is None
+        or reshape.domain != ""
+        or reshape.op_type != "Reshape"
+        or len(reshape.input) != 2
+        or not reshape.input[0]
+        or len(reshape.output) != 1
+        or reshape.output[0] != transpose.input[0]
+        or not _is_internal(reshape.input[0])
+        or len(consumers_of.get(reshape.input[1], [])) != 1
+    ):
+        return None
+    shape_init = initializer_map.get(reshape.input[1])
+    if shape_init is None or shape_init.data_type != onnx.TensorProto.INT64:
+        return None
+    if onnx.numpy_helper.to_array(shape_init).size != 4:
+        return None
+
+    num_heads_literal = _reshape_second_to_last_dim(reshape, initializer_map)
+    reshape_shape = reshape.input[1] if num_heads_literal is not None else None
+    return reshape.input[0], [transpose, reshape], reshape_shape
+
+
+def _match_reverse_bnsh_reshape(
+    name: str,
+    initializer_map: Dict[str, onnx.TensorProto],
+    consumers_of: Dict[str, List[onnx.NodeProto]],
+    graph_outputs: Set[str],
+    node_by_output: Dict[str, onnx.NodeProto],
+) -> Optional[Tuple[str, List[onnx.NodeProto], Optional[str]]]:
+    """The reverse of :func:`_match_bnsh_reshape`: `Transpose(perm=[0, 2, 1,
+    3])` back to `(batch, seq, num_heads, head_size)` then `Reshape` to flat
+    `(batch, seq, num_heads * head_size)`, walked *backward* from `name`
+    (an attention consumer's own Q or K input). Needed on the OUTPUT side
+    of a `GemmaRotaryEmbedding` node for exactly the mirror-image reason
+    :func:`_match_bnsh_reshape` is needed on its INPUT side: that node's
+    own outputs are always 4D BNSH (same schema fact -- see this section's
+    own comment above), while `com.microsoft::GroupQueryAttention`'s own
+    schema requires a strictly 3D Q/K input (confirmed empirically: a 4D
+    Q input against this op's own real CPU kernel fails with `"Inputs 0
+    (query) shall be 3 dimensions"`, not merely undocumented) -- so in any
+    schema-valid `GemmaRotaryEmbedding` + `GroupQueryAttention` composition,
+    this reverse hop MUST be present. (The plain ai.onnx `Attention` op, by
+    contrast, accepts a 4D Q/K input directly per its own schema -- so this
+    hop is genuinely optional, crossed only when present, exactly like
+    every other hop in this section.)
+
+    Returns `(root, nodes, reshape_shape)` -- `root` is the `Transpose`'s
+    own input (expected, by the caller, to be one of `GemmaRotaryEmbedding`'s
+    own two outputs), `nodes` is `[reshape, transpose]` (note the reverse
+    order vs. :func:`_match_bnsh_reshape` -- this walks backward from the
+    `Reshape`, which sits closer to `name`), `reshape_shape` is that
+    `Reshape`'s own target-shape constant name via :func:`_reshape_last_dim`'s
+    same deferred, wildcard-aware convention (its own LAST entry -- this
+    branch's flat width -- is what needs rewriting here, the same
+    convention :class:`_QKNormRopePassThrough`'s own `reshape_shape` field
+    already holds for the pre-node norm sandwich's post-norm `Reshape`; a
+    dedicated `output_reshape_shape` field keeps the two from colliding
+    when both a norm sandwich AND this reverse hop are crossed on the same
+    branch). ``None`` entirely on no match (`name` isn't produced by this
+    exact shape at all -- including simply not being produced by a
+    `Reshape` in the first place, the common case when this hop isn't
+    present).
+    """
+
+    def _is_internal(n: str) -> bool:
+        return len(consumers_of.get(n, [])) == 1 and n not in graph_outputs
+
+    reshape = node_by_output.get(name)
+    if (
+        reshape is None
+        or reshape.domain != ""
+        or reshape.op_type != "Reshape"
+        or len(reshape.input) != 2
+        or not reshape.input[0]
+        or len(reshape.output) != 1
+        or reshape.output[0] != name
+        or not _is_internal(reshape.input[0])
+        or _reshape_last_dim(reshape, initializer_map) is None
+        or len(consumers_of.get(reshape.input[1], [])) != 1
+    ):
+        return None
+
+    transpose = node_by_output.get(reshape.input[0])
+    if (
+        transpose is None
+        or transpose.domain != ""
+        or transpose.op_type != "Transpose"
+        or len(transpose.input) != 1
+        or not transpose.input[0]
+        or len(transpose.output) != 1
+        or transpose.output[0] != reshape.input[0]
+    ):
+        return None
+    perm = None
+    for attr in transpose.attribute:
+        if attr.name == "perm":
+            perm = list(attr.ints)
+    if perm != [0, 2, 1, 3]:
+        return None
+
+    return transpose.input[0], [reshape, transpose], reshape.input[1]
+
+
+def _walk_back_through_gemma_rope_pair(
+    q_name: str,
+    k_name: str,
+    initializer_map: Dict[str, onnx.TensorProto],
+    consumers_of: Dict[str, List[onnx.NodeProto]],
+    graph_outputs: Set[str],
+    node_by_output: Dict[str, onnx.NodeProto],
+) -> Optional[Tuple[str, str, _QKNormRopePassThrough, _QKNormRopePassThrough]]:
+    """`com.microsoft::GemmaRotaryEmbedding`'s own schema (confirmed live,
+    the same way as every other schema fact in this section) is a genuinely
+    different SHAPE from `RotaryEmbedding`/`MRotaryEmbedding`, not just a
+    different op_type accepted by the same check: inputs, in order, `emb`
+    (U -- float32, `(batch, seq_len, head_size)` -- confirmed empirically to
+    broadcast against `q`'s/`q_rot`'s own FULL trailing axis, not a
+    half-width cache the way plain `RotaryEmbedding`'s own `cos_cache`/
+    `sin_cache` are -- no head axis at all either way -- the
+    position-dependent angle the node itself takes `Sin`/`Cos` of
+    internally), `q`/`q_rot`/`k`/`k_rot` (T -- confirmed
+    float16-ONLY, no float32 type entry in the live schema's own type
+    constraint at all, see this section's own comment above), each
+    `(batch, num_heads-or-kv_num_heads, seq_len, head_size)`; outputs
+    `output1`/`output2` (T), the rotated Q/K, same shape as `q`/`k`. So a
+    SINGLE node call handles BOTH Q's and K's own rotation together (unlike
+    `RotaryEmbedding`/`MRotaryEmbedding`, one call per branch) -- this
+    function is therefore called *once*, from :func:`_find_separate_qkv_chains`,
+    with BOTH the attention op's own Q and K input names together, instead
+    of :func:`_walk_back_through_qk_norm_rope` being called once per branch;
+    that function's own single-tensor hop check structurally never matches
+    this op at all (`len(rope.output) == 1` alone already excludes it), so
+    the two never overlap/double-match the same node.
+
+    Matches only when:
+
+    - `q_name`/`k_name` are respectively `output1`/`output2` of the exact
+      SAME `com.microsoft::GemmaRotaryEmbedding` node (five inputs, two
+      outputs, per the schema above) -- both internal (single consumer, not
+      a graph output), the same bar every hop in this section already
+      holds.
+    - That node's own `q`/`k` inputs are themselves internal.
+    - That node's own `q_rot`/`k_rot` inputs each match
+      :func:`_match_rotate_half` rooted at the node's OWN `q`/`k` input
+      respectively -- confirming `q_rot`/`k_rot` are a deterministic,
+      per-head-local function of the exact same tensor as `q`/`k` (not of
+      some other, unrelated tensor), which is what makes crossing this
+      node safe under head pruning: nothing about the node's own
+      arithmetic (`Sin`/`Cos` of `emb`, elementwise combined with `q`/
+      `q_rot` or `k`/`k_rot`) or its `rotate_half` inputs ever mixes across
+      heads, exactly the same "safe by construction" argument already
+      established for `SimplifiedLayerNormalization`'s own `scale` and
+      `RotaryEmbedding`'s own `cos_cache`/`sin_cache` (see this section's
+      own comment above) -- confirmed for the underlying decomposed
+      arithmetic via a real `InferenceSession` run against a numpy oracle
+      in `tests/test_pruning.py`'s own
+      ``test_gemma_rotary_embedding_decomposition_is_head_independent_for_pruning``,
+      since the fused node itself has no usable CPU kernel in this
+      environment to run directly (see this section's own comment above
+      for the exact `CastFloat16Transformer` failure this was confirmed
+      with).
+    - `emb` is read but never itself checked/sliced -- per the schema
+      above it has no head axis at all, so nothing about it can go stale
+      under head pruning.
+
+    From there, `q`/`k` (the node's own inputs, NOT `q_rot`/`k_rot`, which
+    this function never walks further back through -- only their own
+    `rotate_half` root, already confirmed to be `q`/`k` itself, matters)
+    are each walked further back through the same optional per-head norm
+    sandwich :func:`_walk_back_through_qk_norm_rope` already crosses (via
+    the shared :func:`_walk_back_through_qk_norm` helper both functions
+    now call), so a `GemmaRotaryEmbedding` sitting *on top of* the CPU/
+    DirectML Q/K-norm sandwich (norm first, then this fused RoPE node,
+    mirroring `make_attention_qk_rope_and_norm`'s own "norm first" order
+    for the plain-`RotaryEmbedding` shape) is still recognized.
+
+    Returns ``(root_q, root_k, q_hop, k_hop)`` on a match; ``None``
+    (decline -- caller falls back to :func:`_walk_back_through_qk_norm_rope`'s
+    own per-branch walk, which simply won't match this node at all) on any
+    of the above failing.
+    """
+
+    def _is_internal(n: str) -> bool:
+        return len(consumers_of.get(n, [])) == 1 and n not in graph_outputs
+
+    if not _is_internal(q_name) or not _is_internal(k_name):
+        return None
+
+    # `GemmaRotaryEmbedding`'s own outputs are always 4D BNSH; an optional
+    # `Transpose`+`Reshape` hop (:func:`_match_reverse_bnsh_reshape`) may
+    # sit between it and the attention consumer's own 3D-only Q/K input
+    # (`GroupQueryAttention`) -- crossed here, on `q_name`/`k_name`
+    # themselves, BEFORE identifying the node, so `q_pre`/`k_pre` name
+    # whichever of the node's own two outputs actually feeds this hop (or
+    # `q_name`/`k_name` unchanged when the attention consumer accepts 4D
+    # BNSH directly, e.g. the plain ai.onnx `Attention` op).
+    q_reverse_bnsh = _match_reverse_bnsh_reshape(
+        q_name, initializer_map, consumers_of, graph_outputs, node_by_output
+    )
+    k_reverse_bnsh = _match_reverse_bnsh_reshape(
+        k_name, initializer_map, consumers_of, graph_outputs, node_by_output
+    )
+    q_pre = q_reverse_bnsh[0] if q_reverse_bnsh is not None else q_name
+    q_reverse_nodes = q_reverse_bnsh[1] if q_reverse_bnsh is not None else []
+    q_output_reshape_shape = q_reverse_bnsh[2] if q_reverse_bnsh is not None else None
+    k_pre = k_reverse_bnsh[0] if k_reverse_bnsh is not None else k_name
+    k_reverse_nodes = k_reverse_bnsh[1] if k_reverse_bnsh is not None else []
+    k_output_reshape_shape = k_reverse_bnsh[2] if k_reverse_bnsh is not None else None
+    if not _is_internal(q_pre) or not _is_internal(k_pre):
+        return None
+
+    node = node_by_output.get(q_pre)
+    if (
+        node is None
+        or node is not node_by_output.get(k_pre)
+        or node.domain != _ATTENTION_DOMAIN
+        or node.op_type != "GemmaRotaryEmbedding"
+        or len(node.input) != 5
+        or len(node.output) != 2
+        or node.output[0] != q_pre
+        or node.output[1] != k_pre
+    ):
+        return None
+    emb, q_in, q_rot_in, k_in, k_rot_in = node.input
+    if not emb or not q_in or not q_rot_in or not k_in or not k_rot_in:
+        return None
+    if q_in == k_in:
+        return None  # degenerate -- can't independently slice a shared branch
+
+    q_rotate_half = _match_rotate_half(
+        q_rot_in, q_in, initializer_map, consumers_of, graph_outputs, node_by_output
+    )
+    if q_rotate_half is None:
+        return None
+    k_rotate_half = _match_rotate_half(
+        k_rot_in, k_in, initializer_map, consumers_of, graph_outputs, node_by_output
+    )
+    if k_rotate_half is None:
+        return None
+
+    # `q_in`/`k_in` are each consumed by exactly TWO things -- this node's
+    # own `q`/`k` input slot, and `q_rotate_half`'s/`k_rotate_half`'s own
+    # `Split` (the last of the three nodes :func:`_match_rotate_half`
+    # returns, confirmed rooted at `q_in`/`k_in` respectively) -- never
+    # anything else. Unlike every other hop in this section, `q_in`/`k_in`
+    # genuinely can't be single-consumer (`GemmaRotaryEmbedding`'s own
+    # `q`/`q_rot` -- see this section's own comment above -- are both
+    # functions of the SAME upstream tensor by construction), so this is
+    # the two-consumer analogue of the `_is_internal` bar every other
+    # crossed edge in this module still holds: a genuine THIRD consumer
+    # would mean some other node depends on the un-pruned shape this pass
+    # doesn't itself verify, and is declined here rather than risking that.
+    q_split, k_split = q_rotate_half[-1], k_rotate_half[-1]
+    if q_in in graph_outputs or k_in in graph_outputs:
+        return None
+    if {id(c) for c in consumers_of.get(q_in, [])} != {id(node), id(q_split)}:
+        return None
+    if len(consumers_of.get(q_in, [])) != 2:
+        return None
+    if {id(c) for c in consumers_of.get(k_in, [])} != {id(node), id(k_split)}:
+        return None
+    if len(consumers_of.get(k_in, [])) != 2:
+        return None
+
+    # `q_in`/`k_in` themselves are always 4D (BNSH) -- required by
+    # `GemmaRotaryEmbedding`'s own schema -- while every root
+    # :func:`_walk_back_through_qk_norm` (and, transitively, the packed
+    # `Split` it bottoms out at) recognizes is 3D; see
+    # :func:`_match_bnsh_reshape`'s own docstring for why crossing that
+    # shape-only ``Reshape``+``Transpose`` hop first is *required*, not
+    # optional, for this op specifically (unlike the plain-`RotaryEmbedding`
+    # hop, whose own single tensor is already 3D throughout). Declines
+    # (falls back to treating `q_in`/`k_in` as already-3D, which will then
+    # simply fail to resolve to the shared `Split` and decline the whole
+    # chain the usual way) whenever that hop isn't itself matched.
+    q_bnsh = _match_bnsh_reshape(
+        q_in, initializer_map, consumers_of, graph_outputs, node_by_output
+    )
+    k_bnsh = _match_bnsh_reshape(
+        k_in, initializer_map, consumers_of, graph_outputs, node_by_output
+    )
+    q_pre_norm = q_bnsh[0] if q_bnsh is not None else q_in
+    q_bnsh_nodes = q_bnsh[1] if q_bnsh is not None else []
+    q_bnsh_shape = q_bnsh[2] if q_bnsh is not None else None
+    k_pre_norm = k_bnsh[0] if k_bnsh is not None else k_in
+    k_bnsh_nodes = k_bnsh[1] if k_bnsh is not None else []
+    k_bnsh_shape = k_bnsh[2] if k_bnsh is not None else None
+
+    root_q, q_norm_nodes, q_reshape_shape = _walk_back_through_qk_norm(
+        q_pre_norm, initializer_map, consumers_of, graph_outputs, node_by_output
+    )
+    root_k, k_norm_nodes, k_reshape_shape = _walk_back_through_qk_norm(
+        k_pre_norm, initializer_map, consumers_of, graph_outputs, node_by_output
+    )
+
+    q_hop = _QKNormRopePassThrough(
+        nodes=(node, *q_reverse_nodes, *q_rotate_half, *q_bnsh_nodes, *q_norm_nodes),
+        rotary_node=None,
+        reshape_shape=q_reshape_shape,
+        bnsh_reshape_shape=q_bnsh_shape,
+        output_reshape_shape=q_output_reshape_shape,
+    )
+    k_hop = _QKNormRopePassThrough(
+        nodes=(*k_reverse_nodes, *k_rotate_half, *k_bnsh_nodes, *k_norm_nodes),
+        rotary_node=None,
+        reshape_shape=k_reshape_shape,
+        bnsh_reshape_shape=k_bnsh_shape,
+        output_reshape_shape=k_output_reshape_shape,
+        # `node.output[1]` (`k_pre`) is the shared node's OWN other output --
+        # marked stale here since `node` itself only sits in `q_hop.nodes`
+        # (see this function's own docstring for why); `k_name` itself is
+        # already covered by `k_reverse_nodes`'s own trailing `Reshape` when
+        # the reverse hop was crossed, or is `k_pre` verbatim when it wasn't.
+        extra_stale_outputs=(k_pre,),
+    )
+    return root_q, root_k, q_hop, k_hop
 
 
 def _qk_norm_rope_hop_is_consistent(
@@ -14426,10 +15652,13 @@ def _qk_norm_rope_hop_is_consistent(
     (nothing to check) when `hop` is ``None`` (no pass-through crossed for
     this branch). Otherwise: any crossed `SimplifiedLayerNormalization`'s
     own `scale` must be exactly `[head_size]`-shaped (not just flat -- the
-    real per-head-width fact the walk itself deferred), and, when a post-norm
-    `Reshape` was crossed, its own target-shape constant's last entry must
-    exactly equal `branch_width` -- both declined (``False``), never
-    guessed at, on any mismatch.
+    real per-head-width fact the walk itself deferred), when a post-norm
+    `Reshape` was crossed its own target-shape constant's last entry must
+    exactly equal `branch_width`, and, when a `GemmaRotaryEmbedding`'s own
+    required BNSH `Reshape` (:func:`_match_bnsh_reshape`) was crossed, its
+    own target-shape constant's SECOND-TO-LAST entry must exactly equal
+    `branch_width // head_size` (this branch's own pre-pruning head count)
+    -- every one declined (``False``), never guessed at, on any mismatch.
     """
     if hop is None:
         return True
@@ -14439,6 +15668,16 @@ def _qk_norm_rope_hop_is_consistent(
                 return False
     if hop.reshape_shape is not None:
         dims = onnx.numpy_helper.to_array(initializer_map[hop.reshape_shape])
+        if dims.size == 0 or int(dims[-1]) != branch_width:
+            return False
+    if hop.bnsh_reshape_shape is not None:
+        if head_size <= 0 or branch_width % head_size:
+            return False
+        dims = onnx.numpy_helper.to_array(initializer_map[hop.bnsh_reshape_shape])
+        if dims.size != 4 or int(dims[-2]) != branch_width // head_size:
+            return False
+    if hop.output_reshape_shape is not None:
+        dims = onnx.numpy_helper.to_array(initializer_map[hop.output_reshape_shape])
         if dims.size == 0 or int(dims[-1]) != branch_width:
             return False
     return True
@@ -14542,20 +15781,47 @@ def _find_separate_qkv_chains(
         packed_split_sizes: Optional[str] = None
         q_norm_rope: Optional[_QKNormRopePassThrough] = None
         k_norm_rope: Optional[_QKNormRopePassThrough] = None
-        root_q, q_hop = (
-            _walk_back_through_qk_norm_rope(
-                q_name, initializer_map, consumers_of, graph_outputs, node_by_output
+        # A jointly-consumed `com.microsoft::GemmaRotaryEmbedding` node --
+        # one node call rotating BOTH Q's and K's own branch together, a
+        # genuinely different shape from the single-tensor-per-branch
+        # `RotaryEmbedding`/`MRotaryEmbedding` hop below (see
+        # :func:`_walk_back_through_gemma_rope_pair`'s own docstring) -- is
+        # tried first, on the ORIGINAL `q_name`/`k_name` pair together;
+        # falling through to the ordinary per-branch walk (which never
+        # matches this op at all) whenever it declines.
+        gemma_pair = (
+            _walk_back_through_gemma_rope_pair(
+                q_name,
+                k_name,
+                initializer_map,
+                consumers_of,
+                graph_outputs,
+                node_by_output,
             )
-            if _is_internal(q_name)
-            else (q_name, None)
+            if _is_internal(q_name) and _is_internal(k_name)
+            else None
         )
-        root_k, k_hop = (
-            _walk_back_through_qk_norm_rope(
-                k_name, initializer_map, consumers_of, graph_outputs, node_by_output
+        root_q: str
+        root_k: str
+        q_hop: Optional[_QKNormRopePassThrough]
+        k_hop: Optional[_QKNormRopePassThrough]
+        if gemma_pair is not None:
+            root_q, root_k, q_hop, k_hop = gemma_pair
+        else:
+            root_q, q_hop = (
+                _walk_back_through_qk_norm_rope(
+                    q_name, initializer_map, consumers_of, graph_outputs, node_by_output
+                )
+                if _is_internal(q_name)
+                else (q_name, None)
             )
-            if _is_internal(k_name)
-            else (k_name, None)
-        )
+            root_k, k_hop = (
+                _walk_back_through_qk_norm_rope(
+                    k_name, initializer_map, consumers_of, graph_outputs, node_by_output
+                )
+                if _is_internal(k_name)
+                else (k_name, None)
+            )
         prod_q = node_by_output.get(root_q) if _is_internal(root_q) else None
         prod_k = node_by_output.get(root_k) if _is_internal(root_k) else None
         prod_v = node_by_output.get(v_name) if _is_internal(v_name) else None
@@ -14785,6 +16051,39 @@ def _find_mha_chains(graph: onnx.GraphProto) -> List[_GQAChain]:
         "num_heads",
         allow_differing_v_head_size=True,
         combined_bias_input_index=3,
+    )
+
+
+def _find_decoder_masked_mha_chains(graph: onnx.GraphProto) -> List[_GQAChain]:
+    """The ``com.microsoft::DecoderMaskedMultiHeadAttention`` analogue of
+    :func:`_find_mha_chains` -- see :func:`_find_separate_qkv_chains` (the
+    shared body) and
+    :func:`_match_decoder_masked_multi_head_attention_producer` (what's
+    matched and why it's declined otherwise, including the full empirical
+    schema/execution investigation this whole function was built from).
+    Passes ``allow_differing_v_head_size=False`` -- **not** the same value
+    :func:`_find_mha_chains` passes for `MultiHeadAttention` -- confirmed
+    empirically via a real `onnxruntime.InferenceSession` run: a
+    `DecoderMaskedMultiHeadAttention` node whose V projection is a
+    genuinely different width than Q's/K's shared one fails outright
+    (``"QK head size should be same as V head size to use
+    DecoderMaskedMultiHeadAttention"``), the same hard equal-head-size
+    requirement `GroupQueryAttention`/`PagedAttention` already have (see
+    their own `_find_*_chains` docstrings) rather than `MultiHeadAttention`'s
+    own genuinely permissive one -- a real difference between two ops this
+    module's naming might otherwise suggest are identical in every way but
+    op_type. ``combined_bias_input_index=10`` -- this op's own `bias`
+    input, moved to the *last* position (not index 3, `MultiHeadAttention`'s
+    own) -- see :func:`_match_decoder_masked_multi_head_attention_producer`'s
+    own docstring for why that reordering is confirmed real rather than
+    assumed.
+    """
+    return _find_separate_qkv_chains(
+        graph,
+        _match_decoder_masked_multi_head_attention_producer,
+        "num_heads",
+        allow_differing_v_head_size=False,
+        combined_bias_input_index=10,
     )
 
 
@@ -15039,7 +16338,15 @@ def _apply_one_plain_attention_chain(
             found_qkv = True
             del attr.ints[:]
             attr.ints.extend([keep_count * dq, keep_count * dk, keep_count * dv])
-    if not found_qkv:
+    # `DecoderMaskedSelfAttention` has no `qkv_hidden_sizes` attribute on its
+    # own schema at all (see :func:`_match_attention_producer`'s own
+    # docstring) -- `dq == dk == dv` is guaranteed for it (the matcher only
+    # ever accepts its own always-even 3-way split), so `keep_count * dq ==
+    # keep_count * dk == keep_count * dv` remains true after pruning too,
+    # and the kernel's own even-split default reproduces the right shape
+    # with no attribute needed. Writing one anyway would just be a dead,
+    # schema-unrecognized attribute on the node -- harmless but pointless.
+    if not found_qkv and chain.node.op_type != "DecoderMaskedSelfAttention":
         chain.node.attribute.append(
             onnx.helper.make_attribute(
                 "qkv_hidden_sizes",
@@ -15281,13 +16588,15 @@ def _apply_one_gqa_chain(
         _slice_last_axis(initializer_map[chain.mha_bias], full_bias_idx)
 
     # `GroupQueryAttention`'s past_key/past_value live at input indices 3/4,
-    # the plain ai.onnx op's own at 4/5, `MultiHeadAttention`'s own at 6/7
-    # (see `_match_gqa_producer`'s, `_match_onnx_attention_producer`'s, and
-    # `_match_multi_head_attention_producer`'s own docstrings) -- all three
-    # already confirmed, at match time, to be either absent/dynamic (nothing
-    # to do here) or a BNSH-format constant (plain FLOAT, or -- GQA only --
-    # quantized with a schema-conforming scale) safe to slice along axis 1
-    # by `keep_groups` (see :func:`_past_kv_constants_are_sliceable`).
+    # the plain ai.onnx op's own at 4/5, `MultiHeadAttention`'s own at 6/7,
+    # `DecoderMaskedMultiHeadAttention`'s own at 5/6 (see `_match_gqa_producer`'s,
+    # `_match_onnx_attention_producer`'s, `_match_multi_head_attention_producer`'s,
+    # and :func:`_match_decoder_masked_multi_head_attention_producer`'s own
+    # docstrings) -- all four already confirmed, at match time, to be either
+    # absent/dynamic (nothing to do here) or a BNSH-format constant (plain
+    # FLOAT, or -- GQA only -- quantized with a schema-conforming scale)
+    # safe to slice along axis 1 by `keep_groups` (see
+    # :func:`_past_kv_constants_are_sliceable`).
     is_gqa = (
         chain.node.domain == _ATTENTION_DOMAIN
         and chain.node.op_type == "GroupQueryAttention"
@@ -15295,6 +16604,10 @@ def _apply_one_gqa_chain(
     is_mha = (
         chain.node.domain == _ATTENTION_DOMAIN
         and chain.node.op_type == "MultiHeadAttention"
+    )
+    is_dmmha = (
+        chain.node.domain == _ATTENTION_DOMAIN
+        and chain.node.op_type == "DecoderMaskedMultiHeadAttention"
     )
     # `PagedAttention`'s own `key_cache`/`value_cache` (indices 3/4) are
     # never sliced at all -- already confirmed, at match time, to always be
@@ -15323,6 +16636,8 @@ def _apply_one_gqa_chain(
         if is_gqa
         else (6, 7)
         if is_mha
+        else (5, 6)
+        if is_dmmha
         else ()
         if is_paged or is_linear_attention
         else (4, 5)
@@ -15413,27 +16728,31 @@ def _apply_one_gqa_chain(
                 _slice_last_axis(beta_init, keep_groups)
 
     # `attention_bias`/`attn_mask` (index 10 for `GroupQueryAttention`, 3
-    # for the plain ai.onnx op, 5 for `MultiHeadAttention` -- see
-    # `_match_gqa_producer`'s, `_match_onnx_attention_producer`'s, and
-    # `_match_multi_head_attention_producer`'s own docstrings) is sliced
-    # along its own head axis by `keep_q_heads` -- *query*-head granularity,
-    # not `keep_groups`'s kv-group one -- whenever `_head_bias_axis` resolves
-    # it to a genuine per-head tensor against the pre-pruning
-    # `chain.num_heads`; left untouched when it resolves to a broadcast (or
-    # is absent/dynamic, matched the same "nothing to slice" way here as at
-    # match time). `PagedAttention` has no `attention_bias`/`attn_mask`-
-    # equivalent input on its own schema at all (confirmed off the same live
-    # schema dump this whole family was built from), so this whole block is
-    # skipped for it outright -- `chain.node.input[3]` (`key_cache` for
-    # `PagedAttention`, `past_state` for `LinearAttention`) must never be
-    # mistaken for one. `LinearAttention` has no `attention_bias`/`attn_mask`-
-    # equivalent input on its own schema either (confirmed off the same live
-    # schema dump), so it is excluded here the same way `PagedAttention` is.
+    # for the plain ai.onnx op, 5 for `MultiHeadAttention`, 4 for
+    # `DecoderMaskedMultiHeadAttention` -- see `_match_gqa_producer`'s,
+    # `_match_onnx_attention_producer`'s, `_match_multi_head_attention_producer`'s,
+    # and :func:`_match_decoder_masked_multi_head_attention_producer`'s own
+    # docstrings) is sliced along its own head axis by `keep_q_heads` --
+    # *query*-head granularity, not `keep_groups`'s kv-group one -- whenever
+    # `_head_bias_axis` resolves it to a genuine per-head tensor against the
+    # pre-pruning `chain.num_heads`; left untouched when it resolves to a
+    # broadcast (or is absent/dynamic, matched the same "nothing to slice"
+    # way here as at match time). `PagedAttention` has no `attention_bias`/
+    # `attn_mask`-equivalent input on its own schema at all (confirmed off
+    # the same live schema dump this whole family was built from), so this
+    # whole block is skipped for it outright -- `chain.node.input[3]`
+    # (`key_cache` for `PagedAttention`, `past_state` for `LinearAttention`)
+    # must never be mistaken for one. `LinearAttention` has no
+    # `attention_bias`/`attn_mask`-equivalent input on its own schema either
+    # (confirmed off the same live schema dump), so it is excluded here the
+    # same way `PagedAttention` is.
     mask_idx = (
         10
         if is_gqa
         else 5
         if is_mha
+        else 4
+        if is_dmmha
         else None
         if is_paged or is_linear_attention
         else 3
@@ -15488,7 +16807,7 @@ def _apply_one_gqa_chain(
     # crossed one (see :class:`_QKNormRopePassThrough`'s own docstring for
     # why neither a crossed norm's own `scale` nor a crossed
     # `RotaryEmbedding`'s `cos_cache`/`sin_cache` ever needs touching --
-    # only these two constants do): `new_branch_width`/`new_branch_heads`
+    # only these three constants do): `new_branch_width`/`new_branch_heads`
     # are Q's own post-pruning `num_heads`/flat width for `.q_norm_rope`,
     # K's own post-pruning `kv_num_heads`/flat width (K's own head_size
     # equals Q's/K's shared `d`, already confirmed at match time) for
@@ -15510,6 +16829,20 @@ def _apply_one_gqa_chain(
             shape_init.CopyFrom(
                 onnx.numpy_helper.from_array(dims, name=shape_init.name)
             )
+        if hop.bnsh_reshape_shape is not None:
+            shape_init = initializer_map[hop.bnsh_reshape_shape]
+            dims = onnx.numpy_helper.to_array(shape_init).copy()
+            dims[-2] = new_branch_heads
+            shape_init.CopyFrom(
+                onnx.numpy_helper.from_array(dims, name=shape_init.name)
+            )
+        if hop.output_reshape_shape is not None:
+            shape_init = initializer_map[hop.output_reshape_shape]
+            dims = onnx.numpy_helper.to_array(shape_init).copy()
+            dims[-1] = new_branch_width
+            shape_init.CopyFrom(
+                onnx.numpy_helper.from_array(dims, name=shape_init.name)
+            )
 
     # Every output, not just [0] -- `LinearAttention`'s own second output,
     # `present_state`, is never sliced (a runtime output, not a weight --
@@ -15521,6 +16854,7 @@ def _apply_one_gqa_chain(
     for hop in (chain.q_norm_rope, chain.k_norm_rope):
         if hop is not None:
             stale.update(n.output[0] for n in hop.nodes if n.output and n.output[0])
+            stale.update(hop.extra_stale_outputs)
     return (
         {chain.q_weight, chain.k_weight, chain.v_weight},
         chain.consumer_weight,
@@ -15711,6 +17045,7 @@ def apply_attention_head_pruning(
         *_find_gqa_chains(graph),
         *_find_onnx_attention_chains(graph),
         *_find_mha_chains(graph),
+        *_find_decoder_masked_mha_chains(graph),
         *_find_paged_attention_chains(graph),
         *_find_linear_attention_chains(graph),
     ]
@@ -15863,6 +17198,7 @@ def apply_attention_head_wanda_pruning(
         *_find_gqa_chains(graph),
         *_find_onnx_attention_chains(graph),
         *_find_mha_chains(graph),
+        *_find_decoder_masked_mha_chains(graph),
         *_find_paged_attention_chains(graph),
         *_find_linear_attention_chains(graph),
     ]
@@ -24093,7 +25429,13 @@ def _attention_not_eligible(
             (node.op_type == "Attention" and node.domain in (_ATTENTION_DOMAIN, ""))
             or (
                 node.op_type
-                in ("GroupQueryAttention", "MultiHeadAttention", "PagedAttention")
+                in (
+                    "GroupQueryAttention",
+                    "MultiHeadAttention",
+                    "PagedAttention",
+                    "DecoderMaskedSelfAttention",
+                    "DecoderMaskedMultiHeadAttention",
+                )
                 and node.domain == _ATTENTION_DOMAIN
             )
             or (node.op_type == "LinearAttention" and node.domain == "")
@@ -24150,7 +25492,19 @@ def _analyze_attention_chains(
             # `GroupQueryAttention` itself supports, so it gets its own
             # `"_group"`-suffixed family string rather than sharing
             # `MultiHeadAttention`'s own `"_head"` one.
-            if chain.node.op_type == "MultiHeadAttention":
+            # `DecoderMaskedMultiHeadAttention` is ONNX Runtime's own
+            # in-place decode-time rewrite target for `MultiHeadAttention`
+            # (see this module's own "Attention-head pruning" section
+            # comment) -- same one-head-per-group granularity
+            # (`chain.kv_num_heads == chain.num_heads` always for it too,
+            # confirmed off its own schema the same way), so it shares
+            # `MultiHeadAttention`'s own family string rather than getting a
+            # distinct one: the reporting granularity is genuinely
+            # identical, not merely similarly named.
+            if chain.node.op_type in (
+                "MultiHeadAttention",
+                "DecoderMaskedMultiHeadAttention",
+            ):
                 family = "attention_mha_head"
             elif chain.node.op_type == "PagedAttention":
                 family = "attention_paged_group"
@@ -24285,6 +25639,7 @@ def _analyze_attention_head_pruning(
         *_find_gqa_chains(graph),
         *_find_onnx_attention_chains(graph),
         *_find_mha_chains(graph),
+        *_find_decoder_masked_mha_chains(graph),
         *_find_paged_attention_chains(graph),
         *_find_linear_attention_chains(graph),
     ]
@@ -24343,6 +25698,7 @@ def _analyze_attention_head_wanda_pruning(
         *_find_gqa_chains(graph),
         *_find_onnx_attention_chains(graph),
         *_find_mha_chains(graph),
+        *_find_decoder_masked_mha_chains(graph),
         *_find_paged_attention_chains(graph),
         *_find_linear_attention_chains(graph),
     ]

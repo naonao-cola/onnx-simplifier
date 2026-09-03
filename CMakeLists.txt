@@ -41,6 +41,12 @@ option(ONNXSIM_C_API "Build the C ABI shared library used by the Rust wrapper an
 option(ONNXSIM_COVERAGE "Instrument onnxsim's own C++ targets for gcov/llvm-cov coverage" OFF)
 option(ONNXSIM_TESTS "Build the dependency-free C++ unit tests (e.g. sym_expr)" OFF)
 option(ONNXSIM_WASM_ORT_WEB "For the Emscripten build: delegate constant folding to the page's onnxruntime-web instead of compiling and linking ONNX Runtime into the module" OFF)
+# Opt-in additional ModelExecutor backend (see onnxsim/xnnpack_executor.h and
+# docs/dlpack-executor.md): runs constant-folding fold groups through Google's
+# XNNPACK instead of ONNX Runtime, for a small, explicitly-supported subset of
+# ops. Independent of ONNXSIM_BUILTIN_ORT -- both may be built at once; the
+# caller picks which GetXxxModelExecutor() to hand to Simplify.
+option(ONNXSIM_BUILTIN_XNNPACK "Build and link Google's XNNPACK as an additional (opt-in) ModelExecutor backend for constant folding" OFF)
 
 if (ONNXSIM_WASM_ORT_WEB)
   # The whole point of this mode is to NOT bundle ONNX Runtime -- constant
@@ -111,6 +117,14 @@ if (ONNXSIM_BUILTIN_ORT)
   set(ORT_NAME onnxruntime)
 endif()
 
+if (ONNXSIM_BUILTIN_XNNPACK)
+  if (EMSCRIPTEN)
+    message(FATAL_ERROR "ONNXSIM_BUILTIN_XNNPACK is not supported for the "
+                        "Emscripten/WebAssembly build")
+  endif()
+  include(cmake/build_xnnpack.cmake)
+endif()
+
 # onnxsim's own onnx/onnx-optimizer fork provides the `onnx` target -- used for
 # every build (onnxsim's own Graph-native optimizer/shape-inference fixed
 # point needs onnxsim-fork-only extensions, e.g. onnx/common/
@@ -164,6 +178,24 @@ if (ONNXSIM_BUILTIN_ORT)
   # onnxsim.cpp/dlpack_bridge.h include onnxruntime_cxx_api.h directly.
   target_include_directories(onnxsim PRIVATE ${ONNXRUNTIME_INCLUDE_DIR})
 endif()
+if (ONNXSIM_BUILTIN_XNNPACK)
+  # onnx_to_xnnpack_subgraph.cpp / xnnpack_executor.cpp include xnnpack.h
+  # directly; the XNNPACK CMake target itself (linked below) already exports
+  # this include directory to its own sources but not to onnxsim's.
+  target_sources(onnxsim PRIVATE onnxsim/onnx_to_xnnpack_subgraph.cpp
+                                 onnxsim/xnnpack_executor.cpp)
+  target_include_directories(onnxsim PRIVATE ${XNNPACK_INCLUDE_DIR})
+  # The actual `target_link_libraries(onnxsim ... XNNPACK)` call is further
+  # below, alongside onnx/onnx_optimizer/ORT_NAME: CMake requires every
+  # target_link_libraries call for a given target to use the same
+  # keyword/plain signature, and those existing calls are plain (no
+  # PUBLIC/PRIVATE/INTERFACE), so this one must be too rather than introduced
+  # here as its own PRIVATE call.
+  # Guards the xnnpack.h-facing glue (onnx_to_xnnpack_subgraph.h,
+  # GetXnnpackModelExecutor) the same way ONNXSIM_HAS_ORT guards the Ort::
+  # glue above.
+  target_compile_definitions(onnxsim PUBLIC ONNXSIM_HAS_XNNPACK)
+endif()
 target_include_directories(onnxsim PUBLIC onnxsim)
 # dlpack.h (at third_party/dlpack/dlpack.h) is the tensor-exchange type at the
 # ModelExecutor / C-ABI executor boundary (see docs/dlpack-executor.md). The
@@ -191,6 +223,9 @@ else()
   target_link_libraries(onnxsim onnx_optimizer onnx Threads::Threads)
   if (ONNXSIM_BUILTIN_ORT)
     target_link_libraries(onnxsim ${ORT_NAME})
+  endif()
+  if (ONNXSIM_BUILTIN_XNNPACK)
+    target_link_libraries(onnxsim XNNPACK)
   endif()
 endif()
 
@@ -639,4 +674,16 @@ if (ONNXSIM_TESTS)
   target_link_libraries(tensor_pool_archive_test onnxsim)
   onnxsim_add_ort_rpath(tensor_pool_archive_test)
   add_test(NAME tensor_pool_archive_test COMMAND tensor_pool_archive_test)
+
+  if (ONNXSIM_BUILTIN_XNNPACK)
+    # Exercises GetXnnpackModelExecutor() end to end (ONNX ModelProto in,
+    # DLManagedTensor out), so it links the fully-configured `onnxsim` target
+    # like the tests above, and additionally needs xnnpack.h for building its
+    # own input/expected-output tensors.
+    add_executable(xnnpack_executor_test onnxsim/xnnpack_executor_test.cpp)
+    target_link_libraries(xnnpack_executor_test onnxsim)
+    target_include_directories(xnnpack_executor_test PRIVATE ${XNNPACK_INCLUDE_DIR})
+    onnxsim_add_ort_rpath(xnnpack_executor_test)
+    add_test(NAME xnnpack_executor_test COMMAND xnnpack_executor_test)
+  endif()
 endif()
