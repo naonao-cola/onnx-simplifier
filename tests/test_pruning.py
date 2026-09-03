@@ -4514,6 +4514,144 @@ def test_structured_pruning_conv_chain_scale_between_convs_is_left_untouched():
     np.testing.assert_array_equal(inits["W2"], w2)
 
 
+def _group_norm_conv_pair_model(
+    w1, w2, gn_scale, gn_bias, num_groups, group1=1, b1=None, spatial=10
+):
+    """The mid-chain-``GroupNormalization`` analogue of `_conv_pair_model`/
+    `_grouped_conv_pair_model`: a `GroupNormalization` node (opset 21+
+    per-channel `scale`/`bias` schema -- `_model`'s own default `opset=21`)
+    sits between the two Convs. `group1`, like `_grouped_conv_pair_model`'s
+    own parameter of the same name, makes the producer Conv itself a
+    general grouped Conv when != 1 (`w1`'s shape must already be
+    ``[C1, Cin/group1, kH, kW]``), so the same builder covers both the
+    plain pass-through chain and the producer-group/`num_groups` mismatch
+    case.
+    """
+    Cin, C2 = w1.shape[1] * group1, w2.shape[0]
+    initializer = [
+        _f32(w1, "W1"),
+        _f32(w2, "W2"),
+        _f32(gn_scale, "GNScale"),
+        _f32(gn_bias, "GNBias"),
+    ]
+    g1 = f", group={group1}" if group1 != 1 else ""
+    if b1 is not None:
+        conv1 = f"h = Conv<kernel_shape=[3,3]{g1}>(X, W1, B1)"
+        initializer.append(_f32(b1, "B1"))
+    else:
+        conv1 = f"h = Conv<kernel_shape=[3,3]{g1}>(X, W1)"
+    out_spatial = spatial - 4  # two valid (no-pad) 3x3 convs
+    return _model(
+        f"""
+        g (float[N,{Cin},{spatial},{spatial}] X) => (float[N,{C2},{out_spatial},{out_spatial}] Y)
+        {{
+          {conv1}
+          gn = GroupNormalization<num_groups={num_groups}, epsilon=1e-05>(h, GNScale, GNBias)
+          Y = Conv<kernel_shape=[3,3]>(gn, W2)
+        }}
+        """,
+        initializer=initializer,
+    )
+
+
+def test_structured_pruning_group_norm_pass_through_matches_oracle_exactly():
+    # THE key correctness bar for the GroupNorm pass-through hop, same as
+    # every other Conv-chain hop's own oracle test: exact equivalence
+    # (float32 noise only) to an independently, already-pruned reference
+    # model -- not "close", and not "matches the un-pruned model's own
+    # output sliced after the fact" (see `_GROUP_NORM_PASS_THROUGH_OP`'s own
+    # comment for why the latter genuinely differs and is not the bar this
+    # hop is held to). `_oracle_keep_indices_conv_grouped` is the identical
+    # per-group L2-norm top-k `_apply_chains`/`_chain_group` itself uses
+    # once `num_groups` becomes the chain's own `group` -- reimplemented
+    # from scratch here, not called into, so this is a real check on the
+    # algorithm.
+    Cin, C1, C2, num_groups = 3, 16, 8, 4
+    rng = np.random.default_rng(50)
+    w1 = rng.standard_normal((C1, Cin, 3, 3)).astype(np.float32)
+    b1 = rng.standard_normal((C1,)).astype(np.float32)
+    w2 = rng.standard_normal((C2, C1, 3, 3)).astype(np.float32)
+    gn_scale = rng.standard_normal((C1,)).astype(np.float32)
+    gn_bias = rng.standard_normal((C1,)).astype(np.float32)
+    model = _group_norm_conv_pair_model(w1, w2, gn_scale, gn_bias, num_groups, b1=b1)
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    dims_after = _initializer_dims(pruned)
+    # `num_groups` (a node attribute, not a tensor) is unchanged; the
+    # surviving channel count must still divide it evenly.
+    assert dims_after["W1"][0] % num_groups == 0
+    assert dims_after["W1"][0] < C1  # actually pruned, not a no-op
+
+    keep = _oracle_keep_indices_conv_grouped(w1, num_groups, 0.5)
+    oracle = _group_norm_conv_pair_model(
+        w1[keep], w2[:, keep], gn_scale[keep], gn_bias[keep], num_groups, b1=b1[keep]
+    )
+
+    rng_x = np.random.default_rng(51)
+    x = rng_x.standard_normal((2, Cin, 10, 10)).astype(np.float32)
+    (y,) = _run(pruned, {"X": x})
+    (y_oracle,) = _run(oracle, {"X": x})
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-5, atol=1e-5)
+
+
+def test_structured_pruning_group_norm_num_groups_mismatch_with_grouped_conv_declines():
+    # A mid-chain GroupNorm hop's own `num_groups` disagreeing with a
+    # same-chain grouped Conv producer's own `group` -- the two partitions'
+    # block boundaries wouldn't generally align (uniform-per-block pruning
+    # under one partition needn't be uniform-per-block under the other), so
+    # the whole chain is declined outright, never guessed at, the same bar
+    # a producer_group != consumer_group mismatch already gets.
+    Cin, C1, C2, group1, num_groups = 4, 8, 8, 2, 4
+    rng = np.random.default_rng(52)
+    w1 = rng.standard_normal((C1, Cin // group1, 3, 3)).astype(np.float32)
+    w2 = rng.standard_normal((C2, C1, 3, 3)).astype(np.float32)
+    gn_scale = rng.standard_normal((C1,)).astype(np.float32)
+    gn_bias = rng.standard_normal((C1,)).astype(np.float32)
+    model = _group_norm_conv_pair_model(
+        w1, w2, gn_scale, gn_bias, num_groups, group1=group1
+    )
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    np.testing.assert_array_equal(inits["W1"], w1)
+    np.testing.assert_array_equal(inits["W2"], w2)
+    np.testing.assert_array_equal(inits["GNScale"], gn_scale)
+    np.testing.assert_array_equal(inits["GNBias"], gn_bias)
+
+
+def test_analyze_structured_pruning_group_norm_pass_through_matches_real_call():
+    # Dry-run/real-call cross-check for the GroupNorm hop specifically: both
+    # `_apply_chains` and its dry-run mirror `_analyze_chains` share
+    # `_chain_group` (and, via `_chain_group_norm_consts`, the same
+    # touched-role bookkeeping), so a mismatch here would mean the mirror
+    # drifted out of sync with the real call -- this module's own
+    # established discipline treats that as a real bug.
+    Cin, C1, C2, num_groups = 3, 16, 8, 4
+    rng = np.random.default_rng(53)
+    w1 = rng.standard_normal((C1, Cin, 3, 3)).astype(np.float32)
+    w2 = rng.standard_normal((C2, C1, 3, 3)).astype(np.float32)
+    gn_scale = rng.standard_normal((C1,)).astype(np.float32)
+    gn_bias = rng.standard_normal((C1,)).astype(np.float32)
+    model = _group_norm_conv_pair_model(w1, w2, gn_scale, gn_bias, num_groups)
+
+    report = onnxsim.analyze_pruning_sensitivity(
+        model, onnxsim.apply_structured_pruning, sparsity=0.5
+    )
+    assert len(report.layers) == 1
+    layer = report.layers[0]
+    assert layer.family == "conv_plain"
+    assert layer.total == C1
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    dims_after = _initializer_dims(pruned)
+    kept = C1 - layer.would_drop
+    assert dims_after["W1"][0] == kept
+    assert dims_after["W2"][1] == kept
+    assert dims_after["GNScale"][0] == kept
+    assert dims_after["GNBias"][0] == kept
+
+
 def test_structured_wanda_pruning_conv_chain_matches_oracle_exactly():
     Cin, C1, C2 = 3, 16, 8
     rng = np.random.default_rng(40)
