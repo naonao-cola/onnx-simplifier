@@ -264,7 +264,9 @@ def _run_with_mlx(model: onnx.ModelProto, feeds):
             target = [int(v) for v in ins[1].tolist()]
             out = mx.reshape(ins[0], target)
         else:
-            raise NotImplementedError(f"op '{op}' not supported by the MLX test backend")
+            raise NotImplementedError(
+                f"op '{op}' not supported by the MLX test backend"
+            )
         values[node.output[0]] = out
 
     return [np.asarray(values[out.name]) for out in model.graph.output]
