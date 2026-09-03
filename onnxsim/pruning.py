@@ -1205,7 +1205,12 @@ def _candidates(
     return out
 
 
-def _weight_to_nk(w: np.ndarray, weight_transposed: bool, is_conv: bool) -> np.ndarray:
+def _weight_to_nk(
+    w: np.ndarray,
+    weight_transposed: bool,
+    is_conv: bool,
+    is_conv_transpose: bool = False,
+) -> np.ndarray:
     """``[out_channels, in_channels, kH, kW]`` -> ``[N, K]`` for a Conv
     weight, or a plain 2-D MatMul/Gemm (or Attention merged-QKV) weight
     transposed to ``[N, K]`` (output channel first) when it isn't already --
@@ -1218,8 +1223,17 @@ def _weight_to_nk(w: np.ndarray, weight_transposed: bool, is_conv: bool) -> np.n
     per-layer callback, global mode needs every candidate's own ``w_nk``
     gathered up front, to pool their importance before any one of them can
     be masked.
+
+    `is_conv_transpose` (default ``False``, meaningless unless `is_conv`)
+    mirrors :func:`_producer_weight_nk`'s own identical flag: a
+    ``ConvTranspose`` weight's own output-channel axis is axis 1, not axis
+    0 (the reverse of Conv's -- see :func:`_match_conv_transpose_producer`'s
+    own docstring), so it is moved to the front before the same flatten,
+    rather than assumed to already be there.
     """
     if is_conv:
+        if is_conv_transpose:
+            w = np.moveaxis(w, 1, 0)
         n, cin, kh, kw = w.shape
         return w.reshape(n, cin * kh * kw)
     return w if weight_transposed else w.T
@@ -8450,6 +8464,101 @@ def apply_structured_wanda_pruning(
 # blockwise QDQ) on either side composes correctly, exactly the way a
 # float/QDQ mix already did before blockwise support existed.
 #
+# ``ConvTranspose`` is matched by this section too, alongside Conv, sharing
+# `is_conv`'s own Conv-shaped (rank-4) matching/slicing machinery via a
+# second, sibling boolean, `is_conv_transpose` -- confirmed to be the right
+# scope to add, not assumed, via two separate checks against this
+# environment's own installed ``onnxruntime`` (1.29.0)
+# ``onnxruntime.quantization`` package:
+#
+#   * Its own operator registry (``onnxruntime/quantization/registry.py``)
+#     maps ``"ConvTranspose"`` to the exact same ``QDQConv`` quantizer class
+#     ``"Conv"`` itself uses (``QDQOpsRegistry = {"Conv": QDQConv,
+#     "ConvTranspose": QDQConv, ...}``) -- so a statically-quantized
+#     ``ConvTranspose`` in the wild is produced by the identical QDQ
+#     machinery as a quantized Conv, not a special internal-domain op.
+#   * A real round trip -- a minimal ``ConvTranspose`` model built with
+#     ``onnx.helper`` and run through ``onnxruntime.quantization
+#     .quantize_static(..., quant_format=QuantFormat.QDQ, per_channel=True)``
+#     -- confirms the exact node sequence this section already targets for
+#     Conv: a constant int8 weight initializer feeding a lone
+#     ``DequantizeLinear`` node, whose output feeds the ``ConvTranspose``
+#     node directly, with nothing ``ConvTranspose``-specific about the
+#     pattern's shape (see this section's own tests, e.g.
+#     ``test_qdq_conv_transpose_producer_matches_oracle``, for the exact
+#     captured node list).
+#
+# The one thing that does NOT carry over unchanged from Conv is which axis
+# is this weight's own *output*-channel (and so, when per-channel
+# quantized, per-channel-quantized) axis. ``ConvTranspose``'s own weight
+# layout is the schema-documented ``[C, M/group, k1, ..., kn]`` (confirmed
+# live via ``onnx.defs.get_schema("ConvTranspose")``, the exact same
+# "reverse of Conv" fact the plain-float ``ConvTranspose`` support far
+# above already establishes) -- so `out_channels` (``M``) lives on axis 1,
+# not axis 0. This is confirmed two ways, not assumed: straight from
+# ``onnxruntime.quantization``'s own source
+# (``operators/conv.py``'s ``QDQConv.quantize``) --
+# ``is_weight_per_channel, weight_axis = self.quantizer
+# .is_tensor_per_channel(node.input[1], default_axis=0 if node.op_type ==
+# "Conv" else 1)`` -- and independently re-confirmed empirically by the
+# very same ``quantize_static`` round trip above, whose emitted
+# ``DequantizeLinear`` node for the weight carries an explicit ``axis=1``
+# attribute and a ``w_scale``/``w_zero_point`` shaped ``[out_channels]``
+# (i.e. ``dims[1]``, not ``dims[0]``).
+#
+# :func:`_match_conv_transpose_qdq` (the :func:`_match_conv_qdq` analogue)
+# therefore calls :func:`_resolve_weight_ref` with ``expected_axis=1``
+# rather than ``0`` -- the ONE place this weight's own reversed axis
+# convention enters this section's matching -- and, like
+# :func:`_match_conv_qdq`, is restricted to ``group == 1`` on BOTH the
+# producer and the consumer role: narrower than the plain-float
+# ``ConvTranspose`` support's own consumer side (any `group`, see
+# :func:`_match_conv_transpose_consumer`'s own docstring), but consistent
+# with THIS section's own pre-existing, independent decision to narrow
+# every Conv/MatMul/Gemm match to ``group == 1`` on both sides regardless
+# of what the float path supports (see this section's own "What's
+# declined" paragraph below) -- a scope choice this addition inherits
+# rather than reopens.
+#
+# :func:`_slice_producer_weight_qdq`/:func:`_slice_consumer_weight_qdq`
+# gain the exact same `is_conv_transpose` flag (and axis handling) the
+# plain-float :func:`_slice_producer_weight`/:func:`_slice_consumer_weight`
+# already use, for the identical reason: producer-role slicing cuts axis 1
+# (``q[:, keep, ...]``), consumer-role slicing cuts axis 0, flat
+# (``q[keep, ...]``) -- mirroring :func:`_slice_consumer_weight`'s own
+# ConvTranspose branch, which is correct for any `group`, even though this
+# section's own matcher never actually resolves a `group != 1`
+# ``ConvTranspose`` consumer today (keeping the two `is_conv_transpose`
+# branches textually identical avoids a silent divergence between the
+# float and QDQ sections if that restriction is ever lifted later). The
+# *blockwise* INT4/UINT4 producer/consumer slicers
+# (:func:`_slice_producer_weight_qdq_block`/
+# :func:`_slice_consumer_weight_qdq_block`) need NO ConvTranspose-specific
+# change at all: they already slice by the `out_axis`/`block_axis` fields
+# carried on the resolved :class:`_QDQBlockwiseWeight` itself (set from the
+# very same `expected_axis` :func:`_match_conv_transpose_qdq` passes
+# through :func:`_resolve_weight_ref`), never a hardcoded axis, so
+# :func:`_match_dequantize_linear_weight_blockwise`'s own existing
+# rank/axis parameterization already generalizes correctly with no new
+# code. Whether this blockwise path is ever actually exercised by a real
+# ``ConvTranspose`` export is a separate question from whether it is *safe*
+# to leave matched: opset 21+ blockwise INT4/UINT4 weight-only quantization
+# is, in every real exporter this investigation found (Olive, Hugging Face
+# Optimum), a technique for LARGE-reduction-axis MatMul/Gemm weights in
+# LLMs, never applied to Conv/ConvTranspose's comparatively tiny ``C * kH *
+# kW``-sized reduction axis in any tool or exported model found -- so this
+# path is left matched (free, and for architectural consistency with the
+# per-channel case above) but is not expected to ever actually fire for a
+# real ``ConvTranspose`` graph, and is exercised by this section's own
+# tests only as a direct unit check of the axis plumbing, not as a claim
+# that real blockwise-quantized ``ConvTranspose`` models exist in the wild.
+#
+# Gated (SwiGLU/GeGLU) chains (:func:`_find_qdq_gated_chains`) stay
+# MatMul/Gemm-only -- ``ConvTranspose`` never takes part, mirroring
+# :func:`_find_gated_chains`'s own restriction, which this module's
+# docstring already gives no Conv-family gated pair support at all, QDQ or
+# otherwise.
+#
 # Blockwise INT4/UINT4 quantization (opset 21 / IR version 10's own
 # ``block_size`` attribute on ``QuantizeLinear``/``DequantizeLinear``, and
 # the ``INT4``/``UINT4`` tensor element types added at the same opset) is
@@ -8590,17 +8699,23 @@ def apply_structured_wanda_pruning(
 #     bookkeeping is well beyond this section's scope. Only the plain single
 #     producer -> [zero or more shape-preserving unary activations, see
 #     `_UNARY_PASS_THROUGH`] -> single consumer topology (an ordinary,
-#     ``group=1`` Conv or MatMul/vanilla-Gemm on both ends) is matched -- no
-#     per-channel Add/Mul bias/scale hop either, unlike the plain float
-#     MatMul/Gemm chain walk above (:func:`_walk_to_consumer`), unnecessary
-#     complexity for this section's own deliberately narrow first cut. A
-#     gated (SwiGLU/GeGLU) MatMul/Gemm pair, by contrast, IS matched
-#     (:func:`_find_qdq_gated_chains`) -- see
+#     ``group=1`` Conv/ConvTranspose or MatMul/vanilla-Gemm on both ends) is
+#     matched -- no per-channel Add/Mul bias/scale hop either, unlike the
+#     plain float MatMul/Gemm chain walk above (:func:`_walk_to_consumer`),
+#     unnecessary complexity for this section's own deliberately narrow
+#     first cut. A grouped ``ConvTranspose`` (either role) is declined the
+#     same way, by :func:`_match_conv_transpose_qdq`'s own ``group == 1``
+#     check -- see this section's own "ConvTranspose" paragraph above for
+#     why that bar is kept even though the plain-float ``ConvTranspose``
+#     consumer supports any `group`. A gated (SwiGLU/GeGLU) MatMul/Gemm
+#     pair, by contrast, IS matched (:func:`_find_qdq_gated_chains`) -- see
 #     :func:`apply_structured_pruning_qdq`'s own docstring: the topology
 #     itself needed no new machinery beyond mirroring
 #     :func:`_find_gated_chains`'s own backward walk against QDQ-resolved
 #     producers, so it no longer belonged on this "materially bigger
-#     project" list.
+#     project" list. ``ConvTranspose`` never takes part in a gated pair
+#     either, mirroring :func:`_find_gated_chains`'s own Conv-family
+#     exclusion there.
 #   * Blocked quantization (opset 21+'s ``block_size`` attribute) with
 #     INT8/UINT8 codes, or blocking along the output-channel axis rather
 #     than the reduction axis, is declined by
@@ -9101,7 +9216,11 @@ def _qdq_channel_importance(w_nk: np.ndarray, importance_norm: str) -> np.ndarra
 
 
 def _slice_producer_weight_qdq(
-    ref: _WeightRef, weight_transposed: bool, keep: np.ndarray, is_conv: bool
+    ref: _WeightRef,
+    weight_transposed: bool,
+    keep: np.ndarray,
+    is_conv: bool,
+    is_conv_transpose: bool = False,
 ) -> None:
     """Slices `ref`'s own output channels to `keep` (ascending indices) --
     the producer role. For a per-tensor/per-channel QDQ weight this means
@@ -9115,16 +9234,31 @@ def _slice_producer_weight_qdq(
     ``Wzp`` in lockstep too -- `scale`/`zero_point` are always full-size,
     never block-reduced, on this axis, see this section's own top comment).
     Mirrors :func:`_slice_producer_weight` exactly for the float case
-    (delegated to it directly).
+    (delegated to it directly, `is_conv_transpose` included).
+
+    `is_conv_transpose` (meaningless unless `is_conv`) is this weight's own
+    ``ConvTranspose``-vs-Conv distinction (see this section's own top
+    comment): a ``ConvTranspose`` weight's own output-channel axis is axis
+    1, not axis 0 -- the reverse of Conv's -- so the per-tensor/per-channel
+    ``Wq`` slice below cuts axis 1 instead. ``Ws``/``Wzp`` need no such
+    branch: they are always a flat, 1-D ``[out_channels]`` vector (or a
+    scalar) regardless of which axis of ``Wq`` they align to, so `keep`
+    applies to them identically either way.
     """
     if ref.float_init is not None:
-        _slice_producer_weight(ref.float_init, weight_transposed, keep, is_conv=is_conv)
+        _slice_producer_weight(
+            ref.float_init,
+            weight_transposed,
+            keep,
+            is_conv=is_conv,
+            is_conv_transpose=is_conv_transpose,
+        )
         return
     if ref.qdq is not None:
         qdq = ref.qdq
         q = onnx.numpy_helper.to_array(qdq.q_init)
         if is_conv:
-            q_new = q[keep, ...]
+            q_new = q[:, keep, ...] if is_conv_transpose else q[keep, ...]
         else:
             q_new = q[keep, :] if weight_transposed else q[:, keep]
         qdq.q_init.CopyFrom(onnx.numpy_helper.from_array(q_new, name=qdq.q_init.name))
@@ -9182,7 +9316,11 @@ def _slice_producer_weight_qdq_block(w: _QDQBlockwiseWeight, keep: np.ndarray) -
 
 
 def _slice_consumer_weight_qdq(
-    ref: _WeightRef, weight_transposed: bool, keep: np.ndarray, is_conv: bool
+    ref: _WeightRef,
+    weight_transposed: bool,
+    keep: np.ndarray,
+    is_conv: bool,
+    is_conv_transpose: bool = False,
 ) -> None:
     """Slices `ref`'s own input (reduction) channels to `keep` -- the
     consumer role for a plain float or per-tensor/per-channel QDQ weight
@@ -9193,7 +9331,15 @@ def _slice_consumer_weight_qdq(
     completely untouched -- genuinely simpler than the producer role, not
     just differently shaped (see this section's own top-of-section
     comment). Mirrors :func:`_slice_consumer_weight` exactly for the float
-    case (delegated to it directly).
+    case (delegated to it directly, `is_conv_transpose` included).
+
+    `is_conv_transpose` (meaningless unless `is_conv`) is this weight's own
+    ``ConvTranspose``-vs-Conv distinction (see this section's own top
+    comment): a ``ConvTranspose`` weight's own input-channel axis is axis
+    0 -- flat, spanning the FULL input-channel count for any `group` value
+    (the mirror image of Conv's own grouped consumer axis 1, see
+    :func:`_match_conv_transpose_consumer`'s own docstring) -- so the
+    ``Wq`` slice below cuts axis 0 instead of axis 1.
 
     Never called for a *blockwise* QDQ weight (`ref.qdq_block`): unlike
     every other case here, that role's own axis (`block_axis`) genuinely IS
@@ -9206,13 +9352,19 @@ def _slice_consumer_weight_qdq(
     chain) before calling either.
     """
     if ref.float_init is not None:
-        _slice_consumer_weight(ref.float_init, weight_transposed, keep, is_conv=is_conv)
+        _slice_consumer_weight(
+            ref.float_init,
+            weight_transposed,
+            keep,
+            is_conv=is_conv,
+            is_conv_transpose=is_conv_transpose,
+        )
         return
     qdq = ref.qdq
     assert qdq is not None
     q = onnx.numpy_helper.to_array(qdq.q_init)
     if is_conv:
-        q_new = q[:, keep, ...]
+        q_new = q[keep, ...] if is_conv_transpose else q[:, keep, ...]
     else:
         q_new = q[:, keep] if weight_transposed else q[keep, :]
     qdq.q_init.CopyFrom(onnx.numpy_helper.from_array(q_new, name=qdq.q_init.name))
@@ -9293,6 +9445,12 @@ class _QDQProducer:
     # :func:`_find_qdq_gated_chains`; empty for a plain single-producer
     # chain). Mirrors :attr:`_Producer.pre_ops` exactly.
     pre_ops: Tuple[onnx.NodeProto, ...] = ()
+    # ``True`` for a ``ConvTranspose`` producer (meaningless unless
+    # `is_conv`) -- see this section's own top-of-section "ConvTranspose"
+    # paragraph and :func:`_match_conv_transpose_qdq`. Always ``False`` for
+    # a gated-pair producer (:func:`_find_qdq_gated_chains`), which is
+    # MatMul/Gemm-only.
+    is_conv_transpose: bool = False
 
 
 @dataclass(frozen=True)
@@ -9301,6 +9459,10 @@ class _QDQConsumer:
     ref: _WeightRef
     weight_transposed: bool
     is_conv: bool
+    # ``True`` for a ``ConvTranspose`` consumer (meaningless unless
+    # `is_conv`) -- see :attr:`_QDQProducer.is_conv_transpose`'s own
+    # comment.
+    is_conv_transpose: bool = False
 
 
 @dataclass(frozen=True)
@@ -9358,6 +9520,60 @@ def _match_conv_qdq(
     return ref, bias_name, out_channels, in_channels
 
 
+def _match_conv_transpose_qdq(
+    node: onnx.NodeProto,
+    initializer_map: Dict[str, onnx.TensorProto],
+    dq_of: Dict[str, onnx.NodeProto],
+    consumers_of: Dict[str, List[onnx.NodeProto]],
+) -> Optional[Tuple[_WeightRef, Optional[str], int, int]]:
+    """The ``ConvTranspose`` analogue of :func:`_match_conv_qdq` -- see this
+    section's own top-of-section "ConvTranspose" paragraph for the
+    ``onnxruntime.quantization`` registry/``quantize_static`` round-trip
+    investigation this scope was reached from. If `node` is an ordinary
+    (``group=1``) 2-D ``ConvTranspose`` whose weight resolves
+    (:func:`_resolve_weight_ref`) to either a direct float initializer or a
+    QDQ one, returns ``(ref, bias_name_or_None, out_channels,
+    in_channels)`` -- the identical return shape :func:`_match_conv_qdq`
+    gives, so both feed the same `_QDQProducer`/`_QDQConsumer` construction
+    unchanged (only the extra `is_conv_transpose=True` flag callers set
+    differs). A grouped ``ConvTranspose`` is never matched here (mirroring
+    :func:`_match_conv_transpose_producer`'s own identical restriction for
+    the plain-float case, and kept even for the consumer role -- unlike
+    :func:`_match_conv_transpose_consumer`'s own any-`group` support --
+    since this whole section already restricts every Conv/MatMul/Gemm match
+    to `group == 1` on both sides; see this section's own top comment).
+
+    Unlike :func:`_match_conv_qdq`'s ``expected_axis=0``, this calls
+    :func:`_resolve_weight_ref` with ``expected_axis=1``:
+    ``ConvTranspose``'s own weight layout is ``[in_channels,
+    out_channels/group, k1, ..., kn]`` (the schema-documented reverse of
+    Conv's ``[out_channels, in_channels/group, ...]``, confirmed live via
+    ``onnx.defs.get_schema("ConvTranspose")``), so `out_channels` is
+    `dims[1]`, not `dims[0]`, and a per-channel QDQ weight's own scale/
+    zero-point (when present) is quantized along axis 1 to match --
+    confirmed both from ``onnxruntime.quantization``'s own source and by an
+    actual ``quantize_static`` round trip, see this section's own top
+    comment.
+    """
+    if node.op_type != "ConvTranspose" or len(node.input) < 2:
+        return None
+    if _conv_group(node) != 1:
+        return None  # grouped ConvTranspose -- declined, see above
+    w_name = node.input[1]
+    ref = _resolve_weight_ref(w_name, 4, 1, initializer_map, dq_of, consumers_of)
+    if ref is None:
+        return None
+    dims = _weight_ref_dims(ref)
+    in_channels, out_channels = dims[0], dims[1]
+    bias_name = None
+    if len(node.input) == 3 and node.input[2]:
+        bias_name = node.input[2]
+        b_init = initializer_map.get(bias_name)
+        if b_init is None or not _is_supported_float_dtype(b_init.data_type):
+            return None  # non-constant bias -- can't safely slice it
+    return ref, bias_name, out_channels, in_channels
+
+
 def _match_matmul_qdq(
     node: onnx.NodeProto,
     initializer_map: Dict[str, onnx.TensorProto],
@@ -9400,13 +9616,23 @@ def _walk_to_consumer_qdq(
 ) -> Optional[Tuple[_QDQConsumer, Tuple[onnx.NodeProto, ...]]]:
     """From tensor `start`, walks forward through shape-preserving unary
     activations (`_UNARY_PASS_THROUGH`) with no other consumer anywhere
-    along the way, until a same-family (Conv-only or MatMul/Gemm-only,
-    matching `is_conv`) consumer is found whose input-channel count matches
-    `n_channels`. No per-channel Add/Mul bias/scale hop, no depthwise Conv
-    pass-through, no branch -- narrower than :func:`_walk_to_consumer`/
-    :func:`_walk_to_conv_consumer` by design, see this section's own
-    top-of-section comment. Returns ``None`` if the walk runs out of hops,
-    hits a branch, or never reaches such a consumer.
+    along the way, until a same-family (Conv/ConvTranspose-only or
+    MatMul/Gemm-only, matching `is_conv`) consumer is found whose
+    input-channel count matches `n_channels`. No per-channel Add/Mul
+    bias/scale hop, no depthwise Conv pass-through, no branch -- narrower
+    than :func:`_walk_to_consumer`/:func:`_walk_to_conv_consumer` by
+    design, see this section's own top-of-section comment. Returns
+    ``None`` if the walk runs out of hops, hits a branch, or never reaches
+    such a consumer.
+
+    Within the `is_conv` family, a ``Conv`` consumer and a ``ConvTranspose``
+    consumer are both tried, in that order, regardless of which one this
+    chain's own producer was -- mirroring :func:`_walk_to_conv_consumer`'s
+    own float-path precedent of matching either producer family against
+    either consumer family (see :func:`_find_conv_chains`, which tries a
+    Conv producer before a ``ConvTranspose`` one, and
+    :func:`_walk_to_conv_consumer`, which tries a Conv consumer before a
+    ``ConvTranspose`` one, independently of the producer's own family).
     """
     chain_ops: List[onnx.NodeProto] = []
     cur = start
@@ -9423,6 +9649,12 @@ def _walk_to_consumer_qdq(
                     return None
                 ref, _bias, _out, _in = m
                 return _QDQConsumer(nxt, ref, False, True), tuple(chain_ops)
+            if nxt.op_type == "ConvTranspose" and nxt.input[0] == cur:
+                m = _match_conv_transpose_qdq(nxt, initializer_map, dq_of, consumers_of)
+                if m is None or m[3] != n_channels:
+                    return None
+                ref, _bias, _out, _in = m
+                return _QDQConsumer(nxt, ref, False, True, True), tuple(chain_ops)
         else:
             mm = _match_matmul_qdq(nxt, initializer_map, dq_of, consumers_of)
             if mm is not None and mm[0] == cur:
@@ -9452,7 +9684,12 @@ def _find_qdq_chains(graph: onnx.GraphProto) -> List[_QDQChain]:
     restricted to the single-producer/single-consumer/unary-hops-only
     topology :func:`_walk_to_consumer_qdq` matches, and requiring at least
     one side of the pair to actually be QDQ (a plain float/float pair is
-    :func:`apply_structured_pruning`'s own job, not duplicated here).
+    :func:`apply_structured_pruning`'s own job, not duplicated here). Tries
+    a Conv producer first, then (only if that declines -- the two
+    matchers' own `op_type` checks are mutually exclusive, so this is never
+    ambiguous) a ``ConvTranspose`` producer, mirroring
+    :func:`_find_conv_chains`'s own identical producer-matching order for
+    the plain-float case.
     """
     initializer_map = {t.name: t for t in graph.initializer}
     consumers_of = _consumers_of(graph)
@@ -9468,6 +9705,7 @@ def _find_qdq_chains(graph: onnx.GraphProto) -> List[_QDQChain]:
 
     chains: List[_QDQChain] = []
     for node in graph.node:
+        is_conv_transpose = False
         if node.op_type == "Conv":
             m = _match_conv_qdq(node, initializer_map, dq_of, consumers_of)
             if m is None:
@@ -9475,6 +9713,14 @@ def _find_qdq_chains(graph: onnx.GraphProto) -> List[_QDQChain]:
             ref, bias_name, out_channels, _in_channels = m
             weight_transposed = False
             is_conv = True
+        elif node.op_type == "ConvTranspose":
+            m = _match_conv_transpose_qdq(node, initializer_map, dq_of, consumers_of)
+            if m is None:
+                continue
+            ref, bias_name, out_channels, _in_channels = m
+            weight_transposed = False
+            is_conv = True
+            is_conv_transpose = True
         else:
             mm = _match_matmul_qdq(node, initializer_map, dq_of, consumers_of)
             if mm is None:
@@ -9504,7 +9750,14 @@ def _find_qdq_chains(graph: onnx.GraphProto) -> List[_QDQChain]:
 
         chains.append(
             _QDQChain(
-                producer=_QDQProducer(node, ref, bias_name, weight_transposed, is_conv),
+                producer=_QDQProducer(
+                    node,
+                    ref,
+                    bias_name,
+                    weight_transposed,
+                    is_conv,
+                    is_conv_transpose=is_conv_transpose,
+                ),
                 chain_ops=chain_ops,
                 consumer=consumer,
                 n_channels=out_channels,
@@ -9728,38 +9981,47 @@ def apply_structured_pruning_qdq(
     sparsity: float = 0.5,
     importance_norm: _ImportanceNorm = "l2",
 ) -> onnx.ModelProto:
-    """Removes whole output channels from a Conv or MatMul/vanilla-Gemm
-    layer whose weight -- on either side of the producer/consumer pair, or
-    both -- is statically quantized in the QDQ format (a constant int8/
-    uint8/int4/uint4 initializer fed through a ``DequantizeLinear`` node),
-    per-tensor, per-channel, or opset 21+ blockwise alike, the way
-    :func:`onnxsim.calibration.quantize_static` (and the wider ONNX
-    ecosystem's own standard static-quantization tooling, e.g. Olive or
-    Hugging Face Optimum's own INT4 weight-only exporters for the blockwise
-    case) produces one. See this module's "QDQ (quantized-weight)
-    structured pruning" section comment for the full investigation this
-    scope was reached from: what this repo's own QDQ tooling emits
-    (cross-checked against the live ``DequantizeLinear`` schema), why
-    structural pruning of a per-channel quantized weight reduces to the
-    same "slice, don't recompute" principle the FP16/BFloat16 weight
-    support above already established (co-slicing the int8 codes with
-    their own per-channel scale/zero-point on the producer side; touching
-    only the int8 codes, never the scale/zero-point, on the consumer
-    side), why a *blockwise* INT4/UINT4 weight's producer/consumer roles
-    are asymmetric in the OPPOSITE way (scale/zero-point untouched on the
-    producer side, block-aligned co-slicing -- or an outright decline for a
-    non-block-aligned `keep` set -- required on the consumer side, since
-    `block_size` always blocks the reduction axis, never the output-channel
-    one), why *unstructured* pruning of a QDQ weight is a fundamentally
-    harder, declined-rather-than-guessed-at problem (already naturally
-    excluded by every existing unstructured matcher, confirmed
-    empirically), and why the *opposite* composition -- pruning a float
-    model, then quantizing the result -- already works with no code changes
-    here at all.
+    """Removes whole output channels from a Conv, ``ConvTranspose``, or
+    MatMul/vanilla-Gemm layer whose weight -- on either side of the
+    producer/consumer pair, or both -- is statically quantized in the QDQ
+    format (a constant int8/uint8/int4/uint4 initializer fed through a
+    ``DequantizeLinear`` node), per-tensor, per-channel, or opset 21+
+    blockwise alike, the way :func:`onnxsim.calibration.quantize_static`
+    (and the wider ONNX ecosystem's own standard static-quantization
+    tooling, e.g. Olive or Hugging Face Optimum's own INT4 weight-only
+    exporters for the blockwise case, or ``onnxruntime.quantization
+    .quantize_static`` itself, which quantizes ``ConvTranspose`` through the
+    identical ``QDQConv`` machinery it uses for Conv) produces one. See
+    this module's "QDQ (quantized-weight) structured pruning" section
+    comment for the full investigation this scope was reached from: what
+    this repo's own QDQ tooling emits (cross-checked against the live
+    ``DequantizeLinear`` schema), why structural pruning of a per-channel
+    quantized weight reduces to the same "slice, don't recompute" principle
+    the FP16/BFloat16 weight support above already established (co-slicing
+    the int8 codes with their own per-channel scale/zero-point on the
+    producer side; touching only the int8 codes, never the scale/
+    zero-point, on the consumer side), why a *blockwise* INT4/UINT4
+    weight's producer/consumer roles are asymmetric in the OPPOSITE way
+    (scale/zero-point untouched on the producer side, block-aligned
+    co-slicing -- or an outright decline for a non-block-aligned `keep` set
+    -- required on the consumer side, since `block_size` always blocks the
+    reduction axis, never the output-channel one), why *unstructured*
+    pruning of a QDQ weight is a fundamentally harder, declined-rather-
+    than-guessed-at problem (already naturally excluded by every existing
+    unstructured matcher, confirmed empirically), why ``ConvTranspose``'s
+    own reversed ``[in_channels, out_channels/group, ...]`` weight layout
+    (confirmed against the live schema, and against a real
+    ``quantize_static`` round trip's own emitted `axis` attribute) needs
+    only a different `expected_axis` passed into the exact same
+    :func:`_resolve_weight_ref`/slicing machinery Conv already uses -- no
+    parallel code path -- and why the *opposite* composition -- pruning a
+    float model, then quantizing the result -- already works with no code
+    changes here at all.
 
-    For every Conv (``group=1``) or MatMul/vanilla-Gemm node (the
-    "producer") whose output feeds, through zero or more shape-preserving
-    unary activations (`_UNARY_PASS_THROUGH`) with no other consumer
+    For every Conv/``ConvTranspose`` (``group=1``, either op) or
+    MatMul/vanilla-Gemm node (the "producer") whose output feeds, through
+    zero or more shape-preserving unary activations
+    (`_UNARY_PASS_THROUGH`) with no other consumer
     anywhere along that path, into exactly one downstream same-family node
     (the "consumer") whose input/reduction dimension matches -- and where at
     least one of the two is QDQ-quantized (a plain float/float pair is
@@ -9811,14 +10073,34 @@ def apply_structured_pruning_qdq(
     including the identical blockwise block-alignment check and whole-chain
     decline when the keep-set doesn't land on whole `block_size` blocks.
     Gated pairs are MatMul/Gemm-only, mirroring :func:`_find_gated_chains`'s
-    own restriction -- Conv chains never take part in this composition.
+    own restriction -- Conv/``ConvTranspose`` chains never take part in
+    this composition.
 
-    No general grouped/depthwise Conv, residual/skip-connection merge, or
-    Concat-merged branch group is matched for a QDQ chain -- every one of
-    those is already a materially bigger project for the plain float case
-    (:func:`apply_structured_pruning`'s own docstring); composing any of
-    them with QDQ's extra scale/zero-point bookkeeping is out of scope here
-    (see this module's "QDQ" section comment for the full reasoning). Call
+    ``ConvTranspose`` is matched by the same walk as Conv (both a producer
+    and a consumer role, either op independently of the other -- a Conv
+    producer may feed a ``ConvTranspose`` consumer or vice versa, mirroring
+    :func:`_find_conv_chains`'s own plain-float precedent), restricted to
+    ``group=1`` on BOTH roles -- narrower than the plain-float
+    ``ConvTranspose`` consumer's own any-`group` support, since this
+    section already narrows every Conv/MatMul/Gemm match to `group=1` on
+    both sides regardless (see this module's "QDQ" section comment's own
+    "ConvTranspose" paragraph for the full reasoning and the empirical
+    ``onnxruntime.quantization`` registry/``quantize_static`` confirmation
+    this was reached from). Its own reversed weight layout
+    (``[in_channels, out_channels/group, ...]``, `out_channels` on axis 1
+    rather than 0) is handled entirely by :func:`_match_conv_transpose_qdq`
+    passing `expected_axis=1` into :func:`_resolve_weight_ref`, and by the
+    `is_conv_transpose` flag :func:`_slice_producer_weight_qdq`/
+    :func:`_slice_consumer_weight_qdq` branch on -- the exact same
+    machinery Conv uses, just with that one axis parameterized differently.
+
+    No general grouped/depthwise Conv or ``ConvTranspose``, residual/skip-
+    connection merge, or Concat-merged branch group is matched for a QDQ
+    chain -- every one of those is already a materially bigger project for
+    the plain float case (:func:`apply_structured_pruning`'s own
+    docstring); composing any of them with QDQ's extra scale/zero-point
+    bookkeeping is out of scope here (see this module's "QDQ" section
+    comment for the full reasoning). Call
     :func:`apply_structured_pruning`/:func:`apply_structured_wanda_pruning`
     for those topologies on an all-float graph, and this function for the
     narrower QDQ-aware slice above (gated pair included); the two never
@@ -9868,7 +10150,7 @@ def apply_structured_pruning_qdq(
             continue  # rounds down to nothing for this layer -- no-op
 
         w = _weight_ref_dequantized(p.ref)
-        w_nk = _weight_to_nk(w, p.weight_transposed, p.is_conv)
+        w_nk = _weight_to_nk(w, p.weight_transposed, p.is_conv, p.is_conv_transpose)
         importance = _qdq_channel_importance(w_nk, importance_norm)
         # `kind="stable"` matters here specifically (unlike most other
         # argsort call sites in this module, which never feed into a
@@ -9896,14 +10178,18 @@ def apply_structured_pruning_qdq(
                 # consumer -- decline the whole chain, see this function's
                 # own top comment
 
-        _slice_producer_weight_qdq(p.ref, p.weight_transposed, keep, p.is_conv)
+        _slice_producer_weight_qdq(
+            p.ref, p.weight_transposed, keep, p.is_conv, p.is_conv_transpose
+        )
         if p.bias is not None:
             _slice_last_axis(initializer_map[p.bias], keep)
         if keep_blocks is not None:
             assert c.ref.qdq_block is not None
             _slice_consumer_weight_qdq_block(c.ref.qdq_block, keep, keep_blocks)
         else:
-            _slice_consumer_weight_qdq(c.ref, c.weight_transposed, keep, c.is_conv)
+            _slice_consumer_weight_qdq(
+                c.ref, c.weight_transposed, keep, c.is_conv, c.is_conv_transpose
+            )
 
         producer_touched.add(p_key)
         consumer_touched.add(c_key)
@@ -19546,11 +19832,15 @@ class PruningLayerSensitivity:
             ``"matmul_residual"``/``"conv_plain"``/``"conv_residual"`` for
             structured pruning; ``"qdq_conv"``/``"qdq_matmul"`` for
             :func:`apply_structured_pruning_qdq` (split by whether the
-            matched producer is a Conv or a MatMul/vanilla-Gemm --
-            `_find_qdq_chains` matches both through one unified walk,
-            unlike the plain float structured family's five separate
-            finders, so this is the one family-string split available for
-            it); ``"attention_head"`` (plain merged-QKV
+            matched producer is a Conv/``ConvTranspose`` or a
+            MatMul/vanilla-Gemm -- a ``ConvTranspose`` producer/consumer
+            gets ``"qdq_conv"`` too, no separate family string, mirroring
+            ``"conv_plain"``'s own identical Conv/``ConvTranspose``
+            treatment above -- `_find_qdq_chains` matches all three shapes
+            through one unified walk, unlike the plain float structured
+            family's five separate finders, so this is the one
+            family-string split available for it); ``"attention_head"``
+            (plain merged-QKV
             ``com.microsoft::Attention``)/``"attention_gqa_group"``
             (``GroupQueryAttention``/plain ``ai.onnx::Attention``, whole-KV-
             group granularity)/``"attention_mha_head"``
@@ -20263,6 +20553,14 @@ def _qdq_not_eligible(
     chains: List[_QDQChain],
     gated_chains: List[_QDQGatedChain],
 ) -> List[str]:
+    """Includes ``ConvTranspose`` alongside Conv/MatMul/Gemm (unlike the
+    plain-float structured family's own :func:`_structured_not_eligible`,
+    which never lists an unmatched ``ConvTranspose`` at all) -- an
+    unmatched ``ConvTranspose`` here (e.g. a grouped one, declined by
+    :func:`_match_conv_transpose_qdq`'s own ``group == 1`` check) is now a
+    real, reportable decline this section can name, since this section's
+    own chain-finding matches ``ConvTranspose`` in the first place.
+    """
     matched_ids: Set[int] = set()
     for chain in chains:
         matched_ids.add(id(chain.producer.node))
@@ -20273,7 +20571,7 @@ def _qdq_not_eligible(
         matched_ids.add(id(gchain.consumer.node))
     not_eligible = []
     for node in graph.node:
-        if node.op_type not in ("Conv", "MatMul", "Gemm"):
+        if node.op_type not in ("Conv", "ConvTranspose", "MatMul", "Gemm"):
             continue
         if id(node) in matched_ids:
             continue
@@ -20300,11 +20598,17 @@ def _analyze_structured_pruning_qdq(
     same helper :func:`apply_structured_pruning_qdq` itself calls, never
     for the actual rewrite) logic, reused directly, but `model` is never
     mutated. `family` is ``"qdq_conv"``/``"qdq_matmul"`` depending on
-    whether the matched producer is a Conv or a MatMul/vanilla-Gemm --
-    :func:`_find_qdq_chains` matches both shapes through one unified
-    walk, unlike the plain float structured family's five separate
-    finders, so this is the one family-string split available to tell
-    the two apart.
+    whether the matched producer is a Conv/``ConvTranspose`` or a
+    MatMul/vanilla-Gemm -- :func:`_find_qdq_chains` matches all three
+    shapes through one unified walk, unlike the plain float structured
+    family's five separate finders, so this is the one family-string split
+    available to tell them apart; a ``ConvTranspose`` producer/consumer
+    gets the same ``"qdq_conv"`` string a Conv one does (no separate
+    ``"qdq_conv_transpose"`` family -- the reporting granularity, one row
+    per matched channel-pruning unit, is identical between the two, and
+    this mirrors the plain-float structured family's own identical
+    treatment: ``family="conv_plain"`` regardless of Conv vs
+    ``ConvTranspose``, see :func:`_structured_chain_groups`).
 
     A degenerate chain naming the exact same weight in both the producer
     and consumer role gets no report row at all (mirroring
@@ -20399,7 +20703,7 @@ def _analyze_structured_pruning_qdq(
             continue  # rounds down to nothing for this chain -- no-op
 
         w = _weight_ref_dequantized(p.ref)
-        w_nk = _weight_to_nk(w, p.weight_transposed, p.is_conv)
+        w_nk = _weight_to_nk(w, p.weight_transposed, p.is_conv, p.is_conv_transpose)
         importance = _qdq_channel_importance(w_nk, importance_norm)
         # `kind="stable"` to match `apply_structured_pruning_qdq`'s own
         # tie-break exactly (see that function's own comment on this same

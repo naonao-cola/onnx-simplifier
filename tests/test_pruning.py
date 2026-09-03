@@ -21714,6 +21714,389 @@ def test_qdq_structured_pruning_conv_both_sides_qdq_matches_oracle():
     np.testing.assert_allclose(y, y_oracle, rtol=1e-4, atol=1e-4)
 
 
+# --- QDQ ConvTranspose -------------------------------------------------
+#
+# Mirrors tests/test_pruning.py's own plain-float
+# "Conv1d / Conv3d / ConvTranspose structural pruning" section
+# (`_conv_transpose_then_conv_model`/`_conv_then_conv_transpose_model`
+# above) but with a QDQ (int8, DequantizeLinear-fed) ConvTranspose weight
+# on one or both sides -- see onnxsim/pruning.py's own "QDQ" section
+# top comment for the empirical onnxruntime.quantization registry/
+# quantize_static investigation this was reached from, and its own
+# "ConvTranspose" paragraph for the exact axis reasoning these tests
+# confirm.
+
+
+def _qdq_conv_transpose_producer_then_conv_model(Wq_ct, Wscale_ct, w2, spatial=10):
+    # QDQ ConvTranspose *producer* -> plain float Conv consumer. `Wq_ct` is
+    # int8, `[Cin, M, kH, kW]` (ConvTranspose's own reversed layout);
+    # `Wscale_ct` is per-channel on axis 1 (`M`, this weight's own
+    # output-channel axis -- confirmed via a real quantize_static round
+    # trip, see onnxsim/pruning.py's own "QDQ" section top comment). `w2`
+    # is Conv's ordinary `[Cout, M, kH, kW]` float weight, consuming `M` on
+    # its own (ordinary) axis 1.
+    Cin = Wq_ct.shape[0]
+    Cout = w2.shape[0]
+    mid_spatial = spatial + 2  # ConvTranspose, unit stride, valid: in - 1 + k
+    out_spatial = mid_spatial - 2  # following Conv, valid 3x3
+    return _model(
+        f"""
+        g (float[N,{Cin},{spatial},{spatial}] X) => (float[N,{Cout},{out_spatial},{out_spatial}] Y)
+        {{
+          WCTdq = DequantizeLinear<axis=1>(WqCT, WscaleCT)
+          h = ConvTranspose<kernel_shape=[3,3]>(X, WCTdq)
+          a = Relu(h)
+          Y = Conv<kernel_shape=[3,3]>(a, W2)
+        }}
+        """,
+        initializer=[_i8(Wq_ct, "WqCT"), _f32(Wscale_ct, "WscaleCT"), _f32(w2, "W2")],
+    )
+
+
+def test_qdq_structured_pruning_conv_transpose_producer_matches_oracle():
+    # THE single most important test in this section: confirms the axis
+    # DIRECTION for a QDQ ConvTranspose producer is correct. Cin, M, Cout
+    # deliberately distinct (5, 8, 6) so a reversed-axis bug -- slicing the
+    # wrong, wrongly-sized axis of either Wq or Wscale -- would either make
+    # onnx.checker/onnxruntime itself refuse the pruned graph's shapes, or
+    # (worse) silently run with a WRONG answer; the oracle comparison below
+    # catches that latter case even if the shapes happen to still line up.
+    Cin, M, Cout = 5, 8, 6
+    rng = np.random.default_rng(400)
+    Wq = rng.integers(-100, 100, size=(Cin, M, 3, 3)).astype(np.int8)
+    Wscale = np.abs(rng.standard_normal(M)).astype(np.float32) * 0.02 + 0.001
+    w2 = rng.standard_normal((Cout, M, 3, 3)).astype(np.float32)
+    model = _qdq_conv_transpose_producer_then_conv_model(Wq, Wscale, w2)
+    onnx.checker.check_model(model)
+
+    pruned = onnxsim.apply_structured_pruning_qdq(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    keep_count = M - round(M * 0.5)
+    inits = {t.name: t for t in pruned.graph.initializer}
+    assert list(inits["WqCT"].dims) == [Cin, keep_count, 3, 3]  # axis 1 sliced
+    assert list(inits["WscaleCT"].dims) == [keep_count]
+    assert list(inits["W2"].dims) == [Cout, keep_count, 3, 3]
+
+    # Oracle keep-set: dequantize with an INDEPENDENT reference formula
+    # (`_qdq_dequant`, not anything from onnxsim.pruning), then move the
+    # output-channel axis (1, ConvTranspose's own reversed convention) to
+    # the front before ranking -- mirrors `_weight_to_nk`'s own
+    # `is_conv_transpose` branch, but reimplemented from scratch here.
+    w_dequant = _qdq_dequant(Wq, Wscale, None, axis=1)
+    w_nk = np.moveaxis(w_dequant, 1, 0).reshape(M, -1)
+    importance = np.linalg.norm(w_nk, axis=1)
+    keep = np.sort(np.argsort(-importance)[:keep_count])
+
+    # Independently reconstructed "already pruned" reference model -- never
+    # a post-hoc slice of the UNPRUNED model's own output -- run through a
+    # real onnxruntime session, same as the pruned model itself.
+    oracle = _qdq_conv_transpose_producer_then_conv_model(
+        Wq[:, keep], Wscale[keep], w2[:, keep]
+    )
+    onnx.checker.check_model(oracle)
+
+    rng_x = np.random.default_rng(401)
+    x = rng_x.standard_normal((2, Cin, 10, 10)).astype(np.float32)
+    (y,) = _run_unfused(pruned, {"X": x})
+    (y_oracle,) = _run_unfused(oracle, {"X": x})
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-4, atol=1e-4)
+
+    # And the pruned graph's own WqCT/WscaleCT, dequantized, reproduce
+    # exactly the hand-sliced reference -- confirms the lockstep co-slice
+    # itself, not just the end-to-end numeric output.
+    wq_pruned = onnx.numpy_helper.to_array(inits["WqCT"])
+    wscale_pruned = onnx.numpy_helper.to_array(inits["WscaleCT"])
+    np.testing.assert_array_equal(wq_pruned, Wq[:, keep])
+    np.testing.assert_allclose(wscale_pruned, Wscale[keep])
+
+
+def _qdq_conv_then_conv_transpose_consumer_model(w1, Wq_ct, Wscale_ct, spatial=10):
+    # Plain float Conv producer -> QDQ ConvTranspose *consumer*. `w1` is an
+    # ordinary Conv's `[C1, Cin, kH, kW]` float weight (`C1`, axis 0,
+    # pruned as always); `Wq_ct` is ConvTranspose's own reversed
+    # `[C1, Cout, kH, kW]` int8 weight, consuming `C1` on its own axis 0 --
+    # the reverse of an ordinary Conv consumer's axis 1, flat regardless of
+    # `group` (the matcher itself restricts `group=1` here, but the slice
+    # shape used is the same flat form `_match_conv_transpose_consumer`'s
+    # own float precedent uses for any `group`).
+    Cin = w1.shape[1]
+    Cout = Wq_ct.shape[1]
+    mid_spatial = spatial - 2  # producer Conv, valid 3x3
+    out_spatial = mid_spatial + 2  # ConvTranspose, unit stride, valid
+    return _model(
+        f"""
+        g (float[N,{Cin},{spatial},{spatial}] X) => (float[N,{Cout},{out_spatial},{out_spatial}] Y)
+        {{
+          h = Conv<kernel_shape=[3,3]>(X, W1)
+          a = Relu(h)
+          WCTdq = DequantizeLinear<axis=1>(WqCT, WscaleCT)
+          Y = ConvTranspose<kernel_shape=[3,3]>(a, WCTdq)
+        }}
+        """,
+        initializer=[_f32(w1, "W1"), _i8(Wq_ct, "WqCT"), _f32(Wscale_ct, "WscaleCT")],
+    )
+
+
+def test_qdq_structured_pruning_conv_transpose_consumer_matches_oracle():
+    # The consumer-role counterpart: ConvTranspose's own INPUT-channel axis
+    # (0, flat) must be sliced, not axis 1 (its own per-channel/output
+    # axis, left untouched here exactly like an ordinary QDQ consumer's
+    # scale/zero-point).
+    C1, Cin, Cout = 8, 5, 6
+    rng = np.random.default_rng(402)
+    w1 = rng.standard_normal((C1, Cin, 3, 3)).astype(np.float32)
+    Wq = rng.integers(-100, 100, size=(C1, Cout, 3, 3)).astype(np.int8)
+    Wscale = np.abs(rng.standard_normal(Cout)).astype(np.float32) * 0.02 + 0.001
+    model = _qdq_conv_then_conv_transpose_consumer_model(w1, Wq, Wscale)
+    onnx.checker.check_model(model)
+
+    pruned = onnxsim.apply_structured_pruning_qdq(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    keep_count = C1 - round(C1 * 0.5)
+    inits = {t.name: t for t in pruned.graph.initializer}
+    assert list(inits["W1"].dims) == [keep_count, Cin, 3, 3]
+    assert list(inits["WqCT"].dims) == [keep_count, Cout, 3, 3]  # axis 0 sliced
+    assert list(inits["WscaleCT"].dims) == [Cout]  # consumer's own scale untouched
+
+    keep = _oracle_keep_indices_conv(w1, keep_count)
+    oracle = _qdq_conv_then_conv_transpose_consumer_model(w1[keep], Wq[keep], Wscale)
+    onnx.checker.check_model(oracle)
+
+    rng_x = np.random.default_rng(403)
+    x = rng_x.standard_normal((2, Cin, 10, 10)).astype(np.float32)
+    (y,) = _run_unfused(pruned, {"X": x})
+    (y_oracle,) = _run_unfused(oracle, {"X": x})
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-4, atol=1e-4)
+
+
+def test_qdq_structured_pruning_conv_transpose_both_sides_qdq_matches_oracle():
+    # ConvTranspose -> ConvTranspose, both sides QDQ-quantized: the
+    # producer's own axis-1 co-slice (Wq/Wscale together) composed with the
+    # consumer's own axis-0 flat slice (Wq only, Wscale untouched), in one
+    # chain.
+    Cin, M, Cout = 4, 8, 4
+    rng = np.random.default_rng(404)
+    Wq1 = rng.integers(-100, 100, size=(Cin, M, 1, 1)).astype(np.int8)
+    Wscale1 = np.abs(rng.standard_normal(M)).astype(np.float32) * 0.02 + 0.001
+    Wq2 = rng.integers(-100, 100, size=(M, Cout, 1, 1)).astype(np.int8)
+    Wscale2 = np.abs(rng.standard_normal(Cout)).astype(np.float32) * 0.02 + 0.001
+    model = _model(
+        f"""
+        g (float[1,{Cin},4,4] X) => (float[1,{Cout},4,4] Y)
+        {{
+          W1dq = DequantizeLinear<axis=1>(Wq1, Wscale1)
+          h = ConvTranspose(X, W1dq)
+          W2dq = DequantizeLinear<axis=1>(Wq2, Wscale2)
+          Y = ConvTranspose(h, W2dq)
+        }}
+        """,
+        initializer=[
+            _i8(Wq1, "Wq1"),
+            _f32(Wscale1, "Wscale1"),
+            _i8(Wq2, "Wq2"),
+            _f32(Wscale2, "Wscale2"),
+        ],
+    )
+    onnx.checker.check_model(model)
+
+    pruned = onnxsim.apply_structured_pruning_qdq(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    inits = {t.name: t for t in pruned.graph.initializer}
+    assert list(inits["Wq1"].dims) == [Cin, M // 2, 1, 1]
+    assert list(inits["Wscale1"].dims) == [M // 2]
+    assert list(inits["Wq2"].dims) == [M // 2, Cout, 1, 1]
+    assert list(inits["Wscale2"].dims) == [Cout]  # consumer's own scale untouched
+
+    w1_dequant = _qdq_dequant(Wq1, Wscale1, None, axis=1)
+    w1_nk = np.moveaxis(w1_dequant, 1, 0).reshape(M, -1)
+    keep = np.sort(np.argsort(-np.linalg.norm(w1_nk, axis=1))[: M // 2])
+    w2_dequant = _qdq_dequant(Wq2, Wscale2, None, axis=1)
+
+    rng_x = np.random.default_rng(405)
+    x = rng_x.standard_normal((1, Cin, 4, 4)).astype(np.float32)
+    (y,) = _run_unfused(pruned, {"X": x})
+
+    ref_model = onnx.helper.make_model(
+        onnx.helper.make_graph(
+            [
+                onnx.helper.make_node("ConvTranspose", ["X", "W1"], ["h"]),
+                onnx.helper.make_node("ConvTranspose", ["h", "W2"], ["Y"]),
+            ],
+            "oracle",
+            [onnx.helper.make_tensor_value_info("X", onnx.TensorProto.FLOAT, None)],
+            [onnx.helper.make_tensor_value_info("Y", onnx.TensorProto.FLOAT, None)],
+            initializer=[
+                onnx.numpy_helper.from_array(
+                    w1_dequant[:, keep].astype(np.float32), name="W1"
+                ),
+                onnx.numpy_helper.from_array(
+                    w2_dequant[keep, :].astype(np.float32), name="W2"
+                ),
+            ],
+        ),
+        opset_imports=[onnx.helper.make_opsetid("", 21)],
+        ir_version=10,
+    )
+    (y_oracle,) = _run_unfused(ref_model, {"X": x})
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-4, atol=1e-4)
+
+
+def test_qdq_structured_pruning_declines_grouped_conv_transpose_producer():
+    # A grouped ConvTranspose (group != 1) is declined as a producer --
+    # narrower than the plain-float ConvTranspose CONSUMER's own any-group
+    # support, since this whole section restricts every Conv/MatMul/Gemm
+    # match to group=1 on both sides regardless (see onnxsim/pruning.py's
+    # own "QDQ" section top comment).
+    Cin, M, group = 4, 8, 2
+    rng = np.random.default_rng(406)
+    Wq = rng.integers(-100, 100, size=(Cin, M // group, 1, 1)).astype(np.int8)
+    Wscale = np.abs(rng.standard_normal(M // group)).astype(np.float32) * 0.02 + 0.001
+    model = _model(
+        f"""
+        g (float[1,{Cin},2,2] X) => (float[1,{M},2,2] Y)
+        {{
+          Wdq = DequantizeLinear<axis=1>(Wq, Wscale)
+          Y = ConvTranspose<group={group}>(X, Wdq)
+        }}
+        """,
+        initializer=[_i8(Wq, "Wq"), _f32(Wscale, "Wscale")],
+    )
+    onnx.checker.check_model(model)
+    pruned = onnxsim.apply_structured_pruning_qdq(model, sparsity=0.5)
+    inits = {t.name: t for t in pruned.graph.initializer}
+    assert list(inits["Wq"].dims) == list(Wq.shape)  # untouched -- declined
+
+
+def test_qdq_structured_pruning_declines_grouped_conv_transpose_consumer():
+    # The consumer-role counterpart: a grouped ConvTranspose consumer is
+    # ALSO declined here (unlike apply_structured_pruning's own plain-float
+    # ConvTranspose consumer, which supports any group) -- the whole chain,
+    # producer included, is left completely untouched.
+    C1, Cin, Cout, group = 8, 4, 8, 2
+    rng = np.random.default_rng(407)
+    w1 = rng.standard_normal((C1, Cin, 1, 1)).astype(np.float32)
+    Wq = rng.integers(-100, 100, size=(C1, Cout // group, 1, 1)).astype(np.int8)
+    Wscale = (
+        np.abs(rng.standard_normal(Cout // group)).astype(np.float32) * 0.02 + 0.001
+    )
+    model = _model(
+        f"""
+        g (float[1,{Cin},2,2] X) => (float[1,{Cout},2,2] Y)
+        {{
+          h = Conv(X, W1)
+          Wdq = DequantizeLinear<axis=1>(Wq, Wscale)
+          Y = ConvTranspose<group={group}>(h, Wdq)
+        }}
+        """,
+        initializer=[_f32(w1, "W1"), _i8(Wq, "Wq"), _f32(Wscale, "Wscale")],
+    )
+    onnx.checker.check_model(model)
+    pruned = onnxsim.apply_structured_pruning_qdq(model, sparsity=0.5)
+    inits = {t.name: t for t in pruned.graph.initializer}
+    assert list(inits["W1"].dims) == list(w1.shape)  # untouched -- whole chain
+    assert list(inits["Wq"].dims) == list(Wq.shape)  # declined, consumer grouped
+
+
+def test_qdq_blockwise_conv_transpose_producer_matches_oracle():
+    # Light plumbing check only -- see onnxsim/pruning.py's own "QDQ"
+    # section top comment for why real blockwise INT4/UINT4-quantized
+    # ConvTranspose models are not expected in practice (block-quantization
+    # tooling targets large-reduction-axis MatMul/Gemm weights, not Conv-
+    # family ones); this just confirms `_match_conv_transpose_qdq`'s own
+    # `expected_axis=1` correctly threads through
+    # `_match_dequantize_linear_weight_blockwise` to block axis 0 (`Cin`,
+    # ConvTranspose's own reduction axis), NOT axis 1 (`M`, its own
+    # output-channel axis) -- mirroring
+    # test_qdq_blockwise_conv_producer_matches_oracle's own Conv analogue.
+    Cin, M, Cout, block_size = 8, 8, 4, 4
+    cin_blocks = Cin // block_size
+    rng = np.random.default_rng(410)
+    Wq1 = rng.integers(-8, 8, size=(Cin, M, 1, 1)).astype(np.int8)
+    Wscale1 = (
+        np.abs(rng.standard_normal((cin_blocks, M, 1, 1))).astype(np.float32) * 0.02
+        + 0.001
+    )
+    w2 = rng.standard_normal((Cout, M, 1, 1)).astype(np.float32)
+    model = _model(
+        f"""
+        g (float[1,{Cin},4,4] X) => (float[1,{Cout},4,4] Y)
+        {{
+          WCTdq = DequantizeLinear<axis=0, block_size={block_size}>(W1q, W1s)
+          h = ConvTranspose(X, WCTdq)
+          Y = Conv(h, W2)
+        }}
+        """,
+        initializer=[_int4(Wq1, "W1q"), _f32(Wscale1, "W1s"), _f32(w2, "W2")],
+    )
+    onnx.checker.check_model(model)
+
+    pruned = onnxsim.apply_structured_pruning_qdq(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    inits = {t.name: t for t in pruned.graph.initializer}
+    assert list(inits["W1q"].dims) == [Cin, M // 2, 1, 1]  # axis 1 sliced
+    assert list(inits["W1s"].dims) == [cin_blocks, M // 2, 1, 1]
+    assert list(inits["W2"].dims) == [Cout, M // 2, 1, 1]
+
+    w1_dequant = _qdq_block_dequant(Wq1, Wscale1, None, axis=0, block_size=block_size)
+    w1_nk = np.moveaxis(w1_dequant, 1, 0).reshape(M, -1)
+    keep = np.sort(np.argsort(-np.linalg.norm(w1_nk, axis=1))[: M // 2])
+
+    rng2 = np.random.default_rng(411)
+    x = rng2.standard_normal((1, Cin, 4, 4)).astype(np.float32)
+    (y,) = _run_unfused(pruned, {"X": x})
+
+    ref_model = onnx.helper.make_model(
+        onnx.helper.make_graph(
+            [
+                onnx.helper.make_node("ConvTranspose", ["X", "W1"], ["h"]),
+                onnx.helper.make_node("Conv", ["h", "W2"], ["Y"]),
+            ],
+            "oracle",
+            [onnx.helper.make_tensor_value_info("X", onnx.TensorProto.FLOAT, None)],
+            [onnx.helper.make_tensor_value_info("Y", onnx.TensorProto.FLOAT, None)],
+            initializer=[
+                onnx.numpy_helper.from_array(
+                    w1_dequant[:, keep].astype(np.float32), name="W1"
+                ),
+                onnx.numpy_helper.from_array(w2[:, keep], name="W2"),
+            ],
+        ),
+        opset_imports=[onnx.helper.make_opsetid("", 21)],
+        ir_version=10,
+    )
+    (y_oracle,) = _run_unfused(ref_model, {"X": x})
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-4, atol=1e-4)
+
+
+def test_analyze_structured_pruning_qdq_conv_transpose_matches_real_call():
+    # Dry-run/real-call parity for a QDQ ConvTranspose producer chain --
+    # mirrors test_analyze_structured_pruning_qdq_matches_real_call's own
+    # MatMul version.
+    Cin, M, Cout = 5, 8, 6
+    rng = np.random.default_rng(412)
+    Wq = rng.integers(-100, 100, size=(Cin, M, 3, 3)).astype(np.int8)
+    Wscale = np.abs(rng.standard_normal(M)).astype(np.float32) * 0.02 + 0.001
+    w2 = rng.standard_normal((Cout, M, 3, 3)).astype(np.float32)
+    model = _qdq_conv_transpose_producer_then_conv_model(Wq, Wscale, w2)
+
+    report = onnxsim.analyze_pruning_sensitivity(
+        model, onnxsim.apply_structured_pruning_qdq, sparsity=0.5
+    )
+    assert len(report.layers) == 1
+    layer = report.layers[0]
+    assert layer.family == "qdq_conv"  # no separate "qdq_conv_transpose" family
+    assert layer.total == M
+    assert report.not_eligible == []
+
+    pruned = onnxsim.apply_structured_pruning_qdq(model, sparsity=0.5)
+    inits = {t.name: t for t in pruned.graph.initializer}
+    kept = M - layer.would_drop
+    assert inits["WqCT"].dims[1] == kept
+    assert inits["W2"].dims[1] == kept
+
+
 def test_qdq_structured_pruning_declines_blocked_quantization():
     # opset-21 blocked quantization (block_size set, scale rank == weight
     # rank) -- a materially different granularity this matcher explicitly
