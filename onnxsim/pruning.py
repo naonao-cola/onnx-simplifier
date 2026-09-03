@@ -17789,11 +17789,48 @@ def apply_qmoe_whole_expert_pruning(
 # never two different ways) regardless of which of the two tied sub-shapes
 # matched it.
 #
+# A *second* producer shape is also matched, alongside the plain `Gather`
+# above: ``com.microsoft::EmbedLayerNormalization``, the single fused node
+# onnxruntime's own BERT-family graph optimizer collapses a
+# word+position+(optional)segment embedding lookup *and* the LayerNorm
+# that follows them into (confirmed by reading
+# `onnxruntime.transformers.fusion_embedlayer.FusionEmbedLayerNoMask`'s own
+# docstring/fusion methods directly from the installed `onnxruntime`
+# package -- it names BERT/DistilBert/ALBert explicitly). On a graph that
+# has already been through that optimizer there is no plain `Gather` left
+# to find at all, so this second shape is the only way to still reach the
+# token embedding table. See :func:`_match_embed_layer_norm_producer`'s own
+# docstring for the exact schema (pulled live from
+# `onnxruntime.capi.onnxruntime_pybind11_state.get_all_operator_schema()`)
+# and, in detail, three scope decisions specific to this shape: only its
+# `word_embedding` input (indexed by `input_ids`, the real token
+# vocabulary) is ever pruned -- `position_embedding`
+# (indexed by sequence position, an unrelated axis) and `segment_embedding`
+# (indexed by `segment_ids`/`token_type_ids`, a different, small index
+# space this pass's single `id_map` cannot also cover) are always left
+# completely untouched; `gamma`/`beta` (the fused LayerNorm's own
+# `hidden_size`-shaped affine parameters) need no changes since this pass
+# never touches `hidden_size`; and the node's optional `mask_index`/
+# `embedding_sum` outputs need no "declined if consumed downstream"
+# handling the way `SkipLayerNormalization`'s own optional secondary
+# outputs do (see that family's own section comment), because neither
+# output's shape *or* value depends on `vocab_size` at all -- confirmed
+# both from the schema and empirically via a real `InferenceSession` run.
+# Once matched, an `EmbedLayerNormalization` node is treated completely
+# interchangeably with a plain `Gather` by everything downstream in this
+# section (:func:`_match_embedding_chain`'s own single dispatch loop, the
+# tied/untied `lm_head` search, the actual row-slicing in
+# :func:`_apply_embedding_vocab_prune`) -- none of that logic assumes its
+# matched producer is literally a `Gather`.
+#
 # Matching/safety bar, held to the same conservative standard as every
 # other pass in this module -- decline outright, model left completely
 # untouched, rather than guess, for anything not confidently recognized:
 #
-# - the `Gather`'s own `axis` must be exactly `0`;
+# - the `Gather`'s own `axis` must be exactly `0` (the
+#   `EmbedLayerNormalization` shape has no `axis` attribute to check at
+#   all -- its `word_embedding` input is unconditionally `[vocab_size,
+#   hidden_size]`, per its own schema);
 # - its `indices` operand must itself be one of the graph's own declared
 #   inputs, or (the one bounded hop allowed, since it is extremely common
 #   in real exports -- an integer dtype cast between the tokenizer's own
@@ -17829,12 +17866,15 @@ def apply_qmoe_whole_expert_pruning(
 #   own output, an `Add` operand of the wrong width, ...) declines that
 #   `lm_head` match outright, rather than silently leaving an unrecognized
 #   bias at the old, now-mismatched width;
-# - when more than one qualifying `Gather` pattern exists in the graph and
+# - when more than one qualifying producer -- `Gather` or
+#   `EmbedLayerNormalization`, counted together -- exists in the graph and
 #   the caller hasn't named which one via `input_name`, the whole call
 #   declines -- there is no reliable structural way to tell "the" token
 #   embedding apart from e.g. a positional embedding that also happens to
 #   read a genuine graph input (`position_ids`) through the identical
-#   `Gather(data, indices, axis=0)` shape.
+#   `Gather(data, indices, axis=0)` shape, or, symmetrically, apart from a
+#   second, unrelated `EmbedLayerNormalization` block elsewhere in the
+#   graph.
 #
 # Which vocabulary rows are safe to keep is fundamentally a question this
 # pass cannot answer from the graph alone -- calibration data can show a
@@ -17900,7 +17940,21 @@ class _LMHeadMatch:
 
 @dataclass(frozen=True)
 class _EmbeddingChain:
-    gather: onnx.NodeProto
+    """`producer` is the matched embedding-table node -- a plain `Gather`
+    (:func:`_match_embedding_gather`) or, for a BERT-family model already
+    fused by onnxruntime's own graph optimizer, a
+    ``com.microsoft::EmbedLayerNormalization`` node
+    (:func:`_match_embed_layer_norm_producer`) -- whichever one
+    :func:`_match_embedding_chain` matched; every other field means exactly
+    the same thing regardless of which one it is: `weight_name` is always
+    the token-vocabulary weight itself (the `Gather`'s own `data` input, or
+    the `EmbedLayerNormalization` node's own `word_embedding` input), never
+    a position- or segment-embedding table (see
+    :func:`_match_embed_layer_norm_producer`'s own docstring for why those
+    two are always out of scope for this pass).
+    """
+
+    producer: onnx.NodeProto
     weight_name: str
     indices_name: str
     vocab_size: int
@@ -17966,6 +18020,171 @@ def _match_embedding_gather(
         return None  # unexpected consumer count -- decline, don't guess
 
     return w_name, indices_name, underlying
+
+
+# ``com.microsoft::EmbedLayerNormalization`` domain -- named separately, the
+# same one-constant-per-family convention `_SKIP_LAYER_NORM_DOMAIN`/
+# `_ATTENTION_DOMAIN`/`_MOE_DOMAIN`/`_FUSED_BIAS_GELU_DOMAIN` already each
+# use, even though every one of those constants happens to hold the
+# identical string today.
+_EMBED_LAYER_NORM_DOMAIN = "com.microsoft"
+
+
+def _match_embed_layer_norm_producer(
+    node: onnx.NodeProto,
+    initializer_map: Dict[str, onnx.TensorProto],
+    consumers_of: Dict[str, List[onnx.NodeProto]],
+    graph_input_names: Set[str],
+    node_by_output: Dict[str, onnx.NodeProto],
+) -> Optional[Tuple[str, str, str]]:
+    """The ``com.microsoft::EmbedLayerNormalization`` counterpart of
+    :func:`_match_embedding_gather` -- same return contract exactly
+    (``(weight_name, indices_name, underlying_input_name)``), so
+    :func:`_match_embedding_chain`'s own single matching loop can try this
+    matcher as a second producer shape and treat whichever one succeeds
+    identically from there on (the same "additional producer shape, same
+    downstream apply logic" extension this module's GQA/`MultiHeadAttention`
+    family already uses -- see :class:`_GQAChain`'s own docstring and
+    :func:`_find_onnx_attention_chains`).
+
+    **Why this shape exists at all**: onnxruntime's own BERT-family graph
+    optimizer (`onnxruntime.transformers.fusion_embedlayer.FusionEmbedLayerNoMask`,
+    confirmed by reading that class's own docstring and `fuse_bert`/
+    `fuse_distilbert`/`fuse_gpt2` methods directly from the installed
+    `onnxruntime` package) fuses a BERT/DistilBert/ALBert model's
+    word+position+(optional)segment embedding `Gather`s *and* the
+    LayerNormalization that follows them into one single
+    ``EmbedLayerNormalization`` node -- so on a model that has already been
+    through that optimizer (or was exported directly in fused form), the
+    plain-`Gather` shape :func:`_match_embedding_gather` looks for is gone
+    entirely; this is the only remaining structural way to find the token
+    embedding table at all.
+
+    **Exact schema** (pulled live via
+    ``onnxruntime.capi.onnxruntime_pybind11_state.get_all_operator_schema()``,
+    filtered for ``name == "EmbedLayerNormalization"``, and cross-checked
+    against `fusion_embedlayer.py`'s own `create_fused_node` -- the fusion
+    pass that actually emits this node -- for the exact input ordering it
+    writes): inputs, in order, are ``input_ids`` (required, 2D
+    ``(batch_size, sequence_length)``), ``segment_ids`` (optional),
+    ``word_embedding`` (required, 2D ``(vocab_size, hidden_size)``),
+    ``position_embedding`` (required, 2D ``(max_position, hidden_size)``),
+    ``segment_embedding`` (optional, 2D ``(num_segment_types,
+    hidden_size)``), ``gamma`` (required, 1D ``(hidden_size,)``), ``beta``
+    (required, 1D ``(hidden_size,)``), ``mask`` (optional), ``position_ids``
+    (optional); outputs are ``output`` (required, 3D ``(batch_size,
+    sequence_length, hidden_size)``), ``mask_index`` (optional, 1D
+    ``(batch_size,)``), ``embedding_sum`` (optional, same 3D shape as
+    ``output``); attributes are ``epsilon`` (float) and ``mask_index_type``
+    (int), neither touched here.
+
+    **Scope decisions, made deliberately and documented here rather than
+    assumed**:
+
+    - Only `word_embedding` (this function's own `weight_name`, indexed by
+      `input_ids`) is ever treated as vocab-axis-prunable by this matcher.
+      `position_embedding` is indexed by *sequence position*
+      (`position_ids`, defaulting to ``0..sequence_length-1`` when the
+      optional input is absent -- confirmed via a live `InferenceSession`
+      run) -- a structurally different axis from token vocabulary
+      altogether, not something a restricted-*vocabulary* deployment would
+      ever want to shrink, so it is always left completely untouched.
+      `segment_embedding` is indexed by `segment_ids` (BERT's
+      `token_type_ids`, conventionally just ``{0, 1}`` -- sentence
+      A/sentence B), a *different, unrelated index space* from the token
+      vocabulary `keep_token_ids`/`drop_token_ids`/the resulting `id_map`
+      are all defined over; reusing the same keep-set/`id_map` against it
+      would be a correctness bug (dropping/renumbering segment id 1 because
+      token id 1 wasn't kept, for instance), and this pass has no mechanism
+      to return an independent second `id_map` for a second index space.
+      So `segment_embedding`, like `position_embedding`, is always left
+      completely untouched -- only ever `word_embedding` is sliced.
+    - `gamma`/`beta` are the fused LayerNorm's own affine parameters,
+      confirmed 1D `(hidden_size,)` by the schema above -- not vocab-shaped
+      at all, and this pass never changes `hidden_size` (only
+      `vocab_size`), so they need no slicing and this matcher never
+      references them.
+    - The optional `mask_index`/`embedding_sum` outputs need no special
+      "declined if consumed downstream" handling (unlike, say,
+      `SkipLayerNormalization`'s own optional `mean`/`inv_std_var`/
+      `input_skip_bias_sum`, declined by :func:`_match_matmul_residual_merge`
+      whenever actually read -- see that function's own docstring): that
+      precedent exists because *that* section prunes `hidden_size`, an axis
+      those particular secondary outputs' own values/shapes *do* depend on.
+      Here, the axis being pruned is `vocab_size`, and neither optional
+      output depends on it at all -- confirmed both from the schema
+      (`mask_index` is 1D `(batch_size,)`; `embedding_sum` matches
+      `output`'s own `(batch_size, sequence_length, hidden_size)`, neither
+      shape mentions `vocab_size`) and empirically, with a real
+      `InferenceSession` run against a small hand-built model: `mask_index`
+      equals a fixed per-batch count/first-zero-position derived purely
+      from the `mask` input (``[0, 0]`` -- unrelated to `input_ids`/
+      `word_embedding` entirely -- when `mask` is omitted, as the fusion
+      pass's own dummy-output naming already implies), and `embedding_sum`
+      equals the exact elementwise sum of the gathered
+      `word_embedding[input_ids] + position_embedding[position_ids] +
+      segment_embedding[segment_ids]` rows -- a value this pass's existing
+      `id_map` contract (the caller remaps `input_ids` before feeding the
+      pruned model, exactly as the plain-`Gather` shape already requires)
+      keeps numerically correct after pruning, with nothing here to
+      reslice.
+    - Whether a tied or untied `lm_head` is also identified works exactly
+      as it already does for the plain-`Gather` shape --
+      :func:`_match_tied_lm_head`/:func:`_match_untied_lm_head` only ever
+      need `weight_name`/`vocab_size`/the primary consuming node (to
+      exclude it from "other" consumers) and never assume that node is
+      literally a `Gather`, so :func:`_match_embedding_chain`'s existing
+      dispatch to them is reused completely unchanged for this shape too --
+      relevant for a real BERT-MLM-style export where the decoder logits
+      projection is tied back to `word_embedding`.
+
+    Matching bar, mirroring :func:`_match_embedding_gather`'s own
+    structural checks exactly, just against `word_embedding`/`input_ids`
+    instead of the Gather's `data`/`indices`: `node` must be
+    ``com.microsoft::EmbedLayerNormalization`` with at least the 7 required
+    inputs; `word_embedding` must be a constant float
+    (:func:`_is_supported_float_dtype`) 2-D initializer; `input_ids` must be
+    a declared graph input, or a `Cast` of one (identical one-bounded-hop
+    rule); `word_embedding` must have exactly one or two consumers, this
+    node among them (the second, when present, resolved the same
+    tied-`lm_head`-or-decline way the plain-`Gather` shape already is).
+    """
+    if (
+        node.op_type != "EmbedLayerNormalization"
+        or node.domain != _EMBED_LAYER_NORM_DOMAIN
+    ):
+        return None
+    if len(node.input) < 7:
+        return None
+    input_ids, w_name = node.input[0], node.input[2]
+    if not input_ids or not w_name:
+        return None
+    w_init = initializer_map.get(w_name)
+    if (
+        w_init is None
+        or not _is_supported_float_dtype(w_init.data_type)
+        or len(w_init.dims) != 2
+    ):
+        return None
+
+    underlying = input_ids
+    if underlying not in graph_input_names:
+        cast_node = node_by_output.get(underlying)
+        if (
+            cast_node is not None
+            and cast_node.op_type == "Cast"
+            and len(cast_node.input) == 1
+            and cast_node.input[0] in graph_input_names
+        ):
+            underlying = cast_node.input[0]
+        else:
+            return None  # not a graph input, nor a Cast of one
+
+    consumers = consumers_of.get(w_name, [])
+    if node not in consumers or not (1 <= len(consumers) <= 2):
+        return None  # unexpected consumer count -- decline, don't guess
+
+    return w_name, input_ids, underlying
 
 
 def _match_lm_head_tail(
@@ -18172,17 +18391,23 @@ def _match_untied_lm_head(
 def _match_embedding_chain(
     graph: onnx.GraphProto, input_name: Optional[str]
 ) -> Optional[_EmbeddingChain]:
-    """Finds the one token-embedding `Gather` this pass should act on
-    (plus its tied/untied `lm_head`, if any) -- see this section's own
-    comment above for the full matching/safety bar. When `input_name` is
-    given, only a `Gather` whose indices resolve to that exact graph
-    input is considered, and it is an error (`ValueError` -- a caller
-    mistake, not an ambiguous topology) if none does. When `input_name`
-    is omitted, exactly one qualifying `Gather` must exist in the whole
-    graph -- zero or more than one (with no way to tell which is "the"
-    token embedding, e.g. a `position_ids`-driven positional embedding
-    matches the identical structural shape) declines the whole call
-    (`None`), the model left completely untouched.
+    """Finds the one token-embedding producer this pass should act on --
+    either a plain `Gather` (:func:`_match_embedding_gather`) or a
+    ``com.microsoft::EmbedLayerNormalization`` node
+    (:func:`_match_embed_layer_norm_producer` -- see its own docstring for
+    why this second shape exists and its exact scope), plus its tied/untied
+    `lm_head`, if any -- see this section's own comment above for the full
+    matching/safety bar. When `input_name` is given, only a producer whose
+    token-id operand resolves to that exact graph input is considered, and
+    it is an error (`ValueError` -- a caller mistake, not an ambiguous
+    topology) if none does. When `input_name` is omitted, exactly one
+    qualifying producer -- of *either* shape, counted together -- must
+    exist in the whole graph -- zero or more than one (with no way to tell
+    which is "the" token embedding, e.g. a `position_ids`-driven positional
+    embedding matches the identical `Gather` structural shape, or a graph
+    could mix a plain-`Gather` embedding with an unrelated
+    `EmbedLayerNormalization` block) declines the whole call (`None`), the
+    model left completely untouched.
     """
     initializer_map = {t.name: t for t in graph.initializer}
     consumers_of = _consumers_of(graph)
@@ -18196,28 +18421,32 @@ def _match_embedding_chain(
             node, initializer_map, consumers_of, graph_input_names, node_by_output
         )
         if m is None:
+            m = _match_embed_layer_norm_producer(
+                node, initializer_map, consumers_of, graph_input_names, node_by_output
+            )
+        if m is None:
             continue
         w_name, indices_name, underlying = m
         if input_name is not None and input_name not in (indices_name, underlying):
             continue
-        matches.append((node, w_name))
+        matches.append((node, w_name, indices_name))
 
     if input_name is not None and not matches:
         raise ValueError(
-            f"no embedding Gather found reading graph input {input_name!r}"
+            f"no embedding Gather/EmbedLayerNormalization found reading graph "
+            f"input {input_name!r}"
         )
     if len(matches) != 1:
         return None  # zero, or ambiguous with no input_name to disambiguate
 
-    gather_node, w_name = matches[0]
+    producer_node, w_name, indices_name = matches[0]
     w_init = initializer_map[w_name]
     vocab_size, hidden_size = int(w_init.dims[0]), int(w_init.dims[1])
-    indices_name = gather_node.input[1]
 
     consumers = consumers_of.get(w_name, [])
     if len(consumers) == 2:
         lm_head = _match_tied_lm_head(
-            w_name, vocab_size, gather_node, consumers_of, initializer_map
+            w_name, vocab_size, producer_node, consumers_of, initializer_map
         )
         if lm_head is None:
             return None  # unexplained second consumer -- decline, don't guess
@@ -18227,7 +18456,7 @@ def _match_embedding_chain(
         )
 
     return _EmbeddingChain(
-        gather=gather_node,
+        producer=producer_node,
         weight_name=w_name,
         indices_name=indices_name,
         vocab_size=vocab_size,
@@ -18278,10 +18507,15 @@ def _finalize_embedding_shapes(
     graph: onnx.GraphProto, chain: _EmbeddingChain, new_v: int
 ) -> None:
     """Invalidates/corrects every downstream shape this pass's slicing
-    makes stale. The `Gather` node's own output shape never needs
-    touching -- gathering along `axis=0` doesn't change `hidden_size`, the
-    only dimension its own output shape carries from the embedding table.
-    An `lm_head`'s output (and, for the tied "Transpose then MatMul"
+    makes stale. `chain.producer`'s own output shape(s) never need
+    touching, whichever of the two shapes matched: a plain `Gather`'s
+    output shape doesn't carry `vocab_size` at all (only `hidden_size`,
+    unaffected by an `axis=0` gather); an `EmbedLayerNormalization` node's
+    `output`/`mask_index`/`embedding_sum` are all `(batch_size,
+    sequence_length[, hidden_size])`-shaped -- none of them mention
+    `vocab_size` either (confirmed against the op's own live schema, see
+    :func:`_match_embed_layer_norm_producer`'s own docstring). An
+    `lm_head`'s output (and, for the tied "Transpose then MatMul"
     sub-shape, the `Transpose`'s own output) *does* change width
     (`vocab_size` -> `new_v`) and is handled here.
     """
@@ -18388,12 +18622,16 @@ def apply_embedding_vocab_pruning(
     drop_token_ids: Optional[Sequence[int]] = None,
     input_name: Optional[str] = None,
 ) -> EmbeddingPruningResult:
-    """Shrinks a matched token-embedding `Gather`'s vocabulary axis (and,
-    where a tied or confidently-auto-identified untied `lm_head` exists,
-    its own vocab-logits projection too) down to a caller-supplied,
-    explicit keep-set. This is the primary, default-recommended entry
-    point in this section -- see this module's own "Embedding / lm_head
-    vocabulary pruning" section comment for why: calibration data can show
+    """Shrinks a matched token-embedding table's vocabulary axis -- a plain
+    `Gather`'s `data` input, or a fused ``com.microsoft::
+    EmbedLayerNormalization`` node's `word_embedding` input, see
+    :func:`_match_embed_layer_norm_producer`'s own docstring for that
+    second shape's exact scope -- (and, where a tied or
+    confidently-auto-identified untied `lm_head` exists, its own
+    vocab-logits projection too) down to a caller-supplied, explicit
+    keep-set. This is the primary, default-recommended entry point in this
+    section -- see this module's own "Embedding / lm_head vocabulary
+    pruning" section comment for why: calibration data can show
     a token id *was* used, never that it is safe to drop in general, so
     (unlike every other technique in this module) there is no defensible
     way to *infer* a safe keep-set from data alone. The caller -- who
@@ -18421,23 +18659,27 @@ def apply_embedding_vocab_pruning(
             every other id in ``range(vocab_size)`` is kept. Give exactly
             one of `keep_token_ids`/`drop_token_ids`.
     :param input_name: when the graph has more than one structurally-
-            eligible embedding `Gather` (e.g. a positional embedding also
+            eligible embedding producer (`Gather` or
+            `EmbedLayerNormalization`, e.g. a positional embedding also
             reading a genuine graph input), names which one to target by
-            its `indices` operand's graph input name (e.g. ``"input_ids"``).
+            its token-id operand's graph input name (e.g. ``"input_ids"``).
             Required in that case -- omitted, an ambiguous graph declines
             the whole call rather than guessing. A name that matches no
-            eligible `Gather` raises `ValueError` (a caller mistake, not an
+            eligible producer raises `ValueError` (a caller mistake, not an
             ambiguous topology).
     :returns: an :class:`EmbeddingPruningResult` -- see its own docstring.
             `matched` is False (model left completely untouched) for any
-            topology this pass doesn't confidently recognize: a non-zero
-            `Gather` axis, indices that aren't a graph input (or a `Cast`
-            of one), a non-constant/wrong-dtype/non-2-D embedding weight,
-            an embedding weight with more than the expected one-or-two
-            consumers (or a second consumer that isn't one of the two
-            recognized tied `lm_head` shapes), or an ambiguous/absent
-            match for `input_name` (or no `input_name` given, more than
-            one eligible `Gather`).
+            topology this pass doesn't confidently recognize: for the plain
+            `Gather` shape, a non-zero axis, indices that aren't a graph
+            input (or a `Cast` of one), a non-constant/wrong-dtype/non-2-D
+            embedding weight, an embedding weight with more than the
+            expected one-or-two consumers (or a second consumer that isn't
+            one of the two recognized tied `lm_head` shapes); for the fused
+            `EmbedLayerNormalization` shape, the analogous checks against
+            its own `word_embedding`/`input_ids` (see
+            :func:`_match_embed_layer_norm_producer`'s own docstring); for
+            either shape, an ambiguous/absent match for `input_name` (or no
+            `input_name` given, more than one eligible producer).
     """
     if (keep_token_ids is None) == (drop_token_ids is None):
         raise ValueError(
@@ -22007,19 +22249,20 @@ def _embedding_not_eligible(
     chain: Optional[_EmbeddingChain],
     input_name: Optional[str],
 ) -> List[str]:
-    """Every `Gather` node :func:`_match_embedding_gather` (the exact same
-    per-node matcher :func:`_match_embedding_chain` itself calls) confirms
-    structurally embedding-shaped, but that the whole call still declines
-    to touch -- every one of them when `chain` is `None` (whether because
-    none exist, more than one does and the call can't disambiguate
-    without `input_name`, or the sole match's own second-consumer/
-    `lm_head` shape wasn't confidently recognized --
+    """Every `Gather`/`EmbedLayerNormalization` node
+    :func:`_match_embedding_gather`/:func:`_match_embed_layer_norm_producer`
+    (the exact same two per-node matchers :func:`_match_embedding_chain`
+    itself calls) confirm structurally embedding-shaped, but that the whole
+    call still declines to touch -- every one of them when `chain` is
+    `None` (whether because none exist, more than one does and the call
+    can't disambiguate without `input_name`, or the sole match's own
+    second-consumer/`lm_head` shape wasn't confidently recognized --
     :func:`_match_embedding_chain` returns `None` for all three), or none
     at all when `chain` is not `None` (:func:`_match_embedding_chain`'s
-    own ``len(matches) != 1`` check guarantees the chosen `chain.gather`
+    own ``len(matches) != 1`` check guarantees the chosen `chain.producer`
     is the *only* structurally-matching node reachable under this same
     `input_name` in that case). Mirrors :func:`_match_embedding_chain`'s
-    own `input_name` filter exactly, so a structurally-matching `Gather`
+    own `input_name` filter exactly, so a structurally-matching producer
     reading a *different* graph input than a given `input_name` is still
     reported here -- this call would never touch it either.
     """
@@ -22034,11 +22277,15 @@ def _embedding_not_eligible(
             node, initializer_map, consumers_of, graph_input_names, node_by_output
         )
         if m is None:
+            m = _match_embed_layer_norm_producer(
+                node, initializer_map, consumers_of, graph_input_names, node_by_output
+            )
+        if m is None:
             continue
         _w_name, indices_name, underlying = m
         if input_name is not None and input_name not in (indices_name, underlying):
             continue
-        if chain is not None and node is chain.gather:
+        if chain is not None and node is chain.producer:
             continue
         not_eligible.append(f"{node.op_type} '{_node_label(node)}'")
     return not_eligible
@@ -22059,14 +22306,20 @@ def _analyze_embedding_vocab_magnitude_pruning(
 
     Reports at most a *single* :class:`PruningLayerSensitivity`
     (`family` ``"embedding_vocab_magnitude"``, `label` the matched
-    `Gather` node's own label, `total=vocab_size`) -- unlike every
-    channel/head/expert family above, :func:`_match_embedding_chain`
-    matches at most one embedding table per graph by construction (an
-    ambiguous multi-`Gather` graph declines the whole call outright
-    rather than guessing which one is "the" token embedding, see its own
-    docstring), so there is only ever one independently-ranked unit for
-    this family to report at all -- never zero-or-more the way a chain/
-    head/expert-matching family's own `_find_*` can return.
+    `Gather`/`EmbedLayerNormalization` producer's own label,
+    `total=vocab_size`) -- unlike every channel/head/expert family above,
+    :func:`_match_embedding_chain` matches at most one embedding table per
+    graph by construction (an ambiguous multi-producer graph -- whether two
+    `Gather`s, two `EmbedLayerNormalization` nodes, or one of each --
+    declines the whole call outright rather than guessing which one is
+    "the" token embedding, see its own docstring), so there is only ever
+    one independently-ranked unit for this family to report at all --
+    never zero-or-more the way a chain/head/expert-matching family's own
+    `_find_*` can return. Reused verbatim for the fused shape: the report's
+    own `family` string, granularity, and every field above mean exactly
+    the same thing whichever producer shape matched, so no separate family
+    name is introduced for it (see this module's own "Embedding / lm_head
+    vocabulary pruning" section comment for the full scope decision).
     """
     if not (0.0 <= sparsity < 1.0):
         raise ValueError(f"sparsity must be in [0, 1), got {sparsity}")
@@ -22117,7 +22370,7 @@ def _analyze_embedding_vocab_magnitude_pruning(
     return PruningSensitivityReport(
         layers=[
             PruningLayerSensitivity(
-                label=_node_label(chain.gather),
+                label=_node_label(chain.producer),
                 family="embedding_vocab_magnitude",
                 total=vocab_size,
                 would_drop=int(vocab_size - len(keep_set)),
