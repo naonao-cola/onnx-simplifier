@@ -15748,6 +15748,788 @@ def test_gqa_packed_qkv_rope_before_norm_is_declined():
     assert pruned.SerializeToString() == model.SerializeToString()
 
 
+# --- apply_attention_head_pruning -- MRotaryEmbedding/GemmaRotaryEmbedding
+#     QK-norm+RoPE pass-through hop --------------------------------------
+#
+# `com.microsoft::MRotaryEmbedding` ("M-RoPE", the Qwen-VL family's own
+# multimodal rotary embedding) and `com.microsoft::GemmaRotaryEmbedding`
+# (the Gemma family's own RoPE variant) -- see
+# `onnxsim.pruning._walk_back_through_qk_norm_rope`'s own section comment
+# for the exact schema facts (pulled live via
+# `onnxruntime.capi.onnxruntime_pybind11_state.get_all_operator_schema()`,
+# same as every other empirical claim there) and safety arguments for both.
+
+
+def test_mrotary_embedding_is_head_independent_for_pruning():
+    # Direct confirmation of `MRotaryEmbedding`'s own head-independence,
+    # isolated from the rest of the pruning machinery, mirroring
+    # `test_rotary_embedding_is_head_independent_for_pruning` -- across both
+    # `mrope_layout` values this module's own matcher accepts (0 "Sectioned/
+    # Chunked", 1 "Interleaved") and a deliberately non-uniform
+    # `mrope_section` split: dropping an arbitrary, non-contiguous subset of
+    # heads before or after this op must give bit-identical results for the
+    # surviving heads either way, since `mrope_section`/`mrope_layout`
+    # partition the cos/sin cache's own `half_rotary_embedding_dim` axis --
+    # a property of `head_size`, never of head count at all.
+    def _mrope_model(batch, seq, num_heads, head_size, cos, sin, section, layout):
+        hidden = num_heads * head_size
+        section_str = "[" + ", ".join(str(s) for s in section) + "]"
+        body = f"""
+            g (float[{batch},{seq},{hidden}] X, int64[3,{batch},{seq}] PosIds)
+              => (float[{batch},{seq},{hidden}] Y)
+            {{
+              Y = com.microsoft.MRotaryEmbedding
+                <num_heads={num_heads}, mrope_section={section_str}, mrope_layout={layout}>
+                (X, PosIds, Cos, Sin)
+            }}
+            """
+        return _model(
+            body,
+            initializer=[_f32(cos, "Cos"), _f32(sin, "Sin")],
+            opset=17,
+        )
+
+    batch, seq, num_heads, head_size = 2, 5, 6, 8
+    rng = np.random.default_rng(103)
+    max_pos = 16
+    half = head_size // 2
+    section = [2, 1, 1]  # deliberately non-uniform, sums to `half`
+    keep = [0, 2, 3, 5]  # arbitrary, non-contiguous
+
+    for layout in (0, 1):
+        cos = rng.standard_normal((max_pos, half)).astype(np.float32)
+        sin = rng.standard_normal((max_pos, half)).astype(np.float32)
+        x = rng.standard_normal((batch, seq, num_heads * head_size)).astype(np.float32)
+        posT = rng.integers(0, max_pos, size=(batch, seq)).astype(np.int64)
+        posH = rng.integers(0, max_pos, size=(batch, seq)).astype(np.int64)
+        posW = rng.integers(0, max_pos, size=(batch, seq)).astype(np.int64)
+        position_ids = np.stack([posT, posH, posW], axis=0)
+
+        full_model = _mrope_model(
+            batch, seq, num_heads, head_size, cos, sin, section, layout
+        )
+        (y_full,) = _run(full_model, {"X": x, "PosIds": position_ids})
+        y_full_heads = y_full.reshape(batch, seq, num_heads, head_size)
+
+        x_heads = x.reshape(batch, seq, num_heads, head_size)
+        x_sub = x_heads[:, :, keep, :].reshape(batch, seq, len(keep) * head_size)
+        sub_model = _mrope_model(
+            batch, seq, len(keep), head_size, cos, sin, section, layout
+        )
+        (y_sub,) = _run(sub_model, {"X": x_sub, "PosIds": position_ids})
+        y_sub_heads = y_sub.reshape(batch, seq, len(keep), head_size)
+
+        np.testing.assert_array_equal(y_sub_heads, y_full_heads[:, :, keep, :])
+
+
+def _gqa_mrope_model(
+    K=8,
+    H=8,
+    KVH=2,
+    D=8,
+    Out=6,
+    seed=0,
+    batch=2,
+    seq=5,
+    packed=True,
+    mrope_section=(2, 1, 1),
+    mrope_layout=0,
+    wqkv=None,
+    wq=None,
+    wk=None,
+    wv=None,
+    wout=None,
+    cos=None,
+    sin=None,
+    position_ids=None,
+    max_pos=32,
+    q_rotary_num_heads=None,
+    k_rotary_num_heads=None,
+):
+    # `MRotaryEmbedding` analogue of `_gqa_qk_norm_rope_model` (RoPE-only,
+    # no Q/K-norm sandwich -- "basic" coverage per this section's own scope,
+    # the norm sandwich's own composition with a rotary hop is already
+    # covered for plain `RotaryEmbedding` above and shares the identical
+    # `_walk_back_through_qk_norm` code path for every rotary op).
+    rng = np.random.default_rng(seed)
+    Nq, Nkv = H * D, KVH * D
+    half = D // 2
+    if wout is None:
+        wout = rng.standard_normal((Nq, Out)).astype(np.float32)
+    initializer = [_f32(wout, "Wout")]
+
+    if packed:
+        if wqkv is None:
+            wqkv = rng.standard_normal((K, Nq + 2 * Nkv)).astype(np.float32)
+        initializer.append(_f32(wqkv, "Wqkv"))
+        split_sizes = np.array([Nq, Nkv, Nkv], dtype=np.int64)
+        initializer.append(onnx.numpy_helper.from_array(split_sizes, "SplitSizes"))
+        producer_body = (
+            "qkv = MatMul(X, Wqkv)\n"
+            "          q_raw, k_raw, v = Split <axis = -1> (qkv, SplitSizes)"
+        )
+    else:
+        if wq is None:
+            wq = rng.standard_normal((K, Nq)).astype(np.float32)
+        if wk is None:
+            wk = rng.standard_normal((K, Nkv)).astype(np.float32)
+        if wv is None:
+            wv = rng.standard_normal((K, Nkv)).astype(np.float32)
+        initializer += [_f32(wq, "Wq"), _f32(wk, "Wk"), _f32(wv, "Wv")]
+        producer_body = (
+            "q_raw = MatMul(X, Wq)\n"
+            "          k_raw = MatMul(X, Wk)\n"
+            "          v = MatMul(X, Wv)"
+        )
+
+    if cos is None:
+        cos = rng.standard_normal((max_pos, half)).astype(np.float32)
+    if sin is None:
+        sin = rng.standard_normal((max_pos, half)).astype(np.float32)
+    if position_ids is None:
+        p = np.tile(np.arange(seq, dtype=np.int64), (batch, 1))
+        position_ids = np.stack([p, p, p], axis=0)
+    initializer += [_f32(cos, "Cos"), _f32(sin, "Sin")]
+    initializer.append(onnx.numpy_helper.from_array(position_ids, "PosIds"))
+    initializer.append(
+        onnx.numpy_helper.from_array(
+            np.full((batch,), seq - 1, dtype=np.int32), "SeqLensK"
+        )
+    )
+    initializer.append(
+        onnx.numpy_helper.from_array(np.array(seq, dtype=np.int32), "TotalSeq")
+    )
+
+    # Unlike plain `RotaryEmbedding`, `MRotaryEmbedding`'s own real CPU
+    # kernel requires an explicit, nonzero `num_heads` for rank-3 (flat)
+    # input -- confirmed empirically ("MRotaryEmbedding: num_heads must be
+    # greater than 0 for rank-3 input") -- so `q_rotary_num_heads`/
+    # `k_rotary_num_heads` default to this branch's own actual head count
+    # rather than the schema's own documented `0` default (which plain
+    # `RotaryEmbedding` self-adjusts from but this op's own kernel rejects
+    # outright for this input rank).
+    q_nh = q_rotary_num_heads if q_rotary_num_heads is not None else H
+    k_nh = k_rotary_num_heads if k_rotary_num_heads is not None else KVH
+    section_str = "[" + ", ".join(str(s) for s in mrope_section) + "]"
+    body = f"""
+        g (float[{batch},{seq},{K}] X) => (float[{batch},{seq},{Out}] Y)
+        {{
+          {producer_body}
+          q_rot = com.microsoft.MRotaryEmbedding
+            <num_heads={q_nh}, mrope_section={section_str}, mrope_layout={mrope_layout}>
+            (q_raw, PosIds, Cos, Sin)
+          k_rot = com.microsoft.MRotaryEmbedding
+            <num_heads={k_nh}, mrope_section={section_str}, mrope_layout={mrope_layout}>
+            (k_raw, PosIds, Cos, Sin)
+          ctx, pk, pv = com.microsoft.GroupQueryAttention <num_heads={H}, kv_num_heads={KVH}> (q_rot, k_rot, v, , , SeqLensK, TotalSeq)
+          Y = MatMul(ctx, Wout)
+        }}
+        """
+    model = parser.parse_model(
+        f"""
+        <
+          ir_version: 10,
+          opset_import: ["": 17, "com.microsoft": 1]
+        >
+        {body}
+        """
+    )
+    model.graph.initializer.extend(initializer)
+    return model, dict(
+        K=K,
+        H=H,
+        KVH=KVH,
+        D=D,
+        Out=Out,
+        Nq=Nq,
+        Nkv=Nkv,
+        wqkv=wqkv,
+        wq=wq,
+        wk=wk,
+        wv=wv,
+        wout=wout,
+        cos=cos,
+        sin=sin,
+        position_ids=position_ids,
+        batch=batch,
+        seq=seq,
+    )
+
+
+def _mrope_oracle_and_pruned(K, H, KVH, D, Out, seed, sparsity, **extra):
+    # Mirrors `_qk_norm_rope_oracle_and_pruned`'s own pattern: builds the
+    # packed (to-be-pruned) model, prunes it, and builds an *independently*
+    # constructed (`packed=False`) already-correctly-reduced oracle model
+    # from the exact same pre-pruning weights/cos/sin/position_ids.
+    model, cfg = _gqa_mrope_model(K=K, H=H, KVH=KVH, D=D, Out=Out, seed=seed, **extra)
+    assert len(onnxsim.pruning._find_gqa_chains(model.graph)) == 1
+
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=sparsity)
+
+    Nq, Nkv = cfg["Nq"], cfg["Nkv"]
+    wqkv = cfg["wqkv"]
+    wq, wk, wv = wqkv[:, :Nq], wqkv[:, Nq : Nq + Nkv], wqkv[:, Nq + Nkv :]
+
+    group_size = H // KVH
+    keep_count = max(1, KVH - round(KVH * sparsity))
+    keep_groups = _oracle_keep_groups(wq, wk, wv, H, KVH, D, keep_count)
+    keep_q_heads = _group_q_heads(keep_groups, group_size)
+    q_idx, kv_idx = _head_idx(keep_q_heads, D), _head_idx(keep_groups, D)
+
+    oracle_extra = dict(extra)
+    q_rotary_num_heads = extra.get("q_rotary_num_heads")
+    k_rotary_num_heads = extra.get("k_rotary_num_heads")
+    oracle_extra["q_rotary_num_heads"] = (
+        None
+        if q_rotary_num_heads is None or q_rotary_num_heads == 0
+        else len(keep_q_heads)
+    )
+    oracle_extra["k_rotary_num_heads"] = (
+        None
+        if k_rotary_num_heads is None or k_rotary_num_heads == 0
+        else len(keep_groups)
+    )
+
+    oracle, _ = _gqa_mrope_model(
+        K=K,
+        H=len(keep_q_heads),
+        KVH=len(keep_groups),
+        D=D,
+        Out=Out,
+        seed=seed,
+        packed=False,
+        wq=wq[:, q_idx],
+        wk=wk[:, kv_idx],
+        wv=wv[:, kv_idx],
+        wout=cfg["wout"][q_idx, :],
+        cos=cfg["cos"],
+        sin=cfg["sin"],
+        position_ids=cfg["position_ids"],
+        **oracle_extra,
+    )
+
+    rng = np.random.default_rng(seed + 1000)
+    x = rng.standard_normal((cfg["batch"], cfg["seq"], K)).astype(np.float32)
+    (y_pruned,) = _run(pruned, {"X": x})
+    (y_oracle,) = _run(oracle, {"X": x})
+    return pruned, oracle, y_pruned, y_oracle, keep_groups, keep_q_heads
+
+
+def test_gqa_packed_qkv_mrope_pruning_matches_oracle_exactly():
+    # Real end-to-end `InferenceSession` correctness check -- `MRotaryEmbedding`
+    # has a genuine CPU kernel in this environment (confirmed empirically,
+    # unlike `GemmaRotaryEmbedding` below) -- comparing the pruned model's
+    # own output against an *independently* rebuilt, already-reduced oracle
+    # model (never the wrong "pruned vs. full unpruned" invariant).
+    K, H, KVH, D, Out = 8, 8, 2, 8, 6
+    pruned, oracle, y_pruned, y_oracle, keep_groups, keep_q_heads = (
+        _mrope_oracle_and_pruned(
+            K, H, KVH, D, Out, seed=201, sparsity=0.5, mrope_layout=1
+        )
+    )
+    node = _gqa_node(pruned)
+    num_heads, kv_num_heads = _gqa_attrs(node)
+    assert kv_num_heads == len(keep_groups) == 1
+    assert num_heads == len(keep_q_heads) == 4
+
+    # `_gqa_mrope_model` always gives `MRotaryEmbedding` an explicit,
+    # nonzero `num_heads` (its own real CPU kernel rejects the schema's
+    # documented `0` "self-adjust" default outright for rank-3 input --
+    # confirmed empirically: "MRotaryEmbedding: num_heads must be greater
+    # than 0 for rank-3 input", unlike plain `RotaryEmbedding` -- see
+    # `_gqa_mrope_model`'s own comment), so this branch's own `num_heads`
+    # attribute IS one of the two constants
+    # :func:`onnxsim.pruning._walk_back_through_qk_norm_rope` rewrites post-
+    # pruning, checked here to be the new post-pruning head/group count on
+    # both the Q-side and K-side node.
+    q_rot = next(
+        n
+        for n in pruned.graph.node
+        if n.op_type == "MRotaryEmbedding" and n.input[0] == "q_raw"
+    )
+    k_rot = next(
+        n
+        for n in pruned.graph.node
+        if n.op_type == "MRotaryEmbedding" and n.input[0] == "k_raw"
+    )
+    for n, expect_heads in ((q_rot, len(keep_q_heads)), (k_rot, len(keep_groups))):
+        nh = next(a.i for a in n.attribute if a.name == "num_heads")
+        assert nh == expect_heads
+        section = next(a.ints for a in n.attribute if a.name == "mrope_section")
+        assert list(section) == [2, 1, 1]  # never touched -- head_size-only axis
+        layout = next(a.i for a in n.attribute if a.name == "mrope_layout")
+        assert layout == 1  # never touched
+
+    np.testing.assert_allclose(y_pruned, y_oracle, rtol=1e-5, atol=1e-5)
+
+
+def test_gqa_packed_qkv_mrope_pruning_updates_explicit_rotary_num_heads():
+    # Mirrors `test_gqa_packed_qkv_qk_norm_rope_pruning_updates_explicit_rotary_num_heads`
+    # for `MRotaryEmbedding`'s own identically-named/-semantic `num_heads`
+    # attribute (see `_walk_back_through_qk_norm_rope`'s own docstring for
+    # why one rewrite site already covers both ops).
+    K, H, KVH, D, Out = 8, 8, 2, 8, 6
+    pruned, oracle, y_pruned, y_oracle, keep_groups, keep_q_heads = (
+        _mrope_oracle_and_pruned(
+            K,
+            H,
+            KVH,
+            D,
+            Out,
+            seed=202,
+            sparsity=0.5,
+            q_rotary_num_heads=H,
+            k_rotary_num_heads=KVH,
+        )
+    )
+    q_rot = next(
+        n
+        for n in pruned.graph.node
+        if n.op_type == "MRotaryEmbedding" and n.input[0] == "q_raw"
+    )
+    k_rot = next(
+        n
+        for n in pruned.graph.node
+        if n.op_type == "MRotaryEmbedding" and n.input[0] == "k_raw"
+    )
+    assert next(a.i for a in q_rot.attribute if a.name == "num_heads") == len(
+        keep_q_heads
+    )
+    assert next(a.i for a in k_rot.attribute if a.name == "num_heads") == len(
+        keep_groups
+    )
+
+    np.testing.assert_allclose(y_pruned, y_oracle, rtol=1e-5, atol=1e-5)
+
+
+def test_gqa_packed_qkv_mrope_pruning_declines_unsupported_mrope_layout():
+    # `mrope_layout` values other than the two the live schema documents (0
+    # "Sectioned/Chunked", 1 "Interleaved") have no confirmed semantics --
+    # this module doesn't guess at whether they're still head-independent,
+    # so the whole chain is declined (left completely untouched) rather
+    # than silently mis-slicing a shape/attribute value this pass hasn't
+    # verified -- mirrors `test_gqa_packed_qkv_rope_before_norm_is_declined`'s
+    # own "whole chain declines" assertion style.
+    K, H, KVH, D, Out = 8, 8, 2, 8, 6
+    model, cfg = _gqa_mrope_model(
+        K=K, H=H, KVH=KVH, D=D, Out=Out, seed=203, mrope_layout=2
+    )
+    assert onnxsim.pruning._find_gqa_chains(model.graph) == []
+
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    assert pruned.SerializeToString() == model.SerializeToString()
+
+
+def test_analyze_attention_head_pruning_gqa_mrope_matches_real_call():
+    # Dry-run (`analyze_pruning_sensitivity`) vs. real-call parity: both
+    # share the identical `_find_gqa_chains` matcher this section extends,
+    # so the analysis-only preview must predict the exact same post-pruning
+    # head/group counts the real call actually produces.
+    K, H, KVH, D, Out = 8, 8, 2, 8, 6
+    model, cfg = _gqa_mrope_model(K=K, H=H, KVH=KVH, D=D, Out=Out, seed=204)
+    report = onnxsim.analyze_pruning_sensitivity(
+        model, onnxsim.apply_attention_head_pruning, sparsity=0.5
+    )
+    assert len(report.layers) == 1
+    layer = report.layers[0]
+    assert layer.family == "attention_gqa_group"
+    assert layer.total == KVH
+
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    node = _gqa_node(pruned)
+    _, kv_num_heads = _gqa_attrs(node)
+    assert kv_num_heads == KVH - layer.would_drop
+
+
+def _decompose_gemma_rotary_nodes(model):
+    # Test-only helper: replaces every `com.microsoft::GemmaRotaryEmbedding`
+    # node in `model` with the literal decomposition its own live schema doc
+    # string gives (the "onnxscript that was tested" reference -- see
+    # `onnxsim.pruning._walk_back_through_gemma_rope_pair`'s own docstring),
+    # minus the fp16-mixed-precision `Cast`s (this helper stays in float32
+    # throughout, since it exists to check the PRUNING TRANSFORM's own
+    # correctness, not to reproduce the real op's fp16 numerics) --
+    # `sin_val = Sin(emb); cos_val = Cos(emb)`, unsqueezed at axis 1, then
+    # `q_embed = q * cos + q_rot * sin`, `k_embed = k * cos + k_rot * sin`.
+    # Needed because `GemmaRotaryEmbedding` itself has no usable CPU kernel
+    # in this environment at all (confirmed empirically -- see this
+    # section's own comment above for the exact `CastFloat16Transformer`
+    # failure) -- every ops this decomposes into (`Sin`/`Cos`/`Unsqueeze`/
+    # `Mul`/`Add`) has a real ai.onnx CPU kernel, so the RESULT is directly
+    # executable via a real `InferenceSession`, the same
+    # decomposed-proxy-topology methodology this module's own
+    # `MatMulNBitsMlp`/`MatMulNBitsQkv`/`PagedAttention` sections already
+    # established (search `onnxsim/pruning.py` for "decompose a (pruned)
+    # fused node's own tensors back into equivalent").
+    out = onnx.ModelProto()
+    out.CopyFrom(model)
+    new_nodes = []
+    counter = 0
+    for node in out.graph.node:
+        if node.op_type != "GemmaRotaryEmbedding" or node.domain != "com.microsoft":
+            new_nodes.append(node)
+            continue
+        counter += 1
+        p = f"_gemma_decomp_{counter}"
+        emb, q, q_rot, k, k_rot = node.input
+        q_embed, k_embed = node.output
+        sin_val, cos_val = f"{p}_sin", f"{p}_cos"
+        sin_u, cos_u = f"{p}_sin_u", f"{p}_cos_u"
+        axes = f"{p}_axes"
+        q_cos, q_sin, k_cos, k_sin = (
+            f"{p}_q_cos",
+            f"{p}_q_sin",
+            f"{p}_k_cos",
+            f"{p}_k_sin",
+        )
+        out.graph.initializer.append(
+            onnx.numpy_helper.from_array(np.array([1], dtype=np.int64), axes)
+        )
+        new_nodes.extend(
+            [
+                onnx.helper.make_node("Sin", [emb], [sin_val], name=f"{p}/Sin"),
+                onnx.helper.make_node("Cos", [emb], [cos_val], name=f"{p}/Cos"),
+                onnx.helper.make_node(
+                    "Unsqueeze", [sin_val, axes], [sin_u], name=f"{p}/UnsqueezeSin"
+                ),
+                onnx.helper.make_node(
+                    "Unsqueeze", [cos_val, axes], [cos_u], name=f"{p}/UnsqueezeCos"
+                ),
+                onnx.helper.make_node("Mul", [q, cos_u], [q_cos], name=f"{p}/QCos"),
+                onnx.helper.make_node("Mul", [q_rot, sin_u], [q_sin], name=f"{p}/QSin"),
+                onnx.helper.make_node(
+                    "Add", [q_cos, q_sin], [q_embed], name=f"{p}/QEmbed"
+                ),
+                onnx.helper.make_node("Mul", [k, cos_u], [k_cos], name=f"{p}/KCos"),
+                onnx.helper.make_node("Mul", [k_rot, sin_u], [k_sin], name=f"{p}/KSin"),
+                onnx.helper.make_node(
+                    "Add", [k_cos, k_sin], [k_embed], name=f"{p}/KEmbed"
+                ),
+            ]
+        )
+    del out.graph.node[:]
+    out.graph.node.extend(new_nodes)
+    del out.graph.value_info[:]  # every shape downstream of the fused node is stale
+    return out
+
+
+def test_gemma_rotary_embedding_decomposition_is_head_independent_for_pruning():
+    # Direct confirmation of `GemmaRotaryEmbedding`'s own head-independence
+    # via its decomposed equivalent (`_decompose_gemma_rotary_nodes`),
+    # executed through a real `InferenceSession` against no other oracle --
+    # the fused op itself has no usable CPU kernel here at all (see this
+    # section's own comment above), so this IS the empirical confirmation,
+    # mirroring `test_rotary_embedding_is_head_independent_for_pruning`'s
+    # own role for plain `RotaryEmbedding`: dropping an arbitrary,
+    # non-contiguous subset of heads before or after this op must give
+    # bit-identical results for the surviving heads either way, since
+    # neither the `Sin`/`Cos` angle (`emb`, no head axis) nor the
+    # elementwise `q`/`q_rot`/`k`/`k_rot` combination ever mixes across
+    # heads.
+    def _gemma_model(batch, seq, num_heads, head_size):
+        # `Emb`'s own last axis is `head_size` -- broadcasting directly
+        # against `Q`/`QRot`'s own trailing axis (the onnxscript reference's
+        # `Unsqueeze`d `cos`/`sin` multiplies `Q`/`QRot` elementwise, full
+        # width -- confirmed empirically: a `head_size // 2`-wide `Emb`
+        # fails real `Mul` shape inference outright), unlike plain
+        # `RotaryEmbedding`'s own half-width `cos_cache`/`sin_cache`.
+        body = f"""
+            g (float[{batch},{seq},{head_size}] Emb,
+               float[{batch},{num_heads},{seq},{head_size}] Q,
+               float[{batch},{num_heads},{seq},{head_size}] QRot,
+               float[{batch},{num_heads},{seq},{head_size}] K,
+               float[{batch},{num_heads},{seq},{head_size}] KRot)
+              => (float[{batch},{num_heads},{seq},{head_size}] QEmbed,
+                  float[{batch},{num_heads},{seq},{head_size}] KEmbed)
+            {{
+              QEmbed, KEmbed = com.microsoft.GemmaRotaryEmbedding (Emb, Q, QRot, K, KRot)
+            }}
+            """
+        return _model(body, opset=17)
+
+    batch, seq, num_heads, head_size = 2, 5, 6, 8
+    rng = np.random.default_rng(104)
+    keep = [0, 2, 3, 5]  # arbitrary, non-contiguous
+
+    emb = rng.standard_normal((batch, seq, head_size)).astype(np.float32)
+    q = rng.standard_normal((batch, num_heads, seq, head_size)).astype(np.float32)
+    q_rot = rng.standard_normal((batch, num_heads, seq, head_size)).astype(np.float32)
+    k = rng.standard_normal((batch, num_heads, seq, head_size)).astype(np.float32)
+    k_rot = rng.standard_normal((batch, num_heads, seq, head_size)).astype(np.float32)
+
+    full_model = _decompose_gemma_rotary_nodes(
+        _gemma_model(batch, seq, num_heads, head_size)
+    )
+    q_embed_full, k_embed_full = _run(
+        full_model,
+        {"Emb": emb, "Q": q, "QRot": q_rot, "K": k, "KRot": k_rot},
+    )
+
+    sub_model = _decompose_gemma_rotary_nodes(
+        _gemma_model(batch, seq, len(keep), head_size)
+    )
+    q_embed_sub, k_embed_sub = _run(
+        sub_model,
+        {
+            "Emb": emb,
+            "Q": q[:, keep, :, :],
+            "QRot": q_rot[:, keep, :, :],
+            "K": k[:, keep, :, :],
+            "KRot": k_rot[:, keep, :, :],
+        },
+    )
+
+    np.testing.assert_array_equal(q_embed_sub, q_embed_full[:, keep, :, :])
+    np.testing.assert_array_equal(k_embed_sub, k_embed_full[:, keep, :, :])
+
+
+def _gqa_gemma_rope_model(
+    K=8,
+    H=8,
+    KVH=2,
+    D=8,
+    Out=6,
+    seed=0,
+    batch=2,
+    seq=5,
+    packed=True,
+    wqkv=None,
+    wq=None,
+    wk=None,
+    wv=None,
+    wout=None,
+    emb=None,
+):
+    # `GemmaRotaryEmbedding` analogue of `_gqa_mrope_model`: packed-QKV (or
+    # separate producers) -> `Reshape`+`Transpose` to 4D BNSH
+    # (`_match_bnsh_reshape`) -> `rotate_half` (`_match_rotate_half`) ->
+    # `GemmaRotaryEmbedding` -> `Transpose`+`Reshape` back to flat 3D
+    # (`_match_reverse_bnsh_reshape`, required for `GroupQueryAttention`'s
+    # own 3D-only Q/K input, confirmed empirically -- see
+    # `onnxsim.pruning._match_reverse_bnsh_reshape`'s own docstring) ->
+    # `GroupQueryAttention`.
+    rng = np.random.default_rng(seed)
+    Nq, Nkv = H * D, KVH * D
+    if wout is None:
+        wout = rng.standard_normal((Nq, Out)).astype(np.float32)
+    initializer = [_f32(wout, "Wout")]
+
+    if packed:
+        if wqkv is None:
+            wqkv = rng.standard_normal((K, Nq + 2 * Nkv)).astype(np.float32)
+        initializer.append(_f32(wqkv, "Wqkv"))
+        split_sizes = np.array([Nq, Nkv, Nkv], dtype=np.int64)
+        initializer.append(onnx.numpy_helper.from_array(split_sizes, "SplitSizes"))
+        producer_body = (
+            "qkv = MatMul(X, Wqkv)\n"
+            "          q_raw, k_raw, v = Split <axis = -1> (qkv, SplitSizes)"
+        )
+    else:
+        if wq is None:
+            wq = rng.standard_normal((K, Nq)).astype(np.float32)
+        if wk is None:
+            wk = rng.standard_normal((K, Nkv)).astype(np.float32)
+        if wv is None:
+            wv = rng.standard_normal((K, Nkv)).astype(np.float32)
+        initializer += [_f32(wq, "Wq"), _f32(wk, "Wk"), _f32(wv, "Wv")]
+        producer_body = (
+            "q_raw = MatMul(X, Wq)\n"
+            "          k_raw = MatMul(X, Wk)\n"
+            "          v = MatMul(X, Wv)"
+        )
+
+    if emb is None:
+        # `emb`'s own last axis broadcasts directly against `q`'s/`k`'s own
+        # full `head_size` (the onnxscript reference's `Unsqueeze`d
+        # `cos`/`sin` multiplies `q`/`q_rot` elementwise) -- `D`, not `D //
+        # 2` (that would only broadcast against a half-width cache the way
+        # plain `RotaryEmbedding`'s own `cos_cache`/`sin_cache` do, which
+        # isn't this op's own shape at all).
+        emb = rng.standard_normal((batch, seq, D)).astype(np.float32)
+    initializer.append(_f32(emb, "Emb"))
+    initializer.append(
+        onnx.numpy_helper.from_array(
+            np.array([D // 2, D // 2], dtype=np.int64), "HalfSizes"
+        )
+    )
+    initializer.append(
+        onnx.numpy_helper.from_array(
+            np.array([0, -1, H, D], dtype=np.int64), "QReshapeA"
+        )
+    )
+    initializer.append(
+        onnx.numpy_helper.from_array(
+            np.array([0, -1, KVH, D], dtype=np.int64), "KReshapeA"
+        )
+    )
+    initializer.append(
+        onnx.numpy_helper.from_array(np.array([0, -1, Nq], dtype=np.int64), "QReshapeB")
+    )
+    initializer.append(
+        onnx.numpy_helper.from_array(
+            np.array([0, -1, Nkv], dtype=np.int64), "KReshapeB"
+        )
+    )
+    initializer.append(
+        onnx.numpy_helper.from_array(
+            np.full((batch,), seq - 1, dtype=np.int32), "SeqLensK"
+        )
+    )
+    initializer.append(
+        onnx.numpy_helper.from_array(np.array(seq, dtype=np.int32), "TotalSeq")
+    )
+
+    body = f"""
+        g (float[{batch},{seq},{K}] X) => (float[{batch},{seq},{Out}] Y)
+        {{
+          {producer_body}
+          q_bnsh_in = Reshape(q_raw, QReshapeA)
+          q_bnsh = Transpose <perm=[0,2,1,3]> (q_bnsh_in)
+          q_x1, q_x2 = Split <axis=-1> (q_bnsh, HalfSizes)
+          q_x2n = Neg(q_x2)
+          q_rot_in = Concat <axis=-1> (q_x2n, q_x1)
+          k_bnsh_in = Reshape(k_raw, KReshapeA)
+          k_bnsh = Transpose <perm=[0,2,1,3]> (k_bnsh_in)
+          k_x1, k_x2 = Split <axis=-1> (k_bnsh, HalfSizes)
+          k_x2n = Neg(k_x2)
+          k_rot_in = Concat <axis=-1> (k_x2n, k_x1)
+          q_embed, k_embed = com.microsoft.GemmaRotaryEmbedding (Emb, q_bnsh, q_rot_in, k_bnsh, k_rot_in)
+          q_flat_bnsh = Transpose <perm=[0,2,1,3]> (q_embed)
+          q_flat = Reshape(q_flat_bnsh, QReshapeB)
+          k_flat_bnsh = Transpose <perm=[0,2,1,3]> (k_embed)
+          k_flat = Reshape(k_flat_bnsh, KReshapeB)
+          ctx, pk, pv = com.microsoft.GroupQueryAttention <num_heads={H}, kv_num_heads={KVH}> (q_flat, k_flat, v, , , SeqLensK, TotalSeq)
+          Y = MatMul(ctx, Wout)
+        }}
+        """
+    model = parser.parse_model(
+        f"""
+        <
+          ir_version: 10,
+          opset_import: ["": 17, "com.microsoft": 1]
+        >
+        {body}
+        """
+    )
+    model.graph.initializer.extend(initializer)
+    return model, dict(
+        K=K,
+        H=H,
+        KVH=KVH,
+        D=D,
+        Out=Out,
+        Nq=Nq,
+        Nkv=Nkv,
+        wqkv=wqkv,
+        wq=wq,
+        wk=wk,
+        wv=wv,
+        wout=wout,
+        emb=emb,
+        batch=batch,
+        seq=seq,
+    )
+
+
+def test_gqa_packed_qkv_gemma_rope_pruning_matches_decomposed_oracle():
+    # `GemmaRotaryEmbedding` itself can't be run end to end here (no usable
+    # CPU kernel -- confirmed empirically, see this section's own comment
+    # above), so, per this module's own `MatMulNBitsMlp`/`MatMulNBitsQkv`/
+    # `PagedAttention` precedent, BOTH the pruned model and an
+    # *independently* rebuilt, already-reduced oracle model are decomposed
+    # (`_decompose_gemma_rotary_nodes`) into an equivalent, genuinely
+    # executable topology before being run through a real `InferenceSession`
+    # -- never comparing the pruned model against the full unpruned one.
+    K, H, KVH, D, Out = 8, 8, 2, 8, 6
+    model, cfg = _gqa_gemma_rope_model(K=K, H=H, KVH=KVH, D=D, Out=Out, seed=205)
+    assert len(onnxsim.pruning._find_gqa_chains(model.graph)) == 1
+
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+
+    node = _gqa_node(pruned)
+    num_heads, kv_num_heads = _gqa_attrs(node)
+
+    Nq, Nkv = cfg["Nq"], cfg["Nkv"]
+    wqkv = cfg["wqkv"]
+    wq, wk, wv = wqkv[:, :Nq], wqkv[:, Nq : Nq + Nkv], wqkv[:, Nq + Nkv :]
+
+    group_size = H // KVH
+    keep_count = max(1, KVH - round(KVH * 0.5))
+    keep_groups = _oracle_keep_groups(wq, wk, wv, H, KVH, D, keep_count)
+    keep_q_heads = _group_q_heads(keep_groups, group_size)
+    q_idx, kv_idx = _head_idx(keep_q_heads, D), _head_idx(keep_groups, D)
+
+    assert kv_num_heads == len(keep_groups)
+    assert num_heads == len(keep_q_heads)
+
+    # The BNSH `Reshape`s' own `num_heads` entries (index -2) and the
+    # reverse-hop `Reshape`s' own flat-width entries (index -1) must both
+    # have been rewritten to the new post-pruning counts -- structural
+    # confirmation alongside the numeric one below.
+    for out_name, expect_heads in (
+        ("q_bnsh_in", len(keep_q_heads)),
+        ("k_bnsh_in", len(keep_groups)),
+    ):
+        n = next(n for n in pruned.graph.node if n.output and n.output[0] == out_name)
+        dims = onnx.numpy_helper.to_array(
+            next(i for i in pruned.graph.initializer if i.name == n.input[1])
+        )
+        assert int(dims[-2]) == expect_heads
+    for out_name, expect_width in (
+        ("q_flat", len(keep_q_heads) * D),
+        ("k_flat", len(keep_groups) * D),
+    ):
+        n = next(n for n in pruned.graph.node if n.output and n.output[0] == out_name)
+        dims = onnx.numpy_helper.to_array(
+            next(i for i in pruned.graph.initializer if i.name == n.input[1])
+        )
+        assert int(dims[-1]) == expect_width
+
+    oracle, _ = _gqa_gemma_rope_model(
+        K=K,
+        H=len(keep_q_heads),
+        KVH=len(keep_groups),
+        D=D,
+        Out=Out,
+        seed=205,
+        packed=False,
+        wq=wq[:, q_idx],
+        wk=wk[:, kv_idx],
+        wv=wv[:, kv_idx],
+        wout=cfg["wout"][q_idx, :],
+        emb=cfg["emb"],
+    )
+
+    pruned_decomposed = _decompose_gemma_rotary_nodes(pruned)
+    oracle_decomposed = _decompose_gemma_rotary_nodes(oracle)
+
+    rng = np.random.default_rng(seed=1205)
+    x = rng.standard_normal((cfg["batch"], cfg["seq"], K)).astype(np.float32)
+    (y_pruned,) = _run(pruned_decomposed, {"X": x})
+    (y_oracle,) = _run(oracle_decomposed, {"X": x})
+    np.testing.assert_allclose(y_pruned, y_oracle, rtol=1e-5, atol=1e-5)
+
+
+def test_analyze_attention_head_pruning_gqa_gemma_rope_matches_real_call():
+    # Dry-run (`analyze_pruning_sensitivity`) vs. real-call parity for the
+    # `GemmaRotaryEmbedding` hop, mirroring
+    # `test_analyze_attention_head_pruning_gqa_mrope_matches_real_call`.
+    K, H, KVH, D, Out = 8, 8, 2, 8, 6
+    model, cfg = _gqa_gemma_rope_model(K=K, H=H, KVH=KVH, D=D, Out=Out, seed=206)
+    report = onnxsim.analyze_pruning_sensitivity(
+        model, onnxsim.apply_attention_head_pruning, sparsity=0.5
+    )
+    assert len(report.layers) == 1
+    layer = report.layers[0]
+    assert layer.family == "attention_gqa_group"
+    assert layer.total == KVH
+
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    node = _gqa_node(pruned)
+    _, kv_num_heads = _gqa_attrs(node)
+    assert kv_num_heads == KVH - layer.would_drop
+
+
 def test_structured_pruning_importance_norm_l2_is_the_unchanged_default():
     model, wg, wu, wd = _swiglu_mlp_model(K=8, H=16, Out=4, seed=30)
     default = onnxsim.apply_structured_pruning(model, sparsity=0.5)
