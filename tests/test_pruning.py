@@ -22520,3 +22520,765 @@ def test_matmul_nbits_pruning_invalid_sparsity_raises():
         onnxsim.apply_structured_pruning_matmul_nbits(model, sparsity=1.0)
     with pytest.raises(ValueError):
         onnxsim.apply_structured_pruning_matmul_nbits(model, sparsity=-0.1)
+
+
+# --- apply_structured_pruning_matmul_nbits: fused MatMulNBitsMlp/MatMulNBitsQkv ---
+#
+# See ``onnxsim/pruning.py``'s own "MatMulNBitsMlp/MatMulNBitsQkv (fused
+# block-quantized weight) structured pruning" section comment for the full
+# empirical schema investigation and, most importantly, WHY neither fused op
+# can be executed end to end via a real ``InferenceSession`` in this
+# environment (both fusions are WebGPU-execution-provider-specific;
+# confirmed no WebGPU adapter is reachable here, via both the system
+# ``onnxruntime`` install and a separately-installed `onnxruntime-webgpu`
+# wheel, tried specifically to check). Every correctness test below
+# therefore DECOMPOSES a (pruned) fused node's own weight tensors back into
+# equivalent standalone ``MatMulNBits``/``SimplifiedLayerNormalization``
+# nodes and runs THOSE through a real CPU-kernel ``InferenceSession`` --
+# both of which this environment's CPU EP genuinely implements -- against an
+# independent numpy oracle. This is a faithful proxy, not a guess: both
+# fused ops' own live schemas type every weight/scale/bias input identically
+# to plain ``MatMulNBits``'s own ``B``/``scales``/``bias`` (confirmed via
+# live schema introspection), and both ops' own doc strings write their
+# fused arithmetic as literal, unmodified ``MatMulNBits(...)``/
+# ``SimplifiedLayerNormalization(...)`` calls.
+#
+# Quantization here uses the schema's own DEFAULT zero point
+# (``2 ** (bits - 1)``) throughout -- unlike ``_nbits_quantize_block``
+# above, neither fused op has a ``zero_points`` input at all (confirmed via
+# live schema introspection), so there is no explicit zero-point tensor to
+# attach.
+
+
+def _nbits_quantize_default_zp(W, block_size, bits=4):
+    """Independent reference block quantizer using the schema's own DEFAULT
+    zero point (``2 ** (bits - 1)``) rather than an explicit
+    ``zero_points`` tensor -- the only encoding ``MatMulNBitsMlp``/
+    ``MatMulNBitsQkv`` support, since neither has a ``zero_points`` input at
+    all (see this section's own top comment). Returns ``(qcodes uint8 [N,
+    K], scales float32 [N, k_blocks], k_blocks)``.
+    """
+    N, K = W.shape
+    assert K % block_size == 0
+    k_blocks = K // block_size
+    qmax = (1 << bits) - 1
+    zp = float(1 << (bits - 1))
+    scales = np.zeros((N, k_blocks), dtype=np.float32)
+    qcodes = np.zeros((N, K), dtype=np.uint8)
+    for n in range(N):
+        for kb in range(k_blocks):
+            k0, k1 = kb * block_size, (kb + 1) * block_size
+            block = W[n, k0:k1]
+            maxabs = max(float(np.max(np.abs(block))), 1e-8)
+            scale = maxabs / max(zp, qmax - zp)
+            scales[n, kb] = scale
+            codes = np.round(block / scale + zp).clip(0, qmax)
+            qcodes[n, k0:k1] = codes.astype(np.uint8)
+    return qcodes, scales, k_blocks
+
+
+def _matmul_nbits_mlp_model(N, K, N2, block_size, W_gate, W_up, bias_gate, bias_up):
+    """Builds ``A -> MatMulNBitsMlp(mlp, activation=Relu) -> Y -> MatMul(down)
+    -> Z``, a real ``com.microsoft::MatMulNBitsMlp`` node (no ``skip``/
+    ``norm_scale`` -- both left empty, see this section's own top comment
+    for why this pass never needs to touch either) feeding a plain-float
+    output projection. Built via ``onnx.helper`` rather than
+    ``onnx.parser.parse_model`` -- the same CLAUDE.md-documented fallback
+    this file's own plain-``MatMulNBits`` section above already uses, for
+    the identical reason (optional inputs interleaved with present ones).
+    Returns ``(model, info)`` with every independently-computed
+    quantization artifact needed to hand-build an oracle.
+    """
+    qcodes_g, scales_g, kb = _nbits_quantize_default_zp(W_gate, block_size)
+    qcodes_u, scales_u, _kb2 = _nbits_quantize_default_zp(W_up, block_size)
+    gate_B = _nbits_pack_B(qcodes_g, N, kb, block_size)
+    up_B = _nbits_pack_B(qcodes_u, N, kb, block_size)
+    rng = np.random.default_rng(9001)
+    down_w = (rng.standard_normal((N, N2)) * 0.3).astype(np.float32)
+
+    node = onnx.helper.make_node(
+        "MatMulNBitsMlp",
+        inputs=[
+            "A",
+            "",
+            "",
+            "gate_B",
+            "gate_scales",
+            "gate_bias",
+            "up_B",
+            "up_scales",
+            "up_bias",
+        ],
+        outputs=["Y"],
+        domain="com.microsoft",
+        name="mlp",
+        activation="Relu",
+        block_size=block_size,
+        bits=4,
+        N=N,
+        K=K,
+    )
+    down_node = onnx.helper.make_node("MatMul", ["Y", "down_w"], ["Z"], name="down")
+    graph = onnx.helper.make_graph(
+        [node, down_node],
+        "g",
+        inputs=[
+            onnx.helper.make_tensor_value_info("A", onnx.TensorProto.FLOAT, [None, K])
+        ],
+        outputs=[
+            onnx.helper.make_tensor_value_info("Z", onnx.TensorProto.FLOAT, [None, N2])
+        ],
+        initializer=[
+            onnx.numpy_helper.from_array(gate_B, name="gate_B"),
+            onnx.numpy_helper.from_array(scales_g, name="gate_scales"),
+            onnx.numpy_helper.from_array(bias_gate, name="gate_bias"),
+            onnx.numpy_helper.from_array(up_B, name="up_B"),
+            onnx.numpy_helper.from_array(scales_u, name="up_scales"),
+            onnx.numpy_helper.from_array(bias_up, name="up_bias"),
+            onnx.numpy_helper.from_array(down_w, name="down_w"),
+        ],
+    )
+    model = onnx.helper.make_model(
+        graph,
+        opset_imports=[
+            onnx.helper.make_opsetid("", 21),
+            onnx.helper.make_opsetid("com.microsoft", 1),
+        ],
+    )
+    model.ir_version = 10
+    return model, dict(
+        qcodes_g=qcodes_g,
+        scales_g=scales_g,
+        qcodes_u=qcodes_u,
+        scales_u=scales_u,
+        kb=kb,
+        down_w=down_w,
+    )
+
+
+def test_matmul_nbits_mlp_pruning_matches_decomposed_oracle():
+    # Channels 0-3 engineered LARGE (kept), 4-7 SMALL (dropped) on BOTH
+    # gate/up branches, so the combined (root-sum-square) importance ranking
+    # is unambiguous: sparsity=0.5 must keep exactly {0, 1, 2, 3}.
+    N, K, N2, block_size = 8, 32, 5, 32
+    rng = np.random.default_rng(200)
+    W_gate = (rng.standard_normal((N, K)) * 0.3).astype(np.float32)
+    W_up = (rng.standard_normal((N, K)) * 0.3).astype(np.float32)
+    W_gate[:4] *= 8.0
+    W_up[:4] *= 8.0
+    W_gate[4:] *= 0.05
+    W_up[4:] *= 0.05
+    bias_gate = (rng.standard_normal(N) * 0.05).astype(np.float32)
+    bias_up = (rng.standard_normal(N) * 0.05).astype(np.float32)
+
+    model, info = _matmul_nbits_mlp_model(
+        N, K, N2, block_size, W_gate, W_up, bias_gate, bias_up
+    )
+    onnx.checker.check_model(model)
+
+    pruned = onnxsim.apply_structured_pruning_matmul_nbits(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    keep = np.array([0, 1, 2, 3])
+    mlp_node = next(n for n in pruned.graph.node if n.name == "mlp")
+    assert next(a.i for a in mlp_node.attribute if a.name == "N") == 4
+    inits = {t.name: t for t in pruned.graph.initializer}
+    assert list(inits["gate_B"].dims) == [4, info["kb"], block_size * 4 // 8]
+    assert list(inits["up_B"].dims) == [4, info["kb"], block_size * 4 // 8]
+
+    # "slice, don't recompute": the pruned packed tensors must be BYTE-
+    # IDENTICAL to the original ones restricted to `keep`, not merely
+    # numerically close.
+    gate_B_expected = _nbits_pack_B(info["qcodes_g"][keep], 4, info["kb"], block_size)
+    up_B_expected = _nbits_pack_B(info["qcodes_u"][keep], 4, info["kb"], block_size)
+    np.testing.assert_array_equal(
+        onnx.numpy_helper.to_array(inits["gate_B"]), gate_B_expected
+    )
+    np.testing.assert_array_equal(
+        onnx.numpy_helper.to_array(inits["up_B"]), up_B_expected
+    )
+    np.testing.assert_array_equal(
+        onnx.numpy_helper.to_array(inits["down_w"]), info["down_w"][keep]
+    )
+
+    # Decompose the PRUNED fused node's own tensors into two standalone
+    # MatMulNBits nodes and run them through a real CPU-kernel
+    # InferenceSession -- see this section's own top comment for why the
+    # literal fused node itself cannot be executed here.
+    decomposed = onnx.helper.make_model(
+        onnx.helper.make_graph(
+            [
+                _nbits_node(
+                    "mm_gate",
+                    "A",
+                    "gate_out",
+                    "gate_B",
+                    "gate_scales",
+                    None,
+                    "gate_bias",
+                    4,
+                    K,
+                    block_size,
+                ),
+                _nbits_node(
+                    "mm_up",
+                    "A",
+                    "up_out",
+                    "up_B",
+                    "up_scales",
+                    None,
+                    "up_bias",
+                    4,
+                    K,
+                    block_size,
+                ),
+            ],
+            "g",
+            inputs=[
+                onnx.helper.make_tensor_value_info(
+                    "A", onnx.TensorProto.FLOAT, [None, K]
+                )
+            ],
+            outputs=[
+                onnx.helper.make_tensor_value_info(
+                    "gate_out", onnx.TensorProto.FLOAT, [None, 4]
+                ),
+                onnx.helper.make_tensor_value_info(
+                    "up_out", onnx.TensorProto.FLOAT, [None, 4]
+                ),
+            ],
+            initializer=[
+                inits["gate_B"],
+                inits["gate_scales"],
+                inits["gate_bias"],
+                inits["up_B"],
+                inits["up_scales"],
+                inits["up_bias"],
+            ],
+        ),
+        opset_imports=[
+            onnx.helper.make_opsetid("", 21),
+            onnx.helper.make_opsetid("com.microsoft", 1),
+        ],
+    )
+    decomposed.ir_version = 10
+
+    x = np.random.default_rng(201).standard_normal((3, K)).astype(np.float32)
+    gate_out, up_out = _run(decomposed, {"A": x})
+    y_actual = np.maximum(gate_out, 0) * up_out
+
+    w_gate_dequant = _nbits_dequant(
+        info["qcodes_g"], info["scales_g"], None, block_size
+    )
+    w_up_dequant = _nbits_dequant(info["qcodes_u"], info["scales_u"], None, block_size)
+    gate_ref = x.astype(np.float64) @ w_gate_dequant[keep].T + bias_gate[keep]
+    up_ref = x.astype(np.float64) @ w_up_dequant[keep].T + bias_up[keep]
+    y_ref = np.maximum(gate_ref, 0) * up_ref
+
+    np.testing.assert_allclose(y_actual, y_ref, rtol=1e-3, atol=1e-3)
+
+
+def _matmul_nbits_qkv_model(
+    num_heads,
+    kv_num_heads,
+    d,
+    K,
+    block_size,
+    N2,
+    W_q,
+    W_k,
+    W_v,
+    bias_q,
+    bias_k,
+    bias_v,
+    norm_scale,
+    consumer="plain",
+    consumer_block_size=None,
+):
+    """Builds ``A -> MatMulNBitsQkv(qkv) -> (Q, K, V) ->
+    GroupQueryAttention(attn) -> MatMul/MatMulNBits(down) -> Z``. `Q`/`K`/`V`
+    feed the attention node's own query/key/value inputs DIRECTLY (no
+    per-head norm/RoPE hop -- see this section's own top comment for why
+    that hop is out of scope). ``consumer="plain"`` builds a plain-float
+    output projection; ``consumer="nbits"`` builds a real ``MatMulNBits``
+    one (block size `consumer_block_size`), to exercise the block-alignment
+    decline path.
+    """
+    Nq = num_heads * d
+    Nkv = kv_num_heads * d
+    qcodes_q, scales_q, kb = _nbits_quantize_default_zp(W_q, block_size)
+    qcodes_k, scales_k, _ = _nbits_quantize_default_zp(W_k, block_size)
+    qcodes_v, scales_v, _ = _nbits_quantize_default_zp(W_v, block_size)
+    q_B = _nbits_pack_B(qcodes_q, Nq, kb, block_size)
+    k_B = _nbits_pack_B(qcodes_k, Nkv, kb, block_size)
+    v_B = _nbits_pack_B(qcodes_v, Nkv, kb, block_size)
+
+    qkv_node = onnx.helper.make_node(
+        "MatMulNBitsQkv",
+        inputs=[
+            "A",
+            "",
+            "norm_scale",
+            "q_B",
+            "q_scales",
+            "q_bias",
+            "k_B",
+            "k_scales",
+            "k_bias",
+            "v_B",
+            "v_scales",
+            "v_bias",
+        ],
+        outputs=["Q", "K", "V"],
+        domain="com.microsoft",
+        name="qkv",
+        block_size=block_size,
+        bits=4,
+        Nq=Nq,
+        Nkv=Nkv,
+        K=K,
+    )
+    attn_node = onnx.helper.make_node(
+        "GroupQueryAttention",
+        inputs=["Q", "K", "V", "", "", "", ""],
+        outputs=["attn_out"],
+        domain="com.microsoft",
+        name="attn",
+        num_heads=num_heads,
+        kv_num_heads=kv_num_heads,
+    )
+    raw_out_width = num_heads * d
+    rng = np.random.default_rng(9002)
+    initializer = [
+        onnx.numpy_helper.from_array(q_B, name="q_B"),
+        onnx.numpy_helper.from_array(scales_q, name="q_scales"),
+        onnx.numpy_helper.from_array(bias_q, name="q_bias"),
+        onnx.numpy_helper.from_array(k_B, name="k_B"),
+        onnx.numpy_helper.from_array(scales_k, name="k_scales"),
+        onnx.numpy_helper.from_array(bias_k, name="k_bias"),
+        onnx.numpy_helper.from_array(v_B, name="v_B"),
+        onnx.numpy_helper.from_array(scales_v, name="v_scales"),
+        onnx.numpy_helper.from_array(bias_v, name="v_bias"),
+        onnx.numpy_helper.from_array(norm_scale, name="norm_scale"),
+    ]
+    if consumer == "plain":
+        down_w = (rng.standard_normal((raw_out_width, N2)) * 0.3).astype(np.float32)
+        down_node = onnx.helper.make_node(
+            "MatMul", ["attn_out", "down_w"], ["Z"], name="down"
+        )
+        initializer.append(onnx.numpy_helper.from_array(down_w, name="down_w"))
+        consumer_info = dict(down_w=down_w)
+    else:
+        assert consumer_block_size is not None
+        Wc = (rng.standard_normal((N2, raw_out_width)) * 0.3).astype(np.float32)
+        qcodes_c, scales_c, _zp_c, kbc = _nbits_quantize_block(Wc, consumer_block_size)
+        Bc = _nbits_pack_B(qcodes_c, N2, kbc, consumer_block_size)
+        initializer.append(onnx.numpy_helper.from_array(Bc, name="down_B"))
+        initializer.append(onnx.numpy_helper.from_array(scales_c, name="down_scales"))
+        down_node = _nbits_node(
+            "down",
+            "attn_out",
+            "Z",
+            "down_B",
+            "down_scales",
+            None,
+            None,
+            N2,
+            raw_out_width,
+            consumer_block_size,
+        )
+        consumer_info = dict(qcodes_c=qcodes_c, scales_c=scales_c, kbc=kbc)
+
+    graph = onnx.helper.make_graph(
+        [qkv_node, attn_node, down_node],
+        "g",
+        inputs=[
+            onnx.helper.make_tensor_value_info("A", onnx.TensorProto.FLOAT, [None, K])
+        ],
+        outputs=[
+            onnx.helper.make_tensor_value_info("Z", onnx.TensorProto.FLOAT, [None, N2])
+        ],
+        initializer=initializer,
+    )
+    model = onnx.helper.make_model(
+        graph,
+        opset_imports=[
+            onnx.helper.make_opsetid("", 21),
+            onnx.helper.make_opsetid("com.microsoft", 1),
+        ],
+    )
+    model.ir_version = 10
+    info = dict(
+        qcodes_q=qcodes_q,
+        scales_q=scales_q,
+        qcodes_k=qcodes_k,
+        scales_k=scales_k,
+        qcodes_v=qcodes_v,
+        scales_v=scales_v,
+        kb=kb,
+        Nq=Nq,
+        Nkv=Nkv,
+    )
+    info.update(consumer_info)
+    return model, info
+
+
+def test_matmul_nbits_qkv_pruning_matches_decomposed_oracle():
+    # 4 query heads, 2 KV heads (group_size=2), head_size=2. KV group 0
+    # (query heads 0,1 + kv head 0) engineered LARGE (kept); KV group 1
+    # (query heads 2,3 + kv head 1) engineered SMALL (dropped). sparsity=0.5
+    # -> keep exactly 1 of 2 groups: group 0.
+    num_heads, kv_num_heads, d, K, block_size, N2 = 4, 2, 2, 32, 32, 5
+    rng = np.random.default_rng(300)
+    W_q = (rng.standard_normal((num_heads * d, K)) * 0.3).astype(np.float32)
+    W_k = (rng.standard_normal((kv_num_heads * d, K)) * 0.3).astype(np.float32)
+    W_v = (rng.standard_normal((kv_num_heads * d, K)) * 0.3).astype(np.float32)
+    W_q[:4] *= 8.0
+    W_q[4:] *= 0.05
+    W_k[:2] *= 8.0
+    W_k[2:] *= 0.05
+    W_v[:2] *= 8.0
+    W_v[2:] *= 0.05
+    bias_q = (rng.standard_normal(num_heads * d) * 0.05).astype(np.float32)
+    bias_k = (rng.standard_normal(kv_num_heads * d) * 0.05).astype(np.float32)
+    bias_v = (rng.standard_normal(kv_num_heads * d) * 0.05).astype(np.float32)
+    norm_scale = (1.0 + rng.standard_normal(K) * 0.1).astype(np.float32)
+
+    model, info = _matmul_nbits_qkv_model(
+        num_heads,
+        kv_num_heads,
+        d,
+        K,
+        block_size,
+        N2,
+        W_q,
+        W_k,
+        W_v,
+        bias_q,
+        bias_k,
+        bias_v,
+        norm_scale,
+    )
+    onnx.checker.check_model(model)
+
+    pruned = onnxsim.apply_structured_pruning_matmul_nbits(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    q_keep = np.array([0, 1, 2, 3])  # heads 0,1 (group 0), d=2 -> rows 0-3
+    kv_keep = np.array([0, 1])  # kv head 0, d=2 -> rows 0-1
+
+    qkv_node = next(n for n in pruned.graph.node if n.name == "qkv")
+    assert next(a.i for a in qkv_node.attribute if a.name == "Nq") == 4
+    assert next(a.i for a in qkv_node.attribute if a.name == "Nkv") == 2
+    attn_node = next(n for n in pruned.graph.node if n.name == "attn")
+    assert next(a.i for a in attn_node.attribute if a.name == "num_heads") == 2
+    assert next(a.i for a in attn_node.attribute if a.name == "kv_num_heads") == 1
+
+    inits = {t.name: t for t in pruned.graph.initializer}
+    q_B_expected = _nbits_pack_B(info["qcodes_q"][q_keep], 4, info["kb"], block_size)
+    k_B_expected = _nbits_pack_B(info["qcodes_k"][kv_keep], 2, info["kb"], block_size)
+    v_B_expected = _nbits_pack_B(info["qcodes_v"][kv_keep], 2, info["kb"], block_size)
+    np.testing.assert_array_equal(
+        onnx.numpy_helper.to_array(inits["q_B"]), q_B_expected
+    )
+    np.testing.assert_array_equal(
+        onnx.numpy_helper.to_array(inits["k_B"]), k_B_expected
+    )
+    np.testing.assert_array_equal(
+        onnx.numpy_helper.to_array(inits["v_B"]), v_B_expected
+    )
+    np.testing.assert_array_equal(
+        onnx.numpy_helper.to_array(inits["down_w"]), info["down_w"][q_keep]
+    )
+
+    # Decompose: real SimplifiedLayerNormalization + 3x real MatMulNBits
+    # CPU kernels, run on the PRUNED tensors, against an independent numpy
+    # RMSNorm + dequantize-then-matmul oracle -- see this section's own top
+    # comment for why the fused node itself cannot be executed here.
+    decomposed = onnx.helper.make_model(
+        onnx.helper.make_graph(
+            [
+                onnx.helper.make_node(
+                    "SimplifiedLayerNormalization",
+                    ["A", "norm_scale"],
+                    ["A_norm"],
+                    domain="",
+                    axis=-1,
+                    epsilon=1e-5,
+                ),
+                _nbits_node(
+                    "mm_q",
+                    "A_norm",
+                    "q_out",
+                    "q_B",
+                    "q_scales",
+                    None,
+                    "q_bias",
+                    4,
+                    K,
+                    block_size,
+                ),
+                _nbits_node(
+                    "mm_k",
+                    "A_norm",
+                    "k_out",
+                    "k_B",
+                    "k_scales",
+                    None,
+                    "k_bias",
+                    2,
+                    K,
+                    block_size,
+                ),
+                _nbits_node(
+                    "mm_v",
+                    "A_norm",
+                    "v_out",
+                    "v_B",
+                    "v_scales",
+                    None,
+                    "v_bias",
+                    2,
+                    K,
+                    block_size,
+                ),
+            ],
+            "g",
+            inputs=[
+                onnx.helper.make_tensor_value_info(
+                    "A", onnx.TensorProto.FLOAT, [None, K]
+                )
+            ],
+            outputs=[
+                onnx.helper.make_tensor_value_info(
+                    "q_out", onnx.TensorProto.FLOAT, [None, 4]
+                ),
+                onnx.helper.make_tensor_value_info(
+                    "k_out", onnx.TensorProto.FLOAT, [None, 2]
+                ),
+                onnx.helper.make_tensor_value_info(
+                    "v_out", onnx.TensorProto.FLOAT, [None, 2]
+                ),
+            ],
+            initializer=[
+                inits["norm_scale"],
+                inits["q_B"],
+                inits["q_scales"],
+                inits["q_bias"],
+                inits["k_B"],
+                inits["k_scales"],
+                inits["k_bias"],
+                inits["v_B"],
+                inits["v_scales"],
+                inits["v_bias"],
+            ],
+        ),
+        opset_imports=[
+            onnx.helper.make_opsetid("", 21),
+            onnx.helper.make_opsetid("com.microsoft", 1),
+        ],
+    )
+    decomposed.ir_version = 10
+
+    x = np.random.default_rng(301).standard_normal((3, K)).astype(np.float32)
+    q_actual, k_actual, v_actual = _run(decomposed, {"A": x})
+
+    def _rmsnorm(a, scale, eps):
+        rms = np.sqrt(np.mean(a.astype(np.float64) ** 2, axis=-1, keepdims=True) + eps)
+        return (a.astype(np.float64) / rms) * scale.astype(np.float64)
+
+    a_norm_ref = _rmsnorm(x, norm_scale, 1e-5)
+    w_q_dequant = _nbits_dequant(info["qcodes_q"], info["scales_q"], None, block_size)
+    w_k_dequant = _nbits_dequant(info["qcodes_k"], info["scales_k"], None, block_size)
+    w_v_dequant = _nbits_dequant(info["qcodes_v"], info["scales_v"], None, block_size)
+    q_ref = a_norm_ref @ w_q_dequant[q_keep].T + bias_q[q_keep]
+    k_ref = a_norm_ref @ w_k_dequant[kv_keep].T + bias_k[kv_keep]
+    v_ref = a_norm_ref @ w_v_dequant[kv_keep].T + bias_v[kv_keep]
+
+    np.testing.assert_allclose(q_actual, q_ref, rtol=1e-3, atol=1e-3)
+    np.testing.assert_allclose(k_actual, k_ref, rtol=1e-3, atol=1e-3)
+    np.testing.assert_allclose(v_actual, v_ref, rtol=1e-3, atol=1e-3)
+
+
+def test_matmul_nbits_qkv_pruning_declines_non_block_aligned_consumer():
+    # head_size=3 (unlike the block-aligned test above's head_size=2):
+    # keep_q_heads=[0, 1] (group 0) -> q_idx = rows [0..5] (6 elements),
+    # which straddles the MatMulNBits consumer's own block boundary at row
+    # 4 (block_size=4: blocks [0,4), [4,8), [8,12)) -- rows 4, 5 are only
+    # PART of block 1, so this keep-set is NOT block-aligned. The whole
+    # chain (qkv node, attention node, AND consumer) must be left
+    # completely untouched, mirroring the plain-``MatMulNBits`` consumer's
+    # own identical decline precedent.
+    num_heads, kv_num_heads, d, K, block_size, N2 = 4, 2, 3, 32, 32, 4
+    consumer_block_size = 4
+    rng = np.random.default_rng(400)
+    W_q = (rng.standard_normal((num_heads * d, K)) * 0.3).astype(np.float32)
+    W_k = (rng.standard_normal((kv_num_heads * d, K)) * 0.3).astype(np.float32)
+    W_v = (rng.standard_normal((kv_num_heads * d, K)) * 0.3).astype(np.float32)
+    W_q[:6] *= 8.0
+    W_q[6:] *= 0.05
+    W_k[:3] *= 8.0
+    W_k[3:] *= 0.05
+    W_v[:3] *= 8.0
+    W_v[3:] *= 0.05
+    bias_q = (rng.standard_normal(num_heads * d) * 0.05).astype(np.float32)
+    bias_k = (rng.standard_normal(kv_num_heads * d) * 0.05).astype(np.float32)
+    bias_v = (rng.standard_normal(kv_num_heads * d) * 0.05).astype(np.float32)
+    norm_scale = (1.0 + rng.standard_normal(K) * 0.1).astype(np.float32)
+
+    model, _info = _matmul_nbits_qkv_model(
+        num_heads,
+        kv_num_heads,
+        d,
+        K,
+        block_size,
+        N2,
+        W_q,
+        W_k,
+        W_v,
+        bias_q,
+        bias_k,
+        bias_v,
+        norm_scale,
+        consumer="nbits",
+        consumer_block_size=consumer_block_size,
+    )
+    onnx.checker.check_model(model)
+
+    pruned = onnxsim.apply_structured_pruning_matmul_nbits(model, sparsity=0.5)
+
+    inits_before = {t.name: t.SerializeToString() for t in model.graph.initializer}
+    inits_after = {t.name: t.SerializeToString() for t in pruned.graph.initializer}
+    assert inits_before == inits_after
+    attrs_before = [
+        (n.name, [(a.name, a.i) for a in n.attribute]) for n in model.graph.node
+    ]
+    attrs_after = [
+        (n.name, [(a.name, a.i) for a in n.attribute]) for n in pruned.graph.node
+    ]
+    assert attrs_before == attrs_after
+
+
+def test_matmul_nbits_mlp_qkv_pruning_dry_run_matches_real_call():
+    N, K, N2, block_size = 8, 32, 5, 32
+    rng = np.random.default_rng(500)
+    W_gate = (rng.standard_normal((N, K)) * 0.3).astype(np.float32)
+    W_up = (rng.standard_normal((N, K)) * 0.3).astype(np.float32)
+    W_gate[:4] *= 8.0
+    W_up[:4] *= 8.0
+    W_gate[4:] *= 0.05
+    W_up[4:] *= 0.05
+    bias_gate = (rng.standard_normal(N) * 0.05).astype(np.float32)
+    bias_up = (rng.standard_normal(N) * 0.05).astype(np.float32)
+    mlp_model, _info = _matmul_nbits_mlp_model(
+        N, K, N2, block_size, W_gate, W_up, bias_gate, bias_up
+    )
+
+    num_heads, kv_num_heads, d = 4, 2, 2
+    W_q = (rng.standard_normal((num_heads * d, K)) * 0.3).astype(np.float32)
+    W_k = (rng.standard_normal((kv_num_heads * d, K)) * 0.3).astype(np.float32)
+    W_v = (rng.standard_normal((kv_num_heads * d, K)) * 0.3).astype(np.float32)
+    W_q[:4] *= 8.0
+    W_q[4:] *= 0.05
+    W_k[:2] *= 8.0
+    W_k[2:] *= 0.05
+    W_v[:2] *= 8.0
+    W_v[2:] *= 0.05
+    bias_q = (rng.standard_normal(num_heads * d) * 0.05).astype(np.float32)
+    bias_k = (rng.standard_normal(kv_num_heads * d) * 0.05).astype(np.float32)
+    bias_v = (rng.standard_normal(kv_num_heads * d) * 0.05).astype(np.float32)
+    norm_scale = (1.0 + rng.standard_normal(K) * 0.1).astype(np.float32)
+    qkv_model, _info2 = _matmul_nbits_qkv_model(
+        num_heads,
+        kv_num_heads,
+        d,
+        K,
+        block_size,
+        N2,
+        W_q,
+        W_k,
+        W_v,
+        bias_q,
+        bias_k,
+        bias_v,
+        norm_scale,
+    )
+
+    for model, expect_family in (
+        (mlp_model, "matmul_nbits_mlp"),
+        (qkv_model, "matmul_nbits_qkv"),
+    ):
+        report = onnxsim.analyze_pruning_sensitivity(
+            model, onnxsim.apply_structured_pruning_matmul_nbits, sparsity=0.5
+        )
+        assert report.not_eligible == []
+        assert len(report.layers) == 1
+        layer = report.layers[0]
+        assert layer.family == expect_family
+
+        pruned = onnxsim.apply_structured_pruning_matmul_nbits(model, sparsity=0.5)
+        if expect_family == "matmul_nbits_mlp":
+            node = next(n for n in pruned.graph.node if n.name == "mlp")
+            real_new_n = next(a.i for a in node.attribute if a.name == "N")
+        else:
+            node = next(n for n in pruned.graph.node if n.name == "attn")
+            real_new_n = next(a.i for a in node.attribute if a.name == "kv_num_heads")
+        assert layer.would_drop == layer.total - real_new_n
+
+    # An orphan fused node (no eligible downstream consumer) is reported via
+    # `not_eligible`, not silently dropped -- extends this file's own
+    # existing plain-``MatMulNBits`` orphan-node precedent
+    # (``test_...not_eligible``-style coverage above) to both new op types.
+    orphan_mlp = onnx.helper.make_model(
+        onnx.helper.make_graph(
+            [
+                onnx.helper.make_node(
+                    "MatMulNBitsMlp",
+                    ["A", "", "", "gate_B", "gate_scales", "", "up_B", "up_scales", ""],
+                    ["Y"],
+                    domain="com.microsoft",
+                    name="mlp_orphan",
+                    activation="Relu",
+                    block_size=32,
+                    bits=4,
+                    N=4,
+                    K=32,
+                )
+            ],
+            "g",
+            inputs=[
+                onnx.helper.make_tensor_value_info(
+                    "A", onnx.TensorProto.FLOAT, [None, 32]
+                )
+            ],
+            outputs=[
+                onnx.helper.make_tensor_value_info(
+                    "Y", onnx.TensorProto.FLOAT, [None, 4]
+                )
+            ],
+            initializer=[
+                onnx.numpy_helper.from_array(
+                    np.zeros((4, 1, 16), dtype=np.uint8), name="gate_B"
+                ),
+                onnx.numpy_helper.from_array(
+                    np.ones((4, 1), dtype=np.float32), name="gate_scales"
+                ),
+                onnx.numpy_helper.from_array(
+                    np.zeros((4, 1, 16), dtype=np.uint8), name="up_B"
+                ),
+                onnx.numpy_helper.from_array(
+                    np.ones((4, 1), dtype=np.float32), name="up_scales"
+                ),
+            ],
+        ),
+        opset_imports=[
+            onnx.helper.make_opsetid("", 21),
+            onnx.helper.make_opsetid("com.microsoft", 1),
+        ],
+    )
+    orphan_mlp.ir_version = 10
+    report = onnxsim.analyze_pruning_sensitivity(
+        orphan_mlp, onnxsim.apply_structured_pruning_matmul_nbits, sparsity=0.5
+    )
+    assert report.layers == []
+    assert report.not_eligible == ["MatMulNBitsMlp 'mlp_orphan'"]
