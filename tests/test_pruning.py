@@ -9722,6 +9722,10 @@ def _gqa_model(
     v_quant_type=None,  # GQA node's own v_quant_type attribute
     kv_cache_bit_width=None,  # GQA node's own kv_cache_bit_width attribute (8 or 4)
     attention_bias=None,  # constant attention_bias array, or None (unconnected)
+    attention_bias_dynamic_shape=None,  # tuple of int/str dims -> AttentionBias becomes
+    # a genuinely DYNAMIC graph input of this shape instead of a constant
+    # initializer (mutually exclusive with `attention_bias`) -- a str entry
+    # becomes a named symbolic dim_param (e.g. "H"), an int a concrete one.
     head_sink=None,  # constant head_sink array (shape (H,)), or None (unconnected)
 ):
     # Real ONNX Runtime CPU kernels for GroupQueryAttention require
@@ -9826,6 +9830,7 @@ def _gqa_model(
     # reach index 10 at all.
     if (
         attention_bias is not None
+        or attention_bias_dynamic_shape is not None
         or head_sink is not None
         or k_scale is not None
         or v_scale is not None
@@ -9833,6 +9838,10 @@ def _gqa_model(
         operands += [""] * 3  # cos_cache, sin_cache, position_ids
         if attention_bias is not None:
             initializer.append(_f32(np.asarray(attention_bias), "AttentionBias"))
+            operands.append("AttentionBias")
+        elif attention_bias_dynamic_shape is not None:
+            shape_text = ",".join(str(d) for d in attention_bias_dynamic_shape)
+            extra_graph_inputs += f", float[{shape_text}] AttentionBias"
             operands.append("AttentionBias")
         else:
             operands.append("")
@@ -10708,6 +10717,228 @@ def test_gqa_pruning_ambiguous_attention_bias_shape_is_declined():
     }
     for name in inits_before:
         np.testing.assert_array_equal(inits_before[name], inits_after[name])
+
+
+def test_gqa_pruning_dynamic_attention_bias_is_gathered_and_matches_oracle():
+    # The core regression test for a real, previously-unwarned gap (see
+    # onnxsim/pruning.py's own "Attention-head pruning" section comment, the
+    # paragraph directly above `_dynamic_head_bias_axis`, for the full
+    # reproduction this closes): a genuinely DYNAMIC (non-initializer)
+    # `attention_bias` graph input of the schema-documented per-head shape
+    # `[1, num_heads, seq, seq]` used to be left completely untouched by
+    # this pass -- both the node's own input reference and the graph's own
+    # declared shape for it -- while `num_heads`/`kv_num_heads` and every
+    # weight were still pruned, producing a model whose own
+    # `attention_bias` input is now the wrong width. Running that (pre-fix)
+    # pruned model through a real `onnxruntime.InferenceSession` with a real
+    # per-head `attention_bias` tensor of the ORIGINAL shape failed outright
+    # with "attention_bias dimension 1 must be equal to the num heads or 1,
+    # got 4" -- not a silent wrong-number bug, but a real "this pass just
+    # produced a model that cannot run" gap. As of this fix, a `Gather` node
+    # is spliced in ahead of the attention node's own input instead, an
+    # exact slice of the original per-head axis performed at runtime rather
+    # than pre-baked into a constant (the one case in this whole module
+    # where that's necessary, since the tensor's own values aren't
+    # available at prune time).
+    K, H, KVH, D, Out = 8, 4, 2, 8, 6
+    seq = 3
+    model, cfg = _gqa_model(
+        K=K,
+        H=H,
+        KVH=KVH,
+        D=D,
+        Out=Out,
+        seed=61,
+        seq=seq,
+        attention_bias_dynamic_shape=(1, H, seq, seq),
+    )
+    node = _gqa_node(model)
+    assert node.input[10] == "AttentionBias"
+    bias_vi_before = next(i for i in model.graph.input if i.name == "AttentionBias")
+    bias_dims_before = [d.dim_value for d in bias_vi_before.type.tensor_type.shape.dim]
+
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    node_after = _gqa_node(pruned)
+    num_heads, kv_num_heads = _gqa_attrs(node_after)
+    group_size = H // KVH
+    assert kv_num_heads == 1
+    assert num_heads == kv_num_heads * group_size
+
+    # The node's own `attention_bias` input must now point at a freshly
+    # inserted `Gather` node's own output -- not the untouched graph input
+    # directly, and not left stale -- and that graph input's own declared
+    # shape must stay exactly as originally declared (it's still the
+    # caller's own full, pre-pruning-width tensor -- only the NODE's own
+    # reference moved, to a new intermediate tensor).
+    assert node_after.input[10] != "AttentionBias"
+    gather_nodes = [n for n in pruned.graph.node if n.op_type == "Gather"]
+    assert len(gather_nodes) == 1
+    gather = gather_nodes[0]
+    assert gather.output[0] == node_after.input[10]
+    assert gather.input[0] == "AttentionBias"
+    axis_attr = next(a.i for a in gather.attribute if a.name == "axis")
+    assert axis_attr == 1
+    indices_init = next(
+        t for t in pruned.graph.initializer if t.name == gather.input[1]
+    )
+    keep_groups = _oracle_keep_groups(cfg["wq"], cfg["wk"], cfg["wv"], H, KVH, D, 1)
+    keep_q_heads = _group_q_heads(keep_groups, group_size)
+    np.testing.assert_array_equal(
+        onnx.numpy_helper.to_array(indices_init), keep_q_heads
+    )
+
+    bias_vi_after = next(i for i in pruned.graph.input if i.name == "AttentionBias")
+    bias_dims_after = [d.dim_value for d in bias_vi_after.type.tensor_type.shape.dim]
+    assert bias_dims_after == bias_dims_before  # untouched -- still full width
+
+    # Run the pruned model through a real onnxruntime.InferenceSession with
+    # a real per-head attention_bias tensor of the ORIGINAL (pre-prune)
+    # shape, and compare against an independently-built "kept heads only"
+    # oracle model (the same construction
+    # `test_gqa_pruning_attention_bias_and_head_sink_are_sliced_and_match_oracle`
+    # already uses for a CONSTANT attention_bias, here against a dynamic
+    # one instead).
+    rng2 = np.random.default_rng(62)
+    x = rng2.standard_normal((cfg["batch"], seq, K)).astype(np.float32)
+    attention_bias = rng2.standard_normal((1, H, seq, seq)).astype(np.float32)
+    (y_pruned,) = _run(pruned, {"X": x, "AttentionBias": attention_bias})
+
+    d = D
+    q_idx, kv_idx = _head_idx(keep_q_heads, d), _head_idx(keep_groups, d)
+    oracle, _ = _gqa_model(
+        K=K,
+        H=len(keep_q_heads),
+        KVH=len(keep_groups),
+        D=d,
+        Out=Out,
+        seed=61,
+        wq=cfg["wq"][:, q_idx],
+        wk=cfg["wk"][:, kv_idx],
+        wv=cfg["wv"][:, kv_idx],
+        wout=cfg["wout"][q_idx, :],
+        batch=cfg["batch"],
+        seq=seq,
+        attention_bias=attention_bias[:, keep_q_heads],
+    )
+    (y_oracle,) = _run(oracle, {"X": x})
+    np.testing.assert_allclose(y_pruned, y_oracle, rtol=1e-4, atol=1e-4)
+
+
+def test_gqa_pruning_dynamic_attention_bias_symbolic_shape_declines_whole_chain():
+    # A dynamic `attention_bias` whose own declared shape has a SYMBOLIC
+    # (named `dim_param`, not a concrete size) entry at the would-be
+    # `num_heads` axis can never statically resolve to either "genuinely
+    # per-head" or "broadcast" -- this pass's own stated bar everywhere else
+    # is "decline rather than guess", so the fix for this case is to
+    # decline the WHOLE chain outright (no weights pruned at all), not
+    # silently proceed and leave the model broken the way the pre-fix code
+    # did for every dynamic attention_bias regardless of shape.
+    K, H, KVH, D, Out = 8, 4, 2, 8, 6
+    model, cfg = _gqa_model(
+        K=K,
+        H=H,
+        KVH=KVH,
+        D=D,
+        Out=Out,
+        seed=63,
+        attention_bias_dynamic_shape=(1, "NumHeads", 3, 3),
+    )
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+
+    node_after = _gqa_node(pruned)
+    num_heads, kv_num_heads = _gqa_attrs(node_after)
+    assert (num_heads, kv_num_heads) == (H, KVH)  # completely unpruned
+    assert node_after.input[10] == "AttentionBias"  # untouched
+    assert not any(n.op_type == "Gather" for n in pruned.graph.node)
+
+    inits_before = {
+        t.name: onnx.numpy_helper.to_array(t) for t in model.graph.initializer
+    }
+    inits_after = {
+        t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer
+    }
+    for name in inits_before:
+        np.testing.assert_array_equal(inits_before[name], inits_after[name])
+
+
+def test_gqa_pruning_dynamic_broadcast_attention_bias_is_left_untouched():
+    # Regression test: a dynamic `attention_bias` whose own declared shape
+    # resolves to a genuine BROADCAST (the would-be `num_heads` axis is
+    # exactly size 1) is the one case where "leave completely alone" was
+    # already correct before this fix and must stay that way -- no `Gather`
+    # inserted, the node's own input reference left exactly as-is, and the
+    # weights still pruned normally.
+    K, H, KVH, D, Out = 8, 4, 2, 8, 6
+    model, cfg = _gqa_model(
+        K=K,
+        H=H,
+        KVH=KVH,
+        D=D,
+        Out=Out,
+        seed=64,
+        attention_bias_dynamic_shape=(1, 1, 3, 3),
+    )
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    node_after = _gqa_node(pruned)
+    num_heads, kv_num_heads = _gqa_attrs(node_after)
+    assert kv_num_heads == 1  # weights ARE still pruned
+    assert num_heads == 2
+    assert node_after.input[10] == "AttentionBias"  # untouched, no Gather
+    assert not any(n.op_type == "Gather" for n in pruned.graph.node)
+
+
+def test_analyze_attention_head_pruning_gqa_dynamic_attention_bias_matches_real_call():
+    # Dry-run (`analyze_pruning_sensitivity`) vs. real-call parity for BOTH
+    # new outcomes this fix introduces: a genuinely per-head dynamic
+    # `attention_bias` (matched, pruned normally -- the dry-run's own
+    # `would_drop` must predict the exact same group count the real call
+    # drops) and a symbolic-shape one (declined outright -- the dry-run
+    # must report zero eligible layers, exactly mirroring the real call's
+    # own "whole chain left untouched"). Both share `_find_gqa_chains`
+    # (extended by this fix to consult a dynamic tensor's own declared
+    # shape) as their one common matcher, so this parity is structural, not
+    # coincidental -- see this module's own "Attention-head pruning"
+    # section comment for why the decline decision lives in the matcher
+    # itself rather than being duplicated in the dry-run's own reporting
+    # logic.
+    K, H, KVH, D, Out = 8, 4, 2, 8, 6
+
+    model, cfg = _gqa_model(
+        K=K,
+        H=H,
+        KVH=KVH,
+        D=D,
+        Out=Out,
+        seed=65,
+        attention_bias_dynamic_shape=(1, H, 3, 3),
+    )
+    report = onnxsim.analyze_pruning_sensitivity(
+        model, onnxsim.apply_attention_head_pruning, sparsity=0.5
+    )
+    assert len(report.layers) == 1
+    assert report.layers[0].would_drop == 1  # KVH=2 -> keep 1 -> drop 1
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    _, kv_num_heads = _gqa_attrs(_gqa_node(pruned))
+    assert kv_num_heads == KVH - report.layers[0].would_drop
+
+    declined_model, _ = _gqa_model(
+        K=K,
+        H=H,
+        KVH=KVH,
+        D=D,
+        Out=Out,
+        seed=66,
+        attention_bias_dynamic_shape=(1, "NumHeads", 3, 3),
+    )
+    declined_report = onnxsim.analyze_pruning_sensitivity(
+        declined_model, onnxsim.apply_attention_head_pruning, sparsity=0.5
+    )
+    assert len(declined_report.layers) == 0  # the chain never matched at all
+    assert len(declined_report.not_eligible) == 1
 
 
 def test_gqa_pruning_malformed_head_sink_shape_is_declined():
@@ -12631,6 +12862,10 @@ def _mha_model(
     bv=None,
     wout=None,
     attention_bias=None,  # constant attention_bias array, or None (unconnected)
+    attention_bias_dynamic_shape=None,  # tuple of int/str dims -> AttentionBias
+    # becomes a genuinely DYNAMIC graph input of this shape instead of a
+    # constant initializer (mutually exclusive with `attention_bias`) -- see
+    # `_gqa_model`'s own identical parameter for the str-entry convention.
     past_kv=None,  # None (omitted) | "nonempty" (constant) | "dynamic" (graph input)
     past_key=None,  # explicit override for past_kv="nonempty" (else random)
     past_value=None,  # explicit override for past_kv="nonempty" (else random)
@@ -12687,10 +12922,18 @@ def _mha_model(
         operands.append("")
 
     extra_graph_inputs = ""
-    if attention_bias is not None or past_kv is not None:
+    if (
+        attention_bias is not None
+        or attention_bias_dynamic_shape is not None
+        or past_kv is not None
+    ):
         operands.append("")  # key_padding_mask -- never touched by this pass
         if attention_bias is not None:
             initializer.append(_f32(np.asarray(attention_bias), "AttentionBias"))
+            operands.append("AttentionBias")
+        elif attention_bias_dynamic_shape is not None:
+            shape_text = ",".join(str(d) for d in attention_bias_dynamic_shape)
+            extra_graph_inputs += f", float[{shape_text}] AttentionBias"
             operands.append("AttentionBias")
         else:
             operands.append("")
@@ -12957,6 +13200,75 @@ def test_mha_pruning_attention_bias_is_sliced_and_matches_oracle():
     rng2 = np.random.default_rng(17)
     x = rng2.standard_normal((cfg["batch"], cfg["seq"], cfg["K"])).astype(np.float32)
     (y_pruned,) = _run(pruned, {"X": x})
+    (y_oracle,) = _run(oracle, {"X": x})
+    np.testing.assert_allclose(y_pruned, y_oracle, rtol=1e-4, atol=1e-4)
+
+
+def test_mha_pruning_dynamic_attention_bias_is_gathered_and_matches_oracle():
+    # The `MultiHeadAttention` analogue of
+    # `test_gqa_pruning_dynamic_attention_bias_is_gathered_and_matches_oracle`
+    # -- confirms this fix's shared `_slice_or_gather_head_bias` helper (and
+    # the shared `_GQAChain`/`_apply_one_gqa_chain` machinery every
+    # separate-Q/K/V-producer op in this family, including
+    # `MultiHeadAttention`, dispatches through) closes the identical gap for
+    # a SECOND op family, not just `GroupQueryAttention`.
+    H, D = 4, 4
+    seq = 5
+    model, cfg = _mha_model(
+        K=8,
+        H=H,
+        D=D,
+        Out=6,
+        seed=19,
+        seq=seq,
+        attention_bias_dynamic_shape=(1, H, seq, seq),
+    )
+    node = _mha_node(model)
+    assert node.input[5] == "AttentionBias"
+
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    node_after = _mha_node(pruned)
+    num_heads = _mha_num_heads(node_after)
+    assert num_heads == 2  # max(1, 4 - round(4*0.5))
+    assert node_after.input[5] != "AttentionBias"  # rewired to the new Gather
+
+    gather_nodes = [n for n in pruned.graph.node if n.op_type == "Gather"]
+    assert len(gather_nodes) == 1
+    gather = gather_nodes[0]
+    assert gather.output[0] == node_after.input[5]
+    assert gather.input[0] == "AttentionBias"
+    assert next(a.i for a in gather.attribute if a.name == "axis") == 1
+
+    keep_heads = _oracle_keep_groups(
+        cfg["wq"], cfg["wk"], cfg["wv"], H, H, D, num_heads
+    )
+    indices_init = next(
+        t for t in pruned.graph.initializer if t.name == gather.input[1]
+    )
+    np.testing.assert_array_equal(onnx.numpy_helper.to_array(indices_init), keep_heads)
+
+    rng2 = np.random.default_rng(20)
+    x = rng2.standard_normal((cfg["batch"], seq, cfg["K"])).astype(np.float32)
+    attention_bias = rng2.standard_normal((1, H, seq, seq)).astype(np.float32)
+    (y_pruned,) = _run(pruned, {"X": x, "AttentionBias": attention_bias})
+
+    idx = _head_idx(keep_heads, D)
+    oracle, _ = _mha_model(
+        K=cfg["K"],
+        H=len(keep_heads),
+        D=D,
+        Out=cfg["Out"],
+        seed=19,
+        seq=seq,
+        attention_bias=attention_bias[:, keep_heads],
+        wq=cfg["wq"][:, idx],
+        wk=cfg["wk"][:, idx],
+        wv=cfg["wv"][:, idx],
+        wout=cfg["wout"][idx, :],
+        batch=cfg["batch"],
+    )
     (y_oracle,) = _run(oracle, {"X": x})
     np.testing.assert_allclose(y_pruned, y_oracle, rtol=1e-4, atol=1e-4)
 
@@ -29574,6 +29886,88 @@ def test_matmul_nbits_qkv_pruning_matches_decomposed_oracle():
     np.testing.assert_allclose(q_actual, q_ref, rtol=1e-3, atol=1e-3)
     np.testing.assert_allclose(k_actual, k_ref, rtol=1e-3, atol=1e-3)
     np.testing.assert_allclose(v_actual, v_ref, rtol=1e-3, atol=1e-3)
+
+
+def test_matmul_nbits_qkv_pruning_dynamic_attention_bias_is_gathered():
+    # `_apply_matmul_nbits_qkv_chains` reuses this fix's own
+    # `_slice_or_gather_head_bias` for its own `attention_bias` handling
+    # (see that function's own docstring) -- a THIRD call site, beyond
+    # `_apply_one_plain_attention_chain`/`_apply_one_gqa_chain` already
+    # covered above, confirming the fix is genuinely shared rather than
+    # reimplemented per op family. Only the Gather-insertion mechanics are
+    # checked here (index/axis/indices-array correctness) -- the underlying
+    # per-group selection and slicing this pass performs is already
+    # end-to-end oracle-verified by
+    # `test_matmul_nbits_qkv_pruning_matches_decomposed_oracle` above.
+    num_heads, kv_num_heads, d, K, block_size, N2 = 4, 2, 2, 32, 32, 5
+    seq = 3
+    rng = np.random.default_rng(302)
+    W_q = (rng.standard_normal((num_heads * d, K)) * 0.3).astype(np.float32)
+    W_k = (rng.standard_normal((kv_num_heads * d, K)) * 0.3).astype(np.float32)
+    W_v = (rng.standard_normal((kv_num_heads * d, K)) * 0.3).astype(np.float32)
+    W_q[:4] *= 8.0
+    W_q[4:] *= 0.05
+    W_k[:2] *= 8.0
+    W_k[2:] *= 0.05
+    W_v[:2] *= 8.0
+    W_v[2:] *= 0.05
+    bias_q = np.zeros(num_heads * d, dtype=np.float32)
+    bias_k = np.zeros(kv_num_heads * d, dtype=np.float32)
+    bias_v = np.zeros(kv_num_heads * d, dtype=np.float32)
+    norm_scale = np.ones(K, dtype=np.float32)
+
+    model, info = _matmul_nbits_qkv_model(
+        num_heads,
+        kv_num_heads,
+        d,
+        K,
+        block_size,
+        N2,
+        W_q,
+        W_k,
+        W_v,
+        bias_q,
+        bias_k,
+        bias_v,
+        norm_scale,
+    )
+    # `attn`'s own inputs stop at `nonpad_kv_seqlen` (index 6) -- pad up to
+    # `attention_bias`'s own index (10) with empty placeholders
+    # (`cos_cache`/`sin_cache`/`position_ids`), then wire a genuinely
+    # dynamic `AttentionBias` graph input there, mirroring how
+    # `_gqa_model`'s own `attention_bias_dynamic_shape` parameter does the
+    # same thing for the plain (non-fused-weight) GQA family above.
+    attn_node = next(n for n in model.graph.node if n.name == "attn")
+    while len(attn_node.input) < 10:
+        attn_node.input.append("")
+    attn_node.input.append("AttentionBias")
+    model.graph.input.append(
+        onnx.helper.make_tensor_value_info(
+            "AttentionBias", onnx.TensorProto.FLOAT, [1, num_heads, seq, seq]
+        )
+    )
+    onnx.checker.check_model(model)
+
+    pruned = onnxsim.apply_structured_pruning_matmul_nbits(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    attn_after = next(n for n in pruned.graph.node if n.name == "attn")
+    assert next(a.i for a in attn_after.attribute if a.name == "num_heads") == 2
+    assert next(a.i for a in attn_after.attribute if a.name == "kv_num_heads") == 1
+    assert attn_after.input[10] != "AttentionBias"  # rewired to the new Gather
+
+    gather_nodes = [n for n in pruned.graph.node if n.op_type == "Gather"]
+    assert len(gather_nodes) == 1
+    gather = gather_nodes[0]
+    assert gather.output[0] == attn_after.input[10]
+    assert gather.input[0] == "AttentionBias"
+    assert next(a.i for a in gather.attribute if a.name == "axis") == 1
+    indices_init = next(
+        t for t in pruned.graph.initializer if t.name == gather.input[1]
+    )
+    np.testing.assert_array_equal(
+        onnx.numpy_helper.to_array(indices_init), np.array([0, 1])
+    )  # kv group 0 (query heads 0,1) is the engineered-LARGE, kept one
 
 
 def test_matmul_nbits_qkv_pruning_declines_non_block_aligned_consumer():

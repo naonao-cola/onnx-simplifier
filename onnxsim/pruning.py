@@ -6507,8 +6507,13 @@ def _value_info_by_name(
     Feeds :func:`_tensor_rank`'s positive-axis rank lookup, used by both a
     `Concat`'s own positive `axis` (this section's own comment) and a
     `_NORM_PASS_THROUGH_OPS` node's own positive `axis`
-    (:func:`_norm_axis_is_last`); nothing else in this module ever consults
-    a tensor's declared type/shape.
+    (:func:`_norm_axis_is_last`); also feeds :func:`_tensor_shape_dims`'s own
+    full-shape lookup (:func:`apply_transformer_block_pruning`'s own
+    `_shapes_match` safety check, and, as of this module's own dynamic-
+    `attention_bias`/`attn_mask` fix, :func:`_dynamic_head_bias_axis` -- see
+    :func:`_shape_inferred_value_info_by_name`, directly below, for the
+    shape-inference-seeded variant every "Attention-head pruning" entry
+    point builds one from).
     """
     by_name: Dict[str, onnx.ValueInfoProto] = {}
     for vi in graph.input:
@@ -6518,6 +6523,45 @@ def _value_info_by_name(
     for vi in graph.value_info:
         by_name[vi.name] = vi
     return by_name
+
+
+def _shape_inferred_value_info_by_name(
+    out: onnx.ModelProto,
+) -> Dict[str, onnx.ValueInfoProto]:
+    """:func:`_value_info_by_name`, seeded by a best-effort
+    ``onnx.shape_inference.infer_shapes()`` pass over `out` first -- the same
+    pattern :func:`apply_transformer_block_pruning` already established
+    (there, to back its own `_shapes_match` safety check) for resolving a
+    tensor's own shape from graph structure, not only whatever the model
+    already happens to declare outright. Used by every "Attention-head
+    pruning" family entry point (:func:`apply_attention_head_pruning`,
+    :func:`apply_attention_head_wanda_pruning`,
+    :func:`apply_structured_pruning_matmul_nbits`, and their `_analyze_*`
+    dry-run mirrors) to classify a *dynamic* `attention_bias`/`attn_mask`
+    input's own shape (:func:`_dynamic_head_bias_axis`) -- a genuinely
+    dynamic tensor's shape is most commonly already declared outright (an
+    ordinary graph input, the common real-world shape this closes -- see
+    this module's own "Attention-head pruning" section comment for the
+    empirical reproduction), but shape inference additionally resolves an
+    *intermediate* tensor's shape purely from graph structure when nothing
+    declares it directly (e.g. a
+    `com.microsoft::RelativePositionBias`/`GatedRelativePositionBias`
+    subgraph's own output feeding `attention_bias` in a real T5/DeBERTa-style
+    export).
+
+    Falls back to `out.graph`'s own as-is `value_info`/`input`/`output` (no
+    inference at all) if shape inference itself raises on `out` -- still
+    enough to resolve any tensor whose shape the graph already declares
+    outright, just not one only *derivable* by inference -- rather than
+    letting an unrelated shape-inference failure block the whole pruning
+    call; every caller of this function already treats an unresolvable
+    shape as "decline that one chain," never as an error.
+    """
+    try:
+        inferred = onnx.shape_inference.infer_shapes(out, strict_mode=False)
+        return _value_info_by_name(inferred.graph)
+    except Exception:
+        return _value_info_by_name(out.graph)
 
 
 def _tensor_rank(
@@ -7780,7 +7824,7 @@ def _slice_axis(init: onnx.TensorProto, keep: np.ndarray, axis: int) -> None:
     init.CopyFrom(onnx.numpy_helper.from_array(new, name=init.name))
 
 
-def _head_bias_axis(dims: Sequence[int], num_heads: int) -> Optional[int]:
+def _head_bias_axis(dims: Sequence[Union[int, str]], num_heads: int) -> Optional[int]:
     """Classifies a broadcastable per-head mask/bias constant's shape
     against the schema-documented rank-4 layout ``(batch_size or 1,
     num_heads or 1, q_sequence_length, kv_sequence_length)`` -- or any rank
@@ -7820,6 +7864,19 @@ def _head_bias_axis(dims: Sequence[int], num_heads: int) -> Optional[int]:
     invalid against this same broadcasting rule, but this function still
     declines rather than assume what a caller might have meant) -- for the
     caller to decline the whole chain on rather than guess.
+
+    `dims` entries are typed ``Union[int, str]`` (rather than plain ``int``)
+    purely so :func:`_dynamic_head_bias_axis` can hand this same classifier
+    a *dynamic* tensor's own declared shape -- one entry per dimension, each
+    either a concrete size or a named symbolic `dim_param` string (see
+    :func:`_tensor_shape_dims`) -- with no logic change needed here at all:
+    a symbolic entry at the target axis can never compare equal to
+    `num_heads` (an ``int``) or ``1`` either, so it falls through to the
+    same ``None`` decline every other unresolvable shape already gets,
+    exactly the right answer (a symbolic per-head-slot dimension is, by
+    definition, not statically known to be either broadcast or `num_heads`-
+    sized). Every existing caller against a constant's own `TensorProto
+    .dims` (always plain ``int``) is unaffected.
     """
     rank = len(dims)
     if rank > 4:
@@ -7835,6 +7892,352 @@ def _head_bias_axis(dims: Sequence[int], num_heads: int) -> Optional[int]:
     if size == 1:
         return -1
     return None
+
+
+# `_dynamic_head_bias_axis` through `_slice_or_gather_head_bias`, below: a
+# *dynamic* `attention_bias`/`attn_mask`-family operand's own safety net --
+# see this module's own "Attention-head pruning" section comment for the
+# full narrative this closes, reproduced here in short since these
+# functions are this fix's own concrete implementation of it.
+#
+# Every one of this module's "Attention-head pruning" matchers already
+# handles a *constant* `attention_bias`/`attn_mask`/`mask_index`-family
+# input correctly: :func:`_head_bias_axis` classifies its shape, a genuine
+# per-head one is sliced in place (:func:`_slice_axis`) by the same
+# kept-head/kept-group index set every other tensor in the matched chain
+# is, a broadcast is left untouched (already correct for any head count),
+# and an unresolvable shape declines the whole match outright. A *dynamic*
+# one -- fed by an ordinary graph input or an upstream node's own
+# computation, no constant `TensorProto` to slice at prune time at all --
+# used to get none of that: every matcher in this section treated it
+# exactly like `past_key`/`past_value`/`PagedAttention`'s own `key_cache`/
+# `value_cache` -- "the caller's own runtime data, leave it alone, it can
+# never block a match" -- and left it connected, completely untouched, to
+# a node whose own `num_heads`/`kv_num_heads` this pass had just shrunk.
+#
+# That reasoning is right for `past_key`/`past_value`/`key_cache`/
+# `value_cache`: their own *values* are the caller's runtime data, but
+# their own *shape* is never asserted against the node's own `num_heads`
+# attribute the way `attention_bias`/`attn_mask` genuinely is -- a
+# dynamic KV cache is simply sized by whatever the caller supplies at
+# whatever sequence length is live that call, no `num_heads`-vs-tensor-
+# shape consistency for this pass to ever get out of sync. A per-head
+# `attention_bias`/`attn_mask`, by contrast, is added directly against the
+# attention op's own ``(batch, num_heads, q_seq, kv_seq)`` score tensor, at
+# a `num_heads` this pass just changed -- so leaving a genuinely
+# `num_heads`-sized dynamic one connected, unslimmed, produces a model
+# whose own kernel rejects it outright at inference. Confirmed via an
+# actual reproduction, not merely reasoned about: a real
+# ``com.microsoft::GroupQueryAttention`` node (``num_heads=4``,
+# ``kv_num_heads=2``) with `attention_bias` wired as a genuinely dynamic
+# (non-initializer) graph input of the schema-documented per-head shape
+# ``[1, num_heads, seq, seq]``, run through
+# :func:`apply_attention_head_pruning` before this fix, came out with
+# `num_heads`/`kv_num_heads` correctly pruned 4->2/2->1 and Q/K/V/O weights
+# correctly sliced, but `attention_bias` -- both the node's own input
+# reference and the graph's own declared input shape for it -- left
+# completely at its stale, pre-pruning ``[1, 4, 3, 3]``. Running that
+# pruned model through a real ``onnxruntime.InferenceSession`` with a real
+# `attention_bias` tensor of the original per-head shape failed outright:
+# ``INVALID_ARGUMENT : ... GroupQueryAttention node ... attention_bias
+# dimension 1 must be equal to the num heads or 1, got 4``. Not a silent
+# wrong-number bug -- ORT's own kernel validates strictly rather than
+# mis-broadcasting -- but a real, completely unwarned "this pass just
+# produced a model that cannot run" gap for any real export where
+# `attention_bias`/`attn_mask` is genuinely dynamic and per-head-shaped
+# (a real, if less common, T5/DeBERTa-style relative-position-bias export
+# shape -- the dynamic tensor fed by a
+# `com.microsoft::RelativePositionBias`/`GatedRelativePositionBias`
+# subgraph rather than baked as a constant). This module otherwise never
+# `warnings.warn`/logs at all (by design -- see this module's own top-level
+# docstring/"Attention-head pruning" section comment: decline rather than
+# guess, but a decline is always supposed to leave a model that still
+# *works*, just unpruned; this was the one case that violated that
+# premise instead of upholding it).
+#
+# The fix, symmetric with the constant case: `attention_bias`/`attn_mask`'s
+# own declared shape (`graph.input`/`graph.output`/`graph.value_info`,
+# whatever the pass's own `value_info_by_name` -- built the same
+# `_value_info_by_name` way :func:`apply_transformer_block_pruning` already
+# builds one, optionally seeded by a prior `onnx.shape_inference
+# .infer_shapes()` pass the same way that function's own caller runs one
+# first -- happens to carry) is classified by the *same*
+# :func:`_head_bias_axis` a constant's own `.dims` already is (see that
+# function's own docstring for why a `Union[int, str]` shape -- concrete
+# sizes and named symbolic `dim_param`s alike -- needs no new logic there
+# at all). A shape that statically resolves to a genuine per-head axis gets
+# an exact slice applied at *graph-construction* time instead of *prune*
+# time -- a new ``Gather`` node spliced in ahead of the attention op's own
+# input, indices the identical sorted kept-head/kept-group array every
+# other tensor in the chain is sliced by -- since the tensor's own actual
+# values aren't available to slice directly the way a constant's are; this
+# is still an exact slice of the original per-head axis, never a recompute,
+# consistent with this whole module's own "slice, don't recompute"
+# philosophy applied to the one case where the slice itself has to happen
+# at runtime. A shape that resolves to a genuine broadcast (or is absent)
+# needs no action at all -- already correct for any head count, exactly as
+# today. A shape that doesn't resolve to either -- genuinely symbolic/
+# unknown at the would-be head axis, or any other unresolvable shape --
+# declines the WHOLE chain outright, the same "don't guess" bar a
+# malformed constant already gets, rather than silently reproducing this
+# exact gap for a shape this pass merely couldn't classify. See
+# ``tests/test_pruning.py``'s own "dynamic attention_bias/attn_mask" tests
+# for the in-repo version of the reproduction above, both fixed outcomes,
+# and the decline path.
+
+
+def _dynamic_head_bias_axis(
+    name: str,
+    value_info_by_name: Dict[str, onnx.ValueInfoProto],
+    num_heads: int,
+) -> Optional[int]:
+    """The :func:`_head_bias_axis` analogue for a *dynamic* (non-constant)
+    `attention_bias`/`attn_mask`-family tensor `name`: reads its own
+    declared shape off `value_info_by_name` (:func:`_tensor_shape_dims` --
+    `graph.input`/`graph.output`/`graph.value_info`, each dimension either a
+    concrete size or a named symbolic `dim_param`) and classifies it exactly
+    :func:`_head_bias_axis` already classifies a constant's own `.dims`.
+    Returns ``None`` -- decline, don't guess -- both when `name`'s own shape
+    isn't stated at all (rank unknown) and when :func:`_head_bias_axis`
+    itself declines (rank > 4, or the would-be head axis is symbolic or
+    some third size that's neither `num_heads` nor a broadcast ``1``); ``-1``
+    when it's a confirmed broadcast (or the tensor's own rank is too low to
+    carry a head axis at all); the axis position itself when it's a
+    confirmed genuine per-head tensor. See this module's own
+    "Attention-head pruning" section comment (the paragraph directly above
+    this function) for the full empirical reproduction and reasoning this
+    closes.
+    """
+    dims = _tensor_shape_dims(name, value_info_by_name)
+    if dims is None:
+        return None
+    return _head_bias_axis(dims, num_heads)
+
+
+def _head_bias_input_is_safe(
+    node: onnx.NodeProto,
+    idx: int,
+    initializer_map: Dict[str, onnx.TensorProto],
+    value_info_by_name: Optional[Dict[str, onnx.ValueInfoProto]],
+    num_heads: int,
+) -> bool:
+    """Match-time safety gate for `node.input[idx]` -- an
+    `attention_bias`/`attn_mask`-family operand, already confirmed non-empty
+    by the caller -- shared by every matcher in this module's
+    "Attention-head pruning" family that owns one. ``True`` unless the input
+    is something this pass cannot prove safe to either leave exactly as-is
+    (a broadcast) or correctly re-derive at apply time (a genuine per-head
+    axis, constant or dynamic): a non-empty **constant** whose shape doesn't
+    cleanly resolve via :func:`_head_bias_axis`, or -- new as of this fix --
+    a **dynamic** tensor whose own declared shape doesn't cleanly resolve
+    via :func:`_dynamic_head_bias_axis`.
+
+    `value_info_by_name` is ``Optional`` purely for
+    :func:`_match_attention_weight_only`'s own reuse of
+    :func:`_match_attention_producer` for unstructured/magnitude/Wanda/
+    SparseGPT weight-only pruning (never given a real one, since that
+    pruning family never changes `num_heads` at all -- it only ever zeros
+    or reweights existing values in place, so a per-head `attention_bias`'s
+    own shape can never go stale under it, dynamic or not, and this whole
+    new safety net is genuinely inapplicable there): ``None`` skips the new
+    dynamic-tensor check entirely (matching this function's own pre-fix
+    behavior for a dynamic input -- never declined), while every real
+    "Attention-head pruning" family caller (which *does* change `num_heads`,
+    and so does need this net) always passes a real dict, even if empty
+    (shape inference found nothing at all -- the maximally conservative,
+    but safe, fallback).
+    """
+    name = node.input[idx]
+    bias_init = initializer_map.get(name)
+    if bias_init is not None:
+        if int(np.prod(bias_init.dims)) == 0:
+            return True  # empty tensor -- schema-degenerate, nothing to slice
+        return _head_bias_axis(list(bias_init.dims), num_heads) is not None
+    if value_info_by_name is None:
+        return True  # caller outside the "Attention-head pruning" family --
+        # see this function's own docstring for why the dynamic check is
+        # skipped rather than applied conservatively
+    return _dynamic_head_bias_axis(name, value_info_by_name, num_heads) is not None
+
+
+@dataclass
+class _DynamicHeadBiasContext:
+    """Bundles what :func:`_slice_or_gather_head_bias` needs, at apply time,
+    to correctly handle a *dynamic* `attention_bias`/`attn_mask`-family
+    input that :func:`_head_bias_input_is_safe` already confirmed resolves
+    to either a genuine per-head axis or a broadcast -- threaded through
+    every apply-time function in this module's "Attention-head pruning"
+    family that owns such an input (:func:`_apply_one_plain_attention_chain`,
+    :func:`_apply_one_gqa_chain`, :func:`_apply_matmul_nbits_qkv_chains`).
+
+    `graph`/`used_names` are only ever touched (graph mutated, names minted)
+    for the genuine-per-head-axis case, via
+    :func:`_insert_dynamic_head_bias_gather` -- a broadcast, an absent
+    input, or a constant bias never reaches that code path at all.
+    """
+
+    graph: onnx.GraphProto
+    value_info_by_name: Dict[str, onnx.ValueInfoProto]
+    used_names: Set[str]
+
+
+def _existing_graph_names(graph: onnx.GraphProto) -> Set[str]:
+    """Every tensor/node name already live in `graph` -- every input,
+    output, initializer, interior `value_info` entry, and every node's own
+    name/inputs/outputs -- the seed set :func:`_mint_unique_name` grows from
+    so a freshly inserted `Gather` node and its own new indices initializer
+    (:func:`_insert_dynamic_head_bias_gather`) can never collide with
+    anything already in the graph.
+    """
+    names: Set[str] = set()
+    for vi in graph.input:
+        names.add(vi.name)
+    for vi in graph.output:
+        names.add(vi.name)
+    for vi in graph.value_info:
+        names.add(vi.name)
+    for t in graph.initializer:
+        names.add(t.name)
+    for node in graph.node:
+        if node.name:
+            names.add(node.name)
+        names.update(n for n in node.input if n)
+        names.update(n for n in node.output if n)
+    return names
+
+
+def _mint_unique_name(base: str, used: Set[str]) -> str:
+    """`base`, or `base` with a numeric suffix appended until it no longer
+    collides with anything in `used` -- and reserves the result in `used`
+    before returning it, so repeated calls (this fix's own three names --
+    indices initializer, `Gather` node, `Gather` output -- for the same
+    `base`) never collide with each other either.
+    """
+    name = base
+    suffix = 0
+    while name in used:
+        suffix += 1
+        name = f"{base}_{suffix}"
+    used.add(name)
+    return name
+
+
+def _insert_dynamic_head_bias_gather(
+    graph: onnx.GraphProto,
+    used_names: Set[str],
+    tensor_name: str,
+    axis: int,
+    keep: np.ndarray,
+    consumer: onnx.NodeProto,
+) -> str:
+    """Inserts a new ``Gather`` node (``axis=axis``, indices `keep` -- the
+    same sorted kept-head/kept-group index array every other tensor in the
+    matched chain is sliced by) between the dynamic tensor `tensor_name` and
+    `consumer` (the attention node about to be rewired to read from it, via
+    the caller's own job, not this function's), and returns the new node's
+    own output name.
+
+    Still an EXACT slice of `tensor_name`'s own per-head axis -- the same
+    index set, the same axis :func:`_slice_axis`'s own in-place ``np.take``
+    would apply to a constant -- just expressed as a new graph node instead
+    of pre-baked into a constant, since `tensor_name`'s own actual values
+    aren't available at prune time (see this module's own "Attention-head
+    pruning" section comment, directly above :func:`_dynamic_head_bias_axis`,
+    for the full reasoning): the one case in this whole pass where a genuine
+    slice has to happen at *runtime* rather than at prune time to stay a
+    slice at all, never a recompute. `tensor_name` itself, and every
+    existing node/initializer in `graph`, is left completely untouched.
+
+    The new node is spliced into `graph.node` immediately *before*
+    `consumer` (found by identity, not `NodeProto`'s own value-based
+    ``==``, since two structurally identical nodes are not the same node) --
+    an ordinary ``graph.node.append`` would instead land it *after* every
+    existing node, including `consumer` itself once the caller rewires its
+    input to read from this Gather's own output, leaving the graph no longer
+    topologically sorted (``onnx.checker`` rejects that outright: a node
+    input naming an as-yet-unproduced output). Inserting directly ahead of
+    `consumer` is always valid regardless of `tensor_name`'s own nature: an
+    ordinary graph input/initializer has no producer position to respect at
+    all, and an intermediate tensor's own producer -- already required to
+    sit somewhere before `consumer` in a valid input graph, since `consumer`
+    already reads `tensor_name` today -- still sits before this new position
+    too (this insertion never moves any existing node).
+    """
+    indices_name = _mint_unique_name(
+        f"{tensor_name}/attention_head_pruning_gather_indices", used_names
+    )
+    graph.initializer.append(
+        onnx.numpy_helper.from_array(keep.astype(np.int64), name=indices_name)
+    )
+    node_name = _mint_unique_name(
+        f"{tensor_name}/attention_head_pruning_gather", used_names
+    )
+    out_name = _mint_unique_name(
+        f"{tensor_name}/attention_head_pruning_gathered", used_names
+    )
+    gather_node = onnx.helper.make_node(
+        "Gather",
+        [tensor_name, indices_name],
+        [out_name],
+        name=node_name,
+        axis=axis,
+    )
+    consumer_idx = next(i for i, n in enumerate(graph.node) if n is consumer)
+    graph.node.insert(consumer_idx, gather_node)
+    return out_name
+
+
+def _slice_or_gather_head_bias(
+    node: onnx.NodeProto,
+    idx: int,
+    initializer_map: Dict[str, onnx.TensorProto],
+    num_heads: int,
+    keep: np.ndarray,
+    bias_ctx: _DynamicHeadBiasContext,
+) -> None:
+    """Applies the actual per-head handling of `node.input[idx]` -- an
+    `attention_bias`/`attn_mask`-family operand already confirmed, at match
+    time (:func:`_head_bias_input_is_safe`), to resolve cleanly one way or
+    another -- once a chain's own `keep` (kept-head or kept-KV-group index
+    set, already sorted ascending) is known. A connected **constant** is
+    sliced in place, exactly as before this fix
+    (:func:`_head_bias_axis`/:func:`_slice_axis`). A connected **dynamic**
+    tensor gets a new ``Gather`` node spliced in ahead of it
+    (:func:`_dynamic_head_bias_axis`/:func:`_insert_dynamic_head_bias_gather`)
+    when it resolves to a genuine per-head axis, and `node.input[idx]` is
+    rewritten in place to the new `Gather`'s own output -- or is left
+    completely untouched, the same as a constant broadcast already is, when
+    it resolves to a broadcast instead. An absent input is a no-op either
+    way. Recomputing `_head_bias_axis`/`_dynamic_head_bias_axis` here rather
+    than threading a value through the chain object mirrors this module's
+    own existing "recompute at apply time from the same tensor" idiom for a
+    constant bias (see e.g. :func:`_apply_one_gqa_chain`'s own docstring).
+
+    Shared by every one of this section's own per-chain apply functions
+    that owns a `mask_idx`/`attention_bias` role at all
+    (:func:`_apply_one_plain_attention_chain`, :func:`_apply_one_gqa_chain`,
+    :func:`_apply_matmul_nbits_qkv_chains`), so this fix's own Gather-
+    insertion/leave-alone logic lives in exactly one place rather than once
+    per op family.
+    """
+    if len(node.input) <= idx or not node.input[idx]:
+        return
+    name = node.input[idx]
+    bias_init = initializer_map.get(name)
+    if bias_init is not None:
+        axis = _head_bias_axis(list(bias_init.dims), num_heads)
+        if axis is not None and axis >= 0:
+            _slice_axis(bias_init, keep, axis)
+        return
+    axis = _dynamic_head_bias_axis(name, bias_ctx.value_info_by_name, num_heads)
+    if axis is not None and axis >= 0:
+        new_name = _insert_dynamic_head_bias_gather(
+            bias_ctx.graph, bias_ctx.used_names, name, axis, keep, node
+        )
+        node.input[idx] = new_name
+    # else: broadcast, or unresolvable (shouldn't reach here -- already
+    # declined at match time -- but left alone defensively rather than
+    # guessed at either way) -- nothing to do.
 
 
 def _producer_weight_nk(w: np.ndarray, p: "_Producer") -> np.ndarray:
@@ -12261,9 +12664,10 @@ def apply_structured_pruning_matmul_nbits(
     out.CopyFrom(model)
     graph = out.graph
 
+    value_info_by_name = _shape_inferred_value_info_by_name(out)
     chains = _find_matmul_nbits_chains(graph)
     mlp_chains = _find_matmul_nbits_mlp_chains(graph)
-    qkv_chains = _find_matmul_nbits_qkv_chains(graph)
+    qkv_chains = _find_matmul_nbits_qkv_chains(graph, value_info_by_name)
     gated_chains = _find_matmul_nbits_gated_chains(graph)
     if not chains and not mlp_chains and not qkv_chains and not gated_chains:
         return out
@@ -12393,6 +12797,7 @@ def apply_structured_pruning_matmul_nbits(
         producer_touched,
         consumer_touched,
         stale_value_info,
+        value_info_by_name,
     )
 
     if stale_value_info:
@@ -13102,6 +13507,45 @@ def apply_structured_pruning_matmul_nbits(
 # attention/mismatched-V-head-size cases above) is reported by name in
 # `not_eligible`, exactly like every other declined op-type in this
 # section, rather than silently vanishing from the report.
+#
+# A *dynamic* (non-constant) `attention_bias`/`attn_mask` -- fed by a real
+# graph input or an upstream node's own computation, e.g. a
+# `com.microsoft::RelativePositionBias`/`GatedRelativePositionBias`
+# subgraph in a T5/DeBERTa-style export -- used to be left completely
+# untouched regardless of its own shape, on every op in this whole family:
+# a real, previously-unwarned gap (confirmed via an actual reproduction, not
+# merely reasoned about -- a real `GroupQueryAttention` node with a
+# genuinely dynamic, per-head-shaped `attention_bias` graph input, pruned
+# and then run through a real `onnxruntime.InferenceSession`, failed
+# outright: "attention_bias dimension 1 must be equal to the num heads or
+# 1, got 4"), not a silent miscompute (ORT's own kernel validates strictly)
+# but a genuine "this pass just produced a model that cannot run" outcome
+# -- unlike every other dynamic tensor this section leaves alone
+# (`past_key`/`past_value`, `PagedAttention`'s own `key_cache`/
+# `value_cache`, ...), all of which are safe to leave untouched because
+# their own *shape* is never asserted against the node's own `num_heads`
+# the way a per-head bias genuinely is. Fixed: a dynamic
+# `attention_bias`/`attn_mask` whose own declared shape (read off
+# `graph.input`/`graph.output`/`graph.value_info`, optionally seeded by a
+# best-effort `onnx.shape_inference.infer_shapes()` pass) statically
+# resolves to a genuine per-head axis now gets a new `Gather` node spliced
+# in ahead of it -- an exact slice performed at graph-construction time
+# rather than prune time, since the tensor's own values aren't available to
+# slice directly; one that resolves to a broadcast is still left
+# completely alone, exactly as before (already correct for any head
+# count); one whose shape doesn't resolve to either declines the WHOLE
+# chain outright, this section's own everywhere-else "don't guess" bar,
+# rather than silently reproducing the same gap for an unclassifiable
+# shape. See :func:`_dynamic_head_bias_axis`'s own docstring and the large
+# comment directly above it (right after :func:`_head_bias_axis`) for the
+# full empirical reproduction and reasoning, and
+# :func:`_slice_or_gather_head_bias` for the one shared apply-time helper
+# every op family in this section (plus the `MatMulNBitsQkv`-fused variant,
+# `_apply_matmul_nbits_qkv_chains`, in the "MatMulNBitsMlp/MatMulNBitsQkv"
+# section below) dispatches through -- `PagedAttention`/`LinearAttention`
+# have no `attention_bias`/`attn_mask`-equivalent input on their own
+# schemas at all (see their own matcher docstrings above), so neither is
+# touched by any of this.
 _ATTENTION_DOMAIN = "com.microsoft"
 
 # The three quantized-cache dtypes `GroupQueryAttention`'s own `T_CACHE` type
@@ -13233,7 +13677,9 @@ _AttnLikeChain = Union[_AttentionChain, _GQAChain]
 
 
 def _match_attention_producer(
-    node: onnx.NodeProto, initializer_map: Dict[str, onnx.TensorProto]
+    node: onnx.NodeProto,
+    initializer_map: Dict[str, onnx.TensorProto],
+    value_info_by_name: Optional[Dict[str, onnx.ValueInfoProto]] = None,
 ) -> Optional[Tuple[str, Optional[str], int, int, int, int]]:
     """If `node` is a ``com.microsoft::Attention`` *or*
     ``com.microsoft::DecoderMaskedSelfAttention`` node with a constant 2-D
@@ -13264,9 +13710,26 @@ def _match_attention_producer(
     doesn't cleanly resolve to either "genuinely per-head, safe to slice"
     or "broadcast, no per-head values at all" against this op's own
     (pre-pruning) `num_heads`; left alone (and never blocks the match) when
-    dynamic, absent, or a constant that resolves to the latter --
-    :func:`_apply_one_plain_attention_chain` performs the actual slice once
-    a match succeeds.
+    absent, or a constant that resolves to the broadcast case. A *dynamic*
+    one gets the identical treatment as of this fix, against its own
+    declared shape rather than a constant's `.dims` (see
+    :func:`_dynamic_head_bias_axis`/:func:`_head_bias_input_is_safe`, and
+    this module's own "Attention-head pruning" section comment, the
+    paragraph directly above :func:`_dynamic_head_bias_axis`, for the real
+    reproduction and reasoning this closes): resolves to a genuine per-head
+    axis -> matched, sliced at apply time via a newly inserted `Gather`
+    node (:func:`_slice_or_gather_head_bias`); resolves to a broadcast ->
+    left alone exactly like a dynamic tensor always was before this fix;
+    doesn't resolve at all (symbolic/unknown shape) -> the whole match is
+    now declined, rather than silently left connected at a stale width the
+    way it used to be. `value_info_by_name` is ``None`` only for
+    :func:`_match_attention_weight_only`'s own reuse of this function
+    (unstructured/magnitude/Wanda/SparseGPT weight-only pruning, which never
+    changes `num_heads` and so never needs this dynamic-tensor check at
+    all -- see :func:`_head_bias_input_is_safe`'s own docstring); every
+    "Attention-head pruning" family caller always passes a real one.
+    :func:`_apply_one_plain_attention_chain` performs the actual slice/
+    Gather-insertion once a match succeeds.
 
     ``DecoderMaskedSelfAttention`` (schema confirmed live the same way,
     ``since_version`` 1) is ONNX Runtime's own in-place rewrite target for a
@@ -13402,10 +13865,10 @@ def _match_attention_producer(
         return None
 
     if len(node.input) > 5 and node.input[5]:  # attention_bias
-        bias_init = initializer_map.get(node.input[5])
-        if bias_init is not None and int(np.prod(bias_init.dims)) > 0:
-            if _head_bias_axis(list(bias_init.dims), num_heads) is None:
-                return None  # doesn't statically resolve -- decline rather than guess
+        if not _head_bias_input_is_safe(
+            node, 5, initializer_map, value_info_by_name, num_heads
+        ):
+            return None  # doesn't statically resolve -- decline rather than guess
 
     return w_name, bias_name, num_heads, nq, nk, nv
 
@@ -13514,7 +13977,26 @@ def _walk_to_attention_consumer(
     return (node, cw_name, c_weight_transposed), chain_ops
 
 
-def _find_attention_chains(graph: onnx.GraphProto) -> List[_AttentionChain]:
+def _find_attention_chains(
+    graph: onnx.GraphProto,
+    value_info_by_name: Optional[Dict[str, onnx.ValueInfoProto]] = None,
+) -> List[_AttentionChain]:
+    """`value_info_by_name` -- built the same way every other caller in this
+    module's "Attention-head pruning" family builds one (see
+    :func:`apply_attention_head_pruning`) -- is threaded to
+    :func:`_match_attention_producer` purely so its own `attention_bias`
+    check can classify a *dynamic* input's declared shape; see this
+    module's own "Attention-head pruning" section comment (the paragraph
+    directly above :func:`_dynamic_head_bias_axis`) for why. Defaults to
+    ``{}`` (no shape info at all -- any dynamic per-head tensor's shape is
+    then unresolvable, so it declines rather than guesses, same as an empty
+    real one would) purely so this module's own white-box unit tests can
+    keep calling this function without threading one through for cases that
+    don't exercise a dynamic `attention_bias` at all; every real entry
+    point always passes a real one explicitly.
+    """
+    if value_info_by_name is None:
+        value_info_by_name = {}
     initializer_map = {t.name: t for t in graph.initializer}
     consumers_of = _consumers_of(graph)
     graph_outputs = {o.name for o in graph.output}
@@ -13524,7 +14006,7 @@ def _find_attention_chains(graph: onnx.GraphProto) -> List[_AttentionChain]:
 
     chains = []
     for node in graph.node:
-        info = _match_attention_producer(node, initializer_map)
+        info = _match_attention_producer(node, initializer_map, value_info_by_name)
         if info is None:
             continue
         w_name, bias_name, num_heads, nq, nk, nv = info
@@ -13658,7 +14140,9 @@ def _past_kv_constants_are_sliceable(
 
 
 def _match_gqa_producer(
-    node: onnx.NodeProto, initializer_map: Dict[str, onnx.TensorProto]
+    node: onnx.NodeProto,
+    initializer_map: Dict[str, onnx.TensorProto],
+    value_info_by_name: Dict[str, onnx.ValueInfoProto],
 ) -> Optional[Tuple[int, int]]:
     """If `node` is a ``com.microsoft::GroupQueryAttention`` node this
     module can safely act on, returns ``(num_heads, kv_num_heads)``.
@@ -13734,10 +14218,10 @@ def _match_gqa_producer(
         return None
 
     if len(node.input) > 10 and node.input[10]:  # attention_bias
-        bias_init = initializer_map.get(node.input[10])
-        if bias_init is not None and int(np.prod(bias_init.dims)) > 0:
-            if _head_bias_axis(list(bias_init.dims), num_heads) is None:
-                return None  # doesn't statically resolve -- decline rather than guess
+        if not _head_bias_input_is_safe(
+            node, 10, initializer_map, value_info_by_name, num_heads
+        ):
+            return None  # doesn't statically resolve -- decline rather than guess
 
     if len(node.input) > 11 and node.input[11]:  # head_sink
         sink_init = initializer_map.get(node.input[11])
@@ -13748,7 +14232,9 @@ def _match_gqa_producer(
 
 
 def _match_onnx_attention_producer(
-    node: onnx.NodeProto, initializer_map: Dict[str, onnx.TensorProto]
+    node: onnx.NodeProto,
+    initializer_map: Dict[str, onnx.TensorProto],
+    value_info_by_name: Dict[str, onnx.ValueInfoProto],
 ) -> Optional[Tuple[int, int]]:
     """If `node` is a plain ``ai.onnx`` ``Attention`` node (domain ``""``,
     opset 24+ -- confirmed via ``onnx.defs.get_schema("Attention",
@@ -13837,10 +14323,10 @@ def _match_onnx_attention_producer(
         return None
 
     if len(node.input) > 3 and node.input[3]:  # attn_mask
-        mask_init = initializer_map.get(node.input[3])
-        if mask_init is not None and int(np.prod(mask_init.dims)) > 0:
-            if _head_bias_axis(list(mask_init.dims), q_num_heads) is None:
-                return None  # doesn't statically resolve -- decline rather than guess
+        if not _head_bias_input_is_safe(
+            node, 3, initializer_map, value_info_by_name, q_num_heads
+        ):
+            return None  # doesn't statically resolve -- decline rather than guess
 
     if not _past_kv_constants_are_sliceable(
         node, initializer_map, (4, 5), kv_num_heads
@@ -13851,7 +14337,9 @@ def _match_onnx_attention_producer(
 
 
 def _match_multi_head_attention_producer(
-    node: onnx.NodeProto, initializer_map: Dict[str, onnx.TensorProto]
+    node: onnx.NodeProto,
+    initializer_map: Dict[str, onnx.TensorProto],
+    value_info_by_name: Dict[str, onnx.ValueInfoProto],
 ) -> Optional[Tuple[int, int]]:
     """If `node` is a ``com.microsoft::MultiHeadAttention`` node this module
     can safely act on, returns ``(num_heads, num_heads)`` -- the same
@@ -13929,10 +14417,10 @@ def _match_multi_head_attention_producer(
         return None
 
     if len(node.input) > 5 and node.input[5]:  # attention_bias
-        bias_init = initializer_map.get(node.input[5])
-        if bias_init is not None and int(np.prod(bias_init.dims)) > 0:
-            if _head_bias_axis(list(bias_init.dims), num_heads) is None:
-                return None  # doesn't statically resolve -- decline rather than guess
+        if not _head_bias_input_is_safe(
+            node, 5, initializer_map, value_info_by_name, num_heads
+        ):
+            return None  # doesn't statically resolve -- decline rather than guess
 
     if not _past_kv_constants_are_sliceable(node, initializer_map, (6, 7), num_heads):
         return None
@@ -13941,7 +14429,9 @@ def _match_multi_head_attention_producer(
 
 
 def _match_decoder_masked_multi_head_attention_producer(
-    node: onnx.NodeProto, initializer_map: Dict[str, onnx.TensorProto]
+    node: onnx.NodeProto,
+    initializer_map: Dict[str, onnx.TensorProto],
+    value_info_by_name: Dict[str, onnx.ValueInfoProto],
 ) -> Optional[Tuple[int, int]]:
     """If `node` is a ``com.microsoft::DecoderMaskedMultiHeadAttention`` node
     this module can safely act on, returns ``(num_heads, num_heads)`` -- the
@@ -14067,10 +14557,10 @@ def _match_decoder_masked_multi_head_attention_producer(
         return None
 
     if len(node.input) > 4 and node.input[4]:  # attention_bias
-        bias_init = initializer_map.get(node.input[4])
-        if bias_init is not None and int(np.prod(bias_init.dims)) > 0:
-            if _head_bias_axis(list(bias_init.dims), num_heads) is None:
-                return None  # doesn't statically resolve -- decline rather than guess
+        if not _head_bias_input_is_safe(
+            node, 4, initializer_map, value_info_by_name, num_heads
+        ):
+            return None  # doesn't statically resolve -- decline rather than guess
 
     if not _past_kv_constants_are_sliceable(node, initializer_map, (5, 6), num_heads):
         return None
@@ -14152,7 +14642,9 @@ def _paged_kv_scale_is_sliceable(
 
 
 def _match_paged_attention_producer(
-    node: onnx.NodeProto, initializer_map: Dict[str, onnx.TensorProto]
+    node: onnx.NodeProto,
+    initializer_map: Dict[str, onnx.TensorProto],
+    value_info_by_name: Optional[Dict[str, onnx.ValueInfoProto]] = None,
 ) -> Optional[Tuple[int, int]]:
     """If `node` is a ``com.microsoft::PagedAttention`` node this module can
     safely act on, returns ``(num_heads, kv_num_heads)`` -- the same shape
@@ -14247,7 +14739,13 @@ def _match_paged_attention_producer(
     reasoning `GroupQueryAttention`'s own `cos_cache`/`sin_cache` already
     gets. This op has no `attention_bias`/`attn_mask`-equivalent input at all
     on its own schema (confirmed off the same live dump) -- nothing here
-    plays that role.
+    plays that role. `value_info_by_name` is accepted, unused, purely so
+    this function matches :func:`_find_separate_qkv_chains`'s own uniform
+    ``match_producer(node, initializer_map, value_info_by_name)`` call
+    convention every matcher it dispatches to shares (see
+    :func:`_head_bias_input_is_safe`'s own docstring for the analogous
+    reason `_match_attention_producer`'s own copy of this same parameter is
+    ``Optional``).
     """
     if node.domain != _ATTENTION_DOMAIN or node.op_type != "PagedAttention":
         return None
@@ -14433,7 +14931,9 @@ def _match_paged_attention_producer(
 #   only to confirm it plays no role here, not because any chain in this
 #   module could cross it meaningfully.
 def _match_linear_attention_producer(
-    node: onnx.NodeProto, initializer_map: Dict[str, onnx.TensorProto]
+    node: onnx.NodeProto,
+    initializer_map: Dict[str, onnx.TensorProto],
+    value_info_by_name: Optional[Dict[str, onnx.ValueInfoProto]] = None,
 ) -> Optional[Tuple[int, int]]:
     """If `node` is a plain ``ai.onnx::LinearAttention`` node (opset 27+,
     domain ``""``) this module can safely act on, returns ``(q_num_heads,
@@ -14453,7 +14953,13 @@ def _match_linear_attention_producer(
     producer will still emit the correct post-pruning width. `beta`'s own
     exact-shape check (its two documented shapes don't need `head_size` to
     tell apart) runs here; `decay`'s own (which does) is deferred to
-    :func:`_find_linear_attention_chains`.
+    :func:`_find_linear_attention_chains`. This op has no
+    `attention_bias`/`attn_mask`-equivalent input at all on its own schema
+    (confirmed off the same live schema dump the rest of this section was
+    built from) -- `value_info_by_name` is accepted, unused, purely for
+    :func:`_find_separate_qkv_chains`'s own uniform `match_producer` call
+    convention (see :func:`_match_paged_attention_producer`'s own docstring
+    for the identical reasoning).
     """
     if node.domain != "" or node.op_type != "LinearAttention":
         return None
@@ -15687,6 +16193,7 @@ def _find_separate_qkv_chains(
     graph: onnx.GraphProto,
     match_producer,
     num_heads_attr: str,
+    value_info_by_name: Optional[Dict[str, onnx.ValueInfoProto]] = None,
     allow_differing_v_head_size: bool = False,
     combined_bias_input_index: Optional[int] = None,
     qk_norm_weight_indices: Optional[Tuple[int, int]] = None,
@@ -15736,7 +16243,22 @@ def _find_separate_qkv_chains(
     purely to validate the deferred shape check and decline the match
     outright when it fails, the same "don't guess" bar every other shape
     check in this function already holds.
+
+    `value_info_by_name` is threaded straight through to every `node`'s own
+    `match_producer(node, initializer_map, value_info_by_name)` call --
+    built the same way every "Attention-head pruning" family entry point
+    builds one (see :func:`apply_attention_head_pruning`) -- purely so a
+    matcher whose own op owns a per-head `attention_bias`/`attn_mask` input
+    (`_match_gqa_producer`/`_match_onnx_attention_producer`/
+    `_match_multi_head_attention_producer`/
+    `_match_decoder_masked_multi_head_attention_producer`) can classify a
+    *dynamic* one's declared shape (:func:`_head_bias_input_is_safe`);
+    `_match_paged_attention_producer`/`_match_linear_attention_producer`
+    accept and ignore it (neither op has such an input at all). Defaults to
+    ``{}`` -- see :func:`_find_attention_chains`'s own docstring for why.
     """
+    if value_info_by_name is None:
+        value_info_by_name = {}
     initializer_map = {t.name: t for t in graph.initializer}
     consumers_of = _consumers_of(graph)
     graph_outputs = {o.name for o in graph.output}
@@ -15747,7 +16269,7 @@ def _find_separate_qkv_chains(
 
     chains = []
     for node in graph.node:
-        info = match_producer(node, initializer_map)
+        info = match_producer(node, initializer_map, value_info_by_name)
         if info is None:
             continue
         num_heads, kv_num_heads = info
@@ -16009,11 +16531,19 @@ def _find_separate_qkv_chains(
     return chains
 
 
-def _find_gqa_chains(graph: onnx.GraphProto) -> List[_GQAChain]:
-    return _find_separate_qkv_chains(graph, _match_gqa_producer, "num_heads")
+def _find_gqa_chains(
+    graph: onnx.GraphProto,
+    value_info_by_name: Optional[Dict[str, onnx.ValueInfoProto]] = None,
+) -> List[_GQAChain]:
+    return _find_separate_qkv_chains(
+        graph, _match_gqa_producer, "num_heads", value_info_by_name
+    )
 
 
-def _find_onnx_attention_chains(graph: onnx.GraphProto) -> List[_GQAChain]:
+def _find_onnx_attention_chains(
+    graph: onnx.GraphProto,
+    value_info_by_name: Optional[Dict[str, onnx.ValueInfoProto]] = None,
+) -> List[_GQAChain]:
     """The plain ``ai.onnx::Attention`` analogue of :func:`_find_gqa_chains`
     -- see :func:`_find_separate_qkv_chains` (the shared body) and
     :func:`_match_onnx_attention_producer` (what's matched and why it's
@@ -16026,11 +16556,15 @@ def _find_onnx_attention_chains(graph: onnx.GraphProto) -> List[_GQAChain]:
         graph,
         _match_onnx_attention_producer,
         "q_num_heads",
+        value_info_by_name,
         allow_differing_v_head_size=True,
     )
 
 
-def _find_mha_chains(graph: onnx.GraphProto) -> List[_GQAChain]:
+def _find_mha_chains(
+    graph: onnx.GraphProto,
+    value_info_by_name: Optional[Dict[str, onnx.ValueInfoProto]] = None,
+) -> List[_GQAChain]:
     """The ``com.microsoft::MultiHeadAttention`` analogue of
     :func:`_find_gqa_chains`/:func:`_find_onnx_attention_chains` -- see
     :func:`_find_separate_qkv_chains` (the shared body) and
@@ -16049,12 +16583,16 @@ def _find_mha_chains(graph: onnx.GraphProto) -> List[_GQAChain]:
         graph,
         _match_multi_head_attention_producer,
         "num_heads",
+        value_info_by_name,
         allow_differing_v_head_size=True,
         combined_bias_input_index=3,
     )
 
 
-def _find_decoder_masked_mha_chains(graph: onnx.GraphProto) -> List[_GQAChain]:
+def _find_decoder_masked_mha_chains(
+    graph: onnx.GraphProto,
+    value_info_by_name: Optional[Dict[str, onnx.ValueInfoProto]] = None,
+) -> List[_GQAChain]:
     """The ``com.microsoft::DecoderMaskedMultiHeadAttention`` analogue of
     :func:`_find_mha_chains` -- see :func:`_find_separate_qkv_chains` (the
     shared body) and
@@ -16082,12 +16620,16 @@ def _find_decoder_masked_mha_chains(graph: onnx.GraphProto) -> List[_GQAChain]:
         graph,
         _match_decoder_masked_multi_head_attention_producer,
         "num_heads",
+        value_info_by_name,
         allow_differing_v_head_size=False,
         combined_bias_input_index=10,
     )
 
 
-def _find_paged_attention_chains(graph: onnx.GraphProto) -> List[_GQAChain]:
+def _find_paged_attention_chains(
+    graph: onnx.GraphProto,
+    value_info_by_name: Optional[Dict[str, onnx.ValueInfoProto]] = None,
+) -> List[_GQAChain]:
     """The ``com.microsoft::PagedAttention`` analogue of
     :func:`_find_gqa_chains` -- see :func:`_find_separate_qkv_chains` (the
     shared body) and :func:`_match_paged_attention_producer` (what's matched
@@ -16100,18 +16642,25 @@ def _find_paged_attention_chains(graph: onnx.GraphProto) -> List[_GQAChain]:
     :func:`_match_paged_attention_producer`'s own docstring) and
     ``qk_norm_weight_indices=(12, 13)`` (this op's own `q_norm_weight`/
     `k_norm_weight` input indices -- see :class:`_GQAChain`'s own docstring
-    for why neither is ever sliced despite this deferred check).
+    for why neither is ever sliced despite this deferred check). This op has
+    no `attention_bias`/`attn_mask`-equivalent input at all, so
+    `value_info_by_name` here is passed straight through only for
+    :func:`_find_separate_qkv_chains`'s own uniform call signature.
     """
     return _find_separate_qkv_chains(
         graph,
         _match_paged_attention_producer,
         "num_heads",
+        value_info_by_name,
         allow_differing_v_head_size=False,
         qk_norm_weight_indices=(12, 13),
     )
 
 
-def _find_linear_attention_chains(graph: onnx.GraphProto) -> List[_GQAChain]:
+def _find_linear_attention_chains(
+    graph: onnx.GraphProto,
+    value_info_by_name: Optional[Dict[str, onnx.ValueInfoProto]] = None,
+) -> List[_GQAChain]:
     """The plain ``ai.onnx::LinearAttention`` analogue of
     :func:`_find_gqa_chains`/:func:`_find_onnx_attention_chains` -- see
     :func:`_find_separate_qkv_chains` (the shared body) and
@@ -16142,6 +16691,7 @@ def _find_linear_attention_chains(graph: onnx.GraphProto) -> List[_GQAChain]:
         graph,
         _match_linear_attention_producer,
         "q_num_heads",
+        value_info_by_name,
         allow_differing_v_head_size=True,
     )
     initializer_map = {t.name: t for t in graph.initializer}
@@ -16288,19 +16838,23 @@ def _apply_one_plain_attention_chain(
     chain: _AttentionChain,
     sparsity: float,
     compute_importance,
+    bias_ctx: _DynamicHeadBiasContext,
 ) -> Optional[Tuple[Set[str], str, Set[str]]]:
     """Applies whole-head pruning to one matched ``Attention`` block in
     place: every dropped head removes a *contiguous* ``head_size``-wide
     column block from the single merged QKV weight (and the matching row
     block from the consumer), not an arbitrary top-k column subset. A
-    connected constant `attention_bias` (input index 5) already confirmed
-    at match time (see :func:`_match_attention_producer`) to resolve, via
-    :func:`_head_bias_axis`, to either a genuine per-head tensor or a
-    broadcast is sliced along its own head axis by `keep_heads` -- the same
-    (not `head_size`-expanded) index set this function's own `keep_heads`
-    already is, since `attention_bias`'s axis holds one entry per head, not
-    per weight column -- or left untouched when it's a broadcast (or
-    absent/dynamic). Returns ``(producer_weight_names, consumer_weight_name,
+    connected `attention_bias` (input index 5) already confirmed at match
+    time (see :func:`_match_attention_producer`) to resolve, via
+    :func:`_head_bias_axis`/:func:`_dynamic_head_bias_axis`, to either a
+    genuine per-head tensor or a broadcast is handled by
+    :func:`_slice_or_gather_head_bias` -- a constant sliced in place along
+    its own head axis by `keep_heads` (the same, not `head_size`-expanded,
+    index set this function's own `keep_heads` already is, since
+    `attention_bias`'s axis holds one entry per head, not per weight
+    column), a dynamic one rewired through a newly inserted ``Gather``
+    (`bias_ctx`) -- or, for either, left untouched when it's a broadcast (or
+    absent). Returns ``(producer_weight_names, consumer_weight_name,
     stale_output_names)`` on success, or ``None`` if `sparsity` rounds to no
     heads dropped for this block (a no-op, left for the caller to skip).
     """
@@ -16354,12 +16908,10 @@ def _apply_one_plain_attention_chain(
             )
         )
 
-    if len(chain.node.input) > 5 and chain.node.input[5]:  # attention_bias
-        bias_init = initializer_map.get(chain.node.input[5])
-        if bias_init is not None:
-            axis = _head_bias_axis(list(bias_init.dims), h)
-            if axis is not None and axis >= 0:
-                _slice_axis(bias_init, keep_heads, axis)
+    # attention_bias (index 5) -- see :func:`_slice_or_gather_head_bias`'s
+    # own docstring for the constant-slice/dynamic-Gather/broadcast-leave-
+    # alone split.
+    _slice_or_gather_head_bias(chain.node, 5, initializer_map, h, keep_heads, bias_ctx)
 
     _slice_consumer_weight(
         initializer_map[chain.consumer_weight],
@@ -16386,6 +16938,7 @@ def _apply_one_gqa_chain(
     chain: _GQAChain,
     sparsity: float,
     compute_group_importance,
+    bias_ctx: _DynamicHeadBiasContext,
 ) -> Optional[Tuple[Set[str], str, Set[str]]]:
     """Applies whole-KV-group pruning to one matched ``GroupQueryAttention``,
     plain ``ai.onnx::Attention``, or ``MultiHeadAttention`` block (see
@@ -16732,20 +17285,22 @@ def _apply_one_gqa_chain(
     # `DecoderMaskedMultiHeadAttention` -- see `_match_gqa_producer`'s,
     # `_match_onnx_attention_producer`'s, `_match_multi_head_attention_producer`'s,
     # and :func:`_match_decoder_masked_multi_head_attention_producer`'s own
-    # docstrings) is sliced along its own head axis by `keep_q_heads` --
-    # *query*-head granularity, not `keep_groups`'s kv-group one -- whenever
-    # `_head_bias_axis` resolves it to a genuine per-head tensor against the
-    # pre-pruning `chain.num_heads`; left untouched when it resolves to a
-    # broadcast (or is absent/dynamic, matched the same "nothing to slice"
-    # way here as at match time). `PagedAttention` has no `attention_bias`/
-    # `attn_mask`-equivalent input on its own schema at all (confirmed off
-    # the same live schema dump this whole family was built from), so this
-    # whole block is skipped for it outright -- `chain.node.input[3]`
-    # (`key_cache` for `PagedAttention`, `past_state` for `LinearAttention`)
-    # must never be mistaken for one. `LinearAttention` has no
-    # `attention_bias`/`attn_mask`-equivalent input on its own schema either
-    # (confirmed off the same live schema dump), so it is excluded here the
-    # same way `PagedAttention` is.
+    # docstrings) is handled by :func:`_slice_or_gather_head_bias` along its
+    # own head axis by `keep_q_heads` -- *query*-head granularity, not
+    # `keep_groups`'s kv-group one -- whenever `_head_bias_axis`/
+    # :func:`_dynamic_head_bias_axis` resolves it to a genuine per-head
+    # tensor against the pre-pruning `chain.num_heads` (a constant sliced in
+    # place, a dynamic one rewired through a newly inserted ``Gather``);
+    # left untouched when it resolves to a broadcast (or is absent, matched
+    # the same "nothing to slice" way here as at match time). `PagedAttention`
+    # has no `attention_bias`/`attn_mask`-equivalent input on its own schema
+    # at all (confirmed off the same live schema dump this whole family was
+    # built from), so this whole block is skipped for it outright --
+    # `chain.node.input[3]` (`key_cache` for `PagedAttention`, `past_state`
+    # for `LinearAttention`) must never be mistaken for one. `LinearAttention`
+    # has no `attention_bias`/`attn_mask`-equivalent input on its own schema
+    # either (confirmed off the same live schema dump), so it is excluded
+    # here the same way `PagedAttention` is.
     mask_idx = (
         10
         if is_gqa
@@ -16757,16 +17312,15 @@ def _apply_one_gqa_chain(
         if is_paged or is_linear_attention
         else 3
     )
-    if (
-        mask_idx is not None
-        and len(chain.node.input) > mask_idx
-        and chain.node.input[mask_idx]
-    ):
-        mask_init = initializer_map.get(chain.node.input[mask_idx])
-        if mask_init is not None:
-            axis = _head_bias_axis(list(mask_init.dims), chain.num_heads)
-            if axis is not None and axis >= 0:
-                _slice_axis(mask_init, keep_q_heads, axis)
+    if mask_idx is not None:
+        _slice_or_gather_head_bias(
+            chain.node,
+            mask_idx,
+            initializer_map,
+            chain.num_heads,
+            keep_q_heads,
+            bias_ctx,
+        )
 
     # `head_sink` (index 11 for both `GroupQueryAttention` and
     # `PagedAttention` -- coincidentally the same position, see
@@ -16868,6 +17422,7 @@ def _apply_attention_chains(
     sparsity: float,
     compute_importance,
     compute_group_importance,
+    value_info_by_name: Dict[str, onnx.ValueInfoProto],
 ) -> None:
     """Shared body for :func:`apply_attention_head_pruning` and
     :func:`apply_attention_head_wanda_pruning`, mirroring
@@ -16883,11 +17438,27 @@ def _apply_attention_chains(
     (individual head vs. whole KV group -- one query head wide, for
     `MultiHeadAttention`) are different enough that sharing that part
     wouldn't simplify either.
+
+    `value_info_by_name` (the same shape-inference-seeded map every
+    "Attention-head pruning" entry point builds -- see
+    :func:`_shape_inferred_value_info_by_name`) feeds
+    :class:`_DynamicHeadBiasContext`, built once here and threaded to both
+    per-chain apply functions so a genuinely dynamic, per-head
+    `attention_bias`/`attn_mask` gets a `Gather` node spliced in ahead of it
+    (:func:`_slice_or_gather_head_bias`) instead of being left silently
+    stale -- see this module's own "Attention-head pruning" section
+    comment, the paragraph directly above :func:`_dynamic_head_bias_axis`,
+    for the full reasoning.
     """
     initializer_map = {t.name: t for t in graph.initializer}
     producer_touched: Set[str] = set()
     consumer_touched: Set[str] = set()
     stale_value_info: Set[str] = set()
+    bias_ctx = _DynamicHeadBiasContext(
+        graph=graph,
+        value_info_by_name=value_info_by_name,
+        used_names=_existing_graph_names(graph),
+    )
 
     for chain in chains:
         if isinstance(chain, _GQAChain):
@@ -16903,11 +17474,11 @@ def _apply_attention_chains(
         applied: Optional[Tuple[Set[str], str, Set[str]]]
         if isinstance(chain, _GQAChain):
             applied = _apply_one_gqa_chain(
-                initializer_map, chain, sparsity, compute_group_importance
+                initializer_map, chain, sparsity, compute_group_importance, bias_ctx
             )
         else:
             applied = _apply_one_plain_attention_chain(
-                initializer_map, chain, sparsity, compute_importance
+                initializer_map, chain, sparsity, compute_importance, bias_ctx
             )
         if applied is None:
             continue
@@ -17039,15 +17610,16 @@ def apply_attention_head_pruning(
     out = onnx.ModelProto()
     out.CopyFrom(model)
     graph = out.graph
+    value_info_by_name = _shape_inferred_value_info_by_name(out)
 
     chains: List[_AttnLikeChain] = [
-        *_find_attention_chains(graph),
-        *_find_gqa_chains(graph),
-        *_find_onnx_attention_chains(graph),
-        *_find_mha_chains(graph),
-        *_find_decoder_masked_mha_chains(graph),
-        *_find_paged_attention_chains(graph),
-        *_find_linear_attention_chains(graph),
+        *_find_attention_chains(graph, value_info_by_name),
+        *_find_gqa_chains(graph, value_info_by_name),
+        *_find_onnx_attention_chains(graph, value_info_by_name),
+        *_find_mha_chains(graph, value_info_by_name),
+        *_find_decoder_masked_mha_chains(graph, value_info_by_name),
+        *_find_paged_attention_chains(graph, value_info_by_name),
+        *_find_linear_attention_chains(graph, value_info_by_name),
     ]
     if chains:
         _apply_attention_chains(
@@ -17060,6 +17632,7 @@ def apply_attention_head_pruning(
             lambda chain, wq, wk, wv: _gqa_group_importance(
                 chain, wq, wk, wv, importance_norm
             ),
+            value_info_by_name,
         )
 
     return out
@@ -17192,15 +17765,16 @@ def apply_attention_head_wanda_pruning(
     out = onnx.ModelProto()
     out.CopyFrom(model)
     graph = out.graph
+    value_info_by_name = _shape_inferred_value_info_by_name(out)
 
     chains: List[_AttnLikeChain] = [
-        *_find_attention_chains(graph),
-        *_find_gqa_chains(graph),
-        *_find_onnx_attention_chains(graph),
-        *_find_mha_chains(graph),
-        *_find_decoder_masked_mha_chains(graph),
-        *_find_paged_attention_chains(graph),
-        *_find_linear_attention_chains(graph),
+        *_find_attention_chains(graph, value_info_by_name),
+        *_find_gqa_chains(graph, value_info_by_name),
+        *_find_onnx_attention_chains(graph, value_info_by_name),
+        *_find_mha_chains(graph, value_info_by_name),
+        *_find_decoder_masked_mha_chains(graph, value_info_by_name),
+        *_find_paged_attention_chains(graph, value_info_by_name),
+        *_find_linear_attention_chains(graph, value_info_by_name),
     ]
     if not chains:
         return out
@@ -17253,6 +17827,7 @@ def apply_attention_head_wanda_pruning(
         sparsity,
         _wanda_attention_head_importance,
         _wanda_gqa_group_importance,
+        value_info_by_name,
     )
     return out
 
@@ -18017,7 +18592,10 @@ class _MatMulNBitsQkvChain:
     consumer: _MatMulNBitsChainSide
 
 
-def _find_matmul_nbits_qkv_chains(graph: onnx.GraphProto) -> List[_MatMulNBitsQkvChain]:
+def _find_matmul_nbits_qkv_chains(
+    graph: onnx.GraphProto,
+    value_info_by_name: Optional[Dict[str, onnx.ValueInfoProto]] = None,
+) -> List[_MatMulNBitsQkvChain]:
     """Matches a ``MatMulNBitsQkv`` node whose `Q`/`K`/`V` outputs each feed
     -- directly, single-consumer, no intermediate hop -- into the
     respective query/key/value inputs of one shared downstream
@@ -18025,7 +18603,9 @@ def _find_matmul_nbits_qkv_chains(graph: onnx.GraphProto) -> List[_MatMulNBitsQk
     ``ai.onnx::Attention`` (:func:`_match_onnx_attention_producer`) node,
     reused verbatim (both already validate `num_heads`/`kv_num_heads` and
     every optional per-head `past_key`/`past_value`/`k_scale`/`v_scale`/
-    `attention_bias`/`head_sink` operand's own safety), and whose own
+    `attention_bias`/`head_sink` operand's own safety, including -- as of
+    this module's own dynamic-`attention_bias` fix -- a genuinely dynamic
+    one's own declared shape, via `value_info_by_name`), and whose own
     output in turn reaches a ``MatMulNBits``-or-plain-float output
     projection (:func:`_walk_to_matmul_nbits_attention_consumer`).
 
@@ -18035,8 +18615,12 @@ def _find_matmul_nbits_qkv_chains(graph: onnx.GraphProto) -> List[_MatMulNBitsQk
     between this fused node's own `Q`/`K` outputs and the attention
     consumer -- a real, deliberate, documented scope boundary (see this
     section's own top comment), not an oversight: a model relying on that
-    hop is declined here rather than mis-sliced.
+    hop is declined here rather than mis-sliced. `value_info_by_name`
+    defaults to ``{}`` -- see :func:`_find_attention_chains`'s own
+    docstring for why.
     """
+    if value_info_by_name is None:
+        value_info_by_name = {}
     initializer_map = {t.name: t for t in graph.initializer}
     consumers_of = _consumers_of(graph)
     graph_outputs = {o.name for o in graph.output}
@@ -18064,9 +18648,11 @@ def _find_matmul_nbits_qkv_chains(graph: onnx.GraphProto) -> List[_MatMulNBitsQk
         num_heads_attr = "num_heads"
         info: Optional[Tuple[int, int]]
         if attn.domain == _ATTENTION_DOMAIN and attn.op_type == "GroupQueryAttention":
-            info = _match_gqa_producer(attn, initializer_map)
+            info = _match_gqa_producer(attn, initializer_map, value_info_by_name)
         elif attn.domain == "" and attn.op_type == "Attention":
-            info = _match_onnx_attention_producer(attn, initializer_map)
+            info = _match_onnx_attention_producer(
+                attn, initializer_map, value_info_by_name
+            )
             num_heads_attr = "q_num_heads"
         else:
             info = None
@@ -18112,18 +18698,26 @@ def _apply_matmul_nbits_qkv_chains(
     producer_touched: Set[str],
     consumer_touched: Set[str],
     stale_value_info: Set[str],
+    value_info_by_name: Dict[str, onnx.ValueInfoProto],
 ) -> None:
     """Applies whole-KV-group pruning to every matched ``MatMulNBitsQkv``
     chain in place -- the fused-op analogue of :func:`_apply_one_gqa_chain`,
     reusing that function's own consumer-side bookkeeping (`past_key`/
-    `past_value`, `k_scale`/`v_scale`, `attention_bias`/`attn_mask`,
-    `head_sink`, `num_heads`/`kv_num_heads` attribute rewrite) directly
-    against `chain.attn_node`, since that node itself owns no weight of its
-    own to slice here -- only `q`'s/`k`'s/`v`'s own producer weights (this
-    function's own job) and the downstream output-projection consumer
+    `past_value`, `k_scale`/`v_scale`, `attention_bias`/`attn_mask`
+    (:func:`_slice_or_gather_head_bias`, including this module's own
+    dynamic-tensor `Gather`-insertion fix), `head_sink`, `num_heads`/
+    `kv_num_heads` attribute rewrite) directly against `chain.attn_node`,
+    since that node itself owns no weight of its own to slice here -- only
+    `q`'s/`k`'s/`v`'s own producer weights (this function's own job) and the
+    downstream output-projection consumer
     (:func:`_slice_matmul_nbits_chain_consumer`, reused verbatim).
     """
     initializer_map = {t.name: t for t in graph.initializer}
+    bias_ctx = _DynamicHeadBiasContext(
+        graph=graph,
+        value_info_by_name=value_info_by_name,
+        used_names=_existing_graph_names(graph),
+    )
 
     for chain in chains:
         p, c = chain.producer, chain.consumer
@@ -18203,12 +18797,14 @@ def _apply_matmul_nbits_qkv_chains(
                     _slice_axis1(scale_init, keep_groups)
 
         mask_idx = 10 if is_gqa else 3
-        if len(chain.attn_node.input) > mask_idx and chain.attn_node.input[mask_idx]:
-            mask_init = initializer_map.get(chain.attn_node.input[mask_idx])
-            if mask_init is not None:
-                axis = _head_bias_axis(list(mask_init.dims), chain.num_heads)
-                if axis is not None and axis >= 0:
-                    _slice_axis(mask_init, keep_q_heads, axis)
+        _slice_or_gather_head_bias(
+            chain.attn_node,
+            mask_idx,
+            initializer_map,
+            chain.num_heads,
+            keep_q_heads,
+            bias_ctx,
+        )
 
         if is_gqa and len(chain.attn_node.input) > 11 and chain.attn_node.input[11]:
             sink_init = initializer_map.get(chain.attn_node.input[11])
@@ -26631,7 +27227,9 @@ def _analyze_structured_pruning_matmul_nbits(
 
     chains = _find_matmul_nbits_chains(graph)
     mlp_chains = _find_matmul_nbits_mlp_chains(graph)
-    qkv_chains = _find_matmul_nbits_qkv_chains(graph)
+    qkv_chains = _find_matmul_nbits_qkv_chains(
+        graph, _shape_inferred_value_info_by_name(model)
+    )
     gated_chains = _find_matmul_nbits_gated_chains(graph)
     not_eligible = _matmul_nbits_not_eligible(
         graph, chains, mlp_chains, qkv_chains, gated_chains
@@ -27057,15 +27655,16 @@ def _analyze_attention_head_pruning(
     if isinstance(model, str):
         model = onnx.load(model, load_external_data=False)
     graph = model.graph
+    value_info_by_name = _shape_inferred_value_info_by_name(model)
 
     chains: List[_AttnLikeChain] = [
-        *_find_attention_chains(graph),
-        *_find_gqa_chains(graph),
-        *_find_onnx_attention_chains(graph),
-        *_find_mha_chains(graph),
-        *_find_decoder_masked_mha_chains(graph),
-        *_find_paged_attention_chains(graph),
-        *_find_linear_attention_chains(graph),
+        *_find_attention_chains(graph, value_info_by_name),
+        *_find_gqa_chains(graph, value_info_by_name),
+        *_find_onnx_attention_chains(graph, value_info_by_name),
+        *_find_mha_chains(graph, value_info_by_name),
+        *_find_decoder_masked_mha_chains(graph, value_info_by_name),
+        *_find_paged_attention_chains(graph, value_info_by_name),
+        *_find_linear_attention_chains(graph, value_info_by_name),
     ]
     layers = _analyze_attention_chains(
         graph,
@@ -27116,15 +27715,16 @@ def _analyze_attention_head_wanda_pruning(
             model, num_samples=num_samples, seed=seed
         )
     graph = model.graph
+    value_info_by_name = _shape_inferred_value_info_by_name(model)
 
     chains: List[_AttnLikeChain] = [
-        *_find_attention_chains(graph),
-        *_find_gqa_chains(graph),
-        *_find_onnx_attention_chains(graph),
-        *_find_mha_chains(graph),
-        *_find_decoder_masked_mha_chains(graph),
-        *_find_paged_attention_chains(graph),
-        *_find_linear_attention_chains(graph),
+        *_find_attention_chains(graph, value_info_by_name),
+        *_find_gqa_chains(graph, value_info_by_name),
+        *_find_onnx_attention_chains(graph, value_info_by_name),
+        *_find_mha_chains(graph, value_info_by_name),
+        *_find_decoder_masked_mha_chains(graph, value_info_by_name),
+        *_find_paged_attention_chains(graph, value_info_by_name),
+        *_find_linear_attention_chains(graph, value_info_by_name),
     ]
     if not chains:
         return PruningSensitivityReport(
