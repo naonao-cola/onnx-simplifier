@@ -31,6 +31,8 @@ def test_full_retention_when_scores_match():
                 "float": 0.8,
                 "quantized": 0.8,
                 "retention": 1.0,
+                "float_basis": "acc",
+                "quantized_basis": "acc",
             }
         }
     }
@@ -100,8 +102,104 @@ def test_build_records_flattens_one_entry_per_task_metric():
         "float_acc": 0.8,
         "quantized_acc": 0.7,
         "retention": pytest.approx(0.875),
+        "float_basis": "acc",
+        "quantized_basis": "acc",
     }
 
 
 def test_build_records_on_empty_retention_returns_empty_list():
     assert build_records("model", 10, {}) == []
+
+
+def test_prefers_acc_completed_over_acc_when_both_present():
+    # run_quality_eval.py's --max-gen-toks-aware output shape: acc_completed is
+    # DeviceMark's own retention definition (see compute_retention.py's
+    # _resolve_score), so it should win over the plain no-answer-counts-as-wrong
+    # acc even though both are present.
+    result = compute_retention(
+        {
+            "ifeval": {
+                "acc": {
+                    "acc": 0.5,
+                    "completed_n": 4,
+                    "total_n": 10,
+                    "acc_completed": 0.8,
+                }
+            }
+        },
+        {
+            "ifeval": {
+                "acc": {
+                    "acc": 0.4,
+                    "completed_n": 6,
+                    "total_n": 10,
+                    "acc_completed": 0.6,
+                }
+            }
+        },
+    )
+    entry = result["ifeval"]["acc"]
+    assert entry["float"] == 0.8
+    assert entry["quantized"] == 0.6
+    assert entry["retention"] == pytest.approx(0.75)
+    assert entry["float_basis"] == "acc_completed"
+    assert entry["quantized_basis"] == "acc_completed"
+
+
+def test_falls_back_to_acc_when_acc_completed_is_none():
+    # Every sampled item hit the generation cap -- acc_completed has nothing
+    # to average, so it's None; falls back to plain acc rather than dropping
+    # the metric.
+    result = compute_retention(
+        {
+            "ifeval": {
+                "acc": {
+                    "acc": 0.5,
+                    "completed_n": 0,
+                    "total_n": 10,
+                    "acc_completed": None,
+                }
+            }
+        },
+        {
+            "ifeval": {
+                "acc": {
+                    "acc": 0.3,
+                    "completed_n": 0,
+                    "total_n": 10,
+                    "acc_completed": None,
+                }
+            }
+        },
+    )
+    entry = result["ifeval"]["acc"]
+    assert entry["float"] == 0.5
+    assert entry["quantized"] == 0.3
+    assert entry["float_basis"] == "acc"
+    assert entry["quantized_basis"] == "acc"
+
+
+def test_falls_back_to_acc_when_acc_completed_key_absent():
+    # No explicit --max-gen-toks was passed to run_quality_eval.py, so
+    # completed-only accounting was never attempted -- only "acc" is present.
+    result = compute_retention(
+        {"ifeval": {"acc": {"acc": 0.5}}},
+        {"ifeval": {"acc": {"acc": 0.4}}},
+    )
+    entry = result["ifeval"]["acc"]
+    assert entry["float"] == 0.5
+    assert entry["float_basis"] == "acc"
+
+
+def test_basis_tracked_independently_per_side():
+    # float side has a known --max-gen-toks (acc_completed available),
+    # quantized side doesn't -- each side should resolve independently.
+    result = compute_retention(
+        {"ifeval": {"acc": {"acc": 0.5, "acc_completed": 0.8}}},
+        {"ifeval": {"acc": {"acc": 0.4}}},
+    )
+    entry = result["ifeval"]["acc"]
+    assert entry["float"] == 0.8
+    assert entry["float_basis"] == "acc_completed"
+    assert entry["quantized"] == 0.4
+    assert entry["quantized_basis"] == "acc"

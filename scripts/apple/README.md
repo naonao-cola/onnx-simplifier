@@ -477,8 +477,8 @@ and MATH-500, plus **retention**: how much of the float model's benchmark
 score survives quantization (`quantized_score / float_score`). See
 `bench/TODO_quality_retention_eval.md` for the full plan (including exactly
 how DeviceMark itself defines this -- subset sizes, 0-shot, and a
-completed-only accuracy this repo's own `compute_retention.py` doesn't yet
-replicate); this is the first implemented slice of it.
+completed-only accuracy `compute_retention.py` now replicates too, see below);
+this is the first implemented slice of it.
 
 Rather than reimplementing any benchmark's prompt formatting or answer
 scoring, these two scripts lean on
@@ -497,14 +497,21 @@ definitions:
 - `run_quality_eval.py` is a thin CLI over `lm_eval.simple_evaluate`,
   supporting both `--model hf` (the float side -- CPU-only, no macOS needed)
   and `--model coreml` (the quantized side -- macOS/real Core ML only) against
-  the same task/subset, writing a small JSON summary.
+  the same task/subset, writing a small JSON summary. Each scored metric
+  reports plain `acc` (no-answer-within-budget counts as wrong) and, whenever
+  `--max-gen-toks` is passed explicitly, `acc_completed` too -- accuracy over
+  only the samples whose response finished before exhausting that budget
+  (`is_completed()`; validated against real generations -- see that
+  function's docstring), DeviceMark's own retention definition.
 - `compute_retention.py` takes one JSON from each side and reports the
-  per-task, per-metric retention ratio. `--output` also writes a flat
-  `"records"` list (one object per task/metric: `model_id`, `benchmark`,
-  `metric`, `subset_n`, `float_acc`, `quantized_acc`, `retention`) alongside
-  the nested summary -- `coreml-integration.yml` uploads these as the
-  `quality-retention-results` CI artifact, so a run's numbers don't have to
-  be re-parsed out of `$GITHUB_STEP_SUMMARY` text.
+  per-task, per-metric retention ratio, preferring each side's `acc_completed`
+  when it's present and defined and falling back to plain `acc` otherwise
+  (`_resolve_score()`). `--output` also writes a flat `"records"` list (one
+  object per task/metric: `model_id`, `benchmark`, `metric`, `subset_n`,
+  `float_acc`, `quantized_acc`, `retention`, `float_basis`, `quantized_basis`)
+  alongside the nested summary -- `coreml-integration.yml` uploads these as
+  the `quality-retention-results` CI artifact, so a run's numbers don't have
+  to be re-parsed out of `$GITHUB_STEP_SUMMARY` text.
 
 ```bash
 pip install "optimum-onnx" transformers coremltools onnxruntime "lm-eval[ifeval]"
