@@ -22089,6 +22089,27 @@ def apply_structured_pruning_matmul_block_quantized_fp4(
 # :func:`_apply_embedding_vocab_prune`) -- none of that logic assumes its
 # matched producer is literally a `Gather`.
 #
+# A *third* producer shape is matched alongside those two:
+# ``com.microsoft::GatherBlockQuantized``, the block-quantized (int2/int4/
+# int8) analogue of a plain-float embedding `Gather` -- the same relationship
+# ``MatMulNBits`` (see that section's own top comment, elsewhere in this
+# file) has to a plain float `MatMul`. See
+# :func:`_match_gather_block_quantized_producer`'s own section-top comment,
+# directly above that function, for the full empirical schema/packing facts
+# this depends on, the real onnxruntime-tooling evidence this shape is a
+# genuine (if today opt-in) exporter output and not hypothetical, and the
+# exact scope this covers (vocab-axis/`gather_axis` pruning only -- never
+# `quantize_axis`/`hidden_size`, which would need `MatMulNBits`-style
+# block-boundary care) and declines (a tied `lm_head` sharing the packed
+# `data` tensor itself, always out of scope for this shape -- an untied,
+# plain-float `lm_head` is still auto-detected exactly as for the other two
+# shapes). Once matched, it too is treated interchangeably with a plain
+# `Gather`/`EmbedLayerNormalization` by `_match_embedding_chain`'s own
+# single dispatch loop and the actual slicing in
+# :func:`_apply_embedding_vocab_prune` -- the one difference is
+# `_EmbeddingChain.quantized`, non-`None` only for this shape, carrying the
+# extra `scales`/`zero_points` operands that need slicing alongside `data`.
+#
 # Matching/safety bar, held to the same conservative standard as every
 # other pass in this module -- decline outright, model left completely
 # untouched, rather than guess, for anything not confidently recognized:
@@ -22132,15 +22153,15 @@ def apply_structured_pruning_matmul_block_quantized_fp4(
 #   own output, an `Add` operand of the wrong width, ...) declines that
 #   `lm_head` match outright, rather than silently leaving an unrecognized
 #   bias at the old, now-mismatched width;
-# - when more than one qualifying producer -- `Gather` or
-#   `EmbedLayerNormalization`, counted together -- exists in the graph and
-#   the caller hasn't named which one via `input_name`, the whole call
-#   declines -- there is no reliable structural way to tell "the" token
-#   embedding apart from e.g. a positional embedding that also happens to
-#   read a genuine graph input (`position_ids`) through the identical
-#   `Gather(data, indices, axis=0)` shape, or, symmetrically, apart from a
-#   second, unrelated `EmbedLayerNormalization` block elsewhere in the
-#   graph.
+# - when more than one qualifying producer -- `Gather`,
+#   `EmbedLayerNormalization`, or `GatherBlockQuantized`, counted together --
+#   exists in the graph and the caller hasn't named which one via
+#   `input_name`, the whole call declines -- there is no reliable structural
+#   way to tell "the" token embedding apart from e.g. a positional embedding
+#   that also happens to read a genuine graph input (`position_ids`) through
+#   the identical `Gather(data, indices, axis=0)` shape, or, symmetrically,
+#   apart from a second, unrelated `EmbedLayerNormalization`/
+#   `GatherBlockQuantized` node elsewhere in the graph.
 #
 # Which vocabulary rows are safe to keep is fundamentally a question this
 # pass cannot answer from the graph alone -- calibration data can show a
@@ -22205,19 +22226,49 @@ class _LMHeadMatch:
 
 
 @dataclass(frozen=True)
+class _GatherBlockQuantizedInfo:
+    """Extra operands/attributes present only when `_EmbeddingChain.producer`
+    is a ``com.microsoft::GatherBlockQuantized`` node -- see
+    :func:`_match_gather_block_quantized_producer`'s own docstring for the
+    full schema/scope this depends on. `None` on every `_EmbeddingChain`
+    matched from either plain-float producer shape
+    (:func:`_match_embedding_gather`/:func:`_match_embed_layer_norm_producer`).
+    `_EmbeddingChain.weight_name` continues to mean the node's own `data`
+    input (the packed/quantized embedding table itself) for this shape too
+    -- only `scales_name`/`zero_points_name` are new. `gather_axis` is
+    always ``0`` (the only value :func:`_match_gather_block_quantized_producer`
+    ever admits -- see its own docstring), kept here rather than
+    hard-coded at every call site so :func:`_apply_embedding_vocab_prune`/
+    :func:`_gather_block_quantized_dequantized` read it off the match
+    itself, the same way every other field on this chain is read off the
+    match rather than re-derived.
+    """
+
+    scales_name: str
+    zero_points_name: Optional[str]
+    bits: int
+    block_size: int
+    gather_axis: int
+
+
+@dataclass(frozen=True)
 class _EmbeddingChain:
     """`producer` is the matched embedding-table node -- a plain `Gather`
-    (:func:`_match_embedding_gather`) or, for a BERT-family model already
-    fused by onnxruntime's own graph optimizer, a
-    ``com.microsoft::EmbedLayerNormalization`` node
-    (:func:`_match_embed_layer_norm_producer`) -- whichever one
+    (:func:`_match_embedding_gather`), a BERT-family model already fused by
+    onnxruntime's own graph optimizer's ``com.microsoft::
+    EmbedLayerNormalization`` node (:func:`_match_embed_layer_norm_producer`),
+    or a block-quantized ``com.microsoft::GatherBlockQuantized`` node
+    (:func:`_match_gather_block_quantized_producer`) -- whichever one
     :func:`_match_embedding_chain` matched; every other field means exactly
     the same thing regardless of which one it is: `weight_name` is always
-    the token-vocabulary weight itself (the `Gather`'s own `data` input, or
-    the `EmbedLayerNormalization` node's own `word_embedding` input), never
-    a position- or segment-embedding table (see
-    :func:`_match_embed_layer_norm_producer`'s own docstring for why those
-    two are always out of scope for this pass).
+    the token-vocabulary weight itself (the `Gather`'s own `data` input, the
+    `EmbedLayerNormalization` node's own `word_embedding` input, or the
+    `GatherBlockQuantized` node's own `data` input), never a position- or
+    segment-embedding table (see :func:`_match_embed_layer_norm_producer`'s
+    own docstring for why those two are always out of scope for this pass).
+    `quantized` is `None` for the two plain-float producer shapes, and the
+    extra `GatherBlockQuantized`-only operands/attributes
+    (:class:`_GatherBlockQuantizedInfo`) otherwise.
     """
 
     producer: onnx.NodeProto
@@ -22226,6 +22277,7 @@ class _EmbeddingChain:
     vocab_size: int
     hidden_size: int
     lm_head: Optional[_LMHeadMatch]
+    quantized: Optional[_GatherBlockQuantizedInfo] = None
 
 
 # Sentinel distinguishing "no bias" (fine, proceed) from "a bias exists but
@@ -22453,6 +22505,327 @@ def _match_embed_layer_norm_producer(
     return w_name, input_ids, underlying
 
 
+# ``com.microsoft::GatherBlockQuantized`` -- a third producer shape, the
+# block-quantized (int2/int4/int8) analogue of a plain-float embedding
+# `Gather`, matched alongside :func:`_match_embedding_gather`/
+# :func:`_match_embed_layer_norm_producer` by :func:`_match_embedding_chain`'s
+# own dispatch loop. Every fact this matcher depends on was confirmed
+# empirically against this environment's live onnxruntime (1.29.0) install,
+# not assumed:
+#
+# **Schema** (pulled live via
+# ``onnxruntime.capi.onnxruntime_pybind11_state.get_all_operator_schema()``,
+# filtered for ``name == "GatherBlockQuantized"``): inputs, in order, are
+# ``data`` (required; ``T1``: ``tensor(uint4)``/``tensor(int4)``/
+# ``tensor(uint8)`` -- "Tensor of rank r >= 1. Block-wise quantized"),
+# ``indices`` (required; ``T2``: ``int32``/``int64``, standard `Gather`
+# indexing semantics), ``scales`` (required; ``T3``:
+# ``float``/``float16``/``bfloat16``), ``zero_points`` (OPTIONAL; same
+# ``T1`` as `data` -- "data and zero_points have the same type", per the
+# schema's own doc string); output is ``output`` (``T3``, same dtype as
+# `scales`). Attributes, with defaults read off the schema's own serialized
+# default-value protos (decoded via a real `onnx.AttributeProto.
+# ParseFromString`, not guessed): ``bits`` (default 4; "Must be 2, 4 or
+# 8"), ``block_size`` (default 128; "power of 2 and not smaller than 16"),
+# ``quantize_axis`` (default 1 -- the axis `data` is block-quantized along),
+# ``gather_axis`` (default 0 -- the axis `indices` gathers along). The
+# schema's own doc string states these two axes are genuinely independent
+# ("Input `data` is a constant. It is quantized block-wise along attribute
+# `quantize_axis`... During op execution, `data` and `indices` are first
+# used to generate the quantized output [along `gather_axis`]. Then,
+# `scales` and `zero_points` are used to dequantize"), and this was
+# cross-checked with real ``InferenceSession`` runs, not taken on faith --
+# see below.
+#
+# **Packing/shape facts, all confirmed via real CPU ``InferenceSession``
+# runs against hand-built models** (this environment's CPU EP genuinely
+# implements this op -- no WebGPU/CUDA-only fallback needed, unlike the
+# ``MatMulNBitsMlp``/``MatMulNBitsQkv``/``PagedAttention``/
+# ``MatMulBlockQuantizedFp4Weight``/``Fp8Weight``/``GemmaRotaryEmbedding``
+# precedents this module's own section comments document elsewhere):
+#
+#   * `scales`/`zero_points` share `data`'s own rank and every dim
+#     EXCEPT `quantize_axis`, whose size becomes ``ceil(data.shape
+#     [quantize_axis] / block_size)`` (the block count) -- in particular,
+#     both share `data`'s own size along `gather_axis` exactly (confirmed:
+#     a `(vocab_size, hidden_size)` `data` with `quantize_axis=1`,
+#     `gather_axis=0` pairs with a `(vocab_size, n_blocks)` `scales`/
+#     `zero_points` -- their own axis-0 size is `vocab_size`, matching
+#     `data`'s, never independently sized).
+#   * `data` (and, when present, `zero_points`) for ``bits == 8`` is a
+#     plain unpacked ``uint8`` tensor, one full byte per code -- no
+#     packing at all, confirmed the same way ``MatMulNBits``'s own
+#     ``bits == 8`` case is (see that section's own top comment).
+#   * For ``bits in (2, 4)``, TWO distinct, genuinely different packing
+#     conventions were confirmed, dispatched purely on `data`'s own
+#     `TensorProto` dtype (never guessed from `bits` alone):
+#     - `data` typed ``tensor(uint4)``/``tensor(int4)`` (ONNX's own native
+#       sub-byte tensor types, ``bits == 4`` only): packed per ONNX's own
+#       spec-defined convention (``onnx.numpy_helper``'s own
+#       ``_pack_4bitx2``/``_unpack_4bit``) -- a FLAT, whole-tensor
+#       row-major pack, 2 values per byte, which can cross a row boundary
+#       when the trailing (non-`gather_axis`) dimension count is odd. This
+#       matters for K-axis (`quantize_axis`) pruning (out of scope here,
+#       see below) but NOT for `gather_axis` pruning: confirmed directly,
+#       with an intentionally-adversarial odd (17) `hidden_size`, that
+#       reading `data` via ``onnx.numpy_helper.to_array`` (which correctly
+#       implements this exact unpack), row-selecting along `gather_axis`,
+#       and re-packing via ``onnx.numpy_helper.from_array`` reproduces the
+#       identical dequantized values a real `InferenceSession` computes
+#       from the original tensor for every kept row -- i.e. this pass
+#       never needs to hand-roll nibble packing at all, unlike
+#       ``MatMulNBits``'s own producer/consumer slicing (see that
+#       section's own top comment) which packs a CUSTOM, `MatMulNBits`
+#       -specific ``uint8`` layout ``onnx.numpy_helper`` itself has no
+#       notion of.
+#     - `data` typed plain ``tensor(uint8)`` with ``bits in (2, 4)``
+#       (manually packed, per the schema doc's own "for bits < 8 the
+#       values are packed along the last dimension (low-order bits
+#       first)"): confirmed, again via a real `InferenceSession` round
+#       trip (including an intentionally-adversarial odd true width, 3,
+#       forcing a padding value), that this packing is independent PER
+#       ROW (each `gather_axis`-row's own trailing bytes are self
+#       contained, never sharing a byte with a different row) -- so an
+#       ordinary ``uint8`` row-slice (``data[keep]``, no unpacking needed
+#       at all, since a plain ``uint8`` tensor's own per-element bytes are
+#       already the atomic storage unit) is exactly byte-exact, matching
+#       this section's own "slice, don't recompute" principle even more
+#       directly than the native-int4/int8 case above. `zero_points`, when
+#       present and also plain ``uint8`` with ``bits < 8``, is packed the
+#       SAME per-row nibble/2-bit way (confirmed: a `(vocab, n_blocks)`
+#       logical zero-point array packs to `(vocab, ceil(n_blocks * bits /
+#       8))` bytes -- NOT simply `(vocab, n_blocks)`, a fact only found by
+#       hitting, and then resolving, a real
+#       ``"scales and zero_points shape does not match"`` kernel error
+#       while iterating on this exact question) -- also therefore a plain
+#       row-slice, no unpacking needed, for the same reason.
+#     Bottom line for THIS pass, in both conventions: because `gather_axis`
+#     (the axis this pass ever slices) is never `quantize_axis` (the only
+#     axis either packing convention ever packs along -- enforced by this
+#     matcher's own degenerate-case decline, below), a plain
+#     ``onnx.numpy_helper.to_array``/``np.take``/``onnx.numpy_helper.
+#     from_array`` round trip -- this module's own existing
+#     :func:`_slice_axis` helper, unchanged, no new pack/unpack code needed
+#     -- is unconditionally byte-exact for `data`/`scales`/`zero_points`
+#     alike, regardless of `bits`/dtype/packing convention. This is
+#     exactly the "structurally SIMPLER than `MatMulNBits`" asymmetry a
+#     prior research survey predicted before this matcher was written, now
+#     independently re-confirmed here rather than taken on faith.
+#   * Default `zero_points` (when the optional input is absent), confirmed
+#     empirically by omitting it and checking the output against each
+#     candidate formula: **0** when `data` is natively ``tensor(uint4)``/
+#     ``tensor(int4)``, or **``2 ** (bits - 1)``** when `data` is
+#     ``tensor(uint8)`` -- exactly the schema doc's own "the default value
+#     is 0 for int4/uint4, or 2^(bits-1) for uint8" wording, confirmed
+#     rather than assumed correct.
+#
+# **Real exporter evidence -- found, not hypothetical**: this environment's
+# own installed ``onnxruntime.quantization.matmul_nbits_quantizer`` module
+# (the same package ``MatMulNBits``'s own top-of-section comment already
+# cites for that op) contains a real, shipped code path,
+# ``DefaultWeightOnlyQuantizer.quantize_gather`` (dispatched from
+# ``MatMulNBitsQuantizer.quantize`` whenever a `Gather` node's own constant
+# weight is quantized -- opt-in via ``op_types_to_quantize=(..., "Gather")``,
+# default is `MatMul`-only), that converts a plain ``Gather`` node into
+# exactly this shape: `gather_axis` copied from the original `Gather`'s own
+# `axis` attribute (default 0), `quantize_axis` from
+# ``self.config.quant_axes.get("Gather", 1)`` (default 1 -- matching this
+# matcher's own required axes below exactly), `data` quantized to native
+# ``TensorProto.INT4`` (symmetric) or ``UINT4`` (asymmetric) -- i.e. this
+# real tool only ever emits the native-int4 packing convention above, never
+# the manually-packed-``uint8`` one, and only ever ``bits == 4`` (the
+# method hard-codes the INT4/UINT4 qtype with no `bits` attribute override,
+# relying on the schema's own default) -- confirmed by reading that
+# module's own source directly in this environment, not inferred from
+# documentation elsewhere. The class-level doc comment above
+# ``quantize_gather`` itself even names the direct correspondence: "Target
+# node: Gather -> QOperator node: GatherBlockQuantized" as literally the
+# `Gather`-family row of the exact same table ``MatMulNBits``'s own
+# `MatMul -> MatMulNBits` row appears in. So while this matcher's own scope
+# (below) is broader than what this one real tool currently emits (it also
+# accepts ``bits in (2, 8)`` and the manually-packed-``uint8`` convention,
+# both independently confirmed against a real kernel above, exactly the
+# same "don't extrapolate past what's actually verified" bar
+# ``MatMulNBits``'s own section holds itself to), the underlying shape --
+# a plain `Gather`'s constant weight, `com.microsoft`-quantized -- is a
+# real, currently-shipped ONNX Runtime tool output, not a hypothetical this
+# module invented ahead of any actual exporter.
+#
+# **Scope, deliberately narrow, mirroring this module's own conservative
+# "decline outright rather than guess" bar**:
+#
+#   * ONLY `gather_axis` (vocab-axis) pruning is in scope -- this is a new
+#     PRODUCER SHAPE for the exact same :func:`apply_embedding_vocab_pruning`/
+#     :func:`apply_embedding_vocab_magnitude_pruning` entry points that
+#     already only ever prune `vocab_size`, never `hidden_size`. Pruning
+#     `quantize_axis` (`hidden_size`, when it differs from `gather_axis`)
+#     would need the exact same block-boundary care ``MatMulNBits``'s own
+#     K-axis (consumer-side) pruning already has (see that section's own
+#     top comment) -- out of scope for this first cut, exactly as this
+#     task's own instructions require, and left as a clearly separate,
+#     independent follow-up rather than attempted here.
+#   * `gather_axis == quantize_axis` (a degenerate case the live schema
+#     does not itself forbid) is always declined outright: this matcher
+#     restricts to rank-2 `data` (mirroring :func:`_match_embedding_gather`'s
+#     own 2-D requirement) with `gather_axis` required to be exactly `0`
+#     and `quantize_axis` exactly `1` -- for a rank-2 tensor these two
+#     requirements alone already make the degenerate case structurally
+#     impossible (the two axes can never coincide), so no separate runtime
+#     check is needed to reach the same guarantee; this is recorded here
+#     as the safety argument, not left implicit.
+#   * `data` must have exactly ONE consumer (this node) -- unlike the
+#     plain-float shapes' own one-OR-two-consumer allowance (a tied
+#     `lm_head` sharing the same float initializer), a TIED `lm_head`
+#     sharing this node's own packed/quantized `data` tensor directly is
+#     always declined here: reusing a block-quantized `data` tensor as a
+#     projection weight would require that second consumer to also be a
+#     compatible quantized op (e.g. `MatMulNBits`, itself reading `data` as
+#     an `[N, K]`-shaped weight under a DIFFERENT packing convention this
+#     matcher has not verified is even compatible) -- composing two
+#     different ops' quantization conventions across a tied boundary is a
+#     real but materially harder problem, deliberately left out of scope
+#     rather than guessed at. An UNTIED `lm_head` (a fully independent
+#     plain-float `MatMul`/`Gemm` elsewhere in the graph, unrelated to
+#     `data`'s own dtype) is still auto-detected exactly as it already is
+#     for the plain-float shapes -- :func:`_match_untied_lm_head` neither
+#     knows nor cares whether the embedding side happens to be quantized.
+#   * `block_size` itself is never validated by this matcher (unlike
+#     ``MatMulNBits``'s own section, which must -- its K-axis consumer
+#     pruning needs to know exact block boundaries): because `quantize_axis`
+#     is never the axis this pass touches, `block_size`/`bits`/
+#     `quantize_axis` only matter here for the magnitude-ranking dequant
+#     helper (:func:`_gather_block_quantized_dequantized`, read verbatim
+#     off the node's own attributes, never re-derived or guessed), not for
+#     matching or slicing correctness.
+_GATHER_BLOCK_QUANTIZED_DOMAIN = "com.microsoft"
+_GATHER_BLOCK_QUANTIZED_DATA_TYPES = {
+    onnx.TensorProto.UINT4,
+    onnx.TensorProto.INT4,
+    onnx.TensorProto.UINT8,
+}
+
+
+def _match_gather_block_quantized_producer(
+    node: onnx.NodeProto,
+    initializer_map: Dict[str, onnx.TensorProto],
+    consumers_of: Dict[str, List[onnx.NodeProto]],
+    graph_input_names: Set[str],
+    node_by_output: Dict[str, onnx.NodeProto],
+) -> Optional[Tuple[str, str, str, _GatherBlockQuantizedInfo]]:
+    """The ``com.microsoft::GatherBlockQuantized`` counterpart of
+    :func:`_match_embedding_gather`/:func:`_match_embed_layer_norm_producer`
+    -- same ``(weight_name, indices_name, underlying_input_name)`` return
+    contract as those two, with one addition (a 4th tuple element, this
+    shape's own :class:`_GatherBlockQuantizedInfo`), so
+    :func:`_match_embedding_chain`'s own single matching loop can try this
+    as a third producer shape. See this section's own top comment for the
+    full empirical schema/packing/real-exporter-evidence this depends on,
+    and the exact scope this declines and why.
+
+    Matching bar: `node` must be ``com.microsoft::GatherBlockQuantized``
+    with 3 or 4 inputs (`zero_points` optional); `bits` in ``{2, 4, 8}``
+    (the live schema's own stated valid set; every value independently
+    confirmed against a real kernel run -- see this section's own top
+    comment); `gather_axis` (default 0) normalized-equal to `0` and
+    `quantize_axis` (default 1) normalized-equal to `1` (together this
+    already forbids the degenerate `gather_axis == quantize_axis` case for
+    the rank-2 `data` this matcher requires, with no separate check
+    needed); `data` a constant rank-2 initializer of dtype
+    ``UINT4``/``INT4``/``UINT8``; `indices` a declared graph input, or one
+    bounded `Cast` hop from one (identical rule to the other two producer
+    shapes); `scales` a constant, rank-2, `_is_supported_float_dtype`
+    initializer whose own axis-0 size matches `data`'s; `zero_points`, when
+    present, a constant, rank-2, SAME-dtype-as-`data` initializer whose own
+    axis-0 size also matches `data`'s (the schema's own "data and
+    zero_points have the same type"); `data` itself must have exactly one
+    consumer (this node) -- see this section's own top comment for why a
+    tied `lm_head` is always declined for this shape specifically.
+    """
+    if node.op_type != "GatherBlockQuantized" or node.domain != (
+        _GATHER_BLOCK_QUANTIZED_DOMAIN
+    ):
+        return None
+    if len(node.input) not in (3, 4):
+        return None
+
+    bits = 4
+    block_size = 128
+    quantize_axis = 1
+    gather_axis = 0
+    for attr in node.attribute:
+        if attr.name == "bits":
+            bits = attr.i
+        elif attr.name == "block_size":
+            block_size = attr.i
+        elif attr.name == "quantize_axis":
+            quantize_axis = attr.i
+        elif attr.name == "gather_axis":
+            gather_axis = attr.i
+    if bits not in (2, 4, 8):
+        return None
+
+    data_name, indices_name, scales_name = node.input[0], node.input[1], node.input[2]
+    zero_points_name = node.input[3] if len(node.input) == 4 and node.input[3] else None
+
+    data_init = initializer_map.get(data_name)
+    if (
+        data_init is None
+        or data_init.data_type not in _GATHER_BLOCK_QUANTIZED_DATA_TYPES
+        or len(data_init.dims) != 2
+    ):
+        return None
+    rank = len(data_init.dims)
+    gather_axis = gather_axis + rank if gather_axis < 0 else gather_axis
+    quantize_axis = quantize_axis + rank if quantize_axis < 0 else quantize_axis
+    if gather_axis != 0 or quantize_axis != 1:
+        return None  # only the plain (vocab_size, hidden_size) layout
+
+    scales_init = initializer_map.get(scales_name)
+    if (
+        scales_init is None
+        or not _is_supported_float_dtype(scales_init.data_type)
+        or len(scales_init.dims) != 2
+        or scales_init.dims[gather_axis] != data_init.dims[gather_axis]
+    ):
+        return None
+
+    if zero_points_name is not None:
+        zp_init = initializer_map.get(zero_points_name)
+        if (
+            zp_init is None
+            or zp_init.data_type != data_init.data_type
+            or len(zp_init.dims) != 2
+            or zp_init.dims[gather_axis] != data_init.dims[gather_axis]
+        ):
+            return None
+
+    underlying = indices_name
+    if underlying not in graph_input_names:
+        cast_node = node_by_output.get(underlying)
+        if (
+            cast_node is not None
+            and cast_node.op_type == "Cast"
+            and len(cast_node.input) == 1
+            and cast_node.input[0] in graph_input_names
+        ):
+            underlying = cast_node.input[0]
+        else:
+            return None  # not a graph input, nor a Cast of one
+
+    consumers = consumers_of.get(data_name, [])
+    if len(consumers) != 1 or consumers[0] is not node:
+        return None  # any other/extra consumer -- always declined, see above
+
+    info = _GatherBlockQuantizedInfo(
+        scales_name=scales_name,
+        zero_points_name=zero_points_name,
+        bits=bits,
+        block_size=block_size,
+        gather_axis=gather_axis,
+    )
+    return data_name, indices_name, underlying, info
+
+
 def _match_lm_head_tail(
     node: onnx.NodeProto,
     initializer_map: Dict[str, onnx.TensorProto],
@@ -22658,20 +23031,25 @@ def _match_embedding_chain(
     graph: onnx.GraphProto, input_name: Optional[str]
 ) -> Optional[_EmbeddingChain]:
     """Finds the one token-embedding producer this pass should act on --
-    either a plain `Gather` (:func:`_match_embedding_gather`) or a
+    a plain `Gather` (:func:`_match_embedding_gather`), a
     ``com.microsoft::EmbedLayerNormalization`` node
     (:func:`_match_embed_layer_norm_producer` -- see its own docstring for
-    why this second shape exists and its exact scope), plus its tied/untied
-    `lm_head`, if any -- see this section's own comment above for the full
+    why this second shape exists and its exact scope), or a block-quantized
+    ``com.microsoft::GatherBlockQuantized`` node
+    (:func:`_match_gather_block_quantized_producer` -- see its own
+    section-top comment for the schema/scope this third shape covers), plus
+    its tied/untied `lm_head`, if any (a tied `lm_head` is always declined
+    for the `GatherBlockQuantized` shape specifically -- see that matcher's
+    own docstring) -- see this section's own comment above for the full
     matching/safety bar. When `input_name` is given, only a producer whose
     token-id operand resolves to that exact graph input is considered, and
     it is an error (`ValueError` -- a caller mistake, not an ambiguous
     topology) if none does. When `input_name` is omitted, exactly one
-    qualifying producer -- of *either* shape, counted together -- must
-    exist in the whole graph -- zero or more than one (with no way to tell
-    which is "the" token embedding, e.g. a `position_ids`-driven positional
-    embedding matches the identical `Gather` structural shape, or a graph
-    could mix a plain-`Gather` embedding with an unrelated
+    qualifying producer -- of *any* of the three shapes, counted together --
+    must exist in the whole graph -- zero or more than one (with no way to
+    tell which is "the" token embedding, e.g. a `position_ids`-driven
+    positional embedding matches the identical `Gather` structural shape,
+    or a graph could mix a plain-`Gather` embedding with an unrelated
     `EmbedLayerNormalization` block) declines the whole call (`None`), the
     model left completely untouched.
     """
@@ -22683,6 +23061,7 @@ def _match_embedding_chain(
 
     matches = []
     for node in graph.node:
+        quantized: Optional[_GatherBlockQuantizedInfo] = None
         m = _match_embedding_gather(
             node, initializer_map, consumers_of, graph_input_names, node_by_output
         )
@@ -22691,26 +23070,45 @@ def _match_embedding_chain(
                 node, initializer_map, consumers_of, graph_input_names, node_by_output
             )
         if m is None:
+            m_q = _match_gather_block_quantized_producer(
+                node, initializer_map, consumers_of, graph_input_names, node_by_output
+            )
+            if m_q is not None:
+                w_name, indices_name, underlying, quantized = m_q
+                m = (w_name, indices_name, underlying)
+        if m is None:
             continue
         w_name, indices_name, underlying = m
         if input_name is not None and input_name not in (indices_name, underlying):
             continue
-        matches.append((node, w_name, indices_name))
+        matches.append((node, w_name, indices_name, quantized))
 
     if input_name is not None and not matches:
         raise ValueError(
-            f"no embedding Gather/EmbedLayerNormalization found reading graph "
-            f"input {input_name!r}"
+            f"no embedding Gather/EmbedLayerNormalization/GatherBlockQuantized "
+            f"found reading graph input {input_name!r}"
         )
     if len(matches) != 1:
         return None  # zero, or ambiguous with no input_name to disambiguate
 
-    producer_node, w_name, indices_name = matches[0]
+    producer_node, w_name, indices_name, quantized = matches[0]
     w_init = initializer_map[w_name]
-    vocab_size, hidden_size = int(w_init.dims[0]), int(w_init.dims[1])
+    if quantized is not None:
+        vocab_size = int(w_init.dims[quantized.gather_axis])
+        hidden_size = int(w_init.dims[1 - quantized.gather_axis])
+    else:
+        vocab_size, hidden_size = int(w_init.dims[0]), int(w_init.dims[1])
 
     consumers = consumers_of.get(w_name, [])
-    if len(consumers) == 2:
+    if quantized is not None:
+        # A tied lm_head sharing the packed/quantized `data` tensor is
+        # always declined -- _match_gather_block_quantized_producer's own
+        # single-consumer requirement already guarantees `consumers == [producer_node]`
+        # here, so only the untied auto-detection path is ever attempted.
+        lm_head = _match_untied_lm_head(
+            graph, w_name, vocab_size, consumers_of, initializer_map, graph_outputs
+        )
+    elif len(consumers) == 2:
         lm_head = _match_tied_lm_head(
             w_name, vocab_size, producer_node, consumers_of, initializer_map
         )
@@ -22728,6 +23126,7 @@ def _match_embedding_chain(
         vocab_size=vocab_size,
         hidden_size=hidden_size,
         lm_head=lm_head,
+        quantized=quantized,
     )
 
 
@@ -22774,15 +23173,20 @@ def _finalize_embedding_shapes(
 ) -> None:
     """Invalidates/corrects every downstream shape this pass's slicing
     makes stale. `chain.producer`'s own output shape(s) never need
-    touching, whichever of the two shapes matched: a plain `Gather`'s
+    touching, whichever of the three shapes matched: a plain `Gather`'s
     output shape doesn't carry `vocab_size` at all (only `hidden_size`,
     unaffected by an `axis=0` gather); an `EmbedLayerNormalization` node's
     `output`/`mask_index`/`embedding_sum` are all `(batch_size,
     sequence_length[, hidden_size])`-shaped -- none of them mention
     `vocab_size` either (confirmed against the op's own live schema, see
-    :func:`_match_embed_layer_norm_producer`'s own docstring). An
-    `lm_head`'s output (and, for the tied "Transpose then MatMul"
-    sub-shape, the `Transpose`'s own output) *does* change width
+    :func:`_match_embed_layer_norm_producer`'s own docstring); a
+    `GatherBlockQuantized` node's own `output` is likewise
+    `indices_shape + data_shape[gather_axis + 1:]` -- ordinary `Gather`
+    semantics per its own schema doc, so it too never mentions `vocab_size`
+    (confirmed the same way, via a real `InferenceSession` run -- see
+    :func:`_match_gather_block_quantized_producer`'s own section-top
+    comment). An `lm_head`'s output (and, for the tied "Transpose then
+    MatMul" sub-shape, the `Transpose`'s own output) *does* change width
     (`vocab_size` -> `new_v`) and is handled here.
     """
     if chain.lm_head is None:
@@ -22800,12 +23204,20 @@ def _apply_embedding_vocab_prune(
     model: onnx.ModelProto, chain: _EmbeddingChain, keep_ids: List[int]
 ) -> onnx.ModelProto:
     """Performs the actual slicing for an already-decided (ascending)
-    `keep_ids` set: the embedding table's own `vocab_size` axis (axis 0,
-    always -- the Gather's own `axis=0` requirement), and, for an untied
-    `lm_head`, its own independent weight/bias. A tied `lm_head`'s weight
-    needs no separate slicing call at all: it *is* the embedding table
-    (the exact same initializer object), already fully accounted for by
-    the one slice below.
+    `keep_ids` set: the embedding table's own `vocab_size` axis (axis 0 for
+    the two plain-float producer shapes -- the `Gather`'s own `axis=0`
+    requirement; `chain.quantized.gather_axis` -- always also `0`, see
+    :func:`_match_gather_block_quantized_producer`'s own docstring -- for
+    the `GatherBlockQuantized` shape), and, for an untied `lm_head`, its own
+    independent weight/bias. A tied `lm_head`'s weight needs no separate
+    slicing call at all: it *is* the embedding table (the exact same
+    initializer object), already fully accounted for by the one slice
+    below. For the `GatherBlockQuantized` shape, `scales`/(if present)
+    `zero_points` are ALSO row-sliced along that same axis -- a plain
+    ``onnx.numpy_helper``-roundtripping :func:`_slice_axis` call, byte-exact
+    regardless of `bits`/packing convention, per this section's own top
+    comment (`gather_axis` is never `quantize_axis`, so this never touches
+    a packed axis).
     """
     out = onnx.ModelProto()
     out.CopyFrom(model)
@@ -22814,7 +23226,18 @@ def _apply_embedding_vocab_prune(
     keep = np.asarray(keep_ids, dtype=np.int64)
     new_v = len(keep_ids)
 
-    _slice_axis(initializer_map[chain.weight_name], keep, axis=0)
+    weight_axis = chain.quantized.gather_axis if chain.quantized is not None else 0
+    _slice_axis(initializer_map[chain.weight_name], keep, axis=weight_axis)
+    if chain.quantized is not None:
+        _slice_axis(
+            initializer_map[chain.quantized.scales_name], keep, axis=weight_axis
+        )
+        if chain.quantized.zero_points_name is not None:
+            _slice_axis(
+                initializer_map[chain.quantized.zero_points_name],
+                keep,
+                axis=weight_axis,
+            )
 
     if chain.lm_head is not None and not chain.lm_head.tied:
         assert chain.lm_head.weight_name is not None
@@ -22992,6 +23415,80 @@ def apply_embedding_vocab_pruning(
     )
 
 
+def _gather_block_quantized_dequantized(
+    chain: _EmbeddingChain, initializer_map: Dict[str, onnx.TensorProto]
+) -> np.ndarray:
+    """The full ``float64`` ``(vocab_size, hidden_size)`` dequantized
+    embedding table `chain`'s own ``com.microsoft::GatherBlockQuantized``
+    producer refers to, for IMPORTANCE RANKING ONLY -- never written back to
+    the graph (this module's own "slice, don't recompute" principle, exactly
+    as ``MatMulNBits``'s own :func:`_matmul_nbits_dequantized`). Requires
+    `chain.quantized` is not `None`. Formula, per this section's own top
+    comment (empirically confirmed against a real `InferenceSession`):
+    ``dequantized[v, h] = (data[v, h] - zero_point[v, h // block_size]) *
+    scale[v, h // block_size]`` -- `data`/`zero_points` read via
+    ``onnx.numpy_helper.to_array`` (which correctly unpacks whichever of the
+    two packing conventions this section's top comment documents applies,
+    dispatched purely off the tensor's own dtype -- never re-derived here),
+    never a raw byte reinterpretation.
+    """
+    q = chain.quantized
+    assert q is not None
+    data = onnx.numpy_helper.to_array(initializer_map[chain.weight_name]).astype(
+        np.float64
+    )
+    scales = onnx.numpy_helper.to_array(initializer_map[q.scales_name]).astype(
+        np.float64
+    )
+    if q.zero_points_name is not None:
+        zp = onnx.numpy_helper.to_array(initializer_map[q.zero_points_name]).astype(
+            np.float64
+        )
+    else:
+        data_init = initializer_map[chain.weight_name]
+        default_zp = (
+            0.0
+            if data_init.data_type in (onnx.TensorProto.UINT4, onnx.TensorProto.INT4)
+            else float(1 << (q.bits - 1))
+        )
+        zp = np.full(scales.shape, default_zp, dtype=np.float64)
+    n_blocks = scales.shape[1]
+    col_block = np.minimum(np.arange(data.shape[1]) // q.block_size, n_blocks - 1)
+    return (data - zp[:, col_block]) * scales[:, col_block]
+
+
+def _embedding_vocab_importance(
+    chain: _EmbeddingChain, initializer_map: Dict[str, onnx.TensorProto]
+) -> np.ndarray:
+    """The per-row (vocab-axis) L2-norm importance vector shared by
+    :func:`apply_embedding_vocab_magnitude_pruning` and its dry-run mirror
+    :func:`_analyze_embedding_vocab_magnitude_pruning`: the matched
+    embedding table's own row norm, combined (root-sum-square) with a
+    matched untied `lm_head`'s own row norm when one exists -- the tied
+    case needs no such combination, the embedding table's own row norm
+    already *is* the tied `lm_head`'s row norm. Reads the embedding table
+    via :func:`_to_f64` for the two plain-float producer shapes, or
+    :func:`_gather_block_quantized_dequantized` (dequantized purely for
+    this ranking, never written back) for the `GatherBlockQuantized` shape.
+    """
+    if chain.quantized is not None:
+        emb = _gather_block_quantized_dequantized(chain, initializer_map)
+    else:
+        emb = _to_f64(initializer_map[chain.weight_name])
+    importance = np.sum(np.square(emb), axis=1)
+    if (
+        chain.lm_head is not None
+        and not chain.lm_head.tied
+        and chain.lm_head.weight_name is not None
+    ):
+        lw = _to_f64(initializer_map[chain.lm_head.weight_name])
+        lw_nk = (
+            lw if chain.lm_head.weight_transposed else lw.T
+        )  # -> [vocab_size, hidden]
+        importance = importance + np.sum(np.square(lw_nk), axis=1)
+    return np.sqrt(importance)
+
+
 def apply_embedding_vocab_magnitude_pruning(
     model: Union[str, onnx.ModelProto],
     sparsity: float = 0.5,
@@ -23057,19 +23554,7 @@ def apply_embedding_vocab_magnitude_pruning(
 
     vocab_size = chain.vocab_size
     initializer_map = {t.name: t for t in model.graph.initializer}
-    emb = _to_f64(initializer_map[chain.weight_name])
-    importance = np.sum(np.square(emb), axis=1)
-    if (
-        chain.lm_head is not None
-        and not chain.lm_head.tied
-        and chain.lm_head.weight_name is not None
-    ):
-        lw = _to_f64(initializer_map[chain.lm_head.weight_name])
-        lw_nk = (
-            lw if chain.lm_head.weight_transposed else lw.T
-        )  # -> [vocab_size, hidden]
-        importance = importance + np.sum(np.square(lw_nk), axis=1)
-    importance = np.sqrt(importance)
+    importance = _embedding_vocab_importance(chain, initializer_map)
 
     protect = {int(i) for i in (protect_token_ids or ())}
     bad_protect = sorted(i for i in protect if not (0 <= i < vocab_size))
@@ -26862,22 +27347,23 @@ def _embedding_not_eligible(
     chain: Optional[_EmbeddingChain],
     input_name: Optional[str],
 ) -> List[str]:
-    """Every `Gather`/`EmbedLayerNormalization` node
-    :func:`_match_embedding_gather`/:func:`_match_embed_layer_norm_producer`
-    (the exact same two per-node matchers :func:`_match_embedding_chain`
-    itself calls) confirm structurally embedding-shaped, but that the whole
-    call still declines to touch -- every one of them when `chain` is
-    `None` (whether because none exist, more than one does and the call
-    can't disambiguate without `input_name`, or the sole match's own
-    second-consumer/`lm_head` shape wasn't confidently recognized --
-    :func:`_match_embedding_chain` returns `None` for all three), or none
-    at all when `chain` is not `None` (:func:`_match_embedding_chain`'s
-    own ``len(matches) != 1`` check guarantees the chosen `chain.producer`
-    is the *only* structurally-matching node reachable under this same
-    `input_name` in that case). Mirrors :func:`_match_embedding_chain`'s
-    own `input_name` filter exactly, so a structurally-matching producer
-    reading a *different* graph input than a given `input_name` is still
-    reported here -- this call would never touch it either.
+    """Every `Gather`/`EmbedLayerNormalization`/`GatherBlockQuantized` node
+    :func:`_match_embedding_gather`/:func:`_match_embed_layer_norm_producer`/
+    :func:`_match_gather_block_quantized_producer` (the exact same three
+    per-node matchers :func:`_match_embedding_chain` itself calls) confirm
+    structurally embedding-shaped, but that the whole call still declines to
+    touch -- every one of them when `chain` is `None` (whether because none
+    exist, more than one does and the call can't disambiguate without
+    `input_name`, or the sole match's own second-consumer/`lm_head` shape
+    wasn't confidently recognized -- :func:`_match_embedding_chain` returns
+    `None` for all three), or none at all when `chain` is not `None`
+    (:func:`_match_embedding_chain`'s own ``len(matches) != 1`` check
+    guarantees the chosen `chain.producer` is the *only* structurally-matching
+    node reachable under this same `input_name` in that case). Mirrors
+    :func:`_match_embedding_chain`'s own `input_name` filter exactly, so a
+    structurally-matching producer reading a *different* graph input than a
+    given `input_name` is still reported here -- this call would never touch
+    it either.
     """
     initializer_map = {t.name: t for t in graph.initializer}
     consumers_of = _consumers_of(graph)
@@ -26893,6 +27379,12 @@ def _embedding_not_eligible(
             m = _match_embed_layer_norm_producer(
                 node, initializer_map, consumers_of, graph_input_names, node_by_output
             )
+        if m is None:
+            m_q = _match_gather_block_quantized_producer(
+                node, initializer_map, consumers_of, graph_input_names, node_by_output
+            )
+            if m_q is not None:
+                m = m_q[:3]
         if m is None:
             continue
         _w_name, indices_name, underlying = m
@@ -26947,19 +27439,7 @@ def _analyze_embedding_vocab_magnitude_pruning(
 
     vocab_size = chain.vocab_size
     initializer_map = {t.name: t for t in graph.initializer}
-    emb = _to_f64(initializer_map[chain.weight_name])
-    importance = np.sum(np.square(emb), axis=1)
-    if (
-        chain.lm_head is not None
-        and not chain.lm_head.tied
-        and chain.lm_head.weight_name is not None
-    ):
-        lw = _to_f64(initializer_map[chain.lm_head.weight_name])
-        lw_nk = (
-            lw if chain.lm_head.weight_transposed else lw.T
-        )  # -> [vocab_size, hidden]
-        importance = importance + np.sum(np.square(lw_nk), axis=1)
-    importance = np.sqrt(importance)
+    importance = _embedding_vocab_importance(chain, initializer_map)
 
     protect = {int(i) for i in (protect_token_ids or ())}
     bad_protect = sorted(i for i in protect if not (0 <= i < vocab_size))
