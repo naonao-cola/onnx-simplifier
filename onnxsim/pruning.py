@@ -18384,6 +18384,1241 @@ def apply_qmoe_whole_expert_pruning(
     return out
 
 
+# --- MatMulBlockQuantizedFp4Weight/MatMulBlockQuantizedFp8Weight
+#     (NVFP4/FP8 block-quantized weight) structured pruning --------------------
+#
+# ``com.microsoft::MatMulBlockQuantizedFp4Weight``/
+# ``com.microsoft::MatMulBlockQuantizedFp8Weight`` are two NEW (``since_version
+# == 1`` -- newly registered, not merely newly matched here) contrib ops this
+# module had no reference to at all before this section (``grep -c
+# "MatMulBlockQuantized" onnxsim/pruning.py`` returned 0 on the commit this
+# section was added from). Both are weight-only block-quantized dense
+# ``MatMul`` variants -- the same *shape* of problem ``MatMulNBits`` (this
+# module's own "MatMulNBits (block-quantized weight) structured pruning"
+# section, above) solves for int4/int8 weights -- but for two entirely
+# different low-precision FLOAT weight encodings instead: FP4 (NVFP4/E2M1)
+# and FP8 (E4M3). Every fact below was confirmed empirically against this
+# environment's live ``onnxruntime`` (1.29.0) install via
+# ``onnxruntime.capi.onnxruntime_pybind11_state.get_all_operator_schema()``,
+# never guessed from either op's name or from how the superficially similar
+# ``MatMulNBits``/``QMoE`` ``quant_type='nvfp4'`` code elsewhere in this
+# module happens to work:
+#
+#   * ``MatMulBlockQuantizedFp8Weight`` inputs, in order: ``A`` (T:
+#     float16/bfloat16, unquantized activation), ``B`` (T1: float8e4m3fn --
+#     "Row-major FP8 E4M3 weight of shape [N, K]"), ``b_scale`` (T2: float32
+#     only -- "Per-block FP32 weight scales of shape [N, ceil(K /
+#     block_size)]"), ``a_scale`` (optional, T2 -- "global fp32 activation
+#     scale (scalar)... A is statically quantized to FP8 E4M3 with this scale
+#     and dequantized back... before the matmul (W8A8 numerics); when absent,
+#     A stays in full FP16/BF16 precision"), ``bias`` (optional, T: same
+#     float16/bfloat16 typing as ``A`` -- NOT float32 -- "shape [N]").
+#     Output: ``Y`` (T, "[..., N]"). One attribute: ``block_size`` (optional
+#     int, schema-serialized default 128, doc "Number of consecutive K values
+#     that share one weight scale" -- no power-of-two or minimum-value
+#     constraint stated anywhere in the live schema, unlike ``MatMulNBits``'s
+#     own explicit "must be a power of two and not smaller than 16"). ``B``'s
+#     own leading axis IS ``N`` (output channels) -- confirmed directly from
+#     the schema's own doc text quoted above, not assumed from ``MatMulNBits``'s
+#     identical convention -- so producer-side (N-axis) pruning is a plain
+#     row-slice, and ``B`` has NO sub-byte packing at all (one full FP8 byte
+#     per weight element, per the doc's own "[N, K]" shape with no packed/2
+#     factor anywhere), unlike ``MatMulNBits``'s nibble-packed ``B``.
+#   * ``MatMulBlockQuantizedFp4Weight`` inputs, in order: ``A`` (T, same
+#     float16/bfloat16 typing), ``B`` (T1: uint8 -- "Packed NVFP4 weight of
+#     shape [N, K/2] stored as uint8 (two E2M1 values per byte, low nibble
+#     first)"), ``weight_scale`` (T2: uint8 -- "Per-block E4M3 weight scales
+#     of shape [N, ceil(K / block_size)] stored as raw uint8 bytes" -- note
+#     this is typed ``uint8`` in the GRAPH, not ``float8e4m3fn``; the bytes
+#     are E4M3 codes but the tensor's own declared element type is plain
+#     ``uint8``, so decoding it requires re-tagging those bytes as
+#     ``float8e4m3fn`` before handing them to a float8-aware decoder -- see
+#     :func:`_decode_e4m3_bytes` below), ``weight_scale_2`` (T3: float32 only
+#     -- "Global fp32 weight scale (scalar)"), ``input_scale`` (optional, T3
+#     -- "Accepted for parity with quantized checkpoints; it is a no-op on
+#     the weight-only FP16/BF16 path and is reserved for the native NVFP4
+#     path on Blackwell" -- confirmed a genuine, documented no-op on the only
+#     path this environment can even construct a model for), ``bias``
+#     (optional, T -- same float16/bfloat16 typing, "[N]"). Output: ``Y`` (T).
+#     One attribute: ``block_size`` (optional int, schema-serialized default
+#     16, doc "Number of consecutive K values that share one E4M3 weight
+#     scale" -- again no stated power-of-two/minimum constraint). The live
+#     schema's own doc string states explicitly: "The output columns `N` and
+#     the contraction dimension `K` are derived from the weight shape: `N =
+#     B.shape[0]` and `K = 2 * B.shape[1]`. `K` must therefore be even" --
+#     ``B``'s own leading axis IS ``N`` here too (confirmed, not assumed by
+#     analogy to ``MatMulNBits`` or to ``MatMulBlockQuantizedFp8Weight``
+#     above), so producer-side pruning is a plain row-slice for this op too;
+#     ``K`` being derived as ``2 * B.shape[1]`` is a structural guarantee
+#     that the ORIGINAL ``K`` is always even -- but a K-axis (consumer-role)
+#     PRUNE that drops an odd number of columns from an interior position can
+#     still produce an odd RESULT, which this section explicitly declines
+#     (see the block-alignment discussion below).
+#
+#   Neither op has ``bits``, ``weight_prepacked``, or ``g_idx`` attributes/
+#   inputs at all (confirmed absent from both live schemas) -- there is
+#   nothing to decline there because there is nothing to guess wrong about:
+#   ``MatMulBlockQuantizedFp8Weight``'s element format is always E4M3
+#   (8-bit), ``MatMulBlockQuantizedFp4Weight``'s is always E2M1 (4-bit,
+#   always 2-packed-per-byte, low nibble first per the doc text quoted
+#   above), full stop, for every matched node.
+#
+# *No CPU kernel exists for either op in this environment* -- confirmed
+# directly, the same way this module's own QMoE ``quant_type='nvfp4'``
+# section comment (point 9) already established for that case: a hand-built,
+# otherwise schema-valid node of EITHER op fails identically at
+# ``onnxruntime.InferenceSession(...)`` construction (even with graph
+# optimization fully disabled, to rule out an optimizer-inserted fp16 cast
+# masking a real kernel) with ``INVALID_GRAPH`` / a precision-free-cast type
+# mismatch on the very first fp16 input -- consistent with both ops' own doc
+# text ("This path is architecture independent and runs on any CUDA
+# architecture (SM80+)" / "runs on Hopper (SM90) as well as Blackwell"):
+# CUDA-only kernels, and ``onnxruntime.get_available_providers()`` returns
+# only ``CPUExecutionProvider``/``AzureExecutionProvider`` here. So, exactly
+# like the QMoE nvfp4 section (and the ``MatMulNBitsMlp``/``MatMulNBitsQkv``
+# section, for its own WebGPU-only-EP reason), this section's own new tests
+# cannot exercise either literal op end to end in this sandbox. Two
+# INDEPENDENT verification strategies stand in, mirroring exactly what those
+# two prior sections each already established:
+#
+#   1. *Byte-identity slice tests* (needs no kernel execution at all, for
+#      either op): every pruned packed tensor is asserted byte-identical
+#      (``np.testing.assert_array_equal`` on raw packed bytes, never
+#      ``assert_allclose``) to a hand-slice of the ORIGINAL quantized
+#      codes/scale bytes -- proving this section only ever moves existing
+#      bytes around, never re-quantizes, independent of whether those bytes
+#      can be executed by anything in this sandbox.
+#   2. *Decomposed-proxy-topology oracle tests* (the same fallback
+#      methodology the ``MatMulNBitsMlp``/``MatMulNBitsQkv`` section's own
+#      top comment documents for its own unrunnable-here fused ops): a
+#      (pruned) node's own packed tensors are dequantized BY HAND -- via this
+#      section's own :func:`_matmul_block_quantized_fp8_dequantized`/
+#      :func:`_matmul_block_quantized_fp4_dequantized`, the exact same
+#      helpers this section's real ranking/pruning code itself calls -- into
+#      a plain float32 weight matrix, wired into an equivalent plain
+#      ``MatMul``/``Gemm`` node, and run through a REAL CPU
+#      ``onnxruntime.InferenceSession`` against an independently-computed
+#      numpy oracle (``A @ W.T + bias``, built from the SAME dequantized
+#      values via a path that never imports this module's own dequantize
+#      helper, so the comparison is a genuine cross-check, not tautological).
+#      This validates the DEQUANTIZATION FORMULA end to end (through a real
+#      kernel) but, unlike ``MatMulNBits``'s own producer/consumer packing
+#      facts, does NOT validate that the literal fused
+#      ``MatMulBlockQuantizedFp4Weight``/``Fp8Weight`` op computes the same
+#      thing a real GPU kernel would -- there is no CPU kernel here to run
+#      that comparison against, for either op, at all.
+#
+#   The E4M3 byte decode itself (both ``Fp8Weight``'s own ``B`` -- already
+#   typed ``float8e4m3fn`` in-graph -- and ``Fp4Weight``'s ``weight_scale``,
+#   raw ``uint8`` bytes re-tagged, per :func:`_decode_e4m3_bytes`) is never
+#   hand-rolled: it goes through ``onnx.numpy_helper.to_array``/
+#   ``from_array``, onnx's own spec-compliant codec (backed by the
+#   independent, third-party ``ml_dtypes`` package -- NOT anything this
+#   module invented), and a byte round-trip through it was verified exact
+#   (``to_array`` then ``from_array`` then re-reading the raw bytes gives
+#   back the identical bytes, for arbitrary random FLOAT8E4M3FN byte
+#   patterns) before this section relied on it for the "slice, don't
+#   recompute" byte-identity guarantee above. The E2M1 (4-bit) decode reuses
+#   this module's own :data:`_E2M1_MAGNITUDE`/:func:`_e2m1_decode` (defined
+#   in the "QMoE (quantized-weight MoE) pruning" section, above this one --
+#   this section is placed AFTER that one specifically so it can reference
+#   those two names by plain backward reference) UNCHANGED: magnitude table
+#   ``{0, 0.5, 1, 1.5, 2, 3, 4, 6}``, signed by the code's own top bit, the
+#   OCP Microscaling (MX) spec's own standard FP4 element format. That
+#   section's own comment already flags this table as schema-derived, never
+#   independently kernel-confirmed (no CPU kernel existed to check it
+#   against there either) -- this section adds one NEW, genuinely
+#   independent cross-check that section did not have available: the
+#   third-party ``ml_dtypes`` package ships its own ``float4_e2m1fn`` numpy
+#   extension dtype, and decoding all 16 possible 4-bit codes through it
+#   (``np.arange(16, dtype=np.uint8).view(ml_dtypes.float4_e2m1fn)``)
+#   reproduces the IDENTICAL magnitude table and sign convention -- an
+#   independent, non-onnxruntime confirmation this module did not previously
+#   have for this exact bit layout, even though it still falls short of a
+#   real kernel run.
+#
+#   ``B``'s own nibble packing for ``Fp4Weight`` is reused from
+#   ``MatMulNBits``'s own :func:`_unpack_nbits_nibbles`/
+#   :func:`_pack_nbits_nibbles` UNCHANGED (bits fixed at 4, no ``bits``
+#   parameter needed) rather than QMoE's differently-named but functionally
+#   identical :func:`_unpack_subbyte`/:func:`_pack_subbyte` -- picked because
+#   this section sits immediately after the ``MatMulNBits`` section and the
+#   live schema's own wording ("two E2M1 4-bit float codes packed per byte,
+#   low nibble first") matches that helper pair's own docstring almost
+#   verbatim. One STRUCTURAL difference from ``MatMulNBits``'s own ``B``
+#   matters here: ``MatMulNBits``'s ``B`` is packed BLOCK-RELATIVE (shape
+#   ``(N, k_blocks, blob_size)``, a fresh byte boundary at every block
+#   start), while ``Fp4Weight``'s ``B`` is packed FLAT across the WHOLE ``K``
+#   axis (shape ``(N, K/2)``, per the schema's own ``K = 2 * B.shape[1]``
+#   formula -- no block dimension in ``B``'s own shape at all). This section
+#   therefore always unpacks/repacks a full ROW's worth of ``K`` nibbles at
+#   once (:func:`_unpack_nbits_nibbles(b, w.K)`), never a per-block slice the
+#   way ``MatMulNBits``'s own producer-row-slice code can get away with for
+#   its block-relative ``B`` -- see :func:`_slice_block_quantized_fp4_consumer_blocks`.
+#
+# The block-alignment principle governing K-axis (consumer-role) pruning is
+# IDENTICAL to ``MatMulNBits``'s own: a block's ``block_size`` K-values share
+# one scale entry (E4M3 byte, for either op here) and cannot be partially
+# dropped without re-deriving that scale from a different, smaller set of
+# elements -- this module never invents new quantized values, only
+# drops/keeps existing ones intact -- so a K-axis prune is only ever applied
+# when the candidate keep-set happens to align to whole ``block_size``
+# blocks (:func:`_matmul_nbits_block_aligned_keep_blocks`, REUSED UNCHANGED
+# from the ``MatMulNBits`` section -- it never depended on that section's own
+# packing details, only on `keep`/`k_blocks`/`block_size` as plain
+# integers), declining the whole chain (both producer and consumer left
+# completely untouched) otherwise. ``Fp4Weight`` adds ONE extra condition on
+# top of that shared check, from its own flat (not block-relative) ``B``
+# packing: the RESULTING ``K`` (``len(keep_blocks) * block_size``) must
+# itself be even, since the schema's own ``K = 2 * B.shape[1]`` formula has
+# no padding-nibble concept -- an odd resulting ``K`` cannot be honestly
+# re-expressed as ``2 * (some integer)`` without either silently padding a
+# wasted nibble (which the schema gives no shape for) or lying about ``K``.
+# :func:`_fp4_block_aligned_keep_blocks` wraps the shared check with this one
+# additional, ``Fp4Weight``-specific decline (odd resulting ``K`` is
+# vanishingly rare in practice -- it only arises when ``block_size`` itself
+# is odd AND an odd number of blocks happens to be kept -- but is checked
+# explicitly rather than silently mishandled).
+#
+# Since neither op has a ``block_size``-power-of-two/minimum requirement
+# documented anywhere in its own live schema (unlike ``MatMulNBits``'s
+# explicit one), this section does NOT invent one -- any ``block_size >= 1``
+# is accepted, so long as ``K`` (the ORIGINAL, unpruned one) is an exact
+# multiple of it. A ``K`` that is NOT an exact multiple of ``block_size`` (a
+# padded, partial final block) is declined at the MATCHER level (the node is
+# never matched at all, reported via ``not_eligible``, exactly like
+# ``MatMulNBits``'s identical stance) for the identical reason that section
+# gives: this section has not verified how a (nonexistent, here) kernel
+# would treat such padding, and getting that wrong would silently corrupt
+# exactly the case this module's own test philosophy exists to catch.
+#
+# Producer-side (N-axis, output channels) pruning is, for BOTH ops, a plain,
+# un-blocked row-slice of ``B``/scale-table/``bias`` -- there is no
+# nibble-parity hazard on this axis for EITHER op, unlike ``MatMulNBits``'s
+# own packed ``zero_points`` (which packs along the BLOCK axis, not the row
+# axis): ``Fp8Weight``'s ``B`` has no packing at all, and ``Fp4Weight``'s
+# ``B``, while flat-packed across the FULL ``K`` axis, packs entirely WITHIN
+# each row -- a byte never straddles two different ``N`` rows, so a row
+# subset (any count, any indices) is always whole-byte-safe. Neither op's
+# own scale table (``b_scale``/``weight_scale``) is packed along ``N`` at
+# all (one full byte per ``(n, block)`` pair for both), so no unpack/repack
+# is ever needed there either -- genuinely simpler than ``MatMulNBits``'s own
+# producer-side ``zero_points`` handling, not merely superficially so.
+#
+# A GLOBAL (not per-row/per-block) scalar operand -- ``Fp8Weight``'s optional
+# ``a_scale``, ``Fp4Weight``'s ``weight_scale_2`` (required) and optional
+# ``input_scale`` -- is NEVER sliced, in EITHER role: each applies uniformly
+# to every element of the weight/activation regardless of which rows/blocks
+# survive (confirmed directly from the dequantization formula each schema's
+# own doc string states: ``fp8_e4m3(B[n,k]) * b_scale[n, k/block_size]`` for
+# ``Fp8Weight`` -- ``a_scale`` doesn't even appear in that formula, it only
+# governs how ``A`` itself is quantized, uniformly, before the matmul --
+# and ``e2m1(B) * weight_scale_2 * e4m3(weight_scale[n, k/block_size])`` for
+# ``Fp4Weight``, where ``weight_scale_2`` is a single float multiplying
+# every element identically). Because of this, this section deliberately
+# DEPARTS from the blanket "every operand needs a single-consumer check"
+# posture ``MatMulNBits``'s own matcher applies uniformly to every one of
+# its operands: for THESE two ops, the single-consumer tied-tensor bar is
+# only applied to the operands this section's own producer/consumer roles
+# actually SLICE (``B``, the scale table, and ``bias``) -- never to
+# ``a_scale``/``weight_scale_2``/``input_scale``, which this section proves
+# above are never written back at all, in either role, so a model where one
+# global calibration scale is legitimately shared across many quantized
+# layers (a realistic, common export shape) is not needlessly blocked from
+# being pruned at all. This is a deliberate, reasoned refinement over
+# blindly mirroring ``MatMulNBits``'s own blanket policy, not an oversight --
+# flagged explicitly here because it is a genuine, load-bearing difference
+# from this module's usual default.
+#
+# Scope boundaries this section lands on, deliberately, mirroring this
+# module's own conservative-decline posture everywhere else:
+#
+#   * A chain's two sides need not both be the SAME one of these two ops: a
+#     ``MatMulBlockQuantizedFp8Weight`` (or ``Fp4Weight``) producer/consumer
+#     may instead pair with a plain-float (directly-constant float32/
+#     float16/bfloat16 weight, no QDQ) ``MatMul``/vanilla-``Gemm`` on the
+#     OTHER side, reusing :func:`_match_plain_matmul_nbits_peer`/
+#     :class:`_PlainMatMulNBitsPeer` UNCHANGED from the ``MatMulNBits``
+#     section -- the identical embedding/``lm_head``-boundary shape that
+#     section's own top comment motivates this mixing for. A plain-float-to-
+#     plain-float pair is :func:`apply_structured_pruning`'s own job, not
+#     duplicated here.
+#   * ``Fp8Weight`` and ``Fp4Weight`` are NEVER mixed with EACH OTHER in one
+#     chain, and NEITHER is ever mixed with a ``MatMulNBits``
+#     (int4/int8-block-quantized) or QDQ (``DequantizeLinear``-fed
+#     int8/uint8) node either -- every one of these is a genuinely different
+#     quantization scheme with its own dequantize/requantize path, and
+#     composing pruning correctly across two DIFFERENT schemes in one chain
+#     is a real but separate extension this section does not attempt, the
+#     same stance ``MatMulNBits``'s own section takes toward QDQ.
+#   * No grouped/gated (SwiGLU/GeGLU) pair, residual/skip-connection merge,
+#     or Concat-merged branch group is matched -- only the plain single
+#     producer -> [zero or more shape-preserving unary activations,
+#     `_UNARY_PASS_THROUGH`] -> single consumer topology, identical in
+#     spirit to ``MatMulNBits``'s own base (non-gated, non-fused) chain
+#     matching. Nor is there a ``MatMulNBitsMlp``/``MatMulNBitsQkv``-style
+#     fused-op analogue for either op: no such ORT graph-optimizer fusion of
+#     ``MatMulBlockQuantizedFp4Weight``/``Fp8Weight`` is known to exist as of
+#     this writing (unlike ``MatMulNBits``, which the WebGPU EP's own
+#     optimizer routinely fuses into ``MatMulNBitsMlp``/``MatMulNBitsQkv``) --
+#     a genuine follow-up if/when ORT ever adds one, not attempted here.
+#   * K-axis (input/hidden-dimension) pruning is reachable ONLY through the
+#     CONSUMER role of an already-matched chain (exactly ``MatMulNBits``'s
+#     own scope) -- there is no standalone "prune this op's own K axis in
+#     isolation" entry point, mirroring that every other pass in this module
+#     only ever prunes an op's reduction axis as the downstream half of a
+#     producer/consumer pair, never on its own.
+#   * A shared/tied ``B``/scale-table/``bias`` tensor (read by more than one
+#     node) is declined by the matcher itself, the same bar every other
+#     matcher in this module is held to for the operands it actually slices
+#     (see the ``a_scale``/``weight_scale_2``/``input_scale`` carve-out
+#     above for the one deliberate exception).
+#   * A padded partial final block (``K`` not an exact multiple of
+#     ``block_size``) is declined at the matcher level, for both ops (see
+#     above).
+
+
+def _decode_e4m3_bytes(raw: np.ndarray) -> np.ndarray:
+    """Decodes `raw` (a plain ``uint8`` numpy array whose bytes are
+    FLOAT8E4M3FN codes -- e.g. :func:`_match_matmul_block_quantized_fp4`'s
+    own ``weight_scale``, typed ``uint8`` in the GRAPH even though its bytes
+    are E4M3, per this section's own top comment) to ``float64``, via a
+    freshly-built, ``raw_data``-backed ``FLOAT8E4M3FN``-tagged
+    ``TensorProto`` fed through ``onnx.numpy_helper.to_array`` -- onnx's own
+    spec-compliant codec (backed by the independent ``ml_dtypes`` package),
+    never a hand-rolled bit decode. Building a FRESH tensor (rather than
+    mutating a copy of the original ``uint8``-typed one in place) sidesteps
+    any doubt about whether the original tensor's own bytes live in
+    ``raw_data`` or a field-based encoding (``int32_data`` etc.) -- `raw` is
+    first materialized as a plain numpy array (:func:`onnx.numpy_helper.to_array`
+    already normalizes either storage), THEN re-encoded fresh as
+    ``raw_data``, so this works regardless of how the original tensor was
+    built.
+    """
+    t = onnx.TensorProto()
+    t.data_type = onnx.TensorProto.FLOAT8E4M3FN
+    t.dims.extend(raw.shape)
+    t.raw_data = np.ascontiguousarray(raw, dtype=np.uint8).tobytes()
+    return onnx.numpy_helper.to_array(t).astype(np.float64)
+
+
+@dataclass(frozen=True)
+class _BlockQuantizedFp8Weight:
+    """A matched ``com.microsoft::MatMulBlockQuantizedFp8Weight`` node's
+    weight operands -- see this section's own top comment for the schema
+    facts this depends on (empirically confirmed, not assumed).
+    """
+
+    node: onnx.NodeProto
+    b_init: onnx.TensorProto
+    b_scale_init: onnx.TensorProto
+    a_scale_init: Optional[onnx.TensorProto]
+    bias_init: Optional[onnx.TensorProto]
+    N: int
+    K: int
+    block_size: int
+    k_blocks: int
+
+
+@dataclass(frozen=True)
+class _BlockQuantizedFp4Weight:
+    """A matched ``com.microsoft::MatMulBlockQuantizedFp4Weight`` node's
+    weight operands -- see this section's own top comment for the schema
+    facts this depends on (empirically confirmed, not assumed).
+    ``weight_scale_init`` is typed ``uint8`` in the graph (raw E4M3 bytes,
+    per the live schema) -- decode via :func:`_decode_e4m3_bytes`, never
+    ``onnx.numpy_helper.to_array`` directly (which would read it as plain
+    integers, not float8 codes).
+    """
+
+    node: onnx.NodeProto
+    b_init: onnx.TensorProto
+    weight_scale_init: onnx.TensorProto
+    weight_scale_2_init: onnx.TensorProto
+    input_scale_init: Optional[onnx.TensorProto]
+    bias_init: Optional[onnx.TensorProto]
+    N: int
+    K: int
+    block_size: int
+    k_blocks: int
+
+
+_Fp8ChainSide = Union[_BlockQuantizedFp8Weight, _PlainMatMulNBitsPeer]
+_Fp4ChainSide = Union[_BlockQuantizedFp4Weight, _PlainMatMulNBitsPeer]
+
+_BLOCK_QUANTIZED_BIAS_DTYPES = (onnx.TensorProto.FLOAT16, onnx.TensorProto.BFLOAT16)
+
+
+def _block_quantized_scalar_dims_ok(dims: List[int]) -> bool:
+    """True for a 0-D (``[]``) or single-element 1-D (``[1]``) shape -- the
+    two ways a "scalar" global scale (``a_scale``/``weight_scale_2``/
+    ``input_scale``) might reasonably be exported, since none of the three
+    live schemas pin down which of the two conventions to expect.
+    """
+    return dims in ([], [1])
+
+
+def _match_matmul_block_quantized_fp8(
+    node: onnx.NodeProto,
+    initializer_map: Dict[str, onnx.TensorProto],
+    consumers_of: Dict[str, List[onnx.NodeProto]],
+) -> Optional[_BlockQuantizedFp8Weight]:
+    """If `node` is a ``com.microsoft::MatMulBlockQuantizedFp8Weight`` node
+    matching every scope boundary this section's own top comment documents,
+    returns the match. ``None`` whenever anything is ambiguous or out of the
+    empirically-verified scope, rather than guessing.
+    """
+    if (
+        node.op_type != "MatMulBlockQuantizedFp8Weight"
+        or node.domain != "com.microsoft"
+    ):
+        return None
+    if len(node.input) < 3 or len(node.output) != 1:
+        return None
+    a_name, b_name, scale_name = node.input[0], node.input[1], node.input[2]
+    if not a_name or not b_name or not scale_name:
+        return None
+    a_scale_name = node.input[3] if len(node.input) > 3 and node.input[3] else None
+    bias_name = node.input[4] if len(node.input) > 4 and node.input[4] else None
+
+    block_size = _matmul_nbits_int_attr(node, "block_size", 128)
+    if block_size is None or block_size < 1:
+        return None
+
+    b_init = initializer_map.get(b_name)
+    scale_init = initializer_map.get(scale_name)
+    if b_init is None or scale_init is None:
+        return None  # non-constant B/b_scale -- can't safely slice them
+    if b_init.data_type != onnx.TensorProto.FLOAT8E4M3FN:
+        return None
+    dims = tuple(b_init.dims)
+    if len(dims) != 2:
+        return None
+    n, k = dims
+    if n <= 0 or k <= 0 or k % block_size != 0:
+        return None  # padded/partial final block -- declined, see section comment
+    k_blocks = k // block_size
+
+    if scale_init.data_type != onnx.TensorProto.FLOAT:
+        return None
+    if list(scale_init.dims) != [n, k_blocks]:
+        return None
+
+    a_scale_init = None
+    if a_scale_name is not None:
+        a_scale_init = initializer_map.get(a_scale_name)
+        if a_scale_init is None or a_scale_init.data_type != onnx.TensorProto.FLOAT:
+            return None  # non-constant, or dtype-mismatched, a_scale
+        if not _block_quantized_scalar_dims_ok(list(a_scale_init.dims)):
+            return None
+
+    bias_init = None
+    if bias_name is not None:
+        bias_init = initializer_map.get(bias_name)
+        if bias_init is None or bias_init.data_type not in _BLOCK_QUANTIZED_BIAS_DTYPES:
+            return None  # non-constant, or dtype-mismatched, bias
+        if list(bias_init.dims) != [n]:
+            return None
+
+    # Single-consumer bar applies only to operands this section's own
+    # producer/consumer roles actually slice (B/b_scale/bias) -- NOT to
+    # a_scale, which this section's own top comment proves is never
+    # written back in either role, so sharing it across many nodes is
+    # harmless (a deliberate departure from MatMulNBits's own blanket
+    # policy, see that comment).
+    for nm in (b_name, scale_name) + ((bias_name,) if bias_name else ()):
+        if len(consumers_of.get(nm, [])) != 1:
+            return None  # shared/tied tensor -- another node reads it too
+
+    return _BlockQuantizedFp8Weight(
+        node=node,
+        b_init=b_init,
+        b_scale_init=scale_init,
+        a_scale_init=a_scale_init,
+        bias_init=bias_init,
+        N=n,
+        K=k,
+        block_size=block_size,
+        k_blocks=k_blocks,
+    )
+
+
+def _match_matmul_block_quantized_fp4(
+    node: onnx.NodeProto,
+    initializer_map: Dict[str, onnx.TensorProto],
+    consumers_of: Dict[str, List[onnx.NodeProto]],
+) -> Optional[_BlockQuantizedFp4Weight]:
+    """If `node` is a ``com.microsoft::MatMulBlockQuantizedFp4Weight`` node
+    matching every scope boundary this section's own top comment documents,
+    returns the match. ``None`` whenever anything is ambiguous or out of the
+    empirically-verified scope, rather than guessing.
+    """
+    if (
+        node.op_type != "MatMulBlockQuantizedFp4Weight"
+        or node.domain != "com.microsoft"
+    ):
+        return None
+    if len(node.input) < 4 or len(node.output) != 1:
+        return None
+    a_name, b_name, ws_name, ws2_name = (
+        node.input[0],
+        node.input[1],
+        node.input[2],
+        node.input[3],
+    )
+    if not a_name or not b_name or not ws_name or not ws2_name:
+        return None
+    input_scale_name = node.input[4] if len(node.input) > 4 and node.input[4] else None
+    bias_name = node.input[5] if len(node.input) > 5 and node.input[5] else None
+
+    block_size = _matmul_nbits_int_attr(node, "block_size", 16)
+    if block_size is None or block_size < 1:
+        return None
+
+    b_init = initializer_map.get(b_name)
+    ws_init = initializer_map.get(ws_name)
+    ws2_init = initializer_map.get(ws2_name)
+    if b_init is None or ws_init is None or ws2_init is None:
+        return None  # non-constant B/weight_scale/weight_scale_2
+    if b_init.data_type != onnx.TensorProto.UINT8:
+        return None
+    dims = tuple(b_init.dims)
+    if len(dims) != 2:
+        return None
+    n, half_k = dims
+    k = 2 * half_k  # schema: "K = 2 * B.shape[1]" -- always even
+    if n <= 0 or k <= 0 or k % block_size != 0:
+        return None  # padded/partial final block -- declined, see section comment
+    k_blocks = k // block_size
+
+    if ws_init.data_type != onnx.TensorProto.UINT8:
+        return None  # raw E4M3 bytes stored as uint8, per the live schema
+    if list(ws_init.dims) != [n, k_blocks]:
+        return None
+
+    if ws2_init.data_type != onnx.TensorProto.FLOAT:
+        return None
+    if not _block_quantized_scalar_dims_ok(list(ws2_init.dims)):
+        return None
+
+    input_scale_init = None
+    if input_scale_name is not None:
+        input_scale_init = initializer_map.get(input_scale_name)
+        if (
+            input_scale_init is None
+            or input_scale_init.data_type != onnx.TensorProto.FLOAT
+        ):
+            return None
+        if not _block_quantized_scalar_dims_ok(list(input_scale_init.dims)):
+            return None
+
+    bias_init = None
+    if bias_name is not None:
+        bias_init = initializer_map.get(bias_name)
+        if bias_init is None or bias_init.data_type not in _BLOCK_QUANTIZED_BIAS_DTYPES:
+            return None
+        if list(bias_init.dims) != [n]:
+            return None
+
+    # Single-consumer bar applies only to B/weight_scale/bias -- NOT to
+    # weight_scale_2/input_scale, see this section's own top comment.
+    for nm in (b_name, ws_name) + ((bias_name,) if bias_name else ()):
+        if len(consumers_of.get(nm, [])) != 1:
+            return None  # shared/tied tensor -- another node reads it too
+
+    return _BlockQuantizedFp4Weight(
+        node=node,
+        b_init=b_init,
+        weight_scale_init=ws_init,
+        weight_scale_2_init=ws2_init,
+        input_scale_init=input_scale_init,
+        bias_init=bias_init,
+        N=n,
+        K=k,
+        block_size=block_size,
+        k_blocks=k_blocks,
+    )
+
+
+def _matmul_block_quantized_fp8_dequantized(w: _BlockQuantizedFp8Weight) -> np.ndarray:
+    """The full float64 ``(N, K)`` dequantized weight matrix `w` refers to,
+    for IMPORTANCE RANKING ONLY -- never written back to the graph (this
+    module's own "slice, don't recompute" principle). Formula per this
+    section's own top comment, read directly off the live schema's own doc
+    string: ``dequantized[n, k] = fp8_e4m3(B[n, k]) * b_scale[n, k //
+    block_size]``.
+    """
+    b = onnx.numpy_helper.to_array(w.b_init).astype(np.float64)  # [N, K]
+    scale = _to_f64(w.b_scale_init)  # [N, k_blocks]
+    scale_expanded = np.repeat(scale, w.block_size, axis=1)  # [N, K]
+    return b * scale_expanded
+
+
+def _matmul_block_quantized_fp4_dequantized(w: _BlockQuantizedFp4Weight) -> np.ndarray:
+    """The full float64 ``(N, K)`` dequantized weight matrix `w` refers to,
+    for IMPORTANCE RANKING ONLY -- never written back to the graph. Formula
+    per this section's own top comment: ``dequantized[n, k] = e2m1(B[n, k])
+    * weight_scale_2 * e4m3(weight_scale[n, k // block_size])``. Reuses
+    :func:`_unpack_nbits_nibbles` (``B``'s own flat, whole-row nibble
+    packing) and :func:`_e2m1_decode`/:data:`_E2M1_MAGNITUDE` (the QMoE
+    nvfp4 section's own E2M1 table, unchanged) for the weight codes, and
+    :func:`_decode_e4m3_bytes` for `weight_scale`'s own raw uint8-tagged
+    E4M3 bytes.
+    """
+    b = onnx.numpy_helper.to_array(w.b_init)  # [N, K/2] uint8, packed
+    codes = _unpack_nbits_nibbles(b, w.K)  # [N, K] uint8 in [0, 16)
+    mag = _e2m1_decode(codes)  # [N, K] float64
+    scale = _decode_e4m3_bytes(
+        onnx.numpy_helper.to_array(w.weight_scale_init)
+    )  # [N, k_blocks] float64
+    scale_expanded = np.repeat(scale, w.block_size, axis=1)  # [N, K]
+    global_scale = float(
+        onnx.numpy_helper.to_array(w.weight_scale_2_init).reshape(()).astype(np.float64)
+    )
+    return mag * scale_expanded * global_scale
+
+
+def _slice_block_quantized_fp8_producer_rows(
+    w: _BlockQuantizedFp8Weight, keep: np.ndarray
+) -> None:
+    """Slices `w`'s own N (output-channel) axis to `keep` (ascending
+    indices) -- the producer role. `B`/`b_scale`/`bias` (if present) are all
+    row-sliced directly -- their leading dim IS `N`, and NEITHER is packed
+    along `N` at all (see this section's own top comment), so this is a
+    plain row-slice with no nibble/byte-parity hazard whatsoever. `a_scale`
+    (a single global scalar, if present) is never touched -- see this
+    section's own top comment.
+    """
+    b = onnx.numpy_helper.to_array(w.b_init)
+    w.b_init.CopyFrom(onnx.numpy_helper.from_array(b[keep], name=w.b_init.name))
+
+    scale = onnx.numpy_helper.to_array(w.b_scale_init)
+    w.b_scale_init.CopyFrom(
+        onnx.numpy_helper.from_array(scale[keep], name=w.b_scale_init.name)
+    )
+
+    if w.bias_init is not None:
+        bias = onnx.numpy_helper.to_array(w.bias_init)
+        w.bias_init.CopyFrom(
+            onnx.numpy_helper.from_array(bias[keep], name=w.bias_init.name)
+        )
+
+
+def _slice_block_quantized_fp4_producer_rows(
+    w: _BlockQuantizedFp4Weight, keep: np.ndarray
+) -> None:
+    """Slices `w`'s own N (output-channel) axis to `keep` (ascending
+    indices) -- the producer role. `B` is packed FLAT across the whole `K`
+    axis (per this section's own top comment) but never ACROSS rows -- a
+    byte never straddles two different `N` rows -- so a row-slice is
+    whole-byte-safe with no unpack/repack needed at all, unlike this same
+    axis's own scale table on ``MatMulNBits``'s ``zero_points``.
+    `weight_scale`/`bias` (if present) are plain row-slices too (neither is
+    packed along `N`). `weight_scale_2`/`input_scale` (single global
+    scalars, if present) are never touched -- see this section's own top
+    comment.
+    """
+    b = onnx.numpy_helper.to_array(w.b_init)
+    w.b_init.CopyFrom(onnx.numpy_helper.from_array(b[keep], name=w.b_init.name))
+
+    ws = onnx.numpy_helper.to_array(w.weight_scale_init)
+    w.weight_scale_init.CopyFrom(
+        onnx.numpy_helper.from_array(ws[keep], name=w.weight_scale_init.name)
+    )
+
+    if w.bias_init is not None:
+        bias = onnx.numpy_helper.to_array(w.bias_init)
+        w.bias_init.CopyFrom(
+            onnx.numpy_helper.from_array(bias[keep], name=w.bias_init.name)
+        )
+
+
+def _block_quantized_keep_elems(keep_blocks: np.ndarray, block_size: int) -> np.ndarray:
+    """Expands ascending BLOCK indices `keep_blocks` into ascending ELEMENT
+    indices (every element of every kept block, in order) -- every block
+    here is full-width (:func:`_match_matmul_block_quantized_fp8`/
+    :func:`_match_matmul_block_quantized_fp4` already decline any `K` not an
+    exact multiple of `block_size`, so there is no partial *final* block to
+    special-case).
+    """
+    if len(keep_blocks) == 0:
+        return np.zeros(0, dtype=np.int64)
+    starts = keep_blocks.astype(np.int64) * block_size
+    offsets = np.arange(block_size, dtype=np.int64)
+    return (starts[:, None] + offsets[None, :]).reshape(-1)
+
+
+def _slice_block_quantized_fp8_consumer_blocks(
+    w: _BlockQuantizedFp8Weight, keep_blocks: np.ndarray
+) -> None:
+    """Drops entire `k_blocks`-axis blocks NOT in `keep_blocks` (ascending
+    block indices) from `w`'s own `B`/`b_scale` -- the consumer role. Never
+    invoked with a non-block-aligned `keep_blocks` (see
+    :func:`_matmul_nbits_block_aligned_keep_blocks`, which computes and
+    validates it before this is called). `B` has NO sub-byte packing at all
+    for this op (see this section's own top comment), so the element-level
+    column slice is direct -- no unpack/repack needed, unlike
+    ``MatMulNBits``'s or ``Fp4Weight``'s own packed `B`.
+    """
+    keep_elems = _block_quantized_keep_elems(keep_blocks, w.block_size)
+    b = onnx.numpy_helper.to_array(w.b_init)
+    w.b_init.CopyFrom(
+        onnx.numpy_helper.from_array(b[:, keep_elems], name=w.b_init.name)
+    )
+
+    scale = onnx.numpy_helper.to_array(w.b_scale_init)
+    w.b_scale_init.CopyFrom(
+        onnx.numpy_helper.from_array(scale[:, keep_blocks], name=w.b_scale_init.name)
+    )
+
+
+def _fp4_block_aligned_keep_blocks(
+    keep: np.ndarray, k_blocks: int, block_size: int
+) -> Optional[np.ndarray]:
+    """:func:`_matmul_nbits_block_aligned_keep_blocks`, reused unchanged,
+    plus ONE additional ``Fp4Weight``-specific decline: the resulting `K`
+    (``len(keep_blocks) * block_size``) must itself be even, since this
+    op's own `B` has no padding-nibble concept (the live schema derives `K`
+    as exactly ``2 * B.shape[1]``, see this section's own top comment) --
+    an odd resulting `K` cannot be honestly represented without either a
+    silently wasted nibble or a lie about `K`, so that keep-set is declined
+    here too (returns ``None``, the same "leave this chain completely
+    untouched" outcome a non-block-aligned keep-set already gets).
+    """
+    keep_blocks = _matmul_nbits_block_aligned_keep_blocks(keep, k_blocks, block_size)
+    if keep_blocks is None:
+        return None
+    if (len(keep_blocks) * block_size) % 2 != 0:
+        return None  # resulting K would be odd -- declined, see this
+        # function's own docstring
+    return keep_blocks
+
+
+def _slice_block_quantized_fp4_consumer_blocks(
+    w: _BlockQuantizedFp4Weight, keep_blocks: np.ndarray
+) -> None:
+    """Drops entire `k_blocks`-axis blocks NOT in `keep_blocks` (ascending
+    block indices) from `w`'s own `B`/`weight_scale` -- the consumer role.
+    Never invoked with a keep-set :func:`_fp4_block_aligned_keep_blocks`
+    didn't already validate (block-aligned AND even resulting `K`). Unlike
+    the producer-side row-slice above, `B` genuinely must be
+    unpacked/re-sliced/re-packed here: its own nibble packing is FLAT
+    across the whole `K` axis (not block-relative like ``MatMulNBits``'s own
+    `B`), so this always unpacks a FULL row's worth of `K` nibbles
+    (:func:`_unpack_nbits_nibbles`), takes the kept element positions, and
+    re-packs (:func:`_pack_nbits_nibbles`) -- exact and padding-free because
+    :func:`_fp4_block_aligned_keep_blocks` already guarantees an even
+    element count. `weight_scale` has no packing along this axis at all (one
+    raw E4M3 byte per `(n, block)` pair), so it is a plain block-index
+    column slice.
+    """
+    keep_elems = _block_quantized_keep_elems(keep_blocks, w.block_size)
+    b = onnx.numpy_helper.to_array(w.b_init)
+    codes = _unpack_nbits_nibbles(b, w.K)
+    kept_codes = codes[:, keep_elems]
+    repacked = _pack_nbits_nibbles(kept_codes)
+    w.b_init.CopyFrom(onnx.numpy_helper.from_array(repacked, name=w.b_init.name))
+
+    ws = onnx.numpy_helper.to_array(w.weight_scale_init)
+    w.weight_scale_init.CopyFrom(
+        onnx.numpy_helper.from_array(ws[:, keep_blocks], name=w.weight_scale_init.name)
+    )
+
+
+def _fp8_chain_side_key(side: _Fp8ChainSide) -> str:
+    """Mirrors :func:`_matmul_nbits_chain_side_key`: a name uniquely
+    identifying the underlying weight tensor `side` resolves to.
+    """
+    if isinstance(side, _BlockQuantizedFp8Weight):
+        return side.b_init.name
+    return side.w_init.name
+
+
+def _fp4_chain_side_key(side: _Fp4ChainSide) -> str:
+    if isinstance(side, _BlockQuantizedFp4Weight):
+        return side.b_init.name
+    return side.w_init.name
+
+
+def _fp8_chain_producer_weight_nk(side: _Fp8ChainSide) -> np.ndarray:
+    """Mirrors :func:`_matmul_nbits_chain_producer_weight_nk`: ``[N, K]``
+    float64 view of one chain PRODUCER's own weight, for IMPORTANCE RANKING
+    ONLY.
+    """
+    if isinstance(side, _BlockQuantizedFp8Weight):
+        return _matmul_block_quantized_fp8_dequantized(side)
+    w = _to_f64(side.w_init)
+    return w if side.weight_transposed else w.T
+
+
+def _fp4_chain_producer_weight_nk(side: _Fp4ChainSide) -> np.ndarray:
+    if isinstance(side, _BlockQuantizedFp4Weight):
+        return _matmul_block_quantized_fp4_dequantized(side)
+    w = _to_f64(side.w_init)
+    return w if side.weight_transposed else w.T
+
+
+def _slice_fp8_chain_producer(side: _Fp8ChainSide, keep: np.ndarray) -> None:
+    if isinstance(side, _BlockQuantizedFp8Weight):
+        _slice_block_quantized_fp8_producer_rows(side, keep)
+        return
+    _slice_producer_weight(side.w_init, side.weight_transposed, keep, is_conv=False)
+    if side.bias_init is not None:
+        bias = onnx.numpy_helper.to_array(side.bias_init)
+        side.bias_init.CopyFrom(
+            onnx.numpy_helper.from_array(bias[keep], name=side.bias_init.name)
+        )
+
+
+def _slice_fp4_chain_producer(side: _Fp4ChainSide, keep: np.ndarray) -> None:
+    if isinstance(side, _BlockQuantizedFp4Weight):
+        _slice_block_quantized_fp4_producer_rows(side, keep)
+        return
+    _slice_producer_weight(side.w_init, side.weight_transposed, keep, is_conv=False)
+    if side.bias_init is not None:
+        bias = onnx.numpy_helper.to_array(side.bias_init)
+        side.bias_init.CopyFrom(
+            onnx.numpy_helper.from_array(bias[keep], name=side.bias_init.name)
+        )
+
+
+def _slice_fp8_chain_consumer(side: _Fp8ChainSide, keep: np.ndarray) -> None:
+    if isinstance(side, _BlockQuantizedFp8Weight):
+        _slice_block_quantized_fp8_consumer_blocks(side, keep)
+        return
+    _slice_consumer_weight(side.w_init, side.weight_transposed, keep, is_conv=False)
+
+
+def _slice_fp4_chain_consumer(side: _Fp4ChainSide, keep: np.ndarray) -> None:
+    if isinstance(side, _BlockQuantizedFp4Weight):
+        _slice_block_quantized_fp4_consumer_blocks(side, keep)
+        return
+    _slice_consumer_weight(side.w_init, side.weight_transposed, keep, is_conv=False)
+
+
+@dataclass(frozen=True)
+class _BlockQuantizedFp8Chain:
+    producer: _Fp8ChainSide
+    chain_ops: Tuple[onnx.NodeProto, ...]
+    consumer: _Fp8ChainSide
+    n_channels: int
+
+
+@dataclass(frozen=True)
+class _BlockQuantizedFp4Chain:
+    producer: _Fp4ChainSide
+    chain_ops: Tuple[onnx.NodeProto, ...]
+    consumer: _Fp4ChainSide
+    n_channels: int
+
+
+def _walk_to_fp8_consumer(
+    start: str,
+    initializer_map: Dict[str, onnx.TensorProto],
+    consumers_of: Dict[str, List[onnx.NodeProto]],
+    graph_outputs: Set[str],
+    n_channels: int,
+    max_hops: int,
+) -> Optional[Tuple[_Fp8ChainSide, Tuple[onnx.NodeProto, ...]]]:
+    """Mirrors :func:`_walk_to_matmul_nbits_consumer`: from tensor `start`,
+    walks forward through shape-preserving unary activations with no other
+    consumer anywhere along the way, until EITHER a
+    ``MatMulBlockQuantizedFp8Weight`` consumer OR a plain-float
+    MatMul/vanilla-Gemm consumer is found whose input-channel count matches
+    `n_channels`. No gated pair, no branch, never a ``Fp4Weight``/
+    ``MatMulNBits``/QDQ consumer (see this section's own top comment).
+    """
+    chain_ops: List[onnx.NodeProto] = []
+    cur = start
+    for _hop in range(max_hops):
+        candidates = consumers_of.get(cur, [])
+        if len(candidates) != 1:
+            return None
+        nxt = candidates[0]
+
+        if (
+            nxt.op_type == "MatMulBlockQuantizedFp8Weight"
+            and nxt.domain == "com.microsoft"
+            and len(nxt.input) > 0
+            and nxt.input[0] == cur
+        ):
+            w = _match_matmul_block_quantized_fp8(nxt, initializer_map, consumers_of)
+            if w is None or w.K != n_channels:
+                return None
+            return w, tuple(chain_ops)
+
+        mm = _match_matmul_like(nxt)
+        if mm is not None and mm[0] == cur:
+            peer = _match_plain_matmul_nbits_peer(nxt, initializer_map, consumers_of)
+            if peer is None or peer.in_channels != n_channels:
+                return None
+            return peer, tuple(chain_ops)
+
+        if not (
+            nxt.op_type in _UNARY_PASS_THROUGH
+            and list(nxt.input) == [cur]
+            and len(nxt.output) == 1
+        ):
+            return None
+        out2 = nxt.output[0]
+        if len(consumers_of.get(out2, [])) != 1 or out2 in graph_outputs:
+            return None
+        chain_ops.append(nxt)
+        cur = out2
+    return None
+
+
+def _walk_to_fp4_consumer(
+    start: str,
+    initializer_map: Dict[str, onnx.TensorProto],
+    consumers_of: Dict[str, List[onnx.NodeProto]],
+    graph_outputs: Set[str],
+    n_channels: int,
+    max_hops: int,
+) -> Optional[Tuple[_Fp4ChainSide, Tuple[onnx.NodeProto, ...]]]:
+    """``Fp4Weight`` analogue of :func:`_walk_to_fp8_consumer` -- see that
+    function's own docstring.
+    """
+    chain_ops: List[onnx.NodeProto] = []
+    cur = start
+    for _hop in range(max_hops):
+        candidates = consumers_of.get(cur, [])
+        if len(candidates) != 1:
+            return None
+        nxt = candidates[0]
+
+        if (
+            nxt.op_type == "MatMulBlockQuantizedFp4Weight"
+            and nxt.domain == "com.microsoft"
+            and len(nxt.input) > 0
+            and nxt.input[0] == cur
+        ):
+            w = _match_matmul_block_quantized_fp4(nxt, initializer_map, consumers_of)
+            if w is None or w.K != n_channels:
+                return None
+            return w, tuple(chain_ops)
+
+        mm = _match_matmul_like(nxt)
+        if mm is not None and mm[0] == cur:
+            peer = _match_plain_matmul_nbits_peer(nxt, initializer_map, consumers_of)
+            if peer is None or peer.in_channels != n_channels:
+                return None
+            return peer, tuple(chain_ops)
+
+        if not (
+            nxt.op_type in _UNARY_PASS_THROUGH
+            and list(nxt.input) == [cur]
+            and len(nxt.output) == 1
+        ):
+            return None
+        out2 = nxt.output[0]
+        if len(consumers_of.get(out2, [])) != 1 or out2 in graph_outputs:
+            return None
+        chain_ops.append(nxt)
+        cur = out2
+    return None
+
+
+def _find_fp8_block_quantized_chains(
+    graph: onnx.GraphProto,
+) -> List[_BlockQuantizedFp8Chain]:
+    """Mirrors :func:`_find_matmul_nbits_chains`: every producer/consumer
+    pair connected by :func:`_walk_to_fp8_consumer` where AT LEAST ONE side
+    is a ``MatMulBlockQuantizedFp8Weight`` node (a plain-float-to-plain-
+    float pair is :func:`apply_structured_pruning`'s own job).
+    """
+    initializer_map = {t.name: t for t in graph.initializer}
+    consumers_of = _consumers_of(graph)
+    graph_outputs = {o.name for o in graph.output}
+
+    def _is_internal(name: str) -> bool:
+        return len(consumers_of.get(name, [])) == 1 and name not in graph_outputs
+
+    chains: List[_BlockQuantizedFp8Chain] = []
+    for node in graph.node:
+        producer: _Fp8ChainSide
+        n_channels: int
+        if (
+            node.op_type == "MatMulBlockQuantizedFp8Weight"
+            and node.domain == "com.microsoft"
+        ):
+            w = _match_matmul_block_quantized_fp8(node, initializer_map, consumers_of)
+            if w is None:
+                continue
+            producer, n_channels = w, w.N
+        else:
+            peer = _match_plain_matmul_nbits_peer(node, initializer_map, consumers_of)
+            if peer is None:
+                continue
+            producer, n_channels = peer, peer.out_channels
+
+        out_name = node.output[0]
+        if not _is_internal(out_name):
+            continue
+        found = _walk_to_fp8_consumer(
+            out_name,
+            initializer_map,
+            consumers_of,
+            graph_outputs,
+            n_channels,
+            _MAX_CHAIN_HOPS,
+        )
+        if found is None:
+            continue
+        consumer, chain_ops = found
+        if isinstance(producer, _PlainMatMulNBitsPeer) and isinstance(
+            consumer, _PlainMatMulNBitsPeer
+        ):
+            continue  # both plain float -- apply_structured_pruning's own job
+        chains.append(
+            _BlockQuantizedFp8Chain(producer, chain_ops, consumer, n_channels)
+        )
+    return chains
+
+
+def _find_fp4_block_quantized_chains(
+    graph: onnx.GraphProto,
+) -> List[_BlockQuantizedFp4Chain]:
+    """``Fp4Weight`` analogue of :func:`_find_fp8_block_quantized_chains`."""
+    initializer_map = {t.name: t for t in graph.initializer}
+    consumers_of = _consumers_of(graph)
+    graph_outputs = {o.name for o in graph.output}
+
+    def _is_internal(name: str) -> bool:
+        return len(consumers_of.get(name, [])) == 1 and name not in graph_outputs
+
+    chains: List[_BlockQuantizedFp4Chain] = []
+    for node in graph.node:
+        producer: _Fp4ChainSide
+        n_channels: int
+        if (
+            node.op_type == "MatMulBlockQuantizedFp4Weight"
+            and node.domain == "com.microsoft"
+        ):
+            w = _match_matmul_block_quantized_fp4(node, initializer_map, consumers_of)
+            if w is None:
+                continue
+            producer, n_channels = w, w.N
+        else:
+            peer = _match_plain_matmul_nbits_peer(node, initializer_map, consumers_of)
+            if peer is None:
+                continue
+            producer, n_channels = peer, peer.out_channels
+
+        out_name = node.output[0]
+        if not _is_internal(out_name):
+            continue
+        found = _walk_to_fp4_consumer(
+            out_name,
+            initializer_map,
+            consumers_of,
+            graph_outputs,
+            n_channels,
+            _MAX_CHAIN_HOPS,
+        )
+        if found is None:
+            continue
+        consumer, chain_ops = found
+        if isinstance(producer, _PlainMatMulNBitsPeer) and isinstance(
+            consumer, _PlainMatMulNBitsPeer
+        ):
+            continue
+        chains.append(
+            _BlockQuantizedFp4Chain(producer, chain_ops, consumer, n_channels)
+        )
+    return chains
+
+
+def apply_structured_pruning_matmul_block_quantized_fp8(
+    model: Union[str, onnx.ModelProto],
+    sparsity: float = 0.5,
+    importance_norm: _ImportanceNorm = "l2",
+) -> onnx.ModelProto:
+    """Removes whole output channels from a
+    ``com.microsoft::MatMulBlockQuantizedFp8Weight`` node (weight-only
+    block-scaled FP8/E4M3 Linear-layer op -- see this module's
+    "MatMulBlockQuantizedFp4Weight/MatMulBlockQuantizedFp8Weight (NVFP4/FP8
+    block-quantized weight) structured pruning" section comment for the full
+    empirical schema investigation this scope was reached from) whose
+    output feeds, through zero or more shape-preserving unary activations
+    with no other consumer along that path, into exactly one downstream
+    consumer whose input channel count matches -- either another
+    ``MatMulBlockQuantizedFp8Weight`` node, or a plain-float (directly-
+    constant weight) ``MatMul``/vanilla-``Gemm`` (and symmetrically, a
+    plain-float producer feeding a ``MatMulBlockQuantizedFp8Weight``
+    consumer). At least one side of every matched chain is always a
+    ``MatMulBlockQuantizedFp8Weight`` node.
+
+    Ranks the producer's output channels by L1/L2 norm of their own
+    (dequantized, for a ``MatMulBlockQuantizedFp8Weight`` producer) weight
+    row (:func:`_matmul_block_quantized_fp8_dequantized`/
+    :func:`_qdq_channel_importance` -- dequantized for ranking only, per
+    this module's "slice, don't recompute" principle), drops the lowest-
+    ``sparsity``-fraction of them, and -- only when the CONSUMER side is
+    itself a ``MatMulBlockQuantizedFp8Weight`` node -- checks whether that
+    keep-set aligns to the consumer's own ``block_size`` boundaries (every
+    block wholly kept or wholly dropped); a plain-float consumer has no
+    block structure, so any keep-set applies directly. When NOT
+    block-aligned for a quantized consumer, that chain is left completely
+    untouched.
+
+    See this module's section comment for the full list of scope
+    boundaries: no ``bits`` concept (this op is always E4M3), a padded
+    partial final block declined, a shared/tied operand declined (except
+    the never-sliced global ``a_scale``), never mixed with ``Fp4Weight``/
+    ``MatMulNBits``/QDQ, no grouped/gated/residual/Concat-merge topology.
+
+    :param model: onnx ModelProto object or file path
+    :param sparsity: fraction of each eligible producer's output channels to
+            drop (rounded, at least one channel is always kept)
+    :param importance_norm: ``"l2"`` (default) or ``"l1"``
+    :returns: the pruned onnx ModelProto
+    """
+    if not (0.0 <= sparsity < 1.0):
+        raise ValueError(f"sparsity must be in [0, 1), got {sparsity}")
+    _validate_importance_norm(importance_norm)
+    if isinstance(model, str):
+        model = onnx.load(model, load_external_data=False)
+    out = onnx.ModelProto()
+    out.CopyFrom(model)
+    graph = out.graph
+
+    chains = _find_fp8_block_quantized_chains(graph)
+    if not chains:
+        return out
+
+    producer_touched: Set[str] = set()
+    consumer_touched: Set[str] = set()
+    stale_value_info: Set[str] = set()
+
+    for chain in chains:
+        p, c = chain.producer, chain.consumer
+        p_key = _fp8_chain_side_key(p)
+        c_key = _fp8_chain_side_key(c)
+        if p_key == c_key:
+            continue  # degenerate (the same weight in both roles)
+        if p_key in producer_touched or c_key in consumer_touched:
+            continue  # a shared/tied weight another chain already resized
+
+        n = chain.n_channels
+        keep_count = max(1, n - round(n * sparsity))
+        if keep_count >= n:
+            continue  # rounds down to nothing for this layer -- no-op
+
+        w_nk = _fp8_chain_producer_weight_nk(p)
+        importance = _qdq_channel_importance(w_nk, importance_norm)
+        # `kind="stable"` -- see apply_structured_pruning_matmul_nbits's own
+        # identical comment: an exactly-tied importance vector's tie-break
+        # order must be deterministic across platforms so a block-alignment
+        # decision never diverges from this family's own `_analyze_*`
+        # dry-run mirror.
+        keep = np.sort(np.argsort(-importance, kind="stable")[:keep_count])
+
+        if isinstance(c, _BlockQuantizedFp8Weight):
+            keep_blocks = _matmul_nbits_block_aligned_keep_blocks(
+                keep, c.k_blocks, c.block_size
+            )
+            if keep_blocks is None:
+                continue  # non-block-aligned -- decline, see section comment
+            consumer_keep = keep_blocks
+        else:
+            consumer_keep = keep  # plain-float consumer -- no block structure
+
+        _slice_fp8_chain_producer(p, keep)
+        _slice_fp8_chain_consumer(c, consumer_keep)
+
+        producer_touched.add(p_key)
+        consumer_touched.add(c_key)
+        stale_value_info.add(p.node.output[0])
+        stale_value_info.update(op.output[0] for op in chain.chain_ops)
+
+    if stale_value_info:
+        kept = [vi for vi in graph.value_info if vi.name not in stale_value_info]
+        del graph.value_info[:]
+        graph.value_info.extend(kept)
+    return out
+
+
+def apply_structured_pruning_matmul_block_quantized_fp4(
+    model: Union[str, onnx.ModelProto],
+    sparsity: float = 0.5,
+    importance_norm: _ImportanceNorm = "l2",
+) -> onnx.ModelProto:
+    """``Fp4Weight`` (NVFP4/E2M1) analogue of
+    :func:`apply_structured_pruning_matmul_block_quantized_fp8` -- see that
+    function's own docstring and this module's shared section comment for
+    the full scope. The one packing-driven difference: a candidate
+    consumer-side keep-set is checked via
+    :func:`_fp4_block_aligned_keep_blocks` rather than
+    :func:`_matmul_nbits_block_aligned_keep_blocks` directly -- this op's
+    own flat (whole-row, not block-relative) nibble packing additionally
+    requires the RESULTING `K` to stay even (see that function's own
+    docstring).
+
+    :param model: onnx ModelProto object or file path
+    :param sparsity: fraction of each eligible producer's output channels to
+            drop (rounded, at least one channel is always kept)
+    :param importance_norm: ``"l2"`` (default) or ``"l1"``
+    :returns: the pruned onnx ModelProto
+    """
+    if not (0.0 <= sparsity < 1.0):
+        raise ValueError(f"sparsity must be in [0, 1), got {sparsity}")
+    _validate_importance_norm(importance_norm)
+    if isinstance(model, str):
+        model = onnx.load(model, load_external_data=False)
+    out = onnx.ModelProto()
+    out.CopyFrom(model)
+    graph = out.graph
+
+    chains = _find_fp4_block_quantized_chains(graph)
+    if not chains:
+        return out
+
+    producer_touched: Set[str] = set()
+    consumer_touched: Set[str] = set()
+    stale_value_info: Set[str] = set()
+
+    for chain in chains:
+        p, c = chain.producer, chain.consumer
+        p_key = _fp4_chain_side_key(p)
+        c_key = _fp4_chain_side_key(c)
+        if p_key == c_key:
+            continue
+        if p_key in producer_touched or c_key in consumer_touched:
+            continue
+
+        n = chain.n_channels
+        keep_count = max(1, n - round(n * sparsity))
+        if keep_count >= n:
+            continue
+
+        w_nk = _fp4_chain_producer_weight_nk(p)
+        importance = _qdq_channel_importance(w_nk, importance_norm)
+        keep = np.sort(np.argsort(-importance, kind="stable")[:keep_count])
+
+        if isinstance(c, _BlockQuantizedFp4Weight):
+            keep_blocks = _fp4_block_aligned_keep_blocks(keep, c.k_blocks, c.block_size)
+            if keep_blocks is None:
+                continue
+            consumer_keep = keep_blocks
+        else:
+            consumer_keep = keep
+
+        _slice_fp4_chain_producer(p, keep)
+        _slice_fp4_chain_consumer(c, consumer_keep)
+
+        producer_touched.add(p_key)
+        consumer_touched.add(c_key)
+        stale_value_info.add(p.node.output[0])
+        stale_value_info.update(op.output[0] for op in chain.chain_ops)
+
+    if stale_value_info:
+        kept = [vi for vi in graph.value_info if vi.name not in stale_value_info]
+        del graph.value_info[:]
+        graph.value_info.extend(kept)
+    return out
+
+
 # --- Embedding / lm_head vocabulary pruning --------------------------------
 #
 # Every other pass in this module changes a graph's *internal* channel/
@@ -20225,6 +21460,11 @@ class PruningLayerSensitivity:
             has at least one ``MatMulNBits`` side (the other optionally a
             plain-float peer, see :class:`_PlainMatMulNBitsPeer`), but that
             distinction isn't split into its own family string);
+            ``"matmul_fp8_block_quantized"``/``"matmul_fp4_block_quantized"``
+            for :func:`apply_structured_pruning_matmul_block_quantized_fp8`/
+            :func:`apply_structured_pruning_matmul_block_quantized_fp4` (the
+            same at-least-one-quantized-side convention as ``matmul_nbits``
+            above, split by op since the two use unrelated packing schemes);
             ``"embedding_vocab_magnitude"`` for
             :func:`apply_embedding_vocab_magnitude_pruning`;
             ``"transformer_block"`` for
@@ -22643,6 +23883,281 @@ def _analyze_qmoe_whole_expert_pruning(
     )
 
 
+# --- MatMulBlockQuantizedFp4Weight/MatMulBlockQuantizedFp8Weight family -----
+
+
+def _block_quantized_fp8_not_eligible(
+    graph: onnx.GraphProto, chains: List[_BlockQuantizedFp8Chain]
+) -> List[str]:
+    matched_ids: Set[int] = set()
+    for chain in chains:
+        matched_ids.add(id(chain.producer.node))
+        matched_ids.add(id(chain.consumer.node))
+    not_eligible = []
+    for node in graph.node:
+        if (
+            node.op_type != "MatMulBlockQuantizedFp8Weight"
+            or node.domain != "com.microsoft"
+        ):
+            continue
+        if id(node) in matched_ids:
+            continue
+        not_eligible.append(f"{node.op_type} '{_node_label(node)}'")
+    return not_eligible
+
+
+def _block_quantized_fp4_not_eligible(
+    graph: onnx.GraphProto, chains: List[_BlockQuantizedFp4Chain]
+) -> List[str]:
+    matched_ids: Set[int] = set()
+    for chain in chains:
+        matched_ids.add(id(chain.producer.node))
+        matched_ids.add(id(chain.consumer.node))
+    not_eligible = []
+    for node in graph.node:
+        if (
+            node.op_type != "MatMulBlockQuantizedFp4Weight"
+            or node.domain != "com.microsoft"
+        ):
+            continue
+        if id(node) in matched_ids:
+            continue
+        not_eligible.append(f"{node.op_type} '{_node_label(node)}'")
+    return not_eligible
+
+
+def _analyze_structured_pruning_matmul_block_quantized_fp8(
+    model: Union[str, onnx.ModelProto],
+    sparsity: float = 0.5,
+    importance_norm: _ImportanceNorm = "l2",
+) -> PruningSensitivityReport:
+    """Dry-run mirror of
+    :func:`apply_structured_pruning_matmul_block_quantized_fp8` -- same
+    matching (:func:`_find_fp8_block_quantized_chains`), touched-role
+    bookkeeping (a chain sharing a `B` weight -- on either side -- with an
+    earlier one is reported `would_drop=0`/`margin=None`, mirroring the real
+    call's own "left completely untouched" outcome), keep-count, and
+    importance (:func:`_qdq_channel_importance`, ranking the producer's own
+    *dequantized* weight row via :func:`_fp8_chain_producer_weight_nk` --
+    the exact same helper the real call itself uses) logic, reused
+    directly, but `model` is never mutated. `family` is always
+    ``"matmul_fp8_block_quantized"``.
+
+    A chain whose keep-set doesn't align to the consumer's own `block_size`
+    boundaries (only checked when the consumer is itself
+    ``MatMulBlockQuantizedFp8Weight``) is also reported `would_drop=0`/
+    `margin=None`, mirroring the real call's own decline. A degenerate chain
+    naming the exact same weight in both roles gets no report row at all.
+    """
+    if not (0.0 <= sparsity < 1.0):
+        raise ValueError(f"sparsity must be in [0, 1), got {sparsity}")
+    _validate_importance_norm(importance_norm)
+    if isinstance(model, str):
+        model = onnx.load(model, load_external_data=False)
+    graph = model.graph
+
+    chains = _find_fp8_block_quantized_chains(graph)
+    not_eligible = _block_quantized_fp8_not_eligible(graph, chains)
+    if not chains:
+        return PruningSensitivityReport(layers=[], not_eligible=not_eligible)
+
+    producer_touched: Set[str] = set()
+    consumer_touched: Set[str] = set()
+    layers: List[PruningLayerSensitivity] = []
+
+    for chain in chains:
+        p, c = chain.producer, chain.consumer
+        p_key = _fp8_chain_side_key(p)
+        c_key = _fp8_chain_side_key(c)
+        if p_key == c_key:
+            continue  # degenerate (the same weight in both roles) -- no report row
+
+        label = _node_label(p.node)
+        family = "matmul_fp8_block_quantized"
+        n = chain.n_channels
+
+        if p_key in producer_touched or c_key in consumer_touched:
+            layers.append(
+                PruningLayerSensitivity(
+                    label=label,
+                    family=family,
+                    total=n,
+                    would_drop=0,
+                    margin=None,
+                    importance_min=0.0,
+                    importance_max=0.0,
+                )
+            )
+            continue  # a shared/tied weight another chain already claimed
+
+        keep_count = max(1, n - round(n * sparsity))
+        if keep_count >= n:
+            layers.append(
+                PruningLayerSensitivity(
+                    label=label,
+                    family=family,
+                    total=n,
+                    would_drop=0,
+                    margin=None,
+                    importance_min=0.0,
+                    importance_max=0.0,
+                )
+            )
+            continue  # rounds down to nothing for this chain -- no-op
+
+        w_nk = _fp8_chain_producer_weight_nk(p)
+        importance = _qdq_channel_importance(w_nk, importance_norm)
+        keep = np.sort(np.argsort(-importance, kind="stable")[:keep_count])
+
+        if isinstance(c, _BlockQuantizedFp8Weight):
+            keep_blocks = _matmul_nbits_block_aligned_keep_blocks(
+                keep, c.k_blocks, c.block_size
+            )
+            if keep_blocks is None:
+                layers.append(
+                    PruningLayerSensitivity(
+                        label=label,
+                        family=family,
+                        total=n,
+                        would_drop=0,
+                        margin=None,
+                        importance_min=0.0,
+                        importance_max=0.0,
+                    )
+                )
+                continue  # non-block-aligned -- the real call declines this
+                # chain entirely too
+
+        keep_mask = np.zeros(n, dtype=bool)
+        keep_mask[keep] = True
+
+        layers.append(
+            PruningLayerSensitivity(
+                label=label,
+                family=family,
+                total=n,
+                would_drop=int(n - keep_count),
+                margin=_normalized_margin(importance, keep_mask),
+                importance_min=float(importance.min()),
+                importance_max=float(importance.max()),
+            )
+        )
+
+        producer_touched.add(p_key)
+        consumer_touched.add(c_key)
+
+    return PruningSensitivityReport(layers=layers, not_eligible=not_eligible)
+
+
+def _analyze_structured_pruning_matmul_block_quantized_fp4(
+    model: Union[str, onnx.ModelProto],
+    sparsity: float = 0.5,
+    importance_norm: _ImportanceNorm = "l2",
+) -> PruningSensitivityReport:
+    """``Fp4Weight`` analogue of
+    :func:`_analyze_structured_pruning_matmul_block_quantized_fp8` -- see
+    that function's own docstring. `family` is always
+    ``"matmul_fp4_block_quantized"``; block-alignment uses
+    :func:`_fp4_block_aligned_keep_blocks` (the additional even-resulting-K
+    check), matching the real call exactly.
+    """
+    if not (0.0 <= sparsity < 1.0):
+        raise ValueError(f"sparsity must be in [0, 1), got {sparsity}")
+    _validate_importance_norm(importance_norm)
+    if isinstance(model, str):
+        model = onnx.load(model, load_external_data=False)
+    graph = model.graph
+
+    chains = _find_fp4_block_quantized_chains(graph)
+    not_eligible = _block_quantized_fp4_not_eligible(graph, chains)
+    if not chains:
+        return PruningSensitivityReport(layers=[], not_eligible=not_eligible)
+
+    producer_touched: Set[str] = set()
+    consumer_touched: Set[str] = set()
+    layers: List[PruningLayerSensitivity] = []
+
+    for chain in chains:
+        p, c = chain.producer, chain.consumer
+        p_key = _fp4_chain_side_key(p)
+        c_key = _fp4_chain_side_key(c)
+        if p_key == c_key:
+            continue
+
+        label = _node_label(p.node)
+        family = "matmul_fp4_block_quantized"
+        n = chain.n_channels
+
+        if p_key in producer_touched or c_key in consumer_touched:
+            layers.append(
+                PruningLayerSensitivity(
+                    label=label,
+                    family=family,
+                    total=n,
+                    would_drop=0,
+                    margin=None,
+                    importance_min=0.0,
+                    importance_max=0.0,
+                )
+            )
+            continue
+
+        keep_count = max(1, n - round(n * sparsity))
+        if keep_count >= n:
+            layers.append(
+                PruningLayerSensitivity(
+                    label=label,
+                    family=family,
+                    total=n,
+                    would_drop=0,
+                    margin=None,
+                    importance_min=0.0,
+                    importance_max=0.0,
+                )
+            )
+            continue
+
+        w_nk = _fp4_chain_producer_weight_nk(p)
+        importance = _qdq_channel_importance(w_nk, importance_norm)
+        keep = np.sort(np.argsort(-importance, kind="stable")[:keep_count])
+
+        if isinstance(c, _BlockQuantizedFp4Weight):
+            keep_blocks = _fp4_block_aligned_keep_blocks(keep, c.k_blocks, c.block_size)
+            if keep_blocks is None:
+                layers.append(
+                    PruningLayerSensitivity(
+                        label=label,
+                        family=family,
+                        total=n,
+                        would_drop=0,
+                        margin=None,
+                        importance_min=0.0,
+                        importance_max=0.0,
+                    )
+                )
+                continue
+
+        keep_mask = np.zeros(n, dtype=bool)
+        keep_mask[keep] = True
+
+        layers.append(
+            PruningLayerSensitivity(
+                label=label,
+                family=family,
+                total=n,
+                would_drop=int(n - keep_count),
+                margin=_normalized_margin(importance, keep_mask),
+                importance_min=float(importance.min()),
+                importance_max=float(importance.max()),
+            )
+        )
+
+        producer_touched.add(p_key)
+        consumer_touched.add(c_key)
+
+    return PruningSensitivityReport(layers=layers, not_eligible=not_eligible)
+
+
 # --- Embedding / lm_head vocabulary family ----------------------------------
 #
 # Only :func:`apply_embedding_vocab_magnitude_pruning` gets a `_analyze_*`
@@ -22961,6 +24476,12 @@ _SENSITIVITY_ANALYZERS: Dict[
     apply_structured_wanda_pruning: _analyze_structured_wanda_pruning,
     apply_structured_pruning_qdq: _analyze_structured_pruning_qdq,
     apply_structured_pruning_matmul_nbits: _analyze_structured_pruning_matmul_nbits,
+    apply_structured_pruning_matmul_block_quantized_fp8: (
+        _analyze_structured_pruning_matmul_block_quantized_fp8
+    ),
+    apply_structured_pruning_matmul_block_quantized_fp4: (
+        _analyze_structured_pruning_matmul_block_quantized_fp4
+    ),
     apply_attention_head_pruning: _analyze_attention_head_pruning,
     apply_attention_head_wanda_pruning: _analyze_attention_head_wanda_pruning,
     apply_moe_expert_channel_pruning: _analyze_moe_expert_channel_pruning,
@@ -22990,11 +24511,13 @@ def analyze_pruning_sensitivity(
     measurement this module already had (actual zero-fraction of an
     already-pruned model); this is the *before* half that was missing.
 
-    `apply_fn` must be one of the fourteen functions this module itself
+    `apply_fn` must be one of the sixteen functions this module itself
     exports: :func:`apply_magnitude_pruning`, :func:`apply_wanda_pruning`,
     :func:`apply_structured_pruning`, :func:`apply_structured_wanda_pruning`,
     :func:`apply_structured_pruning_qdq`,
     :func:`apply_structured_pruning_matmul_nbits`,
+    :func:`apply_structured_pruning_matmul_block_quantized_fp8`,
+    :func:`apply_structured_pruning_matmul_block_quantized_fp4`,
     :func:`apply_attention_head_pruning`,
     :func:`apply_attention_head_wanda_pruning`,
     :func:`apply_moe_expert_channel_pruning`,
@@ -23012,7 +24535,7 @@ def analyze_pruning_sensitivity(
     same way the mutating call itself would compute them, up to (but never
     actually calling) the final slice/zero/delete step. :func:`apply_sparsegpt_pruning`
     is not supported, and neither is :func:`apply_embedding_vocab_pruning`
-    (a `ValueError` naming the fourteen functions that are supported); nor is
+    (a `ValueError` naming the sixteen functions that are supported); nor is
     `apply_structured_pruning`/`apply_structured_wanda_pruning`'s own
     `global_sparsity=True` mode or a model containing any `Concat`-merged
     skip-connection chain (both a `NotImplementedError`, from within the
