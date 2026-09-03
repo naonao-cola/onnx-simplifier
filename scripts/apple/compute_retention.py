@@ -22,18 +22,49 @@ import json
 import sys
 
 
+def _resolve_score(value) -> tuple[float, str] | tuple[None, None]:
+    """Extract a plain accuracy number and its basis from one `run_quality_eval.py`
+    `--output` metric entry.
+
+    `run_quality_eval.py` now reports each metric as `{"acc": ..., possibly
+    "acc_completed": ...}` (see that module's docstring) rather than a bare
+    number -- `acc_completed`, when present and defined, is DeviceMark's own
+    retention definition (accuracy over only the samples that produced an
+    answer before exhausting their generation budget, see
+    `bench/TODO_quality_retention_eval.md`'s "What DeviceMark measures"), so
+    it's preferred here. Falls back to plain `acc` when `acc_completed` is
+    absent (no explicit `--max-gen-toks` was passed to that run) or `None`
+    (every sampled item hit the cap -- nothing to average). A bare number is
+    also accepted directly (returned as-is, basis `"acc"`) for callers
+    (including tests) building this dict by hand rather than via
+    `run_quality_eval.py --output`. Anything else (a non-numeric field like an
+    internal alias) resolves to `(None, None)`.
+    """
+    if isinstance(value, (int, float)):
+        return value, "acc"
+    if isinstance(value, dict):
+        completed = value.get("acc_completed")
+        if isinstance(completed, (int, float)):
+            return completed, "acc_completed"
+        acc = value.get("acc")
+        if isinstance(acc, (int, float)):
+            return acc, "acc"
+    return None, None
+
+
 def compute_retention(float_tasks: dict, quantized_tasks: dict) -> dict:
     """Per-(task, metric) retention for every metric present on both sides.
 
     `float_tasks`/`quantized_tasks` are `run_quality_eval.py` output's "tasks"
-    field: `{task: {metric: value}}`. A metric present on only one side (a
-    task run with different `--tasks` on each side, or a non-numeric field
-    like an internal alias) is silently skipped rather than raising -- the
-    two result files come from independent runs and aren't guaranteed to
-    line up exactly. A float score of exactly 0 makes the ratio undefined
-    (nothing to retain, or the metric legitimately can't score 0 by
-    construction and something else broke) -- reported as `None`, not `inf`
-    or `nan`.
+    field: `{task: {metric: value}}`, `value` resolved via `_resolve_score`
+    (DeviceMark's completed-only accuracy when available, plain accuracy
+    otherwise). A metric present on only one side (a task run with different
+    `--tasks` on each side, or a non-numeric field like an internal alias) is
+    silently skipped rather than raising -- the two result files come from
+    independent runs and aren't guaranteed to line up exactly. A float score
+    of exactly 0 makes the ratio undefined (nothing to retain, or the metric
+    legitimately can't score 0 by construction and something else broke) --
+    reported as `None`, not `inf` or `nan`.
     """
     retention = {}
     for task, float_metrics in float_tasks.items():
@@ -46,14 +77,16 @@ def compute_retention(float_tasks: dict, quantized_tasks: dict) -> dict:
             if metric not in quantized_metrics:
                 continue
             quantized_value = quantized_metrics[metric]
-            if not isinstance(float_value, (int, float)) or not isinstance(
-                quantized_value, (int, float)
-            ):
+            float_score, float_basis = _resolve_score(float_value)
+            quantized_score, quantized_basis = _resolve_score(quantized_value)
+            if float_score is None or quantized_score is None:
                 continue
             task_retention[metric] = {
-                "float": float_value,
-                "quantized": quantized_value,
-                "retention": (quantized_value / float_value) if float_value else None,
+                "float": float_score,
+                "quantized": quantized_score,
+                "retention": (quantized_score / float_score) if float_score else None,
+                "float_basis": float_basis,
+                "quantized_basis": quantized_basis,
             }
         if task_retention:
             retention[task] = task_retention
@@ -65,7 +98,8 @@ def build_records(
 ) -> list[dict]:
     """Flatten `compute_retention`'s `{task: {metric: {...}}}` into one flat
     record per (task, metric): `{model_id, benchmark, metric, subset_n,
-    float_acc, quantized_acc, retention}`.
+    float_acc, quantized_acc, retention, float_basis, quantized_basis}`
+    (`*_basis` is `"acc_completed"` or `"acc"` -- see `_resolve_score`).
 
     The nested shape is convenient to print but awkward to accumulate across
     runs/models into a trend table without re-parsing it; this is the
@@ -86,6 +120,8 @@ def build_records(
                     "float_acc": values["float"],
                     "quantized_acc": values["quantized"],
                     "retention": values["retention"],
+                    "float_basis": values["float_basis"],
+                    "quantized_basis": values["quantized_basis"],
                 }
             )
     return records
@@ -133,9 +169,15 @@ def main() -> int:
         for metric, values in metrics.items():
             ret = values["retention"]
             ret_str = f"{ret:.1%}" if ret is not None else "N/A (float score was 0)"
+            basis_note = ""
+            if "acc_completed" in (values["float_basis"], values["quantized_basis"]):
+                basis_note = (
+                    f" [basis: float={values['float_basis']}, "
+                    f"quantized={values['quantized_basis']}]"
+                )
             print(
                 f"  {metric}: float={values['float']:.4f} "
-                f"quantized={values['quantized']:.4f} retention={ret_str}"
+                f"quantized={values['quantized']:.4f} retention={ret_str}{basis_note}"
             )
 
     if args.output:

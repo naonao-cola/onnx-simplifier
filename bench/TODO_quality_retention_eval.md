@@ -8,11 +8,14 @@ and `--model coreml`), `lm_eval_coreml_adapter.py` (the `CoreMLDecoder`-wrapping
 `generate_until` adapter), and `compute_retention.py` (quantized/float ratio,
 unit-tested in `tests/test_compute_retention.py`) -- see
 `scripts/apple/README.md`'s "Quality and retention eval" section for usage.
-MMLU-Pro is validated as *working* through the same scripts (see "What's been
-prototyped" below) but not yet in CI: a real compute-cost finding during
-prototyping (below) means it needs more thought before it's CI-feasible at all,
-not just a config change. This doc's "Next steps" now reflects what's left, not a
-from-scratch plan.
+Retention is now computed on DeviceMark's own `acc_completed` definition
+(completed-only accuracy) when available, not plain `acc` -- see "What
+DeviceMark measures" -> "Retention" below. MMLU-Pro is validated as *working*
+through the same scripts (see "What's been prototyped" below) but not yet in
+CI: the compute-cost problem is solved (`--max-gen-toks 256`), but the current
+CI model scores 0/10 on `mmlu_pro_biology` regardless, making retention always
+`None` -- see "Next steps" item 4. This doc's "Next steps" now reflects what's
+left, not a from-scratch plan.
 
 `scripts/apple` previously only measured decode speed (`run_llm_decode_benchmark.py`)
 and prefill/decode correctness against the HF reference at the token level
@@ -57,10 +60,19 @@ int8 and float sides hit the token cap at different points (different
 weights, different no-answer rates), which would otherwise let the ratio be
 dominated by cap-timing rather than actual quantization damage -- documented
 on their side as "the retention confound," and it's why a retention number can
-land above 100% at small n. `compute_retention.py`'s
-`retention = quantized_score / float_score` on whatever `run_quality_eval.py`
-already scored (no completed-only split -- see "Proposed scope" below) is the
-same *shape* of ratio, on a coarser accuracy definition.
+land above 100% at small n. **Implemented (2026-09-03):** `run_quality_eval.py`
+now reports `acc_completed` alongside plain `acc` whenever `--max-gen-toks` is
+passed explicitly (already the case for both `quality-eval-macos` steps) --
+`is_completed()` classifies a sample as "completed" when its raw response's
+token count is strictly below `--max-gen-toks` (validated against real
+`mmlu_pro_biology` generations: every `[invalid]`-extracted sample had a
+token count *exactly* equal to the cap, every real-answer sample had a lower
+one -- see that function's docstring). `compute_retention.py`'s
+`_resolve_score()` prefers `acc_completed` when present and defined, falling
+back to plain `acc` when it isn't (no explicit `--max-gen-toks`, or every
+sampled item hit the cap) -- so `retention = quantized_score / float_score`
+is now on `acc_completed` in the case this doc originally called out, not "no
+completed-only split" as this paragraph used to say.
 
 **The bigger gap: DeviceMark's on-device runtime is not Core ML.** Its
 "shipped int8" column runs on the leaderboard author's own private on-device
@@ -319,11 +331,14 @@ trend-plotting script exists) -- that's the next piece if this is picked up furt
    this repo's own implementation needed to change as a result -- the CI-feasibility
    constraints (`--limit`, `--max-gen-toks`) that already exist are still the right call
    for a GitHub-hosted macOS runner's budget; this was a documentation-accuracy gap, not
-   a scope gap. One thing worth doing if this is picked up again: switch
-   `compute_retention.py`'s inputs to a completed-only accuracy (excluding no-answer
-   items from the denominator) to match how DeviceMark defines retention specifically,
-   rather than the plain `acc` `run_quality_eval.py` currently reports -- not done here
-   since it touches `run_quality_eval.py`'s output schema, not just docs.
+   a scope gap. ~~One thing worth doing if this is picked up again: switch
+   `compute_retention.py`'s inputs to a completed-only accuracy~~ -- done (2026-09-03),
+   see "What DeviceMark measures" -> "Retention" above: `run_quality_eval.py` now
+   reports `acc_completed` (whenever `--max-gen-toks` is explicit, which both CI steps
+   already pass) via a validated cap-based `is_completed()` check, and
+   `compute_retention.py` prefers it automatically. No CI YAML changes needed --
+   `retention_ifeval.json`/`retention_math500.json` pick this up on the next
+   `quality-eval-macos` run since both steps already pass `--max-gen-toks`.
 6. ~~Once more than one model has been run through `quality-eval-macos`... consider
    the machine-readable JSON artifact idea~~ -- done: MATH-500 landing alongside
    IFEval (see item 4) gave a second data point, so `compute_retention.py --output`

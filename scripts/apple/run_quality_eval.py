@@ -29,6 +29,16 @@ Run the quantized side (macOS only, real Core ML) against the exported model:
         --tasks ifeval --limit 20 --output coreml_ifeval.json
 
 Then compare the two with `compute_retention.py`.
+
+Each scored metric in `--output`'s "tasks" field is `{"acc": <plain accuracy,
+no-answer-within-budget counts as wrong>}`, plus (only when `--max-gen-toks`
+was passed explicitly, so there's a known budget to check a response against)
+`"total_n"`, `"completed_n"`, and `"acc_completed"` (accuracy over only the
+samples that produced an answer before exhausting that budget) -- DeviceMark's
+own retention definition, see `is_completed`'s docstring and
+`bench/TODO_quality_retention_eval.md`'s "What DeviceMark measures".
+`compute_retention.py` prefers `acc_completed` when present and defined,
+falling back to `acc` otherwise.
 """
 
 from __future__ import annotations
@@ -36,6 +46,70 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from pathlib import Path
+
+
+def is_completed(response_token_count: int, max_gen_toks: int | None) -> bool | None:
+    """Whether a `generate_until` response finished before exhausting its
+    generation budget -- DeviceMark's own definition of a benchmark item
+    "producing an answer" within its token cap, see
+    `bench/TODO_quality_retention_eval.md`'s "What DeviceMark measures".
+    Validated empirically (2026-09-03) against real `mmlu_pro_biology`
+    generations: every sample whose extracted answer was `lm_eval`'s
+    `[invalid]` (couldn't find a parseable answer) had a response token count
+    exactly equal to `max_gen_toks`, and every sample with a real extracted
+    answer had a strictly lower count -- a response that hit the cap without
+    naturally stopping (via `until` or EOS) is indistinguishable in length
+    from one that happened to need every last token, but that's the same
+    approximation DeviceMark's own cap-based definition makes.
+
+    `None` when `max_gen_toks` isn't known -- no explicit `--max-gen-toks`
+    was passed to this run, so there's no fixed budget to compare a
+    response's length against (guessing a task's own YAML default isn't
+    attempted here) -- callers should skip completed-only accounting
+    entirely in that case rather than report a number quietly computed
+    against the wrong cap.
+    """
+    if max_gen_toks is None:
+        return None
+    return response_token_count < max_gen_toks
+
+
+def aggregate_completed_only(values: list) -> float | None:
+    """Mean of per-sample metric values, restricted by the caller to
+    "completed" samples (see `is_completed`) before this is called.
+
+    Flattens any list-valued entries first: IFEval's `inst_level_*_acc`
+    metrics are a list of per-instruction booleans *per sample* (a single
+    response can satisfy some instructions and not others), not a scalar --
+    `lm_eval`'s own aggregation pools every instruction across every sample
+    before averaging, so this does the same, just over the completed subset,
+    to keep a completed-only IFEval score on the same footing as its
+    plain-`acc` counterpart. `None` on an empty list (no completed samples --
+    matches `compute_retention.py`'s handling of an undefined ratio for the
+    same reason: nothing to average).
+    """
+    flat = []
+    for value in values:
+        if isinstance(value, list):
+            flat.extend(value)
+        else:
+            flat.append(value)
+    if not flat:
+        return None
+    return sum(flat) / len(flat)
+
+
+def _load_tokenizer(model: str, model_args: str):
+    from transformers import AutoTokenizer
+
+    pretrained = dict(kv.split("=", 1) for kv in model_args.split(","))["pretrained"]
+    if model == "coreml":
+        # Tokenizer files sit alongside the .mlpackage, exported by
+        # export_llm_to_coreml.py -- same lookup lm_eval_coreml_adapter.py's
+        # own CoreMLLM.__init__ uses.
+        return AutoTokenizer.from_pretrained(str(Path(pretrained).parent))
+    return AutoTokenizer.from_pretrained(pretrained)
 
 
 def run_quality_eval(
@@ -77,31 +151,62 @@ def run_quality_eval(
         apply_chat_template=apply_chat_template,
         fewshot_as_multiturn=apply_chat_template,
         batch_size=1,
-        log_samples=False,
+        # Needed to recover each sample's raw response text below, for
+        # completed-only (DeviceMark's acc_completed) accounting -- see
+        # is_completed's docstring. Cheap: this is CPU tokenization of
+        # already-generated text, not another forward pass.
+        log_samples=True,
     )
     if results is None:
         raise RuntimeError("lm_eval.simple_evaluate() returned no results")
+
+    tokenizer = _load_tokenizer(model, model_args) if max_gen_toks is not None else None
+
+    tasks_out = {}
+    for task, metrics in results["results"].items():
+        samples = results["samples"].get(task, [])
+        scored_metrics = {
+            metric: value
+            for metric, value in metrics.items()
+            # lm_eval's own "metric_name,filter_name" convention for an actual
+            # scored metric -- distinguishes it from bookkeeping fields on the
+            # same dict ("alias", "sample_len", "name", none of which contain
+            # a comma) and from each metric's paired stderr entry
+            # ("metric_stderr,<filter_name>" -- the filter name varies per
+            # task, e.g. MMLU-Pro's "custom-extract", not always "none", and
+            # is itself sometimes the non-numeric string "N/A").
+            if "," in metric and "_stderr," not in metric
+        }
+
+        task_out = {}
+        for metric_full, agg_value in scored_metrics.items():
+            entry = {"acc": agg_value}
+            if tokenizer is not None:
+                metric_name = metric_full.split(",", 1)[0]
+                completed_values = []
+                completed_n = 0
+                for sample in samples:
+                    response = sample["resps"][0][0] if sample.get("resps") else ""
+                    n_toks = len(
+                        tokenizer(response, add_special_tokens=False)["input_ids"]
+                    )
+                    if is_completed(n_toks, max_gen_toks):
+                        completed_n += 1
+                        if metric_name in sample:
+                            completed_values.append(sample[metric_name])
+                entry["total_n"] = len(samples)
+                entry["completed_n"] = completed_n
+                entry["acc_completed"] = aggregate_completed_only(completed_values)
+            task_out[metric_full] = entry
+        tasks_out[task] = task_out
 
     return {
         "model": model,
         "model_args": model_args,
         "limit": limit,
         "num_fewshot": num_fewshot,
-        "tasks": {
-            task: {
-                metric: value
-                for metric, value in metrics.items()
-                # lm_eval's own "metric_name,filter_name" convention for an actual
-                # scored metric -- distinguishes it from bookkeeping fields on the
-                # same dict ("alias", "sample_len", "name", none of which contain
-                # a comma) and from each metric's paired stderr entry
-                # ("metric_stderr,<filter_name>" -- the filter name varies per
-                # task, e.g. MMLU-Pro's "custom-extract", not always "none", and
-                # is itself sometimes the non-numeric string "N/A").
-                if "," in metric and "_stderr," not in metric
-            }
-            for task, metrics in results["results"].items()
-        },
+        "max_gen_toks": max_gen_toks,
+        "tasks": tasks_out,
     }
 
 
