@@ -80,6 +80,18 @@ void InitEnv();
 std::shared_ptr<const ModelExecutor> GetBuiltinModelExecutor();
 #endif
 
+#ifdef ONNXSIM_HAS_XNNPACK
+// Returns a model executor backed by Google's XNNPACK (see
+// onnxsim/xnnpack_executor.h and docs/dlpack-executor.md). Only available
+// when onnxsim is built with ONNXSIM_BUILTIN_XNNPACK. Unlike
+// GetBuiltinModelExecutor, this executor supports only a small, explicit
+// subset of ops (see onnxsim/onnx_to_xnnpack_subgraph.h) -- Run() throws
+// std::runtime_error for anything else, so it is meant as an alternative,
+// explicitly-opted-into backend (e.g. for testing XNNPACK embeddability),
+// not a general-purpose drop-in replacement for the ORT-backed executor.
+std::shared_ptr<const ModelExecutor> GetXnnpackModelExecutor();
+#endif
+
 // ``target_opset_version``, when set, converts the model to that opset version
 // of the default ONNX domain (using onnx's version converter) before
 // simplifying, so the simplifier can clean up any redundant nodes the

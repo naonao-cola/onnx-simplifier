@@ -109,6 +109,52 @@ One boundary, several adapters (`dlpack_bridge.h` holds the conversions):
 | `CppModelExecutor` | onnxsim.cpp (built-in ORT) | `BorrowAsOrtValue` wraps the feed buffer via ORT's borrowing `CreateTensor` — **zero copy** | `FromOrtValue` moves ORT's own output buffer into the managed tensor — **zero copy** | none at the boundary |
 | `CApiModelExecutor` | capi/onnxsim_c_api.cpp | host receives borrowed `DLManagedTensor*` | host returns owned `DLManagedTensor*`, released via their deleters | host's choice |
 | `PyModelExecutor` | cpp2py_export.cc | `ToTensorProto` → bytes | bytes → `FromTensorProtoOwning` | protobuf round trip (see below) |
+| `XnnpackModelExecutor` | xnnpack_executor.cpp (`ONNXSIM_BUILTIN_XNNPACK`) | feed pointers passed straight to `xnn_setup_runtime_v2` as `xnn_external_value`s — **zero copy** | XNNPACK writes into an executor-allocated `std::vector<float>` (it has no ORT-style "hand back the session's buffer" mode) — **one copy at the boundary** (allocation, not a memcpy) | one allocation per output |
+
+### XNNPACK: an explicitly-partial backend, not a drop-in ORT replacement
+
+`GetXnnpackModelExecutor()` (`onnxsim/xnnpack_executor.h` declares it, guarded
+by `ONNXSIM_HAS_XNNPACK`) runs fold groups through Google's
+[XNNPACK](https://github.com/google/XNNPACK) instead of ONNX Runtime, going
+through XNNPACK's own graph-level **Subgraph API**
+(`xnn_create_subgraph`/`xnn_define_*`/`xnn_create_runtime_v4`) rather than its
+per-operator kernel API. `onnxsim/onnx_to_xnnpack_subgraph.{h,cpp}` is the
+ONNX-ModelProto-to-`xnn_subgraph_t` lowering; `onnxsim/xnnpack_executor.cpp`
+is the `ModelExecutor` adapter that creates a runtime from the result, feeds
+it the call's `inputs`, invokes it, and wraps the outputs as
+`DLManagedTensor`s.
+
+Unlike `CppModelExecutor`, which delegates to ORT and so handles essentially
+any ONNX op, this lowering supports only a small, explicit fp32 op set —
+`Add`/`Sub`/`Mul`/`Div`, `Relu`, `Sigmoid`, `Gemm`/`MatMul` (2D operands only),
+and `Reshape` (static target shape only) — see
+`onnx_to_xnnpack_subgraph.h`'s `kSupportedOps`. `Lower()` throws
+`std::runtime_error` naming the reason for anything outside that: an
+unsupported op, a non-fp32 tensor, `Gemm` with `alpha != 1` or `transA != 0`,
+a `Reshape` target shape that is itself produced by another node in the fold
+group rather than being a constant or a feed, and so on. Notably absent is
+`Conv`: XNNPACK's convolution Node is NHWC-native while ONNX's is NCHW, and
+getting that layout conversion (activations *and* the OIHW→OHWI weight
+transpose) right needs more verification than this first cut has had — left
+as follow-up work rather than shipped un-verified.
+
+This makes `GetXnnpackModelExecutor()` an explicitly opt-in *alternative*
+executor (pass it to `Simplify` instead of `GetBuiltinModelExecutor()` when
+you specifically want XNNPACK — e.g. to test XNNPACK embeddability the same
+way `tests/test_tinygrad_integration.py` / `test_nncase_integration.py` test
+those backends), not a general-purpose replacement: swapping it in for a
+model using an unsupported op fails constant folding outright rather than
+falling back. `onnxsim/xnnpack_executor_test.cpp` exercises it end to end
+(each supported op, a two-node chain, and the unsupported-op error path)
+against independently-computed expected values.
+
+Build it with `-DONNXSIM_BUILTIN_XNNPACK=ON` (see `cmake/build_xnnpack.cmake`,
+which `FetchContent`s XNNPACK — pinned by commit, since XNNPACK has no tagged
+releases — the same way ORT's from-source build fetches its own `cpuinfo` and
+`pthreadpool` dependencies). It composes with `ONNXSIM_BUILTIN_ORT`
+independently: a build can have either, both, or neither, and the caller
+picks which `GetXxxModelExecutor()` to hand `Simplify`. Not supported for the
+Emscripten/WebAssembly build.
 
 The Python adapter still pays a `TensorProto` round trip because the Python side
 (onnxruntime's Python API, onnx's reference evaluator) speaks `TensorProto`, not
