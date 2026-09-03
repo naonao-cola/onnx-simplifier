@@ -541,9 +541,10 @@ producers; L1's is a plain sum, with no square/sqrt involved at all) and
 :func:`apply_structured_pruning`'s own ``importance_norm`` parameter. Conv
 support is deliberately
 narrower than the MatMul/Gemm path in one respect that stays true
-regardless of grouping: producers/consumers are joined by unary activations
-alone -- no per-channel ``Add``/``Mul`` scale-or-bias op, since a real Conv
-already carries any bias in its own optional third input, and
+regardless of grouping: producers/consumers are joined by unary activations,
+channel-preserving spatial ops (see below), and depthwise/GroupNorm
+pass-through hops -- no per-channel ``Add``/``Mul`` scale-or-bias op, since a
+real Conv already carries any bias in its own optional third input, and
 ``BatchNormalization`` is expected to already be fused into the preceding
 Conv's weight by the time this pass runs (onnxsim's own default
 optimization does exactly that, see ``fuse_bn_into_conv``), so a raw
@@ -574,6 +575,59 @@ are shaped per-channel (opset 21+'s schema; opset 18-20's differently-shaped,
 now-deprecated per-*group* schema is excluded by the same per-channel shape
 check every other hop in this module already applies, not by inspecting the
 model's own declared opset).
+
+A Conv chain also crosses four more op kinds transparently, each needing no
+weight of its own sliced (folded into `chain_ops` exactly like a unary
+activation, not a dedicated pass-through tuple) -- these close the two most
+common CNN backbone shapes this pass previously left completely unpruned end
+to end (confirmed empirically with zero live hits, before this support
+existed, via ``grep -n "MaxPool\\|AveragePool\\|Resize\\|Pad\\b"`` over this
+Conv-chain-walking section): a downsampling stage's ``Conv -> MaxPool ->
+Conv`` (VGG/AlexNet/ResNet-style backbones) and a decoder's ``Conv -> Resize
+-> Conv``/``-> Concat`` (U-Net/diffusion-model-style upsampling).
+``MaxPool``/``AveragePool``/``GlobalAveragePool`` are unconditional
+pass-through hops -- confirmed both from each op's own ONNX schema (a single
+input, a `kernel_shape` describing only the trailing spatial axes, no
+channel-axis participation at all) and empirically, via a real
+``onnxruntime.InferenceSession``: slicing a tensor's channel axis commutes
+exactly (`0.0` max abs diff) with running any of the three, before or after
+-- see `_CONV_POOL_PASS_THROUGH`'s own comment. ``Resize`` and ``Pad`` are
+narrower: each is a pass-through hop *only* when it is statically provable
+that it leaves axis 1 (the channel axis) untouched -- a constant `scales`
+input whose axis-1 entry is `1.0` (for ``Resize`` -- a `sizes`-driven
+``Resize`` is declined *unconditionally*, not just whenever it's
+non-constant or channel-affecting: `sizes` names an *absolute* output size
+per axis, which would need rewriting to the new channel count once a chain
+through it is actually pruned, and no hop in this pass rewrites a constant
+*value* the way it rewrites a depthwise Conv's own `group` attribute or a
+weight's shape -- see :func:`_match_resize_channel_pass_through`'s own
+docstring for the confirmed-by-construction broken-graph failure mode this
+avoids), or a constant `pads` input that is exactly zero on axis 1 (for
+``Pad``) -- declined outright, never guessed at, whenever `scales`/`pads` is
+computed at runtime rather than a constant initializer, or is statically
+known to actually resize/pad the channel axis itself (confirmed empirically:
+a channel-*resizing* ``Resize``/channel-*padding* ``Pad`` does not commute
+with channel-axis slicing at all -- it changes the output channel count
+outright). See :func:`_match_resize_channel_pass_through`/
+:func:`_match_pad_channel_pass_through`'s own docstrings for the exact
+static-provability bar (including the `axes` attribute/input each op gained
+at a later opset, and why a negative `axes` entry declines rather than
+assumes a tensor rank this pass doesn't have on hand at that point in the
+walk). Unlike the depthwise-Conv/GroupNorm hops above, all four are
+recognized in *both* directions the Conv-chain machinery needs them --
+:func:`_walk_to_conv_consumer`'s forward walk (reached by
+:func:`_find_conv_chains`'s own plain chains, a residual/merge group's
+fan-out branches, and a Concat-branch-merge's shared consumer alike) and
+:func:`_walk_conv_producer_backward`'s backward walk (reached by
+:func:`_find_conv_residual_chains`'s own ``Add``-operand resolution and
+:func:`_find_conv_concat_chains`'s own branch resolution). Deliberately left
+out of scope, and not attempted: a
+``GlobalAveragePool -> Flatten -> Gemm`` classifier head, where a Conv's
+surviving channel set would need to be re-derived through `Flatten`'s exact
+memory layout into the Gemm weight's own input columns -- a fundamentally
+different, harder problem than the plain axis slice every hop in this
+section performs, not a bigger version of the same one (see
+`_CONV_POOL_PASS_THROUGH`'s own comment for the precise boundary).
 
 Within that, three ``group`` shapes are distinguished. Ordinary
 (``group=1``) Conv is the base case already described above. The
@@ -2598,6 +2652,49 @@ _UNARY_PASS_THROUGH = {
 _BINARY_CHANNEL_OPS = {"Add", "Mul"}
 _MAX_CHAIN_HOPS = 8
 
+# Spatial pooling ops recognized as transparent hops *only* by the Conv-chain
+# walkers (:func:`_walk_to_conv_consumer`/:func:`_walk_conv_producer_backward`)
+# -- never folded into `_UNARY_PASS_THROUGH` itself, which is also consulted
+# by the MatMul/Gemm walkers below, whose own channel axis is the *last*
+# tensor dimension, not axis 1. These three all assume NCHW's axis-1-is-
+# channel convention the same way the rest of this Conv-chain-walking section
+# already does throughout (grouped-Conv block boundaries, depthwise
+# pass-through, GroupNorm pass-through, ...), so a dedicated, Conv-only set
+# is the honest scope, not a shortcut. Each pools purely *spatially* -- its
+# own kernel window slides only over the trailing spatial axes -- with no
+# cross-channel mixing at all, confirmed two ways: (1) each op's own ONNX
+# schema (`onnx.defs.get_schema(...)`, checked live against this
+# environment's own onnx==1.22.0): `MaxPool`/`AveragePool` both take exactly
+# one input `X` and a `kernel_shape` describing only the spatial window (no
+# channel-axis participation anywhere in the op definition, and no opset
+# variant changes that -- both are at `since_version=22` here, unchanged in
+# this respect since their very first opset); `GlobalAveragePool` takes just
+# `X`, no attributes at all, and reduces every trailing spatial axis to 1 per
+# channel independently. (2) empirically, via a real
+# `onnxruntime.InferenceSession`: for each op, slicing a tensor's channel
+# axis and *then* running the op reproduces slicing the *un-sliced* input's
+# own output the same way (max abs diff `0.0`, not just "close") -- see
+# `tests/test_pruning.py`'s pooling pass-through tests and this feature's own
+# empirical verification script. `MaxPool`'s optional second (`Indices`)
+# output is excluded the same way every other hop in this module excludes an
+# unexpected extra output: the ordinary `len(node.output) == 1` check applied
+# wherever this set is consulted only matches a `MaxPool` whose `Indices`
+# output isn't wired up to anything.
+#
+# `GlobalAveragePool -> Flatten -> Gemm` -- the classifier-head shape a CNN
+# backbone typically ends in -- is deliberately NOT reached by adding
+# `GlobalAveragePool` here: that pattern needs the *consumer* side (a
+# flattened Gemm's input columns) to recognize `Flatten` as a hop of its own
+# and re-derive which of its columns correspond to which surviving channel,
+# a fundamentally different, harder problem than a simple axis slice (the
+# flattened layout is `channel`-major only when every spatial position is
+# accounted for identically per channel, which the Gemm weight's own columns
+# encode implicitly, not via any axis metadata this pass could re-slice).
+# `GlobalAveragePool` becomes a hop only when it feeds *another* Conv-chain
+# consumer directly (rare in practice -- most real graphs go straight to
+# `Flatten`/`Gemm` after it -- but not disallowed), never through `Flatten`.
+_CONV_POOL_PASS_THROUGH = {"MaxPool", "AveragePool", "GlobalAveragePool"}
+
 # com.microsoft's fused bias-add + Gelu-family activation nodes -- the FFN
 # analogue of the SkipLayerNormalization residual fusion above, done by the
 # same onnxruntime transformer-optimizer tool: `BiasGelu(A, B) = Gelu(A + B)`
@@ -3683,6 +3780,186 @@ def _match_group_norm_pass_through(
     return scale_name, bias_name, num_groups
 
 
+def _match_resize_channel_pass_through(
+    node: onnx.NodeProto, initializer_map: Dict[str, onnx.TensorProto]
+) -> bool:
+    """True iff `node` (already confirmed by the caller to be a plain
+    (default-domain) ``Resize``, `node.input[0]` the tensor being walked
+    through) provably leaves axis 1 -- the NCHW channel axis
+    `_CONV_POOL_PASS_THROUGH`'s own comment already assumes throughout this
+    section -- unresized, so it is safe to cross transparently. Declines
+    (``False``) rather than guesses whenever it cannot statically prove that:
+
+    - Needs a length-3-or-4 `node.input` (``X, roi, scales[, sizes]``, the
+      opset 11+ signature -- confirmed live via
+      ``onnx.defs.get_schema("Resize")``, `since_version=19` in this
+      environment's own onnx==1.22.0) so `scales` lands at a known, fixed
+      position. Opset 10's older 2-input ``Resize(X, scales)`` (no `roi`
+      existed yet at that opset) is declined outright here rather than
+      guessed at: a bare 2-input node is indistinguishable, from the node
+      alone, from an opset 11+ node that simply omitted both trailing
+      optional inputs -- this matcher has no access to the model's own
+      `opset_import` to disambiguate, and modern exporters essentially always
+      emit at least an (even if empty/unused) `roi` placeholder, so this
+      scope loss is negligible in practice.
+    - Only a `scales` (`tensor(float)`)-driven ``Resize`` is ever recognized
+      -- a `sizes` (`tensor(int64)`)-driven one is declined outright, always,
+      never guessed at, *not* because its own channel-axis safety can't be
+      checked (`sizes[1] == n_channels` would confirm that, just like
+      `scales[1] == 1.0` does), but because of what happens *after* a chain
+      through it is actually pruned: `sizes` specifies an *absolute* output
+      size per axis, so once the real producer's channel count changes,
+      `sizes[1]` -- unlike `scales[1] == 1.0`, a ratio that stays correct
+      for whatever channel count actually flows through it at runtime --
+      would need to be rewritten to the new count too, or the pruned graph
+      is simply broken (confirmed by direct construction: a `sizes`-driven
+      Resize accepted the same way `scales` is, with `sizes[1]` left
+      unedited after slicing, fails at `onnxruntime.InferenceSession.run`
+      with a real channel-count-mismatch error on the very next Conv). No
+      hop in this pass currently rewrites a constant *value* the way it
+      rewrites a depthwise Conv's own ``group`` attribute
+      (:func:`_set_conv_group_attr`) or a weight's shape -- adding that here
+      would need genuinely new machinery this feature's own task scope
+      (a transparent hop needing no weight/bias of its own touched) doesn't
+      call for, so the honest cut is to decline `sizes` entirely rather than
+      silently ship the broken-graph case above.
+    - `scales` must be a constant initializer -- a runtime-computed value
+      (e.g. fed by `Shape`/`Concat`/`Cast` elsewhere in the graph) means this
+      pass cannot know which axis is affected, so it's declined, never
+      guessed at, mirroring every other "statically-known-constant-only" bar
+      in this module (`_match_group_norm_pass_through`'s own `scale`/`bias`,
+      `_norm_pass_through_const_names`, ...).
+    - The (opset 18+) `axes` attribute, when present, restricts which input
+      axes `scales` actually describes (omitted, it describes every input
+      axis in order, so `scales[1]` names axis 1 directly). An `axes` entry
+      naming axis 1 negatively (e.g. `-3` on a 4-D NCHW tensor) can only be
+      resolved against the input tensor's own rank, which this matcher --
+      unlike the module's shape-inference-backed :func:`_norm_axis_is_last`
+      -- has no access to here; rather than assume a rank, any negative
+      `axes` entry declines the whole hop. When axis 1 isn't named in `axes`
+      at all, it is by definition not resized (`axes` is exhaustive over
+      which axes `scales` applies to), so this returns ``True`` immediately
+      without even inspecting `scales`.
+
+    Confirmed empirically, not just from the schema text: a channel-safe
+    `Resize` (`scales[1] == 1.0`) run through a real
+    `onnxruntime.InferenceSession` commutes exactly (max abs diff `0.0`) with
+    slicing the channel axis before or after the op; a channel-*unsafe* one
+    (e.g. `scales[1] == 2.0`) changes the output channel count outright and
+    does not commute at all -- see this feature's own empirical verification
+    script and `tests/test_pruning.py`'s Resize pass-through/decline tests.
+    """
+    if node.op_type != "Resize" or node.domain != "":
+        return False
+    if len(node.input) not in (3, 4) or not node.input[0]:
+        return False
+    scales_name = node.input[2]
+    if not scales_name:
+        return False  # only a `scales`-driven Resize is ever recognized
+    s_init = initializer_map.get(scales_name)
+    if s_init is None or s_init.data_type != onnx.TensorProto.FLOAT:
+        return False
+    values = onnx.numpy_helper.to_array(s_init).reshape(-1).tolist()
+
+    axes_attr: Optional[List[int]] = None
+    for attr in node.attribute:
+        if attr.name == "axes":
+            axes_attr = list(attr.ints)
+
+    if axes_attr is None:
+        if len(values) < 2:
+            return False  # no axis-1 slot in a `scales` this short
+        channel_value = values[1]
+    else:
+        if any(a < 0 for a in axes_attr):
+            return False  # can't resolve a negative axis without a known rank
+        if len(values) != len(axes_attr):
+            return False  # malformed -- schema requires equal length
+        if 1 not in axes_attr:
+            return True  # axis 1 isn't named -- definitely not resized
+        channel_value = values[axes_attr.index(1)]
+    return float(channel_value) == 1.0
+
+
+def _match_pad_channel_pass_through(
+    node: onnx.NodeProto, initializer_map: Dict[str, onnx.TensorProto]
+) -> bool:
+    """True iff `node` (already confirmed by the caller to be a plain
+    (default-domain) ``Pad``, `node.input[0]` the tensor being walked
+    through) provably pads *nothing* on axis 1 -- the NCHW channel axis --
+    so it is safe to cross transparently, whatever its `mode` (`constant`/
+    `reflect`/`edge`/`wrap` all become a pure identity along an axis padded
+    by exactly zero either side, regardless of what they do elsewhere).
+    Declines (``False``) rather than guesses whenever it cannot statically
+    prove that:
+
+    - Needs a `pads` *input* at `node.input[1]` (opset 11+'s signature --
+      confirmed live via ``onnx.defs.get_schema("Pad")``, `since_version=25`
+      in this environment's own onnx==1.22.0) that is a constant `int64`
+      initializer -- opset < 11's older attribute-based `pads` (no input at
+      all, a node attribute instead, deprecated for over half a decade) is
+      declined outright by the same `len(node.input) < 2` check that also
+      catches a runtime-computed `pads` input fed by something other than a
+      constant initializer, mirroring `_match_resize_channel_pass_through`'s
+      own "statically-known-constant-only" bar for the identical reason: a
+      value only known at runtime means this pass cannot know which axis is
+      affected.
+    - The (opset 18+) `axes` *input* (`node.input[3]`), when present, must
+      likewise be a constant `int64` initializer, and restricts which axes
+      `pads` actually describes -- `pads` is then exactly
+      ``[axes[0]_begin, ..., axes[k-1]_begin, axes[0]_end, ..., axes[k-1]_end]``
+      (`len(pads) == 2 * len(axes)`, the op's own schema requirement).
+      Exactly like `_match_resize_channel_pass_through`'s own `axes` handling,
+      a negative entry can only be resolved against the input tensor's own
+      rank (not available here), so any negative `axes` entry declines the
+      whole hop; axis 1 simply not being named in `axes` at all means it is
+      by definition not padded, returning ``True`` immediately.
+    - When `axes` is omitted, `pads` instead spans every input axis in order
+      (`len(pads) == 2 * rank`), so `rank = len(pads) // 2` is recovered
+      directly from `pads`'s own length -- no external rank needed at all --
+      and axis 1's begin/end pads sit at `pads[1]`/`pads[rank + 1]`.
+
+    Confirmed empirically: a channel-safe `Pad` (zero on axis 1, nonzero
+    elsewhere) run through a real `onnxruntime.InferenceSession` commutes
+    exactly (max abs diff `0.0`) with slicing the channel axis before or
+    after the op; a channel-*unsafe* one (nonzero on axis 1) changes the
+    output channel count outright -- see this feature's own empirical
+    verification script and `tests/test_pruning.py`'s Pad pass-through/
+    decline tests.
+    """
+    if node.op_type != "Pad" or node.domain != "":
+        return False
+    if len(node.input) < 2 or not node.input[0] or not node.input[1]:
+        return False
+    pads_init = initializer_map.get(node.input[1])
+    if pads_init is None or pads_init.data_type != onnx.TensorProto.INT64:
+        return False
+    pads = onnx.numpy_helper.to_array(pads_init).reshape(-1).tolist()
+    axes_name = node.input[3] if len(node.input) > 3 else ""
+
+    if axes_name:
+        axes_init = initializer_map.get(axes_name)
+        if axes_init is None or axes_init.data_type != onnx.TensorProto.INT64:
+            return False
+        axes = onnx.numpy_helper.to_array(axes_init).reshape(-1).tolist()
+        if any(a < 0 for a in axes):
+            return False  # can't resolve a negative axis without a known rank
+        if len(pads) != 2 * len(axes):
+            return False  # malformed -- schema requires equal length
+        if 1 not in axes:
+            return True  # axis 1 isn't named -- definitely not padded
+        idx = axes.index(1)
+        begin, end = pads[idx], pads[len(axes) + idx]
+    else:
+        if len(pads) % 2 != 0:
+            return False  # malformed -- schema requires an even length
+        rank = len(pads) // 2
+        if rank < 2:
+            return False  # no axis-1 slot in a `pads` this short
+        begin, end = pads[1], pads[rank + 1]
+    return begin == 0 and end == 0
+
+
 def _walk_to_conv_consumer(
     start: str,
     initializer_map: Dict[str, onnx.TensorProto],
@@ -3701,11 +3978,16 @@ def _walk_to_conv_consumer(
 ]:
     """The Conv analogue of :func:`_walk_to_consumer`: from tensor `start`,
     walks forward through unary shape-preserving activations (see
-    `_UNARY_PASS_THROUGH`), depthwise Conv hops (see
-    :func:`_match_depthwise_conv_pass_through` -- transparent to the
-    channel-index mapping, but each still needs its own weight/bias sliced
-    and its ``group`` attribute updated, so they're returned separately as
-    `conv_pass_through` rather than folded into `chain_ops`), and -- when
+    `_UNARY_PASS_THROUGH`), spatial pooling ops that never mix channels
+    (``MaxPool``/``AveragePool``/``GlobalAveragePool``, unconditionally --
+    see `_CONV_POOL_PASS_THROUGH`'s own comment), a channel-axis-unaffected
+    ``Resize``/``Pad`` (see :func:`_match_resize_channel_pass_through`/
+    :func:`_match_pad_channel_pass_through` -- declined, not guessed at,
+    whenever the channel axis can't be statically proven untouched), depthwise
+    Conv hops (see :func:`_match_depthwise_conv_pass_through` -- transparent
+    to the channel-index mapping, but each still needs its own weight/bias
+    sliced and its ``group`` attribute updated, so they're returned separately
+    as `conv_pass_through` rather than folded into `chain_ops`), and -- when
     `recognize_group_norm` -- at most one mid-chain ``GroupNormalization``
     hop (see :func:`_match_group_norm_pass_through` and
     `_GROUP_NORM_PASS_THROUGH_OP`'s own comment for why only one, and why
@@ -3721,7 +4003,13 @@ def _walk_to_conv_consumer(
     the walk with no consumer found, same as any other unmatched topology.
     Unlike the MatMul/Gemm walk, no per-channel ``Add``/``Mul`` op is
     recognized -- see this module's own docstring for why that's out of
-    scope for Conv chains.
+    scope for Conv chains. A pooling/``Resize``/``Pad`` hop, like a unary
+    activation, needs no weight/bias of its own sliced at all -- it is folded
+    into `chain_ops` (a plain ``(node, None)`` entry, the const-name always
+    ``None``) rather than needing a dedicated tuple type the way
+    `conv_pass_through`/`group_norm` do, since :func:`_apply_chains` already
+    treats a ``None``-const `chain_ops` entry as "mark its output stale, slice
+    nothing" -- exactly what these ops need too.
 
     The returned consumer tuple's own 4th element is `is_conv_transpose`
     (see :class:`_Chain`'s own field of the same name) -- always ``False``
@@ -3828,8 +4116,41 @@ def _walk_to_conv_consumer(
                 continue
             break
 
+        if (
+            nxt.op_type == "Resize"
+            and nxt.domain == ""
+            and nxt.input
+            and nxt.input[0] == cur
+            and len(nxt.output) == 1
+            and _match_resize_channel_pass_through(nxt, initializer_map)
+        ):
+            out2 = nxt.output[0]
+            if len(consumers_of.get(out2, [])) != 1 or out2 in graph_outputs:
+                break
+            chain_ops.append((nxt, None))
+            cur = out2
+            continue
+
+        if (
+            nxt.op_type == "Pad"
+            and nxt.domain == ""
+            and nxt.input
+            and nxt.input[0] == cur
+            and len(nxt.output) == 1
+            and _match_pad_channel_pass_through(nxt, initializer_map)
+        ):
+            out2 = nxt.output[0]
+            if len(consumers_of.get(out2, [])) != 1 or out2 in graph_outputs:
+                break
+            chain_ops.append((nxt, None))
+            cur = out2
+            continue
+
         if not (
-            nxt.op_type in _UNARY_PASS_THROUGH
+            (
+                nxt.op_type in _UNARY_PASS_THROUGH
+                or (nxt.op_type in _CONV_POOL_PASS_THROUGH and nxt.domain == "")
+            )
             and list(nxt.input) == [cur]
             and len(nxt.output) == 1
         ):
@@ -4098,12 +4419,26 @@ def _walk_conv_producer_backward(
     Tuple[onnx.NodeProto, ...],
     Tuple[Tuple[str, onnx.NodeProto], ...],
 ]:
-    """The backward counterpart of :func:`_walk_to_conv_consumer`, used only
-    by :func:`_find_conv_residual_chains` to resolve one operand of an
-    ``Add`` merge point back to whatever produces it. Walks backward from
-    tensor `start` through unary pass-through activations and
-    self-consistently-depthwise Conv hops (see
-    :func:`_match_conv_pass_through_self`), declining (only) whenever a
+    """The backward counterpart of :func:`_walk_to_conv_consumer`, used by
+    :func:`_find_conv_residual_chains` to resolve one operand of an ``Add``
+    merge point back to whatever produces it, and by
+    :func:`_find_conv_concat_chains` to resolve one branch of a channel-axis
+    ``Concat`` the same way (the U-Net/diffusion-decoder-style skip
+    connection this reaches: a ``Resize``-upsampled decoder branch walked
+    backward through the ``Resize`` node straight to its own real Conv
+    producer, then merged via ``Concat`` with the encoder's skip branch).
+    Walks backward from tensor `start` through unary pass-through
+    activations, self-consistently-depthwise Conv hops (see
+    :func:`_match_conv_pass_through_self`), spatial pooling ops that never
+    mix channels (``MaxPool``/``AveragePool``/``GlobalAveragePool``,
+    unconditionally -- see `_CONV_POOL_PASS_THROUGH`'s own comment), and a
+    channel-axis-unaffected ``Resize``/``Pad`` (see
+    :func:`_match_resize_channel_pass_through`/
+    :func:`_match_pad_channel_pass_through` -- neither needs this walk's own
+    not-yet-known group channel count, since `_match_resize_channel_pass_
+    through` only ever recognizes a `scales`-driven `Resize`, a ratio that
+    needs no channel count to validate, never a `sizes`-driven one -- see
+    that function's own docstring for why), declining (only) whenever a
     tensor crossed -- `start` itself included -- is a graph output (a
     caller-observed shape this pass never resizes); *how many* other things
     also read that same tensor is deliberately **not** checked here -- see
@@ -4188,6 +4523,32 @@ def _walk_conv_producer_backward(
             continue
 
         if node.op_type in _UNARY_PASS_THROUGH and len(node.input) == 1:
+            unary_ops.append(node)
+            edges.append((node.input[0], node))
+            cur = node.input[0]
+            continue
+
+        if (
+            node.op_type in _CONV_POOL_PASS_THROUGH
+            and node.domain == ""
+            and len(node.input) == 1
+        ):
+            unary_ops.append(node)
+            edges.append((node.input[0], node))
+            cur = node.input[0]
+            continue
+
+        if node.op_type == "Resize" and _match_resize_channel_pass_through(
+            node, initializer_map
+        ):
+            unary_ops.append(node)
+            edges.append((node.input[0], node))
+            cur = node.input[0]
+            continue
+
+        if node.op_type == "Pad" and _match_pad_channel_pass_through(
+            node, initializer_map
+        ):
             unary_ops.append(node)
             edges.append((node.input[0], node))
             cur = node.input[0]
