@@ -63,17 +63,18 @@ name: Core ML Integration
 # matching the other real-model jobs.
 #
 # A fifth job -- `quality-eval-macos` -- is the first slice of
-# bench/TODO_quality_retention_eval.md's quality/retention plan: it runs a small
-# IFEval subset (scripts/apple/run_quality_eval.py, an lm-evaluation-harness wrapper)
-# against both the float Hugging Face model (CPU, no macOS needed for that half) and
-# the exported Core ML model (scripts/apple/lm_eval_coreml_adapter.py, real Core ML
-# runtime), then scripts/apple/compute_retention.py reports the quantized/float score
-# ratio -- the third DeviceMark axis (https://devicemark.github.io/) alongside decode
-# speed and parity. Deliberately small (--limit, --max-gen-toks) and IFEval-only for
-# now: a prototype run of even a single MMLU-Pro example against this suite's
-# unbatched single-sequence decode took minutes on a small model on CPU (see that
-# plan doc's "Proposed scope" section) -- MMLU-Pro and MATH-500 stay future work until
-# that cost is addressed. Also workflow_dispatch/schedule-only.
+# bench/TODO_quality_retention_eval.md's quality/retention plan: it runs small IFEval
+# and MATH-500 subsets (scripts/apple/run_quality_eval.py, an lm-evaluation-harness
+# wrapper) against both the float Hugging Face model (CPU, no macOS needed for that
+# half) and the exported Core ML model (scripts/apple/lm_eval_coreml_adapter.py, real
+# Core ML runtime), then scripts/apple/compute_retention.py reports the quantized/float
+# score ratio for each -- the third DeviceMark axis (https://devicemark.github.io/)
+# alongside decode speed and parity. Deliberately small (--limit, --max-gen-toks):
+# a prototype run of even a single MMLU-Pro example against this suite's unbatched
+# single-sequence decode took minutes on a small model on CPU (see that plan doc's
+# "Proposed scope" section) -- MMLU-Pro alone stays future work until that per-example
+# cost is addressed; MATH-500 was the cheap one (~7s/example prototyped), which is why
+# it's the second benchmark here, not MMLU-Pro. Also workflow_dispatch/schedule-only.
 
 on:
   schedule:
@@ -474,7 +475,11 @@ jobs:
       - name: Install onnxsim wheel + LLM export/eval deps
         run: |
           python3 -m pip install --upgrade pip
-          python3 -m pip install "optimum-onnx" transformers accelerate coremltools onnxruntime "lm-eval[ifeval]"
+          # sympy: hendrycks_math500's answer scorer (lm_eval/tasks/hendrycks_math/utils.py)
+          # imports it directly for symbolic equivalence checking (e.g. 1/2 == 0.5) --
+          # not one of lm-eval's own declared dependencies, so it's listed explicitly
+          # rather than relying on optimum-onnx's torch pulling it in transitively.
+          python3 -m pip install "optimum-onnx" transformers accelerate coremltools onnxruntime sympy "lm-eval[ifeval]"
           python3 -m pip install wheelhouse/*.whl
       - name: Verify the installed wheel is used (not the source tree)
         working-directory: ${{ runner.temp }}
@@ -498,7 +503,7 @@ jobs:
             --model coreml --model-args "pretrained=model.mlpackage" \
             --tasks ifeval --limit 10 --max-gen-toks 128 --apply-chat-template \
             --output coreml_ifeval.json
-      - name: Compute quantized/float retention
+      - name: Compute quantized/float retention (IFEval)
         working-directory: ${{ runner.temp }}
         run: |
           {
@@ -506,5 +511,37 @@ jobs:
             echo '```'
             python3 "$GITHUB_WORKSPACE/scripts/apple/compute_retention.py" \
               float_ifeval.json coreml_ifeval.json
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+      # hendrycks_math500 (MATH-500 -- same HuggingFaceH4/MATH-500 source DeviceMark's
+      # own battery draws from, see bench/TODO_quality_retention_eval.md) is the second
+      # benchmark this suite runs in CI, not MMLU-Pro: prototyping found it far cheaper
+      # per example at this suite's unbatched single-sequence decode (~7s/example on
+      # CPU at --limit 3, vs. MMLU-Pro's ~2 minutes/example -- see that doc's "What's
+      # been prototyped" section) since its task YAML has no large default
+      # max_gen_toks. --max-gen-toks 256 here (vs. IFEval's 128) gives a little more
+      # room for the "show your work, then \boxed{}" answer format MATH problems use.
+      - name: Evaluate the float (Hugging Face) model on a small MATH-500 subset
+        working-directory: ${{ runner.temp }}
+        run: |
+          python3 "$GITHUB_WORKSPACE/scripts/apple/run_quality_eval.py" \
+            --model hf --model-args "pretrained=$MODEL_ID,dtype=float32" \
+            --tasks hendrycks_math500 --limit 10 --max-gen-toks 256 --apply-chat-template \
+            --output float_math500.json
+      - name: Evaluate the quantized (Core ML) model on the same subset
+        working-directory: ${{ runner.temp }}
+        run: |
+          python3 "$GITHUB_WORKSPACE/scripts/apple/run_quality_eval.py" \
+            --model coreml --model-args "pretrained=model.mlpackage" \
+            --tasks hendrycks_math500 --limit 10 --max-gen-toks 256 --apply-chat-template \
+            --output coreml_math500.json
+      - name: Compute quantized/float retention (MATH-500)
+        working-directory: ${{ runner.temp }}
+        run: |
+          {
+            echo "### Quality/retention: $MODEL_ID (MATH-500, --limit 10 -- not benchmark-grade)"
+            echo '```'
+            python3 "$GITHUB_WORKSPACE/scripts/apple/compute_retention.py" \
+              float_math500.json coreml_math500.json
             echo '```'
           } | tee -a "$GITHUB_STEP_SUMMARY"

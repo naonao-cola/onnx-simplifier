@@ -525,9 +525,11 @@ benchmark's default generation budget (MMLU-Pro's is 2048 tokens) directly
 sets wall-clock cost. A prototype run of even a single MMLU-Pro example
 against `HuggingFaceTB/SmolLM2-135M-Instruct` on CPU took well over a
 minute at that default -- `coreml-integration.yml`'s `quality-eval-macos`
-job (workflow_dispatch/schedule-only) therefore only runs IFEval for now,
-with both `--limit` and `--max-gen-toks` capped; MMLU-Pro and MATH-500 stay
-future work until that cost is addressed (see the plan doc's "Next steps").
+job (workflow_dispatch/schedule-only) therefore runs IFEval and MATH-500
+(`hendrycks_math500`, cheap at this suite's scale -- no large default
+generation budget in its task YAML, ~7s/example prototyped on CPU) with both
+`--limit` and `--max-gen-toks` capped; MMLU-Pro stays future work until its
+per-example cost is addressed (see the plan doc's "Next steps").
 
 The retention-ratio logic (`compute_retention`) has no lm-evaluation-harness/
 torch/coremltools dependency and is unit-tested directly in
