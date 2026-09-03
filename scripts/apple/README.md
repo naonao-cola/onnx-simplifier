@@ -87,7 +87,13 @@ check above: not "does Core ML accept this graph", but "how fast does a
 causal LM actually decode through `onnxsim.export_coreml`, on-device" --
 the same two axes (decode tok/s, peak memory) as
 [DeviceMark](https://devicemark.github.io/)'s on-device LLM leaderboard
-methodology.
+methodology. DeviceMark's own on-device runtime is a different, private
+"Core AI" engine (`aimodel` format), not `CoreML.framework`, and its board
+tests a different model roster (Qwen3.5, LFM2.5, Granite-4.0-H, and others --
+see `bench/TODO_quality_retention_eval.md`'s "What DeviceMark measures"
+section) -- this benchmark answers the same *kind* of question for onnxsim's
+own Core ML exporter, not a literal comparison against DeviceMark's own
+numbers.
 
 - `export_llm_to_coreml.py` exports a Hugging Face causal LM (via
   [`optimum-onnx`](https://github.com/huggingface/optimum-onnx)) to an ONNX
@@ -113,7 +119,9 @@ methodology.
 end-to-end on a macOS GitHub-hosted runner, over a matrix spanning the
 smoke-test tier (`HuggingFaceTB/SmolLM2-135M-Instruct`, plus its
 `--quantize-weights`/`--matmul-to-conv` variants -- see below) and the
-few-billion-parameter tier DeviceMark's own leaderboard actually tests
+few-billion-parameter tier -- the same rough weight class as DeviceMark's own
+leaderboard (roughly 0.8-5B; its own current roster is a different,
+non-overlapping model list, see `bench/TODO_quality_retention_eval.md`)
 (`HuggingFaceTB/SmolLM2-1.7B-Instruct`, `Qwen/Qwen2.5-1.5B-Instruct`,
 `Qwen/Qwen2.5-3B-Instruct`, `meta-llama/Llama-3.2-1B-Instruct`,
 `meta-llama/Llama-3.2-3B-Instruct`, `microsoft/Phi-3.5-mini-instruct`) --
@@ -467,8 +475,10 @@ correctness; they say nothing about actual model *quality* -- DeviceMark's
 third axis (alongside decode speed and memory), scored via IFEval, MMLU-Pro,
 and MATH-500, plus **retention**: how much of the float model's benchmark
 score survives quantization (`quantized_score / float_score`). See
-`bench/TODO_quality_retention_eval.md` for the full plan; this is the first
-implemented slice of it.
+`bench/TODO_quality_retention_eval.md` for the full plan (including exactly
+how DeviceMark itself defines this -- subset sizes, 0-shot, and a
+completed-only accuracy this repo's own `compute_retention.py` doesn't yet
+replicate); this is the first implemented slice of it.
 
 Rather than reimplementing any benchmark's prompt formatting or answer
 scoring, these two scripts lean on
@@ -525,8 +535,10 @@ torch/coremltools dependency and is unit-tested directly in
 
 ### Scaling to few-billion-parameter models
 
-DeviceMark's own leaderboard mostly tests models in the 1-4B range, well
-past `HuggingFaceTB/SmolLM2-135M-Instruct`'s 135M. The export pipeline above
+DeviceMark's own leaderboard tests models mostly in the 0.8-5B range (its
+current rows: Qwen3.5-0.8B/2B/4B, LFM2.5-1.2B, Granite-4.0-H-1B,
+Youtu-LLM-2B, Nemotron-3-Nano-4B, Nanbeige4.1-3B, Gemma 4 E2B), well past
+`HuggingFaceTB/SmolLM2-135M-Instruct`'s 135M. The export pipeline above
 has also been validated end-to-end against `HuggingFaceTB/SmolLM2-1.7B-Instruct`
 (24 layers, ~3.4GB of fp16 weights) -- converting a model at that scale
 needs a couple of extra considerations `export_llm_to_coreml.py` handles for
@@ -601,8 +613,11 @@ A batch wrapper around `export_llm_to_coreml.py`: exports every model in its
 `BENCHMARK_MODELS` list (or a `--only` subset) into its own
 `<output-dir>/<slug>/model.mlpackage`, so the result is a ready-made set of
 models to run `run_llm_decode_benchmark.py` against on macOS -- the actual
-"reproduce a DeviceMark-style benchmark" step. The default list spans a few
-architecture families in DeviceMark's own ~1-4B weight class (Llama-style,
+"reproduce a DeviceMark-style benchmark" step (in spirit: same rough weight
+class and the same decode-tok/s-and-memory axes, not literally DeviceMark's
+own models or its private on-device runtime -- see
+`bench/TODO_quality_retention_eval.md`). The default list spans a few
+architecture families in DeviceMark's own ~0.8-5B weight class (Llama-style,
 Qwen2, Phi-3), not just one, since `onnxsim/coreml_export.py`'s translator is
 a hand-written ONNX-to-MIL mapping where different architectures can exercise
 different op combinations -- see the script's module docstring for which
