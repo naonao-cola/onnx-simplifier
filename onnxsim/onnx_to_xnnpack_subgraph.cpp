@@ -11,6 +11,7 @@
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
+#include <utility>
 
 #include "dlpack_bridge.h"
 #include "dlpack_dtype.h"
@@ -144,6 +145,24 @@ int64_t AttrInt(const onnx::NodeProto& node, const std::string& name,
   return attr != nullptr ? attr->i() : default_value;
 }
 
+// Maps an ONNX quantized element dtype to the matching XNNPACK datatype.
+// Only int8/uint8 -- the two ONNX quantization uses (QuantizeLinear/
+// DequantizeLinear/QLinearMatMul's int8 or uint8 tensors), never int32
+// (QLinearMatMul-style bias accumulation is not part of this lowering's
+// quantized op set) or the sub-8-bit/float8 types XNNPACK also has
+// datatypes for.
+xnn_datatype MapQuantDtype(int32_t onnx_dtype) {
+  switch (onnx_dtype) {
+    case onnx::TensorProto::INT8:
+      return xnn_datatype_qint8;
+    case onnx::TensorProto::UINT8:
+      return xnn_datatype_quint8;
+    default:
+      throw std::runtime_error(
+          "xnnpack backend: a quantized tensor must be int8 or uint8");
+  }
+}
+
 // Threaded through every per-node lowering function below. Owns nothing
 // itself -- `subgraph` and `owned_tensors` are borrowed from the
 // LoweredSubgraph the caller (Lower(), at the bottom of this file) is
@@ -162,6 +181,15 @@ struct LoweringContext {
   // means the graph declared an output no node in it actually produces.
   std::unordered_map<std::string, uint32_t> pending_outputs;
   std::vector<DLManagedTensorPtr>* owned_tensors = nullptr;
+  // See LoweredSubgraph::owned_scale_arrays -- backs a per-channel
+  // quantized Value's scale array, which XNNPACK stores as a bare pointer.
+  std::vector<std::vector<float>>* owned_scale_arrays = nullptr;
+  // Set once in Lower() before any node is lowered. Needed to turn an
+  // external output id back into an index into `*output_dtypes` (output ids
+  // are reserved as [num_inputs, num_inputs + num_outputs), one per
+  // model.graph().output() position -- see Lower()).
+  uint32_t num_inputs = 0;
+  std::vector<DLDataType>* output_dtypes = nullptr;
 
   const std::vector<int64_t>& ShapeOf(const std::string& name) const {
     auto it = shapes.find(name);
@@ -210,43 +238,200 @@ struct LoweringContext {
     return id;
   }
 
-  // Reads out the actual int64 values of `name`, which must be a graph input
-  // or an initializer (not the output of another node in this fold group --
-  // XNNPACK's Reshape/Transpose take their target shape/permutation as
-  // compile-time-static arguments, not a runtime tensor input).
-  std::vector<int64_t> ReadInt64Values(const std::string& name) {
+  // Like GetOrDefineValueId, but for a Value that is either already defined
+  // (in which case `scale_name`/`zero_point_name`/`axis` are ignored -- the
+  // Value keeps whatever quantization it was first defined with) or a
+  // constant int8/uint8 initializer, quantized either per-tensor
+  // (`scale_name` resolves to exactly one value) or per-channel
+  // (`scale_name` resolves to one value per channel along `axis`, and
+  // `zero_point_name` must then be all zero --
+  // xnn_define_channelwise_quantized_tensor_value has no per-channel
+  // zero-point parameter, i.e. only symmetric per-channel quantization is
+  // supported).
+  uint32_t GetOrDefineQuantizedValueId(const std::string& name,
+                                       const std::string& scale_name,
+                                       const std::string& zero_point_name,
+                                       int64_t axis) {
+    auto it = value_ids.find(name);
+    if (it != value_ids.end()) return it->second;
+
+    auto init_it = initializers.find(name);
+    if (init_it == initializers.end()) {
+      throw std::runtime_error(
+          "xnnpack backend: value '" + name +
+          "' is neither a graph input, an initializer, nor a prior node "
+          "output");
+    }
+    const onnx::TensorProto& tp = *init_it->second;
+    const xnn_datatype dtype = MapQuantDtype(tp.data_type());
+    DLManagedTensor* dlt = dlpack::FromTensorProtoBorrowing(tp);
+    owned_tensors->emplace_back(dlt);
+    std::vector<int64_t> shape(dlt->dl_tensor.shape,
+                               dlt->dl_tensor.shape + dlt->dl_tensor.ndim);
+    auto dims = ToSizeVec(shape);
+
+    auto scales = ReadFloatValues(scale_name);
+    uint32_t id;
+    if (scales.size() == 1) {
+      int32_t zp_dtype;
+      const auto zps = ReadZeroPointValues(zero_point_name, &zp_dtype);
+      if (zps.size() != 1) {
+        throw std::runtime_error("xnnpack backend: '" + zero_point_name +
+                                 "' must have exactly one element for "
+                                 "per-tensor quantization of '" +
+                                 name + "'");
+      }
+      if (zp_dtype != tp.data_type()) {
+        throw std::runtime_error("xnnpack backend: '" + name +
+                                 "' and its zero point '" + zero_point_name +
+                                 "' must have the same int8/uint8 dtype");
+      }
+      CheckStatus(
+          xnn_define_quantized_tensor_value(
+              subgraph, dtype, zps[0], scales[0], dims.size(), dims.data(),
+              dlt->dl_tensor.data, XNN_INVALID_VALUE_ID, 0, &id),
+          "define quantized initializer '" + name + "'");
+    } else {
+      if (axis < 0 || static_cast<size_t>(axis) >= shape.size() ||
+          shape[static_cast<size_t>(axis)] !=
+              static_cast<int64_t>(scales.size())) {
+        throw std::runtime_error("xnnpack backend: '" + scale_name +
+                                 "' does not match '" + name +
+                                 "'s shape at axis " + std::to_string(axis));
+      }
+      // XNNPACK's per-channel datatypes are a distinct enum from their
+      // per-tensor counterparts (xnn_datatype_qcint8, not
+      // xnn_datatype_qint8) and only exist for signed data -- there is no
+      // per-channel unsigned-int8 datatype.
+      if (tp.data_type() != onnx::TensorProto::INT8) {
+        throw std::runtime_error(
+            "xnnpack backend: per-channel quantization of '" + name +
+            "' is only supported for int8 (not uint8)");
+      }
+      int32_t zp_dtype;
+      const auto zps = ReadZeroPointValues(zero_point_name, &zp_dtype);
+      if (!std::all_of(zps.begin(), zps.end(),
+                       [](int32_t z) { return z == 0; })) {
+        throw std::runtime_error(
+            "xnnpack backend: per-channel zero point for '" + name +
+            "' must be all zero (only symmetric per-channel quantization "
+            "is supported)");
+      }
+      // xnn_define_channelwise_quantized_tensor_value stores `scale` as a
+      // bare pointer (xnn_value.quantization.channelwise_scale), read again
+      // whenever a runtime is later created from this subgraph -- so the
+      // array must outlive this function call. Move it into
+      // owned_scale_arrays (parallel to owned_tensors' handling of tensor
+      // data) rather than passing the local `scales`' pointer directly,
+      // which would dangle the moment this function returns.
+      owned_scale_arrays->push_back(std::move(scales));
+      const float* scale_ptr = owned_scale_arrays->back().data();
+      CheckStatus(xnn_define_channelwise_quantized_tensor_value(
+                      subgraph, xnn_datatype_qcint8, scale_ptr, dims.size(),
+                      static_cast<size_t>(axis), dims.data(),
+                      dlt->dl_tensor.data, XNN_INVALID_VALUE_ID, 0, &id),
+                  "define channelwise-quantized initializer '" + name + "'");
+    }
+    value_ids[name] = id;
+    shapes[name] = std::move(shape);
+    return id;
+  }
+
+  // Resolves `name` to its concrete DLTensor -- either a graph input's
+  // tensor directly, or (for an initializer) a freshly materialized
+  // DLManagedTensor owned via `owned_tensors`. `name` must be a graph input
+  // or an initializer, not the output of another node in this fold group:
+  // every Read*Values helper below reads a compile-time-static argument
+  // (a shape, a permutation, a quantization scale/zero-point), never a
+  // runtime tensor. Shared by every Read*Values helper; each does its own
+  // dtype check since the expected dtype differs per caller.
+  const DLTensor& ResolveStaticTensor(const std::string& name) {
     auto gi = graph_input_index.find(name);
     if (gi != graph_input_index.end()) {
-      const DLTensor& t = inputs[gi->second]->dl_tensor;
-      if (!(t.dtype.code == kDLInt && t.dtype.bits == 64)) {
-        throw std::runtime_error("xnnpack backend: '" + name +
-                                 "' must be int64 to be used as a static "
-                                 "shape");
-      }
-      const auto* data = reinterpret_cast<const int64_t*>(
-          static_cast<const uint8_t*>(t.data) + t.byte_offset);
-      return std::vector<int64_t>(data,
-                                  data + dlpack::NumElements(t.shape, t.ndim));
+      return inputs[gi->second]->dl_tensor;
     }
     auto init_it = initializers.find(name);
     if (init_it != initializers.end()) {
-      const onnx::TensorProto& tp = *init_it->second;
-      if (tp.data_type() != onnx::TensorProto::INT64) {
-        throw std::runtime_error("xnnpack backend: '" + name +
-                                 "' must be int64 to be used as a static "
-                                 "shape");
-      }
-      DLManagedTensor* dlt = dlpack::FromTensorProtoBorrowing(tp);
+      DLManagedTensor* dlt = dlpack::FromTensorProtoBorrowing(*init_it->second);
       owned_tensors->emplace_back(dlt);
-      const auto* data = static_cast<const int64_t*>(dlt->dl_tensor.data);
-      return std::vector<int64_t>(
-          data, data + dlpack::NumElements(dlt->dl_tensor.shape,
-                                           dlt->dl_tensor.ndim));
+      return owned_tensors->back()->dl_tensor;
     }
     throw std::runtime_error(
         "xnnpack backend: '" + name +
-        "' must be a constant or a graph input to be used as a static shape "
+        "' must be a constant or a graph input to be used as a static value "
         "(this lowering does not support one produced by another node)");
+  }
+
+  // Reads out the actual int64 values of `name` -- used for Reshape's target
+  // shape.
+  std::vector<int64_t> ReadInt64Values(const std::string& name) {
+    const DLTensor& t = ResolveStaticTensor(name);
+    if (!(t.dtype.code == kDLInt && t.dtype.bits == 64)) {
+      throw std::runtime_error("xnnpack backend: '" + name +
+                               "' must be int64 to be used as a static shape");
+    }
+    const auto* data = reinterpret_cast<const int64_t*>(
+        static_cast<const uint8_t*>(t.data) + t.byte_offset);
+    return std::vector<int64_t>(data,
+                                data + dlpack::NumElements(t.shape, t.ndim));
+  }
+
+  // Reads out the actual fp32 values of `name` -- used for QuantizeLinear /
+  // DequantizeLinear / QLinearMatMul's scale tensors (per-tensor: one
+  // element; per-channel: one per output channel).
+  std::vector<float> ReadFloatValues(const std::string& name) {
+    const DLTensor& t = ResolveStaticTensor(name);
+    if (!(t.dtype.code == kDLFloat && t.dtype.bits == 32)) {
+      throw std::runtime_error("xnnpack backend: '" + name +
+                               "' must be fp32 to be used as a static scale");
+    }
+    const auto* data = reinterpret_cast<const float*>(
+        static_cast<const uint8_t*>(t.data) + t.byte_offset);
+    return std::vector<float>(data,
+                              data + dlpack::NumElements(t.shape, t.ndim));
+  }
+
+  // Reads out the values of `name` (int8 or uint8) widened to int32 -- used
+  // for QuantizeLinear/DequantizeLinear/QLinearMatMul's zero-point tensors.
+  // `*onnx_dtype_out` is set to the tensor's own ONNX dtype (TensorProto::
+  // INT8 or ::UINT8), which callers use (via MapQuantDtype) to determine a
+  // quantized Value's own datatype.
+  std::vector<int32_t> ReadZeroPointValues(const std::string& name,
+                                           int32_t* onnx_dtype_out) {
+    const DLTensor& t = ResolveStaticTensor(name);
+    const int64_t n = dlpack::NumElements(t.shape, t.ndim);
+    const auto* data = static_cast<const uint8_t*>(t.data) + t.byte_offset;
+    std::vector<int32_t> out(n);
+    if (t.dtype.code == kDLInt && t.dtype.bits == 8) {
+      *onnx_dtype_out = onnx::TensorProto::INT8;
+      for (int64_t i = 0; i < n; ++i) {
+        out[i] = reinterpret_cast<const int8_t*>(data)[i];
+      }
+    } else if (t.dtype.code == kDLUInt && t.dtype.bits == 8) {
+      *onnx_dtype_out = onnx::TensorProto::UINT8;
+      for (int64_t i = 0; i < n; ++i) out[i] = data[i];
+    } else {
+      throw std::runtime_error("xnnpack backend: '" + name +
+                               "' must be int8 or uint8 to be used as a "
+                               "zero point");
+    }
+    return out;
+  }
+
+  // Resolves the external id (and its flag) `name` should use when it is
+  // first defined as an output Value: the reserved external-output id if
+  // `name` is one of the graph's declared outputs, or XNN_INVALID_VALUE_ID
+  // (auto-assigned internal id) otherwise. Shared by DefineOutputValue and
+  // DefineQuantizedOutputValue below.
+  std::pair<uint32_t, uint32_t> ResolveOutputExternalId(
+      const std::string& name) {
+    auto it = pending_outputs.find(name);
+    if (it == pending_outputs.end()) {
+      return {XNN_INVALID_VALUE_ID, 0u};
+    }
+    const uint32_t external_id = it->second;
+    pending_outputs.erase(it);
+    return {external_id, static_cast<uint32_t>(XNN_VALUE_FLAG_EXTERNAL_OUTPUT)};
   }
 
   // Defines the output Value for a just-lowered node: as the reserved
@@ -256,19 +441,48 @@ struct LoweringContext {
   uint32_t DefineOutputValue(const std::string& name,
                              const std::vector<int64_t>& shape) {
     auto dims = ToSizeVec(shape);
-    uint32_t external_id = XNN_INVALID_VALUE_ID;
-    uint32_t flags = 0;
-    auto it = pending_outputs.find(name);
-    if (it != pending_outputs.end()) {
-      external_id = it->second;
-      flags = XNN_VALUE_FLAG_EXTERNAL_OUTPUT;
-      pending_outputs.erase(it);
+    const auto [external_id, flags] = ResolveOutputExternalId(name);
+    if (flags != 0) {
+      (*output_dtypes)[external_id - num_inputs] = DLDataType{kDLFloat, 32, 1};
     }
     uint32_t id;
     CheckStatus(
         xnn_define_tensor_value(subgraph, xnn_datatype_fp32, dims.size(),
                                 dims.data(), nullptr, external_id, flags, &id),
         "define value '" + name + "'");
+    value_ids[name] = id;
+    shapes[name] = shape;
+    return id;
+  }
+
+  // Like DefineOutputValue, but for a per-tensor quantized (qint8/quint8)
+  // Value -- QuantizeLinear's output, or QLinearMatMul's (this lowering only
+  // supports a per-tensor y_scale/y_zero_point for both; per-axis output
+  // quantization is unusual in practice and unsupported here).
+  uint32_t DefineQuantizedOutputValue(const std::string& name,
+                                      const std::vector<int64_t>& shape,
+                                      xnn_datatype dtype, float scale,
+                                      int32_t zero_point) {
+    auto dims = ToSizeVec(shape);
+    const auto [external_id, flags] = ResolveOutputExternalId(name);
+    if (flags != 0) {
+      DLDataType dl_dtype;
+      if (dtype == xnn_datatype_qint8) {
+        dl_dtype = DLDataType{kDLInt, 8, 1};
+      } else if (dtype == xnn_datatype_quint8) {
+        dl_dtype = DLDataType{kDLUInt, 8, 1};
+      } else {
+        throw std::runtime_error(
+            "xnnpack backend: internal error, unexpected quantized output "
+            "dtype");
+      }
+      (*output_dtypes)[external_id - num_inputs] = dl_dtype;
+    }
+    uint32_t id;
+    CheckStatus(xnn_define_quantized_tensor_value(
+                    subgraph, dtype, zero_point, scale, dims.size(),
+                    dims.data(), nullptr, external_id, flags, &id),
+                "define value '" + name + "'");
     value_ids[name] = id;
     shapes[name] = shape;
     return id;
@@ -416,6 +630,140 @@ void LowerReshape(LoweringContext& ctx, const onnx::NodeProto& node) {
               "Reshape '" + node.name() + "'");
 }
 
+// QuantizeLinear(x, y_scale, y_zero_point) -> y (int8/uint8). Lowers to an
+// XNNPACK "convert" Node between an fp32 Value and a quantized Value --
+// XNNPACK's unified subgraph ops (unlike DLPack) determine int8-vs-fp32
+// behavior from each Value's own declared datatype, not a separate op
+// variant. Per-tensor only (y_scale/y_zero_point are always required here,
+// so the output dtype is unambiguous; per-axis activation quantization is
+// unusual in practice and unsupported).
+void LowerQuantizeLinear(LoweringContext& ctx, const onnx::NodeProto& node) {
+  if (node.input_size() != 3 || node.output_size() != 1) {
+    throw std::runtime_error(
+        "xnnpack backend: QuantizeLinear must have 3 inputs (x, y_scale, "
+        "y_zero_point) and 1 output -- y_zero_point is required here so "
+        "the output dtype (int8 vs uint8) is unambiguous");
+  }
+  const uint32_t in_id = ctx.GetOrDefineValueId(node.input(0));
+  const auto& in_shape = ctx.ShapeOf(node.input(0));
+  const auto scales = ctx.ReadFloatValues(node.input(1));
+  if (scales.size() != 1) {
+    throw std::runtime_error(
+        "xnnpack backend: QuantizeLinear: per-axis quantization is not "
+        "supported (y_scale must have exactly one element)");
+  }
+  int32_t onnx_dtype;
+  const auto zps = ctx.ReadZeroPointValues(node.input(2), &onnx_dtype);
+  if (zps.size() != 1) {
+    throw std::runtime_error(
+        "xnnpack backend: QuantizeLinear: y_zero_point must have exactly "
+        "one element");
+  }
+  const uint32_t out = ctx.DefineQuantizedOutputValue(
+      node.output(0), in_shape, MapQuantDtype(onnx_dtype), scales[0], zps[0]);
+  xnn_unary_params params{};
+  CheckStatus(
+      xnn_define_unary(ctx.subgraph, xnn_unary_convert, &params, in_id, out, 0),
+      "QuantizeLinear '" + node.name() + "'");
+}
+
+// DequantizeLinear(x, x_scale, x_zero_point) -> y (fp32). The inverse
+// convert Node of LowerQuantizeLinear above. `x` is usually the output of a
+// preceding QuantizeLinear in this fold group, but may also be a constant
+// int8/uint8 initializer dequantized directly (handled the same way
+// QLinearMatMul's operands are, via GetOrDefineQuantizedValueId) -- per-
+// tensor only, like QuantizeLinear.
+void LowerDequantizeLinear(LoweringContext& ctx, const onnx::NodeProto& node) {
+  if (node.input_size() != 3 || node.output_size() != 1) {
+    throw std::runtime_error(
+        "xnnpack backend: DequantizeLinear must have 3 inputs (x, x_scale, "
+        "x_zero_point) and 1 output");
+  }
+  const auto scales = ctx.ReadFloatValues(node.input(1));
+  if (scales.size() != 1) {
+    throw std::runtime_error(
+        "xnnpack backend: DequantizeLinear: per-axis quantization is not "
+        "supported (x_scale must have exactly one element)");
+  }
+  const uint32_t in_id = ctx.GetOrDefineQuantizedValueId(
+      node.input(0), node.input(1), node.input(2), /*axis=*/1);
+  const auto& in_shape = ctx.ShapeOf(node.input(0));
+  const uint32_t out = ctx.DefineOutputValue(node.output(0), in_shape);
+  xnn_unary_params params{};
+  CheckStatus(
+      xnn_define_unary(ctx.subgraph, xnn_unary_convert, &params, in_id, out, 0),
+      "DequantizeLinear '" + node.name() + "'");
+}
+
+// QLinearMatMul(a, a_scale, a_zero_point, b, b_scale, b_zero_point, y_scale,
+// y_zero_point) -> y. Unlike QuantizeLinear/DequantizeLinear (a bridging
+// convert Node), this is a genuine int8 compute op -- ONNX's fused
+// quantized-matmul, operating directly on already-quantized a/b/y with no
+// float in between. Maps to the same xnn_define_fully_connected used for
+// Gemm/MatMul above (XNNPACK dispatches on the Values' quantized datatype
+// internally); QLinearMatMul has no bias input.
+void LowerQLinearMatMul(LoweringContext& ctx, const onnx::NodeProto& node) {
+  if (node.input_size() != 8 || node.output_size() != 1) {
+    throw std::runtime_error(
+        "xnnpack backend: QLinearMatMul must have 8 inputs (a, a_scale, "
+        "a_zero_point, b, b_scale, b_zero_point, y_scale, y_zero_point) "
+        "and 1 output");
+  }
+  const std::string& a = node.input(0);
+  const std::string& a_scale = node.input(1);
+  const std::string& a_zp = node.input(2);
+  const std::string& b = node.input(3);
+  const std::string& b_scale = node.input(4);
+  const std::string& b_zp = node.input(5);
+  const std::string& y_scale = node.input(6);
+  const std::string& y_zp = node.input(7);
+
+  // a is always per-tensor quantized per the ONNX spec (a_scale is a single
+  // value). b may be per-tensor or per-column (b_scale one value per output
+  // channel). b's layout here is [K, N] -- QLinearMatMul has no transpose
+  // attribute, unlike Gemm -- so its output-channel axis is 1, matching the
+  // XNN_FLAG_TRANSPOSE_WEIGHTS passed to xnn_define_fully_connected below
+  // (the same flag/layout LowerMatMul above uses for plain fp32 MatMul).
+  const uint32_t a_id =
+      ctx.GetOrDefineQuantizedValueId(a, a_scale, a_zp, /*axis=*/1);
+  const uint32_t b_id =
+      ctx.GetOrDefineQuantizedValueId(b, b_scale, b_zp, /*axis=*/1);
+  const auto& a_shape = ctx.ShapeOf(a);
+  const auto& b_shape = ctx.ShapeOf(b);
+  if (a_shape.size() != 2 || b_shape.size() != 2) {
+    throw std::runtime_error(
+        "xnnpack backend: QLinearMatMul only supports 2D operands");
+  }
+  const int64_t m = a_shape[0], k = a_shape[1];
+  if (b_shape[0] != k) {
+    throw std::runtime_error(
+        "xnnpack backend: QLinearMatMul: incompatible operand shapes");
+  }
+  const int64_t n = b_shape[1];
+
+  const auto y_scales = ctx.ReadFloatValues(y_scale);
+  if (y_scales.size() != 1) {
+    throw std::runtime_error(
+        "xnnpack backend: QLinearMatMul: per-axis output quantization is "
+        "not supported (y_scale must have exactly one element)");
+  }
+  int32_t y_onnx_dtype;
+  const auto y_zps = ctx.ReadZeroPointValues(y_zp, &y_onnx_dtype);
+  if (y_zps.size() != 1) {
+    throw std::runtime_error(
+        "xnnpack backend: QLinearMatMul: y_zero_point must have exactly "
+        "one element");
+  }
+  const uint32_t out = ctx.DefineQuantizedOutputValue(
+      node.output(0), {m, n}, MapQuantDtype(y_onnx_dtype), y_scales[0],
+      y_zps[0]);
+  CheckStatus(xnn_define_fully_connected(
+                  ctx.subgraph, -std::numeric_limits<float>::infinity(),
+                  std::numeric_limits<float>::infinity(), a_id, b_id,
+                  XNN_INVALID_VALUE_ID, out, XNN_FLAG_TRANSPOSE_WEIGHTS),
+              "QLinearMatMul '" + node.name() + "'");
+}
+
 void LowerNode(LoweringContext& ctx, const onnx::NodeProto& node) {
   const std::string& op = node.op_type();
   if (op == "Add") return LowerBinary(ctx, node, xnn_binary_add);
@@ -435,6 +783,9 @@ void LowerNode(LoweringContext& ctx, const onnx::NodeProto& node) {
   if (op == "Gemm") return LowerGemm(ctx, node);
   if (op == "MatMul") return LowerMatMul(ctx, node);
   if (op == "Reshape") return LowerReshape(ctx, node);
+  if (op == "QuantizeLinear") return LowerQuantizeLinear(ctx, node);
+  if (op == "DequantizeLinear") return LowerDequantizeLinear(ctx, node);
+  if (op == "QLinearMatMul") return LowerQLinearMatMul(ctx, node);
   throw std::runtime_error("xnnpack backend: unsupported op '" + op +
                            "' (node '" + node.name() + "')");
 }
@@ -463,12 +814,16 @@ LoweredSubgraph Lower(const onnx::ModelProto& model,
   LoweredSubgraph result;
   LoweringContext ctx{model, inputs};
   ctx.owned_tensors = &result.owned_tensors;
+  ctx.owned_scale_arrays = &result.owned_scale_arrays;
   for (const auto& tp : graph.initializer()) {
     ctx.initializers[tp.name()] = &tp;
   }
 
   const uint32_t num_inputs = static_cast<uint32_t>(graph.input_size());
   const uint32_t num_outputs = static_cast<uint32_t>(graph.output_size());
+  ctx.num_inputs = num_inputs;
+  result.output_dtypes.assign(num_outputs, DLDataType{});
+  ctx.output_dtypes = &result.output_dtypes;
   CheckStatus(xnn_create_subgraph(num_inputs + num_outputs, 0, &ctx.subgraph),
               "create subgraph");
   // Own the subgraph from this point on, so a throw below still cleans it up
