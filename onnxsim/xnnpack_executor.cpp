@@ -30,9 +30,9 @@ namespace {
 
 void CheckXnnStatus(xnn_status s, const char* what) {
   if (s != xnn_status_success) {
-    throw std::runtime_error(std::string("xnnpack backend: ") + what +
-                             " failed (xnn_status=" +
-                             std::to_string(static_cast<int>(s)) + ")");
+    throw std::runtime_error(
+        std::string("xnnpack backend: ") + what +
+        " failed (xnn_status=" + std::to_string(static_cast<int>(s)) + ")");
   }
 }
 
@@ -53,8 +53,7 @@ struct XnnpackOutputBuffer {
   std::vector<int64_t> shape;
 };
 
-DLManagedTensor* WrapOutputBuffer(
-    std::unique_ptr<XnnpackOutputBuffer> ctx) {
+DLManagedTensor* WrapOutputBuffer(std::unique_ptr<XnnpackOutputBuffer> ctx) {
   auto* managed = new DLManagedTensor;
   managed->dl_tensor.data = ctx->data.data();
   managed->dl_tensor.device = DLDevice{kDLCPU, 0};

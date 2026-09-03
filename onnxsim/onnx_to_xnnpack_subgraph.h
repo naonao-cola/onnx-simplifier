@@ -42,8 +42,7 @@ namespace xnnpack_backend {
 // Op types this lowering understands. Anything else in the fold-group graph
 // makes Lower() throw std::runtime_error naming the unsupported op.
 inline constexpr const char* kSupportedOps[] = {
-    "Add", "Sub", "Mul", "Div", "Relu", "Sigmoid",
-    "Gemm", "MatMul", "Reshape",
+    "Add", "Sub", "Mul", "Div", "Relu", "Sigmoid", "Gemm", "MatMul", "Reshape",
 };
 
 // Owns an xnn_subgraph_t plus everything it borrows: `subgraph` holds

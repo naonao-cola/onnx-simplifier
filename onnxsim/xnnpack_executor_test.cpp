@@ -34,7 +34,7 @@ void Check(bool cond, const std::string& what) {
 }
 
 void CheckClose(double a, double b, const std::string& what,
-               double atol = 1e-4) {
+                double atol = 1e-4) {
   Check(std::fabs(a - b) <= atol, what + " (got " + std::to_string(a) +
                                       ", want " + std::to_string(b) + ")");
 }
@@ -157,23 +157,21 @@ void TestAddThenReluBroadcast() {
   DLManagedTensor x = MakeInputTensor(x_shape, x_data);
   DLManagedTensor y = MakeInputTensor(y_shape, y_data);
 
-  auto outputs =
-      GetXnnpackModelExecutor()->Run(model, {&x, &y});
+  auto outputs = GetXnnpackModelExecutor()->Run(model, {&x, &y});
   Check(outputs.size() == 1, "Add+Relu: one output");
   if (outputs.empty()) return;
   Check(outputs[0]->dl_tensor.ndim == 2, "Add+Relu: output rank");
   const float* out = OutData(outputs[0]);
   const float expected[6] = {1, 0, 2, 0, 3, 0};
   for (int i = 0; i < 6; ++i) {
-    CheckClose(out[i], expected[i],
-              "Add+Relu: element " + std::to_string(i));
+    CheckClose(out[i], expected[i], "Add+Relu: element " + std::to_string(i));
   }
 }
 
 void TestSigmoid() {
-  auto model = MakeModel({MakeNode("Sigmoid", {"X"}, {"Y"})},
-                         {MakeValueInfo("X", {3})}, {MakeValueInfo("Y", {3})},
-                         {});
+  auto model =
+      MakeModel({MakeNode("Sigmoid", {"X"}, {"Y"})}, {MakeValueInfo("X", {3})},
+                {MakeValueInfo("Y", {3})}, {});
   std::vector<int64_t> x_shape{3};
   std::vector<float> x_data{0.0f, 2.0f, -2.0f};
   DLManagedTensor x = MakeInputTensor(x_shape, x_data);
@@ -194,16 +192,15 @@ void TestGemmWithBiasAndTransB() {
   // Y = A @ B^T + C, shape [2,4].
   onnx::NodeProto gemm = MakeNode("Gemm", {"A", "B", "C"}, {"Y"});
   AddIntAttr(gemm, "transB", 1);
-  const std::vector<float> b_data{
-      1, 0, 0,   //
-      0, 1, 0,   //
-      0, 0, 1,   //
-      1, 1, 1};  // [4,3]
+  const std::vector<float> b_data{1, 0, 0,   //
+                                  0, 1, 0,   //
+                                  0, 0, 1,   //
+                                  1, 1, 1};  // [4,3]
   const std::vector<float> c_data{10, 20, 30, 40};
-  auto model =
-      MakeModel({gemm}, {MakeValueInfo("A", {2, 3})}, {MakeValueInfo("Y", {2, 4})},
-               {MakeFloatInitializer("B", {4, 3}, b_data),
-                MakeFloatInitializer("C", {4}, c_data)});
+  auto model = MakeModel({gemm}, {MakeValueInfo("A", {2, 3})},
+                         {MakeValueInfo("Y", {2, 4})},
+                         {MakeFloatInitializer("B", {4, 3}, b_data),
+                          MakeFloatInitializer("C", {4}, c_data)});
 
   std::vector<int64_t> a_shape{2, 3};
   std::vector<float> a_data{1, 2, 3, 4, 5, 6};
@@ -213,8 +210,8 @@ void TestGemmWithBiasAndTransB() {
   Check(outputs.size() == 1, "Gemm: one output");
   if (outputs.empty()) return;
   Check(outputs[0]->dl_tensor.shape[0] == 2 &&
-           outputs[0]->dl_tensor.shape[1] == 4,
-       "Gemm: output shape");
+            outputs[0]->dl_tensor.shape[1] == 4,
+        "Gemm: output shape");
   const float* out = OutData(outputs[0]);
   // Row 0 of A is [1,2,3]: B^T columns are the standard basis e0,e1,e2 plus
   // an all-ones column, so A@B^T row 0 is [1, 2, 3, 6], plus bias.
@@ -228,10 +225,10 @@ void TestGemmWithBiasAndTransB() {
 void TestMatMul2D() {
   // A: [2,3] input, B: [3,2] initializer -> Y: [2,2].
   const std::vector<float> b_data{1, 4, 2, 5, 3, 6};  // [3,2]
-  auto model = MakeModel({MakeNode("MatMul", {"A", "B"}, {"Y"})},
-                         {MakeValueInfo("A", {2, 3})},
-                         {MakeValueInfo("Y", {2, 2})},
-                         {MakeFloatInitializer("B", {3, 2}, b_data)});
+  auto model =
+      MakeModel({MakeNode("MatMul", {"A", "B"}, {"Y"})},
+                {MakeValueInfo("A", {2, 3})}, {MakeValueInfo("Y", {2, 2})},
+                {MakeFloatInitializer("B", {3, 2}, b_data)});
 
   std::vector<int64_t> a_shape{2, 3};
   std::vector<float> a_data{1, 0, 0, 0, 1, 0};
@@ -252,10 +249,10 @@ void TestMatMul2D() {
 void TestReshapeWithInferredDim() {
   // X: [2,3,4] (24 elements) reshaped via a [-1, 4] initializer to [6,4].
   // Reshape never reorders memory, so the flattened data must be unchanged.
-  auto model = MakeModel(
-      {MakeNode("Reshape", {"X", "shape"}, {"Y"})},
-      {MakeValueInfo("X", {2, 3, 4})}, {MakeValueInfo("Y", {6, 4})},
-      {MakeInt64Initializer("shape", {2}, {-1, 4})});
+  auto model =
+      MakeModel({MakeNode("Reshape", {"X", "shape"}, {"Y"})},
+                {MakeValueInfo("X", {2, 3, 4})}, {MakeValueInfo("Y", {6, 4})},
+                {MakeInt64Initializer("shape", {2}, {-1, 4})});
 
   std::vector<int64_t> x_shape{2, 3, 4};
   std::vector<float> x_data(24);
@@ -266,9 +263,9 @@ void TestReshapeWithInferredDim() {
   Check(outputs.size() == 1, "Reshape: one output");
   if (outputs.empty()) return;
   Check(outputs[0]->dl_tensor.ndim == 2 &&
-           outputs[0]->dl_tensor.shape[0] == 6 &&
-           outputs[0]->dl_tensor.shape[1] == 4,
-       "Reshape: resolved output shape");
+            outputs[0]->dl_tensor.shape[0] == 6 &&
+            outputs[0]->dl_tensor.shape[1] == 4,
+        "Reshape: resolved output shape");
   const float* out = OutData(outputs[0]);
   for (int i = 0; i < 24; ++i) {
     CheckClose(out[i], x_data[i], "Reshape: element " + std::to_string(i));
@@ -276,11 +273,10 @@ void TestReshapeWithInferredDim() {
 }
 
 void TestUnsupportedOpThrows() {
-  auto model = MakeModel({MakeNode("Conv", {"X", "W"}, {"Y"})},
-                         {MakeValueInfo("X", {1, 1, 4, 4})},
-                         {MakeValueInfo("Y", {1, 1, 4, 4})},
-                         {MakeFloatInitializer("W", {1, 1, 3, 3},
-                                               std::vector<float>(9, 1.0f))});
+  auto model = MakeModel(
+      {MakeNode("Conv", {"X", "W"}, {"Y"})}, {MakeValueInfo("X", {1, 1, 4, 4})},
+      {MakeValueInfo("Y", {1, 1, 4, 4})},
+      {MakeFloatInitializer("W", {1, 1, 3, 3}, std::vector<float>(9, 1.0f))});
   std::vector<int64_t> x_shape{1, 1, 4, 4};
   std::vector<float> x_data(16, 1.0f);
   DLManagedTensor x = MakeInputTensor(x_shape, x_data);
@@ -291,8 +287,9 @@ void TestUnsupportedOpThrows() {
   } catch (const std::exception&) {
     threw = true;
   }
-  Check(threw, "unsupported op (Conv): Run() throws rather than "
-              "silently mis-executing");
+  Check(threw,
+        "unsupported op (Conv): Run() throws rather than "
+        "silently mis-executing");
 }
 
 }  // namespace

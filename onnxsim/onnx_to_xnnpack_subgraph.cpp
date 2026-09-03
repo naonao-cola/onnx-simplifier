@@ -167,8 +167,7 @@ struct LoweringContext {
     auto it = shapes.find(name);
     if (it == shapes.end()) {
       throw std::runtime_error(
-          "xnnpack backend: internal error, no known shape for '" + name +
-          "'");
+          "xnnpack backend: internal error, no known shape for '" + name + "'");
     }
     return it->second;
   }
@@ -202,11 +201,10 @@ struct LoweringContext {
                                dlt->dl_tensor.shape + dlt->dl_tensor.ndim);
     auto dims = ToSizeVec(shape);
     uint32_t id;
-    CheckStatus(
-        xnn_define_tensor_value(subgraph, xnn_datatype_fp32, dims.size(),
-                                dims.data(), dlt->dl_tensor.data,
-                                XNN_INVALID_VALUE_ID, 0, &id),
-        "define initializer '" + name + "'");
+    CheckStatus(xnn_define_tensor_value(
+                    subgraph, xnn_datatype_fp32, dims.size(), dims.data(),
+                    dlt->dl_tensor.data, XNN_INVALID_VALUE_ID, 0, &id),
+                "define initializer '" + name + "'");
     value_ids[name] = id;
     shapes[name] = std::move(shape);
     return id;
@@ -227,8 +225,8 @@ struct LoweringContext {
       }
       const auto* data = reinterpret_cast<const int64_t*>(
           static_cast<const uint8_t*>(t.data) + t.byte_offset);
-      return std::vector<int64_t>(data, data + dlpack::NumElements(t.shape,
-                                                                    t.ndim));
+      return std::vector<int64_t>(data,
+                                  data + dlpack::NumElements(t.shape, t.ndim));
     }
     auto init_it = initializers.find(name);
     if (init_it != initializers.end()) {
@@ -240,8 +238,7 @@ struct LoweringContext {
       }
       DLManagedTensor* dlt = dlpack::FromTensorProtoBorrowing(tp);
       owned_tensors->emplace_back(dlt);
-      const auto* data =
-          static_cast<const int64_t*>(dlt->dl_tensor.data);
+      const auto* data = static_cast<const int64_t*>(dlt->dl_tensor.data);
       return std::vector<int64_t>(
           data, data + dlpack::NumElements(dlt->dl_tensor.shape,
                                            dlt->dl_tensor.ndim));
@@ -270,8 +267,7 @@ struct LoweringContext {
     uint32_t id;
     CheckStatus(
         xnn_define_tensor_value(subgraph, xnn_datatype_fp32, dims.size(),
-                                dims.data(), nullptr, external_id, flags,
-                                &id),
+                                dims.data(), nullptr, external_id, flags, &id),
         "define value '" + name + "'");
     value_ids[name] = id;
     shapes[name] = shape;
@@ -292,9 +288,8 @@ void LowerBinary(LoweringContext& ctx, const onnx::NodeProto& node,
   const uint32_t out = ctx.DefineOutputValue(node.output(0), out_shape);
   const xnn_binary_params params{-std::numeric_limits<double>::infinity(),
                                  std::numeric_limits<double>::infinity()};
-  CheckStatus(
-      xnn_define_binary(ctx.subgraph, type, &params, in1, in2, out, 0),
-      node.op_type() + " '" + node.name() + "'");
+  CheckStatus(xnn_define_binary(ctx.subgraph, type, &params, in1, in2, out, 0),
+              node.op_type() + " '" + node.name() + "'");
 }
 
 void LowerUnary(LoweringContext& ctx, const onnx::NodeProto& node,
@@ -347,14 +342,12 @@ void LowerMatMulLike(LoweringContext& ctx, const onnx::NodeProto& node,
     }
   }
   const uint32_t flags = b_is_transposed ? 0 : XNN_FLAG_TRANSPOSE_WEIGHTS;
-  const uint32_t out =
-      ctx.DefineOutputValue(node.output(0), {m, n});
-  CheckStatus(
-      xnn_define_fully_connected(
-          ctx.subgraph, -std::numeric_limits<float>::infinity(),
-          std::numeric_limits<float>::infinity(), a_id, b_id, bias_id, out,
-          flags),
-      node.op_type() + " '" + node.name() + "'");
+  const uint32_t out = ctx.DefineOutputValue(node.output(0), {m, n});
+  CheckStatus(xnn_define_fully_connected(
+                  ctx.subgraph, -std::numeric_limits<float>::infinity(),
+                  std::numeric_limits<float>::infinity(), a_id, b_id, bias_id,
+                  out, flags),
+              node.op_type() + " '" + node.name() + "'");
 }
 
 void LowerGemm(LoweringContext& ctx, const onnx::NodeProto& node) {
@@ -380,8 +373,7 @@ void LowerGemm(LoweringContext& ctx, const onnx::NodeProto& node) {
     if (beta == 1.0f) {
       bias_name = node.input(2);
     } else if (beta != 0.0f) {
-      throw std::runtime_error(
-          "xnnpack backend: Gemm beta must be 0 or 1");
+      throw std::runtime_error("xnnpack backend: Gemm beta must be 0 or 1");
     }
     // beta == 0: C is present but contributes nothing; drop it, matching the
     // ONNX spec ("if beta is 0, C is not required to be defined ... its
@@ -419,8 +411,8 @@ void LowerReshape(LoweringContext& ctx, const onnx::NodeProto& node) {
   }
   const uint32_t out = ctx.DefineOutputValue(node.output(0), out_shape);
   const auto dims = ToSizeVec(out_shape);
-  CheckStatus(xnn_define_static_reshape(ctx.subgraph, dims.size(),
-                                        dims.data(), in_id, out, 0),
+  CheckStatus(xnn_define_static_reshape(ctx.subgraph, dims.size(), dims.data(),
+                                        in_id, out, 0),
               "Reshape '" + node.name() + "'");
 }
 
@@ -462,10 +454,10 @@ LoweredSubgraph Lower(const onnx::ModelProto& model,
                       const std::vector<const DLManagedTensor*>& inputs) {
   const auto& graph = model.graph();
   if (static_cast<size_t>(graph.input_size()) != inputs.size()) {
-    throw std::invalid_argument(
-        "xnnpack backend: Lower() got " + std::to_string(inputs.size()) +
-        " inputs for a graph declaring " +
-        std::to_string(graph.input_size()) + " inputs");
+    throw std::invalid_argument("xnnpack backend: Lower() got " +
+                                std::to_string(inputs.size()) +
+                                " inputs for a graph declaring " +
+                                std::to_string(graph.input_size()) + " inputs");
   }
 
   LoweredSubgraph result;
@@ -477,9 +469,8 @@ LoweredSubgraph Lower(const onnx::ModelProto& model,
 
   const uint32_t num_inputs = static_cast<uint32_t>(graph.input_size());
   const uint32_t num_outputs = static_cast<uint32_t>(graph.output_size());
-  CheckStatus(
-      xnn_create_subgraph(num_inputs + num_outputs, 0, &ctx.subgraph),
-      "create subgraph");
+  CheckStatus(xnn_create_subgraph(num_inputs + num_outputs, 0, &ctx.subgraph),
+              "create subgraph");
   // Own the subgraph from this point on, so a throw below still cleans it up
   // via ~LoweredSubgraph.
   result.subgraph = ctx.subgraph;
@@ -498,11 +489,10 @@ LoweredSubgraph Lower(const onnx::ModelProto& model,
     std::vector<int64_t> shape(t.shape, t.shape + t.ndim);
     auto dims = ToSizeVec(shape);
     uint32_t id;
-    CheckStatus(
-        xnn_define_tensor_value(ctx.subgraph, xnn_datatype_fp32, dims.size(),
-                                dims.data(), nullptr, i,
-                                XNN_VALUE_FLAG_EXTERNAL_INPUT, &id),
-        "define graph input '" + vi.name() + "'");
+    CheckStatus(xnn_define_tensor_value(ctx.subgraph, xnn_datatype_fp32,
+                                        dims.size(), dims.data(), nullptr, i,
+                                        XNN_VALUE_FLAG_EXTERNAL_INPUT, &id),
+                "define graph input '" + vi.name() + "'");
     ctx.value_ids[vi.name()] = id;
     ctx.shapes[vi.name()] = std::move(shape);
     ctx.graph_input_index[vi.name()] = static_cast<int>(i);
@@ -524,16 +514,16 @@ LoweredSubgraph Lower(const onnx::ModelProto& model,
   }
 
   if (!ctx.pending_outputs.empty()) {
-    throw std::runtime_error(
-        "xnnpack backend: graph output '" + ctx.pending_outputs.begin()->first +
-        "' is not produced by any node in the graph");
+    throw std::runtime_error("xnnpack backend: graph output '" +
+                             ctx.pending_outputs.begin()->first +
+                             "' is not produced by any node in the graph");
   }
 
   result.input_value_ids.resize(num_inputs);
   std::iota(result.input_value_ids.begin(), result.input_value_ids.end(), 0);
   result.output_value_ids.resize(num_outputs);
   std::iota(result.output_value_ids.begin(), result.output_value_ids.end(),
-           num_inputs);
+            num_inputs);
   return result;
 }
 
