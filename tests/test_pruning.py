@@ -21862,6 +21862,443 @@ def test_embedding_vocab_pruning_declines_when_no_embedding_pattern_exists():
     assert result.model.SerializeToString() == model.SerializeToString()
 
 
+# --- Embedding / lm_head vocabulary pruning: EmbedLayerNormalization ------
+#
+# The fused ``com.microsoft::EmbedLayerNormalization`` producer shape (see
+# ``onnxsim/pruning.py``'s own "Embedding / lm_head vocabulary pruning"
+# section comment and :func:`onnxsim.pruning._match_embed_layer_norm_producer`'s
+# own docstring for the full empirical schema/scope writeup). Every
+# correctness test below is checked against a real, INDEPENDENTLY
+# reconstructed "already pruned" reference model -- a fresh small-vocab
+# model built directly from a manually-sliced numpy array, never derived by
+# calling any `apply_*`/`_apply_*` function a second time and never a
+# post-hoc slice of the *unpruned* model's own output -- run through its
+# own real `onnxruntime.InferenceSession`, exactly like the pruned model
+# itself. `EmbedLayerNormalization` has a real CPU kernel in this
+# environment (confirmed directly: a plain `InferenceSession` construction
+# against a small hand-built model succeeds and runs), so no decomposed-
+# proxy-topology fallback is needed here.
+
+
+def _embed_layer_norm_model(
+    word_emb,
+    pos_emb,
+    gamma,
+    beta,
+    *,
+    segment_emb=None,
+    mask_index_output=True,
+    embedding_sum_output=False,
+    batch=2,
+    seq=3,
+    extra_body="",
+    extra_outputs="",
+):
+    H = word_emb.shape[1]
+    inits = [
+        _f32(word_emb, "word_embedding"),
+        _f32(pos_emb, "position_embedding"),
+        _f32(gamma, "gamma"),
+        _f32(beta, "beta"),
+    ]
+    inputs = [f"int32[{batch},{seq}] input_ids"]
+    seg_arg, seg_w_arg = "", ""
+    if segment_emb is not None:
+        inits.append(_f32(segment_emb, "segment_embedding"))
+        inputs.append(f"int32[{batch},{seq}] segment_ids")
+        seg_arg, seg_w_arg = "segment_ids", "segment_embedding"
+
+    out_decls = [f"float[{batch},{seq},{H}] output"]
+    # onnxruntime's own EmbedLayerNormalization type/shape inference
+    # unconditionally looks at output index 1 (confirmed directly: a node
+    # with only a single declared output fails InferenceSession
+    # construction with "output index 1 is out of range") -- so the node
+    # itself always carries a real `mask_index` output name, whether or not
+    # the test wants it declared as a genuine graph output/consumed by
+    # anything (an ordinary, harmless unused intermediate value otherwise).
+    out_names = ["output", "mask_index"]
+    if mask_index_output:
+        out_decls.append(f"int32[{batch}] mask_index")
+    if embedding_sum_output:
+        out_decls.append(f"float[{batch},{seq},{H}] embedding_sum")
+        out_names.append("embedding_sum")
+    out_decls.append(extra_outputs) if extra_outputs else None
+
+    node = (
+        f"{', '.join(out_names)} = "
+        f"com.microsoft.EmbedLayerNormalization<epsilon=1e-12>"
+        f"(input_ids, {seg_arg}, word_embedding, position_embedding, "
+        f"{seg_w_arg}, gamma, beta)"
+    )
+    body = f"""
+        g ({", ".join(inputs)}) => ({", ".join(d for d in out_decls if d)})
+        {{
+          {node}
+          {extra_body}
+        }}
+        """
+    model = _model(body, initializer=inits)
+    model.opset_import.append(onnx.helper.make_opsetid("com.microsoft", 1))
+    return model
+
+
+def test_embedding_vocab_pruning_embed_layer_norm_word_embedding_matches_independent_oracle():
+    # Basic correctness: word_embedding's vocab axis is sliced, gamma/beta/
+    # position_embedding are left completely untouched, and the pruned
+    # model's real output matches an independently (from-scratch) built
+    # small-vocab reference model's own real output.
+    V, P, H = 12, 16, 8
+    rng = np.random.default_rng(101)
+    word_emb = rng.standard_normal((V, H)).astype(np.float32)
+    pos_emb = rng.standard_normal((P, H)).astype(np.float32)
+    gamma = rng.standard_normal(H).astype(np.float32) * 0.5 + 1.0
+    beta = rng.standard_normal(H).astype(np.float32) * 0.1
+
+    model = _embed_layer_norm_model(word_emb, pos_emb, gamma, beta)
+    onnx.checker.check_model(model)
+
+    keep_token_ids = [1, 3, 4, 6, 8, 9, 11]
+    result = onnxsim.apply_embedding_vocab_pruning(model, keep_token_ids=keep_token_ids)
+    onnx.checker.check_model(result.model)
+
+    assert result.matched
+    assert not result.lm_head_pruned  # no lm_head in this graph at all
+    assert result.kept_token_ids == keep_token_ids
+    assert result.id_map == {tok: i for i, tok in enumerate(keep_token_ids)}
+
+    inits = {t.name: t for t in result.model.graph.initializer}
+    assert list(inits["word_embedding"].dims) == [len(keep_token_ids), H]
+    np.testing.assert_array_equal(
+        onnx.numpy_helper.to_array(inits["word_embedding"]), word_emb[keep_token_ids]
+    )
+    # gamma/beta/position_embedding: byte-identical, completely untouched.
+    np.testing.assert_array_equal(onnx.numpy_helper.to_array(inits["gamma"]), gamma)
+    np.testing.assert_array_equal(onnx.numpy_helper.to_array(inits["beta"]), beta)
+    np.testing.assert_array_equal(
+        onnx.numpy_helper.to_array(inits["position_embedding"]), pos_emb
+    )
+
+    # Independent oracle: a fresh model built directly from the manually
+    # pre-sliced word_embedding, never touching apply_embedding_vocab_pruning
+    # or any of onnxsim.pruning's own matching/slicing code.
+    ref_model = _embed_layer_norm_model(word_emb[keep_token_ids], pos_emb, gamma, beta)
+    onnx.checker.check_model(ref_model)
+
+    orig_ids = np.array([[1, 3, 4], [6, 8, 9]], dtype=np.int32)
+    local_ids = np.array(
+        [[keep_token_ids.index(int(t)) for t in row] for row in orig_ids],
+        dtype=np.int32,
+    )
+    # Sanity: independently-computed local ids must equal id_map's own.
+    assert local_ids.tolist() == [
+        [result.id_map[int(t)] for t in row] for row in orig_ids
+    ]
+
+    pruned_out, pruned_mask = _run(result.model, {"input_ids": local_ids})
+    ref_out, ref_mask = _run(ref_model, {"input_ids": local_ids})
+    np.testing.assert_allclose(pruned_out, ref_out, atol=1e-5, rtol=1e-5)
+    np.testing.assert_array_equal(pruned_mask, ref_mask)
+
+
+def test_embedding_vocab_pruning_embed_layer_norm_segment_embedding_left_untouched():
+    # segment_embedding is indexed by segment_ids (BERT's token_type_ids --
+    # a small, unrelated index space), never the token-vocabulary
+    # keep_token_ids/id_map -- it must be left completely untouched, and
+    # the pruned model must still execute correctly (segment lookups still
+    # correct, word lookups correctly renumbered).
+    V, P, S, H = 10, 12, 2, 6
+    rng = np.random.default_rng(102)
+    word_emb = rng.standard_normal((V, H)).astype(np.float32)
+    pos_emb = rng.standard_normal((P, H)).astype(np.float32)
+    seg_emb = rng.standard_normal((S, H)).astype(np.float32)
+    gamma = np.ones(H, dtype=np.float32)
+    beta = np.zeros(H, dtype=np.float32)
+
+    model = _embed_layer_norm_model(word_emb, pos_emb, gamma, beta, segment_emb=seg_emb)
+    onnx.checker.check_model(model)
+
+    keep_token_ids = [0, 2, 3, 5, 7, 9]
+    result = onnxsim.apply_embedding_vocab_pruning(model, keep_token_ids=keep_token_ids)
+    onnx.checker.check_model(result.model)
+    assert result.matched
+
+    inits = {t.name: t for t in result.model.graph.initializer}
+    # segment_embedding: byte-identical, completely untouched (different,
+    # unrelated index space -- see this pass's own scope decision).
+    np.testing.assert_array_equal(
+        onnx.numpy_helper.to_array(inits["segment_embedding"]), seg_emb
+    )
+    assert list(inits["word_embedding"].dims) == [len(keep_token_ids), H]
+
+    ref_model = _embed_layer_norm_model(
+        word_emb[keep_token_ids], pos_emb, gamma, beta, segment_emb=seg_emb
+    )
+    onnx.checker.check_model(ref_model)
+
+    orig_ids = np.array([[0, 2, 3], [5, 7, 9]], dtype=np.int32)
+    local_ids = np.array(
+        [[result.id_map[int(t)] for t in row] for row in orig_ids], dtype=np.int32
+    )
+    segment_ids = np.array([[0, 0, 1], [1, 0, 1]], dtype=np.int32)
+
+    pruned_out, pruned_mask = _run(
+        result.model, {"input_ids": local_ids, "segment_ids": segment_ids}
+    )
+    ref_out, ref_mask = _run(
+        ref_model, {"input_ids": local_ids, "segment_ids": segment_ids}
+    )
+    np.testing.assert_allclose(pruned_out, ref_out, atol=1e-5, rtol=1e-5)
+    np.testing.assert_array_equal(pruned_mask, ref_mask)
+
+
+def test_embedding_vocab_magnitude_pruning_embed_layer_norm_matches_independent_oracle():
+    V, P, H = 10, 8, 4
+    word_emb = np.full((V, H), 5.0, dtype=np.float32)
+    word_emb[2] *= 0.001  # deliberately tiny-norm rows -- dropped first
+    word_emb[7] *= 0.001
+    pos_emb = np.random.default_rng(103).standard_normal((P, H)).astype(np.float32)
+    gamma = np.ones(H, dtype=np.float32)
+    beta = np.zeros(H, dtype=np.float32)
+
+    model = _embed_layer_norm_model(word_emb, pos_emb, gamma, beta)
+    onnx.checker.check_model(model)
+
+    result = onnxsim.apply_embedding_vocab_magnitude_pruning(model, sparsity=0.3)
+    onnx.checker.check_model(result.model)
+    assert result.matched
+    assert not result.lm_head_pruned
+    assert len(result.kept_token_ids) == round(V * 0.7) == 7
+    assert 2 not in result.kept_token_ids
+    assert 7 not in result.kept_token_ids
+
+    kept = result.kept_token_ids
+    ref_model = _embed_layer_norm_model(word_emb[kept], pos_emb, gamma, beta)
+    onnx.checker.check_model(ref_model)
+
+    orig_ids = np.array(
+        [[kept[0], kept[1], kept[2]], [kept[3], kept[4], kept[5]]], dtype=np.int32
+    )
+    local_ids = np.array(
+        [[result.id_map[int(t)] for t in row] for row in orig_ids], dtype=np.int32
+    )
+    pruned_out, _ = _run(result.model, {"input_ids": local_ids})
+    ref_out, _ = _run(ref_model, {"input_ids": local_ids})
+    np.testing.assert_allclose(pruned_out, ref_out, atol=1e-5, rtol=1e-5)
+
+
+def test_embedding_vocab_pruning_embed_layer_norm_tied_lm_head_matches_independent_oracle():
+    # A tied lm_head -- the "Transpose then MatMul" tied sub-shape (`Gemm`
+    # has no batch-dim support, and `EmbedLayerNormalization`'s own
+    # `output` is inherently 3-D, so a direct `Gemm(transB=1)` isn't a
+    # valid consumer here at all -- confirmed directly: onnxruntime's own
+    # `InferenceSession` construction rejects it with a rank-mismatch
+    # shape-inference error) -- is still recognized when the embedding
+    # table is consumed via `EmbedLayerNormalization`:
+    # `_match_tied_lm_head`/`_match_untied_lm_head` are reused completely
+    # unchanged, since neither assumes its primary consuming node is
+    # literally a `Gather`.
+    V, P, H = 9, 8, 5
+    rng = np.random.default_rng(104)
+    word_emb = rng.standard_normal((V, H)).astype(np.float32)
+    pos_emb = rng.standard_normal((P, H)).astype(np.float32)
+    gamma = np.ones(H, dtype=np.float32)
+    beta = np.zeros(H, dtype=np.float32)
+    tied_body = (
+        "w_t = Transpose<perm=[1,0]>(word_embedding)\n"
+        "          logits = MatMul(output, w_t)"
+    )
+
+    model = _embed_layer_norm_model(
+        word_emb,
+        pos_emb,
+        gamma,
+        beta,
+        mask_index_output=False,
+        extra_body=tied_body,
+        extra_outputs=f"float[2,3,{V}] logits",
+    )
+    onnx.checker.check_model(model)
+    assert len([t for t in model.graph.initializer if t.name == "word_embedding"]) == 1
+
+    keep_token_ids = [0, 1, 3, 5, 6, 8]
+    result = onnxsim.apply_embedding_vocab_pruning(model, drop_token_ids=[2, 4, 7])
+    onnx.checker.check_model(result.model)
+    assert result.matched
+    assert result.lm_head_pruned
+    assert result.kept_token_ids == keep_token_ids
+    # Tied -- still exactly one word_embedding initializer, sliced once.
+    assert (
+        len([t for t in result.model.graph.initializer if t.name == "word_embedding"])
+        == 1
+    )
+
+    ref_model = _embed_layer_norm_model(
+        word_emb[keep_token_ids],
+        pos_emb,
+        gamma,
+        beta,
+        mask_index_output=False,
+        extra_body=tied_body,
+        extra_outputs=f"float[2,3,{len(keep_token_ids)}] logits",
+    )
+    onnx.checker.check_model(ref_model)
+
+    orig_ids = np.array([[0, 1, 3], [5, 6, 8]], dtype=np.int32)
+    local_ids = np.array(
+        [[result.id_map[int(t)] for t in row] for row in orig_ids], dtype=np.int32
+    )
+    _pruned_hidden, pruned_logits = _run(result.model, {"input_ids": local_ids})
+    _ref_hidden, ref_logits = _run(ref_model, {"input_ids": local_ids})
+    assert pruned_logits.shape[-1] == len(keep_token_ids)
+    np.testing.assert_allclose(pruned_logits, ref_logits, atol=1e-4, rtol=1e-4)
+
+
+def _ambiguous_embed_layer_norm_model(V1=10, V2=8, P=6, H=4, seed=105):
+    # Two structurally-eligible EmbedLayerNormalization producers, each
+    # reading its own genuine graph input -- no reliable way to tell which
+    # is "the" token embedding without input_name.
+    rng = np.random.default_rng(seed)
+    w1 = rng.standard_normal((V1, H)).astype(np.float32)
+    w2 = rng.standard_normal((V2, H)).astype(np.float32)
+    pos_emb = rng.standard_normal((P, H)).astype(np.float32)
+    gamma = np.ones(H, dtype=np.float32)
+    beta = np.zeros(H, dtype=np.float32)
+    model = _model(
+        f"""
+        g (int32[2,3] input_ids_a, int32[2,3] input_ids_b) =>
+           (float[2,3,{H}] out_a, float[2,3,{H}] out_b)
+        {{
+          out_a, mask_a = com.microsoft.EmbedLayerNormalization<epsilon=1e-12>(
+              input_ids_a, , W1, Pos, , Gamma, Beta)
+          out_b, mask_b = com.microsoft.EmbedLayerNormalization<epsilon=1e-12>(
+              input_ids_b, , W2, Pos, , Gamma, Beta)
+        }}
+        """,
+        initializer=[
+            _f32(w1, "W1"),
+            _f32(w2, "W2"),
+            _f32(pos_emb, "Pos"),
+            _f32(gamma, "Gamma"),
+            _f32(beta, "Beta"),
+        ],
+    )
+    model.opset_import.append(onnx.helper.make_opsetid("com.microsoft", 1))
+    onnx.checker.check_model(model)
+    return model
+
+
+def test_embedding_vocab_pruning_declines_when_embed_layer_norm_is_ambiguous():
+    model = _ambiguous_embed_layer_norm_model()
+    result = onnxsim.apply_embedding_vocab_pruning(model, keep_token_ids=[0, 1, 2])
+    assert result.matched is False
+    assert result.model.SerializeToString() == model.SerializeToString()
+
+
+def test_embedding_vocab_pruning_embed_layer_norm_input_name_disambiguates():
+    model = _ambiguous_embed_layer_norm_model(V1=10, V2=8)
+    result = onnxsim.apply_embedding_vocab_pruning(
+        model, drop_token_ids=[4, 5], input_name="input_ids_a"
+    )
+    assert result.matched
+    assert result.kept_token_ids == [0, 1, 2, 3, 6, 7, 8, 9]
+    w2 = {t.name: t for t in result.model.graph.initializer}["W2"]
+    assert list(w2.dims) == [8, 4]  # the other producer's table, untouched
+
+
+def test_analyze_embedding_vocab_magnitude_pruning_embed_layer_norm_matches_real_call():
+    V, P, H = 10, 8, 4
+    rng = np.random.default_rng(106)
+    word_emb = (rng.standard_normal((V, H)) * np.linspace(3.0, 0.1, V)[:, None]).astype(
+        np.float32
+    )
+    pos_emb = rng.standard_normal((P, H)).astype(np.float32)
+    gamma = np.ones(H, dtype=np.float32)
+    beta = np.zeros(H, dtype=np.float32)
+    model = _embed_layer_norm_model(word_emb, pos_emb, gamma, beta)
+
+    report = onnxsim.analyze_pruning_sensitivity(
+        model, onnxsim.apply_embedding_vocab_magnitude_pruning, sparsity=0.3
+    )
+    assert len(report.layers) == 1
+    layer = report.layers[0]
+    assert layer.family == "embedding_vocab_magnitude"
+    assert layer.total == V
+    assert report.not_eligible == []
+
+    result = onnxsim.apply_embedding_vocab_magnitude_pruning(model, sparsity=0.3)
+    assert layer.would_drop == V - len(result.kept_token_ids)
+
+
+def test_analyze_embedding_vocab_magnitude_pruning_embed_layer_norm_ambiguous_reports_not_eligible():
+    model = _ambiguous_embed_layer_norm_model()
+    report = onnxsim.analyze_pruning_sensitivity(
+        model, onnxsim.apply_embedding_vocab_magnitude_pruning, sparsity=0.3
+    )
+    assert report.layers == []
+    assert sorted(report.not_eligible) == [
+        "EmbedLayerNormalization 'out_a'",
+        "EmbedLayerNormalization 'out_b'",
+    ]
+
+
+def test_embedding_vocab_pruning_embed_layer_norm_mask_index_and_embedding_sum_consumed_downstream():
+    # Both optional outputs actually consumed by something else (not just
+    # declared) -- neither needs a "declined if consumed" check the way
+    # SkipLayerNormalization's own optional mean/inv_std_var/
+    # input_skip_bias_sum do, because neither mask_index's nor
+    # embedding_sum's shape/value depends on vocab_size at all. The whole
+    # call must still match (no spurious decline), and embedding_sum's own
+    # real values must still be correct post-prune.
+    V, P, H = 10, 8, 6
+    rng = np.random.default_rng(107)
+    word_emb = rng.standard_normal((V, H)).astype(np.float32)
+    pos_emb = rng.standard_normal((P, H)).astype(np.float32)
+    gamma = np.ones(H, dtype=np.float32)
+    beta = np.zeros(H, dtype=np.float32)
+
+    model = _embed_layer_norm_model(
+        word_emb,
+        pos_emb,
+        gamma,
+        beta,
+        embedding_sum_output=True,
+        extra_body=(
+            "mask_count = Cast<to=7>(mask_index)\n"
+            "          sum_plus = Add(embedding_sum, embedding_sum)"
+        ),
+        extra_outputs="int64[2] mask_count, float[2,3,6] sum_plus",
+    )
+    onnx.checker.check_model(model)
+
+    keep_token_ids = [0, 1, 2, 4, 5, 7, 8, 9]
+    result = onnxsim.apply_embedding_vocab_pruning(model, keep_token_ids=keep_token_ids)
+    onnx.checker.check_model(result.model)
+    assert result.matched  # not spuriously declined despite consumed outputs
+
+    ref_model = _embed_layer_norm_model(
+        word_emb[keep_token_ids],
+        pos_emb,
+        gamma,
+        beta,
+        embedding_sum_output=True,
+        extra_body=(
+            "mask_count = Cast<to=7>(mask_index)\n"
+            "          sum_plus = Add(embedding_sum, embedding_sum)"
+        ),
+        extra_outputs=f"int64[2] mask_count, float[2,3,{H}] sum_plus",
+    )
+    onnx.checker.check_model(ref_model)
+
+    orig_ids = np.array([[0, 1, 2], [4, 5, 7]], dtype=np.int32)
+    local_ids = np.array(
+        [[result.id_map[int(t)] for t in row] for row in orig_ids], dtype=np.int32
+    )
+    pruned = _run(result.model, {"input_ids": local_ids})
+    ref = _run(ref_model, {"input_ids": local_ids})
+    for p, r in zip(pruned, ref):
+        np.testing.assert_allclose(p, r, atol=1e-5, rtol=1e-5)
+
+
 # --- apply_structured_pruning_qdq --------------------------------------------
 #
 # See ``onnxsim/pruning.py``'s own "QDQ (quantized-weight) structured
