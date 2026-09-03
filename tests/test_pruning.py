@@ -31754,6 +31754,385 @@ def test_analyze_attention_head_pruning_linear_attention_matches_real_call():
     assert dims_after["Wv"][1] == kept_groups * cfg["Dv"]
 
 
+# --- SparseAttention head pruning (com.microsoft, block-sparse-KV attention) ---
+#
+# Reuses the `GroupQueryAttention`-family's own whole-KV-group machinery
+# (`_GQAChain`/`_apply_one_gqa_chain`/`_gqa_group_importance`) -- see
+# onnxsim/pruning.py's own "Attention-head pruning" section comment, the
+# `SparseAttention` bullet (right above `_match_sparse_attention_producer`),
+# for the full empirical schema findings and scope boundary (a *dynamic*
+# `block_row_indices`/`block_col_indices` declines the whole match outright,
+# and a post-pruning head count that would violate this op's own "num_heads
+# divisible by num_layout" invariant declines that block's pruning as a
+# no-op). This op has a real CPU kernel in this environment's onnxruntime
+# (confirmed live), but its own schema requires `past_key`/`present_key`
+# (and `past_value`/`present_value`) to literally share the same memory
+# buffer at execution time ("For performance, past_key and present_key
+# share same memory buffer") -- verified empirically: an ordinary
+# `session.run()` call (which always allocates independent output buffers)
+# fails outright ("past_key->DataRaw() == present_key->DataRaw() ... was
+# false"). Every execution test here therefore uses onnxruntime's own
+# IOBinding API (`_run_sparse_attention`), binding the identical `OrtValue`
+# to both the past-cache input and the present-cache output, the same
+# buffer-reuse pattern a real onnxruntime-genai-style autoregressive decode
+# loop uses.
+
+
+def _sparse_attention_model(
+    K=8,
+    H=4,
+    KVH=2,
+    D=8,
+    Out=6,
+    seed=0,
+    batch=1,
+    seq=16,
+    sparse_block_size=16,
+    num_layout=1,
+    wq=None,
+    wk=None,
+    wv=None,
+    wout=None,
+    past_key=None,
+    past_value=None,
+    row_indices=None,
+    col_indices=None,
+    row_indices_dynamic=False,
+):
+    # Real ONNX Runtime CPU kernel for SparseAttention requires head_size to
+    # be a multiple of 8 (verified empirically, the same constraint
+    # GroupQueryAttention's own CPU kernel has -- see `_gqa_model`'s own
+    # comment), so D defaults to 8. `past_key`/`past_value` are declared as
+    # genuine graph inputs *and* given an initializer of the same name (the
+    # standard ONNX "optional input with a default constant" idiom, legal
+    # per `onnx.checker.check_model` -- confirmed below) so a caller can
+    # execute the model through onnxruntime's own IOBinding API (binding the
+    # same buffer to the input and the `present_key`/`present_value`
+    # output), while this module's own matcher/slicer still sees a genuine
+    # constant to prune (`initializer_map` reads `graph.initializer`, not
+    # `graph.input`).
+    rng = np.random.default_rng(seed)
+    Nq, Nkv = H * D, KVH * D
+    if wq is None:
+        wq = rng.standard_normal((K, Nq)).astype(np.float32) * 0.1
+    if wk is None:
+        wk = rng.standard_normal((K, Nkv)).astype(np.float32) * 0.1
+    if wv is None:
+        wv = rng.standard_normal((K, Nkv)).astype(np.float32) * 0.1
+    if wout is None:
+        wout = rng.standard_normal((Nq, Out)).astype(np.float32) * 0.1
+    if past_key is None:
+        past_key = rng.standard_normal((batch, KVH, seq, D)).astype(np.float32) * 0.1
+    if past_value is None:
+        past_value = rng.standard_normal((batch, KVH, seq, D)).astype(np.float32) * 0.1
+    past_key = np.ascontiguousarray(past_key, dtype=np.float32)
+    past_value = np.ascontiguousarray(past_value, dtype=np.float32)
+
+    initializer = [
+        _f32(wq, "Wq"),
+        _f32(wk, "Wk"),
+        _f32(wv, "Wv"),
+        _f32(wout, "Wout"),
+        onnx.numpy_helper.from_array(past_key, "PastKey"),
+        onnx.numpy_helper.from_array(past_value, "PastValue"),
+    ]
+
+    # A trivially "dense" single-row-block CSR mask (`seq == sparse_block_size`
+    # by default, exactly one query/key block, that one block attending
+    # fully to itself -- this op's own real unidirectional/causal masking is
+    # applied internally regardless), `num_layout` identical copies stacked
+    # along axis 0. This module never inspects `block_row_indices`'/
+    # `block_col_indices`' own *content* at all, only their shared leading
+    # `num_layout` dimension (see `_match_sparse_attention_producer`'s own
+    # docstring) -- confirmed via a real onnxruntime CPU-kernel run
+    # (`_run_sparse_attention`) that this minimal mask executes correctly.
+    if row_indices is None:
+        row_indices = np.tile(np.array([0, 1], dtype=np.int32), (num_layout, 1))
+    if col_indices is None:
+        col_indices = np.tile(np.array([0], dtype=np.int32), (num_layout, 1))
+    extra_inputs = ""
+    if row_indices_dynamic:
+        extra_inputs = f", int32[{row_indices.shape[0]},{row_indices.shape[1]}] RowIdx"
+    else:
+        initializer.append(onnx.numpy_helper.from_array(row_indices, "RowIdx"))
+    initializer.append(onnx.numpy_helper.from_array(col_indices, "ColIdx"))
+    initializer.append(
+        onnx.numpy_helper.from_array(np.array(seq, dtype=np.int32), "TotalSeq")
+    )
+    initializer.append(
+        onnx.numpy_helper.from_array(
+            np.full((batch,), seq, dtype=np.int32), "KeyTotalSeq"
+        )
+    )
+
+    # PastKey/PastValue/PresentKey/PresentValue declare a symbolic `kvh`
+    # dim, not a concrete `{KVH}`, for their own `kv_num_heads` axis: this
+    # module's own pruning only resizes the *initializer*'s real shape (the
+    # constant this pass actually slices), not this static graph-level
+    # ValueInfo declaration -- a concrete dim here would go stale the moment
+    # `KVH` is pruned down, and onnxruntime's own loader rejects an
+    # initializer whose shape no longer matches its declared graph input
+    # (confirmed empirically: "Shape of initializer PastValue does not
+    # match").
+    body = f"""
+        g (float[{batch},{seq},{K}] X, float[{batch},kvh,{seq},{D}] PastKey, float[{batch},kvh,{seq},{D}] PastValue{extra_inputs}) => (float[{batch},{seq},{Out}] Y, float[{batch},kvh,{seq},{D}] PresentKey, float[{batch},kvh,{seq},{D}] PresentValue)
+        {{
+          q = MatMul(X, Wq)
+          k = MatMul(X, Wk)
+          v = MatMul(X, Wv)
+          attn, PresentKey, PresentValue = com.microsoft.SparseAttention <num_heads={H}, kv_num_heads={KVH}, sparse_block_size={sparse_block_size}> (q, k, v, PastKey, PastValue, RowIdx, ColIdx, TotalSeq, KeyTotalSeq)
+          Y = MatMul(attn, Wout)
+        }}
+        """
+    model = parser.parse_model(
+        f"""
+        <
+          ir_version: 10,
+          opset_import: ["": 18, "com.microsoft": 1]
+        >
+        {body}
+        """
+    )
+    model.graph.initializer.extend(initializer)
+    return model, dict(
+        K=K,
+        H=H,
+        KVH=KVH,
+        D=D,
+        Out=Out,
+        Nq=Nq,
+        Nkv=Nkv,
+        wq=wq,
+        wk=wk,
+        wv=wv,
+        wout=wout,
+        batch=batch,
+        seq=seq,
+        sparse_block_size=sparse_block_size,
+        num_layout=num_layout,
+        past_key=past_key,
+        past_value=past_value,
+    )
+
+
+def _sparse_attention_node(model):
+    return next(n for n in model.graph.node if n.op_type == "SparseAttention")
+
+
+def _sparse_attention_attrs(node):
+    num_heads = next(a.i for a in node.attribute if a.name == "num_heads")
+    kv_num_heads = next(a.i for a in node.attribute if a.name == "kv_num_heads")
+    return num_heads, kv_num_heads
+
+
+def _run_sparse_attention(model, x, past_key, past_value):
+    # See this section's own top comment for why plain `session.run()` (or
+    # this file's own `_run`) can't be used here: `present_key`/
+    # `present_value` must be bound to the exact same `OrtValue` as
+    # `past_key`/`past_value`.
+    sess = ort.InferenceSession(
+        model.SerializeToString(), providers=["CPUExecutionProvider"]
+    )
+    past_key_ov = ort.OrtValue.ortvalue_from_numpy(np.ascontiguousarray(past_key))
+    past_value_ov = ort.OrtValue.ortvalue_from_numpy(np.ascontiguousarray(past_value))
+    io = sess.io_binding()
+    io.bind_cpu_input("X", np.ascontiguousarray(x))
+    io.bind_ortvalue_input("PastKey", past_key_ov)
+    io.bind_ortvalue_input("PastValue", past_value_ov)
+    io.bind_output("Y", "cpu")
+    io.bind_ortvalue_output("PresentKey", past_key_ov)
+    io.bind_ortvalue_output("PresentValue", past_value_ov)
+    sess.run_with_iobinding(io)
+    outs = io.copy_outputs_to_cpu()
+    return outs[0]
+
+
+def test_sparse_attention_pruning_shrinks_matched_block():
+    model, cfg = _sparse_attention_model(K=8, H=4, KVH=4, D=8, Out=6)
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    node = _sparse_attention_node(pruned)
+    num_heads, kv_num_heads = _sparse_attention_attrs(node)
+    assert num_heads == 2
+    assert kv_num_heads == 2
+
+    inits = {t.name: t for t in pruned.graph.initializer}
+    assert list(inits["Wq"].dims) == [8, 16]
+    assert list(inits["Wk"].dims) == [8, 16]
+    assert list(inits["Wv"].dims) == [8, 16]
+    assert list(inits["Wout"].dims) == [16, 6]
+    assert list(inits["PastKey"].dims) == [1, 2, 16, 8]
+    assert list(inits["PastValue"].dims) == [1, 2, 16, 8]
+
+
+def test_sparse_attention_pruning_zero_sparsity_is_a_no_op():
+    model, cfg = _sparse_attention_model(K=8, H=8, KVH=2, D=8, Out=6, seed=7)
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.0)
+    node = _sparse_attention_node(pruned)
+    num_heads, kv_num_heads = _sparse_attention_attrs(node)
+    assert num_heads == cfg["H"]
+    assert kv_num_heads == cfg["KVH"]
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    np.testing.assert_array_equal(inits["Wq"], cfg["wq"])
+    np.testing.assert_array_equal(inits["Wk"], cfg["wk"])
+    np.testing.assert_array_equal(inits["Wv"], cfg["wv"])
+
+
+def test_sparse_attention_pruning_matches_oracle_exactly():
+    # End-to-end correctness against an independently-reconstructed,
+    # already-pruned reference model -- this module's own established
+    # invariant (comparing against the *unpruned* model's own output has
+    # been a real, caught mistake in an earlier round of this project) --
+    # run through a real onnxruntime CPU kernel via `_run_sparse_attention`,
+    # not merely a shape check. Also directly exercises `past_key`/
+    # `past_value` (required, not optional, on this op's own schema) being
+    # sliced along their own `kv_num_heads` axis by the identical
+    # `keep_groups` index set K's/V's own producer weights are sliced by.
+    model, cfg = _sparse_attention_model(K=8, H=8, KVH=2, D=8, Out=6, seed=1)
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    node = _sparse_attention_node(pruned)
+    num_heads, kv_num_heads = _sparse_attention_attrs(node)
+    group_size = cfg["H"] // cfg["KVH"]
+    assert kv_num_heads == 1  # max(1, 2 - round(2*0.5))
+    assert num_heads == kv_num_heads * group_size
+
+    keep_groups = _oracle_keep_groups(
+        cfg["wq"], cfg["wk"], cfg["wv"], cfg["H"], cfg["KVH"], cfg["D"], kv_num_heads
+    )
+    keep_q_heads = _group_q_heads(keep_groups, group_size)
+    d = cfg["D"]
+    q_idx, kv_idx = _head_idx(keep_q_heads, d), _head_idx(keep_groups, d)
+
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    np.testing.assert_array_equal(inits["Wq"], cfg["wq"][:, q_idx])
+    np.testing.assert_array_equal(inits["Wk"], cfg["wk"][:, kv_idx])
+    np.testing.assert_array_equal(inits["Wv"], cfg["wv"][:, kv_idx])
+    np.testing.assert_array_equal(inits["Wout"], cfg["wout"][q_idx, :])
+    np.testing.assert_array_equal(
+        inits["PastKey"], cfg["past_key"][:, keep_groups, :, :]
+    )
+    np.testing.assert_array_equal(
+        inits["PastValue"], cfg["past_value"][:, keep_groups, :, :]
+    )
+
+    oracle, _ = _sparse_attention_model(
+        K=cfg["K"],
+        H=num_heads,
+        KVH=kv_num_heads,
+        D=d,
+        Out=cfg["Out"],
+        seed=1,
+        batch=cfg["batch"],
+        seq=cfg["seq"],
+        sparse_block_size=cfg["sparse_block_size"],
+        wq=cfg["wq"][:, q_idx],
+        wk=cfg["wk"][:, kv_idx],
+        wv=cfg["wv"][:, kv_idx],
+        wout=cfg["wout"][q_idx, :],
+        past_key=cfg["past_key"][:, keep_groups, :, :],
+        past_value=cfg["past_value"][:, keep_groups, :, :],
+    )
+    onnx.checker.check_model(oracle)
+
+    rng = np.random.default_rng(2)
+    x = (
+        rng.standard_normal((cfg["batch"], cfg["seq"], cfg["K"])).astype(np.float32)
+        * 0.1
+    )
+    pruned_past_key = cfg["past_key"][:, keep_groups, :, :]
+    pruned_past_value = cfg["past_value"][:, keep_groups, :, :]
+    y_pruned = _run_sparse_attention(pruned, x, pruned_past_key, pruned_past_value)
+    y_oracle = _run_sparse_attention(oracle, x, pruned_past_key, pruned_past_value)
+    np.testing.assert_allclose(y_pruned, y_oracle, rtol=1e-4, atol=1e-4)
+
+
+def test_sparse_attention_pruning_dynamic_block_row_indices_is_declined():
+    # `block_row_indices` (and, by the same reasoning, `block_col_indices`)
+    # must be a *constant* for this pass to know `num_layout` and re-verify
+    # this op's own "num_heads divisible by num_layout" invariant once
+    # pruning's post-pruning head count is known -- a real block-sparse
+    # layout is a fixed structure baked at export time, never genuine
+    # runtime data the way GroupQueryAttention's own past_key/past_value
+    # legitimately can be, so a *dynamic* one declines the whole match
+    # outright (see `_match_sparse_attention_producer`'s own docstring).
+    model, cfg = _sparse_attention_model(
+        K=8, H=4, KVH=2, D=8, Out=6, seed=3, row_indices_dynamic=True
+    )
+    before = {
+        t.name: onnx.numpy_helper.to_array(t).copy() for t in model.graph.initializer
+    }
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    after = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    for name in ("Wq", "Wk", "Wv", "Wout"):
+        np.testing.assert_array_equal(before[name], after[name])
+    node = _sparse_attention_node(pruned)
+    num_heads, kv_num_heads = _sparse_attention_attrs(node)
+    assert (num_heads, kv_num_heads) == (cfg["H"], cfg["KVH"])
+
+
+def test_sparse_attention_pruning_num_layout_divisibility_declined():
+    # H=4, KVH=4 (group_size=1, ordinary per-head groups), num_layout=2: at
+    # sparsity=0.75, keep_count == max(1, 4 - round(4*0.75)) == 1, so the
+    # post-pruning query head count would be 1 -- not divisible by
+    # num_layout == 2, which would silently break this op's own "num_heads
+    # is divisible by num_layout" invariant even though it held before
+    # pruning. Declined as a no-op for this block (the same "sparsity
+    # rounds to no groups dropped" outcome, from a different cause) rather
+    # than emitting an invalid node -- see `_apply_one_gqa_chain`'s own
+    # `is_sparse_attention` branch.
+    model, cfg = _sparse_attention_model(
+        K=8, H=4, KVH=4, D=8, Out=6, seed=5, num_layout=2
+    )
+    before = {
+        t.name: onnx.numpy_helper.to_array(t).copy() for t in model.graph.initializer
+    }
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.75)
+    onnx.checker.check_model(pruned)
+    after = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    for name in ("Wq", "Wk", "Wv", "Wout"):
+        np.testing.assert_array_equal(before[name], after[name])
+    node = _sparse_attention_node(pruned)
+    num_heads, kv_num_heads = _sparse_attention_attrs(node)
+    assert (num_heads, kv_num_heads) == (cfg["H"], cfg["KVH"])
+
+
+def test_sparse_attention_not_eligible_lists_unmatched_node():
+    model, cfg = _sparse_attention_model(
+        K=8, H=4, KVH=2, D=8, Out=6, seed=6, row_indices_dynamic=True
+    )
+    node = _sparse_attention_node(model)
+    node.name = "sa_orphan"
+    report = onnxsim.analyze_pruning_sensitivity(
+        model, onnxsim.apply_attention_head_pruning, sparsity=0.5
+    )
+    assert report.layers == []
+    assert report.not_eligible == ["SparseAttention 'sa_orphan'"]
+
+
+def test_analyze_attention_head_pruning_sparse_attention_matches_real_call():
+    model, cfg = _sparse_attention_model(K=8, H=8, KVH=2, D=8, Out=6, seed=7)
+    report = onnxsim.analyze_pruning_sensitivity(
+        model, onnxsim.apply_attention_head_pruning, sparsity=0.5
+    )
+    assert len(report.layers) == 1
+    layer = report.layers[0]
+    assert layer.family == "attention_sparse_group"
+    assert layer.total == cfg["KVH"]
+    assert report.not_eligible == []
+
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    dims_after = {t.name: list(t.dims) for t in pruned.graph.initializer}
+    kept_groups = cfg["KVH"] - layer.would_drop
+    group_size = cfg["H"] // cfg["KVH"]
+    assert dims_after["Wq"][1] == kept_groups * group_size * cfg["D"]
+    assert dims_after["Wk"][1] == kept_groups * cfg["D"]
+    assert dims_after["Wv"][1] == kept_groups * cfg["D"]
+
+
 # --- QOperator (QLinearConv/QLinearMatMul/QGemm) structured pruning tests --
 #
 # QLinearConv/QLinearMatMul/QGemm carry their own quantized weight/scale/
