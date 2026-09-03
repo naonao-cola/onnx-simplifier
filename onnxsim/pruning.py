@@ -10266,6 +10266,70 @@ def apply_structured_pruning_qdq(
 #     apply when the consumer side of a mixed chain is the plain-float one
 #     -- the producer's own keep-set (whatever it is) applies directly, the
 #     same as any other plain-float consumer elsewhere in this module.
+#
+# ``MatMulNBitsMlp``/``MatMulNBitsQkv`` -- ORT's own graph-optimizer fusions of
+# a same-input gate/up ``MatMulNBits`` pair, or a shared-input/shared-norm
+# Q/K/V ``MatMulNBits`` triple, into one node each -- are matched as
+# ADDITIONAL producer shapes below (:func:`_match_matmul_nbits_mlp`/
+# :func:`_match_matmul_nbits_qkv` and the dedicated
+# :func:`_apply_matmul_nbits_mlp_chains`/:func:`_apply_matmul_nbits_qkv_chains`
+# passes :func:`apply_structured_pruning_matmul_nbits` also runs), not folded
+# into :func:`_match_matmul_nbits`/:func:`_find_matmul_nbits_chains` itself --
+# a fused node owns TWO or THREE independent weight pairs, not the one
+# producer/consumer pair that abstraction assumes, so it needed its own
+# matcher/apply pair, sharing this section's own low-level helpers
+# (:func:`_unpack_nbits_codes`/:func:`_pack_nbits_codes`,
+# :func:`_matmul_nbits_dequantized`, :func:`_matmul_nbits_block_aligned_keep_blocks`,
+# :func:`_slice_matmul_nbits_consumer_blocks`, :func:`_walk_to_matmul_nbits_consumer`)
+# rather than reusing :class:`_MatMulNBitsWeight`'s own single-producer shape
+# directly. Full empirical/schema details, and the exact scope this covers
+# and declines, live in the section comment directly above the two matchers
+# themselves (search this file for "MatMulNBitsMlp/MatMulNBitsQkv (fused
+# block-quantized weight) structured pruning" -- placed after this module's
+# own "Attention-head pruning" section since ``MatMulNBitsQkv``'s own
+# pruning unit, per-KV-group, directly reuses that section's
+# :func:`_match_gqa_producer`/:func:`_match_onnx_attention_producer`/
+# :func:`_gqa_group_importance`-style machinery). The one fact worth
+# surfacing here, at the top of this whole ``MatMulNBits`` family: **both
+# fused ops are WebGPU-execution-provider-specific.** Confirmed directly off
+# this environment's installed ``onnxruntime`` (1.29.0) shared library
+# (``strings`` on ``onnxruntime_pybind11_state...so``, not merely inferred
+# from the schema doc's own "...supported by the WebGPU kernel" wording):
+# the fusion pass's own log strings read ``"MatMulNBitsMlpFusion: skipping
+# candidate due to non-WebGPU EP assignment."`` -- i.e. ORT's graph optimizer
+# only ever performs this fusion when the *target* execution provider is
+# WebGPU, not unconditionally for every quantized export the way the plain
+# ``MatMulNBits`` quantization itself is. A model actually *containing*
+# either fused node on disk is still a completely real, valid artifact (an
+# ``InferenceSession.optimized_model_filepath`` save with the WebGPU EP
+# selected, or any other tool/version that performs the same fusion), and
+# this section's matching/slicing logic depends on nothing WebGPU-specific
+# -- it only reads the same constant tensors/attributes the live schema
+# documents. But it does mean this environment (no GPU, no WebGPU adapter --
+# confirmed by actually requesting one: ``Failed to get a WebGPU adapter: No
+# supported adapters``, both via the system `onnxruntime` install and a
+# separately-installed `onnxruntime-webgpu` 1.27.0 wheel, tried specifically
+# to check) cannot execute either fused node end to end via a real
+# ``InferenceSession`` the way this section's *plain* ``MatMulNBits`` tests
+# do -- so this section's own new tests instead decompose a (pruned) fused
+# node's own weight tensors back into equivalent standalone
+# ``MatMulNBits``/``SimplifiedLayerNormalization`` nodes and run THOSE
+# through a real CPU-kernel ``InferenceSession`` (both of which this
+# environment's CPU EP genuinely implements) against a numpy oracle -- the
+# same underlying tensors and packing this section's slicing code actually
+# touches, just exercised through an executable proxy topology rather than
+# the literal fused op. See ``tests/test_pruning.py``'s own
+# ``test_matmul_nbits_mlp_pruning_matches_decomposed_oracle`` and
+# ``test_matmul_nbits_qkv_pruning_matches_decomposed_oracle`` for exactly
+# this methodology, and this section's own top-of-file empirical notes on
+# ``B``/``scales``/``bias`` packing (reused verbatim here, unchanged) for
+# why that decomposition is a faithful proxy and not a guess: both fused
+# ops' own live schemas type every weight/scale/bias input identically to
+# plain ``MatMulNBits``'s own ``B``/``scales``/``bias`` (same ``T1``/``T2``
+# type constraints, same per-input doc wording -- "Packed uint8 tensor for
+# the <branch> projection weights", etc.), and both ops' own doc strings
+# write their fused arithmetic as literal, unmodified ``MatMulNBits(...)``
+# calls, not merely an informally similar computation.
 
 
 def _matmul_nbits_int_attr(
@@ -10635,6 +10699,46 @@ def _slice_matmul_nbits_consumer_blocks(
             )
 
     _set_matmul_nbits_int_attr(w.node, "K", len(keep_blocks) * w.block_size)
+
+
+def _slice_matmul_nbits_rows_no_zp(
+    b_init: onnx.TensorProto,
+    scales_init: onnx.TensorProto,
+    bias_init: Optional[onnx.TensorProto],
+    keep: np.ndarray,
+) -> None:
+    """Row-slices (``N`` axis) `b_init`/`scales_init`/`bias_init` in place --
+    the ``zero_points``-free analogue of
+    :func:`_slice_matmul_nbits_producer_rows`, for one branch of a matched
+    ``MatMulNBitsMlp``/``MatMulNBitsQkv`` node: neither fused op's schema
+    has a ``zero_points`` input at all (confirmed via live schema
+    introspection -- see the "MatMulNBitsMlp/MatMulNBitsQkv (fused
+    block-quantized weight) structured pruning" section comment), so every
+    weight slot on both is implicitly the schema's own default zero point,
+    with nothing packed on this axis for :func:`_unpack_nbits_codes`/
+    :func:`_pack_nbits_codes` to touch at all (contrast
+    :func:`_slice_matmul_nbits_producer_rows`, which must handle a
+    *possibly* packed ``zero_points``). Unlike that function, this one
+    never updates any node attribute itself: a fused node's own N-sized
+    attribute is either shared by more than one branch (``MatMulNBitsMlp``'s
+    single ``N``, sized once per branch call -- harmlessly redundant, same
+    value both times) or not literally named ``"N"`` at all
+    (``MatMulNBitsQkv``'s own ``Nq``/``Nkv``), so naming the right one is
+    left to the caller.
+    """
+    b = onnx.numpy_helper.to_array(b_init)
+    b_init.CopyFrom(onnx.numpy_helper.from_array(b[keep], name=b_init.name))
+
+    scales = onnx.numpy_helper.to_array(scales_init)
+    scales_init.CopyFrom(
+        onnx.numpy_helper.from_array(scales[keep], name=scales_init.name)
+    )
+
+    if bias_init is not None:
+        bias = onnx.numpy_helper.to_array(bias_init)
+        bias_init.CopyFrom(
+            onnx.numpy_helper.from_array(bias[keep], name=bias_init.name)
+        )
 
 
 @dataclass(frozen=True)
@@ -11190,6 +11294,46 @@ def apply_structured_pruning_matmul_nbits(
     supported, above), a padded partial final block declined, a
     shared/tied operand declined.
 
+    ALSO prunes two ``com.microsoft`` fusions of ``MatMulNBits`` itself --
+    ORT's own WebGPU-EP-targeted graph optimizer routinely emits both for a
+    quantized LLM export, silently defeating the plain ``MatMulNBits``
+    matching above entirely if left unhandled (see the "MatMulNBitsMlp/
+    MatMulNBitsQkv (fused block-quantized weight) structured pruning"
+    section comment for the full empirical schema investigation, scope, and
+    limitations):
+
+    * ``MatMulNBitsMlp`` (a fused ``gate``/``up`` SwiGLU/GeGLU-style MLP
+      pair sharing one input and one output-channel count): co-slices
+      ``gate``'s and ``up``'s own shared output-channel axis to one shared
+      keep-set (:func:`_match_matmul_nbits_mlp`/
+      :func:`_apply_matmul_nbits_mlp_chains`, ranked by
+      :func:`_matmul_nbits_mlp_gated_importance` -- the block-quantized
+      analogue of this module's own plain-float gated-pair criterion), then
+      slices whichever ``MatMulNBits``-or-plain-float node consumes its
+      output the same way the plain single-producer chain above does
+      (:func:`_walk_to_matmul_nbits_consumer`, reused verbatim).
+    * ``MatMulNBitsQkv`` (a fused, shared-input/shared-norm Q/K/V
+      projection triple): prunes whole KV groups
+      (:func:`_match_matmul_nbits_qkv`/:func:`_apply_matmul_nbits_qkv_chains`,
+      ranked by :func:`_matmul_nbits_qkv_group_importance`), reusing this
+      module's own GQA/packed-QKV attention-head-pruning matchers
+      (:func:`_match_gqa_producer`/:func:`_match_onnx_attention_producer`)
+      to find and validate the downstream ``GroupQueryAttention``/plain
+      ``ai.onnx::Attention`` consumer those Q/K/V outputs must feed
+      directly (no per-head Q/K-norm + RoPE pass-through hop -- see that
+      section comment for exactly why this is a deliberate, documented
+      scope boundary), and this module's own attention-chain bookkeeping
+      for that consumer's own optional per-head operands (`past_key`/
+      `past_value`, `k_scale`/`v_scale`, `attention_bias`/`attn_mask`,
+      `head_sink`).
+
+    Both fused ops' own ``skip``/``norm_scale`` inputs (an optionally-fused
+    ``(Skip)SimplifiedLayerNormalization`` preceding the projection(s)) are
+    read but never themselves re-sliced: this whole function only ever
+    prunes OUTPUT-channel axes, never the shared INPUT (``K``/hidden-size)
+    axis those two operands would need re-slicing for -- a real, documented
+    limitation (see that section comment), not an oversight.
+
     :param model: onnx ModelProto object or file path
     :param sparsity: fraction of each eligible producer's output channels to
             drop (rounded, at least one channel is always kept)
@@ -11207,8 +11351,10 @@ def apply_structured_pruning_matmul_nbits(
     graph = out.graph
 
     chains = _find_matmul_nbits_chains(graph)
+    mlp_chains = _find_matmul_nbits_mlp_chains(graph)
+    qkv_chains = _find_matmul_nbits_qkv_chains(graph)
     gated_chains = _find_matmul_nbits_gated_chains(graph)
-    if not chains and not gated_chains:
+    if not chains and not mlp_chains and not qkv_chains and not gated_chains:
         return out
 
     producer_touched: Set[str] = set()
@@ -11318,6 +11464,25 @@ def apply_structured_pruning_matmul_nbits(
         stale_value_info.add(pb.node.output[0])
         stale_value_info.update(op.output[0] for op in gchain.producer_b_pre_ops)
         stale_value_info.update(op.output[0] for op in gchain.chain_ops)
+
+    _apply_matmul_nbits_mlp_chains(
+        graph,
+        mlp_chains,
+        sparsity,
+        importance_norm,
+        producer_touched,
+        consumer_touched,
+        stale_value_info,
+    )
+    _apply_matmul_nbits_qkv_chains(
+        graph,
+        qkv_chains,
+        sparsity,
+        importance_norm,
+        producer_touched,
+        consumer_touched,
+        stale_value_info,
+    )
 
     if stale_value_info:
         kept = [vi for vi in graph.value_info if vi.name not in stale_value_info]
@@ -14059,6 +14224,984 @@ def apply_attention_head_wanda_pruning(
         _wanda_gqa_group_importance,
     )
     return out
+
+
+# --- MatMulNBitsMlp/MatMulNBitsQkv (fused block-quantized weight) structured
+#     pruning ----------------------------------------------------------------
+#
+# ``com.microsoft::MatMulNBitsMlp``/``com.microsoft::MatMulNBitsQkv`` are two
+# more fusions ONNX Runtime's own graph optimizer performs on top of plain
+# ``MatMulNBits`` (see this module's "MatMulNBits (block-quantized weight)
+# structured pruning" section comment for that op's own full empirical
+# investigation, reused verbatim below): ``MatMulNBitsMlp`` fuses a
+# same-input ``gate``/``up`` ``MatMulNBits`` pair (the SwiGLU/GeGLU-style
+# gated-MLP shape :func:`_find_gated_chains` already handles for plain-float
+# weights) into one node; ``MatMulNBitsQkv`` fuses a shared-input,
+# shared-norm Q/K/V ``MatMulNBits`` triple (the packed/separate-QKV shape
+# :func:`_find_separate_qkv_chains` already handles for plain-float/mixed
+# weights) into one node. Once ORT's optimizer performs either fusion, the
+# plain :func:`_match_matmul_nbits` matcher above simply never sees a
+# standalone ``MatMulNBits`` node for that block at all -- silently turning
+# :func:`apply_structured_pruning_matmul_nbits` into a no-op for it, not
+# merely a missed optimization. This section closes that gap.
+#
+# Every schema fact below was confirmed empirically against this
+# environment's live ``onnxruntime`` (1.29.0) install, the same way this
+# module's own "MatMulNBits" section comment already established for plain
+# ``MatMulNBits`` -- via
+# ``onnxruntime.capi.onnxruntime_pybind11_state.get_all_operator_schema()``
+# for both fused ops' full input/output/attribute lists, not guessed by
+# extrapolating from the plain op's own schema:
+#
+#   * ``MatMulNBitsMlp`` inputs, in order: ``A`` (T1, unquantized), ``skip``
+#     (optional, T1 -- an ``Add``-style residual input to an optionally
+#     fused ``(Skip)SimplifiedLayerNormalization`` preceding both
+#     projections), ``norm_scale`` (**optional** here -- confirmed via the
+#     live schema's own ``FormalParameterOption``, T1, shape ``[K]``),
+#     ``gate_B``/``gate_scales``/``gate_bias`` (T2/T1/T1 optional, exactly
+#     ``MatMulNBits``'s own ``B``/``scales``/``bias`` typing and per-input
+#     doc wording), then ``up_B``/``up_scales``/``up_bias`` the same shape.
+#     Outputs: ``Y`` (T1, the fused ``activation(gate) * up`` result), plus
+#     an optional ``input_skip_bias_sum`` (the ``SkipSimplifiedLayerNormalization``
+#     residual sum, when fused). Attributes: ``activation`` (required
+#     string -- this section never inspects its *value*, see below),
+#     ``block_size``/``K``/``N`` (required ints, ``N``/``K`` SHARED by both
+#     branches -- unlike plain ``MatMulNBits``, there is exactly one ``N``
+#     attribute for two weight pairs), ``bits`` (optional, default 4, same
+#     schema-serialized default as plain ``MatMulNBits``), ``accuracy_level``/
+#     ``epsilon`` (ignored -- the latter only matters for the optional fused
+#     norm, which this section never touches, see below). **No
+#     ``zero_points`` input at all**, on either branch -- a real finding,
+#     not an omission: the plain op's own 4th input slot simply has no
+#     analogue here, so every weight slot implicitly uses the schema's own
+#     documented default zero point (``2 ** (bits - 1)``) unconditionally.
+#   * ``MatMulNBitsQkv`` inputs, in order: ``A``, ``skip`` (optional),
+#     ``norm_scale`` (**required** here -- unlike ``MatMulNBitsMlp``'s own
+#     optional one, confirmed the same way: this op always applies
+#     ``(Skip)SimplifiedLayerNormalization`` to ``A`` before every
+#     projection, per its own doc string's fused-arithmetic formula), then
+#     ``q_B``/``q_scales``/``q_bias``, ``k_B``/``k_scales``/``k_bias``,
+#     ``v_B``/``v_scales``/``v_bias`` (each the same T2/T1/T1-optional
+#     typing as ``MatMulNBits``'s own operands). Outputs: ``Q``/``K``/``V``
+#     (T1 each), plus an optional ``input_skip_bias_sum``. Attributes:
+#     ``block_size``/``K`` (shared reduction dim for every branch),
+#     ``Nq``/``Nkv`` (``Nkv`` SHARED by K and V -- there is no independent
+#     ``Nv``, confirmed via the live schema, so K's and V's own per-head
+#     width are always identical by construction, never independently
+#     specifiable the way a plain ``ai.onnx::Attention`` chain's own
+#     `v_head_size` can be, see :func:`_find_matmul_nbits_qkv_chains`),
+#     ``bits`` (optional, default 4), ``epsilon`` (the fused norm's own
+#     epsilon), ``accuracy_level`` (ignored). Also **no ``zero_points``
+#     input** on any of the three branches -- confirmed the same way.
+#   * Neither fused op carries ``num_heads``/``kv_num_heads``/head-count
+#     metadata of its own AT ALL -- a real, load-bearing finding: this
+#     section cannot determine per-head/per-KV-group structure from either
+#     matched node in isolation. `MatMulNBitsQkv`'s own per-KV-group
+#     pruning unit is therefore only reachable by finding the REAL
+#     downstream consumer that DOES carry that metadata -- a
+#     ``GroupQueryAttention``/plain ``ai.onnx::Attention`` node whose own
+#     query/key/value inputs are fed directly by this node's own
+#     `Q`/`K`/`V` outputs -- and reusing that consumer's own already-proven
+#     matchers (:func:`_match_gqa_producer`/:func:`_match_onnx_attention_producer`)
+#     rather than re-deriving head counts from scratch. ``MatMulNBitsMlp``
+#     needs no such consumer lookup for its own pruning unit (whole output
+#     channels, ranked the same "gated pair" way this module's own
+#     plain-float SwiGLU/GeGLU precedent already uses), but still needs one
+#     to find and slice whichever downstream node consumes ITS OWN output
+#     (see below).
+#   * **Both fusions are WebGPU-execution-provider-specific** -- this is the
+#     single most important empirical finding for this section, and is
+#     documented at length, with the exact confirmation method and the
+#     resulting testing-methodology consequence, at the top of this
+#     module's own "MatMulNBits (block-quantized weight) structured
+#     pruning" section comment (search this file for
+#     "MatMulNBitsMlpFusion: skipping candidate"). In short: neither fused
+#     node can be executed end to end via a real ``InferenceSession`` in
+#     this (GPU-less) environment, so this section's own new tests instead
+#     decompose a (pruned) fused node's own tensors back into equivalent
+#     standalone ``MatMulNBits``/``SimplifiedLayerNormalization`` nodes and
+#     run THOSE through a real CPU-kernel ``InferenceSession`` against a
+#     numpy oracle -- the exact same underlying packed tensors this
+#     section's own slicing code touches, just exercised through an
+#     executable proxy topology. This does not weaken confidence in the
+#     SCHEMA facts above (read directly off the live schema registry,
+#     independent of which EP can execute the op) or the PACKING facts (this
+#     section reuses, unchanged, the plain ``MatMulNBits`` section's own
+#     packing investigation -- both fused ops' schemas type every weight/
+#     scale/bias operand identically, and both ops' own doc strings write
+#     their fused arithmetic as literal ``MatMulNBits(...)`` calls, not an
+#     informally similar computation) -- only the ability to exercise the
+#     literal fused node itself end to end in THIS sandbox.
+#
+# Scope boundaries this section lands on, deliberately, mirroring this
+# module's own conservative-decline posture everywhere else:
+#
+#   * ``activation`` (``MatMulNBitsMlp``'s own required string attribute) is
+#     never inspected or validated by this section at all -- and doesn't
+#     need to be: pruning ``gate``'s/``up``'s own shared OUTPUT-channel axis
+#     commutes with any per-element activation function applied afterward
+#     (dropping output channel `c` and then evaluating `activation` on the
+#     survivors is identical to evaluating `activation` on every channel and
+#     then dropping channel `c`, regardless of what `activation` computes),
+#     so this section carries the attribute through completely unchanged
+#     and never needs to know which function it names.
+#   * ``skip``/``norm_scale`` (on either fused op, when present) are read
+#     (to confirm they exist, where the schema requires it) but never
+#     themselves re-sliced: this section -- like the plain ``MatMulNBits``
+#     section above it -- only ever prunes OUTPUT-channel (``N``/``Nq``/
+#     ``Nkv``) axes, never the shared INPUT (``K``/hidden-size) axis
+#     ``norm_scale`` (and every branch's own reduction dimension) would need
+#     re-slicing for. A genuinely different pass would be needed to prune
+#     the transformer's own hidden/residual dimension through a fused
+#     ``(Skip)SimplifiedLayerNormalization`` this way -- out of scope here,
+#     same as it is for every other chain kind in this module (no existing
+#     pass in this file prunes the residual/hidden dimension of a
+#     ``MatMulNBits``-quantized transformer block at all, fused norm or
+#     not).
+#   * ``MatMulNBitsQkv``'s own Q/K-norm + RoPE pass-through hop -- the
+#     per-head ``SimplifiedLayerNorm``(+ optional ``RotaryEmbedding``)
+#     ``_find_separate_qkv_chains`` already recognizes between a plain-float
+#     packed-QKV-then-``Split`` producer and its own GQA consumer (see
+#     :func:`_walk_back_through_qk_norm_rope`) -- is NOT matched here: this
+#     node's own `Q`/`K` outputs must feed the attention consumer's own
+#     query/key inputs DIRECTLY (single consumer, no intervening node at
+#     all). A real export relying on that hop between a fused
+#     ``MatMulNBitsQkv`` node and its own attention consumer is declined
+#     here rather than mis-sliced -- a genuine, deliberate scope boundary
+#     this comment flags honestly rather than silently under-implementing.
+#   * The downstream output-projection consumer, for BOTH fused ops, is
+#     matched via the exact same ``MatMulNBits``-or-plain-float union the
+#     plain single-producer chain above already supports
+#     (:func:`_walk_to_matmul_nbits_consumer` for ``MatMulNBitsMlp``'s own
+#     `Y` output, reused verbatim; :func:`_walk_to_matmul_nbits_attention_consumer`
+#     for ``MatMulNBitsQkv``'s own attention-consumer output, the analogous
+#     new function this section adds since that consumer is never itself a
+#     ``MatMulNBits`` node) -- never a QDQ-quantized one, for the same
+#     out-of-scope reason the plain section above gives.
+#   * A shared/tied ``B``/``scales``/``bias`` tensor (read by more than one
+#     node), or two branches degenerately naming the exact same underlying
+#     weight tensor, are both declined by the matchers themselves, the same
+#     bar every matcher in this module is held to.
+#   * ``bits``/``block_size``/``K``-alignment restrictions are IDENTICAL to
+#     plain ``MatMulNBits`` (``bits in {4, 8}``, ``block_size`` a power of
+#     two ``>= 16``, ``K`` an exact multiple of `block_size`) -- reusing
+#     :func:`_matmul_nbits_int_attr`/:func:`_MATMUL_NBITS_VALID_BLOCK_SIZES`
+#     directly, not re-derived.
+
+
+@dataclass(frozen=True)
+class _MatMulNBitsMlpWeight:
+    """A matched ``com.microsoft::MatMulNBitsMlp`` node's two block-
+    quantized weight operands (``gate``/``up``), matched by
+    :func:`_match_matmul_nbits_mlp` -- see this section's own top comment
+    for the empirically-confirmed schema this depends on. Unlike
+    :class:`_MatMulNBitsWeight`, there is no ``zero_points`` field at all:
+    neither this op nor ``MatMulNBitsQkv`` has a ``zero_points`` input on
+    its live schema (confirmed via live schema introspection -- every
+    weight slot on both fused ops uses the schema's own implicit default
+    zero point, ``2 ** (bits - 1)``, unconditionally).
+    """
+
+    node: onnx.NodeProto
+    gate_b: onnx.TensorProto
+    gate_scales: onnx.TensorProto
+    gate_bias: Optional[onnx.TensorProto]
+    up_b: onnx.TensorProto
+    up_scales: onnx.TensorProto
+    up_bias: Optional[onnx.TensorProto]
+    N: int
+    K: int
+    bits: int
+    block_size: int
+    k_blocks: int
+
+
+def _match_matmul_nbits_mlp(
+    node: onnx.NodeProto,
+    initializer_map: Dict[str, onnx.TensorProto],
+    consumers_of: Dict[str, List[onnx.NodeProto]],
+) -> Optional[_MatMulNBitsMlpWeight]:
+    """If `node` is a ``com.microsoft::MatMulNBitsMlp`` node matching every
+    scope boundary this section's own top comment documents, returns the
+    match -- the fused-gated-MLP analogue of :func:`_match_matmul_nbits`.
+    `skip`/`norm_scale` (inputs 1/2), when present, are read but never
+    otherwise inspected: this matcher (and the pruning pass built on it)
+    only ever prunes `gate`'s/`up`'s own shared OUTPUT (`N`) axis, never
+    their shared INPUT (`K`) axis those two operands would need re-slicing
+    for -- see this section's own top comment for why that's a deliberate,
+    documented scope boundary rather than an oversight.
+    """
+    if node.op_type != "MatMulNBitsMlp" or node.domain != "com.microsoft":
+        return None
+    if len(node.input) < 8 or len(node.output) < 1:
+        return None
+    a_name = node.input[0]
+    gate_b_name, gate_scales_name = node.input[3], node.input[4]
+    gate_bias_name = node.input[5] if node.input[5] else None
+    up_b_name, up_scales_name = node.input[6], node.input[7]
+    up_bias_name = node.input[8] if len(node.input) > 8 and node.input[8] else None
+    if not (
+        a_name and gate_b_name and gate_scales_name and up_b_name and up_scales_name
+    ):
+        return None
+    if gate_b_name == up_b_name:
+        return None  # degenerate -- can't independently slice a shared weight
+
+    block_size = _matmul_nbits_int_attr(node, "block_size")
+    N = _matmul_nbits_int_attr(node, "N")
+    K = _matmul_nbits_int_attr(node, "K")
+    if block_size is None or N is None or K is None or N <= 0 or K <= 0:
+        return None
+    if block_size not in _MATMUL_NBITS_VALID_BLOCK_SIZES:
+        return None
+    if K % block_size != 0:
+        return None
+    bits = _matmul_nbits_int_attr(node, "bits", 4)
+    if bits not in (4, 8):
+        return None
+
+    k_blocks = K // block_size
+    blob_size = block_size * bits // 8
+
+    def _resolve_branch(
+        b_name: str, scales_name: str, bias_name: Optional[str]
+    ) -> Optional[
+        Tuple[onnx.TensorProto, onnx.TensorProto, Optional[onnx.TensorProto]]
+    ]:
+        b_init = initializer_map.get(b_name)
+        scales_init = initializer_map.get(scales_name)
+        if b_init is None or scales_init is None:
+            return None  # non-constant B/scales -- can't safely slice them
+        if b_init.data_type != onnx.TensorProto.UINT8:
+            return None
+        if list(b_init.dims) != [N, k_blocks, blob_size]:
+            return None
+        if scales_init.data_type not in (
+            onnx.TensorProto.FLOAT,
+            onnx.TensorProto.FLOAT16,
+            onnx.TensorProto.BFLOAT16,
+        ):
+            return None
+        if list(scales_init.dims) != [N, k_blocks]:
+            return None
+        bias_init = None
+        if bias_name is not None:
+            bias_init = initializer_map.get(bias_name)
+            if bias_init is None or bias_init.data_type != scales_init.data_type:
+                return None
+            if list(bias_init.dims) != [N]:
+                return None
+        for nm in (b_name, scales_name) + ((bias_name,) if bias_name else ()):
+            if len(consumers_of.get(nm, [])) != 1:
+                return None  # shared/tied tensor -- another node reads it too
+        return b_init, scales_init, bias_init
+
+    gate = _resolve_branch(gate_b_name, gate_scales_name, gate_bias_name)
+    if gate is None:
+        return None
+    up = _resolve_branch(up_b_name, up_scales_name, up_bias_name)
+    if up is None:
+        return None
+
+    return _MatMulNBitsMlpWeight(
+        node=node,
+        gate_b=gate[0],
+        gate_scales=gate[1],
+        gate_bias=gate[2],
+        up_b=up[0],
+        up_scales=up[1],
+        up_bias=up[2],
+        N=N,
+        K=K,
+        bits=bits,
+        block_size=block_size,
+        k_blocks=k_blocks,
+    )
+
+
+def _matmul_nbits_mlp_branch_weight(
+    p: _MatMulNBitsMlpWeight, branch: str
+) -> _MatMulNBitsWeight:
+    """Wraps one branch (`"gate"` or `"up"`) of a matched
+    :class:`_MatMulNBitsMlpWeight` as a synthetic :class:`_MatMulNBitsWeight`
+    -- purely so :func:`_matmul_nbits_dequantized` (IMPORTANCE RANKING ONLY,
+    never written back) can be reused verbatim rather than re-derived:
+    `zero_points_init` is always ``None`` here (neither branch has one, see
+    :class:`_MatMulNBitsMlpWeight`'s own docstring), which is exactly what
+    :func:`_matmul_nbits_dequantized` already needs to fall back to the
+    schema's own default zero point.
+    """
+    b, scales, bias = (
+        (p.gate_b, p.gate_scales, p.gate_bias)
+        if branch == "gate"
+        else (p.up_b, p.up_scales, p.up_bias)
+    )
+    return _MatMulNBitsWeight(
+        node=p.node,
+        b_init=b,
+        scales_init=scales,
+        zero_points_init=None,
+        zero_points_packed=False,
+        bias_init=bias,
+        N=p.N,
+        K=p.K,
+        bits=p.bits,
+        block_size=p.block_size,
+        k_blocks=p.k_blocks,
+    )
+
+
+def _matmul_nbits_mlp_gated_importance(
+    gate_nk: np.ndarray, up_nk: np.ndarray, importance_norm: str
+) -> np.ndarray:
+    """Combined per-output-channel importance of a matched
+    ``MatMulNBitsMlp`` node's `gate`/`up` branches -- the block-quantized
+    analogue of :func:`_plain_structured_importance`'s own gated-pair
+    combination (root-sum-square of the two branches' own L2 row norms for
+    ``"l2"``, plain sum of their L1 row norms for ``"l1"``), since `gate`
+    and `up` must always agree on one shared keep-set (``Y =
+    activation(gate) * up`` multiplies them elementwise, exactly the
+    plain-float SwiGLU/GeGLU precedent this fused op's own schema doc names
+    directly -- see :func:`_find_gated_chains`).
+    """
+    gate_imp = _qdq_channel_importance(gate_nk, importance_norm)
+    up_imp = _qdq_channel_importance(up_nk, importance_norm)
+    if importance_norm == "l1":
+        return gate_imp + up_imp
+    return np.sqrt(np.square(gate_imp) + np.square(up_imp))
+
+
+@dataclass(frozen=True)
+class _MatMulNBitsMlpChain:
+    producer: _MatMulNBitsMlpWeight
+    chain_ops: Tuple[onnx.NodeProto, ...]
+    consumer: _MatMulNBitsChainSide
+    n_channels: int
+
+
+def _find_matmul_nbits_mlp_chains(graph: onnx.GraphProto) -> List[_MatMulNBitsMlpChain]:
+    """The ``MatMulNBitsMlp`` analogue of :func:`_find_matmul_nbits_chains`:
+    every matched fused-gated-MLP node whose `Y` output feeds, through zero
+    or more shape-preserving unary activations with no other consumer along
+    the way, into a downstream ``MatMulNBits``-or-plain-float consumer --
+    reusing :func:`_walk_to_matmul_nbits_consumer` verbatim, the exact same
+    walk an ordinary single-``MatMulNBits``-producer chain uses (this fused
+    node's own `Y` is no different a producer, from the consumer's own
+    point of view, than a plain ``MatMulNBits`` node's output).
+    """
+    initializer_map = {t.name: t for t in graph.initializer}
+    consumers_of = _consumers_of(graph)
+    graph_outputs = {o.name for o in graph.output}
+
+    def _is_internal(name: str) -> bool:
+        return len(consumers_of.get(name, [])) == 1 and name not in graph_outputs
+
+    chains: List[_MatMulNBitsMlpChain] = []
+    for node in graph.node:
+        w = _match_matmul_nbits_mlp(node, initializer_map, consumers_of)
+        if w is None:
+            continue
+        out_name = node.output[0]
+        if not _is_internal(out_name):
+            continue
+        found = _walk_to_matmul_nbits_consumer(
+            out_name, initializer_map, consumers_of, graph_outputs, w.N, _MAX_CHAIN_HOPS
+        )
+        if found is None:
+            continue
+        consumer, chain_ops = found
+        chains.append(_MatMulNBitsMlpChain(w, chain_ops, consumer, w.N))
+    return chains
+
+
+def _apply_matmul_nbits_mlp_chains(
+    graph: onnx.GraphProto,
+    chains: List[_MatMulNBitsMlpChain],
+    sparsity: float,
+    importance_norm: str,
+    producer_touched: Set[str],
+    consumer_touched: Set[str],
+    stale_value_info: Set[str],
+) -> None:
+    """Applies whole-output-channel pruning to every matched
+    ``MatMulNBitsMlp`` chain in place -- co-slicing `gate`'s and `up`'s own
+    shared ``N`` axis to one shared `keep` set (ranked by
+    :func:`_matmul_nbits_mlp_gated_importance`), then the downstream
+    consumer's own reduction axis, mirroring
+    :func:`apply_structured_pruning_matmul_nbits`'s own per-chain loop
+    exactly (block-alignment decline for a ``MatMulNBits`` consumer, direct
+    application for a plain-float one). `producer_touched`/
+    `consumer_touched`/`stale_value_info` are the caller's own running sets,
+    shared across every ``MatMulNBits``-family chain kind so a tensor
+    played as one role by an earlier chain (of ANY of the three kinds) is
+    never resized twice.
+    """
+    for chain in chains:
+        p, c = chain.producer, chain.consumer
+        p_keys = {p.gate_b.name, p.up_b.name}
+        c_key = _matmul_nbits_chain_side_key(c)
+        if c_key in p_keys:
+            continue  # degenerate (the same weight in both roles)
+        if p_keys & producer_touched or c_key in consumer_touched:
+            continue  # a shared/tied weight another chain already resized
+
+        n = chain.n_channels
+        keep_count = max(1, n - round(n * sparsity))
+        if keep_count >= n:
+            continue  # rounds down to nothing for this layer -- no-op
+
+        gate_nk = _matmul_nbits_dequantized(_matmul_nbits_mlp_branch_weight(p, "gate"))
+        up_nk = _matmul_nbits_dequantized(_matmul_nbits_mlp_branch_weight(p, "up"))
+        importance = _matmul_nbits_mlp_gated_importance(gate_nk, up_nk, importance_norm)
+        # `kind="stable"` for the identical reason
+        # `apply_structured_pruning_matmul_nbits`'s own per-chain loop gives
+        # on this same line -- keeps this pass's own selection deterministic
+        # across platforms and matching its `_analyze_*` dry-run mirror.
+        keep = np.sort(np.argsort(-importance, kind="stable")[:keep_count])
+
+        if isinstance(c, _MatMulNBitsWeight):
+            keep_blocks = _matmul_nbits_block_aligned_keep_blocks(
+                keep, c.k_blocks, c.block_size
+            )
+            if keep_blocks is None:
+                continue  # non-block-aligned request for this consumer -- decline
+            consumer_keep = keep_blocks
+        else:
+            consumer_keep = keep  # plain-float consumer -- no block structure
+
+        _slice_matmul_nbits_rows_no_zp(p.gate_b, p.gate_scales, p.gate_bias, keep)
+        _slice_matmul_nbits_rows_no_zp(p.up_b, p.up_scales, p.up_bias, keep)
+        _set_matmul_nbits_int_attr(p.node, "N", len(keep))
+        _slice_matmul_nbits_chain_consumer(c, consumer_keep)
+
+        producer_touched.update(p_keys)
+        consumer_touched.add(c_key)
+        stale_value_info.add(p.node.output[0])
+        stale_value_info.update(op.output[0] for op in chain.chain_ops)
+
+
+def _walk_to_matmul_nbits_attention_consumer(
+    start: str,
+    initializer_map: Dict[str, onnx.TensorProto],
+    consumers_of: Dict[str, List[onnx.NodeProto]],
+    graph_outputs: Set[str],
+    nv: int,
+) -> Tuple[
+    Optional[_MatMulNBitsChainSide], Tuple[Tuple[onnx.NodeProto, Optional[str]], ...]
+]:
+    """The ``MatMulNBits``-aware analogue of :func:`_walk_to_attention_consumer`:
+    from a matched ``GroupQueryAttention``/plain ``ai.onnx::Attention``
+    node's own raw (`nv`-wide) output `start`, optionally through one
+    ``Reshape`` hop (identical shape/single-use safety check to that
+    function's own), to an output projection whose reduction dimension
+    matches `nv` -- either a ``MatMulNBits`` node
+    (:func:`_match_matmul_nbits`) or a plain-float MatMul/vanilla-Gemm
+    (:func:`_match_plain_matmul_nbits_peer`), the same ``MatMulNBits``/
+    plain-float union :func:`_walk_to_matmul_nbits_consumer` already
+    supports for an ordinary chain. A real quantized transformer block's
+    own output projection is exactly as likely to be ``MatMulNBits``-
+    quantized as its fused Q/K/V projection already is, so
+    :func:`_walk_to_attention_consumer`'s own plain-float-only consumer
+    would be a real, silent gap here -- this function closes it, at the one
+    extra `Reshape`-hop granularity that function already supports (no
+    further activation/hop chain beyond that, mirroring
+    :func:`_walk_to_attention_consumer`'s own identical restriction, not a
+    new one this function adds).
+    """
+    candidates = consumers_of.get(start, [])
+    if len(candidates) != 1:
+        return None, ()
+    node = candidates[0]
+    chain_ops: Tuple[Tuple[onnx.NodeProto, Optional[str]], ...] = ()
+    cur = start
+
+    if node.op_type == "Reshape" and node.input[:1] == [cur]:
+        last_dim = _reshape_last_dim(node, initializer_map)
+        if last_dim != nv:
+            return None, ()
+        shape_name = node.input[1]
+        if len(consumers_of.get(shape_name, [])) != 1:
+            return None, ()  # shared shape constant -- mutating it isn't safe
+        out_name = node.output[0]
+        if len(consumers_of.get(out_name, [])) != 1 or out_name in graph_outputs:
+            return None, ()
+        chain_ops = ((node, shape_name),)
+        cur = out_name
+        next_candidates = consumers_of.get(cur, [])
+        if len(next_candidates) != 1:
+            return None, chain_ops
+        node = next_candidates[0]
+
+    if (
+        node.op_type == "MatMulNBits"
+        and node.domain == "com.microsoft"
+        and node.input[0] == cur
+    ):
+        w = _match_matmul_nbits(node, initializer_map, consumers_of)
+        if w is None or w.K != nv:
+            return None, chain_ops
+        return w, chain_ops
+
+    mm = _match_matmul_like(node)
+    if mm is not None and mm[0] == cur:
+        peer = _match_plain_matmul_nbits_peer(node, initializer_map, consumers_of)
+        if peer is None or peer.in_channels != nv:
+            return None, chain_ops
+        return peer, chain_ops
+
+    return None, chain_ops
+
+
+@dataclass(frozen=True)
+class _MatMulNBitsQkvWeight:
+    """A matched ``com.microsoft::MatMulNBitsQkv`` node's three block-
+    quantized weight operands (`q`/`k`/`v`), matched by
+    :func:`_match_matmul_nbits_qkv`. Like :class:`_MatMulNBitsMlpWeight`, no
+    ``zero_points`` field at all -- confirmed absent from this op's live
+    schema too, see this section's own top comment.
+    """
+
+    node: onnx.NodeProto
+    q_b: onnx.TensorProto
+    q_scales: onnx.TensorProto
+    q_bias: Optional[onnx.TensorProto]
+    k_b: onnx.TensorProto
+    k_scales: onnx.TensorProto
+    k_bias: Optional[onnx.TensorProto]
+    v_b: onnx.TensorProto
+    v_scales: onnx.TensorProto
+    v_bias: Optional[onnx.TensorProto]
+    Nq: int
+    Nkv: int
+    K: int
+    bits: int
+    block_size: int
+    k_blocks: int
+
+
+def _match_matmul_nbits_qkv(
+    node: onnx.NodeProto,
+    initializer_map: Dict[str, onnx.TensorProto],
+    consumers_of: Dict[str, List[onnx.NodeProto]],
+) -> Optional[_MatMulNBitsQkvWeight]:
+    """If `node` is a ``com.microsoft::MatMulNBitsQkv`` node matching every
+    scope boundary this section's own top comment documents, returns the
+    match. `skip` (input 1, optional) and `norm_scale` (input 2, always
+    REQUIRED on this op's live schema -- unlike ``MatMulNBitsMlp``'s own
+    optional one, confirmed via live schema introspection) are read but
+    never otherwise inspected, for the identical reason
+    :func:`_match_matmul_nbits_mlp` gives its own `skip`/`norm_scale`: only
+    the shared ``Nq``/``Nkv`` OUTPUT axes are ever pruned here, never the
+    shared ``K`` INPUT axis those two operands (and every one of `q`/`k`/
+    `v`'s own weights) would need re-slicing for.
+    """
+    if node.op_type != "MatMulNBitsQkv" or node.domain != "com.microsoft":
+        return None
+    if len(node.input) < 11 or len(node.output) < 3:
+        return None
+    a_name = node.input[0]
+    norm_scale_name = node.input[2] if node.input[2] else None
+    if not a_name or norm_scale_name is None:
+        return None
+    q_b_name, q_scales_name = node.input[3], node.input[4]
+    q_bias_name = node.input[5] if node.input[5] else None
+    k_b_name, k_scales_name = node.input[6], node.input[7]
+    k_bias_name = node.input[8] if node.input[8] else None
+    v_b_name, v_scales_name = node.input[9], node.input[10]
+    v_bias_name = node.input[11] if len(node.input) > 11 and node.input[11] else None
+    if not (
+        q_b_name
+        and q_scales_name
+        and k_b_name
+        and k_scales_name
+        and v_b_name
+        and v_scales_name
+    ):
+        return None
+    if q_b_name == k_b_name or q_b_name == v_b_name or k_b_name == v_b_name:
+        return None  # degenerate -- can't independently slice a shared weight
+
+    block_size = _matmul_nbits_int_attr(node, "block_size")
+    Nq = _matmul_nbits_int_attr(node, "Nq")
+    Nkv = _matmul_nbits_int_attr(node, "Nkv")
+    K = _matmul_nbits_int_attr(node, "K")
+    if block_size is None or Nq is None or Nkv is None or K is None:
+        return None
+    if Nq <= 0 or Nkv <= 0 or K <= 0:
+        return None
+    if block_size not in _MATMUL_NBITS_VALID_BLOCK_SIZES:
+        return None
+    if K % block_size != 0:
+        return None
+    bits = _matmul_nbits_int_attr(node, "bits", 4)
+    if bits not in (4, 8):
+        return None
+
+    k_blocks = K // block_size
+    blob_size = block_size * bits // 8
+
+    def _resolve_branch(
+        n: int, b_name: str, scales_name: str, bias_name: Optional[str]
+    ) -> Optional[
+        Tuple[onnx.TensorProto, onnx.TensorProto, Optional[onnx.TensorProto]]
+    ]:
+        b_init = initializer_map.get(b_name)
+        scales_init = initializer_map.get(scales_name)
+        if b_init is None or scales_init is None:
+            return None
+        if b_init.data_type != onnx.TensorProto.UINT8:
+            return None
+        if list(b_init.dims) != [n, k_blocks, blob_size]:
+            return None
+        if scales_init.data_type not in (
+            onnx.TensorProto.FLOAT,
+            onnx.TensorProto.FLOAT16,
+            onnx.TensorProto.BFLOAT16,
+        ):
+            return None
+        if list(scales_init.dims) != [n, k_blocks]:
+            return None
+        bias_init = None
+        if bias_name is not None:
+            bias_init = initializer_map.get(bias_name)
+            if bias_init is None or bias_init.data_type != scales_init.data_type:
+                return None
+            if list(bias_init.dims) != [n]:
+                return None
+        for nm in (b_name, scales_name) + ((bias_name,) if bias_name else ()):
+            if len(consumers_of.get(nm, [])) != 1:
+                return None
+        return b_init, scales_init, bias_init
+
+    q = _resolve_branch(Nq, q_b_name, q_scales_name, q_bias_name)
+    if q is None:
+        return None
+    k = _resolve_branch(Nkv, k_b_name, k_scales_name, k_bias_name)
+    if k is None:
+        return None
+    v = _resolve_branch(Nkv, v_b_name, v_scales_name, v_bias_name)
+    if v is None:
+        return None
+
+    return _MatMulNBitsQkvWeight(
+        node=node,
+        q_b=q[0],
+        q_scales=q[1],
+        q_bias=q[2],
+        k_b=k[0],
+        k_scales=k[1],
+        k_bias=k[2],
+        v_b=v[0],
+        v_scales=v[1],
+        v_bias=v[2],
+        Nq=Nq,
+        Nkv=Nkv,
+        K=K,
+        bits=bits,
+        block_size=block_size,
+        k_blocks=k_blocks,
+    )
+
+
+def _matmul_nbits_qkv_branch_weight(
+    p: _MatMulNBitsQkvWeight, branch: str
+) -> _MatMulNBitsWeight:
+    """The ``MatMulNBitsQkv`` analogue of
+    :func:`_matmul_nbits_mlp_branch_weight`: wraps one branch (`"q"`, `"k"`,
+    or `"v"`) as a synthetic :class:`_MatMulNBitsWeight` so
+    :func:`_matmul_nbits_dequantized` can be reused verbatim.
+    """
+    if branch == "q":
+        b, scales, bias, n = p.q_b, p.q_scales, p.q_bias, p.Nq
+    elif branch == "k":
+        b, scales, bias, n = p.k_b, p.k_scales, p.k_bias, p.Nkv
+    else:
+        b, scales, bias, n = p.v_b, p.v_scales, p.v_bias, p.Nkv
+    return _MatMulNBitsWeight(
+        node=p.node,
+        b_init=b,
+        scales_init=scales,
+        zero_points_init=None,
+        zero_points_packed=False,
+        bias_init=bias,
+        N=n,
+        K=p.K,
+        bits=p.bits,
+        block_size=p.block_size,
+        k_blocks=p.k_blocks,
+    )
+
+
+def _matmul_nbits_qkv_group_importance(
+    q_nk: np.ndarray,
+    k_nk: np.ndarray,
+    v_nk: np.ndarray,
+    group_size: int,
+    kv_num_heads: int,
+    head_size: int,
+    importance_norm: str,
+) -> np.ndarray:
+    """The ``MatMulNBitsQkv`` analogue of :func:`_gqa_group_importance`:
+    combined per-KV-group importance of `q`'s/`k`'s/`v`'s own dequantized
+    producer-weight ROWS -- this section's own ``[N, K]`` convention
+    (contrast :func:`_gqa_group_importance`'s own ``[K, N]`` one, since a
+    ``MatMulNBits`` dequantized weight's leading axis is always its own
+    output-channel ``N`` axis, never transposed -- see
+    :func:`_matmul_nbits_dequantized`). Every KV group's own query-head
+    rows, K rows, and V rows are contiguous `head_size`-wide row ranges of
+    `q_nk`'s/`k_nk`'s/`v_nk`'s own ``N`` axis -- the same "heads are
+    contiguous output-channel ranges" convention this module already uses
+    everywhere else (:func:`_head_column_indices`, `_gqa_group_importance`
+    itself).
+    """
+    importance = np.zeros(kv_num_heads, dtype=np.float64)
+    for kv in range(kv_num_heads):
+        q_block = q_nk[
+            kv * group_size * head_size : (kv + 1) * group_size * head_size, :
+        ]
+        k_block = k_nk[kv * head_size : (kv + 1) * head_size, :]
+        v_block = v_nk[kv * head_size : (kv + 1) * head_size, :]
+        if importance_norm == "l1":
+            importance[kv] = (
+                np.abs(q_block).sum() + np.abs(k_block).sum() + np.abs(v_block).sum()
+            )
+        else:
+            importance[kv] = np.sqrt(
+                np.linalg.norm(q_block) ** 2
+                + np.linalg.norm(k_block) ** 2
+                + np.linalg.norm(v_block) ** 2
+            )
+    return importance
+
+
+@dataclass(frozen=True)
+class _MatMulNBitsQkvChain:
+    producer: _MatMulNBitsQkvWeight
+    attn_node: onnx.NodeProto
+    num_heads: int
+    kv_num_heads: int
+    head_size: int
+    num_heads_attr: str
+    chain_ops: Tuple[Tuple[onnx.NodeProto, Optional[str]], ...]
+    consumer: _MatMulNBitsChainSide
+
+
+def _find_matmul_nbits_qkv_chains(graph: onnx.GraphProto) -> List[_MatMulNBitsQkvChain]:
+    """Matches a ``MatMulNBitsQkv`` node whose `Q`/`K`/`V` outputs each feed
+    -- directly, single-consumer, no intermediate hop -- into the
+    respective query/key/value inputs of one shared downstream
+    ``GroupQueryAttention`` (:func:`_match_gqa_producer`) or plain
+    ``ai.onnx::Attention`` (:func:`_match_onnx_attention_producer`) node,
+    reused verbatim (both already validate `num_heads`/`kv_num_heads` and
+    every optional per-head `past_key`/`past_value`/`k_scale`/`v_scale`/
+    `attention_bias`/`head_sink` operand's own safety), and whose own
+    output in turn reaches a ``MatMulNBits``-or-plain-float output
+    projection (:func:`_walk_to_matmul_nbits_attention_consumer`).
+
+    Unlike :func:`_find_separate_qkv_chains` (this module's own plain-float
+    separate-Q/K/V-producer precedent), NO per-head Q/K-norm + RoPE
+    pass-through hop (:func:`_walk_back_through_qk_norm_rope`) is matched
+    between this fused node's own `Q`/`K` outputs and the attention
+    consumer -- a real, deliberate, documented scope boundary (see this
+    section's own top comment), not an oversight: a model relying on that
+    hop is declined here rather than mis-sliced.
+    """
+    initializer_map = {t.name: t for t in graph.initializer}
+    consumers_of = _consumers_of(graph)
+    graph_outputs = {o.name for o in graph.output}
+
+    def _is_internal(name: str) -> bool:
+        return len(consumers_of.get(name, [])) == 1 and name not in graph_outputs
+
+    chains: List[_MatMulNBitsQkvChain] = []
+    for node in graph.node:
+        w = _match_matmul_nbits_qkv(node, initializer_map, consumers_of)
+        if w is None:
+            continue
+
+        q_out, k_out, v_out = node.output[0], node.output[1], node.output[2]
+        if not (_is_internal(q_out) and _is_internal(k_out) and _is_internal(v_out)):
+            continue
+        attn = consumers_of[q_out][0]
+        if consumers_of[k_out][0] is not attn or consumers_of[v_out][0] is not attn:
+            continue  # Q/K/V must feed the exact same downstream node
+        if len(attn.input) < 3:
+            continue
+        if attn.input[0] != q_out or attn.input[1] != k_out or attn.input[2] != v_out:
+            continue  # must land on the consumer's own query/key/value inputs
+
+        num_heads_attr = "num_heads"
+        info: Optional[Tuple[int, int]]
+        if attn.domain == _ATTENTION_DOMAIN and attn.op_type == "GroupQueryAttention":
+            info = _match_gqa_producer(attn, initializer_map)
+        elif attn.domain == "" and attn.op_type == "Attention":
+            info = _match_onnx_attention_producer(attn, initializer_map)
+            num_heads_attr = "q_num_heads"
+        else:
+            info = None
+        if info is None:
+            continue
+        num_heads, kv_num_heads = info
+        if w.Nq % num_heads or w.Nkv % kv_num_heads:
+            continue
+        head_size = w.Nq // num_heads
+        if head_size <= 0 or w.Nkv // kv_num_heads != head_size:
+            continue
+
+        out_name = attn.output[0]
+        if not _is_internal(out_name):
+            continue
+        raw_out_width = num_heads * head_size
+        consumer, chain_ops = _walk_to_matmul_nbits_attention_consumer(
+            out_name, initializer_map, consumers_of, graph_outputs, raw_out_width
+        )
+        if consumer is None:
+            continue
+
+        chains.append(
+            _MatMulNBitsQkvChain(
+                producer=w,
+                attn_node=attn,
+                num_heads=num_heads,
+                kv_num_heads=kv_num_heads,
+                head_size=head_size,
+                num_heads_attr=num_heads_attr,
+                chain_ops=chain_ops,
+                consumer=consumer,
+            )
+        )
+    return chains
+
+
+def _apply_matmul_nbits_qkv_chains(
+    graph: onnx.GraphProto,
+    chains: List[_MatMulNBitsQkvChain],
+    sparsity: float,
+    importance_norm: str,
+    producer_touched: Set[str],
+    consumer_touched: Set[str],
+    stale_value_info: Set[str],
+) -> None:
+    """Applies whole-KV-group pruning to every matched ``MatMulNBitsQkv``
+    chain in place -- the fused-op analogue of :func:`_apply_one_gqa_chain`,
+    reusing that function's own consumer-side bookkeeping (`past_key`/
+    `past_value`, `k_scale`/`v_scale`, `attention_bias`/`attn_mask`,
+    `head_sink`, `num_heads`/`kv_num_heads` attribute rewrite) directly
+    against `chain.attn_node`, since that node itself owns no weight of its
+    own to slice here -- only `q`'s/`k`'s/`v`'s own producer weights (this
+    function's own job) and the downstream output-projection consumer
+    (:func:`_slice_matmul_nbits_chain_consumer`, reused verbatim).
+    """
+    initializer_map = {t.name: t for t in graph.initializer}
+
+    for chain in chains:
+        p, c = chain.producer, chain.consumer
+        p_keys = {p.q_b.name, p.k_b.name, p.v_b.name}
+        c_key = _matmul_nbits_chain_side_key(c)
+        if c_key in p_keys:
+            continue  # degenerate (the same weight in both roles)
+        if p_keys & producer_touched or c_key in consumer_touched:
+            continue  # a shared/tied weight another chain already resized
+
+        h = chain.kv_num_heads
+        keep_count = max(1, h - round(h * sparsity))
+        if keep_count >= h:
+            continue  # rounds down to nothing for this block -- no-op
+
+        d = chain.head_size
+        group_size = chain.num_heads // chain.kv_num_heads
+
+        q_nk = _matmul_nbits_dequantized(_matmul_nbits_qkv_branch_weight(p, "q"))
+        k_nk = _matmul_nbits_dequantized(_matmul_nbits_qkv_branch_weight(p, "k"))
+        v_nk = _matmul_nbits_dequantized(_matmul_nbits_qkv_branch_weight(p, "v"))
+        importance = _matmul_nbits_qkv_group_importance(
+            q_nk, k_nk, v_nk, group_size, h, d, importance_norm
+        )
+        # `kind="stable"` for the same reason `_apply_matmul_nbits_mlp_chains`'s
+        # own identical comment gives.
+        keep_groups = np.sort(np.argsort(-importance, kind="stable")[:keep_count])
+        keep_q_heads = np.concatenate(
+            [np.arange(g * group_size, (g + 1) * group_size) for g in keep_groups]
+        )
+        q_idx = _head_column_indices(keep_q_heads, d)
+        kv_idx = _head_column_indices(keep_groups, d)
+
+        if isinstance(c, _MatMulNBitsWeight):
+            keep_blocks = _matmul_nbits_block_aligned_keep_blocks(
+                q_idx, c.k_blocks, c.block_size
+            )
+            if keep_blocks is None:
+                continue  # non-block-aligned request for this consumer -- decline
+            consumer_keep = keep_blocks
+        else:
+            consumer_keep = q_idx  # plain-float consumer -- no block structure
+
+        _slice_matmul_nbits_rows_no_zp(p.q_b, p.q_scales, p.q_bias, q_idx)
+        _slice_matmul_nbits_rows_no_zp(p.k_b, p.k_scales, p.k_bias, kv_idx)
+        _slice_matmul_nbits_rows_no_zp(p.v_b, p.v_scales, p.v_bias, kv_idx)
+        _set_matmul_nbits_int_attr(p.node, "Nq", len(q_idx))
+        _set_matmul_nbits_int_attr(p.node, "Nkv", len(kv_idx))
+
+        new_num_heads = keep_count * group_size
+        for attr in chain.attn_node.attribute:
+            if attr.name == chain.num_heads_attr:
+                attr.i = new_num_heads
+            elif attr.name == "kv_num_heads":
+                attr.i = keep_count
+
+        is_gqa = (
+            chain.attn_node.domain == _ATTENTION_DOMAIN
+            and chain.attn_node.op_type == "GroupQueryAttention"
+        )
+        past_kv_indices = (3, 4) if is_gqa else (4, 5)
+        for idx in past_kv_indices:
+            if len(chain.attn_node.input) <= idx or not chain.attn_node.input[idx]:
+                continue
+            past_init = initializer_map.get(chain.attn_node.input[idx])
+            if past_init is not None:
+                _slice_axis1(past_init, keep_groups)
+
+        if is_gqa:
+            for idx in (12, 13):
+                if len(chain.attn_node.input) <= idx or not chain.attn_node.input[idx]:
+                    continue
+                scale_init = initializer_map.get(chain.attn_node.input[idx])
+                if scale_init is None:
+                    continue
+                if len(scale_init.dims) == 4 and scale_init.dims[1] == h:
+                    _slice_axis1(scale_init, keep_groups)
+
+        mask_idx = 10 if is_gqa else 3
+        if len(chain.attn_node.input) > mask_idx and chain.attn_node.input[mask_idx]:
+            mask_init = initializer_map.get(chain.attn_node.input[mask_idx])
+            if mask_init is not None:
+                axis = _head_bias_axis(list(mask_init.dims), chain.num_heads)
+                if axis is not None and axis >= 0:
+                    _slice_axis(mask_init, keep_q_heads, axis)
+
+        if is_gqa and len(chain.attn_node.input) > 11 and chain.attn_node.input[11]:
+            sink_init = initializer_map.get(chain.attn_node.input[11])
+            if sink_init is not None:
+                _slice_last_axis(sink_init, keep_q_heads)
+
+        _slice_matmul_nbits_chain_consumer(c, consumer_keep)
+
+        for op, shape_name in chain.chain_ops:
+            if shape_name is not None:
+                shape_init = initializer_map[shape_name]
+                dims = onnx.numpy_helper.to_array(shape_init).copy()
+                dims[-1] = new_num_heads * d
+                shape_init.CopyFrom(
+                    onnx.numpy_helper.from_array(dims, name=shape_init.name)
+                )
+
+        producer_touched.update(p_keys)
+        consumer_touched.add(c_key)
+        stale_value_info.add(p.node.output[0])
+        stale_value_info.add(p.node.output[1])
+        stale_value_info.add(p.node.output[2])
+        stale_value_info.add(chain.attn_node.output[0])
+        stale_value_info.update(op.output[0] for op, _ in chain.chain_ops)
 
 
 # --- MoE expert-intermediate-channel pruning --------------------------------
@@ -19403,19 +20546,38 @@ def _analyze_structured_pruning_qdq(
 def _matmul_nbits_not_eligible(
     graph: onnx.GraphProto,
     chains: List[_MatMulNBitsChain],
+    mlp_chains: List[_MatMulNBitsMlpChain],
+    qkv_chains: List[_MatMulNBitsQkvChain],
     gated_chains: List[_MatMulNBitsGatedChain],
 ) -> List[str]:
+    """Extended, alongside :func:`apply_structured_pruning_matmul_nbits`'s
+    own new ``MatMulNBitsMlp``/``MatMulNBitsQkv`` matching, to also mark a
+    matched fused node's own producer (and, for ``MatMulNBitsQkv``, its own
+    downstream attention consumer) ineligible -- otherwise a fused node this
+    module's new matchers *do* recognize would still show up in
+    `not_eligible` merely for not being a plain ``MatMulNBits`` node, an
+    obviously wrong report once this module actually prunes it.
+    """
     matched_ids: Set[int] = set()
     for chain in chains:
         matched_ids.add(id(chain.producer.node))
         matched_ids.add(id(chain.consumer.node))
+    for mlp_chain in mlp_chains:
+        matched_ids.add(id(mlp_chain.producer.node))
+        matched_ids.add(id(mlp_chain.consumer.node))
+    for qkv_chain in qkv_chains:
+        matched_ids.add(id(qkv_chain.producer.node))
+        matched_ids.add(id(qkv_chain.attn_node))
+        matched_ids.add(id(qkv_chain.consumer.node))
     for gchain in gated_chains:
         matched_ids.add(id(gchain.producer_a.node))
         matched_ids.add(id(gchain.producer_b.node))
         matched_ids.add(id(gchain.consumer.node))
     not_eligible = []
     for node in graph.node:
-        if node.op_type != "MatMulNBits" or node.domain != "com.microsoft":
+        if node.domain != "com.microsoft":
+            continue
+        if node.op_type not in ("MatMulNBits", "MatMulNBitsMlp", "MatMulNBitsQkv"):
             continue
         if id(node) in matched_ids:
             continue
@@ -19484,6 +20646,22 @@ def _analyze_structured_pruning_matmul_nbits(
     :func:`_find_matmul_nbits_gated_chains`'s own return value in the first
     place, so it is reported via `not_eligible` exactly like any other
     unmatched ``MatMulNBits`` node.
+
+    ALSO mirrors :func:`apply_structured_pruning_matmul_nbits`'s own new
+    ``MatMulNBitsMlp``/``MatMulNBitsQkv`` fused-node matching: appends one
+    report row per matched :func:`_find_matmul_nbits_mlp_chains`/
+    :func:`_find_matmul_nbits_qkv_chains` chain
+    (:func:`_analyze_matmul_nbits_mlp_chains`/
+    :func:`_analyze_matmul_nbits_qkv_chains`, in the "MatMulNBitsMlp/
+    MatMulNBitsQkv (fused block-quantized weight) structured family" section
+    below -- placed after "Attention-head family" for the identical reason
+    the real functions live after "Attention-head pruning": the QKV mirror
+    reuses that family's own matchers), each sharing this function's own
+    `producer_touched`/`consumer_touched` sets so a tensor touched by one
+    family's chain is correctly reported as already-claimed by another's.
+    `family` is ``"matmul_nbits_mlp"``/``"matmul_nbits_qkv"`` respectively;
+    the latter's `total`/`would_drop` are in KV-GROUP units, not raw
+    channel counts (this fused op's own pruning unit).
     """
     if not (0.0 <= sparsity < 1.0):
         raise ValueError(f"sparsity must be in [0, 1), got {sparsity}")
@@ -19493,9 +20671,13 @@ def _analyze_structured_pruning_matmul_nbits(
     graph = model.graph
 
     chains = _find_matmul_nbits_chains(graph)
+    mlp_chains = _find_matmul_nbits_mlp_chains(graph)
+    qkv_chains = _find_matmul_nbits_qkv_chains(graph)
     gated_chains = _find_matmul_nbits_gated_chains(graph)
-    not_eligible = _matmul_nbits_not_eligible(graph, chains, gated_chains)
-    if not chains and not gated_chains:
+    not_eligible = _matmul_nbits_not_eligible(
+        graph, chains, mlp_chains, qkv_chains, gated_chains
+    )
+    if not chains and not mlp_chains and not qkv_chains and not gated_chains:
         return PruningSensitivityReport(layers=[], not_eligible=not_eligible)
 
     producer_touched: Set[str] = set()
@@ -19684,6 +20866,17 @@ def _analyze_structured_pruning_matmul_nbits(
         producer_touched.add(pa_key)
         producer_touched.add(pb_key)
         consumer_touched.add(c_key)
+
+    layers.extend(
+        _analyze_matmul_nbits_mlp_chains(
+            mlp_chains, sparsity, importance_norm, producer_touched, consumer_touched
+        )
+    )
+    layers.extend(
+        _analyze_matmul_nbits_qkv_chains(
+            qkv_chains, sparsity, importance_norm, producer_touched, consumer_touched
+        )
+    )
 
     return PruningSensitivityReport(layers=layers, not_eligible=not_eligible)
 
@@ -19979,6 +21172,234 @@ def _analyze_attention_head_wanda_pruning(
     return PruningSensitivityReport(
         layers=layers, not_eligible=_attention_not_eligible(graph, chains)
     )
+
+
+# --- MatMulNBitsMlp/MatMulNBitsQkv (fused block-quantized weight) structured
+#     family ---------------------------------------------------------------
+#
+# Dry-run mirrors of :func:`_apply_matmul_nbits_mlp_chains`/
+# :func:`_apply_matmul_nbits_qkv_chains` -- both called directly from
+# :func:`_analyze_structured_pruning_matmul_nbits` above (the same single
+# `_analyze_*` :func:`apply_structured_pruning_matmul_nbits` itself maps to
+# in `_SENSITIVITY_ANALYZERS`; these two fused-node kinds get no separate
+# public entry point of their own, mirroring the real `apply_*` function's
+# own shape). Placed after "Attention-head family" -- rather than
+# immediately alongside `_analyze_structured_pruning_matmul_nbits` itself --
+# because the QKV mirror reuses that family's own already-defined
+# `_match_gqa_producer`/`_match_onnx_attention_producer`/`_head_bias_axis`-
+# style machinery, the same layout reason the real (mutating)
+# `_apply_matmul_nbits_qkv_chains` lives after "Attention-head pruning".
+
+
+def _analyze_matmul_nbits_mlp_chains(
+    chains: List[_MatMulNBitsMlpChain],
+    sparsity: float,
+    importance_norm: str,
+    producer_touched: Set[str],
+    consumer_touched: Set[str],
+) -> List[PruningLayerSensitivity]:
+    """Dry-run mirror of :func:`_apply_matmul_nbits_mlp_chains` -- same
+    matching, touched-role bookkeeping, keep-count, and importance
+    (:func:`_matmul_nbits_mlp_gated_importance`) logic, reused directly,
+    never mutating anything. `producer_touched`/`consumer_touched` are the
+    caller's own running sets (shared with the plain ``MatMulNBits`` and
+    ``MatMulNBitsQkv`` mirrors too, mutated in place here exactly as the
+    real function's own identically-named sets are). `family` is always
+    ``"matmul_nbits_mlp"``.
+    """
+    layers: List[PruningLayerSensitivity] = []
+    for chain in chains:
+        p, c = chain.producer, chain.consumer
+        p_keys = {p.gate_b.name, p.up_b.name}
+        c_key = _matmul_nbits_chain_side_key(c)
+        if c_key in p_keys:
+            continue  # degenerate (the same weight in both roles) -- no report row
+
+        label = _node_label(p.node)
+        family = "matmul_nbits_mlp"
+        n = chain.n_channels
+
+        if p_keys & producer_touched or c_key in consumer_touched:
+            layers.append(
+                PruningLayerSensitivity(
+                    label=label,
+                    family=family,
+                    total=n,
+                    would_drop=0,
+                    margin=None,
+                    importance_min=0.0,
+                    importance_max=0.0,
+                )
+            )
+            continue  # a shared/tied weight another chain already claimed
+
+        keep_count = max(1, n - round(n * sparsity))
+        if keep_count >= n:
+            layers.append(
+                PruningLayerSensitivity(
+                    label=label,
+                    family=family,
+                    total=n,
+                    would_drop=0,
+                    margin=None,
+                    importance_min=0.0,
+                    importance_max=0.0,
+                )
+            )
+            continue  # rounds down to nothing for this chain -- no-op
+
+        gate_nk = _matmul_nbits_dequantized(_matmul_nbits_mlp_branch_weight(p, "gate"))
+        up_nk = _matmul_nbits_dequantized(_matmul_nbits_mlp_branch_weight(p, "up"))
+        importance = _matmul_nbits_mlp_gated_importance(gate_nk, up_nk, importance_norm)
+        keep = np.sort(np.argsort(-importance, kind="stable")[:keep_count])
+
+        if isinstance(c, _MatMulNBitsWeight):
+            keep_blocks = _matmul_nbits_block_aligned_keep_blocks(
+                keep, c.k_blocks, c.block_size
+            )
+            if keep_blocks is None:
+                layers.append(
+                    PruningLayerSensitivity(
+                        label=label,
+                        family=family,
+                        total=n,
+                        would_drop=0,
+                        margin=None,
+                        importance_min=0.0,
+                        importance_max=0.0,
+                    )
+                )
+                continue  # non-block-aligned keep-set -- the real call
+                # declines this chain entirely too
+
+        keep_mask = np.zeros(n, dtype=bool)
+        keep_mask[keep] = True
+
+        layers.append(
+            PruningLayerSensitivity(
+                label=label,
+                family=family,
+                total=n,
+                would_drop=int(n - keep_count),
+                margin=_normalized_margin(importance, keep_mask),
+                importance_min=float(importance.min()),
+                importance_max=float(importance.max()),
+            )
+        )
+
+        producer_touched.update(p_keys)
+        consumer_touched.add(c_key)
+
+    return layers
+
+
+def _analyze_matmul_nbits_qkv_chains(
+    chains: List[_MatMulNBitsQkvChain],
+    sparsity: float,
+    importance_norm: str,
+    producer_touched: Set[str],
+    consumer_touched: Set[str],
+) -> List[PruningLayerSensitivity]:
+    """Dry-run mirror of :func:`_apply_matmul_nbits_qkv_chains` -- same
+    matching, touched-role bookkeeping, keep-group-count, and importance
+    (:func:`_matmul_nbits_qkv_group_importance`) logic, reused directly,
+    never mutating anything. `total`/`would_drop` are in KV-GROUP units
+    (this fused op's own pruning unit -- mirrors
+    :func:`_analyze_attention_head_pruning`'s own GQA family reporting), not
+    raw channel counts. `family` is always ``"matmul_nbits_qkv"``.
+    """
+    layers: List[PruningLayerSensitivity] = []
+    for chain in chains:
+        p, c = chain.producer, chain.consumer
+        p_keys = {p.q_b.name, p.k_b.name, p.v_b.name}
+        c_key = _matmul_nbits_chain_side_key(c)
+        if c_key in p_keys:
+            continue  # degenerate -- no report row
+
+        label = _node_label(p.node)
+        family = "matmul_nbits_qkv"
+        h = chain.kv_num_heads
+
+        if p_keys & producer_touched or c_key in consumer_touched:
+            layers.append(
+                PruningLayerSensitivity(
+                    label=label,
+                    family=family,
+                    total=h,
+                    would_drop=0,
+                    margin=None,
+                    importance_min=0.0,
+                    importance_max=0.0,
+                )
+            )
+            continue
+
+        keep_count = max(1, h - round(h * sparsity))
+        if keep_count >= h:
+            layers.append(
+                PruningLayerSensitivity(
+                    label=label,
+                    family=family,
+                    total=h,
+                    would_drop=0,
+                    margin=None,
+                    importance_min=0.0,
+                    importance_max=0.0,
+                )
+            )
+            continue
+
+        d = chain.head_size
+        group_size = chain.num_heads // chain.kv_num_heads
+        q_nk = _matmul_nbits_dequantized(_matmul_nbits_qkv_branch_weight(p, "q"))
+        k_nk = _matmul_nbits_dequantized(_matmul_nbits_qkv_branch_weight(p, "k"))
+        v_nk = _matmul_nbits_dequantized(_matmul_nbits_qkv_branch_weight(p, "v"))
+        importance = _matmul_nbits_qkv_group_importance(
+            q_nk, k_nk, v_nk, group_size, h, d, importance_norm
+        )
+        keep_groups = np.sort(np.argsort(-importance, kind="stable")[:keep_count])
+        keep_q_heads = np.concatenate(
+            [np.arange(g * group_size, (g + 1) * group_size) for g in keep_groups]
+        )
+        q_idx = _head_column_indices(keep_q_heads, d)
+
+        if isinstance(c, _MatMulNBitsWeight):
+            keep_blocks = _matmul_nbits_block_aligned_keep_blocks(
+                q_idx, c.k_blocks, c.block_size
+            )
+            if keep_blocks is None:
+                layers.append(
+                    PruningLayerSensitivity(
+                        label=label,
+                        family=family,
+                        total=h,
+                        would_drop=0,
+                        margin=None,
+                        importance_min=0.0,
+                        importance_max=0.0,
+                    )
+                )
+                continue
+
+        keep_mask = np.zeros(h, dtype=bool)
+        keep_mask[keep_groups] = True
+
+        layers.append(
+            PruningLayerSensitivity(
+                label=label,
+                family=family,
+                total=h,
+                would_drop=int(h - keep_count),
+                margin=_normalized_margin(importance, keep_mask),
+                importance_min=float(importance.min()),
+                importance_max=float(importance.max()),
+            )
+        )
+
+        producer_touched.update(p_keys)
+        consumer_touched.add(c_key)
+
+    return layers
 
 
 # --- MoE expert-intermediate-channel family --------------------------------
