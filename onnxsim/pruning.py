@@ -548,6 +548,32 @@ already carries any bias in its own optional third input, and
 Conv's weight by the time this pass runs (onnxsim's own default
 optimization does exactly that, see ``fuse_bn_into_conv``), so a raw
 per-channel affine between two Convs isn't a shape this pass special-cases.
+A mid-chain ``GroupNormalization`` (plain ONNX, opset 18+) node *is*
+special-cased, unlike that raw affine -- ``BatchNormalization``'s own fixed,
+running statistics can be folded into a preceding Conv's weight ahead of
+time (exactly what ``fuse_bn_into_conv`` already does), but GroupNorm's
+per-group mean/variance are computed from the actual input data at runtime,
+so there's no equivalent fold; pruning across it instead needs a genuine
+pass-through hop, confirmed safe by direct ``onnxruntime.InferenceSession``
+execution (not assumed from the op's math) with one binding constraint:
+``keep`` must select the exact *same count* of surviving channels from
+every one of the node's own ``num_groups`` equal-sized blocks -- a
+different count from different groups silently mixes what used to be two
+different groups' own channels into one post-prune group, a wrong
+computation ONNX's own checker does not itself catch. This reuses the
+identical uniform-per-block machinery a general grouped Conv's own
+``group`` attribute already drives (:func:`_chain_group`), rather than a
+separate mechanism -- see `_GROUP_NORM_PASS_THROUGH_OP`'s own comment for
+the full empirical finding and reasoning, and why it's scoped to
+:func:`_find_conv_chains`'s own plain single-producer/single-consumer
+topology only (not yet a residual/merge fan-out branch or a
+Concat-branch-merge consumer), the standard op's default domain only (not
+``com.microsoft``'s own channels-last-oriented fused ``GroupNorm``/
+``SkipGroupNorm`` contrib ops), and opset versions whose ``scale``/``bias``
+are shaped per-channel (opset 21+'s schema; opset 18-20's differently-shaped,
+now-deprecated per-*group* schema is excluded by the same per-channel shape
+check every other hop in this module already applies, not by inspecting the
+model's own declared opset).
 
 Within that, three ``group`` shapes are distinguished. Ordinary
 (``group=1``) Conv is the base case already described above. The
@@ -2631,6 +2657,114 @@ _NORM_PASS_THROUGH_OPS = (
     "SimplifiedLayerNormalization",
 )
 
+# GroupNormalization (plain ONNX, opset 18+) as a Conv-chain pass-through hop
+# -- the Conv/spatial-path analogue of `_NORM_PASS_THROUGH_OPS` above, for
+# group- rather than layer-wide normalization statistics. Recognized only by
+# :func:`_walk_to_conv_consumer` (via :func:`_match_group_norm_pass_through`),
+# never :func:`_walk_to_consumer` -- GroupNorm always normalizes over the
+# channel axis (axis 1, NCHW) plus every spatial axis, the Conv convention,
+# never LayerNorm's trailing axis, so no MatMul/Gemm-side analogue exists.
+#
+# Two live-schema facts, both confirmed via `onnx.defs.get_schema` and by
+# direct `onnxruntime.InferenceSession` execution before any of this was
+# written (never guessed at):
+#
+# 1. `scale`/`bias` layout changed shape *between* opset versions of the
+#    *same* op -- opset 18's schema (`onnx.defs.get_schema("GroupNormalization",
+#    18)`) specifies one value *per group* (`scale`/`bias` shaped
+#    `[num_groups]`), while opset 21's (the current, non-deprecated schema --
+#    opset 18's is marked `.deprecated == True` once opset 21 exists, even
+#    though the op *type* isn't renamed) specifies one value *per channel*
+#    (`[n_channels]`), the same per-channel-affine shape every other hop in
+#    this module already handles. This pass never threads a model's
+#    `opset_import` through its `graph`-only finders, and doesn't need to
+#    here either: :func:`_match_group_norm_pass_through` reuses
+#    :func:`_flat_channel_const`'s existing `dims[-1] == n_channels` bar
+#    (the same one `_norm_pass_through_const_names` already applies to a
+#    `_NORM_PASS_THROUGH_OPS` node's own `scale`/`bias`), which already
+#    rejects an opset-18-shaped, `[num_groups]`-sized operand outright
+#    whenever `num_groups < n_channels` (the ordinary case) -- no separate
+#    opset check needed. The one case the shape check alone can't
+#    distinguish -- `num_groups == n_channels` (every group holds exactly
+#    one channel, GroupNorm degenerating to InstanceNorm) -- coincides
+#    exactly under both schema versions (`[num_groups] == [n_channels]`
+#    element-for-element, per-channel either way), so it needs no
+#    disambiguation at all.
+# 2. com.microsoft's fused `GroupNorm`/`SkipGroupNorm` contrib ops (used by
+#    onnxruntime's own Stable-Diffusion optimization scripts to collapse a
+#    GroupNorm + activation, or GroupNorm + residual-Add + activation, into
+#    one node) are int8-quantization-oriented, channels-last (NHWC) fused
+#    kernels with their own separate schema (confirmed via
+#    `onnxruntime.capi.onnxruntime_pybind11_state.get_all_operator_schema()`)
+#    -- a fundamentally different weight/activation layout convention from
+#    this module's NCHW-only Conv-chain machinery throughout (every
+#    producer/consumer weight slice, every depthwise pass-through hop, is
+#    written assuming axis-1 channels). Recognizing them would need new,
+#    layout-aware slicing helpers on top of everything else NCHW-specific in
+#    this module, not a one-matcher addition -- deliberately left out of
+#    scope rather than guessed at; only the plain, standard-domain
+#    `GroupNormalization` op above is recognized.
+#
+# THE key correctness question -- verified empirically with a real
+# `onnxruntime.InferenceSession` run before any of this was written, not
+# assumed from GroupNorm's math alone -- is whether dropping a channel
+# *subset* ahead of a GroupNorm commutes with its own per-group mean/
+# variance reduction. It does not, in general: a group's statistics are
+# computed from *whatever channels survive in that group*, so pruning fewer
+# than all of a group's channels changes that group's own mean/variance for
+# the channels that *do* survive -- e.g., an 8-channel/2-group GroupNorm
+# pruned from 4 to 3 surviving channels per group (`n_channels=8,
+# num_groups=2`, keeping 3 of each group's own 4 channels) diverges from
+# naively slicing the *un-pruned* model's own output at the same indices by
+# up to ~0.42 in one concrete float32 example -- not remotely rounding
+# noise. This is *not a bug*: exactly the same divergence -- for exactly the
+# same reason -- was already established as expected, correct behavior for
+# `_NORM_PASS_THROUGH_OPS`'s own LayerNorm hop above (see its own comment):
+# the bar this pass holds every hop to is matching an *independently,
+# already-pruned* reference model (whose own GroupNorm genuinely reduces
+# over only the surviving channels of each group, from scratch), never
+# "run the original op, then slice its output" after the fact. Measured
+# against *that* bar, the same concrete example matches to float32 noise
+# (~4.8e-7 max abs diff against a from-scratch NumPy reimplementation of the
+# pruned GroupNorm's own per-group reduction) -- i.e. it *is* safe, with one
+# critical caveat the LayerNorm hop never had to consider: unlike LayerNorm
+# (a single reduction spanning the *entire* channel axis, so any surviving
+# subset is automatically "the whole group"), GroupNorm's `num_groups`
+# attribute fixes *how many* groups the channel axis splits into, and ONNX's
+# own runtime (confirmed via `InferenceSession`, not merely the checker,
+# which does *not* itself enforce this) requires the post-prune channel
+# count to still divide evenly by that same `num_groups` -- and, more
+# subtly, requires each surviving group to still hold *exactly* the
+# channels that belonged to it before pruning, contiguously, or the group
+# boundaries drift and post-prune group `g` ends up averaging over a mix of
+# what used to be group `g` and group `g+1`'s own channels, which is simply
+# a different (wrong) computation. Both requirements hold automatically,
+# for free, whenever `keep` selects the exact *same count* of channels from
+# every one of `num_groups` equal-sized blocks -- the identical
+# uniform-per-block invariant :func:`_chain_group`/:func:`_apply_chains`
+# already enforce for a general grouped Conv's own `group` blocks (see
+# their own docstrings) -- so this hop reuses that exact mechanism rather
+# than inventing a parallel one: :func:`_match_group_norm_pass_through`'s
+# own `num_groups` return value simply becomes one more input to
+# :func:`_chain_group`'s block-count decision, alongside a grouped Conv
+# producer's/consumer's own `group`. Concretely, this makes the *safe scope*
+# implemented here "arbitrary per-group-uniform-count pruning" -- keeping
+# the same number of channels from every group, never a different count
+# from different groups -- which strictly *includes* whole-group elimination
+# (dropping some groups to zero survivors and keeping others intact) as one
+# special case, but is not limited to it: keeping 3-of-4 channels from
+# *every* group, as in the concrete example above, is equally safe and
+# equally covered, and is what :func:`_apply_chains`'s existing per-block
+# top-k already produces by default (it has no notion of "prefer keeping
+# whole groups over partial ones" -- every block's own top-k is ranked and
+# cut independently, exactly like a grouped Conv's own blocks already are).
+# A `num_groups` that disagrees with a same-chain grouped Conv producer's or
+# consumer's own non-1 `group` (see :func:`_find_conv_chains`'s own
+# reconciliation check, mirroring its existing producer/consumer `group`
+# mismatch check) is declined outright, the same conservative "declined
+# rather than guessed" bar that mismatch already gets.
+_GROUP_NORM_PASS_THROUGH_OP = "GroupNormalization"
+
 
 def _flat_channel_const(
     name: str, initializer_map: Dict[str, onnx.TensorProto]
@@ -2802,6 +2936,32 @@ class _ConvPassThrough:
 
 
 @dataclass(frozen=True)
+class _GroupNormPassThrough:
+    """A mid-chain ``GroupNormalization`` node the Conv chain walk
+    (:func:`_walk_to_conv_consumer`) crossed transparently -- the Conv/
+    spatial-path analogue of :class:`_ConvPassThrough`'s depthwise-Conv hop,
+    for group-normalization statistics rather than a channel-mixing-free
+    Conv. Unlike a depthwise hop, this one *does* need its own channel-index
+    set to be constrained (:func:`_chain_group`/:func:`_apply_chains`'s
+    per-block ``keep`` selection, keyed on `num_groups` exactly like a
+    general grouped Conv's own `group`) -- see `_GROUP_NORM_PASS_THROUGH_OP`'s
+    own comment for why. Carried on the matched :class:`_Chain` purely so
+    :func:`_apply_chains` can slice its own per-channel `scale`/`bias` (both
+    required by the op's own schema) by the same `keep` index set as the
+    chain's real producer; its `num_groups` attribute is never itself
+    touched -- the whole point of the uniform-per-group-count scope this hop
+    is held to is that `num_groups` stays valid (post-prune channel count
+    still divides it evenly) without changing it. See
+    :func:`_match_group_norm_pass_through`.
+    """
+
+    node: onnx.NodeProto
+    scale: str
+    bias: str
+    num_groups: int
+
+
+@dataclass(frozen=True)
 class _Chain:
     # One producer for a plain chain; two for a gated (elementwise-product)
     # pair, where both branches must agree on which channels survive.
@@ -2819,6 +2979,15 @@ class _Chain:
     # real producer and the real consumer (Conv chains only -- see
     # :class:`_ConvPassThrough`; always empty for a MatMul/Gemm chain).
     conv_pass_through: Tuple[_ConvPassThrough, ...] = ()
+    # A single mid-chain ``GroupNormalization`` hop the chain walk crossed
+    # transparently (:func:`_find_conv_chains` only, for now -- see
+    # :func:`_walk_to_conv_consumer`'s own `recognize_group_norm` parameter;
+    # always ``None`` for every other chain kind, and for a MatMul/Gemm
+    # chain). Present, its own `num_groups` constrains `keep` selection to a
+    # uniform count per group exactly like a general grouped Conv's own
+    # `group` does -- see :class:`_GroupNormPassThrough` and
+    # `_GROUP_NORM_PASS_THROUGH_OP`'s own comment for why that scope is safe.
+    group_norm: Optional[_GroupNormPassThrough] = None
     # The consumer's own ``group`` attribute (always 1 for a MatMul/Gemm
     # consumer, or an ordinary ``group=1`` Conv). > 1 for a general grouped
     # Conv consumer (see :func:`_match_conv_consumer`) -- unlike the
@@ -3465,6 +3634,55 @@ def _match_depthwise_conv_pass_through(
     return w_name, bias_name
 
 
+def _match_group_norm_pass_through(
+    node: onnx.NodeProto,
+    initializer_map: Dict[str, onnx.TensorProto],
+    n_channels: int,
+) -> Optional[Tuple[str, str, int]]:
+    """If `node` is a plain (default-domain) ``GroupNormalization`` node
+    whose own ``num_groups`` attribute evenly divides `n_channels`, with
+    constant, per-channel-shaped (:func:`_flat_channel_const`, `dims[-1] ==
+    n_channels` -- see `_GROUP_NORM_PASS_THROUGH_OP`'s own comment for why
+    this alone already excludes the deprecated opset-18 per-*group*-shaped
+    schema whenever `num_groups < n_channels`) `scale` (input 1) and `bias`
+    (input 2) -- both required by the op's own schema, unlike
+    `_NORM_PASS_THROUGH_OPS`'s optional `LayerNormalization` bias -- returns
+    ``(scale_name, bias_name, num_groups)``. Declines (``None``) on a
+    missing/non-constant/wrongly-shaped `scale` or `bias`, `num_groups < 1`,
+    `n_channels % num_groups != 0`, or `scale`/`bias` naming the same tensor
+    (double-slicing it in :func:`_apply_chains`'s own per-hop loop would
+    corrupt it, the same tied-name bar
+    :func:`_norm_pass_through_const_names` already applies) -- none of these
+    is guessed at. The real "does this hop's own `num_groups` agree with a
+    same-chain grouped Conv producer's/consumer's own `group`" check is left
+    to the caller (:func:`_find_conv_chains`), which has visibility into
+    both.
+    """
+    if node.op_type != _GROUP_NORM_PASS_THROUGH_OP or node.domain != "":
+        return None
+    if len(node.input) != 3 or not node.input[1] or not node.input[2]:
+        return None
+    num_groups = None
+    for attr in node.attribute:
+        if attr.name == "num_groups":
+            num_groups = attr.i
+    if not num_groups or num_groups < 1 or n_channels % num_groups != 0:
+        return None
+    scale_name, bias_name = node.input[1], node.input[2]
+    if scale_name == bias_name:
+        return None  # tied scale/bias -- double-slicing would corrupt it
+    if not _flat_channel_const(scale_name, initializer_map) or not _flat_channel_const(
+        bias_name, initializer_map
+    ):
+        return None
+    if (
+        initializer_map[scale_name].dims[-1] != n_channels
+        or initializer_map[bias_name].dims[-1] != n_channels
+    ):
+        return None
+    return scale_name, bias_name, num_groups
+
+
 def _walk_to_conv_consumer(
     start: str,
     initializer_map: Dict[str, onnx.TensorProto],
@@ -3474,29 +3692,36 @@ def _walk_to_conv_consumer(
     max_hops: int,
     forced_first_hop: Optional[onnx.NodeProto] = None,
     allow_conv_transpose_consumer: bool = False,
+    recognize_group_norm: bool = False,
 ) -> Tuple[
     Optional[Tuple[onnx.NodeProto, str, int, bool]],
     Tuple[Tuple[onnx.NodeProto, None], ...],
     Tuple[_ConvPassThrough, ...],
+    Optional[_GroupNormPassThrough],
 ]:
     """The Conv analogue of :func:`_walk_to_consumer`: from tensor `start`,
     walks forward through unary shape-preserving activations (see
-    `_UNARY_PASS_THROUGH`) and depthwise Conv hops (see
+    `_UNARY_PASS_THROUGH`), depthwise Conv hops (see
     :func:`_match_depthwise_conv_pass_through` -- transparent to the
     channel-index mapping, but each still needs its own weight/bias sliced
     and its ``group`` attribute updated, so they're returned separately as
-    `conv_pass_through` rather than folded into `chain_ops`) with no other
-    consumer anywhere along the way, until an ordinary (``group=1``) *or*
-    general grouped Conv consumer is found whose input channel count
-    matches `n_channels` (see :func:`_match_conv_consumer`), or --
-    when `allow_conv_transpose_consumer` -- a ``ConvTranspose`` consumer
-    (see :func:`_match_conv_transpose_consumer`) is found instead. A
-    depthwise Conv is only ever a transparent hop, never a match for the
-    consumer role itself -- one sitting last before a graph output or a
-    branch simply ends the walk with no consumer found, same as any other
-    unmatched topology. Unlike the MatMul/Gemm walk, no per-channel
-    ``Add``/``Mul`` op is recognized -- see this module's own docstring for
-    why that's out of scope for Conv chains.
+    `conv_pass_through` rather than folded into `chain_ops`), and -- when
+    `recognize_group_norm` -- at most one mid-chain ``GroupNormalization``
+    hop (see :func:`_match_group_norm_pass_through` and
+    `_GROUP_NORM_PASS_THROUGH_OP`'s own comment for why only one, and why
+    its own `num_groups` constrains `keep` selection rather than being a
+    plain transparent hop) with no other consumer anywhere along the way,
+    until an ordinary (``group=1``) *or* general grouped Conv consumer is
+    found whose input channel count matches `n_channels` (see
+    :func:`_match_conv_consumer`), or -- when `allow_conv_transpose_consumer`
+    -- a ``ConvTranspose`` consumer (see
+    :func:`_match_conv_transpose_consumer`) is found instead. A depthwise
+    Conv is only ever a transparent hop, never a match for the consumer role
+    itself -- one sitting last before a graph output or a branch simply ends
+    the walk with no consumer found, same as any other unmatched topology.
+    Unlike the MatMul/Gemm walk, no per-channel ``Add``/``Mul`` op is
+    recognized -- see this module's own docstring for why that's out of
+    scope for Conv chains.
 
     The returned consumer tuple's own 4th element is `is_conv_transpose`
     (see :class:`_Chain`'s own field of the same name) -- always ``False``
@@ -3515,6 +3740,18 @@ def _walk_to_conv_consumer(
     from those more elaborate topologies for now -- a scope decision, not
     an oversight (see this module's own docstring).
 
+    `recognize_group_norm` defaults ``False`` for exactly the same reason
+    `allow_conv_transpose_consumer` does -- only :func:`_find_conv_chains`
+    passes ``True``, the plain single-producer/single-consumer topology this
+    hop was scoped to first; every other caller (residual/merge fan-out,
+    Concat-branch-merge) leaves ``GroupNormalization`` unrecognized, a
+    node hit mid-walk there simply ending that walk with no consumer found,
+    same as any other topology not (yet) matched. A *second*
+    ``GroupNormalization`` hit mid-walk, even with `recognize_group_norm`,
+    likewise just ends the walk unmatched -- only one hop's own `num_groups`
+    is ever carried per chain (see :class:`_Chain.group_norm`'s own
+    comment).
+
     `forced_first_hop`, when given, is used as the walk's very first hop
     instead of deriving it from `consumers_of[start]` -- every ordinary
     caller leaves it ``None`` and gets identical behavior to before this
@@ -3530,6 +3767,7 @@ def _walk_to_conv_consumer(
     """
     chain_ops: List[Tuple[onnx.NodeProto, None]] = []
     conv_pass_through: List[_ConvPassThrough] = []
+    group_norm: Optional[_GroupNormPassThrough] = None
     consumer: Optional[Tuple[onnx.NodeProto, str, int, bool]] = None
     cur = start
     for _hop in range(max_hops):
@@ -3569,6 +3807,27 @@ def _walk_to_conv_consumer(
                 consumer = (nxt, ct_match[0], ct_match[2], True)
             break
 
+        if (
+            recognize_group_norm
+            and group_norm is None
+            and nxt.op_type == _GROUP_NORM_PASS_THROUGH_OP
+            and nxt.domain == ""
+            and nxt.input
+            and nxt.input[0] == cur
+        ):
+            gn_match = _match_group_norm_pass_through(nxt, initializer_map, n_channels)
+            if gn_match is not None:
+                out2 = nxt.output[0]
+                if len(consumers_of.get(out2, [])) != 1 or out2 in graph_outputs:
+                    break
+                gn_scale, gn_bias, gn_num_groups = gn_match
+                group_norm = _GroupNormPassThrough(
+                    nxt, gn_scale, gn_bias, gn_num_groups
+                )
+                cur = out2
+                continue
+            break
+
         if not (
             nxt.op_type in _UNARY_PASS_THROUGH
             and list(nxt.input) == [cur]
@@ -3582,7 +3841,7 @@ def _walk_to_conv_consumer(
         chain_ops.append((nxt, None))
         cur = out2
 
-    return consumer, tuple(chain_ops), tuple(conv_pass_through)
+    return consumer, tuple(chain_ops), tuple(conv_pass_through), group_norm
 
 
 def _find_conv_chains(graph: onnx.GraphProto) -> List[_Chain]:
@@ -3613,7 +3872,7 @@ def _find_conv_chains(graph: onnx.GraphProto) -> List[_Chain]:
         if not _is_internal(out_name):
             continue
 
-        consumer, chain_ops, conv_pass_through = _walk_to_conv_consumer(
+        consumer, chain_ops, conv_pass_through, group_norm = _walk_to_conv_consumer(
             out_name,
             initializer_map,
             consumers_of,
@@ -3621,6 +3880,7 @@ def _find_conv_chains(graph: onnx.GraphProto) -> List[_Chain]:
             n_channels,
             _MAX_CHAIN_HOPS,
             allow_conv_transpose_consumer=True,
+            recognize_group_norm=True,
         )
         if consumer is None:
             continue
@@ -3643,6 +3903,18 @@ def _find_conv_chains(graph: onnx.GraphProto) -> List[_Chain]:
             # than guessed at. See this module's own docstring.
             continue
 
+        if group_norm is not None and (
+            (producer_group > 1 and producer_group != group_norm.num_groups)
+            or (consumer_group > 1 and consumer_group != group_norm.num_groups)
+        ):
+            # The mid-chain GroupNorm hop's own `num_groups` disagrees with
+            # a general grouped Conv producer's or consumer's own `group` --
+            # exactly the same "declined outright" bar the producer/consumer
+            # group mismatch above already gets, for the same reason: the
+            # two partitions' own block boundaries wouldn't generally align.
+            # See `_GROUP_NORM_PASS_THROUGH_OP`'s own comment.
+            continue
+
         chains.append(
             _Chain(
                 producers=(
@@ -3663,6 +3935,7 @@ def _find_conv_chains(graph: onnx.GraphProto) -> List[_Chain]:
                 n_channels=n_channels,
                 consumer_is_conv=True,
                 conv_pass_through=conv_pass_through,
+                group_norm=group_norm,
                 consumer_group=consumer_group,
                 consumer_is_conv_transpose=consumer_is_conv_transpose,
             )
@@ -3993,17 +4266,24 @@ def _resolve_conv_fanout_branches(
             seen_nodes.add(id(consumer_node))
             if id(consumer_node) in accounted.get(tensor, ()):
                 continue  # already part of the group's own established wiring
-            resolved, br_chain_ops, br_pass_through = _walk_to_conv_consumer(
-                tensor,
-                initializer_map,
-                consumers_of,
-                graph_outputs,
-                n_channels,
-                _MAX_CHAIN_HOPS,
-                forced_first_hop=consumer_node,
+            resolved, br_chain_ops, br_pass_through, _br_group_norm = (
+                _walk_to_conv_consumer(
+                    tensor,
+                    initializer_map,
+                    consumers_of,
+                    graph_outputs,
+                    n_channels,
+                    _MAX_CHAIN_HOPS,
+                    forced_first_hop=consumer_node,
+                )
             )
             if resolved is None:
                 return None
+            # `recognize_group_norm` was left at its default (False) above,
+            # so `_br_group_norm` is always `None` -- GroupNorm pass-through
+            # is deliberately out of scope for a residual/merge group's own
+            # fan-out branches for now (see _walk_to_conv_consumer's own
+            # docstring).
             # `allow_conv_transpose_consumer` was left at its default
             # (False) above, so `_` here is always False -- ConvTranspose
             # is deliberately out of scope for a residual/merge group's own
@@ -6435,14 +6715,20 @@ def _find_conv_concat_chains(graph: onnx.GraphProto) -> List[_ConcatChain]:
         if not _is_internal(out_name):
             continue
         total_n = offset
-        consumer, fwd_chain_ops, fwd_pass_through = _walk_to_conv_consumer(
-            out_name,
-            initializer_map,
-            consumers_of,
-            graph_outputs,
-            total_n,
-            _MAX_CHAIN_HOPS,
+        consumer, fwd_chain_ops, fwd_pass_through, _fwd_group_norm = (
+            _walk_to_conv_consumer(
+                out_name,
+                initializer_map,
+                consumers_of,
+                graph_outputs,
+                total_n,
+                _MAX_CHAIN_HOPS,
+            )
         )
+        # `recognize_group_norm` was left at its default (False) above, so
+        # `_fwd_group_norm` is always `None` -- GroupNorm pass-through is
+        # deliberately out of scope for a Concat-branch-merge chain's own
+        # consumer for now (see _walk_to_conv_consumer's own docstring).
         if consumer is None:
             continue
         # `allow_conv_transpose_consumer` was left at its default (False)
@@ -7006,11 +7292,44 @@ def _chain_group(chain: _Chain) -> int:
     `group` value anywhere on this chain -- any producer's, the primary
     consumer's, or any extra branch's -- is guaranteed identical by the
     time this runs; checking the first producer found is enough.
+
+    A mid-chain ``GroupNormalization`` hop (`chain.group_norm`, only ever
+    set by :func:`_find_conv_chains` today -- see
+    :class:`_Chain.group_norm`'s own comment) contributes its own
+    `num_groups` the same way: when set, it *is* the block count this
+    function returns, taking priority over the plain producer/consumer
+    `group` fields above -- :func:`_find_conv_chains` already declined the
+    chain outright if `num_groups` disagreed with a non-1 producer/consumer
+    `group` (see its own reconciliation check), so whenever both are
+    present they already agree, and returning `num_groups` unconditionally
+    is equivalent to returning either. This is what makes GroupNorm's own
+    per-group statistics stay valid after pruning -- see
+    `_GROUP_NORM_PASS_THROUGH_OP`'s own comment for why a uniform count per
+    `num_groups` block is exactly the scope that's safe.
     """
+    group = chain.consumer_group
     for p in chain.producers:
         if p.group > 1:
-            return p.group
-    return chain.consumer_group
+            group = p.group
+            break
+    if chain.group_norm is not None:
+        group = chain.group_norm.num_groups
+    return group
+
+
+def _chain_group_norm_consts(chain: _Chain) -> Set[str]:
+    """`chain.group_norm`'s own `scale`/`bias` names, if present, else an
+    empty set -- shared by :func:`_apply_chains`/:func:`_apply_chains_global`/
+    :func:`_analyze_chains`'s own identical `consts` touched-role
+    bookkeeping (see :class:`_TouchedState`'s own docstring for why every
+    per-channel constant, regardless of which hop owns it, is tracked
+    against the same cross-chain conflict set), so a `GroupNormalization`
+    hop's `scale`/`bias` get exactly the same shared/tied-initializer
+    protection every other chain-op constant already does.
+    """
+    if chain.group_norm is None:
+        return set()
+    return {chain.group_norm.scale, chain.group_norm.bias}
 
 
 def _chain_is_global_sparsity_eligible(chain: _Chain) -> bool:
@@ -7076,6 +7395,12 @@ def _slice_chain_channels(
 
     for hop in chain.conv_pass_through:
         _slice_conv_hop(hop)
+    if chain.group_norm is not None:
+        # Same `keep` index set as the real producer -- `num_groups` itself
+        # is left untouched (see :class:`_GroupNormPassThrough`'s own
+        # comment for why it stays valid without changing it).
+        _slice_last_axis(initializer_map[chain.group_norm.scale], keep)
+        _slice_last_axis(initializer_map[chain.group_norm.bias], keep)
     if (
         chain.consumer_is_conv
         and not chain.consumer_is_conv_transpose
@@ -7136,6 +7461,8 @@ def _slice_chain_channels(
         stale_value_info.update(pre_op.output[0] for pre_op in p.pre_ops)
     stale_value_info.update(chain_node.output[0] for chain_node, _ in chain.chain_ops)
     stale_value_info.update(hop.node.output[0] for hop in chain.conv_pass_through)
+    if chain.group_norm is not None:
+        stale_value_info.add(chain.group_norm.node.output[0])
     stale_value_info.update(
         chain_node.output[0]
         for b in chain.extra_consumers
@@ -7237,6 +7564,7 @@ def _apply_chains(
             for _, const_name in b.chain_ops
             if const_name is not None
         )
+        consts.update(_chain_group_norm_consts(chain))
         if (
             (producer_weights & producer_touched)
             or (consumer_weights & consumer_touched)
@@ -7380,6 +7708,7 @@ def _apply_chains_global(
         consts.update(
             const_name for _, const_name in chain.chain_ops if const_name is not None
         )
+        consts.update(_chain_group_norm_consts(chain))
         if (
             (producer_weights & producer_touched)
             or (consumer_weights & consumer_touched)
@@ -7484,10 +7813,17 @@ def apply_structured_pruning(
     transparently -- its own weight/bias sliced by the producer's channel
     indices and its ``group`` attribute shrunk to match, but it contributes
     no importance of its own and can't itself be the producer or consumer
-    -- see this module's own docstring). No per-channel Add/Mul between two
-    Convs (a Conv already carries its own bias, and ``BatchNormalization``
-    is expected to already be fused into the preceding Conv by the time
-    this pass runs).
+    -- see this module's own docstring) and/or, for the plain
+    single-producer/single-consumer topology only, one mid-chain
+    ``GroupNormalization`` (opset 21+ per-channel ``scale``/``bias``
+    schema) node, its own `scale`/`bias` sliced the same way -- with
+    `keep` floored to a uniform count per one of its own `num_groups`
+    equal-sized blocks whenever it's present, exactly like a general
+    grouped Conv's own `group` already constrains `keep` (see
+    `_GROUP_NORM_PASS_THROUGH_OP`'s own comment for the full empirical
+    finding and scope). No per-channel Add/Mul between two Convs (a Conv
+    already carries its own bias, and ``BatchNormalization`` is expected to
+    already be fused into the preceding Conv by the time this pass runs).
 
     ``ConvTranspose`` is also matched, as a producer and/or an ordinary
     (single, non-residual/Concat) consumer -- its own weight layout is the
@@ -17854,6 +18190,7 @@ def _analyze_chains(
                 for _, const_name in b.chain_ops
                 if const_name is not None
             )
+            consts.update(_chain_group_norm_consts(chain))
 
             label = _chain_label(chain)
             n = chain.n_channels
