@@ -21038,6 +21038,286 @@ def test_analyze_structured_pruning_qdq_blockwise_matches_real_call():
     assert layer2.margin is None
 
 
+# --- apply_structured_pruning_qdq: gated (SwiGLU/GeGLU) pair -----------------
+#
+# The QDQ analogue of the plain-float gated-FFN tests above
+# (``_swiglu_mlp_model``/``_combined_keep_indices``) -- see
+# ``onnxsim/pruning.py``'s own ``_find_qdq_gated_chains``/
+# ``_qdq_gated_channel_importance`` docstrings. ``_combined_keep_indices`` is
+# reused unchanged for the importance oracle (its own ``w.T`` convention
+# matches a QDQ weight's *dequantized* array exactly, since dequantization
+# doesn't change orientation).
+
+
+def _qdq_gated_mlp_model(K=8, H=16, Out=4, gate_activation="Sigmoid", seed=0):
+    # gate_proj/up_proj: per-channel INT8 QDQ MatMul producers sharing input
+    # X; down_proj: plain float MatMul consumer -- at least one QDQ side, as
+    # apply_structured_pruning_qdq's own docstring requires.
+    rng = np.random.default_rng(seed)
+    Wgq = rng.integers(-100, 100, size=(K, H)).astype(np.int8)
+    Wgscale = np.abs(rng.standard_normal(H)).astype(np.float32) * 0.02 + 0.001
+    Wuq = rng.integers(-100, 100, size=(K, H)).astype(np.int8)
+    Wuscale = np.abs(rng.standard_normal(H)).astype(np.float32) * 0.02 + 0.001
+    Wd = rng.standard_normal((H, Out)).astype(np.float32)
+    initializer = [
+        _i8(Wgq, "Wgq"),
+        _f32(Wgscale, "Wgscale"),
+        _i8(Wuq, "Wuq"),
+        _f32(Wuscale, "Wuscale"),
+        _f32(Wd, "Wd"),
+    ]
+    model = _model(
+        f"""
+        g (float[batch,{K}] X) => (float[batch,{Out}] Y)
+        {{
+          Wgdq = DequantizeLinear<axis=1>(Wgq, Wgscale)
+          gate = MatMul(X, Wgdq)
+          gate_act = {gate_activation}(gate)
+          Wudq = DequantizeLinear<axis=1>(Wuq, Wuscale)
+          up = MatMul(X, Wudq)
+          h = Mul(gate_act, up)
+          Y = MatMul(h, Wd)
+        }}
+        """,
+        initializer=initializer,
+    )
+    return model, Wgq, Wgscale, Wuq, Wuscale, Wd
+
+
+def test_qdq_structured_pruning_gated_ffn_matches_oracle():
+    K, H, Out = 8, 16, 4
+    model, Wgq, Wgscale, Wuq, Wuscale, Wd = _qdq_gated_mlp_model(K, H, Out, seed=21)
+    onnx.checker.check_model(model)
+
+    pruned = onnxsim.apply_structured_pruning_qdq(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    inits = {t.name: t for t in pruned.graph.initializer}
+    assert list(inits["Wgq"].dims) == [K, H // 2]
+    assert list(inits["Wgscale"].dims) == [H // 2]
+    assert list(inits["Wuq"].dims) == [K, H // 2]
+    assert list(inits["Wuscale"].dims) == [H // 2]
+    assert list(inits["Wd"].dims) == [H // 2, Out]
+
+    wg_dequant = _qdq_dequant(Wgq, Wgscale, None, axis=1)
+    wu_dequant = _qdq_dequant(Wuq, Wuscale, None, axis=1)
+    keep = _combined_keep_indices(wg_dequant, wu_dequant, H // 2)
+
+    # Exact co-slice: both producers' own int8 codes AND scales sliced by
+    # the identical `keep` set, never independently re-derived.
+    np.testing.assert_array_equal(
+        onnx.numpy_helper.to_array(inits["Wgq"]), Wgq[:, keep]
+    )
+    np.testing.assert_allclose(
+        onnx.numpy_helper.to_array(inits["Wgscale"]), Wgscale[keep]
+    )
+    np.testing.assert_array_equal(
+        onnx.numpy_helper.to_array(inits["Wuq"]), Wuq[:, keep]
+    )
+    np.testing.assert_allclose(
+        onnx.numpy_helper.to_array(inits["Wuscale"]), Wuscale[keep]
+    )
+
+    rng = np.random.default_rng(22)
+    x = rng.standard_normal((5, K)).astype(np.float32)
+    (y,) = _run_unfused(pruned, {"X": x})
+
+    gate = 1.0 / (1.0 + np.exp(-(x @ wg_dequant[:, keep])))
+    up = x @ wu_dequant[:, keep]
+    y_oracle = (gate * up) @ Wd[keep, :]
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-4, atol=1e-4)
+
+
+def test_qdq_structured_pruning_gated_ffn_prunes_both_branches_to_same_channels():
+    # Mirrors test_structured_pruning_gated_ffn_prunes_both_branches_to_same_channels
+    # for the QDQ case -- the real risk is gate/up disagreeing on which
+    # channels survive, silently breaking the elementwise product's
+    # alignment.
+    K, H, Out = 8, 20, 4
+    model, Wgq, Wgscale, Wuq, Wuscale, _Wd = _qdq_gated_mlp_model(K, H, Out, seed=23)
+    pruned = onnxsim.apply_structured_pruning_qdq(model, sparsity=0.3)
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+
+    wg_dequant = _qdq_dequant(Wgq, Wgscale, None, axis=1)
+    wu_dequant = _qdq_dequant(Wuq, Wuscale, None, axis=1)
+    keep = _combined_keep_indices(wg_dequant, wu_dequant, H - round(H * 0.3))
+
+    np.testing.assert_array_equal(inits["Wgq"], Wgq[:, keep])
+    np.testing.assert_array_equal(inits["Wuq"], Wuq[:, keep])
+
+
+def test_qdq_structured_pruning_gelu_gated_ffn_matches_oracle():
+    # GeGLU: the gate activation is Gelu (tanh approximation) rather than
+    # Sigmoid -- exercises _find_qdq_gated_chains's own reuse of the plain-
+    # float gated matcher's unary-activation set (_UNARY_PASS_THROUGH),
+    # mirroring test_structured_pruning_gelu_gated_ffn_matches_oracle.
+    K, H, Out = 8, 16, 4
+    rng = np.random.default_rng(24)
+    Wgq = rng.integers(-100, 100, size=(K, H)).astype(np.int8)
+    Wgscale = np.abs(rng.standard_normal(H)).astype(np.float32) * 0.02 + 0.001
+    Wuq = rng.integers(-100, 100, size=(K, H)).astype(np.int8)
+    Wuscale = np.abs(rng.standard_normal(H)).astype(np.float32) * 0.02 + 0.001
+    Wd = rng.standard_normal((H, Out)).astype(np.float32)
+    model = _model(
+        f"""
+        g (float[batch,{K}] X) => (float[batch,{Out}] Y)
+        {{
+          Wgdq = DequantizeLinear<axis=1>(Wgq, Wgscale)
+          gate = MatMul(X, Wgdq)
+          gate_act = Gelu<approximate = "tanh">(gate)
+          Wudq = DequantizeLinear<axis=1>(Wuq, Wuscale)
+          up = MatMul(X, Wudq)
+          h = Mul(gate_act, up)
+          Y = MatMul(h, Wd)
+        }}
+        """,
+        initializer=[
+            _i8(Wgq, "Wgq"),
+            _f32(Wgscale, "Wgscale"),
+            _i8(Wuq, "Wuq"),
+            _f32(Wuscale, "Wuscale"),
+            _f32(Wd, "Wd"),
+        ],
+    )
+    onnx.checker.check_model(model)
+
+    pruned = onnxsim.apply_structured_pruning_qdq(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    wg_dequant = _qdq_dequant(Wgq, Wgscale, None, axis=1)
+    wu_dequant = _qdq_dequant(Wuq, Wuscale, None, axis=1)
+    keep = _combined_keep_indices(wg_dequant, wu_dequant, H // 2)
+
+    x = rng.standard_normal((5, K)).astype(np.float32)
+    (y,) = _run_unfused(pruned, {"X": x})
+
+    g = x @ wg_dequant[:, keep]
+    gate = 0.5 * g * (1.0 + np.tanh(np.sqrt(2.0 / np.pi) * (g + 0.044715 * g**3)))
+    up = x @ wu_dequant[:, keep]
+    y_oracle = (gate * up) @ Wd[keep, :]
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-4, atol=1e-4)
+
+
+def _qdq_gated_blockwise_down_model(K, H, Out, block_size, wg, wu, seed=0):
+    # gate_proj/up_proj: plain float MatMul producers; down_proj: blockwise
+    # INT4 QDQ MatMul consumer (axis=0 block-quantized on H, down_proj's own
+    # reduction axis) -- exercises this gated path's own block-alignment
+    # check on the CONSUMER side (mirrors
+    # _matmul_qdq_blockwise_consumer_model, extended to a gated pair).
+    rng = np.random.default_rng(seed)
+    h_blocks = H // block_size
+    Wdq = rng.integers(-8, 8, size=(H, Out)).astype(np.int8)
+    Wdscale = (
+        np.abs(rng.standard_normal((h_blocks, Out))).astype(np.float32) * 0.02 + 0.001
+    )
+    initializer = [
+        _f32(wg, "Wg"),
+        _f32(wu, "Wu"),
+        _int4(Wdq, "Wdq"),
+        _f32(Wdscale, "Wdscale"),
+    ]
+    model = _model(
+        f"""
+        g (float[batch,{K}] X) => (float[batch,{Out}] Y)
+        {{
+          gate = MatMul(X, Wg)
+          gate_act = Sigmoid(gate)
+          up = MatMul(X, Wu)
+          h = Mul(gate_act, up)
+          Wddq = DequantizeLinear<axis=0, block_size={block_size}>(Wdq, Wdscale)
+          Y = MatMul(h, Wddq)
+        }}
+        """,
+        initializer=initializer,
+    )
+    return model, Wdq, Wdscale
+
+
+def test_qdq_structured_pruning_gated_ffn_blockwise_consumer_block_aligned_matches_oracle():
+    K, H, Out, block_size = 4, 16, 4, 4
+    n_blocks = H // block_size
+    rng = np.random.default_rng(107)
+    # Both gate and up engineered so blocks 0/2 are large-magnitude (kept)
+    # and blocks 1/3 are small (dropped) -- a deterministic, block-aligned
+    # 50% combined keep set.
+    wg = _block_grouped_column_weight(
+        rng, K, n_blocks, block_size, high_block_idx={0, 2}
+    )
+    wu = _block_grouped_column_weight(
+        rng, K, n_blocks, block_size, high_block_idx={0, 2}
+    )
+    model, Wdq, Wdscale = _qdq_gated_blockwise_down_model(
+        K, H, Out, block_size, wg, wu, seed=108
+    )
+    onnx.checker.check_model(model)
+
+    keep = _combined_keep_indices(wg, wu, H // 2)
+    keep_blocks = sorted({int(k) // block_size for k in keep})
+    assert keep_blocks == [0, 2]  # confirms the engineered data is genuinely
+    # block-aligned, not merely lucky
+
+    pruned = onnxsim.apply_structured_pruning_qdq(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    inits = {t.name: t for t in pruned.graph.initializer}
+    assert list(inits["Wg"].dims) == [K, H // 2]
+    assert list(inits["Wu"].dims) == [K, H // 2]
+    assert list(inits["Wdq"].dims) == [H // 2, Out]
+    assert list(inits["Wdscale"].dims) == [n_blocks // 2, Out]
+
+    wd_dequant = _qdq_block_dequant(Wdq, Wdscale, None, axis=0, block_size=block_size)
+    x = rng.standard_normal((5, K)).astype(np.float32)
+    (y,) = _run_unfused(pruned, {"X": x})
+
+    gate = 1.0 / (1.0 + np.exp(-(x @ wg[:, keep])))
+    up = x @ wu[:, keep]
+    y_oracle = (gate * up) @ wd_dequant[keep, :]
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-4, atol=1e-4)
+
+
+def test_qdq_structured_pruning_gated_ffn_blockwise_consumer_non_block_aligned_declines():
+    # `keep_count` for a 0.625 sparsity on H=16 is 6, not a multiple of
+    # block_size=4 -- the whole gated group (both producers AND the
+    # consumer) must be left completely untouched, mirroring
+    # test_qdq_blockwise_consumer_non_block_aligned_declines's own
+    # single-producer precedent.
+    K, H, Out, block_size = 4, 16, 4, 4
+    rng = np.random.default_rng(109)
+    wg = rng.standard_normal((K, H)).astype(np.float32)
+    wu = rng.standard_normal((K, H)).astype(np.float32)
+    model, Wdq, Wdscale = _qdq_gated_blockwise_down_model(
+        K, H, Out, block_size, wg, wu, seed=110
+    )
+    onnx.checker.check_model(model)
+
+    pruned = onnxsim.apply_structured_pruning_qdq(model, sparsity=0.625)
+    onnx.checker.check_model(pruned)
+    inits = {t.name: t for t in pruned.graph.initializer}
+    assert list(inits["Wg"].dims) == [K, H]  # untouched
+    assert list(inits["Wu"].dims) == [K, H]  # untouched
+    assert list(inits["Wdq"].dims) == [H, Out]  # untouched
+
+
+def test_analyze_structured_pruning_qdq_gated_matches_real_call():
+    K, H, Out = 8, 16, 4
+    model, *_ = _qdq_gated_mlp_model(K, H, Out, seed=25)
+
+    report = onnxsim.analyze_pruning_sensitivity(
+        model, onnxsim.apply_structured_pruning_qdq, sparsity=0.5
+    )
+    assert len(report.layers) == 1
+    layer = report.layers[0]
+    assert layer.family == "qdq_matmul_gated"
+    assert layer.total == H
+    assert report.not_eligible == []
+
+    pruned = onnxsim.apply_structured_pruning_qdq(model, sparsity=0.5)
+    inits = {t.name: t for t in pruned.graph.initializer}
+    kept = H - layer.would_drop
+    assert inits["Wgq"].dims[1] == kept
+    assert inits["Wuq"].dims[1] == kept
+    assert inits["Wd"].dims[0] == kept
+
+
 # --- apply_structured_pruning_matmul_nbits -----------------------------------
 #
 # See ``onnxsim/pruning.py``'s own "MatMulNBits (block-quantized weight)
@@ -22520,6 +22800,252 @@ def test_matmul_nbits_pruning_invalid_sparsity_raises():
         onnxsim.apply_structured_pruning_matmul_nbits(model, sparsity=1.0)
     with pytest.raises(ValueError):
         onnxsim.apply_structured_pruning_matmul_nbits(model, sparsity=-0.1)
+
+
+# --- apply_structured_pruning_matmul_nbits: gated (SwiGLU/GeGLU) pair -------
+#
+# The MatMulNBits analogue of the plain-float gated-FFN tests
+# (``_swiglu_mlp_model``/``_combined_keep_indices``) and the QDQ gated tests
+# above -- see ``onnxsim/pruning.py``'s own ``_find_matmul_nbits_gated_chains``/
+# ``_matmul_nbits_gated_channel_importance`` docstrings. Every quantization
+# artifact is built via this file's own independent reference implementation
+# (``_nbits_quantize_block``/``_nbits_pack_B``/``_nbits_dequant``), never a
+# call into ``onnxsim.pruning``'s own private packing helpers.
+
+
+def _nbits_gated_model(K, H, Out, block_size, W_gate, W_up, W_down, bits=4):
+    # X -> gate=MatMulNBits(Bg) -[Sigmoid]-> gate_act, up=MatMulNBits(Bu) ->
+    # Mul(gate_act, up) -> down=MatMulNBits(Bd) -> Y. All three block-
+    # quantized: gate_proj/up_proj along their own K=`K` axis (unrelated to
+    # the shared gated channel count H), down_proj along its own K=`H` axis
+    # -- the axis this section's own block-alignment check cares about.
+    assert K % block_size == 0
+    assert H % block_size == 0
+    qcodes_g, scales_g, zp_g, kbg = _nbits_quantize_block(W_gate, block_size, bits)
+    qcodes_u, scales_u, zp_u, kbu = _nbits_quantize_block(W_up, block_size, bits)
+    qcodes_d, scales_d, zp_d, kbd = _nbits_quantize_block(W_down, block_size, bits)
+    Bg = _nbits_pack_B(qcodes_g, H, kbg, block_size, bits)
+    Bu = _nbits_pack_B(qcodes_u, H, kbu, block_size, bits)
+    Bd = _nbits_pack_B(qcodes_d, Out, kbd, block_size, bits)
+
+    initializer = [
+        onnx.numpy_helper.from_array(Bg, name="Bg"),
+        onnx.numpy_helper.from_array(scales_g, name="scales_g"),
+        onnx.numpy_helper.from_array(_nbits_pack_codes(zp_g, bits), name="zp_g"),
+        onnx.numpy_helper.from_array(Bu, name="Bu"),
+        onnx.numpy_helper.from_array(scales_u, name="scales_u"),
+        onnx.numpy_helper.from_array(_nbits_pack_codes(zp_u, bits), name="zp_u"),
+        onnx.numpy_helper.from_array(Bd, name="Bd"),
+        onnx.numpy_helper.from_array(scales_d, name="scales_d"),
+        onnx.numpy_helper.from_array(_nbits_pack_codes(zp_d, bits), name="zp_d"),
+    ]
+
+    node_g = _nbits_node(
+        "mm_g", "X", "gate", "Bg", "scales_g", "zp_g", None, H, K, block_size, bits
+    )
+    act = onnx.helper.make_node("Sigmoid", ["gate"], ["gate_act"])
+    node_u = _nbits_node(
+        "mm_u", "X", "up", "Bu", "scales_u", "zp_u", None, H, K, block_size, bits
+    )
+    mul = onnx.helper.make_node("Mul", ["gate_act", "up"], ["h"])
+    node_d = _nbits_node(
+        "mm_d", "h", "Y", "Bd", "scales_d", "zp_d", None, Out, H, block_size, bits
+    )
+
+    M = 3
+    graph = onnx.helper.make_graph(
+        [node_g, act, node_u, mul, node_d],
+        "g",
+        inputs=[
+            onnx.helper.make_tensor_value_info("X", onnx.TensorProto.FLOAT, [M, K])
+        ],
+        outputs=[
+            onnx.helper.make_tensor_value_info("Y", onnx.TensorProto.FLOAT, [M, Out])
+        ],
+        initializer=initializer,
+    )
+    model = onnx.helper.make_model(
+        graph,
+        opset_imports=[
+            onnx.helper.make_opsetid("", 21),
+            onnx.helper.make_opsetid("com.microsoft", 1),
+        ],
+    )
+    model.ir_version = 10
+    return model, dict(
+        qcodes_g=qcodes_g,
+        scales_g=scales_g,
+        zp_g=zp_g,
+        kbg=kbg,
+        qcodes_u=qcodes_u,
+        scales_u=scales_u,
+        zp_u=zp_u,
+        kbu=kbu,
+        qcodes_d=qcodes_d,
+        scales_d=scales_d,
+        zp_d=zp_d,
+        kbd=kbd,
+    )
+
+
+def test_matmul_nbits_pruning_gated_ffn_matches_oracle():
+    # H=32 output channels (gate/up), block_size=16 -> down_proj's own
+    # K2=H=32 axis is exactly 2 blocks. Both W_gate/W_up engineered so the
+    # combined L2-norm importance keeps EXACTLY rows 0-15 (block 0) and
+    # drops 16-31 (block 1) -- a real keep-set the pass has to derive on its
+    # own, that also happens to land on a whole-block boundary.
+    K, H, Out, block_size, bits = 16, 32, 4, 16, 4
+    rng = np.random.default_rng(200)
+    W_gate = (rng.standard_normal((H, K)) * 0.2).astype(np.float32)
+    W_gate[:16] *= 6.0
+    W_up = (rng.standard_normal((H, K)) * 0.2).astype(np.float32)
+    W_up[:16] *= 6.0
+    W_down = (rng.standard_normal((Out, H)) * 0.2).astype(np.float32)
+
+    model, info = _nbits_gated_model(K, H, Out, block_size, W_gate, W_up, W_down, bits)
+    onnx.checker.check_model(model)
+
+    pruned = onnxsim.apply_structured_pruning_matmul_nbits(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    keep = np.arange(16)  # expected keep-set: rows 0-15 (block 0)
+    keep_blocks = np.array([0])
+
+    inits = {t.name: t for t in pruned.graph.initializer}
+    assert list(inits["Bg"].dims) == [16, info["kbg"], block_size * bits // 8]
+    assert list(inits["scales_g"].dims) == [16, info["kbg"]]
+    assert list(inits["Bu"].dims) == [16, info["kbu"], block_size * bits // 8]
+    assert list(inits["Bd"].dims) == [Out, 1, block_size * bits // 8]
+    assert list(inits["scales_d"].dims) == [Out, 1]
+    mm_g = next(n for n in pruned.graph.node if n.name == "mm_g")
+    mm_u = next(n for n in pruned.graph.node if n.name == "mm_u")
+    mm_d = next(n for n in pruned.graph.node if n.name == "mm_d")
+    assert next(a.i for a in mm_g.attribute if a.name == "N") == 16
+    assert next(a.i for a in mm_u.attribute if a.name == "N") == 16
+    assert next(a.i for a in mm_d.attribute if a.name == "K") == 16
+
+    # Exact (byte-level) "slice, don't recompute" checks -- the pruned
+    # graph's own tensors must equal a HAND-SLICE of the ORIGINAL quantized
+    # codes, never a re-quantization of the sliced float weight.
+    np.testing.assert_array_equal(
+        onnx.numpy_helper.to_array(inits["Bg"]),
+        _nbits_pack_B(info["qcodes_g"][keep], 16, info["kbg"], block_size, bits),
+    )
+    np.testing.assert_array_equal(
+        onnx.numpy_helper.to_array(inits["Bu"]),
+        _nbits_pack_B(info["qcodes_u"][keep], 16, info["kbu"], block_size, bits),
+    )
+    np.testing.assert_array_equal(
+        onnx.numpy_helper.to_array(inits["Bd"]),
+        _nbits_pack_B(info["qcodes_d"][:, keep], Out, 1, block_size, bits),
+    )
+    np.testing.assert_array_equal(
+        onnx.numpy_helper.to_array(inits["zp_d"]),
+        _nbits_pack_codes(info["zp_d"][:, keep_blocks], bits),
+    )
+
+    # A pure-float64 dequantize-then-matmul oracle built directly from the
+    # pass's own (unmodified) quantized codes, sliced by hand -- the
+    # tightest oracle, at float rounding error only.
+    wg_dequant = _nbits_dequant(
+        info["qcodes_g"], info["scales_g"], info["zp_g"], block_size, bits
+    )
+    wu_dequant = _nbits_dequant(
+        info["qcodes_u"], info["scales_u"], info["zp_u"], block_size, bits
+    )
+    wd_dequant = _nbits_dequant(
+        info["qcodes_d"], info["scales_d"], info["zp_d"], block_size, bits
+    )
+
+    x = rng.standard_normal((3, K)).astype(np.float32)
+    (y,) = _run(pruned, {"X": x})
+
+    gate_lin = x.astype(np.float64) @ wg_dequant[keep].T
+    gate = 1.0 / (1.0 + np.exp(-gate_lin))
+    up_lin = x.astype(np.float64) @ wu_dequant[keep].T
+    h = gate * up_lin
+    y_oracle = h @ wd_dequant[:, keep].T
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-3, atol=1e-3)
+
+
+def test_matmul_nbits_pruning_gated_ffn_non_block_aligned_declines():
+    # keep_count for a 0.4 sparsity on H=32 is 20 (round(32*0.6)), not a
+    # multiple of block_size=16 -- the whole gated group (both producers
+    # AND the consumer) must be left completely untouched, mirroring
+    # test_matmul_nbits_pruning_consumer_declines_non_block_aligned's own
+    # single-producer precedent.
+    K, H, Out, block_size, bits = 16, 32, 4, 16, 4
+    rng = np.random.default_rng(201)
+    W_gate = (rng.standard_normal((H, K)) * 0.2).astype(np.float32)
+    W_up = (rng.standard_normal((H, K)) * 0.2).astype(np.float32)
+    W_down = (rng.standard_normal((Out, H)) * 0.2).astype(np.float32)
+
+    model, info = _nbits_gated_model(K, H, Out, block_size, W_gate, W_up, W_down, bits)
+    onnx.checker.check_model(model)
+
+    pruned = onnxsim.apply_structured_pruning_matmul_nbits(model, sparsity=0.4)
+    onnx.checker.check_model(pruned)
+
+    inits = {t.name: t for t in pruned.graph.initializer}
+    # Untouched: N/K unchanged on every one of the three nodes.
+    assert list(inits["Bg"].dims) == [H, info["kbg"], block_size * bits // 8]
+    assert list(inits["Bu"].dims) == [H, info["kbu"], block_size * bits // 8]
+    assert list(inits["Bd"].dims) == [Out, info["kbd"], block_size * bits // 8]
+    mm_g = next(n for n in pruned.graph.node if n.name == "mm_g")
+    mm_d = next(n for n in pruned.graph.node if n.name == "mm_d")
+    assert next(a.i for a in mm_g.attribute if a.name == "N") == H
+    assert next(a.i for a in mm_d.attribute if a.name == "K") == H
+
+
+def test_analyze_structured_pruning_matmul_nbits_gated_matches_real_call():
+    K, H, Out, block_size, bits = 16, 32, 4, 16, 4
+    rng = np.random.default_rng(202)
+    W_gate = (rng.standard_normal((H, K)) * 0.2).astype(np.float32)
+    W_gate[:16] *= 6.0
+    W_up = (rng.standard_normal((H, K)) * 0.2).astype(np.float32)
+    W_up[:16] *= 6.0
+    W_down = (rng.standard_normal((Out, H)) * 0.2).astype(np.float32)
+    model, _info = _nbits_gated_model(K, H, Out, block_size, W_gate, W_up, W_down, bits)
+
+    report = onnxsim.analyze_pruning_sensitivity(
+        model, onnxsim.apply_structured_pruning_matmul_nbits, sparsity=0.5
+    )
+    assert len(report.layers) == 1
+    layer = report.layers[0]
+    assert layer.family == "matmul_nbits_gated"
+    assert layer.total == H
+    assert report.not_eligible == []
+
+    pruned = onnxsim.apply_structured_pruning_matmul_nbits(model, sparsity=0.5)
+    inits = {t.name: t for t in pruned.graph.initializer}
+    kept = H - layer.would_drop
+    mm_g = next(n for n in pruned.graph.node if n.name == "mm_g")
+    assert next(a.i for a in mm_g.attribute if a.name == "N") == kept
+    assert inits["Bd"].dims[1] == kept // block_size
+
+
+def test_analyze_structured_pruning_matmul_nbits_gated_non_block_aligned_matches_real_decline():
+    # Dry-run/real-call cross-check for the non-block-aligned decline case
+    # -- mirrors test_analyze_structured_pruning_qdq_blockwise_matches_real_call's
+    # own aligned/non-aligned pairing, for the gated MatMulNBits family.
+    K, H, Out, block_size, bits = 16, 32, 4, 16, 4
+    rng = np.random.default_rng(203)
+    W_gate = (rng.standard_normal((H, K)) * 0.2).astype(np.float32)
+    W_up = (rng.standard_normal((H, K)) * 0.2).astype(np.float32)
+    W_down = (rng.standard_normal((Out, H)) * 0.2).astype(np.float32)
+    model, _info = _nbits_gated_model(K, H, Out, block_size, W_gate, W_up, W_down, bits)
+
+    report = onnxsim.analyze_pruning_sensitivity(
+        model, onnxsim.apply_structured_pruning_matmul_nbits, sparsity=0.4
+    )
+    pruned = onnxsim.apply_structured_pruning_matmul_nbits(model, sparsity=0.4)
+    inits = {t.name: t for t in pruned.graph.initializer}
+    assert len(report.layers) == 1
+    layer = report.layers[0]
+    assert layer.family == "matmul_nbits_gated"
+    real_would_drop = H - onnx.numpy_helper.to_array(inits["Bg"]).shape[0]
+    assert layer.would_drop == real_would_drop == 0
+    assert layer.margin is None
 
 
 # --- apply_structured_pruning_matmul_nbits: fused MatMulNBitsMlp/MatMulNBitsQkv ---
