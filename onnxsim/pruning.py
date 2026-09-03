@@ -11328,10 +11328,18 @@ def apply_structured_pruning_matmul_nbits(
 
 # --- Attention-head pruning -----------------------------------------------
 
-# Three fused self-attention ops are matched here -- two from the
-# ``com.microsoft`` domain, produced by onnxsim's own fusion passes from a
-# decomposed self-attention block, plus the standard ``ai.onnx`` op -- each
-# pruned at the granularity its own kernel contract allows:
+# Four fused self-/cross-attention ops are matched here -- three from the
+# ``com.microsoft`` domain (two produced by onnxsim's own fusion passes from a
+# decomposed self-attention block, plus `MultiHeadAttention`, which onnxsim's
+# own fusion passes deliberately never emit -- see `fuse_gqa.h`'s own comment
+# on why -- but which ONNX Runtime's *own* transformer graph optimizer
+# (`onnxruntime.transformers.fusion_attention.AttentionFusion
+# .create_multihead_attention_node`/`.create_attention_node`, installed in
+# this environment at `onnxruntime/transformers/fusion_attention.py`) emits
+# routinely for BERT/ViT/CLIP/T5/Whisper-style encoder and cross-attention
+# exports -- a real, common op this module was previously unable to prune at
+# all), plus the standard ``ai.onnx`` op -- each pruned at the granularity
+# its own kernel contract allows:
 #
 # - `Attention` (onnxsim/passes/fuse_attention.h): a single merged QKV
 #   weight/bias ([hidden_size, Nq+Nk+Nv] / [Nq+Nk+Nv]) plus
@@ -11483,10 +11491,87 @@ def apply_structured_pruning_matmul_nbits(
 #   ai.onnx Attention" section), the same oracle-vs-onnxruntime bar every
 #   other function in this module is held to; no structural-only fallback
 #   was needed.
+# - `com.microsoft::MultiHeadAttention` (schema confirmed live via
+#   ``onnxruntime.capi.onnxruntime_pybind11_state.get_all_operator_schema()``
+#   against this environment's installed onnxruntime 1.29.0): unlike
+#   `com.microsoft::Attention` above, this op does **not** own any
+#   projection weight at all -- its `query`/`key`/`value` inputs (indices
+#   0/1/2) are already-projected, rank-3 ``[batch, seq, hidden]`` activation
+#   tensors, exactly `GroupQueryAttention`'s own calling convention (the
+#   schema's alternate "packed QKV" input shape for `query` alone, rank 5,
+#   is excluded the same way `_match_gqa_producer` excludes
+#   `GroupQueryAttention`'s own packed convention -- by requiring `key`/
+#   `value` both non-empty). So this op reuses
+#   :func:`_find_separate_qkv_chains` outright, via a fourth matcher,
+#   :func:`_match_multi_head_attention_producer` -- Q's/K's/V's own MatMul/
+#   vanilla-Gemm producer weights (matched by the same
+#   :func:`_match_producer` every other separate-Q/K/V op here uses) are
+#   what gets pruned, never a weight owned by the `MultiHeadAttention` node
+#   itself. Confirmed against ONNX Runtime's *own* transformer fusion code
+#   (`onnxruntime.transformers.fusion_attention.AttentionFusion
+#   .create_multihead_attention_node`, the real code path Hugging Face
+#   Optimum's ORT model optimizer runs for BERT/ViT/CLIP/T5/Whisper-style
+#   models), the realistic export shape feeds Q/K/V into this op straight
+#   from their own MatMul's raw output -- **no** `Add` bias hop in between
+#   (unlike every other op matched in this section) -- and instead folds
+#   Q's/K's/V's three separate biases into *one* combined tensor
+#   (``concatenate([q_bias, k_bias, v_bias])``, exactly
+#   `create_combined_qkv_bias`'s own construction) passed as this op's own
+#   `bias` input (index 3); a model built by hand with per-producer
+#   `Gemm`-with-bias projections feeding this op directly instead is *also*
+#   matched (`_match_producer` already handles a Gemm's own bias
+#   independently of this combined one) -- the two are not mutually
+#   exclusive and both are sliced when both are present. This combined bias
+#   is genuinely new shape this module had no infrastructure for -- neither
+#   one merged *weight+bias* (`_AttentionChain`'s own shape) nor three
+#   independent per-producer biases (every other `_GQAChain`-shaped op's own
+#   shape) -- so :class:`_GQAChain` gained one new field, `mha_bias`, and
+#   :func:`_find_separate_qkv_chains` gained a `combined_bias_input_index`
+#   parameter: when the node input at that index is a non-empty constant, it
+#   is validated to be exactly `[nq + nk + nv]`-shaped (declined, the whole
+#   chain, otherwise -- a non-constant or wrong-shaped combined bias can't be
+#   safely left half-updated) and recorded; :func:`_apply_one_gqa_chain`
+#   slices it in three head-aligned ranges (Q's own kept-head columns, then
+#   K's shifted by the pre-pruning `nq`, then V's shifted by the pre-pruning
+#   `nq + nk`) in the same single combined-index-set style
+#   `chain.packed_split_sizes`'s own packed-bias branch already uses for a
+#   different (packed-*weight*) shape. This op's own `num_heads` attribute
+#   (no separate `kv_num_heads` -- confirmed by the schema dump above having
+#   only one head-count attribute at all, and independently by
+#   `fuse_gqa.h`'s own comment that `MultiHeadAttention` "rejects mismatched
+#   hidden sizes" -- i.e. no GQA/MQA support) means every "KV group" this
+#   pass's shared `_GQAChain`/:func:`_apply_one_gqa_chain` machinery forms is
+#   exactly one query head wide (`group_size == num_heads // kv_num_heads ==
+#   1` always) -- individual per-head pruning, the same granularity plain
+#   `com.microsoft::Attention` gets, arrived at for free by feeding
+#   `num_heads` as both `num_heads` and `kv_num_heads` to the shared
+#   machinery, with no group-vs-head distinction to add. This op's own
+#   `attention_bias` (index 5, same broadcastable-or-per-head shape/
+#   treatment as `GroupQueryAttention`'s own, via the same
+#   :func:`_head_bias_axis`) and `past_key`/`past_value` (indices 6/7, the
+#   same BNSH float layout as every other op here, via the same
+#   :func:`_past_kv_constants_are_sliceable`, called with no `scale_indices`
+#   since this op's own schema has no `k_scale`/`v_scale` inputs at all) get
+#   the identical treatment as `GroupQueryAttention`'s own analogous inputs.
+#   `key_padding_mask` (index 4) is, per its own schema doc, one of five
+#   shapes -- none with a `num_heads`-sized axis -- so it is always left
+#   alone, the same reasoning `com.microsoft::Attention`'s own `mask_index`
+#   already gets. All of this was verified empirically, not assumed from the
+#   schema doc alone: a minimal `MultiHeadAttention` graph (separate Q/K/V
+#   `MatMul` producers, a combined bias, an output-projection `MatMul`) run
+#   through a real `onnxruntime.InferenceSession` matched a numpy reference
+#   oracle to ~1.3e-8 max-abs-diff (float32 noise) both before and after a
+#   manually-pre-reduced 4-head-to-3-head slice built exactly the way
+#   described above; perturbing one head's own slice of a constant
+#   `attention_bias` changed only that head's own output slice (~4e-7,
+#   zero everywhere else); a `past_key`/`past_value`-bearing node ran
+#   successfully with the documented BNSH shape -- see
+#   ``tests/test_pruning.py``'s own "MultiHeadAttention" section for the
+#   in-repo version of these checks.
 #
 # Cross-attention (Q projected from one source tensor, K/V from a genuinely
 # *different* one -- the encoder-decoder shape) was investigated explicitly
-# for all three matched op types, not left an untested assumption:
+# for all four matched op types, not left an untested assumption:
 #
 # - `com.microsoft::Attention`'s own contrib-op schema (`bert_defs.cc`, the
 #   same source consulted elsewhere in this module for `SkipLayerNormalization`)
@@ -11495,9 +11580,11 @@ def apply_structured_pruning_matmul_nbits(
 #   to come from at all. Cross-attention isn't a shape this op's schema can
 #   express, so it's simply not applicable here -- not a gap in
 #   :func:`_match_attention_producer` to close.
-# - `GroupQueryAttention` and the plain ``ai.onnx`` `Attention` op both
-#   already support it, confirmed by construction and by execution: neither
-#   :func:`_match_gqa_producer`/:func:`_match_onnx_attention_producer` nor
+# - `GroupQueryAttention`, the plain ``ai.onnx`` `Attention` op, and
+#   `MultiHeadAttention` all already support it, confirmed by construction
+#   and by execution: none of :func:`_match_gqa_producer`/
+#   :func:`_match_onnx_attention_producer`/
+#   :func:`_match_multi_head_attention_producer` nor
 #   :func:`_find_separate_qkv_chains` (their shared caller) ever compares
 #   Q's own producer against K's or V's own -- each of the three is matched,
 #   via :func:`_match_producer`, purely from its own MatMul/vanilla-Gemm
@@ -11505,17 +11592,25 @@ def apply_structured_pruning_matmul_nbits(
 #   ultimately trace back to. A model where Q's producer reads from one
 #   graph input and K/V's producers read from an entirely different one (a
 #   real decoder/encoder pair, potentially different feature dimensions
-#   too) matches exactly the same way a self-attention model does. Both
-#   ops' own schema docs name this explicitly -- `GroupQueryAttention`'s
-#   own doc string opens with "Group Query **Self/Cross** Attention", and
-#   the plain op's doc (`onnx.defs.get_schema("Attention", domain="")` on
+#   too) matches exactly the same way a self-attention model does. All
+#   three ops' own schema docs name this explicitly -- `GroupQueryAttention`'s
+#   own doc string opens with "Group Query **Self/Cross** Attention", the
+#   plain op's doc (`onnx.defs.get_schema("Attention", domain="")` on
 #   this environment's installed ``onnx==1.22.0``) states outright "this
 #   operator covers self and cross variants ... For cross attention, query
-#   and key might have different lengths" -- and this is verified here the
-#   same oracle-vs-onnxruntime way as everything else (see
+#   and key might have different lengths", and `MultiHeadAttention`'s own
+#   doc opens with "Multi-Head **Self/Cross** Attention" -- and this is
+#   verified here the same oracle-vs-onnxruntime way as everything else (see
 #   ``tests/test_pruning.py``'s own "cross-attention" subsections under the
-#   GroupQueryAttention/plain-Attention sections), with distinct source
-#   tensors of distinct feature dimensions feeding Q vs K/V.
+#   GroupQueryAttention/plain-Attention/MultiHeadAttention sections), with
+#   distinct source tensors, and (for `MultiHeadAttention` and the plain
+#   ``ai.onnx`` op) distinct sequence lengths too, feeding Q vs K/V --
+#   `MultiHeadAttention`'s own cross-attention run matched a numpy oracle to
+#   ~1.3e-8 max-abs-diff both before and after the same 4-head-to-3-head
+#   pruning slice described above, with no restriction of this pass's own
+#   and, unlike `GroupQueryAttention` below, no onnxruntime-kernel-level
+#   same-sequence-length restriction found either (verified directly, not
+#   merely assumed from the absence of a doc-string caveat).
 # - One real bug turned up along the way and is fixed here:
 #   :func:`_gqa_group_importance`'s combined-importance score used to
 #   ``np.concatenate`` each group's Q, K, and V weight *blocks* into one
@@ -11667,6 +11762,20 @@ class _GQAChain:
     # pass-through existed, gets ``None`` on both exactly as before.
     q_norm_rope: Optional["_QKNormRopePassThrough"] = None
     k_norm_rope: Optional["_QKNormRopePassThrough"] = None
+    # Set only for a matched ``com.microsoft::MultiHeadAttention`` node whose
+    # own `bias` input (index 3) is a non-empty constant: the name of that
+    # tensor, which -- unlike `.q_bias`/`.k_bias`/`.v_bias` above (each an
+    # independent per-*producer* bias, from that producer's own Gemm) -- is
+    # one single ``[nq + nk + nv]``-shaped tensor holding Q's, K's, and V's
+    # three biases concatenated end to end (`.q_weight`'s producer bias, if
+    # matched via `_match_producer`, is a distinct, independent tensor from
+    # this one; both are sliced when both are present -- see this module's
+    # own "Attention-head pruning" section comment for how this shape was
+    # confirmed against ONNX Runtime's own transformer fusion code).
+    # ``None`` (the default) for every other matched op, and for a matched
+    # `MultiHeadAttention` node whose own `bias` input is absent/empty --
+    # both exactly as before this field existed.
+    mha_bias: Optional[str] = None
 
 
 # Either kind of matched attention block, sharing enough of a common shape
@@ -12196,6 +12305,96 @@ def _match_onnx_attention_producer(
     return q_num_heads, kv_num_heads
 
 
+def _match_multi_head_attention_producer(
+    node: onnx.NodeProto, initializer_map: Dict[str, onnx.TensorProto]
+) -> Optional[Tuple[int, int]]:
+    """If `node` is a ``com.microsoft::MultiHeadAttention`` node this module
+    can safely act on, returns ``(num_heads, num_heads)`` -- the same
+    ``(num_heads, kv_num_heads)`` shape :func:`_match_gqa_producer`/
+    :func:`_match_onnx_attention_producer` return, but with `kv_num_heads`
+    always equal to `num_heads`: this op's own schema (confirmed live via
+    ``onnxruntime.capi.onnxruntime_pybind11_state.get_all_operator_schema()``
+    against this environment's installed onnxruntime 1.29.0) has exactly one
+    head-count attribute, `num_heads` -- no GQA/MQA support at all (also
+    confirmed independently by `fuse_gqa.h`'s own comment: "verified
+    `MultiHeadAttention` rejects mismatched hidden sizes at runtime"), so
+    every "KV group" the shared :class:`_GQAChain`/:func:`_apply_one_gqa_chain`
+    machinery this function feeds into forms is exactly one query head wide
+    -- ordinary per-head pruning, arrived at for free by feeding this same
+    `num_heads` value as both fields with no separate GQA-vs-MHA branch
+    needed anywhere downstream.
+
+    Unlike `com.microsoft::Attention`, this op owns no projection weight at
+    all: its `query`/`key`/`value` inputs (indices 0/1/2) are
+    already-projected, rank-3 ``[batch, seq, hidden]`` activation tensors --
+    the same calling convention `GroupQueryAttention` uses -- so Q's/K's/V's
+    own separate MatMul/vanilla-Gemm producers (not a weight owned by this
+    node) are what :func:`_find_separate_qkv_chains` matches and
+    :func:`_apply_one_gqa_chain` prunes, exactly as for `GroupQueryAttention`.
+    Requiring `key`/`value` both non-empty (same as
+    :func:`_match_gqa_producer`'s own check) excludes this op's alternate
+    "packed QKV" calling convention, where `query` alone carries a packed,
+    rank-5 ``(batch, kv_sequence_length, num_heads, 3, head_size)`` tensor
+    and `key`/`value` are left empty -- a different tensor layout this
+    function doesn't attempt to slice, the same reasoning
+    :func:`_match_gqa_producer`'s own docstring gives for its own analogous
+    exclusion.
+
+    The optional `attention_bias` input (index 5), documented shape
+    ``(batch_size or 1, num_heads or 1, sequence_length,
+    total_sequence_length)`` -- confirmed, via actual onnxruntime execution,
+    to have a real per-head effect (perturbing one head's own slice changes
+    only that head's own output slice and no other) -- gets the identical
+    constant-resolves-cleanly-or-is-declined treatment via
+    :func:`_head_bias_axis` that `GroupQueryAttention`'s own `attention_bias`
+    and the plain ai.onnx op's own `attn_mask` already get.
+    `key_padding_mask` (index 4) is, per its own schema doc, one of five
+    shapes -- none with a `num_heads`-sized axis -- so it is unconditionally
+    head-count-independent and never inspected here, the same reasoning
+    plain `com.microsoft::Attention`'s own `mask_index` already gets. The
+    optional `past_key`/`past_value` inputs (indices 6/7 -- a different pair
+    of indices from `GroupQueryAttention`'s own 3/4 and the plain ai.onnx
+    op's own 4/5) get the same safety gate via the same shared
+    :func:`_past_kv_constants_are_sliceable`, called with no `scale_indices`:
+    this op's own schema has no `k_scale`/`v_scale` inputs at all (confirmed
+    off the same live schema dump), so a quantized cache here is declined
+    outright exactly as it is for the plain ai.onnx op.
+    :func:`_apply_one_gqa_chain` performs the actual slice(s) of both once a
+    match succeeds. This op's own `bias` input (index 3 -- a combined,
+    ``[nq + nk + nv]``-shaped concatenation of Q's/K's/V's three biases, the
+    shape ONNX Runtime's own transformer fusion code
+    (`fusion_attention.py`'s own `create_combined_qkv_bias`) actually
+    produces for the realistic BERT/ViT/CLIP/T5/Whisper export pattern) is
+    *not* validated here -- `nq`/`nk`/`nv` aren't known until
+    :func:`_find_separate_qkv_chains` has resolved all three producers, so
+    that validation (and recording the bias's own name onto
+    :class:`_GQAChain`'s `mha_bias` field) happens there instead, via its own
+    `combined_bias_input_index` parameter.
+    """
+    if node.domain != _ATTENTION_DOMAIN or node.op_type != "MultiHeadAttention":
+        return None
+    if len(node.input) < 3 or not (node.input[0] and node.input[1] and node.input[2]):
+        return None
+
+    num_heads = None
+    for attr in node.attribute:
+        if attr.name == "num_heads":
+            num_heads = attr.i
+    if not num_heads or num_heads <= 0:
+        return None
+
+    if len(node.input) > 5 and node.input[5]:  # attention_bias
+        bias_init = initializer_map.get(node.input[5])
+        if bias_init is not None and int(np.prod(bias_init.dims)) > 0:
+            if _head_bias_axis(list(bias_init.dims), num_heads) is None:
+                return None  # doesn't statically resolve -- decline rather than guess
+
+    if not _past_kv_constants_are_sliceable(node, initializer_map, (6, 7), num_heads):
+        return None
+
+    return num_heads, num_heads
+
+
 def _match_packed_qkv_split(
     split_node: onnx.NodeProto,
     initializer_map: Dict[str, onnx.TensorProto],
@@ -12633,22 +12832,33 @@ def _find_separate_qkv_chains(
     match_producer,
     num_heads_attr: str,
     allow_differing_v_head_size: bool = False,
+    combined_bias_input_index: Optional[int] = None,
 ) -> List[_GQAChain]:
-    """Shared body for :func:`_find_gqa_chains` and
-    :func:`_find_onnx_attention_chains`: both match a fused attention node
-    fed by three separate, un-merged Q/K/V MatMul/vanilla-Gemm projections
-    (as opposed to :func:`_find_attention_chains`'s single merged-QKV-weight
+    """Shared body for :func:`_find_gqa_chains`,
+    :func:`_find_onnx_attention_chains`, and :func:`_find_mha_chains`: all
+    three match a fused attention node fed by three separate, un-merged
+    Q/K/V MatMul/vanilla-Gemm projections (as opposed to
+    :func:`_find_attention_chains`'s single merged-QKV-weight
     ``com.microsoft::Attention``) and prune it at whole-KV-group granularity
     (see :func:`_apply_one_gqa_chain`/:func:`_gqa_group_importance`),
     differing only in which node/attributes `match_producer` recognizes
-    (:func:`_match_gqa_producer` or :func:`_match_onnx_attention_producer`),
-    which attribute on the matched node holds the query head count
-    (`num_heads_attr` -- see :class:`_GQAChain`'s own field of that name),
-    and whether V's own head_size is allowed to differ from Q/K's shared one
-    (`allow_differing_v_head_size` -- ``False`` for `GroupQueryAttention`,
-    which `fuse_gqa.h` never emits with anything but equal Q/K/V head_size,
-    ``True`` for the plain ai.onnx op, whose schema genuinely allows it; see
-    :class:`_GQAChain`'s own `v_head_size` field).
+    (:func:`_match_gqa_producer`, :func:`_match_onnx_attention_producer`, or
+    :func:`_match_multi_head_attention_producer`), which attribute on the
+    matched node holds the query head count (`num_heads_attr` -- see
+    :class:`_GQAChain`'s own field of that name), whether V's own head_size
+    is allowed to differ from Q/K's shared one (`allow_differing_v_head_size`
+    -- ``False`` for `GroupQueryAttention`, which `fuse_gqa.h` never emits
+    with anything but equal Q/K/V head_size, ``True`` for the plain ai.onnx
+    op and `MultiHeadAttention`, whose schemas genuinely allow it; see
+    :class:`_GQAChain`'s own `v_head_size` field), and whether the matched
+    node itself owns one combined ``[nq + nk + nv]``-shaped Q+K+V bias on one
+    of its own inputs (`combined_bias_input_index` -- ``None``, the default,
+    for `GroupQueryAttention`/the plain ai.onnx op, neither of which has such
+    an input; the `MultiHeadAttention`-specific `bias` input's own index, 3,
+    for :func:`_find_mha_chains` -- see :class:`_GQAChain`'s own `mha_bias`
+    field and this module's "Attention-head pruning" section comment for why
+    this is a genuinely different shape from every other bias this function
+    already threads through `producer_infos` below).
     """
     initializer_map = {t.name: t for t in graph.initializer}
     consumers_of = _consumers_of(graph)
@@ -12791,6 +13001,31 @@ def _find_separate_qkv_chains(
         ):
             continue
 
+        # `MultiHeadAttention`-only: its own `bias` input (index 3) is a
+        # single combined tensor, not a per-producer one -- validated here
+        # (rather than in :func:`_match_multi_head_attention_producer`,
+        # which runs before `nq`/`nk`/`nv` are known) against the exact
+        # ``[nq + nk + nv]`` shape ONNX Runtime's own transformer fusion
+        # code (`create_combined_qkv_bias`) actually produces. Present but
+        # non-constant or wrong-shaped declines the whole chain outright --
+        # a bias this pass can't prove safe to leave untouched, unlike an
+        # absent one, which needs no touching at all.
+        mha_bias: Optional[str] = None
+        if (
+            combined_bias_input_index is not None
+            and len(node.input) > combined_bias_input_index
+        ):
+            bias_name = node.input[combined_bias_input_index]
+            if bias_name:
+                bias_init = initializer_map.get(bias_name)
+                if (
+                    bias_init is None
+                    or not _is_supported_float_dtype(bias_init.data_type)
+                    or list(bias_init.dims) != [nq + nk + nv]
+                ):
+                    continue
+                mha_bias = bias_name
+
         out_name = node.output[0]
         if not _is_internal(out_name):
             continue
@@ -12837,6 +13072,7 @@ def _find_separate_qkv_chains(
                 packed_split_sizes=packed_split_sizes,
                 q_norm_rope=q_norm_rope,
                 k_norm_rope=k_norm_rope,
+                mha_bias=mha_bias,
             )
         )
     return chains
@@ -12860,6 +13096,30 @@ def _find_onnx_attention_chains(graph: onnx.GraphProto) -> List[_GQAChain]:
         _match_onnx_attention_producer,
         "q_num_heads",
         allow_differing_v_head_size=True,
+    )
+
+
+def _find_mha_chains(graph: onnx.GraphProto) -> List[_GQAChain]:
+    """The ``com.microsoft::MultiHeadAttention`` analogue of
+    :func:`_find_gqa_chains`/:func:`_find_onnx_attention_chains` -- see
+    :func:`_find_separate_qkv_chains` (the shared body) and
+    :func:`_match_multi_head_attention_producer` (what's matched and why
+    it's declined otherwise). Passes ``allow_differing_v_head_size=True``
+    (confirmed empirically: a minimal `MultiHeadAttention` node whose V
+    projection is a genuinely different width than Q's/K's shared one -- 2
+    heads of width 4 for Q/K, width 3 for V -- runs successfully under this
+    environment's onnxruntime, the same real-execution bar every other
+    matcher in this section is held to) and
+    ``combined_bias_input_index=3`` -- this op's own `bias` input, the one
+    combined-Q/K/V-bias shape :class:`_GQAChain`'s own `mha_bias` field (and
+    this module's "Attention-head pruning" section comment) documents.
+    """
+    return _find_separate_qkv_chains(
+        graph,
+        _match_multi_head_attention_producer,
+        "num_heads",
+        allow_differing_v_head_size=True,
+        combined_bias_input_index=3,
     )
 
 
@@ -13081,10 +13341,15 @@ def _apply_one_gqa_chain(
     sparsity: float,
     compute_group_importance,
 ) -> Optional[Tuple[Set[str], str, Set[str]]]:
-    """Applies whole-KV-group pruning to one matched ``GroupQueryAttention``
-    or plain ``ai.onnx::Attention`` block (see :class:`_GQAChain`'s own
-    `num_heads_attr` field for how the two are told apart when writing the
-    new query head count back) in place: every dropped group removes one
+    """Applies whole-KV-group pruning to one matched ``GroupQueryAttention``,
+    plain ``ai.onnx::Attention``, or ``MultiHeadAttention`` block (see
+    :class:`_GQAChain`'s own `num_heads_attr` field for how the three are
+    told apart when writing the new query head count back -- and, since
+    `MultiHeadAttention` has no separate `kv_num_heads` at all,
+    `chain.kv_num_heads == chain.num_heads` always for it, so every "group"
+    this function forms for it is exactly one query head wide, ordinary
+    per-head pruning arrived at with no dedicated branch) in place: every
+    dropped group removes one
     *contiguous* ``head_size``-wide column block from K's own separate
     weight and one *contiguous* ``v_head_size``-wide column block (equal to
     ``head_size`` for `GroupQueryAttention`, not necessarily for the plain
@@ -13140,6 +13405,17 @@ def _apply_one_gqa_chain(
     `sin_cache` ever needs touching (both confirmed head-independent -- see
     this module's own "Attention-head pruning" section comment).
 
+    When `chain.mha_bias` is set (`MultiHeadAttention` only -- see
+    :class:`_GQAChain`'s own field of that name), it names one combined
+    ``[nq + nk + nv]``-shaped tensor holding Q's/K's/V's three biases
+    concatenated end to end on the `MultiHeadAttention` node's own `bias`
+    input, sliced in the identical three head-aligned ranges the packed-QKV
+    branch above uses for a packed *weight* -- an independent, unrelated
+    sharing (this bias can be combined even when Q's/K's/V's own weights
+    are three genuinely separate tensors, the realistic
+    `MultiHeadAttention` export shape) so it is applied regardless of
+    whether `chain.packed_split_sizes` is set.
+
     Returns ``(producer_weight_names, consumer_weight_name,
     stale_output_names)`` on success, or ``None`` if `sparsity` rounds to no
     groups dropped for this block (a no-op, left for the caller to skip).
@@ -13152,6 +13428,14 @@ def _apply_one_gqa_chain(
     d = chain.head_size
     dv = chain.v_head_size
     group_size = chain.num_heads // chain.kv_num_heads
+    # Pre-pruning flat widths of Q's/K's own producer weight -- needed both
+    # by the packed-QKV branch below (a column-range view into one shared
+    # tensor) and, independently, by `chain.mha_bias`'s own combined-bias
+    # slice further down (a `MultiHeadAttention`-only, bias-only sharing
+    # that has nothing to do with whether the *weights* are packed -- see
+    # this module's own "Attention-head pruning" section comment).
+    nq_orig = chain.num_heads * d
+    nk_orig = chain.kv_num_heads * d
 
     # `_gqa_group_importance` (and any caller-supplied Wanda variant of it)
     # indexes columns as the head axis, mirroring
@@ -13174,8 +13458,6 @@ def _apply_one_gqa_chain(
         # ``[K, N]`` array, computed from the chain's own original (before
         # this call's own pruning) head counts, rather than three
         # independently-stored arrays.
-        nq_orig = chain.num_heads * d
-        nk_orig = chain.kv_num_heads * d
         w_kn = _to_f64(wq_init)
         if chain.q_weight_transposed:
             w_kn = w_kn.T  # [K, Nq+Nk+Nv]
@@ -13243,18 +13525,39 @@ def _apply_one_gqa_chain(
         if chain.v_bias is not None:
             _slice_last_axis(initializer_map[chain.v_bias], v_idx)
 
+    # `MultiHeadAttention`-only: its own combined `bias` input (see
+    # :class:`_GQAChain`'s own `mha_bias` field) is one single
+    # ``[nq + nk + nv]``-shaped tensor holding Q's, K's, and V's three
+    # biases concatenated end to end -- sliced in the same three
+    # head-aligned ranges (Q's own kept columns, then K's shifted by the
+    # *original* `nq_orig`, then V's shifted by `nq_orig + nk_orig`) the
+    # packed-QKV branch above already uses for a packed *weight*, but
+    # independent of whether `chain.packed_split_sizes` is set -- this bias
+    # sharing and that weight sharing are two unrelated shapes that happen
+    # to reuse the same column-index-set trick.
+    if chain.mha_bias is not None:
+        full_bias_idx = np.concatenate(
+            [q_idx, k_idx + nq_orig, v_idx + nq_orig + nk_orig]
+        )
+        _slice_last_axis(initializer_map[chain.mha_bias], full_bias_idx)
+
     # `GroupQueryAttention`'s past_key/past_value live at input indices 3/4,
-    # the plain ai.onnx op's own at 4/5 (see `_match_gqa_producer`'s and
-    # `_match_onnx_attention_producer`'s own docstrings) -- both already
-    # confirmed, at match time, to be either absent/dynamic (nothing to do
-    # here) or a BNSH-format constant (plain FLOAT, or quantized with a
-    # schema-conforming scale) safe to slice along axis 1 by `keep_groups`
-    # (see :func:`_past_kv_constants_are_sliceable`).
+    # the plain ai.onnx op's own at 4/5, `MultiHeadAttention`'s own at 6/7
+    # (see `_match_gqa_producer`'s, `_match_onnx_attention_producer`'s, and
+    # `_match_multi_head_attention_producer`'s own docstrings) -- all three
+    # already confirmed, at match time, to be either absent/dynamic (nothing
+    # to do here) or a BNSH-format constant (plain FLOAT, or -- GQA only --
+    # quantized with a schema-conforming scale) safe to slice along axis 1
+    # by `keep_groups` (see :func:`_past_kv_constants_are_sliceable`).
     is_gqa = (
         chain.node.domain == _ATTENTION_DOMAIN
         and chain.node.op_type == "GroupQueryAttention"
     )
-    past_kv_indices = (3, 4) if is_gqa else (4, 5)
+    is_mha = (
+        chain.node.domain == _ATTENTION_DOMAIN
+        and chain.node.op_type == "MultiHeadAttention"
+    )
+    past_kv_indices = (3, 4) if is_gqa else (6, 7) if is_mha else (4, 5)
     for idx in past_kv_indices:
         if len(chain.node.input) <= idx or not chain.node.input[idx]:
             continue
@@ -13283,14 +13586,16 @@ def _apply_one_gqa_chain(
             # else: PER_TENSOR broadcast scalar -- no per-head axis to slice
 
     # `attention_bias`/`attn_mask` (index 10 for `GroupQueryAttention`, 3
-    # for the plain ai.onnx op -- see `_match_gqa_producer`'s and
-    # `_match_onnx_attention_producer`'s own docstrings) is sliced along its
-    # own head axis by `keep_q_heads` -- *query*-head granularity, not
-    # `keep_groups`'s kv-group one -- whenever `_head_bias_axis` resolves it
-    # to a genuine per-head tensor against the pre-pruning `chain.num_heads`;
-    # left untouched when it resolves to a broadcast (or is absent/dynamic,
-    # matched the same "nothing to slice" way here as at match time).
-    mask_idx = 10 if is_gqa else 3
+    # for the plain ai.onnx op, 5 for `MultiHeadAttention` -- see
+    # `_match_gqa_producer`'s, `_match_onnx_attention_producer`'s, and
+    # `_match_multi_head_attention_producer`'s own docstrings) is sliced
+    # along its own head axis by `keep_q_heads` -- *query*-head granularity,
+    # not `keep_groups`'s kv-group one -- whenever `_head_bias_axis` resolves
+    # it to a genuine per-head tensor against the pre-pruning
+    # `chain.num_heads`; left untouched when it resolves to a broadcast (or
+    # is absent/dynamic, matched the same "nothing to slice" way here as at
+    # match time).
+    mask_idx = 10 if is_gqa else 5 if is_mha else 3
     if len(chain.node.input) > mask_idx and chain.node.input[mask_idx]:
         mask_init = initializer_map.get(chain.node.input[mask_idx])
         if mask_init is not None:
@@ -13380,12 +13685,16 @@ def _apply_attention_chains(
     :func:`apply_attention_head_wanda_pruning`, mirroring
     :func:`_apply_chains`'s own shape (cross-chain touched-role
     bookkeeping, stale ``value_info`` cleanup) but dispatching each chain to
-    :func:`_apply_one_plain_attention_chain` (a matched ``Attention``
-    block) or :func:`_apply_one_gqa_chain` (a matched
-    ``GroupQueryAttention`` block) for the actual per-chain slicing, since
-    the two ops' weight layouts (one merged QKV tensor vs. three separate
-    Q/K/V producers) and pruning unit (individual head vs. whole KV group)
-    are different enough that sharing that part wouldn't simplify either.
+    :func:`_apply_one_plain_attention_chain` (a matched merged-QKV
+    ``Attention`` block) or :func:`_apply_one_gqa_chain` (a matched
+    ``GroupQueryAttention``, plain ``ai.onnx::Attention``, or
+    `MultiHeadAttention` block -- all three share the one :class:`_GQAChain`
+    shape, so all three dispatch here identically) for the actual per-chain
+    slicing, since the merged-QKV op's weight layout (one merged QKV tensor)
+    versus the other three's (separate Q/K/V producers) and pruning unit
+    (individual head vs. whole KV group -- one query head wide, for
+    `MultiHeadAttention`) are different enough that sharing that part
+    wouldn't simplify either.
     """
     initializer_map = {t.name: t for t in graph.initializer}
     producer_touched: Set[str] = set()
@@ -13433,16 +13742,19 @@ def apply_attention_head_pruning(
 ) -> onnx.ModelProto:
     """Removes whole attention heads -- or, for grouped-query attention,
     whole KV groups -- from every matched ``com.microsoft::Attention``,
-    ``com.microsoft::GroupQueryAttention``, or plain ``ai.onnx::Attention``
-    node (the fused self-attention blocks onnxsim's own
-    ``fuse_attention``/``fuse_gqa`` optimizer passes produce, plus the
-    standard ONNX op those two contrib ops are converging towards -- see
-    this module's own "Attention-head pruning" section comment for the real
-    schema each was confirmed against and how) whose output feeds,
-    optionally through a single shape-preserving ``Reshape``, exactly one
-    downstream MatMul/vanilla-Gemm's reduction dimension (the output
-    projection) -- the attention analogue of :func:`apply_structured_pruning`,
-    at head (or KV-group) instead of single-channel granularity.
+    ``com.microsoft::GroupQueryAttention``, ``com.microsoft::MultiHeadAttention``,
+    or plain ``ai.onnx::Attention`` node (the fused self-attention blocks
+    onnxsim's own ``fuse_attention``/``fuse_gqa`` optimizer passes produce,
+    `MultiHeadAttention`, which those passes deliberately never emit but ONNX
+    Runtime's own transformer graph optimizer routinely does for BERT/ViT/
+    CLIP/T5/Whisper-style exports, and the standard ONNX op the contrib ops
+    are converging towards -- see this module's own "Attention-head pruning"
+    section comment for the real schema each was confirmed against and how)
+    whose output feeds, optionally through a single shape-preserving
+    ``Reshape``, exactly one downstream MatMul/vanilla-Gemm's reduction
+    dimension (the output projection) -- the attention analogue of
+    :func:`apply_structured_pruning`, at head (or KV-group) instead of
+    single-channel granularity.
 
     For each matched plain ``com.microsoft::Attention`` block: ranks every
     head by the combined Frobenius norm of its own
@@ -13455,29 +13767,37 @@ def apply_attention_head_pruning(
     for every surviving head, the same guarantee
     :func:`apply_structured_pruning` gives per channel.
 
-    For each matched ``GroupQueryAttention`` or plain ``ai.onnx::Attention``
-    block: ranks every *KV group* (a KV head and the
-    ``num_heads / kv_num_heads`` query heads the kernel maps to it) by the
-    combined Frobenius norm of that group's own Q+K+V weight block across
-    Q's, K's, and V's own separate producer weights, drops the
+    For each matched ``GroupQueryAttention``, plain ``ai.onnx::Attention``,
+    or ``MultiHeadAttention`` block: ranks every *KV group* (a KV head and
+    the ``num_heads / kv_num_heads`` query heads the kernel maps to it -- for
+    `MultiHeadAttention`, which has no separate `kv_num_heads` at all, this
+    is always exactly one query head, so this reduces to ordinary per-head
+    pruning) by the combined Frobenius norm of that group's own Q+K+V weight
+    block across Q's, K's, and V's own separate producer weights, drops the
     lowest-``sparsity``-fraction of groups (at least one group is always
     kept), and removes the corresponding column blocks from all three
-    producers (and their biases, if present) together with the matching row
-    block from the output projection's weight, decrementing the query head
-    count (``num_heads`` for `GroupQueryAttention`, ``q_num_heads`` for the
-    plain ``ai.onnx`` op) and ``kv_num_heads`` by the number of groups
-    dropped -- so their ratio (query heads per KV head) is unchanged,
-    keeping every surviving KV head mapped to exactly the same number of
-    query heads the kernel requires. An individual query head is never
-    dropped on its own: only a whole group, since neither kernel has a way
-    to keep a KV head alive for some, but not all, of the query heads that
+    producers (and their biases, if present -- for `MultiHeadAttention`,
+    which typically has no per-producer bias at all, folding Q's/K's/V's
+    three biases instead into one combined tensor on its own `bias` input,
+    that combined tensor's own three head-aligned ranges are sliced the same
+    way -- see :class:`_GQAChain`'s own `mha_bias` field) together with the
+    matching row block from the output projection's weight, decrementing the
+    query head count (``num_heads`` for `GroupQueryAttention`/
+    `MultiHeadAttention`, ``q_num_heads`` for the plain ``ai.onnx`` op) and
+    ``kv_num_heads`` by the number of groups dropped -- so their ratio
+    (query heads per KV head) is unchanged, keeping every surviving KV head
+    mapped to exactly the same number of query heads the kernel requires. An
+    individual query head is never dropped on its own from a genuine
+    GQA/MQA block: only a whole group, since neither kernel has a way to
+    keep a KV head alive for some, but not all, of the query heads that
     shared it. A connected `past_key`/`past_value` that is a constant of the
     expected float BNSH shape is sliced along its own `kv_num_heads` axis by
     the same index set (see :func:`_past_kv_constants_are_sliceable`,
-    :func:`_apply_one_gqa_chain`); a plain ``ai.onnx::Attention`` node's V
-    head size may genuinely differ from Q/K's own (a shape that op's schema
-    allows but `GroupQueryAttention` never produces) and is sliced correctly
-    at its own width -- see :class:`_GQAChain`'s own `v_head_size` field.
+    :func:`_apply_one_gqa_chain`); a plain ``ai.onnx::Attention`` or
+    `MultiHeadAttention` node's V head size may genuinely differ from Q/K's
+    own (a shape both ops' schemas allow but `GroupQueryAttention` never
+    produces) and is sliced correctly at its own width -- see
+    :class:`_GQAChain`'s own `v_head_size` field.
 
     :param model: the original onnx ModelProto or file path
     :param sparsity: target fraction of each matched block's heads (or, for
@@ -13534,6 +13854,7 @@ def apply_attention_head_pruning(
         *_find_attention_chains(graph),
         *_find_gqa_chains(graph),
         *_find_onnx_attention_chains(graph),
+        *_find_mha_chains(graph),
     ]
     if chains:
         _apply_attention_chains(
@@ -13608,22 +13929,23 @@ def apply_attention_head_wanda_pruning(
     """The calibrated upgrade of :func:`apply_attention_head_pruning`,
     exactly as :func:`apply_structured_wanda_pruning` is to
     :func:`apply_structured_pruning`: same real head (or, for
-    GroupQueryAttention/plain ai.onnx Attention, whole-KV-group) removal,
-    same topology matching, including the identical `attention_bias`/
-    `attn_mask`/`head_sink` per-head-axis slicing treatment (see
-    :func:`apply_attention_head_pruning`'s own docstring for the three
-    matched op types and exactly what each does with those inputs), but
-    each unit's importance
+    GroupQueryAttention/plain ai.onnx Attention/MultiHeadAttention,
+    whole-KV-group) removal, same topology matching, including the
+    identical `attention_bias`/`attn_mask`/`head_sink` per-head-axis slicing
+    treatment (see :func:`apply_attention_head_pruning`'s own docstring for
+    the four matched op types and exactly what each does with those
+    inputs), but each unit's importance
     is ``||W||_F * ||X||_2`` -- the plain Frobenius-norm weight score times
     the combined (root-sum-square) activation norm of that unit's own slice
     of the *output projection's* input, captured over calibration data --
     instead of weight magnitude alone. For a plain ``com.microsoft::Attention``
-    block this is per head, exactly as before; for a ``GroupQueryAttention``
-    or plain ``ai.onnx::Attention`` block the activation norm is combined
-    (root-sum-square) over every query head a KV group owns, mirroring how
-    :func:`_gqa_group_importance` combines that same group's weight norm
-    across Q+K+V -- both matched separate-Q/K/V-producer ops share that one
-    importance function (and this one calibrated wrapper around it)
+    block this is per head, exactly as before; for a ``GroupQueryAttention``,
+    plain ``ai.onnx::Attention``, or ``MultiHeadAttention`` block the
+    activation norm is combined (root-sum-square) over every query head a KV
+    group owns (exactly one query head, for `MultiHeadAttention`), mirroring
+    how :func:`_gqa_group_importance` combines that same group's weight norm
+    across Q+K+V -- all three matched separate-Q/K/V-producer ops share that
+    one importance function (and this one calibrated wrapper around it)
     unmodified.
 
     :param model: the original onnx ModelProto or file path
@@ -13682,6 +14004,7 @@ def apply_attention_head_wanda_pruning(
         *_find_attention_chains(graph),
         *_find_gqa_chains(graph),
         *_find_onnx_attention_chains(graph),
+        *_find_mha_chains(graph),
     ]
     if not chains:
         return out
@@ -17694,8 +18017,13 @@ class PruningLayerSensitivity:
             `_find_qdq_chains` matches both through one unified walk,
             unlike the plain float structured family's five separate
             finders, so this is the one family-string split available for
-            it); ``"attention_head"``/
-            ``"attention_gqa_group"`` for attention pruning (shared by
+            it); ``"attention_head"`` (plain merged-QKV
+            ``com.microsoft::Attention``)/``"attention_gqa_group"``
+            (``GroupQueryAttention``/plain ``ai.onnx::Attention``, whole-KV-
+            group granularity)/``"attention_mha_head"``
+            (``MultiHeadAttention``, individual-head granularity -- it has
+            no separate `kv_num_heads` at all, so every "group" is one
+            head) for attention pruning (shared by
             :func:`apply_attention_head_pruning` and its Wanda-calibrated
             counterpart :func:`apply_attention_head_wanda_pruning` alike --
             `family` names the topology a unit was matched by, not the
@@ -18982,7 +19310,8 @@ def _attention_not_eligible(
         is_attn_like = (
             node.op_type == "Attention" and node.domain in (_ATTENTION_DOMAIN, "")
         ) or (
-            node.op_type == "GroupQueryAttention" and node.domain == _ATTENTION_DOMAIN
+            node.op_type in ("GroupQueryAttention", "MultiHeadAttention")
+            and node.domain == _ATTENTION_DOMAIN
         )
         if not is_attn_like or id(node) in matched_ids:
             continue
@@ -19022,7 +19351,18 @@ def _analyze_attention_chains(
         if isinstance(chain, _GQAChain):
             producer_names = {chain.q_weight, chain.k_weight, chain.v_weight}
             h = chain.kv_num_heads
-            family = "attention_gqa_group"
+            # `MultiHeadAttention` has no separate `kv_num_heads` at all
+            # (`chain.kv_num_heads == chain.num_heads` always for it -- see
+            # :func:`_match_multi_head_attention_producer`'s own docstring),
+            # so every "group" this shared `_GQAChain` machinery forms for
+            # it is exactly one query head wide -- a distinct family string
+            # names that, rather than reporting genuine multi-head KV groups
+            # and individual-head MHA pruning identically.
+            family = (
+                "attention_mha_head"
+                if chain.node.op_type == "MultiHeadAttention"
+                else "attention_gqa_group"
+            )
         else:
             producer_names = {chain.weight}
             h = chain.num_heads
@@ -19125,7 +19465,7 @@ def _analyze_attention_head_pruning(
 ) -> PruningSensitivityReport:
     """Dry-run mirror of :func:`apply_attention_head_pruning`: same
     matching (:func:`_find_attention_chains`/:func:`_find_gqa_chains`/
-    :func:`_find_onnx_attention_chains`) and per-chain loop
+    :func:`_find_onnx_attention_chains`/:func:`_find_mha_chains`) and per-chain loop
     (:func:`_analyze_attention_chains`, the same shared body
     :func:`_analyze_attention_head_wanda_pruning` uses), with plain
     (:func:`_plain_attention_head_importance`/:func:`_gqa_group_importance`)
@@ -19142,6 +19482,7 @@ def _analyze_attention_head_pruning(
         *_find_attention_chains(graph),
         *_find_gqa_chains(graph),
         *_find_onnx_attention_chains(graph),
+        *_find_mha_chains(graph),
     ]
     layers = _analyze_attention_chains(
         graph,
@@ -19171,7 +19512,7 @@ def _analyze_attention_head_wanda_pruning(
 ) -> PruningSensitivityReport:
     """Dry-run mirror of :func:`apply_attention_head_wanda_pruning` -- same
     matching (:func:`_find_attention_chains`/:func:`_find_gqa_chains`/
-    :func:`_find_onnx_attention_chains`), calibration
+    :func:`_find_onnx_attention_chains`/:func:`_find_mha_chains`), calibration
     (:func:`_wanda_attention_calibration_stats`, the exact same helper
     :func:`apply_attention_head_wanda_pruning` itself calls), per-chain loop
     (:func:`_analyze_attention_chains`), and importance
@@ -19196,6 +19537,7 @@ def _analyze_attention_head_wanda_pruning(
         *_find_attention_chains(graph),
         *_find_gqa_chains(graph),
         *_find_onnx_attention_chains(graph),
+        *_find_mha_chains(graph),
     ]
     if not chains:
         return PruningSensitivityReport(
