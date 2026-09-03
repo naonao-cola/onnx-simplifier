@@ -8246,19 +8246,25 @@ def apply_structured_wanda_pruning(
 #     and empirically confirmed here, per the module's own convention of
 #     explicitly discussing every topology boundary.
 #   * A *general grouped* or depthwise Conv (``group != 1``) on either side
-#     of a QDQ chain, and a gated (SwiGLU/GeGLU) pair, a residual/skip-
-#     connection merge, or a Concat-merged branch group anywhere in a QDQ
-#     chain. Every one of these is already a materially bigger project for
-#     the *plain float* case above (see this module's own top-of-file
-#     docstring) even before QDQ enters the picture; composing either with a
-#     QDQ weight's extra scale/zero-point bookkeeping is well beyond this
-#     section's scope. Only the plain single producer -> [zero or more
-#     shape-preserving unary activations, see `_UNARY_PASS_THROUGH`] ->
-#     single consumer topology (an ordinary, ``group=1`` Conv or MatMul/
-#     vanilla-Gemm on both ends) is matched -- no per-channel Add/Mul
-#     bias/scale hop either, unlike the plain float MatMul/Gemm chain walk
-#     above (:func:`_walk_to_consumer`), unnecessary complexity for this
-#     section's own deliberately narrow first cut.
+#     of a QDQ chain, a residual/skip-connection merge, or a Concat-merged
+#     branch group anywhere in a QDQ chain. Every one of these is already a
+#     materially bigger project for the *plain float* case above (see this
+#     module's own top-of-file docstring) even before QDQ enters the
+#     picture; composing either with a QDQ weight's extra scale/zero-point
+#     bookkeeping is well beyond this section's scope. Only the plain single
+#     producer -> [zero or more shape-preserving unary activations, see
+#     `_UNARY_PASS_THROUGH`] -> single consumer topology (an ordinary,
+#     ``group=1`` Conv or MatMul/vanilla-Gemm on both ends) is matched -- no
+#     per-channel Add/Mul bias/scale hop either, unlike the plain float
+#     MatMul/Gemm chain walk above (:func:`_walk_to_consumer`), unnecessary
+#     complexity for this section's own deliberately narrow first cut. A
+#     gated (SwiGLU/GeGLU) MatMul/Gemm pair, by contrast, IS matched
+#     (:func:`_find_qdq_gated_chains`) -- see
+#     :func:`apply_structured_pruning_qdq`'s own docstring: the topology
+#     itself needed no new machinery beyond mirroring
+#     :func:`_find_gated_chains`'s own backward walk against QDQ-resolved
+#     producers, so it no longer belonged on this "materially bigger
+#     project" list.
 #   * Blocked quantization (opset 21+'s ``block_size`` attribute) with
 #     INT8/UINT8 codes, or blocking along the output-channel axis rather
 #     than the reduction axis, is declined by
@@ -8946,6 +8952,11 @@ class _QDQProducer:
     bias: Optional[str]
     weight_transposed: bool
     is_conv: bool
+    # Activation nodes between this producer's raw output and the point it
+    # combines with another producer (a gated pair only -- see
+    # :func:`_find_qdq_gated_chains`; empty for a plain single-producer
+    # chain). Mirrors :attr:`_Producer.pre_ops` exactly.
+    pre_ops: Tuple[onnx.NodeProto, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -8959,6 +8970,21 @@ class _QDQConsumer:
 @dataclass(frozen=True)
 class _QDQChain:
     producer: _QDQProducer
+    chain_ops: Tuple[onnx.NodeProto, ...]
+    consumer: _QDQConsumer
+    n_channels: int
+
+
+@dataclass(frozen=True)
+class _QDQGatedChain:
+    """The QDQ analogue of a gated (SwiGLU/GeGLU) :class:`_Chain` -- two
+    producers (`producer_a`/`producer_b`, gate_proj/up_proj) combined by an
+    elementwise product, feeding one `consumer` (down_proj), any one or
+    more of the three QDQ-quantized. See :func:`_find_qdq_gated_chains`.
+    """
+
+    producer_a: _QDQProducer
+    producer_b: _QDQProducer
     chain_ops: Tuple[onnx.NodeProto, ...]
     consumer: _QDQConsumer
     n_channels: int
@@ -9151,6 +9177,216 @@ def _find_qdq_chains(graph: onnx.GraphProto) -> List[_QDQChain]:
     return chains
 
 
+def _trace_gate_producer_backward_qdq(
+    tensor_name: str,
+    node_by_output: Dict[str, onnx.NodeProto],
+    producer_infos: Dict[
+        str, Tuple[onnx.NodeProto, _WeightRef, bool, Optional[str], int]
+    ],
+    consumers_of: Dict[str, List[onnx.NodeProto]],
+    graph_outputs: Set[str],
+    max_hops: int,
+) -> Optional[
+    Tuple[
+        Tuple[onnx.NodeProto, _WeightRef, bool, Optional[str], int],
+        Tuple[onnx.NodeProto, ...],
+    ]
+]:
+    """The QDQ analogue of :func:`_trace_gate_producer_backward`: walks
+    backward from `tensor_name` through unary activation ops until it
+    resolves to a QDQ-or-plain-float MatMul/vanilla-Gemm producer's raw
+    output (`producer_infos`, keyed the same way but built from
+    :func:`_match_matmul_qdq` instead of :func:`_match_producer` -- see
+    :func:`_find_qdq_gated_chains`). Duplicated rather than shared with the
+    plain-float walker, the same "self-contained per section" choice this
+    module's own QDQ section comment already gives for its other helpers
+    (e.g. :func:`_qdq_block_aligned_keep_blocks`): the two `producer_infos`
+    dicts hold structurally different tuples (a weight *name* there, a
+    resolved :class:`_WeightRef` here), so sharing one function would need
+    either an unsound cast or a wider, less precise type on both call
+    sites.
+    """
+    pre_ops: List[onnx.NodeProto] = []
+    cur = tensor_name
+    for _ in range(max_hops):
+        if len(consumers_of.get(cur, [])) != 1 or cur in graph_outputs:
+            return None
+        if cur in producer_infos:
+            return producer_infos[cur], tuple(reversed(pre_ops))
+        producer_node = node_by_output.get(cur)
+        if producer_node is None:
+            return None
+        if not (
+            producer_node.op_type in _UNARY_PASS_THROUGH
+            and len(producer_node.input) == 1
+            and len(producer_node.output) == 1
+        ):
+            return None
+        pre_ops.append(producer_node)
+        cur = producer_node.input[0]
+    return None
+
+
+def _qdq_gated_channel_importance(
+    w_a_nk: np.ndarray, w_b_nk: np.ndarray, importance_norm: str
+) -> np.ndarray:
+    """Combined importance across a QDQ gated pair's two producers -- root-
+    sum-square (L2) or plain sum (L1) of each producer's own per-channel
+    dequantized-row norm, mirroring :func:`_plain_structured_importance`'s
+    own gated-pair combination exactly (see that function's own docstring
+    for the identity this implements), restricted to the always-exactly-
+    two-producer case a QDQ gated chain matches (no general N-producer
+    residual/Concat composition here).
+    """
+    if importance_norm == "l1":
+        return _qdq_channel_importance(w_a_nk, "l1") + _qdq_channel_importance(
+            w_b_nk, "l1"
+        )
+    return np.sqrt(
+        np.square(_qdq_channel_importance(w_a_nk, "l2"))
+        + np.square(_qdq_channel_importance(w_b_nk, "l2"))
+    )
+
+
+def _find_qdq_gated_chains(graph: onnx.GraphProto) -> List[_QDQGatedChain]:
+    """The QDQ analogue of :func:`_find_gated_chains`: recognizes the same
+    gated (SwiGLU/GeGLU) MatMul/vanilla-Gemm pair -- gate_proj/up_proj
+    sharing one input, combined via a plain elementwise ``Mul`` of two
+    non-constant operands (each optionally through its own
+    `_UNARY_PASS_THROUGH` activation -- an unactivated GLU, or any
+    activation expressed as ordinary unary ops, e.g. GeGLU's ``Gelu``) or
+    ONNX's native fused ``SwiGLU`` node (opset 28+, with nothing between
+    either producer's raw output and the op), feeding into exactly one
+    downstream MatMul/vanilla-Gemm consumer (:func:`_walk_to_consumer_qdq`)
+    -- except gate_proj/up_proj/down_proj may now each independently
+    resolve (:func:`_resolve_weight_ref`, the exact same resolution
+    :func:`_find_qdq_chains`'s own single-producer case uses) to either a
+    direct float initializer or a QDQ-quantized one, requiring at least one
+    of the three to actually be QDQ (a plain float/float/float triple is
+    :func:`_find_gated_chains`'s own job, not duplicated here). A gate
+    activation decomposed into more than one node isn't recognized here
+    either, for the identical reason :func:`_find_gated_chains`'s own
+    docstring gives -- that block is safely left untouched.
+    """
+    initializer_map = {t.name: t for t in graph.initializer}
+    consumers_of = _consumers_of(graph)
+    dq_of = {
+        n.output[0]: n
+        for n in graph.node
+        if n.op_type == "DequantizeLinear" and len(n.output) == 1
+    }
+    graph_outputs = {o.name for o in graph.output}
+    node_by_output = {out: node for node in graph.node for out in node.output}
+
+    def _is_internal(name: str) -> bool:
+        return len(consumers_of.get(name, [])) == 1 and name not in graph_outputs
+
+    producer_infos: Dict[
+        str, Tuple[onnx.NodeProto, _WeightRef, bool, Optional[str], int]
+    ] = {}
+    for node in graph.node:
+        mm = _match_matmul_qdq(node, initializer_map, dq_of, consumers_of)
+        if mm is not None:
+            _x_name, ref, weight_transposed, bias_name, out_channels, _in_channels = mm
+            producer_infos[node.output[0]] = (
+                node,
+                ref,
+                weight_transposed,
+                bias_name,
+                out_channels,
+            )
+
+    def _producer(info, pre_ops) -> _QDQProducer:
+        node, ref, weight_transposed, bias_name, _n = info
+        return _QDQProducer(node, ref, bias_name, weight_transposed, False, pre_ops)
+
+    chains: List[_QDQGatedChain] = []
+    for node in graph.node:
+        if node.op_type == "Mul" and len(node.input) == 2 and len(node.output) == 1:
+            a_name, b_name = node.input
+            if (
+                a_name == b_name
+                or a_name in initializer_map
+                or b_name in initializer_map
+            ):
+                continue
+            trace_a = _trace_gate_producer_backward_qdq(
+                a_name,
+                node_by_output,
+                producer_infos,
+                consumers_of,
+                graph_outputs,
+                _MAX_CHAIN_HOPS,
+            )
+            trace_b = _trace_gate_producer_backward_qdq(
+                b_name,
+                node_by_output,
+                producer_infos,
+                consumers_of,
+                graph_outputs,
+                _MAX_CHAIN_HOPS,
+            )
+            if trace_a is None or trace_b is None:
+                continue
+            info_a, pre_a = trace_a
+            info_b, pre_b = trace_b
+        elif (
+            node.op_type == "SwiGLU" and len(node.input) == 2 and len(node.output) == 1
+        ):
+            a_name, b_name = node.input
+            if a_name in initializer_map or b_name in initializer_map:
+                continue
+            if not (_is_internal(a_name) and _is_internal(b_name)):
+                continue
+            info_a_lookup = producer_infos.get(a_name)
+            info_b_lookup = producer_infos.get(b_name)
+            if info_a_lookup is None or info_b_lookup is None:
+                continue
+            info_a, pre_a = info_a_lookup, ()
+            info_b, pre_b = info_b_lookup, ()
+        else:
+            continue
+
+        node_a, n_a = info_a[0], info_a[4]
+        node_b, n_b = info_b[0], info_b[4]
+        if node_a is node_b or n_a != n_b:
+            continue
+
+        out_name = node.output[0]
+        if not _is_internal(out_name):
+            continue
+
+        found = _walk_to_consumer_qdq(
+            out_name,
+            False,
+            initializer_map,
+            dq_of,
+            consumers_of,
+            graph_outputs,
+            n_a,
+            _MAX_CHAIN_HOPS,
+        )
+        if found is None:
+            continue
+        consumer, chain_ops = found
+
+        producer_a = _producer(info_a, pre_a)
+        producer_b = _producer(info_b, pre_b)
+        if not (producer_a.ref.is_qdq or producer_b.ref.is_qdq or consumer.ref.is_qdq):
+            continue  # all plain float -- _find_gated_chains's own job
+
+        chains.append(
+            _QDQGatedChain(
+                producer_a=producer_a,
+                producer_b=producer_b,
+                chain_ops=chain_ops,
+                consumer=consumer,
+                n_channels=n_a,
+            )
+        )
+    return chains
+
+
 def apply_structured_pruning_qdq(
     model: Union[str, onnx.ModelProto],
     sparsity: float = 0.5,
@@ -9218,19 +9454,42 @@ def apply_structured_pruning_qdq(
     :func:`apply_structured_pruning_matmul_nbits`'s own identical
     precedent.
 
-    No general grouped/depthwise Conv, gated (SwiGLU/GeGLU) pair, residual/
-    skip-connection merge, or Concat-merged branch group is matched for a
-    QDQ chain -- every one of those is already a materially bigger project
-    for the plain float case (:func:`apply_structured_pruning`'s own
-    docstring); composing any of them with QDQ's extra scale/zero-point
-    bookkeeping is out of scope here (see this module's "QDQ" section
-    comment for the full reasoning). Call :func:`apply_structured_pruning`/
-    :func:`apply_structured_wanda_pruning` for those topologies on an
-    all-float graph, and this function for the narrower QDQ-aware slice
-    above; the two never touch the same tensor (a QDQ chain requires at
-    least one QDQ-quantized side, which the float-only passes above can
-    never match in the first place, their own weight matchers requiring a
-    *direct* float initializer).
+    Also handles the gated (SwiGLU/GeGLU) FFN pair
+    (:func:`_find_qdq_gated_chains`, the QDQ analogue of
+    :func:`_find_gated_chains`) -- gate_proj/up_proj (two MatMul/vanilla-
+    Gemm producers sharing one input, combined by an elementwise ``Mul``
+    with gate_proj's output optionally passed through one of the same
+    unary activations first, or ONNX's native fused ``SwiGLU`` op) feeding
+    one down_proj consumer, with any one or more of the three
+    QDQ-quantized (a plain float/float/float triple stays
+    :func:`apply_structured_pruning`'s own job). Both producers are ranked
+    by combined (root-sum-square, or plain sum for L1) importance of their
+    own dequantized rows (:func:`_qdq_gated_channel_importance`) and cut to
+    the *same* surviving channel-index set, since they're about to be
+    multiplied elementwise -- each producer's own int8/int4 codes/scale/
+    zero-point co-sliced in lockstep exactly like an ordinary QDQ
+    producer's above, using the very same per-role slicing helpers
+    (:func:`_slice_producer_weight_qdq`); down_proj is sliced on its input
+    axis exactly like an ordinary QDQ consumer above
+    (:func:`_slice_consumer_weight_qdq`/:func:`_slice_consumer_weight_qdq_block`),
+    including the identical blockwise block-alignment check and whole-chain
+    decline when the keep-set doesn't land on whole `block_size` blocks.
+    Gated pairs are MatMul/Gemm-only, mirroring :func:`_find_gated_chains`'s
+    own restriction -- Conv chains never take part in this composition.
+
+    No general grouped/depthwise Conv, residual/skip-connection merge, or
+    Concat-merged branch group is matched for a QDQ chain -- every one of
+    those is already a materially bigger project for the plain float case
+    (:func:`apply_structured_pruning`'s own docstring); composing any of
+    them with QDQ's extra scale/zero-point bookkeeping is out of scope here
+    (see this module's "QDQ" section comment for the full reasoning). Call
+    :func:`apply_structured_pruning`/:func:`apply_structured_wanda_pruning`
+    for those topologies on an all-float graph, and this function for the
+    narrower QDQ-aware slice above (gated pair included); the two never
+    touch the same tensor (a QDQ chain requires at least one QDQ-quantized
+    side, which the float-only passes above can never match in the first
+    place, their own weight matchers requiring a *direct* float
+    initializer).
 
     :param model: onnx ModelProto object or file path
     :param sparsity: fraction of each eligible producer's output channels to
@@ -9249,7 +9508,8 @@ def apply_structured_pruning_qdq(
     graph = out.graph
 
     chains = _find_qdq_chains(graph)
-    if not chains:
+    gated_chains = _find_qdq_gated_chains(graph)
+    if not chains and not gated_chains:
         return out
 
     initializer_map = {t.name: t for t in graph.initializer}
@@ -9317,6 +9577,76 @@ def apply_structured_pruning_qdq(
             stale_value_info.add(p.ref.qdq.dq_node.output[0])
         elif p.ref.qdq_block is not None:
             stale_value_info.add(p.ref.qdq_block.dq_node.output[0])
+        if c.ref.qdq is not None:
+            stale_value_info.add(c.ref.qdq.dq_node.output[0])
+        elif c.ref.qdq_block is not None:
+            stale_value_info.add(c.ref.qdq_block.dq_node.output[0])
+
+    for gchain in gated_chains:
+        pa, pb, c = gchain.producer_a, gchain.producer_b, gchain.consumer
+        pa_key = _weight_ref_key(pa.ref)
+        pb_key = _weight_ref_key(pb.ref)
+        c_key = _weight_ref_key(c.ref)
+        if pa_key == pb_key or pa_key == c_key or pb_key == c_key:
+            continue  # degenerate (a weight tied across two roles)
+        if (
+            pa_key in producer_touched
+            or pb_key in producer_touched
+            or c_key in consumer_touched
+        ):
+            continue  # a shared/tied weight another chain already resized
+
+        n = gchain.n_channels
+        keep_count = max(1, n - round(n * sparsity))
+        if keep_count >= n:
+            continue  # rounds down to nothing for this layer -- no-op
+
+        w_a_nk = _weight_to_nk(
+            _weight_ref_dequantized(pa.ref), pa.weight_transposed, False
+        )
+        w_b_nk = _weight_to_nk(
+            _weight_ref_dequantized(pb.ref), pb.weight_transposed, False
+        )
+        importance = _qdq_gated_channel_importance(w_a_nk, w_b_nk, importance_norm)
+        # `kind="stable"` for the identical block-alignment-determinism
+        # reason the single-producer loop above documents on this same line.
+        keep = np.sort(np.argsort(-importance, kind="stable")[:keep_count])
+
+        keep_blocks = None
+        if c.ref.qdq_block is not None:
+            keep_blocks = _qdq_block_aligned_keep_blocks(
+                keep, n, c.ref.qdq_block.block_size
+            )
+            if keep_blocks is None:
+                continue  # non-block-aligned keep set for this blockwise
+                # consumer -- decline the whole gated group, see this
+                # function's own top comment
+
+        _slice_producer_weight_qdq(pa.ref, pa.weight_transposed, keep, False)
+        if pa.bias is not None:
+            _slice_last_axis(initializer_map[pa.bias], keep)
+        _slice_producer_weight_qdq(pb.ref, pb.weight_transposed, keep, False)
+        if pb.bias is not None:
+            _slice_last_axis(initializer_map[pb.bias], keep)
+        if keep_blocks is not None:
+            assert c.ref.qdq_block is not None
+            _slice_consumer_weight_qdq_block(c.ref.qdq_block, keep, keep_blocks)
+        else:
+            _slice_consumer_weight_qdq(c.ref, c.weight_transposed, keep, False)
+
+        producer_touched.add(pa_key)
+        producer_touched.add(pb_key)
+        consumer_touched.add(c_key)
+        stale_value_info.add(pa.node.output[0])
+        stale_value_info.update(op.output[0] for op in pa.pre_ops)
+        stale_value_info.add(pb.node.output[0])
+        stale_value_info.update(op.output[0] for op in pb.pre_ops)
+        stale_value_info.update(op.output[0] for op in gchain.chain_ops)
+        for p in (pa, pb):
+            if p.ref.qdq is not None:
+                stale_value_info.add(p.ref.qdq.dq_node.output[0])
+            elif p.ref.qdq_block is not None:
+                stale_value_info.add(p.ref.qdq_block.dq_node.output[0])
         if c.ref.qdq is not None:
             stale_value_info.add(c.ref.qdq.dq_node.output[0])
         elif c.ref.qdq_block is not None:
@@ -9521,12 +9851,17 @@ def apply_structured_pruning_qdq(
 #     dequantize/requantize paths in one chain is a real but separate
 #     extension left to a follow-up, not attempted here.
 #   * No grouped/depthwise structure (there is none to speak of --
-#     ``MatMulNBits`` has no ``group`` attribute), gated (SwiGLU/GeGLU)
-#     pair, residual/skip-connection merge, or Concat-merged branch group
-#     is matched -- only the plain single producer -> [zero or more
-#     shape-preserving unary activations, `_UNARY_PASS_THROUGH`] -> single
-#     consumer topology, identical in spirit to the QDQ section's own
-#     ``_walk_to_consumer_qdq``.
+#     ``MatMulNBits`` has no ``group`` attribute), residual/skip-connection
+#     merge, or Concat-merged branch group is matched -- only the plain
+#     single producer -> [zero or more shape-preserving unary activations,
+#     `_UNARY_PASS_THROUGH`] -> single consumer topology, identical in
+#     spirit to the QDQ section's own ``_walk_to_consumer_qdq``. A gated
+#     (SwiGLU/GeGLU) pair IS matched, though
+#     (:func:`_find_matmul_nbits_gated_chains`) -- see
+#     :func:`apply_structured_pruning_matmul_nbits`'s own docstring: same
+#     backward-walk topology as :func:`_find_gated_chains`, just against
+#     producers that may each independently be ``MatMulNBits`` or
+#     plain-float.
 #   * A shared/tied ``B``/``scales``/``zero_points``/``bias`` tensor (read
 #     by more than one node) is declined by the matcher itself, the same
 #     bar every other matcher in this module is held to -- a plain-float
@@ -10120,6 +10455,32 @@ class _MatMulNBitsChain:
     n_channels: int
 
 
+@dataclass(frozen=True)
+class _MatMulNBitsGatedChain:
+    """The ``MatMulNBits`` analogue of a gated (SwiGLU/GeGLU) :class:`_Chain`
+    -- two producers (`producer_a`/`producer_b`, gate_proj/up_proj, each
+    EITHER a ``MatMulNBits`` node OR a plain-float peer -- see
+    :data:`_MatMulNBitsChainSide`) combined by an elementwise product,
+    feeding one `consumer` (down_proj, same either/or), with at least one
+    of the three a ``MatMulNBits`` node. `producer_a_pre_ops`/
+    `producer_b_pre_ops` carry each branch's own activation nodes between
+    its raw output and the combine point (mirrors :attr:`_Producer.pre_ops`
+    -- kept on the chain itself, rather than added as a field on
+    :data:`_MatMulNBitsChainSide`, since that type is a bare ``Union`` of
+    two independently-defined weight-fact dataclasses shared with the
+    single-producer chain above, not a per-role wrapper). See
+    :func:`_find_matmul_nbits_gated_chains`.
+    """
+
+    producer_a: _MatMulNBitsChainSide
+    producer_a_pre_ops: Tuple[onnx.NodeProto, ...]
+    producer_b: _MatMulNBitsChainSide
+    producer_b_pre_ops: Tuple[onnx.NodeProto, ...]
+    chain_ops: Tuple[onnx.NodeProto, ...]
+    consumer: _MatMulNBitsChainSide
+    n_channels: int
+
+
 def _walk_to_matmul_nbits_consumer(
     start: str,
     initializer_map: Dict[str, onnx.TensorProto],
@@ -10230,6 +10591,189 @@ def _find_matmul_nbits_chains(graph: onnx.GraphProto) -> List[_MatMulNBitsChain]
     return chains
 
 
+def _trace_gate_producer_backward_matmul_nbits(
+    tensor_name: str,
+    node_by_output: Dict[str, onnx.NodeProto],
+    producer_infos: Dict[str, Tuple[onnx.NodeProto, _MatMulNBitsChainSide, int]],
+    consumers_of: Dict[str, List[onnx.NodeProto]],
+    graph_outputs: Set[str],
+    max_hops: int,
+) -> Optional[
+    Tuple[Tuple[onnx.NodeProto, _MatMulNBitsChainSide, int], Tuple[onnx.NodeProto, ...]]
+]:
+    """The ``MatMulNBits`` analogue of :func:`_trace_gate_producer_backward`
+    (and :func:`_trace_gate_producer_backward_qdq`): walks backward from
+    `tensor_name` through unary activation ops until it resolves to a
+    ``MatMulNBits``-or-plain-float MatMul/vanilla-Gemm producer's raw
+    output (`producer_infos`, built from :func:`_match_matmul_nbits`/
+    :func:`_match_plain_matmul_nbits_peer` -- see
+    :func:`_find_matmul_nbits_gated_chains`). Duplicated rather than shared
+    with the QDQ section's own walker, for the identical reason that
+    section gives (structurally different `producer_infos` value types).
+    """
+    pre_ops: List[onnx.NodeProto] = []
+    cur = tensor_name
+    for _ in range(max_hops):
+        if len(consumers_of.get(cur, [])) != 1 or cur in graph_outputs:
+            return None
+        if cur in producer_infos:
+            return producer_infos[cur], tuple(reversed(pre_ops))
+        producer_node = node_by_output.get(cur)
+        if producer_node is None:
+            return None
+        if not (
+            producer_node.op_type in _UNARY_PASS_THROUGH
+            and len(producer_node.input) == 1
+            and len(producer_node.output) == 1
+        ):
+            return None
+        pre_ops.append(producer_node)
+        cur = producer_node.input[0]
+    return None
+
+
+def _matmul_nbits_gated_channel_importance(
+    w_a_nk: np.ndarray, w_b_nk: np.ndarray, importance_norm: str
+) -> np.ndarray:
+    """Combined importance across a ``MatMulNBits`` gated pair's two
+    producers -- root-sum-square (L2) or plain sum (L1) of each producer's
+    own per-channel dequantized-or-plain row norm, mirroring
+    :func:`_qdq_gated_channel_importance`'s own identical combination
+    (duplicated rather than shared for this section's own established
+    "self-contained" reason -- see its own top comment).
+    """
+    if importance_norm == "l1":
+        return _qdq_channel_importance(w_a_nk, "l1") + _qdq_channel_importance(
+            w_b_nk, "l1"
+        )
+    return np.sqrt(
+        np.square(_qdq_channel_importance(w_a_nk, "l2"))
+        + np.square(_qdq_channel_importance(w_b_nk, "l2"))
+    )
+
+
+def _find_matmul_nbits_gated_chains(
+    graph: onnx.GraphProto,
+) -> List[_MatMulNBitsGatedChain]:
+    """The ``MatMulNBits`` analogue of :func:`_find_qdq_gated_chains` (and,
+    ultimately, of :func:`_find_gated_chains` itself): recognizes the same
+    gated (SwiGLU/GeGLU) MatMul/vanilla-Gemm pair -- gate_proj/up_proj
+    sharing one input, combined via a plain elementwise ``Mul`` of two
+    non-constant operands (each optionally through its own
+    `_UNARY_PASS_THROUGH` activation) or ONNX's native fused ``SwiGLU``
+    node, feeding into exactly one downstream consumer whose input-channel
+    count matches (:func:`_walk_to_matmul_nbits_consumer`) -- except
+    gate_proj/up_proj/down_proj may now each independently be EITHER a
+    ``MatMulNBits`` node OR a plain-float MatMul/vanilla-Gemm peer
+    (:func:`_match_matmul_nbits`/:func:`_match_plain_matmul_nbits_peer`,
+    the exact same resolution :func:`_find_matmul_nbits_chains`'s own
+    single-producer case uses), requiring at least one of the three to
+    actually be ``MatMulNBits`` (an all-plain-float triple is
+    :func:`_find_gated_chains`'s own job, not duplicated here).
+    """
+    initializer_map = {t.name: t for t in graph.initializer}
+    consumers_of = _consumers_of(graph)
+    graph_outputs = {o.name for o in graph.output}
+    node_by_output = {out: node for node in graph.node for out in node.output}
+
+    def _is_internal(name: str) -> bool:
+        return len(consumers_of.get(name, [])) == 1 and name not in graph_outputs
+
+    producer_infos: Dict[str, Tuple[onnx.NodeProto, _MatMulNBitsChainSide, int]] = {}
+    for node in graph.node:
+        if node.op_type == "MatMulNBits":
+            w = _match_matmul_nbits(node, initializer_map, consumers_of)
+            if w is not None:
+                producer_infos[node.output[0]] = (node, w, w.N)
+        else:
+            peer = _match_plain_matmul_nbits_peer(node, initializer_map, consumers_of)
+            if peer is not None:
+                producer_infos[node.output[0]] = (node, peer, peer.out_channels)
+
+    chains: List[_MatMulNBitsGatedChain] = []
+    for node in graph.node:
+        if node.op_type == "Mul" and len(node.input) == 2 and len(node.output) == 1:
+            a_name, b_name = node.input
+            if (
+                a_name == b_name
+                or a_name in initializer_map
+                or b_name in initializer_map
+            ):
+                continue
+            trace_a = _trace_gate_producer_backward_matmul_nbits(
+                a_name,
+                node_by_output,
+                producer_infos,
+                consumers_of,
+                graph_outputs,
+                _MAX_CHAIN_HOPS,
+            )
+            trace_b = _trace_gate_producer_backward_matmul_nbits(
+                b_name,
+                node_by_output,
+                producer_infos,
+                consumers_of,
+                graph_outputs,
+                _MAX_CHAIN_HOPS,
+            )
+            if trace_a is None or trace_b is None:
+                continue
+            info_a, pre_a = trace_a
+            info_b, pre_b = trace_b
+        elif (
+            node.op_type == "SwiGLU" and len(node.input) == 2 and len(node.output) == 1
+        ):
+            a_name, b_name = node.input
+            if a_name in initializer_map or b_name in initializer_map:
+                continue
+            if not (_is_internal(a_name) and _is_internal(b_name)):
+                continue
+            info_a_lookup = producer_infos.get(a_name)
+            info_b_lookup = producer_infos.get(b_name)
+            if info_a_lookup is None or info_b_lookup is None:
+                continue
+            info_a, pre_a = info_a_lookup, ()
+            info_b, pre_b = info_b_lookup, ()
+        else:
+            continue
+
+        node_a, side_a, n_a = info_a
+        node_b, side_b, n_b = info_b
+        if node_a is node_b or n_a != n_b:
+            continue
+
+        out_name = node.output[0]
+        if not _is_internal(out_name):
+            continue
+
+        found = _walk_to_matmul_nbits_consumer(
+            out_name, initializer_map, consumers_of, graph_outputs, n_a, _MAX_CHAIN_HOPS
+        )
+        if found is None:
+            continue
+        consumer, chain_ops = found
+
+        if (
+            isinstance(side_a, _PlainMatMulNBitsPeer)
+            and isinstance(side_b, _PlainMatMulNBitsPeer)
+            and isinstance(consumer, _PlainMatMulNBitsPeer)
+        ):
+            continue  # all plain float -- _find_gated_chains's own job
+
+        chains.append(
+            _MatMulNBitsGatedChain(
+                producer_a=side_a,
+                producer_a_pre_ops=pre_a,
+                producer_b=side_b,
+                producer_b_pre_ops=pre_b,
+                chain_ops=chain_ops,
+                consumer=consumer,
+                n_channels=n_a,
+            )
+        )
+    return chains
+
+
 def apply_structured_pruning_matmul_nbits(
     model: Union[str, onnx.ModelProto],
     sparsity: float = 0.5,
@@ -10273,15 +10817,42 @@ def apply_structured_pruning_matmul_nbits(
     untouched rather than forcing a partial-block re-quantization or a
     disagreeing keep-set between the two.
 
+    Also handles the gated (SwiGLU/GeGLU) FFN pair
+    (:func:`_find_matmul_nbits_gated_chains`, the ``MatMulNBits`` analogue
+    of :func:`_find_gated_chains`) -- gate_proj/up_proj (two producers
+    sharing one input, EACH independently either a ``MatMulNBits`` node or
+    a plain-float MatMul/vanilla-Gemm peer, combined by an elementwise
+    ``Mul`` with gate_proj's output optionally passed through one of the
+    same unary activations first, or ONNX's native fused ``SwiGLU`` op)
+    feeding one down_proj consumer (same either/or), with at least one of
+    the three a ``MatMulNBits`` node. Both producers are ranked by combined
+    (root-sum-square, or plain sum for L1) importance of their own
+    dequantized-or-plain rows (:func:`_matmul_nbits_gated_channel_importance`)
+    and cut to the *same* surviving channel-index set, since they're about
+    to be multiplied elementwise -- each producer sliced by the same
+    per-role helper an ordinary chain's producer already uses
+    (:func:`_slice_matmul_nbits_chain_producer`). down_proj is sliced on
+    its input axis exactly like an ordinary consumer above
+    (:func:`_slice_matmul_nbits_chain_consumer`), including the identical
+    block-alignment check -- and whole-group decline when the keep-set
+    doesn't land on whole `block_size` blocks -- whenever down_proj is
+    itself ``MatMulNBits``-quantized; a plain-float down_proj has no block
+    structure, so any keep-set applies directly, same as an ordinary
+    single-producer chain's plain-float consumer. Gated pairs are
+    MatMul/Gemm-only, mirroring :func:`_find_gated_chains`'s own
+    restriction.
+
     See this module's section comment for the full list of scope
     boundaries: ``bits`` restricted to ``{4, 8}`` (empirically verified;
     ``bits=2`` remains out of scope), ``weight_prepacked`` and ``g_idx``
     always declined, a QDQ-quantized weight on the other side of a mixed
     chain remains out of scope (unlike
     :func:`apply_structured_pruning_qdq`'s own float/QDQ mixing -- this
-    section mixes ``MatMulNBits`` with plain float ONLY), no grouped/
-    gated/residual/Concat-merge topology, a padded partial final block
-    declined, a shared/tied operand declined.
+    section mixes ``MatMulNBits`` with plain float ONLY), no general
+    grouped/depthwise structure, residual/skip-connection merge, or
+    Concat-merge topology (gated pairs are the one composition now
+    supported, above), a padded partial final block declined, a
+    shared/tied operand declined.
 
     :param model: onnx ModelProto object or file path
     :param sparsity: fraction of each eligible producer's output channels to
@@ -10300,7 +10871,8 @@ def apply_structured_pruning_matmul_nbits(
     graph = out.graph
 
     chains = _find_matmul_nbits_chains(graph)
-    if not chains:
+    gated_chains = _find_matmul_nbits_gated_chains(graph)
+    if not chains and not gated_chains:
         return out
 
     producer_touched: Set[str] = set()
@@ -10357,6 +10929,59 @@ def apply_structured_pruning_matmul_nbits(
         consumer_touched.add(c_key)
         stale_value_info.add(p.node.output[0])
         stale_value_info.update(op.output[0] for op in chain.chain_ops)
+
+    for gchain in gated_chains:
+        pa, pb, c = gchain.producer_a, gchain.producer_b, gchain.consumer
+        pa_key = _matmul_nbits_chain_side_key(pa)
+        pb_key = _matmul_nbits_chain_side_key(pb)
+        c_key = _matmul_nbits_chain_side_key(c)
+        if pa_key == pb_key or pa_key == c_key or pb_key == c_key:
+            continue  # degenerate (a weight tied across two roles)
+        if (
+            pa_key in producer_touched
+            or pb_key in producer_touched
+            or c_key in consumer_touched
+        ):
+            continue  # a shared/tied weight another chain already resized
+
+        n = gchain.n_channels
+        keep_count = max(1, n - round(n * sparsity))
+        if keep_count >= n:
+            continue  # rounds down to nothing for this layer -- no-op
+
+        w_a_nk = _matmul_nbits_chain_producer_weight_nk(pa)
+        w_b_nk = _matmul_nbits_chain_producer_weight_nk(pb)
+        importance = _matmul_nbits_gated_channel_importance(
+            w_a_nk, w_b_nk, importance_norm
+        )
+        # `kind="stable"` for the identical block-alignment-determinism
+        # reason the single-producer loop above documents on this same line.
+        keep = np.sort(np.argsort(-importance, kind="stable")[:keep_count])
+
+        if isinstance(c, _MatMulNBitsWeight):
+            keep_blocks = _matmul_nbits_block_aligned_keep_blocks(
+                keep, c.k_blocks, c.block_size
+            )
+            if keep_blocks is None:
+                continue  # non-block-aligned request for this consumer --
+                # decline the whole gated group, see this section's own top
+                # comment
+            consumer_keep = keep_blocks
+        else:
+            consumer_keep = keep  # plain-float consumer -- no block structure
+
+        _slice_matmul_nbits_chain_producer(pa, keep)
+        _slice_matmul_nbits_chain_producer(pb, keep)
+        _slice_matmul_nbits_chain_consumer(c, consumer_keep)
+
+        producer_touched.add(pa_key)
+        producer_touched.add(pb_key)
+        consumer_touched.add(c_key)
+        stale_value_info.add(pa.node.output[0])
+        stale_value_info.update(op.output[0] for op in gchain.producer_a_pre_ops)
+        stale_value_info.add(pb.node.output[0])
+        stale_value_info.update(op.output[0] for op in gchain.producer_b_pre_ops)
+        stale_value_info.update(op.output[0] for op in gchain.chain_ops)
 
     if stale_value_info:
         kept = [vi for vi in graph.value_info if vi.name not in stale_value_info]
@@ -16634,25 +17259,32 @@ def apply_transformer_block_pruning(
 #   `_find_qdq_chains` matches (requiring at least one side to actually be
 #   QDQ-quantized), ranked by `_qdq_channel_importance` on the producer's
 #   own *dequantized* weight row -- the exact same helper the real
-#   function uses to rank, never for the actual (still-quantized) rewrite.
-#   No grouped/depthwise Conv, gated pair, residual merge, or Concat
-#   branch group is matched for a QDQ chain by the real function either,
-#   so none is reported as a matched unit here (they fall out via
-#   `not_eligible` exactly like any other unmatched Conv/MatMul/Gemm node,
-#   same as the plain float structured family above).
+#   function uses to rank, never for the actual (still-quantized) rewrite
+#   -- plus the gated (SwiGLU/GeGLU) pair `_find_qdq_gated_chains` matches
+#   (`family="qdq_matmul_gated"`), ranked by the combined
+#   `_qdq_gated_channel_importance` of both producers, the same way the
+#   plain float structured family's own gated pair is. No grouped/
+#   depthwise Conv, residual merge, or Concat branch group is matched for a
+#   QDQ chain by the real function either, so none is reported as a matched
+#   unit here (they fall out via `not_eligible` exactly like any other
+#   unmatched Conv/MatMul/Gemm node, same as the plain float structured
+#   family above).
 # - `apply_structured_pruning_matmul_nbits` (``MatMulNBits``-quantized
 #   channel pruning): the ``MatMulNBits``-to-``MatMulNBits``-only topology
 #   `_find_matmul_nbits_chains` matches, ranked by `_qdq_channel_importance`
 #   on the producer's own *dequantized* weight row
 #   (`_matmul_nbits_dequantized`, the same helper the real function uses to
-#   rank, never for the actual int4-code rewrite). A chain whose keep-set
-#   doesn't happen to land on the consumer's own `block_size` boundaries
-#   (`_matmul_nbits_block_aligned_keep_blocks` returning `None`) is reported
-#   `would_drop=0`/`margin=None` -- a genuinely matched unit the real call
-#   still declines to touch, mirroring that outcome exactly rather than
-#   folding it into `not_eligible`. No grouped, gated, residual, or
-#   Concat-merged topology is matched here either, for the same reason the
-#   QDQ family above has none.
+#   rank, never for the actual int4-code rewrite) -- plus the gated
+#   (SwiGLU/GeGLU) pair `_find_matmul_nbits_gated_chains` matches
+#   (`family="matmul_nbits_gated"`), ranked by the combined
+#   `_matmul_nbits_gated_channel_importance` of both producers. A chain (or
+#   gated group) whose keep-set doesn't happen to land on the consumer's
+#   own `block_size` boundaries (`_matmul_nbits_block_aligned_keep_blocks`
+#   returning `None`) is reported `would_drop=0`/`margin=None` -- a
+#   genuinely matched unit the real call still declines to touch, mirroring
+#   that outcome exactly rather than folding it into `not_eligible`. No
+#   grouped, residual, or Concat-merged topology is matched here either,
+#   for the same reason the QDQ family above has none.
 # - `apply_embedding_vocab_magnitude_pruning` (embedding/lm_head vocabulary,
 #   magnitude-ranked): `_match_embedding_chain`'s own single matched-or-not
 #   embedding table, ranked by combined embedding-row/untied-lm_head-row L2
@@ -17428,11 +18060,19 @@ def _analyze_structured_wanda_pruning(
 # --- QDQ (quantized-weight) structured family -------------------------------
 
 
-def _qdq_not_eligible(graph: onnx.GraphProto, chains: List[_QDQChain]) -> List[str]:
+def _qdq_not_eligible(
+    graph: onnx.GraphProto,
+    chains: List[_QDQChain],
+    gated_chains: List[_QDQGatedChain],
+) -> List[str]:
     matched_ids: Set[int] = set()
     for chain in chains:
         matched_ids.add(id(chain.producer.node))
         matched_ids.add(id(chain.consumer.node))
+    for gchain in gated_chains:
+        matched_ids.add(id(gchain.producer_a.node))
+        matched_ids.add(id(gchain.producer_b.node))
+        matched_ids.add(id(gchain.consumer.node))
     not_eligible = []
     for node in graph.node:
         if node.op_type not in ("Conv", "MatMul", "Gemm"):
@@ -17484,15 +18124,24 @@ def _analyze_structured_pruning_qdq(
     rather than a `not_eligible` entry (the chain WAS matched; it just
     can't be safely cut at this exact `sparsity`).
 
-    No general grouped/depthwise Conv, gated pair, residual/skip-
-    connection merge, or Concat-merged branch group is ever matched here
-    at all (see :func:`apply_structured_pruning_qdq`'s own docstring) --
-    such a node simply never enters `_find_qdq_chains`'s own return value
-    in the first place, so it is reported via `not_eligible` exactly like
-    any other unmatched Conv/MatMul/Gemm node, with no QDQ-specific label
-    of its own distinguishing *why* it was declined (the real function
-    itself gives none either -- these topologies are out of scope, not
-    individually diagnosed).
+    Also mirrors the real call's own gated (SwiGLU/GeGLU) pair support
+    (:func:`_find_qdq_gated_chains`, `family="qdq_matmul_gated"`) -- same
+    touched-role/keep-count/block-alignment treatment as an ordinary QDQ
+    chain above, just against the combined (root-sum-square, or plain sum
+    for L1) importance of both producers
+    (:func:`_qdq_gated_channel_importance`), and reported as one row per
+    gated pair (`label` joining both producers' own labels, mirroring
+    :func:`_chain_label`'s own plain-float convention).
+
+    No general grouped/depthwise Conv, residual/skip-connection merge, or
+    Concat-merged branch group is ever matched here at all (see
+    :func:`apply_structured_pruning_qdq`'s own docstring) -- such a node
+    simply never enters `_find_qdq_chains`'s/`_find_qdq_gated_chains`'s own
+    return value in the first place, so it is reported via `not_eligible`
+    exactly like any other unmatched Conv/MatMul/Gemm node, with no
+    QDQ-specific label of its own distinguishing *why* it was declined (the
+    real function itself gives none either -- these topologies are out of
+    scope, not individually diagnosed).
     """
     if not (0.0 <= sparsity < 1.0):
         raise ValueError(f"sparsity must be in [0, 1), got {sparsity}")
@@ -17502,8 +18151,9 @@ def _analyze_structured_pruning_qdq(
     graph = model.graph
 
     chains = _find_qdq_chains(graph)
-    not_eligible = _qdq_not_eligible(graph, chains)
-    if not chains:
+    gated_chains = _find_qdq_gated_chains(graph)
+    not_eligible = _qdq_not_eligible(graph, chains, gated_chains)
+    if not chains and not gated_chains:
         return PruningSensitivityReport(layers=[], not_eligible=not_eligible)
 
     producer_touched: Set[str] = set()
@@ -17597,6 +18247,98 @@ def _analyze_structured_pruning_qdq(
         producer_touched.add(p_key)
         consumer_touched.add(c_key)
 
+    for gchain in gated_chains:
+        pa, pb, c = gchain.producer_a, gchain.producer_b, gchain.consumer
+        pa_key = _weight_ref_key(pa.ref)
+        pb_key = _weight_ref_key(pb.ref)
+        c_key = _weight_ref_key(c.ref)
+        if pa_key == pb_key or pa_key == c_key or pb_key == c_key:
+            continue  # degenerate (a weight tied across two roles) -- no report row
+
+        label = f"{_node_label(pa.node)} + {_node_label(pb.node)}"
+        family = "qdq_matmul_gated"
+        n = gchain.n_channels
+
+        if (
+            pa_key in producer_touched
+            or pb_key in producer_touched
+            or c_key in consumer_touched
+        ):
+            layers.append(
+                PruningLayerSensitivity(
+                    label=label,
+                    family=family,
+                    total=n,
+                    would_drop=0,
+                    margin=None,
+                    importance_min=0.0,
+                    importance_max=0.0,
+                )
+            )
+            continue  # a shared/tied weight another chain already claimed
+
+        keep_count = max(1, n - round(n * sparsity))
+        if keep_count >= n:
+            layers.append(
+                PruningLayerSensitivity(
+                    label=label,
+                    family=family,
+                    total=n,
+                    would_drop=0,
+                    margin=None,
+                    importance_min=0.0,
+                    importance_max=0.0,
+                )
+            )
+            continue  # rounds down to nothing for this chain -- no-op
+
+        w_a_nk = _weight_to_nk(
+            _weight_ref_dequantized(pa.ref), pa.weight_transposed, False
+        )
+        w_b_nk = _weight_to_nk(
+            _weight_ref_dequantized(pb.ref), pb.weight_transposed, False
+        )
+        importance = _qdq_gated_channel_importance(w_a_nk, w_b_nk, importance_norm)
+        keep = np.sort(np.argsort(-importance, kind="stable")[:keep_count])
+
+        if c.ref.qdq_block is not None:
+            keep_blocks = _qdq_block_aligned_keep_blocks(
+                keep, n, c.ref.qdq_block.block_size
+            )
+            if keep_blocks is None:
+                layers.append(
+                    PruningLayerSensitivity(
+                        label=label,
+                        family=family,
+                        total=n,
+                        would_drop=0,
+                        margin=None,
+                        importance_min=0.0,
+                        importance_max=0.0,
+                    )
+                )
+                continue  # non-block-aligned keep set -- real call declines
+                # this whole gated group too, see this function's own docstring
+
+        keep_mask = np.zeros(n, dtype=bool)
+        keep_mask[keep] = True
+
+        layers.append(
+            PruningLayerSensitivity(
+                label=label,
+                family=family,
+                total=n,
+                would_drop=int(n - keep_count),
+                margin=_normalized_margin(importance, keep_mask),
+                importance_min=float(importance.min()),
+                importance_max=float(importance.max()),
+            )
+        )
+
+        producer_touched.add(pa_key)
+        producer_touched.add(pb_key)
+        consumer_touched.add(c_key)
+
     return PruningSensitivityReport(layers=layers, not_eligible=not_eligible)
 
 
@@ -17604,12 +18346,18 @@ def _analyze_structured_pruning_qdq(
 
 
 def _matmul_nbits_not_eligible(
-    graph: onnx.GraphProto, chains: List[_MatMulNBitsChain]
+    graph: onnx.GraphProto,
+    chains: List[_MatMulNBitsChain],
+    gated_chains: List[_MatMulNBitsGatedChain],
 ) -> List[str]:
     matched_ids: Set[int] = set()
     for chain in chains:
         matched_ids.add(id(chain.producer.node))
         matched_ids.add(id(chain.consumer.node))
+    for gchain in gated_chains:
+        matched_ids.add(id(gchain.producer_a.node))
+        matched_ids.add(id(gchain.producer_b.node))
+        matched_ids.add(id(gchain.consumer.node))
     not_eligible = []
     for node in graph.node:
         if node.op_type != "MatMulNBits" or node.domain != "com.microsoft":
@@ -17665,12 +18413,22 @@ def _analyze_structured_pruning_matmul_nbits(
     and consumer role gets no report row at all (mirroring
     :func:`_analyze_structured_pruning_qdq`'s own identical treatment).
 
-    No grouped/depthwise structure, gated pair, residual/skip-connection
-    merge, or Concat-merged branch group is ever matched here at all (see
+    Also mirrors the real call's own gated (SwiGLU/GeGLU) pair support
+    (:func:`_find_matmul_nbits_gated_chains`, `family="matmul_nbits_gated"`)
+    -- same touched-role/keep-count/block-alignment treatment as an
+    ordinary chain above, just against the combined (root-sum-square, or
+    plain sum for L1) importance of both producers
+    (:func:`_matmul_nbits_gated_channel_importance`), and reported as one
+    row per gated pair (`label` joining both producers' own labels,
+    mirroring :func:`_chain_label`'s own plain-float convention).
+
+    No general grouped/depthwise structure, residual/skip-connection merge,
+    or Concat-merged branch group is ever matched here at all (see
     :func:`apply_structured_pruning_matmul_nbits`'s own docstring) -- such a
-    node simply never enters :func:`_find_matmul_nbits_chains`'s own return
-    value in the first place, so it is reported via `not_eligible` exactly
-    like any other unmatched ``MatMulNBits`` node.
+    node simply never enters :func:`_find_matmul_nbits_chains`'s/
+    :func:`_find_matmul_nbits_gated_chains`'s own return value in the first
+    place, so it is reported via `not_eligible` exactly like any other
+    unmatched ``MatMulNBits`` node.
     """
     if not (0.0 <= sparsity < 1.0):
         raise ValueError(f"sparsity must be in [0, 1), got {sparsity}")
@@ -17680,8 +18438,9 @@ def _analyze_structured_pruning_matmul_nbits(
     graph = model.graph
 
     chains = _find_matmul_nbits_chains(graph)
-    not_eligible = _matmul_nbits_not_eligible(graph, chains)
-    if not chains:
+    gated_chains = _find_matmul_nbits_gated_chains(graph)
+    not_eligible = _matmul_nbits_not_eligible(graph, chains, gated_chains)
+    if not chains and not gated_chains:
         return PruningSensitivityReport(layers=[], not_eligible=not_eligible)
 
     producer_touched: Set[str] = set()
@@ -17776,6 +18535,99 @@ def _analyze_structured_pruning_matmul_nbits(
         )
 
         producer_touched.add(p_key)
+        consumer_touched.add(c_key)
+
+    for gchain in gated_chains:
+        pa, pb, c = gchain.producer_a, gchain.producer_b, gchain.consumer
+        pa_key = _matmul_nbits_chain_side_key(pa)
+        pb_key = _matmul_nbits_chain_side_key(pb)
+        c_key = _matmul_nbits_chain_side_key(c)
+        if pa_key == pb_key or pa_key == c_key or pb_key == c_key:
+            continue  # degenerate (a weight tied across two roles) -- no report row
+
+        label = f"{_node_label(pa.node)} + {_node_label(pb.node)}"
+        family = "matmul_nbits_gated"
+        n = gchain.n_channels
+
+        if (
+            pa_key in producer_touched
+            or pb_key in producer_touched
+            or c_key in consumer_touched
+        ):
+            layers.append(
+                PruningLayerSensitivity(
+                    label=label,
+                    family=family,
+                    total=n,
+                    would_drop=0,
+                    margin=None,
+                    importance_min=0.0,
+                    importance_max=0.0,
+                )
+            )
+            continue  # a shared/tied weight another chain already claimed
+
+        keep_count = max(1, n - round(n * sparsity))
+        if keep_count >= n:
+            layers.append(
+                PruningLayerSensitivity(
+                    label=label,
+                    family=family,
+                    total=n,
+                    would_drop=0,
+                    margin=None,
+                    importance_min=0.0,
+                    importance_max=0.0,
+                )
+            )
+            continue  # rounds down to nothing for this chain -- no-op
+
+        w_a_nk = _matmul_nbits_chain_producer_weight_nk(pa)
+        w_b_nk = _matmul_nbits_chain_producer_weight_nk(pb)
+        importance = _matmul_nbits_gated_channel_importance(
+            w_a_nk, w_b_nk, importance_norm
+        )
+        keep = np.sort(np.argsort(-importance, kind="stable")[:keep_count])
+
+        if isinstance(c, _MatMulNBitsWeight):
+            keep_blocks = _matmul_nbits_block_aligned_keep_blocks(
+                keep, c.k_blocks, c.block_size
+            )
+            if keep_blocks is None:
+                layers.append(
+                    PruningLayerSensitivity(
+                        label=label,
+                        family=family,
+                        total=n,
+                        would_drop=0,
+                        margin=None,
+                        importance_min=0.0,
+                        importance_max=0.0,
+                    )
+                )
+                continue  # non-block-aligned keep-set for this consumer --
+                # the real call declines this whole gated group too, see
+                # this function's own docstring
+        # else: a plain-float consumer has no block structure -- the real
+        # call applies any keep-set directly.
+
+        keep_mask = np.zeros(n, dtype=bool)
+        keep_mask[keep] = True
+
+        layers.append(
+            PruningLayerSensitivity(
+                label=label,
+                family=family,
+                total=n,
+                would_drop=int(n - keep_count),
+                margin=_normalized_margin(importance, keep_mask),
+                importance_min=float(importance.min()),
+                importance_max=float(importance.max()),
+            )
+        )
+
+        producer_touched.add(pa_key)
+        producer_touched.add(pb_key)
         consumer_touched.add(c_key)
 
     return PruningSensitivityReport(layers=layers, not_eligible=not_eligible)
