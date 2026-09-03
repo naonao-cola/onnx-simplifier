@@ -27186,3 +27186,616 @@ def test_matmul_nbits_mlp_qkv_pruning_dry_run_matches_real_call():
     )
     assert report.layers == []
     assert report.not_eligible == ["MatMulNBitsMlp 'mlp_orphan'"]
+
+
+# --- PagedAttention -----------------------------------------------------
+#
+# ``com.microsoft::PagedAttention`` has no CPU kernel in this environment's
+# onnxruntime (1.29.0) at all -- confirmed empirically (a minimal,
+# ``onnx.checker``-valid node in bfloat16, this op's own other supported
+# dtype besides float16, fails ``InferenceSession`` construction with
+# ``NOT_IMPLEMENTED : Could not find an implementation for PagedAttention(1)
+# node with name ''`` -- see ``onnxsim/pruning.py``'s own "Attention-head
+# pruning" section comment for the full empirical writeup), so unlike every
+# other op tested above, no test here ever runs a real ``PagedAttention``
+# node through ``InferenceSession``. Numeric ("matches oracle") correctness
+# instead follows the ``MatMulNBitsMlp``/``MatMulNBitsQkv`` precedent: a
+# pruned chain's own post-pruning Q/K/V producer weights, output-projection
+# weight, and ``head_sink`` are decomposed into an equivalent, genuinely
+# executable ``GroupQueryAttention`` node (this pass never touches
+# ``past_key``/``past_value``/RoPE for either op, so nothing about that
+# decomposition is lossy) and run through a real CPU-kernel
+# ``InferenceSession``, compared against an independently-built "kept heads
+# only" ``GroupQueryAttention`` oracle -- exactly ``test_gqa_pruning_matches
+# _oracle_exactly``'s own methodology, just fed weights that originated from
+# a ``PagedAttention``-shaped model instead of a ``GroupQueryAttention``-shaped
+# one. ``key_cache``/``value_cache``/``k_scale``/``v_scale`` handling (a
+# different axis convention from anything ``GroupQueryAttention`` itself
+# needs, so not exercisable via that same decomposition) is instead checked
+# structurally, against a numpy reference slice built from the schema's own
+# documented axis convention.
+
+
+def _paged_attention_model(
+    K=8,
+    H=4,
+    KVH=2,
+    D=8,
+    Out=6,
+    seed=0,
+    num_tokens=3,
+    num_blocks=2,
+    block_size=4,
+    wq=None,
+    wk=None,
+    wv=None,
+    wout=None,
+    head_sink=None,  # constant array (H,), or None (unconnected)
+    q_norm_weight=None,  # constant array (D,), or None (unconnected)
+    k_norm_weight=None,  # constant array (D,), or None (unconnected)
+    k_scale=None,  # constant array (PER_TENSOR/PER_CHANNEL), or None (unconnected)
+    v_scale=None,  # constant array, same convention as k_scale
+    kv_cache_layout=None,  # None -> omitted (schema default "SEPARATE"), or explicit
+    key_cache_constant=False,  # True -> key_cache is a constant initializer (declined)
+):
+    # `query`/`key`/`value` (and everything downstream of them, through the
+    # output projection) are float16 -- this op's own `T` type constraint
+    # (unlike `GroupQueryAttention`'s own) has no plain-`float` member to
+    # fall back to at all (confirmed live off the schema dump -- see
+    # `onnxsim/pruning.py`'s own "Attention-head pruning" section comment).
+    # Weights are cast to float16 *once* here and the same post-cast arrays
+    # are returned in `cfg`, exactly the "cast once, reuse the post-cast
+    # array for both the initializer and the returned cfg" idiom
+    # `_gqa_model`'s own quantized-past-kv branch already uses -- so a
+    # caller comparing `cfg["wq"]` against the model's own initializer (e.g.
+    # after slicing) is comparing against the *actual* stored values, not
+    # pre-cast ones that would silently mismatch by float16 rounding.
+    rng = np.random.default_rng(seed)
+    Nq, Nkv = H * D, KVH * D
+    if wq is None:
+        wq = rng.standard_normal((K, Nq)).astype(np.float32) * 0.5
+    if wk is None:
+        wk = rng.standard_normal((K, Nkv)).astype(np.float32) * 0.5
+    if wv is None:
+        wv = rng.standard_normal((K, Nkv)).astype(np.float32) * 0.5
+    if wout is None:
+        wout = rng.standard_normal((Nq, Out)).astype(np.float32) * 0.5
+    wq = np.asarray(wq).astype(np.float16)
+    wk = np.asarray(wk).astype(np.float16)
+    wv = np.asarray(wv).astype(np.float16)
+    wout = np.asarray(wout).astype(np.float16)
+
+    def _f16(arr, name):
+        return onnx.numpy_helper.from_array(np.asarray(arr).astype(np.float16), name)
+
+    initializer = [_f16(wq, "Wq"), _f16(wk, "Wk"), _f16(wv, "Wv"), _f16(wout, "Wout")]
+    initializer.append(
+        onnx.numpy_helper.from_array(
+            np.array([0, num_tokens], dtype=np.int32), "CumSeqLen"
+        )
+    )
+    initializer.append(
+        onnx.numpy_helper.from_array(np.zeros((1,), dtype=np.int32), "PastSeqLens")
+    )
+    initializer.append(
+        onnx.numpy_helper.from_array(np.zeros((1, 1), dtype=np.int32), "BlockTable")
+    )
+
+    extra_inputs = ""
+    if key_cache_constant:
+        initializer.append(_f16(np.zeros((num_blocks, block_size, KVH, D)), "KeyCache"))
+        initializer.append(
+            _f16(np.zeros((num_blocks, block_size, KVH, D)), "ValueCache")
+        )
+    else:
+        extra_inputs = (
+            f", float16[{num_blocks},{block_size},{KVH},{D}] KeyCache"
+            f", float16[{num_blocks},{block_size},{KVH},{D}] ValueCache"
+        )
+
+    operands = [
+        "q",
+        "k",
+        "v",
+        "KeyCache",
+        "ValueCache",
+        "CumSeqLen",
+        "PastSeqLens",
+        "BlockTable",
+    ]
+
+    if any(
+        x is not None
+        for x in (head_sink, q_norm_weight, k_norm_weight, k_scale, v_scale)
+    ):
+        operands += ["", "", ""]  # cos_cache, sin_cache, slot_mapping
+        if head_sink is not None:
+            initializer.append(_f16(head_sink, "HeadSink"))
+            operands.append("HeadSink")
+        else:
+            operands.append("")
+        if q_norm_weight is not None:
+            initializer.append(_f16(q_norm_weight, "QNorm"))
+            operands.append("QNorm")
+        else:
+            operands.append("")
+        if k_norm_weight is not None:
+            initializer.append(_f16(k_norm_weight, "KNorm"))
+            operands.append("KNorm")
+        else:
+            operands.append("")
+        if k_scale is not None:
+            initializer.append(
+                onnx.numpy_helper.from_array(
+                    np.asarray(k_scale).astype(np.float32), "KScale"
+                )
+            )
+            operands.append("KScale")
+        else:
+            operands.append("")
+        if v_scale is not None:
+            initializer.append(
+                onnx.numpy_helper.from_array(
+                    np.asarray(v_scale).astype(np.float32), "VScale"
+                )
+            )
+            operands.append("VScale")
+        else:
+            operands.append("")
+
+    attrs = f"num_heads={H}, kv_num_heads={KVH}"
+    if kv_cache_layout is not None:
+        attrs += f', kv_cache_layout = "{kv_cache_layout}"'
+
+    body = f"""
+        g (float16[{num_tokens},{K}] X{extra_inputs}) => (float16[{num_tokens},{Out}] Y)
+        {{
+          q = MatMul(X, Wq)
+          k = MatMul(X, Wk)
+          v = MatMul(X, Wv)
+          ctx, key_cache_out, value_cache_out = com.microsoft.PagedAttention <{attrs}> ({", ".join(operands)})
+          Y = MatMul(ctx, Wout)
+        }}
+        """
+
+    model = parser.parse_model(
+        f"""
+        <
+          ir_version: 10,
+          opset_import: ["": 17, "com.microsoft": 1]
+        >
+        {body}
+        """
+    )
+    model.graph.initializer.extend(initializer)
+    return model, dict(
+        K=K,
+        H=H,
+        KVH=KVH,
+        D=D,
+        Out=Out,
+        Nq=Nq,
+        Nkv=Nkv,
+        wq=wq,
+        wk=wk,
+        wv=wv,
+        wout=wout,
+        num_tokens=num_tokens,
+    )
+
+
+def _paged_node(model):
+    return next(n for n in model.graph.node if n.op_type == "PagedAttention")
+
+
+def _paged_attrs(node):
+    num_heads = next(a.i for a in node.attribute if a.name == "num_heads")
+    kv_num_heads = next(a.i for a in node.attribute if a.name == "kv_num_heads")
+    return num_heads, kv_num_heads
+
+
+def test_paged_attention_pruning_shrinks_matched_block():
+    model, cfg = _paged_attention_model(K=8, H=4, KVH=4, D=8, Out=6)
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    node = _paged_node(pruned)
+    num_heads, kv_num_heads = _paged_attrs(node)
+    assert num_heads == 2  # round(4 - 4*0.5) query heads ...
+    assert kv_num_heads == 2  # ... and KV heads alike, since group_size == 1 here
+
+    inits = {t.name: t for t in pruned.graph.initializer}
+    assert list(inits["Wq"].dims) == [8, 16]
+    assert list(inits["Wk"].dims) == [8, 16]
+    assert list(inits["Wv"].dims) == [8, 16]
+    assert list(inits["Wout"].dims) == [16, 6]
+
+
+def test_paged_attention_pruning_zero_sparsity_is_a_no_op():
+    model, cfg = _paged_attention_model(K=8, H=8, KVH=2, D=8, Out=6, seed=7)
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.0)
+    node = _paged_node(pruned)
+    num_heads, kv_num_heads = _paged_attrs(node)
+    assert num_heads == cfg["H"]
+    assert kv_num_heads == cfg["KVH"]
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    np.testing.assert_array_equal(inits["Wq"], cfg["wq"])
+    np.testing.assert_array_equal(inits["Wk"], cfg["wk"])
+    np.testing.assert_array_equal(inits["Wv"], cfg["wv"])
+
+
+def test_paged_attention_pruning_unequal_heads_drops_whole_groups_and_preserves_ratio():
+    # 8 query heads sharing 4 KV heads (2 query heads per KV head); at
+    # sparsity=0.5 two of the four *groups* must be dropped, never an
+    # individual query head in isolation -- mirrors
+    # ``test_gqa_pruning_unequal_heads_drops_whole_groups_and_preserves_ratio``
+    # exactly, confirming `PagedAttention`'s own matcher feeds the identical
+    # shared `_gqa_group_importance`/whole-KV-group-selection machinery.
+    model, cfg = _paged_attention_model(K=8, H=8, KVH=4, D=8, Out=6, seed=11)
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    node = _paged_node(pruned)
+    num_heads, kv_num_heads = _paged_attrs(node)
+    assert kv_num_heads == 2
+    assert num_heads == 4
+    assert num_heads // kv_num_heads == cfg["H"] // cfg["KVH"]  # ratio preserved
+
+    group_size = cfg["H"] // cfg["KVH"]
+    keep_groups = _oracle_keep_groups(
+        cfg["wq"].astype(np.float64),
+        cfg["wk"].astype(np.float64),
+        cfg["wv"].astype(np.float64),
+        cfg["H"],
+        cfg["KVH"],
+        cfg["D"],
+        2,
+    )
+    keep_q_heads = _group_q_heads(keep_groups, group_size)
+    d = cfg["D"]
+
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    np.testing.assert_array_equal(inits["Wq"], cfg["wq"][:, _head_idx(keep_q_heads, d)])
+    np.testing.assert_array_equal(inits["Wk"], cfg["wk"][:, _head_idx(keep_groups, d)])
+    np.testing.assert_array_equal(inits["Wv"], cfg["wv"][:, _head_idx(keep_groups, d)])
+
+
+def test_paged_attention_pruning_matches_decomposed_gqa_oracle():
+    # No CPU kernel exists for `PagedAttention` itself (see this section's
+    # own top comment) -- so the pruned chain's own post-pruning Q/K/V/output
+    # weights are decomposed into an equivalent, genuinely executable
+    # `GroupQueryAttention` node and run for real, compared against an
+    # independently-built "kept heads only" `GroupQueryAttention` oracle
+    # (the exact same real-kernel comparison `test_gqa_pruning_matches_oracle
+    # _exactly` performs, just fed weights that originated from a
+    # `PagedAttention`-shaped model).
+    K, H, KVH, D, Out = 8, 8, 2, 8, 6
+    model, cfg = _paged_attention_model(K=K, H=H, KVH=KVH, D=D, Out=Out, seed=1)
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    node = _paged_node(pruned)
+    num_heads, kv_num_heads = _paged_attrs(node)
+    group_size = H // KVH
+    assert kv_num_heads == 1  # max(1, 2 - round(2*0.5))
+    assert num_heads == kv_num_heads * group_size
+
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    decomposed, _ = _gqa_model(
+        K=K,
+        H=num_heads,
+        KVH=kv_num_heads,
+        D=D,
+        Out=Out,
+        seed=1,
+        wq=inits["Wq"].astype(np.float32),
+        wk=inits["Wk"].astype(np.float32),
+        wv=inits["Wv"].astype(np.float32),
+        wout=inits["Wout"].astype(np.float32),
+        batch=1,
+        seq=cfg["num_tokens"],
+    )
+
+    keep_groups = _oracle_keep_groups(
+        cfg["wq"].astype(np.float64),
+        cfg["wk"].astype(np.float64),
+        cfg["wv"].astype(np.float64),
+        H,
+        KVH,
+        D,
+        kv_num_heads,
+    )
+    keep_q_heads = _group_q_heads(keep_groups, group_size)
+    q_idx, kv_idx = _head_idx(keep_q_heads, D), _head_idx(keep_groups, D)
+    oracle, _ = _gqa_model(
+        K=K,
+        H=num_heads,
+        KVH=kv_num_heads,
+        D=D,
+        Out=Out,
+        seed=1,
+        wq=cfg["wq"][:, q_idx].astype(np.float32),
+        wk=cfg["wk"][:, kv_idx].astype(np.float32),
+        wv=cfg["wv"][:, kv_idx].astype(np.float32),
+        wout=cfg["wout"][q_idx, :].astype(np.float32),
+        batch=1,
+        seq=cfg["num_tokens"],
+    )
+
+    rng = np.random.default_rng(2)
+    x = rng.standard_normal((1, cfg["num_tokens"], K)).astype(np.float32)
+    (y_decomposed,) = _run(decomposed, {"X": x})
+    (y_oracle,) = _run(oracle, {"X": x})
+    np.testing.assert_allclose(y_decomposed, y_oracle, rtol=1e-3, atol=1e-3)
+
+
+def test_paged_attention_pruning_slices_head_sink_and_matches_oracle():
+    K, H, KVH, D, Out = 8, 4, 2, 8, 6
+    rng = np.random.default_rng(21)
+    head_sink = rng.standard_normal(H).astype(np.float32)
+    model, cfg = _paged_attention_model(
+        K=K, H=H, KVH=KVH, D=D, Out=Out, seed=21, head_sink=head_sink
+    )
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+
+    node = _paged_node(pruned)
+    num_heads, kv_num_heads = _paged_attrs(node)
+    group_size = H // KVH
+
+    keep_groups = _oracle_keep_groups(
+        cfg["wq"].astype(np.float64),
+        cfg["wk"].astype(np.float64),
+        cfg["wv"].astype(np.float64),
+        H,
+        KVH,
+        D,
+        kv_num_heads,
+    )
+    keep_q_heads = _group_q_heads(keep_groups, group_size)
+
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    np.testing.assert_array_equal(
+        inits["HeadSink"], head_sink.astype(np.float16)[keep_q_heads]
+    )
+
+    # Real-kernel confirmation that the sliced `head_sink` genuinely matches
+    # a from-scratch "kept heads only" oracle: both are fed to a real
+    # `GroupQueryAttention` node (which shares the identical `head_sink`
+    # shape/treatment -- see `onnxsim/pruning.py`'s own "Attention-head
+    # pruning" section comment) and their outputs compared.
+    q_idx, kv_idx = _head_idx(keep_q_heads, D), _head_idx(keep_groups, D)
+    decomposed, _ = _gqa_model(
+        K=K,
+        H=num_heads,
+        KVH=kv_num_heads,
+        D=D,
+        Out=Out,
+        seed=1,
+        wq=inits["Wq"].astype(np.float32),
+        wk=inits["Wk"].astype(np.float32),
+        wv=inits["Wv"].astype(np.float32),
+        wout=inits["Wout"].astype(np.float32),
+        head_sink=inits["HeadSink"].astype(np.float32),
+        batch=1,
+        seq=cfg["num_tokens"],
+    )
+    oracle, _ = _gqa_model(
+        K=K,
+        H=num_heads,
+        KVH=kv_num_heads,
+        D=D,
+        Out=Out,
+        seed=1,
+        wq=cfg["wq"][:, q_idx].astype(np.float32),
+        wk=cfg["wk"][:, kv_idx].astype(np.float32),
+        wv=cfg["wv"][:, kv_idx].astype(np.float32),
+        wout=cfg["wout"][q_idx, :].astype(np.float32),
+        head_sink=head_sink.astype(np.float16).astype(np.float32)[keep_q_heads],
+        batch=1,
+        seq=cfg["num_tokens"],
+    )
+    rng2 = np.random.default_rng(3)
+    x = rng2.standard_normal((1, cfg["num_tokens"], K)).astype(np.float32)
+    (y_decomposed,) = _run(decomposed, {"X": x})
+    (y_oracle,) = _run(oracle, {"X": x})
+    np.testing.assert_allclose(y_decomposed, y_oracle, rtol=1e-3, atol=1e-3)
+
+
+def test_paged_attention_pruning_malformed_head_sink_shape_is_declined():
+    K, H, KVH, D, Out = 8, 4, 2, 8, 6
+    model, cfg = _paged_attention_model(
+        K=K, H=H, KVH=KVH, D=D, Out=Out, seed=5, head_sink=np.ones(H + 1)
+    )
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    node = _paged_node(pruned)
+    num_heads, kv_num_heads = _paged_attrs(node)
+    assert (num_heads, kv_num_heads) == (H, KVH)  # left untouched
+
+
+def test_paged_attention_pruning_qk_norm_weight_paired_presence_required():
+    K, H, KVH, D, Out = 8, 4, 2, 8, 6
+    q_norm = np.ones(D, dtype=np.float32)
+    # `k_norm_weight` deliberately omitted -- the schema's own "must be
+    # provided together" rule declines the whole match, leaving the node
+    # entirely untouched, mirroring GQA's own paired-input rules elsewhere.
+    model, cfg = _paged_attention_model(
+        K=K, H=H, KVH=KVH, D=D, Out=Out, seed=6, q_norm_weight=q_norm
+    )
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    node = _paged_node(pruned)
+    num_heads, kv_num_heads = _paged_attrs(node)
+    assert (num_heads, kv_num_heads) == (H, KVH)  # left untouched
+
+
+def test_paged_attention_pruning_qk_norm_weight_wrong_shape_is_declined():
+    K, H, KVH, D, Out = 8, 4, 2, 8, 6
+    model, cfg = _paged_attention_model(
+        K=K,
+        H=H,
+        KVH=KVH,
+        D=D,
+        Out=Out,
+        seed=8,
+        q_norm_weight=np.ones(D + 1, dtype=np.float32),
+        k_norm_weight=np.ones(D + 1, dtype=np.float32),
+    )
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    node = _paged_node(pruned)
+    num_heads, kv_num_heads = _paged_attrs(node)
+    assert (num_heads, kv_num_heads) == (H, KVH)  # left untouched
+
+
+def test_paged_attention_pruning_qk_norm_weight_both_present_left_unsliced():
+    # `q_norm_weight`/`k_norm_weight` are `(head_size,)`-shaped -- constant
+    # across heads -- so they never need slicing under whole-head/KV-group
+    # pruning: this confirms the pruned model keeps them byte-identical to
+    # their pre-pruning values while Wq/Wk/Wv genuinely do shrink.
+    K, H, KVH, D, Out = 8, 4, 2, 8, 6
+    q_norm = np.arange(D, dtype=np.float32)
+    k_norm = np.arange(D, dtype=np.float32) * 2.0
+    model, cfg = _paged_attention_model(
+        K=K,
+        H=H,
+        KVH=KVH,
+        D=D,
+        Out=Out,
+        seed=9,
+        q_norm_weight=q_norm,
+        k_norm_weight=k_norm,
+    )
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    node = _paged_node(pruned)
+    num_heads, kv_num_heads = _paged_attrs(node)
+    assert (num_heads, kv_num_heads) != (H, KVH)  # a real match/prune happened
+
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    np.testing.assert_array_equal(inits["QNorm"], q_norm.astype(np.float16))
+    np.testing.assert_array_equal(inits["KNorm"], k_norm.astype(np.float16))
+    assert inits["Wq"].shape[1] < cfg["wq"].shape[1]  # genuinely pruned
+
+
+def test_paged_attention_pruning_constant_key_cache_is_declined():
+    # `key_cache`/`value_cache` are, per this op's own doc, a mutable
+    # block-based buffer "updated in place within the op" -- no realistic
+    # export bakes either as a constant, and this module has no
+    # execution-verified story for what slicing one would even mean here
+    # (see `onnxsim/pruning.py`'s own "Attention-head pruning" section
+    # comment) -- so a constant one declines the whole match outright.
+    K, H, KVH, D, Out = 8, 4, 2, 8, 6
+    model, cfg = _paged_attention_model(
+        K=K, H=H, KVH=KVH, D=D, Out=Out, seed=10, key_cache_constant=True
+    )
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    node = _paged_node(pruned)
+    num_heads, kv_num_heads = _paged_attrs(node)
+    assert (num_heads, kv_num_heads) == (H, KVH)  # left untouched
+
+
+def test_paged_attention_pruning_latent_kv_cache_layout_is_declined():
+    # ``kv_cache_layout == "LATENT"`` (absorbed Multi-head Latent Attention)
+    # is a structurally different shape (no independent V/`value_cache` at
+    # all, `kv_num_heads` pinned to 1) this module's own whole-KV-group
+    # machinery was never built to handle -- declined outright, out of scope.
+    K, H, KVH, D, Out = 8, 4, 1, 8, 6
+    model, cfg = _paged_attention_model(
+        K=K, H=H, KVH=KVH, D=D, Out=Out, seed=12, kv_cache_layout="LATENT"
+    )
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    node = _paged_node(pruned)
+    num_heads, kv_num_heads = _paged_attrs(node)
+    assert (num_heads, kv_num_heads) == (H, KVH)  # left untouched
+
+
+def test_paged_attention_pruning_k_scale_v_scale_per_channel_sliced():
+    # `k_scale`/`v_scale`'s own PER_CHANNEL shape here is `(kv_num_heads, 1,
+    # head_size)` -- rank 3, KV axis at position *0* -- a genuinely
+    # different convention from `GroupQueryAttention`'s own rank-4 `[1,
+    # kv_num_heads, 1, head_size]` (KV axis at position 1), so this is
+    # checked structurally against a numpy reference slice built from the
+    # schema's own documented axis convention, not exercisable via the
+    # `GroupQueryAttention`-decomposition proxy used elsewhere in this
+    # section (see this section's own top comment for why).
+    K, H, KVH, D, Out = 8, 8, 4, 8, 6
+    rng = np.random.default_rng(13)
+    k_scale = rng.uniform(0.1, 2.0, size=(KVH, 1, D)).astype(np.float32)
+    v_scale = rng.uniform(0.1, 2.0, size=(KVH, 1, D)).astype(np.float32)
+    model, cfg = _paged_attention_model(
+        K=K,
+        H=H,
+        KVH=KVH,
+        D=D,
+        Out=Out,
+        seed=13,
+        k_scale=k_scale,
+        v_scale=v_scale,
+    )
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    node = _paged_node(pruned)
+    num_heads, kv_num_heads = _paged_attrs(node)
+    assert kv_num_heads == 2
+
+    keep_groups = _oracle_keep_groups(
+        cfg["wq"].astype(np.float64),
+        cfg["wk"].astype(np.float64),
+        cfg["wv"].astype(np.float64),
+        H,
+        KVH,
+        D,
+        kv_num_heads,
+    )
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    np.testing.assert_array_equal(inits["KScale"], k_scale[keep_groups])
+    np.testing.assert_array_equal(inits["VScale"], v_scale[keep_groups])
+
+
+def test_paged_attention_pruning_k_scale_per_tensor_left_untouched():
+    K, H, KVH, D, Out = 8, 4, 2, 8, 6
+    k_scale = np.array([0.5], dtype=np.float32)  # PER_TENSOR -- no per-head axis
+    model, cfg = _paged_attention_model(
+        K=K, H=H, KVH=KVH, D=D, Out=Out, seed=14, k_scale=k_scale
+    )
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    inits = {t.name: onnx.numpy_helper.to_array(t) for t in pruned.graph.initializer}
+    np.testing.assert_array_equal(inits["KScale"], k_scale)
+
+
+def test_analyze_attention_head_pruning_paged_matches_real_call():
+    K, H, KVH, D, Out = 8, 4, 2, 8, 6
+    model, cfg = _paged_attention_model(K=K, H=H, KVH=KVH, D=D, Out=Out, seed=15)
+    report = onnxsim.analyze_pruning_sensitivity(
+        model, onnxsim.apply_attention_head_pruning, sparsity=0.5
+    )
+    assert len(report.layers) == 1
+    layer = report.layers[0]
+    assert layer.family == "attention_paged_group"
+    assert layer.total == KVH
+    assert report.not_eligible == []
+
+    pruned = onnxsim.apply_attention_head_pruning(model, sparsity=0.5)
+    dims_after = _initializer_dims(pruned)
+    kept_groups = KVH - layer.would_drop
+    group_size = H // KVH
+    assert dims_after["Wq"][1] == kept_groups * group_size * D
+    assert dims_after["Wk"][1] == kept_groups * D
+    assert dims_after["Wv"][1] == kept_groups * D
+
+
+def test_paged_attention_not_eligible_lists_unmatched_node():
+    # An orphan `PagedAttention` node (a constant `key_cache` -- see
+    # `test_paged_attention_pruning_constant_key_cache_is_declined` -- so it
+    # never matches) is reported via `not_eligible`, not silently dropped.
+    K, H, KVH, D, Out = 8, 4, 2, 8, 6
+    model, cfg = _paged_attention_model(
+        K=K, H=H, KVH=KVH, D=D, Out=Out, seed=16, key_cache_constant=True
+    )
+    node = _paged_node(model)
+    node.name = "paged_orphan"
+    report = onnxsim.analyze_pruning_sensitivity(
+        model, onnxsim.apply_attention_head_pruning, sparsity=0.5
+    )
+    assert report.layers == []
+    assert report.not_eligible == ["PagedAttention 'paged_orphan'"]
