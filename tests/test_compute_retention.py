@@ -17,7 +17,7 @@ _APPLE_DIR = os.path.join(
 if _APPLE_DIR not in sys.path:
     sys.path.insert(0, _APPLE_DIR)
 
-from compute_retention import compute_retention  # noqa: E402
+from compute_retention import build_records, compute_retention  # noqa: E402
 
 
 def test_full_retention_when_scores_match():
@@ -81,3 +81,27 @@ def test_no_overlap_returns_empty():
         {"ifeval": {"acc": 0.8}}, {"mmlu_pro_biology": {"acc": 0.5}}
     )
     assert result == {}
+
+
+def test_build_records_flattens_one_entry_per_task_metric():
+    retention = compute_retention(
+        {"ifeval": {"acc": 0.8}, "hendrycks_math500": {"exact_match": 0.5}},
+        {"ifeval": {"acc": 0.7}, "hendrycks_math500": {"exact_match": 0.4}},
+    )
+    records = build_records("smollm2-135m", 10, retention)
+    assert len(records) == 2
+    assert {r["benchmark"] for r in records} == {"ifeval", "hendrycks_math500"}
+    ifeval_record = next(r for r in records if r["benchmark"] == "ifeval")
+    assert ifeval_record == {
+        "model_id": "smollm2-135m",
+        "benchmark": "ifeval",
+        "metric": "acc",
+        "subset_n": 10,
+        "float_acc": 0.8,
+        "quantized_acc": 0.7,
+        "retention": pytest.approx(0.875),
+    }
+
+
+def test_build_records_on_empty_retention_returns_empty_list():
+    assert build_records("model", 10, {}) == []

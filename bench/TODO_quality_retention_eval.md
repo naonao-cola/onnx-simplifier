@@ -1,17 +1,18 @@
 # Open: quality + retention measurement for the Core ML LLM benchmark suite
 
-**Status:** first slice implemented -- IFEval only, both directions (float + quantized
-eval, retention computation), wired into a `workflow_dispatch`/schedule-only CI job.
-`scripts/apple` now has `run_quality_eval.py` (an `lm-evaluation-harness` wrapper
-supporting `--model hf` and `--model coreml`), `lm_eval_coreml_adapter.py` (the
-`CoreMLDecoder`-wrapping `generate_until` adapter), and `compute_retention.py`
-(quantized/float ratio, unit-tested in `tests/test_compute_retention.py`) -- see
-`scripts/apple/README.md`'s "Quality and retention eval" section for usage. MMLU-Pro
-and MATH-500 are validated as *working* through the same scripts (see "What's been
-prototyped" below) but not yet in CI: a real compute-cost finding during prototyping
-(below) means they need more thought before they're CI-feasible at all, not just a
-config change. This doc's "Next steps" now reflects what's left, not a from-scratch
-plan.
+**Status:** first two slices implemented -- IFEval and MATH-500, both directions
+(float + quantized eval, retention computation), wired into a
+`workflow_dispatch`/schedule-only CI job. `scripts/apple` now has
+`run_quality_eval.py` (an `lm-evaluation-harness` wrapper supporting `--model hf`
+and `--model coreml`), `lm_eval_coreml_adapter.py` (the `CoreMLDecoder`-wrapping
+`generate_until` adapter), and `compute_retention.py` (quantized/float ratio,
+unit-tested in `tests/test_compute_retention.py`) -- see
+`scripts/apple/README.md`'s "Quality and retention eval" section for usage.
+MMLU-Pro is validated as *working* through the same scripts (see "What's been
+prototyped" below) but not yet in CI: a real compute-cost finding during
+prototyping (below) means it needs more thought before it's CI-feasible at all,
+not just a config change. This doc's "Next steps" now reflects what's left, not a
+from-scratch plan.
 
 `scripts/apple` previously only measured decode speed (`run_llm_decode_benchmark.py`)
 and prefill/decode correctness against the HF reference at the token level
@@ -191,6 +192,8 @@ design on paper:
 - **`hendrycks_math500` (MATH-500):** works end-to-end, and was noticeably faster per
   example than MMLU-Pro at the same `--limit` (no explicit `max_gen_toks` in its task
   YAML, so it relies on the model naturally stopping rather than a large fixed budget).
+  `quality-eval-macos`'s CI job now runs this one too (re-confirmed working,
+  ~7s/example on CPU at `--limit 3`, before wiring it in).
 - **`mmlu_pro_biology` (one MMLU-Pro subject, not the full 14-subject group):** works
   end-to-end, but is dramatically more expensive than the other two --
   **~2 minutes for a single example** at `--limit 1` (5-shot context, 2048-token
@@ -235,10 +238,13 @@ Following `run_llm_decode_benchmark.py`/`check_decode_parity.py`'s existing patt
 print a human-readable summary and let the CI job `tee` it into
 `$GITHUB_STEP_SUMMARY` (decode tok/s, memory, parity agreement, and now per-benchmark
 quality + retention, all in one place per model). A machine-readable JSON artifact
-alongside it (one object per model: `{model_id, benchmark, subset_n, quantized_acc,
-float_acc, retention}`) would let a later step turn a run history into a trend
-without re-parsing log text -- worth adding once there's more than one data point to
-actually compare.
+alongside it -- `compute_retention.py --output`'s `"records"` list, one object per
+(task, metric): `{model_id, benchmark, metric, subset_n, float_acc, quantized_acc,
+retention}` (`build_records()`, unit-tested in `test_compute_retention.py`) --
+now exists and is uploaded from `quality-eval-macos` as the `quality-retention-results`
+artifact, one JSON per benchmark (IFEval, MATH-500). Lets a later step turn a run
+history into a trend without re-parsing log text; nothing reads these back yet (no
+trend-plotting script exists) -- that's the next piece if this is picked up further.
 
 ## Next steps, if picking this up
 
@@ -254,16 +260,22 @@ actually compare.
    end-to-end (does `quality-eval-macos` actually pass, does the Core ML side's IFEval
    score land in a sane range relative to the float side's on the same subset) is the
    most valuable next check once this doc's changes reach a macOS CI run.
-4. ~~Wire a small-subset run into a new CI job~~ -- done (`quality-eval-macos`), but
-   **IFEval only**. MMLU-Pro and MATH-500 remain future work:
-   - MMLU-Pro's ~2-minutes-per-example cost (see "What's been prototyped") needs
-     either a much lower `--max-gen-toks` (with a check that a still-useful score comes
-     out -- an aggressively truncated "think step by step" response might just always
-     score 0, which would be worse than not running it at all) or accepting a very
-     small `--limit` (1-3 examples) purely as a smoke test rather than a real quality
+4. ~~Wire a small-subset run into a new CI job~~ -- done (`quality-eval-macos`).
+   ~~MATH-500 stays future work~~ -- done: `hendrycks_math500` (same
+   `HuggingFaceH4/MATH-500` source DeviceMark's own battery draws from) is now a
+   second benchmark in `quality-eval-macos`, `--limit 10 --max-gen-toks 256`, its own
+   float/coreml/retention step trio mirroring IFEval's. Re-confirmed cheap
+   (~7s/example on CPU at `--limit 3` in this environment, matching the earlier
+   prototype) before wiring it in; `sympy` (its answer-equivalence checker's direct
+   import, not one of `lm-eval`'s own declared dependencies) added explicitly to the
+   job's pip install line rather than relying on it arriving transitively via
+   `optimum-onnx`'s torch dependency. MMLU-Pro remains future work:
+   - Its ~2-minutes-per-example cost (see "What's been prototyped") needs either a
+     much lower `--max-gen-toks` (with a check that a still-useful score comes out --
+     an aggressively truncated "think step by step" response might just always score
+     0, which would be worse than not running it at all) or accepting a very small
+     `--limit` (1-3 examples) purely as a smoke test rather than a real quality
      signal.
-   - MATH-500 looked cheaper in the prototype and is probably the more promising second
-     benchmark to add to `quality-eval-macos` -- worth trying before MMLU-Pro.
    - The full `mmlu_pro` group (14 subjects) was never attempted even structurally;
      only one subject (`mmlu_pro_biology`) has been run. Even after solving the
      per-example cost, decide whether CI should sample across all 14 subjects or just a
@@ -281,6 +293,11 @@ actually compare.
    items from the denominator) to match how DeviceMark defines retention specifically,
    rather than the plain `acc` `run_quality_eval.py` currently reports -- not done here
    since it touches `run_quality_eval.py`'s output schema, not just docs.
-6. Once more than one model has been run through `quality-eval-macos` (or a MATH-500/
-   MMLU-Pro variant of it), consider the machine-readable JSON artifact idea in
-   "Reporting" below -- not worth building for a single data point.
+6. ~~Once more than one model has been run through `quality-eval-macos`... consider
+   the machine-readable JSON artifact idea~~ -- done: MATH-500 landing alongside
+   IFEval (see item 4) gave a second data point, so `compute_retention.py --output`
+   now writes a flat `"records"` list (`build_records()`) and `quality-eval-macos`
+   uploads both benchmarks' JSON as the `quality-retention-results` artifact -- see
+   "Reporting" above. Nothing consumes these across runs yet (no trend-plotting
+   script) -- that would be the next piece once there's an actual run history worth
+   trending.
