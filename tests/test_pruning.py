@@ -3167,7 +3167,7 @@ def _combined_keep_indices(w_gate, w_up, keep_count):
     return np.sort(np.argsort(-importance)[:keep_count])
 
 
-def _swiglu_mlp_model(K=8, H=16, Out=4, gate_activation="Sigmoid", seed=0):
+def _swiglu_mlp_model(K=8, H=16, Out=4, gate_activation="Sigmoid", seed=0, opset=21):
     rng = np.random.default_rng(seed)
     wg = rng.standard_normal((K, H)).astype(np.float32)
     wu = rng.standard_normal((K, H)).astype(np.float32)
@@ -3184,6 +3184,7 @@ def _swiglu_mlp_model(K=8, H=16, Out=4, gate_activation="Sigmoid", seed=0):
         }}
         """,
         initializer=[_f32(wg, "Wg"), _f32(wu, "Wu"), _f32(wd, "Wd")],
+        opset=opset,
     )
     return model, wg, wu, wd
 
@@ -3306,6 +3307,69 @@ def test_structured_pruning_quick_gelu_gated_ffn_matches_oracle():
     up = x @ wu[:, keep]
     y_oracle = (gate * up) @ wd[keep, :]
     np.testing.assert_allclose(y, y_oracle, rtol=1e-4, atol=1e-4)
+
+
+def test_structured_pruning_swish_gated_ffn_matches_oracle():
+    # The SwiGLU-shaped gated MatMul chain with ai.onnx (domain "") Swish
+    # (opset 24+) as the gate activation -- the pattern its name literally
+    # comes from (Swish-Gated Linear Unit). Swish is unary (alpha is a
+    # float attribute, not a second input), so -- exactly like the
+    # QuickGelu gated-FFN case above -- it needed no dedicated gated-chain
+    # machinery, only joining `_UNARY_PASS_THROUGH`.
+    K, H, Out = 8, 16, 4
+    model, wg, wu, wd = _swiglu_mlp_model(
+        K=K, H=H, Out=Out, gate_activation="Swish", seed=130, opset=24
+    )
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    inits = {t.name: t for t in pruned.graph.initializer}
+    assert list(inits["Wg"].dims) == [K, H // 2]
+    assert list(inits["Wu"].dims) == [K, H // 2]
+    assert list(inits["Wd"].dims) == [H // 2, Out]
+
+    keep = _combined_keep_indices(wg, wu, H // 2)
+    rng = np.random.default_rng(131)
+    x = rng.standard_normal((5, K)).astype(np.float32)
+    (y,) = _run(pruned, {"X": x})
+
+    g = x @ wg[:, keep]
+    gate = g / (1.0 + np.exp(-g))  # Swish(x) = x * sigmoid(alpha * x), alpha=1.0
+    up = x @ wu[:, keep]
+    y_oracle = (gate * up) @ wd[keep, :]
+    assert np.isfinite(y).all()
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-4, atol=1e-4)
+
+
+def test_structured_pruning_swish_gated_ffn_prunes_same_shape_as_sigmoid_gate():
+    # The only difference between a Swish-gated and Sigmoid-gated chain
+    # should be the missing-vs-present set membership fixed here -- not
+    # some broader gated-chain limitation. Same K/H/Out/seed/sparsity as
+    # the Sigmoid-gated `_swiglu_mlp_model` default, so any divergence in
+    # which/how many channels survive would show up directly.
+    K, H, Out, seed, sparsity = 8, 16, 4, 30, 0.5
+    sigmoid_model, wg, wu, wd = _swiglu_mlp_model(
+        K=K, H=H, Out=Out, gate_activation="Sigmoid", seed=seed
+    )
+    swish_model, wg2, wu2, wd2 = _swiglu_mlp_model(
+        K=K, H=H, Out=Out, gate_activation="Swish", seed=seed, opset=24
+    )
+    np.testing.assert_array_equal(wg, wg2)
+    np.testing.assert_array_equal(wu, wu2)
+    np.testing.assert_array_equal(wd, wd2)
+
+    sigmoid_pruned = onnxsim.apply_structured_pruning(sigmoid_model, sparsity=sparsity)
+    swish_pruned = onnxsim.apply_structured_pruning(swish_model, sparsity=sparsity)
+
+    sigmoid_inits = {
+        t.name: onnx.numpy_helper.to_array(t) for t in sigmoid_pruned.graph.initializer
+    }
+    swish_inits = {
+        t.name: onnx.numpy_helper.to_array(t) for t in swish_pruned.graph.initializer
+    }
+    for name in ("Wg", "Wu", "Wd"):
+        assert sigmoid_inits[name].shape == swish_inits[name].shape
+        np.testing.assert_array_equal(sigmoid_inits[name], swish_inits[name])
 
 
 def test_structured_pruning_ungated_mul_of_two_producers_still_matches_oracle():
@@ -3444,7 +3508,7 @@ def test_structured_pruning_native_swiglu_node_prunes_both_producers_together():
 # --- Conv2D structured pruning ------------------------------------------
 
 
-def _conv_pair_model(w1, w2, b1=None, spatial=10, activation="Relu"):
+def _conv_pair_model(w1, w2, b1=None, spatial=10, activation="Relu", opset=21):
     Cin, C2 = w1.shape[1], w2.shape[0]
     initializer = [_f32(w1, "W1"), _f32(w2, "W2")]
     if b1 is not None:
@@ -3463,6 +3527,7 @@ def _conv_pair_model(w1, w2, b1=None, spatial=10, activation="Relu"):
         }}
         """,
         initializer=initializer,
+        opset=opset,
     )
 
 
@@ -3810,6 +3875,71 @@ def test_structured_pruning_conv_chain_with_dilation_matches_oracle_exactly():
     x = rng_x.standard_normal((2, Cin, 19, 19)).astype(np.float32)
     (y,) = _run(pruned, {"X": x})
     (y_oracle,) = _run(oracle, {"X": x})
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-5, atol=1e-5)
+
+
+def test_structured_pruning_conv_chain_swish_matches_oracle_exactly():
+    # ai.onnx (domain "") Swish(X) = X * Sigmoid(alpha * X), opset 24+ --
+    # joined _UNARY_PASS_THROUGH alongside QuickGelu (see that set's own
+    # comment). Same oracle bar as
+    # test_structured_pruning_conv_chain_matches_manual_channel_deletion_exactly:
+    # exact equivalence, via a real onnxruntime InferenceSession, to
+    # deleting the same output filters by hand -- confirms both that the
+    # chain is matched *and* pruned (not just left untouched-but-passing).
+    Cin, C1, C2 = 3, 16, 8
+    rng = np.random.default_rng(234)
+    w1 = rng.standard_normal((C1, Cin, 3, 3)).astype(np.float32)
+    b1 = rng.standard_normal((C1,)).astype(np.float32)
+    w2 = rng.standard_normal((C2, C1, 3, 3)).astype(np.float32)
+    model = _conv_pair_model(w1, w2, b1=b1, activation="Swish", opset=24)
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    inits = {t.name: t for t in pruned.graph.initializer}
+    assert list(inits["W1"].dims) == [C1 // 2, Cin, 3, 3]
+    assert list(inits["W2"].dims) == [C2, C1 // 2, 3, 3]
+
+    keep = _oracle_keep_indices_conv(w1, C1 // 2)
+    oracle = _conv_pair_model(
+        w1[keep], w2[:, keep], b1=b1[keep], activation="Swish", opset=24
+    )
+
+    rng_x = np.random.default_rng(235)
+    x = rng_x.standard_normal((2, Cin, 10, 10)).astype(np.float32)
+    (y,) = _run(pruned, {"X": x})
+    (y_oracle,) = _run(oracle, {"X": x})
+    assert np.isfinite(y).all()
+    np.testing.assert_allclose(y, y_oracle, rtol=1e-5, atol=1e-5)
+
+
+def test_structured_pruning_conv_chain_hardswish_matches_oracle_exactly():
+    # ai.onnx (domain "") HardSwish(X) = X * HardSigmoid<alpha=1/6,
+    # beta=0.5>(X), opset 22+ -- the canonical MobileNetV3/EfficientNet-Lite
+    # activation, no attributes at all. Same oracle bar as the Swish test
+    # above.
+    Cin, C1, C2 = 3, 16, 8
+    rng = np.random.default_rng(236)
+    w1 = rng.standard_normal((C1, Cin, 3, 3)).astype(np.float32)
+    b1 = rng.standard_normal((C1,)).astype(np.float32)
+    w2 = rng.standard_normal((C2, C1, 3, 3)).astype(np.float32)
+    model = _conv_pair_model(w1, w2, b1=b1, activation="HardSwish", opset=22)
+
+    pruned = onnxsim.apply_structured_pruning(model, sparsity=0.5)
+    onnx.checker.check_model(pruned)
+    inits = {t.name: t for t in pruned.graph.initializer}
+    assert list(inits["W1"].dims) == [C1 // 2, Cin, 3, 3]
+    assert list(inits["W2"].dims) == [C2, C1 // 2, 3, 3]
+
+    keep = _oracle_keep_indices_conv(w1, C1 // 2)
+    oracle = _conv_pair_model(
+        w1[keep], w2[:, keep], b1=b1[keep], activation="HardSwish", opset=22
+    )
+
+    rng_x = np.random.default_rng(237)
+    x = rng_x.standard_normal((2, Cin, 10, 10)).astype(np.float32)
+    (y,) = _run(pruned, {"X": x})
+    (y_oracle,) = _run(oracle, {"X": x})
+    assert np.isfinite(y).all()
     np.testing.assert_allclose(y, y_oracle, rtol=1e-5, atol=1e-5)
 
 
